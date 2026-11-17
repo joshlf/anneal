@@ -8,6 +8,7 @@ and trusted/audit/README.md.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -28,6 +29,12 @@ TOOLCHAIN = "leanprover/lean4:v4.34.1"
 PARTS = ("olean", "olean.server", "olean.private", "ir.sig", "ir")
 MAX_BYTES = 512 * 1024 * 1024
 CHILD_TIMEOUT_SECS = 180
+# `LEAN_NUM_THREADS` for every Lean child. Ambient `LEAN*` variables are stripped, so this
+# validated knob is the only way to set it. Kernel replay is single-threaded; the value sizes
+# the runtime task pool of children without an explicit `-j` (`lean -c`, compiled inspector).
+AUDIT_LEAN_THREADS_ENV = "ANNEAL_AUDIT_LEAN_THREADS"
+DEFAULT_AUDIT_LEAN_THREADS = 2
+MAX_AUDIT_LEAN_THREADS = 64
 
 # Each entry is (module_name, relative_path, direct_imports, role)
 # where role is "theory", "examples", "claim", or "test".
@@ -89,6 +96,28 @@ class Failure(Exception):
     def __init__(self, code: int, phase: str, message: str):
         super().__init__(message)
         self.code, self.phase = code, phase
+
+
+def resolve_audit_lean_threads(env: Mapping[str, str] | None = None) -> str:
+    """Return the `LEAN_NUM_THREADS` value for the audit's Lean children.
+
+    Reads `ANNEAL_AUDIT_LEAN_THREADS` from `env` (default `os.environ`). Unset or blank selects
+    `DEFAULT_AUDIT_LEAN_THREADS`; any other value must be ASCII digits denoting
+    `1..MAX_AUDIT_LEAN_THREADS`, else it fails closed in phase "admission".
+    """
+    raw = (os.environ if env is None else env).get(AUDIT_LEAN_THREADS_ENV)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return str(DEFAULT_AUDIT_LEAN_THREADS)
+    if isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw):
+        significant = raw.lstrip("0")
+        # Bound the digit count before int(): CPython refuses int(str) beyond 4300 digits.
+        if len(significant) <= len(str(MAX_AUDIT_LEAN_THREADS)):
+            value = int(significant or "0")
+            if 1 <= value <= MAX_AUDIT_LEAN_THREADS:
+                return str(value)
+    shown = repr(raw[:32]) + "..." if isinstance(raw, str) and len(raw) > 32 else repr(raw)
+    raise Failure(2, "admission", f"invalid {AUDIT_LEAN_THREADS_ENV}={shown}; "
+                                  f"expected integer in 1..{MAX_AUDIT_LEAN_THREADS}")
 
 
 def digest(path: Path) -> str:
@@ -365,11 +394,15 @@ class Checker:
             self.cache_dir = raw_cache.resolve()
             if self.cache_dir == self.checkout or self.checkout in self.cache_dir.parents:
                 raise Failure(2, "admission", f"cache directory must reside outside checkout: {self.cache_dir}")
+        # Validated before the stage exists, so a rejected value leaves no temporary directory.
+        audit_lean_threads = resolve_audit_lean_threads(os.environ)
         self.stage = Path(tempfile.mkdtemp(prefix="anneal-trusted-", dir=temp_parent))
         self.phase, self.execution_began, self.counter = "admission", False, 0
         self.environment = {k: v for k, v in os.environ.items()
                             if not k.startswith(("LEAN", "LAKE", "ELAN", "DYLD_"))}
         self.environment["PATH"] = os.defpath
+        # The only LEAN* variable a child sees; an ambient LEAN_NUM_THREADS was stripped above.
+        self.environment["LEAN_NUM_THREADS"] = audit_lean_threads
         self.artifacts: dict[str, list[list[str]]] = {}
         self.graph: dict = {}
         self.expected_artifacts: dict[str, str] = {}

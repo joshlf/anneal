@@ -37,17 +37,26 @@ Why this wrapper exists:
 - Pre-export bundle verification (`--verify-bundle-ff` / `--check-unstable-ff`)
   guards shared integration refs (`refs/heads/unstable`) in remote Git bundles
   against accidental non-fast-forward rollbacks.
+- Kernel replay is single-threaded, so replay / TCB audit commands
+  (`check_trusted.py`, `leanchecker`, `lean4checker`,
+  `lean --run ... TrustedBoundary.lean`) default `LEAN_NUM_THREADS` to the
+  replay budget (`--replay-threads`, default 2) instead of the full worktree
+  budget. Every child also receives `ANNEAL_AUDIT_LEAN_THREADS`, the only
+  thread setting `check_trusted.py` honors after it strips ambient `LEAN*`
+  variables.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from contextlib import contextmanager
 import fcntl
 import json
 import os
 from pathlib import Path
 import posixpath
+import re
 import shutil
 import signal
 import subprocess
@@ -61,6 +70,15 @@ sys.dont_write_bytecode = True
 MIB = 1024 * 1024
 REMOTE_FUSE_PREFIXES: tuple[str, ...] = ("/mnt/fuse/rw/", "/mnt/fuse/ro/")
 REMOTE_URI_PREFIX = "/remote/"
+
+# Replay / audit thread budget. The default and bound mirror
+# `DEFAULT_AUDIT_LEAN_THREADS` / `MAX_AUDIT_LEAN_THREADS` in
+# `trusted/audit/check_trusted.py` (asserted by `--self-test`), so every value
+# exported as `ANNEAL_AUDIT_LEAN_THREADS` is one that `check_trusted.py` admits.
+DEFAULT_REPLAY_THREADS = 2
+MAX_REPLAY_THREADS = 64
+REPLAY_THREADS_ENV = "ANNEAL_REPLAY_THREADS"
+AUDIT_LEAN_THREADS_ENV = "ANNEAL_AUDIT_LEAN_THREADS"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -709,6 +727,155 @@ def inject_lean_m_flag(cmd: list[str], lean_m_mb: int) -> list[str]:
     return list(cmd)
 
 
+def parse_replay_threads(raw: str, name: str = "--replay-threads") -> int:
+    """Parses a replay thread count: ASCII digits denoting `1..MAX_REPLAY_THREADS`.
+
+    Raises `ValueError` for anything else (signs, whitespace, non-ASCII digits,
+    `0`, values above the bound), so malformed settings fail closed.
+    """
+    if isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw):
+        significant = raw.lstrip("0")
+        # Bound the digit count before `int()`: CPython refuses `int(str)`
+        # beyond 4300 digits.
+        if len(significant) <= len(str(MAX_REPLAY_THREADS)):
+            value = int(significant or "0")
+            if 1 <= value <= MAX_REPLAY_THREADS:
+                return value
+    shown = (
+        repr(raw[:32]) + "..."
+        if isinstance(raw, str) and len(raw) > 32
+        else repr(raw)
+    )
+    raise ValueError(
+        f"invalid {name}={shown}; expected integer in 1..{MAX_REPLAY_THREADS}"
+    )
+
+
+def _replay_threads_arg(raw: str) -> int:
+    """`argparse` type for `--replay-threads`."""
+    try:
+        return parse_replay_threads(raw)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def resolve_replay_threads(
+    cli_value: int | None = None, env: Mapping[str, str] | None = None
+) -> tuple[int, str]:
+    """Returns the requested replay budget and its source: "cli", "env", or "default".
+
+    `--replay-threads` wins over `$ANNEAL_REPLAY_THREADS`, which is ignored
+    (and not validated) when the flag is given; unset or blank selects
+    `DEFAULT_REPLAY_THREADS`. Invalid values raise `ValueError`.
+    """
+    if cli_value is not None:
+        if (
+            isinstance(cli_value, bool)
+            or not isinstance(cli_value, int)
+            or not 1 <= cli_value <= MAX_REPLAY_THREADS
+        ):
+            raise ValueError(
+                f"invalid --replay-threads={cli_value!r}; "
+                f"expected integer in 1..{MAX_REPLAY_THREADS}"
+            )
+        return cli_value, "cli"
+    raw = (os.environ if env is None else env).get(REPLAY_THREADS_ENV)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return DEFAULT_REPLAY_THREADS, "default"
+    return parse_replay_threads(raw, REPLAY_THREADS_ENV), "env"
+
+
+_ENV_OPTIONS_WITH_OPERAND = frozenset({"-u", "--unset", "-C", "--chdir"})
+_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
+_LAKE_OPTIONS_WITH_OPERAND = frozenset({"-d", "--dir", "-f", "--file", "-K"})
+_PYTHON_EXE_RE = re.compile(r"(?:python|pypy)(?:[0-9]+(?:\.[0-9]+)*)?[a-z]*")
+_REPLAY_CHECKER_PROGRAMS = frozenset({"leanchecker", "lean4checker"})
+_AUDIT_SCRIPT_NAME = "check_trusted.py"
+_REPLAY_INSPECTOR_NAME = "TrustedBoundary.lean"
+
+
+def _strip_transparent_launchers(cmd: list[str]) -> list[str]:
+    """Drops `env [OPTION|NAME=VALUE]...` and `lake [OPTION]... env|exe|exec` prefixes."""
+    argv = list(cmd)
+    while argv:
+        name = posixpath.basename(argv[0])
+        if name == "env":
+            i = 1
+            while i < len(argv):
+                if argv[i] in _ENV_OPTIONS_WITH_OPERAND:
+                    i += 2
+                elif argv[i].startswith("-") or _ENV_ASSIGNMENT_RE.fullmatch(argv[i]):
+                    i += 1
+                else:
+                    break
+            argv = argv[i:]
+            continue
+        if name == "lake":
+            i = 1
+            while i < len(argv) and argv[i].startswith("-"):
+                i += 2 if argv[i] in _LAKE_OPTIONS_WITH_OPERAND else 1
+            if i < len(argv) and argv[i] in ("env", "exe", "exec"):
+                argv = argv[i + 1 :]
+                continue
+        break
+    return argv
+
+
+def _python_script_operand(args: list[str]) -> str | None:
+    """Returns the script a CPython command line runs, or None for `-c`, `-m`, `-`, or a REPL."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return args[i + 1] if i + 1 < len(args) else None
+        if arg == "-":
+            return None
+        if not arg.startswith("-"):
+            return arg
+        if arg.startswith("--"):
+            # Of CPython's long options only `--check-hash-based-pycs` takes an operand.
+            i += 2 if arg == "--check-hash-based-pycs" else 1
+            continue
+        cluster = arg[1:]
+        for pos, flag in enumerate(cluster):
+            if flag in "cm":
+                return None
+            if flag in "WX":
+                if pos == len(cluster) - 1:
+                    i += 1  # Operand is the next argument (`-W ignore`).
+                break  # Otherwise the operand is attached (`-Wignore`).
+        i += 1
+    return None
+
+
+def is_replay_or_audit_command(cmd: list[str]) -> bool:
+    """Returns True for kernel replay / TCB audit invocations.
+
+    Recognized, optionally behind `env [NAME=VALUE]...` or `lake [OPTION]... env|exe`:
+    - `check_trusted.py`, run directly or as a Python interpreter's script;
+    - `leanchecker` / `lean4checker`;
+    - `lean ... --run ... TrustedBoundary.lean` (any directory).
+    Shell strings (`sh -c '...'`) and other launchers are not parsed; pass
+    `--replay-threads` to pin such commands explicitly.
+    """
+    argv = _strip_transparent_launchers(cmd)
+    if not argv:
+        return False
+    program = posixpath.basename(argv[0])
+    if program in _REPLAY_CHECKER_PROGRAMS or program == _AUDIT_SCRIPT_NAME:
+        return True
+    if _PYTHON_EXE_RE.fullmatch(program):
+        script = _python_script_operand(argv[1:])
+        return script is not None and posixpath.basename(script) == _AUDIT_SCRIPT_NAME
+    if program == "lean" and "--run" in argv[1:]:
+        run_at = argv.index("--run", 1)
+        return any(
+            posixpath.basename(arg) == _REPLAY_INSPECTOR_NAME
+            for arg in argv[run_at + 1 :]
+        )
+    return False
+
+
 class _ForwardSignal(BaseException):
     """Raised when `anneal-lean-run` receives a termination signal."""
 
@@ -734,6 +901,44 @@ def terminate_process_group(pgid: int, grace_sec: float = 2.0) -> None:
         os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+
+
+def build_child_env(
+    cmd: list[str],
+    limits: dict[str, Any],
+    base_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Returns `base_env` (default `os.environ`) plus the thread variables for `cmd`.
+
+    - `CARGO_BUILD_JOBS` / `RAYON_NUM_THREADS` default to the worktree budget
+      `limits["threads"]`, as does `LEAN_NUM_THREADS` for ordinary commands.
+    - Replay / audit commands (`is_replay_or_audit_command`) default
+      `LEAN_NUM_THREADS` to the replay budget instead.
+    - Every child receives `ANNEAL_AUDIT_LEAN_THREADS` (the replay budget)
+      unless the caller exported a non-blank value.
+    - An explicit `--replay-threads` (`replay_threads_source == "cli"`) sets
+      both variables to the replay budget for any command, overriding exports.
+    "Default" means `setdefault`: caller-exported values win. The replay budget
+    is `limits["replay_threads"]` (default `DEFAULT_REPLAY_THREADS`) capped by
+    `limits["threads"]`.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    threads = int(limits["threads"])
+    replay_threads = max(
+        1, min(threads, int(limits.get("replay_threads", DEFAULT_REPLAY_THREADS)))
+    )
+    forced = limits.get("replay_threads_source") == "cli"
+    if forced:
+        env["LEAN_NUM_THREADS"] = str(replay_threads)
+    elif is_replay_or_audit_command(cmd):
+        env.setdefault("LEAN_NUM_THREADS", str(replay_threads))
+    else:
+        env.setdefault("LEAN_NUM_THREADS", str(threads))
+    env.setdefault("CARGO_BUILD_JOBS", str(threads))
+    env.setdefault("RAYON_NUM_THREADS", str(threads))
+    if forced or not env.get(AUDIT_LEAN_THREADS_ENV, "").strip():
+        env[AUDIT_LEAN_THREADS_ENV] = str(replay_threads)
+    return env
 
 
 def run_bounded_command(
@@ -773,10 +978,7 @@ def run_bounded_command(
     else:
         full_cmd = effective_cmd
 
-    env = os.environ.copy()
-    env.setdefault("LEAN_NUM_THREADS", str(threads))
-    env.setdefault("CARGO_BUILD_JOBS", str(threads))
-    env.setdefault("RAYON_NUM_THREADS", str(threads))
+    env = build_child_env(cmd, limits)
 
     need_slot = use_slot_lock and (mode == "build")
     with acquire_build_slot(build_slots, timeout_sec, enabled=need_slot):
@@ -1879,6 +2081,461 @@ def verify_bundle_ff(
         )
 
 
+# Child script for `--self-test`: records the thread variables it inherits, then
+# constructs the real `check_trusted.Checker` and records the `LEAN*` view its
+# Lean children would get. Saved as `check_trusted.py` to exercise detection.
+_SELF_TEST_PROBE = r'''
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+out, check_trusted, scratch = sys.argv[1:4]
+names = ("LEAN_NUM_THREADS", "CARGO_BUILD_JOBS", "RAYON_NUM_THREADS",
+         "ANNEAL_AUDIT_LEAN_THREADS", "LEAN_PATH")
+record = {name: os.environ.get(name) for name in names}
+spec = importlib.util.spec_from_file_location("anneal_check_trusted_probe", check_trusted)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    checker = module.Checker(Path(scratch), Path("/nonexistent/lean"),
+                             temp_parent=Path(scratch))
+except module.Failure as error:
+    record["checker"] = {"failure": [error.code, error.phase, str(error)]}
+else:
+    prefixes = ("LEAN", "LAKE", "ELAN", "DYLD_")
+    record["checker"] = {
+        "LEAN_NUM_THREADS": checker.environment.get("LEAN_NUM_THREADS"),
+        "lean_like_keys": sorted(k for k in checker.environment if k.startswith(prefixes)),
+    }
+    checker.stage.rmdir()
+Path(out).write_text(json.dumps(record))
+'''
+
+
+def run_self_test() -> int:
+    """`--self-test`: hermetic unit tests for replay / audit thread pinning."""
+    import importlib.util
+    import io
+    import unittest
+    from unittest import mock
+
+    module_globals = globals()
+    check_trusted_path = (
+        Path(__file__).resolve().parent.parent / "trusted" / "audit" / "check_trusted.py"
+    )
+    fixed_hw: dict[str, Any] = {
+        "cpu_cores": 8,
+        "mem_total_mb": 32768,
+        "mem_avail_mb": 24576,
+    }
+    scrubbed = (
+        "LEAN_NUM_THREADS",
+        "CARGO_BUILD_JOBS",
+        "RAYON_NUM_THREADS",
+        REPLAY_THREADS_ENV,
+        AUDIT_LEAN_THREADS_ENV,
+        "ANNEAL_WORKTREE_CONCURRENCY",
+        "ANNEAL_LEAN_MEMORY_MAX_MB",
+        "ANNEAL_LEAN_TIMEOUT_SEC",
+    )
+    thread_keys = (
+        "LEAN_NUM_THREADS",
+        "CARGO_BUILD_JOBS",
+        "RAYON_NUM_THREADS",
+        AUDIT_LEAN_THREADS_ENV,
+    )
+
+    @contextmanager
+    def hermetic_host() -> Iterator[None]:
+        """Pins the probed hardware (8 CPUs) and disables `systemd-run` scopes."""
+        replacements = {
+            "probe_host_hardware": lambda *_a, **_k: dict(fixed_hw),
+            "systemd_user_scope_available": lambda: False,
+        }
+        saved = {name: module_globals[name] for name in replacements}
+        module_globals.update(replacements)
+        try:
+            yield
+        finally:
+            module_globals.update(saved)
+
+    def load_check_trusted() -> Any:
+        if not check_trusted_path.is_file():
+            raise unittest.SkipTest(f"no checkout copy of {check_trusted_path}")
+        spec = importlib.util.spec_from_file_location(
+            "anneal_check_trusted_selftest", check_trusted_path
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    class Hermetic(unittest.TestCase):
+        def setUp(self) -> None:
+            patcher = mock.patch.dict(os.environ)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+            for name in scrubbed:
+                os.environ.pop(name, None)
+
+    class ReplayCommandDetection(Hermetic):
+        def test_replay_and_audit_commands(self) -> None:
+            for cmd in (
+                ["python3", "trusted/audit/check_trusted.py", "--fast"],
+                ["python3", "-B", "trusted/audit/check_trusted.py", "--self-test"],
+                ["/usr/bin/python3.13", "-W", "ignore", "-Xdev", "-u", "check_trusted.py"],
+                ["python3.13t", "-Bu", "--", "trusted/audit/check_trusted.py"],
+                ["./trusted/audit/check_trusted.py", "--audit-vacuity"],
+                ["env", "-u", "LEAN_PATH", "FOO=1", "python3", "check_trusted.py"],
+                ["lake", "env", "python3", "trusted/audit/check_trusted.py"],
+                ["leanchecker", "Anneal"],
+                ["lake", "env", "leanchecker", "--fresh", "Anneal"],
+                ["lake", "-d", "theory", "exe", "lean4checker", "Anneal"],
+                ["/opt/lean/bin/lean4checker", "Anneal"],
+                ["lean", "--run", "trusted/audit/TrustedBoundary.lean", "a.json", "b.json"],
+                [
+                    "lake", "--dir", "theory", "env", "lean", "-j1", "-M2048",
+                    "--run", "/tmp/anneal-trusted-x/TrustedBoundary.lean",
+                ],
+                ["/home/u/.elan/toolchains/t/bin/lean", "--run", "TrustedBoundary.lean"],
+            ):
+                with self.subTest(cmd=cmd):
+                    self.assertTrue(is_replay_or_audit_command(cmd))
+
+        def test_ordinary_commands(self) -> None:
+            for cmd in (
+                [],
+                ["true"],
+                ["env"],
+                ["lake", "env"],
+                ["lake", "build"],
+                ["lake", "build", "leanchecker"],
+                ["lake", "build", "lean4checker"],
+                ["lake", "env", "lean", "Foo.lean"],
+                ["lean", "Foo.lean"],
+                ["lean", "trusted/audit/TrustedBoundary.lean"],
+                ["lean", "--run", "Other.lean"],
+                ["lean", "TrustedBoundary.lean", "--run", "Other.lean"],
+                ["cargo", "test", "--manifest-path", "trusted/rustc-capture/Cargo.toml"],
+                ["python3", "-c", "import check_trusted"],
+                ["python3", "-m", "check_trusted"],
+                ["python3", "-W", "check_trusted.py", "other.py"],
+                ["python3", "scripts/other.py", "trusted/audit/check_trusted.py"],
+                ["git", "add", "trusted/audit/check_trusted.py"],
+                ["sh", "-c", "exit 3"],
+            ):
+                with self.subTest(cmd=cmd):
+                    self.assertFalse(is_replay_or_audit_command(cmd))
+
+    class ReplayThreadResolution(Hermetic):
+        def test_cli_flag_accepts_only_1_to_max(self) -> None:
+            parser = build_parser()
+            self.assertIsNone(parser.parse_args(["--probe"]).replay_threads)
+            for raw, expected in (
+                ("1", 1),
+                ("2", 2),
+                ("08", 8),
+                (str(MAX_REPLAY_THREADS), MAX_REPLAY_THREADS),
+            ):
+                args = parser.parse_args(["--replay-threads", raw])
+                self.assertEqual(args.replay_threads, expected)
+            for raw in (
+                "0", "-1", "65", "abc", "1.5", " 2", "2 ", "+2", "\u0663", "",
+                "true", "9" * 5000,
+            ):
+                err = io.StringIO()
+                with self.subTest(raw=raw[:16]), mock.patch("sys.stderr", err):
+                    with self.assertRaises(SystemExit) as caught:
+                        parser.parse_args([f"--replay-threads={raw}"])
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertIn("--replay-threads", err.getvalue())
+
+        def test_resolution_precedence_and_validation(self) -> None:
+            env = REPLAY_THREADS_ENV
+            self.assertEqual(resolve_replay_threads(None, {}), (2, "default"))
+            self.assertEqual(resolve_replay_threads(None, {env: " \t"}), (2, "default"))
+            self.assertEqual(resolve_replay_threads(None, {env: "5"}), (5, "env"))
+            self.assertEqual(resolve_replay_threads(3, {env: "5"}), (3, "cli"))
+            # The flag wins without validating an unused environment value.
+            self.assertEqual(resolve_replay_threads(3, {env: "bogus"}), (3, "cli"))
+            for raw in ("0", "65", "abc", " 5", "-2"):
+                with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, env):
+                    resolve_replay_threads(None, {env: raw})
+            for bad in (0, MAX_REPLAY_THREADS + 1, True, "2"):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    resolve_replay_threads(bad, {})  # type: ignore[arg-type]
+            os.environ[env] = "4"
+            self.assertEqual(resolve_replay_threads(), (4, "env"))
+
+    class ChildEnvironment(Hermetic):
+        ordinary = ["lake", "build"]
+        audit = ["python3", "trusted/audit/check_trusted.py", "--fast"]
+
+        def child_env(
+            self,
+            cmd: list[str],
+            base: dict[str, str],
+            threads: int = 4,
+            replay: int = 2,
+            source: str = "default",
+        ) -> dict[str, str]:
+            limits = {
+                "threads": threads,
+                "replay_threads": replay,
+                "replay_threads_source": source,
+            }
+            env = build_child_env(cmd, limits, base)
+            return {key: env.get(key) for key in thread_keys}
+
+        def expect(self, lean: str, cargo: str, rayon: str, audit: str) -> dict:
+            return dict(zip(thread_keys, (lean, cargo, rayon, audit)))
+
+        def test_ordinary_commands_keep_worktree_thread_defaults(self) -> None:
+            self.assertEqual(
+                self.child_env(self.ordinary, {}), self.expect("4", "4", "4", "2")
+            )
+            exported = self.expect("7", "6", "5", "3")
+            self.assertEqual(self.child_env(self.ordinary, exported), exported)
+            env = build_child_env(self.ordinary, {"threads": 4}, {"HOME": "/h"})
+            self.assertEqual(env["HOME"], "/h")
+
+        def test_replay_commands_default_lean_threads_to_replay_budget(self) -> None:
+            self.assertEqual(
+                self.child_env(self.audit, {}), self.expect("2", "4", "4", "2")
+            )
+            # Caller exports still win without `--replay-threads`.
+            self.assertEqual(
+                self.child_env(["leanchecker", "M"], {"LEAN_NUM_THREADS": "7"}),
+                self.expect("7", "4", "4", "2"),
+            )
+
+        def test_blank_audit_export_is_unset_and_malformed_passes_through(self) -> None:
+            blank = {AUDIT_LEAN_THREADS_ENV: "  "}
+            self.assertEqual(self.child_env(self.ordinary, blank)[AUDIT_LEAN_THREADS_ENV], "2")
+            # check_trusted.py, not this wrapper, rejects a malformed export.
+            bad = {AUDIT_LEAN_THREADS_ENV: "0"}
+            self.assertEqual(self.child_env(self.audit, bad)[AUDIT_LEAN_THREADS_ENV], "0")
+
+        def test_cli_flag_pins_any_command_over_exports(self) -> None:
+            exported = {
+                "LEAN_NUM_THREADS": "16",
+                "CARGO_BUILD_JOBS": "6",
+                AUDIT_LEAN_THREADS_ENV: "9",
+            }
+            for cmd in (self.ordinary, self.audit):
+                with self.subTest(cmd=cmd):
+                    self.assertEqual(
+                        self.child_env(cmd, exported, replay=3, source="cli"),
+                        self.expect("3", "6", "4", "3"),
+                    )
+
+        def test_replay_budget_is_capped_by_worktree_threads(self) -> None:
+            self.assertEqual(
+                self.child_env(self.audit, {}, threads=1),
+                self.expect("1", "1", "1", "1"),
+            )
+            self.assertEqual(
+                self.child_env(self.ordinary, {}, threads=3, replay=8, source="cli"),
+                self.expect("3", "3", "3", "3"),
+            )
+
+        def test_legacy_limits_and_os_environ_default(self) -> None:
+            env = build_child_env(self.audit, {"threads": 4}, {})
+            self.assertEqual(env["LEAN_NUM_THREADS"], str(DEFAULT_REPLAY_THREADS))
+            self.assertEqual(env[AUDIT_LEAN_THREADS_ENV], str(DEFAULT_REPLAY_THREADS))
+            os.environ["ANNEAL_SELF_TEST_MARKER"] = "1"
+            env = build_child_env(self.ordinary, {"threads": 4})
+            self.assertEqual((env["ANNEAL_SELF_TEST_MARKER"], env["LEAN_NUM_THREADS"]), ("1", "4"))
+            self.assertNotIn("LEAN_NUM_THREADS", os.environ)
+            self.assertNotIn(AUDIT_LEAN_THREADS_ENV, os.environ)
+
+    class MainIntegration(Hermetic):
+        def probe_json(self, *argv: str) -> dict[str, Any]:
+            out = io.StringIO()
+            with hermetic_host(), mock.patch("sys.stdout", out):
+                self.assertEqual(main(["--probe", "--json", *argv]), 0)
+            return json.loads(out.getvalue())
+
+        def test_probe_reports_replay_budget_and_keeps_limit_schema(self) -> None:
+            data = self.probe_json("--concurrency", "2")
+            expected = compute_limits(dict(fixed_hw), mode="build", concurrency=2)
+            self.assertNotIn("replay_threads", expected)
+            for key, value in expected.items():
+                self.assertEqual(data[key], value, key)
+            replay_keys = ("replay_threads", "replay_threads_requested", "replay_threads_source")
+            self.assertEqual([data[k] for k in replay_keys], [2, 2, "default"])
+            capped = self.probe_json("--concurrency", "8", "--replay-threads", "3")
+            self.assertEqual(
+                [capped[k] for k in ("threads", *replay_keys)], [1, 1, 3, "cli"]
+            )
+            os.environ[REPLAY_THREADS_ENV] = "3"
+            from_env = self.probe_json("--concurrency", "2")
+            self.assertEqual([from_env[k] for k in replay_keys], [3, 3, "env"])
+            text = io.StringIO()
+            with hermetic_host(), mock.patch("sys.stdout", text):
+                self.assertEqual(main(["--probe", "--concurrency", "2"]), 0)
+            self.assertIn("Replay Threads     : 3 threads", text.getvalue())
+            self.assertIn("source=env", text.getvalue())
+
+        def test_invalid_replay_configuration_fails_closed(self) -> None:
+            with mock.patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    main(["--replay-threads", "0", "--", "true"])
+            self.assertEqual(caught.exception.code, 2)
+            os.environ[REPLAY_THREADS_ENV] = "65"
+            err = io.StringIO()
+            with hermetic_host(), mock.patch("sys.stderr", err):
+                self.assertEqual(main(["--no-slot-lock", "--", "true"]), 2)
+            self.assertIn("invalid ANNEAL_REPLAY_THREADS='65'", err.getvalue())
+            # An explicit flag makes the unused environment value irrelevant.
+            self.assertEqual(self.probe_json("--replay-threads", "2")["replay_threads"], 2)
+            with mock.patch("sys.stderr", io.StringIO()):
+                self.assertEqual(main(["--self-test", "--", "true"]), 2)
+
+    class CheckTrustedIntegration(Hermetic):
+        ct: Any = None
+
+        @classmethod
+        def setUpClass(cls) -> None:
+            cls.ct = load_check_trusted()
+
+        def test_defaults_and_bounds_match_check_trusted(self) -> None:
+            self.assertEqual(self.ct.AUDIT_LEAN_THREADS_ENV, AUDIT_LEAN_THREADS_ENV)
+            self.assertEqual(self.ct.DEFAULT_AUDIT_LEAN_THREADS, DEFAULT_REPLAY_THREADS)
+            self.assertEqual(self.ct.MAX_AUDIT_LEAN_THREADS, MAX_REPLAY_THREADS)
+
+        def test_resolve_audit_lean_threads(self) -> None:
+            resolve = self.ct.resolve_audit_lean_threads
+            self.assertEqual(resolve({}), str(DEFAULT_REPLAY_THREADS))
+            for raw, expected in (("", "2"), (" \t", "2"), ("1", "1"), ("08", "8")):
+                self.assertEqual(resolve({AUDIT_LEAN_THREADS_ENV: raw}), expected)
+            # Every replay budget this wrapper can export is admitted verbatim.
+            for n in range(1, MAX_REPLAY_THREADS + 1):
+                self.assertEqual(resolve({AUDIT_LEAN_THREADS_ENV: str(n)}), str(n))
+            for raw in (
+                "0", "65", "-1", "+4", " 4", "4\n", "abc", "true", "1.0", "\u0663",
+                "9" * 5000,
+            ):
+                with self.subTest(raw=raw[:16]):
+                    with self.assertRaises(self.ct.Failure) as caught:
+                        resolve({AUDIT_LEAN_THREADS_ENV: raw})
+                    self.assertEqual(
+                        (caught.exception.code, caught.exception.phase), (2, "admission")
+                    )
+            os.environ[AUDIT_LEAN_THREADS_ENV] = "3"
+            self.assertEqual(resolve(), "3")
+
+        def test_checker_strips_ambient_lean_and_applies_audit_threads(self) -> None:
+            hostile = {
+                "LEAN_PATH": "/stale",
+                "LEAN_SYSROOT": "/stale",
+                "LEAN_NUM_THREADS": "48",
+                "LAKE_HOME": "/stale",
+                "ELAN_HOME": "/stale",
+                "DYLD_LIBRARY_PATH": "/stale",
+            }
+            with tempfile.TemporaryDirectory() as tmp:
+                parent = Path(tmp)
+                for audit, expected in ((None, "2"), ("5", "5")):
+                    extra = {} if audit is None else {AUDIT_LEAN_THREADS_ENV: audit}
+                    with mock.patch.dict(os.environ, {**hostile, **extra}):
+                        checker = self.ct.Checker(
+                            parent, Path("/nonexistent/lean"), temp_parent=parent
+                        )
+                    checker.stage.rmdir()
+                    lean_like = sorted(
+                        k
+                        for k in checker.environment
+                        if k.startswith(("LEAN", "LAKE", "ELAN", "DYLD_"))
+                    )
+                    self.assertEqual(lean_like, ["LEAN_NUM_THREADS"])
+                    self.assertEqual(checker.environment["LEAN_NUM_THREADS"], expected)
+                    self.assertEqual(checker.environment["PATH"], os.defpath)
+                os.environ[AUDIT_LEAN_THREADS_ENV] = "0"
+                with self.assertRaises(self.ct.Failure) as caught:
+                    self.ct.Checker(parent, Path("/nonexistent/lean"), temp_parent=parent)
+                self.assertEqual(
+                    (caught.exception.code, caught.exception.phase), (2, "admission")
+                )
+                self.assertEqual(list(parent.iterdir()), [])  # No leaked stage.
+
+        def run_probe(
+            self, script_name: str, argv: list[str], env: dict[str, str]
+        ) -> dict[str, Any]:
+            """Runs `_SELF_TEST_PROBE` as a real child of `main` (8 CPUs, W=2)."""
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                probe = root / "audit-probe" / script_name
+                probe.parent.mkdir()
+                probe.write_text(_SELF_TEST_PROBE, encoding="utf-8")
+                scratch = root / "stage-parent"
+                scratch.mkdir()
+                out = root / "record.json"
+                child = [sys.executable, "-B", str(probe), str(out)]
+                child += [str(check_trusted_path), str(scratch)]
+                argv = ["--mode", "build", "--no-slot-lock", "--concurrency", "2", *argv]
+                with mock.patch.dict(os.environ, env), hermetic_host():
+                    self.assertEqual(main([*argv, "--", *child]), 0)
+                self.assertEqual(list(scratch.iterdir()), [])  # No leaked stage.
+                return json.loads(out.read_text(encoding="utf-8"))
+
+        def test_end_to_end_propagation_through_main(self) -> None:
+            if not _PYTHON_EXE_RE.fullmatch(posixpath.basename(sys.executable)):
+                self.skipTest(f"unrecognized interpreter name {sys.executable!r}")
+            ok = {"lean_like_keys": ["LEAN_NUM_THREADS"]}
+            stale = {"LEAN_PATH": "/stale", "LEAN_SYSROOT": "/stale"}
+            # Auto-detected audit: replay budget for the child and check_trusted.py,
+            # whose Lean children never see ambient `LEAN*` variables.
+            rec = self.run_probe("check_trusted.py", [], stale)
+            self.assertEqual(
+                [rec[k] for k in (*thread_keys, "LEAN_PATH")], ["2", "4", "4", "2", "/stale"]
+            )
+            self.assertEqual(rec["checker"], {**ok, "LEAN_NUM_THREADS": "2"})
+            # Exported LEAN_NUM_THREADS reaches the child but not the audit's Lean children.
+            rec = self.run_probe("check_trusted.py", [], {"LEAN_NUM_THREADS": "16"})
+            self.assertEqual([rec[k] for k in thread_keys], ["16", "4", "4", "2"])
+            self.assertEqual(rec["checker"], {**ok, "LEAN_NUM_THREADS": "2"})
+            # Ordinary command: worktree budget, yet the audit knob is still exported.
+            rec = self.run_probe("env_probe.py", [], {})
+            self.assertEqual([rec[k] for k in thread_keys], ["4", "4", "4", "2"])
+            self.assertEqual(rec["checker"], {**ok, "LEAN_NUM_THREADS": "2"})
+            # `--replay-threads` pins any command over exported values.
+            exported = {"LEAN_NUM_THREADS": "16", AUDIT_LEAN_THREADS_ENV: "7"}
+            rec = self.run_probe("env_probe.py", ["--replay-threads", "3"], exported)
+            self.assertEqual([rec[k] for k in thread_keys], ["3", "4", "4", "3"])
+            self.assertEqual(rec["checker"], {**ok, "LEAN_NUM_THREADS": "3"})
+            # `$ANNEAL_REPLAY_THREADS` selects the budget without the flag.
+            rec = self.run_probe("check_trusted.py", [], {REPLAY_THREADS_ENV: "1"})
+            self.assertEqual([rec[k] for k in thread_keys], ["1", "4", "4", "1"])
+            self.assertEqual(rec["checker"], {**ok, "LEAN_NUM_THREADS": "1"})
+            # A malformed exported audit knob fails closed in check_trusted.py.
+            rec = self.run_probe("check_trusted.py", [], {AUDIT_LEAN_THREADS_ENV: "0"})
+            self.assertEqual(rec[AUDIT_LEAN_THREADS_ENV], "0")
+            self.assertEqual(rec["checker"]["failure"][:2], [2, "admission"])
+
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    for case in (
+        ReplayCommandDetection,
+        ReplayThreadResolution,
+        ChildEnvironment,
+        MainIntegration,
+        CheckTrustedIntegration,
+    ):
+        suite.addTests(loader.loadTestsFromTestCase(case))
+    result = unittest.TextTestRunner(stream=sys.stderr, verbosity=2).run(suite)
+    ok = result.wasSuccessful()
+    print(
+        f"{'PASS' if ok else 'FAIL'}: anneal-lean-run --self-test ran "
+        f"{result.testsRun} tests ({len(result.skipped)} skipped, "
+        f"{len(result.failures)} failures, {len(result.errors)} errors)"
+    )
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
@@ -1946,6 +2603,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the host-wide concurrent build slot lock for `build` mode.",
     )
     p.add_argument(
+        "--replay-threads",
+        type=_replay_threads_arg,
+        default=None,
+        metavar="N",
+        help=(
+            f"Thread budget (1..{MAX_REPLAY_THREADS}, capped by the worktree "
+            "budget) for kernel replay / audit commands (`check_trusted.py`, "
+            "`leanchecker`, `lean4checker`, `lean --run ... "
+            "TrustedBoundary.lean`), exported to every child as "
+            "`ANNEAL_AUDIT_LEAN_THREADS` (default: $ANNEAL_REPLAY_THREADS or "
+            f"{DEFAULT_REPLAY_THREADS}). Passing it pins `LEAN_NUM_THREADS` "
+            "and `ANNEAL_AUDIT_LEAN_THREADS` for any command, overriding "
+            "exported values."
+        ),
+    )
+    p.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run the built-in replay/audit thread-pinning unit tests and exit.",
+    )
+    p.add_argument(
         "--verify-bundle-ff",
         "--check-unstable-ff",
         dest="verify_bundle_ff",
@@ -2005,6 +2683,15 @@ def main(argv: list[str] | None = None) -> int:
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
 
+    if args.self_test:
+        if args.probe or cmd or args.verify_bundle_ff is not None:
+            sys.stderr.write(
+                "[anneal-lean-run] ERROR: `--self-test` cannot be combined "
+                "with `--probe`, `--verify-bundle-ff`, or a command execution.\n"
+            )
+            return 2
+        return run_self_test()
+
     if args.verify_bundle_ff is not None:
         if args.probe or cmd:
             sys.stderr.write(
@@ -2030,6 +2717,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0 if verdict["ok"] else 1
 
+    try:
+        replay_threads, replay_source = resolve_replay_threads(args.replay_threads)
+    except ValueError as error:
+        sys.stderr.write(f"[anneal-lean-run] ERROR: {error}\n")
+        return 2
+
     hw = probe_host_hardware()
     eff_mode = detect_mode(cmd, args.mode)
     limits = compute_limits(
@@ -2039,6 +2732,9 @@ def main(argv: list[str] | None = None) -> int:
         override_mem_mb=args.memory_max_mb,
         override_timeout_sec=args.timeout,
     )
+    limits["replay_threads"] = min(limits["threads"], replay_threads)
+    limits["replay_threads_requested"] = replay_threads
+    limits["replay_threads_source"] = replay_source
 
     if args.probe or not cmd:
         if not args.probe and not cmd:
@@ -2057,6 +2753,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"{format_cgroup_probe_line(limits)}\n"
                 f"  Thread Budget (-j) : {limits['threads']} threads "
                 f"(LEAN_NUM_THREADS={limits['threads']})\n"
+                f"  Replay Threads     : {limits['replay_threads']} threads "
+                f"(replay/audit LEAN_NUM_THREADS, ANNEAL_AUDIT_LEAN_THREADS; "
+                f"source={limits['replay_threads_source']})\n"
                 f"  Hard RAM Cap       : {limits['memory_max_mb']} MiB "
                 f"(MemorySwapMax=0, lean -M {limits['lean_m_mb']})\n"
                 f"  Wall-Clock Timeout : {limits['timeout_sec']}s\n"
