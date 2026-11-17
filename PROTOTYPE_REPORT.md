@@ -7,7 +7,7 @@
   - `theory/Anneal/SparseRetagAndVcNarrowPrototype.lean`
   - `tests/mir/SparseRetagAndVcNarrowProtoTests.lean`
   - `PROTOTYPE_REPORT.md`
-- **Kernel & Axiom Audit** (bottom of the test file, on the final code): `axiom audit passed: 2184 declarations (367 prototype theorems, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 leaked constants, 0 placeholder uses, 13 conditional test lemmas all discharged, 100% theorem reachability from closed test witnesses)`
+- **Kernel & Axiom Audit** (bottom of the test file, on the final code): `axiom audit passed: 2261 declarations (388 prototype theorems, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 leaked constants, 0 placeholder uses, 13 conditional test lemmas all discharged, 100% theorem reachability from closed test witnesses)`
   - All theorems depend only on `{propext, Quot.sound}`.
   - The audit's self-tests confirm that it flags:
     - `Classical.choice` reached transitively through current-file constants (rolled-back probe
@@ -26,12 +26,19 @@
   conditions:
   - Conditions 2, 4 and 6 are closed.
   - Conditions 1 and 3 are closed for `isBorrowMonotoneStmt` statements and `isBorrowMonotoneTerminator`
-    terminators. No concrete trace executes a call.
-  - Condition 5 is closed per step for all three external-call forms. Whole-execution losslessness is
-    proved only for all-external cones (standard WP) or under the code-frame assumption
-    (`wpMirExecExtCF`, a weaker WP with no narrowing theorem).
+    terminators, including a concrete interprocedural `.call` + `.return_` trace
+    (`protoInterprocCallReturnBorrowTrace`, `test_partC_interproc_call_return_trace_borrowAware`) that
+    mints stack borrows in both caller (`depth = 0`) and callee (`depth = 1`) and disables the callee
+    borrow on `.return_` via `disableFrameBorrows`.
+  - Condition 5 is closed per step for all three external-call forms, and whole-execution losslessness
+    is proved both for standard `wpMirExecExt` on mixed internal/trait/external cones where internal
+    cone calls resolve via `lookupCallee` and external cone calls are summarized
+    (`wpMirExecExt_cone_iff_unfiltered_of_mixed_cone`, compatible with `UntrustedAdmissible`,
+    `test_partB_mixed_cone_standard_wp_lossless`) and for the code-frame WP `wpMirExecExtCF` with full
+    callee/trait/summary narrowing (`wpMirExecExtCF_trait_cone_narrow`,
+    `vcMirWithCalleesCF_narrow_of_batchedCert`, `vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert`).
   - Condition 7 is measured: one certificate pays off once at least 3 VCs share it. The
-    measured 3-VC batch saves `923,163` hb.
+    measured 3-VC batch saves `923,324` hb.
 
 ---
 
@@ -108,19 +115,38 @@
     `ClosedInvPoly` state targets `cone` and resumes into a `ClosedInvPoly` state on any
     `AnsPreservesCodeFrame` answer.
   - **Whole-execution losslessness**, under the stated hypotheses:
-    1. `wpMirExecExt_cone_iff_unfiltered_of_summarized` (standard WP). Hypotheses: *every* cone path
-       is summarized, and summary contracts imply `AnsPreservesCodeFrame`.
+    1. `wpMirExecExt_cone_iff_unfiltered_of_summarized` (standard WP, all-external cones). Hypotheses:
+       *every* cone path is summarized, and summary contracts imply `AnsPreservesCodeFrame`.
        `summarizedCone_has_no_internal_body` shows that admissible summaries then force an
-       all-external cone, so the theorem never applies to the call cone of a program that calls an
-       internal function (`test_partB_summarized_lossless_inapplicable`).
-    2. `wpMirExecExtCF_cone_iff_unfiltered` (code-frame WP `wpMirExecExtCF`, which admits only
-       answers satisfying `AnsPreservesCodeFrame`, including for havoc'd calls). It holds for every
-       `extEnv` and every `contracts`. `wpMirExecExt_imp_wpMirExecExtCF` shows this WP is *weaker*
-       than the standard one: it is sound for real executions only if external code never replaces
-       the code frame.
-       `wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert` instantiates it at a certified entry
-       state (full callee table only). No narrowing theorem for `wpMirExecExtCF` is proved.
-       Together: `test_partB_whole_exec_lossless`, `test_partB_cf_wp_weaker`.
+       all-external cone (`test_partB_summarized_lossless_inapplicable`).
+    2. `wpMirExecExt_cone_iff_unfiltered_of_mixed_cone` (standard WP, mixed internal/trait/external
+       cones). Hypotheses: `coneCallsResolveOrSummarized c₁ ti₁ extEnv cone root = true` (every call in
+       `root` and `coneBodies cone c₁` either resolves internally via `lookupCallee c₁ _ _ _ ti₁` — so
+       `evalTerminator` steps internally without emitting a `MirCallE` — or has an external summary in
+       `extEnv`) and summary contracts imply `AnsPreservesCodeFrame`. Proved via
+       `lookupCallee_nil_indep_layouts`, `extractCalleeTypeArgs_instantiate_of_nil`,
+       `callResolvesOrSummarizedAt_instantiate_false`, `termCallsResolveOrSummarized_instantiate_false`,
+       `bodyCallsResolveOrSummarized_instantiate_false`, `callResolvesOrSummarizedAt_spec`, and
+       `stepExtCallSummarized_of_closedInvPoly`. Compatible with `UntrustedAdmissible` and instantiated
+       on both `traitCallRootMir` and the mixed internal+external cone of `protoTailExtRootMir` in
+       `test_partB_mixed_cone_standard_wp_lossless`.
+    3. `wpMirExecExtCF_cone_iff_unfiltered` + `wpMirExecExtCF_trait_cone_narrow` +
+       `vcMirWithCalleesCF_narrow_of_batchedCert` +
+       `vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert` (code-frame WP `wpMirExecExtCF`, which
+       admits only answers satisfying `AnsPreservesCodeFrame`, including for havoc'd calls). It holds
+       for every `extEnv` and every `contracts`. `wpMirExecExt_imp_wpMirExecExtCF` shows this WP is
+       *weaker* than the standard one (sound for real executions when external code preserves the code
+       frame). `wpMirExecExtCF_trait_cone_narrow` proves full callee/trait/summary narrowing for
+       `wpMirExecExtCF` via the `MirCallAns.mapMem (Memory.withCalleesAndTraits ...)` bijection
+       (`ansPreservesCodeFrame_mapMem_withCalleesAndTraits`,
+       `mirCallAns_mapMem_withCalleesAndTraits_cancel`, `memory_withCalleesAndTraits_inj_of_eq`,
+       `applyUnwindAction_mem_withCalleesAndTraits`,
+       `invalidateDirectDestWriteBorrows_borrows_withCalleesAndTraits`,
+       `resumeExternalCall_withCalleesAndTraits`, `resumeExternalDivergingCall_withCalleesAndTraits`,
+       `resumeExternalTailCall_withCalleesAndTraits`), and
+       `vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert` relates narrowed cone-filtered
+       `vcMirWithCalleesCF` directly to full unfiltered `wpMirExecExtCFUnfiltered`
+       (`test_partB_whole_exec_lossless`, `test_partB_cf_wp_weaker`).
 - `canary_externalSummary_vc`, `canary_coercedExternalSummary_vc`, `canary_twoExternalCalls_vc`.
 - Symbolic VC over polymorphic and trait-dispatched calls: `symTrait_vc_narrow_of_lt` (for every
   input `n` with `n + 31 < 2^32`, i.e. the whole non-overflowing `u32` range, `n` flows through
@@ -180,9 +206,13 @@
     `runDemandCallerLocationTrace_borrow_monotone`, `eagerInitAux_borrow_monotone`,
     `runEagerCallerLocationTrace_borrow_monotone`, `runDemandCallerLocationTrace_borrowAware_spec`,
     and `demandCallerLocation_bisim_eager_borrowAware` (exercised on `protoBorrowMonotoneTrace` in
-    `test_partC_borrowMonotone_and_trace_borrowAware`, and on `protoGotoDropBorrowTrace` in
-    `test_partC_terminator_trace_borrowAware`, whose `.goto`/`.drop` steps execute but neither mint
-    nor disable a borrow tag. No concrete trace executes a call or return.)
+    `test_partC_borrowMonotone_and_trace_borrowAware`, on `protoGotoDropBorrowTrace` in
+    `test_partC_terminator_trace_borrowAware`, and on the interprocedural `.call` + `.return_` trace
+    `protoInterprocCallReturnBorrowTrace` in `test_partC_interproc_call_return_trace_borrowAware`, which
+    mints caller borrow `tag = 1` at `depth = 0`, pushes a caller frame via `.call`, mints callee
+    borrow `tag = 2` at `depth = 1`, invokes `caller_location` inside the callee, and executes
+    `.return_` to disable callee `tag = 2` to `.disabled` via `disableFrameBorrows` while preserving
+    caller `tag = 1` at `.reservedFrz false`).
 
 ### Part D — `LazyWriteChain` & total shifts
 - `mkLazyWrite w` (static width, `O(1)` per write); `eval_mkLazyWrite`, `eval_mkEagerWrite`,
@@ -219,10 +249,10 @@ labeled otherwise.
 
 | Rows `M` | Linear oracle, 1 query | Sparse: prepare + 1 query | Sparse: prepare + `M` queries |
 | :--- | ---: | ---: | ---: |
-| 16 | `67,541` hb (`12.4` ms) | `146,852` hb (`28.5` ms) | `438,921` hb (`98.1` ms) |
-| 64 | `577,569` hb (`139.2` ms) | `634,328` hb (`194.4` ms) | `1,752,176` hb (`514.4` ms) |
-| 128 | `2,117,815` hb (`355.4` ms) | `1,420,921` hb (`258.5` ms) | `3,559,290` hb (`1,426.1` ms) |
-| 256 | `8,147,437` hb (`1,848.6` ms) | `3,226,248` hb (`930.8` ms) | `7,285,268` hb (`2,873.1` ms) |
+| 16 | `67,541` hb (`9.4` ms) | `146,852` hb (`23.8` ms) | `438,921` hb (`73.6` ms) |
+| 64 | `577,569` hb (`80.9` ms) | `634,328` hb (`105.4` ms) | `1,752,176` hb (`317.9` ms) |
+| 128 | `2,117,815` hb (`334.6` ms) | `1,420,921` hb (`248.4` ms) | `3,559,290` hb (`698.9` ms) |
+| 256 | `8,147,437` hb (`1,641.9` ms) | `3,226,248` hb (`719.6` ms) | `7,285,268` hb (`1,499.8` ms) |
 
 - The linear oracle's cost grows by 3.67× from `M = 64` to `M = 128` and by
   3.85× from `M = 128` to `M = 256`, approaching 4× per doubling.
@@ -237,9 +267,9 @@ labeled otherwise.
 
 | Callees `M` | Full table run | Cert check (compute cone + mask, 1 `decide`) | Narrowed run (narrowing computed in-kernel) | Narrowed run (cached narrowed table) |
 | :--- | ---: | ---: | ---: | ---: |
-| 16 | `562,746` hb (`111.8` ms) | `1,623,921` hb (`450.7` ms) | `588,023` hb (`267.0` ms) | `452,018` hb (`163.2` ms) |
-| 64 | `670,416` hb (`194.4` ms) | `2,066,855` hb (`442.3` ms) | `781,835` hb (`203.0` ms) | `452,011` hb (`182.2` ms) |
-| 128 | `813,934` hb (`171.3` ms) | `2,657,375` hb (`503.3` ms) | `1,040,205` hb (`209.6` ms) | `452,023` hb (`150.3` ms) |
+| 16 | `562,776` hb (`264.0` ms) | `1,623,919` hb (`604.3` ms) | `588,029` hb (`239.6` ms) | `452,013` hb (`202.1` ms) |
+| 64 | `670,399` hb (`275.9` ms) | `2,066,860` hb (`786.4` ms) | `781,836` hb (`303.4` ms) | `451,999` hb (`185.2` ms) |
+| 128 | `813,914` hb (`292.7` ms) | `2,657,361` hb (`940.2` ms) | `1,040,218` hb (`426.7` ms) | `451,992` hb (`202.6` ms) |
 
 - The cached arm's literal table is proved equal (`rfl`) to the computed narrowing
   (`cachedNarrow_eq_computed_*`).
@@ -247,40 +277,40 @@ labeled otherwise.
   full table. Recomputing the narrowing on every run is slower than the full table. The one-time
   certificate costs 3.26× a full run.
 - Concrete VC discharge by elaborator `rfl` (`M = 128`; *not* a symbolic VC): full table
-  `3,861,281` hb (`1,048.6` ms) vs. cached narrowed table `2,160,836` hb (`390.9` ms)
+  `3,861,907` hb (`1,015.5` ms) vs. cached narrowed table `2,160,516` hb (`554.2` ms)
   (1.79×).
 - Symbolic VCs (`∀ x : Nat`, `symTraitRootMir`, `M = 128`, identical tactic script on every arm; the
   three VCs differ in their input range `x % 1000`, `x % 65536`, `x % 1000000`):
 
   | VC | Full table | Cached narrowed table |
   | :--- | ---: | ---: |
-  | `x % 1000` | `5,780,090` hb (`1,118.4` ms) | `4,578,311` hb (`607.1` ms) |
-  | `x % 65536` | `5,779,870` hb (`1,149.6` ms) | `4,578,339` hb (`544.9` ms) |
-  | `x % 1000000` | `5,780,092` hb (`1,660.3` ms) | `4,578,347` hb (`864.8` ms) |
-  | One-time certificate (`PartB_symVC_cert_M128`) | — | `2,681,892` hb (`483.7` ms) |
+  | `x % 1000` | `5,779,757` hb (`1,307.3` ms) | `4,578,029` hb (`1,061.8` ms) |
+  | `x % 65536` | `5,779,869` hb (`1,361.4` ms) | `4,578,098` hb (`1,068.4` ms) |
+  | `x % 1000000` | `5,779,690` hb (`1,372.3` ms) | `4,578,005` hb (`1,199.8` ms) |
+  | One-time certificate (`PartB_symVC_cert_M128`) | — | `2,681,860` hb (`1,204.0` ms) |
 
-  - **Single VC (`x % 1000`):** the narrowed table saves `1,201,779` hb (1.26×).
+  - **Single VC (`x % 1000`):** the narrowed table saves `1,201,728` hb (1.26×).
     `symCachedNarrow_eq_computed_128` proves the cached table is the certified narrowing.
     `test_partB_symVC_transfer_128` turns the narrowed-table proof plus the certificate into the
     full-table VC. The certificate costs 2.23× this saving, so certifying and proving one
-    VC on the narrowed table costs `7,260,203` hb, versus `5,780,090` hb on the
+    VC on the narrowed table costs `7,259,889` hb, versus `5,779,757` hb on the
     full table.
   - **Batch of the three measured VCs** (`test_partB_symVC_batch3_transfer_128`, one certificate):
-    the certificate plus the three narrowed proofs cost `16,416,889` hb, versus `17,340,052` hb for
-    the three full-table proofs, a net saving of `923,163` hb.
+    the certificate plus the three narrowed proofs cost `16,415,992` hb, versus `17,339,316` hb for
+    the three full-table proofs, a net saving of `923,324` hb.
   - Break-even: with this certificate and the single-VC saving above, narrowing pays off from
     3 VCs sharing one certificate.
 - Coercion (`∀ bits`, 16 chained coercions, the same `simp only` script shape): sealed
-  `coerceValueAt` rewritten by `coerceValueAt_u32` `257,237` hb (`27.5` ms) vs. a reducible copy
-  unfolded by `dsimp`/`simp` `447,072` hb (`33.5` ms) (1.74×).
+  `coerceValueAt` rewritten by `coerceValueAt_u32` `257,237` hb (`71.3` ms) vs. a reducible copy
+  unfolded by `dsimp`/`simp` `447,063` hb (`94.5` ms) (1.74×).
 
 ### 2.3 Part C — eager pre-allocation vs. demand-time `Location` (same trace in both worlds)
 
 | Sites `S` | Eager, non-panicking (8 stmts) | Demand, non-panicking | Eager, panicking (1 invocation) | Demand, panicking |
 | :--- | ---: | ---: | ---: | ---: |
-| 16 | `130,093` hb (`20.8` ms) | `53,131` hb (`7.2` ms) | `237,413` hb (`34.8` ms) | `197,021` hb (`26.0` ms) |
-| 64 | `762,225` hb (`108.3` ms) | `53,172` hb (`7.7` ms) | `394,634` hb (`57.2` ms) | `197,038` hb (`27.2` ms) |
-| 128 | `2,508,206` hb (`387.5` ms) | `53,168` hb (`7.6` ms) | `625,750` hb (`81.9` ms) | `197,066` hb (`26.8` ms) |
+| 16 | `130,093` hb (`23.4` ms) | `53,134` hb (`8.1` ms) | `237,361` hb (`43.0` ms) | `197,037` hb (`28.6` ms) |
+| 64 | `762,228` hb (`119.2` ms) | `53,165` hb (`8.0` ms) | `394,645` hb (`61.2` ms) | `197,055` hb (`31.1` ms) |
+| 128 | `2,508,214` hb (`896.3` ms) | `53,170` hb (`8.4` ms) | `625,790` hb (`105.2` ms) | `197,008` hb (`48.4` ms) |
 
 - Demand cost is independent of `S`; the eager arm materializes `S + 1` globals (checked). Its
   super-linear growth is partly an artifact of the list-based `Memory.globals` model.
@@ -289,11 +319,11 @@ labeled otherwise.
 
 | Writes `N` | Eager (`mkEagerWrite`) | Lazy (`mkLazyWrite`) | Proved spine inspections (eager / lazy) |
 | :--- | ---: | ---: | ---: |
-| 16 | `121,695` hb (`17.6` ms) | `60,083` hb (`7.4` ms) | 136 / 16 |
-| 64 | `1,226,839` hb (`325.1` ms) | `113,402` hb (`18.4` ms) | 2080 / 64 |
-| 128 | `4,728,536` hb (`939.5` ms) | `184,011` hb (`26.6` ms) | 8256 / 128 |
+| 16 | `121,690` hb (`18.7` ms) | `60,040` hb (`7.0` ms) | 136 / 16 |
+| 64 | `1,226,863` hb (`239.2` ms) | `113,394` hb (`20.2` ms) | 2080 / 64 |
+| 128 | `4,728,538` hb (`1,208.4` ms) | `184,056` hb (`49.4` ms) | 8256 / 128 |
 
-- Wide-shift canary (`shift = 2^64`, six safe shifts, one `decide +kernel`): `140,266` hb (`10.3` ms).
+- Wide-shift canary (`shift = 2^64`, six safe shifts, one `decide +kernel`): `140,141` hb (`13.4` ms).
 
 ---
 
@@ -320,10 +350,15 @@ labeled otherwise.
   `test_partB_tail_external_call` (caller frame popped by `resumeExternalTailCall` after an external
   tail call resumes in a cone-safe caller state), `test_partB_cone_filter_conservative`,
   `test_partB_whole_exec_lossless` (standard-WP equivalence on the all-external, fully summarized cone
-  of `protoTwoExtCallsRootMir` with an extra out-of-cone summary `ext::unrelated`, and code-frame-WP
-  equivalence at the certified entry state of `traitCallRootMir`),
-  `test_partB_summarized_lossless_inapplicable` (the standard-WP theorem's hypothesis is false for the
-  trait canary's cone, which contains the internal body `proto::poly`), `test_partB_cf_wp_weaker`,
+  of `protoTwoExtCallsRootMir` with an extra out-of-cone summary `ext::unrelated`, plus code-frame-WP
+  entry equivalence and narrowed-to-unfiltered equivalence via `vcMirWithCalleesCF_narrow_of_batchedCert`
+  and `vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert` on `traitCallRootMir`),
+  `test_partB_mixed_cone_standard_wp_lossless` (standard-WP equivalence via
+  `wpMirExecExt_cone_iff_unfiltered_of_mixed_cone` on `traitCallRootMir` and on the mixed
+  internal+external cone of `protoTailExtRootMir` under `checkUntrustedAdmissible = true`),
+  `test_partB_summarized_lossless_inapplicable` (the all-external standard-WP theorem's hypothesis is
+  false for the trait canary's cone, which contains the internal body `proto::poly`),
+  `test_partB_cf_wp_weaker`,
   `symTrait_vc_narrow` +
   `test_partB_symbolic_trait_vc` (symbolic `∀ x : Nat` VC over polymorphic + trait-dispatched
   `AddUnchecked` calls), `test_partB_symbolic_vc_range` (largest admissible input `2^32 - 32`;
@@ -338,8 +373,10 @@ labeled otherwise.
   bisimulation through `readLocationsBorrowAware` across `protoBorrowMonotoneTrace`, which mints stack
   borrows via `Rvalue.ref` and `StatementKind.retag` both before and after `caller_location`),
   `test_partC_terminator_trace_borrowAware` (borrow-aware bisimulation and
-  `normalTerminatorStep_eq_raw_of_borrowMonotone` across `protoGotoDropBorrowTrace`, whose `.goto` and
-  `.drop` steps execute, checked by the block index, but neither mint nor disable a tag), and
+  `normalTerminatorStep_eq_raw_of_borrowMonotone` across `protoGotoDropBorrowTrace`),
+  `test_partC_interproc_call_return_trace_borrowAware` (borrow-aware bisimulation across the
+  interprocedural `.call` + `.return_` trace `protoInterprocCallReturnBorrowTrace`, minting stack
+  borrows at `depth = 0` and `depth = 1` and disabling the callee borrow on `.return_`), and
   `test_partC_borrowAware_needed` (on `protoBorrowMonotoneTrace` an allocator using only `nextAllocId`
   would give the `Location` the live borrow tag `1`).
 - **Part D**: OOB fold, same-address collapse, distinct-address `O(1)` stop, top-write read in one
@@ -446,6 +483,31 @@ labeled otherwise.
      constants reach `Classical.choice` transitively through current-file constants, `sorryAx` and
      `Lean.ofReduceBool` are checked through the imported-constant branch, and a clean-constant check
      guards against false positives.
+- `[adv A4]` (agent-a):
+  1. Proved standard-WP whole-execution lossless cone filtering on mixed internal/polymorphic/trait/external
+     cones (`coneCallsResolveOrSummarized`, `lookupCallee_nil_indep_layouts`,
+     `extractCalleeTypeArgs_instantiate_of_nil`, `callResolvesOrSummarizedAt_instantiate_false`,
+     `termCallsResolveOrSummarized_instantiate_false`, `bodyCallsResolveOrSummarized_instantiate_false`,
+     `callResolvesOrSummarizedAt_spec`, `stepExtCallSummarized_of_closedInvPoly`,
+     `wpMirExecExt_cone_iff_unfiltered_of_mixed_cone`), compatible with `UntrustedAdmissible` and
+     instantiated on both `traitCallRootMir` and the mixed internal+external cone of
+     `protoTailExtRootMir` (`test_partB_mixed_cone_standard_wp_lossless`).
+  2. Proved full callee/trait/summary narrowing and narrowed-to-unfiltered equivalence for the
+     code-frame WP (`MirCallAns.mapMem`, `ansPreservesCodeFrame_mapMem_withCalleesAndTraits`,
+     `mirCallAns_mapMem_withCalleesAndTraits_cancel`, `memory_withCalleesAndTraits_inj_of_eq`,
+     `applyUnwindAction_mem_withCalleesAndTraits`,
+     `invalidateDirectDestWriteBorrows_borrows_withCalleesAndTraits`,
+     `resumeExternalCall_withCalleesAndTraits`, `resumeExternalDivergingCall_withCalleesAndTraits`,
+     `resumeExternalTailCall_withCalleesAndTraits`, `wpMirExecExtCF_trait_cone_narrow`,
+     `vcMirWithCalleesCF`, `vcMirWithCalleesCF_narrow_of_batchedCert`,
+     `vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert`), instantiated in
+     `test_partB_whole_exec_lossless`.
+  3. Added a concrete interprocedural `.call` + `.return_` borrow-monotone trace
+     (`protoInterprocCallReturnBorrowTrace`, `test_partC_interproc_call_return_trace_borrowAware`)
+     that mints stack borrows in both caller (`tag = 1`, `depth = 0`) and callee (`tag = 2`,
+     `depth = 1`), invokes `caller_location` in both frames, and executes `.return_` to disable the
+     callee borrow (`tag = 2` → `.disabled`) via `disableFrameBorrows` while keeping the caller borrow
+     active.
 
 ---
 
@@ -457,15 +519,15 @@ labeled otherwise.
      before `lookupGlobalAlloc`) in the final memory, match `CallerLocationSite.resolve` and bisimulate
      the eager world.
    - This holds on every trace of `isBorrowMonotoneStmt` statements, `isBorrowMonotoneTerminator`
-     terminators, and `caller_location` invocations.
+     terminators, and `caller_location` invocations, including interprocedural `.call` + `.return_`
+     traces that mint stack borrows across call frames and disable callee borrows on `.return_`
+     (`test_partC_interproc_call_return_trace_borrowAware`).
    - On `protoBorrowMonotoneTrace` an allocator using only `nextAllocId` would hand out id `1`, which
      is the live `&mut _2` tag (`test_partC_borrowAware_needed`).
    - *Residual*:
      - `copy_nonoverlapping`, unsizing / fn-ptr cast rvalues, intrinsic calls and calls through
        function pointers are excluded.
-     - The terminator trace executes only `.goto` and `.drop`. No concrete trace executes a call or
-       return.
-     - The trace runners use a single `localDecls`/`layouts` for every frame.
+     - The trace runners use a single `localDecls`/`layouts` for statement steps.
 2. **Implicit writes: closed for the overlay's scope.** The fresh child is written with the
    `Trusted` write transition and UB checks. Reconcile with V2026_08_01's `initProtectedReborrowPerm`
    on schema bump.
@@ -476,26 +538,31 @@ labeled otherwise.
    *Residual*: same as condition 1.
 4. **Trie depth: closed** (`adaptiveRetagTrieDepth` + `adaptiveRetagTrieDepth_bitPath_injective`,
    exercised at `D = 5000`).
-5. **External calls: closed per step; whole-execution only for all-external cones or under the
-   code-frame assumption.** What is proved:
+5. **External calls: closed per step; whole-execution closed for mixed cones with summarized externals
+   (standard WP) and for arbitrary `extEnv` with full narrowing under the code-frame WP.** What is
+   proved:
    - **Soundness of cone filtering, for every execution:** `wpMirExecExt_mono_cone`.
    - **Step-level safety for all three call forms** (`call`, diverging `call -> !`, `tailCall`):
      `stepMirFn_extCallInCone`, `closedInvPoly_resumeExternalCall`,
      `closedInvPoly_resumeExternalDivergingCall`, `closedInvPoly_resumeExternalTailCall`,
      `stepMirFn_extCallSafe`.
-   - **Whole-execution losslessness, standard `wpMirExecExt`:**
-     `wpMirExecExt_cone_iff_unfiltered_of_summarized`. It requires every cone path to be summarized,
-     which admissible summaries make impossible as soon as the cone contains an internal body
-     (`summarizedCone_has_no_internal_body`, `test_partB_summarized_lossless_inapplicable`).
-   - **Whole-execution losslessness, code-frame `wpMirExecExtCF`:**
-     `wpMirExecExtCF_cone_iff_unfiltered`, for every `extEnv` and every `contracts`. This WP is
-     weaker than the standard one (`wpMirExecExt_imp_wpMirExecExtCF`) and sound only if external code
-     never replaces the code frame. No narrowing theorem for it is proved: in a narrowed run,
-     `AnsPreservesCodeFrame` refers to the narrowed callee table.
+   - **Whole-execution losslessness, standard `wpMirExecExt` on mixed cones:**
+     `wpMirExecExt_cone_iff_unfiltered_of_mixed_cone` proves `wpMirExecExt ↔ wpMirExecExtUnfiltered`
+     whenever every call in `root` and `coneBodies cone c₁` either resolves internally via
+     `lookupCallee c₁ _ _ _ ti₁` or has an external summary in `extEnv`
+     (`coneCallsResolveOrSummarized`, compatible with `UntrustedAdmissible`,
+     `test_partB_mixed_cone_standard_wp_lossless`), alongside the all-external special case
+     `wpMirExecExt_cone_iff_unfiltered_of_summarized` (`summarizedCone_has_no_internal_body`).
+   - **Whole-execution losslessness and narrowing, code-frame `wpMirExecExtCF`:**
+     `wpMirExecExtCF_cone_iff_unfiltered`, `wpMirExecExtCF_trait_cone_narrow`,
+     `vcMirWithCalleesCF_narrow_of_batchedCert`, and
+     `vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert` prove both cone-filtering losslessness and
+     callee/trait/summary narrowing for every `extEnv` and `contracts` (`test_partB_whole_exec_lossless`).
+     This WP is weaker than the standard one (`wpMirExecExt_imp_wpMirExecExtCF`) and is sound for real
+     executions when external calls do not replace the linked code frame.
 
-   *Residual*: put `AnsPreservesCodeFrame` into `MirLiftCore`'s answer semantics, or prove
-   `wpMirExecExtCF` sound for the Trusted semantics, and prove a narrowing theorem for the resulting
-   WP. Until then the VC keeps filtering summaries by cone.
+   *Residual*: bake `AnsPreservesCodeFrame` into `MirLiftCore`'s external-call semantics so standard
+   `wpMirExecExt` inherits unsummarized havoc losslessness without a separate `CF` variant.
 6. **Hoisting: closed.** `checkBatchedVcConeNarrowCertGeneral`, `BatchedVcConeNarrowCert.ofCheckGeneral`
    and `traitFilterCovers_hoist_selectByMask` handle arbitrary keep/drop masks, including mixed trait
    partitions.
@@ -504,8 +571,8 @@ labeled otherwise.
      per VC.
    - The one-time certificate costs 2.23× that saving, so narrowing wins from
      3 VCs per certificate.
-   - The measured 3-VC batch (`test_partB_symVC_batch3_transfer_128`) costs `16,416,889` hb with
-     narrowing vs. `17,340,052` hb without (net `923,163` hb).
+   - The measured 3-VC batch (`test_partB_symVC_batch3_transfer_128`) costs `16,415,992` hb with
+     narrowing vs. `17,339,316` hb without (net `923,324` hb).
    - Sealed coercions need 1.74× fewer heartbeats on the `∀ bits` chain.
 
    *Residual*: benchmark multi-function crate VCs end-to-end under `cargo anneal`, with certificate

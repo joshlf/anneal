@@ -799,12 +799,17 @@ theorem test_partB_tail_external_call :
    canary_tailExternalCall_coneSafe.2.2.2.2⟩
 
 /-- Whole-execution lossless cone filtering (`wpMirExecExt_cone_iff_unfiltered_of_summarized`,
-`wpMirExecExtCF_cone_iff_unfiltered`, and `wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert`):
+`wpMirExecExtCF_cone_iff_unfiltered`, `wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert`,
+`vcMirWithCalleesCF_narrow_of_batchedCert`, and
+`vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert`):
 1. On `protoTwoExtCallsRootMir`, whose cone `protoTwoExtCone` is all-external and fully summarized,
    with an extra out-of-cone summary `⟨"ext::unrelated", 99⟩`, cone-filtered `wpMirExecExt` is
    equivalent (`↔`) to unfiltered `wpMirExecExtUnfiltered` over the 4-step 2-call execution.
-2. At the certified entry state of `traitCallRootMir` (full callee table), the code-frame WP
-   `wpMirExecExtCF` is equivalent (`↔`) to its unfiltered version. -/
+2. At the certified entry state of `traitCallRootMir`, the code-frame WP `wpMirExecExtCF` is
+   equivalent (`↔`) to its unfiltered version, AND `vcMirWithCalleesCF` on the *narrowed*
+   `(protoNaiveNarrowCallees, protoHoistedExtra, [])` environment is equivalent (`↔`) to both
+   `vcMirWithCalleesCF` and unfiltered `wpMirExecExtCFUnfiltered` on the *full*
+   `(protoFullCallees, [], [⟨"ext::unrelated", 99⟩])` environment! -/
 theorem test_partB_whole_exec_lossless :
     (wpMirExecExt protoTwoExtContracts protoTwoExtCone
         (protoTwoExtSummaries ++ [⟨"ext::unrelated", 99⟩]) 4
@@ -820,7 +825,15 @@ theorem test_partB_whole_exec_lossless :
         (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) ↔
       wpMirExecExtCFUnfiltered protoTwoExtContracts [⟨"ext::unrelated", 99⟩] 12
         traitCallRootMir (.running protoTraitInitState)
-        (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False)) := by
+        (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False)) ∧
+    (vcMirWithCalleesCF protoTwoExtContracts 12 traitCallRootMir protoTraitInitState
+        protoNaiveNarrowCallees protoHoistedExtra [] protoTraitCone post31 ↔
+      vcMirWithCalleesCF protoTwoExtContracts 12 traitCallRootMir protoTraitInitState
+        protoFullCallees [] [⟨"ext::unrelated", 99⟩] protoTraitCone post31) ∧
+    (vcMirWithCalleesCF protoTwoExtContracts 12 traitCallRootMir protoTraitInitState
+        protoNaiveNarrowCallees protoHoistedExtra [] protoTraitCone post31 ↔
+      wpMirExecExtCFUnfiltered protoTwoExtContracts [⟨"ext::unrelated", 99⟩] 12
+        traitCallRootMir (.running protoTraitInitState) post31) := by
   have h_iff := wpMirExecExt_cone_iff_unfiltered_of_summarized
     (cone := protoTwoExtCone) (root := protoTwoExtCallsRootMir) (c₁ := []) (ti₁ := [])
     protoTwoExtContracts (protoTwoExtSummaries ++ [⟨"ext::unrelated", 99⟩]) protoTwoExtPost
@@ -856,13 +869,100 @@ theorem test_partB_whole_exec_lossless :
         · simp only [h, Bool.false_eq_true, ↓reduceIte])
       protoTwoExtCallsRootMir protoTwoExtPost 4 (.running protoTwoExtInitState)).mpr
       canary_twoExternalCalls_vc.2.2.1
+  have h_cert : BatchedVcConeNarrowCert protoTraitCone traitCallRootMir
+      protoFullCallees protoNaiveNarrowCallees [] protoHoistedExtra
+      [⟨"ext::unrelated", 99⟩] [] := by
+    have hc := BatchedVcConeNarrowCert.ofCheckGeneral
+      (by decide +kernel :
+        checkBatchedVcConeNarrowCertGeneral protoTraitCone traitCallRootMir
+          protoFullCallees protoTraitMask [] [⟨"ext::unrelated", 99⟩] [] = true)
+    rw [show selectByMask protoFullCallees protoTraitMask = protoNaiveNarrowCallees from
+      selectByMask_coneMask protoTraitCone protoFullCallees] at hc
+    exact hc
+  have h_cf_contract : ∀ tag req ans,
+      AnsPreservesCodeFrame req.memory ans →
+      (protoTwoExtContracts tag
+          { req with memory := Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra req.memory }
+          (MirCallAns.mapMem (Memory.withCalleesAndTraits protoNaiveNarrowCallees protoHoistedExtra) ans) ↔
+        protoTwoExtContracts tag req ans) := by
+    intro tag req ans hans
+    cases ans with
+    | aborted =>
+      constructor <;> (rintro (⟨_, h⟩ | ⟨_, _, h⟩) <;> nomatch h)
+    | panicked m =>
+      constructor <;> (rintro (⟨_, h⟩ | ⟨_, _, h⟩) <;> nomatch h)
+    | returned v m =>
+      have hinj := memory_withCalleesAndTraits_inj_of_eq
+        (c₂ := protoNaiveNarrowCallees) (ti₂ := protoHoistedExtra) hans.1 hans.2.1
+      unfold protoTwoExtContracts
+      dsimp only [MirCallAns.mapMem]
+      simp only [MirCallAns.returned.injEq, hinj]
   exact ⟨h_iff, h_iff.mp h_vc_ext,
-    wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert
-      (BatchedVcConeNarrowCert.ofCheckGeneral
-        (by decide +kernel :
-          checkBatchedVcConeNarrowCertGeneral protoTraitCone traitCallRootMir
-            protoFullCallees protoTraitMask [] [⟨"ext::unrelated", 99⟩] [] = true))
-      protoTwoExtContracts 12 protoTraitInitState rfl rfl rfl rfl _⟩
+    wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert h_cert
+      protoTwoExtContracts 12 protoTraitInitState rfl rfl rfl rfl _,
+    vcMirWithCalleesCF_narrow_of_batchedCert h_cert protoTwoExtContracts 12
+      protoTraitInitState rfl rfl rfl rfl post31
+      (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl) h_cf_contract,
+    vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert h_cert protoTwoExtContracts 12
+      protoTraitInitState rfl rfl rfl rfl post31
+      (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl) h_cf_contract⟩
+
+/-- Standard-WP whole-execution losslessness on internal/trait and mixed internal+external cones
+(`wpMirExecExt_cone_iff_unfiltered_of_mixed_cone`):
+1. On `traitCallRootMir` (`protoTraitCone`, internal polymorphic `proto::poly` + trait
+   `proto::Area::area`), `coneCallsResolveOrSummarized` holds with `extEnv = [⟨"ext::unrelated", 99⟩]`,
+   and standard `wpMirExecExt` is equivalent (`↔`) to `wpMirExecExtUnfiltered` over all 12 steps.
+2. On `protoTailExtRootMir` (`protoTailExtCone = ["proto::tail_helper", "ext::tail_seed", "ext::add_twenty"]`,
+   mixing the internal callee `protoTailExtCalleeMir` with two external calls),
+   `coneCallsResolveOrSummarized` AND `checkUntrustedAdmissible` both hold with
+   `extEnv = [⟨"ext::tail_seed", 10⟩, ⟨"ext::add_twenty", 11⟩, ⟨"ext::unrelated", 99⟩]`, and
+   standard `wpMirExecExt` is equivalent (`↔`) to `wpMirExecExtUnfiltered` over all 5 steps! -/
+theorem test_partB_mixed_cone_standard_wp_lossless :
+    coneCallsResolveOrSummarized protoFullCallees [] [⟨"ext::unrelated", 99⟩]
+      protoTraitCone traitCallRootMir = true ∧
+    (wpMirExecExt protoTwoExtContracts protoTraitCone [⟨"ext::unrelated", 99⟩] 12
+        traitCallRootMir (.running protoTraitInitState) post31 ↔
+      wpMirExecExtUnfiltered protoTwoExtContracts [⟨"ext::unrelated", 99⟩] 12
+        traitCallRootMir (.running protoTraitInitState) post31) ∧
+    checkUntrustedAdmissible [protoTailExtCalleeMir]
+      [⟨"ext::tail_seed", 10⟩, ⟨"ext::add_twenty", 11⟩, ⟨"ext::unrelated", 99⟩] = true ∧
+    coneCallsResolveOrSummarized [protoTailExtCalleeMir] []
+      [⟨"ext::tail_seed", 10⟩, ⟨"ext::add_twenty", 11⟩, ⟨"ext::unrelated", 99⟩]
+      protoTailExtCone protoTailExtRootMir = true ∧
+    (wpMirExecExt protoTwoExtContracts protoTailExtCone
+        [⟨"ext::tail_seed", 10⟩, ⟨"ext::add_twenty", 11⟩, ⟨"ext::unrelated", 99⟩] 5
+        protoTailExtRootMir (.running protoTailExtInitState) protoTwoExtPost ↔
+      wpMirExecExtUnfiltered protoTwoExtContracts
+        [⟨"ext::tail_seed", 10⟩, ⟨"ext::add_twenty", 11⟩, ⟨"ext::unrelated", 99⟩] 5
+        protoTailExtRootMir (.running protoTailExtInitState) protoTwoExtPost) := by
+  have hcert := BatchedVcConeNarrowCert.ofCheckGeneral
+    (by decide +kernel :
+      checkBatchedVcConeNarrowCertGeneral protoTraitCone traitCallRootMir
+        protoFullCallees protoTraitMask [] [⟨"ext::unrelated", 99⟩] [] = true)
+  have h_cf : ∀ tag req ans, protoTwoExtContracts tag req ans →
+      AnsPreservesCodeFrame req.memory ans := by
+    intro tag req ans hc
+    rcases hc with ⟨_, rfl⟩ | ⟨_, _, rfl⟩ <;> exact ⟨rfl, rfl, rfl, CallerBodiesEq.refl _⟩
+  refine ⟨by decide +kernel,
+    wpMirExecExt_cone_iff_unfiltered_of_mixed_cone
+      (cone := protoTraitCone) (root := traitCallRootMir)
+      (c₁ := protoFullCallees) (ti₁ := [])
+      protoTwoExtContracts [⟨"ext::unrelated", 99⟩] post31
+      hcert.rootInCone hcert.coneBodiesInCone hcert.traitConeAgree.2.2
+      (by decide +kernel) h_cf 12 (.running protoTraitInitState)
+      (closedInvPoly_entry rfl rfl rfl rfl),
+    by decide +kernel,
+    by decide +kernel,
+    wpMirExecExt_cone_iff_unfiltered_of_mixed_cone
+      (cone := protoTailExtCone) (root := protoTailExtRootMir)
+      (c₁ := [protoTailExtCalleeMir]) (ti₁ := [])
+      protoTwoExtContracts
+      [⟨"ext::tail_seed", 10⟩, ⟨"ext::add_twenty", 11⟩, ⟨"ext::unrelated", 99⟩]
+      protoTwoExtPost
+      (by decide +kernel) (by decide +kernel)
+      (fun _ _ _ he => by change _ ∈ ([] : List TraitImplEntry) at he; nomatch he)
+      (by decide +kernel) h_cf 5 (.running protoTailExtInitState)
+      (closedInvPoly_entry rfl rfl rfl rfl)⟩
 
 /-- The standard-WP losslessness theorem does not apply to the trait canary
 (`summarizedCone_has_no_internal_body`): `protoTraitCone` contains the internal body
@@ -1666,6 +1766,126 @@ theorem test_partC_terminator_trace_borrowAware :
     exact (demandCallerLocation_bisim_eager_borrowAware (protoSites pol pol) protoLocState
       protoRetagLocalDecls protoLayouts protoGotoDropBorrowTrace (by decide +kernel)
       protoLocState_fresh protoLocState_borrowsFresh (protoSites_fileLenOk pol pol)).1
+
+/-- Callee body (`protoBorrowCalleeMir`) and caller body (`protoInterprocCallerMir`) for a genuine
+interprocedural `.call` + `.return_` Part C trace that mints stack borrows at two call-stack depths
+and disables the callee's frame borrows on `.return_`. -/
+def protoBorrowCalleeMir : CapturedMir :=
+  { traitCallRootMir with
+    defPath := "proto::borrow_callee"
+    argCount := 0
+    localDecls := protoRetagLocalDecls
+    layouts := protoLayouts }
+
+def protoInterprocCallerMir : CapturedMir :=
+  { traitCallRootMir with
+    defPath := "proto::borrow_caller"
+    argCount := 0
+    localDecls := protoRetagLocalDecls
+    layouts := protoLayouts }
+
+def protoInterprocLocState : MachineState :=
+  { protoLocState with memory := { emptyMemory with callees := [protoBorrowCalleeMir] } }
+
+theorem protoInterprocLocState_fresh : GlobalsFresh protoInterprocLocState.memory :=
+  fun _ h => nomatch h
+
+theorem protoInterprocLocState_borrowsFresh : BorrowsFresh protoInterprocLocState.memory :=
+  fun _ h => nomatch h
+
+/-- Concrete interprocedural `.call` + `.return_` borrow-monotone trace
+(`protoInterprocCallReturnBorrowTrace`):
+1. Caller (`callStack = []`): `StorageLive(_2)`, `_2 = 42`, `_1 = &mut _2` (mints caller borrow
+   `tag = 0` at `targetFrameDepth = 0`, `perm = .unique`).
+2. `.terminatorStep ⟨.call (protoFnConst "proto::borrow_callee" []) [] ⟨0, []⟩ (some 1) .continue_, "call_callee"⟩ (some protoInterprocCallerMir)`
+   (pushes caller frame onto `callStack`, `callStack.length = 1`, `activeCallee = some protoBorrowCalleeMir`).
+3. Callee (`callStack.length = 1`): `StorageLive(_2)`, `_2 = 7`, `_1 = &mut _2` (mints callee borrow
+   `tag = 1` at `targetFrameDepth = 1`, `perm = .unique`), `_0 = 99`.
+4. `.invokeCallerLocation 2` inside the callee (allocating at `nextFreshGlobalAndTagId = 2`, above
+   both `tag = 0` and `tag = 1`).
+5. `.terminatorStep ⟨.return_, "callee_ret"⟩ (some protoBorrowCalleeMir)` (executes
+   `disableFrameBorrows` at depth `1` — disabling callee `tag = 1` to `.disabled` while keeping
+   caller `tag = 0` at `.unique` — pops `callStack` to `[]`, writes `99 : u32` into caller `_0`, and
+   jumps to caller `blockIdx = 1`).
+6. `.invokeCallerLocation 0` in the caller after return. -/
+def protoInterprocCallReturnBorrowTrace : List CallerLocationTraceEvent :=
+  [ .normalStep ⟨.storageLive 2, "caller_sl2"⟩,
+    .normalStep ⟨.assign ⟨2, []⟩ (.use (protoU32Const 42)), "caller_init2"⟩,
+    .normalStep ⟨.assign ⟨1, []⟩ (.ref (.mut false) ⟨2, []⟩), "caller_ref1"⟩,
+    .terminatorStep
+      ⟨.call (protoFnConst "proto::borrow_callee" []) [] ⟨0, []⟩ (some 1) .continue_, "call_callee"⟩
+      (some protoInterprocCallerMir),
+    .normalStep ⟨.storageLive 1, "callee_sl1"⟩,
+    .normalStep ⟨.storageLive 2, "callee_sl2"⟩,
+    .normalStep ⟨.assign ⟨2, []⟩ (.use (protoU32Const 7)), "callee_init2"⟩,
+    .normalStep ⟨.assign ⟨1, []⟩ (.ref (.mut false) ⟨2, []⟩), "callee_ref1"⟩,
+    .normalStep ⟨.assign ⟨0, []⟩ (.use (protoU32Const 99)), "callee_ret99"⟩,
+    .invokeCallerLocation 2,
+    .terminatorStep ⟨.return_, "callee_ret"⟩ (some protoBorrowCalleeMir),
+    .invokeCallerLocation 0 ]
+
+/-- State inside `protoBorrowCalleeMir` right before `.return_` (after 9 plain steps). -/
+def protoInterprocStateInsideCallee : MachineState :=
+  runPlainTrace protoInterprocLocState protoRetagLocalDecls protoLayouts
+    (protoInterprocCallReturnBorrowTrace.take 9)
+
+/-- Final plain state in `protoInterprocCallerMir` after `.return_` completes. -/
+def protoInterprocStateAfterReturn : MachineState :=
+  runPlainTrace protoInterprocLocState protoRetagLocalDecls protoLayouts
+    protoInterprocCallReturnBorrowTrace
+
+/-- Closed witness for `evalTerminator_borrowMonotone_frame` and
+`demandCallerLocation_bisim_eager_borrowAware` on a genuine interprocedural `.call` + `.return_`
+trace (`protoInterprocCallReturnBorrowTrace`):
+- Inside the callee (before `.return_`), `callStack.length = 1` and the two stack borrow tags `[2, 1]`
+  have `(tag, targetFrameDepth, perm) = [(2, 1, .reservedFrz false), (1, 0, .reservedFrz false)]`.
+- After `.return_`, `callStack` is popped back to `[]`, `frame.blockIdx = 1`, caller `_0 = 99 : u32`,
+  and `disableFrameBorrows` transitions callee `tag = 2` (`depth = 1`) to `.disabled` while keeping
+  caller `tag = 1` (`depth = 0`) at `.reservedFrz false`:
+  `[(2, 1, .disabled), (1, 0, .reservedFrz false)]`!
+- Demand and eager `readLocationsBorrowAware` agree across all 8 `LocationDetailPolicy` combinations. -/
+theorem test_partC_interproc_call_return_trace_borrowAware :
+    protoInterprocStateInsideCallee.memory.callStack.length = 1 ∧
+    (protoInterprocStateInsideCallee.memory.borrows.map
+      (fun b => (b.tag, b.targetFrameDepth, b.perm))) =
+      [(2, 1, .reservedFrz false), (1, 0, .reservedFrz false)] ∧
+    protoInterprocStateAfterReturn.memory.callStack = [] ∧
+    protoInterprocStateAfterReturn.frame.blockIdx = 1 ∧
+    protoInterprocStateAfterReturn.frame.locals.head? =
+      some (.init (.scalar ⟨99, 4⟩)) ∧
+    (protoInterprocStateAfterReturn.memory.borrows.map
+      (fun b => (b.tag, b.targetFrameDepth, b.perm))) =
+      [(2, 1, .disabled), (1, 0, .reservedFrz false)] ∧
+    readLocationsBorrowAware
+        (runDemandCallerLocationTrace (protoSites {} {}) {} protoInterprocLocState
+          protoRetagLocalDecls protoLayouts protoInterprocCallReturnBorrowTrace).2.2.memory
+        (runDemandCallerLocationTrace (protoSites {} {}) {} protoInterprocLocState
+          protoRetagLocalDecls protoLayouts protoInterprocCallReturnBorrowTrace).2.1 =
+      [ some (protoLibRsBytes, 42, 13), some (protoLibRsBytes, 108, 7) ] ∧
+    (∀ pol ∈ allLocationDetailPolicies,
+      readLocationsBorrowAware
+          (runDemandCallerLocationTrace (protoSites pol pol) {} protoInterprocLocState
+            protoRetagLocalDecls protoLayouts protoInterprocCallReturnBorrowTrace).2.2.memory
+          (runDemandCallerLocationTrace (protoSites pol pol) {} protoInterprocLocState
+            protoRetagLocalDecls protoLayouts protoInterprocCallReturnBorrowTrace).2.1 =
+        readLocationsBorrowAware
+          (runEagerCallerLocationWorld (protoSites pol pol) protoInterprocLocState
+            protoRetagLocalDecls protoLayouts protoInterprocCallReturnBorrowTrace).2.memory
+          (runEagerCallerLocationWorld (protoSites pol pol) protoInterprocLocState
+            protoRetagLocalDecls protoLayouts protoInterprocCallReturnBorrowTrace).1) := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, ?_, ?_⟩
+  · have h_ba := (demandCallerLocation_bisim_eager_borrowAware (protoSites {} {})
+      protoInterprocLocState protoRetagLocalDecls protoLayouts protoInterprocCallReturnBorrowTrace
+      (by decide +kernel) protoInterprocLocState_fresh protoInterprocLocState_borrowsFresh
+      (protoSites_fileLenOk {} {})).2
+    rw [h_ba]
+    decide +kernel
+  · intro pol _
+    exact (demandCallerLocation_bisim_eager_borrowAware (protoSites pol pol)
+      protoInterprocLocState protoRetagLocalDecls protoLayouts protoInterprocCallReturnBorrowTrace
+      (by decide +kernel) protoInterprocLocState_fresh protoInterprocLocState_borrowsFresh
+      (protoSites_fileLenOk pol pol)).1
 
 def buildCandidateSites : Nat → List CallerLocationSite
   | 0 => []

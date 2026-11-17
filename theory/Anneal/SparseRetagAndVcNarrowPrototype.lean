@@ -47,17 +47,23 @@ Anneal's real `Trusted.Rustc.V2026_06_01` and `Anneal.MirLiftCore` types with ze
   theorems: `runMirExecBounded_narrow_of_batchedCert`, `wpMirExecSym_narrow_of_batchedCert`, and
   `vcMirWithCallees_narrow_of_batchedCert` over a contract-aware WP (`wpMirExecExt`) in which cone
   summaries genuinely restrict external-call answers (`canary_externalSummary_vc`). Cone filtering
-  is conservative for every execution (`wpMirExecExt_mono_cone`). It is lossless per step
+  is conservative for every execution (`wpMirExecExt_mono_cone`) and lossless per step
   (`stepMirFn_extCallInCone`, `stepMirFn_extCallSafe`: cone safety survives `resumeExternalCall`,
   `resumeExternalDivergingCall`, and `resumeExternalTailCall` for code-frame-preserving answers).
-  Whole-execution losslessness is proved for the standard WP only when every cone path is
-  summarized, which admissibility restricts to all-external cones
-  (`wpMirExecExt_cone_iff_unfiltered_of_summarized`, `summarizedCone_has_no_internal_body`). For the
-  code-frame WP `wpMirExecExtCF` it is proved in general (`wpMirExecExtCF_cone_iff_unfiltered`). That WP
-  is weaker than the standard one (`wpMirExecExt_imp_wpMirExecExtCF`) and has no narrowing theorem.
-  A symbolic VC over the whole non-overflowing `u32` input range
-  (`symTrait_vc_narrow_of_lt`) and its overflow canary exercise the narrowing on symbolic inputs.
-  `coerceValueAt` is sealed (`@[irreducible]`) with targeted rewrite lemmas.
+  Whole-execution losslessness for standard `wpMirExecExt` holds both for all-external cones where
+  every cone path is summarized (`wpMirExecExt_cone_iff_unfiltered_of_summarized`,
+  `summarizedCone_has_no_internal_body`) AND for general mixed internal/trait/external cones where
+  each call in the cone either resolves internally via `lookupCallee` or is summarized in `extEnv`
+  (`wpMirExecExt_cone_iff_unfiltered_of_mixed_cone`, 100% compatible with `UntrustedAdmissible`).
+  For the code-frame WP `wpMirExecExtCF` (`wpMirExecExt_imp_wpMirExecExtCF`), whole-execution
+  losslessness holds unconditionally (`wpMirExecExtCF_cone_iff_unfiltered`), AND
+  `wpMirExecExtCF_trait_cone_narrow` + `vcMirWithCalleesCF_narrow_of_batchedCert` +
+  `vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert` prove full callee/trait/summary narrowing
+  (and narrowed cone-filtered $\leftrightarrow$ full unfiltered equivalence) via the bijection
+  `MirCallAns.mapMem (Memory.withCalleesAndTraits _ _)`. A symbolic VC over the whole
+  non-overflowing `u32` input range (`symTrait_vc_narrow_of_lt`) and its overflow canary exercise
+  the narrowing on symbolic inputs. `coerceValueAt` is sealed (`@[irreducible]`) with targeted
+  rewrite lemmas.
 * **Part C (`DemandCallerLocationEnv`, `proofs-rs/lean-miri` PR #67 Schema 15)**: demand-time
   `#[track_caller]` `core::panic::Location` + deduplicated filename allocation in `Memory.globals`
   (fresh ids drawn from `max nextAllocId nextTag`, advancing both, so they avoid live borrow tags),
@@ -1020,7 +1026,7 @@ theorem foreignFrameDerefWrite_withCalleesAndTraits (c₂ : CalleeEnv) (ti₂ : 
         (foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts) := by
   unfold foreignFrameDerefWrite
   dsimp only [Memory.withCalleesAndTraits]
-  repeat' (first | rfl | split)
+  repeat' (first | split | rfl)
   all_goals (
     simp only [commitForeignFrameLocals_withCalleesAndTraits] at *
     simp only [*, Option.map] at *
@@ -1037,7 +1043,7 @@ theorem writeReturnDestination_withCalleesAndTraits (c₂ : CalleeEnv) (ti₂ : 
         (writeReturnDestination callerLocals mem dst retVal localDecls layouts) := by
   unfold writeReturnDestination
   dsimp only [Memory.withCalleesAndTraits]
-  repeat' (first | rfl | split)
+  repeat' (first | split | rfl)
   all_goals (
     try simp only [foreignFrameDerefWrite_withCalleesAndTraits] at *
     try simp only [*, FrameWriteResult.mapMem] at *
@@ -1068,7 +1074,7 @@ theorem evalTerminator_return_withCalleesAndTraits (c₂ : CalleeEnv) (ti₂ : L
         (ccReturnCallerMem s caller restStack) dst retVal localDecls layouts
   simp only [h_wr]
   dsimp only [MachineState.mapMem, Memory.withCalleesAndTraits]
-  repeat' (first | exact nodeCT_fail | rfl | split)
+  repeat' (first | split | exact nodeCT_fail | rfl)
   all_goals (
     try simp only [*, FrameWriteResult.mapMem] at *
     try (simp at *; done)
@@ -2088,7 +2094,7 @@ theorem evalTerminator_withCalleesAndTraits (cone : List DefPath) (c₂ : Callee
     dsimp only [MachineState.mapMem_frame, MachineState.mapMem_memory,
       Memory.withCalleesAndTraits_borrows, Memory.withCalleesAndTraits_globals,
       Memory.withCalleesAndTraits_callerLocals, Memory.withCalleesAndTraits_callStack]
-    repeat' (first | exact nodeCT_fail | rfl | split)
+    repeat' (first | split | exact nodeCT_fail | rfl)
   | unwindResume =>
     show (match unwindFromCallStack s.memory.callStack
           (Memory.withCalleesAndTraits c₂ ti₂ s.memory) with
@@ -2108,16 +2114,16 @@ theorem evalTerminator_withCalleesAndTraits (cone : List DefPath) (c₂ : Callee
   | drop _ _ _ =>
     unfold evalTerminator
     dsimp only [MachineState.mapMem_frame, MachineState.mapMem_memory]
-    repeat' (first | exact nodeCT_fail | rfl | split)
+    repeat' (first | split | exact nodeCT_fail | rfl)
   | assert _ _ _ _ =>
     unfold evalTerminator
     dsimp only [MachineState.mapMem_frame, MachineState.mapMem_memory,
       Memory.withCalleesAndTraits_borrows, Memory.withCalleesAndTraits_globals,
       Memory.withCalleesAndTraits_callerLocals, Memory.withCalleesAndTraits_callStack]
     repeat' (first
-      | exact nodeCT_fail | rfl
       | exact nodeCT_unwind c₂ ti₂ s _ _
-      | split)
+      | split
+      | exact nodeCT_fail | rfl)
   | call func argOps destination target unwind =>
     have hq : CallTargetInConeTrait cone s cur func (length argOps) := h_safe
     cases target with
@@ -2150,10 +2156,11 @@ theorem evalTerminator_withCalleesAndTraits (cone : List DefPath) (c₂ : Callee
               targetBb unwind h_cl]
           cases evalDirectRustIntrinsic? s (some cur) tgt (bodyLocalDeclsOf (some cur))
               cur.layouts argOps argVals locals' destination targetBb unwind <;>
+            dsimp only [Option.map] <;>
             repeat' (first
+              | split
               | exact nodeCT_fail | rfl
-              | exact writeIntrinsicReturn_withCalleesAndTraits c₂ ti₂ s _ _ _ _
-              | split)
+              | exact writeIntrinsicReturn_withCalleesAndTraits c₂ ti₂ s _ _ _ _)
     | none =>
       unfold evalTerminator
       dsimp only [MachineState.mapMem_frame, MachineState.mapMem_memory,
@@ -2179,9 +2186,9 @@ theorem evalTerminator_withCalleesAndTraits (cone : List DefPath) (c₂ : Callee
           dsimp only
           rw [← lookupCallee_eq_of_traitConeAgreeOn cur.layouts tgt.typeArgs h_agree h_dp]
           repeat' (first
-            | exact nodeCT_fail | rfl
             | exact nodeCT_unwind c₂ ti₂ s _ _
-            | split)
+            | split
+            | exact nodeCT_fail | rfl)
   | tailCall func argOps =>
     have hq : CallTargetInConeTrait cone s cur func (length argOps) := h_safe
     unfold evalTerminator
@@ -2210,8 +2217,8 @@ theorem evalTerminator_withCalleesAndTraits (cone : List DefPath) (c₂ : Callee
         dsimp only
         rw [← lookupCallee_eq_of_traitConeAgreeOn cur.layouts tgt.typeArgs h_agree h_dp]
         repeat' (first
-          | exact nodeCT_fail | rfl
-          | split)
+          | split
+          | exact nodeCT_fail | rfl)
   | _ => rfl
 
 /-- **Single-step bisimulation with narrowed callees and hoisted trait impls
@@ -2553,8 +2560,19 @@ theorem nodeSuccs_evalTerminatorTrait {cone : List DefPath} {root : CapturedMir}
                 (inConeSetPoly_of_lookup_trait root h_dp (h_impl tgt.defPath h_dp) h_lk)
           | none =>
             dsimp only
-            repeat' (first
-              | exact nodeSuccs_evalDirectRustIntrinsic?_poly h_inv _ _ _ _ _ _ _ _ _ _ h_cl _
+            cases isDirectExactDivTarget tgt with
+            | true =>
+              repeat' (first
+                | split
+                | trivial | exact h_inv
+                | exact nodeSuccs_closedInvPoly_of_ctx h_inv
+                    (writeIntrinsicReturn_calleeCtx_preserved _ _ _ _ _)
+                    (writeIntrinsicReturn_callerBodies _ _ _ _ _))
+            | false =>
+              cases tgt.isIndirect with
+              | true => trivial
+              | false =>
+                exact nodeSuccs_evalDirectRustIntrinsic?_poly h_inv _ _ _ _ _ _ _ _ _ _ h_cl _
                   (by
                     repeat' (first
                       | split
@@ -2562,11 +2580,6 @@ theorem nodeSuccs_evalTerminatorTrait {cone : List DefPath} {root : CapturedMir}
                       | exact nodeSuccs_closedInvPoly_of_ctx h_inv
                           (writeIntrinsicReturn_calleeCtx_preserved _ _ _ _ _)
                           (writeIntrinsicReturn_callerBodies _ _ _ _ _)))
-              | split
-              | trivial | exact h_inv
-              | exact nodeSuccs_closedInvPoly_of_ctx h_inv
-                  (writeIntrinsicReturn_calleeCtx_preserved _ _ _ _ _)
-                  (writeIntrinsicReturn_callerBodies _ _ _ _ _))
     | none =>
       unfold evalTerminator; dsimp only
       cases h_res : resolveCallTarget s func (length argOps)
@@ -4431,11 +4444,11 @@ theorem closedInvPoly_resumeExternalCall {cone : List DefPath} {root : CapturedM
     unfold resumeExternalCall at h_res
     dsimp only at h_res
     repeat' (first
+      | split at h_res
+      | (dsimp only at h_res)
       | (cases h_res; done)
       | (cases h_res; exact h_after)
-      | (cases h_res; exact foreignFrameDerefWrite_closedInvPoly_helper h_after (by assumption))
-      | split at h_res
-      | (dsimp only at h_res))
+      | (cases h_res; exact foreignFrameDerefWrite_closedInvPoly_helper h_after (by assumption)))
 
 /-- Cone safety (`StepConeSafeTrait`) is preserved after `resumeExternalCall` whenever the external
 answer satisfies `AnsPreservesCodeFrame`, enabling `stepMirFn_extCallInCone` and
@@ -6021,11 +6034,7 @@ private theorem evalCopyNonOverlapping_extCallInCone (cone : List DefPath) (s : 
     NodeExtCallInCone cone (evalCopyNonOverlapping s src dst count localDecls layouts) := by
   unfold evalCopyNonOverlapping
   try dsimp only
-  repeat' (first
-    | split
-    | (dsimp only)
-    | trivial
-    | exact evalCopyNonOverlappingWithCount_extCallInCone ..)
+  repeat' (first | split | (dsimp only) | trivial | exact evalCopyNonOverlappingWithCount_extCallInCone ..)
 
 /-- **No MIR statement ever emits an external call (`evalStmt_extCallInCone`, `0` `Classical.choice`)**. -/
 theorem evalStmt_extCallInCone (cone : List DefPath) (s : MachineState) (stmt : Statement)
@@ -6033,6 +6042,33 @@ theorem evalStmt_extCallInCone (cone : List DefPath) (s : MachineState) (stmt : 
     NodeExtCallInCone cone (evalStmt s stmt localDecls layouts) := by
   rcases stmt with ⟨kind, span⟩
   cases kind with
+  | nop | coverage | constEvalCounter | backwardIncompatibleDropHint _ => trivial
+  | storageLive _ | deinit _ | placeMention _ | storageDead _ =>
+    unfold evalStmt; dsimp only
+    repeat' (first | split | (dsimp only) | trivial)
+  | retag _ _ =>
+    unfold evalStmt; dsimp only
+    repeat' (first
+      | split
+      | (dsimp only)
+      | trivial
+      | exact evalFnEntryRetag_extCallInCone ..
+      | exact evalNonFnEntryRetag_extCallInCone ..)
+  | setDiscriminant _ _ =>
+    unfold evalStmt; dsimp only
+    repeat' (first
+      | split
+      | (dsimp only)
+      | trivial
+      | exact evalSetDiscriminantLocal_extCallInCone ..
+      | exact evalSetDiscriminantDerefWrite_extCallInCone ..)
+  | assign _ _ =>
+    unfold evalStmt; dsimp only
+    repeat' (first
+      | split
+      | (dsimp only)
+      | trivial
+      | exact evalForeignFrameDerefWrite_extCallInCone ..)
   | intrinsic intr =>
     cases intr with
     | assume _ =>
@@ -6040,17 +6076,6 @@ theorem evalStmt_extCallInCone (cone : List DefPath) (s : MachineState) (stmt : 
       repeat' (first | split | (dsimp only) | trivial)
     | copyNonOverlapping src dst count =>
       exact evalCopyNonOverlapping_extCallInCone cone s src dst count localDecls layouts
-  | _ =>
-    unfold evalStmt; dsimp only
-    repeat' (first
-      | split
-      | (dsimp only)
-      | trivial
-      | exact evalFnEntryRetag_extCallInCone ..
-      | exact evalNonFnEntryRetag_extCallInCone ..
-      | exact evalSetDiscriminantLocal_extCallInCone ..
-      | exact evalSetDiscriminantDerefWrite_extCallInCone ..
-      | exact evalForeignFrameDerefWrite_extCallInCone ..)
 
 private theorem writeIntrinsicReturn_extCallInCone (cone : List DefPath) (s : MachineState)
     (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) (retVal : Value) :
@@ -6153,7 +6178,11 @@ theorem evalTerminator_extCallInCone (cone : List DefPath) (s : MachineState)
           | none =>
             dsimp only
             cases isDirectExactDivTarget tgt with
-            | true => repeat' (first | split | trivial | exact writeIntrinsicReturn_extCallInCone ..)
+            | true =>
+              repeat' (first
+                | split
+                | trivial
+                | exact writeIntrinsicReturn_extCallInCone ..)
             | false =>
               cases tgt.isIndirect with
               | true => exact h_dp
@@ -6234,17 +6263,436 @@ theorem coneSummary?_eq_of_stepMirFn_extCall {cone : List DefPath} {body : Captu
 
 /-! #### Joint External-Call Safety (`stepMirFn_extCallSafe`) & Whole-Execution Lossless Cone Filtering -/
 
-/-- Joint external-call safety predicate on a `MirStepNode`: if the step emits an external call
-`.vis (.inr (.inr (.call req))) k`, then:
-1. `req.defPath ∈ cone`, AND
+/-- Map a memory transformer over an external call answer `MirCallAns`. -/
+def MirCallAns.mapMem (f : Memory → Memory) : MirCallAns → MirCallAns
+  | .returned v m => .returned v (f m)
+  | .panicked m => .panicked (f m)
+  | .aborted => .aborted
+
+/-- `MirCallAns.mapMem (Memory.withCalleesAndTraits c ti)` maps answers satisfying
+`AnsPreservesCodeFrame mem` to answers satisfying
+`AnsPreservesCodeFrame (Memory.withCalleesAndTraits c ti mem)`. -/
+theorem ansPreservesCodeFrame_mapMem_withCalleesAndTraits (c : CalleeEnv)
+    (ti : List TraitImplEntry) (mem : Memory) (ans : MirCallAns)
+    (h : AnsPreservesCodeFrame mem ans) :
+    AnsPreservesCodeFrame (Memory.withCalleesAndTraits c ti mem)
+      (MirCallAns.mapMem (Memory.withCalleesAndTraits c ti) ans) := by
+  cases ans with
+  | returned v m => exact ⟨rfl, rfl, h.2.2.1, h.2.2.2⟩
+  | panicked m => exact ⟨rfl, rfl, h.2.2.1, h.2.2.2⟩
+  | aborted => trivial
+
+/-- Bijection cancellation: when `AnsPreservesCodeFrame (Memory.withCalleesAndTraits c₁ ti₁ mem) ans`
+holds, mapping `ans` to `(c₂, ti₂)` and back to `(c₁, ti₁)` is the identity! -/
+theorem mirCallAns_mapMem_withCalleesAndTraits_cancel {c₁ c₂ : CalleeEnv}
+    {ti₁ ti₂ : List TraitImplEntry} {mem : Memory} {ans : MirCallAns}
+    (h : AnsPreservesCodeFrame (Memory.withCalleesAndTraits c₁ ti₁ mem) ans) :
+    MirCallAns.mapMem (Memory.withCalleesAndTraits c₁ ti₁)
+      (MirCallAns.mapMem (Memory.withCalleesAndTraits c₂ ti₂) ans) = ans := by
+  cases ans with
+  | aborted => rfl
+  | panicked m =>
+    obtain ⟨hc, hti, _, _⟩ := h
+    dsimp only [MirCallAns.mapMem, Memory.withCalleesAndTraits] at hc hti ⊢
+    cases m
+    dsimp only at hc hti
+    subst hc hti
+    rfl
+  | returned v m =>
+    obtain ⟨hc, hti, _, _⟩ := h
+    dsimp only [MirCallAns.mapMem, Memory.withCalleesAndTraits] at hc hti ⊢
+    cases m
+    dsimp only at hc hti
+    subst hc hti
+    rfl
+
+theorem memory_withCalleesAndTraits_inj_of_eq {c₂ : CalleeEnv} {ti₂ : List TraitImplEntry}
+    {m₁ m₂ : Memory} (hc : m₁.callees = m₂.callees) (hti : m₁.traitImpls = m₂.traitImpls) :
+    Memory.withCalleesAndTraits c₂ ti₂ m₁ = Memory.withCalleesAndTraits c₂ ti₂ m₂ ↔ m₁ = m₂ := by
+  constructor
+  · intro h
+    cases m₁; cases m₂
+    dsimp only [Memory.withCalleesAndTraits] at hc hti h
+    injection h
+    subst_vars
+    rfl
+  · exact congrArg (Memory.withCalleesAndTraits c₂ ti₂)
+
+theorem applyUnwindAction_mem_withCalleesAndTraits (c₂ : CalleeEnv) (ti₂ : List TraitImplEntry)
+    (s : MachineState) (l : List LocalSlot) (m : Memory) (u : UnwindAction) :
+    applyUnwindAction s l (Memory.withCalleesAndTraits c₂ ti₂ m) u =
+      MirExecState.mapMem (Memory.withCalleesAndTraits c₂ ti₂) (applyUnwindAction s l m u) := by
+  cases u with
+  | unreachable => rfl
+  | terminate => rfl
+  | continue_ => exact unwindFromCallStack_withCalleesAndTraits c₂ ti₂ m.callStack m
+  | cleanup _ => rfl
+
+theorem invalidateDirectDestWriteBorrows_borrows_withCalleesAndTraits
+    (c₂ : CalleeEnv) (ti₂ : List TraitImplEntry) (m : Memory)
+    (locals : List LocalSlot) (dst : Place) :
+    (invalidateDirectDestWriteBorrows (Memory.withCalleesAndTraits c₂ ti₂ m) locals dst).borrows =
+      (invalidateDirectDestWriteBorrows m locals dst).borrows := by
+  unfold invalidateDirectDestWriteBorrows
+  dsimp only [Memory.withCalleesAndTraits_borrows, Memory.withCalleesAndTraits_callStack]
+  cases m.borrows with
+  | nil => rfl
+  | cons b bs =>
+    cases dst.projection with
+    | nil => rfl
+    | cons p ps => cases p <;> rfl
+
+theorem resumeExternalCall_withCalleesAndTraits (c₂ : CalleeEnv) (ti₂ : List TraitImplEntry)
+    (s : MachineState) (localsAfterArgs : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (unwind : UnwindAction) (ans : MirCallAns) :
+    resumeExternalCall s localsAfterArgs destination targetBb unwind
+        (MirCallAns.mapMem (Memory.withCalleesAndTraits c₂ ti₂) ans) =
+      MirExecState.mapMem (Memory.withCalleesAndTraits c₂ ti₂)
+        (resumeExternalCall s localsAfterArgs destination targetBb unwind ans) := by
+  cases ans with
+  | aborted => rfl
+  | panicked memAfter =>
+    exact applyUnwindAction_mem_withCalleesAndTraits c₂ ti₂ s localsAfterArgs memAfter unwind
+  | returned retVal memAfter =>
+    unfold resumeExternalCall
+    dsimp only [MirCallAns.mapMem, Memory.withCalleesAndTraits_borrows,
+      Memory.withCalleesAndTraits_activeProtectors, Memory.withCalleesAndTraits_callerLocals,
+      Memory.withCalleesAndTraits_callStack]
+    split
+    · rename_i restProj _
+      cases evalPlaceWrite localsAfterArgs memAfter.borrows destination retVal
+          memAfter.activeProtectors [] emptyLayoutTable memAfter.callStack with
+      | unsupported => rfl
+      | ok updatedLocals =>
+        dsimp only
+        cases derefWriteTreeUB localsAfterArgs memAfter.borrows destination <;> rfl
+      | ub =>
+        dsimp only
+        rw [foreignFrameDerefWrite_withCalleesAndTraits]
+        cases foreignFrameDerefWrite localsAfterArgs memAfter destination restProj retVal
+          [] emptyLayoutTable <;> rfl
+    · cases evalPlaceWrite localsAfterArgs memAfter.borrows destination retVal
+          memAfter.activeProtectors [] emptyLayoutTable memAfter.callStack with
+      | ub | unsupported => rfl
+      | ok updatedLocals =>
+        dsimp only
+        rw [invalidateDirectDestWriteBorrows_borrows_withCalleesAndTraits]
+        rfl
+
+theorem resumeExternalDivergingCall_withCalleesAndTraits (c₂ : CalleeEnv) (ti₂ : List TraitImplEntry)
+    (s : MachineState) (localsAfterArgs : List LocalSlot) (unwind : UnwindAction) (ans : MirCallAns) :
+    resumeExternalDivergingCall s localsAfterArgs unwind
+        (MirCallAns.mapMem (Memory.withCalleesAndTraits c₂ ti₂) ans) =
+      MirExecState.mapMem (Memory.withCalleesAndTraits c₂ ti₂)
+        (resumeExternalDivergingCall s localsAfterArgs unwind ans) := by
+  cases ans with
+  | returned _ _ => rfl
+  | panicked memAfter =>
+    exact applyUnwindAction_mem_withCalleesAndTraits c₂ ti₂ s localsAfterArgs memAfter unwind
+  | aborted => rfl
+
+theorem resumeExternalTailCall_withCalleesAndTraits (c₂ : CalleeEnv) (ti₂ : List TraitImplEntry)
+    (ans : MirCallAns) :
+    resumeExternalTailCall (MirCallAns.mapMem (Memory.withCalleesAndTraits c₂ ti₂) ans) =
+      MirExecState.mapMem (Memory.withCalleesAndTraits c₂ ti₂) (resumeExternalTailCall ans) := by
+  cases ans with
+  | aborted => rfl
+  | panicked memAfter =>
+    exact unwindFromCallStack_withCalleesAndTraits c₂ ti₂ memAfter.callStack memAfter
+  | returned retVal memAfter =>
+    unfold resumeExternalTailCall
+    dsimp only [MirCallAns.mapMem, Memory.withCalleesAndTraits_callStack]
+    cases memAfter.callStack with
+    | nil => rfl
+    | cons caller restStack =>
+      dsimp only
+      cases caller.isDiverging with
+      | true => rfl
+      | false =>
+        dsimp only
+        have h_wr := writeReturnDestination_withCalleesAndTraits c₂ ti₂ caller.frame.locals
+          { memAfter with
+            callStack := restStack
+            activeCallee := some caller.callerBody
+            activeProtectors := restoreCallerProtectors caller }
+          caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts
+        change (match writeReturnDestination caller.frame.locals
+            (Memory.withCalleesAndTraits c₂ ti₂
+              { memAfter with
+                callStack := restStack
+                activeCallee := some caller.callerBody
+                activeProtectors := restoreCallerProtectors caller })
+            caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts with
+          | .ok updatedCallerLocals mem' => _
+          | .ub => _
+          | .unsupported => _) = _
+        rw [h_wr]
+        cases writeReturnDestination caller.frame.locals
+          { memAfter with
+            callStack := restStack
+            activeCallee := some caller.callerBody
+            activeProtectors := restoreCallerProtectors caller }
+          caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts <;> rfl
+
+/-- When `typeArgs = []`, `lookupCallee` does not inspect `callerLayouts`. -/
+theorem lookupCallee_nil_indep_layouts (callees : List CapturedMir) (l₁ l₂ : LayoutTable)
+    (dp : DefPath) (extra : List TraitImplEntry) :
+    lookupCallee callees l₁ dp [] extra = lookupCallee callees l₂ dp [] extra := by
+  unfold lookupCallee resolveCalleeBodyAndArgs?
+  dsimp only
+  cases findCallee? callees dp with
+  | none => rfl
+  | some b =>
+    dsimp only
+    cases b.typeParamCount with
+    | zero => rfl
+    | succ _ => rfl
+
+/-- Monomorphizing a constant `.fnDef` operand with empty `typeArgs` preserves `extractCalleeTypeArgs = []`. -/
+theorem extractCalleeTypeArgs_instantiate_of_nil (tbl : LayoutTable) (subst : TypeSubst)
+    {func : Operand} {dp : DefPath}
+    (h_fn : extractFnDefPath? func = some dp)
+    (h_nil : (extractCalleeTypeArgs func).isEmpty = true) :
+    extractCalleeTypeArgs (Operand.instantiate tbl subst func) = [] := by
+  cases func with
+  | copy _ => cases h_fn
+  | move _ => cases h_fn
+  | constant c =>
+    rcases c with ⟨⟨kind, lidx⟩, val⟩
+    cases kind <;> cases h_fn
+    rename_i args
+    change args.isEmpty = true at h_nil
+    cases args with
+    | nil => rfl
+    | cons _ _ => nomatch h_nil
+
+/-- Decidable check that a call operand `func` in a body with layout table `layouts` either targets
+a path summarized in `extEnv` (external) OR resolves to a linked `CapturedMir` body via
+`lookupCallee c₁ _ dp _ ti₁` (internal/polymorphic/trait). On `root` (`isRoot = true`) arbitrary
+polymorphic/trait `typeArgs` are checked against `root.layouts`; on `coneBodies` (`isRoot = false`,
+which may undergo `CapturedMir.instantiate`) internal calls check `(extractCalleeTypeArgs func).isEmpty`
+so resolution is layout- and substitution-invariant. -/
+def callResolvesOrSummarizedAt (c₁ : CalleeEnv) (ti₁ : List TraitImplEntry)
+    (extEnv : ExternalSummaryEnv) (layouts : LayoutTable) (isRoot : Bool)
+    (func : Operand) : Bool :=
+  match extractFnDefPath? func with
+  | some dp =>
+    (findExternalSummary? extEnv dp).isSome ||
+      match isRoot with
+      | true => (lookupCallee c₁ layouts dp (extractCalleeTypeArgs func) ti₁).isSome
+      | false =>
+        (extractCalleeTypeArgs func).isEmpty &&
+          (lookupCallee c₁ emptyLayoutTable dp [] ti₁).isSome
+  | none => false
+
+def termCallsResolveOrSummarized (c₁ : CalleeEnv) (ti₁ : List TraitImplEntry)
+    (extEnv : ExternalSummaryEnv) (layouts : LayoutTable) (isRoot : Bool)
+    (term : Terminator) : Bool :=
+  match term.kind with
+  | .call func _ _ _ _ => callResolvesOrSummarizedAt c₁ ti₁ extEnv layouts isRoot func
+  | .tailCall func _ => callResolvesOrSummarizedAt c₁ ti₁ extEnv layouts isRoot func
+  | _ => true
+
+def bodyCallsResolveOrSummarized (c₁ : CalleeEnv) (ti₁ : List TraitImplEntry)
+    (extEnv : ExternalSummaryEnv) (isRoot : Bool) (b : CapturedMir) : Bool :=
+  b.basicBlocks.all (fun blk =>
+    termCallsResolveOrSummarized c₁ ti₁ extEnv b.layouts isRoot blk.terminator)
+
+/-- Decidable mixed-cone check: every call in `root` and in `coneBodies cone c₁` either resolves
+internally via `lookupCallee c₁ _ _ _ ti₁` or has an external summary in `extEnv` (100% compatible
+with `UntrustedAdmissible`, since internal bodies satisfy the `lookupCallee` branch and external
+targets satisfy the `findExternalSummary?` branch). -/
+def coneCallsResolveOrSummarized (c₁ : CalleeEnv) (ti₁ : List TraitImplEntry)
+    (extEnv : ExternalSummaryEnv) (cone : List DefPath) (root : CapturedMir) : Bool :=
+  bodyCallsResolveOrSummarized c₁ ti₁ extEnv true root &&
+    (coneBodies cone c₁).all (bodyCallsResolveOrSummarized c₁ ti₁ extEnv false)
+
+theorem callResolvesOrSummarizedAt_instantiate_false {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry}
+    {extEnv : ExternalSummaryEnv} {tbl : LayoutTable} (layouts' : LayoutTable) (subst : TypeSubst)
+    {func : Operand}
+    (h : callResolvesOrSummarizedAt c₁ ti₁ extEnv tbl false func = true) :
+    callResolvesOrSummarizedAt c₁ ti₁ extEnv layouts' false
+      (Operand.instantiate tbl subst func) = true := by
+  unfold callResolvesOrSummarizedAt at h ⊢
+  cases h_dp : extractFnDefPath? func with
+  | none => rw [h_dp] at h; nomatch h
+  | some dp =>
+    rw [h_dp] at h
+    rw [extractFnDefPath?_instantiate h_dp]
+    dsimp only at h ⊢
+    cases hs : (findExternalSummary? extEnv dp).isSome with
+    | true => rfl
+    | false =>
+      rw [hs, Bool.false_or, Bool.and_eq_true] at h
+      have h_nil := extractCalleeTypeArgs_instantiate_of_nil tbl subst h_dp h.1
+      rw [h_nil, h.2]
+      rfl
+
+theorem termCallsResolveOrSummarized_instantiate_false {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry}
+    {extEnv : ExternalSummaryEnv} {tbl : LayoutTable} (layouts' : LayoutTable) (subst : TypeSubst)
+    {term : Terminator}
+    (h : termCallsResolveOrSummarized c₁ ti₁ extEnv tbl false term = true) :
+    termCallsResolveOrSummarized c₁ ti₁ extEnv layouts' false
+      (Terminator.instantiate tbl subst term) = true := by
+  rcases term with ⟨kind, span⟩
+  cases kind <;> (try exact callResolvesOrSummarizedAt_instantiate_false layouts' subst h) <;> rfl
+
+private theorem basicBlockData_instantiateList_all_resolveOrSummarized
+    (c₁ : CalleeEnv) (ti₁ : List TraitImplEntry) (extEnv : ExternalSummaryEnv)
+    (tbl layouts' : LayoutTable) (subst : TypeSubst) :
+    ∀ (bs : List BasicBlockData),
+      bs.all (fun blk =>
+        termCallsResolveOrSummarized c₁ ti₁ extEnv tbl false blk.terminator) = true →
+      (BasicBlockData.instantiateList tbl subst bs).all (fun blk =>
+        termCallsResolveOrSummarized c₁ ti₁ extEnv layouts' false blk.terminator) = true
+  | [], _ => rfl
+  | blk :: rest, h => by
+    simp only [List.all_cons, Bool.and_eq_true] at h
+    simp only [BasicBlockData.instantiateList, BasicBlockData.instantiate, List.all_cons,
+      Bool.and_eq_true]
+    exact ⟨termCallsResolveOrSummarized_instantiate_false layouts' subst h.1,
+      basicBlockData_instantiateList_all_resolveOrSummarized c₁ ti₁ extEnv tbl layouts' subst rest h.2⟩
+
+theorem bodyCallsResolveOrSummarized_instantiate_false {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry}
+    {extEnv : ExternalSummaryEnv} {b : CapturedMir} (subst : TypeSubst)
+    (h : bodyCallsResolveOrSummarized c₁ ti₁ extEnv false b = true) :
+    bodyCallsResolveOrSummarized c₁ ti₁ extEnv false (b.instantiate subst) = true :=
+  basicBlockData_instantiateList_all_resolveOrSummarized c₁ ti₁ extEnv b.layouts
+    (b.instantiate subst).layouts subst b.basicBlocks h
+
+theorem callResolvesOrSummarizedAt_spec {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry}
+    {extEnv : ExternalSummaryEnv} {layouts : LayoutTable} {isRoot : Bool} {func : Operand}
+    (h : callResolvesOrSummarizedAt c₁ ti₁ extEnv layouts isRoot func = true) :
+    ∃ dp, extractFnDefPath? func = some dp ∧
+      ((findExternalSummary? extEnv dp).isSome = true ∨
+        (lookupCallee c₁ layouts dp (extractCalleeTypeArgs func) ti₁).isSome = true) := by
+  unfold callResolvesOrSummarizedAt at h
+  cases h_dp : extractFnDefPath? func with
+  | none => rw [h_dp] at h; nomatch h
+  | some dp =>
+    rw [h_dp] at h
+    refine ⟨dp, rfl, ?_⟩
+    cases isRoot with
+    | true =>
+      dsimp only at h
+      cases hs : (findExternalSummary? extEnv dp).isSome with
+      | true => exact Or.inl rfl
+      | false => rw [hs, Bool.false_or] at h; exact Or.inr h
+    | false =>
+      dsimp only at h
+      cases hs : (findExternalSummary? extEnv dp).isSome with
+      | true => exact Or.inl rfl
+      | false =>
+        rw [hs, Bool.false_or, Bool.and_eq_true] at h
+        have h_nil : extractCalleeTypeArgs func = [] := List.isEmpty_iff.mp h.1
+        rw [h_nil, lookupCallee_nil_indep_layouts c₁ layouts emptyLayoutTable dp ti₁]
+        exact Or.inr h.2
+
+/-- Every resolved call target of `func` either resolves to an internal callee in `(c₁, ti₁)` or is
+summarized in `extEnv`. -/
+def CallTargetResolvesOrSummarized (c₁ : CalleeEnv) (ti₁ : List TraitImplEntry)
+    (extEnv : ExternalSummaryEnv) (s : MachineState) (cur : CapturedMir)
+    (func : Operand) (argCount : Nat) : Prop :=
+  ∀ tgt l,
+    resolveCallTarget s func argCount (bodyLocalDeclsOf (some cur)) cur.layouts = .ok tgt l →
+    (findExternalSummary? extEnv tgt.defPath).isSome = true ∨
+      (lookupCallee c₁ cur.layouts tgt.defPath tgt.typeArgs ti₁).isSome = true
+
+def TermExtCallSummarized (c₁ : CalleeEnv) (ti₁ : List TraitImplEntry)
+    (extEnv : ExternalSummaryEnv) (s : MachineState) (cur : CapturedMir)
+    (term : Terminator) : Prop :=
+  match term.kind with
+  | .call func argOps _ _ _ =>
+    CallTargetResolvesOrSummarized c₁ ti₁ extEnv s cur func (length argOps)
+  | .tailCall func argOps =>
+    CallTargetResolvesOrSummarized c₁ ti₁ extEnv s cur func (length argOps)
+  | _ => True
+
+def StepExtCallSummarized (c₁ : CalleeEnv) (ti₁ : List TraitImplEntry)
+    (extEnv : ExternalSummaryEnv) (root : CapturedMir) (s : MachineState) : Prop :=
+  ∀ blk, get? (s.memory.activeCallee.getD root).basicBlocks s.frame.blockIdx = some blk →
+    TermExtCallSummarized c₁ ti₁ extEnv s (s.memory.activeCallee.getD root) blk.terminator
+
+theorem stepExtCallSummarized_of_closedInvPoly {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry} {extEnv : ExternalSummaryEnv} {s : MachineState}
+    (h_res_cone : coneCallsResolveOrSummarized c₁ ti₁ extEnv cone root = true)
+    (h_inv : ClosedInvPoly cone root c₁ ti₁ s) :
+    StepExtCallSummarized c₁ ti₁ extEnv root s := by
+  intro blk h_bb
+  rw [coneCallsResolveOrSummarized, Bool.and_eq_true] at h_res_cone
+  have h_body : ∃ isRoot, bodyCallsResolveOrSummarized c₁ ti₁ extEnv isRoot
+      (s.memory.activeCallee.getD root) = true := by
+    rcases h_inv.2.2.1 with h_eq | ⟨b₀, subst, hb₀, h_eq⟩
+    · refine ⟨true, ?_⟩
+      rw [h_eq]
+      exact h_res_cone.1
+    · refine ⟨false, ?_⟩
+      rw [h_eq]
+      exact bodyCallsResolveOrSummarized_instantiate_false subst
+        (List.all_eq_true.mp h_res_cone.2 b₀ hb₀)
+  obtain ⟨isRoot, h_b⟩ := h_body
+  have h_tc := List.all_eq_true.mp h_b blk (List.mem_of_getElem? h_bb)
+  revert h_tc
+  rcases blk.terminator with ⟨kind, span⟩
+  intro h_tc
+  cases kind with
+  | call func argOps _ _ _ =>
+    intro tgt l h_res
+    obtain ⟨dp, h_fn, h_or⟩ := callResolvesOrSummarizedAt_spec h_tc
+    have h_cd := extractCalleeDefPath?_of_extractFnDefPath? h_fn
+    unfold resolveCallTarget at h_res
+    rw [h_cd] at h_res
+    cases h_res
+    exact h_or
+  | tailCall func argOps =>
+    intro tgt l h_res
+    obtain ⟨dp, h_fn, h_or⟩ := callResolvesOrSummarizedAt_spec h_tc
+    have h_cd := extractCalleeDefPath?_of_extractFnDefPath? h_fn
+    unfold resolveCallTarget at h_res
+    rw [h_cd] at h_res
+    cases h_res
+    exact h_or
+  | _ => trivial
+
+private theorem extCallSummarized_of_lookup_none {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry} {s : MachineState} {cur : CapturedMir}
+    {func : Operand} {argCount : Nat} {tgt : ResolvedCallTarget} {l : List LocalSlot}
+    (h_inv : ClosedInvPoly cone root c₁ ti₁ s)
+    (h_sum : ∀ extEnv, coneCallsResolveOrSummarized c₁ ti₁ extEnv cone root = true →
+      CallTargetResolvesOrSummarized c₁ ti₁ extEnv s cur func argCount)
+    (h_res : resolveCallTarget s func argCount (bodyLocalDeclsOf (some cur)) cur.layouts = .ok tgt l)
+    (h_lk : lookupCallee s.memory.callees cur.layouts tgt.defPath tgt.typeArgs s.memory.traitImpls = none) :
+    ∀ extEnv, coneCallsResolveOrSummarized c₁ ti₁ extEnv cone root = true →
+      (findExternalSummary? extEnv tgt.defPath).isSome = true := by
+  intro extEnv h_rc
+  rcases h_sum extEnv h_rc tgt l h_res with hs | hlk
+  · exact hs
+  · rw [h_inv.1, h_inv.2.1] at h_lk
+    rw [h_lk] at hlk
+    nomatch hlk
+
+/-- Joint external-call safety, commutation, and mixed-cone summary predicate on a `MirStepNode`: if
+the step emits an external call `.vis (.inr (.inr (.call req))) k`, then:
+1. `req.defPath ∈ cone`,
 2. for every code-frame-preserving answer `ans` (`AnsPreservesCodeFrame req.memory ans`), every
-   `.running s'` continuation state preserves `ClosedInvPoly cone root c₁ ti₁ s'`! -/
+   `.running s'` continuation state preserves `ClosedInvPoly cone root c₁ ti₁ s'`,
+3. `req.memory.callees = c₁`, `req.memory.traitImpls = ti₁`, and `k` commutes with
+   `Memory.withCalleesAndTraits c₂ ti₂`, AND
+4. under `coneCallsResolveOrSummarized c₁ ti₁ extEnv cone root = true`, `req.defPath` is summarized
+   in `extEnv`! -/
 def NodeExtCallSafe (cone : List DefPath) (root : CapturedMir)
     (c₁ : CalleeEnv) (ti₁ : List TraitImplEntry) : MirStepNode → Prop
   | .vis (.inr (.inr (.call req))) k =>
     req.defPath ∈ cone ∧
-    ∀ ans s', AnsPreservesCodeFrame req.memory ans → k ans = .running s' →
-      ClosedInvPoly cone root c₁ ti₁ s'
+    (∀ ans s', AnsPreservesCodeFrame req.memory ans → k ans = .running s' →
+      ClosedInvPoly cone root c₁ ti₁ s') ∧
+    req.memory.callees = c₁ ∧
+    req.memory.traitImpls = ti₁ ∧
+    (∀ c₂ ti₂ ans,
+      k (MirCallAns.mapMem (Memory.withCalleesAndTraits c₂ ti₂) ans) =
+        MirExecState.mapMem (Memory.withCalleesAndTraits c₂ ti₂) (k ans)) ∧
+    ∀ extEnv, coneCallsResolveOrSummarized c₁ ti₁ extEnv cone root = true →
+      (findExternalSummary? extEnv req.defPath).isSome = true
   | _ => True
 
 /-- Any `MirStepNode` that emits no external calls (`NodeExtCallInCone [] n`) trivially satisfies
@@ -6261,15 +6709,18 @@ theorem nodeExtCallSafe_of_empty_cone {cone : List DefPath} {root : CapturedMir}
     · trivial
     · cases req with | call req => nomatch h
 
-/-- **Every external call emitted by `evalTerminator` from a `ClosedInvPoly` state targets `cone`
-and resumes into a `ClosedInvPoly` state on any `AnsPreservesCodeFrame` answer
+/-- **Every external call emitted by `evalTerminator` from a `ClosedInvPoly` state targets `cone`,
+resumes into a `ClosedInvPoly` state on any `AnsPreservesCodeFrame` answer, commutes with
+`Memory.withCalleesAndTraits`, and is summarized under `coneCallsResolveOrSummarized`
 (`evalTerminator_extCallSafe`)**, covering normal calls (`resumeExternalCall`), diverging calls
 (`resumeExternalDivergingCall`), and tail calls (`resumeExternalTailCall`). -/
 theorem evalTerminator_extCallSafe {cone : List DefPath} {root : CapturedMir}
     {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry} {s : MachineState}
     {term : Terminator} {cur : CapturedMir}
     (h_inv : ClosedInvPoly cone root c₁ ti₁ s)
-    (h_safe : TermConeSafeTrait cone s cur term) :
+    (h_safe : TermConeSafeTrait cone s cur term)
+    (h_sum : ∀ extEnv, coneCallsResolveOrSummarized c₁ ti₁ extEnv cone root = true →
+      TermExtCallSummarized c₁ ti₁ extEnv s cur term) :
     NodeExtCallSafe cone root c₁ ti₁ (evalTerminator s term (some cur)) := by
   rcases term with ⟨kind, span⟩
   cases kind with
@@ -6300,12 +6751,13 @@ theorem evalTerminator_extCallSafe {cone : List DefPath} {root : CapturedMir}
         | ub | unsupported => trivial
         | ok argVals locals' =>
           dsimp only
-          cases lookupCallee s.memory.callees cur.layouts tgt.defPath tgt.typeArgs
+          cases h_lk : lookupCallee s.memory.callees cur.layouts tgt.defPath tgt.typeArgs
               s.memory.traitImpls with
           | some calleeBody =>
             dsimp only
             cases checkCalleeTargetCompatible tgt calleeBody (length argVals) <;> trivial
           | none =>
+            have h_es := extCallSummarized_of_lookup_none h_inv h_sum h_res h_lk
             dsimp only
             cases isDirectExactDivTarget tgt with
             | true =>
@@ -6316,14 +6768,24 @@ theorem evalTerminator_extCallSafe {cone : List DefPath} {root : CapturedMir}
             | false =>
               cases tgt.isIndirect with
               | true =>
-                exact ⟨h_dp, fun ans s' hans hres =>
-                  closedInvPoly_resumeExternalCall h_inv hans hres⟩
+                exact ⟨h_dp,
+                  fun ans s' hans hres => closedInvPoly_resumeExternalCall h_inv hans hres,
+                  h_inv.1, h_inv.2.1,
+                  fun c₂ ti₂ ans =>
+                    resumeExternalCall_withCalleesAndTraits c₂ ti₂ s locals' destination targetBb
+                      unwind ans,
+                  h_es⟩
               | false =>
                 unfold evalDirectRustIntrinsic?
                 cases hk : classifyRustIntrinsic? tgt.defPath with
                 | none =>
-                  exact ⟨h_dp, fun ans s' hans hres =>
-                    closedInvPoly_resumeExternalCall h_inv hans hres⟩
+                  exact ⟨h_dp,
+                    fun ans s' hans hres => closedInvPoly_resumeExternalCall h_inv hans hres,
+                    h_inv.1, h_inv.2.1,
+                    fun c₂ ti₂ ans =>
+                      resumeExternalCall_withCalleesAndTraits c₂ ti₂ s locals' destination targetBb
+                        unwind ans,
+                    h_es⟩
                 | some k =>
                   rw [hk] at h_cl
                   cases k with
@@ -6344,11 +6806,23 @@ theorem evalTerminator_extCallSafe {cone : List DefPath} {root : CapturedMir}
         | ub | unsupported => trivial
         | ok argVals locals' =>
           dsimp only
-          repeat' (first
-            | split
-            | trivial
-            | exact ⟨h_dp, fun ans s' hans hres =>
-                closedInvPoly_resumeExternalDivergingCall h_inv hans hres⟩)
+          cases h_lk : lookupCallee s.memory.callees cur.layouts tgt.defPath tgt.typeArgs
+              s.memory.traitImpls with
+          | some calleeBody =>
+            dsimp only
+            cases checkCalleeTargetCompatible tgt calleeBody (length argVals) <;> trivial
+          | none =>
+            have h_es := extCallSummarized_of_lookup_none h_inv h_sum h_res h_lk
+            dsimp only
+            repeat' (first
+              | split
+              | trivial
+              | exact ⟨h_dp,
+                  fun ans s' hans hres => closedInvPoly_resumeExternalDivergingCall h_inv hans hres,
+                  h_inv.1, h_inv.2.1,
+                  fun c₂ ti₂ ans =>
+                    resumeExternalDivergingCall_withCalleesAndTraits c₂ ti₂ s locals' unwind ans,
+                  h_es⟩)
   | tailCall func argOps =>
     have hq : CallTargetInConeTrait cone s cur func (length argOps) := h_safe
     unfold evalTerminator evalTailCallTerminator; dsimp only
@@ -6358,16 +6832,34 @@ theorem evalTerminator_extCallSafe {cone : List DefPath} {root : CapturedMir}
     | ok tgt localsAfterFunc =>
       obtain ⟨h_dp, _⟩ := hq tgt localsAfterFunc h_res
       dsimp only
-      repeat' (first
-        | split
-        | trivial
-        | exact ⟨h_dp, fun ans s' hans hres =>
-            closedInvPoly_resumeExternalTailCall h_inv
-              ((ansPreservesCodeFrame_withBorrows s.memory _ ans).mp hans) hres⟩)
+      cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
+          s.memory.callerLocals (callStack := s.memory.callStack) with
+      | ub | unsupported => trivial
+      | ok argVals locals' =>
+        dsimp only
+        cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+            (length s.memory.callStack) (length s.frame.locals) with
+        | true => trivial
+        | false =>
+          dsimp only
+          cases h_lk : lookupCallee s.memory.callees cur.layouts tgt.defPath tgt.typeArgs
+              s.memory.traitImpls with
+          | some calleeBody =>
+            dsimp only
+            cases checkCalleeTargetCompatible tgt calleeBody (length argVals) <;> trivial
+          | none =>
+            exact ⟨h_dp,
+              fun ans s' hans hres =>
+                closedInvPoly_resumeExternalTailCall h_inv
+                  ((ansPreservesCodeFrame_withBorrows s.memory _ ans).mp hans) hres,
+              h_inv.1, h_inv.2.1,
+              fun c₂ ti₂ ans => resumeExternalTailCall_withCalleesAndTraits c₂ ti₂ ans,
+              extCallSummarized_of_lookup_none h_inv h_sum h_res h_lk⟩
   | _ => trivial
 
-/-- **Every external call emitted by `stepMirFn` from a `ClosedInvPoly` state targets `cone` AND
-resumes into a `ClosedInvPoly` state on any `AnsPreservesCodeFrame` answer
+/-- **Every external call emitted by `stepMirFn` from a `ClosedInvPoly` state targets `cone`,
+resumes into a `ClosedInvPoly` state on any `AnsPreservesCodeFrame` answer, commutes with
+`Memory.withCalleesAndTraits`, and is summarized under `coneCallsResolveOrSummarized`
 (`stepMirFn_extCallSafe`)**. -/
 theorem stepMirFn_extCallSafe {cone : List DefPath} {root : CapturedMir}
     {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry} {s : MachineState}
@@ -6396,6 +6888,7 @@ theorem stepMirFn_extCallSafe {cone : List DefPath} {root : CapturedMir}
         dsimp only
         split
         · exact evalTerminator_extCallSafe h_inv h_term
+            (fun extEnv h_rc => stepExtCallSummarized_of_closedInvPoly h_rc h_inv blk h_bb)
         · trivial
 
 /-- Unfiltered `evalNodeWPExt`: consults `findExternalSummary? extEnv req.defPath` directly without
@@ -6503,7 +6996,7 @@ theorem wpMirExecExt_cone_iff_unfiltered_of_summarized {cone : List DefPath} {ro
         exact wpMirExecExt_cone_iff_unfiltered_of_summarized contracts extEnv post
           h_root h_cone h_impl h_sum h_cf fuel (k PUnit.unit) h_st'
       · cases req with | call req => ?_
-        rintro _ ⟨h_in, h_k_safe⟩
+        rintro _ ⟨h_in, h_k_safe, _⟩
         show (match coneSummary? cone extEnv req.defPath with
           | some s => ∀ ans, contracts s.summaryTag req ans →
               wpMirExecExt contracts cone extEnv fuel root (k ans) post
@@ -6632,7 +7125,7 @@ theorem wpMirExecExtCF_cone_iff_unfiltered {cone : List DefPath} {root : Capture
         exact wpMirExecExtCF_cone_iff_unfiltered contracts extEnv post
           h_root h_cone h_impl fuel (k PUnit.unit) h_st'
       · cases req with | call req => ?_
-        rintro _ ⟨h_in, h_k_safe⟩
+        rintro _ ⟨h_in, h_k_safe, _⟩
         show (match coneSummary? cone extEnv req.defPath with
           | some s => ∀ ans, AnsPreservesCodeFrame req.memory ans → contracts s.summaryTag req ans →
               wpMirExecExtCF contracts cone extEnv fuel root (k ans) post
@@ -6707,9 +7200,10 @@ theorem wpMirExecExt_imp_wpMirExecExtCF (contracts : ExternalContractInterp)
 /-- **Cone filtering in the code-frame WP at a certified entry state
 (`wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert`)**: `wpMirExecExtCF_cone_iff_unfiltered`
 instantiated at the entry state of a `BatchedVcConeNarrowCert` (the certificate supplies the cone
-closure). This is about the *full* callee table only. No narrowing theorem for `wpMirExecExtCF` is
-proved: in a narrowed run, `AnsPreservesCodeFrame` refers to the narrowed callee table, so the
-narrowed and full code-frame WPs quantify over different answers. -/
+closure). For narrowing of `wpMirExecExtCF` across `(narrowCallees, extra₂, narrowExt)` and
+`(fullCallees, extra₁, fullExt)`, see `wpMirExecExtCF_trait_cone_narrow`,
+`vcMirWithCalleesCF_narrow_of_batchedCert`, and
+`vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert` below. -/
 theorem wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert {cone : List DefPath}
     {rootBody : CapturedMir} {fullCallees narrowCallees : List CapturedMir}
     {extra₁ extra₂ : List TraitImplEntry} {fullExt narrowExt : ExternalSummaryEnv}
@@ -6726,6 +7220,326 @@ theorem wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert {cone : List Def
   wpMirExecExtCF_cone_iff_unfiltered contracts fullExt post h_cert.rootInCone
     h_cert.coneBodiesInCone h_cert.traitConeAgree.2.2 fuel (.running s)
     (closedInvPoly_entry h_callees h_traits h_ac h_cs)
+
+/-! #### Mixed-Cone Standard-WP Losslessness (`wpMirExecExt_cone_iff_unfiltered_of_mixed_cone`) & Code-Frame WP Narrowing (`wpMirExecExtCF_trait_cone_narrow`) -/
+
+/-- **Standard-WP Whole-Execution Lossless Cone Filtering on Mixed Internal/Trait/External Cones
+(`wpMirExecExt_cone_iff_unfiltered_of_mixed_cone`)**:
+Unlike `wpMirExecExt_cone_iff_unfiltered_of_summarized` (whose `h_sum : ∀ dp ∈ cone, ...` forces an
+all-external cone under `UntrustedAdmissible`), `coneCallsResolveOrSummarized` checks that each call
+in `root` and `coneBodies cone c₁` either resolves internally via `lookupCallee c₁ _ _ _ ti₁` (so
+`evalTerminator` never emits a `MirCallE` for it) OR has an external summary in `extEnv`. Therefore
+standard `wpMirExecExt` is equivalent (`↔`) to unfiltered `wpMirExecExtUnfiltered` across **all**
+`fuel` steps on mixed internal/polymorphic/trait/external call cones while remaining 100% compatible
+with `UntrustedAdmissible`! -/
+theorem wpMirExecExt_cone_iff_unfiltered_of_mixed_cone {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry} (contracts : ExternalContractInterp)
+    (extEnv : ExternalSummaryEnv) (post : MirOutcome → Prop)
+    (h_root : bodyCallsInConePoly cone root = true)
+    (h_cone : (coneBodies cone c₁).all (bodyCallsInConePoly cone) = true)
+    (h_impl : ∀ dp ∈ cone, ∀ e ∈ ti₁ ++ flatMapTraitImpls c₁,
+      stringEq e.traitRef.defPath dp = true → e.implPath ∈ cone)
+    (h_res_cone : coneCallsResolveOrSummarized c₁ ti₁ extEnv cone root = true)
+    (h_cf : ∀ tag req ans, contracts tag req ans → AnsPreservesCodeFrame req.memory ans) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      StateClosedInvPoly cone root c₁ ti₁ st →
+      (wpMirExecExt contracts cone extEnv fuel root st post ↔
+        wpMirExecExtUnfiltered contracts extEnv fuel root st post)
+  | 0, _, _ => Iff.rfl
+  | _ + 1, .halted _, _ => Iff.rfl
+  | _ + 1, .faulted _, _ => Iff.rfl
+  | fuel + 1, .running s, h_inv => by
+    have h_succ := nodeSuccs_stepMirFnTrait h_root h_cone h_impl h_inv
+    have h_ext := stepMirFn_extCallSafe h_root h_cone h_inv
+    show evalNodeWPExt contracts cone extEnv _ post (stepMirFn root s) ↔
+      evalNodeWPExtUnfiltered contracts extEnv _ post (stepMirFn root s)
+    revert h_succ h_ext
+    cases stepMirFn root s with
+    | ret _ => intro _ _; exact Iff.rfl
+    | tau st' =>
+      intro h_succ _
+      have h_st' : StateClosedInvPoly cone root c₁ ti₁ st' := by
+        cases st' with
+        | running s' => exact h_succ
+        | _ => trivial
+      exact wpMirExecExt_cone_iff_unfiltered_of_mixed_cone contracts extEnv post
+        h_root h_cone h_impl h_res_cone h_cf fuel st' h_st'
+    | vis e k =>
+      rcases e with fk | obs | ⟨req⟩
+      · intro _ _; exact Iff.rfl
+      · intro h_succ _
+        have h_st' : StateClosedInvPoly cone root c₁ ti₁ (k PUnit.unit) := by
+          revert h_succ
+          show (match k PUnit.unit with
+            | .running s' => ClosedInvPoly cone root c₁ ti₁ s'
+            | _ => True) → StateClosedInvPoly cone root c₁ ti₁ (k PUnit.unit)
+          cases k PUnit.unit <;> exact id
+        exact wpMirExecExt_cone_iff_unfiltered_of_mixed_cone contracts extEnv post
+          h_root h_cone h_impl h_res_cone h_cf fuel (k PUnit.unit) h_st'
+      · cases req with | call req => ?_
+        rintro _ ⟨h_in, h_k_safe, _, _, _, h_sum⟩
+        have h_some := h_sum extEnv h_res_cone
+        show (match coneSummary? cone extEnv req.defPath with
+          | some s => ∀ ans, contracts s.summaryTag req ans →
+              wpMirExecExt contracts cone extEnv fuel root (k ans) post
+          | none => ∀ ans, wpMirExecExt contracts cone extEnv fuel root (k ans) post) ↔
+          (match findExternalSummary? extEnv req.defPath with
+          | some s => ∀ ans, contracts s.summaryTag req ans →
+              wpMirExecExtUnfiltered contracts extEnv fuel root (k ans) post
+          | none => ∀ ans, wpMirExecExtUnfiltered contracts extEnv fuel root (k ans) post)
+        have h_eq : coneSummary? cone extEnv req.defPath = findExternalSummary? extEnv req.defPath := by
+          unfold coneSummary?
+          rw [inCone_iff.mpr h_in]
+          rfl
+        rw [h_eq]
+        cases h_find : findExternalSummary? extEnv req.defPath with
+        | some sm =>
+          refine forall_congr' (fun ans => imp_congr_right (fun hc => ?_))
+          have h_st' : StateClosedInvPoly cone root c₁ ti₁ (k ans) := by
+            cases hk : k ans with
+            | running s' => exact h_k_safe ans s' (h_cf sm.summaryTag req ans hc) hk
+            | _ => trivial
+          exact wpMirExecExt_cone_iff_unfiltered_of_mixed_cone contracts extEnv post
+            h_root h_cone h_impl h_res_cone h_cf fuel (k ans) h_st'
+        | none =>
+          rw [h_find] at h_some
+          nomatch h_some
+
+/-- **Trait-Aware Narrowing of the Code-Frame WP (`wpMirExecExtCF_trait_cone_narrow`)**:
+`ans₁ ↦ MirCallAns.mapMem (Memory.withCalleesAndTraits c₂ ti₂) ans₁` and
+`ans₂ ↦ MirCallAns.mapMem (Memory.withCalleesAndTraits c₁ ti₁) ans₂` form an exact bijection
+between `{ ans₁ // AnsPreservesCodeFrame req.memory ans₁ }` and
+`{ ans₂ // AnsPreservesCodeFrame (Memory.withCalleesAndTraits c₂ ti₂ req.memory) ans₂ }`, and all
+three external-call continuations (`resumeExternalCall`, `resumeExternalDivergingCall`,
+`resumeExternalTailCall`) commute with `Memory.withCalleesAndTraits c₂ ti₂`
+(`stepMirFn_extCallSafe`). Thus `wpMirExecExtCF` is preserved under simultaneous narrowing of
+`callees`, `traitImpls`, and `extEnv` across arbitrarily many interleaved internal, trait, and
+external calls! -/
+theorem wpMirExecExtCF_trait_cone_narrow {cone : List DefPath} {root : CapturedMir}
+    {c₁ c₂ : CalleeEnv} {ti₁ ti₂ : List TraitImplEntry} (contracts : ExternalContractInterp)
+    {ext₁ ext₂ : ExternalSummaryEnv} (post : MirOutcome → Prop)
+    (h_root : bodyCallsInConePoly cone root = true)
+    (h_cone : (coneBodies cone c₁).all (bodyCallsInConePoly cone) = true)
+    (h_agree : TraitConeAgreeOn cone c₁ c₂ ti₁ ti₂)
+    (h_post : ∀ out,
+      post (MirOutcome.mapMem (Memory.withCalleesAndTraits c₂ ti₂) out) ↔ post out)
+    (h_contract : ∀ tag req ans,
+      AnsPreservesCodeFrame req.memory ans →
+      (contracts tag { req with memory := Memory.withCalleesAndTraits c₂ ti₂ req.memory }
+          (MirCallAns.mapMem (Memory.withCalleesAndTraits c₂ ti₂) ans) ↔
+        contracts tag req ans))
+    (h_ext : ∀ dp, coneSummary? cone ext₂ dp = coneSummary? cone ext₁ dp) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      StateClosedInvPoly cone root c₁ ti₁ st →
+      (wpMirExecExtCF contracts cone ext₂ fuel root
+          (MirExecState.mapMem (Memory.withCalleesAndTraits c₂ ti₂) st) post ↔
+        wpMirExecExtCF contracts cone ext₁ fuel root st post)
+  | 0, _, _ => Iff.rfl
+  | _ + 1, .halted out, _ => h_post out
+  | _ + 1, .faulted _, _ => Iff.rfl
+  | fuel + 1, .running s, h_inv => by
+    have h_ag : TraitConeAgreeOn cone s.memory.callees c₂ s.memory.traitImpls ti₂ := by
+      rw [h_inv.1, h_inv.2.1]; exact h_agree
+    have h_safe := stepConeSafeTrait_of_closedInvPoly h_root h_cone h_inv
+    have h_step := stepMirFn_withCalleesAndTraits cone root s c₂ ti₂ h_ag h_safe
+    have h_succ := nodeSuccs_stepMirFnTrait h_root h_cone h_agree.2.2 h_inv
+    have h_ext_safe := stepMirFn_extCallSafe h_root h_cone h_inv
+    show evalNodeWPExtCF contracts cone ext₂ _ post
+        (stepMirFn root (MachineState.mapMem (Memory.withCalleesAndTraits c₂ ti₂) s)) ↔
+      evalNodeWPExtCF contracts cone ext₁ _ post (stepMirFn root s)
+    rw [h_step]
+    revert h_succ h_ext_safe
+    cases stepMirFn root s with
+    | ret out => intro _ _; exact h_post out
+    | tau st' =>
+      intro h_succ _
+      have h_st' : StateClosedInvPoly cone root c₁ ti₁ st' := by
+        cases st' with
+        | running s' => exact h_succ
+        | _ => trivial
+      exact wpMirExecExtCF_trait_cone_narrow contracts post h_root h_cone h_agree
+        h_post h_contract h_ext fuel st' h_st'
+    | vis e k =>
+      rcases e with fk | obs | ⟨req⟩
+      · intro _ _; exact Iff.rfl
+      · intro h_succ _
+        have h_st' : StateClosedInvPoly cone root c₁ ti₁ (k PUnit.unit) := by
+          revert h_succ
+          show (match k PUnit.unit with
+            | .running s' => ClosedInvPoly cone root c₁ ti₁ s'
+            | _ => True) → StateClosedInvPoly cone root c₁ ti₁ (k PUnit.unit)
+          cases k PUnit.unit <;> exact id
+        exact wpMirExecExtCF_trait_cone_narrow contracts post h_root h_cone h_agree
+          h_post h_contract h_ext fuel (k PUnit.unit) h_st'
+      · cases req with | call req => ?_
+        rintro _ ⟨_, h_k_safe, hc_req, hti_req, h_k_comm, _⟩
+        have h_req_id : Memory.withCalleesAndTraits c₁ ti₁ req.memory = req.memory := by
+          cases hm : req.memory
+          dsimp only [Memory.withCalleesAndTraits] at hc_req hti_req ⊢
+          rw [hm] at hc_req hti_req
+          dsimp only at hc_req hti_req
+          subst hc_req hti_req
+          rfl
+        have h_ih : ∀ ans₁, AnsPreservesCodeFrame req.memory ans₁ →
+            (wpMirExecExtCF contracts cone ext₂ fuel root
+                (k (MirCallAns.mapMem (Memory.withCalleesAndTraits c₂ ti₂) ans₁)) post ↔
+              wpMirExecExtCF contracts cone ext₁ fuel root (k ans₁) post) := by
+          intro ans₁ hans₁
+          rw [h_k_comm c₂ ti₂ ans₁]
+          have h_st' : StateClosedInvPoly cone root c₁ ti₁ (k ans₁) := by
+            cases hk : k ans₁ with
+            | running s' => exact h_k_safe ans₁ s' hans₁ hk
+            | _ => trivial
+          exact wpMirExecExtCF_trait_cone_narrow contracts post h_root h_cone h_agree
+            h_post h_contract h_ext fuel (k ans₁) h_st'
+        show (match coneSummary? cone ext₂ req.defPath with
+          | some sm => ∀ ans₂, AnsPreservesCodeFrame (Memory.withCalleesAndTraits c₂ ti₂ req.memory) ans₂ →
+              contracts sm.summaryTag { req with memory := Memory.withCalleesAndTraits c₂ ti₂ req.memory } ans₂ →
+              wpMirExecExtCF contracts cone ext₂ fuel root (k ans₂) post
+          | none => ∀ ans₂, AnsPreservesCodeFrame (Memory.withCalleesAndTraits c₂ ti₂ req.memory) ans₂ →
+              wpMirExecExtCF contracts cone ext₂ fuel root (k ans₂) post) ↔
+          (match coneSummary? cone ext₁ req.defPath with
+          | some sm => ∀ ans₁, AnsPreservesCodeFrame req.memory ans₁ →
+              contracts sm.summaryTag req ans₁ →
+              wpMirExecExtCF contracts cone ext₁ fuel root (k ans₁) post
+          | none => ∀ ans₁, AnsPreservesCodeFrame req.memory ans₁ →
+              wpMirExecExtCF contracts cone ext₁ fuel root (k ans₁) post)
+        rw [h_ext req.defPath]
+        cases coneSummary? cone ext₁ req.defPath with
+        | some sm =>
+          constructor
+          · intro h_nar ans₁ hans₁ hc₁
+            exact (h_ih ans₁ hans₁).mp (h_nar _
+              (ansPreservesCodeFrame_mapMem_withCalleesAndTraits c₂ ti₂ req.memory ans₁ hans₁)
+              ((h_contract sm.summaryTag req ans₁ hans₁).mpr hc₁))
+          · intro h_full ans₂ hans₂ hc₂
+            let ans₁ := MirCallAns.mapMem (Memory.withCalleesAndTraits c₁ ti₁) ans₂
+            have hans₁ : AnsPreservesCodeFrame req.memory ans₁ := by
+              have h₀ := ansPreservesCodeFrame_mapMem_withCalleesAndTraits c₁ ti₁
+                (Memory.withCalleesAndTraits c₂ ti₂ req.memory) ans₂ hans₂
+              have h_comp : Memory.withCalleesAndTraits c₁ ti₁
+                  (Memory.withCalleesAndTraits c₂ ti₂ req.memory) = req.memory :=
+                h_req_id
+              rw [h_comp] at h₀
+              exact h₀
+            have h_can : MirCallAns.mapMem (Memory.withCalleesAndTraits c₂ ti₂) ans₁ = ans₂ :=
+              mirCallAns_mapMem_withCalleesAndTraits_cancel hans₂
+            rw [← h_can] at hc₂ ⊢
+            exact (h_ih ans₁ hans₁).mpr
+              (h_full ans₁ hans₁ ((h_contract sm.summaryTag req ans₁ hans₁).mp hc₂))
+        | none =>
+          constructor
+          · intro h_nar ans₁ hans₁
+            exact (h_ih ans₁ hans₁).mp (h_nar _
+              (ansPreservesCodeFrame_mapMem_withCalleesAndTraits c₂ ti₂ req.memory ans₁ hans₁))
+          · intro h_full ans₂ hans₂
+            let ans₁ := MirCallAns.mapMem (Memory.withCalleesAndTraits c₁ ti₁) ans₂
+            have hans₁ : AnsPreservesCodeFrame req.memory ans₁ := by
+              have h₀ := ansPreservesCodeFrame_mapMem_withCalleesAndTraits c₁ ti₁
+                (Memory.withCalleesAndTraits c₂ ti₂ req.memory) ans₂ hans₂
+              have h_comp : Memory.withCalleesAndTraits c₁ ti₁
+                  (Memory.withCalleesAndTraits c₂ ti₂ req.memory) = req.memory :=
+                h_req_id
+              rw [h_comp] at h₀
+              exact h₀
+            have h_can : MirCallAns.mapMem (Memory.withCalleesAndTraits c₂ ti₂) ans₁ = ans₂ :=
+              mirCallAns_mapMem_withCalleesAndTraits_cancel hans₂
+            rw [← h_can]
+            exact (h_ih ans₁ hans₁).mpr (h_full ans₁ hans₁)
+
+/-- Code-frame-preserving verification condition (`vcMirWithCalleesCF`): `wpMirExecExtCF` of
+`rootBody` from `s` with callee table `callees`, trait impls `traitImpls`, and external summaries
+`extEnv` (trusted on `cone`). -/
+def vcMirWithCalleesCF (contracts : ExternalContractInterp) (fuel : Nat) (rootBody : CapturedMir)
+    (s : MachineState) (callees : List CapturedMir) (traitImpls : List TraitImplEntry)
+    (extEnv : ExternalSummaryEnv) (cone : List DefPath) (post : MirOutcome → Prop) : Prop :=
+  wpMirExecExtCF contracts cone extEnv fuel rootBody
+    (.running (MachineState.mapMem (Memory.withCalleesAndTraits callees traitImpls) s)) post
+
+/-- **Combined Code-Frame VC Narrowing Theorem (`vcMirWithCalleesCF_narrow_of_batchedCert`)**:
+a `BatchedVcConeNarrowCert` narrows `Memory.callees`, `Memory.traitImpls`, and `extEnv` inside
+`vcMirWithCalleesCF`. -/
+theorem vcMirWithCalleesCF_narrow_of_batchedCert {cone : List DefPath} {rootBody : CapturedMir}
+    {fullCallees narrowCallees : List CapturedMir} {extra₁ extra₂ : List TraitImplEntry}
+    {fullExt narrowExt : ExternalSummaryEnv}
+    (h_cert : BatchedVcConeNarrowCert cone rootBody fullCallees narrowCallees
+      extra₁ extra₂ fullExt narrowExt)
+    (contracts : ExternalContractInterp) (fuel : Nat) (s : MachineState)
+    (h_callees : s.memory.callees = fullCallees)
+    (h_traits : s.memory.traitImpls = extra₁)
+    (h_ac : s.memory.activeCallee = none)
+    (h_cs : s.memory.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out,
+      post (MirOutcome.mapMem (Memory.withCalleesAndTraits narrowCallees extra₂) out) ↔ post out)
+    (h_contract : ∀ tag req ans,
+      AnsPreservesCodeFrame req.memory ans →
+      (contracts tag { req with memory := Memory.withCalleesAndTraits narrowCallees extra₂ req.memory }
+          (MirCallAns.mapMem (Memory.withCalleesAndTraits narrowCallees extra₂) ans) ↔
+        contracts tag req ans)) :
+    vcMirWithCalleesCF contracts fuel rootBody s narrowCallees extra₂ narrowExt cone post ↔
+      vcMirWithCalleesCF contracts fuel rootBody s fullCallees extra₁ fullExt cone post := by
+  have h_self : MachineState.mapMem (Memory.withCalleesAndTraits fullCallees extra₁) s = s := by
+    cases s with
+    | mk frame mem =>
+      dsimp only [MachineState.mapMem, Memory.withCalleesAndTraits] at h_callees h_traits ⊢
+      cases mem
+      dsimp only at h_callees h_traits
+      subst h_callees h_traits
+      rfl
+  have h_ext : ∀ dp, coneSummary? cone narrowExt dp = coneSummary? cone fullExt dp := by
+    intro dp
+    unfold coneSummary?
+    by_cases hin : inCone cone dp = true
+    · simp only [hin, ↓reduceIte]
+      exact (h_cert.extAgree dp (inCone_iff.mp hin)).symm
+    · simp only [hin, Bool.false_eq_true, ↓reduceIte]
+  unfold vcMirWithCalleesCF
+  rw [h_self]
+  exact wpMirExecExtCF_trait_cone_narrow contracts post h_cert.rootInCone
+    h_cert.coneBodiesInCone h_cert.toTraitConeAgreeOn h_post h_contract h_ext fuel (.running s)
+    (closedInvPoly_entry h_callees h_traits h_ac h_cs)
+
+/-- **End-to-End Narrowed Cone-Filtered $\leftrightarrow$ Full Unfiltered Code-Frame VC Theorem
+(`vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert`)**:
+Combines `vcMirWithCalleesCF_narrow_of_batchedCert` and
+`wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert`: proving the cone-filtered code-frame VC on
+the *narrowed* `(narrowCallees, extra₂, narrowExt)` environment is logically equivalent (`↔`) to the
+*unfiltered* code-frame WP on the *full* `(fullCallees, extra₁, fullExt)` environment! -/
+theorem vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert {cone : List DefPath}
+    {rootBody : CapturedMir} {fullCallees narrowCallees : List CapturedMir}
+    {extra₁ extra₂ : List TraitImplEntry} {fullExt narrowExt : ExternalSummaryEnv}
+    (h_cert : BatchedVcConeNarrowCert cone rootBody fullCallees narrowCallees
+      extra₁ extra₂ fullExt narrowExt)
+    (contracts : ExternalContractInterp) (fuel : Nat) (s : MachineState)
+    (h_callees : s.memory.callees = fullCallees)
+    (h_traits : s.memory.traitImpls = extra₁)
+    (h_ac : s.memory.activeCallee = none)
+    (h_cs : s.memory.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out,
+      post (MirOutcome.mapMem (Memory.withCalleesAndTraits narrowCallees extra₂) out) ↔ post out)
+    (h_contract : ∀ tag req ans,
+      AnsPreservesCodeFrame req.memory ans →
+      (contracts tag { req with memory := Memory.withCalleesAndTraits narrowCallees extra₂ req.memory }
+          (MirCallAns.mapMem (Memory.withCalleesAndTraits narrowCallees extra₂) ans) ↔
+        contracts tag req ans)) :
+    vcMirWithCalleesCF contracts fuel rootBody s narrowCallees extra₂ narrowExt cone post ↔
+      wpMirExecExtCFUnfiltered contracts fullExt fuel rootBody (.running s) post := by
+  have h_self : MachineState.mapMem (Memory.withCalleesAndTraits fullCallees extra₁) s = s := by
+    cases s with
+    | mk frame mem =>
+      dsimp only [MachineState.mapMem, Memory.withCalleesAndTraits] at h_callees h_traits ⊢
+      cases mem
+      dsimp only at h_callees h_traits
+      subst h_callees h_traits
+      rfl
+  refine (vcMirWithCalleesCF_narrow_of_batchedCert h_cert contracts fuel s
+    h_callees h_traits h_ac h_cs post h_post h_contract).trans ?_
+  unfold vcMirWithCalleesCF
+  rw [h_self]
+  exact wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert h_cert contracts fuel s
+    h_callees h_traits h_ac h_cs post
 
 /-! ### Trace Semantics: Plain, Demand-Time, and Eager Worlds -/
 
@@ -7123,10 +7937,10 @@ private theorem evalSetDiscriminantDerefWrite_borrowMonotone (s : MachineState)
     | split
     | (dsimp only)
     | trivial
-    | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl
-        (map_tag_invalidateDerefWriteBorrowsWithLayouts ..)
     | exact evalForeignFrameDerefWrite_borrowMonotone s locals₁ s.memory p rest newVal
-        localDecls layouts (MemBorrowMonotone.refl _))
+        localDecls layouts (MemBorrowMonotone.refl _)
+    | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl
+        (map_tag_invalidateDerefWriteBorrowsWithLayouts ..))
 
 /-- Rvalue predicate covering all `Anneal.PureMirExec.isBorrowFreePureRvalue` rvalues *plus* local
 stack reference creation `Rvalue.ref borrowKind place` (`_2 = &_1`, `_2 = &mut _1`, `_2 = &_1.f`). -/
@@ -7147,27 +7961,15 @@ theorem evalRvalue_localRefOrPure_borrowMonotone {locals locals₁ : List LocalS
     unfold isLocalRefOrPureRvalue at h_rv
     unfold evalRvalue at h_ev
     dsimp only at h_rv h_ev
-    cases hproj : place.projection with
-    | nil =>
-      rw [hproj] at h_ev
-      dsimp only at h_ev
-      repeat' (first
+    split at h_ev
+    · rename_i restProj heq
+      rw [heq] at h_rv
+      nomatch h_rv
+    · repeat' (first
         | split at h_ev
         | (dsimp only at h_ev)
         | (cases h_ev; done)
         | (cases h_ev; exact MemBorrowMonotone.of_cons_fresh_tag rfl rfl rfl rfl rfl rfl))
-    | cons pHead pTail =>
-      rw [hproj] at h_rv h_ev
-      cases pHead with
-      | deref => nomatch h_rv
-      | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
-      | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
-        dsimp only at h_ev
-        repeat' (first
-          | split at h_ev
-          | (dsimp only at h_ev)
-          | (cases h_ev; done)
-          | (cases h_ev; exact MemBorrowMonotone.of_cons_fresh_tag rfl rfl rfl rfl rfl rfl))
   | _ =>
     have h_pure : Anneal.PureMirExec.isBorrowFreePureRvalue localDecls layouts _ = true := h_rv
     have h_eq :=
@@ -7209,6 +8011,41 @@ theorem evalStmt_borrowMonotone_frame {s : MachineState} {stmt : Statement}
     NodeBorrowMonotone s.memory (evalStmt s stmt localDecls layouts) := by
   rcases stmt with ⟨kind, span⟩
   cases kind with
+  | nop | coverage | constEvalCounter | backwardIncompatibleDropHint _ =>
+    exact MemBorrowMonotone.refl _
+  | placeMention _ =>
+    unfold evalStmt; dsimp only
+    repeat' (first | split | (dsimp only) | trivial | exact MemBorrowMonotone.refl _)
+  | storageLive _ | deinit _ | storageDead _ =>
+    unfold evalStmt; dsimp only
+    repeat' (first
+      | split
+      | (dsimp only)
+      | trivial
+      | exact MemBorrowMonotone.refl _
+      | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_disableLocalBorrows ..)
+      | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl
+          (map_tag_invalidateConflictingBorrowsAtProj ..))
+  | retag _ _ =>
+    unfold evalStmt; dsimp only
+    repeat' (first
+      | split
+      | (dsimp only)
+      | trivial
+      | exact MemBorrowMonotone.refl _
+      | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_attachBorrowProtector ..)
+      | exact evalFnEntryRetag_borrowMonotone ..
+      | exact evalNonFnEntryRetag_borrowMonotone ..)
+  | setDiscriminant _ _ =>
+    unfold evalStmt; dsimp only
+    repeat' (first
+      | split
+      | (dsimp only)
+      | trivial
+      | exact evalSetDiscriminantLocal_borrowMonotone ..
+      | exact evalSetDiscriminantDerefWrite_borrowMonotone ..
+      | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl
+          (map_tag_invalidateConflictingBorrowsAtProj ..))
   | intrinsic intr =>
     cases intr with
     | copyNonOverlapping _ _ _ => nomatch h_stmt
@@ -7227,6 +8064,8 @@ theorem evalStmt_borrowMonotone_frame {s : MachineState} {stmt : Statement}
         | split
         | (dsimp only)
         | trivial
+        | exact evalForeignFrameDerefWrite_borrowMonotone s locals₁ mem₁ dst _ val
+            localDecls layouts h_rv
         | exact h_rv.trans
             (MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_invalidateConflictingBorrows ..))
         | exact h_rv.trans
@@ -7234,26 +8073,9 @@ theorem evalStmt_borrowMonotone_frame {s : MachineState} {stmt : Statement}
               (map_tag_invalidateDerefWriteBorrowsWithLayouts ..))
         | exact h_rv.trans
             (MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_invalidateDerefWriteBorrows ..))
-        | exact evalForeignFrameDerefWrite_borrowMonotone s locals₁ mem₁ dst _ val
-            localDecls layouts h_rv
         | exact h_rv.trans
             (MemBorrowMonotone.of_tags_eq rfl rfl rfl
               (map_tag_invalidateConflictingBorrowsAtProj ..)))
-  | _ =>
-    unfold evalStmt; dsimp only
-    repeat' (first
-      | split
-      | (dsimp only)
-      | trivial
-      | exact MemBorrowMonotone.refl _
-      | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_disableLocalBorrows ..)
-      | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_attachBorrowProtector ..)
-      | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl
-          (map_tag_invalidateConflictingBorrowsAtProj ..)
-      | exact evalFnEntryRetag_borrowMonotone ..
-      | exact evalNonFnEntryRetag_borrowMonotone ..
-      | exact evalSetDiscriminantLocal_borrowMonotone ..
-      | exact evalSetDiscriminantDerefWrite_borrowMonotone ..)
 
 /-- On any `isBorrowMonotoneStmt` statement (including `.retag`, `&_1` / `&mut _1` borrow creation,
 `StorageLive`, `StorageDead`, etc.) and **any** `MachineState` `s` (even with live borrows and
@@ -7548,7 +8370,10 @@ theorem evalTerminator_borrowMonotone_frame {s : MachineState} {term : Terminato
             dsimp only
             cases isDirectExactDivTarget _ with
             | true =>
-              repeat' (first | split | trivial | exact writeIntrinsicReturn_borrowMonotone ..)
+              repeat' (first
+                | split
+                | trivial
+                | exact writeIntrinsicReturn_borrowMonotone ..)
             | false =>
               unfold evalDirectRustIntrinsic?
               rw [h_term]
