@@ -57,6 +57,7 @@ import LeanMiriSpec.Correspondence.SimLM4_2
 import LeanMiriSpec.Correspondence.WitLM4_2
 import LeanMiriSpec.Correspondence.Safety
 import LeanMiriSpec.Correspondence.MiriDiffWitnesses
+import LeanMiriSpec.Correspondence.WideSliceDstLM
 import LeanMiriSpec.Audit
 
 /-!
@@ -447,6 +448,20 @@ import LeanMiriSpec.Audit
   boundary of `write_bytes` and `rotate_left`: `w6_write_bytes_extCall_boundary`,
   `w6_write_bytes_read_extCall_divergence`, `w6_write_bytes_oob_extCall_divergence`,
   `w6_rotate_left_extCall_boundary`) (`LM-4.3`).
+* `LeanMiriSpec.Correspondence.WideSliceDstLM`: wide-slice DST correspondence
+  (`*const [T]`, `*mut [T]`, `&[T]`, `&mut [T]`, `*const str`, `*mut str`, `&str`,
+  `&mut str`), conservative hook overlays (`annealDynamicLayoutHooksWideSlice`,
+  `annealPlaceProjectionHooksWideSlice`, `annealScalarOpsHooksWideSlice`,
+  `annealCastHooksWideSlice`, `annealAggregateHooksWideSlice`,
+  `annealIntrinsicHooksWideSlice`, `annealCallHooksWideSlice`,
+  `annealStepHooksWideSlice`), lockstep simulation for `AggregateKind.RawPtr`,
+  `UnaryOp.PtrMetadata`, `CastKind.PtrToPtr` (wide-to-thin and wide-to-wide),
+  `CastKind.PointerCoercion .Unsize` (`&[T; N] -> &[T]`), `PlaceElem.Deref` +
+  `Index`/`ConstantIndex`/`Subslice` (`fromEnd = false`/`true`), `Rvalue.Len (*p)`
+  vs `UnaryOp.PtrMetadata`, `size_of_val` / `align_of_val` intrinsics, whole-step
+  `StepHooks.step`, and kernel-checked `Miri`/Anneal semantic divergence witnesses
+  (Provenance-Free `Index` Bounds-Check before Deref, `Rvalue.Len (*p)` Dead-Alloc
+  and Disabled-Tag vs `PtrMetadata`, and `isize::MAX` Dynamic Layout Cap).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
