@@ -2993,6 +2993,339 @@ theorem evalWithOpaqueCallees_cone_narrow_of_agreesOn_poly (cone : List DefPath)
     · rw [hextra]
       exact hno₂ _ hdp
 
+/-- **Narrow-run cone narrowing of the opaque evaluator from `AgreesOn`**: steps only
+`narrowTbl.lookup` in `demandedKeys`, never unfolding `fullTbl` to collect demanded keys. -/
+theorem evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn (cone : List DefPath)
+    (narrowTbl fullTbl : OpaqueCalleeTable) (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : OpaqueCalleeTable.AgreesOn cone narrowTbl fullTbl)
+    (hkeys : ∀ k ∈ demandedKeys narrowTbl.lookup body fuel s, k.defPath ∈ cone ∧ k.typeArgs = []) :
+    evalWithOpaqueCallees narrowTbl body fuel s = evalWithOpaqueCallees fullTbl body fuel s :=
+  evalWithOpaqueCallees_cone_narrow_of_narrow narrowTbl fullTbl body fuel s fun k hk =>
+    lookupKey_eq_of_agreesOn_mono h (hkeys k hk).1 (hkeys k hk).2
+
+/-- **Narrow-run cone narrowing of the opaque evaluator from `AgreesOn`, generic callees included**:
+like `evalWithOpaqueCallees_cone_narrow_of_agreesOn_poly`, except `hkeys` is checked along
+`demandedKeys narrowTbl.lookup` so `fullTbl` is never stepped during key collection. -/
+theorem evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn_poly (cone : List DefPath)
+    (narrowTbl fullTbl : OpaqueCalleeTable) (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : OpaqueCalleeTable.AgreesOn cone narrowTbl fullTbl)
+    (hno₁ : ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (s.memory.traitImpls ++ narrowTbl.traitImpls) dp = false)
+    (hno₂ : ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (s.memory.traitImpls ++ fullTbl.traitImpls) dp = false)
+    (hkeys : ∀ k ∈ demandedKeys narrowTbl.lookup body fuel s, k.defPath ∈ cone) :
+    evalWithOpaqueCallees narrowTbl body fuel s = evalWithOpaqueCallees fullTbl body fuel s :=
+  evalWithOpaqueCallees_cone_narrow_of_narrow narrowTbl fullTbl body fuel s fun k hk => by
+    have hextra := demandedKeys_extraTraitImpls narrowTbl.lookup body fuel s k hk
+    have hdp := hkeys k hk
+    refine lookupKey_eq_of_agreesOn_free h hdp ?_ ?_
+    · rw [hextra]
+      exact hno₁ _ hdp
+    · rw [hextra]
+      exact hno₂ _ hdp
+
+theorem hasTraitImplForDefPath_filter (defPath : DefPath) :
+    ∀ (impls : List TraitImplEntry),
+      hasTraitImplForDefPath impls defPath =
+        !(impls.filter (fun e => stringEq e.traitRef.defPath defPath)).isEmpty
+  | [] => rfl
+  | entry :: rest => by
+    unfold hasTraitImplForDefPath
+    cases h : stringEq entry.traitRef.defPath defPath with
+    | true => simp [h]
+    | false =>
+      simp only [List.filter_cons, h, Bool.false_eq_true, ite_false]
+      exact hasTraitImplForDefPath_filter defPath rest
+
+theorem collectMatchingTraitImplsWith_filter_defPath
+    (lookupRaw : DefPath → Option CapturedMir) (defPath : DefPath) (typeArgs : List RigidTy) :
+    ∀ (impls : List TraitImplEntry) (acc : List (TraitImplEntry × Option (List RigidTy))),
+      collectMatchingTraitImplsWith lookupRaw impls defPath typeArgs acc =
+        collectMatchingTraitImplsWith lookupRaw
+          (impls.filter (fun e => stringEq e.traitRef.defPath defPath)) defPath typeArgs acc
+  | [], _ => rfl
+  | entry :: rest, acc => by
+    cases h : stringEq entry.traitRef.defPath defPath with
+    | false =>
+      simp only [List.filter_cons, h, Bool.false_eq_true, ite_false]
+      rw [collectMatchingTraitImplsWith_cons_ne_path h]
+      exact collectMatchingTraitImplsWith_filter_defPath lookupRaw defPath typeArgs rest acc
+    | true =>
+      simp only [List.filter_cons, h, ite_true]
+      unfold collectMatchingTraitImplsWith
+      simp only [h, ite_true]
+      cases entry.traitRef.args with
+      | nil =>
+        exact collectMatchingTraitImplsWith_filter_defPath lookupRaw defPath typeArgs rest acc
+      | cons a as =>
+        dsimp only
+        cases matchRigidTyPrefix (a :: as) typeArgs [] with
+        | none =>
+          exact collectMatchingTraitImplsWith_filter_defPath lookupRaw defPath typeArgs rest acc
+        | some p =>
+          exact collectMatchingTraitImplsWith_filter_defPath lookupRaw defPath typeArgs rest _
+
+theorem collectMatchingTraitImplsWith_congr
+    {r₁ r₂ : DefPath → Option CapturedMir} (defPath : DefPath) (typeArgs : List RigidTy) :
+    ∀ (impls : List TraitImplEntry) (acc : List (TraitImplEntry × Option (List RigidTy))),
+      (∀ e ∈ impls, stringEq e.traitRef.defPath defPath = true → r₁ e.implPath = r₂ e.implPath) →
+      collectMatchingTraitImplsWith r₁ impls defPath typeArgs acc =
+        collectMatchingTraitImplsWith r₂ impls defPath typeArgs acc
+  | [], _, _ => rfl
+  | entry :: rest, acc, h => by
+    unfold collectMatchingTraitImplsWith
+    by_cases hd : stringEq entry.traitRef.defPath defPath = true
+    · simp only [hd, ite_true]
+      have heq := h entry (List.Mem.head _) hd
+      have hrest : ∀ e ∈ rest, stringEq e.traitRef.defPath defPath = true →
+          r₁ e.implPath = r₂ e.implPath :=
+        fun e hm => h e (List.Mem.tail _ hm)
+      cases entry.traitRef.args with
+      | nil => exact collectMatchingTraitImplsWith_congr defPath typeArgs rest acc hrest
+      | cons a as =>
+        dsimp only
+        cases matchRigidTyPrefix (a :: as) typeArgs [] with
+        | none => exact collectMatchingTraitImplsWith_congr defPath typeArgs rest acc hrest
+        | some p =>
+          dsimp only
+          rw [heq]
+          exact collectMatchingTraitImplsWith_congr defPath typeArgs rest _ hrest
+    · simp only [hd, Bool.false_eq_true, ite_false]
+      exact collectMatchingTraitImplsWith_congr defPath typeArgs rest acc
+        (fun e hm => h e (List.Mem.tail _ hm))
+
+theorem upsertMatchingTraitImpl_forall {P : TraitImplEntry → Prop} {entry : TraitImplEntry}
+    (he : P entry) (opt : Option (List RigidTy)) :
+    ∀ (acc : List (TraitImplEntry × Option (List RigidTy))),
+      (∀ p ∈ acc, P p.1) → ∀ p ∈ upsertMatchingTraitImpl entry opt acc, P p.1
+  | [], _, p, hp => by
+    simp only [upsertMatchingTraitImpl, List.mem_singleton] at hp
+    subst hp
+    exact he
+  | (existing, exOpt) :: rest, hacc, p, hp => by
+    unfold upsertMatchingTraitImpl at hp
+    cases hs : stringEq existing.implPath entry.implPath with
+    | true =>
+      rw [hs] at hp
+      cases exOpt <;> cases opt
+      all_goals
+        dsimp only at hp
+        rcases List.mem_cons.mp hp with rfl | hrest
+        · first | exact he | exact hacc _ (List.Mem.head _)
+        · exact hacc p (List.Mem.tail _ hrest)
+    | false =>
+      rw [hs] at hp
+      dsimp only at hp
+      rcases List.mem_cons.mp hp with rfl | hrest
+      · exact hacc _ (List.Mem.head _)
+      · exact upsertMatchingTraitImpl_forall he opt rest
+          (fun q hq => hacc q (List.Mem.tail _ hq)) p hrest
+
+theorem collectMatchingTraitImplsWith_forall {P : TraitImplEntry → Prop}
+    (r : DefPath → Option CapturedMir) (defPath : DefPath) (typeArgs : List RigidTy) :
+    ∀ (impls : List TraitImplEntry) (acc : List (TraitImplEntry × Option (List RigidTy))),
+      (∀ e ∈ impls, stringEq e.traitRef.defPath defPath = true → P e) →
+      (∀ p ∈ acc, P p.1) →
+      ∀ p ∈ collectMatchingTraitImplsWith r impls defPath typeArgs acc, P p.1
+  | [], _, _, hacc, p, hp => hacc p hp
+  | entry :: rest, acc, himpls, hacc, p, hp => by
+    unfold collectMatchingTraitImplsWith at hp
+    by_cases hd : stringEq entry.traitRef.defPath defPath = true
+    · simp only [hd, ite_true] at hp
+      have hrest : ∀ e ∈ rest, stringEq e.traitRef.defPath defPath = true → P e :=
+        fun e hm => himpls e (List.Mem.tail _ hm)
+      cases hargs : entry.traitRef.args with
+      | nil =>
+        rw [hargs] at hp
+        exact collectMatchingTraitImplsWith_forall r defPath typeArgs rest acc hrest hacc p hp
+      | cons a as =>
+        rw [hargs] at hp
+        dsimp only at hp
+        cases hm : matchRigidTyPrefix (a :: as) typeArgs [] with
+        | none =>
+          rw [hm] at hp
+          exact collectMatchingTraitImplsWith_forall r defPath typeArgs rest acc hrest hacc p hp
+        | some pr =>
+          rw [hm] at hp
+          exact collectMatchingTraitImplsWith_forall r defPath typeArgs rest _ hrest
+            (upsertMatchingTraitImpl_forall (himpls entry (List.Mem.head _) hd) _ acc hacc) p hp
+    · simp only [hd, Bool.false_eq_true, ite_false] at hp
+      exact collectMatchingTraitImplsWith_forall r defPath typeArgs rest acc
+        (fun e hm => himpls e (List.Mem.tail _ hm)) hacc p hp
+
+theorem filterMostSpecificTraitImpls_mem
+    (allMatches : List (TraitImplEntry × Option (List RigidTy))) :
+    ∀ (ms : List (TraitImplEntry × Option (List RigidTy)))
+      {p : TraitImplEntry × Option (List RigidTy)},
+      p ∈ filterMostSpecificTraitImpls allMatches ms → p ∈ ms
+  | [], _, hp => nomatch hp
+  | (entry, opt) :: rest, p, hp => by
+    unfold filterMostSpecificTraitImpls at hp
+    cases hs : isTraitImplInstanceOfAll entry.traitRef.args allMatches with
+    | true =>
+      rw [hs] at hp
+      rcases List.mem_cons.mp hp with rfl | hr
+      · exact List.Mem.head _
+      · exact List.Mem.tail _ (filterMostSpecificTraitImpls_mem allMatches rest hr)
+    | false =>
+      rw [hs] at hp
+      exact List.Mem.tail _ (filterMostSpecificTraitImpls_mem allMatches rest hp)
+
+/-- **Full key congruence under `AgreesOn` (monomorphic, generic, and trait-dispatched callees)**:
+whenever `t₁` and `t₂` agree on `cone` (`k.defPath ∈ cone`), carry matching `TraitImplEntry`
+lists for `k.defPath`, and every matching `TraitImplEntry` has `implPath ∈ cone`,
+`t₁.lookupKey k = t₂.lookupKey k`. -/
+theorem lookupKey_eq_of_agreesOn_with_traits {cone : List DefPath} {t₁ t₂ : OpaqueCalleeTable}
+    {k : CalleeKey} (h : OpaqueCalleeTable.AgreesOn cone t₁ t₂) (hk : k.defPath ∈ cone)
+    (htraits : t₁.traitImpls.filter (fun e => stringEq e.traitRef.defPath k.defPath) =
+      t₂.traitImpls.filter (fun e => stringEq e.traitRef.defPath k.defPath))
+    (himpls : ∀ e ∈ k.extraTraitImpls ++ t₁.traitImpls,
+      stringEq e.traitRef.defPath k.defPath = true → e.implPath ∈ cone) :
+    t₁.lookupKey k = t₂.lookupKey k := by
+  obtain ⟨L, dp, tys, ti⟩ := k
+  simp only at hk htraits himpls
+  have hall_flt :
+      (ti ++ t₁.traitImpls).filter (fun e => stringEq e.traitRef.defPath dp) =
+        (ti ++ t₂.traitImpls).filter (fun e => stringEq e.traitRef.defPath dp) := by
+    simp only [List.filter_append, htraits]
+  have hhas :
+      hasTraitImplForDefPath (ti ++ flatMapTraitImpls t₁.toList) dp =
+        hasTraitImplForDefPath (ti ++ flatMapTraitImpls t₂.toList) dp := by
+    rw [← OpaqueCalleeTable.traitImpls_eq, ← OpaqueCalleeTable.traitImpls_eq,
+      hasTraitImplForDefPath_filter, hasTraitImplForDefPath_filter, hall_flt]
+  have hfind_dp : findCallee? t₁.toList dp = findCallee? t₂.toList dp :=
+    (calleesAgreeOn_of_agreesOn h) dp hk
+  rw [OpaqueCalleeTable.lookupKey_eq, OpaqueCalleeTable.lookupKey_eq,
+    OpaqueCalleeTable.lookup_eq, OpaqueCalleeTable.lookup_eq]
+  suffices hres : resolveCalleeBodyAndArgs? t₁.toList dp tys ti =
+      resolveCalleeBodyAndArgs? t₂.toList dp tys ti by
+    simp only [lookupCallee, hres]
+  cases tys with
+  | nil => simp only [resolveCalleeBodyAndArgs?, hfind_dp]
+  | cons firstArg restArgs =>
+    by_cases hp : rigidTyTag firstArg = 0
+    · cases firstArg <;> first
+        | contradiction
+        | simp only [resolveCalleeBodyAndArgs?, hfind_dp, hhas]
+    · have hcol :
+          collectMatchingTraitImpls t₁.toList (ti ++ flatMapTraitImpls t₁.toList) dp
+              (firstArg :: restArgs) =
+            collectMatchingTraitImpls t₂.toList (ti ++ flatMapTraitImpls t₂.toList) dp
+              (firstArg :: restArgs) := by
+        rw [← OpaqueCalleeTable.traitImpls_eq, ← OpaqueCalleeTable.traitImpls_eq,
+          collectMatchingTraitImpls_eq_with, collectMatchingTraitImpls_eq_with,
+          collectMatchingTraitImplsWith_filter_defPath t₁.lookupRaw,
+          collectMatchingTraitImplsWith_filter_defPath t₂.lookupRaw, ← hall_flt]
+        apply collectMatchingTraitImplsWith_congr dp (firstArg :: restArgs)
+        intro e he hd
+        exact h e.implPath (himpls e (List.mem_filter.mp he).1 hd)
+      have hmem_cone : ∀ p ∈ collectMatchingTraitImpls t₁.toList
+          (ti ++ flatMapTraitImpls t₁.toList) dp (firstArg :: restArgs),
+          p.1.implPath ∈ cone := by
+        rw [← OpaqueCalleeTable.traitImpls_eq, collectMatchingTraitImpls_eq_with]
+        exact collectMatchingTraitImplsWith_forall t₁.lookupRaw dp (firstArg :: restArgs)
+          (ti ++ t₁.traitImpls) [] himpls (fun _ hm => nomatch hm)
+      have htail :
+          (let allTraitImpls := ti ++ flatMapTraitImpls t₁.toList
+            let matchedImpls :=
+              collectMatchingTraitImpls t₁.toList allTraitImpls dp (firstArg :: restArgs)
+            match matchedImpls with
+            | [] =>
+              match findCallee? t₁.toList dp with
+              | none => none
+              | some c =>
+                match Bool.and (hasTraitImplForDefPath allTraitImpls dp)
+                    (Bool.not (allParamsInCallerLayouts 0 firstArg)) with
+                | true => none
+                | false => some (c, firstArg :: restArgs)
+            | _ :: _ =>
+              match filterMostSpecificTraitImpls matchedImpls matchedImpls with
+              | (winnerEntry, some implTypeArgs) :: [] =>
+                match findCallee? t₁.toList winnerEntry.implPath with
+                | some c =>
+                  let effectiveTypeArgs :=
+                    match stringEq winnerEntry.implPath dp with
+                    | true => firstArg :: restArgs
+                    | false => implTypeArgs
+                  if effectiveTypeArgs.length == c.typeParamCount then
+                    some (c, effectiveTypeArgs)
+                  else none
+                | none => none
+              | _ => none) =
+          (let allTraitImpls := ti ++ flatMapTraitImpls t₂.toList
+            let matchedImpls :=
+              collectMatchingTraitImpls t₂.toList allTraitImpls dp (firstArg :: restArgs)
+            match matchedImpls with
+            | [] =>
+              match findCallee? t₂.toList dp with
+              | none => none
+              | some c =>
+                match Bool.and (hasTraitImplForDefPath allTraitImpls dp)
+                    (Bool.not (allParamsInCallerLayouts 0 firstArg)) with
+                | true => none
+                | false => some (c, firstArg :: restArgs)
+            | _ :: _ =>
+              match filterMostSpecificTraitImpls matchedImpls matchedImpls with
+              | (winnerEntry, some implTypeArgs) :: [] =>
+                match findCallee? t₂.toList winnerEntry.implPath with
+                | some c =>
+                  let effectiveTypeArgs :=
+                    match stringEq winnerEntry.implPath dp with
+                    | true => firstArg :: restArgs
+                    | false => implTypeArgs
+                  if effectiveTypeArgs.length == c.typeParamCount then
+                    some (c, effectiveTypeArgs)
+                  else none
+                | none => none
+              | _ => none) := by
+        dsimp only
+        rw [← hcol]
+        cases hm : collectMatchingTraitImpls t₁.toList (ti ++ flatMapTraitImpls t₁.toList) dp
+            (firstArg :: restArgs) with
+        | nil => simp only [hfind_dp, hhas]
+        | cons m ms =>
+          dsimp only
+          cases hw : filterMostSpecificTraitImpls (m :: ms) (m :: ms) with
+          | nil => rfl
+          | cons w ws =>
+            rcases w with ⟨winnerEntry, optArgs⟩
+            cases optArgs with
+            | none => rfl
+            | some implTypeArgs =>
+              cases ws with
+              | cons _ _ => rfl
+              | nil =>
+                have hw_mem : (winnerEntry, some implTypeArgs) ∈ (m :: ms) :=
+                  filterMostSpecificTraitImpls_mem (m :: ms) (m :: ms)
+                    (by rw [hw]; exact List.Mem.head _)
+                have hw_cone : winnerEntry.implPath ∈ cone :=
+                  hmem_cone _ (by rw [hm]; exact hw_mem)
+                have hfind_w : findCallee? t₁.toList winnerEntry.implPath =
+                    findCallee? t₂.toList winnerEntry.implPath :=
+                  (calleesAgreeOn_of_agreesOn h) _ hw_cone
+                simp only [hfind_w]
+      cases firstArg <;> first | exact absurd rfl hp | exact htail
+
+/-- **Narrow-run cone narrowing of the opaque evaluator from `AgreesOn`, including both generic
+and trait-dispatched callees**: steps only `narrowTbl` in `demandedKeys` and checks trait-impl
+filter equality + `implPath ∈ cone` over the sealed `traitImpls`. -/
+theorem evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn_with_traits (cone : List DefPath)
+    (narrowTbl fullTbl : OpaqueCalleeTable) (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : OpaqueCalleeTable.AgreesOn cone narrowTbl fullTbl)
+    (htraits : ∀ dp, dp ∈ cone →
+      narrowTbl.traitImpls.filter (fun e => stringEq e.traitRef.defPath dp) =
+        fullTbl.traitImpls.filter (fun e => stringEq e.traitRef.defPath dp))
+    (himpls : ∀ dp, dp ∈ cone → ∀ e ∈ s.memory.traitImpls ++ narrowTbl.traitImpls,
+      stringEq e.traitRef.defPath dp = true → e.implPath ∈ cone)
+    (hkeys : ∀ k ∈ demandedKeys narrowTbl.lookup body fuel s, k.defPath ∈ cone) :
+    evalWithOpaqueCallees narrowTbl body fuel s = evalWithOpaqueCallees fullTbl body fuel s :=
+  evalWithOpaqueCallees_cone_narrow_of_narrow narrowTbl fullTbl body fuel s fun k hk => by
+    have hextra := demandedKeys_extraTraitImpls narrowTbl.lookup body fuel s k hk
+    have hdp := hkeys k hk
+    refine lookupKey_eq_of_agreesOn_with_traits h hdp (htraits _ hdp) ?_
+    rw [hextra]
+    exact himpls _ hdp
+
 /-- A halting iterated trusted run is a halting `MirFuelFree.runMirExecBounded` run (one more
 unit of fuel absorbs the final `.tau (.halted _)` step). -/
 theorem runMirExecBounded_of_runSteps_halted (body : CapturedMir) :

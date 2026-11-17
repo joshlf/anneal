@@ -954,6 +954,93 @@ theorem canary_cone_narrow_of_agreesOn_poly :
       (by decide +kernel) (by decide +kernel),
     by decide +kernel⟩
 
+/-- Full call cone of `multiRoot`'s live execution: generic `fx::poly`, trait method
+`fx::Area::area`, and winning override `fx::<impl Area for Circle>::area`. -/
+def multiCone : List DefPath :=
+  ["fx::poly", "fx::Area::area", "fx::<impl Area for Circle>::area"]
+
+/-- One-time `traitImpls` certificate for `polyFullTbl`. -/
+theorem polyFullTbl_traitImpls : polyFullTbl.traitImpls = [fxAreaEntry] := by
+  unfold polyFullTbl
+  rw [traitImpls_ofList]
+  rfl
+
+/-- One-time `traitImpls` certificate for `polyFullTbl.narrowToCone ["fx::poly"]`. -/
+theorem polyNarrowTbl_traitImpls :
+    (polyFullTbl.narrowToCone ["fx::poly"]).traitImpls = [] := by
+  unfold polyFullTbl OpaqueCalleeTable.narrowToCone
+  rw [OpaqueCalleeTable.toList_ofList, traitImpls_ofList]
+  rfl
+
+/-- `OpaqueCalleeTable.AgreesOn multiCone multiNarrowTbl multiFullTbl` proved purely from `O(1)`
+`lookupRaw` certificates (zero `multiFullTbl.toList` unfolding). -/
+theorem canary_multi_agreesOn :
+    OpaqueCalleeTable.AgreesOn multiCone multiNarrowTbl multiFullTbl := by
+  intro dp hdp
+  simp only [multiCone, List.mem_cons, List.not_mem_nil, or_false] at hdp
+  rcases hdp with rfl | rfl | rfl
+  · have hN : multiNarrowTbl.lookupRaw "fx::poly" = some fxPoly :=
+      lookupRaw_ofList_cons_hit rfl
+    have hF : multiFullTbl.lookupRaw "fx::poly" = some fxPoly := by
+      unfold multiFullTbl
+      rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
+      exact lookupRaw_ofList_cons_hit rfl
+    rw [hN, hF]
+  · have hN : multiNarrowTbl.lookupRaw "fx::Area::area" = none := by
+      unfold multiNarrowTbl
+      rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+        lookupRaw_ofList_cons_miss (by decide), OpaqueCalleeTable.lookupRaw_eq,
+        OpaqueCalleeTable.toList_ofList]
+      rfl
+    have hF : multiFullTbl.lookupRaw "fx::Area::area" = none := by
+      unfold multiFullTbl
+      rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+        lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+        lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+        OpaqueCalleeTable.lookupRaw_eq, OpaqueCalleeTable.toList_ofList]
+      rfl
+    rw [hN, hF]
+  · have hN : multiNarrowTbl.lookupRaw "fx::<impl Area for Circle>::area" = some fxCircleArea := by
+      unfold multiNarrowTbl
+      rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
+      exact lookupRaw_ofList_cons_hit rfl
+    have hF : multiFullTbl.lookupRaw "fx::<impl Area for Circle>::area" = some fxCircleArea := by
+      unfold multiFullTbl
+      rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+        lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+        lookupRaw_ofList_cons_miss (by decide)]
+      exact lookupRaw_ofList_cons_hit rfl
+    rw [hN, hF]
+
+/-- **Narrow-run `AgreesOn` cone narrowing across monomorphic, generic, and trait-dispatched
+callees** (`evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn`,
+`evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn_poly`,
+`evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn_with_traits`):
+unlike `evalWithOpaqueCallees_cone_narrow_of_agreesOn_poly`, all three theorems step *only*
+`narrowTbl.lookup` in `demandedKeys` (never unfolding or stepping `fullTbl`) and the `_with_traits`
+form handles `multiRoot` (`poly::<u32>` + `<Circle as Area>::area` override) together. -/
+theorem canary_cone_narrow_of_narrow_agreesOn_with_traits :
+    evalWithOpaqueCallees canaryNarrowTbl canaryRoot 8 canaryInit =
+      evalWithOpaqueCallees canaryFullTbl canaryRoot 8 canaryInit ∧
+    evalWithOpaqueCallees (polyFullTbl.narrowToCone ["fx::poly"]) polyRoot 8 polyInit =
+      evalWithOpaqueCallees polyFullTbl polyRoot 8 polyInit ∧
+    evalWithOpaqueCallees multiNarrowTbl multiRoot 12 multiInit =
+      evalWithOpaqueCallees multiFullTbl multiRoot 12 multiInit := by
+  have hmemP : polyInit.memory.traitImpls = [] := rfl
+  have hmemM : multiInit.memory.traitImpls = [] := rfl
+  refine ⟨evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn canaryCone _ _ _ _ _
+      canary_agreesOn_live.1 (by decide +kernel),
+    evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn_poly ["fx::poly"] _ _ _ _ _
+      (agreesOn_narrowToCone ["fx::poly"] polyFullTbl).symm
+      (by intro dp hdp; rw [hmemP, polyNarrowTbl_traitImpls]; revert dp hdp; decide)
+      (by intro dp hdp; rw [hmemP, polyFullTbl_traitImpls]; revert dp hdp; decide)
+      (by decide +kernel),
+    evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn_with_traits multiCone _ _ _ _ _
+      canary_multi_agreesOn
+      (by intro dp _; rw [multiNarrowTbl_traitImpls, multiFullTbl_traitImpls])
+      (by intro dp hdp; rw [hmemM, multiNarrowTbl_traitImpls]; revert dp hdp; decide)
+      (by decide +kernel)⟩
+
 /-- Shadowed duplicate of `fx::live_f` whose unreachable body calls `"fx::outside_cone"`.
 When placed *after* `fxLiveF` in a callee table, `findCallee?` / `lookupRaw` never selects it,
 yet `MirLiftCore.CallConeClosed` scans every list element with `defPath ∈ cone` and falsely
@@ -1310,6 +1397,30 @@ theorem canary_dyn_vtable_offset_is_ub :
       (evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynSite dynRoot 12 dynInit).summary.tag =
         .halted := by
   decide +kernel
+
+/-- `dynInit` with a live stack-local Tree Borrows entry at `tag = 7` (colliding numerically with
+global vtable `7` at `offsetBytes = 0`). -/
+def dynInitStackBorrow : MachineState :=
+  { dynInit with
+    memory :=
+      { dynInit.memory with
+        borrows := [{ tag := 7, targetLocal := 1, targetProjection := [], perm := .frozen }] } }
+
+/-- **Stack-borrow `allocId` collision cannot masquerade as a global vtable**: in `Trusted`,
+`ProvenancePtr.tag p = p.allocId` shares its numeric space with global/vtable allocation IDs.
+Even at `offsetBytes = 0`, a pointer carrying a stack-borrow tag (`lookupBorrow ≠ none`) is
+rejected by `DynCallSite.vtablePtr?` (matching `Terminators.resolveCallTarget`) and faults `.ub`
+instead of dispatching through vtable `7`. -/
+theorem canary_dyn_stack_borrow_vtable_is_ub :
+    ({ allocId := 7, offsetBytes := 0 } : ProvenancePtr).offsetBytes = 0 ∧
+      lookupBorrow dynInitStackBorrow.memory.borrows 7 ≠ none ∧
+      dynSite.vtablePtr?
+        { dynInitStackBorrow with
+          frame := { blockIdx := 1, stmtIdx := 0, locals := dynInitStackBorrow.frame.locals } } =
+        none ∧
+      evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynSite dynRoot 12 dynInitStackBorrow =
+        .faulted .ub [.event 1] :=
+  ⟨rfl, by decide, rfl, by decide +kernel⟩
 
 /-- **Conservative `dyn`-instantiation rejection (documented completeness gap)**: a vtable slot
 whose target is a generic impl method instantiated at a `dyn` type
@@ -2126,6 +2237,180 @@ theorem canary_dyn_registry_theorems_and_unconditional_frames :
     evalDynRegistryWithOpaqueCallees_eq_trusted_of_no_dyn_unconditional dynEnv12 canaryFullTbl
       [dynSite] dynDeadBranchRoot 12 _ (initMachineStateWithCallees_callees _ _ _)
       (by decide +kernel)⟩
+
+/-- `dynRoot` called with a `Square` receiver (`vt = 9`). -/
+def dynInitSquare : MachineState := initMachineState dynRoot [.ptr ⟨9, 0⟩ 0]
+
+/-- `extern "Rust" fn() -> bool`. -/
+def fxRetBoolAbi : FnAbi :=
+  { args := [], ret := ⟨fxBoolLayout, .direct⟩, conv := .rust, canUnwind := true }
+
+/-- Trait reference for a trait named `"core::intrinsics"` (`Self = dyn core::intrinsics`),
+demonstrating why `stepDynTerminator` must never fall through to `evalDirectRustIntrinsic?` on
+`site.dynKey` when the resolved `impl` body is unlinked. -/
+def dynIntrTraitRef : TraitRef := ⟨"core::intrinsics", [.dynamic "core::intrinsics"]⟩
+
+/-- Virtual call site whose `dynKey` (`"core::intrinsics::ub_checks"`) collides syntactically with
+a compiler intrinsic (`methodMatchesTrait = true`, `wellFormed = true`). -/
+def dynIntrSite : DynCallSite :=
+  { vtableLocal := 1
+    lookupOp := ⟨dynIntrTraitRef, 0, [], none⟩
+    callerAbi := fxRetBoolAbi
+    cfiCallSite := none
+    dynKey := ("core::intrinsics::ub_checks", [.dynamic "core::intrinsics"]) }
+
+/-- Root calling `"core::intrinsics::ub_checks"` with `typeArgs = [dyn core::intrinsics]`. -/
+def dynIntrRoot : CapturedMir :=
+  { defPath := "fx::intr_root", phase := .runtimePostCleanup, role := .subject, argCount := 1,
+    localDecls := [⟨.mut, fxBoolTy, some "_0"⟩, ⟨.not, fxVtPtrTy, some "vt"⟩],
+    basicBlocks := [
+      fxCallBlock "core::intrinsics::ub_checks" [.dynamic "core::intrinsics"] 1,
+      ⟨[], ⟨.return_, "intr:ret"⟩, false⟩ ],
+    fnAbi := fxRetBoolAbi, layouts := fxLayouts, allocations := [] }
+
+/-- Schema-13 environment mapping `dyn core::intrinsics` vtable `7` slot `0` to an unlinked user
+`impl` method `"fx::<impl intrinsics for Circle>::ub_checks"`. -/
+def dynIntrEnv13 : CompilerQueryEnv :=
+  { dynEnv13 with
+    fnAbis := [("fx::<impl intrinsics for Circle>::ub_checks", fxRetBoolAbi)]
+    vtables := some
+      [⟨7, dynIntrTraitRef, [("fx::<impl intrinsics for Circle>::ub_checks", [])], [], []⟩] }
+
+/-- Corrupted `CapturedMir` bodies for `<impl Area for Circle>::area`: wrong calling convention
+(`.c` vs. `.rust`) and wrong `argCount` (`1` vs. `0`) while `dynEnv13.fnAbis` still claims
+`fxRetU32Abi`. -/
+def fxCircleAreaBadConv : CapturedMir :=
+  { fxCircleArea with fnAbi := { fxRetU32Abi with conv := .c } }
+
+def fxCircleAreaBadArgs : CapturedMir :=
+  { fxCircleArea with
+    argCount := 1
+    localDecls := [⟨.mut, fxU32Ty, some "_0"⟩, ⟨.not, fxU32Ty, some "_1"⟩] }
+
+/-- **External resolved `MirCallReq`, intrinsic-spoofing prevention, and linked `calleeBody`
+ABI/arity validation canary**:
+1. When `<dyn Area>::area` resolves to `"fx::<impl Area for Square>::area"` (`vt = 9`) and that
+   `impl` is unlinked in `dynNarrowTbl`, `evalDynWithOpaqueCallees` emits an `.external` call to
+   the *vtable-resolved* `"fx::<impl Area for Square>::area"`, whereas raw
+   `stepBranchPruned (redirectResolver ...)` lost receiver resolution and emitted `"fx::Area::area"`.
+2. When a virtual call key collides with `"core::intrinsics::ub_checks"` (`dynIntrSite.wellFormed =
+   true`) and its resolved `impl` is unlinked, `evalDynWithOpaqueCallees` emits `.external` for
+   `"fx::<impl intrinsics for Circle>::ub_checks"` instead of executing `ub_checks` inline as raw
+   `redirectResolver` did; and `CallConv.rustIntrinsic` on `callerAbi` is rejected by `wellFormed`.
+3. When `tbl` links a `CapturedMir` body whose `fnAbi` or `argCount` disagrees with
+   `site.callerAbi` (even if `env.fnAbis` claims compatibility), `dynCalleeBodyCompatible` faults
+   `.ub`; and when the call terminator's `argOps.length ≠ site.callerAbi.args.length`, dispatch
+   fails closed (`.faulted .unsupported`). -/
+theorem canary_dyn_external_impl_and_intrinsic_spoof_and_body_abi :
+    (evalDynWithOpaqueCallees dynEnv13 dynNarrowTbl dynSite dynRoot 12 dynInitSquare).summary =
+      ⟨.external, [.event 1], none, some "fx::<impl Area for Square>::area"⟩ ∧
+    (runSteps (stepBranchPruned (redirectResolver dynNarrowTbl dynSite.dynKey
+        ("fx::<impl Area for Square>::area", [])) dynRoot) 12 dynInitSquare []).summary =
+      ⟨.external, [.event 1], none, some "fx::Area::area"⟩ ∧
+    dynIntrSite.wellFormed = true ∧
+    (evalDynWithOpaqueCallees dynIntrEnv13 (.ofList []) dynIntrSite dynIntrRoot 8
+        (initMachineState dynIntrRoot [.ptr ⟨7, 0⟩ 0])).summary =
+      ⟨.external, [], none, some "fx::<impl intrinsics for Circle>::ub_checks"⟩ ∧
+    (runSteps (stepBranchPruned (redirectResolver (.ofList []) dynIntrSite.dynKey
+        ("fx::<impl intrinsics for Circle>::ub_checks", [])) dynIntrRoot) 8
+        (initMachineState dynIntrRoot [.ptr ⟨7, 0⟩ 0]) []).summary =
+      ⟨.halted, [], some 1, none⟩ ∧
+    ({ dynSite with callerAbi := { fxRetU32Abi with conv := .rustIntrinsic } } :
+        DynCallSite).wellFormed = false ∧
+    evalDynWithOpaqueCallees dynEnv13 (.ofList [fxCircleAreaBadConv]) dynSite dynRoot 12 dynInit =
+      .faulted .ub [.event 1] ∧
+    evalDynWithOpaqueCallees dynEnv13 (.ofList [fxCircleAreaBadArgs]) dynSite dynRoot 12 dynInit =
+      .faulted .ub [.event 1] ∧
+    evalDynWithOpaqueCallees
+        { dynEnv13 with
+          fnAbis := [("fx::<impl Area for Circle>::area",
+            { fxRetU32Abi with args := [⟨fxU32Layout, .direct⟩] })] }
+        dynFullTbl
+        { dynSite with callerAbi := { fxRetU32Abi with args := [⟨fxU32Layout, .direct⟩] } }
+        dynRoot 12 dynInit =
+      .faulted .unsupported [.event 1] :=
+  ⟨by decide +kernel, by decide +kernel, by decide, by decide +kernel, by decide +kernel,
+    by decide, by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- SSA MIR function making two `<dyn Area>::area()` virtual calls in `bb0` and `bb1` whose
+receiver vtable pointers live in *distinct* SSA locals (`_1` vs. `_2`). -/
+def ssaDynRoot : CapturedMir :=
+  { defPath := "fx::ssa_dyn_root", phase := .runtimePostCleanup, role := .subject, argCount := 2,
+    localDecls := [⟨.mut, fxU32Ty, some "_0"⟩, ⟨.not, fxVtPtrTy, some "vt_circle"⟩,
+      ⟨.not, fxVtPtrTy, some "vt_square"⟩],
+    basicBlocks := [
+      fxCallBlock "fx::Area::area" [.dynamic "fx::Area"] 1,
+      fxCallBlock "fx::Area::area" [.dynamic "fx::Area"] 2,
+      ⟨[], ⟨.return_, "ssa:ret"⟩, false⟩ ],
+    fnAbi := fxRetU32Abi, layouts := fxLayouts, allocations := [] }
+
+/-- Block-scoped sites for `ssaDynRoot`: `bb0` reads `_1` and `bb1` reads `_2`. -/
+def ssaSite0 : DynCallSite :=
+  { dynSite with vtableLocal := 1, callSiteLoc? := some ("fx::ssa_dyn_root", 0) }
+
+def ssaSite1 : DynCallSite :=
+  { dynSite with vtableLocal := 2, callSiteLoc? := some ("fx::ssa_dyn_root", 1) }
+
+def ssaRegistry : DynCallRegistry := [ssaSite0, ssaSite1]
+
+def ssaInit : MachineState := initMachineState ssaDynRoot [.ptr ⟨7, 0⟩ 0, .ptr ⟨9, 0⟩ 0]
+
+/-- Callee making an *unregistered* `<dyn Area>::area()` virtual call with its own `_1`. -/
+def fxUnregDynCallee : CapturedMir :=
+  { defPath := "fx::unreg_dyn_callee", phase := .runtimePostCleanup, role := .subject,
+    argCount := 1,
+    localDecls := [⟨.mut, fxU32Ty, some "_0"⟩, ⟨.not, fxVtPtrTy, some "vt_callee"⟩],
+    basicBlocks := [
+      fxCallBlock "fx::Area::area" [.dynamic "fx::Area"] 1,
+      ⟨[], ⟨.return_, "unreg:ret"⟩, false⟩ ],
+    fnAbi := { fxRetU32Abi with args := [⟨fxUnitLayout, .direct⟩] },
+    layouts := fxLayouts, allocations := [] }
+
+/-- Caller executing a registered `<dyn Area>::area()` call in `bb0` (`_1 = vt_circle = 7`), then
+calling `fx::unreg_dyn_callee(vt_square = 9)` in `bb1`. -/
+def crossFrameRoot : CapturedMir :=
+  { defPath := "fx::cross_caller", phase := .runtimePostCleanup, role := .subject, argCount := 2,
+    localDecls := [⟨.mut, fxU32Ty, some "_0"⟩, ⟨.not, fxVtPtrTy, some "vt_circle"⟩,
+      ⟨.not, fxVtPtrTy, some "vt_square"⟩],
+    basicBlocks := [
+      fxCallBlock "fx::Area::area" [.dynamic "fx::Area"] 1,
+      ⟨[], ⟨.call (fxFnItem "fx::unreg_dyn_callee" []) [.copy ⟨2, []⟩] fxRetPlace (some 2)
+        .continue_, "cross:call_callee"⟩, false⟩,
+      ⟨[], ⟨.return_, "cross:ret"⟩, false⟩ ],
+    fnAbi := fxRetU32Abi, layouts := fxLayouts, allocations := [] }
+
+def crossFrameTbl : OpaqueCalleeTable := .ofList [fxCircleArea, fxSquareArea, fxUnregDynCallee]
+
+def crossFrameInit : MachineState := initMachineState crossFrameRoot [.ptr ⟨7, 0⟩ 0, .ptr ⟨9, 0⟩ 0]
+
+/-- **Location-scoped (`callSiteLoc?`) SSA registry & cross-frame hijack protection canary**:
+1. `ssaRegistry` registers two sites for `<dyn Area>::area` at `("fx::ssa_dyn_root", 0)` (`_1`)
+   and `("fx::ssa_dyn_root", 1)` (`_2`): unscoped `wellFormed` is `false` (same `dynKey`), whereas
+   `scopedWellFormed` is `true`, and `evalDynRegistryWithOpaqueCallees` dispatches `Circle` then
+   `Square` (halting with `44`) and preserves the run across `EnvExtends` + narrowing.
+2. On `crossFrameRoot`, an unscoped site (`callSiteLoc? = none`, `vtableLocal = 1`) hijacks
+   `fx::unreg_dyn_callee`'s unregistered `<dyn Area>::area` call and reads the callee's `_1`
+   (halting with `44`), whereas scoping `callSiteLoc? = some ("fx::cross_caller", 0)` dispatches
+   the caller's `bb0` and fails closed (`.faulted .unsupported`) at the callee's unregistered
+   virtual call. -/
+theorem canary_dyn_scoped_ssa_and_cross_frame_registry :
+    ssaRegistry.wellFormed = false ∧
+    ssaRegistry.scopedWellFormed = true ∧
+    (evalDynRegistryWithOpaqueCallees dynEnv13 dyn2NarrowTbl ssaRegistry ssaDynRoot 16
+        ssaInit).summary = ⟨.halted, [], some 44, none⟩ ∧
+    evalDynRegistryWithOpaqueCallees dynEnv13Sync dyn2NarrowTbl ssaRegistry ssaDynRoot 16
+        ssaInit =
+      evalDynRegistryWithOpaqueCallees dynEnv13 dynFullTbl ssaRegistry ssaDynRoot 16 ssaInit ∧
+    (evalDynWithOpaqueCallees dynEnv13 crossFrameTbl dynSite crossFrameRoot 20
+        crossFrameInit).summary = ⟨.halted, [], some 44, none⟩ ∧
+    evalDynWithOpaqueCallees dynEnv13 crossFrameTbl
+        { dynSite with callSiteLoc? := some ("fx::cross_caller", 0) } crossFrameRoot 20
+        crossFrameInit =
+      .faulted .unsupported [] :=
+  ⟨by decide, by decide, by decide +kernel,
+    evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check dyn_envExtends_13_sync 16 ssaInit
+      (by decide +kernel),
+    by decide +kernel, by decide +kernel⟩
 
 
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
@@ -3148,6 +3433,50 @@ constant. -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_generic_impl_at_dyn_fails_closed
 
+/-- info: 'Anneal.OpaqueCalleeTable.evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn
+
+/-- info: 'Anneal.OpaqueCalleeTable.evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn_poly' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn_poly
+
+/-- info: 'Anneal.OpaqueCalleeTable.evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn_with_traits' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.evalWithOpaqueCallees_cone_narrow_of_narrow_agreesOn_with_traits
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallSite.vtablePtr?_no_borrow' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallSite.vtablePtr?_no_borrow
+
+/-- info: 'Anneal.CompilerQueryEnv.stepDynPruned_congr' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.stepDynPruned_congr
+
+/-- info: 'Anneal.CompilerQueryEnv.stepDynPruned_frames' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.stepDynPruned_frames
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_findSite?_of_unscoped' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_findSite?_of_unscoped
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_cone_narrow_of_narrow_agreesOn_with_traits' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_cone_narrow_of_narrow_agreesOn_with_traits
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_stack_borrow_vtable_is_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_stack_borrow_vtable_is_ub
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_external_impl_and_intrinsic_spoof_and_body_abi' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_external_impl_and_intrinsic_spoof_and_body_abi
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_scoped_ssa_and_cross_frame_registry' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_scoped_ssa_and_cross_frame_registry
+
 end Anneal.CompilerQueryAndOpaqueCalleeTests
 
 /-! ## Module-wide axiom and namespace audit
@@ -3184,9 +3513,12 @@ run_cmd do
       (``Lean.ofReduceBool, ``Lean.ofReduceBool)] do
     unless (← forbiddenOf probe).contains ax do
       throwError "axiom audit self-test failed: {probe} not flagged for {ax}"
+  let isDigits (s : String) : Bool :=
+    !s.isEmpty && s.toList.all Char.isDigit
   let isRealizedSuffix (s : String) : Bool :=
     s == "eq_def" || s == "eq_unfold" || s == "splitter" || s == "else_eq" ||
-      s.startsWith "eq_" || s.startsWith "_sparseCasesOn_"
+      (s.startsWith "eq_" && isDigits ((s.drop 3).toString)) ||
+      (s.startsWith "_sparseCasesOn_" && isDigits ((s.drop 15).toString))
   -- The declaration a realized lemma is about (`f.match_1.splitter._sparseCasesOn_3 ↦
   -- f.match_1`), or `none` for a name that is not a realized-lemma name.
   let realizedBase? (n : Name) : Option Name := Id.run do
@@ -3201,12 +3533,29 @@ run_cmd do
       | _ => pure ()
     return if stripped then some m else none
   -- Admission of a constant of module `mod` (index `idx`) lying outside `mod`'s namespace:
-  -- a hygienic auxiliary of `mod`'s own macro scope, or a realized lemma about a declaration
-  -- of another, imported module.
+  -- a hygienic auxiliary whose outermost declaring macro-scope module (`extractMacroScopes`,
+  -- unwrapping async `<mod>.<hash>._hygCtx` command contexts) equals `mod`, or a realized lemma
+  -- about a declaration of another, imported module.
+  let rec hasNum : Name → Bool
+    | .anonymous => false
+    | .num _ _ => true
+    | .str p _ => hasNum p
+  let rec dropThroughLastNum : Name → Name
+    | .anonymous => .anonymous
+    | .num _ _ => .anonymous
+    | .str p s =>
+      if hasNum p then .str (dropThroughLastNum p) s else .str p s
+  let outerDeclaringMod (un : Name) : Name :=
+    let v := Lean.extractMacroScopes un
+    if v.ctx == `_hygCtx then
+      match v.imported with
+      | .num p _ => dropThroughLastNum p
+      | _ => .anonymous
+    else
+      v.ctx
   let admitForeign (mod : Name) (idx : ModuleIdx) (un : Name) : Bool :=
     if un.hasMacroScopes then
-      ((un.toString (escape := false)).splitOn
-        ("_@." ++ mod.toString (escape := false) ++ ".")).length ≥ 2
+      outerDeclaringMod un == mod
     else
       match realizedBase? un with
       | some base =>
@@ -3221,10 +3570,25 @@ run_cmd do
       `Trusted.Rustc.V2026_06_01.MirSemantics.lookupSwitchTarget.match_1.eq_1 &&
       admitForeign `Anneal.OpaqueCalleeTable octIdx
         (Lean.addMacroScope `Anneal.OpaqueCalleeTable `Trusted.aux 7) &&
+      admitForeign `Anneal.OpaqueCalleeTable octIdx
+        (Lean.addMacroScope (.str (.num `Anneal.OpaqueCalleeTable 42) "_hygCtx") `Trusted.aux 7) &&
       !admitForeign `Anneal.OpaqueCalleeTable octIdx
         (Lean.addMacroScope `Anneal.MirLiftCore `Trusted.aux 7) &&
       !admitForeign `Anneal.OpaqueCalleeTable octIdx
+        (Lean.addMacroScope `Anneal.MirLiftCore
+          (Lean.addMacroScope `Anneal.OpaqueCalleeTable `Trusted.aux 3) 7) &&
+      !admitForeign `Anneal.OpaqueCalleeTable octIdx
+        (Lean.addMacroScope (.str (.num `Anneal.MirLiftCore 99) "_hygCtx")
+          (Lean.addMacroScope `Anneal.OpaqueCalleeTable `Trusted.aux 3) 7) &&
+      !admitForeign `Anneal.OpaqueCalleeTable octIdx
+        (Lean.addMacroScope `Anneal.MirLiftCore
+          (.str .anonymous "Trusted._@.Anneal.OpaqueCalleeTable.fake") 7) &&
+      !admitForeign `Anneal.OpaqueCalleeTable octIdx
         `Trusted.Rustc.V2026_06_01.MirAst.UintTy.ofNat &&
+      !admitForeign `Anneal.OpaqueCalleeTable octIdx
+        `Trusted.Rustc.V2026_06_01.MirAst.UintTy.eq_backdoor &&
+      !admitForeign `Anneal.OpaqueCalleeTable octIdx
+        `Trusted.Rustc.V2026_06_01.MirAst.UintTy._sparseCasesOn_evil &&
       !admitForeign `Anneal.OpaqueCalleeTable octIdx `Trusted.Bogus.eq_1 &&
       !admitForeign `Anneal.OpaqueCalleeTable octIdx
         `Anneal.OpaqueCalleeTable.lookupKey_hit_mono.eq_1 do
