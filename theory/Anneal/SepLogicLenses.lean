@@ -27415,6 +27415,164 @@ theorem evalIntrinsic_alignOfValRaw_str
     hArg' hNoOverride hPt hLt hSlot hLive hSet
   exact ⟨hStep, hMir, fun hNe => hDst.of_invalidateDirectDestWriteBorrows locals' hNe⟩
 
+/-- **`evalIntrinsic_sizeOfValRaw_slice_wide`**: `wide.2 * n`-indexed variant of
+`evalIntrinsic_sizeOfValRaw_slice`, avoiding unfolding `elems.length` in `hSet` on large
+`List.replicate` / ZST (`n = 0`) or symbolic `elems` witnesses while also exporting
+`elems.length * n = wide.2 * n`. -/
+theorem evalIntrinsic_sizeOfValRaw_slice_wide {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    {body cur : CapturedMir} {s : MachineState} {blk : BasicBlockData}
+    {func ptrOp : Operand} {dstLoc : Local} {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction} {span : String} {typeArgs : List RigidTy}
+    {elemTy : RigidTy} {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hDst : UnsizedSliceDstAt c 8 (.slice elemTy) s.memory wide fatVal elems bytes)
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack = .ok fatVal locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some (.slice elemTy))
+    (hSz : intrinsicRigidTyByteSize cur.localDecls cur.layouts elemTy = some n)
+    (hLt : wide.2 * n < signedHalfModulus 8)
+    (hSlot : get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : set? locals' dstLoc (.init (.scalar ⟨wide.2 * n, 8⟩)) = some updatedLocals) :
+    let s' : MachineState :=
+      { frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
+    stepMirFn body s = MirStepNode.step s' ∧
+    PureMirExec.mirStep body s = .cont s' ∧
+    elems.length * n = wide.2 * n ∧
+    ((∀ e, lookupBorrow s.memory.borrows wide.1.tag = some e → e.targetLocal ≠ dstLoc) →
+      UnsizedSliceDstAt c 8 (.slice elemTy) s'.memory wide fatVal elems bytes) := by
+  intro s'
+  have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack =
+        .ok (WidePtrVal.toValue 8 wide) locals' := by
+    rw [← hDst.fat_eq]
+    exact hArg
+  obtain ⟨hStep, hMir, _, _⟩ := mirStep_call_sizeOfVal_slice hCur hPhase hBb hEnd hTerm hCallee
+    hArg' hNoOverride hPt hSz hLt hSlot hLive hSet
+  exact ⟨hStep, hMir, congrArg (· * n) hDst.length_eq,
+    fun hNe => hDst.of_invalidateDirectDestWriteBorrows locals' hNe⟩
+
+/-- **`TypedAt.unsize_array_to_unsizedSliceDstAt`**: `PointerCoercion("Unsize")` of a thin array
+pointer `p` over a live global allocation `alloc` holding `[T; N]` (`TypedAt (c.array N) p.offsetBytes xs`)
+evaluates to `.ok (WidePtrVal.toValue ptrBytes (WidePtrVal.mk p N)) locals' mem` and establishes
+`UnsizedSliceDstAt` for `.slice dstElem` over `globalAllocByteMem alloc`. -/
+theorem TypedAt.unsize_array_to_unsizedSliceDstAt {α : Type} {n N : Nat} {c : ByteLensCodec α n}
+    {xs : {xs : List α // xs.length = N}} {alloc : CapturedAllocation}
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (isRef : Bool) (m : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx) (srcTy : Ty)
+    (p : ProvenancePtr)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.ptr p (layoutPointerBytes layouts)) locals')
+    (hNoBorrow : lookupBorrow mem.borrows p.tag = none)
+    (hTy : operandTy localDecls layouts op = some srcTy)
+    (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrKind isRef m dstElem) = some N)
+    (hAlloc : lookupGlobalAlloc mem.globals p.allocId = some alloc)
+    (hMut : m = .mut → alloc.mutability = .mut)
+    (hSz : tyByteSize localDecls layouts
+      { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } = some n)
+    (hAlign : (byteOffsetToElemIdx? p.offsetBytes n).isSome = true)
+    (hArr : TypedAt (c.array N) p.offsetBytes xs (globalAllocByteMem alloc)) :
+    evalRvalue locals (.cast (.pointerCoercion "Unsize") op
+        { kind := slicePtrKind isRef m dstElem, layoutIdx := dstLIdx }) mem localDecls layouts =
+      .ok (WidePtrVal.toValue (layoutPointerBytes layouts) (WidePtrVal.mk p N)) locals' mem ∧
+    UnsizedSliceDstAt c (layoutPointerBytes layouts) (.slice dstElem) mem
+      (WidePtrVal.mk p N) (WidePtrVal.toValue (layoutPointerBytes layouts) (WidePtrVal.mk p N))
+      xs.val (globalAllocByteMem alloc) := by
+  obtain ⟨hEv, hSl⟩ := TypedAt.unsize_array_to_slice locals locals' op mem localDecls layouts
+    isRef m dstElem dstLIdx srcTy p hOp hNoBorrow hTy hSpec hAlloc hMut hSz hAlign hArr
+  exact ⟨hEv, UnsizedSliceDstAt.of_sliceTypedAt (layoutPointerBytes layouts) dstElem mem hSl
+    ⟨alloc, hAlloc, rfl⟩⟩
+
+/-- **Symbolic disabled-tag metadata-without-deref contrast**: when the `BorrowEntry` of `wide.1.tag`
+in `mem.borrows` has `.disabled` permission, dereferencing `Rvalue.len (*place)` faults with `.ub`,
+whereas `Rvalue.unaryOp .ptrMetadata ptrOp` succeeds with `.ok (.scalar ⟨wide.2, ptrBytes⟩) locals' mem`. -/
+theorem WidePtrVal.evalRvalue_len_disabled_ub_and_ptrMetadata_ok
+    (locals locals' : List LocalSlot) (place : Place) (ptrOp : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (initProj : List ProjectionElem) (elem : RigidTy) (lIdx : LayoutIdx)
+    (entry : BorrowEntry) (wide : WidePtrVal)
+    (hTy : placeTy localDecls layouts place = some { kind := .slice elem, layoutIdx := lIdx })
+    (hSplit : splitLastDeref? place.projection = some initProj)
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
+      mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals')
+    (hOp : evalOperand locals ptrOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals')
+    (hBorrow : lookupBorrow mem.borrows wide.1.tag = some entry)
+    (hDis : entry.perm = .disabled) :
+    evalRvalue locals (.len place) mem localDecls layouts = .ub ∧
+      evalRvalue locals (.unaryOp .ptrMetadata ptrOp) mem localDecls layouts =
+        .ok (.scalar ⟨wide.2, layoutPointerBytes layouts⟩) locals' mem := by
+  refine ⟨?_, WidePtrVal.evalRvalue_ptrMetadata locals locals' ptrOp mem localDecls layouts wide hOp⟩
+  show evalPlaceLen locals place mem localDecls layouts = .ub
+  unfold evalPlaceLen
+  dsimp (config := { zeta := true }) only
+  rw [hTy]
+  dsimp only
+  rw [hSplit]
+  dsimp only
+  rw [hRead]
+  simp only [WidePtrVal.toValue, Nat.beq_refl, Bool.and_self, hBorrow, hDis]
+  rfl
+
+/-- **Symbolic out-of-bounds global metadata-without-deref contrast**: when `wide` points into a
+captured global allocation `alloc` (`lookupBorrow mem.borrows wide.1.tag = none`,
+`lookupGlobalAlloc mem.globals wide.1.allocId = some alloc`) but its byte window overflows the
+allocation (`alloc.bytes.length < wide.1.offsetBytes + wide.2 * n`), dereferencing `Rvalue.len (*place)`
+faults with `.ub`, whereas `Rvalue.unaryOp .ptrMetadata ptrOp` succeeds with
+`.ok (.scalar ⟨wide.2, ptrBytes⟩) locals' mem`. -/
+theorem WidePtrVal.evalRvalue_len_oob_global_ub_and_ptrMetadata_ok
+    (locals locals' : List LocalSlot) (place : Place) (ptrOp : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (initProj : List ProjectionElem) (elem : RigidTy) (lIdx : LayoutIdx)
+    (alloc : CapturedAllocation) (n : Nat) (wide : WidePtrVal)
+    (hTy : placeTy localDecls layouts place = some { kind := .slice elem, layoutIdx := lIdx })
+    (hSplit : splitLastDeref? place.projection = some initProj)
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
+      mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals')
+    (hOp : evalOperand locals ptrOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals')
+    (hNoBorrow : lookupBorrow mem.borrows wide.1.tag = none)
+    (hAlloc : lookupGlobalAlloc mem.globals wide.1.allocId = some alloc)
+    (hSz : tyByteSize localDecls layouts
+      { kind := elem, layoutIdx := unresolvedLayoutIdx layouts } = some n)
+    (hOob : alloc.bytes.length < wide.1.offsetBytes + wide.2 * n) :
+    evalRvalue locals (.len place) mem localDecls layouts = .ub ∧
+      evalRvalue locals (.unaryOp .ptrMetadata ptrOp) mem localDecls layouts =
+        .ok (.scalar ⟨wide.2, layoutPointerBytes layouts⟩) locals' mem := by
+  have hb : Nat.ble (Nat.add wide.1.offsetBytes (Nat.mul wide.2 n)) (length alloc.bytes) = false := by
+    change Nat.ble (wide.1.offsetBytes + wide.2 * n) alloc.bytes.length = false
+    cases hble : Nat.ble (wide.1.offsetBytes + wide.2 * n) alloc.bytes.length with
+    | false => rfl
+    | true => exact False.elim (Nat.not_le.mpr hOob (Nat.le_of_ble_eq_true hble))
+  refine ⟨?_, WidePtrVal.evalRvalue_ptrMetadata locals locals' ptrOp mem localDecls layouts wide hOp⟩
+  show evalPlaceLen locals place mem localDecls layouts = .ub
+  unfold evalPlaceLen
+  simp only [hTy, hSplit, hRead, WidePtrVal.toValue, hNoBorrow, hAlloc, hSz, Nat.beq_refl,
+    Bool.true_and, Bool.and_true, Bool.and_self]
+  split
+  · rename_i heq
+    rw [hb] at heq
+    cases heq
+  · rfl
+
 end SliceWidePtrLenses
 
 end Anneal.SepLogicLenses

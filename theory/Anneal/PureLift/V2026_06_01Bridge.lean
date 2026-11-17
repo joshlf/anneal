@@ -8238,6 +8238,130 @@ theorem mirStep_call_alignOfVal_sized_preserves_spatialPin
     hBind hNePin hNeBind hPinLoc hBindLoc hSet rfl
   exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
 
+/-- **`mirStep_assign_aggregate_rawPtr_wide_scalarAddr_preserves_spatialPin`**: executing
+`dstLoc = AggregateKind.rawPtr pointeeTy mutability [dataOp, metaOp]` from a provenance-free
+integer address `.scalar ⟨addr, ptrBytes⟩` and length `.scalar ⟨len, ptrBytes⟩`
+(`ptr::slice_from_raw_parts(NonNull::dangling().as_ptr(), len)`, `addr, len < scalarModulus ptrBytes`)
+into a local `dstLoc` disjoint from `l` and `bindings` steps `PureMirExec.mirStep`, preserves
+`spatialPinnedBlockHolds` and `spatialBindingsHold` without unpinning, and transports
+`MirWpConverges`. -/
+theorem mirStep_assign_aggregate_rawPtr_wide_scalarAddr_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {pointeeTy : Ty} {mutability : Mutability}
+    {dataOp metaOp : Operand} {span : String}
+    {addr len : Nat} {locals₁ locals₂ locals₃ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] }
+               (.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]),
+             span := span })
+    (hWide : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hAddr : addr < scalarModulus (layoutPointerBytes cur.layouts))
+    (hLen : len < scalarModulus (layoutPointerBytes cur.layouts))
+    (hData : evalOperand ms.frame.locals dataOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.scalar ⟨addr, layoutPointerBytes cur.layouts⟩) locals₁)
+    (hMetaOp : evalOperand locals₁ metaOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.scalar ⟨len, layoutPointerBytes cur.layouts⟩) locals₂)
+    (hPinLoc : locals₂[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₂[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hProt : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors dstLoc .none
+      .nil 0 0 (Trusted.Sequence.length ms.memory.callStack) = false)
+    (hSlot : Trusted.Sequence.get? locals₂ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals₂ dstLoc
+      (.init (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes cur.layouts⟩,
+        .scalar ⟨len, layoutPointerBytes cur.layouts⟩])) = some locals₃) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₃ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  have hRv := evalRvalue_aggregate_rawPtr_wide_scalarAddr_of_lt ms.frame.locals locals₁ locals₂
+    pointeeTy mutability dataOp metaOp ms.memory cur.localDecls cur.layouts addr len hWide hAddr
+    hLen hData hMetaOp
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_local hCur hPhase hBb hStmt hRv hProt hSlot hLive
+    hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
+    (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_assign_ptrMetadata_wide_scalarAddr_preserves_spatialPin`**: executing
+`dstLoc = PtrMetadata(op)` on a provenance-free wide pointer
+`.aggregate 0 [.scalar ⟨addr, ptrBytes⟩, .scalar ⟨len, ptrBytes⟩]`
+(`len < scalarModulus ptrBytes`) into a local `dstLoc` disjoint from `l` and `bindings` steps
+`PureMirExec.mirStep`, preserves `spatialPinnedBlockHolds` and `spatialBindingsHold` without
+unpinning, and transports `MirWpConverges`. -/
+theorem mirStep_assign_ptrMetadata_wide_scalarAddr_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {op : Operand} {span : String}
+    {addr len : Nat} {locals₁ locals₂ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] } (.unaryOp .ptrMetadata op),
+             span := span })
+    (hTy : isNonWidePtrAggregateTy (operandTy cur.localDecls cur.layouts op) = false)
+    (hLen : len < scalarModulus (layoutPointerBytes cur.layouts))
+    (hOp : evalOperand ms.frame.locals op ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes cur.layouts⟩,
+          .scalar ⟨len, layoutPointerBytes cur.layouts⟩]) locals₁)
+    (hPinLoc : locals₁[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₁[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hProt : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors dstLoc .none
+      .nil 0 0 (Trusted.Sequence.length ms.memory.callStack) = false)
+    (hSlot : Trusted.Sequence.get? locals₁ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals₁ dstLoc
+      (.init (.scalar ⟨len, layoutPointerBytes cur.layouts⟩)) = some locals₂) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₂ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  have hRv := evalRvalue_unaryOp_ptrMetadata_wide_scalarAddr_of_lt ms.frame.locals locals₁ op
+    ms.memory cur.localDecls cur.layouts addr len hTy hLen hOp
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_local hCur hPhase hBb hStmt hRv hProt hSlot hLive
+    hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
+    (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
 end WideSliceDstBridge
 
 end Anneal.PureLift.V2026_06_01Bridge

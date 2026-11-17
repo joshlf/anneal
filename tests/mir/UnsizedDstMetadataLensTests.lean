@@ -164,6 +164,31 @@ theorem arr_unsizedDst64 :
       (WidePtrVal.toValue 8 wide4) xs4 bytes16 :=
   UnsizedSliceDstAt.of_sliceTypedAt 8 (.uint .u32) mem0 arr_sliceTypedAt arr_liveImage
 
+theorem arr_typedAt_array4 :
+    TypedAt (ByteLensCodec.u32LE.array 4) p9.offsetBytes ⟨xs4, rfl⟩ bytes16 := by
+  rw [typedAt_iff]
+  exact ⟨by decide, rfl⟩
+
+/-- `PointerCoercion("Unsize")` (`*const [u32; 4] -> *const [u32]`) directly produces
+`UnsizedSliceDstAt` via `TypedAt.unsize_array_to_unsizedSliceDstAt`. -/
+theorem arr_unsize_to_unsizedDst64 :
+    let arrPtrTy : Ty := { kind := .rawPtr .not (.array (.uint .u32) 4), layoutIdx := 0 }
+    let decls : List LocalDecl :=
+      [{ mutability := .not, ty := arrPtrTy, debugName := some "arr_ptr" }]
+    let locs : List LocalSlot := [.init (.ptr p9 8)]
+    evalRvalue locs (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := [] })
+        { kind := slicePtrKind false .not (.uint .u32), layoutIdx := 1 }) mem0 decls layouts64 =
+      .ok (WidePtrVal.toValue 8 wide4) locs mem0 ∧
+    UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) mem0 wide4
+      (WidePtrVal.toValue 8 wide4) xs4 bytes16 :=
+  TypedAt.unsize_array_to_unsizedSliceDstAt [.init (.ptr p9 8)] [.init (.ptr p9 8)]
+    (.copy { local_ := 0, projection := [] }) mem0
+    [{ mutability := .not, ty := { kind := .rawPtr .not (.array (.uint .u32) 4), layoutIdx := 0 },
+       debugName := some "arr_ptr" }]
+    layouts64 false .not (.uint .u32) 1
+    { kind := .rawPtr .not (.array (.uint .u32) 4), layoutIdx := 0 } p9
+    rfl rfl rfl rfl rfl (fun h => nomatch h) rfl rfl arr_typedAt_array4
+
 theorem arr_unsizedDst32 :
     UnsizedSliceDstAt ByteLensCodec.u32LE 4 (.slice (.uint .u32)) mem0 wide4
       (WidePtrVal.toValue 4 wide4) xs4 bytes16 :=
@@ -647,9 +672,9 @@ theorem size_and_align_positive_witnesses :
       empty_and_zst_unsizedDst_witnesses.1
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
   obtain ⟨_, hMirZst, _, _⟩ :=
-    mirStep_call_sizeOfVal_slice (body := bodyZst) (cur := bodyZst) (s := sZst_0)
-      (p := p9) (len := 1000) (locals' := sZst_0.frame.locals)
-      (updatedLocals := sZst_1.frame.locals)
+    evalIntrinsic_sizeOfValRaw_slice_wide (body := bodyZst) (cur := bodyZst) (s := sZst_0)
+      (locals' := sZst_0.frame.locals) (updatedLocals := sZst_1.frame.locals)
+      empty_and_zst_unsizedDst_witnesses.2.2
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
   -- ZST `align_of_val::<[()]>` (`operandTy` fallback) writes `1`.
   obtain ⟨_, hMirZstAl, _, _, _⟩ :=
@@ -1270,12 +1295,16 @@ theorem metadata_without_deref_oob_and_disabled_contrast :
     evalNonSelectIntrinsicCall .sizeOfVal pinMs0 tgtU32 bodyU32.localDecls bodyU32.layouts []
       [WidePtrVal.toValue 8 wideOob5] localsOob { local_ := 2, projection := [] } 1 =
       writeIntrinsicReturn pinMs0 localsOob { local_ := 2, projection := [] } 1
-        (.scalar ⟨20, 8⟩) :=
-  ⟨rfl,
-   evalRvalue_unaryOp_ptrMetadata_wide _ _ (.copy { local_ := 1, projection := [] })
-     mem0 dstDecls layouts64 p9 5 rfl,
-   evalNonSelectIntrinsicCall_sizeOfVal_slice pinMs0 _ _ _ [] _
-     { local_ := 2, projection := [] } 1 (.uint .u32) 4 p9 5 rfl rfl (by decide)⟩
+        (.scalar ⟨20, 8⟩) := by
+  intro wideOob5 localsOob bodyU32 tgtU32
+  obtain ⟨hLenUb, hMetaOk⟩ :=
+    WidePtrVal.evalRvalue_len_oob_global_ub_and_ptrMetadata_ok localsOob localsOob
+      { local_ := 1, projection := [.deref] } (.copy { local_ := 1, projection := [] })
+      mem0 dstDecls layouts64 [] (.uint .u32) 0 arrAlloc16 4 wideOob5
+      rfl rfl rfl rfl rfl rfl rfl (by decide)
+  exact ⟨hLenUb, hMetaOk,
+    evalNonSelectIntrinsicCall_sizeOfVal_slice pinMs0 _ _ _ [] _
+      { local_ := 2, projection := [] } 1 (.uint .u32) 4 p9 5 rfl rfl (by decide)⟩
 
 /-- A `sizeAlignSliceCallerMir` state at block `bb` with `_1 := v` over `mem0`. -/
 def ubState (v : Value) (bb : Nat) : MachineState :=
@@ -1775,8 +1804,33 @@ def disabledLocals : List LocalSlot :=
 
 /-- **Metadata-without-deref under a disabled tag** (the brief's second contrast case): once the
 borrow `77` behind the raw `*const [u32]` `_1` is disabled, the dereferencing `Rvalue.len (*_1)`
-faults `.ub`, while `UnOp.ptrMetadata(_1)` still yields `4` and the live
-`size_of_val::<[u32]>(_1)` step still writes `16`: neither consults the borrow table. -/
+faults `.ub` (`WidePtrVal.evalRvalue_len_disabled_ub_and_ptrMetadata_ok`), while
+`UnOp.ptrMetadata(_1)` still yields `4` and the live `size_of_val::<[u32]>(_1)` step still writes
+`16`: neither consults the borrow table. Also exercises
+`mirStep_assign_aggregate_rawPtr_wide_scalarAddr_preserves_spatialPin` and
+`mirStep_assign_ptrMetadata_wide_scalarAddr_preserves_spatialPin` on a provenance-free empty
+slice while `_2 : [u32; 4]` is spatially pinned. -/
+def danglingPinBody : CapturedMir :=
+  { (Anneal.MirLoops.mkMirBody "test::dangling_slice_metadata_with_pinned_array" 1
+      [{ mutability := .mut, ty := usizeTy, debugName := some "_0" },
+       { mutability := .not, ty := usizeTy, debugName := some "addr" },
+       { mutability := .mut, ty := pinArrTy, debugName := some "pinned_arr" },
+       { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 },
+         debugName := some "bound_u32" },
+       { mutability := .mut, ty := usizeTy, debugName := some "zero_len" },
+       { mutability := .mut, ty := { kind := .rawPtr .not (.slice (.uint .u32)), layoutIdx := 1 },
+         debugName := some "dang_sl" }]
+      [retBlock
+         [{ kind := .assign { local_ := 5, projection := [] }
+              (.aggregate (.rawPtr sliceU32Ty .not)
+                [.copy { local_ := 1, projection := [] },
+                 .copy { local_ := 4, projection := [] }])
+            span := "stmt_dangling_from_raw_parts" },
+          { kind := .assign { local_ := 0, projection := [] }
+              (.unaryOp .ptrMetadata (.copy { local_ := 5, projection := [] }))
+            span := "stmt_dangling_ptr_metadata" }]]) with
+    layouts := layouts64 }
+
 theorem metadata_without_deref_disabled_tag_contrast :
     let bodyU32 := sizeAlignSliceCallerMir (.uint .u32)
     let s0 : MachineState :=
@@ -1785,20 +1839,68 @@ theorem metadata_without_deref_disabled_tag_contrast :
       { frame := { blockIdx := 1, stmtIdx := 0,
                    locals := disabledLocals.set 2 (.init (.scalar ⟨16, 8⟩)) }
         memory := disabledMem }
+    let dLocals0 : List LocalSlot :=
+      [.uninit, .init (.scalar ⟨4, 8⟩), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+       .init (.scalar ⟨0, 8⟩), .uninit]
+    let dMs0 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := dLocals0 }
+        memory := { borrows := pinBorrows } }
     evalRvalue disabledLocals (.len { local_ := 1, projection := [.deref] }) disabledMem dstDecls
         layouts64 = .ub ∧
     evalRvalue disabledLocals (.unaryOp .ptrMetadata (.copy { local_ := 1, projection := [] }))
         disabledMem dstDecls layouts64 = .ok (.scalar ⟨4, 8⟩) disabledLocals disabledMem ∧
-    PureMirExec.mirStep bodyU32 s0 = .cont s1 := by
-  intro bodyU32 s0 s1
+    PureMirExec.mirStep bodyU32 s0 = .cont s1 ∧
+    (∃ dMs1 dMs2,
+      PureMirExec.mirStep danglingPinBody dMs0 = .cont dMs1 ∧
+      PureMirExec.mirStep danglingPinBody dMs1 = .cont dMs2 ∧
+      spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt dMs2 ∧
+      spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt dMs2) := by
+  intro bodyU32 s0 s1 dLocals0 dMs0
+  let dLocals1 : List LocalSlot :=
+    [.uninit, .init (.scalar ⟨4, 8⟩), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+     .init (.scalar ⟨0, 8⟩), .init (.aggregate 0 [.scalar ⟨4, 8⟩, .scalar ⟨0, 8⟩])]
+  let dLocals2 : List LocalSlot :=
+    [.init (.scalar ⟨0, 8⟩), .init (.scalar ⟨4, 8⟩), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+     .init (.scalar ⟨0, 8⟩), .init (.aggregate 0 [.scalar ⟨4, 8⟩, .scalar ⟨0, 8⟩])]
+  obtain ⟨hLenUb, hMetaOk⟩ :=
+    WidePtrVal.evalRvalue_len_disabled_ub_and_ptrMetadata_ok disabledLocals disabledLocals
+      { local_ := 1, projection := [.deref] } (.copy { local_ := 1, projection := [] })
+      disabledMem dstDecls layouts64 [] (.uint .u32) 0
+      { tag := 77, targetLocal := 0, targetProjection := [], perm := .disabled,
+        rangeOffset := 0, rangeLen := 16 }
+      wide77 rfl rfl rfl rfl rfl rfl
   obtain ⟨_, hMir, _, _⟩ := mirStep_call_sizeOfVal_slice (body := bodyU32) (cur := bodyU32)
     (s := s0) (p := ⟨77, 0⟩) (len := 4) (locals' := disabledLocals)
     (updatedLocals := s1.frame.locals)
     rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
-  exact ⟨rfl,
-    evalRvalue_unaryOp_ptrMetadata_slice _ _ (.copy { local_ := 1, projection := [] })
-      disabledMem dstDecls layouts64 wide77 rfl,
-    hMir⟩
+  have hPin0 : spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt dMs0 :=
+    ⟨_, _, [], _, rfl, ⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+      ⟨_, rfl, rfl, rfl, rfl⟩⟩
+  have hBind0 : spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt dMs0 :=
+    ⟨⟨trivial, trivial⟩,
+      ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩
+  have hNeBind : ∀ d, d ≠ 3 → ∀ b, b ∈ [(1, 3, ([] : SubPath))] → b.2.1 ≠ d := by
+    intro d hd b hb
+    cases hb with
+    | head => exact fun h => hd h.symm
+    | tail _ h => cases h
+  obtain ⟨hD1, hPin1, hBind1, _⟩ :=
+    mirStep_assign_aggregate_rawPtr_wide_scalarAddr_preserves_spatialPin tagOfLoan
+      (body := danglingPinBody) (cur := danglingPinBody) (ms := dMs0) (dstLoc := 5)
+      (addr := 4) (len := 0) (locals₁ := dLocals0) (locals₂ := dLocals0) (locals₃ := dLocals1)
+      hPin0 hBind0 (by decide) (hNeBind 5 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl (by decide) (by decide) rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl rfl
+  obtain ⟨hD2, hPin2, hBind2, _⟩ :=
+    mirStep_assign_ptrMetadata_wide_scalarAddr_preserves_spatialPin tagOfLoan
+      (body := danglingPinBody) (cur := danglingPinBody) (dstLoc := 0)
+      (addr := 4) (len := 0) (locals₁ := dLocals1) (locals₂ := dLocals2)
+      hPin1 hBind1 (by decide) (hNeBind 0 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl (by decide) rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl rfl
+  exact ⟨hLenUb, hMetaOk, hMir, _, _, hD1, hD2, hPin2, hBind2⟩
 
 /-! ## 8. Automated `run_cmd` Axiom & Reachability Audit -/
 
@@ -1834,18 +1936,27 @@ run_cmd do
                   if subAxs.contains a then
                     culprits := sub :: culprits
                 throwError "{n} depends on non-constructive or disallowed axiom {a} via {culprits}"
-            -- Projection discipline (§2.4): no new definition may reach `Prod.casesOn` /
-            -- `Prod.rec` / `Prod.recOn`, directly or through a compiled `match` on pairs.
+            -- Projection discipline (§2.4): neither new definitions (nor their transitive matcher
+            -- closures) nor new theorem statements (`ci.type`) may reach `Prod.casesOn` /
+            -- `Prod.rec` / `Prod.recOn`.
+            for bad in [``Prod.casesOn, ``Prod.rec, ``Prod.recOn] do
+              if ci.type.getUsedConstantsAsSet.contains bad then
+                throwError "projection discipline violated in statement type of {n}: reaches {bad}"
             if ci matches .defnInfo _ then
               let mut toCheck : Array Name := #[n]
-              for c in ci.getUsedConstantsAsSet do
-                if Lean.Meta.isMatcherCore env c then
-                  toCheck := toCheck.push c
-              for d in toCheck do
+              let mut seen : NameSet := ({} : NameSet).insert n
+              let mut idx : Nat := 0
+              while idx < toCheck.size do
+                let d := toCheck[idx]!
+                idx := idx + 1
                 if let some dci := env.find? d then
                   for bad in [``Prod.casesOn, ``Prod.rec, ``Prod.recOn] do
                     if dci.getUsedConstantsAsSet.contains bad then
                       throwError "projection discipline violated: {n} reaches {bad} via {d}"
+                  for c in dci.getUsedConstantsAsSet do
+                    if Lean.Meta.isMatcherCore env c && !seen.contains c then
+                      seen := seen.insert c
+                      toCheck := toCheck.push c
             count := count + 1
             if ci matches .thmInfo _ then
               theorems := theorems + 1
