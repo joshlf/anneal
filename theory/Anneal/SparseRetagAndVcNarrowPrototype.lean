@@ -41,12 +41,18 @@ Anneal's real `Trusted.Rustc.V2026_06_01` and `Anneal.MirLiftCore` types with ze
   `hoistTraitImpls`, and external-contract admissibility (`UntrustedAdmissible`, summary
   agreement); `checkBatchedVcConeNarrowCertMask` / `BatchedVcConeNarrowCert.ofCheckMask` hoist only
   the dropped bodies' `TraitImplEntry`s (`rustc-capture` layout, where kept impl bodies carry their
-  own entries). `computeBatchedVcNarrowCert` / `collectTraitConeBodies` compute the certificate
-  data; `stepMirFn_extCallInCone` shows external calls of cone-safe states stay in the cone. Core theorems: `runMirExecBounded_narrow_of_batchedCert`,
-  `wpMirExecSym_narrow_of_batchedCert`, and `vcMirWithCallees_narrow_of_batchedCert` over a
-  contract-aware WP (`wpMirExecExt`) in which cone summaries genuinely restrict external-call
-  answers (`canary_externalSummary_vc`). `coerceValueAt` is sealed (`@[irreducible]`) with targeted
-  rewrite lemmas.
+  own entries); `checkBatchedVcConeNarrowCertGeneral` / `BatchedVcConeNarrowCert.ofCheckGeneral`
+  accept arbitrary keep/drop masks (mixed trait partitions, via `TraitFilterCovers`).
+  `computeBatchedVcNarrowCert` / `collectTraitConeBodies` compute the certificate data. Core
+  theorems: `runMirExecBounded_narrow_of_batchedCert`, `wpMirExecSym_narrow_of_batchedCert`, and
+  `vcMirWithCallees_narrow_of_batchedCert` over a contract-aware WP (`wpMirExecExt`) in which cone
+  summaries genuinely restrict external-call answers (`canary_externalSummary_vc`). Cone filtering
+  is conservative for every execution (`wpMirExecExt_mono_cone`); it loses nothing per step
+  (`stepMirFn_extCallInCone`, and cone safety survives `resumeExternalCall` /
+  `resumeExternalDivergingCall` for code-frame-preserving answers), but no whole-execution
+  losslessness theorem is proved. A symbolic VC over the whole non-overflowing `u32` input range
+  (`symTrait_vc_narrow_of_lt`) and its overflow canary exercise the narrowing on symbolic inputs.
+  `coerceValueAt` is sealed (`@[irreducible]`) with targeted rewrite lemmas.
 * **Part C (`DemandCallerLocationEnv`, `proofs-rs/lean-miri` PR #67 Schema 15)**: demand-time
   `#[track_caller]` `core::panic::Location` + deduplicated filename allocation in `Memory.globals`
   (fresh ids drawn from `max nextAllocId nextTag`, advancing both, so they avoid live borrow tags),
@@ -54,7 +60,10 @@ Anneal's real `Trusted.Rustc.V2026_06_01` and `Anneal.MirLiftCore` types with ze
   resolution with per-crate `-Zlocation-detail` policies (all 8 combinations, `Option` call sites),
   and general theorems over ALL call-site tables and traces: `demandCallerLocation_bisim_eager`,
   `demandCallerLocation_no_call_zero_allocs`, `eagerCallerLocation_clutter`, and
-  `allocRenamingRel_of_readLocations`.
+  `allocRenamingRel_of_readLocations`; on traces of borrow-monotone statements (`isBorrowMonotoneStmt`,
+  including retags and `&`/`&mut` of locals, on arbitrary memory) the bisimulation also holds through
+  borrow-aware reads (`demandCallerLocation_bisim_eager_borrowAware`). The trace model has no
+  terminators.
 * **Part D (`LazyWriteChain` & `bvShiftSafe` / `shiftLeftBitsSafe`, `bilid` `cl/1023450318` &
   `cl/1023378691`, `leanprover/lean4` PRs #16501 & #16504)**: static-width lazy 1-layer
   overwrite-stripping writes (`mkLazyWrite`: `O(1)` per write) vs. spine-stripping `mkEagerWrite`,
@@ -3324,6 +3333,69 @@ theorem wpMirExecExt_of_wpMirExecSym (contracts : ExternalContractInterp) (cone 
         | none =>
           exact fun ans => wpMirExecExt_of_wpMirExecSym contracts cone extEnv body post fuel (k ans) (h ans)
 
+/-- A summary trusted on `cone₁` is trusted on every larger `cone₂`. -/
+theorem coneSummary?_mono {cone₁ cone₂ : List DefPath} {extEnv : ExternalSummaryEnv}
+    {dp : DefPath} {sm : ExternalCallSummary}
+    (h_sub : ∀ dp, inCone cone₁ dp = true → inCone cone₂ dp = true)
+    (h : coneSummary? cone₁ extEnv dp = some sm) :
+    coneSummary? cone₂ extEnv dp = some sm := by
+  unfold coneSummary? at h ⊢
+  cases h₁ : inCone cone₁ dp with
+  | true =>
+    rw [h₁] at h
+    rw [h_sub dp h₁]
+    exact h
+  | false =>
+    rw [h₁] at h
+    nomatch h
+
+/-- **Cone filtering is conservative (`wpMirExecExt_mono_cone`)**: trusting the summaries of a
+larger path set (`cone₁ ⊆ cone₂`) can only *weaken* the contract-aware WP. A VC discharged with
+cone-filtered summaries therefore also holds when every summary of a larger cone (in particular
+every summary of `extEnv`) is trusted. Holds for all fuel, states, contracts, and summary
+environments, with no cone-safety hypothesis. The converse (filtering loses nothing) needs every
+reached external call to target `cone₁`; see `coneSummary?_eq_of_stepMirFn_extCall` for one step
+and `closedInvPoly_resumeExternalCall` for resumption after code-frame-preserving answers. -/
+theorem wpMirExecExt_mono_cone (contracts : ExternalContractInterp) {cone₁ cone₂ : List DefPath}
+    (extEnv : ExternalSummaryEnv) (body : CapturedMir) (post : MirOutcome → Prop)
+    (h_sub : ∀ dp, inCone cone₁ dp = true → inCone cone₂ dp = true) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      wpMirExecExt contracts cone₁ extEnv fuel body st post →
+        wpMirExecExt contracts cone₂ extEnv fuel body st post
+  | 0, _, h => h
+  | fuel + 1, st, h => by
+    show evalNodeWPExt contracts cone₂ extEnv _ post (stepMirState body st)
+    change evalNodeWPExt contracts cone₁ extEnv _ post (stepMirState body st) at h
+    revert h
+    cases stepMirState body st with
+    | ret out => exact id
+    | tau st' => exact wpMirExecExt_mono_cone contracts extEnv body post h_sub fuel st'
+    | vis e k =>
+      rcases e with fk | obs | ⟨req⟩
+      · exact id
+      · exact wpMirExecExt_mono_cone contracts extEnv body post h_sub fuel (k PUnit.unit)
+      · cases req with | call req => ?_
+        intro h
+        have ih := wpMirExecExt_mono_cone contracts extEnv body post h_sub fuel
+        change (match coneSummary? cone₁ extEnv req.defPath with
+          | some s => ∀ ans, contracts s.summaryTag req ans →
+              wpMirExecExt contracts cone₁ extEnv fuel body (k ans) post
+          | none => ∀ ans, wpMirExecExt contracts cone₁ extEnv fuel body (k ans) post) at h
+        show match coneSummary? cone₂ extEnv req.defPath with
+          | some s => ∀ ans, contracts s.summaryTag req ans →
+              wpMirExecExt contracts cone₂ extEnv fuel body (k ans) post
+          | none => ∀ ans, wpMirExecExt contracts cone₂ extEnv fuel body (k ans) post
+        cases h₁ : coneSummary? cone₁ extEnv req.defPath with
+        | some sm =>
+          rw [h₁] at h
+          rw [coneSummary?_mono h_sub h₁]
+          exact fun ans hc => ih (k ans) (h ans hc)
+        | none =>
+          rw [h₁] at h
+          cases coneSummary? cone₂ extEnv req.defPath with
+          | some _ => exact fun ans _ => ih (k ans) (h ans)
+          | none => exact fun ans => ih (k ans) (h ans)
+
 /-- A run that terminates without external calls (`runMirExecBounded = some out`) discharges
 the contract-aware WP exactly when `post out` holds (sufficiency). -/
 theorem wpMirExecExt_of_run (contracts : ExternalContractInterp) (cone : List DefPath)
@@ -4376,6 +4448,57 @@ theorem stepConeSafeTrait_of_resumeExternalCall {cone : List DefPath} {root : Ca
   stepConeSafeTrait_of_closedInvPoly h_root h_cone
     (closedInvPoly_resumeExternalCall h_inv h_ans h_res)
 
+/-- `applyUnwindAction` (the panicked branch shared by `resumeExternalCall` and
+`resumeExternalDivergingCall`) preserves `ClosedInvPoly` from the answer memory. -/
+theorem closedInvPoly_applyUnwindAction {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry} {s s' : MachineState}
+    {localsAfterArgs : List LocalSlot} {memAfter : Memory} {unwind : UnwindAction}
+    (h_after : ClosedInvPoly cone root c₁ ti₁ { frame := s.frame, memory := memAfter })
+    (h_res : applyUnwindAction s localsAfterArgs memAfter unwind = .running s') :
+    ClosedInvPoly cone root c₁ ti₁ s' := by
+  unfold applyUnwindAction at h_res
+  cases unwind with
+  | unreachable => cases h_res
+  | terminate => cases h_res
+  | continue_ =>
+    exact closedInvPoly_unwindFromCallStack memAfter.callStack memAfter
+      h_after.1 h_after.2.1 h_after.2.2.2 s' h_res
+  | cleanup bb =>
+    cases h_res
+    exact h_after
+
+/-- **Diverging external calls (`closedInvPoly_resumeExternalDivergingCall`)**: the continuation
+of a diverging external call (`call ... -> !`, `resumeExternalDivergingCall`) only resumes on a
+panicked answer, through `applyUnwindAction`; a code-frame-preserving answer keeps
+`ClosedInvPoly`. (External *tail* calls, `resumeExternalTailCall`, are not covered.) -/
+theorem closedInvPoly_resumeExternalDivergingCall {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry} {s s' : MachineState}
+    {localsAfterArgs : List LocalSlot} {unwind : UnwindAction} {ans : MirCallAns}
+    (h_inv : ClosedInvPoly cone root c₁ ti₁ s)
+    (h_ans : AnsPreservesCodeFrame s.memory ans)
+    (h_res : resumeExternalDivergingCall s localsAfterArgs unwind ans = .running s') :
+    ClosedInvPoly cone root c₁ ti₁ s' := by
+  cases ans with
+  | returned _ _ => cases h_res
+  | aborted => cases h_res
+  | panicked memAfter =>
+    obtain ⟨hc, hti, hac, hb⟩ := h_ans
+    change applyUnwindAction s localsAfterArgs memAfter unwind = .running s' at h_res
+    exact closedInvPoly_applyUnwindAction (s := s)
+      (closedInvPoly_of_callerBodies h_inv hc hti hac hb) h_res
+
+theorem stepConeSafeTrait_of_resumeExternalDivergingCall {cone : List DefPath}
+    {root : CapturedMir} {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry} {s s' : MachineState}
+    {localsAfterArgs : List LocalSlot} {unwind : UnwindAction} {ans : MirCallAns}
+    (h_root : bodyCallsInConePoly cone root = true)
+    (h_cone : (coneBodies cone c₁).all (bodyCallsInConePoly cone) = true)
+    (h_inv : ClosedInvPoly cone root c₁ ti₁ s)
+    (h_ans : AnsPreservesCodeFrame s.memory ans)
+    (h_res : resumeExternalDivergingCall s localsAfterArgs unwind ans = .running s') :
+    StepConeSafeTrait cone root s' :=
+  stepConeSafeTrait_of_closedInvPoly h_root h_cone
+    (closedInvPoly_resumeExternalDivergingCall h_inv h_ans h_res)
+
 /-- Two-call external root body (`protoTwoExtCallsRootMir`):
 - `bb0`: `_0 = ext::seed() -> bb1` (external call #1),
 - `bb1`: `_0 = ext::add_twenty(_0) -> bb2` (external call #2, reached *after* resuming from `ext::seed`),
@@ -4401,8 +4524,9 @@ def protoTwoExtCone : List DefPath := ["ext::seed", "ext::add_twenty"]
 def protoTwoExtSummaries : ExternalSummaryEnv :=
   [⟨"ext::seed", 10⟩, ⟨"ext::add_twenty", 11⟩]
 
-/-- Contracts for `ext::seed` (tag `10`: returns `11 : u32`) and `ext::add_twenty` (tag `11`: adds
-`20` to its `u32` argument). -/
+/-- Contracts for `ext::seed` (tag `10`: returns `11 : u32`) and `ext::add_twenty` (tag `11`: a
+point contract relating only the argument `11 : u32` to the result `31 : u32`; it does not specify
+`add_twenty` on other inputs). Both answers return the request memory unchanged. -/
 def protoTwoExtContracts : ExternalContractInterp := fun tag req ans =>
   (tag = 10 ∧ ans = .returned (.scalar ⟨11, 4⟩) req.memory) ∨
   (tag = 11 ∧ req.args = [.scalar ⟨11, 4⟩] ∧ ans = .returned (.scalar ⟨31, 4⟩) req.memory)
@@ -4575,6 +4699,64 @@ theorem canary_twoExternalCalls_vc :
       nomatch hp'
     · nomatch hv
     · nomatch hv
+
+/-- Root body whose `bb0` performs a *diverging* external call `ext::diverge() -> !` with
+`unwind: cleanup bb1`; `bb1` is a cleanup pad ending in `UnwindResume`. -/
+def protoDivergingExtRootMir : CapturedMir :=
+  { protoTwoExtCallsRootMir with
+    defPath := "proto::diverging_ext_root"
+    basicBlocks := [
+      { statements := []
+        terminator :=
+          ⟨.call (protoFnConst "ext::diverge" []) [] ⟨0, []⟩ none (.cleanup 1), "call_div"⟩
+        isCleanup := false },
+      { statements := [], terminator := ⟨.unwindResume, "resume"⟩, isCleanup := true } ] }
+
+def protoDivergingInitState : MachineState :=
+  MirFuelFree.initMachineStateWithMemoryAndCallees protoDivergingExtRootMir [] emptyMemory []
+
+def protoDivergingCone : List DefPath := ["ext::diverge"]
+
+def protoDivergingReq : MirCallReq :=
+  match stepMirState protoDivergingExtRootMir (.running protoDivergingInitState) with
+  | .vis (.inr (.inr (.call req))) _ => req
+  | _ => { defPath := "", args := [], memory := emptyMemory }
+
+def protoDivergingCont : MirCallAns → MirExecState :=
+  match stepMirState protoDivergingExtRootMir (.running protoDivergingInitState) with
+  | .vis (.inr (.inr (.call _))) k => k
+  | _ => fun _ => .faulted .ub
+
+theorem protoDivergingStep_eq :
+    stepMirState protoDivergingExtRootMir (.running protoDivergingInitState) =
+      .vis (.inr (.inr (.call protoDivergingReq))) protoDivergingCont := rfl
+
+/-- State in the cleanup pad `bb1` after `ext::diverge` panics (memory unchanged). -/
+def protoDivergingStateAfterPanic : MachineState :=
+  match resumeExternalDivergingCall protoDivergingInitState protoDivergingInitState.frame.locals
+      (.cleanup 1) (.panicked protoDivergingInitState.memory) with
+  | .running s₁ => s₁
+  | _ => protoDivergingInitState
+
+/-- **Diverging external call canary (`canary_divergingExternalCall_coneSafe`)**: the real
+`Trusted` step of `protoDivergingExtRootMir` emits the external call `ext::diverge` whose continuation
+on a panicked answer is the cleanup-pad state `protoDivergingStateAfterPanic` (block `1`), which is
+cone-safe by `stepConeSafeTrait_of_resumeExternalDivergingCall`; a normal return from the diverging
+call is UB. -/
+theorem canary_divergingExternalCall_coneSafe :
+    protoDivergingReq.defPath = "ext::diverge" ∧
+    protoDivergingCont (.panicked protoDivergingReq.memory) =
+      .running protoDivergingStateAfterPanic ∧
+    protoDivergingStateAfterPanic.frame.blockIdx = 1 ∧
+    StepConeSafeTrait protoDivergingCone protoDivergingExtRootMir protoDivergingStateAfterPanic ∧
+    protoDivergingCont (.returned (.scalar ⟨0, 4⟩) protoDivergingReq.memory) = .faulted .ub := by
+  refine ⟨rfl, rfl, rfl, ?_, rfl⟩
+  exact stepConeSafeTrait_of_resumeExternalDivergingCall (s := protoDivergingInitState)
+    (localsAfterArgs := protoDivergingInitState.frame.locals) (unwind := .cleanup 1)
+    (ans := .panicked protoDivergingInitState.memory)
+    (by decide +kernel) (by decide +kernel)
+    (closedInvPoly_entry (fullCallees := []) (extra₁ := []) rfl rfl rfl rfl)
+    ⟨rfl, rfl, rfl, CallerBodiesEq.refl _⟩ rfl
 
 /-! #### Genuine Universally Quantified Symbolic VC Over Trait Dispatch & Checked `u32` Addition -/
 
@@ -4749,30 +4931,55 @@ theorem stepMirState_assign_local (rootBody : CapturedMir) (s : MachineState)
   dsimp only
   rw [h_get, h_set, h_prot]
 
-/-- **Genuine Symbolic VC over Narrowed Callees & Hoisted Trait Impls (`symTrait_vc_narrow`)**:
-For *every* `x : Nat`, the symbolic input `x % 1000` flows through polymorphic `sym_poly::<u32>(_1)`
-(`AddUnchecked(_1, 7)`) and trait-dispatched `<Circle as Area>::area(_0)` (`AddUnchecked(_1, 24)`)
-to return `(x % 1000) + 31 : u32`. Neither `rfl` nor `decide +kernel` can discharge this theorem
-because `evalScalarBinOp .addUnchecked` branches on `Nat.ble 4294967296 ((x % 1000) + 7)` and
-`Nat.ble 4294967296 (((x % 1000) + 7) + 24)`. -/
-theorem symTrait_vc_narrow (x : Nat) :
+/-- Inversion of `wpMirExecExt_step_tau`: a WP over a silent step is the WP of its successor. -/
+theorem wpMirExecExt_inv_tau {contracts : ExternalContractInterp} {cone : List DefPath}
+    {extEnv : ExternalSummaryEnv} {fuel : Nat} {rootBody : CapturedMir}
+    {st st' : MirExecState} {post : MirOutcome → Prop}
+    (hstep : stepMirState rootBody st = .tau st')
+    (hwp : wpMirExecExt contracts cone extEnv (fuel + 1) rootBody st post) :
+    wpMirExecExt contracts cone extEnv fuel rootBody st' post := by
+  unfold wpMirExecExt at hwp
+  rw [hstep] at hwp
+  exact hwp
+
+/-- A state whose next step faults (`MirStepNode.fail`, e.g. UB) satisfies no contract-aware WP. -/
+theorem not_wpMirExecExt_of_fail {contracts : ExternalContractInterp} {cone : List DefPath}
+    {extEnv : ExternalSummaryEnv} {rootBody : CapturedMir} {st : MirExecState}
+    {post : MirOutcome → Prop} (fk : FailureKind)
+    (hstep : stepMirState rootBody st = MirStepNode.fail fk) :
+    ∀ fuel, ¬ wpMirExecExt contracts cone extEnv fuel rootBody st post
+  | 0 => id
+  | _ + 1 => by
+    intro hwp
+    unfold wpMirExecExt at hwp
+    rw [hstep] at hwp
+    exact hwp
+
+/-- **Symbolic VC over Narrowed Callees & Hoisted Trait Impls (`symTrait_vc_narrow_of_lt`)**:
+for *every* input `n` with `n + 31 < 2^32` (the whole non-overflowing `u32` range), `n` flows through
+polymorphic `sym_poly::<u32>(_1)` (`AddUnchecked(_1, 7)`) and trait-dispatched
+`<Circle as Area>::area(_0)` (`AddUnchecked(_1, 24)`) to return `n + 31 : u32`, both on the narrowed
+callee table (proved step by step) and on the full table (transferred by `protoSymBatchedCert`).
+Each `AddUnchecked` step branches on `Nat.ble 4294967296 (n + k)`, which is stuck on a free `n` and is
+discharged by `omega` from `h_lt`; `symTrait_vc_overflow_fails` shows the bound is necessary. -/
+theorem symTrait_vc_narrow_of_lt (n : Nat) (h_lt : n + 31 < 4294967296) :
     vcMirWithCallees protoSymContracts 8 symTraitRootMir
-      (symTraitInitState (x % 1000) protoSymFullCallees)
-      protoSymNarrowCallees protoSymHoistedExtra [] protoSymCone (symTraitPost (x % 1000)) ∧
+      (symTraitInitState n protoSymFullCallees)
+      protoSymNarrowCallees protoSymHoistedExtra [] protoSymCone (symTraitPost n) ∧
     vcMirWithCallees protoSymContracts 8 symTraitRootMir
-      (symTraitInitState (x % 1000) protoSymFullCallees)
-      protoSymFullCallees [] [] protoSymCone (symTraitPost (x % 1000)) := by
-  have h_ovf1 : Nat.ble 4294967296 (Nat.add (x % 1000) 7) = false := by
+      (symTraitInitState n protoSymFullCallees)
+      protoSymFullCallees [] [] protoSymCone (symTraitPost n) := by
+  have h_ovf1 : Nat.ble 4294967296 (Nat.add n 7) = false := by
     rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]
-    change ¬(4294967296 ≤ (x % 1000) + 7)
+    change ¬(4294967296 ≤ n + 7)
     omega
-  have h_ovf2 : Nat.ble 4294967296 (Nat.add (Nat.add (x % 1000) 7) 24) = false := by
+  have h_ovf2 : Nat.ble 4294967296 (Nat.add (Nat.add n 7) 24) = false := by
     rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]
-    change ¬(4294967296 ≤ ((x % 1000) + 7) + 24)
+    change ¬(4294967296 ≤ (n + 7) + 24)
     omega
   have h_narrow : vcMirWithCallees protoSymContracts 8 symTraitRootMir
-      (symTraitInitState (x % 1000) protoSymFullCallees)
-      protoSymNarrowCallees protoSymHoistedExtra [] protoSymCone (symTraitPost (x % 1000)) := by
+      (symTraitInitState n protoSymFullCallees)
+      protoSymNarrowCallees protoSymHoistedExtra [] protoSymCone (symTraitPost n) := by
     unfold vcMirWithCallees
     refine wpMirExecExt_step_tau rfl ?_
     refine wpMirExecExt_step_tau
@@ -4785,14 +4992,48 @@ theorem symTrait_vc_narrow (x : Nat) :
         (evalRvalue_addUnchecked_u32 _ _ _ rfl h_ovf2) rfl rfl rfl) ?_
     refine wpMirExecExt_step_tau rfl ?_
     refine wpMirExecExt_step_ret rfl ?_
-    exact congrArg (fun n => Value.scalar ⟨n, 4⟩)
-      (by change ((x % 1000) + 7) + 24 = (x % 1000) + 31; omega)
+    exact congrArg (fun m => Value.scalar ⟨m, 4⟩)
+      (by change (n + 7) + 24 = n + 31; omega)
   refine ⟨h_narrow, ?_⟩
   exact (vcMirWithCallees_narrow_of_batchedCert protoSymBatchedCert protoSymContracts 8
-    (symTraitInitState (x % 1000) protoSymFullCallees) rfl rfl rfl rfl
-    (symTraitPost (x % 1000))
+    (symTraitInitState n protoSymFullCallees) rfl rfl rfl rfl
+    (symTraitPost n)
     (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl)
     (fun _ _ _ => Iff.rfl)).mp h_narrow
+
+/-- `symTrait_vc_narrow_of_lt` on the symbolic family `x % 1000` (used by the benchmarks). -/
+theorem symTrait_vc_narrow (x : Nat) :
+    vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState (x % 1000) protoSymFullCallees)
+      protoSymNarrowCallees protoSymHoistedExtra [] protoSymCone (symTraitPost (x % 1000)) ∧
+    vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState (x % 1000) protoSymFullCallees)
+      protoSymFullCallees [] [] protoSymCone (symTraitPost (x % 1000)) :=
+  symTrait_vc_narrow_of_lt (x % 1000) (by omega)
+
+/-- **Overflow canary (`symTrait_vc_overflow_fails`)**: at the in-range `u32` input
+`4294967290`, `sym_poly`'s `AddUnchecked(_1, 7)` overflows, the step faults with UB, and the VC is
+*false* on the narrowed and on the full callee table. So the `AddUnchecked` obligations are live:
+the bound `n + 31 < 2^32` of `symTrait_vc_narrow_of_lt` cannot be dropped. -/
+theorem symTrait_vc_overflow_fails :
+    ¬ vcMirWithCallees protoSymContracts 8 symTraitRootMir
+        (symTraitInitState 4294967290 protoSymFullCallees)
+        protoSymNarrowCallees protoSymHoistedExtra [] protoSymCone (symTraitPost 4294967290) ∧
+    ¬ vcMirWithCallees protoSymContracts 8 symTraitRootMir
+        (symTraitInitState 4294967290 protoSymFullCallees)
+        protoSymFullCallees [] [] protoSymCone (symTraitPost 4294967290) := by
+  have h_narrow : ¬ vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState 4294967290 protoSymFullCallees)
+      protoSymNarrowCallees protoSymHoistedExtra [] protoSymCone (symTraitPost 4294967290) := by
+    intro h
+    unfold vcMirWithCallees at h
+    exact not_wpMirExecExt_of_fail .ub rfl 7 (wpMirExecExt_inv_tau rfl h)
+  refine ⟨h_narrow, fun h_full => h_narrow ?_⟩
+  exact (vcMirWithCallees_narrow_of_batchedCert protoSymBatchedCert protoSymContracts 8
+    (symTraitInitState 4294967290 protoSymFullCallees) rfl rfl rfl rfl
+    (symTraitPost 4294967290)
+    (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl)
+    (fun _ _ _ => Iff.rfl)).mpr h_full
 
 /-! ## Part C: `DemandCallerLocationEnv` (`proofs-rs/lean-miri` PR #67 Schema 15) -/
 

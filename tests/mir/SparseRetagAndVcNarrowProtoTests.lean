@@ -732,6 +732,53 @@ theorem test_partB_symbolic_trait_vc (x : Nat) :
   ⟨symTraitInitState_eq_initMachineState (x % 1000),
    protoSymBatchedCert_check.1, (symTrait_vc_narrow x).1, (symTrait_vc_narrow x).2⟩
 
+/-- The symbolic VC on the whole non-overflowing `u32` range (`symTrait_vc_narrow_of_lt` at the
+largest admissible input `4294967264 = 2^32 - 32`) and the overflow canary
+(`symTrait_vc_overflow_fails`: at `4294967290` the first `AddUnchecked` is UB and the VC is false on
+the narrowed and on the full callee table). -/
+theorem test_partB_symbolic_vc_range :
+    vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState 4294967264 protoSymFullCallees)
+      protoSymFullCallees [] [] protoSymCone (symTraitPost 4294967264) ∧
+    ¬ vcMirWithCallees protoSymContracts 8 symTraitRootMir
+        (symTraitInitState 4294967290 protoSymFullCallees)
+        protoSymNarrowCallees protoSymHoistedExtra [] protoSymCone (symTraitPost 4294967290) ∧
+    ¬ vcMirWithCallees protoSymContracts 8 symTraitRootMir
+        (symTraitInitState 4294967290 protoSymFullCallees)
+        protoSymFullCallees [] [] protoSymCone (symTraitPost 4294967290) :=
+  ⟨(symTrait_vc_narrow_of_lt 4294967264 (by decide)).2,
+   symTrait_vc_overflow_fails.1, symTrait_vc_overflow_fails.2⟩
+
+/-- Cone filtering is conservative (`wpMirExecExt_mono_cone`): the 2-call VC proved with summaries
+trusted on `protoTwoExtCone` still holds when summaries are trusted on a larger cone. -/
+theorem test_partB_cone_filter_conservative :
+    vcMirWithCallees protoTwoExtContracts 4 protoTwoExtCallsRootMir protoTwoExtInitState [] []
+      protoTwoExtSummaries ("proto::two_ext_root" :: protoTwoExtCone) protoTwoExtPost :=
+  wpMirExecExt_mono_cone protoTwoExtContracts protoTwoExtSummaries protoTwoExtCallsRootMir
+    protoTwoExtPost (fun _ h => inCone_iff.mpr (List.mem_cons_of_mem _ (inCone_iff.mp h))) 4 _
+    canary_twoExternalCalls_vc.2.2.1
+
+/-- Diverging external call (`canary_divergingExternalCall_coneSafe`): the call `ext::diverge` is
+emitted from a cone-safe entry state and targets the cone; after a panicked answer the cleanup-pad
+state is cone-safe again (`stepConeSafeTrait_of_resumeExternalDivergingCall`); a normal return from
+the diverging call is UB. -/
+theorem test_partB_diverging_external_call :
+    stepMirState protoDivergingExtRootMir (.running protoDivergingInitState) =
+      .vis (.inr (.inr (.call protoDivergingReq))) protoDivergingCont ∧
+    NodeExtCallInCone protoDivergingCone
+      (stepMirFn protoDivergingExtRootMir protoDivergingInitState) ∧
+    StepConeSafeTrait protoDivergingCone protoDivergingExtRootMir protoDivergingStateAfterPanic ∧
+    protoDivergingCont (.panicked protoDivergingReq.memory) =
+      .running protoDivergingStateAfterPanic ∧
+    protoDivergingCont (.returned (.scalar ⟨0, 4⟩) protoDivergingReq.memory) = .faulted .ub :=
+  ⟨protoDivergingStep_eq,
+   stepMirFn_extCallInCone protoDivergingCone protoDivergingExtRootMir protoDivergingInitState
+     (stepConeSafeTrait_of_closedInvPoly (c₁ := []) (ti₁ := []) (by decide +kernel)
+       (by decide +kernel) (closedInvPoly_entry rfl rfl rfl rfl)),
+   canary_divergingExternalCall_coneSafe.2.2.2.1,
+   canary_divergingExternalCall_coneSafe.2.1,
+   canary_divergingExternalCall_coneSafe.2.2.2.2⟩
+
 /- Meta-level non-reducibility audit confirming that `rfl` / `isDefEq` CANNOT discharge the symbolic
 VC `symTrait_vc_narrow` because `Nat.ble 4294967296 ((x % 1000) + 7)` and
 `Nat.ble 4294967296 (((x % 1000) + 7) + 24)` are not definitionally equal to `false`, and
@@ -755,7 +802,7 @@ run_cmd liftTermElabM do
     let binRhsExpr ← elabTerm binRhsStx none
     if ← isDefEq binLhsExpr binRhsExpr then
       throwError "symbolic VC audit failed: evalScalarBinOp .addUnchecked unexpectedly reduced by isDefEq!"
-    logInfo m!"symbolic VC audit passed: symTrait_vc_narrow is genuinely symbolic (rejected by isDefEq/rfl)"
+    logInfo m!"symbolic VC audit passed: the AddUnchecked overflow guards of symTrait_vc_narrow do not reduce by isDefEq on a free input"
 
 /-- Part C / Part D theory canaries and the projections of `AllocRenamingRel`, used concretely. -/
 theorem test_partCD_canaries :
@@ -1021,7 +1068,7 @@ run_cmd do
       exact congrArg (fun n => Value.scalar ⟨n, 4⟩)
         (by change ((x % 1000) + 7) + 24 = (x % 1000) + 31; omega))
   bench "PartB_symVC_narrowCached_M128" `(command|
-    theorem bench_partB_symVC_narrowCached_128 (x : Nat) :
+    theorem $(mkIdent `bench_partB_symVC_narrowCached_128) (x : Nat) :
         vcMirWithCallees protoSymContracts 8 symTraitRootMir
           (symTraitInitState (x % 1000) symFullCallees128)
           [protoSymPoly, protoSymCircleArea] [protoAreaEntry] [] protoSymCone
@@ -1044,6 +1091,12 @@ run_cmd do
       refine wpMirExecExt_step_ret rfl ?_
       exact congrArg (fun n => Value.scalar ⟨n, 4⟩)
         (by change ((x % 1000) + 7) + 24 = (x % 1000) + 31; omega))
+  bench "PartB_symVC_cert_M128" `(command|
+    theorem $(mkIdent `bench_partB_symVC_cert_128) :
+        (computeBatchedVcNarrowCert 4 symTraitRootMir symFullCallees128 [] []).1 = protoSymCone ∧
+        checkBatchedVcConeNarrowCert protoSymCone symTraitRootMir symFullCallees128
+          (symFullCallees128.map (fun b => inCone protoSymCone b.defPath)) [] [] [] = true := by
+      decide +kernel)
   bench "PartB_coerce_sealed_simp" `(command|
     theorem bench_partB_coerce_sealed :
         ∀ bits : Nat, chainCoerceSealed 16 (.scalar ⟨bits, 4⟩) =
@@ -1058,6 +1111,28 @@ run_cmd do
       dsimp only [chainCoerceUnsealed, coerceValueAtUnsealed, uintTyByteWidth, protoLayouts,
         layoutPointerBytes]
       simp only [wrapScalarBits_eq_mod_modulus, Nat.mod_mod])
+
+/-- The symbolic benchmark's cached narrowed table is the certified narrowing of
+`symFullCallees128` (mask selection + hoisting), as for `cachedNarrow_eq_computed_*`. -/
+theorem symCachedNarrow_eq_computed_128 :
+    selectByMask symFullCallees128 (symFullCallees128.map (fun b => inCone protoSymCone b.defPath)) =
+      [protoSymPoly, protoSymCircleArea] ∧ hoistTraitImpls symFullCallees128 [] = [protoAreaEntry] :=
+  ⟨rfl, rfl⟩
+
+/-- End-to-end symbolic narrowing at `M = 128`: the VC proved on the cached narrowed table
+(`bench_partB_symVC_narrowCached_128`) plus the one-time certificate (`bench_partB_symVC_cert_128`)
+yields the VC on the *full* 128-entry callee table via `vcMirWithCallees_narrow_of_batchedCert`. -/
+theorem test_partB_symVC_transfer_128 (x : Nat) :
+    vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState (x % 1000) symFullCallees128)
+      symFullCallees128 [] [] protoSymCone (symTraitPost (x % 1000)) := by
+  have hcert := BatchedVcConeNarrowCert.ofCheck bench_partB_symVC_cert_128.2
+  rw [symCachedNarrow_eq_computed_128.1, symCachedNarrow_eq_computed_128.2] at hcert
+  exact (vcMirWithCallees_narrow_of_batchedCert hcert protoSymContracts 8
+    (symTraitInitState (x % 1000) symFullCallees128) rfl rfl rfl rfl
+    (symTraitPost (x % 1000))
+    (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl)
+    (fun _ _ _ => Iff.rfl)).mp (bench_partB_symVC_narrowCached_128 x)
 
 /-! ## 5. Part C Witnesses & Scaling (`DemandCallerLocationEnv`, `lean-miri#67`) -/
 
@@ -1192,6 +1267,25 @@ def protoFnEntryRetagAfter : MachineState :=
   match evalStmt protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts with
   | .tau (.running ns) => ns
   | _ => protoRetagMachineState
+
+/-- Plain state just before the first `caller_location` of `protoBorrowMonotoneTrace` (after
+`StorageLive`, `_2 = 42`, `_1 = &mut _2`, and the fn-entry retag). -/
+def protoBorrowTraceBeforeInvoke : MachineState :=
+  runPlainTrace protoLocState protoRetagLocalDecls protoLayouts (protoBorrowMonotoneTrace.take 4)
+
+/-- Why borrow-aware ids matter on `protoBorrowMonotoneTrace`: before the first `caller_location`,
+`nextAllocId = 0` while the borrow tags `2, 1` minted by `&mut _2` and the retag are live. An
+allocator drawing the filename and `Location` ids from `nextAllocId` alone would hand the `Location`
+the id `1`, which `lookupBorrow` resolves to the live `&mut _2` borrow. `evalDemandCallerLocation`
+draws from `max nextAllocId nextTag = 3` instead. -/
+theorem test_partC_borrowAware_needed :
+    protoBorrowTraceBeforeInvoke.memory.nextAllocId = 0 ∧
+    protoBorrowTraceBeforeInvoke.memory.nextTag = 3 ∧
+    protoBorrowTraceBeforeInvoke.memory.borrows.map BorrowEntry.tag = [2, 1] ∧
+    (lookupBorrow protoBorrowTraceBeforeInvoke.memory.borrows
+      (protoBorrowTraceBeforeInvoke.memory.nextAllocId + 1)).isSome = true ∧
+    nextFreshGlobalAndTagId protoBorrowTraceBeforeInvoke.memory = 3 := by
+  decide +kernel
 
 /-- Closed witness for `evalStmt_borrowMonotone_frame`, `normalStmtStep_eq_raw_of_borrowMonotone`,
 `runDemandCallerLocationTrace_borrowAware_spec`, and `demandCallerLocation_bisim_eager_borrowAware`
