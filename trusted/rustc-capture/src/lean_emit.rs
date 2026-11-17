@@ -2732,16 +2732,24 @@ pub fn plan_lcnf_ctor_layout_levels(
 /// (`initialize`, `macro_rules`, `run_cmd`, `seal`, ...). Lean rejects each of them as a
 /// declaration name, and accepts `this` (`lcnf_tests::lcnf_live_lean_reserved_words_are_keywords`).
 const LEAN_RESERVED_WORDS: &str = concat!(
-    "Prop Sort Type abbrev add_decl_doc at attribute axiom binder_predicate break ",
-    "builtin_dsimproc builtin_initialize builtin_simproc builtin_simproc_decl by calc catch ",
-    "class coinductive continue declare_syntax_cat decreasing_by def deriving do dsimproc elab ",
-    "elab_rules else end example export extends finally for forall from fun grind_pattern have ",
-    "hiding if import in include inductive infix infixl infixr init_quot initialize instance ",
-    "let local macro macro_rules match meta mut mutual namespace noncomputable nofun nomatch ",
-    "nonrec notation omit opaque open partial postfix prefix private protected public ",
-    "recommended_spelling renaming return run_cmd run_elab run_meta scoped seal section ",
-    "set_option show simproc simproc_decl structure suffices syntax termination_by then ",
-    "theorem try universe unless unsafe unseal using variable where with ",
+    "Prop Sort Type abbrev add_decl_doc assert_not_exists assert_not_imported at attribute ",
+    "axiom binder_predicate break builtin_cbv_simproc builtin_cbv_simproc_decl ",
+    "builtin_dsimproc builtin_dsimproc_decl builtin_grind_propagator builtin_initialize ",
+    "builtin_simproc builtin_simproc_decl by calc catch cbv_simproc cbv_simproc_decl class ",
+    "coinductive continue declare_bitwise_int_theorems declare_bitwise_uint_theorems ",
+    "declare_int_theorems declare_simp_like_tactic declare_syntax_cat declare_uint_theorems ",
+    "decreasing_by def deprecated_module deprecated_syntax deriving do docs_to_verso dsimproc ",
+    "dsimproc_decl elab elab_rules else end example export extends finally for forall from ",
+    "fun grind_annotated grind_pattern grind_propagator have hiding if import in include ",
+    "inductive infix infixl infixr init_grind_norm init_quot initialize instance let local ",
+    "macro macro_rules match meta mut mutual namespace nofun nomatch noncomputable nonrec ",
+    "norm_cast_add_elim notation omit opaque open partial postfix prefix private protected ",
+    "public recommended_spelling register_error_explanation register_sym_dsimp ",
+    "register_sym_simp register_tactic_tag register_try?_tactic renaming return run_cmd ",
+    "run_elab run_meta scoped ",
+    "seal section set_library_suggestions set_option show simproc simproc_decl structure ",
+    "suffices syntax tactic_extension termination_by then theorem try unif_hint universe ",
+    "unless unlock_limits unsafe unseal using variable where with with_weak_namespace ",
 );
 
 /// Declarations Lean `v4.34.1` generates in the namespace of every `Type`-valued structure `S`
@@ -2944,20 +2952,41 @@ fn has_balanced_lean_delimiters(text: &str) -> bool {
 /// unparenthesized after `<field> :`, so a type containing one could end the `structure`
 /// command and start another: `y : Nat axiom bad : False` as the last field of a flat
 /// structure declares the axiom `bad`, and `y : Nat deriving Repr` adds a `deriving` clause.
-/// Besides the keywords of Lean `v4.34.1`'s `Init` (all of which [`LEAN_RESERVED_WORDS`] also
-/// lists), it covers commands that importing `Lean` or Mathlib adds (`register_simp_attr`,
-/// `lemma`, `alias`, ...). Header-only commands (`prelude`, `module`) cannot start mid-file.
+///
+/// The list holds every identifier-like leading token of Lean `v4.34.1`'s `command` category
+/// with `Lean` imported (`%`-suffixed tokens such as `gen_injective_theorems%` by their stem),
+/// the declaration clauses (`deriving`, `extends`, `where`, `termination_by`, ...), and the
+/// Mathlib commands `lemma`, `alias`, and `irreducible_def`; the remaining leading tokens are
+/// `#` commands, `@[`, doc comments, and antiquotations, which [`lean_ty_has_command_syntax`]
+/// and [`check_lean_ty`] reject separately
+/// (`lcnf_tests::lcnf_live_lean_command_keywords_cover_lean_commands`). Every word that is a
+/// keyword of `Init` is also in [`LEAN_RESERVED_WORDS`].
 const LEAN_COMMAND_KEYWORDS: &str = concat!(
-    "abbrev add_decl_doc alias attribute axiom binder_predicate builtin_dsimproc ",
-    "builtin_initialize builtin_simproc builtin_simproc_decl class coinductive ",
-    "declare_syntax_cat decreasing_by def deriving dsimproc elab elab_rules end example export ",
-    "extends gen_injective_theorems grind_pattern hiding import include inductive infix infixl ",
-    "infixr init_quot initialize instance irreducible_def lemma local macro macro_rules meta ",
-    "mutual namespace noncomputable nonrec notation omit opaque open partial postfix prefix ",
-    "private protected public recommended_spelling register_builtin_option ",
-    "register_label_attr register_option register_simp_attr renaming run_cmd run_elab ",
-    "run_meta scoped seal section set_option simproc simproc_decl structure syntax ",
-    "termination_by theorem universe unsafe unseal variable where",
+    "abbrev add_decl_doc alias assert_not_exists assert_not_imported attribute axiom ",
+    "binder_predicate builtin_cbv_simproc builtin_cbv_simproc_decl ",
+    "builtin_cbv_simproc_pattern builtin_dsimproc builtin_dsimproc_decl ",
+    "builtin_grind_propagator builtin_initialize builtin_simproc builtin_simproc_decl ",
+    "builtin_simproc_pattern cbv_simproc cbv_simproc_decl cbv_simproc_pattern class ",
+    "coinductive declare_bitwise_int_theorems declare_bitwise_uint_theorems ",
+    "declare_command_config_elab declare_command_config_elab_legacy declare_config_elab ",
+    "declare_config_elab_legacy declare_core_config_elab declare_eval_bin ",
+    "declare_eval_bin_bitwise declare_eval_bin_bool_pred declare_int_theorems ",
+    "declare_simp_like_tactic declare_sint_simprocs declare_syntax_cat ",
+    "declare_term_config_elab declare_uint_simprocs declare_uint_theorems decreasing_by def ",
+    "def_eval_config_item deprecated_module deprecated_syntax deriving docs_to_verso dsimproc ",
+    "dsimproc_decl elab elab_rules elab_stx_quot end example export extends ",
+    "gen_injective_theorems grind_annotated grind_pattern grind_propagator hiding import ",
+    "include inductive infix infixl infixr init_grind_norm init_quot initialize instance ",
+    "irreducible_def lemma local macro macro_rules meta mutual namespace noncomputable nonrec ",
+    "norm_cast_add_elim notation omit opaque open partial postfix prefix private protected ",
+    "public recommended_spelling register_builtin_option register_error_explanation ",
+    "register_grind_attr register_label_attr register_linter_set register_option ",
+    "register_simp_attr register_sym_dsimp register_sym_simp register_sym_simp_attr ",
+    "register_tactic_tag register_try?_tactic renaming reprove reset_grind_attrs run_cmd ",
+    "run_elab run_meta scoped seal section set_library_suggestions set_option ",
+    "show_panel_widgets simproc simproc_decl simproc_pattern structure syntax ",
+    "tactic_extension termination_by test_extern theorem unif_hint universe unlock_limits ",
+    "unsafe unseal variable where with_weak_namespace",
 );
 
 /// True when `ty` contains a [`LEAN_COMMAND_KEYWORDS`] word, a `@[...]` attribute prefix, or a `#`
@@ -5979,70 +6008,68 @@ mod lcnf_tests {
         }
     }
 
-    #[test]
-    fn lcnf_live_lean_reserved_words_are_keywords() {
-        // The command words outside `Init` come from `Lean`, Batteries, and Mathlib.
-        let reserved: BTreeSet<&str> = LEAN_RESERVED_WORDS.split_whitespace().collect();
-        let outside_init: Vec<&str> = LEAN_COMMAND_KEYWORDS
-            .split_whitespace()
-            .filter(|word| !reserved.contains(word))
-            .collect();
-        assert_eq!(
-            outside_init,
-            [
-                "alias",
-                "gen_injective_theorems",
-                "irreducible_def",
-                "lemma",
-                "register_builtin_option",
-                "register_label_attr",
-                "register_option",
-                "register_simp_attr",
-            ]
-        );
-        assert!(!reserved.contains("this"));
+    /// A probe directory removed on drop, or `None` when no Lean `v4.34.1` is available (a failure
+    /// when `ANNEAL_REQUIRE_LCNF_LEAN_PROBE` is set).
+    fn lean_probe_dir(probe: &str) -> Option<(PathBuf, RemoveDirOnDrop)> {
         let Some(lean) = lean_for_probe() else {
             assert!(
                 std::env::var_os("ANNEAL_REQUIRE_LCNF_LEAN_PROBE").is_none_or(|value| value.is_empty()),
-                "ANNEAL_REQUIRE_LCNF_LEAN_PROBE is set but no Lean 4.34.1 was found"
+                "{probe}: ANNEAL_REQUIRE_LCNF_LEAN_PROBE is set but no Lean 4.34.1 was found"
             );
-            eprintln!("lcnf_live_lean_reserved_words_are_keywords: SKIPPED: no Lean 4.34.1");
-            return;
+            eprintln!("{probe}: SKIPPED: no Lean 4.34.1");
+            return None;
         };
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
         let dir = std::env::temp_dir().join(format!(
-            "anneal-lcnf-keywords-{}-{nanos}",
+            "anneal-lcnf-probe-{probe}-{}-{nanos}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("probe directory");
-        let _cleanup = RemoveDirOnDrop(dir.clone());
-        // One Lean process per word: a keyword's parse error must not leak into another case.
-        let words: Vec<&str> = reserved.iter().copied().chain(["this"]).collect();
-        let accepted: Vec<bool> = std::thread::scope(|scope| {
+        Some((lean, RemoveDirOnDrop(dir)))
+    }
+
+    /// Runs `lean` on `source` in `dir/<file>` and returns its exit status and standard output.
+    fn run_lean_file(lean: &Path, dir: &Path, file: &str, source: &str) -> (bool, String) {
+        let path = dir.join(file);
+        std::fs::write(&path, source).expect("probe source");
+        let output = Command::new(lean)
+            .arg(&path)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .env_remove("LEAN_PATH")
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn lean");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    }
+
+    #[test]
+    fn lcnf_live_lean_reserved_words_are_keywords() {
+        let probe = "lcnf_live_lean_reserved_words_are_keywords";
+        let reserved: BTreeSet<&str> = LEAN_RESERVED_WORDS.split_whitespace().collect();
+        let commands: BTreeSet<&str> = LEAN_COMMAND_KEYWORDS.split_whitespace().collect();
+        assert!(!reserved.contains("this"));
+        let Some((lean, dir)) = lean_probe_dir(probe) else {
+            return;
+        };
+        // One Lean process per word, so that a keyword's parse error cannot leak into another.
+        let words: Vec<&str> = reserved.union(&commands).copied().chain(["this"]).collect();
+        let declarable: Vec<bool> = std::thread::scope(|scope| {
             let handles: Vec<_> = words
                 .chunks(words.len().div_ceil(8))
                 .enumerate()
                 .map(|(chunk, chunk_words)| {
-                    let (lean, dir) = (&lean, &dir);
+                    let (lean, dir) = (&lean, &dir.0);
                     scope.spawn(move || {
                         chunk_words
                             .iter()
                             .map(|word| {
-                                let path = dir.join(format!("Word{chunk}.lean"));
-                                std::fs::write(&path, format!("def {word} : Nat := 1\n"))
-                                    .expect("probe source");
-                                Command::new(lean)
-                                    .arg(&path)
-                                    .current_dir(env!("CARGO_MANIFEST_DIR"))
-                                    .env_remove("LEAN_PATH")
-                                    .stdin(Stdio::null())
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .status()
-                                    .expect("spawn lean")
-                                    .success()
+                                let source = format!("def {word} : Nat := 1\n");
+                                run_lean_file(lean, dir, &format!("Word{chunk}.lean"), &source).0
                             })
                             .collect::<Vec<bool>>()
                     })
@@ -6053,13 +6080,62 @@ mod lcnf_tests {
                 .flat_map(|handle| handle.join().expect("probe thread"))
                 .collect()
         });
-        let declarable: Vec<&str> = words
+        let is_keyword: BTreeMap<&str, bool> = words
             .iter()
-            .zip(&accepted)
-            .filter(|(_, accepted)| **accepted)
-            .map(|(word, _)| *word)
+            .copied()
+            .zip(declarable.iter().map(|declarable| !declarable))
             .collect();
-        assert_eq!(declarable, ["this"], "Lean 4.34.1 accepts these words as declaration names");
+        assert!(!is_keyword["this"], "{probe}: `this` must stay declarable (control)");
+        let declarable_reserved: Vec<&str> =
+            reserved.iter().copied().filter(|word| !is_keyword[word]).collect();
+        assert!(
+            declarable_reserved.is_empty(),
+            "{probe}: Lean 4.34.1 accepts these reserved words as names: {declarable_reserved:?}"
+        );
+        let unreserved_keywords: Vec<&str> = commands
+            .iter()
+            .copied()
+            .filter(|word| is_keyword[word] && !reserved.contains(word))
+            .collect();
+        assert!(
+            unreserved_keywords.is_empty(),
+            "{probe}: command keywords of `Init` missing from LEAN_RESERVED_WORDS: {unreserved_keywords:?}"
+        );
+    }
+
+    #[test]
+    fn lcnf_live_lean_command_keywords_cover_lean_commands() {
+        let probe = "lcnf_live_lean_command_keywords_cover_lean_commands";
+        let Some((lean, dir)) = lean_probe_dir(probe) else {
+            return;
+        };
+        let source = "import Lean\n\
+                      open Lean Parser in\n\
+                      #eval show CoreM Unit from do\n  \
+                        let cats := (parserExtension.getState (← getEnv)).categories\n  \
+                        let some cat := cats.find? `command | throwError \"no command category\"\n  \
+                        for (token, _) in cat.tables.leadingTable do\n    \
+                          IO.println s!\"LCNF_COMMAND_TOKEN {token}\"\n";
+        let (ok, stdout) = run_lean_file(&lean, &dir.0, "Commands.lean", source);
+        assert!(ok, "{probe}: lean failed:\n{stdout}");
+        let tokens: Vec<String> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("LCNF_COMMAND_TOKEN "))
+            .map(|token| token.trim_matches(['\u{ab}', '\u{bb}']).to_owned())
+            .collect();
+        assert!(tokens.len() > 100, "{probe}: only {} command tokens", tokens.len());
+        let commands: BTreeSet<&str> = LEAN_COMMAND_KEYWORDS.split_whitespace().collect();
+        let uncovered: Vec<&String> = tokens
+            .iter()
+            .filter(|token| {
+                // `#` commands, `@[`, and doc comments are rejected by their own checks; `$`
+                // and `?` lead antiquotations, which a field type can only spell as terms.
+                !(token.starts_with('#')
+                    || ["@[", "/--", "/-!", "$", "?"].contains(&token.as_str())
+                    || commands.contains(token.trim_end_matches('%')))
+            })
+            .collect();
+        assert!(uncovered.is_empty(), "{probe}: command tokens missing from LEAN_COMMAND_KEYWORDS: {uncovered:?}");
     }
 
     #[test]
