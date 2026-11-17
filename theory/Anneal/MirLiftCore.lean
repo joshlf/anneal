@@ -12059,8 +12059,8 @@ theorem hasProtectedWriteConflict_nil
     simp only [isBorrowProtected_nil, Bool.false_and, Bool.and_false]
     exact ih
 
-theorem readProjectedValue_nil (locals : List LocalSlot) (v : Value) :
-    readProjectedValue locals v [] = .ok v := rfl
+theorem readProjectedValue_nil (locals : List LocalSlot) (sc : ScalarVal) :
+    readProjectedValue locals (.scalar sc) [] = .ok (.scalar sc) := rfl
 
 theorem readProjectedValue_field
     (locals : List LocalSlot) (vIdx : Nat) (fields : List Value)
@@ -12215,9 +12215,12 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
     | .nil =>
       match get? locals p.local_ with
       | .some (.init v) =>
-        match set? locals p.local_ .uninit with
-        | .some locals' => .ok v locals'
-        | .none => .ub
+        match valueContainsUninit v with
+        | true => .ub
+        | false =>
+          match set? locals p.local_ .uninit with
+          | .some locals' => .ok v locals'
+          | .none => .ub
       | .some .uninit => .ub
       | .some .dead => .ub
       | .none => .ub

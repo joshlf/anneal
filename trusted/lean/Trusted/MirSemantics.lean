@@ -20,7 +20,7 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 -/
 
 export Trusted.Rustc.V2026_06_01.MirSemantics (
-  MirObs Value LocalSlot StackFrame TreeBorrowPerm LocalIdx BorrowEntry
+  MirObs Value valueContainsUninit valueListContainsUninit LocalSlot StackFrame TreeBorrowPerm LocalIdx BorrowEntry
   SavedCallerFrame Memory emptyMemory MachineState
   currentFrameDepth frameIndexOfDepth savedFrameAtDepth? activeFrameSlot?
   foreignFrameSlot? readFrameLocalSlot ForeignFrameTarget foreignFrameTarget?
@@ -73,6 +73,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   dropValues takeValues extractSubslice readProjectedValue
   appendValueList replaceSubslice
   setOrExtendFields writeProjectedValue
+  projListHasDeref deinitTailOk deinitProjectedValue deinitProjectedForLocal checkProjectedDropValue
   sliceConstElemKind isScalarCompatibleProj uintRigidTyOfStride
   inferValueByteSizeAux inferElemListByteStride exactByteDivAux byteOffsetToElemIdx?
   splitLastConstantIndex? readSliceBackingAggregate? splitLastSubslice? endsWithSubslice needsThinPtrElemResolution

@@ -2770,6 +2770,10 @@ def ensureNestedFieldShells (val : Value) (projs : List ProjectionElem) : Value 
           let childShell :=
             ensureNestedFieldShells (.aggregate 0 .nil) (nextProj :: rest)
           .aggregate variantIdx (setOrExtendFields fields fieldIdx childShell)
+        | .some .uninit =>
+          let childShell :=
+            ensureNestedFieldShells (.aggregate 0 .nil) (nextProj :: rest)
+          .aggregate variantIdx (setOrExtendFields fields fieldIdx childShell)
         | .some childVal =>
           let childVal' :=
             ensureNestedFieldShells childVal (nextProj :: rest)
@@ -2811,6 +2815,7 @@ def fieldShellChainPopulated : Value → List ProjectionElem → Bool
       match get? fields fieldIdx with
       | .none => false
       | .some .unit => false
+      | .some .uninit => false
       | .some childVal => fieldShellChainPopulated childVal (nextProj :: rest)
     | false => true
   | _, _ => true
@@ -4156,10 +4161,28 @@ def evalStmt
     | proj :: rest =>
       match get? s.frame.locals p.local_ with
       | .some (.init rootVal) =>
-        match readProjectedValue s.frame.locals rootVal (proj :: rest) with
-        | .ok _ => MirStepNode.step (advanceStmt s s.frame.locals)
+        match
+          deinitProjectedForLocal
+            s.frame.locals
+            localDecls
+            layouts
+            p.local_
+            rootVal
+            (proj :: rest)
+        with
+        | .ok rootVal' =>
+          match set? s.frame.locals p.local_ (.init rootVal') with
+          | .some locals' => MirStepNode.step (advanceStmt s locals')
+          | .none => MirStepNode.fail .ub
         | .ub => MirStepNode.fail .ub
         | .unsupported => MirStepNode.unsupported
+      | .some .uninit =>
+        match deinitTailOk s.frame.locals (proj :: rest) with
+        | true => MirStepNode.step (advanceStmt s s.frame.locals)
+        | false =>
+          match projectionHasDeref (proj :: rest) with
+          | true => MirStepNode.unsupported
+          | false => MirStepNode.fail .ub
       | _ => MirStepNode.fail .ub
   | .intrinsic (.assume op) =>
     match
@@ -5468,7 +5491,7 @@ theorem evalStmt_assign_uninit_nested_field_ok
     induction k with
     | zero => rfl
     | succ n ih =>
-      change (Value.unit :: setOrExtendFields .nil n v).length = n + 1 + 1
+      change (Value.uninit :: setOrExtendFields .nil n v).length = n + 1 + 1
       simp [ih]
   have hListSetExt : ∀ (k : Nat) (v w : Value),
       (setOrExtendFields .nil k v).set k w = setOrExtendFields .nil k w := by
@@ -5476,8 +5499,8 @@ theorem evalStmt_assign_uninit_nested_field_ok
     induction k with
     | zero => rfl
     | succ n ih =>
-      change (Value.unit :: setOrExtendFields .nil n v).set (n + 1) w =
-        Value.unit :: setOrExtendFields .nil n w
+      change (Value.uninit :: setOrExtendFields .nil n v).set (n + 1) w =
+        Value.uninit :: setOrExtendFields .nil n w
       simp [ih]
   have hSetExt : ∀ (k : Nat) (v w : Value),
       set? (setOrExtendFields .nil k v) k w = .some (setOrExtendFields .nil k w) := by
@@ -5623,6 +5646,7 @@ theorem ensureNestedFieldShells_eq_self_of_populated :
               rw [hGet] at hPop
               cases childVal with
               | unit => nomatch hPop
+              | uninit => nomatch hPop
               | scalar sc => exact key _ hGet hPop
               | ptr pv sz => exact key _ hGet hPop
               | aggregate v fs => exact key _ hGet hPop
@@ -5785,7 +5809,10 @@ theorem evalStmt_assign_init_unpopulated_nested_field_ok
     (hOuterAgg :
       (∃ innerDefPath innerArgs, outerTy.kind = .adt innerDefPath innerArgs) ∨
       (∃ innerFields, outerTy.kind = .tuple innerFields))
-    (hSlot : get? fields outerIdx = .none ∨ get? fields outerIdx = .some .unit)
+    (hSlot :
+      get? fields outerIdx = .none ∨
+      get? fields outerIdx = .some .unit ∨
+      get? fields outerIdx = .some .uninit)
     (hSet :
       set? locals₁ dstLoc
         (.init
@@ -5834,7 +5861,7 @@ theorem evalStmt_assign_init_unpopulated_nested_field_ok
       induction k with
       | zero => exact Nat.zero_lt_succ 0
       | succ n ih =>
-        change n + 1 < (Value.unit :: setOrExtendFields .nil n v).length
+        change n + 1 < (Value.uninit :: setOrExtendFields .nil n v).length
         simp only [List.length_cons]
         exact Nat.succ_lt_succ ih
     | cons hd tl ihFs =>
@@ -5854,8 +5881,8 @@ theorem evalStmt_assign_init_unpopulated_nested_field_ok
       induction k with
       | zero => rfl
       | succ n ih =>
-        change (Value.unit :: setOrExtendFields .nil n v).set (n + 1) w =
-          Value.unit :: setOrExtendFields .nil n w
+        change (Value.uninit :: setOrExtendFields .nil n v).set (n + 1) w =
+          Value.uninit :: setOrExtendFields .nil n w
         simp [ih]
     | cons hd tl ihFs =>
       intro k v w
@@ -5879,7 +5906,7 @@ theorem evalStmt_assign_init_unpopulated_nested_field_ok
     rcases outerTy with ⟨outerKind, outerLayoutIdx⟩
     rcases hOuterAgg with ⟨innerDefPath, innerArgs, hKind⟩ | ⟨innerFields, hKind⟩ <;>
       dsimp only at hKind <;> subst hKind <;>
-      (rcases hSlot with hS | hS <;>
+      (rcases hSlot with hS | hS | hS <;>
         simp [ensureNestedFieldShells, stripTransparentProjections, hS])
   have hWrite :
       writeProjectedForLocal locals₁ localDecls layouts dstLoc

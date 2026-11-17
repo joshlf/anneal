@@ -573,13 +573,21 @@ def decodeArrayChunksWith
 
 /--
 Encode a runtime `Value` without requiring a type descriptor by dispatching on
-the value's runtime representation (`.unit`, `.scalar`, `.ptr`, or `.aggregate`).
+the value's runtime representation (`.unit`, `.scalar`, `.ptr`, or `.aggregate`),
+failing closed (`.none`) on `Value.uninit`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Invalid values in primitive types, even in private fields and locals:
+> - Uninitialized memory in any type except `MaybeUninit<T>`, unions, or padding bytes."
 -/
 @[reducible]
 def encodeUntypedValueToBytes :
     Nat → Value → Option (List AbstractByte)
   | .zero, _ => .none
   | .succ _, .unit => .some .nil
+  | .succ _, .uninit => .none
   | .succ _, .scalar sv => encodeScalarBytes sv .none
   | .succ _, .ptr p sz =>
     encodeScalarBytes ⟨p.offsetBytes, sz⟩ (.some (p.allocId, p.tag))

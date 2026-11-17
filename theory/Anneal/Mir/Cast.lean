@@ -9753,7 +9753,7 @@ theorem scalarTy_isIntoBytes_of_thin
           | 7 =>
             exact encodeScalarBytes_length_and_init ⟨p.offsetBytes, 8⟩ (some (p.allocId, p.tag)) bs hEnc
           | 0 | 1 | 2 | 3 | 4 | 5 | 6 | _ + 8 => nomatch hEnc
-      | unit => nomatch hEnc
+      | unit | uninit => nomatch hEnc
       | aggregate varIdx fs =>
         match varIdx, fs with
         | 0, .ptr _ 8 :: .scalar _ :: .nil => nomatch hEnc

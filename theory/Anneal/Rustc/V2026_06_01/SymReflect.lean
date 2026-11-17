@@ -221,6 +221,11 @@ theorem set?_concretizeSymSlots_concrete
 
 /-- Pure field projection reader independent of `locals`. -/
 def readProjectedPure : Value → List ProjectionElem → Option Value
+  | .uninit, _ => .none
+  | .aggregate variantIdx fields, .nil =>
+    match valueListContainsUninit fields with
+    | false => .some (.aggregate variantIdx fields)
+    | true => .none
   | val, .nil => .some val
   | .aggregate _ fields, .field idx _ :: rest =>
     match get? fields idx with
@@ -233,10 +238,28 @@ theorem readProjectedPure_sound
     ∀ (val : Value) (proj : List ProjectionElem) (res : Value),
       readProjectedPure val proj = .some res →
       readProjectedValue locals val proj = .ok res
-  | val, .nil, res, h => by
+  | .uninit, .nil, _, h => nomatch h
+  | .uninit, _ :: _, _, h => nomatch h
+  | .unit, .nil, res, h => by
     injection h with hEq
     subst hEq
     rfl
+  | .scalar _, .nil, res, h => by
+    injection h with hEq
+    subst hEq
+    rfl
+  | .ptr _ _, .nil, res, h => by
+    injection h with hEq
+    subst hEq
+    rfl
+  | .aggregate variantIdx fields, .nil, res, h => by
+    dsimp only [readProjectedPure] at h
+    dsimp only [readProjectedValue]
+    cases hU : valueListContainsUninit fields <;> rw [hU] at h
+    · injection h with hEq
+      subst hEq
+      rfl
+    · nomatch h
   | .aggregate _ fields, .field idx _ :: rest, res, h => by
     dsimp only [readProjectedPure] at h
     dsimp only [readProjectedValue]

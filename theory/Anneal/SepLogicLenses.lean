@@ -1027,6 +1027,7 @@ theorem readFieldAt_updateMemoryLocals_writeFieldAt_self {α : Type}
       | unit => nomatch hField
       | scalar _ => nomatch hField
       | ptr _ _ => nomatch hField
+      | uninit => nomatch hField
       | aggregate varIdx elems =>
         cases varIdx with
         | succ _ => nomatch hField
@@ -1066,6 +1067,7 @@ theorem readFieldAt_updateMemoryLocals_writeFieldAt_ne
       | unit => nomatch hField₁
       | scalar _ => nomatch hField₁
       | ptr _ _ => nomatch hField₁
+      | uninit => nomatch hField₁
       | aggregate varIdx elems =>
         cases varIdx with
         | succ _ => nomatch hField₁
@@ -1253,6 +1255,7 @@ theorem readAllocAt_succ_eq_readFieldAt
       | unit => rfl
       | scalar _ => rfl
       | ptr _ _ => rfl
+      | uninit => rfl
       | aggregate varIdx _ =>
         cases varIdx <;> rfl
 
@@ -1275,6 +1278,7 @@ theorem readFieldAt_writeFieldAt_ne_eq
       | unit => simp [hGet]
       | scalar _ => simp [hGet]
       | ptr _ _ => simp [hGet]
+      | uninit => simp [hGet]
       | aggregate varIdx elems =>
         cases varIdx with
         | succ _ => simp [hGet]
@@ -1305,6 +1309,7 @@ theorem get?_writeFieldAt_ne_alloc
       | unit => rfl
       | scalar _ => rfl
       | ptr _ _ => rfl
+      | uninit => rfl
       | aggregate varIdx _ =>
         cases varIdx with
         | succ _ => rfl
@@ -2261,10 +2266,12 @@ inductive LiftLensOperand
     PureEnv → Operand → Value → PureEnv → Prop where
   | copy_local {env : PureEnv} {loc : Local} {v : Value} :
       get? env loc = .some (.init v) →
+      (hInit : valueContainsUninit v = false := by rfl) →
       LiftLensOperand localDecls layouts env (.copy { local_ := loc, projection := [] }) v env
   | move_local {env env' : PureEnv} {loc : Local} {v : Value} :
       get? env loc = .some (.init v) →
       set? env loc .uninit = .some env' →
+      (hInit : valueContainsUninit v = false := by rfl) →
       LiftLensOperand localDecls layouts env (.move { local_ := loc, projection := [] }) v env'
   | copy_field {env : PureEnv} {loc : Local} {fieldIdx : FieldIdx} {fieldTy : Ty}
       {rootVal v : Value} :
@@ -2307,6 +2314,7 @@ inductive LiftDerefRead :
       {ptrLoc : Local} {rp : RawPtrVal} {v : Value} :
       get? env ptrLoc = .some (.init rp.toMirValue) →
       lookupLensVal? entries rp = .some v →
+      (hInit : valueContainsUninit v = false := by rfl) →
       LiftDerefRead
         env entries (.copy { local_ := ptrLoc, projection := [.deref] }) v env
   | move_deref
@@ -2314,6 +2322,7 @@ inductive LiftDerefRead :
       {ptrLoc : Local} {rp : RawPtrVal} {v : Value} :
       get? env ptrLoc = .some (.init rp.toMirValue) →
       lookupLensVal? entries rp = .some v →
+      (hInit : valueContainsUninit v = false := by rfl) →
       LiftDerefRead
         env entries (.move { local_ := ptrLoc, projection := [.deref] }) v env
 
@@ -2422,6 +2431,7 @@ inductive LiftLensRvalue
       {ptrLoc : Local} {rp : RawPtrVal} {v : Value} :
       get? env ptrLoc = .some (.init rp.toMirValue) →
       lookupLensVal? entries rp = .some v →
+      (hInit : valueContainsUninit v = false := by rfl) →
       LiftLensRvalue localDecls layouts env entries
         (.copyForDeref { local_ := ptrLoc, projection := [.deref] }) v env
   | binaryOp
@@ -2828,12 +2838,12 @@ theorem LiftLensOperand.evalOperand_eq
     evalOperand env op borrows globals layouts callerLocals localDecls = .ok v env' ∧
     env'.length = env.length := by
   cases h with
-  | copy_local hGet =>
+  | copy_local hGet hInit =>
     refine ⟨?_, rfl⟩
-    simp [evalOperand, hGet, readProjectedValue]
-  | move_local hGet hSet =>
+    simp [evalOperand, hGet, hInit, readProjectedValue]
+  | move_local hGet hSet hInit =>
     refine ⟨?_, set?_length_eq hSet⟩
-    simp [evalOperand, hGet, hSet]
+    simp [evalOperand, hGet, hSet, hInit]
   | copy_field hGet hNoUnion hRead =>
     refine ⟨?_, rfl⟩
     unfold evalOperand
@@ -2897,7 +2907,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
       derefReadTreeUB env ptrLoc restProj m.borrows m.activeProtectors = false ∧
       freezeDerefReadBorrowsAt env ptrLoc restProj m.borrows m.activeProtectors = m.borrows) := by
   cases h with
-  | copy_deref hGetPtr hLookVal =>
+  | copy_deref hGetPtr hLookVal hInit =>
     rename_i ptrLoc rp
     have hMem := lookupLensVal?_mem hLookVal
     rcases hInv.entries_valid rp v hMem with
@@ -2912,7 +2922,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
         rw [hGetPtr]
         simp [ProvenancePtr.tag, hLookB, hPerm, hP]
         rw [hEnvNone, hT, hCaller]
-        rfl
+        simp [hInit]
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove
       · injection hCopy with hPlace
@@ -2929,7 +2939,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
         exact ⟨hasTreeReadUB_eq_false_of_tree m.borrows m.borrows m.activeProtectors _ _ _ hExcl,
           freezeTreeBorrowsOnReadAtProj_eq_self_of_tree m.borrows m.borrows _ _ _ hExcl m.activeProtectors⟩
       · nomatch hMove
-  | move_deref hGetPtr hLookVal =>
+  | move_deref hGetPtr hLookVal hInit =>
     rename_i ptrLoc rp
     have hMem := lookupLensVal?_mem hLookVal
     rcases hInv.entries_valid rp v hMem with
@@ -2944,7 +2954,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
         rw [hGetPtr]
         simp [ProvenancePtr.tag, hLookB, hPerm, hP]
         rw [hEnvNone, hT, hCaller]
-        rfl
+        simp [hInit]
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove
       · nomatch hCopy
@@ -3120,7 +3130,7 @@ theorem LiftLensRvalue.evalRvalue_eq
     rw [hVal]
     dsimp only
     cases hDeref with
-    | copy_deref _ _ =>
+    | copy_deref _ _ _ =>
       cases hB : m.borrows with
       | nil => rfl
       | cons b₁ tl =>
@@ -3133,7 +3143,7 @@ theorem LiftLensRvalue.evalRvalue_eq
           rw [hNoUb]
           dsimp only
           rw [hFr, ← hB, ← hInv.callStack_nil]
-    | move_deref _ _ =>
+    | move_deref _ _ _ =>
       cases hB : m.borrows with
       | nil => rfl
       | cons b₁ tl =>
@@ -3182,11 +3192,11 @@ theorem LiftLensRvalue.evalRvalue_eq
           rw [hNoUb]
           dsimp only
           rw [hFr, ← hB, ← hInv.callStack_nil]
-  | copyForDeref_deref hGetPtr hLookVal =>
+  | copyForDeref_deref hGetPtr hLookVal hInit =>
     have hDeref :
         LiftDerefRead env entries
           (.copy { local_ := _, projection := [.deref] }) v env :=
-      .copy_deref hGetPtr hLookVal
+      .copy_deref hGetPtr hLookVal hInit
     rcases hDeref.evalOperand_and_freeze_eq hInv layouts localDecls with
       ⟨hEval, _, hFreeze⟩
     refine ⟨?_, rfl⟩
@@ -4356,8 +4366,8 @@ theorem LiftLensOperand.length_eq
     (h : LiftLensOperand localDecls layouts env op v env') :
     env'.length = env.length := by
   cases h with
-  | copy_local _ => rfl
-  | move_local _ hSet => exact set?_length_eq hSet
+  | copy_local _ _ => rfl
+  | move_local _ hSet _ => exact set?_length_eq hSet
   | copy_field _ _ _ => rfl
   | move_field _ _ _ => rfl
   | const_scalar => rfl
@@ -4968,6 +4978,7 @@ theorem readAllocAt_succ_of_not_aggregate
   | unit => rfl
   | scalar _ => rfl
   | ptr _ _ => rfl
+  | uninit => rfl
 
 theorem memoryLocals_of_callStack_nil {m : Memory}
     (h : m.callStack = []) : memoryLocals m = m.callerLocals := by
@@ -5627,10 +5638,10 @@ theorem LiftDerefRead.evalOperand_eq_treeLens_readView {α : Type}
         .ok (codec.encode ((treeMemoryPtrMutLens rp codec).readView m)) env' := by
   rcases (h.evalOperand_and_freeze_eq hInv layouts) with ⟨hEval, _, _⟩
   cases h with
-  | @copy_deref _ rp _ _ hLook =>
+  | @copy_deref _ rp _ _ hLook _ =>
     have hView := hInv.treeLens_readView (lookupLensVal?_mem hLook)
     exact ⟨rp, hLook, hView, by rw [hView]; exact hEval⟩
-  | @move_deref _ rp _ _ hLook =>
+  | @move_deref _ rp _ _ hLook _ =>
     have hView := hInv.treeLens_readView (lookupLensVal?_mem hLook)
     exact ⟨rp, hLook, hView, by rw [hView]; exact hEval⟩
 
@@ -5656,7 +5667,7 @@ theorem LiftDerefRead.evalOperand_eq_treeLens_readView_and_step {α : Type}
         .ok (codec.encode ((treeMemoryPtrMutLens rp codec).readView m)) env' := by
   rcases h.evalOperand_and_freeze_eq hInv layouts with ⟨hEval, _, hFreeze⟩
   cases h with
-  | @copy_deref ptrLoc rp _ _ hLook =>
+  | @copy_deref ptrLoc rp _ _ hLook _ =>
     have hMem := lookupLensVal?_mem hLook
     have hView := hInv.treeLens_readView hMem
     rcases hInv.entries_valid rp (codec.encode a) hMem with ⟨_, _, _, hExcl⟩
@@ -5664,7 +5675,7 @@ theorem LiftDerefRead.evalOperand_eq_treeLens_readView_and_step {α : Type}
       stepTreeBorrowHierarchyAccess_read_eq_some_self_of_tree hExcl,
       (hFreeze ptrLoc [] (Or.inl rfl)).2,
       hView, by rw [hView]; exact hEval⟩
-  | @move_deref ptrLoc rp _ _ hLook =>
+  | @move_deref ptrLoc rp _ _ hLook _ =>
     have hMem := lookupLensVal?_mem hLook
     have hView := hInv.treeLens_readView hMem
     rcases hInv.entries_valid rp (codec.encode a) hMem with ⟨_, _, _, hExcl⟩
@@ -5672,6 +5683,19 @@ theorem LiftDerefRead.evalOperand_eq_treeLens_readView_and_step {α : Type}
       stepTreeBorrowHierarchyAccess_read_eq_some_self_of_tree hExcl,
       (hFreeze ptrLoc [] (Or.inr rfl)).2,
       hView, by rw [hView]; exact hEval⟩
+
+private theorem eq_of_readProjectedValue_nil
+    {locals : List LocalSlot} {fVal v : Value}
+    (h : readProjectedValue locals fVal [] = .ok v) :
+    fVal = v := by
+  cases fVal with
+  | unit | scalar _ | ptr _ _ => injection h with hEq; exact hEq
+  | uninit => nomatch h
+  | aggregate varIdx fields =>
+    dsimp only [readProjectedValue] at h
+    cases hU : valueListContainsUninit fields <;> rw [hU] at h
+    · injection h with hEq; exact hEq
+    · nomatch h
 
 /--
 Alias erasure for projected dereference field reads `(*p).fieldIdx`: when `rp`
@@ -5713,8 +5737,7 @@ theorem LiftDerefFieldRead.evalOperand_eq_rawFieldLens_readView {α : Type}
     | none => rw [hGetF] at hRead; nomatch hRead
     | some fVal =>
       rw [hGetF] at hRead
-      dsimp only [readProjectedValue] at hRead
-      injection hRead with hFVal
+      have hFVal := eq_of_readProjectedValue_nil hRead
       subst hFVal
       have hFieldAt :
           readFieldAt? (memoryLocals m) rp.allocId fieldIdx =
@@ -5739,8 +5762,7 @@ theorem LiftDerefFieldRead.evalOperand_eq_rawFieldLens_readView {α : Type}
     | none => rw [hGetF] at hRead; nomatch hRead
     | some fVal =>
       rw [hGetF] at hRead
-      dsimp only [readProjectedValue] at hRead
-      injection hRead with hFVal
+      have hFVal := eq_of_readProjectedValue_nil hRead
       subst hFVal
       have hFieldAt :
           readFieldAt? (memoryLocals m) rp.allocId fieldIdx =
@@ -6409,6 +6431,7 @@ theorem localSepProp_fieldPointsTo
         | unit => nomatch hField₁
         | scalar _ => nomatch hField₁
         | ptr _ _ => nomatch hField₁
+        | uninit => nomatch hField₁
         | aggregate var₁ elems₁ =>
           cases var₁ with
           | succ _ => nomatch hField₁
@@ -7862,6 +7885,7 @@ theorem eq_aggregate_of_readFieldAt_some
       | unit => nomatch h
       | scalar _ => nomatch h
       | ptr _ _ => nomatch h
+      | uninit => nomatch h
       | aggregate varIdx elems =>
         cases varIdx with
         | succ _ => nomatch h
@@ -8229,7 +8253,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
       derefReadTreeUB env ptrLoc restProj m.borrows m.activeProtectors = false ∧
       freezeDerefReadBorrowsAt env ptrLoc restProj m.borrows m.activeProtectors = m.borrows) := by
   cases h with
-  | copy_deref hGetPtr hLookVal =>
+  | copy_deref hGetPtr hLookVal hInit =>
     rename_i ptrLoc rp
     have hVal := hInv.entries_valid rp v (lookupLensVal?_mem hLookVal)
     unfold BorrowSubplace.entryValid at hVal
@@ -8249,7 +8273,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           rw [hGetPtr]
           simp [ProvenancePtr.tag, hLookB, hPerm, hP]
           rw [hEnvNone, hT, hCaller]
-          rfl
+          simp [hInit]
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · injection hCopy with hPlace
@@ -8284,7 +8308,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           rw [hEnvNone, hT, hCaller]
           dsimp only [appendProjections, readProjectedValue]
           rw [hEl]
-          all_goals rfl
+          all_goals simp [hInit]
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · injection hCopy with hPlace
@@ -8302,7 +8326,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           exact ⟨hasTreeReadUB_eq_false_of_treeField m.borrows m.borrows m.activeProtectors hExcl,
             freezeTreeBorrowsOnReadAtProj_eq_self_of_treeField m.borrows m.borrows hExcl m.activeProtectors⟩
         · nomatch hMove
-  | move_deref hGetPtr hLookVal =>
+  | move_deref hGetPtr hLookVal hInit =>
     rename_i ptrLoc rp
     have hVal := hInv.entries_valid rp v (lookupLensVal?_mem hLookVal)
     unfold BorrowSubplace.entryValid at hVal
@@ -8322,7 +8346,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           rw [hGetPtr]
           simp [ProvenancePtr.tag, hLookB, hPerm, hP]
           rw [hEnvNone, hT, hCaller]
-          rfl
+          simp [hInit]
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · nomatch hCopy
@@ -8621,7 +8645,7 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
     rw [hVal]
     dsimp only
     cases hDeref with
-    | copy_deref _ _ =>
+    | copy_deref _ _ _ =>
       cases hB : m.borrows with
       | nil => rfl
       | cons b₁ tl =>
@@ -8634,7 +8658,7 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
           rw [hNoUb]
           dsimp only
           rw [hFr, ← hB, ← hInv.callStack_nil]
-    | move_deref _ _ =>
+    | move_deref _ _ _ =>
       cases hB : m.borrows with
       | nil => rfl
       | cons b₁ tl =>
@@ -8683,11 +8707,11 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
           rw [hNoUb]
           dsimp only
           rw [hFr, ← hB, ← hInv.callStack_nil]
-  | copyForDeref_deref hGetPtr hLookVal =>
+  | copyForDeref_deref hGetPtr hLookVal hInit =>
     have hDeref :
         LiftDerefRead env entries
           (.copy { local_ := _, projection := [.deref] }) v env :=
-      .copy_deref hGetPtr hLookVal
+      .copy_deref hGetPtr hLookVal hInit
     rcases hDeref.evalOperand_and_freeze_eq_subplace hInv layouts localDecls with
       ⟨hEval, _, hFreeze⟩
     refine ⟨?_, rfl⟩
@@ -11463,7 +11487,7 @@ theorem LiftDerefRead.evalOperand_eq_treeFieldLens_readView_and_step
         (treeFieldMemoryPtrMutLens rp fieldIdx codec).readView m = a := by
   have hEval := (h.evalOperand_and_freeze_eq_subplace hInv layouts).1
   cases h with
-  | @copy_deref _ rp _ hGetPtr hLook =>
+  | @copy_deref _ rp _ hGetPtr hLook _ =>
     have hMem := lookupLensVal?_mem hLook
     have hView := hInv.subplaceTreeLens_readView hMem
     refine ⟨rp, hMem, hView, by rw [hView]; exact hEval,
@@ -11471,7 +11495,7 @@ theorem LiftDerefRead.evalOperand_eq_treeFieldLens_readView_and_step
     rcases hInv.treeFieldLens_readView hMem hSub with ⟨hValid, hFView⟩
     exact ⟨stepTreeBorrowHierarchyAccess_read_eq_some_self_of_treeField
       hValid.exclusive, hValid, hFView⟩
-  | @move_deref _ rp _ hGetPtr hLook =>
+  | @move_deref _ rp _ hGetPtr hLook _ =>
     have hMem := lookupLensVal?_mem hLook
     have hView := hInv.subplaceTreeLens_readView hMem
     refine ⟨rp, hMem, hView, by rw [hView]; exact hEval,
@@ -12492,7 +12516,7 @@ private theorem add_assign_retag_exec_subplace
         | uninit => nomatch hFieldRead
         | init rv =>
           cases rv with
-          | unit | scalar _ | ptr _ _ => nomatch hFieldRead
+          | unit | scalar _ | ptr _ _ | uninit => nomatch hFieldRead
           | aggregate vIdx elems =>
             cases vIdx with
             | succ _ => nomatch hFieldRead

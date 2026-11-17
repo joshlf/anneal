@@ -2363,6 +2363,11 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 def readProjectedValue
     (locals : List LocalSlot) :
     Value → List ProjectionElem → ProjReadResult
+  | .uninit, _ => .ub
+  | .aggregate variantIdx fields, .nil =>
+    match valueListContainsUninit fields with
+    | false => .ok (.aggregate variantIdx fields)
+    | true => .ub
   | val, .nil => .ok val
   | .aggregate _ fields, .field idx _ :: rest =>
     match get? fields idx with
@@ -2454,15 +2459,15 @@ def replaceSubslice
 
 /--
 Update the `Value` at index `idx` in `fields`, extending `fields` with
-`.unit` padding elements when `idx` exceeds the current list length (for
-example, when writing a non-zero field index of a union aggregate
-previously initialized via field `0`).
+`Value.uninit` elements when `idx` exceeds the current list length (for example,
+when initializing field `idx > 0` of a struct or tuple before lower-index
+sibling fields have been written).
 
-Reference (The Rust Reference, "Union types"):
-<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
-> "Unions have no notion of an \"active field\". Instead, every union access
-> just interprets the storage as the type of the field used for the access."
+> "Invalid values in primitive types, even in private fields and locals:
+> - Uninitialized memory in any type except `MaybeUninit<T>`, unions, or padding bytes."
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -2474,7 +2479,7 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 @[reducible]
 def setOrExtendFields : List Value → Nat → Value → List Value
   | .nil, .zero, v => v :: .nil
-  | .nil, .succ n, v => .unit :: setOrExtendFields .nil n v
+  | .nil, .succ n, v => .uninit :: setOrExtendFields .nil n v
   | _ :: rest, .zero, v => v :: rest
   | hd :: rest, .succ n, v => hd :: setOrExtendFields rest n v
 
@@ -2506,7 +2511,7 @@ def writeProjectedValue
       | .ub => .ub
       | .unsupported => .unsupported
     | .none =>
-      match writeProjectedValue locals .unit rest newVal with
+      match writeProjectedValue locals .uninit rest newVal with
       | .ok updatedFieldVal =>
         .ok
           (.aggregate
@@ -2590,6 +2595,296 @@ def writeProjectedValue
   | val, .unwrapUnsafeBinder _ :: rest, newVal =>
     writeProjectedValue locals val rest newVal
   | _, _ :: _, _ => .unsupported
+
+/--
+Return `true` when projection list `proj` contains at least one
+`ProjectionElem.deref`.
+-/
+@[reducible]
+def projListHasDeref : List ProjectionElem → Bool
+  | .nil => false
+  | .deref :: _ => true
+  | _ :: rest => projListHasDeref rest
+
+/--
+Validate a projection suffix `proj` below an already-uninitialized value or
+local slot during `StatementKind.deinit` or `TerminatorKind.drop`:
+- `.nil`, `.field`, `.downcast` immediately followed by `.field`, `.opaqueCast`,
+  and `.unwrapUnsafeBinder` are well-formed when their tail is;
+- `.index i` requires local `i` to hold an initialized scalar index (`get? locals i`);
+- `.constantIndex offset minLen fromEnd` requires static bounds against `minLen`;
+- `.subslice fromIdx toIdx fromEnd` requires `fromEnd = true` or `fromIdx ≤ toIdx`;
+- `.deref` or a `.downcast` not followed by `.field` is rejected (`false`).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L401-L403>
+
+> "/// Deinitializes the place.
+> ///
+> /// This writes `uninit` bytes to the entire place.
+> Deinit(Box<Place<'tcx>>),"
+-/
+@[reducible]
+def deinitTailOk (locals : List LocalSlot) : List ProjectionElem → Bool
+  | .nil => true
+  | .field _ _ :: rest => deinitTailOk locals rest
+  | .downcast _ _ :: .field _ _ :: rest => deinitTailOk locals rest
+  | .index i :: rest =>
+    match get? locals i with
+    | .some (.init (.scalar _)) => deinitTailOk locals rest
+    | _ => false
+  | .constantIndex offset minLen fromEnd :: rest =>
+    let ok :=
+      match fromEnd with
+      | true => Bool.and (Nat.ble 1 offset) (Nat.ble offset minLen)
+      | false => Nat.blt offset minLen
+    Bool.and ok (deinitTailOk locals rest)
+  | .subslice fromIdx toIdx fromEnd :: rest =>
+    Bool.and (Bool.or fromEnd (Nat.ble fromIdx toIdx)) (deinitTailOk locals rest)
+  | .opaqueCast _ :: rest => deinitTailOk locals rest
+  | .unwrapUnsafeBinder _ :: rest => deinitTailOk locals rest
+  | _ :: _ => false
+
+/--
+Deinitialize the sub-value at projection chain `proj` inside `val`, replacing
+the target sub-place with `Value.uninit`:
+- At `.nil`, returns `.ok .uninit`.
+- Below an already-`.uninit` sub-value, validates the remaining projection tail
+  via `deinitTailOk locals`, returning `.ok .uninit` when valid, `.unsupported`
+  if the tail contains `.deref`, and `.ub` otherwise.
+- On `.aggregate 0 fields` with `.field idx _ :: rest`, or `.aggregate actualVariant fields`
+  with `.downcast _ variantIdx :: .field idx _ :: rest` when `actualVariant == variantIdx`,
+  recurses into `fields[idx]` and updates that slot in place.
+- On `.aggregate 0 fields` with `.index`, `.constantIndex`, or `.subslice`,
+  validates index/subslice bounds and deinitializes the selected element(s).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L401-L403>
+
+> "/// Deinitializes the place.
+> ///
+> /// This writes `uninit` bytes to the entire place.
+> Deinit(Box<Place<'tcx>>),"
+-/
+def deinitProjectedValue
+    (locals : List LocalSlot) :
+    Value → List ProjectionElem → ProjWriteResult
+  | _, .nil => .ok .uninit
+  | .uninit, proj :: rest =>
+    match deinitTailOk locals (proj :: rest) with
+    | true => .ok .uninit
+    | false =>
+      match projListHasDeref (proj :: rest) with
+      | true => .unsupported
+      | false => .ub
+  | .aggregate .zero fields, .field idx _ :: rest =>
+    match get? fields idx with
+    | .some oldFieldVal =>
+      match deinitProjectedValue locals oldFieldVal rest with
+      | .ok updatedFieldVal =>
+        match set? fields idx updatedFieldVal with
+        | .some fields' => .ok (.aggregate 0 fields')
+        | .none => .ub
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .none => .ub
+  | .scalar sc, .field .zero _ :: rest =>
+    deinitProjectedValue locals (.scalar sc) rest
+  | .ptr p sz, .field .zero _ :: rest =>
+    deinitProjectedValue locals (.ptr p sz) rest
+  | .unit, .field .zero _ :: rest =>
+    deinitProjectedValue locals .unit rest
+  | _, .field _ _ :: _ => .ub
+  | .aggregate actualVariant fields,
+    .downcast _ variantIdx :: .field idx _ :: rest =>
+    match Nat.beq actualVariant variantIdx with
+    | true =>
+      match get? fields idx with
+      | .some oldFieldVal =>
+        match deinitProjectedValue locals oldFieldVal rest with
+        | .ok updatedFieldVal =>
+          match set? fields idx updatedFieldVal with
+          | .some fields' => .ok (.aggregate actualVariant fields')
+          | .none => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .none => .ub
+    | false => .ub
+  | _, .downcast _ _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | .aggregate 0 fields, .index idxLocal :: rest =>
+    match get? locals idxLocal with
+    | .some (.init (.scalar sc)) =>
+      match get? fields sc.bits with
+      | .some oldElemVal =>
+        match deinitProjectedValue locals oldElemVal rest with
+        | .ok updatedElemVal =>
+          match set? fields sc.bits updatedElemVal with
+          | .some fields' => .ok (.aggregate 0 fields')
+          | .none => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .none => .ub
+    | _ => .ub
+  | _, .index _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | .aggregate 0 fields,
+    .constantIndex offset minLen fromEnd :: rest =>
+    let len := length fields
+    let fromEndOk :=
+      match fromEnd with
+      | false => true
+      | true => Bool.and (Nat.ble 1 offset) (Nat.ble offset len)
+    match Bool.and (Nat.ble minLen len) fromEndOk with
+    | true =>
+      let idx :=
+        match fromEnd with
+        | true => Nat.sub len offset
+        | false => offset
+      match get? fields idx with
+      | .some oldElemVal =>
+        match deinitProjectedValue locals oldElemVal rest with
+        | .ok updatedElemVal =>
+          match set? fields idx updatedElemVal with
+          | .some fields' => .ok (.aggregate 0 fields')
+          | .none => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .none => .ub
+    | false => .ub
+  | _, .constantIndex _ _ _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | .aggregate 0 fields,
+    .subslice fromIdx toIdx fromEnd :: rest =>
+    match extractSubslice fields fromIdx toIdx fromEnd with
+    | .some subElems =>
+      match deinitProjectedValue locals (.aggregate 0 subElems) rest with
+      | .ok (.aggregate 0 updatedSubElems) =>
+        match replaceSubslice fields fromIdx toIdx fromEnd updatedSubElems with
+        | .some fields' => .ok (.aggregate 0 fields')
+        | .none => .ub
+      | .ok _ => .ub
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .none => .ub
+  | _, .subslice _ _ _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | val, .opaqueCast _ :: rest =>
+    deinitProjectedValue locals val rest
+  | val, .unwrapUnsafeBinder _ :: rest =>
+    deinitProjectedValue locals val rest
+  | _, _ :: _ => .unsupported
+
+/--
+Validate a projected place path `proj` on `val` for a trivial (no-drop-glue)
+`TerminatorKind.drop`:
+- Evaluates the place path without reading the leaf value at `.nil` (so an
+  already-`.uninit` root or sub-field with a valid `deinitTailOk` projection
+  tail succeeds, whereas inactive enum `.downcast` variants, out-of-bounds
+  fields/indices, or uninitialized `.index` operand locals fault with `.ub`, and
+  `.deref` returns `.unsupported`).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1177-L1190>
+
+> "The operational semantics of projections Mirrors the operational semantics of
+> place expressions in Rust:
+> - Field projections, Downcast projections, OpaqueCast projections, ConstantIndex
+>   and Subslice projections compute an offset from the base place."
+-/
+def checkProjectedDropValue
+    (locals : List LocalSlot) :
+    Value → List ProjectionElem → ProjReadResult
+  | val, .nil => .ok val
+  | .uninit, proj :: rest =>
+    match deinitTailOk locals (proj :: rest) with
+    | true => .ok .unit
+    | false =>
+      match projListHasDeref (proj :: rest) with
+      | true => .unsupported
+      | false => .ub
+  | .aggregate _ fields, .field idx _ :: rest =>
+    match get? fields idx with
+    | .some fieldVal => checkProjectedDropValue locals fieldVal rest
+    | .none => .ub
+  | .scalar sc, .field .zero _ :: rest =>
+    checkProjectedDropValue locals (.scalar sc) rest
+  | .ptr p sz, .field .zero _ :: rest =>
+    checkProjectedDropValue locals (.ptr p sz) rest
+  | .unit, .field .zero _ :: rest =>
+    checkProjectedDropValue locals .unit rest
+  | _, .field _ _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | .aggregate actualVariant fields,
+    .downcast _ variantIdx :: rest =>
+    match Nat.beq actualVariant variantIdx with
+    | true =>
+      checkProjectedDropValue locals (.aggregate actualVariant fields) rest
+    | false => .ub
+  | _, .downcast _ _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | .aggregate 0 fields, .index idxLocal :: rest =>
+    match get? locals idxLocal with
+    | .some (.init (.scalar sc)) =>
+      match get? fields sc.bits with
+      | .some elemVal => checkProjectedDropValue locals elemVal rest
+      | .none => .ub
+    | _ => .ub
+  | _, .index _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | .aggregate 0 fields,
+    .constantIndex offset minLen fromEnd :: rest =>
+    let len := length fields
+    let fromEndOk :=
+      match fromEnd with
+      | false => true
+      | true => Bool.and (Nat.ble 1 offset) (Nat.ble offset len)
+    match Bool.and (Nat.ble minLen len) fromEndOk with
+    | true =>
+      let idx :=
+        match fromEnd with
+        | true => Nat.sub len offset
+        | false => offset
+      match get? fields idx with
+      | .some elemVal => checkProjectedDropValue locals elemVal rest
+      | .none => .ub
+    | false => .ub
+  | _, .constantIndex _ _ _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | .aggregate 0 fields,
+    .subslice fromIdx toIdx fromEnd :: rest =>
+    match extractSubslice fields fromIdx toIdx fromEnd with
+    | .some subElems =>
+      checkProjectedDropValue locals (.aggregate 0 subElems) rest
+    | .none => .ub
+  | _, .subslice _ _ _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | val, .opaqueCast _ :: rest =>
+    checkProjectedDropValue locals val rest
+  | val, .unwrapUnsafeBinder _ :: rest =>
+    checkProjectedDropValue locals val rest
+  | _, _ :: _ => .unsupported
 
 /--
 Extract the element `RigidTy` of a slice or string constant type for
@@ -2756,6 +3051,7 @@ aggregates).
 -/
 @[reducible]
 def inferValueByteSizeAux : Nat → Value → Option Nat
+  | _, .uninit => .none
   | _, .unit => .some 0
   | _, .scalar sc => .some sc.sizeBytes
   | _, .ptr _ sz => .some sz
@@ -3191,6 +3487,7 @@ field analyzer `recVal`.
 def inferValueCReprStep
     (recVal : Value → Option (Nat × Nat)) :
     Value → Option (Nat × Nat)
+  | .uninit => .none
   | .unit => .some (0, 1)
   | .scalar sc => .some (sc.sizeBytes, scalarNaturalAlignBytes sc.sizeBytes)
   | .ptr _ sz =>
@@ -6986,10 +7283,11 @@ def layoutValueMaskAux :
 
 mutual
 /--
-`true` when `v` contains a `.unit` or zero-width uninitialized scalar leaf.
+`true` when `v` contains a `.unit`, `.uninit`, or zero-width uninitialized scalar leaf.
 -/
 def valueContainsUnit : Value → Bool
   | .unit => true
+  | .uninit => true
   | .scalar ⟨_, 0⟩ => true
   | .aggregate _ fs => valueListContainsUnit fs
   | _ => false
@@ -7100,6 +7398,7 @@ def unionNonUnitNonZstTypedSlotCount (layouts : LayoutTable) :
     let slotEmpty : Bool :=
       match v, flIdxOpt with
       | .unit, _ => true
+      | .uninit, _ => true
       | .aggregate 0 .nil, .none => true
       | .aggregate 0 .nil, .some flIdx =>
         match LayoutTable.lookup layouts flIdx with
@@ -7129,7 +7428,7 @@ def mergeUnionTypedSlotsAux
       | f :: fRest => (.some f, fRest)
       | .nil => (.none, .nil)
     match fv with
-    | .unit =>
+    | .unit | .uninit =>
       mergeUnionTypedSlotsAux
         layouts
         encodeSlot
@@ -7283,6 +7582,7 @@ def unionNonUnitTypedSlotCount : Nat → List Value → Nat
   | .zero, _ => 0
   | _, .nil => 0
   | .succ k, .unit :: rest => unionNonUnitTypedSlotCount k rest
+  | .succ k, .uninit :: rest => unionNonUnitTypedSlotCount k rest
   | .succ k, _ :: rest => .succ (unionNonUnitTypedSlotCount k rest)
 
 /--
@@ -7328,6 +7628,8 @@ def unionLayoutFreeOccupiedSlotCount (hasNonZstFieldlessEnum0 : Bool) :
   | .zero, _ => 0
   | _, .nil => 0
   | .succ k, .unit :: rest =>
+    unionLayoutFreeOccupiedSlotCount hasNonZstFieldlessEnum0 k rest
+  | .succ k, .uninit :: rest =>
     unionLayoutFreeOccupiedSlotCount hasNonZstFieldlessEnum0 k rest
   | .succ k, .aggregate 0 .nil :: rest =>
     match hasNonZstFieldlessEnum0 with
@@ -7476,6 +7778,7 @@ slots inside `.unit`-padded unions.
 def encodeByLayoutIdxAux :
     Nat → LayoutTable → Nat → Value → Option (List AbstractByte)
   | .zero, _, _, _ => .none
+  | .succ _, _, _, .uninit => .none
   | .succ _, _, _, .unit => .some .nil
   | .succ _, layouts, layoutIdx, .scalar sv =>
     let validOk : Bool :=
@@ -8330,6 +8633,14 @@ def readProjectedValueUnionAware
     (localDecls : List LocalDecl)
     (layouts : LayoutTable) :
     Value → Ty → List ProjectionElem → ProjReadResult
+  | .uninit, _, _ => .ub
+  | .aggregate varIdx fields, baseTy, .nil =>
+    match isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts baseTy) with
+    | true => .ok (.aggregate varIdx fields)
+    | false =>
+      match valueListContainsUninit fields with
+      | false => .ok (.aggregate varIdx fields)
+      | true => .ub
   | v, _, .nil => .ok v
   | v, _, .opaqueCast castTy :: rest =>
     readProjectedValueUnionAware
@@ -8384,6 +8695,7 @@ def readProjectedValueUnionAware
             | .none => resolveTyWithLocalDecls localDecls layouts fieldTy
         let directFvOpt : Option Value :=
           match get? fields idx with
+          | .some .uninit => .none
           | .some .unit =>
             match rFieldTy.kind with
             | .tuple .nil => .some .unit
@@ -8536,6 +8848,7 @@ def readProjectedValueUnionAware
           readProjectedValueUnionAware locals localDecls layouts (.ptr p sz) nextTy rest
         | .succ _ => .ub
       | .unit => .ub
+      | .uninit => .ub
   | .aggregate 0 elems, baseTy, .index idxLocal :: rest =>
     let rBase := resolveTyWithLocalDecls localDecls layouts baseTy
     let elemTy : Ty :=
@@ -8695,22 +9008,24 @@ def unionActiveSlotIsZstPlaceholder
 
 /--
 True when `v` is an unpopulated intermediate shell `.aggregate 0 fields`
-materialized by `ensureNestedFieldShells` (every slot is `.unit` or recursively
-an unpopulated shell).
+materialized by `ensureNestedFieldShells` (every slot is `.unit`, `.uninit`, or
+recursively an unpopulated shell).
 -/
 def isUnpopulatedFieldShell : Value → Bool
   | .unit => true
+  | .uninit => true
   | .aggregate 0 .nil => true
   | .aggregate 0 (f :: fs) =>
     Bool.and (isUnpopulatedFieldShell f) (isUnpopulatedFieldShell (.aggregate 0 fs))
   | _ => false
 
 /--
-True when every element of `vs` is `.unit`.
+True when every element of `vs` is `.unit` or `.uninit`.
 -/
 def allValueUnits : List Value → Bool
   | .nil => true
   | .unit :: rest => allValueUnits rest
+  | .uninit :: rest => allValueUnits rest
   | _ :: _ => false
 
 /--
@@ -9062,6 +9377,7 @@ def writeProjectedValueUnionAware
           writeProjectedValueUnionAware locals localDecls layouts (.ptr p sz) nextTy rest newVal
         | .succ _ => .ub
       | .unit => .ub
+      | .uninit => .ub
   | .aggregate 0 elems, baseTy, .index idxLocal :: rest, newVal =>
     let rBase := resolveTyWithLocalDecls localDecls layouts baseTy
     let elemTy : Ty :=
@@ -9204,6 +9520,36 @@ def writeProjectedForLocal
 
 /-- Alias for `writeProjectedForLocal`. -/
 abbrev writeProjectedValueForLocal := writeProjectedForLocal
+
+/--
+Deinitialize `proj` on `rootVal` at `loc`:
+- When `placeTouchesUnion localDecls layouts ⟨loc, proj⟩` is `false`, delegates
+  to `deinitProjectedValue locals rootVal proj`.
+- When `placeTouchesUnion localDecls layouts ⟨loc, proj⟩` is `true`, fails
+  closed with `.unsupported` (`UnsupportedPlaceProjection` on union fields,
+  matching `Anneal.Mir.AdtAndControl.evalDeinitPlaceTyped`).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L401-L403>
+
+> "/// Deinitializes the place.
+> ///
+> /// This writes `uninit` bytes to the entire place.
+> Deinit(Box<Place<'tcx>>),"
+-/
+@[reducible]
+def deinitProjectedForLocal
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (rootVal : Value)
+    (proj : List ProjectionElem) :
+    ProjWriteResult :=
+  match placeTouchesUnion localDecls layouts { local_ := loc, projection := proj } with
+  | false => deinitProjectedValue locals rootVal proj
+  | true => .unsupported
 
 
 /--
@@ -9804,6 +10150,7 @@ def evalStackThinPtrTypedDerefRead
                                 localDecls
                             | .none => .some fieldVal
                           | .aggregate _ _ => .some fieldVal
+                          | .uninit => .none
             match finalValOpt with
             | .none => .ub
             | .some finalVal =>
@@ -10129,9 +10476,13 @@ def evalPlaceRead
   | .nil =>
     match get? locals p.local_ with
     | .some (.init rootVal) =>
-      match validateValueForTy? layouts (placeTy localDecls layouts p) rootVal with
-      | true => .ok rootVal locals
-      | false => .ub
+      match readProjectedValue locals rootVal .nil with
+      | .ok validVal =>
+        match validateValueForTy? layouts (placeTy localDecls layouts p) validVal with
+        | true => .ok validVal locals
+        | false => .ub
+      | .ub => .ub
+      | .unsupported => .unsupported
     | .some .uninit => .ub
     | .some .dead => .ub
     | .none => .ub
@@ -10471,9 +10822,13 @@ def evalOperand
     | .nil =>
       match get? locals p.local_ with
       | .some (.init v) =>
-        match set? locals p.local_ .uninit with
-        | .some locals' => .ok v locals'
-        | .none => .ub
+        match readProjectedValue locals v .nil with
+        | .ok validVal =>
+          match set? locals p.local_ .uninit with
+          | .some locals' => .ok validVal locals'
+          | .none => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
       | .some .uninit => .ub
       | .some .dead => .ub
       | .none => .ub
@@ -11053,10 +11408,12 @@ def spliceSubValueAtByteOffset?
           encodeTypedValueToBytes accLayouts resolvedAccTy newVal
         | .none => .none
       | .none => .none
+    | .uninit => .none
   match patchBytesOpt with
   | .none => .none
   | .some patchBytes =>
     match oldSubVal with
+    | .uninit => .none
     | .unit =>
       match Bool.and (Nat.beq offsetBytes 0) (Nat.beq (length patchBytes) 0) with
       | true => .some .unit
@@ -11505,8 +11862,11 @@ def writeStackThinPtrTypedDeref
                             | false => .some .none
                           | false => .none
                         | .aggregate _ _ => .some (.some val)
+                        | .uninit => .some .none
                       | .none, _ =>
                         match oldVal, val with
+                        | .uninit, _ => .some .none
+                        | _, .uninit => .some .none
                         | .unit, .unit => .some (.some .unit)
                         | .unit, _ => .some .none
                         | _, _ => .some (.some val)
@@ -16767,6 +17127,7 @@ def evalPlaceDiscriminant
     | .none => .ok (.scalar ⟨0, 8⟩) locals' mem
   | .unit => .ok (.scalar ⟨0, 8⟩) locals' mem
   | .ptr _ _ => .ok (.scalar ⟨0, 8⟩) locals' mem
+  | .uninit => .ub
 
 /--
 Validate that a loaded operand value complies with the type's `ScalarLayout.validRange`.
@@ -16989,6 +17350,7 @@ def resolveRefDerefTargetCore?
                 | .some reqBytes =>
                   Nat.ble (Nat.add residualOffset reqBytes) pSz
                 | .none => Nat.beq residualOffset 0
+              | .uninit => false
               | .aggregate aggVar subElems =>
                 match subTyOpt with
                 | .some subTy =>

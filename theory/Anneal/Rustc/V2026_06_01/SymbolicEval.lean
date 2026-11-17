@@ -6672,6 +6672,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_normalUnit
         | scalar _ => nomatch h_ok
         | ptr _ _ => nomatch h_ok
         | aggregate _ _ => nomatch h_ok
+        | uninit => nomatch h_ok
       | panic =>
         simp only [h_step] at h_ok
         nomatch h_ok
@@ -6731,6 +6732,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_normalScalar
           exact ⟨.scalar { bits := b, sizeBytes := sz }, m, rfl, rfl⟩
         | ptr _ _ => nomatch h_ok
         | aggregate _ _ => nomatch h_ok
+        | uninit => nomatch h_ok
       | panic =>
         simp only [h_step] at h_ok
         nomatch h_ok
@@ -6766,6 +6768,7 @@ theorem MirDiffVerdict.toTag_eq_normalUnit_of_toTagWithBody
     | unit => rfl
     | scalar _ => nomatch h
     | ptr _ _ => nomatch h
+    | uninit => nomatch h
     | aggregate varIdx fields =>
       cases fields with
       | nil =>
@@ -7002,6 +7005,7 @@ theorem MirDiffVerdict.eq_normal_of_toTagWithBody_normalScalar
       subst h_sz
       exact ⟨.scalar { bits := b, sizeBytes := sz }, mem, rfl, Or.inl rfl⟩
     | ptr _ _ => nomatch h
+    | uninit => nomatch h
     | aggregate varIdx fields =>
       cases fields with
       | nil =>

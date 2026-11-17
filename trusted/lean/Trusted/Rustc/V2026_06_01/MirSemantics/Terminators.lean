@@ -3916,18 +3916,19 @@ def evalTerminator
             frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
           }
         | .none => MirStepNode.fail .ub
-      | _ :: _ =>
-        match slot with
-        | .init rootVal =>
-          match readProjectedValue s.frame.locals rootVal place.projection with
-          | .ok _ =>
-            MirStepNode.step {
-              s with
-              frame := { s.frame with blockIdx := target, stmtIdx := 0 }
-            }
-          | .ub => MirStepNode.fail .ub
-          | .unsupported => MirStepNode.unsupported
-        | _ => MirStepNode.fail .ub
+      | proj :: rest =>
+        let rootVal :=
+          match slot with
+          | .init v => v
+          | _ => .uninit
+        match checkProjectedDropValue s.frame.locals rootVal (proj :: rest) with
+        | .ok _ =>
+          MirStepNode.step {
+            s with
+            frame := { s.frame with blockIdx := target, stmtIdx := 0 }
+          }
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => MirStepNode.unsupported
   | .call func argOps destination (.some targetBb) unwind =>
     let bodyLocalDecls := bodyLocalDeclsOf currentBody
     let bodyLayouts : LayoutTable :=

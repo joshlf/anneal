@@ -4160,7 +4160,7 @@ theorem adt_primitive_isIntoBytes
     · have hSvSz : sv.sizeBytes = l.size.bytes := Nat.eq_of_beq_eq_true hEq
       have ⟨hLen, hInit⟩ := encodeScalarBytes_length_and_init sv none bs hEnc
       exact ⟨hSvSz ▸ hLen, hInit⟩
-  | unit | ptr _ _ | aggregate _ _ =>
+  | unit | ptr _ _ | aggregate _ _ | uninit =>
     rw [hFields] at hEnc
     nomatch hEnc
 
