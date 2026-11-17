@@ -60,24 +60,43 @@ Runtime value held in a MIR local variable or returned from a function.
 `Value.uninit` represents an uninitialized sub-value inside a partially
 initialized aggregate (such as an unwritten sibling field during field-by-field
 initialization of a struct or tuple, or a sub-place deinitialized by a projected
-`StatementKind.deinit`). Reading `Value.uninit` or reading an aggregate value
-containing `Value.uninit` (except when union byte-reinterpretation applies to an
-initialized union field) is undefined behavior.
+`StatementKind.deinit` or `TerminatorKind.drop`). Reading `Value.uninit` or
+reading an aggregate value containing `Value.uninit` (except when union
+byte-reinterpretation applies to an initialized union field) is undefined
+behavior.
 
-Reference (The Rust Reference, "Behavior considered undefined"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+Modeling note (`agent_docs/trusted-rust.md`): Surface Rust's validity rules
+below require scalars, structs, tuples, arrays, and enum variants to have valid
+(initialized) field values while permitting uninitialized bytes inside `union`s
+and padding. At the `Runtime(PostCleanup)` MIR level, `Value.uninit` models
+sub-place uninitialization within structured `Value.aggregate` trees (whereas
+`rustc` `14210df0e` removed `StatementKind::Deinit` from `mir/syntax.rs` and
+models runtime move/drop deinitialization at byte granularity; `MirAst` retains
+`StatementKind.deinit` alongside `Operand.move` and `TerminatorKind.drop`).
 
-> "Invalid values in primitive types, even in private fields and locals:
-> - Uninitialized memory in any type except `MaybeUninit<T>`, unions, or padding bytes."
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+>
+> "- An integer (`i*`/`u*`), floating point value (`f*`), or raw pointer must be initialized, i.e., must not be obtained from uninitialized memory."
+>
+> "- An `enum` must have a valid discriminant, and all fields of the variant indicated by that discriminant must be valid at their respective type."
+>
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+>
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L378-L382>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1316-L1327>
 
-> "/// Write \"uninitialized\" bytes to the `Place`. This is a runtime operation
-> /// which is equivalent to assigning `MaybeUninit::uninit()` to the place, except
-> /// that it does not require the type to be `MaybeUninit`.
-> Deinit(Box<Place<'tcx>>),"
+> "    /// **Needs clarification:** The operational impact of `Move` is unclear. Currently (both in
+>     /// Miri and codegen) it has no effect at all unless it appears in an argument to `Call`; for
+>     /// `Call` it allows the argument to be passed to the callee \"in-place\", i.e. the callee might
+>     /// just get a reference to this place instead of a full copy. Miri implements this with a
+>     /// combination of aliasing model \"protectors\" and putting `uninit` into the place."
+> "    Move(Place<'tcx>),"
 -/
 inductive Value : Type where
   /-- Zero-sized value (`()`, `FnDef`, etc.). -/
@@ -96,11 +115,12 @@ mutual
   Whether `v` is `Value.uninit` or an aggregate recursively containing
   `Value.uninit`.
 
-  Reference (The Rust Reference, "Behavior considered undefined"):
-  <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+  Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+  <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
 
-  > "Invalid values in primitive types, even in private fields and locals:
-  > - Uninitialized memory in any type except `MaybeUninit<T>`, unions, or padding bytes."
+  > "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+  >
+  > "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
   -/
   @[reducible]
   def valueContainsUninit : Value → Bool
@@ -113,11 +133,10 @@ mutual
   /--
   Whether any element of `fields` satisfies `valueContainsUninit`.
 
-  Reference (The Rust Reference, "Behavior considered undefined"):
-  <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+  Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+  <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
 
-  > "Invalid values in primitive types, even in private fields and locals:
-  > - Uninitialized memory in any type except `MaybeUninit<T>`, unions, or padding bytes."
+  > "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
   -/
   @[reducible]
   def valueListContainsUninit : List Value → Bool

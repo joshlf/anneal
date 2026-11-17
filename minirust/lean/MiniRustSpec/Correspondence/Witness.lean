@@ -6034,7 +6034,7 @@ def projectedDeinitS0 : MachineState := initMachineState projectedDeinit project
 
 theorem projectedDeinit_anneal_ub :
     ∃ tr u, Reaches (mirTree projectedDeinit projectedDeinitS0) tr u ∧ FaultNow u :=
-  faultsA_sound projectedDeinit 10 _ (by decide)
+  faultsA_sound projectedDeinit 10 projectedDeinitS0 rfl
 
 theorem projectedDeinit_minirust_ub :
     (match Interp.steps 3 (machine projectedDeinit projectedDeinitFn projectedDeinitS0.frame.locals
@@ -13606,7 +13606,7 @@ def paddedDeinitReadMInit : Mach :=
 subsequent load `copy _1.1` faults with UB (computed by the kernel). -/
 theorem paddedDeinitRead_anneal_ub :
     ∃ tr u, Reaches (mirCallTree paddedDeinitRead paddedDeinitReadArgs) tr u ∧ FaultNow u :=
-  faultsA_sound paddedDeinitRead 10 _ (by decide)
+  faultsA_sound paddedDeinitRead 10 paddedDeinitReadS0 rfl
 
 /-- MiniRust's `Deinit(_1.1)` overwrites exactly bytes `4..8` of `_1` with
 `Uninit` (keeping field `0`, field `2`, and the padding), and the following
@@ -14239,7 +14239,7 @@ as `Value.uninit` so `Retag(_1.1)`'s operand read faults with UB, and MiniRust's
 theorem paddedDeinitRetagHole_both_ub :
     (∃ tr u, Reaches (mirCallTree paddedDeinitRetagHole paddedDeinitReadArgs) tr u ∧ FaultNow u) ∧
     ∃ msg, Interp.steps 3 paddedDeinitRetagHoleMInit = .error (.ub msg) :=
-  ⟨faultsA_sound paddedDeinitRetagHole 12 _ (by decide), _, rfl⟩
+  ⟨faultsA_sound paddedDeinitRetagHole 12 paddedDeinitRetagHoleS0 rfl, _, rfl⟩
 
 /-- **The committed `paddedDeinitSiblingReinit` is admitted by `inFragmentD`** (its window
 check used to fail): its open-hole window is the sibling read through an integer cast
@@ -14580,7 +14580,7 @@ def deinitSiblingReinitUbMInit : Mach :=
 theorem deinitSiblingReinitUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree deinitSiblingReinitUb deinitSiblingReinitArgs) tr u ∧
       FaultNow u :=
-  faultsA_sound deinitSiblingReinitUb 12 _ (by decide)
+  faultsA_sound deinitSiblingReinitUb 12 deinitSiblingReinitUbS0 rfl
 
 /-- **End-to-end UB transfer through `mirCall_ub_D`.** Since `mirCallTree deinitSiblingReinitUb`
 faults with UB (`deinitSiblingReinitUb_anneal_ub`), MiniRust started at `f.start` raises UB after
@@ -14832,7 +14832,7 @@ def paddedDeinitBinOpDivZeroMInit : Mach :=
 theorem paddedDeinitBinOpDivZero_anneal_ub :
     ∃ tr u, Reaches (mirCallTree paddedDeinitBinOpDivZero paddedDeinitReadArgs) tr u ∧
       FaultNow u :=
-  faultsA_sound paddedDeinitBinOpDivZero 12 _ (by decide)
+  faultsA_sound paddedDeinitBinOpDivZero 12 paddedDeinitBinOpDivZeroS0 rfl
 
 /-- **End-to-end UB transfer through `mirCall_ub_D` for a `BinOp` re-initialization of the hole.**
 Since Anneal faults (`paddedDeinitBinOpDivZero_anneal_ub`), MiniRust started at `f.start` raises UB
@@ -14916,7 +14916,7 @@ the kernel): Anneal's `copy _1.1` faults on `Value.uninit`, and MiniRust's
 theorem paddedDeinitHoleBinOp_both_ub :
     (∃ tr u, Reaches (mirCallTree paddedDeinitHoleBinOp paddedDeinitReadArgs) tr u ∧ FaultNow u) ∧
       ∃ msg, Interp.steps 3 paddedDeinitHoleBinOpMInit = .error (.ub msg) :=
-  ⟨faultsA_sound paddedDeinitHoleBinOp 10 _ (by decide), _, rfl⟩
+  ⟨faultsA_sound paddedDeinitHoleBinOp 10 paddedDeinitHoleBinOpS0 rfl, _, rfl⟩
 
 /-- MIR of
 ```rust
@@ -14993,7 +14993,7 @@ Anneal's `copy _1.1` faults on `Value.uninit`, and MiniRust's cast loads the
 theorem paddedDeinitHoleCastRead_both_ub :
     (∃ tr u, Reaches (mirCallTree paddedDeinitHoleCastRead paddedDeinitReadArgs) tr u ∧ FaultNow u) ∧
       ∃ msg, Interp.steps 4 paddedDeinitHoleCastReadMInit = .error (.ub msg) :=
-  ⟨faultsA_sound paddedDeinitHoleCastRead 12 _ (by decide), _, rfl⟩
+  ⟨faultsA_sound paddedDeinitHoleCastRead 12 paddedDeinitHoleCastReadS0 rfl, _, rfl⟩
 
 /-- `ctxPadded3` is well formed for a body whose locals are `_0: u32`, `_1: Padded`, `_2: u32`,
 and `_3: u32` (with `argCount = 1`). -/

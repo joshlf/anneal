@@ -3806,16 +3806,20 @@ Evaluate basic-block `Terminator` `term` in `s`, producing the next
   live `.uninit`), rejecting projected drops through initialized unions with
   `.unsupported`.
 
-Reference (The Rust Reference, "Behavior considered undefined"):
+Modeling note (`agent_docs/trusted-rust.md`): After drop elaboration on types
+without custom drop glue (or in lowered MIR), `TerminatorKind.drop` marks the
+dropped place uninitialized in our operational model (matching `StatementKind.deinit`
+and `Anneal.Mir.AdtAndControl.evalLoweredTerminator`), whereas `rustc` `14210df0e`
+treats post-elaboration `Drop` on types without drop glue as a runtime nop.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
 
-> "Producing an invalid value is undefined behavior. An invalid value is any
-> value that is not valid for its type.
-> ...
-> An uninitialized value is not valid for any type that has any validity
-> constraints (including `bool`, `char`, integers, floats, raw pointers,
-> references, function pointers, `str`, arrays of types with validity
-> constraints, tuples with fields that have validity constraints, etc.)."
+> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+>
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+>
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -3825,13 +3829,18 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 > ...
 > Return,
 > ...
-> /// Drops the destination
+> /// After drop elaboration: `Drop` terminators are a complete nop for types that have no drop
+> /// glue. For other types, `Drop` terminators behave exactly like a call to
+> /// `core::mem::drop_glue` with a reference to the given place.
+> ...
 > Drop {
 >     place: Place<'tcx>,
 >     target: BasicBlock,
 >     unwind: UnwindAction,
 >     replace: bool,
+>     /// Cleanup to be done if the coroutine is dropped at this suspend point (for async drop).
 >     drop: Option<BasicBlock>,
+>     /// Prepared async future local (for async drop)
 >     async_fut: Option<Local>,
 > },
 > ...

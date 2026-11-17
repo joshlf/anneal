@@ -6132,13 +6132,11 @@ theorem stmt_div_assign_uninit_overlapping_nested_field_write_disables_mut_ref_u
       .some (.some .ub, "(*_2) = move _3", .none) := by
   rfl
 
-/-- Known `D13b` limitation, pinned so that a future fix is noticed: after an
-out-of-order write that initializes only field `b` of an uninitialized struct
-local, reading the never-written field `a` returns the `.unit` padding that
-`setOrExtendFields` (`Places.lean`) inserted below `b`, instead of faulting as
-MiniRust and Miri do for a read of uninitialized memory. Closing this gap needs
-an uninitialized-field representation in `Value` (or a typed-copy validity
-check), both outside the `Statements.lean` scope:
+/-- Closed `D13b` unwritten-lower-field soundness witness: after an out-of-order
+write that initializes only field `b` of an uninitialized struct local,
+`setOrExtendFields` (`Places.lean`) populates field `a` below `b` with
+`Value.uninit`, so reading the never-written field `a` faults with `.ub` just as
+MiniRust and Miri do for a read of uninitialized memory:
 ```text
 StorageLive(_1); _1.b = const 7_u64; _0 = copy (_1.a); return
 ``` -/
@@ -6151,11 +6149,11 @@ private def stmtDivUnwrittenLowerFieldBody : CapturedMir :=
       { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, [.field 0 stmtDivU64Ty]⟩)),
         span := "_0 = copy _1.a" } ]
 
-/-- Known `D13b` limitation witness: the body returns the `.unit` padding. -/
+/-- Closed `D13b` witness: reading unwritten field `a` faults with `.ub`. -/
 theorem stmt_div_known_limitation_unwritten_lower_field_reads_unit :
     diffCProbeBounded 16 stmtDivUnwrittenLowerFieldBody
       (.running (initMachineState stmtDivUnwrittenLowerFieldBody [])) =
-      .some (.none, "none", .some .unit) := by
+      .some (.some .ub, "_0 = copy _1.a", .none) := by
   rfl
 
 /-- `D13b` array-field scope-boundary witness

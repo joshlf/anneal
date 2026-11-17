@@ -576,11 +576,12 @@ Encode a runtime `Value` without requiring a type descriptor by dispatching on
 the value's runtime representation (`.unit`, `.scalar`, `.ptr`, or `.aggregate`),
 failing closed (`.none`) on `Value.uninit`.
 
-Reference (The Rust Reference, "Behavior considered undefined"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
 
-> "Invalid values in primitive types, even in private fields and locals:
-> - Uninitialized memory in any type except `MaybeUninit<T>`, unions, or padding bytes."
+> "- An integer (`i*`/`u*`), floating point value (`f*`), or raw pointer must be initialized, i.e., must not be obtained from uninitialized memory."
+>
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
 -/
 @[reducible]
 def encodeUntypedValueToBytes :

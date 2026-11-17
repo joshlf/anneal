@@ -64,11 +64,15 @@ export MiniRust.Snapshots.S2026_05_Matched.Generated.Ops (
 /--
 **Theorem L3.1 (`mir_readProjectedValue_nil`)**:
 For EVERY local slot environment `locals : List LocalSlot` and EVERY value `v : Value`,
-Anneal's `readProjectedValue locals v []` returns `.ok v`.
+Anneal's `readProjectedValue locals v []` returns `.ok v` when `valueContainsUninit v = false`
+and faults with `.ub` when `valueContainsUninit v = true`.
 -/
 theorem mir_readProjectedValue_nil (locals : List LocalSlot) (v : Value) :
-    readProjectedValue locals v .nil = .ok v :=
-  rfl
+    (valueContainsUninit v = false → readProjectedValue locals v .nil = .ok v) ∧
+    (valueContainsUninit v = true → readProjectedValue locals v .nil = .ub) := by
+  constructor
+  · intro hInit; simp [readProjectedValue, hInit]
+  · intro hUninit; simp [readProjectedValue, hUninit]
 
 /--
 **Theorem L3.2 (`mir_writeProjectedValue_nil`)**:
@@ -130,7 +134,7 @@ theorem mir_writeProjectedValue_field_aggregate
       writeProjectedValue locals (.aggregate vIdx fields) (.field idx ty :: rest) newVal =
         .ok (.aggregate vIdx fields')) ∧
     (get? fields idx = none →
-      writeProjectedValue locals .unit rest newVal = .ok updatedFieldVal →
+      writeProjectedValue locals .uninit rest newVal = .ok updatedFieldVal →
       writeProjectedValue locals (.aggregate vIdx fields) (.field idx ty :: rest) newVal =
         .ok (.aggregate vIdx (setOrExtendFields fields idx updatedFieldVal))) := by
   constructor
@@ -147,7 +151,8 @@ tag resolves to a live (`.active`, `.reserved`, or `.frozen`) `BorrowEntry` targ
 local 1 returns `.ok targetVal locals`, whereas a `.disabled` borrow entry returns `.ub`.
 -/
 theorem mir_readPlace_deref_live_borrow
-    (tag : Nat) (targetVal : Value) :
+    (tag : Nat) (targetVal : Value)
+    (hInit : valueContainsUninit targetVal = false := by rfl) :
     let ptrVal : Value := .ptr { allocId := tag, offsetBytes := 0 } 8
     let locals : List LocalSlot := [.init ptrVal, .init targetVal]
     let activeEntry : BorrowEntry := {
@@ -166,7 +171,8 @@ theorem mir_readPlace_deref_live_borrow
       .ok targetVal locals ∧
     evalOperand locals (.copy { local_ := 0, projection := [.deref] }) [disabledEntry] = .ub := by
   constructor <;>
-    simp [evalOperand, lookupBorrow, get?, ProvenancePtr.tag, Nat.beq_refl, readProjectedValue]
+    simp [evalOperand, lookupBorrow, get?, ProvenancePtr.tag, Nat.beq_refl, readProjectedValue,
+      hInit]
 
 /--
 **Theorem L3.7 (`mir_writePlace_deref_disabled_and_frozen_is_ub`)**:

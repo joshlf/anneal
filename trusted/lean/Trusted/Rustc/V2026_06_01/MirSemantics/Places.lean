@@ -2461,11 +2461,12 @@ Update the `Value` at index `idx` in `fields`, extending `fields` with
 when initializing field `idx > 0` of a struct or tuple before lower-index
 sibling fields have been written).
 
-Reference (The Rust Reference, "Behavior considered undefined"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
 
-> "Invalid values in primitive types, even in private fields and locals:
-> - Uninitialized memory in any type except `MaybeUninit<T>`, unions, or padding bytes."
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+>
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -2614,14 +2615,27 @@ local slot during `StatementKind.deinit` or `TerminatorKind.drop`:
 - `.subslice fromIdx toIdx fromEnd` requires `fromEnd = true` or `fromIdx ≤ toIdx`;
 - `.deref` or a `.downcast` not followed by `.field` is rejected (`false`).
 
+Modeling note (`agent_docs/trusted-rust.md`): `StatementKind.deinit` in `MirAst`
+and post-drop-elaboration `TerminatorKind.drop` write uninitialized state to a
+projected MIR place without reading the old leaf value, while still validating
+place projections (such as `Index` scalar operands and active enum variants).
+Whereas `rustc` `14210df0e` removed `StatementKind::Deinit` from `mir/syntax.rs`,
+`MirAst` retains `StatementKind.deinit` alongside `TerminatorKind.drop`
+(`syntax.rs#L742-L788`) and `Operand.move` (`syntax.rs#L1316-L1327`).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+>
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
+
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L401-L403>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
 
-> "/// Deinitializes the place.
-> ///
-> /// This writes `uninit` bytes to the entire place.
-> Deinit(Box<Place<'tcx>>),"
+> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
+>   place and create a place referring to one of the fields of the type."
 -/
 @[reducible]
 def deinitTailOk (locals : List LocalSlot) : List ProjectionElem → Bool
@@ -2657,14 +2671,27 @@ the target sub-place with `Value.uninit`:
 - On `.aggregate 0 fields` with `.index`, `.constantIndex`, or `.subslice`,
   validates index/subslice bounds and deinitializes the selected element(s).
 
+Modeling note (`agent_docs/trusted-rust.md`): `StatementKind.deinit` in `MirAst`
+and post-drop-elaboration `TerminatorKind.drop` write uninitialized state to a
+projected MIR place without reading the old leaf value, while still validating
+place projections (such as `Index` scalar operands and active enum variants).
+Whereas `rustc` `14210df0e` removed `StatementKind::Deinit` from `mir/syntax.rs`,
+`MirAst` retains `StatementKind.deinit` alongside `TerminatorKind.drop`
+(`syntax.rs#L742-L788`) and `Operand.move` (`syntax.rs#L1316-L1327`).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+>
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
+
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L401-L403>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
 
-> "/// Deinitializes the place.
-> ///
-> /// This writes `uninit` bytes to the entire place.
-> Deinit(Box<Place<'tcx>>),"
+> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
+>   place and create a place referring to one of the fields of the type."
 -/
 def deinitProjectedValue
     (locals : List LocalSlot) :
@@ -5264,12 +5291,17 @@ Traverse `proj` from `rootVal` to locate an enclosing container `Value` for
 pointer byte-offset resolution, without requiring unaccessed sibling fields of
 the enclosing aggregate to be initialized.
 
-Reference (The Rust Reference, "Behavior considered undefined"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Places based on misaligned pointers"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#places-based-on-misaligned-pointers>
 
-> "- Evaluating a dereference expression (`*expr`) on a raw pointer that is
->   dangling or unaligned, even in place expression context (e.g.
->   `addr_of!(*expr)`)."
+> "Note that a place based on a misaligned pointer only leads to undefined behavior when it is loaded from or stored to."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
+
+> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
+>   place and create a place referring to one of the fields of the type."
 -/
 @[reducible]
 def readContainerProjectedValue
@@ -5343,12 +5375,17 @@ Reference (`library/core/src/ptr/const_ptr.rs` at commit
 > ///   pointer to some allocated object, and the entire memory range between
 > ///   `self` and the result must be in bounds of that allocated object."
 
-Reference (The Rust Reference, "Behavior considered undefined"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Places based on misaligned pointers"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#places-based-on-misaligned-pointers>
 
-> "- Evaluating a dereference expression (`*expr`) on a raw pointer that is
->   dangling or unaligned, even in place expression context (e.g.
->   `addr_of!(*expr)`)."
+> "Note that a place based on a misaligned pointer only leads to undefined behavior when it is loaded from or stored to."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
+
+> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
+>   place and create a place referring to one of the fields of the type."
 -/
 def resolveStackThinPtrFieldOffsetProj?
     (indexLocals : List LocalSlot)
@@ -9494,14 +9531,27 @@ Deinitialize `proj` on `rootVal` at `loc`:
   closed with `.unsupported` (`UnsupportedPlaceProjection` on union fields,
   matching `Anneal.Mir.AdtAndControl.evalDeinitPlaceTyped`).
 
+Modeling note (`agent_docs/trusted-rust.md`): `StatementKind.deinit` in `MirAst`
+and post-drop-elaboration `TerminatorKind.drop` write uninitialized state to a
+projected MIR place without reading the old leaf value, while still validating
+place projections (such as `Index` scalar operands and active enum variants).
+Whereas `rustc` `14210df0e` removed `StatementKind::Deinit` from `mir/syntax.rs`,
+`MirAst` retains `StatementKind.deinit` alongside `TerminatorKind.drop`
+(`syntax.rs#L742-L788`) and `Operand.move` (`syntax.rs#L1316-L1327`).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+>
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
+
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L401-L403>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
 
-> "/// Deinitializes the place.
-> ///
-> /// This writes `uninit` bytes to the entire place.
-> Deinit(Box<Place<'tcx>>),"
+> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
+>   place and create a place referring to one of the fields of the type."
 -/
 @[reducible]
 def deinitProjectedForLocal

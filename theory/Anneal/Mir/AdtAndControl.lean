@@ -3745,12 +3745,12 @@ theorem deinitFieldSlot_below (ts : Bool) (locals : List LocalSlot) (slot : Fiel
 theorem evalValueProjRead_nil_eq_ok_iff {locals : List LocalSlot} {v r : Value} :
     evalValueProjRead locals v [] = .ok r ↔ valueContainsUninit v = false ∧ v = r := by
   dsimp only [evalValueProjRead]
-  cases valueContainsUninit v <;> simp [and_comm, eq_comm]
+  cases valueContainsUninit v <;> simp [eq_comm]
 
 theorem readProjectedValue_nil_eq_ok_iff {locals : List LocalSlot} {v r : Value} :
     readProjectedValue locals v [] = .ok r ↔ valueContainsUninit v = false ∧ v = r := by
   dsimp only [readProjectedValue]
-  cases valueContainsUninit v <;> simp [and_comm, eq_comm]
+  cases valueContainsUninit v <;> simp [eq_comm]
 
 theorem valueContainsUninit_eq_false_of_evalValueProjRead :
     ∀ (proj : List ProjectionElem) (locals : List LocalSlot) (val outVal : Value),
