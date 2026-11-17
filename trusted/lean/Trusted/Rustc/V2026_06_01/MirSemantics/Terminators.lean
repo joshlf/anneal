@@ -2834,6 +2834,69 @@ inductive WriteBytesAction : Type where
       WriteBytesAction
 
 /--
+Address-level alignment of the destination of a `write_bytes::<T>` call whose
+`dst` pointer `dstPtr` carries the active-frame Tree Borrows entry `dstEntry`:
+whether the address `addr(dstEntry.targetLocal, dstEntry.targetProjection) +
+dstPtr.offsetBytes` is a multiple of `elemAlign = align_of::<T>()` in every
+valid placement of the target local, checked by `checkTargetPlaceAlignWalk`
+(the walk used for dereferences, `checkTargetPlaceAlign`) from the target
+local's declared type in `bodyLocalDecls`.
+
+The type of the target place alone does not determine this: a field of a
+`#[repr(packed)]` / `#[repr(packed(N))]` struct can sit at an offset that is not
+a multiple of its type's alignment, so `&raw mut packed.field` is a misaligned
+pointer even though the field's type is aligned. Every enclosing container
+whose exact alignment (`tyExactByteAlign?`) is below `elemAlign` makes the
+address possibly misaligned, and so does an exact byte offset that is not a
+multiple of `elemAlign`.
+
+An element alignment of at most `1` is always satisfied. A target local
+without a declaration skips the check, as in `checkTargetPlaceAlign`
+(unreachable from `writeBytesAction`, which first resolves the target place's
+type through that declaration).
+
+Reference (The Rust Reference, "The alignment modifiers"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-alignment-modifiers>
+
+> "The align and packed modifiers can be used to respectively raise or lower
+> the alignment of structs and unions. packed may also alter the padding
+> between fields (although it will not alter the padding inside of any
+> field)."
+
+> "The alignments of each field, for the purpose of positioning fields, is the
+> smaller of the specified alignment and the alignment of the field’s type."
+
+> "References to unaligned fields are not allowed because it is undefined
+> behavior."
+
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L656-L666>
+
+> "/// * `dst` must be properly aligned."
+-/
+def writeBytesDstAddrAligned
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (dstEntry : BorrowEntry)
+    (dstPtr : ProvenancePtr)
+    (elemAlign : Nat) :
+    Bool :=
+  match Nat.ble elemAlign 1, get? bodyLocalDecls dstEntry.targetLocal with
+  | true, _ => true
+  | false, .some rootDecl =>
+    checkTargetPlaceAlignWalk
+      bodyLocalDecls
+      bodyLayouts
+      elemAlign
+      dstPtr.offsetBytes
+      (.some rootDecl.ty)
+      .none
+      .none
+      dstEntry.targetProjection
+  | false, .none => true
+
+/--
 Validate a direct call `write_bytes::<T>(dst, val, count)` whose arguments
 evaluated to `argVals`, against the Tree Borrows `borrows` and the active frame
 depth `frameDepth`. The element type `T` is the single type argument in
@@ -2851,9 +2914,11 @@ Checks, in order:
    allows writes (`.frozen` / `.disabled` are `.ub`); an untracked pointer or a
    caller-frame target is unsupported (alignment and validity unknown).
 5. Alignment: the tag's target place must have an alignment that is a multiple
-   of `align_of::<T>()` (else unsupported) and `dst`'s byte offset must be a
-   multiple of `align_of::<T>()` (else `.ub`, misaligned), even when no byte is
-   written.
+   of `align_of::<T>()` (else unsupported); `dst`'s byte offset must be a
+   multiple of `align_of::<T>()` and the address it denotes must be aligned
+   at the address level (`writeBytesDstAddrAligned`, which rejects pointers to
+   misaligned fields of `#[repr(packed)]` structs), else `.ub` (misaligned),
+   even when no byte is written.
 6. Zero bytes (`count * size_of::<T>() = 0`) leave memory unchanged
    (`.noWrite`): every non-null pointer is valid for a zero-sized write.
 7. A write whose destination is a whole local (an allocation of its own) and
@@ -2969,33 +3034,39 @@ def writeBytesAction
                         match Nat.beq (Nat.mod dstPtr.offsetBytes elemAlign) 0 with
                         | false => .fault .ub
                         | true =>
-                          match Nat.beq byteCount 0 with
-                          | true => .noWrite
-                          | false =>
-                            let rootOutOfBounds : Bool :=
-                              match dstEntry.targetProjection with
-                              | .nil =>
-                                match
-                                  intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts
-                                    dstPlaceTy.kind
-                                with
-                                | .some placeSize =>
-                                  Nat.blt placeSize (Nat.add dstPtr.offsetBytes byteCount)
-                                | .none => false
-                              | _ :: _ => false
-                            match rootOutOfBounds with
-                            | true => .fault .ub
+                          match
+                            writeBytesDstAddrAligned bodyLocalDecls bodyLayouts dstEntry dstPtr
+                              elemAlign
+                          with
+                          | false => .fault .ub
+                          | true =>
+                            match Nat.beq byteCount 0 with
+                            | true => .noWrite
                             | false =>
-                              match
-                                Bool.and (Nat.beq countSc.bits 1)
-                                  (Bool.and (Nat.beq dstPtr.offsetBytes 0)
-                                    (Bool.and (rigidTyEq dstPlaceTy.kind elemTy)
-                                      (isPrimitiveScalarKind elemTy)))
-                              with
-                              | true =>
-                                .store dstPlace dstEntry.targetLocal dstPtr.tag
-                                  (.scalar ⟨writeBytesFillBits valSc.bits elemSize, elemSize⟩)
-                              | false => .fault .unsupported
+                              let rootOutOfBounds : Bool :=
+                                match dstEntry.targetProjection with
+                                | .nil =>
+                                  match
+                                    intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts
+                                      dstPlaceTy.kind
+                                  with
+                                  | .some placeSize =>
+                                    Nat.blt placeSize (Nat.add dstPtr.offsetBytes byteCount)
+                                  | .none => false
+                                | _ :: _ => false
+                              match rootOutOfBounds with
+                              | true => .fault .ub
+                              | false =>
+                                match
+                                  Bool.and (Nat.beq countSc.bits 1)
+                                    (Bool.and (Nat.beq dstPtr.offsetBytes 0)
+                                      (Bool.and (rigidTyEq dstPlaceTy.kind elemTy)
+                                        (isPrimitiveScalarKind elemTy)))
+                                with
+                                | true =>
+                                  .store dstPlace dstEntry.targetLocal dstPtr.tag
+                                    (.scalar ⟨writeBytesFillBits valSc.bits elemSize, elemSize⟩)
+                                | false => .fault .unsupported
         | _, _ =>
           match isUnsizedRigidTy 8 elemTy with
           | true => .fault .ub

@@ -1460,6 +1460,7 @@ theorem call_intrinsic_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.evalTerminator_call_copyNonOverlapping_eq
   let _ := @Anneal.Mir.AdtAndControl.evalTerminator_call_writeBytes_eq
   let _ := @Anneal.Mir.AdtAndControl.writeBytesAction_and_call_corner_cases
+  let _ := @Anneal.Mir.AdtAndControl.writeBytesAction_packed_field_misaligned_ub
   let _ := @Anneal.Mir.AdtAndControl.LTerminator.refinable_call_of_lowerIntrinsicKind
   let _ := @Anneal.Mir.AdtAndControl.LTerminator.multiRefinable_call_of_lowerIntrinsicKind
   let _ := @Anneal.Mir.AdtAndControl.evalLIntrinsicValue_none_trusted_fault

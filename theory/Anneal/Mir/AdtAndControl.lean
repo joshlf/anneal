@@ -26895,11 +26895,15 @@ element layout `(elemSize, elemAlign)`:
    `MirStepNode.fail .ub`.
 3. **Misaligned destination pointer (`dstPtr.offsetBytes % elemAlign ≠ 0`, even when `count = 0` or
    `elemSize = 0`)**: returns `.fault .ub` / `MirStepNode.fail .ub`.
+3b. **Address-level misaligned destination (`writeBytesDstAddrAligned = false`, e.g. a pointer to a
+   misaligned field of a `#[repr(packed)]` struct, whose own offset is `0`)**: returns `.fault .ub` /
+   `MirStepNode.fail .ub`, even when `count * elemSize = 0`.
 4. **Aligned zero-byte write (`count * elemSize = 0`, i.e. `count = 0` or ZST `elemSize = 0`)**:
    returns `.noWrite` and writes `()` to `destination` at `targetBb` with memory unchanged, matching
    `evalWriteBytesSubplace_zero_count`.
 5. **Single-element scalar store (`count = 1`, `elemSize > 0`, `dstPtr.offsetBytes = 0`,
-   `rigidTyEq dstPlaceTy.kind elemTy = true`, `isPrimitiveScalarKind elemTy = true`)**: returns
+   `rigidTyEq dstPlaceTy.kind elemTy = true`, `isPrimitiveScalarKind elemTy = true`)**, into a
+   sub-place or into a whole local whose size is `elemSize`: returns
    `.store dstPlace dstEntry.targetLocal dstPtr.tag (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩)`,
    matching `evalWriteBytesSubplace`'s `repeatByteBits` payload. -/
 theorem writeBytesAction_and_call_corner_cases
@@ -26949,8 +26953,16 @@ theorem writeBytesAction_and_call_corner_cases
             bodyLayouts argOps argVals = .fault .ub ∧
         evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
             destination targetBb = MirStepNode.fail .ub) ∧
+      -- (3b) Address-level misaligned destination (packed field) -> .fault .ub
+      (Nat.beq (Nat.mod dstPtr.offsetBytes elemAlign) 0 = true →
+        writeBytesDstAddrAligned bodyLocalDecls bodyLayouts dstEntry dstPtr elemAlign = false →
+        writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+            bodyLayouts argOps argVals = .fault .ub ∧
+        evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
+            destination targetBb = MirStepNode.fail .ub) ∧
       -- (4) Aligned zero-byte write (count = 0 or ZST) -> .noWrite
       (Nat.beq (Nat.mod dstPtr.offsetBytes elemAlign) 0 = true →
+        writeBytesDstAddrAligned bodyLocalDecls bodyLayouts dstEntry dstPtr elemAlign = true →
         Nat.beq (Nat.mul count elemSize) 0 = true →
         writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
             bodyLayouts argOps argVals = .noWrite ∧
@@ -26960,7 +26972,9 @@ theorem writeBytesAction_and_call_corner_cases
       (count = 1 →
         Nat.beq elemSize 0 = false →
         dstPtr.offsetBytes = 0 →
-        dstEntry.targetProjection ≠ [] →
+        writeBytesDstAddrAligned bodyLocalDecls bodyLayouts dstEntry dstPtr elemAlign = true →
+        (dstEntry.targetProjection ≠ [] ∨
+          intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts dstPlaceTy.kind = some elemSize) →
         rigidTyEq dstPlaceTy.kind elemTy = true →
         isPrimitiveScalarKind elemTy = true →
         writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
@@ -26998,7 +27012,7 @@ theorem writeBytesAction_and_call_corner_cases
     exact ⟨hAct, by unfold evalWriteBytesCall; rw [hAct]⟩
   · intro dstEntry dstPlaceTy placeAlign hBle hLk hNotFrz hNotDis hDepth hPlaceTy hPlaceAl hAlNz hAlDiv
     dsimp only [maxObjSize, ptrBytes] at hBle
-    refine ⟨?_, ?_, ?_⟩
+    refine ⟨?_, ?_, ?_, ?_⟩
     · intro hMis
       have hAct :
           writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
@@ -27016,7 +27030,24 @@ theorem writeBytesAction_and_call_corner_cases
         rw [hAlNz, hAlDiv, hMis]
         cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
       exact ⟨hAct, by unfold evalWriteBytesCall; rw [hAct]⟩
-    · intro hAligned hZero
+    · intro hAligned hAddrMis
+      have hAct :
+          writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+              bodyLayouts argOps argVals = .fault .ub := by
+        unfold writeBytesAction
+        dsimp only [target, argVals, ptrBytes]
+        rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
+        dsimp only
+        rw [hBle, hLk]
+        dsimp only
+        rw [hDepth, hPlaceTy]
+        dsimp only
+        rw [hPlaceAl]
+        dsimp only
+        rw [hAlNz, hAlDiv, hAligned, hAddrMis]
+        cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
+      exact ⟨hAct, by unfold evalWriteBytesCall; rw [hAct]⟩
+    · intro hAligned hAddr hZero
       have hAct :
           writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
               bodyLayouts argOps argVals = .noWrite := by
@@ -27030,19 +27061,28 @@ theorem writeBytesAction_and_call_corner_cases
         dsimp only
         rw [hPlaceAl]
         dsimp only
-        rw [hAlNz, hAlDiv, hAligned, hZero]
+        rw [hAlNz, hAlDiv, hAligned, hAddr, hZero]
         cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
       exact ⟨hAct, by unfold evalWriteBytesCall; rw [hAct]⟩
-    · intro hCnt1 hSzNz hOff0 hProjNe hTyEq hPrim
+    · intro hCnt1 hSzNz hOff0 hAddr hInB hTyEq hPrim
       subst hCnt1
       have hMul1 : Nat.mul 1 elemSize = elemSize := Nat.one_mul elemSize
       have hMod0 : Nat.beq (Nat.mod 0 elemAlign) 0 = true := by
         show Nat.beq (0 % elemAlign) 0 = true
         rw [Nat.zero_mod]; rfl
+      rw [repeatByteBits_eq_writeBytesFillBits]
       cases hProj : dstEntry.targetProjection with
-      | nil => exact absurd hProj hProjNe
-      | cons hd tl =>
-        rw [repeatByteBits_eq_writeBytesFillBits]
+      | nil =>
+        have hPlaceSz : intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts dstPlaceTy.kind =
+            some elemSize := by
+          rcases hInB with hNe | hSz
+          · exact absurd hProj hNe
+          · exact hSz
+        have hAdd0 : Nat.add 0 elemSize = elemSize := Nat.zero_add elemSize
+        have hNotLt : Nat.blt elemSize elemSize = false := by
+          cases h : Nat.blt elemSize elemSize with
+          | false => rfl
+          | true => exact absurd (Nat.blt_eq.mp h) (Nat.lt_irrefl _)
         unfold writeBytesAction
         dsimp only [target, argVals, ptrBytes]
         rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
@@ -27053,8 +27093,89 @@ theorem writeBytesAction_and_call_corner_cases
         dsimp only
         rw [hPlaceAl]
         dsimp only
-        rw [hAlNz, hAlDiv, hOff0, hMod0, hMul1, hSzNz, hProj, hTyEq, hPrim]
+        rw [hAlNz, hAlDiv, hOff0, hMod0, hAddr, hMul1, hSzNz, hProj]
+        dsimp only
+        rw [hPlaceSz]
+        dsimp only
+        rw [hAdd0, hNotLt]
+        dsimp only
+        rw [hTyEq, hPrim]
         cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
+      | cons hd tl =>
+        unfold writeBytesAction
+        dsimp only [target, argVals, ptrBytes]
+        rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
+        dsimp only
+        rw [hBle, hLk]
+        dsimp only
+        rw [hDepth, hPlaceTy]
+        dsimp only
+        rw [hPlaceAl]
+        dsimp only
+        rw [hAlNz, hAlDiv, hOff0, hMod0, hAddr, hMul1, hSzNz, hProj, hTyEq, hPrim]
+        cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
+
+/-- Layouts for the `write_bytes` packed-field witness: entry `1` is
+`#[repr(packed)] struct WbPacked { a: u8, b: u32 }` (size `5`, align `1`, `b` at byte
+offset `1`), entry `2` is the same struct under `#[repr(C)]` (size `8`, align `4`, `b` at
+byte offset `4`), entries `3` / `4` are the `u8` / `u32` field layouts, and entry `0` is
+`()`. -/
+def wbPackedLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .arbitrary [] [],
+          variants := .single 0, isUninhabited := false },
+        { size := ⟨5⟩, align := ⟨1⟩, backendRepr := .memory,
+          fields := .arbitrary [⟨0⟩, ⟨1⟩] [0, 1], variants := .single 0, isUninhabited := false,
+          fieldLayouts := [3, 4] },
+        { size := ⟨8⟩, align := ⟨4⟩, backendRepr := .memory,
+          fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0, isUninhabited := false,
+          fieldLayouts := [3, 4] },
+        { size := ⟨1⟩, align := ⟨1⟩, backendRepr := .memory, fields := .primitive,
+          variants := .single 0, isUninhabited := false },
+        { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .primitive,
+          variants := .single 0, isUninhabited := false } ] }
+
+/-- The `u32` field type `b` of `WbPacked` (layout index `4` of `wbPackedLayouts`). -/
+def wbU32FieldTy : Ty := { kind := .uint .u32, layoutIdx := 4 }
+
+/-- Locals `_0 : ()`, `_1 : WbPacked` at layout index `structIdx` of `wbPackedLayouts`
+(`1`: packed, `2`: `repr(C)`), and `_2 : *mut u32`. -/
+def wbPackedDecls (structIdx : Nat) : List LocalDecl :=
+  [ { mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 }, debugName := none },
+    { mutability := .mut, ty := { kind := .adt "anneal_witness::WbPacked" [], layoutIdx := structIdx },
+      debugName := none },
+    { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 },
+      debugName := none } ]
+
+/-- The Tree Borrows entry of `_2 = &raw mut _1.b` (tag `1`, active frame). -/
+def wbPackedEntry : BorrowEntry :=
+  { tag := 1, targetLocal := 1, targetProjection := [.field 1 wbU32FieldTy], perm := .unique }
+
+/-- **`write_bytes` through a pointer to a misaligned `#[repr(packed)]` field is undefined
+behavior (`writeBytesAction_packed_field_misaligned_ub`)**: for
+`write_bytes::<u32>(&raw mut _1.b, 0xAB, 1)` with `_1 : WbPacked`:
+1. under `#[repr(packed)]` (`b` at byte offset `1` of an align-`1` struct) the pointer has
+   offset `0` within its target place `_1.b`, whose type `u32` is aligned, yet the address
+   is not `4`-aligned in every placement of `_1` (`writeBytesDstAddrAligned = false`), so
+   `writeBytesAction` reports `.fault .ub` ("`dst` must be properly aligned");
+2. under `#[repr(C)]` (`b` at byte offset `4` of an align-`4` struct) the same call stores
+   `0xABABABAB_u32` into `_1.b`, so the address-level check rejects only misaligned
+   destinations. -/
+theorem writeBytesAction_packed_field_misaligned_ub :
+    let target : ResolvedCallTarget :=
+      { defPath := "core::intrinsics::write_bytes", typeArgs := [.uint .u32], isIndirect := false }
+    let argVals : List Value :=
+      [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩]
+    writeBytesDstAddrAligned (wbPackedDecls 1) wbPackedLayouts wbPackedEntry
+        { allocId := 1, offsetBytes := 0 } 4 = false ∧
+      writeBytesAction [wbPackedEntry] 0 target (wbPackedDecls 1) wbPackedLayouts [] argVals =
+        .fault .ub ∧
+      writeBytesDstAddrAligned (wbPackedDecls 2) wbPackedLayouts wbPackedEntry
+        { allocId := 1, offsetBytes := 0 } 4 = true ∧
+      writeBytesAction [wbPackedEntry] 0 target (wbPackedDecls 2) wbPackedLayouts [] argVals =
+        .store ⟨1, [.field 1 wbU32FieldTy]⟩ 1 1 (.scalar ⟨0xABABABAB, 4⟩) := by
+  exact ⟨rfl, rfl, rfl, rfl⟩
 
 /-- **Smart constructor (`LTerminator.refinable_call_of_lowerIntrinsicKind`)**: a direct call of
 any `DefPath` that `lowerIntrinsicKind_V2026_06_01` lowers to an intrinsic, with

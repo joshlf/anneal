@@ -12686,9 +12686,10 @@ theorem evalByteCast_projected_adt_primitive_to_scalar_ok
    `.ok (.aggregate 0 [])`, maps `1_i8` (`1`) to `.ok (.aggregate 1 [])`, and rejects the undeclared
    gap `0` (even though `wrappingRangeContains ⟨255, 1⟩ 0 = true`) with `.ub`.
 2. For a 16-byte `#[repr(u128)]` / `#[repr(i128)]` fieldless enum (`l.size.bytes = 16`,
-   `bitsWidth = 128`) with explicit discriminant `discrBits` (including `discrBits ≥ 2^64`,
-   such as `2^128 - 1`), `evalByteCast` and `evalRvalue (.cast .transmute ...)` round-trip
-   `discrBits` <-> `.aggregate varIdx []` in both directions.
+   `bitsWidth = 128`) at its own layout index `dstLIdx128` and transmuted from its own `u128`
+   operand `op128` (independent of the `#[repr(i8)]` enum and operand of part 1), with explicit
+   discriminant `discrBits` (including `discrBits ≥ 2^64`, such as `2^128 - 1`), `evalByteCast`
+   maps `discrBits` to `.aggregate varIdx []`.
 -/
 theorem evalByteCast_adt_multiple_enum_signed_negative_and_u128_agreement
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
@@ -12720,11 +12721,15 @@ theorem evalByteCast_adt_multiple_enum_signed_negative_and_u128_agreement
         .ok (.scalar ⟨0, 1⟩) locals' →
       wrappingRangeContains ⟨255, 1⟩ 0 = true ∧
       evalByteCast locals op enumTy8 mem localDecls layouts = ub) ∧
-    -- (2) 16-byte u128 explicit discriminant (e.g. 2^128 - 1) -> .ok (.aggregate varIdx [])
-    (∀ (discr128 varIdx : Nat) (vr128 : WrappingRange) (vs128 : List FieldsShape) (vmo : List Nat),
+    -- (2) 16-byte u128 explicit discriminant (e.g. 2^128 - 1) -> .ok (.aggregate varIdx []), at
+    -- its own operand `op128` and layout index `dstLIdx128` (so that its hypotheses do not
+    -- contradict `hLookup8` / `hSz8` / `hTyI8`)
+    (∀ (op128 : Operand) (dstLIdx128 : LayoutIdx) (discr128 varIdx : Nat) (vr128 : WrappingRange)
+        (vs128 : List FieldsShape) (vmo : List Nat),
+      dstLIdx128 ≠ 0 →
       discr128 < scalarModulus 16 →
       wrappingRangeContains vr128 discr128 = true →
-      LayoutTable.lookup layouts dstLIdx = some l128 →
+      LayoutTable.lookup layouts dstLIdx128 = some l128 →
       l128.isUninhabited = false →
       l128.variants = .multiple (.initialized (.int 128 false) vr128) 0 vs128 →
       l128.fields = .arbitrary [⟨0⟩] memoryOrder →
@@ -12735,11 +12740,13 @@ theorem evalByteCast_adt_multiple_enum_signed_negative_and_u128_agreement
         wrappingRangeContains vr128 tag = true →
         ∀ vi, resolveEnumVariantIdxByTag l128.variantDiscriminants tag = some vi →
         ∃ vm, Trusted.Sequence.get? vs128 vi = some (.arbitrary [] vm)) →
-      evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+      evalOperand locals op128 mem.borrows mem.globals layouts mem.callerLocals localDecls
+          mem.callStack =
         .ok (.scalar ⟨discr128, 16⟩) locals' →
-      operandTy localDecls layouts op =
+      operandTy localDecls layouts op128 =
         some { kind := ScalarTy.u128.toTrustedRigidTy m pointee, layoutIdx := srcLIdx } →
-      evalByteCast locals op enumTy8 mem localDecls layouts =
+      evalByteCast locals op128 { kind := .adt defPath args, layoutIdx := dstLIdx128 } mem
+          localDecls layouts =
         ok (.aggregate varIdx []) locals' mem) := by
   intro enumTy8
   have hWidth8 : primitiveKindByteWidth (.int 8 true) = some l8.size.bytes :=
@@ -12790,14 +12797,14 @@ theorem evalByteCast_adt_multiple_enum_signed_negative_and_u128_agreement
       hOp0 hTyI8).2.1
     rw [hDiscr8] at hStep
     exact hStep
-  · intro discr128 varIdx vr128 vs128 vmo hLt128 hIn128 hLk128 hInh128 hVar128 hF128 hSz128
-      hRes128 _ hFl128 hOp128 hTy128
+  · intro op128 dstLIdx128 discr128 varIdx vr128 vs128 vmo hNe128 hLt128 hIn128 hLk128 hInh128
+      hVar128 hF128 hSz128 hRes128 _ hFl128 hOp128 hTy128
     have hW128 : primitiveKindByteWidth (.int 128 false) = some l128.size.bytes :=
       congrArg some hSz128.symm
     have hStep := (tryTransmute_adt_multiple_enum_explicit_discriminants_eq
-      locals locals' op mem localDecls layouts m pointee .u128 srcLIdx defPath args dstLIdx l128
-      128 discr128 false vr128 vs128 memoryOrder rfl
-      ⟨hLt128, trivial⟩ hDstLIdx hLk128 hInh128 hVar128 hF128 hSz128 hW128 hFl128
+      locals locals' op128 mem localDecls layouts m pointee .u128 srcLIdx defPath args dstLIdx128
+      l128 128 discr128 false vr128 vs128 memoryOrder rfl
+      ⟨hLt128, trivial⟩ hNe128 hLk128 hInh128 hVar128 hF128 hSz128 hW128 hFl128
       hOp128 hTy128).2.1
     rw [hIn128, hRes128] at hStep
     exact hStep
