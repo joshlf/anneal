@@ -1012,8 +1012,24 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         helper_ws = gen_dir / "Mir/Demo/helper.lean"
         helper_ws.write_text(valid_mir_mod.replace("item_1", "helper"))
         ob_ws = gen_dir / "Obligations/Demo/item_1.lean"
-        ob_nil = ("import Trusted\nimport Mir.Demo.item_1\nnamespace Obligations.Demo.item_1\n"
-                  "def defaultCallees : List CapturedMir := .nil\nend Obligations.Demo.item_1\n")
+        ob_nil = (
+            "import Trusted\nimport Mir.Demo.item_1\nnamespace Obligations.Demo.item_1\n"
+            "def defaultCallees : List CapturedMir := .nil\n"
+            "def defaultCallContract : MirCallContract where\n"
+            "  pre req := And (req.defPath = \"demo::item_1\") (defaultPre req.args)\n"
+            "  post req ans := match ans with | .ret retVal => And (retMatchesCalleeReturnTy req retVal) (defaultPost req.args retVal) | _ => False\n"
+            "instance (priority := low) defaultModularSpec [spec : ItemSpec \"demo::item_1\"] : "
+            "ModularItemSpec \"demo::item_1\" where\n"
+            "  pre := spec.pre\n  post := spec.post\n"
+            "  envAssumed := fun _ => True\n"
+            "def claim [spec : ItemSpec \"demo::item_1\"] : VerificationObligation :=\n"
+            "  { body := Mir.Demo.item_1.body, callees := defaultCallees, "
+            "pre := spec.pre, post := spec.post }\n"
+            "def modularClaim [spec : ModularItemSpec \"demo::item_1\"] : ModularVerificationObligation :=\n"
+            "  { body := Mir.Demo.item_1.body, callees := defaultCallees, "
+            "envAssumed := spec.envAssumed, pre := spec.pre, post := spec.post }\n"
+            "end Obligations.Demo.item_1\n"
+        )
         ob_ws.write_text(ob_nil)
         ver_ws = gen_dir / "Verify/Demo/item_1.lean"
         ver_claim = ("import Trusted\nimport Mir.Demo.item_1\nimport Obligations.Demo.item_1\n"
@@ -1046,22 +1062,30 @@ def self_test(checkout: Path, lean: Path | None) -> int:
 
         write_receipt()
         ws_manifest = ws_dir / "CaptureManifest.json"
-        ws_manifest.write_text(json.dumps({
-            "schema": 1,
-            "compilation_succeeded": True,
-            "rust_sources": [["src/lib.rs", runner.digest(rs_ws)]],
-            "targets": [{
-                "def_id": "demo::helper",
-                "mir_module_path": ".anneal/generated/Mir/Demo/helper.lean",
-                "mir_module_sha256": runner.digest(helper_ws),
-            }, {
-                "def_id": "demo::item_1",
-                "mir_module_path": ".anneal/generated/Mir/Demo/item_1.lean",
-                "mir_module_sha256": runner.digest(mir_ws),
-            }],
-        }))
+
+        def write_manifest(*extra_targets):
+            ws_manifest.write_text(json.dumps({
+                "schema": 1,
+                "compilation_succeeded": True,
+                "rust_sources": [["src/lib.rs", runner.digest(rs_ws)]],
+                "targets": [{
+                    "def_id": "demo::helper",
+                    "mir_module_path": ".anneal/generated/Mir/Demo/helper.lean",
+                    "mir_module_sha256": runner.digest(helper_ws),
+                }, {
+                    "def_id": "demo::item_1",
+                    "mir_module_path": ".anneal/generated/Mir/Demo/item_1.lean",
+                    "mir_module_sha256": runner.digest(mir_ws),
+                }, *extra_targets],
+            }))
+
+        write_manifest()
         assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
         assert runner.audit_fault_coverage(ws_manifest)["targets"] == 2
+        dot_anneal_manifest = ws_dir / ".anneal/CaptureManifest.json"
+        shutil.copy2(ws_manifest, dot_anneal_manifest)
+        assert runner.audit_fault_coverage(dot_anneal_manifest)["targets"] == 2
+        dot_anneal_manifest.unlink()
 
         # Negative 1: Omitted or unbacked discharged sites fail closed against the independent
         # emitter (a receipt can no longer certify `discharged_sites := census_sites`).
@@ -1110,6 +1134,10 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         ob_ws.write_text(ob_nil.replace(":= .nil", ":= [Mir.Demo.item_1.body]"))
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "missing from FaultCensus `callee_closure.inline_callees`")
         ob_ws.write_text(ob_nil.replace(":= .nil", ":= [Mir.Demo.helper.body]"))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "without `import Mir.Demo.helper`")
+        ob_with_helper = ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Mir.Demo.helper\n").replace(
+            ":= .nil", ":= [Mir.Demo.helper.body]")
+        ob_ws.write_text(ob_with_helper)
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "missing from FaultCensus `callee_closure.inline_callees`")
         write_receipt(callee_closure=closure(inline=["demo::helper"]))
         assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
@@ -1124,7 +1152,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "non-modular")
         write_receipt()
 
-        # Negative 10: Missing, shadowed, modified, or extended `defaultCallees` tables fail closed.
+        # Negative 10: Missing, shadowed, modified, extended `defaultCallees`, or detached/missing
+        # canonical `Obligations` claims fail closed.
         for bad_ob, needle in (
             (ob_nil.replace("def defaultCallees : List CapturedMir := .nil\n", ""), "missing `def defaultCallees"),
             (ob_nil.replace("def defaultCallees", "abbrev defaultCallees"), "via `abbrev`"),
@@ -1134,6 +1163,19 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             (ob_nil.replace(":= .nil", ":= [] ++ [Mir.Demo.helper.body]"), "trailing token"),
             (ob_nil.replace("namespace Obligations.Demo.item_1\n", "namespace Obligations.Demo.item_1\nnamespace Evil\nend Evil\n"), "unexpected `namespace Evil`"),
             (ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Obligations.Demo.item_1\n"), "self-imports"),
+            (ob_nil.replace("def claim [spec : ItemSpec \"demo::item_1\"] : VerificationObligation :=\n"
+                            "  { body := Mir.Demo.item_1.body, callees := defaultCallees, "
+                            "pre := spec.pre, post := spec.post }\n", ""), "is not defined"),
+            (ob_nil.replace("{ body := Mir.Demo.item_1.body, callees := defaultCallees,",
+                            "{ body := Mir.Demo.helper.body, callees := defaultCallees,"), "instead of `Mir.Demo.item_1.body`"),
+            (ob_nil.replace("{ body := Mir.Demo.item_1.body, callees := defaultCallees,",
+                            "{ body := Mir.Demo.item_1.body, callees := [],"), "overrides claim `callees :="),
+            (ob_nil.replace("{ body := Mir.Demo.item_1.body,",
+                            "{ base with body := Mir.Demo.item_1.body,"), "struct-update"),
+            (ob_nil.replace("namespace Obligations.Demo.item_1\n",
+                            "namespace Obligations.Demo.item_1\naxiom smuggled : False\n"), "disallowed top-level `axiom`"),
+            (ob_nil.replace("namespace Obligations.Demo.item_1\n",
+                            "namespace Obligations.Demo.item_1\nopen Evil\n"), "open"),
         ):
             ob_ws.write_text(bad_ob)
             expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", needle)
@@ -1143,8 +1185,11 @@ def self_test(checkout: Path, lean: Path | None) -> int:
 
         # Negative 11: Missing or non-canonical `Verify/<Item>.lean` fails closed.
         for bad_ver, needle in (
-            ("import Trusted\nnamespace Verify.Demo.item_1\ntheorem verified : True := trivial\nend Verify.Demo.item_1\n", "non-canonical"),
+            ("import Trusted\nnamespace Verify.Demo.item_1\ntheorem verified : True := trivial\nend Verify.Demo.item_1\n", "must `import Obligations.Demo.item_1`"),
+            ("import Trusted\nimport Obligations.Demo.item_1\nnamespace Verify.Demo.item_1\ntheorem verified : True := trivial\nend Verify.Demo.item_1\n", "non-canonical"),
             (ver_claim.replace("theorem verified", "axiom verified"), "via `axiom`"),
+            (ver_claim.replace("theorem verified", "private theorem verified"), "private"),
+            (ver_claim.replace("namespace Verify.Demo.item_1\n", "namespace Verify.Demo.item_1\nopen Evil\n"), "open"),
             (ver_claim + "namespace Verify.Demo.item_1\ntheorem verified : True := trivial\nend Verify.Demo.item_1\n", "exactly one"),
             # Verify-surface smuggling (ported from the Rust certificate inspector, plus
             # certificate-type shadowing): axioms, notation, `@[instance]`, spec instances,
@@ -1157,6 +1202,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             (ver_claim.replace("import Trusted\n", "import Trusted\nimport Assumptions.Demo.other\n"), "disallowed `import Assumptions.Demo.other`"),
             (ver_claim.replace("import Trusted\n", "import Trusted\nimport Evil\n"), "disallowed `import Evil`"),
             (ver_claim.replace("theorem verified", "def VerificationResult (_ : Nat) : Prop := True\ntheorem verified"), "shadows or escapes"),
+            (ver_claim.replace("theorem verified", "def ItemSpec (_ : String) : Type := Unit\ntheorem verified"), "shadows or escapes"),
             (ver_claim.replace("theorem verified", "def Obligations.Demo.item_1.claim : Nat := 0\ntheorem verified"), "shadows or escapes"),
         ):
             ver_ws.write_text(bad_ver)
@@ -1164,30 +1210,159 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         ver_ws.unlink()
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "Verify")
         expect_failure(lambda: runner.audit_fault_coverage(ws_manifest), 1, "fault-coverage", "Verify")
+        ver_ws.write_text(ver_claim)
+
+        # Negative 12: Spec-override smuggling in `Proof/` or `Assumptions/` fails closed.
+        proof_ws = ws_dir / "anneal/proofs/Proof/Demo/item_1.lean"
+        proof_ws.parent.mkdir(parents=True, exist_ok=True)
+        proof_ws.write_text(
+            "import Trusted\nimport Obligations.Demo.item_1\nnamespace Proof.Demo.item_1\n"
+            "instance : ItemSpec \"demo::item_1\" where\n  pre := fun _ => False\n  post := fun _ _ => True\n"
+            "end Proof.Demo.item_1\n"
+        )
+        ver_ws.write_text(ver_claim.replace("import Obligations.Demo.item_1\n",
+                                            "import Obligations.Demo.item_1\nimport Proof.Demo.item_1\n"))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "specification override instance")
+        proof_ws.unlink()
+        ver_ws.write_text(ver_claim)
 
         # 19e. External callees are honoured only for an independently derived modular surface
-        # backed by `externalSpecCallContract` targets or imported sibling obligations, and
-        # unresolved indirect calls only for an assumed (`spec(trusted)` / UB-exception) body.
-        ver_ws.write_text(ver_claim.replace(
+        # backed by verified `externalSpecCallContract` sidecars or verified sibling obligations
+        # wired into `envAssumed`, and unresolved indirect calls only for an assumed
+        # (`spec(trusted)` / UB-exception) body.
+        ext_spec_ws = gen_dir / "Mir/Demo/ext_spec.lean"
+        valid_ext_spec_mod = (
+            valid_mir_mod.replace("ContractRole.subject", "ContractRole.externalSpec \"demo::ext\"")
+            .replace("item_1", "ext_spec")
+        )
+        ext_spec_ws.write_text(valid_ext_spec_mod)
+        ver_mod = ver_claim.replace(
             "VerificationResult.VerificationResult Obligations.Demo.item_1.claim",
-            "VerificationResult.ModularVerificationResult Obligations.Demo.item_1.modularClaim"))
-        ob_ws.write_text(ob_nil.replace(
-            "end Obligations.Demo.item_1",
-            "def externalCallContract_ext : MirCallContract :=\n"
-            "  externalSpecCallContract \"demo::ext\" Mir.Demo.helper.body (fun _ => True) (fun _ _ => True)\n"
-            "end Obligations.Demo.item_1"))
+            "VerificationResult.ModularVerificationResult Obligations.Demo.item_1.modularClaim")
+        ver_ws.write_text(ver_mod)
+        ob_ext = (
+            ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Mir.Demo.ext_spec\n")
+            .replace(
+                "instance (priority := low) defaultModularSpec",
+                "def externalCallContract_ext : MirCallContract :=\n"
+                "  externalSpecCallContract \"demo::ext\" Mir.Demo.ext_spec.body (fun _ => True) (fun _ _ => True)\n"
+                "instance (priority := low) defaultModularSpec",
+            )
+            .replace("envAssumed := fun _ => True", "envAssumed := fun env => externalCallContract_ext.holdsOn env")
+        )
+        ob_ws.write_text(ob_ext)
         write_receipt(callee_closure=closure(external=["demo::ext"]))
+        # Unregistered sidecar (absent from CaptureManifest.json) fails closed even if on disk.
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "missing `Mir/Demo/ext_spec.lean`")
+        write_manifest({
+            "def_id": "demo::ext_spec",
+            "mir_module_path": ".anneal/generated/Mir/Demo/ext_spec.lean",
+            "mir_module_sha256": runner.digest(ext_spec_ws),
+        })
         assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
+        # Unlinked externalSpecCallContract (omitted from envAssumed) fails closed.
+        ob_ws.write_text(ob_ext.replace("envAssumed := fun env => externalCallContract_ext.holdsOn env",
+                                        "envAssumed := fun _ => True"))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "without referencing")
+        ob_ws.write_text(ob_ext)
+        # Wrong ContractRole on externalSpecCallContract sidecar fails closed.
+        ext_spec_ws.write_text(valid_mir_mod.replace("item_1", "ext_spec"))
+        write_manifest({
+            "def_id": "demo::ext_spec",
+            "mir_module_path": ".anneal/generated/Mir/Demo/ext_spec.lean",
+            "mir_module_sha256": runner.digest(ext_spec_ws),
+        })
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "ContractRole.externalSpec")
+        ext_spec_ws.write_text(valid_ext_spec_mod)
+        write_manifest({
+            "def_id": "demo::ext_spec",
+            "mir_module_path": ".anneal/generated/Mir/Demo/ext_spec.lean",
+            "mir_module_sha256": runner.digest(ext_spec_ws),
+        })
+        # Specs/<Item>.lean overriding ModularItemSpec.envAssumed fails closed when external_callees is non-empty.
+        specs_ws = ws_dir / "anneal/proofs/Specs/Demo/item_1.lean"
+        specs_ws.parent.mkdir(parents=True, exist_ok=True)
+        specs_ws.write_text(
+            "import Trusted\nnamespace Specs.Demo.item_1\n"
+            "instance : ModularItemSpec \"demo::item_1\" where\n"
+            "  pre := fun _ => True\n  post := fun _ _ => True\n  envAssumed := fun _ => True\n"
+            "end Specs.Demo.item_1\n"
+        )
+        ver_ws.write_text(ver_mod.replace("import Trusted\n", "import Trusted\nimport Specs.Demo.item_1\n"))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "backed by neither")
+        ver_ws.write_text(ver_mod)
+        specs_ws.unlink()
         write_receipt(callee_closure=closure(external=["demo::ext", "demo::ghost"]))
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "backed by neither")
         write_receipt(callee_closure=closure(external=["demo::ext"], unresolved=True))
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "allow_unresolved_indirect_calls")
-        ob_ws.write_text(ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Obligations.Demo.helper\n"))
+        ext_spec_ws.unlink()
+        write_manifest()
+
+        # Verified sibling modular obligation: requires sibling receipt + compatible Verify surface + holdsOn in envAssumed.
+        ob_helper_ws = gen_dir / "Obligations/Demo/helper.lean"
+        ob_helper_ws.write_text(ob_nil.replace("item_1", "helper"))
+        ver_helper_ws = gen_dir / "Verify/Demo/helper.lean"
+        ver_helper_ws.write_text(ver_claim.replace("item_1", "helper"))
+        fc_helper_ws = gen_dir / "FaultCensus/Demo/helper.json"
+        fc_helper_ws.write_text(json.dumps({
+            **valid_receipt,
+            "def_path": "demo::helper",
+            "mir_module_sha256": runner.digest(helper_ws),
+        }, indent=2))
+        ob_sib = (
+            ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Obligations.Demo.helper\n")
+            .replace("envAssumed := fun _ => True",
+                     "envAssumed := fun env => Obligations.Demo.helper.defaultCallContract.holdsOn env")
+        )
+        ob_ws.write_text(ob_sib)
         write_receipt(callee_closure=closure(external=["demo::helper"]))
-        assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
-        ob_ws.write_text(ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Obligations.Demo.missing\n"))
+        assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 2
+        # Unverified helper (no Verify/Demo/helper.lean and no FaultCensus/Demo/helper.json)
+        # cannot be moved from inline_callees to external_callees!
+        ver_helper_ws.unlink()
+        fc_helper_ws.unlink()
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "has no verified `FaultCensus/Demo/helper.json` receipt")
+        ver_helper_ws.write_text(ver_claim.replace("item_1", "helper"))
+        fc_helper_ws.write_text(json.dumps({
+            **valid_receipt,
+            "def_path": "demo::helper",
+            "mir_module_sha256": runner.digest(helper_ws),
+        }, indent=2))
+        # Incompatible sibling Verify surface (`statefulClaim`) cannot back pure `defaultCallContract`.
+        ob_helper_ws.write_text(
+            ob_nil.replace("item_1", "helper").replace(
+                "end Obligations.Demo.helper",
+                "def statefulClaim [spec : StatefulItemSpec \"demo::helper\"] : StatefulVerificationObligation :=\n"
+                "  { body := Mir.Demo.helper.body, callees := defaultCallees, pre := spec.pre, post := spec.post }\n"
+                "end Obligations.Demo.helper",
+            )
+        )
+        ver_helper_ws.write_text(
+            ver_claim.replace("item_1", "helper").replace(
+                "VerificationResult.VerificationResult Obligations.Demo.helper.claim",
+                "VerificationResult.StatefulVerificationResult Obligations.Demo.helper.statefulClaim",
+            )
+        )
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "incompatible with `Verify.Demo.helper` surface")
+        ob_helper_ws.unlink()
+        ver_helper_ws.unlink()
+        fc_helper_ws.unlink()
+
+        ob_ws.write_text(ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Obligations.Demo.missing\n")
+                         .replace("envAssumed := fun _ => True",
+                                  "envAssumed := fun env => Obligations.Demo.missing.defaultCallContract.holdsOn env"))
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "Mir/Demo/missing.lean")
         ob_ws.write_text(ob_nil)
+        assump_ws = gen_dir / "Assumptions/Demo/item_1.lean"
+        assump_ws.parent.mkdir(parents=True, exist_ok=True)
+        assump_ws.write_text(
+            "import Trusted\nimport Mir.Demo.item_1\nimport Obligations.Demo.item_1\n"
+            "namespace Assumptions.Demo.item_1\n"
+            "axiom rust_trusted_contract [ItemSpec \"demo::item_1\"] : "
+            "Trusted.VerificationResult.VerificationResult Obligations.Demo.item_1.claim\n"
+            "end Assumptions.Demo.item_1\n"
+        )
         ver_trusted = ver_claim.replace(
             "import Obligations.Demo.item_1\n", "import Obligations.Demo.item_1\nimport Assumptions.Demo.item_1\n"
         ).replace("Proof.Demo.item_1.verified", "Assumptions.Demo.item_1.rust_trusted_contract")
@@ -1207,6 +1382,41 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         ):
             ver_ws.write_text(not_assumed)
             expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "allow_unresolved_indirect_calls")
+        assump_ws.unlink()
+        # Equivalence surface (`equivClaim`) reconciles the reference `specBody` as well.
+        ref_ws = gen_dir / "Mir/Demo/ref_impl.lean"
+        ref_ws.write_text(valid_mir_mod.replace("item_1", "ref_impl"))
+        write_manifest({
+            "def_id": "demo::ref_impl",
+            "mir_module_path": ".anneal/generated/Mir/Demo/ref_impl.lean",
+            "mir_module_sha256": runner.digest(ref_ws),
+        })
+        ob_equiv = (
+            ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Mir.Demo.ref_impl\n")
+            .replace(
+                "end Obligations.Demo.item_1",
+                "instance (priority := low) rustEquivSpec : StatefulEquivItemSpec \"demo::item_1\" :=\n"
+                "  refineEquivSpec Mir.Demo.ref_impl.body (fun _ _ => True) (fun _ _ _ _ => True)\n"
+                "def equivClaim [spec : StatefulEquivItemSpec \"demo::item_1\"] : StatefulEquivObligation :=\n"
+                "  { implBody := Mir.Demo.item_1.body, specBody := spec.specBody, "
+                "implCallees := defaultCallees, specCallees := defaultCallees, "
+                "frame := spec.frame, argRel := spec.argRel, retRel := spec.retRel }\n"
+                "end Obligations.Demo.item_1",
+            )
+        )
+        ob_ws.write_text(ob_equiv)
+        ver_ws.write_text(ver_claim.replace(
+            "VerificationResult.VerificationResult Obligations.Demo.item_1.claim",
+            "VerificationResult.StatefulEquivVerificationResult Obligations.Demo.item_1.equivClaim"))
+        write_receipt()
+        assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
+        # Missing reference `specBody` fails closed.
+        ob_ws.write_text(ob_equiv.replace(
+            "instance (priority := low) rustEquivSpec : StatefulEquivItemSpec \"demo::item_1\" :=\n"
+            "  refineEquivSpec Mir.Demo.ref_impl.body (fun _ _ => True) (fun _ _ _ _ => True)\n", ""))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "declares a `StatefulEquivItemSpec`")
+        ref_ws.unlink()
+        write_manifest()
         shutil.rmtree(ws_dir)
         done("fault-site census, 12-class PropertyRegistry, source pins, 4+2 false-proof mutation probes, and --audit-fault-coverage")
     except BaseException as error:

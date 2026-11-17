@@ -1663,6 +1663,108 @@ print(f"REAL_MIR_CENSUS_PARITY_OK {{len(cases)}}")
     assert_audit_rejects(&check_trusted_py, &crate_a, "deleted Verify module", "Verify/CrateA/local_helper.lean");
     fs::write(&verify_helper_path, &verify_helper).expect("restore Verify module");
 
+    // Detached `Obligations` claim (`callees := []` while `defaultCallees` stays intact) fails closed.
+    let ob_calls_helper_path = gen_dir.join("Obligations/CrateA/calls_local_helper.lean");
+    let ob_calls_helper = read(&ob_calls_helper_path);
+    tamper(
+        ob_calls_helper_path.clone(),
+        ob_calls_helper.replacen("callees := defaultCallees", "callees := []", 1),
+        "detached Obligations claim callees",
+        "overrides claim `callees :=",
+    );
+    // Unlinked `externalSpecCallContract` (dropped from `defaultModularSpec.envAssumed`) fails closed.
+    let ob_ext_path = gen_dir.join("Obligations/CrateA/caller_with_external_specs.lean");
+    let ob_ext_src = read(&ob_ext_path);
+    let unlinked_ob_ext = ob_ext_src.replacen(
+        "envAssumed := externalCallContract_",
+        "envAssumed := fun _ => True -- externalCallContract_",
+        1,
+    );
+    tamper(
+        ob_ext_path,
+        unlinked_ob_ext,
+        "unlinked externalSpecCallContract in defaultModularSpec.envAssumed",
+        "without referencing",
+    );
+    // `Specs/<Item>.lean` overriding `ModularItemSpec.envAssumed` fails closed when `external_callees` is non-empty.
+    let specs_ext_path = crate_a.join("anneal/proofs/Specs/CrateA/caller_with_external_specs.lean");
+    fs::create_dir_all(specs_ext_path.parent().unwrap()).expect("create Specs/CrateA");
+    let verify_ext_path = gen_dir.join("Verify/CrateA/caller_with_external_specs.lean");
+    let verify_ext_orig = read(&verify_ext_path);
+    let specs_ext_orig = specs_ext_path.is_file().then(|| read(&specs_ext_path));
+    fs::write(
+        &specs_ext_path,
+        "import Trusted\nnamespace Specs.CrateA.caller_with_external_specs\n\
+         instance : ModularItemSpec \"crate_a::caller_with_external_specs\" where\n\
+           pre := fun _ => True\n  post := fun _ _ => True\n  envAssumed := fun _ => True\n\
+         end Specs.CrateA.caller_with_external_specs\n",
+    )
+    .expect("write Specs override");
+    if !verify_ext_orig.contains("import Specs.CrateA.caller_with_external_specs") {
+        fs::write(
+            &verify_ext_path,
+            verify_ext_orig.replacen(
+                "import Trusted\n",
+                "import Trusted\nimport Specs.CrateA.caller_with_external_specs\n",
+                1,
+            ),
+        )
+        .expect("import Specs in Verify");
+    }
+    assert_audit_rejects(
+        &check_trusted_py,
+        &crate_a,
+        "Specs ModularItemSpec.envAssumed override with external_callees",
+        "backed by neither",
+    );
+    fs::write(&verify_ext_path, &verify_ext_orig).expect("restore Verify ext");
+    match specs_ext_orig {
+        Some(orig) => fs::write(&specs_ext_path, orig).expect("restore Specs ext"),
+        None => {
+            let _ = fs::remove_file(&specs_ext_path);
+        }
+    }
+
+    // Spec-override smuggling inside `Proof/<Item>.lean` fails closed.
+    let proof_calls_helper_path = crate_a.join("anneal/proofs/Proof/CrateA/calls_local_helper.lean");
+    fs::create_dir_all(proof_calls_helper_path.parent().unwrap()).expect("create Proof/CrateA");
+    let verify_calls_helper_path = gen_dir.join("Verify/CrateA/calls_local_helper.lean");
+    let verify_calls_helper_orig = read(&verify_calls_helper_path);
+    let proof_calls_helper_orig = proof_calls_helper_path.is_file().then(|| read(&proof_calls_helper_path));
+    fs::write(
+        &proof_calls_helper_path,
+        "import Trusted\nimport Obligations.CrateA.calls_local_helper\n\
+         namespace Proof.CrateA.calls_local_helper\n\
+         instance : ItemSpec \"crate_a::calls_local_helper\" where\n\
+           pre := fun _ => False\n  post := fun _ _ => True\n\
+         end Proof.CrateA.calls_local_helper\n",
+    )
+    .expect("write smuggled Proof override");
+    if !verify_calls_helper_orig.contains("import Proof.CrateA.calls_local_helper") {
+        fs::write(
+            &verify_calls_helper_path,
+            verify_calls_helper_orig.replacen(
+                "import Trusted\n",
+                "import Trusted\nimport Proof.CrateA.calls_local_helper\n",
+                1,
+            ),
+        )
+        .expect("import Proof in Verify");
+    }
+    assert_audit_rejects(
+        &check_trusted_py,
+        &crate_a,
+        "Proof ItemSpec smuggling",
+        "specification override instance",
+    );
+    fs::write(&verify_calls_helper_path, &verify_calls_helper_orig).expect("restore Verify");
+    match proof_calls_helper_orig {
+        Some(orig) => fs::write(&proof_calls_helper_path, orig).expect("restore Proof"),
+        None => {
+            let _ = fs::remove_file(&proof_calls_helper_path);
+        }
+    }
+
     let restored = run_python_audit(&check_trusted_py, &crate_a);
     assert!(
         restored.status.success(),

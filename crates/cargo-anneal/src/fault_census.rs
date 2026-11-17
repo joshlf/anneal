@@ -2515,7 +2515,7 @@ fn is_valid_captured_mir_type(ty: &str) -> bool {
 /// interprets. Strict module scanning rejects any declaration or namespace that
 /// reuses one of these names, because a local `def TerminatorKind.goto` would
 /// shadow the real constructor for every `TerminatorKind.goto` written in the module.
-const MIR_AST_TYPE_NAMES: [&str; 35] = [
+const MIR_AST_TYPE_NAMES: [&str; 62] = [
     "AggregateKind",
     "BasicBlockData",
     "BinOp",
@@ -2527,9 +2527,18 @@ const MIR_AST_TYPE_NAMES: [&str; 35] = [
     "ConstScalar",
     "ConstValue",
     "ContractRole",
+    "CrateClaim",
+    "CrateVerificationResult",
+    "ItemProof",
+    "ItemSpec",
     "List",
     "LocalDecl",
+    "MirCallContract",
     "MirPhaseTag",
+    "ModularItemProof",
+    "ModularItemSpec",
+    "ModularVerificationClaim",
+    "ModularVerificationResult",
     "Mutability",
     "Nat",
     "NonDivergingIntrinsic",
@@ -2545,12 +2554,30 @@ const MIR_AST_TYPE_NAMES: [&str; 35] = [
     "ScalarInt",
     "Statement",
     "StatementKind",
+    "StatefulEquivClaim",
+    "StatefulEquivItemProof",
+    "StatefulEquivItemSpec",
+    "StatefulEquivVerificationResult",
+    "StatefulItemProof",
+    "StatefulItemSpec",
+    "StatefulVerificationClaim",
+    "StatefulVerificationResult",
     "SwitchTargets",
     "Terminator",
     "TerminatorKind",
+    "TotalItemProof",
+    "TotalItemSpec",
+    "TotalVerificationClaim",
+    "TotalVerificationResult",
     "Ty",
+    "UbExceptionClaim",
+    "UbExceptionItemProof",
+    "UbExceptionItemSpec",
+    "UbExceptionVerificationResult",
     "UnOp",
     "UnwindAction",
+    "VerificationClaim",
+    "VerificationResult",
 ];
 
 /// `[adv B1]`: validate that the constructor head `full` (whose last segment is
@@ -5623,11 +5650,38 @@ pub fn validate_obligations_canonical_claims_for_def_path(
                     }
                 }
             }
-            "axiom" | "opaque" | "macro" | "macro_rules" | "syntax" | "notation" | "elab"
-            | "local" | "scoped" | "attribute" | "unsafe" | "partial" => {
+            "axiom" | "opaque" | "macro" | "macro_rules" | "syntax" | "notation" | "infix"
+            | "infixl" | "infixr" | "prefix" | "postfix" | "elab" | "local" | "scoped"
+            | "attribute" | "unsafe" | "partial" | "export" | "section" => {
                 return Err(format!(
                     "disallowed top-level `{kw}` command in Obligations module for {subject_suffix}"
                 ));
+            }
+            "open" => {
+                let mut open_idx = idx + 1;
+                let mut count = 0usize;
+                while let Some(LeanToken::Ident(ns_name)) = tokens.get(open_idx) {
+                    if is_lean_command_start(&tokens[open_idx]) {
+                        break;
+                    }
+                    if matches!(ns_name.as_str(), "renaming" | "hiding" | "in" | "scoped") {
+                        return Err(format!(
+                            "`open ... {ns_name}` is not supported in Obligations module for {subject_suffix}"
+                        ));
+                    }
+                    if !STRICT_MODULE_OPENS.contains(&ns_name.as_str()) {
+                        return Err(format!(
+                            "disallowed `open {ns_name}` in Obligations module for {subject_suffix}"
+                        ));
+                    }
+                    count += 1;
+                    open_idx += 1;
+                }
+                if count == 0 {
+                    return Err(format!(
+                        "`open` without namespaces in Obligations module for {subject_suffix}"
+                    ));
+                }
             }
             "private" | "protected" | "noncomputable" => {
                 if let Some(LeanToken::Ident(next_name)) = tokens.get(idx + 2)
@@ -6136,6 +6190,11 @@ pub fn validate_obligations_canonical_claims_for_def_path(
 
     let links = scan_obligations_callee_links(ob_text)
         .map_err(|err| format!("failed to scan Obligations module for {subject_suffix}: {err}"))?;
+    if !links.imported_mir_suffixes.iter().any(|m| m == subject_suffix) {
+        return Err(format!(
+            "Obligations module for {subject_suffix} must `import Mir.{subject_suffix}`"
+        ));
+    }
     if links.default_spec_count != 1 {
         return Err(format!(
             "Obligations module for {subject_suffix} must declare exactly one `defaultSpec` instance (found {})",
@@ -6310,10 +6369,35 @@ pub fn inspect_verify_module_certificate(
     let expected_ns = format!("Verify.{subject_suffix}");
     let mut ns_opens = 0usize;
     let mut ns_closes = 0usize;
+    let mut imported_own_obligations = false;
     let mut verified_types: Vec<Vec<LeanToken>> = Vec::new();
     let mut imported_specs_suffixes: Vec<String> = Vec::new();
     let mut imported_proof_suffixes: Vec<String> = Vec::new();
     let mut imported_assumptions_suffixes: Vec<String> = Vec::new();
+
+    const VERIFY_CERTIFICATE_TYPE_NAMES: &[&str] = &[
+        "VerificationResult",
+        "StatefulVerificationResult",
+        "TotalVerificationResult",
+        "StatefulEquivVerificationResult",
+        "ModularVerificationResult",
+        "UbExceptionVerificationResult",
+        "CrateVerificationResult",
+    ];
+
+    let check_decl_not_shadowing = |decl_kw: &str, decl_name: &str| -> Result<(), String> {
+        let last = decl_name.rsplit_once('.').map(|(_, s)| s).unwrap_or(decl_name);
+        if VERIFY_CERTIFICATE_TYPE_NAMES.contains(&last)
+            || canonical_spec_class_name(last).is_some()
+            || canonical_proof_class_name(last).is_some()
+            || decl_name.contains('.')
+        {
+            return Err(format!(
+                "`{decl_kw} {decl_name}` shadows or escapes the certificate namespace in Verify module for {subject_suffix}"
+            ));
+        }
+        Ok(())
+    };
 
     let find_command_end = |start: usize| -> usize {
         let mut cdepth = 0isize;
@@ -6388,6 +6472,9 @@ pub fn inspect_verify_module_certificate(
                         imported_assumptions_suffixes.push(assump_suf.to_string());
                     }
                 } else {
+                    if module == &format!("Obligations.{subject_suffix}") {
+                        imported_own_obligations = true;
+                    }
                     let allowed = module == "Init"
                         || module.starts_with("Init.")
                         || module == "Std"
@@ -6421,35 +6508,73 @@ pub fn inspect_verify_module_certificate(
                     ));
                 }
             },
-            "axiom" | "opaque" | "macro" | "macro_rules" | "syntax" | "notation" | "elab"
-            | "local" | "scoped" | "attribute" | "class" | "structure" | "inductive" | "unsafe"
-            | "partial" => {
+            "open" => {
+                let mut open_idx = idx + 1;
+                let mut count = 0usize;
+                while let Some(LeanToken::Ident(ns_name)) = tokens.get(open_idx) {
+                    if is_lean_command_start(&tokens[open_idx]) {
+                        break;
+                    }
+                    if matches!(ns_name.as_str(), "renaming" | "hiding" | "in" | "scoped") {
+                        return Err(format!(
+                            "`open ... {ns_name}` is not supported in Verify module for {subject_suffix}"
+                        ));
+                    }
+                    if !STRICT_MODULE_OPENS.contains(&ns_name.as_str()) {
+                        return Err(format!(
+                            "disallowed `open {ns_name}` in Verify module for {subject_suffix}"
+                        ));
+                    }
+                    count += 1;
+                    open_idx += 1;
+                }
+                if count == 0 {
+                    return Err(format!(
+                        "`open` without namespaces in Verify module for {subject_suffix}"
+                    ));
+                }
+            }
+            "axiom" | "opaque" | "macro" | "macro_rules" | "syntax" | "notation" | "infix"
+            | "infixl" | "infixr" | "prefix" | "postfix" | "elab" | "local" | "scoped"
+            | "attribute" | "class" | "structure" | "inductive" | "unsafe" | "partial"
+            | "export" | "section" | "private" | "protected" | "noncomputable" | "nonrec" => {
                 return Err(format!(
-                    "disallowed top-level `{kw}` command in Verify module for {subject_suffix}"
+                    "disallowed top-level `{kw}` command or modifier in Verify module for {subject_suffix}"
                 ));
             }
-            "def" | "abbrev" | "lemma" => {
-                if matches!(tokens.get(idx + 1), Some(LeanToken::Ident(n)) if n == "verified") {
-                    return Err(format!(
-                        "`verified` declared as `{kw}` instead of `theorem` in Verify module for {subject_suffix}"
-                    ));
+            "def" | "abbrev" | "lemma" | "example" => {
+                if let Some(LeanToken::Ident(n)) = tokens.get(idx + 1) {
+                    if n == "verified" {
+                        return Err(format!(
+                            "`verified` declared as `{kw}` instead of `theorem` in Verify module for {subject_suffix}"
+                        ));
+                    }
+                    check_decl_not_shadowing(kw, n)?;
                 }
                 let cmd_end = find_command_end(idx + 1);
                 for tok in &tokens[idx..cmd_end] {
-                    if let LeanToken::Ident(id) = tok
-                        && let Some(spec_cls) = canonical_spec_class_name(id)
-                    {
-                        return Err(format!(
-                            "Verify module for {subject_suffix} references `{spec_cls}` inside `{kw}` declaration"
-                        ));
+                    if let LeanToken::Ident(id) = tok {
+                        if let Some(spec_cls) = canonical_spec_class_name(id) {
+                            return Err(format!(
+                                "Verify module for {subject_suffix} references `{spec_cls}` inside `{kw}` declaration"
+                            ));
+                        }
+                        if is_refine_spec_helper_ident(id) {
+                            return Err(format!(
+                                "Verify module for {subject_suffix} invokes specification override helper `{id}` inside `{kw}`"
+                            ));
+                        }
                     }
                 }
             }
             "instance" => {
-                if matches!(tokens.get(idx + 1), Some(LeanToken::Ident(n)) if n == "verified") {
-                    return Err(format!(
-                        "`verified` declared as `instance` instead of `theorem` in Verify module for {subject_suffix}"
-                    ));
+                if let Some(LeanToken::Ident(n)) = tokens.get(idx + 1) {
+                    if n == "verified" {
+                        return Err(format!(
+                            "`verified` declared as `instance` instead of `theorem` in Verify module for {subject_suffix}"
+                        ));
+                    }
+                    check_decl_not_shadowing(kw, n)?;
                 }
                 let cmd_end = find_command_end(idx + 1);
                 let cmd_slice = &tokens[idx..cmd_end];
@@ -6496,6 +6621,24 @@ pub fn inspect_verify_module_certificate(
                 }
             }
             "theorem" => {
+                if let Some(LeanToken::Ident(n)) = tokens.get(idx + 1) {
+                    check_decl_not_shadowing(kw, n)?;
+                }
+                let cmd_end = find_command_end(idx + 1);
+                for tok in &tokens[idx..cmd_end] {
+                    if let LeanToken::Ident(id) = tok {
+                        if let Some(spec_cls) = canonical_spec_class_name(id) {
+                            return Err(format!(
+                                "Verify module for {subject_suffix} references `{spec_cls}` inside `theorem` declaration"
+                            ));
+                        }
+                        if is_refine_spec_helper_ident(id) {
+                            return Err(format!(
+                                "Verify module for {subject_suffix} invokes specification override helper `{id}` inside `theorem`"
+                            ));
+                        }
+                    }
+                }
                 if matches!(tokens.get(idx + 1), Some(LeanToken::Ident(n)) if n == "verified") {
                     if tokens.get(idx + 2) != Some(&LeanToken::Colon) {
                         return Err(format!(
@@ -6540,6 +6683,11 @@ pub fn inspect_verify_module_certificate(
         idx += 1;
     }
 
+    if !imported_own_obligations {
+        return Err(format!(
+            "Verify module for {subject_suffix} must `import Obligations.{subject_suffix}`"
+        ));
+    }
     if ns_opens != 1 || ns_closes != 1 {
         return Err(format!(
             "Verify module for {subject_suffix} must contain a single `namespace {expected_ns} ... end {expected_ns}` block"

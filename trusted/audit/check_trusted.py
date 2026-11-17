@@ -5934,9 +5934,18 @@ _MIR_AST_TYPE_NAMES: frozenset[str] = frozenset((
     "ConstScalar",
     "ConstValue",
     "ContractRole",
+    "CrateClaim",
+    "CrateVerificationResult",
+    "ItemProof",
+    "ItemSpec",
     "List",
     "LocalDecl",
+    "MirCallContract",
     "MirPhaseTag",
+    "ModularItemProof",
+    "ModularItemSpec",
+    "ModularVerificationClaim",
+    "ModularVerificationResult",
     "Mutability",
     "Nat",
     "NonDivergingIntrinsic",
@@ -5952,12 +5961,30 @@ _MIR_AST_TYPE_NAMES: frozenset[str] = frozenset((
     "ScalarInt",
     "Statement",
     "StatementKind",
+    "StatefulEquivClaim",
+    "StatefulEquivItemProof",
+    "StatefulEquivItemSpec",
+    "StatefulEquivVerificationResult",
+    "StatefulItemProof",
+    "StatefulItemSpec",
+    "StatefulVerificationClaim",
+    "StatefulVerificationResult",
     "SwitchTargets",
     "Terminator",
     "TerminatorKind",
+    "TotalItemProof",
+    "TotalItemSpec",
+    "TotalVerificationClaim",
+    "TotalVerificationResult",
     "Ty",
+    "UbExceptionClaim",
+    "UbExceptionItemProof",
+    "UbExceptionItemSpec",
+    "UbExceptionVerificationResult",
     "UnOp",
     "UnwindAction",
+    "VerificationClaim",
+    "VerificationResult",
 ))
 
 _LEAN_COMMAND_KEYWORDS: frozenset[str] = frozenset((
@@ -9210,37 +9237,48 @@ def run_false_proof_mutation_probes(
 
 
 def _trusted_string_eq_literals(src: str, def_name: str) -> set[str]:
-    header = f"def {def_name} "
-    pos = src.find(header)
-    if pos < 0:
-        raise Failure(
-            1,
-            FAULT_COVERAGE_PHASE,
-            f"missing trusted definition `{header.strip()}` in Terminators.lean",
-        )
-    rest = src[pos + len(header) :]
-    end_candidates = [
-        idx
-        for marker in ("\n/--", "\ndef ", "\n@[", "\ntheorem ")
-        if (idx := rest.find(marker)) >= 0
-    ]
-    end = min(end_candidates) if end_candidates else len(rest)
-    body = rest[:end]
-    # Strip `--` line comments and `/- ... -/` block comments before scanning `stringEq "..."`
     try:
-        tokens = tokenize_lean_source(body)
+        tokens = tokenize_lean_source(src)
     except CensusScanError as err:
         raise Failure(
             1,
             FAULT_COVERAGE_PHASE,
-            f"malformed syntax in Terminators.lean `{def_name}`: {err}",
+            f"malformed syntax in Terminators.lean while scanning `{def_name}`: {err}",
         ) from err
+    top_indices = _top_level_token_indices(tokens)
+    top_set = set(top_indices)
+    start_idx: int | None = None
+    for idx in top_indices:
+        if (
+            idx + 1 < len(tokens)
+            and tokens[idx] == ("Ident", "def")
+            and tokens[idx + 1] == ("Ident", def_name)
+        ):
+            if start_idx is not None:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"duplicate `def {def_name}` in Terminators.lean",
+                )
+            start_idx = idx
+    if start_idx is None:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"missing trusted definition `def {def_name}` in Terminators.lean",
+        )
+    end_idx = len(tokens)
+    for k in range(start_idx + 2, len(tokens)):
+        if k in top_set and _fc_is_lean_command_start(tokens[k]):
+            end_idx = k
+            break
+    body_tokens = tokens[start_idx:end_idx]
     out: set[str] = set()
-    for i in range(len(tokens) - 1):
-        if tokens[i] == ("Ident", "stringEq"):
-            for j in range(i + 1, min(i + 4, len(tokens))):
-                if tokens[j][0] == "StrLit":
-                    out.add(str(tokens[j][1]))
+    for i in range(len(body_tokens) - 1):
+        if body_tokens[i] == ("Ident", "stringEq"):
+            for j in range(i + 1, min(i + 4, len(body_tokens))):
+                if body_tokens[j][0] == "StrLit":
+                    out.add(str(body_tokens[j][1]))
                     break
     return out
 
@@ -9249,14 +9287,23 @@ def _parse_lean_expected_fault_site_list(
     tokens: list[tuple[str, Any]], def_name: str
 ) -> list[FaultSite]:
     n = len(tokens)
+    top_set = set(_top_level_token_indices(tokens))
+    found: list[FaultSite] | None = None
     idx = 0
     while idx + 5 < n:
         if (
-            tokens[idx] == ("Ident", "def")
+            idx in top_set
+            and tokens[idx] == ("Ident", "def")
             and tokens[idx + 1] == ("Ident", def_name)
             and tokens[idx + 2][0] == "Colon"
             and tokens[idx + 5][0] == "ColonEq"
         ):
+            if found is not None:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"duplicate `def {def_name}` in FaultSiteCensus.lean",
+                )
             cur = _MirTokenCursor(tokens, idx + 6)
 
             def _parse_site(c: _MirTokenCursor) -> FaultSite:
@@ -9274,13 +9321,24 @@ def _parse_lean_expected_fault_site_list(
                 c.expect("RParen")
                 return FaultSite(b, s, cls)
 
-            return cur.parse_list(_parse_site)
-        idx += 1
-    raise Failure(
-        1,
-        FAULT_COVERAGE_PHASE,
-        f"missing `def {def_name} : List FaultSite` in FaultSiteCensus.lean",
-    )
+            sites = cur.parse_list(_parse_site)
+            nxt = cur.peek()
+            if nxt is not None and not _fc_is_lean_command_start(nxt):
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"unexpected trailing token {nxt!r} after `def {def_name}` in FaultSiteCensus.lean",
+                )
+            found = sites
+            idx = cur.pos
+        else:
+            idx += 1
+    if found is None:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"missing `def {def_name} : List FaultSite` in FaultSiteCensus.lean",
+        )
+    return found
 
 
 def _check_fault_site_census_lean_pins(src: str) -> None:
@@ -9313,6 +9371,12 @@ def _check_fault_site_census_lean_pins(src: str) -> None:
     cur = _MirTokenCursor(hdr_tokens, 6)
     try:
         ctors = cur.parse_list(lambda c: c.parse_ctor_head()[1])
+        nxt_all = cur.peek()
+        if nxt_all is not None and not _fc_is_lean_command_start(nxt_all):
+            raise CensusScanError(
+                "malformed_syntax",
+                f"unexpected trailing token {nxt_all!r} after `MirFaultClass.all`",
+            )
     except CensusScanError as err:
         raise Failure(
             1,
@@ -9327,18 +9391,29 @@ def _check_fault_site_census_lean_pins(src: str) -> None:
             f"`MirFaultClass.all` in FaultSiteCensus.lean ({ctors}) drifted from MIR_FAULT_CLASSES ({expected_ctors})",
         )
 
-    # 2. Verify `def toRank` arms and `def asStr` arms in `header_window`
-    to_rank_matches = re.findall(
-        r"\|\s*\.([A-Za-z0-9_]+)\s*=>\s*(\d+)", header_window
-    )
+    # 2. Verify `def toRank` arms and `def asStr` arms over comment-free `hdr_tokens`
+    to_rank_matches: list[tuple[str, int]] = []
+    as_str_matches: list[tuple[str, str]] = []
+    for i in range(len(hdr_tokens) - 4):
+        if (
+            hdr_tokens[i] == ("Ident", "|")
+            and hdr_tokens[i + 1][0] == "Dot"
+            and hdr_tokens[i + 2][0] == "Ident"
+            and hdr_tokens[i + 3] == ("Ident", "=>")
+        ):
+            ctor = str(hdr_tokens[i + 2][1])
+            rhs = hdr_tokens[i + 4]
+            if rhs[0] == "NatLit":
+                to_rank_matches.append((ctor, int(rhs[1])))
+            elif rhs[0] == "StrLit":
+                as_str_matches.append((ctor, str(rhs[1])))
     if len(to_rank_matches) != len(MIR_FAULT_CLASSES):
         raise Failure(
             1,
             FAULT_COVERAGE_PHASE,
             f"`MirFaultClass.toRank` arm count ({len(to_rank_matches)}) != {len(MIR_FAULT_CLASSES)} in FaultSiteCensus.lean",
         )
-    for ctor, rank_str in to_rank_matches:
-        rank = int(rank_str)
+    for ctor, rank in to_rank_matches:
         expected_cls = LEAN_CTOR_TO_FAULT_CLASS.get(ctor)
         if expected_cls is None or FAULT_CLASS_RANK.get(expected_cls) != rank:
             raise Failure(
@@ -9347,9 +9422,6 @@ def _check_fault_site_census_lean_pins(src: str) -> None:
                 f"`MirFaultClass.toRank` drift for `.{ctor} => {rank}` in FaultSiteCensus.lean",
             )
 
-    as_str_matches = re.findall(
-        r'\|\s*\.([A-Za-z0-9_]+)\s*=>\s*"([^"]+)"', header_window
-    )
     if len(as_str_matches) != len(MIR_FAULT_CLASSES):
         raise Failure(
             1,
@@ -9824,43 +9896,6 @@ def _check_single_namespace(
         )
 
 
-def _scan_obligations_module(ob_text: str, suffix: str, ob_label: str) -> dict[str, Any]:
-    """`[adv ep2-B1]` Independently extract the callee links of `Obligations/<Item>.lean`:
-    strict `defaultCallees`, imported sibling `Obligations.<Callee>` suffixes, and
-    `externalSpecCallContract "<target>"` targets (never trusting the receipt)."""
-    tokens = _tokenize_lean_or_fail(ob_text, ob_label)
-    _check_single_namespace(tokens, f"Obligations.{suffix}", ob_label)
-    default_callee_suffixes = _parse_obligations_default_callee_suffixes(ob_text, ob_label)
-    imported: list[str] = []
-    for mod in _scan_lean_module_imports(ob_text, ob_label):
-        if mod.startswith("Obligations."):
-            sib = mod[len("Obligations.") :]
-            if sib == suffix:
-                raise Failure(
-                    1,
-                    FAULT_COVERAGE_PHASE,
-                    f"{ob_label} self-imports `Obligations.{suffix}`",
-                )
-            if sib not in imported:
-                imported.append(sib)
-    ext_targets: list[str] = []
-    for i, tok in enumerate(tokens):
-        if (
-            tok[0] == "Ident"
-            and (tok[1] == "externalSpecCallContract" or str(tok[1]).endswith(".externalSpecCallContract"))
-            and i + 1 < len(tokens)
-            and tokens[i + 1][0] == "StrLit"
-        ):
-            tgt = str(tokens[i + 1][1])
-            if tgt and tgt not in ext_targets:
-                ext_targets.append(tgt)
-    return {
-        "default_callee_suffixes": default_callee_suffixes,
-        "imported_obligation_suffixes": imported,
-        "external_spec_targets": ext_targets,
-    }
-
-
 _VERIFY_MONO_CERT_CLAIMS: dict[str, str] = {
     "VerificationResult": "claim",
     "StatefulVerificationResult": "statefulClaim",
@@ -9877,6 +9912,55 @@ _VERIFY_POLY_CLAIMS: frozenset[str] = frozenset((
     "polyModularClaim",
     "polyUbExceptionClaim",
 ))
+
+_POLY_CLAIM_TO_FOR: dict[str, tuple[str, str]] = {
+    "polyClaim": ("VerificationResult", "claimFor"),
+    "polyStatefulClaim": ("StatefulVerificationResult", "statefulClaimFor"),
+    "polyTotalClaim": ("TotalVerificationResult", "totalClaimFor"),
+    "polyModularClaim": ("ModularVerificationResult", "modularClaimFor"),
+    "polyUbExceptionClaim": ("UbExceptionVerificationResult", "ubExceptionClaimFor"),
+}
+
+_OB_RECORD_CLAIMS: frozenset[str] = frozenset((
+    "claim",
+    "statefulClaim",
+    "totalClaim",
+    "equivClaim",
+    "modularClaim",
+    "ubExceptionClaim",
+    "claimFor",
+    "statefulClaimFor",
+    "totalClaimFor",
+    "modularClaimFor",
+    "ubExceptionClaimFor",
+))
+
+_OB_CANONICAL_CLAIM_NAMES: frozenset[str] = frozenset((
+    *_OB_RECORD_CLAIMS,
+    *_VERIFY_POLY_CLAIMS,
+))
+
+_OB_RESERVED_HELPER_DEFS: frozenset[str] = frozenset((
+    "defaultCallContract",
+    "polyCertificate",
+    "refineEquivSpec",
+    "refineModularSpec",
+))
+
+_CLAIM_EXPECTED_SPEC_CLASS: dict[str, str] = {
+    "claim": "ItemSpec",
+    "statefulClaim": "StatefulItemSpec",
+    "totalClaim": "TotalItemSpec",
+    "equivClaim": "StatefulEquivItemSpec",
+    "modularClaim": "ModularItemSpec",
+    "ubExceptionClaim": "UbExceptionItemSpec",
+    "claimFor": "ItemSpec",
+    "modularClaimFor": "ModularItemSpec",
+    "ubExceptionClaimFor": "UbExceptionItemSpec",
+    "polyClaim": "ItemSpec",
+    "polyModularClaim": "ModularItemSpec",
+    "polyUbExceptionClaim": "UbExceptionItemSpec",
+}
 
 
 def _strip_verification_result_qual(name: str) -> str:
@@ -9907,6 +9991,34 @@ _VERIFY_DISALLOWED_TOP_LEVEL: frozenset[str] = frozenset((
     "inductive",
     "unsafe",
     "partial",
+    "export",
+    "section",
+    "private",
+    "protected",
+    "noncomputable",
+    "nonrec",
+))
+
+_OB_DISALLOWED_TOP_LEVEL: frozenset[str] = frozenset((
+    "axiom",
+    "opaque",
+    "macro",
+    "macro_rules",
+    "syntax",
+    "notation",
+    "infix",
+    "infixl",
+    "infixr",
+    "prefix",
+    "postfix",
+    "elab",
+    "local",
+    "scoped",
+    "attribute",
+    "unsafe",
+    "partial",
+    "export",
+    "section",
 ))
 
 _VERIFY_CERTIFICATE_TYPE_NAMES: frozenset[str] = frozenset((
@@ -9968,21 +10080,1066 @@ def _verify_detect_instance_attribute(tokens: list[tuple[str, Any]]) -> str | No
     return None
 
 
+def _strip_enclosing_parens_tokens(
+    seq: list[tuple[str, Any]]
+) -> list[tuple[str, Any]]:
+    while len(seq) >= 2 and seq[0][0] == "LParen" and seq[-1][0] == "RParen":
+        bal = 0
+        enclosed = True
+        for pos, (tk, _v) in enumerate(seq):
+            if tk in ("LParen", "LBrace", "LBracket"):
+                bal += 1
+            elif tk in ("RParen", "RBrace", "RBracket"):
+                bal -= 1
+            if bal <= 0 and pos + 1 < len(seq):
+                enclosed = False
+                break
+        if enclosed and bal == 0:
+            seq = seq[1:-1]
+        else:
+            break
+    return seq
+
+
+def _take_one_balanced_lean_arg(
+    seq: list[tuple[str, Any]]
+) -> tuple[list[tuple[str, Any]], list[tuple[str, Any]]] | None:
+    if not seq:
+        return None
+    tk0 = seq[0][0]
+    if tk0 in ("LParen", "LBrace", "LBracket"):
+        bal = 0
+        for idx, (tk, _v) in enumerate(seq):
+            if tk in ("LParen", "LBrace", "LBracket"):
+                bal += 1
+            elif tk in ("RParen", "RBrace", "RBracket"):
+                bal -= 1
+                if bal == 0:
+                    return (seq[: idx + 1], seq[idx + 1 :])
+        return None
+    if tk0 in ("Ident", "StrLit", "NatLit", "CharLit"):
+        return (seq[:1], seq[1:])
+    return None
+
+
+def _take_exact_n_balanced_args(
+    seq: list[tuple[str, Any]], count: int
+) -> list[list[tuple[str, Any]]] | None:
+    args: list[list[tuple[str, Any]]] = []
+    cur = seq
+    for _ in range(count):
+        res = _take_one_balanced_lean_arg(cur)
+        if res is None:
+            return None
+        arg, cur = res
+        args.append(arg)
+    return args if not cur else None
+
+
+def _parse_env_assumed_conjuncts(
+    expr: list[tuple[str, Any]], binder: str, out: list[str], label: str
+) -> None:
+    expr = _strip_enclosing_parens_tokens(expr)
+    if not expr:
+        raise Failure(1, FAULT_COVERAGE_PHASE, f"empty clause in `envAssumed` in {label}")
+    depth = 0
+    for idx, (tk, val) in enumerate(expr):
+        if tk in ("LParen", "LBrace", "LBracket"):
+            depth += 1
+        elif tk in ("RParen", "RBrace", "RBracket"):
+            depth = max(0, depth - 1)
+        elif tk == "Ident" and depth == 0 and val == "∧":
+            _parse_env_assumed_conjuncts(expr[:idx], binder, out, label)
+            _parse_env_assumed_conjuncts(expr[idx + 1 :], binder, out, label)
+            return
+    if expr[0] == ("Ident", "And"):
+        args2 = _take_exact_n_balanced_args(expr[1:], 2)
+        if args2 is None:
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"malformed `And` clause in `envAssumed` in {label}"
+            )
+        _parse_env_assumed_conjuncts(args2[0], binder, out, label)
+        _parse_env_assumed_conjuncts(args2[1], binder, out, label)
+        return
+    if (
+        len(expr) == 2
+        and expr[0][0] == "Ident"
+        and expr[1] == ("Ident", binder)
+    ):
+        holds_ident = str(expr[0][1])
+        if holds_ident == "defaultModularSpec.envAssumed" or holds_ident.endswith(
+            ".defaultModularSpec.envAssumed"
+        ):
+            if holds_ident not in out:
+                out.append(holds_ident)
+            return
+        if holds_ident.endswith(".holdsOn") and len(holds_ident) > len(".holdsOn"):
+            stem = holds_ident[: -len(".holdsOn")]
+            if stem not in out:
+                out.append(stem)
+            return
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"expected `<contract>.holdsOn {binder}` in `envAssumed` in {label}, found `{holds_ident} {binder}`",
+        )
+    if (
+        len(expr) == 3
+        and expr[0][0] == "Ident"
+        and str(expr[0][1])
+        in ("MirCallContract.holdsOn", "Trusted.VerificationResult.MirCallContract.holdsOn")
+        and expr[1][0] == "Ident"
+        and expr[2] == ("Ident", binder)
+    ):
+        c_ident = str(expr[1][1])
+        if c_ident not in out:
+            out.append(c_ident)
+        return
+    raise Failure(
+        1,
+        FAULT_COVERAGE_PHASE,
+        f"unsupported or non-canonical `envAssumed` clause {expr!r} in {label}",
+    )
+
+
+def _parse_env_assumed_holds_on_stems(
+    env_rhs: list[tuple[str, Any]], label: str
+) -> list[str]:
+    env_rhs = _strip_enclosing_parens_tokens(env_rhs)
+    if len(env_rhs) == 1 and env_rhs[0][0] == "Ident":
+        holds_ident = str(env_rhs[0][1])
+        if holds_ident == "defaultModularSpec.envAssumed" or holds_ident.endswith(
+            ".defaultModularSpec.envAssumed"
+        ):
+            return [holds_ident]
+        if holds_ident.endswith(".holdsOn") and len(holds_ident) > len(".holdsOn"):
+            return [holds_ident[: -len(".holdsOn")]]
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"expected `<contract>.holdsOn` in `envAssumed` in {label}, found `{holds_ident}`",
+        )
+    if (
+        len(env_rhs) == 2
+        and env_rhs[0][0] == "Ident"
+        and str(env_rhs[0][1])
+        in ("MirCallContract.holdsOn", "Trusted.VerificationResult.MirCallContract.holdsOn")
+        and env_rhs[1][0] == "Ident"
+    ):
+        return [str(env_rhs[1][1])]
+    if (
+        len(env_rhs) >= 4
+        and env_rhs[0][0] == "Ident"
+        and env_rhs[0][1] in ("fun", "λ")
+        and env_rhs[1][0] == "Ident"
+        and env_rhs[2][0] == "Ident"
+        and env_rhs[2][1] in ("=>", "↦")
+    ):
+        binder = str(env_rhs[1][1])
+        body = _strip_enclosing_parens_tokens(env_rhs[3:])
+        if body == [("Ident", "True")]:
+            return []
+        if binder == "_":
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"`envAssumed := fun _ => ...` may only have body `True` in {label}",
+            )
+        stems: list[str] = []
+        _parse_env_assumed_conjuncts(body, binder, stems, label)
+        return stems
+    raise Failure(
+        1,
+        FAULT_COVERAGE_PHASE,
+        f"non-canonical `envAssumed` expression {env_rhs!r} in {label}",
+    )
+
+
+def _check_strict_open_command(
+    tokens: list[tuple[str, Any]], start_idx: int, label: str
+) -> None:
+    n = len(tokens)
+    k = start_idx + 1
+    count = 0
+    while k < n and tokens[k][0] == "Ident":
+        ns_name = str(tokens[k][1])
+        if _fc_is_lean_command_start(tokens[k]):
+            break
+        if ns_name in ("renaming", "hiding", "in", "scoped"):
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"`open ... {ns_name}` is not supported in {label}"
+            )
+        if ns_name not in _STRICT_MODULE_OPENS:
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"disallowed `open {ns_name}` in {label}"
+            )
+        count += 1
+        k += 1
+    if count == 0:
+        raise Failure(1, FAULT_COVERAGE_PHASE, f"`open` without namespaces in {label}")
+
+
+def _parse_record_literal_fields(
+    rhs: list[tuple[str, Any]], def_name: str, label: str
+) -> dict[str, list[tuple[str, Any]]]:
+    if len(rhs) < 2 or rhs[0][0] != "LBrace" or rhs[-1][0] != "RBrace":
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"canonical `def {def_name}` in {label} must be a `{{ ... }}` record literal (positional constructors and trailing expressions are forbidden)",
+        )
+    bal = 0
+    for pos, (tk, _v) in enumerate(rhs):
+        if tk in ("LParen", "LBrace", "LBracket"):
+            bal += 1
+        elif tk in ("RParen", "RBrace", "RBracket"):
+            bal -= 1
+        if bal <= 0 and pos + 1 < len(rhs):
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"canonical `def {def_name}` in {label} has trailing tokens after closing `}}`",
+            )
+    if bal != 0:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"unbalanced delimiters in `def {def_name}` of {label}",
+        )
+    inner = rhs[1:-1]
+    fields: dict[str, list[tuple[str, Any]]] = {}
+    p = 0
+    m = len(inner)
+    while p < m:
+        if inner[p][0] != "Ident":
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"unexpected token {inner[p]!r} in record literal of `def {def_name}` in {label}",
+            )
+        fname = str(inner[p][1])
+        if fname == "with":
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"struct-update `with` syntax is forbidden in `def {def_name}` of {label}",
+            )
+        if p + 1 >= m or inner[p + 1][0] != "ColonEq":
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"expected `:=` after field `{fname}` in `def {def_name}` of {label} (struct-update syntax is forbidden)",
+            )
+        val_start = p + 2
+        q = val_start
+        fdepth = 0
+        while q < m:
+            tk_q, val_q = inner[q]
+            if fdepth == 0:
+                if tk_q in ("Comma", "Semicolon"):
+                    break
+                if q > val_start and tk_q == "Ident" and q + 1 < m and inner[q + 1][0] == "ColonEq":
+                    break
+                if tk_q == "Ident" and val_q == "with":
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"struct-update `with` syntax is forbidden in `def {def_name}` of {label}",
+                    )
+            if tk_q in ("LParen", "LBrace", "LBracket"):
+                fdepth += 1
+            elif tk_q in ("RParen", "RBrace", "RBracket"):
+                fdepth = max(0, fdepth - 1)
+            q += 1
+        if fname in fields:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"duplicate field `{fname}` in `def {def_name}` of {label}",
+            )
+        fields[fname] = inner[val_start:q]
+        p = q + 1 if q < m and inner[q][0] in ("Comma", "Semicolon") else q
+    return fields
+
+
+def _scan_obligations_module(
+    ob_text: str,
+    suffix: str,
+    ob_label: str,
+    *,
+    expected_def_path: str | None = None,
+) -> dict[str, Any]:
+    """`[adv ep2-A1]` Independently verify the claim definitions, `defaultCallees`,
+    `defaultModularSpec.envAssumed`, `externalSpecCallContract` sidecar bindings,
+    `defaultCallContract`, and `rustEquivSpec` of `Obligations/<Item>.lean`."""
+    tokens = _tokenize_lean_or_fail(ob_text, ob_label)
+    _check_single_namespace(tokens, f"Obligations.{suffix}", ob_label)
+    attr = _verify_detect_instance_attribute(tokens)
+    if attr is not None:
+        raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {ob_label}")
+    default_callee_suffixes = _parse_obligations_default_callee_suffixes(ob_text, ob_label)
+    imports = _scan_lean_module_imports(ob_text, ob_label)
+    imported_mir: list[str] = []
+    imported_obligations: list[str] = []
+    has_legacy_spec_override = False
+    for mod in imports:
+        if mod.startswith("Mir."):
+            msuf = mod[len("Mir.") :]
+            if msuf and msuf not in imported_mir:
+                imported_mir.append(msuf)
+        elif mod.startswith("Obligations."):
+            sib = mod[len("Obligations.") :]
+            if sib == suffix:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{ob_label} self-imports `Obligations.{suffix}`",
+                )
+            if sib not in imported_obligations:
+                imported_obligations.append(sib)
+        elif mod == f"Specs.{suffix}":
+            has_legacy_spec_override = True
+        elif not any(
+            mod == root or mod.startswith(root + ".")
+            for root in ("Init", "Std", "Trusted", "Anneal")
+        ):
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"disallowed `import {mod}` in {ob_label}"
+            )
+    if suffix not in imported_mir:
+        raise Failure(
+            1, FAULT_COVERAGE_PHASE, f"{ob_label} must `import Mir.{suffix}`"
+        )
+    for dsuf in default_callee_suffixes:
+        if dsuf not in imported_mir:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"{ob_label} lists `Mir.{dsuf}.body` in `defaultCallees` without `import Mir.{dsuf}`",
+            )
+
+    n = len(tokens)
+    top = _top_level_token_indices(tokens)
+    top_set = set(top)
+
+    def command_end(start: int) -> int:
+        k = start + 1
+        while k < n and not (k in top_set and _fc_is_lean_command_start(tokens[k])):
+            k += 1
+        return k
+
+    def find_field_rhs_end(start: int) -> int:
+        depth = 0
+        k = start
+        while k < n:
+            tk_k = tokens[k][0]
+            if depth == 0:
+                if tk_k in ("Comma", "RBrace") or _fc_is_lean_command_start(tokens[k]):
+                    break
+                if k > start and tk_k == "Ident" and k + 1 < n and tokens[k + 1][0] == "ColonEq":
+                    break
+            if tk_k in ("LParen", "LBrace", "LBracket"):
+                depth += 1
+            elif tk_k in ("RParen", "RBrace", "RBracket"):
+                depth = max(0, depth - 1)
+            k += 1
+        return k
+
+    claim_defs: dict[str, list[tuple[str, Any]]] = {}
+    claim_sigs: dict[str, list[tuple[str, Any]]] = {}
+    helper_cmds: dict[str, list[tuple[str, Any]]] = {}
+    linked_ext_positions: set[int] = set()
+    external_spec_contracts: list[dict[str, str]] = []
+    default_ext_alias: str | None = None
+    default_modular_spec_count = 0
+    raw_holds_on_stems: list[str] = []
+    rust_equiv_spec_body_suffix: str | None = None
+    default_call_contract_def_path: str | None = None
+
+    for idx in top:
+        tk, val = tokens[idx]
+        if tk != "Ident":
+            continue
+        if val in _OB_DISALLOWED_TOP_LEVEL:
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"disallowed top-level `{val}` command in {ob_label}"
+            )
+        if val == "open":
+            _check_strict_open_command(tokens, idx, ob_label)
+            continue
+        if val in _OB_DECL_MODIFIER_KWS:
+            j = idx + 1
+            while j < n and tokens[j][0] == "Ident" and tokens[j][1] in _OB_DECL_MODIFIER_KWS:
+                j += 1
+            if j + 1 < n and tokens[j][0] == "Ident" and tokens[j + 1][0] == "Ident":
+                next_name = str(tokens[j + 1][1])
+                if (
+                    next_name in _OB_CANONICAL_CLAIM_NAMES
+                    or next_name in _OB_RESERVED_HELPER_DEFS
+                    or next_name in ("defaultModularSpec", "externalSpecCallContract")
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`{val}` modifier on canonical `{next_name}` in {ob_label}",
+                    )
+        if val in ("abbrev", "theorem", "lemma", "instance", "structure", "inductive", "class"):
+            if idx + 1 < n and tokens[idx + 1][0] == "Ident":
+                nm = str(tokens[idx + 1][1])
+                if (
+                    nm in _OB_CANONICAL_CLAIM_NAMES
+                    or nm in _OB_RESERVED_HELPER_DEFS
+                    or nm == "externalSpecCallContract"
+                    or (val != "instance" and nm == "defaultModularSpec")
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"canonical `{nm}` shadowed as `{val}` in {ob_label}",
+                    )
+        if val == "instance":
+            cmd_slice = tokens[idx : command_end(idx)]
+            header_end = len(cmd_slice)
+            h_depth = 0
+            for h_pos, (t_h, v_h) in enumerate(cmd_slice):
+                if h_depth == 0 and (t_h == "ColonEq" or (t_h, v_h) == ("Ident", "where")):
+                    header_end = h_pos
+                    break
+                if t_h in ("LParen", "LBrace", "LBracket"):
+                    h_depth += 1
+                elif t_h in ("RParen", "RBrace", "RBracket"):
+                    h_depth = max(0, h_depth - 1)
+            header = cmd_slice[:header_end]
+            if any((t_h, v_h) == ("Ident", "legacySpec") for t_h, v_h in header):
+                has_legacy_spec_override = True
+            spec_cls_opt: tuple[str, str | None] | None = None
+            for h_pos, (t_h, v_h) in enumerate(header):
+                if t_h == "Ident":
+                    short_cls = _strip_verification_result_qual(str(v_h))
+                    if short_cls in _VERIFY_SPEC_CLASS_NAMES:
+                        did_opt = (
+                            str(header[h_pos + 1][1])
+                            if h_pos + 1 < len(header) and header[h_pos + 1][0] == "StrLit"
+                            else None
+                        )
+                        spec_cls_opt = (short_cls, did_opt)
+                        break
+            if spec_cls_opt is not None:
+                cls_name, did_opt = spec_cls_opt
+                allowed_inst_names = {
+                    "defaultSpec",
+                    "defaultStatefulSpec",
+                    "defaultTotalSpec",
+                    "defaultModularSpec",
+                    "defaultUbExceptionSpec",
+                    "rustSafeTotalSpec",
+                    "rustSafeTotalStatefulSpec",
+                    "rustEquivSpec",
+                    "legacySpec",
+                }
+                if not any(
+                    t_h == "Ident" and str(v_h) in allowed_inst_names for t_h, v_h in header
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"unexpected `{cls_name}` instance in {ob_label}",
+                    )
+                if did_opt is None:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`{cls_name}` instance in {ob_label} omits explicit `\"<defId>\"` target",
+                    )
+                if expected_def_path is not None and did_opt != expected_def_path:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`{cls_name}` instance in {ob_label} binds `{did_opt}` instead of `{expected_def_path}`",
+                    )
+            is_default_modular = any(
+                (t_h, v_h) == ("Ident", "defaultModularSpec") for t_h, v_h in header
+            ) or (spec_cls_opt is not None and spec_cls_opt[0] == "ModularItemSpec")
+            if is_default_modular:
+                default_modular_spec_count += 1
+                if default_modular_spec_count > 1:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"multiple `defaultModularSpec` instances in {ob_label}",
+                    )
+                if header_end >= len(cmd_slice) or cmd_slice[header_end] != ("Ident", "where"):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`defaultModularSpec` in {ob_label} must be declared with `where envAssumed := ...`",
+                    )
+                body_tokens = cmd_slice[header_end + 1 :]
+                if any((t_b, v_b) == ("Ident", "where") for t_b, v_b in body_tokens):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"nested `where` clause is forbidden inside `defaultModularSpec` in {ob_label}",
+                    )
+                env_count = 0
+                b_idx = 0
+                b_depth = 0
+                while b_idx < len(body_tokens):
+                    t_b, v_b = body_tokens[b_idx]
+                    if b_depth == 0 and (t_b, v_b) == ("Ident", "envAssumed"):
+                        env_count += 1
+                        if b_idx + 1 >= len(body_tokens) or body_tokens[b_idx + 1][0] != "ColonEq":
+                            raise Failure(
+                                1,
+                                FAULT_COVERAGE_PHASE,
+                                f"`defaultModularSpec.envAssumed` in {ob_label} must use `envAssumed := ...` without binders",
+                            )
+                        rhs_start = idx + header_end + 1 + b_idx + 2
+                        rhs_end = find_field_rhs_end(rhs_start)
+                        scan_k = rhs_start
+                        scan_d = 0
+                        while scan_k < rhs_end:
+                            tk_s, val_s = tokens[scan_k]
+                            if (
+                                scan_d == 0
+                                and scan_k > rhs_start
+                                and tk_s == "Ident"
+                                and val_s in ("pre", "post", "envAssumed")
+                            ):
+                                rhs_end = scan_k
+                                break
+                            if tk_s in ("LParen", "LBrace", "LBracket"):
+                                scan_d += 1
+                            elif tk_s in ("RParen", "RBrace", "RBracket"):
+                                scan_d = max(0, scan_d - 1)
+                            scan_k += 1
+                        for st in _parse_env_assumed_holds_on_stems(
+                            tokens[rhs_start:rhs_end], ob_label
+                        ):
+                            if st not in raw_holds_on_stems:
+                                raw_holds_on_stems.append(st)
+                    if t_b in ("LParen", "LBrace", "LBracket"):
+                        b_depth += 1
+                    elif t_b in ("RParen", "RBrace", "RBracket"):
+                        b_depth = max(0, b_depth - 1)
+                    b_idx += 1
+                if env_count != 1:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`defaultModularSpec` in {ob_label} must bind `envAssumed :=` once (found {env_count})",
+                    )
+            if spec_cls_opt is not None and spec_cls_opt[0] == "StatefulEquivItemSpec":
+                if rust_equiv_spec_body_suffix is not None:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"multiple `StatefulEquivItemSpec` instances in {ob_label}",
+                    )
+                if header_end >= len(cmd_slice) or cmd_slice[header_end][0] != "ColonEq":
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`StatefulEquivItemSpec` instance in {ob_label} must use `:= refineEquivSpec Mir.<Ref>.body ...`",
+                    )
+                rhs_eq = _strip_enclosing_parens_tokens(cmd_slice[header_end + 1 :])
+                args3 = (
+                    _take_exact_n_balanced_args(rhs_eq[1:], 3)
+                    if rhs_eq
+                    and rhs_eq[0][0] == "Ident"
+                    and (
+                        rhs_eq[0][1] == "refineEquivSpec"
+                        or str(rhs_eq[0][1]).endswith(".refineEquivSpec")
+                    )
+                    else None
+                )
+                if args3 is None:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`StatefulEquivItemSpec` instance in {ob_label} must use `refineEquivSpec Mir.<Ref>.body <pre> <post>` with exact 3 arguments",
+                    )
+                mir_arg = _strip_enclosing_parens_tokens(args3[0])
+                if (
+                    len(mir_arg) == 1
+                    and mir_arg[0][0] == "Ident"
+                    and str(mir_arg[0][1]).startswith("Mir.")
+                    and str(mir_arg[0][1]).endswith(".body")
+                ):
+                    ref_suf = str(mir_arg[0][1])[len("Mir.") : -len(".body")]
+                    if not ref_suf:
+                        raise Failure(
+                            1, FAULT_COVERAGE_PHASE, f"empty `Mir.<Ref>.body` in {ob_label}"
+                        )
+                    rust_equiv_spec_body_suffix = ref_suf
+                else:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`StatefulEquivItemSpec` in {ob_label} binds non-`Mir.<Ref>.body` reference {mir_arg!r}",
+                    )
+
+        if val == "abbrev" and idx + 5 < n:
+            if (
+                tokens[idx + 1] == ("Ident", "defaultExternalCallContract")
+                and tokens[idx + 2][0] == "Colon"
+                and tokens[idx + 3][0] == "Ident"
+                and _strip_verification_result_qual(str(tokens[idx + 3][1])) == "MirCallContract"
+                and tokens[idx + 4][0] == "ColonEq"
+                and tokens[idx + 5][0] == "Ident"
+            ):
+                cmd_e = command_end(idx)
+                if cmd_e != idx + 6:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`abbrev defaultExternalCallContract` in {ob_label} has unexpected trailing tokens",
+                    )
+                default_ext_alias = str(tokens[idx + 5][1])
+
+        if val == "def":
+            if idx + 1 >= n or tokens[idx + 1][0] != "Ident":
+                raise Failure(1, FAULT_COVERAGE_PHASE, f"malformed `def` in {ob_label}")
+            def_name = str(tokens[idx + 1][1])
+            if def_name in ("defaultModularSpec", "externalSpecCallContract"):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"reserved identifier `{def_name}` shadowed as `def` in {ob_label}",
+                )
+            cmd_e = command_end(idx)
+            if def_name in _OB_RESERVED_HELPER_DEFS:
+                if def_name in helper_cmds:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"duplicate `def {def_name}` in {ob_label}",
+                    )
+                helper_cmds[def_name] = tokens[idx + 2 : cmd_e]
+            if def_name in _OB_CANONICAL_CLAIM_NAMES or any(
+                def_name.endswith(f".{c}") for c in _OB_CANONICAL_CLAIM_NAMES
+            ):
+                if "." in def_name:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"qualified `def {def_name}` is not allowed in {ob_label}",
+                    )
+                if def_name in claim_defs:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"duplicate `def {def_name}` in {ob_label}",
+                    )
+                j = idx + 2
+                while j < cmd_e and not (j in top_set and tokens[j][0] == "ColonEq"):
+                    j += 1
+                if j >= cmd_e or tokens[j][0] != "ColonEq":
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`def {def_name}` has no `:=` body in {ob_label}",
+                    )
+                claim_sigs[def_name] = tokens[idx + 2 : j]
+                claim_defs[def_name] = tokens[j + 1 : cmd_e]
+
+            # Check `def defaultCallContract : MirCallContract where ...`
+            if def_name == "defaultCallContract":
+                if (
+                    idx + 4 >= cmd_e
+                    or tokens[idx + 2][0] != "Colon"
+                    or tokens[idx + 3][0] != "Ident"
+                    or _strip_verification_result_qual(str(tokens[idx + 3][1])) != "MirCallContract"
+                    or tokens[idx + 4] != ("Ident", "where")
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`def defaultCallContract` in {ob_label} must use canonical `: MirCallContract where pre req := And (req.defPath = ...) ...`",
+                    )
+                sl = tokens[idx + 5 : cmd_e]
+                if any((t_s, v_s) == ("Ident", "where") for t_s, v_s in sl):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"nested `where` in `def defaultCallContract` in {ob_label}",
+                    )
+                post_ok = (
+                    any(
+                        sl[p : p + 4]
+                        == [
+                            ("Ident", "post"),
+                            ("Ident", "req"),
+                            ("Ident", "ans"),
+                            ("ColonEq", ":="),
+                        ]
+                        for p in range(max(0, len(sl) - 3))
+                    )
+                    and any(
+                        sl[p : p + 3]
+                        == [
+                            ("Ident", "defaultPost"),
+                            ("Ident", "req.args"),
+                            ("Ident", "retVal"),
+                        ]
+                        for p in range(max(0, len(sl) - 2))
+                    )
+                    and any(
+                        t_s == "Ident"
+                        and _strip_verification_result_qual(str(v_s)) == "retMatchesCalleeReturnTy"
+                        for t_s, v_s in sl
+                    )
+                )
+                pre_ok = (
+                    post_ok
+                    and len(sl) >= 13
+                    and sl[0] == ("Ident", "pre")
+                    and sl[1] == ("Ident", "req")
+                    and sl[2][0] == "ColonEq"
+                    and sl[3] == ("Ident", "And")
+                    and sl[4][0] == "LParen"
+                    and sl[5] == ("Ident", "req.defPath")
+                    and sl[6] == ("Ident", "=")
+                    and sl[7][0] == "StrLit"
+                    and sl[8][0] == "RParen"
+                    and sl[9][0] == "LParen"
+                    and sl[10] == ("Ident", "defaultPre")
+                    and sl[11] == ("Ident", "req.args")
+                    and sl[12][0] == "RParen"
+                )
+                if not pre_ok:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"malformed `def defaultCallContract` in {ob_label}",
+                    )
+                did_cc = str(sl[7][1])
+                if expected_def_path is not None and did_cc != expected_def_path:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`def defaultCallContract` in {ob_label} binds `{did_cc}` instead of `{expected_def_path}`",
+                    )
+                default_call_contract_def_path = did_cc
+
+            # Check `def <ident> : MirCallContract := externalSpecCallContract "<target>" Mir.<sidecar>.body <pre> <post>`
+            if (
+                idx + 7 < cmd_e
+                and tokens[idx + 2][0] == "Colon"
+                and tokens[idx + 3][0] == "Ident"
+                and _strip_verification_result_qual(str(tokens[idx + 3][1])) == "MirCallContract"
+                and tokens[idx + 4][0] == "ColonEq"
+                and tokens[idx + 5] == ("Ident", "externalSpecCallContract")
+                and tokens[idx + 6][0] == "StrLit"
+                and tokens[idx + 7][0] == "Ident"
+            ):
+                target_dp = str(tokens[idx + 6][1])
+                sidecar_expr = str(tokens[idx + 7][1])
+                sidecar_suf = (
+                    sidecar_expr[len("Mir.") : -len(".body")]
+                    if sidecar_expr.startswith("Mir.") and sidecar_expr.endswith(".body")
+                    else ""
+                )
+                if sidecar_suf and _take_exact_n_balanced_args(tokens[idx + 6 : cmd_e], 4) is not None:
+                    if sidecar_suf == suffix:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"{ob_label} binds `externalSpecCallContract` `{def_name}` to its own MIR body `Mir.{suffix}.body`",
+                        )
+                    if sidecar_suf not in imported_mir:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"{ob_label} binds `externalSpecCallContract` `{def_name}` to `Mir.{sidecar_suf}.body` without `import Mir.{sidecar_suf}`",
+                        )
+                    linked_ext_positions.add(idx + 5)
+                    external_spec_contracts.append(
+                        {
+                            "def_ident": def_name,
+                            "target_def_path": target_dp,
+                            "sidecar_mir_suffix": sidecar_suf,
+                        }
+                    )
+
+    # Reject any unlinked/malformed `externalSpecCallContract` token or detached `body`/`callees` assignment
+    for i, (tk_i, val_i) in enumerate(tokens):
+        if tk_i != "Ident":
+            continue
+        if (
+            val_i == "externalSpecCallContract"
+            or str(val_i).endswith(".externalSpecCallContract")
+        ) and i not in linked_ext_positions:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"{ob_label} contains unlinked or malformed `externalSpecCallContract` expression",
+            )
+        if val_i in ("body", "implBody") and i + 1 < n and tokens[i + 1][0] == "ColonEq":
+            rhs_b = tokens[i + 2 : find_field_rhs_end(i + 2)]
+            if rhs_b != [("Ident", f"Mir.{suffix}.body")] and rhs_b != [
+                ("Ident", f"Mir.{suffix}.body.instantiate"),
+                ("Ident", "typeArgs"),
+            ]:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{ob_label} binds `{val_i} := {rhs_b!r}` instead of `Mir.{suffix}.body`",
+                )
+        if (
+            val_i in ("callees", "implCallees", "specCallees")
+            and i + 1 < n
+            and tokens[i + 1][0] == "ColonEq"
+        ):
+            rhs_c = tokens[i + 2 : find_field_rhs_end(i + 2)]
+            if rhs_c != [("Ident", "defaultCallees")]:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{ob_label} overrides claim `{val_i} := {rhs_c!r}` instead of `defaultCallees`",
+                )
+
+    # Validate every declared canonical claim and helper
+    mir_body_tok = [("Ident", f"Mir.{suffix}.body")]
+    mir_inst_tok = [("Ident", f"Mir.{suffix}.body.instantiate"), ("Ident", "typeArgs")]
+    default_callees_tok = [("Ident", "defaultCallees")]
+    spec_env_tok = [("Ident", "spec.envAssumed")]
+    spec_body_tok = [("Ident", "spec.specBody")]
+
+    for claim_name, rhs_tokens in claim_defs.items():
+        sig_tokens = claim_sigs[claim_name]
+        if claim_name in _CLAIM_EXPECTED_SPEC_CLASS and sig_tokens and sig_tokens[0][0] == "LBracket":
+            exp_cls = _CLAIM_EXPECTED_SPEC_CLASS[claim_name]
+            binder_ok = (
+                len(sig_tokens) >= 6
+                and sig_tokens[0][0] == "LBracket"
+                and sig_tokens[1][0] == "Ident"
+                and (
+                    sig_tokens[1][1] == "spec"
+                    or (claim_name == "claimFor" and sig_tokens[1][1] in ("spec", "_spec"))
+                )
+                and sig_tokens[2][0] == "Colon"
+                and sig_tokens[3][0] == "Ident"
+                and _strip_verification_result_qual(str(sig_tokens[3][1])) == exp_cls
+                and sig_tokens[4][0] == "StrLit"
+                and (expected_def_path is None or str(sig_tokens[4][1]) == expected_def_path)
+                and sig_tokens[5][0] == "RBracket"
+            )
+            if not binder_ok:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"canonical `def {claim_name}` in {ob_label} has non-canonical `[spec : {exp_cls} \"...\"]` binder {sig_tokens!r}",
+                )
+        if claim_name in ("claim", "statefulClaim", "totalClaim", "ubExceptionClaim"):
+            fields = _parse_record_literal_fields(rhs_tokens, claim_name, ob_label)
+            expected_f = {"body": mir_body_tok, "callees": default_callees_tok}
+        elif claim_name == "modularClaim":
+            fields = _parse_record_literal_fields(rhs_tokens, claim_name, ob_label)
+            expected_f = {
+                "body": mir_body_tok,
+                "envAssumed": spec_env_tok,
+                "callees": default_callees_tok,
+            }
+        elif claim_name == "equivClaim":
+            fields = _parse_record_literal_fields(rhs_tokens, claim_name, ob_label)
+            expected_f = {
+                "implBody": mir_body_tok,
+                "specBody": spec_body_tok,
+                "implCallees": default_callees_tok,
+                "specCallees": default_callees_tok,
+            }
+        elif claim_name in (
+            "claimFor",
+            "statefulClaimFor",
+            "totalClaimFor",
+            "ubExceptionClaimFor",
+        ):
+            fields = _parse_record_literal_fields(rhs_tokens, claim_name, ob_label)
+            expected_f = {"body": mir_inst_tok, "callees": default_callees_tok}
+        elif claim_name == "modularClaimFor":
+            fields = _parse_record_literal_fields(rhs_tokens, claim_name, ob_label)
+            expected_f = {
+                "body": mir_inst_tok,
+                "envAssumed": spec_env_tok,
+                "callees": default_callees_tok,
+            }
+        elif claim_name in _POLY_CLAIM_TO_FOR:
+            cert_short, claim_for_name = _POLY_CLAIM_TO_FOR[claim_name]
+            expected_tp_count = f"Mir.{suffix}.body.typeParamCount"
+            poly_ok = (
+                len(rhs_tokens) == 16
+                and rhs_tokens[0][0] == "Ident"
+                and rhs_tokens[0][1] in ("∀", "forall")
+                and rhs_tokens[1][0] == "LParen"
+                and rhs_tokens[2] == ("Ident", "typeArgs")
+                and rhs_tokens[3][0] == "Colon"
+                and rhs_tokens[4][0] == "Ident"
+                and rhs_tokens[4][1] in ("Trusted.MirAst.TypeSubst", "TypeSubst")
+                and rhs_tokens[5][0] == "RParen"
+                and rhs_tokens[6][0] == "Comma"
+                and rhs_tokens[7] == ("Ident", "typeArgs.length")
+                and rhs_tokens[8] == ("Ident", "=")
+                and rhs_tokens[9] == ("Ident", expected_tp_count)
+                and rhs_tokens[10][0] == "Ident"
+                and rhs_tokens[10][1] in ("→", "->")
+                and rhs_tokens[11][0] == "Ident"
+                and _strip_verification_result_qual(str(rhs_tokens[11][1])) == cert_short
+                and rhs_tokens[12][0] == "LParen"
+                and rhs_tokens[13] == ("Ident", claim_for_name)
+                and rhs_tokens[14] == ("Ident", "typeArgs")
+                and rhs_tokens[15][0] == "RParen"
+            )
+            if not poly_ok:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"canonical `def {claim_name}` in {ob_label} does not wrap `({claim_for_name} typeArgs)` in `{cert_short}`",
+                )
+            continue
+        else:
+            continue
+        for req_name, req_val in expected_f.items():
+            if fields.get(req_name) != req_val:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"canonical `def {claim_name}` in {ob_label} binds `{req_name} := {fields.get(req_name)!r}` instead of `{req_val!r}`",
+                )
+
+    if "polyCertificate" in helper_cmds:
+        pc = helper_cmds["polyCertificate"]
+        pc_ok = (
+            len(pc) >= 21
+            and pc[0][0] == "LParen"
+            and pc[1] == ("Ident", "P")
+            and pc[2][0] == "Colon"
+            and pc[3] == ("Ident", "Prop")
+            and pc[4][0] == "RParen"
+            and pc[5][0] == "Colon"
+            and pc[6][0] == "Ident"
+            and _strip_verification_result_qual(str(pc[6][1])) == "CrateClaim"
+            and pc[-13:]
+            == [
+                ("Ident", "items"),
+                ("ColonEq", ":="),
+                ("LBracket", "["),
+                ("LBrace", "{"),
+                ("Ident", "identity"),
+                ("ColonEq", ":="),
+                ("Ident", "artifactIdentity"),
+                ("Comma", ","),
+                ("Ident", "certificate"),
+                ("ColonEq", ":="),
+                ("Ident", "P"),
+                ("RBrace", "}"),
+                ("RBracket", "]"),
+            ]
+        )
+        if not pc_ok:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"canonical `def polyCertificate` in {ob_label} was altered from `items := [{{ identity := artifactIdentity, certificate := P }}]`",
+            )
+
+    for helper_name, field_name in (
+        ("refineEquivSpec", "specBody"),
+        ("refineModularSpec", "envAssumed"),
+    ):
+        if helper_name in helper_cmds:
+            hcmd = helper_cmds[helper_name]
+            where_idx = next(
+                (i for i, t in enumerate(hcmd) if t == ("Ident", "where")), -1
+            )
+            body_h = hcmd[where_idx + 1 :] if where_idx >= 0 else []
+            if not (
+                len(body_h) >= 4
+                and body_h[0] == ("Ident", field_name)
+                and body_h[1][0] == "ColonEq"
+                and body_h[2] == ("Ident", field_name)
+                and body_h[3][0] == "Ident"
+                and body_h[3][1] in ("pre", "post")
+            ):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`def {helper_name}` in {ob_label} does not bind `{field_name} := {field_name}`",
+                )
+
+    referenced_callee_contracts: list[str] = []
+    referenced_ext_idents: list[str] = []
+    for stem in raw_holds_on_stems:
+        if stem.startswith("Obligations.") and stem.endswith(".defaultCallContract"):
+            csuf = stem[len("Obligations.") : -len(".defaultCallContract")]
+            if csuf and csuf not in referenced_callee_contracts:
+                referenced_callee_contracts.append(csuf)
+        elif stem == "defaultExternalCallContract":
+            if default_ext_alias is None:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`defaultModularSpec.envAssumed` in {ob_label} references `defaultExternalCallContract.holdsOn` without an `abbrev defaultExternalCallContract` alias",
+                )
+            if default_ext_alias not in referenced_ext_idents:
+                referenced_ext_idents.append(default_ext_alias)
+        elif "." not in stem:
+            if stem not in referenced_ext_idents:
+                referenced_ext_idents.append(stem)
+        else:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"`defaultModularSpec.envAssumed` in {ob_label} references unexpected qualified contract `{stem}.holdsOn`",
+            )
+
+    for ext in external_spec_contracts:
+        if ext["def_ident"] not in referenced_ext_idents:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"{ob_label} declares `def {ext['def_ident']}` (`externalSpecCallContract \"{ext['target_def_path']}\"`) without referencing `{ext['def_ident']}.holdsOn` in `defaultModularSpec.envAssumed`",
+            )
+    for sib in imported_obligations:
+        if sib not in referenced_callee_contracts:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"{ob_label} imports `Obligations.{sib}` without referencing `Obligations.{sib}.defaultCallContract` in `defaultModularSpec.envAssumed`",
+            )
+    for csuf in referenced_callee_contracts:
+        if csuf not in imported_obligations:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"{ob_label} references `Obligations.{csuf}.defaultCallContract` without `import Obligations.{csuf}`",
+            )
+
+    return {
+        "default_callee_suffixes": default_callee_suffixes,
+        "imported_mir_suffixes": imported_mir,
+        "imported_obligation_suffixes": imported_obligations,
+        "referenced_callee_contracts": referenced_callee_contracts,
+        "external_spec_contracts": external_spec_contracts,
+        "default_external_contract_alias": default_ext_alias,
+        "default_modular_spec_count": default_modular_spec_count,
+        "rust_equiv_spec_body_suffix": rust_equiv_spec_body_suffix,
+        "default_call_contract_def_path": default_call_contract_def_path,
+        "has_legacy_spec_override": has_legacy_spec_override,
+        "declared_claims": set(claim_defs),
+        "declared_helpers": set(helper_cmds),
+    }
+
+
 def _scan_verify_module_surface(verify_text: str, suffix: str, label: str) -> dict[str, Any]:
-    """`[adv ep2-B1]` Independently derive the certificate surface of `Verify/<Item>.lean`.
+    """`[adv ep2-B1]` / `[adv ep2-A1]` Independently derive the certificate surface of `Verify/<Item>.lean`.
 
     Ports the Rust `inspect_verify_module_certificate` restrictions (import allowlist,
-    single `namespace Verify.<Item>` block, no `axiom` / `opaque` / notation / macro /
-    `attribute` / `@[instance]` / spec-class or non-`*ItemProof` `instance` commands) and
-    additionally rejects declarations shadowing a certificate type or the canonical spec
-    classes. Requires exactly one top-level
-    `theorem verified : <Cert> Obligations.<Item>.<claim> :=` (or
-    `CrateVerificationResult (Obligations.<Item>.polyCertificate Obligations.<Item>.poly*)`),
-    and reports whether the surface is modular, a scoped UB exception, and whether the
-    subject's own body is *assumed*: a UB-exception surface, or the exact generated
-    `spec(trusted)` certificate whose whole proof term is
-    `Assumptions.<Item>.rust_trusted_contract` (with `import Assumptions.<Item>`). Only
-    assumed subjects may carry implicit external callees or unresolved indirect calls.
+    mandatory `import Obligations.<Item>`, single `namespace Verify.<Item>` block,
+    strict `open` allowlist, no `export` / modifiers / `axiom` / `opaque` / notation /
+    macro / `attribute` / `@[instance]` / spec-class or non-`*ItemProof` `instance`
+    commands) and rejects declarations shadowing a certificate type or the canonical spec
+    classes.
     """
     tokens = _tokenize_lean_or_fail(verify_text, label)
     _check_single_namespace(tokens, f"Verify.{suffix}", label)
@@ -10003,6 +11160,10 @@ def _scan_verify_module_surface(verify_text: str, suffix: str, label: str) -> di
         )
         if not allowed:
             raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `import {mod}` in {label}")
+    if f"Obligations.{suffix}" not in imports:
+        raise Failure(
+            1, FAULT_COVERAGE_PHASE, f"{label} must `import Obligations.{suffix}`"
+        )
     n = len(tokens)
     top = _top_level_token_indices(tokens)
     top_set = set(top)
@@ -10031,6 +11192,9 @@ def _scan_verify_module_surface(verify_text: str, suffix: str, label: str) -> di
                 FAULT_COVERAGE_PHASE,
                 f"`verified` declared via `{val}` instead of `theorem` in {label}",
             )
+        if val == "open":
+            _check_strict_open_command(tokens, idx, label)
+            continue
         if val in _VERIFY_DISALLOWED_TOP_LEVEL:
             raise Failure(
                 1, FAULT_COVERAGE_PHASE, f"disallowed top-level `{val}` command in {label}"
@@ -10052,20 +11216,19 @@ def _scan_verify_module_surface(verify_text: str, suffix: str, label: str) -> di
                         f"`{val} {declared}` shadows or escapes the certificate namespace in {label}",
                     )
             idents = [str(v) for t, v in cmd if t == "Ident"]
-            if val in ("def", "abbrev", "lemma", "instance"):
-                for ident in idents:
-                    if short_name(ident) in _VERIFY_SPEC_CLASS_NAMES:
-                        raise Failure(
-                            1,
-                            FAULT_COVERAGE_PHASE,
-                            f"{label} references specification class `{ident}` inside `{val}` (specifications live in `Specs.{suffix}`)",
-                        )
-                    if ident.rsplit(".", 1)[-1] in _VERIFY_REFINE_SPEC_HELPERS:
-                        raise Failure(
-                            1,
-                            FAULT_COVERAGE_PHASE,
-                            f"{label} invokes specification override helper `{ident}` inside `{val}`",
-                        )
+            for ident in idents:
+                if short_name(ident) in _VERIFY_SPEC_CLASS_NAMES:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"{label} references specification class `{ident}` inside `{val}` (specifications live in `Specs.{suffix}`)",
+                    )
+                if ident.rsplit(".", 1)[-1] in _VERIFY_REFINE_SPEC_HELPERS:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"{label} invokes specification override helper `{ident}` inside `{val}`",
+                    )
             if val == "instance":
                 header: list[str] = []
                 h_depth = 0
@@ -10142,12 +11305,747 @@ def _scan_verify_module_surface(verify_text: str, suffix: str, label: str) -> di
     )
     ub_exception = claim in ("ubExceptionClaim", "polyUbExceptionClaim")
     modular = claim in ("modularClaim", "polyModularClaim")
+    equiv = claim == "equivClaim"
     return {
         "claim": claim,
         "modular": modular,
+        "equiv": equiv,
         "ub_exception": ub_exception,
+        "trusted": trusted,
         "assumed": ub_exception or trusted,
+        "imports_specs": f"Specs.{suffix}" in imports,
+        "imported_proof_suffixes": [
+            m[len("Proof.") :] for m in imports if m.startswith("Proof.")
+        ],
+        "imported_assumptions_suffixes": [
+            m[len("Assumptions.") :] for m in imports if m.startswith("Assumptions.")
+        ],
     }
+
+
+def _is_allowed_specs_import(module: str) -> bool:
+    return (
+        module.startswith(("Mir.", "Obligations.", "Specs."))
+        or any(
+            module == root or module.startswith(root + ".")
+            for root in ("Init", "Std", "Trusted", "Anneal")
+        )
+    )
+
+
+def _is_allowed_aux_import(module: str) -> bool:
+    return _is_allowed_specs_import(module) or module.startswith(("Proof.", "Assumptions."))
+
+
+def _scan_specs_module(
+    specs_text: str, subject_suffix: str, label: str
+) -> dict[str, Any]:
+    """`[adv ep2-A1]` Port of Rust `scan_specs_module`: scan `Specs/<Item>.lean` for
+    `*ItemSpec` instances, `ModularItemSpec.envAssumed` contracts, and
+    `StatefulEquivItemSpec.specBody` reference MIR bodies."""
+    tokens = _tokenize_lean_or_fail(specs_text, label)
+    attr = _verify_detect_instance_attribute(tokens)
+    if attr is not None:
+        raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {label}")
+    expected_ns = f"Specs.{subject_suffix}"
+    ns_opens = 0
+    ns_closes = 0
+    local_env_assumed_def: list[tuple[str, Any]] | None = None
+    declared_spec_def_ids: list[str] = []
+    declared_spec_classes: list[str] = []
+    has_modular_spec_instance = False
+    delegates_to_default_modular_spec_env = False
+    imported_obligation_suffixes: list[str] = []
+    imported_mir_suffixes: list[str] = []
+    imported_specs_suffixes: list[str] = []
+    sibling_modular_contracts: list[tuple[str, str]] = []
+    referenced_subject_external_contract_idents: list[str] = []
+    has_equiv_spec_instance = False
+    equiv_spec_body_suffix: str | None = None
+    raw_modular_stems: list[str] = []
+
+    n = len(tokens)
+    top = _top_level_token_indices(tokens)
+    top_set = set(top)
+
+    def command_end(start: int) -> int:
+        k = start + 1
+        while k < n and not (k in top_set and _fc_is_lean_command_start(tokens[k])):
+            k += 1
+        return k
+
+    for idx in top:
+        tk, val = tokens[idx]
+        if tk != "Ident":
+            continue
+        if val in (
+            "axiom",
+            "opaque",
+            "macro",
+            "macro_rules",
+            "syntax",
+            "notation",
+            "infix",
+            "infixl",
+            "infixr",
+            "prefix",
+            "postfix",
+            "elab",
+            "local",
+            "scoped",
+            "attribute",
+            "class",
+            "unsafe",
+            "partial",
+            "export",
+            "section",
+        ):
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"disallowed top-level `{val}` command in {label}"
+            )
+        if val in ("structure", "inductive"):
+            for t_c, v_c in tokens[idx : command_end(idx)]:
+                if t_c == "Ident" and (
+                    _strip_verification_result_qual(str(v_c)) in _VERIFY_SPEC_CLASS_NAMES
+                    or str(v_c).rsplit(".", 1)[-1] in _VERIFY_REFINE_SPEC_HELPERS
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"{label} references `{v_c}` inside `{val}` declaration",
+                    )
+        elif val == "namespace":
+            if idx + 1 >= n or tokens[idx + 1] != ("Ident", expected_ns):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"unexpected `namespace` in {label} (expected `{expected_ns}`)",
+                )
+            ns_opens += 1
+        elif val == "end":
+            if idx + 1 < n and tokens[idx + 1] == ("Ident", expected_ns):
+                ns_closes += 1
+            elif ns_opens > ns_closes:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"unexpected `end` in {label} (expected `{expected_ns}`)",
+                )
+        elif val == "import":
+            if idx + 1 >= n or tokens[idx + 1][0] != "Ident":
+                raise Failure(1, FAULT_COVERAGE_PHASE, f"malformed `import` in {label}")
+            mod = str(tokens[idx + 1][1])
+            if not _is_allowed_specs_import(mod):
+                raise Failure(
+                    1, FAULT_COVERAGE_PHASE, f"disallowed `import {mod}` in {label}"
+                )
+            if mod.startswith("Obligations."):
+                ob_suf = mod[len("Obligations.") :]
+                if ob_suf != subject_suffix and ob_suf not in imported_obligation_suffixes:
+                    imported_obligation_suffixes.append(ob_suf)
+            elif mod.startswith("Mir."):
+                mir_suf = mod[len("Mir.") :]
+                if mir_suf and mir_suf not in imported_mir_suffixes:
+                    imported_mir_suffixes.append(mir_suf)
+            elif mod.startswith("Specs."):
+                spec_suf = mod[len("Specs.") :]
+                if spec_suf != subject_suffix and spec_suf not in imported_specs_suffixes:
+                    imported_specs_suffixes.append(spec_suf)
+        elif val in ("def", "abbrev", "theorem", "lemma"):
+            cmd_e = command_end(idx)
+            if val == "abbrev":
+                for t_c, v_c in tokens[idx:cmd_e]:
+                    if (
+                        t_c == "Ident"
+                        and _strip_verification_result_qual(str(v_c)) in _VERIFY_SPEC_CLASS_NAMES
+                    ):
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"{label} aliases `{v_c}` via `abbrev`",
+                        )
+            if idx + 1 < n and tokens[idx + 1][0] == "Ident":
+                decl_name = str(tokens[idx + 1][1])
+                if (
+                    decl_name.startswith(("Obligations.", "Mir.", "Trusted.", "externalCallContract_"))
+                    or decl_name in ("defaultModularSpec", "defaultExternalCallContract")
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"{label} shadows reserved contract identifier `{decl_name}`",
+                    )
+                if val in ("def", "abbrev") and decl_name == "envAssumed":
+                    if local_env_assumed_def is not None:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"duplicate `def envAssumed` in {label}",
+                        )
+                    cmd_slice = tokens[idx:cmd_e]
+                    colon_eq_pos: int | None = None
+                    s_depth = 0
+                    for s_pos in range(2, len(cmd_slice)):
+                        t_s = cmd_slice[s_pos][0]
+                        if s_depth == 0 and t_s == "ColonEq":
+                            colon_eq_pos = s_pos
+                            break
+                        if t_s in ("LParen", "LBrace", "LBracket"):
+                            s_depth += 1
+                        elif t_s in ("RParen", "RBrace", "RBracket"):
+                            s_depth = max(0, s_depth - 1)
+                    if colon_eq_pos is None:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"`def envAssumed` in {label} lacks `:=`",
+                        )
+                    sig_tokens = cmd_slice[2:colon_eq_pos]
+                    rhs_tokens = cmd_slice[colon_eq_pos + 1 :]
+                    if (
+                        len(sig_tokens) >= 2
+                        and sig_tokens[0][0] == "LParen"
+                        and sig_tokens[1][0] == "Ident"
+                    ):
+                        local_env_assumed_def = [
+                            ("Ident", "fun"),
+                            ("Ident", str(sig_tokens[1][1])),
+                            ("Ident", "=>"),
+                            *rhs_tokens,
+                        ]
+                    else:
+                        local_env_assumed_def = list(rhs_tokens)
+        elif val == "instance":
+            if idx + 1 < n and tokens[idx + 1][0] == "Ident":
+                inst_name = str(tokens[idx + 1][1])
+                if inst_name.startswith(("Obligations.", "Mir.", "Trusted.")) or inst_name == "defaultModularSpec":
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"{label} shadows reserved instance identifier `{inst_name}`",
+                    )
+            cmd_slice = tokens[idx : command_end(idx)]
+            header_end = len(cmd_slice)
+            h_depth = 0
+            for h_pos, (t_h, v_h) in enumerate(cmd_slice):
+                if h_depth == 0 and (t_h == "ColonEq" or (t_h, v_h) == ("Ident", "where")):
+                    header_end = h_pos
+                    break
+                if t_h in ("LParen", "LBrace", "LBracket"):
+                    h_depth += 1
+                elif t_h in ("RParen", "RBrace", "RBracket"):
+                    h_depth = max(0, h_depth - 1)
+            header = cmd_slice[:header_end]
+            header_spec_classes: list[str] = []
+            for h_pos, (t_h, v_h) in enumerate(header):
+                if t_h == "Ident":
+                    short_cls = _strip_verification_result_qual(str(v_h))
+                    if short_cls in _VERIFY_SPEC_CLASS_NAMES:
+                        if h_pos + 1 >= len(header) or header[h_pos + 1][0] != "StrLit":
+                            raise Failure(
+                                1,
+                                FAULT_COVERAGE_PHASE,
+                                f"`{short_cls}` instance in {label} must have an explicit string-literal `defId` immediately after `{short_cls}`",
+                            )
+                        did = str(header[h_pos + 1][1])
+                        if did not in declared_spec_def_ids:
+                            declared_spec_def_ids.append(did)
+                        if short_cls not in declared_spec_classes:
+                            declared_spec_classes.append(short_cls)
+                        header_spec_classes.append(short_cls)
+            if len(header_spec_classes) != 1:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"every `instance` in {label} must declare an explicit `<*ItemSpec> \"<defId>\"` header",
+                )
+            cls0 = header_spec_classes[0]
+            if cls0 == "ModularItemSpec":
+                if has_modular_spec_instance:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"multiple `ModularItemSpec` instances in {label}",
+                    )
+                has_modular_spec_instance = True
+
+                def parse_env_with_local(env_slice: list[tuple[str, Any]]) -> list[str]:
+                    stripped = _strip_enclosing_parens_tokens(env_slice)
+                    if stripped == [("Ident", "envAssumed")] and local_env_assumed_def is not None:
+                        return _parse_env_assumed_holds_on_stems(local_env_assumed_def, label)
+                    return _parse_env_assumed_holds_on_stems(stripped, label)
+
+                def extract_where_or_brace_env(
+                    fields_slice: list[tuple[str, Any]]
+                ) -> list[str]:
+                    if any((t_f, v_f) == ("Ident", "where") for t_f, v_f in fields_slice):
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"nested `where` clause is forbidden inside `ModularItemSpec` in {label}",
+                        )
+                    extracted_stems: list[str] | None = None
+                    f_idx = 0
+                    f_depth = 0
+                    while f_idx < len(fields_slice):
+                        t_f, v_f = fields_slice[f_idx]
+                        if f_depth == 0 and (t_f, v_f) == ("Ident", "envAssumed"):
+                            if extracted_stems is not None:
+                                raise Failure(
+                                    1,
+                                    FAULT_COVERAGE_PHASE,
+                                    f"duplicate `envAssumed` field in `ModularItemSpec` of {label}",
+                                )
+                            if f_idx + 1 >= len(fields_slice) or fields_slice[f_idx + 1][0] != "ColonEq":
+                                raise Failure(
+                                    1,
+                                    FAULT_COVERAGE_PHASE,
+                                    f"`ModularItemSpec.envAssumed` in {label} must use `envAssumed := ...` without binders",
+                                )
+                            rhs_s = f_idx + 2
+                            r_idx = rhs_s
+                            r_depth = 0
+                            while r_idx < len(fields_slice):
+                                t_r, v_r = fields_slice[r_idx]
+                                if r_depth == 0:
+                                    if t_r in ("Comma", "Semicolon", "RBrace"):
+                                        break
+                                    if r_idx > rhs_s and t_r == "Ident" and (
+                                        v_r in ("pre", "post", "envAssumed")
+                                        or (
+                                            r_idx + 1 < len(fields_slice)
+                                            and fields_slice[r_idx + 1][0] == "ColonEq"
+                                        )
+                                    ):
+                                        break
+                                if t_r in ("LParen", "LBrace", "LBracket"):
+                                    r_depth += 1
+                                elif t_r in ("RParen", "RBrace", "RBracket"):
+                                    r_depth = max(0, r_depth - 1)
+                                r_idx += 1
+                            extracted_stems = parse_env_with_local(fields_slice[rhs_s:r_idx])
+                            f_idx = r_idx
+                            continue
+                        if t_f in ("LParen", "LBrace", "LBracket"):
+                            f_depth += 1
+                        elif t_f in ("RParen", "RBrace", "RBracket"):
+                            f_depth = max(0, f_depth - 1)
+                        f_idx += 1
+                    if extracted_stems is None:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"`ModularItemSpec` instance in {label} omits `envAssumed :=`",
+                        )
+                    return extracted_stems
+
+                if header_end < len(cmd_slice) and cmd_slice[header_end] == ("Ident", "where"):
+                    stems = extract_where_or_brace_env(cmd_slice[header_end + 1 :])
+                elif header_end < len(cmd_slice) and cmd_slice[header_end][0] == "ColonEq":
+                    rhs_m = _strip_enclosing_parens_tokens(cmd_slice[header_end + 1 :])
+                    if len(rhs_m) >= 2 and rhs_m[0][0] == "LBrace" and rhs_m[-1][0] == "RBrace":
+                        stems = extract_where_or_brace_env(rhs_m[1:-1])
+                    elif rhs_m and rhs_m[0][0] == "Ident" and rhs_m[0][1] in (
+                        "refineModularSpec",
+                        f"Obligations.{subject_suffix}.refineModularSpec",
+                    ):
+                        args3 = _take_exact_n_balanced_args(rhs_m[1:], 3)
+                        if args3 is None:
+                            raise Failure(
+                                1,
+                                FAULT_COVERAGE_PHASE,
+                                f"`refineModularSpec` in {label} must take exactly 3 balanced arguments without trailing tokens",
+                            )
+                        stems = parse_env_with_local(args3[0])
+                    else:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"`ModularItemSpec` instance in {label} must use `where`, `{{ ... }}`, or `refineModularSpec`",
+                        )
+                else:
+                    raise Failure(
+                        1, FAULT_COVERAGE_PHASE, f"malformed `ModularItemSpec` instance in {label}"
+                    )
+                for st in stems:
+                    if st not in raw_modular_stems:
+                        raw_modular_stems.append(st)
+
+            if cls0 == "StatefulEquivItemSpec":
+                if has_equiv_spec_instance:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"multiple `StatefulEquivItemSpec` instances in {label}",
+                    )
+                has_equiv_spec_instance = True
+
+                def extract_mir_ref_from_fields(fields_slice: list[tuple[str, Any]]) -> str:
+                    if any((t_f, v_f) == ("Ident", "where") for t_f, v_f in fields_slice):
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"nested `where` clause is forbidden inside `StatefulEquivItemSpec` in {label}",
+                        )
+                    extracted_ref: str | None = None
+                    f_idx = 0
+                    f_depth = 0
+                    while f_idx < len(fields_slice):
+                        t_f, v_f = fields_slice[f_idx]
+                        if f_depth == 0 and (t_f, v_f) == ("Ident", "specBody"):
+                            if extracted_ref is not None:
+                                raise Failure(
+                                    1,
+                                    FAULT_COVERAGE_PHASE,
+                                    f"duplicate `specBody` field in `StatefulEquivItemSpec` of {label}",
+                                )
+                            if f_idx + 1 >= len(fields_slice) or fields_slice[f_idx + 1][0] != "ColonEq":
+                                raise Failure(
+                                    1,
+                                    FAULT_COVERAGE_PHASE,
+                                    f"`StatefulEquivItemSpec.specBody` in {label} must use `specBody := Mir.<Ref>.body`",
+                                )
+                            rhs_s = f_idx + 2
+                            r_idx = rhs_s
+                            r_depth = 0
+                            while r_idx < len(fields_slice):
+                                t_r, v_r = fields_slice[r_idx]
+                                if r_depth == 0:
+                                    if t_r in ("Comma", "Semicolon", "RBrace"):
+                                        break
+                                    if r_idx > rhs_s and t_r == "Ident" and (
+                                        v_r in ("pre", "post", "specBody")
+                                        or (
+                                            r_idx + 1 < len(fields_slice)
+                                            and fields_slice[r_idx + 1][0] == "ColonEq"
+                                        )
+                                    ):
+                                        break
+                                if t_r in ("LParen", "LBrace", "LBracket"):
+                                    r_depth += 1
+                                elif t_r in ("RParen", "RBrace", "RBracket"):
+                                    r_depth = max(0, r_depth - 1)
+                                r_idx += 1
+                            spec_rhs = _strip_enclosing_parens_tokens(fields_slice[rhs_s:r_idx])
+                            if (
+                                len(spec_rhs) == 1
+                                and spec_rhs[0][0] == "Ident"
+                                and str(spec_rhs[0][1]).startswith("Mir.")
+                                and str(spec_rhs[0][1]).endswith(".body")
+                            ):
+                                ref_s = str(spec_rhs[0][1])[len("Mir.") : -len(".body")]
+                                if ref_s:
+                                    extracted_ref = ref_s
+                                    f_idx = r_idx
+                                    continue
+                            raise Failure(
+                                1,
+                                FAULT_COVERAGE_PHASE,
+                                f"`StatefulEquivItemSpec.specBody` in {label} must be an exact `Mir.<Ref>.body` reference",
+                            )
+                        if t_f in ("LParen", "LBrace", "LBracket"):
+                            f_depth += 1
+                        elif t_f in ("RParen", "RBrace", "RBracket"):
+                            f_depth = max(0, r_depth - 1)
+                        f_idx += 1
+                    if extracted_ref is None:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"`StatefulEquivItemSpec` instance in {label} omits `specBody := Mir.<Ref>.body`",
+                        )
+                    return extracted_ref
+
+                if header_end < len(cmd_slice) and cmd_slice[header_end] == ("Ident", "where"):
+                    equiv_spec_body_suffix = extract_mir_ref_from_fields(
+                        cmd_slice[header_end + 1 :]
+                    )
+                elif header_end < len(cmd_slice) and cmd_slice[header_end][0] == "ColonEq":
+                    rhs_e = _strip_enclosing_parens_tokens(cmd_slice[header_end + 1 :])
+                    if len(rhs_e) >= 2 and rhs_e[0][0] == "LBrace" and rhs_e[-1][0] == "RBrace":
+                        equiv_spec_body_suffix = extract_mir_ref_from_fields(rhs_e[1:-1])
+                    elif rhs_e and rhs_e[0][0] == "Ident" and rhs_e[0][1] in (
+                        "refineEquivSpec",
+                        f"Obligations.{subject_suffix}.refineEquivSpec",
+                    ):
+                        args3 = _take_exact_n_balanced_args(rhs_e[1:], 3)
+                        if args3 is None:
+                            raise Failure(
+                                1,
+                                FAULT_COVERAGE_PHASE,
+                                f"`refineEquivSpec` in {label} must take exactly 3 balanced arguments without trailing tokens",
+                            )
+                        arg0 = _strip_enclosing_parens_tokens(args3[0])
+                        if (
+                            len(arg0) == 1
+                            and arg0[0][0] == "Ident"
+                            and str(arg0[0][1]).startswith("Mir.")
+                            and str(arg0[0][1]).endswith(".body")
+                        ):
+                            ref_s = str(arg0[0][1])[len("Mir.") : -len(".body")]
+                            if not ref_s:
+                                raise Failure(
+                                    1, FAULT_COVERAGE_PHASE, f"empty `Mir.<Ref>.body` in {label}"
+                                )
+                            equiv_spec_body_suffix = ref_s
+                        else:
+                            raise Failure(
+                                1,
+                                FAULT_COVERAGE_PHASE,
+                                f"`refineEquivSpec` in {label} must take `Mir.<Ref>.body` as its first argument",
+                            )
+                    else:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"`StatefulEquivItemSpec` instance in {label} must use `refineEquivSpec Mir.<Ref>.body ...` or `where specBody := Mir.<Ref>.body`",
+                        )
+                else:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"malformed `StatefulEquivItemSpec` instance in {label}",
+                    )
+
+    if ns_opens != ns_closes or ns_opens > 1:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"{label} has unbalanced or repeated `namespace {expected_ns}` blocks",
+        )
+
+    own_ob_prefix = f"Obligations.{subject_suffix}."
+    own_default_mod_env = f"Obligations.{subject_suffix}.defaultModularSpec.envAssumed"
+    for stem in raw_modular_stems:
+        if stem in ("defaultModularSpec.envAssumed", own_default_mod_env):
+            delegates_to_default_modular_spec_env = True
+        elif stem.startswith("Obligations.") and (
+            stem.endswith(".defaultCallContract")
+            or stem.endswith(".ubExceptionClaim.callContract")
+        ):
+            rest = stem[len("Obligations.") :]
+            if rest.endswith(".defaultCallContract"):
+                callee = rest[: -len(".defaultCallContract")]
+                kind = "defaultCallContract"
+            else:
+                callee = rest[: -len(".ubExceptionClaim.callContract")]
+                kind = "ubExceptionCallContract"
+            if not callee or callee == subject_suffix:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{label} `ModularItemSpec.envAssumed` cannot self-assume `Obligations.{subject_suffix}`'s own callContract",
+                )
+            if callee not in imported_obligation_suffixes:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{label} references `{stem}.holdsOn` without `import Obligations.{callee}`",
+                )
+            if (callee, kind) not in sibling_modular_contracts:
+                sibling_modular_contracts.append((callee, kind))
+        elif stem.startswith(own_ob_prefix):
+            local_ext = stem[len(own_ob_prefix) :]
+            if local_ext and "." not in local_ext:
+                if local_ext not in referenced_subject_external_contract_idents:
+                    referenced_subject_external_contract_idents.append(local_ext)
+            else:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{label} `ModularItemSpec.envAssumed` references unsupported contract `{stem}.holdsOn`",
+                )
+        elif "." not in stem and (
+            stem == "defaultExternalCallContract" or stem.startswith("externalCallContract_")
+        ):
+            if stem not in referenced_subject_external_contract_idents:
+                referenced_subject_external_contract_idents.append(stem)
+        else:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"{label} `ModularItemSpec.envAssumed` references unsupported contract `{stem}.holdsOn`",
+            )
+
+    return {
+        "declared_spec_def_ids": declared_spec_def_ids,
+        "declared_spec_classes": declared_spec_classes,
+        "has_modular_spec_instance": has_modular_spec_instance,
+        "delegates_to_default_modular_spec_env": delegates_to_default_modular_spec_env,
+        "imported_obligation_suffixes": imported_obligation_suffixes,
+        "imported_mir_suffixes": imported_mir_suffixes,
+        "imported_specs_suffixes": imported_specs_suffixes,
+        "sibling_modular_contracts": sibling_modular_contracts,
+        "referenced_subject_external_contract_idents": referenced_subject_external_contract_idents,
+        "has_equiv_spec_instance": has_equiv_spec_instance,
+        "equiv_spec_body_suffix": equiv_spec_body_suffix,
+    }
+
+
+def _validate_auxiliary_module_no_spec_override(
+    aux_text: str,
+    aux_label: str,
+    subject_suffix: str,
+    verify_imports_specs: bool,
+) -> dict[str, list[str]]:
+    """`[adv ep2-A1]` Port of Rust `validate_auxiliary_module_no_spec_override`: verify
+    that `Proof/<X>.lean` or `Assumptions/<X>.lean` introduces no `*ItemSpec` overrides,
+    `@[instance]`, `attribute`, `local`, `scoped`, or unauthorized imports."""
+    tokens = _tokenize_lean_or_fail(aux_text, aux_label)
+    attr = _verify_detect_instance_attribute(tokens)
+    if attr is not None:
+        raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {aux_label}")
+    imported_sibling_specs: list[str] = []
+    imported_proof_suffixes: list[str] = []
+    imported_assumptions_suffixes: list[str] = []
+    n = len(tokens)
+    top = _top_level_token_indices(tokens)
+    top_set = set(top)
+
+    def command_end(start: int) -> int:
+        k = start + 1
+        while k < n and not (k in top_set and _fc_is_lean_command_start(tokens[k])):
+            k += 1
+        return k
+
+    for idx in top:
+        tk, val = tokens[idx]
+        if tk != "Ident":
+            continue
+        if val in (
+            "macro",
+            "macro_rules",
+            "syntax",
+            "notation",
+            "infix",
+            "infixl",
+            "infixr",
+            "prefix",
+            "postfix",
+            "elab",
+            "local",
+            "scoped",
+            "attribute",
+            "class",
+            "unsafe",
+            "partial",
+        ):
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"disallowed top-level `{val}` command in {aux_label}"
+            )
+        if val in ("def", "theorem", "lemma") and idx + 1 < n and tokens[idx + 1][0] == "Ident":
+            decl_name = str(tokens[idx + 1][1])
+            if decl_name.startswith(("Obligations.", "Mir.", "Trusted.")):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{aux_label} shadows reserved namespace declaration `{decl_name}`",
+                )
+        elif val in ("structure", "inductive"):
+            for t_c, v_c in tokens[idx : command_end(idx)]:
+                if t_c == "Ident" and (
+                    _strip_verification_result_qual(str(v_c)) in _VERIFY_SPEC_CLASS_NAMES
+                    or str(v_c).rsplit(".", 1)[-1] in _VERIFY_REFINE_SPEC_HELPERS
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"{aux_label} references `{v_c}` inside `{val}` declaration",
+                    )
+        elif val == "import":
+            if idx + 1 >= n or tokens[idx + 1][0] != "Ident":
+                raise Failure(1, FAULT_COVERAGE_PHASE, f"malformed `import` in {aux_label}")
+            mod = str(tokens[idx + 1][1])
+            if not _is_allowed_aux_import(mod):
+                raise Failure(
+                    1, FAULT_COVERAGE_PHASE, f"disallowed `import {mod}` in {aux_label}"
+                )
+            if mod.startswith("Specs."):
+                spec_suf = mod[len("Specs.") :]
+                if spec_suf == subject_suffix:
+                    if not verify_imports_specs:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"{aux_label} imports `Specs.{subject_suffix}`, which is not imported by `Verify.{subject_suffix}`",
+                        )
+                elif spec_suf not in imported_sibling_specs:
+                    imported_sibling_specs.append(spec_suf)
+            elif mod.startswith("Proof."):
+                psuf = mod[len("Proof.") :]
+                if psuf not in imported_proof_suffixes:
+                    imported_proof_suffixes.append(psuf)
+            elif mod.startswith("Assumptions."):
+                asuf = mod[len("Assumptions.") :]
+                if asuf not in imported_assumptions_suffixes:
+                    imported_assumptions_suffixes.append(asuf)
+        elif val == "abbrev":
+            for t_c, v_c in tokens[idx : command_end(idx)]:
+                if (
+                    t_c == "Ident"
+                    and _strip_verification_result_qual(str(v_c)) in _VERIFY_SPEC_CLASS_NAMES
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"{aux_label} aliases `{v_c}` via `abbrev` (specification instances must reside in `Specs.{subject_suffix}`)",
+                    )
+        elif val == "instance":
+            cmd_slice = tokens[idx : command_end(idx)]
+            header_end = len(cmd_slice)
+            h_depth = 0
+            for h_pos, (t_h, v_h) in enumerate(cmd_slice):
+                if h_depth == 0 and (t_h == "ColonEq" or (t_h, v_h) == ("Ident", "where")):
+                    header_end = h_pos
+                    break
+                if t_h in ("LParen", "LBrace", "LBracket"):
+                    h_depth += 1
+                elif t_h in ("RParen", "RBrace", "RBracket"):
+                    h_depth = max(0, h_depth - 1)
+            header = cmd_slice[:header_end]
+            if not any(t_h == "Colon" for t_h, _ in header):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{aux_label} declares an `instance` without an explicit `: <ClassName>` type signature",
+                )
+            for t_c, v_c in cmd_slice:
+                if t_c == "Ident":
+                    short_cls = _strip_verification_result_qual(str(v_c))
+                    if short_cls in _VERIFY_SPEC_CLASS_NAMES:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"{aux_label} declares a `{short_cls}` specification override instance (must reside in `Specs.{subject_suffix}`)",
+                        )
+                    if str(v_c).rsplit(".", 1)[-1] in _VERIFY_REFINE_SPEC_HELPERS:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"{aux_label} invokes `{v_c}` inside an `instance` declaration",
+                        )
+    return {
+        "imported_sibling_specs": imported_sibling_specs,
+        "imported_proof_suffixes": imported_proof_suffixes,
+        "imported_assumptions_suffixes": imported_assumptions_suffixes,
+    }
+
+
+def _validate_sibling_specs_no_subject_override(
+    specs_text: str, sibling_suffix: str, subject_def_path: str
+) -> list[str]:
+    """`[adv ep2-A1]` Port of Rust `validate_sibling_specs_no_subject_override`: verify
+    that a transitively imported sibling `Specs.<Other>` module declares no `*ItemSpec`
+    instance targeting `subject_def_path`."""
+    label = f"sibling Specs.{sibling_suffix}"
+    scan = _scan_specs_module(specs_text, sibling_suffix, label)
+    if subject_def_path in scan["declared_spec_def_ids"]:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"imported sibling `Specs.{sibling_suffix}` declares an `*ItemSpec` override for subject `{subject_def_path}`",
+        )
+    return list(scan["imported_specs_suffixes"])
 
 
 def _parse_fault_census_receipt_json(receipt_path: Path) -> dict[str, Any]:
@@ -10305,25 +12203,15 @@ def _audit_single_item_receipt(
     mir_meta: dict[str, Any],
     receipt_path: Path,
     mir_by_stem: dict[str, dict[str, Any]],
+    receipt_files: dict[str, Path],
     obligations_root: Path | None,
     verify_root: Path | None,
     specs_root: Path | None,
+    proofs_root: Path | None,
+    gen_assumptions_root: Path | None,
     reg: dict[str, dict[str, str]],
 ) -> dict[str, Any]:
-    """Independently re-audit one `FaultCensus/<Item>.json` receipt.
-
-    `[adv ep2-B1]`: the receipt is cargo-anneal output and therefore untrusted input.
-    Its `census_sites` must equal the independent Python census, its
-    `discharged_sites` must equal the independent Python obligation emitter
-    (`emit_mir_obligation_fault_sites`) and coverage is reconciled against that
-    recomputed set, and its `callee_closure` is never taken at face value:
-    `inline_callees` must equal the `Obligations/<Item>.lean` `defaultCallees`
-    table exactly, inline callee obligations are recomputed (never read from other
-    receipts), and `external_callees` / `allow_unresolved_indirect_calls` are only
-    honoured when `Verify/<Item>.lean` independently proves a modular surface (with
-    every external callee backed by an `externalSpecCallContract` target or an
-    imported sibling `Obligations.<Callee>`) or assumes the subject's own body.
-    """
+    """Independently re-audit one `FaultCensus/<Item>.json` receipt (`[adv ep2-B1]` / `[adv ep2-A1]`)."""
     receipt = _parse_fault_census_receipt_json(receipt_path)
     actual_sha = digest(mir_path)
     if receipt["mir_module_sha256"] != actual_sha:
@@ -10385,7 +12273,8 @@ def _audit_single_item_receipt(
     closure = receipt["callee_closure"]
 
     # 1. `inline_callees` must be exactly the `defaultCallees` installed into
-    #    `s.memory.callees` by `Obligations/<Item>.lean` (both directions).
+    #    `s.memory.callees` by `Obligations/<Item>.lean` (both directions), and
+    #    every claim in `Obligations/<Item>.lean` must bind `Mir.<Item>.body` + `defaultCallees`.
     if obligations_root is None:
         raise Failure(
             1,
@@ -10394,7 +12283,9 @@ def _audit_single_item_receipt(
         )
     ob_path = obligations_root / f"{rel_stem}.lean"
     ob_text = _read_regular_text(ob_path, f"Obligations module for `{rel_stem}`")
-    ob_scan = _scan_obligations_module(ob_text, suffix, str(ob_path))
+    ob_scan = _scan_obligations_module(
+        ob_text, suffix, str(ob_path), expected_def_path=subject_body["def_path"]
+    )
     inline_metas: list[dict[str, Any]] = []
     for suf in ob_scan["default_callee_suffixes"]:
         callee_meta = mir_by_stem.get(suf.replace(".", "/"))
@@ -10429,8 +12320,25 @@ def _audit_single_item_receipt(
             f"FaultCensus `callee_closure.inline_callees` in {receipt_path} declares {extra_inline or closure['inline_callees']} that `Obligations/{rel_stem}.lean` `defaultCallees` never installs",
         )
 
-    # 2. `external_callees` / `allow_unresolved_indirect_calls` are only honoured
-    #    for an independently established modular or assumed certificate surface.
+    # Validate sidecar MIR modules of any `externalSpecCallContract` in `Obligations/<Item>.lean`.
+    for ext in ob_scan["external_spec_contracts"]:
+        sidecar_stem = ext["sidecar_mir_suffix"].replace(".", "/")
+        sidecar_meta = mir_by_stem.get(sidecar_stem)
+        if sidecar_meta is None:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"Obligations module {ob_path} binds `externalSpecCallContract` `{ext['def_ident']}` to missing `Mir/{sidecar_stem}.lean`",
+            )
+        if sidecar_meta["role"] != ("externalSpec", ext["target_def_path"]):
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"sidecar `Mir.{ext['sidecar_mir_suffix']}` for `externalSpecCallContract \"{ext['target_def_path']}\"` has role `{sidecar_meta['role']}` instead of `ContractRole.externalSpec \"{ext['target_def_path']}\"`",
+            )
+
+    # 2. Verify `Verify/<Item>.lean` surface, active claim binding in `Obligations/<Item>.lean`,
+    #    and transitive `Specs.*` / `Proof.*` / `Assumptions.*` import cone.
     if verify_root is None:
         raise Failure(
             1,
@@ -10440,6 +12348,140 @@ def _audit_single_item_receipt(
     v_path = verify_root / f"{rel_stem}.lean"
     v_text = _read_regular_text(v_path, f"Verify module for `{rel_stem}`")
     surface = _scan_verify_module_surface(v_text, suffix, str(v_path))
+    active_claim = surface["claim"]
+    if active_claim not in ob_scan["declared_claims"]:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"`Verify/{rel_stem}.lean` proves `Obligations.{suffix}.{active_claim}`, which is not defined in {ob_path}",
+        )
+    if active_claim in _POLY_CLAIM_TO_FOR:
+        _, claim_for_name = _POLY_CLAIM_TO_FOR[active_claim]
+        if (
+            claim_for_name not in ob_scan["declared_claims"]
+            or "polyCertificate" not in ob_scan["declared_helpers"]
+        ):
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"`Verify/{rel_stem}.lean` proves `{active_claim}`, but `{claim_for_name}` or `polyCertificate` is missing in {ob_path}",
+            )
+
+    specs_scan: dict[str, Any] | None = None
+    specs_queue: list[str] = []
+    if surface["imports_specs"]:
+        if specs_root is None:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"`Verify.{suffix}` imports `Specs.{suffix}`, but no `anneal/proofs/Specs` directory exists",
+            )
+        specs_path = specs_root / f"{rel_stem}.lean"
+        specs_text = _read_regular_text(specs_path, f"Specs module for `{rel_stem}`")
+        specs_scan = _scan_specs_module(specs_text, suffix, str(specs_path))
+        for did in specs_scan["declared_spec_def_ids"]:
+            if did != subject_body["def_path"]:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"Specs.{suffix} ({specs_path}) declares an `*ItemSpec` instance for `{did}` instead of subject `{subject_body['def_path']}`",
+                )
+        specs_queue.extend(specs_scan["imported_specs_suffixes"])
+    elif specs_root is not None:
+        specs_path = specs_root / f"{rel_stem}.lean"
+        if specs_path.exists() or specs_path.is_symlink():
+            specs_text = _read_regular_text(specs_path, f"Specs module for `{rel_stem}`")
+            specs_scan = _scan_specs_module(specs_text, suffix, str(specs_path))
+            for did in specs_scan["declared_spec_def_ids"]:
+                if did != subject_body["def_path"]:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"Specs.{suffix} ({specs_path}) declares an `*ItemSpec` instance for `{did}` instead of subject `{subject_body['def_path']}`",
+                    )
+
+    # Walk transitive `Proof.*` / `Assumptions.*` / sibling `Specs.*` import cone.
+    proof_queue = list(surface["imported_proof_suffixes"])
+    assump_queue = list(surface["imported_assumptions_suffixes"])
+    visited_proof: set[str] = set()
+    visited_assump: set[str] = set()
+    visited_sib_specs: set[str] = set()
+    while proof_queue or assump_queue or specs_queue:
+        while proof_queue:
+            psuf = proof_queue.pop(0)
+            if psuf in visited_proof:
+                continue
+            visited_proof.add(psuf)
+            if proofs_root is None:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`Verify.{suffix}` imports `Proof.{psuf}`, but no `anneal/proofs/Proof` directory exists",
+                )
+            ppath = proofs_root / "Proof" / f"{psuf.replace('.', '/')}.lean"
+            ptext = _read_regular_text(ppath, f"Proof.{psuf}")
+            aux = _validate_auxiliary_module_no_spec_override(
+                ptext, f"Proof.{psuf}", suffix, surface["imports_specs"]
+            )
+            specs_queue.extend(aux["imported_sibling_specs"])
+            proof_queue.extend(aux["imported_proof_suffixes"])
+            assump_queue.extend(aux["imported_assumptions_suffixes"])
+        while assump_queue:
+            asuf = assump_queue.pop(0)
+            if asuf in visited_assump:
+                continue
+            visited_assump.add(asuf)
+            rel_a = f"{asuf.replace('.', '/')}.lean"
+            cand_paths: list[Path] = []
+            if proofs_root is not None:
+                ap = proofs_root / "Assumptions" / rel_a
+                if ap.exists() or ap.is_symlink():
+                    cand_paths.append(ap)
+            if gen_assumptions_root is not None:
+                gp = gen_assumptions_root / rel_a
+                if gp.exists() or gp.is_symlink():
+                    cand_paths.append(gp)
+            if not cand_paths:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`Verify.{suffix}` imports missing `Assumptions.{asuf}`",
+                )
+            for cpath in cand_paths:
+                atext = _read_regular_text(cpath, f"Assumptions.{asuf}")
+                aux = _validate_auxiliary_module_no_spec_override(
+                    atext, f"Assumptions.{asuf}", suffix, surface["imports_specs"]
+                )
+                specs_queue.extend(aux["imported_sibling_specs"])
+                proof_queue.extend(aux["imported_proof_suffixes"])
+                assump_queue.extend(aux["imported_assumptions_suffixes"])
+        while specs_queue:
+            sib_suf = specs_queue.pop(0)
+            if sib_suf == suffix:
+                if not surface["imports_specs"]:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"import cone of `Verify.{suffix}` transitively imports `Specs.{suffix}`, which is not imported by `Verify.{suffix}`",
+                    )
+                continue
+            if sib_suf in visited_sib_specs:
+                continue
+            visited_sib_specs.add(sib_suf)
+            if specs_root is None:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"import cone of `Verify.{suffix}` imports missing `Specs.{sib_suf}`",
+                )
+            spath = specs_root / f"{sib_suf.replace('.', '/')}.lean"
+            stext = _read_regular_text(spath, f"Specs.{sib_suf}")
+            specs_queue.extend(
+                _validate_sibling_specs_no_subject_override(
+                    stext, sib_suf, subject_body["def_path"]
+                )
+            )
+
     if closure["allow_unresolved_indirect_calls"] and not surface["assumed"]:
         raise Failure(
             1,
@@ -10453,26 +12495,119 @@ def _audit_single_item_receipt(
                 FAULT_COVERAGE_PHASE,
                 f"FaultCensus receipt {receipt_path} declares external callees {closure['external_callees']}, but `Verify/{rel_stem}.lean` proves non-modular `{surface['claim']}`",
             )
-        justified: set[str] = set(ob_scan["external_spec_targets"])
-        sibling_suffixes: list[str] = list(ob_scan["imported_obligation_suffixes"])
-        if specs_root is not None:
-            specs_path = specs_root / f"{rel_stem}.lean"
-            if specs_path.exists() or specs_path.is_symlink():
-                specs_text = _read_regular_text(specs_path, f"Specs module for `{rel_stem}`")
-                for mod in _scan_lean_module_imports(specs_text, str(specs_path)):
-                    if mod.startswith("Obligations."):
-                        sib = mod[len("Obligations.") :]
-                        if sib != suffix and sib not in sibling_suffixes:
-                            sibling_suffixes.append(sib)
-        for sib in sibling_suffixes:
-            sib_meta = mir_by_stem.get(sib.replace(".", "/"))
+        ext_by_ident = {
+            e["def_ident"]: e["target_def_path"] for e in ob_scan["external_spec_contracts"]
+        }
+        justified: set[str] = set()
+        sibling_deps: list[tuple[str, str]] = []
+        if (
+            surface["imports_specs"]
+            and specs_scan is not None
+            and specs_scan["has_modular_spec_instance"]
+        ):
+            if specs_scan["delegates_to_default_modular_spec_env"]:
+                if ob_scan["default_modular_spec_count"] != 1:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`Specs.{suffix}` delegates to `defaultModularSpec.envAssumed`, which is missing in {ob_path}",
+                    )
+                justified.update(ext_by_ident.values())
+                for csuf in ob_scan["referenced_callee_contracts"]:
+                    sibling_deps.append((csuf, "defaultCallContract"))
+            for csuf, kind in specs_scan["sibling_modular_contracts"]:
+                if (csuf, kind) not in sibling_deps:
+                    sibling_deps.append((csuf, kind))
+            for ext_id in specs_scan["referenced_subject_external_contract_idents"]:
+                resolved_id = (
+                    ob_scan["default_external_contract_alias"]
+                    if ext_id == "defaultExternalCallContract"
+                    else ext_id
+                )
+                target_dp = ext_by_ident.get(resolved_id or "")
+                if target_dp is None:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`Specs.{suffix}` `ModularItemSpec.envAssumed` references unknown external contract `{ext_id}.holdsOn`",
+                    )
+                justified.add(target_dp)
+        else:
+            if ob_scan["default_modular_spec_count"] != 1:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`Verify/{rel_stem}.lean` proves `{surface['claim']}` without `defaultModularSpec` in {ob_path}",
+                )
+            justified.update(ext_by_ident.values())
+            for csuf in ob_scan["referenced_callee_contracts"]:
+                sibling_deps.append((csuf, "defaultCallContract"))
+
+        for sib, kind in sibling_deps:
+            sib_stem = sib.replace(".", "/")
+            sib_meta = mir_by_stem.get(sib_stem)
             if sib_meta is None:
                 raise Failure(
                     1,
                     FAULT_COVERAGE_PHASE,
-                    f"`{rel_stem}` imports sibling `Obligations.{sib}`, but `Mir/{sib.replace('.', '/')}.lean` is missing",
+                    f"`{rel_stem}` references sibling `Obligations.{sib}`, but `Mir/{sib_stem}.lean` is missing",
                 )
+            if sib_stem not in receipt_files:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"modular caller `{rel_stem}` assumes sibling `Obligations.{sib}`, which has no verified `FaultCensus/{sib_stem}.json` receipt",
+                )
+            sib_ob_path = obligations_root / f"{sib_stem}.lean"
+            sib_ob_text = _read_regular_text(
+                sib_ob_path, f"sibling Obligations module `Obligations.{sib}`"
+            )
+            sib_ob = _scan_obligations_module(
+                sib_ob_text,
+                sib,
+                str(sib_ob_path),
+                expected_def_path=sib_meta["body"]["def_path"],
+            )
+            sib_v_path = verify_root / f"{sib_stem}.lean"
+            sib_v_text = _read_regular_text(
+                sib_v_path, f"sibling Verify module `Verify.{sib}`"
+            )
+            sib_surface = _scan_verify_module_surface(sib_v_text, sib, str(sib_v_path))
+            if kind == "defaultCallContract":
+                if sib_ob["default_call_contract_def_path"] != sib_meta["body"]["def_path"]:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"sibling `Obligations.{sib}` is missing canonical `defaultCallContract` for `{sib_meta['body']['def_path']}`",
+                    )
+                sib_specs_overrides = False
+                if sib_surface["imports_specs"] and specs_root is not None:
+                    sib_sp_path = specs_root / f"{sib_stem}.lean"
+                    sib_sp_text = _read_regular_text(sib_sp_path, f"Specs.{sib}")
+                    sib_sp = _scan_specs_module(sib_sp_text, sib, str(sib_sp_path))
+                    expected_cls = (
+                        "ItemSpec" if sib_surface["claim"] == "claim" else "TotalItemSpec"
+                    )
+                    sib_specs_overrides = expected_cls in sib_sp["declared_spec_classes"]
+                if (
+                    sib_surface["claim"] not in ("claim", "totalClaim")
+                    or sib_ob["has_legacy_spec_override"]
+                    or sib_specs_overrides
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"modular caller `{rel_stem}` assumes `Obligations.{sib}.defaultCallContract`, which is incompatible with `Verify.{sib}` surface `{sib_surface['claim']}`",
+                    )
+            else:
+                if sib_surface["claim"] != "ubExceptionClaim":
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"modular caller `{rel_stem}` assumes `Obligations.{sib}.ubExceptionClaim.callContract`, which is incompatible with `Verify.{sib}` surface `{sib_surface['claim']}`",
+                    )
             justified.add(sib_meta["body"]["def_path"])
+
         unjustified = sorted(set(closure["external_callees"]) - justified)
         if unjustified:
             raise Failure(
@@ -10481,7 +12616,8 @@ def _audit_single_item_receipt(
                 f"FaultCensus receipt {receipt_path} declares external callee(s) {unjustified} that are backed by neither an `externalSpecCallContract` target nor an imported sibling `Obligations.<Callee>`",
             )
 
-    # 3. Reconcile every inline callee body with independently emitted obligations.
+    # 3. Reconcile every inline callee body (and `equivClaim` reference `specBody`)
+    #    with independently emitted obligations.
     batch_items: list[dict[str, Any]] = [
         {
             "def_path": subject_body["def_path"],
@@ -10507,8 +12643,79 @@ def _audit_single_item_receipt(
 
     batch_verdict = reconcile_multi_item_coverage(batch_items, closure, reg)
     trait_reasons = _check_trait_impl_closure(mir_meta, callee_metas, closure)
-    if not batch_verdict["is_verified"] or trait_reasons:
-        all_reasons = [*batch_verdict["reasons"], *trait_reasons]
+    all_reasons = [*batch_verdict["reasons"], *trait_reasons]
+
+    if surface["equiv"]:
+        ref_suffix: str | None = None
+        if (
+            surface["imports_specs"]
+            and specs_scan is not None
+            and specs_scan["has_equiv_spec_instance"]
+        ):
+            ref_suffix = specs_scan["equiv_spec_body_suffix"]
+            if (
+                ref_suffix is not None
+                and ref_suffix != suffix
+                and ref_suffix not in specs_scan["imported_mir_suffixes"]
+            ):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`Specs.{suffix}` binds `StatefulEquivItemSpec` to `Mir.{ref_suffix}.body` without `import Mir.{ref_suffix}`",
+                )
+        else:
+            ref_suffix = ob_scan["rust_equiv_spec_body_suffix"]
+            if (
+                ref_suffix is not None
+                and ref_suffix != suffix
+                and ref_suffix not in ob_scan["imported_mir_suffixes"]
+            ):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`Obligations.{suffix}` binds `rustEquivSpec` to `Mir.{ref_suffix}.body` without `import Mir.{ref_suffix}`",
+                )
+        if not ref_suffix:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"`Verify.{suffix}` proves `equivClaim`, but neither `Specs.{suffix}` nor `Obligations.{suffix}` declares a `StatefulEquivItemSpec` reference body",
+            )
+        ref_meta = mir_by_stem.get(ref_suffix.replace(".", "/"))
+        if ref_meta is None:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"missing reference MIR module `Mir/{ref_suffix.replace('.', '/')}.lean` for `equivClaim` of `{rel_stem}`",
+            )
+        ref_body = ref_meta["body"]
+        spec_batch_items: list[dict[str, Any]] = [
+            {
+                "def_path": ref_body["def_path"],
+                "body": ref_body,
+                "discharged": emit_mir_obligation_fault_sites(ref_body),
+            }
+        ]
+        seen_spec_dps = {ref_body["def_path"]}
+        for c_meta in callee_metas:
+            c_dp = c_meta["body"]["def_path"]
+            if c_dp in seen_spec_dps:
+                continue
+            seen_spec_dps.add(c_dp)
+            spec_batch_items.append(
+                {
+                    "def_path": c_dp,
+                    "body": c_meta["body"],
+                    "discharged": emit_mir_obligation_fault_sites(c_meta["body"]),
+                }
+            )
+        spec_verdict = reconcile_multi_item_coverage(spec_batch_items, closure, reg)
+        spec_trait_reasons = _check_trait_impl_closure(ref_meta, callee_metas, closure)
+        if not spec_verdict["is_verified"] or spec_trait_reasons:
+            all_reasons.extend(spec_verdict["reasons"])
+            all_reasons.extend(spec_trait_reasons)
+
+    if not batch_verdict["is_verified"] or all_reasons:
         raise Failure(
             1,
             FAULT_COVERAGE_PHASE,
@@ -10583,7 +12790,9 @@ def _audit_manifest_targets_fault_coverage(
     mir_path_by_stem: dict[str, Path] = {}
     generated_root: Path | None = None
 
-    for mir_rel, mir_path in lean_audit_targets:
+    for target_entry, (mir_rel, mir_path) in zip(
+        manifest["targets"], lean_audit_targets
+    ):
         try:
             mir_text = mir_path.read_text(encoding="utf-8", errors="strict")
         except (OSError, UnicodeDecodeError) as err:
@@ -10598,18 +12807,11 @@ def _audit_manifest_targets_fault_coverage(
                 FAULT_COVERAGE_PHASE,
                 f"Mir target {mir_rel} failed strict fault-site census scan: {err}",
             ) from err
-        if meta["body"]["def_path"] != next(
-            (
-                t["def_id"]
-                for t in manifest["targets"]
-                if t["mir_module_path"] == mir_rel
-            ),
-            meta["body"]["def_path"],
-        ):
+        if meta["body"]["def_path"] != target_entry["def_id"]:
             raise Failure(
                 1,
                 FAULT_COVERAGE_PHASE,
-                f"CaptureManifest target def_id does not match Mir defPath `{meta['body']['def_path']}` in {mir_rel}",
+                f"CaptureManifest target def_id `{target_entry['def_id']}` does not match Mir defPath `{meta['body']['def_path']}` in {mir_rel}",
             )
         norm_rel = mir_rel.removeprefix("./")
         if norm_rel.startswith(".anneal/generated/Mir/") and norm_rel.endswith(".lean"):
@@ -10623,6 +12825,12 @@ def _audit_manifest_targets_fault_coverage(
             stem = norm_rel[: -len(".lean")]
             if generated_root is None:
                 generated_root = root
+        if stem in mir_by_stem:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"duplicate Mir module stem `{stem}` in CaptureManifest.json",
+            )
         mir_by_stem[stem] = meta
         mir_path_by_stem[stem] = mir_path
 
@@ -10656,10 +12864,6 @@ def _audit_manifest_targets_fault_coverage(
             )
         _parse_fault_census_receipt_json(r_path)
 
-    # `[adv ep2-B1]`: receipts are produced by scaffolding together with
-    # `Obligations/` and `Verify/`; every `Verify/<Item>.lean` subject needs a
-    # receipt, and inline callee bodies captured with `ContractRole.subject` (which
-    # never get their own receipt) are not mistaken for unaudited subjects.
     ob_root = (
         generated_root / "Obligations"
         if generated_root is not None
@@ -10709,10 +12913,22 @@ def _audit_manifest_targets_fault_coverage(
             FAULT_COVERAGE_PHASE,
             f"FaultCensus directory {fc_root} contains no `.json` receipts",
         )
-    specs_root = (
-        root / "anneal/proofs/Specs"
+    proofs_root = (
+        root / "anneal/proofs"
         if generated_root == root / ".anneal/generated"
-        and (root / "anneal/proofs/Specs").is_dir()
+        and (root / "anneal/proofs").is_dir()
+        else None
+    )
+    specs_root = (
+        proofs_root / "Specs"
+        if proofs_root is not None and (proofs_root / "Specs").is_dir()
+        else None
+    )
+    gen_assumptions_root = (
+        generated_root / "Assumptions"
+        if generated_root is not None
+        and (generated_root / "Assumptions").is_dir()
+        and not (generated_root / "Assumptions").is_symlink()
         else None
     )
     for stem, r_path in sorted(receipt_files.items()):
@@ -10722,9 +12938,12 @@ def _audit_manifest_targets_fault_coverage(
             mir_by_stem[stem],
             r_path,
             mir_by_stem,
+            receipt_files,
             ob_root,
             verify_root,
             specs_root,
+            proofs_root,
+            gen_assumptions_root,
             reg,
         )
 
@@ -10732,6 +12951,21 @@ def _audit_manifest_targets_fault_coverage(
         "mirTargetsAudited": len(mir_by_stem),
         "receiptsAudited": len(receipt_files),
     }
+
+
+def _resolve_manifest_workspace_root(manifest_path: Path) -> Path:
+    parent = manifest_path.parent
+    if (
+        parent.name == ".anneal"
+        and not (parent / ".anneal").exists()
+        and (
+            (parent / "generated").exists()
+            or (parent.parent / "src").exists()
+            or (parent.parent / "Cargo.toml").exists()
+        )
+    ):
+        return parent.parent
+    return parent
 
 
 def audit_fault_coverage(
@@ -10752,9 +12986,10 @@ def audit_fault_coverage(
         )
     resolved = target_path.resolve()
     if resolved.is_file():
+        manifest_root = _resolve_manifest_workspace_root(resolved)
         manifest = verify_capture_manifest(
             resolved,
-            resolved.parent,
+            manifest_root,
             registry=reg,
             require_fault_coverage=True,
         )
@@ -10867,11 +13102,6 @@ def audit_fault_coverage(
             )
         _parse_fault_census_receipt_json(r_path)
 
-    # `[adv ep2-B1]`: every `Verify/<Item>.lean` subject must have a receipt (and
-    # vice versa). Inline callee bodies are captured with `ContractRole.subject` but
-    # never receive their own receipt, so requiring a receipt for every role-subject
-    # `Mir/` module rejected every realistic workspace with callees, while
-    # `Obligations/` and `Verify/` are mandatory inputs of the independent closure audit.
     verify_root = generated_dir / "Verify"
     ob_root = generated_dir / "Obligations"
     for label, required_dir in (("Verify", verify_root), ("Obligations", ob_root)):
@@ -10910,10 +13140,21 @@ def audit_fault_coverage(
                 f"FaultCensus receipt `{stem}.json` has no matching `Verify/{stem}.lean` module",
             )
 
-    specs_root = (
-        resolved / "anneal/proofs/Specs"
+    proofs_root = (
+        resolved / "anneal/proofs"
         if generated_dir == resolved / ".anneal/generated"
-        and (resolved / "anneal/proofs/Specs").is_dir()
+        and (resolved / "anneal/proofs").is_dir()
+        else None
+    )
+    specs_root = (
+        proofs_root / "Specs"
+        if proofs_root is not None and (proofs_root / "Specs").is_dir()
+        else None
+    )
+    gen_assumptions_root = (
+        generated_dir / "Assumptions"
+        if (generated_dir / "Assumptions").is_dir()
+        and not (generated_dir / "Assumptions").is_symlink()
         else None
     )
     total_sites = 0
@@ -10924,9 +13165,12 @@ def audit_fault_coverage(
             mir_by_stem[stem],
             r_path,
             mir_by_stem,
+            receipt_files,
             ob_root,
             verify_root,
             specs_root,
+            proofs_root,
+            gen_assumptions_root,
             reg,
         )
         total_sites += len(rec["census_sites"])
