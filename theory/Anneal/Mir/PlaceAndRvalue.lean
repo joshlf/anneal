@@ -1417,15 +1417,18 @@ theorem evalPlaceRead_root_of_valid
     (layouts : LayoutTable)
     (callerLocals : List LocalSlot)
     (localDecls : List LocalDecl)
-    (rootVal : Value)
+    (rootVal outVal : Value)
     (hGet : get? locals loc = .some (.init rootVal))
+    (hRead : readProjectedValue locals rootVal .nil = .ok outVal)
     (hValid :
-      validateValueForTy? layouts (placeTy localDecls layouts ⟨loc, .nil⟩) rootVal = true) :
+      validateValueForTy? layouts (placeTy localDecls layouts ⟨loc, .nil⟩) outVal = true) :
     evalPlaceRead locals ⟨loc, .nil⟩ borrows globals layouts callerLocals localDecls =
-      .ok rootVal locals := by
+      .ok outVal locals := by
   unfold evalPlaceRead
   dsimp only
   rw [hGet]
+  dsimp only
+  rw [hRead]
   dsimp only
   rw [hValid]
 
@@ -2172,7 +2175,10 @@ theorem evalConstantIndex_lt_len
 def evalValueProjRead
     (locals : List LocalSlot) :
     Value → List ProjectionElem → ProjReadResult
-  | val, .nil => .ok val
+  | val, .nil =>
+    match valueContainsUninit val with
+    | false => .ok val
+    | true => .ub
   | .aggregate _ fields, .field idx _ :: rest =>
     match get? fields idx with
     | .some fieldVal => evalValueProjRead locals fieldVal rest
@@ -2355,9 +2361,12 @@ theorem evalValueProjWrite_read_same :
   induction proj with
   | nil =>
     intro locals val subVal hRead
-    injection hRead with hEq
-    subst hEq
-    rfl
+    dsimp only [evalValueProjRead] at hRead
+    cases hU : valueContainsUninit val <;> rw [hU] at hRead
+    · injection hRead with hEq
+      subst hEq
+      rfl
+    · nomatch hRead
   | cons p rest ih =>
     intro locals val subVal hRead
     cases p with
@@ -2464,19 +2473,21 @@ For every projection path `proj`, local environment `locals`, root value `val`,
 written value `newVal`, and updated root value `val'`, if writing `newVal` to
 `proj` in `val` succeeds with `.ok val'`, then reading `proj` back from `val'`
 yields `.ok newVal`. -/
-theorem evalValueProjRead_write_same :
-    ∀ (proj : List ProjectionElem) (locals : List LocalSlot) (val newVal val' : Value),
-      evalValueProjWrite locals val proj newVal = .ok val' →
-      evalValueProjRead locals val' proj = .ok newVal := by
-  intro proj
+theorem evalValueProjRead_write_same
+    (proj : List ProjectionElem) (locals : List LocalSlot) (val newVal val' : Value)
+    (hWrite : evalValueProjWrite locals val proj newVal = .ok val')
+    (hInit : valueContainsUninit newVal = false := by rfl) :
+    evalValueProjRead locals val' proj = .ok newVal := by
+  revert locals val val' hWrite
   induction proj with
   | nil =>
-    intro locals val newVal val' hWrite
+    intro locals val val' hWrite
     injection hWrite with hEq
     subst hEq
-    rfl
+    dsimp only [evalValueProjRead]
+    rw [hInit]
   | cons p rest ih =>
-    intro locals val newVal val' hWrite
+    intro locals val val' hWrite
     cases p with
     | field idx ty =>
       cases val with
@@ -2501,7 +2512,7 @@ theorem evalValueProjRead_write_same :
               subst hEq
               dsimp only [evalValueProjRead]
               rw [get?_of_set?_same hSet]
-              exact ih locals oldFieldVal newVal updatedFieldVal hRec
+              exact ih locals oldFieldVal updatedFieldVal hRec
       | _ => nomatch hWrite
     | downcast vName variantIdx =>
       cases val with
@@ -2520,7 +2531,7 @@ theorem evalValueProjRead_write_same :
             ⟨fields', rfl, _⟩
           dsimp only [evalValueProjRead]
           rw [hCond]
-          exact ih locals (.aggregate actualVariant fields) newVal (.aggregate actualVariant fields') hWrite
+          exact ih locals (.aggregate actualVariant fields) (.aggregate actualVariant fields') hWrite
       | _ => nomatch hWrite
     | index idxLocal =>
       cases val with
@@ -2560,7 +2571,7 @@ theorem evalValueProjRead_write_same :
                       rw [hLoc]
                       dsimp only
                       rw [get?_of_set?_same hSet]
-                      exact ih locals oldElemVal newVal updatedElemVal hRec
+                      exact ih locals oldElemVal updatedElemVal hRec
               | _ => nomatch hWrite
         | succ _ => nomatch hWrite
       | _ => nomatch hWrite
@@ -2597,7 +2608,7 @@ theorem evalValueProjRead_write_same :
                   rw [hLenEq, hIdx]
                   dsimp only
                   rw [get?_of_set?_same hSet]
-                  exact ih locals oldElemVal newVal updatedElemVal hRec
+                  exact ih locals oldElemVal updatedElemVal hRec
         | succ _ => nomatch hWrite
       | _ => nomatch hWrite
     | subslice fromIdx toIdx fromEnd =>
@@ -2629,7 +2640,7 @@ theorem evalValueProjRead_write_same :
                     subst hEq
                     dsimp only [evalValueProjRead]
                     rw [extractSubslice_replaceSubslice_same hRep]
-                    exact ih locals (.aggregate .zero subElems) newVal (.aggregate .zero updatedSubElems) hRec
+                    exact ih locals (.aggregate .zero subElems) (.aggregate .zero updatedSubElems) hRec
                 | succ _ => nomatch hWrite
               | _ => nomatch hWrite
         | succ _ => nomatch hWrite
@@ -5997,7 +6008,7 @@ def readFromPartialShell
   match proj with
   | .nil =>
     match shell.tryIntoValue? with
-    | .some v => .ok v
+    | .some v => evalValueProjRead locals v .nil
     | .none => .ub
   | .downcast _ variantIdx :: rest =>
     let actual := match shell.isAdt with | true => shell.variantIdx | false => 0
@@ -6385,11 +6396,11 @@ theorem writeToFieldSlot_promotes_last_field_n
     rfl
 
 /-- In `Trusted.MirSemantics.setOrExtendFields`, writing index `idx` on an empty
-field list `.nil` pads every lower unwritten index `j < idx` with `Value.unit`. -/
+field list `.nil` pads every lower unwritten index `j < idx` with `Value.uninit`. -/
 theorem get?_setOrExtendFields_nil_lt :
     ∀ (idx j : Nat) (v : Value),
       j < idx →
-      get? (setOrExtendFields .nil idx v) j = .some .unit := by
+      get? (setOrExtendFields .nil idx v) j = .some .uninit := by
   intro idx
   induction idx with
   | zero =>
@@ -6418,7 +6429,7 @@ theorem get?_setOrExtendFields_nil_self :
     rw [← get?_eq_getElem?]
     exact ih v
 
-/-- **General `n`-Field First-Write Divergence vs. Trusted `.unit` Padding (`writeToFieldSlot_first_field_n_vs_trusted_padding`)**:
+/-- **General `n`-Field First-Write Agreement (`writeToFieldSlot_first_field_n_vs_trusted_padding`)**:
 When an uninitialized `n`-field tuple local (`fieldTys.length = n`, `0 < idx < n`)
 has field `idx` initialized first (`_1.idx = v`):
 1. **Anneal (`writeToFieldSlot`)**: materializes a `PartialAggregate` shell of
@@ -6428,8 +6439,8 @@ has field `idx` initialized first (`_1.idx = v`):
    or reading the whole local `_1` returns `.ub` (`UninitializedLocal`).
 2. **Trusted (`writeProjectedValue` on `uninitFieldWriteShell? = .aggregate 0 []`)**:
    extends the empty field list via `setOrExtendFields [] idx v`, padding every
-   lower unwritten field `j < idx` with `Value.unit` so `readProjectedValue` on
-   `[.field j tyJ]` falsely returns `.ok .unit`! -/
+   lower unwritten field `j < idx` with `Value.uninit` so `readProjectedValue` on
+   `[.field j tyJ]` and on `.nil` both return `.ub`, matching `readFromPartialShell`! -/
 theorem writeToFieldSlot_first_field_n_vs_trusted_padding
     (locals : List LocalSlot)
     (fieldTys : List RigidTy)
@@ -6438,7 +6449,8 @@ theorem writeToFieldSlot_first_field_n_vs_trusted_padding
     (fieldTy tyJ : Ty)
     (v : Value)
     (hIdxLt : idx < fieldTys.length)
-    (hJLtIdx : j < idx) :
+    (hJLtIdx : j < idx)
+    (hInit : valueContainsUninit v = false := by rfl) :
     let containerTy : Ty := { kind := .tuple fieldTys, layoutIdx := lIdx }
     let initFields := (replicateUninitFieldSlots fieldTys.length).set idx (.init v)
     let expectedShell : PartialAggregate :=
@@ -6456,7 +6468,7 @@ theorem writeToFieldSlot_first_field_n_vs_trusted_padding
       .ok (.aggregate 0 (setOrExtendFields .nil idx v)) ∧
     Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue
       locals (.aggregate 0 (setOrExtendFields .nil idx v)) [.field j tyJ] =
-      .ok .unit := by
+      .ub := by
   intro containerTy initFields expectedShell
   have hRepLen : (replicateUninitFieldSlots fieldTys.length).length = fieldTys.length :=
     length_replicateUninitFieldSlots fieldTys.length
@@ -6491,7 +6503,8 @@ theorem writeToFieldSlot_first_field_n_vs_trusted_padding
   · unfold readFromPartialShell
     dsimp only [expectedShell]
     rw [hGetIdx]
-    rfl
+    dsimp only [evalValueProjRead]
+    rw [hInit]
   · unfold readFromPartialShell
     dsimp only [expectedShell]
     rw [hGetJ]
@@ -6701,6 +6714,7 @@ theorem evalOperand_move_bare_vs_projected_correspondence
     (callerLocals : List LocalSlot)
     (localDecls : List LocalDecl) :
     (get? locals loc = .some (.init rootVal) →
+      valueContainsUninit rootVal = false →
       set? locals loc .uninit = .some locals' →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
         locals (.move ⟨loc, .nil⟩) borrows globals layouts callerLocals localDecls =
@@ -6713,9 +6727,12 @@ theorem evalOperand_move_bare_vs_projected_correspondence
         locals (.move ⟨loc, proj :: rest⟩) borrows globals layouts callerLocals localDecls =
         .ok outVal locals) := by
   refine ⟨?_, ?_⟩
-  · intro hGet hSet
-    dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
+  · intro hGet hInit hSet
+    dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand,
+      Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue]
     rw [hGet]
+    dsimp only
+    rw [hInit]
     dsimp only
     rw [hSet]
   · intro hNotDeref hNoUnion hGet hProjRead
@@ -7332,7 +7349,8 @@ general any-order, any-arity statement is `evalStmt_assign_field_flat_refines`. 
 example
     (locals : List LocalSlot)
     (ty0 ty1 : Ty)
-    (v0 v1 : Value) :
+    (v0 v1 : Value)
+    (hV0 : valueContainsUninit v0 = false := by rfl) :
     let shellAfter0 : PartialAggregate :=
       { variantIdx := 0, isAdt := false, discriminantSet := false,
         fields := [.init v0, .uninit] }
@@ -7349,7 +7367,12 @@ example
     Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
       locals (.aggregate 0 [v0]) [.field 1 ty1] v1 =
       .ok (.aggregate 0 [v0, v1]) := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+  intro shellAfter0 shellAfter01
+  refine ⟨rfl, rfl, ?_, rfl, rfl, rfl⟩
+  change (match valueContainsUninit v0 with
+    | false => ProjReadResult.ok v0
+    | true => ProjReadResult.ub) = _
+  rw [hV0]
 
 /-! ### Stateful `LocalSlotState` Evaluators (`PlaceMention`, `Assume`, `SetDiscriminant`, `writePlaceState`) & `SlotsRefine` Correspondence -/
 
@@ -8052,12 +8075,10 @@ theorem evalOperandState_trusted_correspondence
             refine ⟨locals, ?_, hRel⟩
             cases proj with
             | nil =>
-              unfold evalValueProjRead at hRead
-              injection hRead with hV
-              subst hV
               dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
               rw [hGetT]
-              rfl
+              dsimp only
+              rw [hTRead]
             | cons p rest =>
               cases p with
               | deref => exact False.elim (hNoDeref rest rfl)
@@ -8103,9 +8124,6 @@ theorem evalOperandState_trusted_correspondence
               injection hEval with hRes hSlots
               injection hRes with hVal
               subst hVal hSlots
-              unfold evalValueProjRead at hRead
-              injection hRead with hRootEq
-              subst hRootEq
               have hLtT : loc < locals.length := by
                 simp only [get?_eq_getElem?] at hGetT
                 exact (List.getElem?_eq_some_iff.mp hGetT).1
@@ -8115,6 +8133,8 @@ theorem evalOperandState_trusted_correspondence
                 SlotsRefine.set (R := PromotedSlotRefines) (a := .uninit) (t := .uninit) trivial loc hRel⟩
               dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
               rw [hGetT]
+              dsimp only
+              rw [hTRead]
               dsimp only
               rw [hSetT]
             | cons p rest =>
@@ -8239,7 +8259,10 @@ def setDiscriminantProjectedValue
   match proj with
   | .nil =>
     match val with
-    | .aggregate _ fields => .ok (.aggregate variantIdx fields)
+    | .aggregate _ fields =>
+      match valueListContainsUninit fields with
+      | false => .ok (.aggregate variantIdx fields)
+      | true => .ub
     | .unit => .ok (.aggregate variantIdx .nil)
     | _ => .ub
   | p :: rest =>
@@ -8406,10 +8429,17 @@ def evalSetDiscriminantState
       | .unwrapUnsafeBinder _ :: _ => .unsupported
       | _ => .ub
     | .some (.init existingVal) =>
-      match setDiscriminantInFieldSlot locals (.init existingVal) place.projection variantIdx with
-      | .ok nextSlot => .ok (slots.set place.local_ (fieldSlotToLocalSlotState nextSlot))
-      | .ub => .ub
-      | .unsupported => .unsupported
+      match place.projection with
+      | .nil =>
+        match existingVal with
+        | .aggregate _ fields => .ok (slots.set place.local_ (.init (.aggregate variantIdx fields)))
+        | .unit => .ok (slots.set place.local_ (.init (.aggregate variantIdx .nil)))
+        | _ => .ub
+      | p :: rest =>
+        match setDiscriminantInFieldSlot locals (.init existingVal) (p :: rest) variantIdx with
+        | .ok nextSlot => .ok (slots.set place.local_ (fieldSlotToLocalSlotState nextSlot))
+        | .ub => .ub
+        | .unsupported => .unsupported
     | .some (.partialShell shell) =>
       match setDiscriminantInFieldSlot locals shell.toFieldSlot place.projection variantIdx with
       | .ok nextSlot => .ok (slots.set place.local_ (fieldSlotToLocalSlotState nextSlot))
@@ -8767,11 +8797,11 @@ shell read agrees with Trusted's read of the padded aggregate, and that the
 promoted value equals Trusted's value once all fields are written. -/
 
 /-- Field-level relation: an initialized Anneal field slot holds exactly Trusted's
-field value; an uninitialized slot corresponds to an absent field or to `.unit`
+field value; an uninitialized slot corresponds to an absent field or to `.uninit`
 padding; nested shells are not flat. -/
 def FlatFieldRefines : FieldSlot → Option Value → Prop
   | .init w, t => t = .some w
-  | .uninit, t => t = .none ∨ t = .some .unit
+  | .uninit, t => t = .none ∨ t = .some .uninit
   | .nested _ _ _ _, _ => False
 
 /-- Flat tuple-shell relation between Anneal field slots `fs` and Trusted's
@@ -8811,7 +8841,7 @@ theorem get?_setOrExtendFields :
       get? (setOrExtendFields tfs i v) j =
         if j = i then .some v
         else if j < tfs.length then get? tfs j
-        else if j < i then .some .unit
+        else if j < i then .some .uninit
         else .none := by
   intro tfs
   induction tfs with
@@ -9046,14 +9076,12 @@ theorem readFromPartialShell_flat_refines
     | none => rw [hProm] at hRead; nomatch hRead
     | some v =>
       rw [hProm] at hRead
-      injection hRead with hV
-      subst hV
       obtain ⟨_, vals, hFields, hOut⟩ := (tryIntoValue?_eq_some_iff shell v).mp hProm
       rw [hFields] at hRef
       have hTfs := flatShellRefines_complete vals tfs hRef
       subst hTfs
-      rw [hOut, hTuple]
-      rfl
+      rw [hOut, hTuple] at hRead
+      exact hRead
   | cons p rest =>
     cases p with
     | field idx ty =>
@@ -9088,6 +9116,73 @@ theorem readFromPartialShell_flat_refines
     | deref => unfold readFromPartialShell at hRead; nomatch hRead
     | opaqueCast _ => unfold readFromPartialShell at hRead; nomatch hRead
     | unwrapUnsafeBinder _ => unfold readFromPartialShell at hRead; nomatch hRead
+
+mutual
+
+/-- Canonical embedding of an Anneal `FieldSlot` into a TCB `Value` using `Value.uninit`
+for uninitialized sub-places. -/
+def fieldSlotToValue : FieldSlot → Value
+  | .uninit => .uninit
+  | .init v => v
+  | .nested variantIdx isAdt _ fields =>
+    let actualVar := match isAdt with | true => variantIdx | false => 0
+    .aggregate actualVar (fieldSlotsToValues fields)
+
+/-- Pointwise embedding of `List FieldSlot` into `List Value`. -/
+def fieldSlotsToValues : List FieldSlot → List Value
+  | .nil => .nil
+  | s :: rest => fieldSlotToValue s :: fieldSlotsToValues rest
+
+end
+
+/-- Canonical embedding of a `PartialAggregate` shell into a TCB `Value`. -/
+def PartialAggregate.toTrustedValue (shell : PartialAggregate) : Value :=
+  .aggregate shell.activeVariant (fieldSlotsToValues shell.fields)
+
+/-- **Two-Sided Flat Partial-Shell Field Read Equivalence (`readFromPartialShell_flat_field_eq_trusted`)**:
+Because `setOrExtendFields` pads unwritten lower-index sibling slots with `Value.uninit`
+(rather than `Value.unit`) and leaves unwritten higher-index slots unpopulated (`.none`),
+reading any single field `[.field idx ty]` from a flat tuple shell `shell`
+(`shell.isAdt = false`) and from any `FlatShellRefines`-related TCB aggregate
+`.aggregate 0 tfs` produces the **exact same** `ProjReadResult` (`=`, both on `.ok v`
+for initialized fields and on `.ub` for unwritten lower-index, higher-index, or
+out-of-bounds fields). -/
+theorem readFromPartialShell_flat_field_eq_trusted
+    (locals : List LocalSlot)
+    (shell : PartialAggregate)
+    (tfs : List Value)
+    (idx : FieldIdx)
+    (ty : Ty)
+    (hTuple : shell.isAdt = false)
+    (hRef : FlatShellRefines shell.fields tfs) :
+    readFromPartialShell locals shell [.field idx ty] =
+      Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue
+        locals (.aggregate 0 tfs) [.field idx ty] := by
+  unfold readFromPartialShell
+  rw [hTuple]
+  dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue]
+  cases hGet : get? shell.fields idx with
+  | none =>
+    have hGeS : shell.fields.length ≤ idx := by
+      simp only [get?_eq_getElem?] at hGet
+      exact List.getElem?_eq_none_iff.mp hGet
+    have hGeT : tfs.length ≤ idx := Nat.le_trans hRef.1 hGeS
+    have hGetT : get? tfs idx = .none := by
+      simp only [get?_eq_getElem?]
+      exact List.getElem?_eq_none hGeT
+    rw [hGetT]
+  | some slot =>
+    have hSlotRef := hRef.2 idx slot hGet
+    cases slot with
+    | uninit =>
+      rcases hSlotRef with hNone | hUninit
+      · rw [hNone]
+      · rw [hUninit]
+    | nested _ _ _ _ => nomatch hSlotRef
+    | init fieldVal =>
+      simp only [FlatFieldRefines] at hSlotRef
+      rw [hSlotRef]
+      rfl
 
 /-- Writing along the empty path stores the value (`write_to_partial_slot`, `proj = []`). -/
 @[simp]
@@ -9438,10 +9533,10 @@ example (locals : List LocalSlot) (k0 k1 : RigidTy) (lIdx : LayoutIdx) (ty0 ty1 
         fields := [.uninit, .init v1] }
     writeToFieldSlot locals tupleArityOf .uninit tupTy [.field 1 ty1] v1 =
       .ok shell1.toFieldSlot ∧
-    setOrExtendFields .nil 1 v1 = [.unit, v1] ∧
+    setOrExtendFields .nil 1 v1 = [.uninit, v1] ∧
     writeToFieldSlot locals tupleArityOf shell1.toFieldSlot tupTy [.field 0 ty0] v0 =
       .ok (.init (.aggregate 0 [v0, v1])) ∧
-    setOrExtendFields [.unit, v1] 0 v0 = [v0, v1] := by
+    setOrExtendFields [.uninit, v1] 0 v0 = [v0, v1] := by
   exact ⟨rfl, rfl, rfl, rfl⟩
 
 /-- **Trusted Divergence on `SetDiscriminant` of a `()` Value (`evalSetDiscriminantState_unit_vs_trusted_ub`)**:
@@ -9995,12 +10090,10 @@ theorem evalOperandState_flat_refines
     refine ⟨locals, ?_, hRel⟩
     cases proj with
     | nil =>
-      unfold Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue at hTRead
-      injection hTRead with hV
-      subst hV
       dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
       rw [hGetT]
-      rfl
+      dsimp only
+      rw [hTRead]
     | cons p rest =>
       cases p with
       | deref => exact False.elim (hNoDeref rest rfl)
@@ -10026,9 +10119,6 @@ theorem evalOperandState_flat_refines
         injection hEval with hRes hSlots
         injection hRes with hV
         subst hV hSlots
-        unfold Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue at hTRead
-        injection hTRead with hRootEq
-        subst hRootEq
         have hLtT : loc < locals.length := by
           simp only [get?_eq_getElem?] at hGetT
           exact (List.getElem?_eq_some_iff.mp hGetT).1
@@ -10038,6 +10128,8 @@ theorem evalOperandState_flat_refines
           SlotsRefine.set (R := FlatSlotStateRefines) (a := .uninit) (t := .uninit) trivial loc hRel⟩
         dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
         rw [hGetT]
+        dsimp only
+        rw [hTRead]
         dsimp only
         rw [hSetT]
       | cons p rest =>
@@ -10870,8 +10962,8 @@ theorem evalSetDiscriminantState_general_flat_refines
               (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
               span localDecls layouts hNoProt).1 hGetT hSetT,
             SlotsRefine.set (R := FlatSlotStateRefines)
-              (a := .init (.aggregate variantIdx fields))
-              (t := .init (.aggregate variantIdx fields)) rfl loc hRel⟩
+            (a := .init (.aggregate variantIdx fields))
+            (t := .init (.aggregate variantIdx fields)) rfl loc hRel⟩
     | _ => nomatch hOk
   · intro hNotDeref hDestOk hGetS hNotUnit hOk
     unfold evalSetDiscriminantState at hOk
@@ -10973,9 +11065,18 @@ theorem setDiscriminantProjectedValue_inv_of_not_unit
     unfold setDiscriminantProjectedValue at hSet
     cases w with
     | aggregate oldVar fields =>
-      injection hSet with hW
-      exact ⟨oldVar, fields, rfl, by rw [← hW]; rfl⟩
-    | unit => exact False.elim (hNotUnit rfl)
+      dsimp only at hSet
+      cases hUF : valueListContainsUninit fields with
+      | true => rw [hUF] at hSet; nomatch hSet
+      | false =>
+        rw [hUF] at hSet
+        injection hSet with hW
+        refine ⟨oldVar, fields, ?_, by rw [← hW]; rfl⟩
+        dsimp only [evalValueProjRead, valueContainsUninit]
+        rw [hUF]
+    | unit =>
+      exact False.elim (hNotUnit rfl)
+    | uninit => nomatch hSet
     | scalar _ => nomatch hSet
     | ptr _ _ => nomatch hSet
   | cons p rest' =>
@@ -10990,6 +11091,7 @@ theorem setDiscriminantProjectedValue_inv_of_not_unit
       | aggregate oldVar fields =>
         exact ⟨oldVar, fields, rfl, hSet⟩
       | unit => exact False.elim (hNotUnit hRead)
+      | uninit => nomatch hSet
       | scalar _ => nomatch hSet
       | ptr _ _ => nomatch hSet
 
@@ -11138,13 +11240,13 @@ mutual
   /-- Recursive field-slot refinement relation generalizing `FlatFieldRefines`
   to arbitrary nesting depth of non-ADT tuple/struct `.nested` partial shells:
   - `.init w` refines `.some w`.
-  - `.uninit` refines `.none`, `.some .unit`, or `.some (.aggregate 0 .nil)`.
+  - `.uninit` refines `.none`, `.some .uninit`, or `.some (.aggregate 0 .nil)`.
   - `.nested cVar cAdt cDisc cFields` refines `.some (.aggregate tVar childTfs)`
     when `cAdt = false`, `tVar = 0`, `childTfs.length ≤ cFields.length`, and
     `NestedFieldListRefines cFields childTfs`. -/
   def NestedFieldRefines : FieldSlot → Option Value → Prop
     | .init w, t => t = .some w
-    | .uninit, t => t = .none ∨ t = .some .unit ∨ t = .some (.aggregate 0 .nil)
+    | .uninit, t => t = .none ∨ t = .some .uninit ∨ t = .some (.aggregate 0 .nil)
     | .nested _ cAdt _ cFields, .some (.aggregate tVar childTfs) =>
       cAdt = false ∧ tVar = 0 ∧ childTfs.length ≤ cFields.length ∧
         NestedFieldListRefines cFields childTfs
@@ -11286,14 +11388,12 @@ theorem readFromPartialShell_nested_refines
     | none => rw [hProm] at hRead; nomatch hRead
     | some v =>
       rw [hProm] at hRead
-      injection hRead with hV
-      subst hV
       obtain ⟨_, vals, hFields, hOut⟩ := (tryIntoValue?_eq_some_iff shell v).mp hProm
       rw [hFields] at hRef
       have hTfs := nestedShellRefines_complete vals tfs hRef
       subst hTfs
-      rw [hOut, hTuple]
-      rfl
+      rw [hOut, hTuple] at hRead
+      exact hRead
   | .cons (.field idx ty) tail, shell, tfs, outVal, hTuple, hRef, hRead => by
     unfold readFromPartialShell at hRead
     dsimp only at hRead
@@ -11883,10 +11983,8 @@ theorem readPlaceStateCheckedIndex_evalPlaceRead_nested_refines
   · intro hValid
     rcases place with ⟨loc, _ | ⟨hd, tl⟩⟩
     · dsimp only at hProjR hValid
-      injection hProjR with hEq
-      subst hEq
       exact evalPlaceRead_root_of_valid locals loc borrows globals layouts callerLocals
-        localDecls rootVal hGetT hValid
+        localDecls rootVal val hGetT hProjR hValid
     · have hNotDeref : hd ≠ .deref := by
         intro h; subst h; nomatch hNoDeref
       exact evalPlaceRead_proj_of_noUnion locals loc hd tl borrows globals layouts callerLocals
@@ -11979,12 +12077,10 @@ theorem evalOperandState_nested_refines
     refine ⟨locals, ?_, hRel⟩
     cases proj with
     | nil =>
-      unfold Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue at hTRead
-      injection hTRead with hV
-      subst hV
       dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
       rw [hGetT]
-      rfl
+      dsimp only
+      rw [hTRead]
     | cons p rest =>
       cases p with
       | deref => exact False.elim (hNoDeref rest rfl)
@@ -12010,9 +12106,6 @@ theorem evalOperandState_nested_refines
         injection hEval with hRes hSlots
         injection hRes with hV
         subst hV hSlots
-        unfold Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue at hTRead
-        injection hTRead with hRootEq
-        subst hRootEq
         have hLtT : loc < locals.length := by
           simp only [get?_eq_getElem?] at hGetT
           exact (List.getElem?_eq_some_iff.mp hGetT).1
@@ -12022,6 +12115,8 @@ theorem evalOperandState_nested_refines
           SlotsRefine.set (R := NestedSlotStateRefines) (a := .uninit) (t := .uninit) trivial loc hRel⟩
         dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
         rw [hGetT]
+        dsimp only
+        rw [hTRead]
         dsimp only
         rw [hSetT]
       | cons p rest =>
@@ -12655,6 +12750,7 @@ theorem fieldShellChainPopulated_of_evalValueProjWrite_ok
                   dsimp only [fieldShellChainPopulated, stripTransparentProjections]
                   rw [hGet]
                   cases fieldTy.kind <;> first | rfl | exact hOldPop
+                | uninit => nomatch hRec
                 | unit => nomatch hRec
                 | scalar _ => nomatch hRec
                 | ptr _ _ => nomatch hRec
@@ -13141,7 +13237,7 @@ theorem evalStmt_assign_two_level_field_nested_refines
                 · refine ⟨_, _,
                     Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt_assign_init_unpopulated_nested_field_ok
                       s loc 0 tfs i j innerTy leafTy rv span localDecls layouts val locals₁ _ mem₁
-                      hRv hGetT (Or.inr ⟨innerFieldTys, rfl⟩) (Or.inr hUnitT) hSetT hNoProt
+                      hRv hGetT (Or.inr ⟨innerFieldTys, rfl⟩) (Or.inr (Or.inr hUnitT)) hSetT hNoProt
                       hNoUnion,
                     SlotsRefine.set hSlotRel loc hRel⟩
                 · have hLtTfs : i < tfs.length := by
@@ -13329,7 +13425,8 @@ Initializing a 2×2 nested tuple `((T, T), (T, T))` in reverse leaf order
    agreeing identically with Trusted! -/
 example
     (leafKind : RigidTy) (lIdx : LayoutIdx)
-    (v00 v01 v10 v11 : Value) :
+    (v00 v01 v10 v11 : Value)
+    (hV11 : valueContainsUninit v11 = false := by rfl) :
     let leafTy : Ty := { kind := leafKind, layoutIdx := lIdx }
     let innerKind : RigidTy := .tuple [leafKind, leafKind]
     let innerTy : Ty := { kind := innerKind, layoutIdx := lIdx }
@@ -13351,7 +13448,12 @@ example
     writePlaceState tupleArityOf s1 ⟨0, [.field 1 innerTy, .field 0 leafTy]⟩ outerTy v10 = .ok s2 ∧
     writePlaceState tupleArityOf s2 ⟨0, [.field 0 innerTy, .field 1 leafTy]⟩ outerTy v01 = .ok s3 ∧
     writePlaceState tupleArityOf s3 ⟨0, [.field 0 innerTy, .field 0 leafTy]⟩ outerTy v00 = .ok s4 := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+  intro leafTy innerKind innerTy outerTy s1 s2 s3 s4
+  refine ⟨rfl, ?_, rfl, rfl, rfl, rfl⟩
+  change (match valueContainsUninit v11 with
+    | false => ProjReadResult.ok v11
+    | true => ProjReadResult.ub) = _
+  rw [hV11]
 
 /-- **Multi-Deref `PlaceMention` Rejection Witness (`evalPlaceMentionStateTyped_double_deref_unsupported`)**:
 In Rust/Miri, `PlaceMention(**_0)` (`⟨0, [.deref, .deref]⟩`) must load the inner
@@ -13647,8 +13749,8 @@ theorem evalSetDiscriminantState_general_nested_refines
               (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
               span localDecls layouts hNoProt).1 hGetT hSetT,
             SlotsRefine.set (R := NestedSlotStateRefines)
-              (a := .init (.aggregate variantIdx fields))
-              (t := .init (.aggregate variantIdx fields)) rfl loc hRel⟩
+            (a := .init (.aggregate variantIdx fields))
+            (t := .init (.aggregate variantIdx fields)) rfl loc hRel⟩
     | _ => nomatch hOk
   · intro hNotDeref hDestOk hGetS hNotUnit hOk
     unfold evalSetDiscriminantState at hOk
@@ -13821,6 +13923,7 @@ theorem setDiscriminantInFieldSlot_chain_nested_refines
         | some childSlot =>
           rw [hGetS] at hLook
           cases tv with
+          | uninit => nomatch hRef
           | unit => nomatch hRef
           | scalar _ => nomatch hRef
           | ptr _ _ => nomatch hRef
@@ -14187,6 +14290,7 @@ theorem writeToFieldSlot_any_depth_field_chain_nested_refines
             nomatch hW
         | nested sVar sAdt sDisc sFields =>
           cases tv with
+          | uninit => nomatch hRef
           | unit => nomatch hRef
           | scalar _ => nomatch hRef
           | ptr _ _ => nomatch hRef
@@ -14337,6 +14441,7 @@ theorem writeToFieldSlot_any_depth_field_chain_nested_refines
                     promoteShellToFieldSlot_nestedFieldRefines 0 false _ _ hShellRef'⟩
           | nested sVar sAdt sDisc sFields =>
             cases tv with
+            | uninit => nomatch hRef
             | unit => nomatch hRef
             | scalar _ => nomatch hRef
             | ptr _ _ => nomatch hRef
@@ -14417,7 +14522,7 @@ theorem writeToFieldSlot_any_depth_field_chain_nested_refines
                     have hLtT : idx < tfs.length := by
                       simp only [get?_eq_getElem?] at hGetT
                       exact (List.getElem?_eq_some_iff.mp hGetT).1
-                    by_cases hUnit : childTv = .unit
+                    by_cases hUnit : childTv = .uninit
                     · subst hUnit
                       have hOldUninit : oldChildSlot = .uninit := by
                         cases oldChildSlot with
@@ -14487,7 +14592,21 @@ theorem writeToFieldSlot_any_depth_field_chain_nested_refines
                         dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.stripTransparentProjections, nextProjs]
                         rw [hGetT]
                         cases childTv with
-                        | unit => exact False.elim (hUnit rfl)
+                        | uninit => exact False.elim (hUnit rfl)
+                        | unit =>
+                          cases oldChildSlot with
+                          | uninit =>
+                            rcases hOldChildRef with hN | hU' | hAgg
+                            · nomatch hN
+                            · nomatch hU'
+                            · nomatch hAgg
+                          | nested _ _ _ _ => nomatch hOldChildRef
+                          | init cw =>
+                            dsimp only [NestedFieldRefines] at hOldChildRef
+                            injection hOldChildRef with hCw
+                            subst hCw
+                            rw [writeToFieldSlot_init_cons_eq] at hWChild
+                            nomatch hWChild
                         | scalar _ => dsimp only; rw [hSetPop]
                         | ptr _ _ => dsimp only; rw [hSetPop]
                         | aggregate _ _ => dsimp only; rw [hSetPop]
@@ -14771,6 +14890,7 @@ theorem writeToFieldSlot_init_subslot_chain_nested_refines
         | some childSlot =>
           rw [hGetS] at hLook
           cases tv with
+          | uninit => nomatch hRef
           | unit => nomatch hRef
           | scalar _ => nomatch hRef
           | ptr _ _ => nomatch hRef

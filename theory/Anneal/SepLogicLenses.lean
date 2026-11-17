@@ -1112,6 +1112,7 @@ theorem rawFieldMutLens_lawful {α : Type}
       | uninit => nomatch hField
       | init val =>
         cases val with
+        | uninit => nomatch hField
         | unit => nomatch hField
         | scalar _ => nomatch hField
         | ptr _ _ => nomatch hField
@@ -1138,6 +1139,7 @@ theorem rawFieldMutLens_lawful {α : Type}
       | uninit => nomatch hField
       | init val =>
         cases val with
+        | uninit => nomatch hField
         | unit => nomatch hField
         | scalar _ => nomatch hField
         | ptr _ _ => nomatch hField
@@ -1224,6 +1226,7 @@ theorem rawFieldMutLens_independent_of_ne_field {α β : Type}
       | uninit => nomatch hField₁
       | init val =>
         cases val with
+        | uninit => nomatch hField₁
         | unit => nomatch hField₁
         | scalar _ => nomatch hField₁
         | ptr _ _ => nomatch hField₁
@@ -2922,7 +2925,12 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
         rw [hGetPtr]
         simp [ProvenancePtr.tag, hLookB, hPerm, hP]
         rw [hEnvNone, hT, hCaller]
-        simp [hInit]
+        cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
+        | none => simp [hFT, hInit]
+        | some ft =>
+          cases ft with
+          | callerReferent _ => simp [hFT, hInit]
+          | savedFrame _ _ => nomatch hFT
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove
       · injection hCopy with hPlace
@@ -2954,7 +2962,12 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
         rw [hGetPtr]
         simp [ProvenancePtr.tag, hLookB, hPerm, hP]
         rw [hEnvNone, hT, hCaller]
-        simp [hInit]
+        cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
+        | none => simp [hFT, hInit]
+        | some ft =>
+          cases ft with
+          | callerReferent _ => simp [hFT, hInit]
+          | savedFrame _ _ => nomatch hFT
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove
       · nomatch hCopy
@@ -5688,14 +5701,10 @@ private theorem eq_of_readProjectedValue_nil
     {locals : List LocalSlot} {fVal v : Value}
     (h : readProjectedValue locals fVal [] = .ok v) :
     fVal = v := by
-  cases fVal with
-  | unit | scalar _ | ptr _ _ => injection h with hEq; exact hEq
-  | uninit => nomatch h
-  | aggregate varIdx fields =>
-    dsimp only [readProjectedValue] at h
-    cases hU : valueListContainsUninit fields <;> rw [hU] at h
-    · injection h with hEq; exact hEq
-    · nomatch h
+  dsimp only [readProjectedValue] at h
+  cases hU : valueContainsUninit fVal <;> rw [hU] at h
+  · injection h with hEq; exact hEq
+  · nomatch h
 
 /--
 Alias erasure for projected dereference field reads `(*p).fieldIdx`: when `rp`
@@ -8273,7 +8282,12 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           rw [hGetPtr]
           simp [ProvenancePtr.tag, hLookB, hPerm, hP]
           rw [hEnvNone, hT, hCaller]
-          simp [hInit]
+          cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
+          | none => simp [hFT, hInit]
+          | some ft =>
+            cases ft with
+            | callerReferent _ => simp [hFT, hInit]
+            | savedFrame _ _ => nomatch hFT
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · injection hCopy with hPlace
@@ -8308,7 +8322,12 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           rw [hEnvNone, hT, hCaller]
           dsimp only [appendProjections, readProjectedValue]
           rw [hEl]
-          all_goals simp [hInit]
+          cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
+          | none => simp [hFT, hInit]
+          | some ft =>
+            cases ft with
+            | callerReferent _ => simp [hFT, hInit]
+            | savedFrame _ _ => nomatch hFT
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · injection hCopy with hPlace
@@ -8346,7 +8365,12 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           rw [hGetPtr]
           simp [ProvenancePtr.tag, hLookB, hPerm, hP]
           rw [hEnvNone, hT, hCaller]
-          simp [hInit]
+          cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
+          | none => simp [hFT, hInit]
+          | some ft =>
+            cases ft with
+            | callerReferent _ => simp [hFT, hInit]
+            | savedFrame _ _ => nomatch hFT
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · nomatch hCopy
@@ -8381,7 +8405,12 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           rw [hEnvNone, hT, hCaller]
           dsimp only [appendProjections, readProjectedValue]
           rw [hEl]
-          all_goals rfl
+          cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
+          | none => simp [hFT, hInit]
+          | some ft =>
+            cases ft with
+            | callerReferent _ => simp [hFT, hInit]
+            | savedFrame _ _ => nomatch hFT
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · nomatch hCopy
