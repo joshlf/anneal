@@ -6,6 +6,10 @@
 //! MIR/layout line comments with 1-to-1 `CapturedMir` and `LayoutTable`
 //! constructors matching `trusted/lean/Trusted/Rustc/V2026_06_01/`.
 
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::ops::Range;
+
 use crate::manifest::MIR_DIALECT_V2026_06_01;
 
 /// Byte size corresponding to `Trusted.Rustc.V2026_06_01.Layout.Size`.
@@ -510,6 +514,9 @@ pub enum IrRvalue {
 
 /// Non-diverging intrinsics lowered directly as MIR statements, corresponding
 /// to `Trusted.Rustc.V2026_06_01.MirAst.NonDivergingIntrinsic`.
+// The variants mirror the Lean constructors one-to-one; boxing `CopyNonOverlapping` would
+// change the IR shape that `mir_lower.rs` builds.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IrNonDivergingIntrinsic {
     /// `core::intrinsics::assume(op)`: UB if `op` evaluates to `false`.
@@ -779,6 +786,10 @@ pub fn render_mir_module_header(lean_module_namespace: &str, def_path: &str) -> 
 /// Formats a complete, deterministic Lean 4 module (`Mir/<Crate>/<Item>.lean`)
 /// defining `layouts : LayoutTable`, `body : CapturedMir`, and
 /// `defaultClaim : Claim`.
+///
+/// Every constructor of the module is one of [`MIR_MODULE_CTOR_ARITIES`], whose fit within the
+/// LCNF constructor budgets is asserted at compile time; [`try_emit_mir_lean_module`] re-checks
+/// it before emitting.
 pub fn emit_mir_lean_module(lean_module_namespace: &str, mir: &IrCapturedMir) -> String {
     let mut out = render_mir_module_header(lean_module_namespace, &mir.def_path);
     out.push('\n');
@@ -1848,6 +1859,1404 @@ fn render_captured_mir(mir: &IrCapturedMir) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// LCNF constructor-size guard (Lean `v4.34.1` `IR/Checker.lean` limits)
+// ---------------------------------------------------------------------------
+
+/// Scalar-area budget, in bytes, of every constructor the LCNF guard emits.
+///
+/// Lean `v4.34.1`'s IR checker (`IR/Checker.lean`, `checkExpr` on `.ctor`) rejects a
+/// constructor whose scalar area (`ssize + usize * 8`) exceeds
+/// [`LEAN_IR_MAX_CTOR_SCALAR_BYTES`] ("has too many scalar fields"), and the debug C runtime
+/// asserts the strict `scalar_sz < 1024` in `lean_alloc_ctor`. `960 = 1024 - 64` stays below
+/// both.
+pub const MAX_LCNF_CTOR_SCALAR_BYTES: usize = 960;
+
+/// Boxed-field budget of every constructor the LCNF guard emits.
+///
+/// The IR checker rejects more than [`LEAN_IR_MAX_CTOR_OBJ_FIELDS`] boxed fields ("has too many
+/// fields") and `lean_alloc_ctor` asserts `num_objs < 256`. `240 = 256 - 16` stays below both.
+pub const MAX_LCNF_CTOR_OBJ_FIELDS: usize = 240;
+
+/// Declared-field budget (erased fields included) of every constructor the LCNF guard emits.
+///
+/// Independently of the IR checker, Lean `v4.34.1` stops elaborating wide structures: the
+/// `structure` command fails with "maximum recursion depth has been reached" (default
+/// `maxRecDepth`) at `520` fields while `500` fields elaborate, and the derived `BEq` instance
+/// already fails at `256` fields. At `240` fields, a structure deriving `Inhabited`, `Repr`,
+/// `BEq` and `Hashable` elaborates. A constructor within the two IR budgets may still declare
+/// `960` one-byte scalar fields plus any number of erased fields, so the guard also caps the
+/// declared fields. The cap equals [`MAX_LCNF_CTOR_OBJ_FIELDS`], so splits forced by boxed
+/// fields (`300 x Nat` into `[240, 60]`) are unchanged.
+pub const MAX_LCNF_CTOR_DECLARED_FIELDS: usize = 240;
+
+/// `LEAN_MAX_CTOR_SCALARS_SIZE` (`lean.h`): the largest constructor scalar area, in bytes, that
+/// the IR checker accepts.
+pub const LEAN_IR_MAX_CTOR_SCALAR_BYTES: usize = 1024;
+
+/// `LEAN_MAX_CTOR_FIELDS` (`lean.h`): the largest number of boxed fields of one constructor that
+/// the IR checker accepts.
+pub const LEAN_IR_MAX_CTOR_OBJ_FIELDS: usize = 256;
+
+/// Width, in bytes, of the widest unboxed LCNF scalar (`UInt64`, `USize`, `Float`).
+pub const MAX_LCNF_SCALAR_FIELD_BYTES: usize = 8;
+
+// Every guard budget stays strictly below the Lean limits, and any two wrapper fields (at most
+// `MAX_LCNF_SCALAR_FIELD_BYTES` scalar bytes or one boxed field each) fit one constructor, so
+// every wrapper level of `plan_lcnf_ctor_layout_levels` shrinks.
+const _: () = assert!(
+    MAX_LCNF_CTOR_SCALAR_BYTES < LEAN_IR_MAX_CTOR_SCALAR_BYTES
+        && MAX_LCNF_CTOR_OBJ_FIELDS < LEAN_IR_MAX_CTOR_OBJ_FIELDS
+        && MAX_LCNF_CTOR_DECLARED_FIELDS >= MAX_LCNF_CTOR_OBJ_FIELDS
+        && 2 * MAX_LCNF_SCALAR_FIELD_BYTES <= MAX_LCNF_CTOR_SCALAR_BYTES
+        && MAX_LCNF_CTOR_OBJ_FIELDS >= 2,
+    "LCNF guard budgets must stay below the Lean limits and fit any two wrapper fields"
+);
+
+/// How Lean `v4.34.1` stores one structure field after LCNF erasure and IR lowering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LcnfFieldKind {
+    /// Unboxed scalar of `bytes` bytes in the constructor's scalar area. Valid widths are `1`
+    /// (`Bool`, `UInt8`, `Int8`, enumeration types with fewer than `256` constructors), `2`
+    /// (`UInt16`, `Int16`), `4` (`UInt32`, `Int32`, `Char`, `Float32`) and `8` (`UInt64`,
+    /// `Int64`, `USize`, `ISize`, `Float`). A structure with exactly one relevant field of such a
+    /// type is unboxed the same way.
+    Scalar {
+        /// Width in bytes (`1`, `2`, `4`, or `8`).
+        bytes: usize,
+    },
+    /// Boxed `lean_object *` field: `Nat`, `Int`, `String`, `Unit`, `List _`, `Array _`,
+    /// `Option _`, and `Type`-valued structures with zero or at least two relevant fields.
+    ObjectRef,
+    /// Computationally irrelevant field erased by LCNF (a proof of a proposition, a type, or a
+    /// type former): no scalar bytes and no boxed field.
+    Irrelevant,
+}
+
+impl LcnfFieldKind {
+    /// Scalar-area bytes this field occupies in its constructor.
+    pub const fn scalar_bytes(self) -> usize {
+        match self {
+            Self::Scalar { bytes } => bytes,
+            Self::ObjectRef | Self::Irrelevant => 0,
+        }
+    }
+
+    /// Boxed fields this field occupies in its constructor (`0` or `1`).
+    pub const fn obj_fields(self) -> usize {
+        match self {
+            Self::ObjectRef => 1,
+            Self::Scalar { .. } | Self::Irrelevant => 0,
+        }
+    }
+
+    /// True unless the field is erased.
+    pub const fn is_relevant(self) -> bool {
+        !matches!(self, Self::Irrelevant)
+    }
+
+    /// True unless the field is a `Scalar` whose width is not `1`, `2`, `4`, or `8` bytes.
+    pub const fn is_valid(self) -> bool {
+        match self {
+            Self::Scalar { bytes } => matches!(bytes, 1 | 2 | 4 | 8),
+            Self::ObjectRef | Self::Irrelevant => true,
+        }
+    }
+
+    /// The kind of a field whose type is the given builtin Lean type, or `None` when the type
+    /// is not in this table.
+    ///
+    /// Every entry agrees with Lean `v4.34.1` (probed in
+    /// `lcnf_tests::lcnf_live_lean_builtin_kinds_match_model`). The function returns `None` for
+    /// every other type, including user structures (unboxed when they have exactly one relevant
+    /// field) and enumeration types (`1`-byte scalars), so callers classify those explicitly.
+    pub fn of_builtin_lean_ty(lean_ty: &str) -> Option<Self> {
+        match lean_ty.trim() {
+            "Bool" | "UInt8" | "Int8" => Some(Self::Scalar { bytes: 1 }),
+            "UInt16" | "Int16" => Some(Self::Scalar { bytes: 2 }),
+            "UInt32" | "Int32" | "Char" | "Float32" => Some(Self::Scalar { bytes: 4 }),
+            "UInt64" | "Int64" | "USize" | "ISize" | "Float" => Some(Self::Scalar { bytes: 8 }),
+            "Nat" | "Int" | "String" | "Unit" => Some(Self::ObjectRef),
+            "True" | "Prop" | "Type" => Some(Self::Irrelevant),
+            _ => None,
+        }
+    }
+}
+
+/// One field of a structure emitted through the LCNF guard.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LcnfFieldSpec {
+    /// Lean field name: an ASCII identifier that is not a Lean keyword.
+    pub name: String,
+    /// Lean type of the field, emitted verbatim (trimmed).
+    pub lean_ty: String,
+    /// How Lean stores the field.
+    pub kind: LcnfFieldKind,
+}
+
+impl LcnfFieldSpec {
+    /// A field with an explicit kind.
+    pub fn new(name: impl Into<String>, lean_ty: impl Into<String>, kind: LcnfFieldKind) -> Self {
+        Self {
+            name: name.into(),
+            lean_ty: lean_ty.into(),
+            kind,
+        }
+    }
+
+    /// A field whose kind follows from a builtin Lean type
+    /// ([`LcnfFieldKind::of_builtin_lean_ty`]).
+    pub fn builtin(
+        name: impl Into<String>,
+        lean_ty: impl Into<String>,
+    ) -> Result<Self, LcnfLayoutError> {
+        let name = name.into();
+        let lean_ty = lean_ty.into();
+        match LcnfFieldKind::of_builtin_lean_ty(&lean_ty) {
+            Some(kind) => Ok(Self::new(name, lean_ty, kind)),
+            None => Err(LcnfLayoutError::UnknownBuiltinLeanType {
+                field: name,
+                lean_ty,
+            }),
+        }
+    }
+}
+
+/// How a constructor (a guard `Part` or wrapper) is stored as a field of its parent wrapper.
+///
+/// This models Lean `v4.34.1`'s trivial-structure optimization (`hasTrivialStructure?`): a
+/// single-constructor structure with exactly one relevant field is represented by that field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CtorReprKind {
+    /// At least two relevant fields, or one boxed relevant field: one boxed field in the
+    /// parent.
+    BoxedObject,
+    /// Exactly one relevant field, an unboxed scalar of `bytes` bytes: the parent stores the
+    /// scalar unboxed. A wrapper over single-`UInt64` parts therefore needs `8` scalar bytes per
+    /// part, not one pointer per part.
+    UnboxedScalar {
+        /// Width in bytes of the single relevant scalar field.
+        bytes: usize,
+    },
+    /// No relevant field (every field is erased, or there are no fields).
+    ///
+    /// Lean erases such a constructor in its parent only if the structure is itself a
+    /// proposition (Lean infers `Prop` for a structure whose fields are all proofs). A
+    /// structure with an erased type field, or with no fields at all, is a `Type` stored as a
+    /// `lean_box(0)` object: Lean `v4.34.1` rejects `300` fields of
+    /// `structure Z : Type where h : True` with "has too many fields". The guard therefore
+    /// charges one boxed field ([`CtorReprKind::parent_field_kind`]).
+    Erased,
+}
+
+impl CtorReprKind {
+    /// Representation of a constructor whose fields have the given kinds.
+    pub fn of_kinds(kinds: &[LcnfFieldKind]) -> Self {
+        let mut relevant = kinds.iter().copied().filter(|kind| kind.is_relevant());
+        match (relevant.next(), relevant.next()) {
+            (None, _) => Self::Erased,
+            (Some(LcnfFieldKind::Scalar { bytes }), None) => Self::UnboxedScalar { bytes },
+            (Some(_), _) => Self::BoxedObject,
+        }
+    }
+
+    /// Representation of a constructor with the given fields.
+    pub fn of_fields(fields: &[LcnfFieldSpec]) -> Self {
+        let kinds: Vec<LcnfFieldKind> = fields.iter().map(|field| field.kind).collect();
+        Self::of_kinds(&kinds)
+    }
+
+    /// Kind of the parent-wrapper field that holds a constructor with this representation.
+    /// `Erased` is charged as a boxed field (see [`CtorReprKind::Erased`]).
+    pub const fn parent_field_kind(self) -> LcnfFieldKind {
+        match self {
+            Self::UnboxedScalar { bytes } => LcnfFieldKind::Scalar { bytes },
+            Self::BoxedObject | Self::Erased => LcnfFieldKind::ObjectRef,
+        }
+    }
+}
+
+/// `IR/Checker.lean` constructor limit, in the order `checkExpr` tests them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IrCtorLimit {
+    /// More than [`LEAN_IR_MAX_CTOR_OBJ_FIELDS`] boxed fields.
+    Fields,
+    /// More than [`LEAN_IR_MAX_CTOR_SCALAR_BYTES`] scalar bytes.
+    Scalar,
+}
+
+impl IrCtorLimit {
+    /// The diagnostic Lean `v4.34.1` reports for this limit
+    /// (`constructor '<name>' has too many ...`).
+    pub const fn lean_diagnostic(self) -> &'static str {
+        match self {
+            Self::Fields => "has too many fields",
+            Self::Scalar => "has too many scalar fields",
+        }
+    }
+}
+
+/// Scalar-area bytes, boxed fields, and declared fields of one constructor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LcnfCtorFootprint {
+    /// Bytes in the scalar area (`ssize + usize * 8`).
+    pub scalar_bytes: usize,
+    /// Boxed (`lean_object *`) fields.
+    pub obj_fields: usize,
+    /// Declared fields, erased ones included.
+    pub declared_fields: usize,
+}
+
+impl LcnfCtorFootprint {
+    /// Footprint of a constructor whose fields have the given kinds.
+    pub fn of_kinds<I: IntoIterator<Item = LcnfFieldKind>>(kinds: I) -> Self {
+        kinds
+            .into_iter()
+            .fold(Self::default(), |footprint, kind| footprint.with(kind))
+    }
+
+    /// Footprint of a constructor with the given fields.
+    pub fn of_fields(fields: &[LcnfFieldSpec]) -> Self {
+        Self::of_kinds(fields.iter().map(|field| field.kind))
+    }
+
+    /// This footprint extended by one field of kind `kind`.
+    pub const fn with(self, kind: LcnfFieldKind) -> Self {
+        Self {
+            scalar_bytes: self.scalar_bytes.saturating_add(kind.scalar_bytes()),
+            obj_fields: self.obj_fields.saturating_add(kind.obj_fields()),
+            declared_fields: self.declared_fields.saturating_add(1),
+        }
+    }
+
+    /// The first IR-checker limit this constructor violates, in `checkExpr` order, or `None`
+    /// when Lean `v4.34.1` accepts it.
+    pub const fn ir_violation(self) -> Option<IrCtorLimit> {
+        if self.obj_fields > LEAN_IR_MAX_CTOR_OBJ_FIELDS {
+            Some(IrCtorLimit::Fields)
+        } else if self.scalar_bytes > LEAN_IR_MAX_CTOR_SCALAR_BYTES {
+            Some(IrCtorLimit::Scalar)
+        } else {
+            None
+        }
+    }
+
+    /// True when the IR checker accepts this constructor.
+    pub const fn is_ir_accepted(self) -> bool {
+        self.ir_violation().is_none()
+    }
+
+    /// True when this constructor fits the guard budgets `max_scalar_bytes` / `max_obj_fields`
+    /// and [`MAX_LCNF_CTOR_DECLARED_FIELDS`].
+    pub const fn fits_budget(self, max_scalar_bytes: usize, max_obj_fields: usize) -> bool {
+        self.scalar_bytes <= max_scalar_bytes
+            && self.obj_fields <= max_obj_fields
+            && self.declared_fields <= MAX_LCNF_CTOR_DECLARED_FIELDS
+    }
+}
+
+/// The first IR-checker limit a constructor with `fields` violates, or `None`.
+pub fn ir_ctor_violation(fields: &[LcnfFieldSpec]) -> Option<IrCtorLimit> {
+    LcnfCtorFootprint::of_fields(fields).ir_violation()
+}
+
+/// Checks that Lean `v4.34.1`'s IR checker accepts a constructor with `fields`, returning its
+/// footprint.
+pub fn check_ir_ctor_accepted(
+    fields: &[LcnfFieldSpec],
+) -> Result<LcnfCtorFootprint, LcnfLayoutError> {
+    check_field_kinds(fields)?;
+    let footprint = LcnfCtorFootprint::of_fields(fields);
+    match footprint.ir_violation() {
+        None => Ok(footprint),
+        Some(limit) => Err(LcnfLayoutError::IrCtorRejected { limit, footprint }),
+    }
+}
+
+/// Error raised by the LCNF guard. Every error is raised before any Lean text is produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LcnfLayoutError {
+    /// A per-constructor budget is zero.
+    ZeroBudget {
+        max_scalar_bytes: usize,
+        max_obj_fields: usize,
+    },
+    /// A per-constructor budget reaches a Lean runtime limit (`scalar_sz < 1024`,
+    /// `num_objs < 256`).
+    BudgetAtLeanLimit {
+        max_scalar_bytes: usize,
+        max_obj_fields: usize,
+    },
+    /// A `Scalar` field whose width is not `1`, `2`, `4`, or `8` bytes.
+    InvalidScalarWidth { field: String, bytes: usize },
+    /// A single field that does not fit an otherwise empty constructor.
+    FieldExceedsBudget {
+        field: String,
+        scalar_bytes: usize,
+        max_scalar_bytes: usize,
+    },
+    /// A structure, field, or `deriving` name that is not a plain Lean identifier.
+    InvalidLeanName { what: &'static str, name: String },
+    /// Two fields with the same name.
+    DuplicateFieldName { name: String },
+    /// Two identical `deriving` entries.
+    DuplicateDerive { name: String },
+    /// An empty or malformed field type (control character, comment, or `:=`).
+    InvalidLeanType { field: String, lean_ty: String },
+    /// [`LcnfFieldSpec::builtin`] on a type outside [`LcnfFieldKind::of_builtin_lean_ty`].
+    UnknownBuiltinLeanType { field: String, lean_ty: String },
+    /// A field name that would collide with a declaration the split layout generates.
+    ReservedFieldName { name: String },
+    /// In a split layout, a field type that mentions a field, the structure, or `self`.
+    DependentFieldType { field: String, depends_on: String },
+    /// A constructor that the IR checker rejects.
+    IrCtorRejected {
+        limit: IrCtorLimit,
+        footprint: LcnfCtorFootprint,
+    },
+    /// A layout plan that violates an invariant of [`LcnfCtorLayoutPlan::validate`].
+    MalformedPlan { reason: String },
+    /// No expression for a field in [`render_lcnf_guarded_ctor_expr`].
+    MissingFieldExpr { field: String },
+    /// An expression for a name that is not a field.
+    UnknownFieldExpr { field: String },
+    /// Two expressions for the same field.
+    DuplicateFieldExpr { field: String },
+    /// An empty expression, or one with a control character.
+    InvalidFieldExpr { field: String },
+    /// A constructor of [`MIR_MODULE_CTOR_ARITIES`] (or another arity table) over the budget.
+    MirCtorOverBudget {
+        lean_name: &'static str,
+        fields: usize,
+    },
+}
+
+impl fmt::Display for LcnfLayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroBudget {
+                max_scalar_bytes,
+                max_obj_fields,
+            } => write!(
+                f,
+                "LCNF budget must be positive (scalar {max_scalar_bytes} B, objects {max_obj_fields})"
+            ),
+            Self::BudgetAtLeanLimit {
+                max_scalar_bytes,
+                max_obj_fields,
+            } => write!(
+                f,
+                "LCNF budget (scalar {max_scalar_bytes} B, objects {max_obj_fields}) must stay below \
+                 the Lean limits ({LEAN_IR_MAX_CTOR_SCALAR_BYTES} B, {LEAN_IR_MAX_CTOR_OBJ_FIELDS} objects)"
+            ),
+            Self::InvalidScalarWidth { field, bytes } => write!(
+                f,
+                "field `{field}`: scalar width {bytes} B is not 1, 2, 4, or 8"
+            ),
+            Self::FieldExceedsBudget {
+                field,
+                scalar_bytes,
+                max_scalar_bytes,
+            } => write!(
+                f,
+                "field `{field}` ({scalar_bytes} B) exceeds the {max_scalar_bytes} B constructor budget"
+            ),
+            Self::InvalidLeanName { what, name } => {
+                write!(f, "invalid Lean {what} name `{name}`")
+            }
+            Self::DuplicateFieldName { name } => write!(f, "duplicate field `{name}`"),
+            Self::DuplicateDerive { name } => write!(f, "duplicate deriving entry `{name}`"),
+            Self::InvalidLeanType { field, lean_ty } => {
+                write!(f, "field `{field}`: invalid Lean type `{lean_ty}`")
+            }
+            Self::UnknownBuiltinLeanType { field, lean_ty } => write!(
+                f,
+                "field `{field}`: `{lean_ty}` is not a builtin Lean type with a known LCNF kind"
+            ),
+            Self::ReservedFieldName { name } => write!(
+                f,
+                "field `{name}` collides with a declaration of the split LCNF layout"
+            ),
+            Self::DependentFieldType { field, depends_on } => write!(
+                f,
+                "field `{field}`: its type mentions `{depends_on}`, which a split LCNF layout cannot scope"
+            ),
+            Self::IrCtorRejected { limit, footprint } => write!(
+                f,
+                "constructor rejected by IR/Checker ({}): {} scalar bytes, {} object fields",
+                limit.lean_diagnostic(),
+                footprint.scalar_bytes,
+                footprint.obj_fields
+            ),
+            Self::MalformedPlan { reason } => write!(f, "malformed LCNF layout plan: {reason}"),
+            Self::MissingFieldExpr { field } => write!(f, "no expression for field `{field}`"),
+            Self::UnknownFieldExpr { field } => {
+                write!(f, "expression for unknown field `{field}`")
+            }
+            Self::DuplicateFieldExpr { field } => {
+                write!(f, "duplicate expression for field `{field}`")
+            }
+            Self::InvalidFieldExpr { field } => {
+                write!(f, "invalid expression for field `{field}`")
+            }
+            Self::MirCtorOverBudget { lean_name, fields } => write!(
+                f,
+                "MIR module constructor `{lean_name}` with {fields} fields exceeds the LCNF budget"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LcnfLayoutError {}
+
+/// Per-constructor limits applied by the chunker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LcnfCtorBudget {
+    max_scalar_bytes: usize,
+    max_obj_fields: usize,
+}
+
+impl LcnfCtorBudget {
+    /// The default budget, which every wrapper level uses.
+    const DEFAULT: Self = Self {
+        max_scalar_bytes: MAX_LCNF_CTOR_SCALAR_BYTES,
+        max_obj_fields: MAX_LCNF_CTOR_OBJ_FIELDS,
+    };
+
+    fn checked(max_scalar_bytes: usize, max_obj_fields: usize) -> Result<Self, LcnfLayoutError> {
+        if max_scalar_bytes == 0 || max_obj_fields == 0 {
+            return Err(LcnfLayoutError::ZeroBudget {
+                max_scalar_bytes,
+                max_obj_fields,
+            });
+        }
+        if max_scalar_bytes >= LEAN_IR_MAX_CTOR_SCALAR_BYTES
+            || max_obj_fields >= LEAN_IR_MAX_CTOR_OBJ_FIELDS
+        {
+            return Err(LcnfLayoutError::BudgetAtLeanLimit {
+                max_scalar_bytes,
+                max_obj_fields,
+            });
+        }
+        Ok(Self {
+            max_scalar_bytes,
+            max_obj_fields,
+        })
+    }
+
+    const fn allows(self, footprint: LcnfCtorFootprint) -> bool {
+        footprint.fits_budget(self.max_scalar_bytes, self.max_obj_fields)
+    }
+}
+
+fn check_field_kinds(fields: &[LcnfFieldSpec]) -> Result<(), LcnfLayoutError> {
+    match fields.iter().find(|field| !field.kind.is_valid()) {
+        Some(field) => Err(LcnfLayoutError::InvalidScalarWidth {
+            field: field.name.clone(),
+            bytes: field.kind.scalar_bytes(),
+        }),
+        None => Ok(()),
+    }
+}
+
+fn check_fields_fit(
+    fields: &[LcnfFieldSpec],
+    budget: LcnfCtorBudget,
+) -> Result<(), LcnfLayoutError> {
+    check_field_kinds(fields)?;
+    match fields
+        .iter()
+        .find(|field| !budget.allows(LcnfCtorFootprint::default().with(field.kind)))
+    {
+        Some(field) => Err(LcnfLayoutError::FieldExceedsBudget {
+            field: field.name.clone(),
+            scalar_bytes: field.kind.scalar_bytes(),
+            max_scalar_bytes: budget.max_scalar_bytes,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Greedy, order-preserving chunking of `kinds` into contiguous ranges, each allowed by
+/// `budget`. A kind starts a new range only when the current range is non-empty and adding the
+/// kind would exceed a budget. Every kind must individually fit `budget`.
+fn chunk_kind_ranges(kinds: &[LcnfFieldKind], budget: LcnfCtorBudget) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut current = LcnfCtorFootprint::default();
+    for (index, &kind) in kinds.iter().enumerate() {
+        let extended = current.with(kind);
+        if index > start && !budget.allows(extended) {
+            ranges.push(start..index);
+            start = index;
+            current = LcnfCtorFootprint::default().with(kind);
+        } else {
+            current = extended;
+        }
+    }
+    if start < kinds.len() {
+        ranges.push(start..kinds.len());
+    }
+    ranges
+}
+
+/// Greedy, order-preserving two-budget chunker.
+///
+/// Splits `fields` into consecutive parts. A field joins the current part when the part then
+/// stays within `max_scalar_bytes` scalar bytes, `max_obj_fields` boxed fields, and
+/// [`MAX_LCNF_CTOR_DECLARED_FIELDS`] declared fields; otherwise it starts the next part.
+/// Concatenating the parts gives back `fields`.
+///
+/// Rejects zero budgets, budgets at or above the Lean limits, invalid scalar widths, and any
+/// field that alone exceeds `max_scalar_bytes`.
+pub fn chunk_lcnf_ctor_fields(
+    fields: &[LcnfFieldSpec],
+    max_scalar_bytes: usize,
+    max_obj_fields: usize,
+) -> Result<Vec<Vec<LcnfFieldSpec>>, LcnfLayoutError> {
+    let budget = LcnfCtorBudget::checked(max_scalar_bytes, max_obj_fields)?;
+    check_fields_fit(fields, budget)?;
+    let kinds: Vec<LcnfFieldKind> = fields.iter().map(|field| field.kind).collect();
+    Ok(chunk_kind_ranges(&kinds, budget)
+        .into_iter()
+        .map(|range| fields[range].to_vec())
+        .collect())
+}
+
+/// Field kinds of a single wrapper constructor holding one field per part, each stored the way
+/// Lean stores the part ([`CtorReprKind::parent_field_kind`]).
+pub fn lcnf_wrapper_field_kinds(parts: &[Vec<LcnfFieldSpec>]) -> Vec<LcnfFieldKind> {
+    parts
+        .iter()
+        .map(|part| CtorReprKind::of_fields(part).parent_field_kind())
+        .collect()
+}
+
+/// One constructor of an [`LcnfCtorLayoutPlan`] level.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LcnfLayoutCtor {
+    /// Contiguous children: original field indices on level `0`, constructor indices of the
+    /// level below on wrapper levels.
+    pub children: Range<usize>,
+    /// Kind of each field of this constructor, one per child.
+    pub field_kinds: Vec<LcnfFieldKind>,
+    /// Footprint of this constructor.
+    pub footprint: LcnfCtorFootprint,
+    /// How the parent wrapper stores this constructor.
+    pub repr: CtorReprKind,
+}
+
+/// Multi-level constructor layout of one structure.
+///
+/// Level `0` holds the `Part` constructors over the original fields. Each further level holds
+/// wrapper constructors with one field per constructor of the level below. The last level is
+/// the root and has exactly one constructor. A plan whose only level is the root is flat: the
+/// structure is emitted unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LcnfCtorLayoutPlan {
+    fields: Vec<LcnfFieldSpec>,
+    part_budget: LcnfCtorBudget,
+    levels: Vec<Vec<LcnfLayoutCtor>>,
+}
+
+/// Name of the field through which a wrapper holds constructor `child_index` of level
+/// `child_level`: `part<j>` for parts, `level<L>_part<j>` for wrappers (`j` counts from `1`).
+pub fn lcnf_child_field_name(child_level: usize, child_index: usize) -> String {
+    if child_level == 0 {
+        format!("part{}", child_index + 1)
+    } else {
+        format!("level{child_level}_part{}", child_index + 1)
+    }
+}
+
+/// Index of the constructor of `ctors` whose children contain `child`.
+fn ctor_containing(ctors: &[LcnfLayoutCtor], child: usize) -> Option<usize> {
+    let index = ctors.partition_point(|ctor| ctor.children.end <= child);
+    ctors
+        .get(index)
+        .filter(|ctor| ctor.children.contains(&child))
+        .map(|_| index)
+}
+
+impl LcnfCtorLayoutPlan {
+    /// The original fields, in order.
+    pub fn fields(&self) -> &[LcnfFieldSpec] {
+        &self.fields
+    }
+
+    /// The levels, from the `Part` level to the root level.
+    pub fn levels(&self) -> &[Vec<LcnfLayoutCtor>] {
+        &self.levels
+    }
+
+    /// Number of constructors on each level (the last entry is `1`).
+    pub fn ctor_counts_per_level(&self) -> Vec<usize> {
+        self.levels.iter().map(Vec::len).collect()
+    }
+
+    /// True when the structure is emitted as one flat constructor.
+    pub fn is_flat(&self) -> bool {
+        self.levels.len() == 1
+    }
+
+    /// The root constructor.
+    pub fn root(&self) -> &LcnfLayoutCtor {
+        &self.levels[self.levels.len() - 1][0]
+    }
+
+    /// The `(max_scalar_bytes, max_obj_fields)` budget of the `Part` level.
+    pub fn part_budget(&self) -> (usize, usize) {
+        (
+            self.part_budget.max_scalar_bytes,
+            self.part_budget.max_obj_fields,
+        )
+    }
+
+    /// The fields of each `Part` constructor.
+    pub fn parts(&self) -> Vec<&[LcnfFieldSpec]> {
+        self.levels[0]
+            .iter()
+            .map(|ctor| &self.fields[ctor.children.clone()])
+            .collect()
+    }
+
+    /// Lean name of constructor `index` on `level` when the root structure is `struct_name`:
+    /// `<struct_name>` for the root, `<struct_name>.Part<j>` on level `0`, and
+    /// `<struct_name>.Level<L>_Part<j>` on wrapper levels (`j` counts from `1`).
+    pub fn ctor_lean_name(&self, struct_name: &str, level: usize, index: usize) -> String {
+        if level + 1 == self.levels.len() {
+            struct_name.to_owned()
+        } else if level == 0 {
+            format!("{struct_name}.Part{}", index + 1)
+        } else {
+            format!("{struct_name}.Level{level}_Part{}", index + 1)
+        }
+    }
+
+    /// Field names leading from the root to original field `field_index`, ending with the
+    /// field's own name (`[name]` for a flat plan, `[part<j>, name]` for one wrapper level).
+    pub fn field_projection_path(&self, field_index: usize) -> Option<Vec<String>> {
+        let field = self.fields.get(field_index)?;
+        let mut path = vec![field.name.clone()];
+        let mut child = ctor_containing(&self.levels[0], field_index)?;
+        for level in 1..self.levels.len() {
+            let parent = ctor_containing(&self.levels[level], child)?;
+            path.push(lcnf_child_field_name(level - 1, child));
+            child = parent;
+        }
+        path.reverse();
+        Some(path)
+    }
+
+    /// [`LcnfCtorLayoutPlan::field_projection_path`] of the field named `name`.
+    pub fn field_projection_path_by_name(&self, name: &str) -> Option<Vec<String>> {
+        let index = self.fields.iter().position(|field| field.name == name)?;
+        self.field_projection_path(index)
+    }
+
+    /// Checks every invariant of the plan.
+    ///
+    /// The `Part` level partitions the fields in order and every wrapper level partitions the
+    /// level below in order, so no field or constructor is lost, duplicated, or reordered.
+    /// Every constructor records the kinds, footprint and representation of its children, fits
+    /// its budget (the `Part` budget on level `0`, the default budget on wrapper levels) and
+    /// the IR-checker limits. Each wrapper level has fewer constructors than the level below,
+    /// and the root level has exactly one constructor.
+    pub fn validate(&self) -> Result<(), LcnfLayoutError> {
+        let malformed = |reason: String| Err(LcnfLayoutError::MalformedPlan { reason });
+        let Some(root_level) = self.levels.last() else {
+            return malformed(String::from("no levels"));
+        };
+        if root_level.len() != 1 {
+            return malformed(format!("root level has {} constructors", root_level.len()));
+        }
+        for (level, ctors) in self.levels.iter().enumerate() {
+            let (expected_children, budget) = if level == 0 {
+                (self.fields.len(), self.part_budget)
+            } else {
+                (self.levels[level - 1].len(), LcnfCtorBudget::DEFAULT)
+            };
+            if level > 0 && ctors.len() >= expected_children {
+                return malformed(format!(
+                    "level {level} has {} constructors over {expected_children}",
+                    ctors.len()
+                ));
+            }
+            let mut next = 0;
+            for (index, ctor) in ctors.iter().enumerate() {
+                let children = ctor.children.clone();
+                if children.start != next || children.end < children.start {
+                    return malformed(format!(
+                        "level {level} constructor {index} is not contiguous"
+                    ));
+                }
+                let empty_root = level == 0 && self.fields.is_empty() && ctors.len() == 1;
+                if children.is_empty() && !empty_root {
+                    return malformed(format!("level {level} constructor {index} is empty"));
+                }
+                next = children.end;
+                if next > expected_children {
+                    return malformed(format!("level {level} constructor {index} is out of range"));
+                }
+                let expected_kinds: Vec<LcnfFieldKind> = if level == 0 {
+                    self.fields[children]
+                        .iter()
+                        .map(|field| field.kind)
+                        .collect()
+                } else {
+                    self.levels[level - 1][children]
+                        .iter()
+                        .map(|child| child.repr.parent_field_kind())
+                        .collect()
+                };
+                if ctor.field_kinds != expected_kinds
+                    || ctor.footprint != LcnfCtorFootprint::of_kinds(expected_kinds.iter().copied())
+                    || ctor.repr != CtorReprKind::of_kinds(&expected_kinds)
+                {
+                    return malformed(format!(
+                        "level {level} constructor {index} does not match its children"
+                    ));
+                }
+                if let Some(limit) = ctor.footprint.ir_violation() {
+                    return Err(LcnfLayoutError::IrCtorRejected {
+                        limit,
+                        footprint: ctor.footprint,
+                    });
+                }
+                if !budget.allows(ctor.footprint) {
+                    return malformed(format!(
+                        "level {level} constructor {index} exceeds its budget: {:?}",
+                        ctor.footprint
+                    ));
+                }
+            }
+            if next != expected_children {
+                return malformed(format!(
+                    "level {level} covers {next} of {expected_children} children"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn build_layout_level(kinds: &[LcnfFieldKind], ranges: Vec<Range<usize>>) -> Vec<LcnfLayoutCtor> {
+    ranges
+        .into_iter()
+        .map(|children| {
+            let field_kinds = kinds[children.clone()].to_vec();
+            LcnfLayoutCtor {
+                footprint: LcnfCtorFootprint::of_kinds(field_kinds.iter().copied()),
+                repr: CtorReprKind::of_kinds(&field_kinds),
+                field_kinds,
+                children,
+            }
+        })
+        .collect()
+}
+
+/// Plans the multi-level constructor layout of a structure with `fields`.
+///
+/// Level `0` is [`chunk_lcnf_ctor_fields`] under `max_scalar_bytes` / `max_obj_fields` (the
+/// guard passes [`MAX_LCNF_CTOR_SCALAR_BYTES`] / [`MAX_LCNF_CTOR_OBJ_FIELDS`]). While a level
+/// has more than one constructor, the next level re-chunks one wrapper field per constructor,
+/// stored as Lean stores it ([`CtorReprKind::parent_field_kind`]: an unboxed scalar for a part
+/// with one relevant scalar field, otherwise a boxed field), under the default budgets. Any two
+/// wrapper fields fit one constructor, so every wrapper level shrinks and the plan ends at
+/// exactly one root constructor; an empty field list yields one empty root constructor. The
+/// plan is checked with [`LcnfCtorLayoutPlan::validate`] before it is returned.
+pub fn plan_lcnf_ctor_layout_levels(
+    fields: &[LcnfFieldSpec],
+    max_scalar_bytes: usize,
+    max_obj_fields: usize,
+) -> Result<LcnfCtorLayoutPlan, LcnfLayoutError> {
+    let part_budget = LcnfCtorBudget::checked(max_scalar_bytes, max_obj_fields)?;
+    check_field_specs(fields)?;
+    check_fields_fit(fields, part_budget)?;
+    let kinds: Vec<LcnfFieldKind> = fields.iter().map(|field| field.kind).collect();
+    let part_ranges = if kinds.is_empty() {
+        vec![Range::default()]
+    } else {
+        chunk_kind_ranges(&kinds, part_budget)
+    };
+    let mut levels = vec![build_layout_level(&kinds, part_ranges)];
+    // Each wrapper level shrinks, so `levels[0].len()` wrapper levels always suffice.
+    let mut fuel = levels[0].len();
+    while levels[levels.len() - 1].len() > 1 {
+        let below = &levels[levels.len() - 1];
+        let child_kinds: Vec<LcnfFieldKind> = below
+            .iter()
+            .map(|ctor| ctor.repr.parent_field_kind())
+            .collect();
+        let ranges = chunk_kind_ranges(&child_kinds, LcnfCtorBudget::DEFAULT);
+        if fuel == 0 || ranges.len() >= below.len() {
+            return Err(LcnfLayoutError::MalformedPlan {
+                reason: format!(
+                    "wrapper level {} does not shrink ({} -> {} constructors)",
+                    levels.len(),
+                    below.len(),
+                    ranges.len()
+                ),
+            });
+        }
+        fuel -= 1;
+        levels.push(build_layout_level(&child_kinds, ranges));
+    }
+    let plan = LcnfCtorLayoutPlan {
+        fields: fields.to_vec(),
+        part_budget,
+        levels,
+    };
+    plan.validate()?;
+    Ok(plan)
+}
+
+/// Lean keywords rejected as structure, field, and `deriving` name components
+/// (whitespace-separated).
+const LEAN_RESERVED_WORDS: &str = concat!(
+    "Prop Sort Type abbrev at attribute axiom break by calc catch class continue ",
+    "decreasing_by def deriving do elab else end example export extends finally for forall ",
+    "from fun have hiding if import in include inductive infix infixl infixr instance let ",
+    "local macro match meta mut mutual namespace noncomputable nofun nomatch notation omit ",
+    "opaque open partial postfix prefix private protected public renaming return scoped ",
+    "section set_option show structure suffices syntax termination_by then theorem this try ",
+    "universe unless unsafe using variable where with ",
+);
+
+/// Declarations Lean generates in a structure's namespace, which an accessor of a split layout
+/// must not shadow (whitespace-separated).
+const LEAN_STRUCTURE_AUX_NAMES: &str = concat!(
+    "below binductionOn brecOn casesOn ctorIdx ext ext_iff ibelow mk noConfusion ",
+    "noConfusionType rec recOn toCtorIdx ",
+);
+
+/// True for an ASCII Lean identifier component that is not a keyword: `[A-Za-z_][A-Za-z0-9_']*`
+/// other than `_`.
+fn is_lean_ident_component(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
+        && name != "_"
+        && !LEAN_RESERVED_WORDS
+            .split_whitespace()
+            .any(|word| word == name)
+}
+
+/// True for a dot-separated sequence of [`is_lean_ident_component`] components.
+fn is_lean_decl_name(name: &str) -> bool {
+    name.split('.').all(is_lean_ident_component)
+}
+
+/// ASCII identifier atoms of a Lean type: maximal runs of `[A-Za-z0-9_']`. Every reference to a
+/// field named by an ASCII identifier appears as one of these atoms.
+fn lean_ident_atoms(lean_ty: &str) -> impl Iterator<Item = &str> {
+    lean_ty
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '\''))
+        .filter(|atom| !atom.is_empty())
+}
+
+fn check_lean_ty(field: &str, lean_ty: &str) -> Result<(), LcnfLayoutError> {
+    let ty = lean_ty.trim();
+    if ty.is_empty()
+        || ty.chars().any(char::is_control)
+        || ty.contains("--")
+        || ty.contains("/-")
+        || ty.contains(":=")
+    {
+        return Err(LcnfLayoutError::InvalidLeanType {
+            field: field.to_owned(),
+            lean_ty: lean_ty.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn check_field_specs(fields: &[LcnfFieldSpec]) -> Result<(), LcnfLayoutError> {
+    let mut seen = HashSet::with_capacity(fields.len());
+    for field in fields {
+        if !is_lean_ident_component(&field.name) {
+            return Err(LcnfLayoutError::InvalidLeanName {
+                what: "field",
+                name: field.name.clone(),
+            });
+        }
+        if !seen.insert(field.name.as_str()) {
+            return Err(LcnfLayoutError::DuplicateFieldName {
+                name: field.name.clone(),
+            });
+        }
+        check_lean_ty(&field.name, &field.lean_ty)?;
+    }
+    Ok(())
+}
+
+/// Checks the structure name, the `deriving` entries and the plan, and, for a split layout,
+/// that no field name collides with a generated declaration and no field type depends on a
+/// field, on the structure itself, or on the accessor binder `self`.
+fn check_lcnf_emission(
+    struct_name: &str,
+    plan: &LcnfCtorLayoutPlan,
+    derives: &[&str],
+) -> Result<(), LcnfLayoutError> {
+    if !is_lean_decl_name(struct_name) {
+        return Err(LcnfLayoutError::InvalidLeanName {
+            what: "structure",
+            name: struct_name.to_owned(),
+        });
+    }
+    let mut seen_derives = HashSet::with_capacity(derives.len());
+    for &derive in derives {
+        if !is_lean_decl_name(derive) {
+            return Err(LcnfLayoutError::InvalidLeanName {
+                what: "deriving",
+                name: derive.to_owned(),
+            });
+        }
+        if !seen_derives.insert(derive) {
+            return Err(LcnfLayoutError::DuplicateDerive {
+                name: derive.to_owned(),
+            });
+        }
+    }
+    check_field_specs(&plan.fields)?;
+    plan.validate()?;
+    if plan.is_flat() {
+        return Ok(());
+    }
+    let top = plan.levels.len() - 1;
+    let mut reserved: HashSet<String> = LEAN_STRUCTURE_AUX_NAMES
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    for (level, ctors) in plan.levels[..top].iter().enumerate() {
+        for index in 0..ctors.len() {
+            reserved.insert(if level == 0 {
+                format!("Part{}", index + 1)
+            } else {
+                format!("Level{level}_Part{}", index + 1)
+            });
+        }
+    }
+    for child in plan.root().children.clone() {
+        reserved.insert(lcnf_child_field_name(top - 1, child));
+    }
+    let struct_leaf = struct_name.rsplit('.').next().unwrap_or(struct_name);
+    let field_names: HashSet<&str> = plan
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    for field in &plan.fields {
+        if reserved.contains(&field.name) {
+            return Err(LcnfLayoutError::ReservedFieldName {
+                name: field.name.clone(),
+            });
+        }
+        if let Some(atom) = lean_ident_atoms(&field.lean_ty)
+            .find(|&atom| atom == "self" || atom == struct_leaf || field_names.contains(atom))
+        {
+            return Err(LcnfLayoutError::DependentFieldType {
+                field: field.name.clone(),
+                depends_on: atom.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Renders the Lean declarations of `plan` for a structure named `struct_name`.
+///
+/// A flat plan renders the conventional `structure <struct_name> where` with one line per field
+/// and an optional `deriving` line, exactly as without the guard. A split plan renders, in
+/// dependency order, one `structure <struct_name>.Part<j>` per part, one
+/// `structure <struct_name>.Level<L>_Part<j>` per intermediate wrapper, the root
+/// `structure <struct_name>` (each with the same `deriving` line), and then one
+/// `abbrev <struct_name>.<field> (self : <struct_name>) : <type> := self.<path>` accessor per
+/// original field, so `s.<field>` keeps working and reads exactly the original field.
+pub fn render_lcnf_guarded_structure(
+    struct_name: &str,
+    plan: &LcnfCtorLayoutPlan,
+    derives: &[&str],
+) -> Result<String, LcnfLayoutError> {
+    check_lcnf_emission(struct_name, plan, derives)?;
+    let deriving = if derives.is_empty() {
+        String::new()
+    } else {
+        format!("  deriving {}\n", derives.join(", "))
+    };
+    let mut out = String::new();
+    for (level, ctors) in plan.levels.iter().enumerate() {
+        for (index, ctor) in ctors.iter().enumerate() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "structure {} where\n",
+                plan.ctor_lean_name(struct_name, level, index)
+            ));
+            for child in ctor.children.clone() {
+                if level == 0 {
+                    let field = &plan.fields[child];
+                    out.push_str(&format!("  {} : {}\n", field.name, field.lean_ty.trim()));
+                } else {
+                    out.push_str(&format!(
+                        "  {} : {}\n",
+                        lcnf_child_field_name(level - 1, child),
+                        plan.ctor_lean_name(struct_name, level - 1, child)
+                    ));
+                }
+            }
+            out.push_str(&deriving);
+        }
+    }
+    if !plan.is_flat() {
+        out.push('\n');
+        for (index, field) in plan.fields.iter().enumerate() {
+            let path = plan.field_projection_path(index).ok_or_else(|| {
+                LcnfLayoutError::MalformedPlan {
+                    reason: format!("no projection path for field `{}`", field.name),
+                }
+            })?;
+            out.push_str(&format!(
+                "abbrev {struct_name}.{} (self : {struct_name}) : {} := self.{}\n",
+                field.name,
+                field.lean_ty.trim(),
+                path.join(".")
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Emits the Lean declarations of a structure named `struct_name` with `fields`, deriving
+/// `derives`, under the default guard budgets.
+///
+/// When the fields fit one constructor within [`MAX_LCNF_CTOR_SCALAR_BYTES`],
+/// [`MAX_LCNF_CTOR_OBJ_FIELDS`] and [`MAX_LCNF_CTOR_DECLARED_FIELDS`], the output is the flat
+/// structure, unchanged. Otherwise it is the `Part` / `Level` layout of
+/// [`plan_lcnf_ctor_layout_levels`] with accessors ([`render_lcnf_guarded_structure`]); every
+/// emitted constructor then fits the budgets. The `deriving` line is repeated on every emitted
+/// structure: Lean `v4.34.1` derives `Inhabited`, `Repr`, `BEq` and `Hashable` for structures at
+/// the budget, but its `DecidableEq` handler already fails ("maximum recursion depth has been
+/// reached") on a flat `128`-field structure.
+pub fn emit_lcnf_guarded_structure(
+    struct_name: &str,
+    fields: &[LcnfFieldSpec],
+    derives: &[&str],
+) -> Result<String, LcnfLayoutError> {
+    let plan =
+        plan_lcnf_ctor_layout_levels(fields, MAX_LCNF_CTOR_SCALAR_BYTES, MAX_LCNF_CTOR_OBJ_FIELDS)?;
+    render_lcnf_guarded_structure(struct_name, &plan, derives)
+}
+
+fn render_lcnf_ctor_expr_at(
+    struct_name: &str,
+    plan: &LcnfCtorLayoutPlan,
+    exprs: &[&str],
+    level: usize,
+    index: usize,
+) -> String {
+    let ctor = &plan.levels[level][index];
+    let items: Vec<String> = ctor
+        .children
+        .clone()
+        .map(|child| {
+            if level == 0 {
+                format!("{} := ({})", plan.fields[child].name, exprs[child])
+            } else {
+                format!(
+                    "{} := {}",
+                    lcnf_child_field_name(level - 1, child),
+                    render_lcnf_ctor_expr_at(struct_name, plan, exprs, level - 1, child)
+                )
+            }
+        })
+        .collect();
+    let body = if items.is_empty() {
+        String::from("{ }")
+    } else {
+        format!("{{ {} }}", items.join(", "))
+    };
+    format!(
+        "({body} : {})",
+        plan.ctor_lean_name(struct_name, level, index)
+    )
+}
+
+/// Renders a Lean term of type `struct_name` built from one expression per field.
+///
+/// `field_exprs` pairs every field name of `plan` with a Lean expression, in any order. The term
+/// is a type-ascribed structure instance per constructor:
+/// `({ f := (e), ... } : <struct_name>)` for a flat plan and nested
+/// `({ part1 := ({ f := (e), ... } : <struct_name>.Part1), ... } : <struct_name>)` for a split
+/// plan, so projecting any field through its accessor returns its expression.
+pub fn render_lcnf_guarded_ctor_expr(
+    struct_name: &str,
+    field_exprs: &[(&str, &str)],
+    plan: &LcnfCtorLayoutPlan,
+) -> Result<String, LcnfLayoutError> {
+    if !is_lean_decl_name(struct_name) {
+        return Err(LcnfLayoutError::InvalidLeanName {
+            what: "structure",
+            name: struct_name.to_owned(),
+        });
+    }
+    plan.validate()?;
+    let index_of: HashMap<&str, usize> = plan
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| (field.name.as_str(), index))
+        .collect();
+    let mut exprs: Vec<Option<&str>> = vec![None; plan.fields.len()];
+    for &(name, expr) in field_exprs {
+        let Some(&index) = index_of.get(name) else {
+            return Err(LcnfLayoutError::UnknownFieldExpr {
+                field: name.to_owned(),
+            });
+        };
+        if exprs[index].is_some() {
+            return Err(LcnfLayoutError::DuplicateFieldExpr {
+                field: name.to_owned(),
+            });
+        }
+        if expr.trim().is_empty() || expr.chars().any(char::is_control) {
+            return Err(LcnfLayoutError::InvalidFieldExpr {
+                field: name.to_owned(),
+            });
+        }
+        exprs[index] = Some(expr.trim());
+    }
+    let mut complete = Vec::with_capacity(exprs.len());
+    for (index, expr) in exprs.into_iter().enumerate() {
+        match expr {
+            Some(expr) => complete.push(expr),
+            None => {
+                return Err(LcnfLayoutError::MissingFieldExpr {
+                    field: plan.fields[index].name.clone(),
+                });
+            }
+        }
+    }
+    Ok(render_lcnf_ctor_expr_at(
+        struct_name,
+        plan,
+        &complete,
+        plan.levels.len() - 1,
+        0,
+    ))
+}
+
+/// A Lean constructor that [`emit_mir_lean_module`] may render, with its number of explicit
+/// fields (defaulted structure fields included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MirModuleCtorArity {
+    /// Structure or constructor name: `Layout.*` and `MirAst.*` under
+    /// `Trusted.Rustc.V2026_06_01`, `VerificationResult.Claim` under `Trusted`, or a prelude
+    /// constructor.
+    pub lean_name: &'static str,
+    /// Number of explicit fields.
+    pub fields: usize,
+}
+
+const fn mir_ctor(lean_name: &'static str, fields: usize) -> MirModuleCtorArity {
+    MirModuleCtorArity { lean_name, fields }
+}
+
+/// Every structure and every constructor with fields declared in
+/// `trusted/lean/Trusted/Rustc/V2026_06_01/{Layout.lean,MirAst/*.lean}`, plus
+/// `VerificationResult.Claim` and the prelude constructors `List.cons`, `Option.some`, and
+/// `Prod.mk`: a superset of the constructors [`emit_mir_lean_module`] renders.
+///
+/// `lcnf_tests::mir_module_ctor_arities_match_trusted_lean_sources` re-derives the trusted
+/// entries from the Lean sources.
+pub const MIR_MODULE_CTOR_ARITIES: &[MirModuleCtorArity] = &[
+    mir_ctor("Layout.Size", 1),
+    mir_ctor("Layout.Align", 1),
+    mir_ctor("Layout.WrappingRange", 2),
+    mir_ctor("Layout.PrimitiveKind.int", 2),
+    mir_ctor("Layout.PrimitiveKind.float", 1),
+    mir_ctor("Layout.PrimitiveKind.pointer", 1),
+    mir_ctor("Layout.ScalarLayout.initialized", 2),
+    mir_ctor("Layout.ScalarLayout.union", 1),
+    mir_ctor("Layout.FieldsShape.union", 1),
+    mir_ctor("Layout.FieldsShape.array", 2),
+    mir_ctor("Layout.FieldsShape.arbitrary", 2),
+    mir_ctor("Layout.VariantsShape.single", 1),
+    mir_ctor("Layout.VariantsShape.multiple", 3),
+    mir_ctor("Layout.BackendRepr.scalar", 1),
+    mir_ctor("Layout.BackendRepr.scalarPair", 2),
+    mir_ctor("Layout.TypeLayout", 7),
+    mir_ctor("Layout.ArgAbi", 2),
+    mir_ctor("Layout.CallConv.other", 1),
+    mir_ctor("Layout.FnAbi", 4),
+    mir_ctor("Layout.LayoutTable", 3),
+    mir_ctor("MirAst.BasicBlockData", 3),
+    mir_ctor("MirAst.LocalDecl", 3),
+    mir_ctor("MirAst.CapturedAllocation", 5),
+    mir_ctor("MirAst.CapturedMir", 12),
+    mir_ctor("MirAst.ProjectionElem.field", 2),
+    mir_ctor("MirAst.ProjectionElem.index", 1),
+    mir_ctor("MirAst.ProjectionElem.constantIndex", 3),
+    mir_ctor("MirAst.ProjectionElem.subslice", 3),
+    mir_ctor("MirAst.ProjectionElem.downcast", 2),
+    mir_ctor("MirAst.ProjectionElem.opaqueCast", 1),
+    mir_ctor("MirAst.ProjectionElem.unwrapUnsafeBinder", 1),
+    mir_ctor("MirAst.Place", 2),
+    mir_ctor("MirAst.Operand.copy", 1),
+    mir_ctor("MirAst.Operand.move", 1),
+    mir_ctor("MirAst.Operand.constant", 1),
+    mir_ctor("MirAst.NullOp.offsetOf", 1),
+    mir_ctor("MirAst.BorrowKind.mut", 1),
+    mir_ctor("MirAst.CastKind.pointerCoercion", 1),
+    mir_ctor("MirAst.AggregateKind.array", 1),
+    mir_ctor("MirAst.AggregateKind.adt", 3),
+    mir_ctor("MirAst.AggregateKind.closure", 1),
+    mir_ctor("MirAst.AggregateKind.coroutine", 1),
+    mir_ctor("MirAst.AggregateKind.rawPtr", 2),
+    mir_ctor("MirAst.Rvalue.use", 1),
+    mir_ctor("MirAst.Rvalue.repeat", 2),
+    mir_ctor("MirAst.Rvalue.ref", 2),
+    mir_ctor("MirAst.Rvalue.threadLocalRef", 1),
+    mir_ctor("MirAst.Rvalue.rawPtr", 2),
+    mir_ctor("MirAst.Rvalue.len", 1),
+    mir_ctor("MirAst.Rvalue.cast", 3),
+    mir_ctor("MirAst.Rvalue.binaryOp", 3),
+    mir_ctor("MirAst.Rvalue.nullaryOp", 2),
+    mir_ctor("MirAst.Rvalue.unaryOp", 2),
+    mir_ctor("MirAst.Rvalue.discriminant", 1),
+    mir_ctor("MirAst.Rvalue.aggregate", 2),
+    mir_ctor("MirAst.Rvalue.shallowInitBox", 2),
+    mir_ctor("MirAst.Rvalue.copyForDeref", 1),
+    mir_ctor("MirAst.Rvalue.wrapUnsafeBinder", 2),
+    mir_ctor("MirAst.NonDivergingIntrinsic.assume", 1),
+    mir_ctor("MirAst.NonDivergingIntrinsic.copyNonOverlapping", 3),
+    mir_ctor("MirAst.StatementKind.assign", 2),
+    mir_ctor("MirAst.StatementKind.setDiscriminant", 2),
+    mir_ctor("MirAst.StatementKind.deinit", 1),
+    mir_ctor("MirAst.StatementKind.storageLive", 1),
+    mir_ctor("MirAst.StatementKind.storageDead", 1),
+    mir_ctor("MirAst.StatementKind.retag", 2),
+    mir_ctor("MirAst.StatementKind.placeMention", 1),
+    mir_ctor("MirAst.StatementKind.intrinsic", 1),
+    mir_ctor("MirAst.StatementKind.backwardIncompatibleDropHint", 1),
+    mir_ctor("MirAst.Statement", 2),
+    mir_ctor("MirAst.SwitchTargets", 2),
+    mir_ctor("MirAst.UnwindAction.cleanup", 1),
+    mir_ctor("MirAst.TerminatorKind.goto", 1),
+    mir_ctor("MirAst.TerminatorKind.switchInt", 2),
+    mir_ctor("MirAst.TerminatorKind.drop", 3),
+    mir_ctor("MirAst.TerminatorKind.call", 5),
+    mir_ctor("MirAst.TerminatorKind.tailCall", 2),
+    mir_ctor("MirAst.TerminatorKind.assert", 4),
+    mir_ctor("MirAst.TerminatorKind.inlineAsm", 3),
+    mir_ctor("MirAst.Terminator", 2),
+    mir_ctor("MirAst.RigidTy.param", 2),
+    mir_ctor("MirAst.RigidTy.alias", 2),
+    mir_ctor("MirAst.RigidTy.int", 1),
+    mir_ctor("MirAst.RigidTy.uint", 1),
+    mir_ctor("MirAst.RigidTy.float", 1),
+    mir_ctor("MirAst.RigidTy.tuple", 1),
+    mir_ctor("MirAst.RigidTy.array", 2),
+    mir_ctor("MirAst.RigidTy.slice", 1),
+    mir_ctor("MirAst.RigidTy.ref", 2),
+    mir_ctor("MirAst.RigidTy.rawPtr", 2),
+    mir_ctor("MirAst.RigidTy.adt", 2),
+    mir_ctor("MirAst.RigidTy.fnDef", 2),
+    mir_ctor("MirAst.RigidTy.fnPtr", 4),
+    mir_ctor("MirAst.RigidTy.closure", 2),
+    mir_ctor("MirAst.RigidTy.dynamic", 1),
+    mir_ctor("MirAst.RigidTy.foreign", 1),
+    mir_ctor("MirAst.RigidTy.other", 1),
+    mir_ctor("MirAst.Ty", 2),
+    mir_ctor("MirAst.ScalarInt", 2),
+    mir_ctor("MirAst.ProvenancePtr", 2),
+    mir_ctor("MirAst.ConstScalar.int", 1),
+    mir_ctor("MirAst.ConstScalar.ptr", 2),
+    mir_ctor("MirAst.ConstValue.scalar", 1),
+    mir_ctor("MirAst.ConstValue.slice", 2),
+    mir_ctor("MirAst.ConstValue.indirect", 2),
+    mir_ctor("MirAst.ConstValue.unevaluated", 1),
+    mir_ctor("MirAst.ConstOperand", 2),
+    mir_ctor("MirAst.MirPhaseTag.other", 1),
+    mir_ctor("MirAst.ContractRole.requires", 1),
+    mir_ctor("MirAst.ContractRole.ensures", 1),
+    mir_ctor("MirAst.ContractRole.externalSpec", 1),
+    mir_ctor("MirAst.GenericParamDef", 2),
+    mir_ctor("MirAst.TraitRef", 2),
+    mir_ctor("MirAst.TraitImplEntry", 2),
+    mir_ctor("VerificationResult.Claim", 4),
+    mir_ctor("List.cons", 2),
+    mir_ctor("Option.some", 1),
+    mir_ctor("Prod.mk", 2),
+];
+
+/// True when every constructor of `arities` fits the LCNF budgets even if each field takes the
+/// worst case: [`MAX_LCNF_SCALAR_FIELD_BYTES`] scalar bytes and one boxed field.
+const fn mir_module_ctor_arities_fit(arities: &[MirModuleCtorArity]) -> bool {
+    let mut index = 0;
+    while index < arities.len() {
+        let fields = arities[index].fields;
+        if fields > MAX_LCNF_CTOR_OBJ_FIELDS
+            || fields > MAX_LCNF_CTOR_DECLARED_FIELDS
+            || fields.saturating_mul(MAX_LCNF_SCALAR_FIELD_BYTES) > MAX_LCNF_CTOR_SCALAR_BYTES
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+// Pre-emission LCNF check of `emit_mir_lean_module`, at compile time.
+const _: () = assert!(
+    mir_module_ctor_arities_fit(MIR_MODULE_CTOR_ARITIES),
+    "a MIR module constructor exceeds the LCNF constructor budget"
+);
+
+/// Checks that every constructor of `arities` fits the LCNF budgets with worst-case fields and
+/// returns the worst-case footprint of the widest one.
+pub fn validate_mir_module_ctor_arities(
+    arities: &[MirModuleCtorArity],
+) -> Result<LcnfCtorFootprint, LcnfLayoutError> {
+    let mut widest = LcnfCtorFootprint::default();
+    for arity in arities {
+        let footprint = LcnfCtorFootprint {
+            scalar_bytes: arity.fields.saturating_mul(MAX_LCNF_SCALAR_FIELD_BYTES),
+            obj_fields: arity.fields,
+            declared_fields: arity.fields,
+        };
+        if !footprint.fits_budget(MAX_LCNF_CTOR_SCALAR_BYTES, MAX_LCNF_CTOR_OBJ_FIELDS) {
+            return Err(LcnfLayoutError::MirCtorOverBudget {
+                lean_name: arity.lean_name,
+                fields: arity.fields,
+            });
+        }
+        if footprint.declared_fields > widest.declared_fields {
+            widest = footprint;
+        }
+    }
+    Ok(widest)
+}
+
+/// [`emit_mir_lean_module`] after the pre-emission LCNF check.
+///
+/// `emit_mir_lean_module` renders lists (locals, blocks, statements, operands, layouts,
+/// allocation bytes) as `List.cons` chains and every other value with a fixed constructor of
+/// [`MIR_MODULE_CTOR_ARITIES`], so no constructor grows with the size of `mir`. This function
+/// re-checks that table ([`validate_mir_module_ctor_arities`], also asserted at compile time)
+/// and returns exactly the text of `emit_mir_lean_module`.
+pub fn try_emit_mir_lean_module(
+    lean_module_namespace: &str,
+    mir: &IrCapturedMir,
+) -> Result<String, LcnfLayoutError> {
+    validate_mir_module_ctor_arities(MIR_MODULE_CTOR_ARITIES)?;
+    Ok(emit_mir_lean_module(lean_module_namespace, mir))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2044,5 +3453,1816 @@ mod tests {
         assert!(code.contains("traitImpls := (List.cons { traitRef := { defPath := \"demo::MyTrait::method\", args := (List.cons (RigidTy.adt \"demo::Wrapper\" (List.cons (RigidTy.param 0 \"T\") List.nil)) List.nil) }, implPath := \"demo::<Wrapper<T> as MyTrait>::method\" } List.nil)"));
         assert!(code.contains("(RigidTy.alias \"demo::MyTrait::Assoc\" (List.cons (RigidTy.param 0 \"T\") List.nil))"));
         assert!(code.contains("fieldLayouts := (List.cons 0 (List.cons 0 List.nil))"));
+    }
+}
+
+#[cfg(test)]
+mod lcnf_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs::File;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use LcnfFieldKind::{Irrelevant, ObjectRef};
+
+    const BOOL: LcnfFieldKind = LcnfFieldKind::Scalar { bytes: 1 };
+    const U64: LcnfFieldKind = LcnfFieldKind::Scalar { bytes: 8 };
+
+    fn uniform(
+        count: usize,
+        prefix: &str,
+        lean_ty: &str,
+        kind: LcnfFieldKind,
+    ) -> Vec<LcnfFieldSpec> {
+        (0..count)
+            .map(|index| LcnfFieldSpec::new(format!("{prefix}{index}"), lean_ty, kind))
+            .collect()
+    }
+
+    fn u64s(count: usize) -> Vec<LcnfFieldSpec> {
+        uniform(count, "f", "UInt64", U64)
+    }
+
+    fn nats(count: usize) -> Vec<LcnfFieldSpec> {
+        uniform(count, "f", "Nat", ObjectRef)
+    }
+
+    fn part_scalar_bytes(parts: &[Vec<LcnfFieldSpec>]) -> Vec<usize> {
+        parts
+            .iter()
+            .map(|part| LcnfCtorFootprint::of_fields(part).scalar_bytes)
+            .collect()
+    }
+
+    fn part_obj_fields(parts: &[Vec<LcnfFieldSpec>]) -> Vec<usize> {
+        parts
+            .iter()
+            .map(|part| LcnfCtorFootprint::of_fields(part).obj_fields)
+            .collect()
+    }
+
+    fn default_plan(fields: &[LcnfFieldSpec]) -> LcnfCtorLayoutPlan {
+        plan_lcnf_ctor_layout_levels(fields, MAX_LCNF_CTOR_SCALAR_BYTES, MAX_LCNF_CTOR_OBJ_FIELDS)
+            .expect("default LCNF plan")
+    }
+
+    fn level_scalar_bytes(plan: &LcnfCtorLayoutPlan, level: usize) -> Vec<usize> {
+        plan.levels()[level]
+            .iter()
+            .map(|ctor| ctor.footprint.scalar_bytes)
+            .collect()
+    }
+
+    fn level_obj_fields(plan: &LcnfCtorLayoutPlan, level: usize) -> Vec<usize> {
+        plan.levels()[level]
+            .iter()
+            .map(|ctor| ctor.footprint.obj_fields)
+            .collect()
+    }
+
+    /// Follows `path` from the root of `plan` and returns the original field index it reaches.
+    fn resolve_projection(plan: &LcnfCtorLayoutPlan, path: &[String]) -> Option<usize> {
+        let (field_name, wrapper_fields) = path.split_last()?;
+        let mut level = plan.levels().len() - 1;
+        let mut index = 0;
+        for name in wrapper_fields {
+            if level == 0 {
+                return None;
+            }
+            let ctor = &plan.levels()[level][index];
+            index = ctor
+                .children
+                .clone()
+                .find(|&child| lcnf_child_field_name(level - 1, child) == *name)?;
+            level -= 1;
+        }
+        if level != 0 {
+            return None;
+        }
+        plan.levels()[0][index]
+            .children
+            .clone()
+            .find(|&field| plan.fields()[field].name == *field_name)
+    }
+
+    /// Checks that `plan` loses, duplicates, and reorders nothing, and that every field's
+    /// projection path reads exactly that field.
+    fn assert_lossless(plan: &LcnfCtorLayoutPlan) {
+        plan.validate().expect("valid plan");
+        assert_eq!(plan.parts().concat(), plan.fields());
+        for level in 1..plan.levels().len() {
+            let covered: Vec<usize> = plan.levels()[level]
+                .iter()
+                .flat_map(|ctor| ctor.children.clone())
+                .collect();
+            let below: Vec<usize> = (0..plan.levels()[level - 1].len()).collect();
+            assert_eq!(
+                covered, below,
+                "level {level} does not wrap the level below losslessly"
+            );
+        }
+        assert_eq!(plan.ctor_counts_per_level().last(), Some(&1));
+        for (index, field) in plan.fields().iter().enumerate() {
+            let path = plan.field_projection_path(index).expect("projection path");
+            assert_eq!(path.len(), plan.levels().len());
+            assert_eq!(path.last(), Some(&field.name));
+            assert_eq!(
+                resolve_projection(plan, &path),
+                Some(index),
+                "path {path:?}"
+            );
+            assert_eq!(plan.field_projection_path_by_name(&field.name), Some(path));
+        }
+        assert_eq!(plan.field_projection_path(plan.fields().len()), None);
+    }
+
+    #[test]
+    fn lcnf_field_kind_accounting() {
+        assert_eq!(
+            (U64.scalar_bytes(), U64.obj_fields(), U64.is_relevant()),
+            (8, 0, true)
+        );
+        assert_eq!(
+            (
+                ObjectRef.scalar_bytes(),
+                ObjectRef.obj_fields(),
+                ObjectRef.is_relevant()
+            ),
+            (0, 1, true)
+        );
+        assert_eq!(
+            (
+                Irrelevant.scalar_bytes(),
+                Irrelevant.obj_fields(),
+                Irrelevant.is_relevant()
+            ),
+            (0, 0, false)
+        );
+        for bytes in [1, 2, 4, 8] {
+            assert!(LcnfFieldKind::Scalar { bytes }.is_valid());
+        }
+        for bytes in [0, 3, 16] {
+            assert!(!LcnfFieldKind::Scalar { bytes }.is_valid());
+        }
+        assert_eq!(
+            LcnfCtorFootprint::of_kinds([U64, ObjectRef, Irrelevant, BOOL]),
+            LcnfCtorFootprint {
+                scalar_bytes: 9,
+                obj_fields: 1,
+                declared_fields: 4
+            }
+        );
+        assert_eq!(IrCtorLimit::Fields.lean_diagnostic(), "has too many fields");
+        assert_eq!(
+            IrCtorLimit::Scalar.lean_diagnostic(),
+            "has too many scalar fields"
+        );
+    }
+
+    /// Every type [`LcnfFieldKind::of_builtin_lean_ty`] classifies; each one is probed against
+    /// Lean by [`lcnf_live_lean_builtin_kinds_match_model`].
+    const BUILTIN_LEAN_TYPES: &[&str] = &[
+        "Bool", "UInt8", "Int8", "UInt16", "Int16", "UInt32", "Int32", "Char", "Float32", "UInt64",
+        "Int64", "USize", "ISize", "Float", "Nat", "Int", "String", "Unit", "True", "Prop", "Type",
+    ];
+
+    #[test]
+    fn builtin_lean_types_have_their_lean_kinds() {
+        let scalar = |bytes| Some(LcnfFieldKind::Scalar { bytes });
+        let expected = [
+            ("Bool", scalar(1)),
+            ("UInt8", scalar(1)),
+            ("Int8", scalar(1)),
+            ("UInt16", scalar(2)),
+            ("Int16", scalar(2)),
+            ("UInt32", scalar(4)),
+            ("Int32", scalar(4)),
+            ("Char", scalar(4)),
+            ("Float32", scalar(4)),
+            ("UInt64", scalar(8)),
+            ("Int64", scalar(8)),
+            ("USize", scalar(8)),
+            ("ISize", scalar(8)),
+            ("Float", scalar(8)),
+            ("Nat", Some(ObjectRef)),
+            ("Int", Some(ObjectRef)),
+            ("String", Some(ObjectRef)),
+            ("Unit", Some(ObjectRef)),
+            ("True", Some(Irrelevant)),
+            ("Prop", Some(Irrelevant)),
+            ("Type", Some(Irrelevant)),
+            (" UInt64 ", scalar(8)),
+            ("List Nat", None),
+            ("Fin 3", None),
+            ("UInt128", None),
+            ("Point", None),
+        ];
+        for (lean_ty, kind) in expected {
+            assert_eq!(
+                LcnfFieldKind::of_builtin_lean_ty(lean_ty),
+                kind,
+                "`{lean_ty}`"
+            );
+        }
+        assert!(
+            BUILTIN_LEAN_TYPES
+                .iter()
+                .all(|ty| LcnfFieldKind::of_builtin_lean_ty(ty).is_some())
+        );
+        assert_eq!(
+            LcnfFieldSpec::builtin("c", "Char").map(|f| f.kind),
+            Ok(LcnfFieldKind::Scalar { bytes: 4 })
+        );
+        assert!(matches!(
+            LcnfFieldSpec::builtin("x", "Fin 3"),
+            Err(LcnfLayoutError::UnknownBuiltinLeanType { .. })
+        ));
+    }
+
+    #[test]
+    fn ctor_repr_models_trivial_structure_unboxing() {
+        assert_eq!(
+            CtorReprKind::of_kinds(&[U64]),
+            CtorReprKind::UnboxedScalar { bytes: 8 }
+        );
+        assert_eq!(
+            CtorReprKind::of_kinds(&[Irrelevant, BOOL, Irrelevant]),
+            CtorReprKind::UnboxedScalar { bytes: 1 }
+        );
+        assert_eq!(
+            CtorReprKind::of_kinds(&[ObjectRef]),
+            CtorReprKind::BoxedObject
+        );
+        assert_eq!(
+            CtorReprKind::of_kinds(&[Irrelevant, ObjectRef]),
+            CtorReprKind::BoxedObject
+        );
+        assert_eq!(
+            CtorReprKind::of_kinds(&[BOOL, BOOL]),
+            CtorReprKind::BoxedObject
+        );
+        assert_eq!(
+            CtorReprKind::of_kinds(&[U64, Irrelevant, ObjectRef]),
+            CtorReprKind::BoxedObject
+        );
+        assert_eq!(
+            CtorReprKind::of_kinds(&[Irrelevant, Irrelevant]),
+            CtorReprKind::Erased
+        );
+        assert_eq!(CtorReprKind::of_kinds(&[]), CtorReprKind::Erased);
+        assert_eq!(
+            CtorReprKind::UnboxedScalar { bytes: 8 }.parent_field_kind(),
+            U64
+        );
+        assert_eq!(CtorReprKind::BoxedObject.parent_field_kind(), ObjectRef);
+        assert_eq!(CtorReprKind::Erased.parent_field_kind(), ObjectRef);
+        assert_eq!(
+            CtorReprKind::of_fields(&u64s(1)),
+            CtorReprKind::UnboxedScalar { bytes: 8 }
+        );
+    }
+
+    // The 11 boundary cases of `PROTOTYPE_REPORT.md` §4.3 (Lean `v4.34.1` verdicts reproduced by
+    // `lcnf_live_lean_probe_matches_model`).
+
+    #[test]
+    fn boundary_01_flat_130_uint64_1040b_rejected_scalar() {
+        let fields = u64s(130);
+        let footprint = LcnfCtorFootprint::of_fields(&fields);
+        assert_eq!((footprint.scalar_bytes, footprint.obj_fields), (1040, 0));
+        assert_eq!(ir_ctor_violation(&fields), Some(IrCtorLimit::Scalar));
+        assert!(matches!(
+            check_ir_ctor_accepted(&fields),
+            Err(LcnfLayoutError::IrCtorRejected {
+                limit: IrCtorLimit::Scalar,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn boundary_02_split_130_uint64_960b_parts_accepted() {
+        let fields = u64s(130);
+        let parts = chunk_lcnf_ctor_fields(&fields, 960, 240).unwrap();
+        assert_eq!(part_scalar_bytes(&parts), [960, 80]);
+        assert_eq!(part_obj_fields(&parts), [0, 0]);
+        assert!(parts.iter().all(|part| ir_ctor_violation(part).is_none()));
+        let wrapper = LcnfCtorFootprint::of_kinds(lcnf_wrapper_field_kinds(&parts));
+        assert_eq!((wrapper.scalar_bytes, wrapper.obj_fields), (0, 2));
+        assert!(wrapper.is_ir_accepted());
+        assert_eq!(parts.concat(), fields);
+        let plan = default_plan(&fields);
+        assert_eq!(plan.ctor_counts_per_level(), [2, 1]);
+        assert_eq!(level_scalar_bytes(&plan, 0), [960, 80]);
+        assert_eq!(
+            (level_scalar_bytes(&plan, 1), level_obj_fields(&plan, 1)),
+            (vec![0], vec![2])
+        );
+        assert_lossless(&plan);
+    }
+
+    #[test]
+    fn boundary_03_flat_128_uint64_1024b_accepted_by_ir_but_split_by_guard() {
+        let fields = u64s(128);
+        assert_eq!(LcnfCtorFootprint::of_fields(&fields).scalar_bytes, 1024);
+        assert_eq!(ir_ctor_violation(&fields), None);
+        assert_eq!(
+            check_ir_ctor_accepted(&fields).map(|f| f.scalar_bytes),
+            Ok(1024)
+        );
+        // The guard keeps a 64-byte margin: 1024 B is over its 960 B budget.
+        let plan = default_plan(&fields);
+        assert_eq!(level_scalar_bytes(&plan, 0), [960, 64]);
+    }
+
+    #[test]
+    fn boundary_04_flat_129_uint64_1032b_rejected_scalar() {
+        let fields = u64s(129);
+        assert_eq!(LcnfCtorFootprint::of_fields(&fields).scalar_bytes, 1032);
+        assert_eq!(ir_ctor_violation(&fields), Some(IrCtorLimit::Scalar));
+    }
+
+    #[test]
+    fn boundary_05_flat_256_nat_accepted() {
+        let fields = nats(256);
+        let footprint = LcnfCtorFootprint::of_fields(&fields);
+        assert_eq!((footprint.scalar_bytes, footprint.obj_fields), (0, 256));
+        assert_eq!(ir_ctor_violation(&fields), None);
+    }
+
+    #[test]
+    fn boundary_06_flat_257_nat_rejected_fields() {
+        assert_eq!(ir_ctor_violation(&nats(257)), Some(IrCtorLimit::Fields));
+    }
+
+    #[test]
+    fn boundary_07_flat_300_nat_rejected_fields_with_zero_scalar_bytes() {
+        let fields = nats(300);
+        assert_eq!(LcnfCtorFootprint::of_fields(&fields).scalar_bytes, 0);
+        assert_eq!(ir_ctor_violation(&fields), Some(IrCtorLimit::Fields));
+    }
+
+    #[test]
+    fn boundary_08_split_300_nat_240_objects_accepted() {
+        let fields = nats(300);
+        let parts = chunk_lcnf_ctor_fields(&fields, 960, 240).unwrap();
+        assert_eq!(part_obj_fields(&parts), [240, 60]);
+        assert_eq!(part_scalar_bytes(&parts), [0, 0]);
+        let wrapper = LcnfCtorFootprint::of_kinds(lcnf_wrapper_field_kinds(&parts));
+        assert_eq!((wrapper.scalar_bytes, wrapper.obj_fields), (0, 2));
+        let plan = default_plan(&fields);
+        assert_eq!(plan.ctor_counts_per_level(), [2, 1]);
+        assert_lossless(&plan);
+    }
+
+    #[test]
+    fn boundary_09_split_121_uint64_singleton_tail_is_unboxed_in_wrapper() {
+        let fields = u64s(121);
+        let parts = chunk_lcnf_ctor_fields(&fields, 960, 240).unwrap();
+        assert_eq!(part_scalar_bytes(&parts), [960, 8]);
+        assert_eq!(
+            CtorReprKind::of_fields(&parts[0]),
+            CtorReprKind::BoxedObject
+        );
+        assert_eq!(
+            CtorReprKind::of_fields(&parts[1]),
+            CtorReprKind::UnboxedScalar { bytes: 8 }
+        );
+        let wrapper = LcnfCtorFootprint::of_kinds(lcnf_wrapper_field_kinds(&parts));
+        assert_eq!((wrapper.scalar_bytes, wrapper.obj_fields), (8, 1));
+        assert!(wrapper.is_ir_accepted());
+        let plan = default_plan(&fields);
+        assert_eq!(plan.root().field_kinds, [ObjectRef, U64]);
+        assert_lossless(&plan);
+    }
+
+    #[test]
+    fn boundary_10_one_wrapper_over_300_single_uint64_parts_rejected_scalar() {
+        let parts = chunk_lcnf_ctor_fields(&u64s(300), 8, 240).unwrap();
+        assert_eq!(parts.len(), 300);
+        assert!(parts.iter().all(|part| ir_ctor_violation(part).is_none()));
+        let wrapper_kinds = lcnf_wrapper_field_kinds(&parts);
+        let wrapper = LcnfCtorFootprint::of_kinds(wrapper_kinds.iter().copied());
+        assert_eq!((wrapper.scalar_bytes, wrapper.obj_fields), (2400, 0));
+        // Lean reports the scalar limit; a one-pointer-per-part model would blame the fields.
+        assert_eq!(wrapper.ir_violation(), Some(IrCtorLimit::Scalar));
+        let pointer_only = LcnfCtorFootprint::of_kinds(wrapper_kinds.iter().map(|_| ObjectRef));
+        assert_eq!(pointer_only.ir_violation(), Some(IrCtorLimit::Fields));
+    }
+
+    #[test]
+    fn boundary_11_layout_300_single_uint64_parts_levels_300_3_1() {
+        let fields = u64s(300);
+        let plan = plan_lcnf_ctor_layout_levels(&fields, 8, 240).unwrap();
+        assert_eq!(plan.part_budget(), (8, 240));
+        assert_eq!(plan.ctor_counts_per_level(), [300, 3, 1]);
+        assert_eq!(level_scalar_bytes(&plan, 0), vec![8; 300]);
+        assert_eq!(level_scalar_bytes(&plan, 1), [960, 960, 480]);
+        assert_eq!(level_obj_fields(&plan, 1), [0, 0, 0]);
+        assert_eq!(
+            (level_scalar_bytes(&plan, 2), level_obj_fields(&plan, 2)),
+            (vec![0], vec![3])
+        );
+        assert!(
+            plan.levels()
+                .iter()
+                .flatten()
+                .all(|ctor| ctor.footprint.is_ir_accepted())
+        );
+        assert_lossless(&plan);
+    }
+
+    #[test]
+    fn erased_prop_fields_cost_no_scalar_bytes_and_no_objects() {
+        let mut fields = Vec::new();
+        for index in 0..130 {
+            fields.push(LcnfFieldSpec::new(format!("x{index}"), "UInt64", U64));
+            if index < 100 {
+                fields.push(LcnfFieldSpec::new(
+                    format!("h{index}"),
+                    "x0 = x0",
+                    Irrelevant,
+                ));
+            }
+        }
+        assert_eq!(
+            LcnfCtorFootprint::of_fields(&fields),
+            LcnfCtorFootprint {
+                scalar_bytes: 1040,
+                obj_fields: 0,
+                declared_fields: 230
+            }
+        );
+        let parts = chunk_lcnf_ctor_fields(&fields, 960, 240).unwrap();
+        assert_eq!(part_scalar_bytes(&parts), [960, 80]);
+        assert_eq!(part_obj_fields(&parts), [0, 0]);
+        assert_eq!(parts.concat(), fields);
+        // 256 boxed fields plus erased ones still pass the IR checker.
+        let mut boxed = nats(256);
+        boxed.extend(uniform(200, "h", "True", Irrelevant));
+        assert_eq!(ir_ctor_violation(&boxed), None);
+    }
+
+    #[test]
+    fn declared_field_budget_splits_wide_scalar_and_proof_runs() {
+        let bools = uniform(600, "b", "Bool", BOOL);
+        // 600 B and no object: the IR checker would accept it, but `structure` cannot
+        // elaborate 600 fields.
+        assert_eq!(ir_ctor_violation(&bools), None);
+        let parts = chunk_lcnf_ctor_fields(&bools, 960, 240).unwrap();
+        assert_eq!(
+            parts.iter().map(Vec::len).collect::<Vec<_>>(),
+            [240, 240, 120]
+        );
+        let plan = default_plan(&bools);
+        assert_eq!(plan.ctor_counts_per_level(), [3, 1]);
+        assert_eq!(
+            plan.root().footprint,
+            LcnfCtorFootprint {
+                scalar_bytes: 0,
+                obj_fields: 3,
+                declared_fields: 3
+            }
+        );
+        assert_lossless(&plan);
+
+        let mut proofs = nats(240);
+        proofs.extend(uniform(300, "h", "True", Irrelevant));
+        let plan = default_plan(&proofs);
+        let part_sizes: Vec<usize> = plan.levels()[0]
+            .iter()
+            .map(|ctor| ctor.children.len())
+            .collect();
+        assert_eq!(part_sizes, [240, 240, 60]);
+        let reprs: Vec<CtorReprKind> = plan.levels()[0].iter().map(|ctor| ctor.repr).collect();
+        assert_eq!(
+            reprs,
+            [
+                CtorReprKind::BoxedObject,
+                CtorReprKind::Erased,
+                CtorReprKind::Erased
+            ]
+        );
+        assert_eq!(plan.root().field_kinds, [ObjectRef; 3]);
+        assert_lossless(&plan);
+    }
+
+    fn mixed_fields(count: usize, seed: u64) -> Vec<LcnfFieldSpec> {
+        let kinds = [
+            ("Bool", BOOL),
+            ("UInt16", LcnfFieldKind::Scalar { bytes: 2 }),
+            ("UInt32", LcnfFieldKind::Scalar { bytes: 4 }),
+            ("UInt64", U64),
+            ("Nat", ObjectRef),
+            ("True", Irrelevant),
+        ];
+        let mut state = seed | 1;
+        (0..count)
+            .map(|index| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let (lean_ty, kind) = kinds[(state % kinds.len() as u64) as usize];
+                LcnfFieldSpec::new(format!("m{index}"), lean_ty, kind)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn multi_level_layout_ends_at_one_accepted_root_for_many_shapes() {
+        let sizes = [
+            0, 1, 2, 3, 119, 120, 121, 239, 240, 241, 255, 256, 257, 511, 1000, 4096,
+        ];
+        let budgets = [(960, 240), (8, 240), (8, 1), (1, 1), (16, 2), (1023, 255)];
+        for &count in &sizes {
+            let shapes = [
+                u64s(count),
+                nats(count),
+                uniform(count, "b", "Bool", BOOL),
+                uniform(count, "h", "True", Irrelevant),
+                mixed_fields(count, count as u64 + 7),
+            ];
+            for fields in &shapes {
+                for &(max_scalar_bytes, max_obj_fields) in &budgets {
+                    match plan_lcnf_ctor_layout_levels(fields, max_scalar_bytes, max_obj_fields) {
+                        Ok(plan) => {
+                            assert_lossless(&plan);
+                            for (level, ctors) in plan.levels().iter().enumerate() {
+                                let (scalar, objects) = if level == 0 {
+                                    (max_scalar_bytes, max_obj_fields)
+                                } else {
+                                    (MAX_LCNF_CTOR_SCALAR_BYTES, MAX_LCNF_CTOR_OBJ_FIELDS)
+                                };
+                                for ctor in ctors {
+                                    assert!(ctor.footprint.fits_budget(scalar, objects));
+                                    assert!(ctor.footprint.is_ir_accepted());
+                                }
+                                if level > 0 {
+                                    assert!(ctors.len() < plan.levels()[level - 1].len());
+                                }
+                            }
+                            if count > 0 {
+                                assert_eq!(
+                                    plan.root().children.len(),
+                                    plan.levels().iter().rev().nth(1).map_or(count, Vec::len)
+                                );
+                            }
+                        }
+                        Err(LcnfLayoutError::FieldExceedsBudget { scalar_bytes, .. }) => {
+                            assert!(scalar_bytes > max_scalar_bytes);
+                        }
+                        Err(error) => panic!("unexpected error for {count} fields: {error}"),
+                    }
+                }
+            }
+        }
+        let deep = plan_lcnf_ctor_layout_levels(&u64s(30_000), 8, 240).unwrap();
+        assert_eq!(deep.ctor_counts_per_level(), [30_000, 250, 2, 1]);
+        assert_lossless(&deep);
+    }
+
+    #[test]
+    fn guard_rejects_invalid_budgets_and_field_kinds() {
+        let fields = u64s(3);
+        for (scalar, objects) in [(0, 240), (960, 0), (0, 0)] {
+            assert!(matches!(
+                chunk_lcnf_ctor_fields(&fields, scalar, objects),
+                Err(LcnfLayoutError::ZeroBudget { .. })
+            ));
+        }
+        for (scalar, objects) in [(1024, 240), (960, 256), (4096, 1000)] {
+            assert!(matches!(
+                plan_lcnf_ctor_layout_levels(&fields, scalar, objects),
+                Err(LcnfLayoutError::BudgetAtLeanLimit { .. })
+            ));
+        }
+        assert!(plan_lcnf_ctor_layout_levels(&fields, 1023, 255).is_ok());
+        for bytes in [0, 3, 16] {
+            let bad = [LcnfFieldSpec::new(
+                "w",
+                "UInt128",
+                LcnfFieldKind::Scalar { bytes },
+            )];
+            assert_eq!(
+                chunk_lcnf_ctor_fields(&bad, 960, 240),
+                Err(LcnfLayoutError::InvalidScalarWidth {
+                    field: String::from("w"),
+                    bytes
+                })
+            );
+            assert!(matches!(
+                check_ir_ctor_accepted(&bad),
+                Err(LcnfLayoutError::InvalidScalarWidth { .. })
+            ));
+        }
+        assert_eq!(
+            chunk_lcnf_ctor_fields(&u64s(1), 4, 240),
+            Err(LcnfLayoutError::FieldExceedsBudget {
+                field: String::from("f0"),
+                scalar_bytes: 8,
+                max_scalar_bytes: 4
+            })
+        );
+        assert_eq!(chunk_lcnf_ctor_fields(&[], 960, 240), Ok(vec![]));
+    }
+
+    #[test]
+    fn guard_rejects_invalid_lean_names_and_types() {
+        for name in [
+            "", "1x", "_", "end", "where", "a.b", "x y", "\u{3b1}", "f-1",
+        ] {
+            let fields = [LcnfFieldSpec::new(name, "Nat", ObjectRef)];
+            assert!(
+                matches!(
+                    plan_lcnf_ctor_layout_levels(&fields, 960, 240),
+                    Err(LcnfLayoutError::InvalidLeanName { what: "field", .. })
+                ),
+                "field name `{name}`"
+            );
+        }
+        let duplicate = [
+            LcnfFieldSpec::new("x", "Nat", ObjectRef),
+            LcnfFieldSpec::new("x", "Bool", BOOL),
+        ];
+        assert_eq!(
+            plan_lcnf_ctor_layout_levels(&duplicate, 960, 240),
+            Err(LcnfLayoutError::DuplicateFieldName {
+                name: String::from("x")
+            })
+        );
+        for lean_ty in [
+            "",
+            "  ",
+            "Nat -- note",
+            "Nat /- c -/",
+            "Nat\nNat",
+            "Nat := 0",
+        ] {
+            let fields = [LcnfFieldSpec::new("x", lean_ty, ObjectRef)];
+            assert!(
+                matches!(
+                    plan_lcnf_ctor_layout_levels(&fields, 960, 240),
+                    Err(LcnfLayoutError::InvalidLeanType { .. })
+                ),
+                "type `{lean_ty:?}`"
+            );
+        }
+        let small = u64s(2);
+        for struct_name in ["", "Foo..Bar", "9Foo", "Foo.end", "Foo Bar", ".Foo", "Foo."] {
+            assert!(
+                matches!(
+                    emit_lcnf_guarded_structure(struct_name, &small, &[]),
+                    Err(LcnfLayoutError::InvalidLeanName {
+                        what: "structure",
+                        ..
+                    })
+                ),
+                "structure name `{struct_name}`"
+            );
+        }
+        assert!(emit_lcnf_guarded_structure("Foo.Bar_2'", &small, &["Lean.ToJson"]).is_ok());
+        assert!(matches!(
+            emit_lcnf_guarded_structure("Foo", &small, &["Repr BEq"]),
+            Err(LcnfLayoutError::InvalidLeanName {
+                what: "deriving",
+                ..
+            })
+        ));
+        assert!(matches!(
+            emit_lcnf_guarded_structure("Foo", &small, &[""]),
+            Err(LcnfLayoutError::InvalidLeanName {
+                what: "deriving",
+                ..
+            })
+        ));
+        assert_eq!(
+            emit_lcnf_guarded_structure("Foo", &small, &["Repr", "Repr"]),
+            Err(LcnfLayoutError::DuplicateDerive {
+                name: String::from("Repr")
+            })
+        );
+    }
+
+    #[test]
+    fn split_layout_rejects_collisions_and_dependent_types() {
+        let flat = vec![
+            LcnfFieldSpec::new("part1", "Nat", ObjectRef),
+            LcnfFieldSpec::new("n", "Nat", ObjectRef),
+            LcnfFieldSpec::new("v", "Fin n", ObjectRef),
+            LcnfFieldSpec::new("mk", "Nat", ObjectRef),
+        ];
+        // A flat structure keeps Lean's own scoping, so these fields are accepted there.
+        assert!(emit_lcnf_guarded_structure("Small", &flat, &[]).is_ok());
+
+        let wide = |extra: &[LcnfFieldSpec]| -> Vec<LcnfFieldSpec> {
+            let mut fields = extra.to_vec();
+            fields.extend(u64s(130));
+            fields
+        };
+        for reserved in ["part1", "part2", "Part1", "Part2", "mk", "casesOn"] {
+            let fields = wide(&[LcnfFieldSpec::new(reserved, "Nat", ObjectRef)]);
+            assert_eq!(
+                emit_lcnf_guarded_structure("Wide", &fields, &[]),
+                Err(LcnfLayoutError::ReservedFieldName {
+                    name: reserved.to_owned()
+                })
+            );
+        }
+        let dependent = wide(&flat[1..3]);
+        assert_eq!(
+            emit_lcnf_guarded_structure("Wide", &dependent, &[]),
+            Err(LcnfLayoutError::DependentFieldType {
+                field: String::from("v"),
+                depends_on: String::from("n")
+            })
+        );
+        let uses_self = wide(&[LcnfFieldSpec::new("w", "List self", ObjectRef)]);
+        assert!(matches!(
+            emit_lcnf_guarded_structure("Wide", &uses_self, &[]),
+            Err(LcnfLayoutError::DependentFieldType { .. })
+        ));
+        let recursive = wide(&[LcnfFieldSpec::new("next", "Option Node", ObjectRef)]);
+        assert_eq!(
+            emit_lcnf_guarded_structure("Demo.Node", &recursive, &[]),
+            Err(LcnfLayoutError::DependentFieldType {
+                field: String::from("next"),
+                depends_on: String::from("Node")
+            })
+        );
+        let fine = wide(&[
+            LcnfFieldSpec::new("part", "Nat", ObjectRef),
+            LcnfFieldSpec::new("v", "Fin 3", ObjectRef),
+        ]);
+        assert!(emit_lcnf_guarded_structure("Wide", &fine, &[]).is_ok());
+    }
+
+    #[test]
+    fn flat_structure_is_emitted_unchanged() {
+        let fields = [
+            LcnfFieldSpec::builtin("x", "UInt64").unwrap(),
+            LcnfFieldSpec::builtin("y", "Nat").unwrap(),
+            LcnfFieldSpec::builtin("ok", "Bool").unwrap(),
+            LcnfFieldSpec::new("h", "x = x", Irrelevant),
+        ];
+        let plan = default_plan(&fields);
+        assert!(plan.is_flat());
+        assert_eq!(plan.field_projection_path(1), Some(vec![String::from("y")]));
+        assert_eq!(
+            emit_lcnf_guarded_structure("Demo.Point", &fields, &["Repr", "BEq"]).unwrap(),
+            "structure Demo.Point where\n  x : UInt64\n  y : Nat\n  ok : Bool\n  h : x = x\n  deriving Repr, BEq\n"
+        );
+        assert_eq!(
+            emit_lcnf_guarded_structure("Demo.Point", &fields, &[]).unwrap(),
+            "structure Demo.Point where\n  x : UInt64\n  y : Nat\n  ok : Bool\n  h : x = x\n"
+        );
+        let empty = default_plan(&[]);
+        assert!(empty.is_flat());
+        assert_eq!(empty.ctor_counts_per_level(), [1]);
+        assert_eq!(
+            emit_lcnf_guarded_structure("Empty", &[], &["Inhabited"]).unwrap(),
+            "structure Empty where\n  deriving Inhabited\n"
+        );
+        // 120 x UInt64 = 960 B fits the budget exactly and stays flat.
+        assert!(default_plan(&u64s(120)).is_flat());
+        assert!(default_plan(&nats(240)).is_flat());
+        assert!(!default_plan(&nats(241)).is_flat());
+    }
+
+    #[test]
+    fn split_structure_emits_parts_root_and_accessors() {
+        let out = emit_lcnf_guarded_structure("Wide", &u64s(130), &["Inhabited"]).unwrap();
+        let mut expected = String::from("structure Wide.Part1 where\n");
+        for index in 0..120 {
+            expected.push_str(&format!("  f{index} : UInt64\n"));
+        }
+        expected.push_str("  deriving Inhabited\n\nstructure Wide.Part2 where\n");
+        for index in 120..130 {
+            expected.push_str(&format!("  f{index} : UInt64\n"));
+        }
+        expected.push_str(
+            "  deriving Inhabited\n\nstructure Wide where\n  part1 : Wide.Part1\n  part2 : Wide.Part2\n  deriving Inhabited\n\n",
+        );
+        for index in 0..130 {
+            let part = if index < 120 { 1 } else { 2 };
+            expected.push_str(&format!(
+                "abbrev Wide.f{index} (self : Wide) : UInt64 := self.part{part}.f{index}\n"
+            ));
+        }
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn multi_level_structure_names_and_projection_paths() {
+        let plan = plan_lcnf_ctor_layout_levels(&u64s(300), 8, 240).unwrap();
+        assert_eq!(plan.ctor_lean_name("Deep", 0, 0), "Deep.Part1");
+        assert_eq!(plan.ctor_lean_name("Deep", 1, 2), "Deep.Level1_Part3");
+        assert_eq!(plan.ctor_lean_name("Deep", 2, 0), "Deep");
+        assert_eq!(
+            plan.field_projection_path(299),
+            Some(vec![
+                String::from("level1_part3"),
+                String::from("part300"),
+                String::from("f299")
+            ])
+        );
+        let out = render_lcnf_guarded_structure("Deep", &plan, &[]).unwrap();
+        assert!(out.starts_with(
+            "structure Deep.Part1 where\n  f0 : UInt64\n\nstructure Deep.Part2 where\n  f1 : UInt64\n"
+        ));
+        assert!(out.contains(
+            "\nstructure Deep.Level1_Part1 where\n  part1 : Deep.Part1\n  part2 : Deep.Part2\n"
+        ));
+        assert!(out.contains("  part120 : Deep.Part120\n\nstructure Deep.Level1_Part2 where\n  part121 : Deep.Part121\n"));
+        assert!(out.contains(
+            "\nstructure Deep where\n  level1_part1 : Deep.Level1_Part1\n  level1_part2 : Deep.Level1_Part2\n  level1_part3 : Deep.Level1_Part3\n\n"
+        ));
+        assert!(
+            out.contains("abbrev Deep.f0 (self : Deep) : UInt64 := self.level1_part1.part1.f0\n")
+        );
+        assert!(out.ends_with(
+            "abbrev Deep.f299 (self : Deep) : UInt64 := self.level1_part3.part300.f299\n"
+        ));
+        assert_eq!(out.matches("structure ").count(), 304);
+        assert_eq!(out.matches("abbrev ").count(), 300);
+    }
+
+    fn owned_exprs(fields: &[LcnfFieldSpec]) -> Vec<(String, String)> {
+        fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| (field.name.clone(), index.to_string()))
+            .collect()
+    }
+
+    fn borrowed(exprs: &[(String, String)]) -> Vec<(&str, &str)> {
+        exprs
+            .iter()
+            .map(|(name, expr)| (name.as_str(), expr.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn ctor_expr_builds_every_level() {
+        let point = [
+            LcnfFieldSpec::builtin("x", "UInt64").unwrap(),
+            LcnfFieldSpec::builtin("y", "Nat").unwrap(),
+        ];
+        let plan = default_plan(&point);
+        assert_eq!(
+            render_lcnf_guarded_ctor_expr("P", &[("y", "2"), ("x", " 1 ")], &plan),
+            Ok(String::from("({ x := (1), y := (2) } : P)"))
+        );
+        assert_eq!(
+            render_lcnf_guarded_ctor_expr("E", &[], &default_plan(&[])),
+            Ok(String::from("({ } : E)"))
+        );
+
+        let fields = u64s(121);
+        let plan = default_plan(&fields);
+        let exprs = owned_exprs(&fields);
+        let refs = borrowed(&exprs);
+        let expr = render_lcnf_guarded_ctor_expr("T", &refs, &plan).unwrap();
+        assert!(expr.starts_with("({ part1 := ({ f0 := (0), f1 := (1), "));
+        assert!(expr.ends_with(
+            "f119 := (119) } : T.Part1), part2 := ({ f120 := (120) } : T.Part2) } : T)"
+        ));
+
+        let deep = plan_lcnf_ctor_layout_levels(&u64s(300), 8, 240).unwrap();
+        let deep_exprs = owned_exprs(deep.fields());
+        let deep_expr = render_lcnf_guarded_ctor_expr("D", &borrowed(&deep_exprs), &deep).unwrap();
+        assert!(deep_expr.starts_with(
+            "({ level1_part1 := ({ part1 := ({ f0 := (0) } : D.Part1), part2 := ({ f1 := (1) } : D.Part2), "
+        ));
+        assert!(
+            deep_expr
+                .ends_with("part300 := ({ f299 := (299) } : D.Part300) } : D.Level1_Part3) } : D)")
+        );
+
+        assert_eq!(
+            render_lcnf_guarded_ctor_expr("T", &refs[1..], &plan),
+            Err(LcnfLayoutError::MissingFieldExpr {
+                field: String::from("f0")
+            })
+        );
+        let mut unknown = refs.clone();
+        unknown.push(("nope", "0"));
+        assert_eq!(
+            render_lcnf_guarded_ctor_expr("T", &unknown, &plan),
+            Err(LcnfLayoutError::UnknownFieldExpr {
+                field: String::from("nope")
+            })
+        );
+        let mut duplicate = refs.clone();
+        duplicate.push(("f3", "3"));
+        assert_eq!(
+            render_lcnf_guarded_ctor_expr("T", &duplicate, &plan),
+            Err(LcnfLayoutError::DuplicateFieldExpr {
+                field: String::from("f3")
+            })
+        );
+        for bad in ["", "  ", "1\n"] {
+            let mut invalid = refs.clone();
+            invalid[0] = ("f0", bad);
+            assert_eq!(
+                render_lcnf_guarded_ctor_expr("T", &invalid, &plan),
+                Err(LcnfLayoutError::InvalidFieldExpr {
+                    field: String::from("f0")
+                })
+            );
+        }
+        assert!(matches!(
+            render_lcnf_guarded_ctor_expr("T.", &refs, &plan),
+            Err(LcnfLayoutError::InvalidLeanName { .. })
+        ));
+    }
+
+    #[test]
+    fn check_ir_ctor_accepted_reports_the_first_checker_limit() {
+        assert_eq!(
+            check_ir_ctor_accepted(&u64s(128)),
+            Ok(LcnfCtorFootprint {
+                scalar_bytes: 1024,
+                obj_fields: 0,
+                declared_fields: 128
+            })
+        );
+        assert_eq!(
+            check_ir_ctor_accepted(&nats(256)).map(|f| f.obj_fields),
+            Ok(256)
+        );
+        let mut both = nats(257);
+        both.extend(uniform(129, "x", "UInt64", U64));
+        assert_eq!(ir_ctor_violation(&both), Some(IrCtorLimit::Fields));
+        let error = check_ir_ctor_accepted(&both).unwrap_err();
+        assert!(error.to_string().contains("has too many fields"), "{error}");
+    }
+
+    fn demo_answer_mir() -> IrCapturedMir {
+        let u32_layout = IrTypeLayout {
+            size: IrSize { bytes: 4 },
+            align: IrAlign { bytes: 4 },
+            backend_repr: IrBackendRepr::Scalar(IrScalarLayout::Initialized {
+                value: IrPrimitiveKind::Int {
+                    bits: 32,
+                    signed: false,
+                },
+                valid_range: IrWrappingRange {
+                    start: 0,
+                    end_: u32::MAX as u128,
+                },
+            }),
+            fields: IrFieldsShape::Primitive,
+            variants: IrVariantsShape::Single { index: 0 },
+            is_uninhabited: false,
+            field_layouts: vec![],
+        };
+        let u32_ty = IrTy {
+            kind: IrRigidTy::Uint(IrUintTy::U32),
+            layout_idx: 0,
+        };
+        IrCapturedMir {
+            def_path: String::from("demo::answer"),
+            phase: IrMirPhaseTag::RuntimeOptimized,
+            role: IrContractRole::Subject,
+            type_param_count: 0,
+            generic_params: vec![],
+            trait_impls: vec![],
+            arg_count: 0,
+            local_decls: vec![IrLocalDecl {
+                mutability: IrMutability::Mut,
+                ty: u32_ty.clone(),
+                debug_name: None,
+            }],
+            basic_blocks: vec![IrBasicBlockData {
+                statements: vec![IrStatement {
+                    kind: IrStatementKind::Assign(
+                        IrPlace {
+                            local_: 0,
+                            projection: vec![],
+                        },
+                        IrRvalue::Use(IrOperand::Constant(IrConstOperand {
+                            ty: u32_ty,
+                            val: IrConstValue::Scalar(IrConstScalar::Int(IrScalarInt {
+                                bits: 42,
+                                size_bytes: 4,
+                            })),
+                        })),
+                    ),
+                    span: String::from("src/lib.rs:1:21: 1:23"),
+                    comment: Some(String::from("_0 = const 42_u32")),
+                }],
+                terminator: IrTerminator {
+                    kind: IrTerminatorKind::Return,
+                    span: String::from("src/lib.rs:1:25: 1:25"),
+                    comment: Some(String::from("return")),
+                },
+                is_cleanup: false,
+            }],
+            fn_abi: IrFnAbi {
+                args: vec![],
+                ret: IrArgAbi {
+                    layout: u32_layout.clone(),
+                    mode: IrAbiPassMode::Direct,
+                },
+                conv: IrCallConv::Rust,
+                can_unwind: true,
+            },
+            layouts: IrLayoutTable {
+                pointer_bits: 64,
+                is_little_endian: true,
+                entries: vec![u32_layout],
+            },
+            allocations: vec![],
+        }
+    }
+
+    #[test]
+    fn mir_module_ctor_arities_fit_the_lcnf_budget() {
+        assert!(mir_module_ctor_arities_fit(MIR_MODULE_CTOR_ARITIES));
+        assert_eq!(
+            validate_mir_module_ctor_arities(MIR_MODULE_CTOR_ARITIES),
+            Ok(LcnfCtorFootprint {
+                scalar_bytes: 96,
+                obj_fields: 12,
+                declared_fields: 12
+            })
+        );
+        let objects = [MirModuleCtorArity {
+            lean_name: "Synthetic.objects",
+            fields: 241,
+        }];
+        assert!(!mir_module_ctor_arities_fit(&objects));
+        assert_eq!(
+            validate_mir_module_ctor_arities(&objects),
+            Err(LcnfLayoutError::MirCtorOverBudget {
+                lean_name: "Synthetic.objects",
+                fields: 241
+            })
+        );
+        // 121 worst-case fields need 968 scalar bytes.
+        let scalars = [MirModuleCtorArity {
+            lean_name: "Synthetic.scalars",
+            fields: 121,
+        }];
+        assert!(!mir_module_ctor_arities_fit(&scalars));
+        assert!(validate_mir_module_ctor_arities(&scalars).is_err());
+        let largest = [MirModuleCtorArity {
+            lean_name: "Synthetic.largest",
+            fields: 120,
+        }];
+        assert!(mir_module_ctor_arities_fit(&largest));
+        assert!(validate_mir_module_ctor_arities(&largest).is_ok());
+    }
+
+    #[test]
+    fn try_emit_mir_lean_module_is_byte_identical() {
+        let mir = demo_answer_mir();
+        let emitted = emit_mir_lean_module("Mir.Demo.answer", &mir);
+        assert_eq!(
+            try_emit_mir_lean_module("Mir.Demo.answer", &mir),
+            Ok(emitted.clone())
+        );
+        // SHA-256 of the module emitted by the pre-guard emitter (base `9110fbec`).
+        assert_eq!(
+            crate::manifest::sha256_hex(emitted.as_bytes()),
+            "41f365d3e8274ca6da09dc4f0daecdc72fd0ecee8b06c7d5d761a4deace348e9"
+        );
+    }
+
+    #[test]
+    fn rendered_mir_module_ctors_are_in_the_arity_table() {
+        let known: BTreeSet<&str> = MIR_MODULE_CTOR_ARITIES
+            .iter()
+            .map(|arity| match arity.lean_name.split_once('.') {
+                Some(("Layout" | "MirAst", rest)) => rest,
+                _ => arity.lean_name,
+            })
+            .collect();
+        let module = emit_mir_lean_module("Mir.Demo.answer", &demo_answer_mir());
+        let applied: BTreeSet<&str> = module
+            .match_indices('(')
+            .filter_map(|(offset, _)| {
+                let rest = &module[offset + 1..];
+                let head_len = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                    .unwrap_or(rest.len());
+                let head = &rest[..head_len];
+                (head.contains('.') && rest[head_len..].starts_with(' ')).then_some(head)
+            })
+            .collect();
+        assert!(applied.contains("RigidTy.uint") && applied.contains("List.cons"));
+        // `UInt8.ofNat` is a function, not a constructor.
+        let unknown: Vec<&str> = applied
+            .into_iter()
+            .filter(|head| !known.contains(head) && *head != "UInt8.ofNat")
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "constructors missing from the table: {unknown:?}"
+        );
+    }
+
+    /// Removes Lean comments, keeping string literals and line structure.
+    fn strip_lean_comments(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut index = 0;
+        let mut depth = 0usize;
+        while index < chars.len() {
+            let current = chars[index];
+            let next = chars.get(index + 1).copied();
+            if depth == 0 && current == '"' {
+                out.push(current);
+                index += 1;
+                while index < chars.len() && chars[index] != '"' {
+                    if chars[index] == '\\' && index + 1 < chars.len() {
+                        out.push(chars[index]);
+                        index += 1;
+                    }
+                    out.push(chars[index]);
+                    index += 1;
+                }
+                if index < chars.len() {
+                    out.push('"');
+                    index += 1;
+                }
+            } else if current == '/' && next == Some('-') {
+                depth += 1;
+                index += 2;
+            } else if depth > 0 && current == '-' && next == Some('/') {
+                depth -= 1;
+                index += 2;
+            } else if depth > 0 {
+                if current == '\n' {
+                    out.push('\n');
+                }
+                index += 1;
+            } else if current == '-' && next == Some('-') {
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+            } else {
+                out.push(current);
+                index += 1;
+            }
+        }
+        out
+    }
+
+    /// Number of binder names in the explicit, implicit, and instance binder groups of one
+    /// inductive constructor entry (the text after `|`), plus arrows of an arrow-style type.
+    fn lean_ctor_entry_arity(entry: &str) -> (String, usize) {
+        let entry = entry.trim_start();
+        let name: String = entry
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '\'')
+            .collect();
+        let rest = &entry[name.len()..];
+        let mut arity = 0;
+        let mut depth = 0usize;
+        let mut group = String::new();
+        let mut result_type = None;
+        for (offset, c) in rest.char_indices() {
+            match c {
+                '(' | '{' | '[' | '\u{2983}' => {
+                    if depth > 0 {
+                        group.push(c);
+                    }
+                    depth += 1;
+                }
+                ')' | '}' | ']' | '\u{2984}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let names = group.split(':').next().unwrap_or("");
+                        arity += names.split_whitespace().count();
+                        group.clear();
+                    } else {
+                        group.push(c);
+                    }
+                }
+                ':' if depth == 0 => {
+                    result_type = Some(&rest[offset + 1..]);
+                    break;
+                }
+                _ if depth > 0 => group.push(c),
+                _ => {}
+            }
+        }
+        if let Some(result_type) = result_type {
+            let mut nesting = 0i32;
+            for c in result_type.chars() {
+                match c {
+                    '(' | '{' | '[' => nesting += 1,
+                    ')' | '}' | ']' => nesting -= 1,
+                    '\u{2192}' if nesting == 0 => arity += 1,
+                    _ => {}
+                }
+            }
+        }
+        (name, arity)
+    }
+
+    /// `(name, explicit field count, is_structure)` of every structure and inductive
+    /// constructor declared at the top level of a Lean source file.
+    fn lean_decl_arities(text: &str) -> Vec<(String, usize, bool)> {
+        let stripped = strip_lean_comments(text);
+        let lines: Vec<&str> = stripped.lines().collect();
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            index += 1;
+            let (is_structure, rest) = if let Some(rest) = line.strip_prefix("structure ") {
+                (true, rest)
+            } else if let Some(rest) = line.strip_prefix("inductive ") {
+                (false, rest)
+            } else {
+                continue;
+            };
+            let type_name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '\'' || *c == '.')
+                .collect();
+            let body_start = index;
+            while index < lines.len()
+                && (lines[index].is_empty() || lines[index].starts_with([' ', '\t']))
+            {
+                index += 1;
+            }
+            let body = &lines[body_start..index];
+            if is_structure {
+                let fields = body
+                    .iter()
+                    .filter(|line| {
+                        let Some(field) = line.strip_prefix("  ") else {
+                            return false;
+                        };
+                        let name_len = field
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '\'')
+                            .count();
+                        name_len > 0
+                            && !field.starts_with(|c: char| c.is_ascii_digit())
+                            && field[name_len..].starts_with(" :")
+                    })
+                    .count();
+                out.push((type_name, fields, true));
+            } else {
+                let mut entries: Vec<String> = Vec::new();
+                for line in body {
+                    if let Some(entry) = line.trim_start().strip_prefix('|') {
+                        entries.push(entry.to_owned());
+                    } else if let Some(last) = entries.last_mut() {
+                        last.push('\n');
+                        last.push_str(line);
+                    }
+                }
+                for entry in entries {
+                    let (ctor, arity) = lean_ctor_entry_arity(&entry);
+                    out.push((format!("{type_name}.{ctor}"), arity, false));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn mir_module_ctor_arities_match_trusted_lean_sources() {
+        let dialect =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../lean/Trusted/Rustc/V2026_06_01");
+        let mut sources = vec![(String::from("Layout"), dialect.join("Layout.lean"))];
+        let mut mir_ast: Vec<PathBuf> = std::fs::read_dir(dialect.join("MirAst"))
+            .expect("MirAst sources")
+            .map(|entry| entry.expect("MirAst entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "lean"))
+            .collect();
+        mir_ast.sort();
+        assert!(!mir_ast.is_empty());
+        sources.extend(
+            mir_ast
+                .into_iter()
+                .map(|path| (String::from("MirAst"), path)),
+        );
+
+        let mut expected: BTreeMap<String, usize> = BTreeMap::new();
+        for (prefix, path) in &sources {
+            let text = std::fs::read_to_string(path).expect("trusted Lean source");
+            for (name, fields, is_structure) in lean_decl_arities(&text) {
+                if is_structure || fields > 0 {
+                    let previous = expected.insert(format!("{prefix}.{name}"), fields);
+                    assert_eq!(previous, None, "duplicate declaration {name}");
+                }
+            }
+        }
+        let verification = std::fs::read_to_string(dialect.join("../../VerificationResult.lean"))
+            .expect("VerificationResult.lean");
+        let claim = lean_decl_arities(&verification)
+            .into_iter()
+            .find(|(name, _, is_structure)| name == "Claim" && *is_structure)
+            .expect("structure Claim");
+        expected.insert(String::from("VerificationResult.Claim"), claim.1);
+        for (name, fields) in [("List.cons", 2), ("Option.some", 1), ("Prod.mk", 2)] {
+            expected.insert(String::from(name), fields);
+        }
+
+        let table: BTreeMap<String, usize> = MIR_MODULE_CTOR_ARITIES
+            .iter()
+            .map(|arity| (arity.lean_name.to_owned(), arity.fields))
+            .collect();
+        assert_eq!(
+            table.len(),
+            MIR_MODULE_CTOR_ARITIES.len(),
+            "duplicate table entries"
+        );
+        assert_eq!(table, expected);
+        assert_eq!(table.get("MirAst.CapturedMir"), Some(&12));
+        assert_eq!(table.get("MirAst.TerminatorKind.call"), Some(&5));
+    }
+
+    // Live Lean `v4.34.1` probes.
+
+    /// One namespace of a Lean probe file and the IR-checker diagnostics the model predicts.
+    struct LeanProbeCase {
+        name: String,
+        source: String,
+        predicted: Vec<&'static str>,
+    }
+
+    impl LeanProbeCase {
+        fn new(name: &str, body: &str, ctors: &[LcnfCtorFootprint]) -> Self {
+            let predicted: BTreeSet<&'static str> = ctors
+                .iter()
+                .filter_map(|footprint| footprint.ir_violation())
+                .map(IrCtorLimit::lean_diagnostic)
+                .collect();
+            Self {
+                name: name.to_owned(),
+                source: format!("namespace LcnfProbe.{name}\n{body}end LcnfProbe.{name}\n"),
+                predicted: predicted.into_iter().collect(),
+            }
+        }
+    }
+
+    /// Removes the probe directory unless `ANNEAL_LCNF_PROBE_KEEP` is set.
+    struct RemoveDirOnDrop(PathBuf);
+
+    impl Drop for RemoveDirOnDrop {
+        fn drop(&mut self) {
+            if std::env::var_os("ANNEAL_LCNF_PROBE_KEEP").is_some() {
+                eprintln!("kept LCNF probe directory {}", self.0.display());
+            } else {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    /// A `lean` executable reporting version `4.34.1`, or `None`.
+    fn lean_for_probe() -> Option<PathBuf> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(lean) = std::env::var_os("ANNEAL_LCNF_PROBE_LEAN") {
+            candidates.push(PathBuf::from(lean));
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("lean")));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(PathBuf::from(home).join(".elan/bin/lean"));
+        }
+        candidates.into_iter().find(|lean| {
+            lean.is_file()
+                && Command::new(lean)
+                    .arg("--version")
+                    .current_dir(env!("CARGO_MANIFEST_DIR"))
+                    .output()
+                    .is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout).contains("version 4.34.1")
+                    })
+        })
+    }
+
+    /// Compiles `cases` in one Lean file and returns the error lines of each case, or `None`
+    /// when no Lean `v4.34.1` is available (a failure when `ANNEAL_REQUIRE_LCNF_LEAN_PROBE` is
+    /// set).
+    fn run_lean_probe(probe: &str, cases: &[LeanProbeCase]) -> Option<Vec<Vec<String>>> {
+        let Some(lean) = lean_for_probe() else {
+            assert!(
+                std::env::var_os("ANNEAL_REQUIRE_LCNF_LEAN_PROBE")
+                    .is_none_or(|value| value.is_empty()),
+                "{probe}: ANNEAL_REQUIRE_LCNF_LEAN_PROBE is set but no Lean 4.34.1 was found"
+            );
+            eprintln!(
+                "{probe}: SKIPPED: no Lean 4.34.1 in ANNEAL_LCNF_PROBE_LEAN, on PATH, or at ~/.elan/bin/lean"
+            );
+            return None;
+        };
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "anneal-lcnf-probe-{probe}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("probe directory");
+        let _cleanup = RemoveDirOnDrop(dir.clone());
+
+        let mut source = String::new();
+        let mut ranges = Vec::with_capacity(cases.len());
+        let mut line = 1;
+        for case in cases {
+            let lines = case.source.matches('\n').count();
+            ranges.push((line, line + lines - 1));
+            source.push_str(&case.source);
+            source.push('\n');
+            line += lines + 1;
+        }
+        source.push_str("#eval IO.println \"LCNF_PROBE_END\"\n");
+        let path = dir.join("LcnfProbe.lean");
+        std::fs::write(&path, &source).expect("probe source");
+
+        let stdout_path = dir.join("stdout.txt");
+        let stderr_path = dir.join("stderr.txt");
+        let started = Instant::now();
+        let mut child = Command::new(&lean)
+            .arg(&path)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .env_remove("LEAN_PATH")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                File::create(&stdout_path).expect("stdout file"),
+            ))
+            .stderr(Stdio::from(
+                File::create(&stderr_path).expect("stderr file"),
+            ))
+            .spawn()
+            .expect("spawn lean");
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait for lean") {
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(1200) {
+                let _ = child.kill();
+                panic!("{probe}: lean did not finish within 1200 s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let output = std::fs::read_to_string(&stdout_path).unwrap_or_default()
+            + &std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        assert!(
+            output.contains("LCNF_PROBE_END"),
+            "{probe}: lean stopped early ({status}):\n{output}"
+        );
+
+        let prefix = format!("{}:", path.display());
+        let mut errors = vec![Vec::new(); cases.len()];
+        for text in output.lines() {
+            let Some(rest) = text.strip_prefix(&prefix) else {
+                continue;
+            };
+            let mut parts = rest.splitn(3, ':');
+            let (Some(line), Some(_column), Some(message)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if !message.trim_start().starts_with("error") {
+                continue;
+            }
+            let line: usize = line.parse().expect("diagnostic line number");
+            let case = ranges
+                .iter()
+                .position(|&(first, last)| (first..=last).contains(&line))
+                .unwrap_or_else(|| panic!("{probe}: error outside every case: {text}"));
+            errors[case].push(text.to_owned());
+        }
+        assert_eq!(
+            status.success(),
+            errors.iter().all(Vec::is_empty),
+            "{probe}: lean exit status {status} disagrees with its diagnostics:\n{output}"
+        );
+        eprintln!(
+            "{probe}: {} ({} cases, {} lines) compiled by {} in {:.1} s",
+            if status.success() {
+                "accepted"
+            } else {
+                "rejected"
+            },
+            cases.len(),
+            line,
+            lean.display(),
+            started.elapsed().as_secs_f64()
+        );
+        Some(errors)
+    }
+
+    fn assert_lean_matches_model(probe: &str, cases: &[LeanProbeCase]) {
+        let Some(errors) = run_lean_probe(probe, cases) else {
+            return;
+        };
+        let mut mismatches = Vec::new();
+        for (case, case_errors) in cases.iter().zip(&errors) {
+            let observed: BTreeSet<&'static str> = [IrCtorLimit::Fields, IrCtorLimit::Scalar]
+                .into_iter()
+                .map(IrCtorLimit::lean_diagnostic)
+                .filter(|diagnostic| case_errors.iter().any(|error| error.contains(diagnostic)))
+                .collect();
+            let observed: Vec<&'static str> = observed.into_iter().collect();
+            let matches = if case.predicted.is_empty() {
+                case_errors.is_empty()
+            } else {
+                !case_errors.is_empty() && observed == case.predicted
+            };
+            if !matches {
+                mismatches.push(format!(
+                    "{}: model {:?}, Lean {:?}: {:?}",
+                    case.name,
+                    case.predicted,
+                    observed,
+                    case_errors.iter().take(3).collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{probe}: Lean 4.34.1 disagrees with the LCNF model:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    fn render_fields(fields: &[LcnfFieldSpec]) -> String {
+        fields
+            .iter()
+            .map(|field| format!("  {} : {}\n", field.name, field.lean_ty))
+            .collect()
+    }
+
+    /// One flat structure `W` over `fields`, without the guard.
+    fn unguarded_flat_case(name: &str, fields: &[LcnfFieldSpec]) -> LeanProbeCase {
+        let body = format!(
+            "structure W where\n{}  deriving Inhabited\n",
+            render_fields(fields)
+        );
+        LeanProbeCase::new(name, &body, &[LcnfCtorFootprint::of_fields(fields)])
+    }
+
+    /// `Part<j>` structures plus one wrapper `W` with one field per part, without the guard.
+    fn unguarded_one_wrapper_case(name: &str, parts: &[Vec<LcnfFieldSpec>]) -> LeanProbeCase {
+        let mut body = String::new();
+        let mut ctors = Vec::with_capacity(parts.len() + 1);
+        for (index, part) in parts.iter().enumerate() {
+            body.push_str(&format!(
+                "structure Part{} where\n{}  deriving Inhabited\n\n",
+                index + 1,
+                render_fields(part)
+            ));
+            ctors.push(LcnfCtorFootprint::of_fields(part));
+        }
+        body.push_str("structure W where\n");
+        for index in 0..parts.len() {
+            body.push_str(&format!("  part{} : Part{}\n", index + 1, index + 1));
+        }
+        body.push_str("  deriving Inhabited\n");
+        ctors.push(LcnfCtorFootprint::of_kinds(lcnf_wrapper_field_kinds(parts)));
+        LeanProbeCase::new(name, &body, &ctors)
+    }
+
+    /// Lean literal of field `index` for a builtin type, and whether `rfl` can check it.
+    fn probe_literal(lean_ty: &str, index: usize) -> (String, bool) {
+        match lean_ty {
+            "Bool" => (
+                String::from(if index.is_multiple_of(3) {
+                    "true"
+                } else {
+                    "false"
+                }),
+                true,
+            ),
+            "UInt8" | "UInt16" | "UInt32" | "UInt64" | "USize" | "Nat" => {
+                ((index % 250).to_string(), true)
+            }
+            "Int8" | "Int16" | "Int32" | "Int64" | "ISize" | "Int" => {
+                (format!("-{}", index % 100), true)
+            }
+            "Char" => (format!("'{}'", char::from(b'a' + (index % 26) as u8)), true),
+            "Float" | "Float32" => (format!("{}.5", index % 100), true),
+            "String" => (format!("\"s{index}\""), true),
+            "Unit" => (String::from("()"), true),
+            "Prop" => (
+                String::from(if index.is_multiple_of(2) {
+                    "True"
+                } else {
+                    "False"
+                }),
+                true,
+            ),
+            "Type" => (
+                String::from(if index.is_multiple_of(2) {
+                    "Nat"
+                } else {
+                    "Bool"
+                }),
+                true,
+            ),
+            _ => (String::from("trivial"), false),
+        }
+    }
+
+    /// The guarded structure `S` of `plan`, a value built with `render_lcnf_guarded_ctor_expr`,
+    /// and one `rfl` example per field reading the value back through its accessor.
+    fn guarded_case(name: &str, plan: &LcnfCtorLayoutPlan, derives: &[&str]) -> LeanProbeCase {
+        let mut body =
+            render_lcnf_guarded_structure("S", plan, derives).expect("guarded structure");
+        let literals: Vec<(String, bool)> = plan
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| probe_literal(field.lean_ty.trim(), index))
+            .collect();
+        let exprs: Vec<(&str, &str)> = plan
+            .fields()
+            .iter()
+            .zip(&literals)
+            .map(|(field, (literal, _))| (field.name.as_str(), literal.as_str()))
+            .collect();
+        let value =
+            render_lcnf_guarded_ctor_expr("S", &exprs, plan).expect("constructor expression");
+        body.push_str(&format!("\n@[noinline] def mkValue : S := {value}\n\n"));
+        for (field, (literal, checkable)) in plan.fields().iter().zip(&literals) {
+            if *checkable {
+                body.push_str(&format!(
+                    "example : mkValue.{} = ({literal} : {}) := rfl\n",
+                    field.name,
+                    field.lean_ty.trim()
+                ));
+            }
+        }
+        let ctors: Vec<LcnfCtorFootprint> = plan
+            .levels()
+            .iter()
+            .flatten()
+            .map(|ctor| ctor.footprint)
+            .collect();
+        LeanProbeCase::new(name, &body, &ctors)
+    }
+
+    #[test]
+    fn lcnf_live_lean_probe_matches_model() {
+        let deep = plan_lcnf_ctor_layout_levels(&u64s(300), 8, 240).unwrap();
+        let mut proof_tail = nats(240);
+        proof_tail.extend(uniform(300, "h", "True", Irrelevant));
+        let mixed: Vec<LcnfFieldSpec> = (0..520)
+            .map(|index| {
+                LcnfFieldSpec::builtin(
+                    format!("m{index}"),
+                    BUILTIN_LEAN_TYPES[index % BUILTIN_LEAN_TYPES.len()],
+                )
+                .unwrap()
+            })
+            .collect();
+        let small = [
+            LcnfFieldSpec::builtin("x", "UInt64").unwrap(),
+            LcnfFieldSpec::builtin("y", "Nat").unwrap(),
+            LcnfFieldSpec::builtin("ok", "Bool").unwrap(),
+            LcnfFieldSpec::builtin("name", "String").unwrap(),
+        ];
+        let zero_relevant = [LcnfFieldSpec::new("h", "True", Irrelevant)];
+        let zero_relevant_parent: Vec<LcnfFieldKind> =
+            vec![CtorReprKind::of_fields(&zero_relevant).parent_field_kind(); 300];
+        let zero_relevant_body = format!(
+            "structure Z : Type where\n  h : True\n  deriving Inhabited\n\nstructure W where\n{}  deriving Inhabited\n",
+            (0..300)
+                .map(|index| format!("  z{index} : Z\n"))
+                .collect::<String>()
+        );
+        let cases = vec![
+            // `PROTOTYPE_REPORT.md` §4.3, in order.
+            unguarded_flat_case("flat_130xUInt64_1040B", &u64s(130)),
+            guarded_case(
+                "split_130xUInt64_960B",
+                &default_plan(&u64s(130)),
+                &["Inhabited"],
+            ),
+            unguarded_flat_case("flat_128xUInt64_1024B", &u64s(128)),
+            unguarded_flat_case("flat_129xUInt64_1032B", &u64s(129)),
+            unguarded_flat_case("flat_256xNat", &nats(256)),
+            unguarded_flat_case("flat_257xNat", &nats(257)),
+            unguarded_flat_case("flat_300xNat", &nats(300)),
+            guarded_case(
+                "split_300xNat_240obj",
+                &default_plan(&nats(300)),
+                &["Inhabited"],
+            ),
+            guarded_case(
+                "split_121xUInt64_960B_singleton_tail",
+                &default_plan(&u64s(121)),
+                &["Inhabited"],
+            ),
+            unguarded_one_wrapper_case(
+                "split_300xUInt64_cap8_one_wrapper",
+                &chunk_lcnf_ctor_fields(&u64s(300), 8, 240).unwrap(),
+            ),
+            guarded_case("layout_300xUInt64_cap8_two_levels", &deep, &["Inhabited"]),
+            // Further guard layouts.
+            guarded_case(
+                "declared_cap_600xBool",
+                &default_plan(&uniform(600, "b", "Bool", BOOL)),
+                &["Inhabited"],
+            ),
+            guarded_case(
+                "proof_only_parts",
+                &default_plan(&proof_tail),
+                &["Inhabited"],
+            ),
+            guarded_case(
+                "mixed_520_builtin_fields",
+                &default_plan(&mixed),
+                &["Inhabited"],
+            ),
+            guarded_case(
+                "flat_small_all_derives",
+                &default_plan(&small),
+                &["Inhabited", "Repr", "BEq", "Hashable", "DecidableEq"],
+            ),
+            guarded_case("empty_structure", &default_plan(&[]), &["Inhabited"]),
+            guarded_case("empty_structure_no_deriving", &default_plan(&[]), &[]),
+            // A `Type` with no relevant field is one boxed field in its parent.
+            LeanProbeCase::new(
+                "zero_relevant_type_is_boxed",
+                &zero_relevant_body,
+                &[
+                    LcnfCtorFootprint::of_fields(&zero_relevant),
+                    LcnfCtorFootprint::of_kinds(zero_relevant_parent),
+                ],
+            ),
+        ];
+        assert_eq!(cases[0].predicted, [IrCtorLimit::Scalar.lean_diagnostic()]);
+        assert_eq!(cases[5].predicted, [IrCtorLimit::Fields.lean_diagnostic()]);
+        assert_eq!(cases[9].predicted, [IrCtorLimit::Scalar.lean_diagnostic()]);
+        assert_eq!(cases[17].predicted, [IrCtorLimit::Fields.lean_diagnostic()]);
+        assert!(cases[1].predicted.is_empty() && cases[10].predicted.is_empty());
+        assert_lean_matches_model("lcnf_live_lean_probe_matches_model", &cases);
+    }
+
+    #[test]
+    fn lcnf_live_lean_builtin_kinds_match_model() {
+        let mut cases = Vec::new();
+        for &lean_ty in BUILTIN_LEAN_TYPES {
+            let kind = LcnfFieldKind::of_builtin_lean_ty(lean_ty).unwrap();
+            let fill = |count: usize| uniform(count, "t", lean_ty, kind);
+            let base = uniform(120, "u", "UInt64", U64);
+            let with_base = |count: usize| -> Vec<LcnfFieldSpec> {
+                let mut fields = base.clone();
+                fields.extend(fill(count));
+                fields
+            };
+            let shapes: Vec<(&str, Vec<LcnfFieldSpec>)> = match kind {
+                // 960 B of `UInt64` plus `64 / bytes` fields reach exactly 1024 B.
+                LcnfFieldKind::Scalar { bytes } => vec![
+                    ("at_scalar_limit", with_base(64 / bytes)),
+                    ("over_scalar_limit", with_base(64 / bytes + 1)),
+                ],
+                LcnfFieldKind::ObjectRef => vec![
+                    ("at_field_limit", fill(256)),
+                    ("over_field_limit", fill(257)),
+                ],
+                // Accepted only if the field has no scalar byte and no boxed field.
+                LcnfFieldKind::Irrelevant => vec![
+                    ("no_scalar_bytes", with_base(65)),
+                    ("no_objects", {
+                        let mut fields = nats(256);
+                        fields.extend(fill(1));
+                        fields
+                    }),
+                ],
+            };
+            for (shape, fields) in shapes {
+                cases.push(unguarded_flat_case(&format!("{lean_ty}_{shape}"), &fields));
+            }
+        }
+        assert_eq!(cases.len(), 2 * BUILTIN_LEAN_TYPES.len());
+        assert!(cases.iter().any(|case| !case.predicted.is_empty()));
+        assert_lean_matches_model("lcnf_live_lean_builtin_kinds_match_model", &cases);
+    }
+
+    #[test]
+    fn lcnf_live_lean_standard_derives_scale_to_the_budget() {
+        let bools = uniform(600, "b", "Bool", BOOL);
+        let plan = default_plan(&bools);
+        let part_sizes: Vec<usize> = plan.levels()[0]
+            .iter()
+            .map(|ctor| ctor.children.len())
+            .collect();
+        assert_eq!(part_sizes, [240, 240, 120]);
+        let cases = [guarded_case(
+            "derives_at_declared_cap_600xBool",
+            &plan,
+            &["Inhabited", "Repr", "BEq", "Hashable"],
+        )];
+        assert_lean_matches_model(
+            "lcnf_live_lean_standard_derives_scale_to_the_budget",
+            &cases,
+        );
     }
 }
