@@ -2571,8 +2571,17 @@ pub fn verify_workspace_with_config(config: &VerifyConfig) -> Result<Verificatio
     refresh_workspace_assembly(&workspace_root)?;
     let dot_anneal = workspace_root.join(".anneal");
     let matched_targets = resolve_filtered_verify_modules(&workspace_root, config.item_filter.as_deref())?;
+    // `[adv ep1-A4]`: under `--item` filtering, expand the `lake build` + `TrustedBoundary`
+    // audit target set across assumed modular sibling `Verify.<Callee>` modules so a
+    // `sorry`-backed, unapproved-assumption, or ill-typed sibling can never bypass kernel
+    // verification, then filter `report.items` back to `matched_targets` after reconciliation.
+    let audit_targets = if config.item_filter.is_some() {
+        expand_verify_targets_with_modular_siblings(&workspace_root, &matched_targets)
+    } else {
+        matched_targets.clone()
+    };
     if config.item_filter.is_some() {
-        run_lake_verify_targets(&dot_anneal, &matched_targets)?;
+        run_lake_verify_targets(&dot_anneal, &audit_targets)?;
     } else {
         run_lake_verify(&dot_anneal)?;
     }
@@ -2582,7 +2591,7 @@ pub fn verify_workspace_with_config(config: &VerifyConfig) -> Result<Verificatio
         config.allow_assumptions,
         config.allow_provisional_native,
         config.item_filter.as_deref(),
-        &matched_targets,
+        &audit_targets,
     )?;
     let effective_registry = config
         .property_registry
@@ -2594,6 +2603,13 @@ pub fn verify_workspace_with_config(config: &VerifyConfig) -> Result<Verificatio
         &effective_registry,
         &config.simulated_dropped_fault_sites,
     );
+    if config.item_filter.is_some() {
+        let matched_set: std::collections::BTreeSet<&str> =
+            matched_targets.iter().map(String::as_str).collect();
+        report
+            .items
+            .retain(|it| matched_set.contains(it.verify_module.as_str()));
+    }
     Ok(report)
 }
 
@@ -2831,8 +2847,74 @@ pub fn ensure_fault_site_coverage_reconciled(report: &VerificationReport) -> Res
 #[derive(Clone, Debug)]
 struct SubjectReconciliationOutcome {
     cert_info: Option<fault_census::VerifiedCertificateInfo>,
+    overrides_default_call_contract_spec: bool,
     sibling_modular_deps: Vec<(String, fault_census::SiblingModularContractKind)>,
     failure_status: Option<VerificationStatus>,
+}
+
+fn expand_verify_targets_with_modular_siblings(
+    workspace_root: &Path,
+    initial_targets: &[String],
+) -> Vec<String> {
+    let generated_root = workspace_root.join(".anneal/generated");
+    let verify_root = generated_root.join("Verify");
+    let obligations_root = generated_root.join("Obligations");
+    let specs_root = workspace_root.join("anneal/proofs/Specs");
+
+    let mut visited: std::collections::BTreeSet<String> = initial_targets.iter().cloned().collect();
+    let mut queue: std::collections::VecDeque<String> = initial_targets.iter().cloned().collect();
+    let mut ordered: Vec<String> = initial_targets.to_vec();
+
+    while let Some(target_mod) = queue.pop_front() {
+        let Some(suffix) = target_mod.strip_prefix("Verify.") else {
+            continue;
+        };
+        let rel = module_suffix_to_rel_path(suffix);
+        let Ok(verify_text) = fs::read_to_string(verify_root.join(&rel)) else {
+            continue;
+        };
+        let Ok(cert) = fault_census::inspect_verify_module_certificate(&verify_text, suffix) else {
+            continue;
+        };
+        if !cert.surface.is_modular() {
+            continue;
+        }
+        let mut sibling_suffixes: Vec<String> = Vec::new();
+        let ob_links_opt = fs::read_to_string(obligations_root.join(&rel))
+            .ok()
+            .and_then(|t| fault_census::scan_obligations_callee_links(&t).ok());
+        let specs_links_opt = if cert.imported_specs_suffixes.iter().any(|s| s == suffix) {
+            fs::read_to_string(specs_root.join(&rel))
+                .ok()
+                .and_then(|t| fault_census::scan_specs_module(&t, suffix).ok())
+        } else {
+            None
+        };
+        if let Some(ref sl) = specs_links_opt
+            && sl.has_modular_spec_instance
+        {
+            if sl.delegates_to_default_modular_spec_env
+                && let Some(ref obl) = ob_links_opt
+            {
+                sibling_suffixes.extend(obl.referenced_callee_contracts.iter().cloned());
+            }
+            sibling_suffixes.extend(sl.referenced_modular_callee_suffixes.iter().cloned());
+        } else if let Some(ref obl) = ob_links_opt {
+            sibling_suffixes.extend(obl.referenced_callee_contracts.iter().cloned());
+        }
+        for csuf in sibling_suffixes {
+            let sib_verify_path = verify_root.join(module_suffix_to_rel_path(&csuf));
+            if !sib_verify_path.is_file() {
+                continue;
+            }
+            let sib_mod = format!("Verify.{csuf}");
+            if visited.insert(sib_mod.clone()) {
+                ordered.push(sib_mod.clone());
+                queue.push_back(sib_mod);
+            }
+        }
+    }
+    ordered
 }
 
 fn reconcile_subject_by_suffix(
@@ -2852,6 +2934,7 @@ fn reconcile_subject_by_suffix(
 
     let fail_early = |reason: String| SubjectReconciliationOutcome {
         cert_info: None,
+        overrides_default_call_contract_spec: true,
         sibling_modular_deps: Vec::new(),
         failure_status: Some(unmapped_fault_site_status(reason)),
     };
@@ -2863,6 +2946,7 @@ fn reconcile_subject_by_suffix(
             .and_then(|vt| fault_census::inspect_verify_module_certificate(&vt, suffix).ok());
         return SubjectReconciliationOutcome {
             cert_info,
+            overrides_default_call_contract_spec: true,
             sibling_modular_deps: Vec::new(),
             failure_status: Some(status.clone()),
         };
@@ -2924,6 +3008,7 @@ fn reconcile_subject_by_suffix(
     let fail_with_cert =
         |cert: fault_census::VerifiedCertificateInfo, reason: String| SubjectReconciliationOutcome {
             cert_info: Some(cert),
+            overrides_default_call_contract_spec: true,
             sibling_modular_deps: Vec::new(),
             failure_status: Some(unmapped_fault_site_status(reason)),
         };
@@ -3536,8 +3621,21 @@ fn reconcile_subject_by_suffix(
         None
     };
 
+    let specs_overrides_active = match cert_info.surface {
+        fault_census::VerifiedCertificateSurface::Claim => specs_links_opt
+            .as_ref()
+            .is_some_and(|sl| sl.declared_spec_classes.iter().any(|c| c == "ItemSpec")),
+        fault_census::VerifiedCertificateSurface::TotalClaim => specs_links_opt
+            .as_ref()
+            .is_some_and(|sl| sl.declared_spec_classes.iter().any(|c| c == "TotalItemSpec")),
+        _ => true,
+    };
+    let overrides_default_call_contract_spec =
+        links.has_legacy_spec_override || specs_overrides_active;
+
     SubjectReconciliationOutcome {
         cert_info: Some(cert_info),
+        overrides_default_call_contract_spec,
         sibling_modular_deps,
         failure_status,
     }
@@ -3633,15 +3731,15 @@ fn apply_fault_site_coverage_reconciliation(
                     ));
                     break;
                 };
-                let callee_imports_specs = !callee_cert.imported_specs_suffixes.is_empty();
+                let callee_overrides_spec = callee_outcome.overrides_default_call_contract_spec;
                 if !callee_cert
                     .surface
-                    .supports_sibling_modular_contract(*contract_kind, callee_imports_specs)
+                    .supports_sibling_modular_contract(*contract_kind, callee_overrides_spec)
                 {
                     updates.push((
                         caller_suf.clone(),
                         unmapped_fault_site_status(format!(
-                            "modular caller Verify.{caller_suf} assumes `Obligations.{callee_suf}` ({contract_kind:?}), which is incompatible with `Verify.{callee_suf}` surface {:?} (imports_specs={callee_imports_specs})",
+                            "modular caller Verify.{caller_suf} assumes `Obligations.{callee_suf}` ({contract_kind:?}), which is incompatible with `Verify.{callee_suf}` surface {:?} (overrides_default_spec={callee_overrides_spec})",
                             callee_cert.surface
                         )),
                     ));
@@ -7138,6 +7236,193 @@ end Mir.Demo.caller
         );
         let _ = fs::remove_file(&proof_helper_path);
         let _ = fs::remove_file(&proof_caller_path);
+
+        // Negative & positive tests 20 (`[adv ep1-A4]`):
+        // (a) `expand_verify_targets_with_modular_siblings` expands `--item` modular
+        //     caller targets to include assumed `Verify.Demo.leaf` siblings while leaving
+        //     non-modular callers and unreferenced siblings untouched.
+        let unrelated_verify_path = workspace.join(".anneal/generated/Verify/Demo/unrelated.lean");
+        fs::write(&unrelated_verify_path, "-- unrelated\n").expect("write unrelated verify");
+        fs::write(&leaf_ob_path, &canonical_leaf_ob).expect("write canonical leaf ob");
+        fs::write(&leaf_verify_path, canonical_leaf_ub_verify).expect("write leaf ub verify");
+        fs::write(
+            &specs_caller_path,
+            "import Trusted\nimport Mir.Demo.caller\nimport Obligations.Demo.caller\nimport Obligations.Demo.leaf\n\
+             namespace Specs.Demo.caller\n\
+             instance : ModularItemSpec \"demo::caller\" where\n  \
+               envAssumed := Obligations.Demo.leaf.ubExceptionClaim.callContract.holdsOn\n  \
+               pre := fun _ _ => True\n  post := fun _ _ _ _ => True\n\
+             end Specs.Demo.caller\n",
+        )
+        .expect("write Specs modular caller");
+        let specs_mod_verify = "\
+            -- @anneal-def-id: demo::caller\n\
+            import Trusted\n\
+            import Mir.Demo.caller\n\
+            import Obligations.Demo.caller\n\
+            import Specs.Demo.caller\n\
+            namespace Verify.Demo.caller\n\
+            theorem verified : Trusted.VerificationResult.ModularVerificationResult Obligations.Demo.caller.modularClaim := Proof.Demo.caller.verified\n\
+            end Verify.Demo.caller\n";
+        fs::write(&caller_verify_path, specs_mod_verify).expect("write modular caller verify");
+        assert_eq!(
+            expand_verify_targets_with_modular_siblings(
+                &workspace,
+                &["Verify.Demo.caller".to_string()],
+            ),
+            vec![
+                "Verify.Demo.caller".to_string(),
+                "Verify.Demo.leaf".to_string(),
+            ],
+            "`--item` target expansion must include assumed modular sibling `Verify.Demo.leaf` and omit `Verify.Demo.unrelated`"
+        );
+        let _ = fs::remove_file(&unrelated_verify_path);
+
+        // (b) Local `where envAssumed := ...` / `where specBody := ...` shadowing inside
+        //     `ModularItemSpec`, `StatefulEquivItemSpec`, or `defaultModularSpec` fails closed!
+        assert!(
+            fault_census::scan_specs_module(
+                "import Trusted\nimport Obligations.Demo.leaf\nnamespace Specs.Demo.caller\n\
+                 instance : ModularItemSpec \"demo::caller\" where\n  \
+                   pre args mem := True where\n    \
+                     envAssumed := Obligations.Demo.leaf.ubExceptionClaim.callContract.holdsOn\n  \
+                   post _ _ _ _ := True\n  \
+                   envAssumed := fun _ => True\n\
+                 end Specs.Demo.caller\n",
+                "Demo.caller",
+            )
+            .is_err(),
+            "local `where envAssumed` shadowing before `envAssumed := fun _ => True` must fail closed"
+        );
+        assert!(
+            fault_census::scan_specs_module(
+                "import Trusted\nimport Mir.Demo.leaf\nimport Mir.Demo.evil\nnamespace Specs.Demo.caller\n\
+                 instance : StatefulEquivItemSpec \"demo::caller\" where\n  \
+                   pre args mem := True where\n    \
+                     specBody := Mir.Demo.leaf.body\n  \
+                   post _ _ _ _ := True\n  \
+                   specBody := Mir.Demo.evil.body\n\
+                 end Specs.Demo.caller\n",
+                "Demo.caller",
+            )
+            .is_err(),
+            "local `where specBody` shadowing before `specBody := Mir.Demo.evil.body` must fail closed"
+        );
+
+        // (c) `class Evil extends ModularItemSpec "demo::caller"` typeclass-inheritance
+        //     smuggling inside `Proof`, `Assumptions`, `Verify`, or `Specs` fails closed!
+        assert!(
+            fault_census::validate_auxiliary_module_no_spec_override(
+                "import Trusted\nnamespace Proof.Demo.caller\n\
+                 class Evil extends ModularItemSpec \"demo::caller\"\n\
+                 instance : Evil where\n  envAssumed := fun _ => True\n  pre := fun _ _ => True\n  post := fun _ _ _ _ => True\n\
+                 end Proof.Demo.caller\n",
+                "Proof.Demo.caller",
+                "Demo.caller",
+                false,
+            )
+            .is_err(),
+            "`class Evil extends ModularItemSpec` in Proof must fail closed"
+        );
+
+        // (d) Tampering with `defaultSpec`, `defaultTotalSpec`, or `defaultCallContract.post`,
+        //     or decoupling a sibling via `legacySpec` (`import Specs.Demo.leaf` inside
+        //     `Obligations/Demo/leaf.lean`) fails closed!
+        let tampered_default_spec_ob = canonical_leaf_ob.replacen(
+            "pre := defaultPre",
+            "pre := fun _ => False",
+            1,
+        );
+        assert_ne!(tampered_default_spec_ob, canonical_leaf_ob);
+        assert!(
+            fault_census::validate_obligations_canonical_claims_for_def_path(
+                &tampered_default_spec_ob,
+                "Demo.leaf",
+                Some("demo::leaf"),
+            )
+            .is_err(),
+            "tampering with `defaultSpec.pre` must fail closed"
+        );
+        let tampered_call_contract_post_ob = canonical_leaf_ob.replacen(
+            "(defaultPost req.args retVal)",
+            "False",
+            1,
+        );
+        assert_ne!(tampered_call_contract_post_ob, canonical_leaf_ob);
+        assert!(
+            fault_census::validate_obligations_canonical_claims_for_def_path(
+                &tampered_call_contract_post_ob,
+                "Demo.leaf",
+                Some("demo::leaf"),
+            )
+            .is_err(),
+            "tampering with `defaultCallContract.post` must fail closed"
+        );
+        // `legacySpec` inside `Obligations/Demo/leaf.lean` overrides `defaultSpec`, so a
+        // modular caller assuming `Obligations.Demo.leaf.defaultCallContract` must fail closed
+        // even when `Verify/Demo/leaf.lean` omits `import Specs.Demo.leaf`!
+        fs::write(&caller_ob_path, &unlinked_ob).expect("write unlinked modular caller ob");
+        let legacy_leaf_ob = format!(
+            "import Specs.Demo.leaf\n{}",
+            canonical_leaf_ob.replacen(
+                "end Obligations.Demo.leaf",
+                "instance legacySpec : ItemSpec \"demo::leaf\" where\n  pre := Specs.Demo.leaf.pre\n  post := Specs.Demo.leaf.post\nend Obligations.Demo.leaf",
+                1,
+            )
+        );
+        fs::write(&leaf_ob_path, &legacy_leaf_ob).expect("write legacySpec leaf ob");
+        fs::write(&leaf_verify_path, mismatched_leaf_claim_verify).expect("write Claim leaf verify");
+        fs::write(
+            &specs_caller_path,
+            "import Trusted\nimport Mir.Demo.caller\nimport Obligations.Demo.caller\nimport Obligations.Demo.leaf\n\
+             namespace Specs.Demo.caller\n\
+             instance : ModularItemSpec \"demo::caller\" where\n  \
+               envAssumed := Obligations.Demo.leaf.defaultCallContract.holdsOn\n  \
+               pre := fun _ _ => True\n  post := fun _ _ _ _ => True\n\
+             end Specs.Demo.caller\n",
+        )
+        .expect("write defaultCallContract Specs caller");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller")
+                .expect("caller")
+                .as_str(),
+            unknown,
+            "assuming `defaultCallContract` on a sibling with `legacySpec` must fail closed"
+        );
+        // Whereas if `Specs/Demo/leaf.lean` only overrides `StatefulItemSpec` while
+        // `Verify/Demo/leaf.lean` proves `Claim` (backed by `defaultSpec`), `defaultCallContract`
+        // IS sound and reconciles cleanly!
+        let specs_leaf_path = workspace.join("anneal/proofs/Specs/Demo/leaf.lean");
+        fs::write(
+            &specs_leaf_path,
+            "import Trusted\nnamespace Specs.Demo.leaf\n\
+             instance : StatefulItemSpec \"demo::leaf\" where\n  pre := fun _ _ => True\n  post := fun _ _ _ _ => True\n\
+             end Specs.Demo.leaf\n",
+        )
+        .expect("write StatefulItemSpec-only Specs/Demo/leaf.lean");
+        fs::write(&leaf_ob_path, &canonical_leaf_ob).expect("restore canonical leaf ob");
+        let claim_with_specs_leaf_verify = "\
+            -- @anneal-def-id: demo::leaf\n\
+            import Trusted\n\
+            import Mir.Demo.leaf\n\
+            import Obligations.Demo.leaf\n\
+            import Specs.Demo.leaf\n\
+            namespace Verify.Demo.leaf\n\
+            theorem verified : Trusted.VerificationResult.VerificationResult Obligations.Demo.leaf.claim := Proof.Demo.leaf.verified\n\
+            end Verify.Demo.leaf\n";
+        fs::write(&leaf_verify_path, claim_with_specs_leaf_verify)
+            .expect("write Claim-with-StatefulSpecs leaf verify");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller"),
+            Some(&VerificationStatus::VerifiedUnconditional),
+            "sibling importing `Specs` that only declares `StatefulItemSpec` still backs `Claim` / `defaultCallContract` via `defaultSpec`"
+        );
+        let _ = fs::remove_file(&specs_leaf_path);
+        let _ = fs::remove_file(&specs_caller_path);
+        let _ = fs::remove_file(&leaf_ob_path);
+        let _ = fs::remove_file(&leaf_verify_path);
 
         fs::write(&caller_mir_path, &original_caller).expect("restore caller.lean");
         fs::write(&caller_ob_path, &original_ob).expect("restore caller obligations");

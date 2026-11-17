@@ -1136,6 +1136,11 @@ pub fn compute_bundle_fault_census_receipt_with_context(
 
     if let Some(spec_src) = equiv_spec_mir_src {
         let spec_meta = parse_lean_mir_module_metadata_strict(spec_src)?;
+        if spec_meta.body.def_path.is_empty() {
+            return Err(CensusScanError::MalformedCapturedMirSyntax(
+                "equivalence `specBody` MIR module has an empty `defPath`".to_string(),
+            ));
+        }
         let spec_closure = build_batch_callee_closure(
             &spec_meta.body,
             &callee_bodies,
