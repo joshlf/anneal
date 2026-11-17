@@ -990,30 +990,33 @@ impl TrackedProcessTree {
             let _ = grace_period;
         }
     }
-    /// Returns true only on a *positive* `/proc` observation that `root_pid` is an
-    /// un-reaped zombie with its recorded `starttime` (never on a failed read), so
-    /// the caller may still signal `-pgid` (reserved by the zombie) before reaping.
-    fn root_is_zombie(&self) -> bool {
-        let Some(root_st) = self.root_starttime else {
-            return false;
-        };
-        matches!(
-            proc_state_ppid_starttime_in(&self.proc_root, self.root_pid),
-            Some(('Z', _, actual_st)) if actual_st == root_st
-        )
+    /// Classifies `root_pid`'s `/proc/<root_pid>/stat` state against its
+    /// recorded `starttime` without reaping `Child`:
+    /// - `Some(true)`: positively observed as an un-reaped zombie (`'Z'`), so
+    ///   `pgid == root_pid` is still reserved and `-pgid` can be signaled before
+    ///   `wait()`.
+    /// - `Some(false)`: positively observed as still running (non-`'Z'`/`'X'`)
+    ///   with matching `starttime`, so `try_wait()` must NOT be called right
+    ///   after (avoiding the race where `root_pid` exits between `/proc` read
+    ///   and `try_wait()` and gets reaped without signaling `-pgid`).
+    /// - `None`: `/proc` unavailable/unreadable or `root_pid` no longer present.
+    fn root_proc_zombie_or_running(&self) -> Option<bool> {
+        let root_st = self.root_starttime?;
+        match proc_state_ppid_starttime_in(&self.proc_root, self.root_pid) {
+            Some(('Z', _, actual_st)) if actual_st == root_st => Some(true),
+            Some((state, _, actual_st))
+                if actual_st == root_st && state != 'Z' && state != 'X' =>
+            {
+                Some(false)
+            }
+            _ => None,
+        }
     }
 
     /// Returns true if `root_pid` has already exited (zombie `'Z'`/`'X'`, gone,
     /// or recycled with a different `starttime`) without reaping `Child`.
     fn root_has_exited(&self) -> bool {
-        let Some(root_st) = self.root_starttime else {
-            return false;
-        };
-        !matches!(
-            proc_state_ppid_starttime_in(&self.proc_root, self.root_pid),
-            Some((state, _, actual_st))
-                if actual_st == root_st && state != 'Z' && state != 'X'
-        )
+        !matches!(self.root_proc_zombie_or_running(), Some(false))
     }
 }
 
@@ -1043,28 +1046,36 @@ fn signal_process_group(pgid: u32, sig: i32) {
 }
 
 /// Returns `Some(status)` once the root has exited on its own (`None` while it
-/// runs). Where `/proc` shows the root as a zombie with its recorded
+/// runs). Where `/proc` positively shows the root as a zombie with its recorded
 /// `starttime`, its process group (`pgid == root_pid`, still reserved by the
 /// un-reaped zombie) is `SIGKILL`ed before the root is reaped, so a stray group
 /// member spawned after the last `(pid, starttime)` scan can neither keep
 /// running nor hold the output pipes open; tracked descendants that left the
-/// group are killed by `(pid, starttime)`. Without `/proc` this falls back to
-/// `try_wait` plus tracked-descendant cleanup.
+/// group are killed by `(pid, starttime)`. When `/proc` positively shows the
+/// root still running, `try_wait` is skipped so `root_pid` cannot exit and get
+/// reaped in the window between the `/proc` read and `try_wait`. Without `/proc`
+/// this falls back to `try_wait` plus tracked-descendant cleanup.
 fn reap_exited_root(
     child: &mut Child,
     tree: &mut TrackedProcessTree,
+    peak_rss_kib: &mut u64,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     const SIGKILL: i32 = 9;
-    if tree.root_is_zombie() {
-        let _ = tree.sample_rss_kib();
-        signal_process_group(tree.root_pid, SIGKILL);
-        tree.kill_descendants(Duration::ZERO);
-        return child.wait().map(Some);
+    match tree.root_proc_zombie_or_running() {
+        Some(true) => {
+            *peak_rss_kib = (*peak_rss_kib).max(tree.sample_rss_kib());
+            signal_process_group(tree.root_pid, SIGKILL);
+            tree.kill_descendants(Duration::ZERO);
+            return child.wait().map(Some);
+        }
+        Some(false) => return Ok(None),
+        None => {}
     }
     match child.try_wait()? {
         Some(status) => {
             // Already reaped: only `(pid, starttime)`-verified descendants may be
             // signaled now (never `-pgid`).
+            *peak_rss_kib = (*peak_rss_kib).max(tree.sample_rss_kib());
             tree.kill_descendants(Duration::ZERO);
             Ok(Some(status))
         }
@@ -1358,7 +1369,7 @@ pub fn run_command_with_watchdog(
     let mut peak_rss_kib = tree.sample_rss_kib();
     let mut watchdog_killed: Option<ItreeLeanFailureKind> = None;
     let (exit_success, signal_terminated) = loop {
-        match reap_exited_root(&mut child, &mut tree) {
+        match reap_exited_root(&mut child, &mut tree, &mut peak_rss_kib) {
             Ok(Some(status)) => break (status.success(), status.code().is_none()),
             Ok(None) => {}
             Err(e) => {
@@ -1383,7 +1394,7 @@ pub fn run_command_with_watchdog(
             // Re-check before killing: a root that exited while `/proc` was
             // scanned keeps its genuine exit status instead of being
             // misattributed to the watchdog.
-            if let Ok(Some(status)) = reap_exited_root(&mut child, &mut tree) {
+            if let Ok(Some(status)) = reap_exited_root(&mut child, &mut tree, &mut peak_rss_kib) {
                 break (status.success(), status.code().is_none());
             }
             watchdog_killed = Some(kind);
@@ -1527,20 +1538,37 @@ fn itree_bisect_failure_budget(n: usize) -> usize {
     2 * ceil_log2 + 2
 }
 
-/// Normalized, sorted, deduplicated Lean `error:` messages of a failed run: the
-/// text after each `error:` marker, so the `<file>:<line>:<col>:` location (which
+/// Normalized, sorted, deduplicated Lean `error:` blocks of a failed run: the
+/// text after each `error:` marker together with any immediately following
+/// indented continuation lines, so the `<file>:<line>:<col>:` location (which
 /// names the per-slice module), the harness header (peak RSS, `-M`, thread
-/// count), and non-error output are dropped. Two bisection halves failing with the
-/// same non-empty signature reproduce one candidate-wide failure.
+/// count), and non-error output are dropped while multi-line tactic / type-mismatch
+/// payloads stay intact.
 fn lean_error_signature(err: &str) -> Vec<String> {
-    let mut messages: Vec<String> = err
-        .lines()
-        .filter_map(|line| {
-            let idx = line.find("error:")?;
+    let mut messages: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in err.lines() {
+        if let Some(idx) = line.find("error:") {
+            if let Some(prev) = current.take() {
+                messages.push(prev);
+            }
             let msg = line[idx + "error:".len()..].trim();
-            (!msg.is_empty()).then(|| msg.to_string())
-        })
-        .collect();
+            if !msg.is_empty() {
+                current = Some(msg.to_string());
+            }
+        } else if (line.starts_with(' ') || line.starts_with('\t'))
+            && !line.trim().is_empty()
+            && let Some(cur) = current.as_mut()
+        {
+            cur.push('\n');
+            cur.push_str(line.trim());
+        } else if let Some(prev) = current.take() {
+            messages.push(prev);
+        }
+    }
+    if let Some(prev) = current.take() {
+        messages.push(prev);
+    }
     messages.sort();
     messages.dedup();
     messages
@@ -1721,10 +1749,19 @@ where
                                 .strip_prefix(&format!("{sub_label}: "))
                                 .unwrap_or(&sub_err)
                                 .to_string();
+                            let error_line_count =
+                                raw_body.lines().filter(|l| l.contains("error:")).count();
+                            let lower_body = raw_body.to_ascii_lowercase();
+                            let is_partial_tactic_or_type_err = error_line_count > 0
+                                && error_line_count < slice.len()
+                                && (lower_body.contains("tactic '")
+                                    || lower_body.contains("tactic `")
+                                    || lower_body.contains("type mismatch"));
                             let case_or_limit_specific = slice
                                 .iter()
                                 .any(|c| raw_body.contains(case_key(c)))
-                                || itree_lean_failure_is_inconclusive(&raw_body);
+                                || itree_lean_failure_is_inconclusive(&raw_body)
+                                || is_partial_tactic_or_type_err;
                             // Compare halves by their normalized Lean `error:` messages:
                             // the raw bodies embed the per-slice module path / label and
                             // peak-RSS figures, so they never compare equal verbatim.
@@ -6913,5 +6950,51 @@ mod tests {
             "distinct case failures in opposite halves must not trigger candidate-wide stop: {:?}",
             stage.errors
         );
+
+        // 5. Two Stage 2 `tactic 'rfl' failed` failures in opposite halves (`t1`
+        //    in `0..4` and `t6` in `4..8`) where Lean's `error:` line does not
+        //    include the theorem identifier (`case_...`) and puts the mismatched
+        //    terms on indented continuation lines must ALSO bisect and recover all
+        //    6 healthy siblings.
+        let (cases, case_to_fn) = stage_fixture(&[("cand_two_rfl_poison", 8)]);
+        let stage_rfl = run_isolated_lean_stage(
+            "ItreeDiffBatchConfirm",
+            &cases,
+            16,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, chunk: &[String]| {
+                let mut errs = Vec::new();
+                if chunk.iter().any(|c| c == "case_cand_two_rfl_poison_t1") {
+                    errs.push(format!(
+                        "/tmp/verify/{label}.lean:18:42: error: tactic 'rfl' failed, the left-hand side\n  \"branch_tag_mismatch\"\nis not definitionally equal to the right-hand side\n  \"ok\""
+                    ));
+                }
+                if chunk.iter().any(|c| c == "case_cand_two_rfl_poison_t6") {
+                    errs.push(format!(
+                        "/tmp/verify/{label}.lean:42:42: error: tactic 'rfl' failed, the left-hand side\n  \"branch_tag_mismatch\"\nis not definitionally equal to the right-hand side\n  \"ok\""
+                    ));
+                }
+                if !errs.is_empty() {
+                    return Err(format!(
+                        "`/tmp/verify/{label}.lean` failed (peak RSS 120000 KiB / 8388608 KiB, -M 8192 MiB, LEAN_NUM_THREADS=2):\nstdout:\n{}\nstderr:\n",
+                        errs.join("\n")
+                    ));
+                }
+                ok_all(chunk)
+            },
+        );
+        for t in [0, 2, 3, 4, 5, 7] {
+            assert!(
+                stage_rfl
+                    .results
+                    .contains_key(&format!("case_cand_two_rfl_poison_t{t}")),
+                "healthy sibling t{t} must be recovered when t1 and t6 fail tactic 'rfl'"
+            );
+        }
+        assert!(!stage_rfl.results.contains_key("case_cand_two_rfl_poison_t1"));
+        assert!(!stage_rfl.results.contains_key("case_cand_two_rfl_poison_t6"));
+        assert!(!stage_rfl.errors.iter().any(|e| e.contains("candidate-wide")));
     }
 }

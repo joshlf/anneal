@@ -143,18 +143,17 @@ fn existing_itree_helper_depth(file: &File) -> usize {
         .filter(|it| {
             matches!(
                 it,
-                Item::Fn(f) if f.sig.ident.to_string().starts_with("__anneal_")
+                Item::Fn(f)
+                    if f.sig.ident.to_string().starts_with("__anneal_")
+                        && !f.sig.ident.to_string().starts_with("__anneal_itree_outlined_stage2_")
             )
         })
         .count()
 }
 
 fn preamble_arg_shifts(file: &File) -> (u32, u32) {
-    let outer_shift = match existing_itree_helper_depth(file).min(2) {
-        0 => 4,
-        1 => 8,
-        _ => 12,
-    };
+    let pass_depth = existing_itree_helper_depth(file).min(5) as u32;
+    let outer_shift = (pass_depth + 1) * 4;
     (outer_shift, outer_shift.saturating_sub(2))
 }
 
@@ -2024,17 +2023,23 @@ fn concolic_candidate_pool(
     pool
 }
 
-/// Branch / callee skeleton of a run (call values erased), used to prefer return
-/// perturbations that steer execution onto a different path.
+/// Branch / callee / outcome skeleton of a run (call values erased), used to
+/// prefer argument negations and return perturbations that steer execution onto
+/// an unseen observable path.
 fn concolic_path_shape(run: &ItreeConcreteRun) -> Vec<(u32, u128, &str)> {
-    run.events
+    let mut shape: Vec<(u32, u128, &str)> = run
+        .events
         .iter()
         .map(|ev| match ev {
             ItreeConcreteEvent::Branch { site, tag } => (*site, *tag, ""),
             ItreeConcreteEvent::ExtCall { callee, .. } => (u32::MAX, 0, callee.as_str()),
             ItreeConcreteEvent::ExtCallPanic { callee, .. } => (u32::MAX, 1, callee.as_str()),
         })
-        .collect()
+        .collect();
+    if matches!(run.outcome, ItreeConcreteOutcome::Panic) {
+        shape.push((u32::MAX, 2, "__panic"));
+    }
+    shape
 }
 
 /// Owned [`concolic_path_shape`]: the run's observable path skeleton (branch
@@ -2272,6 +2277,9 @@ pub fn explore_itree_concolic_trials(
                     let run = (*run).clone();
                     register_concolic_args(&mut seen_args, &run);
                     ps.pin.record_excluded_arg_tuple(new_args.clone());
+                    if ps.pin.is_arg_domain_exhausted() {
+                        ps.exhausted = Some(ArgPinFallbackReason::DomainExhausted);
+                    }
                     used_plain_inputs.insert((m, p));
                     seen_shapes.insert(concolic_owned_shape(&run));
                     seen_runs.insert(run.clone());
@@ -2305,7 +2313,16 @@ pub fn explore_itree_concolic_trials(
     }
     for ps in &mut pins {
         if ps.exhausted.is_none() {
-            ps.exhausted = Some(ArgPinFallbackReason::NegationRoundCapReached);
+            let base = &bases[ps.base].3;
+            let key = (base.events[..ps.pos].to_vec(), ps.pin.callee.clone());
+            for tuple in seen_args.get(&key).into_iter().flatten() {
+                ps.pin.record_excluded_arg_tuple(tuple.clone());
+            }
+            ps.exhausted = Some(if ps.pin.is_arg_domain_exhausted() {
+                ArgPinFallbackReason::DomainExhausted
+            } else {
+                ArgPinFallbackReason::NegationRoundCapReached
+            });
         }
     }
 
@@ -3416,5 +3433,35 @@ mod tests {
         assert!(t.predicted.shares_prefix_with(&base, t.target_event_pos));
         assert_ne!(concolic_owned_shape(&t.predicted), concolic_owned_shape(&base));
         assert_eq!(t.predicted.events.last(), Some(&branch(0, 1)));
+
+        // When `max_trials == 2` (`arg_round_cap == 1`), a `bool` argument pin
+        // whose 2-element domain `{false, true}` is exhausted by Round 1 must
+        // report `ArgPinFallbackReason::DomainExhausted` (not `NegationRoundCapReached`)
+        // in Phase 2.
+        let bool_src = r#"
+            pub fn ext_flag(f: bool) -> u32 { if f { 11 } else { 13 } }
+            pub fn kernel_step(magic: u32, payload_len: u32) -> u32 {
+                let f: u32 = ext_flag(payload_len > 5000);
+                f ^ magic
+            }
+        "#;
+        let bool_dict = MirInputDictionary::from_rust_source(bool_src).unwrap();
+        let cap2_trials = explore_itree_concolic_trials(
+            bool_src,
+            "kernel_step",
+            "",
+            &[(0x414E_4E4C, 2048)],
+            &bool_dict,
+            2,
+            11,
+        );
+        assert_eq!(cap2_trials.len(), 2);
+        assert!(matches!(
+            cap2_trials[1].phase,
+            ConcolicTrialPhase::PerturbOracleReturn {
+                reason: ArgPinFallbackReason::DomainExhausted,
+                ..
+            }
+        ));
     }
 }

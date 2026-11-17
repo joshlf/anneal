@@ -1906,21 +1906,36 @@ impl ConcolicGuardOp {
         }
     }
 
-    /// Returns a `bit_width`-bit witness `v` with `(v <op> target) == want`, or
-    /// `None` when no such value exists (e.g. `v < 0` or `v > u32::MAX`).
-    pub fn witness(self, target: u128, want: bool, bit_width: u32) -> Option<u128> {
+    /// Returns all distinct `bit_width`-bit boundary witnesses `v` with
+    /// `(v <op> target) == want`.
+    pub fn witnesses(self, target: u128, want: bool, bit_width: u32) -> Vec<u128> {
         let mask = width_mask(bit_width);
         let t = target & mask;
-        [
+        let mut out = Vec::new();
+        for cand in [
             Some(t),
             t.checked_sub(1),
             t.checked_add(1).filter(|&v| v <= mask),
+            t.checked_sub(2),
+            t.checked_add(2).filter(|&v| v <= mask),
             Some(0),
+            Some(1).filter(|&v| v <= mask),
             Some(mask),
         ]
         .into_iter()
         .flatten()
-        .find(|&v| self.eval(v, t) == want)
+        {
+            if self.eval(cand, t) == want && !out.contains(&cand) {
+                out.push(cand);
+            }
+        }
+        out
+    }
+
+    /// Returns a `bit_width`-bit witness `v` with `(v <op> target) == want`, or
+    /// `None` when no such value exists (e.g. `v < 0` or `v > u32::MAX`).
+    pub fn witness(self, target: u128, want: bool, bit_width: u32) -> Option<u128> {
+        self.witnesses(target, want, bit_width).into_iter().next()
     }
 }
 
@@ -2256,6 +2271,23 @@ impl ArgPinConstraint {
                 .unwrap_or_else(|| ScalarLayout::unsigned(self.arg_tuple[i].len().max(1)))
         };
 
+        let valid_for_pos = |pos: usize, bits: u128| -> bool {
+            let layout = layout_of(pos);
+            let clamped = layout.clamp_to_valid_bits(bits);
+            let encoded = encode_scalar_le_bytes(clamped, layout.size_bytes);
+            clamped == bits && LayoutSpec::Scalar(layout).validate_bytes(&encoded).is_ok()
+        };
+        let valid_for_shared_field = |fname: &str, bits: u128| -> bool {
+            let guards_ok = prefix_guards
+                .iter()
+                .filter(|g| g.field_name.as_deref() == Some(fname))
+                .all(|g| g.effective_term(bits));
+            guards_ok
+                && (0..arity)
+                    .filter(|&k| self.arg_field_sources.get(k).and_then(Option::as_deref) == Some(fname))
+                    .all(|k| valid_for_pos(k, bits))
+        };
+
         // One enumeration variable per distinct source field (shared by every position
         // reading it) plus one per unsourced position; each variable holds candidate
         // bit patterns (not yet encoded).
@@ -2275,33 +2307,39 @@ impl ArgPinConstraint {
                 && let Some(&locked_bits) = locked_fields.get(fname)
             {
                 // Locked by a prefix branch guard or an earlier call pin: verify that
-                // `locked_bits` is valid for `layout` and satisfies every prefix guard
-                // on `fname`.
-                let clamped = layout.clamp_to_valid_bits(locked_bits);
-                let encoded = encode_scalar_le_bytes(clamped, layout.size_bytes);
-                let guards_ok = prefix_guards
-                    .iter()
-                    .filter(|g| g.field_name.as_deref() == Some(fname))
-                    .all(|g| g.effective_term(locked_bits));
-                if clamped == locked_bits
-                    && LayoutSpec::Scalar(layout.clone()).validate_bytes(&encoded).is_ok()
-                    && guards_ok
-                {
-                    vec![clamped]
+                // `locked_bits` is valid for every position reading `fname` and satisfies
+                // every prefix guard on `fname`.
+                if valid_for_shared_field(fname, locked_bits) {
+                    vec![locked_bits]
                 } else {
                     Vec::new()
                 }
             } else {
-                candidate_arg_bytes_for_layout(&layout, field_source, &self.arg_tuple[i], dict)
-                    .iter()
-                    .map(|b| decode_scalar_le_bytes(b))
-                    .filter(|&bits| {
-                        field_source.is_none_or(|fname| {
-                            prefix_guards
-                                .iter()
-                                .filter(|g| g.field_name.as_deref() == Some(fname))
-                                .all(|g| g.effective_term(bits))
-                        })
+                let mut raw_cands: Vec<u128> =
+                    candidate_arg_bytes_for_layout(&layout, field_source, &self.arg_tuple[i], dict)
+                        .iter()
+                        .map(|b| decode_scalar_le_bytes(b))
+                        .collect();
+                if let Some(fname) = field_source {
+                    for g in prefix_guards
+                        .iter()
+                        .filter(|g| g.field_name.as_deref() == Some(fname))
+                    {
+                        if !raw_cands.contains(&g.concrete_bits) {
+                            raw_cands.push(g.concrete_bits);
+                        }
+                        for w in g.op.witnesses(g.target_bits, g.taken, g.bit_width) {
+                            if !raw_cands.contains(&w) {
+                                raw_cands.push(w);
+                            }
+                        }
+                    }
+                }
+                raw_cands
+                    .into_iter()
+                    .filter(|&bits| match field_source {
+                        Some(fname) => valid_for_shared_field(fname, bits),
+                        None => valid_for_pos(i, bits),
                     })
                     .collect()
             };
@@ -2636,9 +2674,19 @@ fn collect_prefix_field_overrides_checked(
                 return None;
             }
         }
-        let mut candidates = vec![g.concrete_bits];
-        if let Some(w) = g.op.witness(g.target_bits, g.taken, g.bit_width) {
-            candidates.push(w);
+        let mut candidates = Vec::new();
+        for pg in prefix_guards
+            .iter()
+            .filter(|pg| pg.field_name.as_ref() == Some(fname))
+        {
+            if !candidates.contains(&pg.concrete_bits) {
+                candidates.push(pg.concrete_bits);
+            }
+            for w in pg.op.witnesses(pg.target_bits, pg.taken, pg.bit_width) {
+                if !candidates.contains(&w) {
+                    candidates.push(w);
+                }
+            }
         }
         let valid = candidates.into_iter().find(|&c| {
             prefix_guards
@@ -2842,14 +2890,29 @@ fn flip_branch_guard_with_generator(
     let layout = ScalarLayout::unsigned((target_guard.bit_width / 8).max(1) as usize);
     let cur_bytes = encode_scalar_le_bytes(target_guard.concrete_bits, layout.size_bytes);
     let mut cands: Vec<u128> = Vec::new();
-    // The operator's own witness for the flipped polarity comes first (e.g. `x = t`
-    // for an untaken `x == t`, `x = t` for a taken `x > t`).
-    if let Some(w) =
-        target_guard
-            .op
-            .witness(target_guard.target_bits, !target_guard.taken, target_guard.bit_width)
-    {
-        cands.push(w);
+    // The operator's own witnesses for the flipped polarity come first (e.g. `x = t`
+    // and `x = t + 1` for an untaken `x >= t`, so an earlier `x != t` guard does not
+    // block the flip), followed by prefix-guard boundary witnesses.
+    for w in target_guard.op.witnesses(
+        target_guard.target_bits,
+        !target_guard.taken,
+        target_guard.bit_width,
+    ) {
+        if !cands.contains(&w) {
+            cands.push(w);
+        }
+    }
+    if let Some(ref fname) = target_guard.field_name {
+        for pg in prefix_guards
+            .iter()
+            .filter(|pg| pg.field_name.as_ref() == Some(fname))
+        {
+            for w in pg.op.witnesses(pg.target_bits, pg.taken, pg.bit_width) {
+                if !cands.contains(&w) {
+                    cands.push(w);
+                }
+            }
+        }
     }
     for b in candidate_arg_bytes_for_layout(
         &layout,
@@ -3645,5 +3708,44 @@ mod tests {
             relax_pin_constraint_with_generator(&singleton_gen, &no_fields, &[], &[zero_pin], 0, 0)
                 .is_none()
         );
+
+        // Two argument positions sharing a single field source with different scalar
+        // widths (`u32` and `u8`) must never clamp only the narrower position to produce
+        // an inconsistent `(1000, 255)` tuple; every synthesized tuple must use a value
+        // that fits both layouts without clamping.
+        let mixed_twin = ArgPinConstraint::new(0, "ext_mixed", 0, vec![le(5), vec![5u8]], le(0))
+            .with_arg_layouts(vec![ScalarLayout::u32(), ScalarLayout::u8()])
+            .with_arg_field_sources(vec![field("payload_len"), field("payload_len")]);
+        for attempt in 0..8 {
+            let t = mixed_twin
+                .negate_arg_pin(&dict, &BTreeMap::new(), attempt)
+                .expect("negate mixed-width twin pin");
+            assert_eq!(decode_scalar_le_bytes(&t[0]), decode_scalar_le_bytes(&t[1]));
+            assert!(decode_scalar_le_bytes(&t[0]) <= 255);
+        }
+
+        // Flipping `x >= 50_000` from false (`x = 50`) to true when an earlier guard
+        // requires `x != 50_000` uses `ConcolicGuardOp::witnesses`'s `t + 1 = 50_001`
+        // witness even with an empty dictionary.
+        let g_ne = ConcolicBranchGuard::new_comparison(
+            0,
+            field("payload_len"),
+            ConcolicGuardOp::Ne,
+            50,
+            50_000,
+            32,
+        );
+        let g_ge = ConcolicBranchGuard::new_comparison(
+            1,
+            field("payload_len"),
+            ConcolicGuardOp::Ge,
+            50,
+            50_000,
+            32,
+        );
+        let flipped_ge =
+            flip_branch_guard(&no_fields, &[g_ne, g_ge], &[], 1, &MirInputDictionary::new(), 0)
+                .expect("flip x >= 50_000 under x != 50_000");
+        assert!(flipped_ge.flipped_bits > 50_000);
     }
 }
