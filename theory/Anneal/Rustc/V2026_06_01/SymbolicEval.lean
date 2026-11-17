@@ -12093,6 +12093,122 @@ theorem switchTableMergePlan_spec {cfg : MirCfg} {hints : JoinHints}
     · cases h
   · cases h
 
+/-- Extract the arm statements for a list of `(caseVal, armBb)` pairs in an N-way `switchTable`
+    triangle: each `armBb` may either jump **directly** to `joinBb` (`armBb = joinBb`, contributing
+    `[]` arm statements) or be an arm block ending in `goto joinBb` (`armGoto? blk = some joinBb`,
+    contributing `blk.stmts`). -/
+def matchSwitchTriangleCases (cfg : MirCfg) (joinBb : BlockId) :
+    List (Nat × BlockId) → Option (List (Nat × List MirStmt))
+  | [] => some []
+  | (val, bb) :: rest =>
+    if bb = joinBb then
+      match matchSwitchTriangleCases cfg joinBb rest with
+      | some restArms => some ((val, []) :: restArms)
+      | none => none
+    else
+      match cfg.blocks[bb]?, matchSwitchTriangleCases cfg joinBb rest with
+      | some blk, some restArms =>
+        match armGoto? blk with
+        | some j => if j = joinBb then some ((val, blk.stmts) :: restArms) else none
+        | none => none
+      | _, _ => none
+
+/-- N-way `switchTable` triangle plan where `otherwiseBb` **is** the hinted `joinBb` (`otherwiseStmts = []`). -/
+def switchTableDirectOtherwisePlan (cfg : MirCfg) (hints : JoinHints)
+    (cases : List (Nat × BlockId)) (otherwiseBb : BlockId) :
+    Option (List (Nat × List MirStmt) × List MirStmt × BlockId × List Bool) :=
+  match hints otherwiseBb, matchSwitchTriangleCases cfg otherwiseBb cases with
+  | some mask, some caseArms => some (caseArms, [], otherwiseBb, mask)
+  | _, _ => none
+
+/-- N-way `switchTable` triangle plan where `otherwiseBb` is an arm block ending in `goto joinBb`,
+    and one or more case targets in `cases` jump directly to `joinBb`. -/
+def switchTableArmOtherwiseTrianglePlan (cfg : MirCfg) (hints : JoinHints)
+    (cases : List (Nat × BlockId)) (otherwiseBb : BlockId) :
+    Option (List (Nat × List MirStmt) × List MirStmt × BlockId × List Bool) :=
+  match cfg.blocks[otherwiseBb]? with
+  | some oBlk =>
+    match armGoto? oBlk with
+    | some joinBb =>
+      match hints joinBb, matchSwitchTriangleCases cfg joinBb cases with
+      | some mask, some caseArms => some (caseArms, oBlk.stmts, joinBb, mask)
+      | _, _ => none
+    | none => none
+  | none => none
+
+/-- Combined N-way `switchTable` triangle merge plan: handles both `otherwiseBb = joinBb` and
+    arm-block `otherwiseBb -> joinBb` when any subset of `cases` jumps directly to `joinBb`. -/
+def switchTableTrianglePlan (cfg : MirCfg) (hints : JoinHints)
+    (cases : List (Nat × BlockId)) (otherwiseBb : BlockId) :
+    Option (List (Nat × List MirStmt) × List MirStmt × BlockId × List Bool) :=
+  match switchTableDirectOtherwisePlan cfg hints cases otherwiseBb with
+  | some plan => some plan
+  | none => switchTableArmOtherwiseTrianglePlan cfg hints cases otherwiseBb
+
+theorem switchTableDirectOtherwisePlan_spec {cfg : MirCfg} {hints : JoinHints}
+    {cases : List (Nat × BlockId)} {otherwiseBb joinBb : BlockId}
+    {caseArms : List (Nat × List MirStmt)} {otherwiseStmts : List MirStmt} {mask : List Bool}
+    (h : switchTableDirectOtherwisePlan cfg hints cases otherwiseBb =
+      some (caseArms, otherwiseStmts, joinBb, mask)) :
+    otherwiseBb = joinBb ∧ otherwiseStmts = [] ∧
+      matchSwitchTriangleCases cfg joinBb cases = some caseArms := by
+  unfold switchTableDirectOtherwisePlan at h
+  split at h
+  · rename_i m cArms hM hCA
+    injection h with h1
+    injection h1 with hCAEq h2
+    injection h2 with hOSEq h3
+    injection h3 with hJEq _
+    subst hCAEq hOSEq hJEq
+    exact ⟨rfl, rfl, hCA⟩
+  · cases h
+
+theorem switchTableArmOtherwiseTrianglePlan_spec {cfg : MirCfg} {hints : JoinHints}
+    {cases : List (Nat × BlockId)} {otherwiseBb joinBb : BlockId}
+    {caseArms : List (Nat × List MirStmt)} {otherwiseStmts : List MirStmt} {mask : List Bool}
+    (h : switchTableArmOtherwiseTrianglePlan cfg hints cases otherwiseBb =
+      some (caseArms, otherwiseStmts, joinBb, mask)) :
+    ∃ oBlk, cfg.blocks[otherwiseBb]? = some oBlk ∧ oBlk.stmts = otherwiseStmts ∧
+      oBlk.term = .goto joinBb ∧ matchSwitchTriangleCases cfg joinBb cases = some caseArms := by
+  unfold switchTableArmOtherwiseTrianglePlan at h
+  split at h
+  · rename_i oBlk hO
+    split at h
+    · rename_i j hj
+      split at h
+      · rename_i m cArms hM hCA
+        injection h with h1
+        injection h1 with hCAEq h2
+        injection h2 with hOSEq h3
+        injection h3 with hJEq _
+        subst hCAEq hOSEq hJEq
+        exact ⟨oBlk, hO, rfl, armGoto?_spec hj, hCA⟩
+      · cases h
+    · cases h
+  · cases h
+
+theorem switchTableTrianglePlan_spec {cfg : MirCfg} {hints : JoinHints}
+    {cases : List (Nat × BlockId)} {otherwiseBb joinBb : BlockId}
+    {caseArms : List (Nat × List MirStmt)} {otherwiseStmts : List MirStmt} {mask : List Bool}
+    (h : switchTableTrianglePlan cfg hints cases otherwiseBb =
+      some (caseArms, otherwiseStmts, joinBb, mask)) :
+    ((otherwiseBb = joinBb ∧ otherwiseStmts = []) ∨
+      (∃ oBlk, cfg.blocks[otherwiseBb]? = some oBlk ∧ oBlk.stmts = otherwiseStmts ∧
+        oBlk.term = .goto joinBb)) ∧
+      matchSwitchTriangleCases cfg joinBb cases = some caseArms := by
+  unfold switchTableTrianglePlan at h
+  cases hD : switchTableDirectOtherwisePlan cfg hints cases otherwiseBb with
+  | some p =>
+    rw [hD] at h
+    injection h with hEq
+    subst hEq
+    rcases switchTableDirectOtherwisePlan_spec hD with ⟨hOB, hOS, hCA⟩
+    exact ⟨Or.inl ⟨hOB, hOS⟩, hCA⟩
+  | none =>
+    rw [hD] at h
+    rcases switchTableArmOtherwiseTrianglePlan_spec h with ⟨oBlk, hOB, hOS, hOT, hCA⟩
+    exact ⟨Or.inr ⟨oBlk, hOB, hOS, hOT⟩, hCA⟩
+
 /-- Concrete statement list selected by an N-way `switchTable` for discriminator value `v`. -/
 def lookupSwitchArmStmts (v : Nat) : List (Nat × List MirStmt) → List MirStmt → List MirStmt
   | [], otherwiseStmts => otherwiseStmts
@@ -12346,6 +12462,86 @@ theorem execCfg_lookupSwitchTarget_of_matchSwitchCases {cfg : MirCfg} {joinBb : 
       · cases hCases
     · cases hCases
 
+theorem execCfg_lookupSwitchTarget_of_matchSwitchTriangleCases {cfg : MirCfg} {joinBb : BlockId} :
+    ∀ (cases : List (Nat × BlockId)) {caseArms : List (Nat × List MirStmt)}
+      {otherwiseBb : BlockId} {otherwiseStmts : List MirStmt} {f : Nat} {v : Nat}
+      {cst cst' : CanonState Nat} {retVal : Nat},
+      matchSwitchTriangleCases cfg joinBb cases = some caseArms →
+      ((otherwiseBb = joinBb ∧ otherwiseStmts = []) ∨
+        (∃ oBlk, cfg.blocks[otherwiseBb]? = some oBlk ∧ oBlk.stmts = otherwiseStmts ∧
+          oBlk.term = .goto joinBb)) →
+      execStmts cst (lookupSwitchArmStmts v caseArms otherwiseStmts) = some cst' →
+      execCfg cfg f joinBb cst' = .ret retVal →
+      execCfg cfg (f + 1) (lookupCfgSwitchTarget v cases otherwiseBb) cst = .ret retVal
+  | [], _, otherwiseBb, otherwiseStmts, f, v, cst, cst', retVal, hCases, hO, hExec, hRet => by
+    injection hCases with hNil
+    subst hNil
+    dsimp only [lookupCfgSwitchTarget, lookupSwitchArmStmts] at hExec ⊢
+    rcases hO with ⟨hOB, hOS⟩ | ⟨oBlk, hOBlk, hOS, hOTerm⟩
+    · subst hOB hOS
+      have hc : cst = cst' := Option.some.inj hExec
+      subst hc
+      exact execCfg_ret_succ cfg f otherwiseBb cst _ hRet
+    · subst hOS
+      dsimp only [execCfg]
+      rw [hOBlk]
+      dsimp only
+      rw [hExec]
+      dsimp only
+      rw [hOTerm]
+      exact hRet
+  | (caseVal, targetBb) :: rest, _, otherwiseBb, otherwiseStmts, f, v, cst, cst', retVal, hCases, hO, hExec, hRet => by
+    unfold matchSwitchTriangleCases at hCases
+    by_cases hEqBb : targetBb = joinBb
+    · rw [ite_eq_left hEqBb] at hCases
+      cases hRest : matchSwitchTriangleCases cfg joinBb rest with
+      | none => rw [hRest] at hCases; cases hCases
+      | some restArms =>
+        rw [hRest] at hCases
+        injection hCases with hCons
+        subst hCons
+        dsimp only [lookupCfgSwitchTarget, lookupSwitchArmStmts] at hExec ⊢
+        cases hEq : (v == wrap64 caseVal) with
+        | true =>
+          rw [hEq, ite_eq_left rfl] at hExec
+          rw [ite_eq_left rfl, hEqBb]
+          have hc : cst = cst' := Option.some.inj hExec
+          subst hc
+          exact execCfg_ret_succ cfg f joinBb cst _ hRet
+        | false =>
+          rw [hEq, ite_eq_right Bool.false_ne_true] at hExec
+          rw [ite_eq_right Bool.false_ne_true]
+          exact execCfg_lookupSwitchTarget_of_matchSwitchTriangleCases rest hRest hO hExec hRet
+    · rw [ite_eq_right hEqBb] at hCases
+      split at hCases
+      · rename_i tBlk restArms hTBlk hRest
+        split at hCases
+        · rename_i j hj
+          split at hCases
+          · rename_i hjEq
+            subst hjEq
+            injection hCases with hCons
+            subst hCons
+            dsimp only [lookupCfgSwitchTarget, lookupSwitchArmStmts] at hExec ⊢
+            cases hEq : (v == wrap64 caseVal) with
+            | true =>
+              rw [hEq, ite_eq_left rfl] at hExec
+              rw [ite_eq_left rfl]
+              dsimp only [execCfg]
+              rw [hTBlk]
+              dsimp only
+              rw [hExec]
+              dsimp only
+              rw [armGoto?_spec hj]
+              exact hRet
+            | false =>
+              rw [hEq, ite_eq_right Bool.false_ne_true] at hExec
+              rw [ite_eq_right Bool.false_ne_true]
+              exact execCfg_lookupSwitchTarget_of_matchSwitchTriangleCases rest hRest hO hExec hRet
+          · cases hCases
+        · cases hCases
+      · cases hCases
+
 /-- Statically known `switchTable` target for a **constant** discriminant (the N-way analogue of
     `constCond?`): `lookupCfgSwitchTarget (wrap64 v) cases otherwiseBb` when `discrId` is interned as
     `.const v`. Infeasible arms are then neither merged nor explored, so an arm that can never run
@@ -12564,9 +12760,18 @@ def symEvalCfgGvn (cfg : MirCfg) (hints : JoinHints) :
                   | none => none
                   | some (stM, tblM) => symEvalCfgGvn cfg hints f joinBb stM tblM pc
               | none =>
-                evalSwitchTableSplit
-                  (fun targetBb tblIn pcIn => symEvalCfgGvn cfg hints fuel targetBb st₂ tblIn pcIn)
-                  discrId pc cases otherwiseBb tbl₁
+                match switchTableTrianglePlan cfg hints cases otherwiseBb with
+                | some (caseArms, otherwiseStmts, joinBb, mask) =>
+                  match fuel with
+                  | 0 => none
+                  | f + 1 =>
+                    match symExecSwitchTableJoin st₂ discrId mask otherwiseStmts caseArms tbl₁ pc with
+                    | none => none
+                    | some (stM, tblM) => symEvalCfgGvn cfg hints f joinBb stM tblM pc
+                | none =>
+                  evalSwitchTableSplit
+                    (fun targetBb tblIn pcIn => symEvalCfgGvn cfg hints fuel targetBb st₂ tblIn pcIn)
+                    discrId pc cases otherwiseBb tbl₁
         | .ret retLoc =>
           match readSymScalar st₁ retLoc with
           | some retSymId => some ([retSymId], tbl₁)
@@ -12956,34 +13161,70 @@ theorem symEvalCfgGvn_under_sound (cfg : MirCfg) (hints : JoinHints) :
             | none =>
               rw [hPlan] at hEval
               dsimp only at hEval
-              have hBlockSound :
-                  ∀ (targetBb : BlockId) (tblIn : SymTable) (pcIn : PathCond)
-                    (retsOut : List SymId) (tblOut : SymTable),
-                    ValidTable tblIn →
-                    ValidSymCanonState tblIn.nodes.length (st₁.ownerReadLoc discr) →
-                    PathCondValid tblIn.nodes.length pcIn →
-                    symEvalCfgGvn cfg hints fuel targetBb (st₁.ownerReadLoc discr) tblIn pcIn =
-                      some (retsOut, tblOut) →
-                    ValidTable tblOut ∧ tblIn.Extends tblOut ∧
-                      (∀ r ∈ retsOut, r < tblOut.nodes.length) ∧
-                      ∀ (env : SymEnv) (cst₂ : CanonState Nat),
-                        PathCondHolds tblIn env pcIn →
-                        StateRefines (evalSymCanonState tblIn env (st₁.ownerReadLoc discr)) cst₂ →
-                        ∃ r ∈ retsOut,
-                          execCfg cfg fuel targetBb cst₂ = .ret (evalSymId tblOut env r) :=
-                fun targetBb tblIn pcIn retsOut tblOut hV hS hP hE =>
-                  symEvalCfgGvn_under_sound cfg hints fuel targetBb (st₁.ownerReadLoc discr)
-                    tblIn pcIn retsOut tblOut hV hS hP hE
-              rcases evalSwitchTableSplit_sound hBlockSound cases otherwiseBb tbl₁ pc rets tbl'
-                hValid₁ hSt₂ hPcValid₁ hDiscrLt hEval with ⟨hV', hE', hLt', hEv'⟩
-              refine ⟨hV', hExt₁.trans hE', hLt', ?_⟩
-              intro env cst hPc hR
-              rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, hPc₁⟩
-              rcases hEv' env (c₁.ownerReadLoc discr)
-                hPc₁ (hR₂ env c₁ hR₁) with ⟨r, hr, hExec⟩
-              refine ⟨r, hr, ?_⟩
-              rw [hStepT env cst c₁ hC₁ hR₁]
-              exact hExec
+              cases hTriPlan : switchTableTrianglePlan cfg hints cases otherwiseBb with
+              | none =>
+                rw [hTriPlan] at hEval
+                dsimp only at hEval
+                have hBlockSound :
+                    ∀ (targetBb : BlockId) (tblIn : SymTable) (pcIn : PathCond)
+                      (retsOut : List SymId) (tblOut : SymTable),
+                      ValidTable tblIn →
+                      ValidSymCanonState tblIn.nodes.length (st₁.ownerReadLoc discr) →
+                      PathCondValid tblIn.nodes.length pcIn →
+                      symEvalCfgGvn cfg hints fuel targetBb (st₁.ownerReadLoc discr) tblIn pcIn =
+                        some (retsOut, tblOut) →
+                      ValidTable tblOut ∧ tblIn.Extends tblOut ∧
+                        (∀ r ∈ retsOut, r < tblOut.nodes.length) ∧
+                        ∀ (env : SymEnv) (cst₂ : CanonState Nat),
+                          PathCondHolds tblIn env pcIn →
+                          StateRefines (evalSymCanonState tblIn env (st₁.ownerReadLoc discr)) cst₂ →
+                          ∃ r ∈ retsOut,
+                            execCfg cfg fuel targetBb cst₂ = .ret (evalSymId tblOut env r) :=
+                  fun targetBb tblIn pcIn retsOut tblOut hV hS hP hE =>
+                    symEvalCfgGvn_under_sound cfg hints fuel targetBb (st₁.ownerReadLoc discr)
+                      tblIn pcIn retsOut tblOut hV hS hP hE
+                rcases evalSwitchTableSplit_sound hBlockSound cases otherwiseBb tbl₁ pc rets tbl'
+                  hValid₁ hSt₂ hPcValid₁ hDiscrLt hEval with ⟨hV', hE', hLt', hEv'⟩
+                refine ⟨hV', hExt₁.trans hE', hLt', ?_⟩
+                intro env cst hPc hR
+                rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, hPc₁⟩
+                rcases hEv' env (c₁.ownerReadLoc discr)
+                  hPc₁ (hR₂ env c₁ hR₁) with ⟨r, hr, hExec⟩
+                refine ⟨r, hr, ?_⟩
+                rw [hStepT env cst c₁ hC₁ hR₁]
+                exact hExec
+              | some triPlan =>
+                rcases triPlan with ⟨caseArms, otherwiseStmts, joinBb, mask⟩
+                rw [hTriPlan] at hEval
+                cases fuel with
+                | zero => cases hEval
+                | succ f =>
+                  dsimp only at hEval
+                  cases hJoin : symExecSwitchTableJoin (st₁.ownerReadLoc discr) discrId mask
+                      otherwiseStmts caseArms tbl₁ pc with
+                  | none => rw [hJoin] at hEval; cases hEval
+                  | some pM =>
+                    rcases pM with ⟨stM, tblM⟩
+                    rw [hJoin] at hEval
+                    dsimp only at hEval
+                    rcases wpSwitchTableJoin_under_sound caseArms hValid₁ hSt₂ hDiscrLt hPcValid₁
+                      hJoin with ⟨hVM, hEM, hStM, hJoinC⟩
+                    have hPcValidM : PathCondValid tblM.nodes.length pc :=
+                      hPcValid₁.mono hEM.length_le
+                    rcases symEvalCfgGvn_under_sound cfg hints f joinBb stM tblM pc rets tbl'
+                      hVM hStM hPcValidM hEval with ⟨hV', hE', hLt', hEv'⟩
+                    rcases switchTableTrianglePlan_spec hTriPlan with ⟨hO, hCases⟩
+                    refine ⟨hV', (hExt₁.trans hEM).trans hE', hLt', ?_⟩
+                    intro env cst hPc hR
+                    rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, hPc₁⟩
+                    rcases hJoinC env (c₁.ownerReadLoc discr) hPc₁ (hR₂ env c₁ hR₁) with
+                      ⟨c₂, hC₂, hR₂'⟩
+                    have hPcM : PathCondHolds tblM env pc :=
+                      PathCondHolds.mono hValid₁ hEM hPcValid₁ hPc₁
+                    rcases hEv' env c₂ hPcM hR₂' with ⟨r, hr, hExec⟩
+                    refine ⟨r, hr, ?_⟩
+                    rw [hStepT env cst c₁ hC₁ hR₁]
+                    exact execCfg_lookupSwitchTarget_of_matchSwitchTriangleCases cases hCases hO hC₂ hExec
             | some plan =>
               rcases plan with ⟨caseArms, otherwiseStmts, joinBb, mask⟩
               rw [hPlan] at hEval
@@ -13561,6 +13802,40 @@ theorem switchOtherwiseNegatedCase_concrete_sound (env : SymEnv) :
       (evalSymCanonState diamondInitSymTable env diamondInitSymState) =
       .ret ((ExprTree.op1 (.addConst 10) (.var 0)).eval env) :=
   checkCfgAgainstTree_sound switchOtherwiseNegatedCase_verified.2.1 diamondInitSymTable_valid
+    diamondInitSymState_valid env _ (StateRefines.refl _)
+
+/-- N-way `switchTable` triangle (`3 => bb1 | 5 => bb2 | otherwise => bb2`) where `bb1` executes
+    `_0 := _0 + 10; goto bb2` while BOTH `5 => bb2` and `otherwise => bb2` jump **directly** to the
+    join block `bb2` (`ret 0`), the post-`SimplifyCfg` MIR shape of `match _1 { 3 => _0 += 10, 5 | _ => {} }`. -/
+def switchTableTriangleCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [], term := .switchTable 1 [(3, 1), (5, 2)] 2 },
+        { stmts := [ .assign 0 (.op1 (.addConst 10) 0) ], term := .goto 2 },
+        { stmts := [], term := .ret 0 } ] }
+
+def switchTableTriangleTree : ExprTree :=
+  .ite (.op2 .eq (.var 1) (.const 3))
+    (.op1 (.addConst 10) (.var 0))
+    (.var 0)
+
+/-- **N-Way `switchTable` Triangle Merge Witness (`switchTableTriangle_verified`)**:
+    `switchTableTrianglePlan` merges the arm block `3 => bb1` with the direct-to-join edges
+    `5 => bb2` and `otherwise => bb2` into **1** path at `bb2` (vs. `3` paths without hints). -/
+theorem switchTableTriangle_verified :
+    let hints : JoinHints := fun bb => if bb == 2 then some [true, true, false] else none
+    (symEvalCfgGvn switchTableTriangleCfg hints 3 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => res.1.length) = some 1 ∧
+      checkCfgAgainstTree switchTableTriangleCfg hints 3 0 diamondInitSymState
+        diamondInitSymTable switchTableTriangleTree = true ∧
+      (symEvalCfgGvn switchTableTriangleCfg noJoinHints 3 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => res.1.length) = some 3 := by
+  decide +kernel
+
+theorem switchTableTriangle_concrete_sound (env : SymEnv) :
+    execCfg switchTableTriangleCfg 3 0
+      (evalSymCanonState diamondInitSymTable env diamondInitSymState) =
+      .ret (switchTableTriangleTree.eval env) :=
+  checkCfgAgainstTree_sound switchTableTriangle_verified.2.1 diamondInitSymTable_valid
     diamondInitSymState_valid env _ (StateRefines.refl _)
 
 /-- Nested `switchInt` CFG: outer `switchInt _1 -> 1 | 2` where `bb1` (`_1 != 0`) branches on
@@ -17073,6 +17348,109 @@ theorem mirJoinFullMemory_verified_witness (initOut x flag : Nat) :
       PUnit.unit :=
   wpMirJoinDiamond_sound (mirJoinFullMemory_evalJoinDiamondWP initOut x flag)
 
+/-- Canonicalize a `MirSemantics.LocalSlot` against a liveness bit (`true` = live at join,
+    `false` = dead/scratch at join): dead/scratch slots are reset to `.dead` (the production
+    `MirSemantics` analogue of `CanonLocals.canonicalize`). -/
+def canonicalizeMirSlot (live : Bool) (s : LocalSlot) : LocalSlot :=
+  if live then s else .dead
+
+/-- Pointwise liveness canonicalization of a `List LocalSlot` local store. -/
+def canonicalizeMirLocals : List Bool → List LocalSlot → List LocalSlot
+  | live :: restMask, s :: restSlots =>
+    canonicalizeMirSlot live s :: canonicalizeMirLocals restMask restSlots
+  | _, slots => slots
+
+theorem canonicalizeMirSlot_idempotent (live : Bool) (s : LocalSlot) :
+    canonicalizeMirSlot live (canonicalizeMirSlot live s) = canonicalizeMirSlot live s := by
+  cases live <;> rfl
+
+theorem canonicalizeMirLocals_idempotent :
+    ∀ (mask : List Bool) (slots : List LocalSlot),
+      canonicalizeMirLocals mask (canonicalizeMirLocals mask slots) =
+        canonicalizeMirLocals mask slots
+  | [], _ => rfl
+  | _ :: _, [] => rfl
+  | live :: restMask, s :: restSlots => by
+    simp [canonicalizeMirLocals, canonicalizeMirSlot_idempotent,
+      canonicalizeMirLocals_idempotent restMask restSlots]
+
+/-- Two `MirSemantics` local stores are live-equivalent under `liveMask` iff their canonicalized
+    stores are equal. -/
+def MirLocalsLiveEquiv (liveMask : List Bool) (lT lF : List LocalSlot) : Prop :=
+  canonicalizeMirLocals liveMask lT = canonicalizeMirLocals liveMask lF
+
+/-- Two `MachineState`s arriving at a join block are live-equivalent under `liveMask` iff they agree
+    on `blockIdx`, `stmtIdx`, `memory`, and `canonicalizeMirLocals liveMask`. -/
+structure MirStateLiveEquiv (liveMask : List Bool) (sT sF : MachineState) : Prop where
+  blockIdx : sT.frame.blockIdx = sF.frame.blockIdx
+  stmtIdx : sT.frame.stmtIdx = sF.frame.stmtIdx
+  memory : sT.memory = sF.memory
+  locals : MirLocalsLiveEquiv liveMask sT.frame.locals sF.frame.locals
+
+/-- **Bridge from `MirLocalsLiveEquiv` (`liveMask`) to `MirArmSlotsAgree` (`differs = liveMask.map Bool.not`)**:
+    any two local stores whose `liveMask`-canonicalizations are equal automatically satisfy
+    `MirArmSlotsAgree (liveMask.map Bool.not) lT lF` (every `live = true` slot is equal in `lT` and
+    `lF`, while every `live = false` dead/scratch slot has `differs = true`). -/
+theorem mirArmSlotsAgree_of_liveEquiv :
+    ∀ (liveMask : List Bool) {lT lF : List LocalSlot},
+      MirLocalsLiveEquiv liveMask lT lF →
+      MirArmSlotsAgree (liveMask.map Bool.not) lT lF
+  | [], _, _, h => h
+  | _ :: _, [], [], _ => rfl
+  | _ :: _, [], _ :: _, h => by cases h
+  | _ :: _, _ :: _, [], h => by cases h
+  | true :: restMask, _ :: restT, _ :: restF, h => by
+    injection h with hHead hTail
+    exact ⟨hHead, mirArmSlotsAgree_of_liveEquiv restMask hTail⟩
+  | false :: restMask, _ :: restT, _ :: restF, h => by
+    injection h with _ hTail
+    exact ⟨trivial, mirArmSlotsAgree_of_liveEquiv restMask hTail⟩
+
+theorem mirArmsAgree_of_liveEquiv {liveMask : List Bool} {sT sF : MachineState}
+    (h : MirStateLiveEquiv liveMask sT sF) :
+    MirArmsAgree (liveMask.map Bool.not) sT sF :=
+  ⟨h.blockIdx, h.stmtIdx, h.memory, mirArmSlotsAgree_of_liveEquiv liveMask h.locals⟩
+
+/-- **Live-Equivalence Diamond Join Cut (`wpMirJoinDiamond_liveEquiv_sound`)**:
+    if two `SwitchInt` arms reach `joinBb` in states `sT, sF` that are `MirStateLiveEquiv liveMask sT sF`
+    (their `canonicalizeMirLocals liveMask` stores are identical, while dead/scratch slots where
+    `liveMask[i] = false` may diverge arbitrarily), then proving `wpMirSym` **once** on
+    `mergeMirJoinState cond (liveMask.map Bool.not) sT sF` discharges `evalJoinDiamondWP`. -/
+theorem wpMirJoinDiamond_liveEquiv_sound
+    {prefixFuel suffixFuel : Nat} {body : CapturedMir} {joinBb : BasicBlockIdx}
+    {s : MachineState} {cond : Bool} {liveMask : List Bool} {sT sF : MachineState}
+    {post : MirOutcome → Prop}
+    (hPrefix : wpMirUntilJoinSym prefixFuel body joinBb (.running s)
+      (fun s' => s' = if cond then sT else sF) post)
+    (hLive : MirStateLiveEquiv liveMask sT sF)
+    (hJoin : wpMirSym suffixFuel body (mergeMirJoinState cond (liveMask.map Bool.not) sT sF) post) :
+    evalJoinDiamondWP prefixFuel suffixFuel body joinBb s
+      (mergeMirJoinState cond (liveMask.map Bool.not) sT sF) post :=
+  wpMirJoinDiamond_merge_sound hPrefix (mirArmsAgree_of_liveEquiv hLive) hJoin
+
+theorem wpMirJoinDiamond_liveEquiv_dwlp_sound
+    {prefixFuel : Nat} {body : CapturedMir} {joinBb : BasicBlockIdx}
+    {s : MachineState} {cond : Bool} {liveMask : List Bool} {sT sF : MachineState}
+    {post : MirOutcome → Prop}
+    (hPrefix : wpMirUntilJoinSym prefixFuel body joinBb (.running s)
+      (fun s' => s' = if cond then sT else sF) post)
+    (hLive : MirStateLiveEquiv liveMask sT sF)
+    (hJoin : DWLP mirDefaultWP
+      (mirTree body (mergeMirJoinState cond (liveMask.map Bool.not) sT sF))
+      (fun out _ => post out) PUnit.unit) :
+    DWLP mirDefaultWP (mirTree body s) (fun out _ => post out) PUnit.unit :=
+  wpMirJoinDiamond_merge_dwlp_sound hPrefix (mirArmsAgree_of_liveEquiv hLive) hJoin
+
+/-- Concrete witness: the asymmetric scratch-slot arm states of `mirJoinAsymmetricScratchBody`
+    (where slot `_3` is `.dead` in one arm and `.init (.scalar ⟨x + 1, 8⟩)` in the other) are
+    `MirStateLiveEquiv [false, true, true, false]`! -/
+theorem mirJoinAsymmetricScratch_liveEquiv (x flag : Nat) :
+    MirStateLiveEquiv [false, true, true, false]
+      (mirJoinAsymmetricArmState x flag (mirJoinDiamondElseVal x) .dead)
+      (mirJoinAsymmetricArmState x flag (mirJoinDiamondThenVal x)
+        (.init (.scalar ⟨wrapScalarBits (Nat.add x 1) (scalarModulus 8), 8⟩))) :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
 end MirJoinDiamondWitness
 
 /-!
@@ -17087,18 +17465,19 @@ the corollaries whose *statements* mention `Anneal.ITreeWP.DWLP`/`DWP`
 (`dwlp_of_wpMirUntilJoinSym`, `dwpMirJoinDiamond_sound`, `wpMirJoinDiamond_sound`,
 `wpMirJoinDiamond_dwlp_sound`, `wpMirJoinDiamond_merge_dwlp_sound`,
 `wpMirJoinDiamond_callerMerge_dwlp_sound`, `wpMirJoinDiamond_fullMemoryMerge_dwlp_sound`,
-`mirJoinDiamond_verified_witness`, `mirSeqTwoDiamond_verified_witness`,
-`mirJoinTriangle_verified_witness`, `mirJoinSwitch3_verified_witness`,
-`mirJoinCallerMutRef_verified_witness`, `mirJoinFullMemory_verified_witness`): `DWLP`/`DWP` are
+`wpMirJoinDiamond_liveEquiv_dwlp_sound`, `mirJoinDiamond_verified_witness`,
+`mirSeqTwoDiamond_verified_witness`, `mirJoinTriangle_verified_witness`,
+`mirJoinSwitch3_verified_witness`, `mirJoinCallerMutRef_verified_witness`,
+`mirJoinFullMemory_verified_witness`): `DWLP`/`DWP` are
 built with `coinductive_fixpoint`/`inductive_fixpoint` and themselves depend on `Classical.choice`,
 so no proof of such a statement can avoid it, while their fuel-level premises
 (`wpMirSym_of_evalJoinDiamondWP`, `wpMirJoinDiamond_merge_sound`,
 `wpMirJoinDiamond_callerMerge_sound`, `wpMirJoinDiamond_fullMemoryMerge_sound`,
-`wpMirJoinSwitch3_merge_sound`, `mirJoinDiamond_wpMirSym_witness`,
-`mirJoinAsymmetricScratch_wpMirSym_witness`, `mirSeqTwoDiamond_wpMirSym_witness`,
-`mirJoinTriangle_wpMirSym_witness`, `mirJoinSwitch3_wpMirSym_witness`,
-`mirJoinCallerMutRef_wpMirSym_witness`, `mirJoinFullMemory_wpMirSym_witness`) stay
-`Classical.choice`-free.
+`wpMirJoinDiamond_liveEquiv_sound`, `wpMirJoinSwitch3_merge_sound`,
+`mirJoinDiamond_wpMirSym_witness`, `mirJoinAsymmetricScratch_wpMirSym_witness`,
+`mirSeqTwoDiamond_wpMirSym_witness`, `mirJoinTriangle_wpMirSym_witness`,
+`mirJoinSwitch3_wpMirSym_witness`, `mirJoinCallerMutRef_wpMirSym_witness`,
+`mirJoinFullMemory_wpMirSym_witness`) stay `Classical.choice`-free.
 `trusted/audit/TrustedBoundary.lean` admits no `#guard_msgs`/`#print` commands in audited modules,
 so this inventory is checked out-of-file by `#print axioms` over the declarations above.
 -/
