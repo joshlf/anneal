@@ -18,10 +18,13 @@ import Lean.Elab.Command
 
 Concrete kernel-checked witnesses and negative boundary canaries for Episode 1
 (`ep1-unsized-dst-ptr-metadata-lenses-and-pure-lift-bridge`) across:
-1. `Anneal.MirLiftCore` (`UnsizedDstMetadataLifters`),
-2. `Anneal.SepLogicLenses` (`PtrMetadataOf`, `UnsizedSliceDstAt`, `UnsizedStrDstAt`),
+1. `Anneal.MirLiftCore` (`UnsizedDstMetadataLifters`: Rvalue / intrinsic / `stepMirFn` lifters,
+   `stepMirFn`-level `.ub` faults, sized lifters, and protector-aware assignment lifters),
+2. `Anneal.SepLogicLenses` (`PtrMetadataOf`, `UnsizedSliceDstBacking`, `UnsizedSliceDstAt`,
+   `UnsizedStrDstAt`, with live global-image / borrow / empty-window backings and frame rules),
 3. `Anneal.PureLift.V2026_06_01Bridge` (`WideSliceDstBridge`: `stdWideSliceVal`,
-   `StdValRefines.wideSlice`, and `spatialPinnedBlockHolds` / `spatialBindingsHold` framing).
+   `StdValRefines.wideSlice`, and `spatialPinnedBlockHolds` / `spatialBindingsHold` framing for
+   `copy` / `move` operands, `[T]` and `str`).
 -/
 
 namespace Anneal.UnsizedDstMetadataLensTests
@@ -135,19 +138,23 @@ theorem str_sliceTypedAt : SliceTypedAt ByteLensCodec.u8 wideStr5 helloBytes byt
   | 4, _ => rfl
   | k + 5, hi => exact absurd hi (by simp [helloBytes])
 
+/-- `bytes16` / `bytesStr5` are the live images of the captured globals `9` / `10` in `mem0`. -/
+theorem arr_liveImage : LiveSliceImage mem0 wide4 bytes16 := ⟨arrAlloc16, rfl, rfl⟩
+theorem str_liveImage : LiveSliceImage mem0 wideStr5 bytesStr5 := ⟨strAlloc5, rfl, rfl⟩
+
 theorem arr_unsizedDst64 :
     UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) mem0 wide4
       (WidePtrVal.toValue 8 wide4) xs4 bytes16 :=
-  UnsizedSliceDstAt.of_sliceTypedAt 8 (.uint .u32) mem0 arr_sliceTypedAt
+  UnsizedSliceDstAt.of_sliceTypedAt 8 (.uint .u32) mem0 arr_sliceTypedAt arr_liveImage
 
 theorem arr_unsizedDst32 :
     UnsizedSliceDstAt ByteLensCodec.u32LE 4 (.slice (.uint .u32)) mem0 wide4
       (WidePtrVal.toValue 4 wide4) xs4 bytes16 :=
-  UnsizedSliceDstAt.of_sliceTypedAt 4 (.uint .u32) mem0 arr_sliceTypedAt
+  UnsizedSliceDstAt.of_sliceTypedAt 4 (.uint .u32) mem0 arr_sliceTypedAt arr_liveImage
 
 theorem str_unsizedDst64 :
     UnsizedStrDstAt 8 mem0 wideStr5 (WidePtrVal.toValue 8 wideStr5) helloBytes bytesStr5 :=
-  UnsizedSliceDstAt.of_str_sliceTypedAt 8 mem0 str_sliceTypedAt
+  UnsizedSliceDstAt.of_str_sliceTypedAt 8 mem0 str_sliceTypedAt str_liveImage
 
 theorem empty_and_zst_unsizedDst_witnesses :
     UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) mem0 wideEmpty
@@ -159,6 +166,18 @@ theorem empty_and_zst_unsizedDst_witnesses :
   ⟨UnsizedSliceDstAt.empty_slice ByteLensCodec.u32LE 8 (.uint .u32) mem0 p9 bytes16 (by decide),
    UnsizedSliceDstAt.empty_str 8 mem0 p10 bytesStr5 (by decide),
    UnsizedSliceDstAt.zst_unit_replicate 8 (.tuple []) mem0 p9 1000 bytes16 (by decide)⟩
+
+/-- **Memory backing is not vacuous**: the same `[u32]` view over `bytes16` is *not* an
+`UnsizedSliceDstAt` lens in a `Memory` with no captured global `9`, no live borrow, and a
+non-empty (`4 * 4 = 16`-byte) window, while it is one in `mem0` (`arr_unsizedDst64`). -/
+theorem unsizedDst_requires_live_backing :
+    ¬ UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) ({} : Memory) wide4
+      (WidePtrVal.toValue 8 wide4) xs4 bytes16 := by
+  intro h
+  rcases h.image_or_activeBorrow_or_zeroSized with ⟨_, hA, _⟩ | ⟨_, _, _, hL, _, _⟩ | hZ
+  · cases hA
+  · cases hL
+  · exact absurd hZ (by decide)
 
 theorem unsizedDst_projections_split_and_unique :
     xs4.length = wide4.2 ∧
@@ -182,7 +201,7 @@ theorem unsizedDst_projections_split_and_unique :
     fun ys h => UnsizedSliceDstAt.unique h arr_unsizedDst64,
     fun _ _ h1 h2 => PtrMetadataOf.unique h1 h2,
     arr_unsizedDst64.dst_ty.isUnsizedRawPtrPointee_eq_true 0,
-    UnsizedSliceDstAt.of_splitAt (k := 2) (by decide) hL hR⟩
+    UnsizedSliceDstAt.of_splitAt (k := 2) (by decide) hL hR arr_unsizedDst64.backing⟩
 
 /-! ## 3. `UnOp.ptrMetadata`, `AggregateKind.rawPtr` (`from_raw_parts`), and `to_raw_parts` -/
 
@@ -532,7 +551,7 @@ theorem size_and_align_positive_witnesses :
     decide
   obtain ⟨_, hMirU32_1, hDstU32_1, hShU32_1, hMutU32_1⟩ :=
     evalIntrinsic_sizeOfValRaw_slice (body := bodyU32) (cur := bodyU32) (s := sU32_0)
-      (arr_unsizedDst64.of_mem_change sU32_0.memory)
+      (arr_unsizedDst64.of_frame rfl (fun _ _ h => by cases h))
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
   have hStep1 : PureMirExec.mirStep bodyU32 sU32_0 = .cont sU32_1 := by
     rw [hInv2] at hMirU32_1
@@ -543,7 +562,7 @@ theorem size_and_align_positive_witnesses :
   obtain ⟨_, hMirU32_2, _, hShU32_2, hMutU32_2⟩ :=
     evalIntrinsic_alignOfValRaw_slice (body := bodyU32) (cur := bodyU32) (s := sU32_1)
       (alignBytes := 4)
-      (arr_unsizedDst64.of_mem_change sU32_1.memory)
+      (arr_unsizedDst64.of_frame rfl (fun _ _ h => by cases h))
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
   have hStep2 : PureMirExec.mirStep bodyU32 sU32_1 = .cont sU32_2 := by
     rw [hInv3] at hMirU32_2
@@ -556,7 +575,8 @@ theorem size_and_align_positive_witnesses :
       str_unsizedDst64 rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
   obtain ⟨_, hMirStr_2, _⟩ :=
     evalIntrinsic_alignOfValRaw_str (body := bodyStr) (cur := bodyStr) (s := sStr_1)
-      hDstStr_1 rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
+      (hDstStr_1 (fun _ _ h => by cases h)) rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl
+      (by decide) rfl rfl rfl
   obtain ⟨_, hMirEmpty, _, _, _⟩ :=
     evalIntrinsic_sizeOfValRaw_slice (body := bodyU32) (cur := bodyU32) (s := sEmpty_0)
       empty_and_zst_unsizedDst_witnesses.1
@@ -586,14 +606,28 @@ def tagOfLoan (lid : LoanId) : Nat := lid + 77
 
 def pinCodec : SpatialCodec StdVal := u32SpatialCodec layouts64
 
+/-- The pinned place `_2 : [u32; 4]` (element layout `u32Layout`). -/
+def pinArrTy : Ty := { kind := .array (.uint .u32) 4, layoutIdx := 0 }
+
+/-- `[1u32, 2, 3, 4]`. -/
+def pinArrVal : Value :=
+  .aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]
+
+/-- `*const [u32]` raw slice pointer `(&raw const _2) as *const [u32]` carrying borrow tag `77`
+(`= tagOfLoan 0`) over the pinned array's `16` bytes. -/
+def wide77 : WidePtrVal := WidePtrVal.mk ⟨77, 0⟩ 4
+
+/-- Callee body (run with an active protector, which the `activeProtectors = []`-only lifters
+could not step): `_4 = PtrMetadata(copy _1)`, `_5 = from_raw_parts(copy (_1.0), move _4)`,
+`_6 = size_of_val::<[u32]>(copy _5)`, `_7 = align_of_val::<[u32]>(move _5)`,
+`_0 = (move _6, move _7)` (`Layout::for_value_raw`). -/
 def pinBody : CapturedMir :=
-  { (Anneal.MirLoops.mkMirBody "test::dst_metadata_layout_with_pinned_borrow" 1
+  { (Anneal.MirLoops.mkMirBody "test::dst_metadata_layout_with_pinned_array" 1
       [{ mutability := .mut, ty := { kind := .tuple [.uint .usize, .uint .usize], layoutIdx := 1 },
          debugName := some "_0" },
        { mutability := .not, ty := { kind := .rawPtr .not (.slice (.uint .u32)), layoutIdx := 1 },
          debugName := some "raw_sl" },
-       { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 },
-         debugName := some "pinned_u32" },
+       { mutability := .mut, ty := pinArrTy, debugName := some "pinned_arr" },
        { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 },
          debugName := some "bound_u32" },
        { mutability := .mut, ty := usizeTy, debugName := some "meta_len" },
@@ -608,7 +642,7 @@ def pinBody : CapturedMir :=
             { kind := .assign { local_ := 5, projection := [] }
                 (.aggregate (.rawPtr sliceU32Ty .not)
                   [.copy { local_ := 1, projection := [.field 0 ptrU32Ty] },
-                   .copy { local_ := 4, projection := [] }])
+                   .move { local_ := 4, projection := [] }])
               span := "stmt_from_raw_parts" }]
          terminator :=
            { kind := .call (sizeOfValFn [.slice (.uint .u32)])
@@ -619,21 +653,23 @@ def pinBody : CapturedMir :=
        { statements := []
          terminator :=
            { kind := .call (alignOfValFn [.slice (.uint .u32)])
-               [.copy { local_ := 5, projection := [] }]
+               [.move { local_ := 5, projection := [] }]
                { local_ := 7, projection := [] } (some 2) .continue_
              span := "term_align_of_val" }
          isCleanup := false },
        retBlock
          [{ kind := .assign { local_ := 0, projection := [] }
               (.aggregate .tuple
-                [.copy { local_ := 6, projection := [] },
-                 .copy { local_ := 7, projection := [] }])
+                [.move { local_ := 6, projection := [] },
+                 .move { local_ := 7, projection := [] }])
             span := "stmt_layout_tuple" }]]) with
     layouts := layouts64 }
 
+/-- Tag `77`: unique borrow of the whole pinned array `_2` (`16` bytes); tag `78`: unique borrow
+of the bound `_3 : u32`. -/
 def pinBorrows : List BorrowEntry :=
   [{ tag := 77, targetLocal := 2, targetProjection := [], perm := .unique,
-     rangeOffset := 0, rangeLen := 4 },
+     rangeOffset := 0, rangeLen := 16 },
    { tag := 78, targetLocal := 3, targetProjection := [], perm := .unique,
      rangeOffset := 0, rangeLen := 4 }]
 
@@ -642,7 +678,10 @@ def pinSt : SymState StdVal :=
    [⟨0, .spatialPinned 0 pinCodec, ⟨.nat 42, .unborrowed⟩, .direct (.localReg 0) []⟩,
     ⟨1, .activeMut, ⟨.nat 99, .unborrowed⟩, .direct (.localReg 1) []⟩],
    [], [],
-   [⟨0, 0, .readWrite, 0, 0, [.rawByte 42, .rawByte 0, .rawByte 0, .rawByte 0]⟩],
+   [⟨0, 0, .readWrite, 0, 0,
+     [.rawByte 1, .rawByte 0, .rawByte 0, .rawByte 0, .rawByte 2, .rawByte 0, .rawByte 0, .rawByte 0,
+      .rawByte 3, .rawByte 0, .rawByte 0, .rawByte 0, .rawByte 4, .rawByte 0, .rawByte 0,
+      .rawByte 0]⟩],
    1⟩
 
 def pinMs0 : MachineState :=
@@ -650,23 +689,49 @@ def pinMs0 : MachineState :=
       { blockIdx := 0, stmtIdx := 0,
         locals :=
           [.uninit,
-           .init (WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4)),
-           .init (.scalar ⟨42, 4⟩),
+           .init (WidePtrVal.toValue 8 wide77),
+           .init pinArrVal,
            .init (.scalar ⟨99, 4⟩),
            .uninit, .uninit, .uninit, .uninit] }
-    memory := { borrows := pinBorrows } }
+    memory := { borrows := pinBorrows, activeProtectors := [5] } }
 
 theorem pinMs0_pinned_and_bound :
-    spatialPinnedBlockHolds tagOfLoan layouts64 u32Ty 0 0 pinCodec 2 [] pinSt pinMs0 ∧
+    spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt pinMs0 ∧
     spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt pinMs0 :=
   ⟨⟨_, _, [], _, rfl, ⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
     ⟨_, rfl, rfl, rfl, rfl⟩⟩,
    ⟨⟨trivial, trivial⟩,
     ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩⟩
 
+/-- **Coherence**: the pinned block's bytes, the live MIR byte window of `_2 : [u32; 4]`, and the
+`SliceTypedAt` image of the raw slice pointer `wide77` are the same `16` bytes. -/
+theorem pinned_window_eq_slice_image :
+    placeByteWindow? layouts64 pinArrTy pinMs0 2 [] =
+      some (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4) := rfl
+
+/-- The raw slice pointer `wide77` is a live `&mut [u32]`-style lens through tag `77` covering
+the pinned array's `16` bytes. -/
+theorem pinMutLens77 :
+    ActiveTypedSliceMutBorrow ByteLensCodec.u32LE pinMs0.memory.borrows 77 wide77 xs4
+      (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4) :=
+  ⟨sliceTypedAt_encodeElems ByteLensCodec.u32LE 77 xs4, _, rfl,
+    ⟨Nat.le_refl 0, Nat.le_refl 16⟩, TreeBorrowPerm.permitsUniqueWrite_unique⟩
+
+/-- `UnsizedSliceDstAt` for `wide77`, backed by the live borrow `77` in `pinMs0.memory`. -/
+theorem pinDst77 :
+    UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) pinMs0.memory wide77
+      (WidePtrVal.toValue 8 wide77) xs4 (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4) :=
+  UnsizedSliceDstAt.of_mutBorrow 8 (IsUnsizedSliceDstTy.slice (.uint .u32) 4) pinMutLens77
+
+/-- From `∀ e ∈ borrows, e.targetLocal ≠ d` (decidable on concrete tables) to the lookup form
+consumed by the `UnsizedSliceDstAt` frame rules. -/
+theorem lookupBorrow_targetLocal_ne_of_forall_mem {borrows : List BorrowEntry} {d : Local}
+    (h : ∀ e ∈ borrows, e.targetLocal ≠ d) :
+    ∀ tag e, lookupBorrow borrows tag = some e → e.targetLocal ≠ d :=
+  fun _ e he => h e (lookupBorrow_mem_and_tag he).1
+
 /-- **Wide-slice `StdValRefines` constructor, field projections, inversion, and round-trip**. -/
 theorem wideSlice_stdValRefines_witnesses :
-    let wide77 : WidePtrVal := WidePtrVal.mk ⟨77, 0⟩ 4
     stdValAlg.getField 0 (stdWideSliceVal 0 4) = some (.refVal 0 []) ∧
     stdValAlg.getField 1 (stdWideSliceVal 0 4) = some (.nat 4) ∧
     StdValRefines tagOfLoan (stdWideSliceVal 0 4) (WidePtrVal.toValue 8 wide77) ∧
@@ -686,11 +751,8 @@ theorem wideSlice_stdValRefines_witnesses :
        .ok (WidePtrVal.toValue 8 wide77) pinMs0.frame.locals pinMs0.memory ∧
      StdValRefines tagOfLoan (stdWideSliceVal 0 xs4.length) (WidePtrVal.toValue 8 wide77) ∧
      UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32))
-       pinMs0.memory wide77 (WidePtrVal.toValue 8 wide77) xs4 bytes16) := by
-  intro wide77
-  let hDst77 : UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32))
-      pinMs0.memory wide77 (WidePtrVal.toValue 8 wide77) xs4 bytes16 :=
-    UnsizedSliceDstAt.of_sliceTypedAt 8 (.uint .u32) pinMs0.memory arr_sliceTypedAt
+       pinMs0.memory wide77 (WidePtrVal.toValue 8 wide77) xs4
+       (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4)) := by
   have hRef8 : StdValRefines tagOfLoan (stdWideSliceVal 0 4) (WidePtrVal.toValue 8 wide77) :=
     StdValRefines.wideSlice8 tagOfLoan 0 wide77 rfl rfl (by decide)
   exact ⟨stdWideSliceVal_getField_zero 0 4,
@@ -698,66 +760,68 @@ theorem wideSlice_stdValRefines_witnesses :
     hRef8,
     StdValRefines.wideSlice_data_and_meta tagOfLoan 0 8 wide77 rfl rfl (by decide),
     hRef8.wideSlice_toValue_inv,
-    StdValRefines.of_unsizedSliceDstAt tagOfLoan 0 hDst77 rfl rfl (by decide),
+    StdValRefines.of_unsizedSliceDstAt tagOfLoan 0 pinDst77 rfl rfl (by decide),
     StdValRefines.wideSlice_ptrMetadata_refines tagOfLoan pinMs0.frame.locals pinMs0.frame.locals
-      (.copy { local_ := 1, projection := [] }) pinBody.localDecls layouts64 hDst77 (by decide) rfl,
+      (.copy { local_ := 1, projection := [] }) pinBody.localDecls layouts64 pinDst77 (by decide)
+      rfl,
     StdValRefines.wideSlice_from_raw_parts_roundtrip tagOfLoan 0 pinMs0.frame.locals 1 0
-      ptrU32Ty usizeTy .not pinBody.localDecls layouts64 hDst77
-      (StdValRefines.of_unsizedSliceDstAt tagOfLoan 0 hDst77 rfl rfl (by decide))
+      ptrU32Ty usizeTy .not pinBody.localDecls layouts64 pinDst77
+      (StdValRefines.of_unsizedSliceDstAt tagOfLoan 0 pinDst77 rfl rfl (by decide))
       rfl rfl rfl⟩
 
+/-- Locals after `_4 = PtrMetadata(copy _1)`. -/
 def pinLocals1 : List LocalSlot :=
-  [.uninit,
-   .init (WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4)),
-   .init (.scalar ⟨42, 4⟩),
-   .init (.scalar ⟨99, 4⟩),
-   .init (.scalar ⟨4, 8⟩),
-   .uninit, .uninit, .uninit]
+  [.uninit, .init (WidePtrVal.toValue 8 wide77), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+   .init (.scalar ⟨4, 8⟩), .uninit, .uninit, .uninit]
 
+/-- Locals after evaluating `[copy (_1.0), move _4]` (`_4` moved out). -/
+def pinLocals1Moved : List LocalSlot :=
+  [.uninit, .init (WidePtrVal.toValue 8 wide77), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+   .uninit, .uninit, .uninit, .uninit]
+
+/-- Locals after `_5 = from_raw_parts(copy (_1.0), move _4)`. -/
 def pinLocals2 : List LocalSlot :=
-  [.uninit,
-   .init (WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4)),
-   .init (.scalar ⟨42, 4⟩),
-   .init (.scalar ⟨99, 4⟩),
-   .init (.scalar ⟨4, 8⟩),
-   .init (WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4)),
-   .uninit, .uninit]
+  [.uninit, .init (WidePtrVal.toValue 8 wide77), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+   .uninit, .init (WidePtrVal.toValue 8 wide77), .uninit, .uninit]
 
+/-- Locals after `_6 = size_of_val(copy _5)`. -/
 def pinLocals3 : List LocalSlot :=
-  [.uninit,
-   .init (WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4)),
-   .init (.scalar ⟨42, 4⟩),
-   .init (.scalar ⟨99, 4⟩),
-   .init (.scalar ⟨4, 8⟩),
-   .init (WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4)),
-   .init (.scalar ⟨16, 8⟩),
-   .uninit]
+  [.uninit, .init (WidePtrVal.toValue 8 wide77), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+   .uninit, .init (WidePtrVal.toValue 8 wide77), .init (.scalar ⟨16, 8⟩), .uninit]
 
+/-- Locals after evaluating `[move _5]` (`_5` moved out). -/
+def pinLocals3Moved : List LocalSlot :=
+  [.uninit, .init (WidePtrVal.toValue 8 wide77), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+   .uninit, .uninit, .init (.scalar ⟨16, 8⟩), .uninit]
+
+/-- Locals after `_7 = align_of_val(move _5)`. -/
 def pinLocals4 : List LocalSlot :=
-  [.uninit,
-   .init (WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4)),
-   .init (.scalar ⟨42, 4⟩),
-   .init (.scalar ⟨99, 4⟩),
-   .init (.scalar ⟨4, 8⟩),
-   .init (WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4)),
-   .init (.scalar ⟨16, 8⟩),
-   .init (.scalar ⟨4, 8⟩)]
+  [.uninit, .init (WidePtrVal.toValue 8 wide77), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+   .uninit, .uninit, .init (.scalar ⟨16, 8⟩), .init (.scalar ⟨4, 8⟩)]
 
+/-- Locals after evaluating `[move _6]` and then `[move _7]`. -/
+def pinLocals4Moved6 : List LocalSlot :=
+  [.uninit, .init (WidePtrVal.toValue 8 wide77), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+   .uninit, .uninit, .uninit, .init (.scalar ⟨4, 8⟩)]
+
+def pinLocals4Moved : List LocalSlot :=
+  [.uninit, .init (WidePtrVal.toValue 8 wide77), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+   .uninit, .uninit, .uninit, .uninit]
+
+/-- Locals after `_0 = (move _6, move _7)`. -/
 def pinLocals5 : List LocalSlot :=
   [.init (.aggregate 0 [.scalar ⟨16, 8⟩, .scalar ⟨4, 8⟩]),
-   .init (WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4)),
-   .init (.scalar ⟨42, 4⟩),
-   .init (.scalar ⟨99, 4⟩),
-   .init (.scalar ⟨4, 8⟩),
-   .init (WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4)),
-   .init (.scalar ⟨16, 8⟩),
-   .init (.scalar ⟨4, 8⟩)]
+   .init (WidePtrVal.toValue 8 wide77), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+   .uninit, .uninit, .uninit, .uninit]
 
-/-- **End-to-end multi-step `MirWpConverges` + `spatialPinnedBlockHolds` preservation**:
-steps across `UnOp.ptrMetadata`, `AggregateKind.rawPtr` (`from_raw_parts`),
-`core::intrinsics::size_of_val`, `core::intrinsics::align_of_val`, and `Layout::for_value_raw`
-`(size, align)` tuple assembly, proving both `MirWpConverges` to `(16usize, 4usize)` and
-that the spatial pin on `_2` and loan binding on `_3` remain intact throughout without unpinning! -/
+/-- **End-to-end multi-step `MirWpConverges` + spatial-pin + unsized-lens preservation** with an
+active protector (`activeProtectors = [5]`): steps across
+`UnOp.ptrMetadata`, `AggregateKind.rawPtr` (`from_raw_parts`, with a `move` metadata operand),
+`core::intrinsics::size_of_val`, `core::intrinsics::align_of_val` (with a `move` argument), and
+`Layout::for_value_raw` `(size, align)` tuple assembly (`move` operands), proving
+`MirWpConverges` to `(16usize, 4usize)` and that the spatial pin on `_2 : [u32; 4]`, the loan
+binding on `_3`, the borrow-backed `UnsizedSliceDstAt` lens of the raw slice pointer into the
+pinned array, and its `ActiveTypedSliceMutBorrow` all remain intact after every step. -/
 theorem dst_metadata_and_layout_converges_preserving_spatialPin :
     Anneal.MirFuelFree.MirWpConverges pinBody pinMs0
       (fun out =>
@@ -765,62 +829,101 @@ theorem dst_metadata_and_layout_converges_preserving_spatialPin :
           out = .normal (.aggregate 0 [.scalar ⟨16, 8⟩, .scalar ⟨4, 8⟩], mem')) ∧
     ∃ ms1 ms2 ms3 ms4 ms5,
       PureMirExec.mirStep pinBody pinMs0 = .cont ms1 ∧
-      spatialPinnedBlockHolds tagOfLoan layouts64 u32Ty 0 0 pinCodec 2 [] pinSt ms1 ∧
+      spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt ms1 ∧
       spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt ms1 ∧
+      UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) ms1.memory wide77
+        (WidePtrVal.toValue 8 wide77) xs4 (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4) ∧
       PureMirExec.mirStep pinBody ms1 = .cont ms2 ∧
-      spatialPinnedBlockHolds tagOfLoan layouts64 u32Ty 0 0 pinCodec 2 [] pinSt ms2 ∧
+      spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt ms2 ∧
       spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt ms2 ∧
+      UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) ms2.memory wide77
+        (WidePtrVal.toValue 8 wide77) xs4 (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4) ∧
       PureMirExec.mirStep pinBody ms2 = .cont ms3 ∧
-      spatialPinnedBlockHolds tagOfLoan layouts64 u32Ty 0 0 pinCodec 2 [] pinSt ms3 ∧
+      spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt ms3 ∧
       spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt ms3 ∧
+      UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) ms3.memory wide77
+        (WidePtrVal.toValue 8 wide77) xs4 (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4) ∧
       PureMirExec.mirStep pinBody ms3 = .cont ms4 ∧
-      spatialPinnedBlockHolds tagOfLoan layouts64 u32Ty 0 0 pinCodec 2 [] pinSt ms4 ∧
+      spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt ms4 ∧
       spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt ms4 ∧
+      UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) ms4.memory wide77
+        (WidePtrVal.toValue 8 wide77) xs4 (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4) ∧
+      ActiveTypedSliceMutBorrow ByteLensCodec.u32LE ms4.memory.borrows 77 wide77 xs4
+        (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4) ∧
       PureMirExec.mirStep pinBody ms4 = .cont ms5 ∧
-      spatialPinnedBlockHolds tagOfLoan layouts64 u32Ty 0 0 pinCodec 2 [] pinSt ms5 ∧
-      spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt ms5 := by
+      spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt ms5 ∧
+      spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt ms5 ∧
+      UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) ms5.memory wide77
+        (WidePtrVal.toValue 8 wide77) xs4 (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4) := by
   obtain ⟨hPin0, hBind0⟩ := pinMs0_pinned_and_bound
-  have hNeBind4 : ∀ b, b ∈ [(1, 3, ([] : SubPath))] → b.2.1 ≠ 4 := by
-    intro b hb; cases hb with | head => decide | tail _ h => cases h
-  have hNeBind5 : ∀ b, b ∈ [(1, 3, ([] : SubPath))] → b.2.1 ≠ 5 := by
-    intro b hb; cases hb with | head => decide | tail _ h => cases h
-  have hNeBind6 : ∀ b, b ∈ [(1, 3, ([] : SubPath))] → b.2.1 ≠ 6 := by
-    intro b hb; cases hb with | head => decide | tail _ h => cases h
-  have hNeBind7 : ∀ b, b ∈ [(1, 3, ([] : SubPath))] → b.2.1 ≠ 7 := by
-    intro b hb; cases hb with | head => decide | tail _ h => cases h
-  have hNeBind0 : ∀ b, b ∈ [(1, 3, ([] : SubPath))] → b.2.1 ≠ 0 := by
-    intro b hb; cases hb with | head => decide | tail _ h => cases h
+  have hNeBind : ∀ d, d ≠ 3 → ∀ b, b ∈ [(1, 3, ([] : SubPath))] → b.2.1 ≠ d := by
+    intro d hd b hb
+    cases hb with
+    | head => exact fun h => hd h.symm
+    | tail _ h => cases h
+  -- Step 1: `_4 = PtrMetadata(copy _1)` (protector `5` active; no borrow targets `_4`).
   obtain ⟨hS1, hPin1, hBind1⟩ :=
     mirStep_assign_ptrMetadata_preserves_spatialPin tagOfLoan (body := pinBody) (cur := pinBody)
-      (ms := pinMs0) (dstLoc := 4) (locals₂ := pinLocals1) hPin0 hBind0 (by decide) hNeBind4
-      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl
+      (ms := pinMs0) (dstLoc := 4) (locals₁ := pinMs0.frame.locals) (locals₂ := pinLocals1)
+      hPin0 hBind0 (by decide) (hNeBind 4 (by decide))
+      rfl (Or.inl rfl) rfl rfl (PtrMetadataOf.wide wide77) rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      (hasProtectedWriteConflict_eq_false_of_forall_ne _ _ _ _ _ _ _ _ (by decide))
+      rfl rfl rfl
+  have hDst1 := pinDst77.of_invalidateConflictingBorrows (dstLoc := 4) .none 0
+    (lookupBorrow_targetLocal_ne_of_forall_mem (by decide))
+  -- Step 2: `_5 = from_raw_parts(copy (_1.0), move _4)`.
   obtain ⟨hS2, hPin2, hBind2⟩ :=
-    mirStep_assign_aggregate_rawPtr_preserves_spatialPin tagOfLoan (body := pinBody) (cur := pinBody)
-      (dstLoc := 5) (locals₃ := pinLocals2) hPin1 hBind1 (by decide) hNeBind5
-      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl
+    mirStep_assign_aggregate_rawPtr_preserves_spatialPin tagOfLoan (body := pinBody)
+      (cur := pinBody) (dstLoc := 5) (p := ⟨77, 0⟩) (len := 4) (locals₁ := pinLocals1)
+      (locals₂ := pinLocals1Moved) (locals₃ := pinLocals2) hPin1 hBind1 (by decide)
+      (hNeBind 5 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl rfl
+  have hDst2 := hDst1.of_invalidateConflictingBorrows (dstLoc := 5) .none 0
+    (lookupBorrow_targetLocal_ne_of_forall_mem (by decide))
+  -- Step 3: `_6 = size_of_val::<[u32]>(copy _5)`.
   obtain ⟨hS3, hPin3, hBind3⟩ :=
     mirStep_call_sizeOfVal_slice_preserves_spatialPin tagOfLoan (body := pinBody) (cur := pinBody)
-      (dstLoc := 6) (updatedLocals := pinLocals3) hPin2 hBind2 (by decide) hNeBind6
-      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
+      (dstLoc := 6) (p := ⟨77, 0⟩) (len := 4) (locals' := pinLocals2)
+      (updatedLocals := pinLocals3) hPin2 hBind2 (by decide) (hNeBind 6 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl (by decide) rfl rfl rfl
+  have hDst3 := hDst2.of_invalidateDirectDestWriteBorrows (dstLoc := 6) pinLocals2
+    (lookupBorrow_targetLocal_ne_of_forall_mem (by decide))
+  -- Step 4: `_7 = align_of_val::<[u32]>(move _5)`.
   obtain ⟨hS4, hPin4, hBind4⟩ :=
     mirStep_call_alignOfVal_slice_preserves_spatialPin tagOfLoan (body := pinBody) (cur := pinBody)
-      (dstLoc := 7) (updatedLocals := pinLocals4) hPin3 hBind3 (by decide) hNeBind7
-      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
+      (dstLoc := 7) (p := ⟨77, 0⟩) (len := 4) (locals' := pinLocals3Moved)
+      (updatedLocals := pinLocals4) hPin3 hBind3 (by decide) (hNeBind 7 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl rfl (by decide) rfl rfl rfl
+  have hDst4 := hDst3.of_invalidateDirectDestWriteBorrows (dstLoc := 7) pinLocals3Moved
+    (lookupBorrow_targetLocal_ne_of_forall_mem (by decide))
+  -- Step 5: `_0 = (move _6, move _7)`.
   obtain ⟨hS5, hPin5, hBind5⟩ :=
     mirStep_assign_layout_tuple_preserves_spatialPin tagOfLoan (body := pinBody) (cur := pinBody)
       (dstLoc := 0) (vSize := .scalar ⟨16, 8⟩) (vAlign := .scalar ⟨4, 8⟩)
-      (locals₃ := pinLocals5) hPin4 hBind4 (by decide) hNeBind0
-      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl
+      (locals₁ := pinLocals4Moved6) (locals₂ := pinLocals4Moved) (locals₃ := pinLocals5)
+      hPin4 hBind4 (by decide) (hNeBind 0 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl rfl
+  have hDst5 := hDst4.of_invalidateConflictingBorrows (dstLoc := 0) .none 0
+    (lookupBorrow_targetLocal_ne_of_forall_mem (by decide))
   have hConv : Anneal.MirFuelFree.MirWpConverges pinBody pinMs0
       (fun out =>
         ∃ mem', out = .normal (.aggregate 0 [.scalar ⟨16, 8⟩, .scalar ⟨4, 8⟩], mem')) :=
     ⟨6, ⟨_, rfl⟩⟩
   exact ⟨hConv, _, _, _, _, _,
-    hS1, hPin1, hBind1,
-    hS2, hPin2, hBind2,
-    hS3, hPin3, hBind3,
-    hS4, hPin4, hBind4,
-    hS5, hPin5, hBind5⟩
+    hS1, hPin1, hBind1, hDst1,
+    hS2, hPin2, hBind2, hDst2,
+    hS3, hPin3, hBind3, hDst3,
+    hS4, hPin4, hBind4, hDst4, pinMutLens77,
+    hS5, hPin5, hBind5, hDst5⟩
 
 /-! ## 6. Negative UB-Rejection Canaries & Metadata-Without-Deref Contrast -/
 
@@ -971,7 +1074,244 @@ theorem metadata_without_deref_oob_and_disabled_contrast :
    evalNonSelectIntrinsicCall_sizeOfVal_slice pinMs0 _ _ _ [] _
      { local_ := 2, projection := [] } 1 (.uint .u32) 4 p9 5 rfl rfl (by decide)⟩
 
-/-! ## 7. Automated `run_cmd` Axiom & Reachability Audit -/
+/-- A `sizeAlignSliceCallerMir` state at block `bb` with `_1 := v` over `mem0`. -/
+def ubState (v : Value) (bb : Nat) : MachineState :=
+  { frame := { blockIdx := bb, stmtIdx := 0, locals := [.uninit, .init v, .uninit, .uninit] }
+    memory := mem0 }
+
+/-- **`stepMirFn`-level exact `isize` boundary** on the live `[u32]` caller body: `size_of_val`
+with `len = 2^61 - 1` steps to `bb1` writing `(2^61 - 1) * 4 = 2^63 - 4`, while `len = 2^61`
+(`len * 4 = 2^63 = signedHalfModulus 8`) faults `MirStepNode.fail .ub` (`mirStep` `.fault`) for
+both `size_of_val` (explicit `typeArgs`) and `align_of_val` (`operandTy` fallback), and a thin
+pointer passed for `[u32]` faults as well. -/
+theorem size_and_align_stepMirFn_boundary_canaries :
+    let bodyU32 := sizeAlignSliceCallerMir (.uint .u32)
+    let okLocals : List LocalSlot :=
+      [.uninit, .init (.aggregate 0 [.ptr p9 8, .scalar ⟨lenMaxOk, 8⟩]),
+       .init (.scalar ⟨lenMaxOk * 4, 8⟩), .uninit]
+    (∃ s', PureMirExec.mirStep bodyU32
+        (ubState (.aggregate 0 [.ptr p9 8, .scalar ⟨lenMaxOk, 8⟩]) 0) = .cont s' ∧
+      s'.frame.locals = okLocals ∧ s'.frame.blockIdx = 1) ∧
+    (stepMirFn bodyU32 (ubState (.aggregate 0 [.ptr p9 8, .scalar ⟨lenOverflow, 8⟩]) 0) =
+        MirStepNode.fail .ub ∧
+      PureMirExec.mirStep bodyU32
+        (ubState (.aggregate 0 [.ptr p9 8, .scalar ⟨lenOverflow, 8⟩]) 0) = .fault) ∧
+    (stepMirFn bodyU32 (ubState (.aggregate 0 [.ptr p9 8, .scalar ⟨lenOverflow, 8⟩]) 1) =
+        MirStepNode.fail .ub ∧
+      PureMirExec.mirStep bodyU32
+        (ubState (.aggregate 0 [.ptr p9 8, .scalar ⟨lenOverflow, 8⟩]) 1) = .fault) ∧
+    (stepMirFn bodyU32 (ubState (.ptr p9 8) 0) = MirStepNode.fail .ub ∧
+      PureMirExec.mirStep bodyU32 (ubState (.ptr p9 8) 0) = .fault) := by
+  intro bodyU32 okLocals
+  obtain ⟨_, hOk, _, _⟩ := mirStep_call_sizeOfVal_slice (body := bodyU32) (cur := bodyU32)
+    (s := ubState (.aggregate 0 [.ptr p9 8, .scalar ⟨lenMaxOk, 8⟩]) 0)
+    (p := p9) (len := lenMaxOk)
+    (locals' := (ubState (.aggregate 0 [.ptr p9 8, .scalar ⟨lenMaxOk, 8⟩]) 0).frame.locals)
+    (updatedLocals := okLocals)
+    rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
+  exact ⟨⟨_, hOk, rfl, rfl⟩,
+    mirStep_call_sizeOfVal_slice_overflow_ub (body := bodyU32) (cur := bodyU32)
+      (s := ubState (.aggregate 0 [.ptr p9 8, .scalar ⟨lenOverflow, 8⟩]) 0)
+      (p := p9) (len := lenOverflow)
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) (by decide),
+    mirStep_call_alignOfVal_slice_overflow_ub (body := bodyU32) (cur := bodyU32)
+      (s := ubState (.aggregate 0 [.ptr p9 8, .scalar ⟨lenOverflow, 8⟩]) 1)
+      (p := p9) (len := lenOverflow)
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide) (by decide),
+    mirStep_call_sizeOfVal_unsized_thinPtr_ub (body := bodyU32) (cur := bodyU32)
+      (s := ubState (.ptr p9 8) 0) (dstTy := .slice (.uint .u32)) (p := p9) (ptrSz := 8)
+      (Or.inl ⟨_, rfl⟩) rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl⟩
+
+/-! ## 7. Sized `size_of_val` / `align_of_val` Lifters, Protectors, and `str` Spatial Pins -/
+
+/-- `size_of_val::<u32>(copy _1)` (explicit `typeArgs`) and `align_of_val(copy _1)` (`operandTy`
+fallback on `*const u32`) on a thin pointer, then `_0 = (copy _2, copy _3)`. -/
+def sizedCallerMir : CapturedMir :=
+  { (Anneal.MirLoops.mkMirBody "test::size_align_sized" 1
+      [{ mutability := .mut, ty := { kind := .tuple [.uint .usize, .uint .usize], layoutIdx := 1 },
+         debugName := some "_0" },
+       { mutability := .not, ty := ptrU32Ty, debugName := some "p" },
+       { mutability := .mut, ty := usizeTy, debugName := some "sz" },
+       { mutability := .mut, ty := usizeTy, debugName := some "al" }]
+      [{ statements := []
+         terminator :=
+           { kind := .call (sizeOfValFn [.uint .u32])
+               [.copy { local_ := 1, projection := [] }]
+               { local_ := 2, projection := [] } (some 1) .continue_
+             span := "call_size_of_val_sized" }
+         isCleanup := false },
+       { statements := []
+         terminator :=
+           { kind := .call (alignOfValFn [])
+               [.copy { local_ := 1, projection := [] }]
+               { local_ := 3, projection := [] } (some 2) .continue_
+             span := "call_align_of_val_sized_fallback" }
+         isCleanup := false },
+       retBlock
+         [{ kind := .assign { local_ := 0, projection := [] }
+              (.aggregate .tuple
+                [.copy { local_ := 2, projection := [] },
+                 .copy { local_ := 3, projection := [] }])
+            span := "mk_layout_tuple" }]]) with
+    layouts := layouts64 }
+
+/-- Sized `size_of_val::<u32>` (`4`) and `align_of_val::<u32>` (`4`) one-step lifters. -/
+theorem size_and_align_sized_lifters :
+    let s0 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0,
+                   locals := [.uninit, .init (.ptr p9 8), .uninit, .uninit] }
+        memory := mem0 }
+    let s1 : MachineState :=
+      { frame := { blockIdx := 1, stmtIdx := 0,
+                   locals := [.uninit, .init (.ptr p9 8), .init (.scalar ⟨4, 8⟩), .uninit] }
+        memory := mem0 }
+    let s2 : MachineState :=
+      { frame := { blockIdx := 2, stmtIdx := 0,
+                   locals := [.uninit, .init (.ptr p9 8), .init (.scalar ⟨4, 8⟩),
+                              .init (.scalar ⟨4, 8⟩)] }
+        memory := mem0 }
+    PureMirExec.mirStep sizedCallerMir s0 = .cont s1 ∧
+    PureMirExec.mirStep sizedCallerMir s1 = .cont s2 := by
+  intro s0 s1 s2
+  obtain ⟨_, h1, _, _⟩ := mirStep_call_sizeOfVal_sized (body := sizedCallerMir)
+    (cur := sizedCallerMir) (s := s0) (p := p9) (locals' := s0.frame.locals)
+    (updatedLocals := s1.frame.locals)
+    rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
+  obtain ⟨_, h2, _, _⟩ := mirStep_call_alignOfVal_sized (body := sizedCallerMir)
+    (cur := sizedCallerMir) (s := s1) (p := p9) (locals' := s1.frame.locals)
+    (updatedLocals := s2.frame.locals)
+    rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+  exact ⟨h1, h2⟩
+
+/-- Callee memory in which the borrow `77` of `_2` is protected by the active protector `5`. -/
+def protMem : Memory :=
+  { borrows := [{ tag := 77, targetLocal := 2, targetProjection := [], perm := .unique,
+                  rangeOffset := 0, rangeLen := 16, protector := some 5 }]
+    activeProtectors := [5] }
+
+/-- **Protector side condition is exact**: with the borrow `77` of `_2` protected by the active
+protector `5`, `_4 = PtrMetadata(copy _1)` steps (no borrow targets the fresh temporary `_4`),
+whereas a write to the protected array `_2` itself is a protected write conflict. -/
+theorem ptrMetadata_step_under_active_protector :
+    (∃ s', PureMirExec.mirStep pinBody { pinMs0 with memory := protMem } = .cont s') ∧
+    hasProtectedWriteConflict protMem.borrows protMem.activeProtectors 2 .none .nil 0 0 0 =
+      true := by
+  obtain ⟨_, hMir, _, _⟩ := mirStep_assign_ptrMetadata_wide (body := pinBody) (cur := pinBody)
+    (s := { pinMs0 with memory := protMem }) (p := ⟨77, 0⟩) (len := 4)
+    (locals₁ := pinMs0.frame.locals)
+    (locals₂ := pinLocals1)
+    rfl (Or.inl rfl) rfl rfl rfl
+    (hasProtectedWriteConflict_eq_false_of_forall_ne _ _ _ _ _ _ _ _ (by decide)) rfl rfl rfl
+  exact ⟨⟨_, hMir⟩, rfl⟩
+
+/-- `size_of_val::<str>(copy _1)` and `align_of_val(move _1)` (`operandTy` fallback on `&str`)
+inside the protected callee with the pinned array `_2` and bound `_3`. -/
+def pinStrBody : CapturedMir :=
+  { (Anneal.MirLoops.mkMirBody "test::str_layout_with_pinned_array" 1
+      [{ mutability := .mut, ty := { kind := .tuple [.uint .usize, .uint .usize], layoutIdx := 1 },
+         debugName := some "_0" },
+       { mutability := .not, ty := { kind := .ref .not .str, layoutIdx := 1 },
+         debugName := some "s" },
+       { mutability := .mut, ty := pinArrTy, debugName := some "pinned_arr" },
+       { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 },
+         debugName := some "bound_u32" },
+       { mutability := .mut, ty := usizeTy, debugName := some "sz" },
+       { mutability := .mut, ty := usizeTy, debugName := some "al" }]
+      [{ statements := []
+         terminator :=
+           { kind := .call (sizeOfValFn [.str])
+               [.copy { local_ := 1, projection := [] }]
+               { local_ := 4, projection := [] } (some 1) .continue_
+             span := "call_size_of_val_str" }
+         isCleanup := false },
+       { statements := []
+         terminator :=
+           { kind := .call (alignOfValFn [])
+               [.move { local_ := 1, projection := [] }]
+               { local_ := 5, projection := [] } (some 2) .continue_
+             span := "call_align_of_val_str" }
+         isCleanup := false },
+       retBlock
+         [{ kind := .assign { local_ := 0, projection := [] }
+              (.aggregate .tuple
+                [.copy { local_ := 4, projection := [] },
+                 .copy { local_ := 5, projection := [] }])
+            span := "mk_layout_tuple" }]]) with
+    layouts := layouts64 }
+
+def pinStrMs0 : MachineState :=
+  { frame :=
+      { blockIdx := 0, stmtIdx := 0,
+        locals :=
+          [.uninit, .init (WidePtrVal.toValue 8 wideStr5), .init pinArrVal,
+           .init (.scalar ⟨99, 4⟩), .uninit, .uninit] }
+    memory := { mem0 with borrows := pinBorrows, activeProtectors := [5] } }
+
+def pinStrLocals1 : List LocalSlot :=
+  [.uninit, .init (WidePtrVal.toValue 8 wideStr5), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
+   .init (.scalar ⟨5, 8⟩), .uninit]
+
+def pinStrLocals1Moved : List LocalSlot :=
+  [.uninit, .uninit, .init pinArrVal, .init (.scalar ⟨99, 4⟩), .init (.scalar ⟨5, 8⟩), .uninit]
+
+def pinStrLocals2 : List LocalSlot :=
+  [.uninit, .uninit, .init pinArrVal, .init (.scalar ⟨99, 4⟩), .init (.scalar ⟨5, 8⟩),
+   .init (.scalar ⟨1, 8⟩)]
+
+/-- **`str` dynamic layout queries preserve the spatial pin and the global-backed `str` lens**:
+`size_of_val::<str>` (`5`) and `align_of_val::<str>` (`1`, with a `move` argument) step while the
+pinned array `_2`, the loan binding on `_3`, and `UnsizedStrDstAt` over the captured global
+`"hello"` all stay intact. -/
+theorem str_size_align_preserving_spatialPin :
+    ∃ ms1 ms2,
+      PureMirExec.mirStep pinStrBody pinStrMs0 = .cont ms1 ∧
+      spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt ms1 ∧
+      spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt ms1 ∧
+      UnsizedStrDstAt 8 ms1.memory wideStr5 (WidePtrVal.toValue 8 wideStr5) helloBytes
+        bytesStr5 ∧
+      PureMirExec.mirStep pinStrBody ms1 = .cont ms2 ∧
+      spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt ms2 ∧
+      spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt ms2 ∧
+      UnsizedStrDstAt 8 ms2.memory wideStr5 (WidePtrVal.toValue 8 wideStr5) helloBytes
+        bytesStr5 := by
+  have hPin0 :
+      spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt pinStrMs0 :=
+    ⟨_, _, [], _, rfl, ⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+      ⟨_, rfl, rfl, rfl, rfl⟩⟩
+  have hBind0 : spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt pinStrMs0 :=
+    ⟨⟨trivial, trivial⟩,
+      ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩
+  have hNeBind : ∀ d, d ≠ 3 → ∀ b, b ∈ [(1, 3, ([] : SubPath))] → b.2.1 ≠ d := by
+    intro d hd b hb
+    cases hb with
+    | head => exact fun h => hd h.symm
+    | tail _ h => cases h
+  have hStr0 : UnsizedStrDstAt 8 pinStrMs0.memory wideStr5 (WidePtrVal.toValue 8 wideStr5)
+      helloBytes bytesStr5 :=
+    str_unsizedDst64.of_frame rfl (fun _ _ h => by cases h)
+  obtain ⟨hS1, hPin1, hBind1⟩ :=
+    mirStep_call_sizeOfVal_str_preserves_spatialPin tagOfLoan (body := pinStrBody)
+      (cur := pinStrBody) (ms := pinStrMs0) (dstLoc := 4) (p := p10) (len := 5)
+      (locals' := pinStrMs0.frame.locals) (updatedLocals := pinStrLocals1) hPin0 hBind0
+      (by decide) (hNeBind 4 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl (by decide) rfl rfl rfl
+  have hStr1 := hStr0.of_invalidateDirectDestWriteBorrows (dstLoc := 4) pinStrMs0.frame.locals
+    (lookupBorrow_targetLocal_ne_of_forall_mem (by decide))
+  obtain ⟨hS2, hPin2, hBind2⟩ :=
+    mirStep_call_alignOfVal_str_preserves_spatialPin tagOfLoan (body := pinStrBody)
+      (cur := pinStrBody) (dstLoc := 5) (p := p10) (len := 5)
+      (locals' := pinStrLocals1Moved) (updatedLocals := pinStrLocals2) hPin1 hBind1
+      (by decide) (hNeBind 5 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl (by decide) rfl rfl rfl
+  have hStr2 := hStr1.of_invalidateDirectDestWriteBorrows (dstLoc := 5) pinStrLocals1Moved
+    (lookupBorrow_targetLocal_ne_of_forall_mem (by decide))
+  exact ⟨_, _, hS1, hPin1, hBind1, hStr1, hS2, hPin2, hBind2, hStr2⟩
+
+/-! ## 8. Automated `run_cmd` Axiom & Reachability Audit -/
 
 open Lean Elab Command in
 run_cmd do

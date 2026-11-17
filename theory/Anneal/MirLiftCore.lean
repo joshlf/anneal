@@ -19427,6 +19427,58 @@ theorem invalidateDirectDestWriteBorrows_eq_self_of_forall_ne (mem : Memory)
         (length mem.callStack) (by rw [← hb]; exact hDisj)
     rw [hEq, ← hb]
 
+/-- `invalidateDirectDestWriteBorrows` only rewrites `borrows`: it is `{ mem with borrows := bs }`
+for some `bs`, for every destination place. -/
+theorem invalidateDirectDestWriteBorrows_eq_with_borrows (mem : Memory) (locals : List LocalSlot)
+    (dst : Place) :
+    ∃ bs, invalidateDirectDestWriteBorrows mem locals dst = { mem with borrows := bs } := by
+  unfold invalidateDirectDestWriteBorrows
+  cases mem.borrows with
+  | nil => exact ⟨mem.borrows, rfl⟩
+  | cons bHead bTail =>
+    dsimp only
+    cases dst.projection with
+    | nil => exact ⟨_, rfl⟩
+    | cons proj rest =>
+      cases proj with
+      | deref => exact ⟨mem.borrows, rfl⟩
+      | _ => exact ⟨_, rfl⟩
+
+@[simp]
+theorem invalidateDirectDestWriteBorrows_globals (mem : Memory) (locals : List LocalSlot)
+    (dst : Place) : (invalidateDirectDestWriteBorrows mem locals dst).globals = mem.globals := by
+  obtain ⟨bs, h⟩ := invalidateDirectDestWriteBorrows_eq_with_borrows mem locals dst
+  rw [h]
+
+@[simp]
+theorem invalidateDirectDestWriteBorrows_callerLocals (mem : Memory) (locals : List LocalSlot)
+    (dst : Place) :
+    (invalidateDirectDestWriteBorrows mem locals dst).callerLocals = mem.callerLocals := by
+  obtain ⟨bs, h⟩ := invalidateDirectDestWriteBorrows_eq_with_borrows mem locals dst
+  rw [h]
+
+/-- When no entry of `borrows` targets `targetLocal`, `hasProtectedWriteConflict` reports no
+conflict for any set of active protectors (e.g. writes to fresh MIR temporaries inside a
+function whose `&mut` / `&` arguments carry `FnEntry` protectors). -/
+theorem hasProtectedWriteConflict_eq_false_of_forall_ne :
+    ∀ (borrows : List BorrowEntry) (activeProtectors : List Nat) (targetLocal : Local)
+      (writerTag : Option Nat) (writeProj : List ProjectionElem)
+      (writeRangeOff writeRangeLen targetFrameDepth : Nat),
+      (∀ e ∈ borrows, e.targetLocal ≠ targetLocal) →
+      hasProtectedWriteConflict borrows activeProtectors targetLocal writerTag writeProj
+        writeRangeOff writeRangeLen targetFrameDepth = false
+  | [], _, _, _, _, _, _, _, _ => rfl
+  | e :: rest, prots, targetLocal, writerTag, writeProj, off, len, depth, hDisj => by
+    have ih := hasProtectedWriteConflict_eq_false_of_forall_ne rest prots targetLocal writerTag
+      writeProj off len depth (fun b hb => hDisj b (List.Mem.tail _ hb))
+    have hBeq : Nat.beq e.targetLocal targetLocal = false := by
+      cases hb : Nat.beq e.targetLocal targetLocal with
+      | false => rfl
+      | true => exact False.elim (hDisj e (List.Mem.head _) (Nat.eq_of_beq_eq_true hb))
+    unfold hasProtectedWriteConflict
+    simp only [hBeq, Bool.and_false, Bool.false_and]
+    exact ih
+
 /-! ### 1. `UnOp.ptrMetadata`, `AggregateKind.rawPtr`, and `to_raw_parts` Rvalue Lemmas -/
 
 /-- **`evalRvalue_unaryOp_ptrMetadata_wide`**: `Rvalue.unaryOp .ptrMetadata op` on a wide pointer
@@ -20252,7 +20304,13 @@ theorem mirStep_and_wp_of_stepMirFn_step {body : CapturedMir} {s s' : MachineSta
 
 /-- **`mirStep_assign_local`**: composable single-step lifter for `StatementKind.assign` into an
 unprojected local `{ local_ := dstLoc, projection := [] }`, yielding `stepMirFn`, `mirStep`,
-`wpMirBounded`, and `WpConverges` transitions in one rule. -/
+`wpMirBounded`, and `WpConverges` transitions in one rule.
+
+The protector side condition is exactly the trusted one: the write must not conflict with a
+protected borrow (`hasProtectedWriteConflict ... = false`). It holds for any write when no
+protectors are active (`hasProtectedWriteConflict_nil`) and for writes to locals no
+borrow targets (`hasProtectedWriteConflict_eq_false_of_forall_ne`), so the lifter also applies
+inside callees whose reference arguments carry `FnEntry` protectors. -/
 theorem mirStep_assign_local {body cur : CapturedMir} {s : MachineState}
     {blk : BasicBlockData} {dstLoc : Local} {rv : Rvalue} {span : String}
     {val : Value} {locals₁ locals₂ : List LocalSlot} {mem₁ : Memory} {slot : LocalSlot}
@@ -20262,7 +20320,8 @@ theorem mirStep_assign_local {body cur : CapturedMir} {s : MachineState}
     (hStmt : get? blk.statements s.frame.stmtIdx =
       some { kind := .assign { local_ := dstLoc, projection := [] } rv, span := span })
     (hRv : evalRvalue s.frame.locals rv s.memory cur.localDecls cur.layouts = .ok val locals₁ mem₁)
-    (hProt : mem₁.activeProtectors = [])
+    (hProt : hasProtectedWriteConflict mem₁.borrows mem₁.activeProtectors dstLoc .none .nil 0 0
+      (length mem₁.callStack) = false)
     (hSlot : get? locals₁ dstLoc = some slot)
     (hLive : slotLive slot = true)
     (hSet : set? locals₁ dstLoc (.init val) = some locals₂) :
@@ -20293,17 +20352,31 @@ theorem mirStep_assign_local {body cur : CapturedMir} {s : MachineState}
       rw [hSet]
       dsimp only []
       unfold s'
-      rw [hProt]
-      rcases s with ⟨⟨bb, stIdx, locs⟩, mem⟩
-      rfl
+      cases hP : mem₁.activeProtectors with
+      | nil =>
+        rcases s with ⟨⟨bb, stIdx, locs⟩, mem⟩
+        rfl
+      | cons ph pt =>
+        rw [hP] at hProt
+        dsimp only []
+        rw [hProt]
+        rcases s with ⟨⟨bb, stIdx, locs⟩, mem⟩
+        rfl
     | init _ =>
       dsimp only []
       rw [hSet]
       dsimp only []
       unfold s'
-      rw [hProt]
-      rcases s with ⟨⟨bb, stIdx, locs⟩, mem⟩
-      rfl
+      cases hP : mem₁.activeProtectors with
+      | nil =>
+        rcases s with ⟨⟨bb, stIdx, locs⟩, mem⟩
+        rfl
+      | cons ph pt =>
+        rw [hP] at hProt
+        dsimp only []
+        rw [hProt]
+        rcases s with ⟨⟨bb, stIdx, locs⟩, mem⟩
+        rfl
   have hStep : stepMirFn body s = MirStepNode.step s' := hStepStmt.trans hEv
   obtain ⟨hMir, hWp, hConv⟩ := mirStep_and_wp_of_stepMirFn_step hStep
   exact ⟨hStep, hMir, hWp, hConv⟩
@@ -20323,7 +20396,8 @@ theorem mirStep_assign_ptrMetadata_wide {body cur : CapturedMir} {s : MachineSta
       s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p (layoutPointerBytes cur.layouts),
           .scalar ⟨len, layoutPointerBytes cur.layouts⟩]) locals₁)
-    (hProt : s.memory.activeProtectors = [])
+    (hProt : hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors dstLoc .none
+      .nil 0 0 (length s.memory.callStack) = false)
     (hSlot : get? locals₁ dstLoc = some slot)
     (hLive : slotLive slot = true)
     (hSet : set? locals₁ dstLoc (.init (.scalar ⟨len, layoutPointerBytes cur.layouts⟩)) =
@@ -20364,7 +20438,8 @@ theorem mirStep_assign_aggregate_rawPtr_wide {body cur : CapturedMir} {s : Machi
     (hMeta : evalOperand locals₁ metaOp s.memory.borrows s.memory.globals cur.layouts
       s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.scalar ⟨len, layoutPointerBytes cur.layouts⟩) locals₂)
-    (hProt : s.memory.activeProtectors = [])
+    (hProt : hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors dstLoc .none
+      .nil 0 0 (length s.memory.callStack) = false)
     (hSlot : get? locals₂ dstLoc = some slot)
     (hLive : slotLive slot = true)
     (hSet : set? locals₂ dstLoc
@@ -20402,7 +20477,8 @@ theorem mirStep_assign_layout_tuple {body cur : CapturedMir} {s : MachineState}
       s.memory.callerLocals cur.localDecls s.memory.callStack = .ok vSize locals₁)
     (hAlign : evalOperand locals₁ alignOp s.memory.borrows s.memory.globals cur.layouts
       s.memory.callerLocals cur.localDecls s.memory.callStack = .ok vAlign locals₂)
-    (hProt : s.memory.activeProtectors = [])
+    (hProt : hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors dstLoc .none
+      .nil 0 0 (length s.memory.callStack) = false)
     (hSlot : get? locals₂ dstLoc = some slot)
     (hLive : slotLive slot = true)
     (hSet : set? locals₂ dstLoc (.init (.aggregate 0 [vSize, vAlign])) = some locals₃) :
@@ -20676,6 +20752,364 @@ theorem mirStep_call_alignOfVal_str {body cur : CapturedMir} {s : MachineState}
     rw [hStepTerm, hTerm, hEvTerm, hEvIntr, hWr]
   obtain ⟨hMir, hWp, hConv⟩ := mirStep_and_wp_of_stepMirFn_step hStep
   exact ⟨hStep, hMir, hWp, hConv⟩
+
+/-! ### 4. General Intrinsic-Call Combinators, `stepMirFn`-Level UB Faults, and Sized Lifters -/
+
+/-- **`stepMirFn_call_nonSelectIntrinsic`**: at a block terminator, a direct
+`TerminatorKind.call` to any non-`const_eval_select` compiler intrinsic with no
+`s.memory.callees` override steps exactly as `evalNonSelectIntrinsicCall`, so every
+intrinsic-level lemma (positive or `.ub`) lifts to `stepMirFn` by one rewrite. -/
+theorem stepMirFn_call_nonSelectIntrinsic {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func : Operand} {argOps : List Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {defPath : DefPath} {typeArgs : List RigidTy} {kind : RustIntrinsicKind}
+    {argVals : List Value} {locals' : List LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func argOps destination (some targetBb) unwind, span := span })
+    (hCallee : extractCallee? func = some (defPath, typeArgs))
+    (hArgs : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts defPath typeArgs
+      s.memory.traitImpls = none)
+    (hNoExact :
+      isDirectExactDivTarget
+        { defPath := defPath, typeArgs := typeArgs, fnSig := none, isIndirect := false } = false)
+    (hKind : classifyRustIntrinsic? defPath = some kind)
+    (hNonSelect : isNonSelectIntrinsicOpt (some kind) = true) :
+    stepMirFn body s =
+      evalNonSelectIntrinsicCall kind s
+        { defPath := defPath, typeArgs := typeArgs, fnSig := none, isIndirect := false }
+        cur.localDecls cur.layouts argOps argVals locals' destination targetBb := by
+  rw [stepMirFn_frame_term_constructive hCur hPhase hBb hEnd, hTerm]
+  exact evalTerminator_call_nonSelectIntrinsic s cur func argOps destination targetBb unwind span
+    defPath typeArgs kind argVals locals' hCallee hArgs hNoOverride hNoExact hKind hNonSelect
+
+/-- A `MirStepNode.fail fk` trusted step is a `mirStep` `.fault`. -/
+theorem mirStep_of_stepMirFn_fail {body : CapturedMir} {s : MachineState} {fk : FailureKind}
+    (h : stepMirFn body s = MirStepNode.fail fk) : mirStep body s = .fault := by
+  unfold mirStep
+  rw [h]
+  rfl
+
+/-- **`mirStep_call_nonSelectIntrinsic_fail`**: an intrinsic-level fault
+(`evalNonSelectIntrinsicCall ... = MirStepNode.fail fk`) at a block terminator is a `stepMirFn`
+fault and a `mirStep` `.fault`. -/
+theorem mirStep_call_nonSelectIntrinsic_fail {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func : Operand} {argOps : List Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {defPath : DefPath} {typeArgs : List RigidTy} {kind : RustIntrinsicKind}
+    {argVals : List Value} {locals' : List LocalSlot} {fk : FailureKind}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func argOps destination (some targetBb) unwind, span := span })
+    (hCallee : extractCallee? func = some (defPath, typeArgs))
+    (hArgs : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts defPath typeArgs
+      s.memory.traitImpls = none)
+    (hNoExact :
+      isDirectExactDivTarget
+        { defPath := defPath, typeArgs := typeArgs, fnSig := none, isIndirect := false } = false)
+    (hKind : classifyRustIntrinsic? defPath = some kind)
+    (hNonSelect : isNonSelectIntrinsicOpt (some kind) = true)
+    (hFail : evalNonSelectIntrinsicCall kind s
+        { defPath := defPath, typeArgs := typeArgs, fnSig := none, isIndirect := false }
+        cur.localDecls cur.layouts argOps argVals locals' destination targetBb =
+      MirStepNode.fail fk) :
+    stepMirFn body s = MirStepNode.fail fk ∧ mirStep body s = .fault := by
+  have hStep : stepMirFn body s = MirStepNode.fail fk :=
+    (stepMirFn_call_nonSelectIntrinsic hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
+      hNoExact hKind hNonSelect).trans hFail
+  exact ⟨hStep, mirStep_of_stepMirFn_fail hStep⟩
+
+/-- **`mirStep_call_nonSelectIntrinsic_write_local`**: an intrinsic-level return write
+(`evalNonSelectIntrinsicCall ... = writeIntrinsicReturn s locals' dst targetBb retVal`) into a
+live unprojected local steps `stepMirFn` / `mirStep` / `wpMirBounded` / `WpConverges`. -/
+theorem mirStep_call_nonSelectIntrinsic_write_local {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func : Operand} {argOps : List Operand} {dstLoc : Local}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {defPath : DefPath} {typeArgs : List RigidTy} {kind : RustIntrinsicKind}
+    {argVals : List Value} {retVal : Value} {locals' updatedLocals : List LocalSlot}
+    {slot : LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func argOps { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some (defPath, typeArgs))
+    (hArgs : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts defPath typeArgs
+      s.memory.traitImpls = none)
+    (hNoExact :
+      isDirectExactDivTarget
+        { defPath := defPath, typeArgs := typeArgs, fnSig := none, isIndirect := false } = false)
+    (hKind : classifyRustIntrinsic? defPath = some kind)
+    (hNonSelect : isNonSelectIntrinsicOpt (some kind) = true)
+    (hEval : evalNonSelectIntrinsicCall kind s
+        { defPath := defPath, typeArgs := typeArgs, fnSig := none, isIndirect := false }
+        cur.localDecls cur.layouts argOps argVals locals' { local_ := dstLoc, projection := [] }
+        targetBb =
+      writeIntrinsicReturn s locals' { local_ := dstLoc, projection := [] } targetBb retVal)
+    (hSlot : get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : set? locals' dstLoc (.init retVal) = some updatedLocals) :
+    let s' : MachineState :=
+      { frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
+    stepMirFn body s = MirStepNode.step s' ∧
+    mirStep body s = .cont s' ∧
+    (∀ fuel post,
+      Anneal.Rustc.V2026_06_01.Lower.wpMirBounded (fuel + 1) body s post ↔
+        Anneal.Rustc.V2026_06_01.Lower.wpMirBounded fuel body s' post) ∧
+    (∀ post, WpConverges (mirStep body) s' post → WpConverges (mirStep body) s post) := by
+  intro s'
+  have hStep : stepMirFn body s = MirStepNode.step s' := by
+    rw [stepMirFn_call_nonSelectIntrinsic hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
+      hNoExact hKind hNonSelect, hEval,
+      writeIntrinsicReturn_local s locals' updatedLocals dstLoc slot targetBb retVal hSlot hLive
+        hSet]
+  obtain ⟨hMir, hWp, hConv⟩ := mirStep_and_wp_of_stepMirFn_step hStep
+  exact ⟨hStep, hMir, hWp, hConv⟩
+
+/-- **`mirStep_call_sizeOfVal_sized`**: one-step terminator lifter for
+`core::intrinsics::size_of_val` on a sized pointee (thin pointer `.ptr p 8`, non-`extern` tail,
+`sz < signedHalfModulus 8`), resolved via `typeArgs` or the `operandTy` fallback. -/
+theorem mirStep_call_sizeOfVal_sized {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand} {dstLoc : Local}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {pointeeTy : RigidTy} {sz : Nat}
+    {p : ProvenancePtr} {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack = .ok (.ptr p 8) locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some pointeeTy)
+    (hSized : isUnsizedRawPtrPointee { kind := pointeeTy, layoutIdx := 0 } = false)
+    (hNoExt : intrinsicTailIsExtern 8 pointeeTy = false)
+    (hSz : intrinsicRigidTyByteSize cur.localDecls cur.layouts pointeeTy = some sz)
+    (hLt : sz < signedHalfModulus 8)
+    (hSlot : get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : set? locals' dstLoc (.init (.scalar ⟨sz, 8⟩)) = some updatedLocals) :
+    let s' : MachineState :=
+      { frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
+    stepMirFn body s = MirStepNode.step s' ∧
+    mirStep body s = .cont s' ∧
+    (∀ fuel post,
+      Anneal.Rustc.V2026_06_01.Lower.wpMirBounded (fuel + 1) body s post ↔
+        Anneal.Rustc.V2026_06_01.Lower.wpMirBounded fuel body s' post) ∧
+    (∀ post, WpConverges (mirStep body) s' post → WpConverges (mirStep body) s post) := by
+  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) = .ok [.ptr p 8] locals' := by
+    unfold evalOperands
+    rw [hArg]
+    rfl
+  exact mirStep_call_nonSelectIntrinsic_write_local hCur hPhase hBb hEnd hTerm hCallee hArgs
+    hNoOverride rfl rfl rfl
+    (evalNonSelectIntrinsicCall_sizeOfVal_sized s _ cur.localDecls cur.layouts [ptrOp] locals'
+      { local_ := dstLoc, projection := [] } targetBb pointeeTy sz p hPt hSized hNoExt hSz hLt)
+    hSlot hLive hSet
+
+/-- **`mirStep_call_alignOfVal_sized`**: one-step terminator lifter for
+`core::intrinsics::align_of_val` on a sized pointee (thin pointer `.ptr p 8`, non-`extern`
+tail). -/
+theorem mirStep_call_alignOfVal_sized {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand} {dstLoc : Local}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {pointeeTy : RigidTy} {alignBytes : Nat}
+    {p : ProvenancePtr} {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack = .ok (.ptr p 8) locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::align_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some pointeeTy)
+    (hSized : isUnsizedRawPtrPointee { kind := pointeeTy, layoutIdx := 0 } = false)
+    (hNoExt : intrinsicTailIsExtern 8 pointeeTy = false)
+    (hAlign : intrinsicRigidTyAlign cur.localDecls cur.layouts pointeeTy = some alignBytes)
+    (hSlot : get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : set? locals' dstLoc (.init (.scalar ⟨alignBytes, 8⟩)) = some updatedLocals) :
+    let s' : MachineState :=
+      { frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
+    stepMirFn body s = MirStepNode.step s' ∧
+    mirStep body s = .cont s' ∧
+    (∀ fuel post,
+      Anneal.Rustc.V2026_06_01.Lower.wpMirBounded (fuel + 1) body s post ↔
+        Anneal.Rustc.V2026_06_01.Lower.wpMirBounded fuel body s' post) ∧
+    (∀ post, WpConverges (mirStep body) s' post → WpConverges (mirStep body) s post) := by
+  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) = .ok [.ptr p 8] locals' := by
+    unfold evalOperands
+    rw [hArg]
+    rfl
+  exact mirStep_call_nonSelectIntrinsic_write_local hCur hPhase hBb hEnd hTerm hCallee hArgs
+    hNoOverride rfl rfl rfl
+    (evalNonSelectIntrinsicCall_alignOfVal_sized s _ cur.localDecls cur.layouts [ptrOp] locals'
+      { local_ := dstLoc, projection := [] } targetBb pointeeTy alignBytes p hPt hSized hNoExt
+      hAlign)
+    hSlot hLive hSet
+
+/-- **`mirStep_call_sizeOfVal_slice_overflow_ub`** (`stepMirFn`-level exact `isize` boundary):
+`size_of_val::<[T]>` on `.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]` with
+`signedHalfModulus 8 ≤ len * elemSz` (`len < 2^64`) steps to `MirStepNode.fail .ub`
+(`mirStep` `.fault`), for any destination place. -/
+theorem mirStep_call_sizeOfVal_slice_overflow_ub {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {elemTy : RigidTy} {elemSz : Nat}
+    {p : ProvenancePtr} {len : Nat} {locals' : List LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack =
+        .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some (.slice elemTy))
+    (hSz : intrinsicRigidTyByteSize cur.localDecls cur.layouts elemTy = some elemSz)
+    (hLen : len < scalarModulus 8)
+    (hGe : signedHalfModulus 8 ≤ len * elemSz) :
+    stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
+  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) =
+        .ok [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] locals' := by
+    unfold evalOperands
+    rw [hArg]
+    rfl
+  exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
+    rfl rfl rfl
+    (evalNonSelectIntrinsicCall_sizeOfVal_slice_overflow_ub s _ cur.localDecls cur.layouts [ptrOp]
+      locals' destination targetBb elemTy elemSz p len hPt hSz hLen hGe)
+
+/-- **`mirStep_call_alignOfVal_slice_overflow_ub`** (`stepMirFn`-level exact `isize` boundary):
+`align_of_val::<[T]>` enforces the same `signedHalfModulus 8` slice byte-size bound and steps to
+`MirStepNode.fail .ub` (`mirStep` `.fault`) when `signedHalfModulus 8 ≤ len * elemSz`. -/
+theorem mirStep_call_alignOfVal_slice_overflow_ub {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {elemTy : RigidTy} {elemSz alignBytes : Nat}
+    {p : ProvenancePtr} {len : Nat} {locals' : List LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack =
+        .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::align_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some (.slice elemTy))
+    (hSz : intrinsicRigidTyByteSize cur.localDecls cur.layouts elemTy = some elemSz)
+    (hAlign : intrinsicRigidTyAlign cur.localDecls cur.layouts elemTy = some alignBytes)
+    (hLen : len < scalarModulus 8)
+    (hGe : signedHalfModulus 8 ≤ len * elemSz) :
+    stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
+  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) =
+        .ok [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] locals' := by
+    unfold evalOperands
+    rw [hArg]
+    rfl
+  exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
+    rfl rfl rfl
+    (evalNonSelectIntrinsicCall_alignOfVal_slice_overflow_ub s _ cur.localDecls cur.layouts
+      [ptrOp] locals' destination targetBb elemTy elemSz alignBytes p len hPt hSz hAlign hLen hGe)
+
+/-- **`mirStep_call_sizeOfVal_unsized_thinPtr_ub`** (`stepMirFn`-level): passing a thin pointer
+`.ptr p ptrSz` to `size_of_val` for an unsized `.slice elemTy` or `.str` pointee steps to
+`MirStepNode.fail .ub` (`mirStep` `.fault`). -/
+theorem mirStep_call_sizeOfVal_unsized_thinPtr_ub {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {dstTy : RigidTy}
+    {p : ProvenancePtr} {ptrSz : Nat} {locals' : List LocalSlot}
+    (hDstTy : (∃ elemTy, dstTy = .slice elemTy) ∨ dstTy = .str)
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack = .ok (.ptr p ptrSz) locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some dstTy) :
+    stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
+  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) = .ok [.ptr p ptrSz] locals' := by
+    unfold evalOperands
+    rw [hArg]
+    rfl
+  have hThin := evalNonSelectIntrinsicCall_unsized_thinPtr_ub s
+    { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+      isIndirect := false }
+    cur.localDecls cur.layouts [ptrOp] locals' destination targetBb
+  have hFail : evalNonSelectIntrinsicCall .sizeOfVal s
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] [.ptr p ptrSz] locals' destination targetBb =
+      MirStepNode.fail .ub := by
+    rcases hDstTy with ⟨elemTy, rfl⟩ | rfl
+    · exact ((hThin elemTy p ptrSz).1 hPt).1
+    · exact ((hThin (.tuple []) p ptrSz).2 hPt).1
+  exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
+    rfl rfl rfl hFail
 
 end UnsizedDstMetadataLifters
 
