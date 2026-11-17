@@ -1874,22 +1874,254 @@ fn render_captured_mir(mir: &IrCapturedMir) -> String {
 // Capture-time pre-indexed `Anneal.OpaqueCalleeTable` certificate modules.
 // ---------------------------------------------------------------------------
 
-/// Identifier-like Lean 4 tokens (term- and command-category keywords, plus `sorry` / `admit`)
-/// that can never be used as a bare identifier. `sanitize_lean_ident` escapes them with a
-/// trailing `_`; `validate_lean_term_expr` and `validate_lean_dotted_name` reject them as name
-/// components. Over-approximating is harmless: escaping a non-keyword still yields a valid name.
+/// Sorted Lean 4.34.1 parser-reserved ASCII tokens (extracted from `Lean.Parser.getTokenTable`
+/// plus `Prop` / `Sort` / `Type` / `sorry` / `admit` / `prelude` / `module`) that cannot stand as
+/// bare identifiers in `def <id>` or `namespace <id>`. `sanitize_lean_ident` escapes them with a
+/// trailing `_`; `validate_lean_term_expr` and `validate_lean_dotted_name` reject them as bare
+/// name components.
 const LEAN_RESERVED_IDENTS: &[&str] = &[
-    "Prop", "Sort", "Type", "abbrev", "admit", "at", "attribute", "axiom", "break", "by", "calc",
-    "catch", "class", "continue", "decreasing_by", "def", "deriving", "do", "else", "end",
-    "example", "export", "extends", "finally", "for", "forall", "from", "fun", "have", "hiding",
-    "if", "import", "in", "include", "inductive", "infix", "infixl", "infixr", "initialize",
-    "instance", "let", "local", "macro", "macro_rules", "match", "meta", "module", "mut", "mutual",
-    "namespace", "noncomputable", "nofun", "nomatch", "nonrec", "notation", "omit", "opaque",
-    "open", "partial", "postfix", "prefix", "private", "protected", "public", "renaming", "return",
-    "scoped", "section", "set_option", "show", "sorry", "structure", "suffices", "syntax",
-    "termination_by", "then", "theorem", "this", "try", "universe", "unless", "unsafe", "using",
-    "variable", "where", "with",
+    "Prop",
+    "Sort",
+    "StateRefT",
+    "Type",
+    "abbrev",
+    "add_decl_doc",
+    "admit",
+    "assert!",
+    "assert_not_exists",
+    "assert_not_imported",
+    "at",
+    "attribute",
+    "axiom",
+    "bif",
+    "binder_predicate",
+    "break",
+    "builtin_cbv_simproc",
+    "builtin_cbv_simproc_decl",
+    "builtin_dsimproc",
+    "builtin_dsimproc_decl",
+    "builtin_grind_propagator",
+    "builtin_initialize",
+    "builtin_simproc",
+    "builtin_simproc_decl",
+    "by",
+    "by?",
+    "by_elab",
+    "calc",
+    "catch",
+    "cbv_eval",
+    "cbv_simproc",
+    "cbv_simproc_decl",
+    "class",
+    "coinductive",
+    "coinductive_fixpoint",
+    "continue",
+    "dbg_trace",
+    "debug_assert!",
+    "declare_bitwise_int_theorems",
+    "declare_bitwise_uint_theorems",
+    "declare_command_config_elab",
+    "declare_command_config_elab_legacy",
+    "declare_config_elab",
+    "declare_config_elab_legacy",
+    "declare_core_config_elab",
+    "declare_eval_bin",
+    "declare_eval_bin_bitwise",
+    "declare_eval_bin_bool_pred",
+    "declare_int_theorems",
+    "declare_simp_like_tactic",
+    "declare_sint_simprocs",
+    "declare_syntax_cat",
+    "declare_term_config_elab",
+    "declare_uint_simprocs",
+    "declare_uint_theorems",
+    "decreasing_by",
+    "def",
+    "def_eval_config_item",
+    "deprecated_module",
+    "deprecated_syntax",
+    "deriving",
+    "do",
+    "docs_to_verso",
+    "dsimproc",
+    "dsimproc_decl",
+    "elab",
+    "elab_rules",
+    "elab_stx_quot",
+    "else",
+    "end",
+    "eval_prec",
+    "eval_prio",
+    "example",
+    "exists",
+    "export",
+    "extends",
+    "f!",
+    "finally",
+    "for",
+    "forall",
+    "from",
+    "fun",
+    "generalizing",
+    "grind_annotated",
+    "grind_pattern",
+    "grind_propagator",
+    "have",
+    "haveI",
+    "hiding",
+    "idbg",
+    "if",
+    "import",
+    "in",
+    "include",
+    "include_str",
+    "inductive",
+    "inductive_fixpoint",
+    "inferInstanceAs",
+    "infix",
+    "infixl",
+    "infixr",
+    "init_grind_norm",
+    "init_quot",
+    "initialize",
+    "instance",
+    "leading_parser",
+    "let",
+    "letI",
+    "let_delayed",
+    "let_expr",
+    "let_fun",
+    "let_tmp",
+    "local",
+    "logNamedError",
+    "logNamedErrorAt",
+    "logNamedWarning",
+    "logNamedWarningAt",
+    "m!",
+    "macro",
+    "macro_rules",
+    "match",
+    "match_expr",
+    "matches",
+    "max_prec",
+    "meta",
+    "mod_cast",
+    "module",
+    "mut",
+    "mutual",
+    "namespace",
+    "nat_lit",
+    "no_index",
+    "nofun",
+    "nomatch",
+    "noncomputable",
+    "nonrec",
+    "norm_cast_add_elim",
+    "notation",
+    "omit",
+    "opaque",
+    "open",
+    "panic!",
+    "partial",
+    "partial_fixpoint",
+    "postfix",
+    "prefix",
+    "prelude",
+    "println!",
+    "private",
+    "protected",
+    "public",
+    "recommended_spelling",
+    "register_builtin_option",
+    "register_error_explanation",
+    "register_grind_attr",
+    "register_label_attr",
+    "register_linter_set",
+    "register_option",
+    "register_parser_alias",
+    "register_simp_attr",
+    "register_sym_dsimp",
+    "register_sym_simp",
+    "register_sym_simp_attr",
+    "register_tactic_tag",
+    "register_try?_tactic",
+    "renaming",
+    "repeat",
+    "reportDbgIssue!",
+    "reportEMatchIssue!",
+    "reportIssue!",
+    "reprove",
+    "return",
+    "run_cmd",
+    "run_elab",
+    "run_meta",
+    "s!",
+    "scoped",
+    "seal",
+    "section",
+    "set_library_suggestions",
+    "set_option",
+    "show",
+    "show_panel_widgets",
+    "show_term",
+    "show_term_elab",
+    "simproc",
+    "simproc_decl",
+    "sorry",
+    "structure",
+    "suffices",
+    "syntax",
+    "tactic_alt",
+    "tactic_extension",
+    "tactic_name",
+    "tactic_tag",
+    "termination_by",
+    "termination_by?",
+    "test_extern",
+    "then",
+    "theorem",
+    "this",
+    "throwError",
+    "throwErrorAt",
+    "throwNamedError",
+    "throwNamedErrorAt",
+    "trailing_parser",
+    "try",
+    "unif_hint",
+    "universe",
+    "unless",
+    "unlock_limits",
+    "unreachable!",
+    "unsafe",
+    "unseal",
+    "until",
+    "using",
+    "using!",
+    "variable",
+    "where",
+    "while",
+    "with",
+    "with_annotate_term",
+    "with_weak_namespace",
+    "without_expected_type",
 ];
+
+fn is_reserved_lean_ident(s: &str) -> bool {
+    LEAN_RESERVED_IDENTS.binary_search(&s).is_ok()
+}
+
+fn is_disallowed_guillemet_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
 
 /// One callee of a capture-time `Anneal.OpaqueCalleeTable.OpaqueCalleeTable`, carrying exactly
 /// the `CapturedMir` fields the Episode 1 certificate lemmas of
@@ -1948,7 +2180,7 @@ pub fn sanitize_lean_ident(hint: &str) -> String {
     if ident.as_bytes()[0].is_ascii_digit() {
         ident.insert(0, '_');
     }
-    if LEAN_RESERVED_IDENTS.contains(&ident.as_str()) {
+    if is_reserved_lean_ident(ident.as_str()) {
         ident.push('_');
     }
     ident
@@ -1971,77 +2203,168 @@ fn claim_unique_ident(base: String, used: &mut std::collections::BTreeSet<String
 /// Checks that `expr` is a single-line Lean term built only from identifiers (optionally
 /// `«»`-quoted), numerals, `.`, `@`, spaces and balanced `()` / `[]`, so splicing it into a
 /// generated module can never open a comment, string or char literal, terminate the enclosing
-/// parentheses or start a new command. Reserved keywords (including `sorry` / `admit`) are
-/// rejected as name components.
+/// parentheses or start a new command. Reserved keywords (including `sorry` / `admit`), holes `_`,
+/// malformed numerals (`0abc`, `123'!`), empty `«»`, and dangling `.` / `@` are rejected.
 pub fn validate_lean_term_expr(expr: &str) -> Result<(), String> {
-    fn end_component(component: &mut String) -> Result<(), String> {
-        if LEAN_RESERVED_IDENTS.contains(&component.as_str()) {
-            return Err(format!("reserved Lean keyword `{component}`"));
-        }
-        component.clear();
-        Ok(())
+    if expr.contains(['\n', '\r']) {
+        return Err("newline in Lean term".to_owned());
     }
-    let trimmed = expr.trim();
+    let trimmed = expr.trim_matches([' ', '\t']);
     if trimmed.is_empty() {
         return Err("empty Lean term".to_owned());
     }
+    let mut chars = trimmed.chars().peekable();
     let mut brackets: Vec<char> = Vec::new();
-    let mut component = String::new();
-    let mut in_quote = false;
-    let mut prev: Option<char> = None;
-    for c in trimmed.chars() {
-        if in_quote {
-            match c {
-                '»' => in_quote = false,
-                '«' => return Err("nested `«` in Lean term".to_owned()),
-                c if c.is_control() => {
-                    return Err(format!("control character {c:?} inside `«»`"));
-                }
-                _ => {}
-            }
-            prev = Some(c);
-            continue;
-        }
-        let after_ident_char = matches!(
-            prev,
-            Some(p) if p.is_ascii_alphanumeric() || matches!(p, '_' | '\'' | '!' | '?' | '»')
-        );
+    let mut saw_ident = false;
+    // Previous token class: 0 = start/space/open-bracket, 1 = ident/`»`/`)`, 2 = `]`, 3 = numeral, 4 = `.`, 5 = `@`.
+    let mut prev_kind = 0u8;
+
+    while let Some(c) = chars.next() {
         match c {
-            c if c.is_ascii_alphanumeric() || c == '_' => component.push(c),
-            '\'' | '!' | '?' if after_ident_char => component.push(c),
-            '«' => {
-                end_component(&mut component)?;
-                in_quote = true;
+            ' ' | '\t' => {
+                if matches!(prev_kind, 4 | 5) {
+                    return Err("dangling `.` or `@` in Lean term".to_owned());
+                }
+                prev_kind = 0;
             }
-            '.' | '@' | ' ' => end_component(&mut component)?,
+            '«' => {
+                if prev_kind == 3 {
+                    return Err("unexpected `«` immediately after numeral".to_owned());
+                }
+                let mut empty = true;
+                loop {
+                    match chars.next() {
+                        Some('»') => break,
+                        None => return Err("unterminated `«` in Lean term".to_owned()),
+                        Some('«') => return Err("nested `«` in Lean term".to_owned()),
+                        Some(ch) if is_disallowed_guillemet_char(ch) => {
+                            return Err(format!("disallowed character {ch:?} inside `«»`"));
+                        }
+                        Some(_) => empty = false,
+                    }
+                }
+                if empty {
+                    return Err("empty `«»` component in Lean term".to_owned());
+                }
+                saw_ident = true;
+                prev_kind = 1;
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                if prev_kind == 3 {
+                    return Err("identifier character immediately after numeral".to_owned());
+                }
+                let mut component = String::from(c);
+                while let Some(&nc) = chars.peek() {
+                    if nc.is_ascii_alphanumeric() || matches!(nc, '_' | '\'' | '!' | '?') {
+                        component.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if component == "_" {
+                    return Err("wildcard hole `_` is not allowed in Lean term".to_owned());
+                }
+                if is_reserved_lean_ident(&component) {
+                    return Err(format!("reserved Lean keyword `{component}`"));
+                }
+                saw_ident = true;
+                prev_kind = 1;
+            }
+            c if c.is_ascii_digit() => {
+                if matches!(prev_kind, 1 | 4 | 5) {
+                    return Err("unexpected numeral after identifier, `.`, or `@`".to_owned());
+                }
+                if c == '0' && matches!(chars.peek(), Some('x' | 'X' | 'b' | 'B' | 'o' | 'O')) {
+                    let radix_ch = chars.next().unwrap();
+                    let mut digits = 0usize;
+                    while let Some(&nc) = chars.peek() {
+                        let ok = match radix_ch {
+                            'x' | 'X' => nc.is_ascii_hexdigit() || nc == '_',
+                            'b' | 'B' => matches!(nc, '0' | '1' | '_'),
+                            _ => matches!(nc, '0'..='7' | '_'),
+                        };
+                        if ok {
+                            if nc != '_' {
+                                digits += 1;
+                            }
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if digits == 0 {
+                        return Err(format!("malformed `0{radix_ch}` numeral in Lean term"));
+                    }
+                } else {
+                    while let Some(&nc) = chars.peek() {
+                        if nc.is_ascii_digit() || nc == '_' {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if let Some(&nc) = chars.peek() {
+                    if nc.is_ascii_alphabetic() || matches!(nc, '\'' | '!' | '?' | '«' | '.') {
+                        return Err(format!("invalid character {nc:?} after numeral in Lean term"));
+                    }
+                }
+                prev_kind = 3;
+            }
+            '.' => {
+                if prev_kind != 1 {
+                    return Err("`.` must follow an identifier, `»`, or `)` in Lean term".to_owned());
+                }
+                if !matches!(chars.peek(), Some(nc) if nc.is_ascii_alphabetic() || *nc == '_' || *nc == '«') {
+                    return Err("`.` must be followed by an identifier component in Lean term".to_owned());
+                }
+                prev_kind = 4;
+            }
+            '@' => {
+                if prev_kind != 0 {
+                    return Err("`@` must appear at term start, after whitespace, or after `(` / `[`".to_owned());
+                }
+                if !matches!(chars.peek(), Some(nc) if nc.is_ascii_alphabetic() || matches!(nc, '_' | '«' | '(')) {
+                    return Err("dangling `@` in Lean term".to_owned());
+                }
+                prev_kind = 5;
+            }
             '(' | '[' => {
-                end_component(&mut component)?;
+                if prev_kind == 4 || (c == '[' && prev_kind == 5) {
+                    return Err(format!("unexpected `{c}` after `.` or `@` in Lean term"));
+                }
                 brackets.push(c);
+                prev_kind = 0;
             }
             ')' | ']' => {
-                end_component(&mut component)?;
+                if matches!(prev_kind, 4 | 5) {
+                    return Err(format!("dangling `.` or `@` before `{c}` in Lean term"));
+                }
                 let open = if c == ')' { '(' } else { '[' };
                 if brackets.pop() != Some(open) {
                     return Err(format!("unbalanced `{c}` in Lean term"));
                 }
+                prev_kind = if c == ')' { 1 } else { 2 };
             }
             _ => return Err(format!("disallowed character {c:?} in Lean term")),
         }
-        prev = Some(c);
     }
-    if in_quote {
-        return Err("unterminated `«` in Lean term".to_owned());
+    if matches!(prev_kind, 4 | 5) {
+        return Err("trailing `.` or `@` in Lean term".to_owned());
     }
-    end_component(&mut component)?;
     if !brackets.is_empty() {
         return Err("unclosed `(` / `[` in Lean term".to_owned());
+    }
+    if !saw_ident {
+        return Err("Lean term must reference at least one identifier".to_owned());
     }
     Ok(())
 }
 
 /// Checks that `name` is a dotted Lean name (`A.B.C`) whose components are ASCII identifiers
 /// (`[A-Za-z_][A-Za-z0-9_']*`, neither the hole `_` nor a reserved keyword) or non-empty
-/// `«»`-quoted components without control characters, so it can be spliced into generated
+/// `«»`-quoted components without control or format characters, so it can be spliced into generated
 /// `import` / `namespace` / `end` lines.
 pub fn validate_lean_dotted_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars().peekable();
@@ -2056,8 +2379,8 @@ pub fn validate_lean_dotted_name(name: &str) -> Result<(), String> {
                         None | Some('«') => {
                             return Err(format!("malformed `«»` component in Lean name {name:?}"));
                         }
-                        Some(c) if c.is_control() => {
-                            return Err(format!("control character in Lean name {name:?}"));
+                        Some(c) if is_disallowed_guillemet_char(c) => {
+                            return Err(format!("disallowed character in Lean name {name:?}"));
                         }
                         Some(_) => empty = false,
                     }
@@ -2075,7 +2398,7 @@ pub fn validate_lean_dotted_name(name: &str) -> Result<(), String> {
                     component.push(c);
                     chars.next();
                 }
-                if component == "_" || LEAN_RESERVED_IDENTS.contains(&component.as_str()) {
+                if component == "_" || is_reserved_lean_ident(&component) {
                     return Err(format!("invalid component `{component}` in Lean name {name:?}"));
                 }
             }
@@ -2242,6 +2565,19 @@ pub fn emit_opaque_callee_table_lean_module_with_imports(
                  hasTraitImplForDefPath (List.nil ++ table.traitImpls) {def_path} = false := by\n  \
                  rw [cert_traitImpls]\n  \
                  decide +kernel\n\n\
+                 /-- `tbl.toList`-free and `impls`-list-free `O(1)` free-generic lookup \
+                 certificate for callee [{k}] with arbitrary caller `extra` (`O(|extra|)`). -/\n\
+                 theorem cert_lookup_free_poly_extra_{ident} (callerLayouts : LayoutTable)\n    \
+                 (firstArg : RigidTy) (restArgs : List RigidTy) (extra : List TraitImplEntry)\n    \
+                 (argLayouts : List TypeLayout)\n    \
+                 (hextra : hasTraitImplForDefPath extra {def_path} = false)\n    \
+                 (harity : (List.cons firstArg restArgs).length = {arity})\n    \
+                 (hlay : instantiationLayouts? callerLayouts (List.cons firstArg restArgs) =\n      \
+                 Option.some argLayouts) :\n    \
+                 table.lookup callerLayouts {def_path} (List.cons firstArg restArgs) extra =\n      \
+                 Option.some ({body}.instantiate ((List.cons firstArg restArgs).zip argLayouts)) :=\n  \
+                 lookupCallee_hit_free_poly_of_noImpl_opaque cert_noImpl_{ident} hextra\n    \
+                 cert_lookupRaw_{ident} (harity.trans (rfl : {arity} = {body}.typeParamCount)) hlay\n\n\
                  /-- `tbl.toList`-free `O(1)` free-generic lookup certificate for callee [{k}] \
                  (`extra = []`). -/\n\
                  theorem cert_lookup_free_poly_{ident} (callerLayouts : LayoutTable)\n    \
@@ -2251,8 +2587,8 @@ pub fn emit_opaque_callee_table_lean_module_with_imports(
                  Option.some argLayouts) :\n    \
                  table.lookup callerLayouts {def_path} (List.cons firstArg restArgs) List.nil =\n      \
                  Option.some ({body}.instantiate ((List.cons firstArg restArgs).zip argLayouts)) :=\n  \
-                 lookupCallee_hit_free_poly_opaque rfl cert_noImpl_{ident} cert_lookupRaw_{ident}\n    \
-                 (harity.trans (rfl : {arity} = {body}.typeParamCount)) hlay\n\n"
+                 cert_lookup_free_poly_extra_{ident} callerLayouts firstArg restArgs List.nil\n    \
+                 argLayouts rfl harity hlay\n\n"
             ));
         }
     }
@@ -2265,93 +2601,207 @@ pub fn emit_opaque_callee_table_lean_module_with_imports(
 // `DecidableEq`-without-redundant-`BEq` (`LawfulBEq`) deriving hygiene.
 // ---------------------------------------------------------------------------
 
-/// The head class reference of one `deriving` class entry: leading `@[...]` attributes (e.g.
-/// `@[expose]`) and balanced outer parentheses are stripped, and trailing class arguments
-/// (`Handler opt (x) [i] {c}`) are dropped.
-fn deriving_class_head(entry: &str) -> &str {
+/// If `s` starts with `open` (`(` or `[`) and that opener's matching `close` (`)` or `]`) occurs in
+/// `s` (ignoring delimiters inside `"..."` strings and `«...»` guillemets), returns the byte index
+/// of that matching `close`.
+fn find_matching_delim(s: &str, open: char, close: char) -> Option<usize> {
+    if !s.starts_with(open) {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut in_gui = false;
+    for (i, c) in s.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        if in_gui {
+            if c == '»' {
+                in_gui = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '«' => in_gui = true,
+            _ if c == open => depth += 1,
+            _ if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Strips leading `@[...]` attributes (including nested brackets like `@[aesop safe [constructors]]`)
+/// and outer parentheses wrapping the entire entry, then splits the remaining entry into
+/// `(head_class_ref, arg_tail)` while respecting `«...»` guillemets and parenthesized heads like
+/// `(CustomHandler) opt`.
+fn parse_deriving_entry(entry: &str) -> (&str, &str) {
     let mut s = entry.trim();
-    while let Some(rest) = s.strip_prefix("@[") {
-        match rest.find(']') {
-            Some(close) => s = rest[close + 1..].trim_start(),
-            None => break,
+    while let Some(after_at) = s.strip_prefix('@') {
+        let after_at = after_at.trim_start();
+        if !after_at.starts_with('[') {
+            break;
+        }
+        match find_matching_delim(after_at, '[', ']') {
+            Some(close) => s = after_at[close + 1..].trim_start(),
+            None => return ("", ""),
         }
     }
     loop {
         let t = s.trim();
-        let wrapped = t.len() >= 2 && t.starts_with('(') && t.ends_with(')') && {
-            // `(` at 0 must close at the very end, not earlier (as in `(A) (B)`).
-            let mut depth = 0usize;
-            let mut closes_at_end = false;
-            for (i, c) in t.char_indices() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            closes_at_end = i + 1 == t.len();
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
+        if let Some(close) = find_matching_delim(t, '(', ')') {
+            if close + 1 == t.len() {
+                s = &t[1..close];
+                continue;
             }
-            closes_at_end
-        };
-        if !wrapped {
-            s = t;
+        }
+        s = t;
+        break;
+    }
+    if s.is_empty() {
+        return ("", "");
+    }
+    if s.starts_with('(') {
+        if let Some(close) = find_matching_delim(s, '(', ')') {
+            let inner = s[1..close].trim();
+            let (head, inner_args) = parse_deriving_entry(inner);
+            let outer_args = s[close + 1..].trim();
+            let tail = if !inner_args.is_empty() { inner_args } else { outer_args };
+            return (head, tail);
+        }
+        return ("", "");
+    }
+    let mut in_gui = false;
+    let mut head_end = s.len();
+    for (i, c) in s.char_indices() {
+        if in_gui {
+            if c == '»' {
+                in_gui = false;
+            }
+            continue;
+        }
+        if c == '«' {
+            in_gui = true;
+            continue;
+        }
+        if c.is_whitespace() || matches!(c, '(' | '[' | '{' | '⟨' | '⦃') {
+            head_end = i;
             break;
         }
-        s = &t[1..t.len() - 1];
     }
-    s.split(|c: char| c.is_whitespace() || matches!(c, '(' | '[' | '{' | '⟨' | '⦃'))
-        .next()
-        .unwrap_or("")
+    (&s[..head_end], s[head_end..].trim())
 }
 
-/// The unqualified class name of a `deriving` entry (`_root_.BEq`, `Foo.DecidableEq`,
-/// `@[expose] BEq`, `(BEq)` and `Lean.«BEq»` map to `BEq` / `DecidableEq`).
-fn deriving_class_core(entry: &str) -> &str {
-    let head = deriving_class_head(entry);
-    if let Some(stripped) = head.strip_suffix('»') {
-        if let Some(open) = stripped.rfind('«') {
-            return &stripped[open + '«'.len_utf8()..];
+/// Splits a dotted Lean identifier on `.` outside `«...»` guillemets.
+fn split_dotted_outside_guillemets(head: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_gui = false;
+    for (i, c) in head.char_indices() {
+        if in_gui {
+            if c == '»' {
+                in_gui = false;
+            }
+        } else if c == '«' {
+            in_gui = true;
+        } else if c == '.' {
+            parts.push(&head[start..i]);
+            start = i + 1;
         }
     }
-    head.rsplit('.').next().unwrap_or(head)
+    parts.push(&head[start..]);
+    parts
 }
 
-/// Deduplication key of a `deriving` entry: the entry without attributes and outer parentheses,
-/// whitespace-normalized, with a leading `_root_.` dropped.
+fn unwrap_guillemet_component(comp: &str) -> &str {
+    comp.strip_prefix('«')
+        .and_then(|s| s.strip_suffix('»'))
+        .unwrap_or(comp)
+}
+
+/// Unqualified unary class name of a `deriving` entry (`_root_.BEq`, `Foo.DecidableEq`,
+/// `@[expose] BEq`, `(BEq)`, `Lean.«BEq»`, and `«a b».BEq` map to `Some("BEq")` /
+/// `Some("DecidableEq")`, whereas an atomic guillemet containing a dot `«Not.BEq»` maps to
+/// `Some("Not.BEq")` and a multi-argument class term `Custom.BEq opt` maps to `None`).
+fn deriving_unary_class_core(entry: &str) -> Option<&str> {
+    let (head, arg_tail) = parse_deriving_entry(entry);
+    if head.is_empty() || !arg_tail.is_empty() {
+        return None;
+    }
+    let last = *split_dotted_outside_guillemets(head).last()?;
+    Some(unwrap_guillemet_component(last))
+}
+
+/// Deduplication key of a `deriving` entry: attributes and outer parentheses stripped, leading
+/// `_root_.` removed, simple ASCII guillemets (`«DecidableEq»` -> `DecidableEq`) normalized, and
+/// trailing arguments whitespace-collapsed.
 fn deriving_class_dedup_key(entry: &str) -> String {
-    let head = deriving_class_head(entry);
+    let (head, arg_tail) = parse_deriving_entry(entry);
     if head.is_empty() {
         return String::new();
     }
-    // `head` is a subslice of `entry`: resume from its exact offset (attributes dropped).
-    let start = head.as_ptr() as usize - entry.as_ptr() as usize;
-    let mut rest = &entry[start..];
-    // Drop the unmatched `)` of stripped outer parentheses from the argument tail.
-    while rest.ends_with(')') && rest.matches('(').count() < rest.matches(')').count() {
-        rest = rest[..rest.len() - 1].trim_end();
+    let raw_parts = split_dotted_outside_guillemets(head);
+    let parts = if raw_parts.len() > 1 && unwrap_guillemet_component(raw_parts[0]) == "_root_" {
+        &raw_parts[1..]
+    } else {
+        &raw_parts[..]
+    };
+    let norm_head: String = parts
+        .iter()
+        .map(|&comp| {
+            let unq = unwrap_guillemet_component(comp);
+            let is_plain_ident = !unq.is_empty()
+                && unq.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'')
+                && !unq.as_bytes()[0].is_ascii_digit()
+                && unq != "_"
+                && !is_reserved_lean_ident(unq);
+            if is_plain_ident {
+                unq.to_owned()
+            } else {
+                comp.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    if arg_tail.is_empty() {
+        norm_head
+    } else {
+        let norm_args = arg_tail.split_whitespace().collect::<Vec<_>>().join(" ");
+        format!("{norm_head} {norm_args}")
     }
-    let normalized = rest.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized.strip_prefix("_root_.").map(str::to_owned).unwrap_or(normalized)
 }
 
 /// Sanitizes the classes of one `deriving` clause (cl/1022563952): whenever `DecidableEq`
-/// (possibly qualified, parenthesized or `@[expose]`-attributed) is present, every `BEq` entry
+/// (possibly qualified, parenthesized or `@[...]`-attributed) is present, every unary `BEq` entry
 /// (in any of those forms) is dropped, so the derived structural `BEq` instance never shadows
 /// `instBEqOfDecidableEq` and core's `instLawfulBEq` (`beq_iff_eq`) keeps applying. Entries are
 /// trimmed, empty entries dropped, and duplicates (same class reference) removed keeping the
 /// first occurrence, preserving order.
 pub fn sanitize_deriving_classes<'a>(classes: &[&'a str]) -> Vec<&'a str> {
-    let has_decidable_eq = classes.iter().any(|class| deriving_class_core(class) == "DecidableEq");
+    let has_decidable_eq = classes
+        .iter()
+        .any(|class| deriving_unary_class_core(class) == Some("DecidableEq"));
     let mut seen: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for &class in classes {
         let class = class.trim();
-        if deriving_class_head(class).is_empty()
-            || (has_decidable_eq && deriving_class_core(class) == "BEq")
+        let (head, _) = parse_deriving_entry(class);
+        if head.is_empty()
+            || (has_decidable_eq && deriving_unary_class_core(class) == Some("BEq"))
         {
             continue;
         }
@@ -2791,6 +3241,19 @@ mod opaque_callee_table_tests {
              rw [cert_traitImpls]\n  decide +kernel\n"
         ));
         assert!(code.contains(
+            "theorem cert_lookup_free_poly_extra_demo__poly (callerLayouts : LayoutTable)\n    \
+             (firstArg : RigidTy) (restArgs : List RigidTy) (extra : List TraitImplEntry)\n    \
+             (argLayouts : List TypeLayout)\n    \
+             (hextra : hasTraitImplForDefPath extra \"demo::poly\" = false)\n    \
+             (harity : (List.cons firstArg restArgs).length = 2)\n    \
+             (hlay : instantiationLayouts? callerLayouts (List.cons firstArg restArgs) =\n      \
+             Option.some argLayouts) :\n    \
+             table.lookup callerLayouts \"demo::poly\" (List.cons firstArg restArgs) extra =\n      \
+             Option.some ((Mir.Demo.Poly.body).instantiate ((List.cons firstArg restArgs).zip argLayouts)) :=\n  \
+             lookupCallee_hit_free_poly_of_noImpl_opaque cert_noImpl_demo__poly hextra\n    \
+             cert_lookupRaw_demo__poly (harity.trans (rfl : 2 = (Mir.Demo.Poly.body).typeParamCount)) hlay\n"
+        ));
+        assert!(code.contains(
             "theorem cert_lookup_free_poly_demo__poly (callerLayouts : LayoutTable)\n    \
              (firstArg : RigidTy) (restArgs : List RigidTy) (argLayouts : List TypeLayout)\n    \
              (harity : (List.cons firstArg restArgs).length = 2)\n    \
@@ -2798,8 +3261,8 @@ mod opaque_callee_table_tests {
              Option.some argLayouts) :\n    \
              table.lookup callerLayouts \"demo::poly\" (List.cons firstArg restArgs) List.nil =\n      \
              Option.some ((Mir.Demo.Poly.body).instantiate ((List.cons firstArg restArgs).zip argLayouts)) :=\n  \
-             lookupCallee_hit_free_poly_opaque rfl cert_noImpl_demo__poly cert_lookupRaw_demo__poly\n    \
-             (harity.trans (rfl : 2 = (Mir.Demo.Poly.body).typeParamCount)) hlay\n"
+             cert_lookup_free_poly_extra_demo__poly callerLayouts firstArg restArgs List.nil\n    \
+             argLayouts rfl harity hlay\n"
         ));
         assert_eq!(
             theorem_names(&code),
@@ -2809,6 +3272,7 @@ mod opaque_callee_table_tests {
                 "cert_lookup_mono_demo__leaf",
                 "cert_lookupRaw_demo__poly",
                 "cert_noImpl_demo__poly",
+                "cert_lookup_free_poly_extra_demo__poly",
                 "cert_lookup_free_poly_demo__poly",
             ]
         );
@@ -2845,6 +3309,7 @@ mod opaque_callee_table_tests {
                 "cert_lookupRaw_display",
                 "cert_lookupRaw_free",
                 "cert_noImpl_free",
+                "cert_lookup_free_poly_extra_free",
                 "cert_lookup_free_poly_free",
             ]
         );
@@ -2888,6 +3353,7 @@ mod opaque_callee_table_tests {
                 "cert_lookup_mono_first",
                 "cert_lookupRaw_other",
                 "cert_noImpl_other",
+                "cert_lookup_free_poly_extra_other",
                 "cert_lookup_free_poly_other",
             ]
         );
@@ -2897,6 +3363,14 @@ mod opaque_callee_table_tests {
         assert!(!code.contains("(Mir.Demo.OtherShadow.body)."));
         assert!(!code.contains("Option.some (Mir.Demo.LeafShadow.body)"));
         assert!(!code.contains("first_1") && !code.contains("other_1"));
+    }
+
+    #[test]
+    fn lean_reserved_idents_is_strictly_sorted() {
+        assert!(
+            LEAN_RESERVED_IDENTS.windows(2).all(|w| w[0] < w[1]),
+            "LEAN_RESERVED_IDENTS must be strictly sorted for binary_search"
+        );
     }
 
     #[test]
@@ -2913,6 +3387,17 @@ mod opaque_callee_table_tests {
             ("end", "end_"),
             ("sorry", "sorry_"),
             ("Type", "Type_"),
+            ("repeat", "repeat_"),
+            ("exists", "exists_"),
+            ("matches", "matches_"),
+            ("while", "while_"),
+            ("until", "until_"),
+            ("seal", "seal_"),
+            ("elab", "elab_"),
+            ("prelude", "prelude_"),
+            ("coinductive", "coinductive_"),
+            ("builtin_initialize", "builtin_initialize_"),
+            ("declare_syntax_cat", "declare_syntax_cat_"),
             ("defs", "defs"),
             ("x'", "x_"),
             ("théorème", "th_or_me"),
@@ -2990,15 +3475,19 @@ mod opaque_callee_table_tests {
             "(Mir.Demo.leaf.body)",
             "Mir.«my-crate».leaf.body",
             "Foo.mk 3 (Bar.x') [y]",
+            "Foo.mk 0xff 0b101 0o77 [] ()",
             "x!",
             "is_ok?",
         ] {
             assert_eq!(validate_lean_term_expr(ok), Ok(()), "{ok:?}");
         }
         for bad in [
-            "", "   ", "a\nb", "a -- c", "a /- c -/", "\"s\"", "'a'", "a)", "(a", "[a)", "a; b",
-            "a := b", "Mir.def.body", "sorry", "x end Foo", "«a", "«a\nb»", "a «b «c» »", "a,b",
-            "a{b}", "a#b", "a\\b", "a`b", "$x", "a ⟨b⟩",
+            "", "   ", "a\nb", "Mir.X.body\n", "a -- c", "a /- c -/", "\"s\"", "'a'", "a)", "(a",
+            "[a)", "a; b", "a := b", "Mir.def.body", "Mir.repeat.body", "Mir.exists.body",
+            "Mir.elab.body", "sorry", "s!", "_", "Mir._.body", "x end Foo", "«»", "Mir.«».body",
+            "«a", "«a\nb»", "Mir.«a\u{202e}b».body", "Mir.«a\u{2028}b».body", "a «b «c» »", "a,b",
+            "a{b}", "a#b", "a\\b", "a`b", "$x", "a ⟨b⟩", "@", "@ ", "@)", "a@b", "@@x", ".", ".x",
+            "Mir.", "Mir..body", "Mir.0", "0abc", "123'!", "0x", "()", "[]", "42",
         ] {
             assert!(validate_lean_term_expr(bad).is_err(), "{bad:?}");
         }
@@ -3011,7 +3500,8 @@ mod opaque_callee_table_tests {
         }
         for bad in [
             "", ".", "Mir.", ".Mir", "Mir..Demo", "Mir.Demo\nimport Evil", "Mir Demo", "0Mir",
-            "Mir._", "Mir.end", "Mir.«»", "Mir.«a", "Mir-Demo", "Mir.Demo -- x",
+            "Mir._", "Mir.end", "Mir.repeat", "Mir.exists", "Mir.elab", "Mir.prelude",
+            "Mir.coinductive", "Mir.«»", "Mir.«a", "Mir.«a\u{202e}b»", "Mir-Demo", "Mir.Demo -- x",
         ] {
             assert!(validate_lean_dotted_name(bad).is_err(), "{bad:?}");
         }
@@ -3092,6 +3582,22 @@ mod opaque_callee_table_tests {
                 &["ToJson (opt := 1)", "ToJson  (opt := 1)", "BEq", "DecidableEq"],
                 &["ToJson (opt := 1)", "DecidableEq"],
             ),
+            // Guillemets containing spaces or parens before `.BEq` / `.DecidableEq`:
+            (&["«a b».BEq", "«c(d)».DecidableEq"], &["«c(d)».DecidableEq"]),
+            // Single atomic guillemet component containing `.` is NOT namespace-qualified `BEq`:
+            (&["«Not.BEq»", "DecidableEq"], &["«Not.BEq»", "DecidableEq"]),
+            // Nested `[...]` inside `@[...]` attributes:
+            (
+                &["@[aesop safe [constructors]] BEq", "@[aesop safe [constructors]] DecidableEq"],
+                &["@[aesop safe [constructors]] DecidableEq"],
+            ),
+            // Parenthesized head with trailing arguments must be preserved and deduplicated:
+            (
+                &["(CustomHandler) opt", "((CustomHandler) opt)", "BEq", "DecidableEq"],
+                &["(CustomHandler) opt", "DecidableEq"],
+            ),
+            // Multi-argument handler whose head ends in `.BEq` is not core's unary `BEq`:
+            (&["CustomPkg.BEq opt", "DecidableEq"], &["CustomPkg.BEq opt", "DecidableEq"]),
         ];
         for (input, want) in cases {
             assert_eq!(sanitize_deriving_classes(input), want.to_vec(), "{input:?}");
@@ -3112,38 +3618,92 @@ mod opaque_callee_table_tests {
         );
     }
 
-    /// `(1-based line, clause)` of every `deriving` clause in `text` (inline, or
+    /// Splits a `deriving` class list on top-level commas outside brackets, quotes, and `«...»`.
+    fn split_top_level_commas(s: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        let mut depth = 0usize;
+        let mut in_gui = false;
+        let mut in_str = false;
+        let mut escaped = false;
+        for (i, c) in s.char_indices() {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            if in_gui {
+                if c == '»' {
+                    in_gui = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '«' => in_gui = true,
+                '(' | '[' | '{' | '⟨' | '⦃' => depth += 1,
+                ')' | ']' | '}' | '⟩' | '⦄' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    out.push(&s[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(&s[start..]);
+        out
+    }
+
+    /// `(1-based line, clause)` of every `deriving` clause in `text` (inline, multiline, or
     /// `deriving [noncomputable] instance ... for`) naming both a `BEq` and a `DecidableEq` class.
     fn redundant_beq_deriving_clauses(text: &str) -> Vec<(usize, String)> {
         let keyword = ["der", "iving"].concat();
         let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '\'';
+        let normalized = text.replace("\\n", "\n");
         let mut hits = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            let mut from = 0;
-            while let Some(pos) = line[from..].find(&keyword).map(|p| p + from) {
-                from = pos + keyword.len();
-                let standalone = line[..pos].chars().next_back().is_none_or(|c| !is_ident(c))
-                    && line[from..].chars().next().is_none_or(|c| !is_ident(c));
-                if !standalone {
-                    continue;
+        let mut from = 0usize;
+        while let Some(pos) = normalized[from..].find(&keyword).map(|p| p + from) {
+            let after = pos + keyword.len();
+            let standalone = normalized[..pos].chars().next_back().is_none_or(|c| !is_ident(c) && c != '.')
+                && normalized[after..].chars().next().is_none_or(|c| !is_ident(c));
+            from = after;
+            if !standalone {
+                continue;
+            }
+            let line_no = 1 + normalized[..pos].bytes().filter(|&b| b == b'\n').count();
+            let mut rest = &normalized[after..];
+            if let Some(q) = rest.find('"') {
+                rest = &rest[..q];
+            }
+            // Collect continuation lines while the previous trimmed line ends with `,` or `deriving`.
+            let mut acc = String::new();
+            for (li, raw_line) in rest.lines().enumerate() {
+                if li > 0 && !acc.trim_end().ends_with(',') && !acc.trim().is_empty() {
+                    break;
                 }
-                let mut clause = &line[from..];
-                for stop in ["\"", "\\n"] {
-                    if let Some(end) = clause.find(stop) {
-                        clause = &clause[..end];
-                    }
+                if !acc.is_empty() {
+                    acc.push(' ');
                 }
-                let mut words = clause.trim_start();
-                for prefix in ["noncomputable ", "instance "] {
-                    if let Some(rest) = words.strip_prefix(prefix) {
-                        words = rest.trim_start();
-                    }
+                acc.push_str(raw_line);
+            }
+            let mut words = acc.trim_start();
+            for prefix in ["noncomputable ", "instance "] {
+                if let Some(r) = words.strip_prefix(prefix) {
+                    words = r.trim_start();
                 }
-                let classes = words.find(" for ").map_or(words, |end| &words[..end]);
-                let cores: Vec<&str> = classes.split(',').map(deriving_class_core).collect();
-                if cores.contains(&"BEq") && cores.contains(&"DecidableEq") {
-                    hits.push((index + 1, clause.trim().to_owned()));
-                }
+            }
+            let classes = words.find(" for ").map_or(words, |end| &words[..end]);
+            let cores: Vec<&str> = split_top_level_commas(classes)
+                .into_iter()
+                .filter_map(deriving_unary_class_core)
+                .collect();
+            if cores.contains(&"BEq") && cores.contains(&"DecidableEq") {
+                hits.push((line_no, acc.trim().to_owned()));
             }
         }
         hits
@@ -3152,13 +3712,14 @@ mod opaque_callee_table_tests {
     #[test]
     fn audit_no_generated_deriving_clause_combines_beq_and_decidable_eq() {
         let kw = ["der", "iving"].concat();
-        // Canaries: the audit detects every spelling it must reject ...
+        // Canaries: the audit detects every spelling it must reject (including multiline and bracketed args) ...
         for bad in [
             format!("{kw} BEq, DecidableEq"),
-            format!("  {kw} Repr, _root_.BEq, Hashable, @[expose] DecidableEq"),
+            format!("  {kw} Repr,\n    _root_.BEq,\n    @[expose] DecidableEq"),
+            format!("{kw} Handler [a, b], BEq, DecidableEq"),
             format!("{kw} instance BEq, DecidableEq for Foo"),
             format!("{kw} noncomputable instance (BEq), Foo.DecidableEq for Foo α, (Bar β)"),
-            format!("out.push_str(\"{kw} DecidableEq, BEq\\n\")"),
+            format!("out.push_str(\"{kw} DecidableEq,\\n  BEq\\n\")"),
         ] {
             assert_eq!(redundant_beq_deriving_clauses(&bad).len(), 1, "{bad}");
         }
@@ -3356,6 +3917,7 @@ mod opaque_callee_table_tests {
                 "cert_lookup_mono_demo__leaf",
                 "cert_lookupRaw_demo__poly",
                 "cert_noImpl_demo__poly",
+                "cert_lookup_free_poly_extra_demo__poly",
                 "cert_lookup_free_poly_demo__poly",
                 "cert_lookupRaw_demo___Square_as_Area___area",
                 "cert_lookup_mono_demo___Square_as_Area___area",
@@ -3379,10 +3941,31 @@ mod opaque_callee_table_tests {
              open Trusted.Rustc.{MIR_DIALECT_V2026_06_01}.Layout\n\
              open Trusted.Rustc.{MIR_DIALECT_V2026_06_01}.MirAst\n\
              open Anneal.OpaqueCalleeTable\n\n\
-             -- Use-site `O(1)` rewriting with an emitted certificate.\n\
+             -- Use-site `O(1)` rewriting with an emitted monomorphic certificate.\n\
              example (cl : LayoutTable) :\n    \
              Gen.DemoCallees.table.lookup cl \"demo::leaf\" [] [] = some Mir.Demo.Leaf.body := by\n  \
              rw [Gen.DemoCallees.cert_lookup_mono_demo__leaf]\n\n\
+             -- Use-site `O(1)` rewriting with both `extra = []` and non-empty caller `extra`\n\
+             -- free-polymorphic certificates (without unfolding `table.traitImpls`).\n\
+             def sampleCallerLayouts : LayoutTable := Mir.Demo.Leaf.layouts\n\
+             def samplePolyTys : List RigidTy := [RigidTy.uint UintTy.u32, RigidTy.bool]\n\
+             def samplePolyLayouts : List TypeLayout :=\n  \
+             (instantiationLayouts? sampleCallerLayouts samplePolyTys).getD []\n\
+             def sampleUnrelatedImpl : TraitImplEntry :=\n  \
+             {{ traitRef := {{ defPath := \"demo::Other::other\", args := [RigidTy.bool] }},\n    \
+             implPath := \"demo::<bool as Other>::other\" }}\n\n\
+             example :\n    \
+             Gen.DemoCallees.table.lookup sampleCallerLayouts \"demo::poly\" samplePolyTys [] =\n      \
+             some (Mir.Demo.Poly.body.instantiate (samplePolyTys.zip samplePolyLayouts)) :=\n  \
+             Gen.DemoCallees.cert_lookup_free_poly_demo__poly sampleCallerLayouts\n    \
+             (RigidTy.uint UintTy.u32) [RigidTy.bool] samplePolyLayouts rfl (by decide +kernel)\n\n\
+             example :\n    \
+             Gen.DemoCallees.table.lookup sampleCallerLayouts \"demo::poly\" samplePolyTys\n      \
+             [sampleUnrelatedImpl] =\n      \
+             some (Mir.Demo.Poly.body.instantiate (samplePolyTys.zip samplePolyLayouts)) :=\n  \
+             Gen.DemoCallees.cert_lookup_free_poly_extra_demo__poly sampleCallerLayouts\n    \
+             (RigidTy.uint UintTy.u32) [RigidTy.bool] [sampleUnrelatedImpl] samplePolyLayouts\n    \
+             (by decide +kernel) rfl (by decide +kernel)\n\n\
              -- Captured def paths survive Lean string escaping character-for-character.\n\
              example : (Mir.Demo.Weird.body).defPath.toList = [{}] := by decide +kernel\n\n\
              {axiom_queries}",
@@ -3401,7 +3984,8 @@ mod opaque_callee_table_tests {
         }
 
         // Negative controls: certificates for entries inconsistent with the bodies they name
-        // (wrong `defPath`, wrong `typeParamCount`) are rejected, never silently accepted.
+        // (wrong `defPath`, wrong `typeParamCount`, or forged `traitImpls`) are rejected, never
+        // silently accepted.
         let bad_entries = vec![
             IrCalleeTableEntry {
                 def_path: "demo::leaf".to_owned(),
@@ -3410,6 +3994,10 @@ mod opaque_callee_table_tests {
             IrCalleeTableEntry {
                 type_param_count: 0,
                 ..IrCalleeTableEntry::from_captured_mir("bad_arity", "Mir.Demo.AreaMethod.body", &items[3].2)
+            },
+            IrCalleeTableEntry {
+                trait_impls: vec![],
+                ..IrCalleeTableEntry::from_captured_mir("bad_traits", "Mir.Demo.SquareArea.body", &items[2].2)
             },
         ];
         let bad = emit_opaque_callee_table_lean_module_with_imports("Gen.BadCallees", &imports, &bad_entries);
@@ -3422,7 +4010,7 @@ mod opaque_callee_table_tests {
         }
         let error_lines = lean_error_lines(&out, "BadCallees.lean");
         let lines: Vec<&str> = bad.lines().collect();
-        for name in ["cert_lookupRaw_bad_path", "cert_lookup_mono_bad_arity"] {
+        for name in ["cert_traitImpls", "cert_lookupRaw_bad_path", "cert_lookup_mono_bad_arity"] {
             let start = 1 + lines.iter().position(|line| line.starts_with(&format!("theorem {name} "))).unwrap();
             let end = start + lines[start..].iter().position(|line| line.is_empty()).unwrap();
             assert!(

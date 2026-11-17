@@ -5119,10 +5119,24 @@ class TestRule8RedundantBeqDecidableEq(unittest.TestCase):
             "end\n"
             "theorem boundary : True := trivial\n"
             "deriving BEq, DecidableEq\n"
+            "structure CleanBeforeVar where\n"
+            "  x : Nat\n"
+            "variable (α : Type)\n"
+            "deriving BEq, DecidableEq\n"
+            "structure FieldKeywordNames where\n"
+            "  lemma : String := open Nat in \"ok\"\n"
+            "  constant : Nat := 0\n"
+            "  deriving CustomHandler Foo.{0} (bar).baz, BEq, DecidableEq\n"
         )
         self.assertEqual(
             [(f.line, f.symbol) for f in self._scan8(src)],
-            [(5, "Even"), (11, "Odd"), (14, "BEq,DecidableEq")],
+            [
+                (5, "Even"),
+                (11, "Odd"),
+                (14, "BEq,DecidableEq"),
+                (18, "BEq,DecidableEq"),
+                (22, "FieldKeywordNames"),
+            ],
         )
 
     def test_deriving_instance_and_noncomputable_instance_targets(self) -> None:

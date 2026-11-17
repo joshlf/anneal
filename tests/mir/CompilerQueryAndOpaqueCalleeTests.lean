@@ -4085,6 +4085,18 @@ constant. -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_eager_vs_gated_out_of_scope
 
+/-- info: 'Anneal.OpaqueCalleeTable.hasTraitImplForDefPath_append' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.hasTraitImplForDefPath_append
+
+/-- info: 'Anneal.OpaqueCalleeTable.lookupCallee_hit_free_poly_of_noImpl_opaque' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.lookupCallee_hit_free_poly_of_noImpl_opaque
+
+/-- info: 'Anneal.OpaqueCalleeTable.lookupCallee_miss_free_poly_of_noImpl_opaque' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.lookupCallee_miss_free_poly_of_noImpl_opaque
+
 end Anneal.CompilerQueryAndOpaqueCalleeTests
 
 /-! ## Module-wide axiom and namespace audit

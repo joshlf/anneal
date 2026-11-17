@@ -2367,6 +2367,18 @@ def _scan_lean_text_uncached(
                     old_text, old_code, c_starts, c_ends, col0_thms, text
                 )
                 if win_info is not None:
+                    if old_rbd_clean is None:
+                        old_rbd_clean = not _needs_exact_rbd_blank(old_text)
+                        _LAST_LEAN_SCAN[scan_key] = (
+                            old_text,
+                            old_code,
+                            c_starts,
+                            c_ends,
+                            col0_thms,
+                            old_sibs,
+                            old_findings,
+                            old_rbd_clean,
+                        )
                     (
                         safe_lo,
                         safe_hi_old,
@@ -2663,21 +2675,24 @@ def _scan_lean_text_uncached(
         )
     )
 
-    # Rule 8: `redundant_beq_decidable_eq` (fast C substring guard skips clean files in <0.1 ms)
-    rbd_needs_exact: bool | None = None
-    if "BEq" in stripped and "deriving" in stripped and "DecidableEq" in stripped:
-        rbd_needs_exact = _needs_exact_rbd_blank(text)
-        findings.extend(
-            _scan_redundant_beq_decidable_eq(
-                text, stripped, line_of, needs_exact=rbd_needs_exact
-            )
-        )
-    elif "BEq" in text and "deriving" in text and "DecidableEq" in text:
-        rbd_needs_exact = _needs_exact_rbd_blank(text)
-        if rbd_needs_exact:
+    # Rule 8: `redundant_beq_decidable_eq` (single C substring gate skips clean files in ~0.04 ms)
+    rbd_clean: bool | None = None
+    if "BEq" in text and "deriving" in text and "DecidableEq" in text:
+        if "BEq" in stripped and "deriving" in stripped and "DecidableEq" in stripped:
+            needs_exact = _needs_exact_rbd_blank(text)
+            rbd_clean = not needs_exact
             findings.extend(
-                _scan_redundant_beq_decidable_eq(text, stripped, line_of, needs_exact=True)
+                _scan_redundant_beq_decidable_eq(
+                    text, stripped, line_of, needs_exact=needs_exact
+                )
             )
+        else:
+            needs_exact = _needs_exact_rbd_blank(text)
+            rbd_clean = not needs_exact
+            if needs_exact:
+                findings.extend(
+                    _scan_redundant_beq_decidable_eq(text, stripped, line_of, needs_exact=True)
+                )
 
     findings.sort(key=lambda f: (f.line, f.rule, f.symbol))
     if INCREMENTAL_SPLICING and _preparsed is None and len(text) >= 32768:
@@ -2686,8 +2701,6 @@ def _scan_lean_text_uncached(
         if len(col0_thms) >= 8:
             if len(_LAST_LEAN_SCAN) >= 16:
                 _LAST_LEAN_SCAN.clear()
-            if rbd_needs_exact is None:
-                rbd_needs_exact = _needs_exact_rbd_blank(text)
             _LAST_LEAN_SCAN[scan_key] = (
                 text,
                 stripped,
@@ -2696,7 +2709,7 @@ def _scan_lean_text_uncached(
                 col0_thms,
                 tuple(ext_decls),
                 tuple(findings),
-                not rbd_needs_exact,
+                rbd_clean,
             )
     return findings
 
@@ -2711,7 +2724,7 @@ _LAST_LEAN_SCAN: dict[
         list[int],
         tuple[PrivateDecl, ...],
         tuple[ProofHealthFinding, ...],
-        bool,
+        bool | None,
     ],
 ] = {}
 
@@ -7744,21 +7757,25 @@ _DERIVING_STOP_WORDS: frozenset[str] = frozenset(
 _DERIVING_INLINE_DECL_KWS: frozenset[str] = frozenset(
     ("inductive", "coinductive", "structure", "class", "def", "abbrev")
 )
-_DERIVING_ENCLOSING_RESET_KWS: frozenset[str] = frozenset(
+_DERIVING_DECL_MODIFIERS: frozenset[str] = frozenset(
     (
-        "theorem",
-        "lemma",
-        "example",
-        "instance",
-        "axiom",
-        "opaque",
-        "constant",
-        "namespace",
-        "section",
-        "end",
-        "mutual",
-        "deriving",
+        "private",
+        "protected",
+        "public",
+        "scoped",
+        "local",
+        "noncomputable",
+        "unsafe",
+        "partial",
+        "nonrec",
+        "meta",
     )
+)
+_DERIVING_ENCLOSING_RESET_KWS: frozenset[str] = (
+    _DERIVING_STOP_WORDS
+    - _DERIVING_INLINE_DECL_KWS
+    - _DERIVING_DECL_MODIFIERS
+    - frozenset(("where", "in", "by", "open", "set_option"))
 )
 
 
@@ -8314,7 +8331,7 @@ def _parse_deriving_instance_targets_cursor(cur: _LeanCursor) -> list[str]:
                 break
             if kind == "punct" and val in _RBD_BRACKETS:
                 _consume_balanced_group(cur)
-            elif kind in ("ident", "lit") or (kind == "punct" and val == "@"):
+            elif kind in ("ident", "lit") or (kind == "punct" and val in ("@", ".")):
                 cur.next()
             else:
                 break
@@ -8394,7 +8411,7 @@ def _parse_deriving_clause_at(text: str, after_deriving: int) -> tuple[bool, lis
                 break
             if kind == "punct" and val in _RBD_BRACKETS:
                 _consume_balanced_group(cur)
-            elif kind in ("ident", "lit") or (kind == "punct" and val == "@"):
+            elif kind in ("ident", "lit") or (kind == "punct" and val in ("@", ".")):
                 cur.next()
             else:
                 break
@@ -8431,7 +8448,7 @@ def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str
     depth = 0
     enclosing: str | None = None
     while True:
-        kind, val, *_ = cur.next()
+        kind, val, _, _, has_nl, col = cur.next()
         if kind == "eof":
             break
         if kind == "punct":
@@ -8439,6 +8456,8 @@ def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str
                 depth += 1
             elif val in _RBD_CLOSING_BRACKETS and depth > 0:
                 depth -= 1
+            elif val == "#" and depth == 0:
+                enclosing = None
         elif kind == "ident" and depth == 0:
             if val in _DERIVING_INLINE_DECL_KWS:
                 nxt = cur.peek()
@@ -8449,6 +8468,15 @@ def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str
                     enclosing = nxt[1]
                     cur.next()
             elif val in _DERIVING_ENCLOSING_RESET_KWS:
+                if val in ("lemma", "constant", "universes", "variables") and cur.peek()[:2] == (
+                    "punct",
+                    ":",
+                ):
+                    continue
+                enclosing = None
+            elif val in ("open", "set_option") and has_nl and col == 0:
+                # Top-level `open` / `set_option` without an `in` continuation resets any prior
+                # declaration; if `in <decl>` follows, `<decl>` immediately sets `enclosing`.
                 enclosing = None
     return enclosing
 
