@@ -402,16 +402,13 @@ assert d1["mutator_applications"] != d2["mutator_applications"], (
     // generation (`repro.rs`, `finding.json`, `SUMMARY.md`) and standalone
     // `--reproduce` round-tripping. `ANNEAL_CAPTURE_DIR` is set for every
     // `anneal-rustc-capture` compilation (the capture wrapper records nothing
-    // without it) and never for the plain `rustc` compilation of the Miri `.rlib`,
-    // so Anneal returns `2` (kernel-confirmed by `rfl`) while Miri reads an
-    // invalid `bool` (`missed_ub`). (The previous control, a surrogate `char`
-    // written through `*mut u32`, agrees since `DIV-LM-RAW-OVERWRITE-CHAR-COPY` was
-    // fixed; `cfg(miri)` cannot split the oracles because the `.rlib` is compiled
-    // without `--cfg miri`.)
-    assert!(
-        std::env::var_os("ANNEAL_CAPTURE_DIR").is_none(),
-        "ANNEAL_CAPTURE_DIR must be unset: it would reach the Miri `.rlib` compilation"
-    );
+    // without it) and never for the plain `rustc` compilation of the Miri
+    // `.rlib` (`run_miri_oracle` removes any ambient value; the `--reproduce`
+    // run below passes one), so Anneal returns `2` (kernel-confirmed by `rfl`)
+    // while Miri reads an invalid `bool` (`missed_ub`). (The previous control,
+    // a surrogate `char` written through `*mut u32`, agrees since
+    // `DIV-LM-RAW-OVERWRITE-CHAR-COPY` was fixed; `cfg(miri)` cannot split the
+    // oracles because the `.rlib` is compiled without `--cfg miri`.)
     let root = repo_root();
     let neg_fn = r#"pub fn neg_ctrl_capture_split_invalid_bool__b0_c0() -> u32 {
     const ANNEAL_CAPTURE: bool = option_env!("ANNEAL_CAPTURE_DIR").is_some();
@@ -623,14 +620,11 @@ pub fn agree_helper_call__b0_c0() -> u32 {
     // The diverging negative control steps through `helper_add_ten()` in both
     // oracles, then splits them without relying on any `trusted/` semantic gap:
     // `ANNEAL_CAPTURE_DIR` is set for every `anneal-rustc-capture` compilation and
-    // never for the plain `rustc` compilation of the Miri `.rlib`, so Anneal
-    // returns `base` (`10`, kernel-confirmed) while Miri reads an invalid `bool`
-    // (`missed_ub`). (A surrogate `char` written through `*mut u32` agrees since
-    // `DIV-LM-RAW-OVERWRITE-CHAR-COPY` was fixed.)
-    assert!(
-        std::env::var_os("ANNEAL_CAPTURE_DIR").is_none(),
-        "ANNEAL_CAPTURE_DIR must be unset: it would reach the Miri `.rlib` compilation"
-    );
+    // never for the plain `rustc` compilation of the Miri `.rlib` (from which
+    // `run_miri_oracle` removes any ambient value), so Anneal returns `base`
+    // (`10`, kernel-confirmed) while Miri reads an invalid `bool`
+    // (`missed_ub`). (A surrogate `char` written through `*mut u32` agrees
+    // since `DIV-LM-RAW-OVERWRITE-CHAR-COPY` was fixed.)
     let div_fn = r#"pub fn neg_ctrl_helper_call_capture_split__b0_c1() -> u32 {
     const ANNEAL_CAPTURE: bool = option_env!("ANNEAL_CAPTURE_DIR").is_some();
     let base: u32 = helper_add_ten();
@@ -2344,10 +2338,6 @@ const CHAR_SURROGATE_ON_FIELD_FLIP_SEED: &str = r#"pub fn seed_char_surrogate_on
 /// pre-shrink artifact is left on a minimized finding).
 #[test]
 fn seeded_divergent_findings_shrink_live_and_minimized_repros_reproduce() {
-    assert!(
-        std::env::var_os("ANNEAL_CAPTURE_DIR").is_none(),
-        "ANNEAL_CAPTURE_DIR must be unset in the test process environment"
-    );
     let dir = unique_temp_dir("shrink_live");
     let root = repo_root();
     let findings_dir = dir.join("findings_shrink");

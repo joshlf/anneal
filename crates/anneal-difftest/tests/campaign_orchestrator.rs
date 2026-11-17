@@ -253,15 +253,12 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     // `not_compared`). It branches on `option_env!("ANNEAL_CAPTURE_DIR")`, which is
     // set for every `anneal-rustc-capture` compilation (the capture wrapper records
     // nothing without it) and never for the plain `rustc` compilation of the Miri
-    // `.rlib`. Anneal therefore evaluates the defined branch (`normalScalar 2 4`,
-    // kernel-confirmed by `rfl`), while Miri evaluates an invalid `bool` read, which
-    // is UB. `cfg(miri)` cannot split the oracles: the corpus `.rlib` is compiled by
-    // plain `rustc` without `--cfg miri`, so Miri executes `cfg(not(miri))` code.
-    assert!(
-        std::env::var_os("ANNEAL_CAPTURE_DIR").is_none(),
-        "ANNEAL_CAPTURE_DIR must be unset for this test: it would reach the Miri `.rlib` \
-         compilation and erase the oracle split of `neg_ctrl_synthetic_missed_ub__b0_c4`"
-    );
+    // `.rlib`; `run_miri_oracle` removes any ambient value, so the split does
+    // not depend on this test's environment. Anneal therefore evaluates the
+    // defined branch (`normalScalar 2 4`, kernel-confirmed by `rfl`), while
+    // Miri evaluates an invalid `bool` read, which is UB. `cfg(miri)` cannot
+    // split the oracles: the corpus `.rlib` is compiled by plain `rustc`
+    // without `--cfg miri`, so Miri executes `cfg(not(miri))` code.
     let root = repo_root();
     let mut div_batch =
         anneal_difftest::mutators_miri::generate_miri_corpus_batch(3, 0x5eed_0001, 0);

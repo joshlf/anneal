@@ -4035,6 +4035,11 @@ def evalTerminatorFrameSymTree
        | _ :: _ => evalTerminator s term (some currentBody))
   | _ => evalTerminatorSymTree s term currentBody
 
+/--
+`evalTerminatorFrameSymTree` and `evalTerminatorSymTree` denote the same
+`MirStepNode`: the `.return_` shortcut is taken only when no protector is
+active, where `hasFrameDeallocProtectorConflict` is `false`.
+-/
 theorem evalTerminatorFrameSymTree_eval_eq
     (s : MachineState)
     (term : Terminator)
@@ -4084,6 +4089,7 @@ def stepMirFrameSymTree
         else
           .leaf (MirStepNode.fail .ub)
 
+/-- `stepMirFrameSymTree` and `stepMirSymTree` denote the same `MirStepNode`. -/
 theorem stepMirFrameSymTree_eval_eq
     (body : CapturedMir)
     (s : MachineState) :
@@ -4118,6 +4124,10 @@ def stepMirExecFrameSymTree
   | .halted out => .leaf (.ret out)
   | .faulted fk => .leaf (MirStepNode.fail fk)
 
+/--
+`stepMirExecFrameSymTree` and `stepMirExecSymTree` denote the same
+`MirStepNode`.
+-/
 theorem stepMirExecFrameSymTree_eval_eq
     (body : CapturedMir)
     (st : MirExecState) :
@@ -4127,6 +4137,10 @@ theorem stepMirExecFrameSymTree_eval_eq
   | halted _ => rfl
   | faulted _ => rfl
 
+/--
+`stepMirExecFrameSymTree` denotes the trusted one-step transition
+`stepMirState`.
+-/
 theorem stepMirExecFrameSymTree_eval
     (body : CapturedMir)
     (st : MirExecState) :
@@ -4359,7 +4373,9 @@ invoking an `#[external_spec]` contract `contract` (definitionally equal to
 `externalSpecCallContract targetDefPath sidecarBody extraPre extraPost`), using
 frame-restoring `wpMirFrameModularSym` so post-call `resumeExternalCall` and
 `evalTerminator` `.return_` transitions reduce by WHNF without manual
-frame-preservation rewrites.
+frame-preservation rewrites. The rely is the single `contract.holdsOn`; for a
+caller of two `#[external_spec]` targets, use
+`verifyExternalSpecContractPairWithCalleesMirSym`.
 -/
 theorem verifyExternalSpecContractWithCalleesMirSym
     {targetDefPath : DefPath}
@@ -4428,6 +4444,146 @@ theorem verifyExternalSpecContractMirSym
         post := post } :=
   verifyExternalSpecContractWithCalleesMirSym
     contract body .nil pre post fuel h_wp h_eq
+
+/--
+`ModularVerificationResult` is antitone in the rely `envAssumed`: a result
+proven under `env` also holds under every `env'` that implies `env`, because
+`ModularClaim.holds` uses `envAssumed` only as a hypothesis. This restates a
+result proven under one combined contract (such as `bothCallContracts`) against
+the conjunction of per-callee contracts that `cargo anneal` renders in
+`defaultModularSpec.envAssumed`.
+-/
+theorem modularVerificationResult_of_envAssumed_imp
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    {env env' : ExternalCallHandler → Prop}
+    (h_imp : ∀ h, env' h → env h)
+    (h_res :
+      ModularVerificationResult
+        { body := body
+          envAssumed := env
+          pre := pre
+          post := post
+          callees := callees }) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := env'
+        pre := pre
+        post := post
+        callees := callees } :=
+  ⟨fun h h_env => h_res.proof h (h_imp h h_env)⟩
+
+/--
+Rely contract for a caller that assumes both `c₁` and `c₂`: a request is
+permitted when either contract permits it, and an answer to a permitted request
+satisfies the postcondition of every contract that permits the request. A
+handler that implements both contracts implements this one
+(`bothCallContracts_holdsOn`).
+
+The postcondition repeats the disjunction of preconditions so that frame
+preservation transfers from `c₁` and `c₂` (`bothCallContracts_framePreserved`):
+without it, an answer to a request that neither contract permits would satisfy
+the postcondition vacuously and constrain nothing.
+-/
+def bothCallContracts (c₁ c₂ : MirCallContract) : MirCallContract where
+  pre req := c₁.pre req ∨ c₂.pre req
+  post req ans :=
+    (c₁.pre req ∨ c₂.pre req) ∧
+      (c₁.pre req → c₁.post req ans) ∧
+      (c₂.pre req → c₂.post req ans)
+
+/--
+A handler that implements both `c₁` and `c₂` implements
+`bothCallContracts c₁ c₂`.
+-/
+theorem bothCallContracts_holdsOn
+    {c₁ c₂ : MirCallContract} {h : ExternalCallHandler}
+    (h₁ : c₁.holdsOn h) (h₂ : c₂.holdsOn h) :
+    (bothCallContracts c₁ c₂).holdsOn h := by
+  intro req h_pre
+  refine ⟨?_, fun tr ans h_ret =>
+    ⟨h_pre,
+     fun hp₁ => (h₁ req hp₁).2 tr ans h_ret,
+     fun hp₂ => (h₂ req hp₂).2 tr ans h_ret⟩⟩
+  rcases h_pre with hp₁ | hp₂
+  · exact (h₁ req hp₁).1
+  · exact (h₂ req hp₂).1
+
+/--
+`bothCallContracts c₁ c₂` guarantees `ans.framePreserved req.memory` on every
+answer that its postcondition permits when `c₁` and `c₂` both do.
+-/
+theorem bothCallContracts_framePreserved
+    {c₁ c₂ : MirCallContract}
+    (hf₁ :
+      ∀ (req : MirCallReq) (ans : MirCallAns),
+        c₁.post req ans → ans.framePreserved req.memory)
+    (hf₂ :
+      ∀ (req : MirCallReq) (ans : MirCallAns),
+        c₂.post req ans → ans.framePreserved req.memory) :
+    ∀ (req : MirCallReq) (ans : MirCallAns),
+      (bothCallContracts c₁ c₂).post req ans → ans.framePreserved req.memory := by
+  rintro req ans ⟨hp₁ | hp₂, hi₁, hi₂⟩
+  · exact hf₁ req ans (hi₁ hp₁)
+  · exact hf₂ req ans (hi₂ hp₂)
+
+/--
+Discharge a `ModularVerificationResult` with linked `callees` for a caller
+invoking two `#[external_spec]` contracts `c₁` and `c₂` (each definitionally
+equal to an `externalSpecCallContract`) under the rely
+`fun h => c₁.holdsOn h ∧ c₂.holdsOn h`, which is the
+`defaultModularSpec.envAssumed` that `cargo anneal` renders for a caller with
+two abstracted callees.
+
+Symbolic evaluation runs frame-restoring `wpMirFrameModularSym` under
+`bothCallContracts c₁ c₂`. Each call site proves the precondition of its own
+contract (`Or.inl` or `Or.inr`) and obtains that contract's postcondition by
+applying the matching implication to the same precondition proof. For three or
+more contracts, nest `bothCallContracts` in
+`verifyModularFrameContractWithCalleesMirSym` and restate the result with
+`modularVerificationResult_of_envAssumed_imp`.
+-/
+theorem verifyExternalSpecContractPairWithCalleesMirSym
+    {targetDefPath₁ targetDefPath₂ : DefPath}
+    {sidecarBody₁ sidecarBody₂ : CapturedMir}
+    {extraPre₁ extraPre₂ : List Value → Prop}
+    {extraPost₁ extraPost₂ : List Value → Value → Prop}
+    (c₁ c₂ : MirCallContract)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameModularSym (bothCallContracts c₁ c₂) fuel body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem'))
+    (h_eq₁ :
+      c₁ =
+        externalSpecCallContract targetDefPath₁ sidecarBody₁ extraPre₁ extraPost₁ := by rfl)
+    (h_eq₂ :
+      c₂ =
+        externalSpecCallContract targetDefPath₂ sidecarBody₂ extraPre₂ extraPost₂ := by rfl) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := fun h => c₁.holdsOn h ∧ c₂.holdsOn h
+        pre := pre
+        post := post
+        callees := callees } :=
+  modularVerificationResult_of_envAssumed_imp
+    (fun _ h_env => bothCallContracts_holdsOn h_env.1 h_env.2)
+    (verifyModularFrameContractWithCalleesMirSym
+      (bothCallContracts c₁ c₂)
+      (bothCallContracts_framePreserved
+        (externalSpecContract_framePreserved c₁ h_eq₁)
+        (externalSpecContract_framePreserved c₂ h_eq₂))
+      body callees pre post fuel h_wp)
 
 theorem restoreCallerMemoryFrame_eq_of_callFrameAndTraitsPreserved
     {before after : Memory}

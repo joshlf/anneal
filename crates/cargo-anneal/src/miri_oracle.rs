@@ -1090,25 +1090,7 @@ fn run_miri_setup(
     timeout: Duration,
 ) -> Result<(), String> {
     let setup = resolve_miri_setup_cargo(get_env)?;
-    let mut cmd = Command::new(&setup.cargo_bin);
-    if setup.pass_toolchain_arg {
-        cmd.arg(MIRI_SETUP_TOOLCHAIN_ARG);
-    }
-    cmd.args(["miri", "setup"]);
-    cmd.env("MIRI_SYSROOT", candidate);
-    if let Some(toolchain) = &setup.rustup_toolchain {
-        cmd.env("RUSTUP_TOOLCHAIN", toolchain);
-    }
-    if let Some(bin_dir) = &setup.prepend_path_dir {
-        let current_path = get_env("ANNEAL_CALLER_PATH")
-            .or_else(|| get_env("PATH"))
-            .unwrap_or_default();
-        let mut paths = vec![bin_dir.clone()];
-        paths.extend(env::split_paths(&current_path));
-        if let Ok(joined) = env::join_paths(paths) {
-            cmd.env("PATH", joined);
-        }
-    }
+    let cmd = build_miri_setup_command(&setup, candidate, get_env);
 
     let outcome = run_with_timeout(cmd, timeout).map_err(|err| {
         format!(
@@ -1139,6 +1121,46 @@ fn run_miri_setup(
             String::from_utf8_lossy(&stderr).trim()
         )),
     }
+}
+
+/// Builds the `cargo miri setup` command that provisions the Miri sysroot at
+/// `candidate`.
+///
+/// The sysroot belongs to the Miri reference toolchain, so the command drops an
+/// ambient `anneal-rustc-capture` configuration: `ANNEAL_CAPTURE_DIR` and
+/// `ANNEAL_CAPTURE_FILTER`, and the `RUSTC_WRAPPER` and
+/// `RUSTC_WORKSPACE_WRAPPER` variables through which Cargo would run a wrapper
+/// on the sysroot build's own crates (recording their units into an unrelated
+/// capture directory).
+fn build_miri_setup_command(
+    setup: &MiriSetupCommand,
+    candidate: &Path,
+    get_env: EnvLookup<'_>,
+) -> Command {
+    let mut cmd = Command::new(&setup.cargo_bin);
+    if setup.pass_toolchain_arg {
+        cmd.arg(MIRI_SETUP_TOOLCHAIN_ARG);
+    }
+    cmd.args(["miri", "setup"]);
+    cmd.env("MIRI_SYSROOT", candidate)
+        .env_remove(ANNEAL_CAPTURE_DIR_ENV)
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    if let Some(toolchain) = &setup.rustup_toolchain {
+        cmd.env("RUSTUP_TOOLCHAIN", toolchain);
+    }
+    if let Some(bin_dir) = &setup.prepend_path_dir {
+        let current_path = get_env("ANNEAL_CALLER_PATH")
+            .or_else(|| get_env("PATH"))
+            .unwrap_or_default();
+        let mut paths = vec![bin_dir.clone()];
+        paths.extend(env::split_paths(&current_path));
+        if let Ok(joined) = env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+    cmd
 }
 
 /// Result of [`run_with_timeout`].
@@ -3551,6 +3573,41 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
                     "{label} must explicitly remove {removed}"
                 );
             }
+        }
+
+        // `cargo miri setup` builds the Miri sysroot through Cargo, so it also
+        // drops the rustc wrappers; the setup-specific variables stay set.
+        let setup = MiriSetupCommand {
+            cargo_bin: PathBuf::from("/usr/bin/cargo"),
+            pass_toolchain_arg: false,
+            prepend_path_dir: Some(PathBuf::from("/opt/toolchain/bin")),
+            rustup_toolchain: Some("nightly-2026-06-01".to_string()),
+        };
+        let get_env = env_map(&[("PATH", OsStr::new("/usr/bin"))]);
+        let setup_cmd = build_miri_setup_command(&setup, Path::new("/tmp/miri-sysroot"), &get_env);
+        let envs: BTreeMap<&OsStr, Option<&OsStr>> = setup_cmd.get_envs().collect();
+        for removed in [
+            ANNEAL_CAPTURE_DIR_ENV,
+            ANNEAL_CAPTURE_FILTER_ENV,
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            assert_eq!(
+                envs.get(OsStr::new(removed)),
+                Some(&None),
+                "setup_cmd must explicitly remove {removed}"
+            );
+        }
+        for (key, value) in [
+            ("MIRI_SYSROOT", "/tmp/miri-sysroot"),
+            ("RUSTUP_TOOLCHAIN", "nightly-2026-06-01"),
+            ("PATH", "/opt/toolchain/bin:/usr/bin"),
+        ] {
+            assert_eq!(
+                envs.get(OsStr::new(key)),
+                Some(&Some(OsStr::new(value))),
+                "setup_cmd must set {key}"
+            );
         }
     }
 }

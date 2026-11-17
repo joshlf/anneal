@@ -11885,4 +11885,49 @@ pub fn cand_shadow() -> u32 {
         let _ = fs::remove_dir_all(&d1);
         let _ = fs::remove_dir_all(&d2);
     }
+
+    /// Each `anneal-difftest` test binary runs its tests in parallel threads of
+    /// one process, and the oracles read the process environment (`HOME`,
+    /// `PATH`, `CARGO`, `RUSTC`, `ANNEAL_*`) and working directory, so a test
+    /// that mutates either races every other test. Tests vary the environment
+    /// of child processes with `Command::env`, `Command::env_remove`, and
+    /// `Command::current_dir` instead (as the `--reproduce` run with an ambient
+    /// `ANNEAL_CAPTURE_DIR` in `tests/miri_difftest_oracle.rs` does). This
+    /// mirrors `cargo_anneal_sources_never_mutate_the_process_environment`.
+    #[test]
+    fn anneal_difftest_sources_never_mutate_the_process_environment() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let forbidden = [
+            concat!("set", "_var("),
+            concat!("remove", "_var("),
+            concat!("set_current", "_dir("),
+        ];
+        let mut stack = vec![manifest_dir.join("src"), manifest_dir.join("tests")];
+        let mut offenders = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).expect("read source dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = fs::read_to_string(&path).expect("read source");
+                    for (lineno, line) in text.lines().enumerate() {
+                        if forbidden.iter().any(|needle| line.contains(needle)) {
+                            offenders.push(format!(
+                                "{}:{}: {}",
+                                path.display(),
+                                lineno + 1,
+                                line.trim()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "process-environment mutation in anneal-difftest sources:\n{}",
+            offenders.join("\n")
+        );
+    }
 }
