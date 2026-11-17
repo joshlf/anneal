@@ -1199,6 +1199,151 @@ theorem canary_bug1_zero_byte_copies_are_noops :
       MirStepNode.step { s with frame := { blockIdx := 0, stmtIdx := 1, locals := locals } } := by
   exact ⟨rfl, rfl⟩
 
+/--
+Canary 4O (`copyViaBytes` runs full Tree Borrows source-read and destination-write
+transitions): when `copy_nonoverlapping::<u8>(&raw const bytes[0], &raw mut word as *mut u8, 4)`
+copies 4 bytes from `_0 : [u8; 4]` into `_1 : u32` via `copyViaBytes`:
+1. A foreign `.unique` borrow `tag = 602` on `bytes[2]` (inside the 4-byte source
+   read window `[0, 4)`) is frozen to `.frozen`, and a `.reservedFrz` destination
+   borrow `tag = 601` on `word` is activated to `.unique`.
+2. When `tag = 602` has an active function-entry protector (`activeProtectors = [602]`),
+   the source read faults with `MirStepNode.fail .ub` (`hasTreeReadUB`).
+(B3's `commitCopyDstPlaceWriteProto` skipped source-read Tree Borrows checks and
+called `invalidateConflictingBorrows` instead of `invalidateTreeBorrowsAtProj`.)
+-/
+theorem canary_bug1_copyViaBytes_runs_full_tree_borrows_read_write :
+    let u8ArrTy : Ty := { kind := .array (.uint .u8) 4, layoutIdx := noLayout }
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := noLayout }
+    let ptrConstU8 : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := noLayout }
+    let ptrMutU8 : Ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := noLayout }
+    let decls : List LocalDecl := [
+      { mutability := .mut, ty := u8ArrTy, debugName := none },
+      { mutability := .mut, ty := u32Ty, debugName := none },
+      { mutability := .mut, ty := ptrConstU8, debugName := none },
+      { mutability := .mut, ty := ptrMutU8, debugName := none }]
+    let bytesVal : Value := .aggregate 0 [mkU8 1, mkU8 2, mkU8 3, mkU8 4]
+    let locals : List LocalSlot := [
+      .init bytesVal,
+      .init (mkU32 0),
+      .init (.ptr { allocId := 600, offsetBytes := 0 } 8),
+      .init (.ptr { allocId := 601, offsetBytes := 0 } 8)]
+    let srcEntry : BorrowEntry := {
+      tag := 600, targetLocal := 0, targetProjection := [.constantIndex 0 4 false],
+      perm := .frozen, parentTag := .none }
+    let dstEntry : BorrowEntry := {
+      tag := 601, targetLocal := 1, targetProjection := [],
+      perm := .reservedFrz false, parentTag := .none }
+    let foreignSrcUnique : BorrowEntry := {
+      tag := 602, targetLocal := 0, targetProjection := [.constantIndex 2 4 false],
+      perm := .unique, protector := .some 602, parentTag := .some 600 }
+    let sUnprot : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := {
+        emptyMemory with
+        borrows := [srcEntry, dstEntry, foreignSrcUnique]
+        nextTag := 603 } }
+    let sProt : MachineState := {
+      sUnprot with
+      memory := { sUnprot.memory with activeProtectors := [602] } }
+    evalCopyNonOverlappingPermOkProto
+      sUnprot (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls b3Layouts
+      { allocId := 600, offsetBytes := 0 } { allocId := 601, offsetBytes := 0 }
+      srcEntry dstEntry 4 locals =
+    MirStepNode.step {
+      sUnprot with
+      frame := {
+        blockIdx := 0, stmtIdx := 1,
+        locals := [
+          .init bytesVal,
+          .init (mkU32 0x04030201),
+          .init (.ptr { allocId := 600, offsetBytes := 0 } 8),
+          .init (.ptr { allocId := 601, offsetBytes := 0 } 8)] }
+      memory := {
+        sUnprot.memory with
+        borrows := [
+          srcEntry,
+          { dstEntry with perm := .unique },
+          { foreignSrcUnique with perm := .frozen }] } } ∧
+    evalCopyNonOverlappingPermOkProto
+      sProt (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls b3Layouts
+      { allocId := 600, offsetBytes := 0 } { allocId := 601, offsetBytes := 0 }
+      srcEntry dstEntry 4 locals =
+    MirStepNode.fail .ub := by
+  exact ⟨rfl, rfl⟩
+
+/--
+Canary 4P (Empty array `[]` overrun is `.ub` and `[(); 2]`-to-`[u32; 2]` stride
+mismatch is `.unsupported`):
+1. Copying `n = 2` elements out of an empty 0-element array `_0 = .aggregate 0 []`
+   into `_1 = .aggregate 0 [mkU32 1, mkU32 2]` faults with `MirStepNode.fail .ub`
+   (B3's `zeroByteSlice` used `allUnitValues [] = true` and stepped as a no-op).
+2. Copying `n = 2` elements from an untyped `.unit` array `.aggregate 0 [.unit, .unit]`
+   into `.aggregate 0 [mkU32 1, mkU32 2]` fails closed with `MirStepNode.unsupported`
+   (B3's `zeroByteSlice` did not check `dstElems` and stepped as a no-op).
+-/
+theorem canary_bug1_empty_array_oob_and_zst_mismatch :
+    let dstArr : Value := .aggregate 0 [mkU32 1, mkU32 2]
+    let localsEmpty : List LocalSlot := [.init (.aggregate 0 []), .init dstArr]
+    let localsUnitToU32 : List LocalSlot := [.init (.aggregate 0 [.unit, .unit]), .init dstArr]
+    let srcEntry : BorrowEntry :=
+      { tag := 610, targetLocal := 0, targetProjection := [.constantIndex 0 0 false], perm := .cell }
+    let dstEntry : BorrowEntry :=
+      { tag := 611, targetLocal := 1, targetProjection := [.constantIndex 0 2 false], perm := .unique }
+    let sEmpty : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := localsEmpty }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 612 } }
+    let sUnitToU32 : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := localsUnitToU32 }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 612 } }
+    evalCopyNonOverlappingPermOkProto
+      sEmpty dummySrcOp dummyDstOp [] emptyLayoutTable
+      { allocId := 610, offsetBytes := 0 } { allocId := 611, offsetBytes := 0 }
+      srcEntry dstEntry 2 localsEmpty =
+      MirStepNode.fail .ub ∧
+    evalCopyNonOverlappingPermOkProto
+      sUnitToU32 dummySrcOp dummyDstOp [] emptyLayoutTable
+      { allocId := 610, offsetBytes := 0 } { allocId := 611, offsetBytes := 0 }
+      srcEntry dstEntry 2 localsUnitToU32 =
+      MirStepNode.unsupported := by
+  exact ⟨rfl, rfl⟩
+
+/--
+Canary 4Q (Zero-sized pointee copies at non-zero aligned byte offsets and
+out-of-bounds byte offsets): for `_0 : T` (`8` bytes in `b3Layouts`) and
+`_1 : ()` accessed through `*const ()` / `*mut ()`:
+1. `srcOff = 4` (aligned, inside the `8`-byte allocation `_0`) with `n = 3`
+   succeeds as a zero-byte no-op (`MirStepNode.step ...`), whereas B3 checked
+   `zeroByteCopy` after `resolvePtrElemOffset?` and returned `.unsupported`.
+2. `srcOff = 9` (`9 > 8`, outside the `8`-byte allocation `_0`) faults with
+   `MirStepNode.fail .ub` (`evalZeroByteCopyStep`).
+-/
+theorem canary_bug1_zst_nonzero_aligned_offset_and_oob :
+    let tTy : Ty := { kind := .adt "T" [], layoutIdx := 0 }
+    let unitTy : Ty := { kind := .tuple [], layoutIdx := noLayout }
+    let tVal : Value := .aggregate 0 [mkU32 7, mkU8 9]
+    let decls : List LocalDecl := [
+      { mutability := .mut, ty := tTy, debugName := none },
+      { mutability := .mut, ty := unitTy, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .not (.tuple []), layoutIdx := noLayout }, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .mut (.tuple []), layoutIdx := noLayout }, debugName := none }]
+    let locals4 : List LocalSlot := [
+      .init tVal, .init .unit,
+      .init (.ptr { allocId := 620, offsetBytes := 4 } 8),
+      .init (.ptr { allocId := 621, offsetBytes := 0 } 8)]
+    let srcEntry : BorrowEntry := { tag := 620, targetLocal := 0, targetProjection := [], perm := .cell }
+    let dstEntry : BorrowEntry := { tag := 621, targetLocal := 1, targetProjection := [], perm := .unique }
+    let s4 : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals4 }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 622 } }
+    evalCopyNonOverlappingPermOkProto
+      s4 (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls b3Layouts
+      { allocId := 620, offsetBytes := 4 } { allocId := 621, offsetBytes := 0 }
+      srcEntry dstEntry 3 locals4 =
+      MirStepNode.step { s4 with frame := { blockIdx := 0, stmtIdx := 1, locals := locals4 } } ∧
+    b3Copy tTy unitTy (.tuple []) tVal .unit 0 [] 9 1 [] 0 3 =
+      MirStepNode.fail .ub := by
+  exact ⟨rfl, rfl⟩
+
 /-! ## 5. Conservativity Canaries (the prototype is `Trusted` wherever no repair applies) -/
 
 open TailCallCallerReferentWitnesses in
@@ -1273,6 +1418,9 @@ theorem canary_conservativity_use_keeps_tree_borrows_read :
 #print axioms canary_bug1_nested_array_overrun_within_allocation
 #print axioms canary_bug1_scalar_offset_and_partial_write_fail_closed
 #print axioms canary_bug1_zero_byte_copies_are_noops
+#print axioms canary_bug1_copyViaBytes_runs_full_tree_borrows_read_write
+#print axioms canary_bug1_empty_array_oob_and_zst_mismatch
+#print axioms canary_bug1_zst_nonzero_aligned_offset_and_oob
 #print axioms canary_bug4_opaque_alias_field_shell_uses_cast_type
 #print axioms canary_bug4_call_destination_and_binop_move_opaqueCast
 #print axioms canary_conservativity_use_keeps_tree_borrows_read
