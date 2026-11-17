@@ -2208,7 +2208,8 @@ pub enum LcnfLayoutError {
     DuplicateFieldName { name: String },
     /// Two identical `deriving` entries.
     DuplicateDerive { name: String },
-    /// An empty or malformed field type (control character, comment, or `:=`).
+    /// An empty or malformed field type: a control character, a comment, `:=`, an unclosed
+    /// literal or unbalanced delimiter, or command syntax (`axiom`, `deriving`, `#eval`, ...).
     InvalidLeanType { field: String, lean_ty: String },
     /// [`LcnfFieldSpec::builtin`] on a type outside [`LcnfFieldKind::of_builtin_lean_ty`].
     UnknownBuiltinLeanType { field: String, lean_ty: String },
@@ -2229,7 +2230,8 @@ pub enum LcnfLayoutError {
     UnknownFieldExpr { field: String },
     /// Two expressions for the same field.
     DuplicateFieldExpr { field: String },
-    /// An empty expression, or one with a control character.
+    /// An empty expression, or one with a control character, a comment, an unclosed literal,
+    /// or an unbalanced delimiter.
     InvalidFieldExpr { field: String },
     /// A constructor of [`MIR_MODULE_CTOR_ARITIES`] (or another arity table) over the budget.
     MirCtorOverBudget {
@@ -2726,15 +2728,20 @@ pub fn plan_lcnf_ctor_layout_levels(
 }
 
 /// Lean keywords rejected as structure, field, and `deriving` name components
-/// (whitespace-separated).
+/// (whitespace-separated), including the command keywords of Lean `v4.34.1`'s `Init`
+/// (`initialize`, `macro_rules`, `run_cmd`, `seal`, ...). Lean rejects each of them as a
+/// declaration name, and accepts `this` (`lcnf_tests::lcnf_live_lean_reserved_words_are_keywords`).
 const LEAN_RESERVED_WORDS: &str = concat!(
-    "Prop Sort Type abbrev at attribute axiom break by calc catch class continue ",
-    "decreasing_by def deriving do elab else end example export extends finally for forall ",
-    "from fun have hiding if import in include inductive infix infixl infixr instance let ",
-    "local macro match meta mut mutual namespace noncomputable nofun nomatch notation omit ",
-    "opaque open partial postfix prefix private protected public renaming return scoped ",
-    "section set_option show structure suffices syntax termination_by then theorem this try ",
-    "universe unless unsafe using variable where with ",
+    "Prop Sort Type abbrev add_decl_doc at attribute axiom binder_predicate break ",
+    "builtin_dsimproc builtin_initialize builtin_simproc builtin_simproc_decl by calc catch ",
+    "class coinductive continue declare_syntax_cat decreasing_by def deriving do dsimproc elab ",
+    "elab_rules else end example export extends finally for forall from fun grind_pattern have ",
+    "hiding if import in include inductive infix infixl infixr init_quot initialize instance ",
+    "let local macro macro_rules match meta mut mutual namespace noncomputable nofun nomatch ",
+    "nonrec notation omit opaque open partial postfix prefix private protected public ",
+    "recommended_spelling renaming return run_cmd run_elab run_meta scoped seal section ",
+    "set_option show simproc simproc_decl structure suffices syntax termination_by then ",
+    "theorem try universe unless unsafe unseal using variable where with ",
 );
 
 /// Declarations Lean `v4.34.1` generates in the namespace of every `Type`-valued structure `S`
@@ -2933,6 +2940,38 @@ fn has_balanced_lean_delimiters(text: &str) -> bool {
     stack.is_empty()
 }
 
+/// Keywords that start or extend a Lean command (whitespace-separated). A field type is emitted
+/// unparenthesized after `<field> :`, so a type containing one could end the `structure`
+/// command and start another: `y : Nat axiom bad : False` as the last field of a flat
+/// structure declares the axiom `bad`, and `y : Nat deriving Repr` adds a `deriving` clause.
+/// Besides the keywords of Lean `v4.34.1`'s `Init` (all of which [`LEAN_RESERVED_WORDS`] also
+/// lists), it covers commands that importing `Lean` or Mathlib adds (`register_simp_attr`,
+/// `lemma`, `alias`, ...). Header-only commands (`prelude`, `module`) cannot start mid-file.
+const LEAN_COMMAND_KEYWORDS: &str = concat!(
+    "abbrev add_decl_doc alias attribute axiom binder_predicate builtin_dsimproc ",
+    "builtin_initialize builtin_simproc builtin_simproc_decl class coinductive ",
+    "declare_syntax_cat decreasing_by def deriving dsimproc elab elab_rules end example export ",
+    "extends gen_injective_theorems grind_pattern hiding import include inductive infix infixl ",
+    "infixr init_quot initialize instance irreducible_def lemma local macro macro_rules meta ",
+    "mutual namespace noncomputable nonrec notation omit opaque open partial postfix prefix ",
+    "private protected public recommended_spelling register_builtin_option ",
+    "register_label_attr register_option register_simp_attr renaming run_cmd run_elab ",
+    "run_meta scoped seal section set_option simproc simproc_decl structure syntax ",
+    "termination_by theorem universe unsafe unseal variable where",
+);
+
+/// True when `ty` contains a [`LEAN_COMMAND_KEYWORDS`] word or a `#` command (`#eval`).
+fn lean_ty_has_command_syntax(ty: &str) -> bool {
+    lean_ident_atoms(ty).any(|atom| {
+        LEAN_COMMAND_KEYWORDS
+            .split_whitespace()
+            .any(|keyword| keyword == atom)
+    }) || ty
+        .split('#')
+        .skip(1)
+        .any(|rest| rest.starts_with(|c: char| c.is_ascii_alphabetic()))
+}
+
 fn check_lean_ty(field: &str, lean_ty: &str) -> Result<(), LcnfLayoutError> {
     let ty = lean_ty.trim();
     if ty.is_empty()
@@ -2941,6 +2980,7 @@ fn check_lean_ty(field: &str, lean_ty: &str) -> Result<(), LcnfLayoutError> {
         || ty.contains("/-")
         || ty.contains(":=")
         || !has_balanced_lean_delimiters(ty)
+        || lean_ty_has_command_syntax(ty)
     {
         return Err(LcnfLayoutError::InvalidLeanType {
             field: field.to_owned(),
@@ -3043,6 +3083,11 @@ fn check_lcnf_emission(
                 .iter()
                 .any(|ty| ident.ends_with(ty.as_str()))
     };
+    // `deriving C` on the root declares `instC<struct_leaf>` in the enclosing namespace, which
+    // is open in the accessors (`Foo.instReprBar` for `Foo.Bar`) but not yet declared in the
+    // flat structure's field types.
+    let is_derived_root_instance =
+        |ident: &str| ident.starts_with("inst") && ident.ends_with(struct_leaf);
     for field in &plan.fields {
         // `deriving C` on a generated structure `<struct_name>.<T>` declares the instance
         // `<struct_name>.instC<T>` (`Wide.instReprPart1`), which an accessor would collide with.
@@ -3062,8 +3107,11 @@ fn check_lcnf_emission(
                     || generated_types.contains(atom)
             })
             .or_else(|| {
-                lean_ident_heads(&field.lean_ty)
-                    .find(|&head| reserved.contains(head) || is_derived_part_instance(head))
+                lean_ident_heads(&field.lean_ty).find(|&head| {
+                    reserved.contains(head)
+                        || is_derived_part_instance(head)
+                        || is_derived_root_instance(head)
+                })
             })
         {
             return Err(LcnfLayoutError::DependentFieldType {
@@ -4535,6 +4583,49 @@ mod lcnf_tests {
     }
 
     #[test]
+    fn field_types_cannot_inject_commands() {
+        for lean_ty in [
+            "Nat axiom injected : Nat",
+            "Nat deriving Repr",
+            "Nat theorem injected : True",
+            "Nat set_option maxRecDepth 100",
+            "Nat attribute [simp] Nat.add_comm",
+            "Nat instance : Inhabited Nat",
+            "Nat end",
+            "Nat #eval 1",
+            "Nat macro_rules | `(x) => `(x)",
+        ] {
+            let fields = [
+                LcnfFieldSpec::new("x", "Nat", ObjectRef),
+                LcnfFieldSpec::new("y", lean_ty, ObjectRef),
+            ];
+            assert_eq!(
+                emit_lcnf_guarded_structure("F", &fields, &[]),
+                Err(LcnfLayoutError::InvalidLeanType {
+                    field: String::from("y"),
+                    lean_ty: lean_ty.to_owned()
+                }),
+                "type `{lean_ty}`"
+            );
+        }
+        // Term keywords and `#[...]` array literals stay valid.
+        for lean_ty in [
+            "(fun n => n) Nat",
+            "if True then Nat else Bool",
+            "match (0 : Nat) with | 0 => Nat | _ => Bool",
+            "Fin (#[1, 2].size)",
+            "\u{2200} n : Nat, n = n",
+            "Id.run do return Nat",
+        ] {
+            let fields = [LcnfFieldSpec::new("y", lean_ty, ObjectRef)];
+            assert!(
+                emit_lcnf_guarded_structure("F", &fields, &[]).is_ok(),
+                "type `{lean_ty}`"
+            );
+        }
+    }
+
+    #[test]
     fn split_layout_rejects_collisions_and_dependent_types() {
         let flat = vec![
             LcnfFieldSpec::new("part1", "Nat", ObjectRef),
@@ -4644,6 +4735,7 @@ mod lcnf_tests {
             ("Fin rec.succ", "rec"),
             ("Fin _sizeOf_1", "_sizeOf_1"),
             ("Fin instReprPart1", "instReprPart1"),
+            ("Fin instReprWide", "instReprWide"),
         ] {
             let fields = wide(&[LcnfFieldSpec::new("w", lean_ty, ObjectRef)]);
             assert_eq!(
@@ -5879,6 +5971,122 @@ mod lcnf_tests {
         };
         for ((name, _, accepted), case_errors) in cases.iter().zip(&errors) {
             assert_eq!(case_errors.is_empty(), *accepted, "{name}: {case_errors:?}");
+        }
+    }
+
+    #[test]
+    fn lcnf_live_lean_reserved_words_are_keywords() {
+        // The command words outside `Init` come from `Lean`, Batteries, and Mathlib.
+        let reserved: BTreeSet<&str> = LEAN_RESERVED_WORDS.split_whitespace().collect();
+        let outside_init: Vec<&str> = LEAN_COMMAND_KEYWORDS
+            .split_whitespace()
+            .filter(|word| !reserved.contains(word))
+            .collect();
+        assert_eq!(
+            outside_init,
+            [
+                "alias",
+                "gen_injective_theorems",
+                "irreducible_def",
+                "lemma",
+                "register_builtin_option",
+                "register_label_attr",
+                "register_option",
+                "register_simp_attr",
+            ]
+        );
+        assert!(!reserved.contains("this"));
+        let Some(lean) = lean_for_probe() else {
+            assert!(
+                std::env::var_os("ANNEAL_REQUIRE_LCNF_LEAN_PROBE").is_none_or(|value| value.is_empty()),
+                "ANNEAL_REQUIRE_LCNF_LEAN_PROBE is set but no Lean 4.34.1 was found"
+            );
+            eprintln!("lcnf_live_lean_reserved_words_are_keywords: SKIPPED: no Lean 4.34.1");
+            return;
+        };
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "anneal-lcnf-keywords-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("probe directory");
+        let _cleanup = RemoveDirOnDrop(dir.clone());
+        // One Lean process per word: a keyword's parse error must not leak into another case.
+        let words: Vec<&str> = reserved.iter().copied().chain(["this"]).collect();
+        let accepted: Vec<bool> = std::thread::scope(|scope| {
+            let handles: Vec<_> = words
+                .chunks(words.len().div_ceil(8))
+                .enumerate()
+                .map(|(chunk, chunk_words)| {
+                    let (lean, dir) = (&lean, &dir);
+                    scope.spawn(move || {
+                        chunk_words
+                            .iter()
+                            .map(|word| {
+                                let path = dir.join(format!("Word{chunk}.lean"));
+                                std::fs::write(&path, format!("def {word} : Nat := 1\n"))
+                                    .expect("probe source");
+                                Command::new(lean)
+                                    .arg(&path)
+                                    .current_dir(env!("CARGO_MANIFEST_DIR"))
+                                    .env_remove("LEAN_PATH")
+                                    .stdin(Stdio::null())
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .status()
+                                    .expect("spawn lean")
+                                    .success()
+                            })
+                            .collect::<Vec<bool>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("probe thread"))
+                .collect()
+        });
+        let declarable: Vec<&str> = words
+            .iter()
+            .zip(&accepted)
+            .filter(|(_, accepted)| **accepted)
+            .map(|(word, _)| *word)
+            .collect();
+        assert_eq!(declarable, ["this"], "Lean 4.34.1 accepts these words as declaration names");
+    }
+
+    #[test]
+    fn lcnf_live_lean_field_types_could_inject_commands() {
+        // Emitted unchecked, these last-field types end the `structure` command and Lean
+        // accepts the result: an extra axiom, and an extra `deriving` clause.
+        let injected = [
+            ("Nat axiom injected : Nat", "#check (injected : Nat)\n"),
+            ("Nat deriving Repr", "#eval repr ({ x := 1, y := 2 } : F)\n"),
+        ];
+        let mut cases = Vec::new();
+        for (index, (lean_ty, check)) in injected.iter().enumerate() {
+            let fields = [
+                LcnfFieldSpec::new("x", "Nat", ObjectRef),
+                LcnfFieldSpec::new("y", *lean_ty, ObjectRef),
+            ];
+            assert!(matches!(
+                emit_lcnf_guarded_structure("F", &fields, &[]),
+                Err(LcnfLayoutError::InvalidLeanType { .. })
+            ));
+            cases.push(LeanProbeCase::new(
+                &format!("injected_{index}"),
+                &format!("structure F where\n  x : Nat\n  y : {lean_ty}\n{check}"),
+                &[],
+            ));
+        }
+        let Some(errors) = run_lean_probe("lcnf_live_lean_field_types_could_inject_commands", &cases)
+        else {
+            return;
+        };
+        for (case, case_errors) in cases.iter().zip(&errors) {
+            assert!(case_errors.is_empty(), "{}: {case_errors:?}", case.name);
         }
     }
 
