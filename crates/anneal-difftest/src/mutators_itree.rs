@@ -127,13 +127,35 @@ fn second_u32_param_expr(func: &syn::ItemFn, fallback: u32) -> Expr {
     syn::parse_quote!(#fallback)
 }
 
-fn combined_u32_param_expr(func: &syn::ItemFn, fallback: u32) -> Expr {
+fn combined_u32_param_expr(func: &syn::ItemFn, fallback: u32, shift: u32) -> Expr {
     let idents = collect_u32_param_idents(func);
     match idents.as_slice() {
+        [p0, p1, ..] if shift > 0 => syn::parse_quote!(#p0 ^ (#p1 >> #shift)),
         [p0, p1, ..] => syn::parse_quote!(#p0 ^ #p1),
         [p0] => syn::parse_quote!(#p0),
         [] => syn::parse_quote!(#fallback),
     }
+}
+
+fn existing_itree_helper_depth(file: &File) -> usize {
+    file.items
+        .iter()
+        .filter(|it| {
+            matches!(
+                it,
+                Item::Fn(f) if f.sig.ident.to_string().starts_with("__anneal_")
+            )
+        })
+        .count()
+}
+
+fn preamble_arg_shifts(file: &File) -> (u32, u32) {
+    let outer_shift = match existing_itree_helper_depth(file).min(2) {
+        0 => 4,
+        1 => 8,
+        _ => 12,
+    };
+    (outer_shift, outer_shift.saturating_sub(2))
 }
 
 fn target_fn_index(file: &File) -> Option<usize> {
@@ -232,6 +254,7 @@ impl ItreeAstMutator for CallBoundaryOutliner {
         let leaf_ident = format_ident!("__anneal_itree_leaf_{}", tag);
         let k_const = ((rng.next_u64() % 251) as u32).wrapping_add(1);
 
+        let (outer_shift, inner_shift) = preamble_arg_shifts(file);
         if use_multi_callee {
             let helper_item1: Item = syn::parse_quote! {
                 #[inline(never)]
@@ -271,8 +294,8 @@ impl ItreeAstMutator for CallBoundaryOutliner {
                 let stage1_local = format_ident!("__itree_call_s1_{}", tag);
                 let local_ident = format_ident!("__itree_call_res_{}", tag);
                 let injected: Vec<Stmt> = syn::parse_quote! {
-                    let #stage1_local: u32 = #helper_ident(#arg0_expr, #arg1_expr);
-                    let #local_ident: u32 = #stage2_ident(#stage1_local, #arg1_expr ^ #k_const);
+                    let #stage1_local: u32 = #helper_ident(#arg0_expr, #arg1_expr >> #outer_shift);
+                    let #local_ident: u32 = #stage2_ident(#stage1_local, (#arg1_expr >> #inner_shift) ^ #k_const);
                 };
                 weave_into_fn_body(func, injected, &local_ident);
             }
@@ -296,7 +319,7 @@ impl ItreeAstMutator for CallBoundaryOutliner {
                 let arg1_expr = second_u32_param_expr(func, k_const);
                 let local_ident = format_ident!("__itree_call_res_{}", tag);
                 let injected: Vec<Stmt> = syn::parse_quote! {
-                    let #local_ident: u32 = #helper_ident(#arg0_expr, #arg1_expr);
+                    let #local_ident: u32 = #helper_ident(#arg0_expr, #arg1_expr >> #outer_shift);
                 };
                 weave_into_fn_body(func, injected, &local_ident);
             }
@@ -443,11 +466,12 @@ impl ItreeAstMutator for ExtOracleInjector {
             }
         };
 
+        let (outer_shift, _) = preamble_arg_shifts(file);
         let target_idx = target_fn_index(file);
         if let Some(idx) = target_idx
             && let Item::Fn(func) = &mut file.items[idx]
         {
-            let arg_expr = combined_u32_param_expr(func, mask);
+            let arg_expr = combined_u32_param_expr(func, mask, outer_shift);
             let ans_ident = format_ident!("__itree_oracle_ans_{}", tag);
             let injected: Vec<Stmt> = syn::parse_quote! {
                 let #ans_ident: u32 = #oracle_ident(#arg_expr);
@@ -1363,6 +1387,21 @@ impl ItreeConcreteEvaluator {
             .collect()
     }
 
+    /// Return bit-validity domain of boundary callee `callee` (`()` ->
+    /// `ScalarLayout::unsigned(0)`, `bool` -> [`ScalarLayout::bool_layout`], `uN` ->
+    /// `N`-bit unsigned).
+    pub fn callee_return_layout(&self, callee: &str) -> Option<ScalarLayout> {
+        let f = self.top_fn(callee)?;
+        match ret_ty_of(&f.sig.output) {
+            EvalTy::Unit => Some(ScalarLayout::unsigned(0)),
+            EvalTy::Bool => Some(ScalarLayout::bool_layout()),
+            EvalTy::Int(t) if t != EvalIntTy::Infer => {
+                Some(ScalarLayout::unsigned((t.bits() / 8) as usize))
+            }
+            _ => None,
+        }
+    }
+
     /// Executes the root function on `root_args` (one value per parameter,
     /// truncation-checked against the parameter types) under `schedule`, whose
     /// queues are keyed by `callee_key_prefix` + callee name (the staged
@@ -1925,8 +1964,9 @@ fn concolic_candidate_pool(
     dict: &MirInputDictionary,
     seed: u64,
 ) -> Vec<(u32, u32)> {
-    const DELTAS: [u32; 15] = [
-        1, 2, 3, 4, 7, 8, 15, 16, 17, 0x80, 0x100, 0x400, 0x401, 0x1000, 0x8000_0000,
+    const DELTAS: [u32; 21] = [
+        1, 2, 3, 4, 7, 8, 12, 15, 16, 32, 48, 64, 0x80, 0x100, 0x200, 0x400, 0x401, 0x800,
+        0x1000, 0x2000, 0x8000_0000,
     ];
     let mut values: Vec<u32> = Vec::new();
     let mut push_value = |v: u128| {
@@ -1993,6 +2033,17 @@ fn concolic_path_shape(run: &ItreeConcreteRun) -> Vec<(u32, u128, &str)> {
             ItreeConcreteEvent::Branch { site, tag } => (*site, *tag, ""),
             ItreeConcreteEvent::ExtCall { callee, .. } => (u32::MAX, 0, callee.as_str()),
             ItreeConcreteEvent::ExtCallPanic { callee, .. } => (u32::MAX, 1, callee.as_str()),
+        })
+        .collect()
+}
+
+/// Ordered `(site, tag)` sequence of all branch decisions in `run`.
+fn concolic_branch_decisions(run: &ItreeConcreteRun) -> Vec<(u32, u128)> {
+    run.events
+        .iter()
+        .filter_map(|ev| match ev {
+            ItreeConcreteEvent::Branch { site, tag } => Some((*site, *tag)),
+            _ => None,
         })
         .collect()
 }
@@ -2141,23 +2192,35 @@ pub fn explore_itree_concolic_trials(
                 ps.exhausted = Some(ArgPinFallbackReason::DomainExhausted);
                 continue;
             }
-            let found = pools[ps.base].iter().find_map(|&(m, p)| {
+            let base_branches = concolic_branch_decisions(base);
+            let mut fallback_found: Option<(u32, u32, Vec<Vec<u8>>, ItreeConcreteRun)> = None;
+            let mut branch_preserving_found: Option<(u32, u32, Vec<Vec<u8>>, ItreeConcreteRun)> =
+                None;
+            for &(m, p) in &pools[ps.base] {
                 if used_plain_inputs.contains(&(m, p)) {
-                    return None;
+                    continue;
                 }
-                let run = run_plain(m, p)?;
-                if !run.shares_prefix_with(base, ps.pos) {
-                    return None;
+                let Some(run) = run_plain(m, p) else {
+                    continue;
+                };
+                if !run.shares_prefix_with(base, ps.pos) || seen_runs.contains(&run) {
+                    continue;
                 }
-                match run.events.get(ps.pos) {
-                    Some(ItreeConcreteEvent::ExtCall { callee, args, .. })
-                        if *callee == ps.pin.callee && ps.pin.neg_arg_pin_term(args) =>
-                    {
-                        Some((m, p, args.clone(), run))
+                if let Some(ItreeConcreteEvent::ExtCall { callee, args, .. }) =
+                    run.events.get(ps.pos)
+                    && *callee == ps.pin.callee
+                    && ps.pin.neg_arg_pin_term(args)
+                {
+                    if concolic_branch_decisions(&run) == base_branches {
+                        branch_preserving_found = Some((m, p, args.clone(), run));
+                        break;
                     }
-                    _ => None,
+                    if fallback_found.is_none() {
+                        fallback_found = Some((m, p, args.clone(), run));
+                    }
                 }
-            });
+            }
+            let found = branch_preserving_found.or(fallback_found);
             match found {
                 Some((m, p, new_args, run)) => {
                     register_concolic_args(&mut seen_args, &run);
@@ -2213,6 +2276,15 @@ pub fn explore_itree_concolic_trials(
             let ItreeConcreteEvent::ExtCall { callee, args, ret } = &base.events[ps.pos] else {
                 continue;
             };
+            if ret.is_empty() {
+                continue;
+            }
+            let ret_layout = ev
+                .callee_return_layout(callee)
+                .unwrap_or_else(|| ScalarLayout::unsigned(ret.len().min(16)));
+            if ret_layout.valid_start == ret_layout.valid_end {
+                continue;
+            }
             let key = (base.events[..ps.pos].to_vec(), callee.clone());
             let used = used_rets.entry(key).or_insert_with(|| BTreeSet::from([ret.clone()]));
             let mut prefix_sched = EnvSchedule::new();
@@ -2244,7 +2316,11 @@ pub fn explore_itree_concolic_trials(
             let mut fallback: Option<(Vec<u8>, EnvSchedule, ItreeConcreteRun)> = None;
             let mut chosen: Option<(Vec<u8>, EnvSchedule, ItreeConcreteRun)> = None;
             for bits in cands {
-                let bytes = (bits & width_mask(width)).to_le_bytes()[..ret.len().min(16)].to_vec();
+                let masked = bits & width_mask(width);
+                if masked < ret_layout.valid_start || masked > ret_layout.valid_end {
+                    continue;
+                }
+                let bytes = masked.to_le_bytes()[..ret.len().min(16)].to_vec();
                 if used.contains(&bytes) {
                     continue;
                 }
@@ -3183,6 +3259,83 @@ mod tests {
                 .iter()
                 .map(|t| (t.magic, t.payload_len, t.schedule.clone()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn outliner_and_oracle_injector_preserve_downstream_call_negation_freedom() {
+        let seed0 = crate::itree_eval::ITREE_SAFE_SEEDS[0];
+        let bases = [(0x414E_4E4C, 2048)];
+
+        // 1. Multi-callee `CallBoundaryOutliner` on Seed 0: has 3 boundary calls on
+        //    `(0x414E_4E4C, 2048)`: `pin_idx = 0` (`__anneal_itree_outlined_*`),
+        //    `pin_idx = 1` (`__anneal_itree_outlined_stage2_*`), and `pin_idx = 2`
+        //    (`ext_oracle` inside `if magic == 0x414E_4E4C { if payload_len > 1024 }`).
+        let mut multi_src = None;
+        for s in 0..32u64 {
+            let mut f = syn::parse_file(seed0).unwrap();
+            let mut rng = DetRng::new(s);
+            CallBoundaryOutliner.mutate(&mut f, &mut rng);
+            let src = prettyplease::unparse(&f);
+            if src.contains("__anneal_itree_outlined_stage2_") {
+                multi_src = Some(src);
+                break;
+            }
+        }
+        let multi_src = multi_src.expect("multi-callee outliner source");
+        let dict = MirInputDictionary::from_rust_source(&multi_src).unwrap();
+        let ev = ItreeConcreteEvaluator::new(&multi_src, "kernel_step").unwrap();
+        let base_run = ev
+            .run_kernel_step(0x414E_4E4C, 2048, &EnvSchedule::new(), "s__")
+            .unwrap();
+        assert_eq!(base_run.ext_calls().len(), 3);
+        let trials =
+            explore_itree_concolic_trials(&multi_src, "kernel_step", "s__", &bases, &dict, 18, 42);
+        let negated_pins: BTreeSet<usize> = trials
+            .iter()
+            .filter_map(|t| match &t.phase {
+                ConcolicTrialPhase::NegateCallArg { pin_idx, .. } => Some(*pin_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            negated_pins,
+            BTreeSet::from([0, 1, 2]),
+            "all 3 boundary calls (stage1, stage2, ext_oracle) must be negatable under prefix pins"
+        );
+        for t in &trials {
+            if let ConcolicTrialPhase::NegateCallArg { pin_idx, .. } = &t.phase {
+                assert!(t.predicted.shares_prefix_with(&base_run, t.target_event_pos));
+                if *pin_idx == 0 {
+                    assert_eq!(
+                        concolic_branch_decisions(&t.predicted),
+                        concolic_branch_decisions(&base_run),
+                        "pin_idx = 0 negation should preserve downstream branch decisions when possible"
+                    );
+                }
+            }
+        }
+
+        // 2. `ExtOracleInjector` on Seed 0: both `pin_idx = 0` (`__anneal_ext_oracle_*`)
+        //    and `pin_idx = 1` (`ext_oracle`) must be negatable under prefix pins.
+        let mut f_inj = syn::parse_file(seed0).unwrap();
+        let mut rng_inj = DetRng::new(7);
+        ExtOracleInjector.mutate(&mut f_inj, &mut rng_inj);
+        let inj_src = prettyplease::unparse(&f_inj);
+        let inj_dict = MirInputDictionary::from_rust_source(&inj_src).unwrap();
+        let inj_trials =
+            explore_itree_concolic_trials(&inj_src, "kernel_step", "s__", &bases, &inj_dict, 12, 99);
+        let inj_negated_pins: BTreeSet<usize> = inj_trials
+            .iter()
+            .filter_map(|t| match &t.phase {
+                ConcolicTrialPhase::NegateCallArg { pin_idx, .. } => Some(*pin_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inj_negated_pins,
+            BTreeSet::from([0, 1]),
+            "both injected oracle and seed ext_oracle must be negatable under prefix pins"
         );
     }
 }

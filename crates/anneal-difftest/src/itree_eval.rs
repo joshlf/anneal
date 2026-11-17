@@ -828,13 +828,32 @@ impl TrackedProcessTree {
         }
 
         // If `root_pid` exited or was recycled for an unrelated process, do not
-        // attribute its RSS.
-        match live_meta.get(&self.root_pid) {
-            Some(&(_, st)) if st == root_st => {}
-            _ => {
-                self.tracked.remove(&self.root_pid);
-                return 0;
-            }
+        // attribute `root_pid`'s own RSS; if `root_pid` is a zombie with matching
+        // `starttime`, still expand its children before pruning `'Z'`/`'X'`.
+        let root_matches = matches!(
+            live_meta.get(&self.root_pid),
+            Some(&(_, st)) if st == root_st
+        );
+        if !root_matches {
+            self.tracked.remove(&self.root_pid);
+        }
+
+        // Seed expansion from all tracked PIDs whose `starttime` still matches
+        // (including a just-zombied parent whose un-reaped PID is still its
+        // live children's `ppid`).
+        let mut stack: Vec<u32> = self
+            .tracked
+            .iter()
+            .filter_map(|(&pid, &(expected_st, _))| {
+                matches!(
+                    live_meta.get(&pid),
+                    Some(&(_, actual_st)) if actual_st == expected_st
+                )
+                .then_some(pid)
+            })
+            .collect();
+        if root_matches && !stack.contains(&self.root_pid) {
+            stack.push(self.root_pid);
         }
 
         // Prune any tracked PID that exited, turned into a zombie, or was reused
@@ -849,7 +868,6 @@ impl TrackedProcessTree {
         // Expand from all verified tracked members to discover any new children
         // or grandchildren (including descendants reparented before their parent
         // exited).
-        let mut stack: Vec<u32> = self.tracked.keys().copied().collect();
         while let Some(pid) = stack.pop() {
             if let Some(children) = children_by_ppid.get(&pid) {
                 for &child_pid in children {
@@ -867,6 +885,9 @@ impl TrackedProcessTree {
                     }
                 }
             }
+        }
+        if self.tracked.is_empty() {
+            return 0;
         }
 
         let mut total_rss_kib = 0u64;
@@ -969,6 +990,18 @@ impl TrackedProcessTree {
             let _ = grace_period;
         }
     }
+    /// Returns true if `root_pid` has already exited (zombie `'Z'`/`'X'`, gone,
+    /// or recycled with a different `starttime`) without reaping `Child`.
+    fn root_has_exited(&self) -> bool {
+        let Some(root_st) = self.root_starttime else {
+            return false;
+        };
+        !matches!(
+            proc_state_ppid_starttime_in(&self.proc_root, self.root_pid),
+            Some((state, _, actual_st))
+                if actual_st == root_st && state != 'Z' && state != 'X'
+        )
+    }
 }
 
 /// Terminates `child` (spawned with `.process_group(0)` so `pgid == root_pid`)
@@ -977,13 +1010,13 @@ impl TrackedProcessTree {
 ///    reused before `wait()`).
 /// 2. Sends `SIGTERM` to `-pgid` and to all `(pid, starttime)`-verified
 ///    descendants (in case a grandchild called `setsid` / `setpgid`).
-/// 3. Polls up to `grace_period` for `child` and all non-zombie descendants to
-///    exit.
+/// 3. Polls up to `grace_period` for `child` (via `/proc` zombie state without
+///    reaping so `pgid == root_pid` stays reserved) and all non-zombie
+///    descendants to exit.
 /// 4. Escalates to `SIGKILL` on `-pgid` and any surviving verified descendants,
-///    and reaps `child` via `child.wait()` so no zombie is left behind.
+///    and only then reaps `child` via `child.wait()` so no zombie is left behind.
 fn terminate_process_tree(child: &mut Child, tree: &mut TrackedProcessTree, grace_period: Duration) {
     let _ = tree.sample_rss_kib();
-    let mut root_reaped = child.try_wait().ok().flatten().is_some();
 
     #[cfg(unix)]
     {
@@ -994,7 +1027,7 @@ fn terminate_process_tree(child: &mut Child, tree: &mut TrackedProcessTree, grac
         const SIGKILL: i32 = 9;
 
         let pgid = i32::try_from(tree.root_pid).ok().filter(|&p| p > 1);
-        if !root_reaped && let Some(pg) = pgid {
+        if let Some(pg) = pgid {
             unsafe {
                 let _ = kill(-pg, SIGTERM);
             }
@@ -1012,16 +1045,14 @@ fn terminate_process_tree(child: &mut Child, tree: &mut TrackedProcessTree, grac
 
         let deadline = Instant::now() + grace_period;
         while Instant::now() < deadline {
-            if !root_reaped && child.try_wait().ok().flatten().is_some() {
-                root_reaped = true;
-            }
-            if root_reaped && !tree.has_live_descendants() {
+            let _ = tree.sample_rss_kib();
+            if tree.root_has_exited() && !tree.has_live_descendants() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        if !root_reaped && let Some(pg) = pgid {
+        if let Some(pg) = pgid {
             unsafe {
                 let _ = kill(-pg, SIGKILL);
             }
@@ -1038,10 +1069,8 @@ fn terminate_process_tree(child: &mut Child, tree: &mut TrackedProcessTree, grac
         }
     }
 
-    if !root_reaped {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Classification of a `lake env lean` failure so `run_isolated_lean_stage` and
@@ -1136,38 +1165,60 @@ pub struct WatchdogCommandOutput {
     pub pipes_drained: bool,
 }
 
+/// Upper bound on bytes buffered per child output stream (`stdout` / `stderr`)
+/// in [`WatchdogPipeReader`] (`16 MiB`), so a runaway child spewing unbounded
+/// output cannot exhaust host memory before the watchdog fires.
+const MAX_WATCHDOG_PIPE_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Background reader that drains one child pipe into a shared buffer, so the
 /// captured prefix stays available even if the reader has to be abandoned.
 struct WatchdogPipeReader {
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    abandoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WatchdogPipeReader {
     fn spawn<R: Read + Send + 'static>(pipe: Option<R>) -> Self {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = pipe.map(|mut pipe| {
             let sink = std::sync::Arc::clone(&buf);
+            let stop = std::sync::Arc::clone(&abandoned);
             std::thread::spawn(move || {
                 let mut chunk = [0u8; 8192];
                 loop {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     match pipe.read(&mut chunk) {
                         Ok(0) => break,
-                        Ok(n) => sink
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .extend_from_slice(&chunk[..n]),
+                        Ok(n) => {
+                            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+                            if guard.len() < MAX_WATCHDOG_PIPE_CAPTURE_BYTES {
+                                let take = (MAX_WATCHDOG_PIPE_CAPTURE_BYTES - guard.len()).min(n);
+                                guard.extend_from_slice(&chunk[..take]);
+                            }
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(_) => break,
                     }
                 }
             })
         });
-        Self { buf, handle }
+        Self {
+            buf,
+            abandoned,
+            handle,
+        }
     }
 
     /// Waits until `deadline` for EOF and returns the bytes read so far plus
-    /// whether EOF was reached (an unfinished reader is detached).
+    /// whether EOF was reached (an unfinished reader is signaled to stop and
+    /// detached).
     fn finish(self, deadline: Instant) -> (Vec<u8>, bool) {
         let drained = match self.handle {
             None => true,
@@ -1178,6 +1229,9 @@ impl WatchdogPipeReader {
                 let finished = handle.is_finished();
                 if finished {
                     let _ = handle.join();
+                } else {
+                    self.abandoned
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 finished
             }
@@ -1230,7 +1284,7 @@ pub fn run_command_with_watchdog(
     let mut poll = ITREE_WATCHDOG_MIN_POLL_INTERVAL.min(max_poll);
 
     let start = Instant::now();
-    let mut peak_rss_kib = 0u64;
+    let mut peak_rss_kib = tree.sample_rss_kib();
     let mut watchdog_killed: Option<ItreeLeanFailureKind> = None;
     let (exit_success, signal_terminated) = loop {
         match child.try_wait() {
@@ -1558,7 +1612,11 @@ where
             let mut stack: Vec<(usize, usize)> = vec![(0, fn_cases.len())];
             while let Some((lo, hi)) = stack.pop() {
                 let mid = lo + (hi - lo) / 2;
-                let mut halves: Vec<(usize, usize, Option<ItreeLeanFailureKind>)> = Vec::new();
+                let mut halves: Vec<(
+                    usize,
+                    usize,
+                    Option<(ItreeLeanFailureKind, String, bool)>,
+                )> = Vec::new();
                 for (a, b) in [(lo, mid), (mid, hi)] {
                     if failing_runs >= budget {
                         unresolved_by_budget += b - a;
@@ -1576,6 +1634,14 @@ where
                         Err(sub_err) => {
                             failing_runs += 1;
                             let kind = classify_itree_lean_failure(&sub_err);
+                            let raw_body = sub_err
+                                .strip_prefix(&format!("{sub_label}: "))
+                                .unwrap_or(&sub_err)
+                                .to_string();
+                            let case_or_limit_specific = slice
+                                .iter()
+                                .any(|c| raw_body.contains(case_key(c)))
+                                || itree_lean_failure_is_inconclusive(&raw_body);
                             if slice.len() == 1 {
                                 errors.push(format!(
                                     "{sub_label} (irreducible single case `{}` of `{fn_name}`): {}",
@@ -1585,27 +1651,30 @@ where
                             } else {
                                 errors.push(sub_err);
                             }
-                            halves.push((a, b, Some(kind)));
+                            halves.push((a, b, Some((kind, raw_body, case_or_limit_specific))));
                         }
                     }
                 }
-                let elaboration_failures = halves
-                    .iter()
-                    .filter(|h| h.2 == Some(ItreeLeanFailureKind::ElaborationOrOutputFailure))
-                    .count();
-                if elaboration_failures == 2 {
+                let candidate_wide_elaboration = match halves.as_slice() {
+                    [
+                        (_, _, Some((ItreeLeanFailureKind::ElaborationOrOutputFailure, b0, false))),
+                        (_, _, Some((ItreeLeanFailureKind::ElaborationOrOutputFailure, b1, false))),
+                    ] => b0 == b1,
+                    _ => false,
+                };
+                if candidate_wide_elaboration {
                     errors.push(format!(
                         "{stage_label}Bisect_{fn_name}: both halves of cases {lo}..{hi} fail \
                          elaboration; treating the failure as candidate-wide and stopping bisection"
                     ));
                     continue;
                 }
-                for &(a, b, kind) in halves.iter().rev() {
-                    if let Some(kind) = kind
+                for (a, b, failure) in halves.iter().rev() {
+                    if let Some((kind, _, _)) = failure
                         && b - a > 1
-                        && kind != ItreeLeanFailureKind::MissingToolchain
+                        && *kind != ItreeLeanFailureKind::MissingToolchain
                     {
-                        stack.push((a, b));
+                        stack.push((*a, *b));
                     }
                 }
             }
@@ -6167,6 +6236,14 @@ mod tests {
         assert_eq!(tree.sample_rss_kib(), 400 + 2400);
         assert_eq!(tree.descendant_kill_order(), vec![(105, 300)]);
 
+        // Now simulate root PID 30000 becoming an un-reaped zombie ('Z') right
+        // after spawning a new worker PID 40000 (ppid = 30000, starttime 400, 300 pages = 1200 KiB).
+        write_proc(30000, "lake (env)", 'Z', 1, 100, 0);
+        write_proc(40000, "lean late worker", 'R', 30000, 400, 300);
+        assert_eq!(tree.sample_rss_kib(), 2400 + 1200);
+        assert_eq!(tree.descendant_kill_order(), vec![(40000, 400), (105, 300)]);
+        assert!(tree.root_has_exited());
+
         let _ = fs::remove_dir_all(&proc_dir);
     }
 
@@ -6662,5 +6739,40 @@ mod tests {
         assert_eq!(seen["ItreeDiffBatchProbeChunk2"], 1, "last wave holds one chunk");
         assert_eq!(seen["ItreeDiffBatchProbeFallback_cand_a"], 1);
         assert_eq!(itree_lean_stage_concurrency(99), 99, "guard restores outside a stage");
+
+        // 4. Two case-specific elaboration / missing-result failures in opposite
+        //    halves (`t1` in `0..4` and `t6` in `4..8`) must NOT be mistaken for a
+        //    candidate-wide failure: bisection isolates both poison cases and
+        //    recovers all 6 healthy siblings.
+        let (cases, case_to_fn) = stage_fixture(&[("cand_two_poison", 8)]);
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchProbe",
+            &cases,
+            64,
+            1,
+            ident,
+            &case_to_fn,
+            |_label: &str, chunk: &[String]| {
+                let mut map = ok_all(chunk)?;
+                map.remove("case_cand_two_poison_t1");
+                map.remove("case_cand_two_poison_t6");
+                Ok(map)
+            },
+        );
+        for t in [0, 2, 3, 4, 5, 7] {
+            assert!(
+                stage
+                    .results
+                    .contains_key(&format!("case_cand_two_poison_t{t}")),
+                "healthy sibling t{t} must be recovered even when both halves have a poison case"
+            );
+        }
+        assert!(!stage.results.contains_key("case_cand_two_poison_t1"));
+        assert!(!stage.results.contains_key("case_cand_two_poison_t6"));
+        assert!(
+            !stage.errors.iter().any(|e| e.contains("candidate-wide")),
+            "distinct case failures in opposite halves must not trigger candidate-wide stop: {:?}",
+            stage.errors
+        );
     }
 }

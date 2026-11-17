@@ -1699,20 +1699,24 @@ impl<'a> EnvScheduleGenerator<'a> {
 
         // Phase 1: Relax external-call argument pins (`neg_arg_pin_term`) across all call
         // sites in round-robin rounds while keeping prefix branch guards and earlier call
-        // pins fixed.
-        let mut exhausted_pins = vec![false; working_pins.len()];
+        // pins fixed. Capped at `ceil(max_trials / 2)` rounds so a call with a large
+        // (`u16` / `u32` / `u64`) argument domain cannot starve Phase 2 (oracle return
+        // perturbation) and Phase 3 (branch flips).
+        let arg_round_cap = max_trials.div_ceil(2).max(1);
+        let mut exhaust_reasons: Vec<Option<ArgPinFallbackReason>> =
+            vec![None; working_pins.len()];
         let mut round = 0usize;
         while out.len() < max_trials
             && !working_pins.is_empty()
-            && exhausted_pins.iter().any(|&ex| !ex)
-            && round < max_trials.saturating_mul(2).max(8)
+            && exhaust_reasons.iter().any(Option::is_none)
+            && round < arg_round_cap
         {
             let mut made_progress = false;
             for pin_idx in 0..working_pins.len() {
                 if out.len() >= max_trials {
                     break;
                 }
-                if exhausted_pins[pin_idx] {
+                if exhaust_reasons[pin_idx].is_some() {
                     continue;
                 }
                 match relax_pin_constraint_with_generator(
@@ -1752,11 +1756,14 @@ impl<'a> EnvScheduleGenerator<'a> {
                             made_progress = true;
                         }
                         if working_pins[pin_idx].is_arg_domain_exhausted() {
-                            exhausted_pins[pin_idx] = true;
+                            exhaust_reasons[pin_idx] = Some(ArgPinFallbackReason::DomainExhausted);
                         }
                     }
-                    Some(RelaxPinResult::FallbackReturnPerturbation { .. }) | None => {
-                        exhausted_pins[pin_idx] = true;
+                    Some(RelaxPinResult::FallbackReturnPerturbation { reason, .. }) => {
+                        exhaust_reasons[pin_idx] = Some(reason);
+                    }
+                    None => {
+                        exhaust_reasons[pin_idx] = Some(ArgPinFallbackReason::PrefixLocked);
                     }
                 }
             }
@@ -1764,6 +1771,11 @@ impl<'a> EnvScheduleGenerator<'a> {
                 break;
             }
             round += 1;
+        }
+        for reason_slot in &mut exhaust_reasons {
+            if reason_slot.is_none() {
+                *reason_slot = Some(ArgPinFallbackReason::NegationRoundCapReached);
+            }
         }
 
         // Phase 2: Once distinct external-call arguments under the current prefix have been
@@ -1789,7 +1801,7 @@ impl<'a> EnvScheduleGenerator<'a> {
                 );
                 if let Some(RelaxPinResult::FallbackReturnPerturbation {
                     callee,
-                    reason,
+                    reason: default_reason,
                     prefix_guards,
                     prefix_pins,
                     input_field_overrides,
@@ -1797,6 +1809,7 @@ impl<'a> EnvScheduleGenerator<'a> {
                     ..
                 }) = fallback
                 {
+                    let reason = exhaust_reasons[pin_idx].unwrap_or(default_reason);
                     let mut merged_fields = base_fields.clone();
                     for (k, v) in input_field_overrides {
                         merged_fields.insert(k, v);
@@ -1833,9 +1846,14 @@ impl<'a> EnvScheduleGenerator<'a> {
                 if out.len() >= max_trials {
                     break;
                 }
-                if let Some(flipped) =
-                    flip_branch_guard(base_fields, guards, &working_pins, guard_idx, self.dict, attempt)
-                {
+                if let Some(flipped) = flip_branch_guard_with_generator(
+                    self,
+                    base_fields,
+                    guards,
+                    &working_pins,
+                    guard_idx,
+                    attempt,
+                ) {
                     let plan = ConcolicTrialPlan {
                         phase: ConcolicTrialPhase::FlipBranchGuard {
                             guard_idx,
@@ -2256,8 +2274,23 @@ impl ArgPinConstraint {
             let values: Vec<u128> = if let Some(fname) = field_source
                 && let Some(&locked_bits) = locked_fields.get(fname)
             {
-                // Locked by a prefix branch guard or an earlier call pin.
-                vec![layout.clamp_to_valid_bits(locked_bits)]
+                // Locked by a prefix branch guard or an earlier call pin: verify that
+                // `locked_bits` is valid for `layout` and satisfies every prefix guard
+                // on `fname`.
+                let clamped = layout.clamp_to_valid_bits(locked_bits);
+                let encoded = encode_scalar_le_bytes(clamped, layout.size_bytes);
+                let guards_ok = prefix_guards
+                    .iter()
+                    .filter(|g| g.field_name.as_deref() == Some(fname))
+                    .all(|g| g.effective_term(locked_bits));
+                if clamped == locked_bits
+                    && LayoutSpec::Scalar(layout.clone()).validate_bytes(&encoded).is_ok()
+                    && guards_ok
+                {
+                    vec![clamped]
+                } else {
+                    Vec::new()
+                }
             } else {
                 candidate_arg_bytes_for_layout(&layout, field_source, &self.arg_tuple[i], dict)
                     .iter()
@@ -2520,55 +2553,102 @@ pub struct ConcolicTrialPlan {
 /// Fields fixed to a single value by the prefix: guards whose `effective_term`
 /// admits exactly one value ([`ConcolicBranchGuard::pinned_value`]) and every
 /// source field of an earlier full call pin (`pinTerm` fixes its arguments).
-fn collect_prefix_locked_fields(
+///
+/// Returns `None` when two prefix constraints lock the same field to different
+/// values, or when a locked value violates any prefix guard on that field.
+fn collect_prefix_locked_fields_checked(
     base_fields: &BTreeMap<String, u128>,
     prefix_guards: &[ConcolicBranchGuard],
     prefix_pins: &[ArgPinConstraint],
-) -> BTreeMap<String, u128> {
+) -> Option<BTreeMap<String, u128>> {
     let mut locked = BTreeMap::new();
     for g in prefix_guards {
         if let Some(ref fname) = g.field_name
             && let Some(v) = g.pinned_value()
         {
-            locked.entry(fname.clone()).or_insert(v);
+            if let Some(&prev) = locked.get(fname) {
+                if prev != v {
+                    return None;
+                }
+            } else {
+                locked.insert(fname.clone(), v);
+            }
         }
     }
     for p in prefix_pins {
         for (arg_idx, src) in p.arg_field_sources.iter().enumerate() {
-            if let Some(fname) = src
-                && !locked.contains_key(fname)
-            {
-                if let Some(&val) = base_fields.get(fname) {
-                    locked.insert(fname.clone(), val);
-                } else if let Some(arg_bytes) = p.arg_tuple.get(arg_idx) {
-                    locked.insert(fname.clone(), decode_scalar_le_bytes(arg_bytes));
+            if let Some(fname) = src {
+                let pin_val = if let Some(arg_bytes) = p.arg_tuple.get(arg_idx) {
+                    decode_scalar_le_bytes(arg_bytes)
+                } else if let Some(&val) = base_fields.get(fname) {
+                    val
+                } else {
+                    continue;
+                };
+                if let Some(&prev) = locked.get(fname) {
+                    if prev != pin_val {
+                        return None;
+                    }
+                } else {
+                    locked.insert(fname.clone(), pin_val);
                 }
             }
         }
     }
-    locked
+    // Verify that every locked field value satisfies all prefix guards on that field.
+    for (fname, &val) in &locked {
+        if !prefix_guards
+            .iter()
+            .filter(|g| g.field_name.as_ref() == Some(fname))
+            .all(|g| g.effective_term(val))
+        {
+            return None;
+        }
+    }
+    Some(locked)
 }
 
 /// Locked prefix fields plus, for every field merely *constrained* by a prefix
-/// guard (e.g. `payload_len > 1024`) and absent from `base_fields`, the guard's
-/// concrete trace value (which satisfies its `effective_term`), so a trial built
-/// from these overrides alone still follows the prefix.
-fn collect_prefix_field_overrides(
+/// guard (e.g. `payload_len > 1024`) and absent from `base_fields`, a concrete
+/// witness satisfying all prefix guards on that field, so a trial built from
+/// these overrides alone still follows the prefix. Returns `None` if a
+/// constrained field has mutually unsatisfiable prefix guards.
+fn collect_prefix_field_overrides_checked(
     base_fields: &BTreeMap<String, u128>,
     prefix_guards: &[ConcolicBranchGuard],
     locked: &BTreeMap<String, u128>,
-) -> BTreeMap<String, u128> {
+) -> Option<BTreeMap<String, u128>> {
     let mut overrides = locked.clone();
     for g in prefix_guards {
-        if let Some(ref fname) = g.field_name
-            && !overrides.contains_key(fname)
-            && !base_fields.contains_key(fname)
-            && g.effective_term(g.concrete_bits)
-        {
-            overrides.insert(fname.clone(), g.concrete_bits);
+        let Some(ref fname) = g.field_name else {
+            continue;
+        };
+        if let Some(&existing) = overrides.get(fname).or_else(|| base_fields.get(fname)) {
+            if prefix_guards
+                .iter()
+                .filter(|pg| pg.field_name.as_ref() == Some(fname))
+                .all(|pg| pg.effective_term(existing))
+            {
+                overrides.entry(fname.clone()).or_insert(existing);
+                continue;
+            }
+            if locked.contains_key(fname) {
+                return None;
+            }
         }
+        let mut candidates = vec![g.concrete_bits];
+        if let Some(w) = g.op.witness(g.target_bits, g.taken, g.bit_width) {
+            candidates.push(w);
+        }
+        let valid = candidates.into_iter().find(|&c| {
+            prefix_guards
+                .iter()
+                .filter(|pg| pg.field_name.as_ref() == Some(fname))
+                .all(|pg| pg.effective_term(c))
+        })?;
+        overrides.insert(fname.clone(), valid);
     }
-    overrides
+    Some(overrides)
 }
 
 fn prefix_pin_schedule(
@@ -2577,8 +2657,12 @@ fn prefix_pin_schedule(
 ) -> EnvSchedule {
     let mut schedule = EnvSchedule::new();
     for p in prefix_pins {
-        let layout = sched_gen.expected_callee_layout(&p.callee);
-        schedule.register_callee_return_size(&p.callee, layout.total_size());
+        let size = if p.ret_bytes.is_empty() {
+            sched_gen.expected_callee_layout(&p.callee).total_size()
+        } else {
+            p.ret_bytes.len()
+        };
+        schedule.register_callee_return_size(&p.callee, size);
         schedule.push_callee_response(&p.callee, p.ret_bytes.clone());
     }
     schedule
@@ -2596,8 +2680,10 @@ fn build_return_perturbation_fallback(
     let guard_bound = target_pin.before_guard_idx.min(guards.len());
     let prefix_guards = guards[..guard_bound].to_vec();
     let prefix_pins = pins[..pin_idx].to_vec();
-    let locked_fields = collect_prefix_locked_fields(base_fields, &prefix_guards, &prefix_pins);
-    let overrides = collect_prefix_field_overrides(base_fields, &prefix_guards, &locked_fields);
+    let locked_fields =
+        collect_prefix_locked_fields_checked(base_fields, &prefix_guards, &prefix_pins)?;
+    let overrides =
+        collect_prefix_field_overrides_checked(base_fields, &prefix_guards, &locked_fields)?;
 
     let reason = if target_pin.is_zero_arg() {
         ArgPinFallbackReason::ZeroArgCall
@@ -2609,11 +2695,18 @@ fn build_return_perturbation_fallback(
 
     let mut schedule = prefix_pin_schedule(sched_gen, &prefix_pins);
     let ret_layout = sched_gen.expected_callee_layout(&target_pin.callee);
-    let ret_size = ret_layout.total_size();
+    let ret_size = if target_pin.ret_bytes.is_empty() {
+        ret_layout.total_size()
+    } else {
+        target_pin.ret_bytes.len()
+    };
+    if ret_size == 0 {
+        return None;
+    }
     schedule.register_callee_return_size(&target_pin.callee, ret_size);
 
     let scalar_ret = match &ret_layout {
-        LayoutSpec::Scalar(s) => s.clone(),
+        LayoutSpec::Scalar(s) if s.size_bytes == ret_size => s.clone(),
         _ => ScalarLayout::unsigned(ret_size.max(1)),
     };
     let ret_candidates = candidate_arg_bytes_for_layout(
@@ -2628,12 +2721,7 @@ fn build_return_perturbation_fallback(
         .skip(attempt)
         .take(ret_candidates.len().max(1))
         .find(|cand| cand.as_slice() != target_pin.ret_bytes.as_slice())
-        .cloned()
-        .unwrap_or_else(|| {
-            let cur = decode_scalar_le_bytes(&target_pin.ret_bytes);
-            let next = scalar_ret.clamp_to_valid_bits(cur ^ 1);
-            encode_scalar_le_bytes(next, ret_size)
-        });
+        .cloned()?;
     schedule.push_callee_response(&target_pin.callee, perturbed_ret);
 
     Some(RelaxPinResult::FallbackReturnPerturbation {
@@ -2659,7 +2747,10 @@ fn relax_pin_constraint_with_generator(
     let guard_bound = target_pin.before_guard_idx.min(guards.len());
     let prefix_guards = guards[..guard_bound].to_vec();
     let prefix_pins = pins[..pin_idx].to_vec();
-    let locked_fields = collect_prefix_locked_fields(base_fields, &prefix_guards, &prefix_pins);
+    let locked_fields =
+        collect_prefix_locked_fields_checked(base_fields, &prefix_guards, &prefix_pins)?;
+    let base_overrides =
+        collect_prefix_field_overrides_checked(base_fields, &prefix_guards, &locked_fields)?;
 
     if let Some(new_arg_tuple) = target_pin.negate_arg_pin_under_guards(
         sched_gen.dict,
@@ -2667,8 +2758,7 @@ fn relax_pin_constraint_with_generator(
         &prefix_guards,
         attempt,
     ) {
-        let mut overrides =
-            collect_prefix_field_overrides(base_fields, &prefix_guards, &locked_fields);
+        let mut overrides = base_overrides;
         for (arg_idx, bytes) in new_arg_tuple.iter().enumerate() {
             if let Some(Some(fname)) = target_pin.arg_field_sources.get(arg_idx)
                 && !locked_fields.contains_key(fname)
@@ -2680,7 +2770,12 @@ fn relax_pin_constraint_with_generator(
         // unconstrained under `negArgPinTerm`, so it passes through to the real callee.
         let mut schedule = prefix_pin_schedule(sched_gen, &prefix_pins);
         let target_layout = sched_gen.expected_callee_layout(&target_pin.callee);
-        schedule.register_callee_return_size(&target_pin.callee, target_layout.total_size());
+        let target_ret_size = if target_pin.ret_bytes.is_empty() {
+            target_layout.total_size()
+        } else {
+            target_pin.ret_bytes.len()
+        };
+        schedule.register_callee_return_size(&target_pin.callee, target_ret_size);
         return Some(RelaxPinResult::RelaxedArgPin {
             pin_idx,
             callee: target_pin.callee.clone(),
@@ -2711,22 +2806,12 @@ pub fn relax_pin_constraint(
     relax_pin_constraint_with_generator(&sched_gen, &base_fields, guards, pins, pin_idx, attempt)
 }
 
-/// Flips the `guard_idx`-th branch guard in `guards` by asserting
-/// `target_guard.flipped_term` while preserving all earlier branch guards
-/// (`guards[..guard_idx]`) and all external call pins recorded up to `guard_idx`
-/// (`pins.iter().filter(|p| p.before_guard_idx <= guard_idx)`), modeled on
-/// `Nightowl.MultiInterp.flipBranchGuard`.
-///
-/// Returns `None` when the flip is unsatisfiable under that prefix: no candidate
-/// value satisfies the flipped term together with every earlier guard on the same
-/// field, or the guarded field feeds an earlier pinned call (whose `pinTerm`
-/// fixes the field).
-pub fn flip_branch_guard(
+fn flip_branch_guard_with_generator(
+    sched_gen: &EnvScheduleGenerator<'_>,
     base_fields: &BTreeMap<String, u128>,
     guards: &[ConcolicBranchGuard],
     pins: &[ArgPinConstraint],
     guard_idx: usize,
-    dict: &MirInputDictionary,
     attempt: usize,
 ) -> Option<FlippedBranchTrial> {
     let target_guard = guards.get(guard_idx)?;
@@ -2736,10 +2821,10 @@ pub fn flip_branch_guard(
         .filter(|p| p.before_guard_idx <= guard_idx)
         .cloned()
         .collect();
-    let pin_locked = collect_prefix_locked_fields(base_fields, &[], &prefix_pins);
-    let locked = collect_prefix_locked_fields(base_fields, &prefix_guards, &prefix_pins);
+    let pin_locked = collect_prefix_locked_fields_checked(base_fields, &[], &prefix_pins)?;
+    let locked = collect_prefix_locked_fields_checked(base_fields, &prefix_guards, &prefix_pins)?;
     let mut input_fields = base_fields.clone();
-    for (k, v) in collect_prefix_field_overrides(base_fields, &prefix_guards, &locked) {
+    for (k, v) in collect_prefix_field_overrides_checked(base_fields, &prefix_guards, &locked)? {
         input_fields.insert(k, v);
     }
 
@@ -2770,7 +2855,7 @@ pub fn flip_branch_guard(
         &layout,
         target_guard.field_name.as_deref(),
         &cur_bytes,
-        dict,
+        sched_gen.dict,
     ) {
         let bits = decode_scalar_le_bytes(&b);
         if !cands.contains(&bits) {
@@ -2789,10 +2874,7 @@ pub fn flip_branch_guard(
         input_fields.insert(fname.clone(), flipped_bits);
     }
 
-    let mut schedule = EnvSchedule::new();
-    for p in &prefix_pins {
-        schedule.push_callee_response(&p.callee, p.ret_bytes.clone());
-    }
+    let schedule = prefix_pin_schedule(sched_gen, &prefix_pins);
 
     Some(FlippedBranchTrial {
         guard_idx,
@@ -2802,6 +2884,28 @@ pub fn flip_branch_guard(
         input_fields,
         schedule,
     })
+}
+
+/// Flips the `guard_idx`-th branch guard in `guards` by asserting
+/// `target_guard.flipped_term` while preserving all earlier branch guards
+/// (`guards[..guard_idx]`) and all external call pins recorded up to `guard_idx`
+/// (`pins.iter().filter(|p| p.before_guard_idx <= guard_idx)`), modeled on
+/// `Nightowl.MultiInterp.flipBranchGuard`.
+///
+/// Returns `None` when the flip is unsatisfiable under that prefix: no candidate
+/// value satisfies the flipped term together with every earlier guard on the same
+/// field, or the guarded field feeds an earlier pinned call (whose `pinTerm`
+/// fixes the field).
+pub fn flip_branch_guard(
+    base_fields: &BTreeMap<String, u128>,
+    guards: &[ConcolicBranchGuard],
+    pins: &[ArgPinConstraint],
+    guard_idx: usize,
+    dict: &MirInputDictionary,
+    attempt: usize,
+) -> Option<FlippedBranchTrial> {
+    let sched_gen = EnvScheduleGenerator::new(dict).with_panic_injection_pct(0);
+    flip_branch_guard_with_generator(&sched_gen, base_fields, guards, pins, guard_idx, attempt)
 }
 
 /// Canonical equivalence class key for an observed execution path in [`MirObsPathSet`].
@@ -3471,5 +3575,75 @@ mod tests {
             assert_eq!(t[0], t[1]);
             assert_ne!(t[0], le(5));
         }
+
+        // `synthesize_concolic_trials` on a `u32` pin caps Phase 1 at `ceil(max_trials / 2)`
+        // so Phase 2 (`PerturbOracleReturn` with `NegationRoundCapReached`) and Phase 3
+        // (`FlipBranchGuard` with registered return sizes) also run.
+        let sched_gen = EnvScheduleGenerator::new(&dict)
+            .with_panic_injection_pct(0)
+            .with_callee_return_layout("ext_u32", LayoutSpec::Scalar(ScalarLayout::u32()));
+        let u32_pin = ArgPinConstraint::new(0, "ext_u32", 1, vec![le(2048)], le(99))
+            .with_arg_field_sources(vec![field("payload_len")]);
+        let base_fields = BTreeMap::from([("payload_len".to_string(), 2048u128)]);
+        let mut u = Unstructured::new(&[0x33; 32]);
+        let plans = sched_gen.synthesize_concolic_trials(
+            &base_fields,
+            std::slice::from_ref(&g_then),
+            std::slice::from_ref(&u32_pin),
+            6,
+            &mut u,
+        );
+        assert!(plans.iter().any(|p| matches!(
+            p.phase,
+            ConcolicTrialPhase::PerturbOracleReturn {
+                reason: ArgPinFallbackReason::NegationRoundCapReached,
+                ..
+            }
+        )));
+        let flip_after_pin = flip_branch_guard(
+            &base_fields,
+            &[
+                g_then.clone(),
+                ConcolicBranchGuard::new_equality(1, field("magic"), 7, 7, 32),
+            ],
+            std::slice::from_ref(&u32_pin),
+            1,
+            &dict,
+            0,
+        )
+        .expect("flip second guard after pin");
+        assert_eq!(
+            flip_after_pin.schedule.expected_return_size("ext_u32"),
+            Some(4)
+        );
+
+        // Conflicting prefix locks (e.g., `payload_len > 1024` AND an earlier pin locking
+        // `payload_len = 50`) or singleton return domains (`valid_start == valid_end`) are
+        // rejected instead of emitting invalid or duplicate trials.
+        let bad_prefix_pin = ArgPinConstraint::new(0, "ext_first", 0, vec![le(50)], le(1))
+            .with_arg_field_sources(vec![field("payload_len")]);
+        let second_pin = ArgPinConstraint::new(1, "ext_second", 1, vec![le(10)], le(2))
+            .with_arg_field_sources(vec![field("magic")]);
+        assert!(
+            relax_pin_constraint(
+                std::slice::from_ref(&g_then),
+                &[bad_prefix_pin, second_pin],
+                1,
+                &dict,
+                0,
+            )
+            .is_none()
+        );
+        let singleton_gen = EnvScheduleGenerator::new(&dict)
+            .with_panic_injection_pct(0)
+            .with_callee_return_layout(
+                "ext_const",
+                LayoutSpec::Scalar(ScalarLayout::with_valid_range(1, false, 7, 7)),
+            );
+        let zero_pin = ArgPinConstraint::new(0, "ext_const", 0, Vec::new(), vec![7u8]);
+        assert!(
+            relax_pin_constraint_with_generator(&singleton_gen, &no_fields, &[], &[zero_pin], 0, 0)
+                .is_none()
+        );
     }
 }
