@@ -1327,25 +1327,355 @@ def resolveCalleeNonParam? (callees : List CapturedMir) (allTraitImpls : List Tr
       | Option.none => Option.none
     | _ => Option.none
 
-theorem resolveCalleeNonParam?_congr
+/-- Compute the `implTypeArgsOpt` that `collectMatchingTraitImpls` passes to
+`upsertMatchingTraitImpl` when `matchRigidTyPrefix` succeeds with `(subst, methodTypeArgs)`. -/
+def computeImplTypeArgsOpt (c : List CapturedMir) (dp : DefPath) (typeArgs : List RigidTy)
+    (e : TraitImplEntry) (subst : List (Nat × RigidTy)) (methodTypeArgs : List RigidTy) :
+    Option (List RigidTy) :=
+  let rawImplTypeArgsOpt :=
+    match extractImplTypeArgs subst subst.length with
+    | some implHeaderArgs => some (implHeaderArgs ++ methodTypeArgs)
+    | none => none
+  match rawImplTypeArgsOpt, findCallee? c e.implPath with
+  | some rawArgs, some cb =>
+    let effectiveTypeArgs :=
+      match stringEq e.implPath dp with
+      | true => typeArgs
+      | false => rawArgs
+    if effectiveTypeArgs.length == cb.typeParamCount then
+      some effectiveTypeArgs
+    else
+      none
+  | _, _ => none
+
+/-- One step of `collectMatchingTraitImpls` for a single `TraitImplEntry` `e`. -/
+def stepMatchingTraitImpl (c : List CapturedMir) (dp : DefPath) (typeArgs : List RigidTy)
+    (e : TraitImplEntry) (acc : List (TraitImplEntry × Option (List RigidTy))) :
+    List (TraitImplEntry × Option (List RigidTy)) :=
+  if stringEq e.traitRef.defPath dp then
+    match e.traitRef.args with
+    | [] => acc
+    | firstPattern :: restPatterns =>
+      match matchRigidTyPrefix (firstPattern :: restPatterns) typeArgs [] with
+      | none => acc
+      | some (subst, methodTypeArgs) =>
+        upsertMatchingTraitImpl e
+          (computeImplTypeArgsOpt c dp typeArgs e subst methodTypeArgs) acc
+  else
+    acc
+
+theorem collectMatchingTraitImpls_cons (c : List CapturedMir) (dp : DefPath)
+    (typeArgs : List RigidTy) (e : TraitImplEntry) (rest : List TraitImplEntry)
+    (acc : List (TraitImplEntry × Option (List RigidTy))) :
+    collectMatchingTraitImpls c (e :: rest) dp typeArgs acc =
+      collectMatchingTraitImpls c rest dp typeArgs (stepMatchingTraitImpl c dp typeArgs e acc) := by
+  conv => lhs; unfold collectMatchingTraitImpls
+  unfold stepMatchingTraitImpl computeImplTypeArgsOpt
+  cases hs : stringEq e.traitRef.defPath dp with
+  | false => simp only [Bool.false_eq_true, ↓reduceIte]
+  | true =>
+    simp only [↓reduceIte]
+    cases hargs : e.traitRef.args with
+    | nil => rfl
+    | cons a as =>
+      dsimp only
+      cases hm : matchRigidTyPrefix (a :: as) typeArgs [] <;> rfl
+
+theorem collectMatchingTraitImpls_append (c : List CapturedMir) (dp : DefPath)
+    (typeArgs : List RigidTy) :
+    ∀ (ti₁ ti₂ : List TraitImplEntry) (acc : List (TraitImplEntry × Option (List RigidTy))),
+      collectMatchingTraitImpls c (ti₁ ++ ti₂) dp typeArgs acc =
+        collectMatchingTraitImpls c ti₂ dp typeArgs
+          (collectMatchingTraitImpls c ti₁ dp typeArgs acc)
+  | [], _, _ => rfl
+  | e :: rest, ti₂, acc => by
+    rw [List.cons_append, collectMatchingTraitImpls_cons, collectMatchingTraitImpls_cons,
+      collectMatchingTraitImpls_append c dp typeArgs rest ti₂]
+
+private theorem stringEq_self (s : String) : stringEq s s = true :=
+  coneStringEq_iff.mpr rfl
+
+/-- Whether `acc` already records an entry with `implPath` whose instantiated type-argument option
+subsumes `opt` (`opt.isNone || opt₀.isSome`), so `upsertMatchingTraitImpl` is a no-op. -/
+def AccCoversImpl (implPath : DefPath) (opt : Option (List RigidTy)) :
+    List (TraitImplEntry × Option (List RigidTy)) → Bool
+  | [] => false
+  | (e₀, opt₀) :: rest =>
+    match stringEq e₀.implPath implPath with
+    | true => opt.isNone || opt₀.isSome
+    | false => AccCoversImpl implPath opt rest
+
+theorem upsertMatchingTraitImpl_eq_self_of_accCoversImpl {e : TraitImplEntry}
+    {opt : Option (List RigidTy)} :
+    ∀ (acc : List (TraitImplEntry × Option (List RigidTy))),
+      AccCoversImpl e.implPath opt acc = true →
+      upsertMatchingTraitImpl e opt acc = acc
+  | [], h => nomatch h
+  | (e₀, opt₀) :: rest, h => by
+    unfold AccCoversImpl at h
+    unfold upsertMatchingTraitImpl
+    cases hs : stringEq e₀.implPath e.implPath with
+    | true =>
+      rw [hs] at h
+      dsimp only at h ⊢
+      cases opt₀ with
+      | some x => rfl
+      | none =>
+        cases opt with
+        | none => rfl
+        | some y => nomatch h
+    | false =>
+      rw [hs] at h
+      dsimp only at h ⊢
+      rw [upsertMatchingTraitImpl_eq_self_of_accCoversImpl rest h]
+
+theorem accCoversImpl_upsertMatchingTraitImpl_self (e : TraitImplEntry)
+    (opt : Option (List RigidTy)) :
+    ∀ (acc : List (TraitImplEntry × Option (List RigidTy))),
+      AccCoversImpl e.implPath opt (upsertMatchingTraitImpl e opt acc) = true
+  | [] => by
+    unfold upsertMatchingTraitImpl AccCoversImpl
+    rw [stringEq_self]
+    cases opt <;> rfl
+  | (e₀, opt₀) :: rest => by
+    unfold upsertMatchingTraitImpl
+    cases hs : stringEq e₀.implPath e.implPath with
+    | true =>
+      dsimp only
+      cases opt₀ <;> cases opt <;>
+        (unfold AccCoversImpl; first | (rw [hs]; rfl) | (rw [stringEq_self]; rfl))
+    | false =>
+      dsimp only
+      unfold AccCoversImpl
+      rw [hs]
+      exact accCoversImpl_upsertMatchingTraitImpl_self e opt rest
+
+theorem accCoversImpl_upsertMatchingTraitImpl_mono {implPath : DefPath}
+    {opt : Option (List RigidTy)} (e' : TraitImplEntry) (opt' : Option (List RigidTy)) :
+    ∀ (acc : List (TraitImplEntry × Option (List RigidTy))),
+      AccCoversImpl implPath opt acc = true →
+      AccCoversImpl implPath opt (upsertMatchingTraitImpl e' opt' acc) = true
+  | [], h => nomatch h
+  | (e₀, opt₀) :: rest, h => by
+    unfold AccCoversImpl at h
+    unfold upsertMatchingTraitImpl
+    cases hs' : stringEq e₀.implPath e'.implPath with
+    | true =>
+      dsimp only
+      cases opt₀ with
+      | some x =>
+        unfold AccCoversImpl
+        exact h
+      | none =>
+        cases opt' with
+        | none =>
+          unfold AccCoversImpl
+          exact h
+        | some y =>
+          unfold AccCoversImpl
+          have heq : stringEq e'.implPath implPath = stringEq e₀.implPath implPath := by
+            rw [← coneStringEq_iff.mp hs']
+          rw [heq]
+          cases hs : stringEq e₀.implPath implPath with
+          | true => cases opt <;> rfl
+          | false => rw [hs] at h; exact h
+    | false =>
+      dsimp only
+      unfold AccCoversImpl
+      cases hs : stringEq e₀.implPath implPath with
+      | true => rw [hs] at h; exact h
+      | false =>
+        rw [hs] at h
+        exact accCoversImpl_upsertMatchingTraitImpl_mono e' opt' rest h
+
+/-- Predicate stating that `acc` already covers `TraitImplEntry` `e` for `(c, dp, typeArgs)`. -/
+def AccCoversEntry (c : List CapturedMir) (dp : DefPath) (typeArgs : List RigidTy)
+    (e : TraitImplEntry) (acc : List (TraitImplEntry × Option (List RigidTy))) : Prop :=
+  ∀ firstPattern restPatterns subst methodTypeArgs,
+    stringEq e.traitRef.defPath dp = true →
+    e.traitRef.args = firstPattern :: restPatterns →
+    matchRigidTyPrefix (firstPattern :: restPatterns) typeArgs [] =
+      some (subst, methodTypeArgs) →
+    AccCoversImpl e.implPath
+      (computeImplTypeArgsOpt c dp typeArgs e subst methodTypeArgs) acc = true
+
+theorem stepMatchingTraitImpl_eq_self_of_accCoversEntry {c : List CapturedMir} {dp : DefPath}
+    {typeArgs : List RigidTy} {e : TraitImplEntry}
+    {acc : List (TraitImplEntry × Option (List RigidTy))}
+    (h : AccCoversEntry c dp typeArgs e acc) :
+    stepMatchingTraitImpl c dp typeArgs e acc = acc := by
+  unfold stepMatchingTraitImpl
+  cases hs : stringEq e.traitRef.defPath dp with
+  | false => rfl
+  | true =>
+    simp only [↓reduceIte]
+    cases hargs : e.traitRef.args with
+    | nil => rfl
+    | cons a as =>
+      dsimp only
+      cases hm : matchRigidTyPrefix (a :: as) typeArgs [] with
+      | none => rfl
+      | some p =>
+        rcases p with ⟨subst, methodTypeArgs⟩
+        dsimp only
+        exact upsertMatchingTraitImpl_eq_self_of_accCoversImpl acc
+          (h a as subst methodTypeArgs hs hargs hm)
+
+theorem accCoversEntry_stepMatchingTraitImpl_self (c : List CapturedMir) (dp : DefPath)
+    (typeArgs : List RigidTy) (e : TraitImplEntry)
+    (acc : List (TraitImplEntry × Option (List RigidTy))) :
+    AccCoversEntry c dp typeArgs e (stepMatchingTraitImpl c dp typeArgs e acc) := by
+  intro a as subst methodTypeArgs hs hargs hm
+  unfold stepMatchingTraitImpl
+  rw [hs, hargs]
+  simp only [↓reduceIte]
+  rw [hm]
+  exact accCoversImpl_upsertMatchingTraitImpl_self _ _ acc
+
+theorem accCoversEntry_stepMatchingTraitImpl_mono {c : List CapturedMir} {dp : DefPath}
+    {typeArgs : List RigidTy} {e : TraitImplEntry} (e' : TraitImplEntry)
+    {acc : List (TraitImplEntry × Option (List RigidTy))}
+    (h : AccCoversEntry c dp typeArgs e acc) :
+    AccCoversEntry c dp typeArgs e (stepMatchingTraitImpl c dp typeArgs e' acc) := by
+  intro a as subst methodTypeArgs hs hargs hm
+  have hcov := h a as subst methodTypeArgs hs hargs hm
+  unfold stepMatchingTraitImpl
+  cases stringEq e'.traitRef.defPath dp with
+  | false => exact hcov
+  | true =>
+    simp only [↓reduceIte]
+    cases e'.traitRef.args with
+    | nil => exact hcov
+    | cons a' as' =>
+      dsimp only
+      cases matchRigidTyPrefix (a' :: as') typeArgs [] with
+      | none => exact hcov
+      | some _ => exact accCoversImpl_upsertMatchingTraitImpl_mono e' _ acc hcov
+
+theorem accCoversEntry_collectMatchingTraitImpls_mono {c : List CapturedMir} {dp : DefPath}
+    {typeArgs : List RigidTy} {e : TraitImplEntry} :
+    ∀ (ti : List TraitImplEntry) {acc : List (TraitImplEntry × Option (List RigidTy))},
+      AccCoversEntry c dp typeArgs e acc →
+      AccCoversEntry c dp typeArgs e (collectMatchingTraitImpls c ti dp typeArgs acc)
+  | [], _, h => h
+  | e' :: rest, _, h => by
+    rw [collectMatchingTraitImpls_cons]
+    exact accCoversEntry_collectMatchingTraitImpls_mono rest
+      (accCoversEntry_stepMatchingTraitImpl_mono e' h)
+
+theorem accCoversEntry_collectMatchingTraitImpls_of_mem {c : List CapturedMir} {dp : DefPath}
+    {typeArgs : List RigidTy} {e : TraitImplEntry} :
+    ∀ (ti : List TraitImplEntry) (acc : List (TraitImplEntry × Option (List RigidTy))),
+      e ∈ ti →
+      AccCoversEntry c dp typeArgs e (collectMatchingTraitImpls c ti dp typeArgs acc)
+  | [], _, h => nomatch h
+  | e₀ :: rest, acc, h => by
+    rw [collectMatchingTraitImpls_cons]
+    rcases List.mem_cons.mp h with rfl | hrest
+    · exact accCoversEntry_collectMatchingTraitImpls_mono rest
+        (accCoversEntry_stepMatchingTraitImpl_self c dp typeArgs e acc)
+    · exact accCoversEntry_collectMatchingTraitImpls_of_mem rest _ hrest
+
+theorem collectMatchingTraitImpls_eq_self_of_all_covered (c : List CapturedMir) (dp : DefPath)
+    (typeArgs : List RigidTy) :
+    ∀ (sub : List TraitImplEntry) (acc : List (TraitImplEntry × Option (List RigidTy))),
+      (∀ e ∈ sub, AccCoversEntry c dp typeArgs e acc) →
+      collectMatchingTraitImpls c sub dp typeArgs acc = acc
+  | [], _, _ => rfl
+  | e :: rest, acc, h => by
+    rw [collectMatchingTraitImpls_cons,
+      stepMatchingTraitImpl_eq_self_of_accCoversEntry (h e (List.Mem.head _))]
+    exact collectMatchingTraitImpls_eq_self_of_all_covered c dp typeArgs rest acc
+      (fun e' hm => h e' (List.Mem.tail _ hm))
+
+/-- **Deduplication Invariance (`collectMatchingTraitImpls_append_of_subset`)**: appending any
+sublist `sub` whose entries already occur in `ti` leaves `collectMatchingTraitImpls` strictly
+unchanged because `upsertMatchingTraitImpl` deduplicates by `entry.implPath`. -/
+theorem collectMatchingTraitImpls_append_of_subset (c : List CapturedMir) (dp : DefPath)
+    (typeArgs : List RigidTy) (ti sub : List TraitImplEntry)
+    (acc : List (TraitImplEntry × Option (List RigidTy)))
+    (h_sub : ∀ e ∈ sub, e ∈ ti) :
+    collectMatchingTraitImpls c (ti ++ sub) dp typeArgs acc =
+      collectMatchingTraitImpls c ti dp typeArgs acc := by
+  rw [collectMatchingTraitImpls_append]
+  exact collectMatchingTraitImpls_eq_self_of_all_covered c dp typeArgs sub _
+    (fun e hm => accCoversEntry_collectMatchingTraitImpls_of_mem ti acc (h_sub e hm))
+
+/-- Equivalence of filtered `TraitImplEntry` lists for `dp` up to trailing duplicate entries:
+`ti₂.filter ... = ti₁.filter ... ++ sub` where every `e ∈ sub` already appears in `ti₁.filter ...`.
+List equality (`sub = []`) and full `hoistTraitImpls` across arbitrary mixed keep/drop masks both
+satisfy `TraitFilterCovers`. -/
+def TraitFilterCovers (dp : DefPath) (ti₁ ti₂ : List TraitImplEntry) : Prop :=
+  ∃ sub : List TraitImplEntry,
+    ti₂.filter (fun e => stringEq e.traitRef.defPath dp) =
+      ti₁.filter (fun e => stringEq e.traitRef.defPath dp) ++ sub ∧
+    ∀ e ∈ sub, e ∈ ti₁.filter (fun e => stringEq e.traitRef.defPath dp)
+
+theorem TraitFilterCovers.refl (dp : DefPath) (ti : List TraitImplEntry) :
+    TraitFilterCovers dp ti ti :=
+  ⟨[], (List.append_nil _).symm, fun _ h => nomatch h⟩
+
+theorem TraitFilterCovers.of_filter_eq {dp : DefPath} {ti₁ ti₂ : List TraitImplEntry}
+    (h : ti₁.filter (fun e => stringEq e.traitRef.defPath dp) =
+         ti₂.filter (fun e => stringEq e.traitRef.defPath dp)) :
+    TraitFilterCovers dp ti₁ ti₂ :=
+  ⟨[], by rw [h, List.append_nil], fun _ hm => nomatch hm⟩
+
+theorem hasTraitImplForDefPath_eq_of_traitFilterCovers {ti₁ ti₂ : List TraitImplEntry}
+    {dp : DefPath} (h : TraitFilterCovers dp ti₁ ti₂) :
+    hasTraitImplForDefPath ti₁ dp = hasTraitImplForDefPath ti₂ dp := by
+  obtain ⟨sub, h_eq, h_sub⟩ := h
+  have haux : ∀ (ti : List TraitImplEntry),
+      hasTraitImplForDefPath ti dp = !(ti.filter (fun e => stringEq e.traitRef.defPath dp)).isEmpty := by
+    intro ti
+    induction ti with
+    | nil => rfl
+    | cons e rest ih =>
+      unfold hasTraitImplForDefPath
+      cases hs : stringEq e.traitRef.defPath dp with
+      | true => simp [hs]
+      | false => simp [hs, ih]
+  rw [haux ti₁, haux ti₂, h_eq]
+  cases hflt : ti₁.filter (fun e => stringEq e.traitRef.defPath dp) with
+  | nil =>
+    cases sub with
+    | nil => rfl
+    | cons s ss =>
+      have hs := h_sub s (List.Mem.head _)
+      rw [hflt] at hs
+      nomatch hs
+  | cons x xs => rfl
+
+theorem collectMatchingTraitImpls_eq_of_traitFilterCovers
+    {c₁ c₂ : List CapturedMir} {ti₁ ti₂ : List TraitImplEntry} {dp : DefPath}
+    (typeArgs : List RigidTy)
+    (h_cov : TraitFilterCovers dp ti₁ ti₂)
+    (h_impl : ∀ e ∈ ti₁, stringEq e.traitRef.defPath dp = true →
+      findCallee? c₁ e.implPath = findCallee? c₂ e.implPath) :
+    collectMatchingTraitImpls c₁ ti₁ dp typeArgs [] =
+      collectMatchingTraitImpls c₂ ti₂ dp typeArgs [] := by
+  obtain ⟨sub, h_eq, h_sub⟩ := h_cov
+  rw [collectMatchingTraitImpls_filter_defPath c₁ dp typeArgs ti₁ [],
+    collectMatchingTraitImpls_filter_defPath c₂ dp typeArgs ti₂ [],
+    h_eq,
+    collectMatchingTraitImpls_append_of_subset c₂ dp typeArgs _ sub [] h_sub]
+  exact collectMatchingTraitImpls_congr_callees typeArgs _ []
+    (fun e hm hs => h_impl e (List.mem_filter.mp hm).1 hs)
+
+theorem resolveCalleeNonParam?_congr_covers
     {c₁ c₂ : List CapturedMir} {ti₁ ti₂ : List TraitImplEntry} {dp : DefPath}
     (firstArg : RigidTy) (restArgs : List RigidTy)
     (h_dp : findCallee? c₁ dp = findCallee? c₂ dp)
-    (h_ti : ti₁.filter (fun e => stringEq e.traitRef.defPath dp) =
-            ti₂.filter (fun e => stringEq e.traitRef.defPath dp))
+    (h_cov : TraitFilterCovers dp ti₁ ti₂)
     (h_impl : ∀ e ∈ ti₁, stringEq e.traitRef.defPath dp = true →
       findCallee? c₁ e.implPath = findCallee? c₂ e.implPath) :
     resolveCalleeNonParam? c₁ ti₁ dp firstArg restArgs =
       resolveCalleeNonParam? c₂ ti₂ dp firstArg restArgs := by
   have h_has : hasTraitImplForDefPath ti₁ dp = hasTraitImplForDefPath ti₂ dp :=
-    hasTraitImplForDefPath_eq_of_filter_eq h_ti
+    hasTraitImplForDefPath_eq_of_traitFilterCovers h_cov
   have h_col : collectMatchingTraitImpls c₁ ti₁ dp (firstArg :: restArgs) [] =
-      collectMatchingTraitImpls c₂ ti₂ dp (firstArg :: restArgs) [] := by
-    rw [collectMatchingTraitImpls_filter_defPath c₁ dp (firstArg :: restArgs) ti₁ [],
-      collectMatchingTraitImpls_filter_defPath c₂ dp (firstArg :: restArgs) ti₂ [],
-      ← h_ti]
-    exact collectMatchingTraitImpls_congr_callees (firstArg :: restArgs) _ []
-      (fun e hm hs => h_impl e (List.mem_filter.mp hm).1 hs)
+      collectMatchingTraitImpls c₂ ti₂ dp (firstArg :: restArgs) [] :=
+    collectMatchingTraitImpls_eq_of_traitFilterCovers (firstArg :: restArgs) h_cov h_impl
   unfold resolveCalleeNonParam?
   dsimp only
   rw [← h_col]
@@ -1381,6 +1711,47 @@ theorem resolveCalleeNonParam?_congr
           · nomatch hnil
           · rw [h_impl winnerEntry h_in h_str]
 
+theorem resolveCalleeNonParam?_congr
+    {c₁ c₂ : List CapturedMir} {ti₁ ti₂ : List TraitImplEntry} {dp : DefPath}
+    (firstArg : RigidTy) (restArgs : List RigidTy)
+    (h_dp : findCallee? c₁ dp = findCallee? c₂ dp)
+    (h_ti : ti₁.filter (fun e => stringEq e.traitRef.defPath dp) =
+            ti₂.filter (fun e => stringEq e.traitRef.defPath dp))
+    (h_impl : ∀ e ∈ ti₁, stringEq e.traitRef.defPath dp = true →
+      findCallee? c₁ e.implPath = findCallee? c₂ e.implPath) :
+    resolveCalleeNonParam? c₁ ti₁ dp firstArg restArgs =
+      resolveCalleeNonParam? c₂ ti₂ dp firstArg restArgs :=
+  resolveCalleeNonParam?_congr_covers firstArg restArgs h_dp
+    (TraitFilterCovers.of_filter_eq h_ti) h_impl
+
+theorem resolveCalleeBodyAndArgs?_eq_of_traitFilterCovers
+    {c₁ c₂ : List CapturedMir} {extra₁ extra₂ : List TraitImplEntry} {dp : DefPath}
+    (typeArgs : List RigidTy)
+    (h_dp : findCallee? c₁ dp = findCallee? c₂ dp)
+    (h_cov : TraitFilterCovers dp (extra₁ ++ flatMapTraitImpls c₁)
+      (extra₂ ++ flatMapTraitImpls c₂))
+    (h_impl : ∀ e ∈ extra₁ ++ flatMapTraitImpls c₁,
+      stringEq e.traitRef.defPath dp = true →
+      findCallee? c₁ e.implPath = findCallee? c₂ e.implPath) :
+    resolveCalleeBodyAndArgs? c₁ dp typeArgs extra₁ =
+      resolveCalleeBodyAndArgs? c₂ dp typeArgs extra₂ := by
+  have h_has : hasTraitImplForDefPath (extra₁ ++ flatMapTraitImpls c₁) dp =
+      hasTraitImplForDefPath (extra₂ ++ flatMapTraitImpls c₂) dp :=
+    hasTraitImplForDefPath_eq_of_traitFilterCovers h_cov
+  cases typeArgs with
+  | nil =>
+    unfold resolveCalleeBodyAndArgs?
+    dsimp only
+    rw [h_dp]
+  | cons firstArg restArgs =>
+    have h_np := resolveCalleeNonParam?_congr_covers firstArg restArgs h_dp h_cov h_impl
+    cases firstArg with
+    | param _ _ =>
+      unfold resolveCalleeBodyAndArgs?
+      dsimp only
+      rw [h_dp, h_has]
+    | _ => exact h_np
+
 /-- **Trait-Aware `resolveCalleeBodyAndArgs?` Congruence**: whenever `c₁` and `c₂` agree on
 `findCallee?` at `dp`, have identical `TraitImplEntry` records for `dp`, and agree on
 `findCallee?` at `e.implPath` for every `TraitImplEntry` targeting `dp`, `resolveCalleeBodyAndArgs?`
@@ -1412,6 +1783,20 @@ theorem resolveCalleeBodyAndArgs?_eq_of_traitConeAgree
       dsimp only
       rw [h_dp, h_has]
     | _ => exact h_np
+
+theorem lookupCallee_eq_of_traitFilterCovers
+    {c₁ c₂ : List CapturedMir} {extra₁ extra₂ : List TraitImplEntry} {dp : DefPath}
+    (layouts : LayoutTable) (typeArgs : List RigidTy)
+    (h_dp : findCallee? c₁ dp = findCallee? c₂ dp)
+    (h_cov : TraitFilterCovers dp (extra₁ ++ flatMapTraitImpls c₁)
+      (extra₂ ++ flatMapTraitImpls c₂))
+    (h_impl : ∀ e ∈ extra₁ ++ flatMapTraitImpls c₁,
+      stringEq e.traitRef.defPath dp = true →
+      findCallee? c₁ e.implPath = findCallee? c₂ e.implPath) :
+    lookupCallee c₁ layouts dp typeArgs extra₁ =
+      lookupCallee c₂ layouts dp typeArgs extra₂ := by
+  unfold lookupCallee
+  rw [resolveCalleeBodyAndArgs?_eq_of_traitFilterCovers typeArgs h_dp h_cov h_impl]
 
 /-- **Trait-Aware `lookupCallee` Congruence (`lookupCallee_eq_of_traitConeAgree`)**. -/
 theorem lookupCallee_eq_of_traitConeAgree
@@ -1599,17 +1984,17 @@ theorem inConeSetPoly_of_lookup_trait {cone : List DefPath} (root : CapturedMir)
 /-! ### Trait-Aware Semantic & Syntactic Cone Narrowing -/
 
 /-- Agreement condition between `(c₁, ti₁)` and `(c₂, ti₂)` on a call cone `cone` supporting full
-`TraitImplEntry` dispatch:
+`TraitImplEntry` dispatch (including mixed-partition hoisting via `TraitFilterCovers`):
 1. `calleesAgreeOn cone c₁ c₂` (`findCallee? c₁ dp = findCallee? c₂ dp` for all `dp ∈ cone`),
-2. For every `dp ∈ cone`, the filtered `TraitImplEntry` lists targeting `dp` in
-   `ti₁ ++ flatMapTraitImpls c₁` and `ti₂ ++ flatMapTraitImpls c₂` are equal, and
+2. For every `dp ∈ cone`, `TraitFilterCovers dp (ti₁ ++ flatMapTraitImpls c₁) (ti₂ ++ flatMapTraitImpls c₂)`
+   (either exact filtered equality or `hoistTraitImpls` with trailing duplicate entries from kept
+   bodies, which `upsertMatchingTraitImpl` deduplicates), and
 3. For every `dp ∈ cone` and `e ∈ ti₁ ++ flatMapTraitImpls c₁` targeting `dp`, `e.implPath ∈ cone`. -/
 def TraitConeAgreeOn (cone : List DefPath) (c₁ c₂ : CalleeEnv)
     (ti₁ ti₂ : List TraitImplEntry) : Prop :=
   calleesAgreeOn cone c₁ c₂ ∧
     (∀ dp ∈ cone,
-      (ti₁ ++ flatMapTraitImpls c₁).filter (fun e => stringEq e.traitRef.defPath dp) =
-        (ti₂ ++ flatMapTraitImpls c₂).filter (fun e => stringEq e.traitRef.defPath dp)) ∧
+      TraitFilterCovers dp (ti₁ ++ flatMapTraitImpls c₁) (ti₂ ++ flatMapTraitImpls c₂)) ∧
     (∀ dp ∈ cone, ∀ e ∈ ti₁ ++ flatMapTraitImpls c₁,
       stringEq e.traitRef.defPath dp = true → e.implPath ∈ cone)
 
@@ -1617,14 +2002,14 @@ theorem TraitConeAgreeOn.refl (cone : List DefPath) (c : CalleeEnv) (ti : List T
     (h_impl : ∀ dp ∈ cone, ∀ e ∈ ti ++ flatMapTraitImpls c,
       stringEq e.traitRef.defPath dp = true → e.implPath ∈ cone) :
     TraitConeAgreeOn cone c c ti ti :=
-  ⟨calleesAgreeOn.refl cone c, fun _ _ => rfl, h_impl⟩
+  ⟨calleesAgreeOn.refl cone c, fun dp _ => TraitFilterCovers.refl dp _, h_impl⟩
 
 theorem lookupCallee_eq_of_traitConeAgreeOn {cone : List DefPath}
     {c₁ c₂ : CalleeEnv} {ti₁ ti₂ : List TraitImplEntry} {dp : DefPath}
     (L : LayoutTable) (typeArgs : List RigidTy)
     (h_ag : TraitConeAgreeOn cone c₁ c₂ ti₁ ti₂) (h_dp : dp ∈ cone) :
     lookupCallee c₁ L dp typeArgs ti₁ = lookupCallee c₂ L dp typeArgs ti₂ :=
-  lookupCallee_eq_of_traitConeAgree L typeArgs (h_ag.1 dp h_dp) (h_ag.2.1 dp h_dp)
+  lookupCallee_eq_of_traitFilterCovers L typeArgs (h_ag.1 dp h_dp) (h_ag.2.1 dp h_dp)
     (fun e he hs => h_ag.1 e.implPath (h_ag.2.2 dp h_dp e he hs))
 
 /-- Trait-aware call-target cone condition (`CallTargetInConeTrait`): every target resolved by
@@ -2646,7 +3031,8 @@ theorem BatchedVcConeNarrowCert.ofCheck {cone : List DefPath} {rootBody : Captur
   simp only [Bool.and_eq_true] at h
   obtain ⟨⟨⟨⟨⟨⟨h_root, h_cone⟩, h_mask⟩, h_closed⟩, h_kept⟩, h_adm⟩, h_ext⟩ := h
   refine ⟨h_root, h_cone, ⟨calleesAgreeOn_selectByMask h_mask,
-    fun dp hdp => traitFilter_hoist_eq h_kept hdp, traitImplConeClosed_imp h_closed⟩, ?_, ?_⟩
+    fun dp hdp => TraitFilterCovers.of_filter_eq (traitFilter_hoist_eq h_kept hdp),
+    traitImplConeClosed_imp h_closed⟩, ?_, ?_⟩
   · intro ext hext
     unfold checkUntrustedAdmissible at h_adm
     exact Option.isNone_iff_eq_none.mp (List.all_eq_true.mp h_adm ext hext)
@@ -2682,7 +3068,78 @@ theorem BatchedVcConeNarrowCert.ofCheckMask {cone : List DefPath} {rootBody : Ca
   simp only [Bool.and_eq_true] at h
   obtain ⟨⟨⟨⟨⟨⟨h_root, h_cone⟩, h_mask⟩, h_closed⟩, h_part⟩, h_adm⟩, h_ext⟩ := h
   refine ⟨h_root, h_cone, ⟨calleesAgreeOn_selectByMask h_mask,
-    fun dp hdp => traitFilter_hoistMask_eq h_part hdp, traitImplConeClosed_imp h_closed⟩, ?_, ?_⟩
+    fun dp hdp => TraitFilterCovers.of_filter_eq (traitFilter_hoistMask_eq h_part hdp),
+    traitImplConeClosed_imp h_closed⟩, ?_, ?_⟩
+  · intro ext hext
+    unfold checkUntrustedAdmissible at h_adm
+    exact Option.isNone_iff_eq_none.mp (List.all_eq_true.mp h_adm ext hext)
+  · intro dp hdp
+    unfold checkExternalSummariesAgreeOn at h_ext
+    exact of_decide_eq_true (List.all_eq_true.mp h_ext dp hdp)
+
+theorem mem_flatMapTraitImpls_selectByMask {e : TraitImplEntry} :
+    ∀ (full : List CapturedMir) (mask : List Bool),
+      e ∈ flatMapTraitImpls (selectByMask full mask) →
+      e ∈ flatMapTraitImpls full
+  | [], _, h => nomatch h
+  | _ :: _, [], h => nomatch h
+  | c :: cs, b :: bs, h => by
+    cases b with
+    | false =>
+      show e ∈ c.traitImpls ++ flatMapTraitImpls cs
+      exact List.mem_append_right _ (mem_flatMapTraitImpls_selectByMask cs bs h)
+    | true =>
+      change e ∈ c.traitImpls ++ flatMapTraitImpls (selectByMask cs bs) at h
+      show e ∈ c.traitImpls ++ flatMapTraitImpls cs
+      rcases List.mem_append.mp h with hc | hcs
+      · exact List.mem_append_left _ hc
+      · exact List.mem_append_right _ (mem_flatMapTraitImpls_selectByMask cs bs hcs)
+
+/-- **Unconditional Mixed-Partition Trait Coverage (`traitFilterCovers_hoist_selectByMask`)**:
+For *every* `fullCallees : List CapturedMir` and *every* keep-mask `mask : List Bool` (even when
+`TraitImplEntry` records for the same `dp` are mixed across kept `selectByMask` bodies and dropped
+`dropByMask` bodies), `hoistTraitImpls fullCallees extra` paired with `selectByMask fullCallees mask`
+satisfies `TraitFilterCovers` at `dp` without `checkKeptCarryNoConeTraitImpls` or
+`checkMaskTraitPartition`! -/
+theorem traitFilterCovers_hoist_selectByMask (full : List CapturedMir) (mask : List Bool)
+    (extra : List TraitImplEntry) (dp : DefPath) :
+    TraitFilterCovers dp (extra ++ flatMapTraitImpls full)
+      (hoistTraitImpls full extra ++ flatMapTraitImpls (selectByMask full mask)) := by
+  refine ⟨(flatMapTraitImpls (selectByMask full mask)).filter
+    (fun e => stringEq e.traitRef.defPath dp), ?_, ?_⟩
+  · unfold hoistTraitImpls
+    rw [List.filter_append]
+  · intro e he
+    rw [List.mem_filter] at he ⊢
+    exact ⟨List.mem_append_right _ (mem_flatMapTraitImpls_selectByMask full mask he.1), he.2⟩
+
+/-- Partition-free batched VC certificate checker (`checkBatchedVcConeNarrowCertGeneral`):
+requires neither `checkKeptCarryNoConeTraitImpls` nor `checkMaskTraitPartition`, certifying
+`(selectByMask fullCallees mask, hoistTraitImpls fullCallees extra)` even when `TraitImplEntry`
+records for the same `dp ∈ cone` are mixed across kept and dropped bodies! -/
+def checkBatchedVcConeNarrowCertGeneral (cone : List DefPath) (rootBody : CapturedMir)
+    (fullCallees : List CapturedMir) (mask : List Bool) (extra : List TraitImplEntry)
+    (fullExt narrowExt : ExternalSummaryEnv := []) : Bool :=
+  bodyCallsInConePoly cone rootBody &&
+    (coneBodies cone fullCallees).all (bodyCallsInConePoly cone) &&
+    checkMaskKeepsFirstMatch cone fullCallees mask &&
+    checkTraitImplConeClosed cone fullCallees (selectByMask fullCallees mask) extra &&
+    checkUntrustedAdmissible fullCallees fullExt &&
+    checkExternalSummariesAgreeOn cone fullExt narrowExt
+
+/-- **Soundness of the partition-free batched checker (`BatchedVcConeNarrowCert.ofCheckGeneral`)**. -/
+theorem BatchedVcConeNarrowCert.ofCheckGeneral {cone : List DefPath} {rootBody : CapturedMir}
+    {fullCallees : List CapturedMir} {mask : List Bool} {extra : List TraitImplEntry}
+    {fullExt narrowExt : ExternalSummaryEnv}
+    (h : checkBatchedVcConeNarrowCertGeneral cone rootBody fullCallees mask extra fullExt narrowExt = true) :
+    BatchedVcConeNarrowCert cone rootBody fullCallees (selectByMask fullCallees mask)
+      extra (hoistTraitImpls fullCallees extra) fullExt narrowExt := by
+  unfold checkBatchedVcConeNarrowCertGeneral at h
+  simp only [Bool.and_eq_true] at h
+  obtain ⟨⟨⟨⟨⟨h_root, h_cone⟩, h_mask⟩, h_closed⟩, h_adm⟩, h_ext⟩ := h
+  refine ⟨h_root, h_cone, ⟨calleesAgreeOn_selectByMask h_mask,
+    fun dp _ => traitFilterCovers_hoist_selectByMask fullCallees mask extra dp,
+    traitImplConeClosed_imp h_closed⟩, ?_, ?_⟩
   · intro ext hext
     unfold checkUntrustedAdmissible at h_adm
     exact Option.isNone_iff_eq_none.mp (List.all_eq_true.mp h_adm ext hext)
@@ -3600,6 +4057,75 @@ theorem canary_keptBodyWithTraitImpl_accepted :
   ⟨by decide +kernel, by decide +kernel, rfl,
     BatchedVcConeNarrowCert.ofCheckMask (by decide +kernel)⟩
 
+/-- Second impl type `proto::Square` for `"proto::Area::area"` to witness mixed-partition hoisting. -/
+def protoSquareTy : RigidTy := .adt "proto::Square" []
+
+def protoSquareAreaEntry : TraitImplEntry :=
+  { traitRef := { defPath := "proto::Area::area", args := [protoSquareTy] }
+    implPath := "proto::<impl Area for Square>::area" }
+
+def protoSquareArea : CapturedMir :=
+  protoLeaf "proto::<impl Area for Square>::area" 64 0 []
+
+/-- Dropped carrier body holding `protoSquareAreaEntry` while `protoCircleAreaWithTrait` is kept. -/
+def protoSquareAreaHolder : CapturedMir :=
+  protoLeaf "proto::<impl Area for Square>" 0 0 [protoSquareAreaEntry]
+
+def protoMixedTraitCallees : List CapturedMir :=
+  [protoFillerA, protoPoly, protoSquareAreaHolder, protoCircleAreaWithTrait, protoSquareArea]
+
+def protoMixedTraitCone : List DefPath :=
+  ["proto::poly", "proto::Area::area",
+   "proto::<impl Area for Circle>::area", "proto::<impl Area for Square>::area"]
+
+def protoMixedTraitMask : List Bool :=
+  [false, true, false, true, true]
+
+/-- **Mixed-Partition Trait Canary (`canary_mixedTraitPartition_accepted`)**:
+`"proto::Area::area"` has `protoAreaEntry` on the **kept** body `protoCircleAreaWithTrait` (`mask = true`)
+AND `protoSquareAreaEntry` on the **dropped** carrier `protoSquareAreaHolder` (`mask = false`):
+1. `checkKeptCarryNoConeTraitImpls` returns `false`,
+2. `checkMaskTraitPartition` returns `false` (neither pure-kept nor pure-dropped),
+3. `checkBatchedVcConeNarrowCertGeneral` returns `true` (`by decide +kernel`), certifying
+   `(selectByMask, hoistTraitImpls)` via `BatchedVcConeNarrowCert.ofCheckGeneral` (`upsertMatchingTraitImpl`
+   deduplication), and the narrowed execution returns `31 : u32`! -/
+theorem canary_mixedTraitPartition_accepted :
+    checkKeptCarryNoConeTraitImpls protoMixedTraitCone
+      (selectByMask protoMixedTraitCallees protoMixedTraitMask) = false ∧
+    checkMaskTraitPartition protoMixedTraitCone protoMixedTraitCallees protoMixedTraitMask = false ∧
+    checkBatchedVcConeNarrowCertGeneral protoMixedTraitCone traitCallRootMir
+      protoMixedTraitCallees protoMixedTraitMask [] [] [] = true ∧
+    BatchedVcConeNarrowCert protoMixedTraitCone traitCallRootMir
+      protoMixedTraitCallees (selectByMask protoMixedTraitCallees protoMixedTraitMask)
+      [] (hoistTraitImpls protoMixedTraitCallees []) [] [] ∧
+    ((runMirExecBounded 12 traitCallRootMir
+        (.running (MachineState.mapMem
+          (Memory.withCalleesAndTraits
+            (selectByMask protoMixedTraitCallees protoMixedTraitMask)
+            (hoistTraitImpls protoMixedTraitCallees []))
+          (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
+            emptyMemory protoMixedTraitCallees)))).map
+      (fun out => match out with | .normal (v, _) => some v | _ => none)) =
+      some (some (Value.scalar ⟨31, 4⟩)) := by
+  have hcert := BatchedVcConeNarrowCert.ofCheckGeneral
+    (by decide +kernel :
+      checkBatchedVcConeNarrowCertGeneral protoMixedTraitCone traitCallRootMir
+        protoMixedTraitCallees protoMixedTraitMask [] [] [] = true)
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, hcert, ?_⟩
+  let s₀ := MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
+    emptyMemory protoMixedTraitCallees
+  rw [runMirExecBounded_narrow_of_batchedCert hcert 12 s₀ rfl rfl rfl rfl, Option.map_map]
+  have hfun : ((fun out => match out with | .normal (v, _) => some v | _ => none) ∘
+      MirOutcome.mapMem
+        (Memory.withCalleesAndTraits
+          (selectByMask protoMixedTraitCallees protoMixedTraitMask)
+          (hoistTraitImpls protoMixedTraitCallees []))) =
+      (fun out => match out with | .normal (v, _) => some v | _ => none) := by
+    funext out
+    rcases out with ⟨v, m⟩ | _ | _ <;> rfl
+  rw [hfun]
+  rfl
+
 
 /-- Root body `_0 = ext::rand() -> bb1; bb1: return` calling an *external* function that is
 absent from `Memory.callees` (so `Trusted` semantics emits a `MirCallE` interaction). -/
@@ -3752,6 +4278,521 @@ theorem canary_coercedExternalSummary_vc :
   · exact Option.some.inj hv
   · nomatch hv
   · nomatch hv
+
+/-! #### Preserving Cone Safety Across External Call Continuations & Multi-Call External VCs -/
+
+/-- An external-call answer `ans` preserves the code and call-stack frame of `mem` when any
+returned or panicked memory `memAfter` keeps `callees`, `traitImpls`, `activeCallee`, and
+`CallerBodiesEq mem.callStack memAfter.callStack`. -/
+def AnsPreservesCodeFrame (mem : Memory) : MirCallAns → Prop
+  | .returned _ memAfter =>
+    memAfter.callees = mem.callees ∧
+    memAfter.traitImpls = mem.traitImpls ∧
+    memAfter.activeCallee = mem.activeCallee ∧
+    CallerBodiesEq mem.callStack memAfter.callStack
+  | .panicked memAfter =>
+    memAfter.callees = mem.callees ∧
+    memAfter.traitImpls = mem.traitImpls ∧
+    memAfter.activeCallee = mem.activeCallee ∧
+    CallerBodiesEq mem.callStack memAfter.callStack
+  | .aborted => True
+
+private theorem foreignFrameDerefWrite_closedInvPoly_helper
+    {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry}
+    {fr fr' : StackFrame} {memAfter mem' : Memory} {localsAfterArgs updatedLocals : List LocalSlot}
+    {destination : Place} {restProj : List ProjectionElem} {retVal : Value}
+    (h_after : ClosedInvPoly cone root c₁ ti₁ { frame := fr, memory := memAfter })
+    (hff : foreignFrameDerefWrite localsAfterArgs memAfter destination restProj retVal
+      [] emptyLayoutTable = .ok updatedLocals mem') :
+    ClosedInvPoly cone root c₁ ti₁ { frame := fr', memory := mem' } := by
+  have hctx := foreignFrameDerefWrite_withCalleeCtx
+    memAfter.callees memAfter.activeCallee memAfter.traitImpls
+    localsAfterArgs memAfter destination restProj retVal [] emptyLayoutTable
+  have hself : Memory.withCalleeCtx memAfter.callees memAfter.activeCallee
+      memAfter.traitImpls memAfter = memAfter := by
+    cases memAfter; rfl
+  rw [hself, hff] at hctx
+  injection hctx with _ hmem'
+  exact closedInvPoly_of_callerBodies h_after
+    (by rw [hmem'])
+    (by rw [hmem'])
+    (by rw [hmem'])
+    (foreignFrameDerefWrite_callerBodies hff)
+
+/-- **External-Call Continuation Cone Invariant (`closedInvPoly_resumeExternalCall`)**:
+Whenever `ClosedInvPoly cone root c₁ ti₁ s` holds at an external call site and the external answer
+`ans` satisfies `AnsPreservesCodeFrame s.memory ans`, every running state `s'` produced by
+`resumeExternalCall` preserves `ClosedInvPoly cone root c₁ ti₁ s'`! -/
+theorem closedInvPoly_resumeExternalCall {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry} {s s' : MachineState}
+    {localsAfterArgs : List LocalSlot} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {ans : MirCallAns}
+    (h_inv : ClosedInvPoly cone root c₁ ti₁ s)
+    (h_ans : AnsPreservesCodeFrame s.memory ans)
+    (h_res : resumeExternalCall s localsAfterArgs destination targetBb unwind ans = .running s') :
+    ClosedInvPoly cone root c₁ ti₁ s' := by
+  cases ans with
+  | aborted => cases h_res
+  | panicked memAfter =>
+    obtain ⟨hc, hti, hac, hb⟩ := h_ans
+    have h_after : ClosedInvPoly cone root c₁ ti₁ { frame := s.frame, memory := memAfter } :=
+      closedInvPoly_of_callerBodies h_inv hc hti hac hb
+    unfold resumeExternalCall at h_res
+    cases unwind with
+    | unreachable => cases h_res
+    | terminate => cases h_res
+    | continue_ =>
+      exact closedInvPoly_unwindFromCallStack memAfter.callStack memAfter
+        h_after.1 h_after.2.1 h_after.2.2.2 s' h_res
+    | cleanup bb =>
+      cases h_res
+      exact h_after
+  | returned retVal memAfter =>
+    obtain ⟨hc, hti, hac, hb⟩ := h_ans
+    have h_after : ClosedInvPoly cone root c₁ ti₁ { frame := s.frame, memory := memAfter } :=
+      closedInvPoly_of_callerBodies h_inv hc hti hac hb
+    unfold resumeExternalCall at h_res
+    dsimp only at h_res
+    repeat' (first
+      | (cases h_res; done)
+      | (cases h_res; exact h_after)
+      | (cases h_res; exact foreignFrameDerefWrite_closedInvPoly_helper h_after (by assumption))
+      | split at h_res
+      | (dsimp only at h_res))
+
+/-- Cone safety (`StepConeSafeTrait`) is preserved after `resumeExternalCall` whenever the external
+answer satisfies `AnsPreservesCodeFrame`, enabling `stepMirFn_extCallInCone` and
+`coneSummary?_eq_of_stepMirFn_extCall` on subsequent external calls! -/
+theorem stepConeSafeTrait_of_resumeExternalCall {cone : List DefPath} {root : CapturedMir}
+    {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry} {s s' : MachineState}
+    {localsAfterArgs : List LocalSlot} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {ans : MirCallAns}
+    (h_root : bodyCallsInConePoly cone root = true)
+    (h_cone : (coneBodies cone c₁).all (bodyCallsInConePoly cone) = true)
+    (h_inv : ClosedInvPoly cone root c₁ ti₁ s)
+    (h_ans : AnsPreservesCodeFrame s.memory ans)
+    (h_res : resumeExternalCall s localsAfterArgs destination targetBb unwind ans = .running s') :
+    StepConeSafeTrait cone root s' :=
+  stepConeSafeTrait_of_closedInvPoly h_root h_cone
+    (closedInvPoly_resumeExternalCall h_inv h_ans h_res)
+
+/-- Two-call external root body (`protoTwoExtCallsRootMir`):
+- `bb0`: `_0 = ext::seed() -> bb1` (external call #1),
+- `bb1`: `_0 = ext::add_twenty(_0) -> bb2` (external call #2, reached *after* resuming from `ext::seed`),
+- `bb2`: `return`. -/
+def protoTwoExtCallsRootMir : CapturedMir :=
+  { traitCallRootMir with
+    defPath := "proto::two_ext_root"
+    localDecls := [⟨.mut, protoU32Ty, some "_0"⟩]
+    basicBlocks := [
+      { statements := []
+        terminator := ⟨.call (protoFnConst "ext::seed" []) [] ⟨0, []⟩ (some 1) .continue_, "call1"⟩
+        isCleanup := false },
+      { statements := []
+        terminator := ⟨.call (protoFnConst "ext::add_twenty" []) [.copy ⟨0, []⟩] ⟨0, []⟩ (some 2) .continue_, "call2"⟩
+        isCleanup := false },
+      { statements := [], terminator := ⟨.return_, "ret"⟩, isCleanup := false } ] }
+
+def protoTwoExtInitState : MachineState :=
+  MirFuelFree.initMachineStateWithMemoryAndCallees protoTwoExtCallsRootMir [] emptyMemory []
+
+def protoTwoExtCone : List DefPath := ["ext::seed", "ext::add_twenty"]
+
+def protoTwoExtSummaries : ExternalSummaryEnv :=
+  [⟨"ext::seed", 10⟩, ⟨"ext::add_twenty", 11⟩]
+
+/-- Contracts for `ext::seed` (tag `10`: returns `11 : u32`) and `ext::add_twenty` (tag `11`: adds
+`20` to its `u32` argument). -/
+def protoTwoExtContracts : ExternalContractInterp := fun tag req ans =>
+  (tag = 10 ∧ ans = .returned (.scalar ⟨11, 4⟩) req.memory) ∨
+  (tag = 11 ∧ req.args = [.scalar ⟨11, 4⟩] ∧ ans = .returned (.scalar ⟨31, 4⟩) req.memory)
+
+def protoTwoExtPost (out : MirOutcome) : Prop :=
+  match out with
+  | .normal (v, _) => v = Value.scalar ⟨31, 4⟩
+  | _ => False
+
+def protoTwoExtStep1 : MirStepNode :=
+  stepMirState protoTwoExtCallsRootMir (.running protoTwoExtInitState)
+
+def protoTwoExtReq1 : MirCallReq :=
+  match protoTwoExtStep1 with
+  | .vis (.inr (.inr (.call req))) _ => req
+  | _ => { defPath := "", args := [], memory := emptyMemory }
+
+def protoTwoExtCont1 : MirCallAns → MirExecState :=
+  match protoTwoExtStep1 with
+  | .vis (.inr (.inr (.call _))) k => k
+  | _ => fun _ => .faulted .ub
+
+theorem protoTwoExtStep1_eq :
+    protoTwoExtStep1 = .vis (.inr (.inr (.call protoTwoExtReq1))) protoTwoExtCont1 := rfl
+
+/-- State in `bb1` after `ext::seed()` returns `11 : u32` into `_0`. -/
+def protoTwoExtStateAfterSeed : MachineState :=
+  match resumeExternalCall protoTwoExtInitState protoTwoExtInitState.frame.locals ⟨0, []⟩ 1
+      .continue_ (.returned (.scalar ⟨11, 4⟩) protoTwoExtInitState.memory) with
+  | .running s₁ => s₁
+  | _ => protoTwoExtInitState
+
+def protoTwoExtStep2 : MirStepNode :=
+  stepMirState protoTwoExtCallsRootMir (.running protoTwoExtStateAfterSeed)
+
+def protoTwoExtReq2 : MirCallReq :=
+  match protoTwoExtStep2 with
+  | .vis (.inr (.inr (.call req))) _ => req
+  | _ => { defPath := "", args := [], memory := emptyMemory }
+
+def protoTwoExtCont2 : MirCallAns → MirExecState :=
+  match protoTwoExtStep2 with
+  | .vis (.inr (.inr (.call _))) k => k
+  | _ => fun _ => .faulted .ub
+
+theorem protoTwoExtStep2_eq :
+    protoTwoExtStep2 = .vis (.inr (.inr (.call protoTwoExtReq2))) protoTwoExtCont2 := rfl
+
+def protoTwoExtResultAfter (ans₂ : MirCallAns) : Option (Option Value) :=
+  (runMirExecBounded 2 protoTwoExtCallsRootMir (protoTwoExtCont2 ans₂)).map
+    (fun out => match out with | .normal (v, _) => some v | _ => none)
+
+/-- **Two-Call External Summary Canary (`canary_twoExternalCalls_vc`)**:
+1. After resuming from the first external call (`ext::seed`), `stepConeSafeTrait_of_resumeExternalCall`
+   proves that `protoTwoExtStateAfterSeed` in `bb1` is cone-safe (`StepConeSafeTrait`), so the
+   *second* external call (`ext::add_twenty`) satisfies `coneSummary?_eq_of_stepMirFn_extCall`!
+2. With both summaries (`protoTwoExtSummaries`), `vcMirWithCallees` holds (`_0 = 31 : u32`).
+3. Dropping the second summary (`[⟨"ext::seed", 10⟩]` only) makes `vcMirWithCallees` false, proving
+   that external summaries are consulted *after* the first external call! -/
+theorem canary_twoExternalCalls_vc :
+    StepConeSafeTrait protoTwoExtCone protoTwoExtCallsRootMir protoTwoExtStateAfterSeed ∧
+    coneSummary? protoTwoExtCone protoTwoExtSummaries protoTwoExtReq2.defPath =
+      findExternalSummary? protoTwoExtSummaries protoTwoExtReq2.defPath ∧
+    vcMirWithCallees protoTwoExtContracts 4 protoTwoExtCallsRootMir protoTwoExtInitState [] []
+      protoTwoExtSummaries protoTwoExtCone protoTwoExtPost ∧
+    ¬ vcMirWithCallees protoTwoExtContracts 4 protoTwoExtCallsRootMir protoTwoExtInitState [] []
+      [⟨"ext::seed", 10⟩] protoTwoExtCone protoTwoExtPost := by
+  have h_inv₀ : ClosedInvPoly protoTwoExtCone protoTwoExtCallsRootMir [] [] protoTwoExtInitState :=
+    closedInvPoly_entry rfl rfl rfl rfl
+  have h_ans₁ : AnsPreservesCodeFrame protoTwoExtInitState.memory
+      (.returned (.scalar ⟨11, 4⟩) protoTwoExtInitState.memory) :=
+    ⟨rfl, rfl, rfl, CallerBodiesEq.refl _⟩
+  have h_safe₁ : StepConeSafeTrait protoTwoExtCone protoTwoExtCallsRootMir
+      protoTwoExtStateAfterSeed :=
+    stepConeSafeTrait_of_resumeExternalCall
+      (localsAfterArgs := protoTwoExtInitState.frame.locals)
+      (destination := ⟨0, []⟩) (targetBb := 1) (unwind := .continue_)
+      (by decide +kernel) (by decide +kernel)
+      h_inv₀ h_ans₁ rfl
+  have h_csum₂ : coneSummary? protoTwoExtCone protoTwoExtSummaries protoTwoExtReq2.defPath =
+      findExternalSummary? protoTwoExtSummaries protoTwoExtReq2.defPath := by
+    decide +kernel
+  have h31 : protoTwoExtResultAfter (.returned (.scalar ⟨31, 4⟩) protoTwoExtReq2.memory) =
+      some (some (Value.scalar ⟨31, 4⟩)) := rfl
+  have h99 : protoTwoExtResultAfter (.returned (.scalar ⟨99, 4⟩) protoTwoExtReq2.memory) =
+      some (some (Value.scalar ⟨99, 4⟩)) := rfl
+  have hself : MachineState.mapMem (Memory.withCalleesAndTraits [] []) protoTwoExtInitState =
+      protoTwoExtInitState := rfl
+  have hcont1 : protoTwoExtCont1 (.returned (.scalar ⟨11, 4⟩) protoTwoExtReq1.memory) =
+      .running protoTwoExtStateAfterSeed := rfl
+  refine ⟨h_safe₁, h_csum₂, ?_, ?_⟩
+  · unfold vcMirWithCallees
+    rw [hself]
+    show evalNodeWPExt protoTwoExtContracts protoTwoExtCone protoTwoExtSummaries _
+      protoTwoExtPost protoTwoExtStep1
+    rw [protoTwoExtStep1_eq]
+    have hsum1 : coneSummary? protoTwoExtCone protoTwoExtSummaries protoTwoExtReq1.defPath =
+        some ⟨"ext::seed", 10⟩ := by decide +kernel
+    show (match coneSummary? protoTwoExtCone protoTwoExtSummaries protoTwoExtReq1.defPath with
+      | some s => ∀ ans, protoTwoExtContracts s.summaryTag protoTwoExtReq1 ans →
+          wpMirExecExt protoTwoExtContracts protoTwoExtCone protoTwoExtSummaries 3
+            protoTwoExtCallsRootMir (protoTwoExtCont1 ans) protoTwoExtPost
+      | none => ∀ ans, wpMirExecExt protoTwoExtContracts protoTwoExtCone protoTwoExtSummaries 3
+          protoTwoExtCallsRootMir (protoTwoExtCont1 ans) protoTwoExtPost)
+    rw [hsum1]
+    intro ans₁ hans₁
+    rcases hans₁ with ⟨_, rfl⟩ | ⟨hbad, _⟩
+    · rw [hcont1]
+      show evalNodeWPExt protoTwoExtContracts protoTwoExtCone protoTwoExtSummaries _
+        protoTwoExtPost protoTwoExtStep2
+      rw [protoTwoExtStep2_eq]
+      have hsum2 : coneSummary? protoTwoExtCone protoTwoExtSummaries protoTwoExtReq2.defPath =
+          some ⟨"ext::add_twenty", 11⟩ := by decide +kernel
+      show (match coneSummary? protoTwoExtCone protoTwoExtSummaries protoTwoExtReq2.defPath with
+        | some s => ∀ ans, protoTwoExtContracts s.summaryTag protoTwoExtReq2 ans →
+            wpMirExecExt protoTwoExtContracts protoTwoExtCone protoTwoExtSummaries 2
+              protoTwoExtCallsRootMir (protoTwoExtCont2 ans) protoTwoExtPost
+        | none => ∀ ans, wpMirExecExt protoTwoExtContracts protoTwoExtCone protoTwoExtSummaries 2
+            protoTwoExtCallsRootMir (protoTwoExtCont2 ans) protoTwoExtPost)
+      rw [hsum2]
+      intro ans₂ hans₂
+      rcases hans₂ with ⟨hbad, _⟩ | ⟨_, _, rfl⟩
+      · nomatch hbad
+      · unfold protoTwoExtResultAfter at h31
+        obtain ⟨out, hout, hv⟩ := Option.map_eq_some_iff.mp h31
+        apply wpMirExecExt_of_run _ _ _ _ _ 2 _ out hout
+        rcases out with ⟨v, m⟩ | _ | _
+        · exact Option.some.inj hv
+        · nomatch hv
+        · nomatch hv
+    · nomatch hbad
+  · intro hvc
+    unfold vcMirWithCallees at hvc
+    rw [hself] at hvc
+    change evalNodeWPExt protoTwoExtContracts protoTwoExtCone [⟨"ext::seed", 10⟩] _
+      protoTwoExtPost protoTwoExtStep1 at hvc
+    rw [protoTwoExtStep1_eq] at hvc
+    have hsum1 : coneSummary? protoTwoExtCone [⟨"ext::seed", 10⟩] protoTwoExtReq1.defPath =
+        some ⟨"ext::seed", 10⟩ := by decide +kernel
+    change (match coneSummary? protoTwoExtCone [⟨"ext::seed", 10⟩] protoTwoExtReq1.defPath with
+      | some s => ∀ ans, protoTwoExtContracts s.summaryTag protoTwoExtReq1 ans →
+          wpMirExecExt protoTwoExtContracts protoTwoExtCone [⟨"ext::seed", 10⟩] 3
+            protoTwoExtCallsRootMir (protoTwoExtCont1 ans) protoTwoExtPost
+      | none => ∀ ans, wpMirExecExt protoTwoExtContracts protoTwoExtCone [⟨"ext::seed", 10⟩] 3
+          protoTwoExtCallsRootMir (protoTwoExtCont1 ans) protoTwoExtPost) at hvc
+    rw [hsum1] at hvc
+    have hw₁ := hvc (.returned (.scalar ⟨11, 4⟩) protoTwoExtReq1.memory)
+      (Or.inl ⟨rfl, rfl⟩)
+    rw [hcont1] at hw₁
+    change evalNodeWPExt protoTwoExtContracts protoTwoExtCone [⟨"ext::seed", 10⟩] _
+      protoTwoExtPost protoTwoExtStep2 at hw₁
+    rw [protoTwoExtStep2_eq] at hw₁
+    have hnone2 : coneSummary? protoTwoExtCone [⟨"ext::seed", 10⟩] protoTwoExtReq2.defPath =
+        none := by decide +kernel
+    change (match coneSummary? protoTwoExtCone [⟨"ext::seed", 10⟩] protoTwoExtReq2.defPath with
+      | some s => ∀ ans, protoTwoExtContracts s.summaryTag protoTwoExtReq2 ans →
+          wpMirExecExt protoTwoExtContracts protoTwoExtCone [⟨"ext::seed", 10⟩] 2
+            protoTwoExtCallsRootMir (protoTwoExtCont2 ans) protoTwoExtPost
+      | none => ∀ ans, wpMirExecExt protoTwoExtContracts protoTwoExtCone [⟨"ext::seed", 10⟩] 2
+          protoTwoExtCallsRootMir (protoTwoExtCont2 ans) protoTwoExtPost) at hw₁
+    rw [hnone2] at hw₁
+    have hw₂ := hw₁ (.returned (.scalar ⟨99, 4⟩) protoTwoExtReq2.memory)
+    unfold protoTwoExtResultAfter at h99
+    obtain ⟨out, hout, hv⟩ := Option.map_eq_some_iff.mp h99
+    have hp := post_of_wpMirExecExt_run _ _ _ _ _ 2 _ out hout hw₂
+    rcases out with ⟨v, m⟩ | _ | _
+    · have hv' : v = Value.scalar ⟨99, 4⟩ := Option.some.inj hv
+      have hp' : v = Value.scalar ⟨31, 4⟩ := hp
+      rw [hv'] at hp'
+      nomatch hp'
+    · nomatch hv
+    · nomatch hv
+
+/-! #### Genuine Universally Quantified Symbolic VC Over Trait Dispatch & Checked `u32` Addition -/
+
+def protoArg1RetU32Abi : FnAbi :=
+  { args := [⟨protoU32Layout, .direct⟩], ret := ⟨protoU32Layout, .direct⟩,
+    conv := .rust, canUnwind := true }
+
+/-- Construct a 1-argument `CapturedMir` body computing `_0 = AddUnchecked(_1, const addend_u32); return`. -/
+def protoAddUncheckedCallee (dp : DefPath) (addend : Nat) (typeParamCount : Nat := 0)
+    (traitImpls : List TraitImplEntry := []) : CapturedMir :=
+  { defPath := dp
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 1
+    localDecls := [⟨.mut, protoU32Ty, some "_0"⟩, ⟨.not, protoU32Ty, some "_1"⟩]
+    basicBlocks := [
+      { statements := [
+          ⟨.assign ⟨0, []⟩ (.binaryOp .addUnchecked (.copy ⟨1, []⟩) (protoU32Const addend)),
+            "add_unchecked"⟩ ]
+        terminator := ⟨.return_, "ret"⟩
+        isCleanup := false } ]
+    fnAbi := protoArg1RetU32Abi
+    layouts := protoLayouts
+    allocations := []
+    typeParamCount := typeParamCount
+    traitImpls := traitImpls }
+
+/-- Polymorphic `fn sym_poly<T>(x: u32) -> u32 { unchecked_add(x, 7) }`. -/
+def protoSymPoly : CapturedMir :=
+  protoAddUncheckedCallee "proto::sym_poly" 7 1 []
+
+/-- Trait impl body `fn <impl Area for Circle>::area(x: u32) -> u32 { unchecked_add(x, 24) }`. -/
+def protoSymCircleArea : CapturedMir :=
+  protoAddUncheckedCallee "proto::<impl Area for Circle>::area" 24 0 []
+
+/-- Root MIR body taking symbolic `_1 : u32`:
+- `bb0`: `_0 = sym_poly::<u32>(_1) -> bb1`
+- `bb1`: `_0 = <Circle as Area>::area(_0) -> bb2`
+- `bb2`: `return` -/
+def symTraitRootMir : CapturedMir :=
+  { defPath := "proto::sym_trait_root"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 1
+    localDecls := [⟨.mut, protoU32Ty, some "_0"⟩, ⟨.not, protoU32Ty, some "_1"⟩]
+    basicBlocks := [
+      { statements := []
+        terminator := ⟨.call (protoFnConst "proto::sym_poly" [.uint .u32]) [.copy ⟨1, []⟩]
+          ⟨0, []⟩ (some 1) .continue_, "call_poly"⟩
+        isCleanup := false },
+      { statements := []
+        terminator := ⟨.call (protoFnConst "proto::Area::area" [protoCircleTy]) [.copy ⟨0, []⟩]
+          ⟨0, []⟩ (some 2) .continue_, "call_trait"⟩
+        isCleanup := false },
+      { statements := [], terminator := ⟨.return_, "ret"⟩, isCleanup := false } ]
+    fnAbi := protoArg1RetU32Abi
+    layouts := protoLayouts
+    allocations := [] }
+
+def protoSymFullCallees : List CapturedMir :=
+  [protoFillerA, protoGDead, protoSymPoly, protoAreaImplHolder, protoFillerB, protoSymCircleArea]
+
+def protoSymCone : List DefPath :=
+  ["proto::sym_poly", "proto::Area::area", "proto::<impl Area for Circle>::area"]
+
+def protoSymMask : List Bool :=
+  protoSymFullCallees.map (fun b => inCone protoSymCone b.defPath)
+
+def protoSymNarrowCallees : List CapturedMir :=
+  coneBodies protoSymCone protoSymFullCallees
+
+def protoSymHoistedExtra : List TraitImplEntry :=
+  hoistTraitImpls protoSymFullCallees []
+
+def symTraitInitState (n : Nat) (callees : List CapturedMir := protoSymFullCallees) : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.scalar ⟨n, 4⟩)] }
+    memory := { emptyMemory with callees := callees } }
+
+theorem symTraitInitState_eq_initMachineState (n : Nat) :
+    symTraitInitState n protoSymFullCallees =
+      MirFuelFree.initMachineStateWithMemoryAndCallees symTraitRootMir [.scalar ⟨n, 4⟩]
+        emptyMemory protoSymFullCallees := rfl
+
+def symTraitPost (n : Nat) (out : MirOutcome) : Prop :=
+  match out with
+  | .normal (v, _) => v = Value.scalar ⟨n + 31, 4⟩
+  | _ => False
+
+def protoSymContracts : ExternalContractInterp := fun tag _ ans =>
+  match ans with
+  | .returned v _ => tag = 7 ∧ v = .scalar ⟨5, 4⟩
+  | _ => False
+
+theorem protoSymBatchedCert_check :
+    computeBatchedVcNarrowCert 4 symTraitRootMir protoSymFullCallees [] [] =
+      (protoSymCone, protoSymMask, []) ∧
+    checkBatchedVcConeNarrowCert protoSymCone symTraitRootMir protoSymFullCallees protoSymMask
+      [] [] [] = true := by
+  decide +kernel
+
+theorem protoSymBatchedCert :
+    BatchedVcConeNarrowCert protoSymCone symTraitRootMir
+      protoSymFullCallees protoSymNarrowCallees [] protoSymHoistedExtra [] [] := by
+  have h := BatchedVcConeNarrowCert.ofCheck protoSymBatchedCert_check.2
+  rw [show selectByMask protoSymFullCallees protoSymMask = protoSymNarrowCallees from
+    selectByMask_coneMask protoSymCone protoSymFullCallees] at h
+  exact h
+
+theorem wpMirExecExt_step_tau {contracts : ExternalContractInterp} {cone : List DefPath}
+    {extEnv : ExternalSummaryEnv} {fuel : Nat} {rootBody : CapturedMir}
+    {st st' : MirExecState} {post : MirOutcome → Prop}
+    (hstep : stepMirState rootBody st = .tau st')
+    (hwp : wpMirExecExt contracts cone extEnv fuel rootBody st' post) :
+    wpMirExecExt contracts cone extEnv (fuel + 1) rootBody st post := by
+  unfold wpMirExecExt
+  rw [hstep]
+  exact hwp
+
+theorem wpMirExecExt_step_ret {contracts : ExternalContractInterp} {cone : List DefPath}
+    {extEnv : ExternalSummaryEnv} {fuel : Nat} {rootBody : CapturedMir}
+    {st : MirExecState} {out : MirOutcome} {post : MirOutcome → Prop}
+    (hstep : stepMirState rootBody st = .ret out)
+    (hpost : post out) :
+    wpMirExecExt contracts cone extEnv (fuel + 1) rootBody st post := by
+  unfold wpMirExecExt
+  rw [hstep]
+  exact hpost
+
+theorem evalRvalue_addUnchecked_u32 (a b : Nat) (mem : Memory)
+    (h_bor : mem.borrows = [])
+    (h_ovf : Nat.ble 4294967296 (Nat.add a b) = false) :
+    evalRvalue [.uninit, .init (.scalar ⟨a, 4⟩)]
+      (.binaryOp .addUnchecked (.copy ⟨1, []⟩) (protoU32Const b))
+      mem [⟨.mut, protoU32Ty, some "_0"⟩, ⟨.not, protoU32Ty, some "_1"⟩] protoLayouts =
+      .ok (.scalar ⟨Nat.add a b, 4⟩) [.uninit, .init (.scalar ⟨a, 4⟩)] mem := by
+  have h_m : { mem with borrows := [] } = mem := by
+    cases mem; dsimp only at h_bor ⊢; rw [h_bor]
+  rw [← h_m]
+  change (match Nat.ble 4294967296 (Nat.add a b) with
+    | true => RvalueEvalResult.ub
+    | false => RvalueEvalResult.ok (.scalar ⟨Nat.add a b, 4⟩)
+        [.uninit, .init (.scalar ⟨a, 4⟩)] { mem with borrows := [] }) = _
+  rw [h_ovf]
+
+theorem stepMirState_assign_local (rootBody : CapturedMir) (s : MachineState)
+    (body : CapturedMir) (bb : BasicBlockData) (loc : Local) (rv : Rvalue) (span : String)
+    (val : Value) (locals₁ locals₂ : List LocalSlot) (mem₁ : Memory)
+    (h_body : s.memory.activeCallee.getD rootBody = body)
+    (h_phase : body.phase = .runtimePostCleanup)
+    (h_bb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (h_stmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign ⟨loc, []⟩ rv, span⟩)
+    (h_rv : evalRvalue s.frame.locals rv s.memory body.localDecls body.layouts =
+      .ok val locals₁ mem₁)
+    (h_get : get? locals₁ loc = some .uninit)
+    (h_set : set? locals₁ loc (.init val) = some locals₂)
+    (h_prot : mem₁.activeProtectors = []) :
+    stepMirState rootBody (.running s) =
+      MirStepNode.step (advanceStmt s locals₂
+        { mem₁ with borrows :=
+            invalidateConflictingBorrows mem₁.borrows loc .none (length mem₁.callStack) }) := by
+  unfold stepMirState stepMirFn
+  dsimp only
+  rw [h_body, h_phase]
+  dsimp only
+  rw [h_bb]
+  dsimp only
+  rw [h_stmt]
+  unfold evalStmt
+  dsimp only
+  rw [h_rv]
+  dsimp only
+  rw [h_get, h_set, h_prot]
+
+/-- **Genuine Symbolic VC over Narrowed Callees & Hoisted Trait Impls (`symTrait_vc_narrow`)**:
+For *every* `x : Nat`, the symbolic input `x % 1000` flows through polymorphic `sym_poly::<u32>(_1)`
+(`AddUnchecked(_1, 7)`) and trait-dispatched `<Circle as Area>::area(_0)` (`AddUnchecked(_1, 24)`)
+to return `(x % 1000) + 31 : u32`. Neither `rfl` nor `decide +kernel` can discharge this theorem
+because `evalScalarBinOp .addUnchecked` branches on `Nat.ble 4294967296 ((x % 1000) + 7)` and
+`Nat.ble 4294967296 (((x % 1000) + 7) + 24)`. -/
+theorem symTrait_vc_narrow (x : Nat) :
+    vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState (x % 1000) protoSymFullCallees)
+      protoSymNarrowCallees protoSymHoistedExtra [] protoSymCone (symTraitPost (x % 1000)) ∧
+    vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState (x % 1000) protoSymFullCallees)
+      protoSymFullCallees [] [] protoSymCone (symTraitPost (x % 1000)) := by
+  have h_ovf1 : Nat.ble 4294967296 (Nat.add (x % 1000) 7) = false := by
+    rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]
+    change ¬(4294967296 ≤ (x % 1000) + 7)
+    omega
+  have h_ovf2 : Nat.ble 4294967296 (Nat.add (Nat.add (x % 1000) 7) 24) = false := by
+    rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]
+    change ¬(4294967296 ≤ ((x % 1000) + 7) + 24)
+    omega
+  have h_narrow : vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState (x % 1000) protoSymFullCallees)
+      protoSymNarrowCallees protoSymHoistedExtra [] protoSymCone (symTraitPost (x % 1000)) := by
+    unfold vcMirWithCallees
+    refine wpMirExecExt_step_tau rfl ?_
+    refine wpMirExecExt_step_tau
+      (stepMirState_assign_local _ _ _ _ _ _ _ _ _ _ _ rfl rfl rfl rfl
+        (evalRvalue_addUnchecked_u32 _ _ _ rfl h_ovf1) rfl rfl rfl) ?_
+    refine wpMirExecExt_step_tau rfl ?_
+    refine wpMirExecExt_step_tau rfl ?_
+    refine wpMirExecExt_step_tau
+      (stepMirState_assign_local _ _ _ _ _ _ _ _ _ _ _ rfl rfl rfl rfl
+        (evalRvalue_addUnchecked_u32 _ _ _ rfl h_ovf2) rfl rfl rfl) ?_
+    refine wpMirExecExt_step_tau rfl ?_
+    refine wpMirExecExt_step_ret rfl ?_
+    exact congrArg (fun n => Value.scalar ⟨n, 4⟩)
+      (by change ((x % 1000) + 7) + 24 = (x % 1000) + 31; omega)
+  refine ⟨h_narrow, ?_⟩
+  exact (vcMirWithCallees_narrow_of_batchedCert protoSymBatchedCert protoSymContracts 8
+    (symTraitInitState (x % 1000) protoSymFullCallees) rfl rfl rfl rfl
+    (symTraitPost (x % 1000))
+    (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl)
+    (fun _ _ _ => Iff.rfl)).mp h_narrow
 
 /-! ## Part C: `DemandCallerLocationEnv` (`proofs-rs/lean-miri` PR #67 Schema 15) -/
 
@@ -4825,6 +5866,517 @@ theorem normalStmtStep_nextAllocId (s : MachineState) (stmt : Statement)
   unfold normalStmtStep
   split <;> rfl
 
+/-! #### General Borrow-Monotone Statement Frame & Tag Monotonicity (`evalStmt_borrowMonotone_frame`) -/
+
+private theorem updateBorrowPerm_tag (entry : BorrowEntry) (tl : Local) (wt : Option Nat)
+    (d : Nat) : (updateBorrowPerm entry tl wt d).tag = entry.tag := by
+  unfold updateBorrowPerm
+  split
+  · rfl
+  · exact (applyTreeBorrowTransition_fields _ _).1
+
+private theorem updateBorrowPermAtProj_tag (entry : BorrowEntry) (tl : Local) (wt : Option Nat)
+    (wp : List ProjectionElem) (ro rl d : Nat) :
+    (updateBorrowPermAtProj entry tl wt wp ro rl d).tag = entry.tag := by
+  unfold updateBorrowPermAtProj
+  repeat' (first | rfl | exact (applyTreeBorrowTransition_fields _ _).1 | split)
+
+private theorem updateBorrowPermTreeAtProj_tag (all : List BorrowEntry) (entry : BorrowEntry)
+    (tl : Local) (wt : Option Nat) (wp : List ProjectionElem) (ro rl d : Nat) :
+    (updateBorrowPermTreeAtProj all entry tl wt wp ro rl d).tag = entry.tag :=
+  updateBorrowPermAtProj_tag ..
+
+private theorem updateBorrowPermOnReadAtProj_tag (all : List BorrowEntry) (entry : BorrowEntry)
+    (tl : Local) (rt : Option Nat) (rp : List ProjectionElem) (ro rl : Nat) (ap : List Nat)
+    (d : Nat) :
+    (updateBorrowPermOnReadAtProj all entry tl rt rp ro rl ap d).tag = entry.tag := by
+  unfold updateBorrowPermOnReadAtProj
+  dsimp only
+  repeat' (first | rfl | exact (applyTreeBorrowTransition_fields _ _).1 | split | (dsimp only))
+
+theorem map_tag_disableLocalBorrows (loc : Local) (d : Nat) :
+    ∀ (bs : List BorrowEntry),
+      (disableLocalBorrows bs loc d).map BorrowEntry.tag = bs.map BorrowEntry.tag
+  | [] => rfl
+  | b :: rest => by
+    unfold disableLocalBorrows
+    cases Nat.beq b.targetFrameDepth d && Nat.beq b.targetLocal loc <;>
+      simp [map_tag_disableLocalBorrows loc d rest]
+
+theorem map_tag_attachBorrowProtector (tag protId : Nat) :
+    ∀ (bs : List BorrowEntry),
+      (attachBorrowProtector bs tag protId).map BorrowEntry.tag = bs.map BorrowEntry.tag
+  | [] => rfl
+  | b :: rest => by
+    unfold attachBorrowProtector
+    cases Nat.beq b.tag tag <;>
+      simp [map_tag_attachBorrowProtector tag protId rest]
+
+theorem map_tag_invalidateConflictingBorrows (tl : Local) (wt : Option Nat) (d : Nat) :
+    ∀ (bs : List BorrowEntry),
+      (invalidateConflictingBorrows bs tl wt d).map BorrowEntry.tag = bs.map BorrowEntry.tag
+  | [] => rfl
+  | b :: rest => by
+    unfold invalidateConflictingBorrows
+    simp only [List.map_cons, updateBorrowPerm_tag,
+      map_tag_invalidateConflictingBorrows tl wt d rest]
+
+theorem map_tag_invalidateConflictingBorrowsAtProj (tl : Local) (wt : Option Nat)
+    (wp : List ProjectionElem) (ro rl d : Nat) :
+    ∀ (bs : List BorrowEntry),
+      (invalidateConflictingBorrowsAtProj bs tl wt wp ro rl d).map BorrowEntry.tag =
+        bs.map BorrowEntry.tag
+  | [] => rfl
+  | b :: rest => by
+    simp [invalidateConflictingBorrowsAtProj, updateBorrowPermAtProj_tag,
+      map_tag_invalidateConflictingBorrowsAtProj tl wt wp ro rl d rest]
+
+theorem map_tag_invalidateTreeBorrowsAtProj (all : List BorrowEntry) (tl : Local)
+    (wt : Option Nat) (wp : List ProjectionElem) (ro rl d : Nat) :
+    ∀ (bs : List BorrowEntry),
+      (invalidateTreeBorrowsAtProj all bs tl wt wp ro rl d).map BorrowEntry.tag =
+        bs.map BorrowEntry.tag
+  | [] => rfl
+  | b :: rest => by
+    simp [invalidateTreeBorrowsAtProj, updateBorrowPermTreeAtProj_tag,
+      map_tag_invalidateTreeBorrowsAtProj all tl wt wp ro rl d rest]
+
+theorem map_tag_freezeTreeBorrowsOnReadAtProj (all : List BorrowEntry) (tl : Local)
+    (rt : Option Nat) (rp : List ProjectionElem) (ro rl : Nat) (ap : List Nat) (d : Nat) :
+    ∀ (bs : List BorrowEntry),
+      (freezeTreeBorrowsOnReadAtProj all bs tl rt rp ro rl ap d).map BorrowEntry.tag =
+        bs.map BorrowEntry.tag
+  | [] => rfl
+  | b :: rest => by
+    unfold freezeTreeBorrowsOnReadAtProj
+    simp [updateBorrowPermOnReadAtProj_tag,
+      map_tag_freezeTreeBorrowsOnReadAtProj all tl rt rp ro rl ap d rest]
+
+theorem map_tag_invalidateDerefWriteBorrows (locals₁ : List LocalSlot) (bs : List BorrowEntry)
+    (dst : Place) (restProj : List ProjectionElem) (callerLocals : List LocalSlot)
+    (callStack : List SavedCallerFrame) :
+    (invalidateDerefWriteBorrows locals₁ bs dst restProj callerLocals callStack).map
+        BorrowEntry.tag = bs.map BorrowEntry.tag := by
+  unfold invalidateDerefWriteBorrows
+  dsimp only
+  repeat' (first
+    | rfl
+    | exact map_tag_invalidateConflictingBorrows ..
+    | exact map_tag_invalidateConflictingBorrowsAtProj ..
+    | exact map_tag_invalidateTreeBorrowsAtProj ..
+    | split)
+
+theorem map_tag_invalidateDerefWriteBorrowsWithLayouts (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (locals₁ : List LocalSlot) (bs : List BorrowEntry) (dst : Place)
+    (restProj : List ProjectionElem) (callStack : List SavedCallerFrame) :
+    (invalidateDerefWriteBorrowsWithLayouts localDecls layouts locals₁ bs dst restProj
+        callStack).map BorrowEntry.tag = bs.map BorrowEntry.tag := by
+  unfold invalidateDerefWriteBorrowsWithLayouts
+  dsimp only
+  repeat' (first
+    | rfl
+    | exact map_tag_invalidateConflictingBorrows ..
+    | exact map_tag_invalidateConflictingBorrowsAtProj ..
+    | exact map_tag_invalidateTreeBorrowsAtProj ..
+    | split)
+
+theorem lookupBorrow_eq_none_iff_forall_tag_ne (id : Nat) :
+    ∀ (bs : List BorrowEntry),
+      lookupBorrow bs id = none ↔ ∀ t ∈ bs.map BorrowEntry.tag, Nat.beq t id = false
+  | [] => ⟨(fun _ _ h => nomatch h), fun _ => rfl⟩
+  | b :: rest => by
+    unfold lookupBorrow
+    cases hb : Nat.beq b.tag id with
+    | true =>
+      simp only [reduceCtorEq, false_iff]
+      intro hall
+      have := hall b.tag (List.Mem.head _)
+      rw [hb] at this
+      nomatch this
+    | false =>
+      rw [lookupBorrow_eq_none_iff_forall_tag_ne id rest]
+      constructor
+      · intro hrest t ht
+        rcases List.mem_cons.mp ht with rfl | htl
+        · exact hb
+        · exact hrest t htl
+      · intro hall t ht
+        exact hall t (List.Mem.tail _ ht)
+
+theorem lookupBorrow_eq_none_of_map_tag_eq {bs₁ bs₂ : List BorrowEntry} {id : Nat}
+    (h_tags : bs₂.map BorrowEntry.tag = bs₁.map BorrowEntry.tag)
+    (h_none : lookupBorrow bs₁ id = none) :
+    lookupBorrow bs₂ id = none := by
+  rw [lookupBorrow_eq_none_iff_forall_tag_ne] at h_none ⊢
+  rw [h_tags]
+  exact h_none
+
+theorem borrowsFresh_iff_forall_mem_tags (mem : Memory) :
+    BorrowsFresh mem ↔ ∀ t ∈ mem.borrows.map BorrowEntry.tag, t < mem.nextTag := by
+  unfold BorrowsFresh
+  constructor
+  · intro h t ht
+    obtain ⟨b, hb, rfl⟩ := List.mem_map.mp ht
+    exact h b hb
+  · intro h b hb
+    exact h b.tag (List.mem_map_of_mem hb)
+
+/-- Memory transition frame and borrow-tag monotonicity invariant (`MemBorrowMonotone mem mem'`):
+1. `globals` and `nextAllocId` are unchanged,
+2. `nextTag` is non-decreasing (`mem.nextTag ≤ mem'.nextTag`),
+3. `BorrowsFresh` (`∀ b ∈ borrows, b.tag < nextTag`) is preserved, and
+4. Any identifier `id < mem.nextTag` absent from `mem.borrows` (`lookupBorrow = none`) remains
+   absent from `mem'.borrows`. -/
+structure MemBorrowMonotone (mem mem' : Memory) : Prop where
+  globals_eq : mem'.globals = mem.globals
+  nextAllocId_eq : mem'.nextAllocId = mem.nextAllocId
+  nextTag_le : mem.nextTag ≤ mem'.nextTag
+  borrowsFresh_imp : BorrowsFresh mem → BorrowsFresh mem'
+  lookupBorrow_none_imp :
+    ∀ id, id < mem.nextTag → lookupBorrow mem.borrows id = none →
+      lookupBorrow mem'.borrows id = none
+
+theorem MemBorrowMonotone.refl (mem : Memory) : MemBorrowMonotone mem mem :=
+  ⟨rfl, rfl, Nat.le_refl _, id, fun _ _ h => h⟩
+
+theorem MemBorrowMonotone.trans {m₁ m₂ m₃ : Memory}
+    (h₁ : MemBorrowMonotone m₁ m₂) (h₂ : MemBorrowMonotone m₂ m₃) :
+    MemBorrowMonotone m₁ m₃ :=
+  ⟨h₂.globals_eq.trans h₁.globals_eq,
+   h₂.nextAllocId_eq.trans h₁.nextAllocId_eq,
+   Nat.le_trans h₁.nextTag_le h₂.nextTag_le,
+   fun hbf => h₂.borrowsFresh_imp (h₁.borrowsFresh_imp hbf),
+   fun id hlt hnone =>
+     h₂.lookupBorrow_none_imp id (Nat.lt_of_lt_of_le hlt h₁.nextTag_le)
+       (h₁.lookupBorrow_none_imp id hlt hnone)⟩
+
+theorem MemBorrowMonotone.of_tags_eq {m m' : Memory}
+    (hg : m'.globals = m.globals) (ha : m'.nextAllocId = m.nextAllocId)
+    (ht : m'.nextTag = m.nextTag)
+    (hb : m'.borrows.map BorrowEntry.tag = m.borrows.map BorrowEntry.tag) :
+    MemBorrowMonotone m m' := by
+  refine ⟨hg, ha, Nat.le_of_eq ht.symm, ?_, ?_⟩
+  · intro hbf
+    rw [borrowsFresh_iff_forall_mem_tags] at hbf ⊢
+    rw [hb, ht]
+    exact hbf
+  · intro id _ hnone
+    exact lookupBorrow_eq_none_of_map_tag_eq hb hnone
+
+theorem MemBorrowMonotone.of_cons_fresh_tag {m m' : Memory}
+    {child : BorrowEntry} {bs : List BorrowEntry}
+    (hg : m'.globals = m.globals) (ha : m'.nextAllocId = m.nextAllocId)
+    (ht : m'.nextTag = m.nextTag + 1)
+    (hbor : m'.borrows = child :: bs)
+    (hchild : child.tag = m.nextTag)
+    (hbs : bs.map BorrowEntry.tag = m.borrows.map BorrowEntry.tag) :
+    MemBorrowMonotone m m' := by
+  refine ⟨hg, ha, by omega, ?_, ?_⟩
+  · intro hbf
+    rw [borrowsFresh_iff_forall_mem_tags] at hbf ⊢
+    rw [hbor, List.map_cons, ht]
+    intro t ht_mem
+    rcases List.mem_cons.mp ht_mem with rfl | hrest
+    · rw [hchild]
+      exact Nat.lt_succ_self _
+    · rw [hbs] at hrest
+      exact Nat.lt_succ_of_lt (hbf t hrest)
+  · intro id hlt hnone
+    rw [hbor]
+    unfold lookupBorrow
+    rw [hchild, nat_beq_ne (Nat.ne_of_gt hlt)]
+    exact lookupBorrow_eq_none_of_map_tag_eq hbs hnone
+
+def NodeBorrowMonotone (m : Memory) : MirStepNode → Prop
+  | .tau (.running ns) => MemBorrowMonotone m ns.memory
+  | _ => True
+
+private theorem evalFnEntryRetag_borrowMonotone (s : MachineState) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (place : Place) (ptrVal : ProvenancePtr) (sz : Nat)
+    (parentEntry : BorrowEntry) (locals' : List LocalSlot) :
+    NodeBorrowMonotone s.memory
+      (evalFnEntryRetag s localDecls layouts place ptrVal sz parentEntry locals') := by
+  unfold evalFnEntryRetag
+  dsimp only
+  repeat' (first
+    | trivial
+    | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_attachBorrowProtector ..)
+    | exact MemBorrowMonotone.of_cons_fresh_tag rfl rfl rfl rfl rfl
+        (by split <;> first | rfl | exact map_tag_freezeTreeBorrowsOnReadAtProj ..)
+    | split
+    | (dsimp only))
+
+private theorem evalNonFnEntryRetag_borrowMonotone (retagKind : RetagKind) (s : MachineState)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (place : Place)
+    (ptrVal : ProvenancePtr) (sz : Nat) (parentEntry : BorrowEntry) (locals' : List LocalSlot) :
+    NodeBorrowMonotone s.memory
+      (evalNonFnEntryRetag retagKind s localDecls layouts place ptrVal sz parentEntry locals') := by
+  unfold evalNonFnEntryRetag
+  dsimp only
+  repeat' (first
+    | trivial
+    | exact MemBorrowMonotone.refl _
+    | exact MemBorrowMonotone.of_cons_fresh_tag rfl rfl rfl rfl rfl
+        (by split <;> first | rfl | exact map_tag_freezeTreeBorrowsOnReadAtProj ..)
+    | split
+    | (dsimp only))
+
+private theorem evalSetDiscriminantLocal_borrowMonotone (s : MachineState) (loc : Local)
+    (variantIdx : Nat) (fields : List Value) :
+    NodeBorrowMonotone s.memory (evalSetDiscriminantLocal s loc variantIdx fields) := by
+  unfold evalSetDiscriminantLocal
+  dsimp only
+  repeat' (first
+    | trivial
+    | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_invalidateConflictingBorrows ..)
+    | split
+    | (dsimp only))
+
+private theorem commitForeignFrameLocals_globals_nextAllocId_nextTag {m m' : Memory}
+    {t : ForeignFrameTarget} {l : List LocalSlot}
+    (h : commitForeignFrameLocals m t l = some m') :
+    m'.globals = m.globals ∧ m'.nextAllocId = m.nextAllocId ∧ m'.nextTag = m.nextTag := by
+  cases t with
+  | callerReferent _ =>
+    cases h
+    exact ⟨rfl, rfl, rfl⟩
+  | savedFrame idx _ =>
+    unfold commitForeignFrameLocals at h
+    dsimp only at h
+    cases hget : get? m.callStack idx with
+    | none => rw [hget] at h; cases h
+    | some sf =>
+      rw [hget] at h
+      dsimp only at h
+      cases hset : set? m.callStack idx { sf with frame := { sf.frame with locals := l } } with
+      | none => rw [hset] at h; cases h
+      | some cs' =>
+        rw [hset] at h
+        cases h
+        exact ⟨rfl, rfl, rfl⟩
+
+private theorem commitForeignFrameLocals_borrowMonotone_helper
+    {m m₂ m' : Memory} {t : ForeignFrameTarget} {l : List LocalSlot}
+    (h : commitForeignFrameLocals m t l = some m₂)
+    (hg : m'.globals = m₂.globals) (ha : m'.nextAllocId = m₂.nextAllocId)
+    (ht : m'.nextTag = m₂.nextTag)
+    (hb : m'.borrows.map BorrowEntry.tag = m.borrows.map BorrowEntry.tag) :
+    MemBorrowMonotone m m' := by
+  obtain ⟨hg₂, ha₂, ht₂⟩ := commitForeignFrameLocals_globals_nextAllocId_nextTag h
+  exact MemBorrowMonotone.of_tags_eq (hg.trans hg₂) (ha.trans ha₂) (ht.trans ht₂) hb
+
+private theorem foreignFrameDerefWrite_borrowMonotone {locals₁ locals₂ : List LocalSlot}
+    {mem₁ mem₂ : Memory} {dst : Place} {restProj : List ProjectionElem} {val : Value}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    (h : foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts =
+      .ok locals₂ mem₂) :
+    MemBorrowMonotone mem₁ mem₂ := by
+  unfold foreignFrameDerefWrite at h
+  dsimp only at h
+  repeat' (first
+    | (cases h; done)
+    | (cases h
+       exact commitForeignFrameLocals_borrowMonotone_helper (by assumption) (by rfl) (by rfl) (by rfl)
+         (by dsimp only; first
+             | exact map_tag_invalidateDerefWriteBorrows ..
+             | exact map_tag_invalidateDerefWriteBorrowsWithLayouts ..))
+    | split at h
+    | (dsimp only at h))
+
+private theorem evalForeignFrameDerefWrite_borrowMonotone {m₀ : Memory} (s : MachineState)
+    (locals₁ : List LocalSlot) (mem₁ : Memory) (dst : Place) (restProj : List ProjectionElem)
+    (val : Value) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h_m : MemBorrowMonotone m₀ mem₁) :
+    NodeBorrowMonotone m₀
+      (evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts) := by
+  unfold evalForeignFrameDerefWrite
+  cases hff : foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts with
+  | ok locals₂ mem₂ => exact h_m.trans (foreignFrameDerefWrite_borrowMonotone hff)
+  | ub | unsupported => trivial
+
+private theorem evalSetDiscriminantDerefWrite_borrowMonotone (s : MachineState)
+    (locals₁ : List LocalSlot) (p : Place) (rest : List ProjectionElem) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    NodeBorrowMonotone s.memory
+      (evalSetDiscriminantDerefWrite s locals₁ p rest newVal localDecls layouts) := by
+  unfold evalSetDiscriminantDerefWrite
+  dsimp only
+  repeat' (first
+    | trivial
+    | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl
+        (map_tag_invalidateDerefWriteBorrowsWithLayouts ..)
+    | exact evalForeignFrameDerefWrite_borrowMonotone s locals₁ s.memory p rest newVal
+        localDecls layouts (MemBorrowMonotone.refl _)
+    | split
+    | (dsimp only))
+
+/-- Rvalue predicate covering all `Anneal.PureMirExec.isBorrowFreePureRvalue` rvalues *plus* local
+stack reference creation `Rvalue.ref borrowKind place` (`_2 = &_1`, `_2 = &mut _1`, `_2 = &_1.f`). -/
+def isLocalRefOrPureRvalue (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (rv : Rvalue) : Bool :=
+  match rv with
+  | .ref _ p => !(projectionHasDeref p.projection)
+  | _ => Anneal.PureMirExec.isBorrowFreePureRvalue localDecls layouts rv
+
+theorem evalRvalue_localRefOrPure_borrowMonotone {locals locals₁ : List LocalSlot}
+    {rv : Rvalue} {mem mem₁ : Memory} {val : Value}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    (h_rv : isLocalRefOrPureRvalue localDecls layouts rv = true)
+    (h_ev : evalRvalue locals rv mem localDecls layouts = .ok val locals₁ mem₁) :
+    MemBorrowMonotone mem mem₁ := by
+  cases rv with
+  | ref borrowKind place =>
+    unfold isLocalRefOrPureRvalue at h_rv
+    unfold evalRvalue at h_ev
+    dsimp only at h_rv h_ev
+    cases hproj : place.projection with
+    | nil =>
+      rw [hproj] at h_ev
+      dsimp only at h_ev
+      repeat' (first
+        | (cases h_ev; done)
+        | (cases h_ev; exact MemBorrowMonotone.of_cons_fresh_tag rfl rfl rfl rfl rfl rfl)
+        | split at h_ev
+        | (dsimp only at h_ev))
+    | cons pHead pTail =>
+      rw [hproj] at h_rv h_ev
+      cases pHead with
+      | deref => nomatch h_rv
+      | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
+      | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+        dsimp only at h_ev
+        repeat' (first
+          | (cases h_ev; done)
+          | (cases h_ev; exact MemBorrowMonotone.of_cons_fresh_tag rfl rfl rfl rfl rfl rfl)
+          | split at h_ev
+          | (dsimp only at h_ev))
+  | _ =>
+    have h_pure : Anneal.PureMirExec.isBorrowFreePureRvalue localDecls layouts _ = true := h_rv
+    have h_eq :=
+      Anneal.PureMirExec.evalRvalue_borrowFree_pure_eq_withMem locals _ mem localDecls layouts
+        h_pure
+    rw [h_ev] at h_eq
+    cases h_emp : evalRvalue locals _ emptyMemory localDecls layouts with
+    | ub | unsupported => rw [h_emp] at h_eq; cases h_eq
+    | ok v' l' m' =>
+      rw [h_emp] at h_eq
+      injection h_eq with _ _ h_mem
+      rw [h_mem]
+      exact MemBorrowMonotone.refl mem
+
+/-- Predicate identifying MIR statements proved to preserve `globals` and `nextAllocId` while
+evolving `borrows` and `nextTag` monotonically (`MemBorrowMonotone`) on **arbitrary** `Memory`
+(with live stack borrows and active function-entry protectors): covers `.nop`, `.coverage`,
+`.constEvalCounter`, `.backwardIncompatibleDropHint`, `.placeMention`, `.storageLive`,
+`.storageDead`, `.deinit`, all `.retag` variants (`.fnEntry`, `.default`, `.twoPhase`, `.raw`),
+all `.setDiscriminant` variants, `.intrinsic (.assume _)`, and `.assign` for all
+`isLocalRefOrPureRvalue` rvalues (including `&_1` / `&mut _1`). -/
+def isBorrowMonotoneStmt (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (stmt : Statement) : Bool :=
+  match stmt.kind with
+  | .nop | .coverage | .constEvalCounter | .backwardIncompatibleDropHint _
+  | .placeMention _ | .storageLive _ | .storageDead _ | .deinit _
+  | .retag _ _ | .setDiscriminant _ _ | .intrinsic (.assume _) => true
+  | .assign _ rv => isLocalRefOrPureRvalue localDecls layouts rv
+  | .intrinsic (.copyNonOverlapping _ _ _) => false
+
+/-- **General Statement Borrow-Tag Monotonicity & Memory Frame Theorem
+(`evalStmt_borrowMonotone_frame`)**: on any `MachineState` `s` (even with non-empty `borrows` and
+`activeProtectors`), stepping any `isBorrowMonotoneStmt` statement preserves `globals` and
+`nextAllocId`, never decreases `nextTag`, preserves `BorrowsFresh`, and preserves `lookupBorrow =
+none` for all `id < s.memory.nextTag`. -/
+theorem evalStmt_borrowMonotone_frame {s : MachineState} {stmt : Statement}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    (h_stmt : isBorrowMonotoneStmt localDecls layouts stmt = true) :
+    NodeBorrowMonotone s.memory (evalStmt s stmt localDecls layouts) := by
+  rcases stmt with ⟨kind, span⟩
+  cases kind with
+  | intrinsic intr =>
+    cases intr with
+    | copyNonOverlapping _ _ _ => nomatch h_stmt
+    | assume op =>
+      unfold evalStmt; dsimp only
+      repeat' (first | trivial | exact MemBorrowMonotone.refl _ | split | (dsimp only))
+  | assign dst rv =>
+    change isLocalRefOrPureRvalue localDecls layouts rv = true at h_stmt
+    unfold evalStmt; dsimp only
+    cases h_ev : evalRvalue s.frame.locals rv s.memory localDecls layouts with
+    | ub | unsupported => trivial
+    | ok val locals₁ mem₁ =>
+      have h_rv := evalRvalue_localRefOrPure_borrowMonotone h_stmt h_ev
+      dsimp only
+      repeat' (first
+        | trivial
+        | exact h_rv.trans
+            (MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_invalidateConflictingBorrows ..))
+        | exact h_rv.trans
+            (MemBorrowMonotone.of_tags_eq rfl rfl rfl
+              (map_tag_invalidateDerefWriteBorrowsWithLayouts ..))
+        | exact h_rv.trans
+            (MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_invalidateDerefWriteBorrows ..))
+        | exact evalForeignFrameDerefWrite_borrowMonotone s locals₁ mem₁ dst _ val
+            localDecls layouts h_rv
+        | exact h_rv.trans
+            (MemBorrowMonotone.of_tags_eq rfl rfl rfl
+              (map_tag_invalidateConflictingBorrowsAtProj ..))
+        | split
+        | (dsimp only))
+  | _ =>
+    unfold evalStmt; dsimp only
+    repeat' (first
+      | trivial
+      | exact MemBorrowMonotone.refl _
+      | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_disableLocalBorrows ..)
+      | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl (map_tag_attachBorrowProtector ..)
+      | exact MemBorrowMonotone.of_tags_eq rfl rfl rfl
+          (map_tag_invalidateConflictingBorrowsAtProj ..)
+      | exact evalFnEntryRetag_borrowMonotone ..
+      | exact evalNonFnEntryRetag_borrowMonotone ..
+      | exact evalSetDiscriminantLocal_borrowMonotone ..
+      | exact evalSetDiscriminantDerefWrite_borrowMonotone ..
+      | split
+      | (dsimp only))
+
+/-- On any `isBorrowMonotoneStmt` statement (including `.retag`, `&_1` / `&mut _1` borrow creation,
+`StorageLive`, `StorageDead`, etc.) and **any** `MachineState` `s` (even with live borrows and
+protectors), `normalStmtStep` equals the raw `evalStmt` transition with zero field overwrites! -/
+theorem normalStmtStep_eq_raw_of_borrowMonotone (s : MachineState) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h_stmt : isBorrowMonotoneStmt localDecls layouts stmt = true) :
+    normalStmtStep s stmt localDecls layouts =
+      (match evalStmt s stmt localDecls layouts with
+       | .tau (.running ns) => ns
+       | _ => s) := by
+  have h_bm := evalStmt_borrowMonotone_frame (s := s) h_stmt
+  unfold normalStmtStep
+  cases h_ev : evalStmt s stmt localDecls layouts with
+  | ret _ | vis _ _ => rfl
+  | tau st =>
+    cases st with
+    | halted _ | faulted _ => rfl
+    | running ns =>
+      rw [h_ev] at h_bm
+      rcases ns with ⟨fr, mem⟩
+      obtain ⟨hg, ha, _, _, _⟩ := h_bm
+      cases mem
+      dsimp only at hg ha ⊢
+      rw [hg, ha]
+
+theorem normalStmtStep_borrowMonotone (s : MachineState) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h_stmt : isBorrowMonotoneStmt localDecls layouts stmt = true) :
+    MemBorrowMonotone s.memory (normalStmtStep s stmt localDecls layouts).memory := by
+  rw [normalStmtStep_eq_raw_of_borrowMonotone s stmt localDecls layouts h_stmt]
+  have h_bm := evalStmt_borrowMonotone_frame (s := s) h_stmt
+  cases h_ev : evalStmt s stmt localDecls layouts with
+  | ret _ | vis _ _ => exact MemBorrowMonotone.refl _
+  | tau st =>
+    cases st with
+    | halted _ | faulted _ => exact MemBorrowMonotone.refl _
+    | running ns =>
+      rw [h_ev] at h_bm
+      exact h_bm
+
 /-- Plain execution with no `caller_location` machinery at all (invocations are ignored). -/
 def runPlainTrace (s : MachineState) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     List CallerLocationTraceEvent → MachineState
@@ -5044,6 +6596,272 @@ theorem demandCallerLocation_bisim_eager (sites : List CallerLocationSite) (s₀
   unfold runEagerCallerLocationWorld
   dsimp only
   rw [h_d, h_e.2, h_e.1]
+
+/-! #### Borrow-Aware Trace Soundness & Bisimulation (`demandCallerLocation_bisim_eager_borrowAware`) -/
+
+/-- Borrow-table-aware observations across a list of `&'static Location` pointers (`lookupBorrow`
+checked before `lookupGlobalAlloc`, matching `Trusted` pointer resolution). -/
+def readLocationsBorrowAware (mem : Memory) (ptrs : List ProvenancePtr) :
+    List (Option (List UInt8 × UInt32 × UInt32)) :=
+  ptrs.map (readLocationBorrowAware mem)
+
+/-- Predicate stating that every `.normalStep stmt` in `trace` satisfies `isBorrowMonotoneStmt`
+(which includes `.retag .fnEntry`/`.default`/`.twoPhase`/`.raw`, `&_1` / `&mut _1`, `StorageLive`,
+`StorageDead`, `SetDiscriminant`, and all borrow-free pure statements). -/
+def traceBorrowMonotone (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    List CallerLocationTraceEvent → Bool
+  | [] => true
+  | .normalStep stmt :: rest =>
+    isBorrowMonotoneStmt localDecls layouts stmt &&
+      traceBorrowMonotone localDecls layouts rest
+  | .invokeCallerLocation _ :: rest =>
+    traceBorrowMonotone localDecls layouts rest
+
+theorem readLocationsBorrowAware_eq_readLocations {mem : Memory} {ptrs : List ProvenancePtr}
+    (h_none : ∀ p ∈ ptrs, lookupBorrow mem.borrows p.tag = none) :
+    readLocationsBorrowAware mem ptrs = readLocations mem.globals ptrs := by
+  apply List.map_congr_left
+  intro p hp
+  unfold readLocationBorrowAware
+  rw [h_none p hp]
+
+theorem evalDemandCallerLocation_nextTag_le (env : DemandCallerLocationEnv)
+    (site : CallerLocationSite) (mem : Memory) :
+    mem.nextTag ≤ (evalDemandCallerLocation env site mem).2.2.nextTag := by
+  have hle : mem.nextTag ≤ nextFreshGlobalAndTagId mem := Nat.le_max_right _ _
+  unfold evalDemandCallerLocation
+  dsimp only
+  split <;> (dsimp only; omega)
+
+theorem evalDemandCallerLocation_ptr_tag_lt (env : DemandCallerLocationEnv)
+    (site : CallerLocationSite) (mem : Memory) :
+    (evalDemandCallerLocation env site mem).2.1.tag <
+      (evalDemandCallerLocation env site mem).2.2.nextTag := by
+  unfold evalDemandCallerLocation
+  dsimp only [ProvenancePtr.tag]
+  split <;> (dsimp only; omega)
+
+theorem evalDemandCallerLocation_borrows_eq (env : DemandCallerLocationEnv)
+    (site : CallerLocationSite) (mem : Memory) :
+    (evalDemandCallerLocation env site mem).2.2.borrows = mem.borrows := by
+  unfold evalDemandCallerLocation
+  dsimp only
+  split <;> rfl
+
+theorem runDemandCallerLocationTrace_borrow_monotone (sites : List CallerLocationSite)
+    (h_sites : SitesFileLenOk sites) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ∀ (trace : List CallerLocationTraceEvent) (env : DemandCallerLocationEnv) (s : MachineState),
+      traceBorrowMonotone localDecls layouts trace = true →
+      DemandLocInv env s.memory →
+      BorrowsFresh s.memory →
+      s.memory.nextTag ≤
+          (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.2.memory.nextTag ∧
+        BorrowsFresh
+          (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.2.memory ∧
+        (∀ id, id < s.memory.nextTag → lookupBorrow s.memory.borrows id = none →
+          lookupBorrow
+            (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.2.memory.borrows
+            id = none) ∧
+        (∀ p ∈ (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.1,
+          p.tag <
+              (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.2.memory.nextTag ∧
+            lookupBorrow
+              (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.2.memory.borrows
+              p.tag = none)
+  | [], _, _, _, _, h_bf =>
+    ⟨Nat.le_refl _, h_bf, fun _ _ h => h, fun _ h => nomatch h⟩
+  | .normalStep stmt :: rest, env, s, h_tr, h_inv, h_bf => by
+    rw [traceBorrowMonotone, Bool.and_eq_true] at h_tr
+    have h_step := normalStmtStep_borrowMonotone s stmt localDecls layouts h_tr.1
+    obtain ⟨ih_le, ih_bf, ih_none, ih_ptrs⟩ :=
+      runDemandCallerLocationTrace_borrow_monotone sites h_sites localDecls layouts rest env
+        (normalStmtStep s stmt localDecls layouts) h_tr.2
+        (demandLocInv_normalStmtStep stmt localDecls layouts h_inv)
+        (h_step.borrowsFresh_imp h_bf)
+    exact ⟨Nat.le_trans h_step.nextTag_le ih_le, ih_bf,
+      fun id hlt hnone =>
+        ih_none id (Nat.lt_of_lt_of_le hlt h_step.nextTag_le)
+          (h_step.lookupBorrow_none_imp id hlt hnone),
+      ih_ptrs⟩
+  | .invokeCallerLocation i :: rest, env, s, h_tr, h_inv, h_bf => by
+    unfold runDemandCallerLocationTrace
+    cases hsite : sites[i]? with
+    | none =>
+      exact runDemandCallerLocationTrace_borrow_monotone sites h_sites localDecls layouts rest
+        env s h_tr h_inv h_bf
+    | some site =>
+      dsimp only
+      have h_mem : site ∈ sites := List.mem_of_getElem? hsite
+      have h_inv' := (evalDemandCallerLocation_spec env site s.memory h_inv (h_sites site h_mem)).2.1
+      obtain ⟨h_pnone, _, h_bf'⟩ :=
+        evalDemandCallerLocation_borrowAware_spec env site s.memory h_inv h_bf
+          (h_sites site h_mem)
+      have h_plt := evalDemandCallerLocation_ptr_tag_lt env site s.memory
+      have h_tle := evalDemandCallerLocation_nextTag_le env site s.memory
+      have h_beq := evalDemandCallerLocation_borrows_eq env site s.memory
+      obtain ⟨ih_le, ih_bf, ih_none, ih_ptrs⟩ :=
+        runDemandCallerLocationTrace_borrow_monotone sites h_sites localDecls layouts rest
+          (evalDemandCallerLocation env site s.memory).1
+          { s with memory := (evalDemandCallerLocation env site s.memory).2.2 }
+          h_tr h_inv' h_bf'
+      refine ⟨Nat.le_trans h_tle ih_le, ih_bf,
+        fun id hlt hnone =>
+          ih_none id (Nat.lt_of_lt_of_le hlt h_tle) (by rw [h_beq]; exact hnone),
+        ?_⟩
+      intro p hp
+      rcases List.mem_cons.mp hp with rfl | htl
+      · exact ⟨Nat.lt_of_lt_of_le h_plt ih_le, ih_none _ h_plt h_pnone⟩
+      · exact ih_ptrs p htl
+
+/-- **Multi-Step Borrow-Aware Demand Soundness (`runDemandCallerLocationTrace_borrowAware_spec`)**:
+On any trace of `isBorrowMonotoneStmt` steps (including `.retag`, `&_1` / `&mut _1`, `StorageLive`,
+`StorageDead`, etc.) and `.invokeCallerLocation` events, every returned `Location` pointer has
+`lookupBorrow = none` in the *final* borrow table (even when new stack borrow tags are minted both
+before and after `caller_location`!) and dereferences through `readLocationsBorrowAware` to
+`(invokedSites sites trace).map expectedLocation`. -/
+theorem runDemandCallerLocationTrace_borrowAware_spec (sites : List CallerLocationSite)
+    (h_sites : SitesFileLenOk sites) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (trace : List CallerLocationTraceEvent) (env : DemandCallerLocationEnv) (s : MachineState)
+    (h_tr : traceBorrowMonotone localDecls layouts trace = true)
+    (h_inv : DemandLocInv env s.memory) (h_bf : BorrowsFresh s.memory) :
+    readLocationsBorrowAware
+        (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.2.memory
+        (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.1 =
+      (invokedSites sites trace).map expectedLocation ∧
+    BorrowsFresh
+      (runDemandCallerLocationTrace sites env s localDecls layouts trace).2.2.memory := by
+  have h_spec := (runDemandCallerLocationTrace_spec sites h_sites localDecls layouts trace env s h_inv).1
+  obtain ⟨_, h_bf_final, _, h_ptrs⟩ :=
+    runDemandCallerLocationTrace_borrow_monotone sites h_sites localDecls layouts trace env s
+      h_tr h_inv h_bf
+  refine ⟨?_, h_bf_final⟩
+  rw [readLocationsBorrowAware_eq_readLocations (fun p hp => (h_ptrs p hp).2)]
+  exact h_spec
+
+theorem eagerInitAux_borrow_monotone :
+    ∀ (sites : List CallerLocationSite) (env : DemandCallerLocationEnv) (mem : Memory),
+      DemandLocInv env mem →
+      BorrowsFresh mem →
+      SitesFileLenOk sites →
+      mem.nextTag ≤ (eagerInitAux env mem sites).2.2.nextTag ∧
+        BorrowsFresh (eagerInitAux env mem sites).2.2 ∧
+        (eagerInitAux env mem sites).2.2.borrows = mem.borrows ∧
+        (∀ p ∈ (eagerInitAux env mem sites).2.1,
+          p.tag < (eagerInitAux env mem sites).2.2.nextTag ∧
+            lookupBorrow (eagerInitAux env mem sites).2.2.borrows p.tag = none)
+  | [], _, mem, _, h_bf, _ =>
+    ⟨Nat.le_refl _, h_bf, rfl, fun _ h => nomatch h⟩
+  | site :: rest, env, mem, h_inv, h_bf, h_sites => by
+    unfold eagerInitAux
+    dsimp only
+    have h_len := h_sites site (List.Mem.head _)
+    have h_inv' := (evalDemandCallerLocation_spec env site mem h_inv h_len).2.1
+    obtain ⟨h_pnone, _, h_bf'⟩ :=
+      evalDemandCallerLocation_borrowAware_spec env site mem h_inv h_bf h_len
+    have h_plt := evalDemandCallerLocation_ptr_tag_lt env site mem
+    have h_tle := evalDemandCallerLocation_nextTag_le env site mem
+    have h_beq := evalDemandCallerLocation_borrows_eq env site mem
+    obtain ⟨ih_le, ih_bf, ih_beq, ih_ptrs⟩ :=
+      eagerInitAux_borrow_monotone rest (evalDemandCallerLocation env site mem).1
+        (evalDemandCallerLocation env site mem).2.2 h_inv' h_bf'
+        (fun st hst => h_sites st (List.Mem.tail _ hst))
+    refine ⟨Nat.le_trans h_tle ih_le, ih_bf, ih_beq.trans h_beq, ?_⟩
+    intro p hp
+    rcases List.mem_cons.mp hp with rfl | htl
+    · exact ⟨Nat.lt_of_lt_of_le h_plt ih_le, by rw [ih_beq]; exact h_pnone⟩
+    · exact ih_ptrs p htl
+
+theorem runEagerCallerLocationTrace_borrow_monotone (ePtrs : List ProvenancePtr)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ∀ (trace : List CallerLocationTraceEvent) (s : MachineState),
+      traceBorrowMonotone localDecls layouts trace = true →
+      BorrowsFresh s.memory →
+      s.memory.nextTag ≤
+          (runEagerCallerLocationTrace ePtrs s localDecls layouts trace).2.memory.nextTag ∧
+        BorrowsFresh (runEagerCallerLocationTrace ePtrs s localDecls layouts trace).2.memory ∧
+        (∀ id, id < s.memory.nextTag → lookupBorrow s.memory.borrows id = none →
+          lookupBorrow
+            (runEagerCallerLocationTrace ePtrs s localDecls layouts trace).2.memory.borrows
+            id = none) ∧
+        (∀ p ∈ (runEagerCallerLocationTrace ePtrs s localDecls layouts trace).1, p ∈ ePtrs)
+  | [], _, _, h_bf =>
+    ⟨Nat.le_refl _, h_bf, fun _ _ h => h, fun _ h => nomatch h⟩
+  | .normalStep stmt :: rest, s, h_tr, h_bf => by
+    rw [traceBorrowMonotone, Bool.and_eq_true] at h_tr
+    have h_step := normalStmtStep_borrowMonotone s stmt localDecls layouts h_tr.1
+    obtain ⟨ih_le, ih_bf, ih_none, ih_mem⟩ :=
+      runEagerCallerLocationTrace_borrow_monotone ePtrs localDecls layouts rest
+        (normalStmtStep s stmt localDecls layouts) h_tr.2 (h_step.borrowsFresh_imp h_bf)
+    exact ⟨Nat.le_trans h_step.nextTag_le ih_le, ih_bf,
+      fun id hlt hnone =>
+        ih_none id (Nat.lt_of_lt_of_le hlt h_step.nextTag_le)
+          (h_step.lookupBorrow_none_imp id hlt hnone),
+      ih_mem⟩
+  | .invokeCallerLocation i :: rest, s, h_tr, h_bf => by
+    unfold runEagerCallerLocationTrace
+    cases hp : ePtrs[i]? with
+    | none =>
+      exact runEagerCallerLocationTrace_borrow_monotone ePtrs localDecls layouts rest s h_tr h_bf
+    | some p =>
+      dsimp only
+      obtain ⟨ih_le, ih_bf, ih_none, ih_mem⟩ :=
+        runEagerCallerLocationTrace_borrow_monotone ePtrs localDecls layouts rest s h_tr h_bf
+      refine ⟨ih_le, ih_bf, ih_none, ?_⟩
+      intro q hq
+      rcases List.mem_cons.mp hq with rfl | htl
+      · exact List.mem_of_getElem? hp
+      · exact ih_mem q htl
+
+/-- **Borrow-Aware Observational Bisimulation (`demandCallerLocation_bisim_eager_borrowAware`)**:
+Across any `traceBorrowMonotone` trace (interleaving `.retag`, `&_1` / `&mut _1`, `StorageLive`,
+`StorageDead`, `SetDiscriminant`, and pure statements with `.invokeCallerLocation` events), starting
+from `GlobalsFresh s₀.memory` and `BorrowsFresh s₀.memory`, the demand-time world and the eager
+pre-allocated world observe the exact same `(fileBytes, line, column)` through
+`readLocationsBorrowAware` (`lookupBorrow` before `lookupGlobalAlloc`) in their respective final
+`Memory` states! -/
+theorem demandCallerLocation_bisim_eager_borrowAware (sites : List CallerLocationSite)
+    (s₀ : MachineState) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (trace : List CallerLocationTraceEvent)
+    (h_tr : traceBorrowMonotone localDecls layouts trace = true)
+    (h_fresh : GlobalsFresh s₀.memory) (h_bf : BorrowsFresh s₀.memory)
+    (h_sites : SitesFileLenOk sites) :
+    readLocationsBorrowAware
+        (runDemandCallerLocationTrace sites {} s₀ localDecls layouts trace).2.2.memory
+        (runDemandCallerLocationTrace sites {} s₀ localDecls layouts trace).2.1 =
+      readLocationsBorrowAware
+        (runEagerCallerLocationWorld sites s₀ localDecls layouts trace).2.memory
+        (runEagerCallerLocationWorld sites s₀ localDecls layouts trace).1 ∧
+    readLocationsBorrowAware
+        (runDemandCallerLocationTrace sites {} s₀ localDecls layouts trace).2.2.memory
+        (runDemandCallerLocationTrace sites {} s₀ localDecls layouts trace).2.1 =
+      (invokedSites sites trace).map expectedLocation := by
+  have h_inv₀ : DemandLocInv {} s₀.memory := ⟨h_fresh, fun _ _ h => nomatch h⟩
+  have h_d := (runDemandCallerLocationTrace_borrowAware_spec sites h_sites localDecls layouts
+    trace {} s₀ h_tr h_inv₀ h_bf).1
+  have h_bisim := (demandCallerLocation_bisim_eager sites s₀ localDecls layouts trace
+    h_fresh h_sites).1
+  obtain ⟨_, h_init_bf, _, h_init_ptrs⟩ :=
+    eagerInitAux_borrow_monotone sites {} s₀.memory h_inv₀ h_bf h_sites
+  obtain ⟨_, _, h_e_none, h_e_mem⟩ :=
+    runEagerCallerLocationTrace_borrow_monotone (eagerInitCallerLocations sites s₀.memory).2.1
+      localDecls layouts trace
+      { s₀ with memory := (eagerInitCallerLocations sites s₀.memory).2.2 }
+      h_tr h_init_bf
+  have h_e_ba :
+      readLocationsBorrowAware
+        (runEagerCallerLocationWorld sites s₀ localDecls layouts trace).2.memory
+        (runEagerCallerLocationWorld sites s₀ localDecls layouts trace).1 =
+      readLocations
+        (runEagerCallerLocationWorld sites s₀ localDecls layouts trace).2.memory.globals
+        (runEagerCallerLocationWorld sites s₀ localDecls layouts trace).1 := by
+    apply readLocationsBorrowAware_eq_readLocations
+    intro p hp
+    have hp_init := h_e_mem p hp
+    obtain ⟨h_plt, h_pnone⟩ := h_init_ptrs p hp_init
+    exact h_e_none p.tag h_plt h_pnone
+  refine ⟨?_, h_d⟩
+  rw [h_d, h_e_ba, ← h_bisim,
+    (demandCallerLocation_bisim_eager sites s₀ localDecls layouts trace h_fresh h_sites).2]
 
 /-- **Zero-Clutter Theorem (`demandCallerLocation_no_call_zero_allocs`)**: on any trace that does
 not invoke `caller_location`, the demand-time world is *identical* (`=`) to plain execution with no

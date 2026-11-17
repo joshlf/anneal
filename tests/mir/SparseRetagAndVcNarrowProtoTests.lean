@@ -609,13 +609,26 @@ execution returns exactly the full execution's `31`. -/
 theorem test_partB_rustcStyle_narrow_run :
     hoistMaskTraitImpls protoRustcStyleCallees protoRustcStyleMask [] =
       hoistTraitImpls [protoFillerA, protoFillerB] [] ∧
+    lookupCallee protoRustcStyleCallees protoLayouts "proto::Area::area" [protoCircleTy] [] =
+      lookupCallee (selectByMask protoRustcStyleCallees protoRustcStyleMask) protoLayouts
+        "proto::Area::area" [protoCircleTy]
+        (hoistMaskTraitImpls protoRustcStyleCallees protoRustcStyleMask []) ∧
     (runMirExecBounded 12 traitCallRootMir
         (.running (MachineState.mapMem
           (Memory.withCalleesAndTraits (selectByMask protoRustcStyleCallees protoRustcStyleMask)
             (hoistMaskTraitImpls protoRustcStyleCallees protoRustcStyleMask []))
           (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory
             protoRustcStyleCallees)))).map leafBits = some (some 31) := by
-  refine ⟨hoistMaskTraitImpls_eq_hoistTraitImpls _ _ _, ?_⟩
+  refine ⟨hoistMaskTraitImpls_eq_hoistTraitImpls _ _ _,
+    lookupCallee_eq_of_traitConeAgree protoLayouts [protoCircleTy] rfl
+      (traitFilter_hoistMask_eq (cone := protoTraitCone) (extra := []) rfl
+        (List.Mem.tail _ (List.Mem.head _)))
+      (fun e he _ => by
+        change e ∈ [protoAreaEntry] at he
+        rcases he with _ | ⟨_, h⟩
+        · rfl
+        · nomatch h),
+    ?_⟩
   rw [runMirExecBounded_narrow_of_batchedCert canary_keptBodyWithTraitImpl_accepted.2.2.2 12 _
     rfl rfl rfl rfl, Option.map_map]
   have hfun : (leafBits ∘ MirOutcome.mapMem (Memory.withCalleesAndTraits
@@ -647,6 +660,102 @@ theorem test_partB_extCallInCone :
     coneSummary?_eq_of_stepMirFn_extCall [⟨"ext::rand", 7⟩] protoExtInitState_coneSafe
       protoExtStep_eq,
     by decide +kernel⟩
+
+/-- Mixed-partition trait-impl hoisting: when `"proto::Area::area"` has `protoAreaEntry` on a kept
+body (`protoCircleAreaWithTrait`) and `protoSquareAreaEntry` on a dropped carrier
+(`protoSquareAreaHolder`), both `checkKeptCarryNoConeTraitImpls` and `checkMaskTraitPartition`
+return `false`, while `checkBatchedVcConeNarrowCertGeneral` + `BatchedVcConeNarrowCert.ofCheckGeneral`
+certify narrowing (via `upsertMatchingTraitImpl` deduplication) and preserve the execution outcome. -/
+theorem test_partB_mixed_trait_partition :
+    checkKeptCarryNoConeTraitImpls protoMixedTraitCone
+      (selectByMask protoMixedTraitCallees protoMixedTraitMask) = false ∧
+    checkMaskTraitPartition protoMixedTraitCone protoMixedTraitCallees protoMixedTraitMask = false ∧
+    checkBatchedVcConeNarrowCertGeneral protoMixedTraitCone traitCallRootMir
+      protoMixedTraitCallees protoMixedTraitMask [] [] [] = true ∧
+    lookupCallee protoMixedTraitCallees protoLayouts "proto::Area::area" [protoCircleTy] [] =
+      lookupCallee (selectByMask protoMixedTraitCallees protoMixedTraitMask) protoLayouts
+        "proto::Area::area" [protoCircleTy] (hoistTraitImpls protoMixedTraitCallees []) ∧
+    ((runMirExecBounded 12 traitCallRootMir
+        (.running (MachineState.mapMem
+          (Memory.withCalleesAndTraits
+            (selectByMask protoMixedTraitCallees protoMixedTraitMask)
+            (hoistTraitImpls protoMixedTraitCallees []))
+          (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir []
+            emptyMemory protoMixedTraitCallees)))).map
+      (fun out => match out with | .normal (v, _) => some v | _ => none)) =
+      some (some (Value.scalar ⟨31, 4⟩)) :=
+  ⟨canary_mixedTraitPartition_accepted.1,
+   canary_mixedTraitPartition_accepted.2.1,
+   canary_mixedTraitPartition_accepted.2.2.1,
+   lookupCallee_eq_of_batchedCert canary_mixedTraitPartition_accepted.2.2.2.1 protoLayouts
+     (List.Mem.tail _ (List.Mem.head _)) [protoCircleTy],
+   canary_mixedTraitPartition_accepted.2.2.2.2⟩
+
+/-- Multi-call external summary preservation (`closedInvPoly_resumeExternalCall` +
+`canary_twoExternalCalls_vc`): after resuming from the first external call (`ext::seed`), the
+resumed state in `bb1` stays cone-safe (`StepConeSafeTrait`), `coneSummary?_eq_of_stepMirFn_extCall`
+applies to the second external call (`ext::add_twenty`), and the 2-call VC holds with both summaries
+and fails when the second summary is dropped. -/
+theorem test_partB_two_external_calls :
+    StepConeSafeTrait protoTwoExtCone protoTwoExtCallsRootMir protoTwoExtStateAfterSeed ∧
+    NodeExtCallInCone protoTwoExtCone
+      (stepMirFn protoTwoExtCallsRootMir protoTwoExtStateAfterSeed) ∧
+    coneSummary? protoTwoExtCone protoTwoExtSummaries protoTwoExtReq2.defPath =
+      findExternalSummary? protoTwoExtSummaries protoTwoExtReq2.defPath ∧
+    vcMirWithCallees protoTwoExtContracts 4 protoTwoExtCallsRootMir protoTwoExtInitState [] []
+      protoTwoExtSummaries protoTwoExtCone protoTwoExtPost ∧
+    ¬ vcMirWithCallees protoTwoExtContracts 4 protoTwoExtCallsRootMir protoTwoExtInitState [] []
+      [⟨"ext::seed", 10⟩] protoTwoExtCone protoTwoExtPost :=
+  ⟨canary_twoExternalCalls_vc.1,
+   stepMirFn_extCallInCone protoTwoExtCone protoTwoExtCallsRootMir protoTwoExtStateAfterSeed
+     canary_twoExternalCalls_vc.1,
+   coneSummary?_eq_of_stepMirFn_extCall protoTwoExtSummaries canary_twoExternalCalls_vc.1
+     protoTwoExtStep2_eq,
+   canary_twoExternalCalls_vc.2.2.1,
+   canary_twoExternalCalls_vc.2.2.2⟩
+
+/-- Genuine universally quantified symbolic VC (`∀ x : Nat`) where `x % 1000` flows through
+polymorphic `sym_poly::<u32>(_1)` (`AddUnchecked(_1, 7)`) and trait-dispatched
+`<Circle as Area>::area(_0)` (`AddUnchecked(_1, 24)`) to return `(x % 1000) + 31 : u32`. -/
+theorem test_partB_symbolic_trait_vc (x : Nat) :
+    symTraitInitState (x % 1000) protoSymFullCallees =
+      MirFuelFree.initMachineStateWithMemoryAndCallees symTraitRootMir [.scalar ⟨x % 1000, 4⟩]
+        emptyMemory protoSymFullCallees ∧
+    computeBatchedVcNarrowCert 4 symTraitRootMir protoSymFullCallees [] [] =
+      (protoSymCone, protoSymMask, []) ∧
+    vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState (x % 1000) protoSymFullCallees)
+      protoSymNarrowCallees protoSymHoistedExtra [] protoSymCone (symTraitPost (x % 1000)) ∧
+    vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState (x % 1000) protoSymFullCallees)
+      protoSymFullCallees [] [] protoSymCone (symTraitPost (x % 1000)) :=
+  ⟨symTraitInitState_eq_initMachineState (x % 1000),
+   protoSymBatchedCert_check.1, (symTrait_vc_narrow x).1, (symTrait_vc_narrow x).2⟩
+
+/- Meta-level non-reducibility audit confirming that `rfl` / `isDefEq` CANNOT discharge the symbolic
+VC `symTrait_vc_narrow` because `Nat.ble 4294967296 ((x % 1000) + 7)` and
+`Nat.ble 4294967296 (((x % 1000) + 7) + 24)` are not definitionally equal to `false`, and
+`evalScalarBinOp .addUnchecked ⟨x % 1000, 4⟩ ⟨7, 4⟩ [] emptyMemory false` is not definitionally
+equal to `.ok (.scalar ⟨(x % 1000) + 7, 4⟩) [] emptyMemory` for a symbolic free variable `x : Nat`. -/
+open Lean Elab Command Term Meta in
+run_cmd liftTermElabM do
+  withLocalDeclD `x (mkConst ``Nat) fun x => do
+    let falseExpr := toExpr false
+    let ble1Stx ← `(term| Nat.ble 4294967296 (Nat.add ($(← exprToSyntax x) % 1000) 7))
+    let ble1Expr ← elabTerm ble1Stx none
+    if ← isDefEq ble1Expr falseExpr then
+      throwError "symbolic VC audit failed: first Nat.ble overflow check unexpectedly reduced by isDefEq!"
+    let ble2Stx ← `(term| Nat.ble 4294967296 (Nat.add (Nat.add ($(← exprToSyntax x) % 1000) 7) 24))
+    let ble2Expr ← elabTerm ble2Stx none
+    if ← isDefEq ble2Expr falseExpr then
+      throwError "symbolic VC audit failed: second Nat.ble overflow check unexpectedly reduced by isDefEq!"
+    let binLhsStx ← `(term| evalScalarBinOp .addUnchecked ⟨$(← exprToSyntax x) % 1000, 4⟩ ⟨7, 4⟩ [] emptyMemory false)
+    let binRhsStx ← `(term| RvalueEvalResult.ok (.scalar ⟨Nat.add ($(← exprToSyntax x) % 1000) 7, 4⟩) [] emptyMemory)
+    let binLhsExpr ← elabTerm binLhsStx none
+    let binRhsExpr ← elabTerm binRhsStx none
+    if ← isDefEq binLhsExpr binRhsExpr then
+      throwError "symbolic VC audit failed: evalScalarBinOp .addUnchecked unexpectedly reduced by isDefEq!"
+    logInfo m!"symbolic VC audit passed: symTrait_vc_narrow is genuinely symbolic (rejected by isDefEq/rfl)"
 
 /-- Part C / Part D theory canaries and the projections of `AllocRenamingRel`, used concretely. -/
 theorem test_partCD_canaries :
@@ -802,6 +911,9 @@ theorem test_partB_chain_idempotent :
     chainCoerceSealed 16 (.scalar ⟨5, 4⟩) = some (.scalar ⟨wrapScalarBits 5 (scalarModulus 4), 4⟩) :=
   chainCoerceSealed_idempotent _ _ (coerceValueAt_u32 protoLayouts 5) 15
 
+def symFullCallees128 : List CapturedMir :=
+  buildFillerCallees 125 ++ [protoSymPoly, protoAreaImplHolder, protoSymCircleArea]
+
 open Lean Elab Command in
 run_cmd do
   let bench (label : String) (mkCmd : CommandElabM (TSyntax `command)) : CommandElabM Unit := do
@@ -885,6 +997,53 @@ run_cmd do
           [protoPoly, protoCircleArea] [protoAreaEntry] [] protoTraitCone
           (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) :=
       rfl)
+  bench "PartB_symVC_full_M128" `(command|
+    theorem bench_partB_symVC_full_128 (x : Nat) :
+        vcMirWithCallees protoSymContracts 8 symTraitRootMir
+          (symTraitInitState (x % 1000) symFullCallees128)
+          symFullCallees128 [] [] protoSymCone (symTraitPost (x % 1000)) := by
+      have h_ovf1 : Nat.ble 4294967296 (Nat.add (x % 1000) 7) = false := by
+        rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]; change ¬(4294967296 ≤ (x % 1000) + 7); omega
+      have h_ovf2 : Nat.ble 4294967296 (Nat.add (Nat.add (x % 1000) 7) 24) = false := by
+        rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]; change ¬(4294967296 ≤ ((x % 1000) + 7) + 24); omega
+      unfold vcMirWithCallees
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau
+        (stepMirState_assign_local _ _ _ _ _ _ _ _ _ _ _ rfl rfl rfl rfl
+          (evalRvalue_addUnchecked_u32 _ _ _ rfl h_ovf1) rfl rfl rfl) ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau
+        (stepMirState_assign_local _ _ _ _ _ _ _ _ _ _ _ rfl rfl rfl rfl
+          (evalRvalue_addUnchecked_u32 _ _ _ rfl h_ovf2) rfl rfl rfl) ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_ret rfl ?_
+      exact congrArg (fun n => Value.scalar ⟨n, 4⟩)
+        (by change ((x % 1000) + 7) + 24 = (x % 1000) + 31; omega))
+  bench "PartB_symVC_narrowCached_M128" `(command|
+    theorem bench_partB_symVC_narrowCached_128 (x : Nat) :
+        vcMirWithCallees protoSymContracts 8 symTraitRootMir
+          (symTraitInitState (x % 1000) symFullCallees128)
+          [protoSymPoly, protoSymCircleArea] [protoAreaEntry] [] protoSymCone
+          (symTraitPost (x % 1000)) := by
+      have h_ovf1 : Nat.ble 4294967296 (Nat.add (x % 1000) 7) = false := by
+        rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]; change ¬(4294967296 ≤ (x % 1000) + 7); omega
+      have h_ovf2 : Nat.ble 4294967296 (Nat.add (Nat.add (x % 1000) 7) 24) = false := by
+        rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]; change ¬(4294967296 ≤ ((x % 1000) + 7) + 24); omega
+      unfold vcMirWithCallees
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau
+        (stepMirState_assign_local _ _ _ _ _ _ _ _ _ _ _ rfl rfl rfl rfl
+          (evalRvalue_addUnchecked_u32 _ _ _ rfl h_ovf1) rfl rfl rfl) ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau
+        (stepMirState_assign_local _ _ _ _ _ _ _ _ _ _ _ rfl rfl rfl rfl
+          (evalRvalue_addUnchecked_u32 _ _ _ rfl h_ovf2) rfl rfl rfl) ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_ret rfl ?_
+      exact congrArg (fun n => Value.scalar ⟨n, 4⟩)
+        (by change ((x % 1000) + 7) + 24 = (x % 1000) + 31; omega))
   bench "PartB_coerce_sealed_simp" `(command|
     theorem bench_partB_coerce_sealed :
         ∀ bits : Nat, chainCoerceSealed 16 (.scalar ⟨bits, 4⟩) =
@@ -1011,6 +1170,64 @@ theorem test_partC_demandCallerLocation :
       (by decide +kernel)⟩
   rw [h_bisim.2]
   decide +kernel
+
+theorem protoLocState_borrowsFresh : BorrowsFresh protoLocState.memory := fun _ h => nomatch h
+
+/-- Realistic borrow-monotone trace that interleaves `StorageLive`, scalar assignment, `&mut _2`
+stack reference creation (`Rvalue.ref`), `Retag([fn entry] _1)` (minting a protected child borrow
+tag before `caller_location`), `.invokeCallerLocation 2`, `Retag([default] _1)` (minting a fresh
+stack borrow tag *after* `caller_location`), and `.invokeCallerLocation 0`. -/
+def protoBorrowMonotoneTrace : List CallerLocationTraceEvent :=
+  [ .normalStep ⟨.storageLive 2, "sl2"⟩,
+    .normalStep ⟨.assign ⟨2, []⟩ (.use (protoU32Const 42)), "init2"⟩,
+    .normalStep ⟨.assign ⟨1, []⟩ (.ref (.mut false) ⟨2, []⟩), "ref1"⟩,
+    .normalStep protoFnEntryRetagStmt,
+    .invokeCallerLocation 2,
+    .normalStep protoDefaultRetagStmt,
+    .invokeCallerLocation 0 ]
+
+/-- Successor of `protoRetagMachineState` (which has a live stack borrow `tag = 1`) after
+`protoFnEntryRetagStmt`. -/
+def protoFnEntryRetagAfter : MachineState :=
+  match evalStmt protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts with
+  | .tau (.running ns) => ns
+  | _ => protoRetagMachineState
+
+/-- Closed witness for `evalStmt_borrowMonotone_frame`, `normalStmtStep_eq_raw_of_borrowMonotone`,
+`runDemandCallerLocationTrace_borrowAware_spec`, and `demandCallerLocation_bisim_eager_borrowAware`
+across all 8 `LocationDetailPolicy` combinations on `protoBorrowMonotoneTrace`. -/
+theorem test_partC_borrowMonotone_and_trace_borrowAware :
+    normalStmtStep protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts =
+      protoFnEntryRetagAfter ∧
+    readLocationsBorrowAware
+        (runDemandCallerLocationTrace (protoSites {} {}) {} protoLocState protoRetagLocalDecls
+          protoLayouts protoBorrowMonotoneTrace).2.2.memory
+        (runDemandCallerLocationTrace (protoSites {} {}) {} protoLocState protoRetagLocalDecls
+          protoLayouts protoBorrowMonotoneTrace).2.1 =
+      [ some (protoLibRsBytes, 42, 13), some (protoLibRsBytes, 108, 7) ] ∧
+    (∀ pol ∈ allLocationDetailPolicies,
+      readLocationsBorrowAware
+          (runDemandCallerLocationTrace (protoSites pol pol) {} protoLocState protoRetagLocalDecls
+            protoLayouts protoBorrowMonotoneTrace).2.2.memory
+          (runDemandCallerLocationTrace (protoSites pol pol) {} protoLocState protoRetagLocalDecls
+            protoLayouts protoBorrowMonotoneTrace).2.1 =
+        readLocationsBorrowAware
+          (runEagerCallerLocationWorld (protoSites pol pol) protoLocState protoRetagLocalDecls
+            protoLayouts protoBorrowMonotoneTrace).2.memory
+          (runEagerCallerLocationWorld (protoSites pol pol) protoLocState protoRetagLocalDecls
+            protoLayouts protoBorrowMonotoneTrace).1) := by
+  refine ⟨?_, ?_, ?_⟩
+  · rw [normalStmtStep_eq_raw_of_borrowMonotone _ _ _ _ rfl]
+    rfl
+  · have h_ba := (demandCallerLocation_bisim_eager_borrowAware (protoSites {} {}) protoLocState
+      protoRetagLocalDecls protoLayouts protoBorrowMonotoneTrace (by decide +kernel)
+      protoLocState_fresh protoLocState_borrowsFresh (protoSites_fileLenOk {} {})).2
+    rw [h_ba]
+    decide +kernel
+  · intro pol _
+    exact (demandCallerLocation_bisim_eager_borrowAware (protoSites pol pol) protoLocState
+      protoRetagLocalDecls protoLayouts protoBorrowMonotoneTrace (by decide +kernel)
+      protoLocState_fresh protoLocState_borrowsFresh (protoSites_fileLenOk pol pol)).1
 
 def buildCandidateSites : Nat → List CallerLocationSite
   | 0 => []

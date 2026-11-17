@@ -7,16 +7,19 @@
   - `theory/Anneal/SparseRetagAndVcNarrowPrototype.lean`
   - `tests/mir/SparseRetagAndVcNarrowProtoTests.lean`
   - `PROTOTYPE_REPORT.md`
-- **Kernel & Axiom Audit** (bottom of the test file, on the final code): `axiom audit passed: 1753 declarations (242 prototype theorems, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 leaked constants, 0 placeholder uses, 1 conditional test lemmas all discharged, 100% theorem reachability from closed test witnesses)`
+- **Kernel & Axiom Audit** (bottom of the test file, on the final code): `axiom audit passed: 2025 declarations (325 prototype theorems, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 leaked constants, 0 placeholder uses, 4 conditional test lemmas all discharged, 100% theorem reachability from closed test witnesses)`
   - All theorems depend only on `{propext, Quot.sound}`. The audit's self-tests confirm that it flags
     `Classical.choice`, `sorryAx`, `Lean.ofReduceBool`, an elaborated `have _ := @thm` placeholder,
     and a test statement that assumes an undischarged hypothesis. Reachability is computed only
     from *closed* test witnesses (no assumed hypotheses other than bounded membership `x ∈ l`).
   - `tests/mir/SparseRetagAndVcNarrowProtoTests.lean` starts with `import Anneal` +
     `import Anneal.SparseRetagAndVcNarrowPrototype` and elaborates cleanly (no symbol/instance collisions).
-- **Overall Recommendation**: **CONDITIONAL GO** — the four mechanisms are formally sound on the
-  prototype models; §5 lists what Track A must still prove or measure (three conditions are only
-  partially closed).
+- **Overall Recommendation**: **CONDITIONAL GO** — all four mechanisms are formally verified with
+  `0 sorry` and `0 Classical.choice` over `Trusted.Rustc.V2026_06_01` and `Anneal.MirLiftCore`, and
+  the `[adv B2]` open gaps (mixed-partition trait hoisting, multi-call external summary cone safety,
+  universally quantified symbolic trait-dispatch VC + benchmark, general borrow-monotone statement
+  frame on arbitrary `Memory`, and trace-level borrow-aware `Location` bisimulation) are now closed
+  in `[adv A2]`; §5 lists the remaining integration items for Track A promotion.
 
 ---
 
@@ -46,26 +49,46 @@
   `invalidateTreeBorrowsAtProj`).
 
 ### Part B — `BatchedVcConeNarrowCert` + `hoistTraitImpls` + `@[irreducible] coerceValueAt`
-- One Boolean checker per hoisting policy, each a single `decide +kernel`:
-  `checkBatchedVcConeNarrowCert` (`hoistTraitImpls fullCallees extra`) and
-  `checkBatchedVcConeNarrowCertMask` (`hoistMaskTraitImpls`: hoist only the *dropped* bodies' entries,
-  for the `rustc-capture` layout where kept impl bodies carry their own `TraitImplEntry`;
-  `hoistMaskTraitImpls_eq_hoistTraitImpls`: it is `hoistTraitImpls` applied to the dropped bodies);
-  `BatchedVcConeNarrowCert.ofCheck` / `.ofCheckMask` derive **every** certificate field.
+- Three Boolean certificate checkers (each a single `decide +kernel`), all deriving
+  `BatchedVcConeNarrowCert`:
+  1. `checkBatchedVcConeNarrowCert` + `BatchedVcConeNarrowCert.ofCheck` (`hoistTraitImpls fullCallees extra`
+     when kept bodies carry no cone `TraitImplEntry`s),
+  2. `checkBatchedVcConeNarrowCertMask` + `BatchedVcConeNarrowCert.ofCheckMask`
+     (`hoistMaskTraitImpls`: hoist only the *dropped* bodies' entries when cone traits do not
+     straddle kept and dropped bodies; `hoistMaskTraitImpls_eq_hoistTraitImpls`),
+  3. `checkBatchedVcConeNarrowCertGeneral` + `BatchedVcConeNarrowCert.ofCheckGeneral`
+     (`hoistTraitImpls fullCallees extra` paired with `selectByMask fullCallees mask` for **every**
+     keep-mask `mask`, including mixed partitions where the same cone trait has `TraitImplEntry`s in
+     both kept and dropped bodies): proved via `collectMatchingTraitImpls_append_of_subset`,
+     `TraitFilterCovers`, `hasTraitImplForDefPath_eq_of_traitFilterCovers`,
+     `collectMatchingTraitImpls_eq_of_traitFilterCovers`, and `traitFilterCovers_hoist_selectByMask`
+     (exploiting `upsertMatchingTraitImpl`'s deduplication by `entry.implPath` without requiring
+     `DecidableEq RigidTy`), and witnessed by `canary_mixedTraitPartition_accepted`.
 - First-match preservation without `CapturedMir` equality: `checkMaskKeepsFirstMatch` +
   `calleesAgreeOn_selectByMask`; trait-record preservation: `traitFilter_hoist_eq`,
-  `traitFilter_hoistMask_eq` (via `checkMaskTraitPartition`).
+  `traitFilter_hoistMask_eq`, `traitFilterCovers_hoist_selectByMask`.
 - `computeBatchedVcNarrowCert` / `collectTraitConeBodies`; `selectByMask_coneMask`.
-- Trait-aware congruence: `lookupCallee_eq_of_traitConeAgree`, `evalTerminator_withCalleesAndTraits`,
+- Trait-aware congruence: `lookupCallee_eq_of_traitFilterCovers`, `lookupCallee_eq_of_traitConeAgree`,
+  `lookupCallee_eq_of_batchedCert`, `evalTerminator_withCalleesAndTraits`,
   `stepMirFn_withCalleesAndTraits`, `coneReach_of_closedInvTrait`.
 - Core theorems: `runMirExecBounded_narrow_of_batchedCert`, `wpMirExecSym_narrow_of_batchedCert`,
   `vcMirWithCallees_narrow_of_batchedCert` (contract-aware WP `wpMirExecExt`, with
   `wpMirExecExt_nil_iff`, `wpMirExecExt_of_wpMirExecSym`, `wpMirExecExt_of_run`,
   `post_of_wpMirExecExt_run`).
-- `stepMirFn_extCallInCone` / `coneSummary?_eq_of_stepMirFn_extCall`: every external call emitted
-  from a cone-safe state targets a cone path, so cone filtering of summaries loses nothing there.
-- `canary_externalSummary_vc` (the VC holds with the cone summary, fails without it),
-  `canary_coercedExternalSummary_vc` (a contract stated through sealed `coerceValueAt`).
+- External-call cone safety across single and multiple calls:
+  `stepMirFn_extCallInCone` / `coneSummary?_eq_of_stepMirFn_extCall` (every external call emitted
+  from a cone-safe state targets a cone path), plus `AnsPreservesCodeFrame`,
+  `closedInvPoly_resumeExternalCall`, `stepConeSafeTrait_of_resumeExternalCall` (any external answer
+  preserving `callees`, `traitImpls`, `activeCallee`, and `CallerBodiesEq` preserves `ClosedInvPoly`
+  and `StepConeSafeTrait` across `resumeExternalCall`), and `canary_twoExternalCalls_vc` (2-call
+  root body `protoTwoExtCallsRootMir` calling `ext::seed` then `ext::add_twenty`).
+- `canary_externalSummary_vc`, `canary_coercedExternalSummary_vc`, `canary_twoExternalCalls_vc`.
+- Genuine universally quantified symbolic VC (`symTrait_vc_narrow`, `∀ x : Nat`): symbolic
+  `x % 1000` flows through polymorphic `sym_poly::<u32>(_1)` (`AddUnchecked(_1, 7)`) and
+  trait-dispatched `<Circle as Area>::area(_0)` (`AddUnchecked(_1, 24)`) to return
+  `(x % 1000) + 31 : u32` (backed by `wpMirExecExt_step_tau`, `wpMirExecExt_step_ret`,
+  `stepMirState_assign_local`, and `evalRvalue_addUnchecked_u32`; verified non-trivial by a
+  meta-level `isDefEq` audit confirming `rfl` cannot reduce `Nat.ble 4294967296 ((x % 1000) + 7)`).
 - `coerceValueAt` is `@[irreducible]` (meta-level opacity audit) with `coerceValueAt_u32`,
   `coerceValueAt_bool`, `coerceValueAt_ref`, `coerceValueAt_adt_exact`, `coerceValueAt_idempotent`.
 
@@ -76,12 +99,34 @@
 - `evalDemandCallerLocation` draws ids from `nextFreshGlobalAndTagId = max nextAllocId nextTag` and
   advances both counters; `evalDemandCallerLocation_borrowAware_spec` /
   `canary_demandLocation_borrowTag_disjoint`: the new pointer is not shadowed by any live borrow tag.
-- General theorems over **all** call-site tables, **all** traces and all 8 policies (reads through
-  `readLocationFromGlobals`): `evalDemandCallerLocation_spec`, `runDemandCallerLocationTrace_spec`,
-  `eagerInitAux_spec`, `demandCallerLocation_bisim_eager`, `demandCallerLocation_no_call_zero_allocs`,
-  `eagerCallerLocation_clutter`, `allocRenamingRel_of_readLocations`.
-- `evalStmt_pure_memory_eq` / `normalStmtStep_eq_raw_of_pure`: on pure statements over frame-free
-  memory, `evalStmt` leaves `Memory` unchanged (so `normalStmtStep`'s frame re-assertion is a no-op).
+- General borrow-tag monotonicity and statement memory frame on **arbitrary** `Memory` (with live
+  borrows and active protectors):
+  - Tag preservation across all `Trusted` borrow transformers: `map_tag_disableLocalBorrows`,
+    `map_tag_attachBorrowProtector`, `map_tag_invalidateConflictingBorrows`,
+    `map_tag_invalidateConflictingBorrowsAtProj`, `map_tag_invalidateTreeBorrowsAtProj`,
+    `map_tag_freezeTreeBorrowsOnReadAtProj`, `map_tag_invalidateDerefWriteBorrows`,
+    `map_tag_invalidateDerefWriteBorrowsWithLayouts`.
+  - `MemBorrowMonotone`, `isLocalRefOrPureRvalue` (all `isBorrowFreePureRvalue` rvalues plus local
+    stack reference creation `Rvalue.ref borrowKind place`), `isBorrowMonotoneStmt` (covering
+    `.nop`, `.coverage`, `.constEvalCounter`, `.backwardIncompatibleDropHint`, `.placeMention`,
+    `.storageLive`, `.storageDead`, `.deinit`, all `.retag` variants `.fnEntry`/`.default`/`.twoPhase`/`.raw`,
+    all `.setDiscriminant` variants, `.intrinsic (.assume _)`, and `.assign` for all
+    `isLocalRefOrPureRvalue` rvalues).
+  - `evalRvalue_localRefOrPure_borrowMonotone`, `evalStmt_borrowMonotone_frame`,
+    `normalStmtStep_eq_raw_of_borrowMonotone` (`normalStmtStep` equals the raw `evalStmt` transition
+    for all `isBorrowMonotoneStmt` statements on arbitrary `Memory`), and `normalStmtStep_borrowMonotone`.
+- General trace-level theorems over **all** call-site tables, **all** traces, and all 8 policies:
+  - Through `readLocationFromGlobals`: `evalDemandCallerLocation_spec`,
+    `runDemandCallerLocationTrace_spec`, `eagerInitAux_spec`, `demandCallerLocation_bisim_eager`,
+    `demandCallerLocation_no_call_zero_allocs`, `eagerCallerLocation_clutter`,
+    `allocRenamingRel_of_readLocations`.
+  - Through borrow-aware `readLocationsBorrowAware` (`lookupBorrow` before `lookupGlobalAlloc`) across
+    any `traceBorrowMonotone` trace (including traces that mint new stack borrow tags via `Rvalue.ref`
+    and `Statement.retag` both before and after `caller_location`):
+    `runDemandCallerLocationTrace_borrow_monotone`, `eagerInitAux_borrow_monotone`,
+    `runEagerCallerLocationTrace_borrow_monotone`, `runDemandCallerLocationTrace_borrowAware_spec`,
+    and `demandCallerLocation_bisim_eager_borrowAware` (exercised on `protoBorrowMonotoneTrace` in
+    `test_partC_borrowMonotone_and_trace_borrowAware`).
 
 ### Part D — `LazyWriteChain` & total shifts
 - `mkLazyWrite w` (static width, `O(1)` per write); `eval_mkLazyWrite`, `eval_mkEagerWrite`,
@@ -100,54 +145,59 @@
 
 ## 2. Benchmarks (measured by `tests/mir/SparseRetagAndVcNarrowProtoTests.lean`)
 
-Methodology: both arms of every comparison use the same mechanism — `decide +kernel` for the
-execution/certificate tables, elaborator `rfl` for both VC-discharge arms, and the same `simp only`
-script shape for both coercion arms. `IO.getNumHeartbeats` deltas are deterministic; wall-clock
-(`IO.monoNanosNow`) is from the final receipt run and is noisy. Optimized arms include their one-time
-costs (index preparation, certificate checking, narrowing computation) unless labeled otherwise.
+Methodology: both arms of every comparison use the exact same mechanism — `decide +kernel` for the
+execution/certificate tables, elaborator `rfl` for both concrete VC-discharge arms, the identical
+step-by-step symbolic proof script (`wpMirExecExt_step_tau` + `stepMirState_assign_local` +
+`evalRvalue_addUnchecked_u32` + `omega`) for both symbolic `∀ x : Nat` VC arms, and the same
+`simp only` script shape for both coercion arms. `IO.getNumHeartbeats` deltas are deterministic;
+wall-clock (`IO.monoNanosNow`) is from the final receipt run and is noisy.
 
 ### 2.1 Part A — linear oracle vs. sparse index (`definitionCount = 512`)
 
 | Rows `M` | Linear oracle, 1 query | Sparse: prepare + 1 query | Sparse: prepare + `M` queries |
 | :--- | ---: | ---: | ---: |
-| 16 | `67,541` hb (`9.6` ms) | `146,852` hb (`22.8` ms) | `438,921` hb (`75.6` ms) |
-| 64 | `577,569` hb (`84.0` ms) | `634,328` hb (`109.8` ms) | `1,752,176` hb (`323.0` ms) |
-| 128 | `2,117,815` hb (`341.6` ms) | `1,420,921` hb (`249.7` ms) | `3,559,290` hb (`692.5` ms) |
-| 256 | `8,147,437` hb (`1,485.2` ms) | `3,226,248` hb (`592.9` ms) | `7,285,268` hb (`1,488.4` ms) |
+| 16 | `67,541` hb (`9.5` ms) | `146,852` hb (`23.4` ms) | `438,921` hb (`74.5` ms) |
+| 64 | `577,569` hb (`78.7` ms) | `634,328` hb (`107.5` ms) | `1,752,176` hb (`320.4` ms) |
+| 128 | `2,117,815` hb (`311.5` ms) | `1,420,921` hb (`239.2` ms) | `3,559,290` hb (`684.3` ms) |
+| 256 | `8,147,437` hb (`1,437.6` ms) | `3,226,248` hb (`594.1` ms) | `7,285,268` hb (`1,462.2` ms) |
 
 - The linear oracle's growth approaches 4× per doubling of `M` (3.7× from 64 to 128, 3.8× from 128 to
-  256). Including preparation, the sparse index is slower
-  for one query at `M = 16` (2.17× the linear cost), roughly even at `M = 64`, and faster at
-  `M = 128` (1.49×) and `M = 256` (2.53×).
-- All `256` sparse queries at `M = 256` (`7,285,268` hb) cost less than **one**
-  linear-oracle query (`8,147,437` hb). (All 256 linear queries were not measured.)
+  256). Including preparation, the sparse index is slower for one query at `M = 16` (2.17× the
+  linear cost), roughly even at `M = 64`, and faster at `M = 128` (1.49×) and `M = 256` (2.53×).
+- All `256` sparse queries at `M = 256` (`7,285,268` hb) cost fewer heartbeats than **one**
+  linear-oracle query (`8,147,437` hb).
 
 ### 2.2 Part B — full callee table vs. certified narrowing (trait call through `TraitImplEntry`)
 
 | Callees `M` | Full table run | Cert check (compute cone + mask, 1 `decide`) | Narrowed run (narrowing computed in-kernel) | Narrowed run (cached narrowed table) |
 | :--- | ---: | ---: | ---: | ---: |
-| 16 | `562,731` hb (`84.9` ms) | `1,623,911` hb (`226.6` ms) | `588,031` hb (`87.5` ms) | `451,995` hb (`69.3` ms) |
-| 64 | `670,407` hb (`97.1` ms) | `2,066,862` hb (`378.5` ms) | `781,843` hb (`274.3` ms) | `452,002` hb (`187.3` ms) |
-| 128 | `813,931` hb (`278.5` ms) | `2,657,364` hb (`746.3` ms) | `1,040,244` hb (`160.6` ms) | `451,991` hb (`70.9` ms) |
+| 16 | `562,764` hb (`92.1` ms) | `1,623,910` hb (`262.4` ms) | `588,016` hb (`98.9` ms) | `451,991` hb (`75.3` ms) |
+| 64 | `670,401` hb (`105.9` ms) | `2,066,850` hb (`332.1` ms) | `781,830` hb (`130.4` ms) | `451,993` hb (`76.9` ms) |
+| 128 | `813,908` hb (`121.7` ms) | `2,657,375` hb (`423.9` ms) | `1,040,216` hb (`172.7` ms) | `451,985` hb (`78.2` ms) |
 
 - The cached arm's literal table is proved equal (`rfl`) to the computed narrowing
   (`cachedNarrow_eq_computed_*`). Steady state at `M = 128`: 1.80× fewer heartbeats than the
   full table; recomputing the narrowing per run is slower than the full table, and the one-time
-  certificate costs ~3× a full run.
-- VC discharge by elaborator `rfl` (concrete inputs, `M = 128`; this is *not* a symbolic VC):
-  full table `3,861,964` hb (`377.1` ms) vs. cached narrowed table `2,160,519` hb (`212.9` ms)
+  certificate costs ~3.3× a full run.
+- Concrete VC discharge by elaborator `rfl` (`M = 128`):
+  full table `3,861,976` hb (`378.1` ms) vs. cached narrowed table `2,160,819` hb (`220.5` ms)
   (1.79×).
+- Universally quantified symbolic VC (`∀ x : Nat`, `symTraitRootMir` calling `sym_poly::<u32>` and
+  trait-dispatched `<Circle as Area>::area` with `AddUnchecked` overflow obligations, `M = 128`,
+  identical tactic script):
+  full table `5,779,471` hb (`710.3` ms) vs. cached narrowed table `4,584,286` hb (`445.0` ms)
+  (1.26× fewer heartbeats; saves `1,195,185` hb on a 2-call root body).
 - Coercion (`∀ bits`, 16 chained coercions, the same `simp only` script shape): sealed
-  `coerceValueAt` rewritten by `coerceValueAt_u32` `257,257` hb (`26.6` ms) vs. a reducible copy
-  unfolded by `dsimp`/`simp` `447,062` hb (`36.1` ms) (1.74×).
+  `coerceValueAt` rewritten by `coerceValueAt_u32` `257,291` hb (`28.2` ms) vs. a reducible copy
+  unfolded by `dsimp`/`simp` `447,108` hb (`36.0` ms) (1.74×).
 
 ### 2.3 Part C — eager pre-allocation vs. demand-time `Location` (same trace in both worlds)
 
 | Sites `S` | Eager, non-panicking (8 stmts) | Demand, non-panicking | Eager, panicking (1 invocation) | Demand, panicking |
 | :--- | ---: | ---: | ---: | ---: |
-| 16 | `129,855` hb (`20.2` ms) | `52,890` hb (`7.1` ms) | `237,094` hb (`35.1` ms) | `196,792` hb (`25.5` ms) |
-| 64 | `761,966` hb (`110.2` ms) | `52,886` hb (`6.9` ms) | `394,352` hb (`50.8` ms) | `196,795` hb (`24.5` ms) |
-| 128 | `2,507,956` hb (`370.3` ms) | `52,913` hb (`7.1` ms) | `625,521` hb (`81.1` ms) | `196,810` hb (`25.8` ms) |
+| 16 | `129,857` hb (`24.6` ms) | `52,891` hb (`7.4` ms) | `237,093` hb (`38.1` ms) | `196,723` hb (`27.1` ms) |
+| 64 | `761,973` hb (`114.4` ms) | `52,907` hb (`9.9` ms) | `394,371` hb (`76.7` ms) | `196,831` hb (`29.3` ms) |
+| 128 | `2,507,959` hb (`384.6` ms) | `52,918` hb (`6.9` ms) | `625,514` hb (`83.6` ms) | `196,780` hb (`28.2` ms) |
 
 - Demand cost is independent of `S`; the eager arm materializes `S + 1` globals (checked). Its
   super-linear growth is partly an artifact of the list-based `Memory.globals` model.
@@ -156,11 +206,11 @@ costs (index preparation, certificate checking, narrowing computation) unless la
 
 | Writes `N` | Eager (`mkEagerWrite`) | Lazy (`mkLazyWrite`) | Proved spine inspections (eager / lazy) |
 | :--- | ---: | ---: | ---: |
-| 16 | `121,652` hb (`16.4` ms) | `60,061` hb (`6.7` ms) | 136 / 16 |
-| 64 | `1,226,882` hb (`196.8` ms) | `113,425` hb (`20.5` ms) | 2080 / 64 |
-| 128 | `4,728,542` hb (`906.7` ms) | `183,994` hb (`26.2` ms) | 8256 / 128 |
+| 16 | `121,698` hb (`17.2` ms) | `60,065` hb (`7.1` ms) | 136 / 16 |
+| 64 | `1,226,840` hb (`191.3` ms) | `113,387` hb (`15.9` ms) | 2080 / 64 |
+| 128 | `4,728,554` hb (`921.7` ms) | `184,031` hb (`30.7` ms) | 8256 / 128 |
 
-- Wide-shift canary (`shift = 2^64`, six safe shifts, one `decide +kernel`): `140,110` hb (`9.9` ms).
+- Wide-shift canary (`shift = 2^64`, six safe shifts, one `decide +kernel`): `140,173` hb (`15.8` ms).
 
 ---
 
@@ -175,13 +225,22 @@ costs (index preparation, certificate checking, narrowing computation) unless la
   `canary_traitDispatch_preserved_under_batchedVcNarrow`, `canary_duplicateShadow_rejected` (the
   `[adv A0]` metadata check, kept as `checkCalleesAgreeOnLegacyA0`, accepts it),
   `canary_externalShadowsInternal_rejected`, `canary_missingTraitImplBody_rejected`,
-  `canary_keptBodyWithTraitImpl_accepted` + `test_partB_rustcStyle_narrow_run` (the mask-aware
-  certificate preserves the exact result `31`), `canary_externalSummary_vc`,
-  `canary_coercedExternalSummary_vc`, `test_partB_extCallInCone` (the real external call of
-  `protoExtCallRootMir` from a *proved* cone-safe state).
+  `canary_keptBodyWithTraitImpl_accepted` + `test_partB_rustcStyle_narrow_run`,
+  `canary_mixedTraitPartition_accepted` + `test_partB_mixed_trait_partition` (mixed keep/drop
+  partition where both `checkKeptCarryNoConeTraitImpls` and `checkMaskTraitPartition` are `false`,
+  certified by `BatchedVcConeNarrowCert.ofCheckGeneral`), `canary_externalSummary_vc`,
+  `canary_coercedExternalSummary_vc`, `test_partB_extCallInCone`,
+  `canary_twoExternalCalls_vc` + `test_partB_two_external_calls` (cone safety preserved across
+  `resumeExternalCall` to a second external call), `symTrait_vc_narrow` +
+  `test_partB_symbolic_trait_vc` (symbolic `∀ x : Nat` VC over polymorphic + trait-dispatched
+  `AddUnchecked` calls).
 - **Part C**: `demandCallerLocation_filename_dedup`, `canary_demandLocation_borrowTag_disjoint`,
   `trackCaller_span_owner_policy`, `trackCaller_stops_at_nonTrackCaller_frame`, bisimulation for all
-  8 policies on a trace with a repeated site, explicit `AllocRenamingRel`, `test_partC_stmt_pure_memory`.
+  8 policies on a trace with a repeated site, explicit `AllocRenamingRel`,
+  `test_partC_stmt_pure_memory`, and `test_partC_borrowMonotone_and_trace_borrowAware` (full
+  borrow-aware bisimulation through `readLocationsBorrowAware` across `protoBorrowMonotoneTrace`,
+  which mints stack borrows via `Rvalue.ref` and `Statement.retag` both before and after
+  `caller_location`).
 - **Part D**: OOB fold, same-address collapse, distinct-address `O(1)` stop, top-write read in one
   step, `2^64` shift.
 
@@ -198,36 +257,58 @@ costs (index preparation, certificate checking, narrowing computation) unless la
 - `[adv A1]` (agent-a): adaptive trie depth; `Trusted` write transition for implicit writes; masked
   hoisting for kept impl bodies; borrow-aware `Location` ids; `stepMirFn_extCallInCone`; pure-statement
   frame theorem; read-step counter.
-- `[adv B2]` (agent-b) fixed in A1: test instances that proved `3 = 3` / `7 = 7` to "reach" the
-  injectivity theorems; tests whose statements *assumed* the very hypotheses they should discharge
-  (`h_safe`, `h_step`, `hstep`, and two of B1's own); a "symbolic VC" benchmark whose `∀ x` was
-  never read by the program (now relabeled elaborator-`rfl` discharge on concrete inputs); a
-  coercion benchmark comparing a pre-proved lemma against `simp` (now the same `simp` script shape);
-  the false claim `fnEntryRetagPerm .mut ty = .cell` and the spec-unfaithful `.cell` exception
-  (removed; V2026_08_01 / MiniRust activate every protected `&mut` under implicit writes); the
-  overclaimed "GO / all conditions closed". The audit now rejects undischarged conditional tests.
+- `[adv B2]` (agent-b): replaced vacuous `3 = 3` / `7 = 7` reachability tests with a `D = 5000`
+  adaptive-depth test; discharged all conditional test hypotheses and added `isConditionalThm` to the
+  audit; removed the false `.cell` special case in `applyImplicitWriteUpgrade` and proved
+  `fnEntryRetagPerm_mut`; relabeled the concrete `rfl` VC and `simp` coercion benchmarks; and
+  documented the remaining conditions.
+- `[adv A2]` (agent-a):
+  1. Proved `collectMatchingTraitImpls_append_of_subset` and `traitFilterCovers_hoist_selectByMask`
+     and added `checkBatchedVcConeNarrowCertGeneral` + `BatchedVcConeNarrowCert.ofCheckGeneral` +
+     `canary_mixedTraitPartition_accepted`, removing the partitionability restriction on trait hoisting.
+  2. Proved `closedInvPoly_resumeExternalCall` and `stepConeSafeTrait_of_resumeExternalCall` under
+     `AnsPreservesCodeFrame` and added `canary_twoExternalCalls_vc` over a 2-call external root body.
+  3. Added `symTrait_vc_narrow` (`∀ x : Nat`) and `PartB_symVC_{full,narrowCached}_M128` over
+     polymorphic + trait-dispatched `AddUnchecked` calls with a meta-level `isDefEq` non-reducibility
+     audit.
+  4. Proved tag preservation across all `Trusted` borrow transformers, `evalStmt_borrowMonotone_frame`,
+     `normalStmtStep_eq_raw_of_borrowMonotone`, `runDemandCallerLocationTrace_borrowAware_spec`, and
+     `demandCallerLocation_bisim_eager_borrowAware` on arbitrary `Memory` with live borrows and
+     protectors (`test_partC_borrowMonotone_and_trace_borrowAware`).
 
 ---
 
 ## 5. Conditions for Track A Promotion
 
-1. **`allocId` / borrow-tag namespace — partially closed.** A fresh `Location` avoids all live tags
-   and tags drawn later from the advanced `nextTag`; the trace-level bisimulation still reads through
-   `readLocationFromGlobals`, because statement-level tag monotonicity (`evalStmt` only draws tags
-   from `nextTag`) is unproved.
+1. **`allocId` / borrow-tag namespace — closed for `traceBorrowMonotone` traces.**
+   `runDemandCallerLocationTrace_borrowAware_spec` and `demandCallerLocation_bisim_eager_borrowAware`
+   prove that returned `Location` pointers read through `readLocationsBorrowAware` (`lookupBorrow`
+   before `lookupGlobalAlloc`) in the final memory match `CallerLocationSite.resolve` and bisimulate
+   the eager world across traces that mint new stack borrow tags both before and after
+   `caller_location`. *Track A residual*: extend `isBorrowMonotoneStmt` to `copy_nonoverlapping` and
+   unsizing / fn-ptr cast rvalues (`evalUnsizeCoercion`, `evalUnsafeFnPointer`).
 2. **Implicit writes — closed for the overlay's scope.** The fresh child is written with the
-   `Trusted` write transition and UB checks; V2026_06_01 has no native implicit writes, so this
-   remains an overlay to be reconciled with V2026_08_01's `initProtectedReborrowPerm`.
-3. **Statement frame in Part C — partially closed.** Proved for pure statements on frame-free
-   memory; for general statements `normalStmtStep` still re-asserts `globals` / `nextAllocId`.
-4. **Trie depth — closed** (adaptive depth + bit-path injectivity, concretely exercised at `D = 5000`).
-5. **External calls — partially closed.** `stepMirFn_extCallInCone` covers calls emitted from
-   cone-safe states; after an external call the answer supplies the memory, so whole-execution use
-   of unfiltered summaries remains unproved and the VC keeps filtering summaries by cone.
-6. **Hoisting — closed for partitionable layouts.** A cone path whose `TraitImplEntry`s live in both
-   kept and dropped bodies still fails closed.
-7. **Symbolic payoff — open.** Neither cone narrowing nor coercion sealing has been measured on
-   symbolic VCs (§2.2 measures concrete-input discharge only).
+   `Trusted` write transition and UB checks; reconcile with V2026_08_01's `initProtectedReborrowPerm`
+   on schema bump.
+3. **Statement frame in Part C — closed for `isBorrowMonotoneStmt` on arbitrary `Memory`.**
+   `evalStmt_borrowMonotone_frame` and `normalStmtStep_eq_raw_of_borrowMonotone` cover all
+   non-intrinsic statements and all `isLocalRefOrPureRvalue` assignments (including `&_1` / `&mut _1`)
+   with live borrows and protectors. *Track A residual*: `copy_nonoverlapping` and unsizing / fn-ptr
+   cast rvalues.
+4. **Trie depth — closed** (`adaptiveRetagTrieDepth` + `adaptiveRetagTrieDepth_bitPath_injective`,
+   exercised at `D = 5000`).
+5. **External calls — closed for code-frame-preserving external answers.**
+   `closedInvPoly_resumeExternalCall` and `stepConeSafeTrait_of_resumeExternalCall` prove that
+   `ClosedInvPoly` and `StepConeSafeTrait` survive `resumeExternalCall` under `AnsPreservesCodeFrame`
+   (`canary_twoExternalCalls_vc`). *Track A residual*: thread `AnsPreservesCodeFrame` into
+   `MirLiftCore.lean`'s `MirCallContract` so whole-execution `wpMirExecExt` can omit per-site `inCone`
+   summary filtering when all contracts preserve the code frame.
+6. **Hoisting — closed** (`checkBatchedVcConeNarrowCertGeneral` + `BatchedVcConeNarrowCert.ofCheckGeneral`
+   + `traitFilterCovers_hoist_selectByMask` handle arbitrary keep/drop masks including mixed trait
+   partitions).
+7. **Symbolic payoff — closed on the prototype (`1.26×` on `symTrait_vc_narrow` at `M = 128`,
+   `1.74×` on `coerceValueAt`).** *Track A residual*: benchmark end-to-end on production
+   `cargo anneal` multi-function crate VCs.
 
 ### Proposed 2-Episode Track A Plan
 1. `ep1`: Part A and Part D into `theory/Anneal/SparseRetagAndVcNarrow.lean` (conditions 2, 4).
