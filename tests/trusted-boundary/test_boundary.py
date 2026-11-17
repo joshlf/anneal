@@ -1711,6 +1711,117 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         ):
             specs_ws.write_text(vacuous_spec)
             expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "vacuous `False` precondition")
+        # `[adv ep2-A3]`: Positional `⟨...⟩` / `.mk` constructors, `with` struct updates,
+        # local `def pre := False` / `def wrap (P : Prop) : Prop := P` indirection,
+        # `def True : Prop := _root_.False` / `def refineSpec` shadowing, `open ... renaming`,
+        # and propositional/equality contradictions (`¬ True`, `0 = 1`, `True → False`,
+        # `True ↔ False`, `args ≠ args`) in `Specs` all fail closed.
+        for bad_spec_ep2_a3, expected_sub in (
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "instance : ItemSpec \"demo::item_1\" := ⟨fun _ => False, fun _ _ => True⟩\n"
+                "end Specs.Demo.item_1\n",
+                "positional constructors and `with` struct updates are forbidden",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "instance : ItemSpec \"demo::item_1\" := ItemSpec.mk (fun _ => False) (fun _ _ => True)\n"
+                "end Specs.Demo.item_1\n",
+                "positional constructors and `with` struct updates are forbidden",
+            ),
+            (
+                "import Trusted\nimport Obligations.Demo.item_1\nnamespace Specs.Demo.item_1\n"
+                "instance : ItemSpec \"demo::item_1\" := { Obligations.Demo.item_1.defaultSpec with pre := fun _ => False }\n"
+                "end Specs.Demo.item_1\n",
+                "`with` struct updates",
+            ),
+            (
+                "import Trusted\nimport Obligations.Demo.item_1\nnamespace Specs.Demo.item_1\n"
+                "instance : ModularItemSpec \"demo::item_1\" := { Obligations.Demo.item_1.defaultModularSpec with "
+                "envAssumed := Obligations.Demo.item_1.defaultModularSpec.envAssumed, pre := fun _ _ => False }\n"
+                "end Specs.Demo.item_1\n",
+                "`with` struct updates",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "def pre (args : List Value) : Prop := False\n"
+                "def post (args : List Value) (ret : Value) : Prop := True\n"
+                "instance : ItemSpec \"demo::item_1\" where\n  pre := pre\n  post := post\n"
+                "end Specs.Demo.item_1\n",
+                "vacuous `False` precondition",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "def wrap (P : Prop) : Prop := P\n"
+                "instance : ItemSpec \"demo::item_1\" where\n  pre := fun _ => wrap False\n  post := fun _ _ => True\n"
+                "end Specs.Demo.item_1\n",
+                "vacuous `False` precondition",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "def True : Prop := _root_.False\n"
+                "instance : ItemSpec \"demo::item_1\" where\n  pre := fun _ => True\n  post := fun _ _ => True\n"
+                "end Specs.Demo.item_1\n",
+                "shadows reserved identifier `True`",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "def refineSpec (p : List Value → Prop) (q : List Value → Value → Prop) : Nat := 0\n"
+                "end Specs.Demo.item_1\n",
+                "references `refineSpec` inside `def`",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "def customSpec : ItemSpec \"demo::item_1\" where\n"
+                "  pre := fun _ => False\n  post := fun _ _ => True\n"
+                "end Specs.Demo.item_1\n",
+                "references specification class `ItemSpec` inside `def`",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "open Trusted.VerificationResult renaming ItemSpec -> MySpec\n"
+                "end Specs.Demo.item_1\n",
+                "`open ... renaming` is not supported",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "instance : ItemSpec \"demo::item_1\" where\n  pre := fun _ => ¬ True\n  post := fun _ _ => True\n"
+                "end Specs.Demo.item_1\n",
+                "vacuous `False` precondition",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "instance : ItemSpec \"demo::item_1\" where\n  pre := fun _ => 0 = 1\n  post := fun _ _ => True\n"
+                "end Specs.Demo.item_1\n",
+                "vacuous `False` precondition",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "instance : ItemSpec \"demo::item_1\" where\n  pre := fun _ => True → False\n  post := fun _ _ => True\n"
+                "end Specs.Demo.item_1\n",
+                "vacuous `False` precondition",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "instance : ItemSpec \"demo::item_1\" where\n  pre := fun _ => True ↔ False\n  post := fun _ _ => True\n"
+                "end Specs.Demo.item_1\n",
+                "vacuous `False` precondition",
+            ),
+            (
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "instance : ItemSpec \"demo::item_1\" where\n  pre := fun args => args ≠ args\n  post := fun _ _ => True\n"
+                "end Specs.Demo.item_1\n",
+                "vacuous `False` precondition",
+            ),
+            (
+                "import Trusted\nimport Mir.Demo.unregistered_rogue\nnamespace Specs.Demo.item_1\n"
+                "instance : ItemSpec \"demo::item_1\" where\n  pre := fun _ => True\n  post := fun _ _ => True\n"
+                "end Specs.Demo.item_1\n",
+                "Mir/Demo/unregistered_rogue.lean` is missing or unregistered",
+            ),
+        ):
+            specs_ws.write_text(bad_spec_ep2_a3)
+            expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", expected_sub)
         specs_ws.unlink()
         ver_ws.write_text(ver_claim)
 

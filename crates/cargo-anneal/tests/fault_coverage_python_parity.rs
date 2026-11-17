@@ -1855,11 +1855,90 @@ print(f"REAL_MIR_CENSUS_PARITY_OK {{len(cases)}}")
         "Proof ItemSpec smuggling",
         "specification override instance",
     );
+    // `[adv ep2-A3]`: `@[macro]` and `#eval` in `Proof/<Item>.lean` fail closed.
+    for (bad_proof_src, expected_sub) in [
+        (
+            "import Trusted\nimport Obligations.CrateA.calls_local_helper\n\
+             namespace Proof.CrateA.calls_local_helper\n\
+             @[macro Lean.Parser.Term.app] def h : Nat := 0\n\
+             end Proof.CrateA.calls_local_helper\n",
+            "disallowed `@[macro]` attribute",
+        ),
+        (
+            "import Trusted\nimport Obligations.CrateA.calls_local_helper\n\
+             namespace Proof.CrateA.calls_local_helper\n\
+             #eval (pure () : IO Unit)\n\
+             end Proof.CrateA.calls_local_helper\n",
+            "disallowed meta command `#eval`",
+        ),
+    ] {
+        fs::write(&proof_calls_helper_path, bad_proof_src).expect("write bad Proof");
+        assert_audit_rejects(
+            &check_trusted_py,
+            &crate_a,
+            "Proof meta attribute/command smuggling",
+            expected_sub,
+        );
+    }
     fs::write(&verify_calls_helper_path, &verify_calls_helper_orig).expect("restore Verify");
     match proof_calls_helper_orig {
         Some(orig) => fs::write(&proof_calls_helper_path, orig).expect("restore Proof"),
         None => {
             let _ = fs::remove_file(&proof_calls_helper_path);
+        }
+    }
+
+    // `[adv ep2-A3]`: Positional `⟨...⟩` / `with` struct-update / local `def pre := False`
+    // vacuity bypasses in `Specs/<Item>.lean` fail closed.
+    let specs_ch_path = crate_a.join("anneal/proofs/Specs/CrateA/calls_local_helper.lean");
+    let specs_ch_orig = specs_ch_path.is_file().then(|| read(&specs_ch_path));
+    if !verify_calls_helper_orig.contains("import Specs.CrateA.calls_local_helper") {
+        fs::write(
+            &verify_calls_helper_path,
+            verify_calls_helper_orig.replacen(
+                "import Trusted\n",
+                "import Trusted\nimport Specs.CrateA.calls_local_helper\n",
+                1,
+            ),
+        )
+        .expect("import Specs in Verify");
+    }
+    for (bad_specs_src, expected_sub) in [
+        (
+            "import Trusted\nnamespace Specs.CrateA.calls_local_helper\n\
+             instance : ItemSpec \"crate_a::calls_local_helper\" := ⟨fun _ => False, fun _ _ => True⟩\n\
+             end Specs.CrateA.calls_local_helper\n",
+            "positional constructors and `with` struct updates are forbidden",
+        ),
+        (
+            "import Trusted\nimport Obligations.CrateA.calls_local_helper\n\
+             namespace Specs.CrateA.calls_local_helper\n\
+             instance : ItemSpec \"crate_a::calls_local_helper\" := { Obligations.CrateA.calls_local_helper.defaultSpec with pre := fun _ => False }\n\
+             end Specs.CrateA.calls_local_helper\n",
+            "`with` struct updates",
+        ),
+        (
+            "import Trusted\nnamespace Specs.CrateA.calls_local_helper\n\
+             def pre (args : List Value) : Prop := False\n\
+             def post (args : List Value) (ret : Value) : Prop := True\n\
+             instance : ItemSpec \"crate_a::calls_local_helper\" where\n  pre := pre\n  post := post\n\
+             end Specs.CrateA.calls_local_helper\n",
+            "vacuous `False` precondition",
+        ),
+    ] {
+        fs::write(&specs_ch_path, bad_specs_src).expect("write bad Specs");
+        assert_audit_rejects(
+            &check_trusted_py,
+            &crate_a,
+            "Specs positional/with/local-def vacuity bypass",
+            expected_sub,
+        );
+    }
+    fs::write(&verify_calls_helper_path, &verify_calls_helper_orig).expect("restore Verify");
+    match specs_ch_orig {
+        Some(orig) => fs::write(&specs_ch_path, orig).expect("restore Specs"),
+        None => {
+            let _ = fs::remove_file(&specs_ch_path);
         }
     }
 

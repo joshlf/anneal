@@ -2751,7 +2751,12 @@ fn extract_external_callee_def_paths_from_obligations(
                 callee_mir_path.display()
             ));
         }
-        validate_sibling_obligations_module(&callee_ob_text, callee_suffix, &cbody.def_path)?;
+        validate_sibling_obligations_module(
+            &callee_ob_text,
+            callee_suffix,
+            &cbody.def_path,
+            mir_root,
+        )?;
         if !out.contains(&cbody.def_path) {
             out.push(cbody.def_path);
         }
@@ -2770,6 +2775,54 @@ fn extract_external_callee_def_paths_from_obligations(
     Ok(out)
 }
 
+/// `[adv ep2-A3]` Verify that every `__anodized_fn_requires_*` / `__anodized_fn_ensures_*`
+/// companion evaluated in `defaultPre`/`defaultPost`/`defaultPreFor`/`defaultPostFor` or
+/// `externalSpecCallContract` carries `ContractRole::Requires(owner)` /
+/// `ContractRole::Ensures(owner)` for its respective owner `defPath`.
+fn validate_obligations_companion_bindings(
+    ob_label: &str,
+    owner_def_path: &str,
+    links: &fault_census::ObligationsCalleeLinks,
+    mir_root: &Path,
+) -> Result<(), String> {
+    for cb in &links.companion_bindings {
+        let comp_path = mir_root.join(module_suffix_to_rel_path(&cb.companion_mir_suffix));
+        let comp_src = fs::read_to_string(&comp_path).map_err(|err| {
+            format!(
+                "{} in {ob_label} evaluates companion `Mir.{}.body`, but `Mir/{}.lean` is missing: {err}",
+                cb.context,
+                cb.companion_mir_suffix,
+                cb.companion_mir_suffix.replace('.', "/")
+            )
+        })?;
+        let comp_meta = fault_census::parse_lean_mir_module_metadata_strict(&comp_src).map_err(
+            |err| {
+                format!(
+                    "MIR fault-census scan error in companion `Mir.{}` referenced by {ob_label}: {err}",
+                    cb.companion_mir_suffix
+                )
+            },
+        )?;
+        let owner = cb
+            .expected_owner_def_path
+            .as_deref()
+            .unwrap_or(owner_def_path);
+        let role_ok = match (&comp_meta.role, cb.is_ensures) {
+            (fault_census::ProtoContractRole::Requires(r), false) => r == owner,
+            (fault_census::ProtoContractRole::Ensures(r), true) => r == owner,
+            _ => false,
+        };
+        if !role_ok {
+            let exp_kind = if cb.is_ensures { "ensures" } else { "requires" };
+            return Err(format!(
+                "{} in {ob_label} evaluates companion `Mir.{}.body` whose role is `{:?}` instead of `ContractRole.{exp_kind} \"{owner}\"`",
+                cb.context, cb.companion_mir_suffix, comp_meta.role
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `[adv ep1-B4]` Verify that a referenced sibling `.anneal/generated/Obligations/<Callee>.lean`
 /// module defines canonical claims for `callee_suffix` bound to `Mir.<Callee>.body`,
 /// `defaultCallees`, and `callee_def_path` (rejecting forged stubs or detached sibling claims).
@@ -2777,6 +2830,7 @@ fn validate_sibling_obligations_module(
     callee_ob_text: &str,
     callee_suffix: &str,
     callee_def_path: &str,
+    mir_root: &Path,
 ) -> Result<(), String> {
     let _ = extract_default_callee_suffixes_from_obligations(callee_ob_text)
         .map_err(|err| format!("sibling Obligations.{callee_suffix}: {err}"))?;
@@ -2807,6 +2861,12 @@ fn validate_sibling_obligations_module(
         callee_ob_text,
         callee_suffix,
         Some(callee_def_path),
+    )?;
+    validate_obligations_companion_bindings(
+        &format!("sibling Obligations.{callee_suffix}"),
+        callee_def_path,
+        &clinks,
+        mir_root,
     )
 }
 
@@ -3281,6 +3341,14 @@ fn reconcile_subject_by_suffix(
     ) {
         return fail_with_cert(cert_info, err);
     }
+    if let Err(err) = validate_obligations_companion_bindings(
+        &format!("Obligations module for {suffix}"),
+        &subject_meta.body.def_path,
+        &links,
+        &mir_root,
+    ) {
+        return fail_with_cert(cert_info, err);
+    }
     let ob_explicit_external = match extract_external_callee_def_paths_from_obligations(
         suffix,
         &links,
@@ -3356,6 +3424,7 @@ fn reconcile_subject_by_suffix(
                         &callee_ob_text,
                         callee_suffix,
                         &cbody.def_path,
+                        &mir_root,
                     ) {
                         return fail_with_cert(cert_info, err);
                     }
