@@ -878,7 +878,8 @@ fn canonical_zst_value_within(
 /// (`InactiveUnionField`), every inhabited zero-sized field reads its unique value, and a
 /// whole-value copy is defined, exactly as for uninitialized union storage in Miri and
 /// `Trusted.MirSemantics` (`kani#5176`; `AdtAndControl.lean`'s
-/// `kani5176_uninit_storage_zst_field` and `kani5176_uninit_storage_int_field_ub`).
+/// `kani5176_uninit_storage_zst_field`, `kani5176_uninit_storage_zst_subProj`, and
+/// `kani5176_uninit_storage_int_field_ub`).
 ///
 /// `None` for every other type (including legacy tuple-modeled unions, which carry no
 /// union definition, unions without an inhabited zero-sized field, and types without any
@@ -6115,11 +6116,12 @@ fn project_mir_value<'a>(
 /// bytes).
 ///
 /// An uninhabited field or container (`!`, `Infallible`, `(Infallible, ())`, `[Infallible; 1]`,
-/// `ManuallyDrop<Infallible>`) yields `Ok(None)`, so the read fails with `InactiveUnionField`:
-/// `readProjectedValueUnionAware` faults with `.ub` on every 0-byte read of an uninhabited
-/// field, through an uninhabited container (`subProjTouchesUninhabited`, e.g.
-/// `(Infallible, ()).1`), or of an uninhabited leaf (`kani#5159`; `AdtAndControl.lean`'s
-/// `readUnion_zeroByte_root_ub_iff` and `readUnion_zeroByte_subProj_iff`).
+/// `ManuallyDrop<Infallible>`, `(Infallible, u32)`) yields `Ok(None)`, so the read fails with
+/// `InactiveUnionField`: `readProjectedValueUnionAware` faults with `.ub` on every read of an
+/// uninhabited field, through an uninhabited container (`subProjTouchesUninhabited`, e.g.
+/// `(Infallible, ()).1` or `(Infallible, u32).1`), or of an uninhabited leaf (`kani#5159`;
+/// `AdtAndControl.lean`'s `readUnion_zeroByte_root_ub_iff`, `readUnion_zeroByte_subProj_iff`,
+/// `kani5159_uninhabited_subProj_ub`, and `readUnion_posLeaf_subProj`).
 fn resolve_inactive_union_zst_subplace<'a, F>(
     field_ty: &'a Ty,
     rest: &'a [ProjectionElem],

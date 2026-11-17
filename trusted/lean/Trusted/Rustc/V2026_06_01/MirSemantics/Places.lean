@@ -8428,12 +8428,23 @@ def subProjTouchesUninhabited
         match fromEnd with
         | true => Nat.sub arrLen toIdx
         | false => toIdx
+      let subLen := Nat.sub endIdx fromIdx
       let subTy : Ty :=
-        { kind := .array ek (Nat.sub endIdx fromIdx)
-          layoutIdx := unresolvedLayoutIdx layouts }
+        match Nat.beq subLen arrLen with
+        | true => rCur
+        | false =>
+          resolveTyWithLocalDecls
+            localDecls
+            layouts
+            { kind := .array ek subLen
+              layoutIdx := unresolvedLayoutIdx layouts }
+      let nextArrTy : Ty :=
+        match rest with
+        | .constantIndex _ _ _ :: _ => rCur
+        | _ => subTy
       Bool.or
         (tyIsUninhabited layouts subTy)
-        (subProjTouchesUninhabited localDecls layouts subTy rest)
+        (subProjTouchesUninhabited localDecls layouts nextArrTy rest)
     | _ => false
   | _, _ => false
 
@@ -8448,12 +8459,13 @@ union byte-reinterpretation semantics:
   for direct sub-projections (or `[0 .. sizeof(fieldTy))` at the field root),
   and decodes via `decodeTypedValueFromBytes` (faulting with `.ub` on `.uninit`
   or bit-invalid bytes).
-- A 0-byte read through such a slot (a 0-byte field at the field root, or a
-  0-byte statically bounded sub-place of any field) reads no storage: it faults
-  with `.ub` when the accessed field, a container along the sub-projection
-  (`subProjTouchesUninhabited`), or the 0-byte leaf is uninhabited
-  (`tyIsUninhabited`), since no value of an uninhabited type exists (kani#5159);
-  otherwise it yields the leaf's unique value decoded from zero bytes. A
+- A statically bounded sub-projection through an uninhabited field, an
+  uninhabited container (`subProjTouchesUninhabited`), or to an uninhabited leaf
+  (`tyIsUninhabited`) faults with `.ub` (kani#5159), whether the leaf is 0-byte,
+  positive-sized (e.g. `(Infallible, u32).1`), or an uninhabited tuple whose
+  layout `tyByteSize` rejects (e.g. `v.p` with `p : (Infallible, ())`). An
+  inhabited 0-byte read (at the field root or at a statically bounded sub-place)
+  reads no storage and yields the leaf's unique value decoded from zero bytes. A
   field-root read of an uninhabited field whose size `tyByteSize` does not
   determine (an uninhabited tuple such as `(Infallible, ())`) faults with `.ub`
   as well; any other undetermined size is `.unsupported`.
@@ -8592,42 +8604,45 @@ def readProjectedValueUnionAware
                     resolveProjectedTyResolved localDecls layouts rFieldTy normRest
                   with
                   | .some subOff, .some leafTy =>
-                    match tyByteSize localDecls layouts leafTy with
-                    | .none => .none
-                    | .some 0 =>
-                      -- A 0-byte leaf occupies no storage, so its bytes cannot
-                      -- fault; it is UB exactly when the accessed field, some
-                      -- container along the sub-projection, or the leaf itself
-                      -- is uninhabited (no value of that type exists, kani#5159).
-                      match
-                        Bool.or
-                          (tyIsUninhabited layouts rFieldTy)
-                          (Bool.or
-                            (subProjTouchesUninhabited localDecls layouts rFieldTy normRest)
-                            (tyIsUninhabited layouts leafTy))
-                      with
-                      | true => .some .ub
-                      | false =>
+                    -- A sub-projection through an uninhabited field, an
+                    -- uninhabited container along the sub-projection, or to an
+                    -- uninhabited leaf has no value to read (kani#5159),
+                    -- whether the leaf is 0-byte, positive-sized (e.g.
+                    -- `(Infallible, u32).1`), or an uninhabited tuple whose
+                    -- layout `tyByteSize` rejects (e.g. `v.p` with
+                    -- `p : (Infallible, ())`).
+                    match
+                      Bool.or
+                        (tyIsUninhabited layouts rFieldTy)
+                        (Bool.or
+                          (subProjTouchesUninhabited localDecls layouts rFieldTy normRest)
+                          (tyIsUninhabited layouts leafTy))
+                    with
+                    | true => .some .ub
+                    | false =>
+                      match tyByteSize localDecls layouts leafTy with
+                      | .none => .none
+                      | .some 0 =>
                         let zv :=
                           match decodeTypedValueFromBytes defaultCodecFuel layouts leafTy .nil with
                           | .some v0 => v0
                           | .none => .unit
                         .some (.ok zv)
-                    | .some (.succ leafPred) =>
-                      let leafSz := .succ leafPred
-                      match
-                        encodeByLayoutIdxAux 8 layouts rBase.layoutIdx (.aggregate 0 fields)
-                      with
-                      | .none => .some .ub
-                      | .some unionBytes =>
-                        match sliceAbstractBytes unionBytes subOff leafSz with
+                      | .some (.succ leafPred) =>
+                        let leafSz := .succ leafPred
+                        match
+                          encodeByLayoutIdxAux 8 layouts rBase.layoutIdx (.aggregate 0 fields)
+                        with
                         | .none => .some .ub
-                        | .some leafSlice =>
-                          match
-                            decodeTypedValueFromBytes defaultCodecFuel layouts leafTy leafSlice
-                          with
-                          | .some leafVal => .some (.ok leafVal)
+                        | .some unionBytes =>
+                          match sliceAbstractBytes unionBytes subOff leafSz with
                           | .none => .some .ub
+                          | .some leafSlice =>
+                            match
+                              decodeTypedValueFromBytes defaultCodecFuel layouts leafTy leafSlice
+                            with
+                            | .some leafVal => .some (.ok leafVal)
+                            | .none => .some .ub
                   | _, _ => .none
           match directSubReadOpt with
           | .some res => res

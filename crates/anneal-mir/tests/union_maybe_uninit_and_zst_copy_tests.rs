@@ -2844,18 +2844,26 @@ fn infallible() -> Ty {
 
 /// `union K5159 { val: u32, inf: Infallible, pair: (Infallible, ()), arr1: [Infallible; 1],
 /// md: ManuallyDrop<Infallible>, phantom: PhantomData<Infallible>, arr0: [Infallible; 0],
-/// zarr: [(); 3], v: V, mu: MaybeUninit<Infallible> }` with `union V { p: (Infallible, ()),
-/// y: () }`, mirroring `AdtAndControl.lean`'s `kani5159_witness_reads`: `Trusted.MirSemantics`'
-/// `readProjectedValueUnionAware` faults with `.ub` on every 0-byte read of an uninhabited
-/// field, or through an uninhabited container (`subProjTouchesUninhabited`), and decodes every
-/// other 0-byte field or sub-place from zero bytes.
+/// zarr: [(); 3], v: V, mu: MaybeUninit<Infallible>, pair_u32: (Infallible, u32),
+/// void_arr0: [CustomVoid; 0], void_arr1: [CustomVoid; 1], void_pair: (CustomVoid, ()),
+/// arr2_v: [V; 2], v4: V4 }` with `union V { p: (Infallible, ()), y: () }` and
+/// `union V4 { p: (Infallible, u32), x: u32 }`, mirroring `AdtAndControl.lean`'s
+/// `kani5159_witness_reads`: `Trusted.MirSemantics`' `readProjectedValueUnionAware` faults with
+/// `.ub` on every read of an uninhabited field, or through an uninhabited container
+/// (`subProjTouchesUninhabited`, whether the leaf is 0-byte or positive-sized as in
+/// `(Infallible, u32).1`), and decodes every inhabited 0-byte field or sub-place from zero
+/// bytes.
 #[test]
 fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
     let inf = infallible();
+    let custom_void = adt(AdtDef::new_enum("CustomVoid", None, vec![])).1;
     let pair = Ty::Tuple(vec![inf.clone(), unit()]);
+    let pair_u32 = Ty::Tuple(vec![inf.clone(), u32_ty()]);
+    let void_pair = Ty::Tuple(vec![custom_void.clone(), unit()]);
     let (_, md_ty) = manually_drop(inf.clone());
     let (phantom_def, phantom_ty) = adt(AdtDef::new_struct("core::marker::PhantomData", vec![]));
     let (v_def, v_ty) = adt(AdtDef::new_union("V", vec![pair.clone(), unit()]));
+    let (_, v4_ty) = adt(AdtDef::new_union("V4", vec![pair_u32.clone(), u32_ty()]));
     let mu = MaybeUninitTy::new(inf.clone());
     let fields = vec![
         u32_ty(),
@@ -2866,8 +2874,14 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
         phantom_ty,
         arr(inf.clone(), 0),
         arr(unit(), 3),
-        v_ty,
+        v_ty.clone(),
         mu.ty.clone(),
+        pair_u32.clone(),
+        arr(custom_void.clone(), 0),
+        arr(custom_void.clone(), 1),
+        void_pair.clone(),
+        arr(v_ty.clone(), 2),
+        v4_ty,
     ];
     let (u_def, u_ty) = adt(AdtDef::new_union("K5159", fields.clone()));
     let f = |idx: usize| field(idx, fields[idx].clone());
@@ -2884,8 +2898,9 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
             })
         };
         // Inhabited zero-sized fields read their unique value, also when built from
-        // `Infallible` (`PhantomData<Infallible>`, `[Infallible; 0]`) and inside the
-        // inhabited zero-sized union `V` (whose unique value has `y` active).
+        // `Infallible` or `CustomVoid` (`PhantomData<Infallible>`, `[Infallible; 0]`,
+        // `[CustomVoid; 0]`) and inside the inhabited zero-sized union `V` (whose unique value
+        // has `y` active).
         assert_eq!(
             state.read_place(&proj(0, vec![f(5)])),
             Ok(MirValue::adt(&phantom_def, 0, vec![]))
@@ -2895,6 +2910,13 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
             Ok(MirValue::Array {
                 elements: vec![],
                 elem_ty: inf.clone(),
+            })
+        );
+        assert_eq!(
+            state.read_place(&proj(0, vec![f(11)])),
+            Ok(MirValue::Array {
+                elements: vec![],
+                elem_ty: custom_void.clone(),
             })
         );
         assert_eq!(state.read_place(&proj(0, vec![f(7)])), Ok(units(3)));
@@ -2911,11 +2933,27 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
             Ok(MirValue::Unit)
         );
         assert_eq!(
+            state.read_place(&proj(
+                0,
+                vec![
+                    f(14),
+                    ProjectionElem::Subslice {
+                        from: 0,
+                        to: 1,
+                        from_end: true,
+                    },
+                    cidx(0, 1),
+                    field(1, unit()),
+                ]
+            )),
+            Ok(MirValue::Unit)
+        );
+        assert_eq!(
             state.read_place(&proj(0, vec![f(9), mu.uninit_field()])),
             Ok(MirValue::Unit)
         );
-        // Uninhabited zero-sized fields have no value: reading one is undefined behavior.
-        for idx in [1, 2, 3, 4] {
+        // Uninhabited fields have no value: reading one is undefined behavior.
+        for idx in [1, 2, 3, 4, 10, 12, 13] {
             assert_eq!(
                 state.read_place(&proj(0, vec![f(idx)])),
                 inactive(idx),
@@ -2923,8 +2961,9 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
             );
         }
         // So is reading any place through one: `(Infallible, ()).1` and `.0`,
-        // `[Infallible; 1][0]` (constant and dynamic index), and `ManuallyDrop<Infallible>`'s
-        // `value`.
+        // `[Infallible; 1][0]` (constant and dynamic index), `ManuallyDrop<Infallible>`'s
+        // `value`, `(Infallible, u32).0` and `.1` (whose `u32` leaf is positive-sized),
+        // `[CustomVoid; 1][0]`, and `(CustomVoid, ()).1`.
         assert_eq!(
             state.read_place(&proj(0, vec![f(2), field(1, unit())])),
             inactive(2)
@@ -2945,8 +2984,25 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
             state.read_place(&proj(0, vec![f(4), field(0, inf.clone())])),
             inactive(4)
         );
-        // Inside `V`, the uninhabited field `p` and `p.1` (whose `()` leaf alone is inhabited)
-        // fault, as does `MaybeUninit<Infallible>`'s `value` field.
+        assert_eq!(
+            state.read_place(&proj(0, vec![f(10), field(0, inf.clone())])),
+            inactive(10)
+        );
+        assert_eq!(
+            state.read_place(&proj(0, vec![f(10), field(1, u32_ty())])),
+            inactive(10)
+        );
+        assert_eq!(
+            state.read_place(&proj(0, vec![f(12), cidx(0, 1)])),
+            inactive(12)
+        );
+        assert_eq!(
+            state.read_place(&proj(0, vec![f(13), field(1, unit())])),
+            inactive(13)
+        );
+        // Inside `V` (and `[V; 2][0..-1][0]`), the uninhabited field `p` and `p.1` (whose `()`
+        // leaf alone is inhabited) fault, as do `V4.p.1` and `MaybeUninit<Infallible>`'s
+        // `value` field.
         let v_inactive = Err(RvalueEvalError::InactiveUnionField {
             active_field: 1,
             requested_field: 0,
@@ -2961,6 +3017,30 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
                 vec![f(8), field(0, pair.clone()), field(1, unit())]
             )),
             v_inactive
+        );
+        assert_eq!(
+            state.read_place(&proj(
+                0,
+                vec![
+                    f(14),
+                    ProjectionElem::Subslice {
+                        from: 0,
+                        to: 1,
+                        from_end: true,
+                    },
+                    cidx(0, 1),
+                    field(0, pair.clone()),
+                    field(1, unit()),
+                ]
+            )),
+            v_inactive
+        );
+        assert_eq!(
+            state.read_place(&proj(
+                0,
+                vec![f(15), field(0, pair_u32.clone()), field(1, u32_ty())]
+            )),
+            inactive(15)
         );
         assert_eq!(
             state.read_place(&proj(0, vec![f(9), field(1, mu.md_ty.clone())])),
