@@ -43,11 +43,13 @@ OpaqueCalleeTable.lookup → stepDynPruned` built on `Anneal.OpaqueCalleeTable`.
   is checked by `DynCallSite.wellFormed` (`methodMatchesTrait`, generic supertraits). The call
   itself is `stepDynTerminator`, whose every successful step is the resolver-parametric trusted
   call step with only the virtual key redirected to the vtable-resolved target
-  (`stepTerminatorWith_of_stepDynTerminator_step`, `dynDispatchStep_step_spec`). Registries are
-  unambiguous (`DynCallRegistry.findSite?`; location-scoped `findSiteAt?` with unique
-  resolution under `scopedWellFormed`), unregistered virtual calls fail closed
-  (`demandsUnregisteredDyn`), and narrow-run certificates preserve whole runs under
-  `EnvExtends` and call-cone narrowing.
+  (`stepTerminatorWith_of_stepDynTerminator_step`, `dynDispatchStep_step_spec`). Sites are
+  scoped to a function and block (`callSiteLoc?`; unscoped sites to the root function) and to
+  direct calls, registries are unambiguous (`DynCallRegistry.findSite?`; location-scoped
+  `findSiteAt?` with unique resolution under `scopedWellFormed` / the root-aware
+  `scopedWellFormedFor`), unregistered virtual calls fail closed (`demandsUnregisteredDyn`), and
+  narrow-run certificates (decidable, demand-collected, or `OpaqueCalleeTable.AgreesOn`-based)
+  preserve whole runs under `EnvExtends` and call-cone narrowing.
 
 Concrete canaries, axiom pins, and the module-wide axiom / namespace audit live in
 `tests/mir/CompilerQueryAndOpaqueCalleeTests.lean`.
@@ -3387,7 +3389,16 @@ type-id mismatch is the defined CFI trap (`abort`), and every other semantic err
 UB. A resolved slot that fails `vtableTargetAgrees` (either still carrying a `dyn`
 receiver type or failing `slotMethodAgrees`) and a slot whose explicit binding names
 another trait method (`.vtableSlotMethodMismatch`) are configuration errors and fail
-closed. -/
+closed.
+
+`dynDispatchStep` is the dispatch step *at a demanded site*: the gated evaluators
+(`dynDemandStep`, `dynRegistryStep`) apply it only when `demandsDynSite` holds (direct call, call
+key, site scope). Applied eagerly elsewhere it still never dispatches out of scope or through an
+indirect call — the redirected call re-checks scope and directness (`stepDynPruned`,
+`stepDynTerminator`), so every successful step satisfies `demandsDynSite`
+(`demandsDynSite_of_dynDispatchStep_step`) — but it reads and resolves the frame's `vtableLocal`
+first, so a receiver-side outcome (UB on a missing pointer, the CFI trap) is reported before the
+scope check (`canary_eager_vs_gated_out_of_scope`). -/
 def dynDispatchStep (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable) (site : DynCallSite)
     (body : CapturedMir) (s : MachineState) : MirStepNode :=
   if site.wellFormed then

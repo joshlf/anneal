@@ -2615,7 +2615,9 @@ def ssaAtBb1 : MachineState :=
    (`MirStepNode.unsupported`) instead of hijacking `_1`.
 2. At `crossForeignFrameState` (foreign callee `fx::unreg_dyn_callee`), `demandsDynKey = true` and
    `isDirectCallAt = true`, but unscoped `dynSite` has `matchesLoc crossFrameRoot = false`;
-   `stepDynPruned` rejects out-of-scope calls, so **even eager `dynDispatchStep`** fails closed.
+   `stepDynPruned` rejects out-of-scope calls, so **even eager `dynDispatchStep`** fails closed
+   (here the foreign `_1` holds a valid vtable pointer; with an uninitialized one the eager step
+   reports the receiver's UB first — `canary_eager_vs_gated_out_of_scope`).
 3. At `ssaAtBb1` (`bb1` of `ssaDynRoot`), `bb0`-scoped `ssaSite0` has `matchesLoc = false`, so
    eager `dynDispatchStep` fails closed instead of reading `bb0`'s `_1` (`Circle`).
 4. Universally (`demandsDynSite_of_dynDispatchStep_step`), any `.step s'` of `dynDispatchStep` on
@@ -2642,6 +2644,23 @@ theorem canary_eager_dynDispatchStep_respects_scope_and_direct_call :
     by decide +kernel, by decide, by decide +kernel,
     by decide, by decide +kernel,
     fun _ _ _ _ _ _ => demandsDynSite_of_dynDispatchStep_step⟩
+
+/-- `crossForeignFrameState` with the foreign callee's `_1` uninitialized. -/
+def crossForeignFrameUninit : MachineState :=
+  { crossForeignFrameState with
+    frame := { crossForeignFrameState.frame with locals := [.uninit, .uninit] } }
+
+/-- **Eager vs. gated dispatch at an out-of-scope call (documented behavior)**: eager
+`dynDispatchStep` reads the receiver's vtable pointer *before* the redirected call re-checks the
+site's scope, so at a foreign frame whose `vtableLocal` is uninitialized it reports UB — never a
+dispatch (`demandsDynSite_of_dynDispatchStep_step`) — whereas the gated `dynDemandStep`, which
+checks scope and directness before touching the frame, fails closed (`unsupported`). -/
+theorem canary_eager_vs_gated_out_of_scope :
+    viewStepNode (dynDispatchStep dynEnv13 crossFrameTbl dynSite crossFrameRoot
+        crossForeignFrameUninit) = .fault .ub ∧
+    viewStepNode (dynDemandStep dynEnv13 crossFrameTbl dynSite crossFrameRoot
+        crossForeignFrameUninit) = .fault .unsupported := by
+  decide +kernel
 
 /-- Cross-frame registry pairing the verified root's **unscoped** `dynSite` (`callSiteLoc? = none`,
 matching all frames of `crossFrameRoot`) with the callee's scoped `crossCalleeSite`
@@ -4061,6 +4080,10 @@ constant. -/
 /-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_agreesOn_with_traits_and_poly_miss_opaque' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_agreesOn_with_traits_and_poly_miss_opaque
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_eager_vs_gated_out_of_scope' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_eager_vs_gated_out_of_scope
 
 end Anneal.CompilerQueryAndOpaqueCalleeTests
 
