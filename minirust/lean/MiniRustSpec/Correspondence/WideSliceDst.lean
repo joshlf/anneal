@@ -1,0 +1,1473 @@
+/-
+Copyright 2026 The Fuchsia Authors
+
+Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+<LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+This file may not be copied, modified, or distributed except according to
+those terms.
+-/
+
+import MiniRustSpec.Correspondence.TbWitness
+import MiniRustSpec.Correspondence.ProvenanceWitness
+import MiniRustSpec.Correspondence.IntrinsicFallback
+
+/-!
+# Wide-Slice and Unsized DST Pointer-Metadata Correspondence (`MiniRustSpec`)
+
+Operational correspondence between Anneal's trusted MIR semantics
+(`Trusted.Rustc.V2026_06_01.MirSemantics`) and MiniRust's operational semantics
+(`MiniRustSpec.Interp` over both `BasicMemory<x86_64>` (`Mach`) and
+`TreeBorrowsMemory<x86_64>` (`MachTB`)) for wide-slice (`[T]`) and string-slice (`str`)
+unsized DST pointer-metadata operations:
+
+1. **Symbolic Wide-Slice Value, Layout, Encoding & Metadata Correspondence**:
+   - Anneal's wide-pointer representation `.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]` (and
+     provenance-free `.aggregate 0 [.scalar ⟨addr, 8⟩, .scalar ⟨len, 8⟩]`) over `.slice elemTy`
+     and `.str` corresponds to MiniRust's `Value.Ptr ⟨thin, some (.ElementCount len)⟩` at
+     16-byte, 8-byte-aligned `Type.Ptr (.Raw .ElementCount)` / `Type.Ptr (.Ref mutbl sliceInfo)`,
+     whose representation relation (`encodeWidePtr` / `decodeWidePtr`) is byte-identical to the
+     16-byte 2-field tuple `PtrType.as_wide_pair` (`[(0, *const ()), (8, usize)]`).
+2. **Symbolic Lockstep Correspondence (`UnOp.ptrMetadata`, `AggregateKind.rawPtr`, `to_raw_parts`)**:
+   - `UnOp.ptrMetadata`: Anneal `evalRvalue ... (.unaryOp .ptrMetadata op)` and MiniRust
+     `PointerMetaKind.encode_as_value` extract `.scalar ⟨len, 8⟩` / `.Int len` on wide `[T]` and
+     `str` pointers (including provenance-free, dangling, out-of-bounds, and `.disabled`-borrow
+     pointers, without dereferencing memory!) and `.unit` / `.Tuple []` (`unit_value()`) on thin
+     pointers.
+   - `to_raw_parts` (`CastKind.ptrToPtr` wide-to-thin `p as *const ()` $\mapsto$
+     `UnOp.GetThinPointer`, and wide-to-wide `*const [T] as *mut [T]` / `*const str as *const [u8]`
+     $\mapsto$ identity) and `AggregateKind.rawPtr` (`ptr::from_raw_parts(_mut)` /
+     `ptr::slice_from_raw_parts(_mut)`) round-trip preserving provenance (`allocId`, Tree Borrows
+     `tag`), byte offset, and element count in lockstep across Anneal, `Mach`, and `MachTB`.
+3. **Symbolic Lockstep Correspondence (`core::intrinsics::size_of_val` & `align_of_val`)**:
+   - Anneal's `evalSliceSizeOfVal elemSz ⟨len, 8⟩` (`Nat.blt (len * elemSz) (signedHalfModulus 8)`)
+     and `evalNonSelectIntrinsicCall` (`.sizeOfVal` / `.alignOfVal`) match MiniRust's
+     `LayoutStrategy.compute_size_and_align` + `x86_64.valid_size` (`inBounds size.bytes .Signed
+     x86_64.PTR_SIZE`, i.e. `len * elemSz < 2^63 = isize::MAX + 1`) across `[T]`, `str`
+     (`elemSz = 1, align = 1`), empty slices (`len = 0`), and ZST slices (`elemSz = 0`).
+4. **Symbolic & Concrete `slice::from_raw_parts(_mut)` (`&*p` / `&mut *p`), `Rvalue.len (*s)`,
+   Checked Slice Indexing `(*s)[i]`, and Tree Borrows `Frozen` / `Unique` / `Disabled` UB**:
+   - Reborrowing `*wide_raw_ptr` to `&[T]` / `&mut [T]`, reading `Rvalue.len (*s)` and `(*s)[i]`,
+     writing `(*s)[i] = v`, out-of-bounds indexing `i ≥ len` UB, and Tree Borrows `Disabled`
+     parent-write invalidation (contrasted with `UnOp.ptrMetadata(s)` succeeding without deref).
+5. **Concrete Multi-Way Execution Witnesses & Negative/Divergence Canaries**:
+   - Kernel-checked (`rfl` / `decide +kernel`, zero `native_decide`) 3-way witnesses across
+     Anneal, `Mach`, and `MachTB`, including the exact `isize::MAX` (`len = 2^61 - 1` vs.
+     `len = 2^61` for `[u32]`) boundary and the documented Stage-1 `Trusted` fail-closed
+     provenance-free `.scalar`-address `size_of_val` divergence on empty slices (`len = 0`).
+-/
+
+namespace MiniRustSpec.Correspondence.WideSliceDst
+
+set_option Elab.async false
+set_option linter.unusedSimpArgs false
+
+open Trusted.Effect
+open Trusted.ITree
+open Trusted.Sequence
+open Trusted.Rustc.V2026_06_01
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.Rustc.V2026_06_01.Layout
+open MiniRustSpec
+open MiniRustSpec.Gen
+open MiniRustSpec.LibSpecr
+open MiniRustSpec.Interp
+open MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.Witness
+open MiniRustSpec.Correspondence.PointerWitness
+open MiniRustSpec.Correspondence.RefWitness
+open MiniRustSpec.Correspondence.TbWitness
+
+/-! ## 1. Wide-Slice Value, Layout, Encoding & Metadata Correspondence -/
+
+/-- Anneal runtime representation of a wide `[T]` or `str` pointer/reference
+`.aggregate 0 [.ptr p ptrBytes, .scalar ⟨len, ptrBytes⟩]`. -/
+@[reducible]
+def annealWidePtrVal (p : ProvenancePtr) (len : Nat) (ptrBytes : Nat := 8) : MirSemantics.Value :=
+  .aggregate 0 [.ptr p ptrBytes, .scalar ⟨len, ptrBytes⟩]
+
+/-- Anneal runtime representation of a provenance-free (integer-address) wide `[T]` or `str`
+pointer `.aggregate 0 [.scalar ⟨addr, ptrBytes⟩, .scalar ⟨len, ptrBytes⟩]`. -/
+@[reducible]
+def annealWideScalarPtrVal (addr len : Nat) (ptrBytes : Nat := 8) : MirSemantics.Value :=
+  .aggregate 0 [.scalar ⟨addr, ptrBytes⟩, .scalar ⟨len, ptrBytes⟩]
+
+/-- MiniRust (`BasicMemory`) wide slice/str pointer value
+`Value::Ptr(thin.widen(Some(PointerMeta::ElementCount(len))))`. -/
+@[reducible]
+def mrWidePtrVal (thin : Ptr) (len : Int) : Val :=
+  .Ptr (ThinPointer.widen thin (some (.ElementCount len)))
+
+/-- Polymorphic MiniRust (`Machine<M>`) wide slice/str pointer value. -/
+@[reducible]
+def mrWidePtrValM {M : Type} [Gen.Memory M]
+    (thin : ThinPointer (Gen.Memory.Provenance M)) (len : Int) : Gen.Value M :=
+  .Ptr (ThinPointer.widen thin (some (.ElementCount len)))
+
+/-- MiniRust 2-field tuple value `(Value::Ptr(thin.widen(None)), Value::Int(len))` matching
+`PtrType::as_wide_pair` for `PointerMetaKind::ElementCount`. -/
+@[reducible]
+def mrWidePairTupleVal (thin : Ptr) (len : Int) : Val :=
+  .Tuple [.Ptr (ThinPointer.widen thin none), .Int len]
+
+/-- Polymorphic MiniRust 2-field tuple value `(Value::Ptr(thin.widen(None)), Value::Int(len))`
+for `Machine<M>`. -/
+@[reducible]
+def mrWidePairTupleValM {M : Type} [Gen.Memory M]
+    (thin : ThinPointer (Gen.Memory.Provenance M)) (len : Int) : Gen.Value M :=
+  .Tuple [.Ptr (ThinPointer.widen thin none), .Int len]
+
+/-- The 16-byte, 8-byte-aligned 2-field tuple type `[(0, *const ()), (8, usize)]` returned by
+`PtrType.as_wide_pair` for any pointer type with `PointerMetaKind::ElementCount`. -/
+@[reducible]
+def mrWidePairTupleTy : Gen.Type :=
+  .Tuple [(⟨0⟩, .Ptr (.Raw .None)), (x86_64.PTR_SIZE, .Int IntType.usize_ty)]
+    ⟨⟨2 * x86_64.PTR_SIZE.bytes⟩, x86_64.PTR_ALIGN, none⟩ none
+
+/-- MiniRust `PointeeInfo` for an unsized slice `[T]` (or `str` when `elemSize = ⟨1⟩`,
+`elemAlign = ⟨1⟩`). -/
+@[reducible]
+def slicePointeeInfo (elemSize : LibSpecr.Size) (elemAlign : LibSpecr.Align)
+    (freeze : Bool := true) : Gen.PointeeInfo :=
+  { layout := .Slice elemSize elemAlign
+    inhabited := true
+    unsafe_cells := .Slice []
+    freeze := freeze
+    unpin := true }
+
+/-- MiniRust reference pointer type `&[T]` / `&mut [T]` (or `&str` when `elemSize = ⟨1⟩`,
+`elemAlign = ⟨1⟩`). -/
+@[reducible]
+def sliceRefPtrType (mutbl : MirAst.Mutability) (elemSize : LibSpecr.Size)
+    (elemAlign : LibSpecr.Align) (freeze : Bool := true) : Gen.PtrType :=
+  .Ref (translateMutbl mutbl) (slicePointeeInfo elemSize elemAlign freeze)
+
+/-- Value-level correspondence between an Anneal 64-bit wide slice pointer `annealVal` and a
+MiniRust wide slice pointer `mrVal` with thin pointer `thin` and element count `len`. -/
+def WideSlicePtrRel (p : ProvenancePtr) (len : Nat) (thin : Ptr)
+    (annealVal : MirSemantics.Value) (mrVal : Val) : Prop :=
+  annealVal = annealWidePtrVal p len 8 ∧
+  mrVal = mrWidePtrVal thin (Int.ofNat len) ∧
+  0 ≤ thin.addr ∧ thin.addr < 2 ^ 64 ∧
+  len < scalarModulus 8
+
+/-- Both raw wide slice pointers (`PtrType.Raw .ElementCount`) and safe slice references
+(`sliceRefPtrType mutbl elemSize elemAlign freeze`) have `meta_kind = .ElementCount` and expand to
+the exact same 16-byte `mrWidePairTupleTy` under `PtrType.as_wide_pair`. -/
+theorem mrWideRawPtr_as_wide_pair_eq (mutbl : MirAst.Mutability) (elemSize : LibSpecr.Size)
+    (elemAlign : LibSpecr.Align) (freeze : Bool) :
+    PtrType.meta_kind (.Raw .ElementCount) = .ElementCount ∧
+    PtrType.meta_kind (sliceRefPtrType mutbl elemSize elemAlign freeze) = .ElementCount ∧
+    PtrType.as_wide_pair (.Raw .ElementCount) = some mrWidePairTupleTy ∧
+    PtrType.as_wide_pair (sliceRefPtrType mutbl elemSize elemAlign freeze) =
+      some mrWidePairTupleTy :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Every wide slice pointer type (`*const [T]`, `*mut [T]`, `*const str`, `&[T]`, `&mut [T]`,
+`&str`) has `Type.layout = .ok (.Sized ⟨16⟩ ⟨8⟩)` in MiniRust, matching Anneal's `2 * 8 = 16`-byte
+wide pointer representation on 64-bit targets (`layoutPointerBytes emptyLayoutTable = 8`), while
+the `as_wide_pair` tuple `mrWidePairTupleTy` also has `Type.layout = .ok (.Sized ⟨16⟩ ⟨8⟩)`. -/
+theorem mrWidePtr_type_layout_eq (mutbl : MirAst.Mutability) (elemSize : LibSpecr.Size)
+    (elemAlign : LibSpecr.Align) (freeze : Bool) :
+    Type.layout (.Ptr (.Raw .ElementCount)) = .ok (.Sized ⟨16⟩ ⟨8⟩) ∧
+    Type.layout (.Ptr (sliceRefPtrType mutbl elemSize elemAlign freeze)) = .ok (.Sized ⟨16⟩ ⟨8⟩) ∧
+    Type.layout mrWidePairTupleTy = .ok (.Sized ⟨16⟩ ⟨8⟩) ∧
+    2 * layoutPointerBytes emptyLayoutTable = 16 :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- `Type.layout` on `Type.Slice`: for `u32` elements (`size = 4, align = 4`) and `u8` / `str`
+elements (`size = 1, align = 1`), `Type.layout (.Slice ...)` returns `.ok (.Slice elemSize elemAlign)`,
+which is unsized (`LayoutStrategy.is_sized = false`). -/
+theorem mrSlice_type_layout_eq :
+    let u8It : IntType := ⟨.Unsigned, ⟨1⟩⟩
+    Type.layout (.Slice (.Int u32)) = .ok (.Slice ⟨4⟩ ⟨4⟩) ∧
+    Type.layout (.Slice (.Int u8It)) = .ok (.Slice ⟨1⟩ ⟨1⟩) ∧
+    LayoutStrategy.is_sized (.Slice ⟨4⟩ ⟨4⟩) = false ∧
+    LayoutStrategy.is_sized (.Slice ⟨1⟩ ⟨1⟩) = false :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- **Representation-relation identity (`encodeWidePtr` vs. `encodePtr ++ encodeInt`)**:
+`Type.encode (.Ptr (.Raw .ElementCount)) (mrWidePtrVal thin len)` (and `Type.encode` at any
+`sliceRefPtrType`) equals `encodeWidePtr .ElementCount (ThinPointer.widen thin (some (.ElementCount len)))`,
+which concatenates `encodePtr thin` (`8` bytes carrying `thin.provenance`) and
+`Type.encodeInt IntType.usize_ty (.Int len)` (`8` bytes of little-endian `usize`), and decodes back
+under `decodeWidePtr .ElementCount` and `Type.decode mrWidePairTupleTy`. -/
+theorem encodeWidePtr_eq_encode_widePairTuple (thin : Ptr) (len : Int)
+    (mutbl : MirAst.Mutability) (elemSize : LibSpecr.Size) (elemAlign : LibSpecr.Align)
+    (freeze : Bool) :
+    Type.encode (.Ptr (.Raw .ElementCount)) (mrWidePtrVal thin len) =
+      encodeWidePtr .ElementCount (ThinPointer.widen thin (some (.ElementCount len))) ∧
+    Type.encode (.Ptr (sliceRefPtrType mutbl elemSize elemAlign freeze))
+        (mrWidePtrVal thin len) =
+      encodeWidePtr .ElementCount (ThinPointer.widen thin (some (.ElementCount len))) ∧
+    encodeWidePtr .ElementCount (ThinPointer.widen thin (some (.ElementCount len))) =
+      (do
+        let thinBytes ← encodePtr thin
+        let metaBytes ← Type.encodeInt IntType.usize_ty (.Int len)
+        pure (thinBytes ++ metaBytes)) :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- **`checkPtrMetadata` correspondence with Anneal `usize` bounds (`scalarModulus 8 = 2^64`)**:
+`checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount` succeeds in MiniRust iff
+`len < scalarModulus 8` (`2^64`), and fails closed with `.error (.ub "Value::Int: invalid integer value")`
+when `scalarModulus 8 ≤ len`; mismatched metadata/kind pairs fail closed with
+`.error (.ub "Value::Ptr: invalid metadata")`. -/
+theorem checkPtrMetadata_elementCount_iff_anneal_usize (len : Nat) :
+    (checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount = .ok () ↔
+      len < scalarModulus 8) ∧
+    (scalarModulus 8 ≤ len →
+      checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount =
+        .error (.ub "Value::Int: invalid integer value")) ∧
+    checkPtrMetadata none .ElementCount = .error (.ub "Value::Ptr: invalid metadata") ∧
+    checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .None =
+      .error (.ub "Value::Ptr: invalid metadata") := by
+  have hMod : (2 : Int) ^ (8 * x86_64.PTR_SIZE.bytes) = ((scalarModulus 8 : Nat) : Int) := by
+    decide
+  have hCanRep : IntType.can_represent IntType.usize_ty (Int.ofNat len) =
+      decide (len < scalarModulus 8) := by
+    unfold IntType.can_represent IntType.usize_ty inBounds Size.bits
+    rw [hMod]
+    have h1 : decide ((0 : Int) ≤ Int.ofNat len) = true :=
+      decide_eq_true (Int.natCast_nonneg len)
+    have h2 : decide (Int.ofNat len < ((scalarModulus 8 : Nat) : Int)) =
+        decide (len < scalarModulus 8) := by
+      change decide ((len : Int) < ((scalarModulus 8 : Nat) : Int)) = decide (len < scalarModulus 8)
+      by_cases h : len < scalarModulus 8
+      · rw [decide_eq_true h]
+        exact decide_eq_true (by omega)
+      · rw [decide_eq_false h]
+        exact decide_eq_false (by omega)
+    rw [h1, h2, Bool.true_and]
+  refine ⟨?_, ?_, rfl, rfl⟩
+  · unfold checkPtrMetadata ensureElseUb
+    dsimp only
+    rw [hCanRep]
+    by_cases hLt : len < scalarModulus 8
+    · simp [hLt]
+    · simp [hLt, ub]
+  · intro hGe
+    have hNotLt : ¬ len < scalarModulus 8 := Nat.not_lt.mpr hGe
+    unfold checkPtrMetadata ensureElseUb
+    dsimp only
+    rw [hCanRep, decide_eq_false hNotLt]
+    rfl
+
+/-! ## 2. Symbolic Lockstep Correspondence: `UnOp.ptrMetadata`, `AggregateKind.rawPtr` & `to_raw_parts` -/
+
+/-- **`UnOp.ptrMetadata` symbolic lockstep (`ptrMetadata_wide_and_thin_lockstep`)**:
+1. On any wide `[T]` or `str` pointer (`annealWidePtrVal p len 8` and `mrWidePtrVal thin (Int.ofNat len)`),
+   Anneal's `evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls emptyLayoutTable` returns
+   `.ok (.scalar ⟨len, 8⟩) locals' mem` and MiniRust's `PointerMetaKind.encode_as_value .ElementCount`
+   returns `.ok (.Int (Int.ofNat len))` — without inspecting `mem.borrows` or `mem.globals`!
+2. On a provenance-free scalar-address wide pointer (`annealWideScalarPtrVal addr len 8`,
+   `len < scalarModulus 8`), Anneal's `evalRvalue` returns `.ok (.scalar ⟨len, 8⟩) locals' mem` and
+   MiniRust returns `.ok (.Int (Int.ofNat len))`.
+3. On a thin pointer (`.ptr p 8` and `ThinPointer.widen thin none`), Anneal returns
+   `.ok .unit locals' mem` and MiniRust returns `.ok (.Tuple [])` (`unit_value()`). -/
+theorem ptrMetadata_wide_and_thin_lockstep
+    (locals locals' : List LocalSlot) (wideOp scalarWideOp thinOp : Operand)
+    (mem : MirSemantics.Memory) (localDecls : List LocalDecl)
+    (p : ProvenancePtr) (thin : Ptr) (addr len : Nat)
+    (hWideOp : evalOperand locals wideOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals')
+    (hScalarTy : isNonWidePtrAggregateTy (operandTy localDecls emptyLayoutTable scalarWideOp) =
+      false)
+    (hLen : len < scalarModulus 8)
+    (hScalarOp : evalOperand locals scalarWideOp mem.borrows mem.globals emptyLayoutTable
+      mem.callerLocals localDecls mem.callStack = .ok (annealWideScalarPtrVal addr len 8) locals')
+    (hThinOp : evalOperand locals thinOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (.ptr p 8) locals') :
+    (evalRvalue locals (.unaryOp .ptrMetadata wideOp) mem localDecls emptyLayoutTable =
+       .ok (.scalar ⟨len, 8⟩) locals' mem ∧
+     PointerMetaKind.encode_as_value .ElementCount
+         (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))).metadata =
+       .ok (.Int (Int.ofNat len))) ∧
+    (evalRvalue locals (.unaryOp .ptrMetadata scalarWideOp) mem localDecls emptyLayoutTable =
+       .ok (.scalar ⟨len, 8⟩) locals' mem ∧
+     PointerMetaKind.encode_as_value .ElementCount (some (.ElementCount (Int.ofNat len))) =
+       .ok (.Int (Int.ofNat len))) ∧
+    (evalRvalue locals (.unaryOp .ptrMetadata thinOp) mem localDecls emptyLayoutTable =
+       .ok .unit locals' mem ∧
+     PointerMetaKind.encode_as_value .None none = .ok (.Tuple [])) := by
+  have hWrap : wrapScalarBits len (scalarModulus 8) = len := by
+    unfold wrapScalarBits
+    cases hb : Nat.ble (scalarModulus 8) len with
+    | false => rfl
+    | true => exact False.elim (Nat.not_le.mpr hLen (Nat.le_of_ble_eq_true hb))
+  refine ⟨⟨?_, rfl⟩, ⟨?_, rfl⟩, ⟨?_, rfl⟩⟩
+  · show evalUnaryPtrMetadata locals wideOp mem localDecls emptyLayoutTable = _
+    unfold evalUnaryPtrMetadata
+    simp only [hWideOp, annealWidePtrVal, layoutPointerBytes, emptyLayoutTable, Nat.beq_refl,
+      Bool.and_self]
+  · show evalUnaryPtrMetadata locals scalarWideOp mem localDecls emptyLayoutTable = _
+    unfold evalUnaryPtrMetadata
+    simp only [hScalarOp, annealWideScalarPtrVal, hScalarTy, layoutPointerBytes, emptyLayoutTable,
+      Nat.beq_refl, Bool.and_self, hWrap]
+  · show evalUnaryPtrMetadata locals thinOp mem localDecls emptyLayoutTable = _
+    unfold evalUnaryPtrMetadata
+    simp only [hThinOp, layoutPointerBytes, emptyLayoutTable, Nat.beq_refl]
+
+/-- **`Translate.translateRvalue` on `CastKind.ptrToPtr` for wide `[T]` and `str` raw pointers**:
+- Casting a wide `.slice elem` (with `isMonoRigidTy elem = true`) or `.str` raw pointer local to
+  any sized raw pointer (`rawPtrMetaOf thinCastTy = some .None`, e.g., `*const ()` or `*const T`)
+  translates via `minimize` to `some (.UnOp .GetThinPointer (.Load (.Local (localName i))))`.
+- Casting between wide `.slice elem` / `.str` raw pointer types (`rawPtrMetaOf wideCastTy =
+  some .ElementCount`, e.g., `*const [T] as *mut [T]` or `*const str as *const [u8]`) translates to
+  the identity `some (.Load (.Local (localName i)))`. -/
+theorem translateRvalue_cast_ptrToPtr_wide_to_thin_and_wide
+    (layouts : LayoutTable) (decls : List LocalDecl) (i : Nat) (d : LocalDecl)
+    (thinCastTy wideCastTy : Ty)
+    (hDecl : decls[i]? = some d)
+    (hSrcMeta : rawPtrMetaOf d.ty = some .ElementCount)
+    (hThinMeta : rawPtrMetaOf thinCastTy = some .None)
+    (hWideMeta : rawPtrMetaOf wideCastTy = some .ElementCount) :
+    translateRvalue layouts decls none (.cast .ptrToPtr (.copy (local_ i)) thinCastTy) =
+      some (.UnOp .GetThinPointer (.Load (.Local (localName i)))) ∧
+    translateRvalue layouts decls none (.cast .ptrToPtr (.copy (local_ i)) wideCastTy) =
+      some (.Load (.Local (localName i))) := by
+  have hOp : translateOperand decls (.copy (local_ i)) = some (.Load (.Local (localName i))) := by
+    simp [translateOperand, translatePlace, local_, hDecl]
+  have hOpMeta : operandRawPtrMeta decls (.copy (local_ i)) = some .ElementCount := by
+    simp [operandRawPtrMeta, local_, hDecl, hSrcMeta]
+  refine ⟨?_, ?_⟩
+  · unfold translateRvalue
+    simp [hOp, hOpMeta, hThinMeta]
+  · unfold translateRvalue
+    simp [hOp, hOpMeta, hWideMeta]
+
+/-- **`to_raw_parts` (`CastKind.ptrToPtr` wide-to-thin & wide-to-wide) symbolic lockstep** across
+Anneal, `Machine<BasicMemory>` (`BM`), and `Machine<TreeBorrowsMemory>` (`TBM`):
+1. **Wide-to-thin (`p as *const U` $\leftrightarrow$ `UnOp.GetThinPointer`)**:
+   - When `p` is global-backed (`lookupBorrow mem.borrows p.tag = none`), Anneal's
+     `evalRvalue locals (.cast .ptrToPtr op thinTargetTy) mem localDecls emptyLayoutTable` returns
+     `.ok (.ptr p 8) locals' mem`;
+   - In MiniRust, `evalUnOp .GetThinPointer` on `BM` and `evalUnOpM .GetThinPointer` on `TBM` both
+     return `.ok (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None))`, preserving `thin.addr`
+     and `thin.provenance` (`allocId` and Tree Borrows `tag`) identically!
+2. **Wide-to-wide (`*const [T] as *mut [T]`, `*const str as *const [u8]`)**:
+   - Anneal's `evalRvalue locals (.cast .ptrToPtr op wideTargetTy) mem localDecls emptyLayoutTable`
+     returns `.ok (annealWidePtrVal p len 8) locals' mem` (for both global-backed and borrow-backed
+     pointers!), matching MiniRust's identity translation on `mrWidePtrVal thin (Int.ofNat len)` and
+     `mrWidePtrValM thinTB (Int.ofNat len)`. -/
+theorem ptrToPtr_wide_to_thin_and_wide_to_wide_lockstep
+    (locals locals' : List LocalSlot) (op : Operand) (thinTargetTy wideTargetTy : Ty)
+    (mem : MirSemantics.Memory) (localDecls : List LocalDecl)
+    (p : ProvenancePtr) (len : Nat) (thin : Ptr)
+    (thinTB : ThinPointer TreeBorrowsProvenance) (ptrTy : PtrType)
+    (hThin : isThinRawPtrTy thinTargetTy = true)
+    (hNotThin : isThinRawPtrTy wideTargetTy = false)
+    (hWide : wideRawPtrIsDyn? wideTargetTy = some false)
+    (hOp : evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals') :
+    ((lookupBorrow mem.borrows p.tag = none →
+        evalRvalue locals (.cast .ptrToPtr op thinTargetTy) mem localDecls emptyLayoutTable =
+          .ok (.ptr p 8) locals' mem) ∧
+     evalUnOp .GetThinPointer (mrWidePtrVal thin (Int.ofNat len), .Ptr ptrTy) =
+       .ok (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None)) ∧
+     evalUnOpM (M := TBM) .GetThinPointer (mrWidePtrValM thinTB (Int.ofNat len), .Ptr ptrTy) =
+       .ok (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None))) ∧
+    evalRvalue locals (.cast .ptrToPtr op wideTargetTy) mem localDecls emptyLayoutTable =
+      .ok (annealWidePtrVal p len 8) locals' mem := by
+  refine ⟨⟨?_, rfl, rfl⟩, ?_⟩
+  · intro hNoBorrow
+    show evalCastPtrToPtr locals op thinTargetTy mem localDecls emptyLayoutTable = _
+    unfold evalCastPtrToPtr
+    simp only [hOp, annealWidePtrVal, layoutPointerBytes, emptyLayoutTable, Nat.beq_refl,
+      Bool.and_self, hThin, hNoBorrow]
+  · show evalCastPtrToPtr locals op wideTargetTy mem localDecls emptyLayoutTable = _
+    unfold evalCastPtrToPtr
+    simp only [hOp, annealWidePtrVal, layoutPointerBytes, emptyLayoutTable, Nat.beq_refl,
+      Bool.and_self, hNotThin, hWide]
+
+/-- **Borrow-backed `CastKind.ptrToPtr` (`alreadySubslice = true`) lockstep**: when a stack-borrow
+wide slice pointer's `BorrowEntry` already ends with a `.subslice` covering `[0 .. length elems)` at
+offset `0`, Anneal's `evalCastPtrToPtr` returns `.ok (.ptr p 8) locals' mem` with `mem` unchanged
+(no fresh tag allocated), matching MiniRust's `evalUnOp .GetThinPointer` and `evalUnOpM .GetThinPointer`
+returning `ThinPointer.widen thin none` with the exact same borrow provenance tag! -/
+theorem ptrToPtr_wide_to_thin_already_subslice_lockstep
+    (locals locals' : List LocalSlot) (op : Operand) (thinTargetTy : Ty)
+    (mem : MirSemantics.Memory) (localDecls : List LocalDecl)
+    (p : ProvenancePtr) (len : Nat) (parentEntry : BorrowEntry) (rootVal : MirSemantics.Value)
+    (containerProj : List ProjectionElem) (baseIdx : Nat) (elems : List MirSemantics.Value)
+    (rawElemOffset : Nat) (thin : Ptr) (thinTB : ThinPointer TreeBorrowsProvenance)
+    (ptrTy : PtrType)
+    (hThin : isThinRawPtrTy thinTargetTy = true)
+    (hOp : evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals')
+    (hBorrow : lookupBorrow mem.borrows p.tag = some parentEntry)
+    (hPerm : parentEntry.perm ≠ .disabled)
+    (hRoot : activeFrameSlot? locals' mem.callStack parentEntry.targetFrameDepth
+      parentEntry.targetLocal = some (.init rootVal))
+    (hRead : readSliceBackingAggregate? locals' rootVal
+      (normalizeSubsliceProjections (stripTransparentProjections parentEntry.targetProjection))
+      len = some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? p.offsetBytes (inferElemListByteStride elems) =
+      some rawElemOffset)
+    (hBound : Nat.ble (Nat.add (Nat.add rawElemOffset baseIdx) len) (length elems) = true)
+    (hAlready : Bool.and (endsWithSubslice containerProj)
+      (Bool.and (Nat.beq (Nat.add rawElemOffset baseIdx) 0) (Nat.beq len (length elems))) =
+        true) :
+    evalRvalue locals (.cast .ptrToPtr op thinTargetTy) mem localDecls emptyLayoutTable =
+      .ok (.ptr p 8) locals' mem ∧
+    evalUnOp .GetThinPointer (mrWidePtrVal thin (Int.ofNat len), .Ptr ptrTy) =
+      .ok (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None)) ∧
+    evalUnOpM (M := TBM) .GetThinPointer (mrWidePtrValM thinTB (Int.ofNat len), .Ptr ptrTy) =
+      .ok (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None)) := by
+  refine ⟨?_, rfl, rfl⟩
+  show evalCastPtrToPtr locals op thinTargetTy mem localDecls emptyLayoutTable = _
+  unfold evalCastPtrToPtr
+  simp only [hOp, annealWidePtrVal, layoutPointerBytes, emptyLayoutTable, Nat.beq_refl,
+    Bool.and_self, hThin, hBorrow]
+  unfold deriveStackElemThinPtr
+  rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag, tDepth, aDead⟩
+  dsimp only at hPerm hRoot hRead ⊢
+  cases perm
+  all_goals first
+    | exact absurd rfl hPerm
+    | (simp only [hRoot, hRead, hOff, hBound, hAlready] <;> rfl)
+
+/-- **`AggregateKind.rawPtr` (`ptr::from_raw_parts(_mut)` / `ptr::slice_from_raw_parts(_mut)`) &
+`to_raw_parts` round-trip lockstep**:
+Assembling `Rvalue.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]` for `.slice elemTy` or
+`.str` (`wideAggregatePointeeIsDyn? pointeeTy = some false`) from `.ptr p 8` and `.scalar ⟨len, 8⟩`
+yields `.ok (annealWidePtrVal p len 8) locals₂ mem`, and decomposing via `to_raw_parts` (either via
+`CastKind.ptrToPtr` + `UnOp.ptrMetadata` or field projections `.field 0` + `.field 1`) and
+reassembling via `AggregateKind.rawPtr` is the exact identity on `annealWidePtrVal p len 8`,
+matching MiniRust's `ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))` round-trip with
+`evalUnOp .GetThinPointer` and `PointerMetaKind.encode_as_value` on both `BM` and `TBM`! -/
+theorem aggregate_rawPtr_and_to_raw_parts_roundtrip_lockstep
+    (locals locals₁ locals₂ : List LocalSlot) (pointeeTy : Ty) (mutability : MirAst.Mutability)
+    (dataOp metaOp : Operand) (mem : MirSemantics.Memory) (localDecls : List LocalDecl)
+    (p : ProvenancePtr) (len : Nat) (thin : Ptr) (thinTB : ThinPointer TreeBorrowsProvenance)
+    (hWide : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hData : evalOperand locals dataOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (.ptr p 8) locals₁)
+    (hMeta : evalOperand locals₁ metaOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (.scalar ⟨len, 8⟩) locals₂) :
+    evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]) mem localDecls
+        emptyLayoutTable =
+      .ok (annealWidePtrVal p len 8) locals₂ mem ∧
+    (do
+      let (thinVal, _) ← evalUnOp .GetThinPointer
+        (mrWidePtrVal thin (Int.ofNat len), .Ptr (.Raw .ElementCount))
+      let metaVal ← PointerMetaKind.encode_as_value .ElementCount
+        (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))).metadata
+      let decodedMeta ← PointerMetaKind.decode_value .ElementCount metaVal
+      match thinVal with
+      | .Ptr ⟨thin', none⟩ => pure (Value.Ptr (ThinPointer.widen thin' decodedMeta))
+      | _ => specPanic "expected thin pointer") =
+      .ok (mrWidePtrVal thin (Int.ofNat len)) ∧
+    (do
+      let (thinValTB, _) ← evalUnOpM (M := TBM) .GetThinPointer
+        (mrWidePtrValM thinTB (Int.ofNat len), .Ptr (.Raw .ElementCount))
+      match thinValTB with
+      | .Ptr ⟨thinTB', none⟩ => pure (mrWidePtrValM thinTB' (Int.ofNat len))
+      | _ => specPanic "expected thin pointer") =
+      .ok (mrWidePtrValM thinTB (Int.ofNat len)) := by
+  refine ⟨?_, rfl, rfl⟩
+  show evalAggregateRawPtr locals pointeeTy [dataOp, metaOp] mem localDecls emptyLayoutTable = _
+  unfold evalAggregateRawPtr evalOperands
+  rw [hData]
+  dsimp only [evalOperands]
+  rw [hMeta]
+  dsimp only [evalOperands]
+  simp only [hWide, layoutPointerBytes, emptyLayoutTable, Nat.beq_refl, Bool.and_self,
+    annealWidePtrVal]
+
+/-! ## 3. Symbolic Lockstep Correspondence: `core::intrinsics::size_of_val` & `align_of_val` -/
+
+private theorem nat_ble_eq_false_of_lt {a b : Nat} (h : b < a) : Nat.ble a b = false := by
+  cases hb : Nat.ble a b with
+  | false => rfl
+  | true => exact False.elim (Nat.not_le.mpr h (Nat.le_of_ble_eq_true hb))
+
+private theorem nat_ble_eq_true_of_le : ∀ {a b : Nat}, a ≤ b → Nat.ble a b = true
+  | 0, _, _ => rfl
+  | _ + 1, 0, h => absurd h (Nat.not_succ_le_zero _)
+  | a + 1, b + 1, h => @nat_ble_eq_true_of_le a b (Nat.pred_le_pred h)
+
+/-- **`size_of_val` and `align_of_val` symbolic lockstep on `.slice elemTy`
+(`sizeOfVal_and_alignOfVal_slice_lockstep`)**:
+For any slice element byte size `elemSz`, alignment `elemAlign`, and element count `len < scalarModulus 8`:
+1. MiniRust's `LayoutStrategy.compute_size_and_align vtables (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+   (some (.ElementCount (Int.ofNat len)))` returns `.ok (⟨len * elemSz⟩, ⟨elemAlign⟩)`.
+2. MiniRust's `x86_64.valid_size ⟨len * elemSz⟩` (`inBounds (len * elemSz) .Signed x86_64.PTR_SIZE`,
+   checking `len * elemSz ≤ isize::MAX = 2^63 - 1`) equals `decide (len * elemSz < signedHalfModulus 8)`
+   (`2^63`) — matching the boolean condition of Anneal's `evalSliceSizeOfVal elemSz ⟨len, 8⟩`!
+3. **Normal agreement (`len * elemSz < signedHalfModulus 8`)**:
+   `x86_64.valid_size ⟨len * elemSz⟩ = true`, `evalSliceSizeOfVal elemSz ⟨len, 8⟩ = some ⟨len * elemSz, 8⟩`,
+   Anneal's `evalNonSelectIntrinsicCall .sizeOfVal` writes `.scalar ⟨len * elemSz, 8⟩`, and
+   Anneal's `evalNonSelectIntrinsicCall .alignOfVal` writes `.scalar ⟨elemAlign, 8⟩`.
+4. **Overflow UB agreement (`signedHalfModulus 8 ≤ len * elemSz`)**:
+   `x86_64.valid_size ⟨len * elemSz⟩ = false`, `evalSliceSizeOfVal elemSz ⟨len, 8⟩ = none`, and
+   BOTH Anneal's `evalNonSelectIntrinsicCall .sizeOfVal` and `evalNonSelectIntrinsicCall .alignOfVal`
+   fault with `MirStepNode.fail .ub`! -/
+theorem sizeOfVal_and_alignOfVal_slice_lockstep
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : MirAst.Place) (targetBb : BasicBlockIdx)
+    (elemTy : RigidTy) (elemSz elemAlign : Nat) (p : ProvenancePtr) (len : Nat)
+    (vtables : Ptr → Interp VTable)
+    (hPt : resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps =
+      some (.slice elemTy))
+    (hSz : intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy = some elemSz)
+    (hAlign : intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy = some elemAlign)
+    (hLen : len < scalarModulus 8) :
+    LayoutStrategy.compute_size_and_align vtables (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+        (some (.ElementCount (Int.ofNat len))) =
+      .ok (⟨len * elemSz⟩, ⟨elemAlign⟩) ∧
+    x86_64.valid_size ⟨len * elemSz⟩ = decide (len * elemSz < signedHalfModulus 8) ∧
+    (len * elemSz < signedHalfModulus 8 →
+      x86_64.valid_size ⟨len * elemSz⟩ = true ∧
+      evalSliceSizeOfVal elemSz ⟨len, 8⟩ = some ⟨len * elemSz, 8⟩ ∧
+      evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb =
+        writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨len * elemSz, 8⟩) ∧
+      evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb =
+        writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨elemAlign, 8⟩)) ∧
+    (signedHalfModulus 8 ≤ len * elemSz →
+      x86_64.valid_size ⟨len * elemSz⟩ = false ∧
+      evalSliceSizeOfVal elemSz ⟨len, 8⟩ = none ∧
+      evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb = MirStepNode.fail .ub ∧
+      evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb = MirStepNode.fail .ub) := by
+  have hProdNonneg : (0 : Int) ≤ Int.ofNat len * (elemSz : Int) :=
+    Int.mul_nonneg (Int.natCast_nonneg len) (Int.natCast_nonneg elemSz)
+  have hToNat : (Int.ofNat len * (elemSz : Int)).toNat = len * elemSz := rfl
+  have hComp :
+      LayoutStrategy.compute_size_and_align vtables (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+          (some (.ElementCount (Int.ofNat len))) =
+        .ok (⟨len * elemSz⟩, ⟨elemAlign⟩) := by
+    unfold LayoutStrategy.compute_size_and_align
+    dsimp only
+    rw [ite_eq_left_iff.mpr (fun h => absurd hProdNonneg h), hToNat]
+    rfl
+  have hHalf : (2 : Int) ^ (8 * x86_64.PTR_SIZE.bytes - 1) =
+      ((signedHalfModulus 8 : Nat) : Int) := by
+    decide
+  have hValidEq :
+      x86_64.valid_size ⟨len * elemSz⟩ = decide (len * elemSz < signedHalfModulus 8) := by
+    unfold x86_64.valid_size inBounds Size.bits
+    rw [hHalf]
+    have h1 : decide (-((signedHalfModulus 8 : Nat) : Int) ≤ ((len * elemSz : Nat) : Int)) =
+        true :=
+      decide_eq_true (Int.le_trans (by decide : -((signedHalfModulus 8 : Nat) : Int) ≤ 0)
+        (Int.natCast_nonneg (len * elemSz)))
+    have h2 : decide (((len * elemSz : Nat) : Int) < ((signedHalfModulus 8 : Nat) : Int)) =
+        decide (len * elemSz < signedHalfModulus 8) := by
+      by_cases h : len * elemSz < signedHalfModulus 8
+      · rw [decide_eq_true h]
+        exact decide_eq_true (by omega)
+      · rw [decide_eq_false h]
+        exact decide_eq_false (by omega)
+    rw [h1, h2, Bool.true_and]
+  have hWrap : wrapScalarBits len (scalarModulus 8) = len := by
+    unfold wrapScalarBits
+    rw [nat_ble_eq_false_of_lt hLen]
+  have hMulComm : Nat.mul elemSz len = len * elemSz := Nat.mul_comm elemSz len
+  refine ⟨hComp, hValidEq, ?_, ?_⟩
+  · intro hLt
+    have hBle : Nat.ble (signedHalfModulus 8) ( len * elemSz ) = false :=
+      nat_ble_eq_false_of_lt hLt
+    have hEvSlice : evalSliceSizeOfVal elemSz ⟨len, 8⟩ = some ⟨len * elemSz, 8⟩ := by
+      unfold evalSliceSizeOfVal
+      simp only [Nat.beq_refl, hWrap, hMulComm, hBle]
+    refine ⟨hValidEq.trans (decide_eq_true hLt), hEvSlice, ?_, ?_⟩
+    · unfold evalNonSelectIntrinsicCall writeIntrinsicScalarResult
+      simp only [annealWidePtrVal, hPt, Nat.beq_refl, hSz, hEvSlice]
+    · unfold evalNonSelectIntrinsicCall writeIntrinsicScalarResult
+      simp only [annealWidePtrVal, hPt, Nat.beq_refl, hSz, hEvSlice, hAlign]
+  · intro hGe
+    have hBleT : Nat.ble (signedHalfModulus 8) (len * elemSz) = true :=
+      nat_ble_eq_true_of_le hGe
+    have hEvNone : evalSliceSizeOfVal elemSz ⟨len, 8⟩ = none := by
+      unfold evalSliceSizeOfVal
+      simp only [Nat.beq_refl, hWrap, hMulComm, hBleT]
+    refine ⟨hValidEq.trans (decide_eq_false (Nat.not_lt.mpr hGe)), hEvNone, ?_, ?_⟩
+    · unfold evalNonSelectIntrinsicCall
+      simp only [annealWidePtrVal, hPt, Nat.beq_refl, hSz, hEvNone]
+    · unfold evalNonSelectIntrinsicCall
+      simp only [annealWidePtrVal, hPt, Nat.beq_refl, hSz, hAlign, hEvNone]
+
+/-- **`size_of_val` and `align_of_val` symbolic lockstep on `str`, empty slices (`len = 0`), and
+ZST slices (`elemSz = 0`)**:
+1. For `str` (`LayoutStrategy.Slice ⟨1⟩ ⟨1⟩`), `compute_size_and_align` returns `(⟨len⟩, ⟨1⟩)`;
+   when `len < signedHalfModulus 8`, Anneal writes `len` for `size_of_val` and `1` for
+   `align_of_val`, and when `signedHalfModulus 8 ≤ len` (`len < scalarModulus 8`), both fault `.ub`.
+2. For an empty slice (`len = 0`), `0 * elemSz = 0 < signedHalfModulus 8` for every `elemSz`, so
+   `evalSliceSizeOfVal elemSz ⟨0, 8⟩ = some ⟨0, 8⟩` and `compute_size_and_align` returns
+   `(⟨0⟩, ⟨elemAlign⟩)`.
+3. For a ZST slice (`elemSz = 0`), `len * 0 = 0 < signedHalfModulus 8` for every
+   `len < scalarModulus 8` (even when `signedHalfModulus 8 ≤ len`!), so both Anneal and MiniRust
+   succeed with byte size `0` and alignment `elemAlign`. -/
+theorem sizeOfVal_and_alignOfVal_str_empty_zst_lockstep
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : MirAst.Place) (targetBb : BasicBlockIdx)
+    (p : ProvenancePtr) (len elemSz elemAlign : Nat) (vtables : Ptr → Interp VTable)
+    (hPtStr : resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps = some .str)
+    (hLen : len < scalarModulus 8) :
+    LayoutStrategy.compute_size_and_align vtables (.Slice ⟨1⟩ ⟨1⟩)
+        (some (.ElementCount (Int.ofNat len))) =
+      .ok (⟨len⟩, ⟨1⟩) ∧
+    (len < signedHalfModulus 8 →
+      evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb =
+        writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨len, 8⟩) ∧
+      evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb =
+        writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)) ∧
+    (signedHalfModulus 8 ≤ len →
+      evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb = MirStepNode.fail .ub ∧
+      evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb = MirStepNode.fail .ub) ∧
+    (evalSliceSizeOfVal elemSz ⟨0, 8⟩ = some ⟨0, 8⟩ ∧
+     LayoutStrategy.compute_size_and_align vtables (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+         (some (.ElementCount 0)) =
+       .ok (⟨0⟩, ⟨elemAlign⟩)) ∧
+    (evalSliceSizeOfVal 0 ⟨len, 8⟩ = some ⟨0, 8⟩ ∧
+     LayoutStrategy.compute_size_and_align vtables (.Slice ⟨0⟩ ⟨elemAlign⟩)
+         (some (.ElementCount (Int.ofNat len))) =
+       .ok (⟨0⟩, ⟨elemAlign⟩)) := by
+  have hWrap : wrapScalarBits len (scalarModulus 8) = len := by
+    unfold wrapScalarBits
+    cases hb : Nat.ble (scalarModulus 8) len with
+    | false => rfl
+    | true => exact False.elim (Nat.not_le.mpr hLen (Nat.le_of_ble_eq_true hb))
+  have hCompStr :
+      LayoutStrategy.compute_size_and_align vtables (.Slice ⟨1⟩ ⟨1⟩)
+          (some (.ElementCount (Int.ofNat len))) =
+        .ok (⟨len⟩, ⟨1⟩) := by
+    unfold LayoutStrategy.compute_size_and_align
+    dsimp only
+    have hPos : (0 : Int) ≤ Int.ofNat len * ((1 : Nat) : Int) :=
+      Int.mul_nonneg (Int.natCast_nonneg len) (Int.natCast_nonneg 1)
+    have hToNat1 : (Int.ofNat len * ((1 : Nat) : Int)).toNat = len := Nat.mul_one len
+    rw [ite_eq_left_iff.mpr (fun h => absurd hPos h), hToNat1]
+    rfl
+  have hCompZst :
+      LayoutStrategy.compute_size_and_align vtables (.Slice ⟨0⟩ ⟨elemAlign⟩)
+          (some (.ElementCount (Int.ofNat len))) =
+        .ok (⟨0⟩, ⟨elemAlign⟩) := by
+    unfold LayoutStrategy.compute_size_and_align
+    simp [Pure.pure, Except.pure]
+  have hMulZero : Nat.mul 0 len = 0 := Nat.zero_mul len
+  have hZstSlice : evalSliceSizeOfVal 0 ⟨len, 8⟩ = some ⟨0, 8⟩ := by
+    unfold evalSliceSizeOfVal
+    simp only [Nat.beq_refl, hWrap, hMulZero]
+    rfl
+  have hCompEmpty :
+      LayoutStrategy.compute_size_and_align vtables (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+          (some (.ElementCount 0)) =
+        .ok (⟨0⟩, ⟨elemAlign⟩) := by
+    unfold LayoutStrategy.compute_size_and_align
+    simp [Pure.pure, Except.pure]
+  have hMulOne : Nat.mul 1 len = len := Nat.one_mul len
+  refine ⟨hCompStr, ?_, ?_, ⟨rfl, hCompEmpty⟩, ⟨hZstSlice, hCompZst⟩⟩
+  · intro hLt
+    have hBle : Nat.ble (signedHalfModulus 8) len = false := nat_ble_eq_false_of_lt hLt
+    have hEvStr : evalSliceSizeOfVal 1 ⟨len, 8⟩ = some ⟨len, 8⟩ := by
+      unfold evalSliceSizeOfVal
+      simp only [Nat.beq_refl, hWrap, hMulOne, hBle]
+    refine ⟨?_, ?_⟩
+    · unfold evalNonSelectIntrinsicCall writeIntrinsicScalarResult
+      simp only [annealWidePtrVal, hPtStr, Nat.beq_refl, hEvStr]
+    · unfold evalNonSelectIntrinsicCall writeIntrinsicScalarResult
+      simp only [annealWidePtrVal, hPtStr, Nat.beq_refl, hEvStr]
+  · intro hGe
+    have hBleT : Nat.ble (signedHalfModulus 8) len = true := nat_ble_eq_true_of_le hGe
+    have hEvNone : evalSliceSizeOfVal 1 ⟨len, 8⟩ = none := by
+      unfold evalSliceSizeOfVal
+      simp only [Nat.beq_refl, hWrap, hMulOne, hBleT]
+    refine ⟨?_, ?_⟩
+    · unfold evalNonSelectIntrinsicCall
+      simp only [annealWidePtrVal, hPtStr, Nat.beq_refl, hEvNone]
+    · unfold evalNonSelectIntrinsicCall
+      simp only [annealWidePtrVal, hPtStr, Nat.beq_refl, hEvNone]
+
+/-! ## 4. Symbolic & Concrete `slice::from_raw_parts(_mut)`, `Rvalue.len (*s)`, Checked Indexing & Tree Borrows -/
+
+/-- **Symbolic `Rvalue.len (*place)` on a `.disabled` wide slice pointer vs. `UnOp.ptrMetadata`**:
+When `entry.perm = .disabled`, `evalRvalue locals (.len place)` faults with `.ub`, whereas
+`evalRvalue locals (.unaryOp .ptrMetadata ptrOp)` STILL succeeds with
+`.ok (.scalar ⟨len, 8⟩) locals' mem`! -/
+theorem evalRvalue_len_wide_slice_borrow_and_disabled_contrast
+    (locals locals' : List LocalSlot) (place : MirAst.Place) (ptrOp : Operand)
+    (mem : MirSemantics.Memory) (localDecls : List LocalDecl)
+    (initProj : List ProjectionElem) (elem : RigidTy) (lIdx : LayoutIdx)
+    (entry : BorrowEntry) (p : ProvenancePtr) (len : Nat)
+    (hTy : placeTy localDecls emptyLayoutTable place =
+      some { kind := .slice elem, layoutIdx := lIdx })
+    (hSplit : splitLastDeref? place.projection = some initProj)
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
+      mem.globals emptyLayoutTable mem.callerLocals localDecls mem.callStack =
+        .ok (annealWidePtrVal p len 8) locals')
+    (hOp : evalOperand locals ptrOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals')
+    (hBorrow : lookupBorrow mem.borrows p.tag = some entry)
+    (hDis : entry.perm = .disabled) :
+    evalRvalue locals (.len place) mem localDecls emptyLayoutTable = .ub ∧
+    evalRvalue locals (.unaryOp .ptrMetadata ptrOp) mem localDecls emptyLayoutTable =
+      .ok (.scalar ⟨len, 8⟩) locals' mem := by
+  refine ⟨?_, ?_⟩
+  · show evalPlaceLen locals place mem localDecls emptyLayoutTable = .ub
+    unfold evalPlaceLen
+    dsimp (config := { zeta := true }) only
+    rw [hTy]
+    dsimp only
+    rw [hSplit]
+    dsimp only
+    rw [hRead]
+    simp only [annealWidePtrVal, layoutPointerBytes, emptyLayoutTable, Nat.beq_refl, Bool.and_self,
+      hBorrow, hDis]
+    rfl
+  · show evalUnaryPtrMetadata locals ptrOp mem localDecls emptyLayoutTable = _
+    unfold evalUnaryPtrMetadata
+    simp only [hOp, annealWidePtrVal, layoutPointerBytes, emptyLayoutTable, Nat.beq_refl,
+      Bool.and_self]
+
+/-! ## 5. Concrete Multi-Way Execution Witnesses & Negative/Divergence Canaries -/
+
+/-- `u32` array `[u32; 4]` MIR type and declaration. -/
+def arrU32_4Ty : Ty := { kind := .array (.uint .u32) 4, layoutIdx := 0 }
+def arrU32_4Decl : LocalDecl := { mutability := .mut, ty := arrU32_4Ty, debugName := some "arr" }
+
+/-- Raw wide slice pointer `*const [u32]` and `*mut [u32]` MIR types and declarations. -/
+def rawConstSliceU32Ty : Ty := { kind := .rawPtr .not (.slice (.uint .u32)), layoutIdx := 0 }
+def rawMutSliceU32Ty : Ty := { kind := .rawPtr .mut (.slice (.uint .u32)), layoutIdx := 0 }
+def rawConstSliceU8Ty : Ty := { kind := .rawPtr .not (.slice (.uint .u8)), layoutIdx := 0 }
+def rawConstStrTy : Ty := { kind := .rawPtr .not .str, layoutIdx := 0 }
+def rawConstUnitTy : Ty := { kind := .rawPtr .not (.tuple []), layoutIdx := 0 }
+def usizeMirTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
+def sliceU32PointeeTy : Ty := { kind := .slice (.uint .u32), layoutIdx := 0 }
+def strPointeeMirTy : Ty := { kind := .str, layoutIdx := 0 }
+
+def rawConstSliceU32Decl : LocalDecl :=
+  { mutability := .mut, ty := rawConstSliceU32Ty, debugName := some "const_sl" }
+def rawMutSliceU32Decl : LocalDecl :=
+  { mutability := .mut, ty := rawMutSliceU32Ty, debugName := some "mut_sl" }
+def rawConstUnitDecl : LocalDecl :=
+  { mutability := .mut, ty := rawConstUnitTy, debugName := some "data_ptr" }
+def usizeMirDecl : LocalDecl :=
+  { mutability := .mut, ty := usizeMirTy, debugName := some "len_usize" }
+
+def constUsize (n : Nat) : Operand :=
+  .constant { ty := usizeMirTy, val := .scalar (.int ⟨n, 8⟩) }
+
+/-- Extract the stop reason (`Option Stop`, which has `DecidableEq`) after `n` `Mach` steps. -/
+def stopAfterM (m : Mach) (n : Nat) : Option Stop :=
+  match Interp.steps n m with
+  | .error e => some e
+  | .ok _ => none
+
+/-- Extract the stop reason (`Option Stop`, which has `DecidableEq`) after `n` `MachTB` steps. -/
+def stopAfterTB (m : MachTB) (n : Nat) : Option Stop :=
+  match Interp.stepsTB n m with
+  | .error e => some e
+  | .ok _ => none
+
+/-- **Witness 1 (`wideSliceFromRawPartsMetadataRoundTrip_three_way`)**:
+Concrete 3-way witness across Anneal (`mirTree`), MiniRust `Machine<BasicMemory>` (`Mach`), and
+MiniRust `Machine<TreeBorrowsMemory>` (`MachTB`) for:
+1. Initializing `_2 : [u32; 4] = [_1, 20, 30, 40]` (`_1 = 42`) and taking a raw element pointer
+   `_3 = &raw mut (_2[0])`,
+2. Assembling a wide raw slice pointer `_4 = ptr::slice_from_raw_parts_mut(_3, 4)`
+   (`AggregateKind.rawPtr` in Anneal; `Transmute` from `mrWidePairTupleTy` to
+   `Type.Ptr (.Raw .ElementCount)` in MiniRust),
+3. Casting wide-to-wide `_5 = _4 as *const [u32]` (`CastKind.ptrToPtr` $\mapsto$ identity),
+4. Decomposing via `to_raw_parts`: `_6 = _5 as *const ()` (`CastKind.ptrToPtr` $\mapsto$
+   `UnOp.GetThinPointer`) and `_7 = PtrMetadata(_5)`,
+5. Reassembling `_8 = ptr::slice_from_raw_parts(_6, _7)` and reading `(*_8)[0] + (_7 as u32) = 42 + 4 = 46`! -/
+def wideRawPartsMir : CapturedMir :=
+  ptrBody "witness::wide_raw_parts_round_trip"
+    [u32Decl, u32Decl, arrU32_4Decl, ptrMutU32Decl, rawMutSliceU32Decl, rawConstSliceU32Decl,
+     rawConstUnitDecl, usizeMirDecl, rawConstSliceU32Decl, usizeMirDecl, u32Decl, u32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+     .storageLive 6, .storageLive 7, .storageLive 8, .storageLive 9,
+     .storageLive 10, .storageLive 11,
+     .assign (local_ 2)
+       (.aggregate (.array u32Ty) [.copy (local_ 1), constU32 20, constU32 30, constU32 40]),
+     .assign (local_ 3)
+       (.rawPtr .mut { local_ := 2, projection := [.constantIndex 0 4 false] }),
+     .assign (local_ 4)
+       (.aggregate (.rawPtr sliceU32PointeeTy .mut)
+         [.copy (local_ 3), constUsize 4]),
+     .assign (local_ 5) (.cast .ptrToPtr (.copy (local_ 4)) rawConstSliceU32Ty),
+     .assign (local_ 6) (.cast .ptrToPtr (.copy (local_ 5)) rawConstUnitTy),
+     .assign (local_ 7) (.unaryOp .ptrMetadata (.copy (local_ 5))),
+     .assign (local_ 8)
+       (.aggregate (.rawPtr sliceU32PointeeTy .not)
+         [.copy (local_ 6), .copy (local_ 7)]),
+     .assign (local_ 9) (.use (constUsize 0)),
+     .assign (local_ 10)
+       (.use (.copy { local_ := 8, projection := [.deref, .index 9] })),
+     .assign (local_ 11) (.cast .intToInt (.copy (local_ 7)) u32Ty),
+     .assign (local_ 0) (.binaryOp .add (.copy (local_ 10)) (.copy (local_ 11)))]
+
+def wideRawPartsFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, .Array (.Int u32) 4),
+    (localName 3, .Ptr (.Raw .None)),
+    (localName 4, .Ptr (.Raw .ElementCount)),
+    (localName 5, .Ptr (.Raw .ElementCount)),
+    (localName 6, .Ptr (.Raw .None)),
+    (localName 7, .Int IntType.usize_ty),
+    (localName 8, .Ptr (sliceRefPtrType .not ⟨4⟩ ⟨4⟩)),
+    (localName 9, .Int IntType.usize_ty),
+    (localName 10, .Int u32),
+    (localName 11, .Int u32),
+    (localName 12, mrWidePairTupleTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3), .StorageLive (localName 4),
+      .StorageLive (localName 5), .StorageLive (localName 6), .StorageLive (localName 7),
+      .StorageLive (localName 8), .StorageLive (localName 9), .StorageLive (localName 10),
+      .StorageLive (localName 11), .StorageLive (localName 12),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Load (.Local (localName 1)), .Constant (.Int 20) (.Int u32),
+                 .Constant (.Int 30) (.Int u32), .Constant (.Int 40) (.Int u32)]
+          (.Array (.Int u32) 4)),
+      .Assign (.Local (localName 3)) (.AddrOf (.Local (localName 2)) (.Raw .None)),
+      .Assign (.Local (localName 4))
+        (.UnOp (.Cast (.Transmute (.Ptr (.Raw .ElementCount))))
+          (.Tuple [.Load (.Local (localName 3)), .Constant (.Int 4) (.Int IntType.usize_ty)]
+            mrWidePairTupleTy)),
+      .Assign (.Local (localName 5)) (.Load (.Local (localName 4))),
+      .Assign (.Local (localName 6)) (.UnOp .GetThinPointer (.Load (.Local (localName 5)))),
+      .Assign (.Local (localName 12))
+        (.UnOp (.Cast (.Transmute mrWidePairTupleTy)) (.Load (.Local (localName 5)))),
+      .Assign (.Local (localName 7)) (.Load (.Field (.Local (localName 12)) 1)),
+      .Assign (.Local (localName 8))
+        (.UnOp (.Cast (.Transmute (.Ptr (sliceRefPtrType .not ⟨4⟩ ⟨4⟩))))
+          (.Tuple [.Load (.Local (localName 6)), .Load (.Local (localName 7))]
+            mrWidePairTupleTy)),
+      .Assign (.Local (localName 9)) (.Constant (.Int 0) (.Int IntType.usize_ty)),
+      .Assign (.Local (localName 10))
+        (.Load (.Index (.Deref (.Load (.Local (localName 8))) (.Slice (.Int u32)))
+          (.Load (.Local (localName 9))))),
+      .Assign (.Local (localName 11)) (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 7)))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 10))) (.Load (.Local (localName 11))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+def wideRawPartsS0 : MachineState := initMachineState wideRawPartsMir [.scalar ⟨42, 4⟩]
+def wideRawPartsMInit : Mach :=
+  machine wideRawPartsMir wideRawPartsFn wideRawPartsS0.frame.locals wideRawPartsFn.start
+def wideRawPartsTBInit : MachTB := liftMachToTB wideRawPartsMInit
+
+/-- **Three-way lockstep agreement (`wideSliceFromRawPartsMetadataRoundTrip_three_way`)**:
+Anneal (`mirTree`), MiniRust `Machine<BasicMemory>` (`Interp.steps 25`), and MiniRust
+`Machine<TreeBorrowsMemory>` (`Interp.stepsTB 25`) all execute the wide-slice
+`from_raw_parts` $\rightarrow$ `PtrToPtr` wide-to-wide $\rightarrow$ `to_raw_parts`
+(`PtrToPtr` wide-to-thin / `GetThinPointer` + `PtrMetadata`) $\rightarrow$ `from_raw_parts`
+round-trip and return `42 + 4 = 46` without UB! -/
+theorem wideSliceFromRawPartsMetadataRoundTrip_three_way :
+    (∃ mem, ReachesRet (mirTree wideRawPartsMir wideRawPartsS0) []
+      (.normal (.scalar ⟨46, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree wideRawPartsMir wideRawPartsS0) ∧
+    (Interp.steps 25 wideRawPartsMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 46 }, [1]) ∧
+    (Interp.stepsTB 25 wideRawPartsTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 46 := by
+  refine ⟨⟨_, runA_sound wideRawPartsMir 40 _ _ _ rfl⟩,
+    runA_noUB wideRawPartsMir 40 _ _ _ rfl,
+    by decide +kernel,
+    by decide +kernel⟩
+
+/-- **Witness 2 (`wideSliceIndexReadWriteAndOobUb_three_way`)**:
+Concrete 3-way witness for `slice::from_raw_parts_mut` (`&mut *ptr::slice_from_raw_parts_mut`):
+1. Initializes `[u32; 4] = [10, 20, 30, 40]`,
+2. Forms a wide mutable slice pointer (`len = 4`),
+3. Reads element `(*s)[2] = 30`, writes `(*s)[1] = 99`, reads `(*s)[1] = 99` and `Rvalue.len(*s) = 4`,
+   and returns `30 + 99 + 4 = 133` across Anneal, `Mach`, and `MachTB`!
+4. Out-of-bounds index `(*s)[4]` (`idx = 4 ≥ len = 4`) faults with `.ub` in Anneal and
+   `some (.ub "access to out-of-bounds index")` in both `Mach` and `MachTB`! -/
+def wideSliceIdxReadWriteMir : CapturedMir :=
+  ptrBody "witness::wide_slice_idx_read_write"
+    [u32Decl, u32Decl, arrU32_4Decl, ptrMutU32Decl, rawMutSliceU32Decl,
+     usizeMirDecl, usizeMirDecl, u32Decl, u32Decl, usizeMirDecl, u32Decl, u32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+     .storageLive 6, .storageLive 7, .storageLive 8, .storageLive 9, .storageLive 10, .storageLive 11,
+     .assign (local_ 2)
+       (.aggregate (.array u32Ty) [constU32 10, constU32 20, constU32 30, constU32 40]),
+     .assign (local_ 3)
+       (.rawPtr .mut { local_ := 2, projection := [.constantIndex 0 4 false] }),
+     .assign (local_ 4)
+       (.aggregate (.rawPtr sliceU32PointeeTy .mut) [.copy (local_ 3), constUsize 4]),
+     .assign (local_ 5) (.use (constUsize 2)),
+     .assign (local_ 6) (.use (constUsize 1)),
+     .assign (local_ 7)
+       (.use (.copy { local_ := 4, projection := [.deref, .index 5] })),
+     .assign { local_ := 4, projection := [.deref, .index 6] } (.use (constU32 99)),
+     .assign (local_ 8)
+       (.use (.copy { local_ := 4, projection := [.deref, .index 6] })),
+     .assign (local_ 9) (.len (derefPlace 4)),
+     .assign (local_ 10) (.cast .intToInt (.copy (local_ 9)) u32Ty),
+     .assign (local_ 11) (.binaryOp .add (.copy (local_ 7)) (.copy (local_ 8))),
+     .assign (local_ 0) (.binaryOp .add (.copy (local_ 11)) (.copy (local_ 10)))]
+
+def wideSliceIdxReadWriteFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, .Array (.Int u32) 4),
+    (localName 3, .Ptr (.Raw .None)),
+    (localName 4, .Ptr (sliceRefPtrType .mut ⟨4⟩ ⟨4⟩)),
+    (localName 5, .Int IntType.usize_ty),
+    (localName 6, .Int IntType.usize_ty),
+    (localName 7, .Int u32),
+    (localName 8, .Int u32),
+    (localName 9, .Int IntType.usize_ty),
+    (localName 10, .Int u32),
+    (localName 11, .Int u32),
+    (localName 12, mrWidePairTupleTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3), .StorageLive (localName 4),
+      .StorageLive (localName 5), .StorageLive (localName 6), .StorageLive (localName 7),
+      .StorageLive (localName 8), .StorageLive (localName 9), .StorageLive (localName 10),
+      .StorageLive (localName 11), .StorageLive (localName 12),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 10) (.Int u32), .Constant (.Int 20) (.Int u32),
+                 .Constant (.Int 30) (.Int u32), .Constant (.Int 40) (.Int u32)]
+          (.Array (.Int u32) 4)),
+      .Assign (.Local (localName 3)) (.AddrOf (.Local (localName 2)) (.Raw .None)),
+      .Assign (.Local (localName 4))
+        (.UnOp (.Cast (.Transmute (.Ptr (sliceRefPtrType .mut ⟨4⟩ ⟨4⟩))))
+          (.Tuple [.Load (.Local (localName 3)), .Constant (.Int 4) (.Int IntType.usize_ty)]
+            mrWidePairTupleTy)),
+      .Assign (.Local (localName 5)) (.Constant (.Int 2) (.Int IntType.usize_ty)),
+      .Assign (.Local (localName 6)) (.Constant (.Int 1) (.Int IntType.usize_ty)),
+      .Assign (.Local (localName 7))
+        (.Load (.Index (.Deref (.Load (.Local (localName 4))) (.Slice (.Int u32)))
+          (.Load (.Local (localName 5))))),
+      .Assign
+        (.Index (.Deref (.Load (.Local (localName 4))) (.Slice (.Int u32)))
+          (.Load (.Local (localName 6))))
+        (.Constant (.Int 99) (.Int u32)),
+      .Assign (.Local (localName 8))
+        (.Load (.Index (.Deref (.Load (.Local (localName 4))) (.Slice (.Int u32)))
+          (.Load (.Local (localName 6))))),
+      .Assign (.Local (localName 12))
+        (.UnOp (.Cast (.Transmute mrWidePairTupleTy)) (.Load (.Local (localName 4)))),
+      .Assign (.Local (localName 9)) (.Load (.Field (.Local (localName 12)) 1)),
+      .Assign (.Local (localName 10)) (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 9)))),
+      .Assign (.Local (localName 11))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 7))) (.Load (.Local (localName 8)))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 11))) (.Load (.Local (localName 10))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+/-- Out-of-bounds wide-slice indexing companion (`idx = 4` on `len = 4`). -/
+def wideSliceIdxOobMir : CapturedMir :=
+  ptrBody "witness::wide_slice_idx_oob_ub"
+    [u32Decl, u32Decl, arrU32_4Decl, ptrMutU32Decl, rawMutSliceU32Decl, usizeMirDecl]
+    [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+     .assign (local_ 2)
+       (.aggregate (.array u32Ty) [constU32 10, constU32 20, constU32 30, constU32 40]),
+     .assign (local_ 3)
+       (.rawPtr .mut { local_ := 2, projection := [.constantIndex 0 4 false] }),
+     .assign (local_ 4)
+       (.aggregate (.rawPtr sliceU32PointeeTy .mut) [.copy (local_ 3), constUsize 4]),
+     .assign (local_ 5) (.use (constUsize 4)),
+     .assign (local_ 0)
+       (.use (.copy { local_ := 4, projection := [.deref, .index 5] }))]
+
+def wideSliceIdxOobFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, .Array (.Int u32) 4),
+    (localName 3, .Ptr (.Raw .None)),
+    (localName 4, .Ptr (sliceRefPtrType .mut ⟨4⟩ ⟨4⟩)),
+    (localName 5, .Int IntType.usize_ty)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .StorageLive (localName 4), .StorageLive (localName 5),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 10) (.Int u32), .Constant (.Int 20) (.Int u32),
+                 .Constant (.Int 30) (.Int u32), .Constant (.Int 40) (.Int u32)]
+          (.Array (.Int u32) 4)),
+      .Assign (.Local (localName 3)) (.AddrOf (.Local (localName 2)) (.Raw .None)),
+      .Assign (.Local (localName 4))
+        (.UnOp (.Cast (.Transmute (.Ptr (sliceRefPtrType .mut ⟨4⟩ ⟨4⟩))))
+          (.Tuple [.Load (.Local (localName 3)), .Constant (.Int 4) (.Int IntType.usize_ty)]
+            mrWidePairTupleTy)),
+      .Assign (.Local (localName 5)) (.Constant (.Int 4) (.Int IntType.usize_ty)),
+      .Assign (.Local (localName 0))
+        (.Load (.Index (.Deref (.Load (.Local (localName 4))) (.Slice (.Int u32)))
+          (.Load (.Local (localName 5)))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+def wideSliceIdxReadWriteS0 : MachineState :=
+  initMachineState wideSliceIdxReadWriteMir [.scalar ⟨0, 4⟩]
+def wideSliceIdxReadWriteMInit : Mach :=
+  machine wideSliceIdxReadWriteMir wideSliceIdxReadWriteFn
+    wideSliceIdxReadWriteS0.frame.locals wideSliceIdxReadWriteFn.start
+def wideSliceIdxReadWriteTBInit : MachTB := liftMachToTB wideSliceIdxReadWriteMInit
+
+def wideSliceIdxOobS0 : MachineState := initMachineState wideSliceIdxOobMir [.scalar ⟨0, 4⟩]
+def wideSliceIdxOobMInit : Mach :=
+  machine wideSliceIdxOobMir wideSliceIdxOobFn wideSliceIdxOobS0.frame.locals wideSliceIdxOobFn.start
+def wideSliceIdxOobTBInit : MachTB := liftMachToTB wideSliceIdxOobMInit
+
+/-- **Three-way lockstep agreement (`wideSliceIndexReadWriteAndOobUb_three_way`)**:
+1. In-bounds wide-slice indexing `(*_4)[2]` read (`30`), `(*_4)[1] = 99` write, `(*_4)[1]` read
+   (`99`), and `Rvalue.len(*_4)` (`4`) return `133` in Anneal (`mirTree`), `Mach` (`steps 26`),
+   and `MachTB` (`stepsTB 26`).
+2. Out-of-bounds wide-slice indexing `(*_4)[4]` (`4 ≥ 4`) faults with UB in Anneal (`FaultNow`),
+   `Mach` (`"access to out-of-bounds index"`), and `MachTB` (`"access to out-of-bounds index"`). -/
+theorem wideSliceIndexReadWriteAndOobUb_three_way :
+    (∃ mem, ReachesRet (mirTree wideSliceIdxReadWriteMir wideSliceIdxReadWriteS0) []
+      (.normal (.scalar ⟨133, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree wideSliceIdxReadWriteMir wideSliceIdxReadWriteS0) ∧
+    (Interp.steps 26 wideSliceIdxReadWriteMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 133 }, [1]) ∧
+    (Interp.stepsTB 26 wideSliceIdxReadWriteTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 133 ∧
+    (∃ tr u, Reaches (mirTree wideSliceIdxOobMir wideSliceIdxOobS0) tr u ∧ FaultNow u) ∧
+    stopAfterM wideSliceIdxOobMInit 10 = some (.ub "access to out-of-bounds index") ∧
+    stopAfterTB wideSliceIdxOobTBInit 10 = some (.ub "access to out-of-bounds index") := by
+  refine ⟨⟨_, runA_sound wideSliceIdxReadWriteMir 40 _ _ _ rfl⟩,
+    runA_noUB wideSliceIdxReadWriteMir 40 _ _ _ rfl,
+    by decide +kernel,
+    by decide +kernel,
+    faultsA_sound wideSliceIdxOobMir 30 _ rfl,
+    by decide +kernel,
+    by decide +kernel⟩
+
+/-- `PointeeInfo` for `[u32; 4]` (`size = 16, align = 4`). -/
+@[reducible]
+def arrU32_4PointeeInfo : Gen.PointeeInfo :=
+  { layout := .Sized ⟨16⟩ ⟨4⟩
+    inhabited := true
+    unsafe_cells := .Sized []
+    freeze := true
+    unpin := true }
+
+/-- **Witness 3 (`wideSliceTreeBorrowsDisabledVsMetadataOk_three_way`)**:
+Tree Borrows `Disabled` UB on dereferencing a wide slice reference after a conflicting parent write,
+contrasted with `UnOp.ptrMetadata` succeeding without dereferencing:
+1. `_3 = &mut _2` (or raw slice pointer `_4` over `_2 : [u32; 4]`),
+2. Overwriting `_2` directly disables the slice borrow tag,
+3. Dereferencing `(*_4)[0]` faults with UB in Anneal and
+   `some (.ub "Tree Borrows: local read of Disabled reference")` in `MachTB`,
+4. Whereas extracting `UnOp.ptrMetadata(_4)` after the parent write (`wideSliceMetadataAfterParentWriteMir`)
+   succeeds and returns `4` across Anneal, `Mach`, and `MachTB`! -/
+def wideSliceDisabledDerefUbMir : CapturedMir :=
+  ptrBody "witness::wide_slice_disabled_deref_ub"
+    [u32Decl, u32Decl, arrU32_4Decl, ptrMutU32Decl, rawMutSliceU32Decl, usizeMirDecl]
+    [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+     .assign (local_ 2)
+       (.aggregate (.array u32Ty) [constU32 10, constU32 20, constU32 30, constU32 40]),
+     .assign (local_ 3)
+       (.rawPtr .mut { local_ := 2, projection := [.constantIndex 0 4 false] }),
+     .assign (local_ 4)
+       (.aggregate (.rawPtr sliceU32PointeeTy .mut) [.copy (local_ 3), constUsize 4]),
+     -- Direct write to `_2` disables the borrow tag carried by `_4`!
+     .assign (local_ 2)
+       (.aggregate (.array u32Ty) [constU32 1, constU32 2, constU32 3, constU32 4]),
+     .assign (local_ 5) (.use (constUsize 0)),
+     .assign (local_ 0)
+       (.use (.copy { local_ := 4, projection := [.deref, .index 5] }))]
+
+def wideSliceDisabledDerefUbFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, .Array (.Int u32) 4),
+    (localName 3, .Ptr (.Ref .Mutable arrU32_4PointeeInfo)),
+    (localName 4, .Ptr (sliceRefPtrType .mut ⟨4⟩ ⟨4⟩)),
+    (localName 5, .Int IntType.usize_ty)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .StorageLive (localName 4), .StorageLive (localName 5),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 10) (.Int u32), .Constant (.Int 20) (.Int u32),
+                 .Constant (.Int 30) (.Int u32), .Constant (.Int 40) (.Int u32)]
+          (.Array (.Int u32) 4)),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Local (localName 2)) (.Ref .Mutable arrU32_4PointeeInfo)),
+      .Assign (.Local (localName 4))
+        (.UnOp (.Cast (.Transmute (.Ptr (sliceRefPtrType .mut ⟨4⟩ ⟨4⟩))))
+          (.Tuple [.UnOp (.Cast (.Transmute (.Ptr (.Raw .None)))) (.Load (.Local (localName 3))),
+                   .Constant (.Int 4) (.Int IntType.usize_ty)]
+            mrWidePairTupleTy)),
+      -- Activate `Reserved -> Unique` on `_4` by writing element 0, then overwrite `_2` directly
+      -- (`Foreign Write -> Disabled`), then read `(*_4)[0]` (`local read of Disabled reference`)!
+      .Assign (.Local (localName 5)) (.Constant (.Int 0) (.Int IntType.usize_ty)),
+      .Assign
+        (.Index (.Deref (.Load (.Local (localName 4))) (.Slice (.Int u32)))
+          (.Load (.Local (localName 5))))
+        (.Constant (.Int 77) (.Int u32)),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 1) (.Int u32), .Constant (.Int 2) (.Int u32),
+                 .Constant (.Int 3) (.Int u32), .Constant (.Int 4) (.Int u32)]
+          (.Array (.Int u32) 4)),
+      .Assign (.Local (localName 0))
+        (.Load (.Index (.Deref (.Load (.Local (localName 4))) (.Slice (.Int u32)))
+          (.Load (.Local (localName 5)))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+/-- Companion that extracts `UnOp.ptrMetadata(_4)` after the parent write disables `_4`'s borrow tag. -/
+def wideSliceMetadataAfterParentWriteMir : CapturedMir :=
+  ptrBody "witness::wide_slice_metadata_after_parent_write"
+    [u32Decl, u32Decl, arrU32_4Decl, ptrMutU32Decl, rawMutSliceU32Decl, usizeMirDecl]
+    [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+     .assign (local_ 2)
+       (.aggregate (.array u32Ty) [constU32 10, constU32 20, constU32 30, constU32 40]),
+     .assign (local_ 3)
+       (.rawPtr .mut { local_ := 2, projection := [.constantIndex 0 4 false] }),
+     .assign (local_ 4)
+       (.aggregate (.rawPtr sliceU32PointeeTy .mut) [.copy (local_ 3), constUsize 4]),
+     -- Direct write to `_2` disables `_4`'s borrow tag, yet `PtrMetadata(_4)` does not dereference!
+     .assign (local_ 2)
+       (.aggregate (.array u32Ty) [constU32 1, constU32 2, constU32 3, constU32 4]),
+     .assign (local_ 5) (.unaryOp .ptrMetadata (.copy (local_ 4))),
+     .assign (local_ 0) (.cast .intToInt (.copy (local_ 5)) u32Ty)]
+
+def wideSliceDisabledDerefUbS0 : MachineState :=
+  initMachineState wideSliceDisabledDerefUbMir [.scalar ⟨0, 4⟩]
+def wideSliceDisabledDerefUbMInit : Mach :=
+  machine wideSliceDisabledDerefUbMir wideSliceDisabledDerefUbFn
+    wideSliceDisabledDerefUbS0.frame.locals wideSliceDisabledDerefUbFn.start
+def wideSliceDisabledDerefUbTBInit : MachTB := liftMachToTB wideSliceDisabledDerefUbMInit
+
+def wideSliceMetadataAfterParentWriteS0 : MachineState :=
+  initMachineState wideSliceMetadataAfterParentWriteMir [.scalar ⟨0, 4⟩]
+
+theorem wideSliceTreeBorrowsDisabledVsMetadataOk_three_way :
+    (∃ tr u, Reaches (mirTree wideSliceDisabledDerefUbMir wideSliceDisabledDerefUbS0) tr u ∧
+      FaultNow u) ∧
+    stopAfterTB wideSliceDisabledDerefUbTBInit 12 =
+      some (.ub "Tree Borrows: local read of Disabled reference") ∧
+    (∃ mem, ReachesRet
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) []
+      (.normal (.scalar ⟨4, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) := by
+  refine ⟨faultsA_sound wideSliceDisabledDerefUbMir 30 _ rfl,
+    by decide +kernel,
+    ⟨_, runA_sound wideSliceMetadataAfterParentWriteMir 30 _ _ _ rfl⟩,
+    runA_noUB wideSliceMetadataAfterParentWriteMir 30 _ _ _ rfl⟩
+
+/-- **Witness 4 (`wideSliceSizeAndAlignOfVal_u32_str_empty_zst_witnesses`)**:
+Concrete ground-truth agreement between Anneal (`stepMirFn` / `evalNonSelectIntrinsicCall`) and
+MiniRust (`LayoutStrategy.compute_size_and_align` / `x86_64.valid_size`) on:
+1. `[u32]` (`len = 4`, `elemSz = 4`, `elemAlign = 4` $\mapsto$ `size = 16, align = 4`),
+2. `str` (`len = 5` $\mapsto$ `size = 5, align = 1`),
+3. empty `[u32]` (`len = 0` $\mapsto$ `size = 0, align = 4`), and
+4. ZST `[()]` (`len = 1000, elemSz = 0, elemAlign = 1` $\mapsto$ `size = 0, align = 1`). -/
+def sizeOfValCalleeOp (tys : List RigidTy) : Operand :=
+  .constant { ty := { kind := .fnDef "core::intrinsics::size_of_val" tys, layoutIdx := 0 }
+              val := .zeroSized }
+
+def alignOfValCalleeOp (tys : List RigidTy) : Operand :=
+  .constant { ty := { kind := .fnDef "core::intrinsics::align_of_val" tys, layoutIdx := 0 }
+              val := .zeroSized }
+
+def wideSliceSizeAlignMir (elemTy : RigidTy) (len : Nat) : CapturedMir where
+  defPath := "witness::wide_slice_size_align"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, ptrMutU32Decl,
+    { mutability := .mut, ty := { kind := .rawPtr .not (.slice elemTy), layoutIdx := 0 },
+      debugName := some "sl_ptr" },
+    usizeMirDecl, usizeMirDecl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2), mkStmt (.storageLive 3),
+        mkStmt (.storageLive 4), mkStmt (.storageLive 5),
+        mkStmt (.storageLive 6), mkStmt (.storageLive 7),
+        mkStmt (.assign (local_ 2) (.rawPtr .mut (local_ 1))),
+        mkStmt (.assign (local_ 3)
+          (.aggregate (.rawPtr { kind := .slice elemTy, layoutIdx := 0 } .not)
+            [.copy (local_ 2), constUsize len]))],
+      terminator := mkTerm
+        (.call (sizeOfValCalleeOp [.slice elemTy]) [.copy (local_ 3)] (local_ 4) (some 1)
+          .continue_),
+      isCleanup := false },
+    { statements := [],
+      terminator := mkTerm
+        (.call (alignOfValCalleeOp [.slice elemTy]) [.copy (local_ 3)] (local_ 5) (some 2)
+          .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 6) (.cast .intToInt (.copy (local_ 4)) u32Ty)),
+        mkStmt (.assign (local_ 7) (.cast .intToInt (.copy (local_ 5)) u32Ty)),
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 6)) (.copy (local_ 7))))],
+      terminator := mkTerm .return_,
+      isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+def wideStrSizeAlignMir (len : Nat) : CapturedMir where
+  defPath := "witness::wide_str_size_align"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, ptrMutU32Decl,
+    { mutability := .mut, ty := rawConstStrTy, debugName := some "str_ptr" },
+    usizeMirDecl, usizeMirDecl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2), mkStmt (.storageLive 3),
+        mkStmt (.storageLive 4), mkStmt (.storageLive 5),
+        mkStmt (.storageLive 6), mkStmt (.storageLive 7),
+        mkStmt (.assign (local_ 2) (.rawPtr .mut (local_ 1))),
+        mkStmt (.assign (local_ 3)
+          (.aggregate (.rawPtr strPointeeMirTy .not)
+            [.copy (local_ 2), constUsize len]))],
+      terminator := mkTerm
+        (.call (sizeOfValCalleeOp [.str]) [.copy (local_ 3)] (local_ 4) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [],
+      terminator := mkTerm
+        (.call (alignOfValCalleeOp [.str]) [.copy (local_ 3)] (local_ 5) (some 2) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 6) (.cast .intToInt (.copy (local_ 4)) u32Ty)),
+        mkStmt (.assign (local_ 7) (.cast .intToInt (.copy (local_ 5)) u32Ty)),
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 6)) (.copy (local_ 7))))],
+      terminator := mkTerm .return_,
+      isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+private theorem except_bind_ok {ε α β : Type} (x : α) (f : α → Except ε β) :
+    (Except.ok x >>= f) = f x := rfl
+
+private theorem except_bind_error {ε α β : Type} (e : ε) (f : α → Except ε β) :
+    (Except.error e >>= f) = Except.error e := rfl
+
+/-- **`checkPtr` symbolic overflow UB on safe slice references (`&[T]` / `&mut [T]`)**:
+For any in-bounds thin pointer `thin` and element count `len < scalarModulus 8` whose total byte
+size `len * elemSz` overflows `isize::MAX` (`x86_64.valid_size ⟨len * elemSz⟩ = false`, i.e.,
+`signedHalfModulus 8 ≤ len * elemSz`), MiniRust's `checkPtr` on `&[T]` / `&mut [T]` faults with
+`.error (.ub "Value::Ptr: total size exeeds isize::MAX")` before inspecting alignment or memory. -/
+theorem checkPtr_sliceRef_overflow_ub
+    (thin : Ptr) (mutbl : MirAst.Mutability) (elemSz elemAlign : Nat) (freeze : Bool)
+    (len : Nat) (m : Option Mach)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hLen : len < scalarModulus 8)
+    (hOverflow : x86_64.valid_size ⟨len * elemSz⟩ = false) :
+    checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len))))
+      (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) m =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") := by
+  have hAddrOk :
+      ensureElseUb (inBounds thin.addr .Unsigned x86_64.PTR_SIZE)
+        "Value::Ptr: pointer out-of-bounds" = Except.ok () := by
+    unfold ensureElseUb
+    rw [hAddr]
+    rfl
+  have hMeta :
+      checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount = Except.ok () :=
+    (checkPtrMetadata_elementCount_iff_anneal_usize len).1.mpr hLen
+  have hProdNonneg : (0 : Int) ≤ Int.ofNat len * (elemSz : Int) :=
+    Int.mul_nonneg (Int.natCast_nonneg len) (Int.natCast_nonneg elemSz)
+  have hToNat : (Int.ofNat len * (elemSz : Int)).toNat = len * elemSz := rfl
+  have hComp : ∀ (lookup : Ptr → Interp VTable),
+      LayoutStrategy.compute_size_and_align lookup (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+          (some (.ElementCount (Int.ofNat len))) =
+        Except.ok (⟨len * elemSz⟩, ⟨elemAlign⟩) := by
+    intro lookup
+    unfold LayoutStrategy.compute_size_and_align
+    dsimp only
+    rw [ite_eq_left_iff.mpr (fun h => absurd hProdNonneg h), hToNat]
+    rfl
+  have hSizeErr :
+      ensureElseUb (inBounds ((len * elemSz : Nat) : Int) .Signed x86_64.PTR_SIZE)
+        "Value::Ptr: total size exeeds isize::MAX" =
+        Except.error (.ub "Value::Ptr: total size exeeds isize::MAX") := by
+    have hInB : inBounds ((len * elemSz : Nat) : Int) .Signed x86_64.PTR_SIZE = false := hOverflow
+    unfold ensureElseUb
+    rw [hInB]
+    rfl
+  unfold checkPtr sliceRefPtrType ThinPointer.widen PtrType.meta_kind
+    LayoutStrategy.meta_kind PtrType.safe_pointee
+  dsimp only
+  rw [hAddrOk, except_bind_ok, hMeta, except_bind_ok, hComp, except_bind_ok,
+    hSizeErr, except_bind_error]
+
+set_option maxHeartbeats 800000 in
+theorem wideSliceSizeAndAlignOfVal_u32_str_empty_zst_witnesses :
+    let u32SlMir := wideSliceSizeAlignMir (.uint .u32) 4
+    let emptySlMir := wideSliceSizeAlignMir (.uint .u32) 0
+    let zstSlMir := wideSliceSizeAlignMir (.tuple []) 1000
+    let strMir := wideStrSizeAlignMir 5
+    -- `[u32]` (`len = 4`): `size = 16, align = 4`, sum `= 20`
+    (∃ mem, ReachesRet (mirTree u32SlMir (initMachineState u32SlMir [.scalar ⟨0, 4⟩])) []
+      (.normal (.scalar ⟨20, 4⟩, mem))) ∧
+    computeSize wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩) (some (.ElementCount 4)) = .ok ⟨16⟩ ∧
+    computeAlign wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩) (some (.ElementCount 4)) = .ok ⟨4⟩ ∧
+    -- `str` (`len = 5`): `size = 5, align = 1`, sum `= 6`
+    (∃ mem, ReachesRet (mirTree strMir (initMachineState strMir [.scalar ⟨0, 4⟩])) []
+      (.normal (.scalar ⟨6, 4⟩, mem))) ∧
+    computeSize wideRawPartsMInit (.Slice ⟨1⟩ ⟨1⟩) (some (.ElementCount 5)) = .ok ⟨5⟩ ∧
+    computeAlign wideRawPartsMInit (.Slice ⟨1⟩ ⟨1⟩) (some (.ElementCount 5)) = .ok ⟨1⟩ ∧
+    -- empty `[u32]` (`len = 0`): `size = 0, align = 4`, sum `= 4`
+    (∃ mem, ReachesRet (mirTree emptySlMir (initMachineState emptySlMir [.scalar ⟨0, 4⟩])) []
+      (.normal (.scalar ⟨4, 4⟩, mem))) ∧
+    computeSize wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩) (some (.ElementCount 0)) = .ok ⟨0⟩ ∧
+    computeAlign wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩) (some (.ElementCount 0)) = .ok ⟨4⟩ ∧
+    -- ZST `[(); 1000]` (`elemSz = 0, align = 1`): `size = 0, align = 1`, sum `= 1`
+    (∃ mem, ReachesRet (mirTree zstSlMir (initMachineState zstSlMir [.scalar ⟨0, 4⟩])) []
+      (.normal (.scalar ⟨1, 4⟩, mem))) ∧
+    computeSize wideRawPartsMInit (.Slice ⟨0⟩ ⟨1⟩) (some (.ElementCount 1000)) = .ok ⟨0⟩ ∧
+    computeAlign wideRawPartsMInit (.Slice ⟨0⟩ ⟨1⟩) (some (.ElementCount 1000)) = .ok ⟨1⟩ := by
+  intro u32SlMir emptySlMir zstSlMir strMir
+  exact ⟨⟨_, runA_sound u32SlMir 16 _ _ _ rfl⟩, rfl, rfl,
+    ⟨_, runA_sound strMir 16 _ _ _ rfl⟩, rfl, rfl,
+    ⟨_, runA_sound emptySlMir 16 _ _ _ rfl⟩, rfl, rfl,
+    ⟨_, runA_sound zstSlMir 16 _ _ _ rfl⟩, rfl, rfl⟩
+
+/-- **`checkPtr` symbolic agreement on provenance-free empty safe slice references (`&[T]`, `len = 0`)**:
+When `len = 0`, total byte size is `0 * elemSz = 0 ≤ isize::MAX`, so for any non-null aligned
+in-bounds thin pointer `thin` (even with `thin.provenance = none`, e.g., `NonNull::dangling()`),
+MiniRust's `checkPtr` on `&[T]` / `&mut [T]` with `m = none` succeeds with `.ok ()`. -/
+theorem checkPtr_sliceRef_empty_ok
+    (thin : Ptr) (mutbl : MirAst.Mutability) (elemSz elemAlign : Nat) (freeze : Bool)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hNonNull : (thin.addr != 0) = true)
+    (hAligned : Align.is_aligned ⟨elemAlign⟩ thin.addr = true) :
+    checkPtr (ThinPointer.widen thin (some (.ElementCount 0)))
+      (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) none =
+      .ok () := by
+  have hAddrOk :
+      ensureElseUb (inBounds thin.addr .Unsigned x86_64.PTR_SIZE)
+        "Value::Ptr: pointer out-of-bounds" = Except.ok () := by
+    unfold ensureElseUb; rw [hAddr]; rfl
+  have hMeta :
+      checkPtrMetadata (some (.ElementCount 0)) .ElementCount = Except.ok () :=
+    (checkPtrMetadata_elementCount_iff_anneal_usize 0).1.mpr (by decide)
+  have hComp : ∀ (lookup : Ptr → Interp VTable),
+      LayoutStrategy.compute_size_and_align lookup (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+          (some (.ElementCount 0)) =
+        Except.ok (⟨0⟩, ⟨elemAlign⟩) := by
+    intro lookup
+    unfold LayoutStrategy.compute_size_and_align
+    simp [Pure.pure, Except.pure]
+  have hSizeOk :
+      ensureElseUb (inBounds ((0 : Nat) : Int) .Signed x86_64.PTR_SIZE)
+        "Value::Ptr: total size exeeds isize::MAX" = Except.ok () := by
+    have hInB : inBounds ((0 : Nat) : Int) .Signed x86_64.PTR_SIZE = true := by decide
+    unfold ensureElseUb; rw [hInB]; rfl
+  have hNonNullOk :
+      ensureElseUb (thin.addr != 0) "Value::Ptr: null safe pointer" = Except.ok () := by
+    unfold ensureElseUb; rw [hNonNull]; rfl
+  have hAlignOk :
+      ensureElseUb (Align.is_aligned ⟨elemAlign⟩ thin.addr)
+        "Value::Ptr: unaligned safe pointer" = Except.ok () := by
+    unfold ensureElseUb; rw [hAligned]; rfl
+  unfold checkPtr sliceRefPtrType ThinPointer.widen PtrType.meta_kind
+    LayoutStrategy.meta_kind PtrType.safe_pointee
+  dsimp only
+  rw [hAddrOk, except_bind_ok, hMeta, except_bind_ok, hComp, except_bind_ok]
+  dsimp only
+  rw [hSizeOk, except_bind_ok, hNonNullOk, except_bind_ok, hAlignOk, except_bind_ok]
+  rfl
+
+/-- Maximum `[u32]` element count whose byte size `len * 4 = 2^63 - 4` fits in `isize::MAX`. -/
+abbrev u32SliceMaxOkLen : Nat := 2 ^ 61 - 1
+
+/-- Minimal `[u32]` element count whose byte size `len * 4 = 2^63` overflows `isize::MAX`. -/
+abbrev u32SliceOverflowLen : Nat := 2 ^ 61
+
+/-- Concrete MIR program calling `size_of_val::<[u32]>` at `len = 2^61` (`u32SliceOverflowLen`). -/
+def u32SliceOverflowMir : CapturedMir := wideSliceSizeAlignMir (.uint .u32) u32SliceOverflowLen
+
+/-- Provenance-free aligned empty slice pointer `(addr = 4, provenance = none, len = 0)`. -/
+def danglingEmptyU32SlicePtr : Pointer Prov :=
+  ThinPointer.widen { addr := 4, provenance := none } (some (.ElementCount 0))
+
+/-- Overflowing `[u32]` slice pointer `(addr = 256, len = 2^61)`. -/
+def overflowingU32SlicePtr : Pointer Prov :=
+  ThinPointer.widen { addr := 256, provenance := some (⟨1⟩, ()) }
+    (some (.ElementCount (Int.ofNat u32SliceOverflowLen)))
+
+/-- Direct call target for `core::intrinsics::size_of_val::<[u32]>`. -/
+def sizeOfValSliceU32Target : ResolvedCallTarget :=
+  { defPath := "core::intrinsics::size_of_val", typeArgs := [.slice (.uint .u32)],
+    fnSig := none, isIndirect := false }
+
+set_option maxHeartbeats 800000 in
+/-- **Witness 5 (`wideSliceIsizeMaxBoundary_and_scalarAddrDivergence_canaries`)**:
+1. **Exact `isize::MAX` (`2^63 - 1`) boundary on `[u32]` (`elemSz = 4`)**:
+   - At `len = 2^61 - 1` (`len * 4 = 2^63 - 4 < 2^63 = signedHalfModulus 8`), Anneal's
+     `evalSliceSizeOfVal 4 ⟨2^61 - 1, 8⟩ = some ⟨2^63 - 4, 8⟩` and MiniRust's
+     `x86_64.valid_size ⟨(2^61 - 1) * 4⟩ = true`.
+   - At `len = 2^61` (`len * 4 = 2^63 = signedHalfModulus 8`), Anneal's
+     `wideSliceSizeAlignMir (.uint .u32) (2^61)` faults with UB (`FaultNow`), and MiniRust's
+     `x86_64.valid_size ⟨2^61 * 4⟩ = false` and `checkPtr` on `&[u32]` with `len = 2^61` returns
+     `.error (.ub "Value::Ptr: total size exeeds isize::MAX")`!
+2. **Provenance-free empty slice (`ptr::slice_from_raw_parts(4 as *const u32, 0)`)**:
+   - `UnOp.ptrMetadata` on `annealWideScalarPtrVal 4 0 8` and MiniRust `checkPtr` on `&[u32]` with
+     `addr = 4, provenance = none, len = 0` (`size = 0`) BOTH succeed without UB!
+   - **Documented Stage-1 `Trusted` fail-closed divergence**: while MiniRust's `computeSize` and
+     `checkPtr` on `&[u32]` (`len = 0`) accept `provenance = none` (`size = 0`), Stage-1 `Trusted`
+     (`evalNonSelectIntrinsicCall`) requires a provenance-carrying `.ptr p 8` data pointer for
+     `size_of_val` / `align_of_val` and fails closed with `MirStepNode.fail .ub` on
+     `annealWideScalarPtrVal 4 0 8`. -/
+theorem wideSliceIsizeMaxBoundary_and_scalarAddrDivergence_canaries :
+    -- (1) `len = 2^61 - 1` succeeds; `len = 2^61` faults `.ub` in both Anneal and MiniRust
+    evalSliceSizeOfVal 4 ⟨u32SliceMaxOkLen, 8⟩ = some ⟨u32SliceMaxOkLen * 4, 8⟩ ∧
+    x86_64.valid_size ⟨u32SliceMaxOkLen * 4⟩ = true ∧
+    evalSliceSizeOfVal 4 ⟨u32SliceOverflowLen, 8⟩ = none ∧
+    x86_64.valid_size ⟨u32SliceOverflowLen * 4⟩ = false ∧
+    (∃ tr u, Reaches
+      (mirTree u32SliceOverflowMir (initMachineState u32SliceOverflowMir [.scalar ⟨0, 4⟩])) tr u ∧
+      FaultNow u) ∧
+    checkPtr overflowingU32SlicePtr (sliceRefPtrType .not ⟨4⟩ ⟨4⟩) (some wideRawPartsMInit) =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") ∧
+    -- (2) Provenance-free empty slice (`addr = 4, len = 0`): `checkPtr` and `ptrMetadata` succeed,
+    -- while Stage-1 `Trusted` `size_of_val` fails closed with `.fail .ub` on `.scalar` data ptr
+    checkPtr danglingEmptyU32SlicePtr (sliceRefPtrType .not ⟨4⟩ ⟨4⟩) none = .ok () ∧
+    evalNonSelectIntrinsicCall .sizeOfVal wideRawPartsS0 sizeOfValSliceU32Target
+        wideRawPartsMir.localDecls emptyLayoutTable [] [annealWideScalarPtrVal 4 0 8]
+        wideRawPartsS0.frame.locals (local_ 0) 1 =
+      MirStepNode.fail .ub := by
+  refine ⟨rfl, by decide, rfl, by decide,
+    faultsA_sound u32SliceOverflowMir 12 _ (by decide +kernel),
+    checkPtr_sliceRef_overflow_ub { addr := 256, provenance := some (⟨1⟩, ()) }
+      .not 4 4 true u32SliceOverflowLen (some wideRawPartsMInit)
+      (by decide) (by decide) (by decide),
+    checkPtr_sliceRef_empty_ok { addr := 4, provenance := none } .not 4 4 true
+      (by decide) (by decide) (by decide),
+    rfl⟩
+
+end MiniRustSpec.Correspondence.WideSliceDst

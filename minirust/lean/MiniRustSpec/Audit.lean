@@ -16,6 +16,7 @@ import MiniRustSpec.Correspondence.RefWitness
 import MiniRustSpec.Correspondence.TbWitness
 import MiniRustSpec.Correspondence.Provenance
 import MiniRustSpec.Correspondence.ProvenanceWitness
+import MiniRustSpec.Correspondence.WideSliceDst
 import MiniRustSpec.Correspondence.IntrinsicBoundary
 
 /-!
@@ -6124,6 +6125,96 @@ example :
 end StatementPins
 
 end DivMrAuditPins
+
+section WideSliceDstAuditPins
+
+open Trusted.Effect
+open Trusted.ITree
+open Trusted.Rustc.V2026_06_01
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.Rustc.V2026_06_01.Layout
+open MiniRustSpec
+open MiniRustSpec.Gen
+open MiniRustSpec.LibSpecr
+open MiniRustSpec.Interp
+open MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.Witness
+open MiniRustSpec.Correspondence.PointerWitness
+open MiniRustSpec.Correspondence.RefWitness
+open MiniRustSpec.Correspondence.TbWitness
+open MiniRustSpec.Correspondence.WideSliceDst
+
+#check_theorem_deps "[WIDE-SLICE-DST-AUDIT]"
+  mrWideRawPtr_as_wide_pair_eq
+  mrWidePtr_type_layout_eq
+  mrSlice_type_layout_eq
+  encodeWidePtr_eq_encode_widePairTuple
+  checkPtrMetadata_elementCount_iff_anneal_usize
+  ptrMetadata_wide_and_thin_lockstep
+  translateRvalue_cast_ptrToPtr_wide_to_thin_and_wide
+  ptrToPtr_wide_to_thin_and_wide_to_wide_lockstep
+  ptrToPtr_wide_to_thin_already_subslice_lockstep
+  aggregate_rawPtr_and_to_raw_parts_roundtrip_lockstep
+  sizeOfVal_and_alignOfVal_slice_lockstep
+  sizeOfVal_and_alignOfVal_str_empty_zst_lockstep
+  checkPtr_sliceRef_overflow_ub
+  checkPtr_sliceRef_empty_ok
+  evalRvalue_len_wide_slice_borrow_and_disabled_contrast
+  wideSliceFromRawPartsMetadataRoundTrip_three_way
+  wideSliceIndexReadWriteAndOobUb_three_way
+  wideSliceTreeBorrowsDisabledVsMetadataOk_three_way
+  wideSliceSizeAndAlignOfVal_u32_str_empty_zst_witnesses
+  wideSliceIsizeMaxBoundary_and_scalarAddrDivergence_canaries
+
+namespace WideSliceDstStatementPins
+
+example :
+    (∃ mem, ReachesRet (mirTree wideRawPartsMir wideRawPartsS0) []
+      (.normal (.scalar ⟨46, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree wideRawPartsMir wideRawPartsS0) ∧
+    (Interp.steps 25 wideRawPartsMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 46 }, [1]) ∧
+    (Interp.stepsTB 25 wideRawPartsTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 46 :=
+  wideSliceFromRawPartsMetadataRoundTrip_three_way
+
+example :
+    (∃ mem, ReachesRet (mirTree wideSliceIdxReadWriteMir wideSliceIdxReadWriteS0) []
+      (.normal (.scalar ⟨133, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree wideSliceIdxReadWriteMir wideSliceIdxReadWriteS0) ∧
+    (Interp.steps 26 wideSliceIdxReadWriteMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 133 }, [1]) ∧
+    (Interp.stepsTB 26 wideSliceIdxReadWriteTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 133 ∧
+    (∃ tr u, Reaches (mirTree wideSliceIdxOobMir wideSliceIdxOobS0) tr u ∧ FaultNow u) ∧
+    stopAfterM wideSliceIdxOobMInit 10 = some (.ub "access to out-of-bounds index") ∧
+    stopAfterTB wideSliceIdxOobTBInit 10 = some (.ub "access to out-of-bounds index") :=
+  wideSliceIndexReadWriteAndOobUb_three_way
+
+example :
+    (∃ tr u, Reaches (mirTree wideSliceDisabledDerefUbMir wideSliceDisabledDerefUbS0) tr u ∧
+      FaultNow u) ∧
+    stopAfterTB wideSliceDisabledDerefUbTBInit 12 =
+      some (.ub "Tree Borrows: local read of Disabled reference") ∧
+    (∃ mem, ReachesRet
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) []
+      (.normal (.scalar ⟨4, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) :=
+  wideSliceTreeBorrowsDisabledVsMetadataOk_three_way
+
+end WideSliceDstStatementPins
+
+end WideSliceDstAuditPins
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment — as well as every declaration
