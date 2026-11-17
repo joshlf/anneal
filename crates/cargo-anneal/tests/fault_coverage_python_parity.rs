@@ -1732,6 +1732,19 @@ print(f"REAL_MIR_CENSUS_PARITY_OK {{len(cases)}}")
         "externalSpecCallContract extraPost tampered",
         "externalCallContract_",
     );
+    // `[adv ep2-B3]` `defaultPre` may only evaluate the subject's own `requires` companion:
+    // pointing it at another function's companion (e.g. one whose predicate is always false)
+    // keeps the generated `MirBoolPredicateHolds Mir.<companion>.body args` shape but would make
+    // every claim vacuous.
+    tamper(
+        ob_calls_helper_path.clone(),
+        ob_calls_helper.replace(
+            "__anodized_fn_requires_calls_local_helper",
+            "__anodized_fn_requires_trusted_indirect",
+        ),
+        "defaultPre evaluating another subject's requires companion",
+        "instead of `ContractRole.requires \"crate_a::calls_local_helper\"`",
+    );
     // Declarations outside `namespace Obligations.<Item>` can shadow the certificate type
     // that Lean resolves inside `namespace Verify.<Item>` (namespace prefixes win over `open`).
     tamper(

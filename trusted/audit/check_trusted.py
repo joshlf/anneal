@@ -10332,9 +10332,41 @@ _VERIFY_REFINE_SPEC_HELPERS: frozenset[str] = frozenset((
 ))
 
 
+_META_ATTRIBUTE_NAMES: frozenset[str] = frozenset((
+    "macro",
+    "term_elab",
+    "command_elab",
+    "tactic",
+    "init",
+    "implemented_by",
+    "extern",
+    "csimp",
+    "class",
+))
+
+
+def _is_meta_attribute_name(name: str) -> bool:
+    """`[adv ep2-B3]` Attributes that change how *importing* modules are parsed or elaborated
+    (`macro` / `*_elab` / `tactic` / `*_parser` / `builtin_*` expanders), run code at import
+    time (`init`), or swap compiled implementations (`implemented_by` / `extern` / `csimp`)."""
+    short = name.rsplit(".", 1)[-1]
+    return (
+        short in _META_ATTRIBUTE_NAMES
+        or short.endswith(("_parser", "_elab"))
+        or short.startswith("builtin_")
+    )
+
+
 def _verify_detect_instance_attribute(tokens: list[tuple[str, Any]]) -> str | None:
     """Port of Rust `detect_instance_attribute`: `@[... instance ...]` registers a typeclass
-    instance without a top-level `instance` keyword."""
+    instance without a top-level `instance` keyword.
+
+    `[adv ep2-B3]`: also reject the attribute spelling of the commands every audited module
+    already bans at top level (`macro`, `syntax`, `elab`, `initialize`, `class`, ...). E.g. a
+    Proof module's `@[macro Lean.Parser.Term.app] def h : Lean.Macro := ...` registers a macro
+    that rewrites `VerificationResult Obligations.<I>.claim` while `Verify/<I>.lean` (which
+    imports it) is elaborated, so every token of the Verify module still looks canonical.
+    """
     i = 0
     n = len(tokens)
     while i + 2 < n:
@@ -10347,13 +10379,44 @@ def _verify_detect_instance_attribute(tokens: list[tuple[str, Any]]) -> str | No
                     depth += 1
                 elif tk == "RBracket":
                     depth -= 1
-                elif tk == "Ident" and val in ("instance", "default_instance"):
+                elif tk == "Ident" and (
+                    val in ("instance", "default_instance") or _is_meta_attribute_name(str(val))
+                ):
                     return str(val)
                 j += 1
             i = j
         else:
             i += 1
     return None
+
+
+_META_RUN_COMMANDS: frozenset[str] = frozenset(("run_cmd", "run_elab", "run_meta", "run_tac"))
+_HASH_COMMAND_RE = re.compile(r"#[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _reject_meta_commands(tokens: list[tuple[str, Any]], label: str) -> None:
+    """`[adv ep2-B3]` Reject elaboration-time code execution and kernel/elaborator debug
+    switches anywhere in an audited module: `#eval` / `#exit` / any `#<command>`, `run_cmd` /
+    `run_elab` / `run_meta` / `run_tac`, and `set_option debug.*` (e.g.
+    `set_option debug.skipKernelTC true in`). `#eval` and `run_*` run arbitrary `IO` / `CoreM`
+    code while the importing `Verify` module is built, and `#exit` hides the rest of a module
+    from Lean while this scanner still reads it. (`#[...]` array literals lex as a bare `#`.)
+    """
+    for i, (tk, val) in enumerate(tokens):
+        if tk != "Ident":
+            continue
+        v = str(val)
+        if v in _META_RUN_COMMANDS or _HASH_COMMAND_RE.fullmatch(v):
+            raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed meta command `{v}` in {label}")
+        if (
+            v == "set_option"
+            and i + 1 < len(tokens)
+            and tokens[i + 1][0] == "Ident"
+            and str(tokens[i + 1][1]).startswith("debug.")
+        ):
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"disallowed `set_option {tokens[i + 1][1]}` in {label}"
+            )
 
 
 def _strip_enclosing_parens_tokens(
@@ -11179,6 +11242,7 @@ def _scan_obligations_module(
     attr = _verify_detect_instance_attribute(tokens)
     if attr is not None:
         raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {ob_label}")
+    _reject_meta_commands(tokens, ob_label)
     default_callee_suffixes = _parse_obligations_default_callee_suffixes(ob_text, ob_label)
     imports = _scan_lean_module_imports(ob_text, ob_label)
     imported_mir: list[str] = []
@@ -11255,6 +11319,7 @@ def _scan_obligations_module(
     default_modular_uses_default_pre_post = False
     referenced_companion_mir_suffixes: set[str] = set()
     default_spec_callee_suffixes: list[str] = []
+    companion_bindings: list[tuple[str, str, str | None, str]] = []
     claim_sigs: dict[str, list[tuple[str, Any]]] = {}
     helper_cmds: dict[str, list[tuple[str, Any]]] = {}
     linked_ext_positions: set[int] = set()
@@ -11621,6 +11686,13 @@ def _scan_obligations_module(
                     def_name, tokens[idx:cmd_e], suffix, imported_mir, ob_label
                 ):
                     referenced_companion_mir_suffixes.add(c_suf)
+                    # `[adv ep2-B3]`: `None` = the owning subject's own `defPath`.
+                    companion_bindings.append((
+                        c_suf,
+                        "requires" if def_name in ("defaultPre", "defaultPreFor") else "ensures",
+                        None,
+                        f"def {def_name}",
+                    ))
             if def_name == "defaultSpecCallees":
                 # Validate `def defaultSpecCallees : List CapturedMir := [Mir.<c>.body, ...]`
                 if (
@@ -11846,8 +11918,14 @@ def _scan_obligations_module(
                     )
                     if ext_req is not None:
                         referenced_companion_mir_suffixes.add(ext_req)
+                        companion_bindings.append(
+                            (ext_req, "requires", target_dp, f"externalSpecCallContract `{def_name}`")
+                        )
                     if ext_ens is not None:
                         referenced_companion_mir_suffixes.add(ext_ens)
+                        companion_bindings.append(
+                            (ext_ens, "ensures", target_dp, f"externalSpecCallContract `{def_name}`")
+                        )
                     linked_ext_positions.add(idx + 5)
                     external_spec_contracts.append(
                         {
@@ -12197,6 +12275,7 @@ def _scan_obligations_module(
     return {
         "default_callee_suffixes": default_callee_suffixes,
         "default_spec_callee_suffixes": default_spec_callee_suffixes,
+        "companion_bindings": companion_bindings,
         "imported_mir_suffixes": imported_mir,
         "imported_obligation_suffixes": imported_obligations,
         "referenced_callee_contracts": referenced_callee_contracts,
@@ -12228,6 +12307,7 @@ def _scan_verify_module_surface(verify_text: str, suffix: str, label: str) -> di
     attr = _verify_detect_instance_attribute(tokens)
     if attr is not None:
         raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {label}")
+    _reject_meta_commands(tokens, label)
     imports = _scan_lean_module_imports(verify_text, label)
     for mod in imports:
         own = mod in (
@@ -12419,19 +12499,51 @@ def _is_allowed_aux_import(module: str) -> bool:
     return _is_allowed_specs_import(module) or module.startswith(("Proof.", "Assumptions."))
 
 
+_SPEC_PRE_LOWER_PRECEDENCE_OR_BINDERS: frozenset[str] = frozenset((
+    "∨",
+    "\\/",
+    "→",
+    "->",
+    "↔",
+    "<->",
+    "∀",
+    "∃",
+    "forall",
+    "exists",
+    "fun",
+    "λ",
+    "if",
+    "match",
+    "let",
+    "have",
+    "show",
+    "by",
+    "do",
+))
+
+
 def _is_trivially_false_spec_pre(tokens_slice: list[tuple[str, Any]]) -> bool:
-    """`[adv ep2-A2]` Detect a vacuous `False` precondition (`False`, `fun ... => False`,
-    `And False ...`, `And ... False`, `False ∧ ...`, `... ∧ False`) in `Specs/<Item>.lean`."""
+    """`[adv ep2-A2]` / `[adv ep2-B3]` Detect a syntactically vacuous `False` precondition
+    (`False`, `fun ... => False`, `And False _`, `And _ False`, `False ∧ _`, `_ ∧ False`) in
+    `Specs/<Item>.lean`.
+
+    `[adv ep2-B3]`: an empty slice proves nothing (it only arises from a truncated field
+    extraction), and `∧` is only split when no lower-precedence connective or binder occurs at
+    depth 0 (`False ∧ P → Q` is `(False ∧ P) → Q`, which is not vacuous).
+    """
     s = _strip_enclosing_parens_tokens(tokens_slice)
     if not s:
-        return True
-    if s[0] == ("Ident", "fun"):
-        arrow_idx = next(
-            (i for i, (tk, v) in enumerate(s) if tk == "Ident" and v in ("=>", "↦")),
-            -1,
-        )
-        if arrow_idx >= 0:
-            return _is_trivially_false_spec_pre(s[arrow_idx + 1 :])
+        return False
+    if s[0] in (("Ident", "fun"), ("Ident", "λ")):
+        depth = 0
+        for i, (tk, v) in enumerate(s):
+            if tk in ("LParen", "LBrace", "LBracket"):
+                depth += 1
+            elif tk in ("RParen", "RBrace", "RBracket"):
+                depth = max(0, depth - 1)
+            elif depth == 0 and tk == "Ident" and v in ("=>", "↦"):
+                return _is_trivially_false_spec_pre(s[i + 1 :])
+        return False
     if len(s) == 1 and s[0][0] == "Ident" and str(s[0][1]) in ("False", "_root_.False"):
         return True
     if s[0] == ("Ident", "And"):
@@ -12440,17 +12552,111 @@ def _is_trivially_false_spec_pre(tokens_slice: list[tuple[str, Any]]) -> bool:
             return _is_trivially_false_spec_pre(args2[0]) or _is_trivially_false_spec_pre(
                 args2[1]
             )
+        return False
     depth = 0
+    conj_positions: list[int] = []
     for idx, (tk, val) in enumerate(s):
         if tk in ("LParen", "LBrace", "LBracket"):
             depth += 1
         elif tk in ("RParen", "RBrace", "RBracket"):
             depth = max(0, depth - 1)
-        elif tk == "Ident" and depth == 0 and val == "∧":
-            return _is_trivially_false_spec_pre(s[:idx]) or _is_trivially_false_spec_pre(
-                s[idx + 1 :]
-            )
+        elif tk == "Ident" and depth == 0:
+            if val in _SPEC_PRE_LOWER_PRECEDENCE_OR_BINDERS:
+                return False
+            if val == "∧":
+                conj_positions.append(idx)
+    if conj_positions:
+        idx = conj_positions[0]
+        return _is_trivially_false_spec_pre(s[:idx]) or _is_trivially_false_spec_pre(
+            s[idx + 1 :]
+        )
     return False
+
+
+_SPEC_STRUCTURE_FIELD_NAMES: frozenset[str] = frozenset((
+    "pre",
+    "post",
+    "envAssumed",
+    "specBody",
+    "strictSafetyPre",
+))
+
+
+def _split_structure_instance_fields(
+    body: list[tuple[str, Any]],
+) -> list[tuple[str, list[tuple[str, Any]], list[tuple[str, Any]]]]:
+    """`[adv ep2-B3]` Split a `where` / `{ ... }` `*ItemSpec` instance body into
+    `(field, binder_tokens, rhs)` triples.
+
+    The token stream carries no layout, so a field header is recognised only as a depth-0
+    `*ItemSpec` field name (`pre`, `post`, `envAssumed`, `specBody`, `strictSafetyPre`)
+    followed by binders (identifiers or bracketed groups such as `(args : List Value)`) and
+    `:=` (not after `let` / `have` / `mut`); its value runs to the next header or a depth-0
+    `,` / `;`. A reference such as `fun args mem => pre args ∧ ...` (to a user helper named
+    `pre`) therefore never truncates a value. A body that does not start with a recognised
+    header yields no fields (the vacuity heuristic then abstains).
+    """
+    binder_re = re.compile(r"[A-Za-z_][A-Za-z0-9_'!?]*")
+    n = len(body)
+    depth_at: list[int] = []
+    depth = 0
+    for tk, _v in body:
+        depth_at.append(depth)
+        if tk in ("LParen", "LBrace", "LBracket"):
+            depth += 1
+        elif tk in ("RParen", "RBrace", "RBracket"):
+            depth = max(0, depth - 1)
+
+    def header_colon_eq(k: int) -> int | None:
+        if (
+            depth_at[k] != 0
+            or body[k][0] != "Ident"
+            or str(body[k][1]) not in _SPEC_STRUCTURE_FIELD_NAMES
+            or (k > 0 and body[k - 1] in (("Ident", "let"), ("Ident", "have"), ("Ident", "mut")))
+        ):
+            return None
+        m = k + 1
+        while m < n:
+            if (
+                body[m][0] == "Ident"
+                and binder_re.fullmatch(str(body[m][1]))
+                and str(body[m][1]) not in _SPEC_STRUCTURE_FIELD_NAMES
+            ):
+                m += 1
+                continue
+            if body[m][0] in ("LParen", "LBrace", "LBracket") and depth_at[m] == 0:
+                # Bracketed binder group `(args : List Value)` / `{α}` / `[inst]`.
+                close = m + 1
+                while close < n and depth_at[close] != 0:
+                    close += 1
+                if close <= m + 1 or body[close - 1][0] not in ("RParen", "RBrace", "RBracket"):
+                    return None
+                m = close
+                continue
+            break
+        if m < n and body[m][0] == "ColonEq" and depth_at[m] == 0:
+            return m
+        return None
+
+    fields: list[tuple[str, list[tuple[str, Any]], list[tuple[str, Any]]]] = []
+    k = 0
+    while k < n:
+        if body[k][0] in ("Comma", "Semicolon") and depth_at[k] == 0:
+            k += 1
+            continue
+        eq = header_colon_eq(k)
+        if eq is None:
+            return fields
+        r = eq + 1
+        while r < n:
+            if depth_at[r] == 0 and (
+                body[r][0] in ("Comma", "Semicolon") or header_colon_eq(r) is not None
+            ):
+                break
+            r += 1
+        fields.append((str(body[k][1]), body[k + 1 : eq], body[eq + 1 : r]))
+        k = r
+    return fields
 
 
 def _scan_specs_module(
@@ -12464,6 +12670,7 @@ def _scan_specs_module(
     attr = _verify_detect_instance_attribute(tokens)
     if attr is not None:
         raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {label}")
+    _reject_meta_commands(tokens, label)
     expected_ns = f"Specs.{subject_suffix}"
     ns_opens = 0
     ns_closes = 0
@@ -12713,49 +12920,22 @@ def _scan_specs_module(
                                 )
                         inst_body_slice = []
             if inst_body_slice:
-                p_idx = 0
-                p_depth = 0
-                while p_idx < len(inst_body_slice):
-                    t_p, v_p = inst_body_slice[p_idx]
-                    if p_depth == 0 and t_p == "Ident" and v_p == "pre":
-                        c_idx = p_idx + 1
-                        while c_idx < len(inst_body_slice) and inst_body_slice[c_idx][0] != "ColonEq":
-                            c_idx += 1
-                        if c_idx < len(inst_body_slice):
-                            rhs_p = c_idx + 1
-                            end_p = rhs_p
-                            d_p = 0
-                            while end_p < len(inst_body_slice):
-                                tk_e, val_e = inst_body_slice[end_p]
-                                if d_p == 0:
-                                    if tk_e in ("Comma", "Semicolon", "RBrace"):
-                                        break
-                                    if end_p > rhs_p and tk_e == "Ident" and (
-                                        val_e in ("pre", "post", "envAssumed", "specBody", "strictSafetyPre")
-                                        or (
-                                            end_p + 1 < len(inst_body_slice)
-                                            and inst_body_slice[end_p + 1][0] == "ColonEq"
-                                        )
-                                    ):
-                                        break
-                                if tk_e in ("LParen", "LBrace", "LBracket"):
-                                    d_p += 1
-                                elif tk_e in ("RParen", "RBrace", "RBracket"):
-                                    d_p = max(0, d_p - 1)
-                                end_p += 1
-                            if _is_trivially_false_spec_pre(inst_body_slice[rhs_p:end_p]):
-                                raise Failure(
-                                    1,
-                                    FAULT_COVERAGE_PHASE,
-                                    f"vacuous `False` precondition in `{cls0}` instance of {label}",
-                                )
-                            p_idx = end_p
-                            continue
-                    if t_p in ("LParen", "LBrace", "LBracket"):
-                        p_depth += 1
-                    elif t_p in ("RParen", "RBrace", "RBracket"):
-                        p_depth = max(0, p_depth - 1)
-                    p_idx += 1
+                for f_name, f_binders, f_rhs in _split_structure_instance_fields(
+                    inst_body_slice
+                ):
+                    if f_name != "pre":
+                        continue
+                    pre_expr = (
+                        [("Ident", "fun"), *f_binders, ("Ident", "=>"), *f_rhs]
+                        if f_binders
+                        else f_rhs
+                    )
+                    if _is_trivially_false_spec_pre(pre_expr):
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"vacuous `False` precondition in `{cls0}` instance of {label}",
+                        )
             if cls0 == "ModularItemSpec":
                 if has_modular_spec_instance:
                     raise Failure(
@@ -13096,6 +13276,7 @@ def _validate_auxiliary_module_no_spec_override(
     attr = _verify_detect_instance_attribute(tokens)
     if attr is not None:
         raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {aux_label}")
+    _reject_meta_commands(tokens, aux_label)
     imported_sibling_specs: list[str] = []
     imported_proof_suffixes: list[str] = []
     imported_assumptions_suffixes: list[str] = []
@@ -13402,6 +13583,37 @@ def _check_trait_impl_closure(
     return reasons
 
 
+def _check_companion_bindings(
+    ob_scan: dict[str, Any],
+    owner_def_path: str,
+    mir_by_stem: dict[str, dict[str, Any]],
+    ob_label: str,
+) -> None:
+    """`[adv ep2-B3]` Every `__anodized_fn_requires_*` / `__anodized_fn_ensures_*` companion
+    that `defaultPre`/`defaultPost`(`For`) or an `externalSpecCallContract` evaluates must be the
+    captured companion OF THAT subject / external target (`ContractRole.requires "<defPath>"`
+    / `ContractRole.ensures "<defPath>"`). Otherwise `defaultPre` could evaluate some other
+    function's (e.g. always-false) `requires` companion, making every claim vacuous while each
+    clause still has the generated `MirBoolPredicateHolds Mir.<companion>.body args` shape.
+    """
+    for comp_suf, kind, expected_owner, context in ob_scan.get("companion_bindings", ()):
+        comp_meta = mir_by_stem.get(comp_suf.replace(".", "/"))
+        owner = owner_def_path if expected_owner is None else expected_owner
+        if comp_meta is None:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"{context} in {ob_label} evaluates companion `Mir.{comp_suf}.body`, but `Mir/{comp_suf.replace('.', '/')}.lean` is missing",
+            )
+        if comp_meta["role"] != (kind, owner):
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"{context} in {ob_label} evaluates companion `Mir.{comp_suf}.body` whose role is "
+                f"`{comp_meta['role']}` instead of `ContractRole.{kind} \"{owner}\"`",
+            )
+
+
 def _audit_single_item_receipt(
     rel_stem: str,
     mir_path: Path,
@@ -13545,6 +13757,8 @@ def _audit_single_item_receipt(
                 FAULT_COVERAGE_PHASE,
                 f"sidecar `Mir.{ext['sidecar_mir_suffix']}` for `externalSpecCallContract \"{ext['target_def_path']}\"` has role `{sidecar_meta['role']}` instead of `ContractRole.externalSpec \"{ext['target_def_path']}\"`",
             )
+
+    _check_companion_bindings(ob_scan, subject_body["def_path"], mir_by_stem, str(ob_path))
 
     # `[adv ep2-A2]`: Validate every imported `Mir.<Suffix>` and `defaultSpecCallees` entry
     # in `Obligations/<Item>.lean` exists in `mir_by_stem` and reconciles cleanly.
@@ -13807,6 +14021,9 @@ def _audit_single_item_receipt(
                 sib_v_path, f"sibling Verify module `Verify.{sib}`"
             )
             sib_surface = _scan_verify_module_surface(sib_v_text, sib, str(sib_v_path))
+            _check_companion_bindings(
+                sib_ob, sib_meta["body"]["def_path"], mir_by_stem, str(sib_ob_path)
+            )
             if kind == "defaultCallContract":
                 if sib_ob["default_call_contract_def_path"] != sib_meta["body"]["def_path"]:
                     raise Failure(

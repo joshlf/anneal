@@ -1324,6 +1324,113 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "  post := fun _ _ _ _ => True\nend Specs.Demo.item_1\n",
             "Demo.item_1", "Specs.Demo.item_1")
         assert equiv_where["equiv_spec_body_suffix"] == "Demo.ref_impl"
+        # `[adv ep2-B3]` The `Specs` vacuity heuristic must not truncate a field value at a
+        # reference to a user helper named `pre` (the shape used by the fuchsia/fxfs example
+        # specs), must respect `∧`/`→` precedence, and must still catch binder-style fields.
+        specs_helper_pre = (
+            "import Trusted\nnamespace Specs.Demo.item_1\n"
+            "def pre (args : List Value) : Prop := args.length = 1\n"
+            "def post (args : List Value) (ret : Value) : Prop := True\n"
+            "instance : ItemSpec \"demo::item_1\" where\n  pre := pre\n  post := post\n"
+            "instance : StatefulItemSpec \"demo::item_1\" where\n"
+            "  pre := fun args mem => pre args ∧ mem = emptyMemory\n"
+            "  post := fun args _ ret _ => post args ret\n"
+            "end Specs.Demo.item_1\n"
+        )
+        runner._scan_specs_module(specs_helper_pre, "Demo.item_1", "Specs.Demo.item_1")
+        runner._scan_specs_module(
+            specs_helper_pre.replace("pre args ∧ mem = emptyMemory", "False ∧ pre args → mem = emptyMemory"),
+            "Demo.item_1", "Specs.Demo.item_1")
+        for vacuous in (
+            specs_helper_pre.replace("pre := fun args mem => pre args ∧ mem = emptyMemory", "pre args mem := False"),
+            specs_helper_pre.replace("pre := fun args mem => pre args ∧ mem = emptyMemory",
+                                     "pre (args : List Value) (mem : Memory) := False"),
+            specs_helper_pre.replace("pre args ∧ mem = emptyMemory", "pre args ∧ False"),
+            specs_helper_pre.replace("pre args ∧ mem = emptyMemory", "And (pre args) False"),
+        ):
+            expect_failure(lambda: runner._scan_specs_module(vacuous, "Demo.item_1", "Specs.Demo.item_1"),
+                           1, "fault-coverage", "vacuous `False` precondition")
+        # Real-data false-positive regression: every authored `Specs` / `Proof` / `Assumptions`
+        # module shipped under `examples/` passes the structural scanners.
+        authored_count = 0
+        for authored in sorted((checkout / "examples").glob("*/anneal/proofs/*/*/*.lean")):
+            parts = authored.relative_to(checkout / "examples").parts
+            kind, suffix = parts[3], ".".join(parts[4:])[: -len(".lean")]
+            text = authored.read_text()
+            if kind == "Specs":
+                runner._scan_specs_module(text, suffix, f"Specs.{suffix}")
+            elif kind in ("Proof", "Assumptions"):
+                runner._validate_auxiliary_module_no_spec_override(text, f"{kind}.{suffix}", suffix, True)
+            authored_count += 1
+        assert authored_count >= 50, authored_count
+        # `defaultPre` / `defaultPost` / external-spec clauses may only evaluate the captured
+        # companion of their own subject (or external target): pointing `defaultPre` at another
+        # function's (e.g. always-false) `requires` companion would make every claim vacuous.
+        binding = {"companion_bindings": [
+            ("Demo.__anodized_fn_requires_item_1", "requires", None, "def defaultPre"),
+            ("Demo.__anodized_fn_ensures_ext", "ensures", "dep::ext", "externalSpecCallContract `c`"),
+        ]}
+        good_roles = {
+            "Demo/__anodized_fn_requires_item_1": {"role": ("requires", "demo::item_1")},
+            "Demo/__anodized_fn_ensures_ext": {"role": ("ensures", "dep::ext")},
+        }
+        runner._check_companion_bindings(binding, "demo::item_1", good_roles, "Obligations.Demo.item_1")
+        for bad_roles, needle in (
+            ({**good_roles, "Demo/__anodized_fn_requires_item_1": {"role": ("requires", "demo::other")}},
+             "instead of `ContractRole.requires \"demo::item_1\"`"),
+            ({**good_roles, "Demo/__anodized_fn_ensures_ext": {"role": ("requires", "dep::ext")}},
+             "instead of `ContractRole.ensures \"dep::ext\"`"),
+            ({k: v for k, v in good_roles.items() if "requires" not in k}, "is missing"),
+        ):
+            expect_failure(lambda: runner._check_companion_bindings(binding, "demo::item_1", bad_roles,
+                                                                    "Obligations.Demo.item_1"),
+                           1, "fault-coverage", needle)
+        # `@[...]` spellings of the meta commands every audited module bans at top level: an
+        # imported Proof/Specs module's `@[macro Lean.Parser.Term.app]` (or `*_elab`, `init`,
+        # `implemented_by`, `builtin_*`, `class`, ...) could re-elaborate the Verify statement.
+        proof_meta = (
+            "import Trusted\nnamespace Proof.Demo.item_1\n"
+            "@[reducible] def helper : Nat := 1\n"
+            "@[simp, instance_reducible] theorem helper_eq : helper = 1 := rfl\n"
+            "end Proof.Demo.item_1\n"
+        )
+        runner._validate_auxiliary_module_no_spec_override(proof_meta, "Proof.Demo.item_1", "Demo.item_1", True)
+        for attr, shown in (
+            ("macro Lean.Parser.Term.app", "macro"),
+            ("term_elab Lean.Parser.Term.app", "term_elab"),
+            ("command_elab Lean.Parser.Command.declaration", "command_elab"),
+            ("simp, tactic Lean.Parser.Tactic.decide", "tactic"),
+            ("init", "init"),
+            ("implemented_by helper", "implemented_by"),
+            ("builtin_macro Lean.Parser.Term.app", "builtin_macro"),
+            ("class", "class"),
+        ):
+            expect_failure(lambda: runner._validate_auxiliary_module_no_spec_override(
+                proof_meta.replace("@[reducible]", f"@[{attr}]"), "Proof.Demo.item_1", "Demo.item_1", True),
+                1, "fault-coverage", f"disallowed `@[{shown}]` attribute")
+        expect_failure(lambda: runner._scan_specs_module(
+            specs_helper_pre.replace("def post (args", "@[macro Lean.Parser.Term.app] def post (args"),
+            "Demo.item_1", "Specs.Demo.item_1"), 1, "fault-coverage", "disallowed `@[macro]` attribute")
+        # Elaboration-time code execution (`#eval`, `run_cmd`, `run_tac`, ...), `#exit` (hides the
+        # rest of the module from Lean but not from this scanner) and `set_option debug.*`.
+        proof_cmds = proof_meta.replace(
+            "@[reducible] def helper : Nat := 1\n",
+            "set_option maxHeartbeats 400000 in\n@[reducible] def helper : Nat := (#[1, 2]).size - 1\n",
+        )
+        runner._validate_auxiliary_module_no_spec_override(proof_cmds, "Proof.Demo.item_1", "Demo.item_1", True)
+        for injected, needle in (
+            ("#eval (IO.FS.writeFile \"f\" \"x\" : IO Unit)\n", "disallowed meta command `#eval`"),
+            ("#exit\n", "disallowed meta command `#exit`"),
+            ("run_cmd Lean.logInfo \"x\"\n", "disallowed meta command `run_cmd`"),
+            ("theorem t : True := by run_tac pure ()\n", "disallowed meta command `run_tac`"),
+            ("set_option debug.skipKernelTC true in\n", "disallowed `set_option debug.skipKernelTC`"),
+        ):
+            expect_failure(lambda: runner._validate_auxiliary_module_no_spec_override(
+                proof_cmds.replace("@[simp, instance_reducible]", injected + "@[simp, instance_reducible]"),
+                "Proof.Demo.item_1", "Demo.item_1", True), 1, "fault-coverage", needle)
+        expect_failure(lambda: runner._scan_specs_module(
+            specs_helper_pre.replace("def post (args", "#eval (pure () : IO Unit)\ndef post (args"),
+            "Demo.item_1", "Specs.Demo.item_1"), 1, "fault-coverage", "disallowed meta command `#eval`")
 
         # 19e. External callees are honoured only for an independently derived modular surface
         # backed by verified `externalSpecCallContract` sidecars or verified sibling obligations
