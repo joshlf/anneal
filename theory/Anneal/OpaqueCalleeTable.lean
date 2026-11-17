@@ -2011,6 +2011,33 @@ theorem stepTerminatorWith_congr (prune : Bool) {r₁ r₂ : CalleeResolver} (s 
     | unsupported => simp only [stepTerminatorWith, tailCallWith, bodyLocalDeclsOf, hrt]
   | _ => rfl
 
+/-- At an active terminator, `stepMirFnWith` *is* its terminator step. -/
+theorem stepMirFnWith_of_activeTerminator
+    (t : MachineState → Terminator → Option CapturedMir → MirStepNode)
+    {body : CapturedMir} {s : MachineState} {term : Terminator} {cb : CapturedMir}
+    (h : activeTerminator? body s = some (term, cb)) :
+    stepMirFnWith t body s = t s term (some cb) := by
+  unfold activeTerminator? at h
+  unfold stepMirFnWith
+  dsimp only at h ⊢
+  cases hph : (s.memory.activeCallee.getD body).phase with
+  | other name => simp only [hph] at h; nomatch h
+  | runtimePostCleanup | runtimeOptimized =>
+    simp only [hph] at h ⊢
+    cases hbb : get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx with
+    | none => simp only [hbb] at h; nomatch h
+    | some bb =>
+      simp only [hbb] at h ⊢
+      cases hst : get? bb.statements s.frame.stmtIdx with
+      | some st => simp only [hst] at h; nomatch h
+      | none =>
+        simp only [hst] at h ⊢
+        by_cases hidx : (s.frame.stmtIdx == length bb.statements) = true
+        · simp only [hidx, ite_true, Option.some.injEq, Prod.mk.injEq] at h ⊢
+          rw [← h.1, ← h.2]
+        · simp only [hidx, Bool.false_eq_true, ite_false] at h
+          nomatch h
+
 /-- `stepMirFnWith` depends on its terminator step only at the active terminator. -/
 theorem stepMirFnWith_congr_active
     {t₁ t₂ : MachineState → Terminator → Option CapturedMir → MirStepNode}

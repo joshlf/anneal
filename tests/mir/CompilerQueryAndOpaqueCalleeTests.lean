@@ -34,8 +34,11 @@ Contents (every claim is checked by the kernel when this file is elaborated):
   of a table with a shadowed duplicate, and `AgreesOn` narrowing of a generic callee);
 * Part B query canaries and the **receiver-driven `charon#1611` dispatch** canaries, including
   the explicit trait-method binding (`expectedTraitMethod?`) for compiler-generated shims versus
-  the fail-closed `implementsCalledMethod` fallback, and the fail-closed / UB edges of dispatch
-  (ill-formed sites, unresolved `dyn` slot targets, vtable metadata off an allocation start);
+  the fail-closed `implementsCalledMethod` fallback, the fail-closed / UB edges of dispatch
+  (ill-formed sites, unresolved `dyn` slot targets, vtable metadata off an allocation start or
+  carrying a stack-borrow tag, unlinked or ABI-incompatible impl bodies), the trusted-step
+  specification of every successful dispatch step, and location-scoped registries with unique
+  resolution at every matching state;
 * the `BEq`-shadowing demonstration (`ShadowingDemo`);
 * the `run_meta` **opacity witness** on all five sealed `OpaqueCalleeTable` operations;
 * the in-file **heartbeat regression gate** (monomorphic and polymorphic + trait-dispatch
@@ -2412,6 +2415,57 @@ theorem canary_dyn_scoped_ssa_and_cross_frame_registry :
       (by decide +kernel),
     by decide +kernel, by decide +kernel⟩
 
+/-- **Unique scoped resolution at every state** (`findSiteAt?_eq_some_of_scopedWellFormed`):
+in the `scopedWellFormed` registry `ssaRegistry`, the `bb1` site is returned by `findSiteAt?` at
+*every* state whose active block is `bb1` of `fx::ssa_dyn_root` — a statement over all states,
+beyond any `decide` — and conversely anything `findSiteAt?` returns is a matching member
+(`findSiteAt?_spec`). -/
+theorem canary_scoped_registry_unique_resolution :
+    (∀ s : MachineState, ssaSite1.matchesLoc ssaDynRoot s = true →
+      ssaRegistry.findSiteAt? ssaDynRoot s ssaSite1.dynKey = some ssaSite1) ∧
+    ssaRegistry.findSiteAt? ssaDynRoot ssaInit ssaSite0.dynKey = some ssaSite0 ∧
+    (∀ s site, ssaRegistry.findSiteAt? ssaDynRoot s dynSite.dynKey = some site →
+      site ∈ ssaRegistry ∧ site.matchesLoc ssaDynRoot s = true) := by
+  have hwf : ssaRegistry.scopedWellFormed = true := by decide
+  refine ⟨fun s hloc => ?_, ?_, fun s site h => ?_⟩
+  · exact (DynCallRegistry.findSiteAt?_eq_some_of_scopedWellFormed ssaDynRoot s hwf
+      (by simp [ssaRegistry]) hloc).1
+  · exact (DynCallRegistry.findSiteAt?_eq_some_of_scopedWellFormed ssaDynRoot ssaInit hwf
+      (by simp [ssaRegistry]) (by decide)).1
+  · obtain ⟨hmem, -, hloc⟩ := DynCallRegistry.findSiteAt?_spec h
+    exact ⟨hmem, hloc⟩
+
+/-- **A successful dynamic dispatch step is a redirected trusted step**
+(`dynDispatchStep_step_spec`, via `stepTerminatorWith_of_stepDynTerminator_step`): the live
+`<dyn Area>::area` call at `dynAtCall` *does* step (non-vacuity), and whatever state it steps to
+is exactly the branch-pruned trusted step that redirects only the virtual key to the
+vtable-resolved `<impl Area for Circle>::area`. -/
+theorem canary_dynDispatchStep_step_spec :
+    (∃ s', dynDispatchStep dynEnv13 dynFullTbl dynSite dynRoot dynAtCall = MirStepNode.step s') ∧
+    ∀ s', dynDispatchStep dynEnv13 dynFullTbl dynSite dynRoot dynAtCall = MirStepNode.step s' →
+      stepBranchPruned (redirectResolver dynFullTbl dynSite.dynKey
+        ("fx::<impl Area for Circle>::area", [])) dynRoot dynAtCall = MirStepNode.step s' := by
+  refine ⟨?_, fun s' h => ?_⟩
+  · have hview : (match dynDispatchStep dynEnv13 dynFullTbl dynSite dynRoot dynAtCall with
+        | .tau (.running _) => true
+        | _ => false) = true := by
+      decide +kernel
+    revert hview
+    cases dynDispatchStep dynEnv13 dynFullTbl dynSite dynRoot dynAtCall with
+    | tau st =>
+      cases st with
+      | running s' => intro _; exact ⟨s', rfl⟩
+      | halted _ => intro h; nomatch h
+      | faulted _ => intro h; nomatch h
+    | ret _ => intro h; nomatch h
+    | vis _ _ => intro h; nomatch h
+  · obtain ⟨vt, target, -, hvt, hr, -, hstep⟩ := dynDispatchStep_step_spec h
+    rw [dyn_vtablePtr_atCall] at hvt
+    cases hvt
+    rw [dyn_schema13_resolves] at hr
+    cases hr
+    exact hstep
+
 
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
 
@@ -3476,6 +3530,42 @@ constant. -/
 /-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_scoped_ssa_and_cross_frame_registry' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_scoped_ssa_and_cross_frame_registry
+
+/-- info: 'Anneal.OpaqueCalleeTable.stepMirFnWith_of_activeTerminator' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.stepMirFnWith_of_activeTerminator
+
+/-- info: 'Anneal.CompilerQueryEnv.stepTerminatorWith_of_stepDynTerminator_step' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.stepTerminatorWith_of_stepDynTerminator_step
+
+/-- info: 'Anneal.CompilerQueryEnv.stepBranchPruned_redirect_of_stepDynPruned_step' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.stepBranchPruned_redirect_of_stepDynPruned_step
+
+/-- info: 'Anneal.CompilerQueryEnv.dynDispatchStep_step_spec' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.dynDispatchStep_step_spec
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.filter_eq_nil_of_forall' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.filter_eq_nil_of_forall
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_some_of_scopedWellFormed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_some_of_scopedWellFormed
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_spec' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_spec
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_scoped_registry_unique_resolution' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_scoped_registry_unique_resolution
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dynDispatchStep_step_spec' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dynDispatchStep_step_spec
 
 end Anneal.CompilerQueryAndOpaqueCalleeTests
 
