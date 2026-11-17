@@ -1275,6 +1275,145 @@ theorem lookupCallee_trait_default_hit_cert {tbl : OpaqueCalleeTable} {callerLay
   rw [htraits, hcollect]
   exact hwin
 
+/-- **`O(1)` key certificate (miss)**: the `CalleeKey` form of `lookupCallee_miss_direct`. -/
+theorem lookupKey_miss_direct {tbl : OpaqueCalleeTable} {k : CalleeKey}
+    (hraw : tbl.lookupRaw k.defPath = none) (hk : k.typeArgs = []) :
+    tbl.lookupKey k = none := by
+  obtain ⟨L, dp, tys, ti⟩ := k
+  simp only at hraw hk
+  subst hk
+  rw [OpaqueCalleeTable.lookupKey_eq]
+  exact lookupCallee_miss_direct hraw
+
+/-- **`O(1)` key certificate (direct polymorphic / fallback default-method hit)**:
+the `CalleeKey` form of `lookupCallee_hit_poly`. -/
+theorem lookupKey_hit_poly {tbl : OpaqueCalleeTable} {k : CalleeKey}
+    {firstArg : RigidTy} {restArgs : List RigidTy} {c : CapturedMir}
+    {argLayouts : List TypeLayout}
+    (hk : k.typeArgs = firstArg :: restArgs)
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (hnoTrait : (traitMatches tbl k.extraTraitImpls k.defPath (firstArg :: restArgs)).isEmpty = true)
+    (hraw : tbl.lookupRaw k.defPath = some c)
+    (hconcrete : allParamsInCallerLayouts 0 firstArg = true)
+    (harity : (firstArg :: restArgs).length = c.typeParamCount)
+    (hlay : instantiationLayouts? k.callerLayouts (firstArg :: restArgs) = some argLayouts) :
+    tbl.lookupKey k = some (c.instantiate ((firstArg :: restArgs).zip argLayouts)) := by
+  obtain ⟨L, dp, tys, ti⟩ := k
+  simp only at hk hnoTrait hraw hlay
+  subst hk
+  rw [OpaqueCalleeTable.lookupKey_eq]
+  exact lookupCallee_hit_poly hfirst hnoTrait hraw hconcrete harity hlay
+
+/-- **`O(1)` key certificate (free generic function)**: the `CalleeKey` form of
+`lookupCallee_hit_free_poly`. -/
+theorem lookupKey_hit_free_poly {tbl : OpaqueCalleeTable} {k : CalleeKey}
+    {firstArg : RigidTy} {restArgs : List RigidTy} {c : CapturedMir}
+    {argLayouts : List TypeLayout}
+    (hk : k.typeArgs = firstArg :: restArgs)
+    (hnoImpl : hasTraitImplForDefPath (k.extraTraitImpls ++ flatMapTraitImpls tbl.toList)
+      k.defPath = false)
+    (hraw : tbl.lookupRaw k.defPath = some c)
+    (harity : (firstArg :: restArgs).length = c.typeParamCount)
+    (hlay : instantiationLayouts? k.callerLayouts (firstArg :: restArgs) = some argLayouts) :
+    tbl.lookupKey k = some (c.instantiate ((firstArg :: restArgs).zip argLayouts)) := by
+  obtain ⟨L, dp, tys, ti⟩ := k
+  simp only at hk hnoImpl hraw hlay
+  subst hk
+  rw [OpaqueCalleeTable.lookupKey_eq]
+  exact lookupCallee_hit_free_poly hnoImpl hraw harity hlay
+
+/-- **`O(1)` key certificate (free generic function, `tbl.toList`-free)**: the `CalleeKey`
+form of `lookupCallee_hit_free_poly_opaque`, rewriting `tbl.lookupKey k` without unfolding
+`tbl.toList` in either the elaborator or the kernel. -/
+theorem lookupKey_hit_free_poly_opaque {tbl : OpaqueCalleeTable} {k : CalleeKey}
+    {firstArg : RigidTy} {restArgs : List RigidTy} {impls : List TraitImplEntry}
+    {c : CapturedMir} {argLayouts : List TypeLayout}
+    (hk : k.typeArgs = firstArg :: restArgs)
+    (htraits : tbl.traitImpls = impls)
+    (hnoImpl : hasTraitImplForDefPath (k.extraTraitImpls ++ impls) k.defPath = false)
+    (hraw : tbl.lookupRaw k.defPath = some c)
+    (harity : (firstArg :: restArgs).length = c.typeParamCount)
+    (hlay : instantiationLayouts? k.callerLayouts (firstArg :: restArgs) = some argLayouts) :
+    tbl.lookupKey k = some (c.instantiate ((firstArg :: restArgs).zip argLayouts)) := by
+  obtain ⟨L, dp, tys, ti⟩ := k
+  simp only at hk hnoImpl hraw hlay
+  subst hk
+  rw [OpaqueCalleeTable.lookupKey_eq]
+  exact lookupCallee_hit_free_poly_opaque htraits hnoImpl hraw harity hlay
+
+/-- **`O(1)` key certificate (monomorphic `TraitImplEntry` override hit, `tbl.toList`-free)**:
+the `CalleeKey` form of `lookupCallee_trait_hit_cert`. -/
+theorem lookupKey_trait_hit_cert {tbl : OpaqueCalleeTable} {k : CalleeKey}
+    {firstArg : RigidTy} {restArgs : List RigidTy} {impls : List TraitImplEntry}
+    {winner : TraitImplEntry} {matches_ : List (TraitImplEntry × Option (List RigidTy))}
+    {c : CapturedMir}
+    (hk : k.typeArgs = firstArg :: restArgs)
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (htraits : tbl.traitImpls = impls)
+    (hcollect : collectMatchingTraitImplsWith tbl.lookupRaw (k.extraTraitImpls ++ impls)
+      k.defPath (firstArg :: restArgs) [] = matches_)
+    (hwin : filterMostSpecificTraitImpls matches_ matches_ = [(winner, some [])])
+    (himpl : tbl.lookupRaw winner.implPath = some c)
+    (hoverride : winner.implPath ≠ k.defPath)
+    (hmono : c.typeParamCount = 0) :
+    tbl.lookupKey k = some c := by
+  obtain ⟨L, dp, tys, ti⟩ := k
+  simp only at hk hcollect hoverride
+  subst hk
+  rw [OpaqueCalleeTable.lookupKey_eq]
+  exact lookupCallee_trait_hit_cert hfirst htraits hcollect hwin himpl hoverride hmono
+
+/-- **`O(1)` key certificate (polymorphic `TraitImplEntry` override hit, `tbl.toList`-free)**:
+the `CalleeKey` form of `lookupCallee_trait_hit_poly_cert`. -/
+theorem lookupKey_trait_hit_poly_cert {tbl : OpaqueCalleeTable} {k : CalleeKey}
+    {firstArg : RigidTy} {restArgs : List RigidTy} {impls : List TraitImplEntry}
+    {winner : TraitImplEntry} {implArgs : List RigidTy}
+    {matches_ : List (TraitImplEntry × Option (List RigidTy))} {c : CapturedMir}
+    {argLayouts : List TypeLayout}
+    (hk : k.typeArgs = firstArg :: restArgs)
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (htraits : tbl.traitImpls = impls)
+    (hcollect : collectMatchingTraitImplsWith tbl.lookupRaw (k.extraTraitImpls ++ impls)
+      k.defPath (firstArg :: restArgs) [] = matches_)
+    (hwin : filterMostSpecificTraitImpls matches_ matches_ = [(winner, some implArgs)])
+    (himpl : tbl.lookupRaw winner.implPath = some c)
+    (hoverride : winner.implPath ≠ k.defPath)
+    (hpoly : (c.typeParamCount == 0 && implArgs.isEmpty) = false)
+    (harity : implArgs.length = c.typeParamCount)
+    (hlay : instantiationLayouts? k.callerLayouts implArgs = some argLayouts) :
+    tbl.lookupKey k = some (c.instantiate (implArgs.zip argLayouts)) := by
+  obtain ⟨L, dp, tys, ti⟩ := k
+  simp only at hk hcollect hoverride hlay
+  subst hk
+  rw [OpaqueCalleeTable.lookupKey_eq]
+  exact lookupCallee_trait_hit_poly_cert hfirst htraits hcollect hwin himpl hoverride
+    hpoly harity hlay
+
+/-- **`O(1)` key certificate (default trait method inheritance hit, `tbl.toList`-free)**:
+the `CalleeKey` form of `lookupCallee_trait_default_hit_cert`. -/
+theorem lookupKey_trait_default_hit_cert {tbl : OpaqueCalleeTable} {k : CalleeKey}
+    {firstArg : RigidTy} {restArgs : List RigidTy} {impls : List TraitImplEntry}
+    {winner : TraitImplEntry} {implArgs : List RigidTy}
+    {matches_ : List (TraitImplEntry × Option (List RigidTy))} {c : CapturedMir}
+    {argLayouts : List TypeLayout}
+    (hk : k.typeArgs = firstArg :: restArgs)
+    (hfirst : rigidTyTag firstArg ≠ 0)
+    (htraits : tbl.traitImpls = impls)
+    (hcollect : collectMatchingTraitImplsWith tbl.lookupRaw (k.extraTraitImpls ++ impls)
+      k.defPath (firstArg :: restArgs) [] = matches_)
+    (hwin : filterMostSpecificTraitImpls matches_ matches_ = [(winner, some implArgs)])
+    (hdefault : winner.implPath = k.defPath)
+    (hbody : tbl.lookupRaw k.defPath = some c)
+    (harity : (firstArg :: restArgs).length = c.typeParamCount)
+    (hlay : instantiationLayouts? k.callerLayouts (firstArg :: restArgs) = some argLayouts) :
+    tbl.lookupKey k = some (c.instantiate ((firstArg :: restArgs).zip argLayouts)) := by
+  obtain ⟨L, dp, tys, ti⟩ := k
+  simp only at hk hcollect hdefault hbody hlay
+  subst hk
+  rw [OpaqueCalleeTable.lookupKey_eq]
+  exact lookupCallee_trait_default_hit_cert hfirst htraits hcollect hwin hdefault hbody
+    harity hlay
+
 /-! ### Literal-discriminant branch pruning over the real trusted step -/
 
 /-- Literal scalar `switchInt` discriminant (`ConstValue.scalar (.int si)`): covers
@@ -3114,5 +3253,1191 @@ theorem mirWpConverges_cone_narrow_of_agreesOn_closed_poly_wf (cone : List DefPa
   MirLiftCore.mirWpConverges_cone_narrow_of_closed_poly_wf cone body args mem h₁ h₂
     (calleesAgreeOn_of_agreesOn h_agree) h_closed (noTraitImplInCone_toList h_no₂) h_ac h_cs
     post h_post
+
+/-! #### `tbl.toList`-free syntactic call-cone closure (`callConeClosed` & `callConeClosedPoly`)
+
+`MirLiftCore.CallConeClosed` and `MirLiftCore.CallConeClosedPoly` scan `coneBodies cone tbl.toList`
+and `flatMapTraitImpls tbl.toList`, which (a) forces `tbl.toList` to be unfolded across all `M`
+callees at the use site and (b) inspects *shadowed* duplicate `DefPath` entries in `tbl.toList`
+that `findCallee?` / `lookupRaw` can never return.
+
+`OpaqueCalleeTable.callConeClosed` and `OpaqueCalleeTable.callConeClosedPoly` instead query only
+`tbl.lookupRaw dp` for `dp ∈ cone` and the sealed `tbl.traitImpls`, so a client discharges cone
+closure in `O(|cone|)` rewrites using the same `lookupRaw` and `traitImpls` certificates it uses
+for stepping — never unfolding `tbl.toList`, invariant under `OpaqueCalleeTable.AgreesOn cone`,
+and strictly more general when `tbl` contains shadowed duplicate entries. -/
+
+/-- **`tbl.toList`-free syntactic call-cone closure**: checks `root` and the first-match body
+`tbl.lookupRaw dp` for each `dp ∈ cone`. -/
+def OpaqueCalleeTable.callConeClosed (cone : List DefPath) (root : CapturedMir)
+    (tbl : OpaqueCalleeTable) : Bool :=
+  MirLiftCore.bodyCallsInCone cone root &&
+    cone.all (fun dp =>
+      match tbl.lookupRaw dp with
+      | some b => MirLiftCore.bodyCallsInCone cone b
+      | none => true)
+
+/-- **`tbl.toList`-free polymorphic syntactic call-cone closure**: checks `root`, the first-match
+body `tbl.lookupRaw dp` for each `dp ∈ cone`, and absence of trait-impl dispatch over the sealed
+`tbl.traitImpls`. -/
+def OpaqueCalleeTable.callConeClosedPoly (cone : List DefPath) (root : CapturedMir)
+    (tbl : OpaqueCalleeTable) (ti : List TraitImplEntry := []) : Bool :=
+  MirLiftCore.bodyCallsInConePoly cone root &&
+    cone.all (fun dp =>
+      (match tbl.lookupRaw dp with
+       | some b => MirLiftCore.bodyCallsInConePoly cone b
+       | none => true) &&
+      !hasTraitImplForDefPath (ti ++ tbl.traitImpls) dp)
+
+theorem listAll_congr {α : Type} {f g : α → Bool} :
+    ∀ {xs : List α}, (∀ x ∈ xs, f x = g x) → xs.all f = xs.all g
+  | [], _ => rfl
+  | x :: xs, h => by
+    simp only [List.all_cons, h x (List.Mem.head _),
+      listAll_congr (fun y hy => h y (List.Mem.tail _ hy))]
+
+/-- `callConeClosed` is invariant under `OpaqueCalleeTable.AgreesOn cone` (unlike
+`MirLiftCore.CallConeClosed`, which also scans shadowed duplicate entries in `coneBodies`). -/
+theorem callConeClosed_congr_of_agreesOn {cone : List DefPath} {t₁ t₂ : OpaqueCalleeTable}
+    (root : CapturedMir) (h : OpaqueCalleeTable.AgreesOn cone t₁ t₂) :
+    t₁.callConeClosed cone root = t₂.callConeClosed cone root := by
+  unfold OpaqueCalleeTable.callConeClosed
+  congr 1
+  exact listAll_congr fun dp hdp => by rw [h dp hdp]
+
+/-- `callConeClosedPoly` is invariant under `OpaqueCalleeTable.AgreesOn cone` and agreement of
+`hasTraitImplForDefPath` on `cone`. -/
+theorem callConeClosedPoly_congr_of_agreesOn {cone : List DefPath} {t₁ t₂ : OpaqueCalleeTable}
+    (root : CapturedMir) (ti : List TraitImplEntry) (h : OpaqueCalleeTable.AgreesOn cone t₁ t₂)
+    (ht : ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (ti ++ t₁.traitImpls) dp =
+        hasTraitImplForDefPath (ti ++ t₂.traitImpls) dp) :
+    t₁.callConeClosedPoly cone root ti = t₂.callConeClosedPoly cone root ti := by
+  unfold OpaqueCalleeTable.callConeClosedPoly
+  congr 1
+  exact listAll_congr fun dp hdp => by rw [h dp hdp, ht dp hdp]
+
+/-- `MirLiftCore.CallConeClosed` implies `OpaqueCalleeTable.callConeClosed` (the converse can fail
+when `tbl.toList` contains a shadowed duplicate entry with `defPath ∈ cone`). -/
+theorem callConeClosed_of_mirLiftCore {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} (h : MirLiftCore.CallConeClosed cone root tbl.toList = true) :
+    tbl.callConeClosed cone root = true := by
+  unfold MirLiftCore.CallConeClosed at h
+  rw [Bool.and_eq_true] at h
+  unfold OpaqueCalleeTable.callConeClosed
+  rw [Bool.and_eq_true]
+  refine ⟨h.1, List.all_eq_true.mpr fun dp hdp => ?_⟩
+  cases hraw : tbl.lookupRaw dp with
+  | none => rfl
+  | some b =>
+    rw [OpaqueCalleeTable.lookupRaw_eq] at hraw
+    obtain ⟨hm, hd⟩ := MirLiftCore.findCallee?_spec hraw
+    apply List.all_eq_true.mp h.2 b
+    unfold MirLiftCore.coneBodies
+    rw [List.mem_filter]
+    exact ⟨hm, MirLiftCore.inCone_iff.mpr (hd ▸ hdp)⟩
+
+/-- `MirLiftCore.CallConeClosedPoly` implies `OpaqueCalleeTable.callConeClosedPoly`. -/
+theorem callConeClosedPoly_of_mirLiftCore {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {ti : List TraitImplEntry}
+    (h : MirLiftCore.CallConeClosedPoly cone root tbl.toList ti = true) :
+    tbl.callConeClosedPoly cone root ti = true := by
+  unfold MirLiftCore.CallConeClosedPoly at h
+  simp only [Bool.and_eq_true] at h
+  unfold OpaqueCalleeTable.callConeClosedPoly
+  rw [Bool.and_eq_true]
+  refine ⟨h.1.1, List.all_eq_true.mpr fun dp hdp => ?_⟩
+  rw [Bool.and_eq_true, OpaqueCalleeTable.traitImpls_eq]
+  refine ⟨?_, List.all_eq_true.mp h.2 dp hdp⟩
+  cases hraw : tbl.lookupRaw dp with
+  | none => rfl
+  | some b =>
+    rw [OpaqueCalleeTable.lookupRaw_eq] at hraw
+    obtain ⟨hm, hd⟩ := MirLiftCore.findCallee?_spec hraw
+    apply List.all_eq_true.mp h.1.2 b
+    unfold MirLiftCore.coneBodies
+    rw [List.mem_filter]
+    exact ⟨hm, MirLiftCore.inCone_iff.mpr (hd ▸ hdp)⟩
+
+/-- `b` is the root body or the first-match body `tbl.lookupRaw dp = some b` for some `dp ∈ cone`. -/
+def InConeLookup (cone : List DefPath) (root : CapturedMir) (tbl : OpaqueCalleeTable)
+    (b : CapturedMir) : Prop :=
+  b = root ∨ ∃ dp, dp ∈ cone ∧ tbl.lookupRaw dp = some b
+
+/-- Reachable-state invariant of a `callConeClosed` execution over `tbl`. -/
+def ClosedInvLookup (cone : List DefPath) (root : CapturedMir) (tbl : OpaqueCalleeTable)
+    (s : MachineState) : Prop :=
+  s.memory.callees = tbl.toList ∧
+    InConeLookup cone root tbl (s.memory.activeCallee.getD root) ∧
+    ∀ f, f ∈ s.memory.callStack → InConeLookup cone root tbl f.callerBody
+
+theorem bodyCallsInCone_of_inConeLookup {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {b : CapturedMir}
+    (h_closed : tbl.callConeClosed cone root = true)
+    (hb : InConeLookup cone root tbl b) : MirLiftCore.bodyCallsInCone cone b = true := by
+  unfold OpaqueCalleeTable.callConeClosed at h_closed
+  rw [Bool.and_eq_true] at h_closed
+  rcases hb with rfl | ⟨dp, hdp, hraw⟩
+  · exact h_closed.1
+  · have h := List.all_eq_true.mp h_closed.2 dp hdp
+    rw [hraw] at h
+    exact h
+
+theorem stepConeSafe_of_closedInvLookup {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {s : MachineState}
+    (h_closed : tbl.callConeClosed cone root = true)
+    (h_inv : ClosedInvLookup cone root tbl s) : MirLiftCore.StepConeSafe cone root s := by
+  intro blk h_bb
+  have h_body := bodyCallsInCone_of_inConeLookup h_closed h_inv.2.1
+  unfold MirLiftCore.bodyCallsInCone at h_body
+  have h_blk := List.all_eq_true.mp h_body blk (List.mem_of_getElem? h_bb)
+  rw [Bool.and_eq_true] at h_blk
+  exact ⟨fun stmt h_st => List.all_eq_true.mp h_blk.1 stmt (List.mem_of_getElem? h_st),
+    MirLiftCore.termConeSafe_of_termCallsInCone h_blk.2⟩
+
+theorem closedInvLookup_of_callerBodies {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {s s' : MachineState}
+    (h_inv : ClosedInvLookup cone root tbl s)
+    (hc : s'.memory.callees = s.memory.callees)
+    (hac : s'.memory.activeCallee = s.memory.activeCallee)
+    (hb : MirLiftCore.CallerBodiesEq s.memory.callStack s'.memory.callStack) :
+    ClosedInvLookup cone root tbl s' := by
+  refine ⟨hc.trans h_inv.1, hac ▸ h_inv.2.1, ?_⟩
+  intro f hf
+  obtain ⟨f₀, hf₀, he⟩ := hb.mem hf
+  exact he ▸ h_inv.2.2 f₀ hf₀
+
+theorem nodeSuccs_closedInvLookup_of_ctx {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {s : MachineState} {n : MirStepNode}
+    (h_inv : ClosedInvLookup cone root tbl s)
+    (hfix : n = MirLiftCore.MirStepNode.mapMem
+      (MirLiftCore.Memory.withCalleeCtx s.memory.callees s.memory.activeCallee
+        s.memory.traitImpls) n)
+    (hb : MirLiftCore.NodeSuccs
+      (fun s' => MirLiftCore.CallerBodiesEq s.memory.callStack s'.memory.callStack) n) :
+    MirLiftCore.NodeSuccs (ClosedInvLookup cone root tbl) n := by
+  refine MirLiftCore.NodeSuccs.mono ?_
+    (MirLiftCore.NodeSuccs.and
+      (MirLiftCore.nodeSuccs_of_fixed (P := fun s' => s' = MirLiftCore.MachineState.mapMem
+        (MirLiftCore.Memory.withCalleeCtx s.memory.callees s.memory.activeCallee
+          s.memory.traitImpls) s')
+        hfix (fun _ h => h))
+      hb)
+  rintro s' ⟨hs', hb'⟩
+  have hm : s'.memory =
+      MirLiftCore.Memory.withCalleeCtx s.memory.callees s.memory.activeCallee
+        s.memory.traitImpls s'.memory :=
+    congrArg MachineState.memory hs'
+  exact closedInvLookup_of_callerBodies h_inv (by rw [hm]) (by rw [hm]) hb'
+
+theorem closedInvLookup_return {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {s : MachineState} {caller : SavedCallerFrame}
+    {rest : List SavedCallerFrame} {retVal : Value} {locals' : List LocalSlot} {mem' : Memory}
+    {F : StackFrame}
+    (h_inv : ClosedInvLookup cone root tbl s) (h_cs : s.memory.callStack = caller :: rest)
+    (h_w : writeReturnDestination caller.frame.locals (MirLiftCore.ccReturnCallerMem s caller rest)
+      caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts =
+        .ok locals' mem') :
+    ClosedInvLookup cone root tbl { frame := F, memory := mem' } := by
+  obtain ⟨hc, hac, _⟩ := MirLiftCore.writeReturnDestination_ctx_preserved h_w
+  have hb := MirLiftCore.writeReturnDestination_callerBodies h_w
+  refine ⟨hc.trans h_inv.1, ?_, ?_⟩
+  · show InConeLookup cone root tbl (mem'.activeCallee.getD root)
+    rw [hac]
+    exact h_inv.2.2 caller (by rw [h_cs]; exact List.Mem.head _)
+  · intro f hf
+    obtain ⟨f₀, hf₀, he⟩ := hb.mem hf
+    exact he ▸ h_inv.2.2 f₀ (by rw [h_cs]; exact List.Mem.tail _ hf₀)
+
+theorem closedInvLookup_unwindFromCallStack {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} :
+    ∀ (stk : List SavedCallerFrame) (m : Memory), m.callees = tbl.toList →
+      (∀ f, f ∈ stk → InConeLookup cone root tbl f.callerBody) →
+      ∀ s', unwindFromCallStack stk m = .running s' → ClosedInvLookup cone root tbl s'
+  | [], _, _, _, _, h => by cases h
+  | caller :: rest, m, hc, hf, s', h => by
+    unfold unwindFromCallStack at h
+    dsimp only at h
+    cases hr : caller.returnUnwind with
+    | unreachable => rw [hr] at h; dsimp only at h; cases h
+    | terminate => rw [hr] at h; dsimp only at h; cases h
+    | continue_ =>
+      rw [hr] at h
+      dsimp only at h
+      exact closedInvLookup_unwindFromCallStack rest
+        { m with
+          callStack := rest
+          activeCallee := some caller.callerBody
+          activeProtectors := restoreCallerProtectors caller }
+        hc (fun f hm => hf f (List.Mem.tail _ hm)) s' h
+    | cleanup bb =>
+      rw [hr] at h
+      dsimp only at h
+      cases h
+      exact ⟨hc, hf caller (List.Mem.head _), fun f hm => hf f (List.Mem.tail _ hm)⟩
+
+private theorem nodeSuccs_unwindMatchLookup {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} (st : MirExecState)
+    (h : ∀ s', st = .running s' → ClosedInvLookup cone root tbl s') :
+    MirLiftCore.NodeSuccs (ClosedInvLookup cone root tbl)
+      (match (generalizing := false) st with
+        | .running nextState => MirStepNode.step nextState
+        | .halted out => MirStepNode.retOutcome out
+        | .faulted fk => MirStepNode.fail fk) := by
+  cases st with
+  | running s' => exact h s' rfl
+  | halted _ => trivial
+  | faulted _ => trivial
+
+private theorem nodeSuccs_applyUnwindLookup {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {s : MachineState} (h_inv : ClosedInvLookup cone root tbl s)
+    (l : List LocalSlot) (u : UnwindAction) :
+    MirLiftCore.NodeSuccs (ClosedInvLookup cone root tbl)
+      (match applyUnwindAction s l s.memory u with
+        | .running nextState => MirStepNode.step nextState
+        | .halted out => MirStepNode.retOutcome out
+        | .faulted fk => MirStepNode.fail fk) := by
+  refine nodeSuccs_unwindMatchLookup _ ?_
+  intro s' hs'
+  cases u with
+  | unreachable => cases hs'
+  | terminate => cases hs'
+  | continue_ =>
+    exact closedInvLookup_unwindFromCallStack s.memory.callStack s.memory h_inv.1 h_inv.2.2 s' hs'
+  | cleanup bb =>
+    cases hs'
+    exact h_inv
+
+private theorem inConeLookup_of_lookup {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {L : LayoutTable} {dp : DefPath} {ti : List TraitImplEntry}
+    {b : CapturedMir} (h_dp : dp ∈ cone) (h_lk : lookupCallee tbl.toList L dp [] ti = some b) :
+    InConeLookup cone root tbl b :=
+  Or.inr ⟨dp, h_dp,
+    (OpaqueCalleeTable.lookupRaw_eq tbl dp).trans (MirLiftCore.lookupCallee_nil_eq_some h_lk)⟩
+
+private theorem closedInvLookup_push {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {s : MachineState} {saved : SavedCallerFrame} {b : CapturedMir}
+    {F : StackFrame} (h_inv : ClosedInvLookup cone root tbl s)
+    (h_saved : InConeLookup cone root tbl saved.callerBody)
+    (h_b : InConeLookup cone root tbl b) :
+    ClosedInvLookup cone root tbl
+      { frame := F,
+        memory := { s.memory with
+          callStack := saved :: s.memory.callStack
+          activeCallee := some b } } := by
+  refine ⟨h_inv.1, h_b, ?_⟩
+  intro f hf
+  cases hf with
+  | head => exact h_saved
+  | tail _ hf => exact h_inv.2.2 f hf
+
+theorem nodeSuccs_evalDirectRustIntrinsic?_lookup {cone : List DefPath}
+    {root : CapturedMir} {tbl : OpaqueCalleeTable} {s : MachineState}
+    (h_inv : ClosedInvLookup cone root tbl s) (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    (h_cl : MirLiftCore.isNonSelectIntrinsicOpt (classifyRustIntrinsic? target.defPath) = true)
+    (fallback : MirStepNode) (h_fb : MirLiftCore.NodeSuccs (ClosedInvLookup cone root tbl) fallback) :
+    MirLiftCore.NodeSuccs (ClosedInvLookup cone root tbl)
+      (match evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb unwind with
+       | some stepNode => stepNode
+       | none => fallback) := by
+  unfold evalDirectRustIntrinsic?
+  cases h_k : classifyRustIntrinsic? target.defPath with
+  | none => exact h_fb
+  | some kind =>
+    rw [h_k] at h_cl
+    have h_step : ∀ (k : RustIntrinsicKind),
+        MirLiftCore.NodeSuccs (ClosedInvLookup cone root tbl)
+          (evalNonSelectIntrinsicCall k s target bodyLocalDecls bodyLayouts
+            argOps argVals locals' destination targetBb) := by
+      intro k
+      exact nodeSuccs_closedInvLookup_of_ctx h_inv
+        (MirLiftCore.evalNonSelectIntrinsicCall_calleeCtx_preserved k s target bodyLocalDecls
+          bodyLayouts argOps argVals locals' destination targetBb)
+        (MirLiftCore.evalNonSelectIntrinsicCall_callerBodies k s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb)
+    cases kind with
+    | constEvalSelect => cases h_cl
+    | _ => exact h_step _
+
+theorem nodeSuccs_evalTerminatorLookup {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {s : MachineState} {term : Terminator}
+    (h_inv : ClosedInvLookup cone root tbl s)
+    (h_term : MirLiftCore.TermConeSafe cone s (s.memory.activeCallee.getD root) term) :
+    MirLiftCore.NodeSuccs (ClosedInvLookup cone root tbl)
+      (evalTerminator s term (some (s.memory.activeCallee.getD root))) := by
+  have h_cur : InConeLookup cone root tbl (s.memory.activeCallee.getD root) := h_inv.2.1
+  rcases term with ⟨kind, span⟩
+  cases kind with
+  | goto target => exact h_inv
+  | switchInt discr targets =>
+    unfold evalTerminator; dsimp only
+    repeat' (first | trivial | exact h_inv | split)
+  | unwindResume =>
+    unfold evalTerminator; dsimp only
+    exact nodeSuccs_unwindMatchLookup _
+      (closedInvLookup_unwindFromCallStack s.memory.callStack s.memory h_inv.1 h_inv.2.2)
+  | unwindTerminate => trivial
+  | return_ =>
+    rw [MirLiftCore.ccEvalReturn_eq]
+    unfold MirLiftCore.ccEvalReturn
+    repeat' (first | trivial | exact closedInvLookup_return h_inv ‹_› ‹_› | split)
+  | unreachable => trivial
+  | drop place target unwind =>
+    unfold evalTerminator; dsimp only
+    repeat' (first | trivial | exact h_inv | split)
+  | assert cond expected target unwind =>
+    unfold evalTerminator; dsimp only
+    repeat' (first | trivial | exact h_inv | exact nodeSuccs_applyUnwindLookup h_inv _ _ | split)
+  | call func argOps destination target unwind =>
+    have hq : MirLiftCore.CallTargetInCone cone s (s.memory.activeCallee.getD root) func
+        (length argOps) := h_term
+    cases target with
+    | some targetBb =>
+      unfold evalTerminator; dsimp only
+      cases h_res : resolveCallTarget s func (length argOps)
+          (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root)))
+          (s.memory.activeCallee.getD root).layouts with
+      | ub => trivial
+      | unsupported => trivial
+      | ok tgt localsAfterFunc =>
+        obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
+        dsimp only
+        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+            (callStack := s.memory.callStack) with
+        | ub => trivial
+        | unsupported => trivial
+        | ok argVals locals' =>
+          dsimp only
+          rw [h_ta]
+          cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
+              tgt.defPath [] s.memory.traitImpls with
+          | some calleeBody =>
+            dsimp only
+            cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
+            | false => trivial
+            | true =>
+              rw [h_inv.1] at h_lk
+              exact closedInvLookup_push h_inv h_cur (inConeLookup_of_lookup h_dp h_lk)
+          | none =>
+            dsimp only
+            repeat' (first
+              | trivial | exact h_inv
+              | exact nodeSuccs_closedInvLookup_of_ctx h_inv
+                  (MirLiftCore.writeIntrinsicReturn_calleeCtx_preserved _ _ _ _ _)
+                  (MirLiftCore.writeIntrinsicReturn_callerBodies _ _ _ _ _)
+              | exact nodeSuccs_evalDirectRustIntrinsic?_lookup h_inv _ _ _ _ _ _ _ _ _ _ h_cl _
+                  (by
+                    repeat' (first
+                      | trivial | exact h_inv
+                      | exact nodeSuccs_closedInvLookup_of_ctx h_inv
+                          (MirLiftCore.writeIntrinsicReturn_calleeCtx_preserved _ _ _ _ _)
+                          (MirLiftCore.writeIntrinsicReturn_callerBodies _ _ _ _ _)
+                      | split))
+              | split)
+    | none =>
+      unfold evalTerminator; dsimp only
+      cases h_res : resolveCallTarget s func (length argOps)
+          (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root)))
+          (s.memory.activeCallee.getD root).layouts with
+      | ub => trivial
+      | unsupported => trivial
+      | ok tgt localsAfterFunc =>
+        obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
+        dsimp only
+        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+            (callStack := s.memory.callStack) with
+        | ub => trivial
+        | unsupported => trivial
+        | ok argVals locals' =>
+          dsimp only
+          rw [h_ta]
+          cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
+              tgt.defPath [] s.memory.traitImpls with
+          | some calleeBody =>
+            dsimp only
+            cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
+            | false => trivial
+            | true =>
+              rw [h_inv.1] at h_lk
+              exact closedInvLookup_push h_inv h_cur (inConeLookup_of_lookup h_dp h_lk)
+          | none =>
+            dsimp only
+            repeat' (first | trivial | exact nodeSuccs_applyUnwindLookup h_inv _ _ | split)
+  | tailCall func argOps =>
+    have hq : MirLiftCore.CallTargetInCone cone s (s.memory.activeCallee.getD root) func
+        (length argOps) := h_term
+    unfold evalTerminator; dsimp only
+    unfold evalTailCallTerminator; dsimp only
+    cases h_res : resolveCallTarget s func (length argOps)
+        (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root)))
+        (s.memory.activeCallee.getD root).layouts with
+    | ub => trivial
+    | unsupported => trivial
+    | ok tgt localsAfterFunc =>
+      obtain ⟨h_dp, h_ta, _⟩ := hq tgt localsAfterFunc h_res
+      dsimp only
+      cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+          (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+          (callStack := s.memory.callStack) with
+      | ub => trivial
+      | unsupported => trivial
+      | ok argVals locals' =>
+        dsimp only
+        rw [h_ta]
+        cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
+            tgt.defPath [] s.memory.traitImpls with
+        | some calleeBody =>
+          dsimp only
+          rw [h_inv.1] at h_lk
+          repeat' (first
+            | trivial
+            | exact ⟨h_inv.1, inConeLookup_of_lookup h_dp h_lk, h_inv.2.2⟩
+            | split)
+        | none =>
+          dsimp only
+          repeat' (first | trivial | split)
+  | _ => trivial
+
+theorem nodeSuccs_stepMirFnLookup {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {s : MachineState}
+    (h_closed : tbl.callConeClosed cone root = true)
+    (h_inv : ClosedInvLookup cone root tbl s) :
+    MirLiftCore.NodeSuccs (ClosedInvLookup cone root tbl) (stepMirFn root s) := by
+  have h_safe := stepConeSafe_of_closedInvLookup h_closed h_inv
+  unfold stepMirFn; dsimp only
+  split
+  · trivial
+  · cases h_bb : get? (s.memory.activeCallee.getD root).basicBlocks s.frame.blockIdx with
+    | none => trivial
+    | some blk =>
+      obtain ⟨h_stmt, h_term⟩ := h_safe blk h_bb
+      dsimp only
+      cases h_st : get? blk.statements s.frame.stmtIdx with
+      | some stmt =>
+        dsimp only
+        exact nodeSuccs_closedInvLookup_of_ctx h_inv
+          (MirLiftCore.evalStmt_calleeCtx_preserved s stmt _ _ (h_stmt stmt h_st))
+          (MirLiftCore.evalStmt_callerBodies s stmt _ _)
+      | none =>
+        dsimp only
+        by_cases h_end : (s.frame.stmtIdx == length blk.statements) = true
+        · simp only [h_end, ite_true]
+          exact nodeSuccs_evalTerminatorLookup h_inv h_term
+        · simp only [h_end, Bool.false_eq_true, ite_false]
+          trivial
+
+/-- **`tbl.toList`-free syntactic closure implies `MirLiftCore.ConeReach`** for every fuel bound. -/
+theorem coneReach_of_closedInvLookup {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} (h_closed : tbl.callConeClosed cone root = true) :
+    ∀ (fuel : Nat) (s : MachineState), ClosedInvLookup cone root tbl s →
+      MirLiftCore.ConeReach root (MirLiftCore.StepConeSafe cone root) fuel (.running s)
+  | 0, _, _ => trivial
+  | fuel + 1, s, h_inv => by
+    refine ⟨stepConeSafe_of_closedInvLookup h_closed h_inv, ?_⟩
+    have h_succ := nodeSuccs_stepMirFnLookup h_closed h_inv
+    revert h_succ
+    cases stepMirFn root s with
+    | ret _ => intro _; trivial
+    | tau st' =>
+      cases st' with
+      | running s' => intro h; exact coneReach_of_closedInvLookup h_closed fuel s' h
+      | halted _ => intro _; cases fuel <;> trivial
+      | faulted _ => intro _; cases fuel <;> trivial
+    | vis e k =>
+      rcases e with fk | obs | ⟨req⟩
+      · intro _; trivial
+      · intro h
+        show MirLiftCore.ConeReach root _ fuel (k PUnit.unit)
+        revert h
+        show (match k PUnit.unit with
+          | .running s' => ClosedInvLookup cone root tbl s'
+          | _ => True) → _
+        cases k PUnit.unit with
+        | running s' => intro h; exact coneReach_of_closedInvLookup h_closed fuel s' h
+        | halted _ => intro _; cases fuel <;> trivial
+        | faulted _ => intro _; cases fuel <;> trivial
+      · intro _; trivial
+
+theorem initMachineStateWithMemoryAndCallees_activeCallee (body : CapturedMir) (args : List Value)
+    (mem : Memory) (c : List CapturedMir) :
+    (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c).memory.activeCallee =
+      mem.activeCallee := by
+  cases c <;> rfl
+
+theorem initMachineStateWithMemoryAndCallees_callStack (body : CapturedMir) (args : List Value)
+    (mem : Memory) (c : List CapturedMir) :
+    (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem c).memory.callStack =
+      mem.callStack := by
+  cases c <;> rfl
+
+theorem closedInvLookup_init_of_wf (cone : List DefPath) (body : CapturedMir) (args : List Value)
+    (mem : Memory) {tbl : OpaqueCalleeTable} (h₁ : MirLiftCore.CalleeInitWf body mem tbl.toList)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = []) :
+    ClosedInvLookup cone body tbl
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem tbl.toList) := by
+  refine ⟨MirLiftCore.initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁, ?_, ?_⟩
+  · show InConeLookup cone body tbl
+      ((Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+        tbl.toList).memory.activeCallee.getD body)
+    rw [initMachineStateWithMemoryAndCallees_activeCallee, h_ac]
+    exact Or.inl rfl
+  · intro f hf
+    rw [initMachineStateWithMemoryAndCallees_callStack, h_cs] at hf
+    cases hf
+
+/-- **`tbl.toList`-free syntactic `runCfgWithCallees` narrowing between opaque tables**
+(discharged via `t₁.callConeClosed`, which queries only `t₁.lookupRaw` on `cone`). -/
+theorem runCfgWithCallees_cone_narrow_of_callConeClosed_wf (cone : List DefPath) (fuel : Nat)
+    (body : CapturedMir) (args : List Value) (mem : Memory) {t₁ t₂ : OpaqueCalleeTable}
+    (h₁ : MirLiftCore.CalleeInitWf body mem t₁.toList)
+    (h₂ : MirLiftCore.CalleeInitWf body mem t₂.toList)
+    (h_agree : OpaqueCalleeTable.AgreesOn cone t₁ t₂)
+    (h_closed : t₁.callConeClosed cone body = true)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = []) :
+    MirLiftCore.runCfgWithCallees fuel body args mem t₂.toList =
+      (MirLiftCore.runCfgWithCallees fuel body args mem t₁.toList).map
+        (MirLiftCore.MirOutcome.mapMem (MirLiftCore.Memory.withCallees t₂.toList)) := by
+  unfold MirLiftCore.runCfgWithCallees
+  rw [MirLiftCore.initMachineStateWithMemoryAndCallees_withCallees_of_wf body args mem h₁ h₂]
+  refine MirLiftCore.runMirExecBounded_cone_narrow cone body t₂.toList fuel _
+    (coneReach_of_closedInvLookup h_closed fuel _
+      (closedInvLookup_init_of_wf cone body args mem h₁ h_ac h_cs)) ?_
+  intro s hs
+  cases hs
+  rw [MirLiftCore.initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁]
+  exact calleesAgreeOn_of_agreesOn h_agree
+
+/-- **`tbl.toList`-free syntactic `wpMirExecSym` narrowing between opaque tables.** -/
+theorem wpMirExecSym_cone_narrow_of_callConeClosed_wf (cone : List DefPath) (fuel : Nat)
+    (body : CapturedMir) (args : List Value) (mem : Memory) {t₁ t₂ : OpaqueCalleeTable}
+    (h₁ : MirLiftCore.CalleeInitWf body mem t₁.toList)
+    (h₂ : MirLiftCore.CalleeInitWf body mem t₂.toList)
+    (h_agree : OpaqueCalleeTable.AgreesOn cone t₁ t₂)
+    (h_closed : t₁.callConeClosed cone body = true)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out,
+      post (MirLiftCore.MirOutcome.mapMem (MirLiftCore.Memory.withCallees t₂.toList) out) ↔ post out) :
+    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          t₂.toList)) post ↔
+      Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          t₁.toList)) post := by
+  rw [MirLiftCore.initMachineStateWithMemoryAndCallees_withCallees_of_wf body args mem h₁ h₂]
+  refine MirLiftCore.wpMirExecSym_cone_narrow cone body t₂.toList post h_post fuel _
+    (coneReach_of_closedInvLookup h_closed fuel _
+      (closedInvLookup_init_of_wf cone body args mem h₁ h_ac h_cs)) ?_
+  intro s hs
+  cases hs
+  rw [MirLiftCore.initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁]
+  exact calleesAgreeOn_of_agreesOn h_agree
+
+/-- **`tbl.toList`-free syntactic `MirWpConverges` narrowing between opaque tables.** -/
+theorem mirWpConverges_cone_narrow_of_callConeClosed_wf (cone : List DefPath)
+    (body : CapturedMir) (args : List Value) (mem : Memory) {t₁ t₂ : OpaqueCalleeTable}
+    (h₁ : MirLiftCore.CalleeInitWf body mem t₁.toList)
+    (h₂ : MirLiftCore.CalleeInitWf body mem t₂.toList)
+    (h_agree : OpaqueCalleeTable.AgreesOn cone t₁ t₂)
+    (h_closed : t₁.callConeClosed cone body = true)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out,
+      post (MirLiftCore.MirOutcome.mapMem (MirLiftCore.Memory.withCallees t₂.toList) out) ↔ post out) :
+    MirFuelFree.MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          t₂.toList) post ↔
+      MirFuelFree.MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          t₁.toList) post := by
+  rw [MirLiftCore.initMachineStateWithMemoryAndCallees_withCallees_of_wf body args mem h₁ h₂]
+  refine MirLiftCore.mirWpConverges_cone_narrow cone body t₂.toList post h_post _
+    (fun fuel =>
+      coneReach_of_closedInvLookup h_closed fuel _
+        (closedInvLookup_init_of_wf cone body args mem h₁ h_ac h_cs)) ?_
+  rw [MirLiftCore.initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁]
+  exact calleesAgreeOn_of_agreesOn h_agree
+
+/-- `b` is the root body or an instantiation `b₀.instantiate subst` of a first-match body
+`tbl.lookupRaw dp = some b₀` for some `dp ∈ cone`. -/
+def InConeLookupPoly (cone : List DefPath) (root : CapturedMir) (tbl : OpaqueCalleeTable)
+    (b : CapturedMir) : Prop :=
+  b = root ∨ ∃ dp, dp ∈ cone ∧ ∃ b₀ subst, tbl.lookupRaw dp = some b₀ ∧ b = b₀.instantiate subst
+
+/-- Reachable-state invariant of a `callConeClosedPoly` execution over `tbl`. -/
+def ClosedInvLookupPoly (cone : List DefPath) (root : CapturedMir) (tbl : OpaqueCalleeTable)
+    (ti : List TraitImplEntry) (s : MachineState) : Prop :=
+  s.memory.callees = tbl.toList ∧ s.memory.traitImpls = ti ∧
+    InConeLookupPoly cone root tbl (s.memory.activeCallee.getD root) ∧
+    ∀ f, f ∈ s.memory.callStack → InConeLookupPoly cone root tbl f.callerBody
+
+theorem bodyCallsInConePoly_of_inConeLookupPoly {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {ti : List TraitImplEntry} {b : CapturedMir}
+    (h_closed : tbl.callConeClosedPoly cone root ti = true)
+    (hb : InConeLookupPoly cone root tbl b) : MirLiftCore.bodyCallsInConePoly cone b = true := by
+  unfold OpaqueCalleeTable.callConeClosedPoly at h_closed
+  rw [Bool.and_eq_true] at h_closed
+  rcases hb with rfl | ⟨dp, hdp, b₀, subst, hraw, rfl⟩
+  · exact h_closed.1
+  · have h := List.all_eq_true.mp h_closed.2 dp hdp
+    rw [Bool.and_eq_true, hraw] at h
+    exact MirLiftCore.bodyCallsInConePoly_instantiate subst h.1
+
+theorem noTraitImpl_of_callConeClosedPoly_lookup {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {ti : List TraitImplEntry} {dp : DefPath}
+    (h_closed : tbl.callConeClosedPoly cone root ti = true) (h_dp : dp ∈ cone) :
+    hasTraitImplForDefPath (ti ++ flatMapTraitImpls tbl.toList) dp = false := by
+  unfold OpaqueCalleeTable.callConeClosedPoly at h_closed
+  rw [Bool.and_eq_true] at h_closed
+  have h := List.all_eq_true.mp h_closed.2 dp h_dp
+  rw [Bool.and_eq_true, OpaqueCalleeTable.traitImpls_eq] at h
+  cases htr : hasTraitImplForDefPath (ti ++ flatMapTraitImpls tbl.toList) dp with
+  | false => rfl
+  | true => rw [htr] at h; cases h.2
+
+theorem stepConeSafePoly_of_closedInvLookupPoly {cone : List DefPath} {root : CapturedMir}
+    {tbl t₂ : OpaqueCalleeTable} {ti : List TraitImplEntry} {s : MachineState}
+    (h_closed : tbl.callConeClosedPoly cone root ti = true)
+    (h_no₂ : ∀ dp, dp ∈ cone → hasTraitImplForDefPath (ti ++ t₂.traitImpls) dp = false)
+    (h_inv : ClosedInvLookupPoly cone root tbl ti s) :
+    MirLiftCore.StepConeSafePoly cone t₂.toList root s := by
+  intro blk h_bb
+  have h_body := bodyCallsInConePoly_of_inConeLookupPoly h_closed h_inv.2.2.1
+  unfold MirLiftCore.bodyCallsInConePoly at h_body
+  have h_blk := List.all_eq_true.mp h_body blk (List.mem_of_getElem? h_bb)
+  rw [Bool.and_eq_true] at h_blk
+  refine ⟨fun stmt h_st => List.all_eq_true.mp h_blk.1 stmt (List.mem_of_getElem? h_st), ?_⟩
+  have h_tc := h_blk.2
+  revert h_tc
+  rcases blk.terminator with ⟨kind, span⟩
+  intro h_tc
+  cases kind with
+  | call func argOps _ _ _ =>
+    intro tgt l h_res
+    unfold MirLiftCore.termCallsInConePoly MirLiftCore.directCallInConePoly at h_tc
+    dsimp only at h_tc
+    cases h_fn : MirLiftCore.extractFnDefPath? func with
+    | none => rw [h_fn] at h_tc; cases h_tc
+    | some dp =>
+      rw [h_fn, Bool.and_eq_true] at h_tc
+      have h_cd := MirLiftCore.extractCalleeDefPath?_of_extractFnDefPath? h_fn
+      unfold resolveCallTarget at h_res
+      rw [h_cd] at h_res
+      cases h_res
+      have h_dp : dp ∈ cone := MirLiftCore.inCone_iff.mp h_tc.1
+      rw [h_inv.1, h_inv.2.1]
+      exact ⟨h_dp, noTraitImpl_of_callConeClosedPoly_lookup h_closed h_dp,
+        noTraitImplInCone_toList h_no₂ dp h_dp, h_tc.2⟩
+  | tailCall func argOps =>
+    intro tgt l h_res
+    unfold MirLiftCore.termCallsInConePoly MirLiftCore.directCallInConePoly at h_tc
+    dsimp only at h_tc
+    cases h_fn : MirLiftCore.extractFnDefPath? func with
+    | none => rw [h_fn] at h_tc; cases h_tc
+    | some dp =>
+      rw [h_fn, Bool.and_eq_true] at h_tc
+      have h_cd := MirLiftCore.extractCalleeDefPath?_of_extractFnDefPath? h_fn
+      unfold resolveCallTarget at h_res
+      rw [h_cd] at h_res
+      cases h_res
+      have h_dp : dp ∈ cone := MirLiftCore.inCone_iff.mp h_tc.1
+      rw [h_inv.1, h_inv.2.1]
+      exact ⟨h_dp, noTraitImpl_of_callConeClosedPoly_lookup h_closed h_dp,
+        noTraitImplInCone_toList h_no₂ dp h_dp, h_tc.2⟩
+  | _ => trivial
+
+theorem closedInvLookupPoly_of_callerBodies {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {ti : List TraitImplEntry} {s s' : MachineState}
+    (h_inv : ClosedInvLookupPoly cone root tbl ti s)
+    (hc : s'.memory.callees = s.memory.callees)
+    (hti : s'.memory.traitImpls = s.memory.traitImpls)
+    (hac : s'.memory.activeCallee = s.memory.activeCallee)
+    (hb : MirLiftCore.CallerBodiesEq s.memory.callStack s'.memory.callStack) :
+    ClosedInvLookupPoly cone root tbl ti s' := by
+  refine ⟨hc.trans h_inv.1, hti.trans h_inv.2.1, hac ▸ h_inv.2.2.1, ?_⟩
+  intro f hf
+  obtain ⟨f₀, hf₀, he⟩ := hb.mem hf
+  exact he ▸ h_inv.2.2.2 f₀ hf₀
+
+theorem nodeSuccs_closedInvLookupPoly_of_ctx {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {ti : List TraitImplEntry} {s : MachineState} {n : MirStepNode}
+    (h_inv : ClosedInvLookupPoly cone root tbl ti s)
+    (hfix : n = MirLiftCore.MirStepNode.mapMem
+      (MirLiftCore.Memory.withCalleeCtx s.memory.callees s.memory.activeCallee
+        s.memory.traitImpls) n)
+    (hb : MirLiftCore.NodeSuccs
+      (fun s' => MirLiftCore.CallerBodiesEq s.memory.callStack s'.memory.callStack) n) :
+    MirLiftCore.NodeSuccs (ClosedInvLookupPoly cone root tbl ti) n := by
+  refine MirLiftCore.NodeSuccs.mono ?_
+    (MirLiftCore.NodeSuccs.and
+      (MirLiftCore.nodeSuccs_of_fixed (P := fun s' => s' = MirLiftCore.MachineState.mapMem
+        (MirLiftCore.Memory.withCalleeCtx s.memory.callees s.memory.activeCallee
+          s.memory.traitImpls) s')
+        hfix (fun _ h => h))
+      hb)
+  rintro s' ⟨hs', hb'⟩
+  have hm : s'.memory =
+      MirLiftCore.Memory.withCalleeCtx s.memory.callees s.memory.activeCallee
+        s.memory.traitImpls s'.memory :=
+    congrArg MachineState.memory hs'
+  exact closedInvLookupPoly_of_callerBodies h_inv (by rw [hm]) (by rw [hm]) (by rw [hm]) hb'
+
+theorem closedInvLookupPoly_return {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {ti : List TraitImplEntry} {s : MachineState}
+    {caller : SavedCallerFrame} {rest : List SavedCallerFrame} {retVal : Value}
+    {locals' : List LocalSlot} {mem' : Memory} {F : StackFrame}
+    (h_inv : ClosedInvLookupPoly cone root tbl ti s) (h_cs : s.memory.callStack = caller :: rest)
+    (h_w : writeReturnDestination caller.frame.locals (MirLiftCore.ccReturnCallerMem s caller rest)
+      caller.destination retVal caller.callerBody.localDecls caller.callerBody.layouts =
+        .ok locals' mem') :
+    ClosedInvLookupPoly cone root tbl ti { frame := F, memory := mem' } := by
+  obtain ⟨hc, hac, hti⟩ := MirLiftCore.writeReturnDestination_ctx_preserved h_w
+  have hb := MirLiftCore.writeReturnDestination_callerBodies h_w
+  refine ⟨hc.trans h_inv.1, hti.trans h_inv.2.1, ?_, ?_⟩
+  · show InConeLookupPoly cone root tbl (mem'.activeCallee.getD root)
+    rw [hac]
+    exact h_inv.2.2.2 caller (by rw [h_cs]; exact List.Mem.head _)
+  · intro f hf
+    obtain ⟨f₀, hf₀, he⟩ := hb.mem hf
+    exact he ▸ h_inv.2.2.2 f₀ (by rw [h_cs]; exact List.Mem.tail _ hf₀)
+
+theorem closedInvLookupPoly_unwindFromCallStack {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {ti : List TraitImplEntry} :
+    ∀ (stk : List SavedCallerFrame) (m : Memory), m.callees = tbl.toList → m.traitImpls = ti →
+      (∀ f, f ∈ stk → InConeLookupPoly cone root tbl f.callerBody) →
+      ∀ s', unwindFromCallStack stk m = .running s' → ClosedInvLookupPoly cone root tbl ti s'
+  | [], _, _, _, _, _, h => by cases h
+  | caller :: rest, m, hc, hti, hf, s', h => by
+    unfold unwindFromCallStack at h
+    dsimp only at h
+    cases hr : caller.returnUnwind with
+    | unreachable => rw [hr] at h; dsimp only at h; cases h
+    | terminate => rw [hr] at h; dsimp only at h; cases h
+    | continue_ =>
+      rw [hr] at h
+      dsimp only at h
+      exact closedInvLookupPoly_unwindFromCallStack rest
+        { m with
+          callStack := rest
+          activeCallee := some caller.callerBody
+          activeProtectors := restoreCallerProtectors caller }
+        hc hti (fun f hm => hf f (List.Mem.tail _ hm)) s' h
+    | cleanup bb =>
+      rw [hr] at h
+      dsimp only at h
+      cases h
+      exact ⟨hc, hti, hf caller (List.Mem.head _), fun f hm => hf f (List.Mem.tail _ hm)⟩
+
+private theorem nodeSuccs_unwindMatchLookupPoly {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {ti : List TraitImplEntry} (st : MirExecState)
+    (h : ∀ s', st = .running s' → ClosedInvLookupPoly cone root tbl ti s') :
+    MirLiftCore.NodeSuccs (ClosedInvLookupPoly cone root tbl ti)
+      (match (generalizing := false) st with
+        | .running nextState => MirStepNode.step nextState
+        | .halted out => MirStepNode.retOutcome out
+        | .faulted fk => MirStepNode.fail fk) := by
+  cases st with
+  | running s' => exact h s' rfl
+  | halted _ => trivial
+  | faulted _ => trivial
+
+private theorem nodeSuccs_applyUnwindLookupPoly {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {ti : List TraitImplEntry} {s : MachineState}
+    (h_inv : ClosedInvLookupPoly cone root tbl ti s) (l : List LocalSlot) (u : UnwindAction) :
+    MirLiftCore.NodeSuccs (ClosedInvLookupPoly cone root tbl ti)
+      (match applyUnwindAction s l s.memory u with
+        | .running nextState => MirStepNode.step nextState
+        | .halted out => MirStepNode.retOutcome out
+        | .faulted fk => MirStepNode.fail fk) := by
+  refine nodeSuccs_unwindMatchLookupPoly _ ?_
+  intro s' hs'
+  cases u with
+  | unreachable => cases hs'
+  | terminate => cases hs'
+  | continue_ =>
+    exact closedInvLookupPoly_unwindFromCallStack s.memory.callStack s.memory h_inv.1 h_inv.2.1
+      h_inv.2.2.2 s' hs'
+  | cleanup bb =>
+    cases hs'
+    exact h_inv
+
+private theorem inConeLookupPoly_of_lookup {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {L : LayoutTable} {dp : DefPath} {typeArgs : List RigidTy}
+    {ti : List TraitImplEntry} {calleeBody : CapturedMir}
+    (h_dp : dp ∈ cone)
+    (h_no : hasTraitImplForDefPath (ti ++ flatMapTraitImpls tbl.toList) dp = false)
+    (h_lk : lookupCallee tbl.toList L dp typeArgs ti = some calleeBody) :
+    InConeLookupPoly cone root tbl calleeBody := by
+  obtain ⟨b₀, subst, hf, hinst⟩ := MirLiftCore.lookupCallee_eq_some_of_no_traitImpl h_no h_lk
+  exact Or.inr ⟨dp, h_dp, b₀, subst, (OpaqueCalleeTable.lookupRaw_eq tbl dp).trans hf, hinst⟩
+
+private theorem closedInvLookupPoly_push {cone : List DefPath} {root : CapturedMir}
+    {tbl : OpaqueCalleeTable} {ti : List TraitImplEntry} {s : MachineState}
+    {saved : SavedCallerFrame} {b : CapturedMir} {F : StackFrame}
+    (h_inv : ClosedInvLookupPoly cone root tbl ti s)
+    (h_saved : InConeLookupPoly cone root tbl saved.callerBody)
+    (h_b : InConeLookupPoly cone root tbl b) :
+    ClosedInvLookupPoly cone root tbl ti
+      { frame := F,
+        memory := { s.memory with
+          callStack := saved :: s.memory.callStack
+          activeCallee := some b } } := by
+  refine ⟨h_inv.1, h_inv.2.1, h_b, ?_⟩
+  intro f hf
+  cases hf with
+  | head => exact h_saved
+  | tail _ hf => exact h_inv.2.2.2 f hf
+
+theorem nodeSuccs_evalDirectRustIntrinsic?_lookupPoly {cone : List DefPath}
+    {root : CapturedMir} {tbl : OpaqueCalleeTable} {ti : List TraitImplEntry} {s : MachineState}
+    (h_inv : ClosedInvLookupPoly cone root tbl ti s) (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    (h_cl : MirLiftCore.isNonSelectIntrinsicOpt (classifyRustIntrinsic? target.defPath) = true)
+    (fallback : MirStepNode)
+    (h_fb : MirLiftCore.NodeSuccs (ClosedInvLookupPoly cone root tbl ti) fallback) :
+    MirLiftCore.NodeSuccs (ClosedInvLookupPoly cone root tbl ti)
+      (match evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb unwind with
+       | some stepNode => stepNode
+       | none => fallback) := by
+  unfold evalDirectRustIntrinsic?
+  cases h_k : classifyRustIntrinsic? target.defPath with
+  | none => exact h_fb
+  | some kind =>
+    rw [h_k] at h_cl
+    have h_step : ∀ (k : RustIntrinsicKind),
+        MirLiftCore.NodeSuccs (ClosedInvLookupPoly cone root tbl ti)
+          (evalNonSelectIntrinsicCall k s target bodyLocalDecls bodyLayouts
+            argOps argVals locals' destination targetBb) := by
+      intro k
+      exact nodeSuccs_closedInvLookupPoly_of_ctx h_inv
+        (MirLiftCore.evalNonSelectIntrinsicCall_calleeCtx_preserved k s target bodyLocalDecls
+          bodyLayouts argOps argVals locals' destination targetBb)
+        (MirLiftCore.evalNonSelectIntrinsicCall_callerBodies k s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb)
+    cases kind with
+    | constEvalSelect => cases h_cl
+    | _ => exact h_step _
+
+theorem nodeSuccs_evalTerminatorLookupPoly {cone : List DefPath} {root : CapturedMir}
+    {tbl t₂ : OpaqueCalleeTable} {ti : List TraitImplEntry} {s : MachineState} {term : Terminator}
+    (h_inv : ClosedInvLookupPoly cone root tbl ti s)
+    (h_term : MirLiftCore.TermConeSafePoly cone t₂.toList s (s.memory.activeCallee.getD root) term) :
+    MirLiftCore.NodeSuccs (ClosedInvLookupPoly cone root tbl ti)
+      (evalTerminator s term (some (s.memory.activeCallee.getD root))) := by
+  have h_cur : InConeLookupPoly cone root tbl (s.memory.activeCallee.getD root) := h_inv.2.2.1
+  rcases term with ⟨kind, span⟩
+  cases kind with
+  | goto target => exact h_inv
+  | switchInt discr targets =>
+    unfold evalTerminator; dsimp only
+    repeat' (first | trivial | exact h_inv | split)
+  | unwindResume =>
+    unfold evalTerminator; dsimp only
+    exact nodeSuccs_unwindMatchLookupPoly _
+      (closedInvLookupPoly_unwindFromCallStack s.memory.callStack s.memory h_inv.1 h_inv.2.1
+        h_inv.2.2.2)
+  | unwindTerminate => trivial
+  | return_ =>
+    rw [MirLiftCore.ccEvalReturn_eq]
+    unfold MirLiftCore.ccEvalReturn
+    repeat' (first | trivial | exact closedInvLookupPoly_return h_inv ‹_› ‹_› | split)
+  | unreachable => trivial
+  | drop place target unwind =>
+    unfold evalTerminator; dsimp only
+    repeat' (first | trivial | exact h_inv | split)
+  | assert cond expected target unwind =>
+    unfold evalTerminator; dsimp only
+    repeat' (first | trivial | exact h_inv | exact nodeSuccs_applyUnwindLookupPoly h_inv _ _ | split)
+  | call func argOps destination target unwind =>
+    have hq : MirLiftCore.CallTargetInConePoly cone t₂.toList s (s.memory.activeCallee.getD root)
+        func (length argOps) := h_term
+    cases target with
+    | some targetBb =>
+      unfold evalTerminator; dsimp only
+      cases h_res : resolveCallTarget s func (length argOps)
+          (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root)))
+          (s.memory.activeCallee.getD root).layouts with
+      | ub => trivial
+      | unsupported => trivial
+      | ok tgt localsAfterFunc =>
+        obtain ⟨h_dp, h_no₁, _, h_cl⟩ := hq tgt localsAfterFunc h_res
+        dsimp only
+        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+            (callStack := s.memory.callStack) with
+        | ub => trivial
+        | unsupported => trivial
+        | ok argVals locals' =>
+          dsimp only
+          cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
+              tgt.defPath tgt.typeArgs s.memory.traitImpls with
+          | some calleeBody =>
+            dsimp only
+            cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
+            | false => trivial
+            | true =>
+              rw [h_inv.1, h_inv.2.1] at h_lk h_no₁
+              exact closedInvLookupPoly_push h_inv h_cur (inConeLookupPoly_of_lookup h_dp h_no₁ h_lk)
+          | none =>
+            dsimp only
+            repeat' (first
+              | trivial | exact h_inv
+              | exact nodeSuccs_closedInvLookupPoly_of_ctx h_inv
+                  (MirLiftCore.writeIntrinsicReturn_calleeCtx_preserved _ _ _ _ _)
+                  (MirLiftCore.writeIntrinsicReturn_callerBodies _ _ _ _ _)
+              | exact nodeSuccs_evalDirectRustIntrinsic?_lookupPoly h_inv _ _ _ _ _ _ _ _ _ _ h_cl _
+                  (by
+                    repeat' (first
+                      | trivial | exact h_inv
+                      | exact nodeSuccs_closedInvLookupPoly_of_ctx h_inv
+                          (MirLiftCore.writeIntrinsicReturn_calleeCtx_preserved _ _ _ _ _)
+                          (MirLiftCore.writeIntrinsicReturn_callerBodies _ _ _ _ _)
+                      | split))
+              | split)
+    | none =>
+      unfold evalTerminator; dsimp only
+      cases h_res : resolveCallTarget s func (length argOps)
+          (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root)))
+          (s.memory.activeCallee.getD root).layouts with
+      | ub => trivial
+      | unsupported => trivial
+      | ok tgt localsAfterFunc =>
+        obtain ⟨h_dp, h_no₁, _, _⟩ := hq tgt localsAfterFunc h_res
+        dsimp only
+        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+            (callStack := s.memory.callStack) with
+        | ub => trivial
+        | unsupported => trivial
+        | ok argVals locals' =>
+          dsimp only
+          cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
+              tgt.defPath tgt.typeArgs s.memory.traitImpls with
+          | some calleeBody =>
+            dsimp only
+            cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
+            | false => trivial
+            | true =>
+              rw [h_inv.1, h_inv.2.1] at h_lk h_no₁
+              exact closedInvLookupPoly_push h_inv h_cur (inConeLookupPoly_of_lookup h_dp h_no₁ h_lk)
+          | none =>
+            dsimp only
+            repeat' (first | trivial | exact nodeSuccs_applyUnwindLookupPoly h_inv _ _ | split)
+  | tailCall func argOps =>
+    have hq : MirLiftCore.CallTargetInConePoly cone t₂.toList s (s.memory.activeCallee.getD root)
+        func (length argOps) := h_term
+    unfold evalTerminator; dsimp only
+    unfold evalTailCallTerminator; dsimp only
+    cases h_res : resolveCallTarget s func (length argOps)
+        (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root)))
+        (s.memory.activeCallee.getD root).layouts with
+    | ub => trivial
+    | unsupported => trivial
+    | ok tgt localsAfterFunc =>
+      obtain ⟨h_dp, h_no₁, _, _⟩ := hq tgt localsAfterFunc h_res
+      dsimp only
+      cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+          (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+          (callStack := s.memory.callStack) with
+      | ub => trivial
+      | unsupported => trivial
+      | ok argVals locals' =>
+        dsimp only
+        cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
+            tgt.defPath tgt.typeArgs s.memory.traitImpls with
+        | some calleeBody =>
+          dsimp only
+          rw [h_inv.1, h_inv.2.1] at h_lk h_no₁
+          repeat' (first
+            | trivial
+            | exact ⟨h_inv.1, h_inv.2.1, inConeLookupPoly_of_lookup h_dp h_no₁ h_lk, h_inv.2.2.2⟩
+            | split)
+        | none =>
+          dsimp only
+          repeat' (first | trivial | split)
+  | _ => trivial
+
+theorem nodeSuccs_stepMirFnLookupPoly {cone : List DefPath} {root : CapturedMir}
+    {tbl t₂ : OpaqueCalleeTable} {ti : List TraitImplEntry} {s : MachineState}
+    (h_closed : tbl.callConeClosedPoly cone root ti = true)
+    (h_no₂ : ∀ dp, dp ∈ cone → hasTraitImplForDefPath (ti ++ t₂.traitImpls) dp = false)
+    (h_inv : ClosedInvLookupPoly cone root tbl ti s) :
+    MirLiftCore.NodeSuccs (ClosedInvLookupPoly cone root tbl ti) (stepMirFn root s) := by
+  have h_safe := stepConeSafePoly_of_closedInvLookupPoly h_closed h_no₂ h_inv
+  unfold stepMirFn; dsimp only
+  split
+  · trivial
+  · cases h_bb : get? (s.memory.activeCallee.getD root).basicBlocks s.frame.blockIdx with
+    | none => trivial
+    | some blk =>
+      obtain ⟨h_stmt, h_term⟩ := h_safe blk h_bb
+      dsimp only
+      cases h_st : get? blk.statements s.frame.stmtIdx with
+      | some stmt =>
+        dsimp only
+        exact nodeSuccs_closedInvLookupPoly_of_ctx h_inv
+          (MirLiftCore.evalStmt_calleeCtx_preserved s stmt _ _ (h_stmt stmt h_st))
+          (MirLiftCore.evalStmt_callerBodies s stmt _ _)
+      | none =>
+        dsimp only
+        by_cases h_end : (s.frame.stmtIdx == length blk.statements) = true
+        · simp only [h_end, ite_true]
+          exact nodeSuccs_evalTerminatorLookupPoly h_inv h_term
+        · simp only [h_end, Bool.false_eq_true, ite_false]
+          trivial
+
+/-- **`tbl.toList`-free polymorphic syntactic closure implies `MirLiftCore.ConeReach`** for every
+fuel bound. -/
+theorem coneReach_of_closedInvLookupPoly {cone : List DefPath} {root : CapturedMir}
+    {tbl t₂ : OpaqueCalleeTable} {ti : List TraitImplEntry}
+    (h_closed : tbl.callConeClosedPoly cone root ti = true)
+    (h_no₂ : ∀ dp, dp ∈ cone → hasTraitImplForDefPath (ti ++ t₂.traitImpls) dp = false) :
+    ∀ (fuel : Nat) (s : MachineState), ClosedInvLookupPoly cone root tbl ti s →
+      MirLiftCore.ConeReach root (MirLiftCore.StepConeSafePoly cone t₂.toList root) fuel (.running s)
+  | 0, _, _ => trivial
+  | fuel + 1, s, h_inv => by
+    refine ⟨stepConeSafePoly_of_closedInvLookupPoly h_closed h_no₂ h_inv, ?_⟩
+    have h_succ := nodeSuccs_stepMirFnLookupPoly h_closed h_no₂ h_inv
+    revert h_succ
+    cases stepMirFn root s with
+    | ret _ => intro _; trivial
+    | tau st' =>
+      cases st' with
+      | running s' => intro h; exact coneReach_of_closedInvLookupPoly h_closed h_no₂ fuel s' h
+      | halted _ => intro _; cases fuel <;> trivial
+      | faulted _ => intro _; cases fuel <;> trivial
+    | vis e k =>
+      rcases e with fk | obs | ⟨req⟩
+      · intro _; trivial
+      · intro h
+        show MirLiftCore.ConeReach root _ fuel (k PUnit.unit)
+        revert h
+        show (match k PUnit.unit with
+          | .running s' => ClosedInvLookupPoly cone root tbl ti s'
+          | _ => True) → _
+        cases k PUnit.unit with
+        | running s' => intro h; exact coneReach_of_closedInvLookupPoly h_closed h_no₂ fuel s' h
+        | halted _ => intro _; cases fuel <;> trivial
+        | faulted _ => intro _; cases fuel <;> trivial
+      · intro _; trivial
+
+theorem closedInvLookupPoly_init_of_wf (cone : List DefPath) (body : CapturedMir) (args : List Value)
+    (mem : Memory) {tbl : OpaqueCalleeTable} (h₁ : MirLiftCore.CalleeInitWf body mem tbl.toList)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = []) :
+    ClosedInvLookupPoly cone body tbl body.traitImpls
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem tbl.toList) := by
+  refine ⟨MirLiftCore.initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁,
+    MirLiftCore.initMachineStateWithMemoryAndCallees_traitImpls_of_wf body args mem h₁, ?_, ?_⟩
+  · show InConeLookupPoly cone body tbl
+      ((Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+        tbl.toList).memory.activeCallee.getD body)
+    rw [initMachineStateWithMemoryAndCallees_activeCallee, h_ac]
+    exact Or.inl rfl
+  · intro f hf
+    rw [initMachineStateWithMemoryAndCallees_callStack, h_cs] at hf
+    cases hf
+
+/-- **`tbl.toList`-free polymorphic syntactic `runCfgWithCallees` narrowing between opaque tables**
+(discharged via `t₁.callConeClosedPoly`, which queries only `t₁.lookupRaw` and `t₁.traitImpls`). -/
+theorem runCfgWithCallees_cone_narrow_of_callConeClosedPoly_wf (cone : List DefPath)
+    (fuel : Nat) (body : CapturedMir) (args : List Value) (mem : Memory)
+    {t₁ t₂ : OpaqueCalleeTable}
+    (h₁ : MirLiftCore.CalleeInitWf body mem t₁.toList)
+    (h₂ : MirLiftCore.CalleeInitWf body mem t₂.toList)
+    (h_agree : OpaqueCalleeTable.AgreesOn cone t₁ t₂)
+    (h_closed : t₁.callConeClosedPoly cone body body.traitImpls = true)
+    (h_no₂ : ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (body.traitImpls ++ t₂.traitImpls) dp = false)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = []) :
+    MirLiftCore.runCfgWithCallees fuel body args mem t₂.toList =
+      (MirLiftCore.runCfgWithCallees fuel body args mem t₁.toList).map
+        (MirLiftCore.MirOutcome.mapMem (MirLiftCore.Memory.withCallees t₂.toList)) := by
+  unfold MirLiftCore.runCfgWithCallees
+  rw [MirLiftCore.initMachineStateWithMemoryAndCallees_withCallees_of_wf body args mem h₁ h₂]
+  refine MirLiftCore.runMirExecBounded_cone_narrow_poly cone body t₂.toList fuel _
+    (coneReach_of_closedInvLookupPoly h_closed h_no₂ fuel _
+      (closedInvLookupPoly_init_of_wf cone body args mem h₁ h_ac h_cs)) ?_
+  intro s hs
+  cases hs
+  rw [MirLiftCore.initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁]
+  exact calleesAgreeOn_of_agreesOn h_agree
+
+/-- **`tbl.toList`-free polymorphic syntactic `wpMirExecSym` narrowing between opaque tables.** -/
+theorem wpMirExecSym_cone_narrow_of_callConeClosedPoly_wf (cone : List DefPath) (fuel : Nat)
+    (body : CapturedMir) (args : List Value) (mem : Memory) {t₁ t₂ : OpaqueCalleeTable}
+    (h₁ : MirLiftCore.CalleeInitWf body mem t₁.toList)
+    (h₂ : MirLiftCore.CalleeInitWf body mem t₂.toList)
+    (h_agree : OpaqueCalleeTable.AgreesOn cone t₁ t₂)
+    (h_closed : t₁.callConeClosedPoly cone body body.traitImpls = true)
+    (h_no₂ : ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (body.traitImpls ++ t₂.traitImpls) dp = false)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out,
+      post (MirLiftCore.MirOutcome.mapMem (MirLiftCore.Memory.withCallees t₂.toList) out) ↔ post out) :
+    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          t₂.toList)) post ↔
+      Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym fuel body
+        (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          t₁.toList)) post := by
+  rw [MirLiftCore.initMachineStateWithMemoryAndCallees_withCallees_of_wf body args mem h₁ h₂]
+  refine MirLiftCore.wpMirExecSym_cone_narrow_poly cone body t₂.toList post h_post fuel _
+    (coneReach_of_closedInvLookupPoly h_closed h_no₂ fuel _
+      (closedInvLookupPoly_init_of_wf cone body args mem h₁ h_ac h_cs)) ?_
+  intro s hs
+  cases hs
+  rw [MirLiftCore.initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁]
+  exact calleesAgreeOn_of_agreesOn h_agree
+
+/-- **`tbl.toList`-free polymorphic syntactic `MirWpConverges` narrowing between opaque tables.** -/
+theorem mirWpConverges_cone_narrow_of_callConeClosedPoly_wf (cone : List DefPath)
+    (body : CapturedMir) (args : List Value) (mem : Memory) {t₁ t₂ : OpaqueCalleeTable}
+    (h₁ : MirLiftCore.CalleeInitWf body mem t₁.toList)
+    (h₂ : MirLiftCore.CalleeInitWf body mem t₂.toList)
+    (h_agree : OpaqueCalleeTable.AgreesOn cone t₁ t₂)
+    (h_closed : t₁.callConeClosedPoly cone body body.traitImpls = true)
+    (h_no₂ : ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (body.traitImpls ++ t₂.traitImpls) dp = false)
+    (h_ac : mem.activeCallee = none) (h_cs : mem.callStack = [])
+    (post : MirOutcome → Prop)
+    (h_post : ∀ out,
+      post (MirLiftCore.MirOutcome.mapMem (MirLiftCore.Memory.withCallees t₂.toList) out) ↔ post out) :
+    MirFuelFree.MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          t₂.toList) post ↔
+      MirFuelFree.MirWpConverges body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+          t₁.toList) post := by
+  rw [MirLiftCore.initMachineStateWithMemoryAndCallees_withCallees_of_wf body args mem h₁ h₂]
+  have h_at : MirLiftCore.AgreesAt cone t₂.toList
+      (.running (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem
+        t₁.toList)) := by
+    intro s hs
+    cases hs
+    rw [MirLiftCore.initMachineStateWithMemoryAndCallees_callees_of_wf body args mem h₁]
+    exact calleesAgreeOn_of_agreesOn h_agree
+  constructor
+  · rintro ⟨fuel, h⟩
+    exact ⟨fuel,
+      (MirLiftCore.wpMirExecSym_cone_narrow_poly cone body t₂.toList post h_post fuel _
+        (coneReach_of_closedInvLookupPoly h_closed h_no₂ fuel _
+          (closedInvLookupPoly_init_of_wf cone body args mem h₁ h_ac h_cs))
+        h_at).1 h⟩
+  · rintro ⟨fuel, h⟩
+    exact ⟨fuel,
+      (MirLiftCore.wpMirExecSym_cone_narrow_poly cone body t₂.toList post h_post fuel _
+        (coneReach_of_closedInvLookupPoly h_closed h_no₂ fuel _
+          (closedInvLookupPoly_init_of_wf cone body args mem h₁ h_ac h_cs))
+        h_at).2 h⟩
 
 end Anneal.OpaqueCalleeTable

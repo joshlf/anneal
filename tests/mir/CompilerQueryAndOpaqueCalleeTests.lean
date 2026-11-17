@@ -73,6 +73,21 @@ theorem rigidTyV08_decide_canary :
         RigidTy.fnPtr [.bool] .str .unsafe_ .c := by
   decide
 
+/-- V2026_08_01 `Value`, `TreeBorrowPerm`, enumeration (`UnOp`, `BinOp`, `RetagKind`), and
+reverse `V08 → V06 → V08` `RigidTy` round-trip canary (`bridgeRigidTy_roundtrip_v08`). -/
+theorem v08_machine_and_roundtrip_canary :
+    let v08Ty : Trusted.Rustc.V2026_08_01.MirAst.RigidTy :=
+      .fnPtr [.bool, .dynamic "fx::Area"] (.ref .mut (.slice (.uint .u32))) .unsafe_ .c
+    bridgeRigidTyV06ToV08 (bridgeRigidTyV08ToV06 v08Ty) = v08Ty ∧
+      (Trusted.Rustc.V2026_08_01.MirSemantics.Value.aggregate 0 [.scalar ⟨3, 4⟩, .ptr ⟨7, 0⟩ 0] ≠
+        Trusted.Rustc.V2026_08_01.MirSemantics.Value.aggregate 0 [.scalar ⟨4, 4⟩, .ptr ⟨7, 0⟩ 0]) ∧
+      (Trusted.Rustc.V2026_08_01.MirSemantics.TreeBorrowPerm.reservedFrz true ≠
+        Trusted.Rustc.V2026_08_01.MirSemantics.TreeBorrowPerm.reservedFrz false) ∧
+      (Trusted.Rustc.V2026_08_01.MirAst.UnOp.ptrMetadata ≠ .neg) ∧
+      (Trusted.Rustc.V2026_08_01.MirAst.BinOp.offset ≠ .add) ∧
+      (Trusted.Rustc.V2026_08_01.MirAst.RetagKind.twoPhase ≠ .raw) :=
+  ⟨bridgeRigidTy_roundtrip_v08 _, by decide, by decide, by decide, by decide, by decide⟩
+
 /-! ## Opaque callee table: concrete captured MIR -/
 
 /-- `()` layout. -/
@@ -206,16 +221,17 @@ theorem canary_deadArm_tables_differ :
       OpaqueCalleeTable.toList_ofList]
     rfl
 
-/-- `live_f` resolves identically in both tables (`O(1)` certificates). -/
+/-- `live_f` resolves identically in both tables (`O(1)` `lookupKey_hit_mono` certificates,
+zero `lookupKey_eq` unfolding). -/
 theorem canary_liveKey_agrees :
     canaryNarrowTbl.lookupKey canaryLiveKey = canaryFullTbl.lookupKey canaryLiveKey := by
-  rw [OpaqueCalleeTable.lookupKey_eq, OpaqueCalleeTable.lookupKey_eq]
-  simp only [canaryLiveKey]
-  rw [lookupCallee_hit_mono (c := fxLiveF) ?_ rfl, lookupCallee_hit_mono (c := fxLiveF) ?_ rfl]
-  · unfold canaryFullTbl
-    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
-    exact lookupRaw_ofList_cons_hit rfl
-  · exact lookupRaw_ofList_cons_hit rfl
+  have hrawN : canaryNarrowTbl.lookupRaw "fx::live_f" = some fxLiveF :=
+    lookupRaw_ofList_cons_hit rfl
+  rw [lookupKey_hit_mono (c := fxLiveF) hrawN rfl rfl,
+    lookupKey_hit_mono (c := fxLiveF) ?_ rfl rfl]
+  unfold canaryFullTbl
+  rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
+  exact lookupRaw_ofList_cons_hit rfl
 
 /-- **Dead-arm cone canary**: dropping the panicking dead-arm callee `g_dead`
 (and unrelated callees) leaves the run unchanged. -/
@@ -344,21 +360,36 @@ theorem canary_poly_resolve (tbl : List CapturedMir)
   exact lookupCallee_hit (by rw [OpaqueCalleeTable.toList_ofList]; exact h) rfl rfl
     canary_u32_instantiationLayouts
 
+/-- One-time per-table `traitImpls` certificate for `multiNarrowTbl`. -/
+theorem multiNarrowTbl_traitImpls : multiNarrowTbl.traitImpls = [fxAreaEntry] := by
+  unfold multiNarrowTbl
+  rw [traitImpls_ofList]
+  rfl
+
+/-- One-time per-table `traitImpls` certificate for `multiFullTbl`: emitted once
+for the table and reused across all free-generic and trait-method call sites without
+ever unfolding `multiFullTbl.toList` again. -/
+theorem multiFullTbl_traitImpls : multiFullTbl.traitImpls = [fxAreaEntry] := by
+  unfold multiFullTbl
+  rw [traitImpls_ofList]
+  rfl
+
 /-- The polymorphic key agrees across the full and narrowed tables (`O(1)`
-`lookupCallee_hit_poly` certificates over `lookupRaw`, without unfolding
-`resolveCalleeBodyAndArgs?` over the raw list). -/
+`lookupKey_hit_free_poly_opaque` certificates over `lookupRaw` and sealed `traitImpls`,
+with zero `tbl.toList` unfolding). -/
 theorem canary_multi_polyKey_agrees :
     multiNarrowTbl.lookupKey multiPolyKey = multiFullTbl.lookupKey multiPolyKey := by
-  rw [OpaqueCalleeTable.lookupKey_eq, OpaqueCalleeTable.lookupKey_eq]
-  simp only [multiPolyKey]
-  rw [lookupCallee_hit_poly (c := fxPoly) (by decide) (by decide +kernel) ?_
-      (by decide) rfl canary_u32_instantiationLayouts,
-    lookupCallee_hit_poly (c := fxPoly) (by decide) (by decide +kernel) ?_
-      (by decide) rfl canary_u32_instantiationLayouts]
-  · unfold multiFullTbl
+  have hno : hasTraitImplForDefPath ([] ++ [fxAreaEntry]) "fx::poly" = false := by decide
+  have hrawN : multiNarrowTbl.lookupRaw "fx::poly" = some fxPoly :=
+    lookupRaw_ofList_cons_hit rfl
+  have hrawF : multiFullTbl.lookupRaw "fx::poly" = some fxPoly := by
+    unfold multiFullTbl
     rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
     exact lookupRaw_ofList_cons_hit rfl
-  · exact lookupRaw_ofList_cons_hit rfl
+  rw [lookupKey_hit_free_poly_opaque rfl multiNarrowTbl_traitImpls hno hrawN rfl
+      canary_u32_instantiationLayouts,
+    lookupKey_hit_free_poly_opaque rfl multiFullTbl_traitImpls hno hrawF rfl
+      canary_u32_instantiationLayouts]
 
 /-- `impl Area for Circle` is the unique most-specific override in both tables. -/
 theorem canary_area_winner_narrow :
@@ -374,24 +405,41 @@ theorem canary_area_winner_full :
         [(fxAreaEntry, some [])] := by
   decide +kernel
 
-/-- The trait-dispatch key agrees across the full and narrowed tables
-(`O(1)` `lookupCallee_trait_hit` certificates). -/
+/-- The trait-dispatch key agrees across the full and narrowed tables (`O(1)`
+`lookupKey_trait_hit_cert` + `collectMatchingTraitImplsWith_cons_hit_mono` certificates,
+with zero `tbl.toList` unfolding). -/
 theorem canary_multi_areaKey_agrees :
     multiNarrowTbl.lookupKey multiAreaKey = multiFullTbl.lookupKey multiAreaKey := by
-  rw [OpaqueCalleeTable.lookupKey_eq, OpaqueCalleeTable.lookupKey_eq]
-  simp only [multiAreaKey]
-  rw [lookupCallee_trait_hit (c := fxCircleArea) (by decide) canary_area_winner_narrow ?_
-      (by decide) rfl,
-    lookupCallee_trait_hit (c := fxCircleArea) (by decide) canary_area_winner_full ?_
-      (by decide) rfl]
-  · unfold multiFullTbl
+  have himplN : multiNarrowTbl.lookupRaw "fx::<impl Area for Circle>::area" =
+      some fxCircleArea := by
+    unfold multiNarrowTbl
+    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  have himplF : multiFullTbl.lookupRaw "fx::<impl Area for Circle>::area" =
+      some fxCircleArea := by
+    unfold multiFullTbl
     rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
       lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
       lookupRaw_ofList_cons_miss (by decide)]
     exact lookupRaw_ofList_cons_hit rfl
-  · unfold multiNarrowTbl
-    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
-    exact lookupRaw_ofList_cons_hit rfl
+  have hcolN :
+      collectMatchingTraitImplsWith multiNarrowTbl.lookupRaw ([] ++ [fxAreaEntry])
+        "fx::Area::area" [fxCircleTy] [] = [(fxAreaEntry, some [])] := by
+    rw [List.nil_append,
+      collectMatchingTraitImplsWith_cons_hit_mono (c := fxCircleArea)
+        (by decide) rfl (by decide) himplN (by decide) rfl]
+    rfl
+  have hcolF :
+      collectMatchingTraitImplsWith multiFullTbl.lookupRaw ([] ++ [fxAreaEntry])
+        "fx::Area::area" [fxCircleTy] [] = [(fxAreaEntry, some [])] := by
+    rw [List.nil_append,
+      collectMatchingTraitImplsWith_cons_hit_mono (c := fxCircleArea)
+        (by decide) rfl (by decide) himplF (by decide) rfl]
+    rfl
+  rw [lookupKey_trait_hit_cert (winner := fxAreaEntry) rfl (by decide) multiNarrowTbl_traitImpls
+      hcolN (by decide) himplN (by decide) rfl,
+    lookupKey_trait_hit_cert (winner := fxAreaEntry) rfl (by decide) multiFullTbl_traitImpls
+      hcolF (by decide) himplF (by decide) rfl]
 
 /-- **Multi-callee cone canary** (polymorphic + trait dispatch, dead-arm `g_dead`
 excluded). -/
@@ -507,14 +555,6 @@ theorem canary_free_poly_param_and_concrete :
     decide
   exact ⟨lookupCallee_hit_free_poly hno hraw rfl canary_u32_instantiationLayouts,
     lookupCallee_hit_free_poly hno hraw rfl hlayP⟩
-
-/-- One-time per-table `traitImpls` certificate for `multiFullTbl`: emitted once
-for the table and reused across all free-generic and trait-method call sites without
-ever unfolding `multiFullTbl.toList` again. -/
-theorem multiFullTbl_traitImpls : multiFullTbl.traitImpls = [fxAreaEntry] := by
-  unfold multiFullTbl
-  rw [traitImpls_ofList]
-  rfl
 
 /-- **`tbl.toList`-free free-generic certificate canary**: reuses the per-table
 `multiFullTbl_traitImpls` certificate (`multiFullTbl.traitImpls = [fxAreaEntry]`)
@@ -891,6 +931,86 @@ theorem canary_runCfgWithCallees_poly_bridge :
     canary_polyCone_closed.2 (by decide +kernel) rfl rfl, h₁]
   rfl
 
+/-- Shadowed duplicate of `fx::live_f` whose unreachable body calls `"fx::outside_cone"`.
+When placed *after* `fxLiveF` in a callee table, `findCallee?` / `lookupRaw` never selects it,
+yet `MirLiftCore.CallConeClosed` scans every list element with `defPath ∈ cone` and falsely
+rejects the table (`false`). -/
+def fxLiveFShadowed : CapturedMir :=
+  { defPath := "fx::live_f", phase := .runtimePostCleanup, role := .subject, argCount := 0,
+    localDecls := [⟨.mut, fxU32Ty, some "_0"⟩],
+    basicBlocks := [
+      fxCallBlock "fx::outside_cone" [] 1,
+      ⟨[], ⟨.return_, "shadow:ret"⟩, false⟩ ],
+    fnAbi := fxRetU32Abi, layouts := fxLayouts, allocations := [] }
+
+/-- Table where `fxLiveFShadowed` is shadowed by `fxLiveF`. -/
+def canaryShadowedTbl : OpaqueCalleeTable :=
+  .ofList [fxFillerA, fxLiveF, fxGDead, fxLiveFShadowed]
+
+/-- **`tbl.toList`-free `OpaqueCalleeTable.callConeClosed` & shadowed-duplicate canary**:
+1. `canaryFullTbl.callConeClosed canaryClosedCone canaryRoot = true` is proved purely from
+   `O(1)` `lookupRaw` certificates on the 3 cone paths (zero `canaryFullTbl.toList` unfolding!).
+2. On `canaryShadowedTbl`, `MirLiftCore.CallConeClosed` falsely returns `false` (tripped by the
+   shadowed `fxLiveFShadowed`), whereas `OpaqueCalleeTable.callConeClosed` queries `lookupRaw`
+   (first-match) and returns `true`, enabling `runCfgWithCallees_cone_narrow_of_callConeClosed_wf`!
+3. `polyFullTbl.callConeClosedPoly` narrows `polyRoot` via
+   `runCfgWithCallees_cone_narrow_of_callConeClosedPoly_wf` without unfolding `polyFullTbl.toList`. -/
+theorem canary_callConeClosed_no_toList_and_shadowed_dup :
+    canaryFullTbl.callConeClosed canaryClosedCone canaryRoot = true ∧
+    MirLiftCore.CallConeClosed canaryClosedCone canaryRoot canaryShadowedTbl.toList = false ∧
+    canaryShadowedTbl.callConeClosed canaryClosedCone canaryRoot = true ∧
+    MirLiftCore.runCfgWithCallees 9 canaryRoot [] emptyMemory
+        (canaryShadowedTbl.narrowToCone canaryClosedCone).toList =
+      (MirLiftCore.runCfgWithCallees 9 canaryRoot [] emptyMemory canaryShadowedTbl.toList).map
+        (MirLiftCore.MirOutcome.mapMem
+          (MirLiftCore.Memory.withCallees
+            (canaryShadowedTbl.narrowToCone canaryClosedCone).toList)) ∧
+    MirLiftCore.runCfgWithCallees 9 polyRoot [] emptyMemory
+        (polyFullTbl.narrowToCone polyCone).toList =
+      (MirLiftCore.runCfgWithCallees 9 polyRoot [] emptyMemory polyFullTbl.toList).map
+        (MirLiftCore.MirOutcome.mapMem
+          (MirLiftCore.Memory.withCallees (polyFullTbl.narrowToCone polyCone).toList)) := by
+  have hgdead : canaryFullTbl.lookupRaw "fx::g_dead" = some fxGDead := by
+    unfold canaryFullTbl
+    rw [lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  have hpanic : canaryFullTbl.lookupRaw "core::panicking::panic" = none := by
+    unfold canaryFullTbl
+    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+      lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide),
+      OpaqueCalleeTable.lookupRaw_eq, OpaqueCalleeTable.toList_ofList]
+    rfl
+  have hclosedNoToList : canaryFullTbl.callConeClosed canaryClosedCone canaryRoot = true := by
+    simp only [OpaqueCalleeTable.callConeClosed, canaryClosedCone, List.all_cons, List.all_nil,
+      canaryFullTbl_lookupRaw_live, hgdead, hpanic]
+    decide
+  have hshadowLive : canaryShadowedTbl.lookupRaw "fx::live_f" = some fxLiveF := by
+    unfold canaryShadowedTbl
+    rw [lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  have hwfS₁ : MirLiftCore.CalleeInitWf canaryRoot emptyMemory canaryShadowedTbl.toList :=
+    calleeInitWf_of_lookupRaw canaryRoot emptyMemory hshadowLive
+  have hwfS₂ : MirLiftCore.CalleeInitWf canaryRoot emptyMemory
+      (canaryShadowedTbl.narrowToCone canaryClosedCone).toList :=
+    calleeInitWf_of_lookupRaw canaryRoot emptyMemory
+      ((lookupRaw_narrowToCone (cone := canaryClosedCone) canaryShadowedTbl
+        (List.Mem.head _)).trans hshadowLive)
+  have hwfP₁ : MirLiftCore.CalleeInitWf polyRoot emptyMemory polyFullTbl.toList :=
+    calleeInitWf_of_lookupRaw polyRoot emptyMemory polyFullTbl_lookupRaw_poly
+  have hwfP₂ : MirLiftCore.CalleeInitWf polyRoot emptyMemory
+      (polyFullTbl.narrowToCone polyCone).toList :=
+    calleeInitWf_of_lookupRaw polyRoot emptyMemory
+      ((lookupRaw_narrowToCone (cone := polyCone) polyFullTbl (List.Mem.head _)).trans
+        polyFullTbl_lookupRaw_poly)
+  refine ⟨hclosedNoToList, by decide +kernel, by decide +kernel, ?_, ?_⟩
+  · exact runCfgWithCallees_cone_narrow_of_callConeClosed_wf canaryClosedCone 9 canaryRoot []
+      emptyMemory hwfS₁ hwfS₂ (agreesOn_narrowToCone canaryClosedCone canaryShadowedTbl)
+      (by decide +kernel) rfl rfl
+  · exact runCfgWithCallees_cone_narrow_of_callConeClosedPoly_wf polyCone 9 polyRoot []
+      emptyMemory hwfP₁ hwfP₂ (agreesOn_narrowToCone polyCone polyFullTbl)
+      (callConeClosedPoly_of_mirLiftCore canary_polyCone_closed.2)
+      (by decide +kernel) rfl rfl
+
 
 /-! ## Demand-time compiler queries -/
 
@@ -1165,25 +1285,29 @@ theorem dyn_step_preserved :
     dynDispatchStep dynEnv13Sync dynNarrowTbl dynSite dynRoot dynAtCall =
       dynDispatchStep dynEnv13 dynFullTbl dynSite dynRoot dynAtCall := by
   apply dynDispatchStep_preserved dyn_envExtends_13_sync
-  · intro vt hvt
+  · intro _ vt hvt
     rw [dyn_vtablePtr_atCall] at hvt
     cases hvt
     rw [dyn_schema13_resolves]
     exact fun _ h => nomatch h
-  · intro vt target hvt ht k hk
+  · intro _ vt target hvt ht _ k hk
     rw [dyn_vtablePtr_atCall] at hvt
     cases hvt
     rw [dyn_schema13_resolves] at ht
     cases ht
     rw [dyn_demandedKey] at hk
     cases hk
-    simp only [CalleeKey.apply, redirectResolver, dynSite, ite_true]
-    rw [lookupCallee_hit_mono (c := fxCircleArea) ?_ rfl,
-      lookupCallee_hit_mono (c := fxCircleArea) ?_ rfl]
-    · unfold dynFullTbl
-      rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
-      exact lookupRaw_ofList_cons_hit rfl
-    · exact lookupRaw_ofList_cons_hit rfl
+    have hrawN : dynNarrowTbl.lookupRaw "fx::<impl Area for Circle>::area" = some fxCircleArea :=
+      lookupRaw_ofList_cons_hit rfl
+    rw [redirectResolver_apply_hit dynNarrowTbl dynSite.dynKey
+        ("fx::<impl Area for Circle>::area", []) rfl,
+      redirectResolver_apply_hit dynFullTbl dynSite.dynKey
+        ("fx::<impl Area for Circle>::area", []) rfl,
+      lookupKey_hit_mono (c := fxCircleArea) hrawN rfl rfl,
+      lookupKey_hit_mono (c := fxCircleArea) ?_ rfl rfl]
+    unfold dynFullTbl
+    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
 
 /-- Monotonicity canary: Schema-13-only answers appear after the upgrade, while
 supported Schema-12 answers are unchanged; vtable errors are exact. -/
@@ -1820,13 +1944,138 @@ theorem canary_expected_trait_method_supertrait_chain :
       .faulted .unsupported [.event 1] := by
   decide +kernel
 
-/-- `slotMethodAgrees` is the item-name check without a binding, and accepts every target
-with a binding that names the called method. -/
+/-- `slotMethodAgrees` is the item-name check without a binding, and accepts every non-empty
+target with a binding that names the called method. -/
 theorem canary_slotMethodAgrees :
     slotMethodAgrees dynSite "fx::<Circle as Area>::area::{{vtable.shim}}" = false ∧
       slotMethodAgrees dynShimSite "fx::<Circle as Area>::area::{{vtable.shim}}" = true :=
   ⟨by rw [slotMethodAgrees_of_none _ rfl]; decide,
-    slotMethodAgrees_of_some _ rfl rfl⟩
+    slotMethodAgrees_of_some _ rfl rfl (by decide)⟩
+
+/-- **Symmetric `CoherentEnvExtends` layout invariance (`evalLayoutOf_any_dialect_of_coherentExtends`)**:
+upgrading a Schema-12 environment via `withBridgedV08Layouts` produces a `CoherentEnvExtends` pair
+(`coherent₁` holds as well), and `evalLayoutOf` agrees across *any* pair of layout dialects
+(when supported in `env₁` or `d₁ = .v2026_06_01`). -/
+theorem canary_coherentExtends_any_dialect :
+    let env₁ := autoCfiEnv₁
+    let env₂ := env₁.withBridgedV08Layouts .schema13
+    let tupTy : Ty := ⟨.tuple [.bool, .uint .u32], 0⟩
+    CoherentEnvExtends env₁ env₂ ∧
+      env₁.isLayoutCoherent = true ∧
+      evalCompilerQuery env₂ (.layoutOf .v2026_08_01 tupTy) =
+        evalCompilerQuery env₁ (.layoutOf .v2026_06_01 tupTy) ∧
+      evalCompilerQuery env₂ (.layoutOf .v2026_06_01 tupTy) =
+        evalCompilerQuery env₂ (.layoutOf .v2026_08_01 tupTy) := by
+  have hcoh : CoherentEnvExtends autoCfiEnv₁ (autoCfiEnv₁.withBridgedV08Layouts .schema13) :=
+    withBridgedV08Layouts_coherentExtends autoCfiEnv₁ .schema13 (by decide)
+      (isLayoutCoherent_of_schema_v06 autoCfiEnv₁ rfl)
+  exact ⟨hcoh, hcoh.coherent₁,
+    evalLayoutOf_any_dialect_of_coherentExtends hcoh .v2026_06_01 .v2026_08_01 _
+      (fun _ h => nomatch h) (fun _ h => nomatch h),
+    evalLayoutOf_any_dialect_of_coherentExtends (CoherentEnvExtends.refl _ hcoh.coherent₂)
+      .v2026_08_01 .v2026_06_01 _ (fun _ h => nomatch h) (fun _ h => nomatch h)⟩
+
+/-- Ill-formed supertrait-chain site whose terminal `traitRef` carries a non-`dyn` `Self`
+(`⟨"fx::Area", [u32]⟩`, `args.tail = []`). Checking only `firstTrait.args.head? = some (dyn d)`
+and `!traitRef.args.isEmpty` would falsely accept it, whereas `DynCallSite.wellFormed` validates
+`tr.args.head? = some (.dynamic tr.defPath)` on every hop including the terminal `traitRef`. -/
+def dynBadTermNonDynSite : DynCallSite :=
+  { dynSubSite with
+    lookupOp := ⟨⟨"fx::Area", [.uint .u32]⟩, 0, [dynSubTraitRef], none⟩ }
+
+/-- Ill-formed supertrait-chain site whose terminal `traitRef` carries a mismatched `dyn` `Self`
+(`⟨"fx::Area", [dyn Other]⟩`). -/
+def dynBadTermOtherDynSite : DynCallSite :=
+  { dynSubSite with
+    lookupOp := ⟨⟨"fx::Area", [.dynamic "fx::Other"]⟩, 0, [dynSubTraitRef], none⟩ }
+
+/-- **Terminal/intermediate `TraitRef` `Self`-validation canary**: both `dynBadTermNonDynSite`
+and `dynBadTermOtherDynSite` satisfy `firstTrait.args.head? = some (.dynamic "fx::SubArea")`,
+`!traitRef.args.isEmpty`, `dynKey.2 = .dynamic "fx::SubArea" :: traitRef.args.tail`, and
+`methodMatchesTrait`, yet `DynCallSite.wellFormed` rejects both (`false`) and execution fails
+closed (`.faulted .unsupported`). -/
+theorem canary_dyn_terminal_trait_self_mismatch_fails_closed :
+    (!dynBadTermNonDynSite.lookupOp.traitRef.args.isEmpty) = true ∧
+    decide (dynBadTermNonDynSite.dynKey.2 =
+      .dynamic "fx::SubArea" :: dynBadTermNonDynSite.lookupOp.traitRef.args.tail) = true ∧
+    dynBadTermNonDynSite.wellFormed = false ∧
+    dynBadTermOtherDynSite.wellFormed = false ∧
+    evalDynWithOpaqueCallees dynSubEnv13 dynFullTbl dynBadTermNonDynSite dynSubRoot 12 dynSubInit =
+      .faulted .unsupported [.event 1] ∧
+    evalDynWithOpaqueCallees dynSubEnv13 dynFullTbl dynBadTermOtherDynSite dynSubRoot 12 dynSubInit =
+      .faulted .unsupported [.event 1] := by
+  decide +kernel
+
+/-- Broken Schema-13 environment where vtable `7` slot `0` mistakenly stores the uninstantiated
+virtual key `("fx::Area::area", [dyn Area])` instead of a concrete `impl` method. -/
+def brokenVirtualVTableEnv13 : CompilerQueryEnv :=
+  { dynEnv13 with
+    fnAbis := [("fx::Area::area", fxRetU32Abi)]
+    vtables := some [⟨7, dynTraitRef, [("fx::Area::area", [.dynamic "fx::Area"])], [], []⟩] }
+
+/-- **Unresolved `dyn` vtable target & empty item-name fail-closed canary**:
+1. In `brokenVirtualVTableEnv13`, `resolveDynTarget` returns `.ok ("fx::Area::area", [dyn Area])`
+   and `slotMethodAgrees` is `true` (both paths end in `::area`), so without `vtableTargetAgrees`
+   the redirected step leaks into `stepBranchPruned` and produces an unlinked `.external` call!
+2. `vtableTargetAgrees` rejects `(dynSelfTrait? target).isSome` (`false`), so `dynDispatchStep`
+   and `evalDynWithOpaqueCallees` fail closed with `.faulted .unsupported`
+   (`dynDispatchStep_of_dyn_target`).
+3. Empty item segments (`""` or trailing `"::"`) are rejected by both `implementsCalledMethod`
+   and `slotMethodAgrees` even when `expectedTraitMethod? = some ""`. -/
+theorem canary_dyn_unresolved_vtable_target_and_empty_item_fails_closed :
+    resolveDynTarget brokenVirtualVTableEnv13 dynSite ⟨7, 0⟩ =
+      .ok ("fx::Area::area", [.dynamic "fx::Area"]) ∧
+    slotMethodAgrees dynSite "fx::Area::area" = true ∧
+    vtableTargetAgrees dynSite ("fx::Area::area", [.dynamic "fx::Area"]) = false ∧
+    (runSteps (stepBranchPruned (redirectResolver dynFullTbl dynSite.dynKey
+        ("fx::Area::area", [.dynamic "fx::Area"])) dynRoot) 12 dynInit []).summary =
+      ⟨.external, [.event 1], none, some "fx::Area::area"⟩ ∧
+    dynDispatchStep brokenVirtualVTableEnv13 dynFullTbl dynSite dynRoot dynAtCall =
+      MirStepNode.unsupported ∧
+    evalDynWithOpaqueCallees brokenVirtualVTableEnv13 dynFullTbl dynSite dynRoot 12 dynInit =
+      .faulted .unsupported [.event 1] ∧
+    implementsCalledMethod "" "" = false ∧
+    implementsCalledMethod "fx::Area::" "fx::Impl::" = false ∧
+    slotMethodAgrees
+      ({ dynSite with
+        dynKey := ("", [.dynamic "fx::Area"])
+        lookupOp := ⟨dynTraitRef, 0, [], some ""⟩ }) "" = false :=
+  ⟨by decide, by decide, by decide, by decide +kernel,
+    dynDispatchStep_of_dyn_target (target := ("fx::Area::area", [.dynamic "fx::Area"]))
+      brokenVirtualVTableEnv13 dynFullTbl dynRoot dynAtCall
+      dynSite_wellFormed dyn_vtablePtr_atCall (by decide) rfl,
+    by decide +kernel, by decide, by decide, by decide⟩
+
+/-- **`DynCallRegistry` well-formedness theorems & unconditional non-`dyn` trusted agreement**:
+1. Every member of `dynTwoSiteRegistry` is uniquely returned by `findSite?`
+   (`DynCallRegistry.findSite?_eq_some_of_wellFormed`).
+2. Duplicate keys fail `wellFormed` and yield `findSite? = none` at arbitrary positions
+   (`DynCallRegistry.findSite?_eq_none_of_duplicate`).
+3. On `dynDeadBranchRoot` with `canaryFullTbl.toList` linked in `memory.callees`, both
+   `evalDynWithOpaqueCallees` and `evalDynRegistryWithOpaqueCallees` equal the iterated trusted
+   `stepMirFn` unconditionally (`evalDynWithOpaqueCallees_eq_trusted_of_no_dyn_unconditional`,
+   `evalDynRegistryWithOpaqueCallees_eq_trusted_of_no_dyn_unconditional`). -/
+theorem canary_dyn_registry_theorems_and_unconditional_frames :
+    (dynTwoSiteRegistry.findSite? dynSubSite.dynKey = some dynSubSite ∧
+      dynSubSite.wellFormed = true) ∧
+    (DynCallRegistry.wellFormed ([dynSubBonusSite] ++ dynSite :: [] ++ dynDuplicateSite :: []) = false ∧
+      DynCallRegistry.findSite? ([dynSubBonusSite] ++ dynSite :: [] ++ dynDuplicateSite :: [])
+        dynSite.dynKey = none) ∧
+    evalDynWithOpaqueCallees dynEnv12 canaryFullTbl dynSite dynDeadBranchRoot 12
+        (initMachineStateWithCallees dynDeadBranchRoot [] canaryFullTbl.toList) =
+      runSteps (stepMirFn dynDeadBranchRoot) 12
+        (initMachineStateWithCallees dynDeadBranchRoot [] canaryFullTbl.toList) [] ∧
+    evalDynRegistryWithOpaqueCallees dynEnv12 canaryFullTbl [dynSite] dynDeadBranchRoot 12
+        (initMachineStateWithCallees dynDeadBranchRoot [] canaryFullTbl.toList) =
+      runSteps (stepMirFn dynDeadBranchRoot) 12
+        (initMachineStateWithCallees dynDeadBranchRoot [] canaryFullTbl.toList) [] :=
+  ⟨DynCallRegistry.findSite?_eq_some_of_wellFormed (by decide) (by simp [dynTwoSiteRegistry]),
+    DynCallRegistry.findSite?_eq_none_of_duplicate [dynSubBonusSite] [] [] rfl rfl,
+    evalDynWithOpaqueCallees_eq_trusted_of_no_dyn_unconditional dynEnv12 canaryFullTbl dynSite
+      dynDeadBranchRoot 12 _ (initMachineStateWithCallees_callees _ _ _) (by decide +kernel),
+    evalDynRegistryWithOpaqueCallees_eq_trusted_of_no_dyn_unconditional dynEnv12 canaryFullTbl
+      [dynSite] dynDeadBranchRoot 12 _ (initMachineStateWithCallees_callees _ _ _)
+      (by decide +kernel)⟩
 
 
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
@@ -1928,6 +2177,16 @@ Hint: Additional diagnostic information may be available using the `set_option d
 
 end ShadowedTreeBorrowPerm
 
+/-- V2026_08_01 `TreeBorrowPerm` co-import check (`theory/Correspondence/V2026_08_01/L4_TreeBorrows.lean:61`):
+with `DecidableEq` alone in `Anneal.CompilerQueryEnv`, `LawfulBEq` synthesizes via `instLawfulBEq`
+and `treeBorrowPermV08_beq_iff_eq` applies directly. -/
+example (a b : Trusted.Rustc.V2026_08_01.MirSemantics.TreeBorrowPerm) : (a == b) = true ↔ a = b :=
+  Anneal.CompilerQueryEnv.treeBorrowPermV08_beq_iff_eq
+
+/-- info: instLawfulBEq -/
+#guard_msgs in
+#synth LawfulBEq Trusted.Rustc.V2026_08_01.MirSemantics.TreeBorrowPerm
+
 end ShadowingDemo
 
 /-! ## `@[irreducible]` opacity witness on all five sealed operations
@@ -2000,6 +2259,43 @@ theorem canary_narrow_demandedKeys :
     demandedKeys canaryNarrowTbl.lookup canaryRoot 8 canaryInit = [canaryLiveKey] := by
   decide +kernel
 
+/-- Multi-callee gate table (`m` fillers + dead `g_dead` + generic `poly` + `Area` impl holder +
+`Circle::area` override). -/
+def multiGateTbl (m : Nat) : OpaqueCalleeTable :=
+  .ofList (gateFillers m ++ [fxGDead, fxPoly, fxAreaImplHolder, fxCircleArea])
+
+/-- Narrowed demanded keys of `multiRoot` (computed once over the 3-entry narrowed table). -/
+theorem canary_multi_narrow_demandedKeys :
+    demandedKeys multiNarrowTbl.lookup multiRoot 12 multiInit = [multiPolyKey, multiAreaKey] := by
+  decide +kernel
+
+/-- Pre-proved narrow lookup certificate for `multiPolyKey`. -/
+theorem multiNarrow_polyKey_cert :
+    multiNarrowTbl.lookupKey multiPolyKey =
+      some (fxPoly.instantiate ([RigidTy.uint .u32].zip [fxU32Layout])) := by
+  have hrawN : multiNarrowTbl.lookupRaw "fx::poly" = some fxPoly :=
+    lookupRaw_ofList_cons_hit rfl
+  exact lookupKey_hit_free_poly_opaque rfl multiNarrowTbl_traitImpls (by decide)
+    hrawN rfl canary_u32_instantiationLayouts
+
+/-- Pre-proved narrow lookup certificate for `multiAreaKey`. -/
+theorem multiNarrow_areaKey_cert :
+    multiNarrowTbl.lookupKey multiAreaKey = some fxCircleArea := by
+  have himplN : multiNarrowTbl.lookupRaw "fx::<impl Area for Circle>::area" =
+      some fxCircleArea := by
+    unfold multiNarrowTbl
+    rw [lookupRaw_ofList_cons_miss (by decide), lookupRaw_ofList_cons_miss (by decide)]
+    exact lookupRaw_ofList_cons_hit rfl
+  have hcolN :
+      collectMatchingTraitImplsWith multiNarrowTbl.lookupRaw ([] ++ [fxAreaEntry])
+        "fx::Area::area" [fxCircleTy] [] = [(fxAreaEntry, some [])] := by
+    rw [List.nil_append,
+      collectMatchingTraitImplsWith_cons_hit_mono (c := fxCircleArea)
+        (by decide) rfl (by decide) himplN (by decide) rfl]
+    rfl
+  exact lookupKey_trait_hit_cert (winner := fxAreaEntry) rfl (by decide) multiNarrowTbl_traitImpls
+    hcolN (by decide) himplN (by decide) rfl
+
 open Lean Elab Command in
 run_cmd do
   let o1 : Nat → CommandElabM (TSyntax `command) := fun m => do
@@ -2016,6 +2312,37 @@ run_cmd do
         subst hk
         rw [lookupKey_hit_mono canaryNarrowTbl_lookupRaw_live rfl rfl,
           lookupKey_hit_mono hraw rfl rfl])
+  let o1PolyTrait : Nat → CommandElabM (TSyntax `command) := fun m => do
+    let mLit := Syntax.mkNumLit (toString m)
+    `(command|
+      set_option Elab.async false in
+      example
+          (htraits : (multiGateTbl $mLit).traitImpls = [fxAreaEntry])
+          (hpoly : (multiGateTbl $mLit).lookupRaw "fx::poly" = some fxPoly)
+          (harea : (multiGateTbl $mLit).lookupRaw "fx::<impl Area for Circle>::area" =
+            some fxCircleArea) :
+          evalWithOpaqueCallees multiNarrowTbl multiRoot 12 multiInit =
+            evalWithOpaqueCallees (multiGateTbl $mLit) multiRoot 12 multiInit := by
+        apply evalWithOpaqueCallees_cone_narrow_of_narrow
+        rw [canary_multi_narrow_demandedKeys]
+        intro k hk
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at hk
+        rcases hk with h | h
+        · subst h
+          rw [multiNarrow_polyKey_cert,
+            lookupKey_hit_free_poly_opaque rfl htraits (by decide) hpoly rfl
+              canary_u32_instantiationLayouts]
+        · subst h
+          have hcol :
+              collectMatchingTraitImplsWith (multiGateTbl $mLit).lookupRaw ([] ++ [fxAreaEntry])
+                "fx::Area::area" [fxCircleTy] [] = [(fxAreaEntry, some [])] := by
+            rw [List.nil_append,
+              collectMatchingTraitImplsWith_cons_hit_mono (c := fxCircleArea)
+                (by decide) rfl (by decide) harea (by decide) rfl]
+            rfl
+          rw [multiNarrow_areaKey_cert,
+            lookupKey_trait_hit_cert (winner := fxAreaEntry) rfl (by decide) htraits
+              hcol (by decide) harea (by decide) rfl])
   let leaky : Nat → CommandElabM (TSyntax `command) := fun m => do
     let mLit := Syntax.mkNumLit (toString m)
     `(command|
@@ -2039,15 +2366,20 @@ run_cmd do
     return h₁ - h₀
   -- Warm-up (one-time equation lemmas, instance and simp caches).
   discard <| measure (← o1 2)
+  discard <| measure (← o1PolyTrait 2)
   discard <| measure (← leaky 2)
   let hb4 ← measure (← o1 4)
   let hb32 ← measure (← o1 32)
+  let hbPT4 ← measure (← o1PolyTrait 4)
+  let hbPT32 ← measure (← o1PolyTrait 32)
   let lk4 ← measure (← leaky 4)
   let lk32 ← measure (← leaky 32)
-  unless 0 < hb4 do
+  unless 0 < hb4 && 0 < hbPT4 do
     throwError "heartbeat gate: no heartbeats measured for M = 4"
   unless hb32 * 4 ≤ hb4 * 5 do
-    throwError "heartbeat regression gate failed: Hb(M = 32) = {hb32} > 1.25 × Hb(M = 4) = {hb4}"
+    throwError "heartbeat regression gate (mono) failed: Hb(M = 32) = {hb32} > 1.25 × Hb(M = 4) = {hb4}"
+  unless hbPT32 * 4 ≤ hbPT4 * 5 do
+    throwError "heartbeat regression gate (poly+trait) failed: Hb(M = 32) = {hbPT32} > 1.25 × Hb(M = 4) = {hbPT4}"
   unless lk4 * 7 ≤ lk32 * 5 do
     throwError "heartbeat gate self-test failed: the kernel-unfolding variant did not scale \
       (Hb(M = 4) = {lk4}, Hb(M = 32) = {lk32})"
@@ -2643,6 +2975,98 @@ constant. -/
 /-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_slotMethodAgrees' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_slotMethodAgrees
+
+/-- info: 'Anneal.OpaqueCalleeTable.lookupKey_miss_direct' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.lookupKey_miss_direct
+
+/-- info: 'Anneal.OpaqueCalleeTable.lookupKey_hit_free_poly_opaque' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.lookupKey_hit_free_poly_opaque
+
+/-- info: 'Anneal.OpaqueCalleeTable.lookupKey_trait_hit_cert' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.lookupKey_trait_hit_cert
+
+/-- info: 'Anneal.OpaqueCalleeTable.lookupKey_trait_hit_poly_cert' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.lookupKey_trait_hit_poly_cert
+
+/-- info: 'Anneal.OpaqueCalleeTable.lookupKey_trait_default_hit_cert' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.lookupKey_trait_default_hit_cert
+
+/-- info: 'Anneal.OpaqueCalleeTable.runCfgWithCallees_cone_narrow_of_callConeClosed_wf' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.runCfgWithCallees_cone_narrow_of_callConeClosed_wf
+
+/-- info: 'Anneal.OpaqueCalleeTable.runCfgWithCallees_cone_narrow_of_callConeClosedPoly_wf' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.runCfgWithCallees_cone_narrow_of_callConeClosedPoly_wf
+
+/-- info: 'Anneal.CompilerQueryEnv.instDecidableEqBinOpV08' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.instDecidableEqBinOpV08
+
+/-- info: 'Anneal.CompilerQueryEnv.valueV08StructEq_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.valueV08StructEq_iff
+
+/-- info: 'Anneal.CompilerQueryEnv.treeBorrowPermV08_beq_iff_eq' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.treeBorrowPermV08_beq_iff_eq
+
+/-- info: 'Anneal.CompilerQueryEnv.bridgeRigidTy_roundtrip_v08' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.bridgeRigidTy_roundtrip_v08
+
+/-- info: 'Anneal.CompilerQueryEnv.evalLayoutOf_any_dialect_of_coherentExtends' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.evalLayoutOf_any_dialect_of_coherentExtends
+
+/-- info: 'Anneal.CompilerQueryEnv.dynDispatchStep_of_dyn_target' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.dynDispatchStep_of_dyn_target
+
+/-- info: 'Anneal.CompilerQueryEnv.dynDispatchStep_frames' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.dynDispatchStep_frames
+
+/-- info: 'Anneal.CompilerQueryEnv.dynRegistryStep_frames' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.dynRegistryStep_frames
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.findSite?_eq_some_of_wellFormed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.findSite?_eq_some_of_wellFormed
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.findSite?_eq_none_of_duplicate' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.findSite?_eq_none_of_duplicate
+
+/-- info: 'Anneal.CompilerQueryEnv.evalDynWithOpaqueCallees_eq_trusted_of_no_dyn_unconditional' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.evalDynWithOpaqueCallees_eq_trusted_of_no_dyn_unconditional
+
+/-- info: 'Anneal.CompilerQueryEnv.evalDynRegistryWithOpaqueCallees_eq_trusted_of_no_dyn_unconditional' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.evalDynRegistryWithOpaqueCallees_eq_trusted_of_no_dyn_unconditional
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_callConeClosed_no_toList_and_shadowed_dup' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_callConeClosed_no_toList_and_shadowed_dup
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_terminal_trait_self_mismatch_fails_closed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_terminal_trait_self_mismatch_fails_closed
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_unresolved_vtable_target_and_empty_item_fails_closed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_unresolved_vtable_target_and_empty_item_fails_closed
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_registry_theorems_and_unconditional_frames' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_registry_theorems_and_unconditional_frames
 
 end Anneal.CompilerQueryAndOpaqueCalleeTests
 
