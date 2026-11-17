@@ -1115,6 +1115,94 @@ def expectedMultiCopyBytes?
       | .none => .none
     | _ => .none
 
+/-- True iff every element in `elems` is `.unit` (zero-sized element values). -/
+def allUnitValues : List Value → Bool
+  | .nil => true
+  | .unit :: rest => allUnitValues rest
+  | _ :: _ => false
+
+/--
+Check that every element in `elems` has byte size `elemSz`: for `elemSz = 0`
+(zero-sized element arrays such as `[(); N]`), requires `allUnitValues elems`;
+for `elemSz > 0`, delegates to `Trusted.elemsHaveUniformByteStride`.
+-/
+@[reducible]
+def elemsMatchByteStride (elems : List Value) (elemSz : Nat) : Bool :=
+  match Nat.beq elemSz 0 with
+  | true => allUnitValues elems
+  | false => elemsHaveUniformByteStride elems elemSz
+
+/--
+Remaining byte capacity of `rootVal` starting at a normalized projection path:
+- At `.nil`, the total byte size of `rootVal`.
+- At `.field idx _ :: rest` on `.aggregate _ fields`, the remaining bytes from
+  `rest` inside `fields[idx]` plus the byte size of the trailing fields
+  `dropValues (idx + 1) fields`.
+- At `.constantIndex offset minLen fromEnd :: rest` on `.aggregate 0 elems`, the
+  remaining bytes from `rest` inside `elems[baseIdx]` plus the byte size of the
+  trailing elements `dropValues (baseIdx + 1) elems`.
+-/
+def remainingRootBytesFromProjAux : Value → List ProjectionElem → Option Nat
+  | val, .nil =>
+    match encodeUntypedValueToBytes defaultCodecFuel val with
+    | .some bs => .some (length bs)
+    | .none => .none
+  | .aggregate _ fields, .field idx _ :: rest =>
+    match get? fields idx with
+    | .none => .none
+    | .some fVal =>
+      match
+        remainingRootBytesFromProjAux fVal rest,
+        encodeUntypedValueToBytes defaultCodecFuel (.aggregate 0 (dropValues (Nat.succ idx) fields))
+      with
+      | .some subRem, .some tailBs => .some (Nat.add subRem (length tailBs))
+      | _, _ => .none
+  | .aggregate 0 elems, .constantIndex offset minLen fromEnd :: rest =>
+    let len := length elems
+    let baseIdxOpt : Option Nat :=
+      match fromEnd with
+      | false =>
+        match Bool.and (Nat.ble minLen len) (Nat.ble offset len) with
+        | true => .some offset
+        | false => .none
+      | true =>
+        match Bool.and (Nat.ble minLen len) (Bool.and (Nat.ble 1 offset) (Nat.ble offset len)) with
+        | true => .some (Nat.sub len offset)
+        | false => .none
+    match baseIdxOpt with
+    | .none => .none
+    | .some baseIdx =>
+      match get? elems baseIdx with
+      | .none => .none
+      | .some eVal =>
+        match
+          remainingRootBytesFromProjAux eVal rest,
+          encodeUntypedValueToBytes defaultCodecFuel (.aggregate 0 (dropValues (Nat.succ baseIdx) elems))
+        with
+        | .some subRem, .some tailBs => .some (Nat.add subRem (length tailBs))
+        | _, _ => .none
+  | _, _ => .none
+
+/--
+Remaining byte capacity in `rootVal` starting at a strict sub-place `proj`
+(returning `.none` when `proj` is the root `[]` after stripping transparent
+projections).
+-/
+@[reducible]
+def remainingSubPlaceBytesInRoot?
+    (locals : List LocalSlot)
+    (rootVal : Value)
+    (proj : List ProjectionElem) :
+    Option Nat :=
+  let resolvedProj :=
+    match resolveBorrowProjectionElems locals proj with
+    | .some rp => rp
+    | .none => proj
+  let normProj := normalizeSubsliceProjections (stripTransparentProjections resolvedProj)
+  match normProj with
+  | .nil => .none
+  | _ :: _ => remainingRootBytesFromProjAux rootVal normProj
+
 /-- Static element kind of an array / slice container type (`.none` when unknown). -/
 @[reducible]
 def containerElemKind? : Option Ty → Option RigidTy
@@ -1133,7 +1221,8 @@ array containers hold elements of the copied element type. Per container:
 - otherwise (untyped, or a container whose type is not in scope such as a
   caller-owned referent) every element must have the copied element byte size
   `elemSz` (the pointee size, or the source element stride) by value
-  (`elemsHaveUniformByteStride`).
+  (`elemsMatchByteStride`, which also supports zero-sized `.unit` elements when
+  `elemSz = 0`).
 A type-punned element pointer (a `[u8; 4]` read through `*const u16`) or a
 heterogeneous struct/tuple mistaken for an array container fails closed with
 `.unsupported` instead of splicing mis-sized values.
@@ -1155,9 +1244,9 @@ def copySliceStrideOk
       Bool.or
         (sameRigidTyShape k pt.kind)
         (match rigidTyKindByteSize k, rigidTyKindByteSize pt.kind with
-         | .some a, .some b => Bool.and (Nat.beq a b) (elemsHaveUniformByteStride elems a)
+         | .some a, .some b => Bool.and (Nat.beq a b) (elemsMatchByteStride elems a)
          | _, _ => false)
-    | _, _ => elemsHaveUniformByteStride elems elemSz
+    | _, _ => elemsMatchByteStride elems elemSz
   Bool.and (sideOk srcContainerTy srcElems) (sideOk dstContainerTy dstElems)
 
 /--
@@ -1321,12 +1410,9 @@ def evalCopyNonOverlappingPermOkProto
                         | true => .some true
                         | false =>
                           let isSubPlaceWithinRoot : Bool :=
-                            match
-                              stripTransparentProjections srcEntry.targetProjection,
-                              encodeUntypedValueToBytes defaultCodecFuel srcRootVal
-                            with
-                            | _ :: _, .some rootBs => Nat.ble expBytes (length rootBs)
-                            | _, _ => false
+                            match remainingSubPlaceBytesInRoot? locals₃ srcRootVal srcEntry.targetProjection with
+                            | .some remBytes => Nat.ble expBytes remBytes
+                            | .none => false
                           match isSubPlaceWithinRoot with
                           | true => .none
                           | false => .some false
@@ -1365,12 +1451,9 @@ def evalCopyNonOverlappingPermOkProto
                         | .none, .aggregate 0 _ => true
                         | _, _ => false
                       let dstSubPlaceWithinRoot : Bool :=
-                        match
-                          stripTransparentProjections effDstPlace.projection,
-                          encodeUntypedValueToBytes defaultCodecFuel dstRootVal
-                        with
-                        | _ :: _, .some rootBs => Nat.ble (length bs) (length rootBs)
-                        | _, _ => false
+                        match remainingSubPlaceBytesInRoot? locals₃ dstRootVal effDstPlace.projection with
+                        | .some remBytes => Nat.ble (length bs) remBytes
+                        | .none => false
                       match preferSplicedArray, spliceBytesToDstArray with
                       | true, .some splicedVal => writeDstVal splicedVal
                       | _, _ =>
@@ -1441,7 +1524,47 @@ def evalCopyNonOverlappingPermOkProto
                     dstParentPlace
                     dstParentTy
                     dstParentIsAdt
-                | false => MirStepNode.fail .ub
+                | false =>
+                  match copyElemSzOpt with
+                  | .none => MirStepNode.fail .ub
+                  | .some elemSz =>
+                    let srcContainerTy : Option Ty :=
+                      match get? locals₃ srcEntry.targetLocal with
+                      | .some _ =>
+                        placeTy localDecls layouts
+                          { local_ := srcEntry.targetLocal, projection := srcParentProj }
+                      | .none => .none
+                    match
+                      copySliceStrideOk
+                        effSrcPtOpt copyElemSzOpt srcContainerTy dstParentTy srcElems dstElems
+                    with
+                    | true => MirStepNode.fail .ub
+                    | false =>
+                      let totalCopyBytes := Nat.mul n elemSz
+                      let srcRemOpt : Option Nat :=
+                        match remainingSubPlaceBytesInRoot? locals₃ srcRootVal srcEntry.targetProjection with
+                        | .some r => .some r
+                        | .none =>
+                          match encodeUntypedValueToBytes defaultCodecFuel srcRootVal with
+                          | .some bs => .some (length bs)
+                          | .none => .none
+                      let dstRemOpt : Option Nat :=
+                        match remainingSubPlaceBytesInRoot? locals₃ dstRootVal dstEntry.targetProjection with
+                        | .some r => .some r
+                        | .none =>
+                          match encodeUntypedValueToBytes defaultCodecFuel dstRootVal with
+                          | .some bs => .some (length bs)
+                          | .none => .none
+                      match srcRemOpt, dstRemOpt with
+                      | .some srcRem, .some dstRem =>
+                        match
+                          Bool.and
+                            (Nat.ble (Nat.add (Nat.mul srcElemOff elemSz) totalCopyBytes) srcRem)
+                            (Nat.ble (Nat.add (Nat.mul dstElemOff elemSz) totalCopyBytes) dstRem)
+                        with
+                        | true => MirStepNode.unsupported
+                        | false => MirStepNode.fail .ub
+                      | _, _ => MirStepNode.unsupported
               | true =>
                 let sameContainer :=
                   Bool.and
@@ -2145,6 +2268,18 @@ def evalStmtProto
   match stmt.kind with
   | .intrinsic (.copyNonOverlapping src dst count) =>
     evalCopyNonOverlappingProto s src dst count localDecls layouts
+  | .intrinsic (.assume op) =>
+    match isPureOpaqueCastMoveOp op with
+    | false => evalStmt s stmt localDecls layouts
+    | true =>
+      match validatePureOpaqueCastMoveOp s.frame.locals localDecls layouts op with
+      | false => MirStepNode.fail .ub
+      | true =>
+        evalStmt
+          s
+          ⟨.intrinsic (.assume (erasePureOpaqueCastMoveOp op)), stmt.span⟩
+          (erasePureOpaqueCastMoveDeclsOp localDecls layouts op)
+          layouts
   | .deinit p =>
     match stripLeadingOpaqueCast p.projection with
     | .nil =>
@@ -2529,95 +2664,6 @@ def enterTailCalleeFrameProto
   }
 
 /--
-Repaired `evalTailCallTerminator` (`Terminators.lean:3307-3378`), equal to
-`Trusted.evalTailCallTerminator` except that:
-- argument operands go through `evalOperandsProto` (Bug 4; `localDecls` stays
-  `.nil` exactly as in `Trusted`),
-- at a modular root (`callStack = []`) the torn-down memory is relocated by
-  `relocateRootCallerReferents` (Bug 3) before entering the callee,
-- the callee is entered with `enterTailCalleeFrameProto` (Bug 2).
--/
-def evalTailCallTerminatorProto
-    (s : MachineState)
-    (func : Operand)
-    (argOps : List Operand)
-    (currentBody : Option CapturedMir) :
-    MirStepNode :=
-  let bodyLocalDecls := bodyLocalDeclsOf currentBody
-  let bodyLayouts : LayoutTable :=
-    match currentBody with
-    | .some b => b.layouts
-    | .none => emptyLayoutTable
-  let ceiling : Bool :=
-    match currentBody with
-    | .some b => b.fnAbi.canUnwind
-    | .none => true
-  match
-    resolveCallTarget
-      s
-      func
-      (length argOps)
-      bodyLocalDecls
-      bodyLayouts
-  with
-  | .ub => MirStepNode.fail .ub
-  | .unsupported => MirStepNode.unsupported
-  | .ok target localsAfterFunc =>
-    match
-      evalOperandsProto
-        localsAfterFunc
-        argOps
-        s.memory.borrows
-        s.memory.globals
-        bodyLayouts
-        s.memory.callerLocals
-        .nil
-        s.memory.callStack
-    with
-    | .ub => MirStepNode.fail .ub
-    | .unsupported => MirStepNode.unsupported
-    | .ok argVals _ =>
-      let depth := length s.memory.callStack
-      let nLocals := length s.frame.locals
-      match
-        hasFrameDeallocProtectorConflict
-          s.memory.borrows
-          s.memory.activeProtectors
-          depth
-          nLocals
-      with
-      | true => MirStepNode.fail .ub
-      | false =>
-        let memAfterTeardown : Memory :=
-          { s.memory with borrows := disableFrameBorrows s.memory.borrows depth nLocals }
-        match
-          lookupCallee
-            s.memory.callees
-            bodyLayouts
-            target.defPath
-            target.typeArgs
-            s.memory.traitImpls
-        with
-        | .some calleeBody =>
-          match checkCalleeTargetCompatible target calleeBody (length argVals) with
-          | false => MirStepNode.fail .ub
-          | true =>
-            let memEntered : Memory :=
-              match s.memory.callStack with
-              | .nil =>
-                relocateRootCallerReferents
-                  memAfterTeardown nLocals (length (initLocals calleeBody argVals))
-              | _ :: _ => memAfterTeardown
-            MirStepNode.step (enterTailCalleeFrameProto memEntered ceiling calleeBody argVals)
-        | .none =>
-          MirStepNode.extCall
-            { defPath := target.defPath
-              typeArgs := target.typeArgs
-              args := argVals
-              memory := memAfterTeardown }
-            resumeExternalTailCall
-
-/--
 Repaired `writeReturnDestination` (`Terminators.lean:599-725`): strips leading
 `.opaqueCast` projections on the caller's return `destination` before
 root-vs-projected dispatch, validating against the cast type on pure
@@ -2655,6 +2701,201 @@ def writeReturnDestinationProto
     | p0 :: ps =>
       writeReturnDestination
         callerLocals mem { local_ := dst.local_, projection := p0 :: ps } retVal writeDecls layouts
+
+/--
+Whether a calling convention permits unwinding (`rustc_abi::ExternAbi::can_unwind`:
+`extern "C"` and `extern "rust-intrinsic"` never unwind; `"C-unwind"` / `"Rust"` do).
+-/
+@[reducible]
+def callConvCanUnwind : CallConv → Bool
+  | .c => false
+  | .rustIntrinsic => false
+  | .other "system" => false
+  | .other "stdcall" => false
+  | .other "fastcall" => false
+  | .other "vectorcall" => false
+  | .other "thiscall" => false
+  | .other "aapcs" => false
+  | .other "win64" => false
+  | .other "sysv64" => false
+  | _ => true
+
+/--
+Infer whether an unlinked external call target can unwind from its resolved
+function-pointer signature (`target.fnSig`) or call-site operand type (`func`).
+-/
+@[reducible]
+def externalTargetCanUnwind
+    (target : ResolvedCallTarget)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (func : Operand) :
+    Bool :=
+  match target.fnSig with
+  | .some (.fnPtr _ _ _ sigAbi) => callConvCanUnwind sigAbi
+  | _ =>
+    match operandTy localDecls layouts func with
+    | .some { kind := .fnPtr _ _ _ sigAbi, .. } => callConvCanUnwind sigAbi
+    | _ => true
+
+/--
+Repaired `resumeExternalTailCall` (`Terminators.lean:1117-1156`):
+- On `.returned retVal memAfter`, uses `writeReturnDestinationProto` when
+  `caller.destination` has a leading `.opaqueCast` (otherwise delegating directly
+  to `Trusted.resumeExternalTailCall`).
+- On `.panicked memAfter`, enforces the root unwind ceiling `extCeiling` when
+  `memAfter.callStack = []`.
+-/
+def resumeExternalTailCallProto (extCeiling : Bool) (ans : MirCallAns) : MirExecState :=
+  match ans with
+  | .returned retVal memAfter =>
+    match memAfter.callStack with
+    | .nil => .halted (.normal (retVal, memAfter))
+    | caller :: restStack =>
+      match takeLeadingOpaqueCast caller.destination.projection with
+      | .nil => resumeExternalTailCall ans
+      | _ :: _ =>
+        match caller.isDiverging with
+        | true => .faulted .ub
+        | false =>
+          let restoredProtectors := restoreCallerProtectors caller
+          let callerMem : Memory := {
+            memAfter with
+            callStack := restStack
+            activeCallee := .some caller.callerBody
+            activeProtectors := restoredProtectors
+          }
+          match
+            writeReturnDestinationProto
+              caller.frame.locals
+              callerMem
+              caller.destination
+              retVal
+              caller.callerBody.localDecls
+              caller.callerBody.layouts
+          with
+          | .ok updatedCallerLocals mem' =>
+            .running {
+              frame := {
+                caller.frame with
+                blockIdx := caller.returnTarget
+                stmtIdx := 0
+                locals := updatedCallerLocals
+              }
+              memory := mem'
+            }
+          | .ub => .faulted .ub
+          | .unsupported => .faulted .unsupported
+  | .panicked memAfter =>
+    match unwindFromCallStack memAfter.callStack memAfter with
+    | .halted .panic =>
+      match extCeiling with
+      | true => .halted .panic
+      | false => .faulted .ub
+    | st => st
+  | .aborted => .halted .abort
+
+/--
+Repaired `evalTailCallTerminator` (`Terminators.lean:3307-3378`), equal to
+`Trusted.evalTailCallTerminator` except that:
+- `func` and argument operands normalize pure-`.opaqueCast` `move` operands
+  (`evalOperandsProto`; `localDecls` stays `.nil` for `argOps` as in `Trusted`),
+- at a modular root (`callStack = []`) the torn-down memory is relocated by
+  `relocateRootCallerReferents` (Bug 3) before entering the callee,
+- an in-table callee is entered with `enterTailCalleeFrameProto` (Bug 2), and an
+  external (out-of-table) callee narrows `callStack` / `extCeiling` from its
+  call-site function-pointer ABI (`externalTargetCanUnwind`) and resumes via
+  `resumeExternalTailCallProto`.
+-/
+def evalTailCallTerminatorProto
+    (s : MachineState)
+    (func : Operand)
+    (argOps : List Operand)
+    (currentBody : Option CapturedMir) :
+    MirStepNode :=
+  let bodyLocalDecls := bodyLocalDeclsOf currentBody
+  let bodyLayouts : LayoutTable :=
+    match currentBody with
+    | .some b => b.layouts
+    | .none => emptyLayoutTable
+  let ceiling : Bool :=
+    match currentBody with
+    | .some b => b.fnAbi.canUnwind
+    | .none => true
+  match validatePureOpaqueCastMoveOp s.frame.locals bodyLocalDecls bodyLayouts func with
+  | false => MirStepNode.fail .ub
+  | true =>
+    let func' := erasePureOpaqueCastMoveOp func
+    let decls' := erasePureOpaqueCastMoveDeclsOp bodyLocalDecls bodyLayouts func
+    match
+      resolveCallTarget
+        s
+        func'
+        (length argOps)
+        decls'
+        bodyLayouts
+    with
+    | .ub => MirStepNode.fail .ub
+    | .unsupported => MirStepNode.unsupported
+    | .ok target localsAfterFunc =>
+      match
+        evalOperandsProto
+          localsAfterFunc
+          argOps
+          s.memory.borrows
+          s.memory.globals
+          bodyLayouts
+          s.memory.callerLocals
+          .nil
+          s.memory.callStack
+      with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok argVals _ =>
+        let depth := length s.memory.callStack
+        let nLocals := length s.frame.locals
+        match
+          hasFrameDeallocProtectorConflict
+            s.memory.borrows
+            s.memory.activeProtectors
+            depth
+            nLocals
+        with
+        | true => MirStepNode.fail .ub
+        | false =>
+          let memAfterTeardown : Memory :=
+            { s.memory with borrows := disableFrameBorrows s.memory.borrows depth nLocals }
+          match
+            lookupCallee
+              s.memory.callees
+              bodyLayouts
+              target.defPath
+              target.typeArgs
+              s.memory.traitImpls
+          with
+          | .some calleeBody =>
+            match checkCalleeTargetCompatible target calleeBody (length argVals) with
+            | false => MirStepNode.fail .ub
+            | true =>
+              let memEntered : Memory :=
+                match s.memory.callStack with
+                | .nil =>
+                  relocateRootCallerReferents
+                    memAfterTeardown nLocals (length (initLocals calleeBody argVals))
+                | _ :: _ => memAfterTeardown
+              MirStepNode.step (enterTailCalleeFrameProto memEntered ceiling calleeBody argVals)
+          | .none =>
+            let extCanUnwind := externalTargetCanUnwind target decls' bodyLayouts func'
+            let memExt : Memory :=
+              { memAfterTeardown with
+                callStack := narrowCallStackForTailCallee memAfterTeardown.callStack extCanUnwind }
+            let extCeiling := Bool.and ceiling extCanUnwind
+            MirStepNode.extCall
+              { defPath := target.defPath
+                typeArgs := target.typeArgs
+                args := argVals
+                memory := memExt }
+              (resumeExternalTailCallProto extCeiling)
 
 /--
 Repaired `evalTerminator` (`Terminators.lean:3379-3704`), equal to

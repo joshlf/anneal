@@ -818,6 +818,163 @@ theorem canary_bug4_call_destination_and_binop_move_opaqueCast :
       } := by
   exact ⟨rfl, rfl, rfl, rfl⟩
 
+/--
+Canary 4F (Type-punned subplace copy where `n > length srcElems` or `n > length dstElems`
+fails closed with `.unsupported` when the byte span fits, instead of B2's false `.ub`):
+1. `a : [u32; 2]` (8 bytes), `b : [u8; 4]` (4 bytes),
+   `copy_nonoverlapping::<u8>(&raw const a[0] as *const u8, &raw mut b[1], 3)`:
+   `n = 3 > length srcElems = 2`, `dstStart = 1 != 0`, and `3` bytes fits within
+   `a` (8 bytes) and `b[1..]` (4 bytes). B2 faulted with a false `.ub` because
+   `inBounds` checked `n <= length srcElems` (`3 <= 2`) before checking
+   `copySliceStrideOk`; A2 fails closed with `.unsupported`.
+2. When `n = 9` (`9` bytes > `8` bytes of `a`), A2 still faults with `.ub`.
+-/
+theorem canary_bug1_type_punned_count_gt_container_len_unsupported :
+    let sc : Nat → Nat → Value := fun b n => .scalar { bits := b, sizeBytes := n }
+    let decls : List LocalDecl := [
+      { mutability := .mut, ty := { kind := .array (.uint .u32) 2, layoutIdx := 0 }, debugName := none },
+      { mutability := .mut, ty := { kind := .array (.uint .u8) 4, layoutIdx := 0 }, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }, debugName := none }]
+    let locals : List LocalSlot := [
+      .init (.aggregate 0 [mkU32 100, mkU32 200]),
+      .init (.aggregate 0 [sc 0 1, sc 0 1, sc 0 1, sc 0 1]),
+      .init (.ptr { allocId := 90, offsetBytes := 0 } 8),
+      .init (.ptr { allocId := 91, offsetBytes := 0 } 8)]
+    let srcEntry : BorrowEntry :=
+      { tag := 90, targetLocal := 0, targetProjection := [.constantIndex 0 2 false], perm := .cell }
+    let dstEntry : BorrowEntry :=
+      { tag := 91, targetLocal := 1, targetProjection := [.constantIndex 1 4 false], perm := .unique }
+    let s : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 92 }
+    }
+    evalCopyNonOverlappingPermOkProto
+      s (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls emptyLayoutTable
+      { allocId := 90, offsetBytes := 0 } { allocId := 91, offsetBytes := 0 }
+      srcEntry dstEntry 3 locals =
+      MirStepNode.unsupported ∧
+    evalCopyNonOverlappingPermOkProto
+      s (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls emptyLayoutTable
+      { allocId := 90, offsetBytes := 0 } { allocId := 91, offsetBytes := 0 }
+      srcEntry dstEntry 9 locals =
+      MirStepNode.fail .ub := by
+  exact ⟨rfl, rfl⟩
+
+/--
+Canary 4G (Subplace byte-span starting at the *second* field `pair.1` of an
+8-byte struct `PairU32` with `n = 2` faults with `.ub`, whereas B2 compared
+against the total 8-byte root size and returned `.unsupported`):
+At `&raw const pair.1` (or `&raw mut pair.1`), only `4` bytes remain in `pair`,
+so copying `n = 2` `u32`s (`8` bytes > `4` remaining bytes) is out-of-bounds on
+both source and destination sides and faults with `MirStepNode.fail .ub`.
+-/
+theorem canary_bug1_second_field_oob_faults_ub :
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let pairVal : Value := .aggregate 0 [mkU32 10, mkU32 20]
+    let arrVal : Value := .aggregate 0 [mkU32 1, mkU32 2]
+    let locals : List LocalSlot := [.init pairVal, .init arrVal]
+    let srcField1 : BorrowEntry :=
+      { tag := 92, targetLocal := 0, targetProjection := [.field 1 u32Ty], perm := .cell }
+    let dstArrEntry : BorrowEntry :=
+      { tag := 93, targetLocal := 1, targetProjection := [], perm := .unique }
+    let srcArrEntry : BorrowEntry :=
+      { tag := 94, targetLocal := 1, targetProjection := [], perm := .cell }
+    let dstField1 : BorrowEntry :=
+      { tag := 95, targetLocal := 0, targetProjection := [.field 1 u32Ty], perm := .unique }
+    let sSrc : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := { emptyMemory with borrows := [srcField1, dstArrEntry], nextTag := 96 }
+    }
+    let sDst : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := { emptyMemory with borrows := [srcArrEntry, dstField1], nextTag := 96 }
+    }
+    evalCopyNonOverlappingPermOkProto
+      sSrc (.copy ⟨0, []⟩) (.copy ⟨1, []⟩) [] emptyLayoutTable
+      { allocId := 92, offsetBytes := 0 } { allocId := 93, offsetBytes := 0 }
+      srcField1 dstArrEntry 2 locals =
+      MirStepNode.fail .ub ∧
+    evalCopyNonOverlappingPermOkProto
+      sDst (.copy ⟨1, []⟩) (.copy ⟨0, []⟩) [] emptyLayoutTable
+      { allocId := 94, offsetBytes := 0 } { allocId := 95, offsetBytes := 0 }
+      srcArrEntry dstField1 2 locals =
+      MirStepNode.fail .ub := by
+  exact ⟨rfl, rfl⟩
+
+/--
+Canary 4H (Zero-sized element `[(); 4]` multi-element subplace copy succeeds):
+B2's `copySliceStrideOk` delegated to `elemsHaveUniformByteStride`, which returns
+`false` whenever `elemSz == 0` and `elems` is non-empty; A2's `elemsMatchByteStride`
+accepts `.unit` elements when `elemSz == 0`.
+-/
+theorem canary_bug1_zst_unit_array_subplace_copy :
+    let unitArr : Value := .aggregate 0 [.unit, .unit, .unit, .unit]
+    let locals : List LocalSlot := [.init unitArr, .init unitArr]
+    let srcEntry : BorrowEntry :=
+      { tag := 96, targetLocal := 0, targetProjection := [.constantIndex 1 4 false], perm := .cell }
+    let dstEntry : BorrowEntry :=
+      { tag := 97, targetLocal := 1, targetProjection := [.constantIndex 0 4 false], perm := .unique }
+    let s : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 98 }
+    }
+    evalCopyNonOverlappingPermOkProto
+      s dummySrcOp dummyDstOp [] emptyLayoutTable
+      { allocId := 96, offsetBytes := 0 } { allocId := 97, offsetBytes := 0 }
+      srcEntry dstEntry 2 locals =
+    MirStepNode.step {
+      s with
+      frame := { blockIdx := 0, stmtIdx := 1, locals := locals }
+    } := by
+  rfl
+
+/--
+Canary 4I (External `extern "C"` tail-call unwind narrowing and `StatementKind.intrinsic (.assume)`
+pure-`.opaqueCast` `move` de-initialization):
+1. An external tail call through a reified `extern "C" fn()` pointer (`CallConv.c`)
+   narrows the root unwind ceiling so a `.panicked` external answer faults with
+   `.faulted .ub` under `evalTerminatorProto` (whereas unpatched `evalTerminator`
+   halts with `.halted .panic`).
+2. `StatementKind.intrinsic (.assume (move (_0 as bool)))` de-initializes `_0`
+   under `evalStmtProto` (whereas unpatched `evalStmt` leaves `_0` initialized).
+-/
+theorem canary_bug2_bug4_external_c_abi_tailcall_and_assume_opaqueCast :
+    let cFnSig : RigidTy := .fnPtr [] (.tuple []) .safe .c
+    let fnPtrTy : Ty := { kind := cFnSig, layoutIdx := 0 }
+    let boolTy : Ty := { kind := .bool, layoutIdx := 0 }
+    let fnEntry : FnPtrEntry :=
+      { allocId := 500, defPath := "ext::c_callee", typeArgs := [], fnSig := .some cFnSig }
+    let sTail : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.ptr { allocId := 500, offsetBytes := 0 } 8)] }
+      memory := { emptyMemory with fnPtrs := [fnEntry] }
+    }
+    let tailTerm : Terminator :=
+      ⟨.tailCall (.move ⟨0, [.opaqueCast fnPtrTy]⟩) [], "t"⟩
+    let sAssume : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar { bits := 1, sizeBytes := 1 })] }
+      memory := emptyMemory
+    }
+    let assumeStmt : Statement :=
+      ⟨.intrinsic (.assume (.move ⟨0, [.opaqueCast boolTy]⟩)), "a"⟩
+    (match evalTerminator sTail tailTerm .none with
+     | .vis (.inr (.inr (.call _))) k => some (k (.panicked emptyMemory))
+     | _ => none) = some (.halted .panic) ∧
+    (match evalTerminatorProto sTail tailTerm .none with
+     | .vis (.inr (.inr (.call _))) k => some (k (.panicked emptyMemory))
+     | _ => none) = some (.faulted .ub) ∧
+    evalStmt sAssume assumeStmt [] emptyLayoutTable =
+      MirStepNode.step {
+        sAssume with
+        frame := { blockIdx := 0, stmtIdx := 1, locals := [.init (.scalar { bits := 1, sizeBytes := 1 })] }
+      } ∧
+    evalStmtProto sAssume assumeStmt [] emptyLayoutTable =
+      MirStepNode.step {
+        sAssume with
+        frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit] }
+      } := by
+  exact ⟨rfl, rfl, rfl, rfl⟩
+
 /-! ## 5. Conservativity Canaries (the prototype is `Trusted` wherever no repair applies) -/
 
 open TailCallCallerReferentWitnesses in
@@ -883,6 +1040,10 @@ theorem canary_conservativity_use_keeps_tree_borrows_read :
 #print axioms opaqueCast_before_deref_stays_unsupported
 #print axioms writeReturnDestinationProto_pure_opaqueCast_simulation
 #print axioms canary_bug1_cross_field_span_unsupported_vs_oob_ub
+#print axioms canary_bug1_type_punned_count_gt_container_len_unsupported
+#print axioms canary_bug1_second_field_oob_faults_ub
+#print axioms canary_bug1_zst_unit_array_subplace_copy
+#print axioms canary_bug2_bug4_external_c_abi_tailcall_and_assume_opaqueCast
 #print axioms canary_bug4_opaque_alias_field_shell_uses_cast_type
 #print axioms canary_bug4_call_destination_and_binop_move_opaqueCast
 #print axioms canary_conservativity_use_keeps_tree_borrows_read
