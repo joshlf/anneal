@@ -26579,6 +26579,42 @@ theorem PtrMetadataOf.evalRvalue_ptrMetadata {locals locals' : List LocalSlot} {
   | thin p =>
     exact evalRvalue_unaryOp_ptrMetadata_thin locals locals' op mem localDecls layouts p hOp
 
+/-- **`evalRvalue_unaryOp_ptrMetadata_slice`** (the brief's named form, stated on `WidePtrVal`):
+`Rvalue.unaryOp .ptrMetadata op` on the trusted wide `[T]` / `str` pointer
+`WidePtrVal.toValue ptrBytes wide` (`ptrBytes = layoutPointerBytes layouts`) yields the metadata
+`.scalar ⟨wide.2, ptrBytes⟩` with `locals'` and `mem` unchanged, without dereferencing `wide.1`. -/
+theorem evalRvalue_unaryOp_ptrMetadata_slice (locals locals' : List LocalSlot) (op : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (wide : WidePtrVal)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals') :
+    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
+      .ok (.scalar ⟨wide.2, layoutPointerBytes layouts⟩) locals' mem :=
+  evalRvalue_unaryOp_ptrMetadata_wide locals locals' op mem localDecls layouts wide.1 wide.2 hOp
+
+/-- **`evalRvalue_aggregate_rawPtr_slice_roundtrip`** (the brief's named form, stated on
+`WidePtrVal`): decomposing `WidePtrVal.toValue ptrBytes wide` at `loc` via `to_raw_parts`
+(`.field 0` data pointer, `.field 1` length) and reassembling with
+`AggregateKind.rawPtr` on `.slice elemTy` (`ptr::slice_from_raw_parts(_mut)`) is the exact
+identity on the wide pointer, leaving `locals` and `mem` unchanged. -/
+theorem evalRvalue_aggregate_rawPtr_slice_roundtrip (locals : List LocalSlot) (loc : Local)
+    (elemTy : RigidTy) (lIdx : LayoutIdx) (dataTy metaTy : Ty) (mutability : Mutability)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (wide : WidePtrVal)
+    (hSlot : get? locals loc =
+      some (.init (WidePtrVal.toValue (layoutPointerBytes layouts) wide)))
+    (hNoUnion0 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 0 dataTy] } = false)
+    (hNoUnion1 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 1 metaTy] } = false) :
+    evalRvalue locals
+        (.aggregate (.rawPtr { kind := .slice elemTy, layoutIdx := lIdx } mutability)
+          [.copy { local_ := loc, projection := [.field 0 dataTy] },
+           .copy { local_ := loc, projection := [.field 1 metaTy] }])
+        mem localDecls layouts =
+      .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals mem :=
+  evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip locals loc
+    { kind := .slice elemTy, layoutIdx := lIdx } dataTy metaTy mutability mem localDecls layouts
+    wide.1 wide.2 rfl hSlot hNoUnion0 hNoUnion1
+
 /-- Predicate characterizing an unsized slice-like DST `RigidTy` (`.slice elemTy` for element
 byte stride `n`, or `.str` with `n = 1`). -/
 @[reducible]

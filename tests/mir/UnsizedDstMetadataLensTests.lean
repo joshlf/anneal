@@ -65,6 +65,23 @@ theorem widePtr_dataVal_metaVal_symbolic_simp (ptrBytes : Nat) (p : ProvenancePt
    WidePtrVal.metaVal_dropElems ptrBytes (WidePtrVal.mk p len) n k,
    WidePtrVal.toValue_eq_dataVal_metaVal ptrBytes (WidePtrVal.mk p len)⟩
 
+/-- **Symbolic `simp` normal forms on an arbitrary `wide : WidePtrVal`** (no `WidePtrVal.mk`
+constructor is exposed, so no pair pattern / `Prod.casesOn` can fire): the `@[simp]` `.1` / `.2`
+lens lemmas normalize sub-slice data pointers, metadata, provenance, and fat-pointer values by
+`simp only`. -/
+theorem widePtr_symbolic_simp_on_arbitrary_wide (ptrBytes n k : Nat) (wide : WidePtrVal) :
+    WidePtrVal.dataVal ptrBytes (WidePtrVal.takeElems wide k) = .ptr wide.1 ptrBytes ∧
+    WidePtrVal.metaVal ptrBytes (WidePtrVal.takeElems wide k) = .scalar ⟨k, ptrBytes⟩ ∧
+    WidePtrVal.dataVal ptrBytes (WidePtrVal.dropElems wide n k) =
+      .ptr (WidePtrVal.elemPtr wide n k) ptrBytes ∧
+    WidePtrVal.metaVal ptrBytes (WidePtrVal.dropElems wide n k) =
+      .scalar ⟨wide.2 - k, ptrBytes⟩ ∧
+    (WidePtrVal.dropElems wide n k).1.allocId = wide.1.allocId ∧
+    (WidePtrVal.takeElems wide k).1 = wide.1 ∧
+    WidePtrVal.toValue ptrBytes wide =
+      .aggregate 0 [WidePtrVal.dataVal ptrBytes wide, WidePtrVal.metaVal ptrBytes wide] := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> simp
+
 /-! ## 2. Concrete layouts, allocations, and `[u32]` / `str` / empty / ZST `UnsizedSliceDstAt` views -/
 
 def u32Layout : TypeLayout :=
@@ -270,6 +287,21 @@ theorem ptrMetadata_wide_and_thin_witnesses :
    (PtrMetadataOf.thin p9).evalRvalue_ptrMetadata (layouts := layouts64) rfl,
    evalRvalue_unaryOp_ptrMetadata_thin (dstLocals 4) (dstLocals 4)
      (.copy { local_ := 5, projection := [] }) mem0 dstDecls layouts32 p9 rfl⟩
+
+/-- The brief's named forms `evalRvalue_unaryOp_ptrMetadata_slice` and
+`evalRvalue_aggregate_rawPtr_slice_roundtrip` on `*mut [u32]` (`_2`). -/
+theorem brief_named_slice_metadata_and_roundtrip :
+    evalRvalue (dstLocals 8) (.unaryOp .ptrMetadata (.copy { local_ := 2, projection := [] }))
+        mem0 dstDecls layouts64 = .ok (.scalar ⟨4, 8⟩) (dstLocals 8) mem0 ∧
+    evalRvalue (dstLocals 8)
+        (.aggregate (.rawPtr sliceU32Ty .mut)
+          [.copy { local_ := 2, projection := [.field 0 ptrU32Ty] },
+           .copy { local_ := 2, projection := [.field 1 usizeTy] }])
+        mem0 dstDecls layouts64 = .ok (WidePtrVal.toValue 8 wide4) (dstLocals 8) mem0 :=
+  ⟨evalRvalue_unaryOp_ptrMetadata_slice _ _ (.copy { local_ := 2, projection := [] }) mem0
+      dstDecls layouts64 wide4 rfl,
+    evalRvalue_aggregate_rawPtr_slice_roundtrip _ 2 (.uint .u32) 0 ptrU32Ty usizeTy .mut mem0
+      dstDecls layouts64 wide4 rfl rfl rfl⟩
 
 /-- `AggregateKind.rawPtr` (`from_raw_parts`) on `[u32]`, `str`, and thin `u32`, plus
 `to_raw_parts` round-trip preserving `UnsizedSliceDstAt`, `ActiveTypedSliceBorrow`, and
@@ -509,6 +541,21 @@ theorem size_and_align_positive_witnesses :
       { frame := { blockIdx := 0, stmtIdx := 0,
                    locals := [.uninit, .init (WidePtrVal.toValue 8 wideZst1000), .uninit, .uninit] }
         memory := mem0 }
+    let sEmpty_1 : MachineState :=
+      { frame := { blockIdx := 1, stmtIdx := 0,
+                   locals := [.uninit, .init (WidePtrVal.toValue 8 wideEmpty),
+                              .init (.scalar ⟨0, 8⟩), .uninit] }
+        memory := mem0 }
+    let sZst_1 : MachineState :=
+      { frame := { blockIdx := 1, stmtIdx := 0,
+                   locals := [.uninit, .init (WidePtrVal.toValue 8 wideZst1000),
+                              .init (.scalar ⟨0, 8⟩), .uninit] }
+        memory := mem0 }
+    let sZst_2 : MachineState :=
+      { frame := { blockIdx := 2, stmtIdx := 0,
+                   locals := [.uninit, .init (WidePtrVal.toValue 8 wideZst1000),
+                              .init (.scalar ⟨0, 8⟩), .init (.scalar ⟨1, 8⟩)] }
+        memory := mem0 }
     evalSliceSizeOfVal 0 ⟨1000, 8⟩ = some ⟨0, 8⟩ ∧
     evalSliceSizeOfVal 4 ⟨0, 8⟩ = some ⟨0, 8⟩ ∧
     (PureMirExec.mirStep bodyU32 sU32_0 = .cont sU32_1 ∧
@@ -523,8 +570,9 @@ theorem size_and_align_positive_witnesses :
        (WidePtrVal.mk ⟨77, 0⟩ 4) xs4 (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4)) ∧
     PureMirExec.mirStep bodyStr sStr_0 = .cont sStr_1 ∧
     PureMirExec.mirStep bodyStr sStr_1 = .cont sStr_2 ∧
-    (∃ sEmpty_1, PureMirExec.mirStep bodyU32 sEmpty_0 = .cont sEmpty_1) ∧
-    (∃ sZst_1, PureMirExec.mirStep bodyZst sZst_0 = .cont sZst_1) ∧
+    PureMirExec.mirStep bodyU32 sEmpty_0 = .cont sEmpty_1 ∧
+    PureMirExec.mirStep bodyZst sZst_0 = .cont sZst_1 ∧
+    PureMirExec.mirStep bodyZst sZst_1 = .cont sZst_2 ∧
     evalNonSelectIntrinsicCall .sizeOfVal sStr_0
       { defPath := "core::intrinsics::size_of_val", typeArgs := [.uint .u32],
         fnSig := none, isIndirect := false }
@@ -540,6 +588,7 @@ theorem size_and_align_positive_witnesses :
       writeIntrinsicReturn sStr_0 sStr_0.frame.locals { local_ := 3, projection := [] } 1
         (.scalar ⟨4, 8⟩) := by
   intro bodyU32 bodyZst bodyStr sU32_0 sU32_1 sU32_2 sStr_0 sStr_1 sStr_2 sEmpty_0 sZst_0
+    sEmpty_1 sZst_1 sZst_2
   have hDisj2 : ∀ e ∈ sU32_0.memory.borrows, e.targetLocal ≠ 2 := by
     intro e he
     cases he with
@@ -594,20 +643,29 @@ theorem size_and_align_positive_witnesses :
       (by decide) rfl rfl rfl
   obtain ⟨_, hMirEmpty, _, _, _⟩ :=
     evalIntrinsic_sizeOfValRaw_slice (body := bodyU32) (cur := bodyU32) (s := sEmpty_0)
+      (locals' := sEmpty_0.frame.locals) (updatedLocals := sEmpty_1.frame.locals)
       empty_and_zst_unsizedDst_witnesses.1
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
-  obtain ⟨_, hMirZst, _, _, _⟩ :=
-    evalIntrinsic_sizeOfValRaw_slice (body := bodyZst) (cur := bodyZst) (s := sZst_0)
-      empty_and_zst_unsizedDst_witnesses.2.2
+  obtain ⟨_, hMirZst, _, _⟩ :=
+    mirStep_call_sizeOfVal_slice (body := bodyZst) (cur := bodyZst) (s := sZst_0)
+      (p := p9) (len := 1000) (locals' := sZst_0.frame.locals)
+      (updatedLocals := sZst_1.frame.locals)
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
+  -- ZST `align_of_val::<[()]>` (`operandTy` fallback) writes `1`.
+  obtain ⟨_, hMirZstAl, _, _, _⟩ :=
+    evalIntrinsic_alignOfValRaw_slice (body := bodyZst) (cur := bodyZst) (s := sZst_1)
+      (alignBytes := 1) (locals' := sZst_1.frame.locals) (updatedLocals := sZst_2.frame.locals)
+      empty_and_zst_unsizedDst_witnesses.2.2
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
   exact ⟨evalSliceSizeOfVal_zst 1000,
     evalSliceSizeOfVal_empty 4,
     ⟨hStep1, hMut1, hSh1⟩,
     ⟨hStep2, hMut2, hSh2⟩,
     hMirStr_1,
     hMirStr_2,
-    ⟨_, hMirEmpty⟩,
-    ⟨_, hMirZst⟩,
+    hMirEmpty,
+    hMirZst,
+    hMirZstAl,
     evalNonSelectIntrinsicCall_sizeOfVal_sized sStr_0 _ bodyU32.localDecls bodyU32.layouts []
       sStr_0.frame.locals { local_ := 2, projection := [] } 1 (.uint .u32) 4 p9
       rfl rfl rfl rfl (by decide),
@@ -1706,6 +1764,42 @@ theorem str_size_align_preserving_spatialPin :
     (lookupBorrow_targetLocal_ne_of_forall_mem (by decide) _)
   exact ⟨_, _, hS1, hPin1, hBind1, hStr1, hS2, hPin2, hBind2, hStr2⟩
 
+/-- Borrow `77` of the backing array `_0` after it has been disabled (e.g. by a conflicting
+foreign write). -/
+def disabledMem : Memory :=
+  { borrows := [{ tag := 77, targetLocal := 0, targetProjection := [], perm := .disabled,
+                  rangeOffset := 0, rangeLen := 16 }] }
+
+def disabledLocals : List LocalSlot :=
+  [.init pinArrVal, .init (WidePtrVal.toValue 8 wide77), .uninit, .uninit]
+
+/-- **Metadata-without-deref under a disabled tag** (the brief's second contrast case): once the
+borrow `77` behind the raw `*const [u32]` `_1` is disabled, the dereferencing `Rvalue.len (*_1)`
+faults `.ub`, while `UnOp.ptrMetadata(_1)` still yields `4` and the live
+`size_of_val::<[u32]>(_1)` step still writes `16`: neither consults the borrow table. -/
+theorem metadata_without_deref_disabled_tag_contrast :
+    let bodyU32 := sizeAlignSliceCallerMir (.uint .u32)
+    let s0 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := disabledLocals }, memory := disabledMem }
+    let s1 : MachineState :=
+      { frame := { blockIdx := 1, stmtIdx := 0,
+                   locals := disabledLocals.set 2 (.init (.scalar ⟨16, 8⟩)) }
+        memory := disabledMem }
+    evalRvalue disabledLocals (.len { local_ := 1, projection := [.deref] }) disabledMem dstDecls
+        layouts64 = .ub ∧
+    evalRvalue disabledLocals (.unaryOp .ptrMetadata (.copy { local_ := 1, projection := [] }))
+        disabledMem dstDecls layouts64 = .ok (.scalar ⟨4, 8⟩) disabledLocals disabledMem ∧
+    PureMirExec.mirStep bodyU32 s0 = .cont s1 := by
+  intro bodyU32 s0 s1
+  obtain ⟨_, hMir, _, _⟩ := mirStep_call_sizeOfVal_slice (body := bodyU32) (cur := bodyU32)
+    (s := s0) (p := ⟨77, 0⟩) (len := 4) (locals' := disabledLocals)
+    (updatedLocals := s1.frame.locals)
+    rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
+  exact ⟨rfl,
+    evalRvalue_unaryOp_ptrMetadata_slice _ _ (.copy { local_ := 1, projection := [] })
+      disabledMem dstDecls layouts64 wide77 rfl,
+    hMir⟩
+
 /-! ## 8. Automated `run_cmd` Axiom & Reachability Audit -/
 
 open Lean Elab Command in
@@ -1740,6 +1834,18 @@ run_cmd do
                   if subAxs.contains a then
                     culprits := sub :: culprits
                 throwError "{n} depends on non-constructive or disallowed axiom {a} via {culprits}"
+            -- Projection discipline (§2.4): no new definition may reach `Prod.casesOn` /
+            -- `Prod.rec` / `Prod.recOn`, directly or through a compiled `match` on pairs.
+            if ci matches .defnInfo _ then
+              let mut toCheck : Array Name := #[n]
+              for c in ci.getUsedConstantsAsSet do
+                if Lean.Meta.isMatcherCore env c then
+                  toCheck := toCheck.push c
+              for d in toCheck do
+                if let some dci := env.find? d then
+                  for bad in [``Prod.casesOn, ``Prod.rec, ``Prod.recOn] do
+                    if dci.getUsedConstantsAsSet.contains bad then
+                      throwError "projection discipline violated: {n} reaches {bad} via {d}"
             count := count + 1
             if ci matches .thmInfo _ then
               theorems := theorems + 1
@@ -1777,6 +1883,6 @@ run_cmd do
   unless unreached.isEmpty do
     throwError "theorems not instantiated by any witness: {unreached.toList}"
   logInfo m!"axiom & reachability audit passed: {audited} declarations ({theorems} module theorems, \
-    all constructive and instantiated by witnesses)"
+    all constructive and instantiated by witnesses; no Prod.casesOn/Prod.rec in new definitions)"
 
 end Anneal.UnsizedDstMetadataLensTests
