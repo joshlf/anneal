@@ -856,10 +856,13 @@ pub fn emit_mir_obligation_fault_sites(body: &ProtoMirBody) -> Vec<FaultSite> {
 
 /// Build the `CalleeClosure` for a multi-item batch (`subject_body` + `callee_bodies`)
 /// given `explicit_external` callees (`#[external_spec]`, `#[spec(trusted)]`,
-/// `called_callees`). When `allow_implicit_external_callees` is `true` (e.g., for
-/// modular `MirCallE` items or `#[spec(trusted)]` subjects), non-inline non-native
-/// callees are also included in `external_callees`; when `false`, only
-/// `explicit_external` are included so any unclosed callee fails closed.
+/// `called_callees`). When `allow_implicit_external_callees` is `true` (only for
+/// subjects whose own body is assumed rather than verified: their own
+/// `#[spec(trusted)]` contract or a UB-exception claim), non-inline non-native
+/// callees are also included in `external_callees` and unresolved indirect calls
+/// are permitted (`CalleeClosure::allow_unresolved_indirect_calls`); when `false`,
+/// only `explicit_external` are included so any unclosed direct, reified, or
+/// indirect callee fails closed.
 pub(crate) fn build_batch_callee_closure(
     subject_body: &ProtoMirBody,
     callee_bodies: &[ProtoMirBody],
@@ -891,24 +894,12 @@ pub(crate) fn build_batch_callee_closure(
                 external_set.insert(callee);
             }
         }
-        if allow_implicit_external_callees
-            && inline_set.is_empty()
-            && external_set.is_empty()
-            && body.basic_blocks.iter().any(|bb| match &bb.terminator.kind {
-                ProtoTerminatorKind::Call { func, .. }
-                | ProtoTerminatorKind::TailCall { func, .. } => {
-                    func.extract_callee_def_path().is_none()
-                }
-                _ => false,
-            })
-        {
-            external_set.insert("__anneal_assumed_indirect_callee".to_string());
-        }
     }
 
     CalleeClosure {
         inline_callees: inline_set.into_iter().collect(),
         external_callees: external_set.into_iter().collect(),
+        allow_unresolved_indirect_calls: allow_implicit_external_callees,
     }
 }
 
@@ -4251,6 +4242,7 @@ mod tests {
             callee_closure: CalleeClosure {
                 inline_callees: vec![callee.to_string()],
                 external_callees: Vec::new(),
+                allow_unresolved_indirect_calls: false,
             },
             reconciliation_verdict: verdict.to_string(),
             is_verified: verdict == "VERIFIED",

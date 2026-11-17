@@ -2444,6 +2444,39 @@ theorem evalRvalue_ub_implies_mem_censusRvalue
     exact ⟨.uninitRead, by simp [censusRvalueFaultClasses, censusPlaceReadFaultClasses]⟩
 
 /--
+`[adv ep1-B2]` Statement-site attribution of right-hand-side faults:
+`StatementKind.assign dst rv` evaluates `rv` first, so whenever `evalRvalue` faults the
+statement steps to `MirStepNode.fail .ub`, and that fault is justified by a class of
+`censusRvalueFaultClasses rv` which `censusStmtFaultClasses (.assign dst rv)` contains.
+Unlike `evalStmt_exposesUb_implies_mem_censusStmt` (which may witness an assign site
+with a destination-write class such as `.storageLiveProtected`), this pins every
+rvalue fault at an assign site to the rvalue's own census entries.
+-/
+theorem evalStmt_assign_rvalue_ub_justified
+    (s : MachineState) (dst : Place) (rv : Rvalue) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUb : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ub) :
+    evalStmt s ⟨.assign dst rv, span⟩ localDecls layouts = MirStepNode.fail .ub ∧
+    ∃ cls : MirFaultClass, cls ∈ censusRvalueFaultClasses rv ∧
+      cls ∈ censusStmtFaultClasses (.assign dst rv) := by
+  refine ⟨?_, ?_⟩
+  · dsimp only [evalStmt]
+    rw [hUb]
+  · rcases evalRvalue_ub_implies_mem_censusRvalue s.frame.locals rv s.memory localDecls
+      layouts hUb with ⟨cls, hCls⟩
+    have hEval : rvalueUnevaluated rv = false := by
+      cases hU : rvalueUnevaluated rv with
+      | false => rfl
+      | true =>
+        rw [evalRvalue_eq_unsupported_of_rvalueUnevaluated s.frame.locals rv s.memory
+          localDecls layouts hU] at hUb
+        nomatch hUb
+    refine ⟨cls, hCls, ?_⟩
+    dsimp only [censusStmtFaultClasses]
+    rw [hEval, mem_dedupFaultClasses_iff]
+    exact List.mem_append_right _ hCls
+
+/--
 `[adv A2]` Exact `.ub` characterization for writing to an unprojected local place
 `writePlaceValue locals borrows { local_ := loc, projection := [] } val`: returns
 `.ub` iff `loc` is out of bounds or `.dead` (succeeding on both `.uninit` and

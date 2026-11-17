@@ -5711,6 +5711,37 @@ end Mir.Demo.caller
             Some(&VerificationStatus::VerifiedUnconditional)
         );
 
+        // Negative test 12 (`[adv ep1-B2]`): an indirect call through a non-constant
+        // `func` operand fails closed even though the batch still declares an inline
+        // callee (`demo::leaf` stays in `defaultCallees`); only the subject's own
+        // trusted contract permits unresolved indirect targets.
+        let indirect_caller = original_caller.replacen(
+            "(Operand.constant { ty := { kind := (RigidTy.fnDef \"demo::leaf\" List.nil), layoutIdx := 0 }, val := ConstValue.zeroSized })",
+            "(Operand.copy { local_ := 1, projection := List.nil })",
+            1,
+        );
+        assert_ne!(indirect_caller, original_caller, "{original_caller}");
+        fs::write(&caller_mir_path, &indirect_caller).expect("write indirect caller.lean");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("indirect call"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", own_trusted.clone()))
+                .status_for("Verify.Demo.caller"),
+            Some(&own_trusted)
+        );
+        fs::write(&caller_mir_path, &original_caller).expect("restore caller.lean");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller"),
+            Some(&VerificationStatus::VerifiedUnconditional)
+        );
+
         // Positive control: `extract_default_callee_suffixes_from_obligations` reads
         // multi-line tables up to the next top-level command and ignores commented-out
         // `def defaultCallees` tables.

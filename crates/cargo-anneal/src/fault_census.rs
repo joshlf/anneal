@@ -4633,6 +4633,16 @@ pub struct CalleeClosure {
     pub inline_callees: Vec<String>,
     /// `DefPath`s of callees modeled as external calls.
     pub external_callees: Vec<String>,
+    /// `[adv ep1-B2]` Permit `Call` / `TailCall` terminators whose `func` is not a
+    /// constant function item. `resolveCallTarget` resolves such calls at run time
+    /// through `s.memory.fnPtrs` (which a stateful precondition or an external
+    /// call's answer memory can populate with arbitrary targets) or through the
+    /// function-item *type* of a local, neither of which this syntactic census
+    /// can bound, so an unresolved indirect call is an unclosed callee. Only items
+    /// whose own body is assumed rather than verified (a subject's own
+    /// `#[spec(trusted)]` contract or a UB-exception claim) set this; it is never
+    /// implied by the presence of unrelated inline or external callees.
+    pub allow_unresolved_indirect_calls: bool,
 }
 
 /// `[adv B3]` Sorted, duplicate-free direct callee `DefPath`s of the `Call` / `TailCall`
@@ -4964,9 +4974,9 @@ pub fn reconcile_multi_item_coverage(
                                 ));
                             }
                         }
-                    } else if inline_set.is_empty() && external.is_empty() {
+                    } else if !closure.allow_unresolved_indirect_calls {
                         unsupported_reasons.push(format!(
-                            "[{}] bb{bb_idx} indirect call has no classified inline or external target in CalleeClosure",
+                            "[{}] bb{bb_idx} indirect call through a non-constant `func` operand has an unresolved target (runtime `fnPtrs` / fn-item-typed local) and CalleeClosure does not permit unresolved indirect calls",
                             item.def_path
                         ));
                     }
@@ -4985,9 +4995,9 @@ pub fn reconcile_multi_item_coverage(
                                 item.def_path
                             ));
                         }
-                    } else if inline_set.is_empty() && external.is_empty() {
+                    } else if !closure.allow_unresolved_indirect_calls {
                         unsupported_reasons.push(format!(
-                            "[{}] bb{bb_idx} indirect diverging call has no classified inline or external target in CalleeClosure",
+                            "[{}] bb{bb_idx} indirect diverging call through a non-constant `func` operand has an unresolved target (runtime `fnPtrs` / fn-item-typed local) and CalleeClosure does not permit unresolved indirect calls",
                             item.def_path
                         ));
                     }
@@ -5002,9 +5012,9 @@ pub fn reconcile_multi_item_coverage(
                                 item.def_path
                             ));
                         }
-                    } else if inline_set.is_empty() && external.is_empty() {
+                    } else if !closure.allow_unresolved_indirect_calls {
                         unsupported_reasons.push(format!(
-                            "[{}] bb{bb_idx} indirect tail call has no classified inline or external target in CalleeClosure",
+                            "[{}] bb{bb_idx} indirect tail call through a non-constant `func` operand has an unresolved target (runtime `fnPtrs` / fn-item-typed local) and CalleeClosure does not permit unresolved indirect calls",
                             item.def_path
                         ));
                     }
@@ -5601,13 +5611,14 @@ impl FaultCensusReceipt {
         };
 
         format!(
-            "{{\n  \"def_path\": \"{}\",\n  \"mir_module_sha256\": \"{}\",\n  \"census_sites\": {},\n  \"discharged_sites\": {},\n  \"callee_closure\": {{\n    \"inline_callees\": {},\n    \"external_callees\": {}\n  }},\n  \"reconciliation_verdict\": \"{}\",\n  \"is_verified\": {},\n  \"reasons\": {}\n}}\n",
+            "{{\n  \"def_path\": \"{}\",\n  \"mir_module_sha256\": \"{}\",\n  \"census_sites\": {},\n  \"discharged_sites\": {},\n  \"callee_closure\": {{\n    \"inline_callees\": {},\n    \"external_callees\": {},\n    \"allow_unresolved_indirect_calls\": {}\n  }},\n  \"reconciliation_verdict\": \"{}\",\n  \"is_verified\": {},\n  \"reasons\": {}\n}}\n",
             json_escape_str(&self.def_path),
             json_escape_str(&self.mir_module_sha256),
             fmt_array(&census_entries, "  "),
             fmt_array(&discharged_entries, "  "),
             fmt_array(&inline_entries, "    "),
             fmt_array(&external_entries, "    "),
+            self.callee_closure.allow_unresolved_indirect_calls,
             json_escape_str(&self.reconciliation_verdict),
             self.is_verified,
             fmt_array(&reason_entries, "  "),
@@ -5639,7 +5650,7 @@ impl FaultCensusReceipt {
                 self.reconciliation_verdict
             ),
             format!(
-                "Callee closure: {} inline ({}), {} external ({})",
+                "Callee closure: {} inline ({}), {} external ({}){}",
                 self.callee_closure.inline_callees.len(),
                 if self.callee_closure.inline_callees.is_empty() {
                     "none".to_string()
@@ -5651,6 +5662,11 @@ impl FaultCensusReceipt {
                     "none".to_string()
                 } else {
                     self.callee_closure.external_callees.join(", ")
+                },
+                if self.callee_closure.allow_unresolved_indirect_calls {
+                    "; unresolved indirect calls permitted (assumed subject)"
+                } else {
+                    ""
                 },
             ),
         ]
@@ -7790,6 +7806,7 @@ end Mir.Probe.item",
         let closure = CalleeClosure {
             inline_callees: vec![callee.def_path.clone()],
             external_callees: Vec::new(),
+            allow_unresolved_indirect_calls: false,
         };
         let item = ItemCoverageInput::from_body;
 
@@ -7887,6 +7904,7 @@ end Mir.Probe.item",
         let contradictory = CalleeClosure {
             inline_callees: vec![callee.def_path.clone()],
             external_callees: vec![callee.def_path.clone()],
+            allow_unresolved_indirect_calls: false,
         };
         assert!(!reconcile_multi_item_coverage(&full_batch, &contradictory, &reg).is_verified());
 
@@ -7909,6 +7927,7 @@ end Mir.Probe.item",
         let external = CalleeClosure {
             inline_callees: Vec::new(),
             external_callees: vec![String::from("proto::callee_u32")],
+            allow_unresolved_indirect_calls: false,
         };
         assert_eq!(
             reconcile_multi_item_coverage(&call_items, &external, &reg),
@@ -8138,6 +8157,7 @@ end Mir.Probe.item",
         let rec_inline = CalleeClosure {
             inline_callees: vec![String::from("proto::rec_self")],
             external_callees: Vec::new(),
+            allow_unresolved_indirect_calls: false,
         };
         assert_eq!(
             reconcile_multi_item_coverage(&[item(recursive_self, rec_census)], &rec_inline, &reg),
@@ -8174,6 +8194,7 @@ end Mir.Probe.item",
         let reified_ext = CalleeClosure {
             inline_callees: Vec::new(),
             external_callees: vec![String::from("proto::hidden_target")],
+            allow_unresolved_indirect_calls: false,
         };
         assert_eq!(
             reconcile_multi_item_coverage(
@@ -8409,6 +8430,7 @@ end Mir.Probe.item",
             &CalleeClosure {
                 inline_callees: Vec::new(),
                 external_callees: vec![String::from("proto::recursive_subject")],
+                allow_unresolved_indirect_calls: false,
             },
             &reg,
         );
@@ -8431,6 +8453,7 @@ end Mir.Probe.item",
             &CalleeClosure {
                 inline_callees: vec![String::from("proto::recursive_subject")],
                 external_callees: Vec::new(),
+                allow_unresolved_indirect_calls: false,
             },
             &reg,
         );
@@ -8540,6 +8563,7 @@ end Mir.Probe.item",
             "theorem evalRvalue_unaryOp_ub_cause",
             "theorem evalRvalue_binaryOp_ub_cause",
             "theorem evalRvalue_ub_implies_mem_censusRvalue",
+            "theorem evalStmt_assign_rvalue_ub_justified",
         ] {
             assert!(
                 LEAN_PROTOTYPE_SRC.contains(decl),
@@ -8593,18 +8617,48 @@ end Mir.Probe.item",
                 "expected indirect call with empty CalleeClosure to fail closed: {indirect_verdict:?}"
             );
             assert_eq!(indirect_verdict.status_code(), "UNKNOWN(UNMAPPED_FAULT_SITE)");
+            // `[adv ep1-B2]`: an unrelated declared callee must NOT legitimize an
+            // indirect call (its run-time target is unbounded), but an assumed
+            // subject's closure (`allow_unresolved_indirect_calls`) does.
             let with_external = CalleeClosure {
                 inline_callees: Vec::new(),
                 external_callees: vec![String::from("proto::ext_fn_ptr_target")],
+                allow_unresolved_indirect_calls: false,
             };
             assert!(
-                reconcile_multi_item_coverage(
-                    &[ItemCoverageInput::from_body(indirect_body, indirect_census)],
+                !reconcile_multi_item_coverage(
+                    &[ItemCoverageInput::from_body(indirect_body.clone(), indirect_census.clone())],
                     &with_external,
                     &PropertyRegistry::all_verified(),
                 )
                 .is_verified()
             );
+            let assumed_closure = CalleeClosure {
+                inline_callees: Vec::new(),
+                external_callees: Vec::new(),
+                allow_unresolved_indirect_calls: true,
+            };
+            assert!(
+                reconcile_multi_item_coverage(
+                    &[ItemCoverageInput::from_body(indirect_body.clone(), indirect_census)],
+                    &assumed_closure,
+                    &PropertyRegistry::all_verified(),
+                )
+                .is_verified()
+            );
+            // `build_batch_callee_closure` only grants the permission to assumed
+            // subjects, and never through a sentinel external callee.
+            let strict = crate::obligations::build_batch_callee_closure(
+                &indirect_body,
+                &[],
+                &[String::from("proto::ext_fn_ptr_target")],
+                false,
+            );
+            assert!(!strict.allow_unresolved_indirect_calls);
+            assert_eq!(strict.external_callees, vec![String::from("proto::ext_fn_ptr_target")]);
+            let assumed = crate::obligations::build_batch_callee_closure(&indirect_body, &[], &[], true);
+            assert!(assumed.allow_unresolved_indirect_calls);
+            assert!(assumed.external_callees.is_empty(), "{assumed:?}");
         }
 
         // `[adv ep1-A1]` Lexer-based `parse_obligations_default_callees` neutralizes
