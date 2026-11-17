@@ -12768,6 +12768,49 @@ def evalSymIdToMirValue (tbl : SymTable) (env : SymEnv) (id : SymId) :
     Trusted.Rustc.V2026_06_01.MirSemantics.Value :=
   .scalar { bits := evalSymId tbl env id, sizeBytes := 8 }
 
+/-- Monotonicity of `evalSymIdToMirValue` under append-only `SymTable.Extends`. -/
+theorem evalSymIdToMirValue_mono {tbl₁ tbl₂ : SymTable}
+    (hValid : ValidTable tbl₁) (hExt : tbl₁.Extends tbl₂)
+    (env : SymEnv) {id : SymId} (hlt : id < tbl₁.nodes.length) :
+    evalSymIdToMirValue tbl₁ env id = evalSymIdToMirValue tbl₂ env id := by
+  dsimp [evalSymIdToMirValue]
+  rw [evalSymId_mono hValid hExt env hlt]
+
+/-- `evalSymIdToMirValue` after `internTree` produces the exact 8-byte `MirSemantics.Value`
+    of `ExprTree.eval`. -/
+theorem evalSymIdToMirValue_internTree (tbl : SymTable) (hValid : ValidTable tbl)
+    (t : ExprTree) (env : SymEnv) :
+    evalSymIdToMirValue (internTree tbl t).2 env (internTree tbl t).1 =
+      .scalar { bits := t.eval env, sizeBytes := 8 } := by
+  dsimp [evalSymIdToMirValue]
+  rw [(internTree_spec t tbl hValid).2.2.2 env]
+
+/-- Universal `u64` range invariant for `evalSymIdToMirValue`: every `SymId` evaluates to a
+    canonical 8-byte `MirSemantics.Value` whose scalar bits are `< word64Modulus`. -/
+theorem evalSymIdToMirValue_lt_word64 (tbl : SymTable) (env : SymEnv) (id : SymId) :
+    ∃ bits : Nat,
+      evalSymIdToMirValue tbl env id = .scalar { bits := bits, sizeBytes := 8 } ∧
+        bits < word64Modulus :=
+  ⟨evalSymId tbl env id, rfl, evalSymId_lt_word64 tbl env id⟩
+
+/-- `evalSymIdToMirValue` after `internNode` agrees with the single-step node evaluation. -/
+theorem evalSymIdToMirValue_internNode {tbl : SymTable} {n : SymNode}
+    (hValid : ValidTable tbl) (hNode : ValidNode tbl.nodes.length n) (env : SymEnv) :
+    evalSymIdToMirValue (internNode tbl n).2 env (internNode tbl n).1 =
+      .scalar { bits := evalSymNodeWith (evalSymId tbl env) env n, sizeBytes := 8 } := by
+  dsimp [evalSymIdToMirValue]
+  rw [internNode_eval hValid hNode env]
+
+/-- `evalSymIdToMirValue` after `internOp2` (including peephole canonicalization) agrees with
+    `evalSymOp2` on the operand `SymId`s. -/
+theorem evalSymIdToMirValue_internOp2 {tbl : SymTable} {op : SymOp2} {a b : SymId}
+    (hValid : ValidTable tbl) (ha : a < tbl.nodes.length) (hb : b < tbl.nodes.length)
+    (env : SymEnv) :
+    evalSymIdToMirValue (internOp2 tbl op a b).2 env (internOp2 tbl op a b).1 =
+      .scalar { bits := evalSymOp2 op (evalSymId tbl env a) (evalSymId tbl env b), sizeBytes := 8 } := by
+  dsimp [evalSymIdToMirValue]
+  rw [internOp2_eval hValid ⟨ha, hb⟩ env]
+
 theorem bridge_coexistence_rfl :
     evalSymIdToMirValue (buildDiamondGvn 4).2 (fun _ => 7) (buildDiamondGvn 4).1 =
       .scalar { bits := (buildDiamondTree 4).eval (fun _ => 7), sizeBytes := 8 } :=
@@ -12933,7 +12976,8 @@ theorem evalSymOp2_mul_eq_evalScalarBinOp
   rw [wrapScalarBits_eq_mod]
 
 /-- Universal `u64` wrapping subtraction bridge: `evalSymOp2 .sub a b` matches
-    `MirSemantics.evalScalarBinOp .sub` for **all** `u64` words `a, b < word64Modulus`. -/
+    `MirSemantics.evalScalarBinOp .sub` for **all** `u64` words `a, b < word64Modulus`
+    (proved without `omega`). -/
 theorem evalSymOp2_sub_eq_evalScalarBinOp
     {a b : Nat} (ha : a < word64Modulus) (hb : b < word64Modulus)
     (locals : List LocalSlot) (mem : Memory) :
@@ -12947,13 +12991,15 @@ theorem evalSymOp2_sub_eq_evalScalarBinOp
     have hLe : b ≤ a := (nat_ble_eq_true_iff b a).1 hBle
     rw [wrapScalarBits_eq_mod]
     congr 2
-    have hSubLt : a - b < 18446744073709551616 := by omega
-    have hAddEq : a + (18446744073709551616 - b) = (a - b) + 18446744073709551616 := by omega
+    have hSubLt : a - b < 18446744073709551616 := Nat.lt_of_le_of_lt (Nat.sub_le a b) ha
+    have hAddEq : a + (18446744073709551616 - b) = (a - b) + 18446744073709551616 := by
+      rw [← Nat.add_sub_assoc (Nat.le_of_lt hb), Nat.sub_add_comm hLe]
     rw [hAddEq, Nat.add_mod_right, Nat.mod_eq_of_lt hSubLt]
   | false =>
     dsimp only
     rw [wrapScalarBits_of_lt ha, wrapScalarBits_of_lt hb, wrapScalarBits_eq_mod]
-    have hEq : 18446744073709551616 + a - b = a + (18446744073709551616 - b) := by omega
+    have hEq : 18446744073709551616 + a - b = a + (18446744073709551616 - b) := by
+      rw [Nat.add_comm 18446744073709551616 a, Nat.add_sub_assoc (Nat.le_of_lt hb)]
     rw [hEq]
 
 /-- Universal `u64` equality comparison bridge: `evalSymOp2 .eq a b` matches
@@ -13164,6 +13210,232 @@ theorem evalSymOp2_bitXor_eq_evalScalarBinOp
   show RvalueEvalResult.ok (.scalar ⟨bitwiseXorBits (Nat.mul 8 8) a b, 8⟩) locals mem = _
   rw [bitwiseXorBits_eq]
   rfl
+
+/-- `k`-bit all-ones mask (`2 ^ k - 1`), defined structurally so `testBit`, low-masking, and
+    bitwise-complement identities can be proved by elementary bit recursion without
+    `Classical.choice` (`Nat.testBit_two_pow_sub_succ` in Lean core depends on `Classical.choice`). -/
+def onesBits : Nat → Nat
+  | 0 => 0
+  | k + 1 => 1 + 2 * onesBits k
+
+theorem testBit_onesBits : ∀ (k i : Nat), (onesBits k).testBit i = decide (i < k)
+  | 0, i => by
+    show (0 : Nat).testBit i = _
+    rw [Nat.zero_testBit]
+    rfl
+  | k + 1, 0 => by
+    refine (testBit_bitStep_zero (by decide : 1 < 2)).trans ?_
+    rfl
+  | k + 1, j + 1 => by
+    refine (testBit_bitStep_succ (by decide : 1 < 2) j).trans ?_
+    rw [testBit_onesBits k j, decide_succ_lt_succ]
+
+theorem and_onesBits_eq_mod (k a : Nat) : (a &&& onesBits k) = a % 2 ^ k := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [Nat.testBit_and, testBit_onesBits, Nat.testBit_mod_two_pow, Bool.and_comm]
+
+/-- `k`-bit bitwise complement of `a`, defined by the same bit-step recursion as `bitwiseXorBits`. -/
+def bitwiseComplementBits : Nat → Nat → Nat
+  | 0, _ => 0
+  | k + 1, a => (1 - a % 2) + 2 * bitwiseComplementBits k (a / 2)
+
+theorem testBit_bitwiseComplementBits :
+    ∀ (k a i : Nat),
+      (bitwiseComplementBits k a).testBit i = (decide (i < k) && !a.testBit i)
+  | 0, a, i => by
+    show (0 : Nat).testBit i = _
+    rw [Nat.zero_testBit]
+    rfl
+  | k + 1, a, 0 => by
+    have hb : 1 - a % 2 < 2 := Nat.lt_of_le_of_lt (Nat.sub_le 1 (a % 2)) (by decide)
+    refine (testBit_bitStep_zero hb).trans ?_
+    rw [Nat.testBit_zero a]
+    rcases Nat.mod_two_eq_zero_or_one a with ha | ha <;> simp [ha]
+  | k + 1, a, j + 1 => by
+    have hb : 1 - a % 2 < 2 := Nat.lt_of_le_of_lt (Nat.sub_le 1 (a % 2)) (by decide)
+    refine (testBit_bitStep_succ hb j).trans ?_
+    rw [testBit_bitwiseComplementBits k (a / 2) j, Nat.testBit_succ a j, decide_succ_lt_succ]
+
+theorem bitwiseComplementBits_eq_xor_onesBits (k a : Nat) :
+    bitwiseComplementBits k a = (a ^^^ onesBits k) % 2 ^ k := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [testBit_bitwiseComplementBits, Nat.testBit_mod_two_pow, Nat.testBit_xor, testBit_onesBits]
+  cases decide (i < k) <;> cases a.testBit i <;> rfl
+
+private theorem bitStep_add_compl (r c q : Nat) (hr : r = 0 ∨ r = 1) :
+    ((1 - r) + 2 * c) + (r + 2 * q) = 1 + 2 * (c + q) := by
+  rcases hr with rfl | rfl
+  · show (1 + 2 * c) + (0 + 2 * q) = 1 + 2 * (c + q)
+    rw [Nat.zero_add, Nat.add_assoc, ← Nat.left_distrib]
+  · show (0 + 2 * c) + (1 + 2 * q) = 1 + 2 * (c + q)
+    rw [Nat.zero_add, ← Nat.add_assoc, Nat.add_comm (2 * c) 1, Nat.add_assoc, ← Nat.left_distrib]
+
+theorem bitwiseComplementBits_add_eq_onesBits :
+    ∀ (k a : Nat), a < 2 ^ k → bitwiseComplementBits k a + a = onesBits k
+  | 0, a, ha => by
+    match a, ha with
+    | 0, _ => rfl
+  | k + 1, a, ha => by
+    have hDivLt : a / 2 < 2 ^ k :=
+      (Nat.div_lt_iff_lt_mul (by decide : 0 < 2)).2 (by rw [← Nat.pow_succ]; exact ha)
+    have ih := bitwiseComplementBits_add_eq_onesBits k (a / 2) hDivLt
+    have hDecomp : a % 2 + 2 * (a / 2) = a := by
+      rw [Nat.add_comm]
+      exact Nat.div_add_mod a 2
+    show ((1 - a % 2) + 2 * bitwiseComplementBits k (a / 2)) + a = 1 + 2 * onesBits k
+    conv => lhs; rhs; rw [← hDecomp]
+    rw [bitStep_add_compl (a % 2) (bitwiseComplementBits k (a / 2)) (a / 2)
+      (Nat.mod_two_eq_zero_or_one a), ih]
+
+/-- Constructive (`Classical.choice`-free) equivalence between `(2 ^ k - 1) - a` and
+    `(a ^^^ (2 ^ k - 1)) % 2 ^ k` for all `a < 2 ^ k`. -/
+theorem onesBits_sub_eq_xor {k a : Nat} (ha : a < 2 ^ k) :
+    onesBits k - a = (a ^^^ onesBits k) % 2 ^ k := by
+  have hSub : onesBits k - a = bitwiseComplementBits k a := by
+    rw [← bitwiseComplementBits_add_eq_onesBits k a ha, Nat.add_sub_cancel]
+  rw [hSub, bitwiseComplementBits_eq_xor_onesBits]
+
+/-- Equivalence between `evalSymOp2 .sub (2^64 - 1) a` (`u64::MAX.wrapping_sub(a)`) and
+    `evalSymOp1 (.xorConst (2^64 - 1)) a` (`a ^ u64::MAX`) for all `a < word64Modulus`
+    (proved without `Classical.choice`). -/
+theorem evalSymOp2_sub_max_eq_xorConst_max {a : Nat} (ha : a < word64Modulus) :
+    evalSymOp2 .sub 18446744073709551615 a = evalSymOp1 (.xorConst 18446744073709551615) a := by
+  have ha' : a < 18446744073709551616 := ha
+  have hle : a ≤ 18446744073709551615 := Nat.le_of_lt_succ ha'
+  have hLt : 18446744073709551615 - a < 18446744073709551616 :=
+    Nat.lt_of_le_of_lt (Nat.sub_le _ _) (by decide)
+  have hSub : evalSymOp2 .sub 18446744073709551615 a = 18446744073709551615 - a := by
+    show (18446744073709551615 + (18446744073709551616 - a % 18446744073709551616)) %
+        18446744073709551616 = _
+    rw [Nat.mod_eq_of_lt ha', ← Nat.add_sub_assoc (Nat.le_of_lt ha'),
+      Nat.sub_add_comm hle, Nat.add_mod_right, Nat.mod_eq_of_lt hLt]
+  rw [hSub]
+  exact onesBits_sub_eq_xor (k := 64) ha
+
+/-- **Universal typed-`u64` `UnOp::Not` ↔ `xorConst (2^64 - 1)` bridge
+    (`evalUnaryNot_u64_eq_xorConst_max`)**: on **every** `u64` word `a < word64Modulus`,
+    trusted `MirSemantics.evalUnaryNot` on `u64` equals `evalSymOp1 (.xorConst (2^64 - 1)) a`
+    (proved without `Classical.choice`). -/
+theorem evalUnaryNot_u64_eq_xorConst_max {a : Nat} (ha : a < word64Modulus)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalUnaryNot ⟨a, 8⟩ (some bridgeU64Ty) locals mem =
+      .ok (.scalar ⟨evalSymOp1 (.xorConst 18446744073709551615) a, 8⟩) locals mem := by
+  rw [evalUnaryNot_u64_eq_wrappingSubMax ha, evalSymOp2_sub_max_eq_xorConst_max ha]
+
+/-- Universal typed-`u8` `UnOp::Not` bridge (`evalUnaryNot_u8_eq_xor_255`): on every `u8` byte
+    `a < 256`, trusted `MirSemantics.evalUnaryNot` on `u8` computes `(a ^^^ 255) % 256` (`1` byte),
+    which disagrees with `boolNot 0 = 1` on `a = 0`. -/
+theorem evalUnaryNot_u8_eq_xor_255 {a : Nat} (ha : a < 256)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalUnaryNot ⟨a, 1⟩ (some bridgeU8Ty) locals mem =
+      .ok (.scalar ⟨(a ^^^ 255) % 256, 1⟩) locals mem := by
+  have hSubXor : 255 - a = (a ^^^ 255) % 256 := onesBits_sub_eq_xor (k := 8) ha
+  show RvalueEvalResult.ok (.scalar ⟨Nat.sub 255 (wrapScalarBits a 256), 1⟩) locals mem = _
+  rw [wrapScalarBits_of_lt ha]
+  change RvalueEvalResult.ok (.scalar ⟨255 - a, 1⟩) locals mem = _
+  rw [hSubXor]
+
+/-- Universal `SymOp1.id` bridge: `wrapScalarBits a (scalarModulus 8)` equals `evalSymOp1 .id a`
+    for **all** `a < word64Modulus`. -/
+theorem evalSymOp1_id_eq_wrapScalarBits {a : Nat} (ha : a < word64Modulus) :
+    wrapScalarBits a (scalarModulus 8) = evalSymOp1 .id a := by
+  have ha' : a < 18446744073709551616 := ha
+  show wrapScalarBits a 18446744073709551616 = a
+  exact wrapScalarBits_of_lt ha'
+
+/-- Universal `SymOp1.boolNot` bridge: `evalScalarBinOp .eq ⟨a, 8⟩ ⟨0, 8⟩` produces
+    `evalSymOp1 .boolNot a` (`1`-byte `bool`) for **all** `a : Nat`. -/
+theorem evalSymOp1_boolNot_eq_evalScalarBinOp
+    (a : Nat) (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .eq ⟨a, 8⟩ ⟨0, 8⟩ locals mem false =
+      .ok (.scalar ⟨evalSymOp1 .boolNot a, 1⟩) locals mem :=
+  evalSymOp2_eq_eq_evalScalarBinOp a 0 locals mem
+
+/-- Universal `SymOp1.wrappingNeg64` bridge: `evalScalarBinOp .sub ⟨0, 8⟩ ⟨a, 8⟩` produces
+    `evalSymOp1 .wrappingNeg64 a` (`8`-byte `u64`) for **all** `a < word64Modulus`. -/
+theorem evalSymOp1_wrappingNeg64_eq_evalScalarBinOp
+    {a : Nat} (ha : a < word64Modulus) (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .sub ⟨0, 8⟩ ⟨a, 8⟩ locals mem false =
+      .ok (.scalar ⟨evalSymOp1 .wrappingNeg64 a, 8⟩) locals mem := by
+  have h0 : (0 : Nat) < word64Modulus := by decide
+  have hSub := evalSymOp2_sub_eq_evalScalarBinOp h0 ha locals mem
+  have hEq : evalSymOp2 .sub 0 a = evalSymOp1 .wrappingNeg64 a := by
+    dsimp [evalSymOp2, evalSymOp1, wrap64]
+    rw [Nat.zero_add]
+  rw [hEq] at hSub
+  exact hSub
+
+/-- Universal `SymOp1.maskLow32` bridge: `evalScalarBinOp .bitAnd ⟨a, 8⟩ ⟨0xFFFFFFFF, 8⟩` produces
+    `evalSymOp1 .maskLow32 a` (`a % 2^32`, `8` bytes) for **all** `a : Nat` (closing the sampled-only
+    gap for `maskLow32` without `Classical.choice`). -/
+theorem evalSymOp1_maskLow32_eq_evalScalarBinOp
+    (a : Nat) (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .bitAnd ⟨a, 8⟩ ⟨0xFFFFFFFF, 8⟩ locals mem false =
+      .ok (.scalar ⟨evalSymOp1 .maskLow32 a, 8⟩) locals mem := by
+  rw [evalSymOp2_bitAnd_eq_evalScalarBinOp]
+  have hMask : (a &&& 0xFFFFFFFF) % 18446744073709551616 = a % 4294967296 := by
+    change (a &&& onesBits 32) % 2 ^ 64 = a % 2 ^ 32
+    rw [and_onesBits_eq_mod 32 a]
+    exact Nat.mod_eq_of_lt (Nat.lt_trans (Nat.mod_lt a (by decide)) (by decide))
+  dsimp [evalSymOp2, evalSymOp1, wrap64, word64Modulus]
+  rw [hMask]
+
+/-- Universal `SymOp1.xorConst` bridge: `evalScalarBinOp .bitXor ⟨a, 8⟩ ⟨wrap64 b, 8⟩` produces
+    `evalSymOp1 (.xorConst b) a` for **all** `a b : Nat`. -/
+theorem evalSymOp1_xorConst_eq_evalScalarBinOp
+    (a b : Nat) (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .bitXor ⟨a, 8⟩ ⟨wrap64 b, 8⟩ locals mem false =
+      .ok (.scalar ⟨evalSymOp1 (.xorConst b) a, 8⟩) locals mem := by
+  rw [evalSymOp2_bitXor_eq_evalScalarBinOp]
+  have hXor : (a ^^^ (b % 2 ^ 64)) % 2 ^ 64 = (a ^^^ b) % 2 ^ 64 := by
+    apply Nat.eq_of_testBit_eq
+    intro i
+    rw [Nat.testBit_mod_two_pow, Nat.testBit_xor, Nat.testBit_mod_two_pow,
+      Nat.testBit_mod_two_pow, Nat.testBit_xor]
+    cases decide (i < 64) <;> cases a.testBit i <;> cases b.testBit i <;> rfl
+  dsimp [evalSymOp2, evalSymOp1, wrap64, word64Modulus]
+  exact congrArg (fun v => RvalueEvalResult.ok (.scalar ⟨v, 8⟩) locals mem) hXor
+
+/-- Universal `SymOp1.addConst` bridge: `evalScalarBinOp .add ⟨a, 8⟩ ⟨wrap64 b, 8⟩` produces
+    `evalSymOp1 (.addConst b) a` for **all** `a b : Nat`. -/
+theorem evalSymOp1_addConst_eq_evalScalarBinOp
+    (a b : Nat) (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .add ⟨a, 8⟩ ⟨wrap64 b, 8⟩ locals mem false =
+      .ok (.scalar ⟨evalSymOp1 (.addConst b) a, 8⟩) locals mem := by
+  rw [evalSymOp2_add_eq_evalScalarBinOp]
+  dsimp [evalSymOp2, evalSymOp1, wrap64, word64Modulus]
+  rw [Nat.add_mod_mod]
+
+/-- **Universal `SymOp1` unary operator bridge (`bridge_symOp1_semantics_agree_universal`)**:
+    for **every** `u64` word `a < word64Modulus` and constant `b : Nat`, all 6 `SymOp1` unary
+    operators (`id`, `boolNot`, `wrappingNeg64`, `maskLow32`, `xorConst`, `addConst`) agree with
+    their trusted `MirSemantics` encodings, and `xorConst (2^64 - 1)` agrees with typed `u64`
+    `MirSemantics.evalUnaryNot`. -/
+theorem bridge_symOp1_semantics_agree_universal
+    {a : Nat} (ha : a < word64Modulus) (b : Nat)
+    (locals : List LocalSlot) (mem : Memory) :
+    wrapScalarBits a (scalarModulus 8) = evalSymOp1 .id a ∧
+      evalScalarBinOp .eq ⟨a, 8⟩ ⟨0, 8⟩ locals mem false =
+        .ok (.scalar ⟨evalSymOp1 .boolNot a, 1⟩) locals mem ∧
+      evalScalarBinOp .sub ⟨0, 8⟩ ⟨a, 8⟩ locals mem false =
+        .ok (.scalar ⟨evalSymOp1 .wrappingNeg64 a, 8⟩) locals mem ∧
+      evalScalarBinOp .bitAnd ⟨a, 8⟩ ⟨0xFFFFFFFF, 8⟩ locals mem false =
+        .ok (.scalar ⟨evalSymOp1 .maskLow32 a, 8⟩) locals mem ∧
+      evalScalarBinOp .bitXor ⟨a, 8⟩ ⟨wrap64 b, 8⟩ locals mem false =
+        .ok (.scalar ⟨evalSymOp1 (.xorConst b) a, 8⟩) locals mem ∧
+      evalScalarBinOp .add ⟨a, 8⟩ ⟨wrap64 b, 8⟩ locals mem false =
+        .ok (.scalar ⟨evalSymOp1 (.addConst b) a, 8⟩) locals mem ∧
+      evalUnaryNot ⟨a, 8⟩ (some bridgeU64Ty) locals mem =
+        .ok (.scalar ⟨evalSymOp1 (.xorConst 18446744073709551615) a, 8⟩) locals mem :=
+  ⟨evalSymOp1_id_eq_wrapScalarBits ha,
+   evalSymOp1_boolNot_eq_evalScalarBinOp a locals mem,
+   evalSymOp1_wrappingNeg64_eq_evalScalarBinOp ha locals mem,
+   evalSymOp1_maskLow32_eq_evalScalarBinOp a locals mem,
+   evalSymOp1_xorConst_eq_evalScalarBinOp a b locals mem,
+   evalSymOp1_addConst_eq_evalScalarBinOp a b locals mem,
+   evalUnaryNot_u64_eq_xorConst_max ha locals mem⟩
 
 /-- **Universal `u64` operator bridge (`bridge_u64_semantics_agree_universal`)**: for **every** pair
     of `u64` words `a, b` (the canonical-range hypotheses are needed only by `sub`), all 11 `SymOp2`
@@ -13396,16 +13668,26 @@ theorem dwlp_of_wpMirUntilJoinSym
     **untrusted** per-slot hint `differs` (the production-semantics analogue of `JoinHints`):
     - `differs = false`: the arms are expected to agree on this slot, which is kept **verbatim** from
       the `then` arm (no `ite`, so the join continuation sees exactly the shared value);
-    - `differs = true`: both arms are expected to hold initialized scalars of the same width, and the
-      merged slot pushes `if cond` **inside** `ScalarInt.bits`, so `evalOperand` / `evalRvalue` in the
-      join block see a single `.init (.scalar ⟨_, sz⟩)` constructor and never re-split on `cond`.
+    - `differs = true`:
+      1. when both arms hold initialized scalars of the same width (`Nat.beq scT.sizeBytes scF.sizeBytes`),
+         the merged slot pushes `if cond` **inside** `ScalarInt.bits`, so `evalOperand` / `evalRvalue` in
+         the join block see a single `.init (.scalar ⟨_, sz⟩)` constructor and never re-split on `cond`;
+      2. when the arms differ in slot kind or width (e.g., a branch-local scratch temporary `_3` left
+         `.init` or `.uninit` in one arm and `.dead` in the other), the merged slot places
+         `if cond then sT else sF` at that slot index — allowing a join block that either never reads
+         the dead scratch slot or cleans it up via `StorageDead`/`StorageLive` to step once by `rfl`,
+         while still faulting if the join block attempts to read a dead/uninitialized scratch slot!
     The hint is never trusted: `mergeMirJoinState_eq_ite` only fires under `MirArmsAgree`, and the
     join cut (`evalJoinDiamondWP`) independently checks that each arm reaches the merged state. -/
 def mergeMirScalarSlot (cond differs : Bool) (sT sF : LocalSlot) : LocalSlot :=
   match differs, sT, sF with
+  | false, _, _ => sT
   | true, .init (.scalar scT), .init (.scalar scF) =>
-    .init (.scalar { bits := if cond then scT.bits else scF.bits, sizeBytes := scT.sizeBytes })
-  | _, _, _ => sT
+    if Nat.beq scT.sizeBytes scF.sizeBytes then
+      .init (.scalar { bits := if cond then scT.bits else scF.bits, sizeBytes := scT.sizeBytes })
+    else
+      if cond then sT else sF
+  | true, _, _ => if cond then sT else sF
 
 /-- Pointwise hint-driven merge of two `List LocalSlot` local stores; slots beyond the hint list
     are kept verbatim from the `then` arm. -/
@@ -13427,12 +13709,12 @@ def mergeMirJoinState (cond : Bool) (differs : List Bool) (sT sF : MachineState)
     memory := sT.memory }
 
 /-- Per-slot arm agreement demanded by the `differs` hint: equal slots when `differs = false`,
-    equal-width initialized scalars when `differs = true`. -/
+    unrestricted when `differs = true` (equal-width scalars fold `if cond` into `ScalarInt.bits`;
+    diverging dead/scratch slots fold `if cond` into that single `LocalSlot`). -/
 def MirArmSlotAgree (differs : Bool) (sT sF : LocalSlot) : Prop :=
   match differs with
   | false => sT = sF
-  | true => ∃ scT scF : ScalarInt,
-      sT = .init (.scalar scT) ∧ sF = .init (.scalar scF) ∧ scT.sizeBytes = scF.sizeBytes
+  | true => True
 
 /-- Pointwise `MirArmSlotAgree`; slots beyond the hint list must be equal. -/
 def MirArmSlotsAgree : List Bool → List LocalSlot → List LocalSlot → Prop
@@ -13440,7 +13722,7 @@ def MirArmSlotsAgree : List Bool → List LocalSlot → List LocalSlot → Prop
   | _, lT, lF => lT = lF
 
 /-- The two arm states agree on the control point, on the whole `Memory`, and on every local
-    outside the hinted `differs` slots (which must be equal-width initialized scalars). -/
+    outside the hinted `differs` slots. -/
 structure MirArmsAgree (differs : List Bool) (sT sF : MachineState) : Prop where
   blockIdx : sT.frame.blockIdx = sF.frame.blockIdx
   stmtIdx : sT.frame.stmtIdx = sF.frame.stmtIdx
@@ -13453,25 +13735,49 @@ theorem mergeMirScalarSlot_true (d : Bool) (sT sF : LocalSlot) :
   | false => rfl
   | true =>
     cases sT with
+    | dead => rfl
+    | uninit => rfl
     | init vT =>
       cases vT with
       | scalar scT =>
         cases sF with
-        | init vF => cases vF <;> rfl
-        | _ => rfl
+        | dead => rfl
+        | uninit => rfl
+        | init vF =>
+          cases vF with
+          | scalar scF =>
+            dsimp [mergeMirScalarSlot]
+            cases Nat.beq scT.sizeBytes scF.sizeBytes <;> rfl
+          | _ => rfl
       | _ => rfl
-    | _ => rfl
 
 theorem mergeMirScalarSlot_false {d : Bool} {sT sF : LocalSlot} (h : MirArmSlotAgree d sT sF) :
     mergeMirScalarSlot false d sT sF = sF := by
   cases d with
   | false => exact h
   | true =>
-    rcases h with ⟨scT, scF, rfl, rfl, hSz⟩
-    rcases scF with ⟨bitsF, szF⟩
-    dsimp only at hSz
-    subst hSz
-    rfl
+    cases sT with
+    | dead => rfl
+    | uninit => rfl
+    | init vT =>
+      cases vT with
+      | scalar scT =>
+        cases sF with
+        | dead => rfl
+        | uninit => rfl
+        | init vF =>
+          cases vF with
+          | scalar scF =>
+            dsimp [mergeMirScalarSlot]
+            cases hSz : Nat.beq scT.sizeBytes scF.sizeBytes with
+            | false => rfl
+            | true =>
+              rcases scF with ⟨bitsF, szF⟩
+              have hEq : scT.sizeBytes = szF := (nat_beq_eq_true_iff _ _).1 hSz
+              rw [hEq]
+              rfl
+          | _ => rfl
+      | _ => rfl
 
 theorem mergeMirScalarSlot_self (cond d : Bool) (s : LocalSlot) :
     mergeMirScalarSlot cond d s s = s := by
@@ -13479,10 +13785,7 @@ theorem mergeMirScalarSlot_self (cond d : Bool) (s : LocalSlot) :
   | false =>
     cases d with
     | false => rfl
-    | true =>
-      cases s with
-      | init v => cases v <;> rfl
-      | _ => rfl
+    | true => exact mergeMirScalarSlot_false (d := true) trivial
   | true => exact mergeMirScalarSlot_true d s s
 
 theorem mergeMirLocalSlots_true :
@@ -13615,11 +13918,13 @@ theorem wpMirJoinDiamond_dwlp_sound
     reaches the join entry in the state-level `if cond then sT else sF` (each `SwitchInt` arm reaches
     its own natural arm state), the arms agree outside the untrusted `differs` hint
     (`MirArmsAgree`), and the join continuation holds **once** on the structurally merged state
-    `mergeMirJoinState cond differs sT sF` (in which only the hinted scalar slots carry
-    `if cond then _ else _` bits), then `evalJoinDiamondWP` holds for that merged state; hence
+    `mergeMirJoinState cond differs sT sF` (in which hinted equal-width scalar slots carry
+    `if cond then _ else _` bits and hinted dead/scratch slots carry `if cond then sT[i] else sF[i]`),
+    then `evalJoinDiamondWP` holds for that merged state; hence
     (`wpMirSym_of_evalJoinDiamondWP` / `wpMirJoinDiamond_sound`) the whole diamond is verified
-    without evaluating the join block twice. A wrong hint can only make `MirArmsAgree` unprovable
-    (`mirJoinDiamond_unhinted_merge_rejected`), never unsound. -/
+    without evaluating the join block twice. A wrong hint can only make `MirArmsAgree` or `hJoin`
+    unprovable (`mirJoinDiamond_unhinted_merge_rejected`,
+    `mirJoinAsymmetricScratch_read_dead_slot3_rejected`), never unsound. -/
 theorem wpMirJoinDiamond_merge_sound
     {prefixFuel suffixFuel : Nat} {body : CapturedMir} {joinBb : BasicBlockIdx}
     {s : MachineState} {cond : Bool} {differs : List Bool} {sT sF : MachineState}
@@ -13771,7 +14076,7 @@ theorem mirJoinDiamond_arms_agree (x flag : Nat) :
     MirArmsAgree mirJoinDiamondDiffers
       (mirJoinDiamondArmState x flag (mirJoinDiamondElseVal x))
       (mirJoinDiamondArmState x flag (mirJoinDiamondThenVal x)) :=
-  ⟨rfl, rfl, rfl, ⟨⟨_, _, rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl⟩⟩
+  ⟨rfl, rfl, rfl, ⟨trivial, rfl, rfl, rfl, rfl⟩⟩
 
 /-- **Non-Vacuity Witness for `evalJoinDiamondWP` / `wpMirJoinDiamond_merge_sound`
     (`mirJoinDiamond_evalJoinDiamondWP`)**: for all `x, flag : Nat`,
@@ -13860,6 +14165,381 @@ theorem mirJoinDiamond_unhinted_merge_rejected :
     | _ => 0) h.locals.1
   exact absurd hBits (by decide)
 
+/-- **Asymmetric Dead/Scratch Slot Diamond (`mirJoinAsymmetricScratchBody`)**:
+    Unlike `mirJoinDiamondBody`, `bb1` (`then` arm) allocates and initializes scratch local `_3`
+    (`StorageLive(3); _3 := _1 + 10; _0 := _3; goto bb3`) **without** executing `StorageDead(3)`
+    before jumping to `bb3`, while `bb2` (`else` arm) never touches `_3` (leaving `_3 = .dead`).
+    At `bb3` entry, `_3` is `.dead` on `bb2` (`flag = 0`) and `.init (.scalar ⟨x + 10, 8⟩)` on
+    `bb1` (`flag ≠ 0`). Because `_3` is dead (unused) in `bb3`, `mergeMirJoinState` with
+    `differs = [true, false, false, true]` merges both arms and evaluates `bb3` **once** by `rfl`. -/
+def mirJoinAsymmetricScratchBody : CapturedMir :=
+  { mirJoinDiamondBody with
+    defPath := "sym_eval::mir_join_asymmetric_scratch_witness"
+    basicBlocks :=
+      [ { statements := []
+          terminator :=
+            { kind := .switchInt (.copy { local_ := 2, projection := [] })
+                { branches := [(0, 2)], otherwise := 1 }
+              span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .storageLive 3, span := "SymbolicEval.lean" }
+            , { kind := .assign { local_ := 3, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 1, projection := [] })
+                    (u64JoinConstOp 10))
+                span := "SymbolicEval.lean" }
+            , { kind := .assign { local_ := 0, projection := [] }
+                  (.use (.copy { local_ := 3, projection := [] }))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .goto 3, span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 1, projection := [] })
+                    (u64JoinConstOp 20))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .goto 3, span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 0, projection := [] })
+                    (.copy { local_ := 1, projection := [] }))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .return_, span := "SymbolicEval.lean" }
+          isCleanup := false } ] }
+
+/-- Join-entry state of `mirJoinAsymmetricScratchBody` at `bb3` with explicit slot `_3` state. -/
+def mirJoinAsymmetricArmState (x flag armVal : Nat) (slot3 : LocalSlot) : MachineState :=
+  let sInit := initMachineState mirJoinAsymmetricScratchBody [.scalar ⟨x, 8⟩, .scalar ⟨flag, 8⟩]
+  { sInit with
+    frame :=
+      { blockIdx := 3
+        stmtIdx := 0
+        locals :=
+          [ .init (.scalar ⟨armVal, 8⟩)
+          , .init (.scalar ⟨x, 8⟩)
+          , .init (.scalar ⟨flag, 8⟩)
+          , slot3 ] } }
+
+def mirJoinAsymmetricDiffers : List Bool := [true, false, false, true]
+
+def mirJoinAsymmetricArmResult (x flag : Nat) : MachineState :=
+  if Nat.beq flag 0 then
+    mirJoinAsymmetricArmState x flag (mirJoinDiamondElseVal x) .dead
+  else
+    mirJoinAsymmetricArmState x flag (mirJoinDiamondThenVal x)
+      (.init (.scalar ⟨mirJoinDiamondThenVal x, 8⟩))
+
+def mirJoinAsymmetricMergedState (x flag : Nat) : MachineState :=
+  mergeMirJoinState (Nat.beq flag 0) mirJoinAsymmetricDiffers
+    (mirJoinAsymmetricArmState x flag (mirJoinDiamondElseVal x) .dead)
+    (mirJoinAsymmetricArmState x flag (mirJoinDiamondThenVal x)
+      (.init (.scalar ⟨mirJoinDiamondThenVal x, 8⟩)))
+
+theorem mirJoinAsymmetric_arms_agree (x flag : Nat) :
+    MirArmsAgree mirJoinAsymmetricDiffers
+      (mirJoinAsymmetricArmState x flag (mirJoinDiamondElseVal x) .dead)
+      (mirJoinAsymmetricArmState x flag (mirJoinDiamondThenVal x)
+        (.init (.scalar ⟨mirJoinDiamondThenVal x, 8⟩))) :=
+  ⟨rfl, rfl, rfl, ⟨trivial, rfl, rfl, trivial, rfl⟩⟩
+
+/-- **Non-Vacuity Witness for Asymmetric Dead/Scratch Slots at Join
+    (`mirJoinAsymmetricScratch_evalJoinDiamondWP`)**: even though `_3` is `.dead` on `bb2` and
+    `.init (.scalar ⟨x + 10, 8⟩)` on `bb1` at `bb3` entry, `wpMirJoinDiamond_merge_sound` merges
+    both arms and evaluates `bb3` **once** by `rfl`. -/
+theorem mirJoinAsymmetricScratch_evalJoinDiamondWP (x flag : Nat) :
+    let armVal :=
+      if Nat.beq flag 0 then
+        wrapScalarBits (Nat.add x 20) (scalarModulus 8)
+      else
+        wrapScalarBits (Nat.add x 10) (scalarModulus 8)
+    let expectedRet := wrapScalarBits (Nat.add armVal x) (scalarModulus 8)
+    evalJoinDiamondWP 5 3 mirJoinAsymmetricScratchBody 3
+      (initMachineState mirJoinAsymmetricScratchBody [.scalar ⟨x, 8⟩, .scalar ⟨flag, 8⟩])
+      (mirJoinAsymmetricMergedState x flag)
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨expectedRet, 8⟩)) := by
+  intro armVal expectedRet
+  refine wpMirJoinDiamond_merge_sound ?_ (mirJoinAsymmetric_arms_agree x flag) ?_
+  · show wpMirUntilJoinSym 5 mirJoinAsymmetricScratchBody 3 _
+      (fun s' => s' = mirJoinAsymmetricArmResult x flag) _
+    (repeat' ((conv => whnf); split)); all_goals
+      (rename_i hCond; change Nat.beq flag 0 = _ at hCond;
+       dsimp only [mirJoinAsymmetricArmResult]; rw [hCond]; rfl)
+  · rfl
+
+theorem mirJoinAsymmetricScratch_wpMirSym_witness (x flag : Nat) :
+    let armVal :=
+      if Nat.beq flag 0 then
+        wrapScalarBits (Nat.add x 20) (scalarModulus 8)
+      else
+        wrapScalarBits (Nat.add x 10) (scalarModulus 8)
+    let expectedRet := wrapScalarBits (Nat.add armVal x) (scalarModulus 8)
+    wpMirSym 8 mirJoinAsymmetricScratchBody
+      (initMachineState mirJoinAsymmetricScratchBody [.scalar ⟨x, 8⟩, .scalar ⟨flag, 8⟩])
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨expectedRet, 8⟩)) :=
+  wpMirSym_of_evalJoinDiamondWP (mirJoinAsymmetricScratch_evalJoinDiamondWP x flag)
+
+/-- **Negative control on asymmetric scratch slot `_3` (`mirJoinAsymmetricScratch_unhinted_slot3_rejected`)**:
+    if the hint `[true, false, false, false]` omits `differs[3] = true`, `MirArmsAgree` is refuted
+    because `.dead ≠ .init (.scalar ...)`. -/
+theorem mirJoinAsymmetricScratch_unhinted_slot3_rejected :
+    ¬ MirArmsAgree [true, false, false, false]
+      (mirJoinAsymmetricArmState 0 0 (mirJoinDiamondElseVal 0) .dead)
+      (mirJoinAsymmetricArmState 0 0 (mirJoinDiamondThenVal 0)
+        (.init (.scalar ⟨mirJoinDiamondThenVal 0, 8⟩))) := by
+  intro h
+  exact LocalSlot.noConfusion h.locals.2.2.2.1
+
+/-- **Negative control on reading an asymmetric dead scratch slot in the join block
+    (`mirJoinAsymmetricScratch_read_dead_slot3_rejected`)**: if a join block tries to read `_3`
+    (`_0 := _0 + _3; return`) on `mirJoinAsymmetricMergedState 0 0` (where `_3 = .dead` because
+    `flag = 0` took `bb2`), `wpMirSym` on the merged state is **refuted** (reading `.dead` faults
+    with `.ub`). -/
+def mirJoinReadScratchInJoinBody : CapturedMir :=
+  { mirJoinAsymmetricScratchBody with
+    defPath := "sym_eval::mir_join_read_scratch_in_join_neg"
+    basicBlocks :=
+      [ { statements := []
+          terminator :=
+            { kind := .switchInt (.copy { local_ := 2, projection := [] })
+                { branches := [(0, 2)], otherwise := 1 }
+              span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .storageLive 3, span := "SymbolicEval.lean" }
+            , { kind := .assign { local_ := 3, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 1, projection := [] })
+                    (u64JoinConstOp 10))
+                span := "SymbolicEval.lean" }
+            , { kind := .assign { local_ := 0, projection := [] }
+                  (.use (.copy { local_ := 3, projection := [] }))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .goto 3, span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 1, projection := [] })
+                    (u64JoinConstOp 20))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .goto 3, span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 0, projection := [] })
+                    (.copy { local_ := 3, projection := [] }))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .return_, span := "SymbolicEval.lean" }
+          isCleanup := false } ] }
+
+theorem mirJoinAsymmetricScratch_read_dead_slot3_rejected :
+    ¬ wpMirSym 3 mirJoinReadScratchInJoinBody
+      (mirJoinAsymmetricMergedState 0 0)
+      (fun _ => True) := by
+  intro h
+  exact h
+
+/-- **Sequential Two-Diamond `CapturedMir` Witness (`mirSeqTwoDiamondBody`)**:
+    Chains two `SwitchInt` diamonds (`bb0 -> {bb1, bb2} -> bb3 (join 1) -> {bb4, bb5} -> bb6 (join 2)`)
+    by composing two `wpMirJoinDiamond_merge_sound` cuts back-to-back, evaluating `bb3` **once** on
+    the first merged state and `bb6` **once** on the second merged state ($O(k)$ block evaluations
+    instead of $2^k$ path unfoldings):
+    - `_0`: `u64` return slot, `_1`: `x`, `_2`: `flag1`, `_3`: `flag2`, `_4`: scratch slot in `bb1`.
+    - `bb0`: `SwitchInt(_2)` (`0 -> bb2`, `otherwise -> bb1`),
+      - `bb1`: `StorageLive(_4); _4 := _1 + 1; _0 := _4; StorageDead(_4); goto bb3`,
+      - `bb2`: `_0 := _1 + 2; goto bb3`,
+    - `bb3` (Join 1): `SwitchInt(_3)` (`0 -> bb5`, `otherwise -> bb4`),
+      - `bb4`: `_0 := _0 + 10; goto bb6`,
+      - `bb5`: `_0 := _0 + 20; goto bb6`,
+    - `bb6` (Join 2): `_0 := _0 + _1; return`. -/
+def mirSeqTwoDiamondBody : CapturedMir :=
+  { defPath := "sym_eval::mir_seq_two_diamond_witness"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 3
+    localDecls :=
+      [ { mutability := .mut, ty := u64JoinMirTy, debugName := none }
+      , { mutability := .not, ty := u64JoinMirTy, debugName := none }
+      , { mutability := .not, ty := u64JoinMirTy, debugName := none }
+      , { mutability := .not, ty := u64JoinMirTy, debugName := none }
+      , { mutability := .mut, ty := u64JoinMirTy, debugName := none } ]
+    basicBlocks :=
+      [ { statements := []
+          terminator :=
+            { kind := .switchInt (.copy { local_ := 2, projection := [] })
+                { branches := [(0, 2)], otherwise := 1 }
+              span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .storageLive 4, span := "SymbolicEval.lean" }
+            , { kind := .assign { local_ := 4, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 1, projection := [] })
+                    (u64JoinConstOp 1))
+                span := "SymbolicEval.lean" }
+            , { kind := .assign { local_ := 0, projection := [] }
+                  (.use (.copy { local_ := 4, projection := [] }))
+                span := "SymbolicEval.lean" }
+            , { kind := .storageDead 4, span := "SymbolicEval.lean" } ]
+          terminator := { kind := .goto 3, span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 1, projection := [] })
+                    (u64JoinConstOp 2))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .goto 3, span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements := []
+          terminator :=
+            { kind := .switchInt (.copy { local_ := 3, projection := [] })
+                { branches := [(0, 5)], otherwise := 4 }
+              span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 0, projection := [] })
+                    (u64JoinConstOp 10))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .goto 6, span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 0, projection := [] })
+                    (u64JoinConstOp 20))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .goto 6, span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 0, projection := [] })
+                    (.copy { local_ := 1, projection := [] }))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .return_, span := "SymbolicEval.lean" }
+          isCleanup := false } ]
+    fnAbi := defaultU64JoinFnAbi
+    layouts := emptyLayoutTable
+    allocations := [] }
+
+def mirSeqTwoDiamondDiffers : List Bool := [true, false, false, false, false]
+
+def mirSeqTwoDiamondStateAt (bb : BasicBlockIdx) (x flag1 flag2 val0 : Nat) : MachineState :=
+  let sInit :=
+    initMachineState mirSeqTwoDiamondBody
+      [.scalar ⟨x, 8⟩, .scalar ⟨flag1, 8⟩, .scalar ⟨flag2, 8⟩]
+  { sInit with
+    frame :=
+      { blockIdx := bb
+        stmtIdx := 0
+        locals :=
+          [ .init (.scalar ⟨val0, 8⟩)
+          , .init (.scalar ⟨x, 8⟩)
+          , .init (.scalar ⟨flag1, 8⟩)
+          , .init (.scalar ⟨flag2, 8⟩)
+          , .dead ] } }
+
+def mirSeqDiamond1Val (x flag1 : Nat) : Nat :=
+  if Nat.beq flag1 0 then
+    wrapScalarBits (Nat.add x 2) (scalarModulus 8)
+  else
+    wrapScalarBits (Nat.add x 1) (scalarModulus 8)
+
+def mirSeqDiamond2Val (x flag1 flag2 : Nat) : Nat :=
+  let v1 := mirSeqDiamond1Val x flag1
+  if Nat.beq flag2 0 then
+    wrapScalarBits (Nat.add v1 20) (scalarModulus 8)
+  else
+    wrapScalarBits (Nat.add v1 10) (scalarModulus 8)
+
+def mirSeqDiamond1ArmResult (x flag1 flag2 : Nat) : MachineState :=
+  if Nat.beq flag1 0 then
+    mirSeqTwoDiamondStateAt 3 x flag1 flag2 (wrapScalarBits (Nat.add x 2) (scalarModulus 8))
+  else
+    mirSeqTwoDiamondStateAt 3 x flag1 flag2 (wrapScalarBits (Nat.add x 1) (scalarModulus 8))
+
+def mirSeqDiamond2ArmResult (x flag1 flag2 : Nat) : MachineState :=
+  let v1 := mirSeqDiamond1Val x flag1
+  if Nat.beq flag2 0 then
+    mirSeqTwoDiamondStateAt 6 x flag1 flag2 (wrapScalarBits (Nat.add v1 20) (scalarModulus 8))
+  else
+    mirSeqTwoDiamondStateAt 6 x flag1 flag2 (wrapScalarBits (Nat.add v1 10) (scalarModulus 8))
+
+def mirSeqDiamond1MergedState (x flag1 flag2 : Nat) : MachineState :=
+  mergeMirJoinState (Nat.beq flag1 0) mirSeqTwoDiamondDiffers
+    (mirSeqTwoDiamondStateAt 3 x flag1 flag2 (wrapScalarBits (Nat.add x 2) (scalarModulus 8)))
+    (mirSeqTwoDiamondStateAt 3 x flag1 flag2 (wrapScalarBits (Nat.add x 1) (scalarModulus 8)))
+
+def mirSeqDiamond2MergedState (x flag1 flag2 : Nat) : MachineState :=
+  let v1 := mirSeqDiamond1Val x flag1
+  mergeMirJoinState (Nat.beq flag2 0) mirSeqTwoDiamondDiffers
+    (mirSeqTwoDiamondStateAt 6 x flag1 flag2 (wrapScalarBits (Nat.add v1 20) (scalarModulus 8)))
+    (mirSeqTwoDiamondStateAt 6 x flag1 flag2 (wrapScalarBits (Nat.add v1 10) (scalarModulus 8)))
+
+theorem mirSeqDiamond1_arms_agree (x flag1 flag2 : Nat) :
+    MirArmsAgree mirSeqTwoDiamondDiffers
+      (mirSeqTwoDiamondStateAt 3 x flag1 flag2 (wrapScalarBits (Nat.add x 2) (scalarModulus 8)))
+      (mirSeqTwoDiamondStateAt 3 x flag1 flag2 (wrapScalarBits (Nat.add x 1) (scalarModulus 8))) :=
+  ⟨rfl, rfl, rfl, ⟨trivial, rfl, rfl, rfl, rfl, rfl⟩⟩
+
+theorem mirSeqDiamond2_arms_agree (x flag1 flag2 : Nat) :
+    let v1 := mirSeqDiamond1Val x flag1
+    MirArmsAgree mirSeqTwoDiamondDiffers
+      (mirSeqTwoDiamondStateAt 6 x flag1 flag2 (wrapScalarBits (Nat.add v1 20) (scalarModulus 8)))
+      (mirSeqTwoDiamondStateAt 6 x flag1 flag2 (wrapScalarBits (Nat.add v1 10) (scalarModulus 8))) :=
+  ⟨rfl, rfl, rfl, ⟨trivial, rfl, rfl, rfl, rfl, rfl⟩⟩
+
+/-- **Sequential Two-Diamond Compositional Join-Cut Witness (`mirSeqTwoDiamond_wpMirSym_witness`)**:
+    Chains two `wpMirJoinDiamond_merge_sound` cuts across `bb3` and `bb6`, proving `wpMirSym` for
+    all `x, flag1, flag2 : Nat` without exponential path splitting (`Classical.choice`-free). -/
+theorem mirSeqTwoDiamond_wpMirSym_witness (x flag1 flag2 : Nat) :
+    let expectedRet := wrapScalarBits (Nat.add (mirSeqDiamond2Val x flag1 flag2) x) (scalarModulus 8)
+    wpMirSym 12 mirSeqTwoDiamondBody
+      (initMachineState mirSeqTwoDiamondBody
+        [.scalar ⟨x, 8⟩, .scalar ⟨flag1, 8⟩, .scalar ⟨flag2, 8⟩])
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨expectedRet, 8⟩)) := by
+  intro expectedRet
+  refine wpMirSym_of_evalJoinDiamondWP (prefixFuel := 6) (suffixFuel := 6) (joinBb := 3)
+    (sJoin := mirSeqDiamond1MergedState x flag1 flag2) ?_
+  refine wpMirJoinDiamond_merge_sound ?_ (mirSeqDiamond1_arms_agree x flag1 flag2) ?_
+  · -- Diamond 1 (`bb0 -> {bb1, bb2} -> bb3`):
+    show wpMirUntilJoinSym 6 mirSeqTwoDiamondBody 3 _
+      (fun s' => s' = mirSeqDiamond1ArmResult x flag1 flag2) _
+    (repeat' ((conv => whnf); split)); all_goals
+      (rename_i hCond; change Nat.beq flag1 0 = _ at hCond;
+       dsimp only [mirSeqDiamond1ArmResult]; rw [hCond]; rfl)
+  · -- From `mirSeqDiamond1MergedState x flag1 flag2` at `bb3`, cut again at `bb6`:
+    refine wpMirSym_of_evalJoinDiamondWP (prefixFuel := 3) (suffixFuel := 3) (joinBb := 6)
+      (sJoin := mirSeqDiamond2MergedState x flag1 flag2) ?_
+    refine wpMirJoinDiamond_merge_sound ?_ (mirSeqDiamond2_arms_agree x flag1 flag2) ?_
+    · -- Diamond 2 (`bb3 -> {bb4, bb5} -> bb6`) evaluated ONCE from `mirSeqDiamond1MergedState`:
+      show wpMirUntilJoinSym 3 mirSeqTwoDiamondBody 6 _
+        (fun s' => s' = mirSeqDiamond2ArmResult x flag1 flag2) _
+      ((conv => whnf); split); all_goals
+        (rename_i hCond; change Nat.beq flag2 0 = _ at hCond;
+         dsimp only [mirSeqDiamond2ArmResult]; rw [hCond]; rfl)
+    · -- Join 2 (`bb6 -> return`) evaluated ONCE on `mirSeqDiamond2MergedState`:
+      rfl
+
+/-- `DWLP mirDefaultWP` witness for `mirSeqTwoDiamondBody`. -/
+theorem mirSeqTwoDiamond_verified_witness (x flag1 flag2 : Nat) :
+    let expectedRet := wrapScalarBits (Nat.add (mirSeqDiamond2Val x flag1 flag2) x) (scalarModulus 8)
+    DWLP mirDefaultWP
+      (mirCallTree mirSeqTwoDiamondBody
+        [.scalar ⟨x, 8⟩, .scalar ⟨flag1, 8⟩, .scalar ⟨flag2, 8⟩])
+      (fun out _ =>
+        mirNormalPost (fun retVal _ => retVal = .scalar ⟨expectedRet, 8⟩) out)
+      PUnit.unit :=
+  (dwp_of_wpMirSym (mirSeqTwoDiamond_wpMirSym_witness x flag1 flag2)).toDWLP
+
 end MirJoinDiamondWitness
 
 /-!
@@ -13868,14 +14548,17 @@ end MirJoinDiamondWitness
 Every GVN, canonical-state, join-cut, aliasing, witness, operator-bridge and fuel-level
 `MirSemantics` join-cut theorem in this file depends on at most `{propext, Quot.sound}`: no
 `sorryAx`, no `Lean.ofReduceBool` (closed witnesses use `decide +kernel`), and no
-`Classical.choice` (the fuel-monotonicity lemmas avoid `omega`, which can introduce it). The only
-exceptions are the corollaries whose *statements* mention `Anneal.ITreeWP.DWLP`/`DWP`
+`Classical.choice` (the fuel-monotonicity, subtraction, low-mask, and bitwise-complement lemmas
+avoid `omega` and `Nat.testBit_two_pow_sub_succ`, which can introduce it). The only exceptions are
+the corollaries whose *statements* mention `Anneal.ITreeWP.DWLP`/`DWP`
 (`dwlp_of_wpMirUntilJoinSym`, `dwpMirJoinDiamond_sound`, `wpMirJoinDiamond_sound`,
 `wpMirJoinDiamond_dwlp_sound`, `wpMirJoinDiamond_merge_dwlp_sound`,
-`mirJoinDiamond_verified_witness`): `DWLP`/`DWP` are built with
-`coinductive_fixpoint`/`inductive_fixpoint` and themselves depend on `Classical.choice`, so no proof
-of such a statement can avoid it, while their fuel-level premises (`wpMirSym_of_evalJoinDiamondWP`,
-`wpMirJoinDiamond_merge_sound`, `mirJoinDiamond_wpMirSym_witness`) stay `Classical.choice`-free.
+`mirJoinDiamond_verified_witness`, `mirSeqTwoDiamond_verified_witness`): `DWLP`/`DWP` are built
+with `coinductive_fixpoint`/`inductive_fixpoint` and themselves depend on `Classical.choice`, so no
+proof of such a statement can avoid it, while their fuel-level premises (`wpMirSym_of_evalJoinDiamondWP`,
+`wpMirJoinDiamond_merge_sound`, `mirJoinDiamond_wpMirSym_witness`,
+`mirJoinAsymmetricScratch_wpMirSym_witness`, `mirSeqTwoDiamond_wpMirSym_witness`) stay
+`Classical.choice`-free.
 `trusted/audit/TrustedBoundary.lean` admits no `#guard_msgs`/`#print` commands in audited modules,
 so this inventory is checked out-of-file by `#print axioms` over the declarations above.
 -/
