@@ -15674,36 +15674,29 @@ theorem union_reaggregate_needs_deinit_witness :
 
 /-! ### Computed Union Translation (`translateFnWithUnions`) and Two-Sided Union Step Simulation Instantiations (`G2`) -/
 
-/-- `translateFnWithUnions` computes a MiniRust `Gen.Function` directly from
-`wMaybeUninitMir`, `wUnionReaggMir`, and `wUnionWitnessMir` without hand-writing
-any MiniRust blocks. -/
-def wMaybeUninitAutoFn : Gen.Function where
-  locals := ⟨[(localName 0, .Int u32), (localName 1, mrMUU32), (localName 2, mrMDU32)]⟩
-  args := []
-  ret := localName 0
-  calling_convention := .Rust
-  blocks := ⟨[
-    (bbName 0, ⟨[
-      .StorageLive (localName 1), .StorageLive (localName 2),
-      .Assign (.Local (localName 2)) (.Tuple [.Load (.Local (localName 2))] mrMDU32),
-      .Deinit (.Local (localName 1)),
-      .Assign (.Field (.Local (localName 1)) 1) (.Load (.Local (localName 2))),
-      .Assign (.Local (localName 0)) (.Load (.Field (.Field (.Local (localName 1)) 1) 0))],
-      .Return, .Regular⟩),
-    (bbName 1, ⟨[
-      .StorageLive (localName 1),
-      .Deinit (.Local (localName 1)),
-      .Assign (.Field (.Local (localName 1)) 0) (.Tuple [] mrUnitTy),
-      .Assign (.Local (localName 0)) (.Load (.Field (.Field (.Local (localName 1)) 1) 0))],
-      .Return, .Regular⟩),
-    (bbName 2, ⟨[
-      .StorageLive (localName 2),
-      .Assign (.Local (localName 2)) (.Tuple [.Constant (.Int 7) (.Int u32)] mrMDU32),
-      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 2)) 0))],
-      .Return, .Regular⟩)]⟩
-  start := bbName 0
-  implicit_writes := true
+/-- **Witness (`translateFnWithUnions` on `wMaybeUninitMir`)**: the function
+that `translateFnWithUnions` computes from `wMaybeUninitMir` (no hand-written
+blocks) returns `42_u32` from `bb0` (`Interp.steps 7`), faults reading the
+uninitialized `value` arm in `bb1` (step 4), and returns `7_u32` from `bb2`
+(`Interp.steps 4`), as Anneal does
+(`maybeUninitU32_new_assume_init_and_uninit_ub_witness`,
+`manuallyDropU32_new_into_inner_witness`). Its runs are shorter than
+`wMaybeUninitFn`'s because it emits no `StorageDead`. -/
+theorem wMaybeUninit_translateFnWithUnions_witness :
+    ∃ f, translateFnWithUnions wMaybeUninitMir = some f ∧
+      (Interp.steps 7 (machine wMaybeUninitMir f (wMUS0 0).frame.locals (bbName 0))).toOption.map
+          (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+        some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
+      (Interp.steps 3 (machine wMaybeUninitMir f (wMUS0 1).frame.locals (bbName 1))).isOk = true ∧
+      Interp.steps 4 (machine wMaybeUninitMir f (wMUS0 1).frame.locals (bbName 1)) =
+        .error (.ub "load at type but the data in memory violates the language invariant") ∧
+      (Interp.steps 4 (machine wMaybeUninitMir f (wMUS0 2).frame.locals (bbName 2))).toOption.map
+          (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+        some (some { retAlloc with data := scalarBytes u32 7 }, [1]) :=
+  ⟨_, rfl, rfl, rfl, rfl, rfl⟩
 
+/-- The function that `translateFnWithUnions` computes from `wUnionReaggMir`
+(`wUnionReaggAutoFn_eq_true`, `wUnionReaggAutoFn_eq_false`). -/
 def wUnionReaggAutoFn (deinit : Bool) : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, mrPU)]⟩
   args := []
@@ -15817,19 +15810,20 @@ theorem wUnionMid2_storage5 :
   alloc_eq := rfl
   slot_rel := rfl
 
-/-- **Direct instantiation of `step_union_whole_copy_minirust_simulation`,
-`evalValue_load_union_zstArray_field`, `evalValue_load_union_uninhabited_ub`,
-and `evalValue_load_union_int_uninit_ub` (`G2`)** on `wUnionMidAnneal2` /
-`wUnionMidMach2`:
+/-- **Instantiation of `step_union_whole_copy_minirust_simulation` and the
+MiniRust union field-read lemmas (`G2`)** on `wUnionMidAnneal2` /
+`wUnionMidMach2`, the state of `bb2` before `_5 = copy _4`:
 1. `_5 = copy _4` steps in lockstep via `step_union_whole_copy_minirust_simulation`,
    establishing `MiniRustUnionLocalStorage` on `_5` with
    `[.Init 0x55 none, .Uninit, .Uninit, .Uninit]`;
-2. Reading the `[(); 4]` ZST arm (`_4.0`) succeeds via
-   `evalValue_load_union_zstArray_field`;
-3. Reading the uninhabited `VoidZst` arm (`_4.3`) faults with `.ub` via
-   `evalValue_load_union_uninhabited_ub`;
-4. Reading the `u32` arm (`_4.2`) across the 3 `.Uninit` padding bytes faults
-   with `.ub` via `evalValue_load_union_int_uninit_ub`. -/
+2. reading the `[(); 4]` ZST arm (`_4.0`) succeeds in Anneal (computed) and in
+   MiniRust (`evalValue_load_union_zstArray_field`);
+3. reading the uninhabited `VoidZst` arm (`_4.3`) faults in Anneal (computed)
+   and in MiniRust (`evalValue_load_union_uninhabited_ub`);
+4. reading the `u32` arm (`_4.2`) across the 3 `.Uninit` padding bytes faults
+   in Anneal (computed) and in MiniRust (`evalValue_load_union_int_uninit_ub`).
+The general lemmas cover only the MiniRust side of items 2-4; the Anneal side
+is evaluated on this state. -/
 theorem wUnionMid2_two_sided_step_simulations :
     (evalStmt wUnionMidAnneal2 (mkStmt (.assign (local_ 5) (.use (.copy (local_ 4)))))
         wUnionWitnessMir.localDecls wUnionWitnessMir.layouts =
@@ -15850,11 +15844,20 @@ theorem wUnionMid2_two_sided_step_simulations :
          [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u8), (⟨0⟩, .Int u32), (⟨0⟩, mrUninhabitedZstTy)]
          4 4 (.init (.aggregate 0 [.unit, .scalar ⟨0x55, 1⟩, .unit, .unit]))
          [.Init 0x55 none, .Uninit, .Uninit, .Uninit]) ∧
+    (∃ s', evalStmt wUnionMidAnneal2
+        (mkStmt (.assign (local_ 3) (.use (.copy ⟨4, [.field 0 wZstArr4Ty]⟩))))
+        wUnionWitnessMir.localDecls wUnionWitnessMir.layouts = MirStepNode.step s') ∧
     (∃ m',
       evalValue wUnionMidMach2 (.Load (.Field (.Local (localName 4)) 0)) =
         .ok ((.Tuple (List.replicate 4 (.Tuple [])), mrZstArrayTy 4), m')) ∧
+    evalStmt wUnionMidAnneal2
+        (mkStmt (.assign (local_ 7) (.use (.copy ⟨4, [.field 3 wVoidZstTy]⟩))))
+        wUnionWitnessMir.localDecls wUnionWitnessMir.layouts = MirStepNode.fail .ub ∧
     evalValue wUnionMidMach2 (.Load (.Field (.Local (localName 4)) 3)) =
       .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    evalStmt wUnionMidAnneal2
+        (mkStmt (.assign (local_ 0) (.use (.copy ⟨4, [.field 2 wU32Ty]⟩))))
+        wUnionWitnessMir.localDecls wUnionWitnessMir.layouts = MirStepNode.fail .ub ∧
     evalValue wUnionMidMach2 (.Load (.Field (.Local (localName 4)) 2)) =
       .error (.ub "load at type but the data in memory violates the language invariant") := by
   refine ⟨step_union_whole_copy_minirust_simulation (body := wUnionWitnessMir)
@@ -15873,8 +15876,9 @@ theorem wUnionMid2_two_sided_step_simulations :
                .StorageDead (localName 4), .StorageDead (localName 3)],
               .Return, .Regular⟩)
       rfl (by decide) rfl,
-    ?_,
+    ⟨_, rfl⟩, ?_, rfl,
     evalValue_load_union_uninhabited_ub wUnionMid2_shape wUnionMid2_storage4 rfl,
+    rfl,
     evalValue_load_union_int_uninit_ub wUnionMid2_shape wUnionMid2_storage4 rfl
       (.inr (.inr (.inl rfl))) (by decide) (by decide)⟩
   obtain ⟨m', hm', _⟩ :=

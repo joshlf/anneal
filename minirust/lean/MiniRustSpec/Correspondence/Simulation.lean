@@ -17252,10 +17252,13 @@ theorem step_union_whole_copy_minirust_simulation
     alloc_eq := List.getElem?_set_self hw_lt_L
     slot_rel := hu.slot_rel }⟩
 
-/-- **Two-sided 0-byte `[(); N]` ZST union field read simulation (`G2`, `kani#5176`)**:
+/-- **MiniRust side of a 0-byte `[(); N]` union field read (`G2`, `kani#5176`)**:
 On a `Shape` state where union local `u` satisfies `MiniRustUnionLocalStorage`
-(whether `.uninit` or `.init val` with uninitialized padding bytes!) and field
-`j` of `mrUnionTy fields S al` is `mrZstArrayTy N`:
+(whether `.uninit` or `.init val` with uninitialized padding bytes) and field
+`j` of `mrUnionTy fields S al` is `mrZstArrayTy N`, the read succeeds. This
+lemma has no Anneal side. Anneal agrees for an `.init` union, but it faults on
+a field read of an `.uninit` union local, which MiniRust (and rustc's
+interpreter, which reads zero bytes) accepts. Here:
 `evalValue m (.Load (.Field (.Local (localName u)) (j : Int)))` succeeds with
 `(.Tuple (List.replicate N (.Tuple [])), mrZstArrayTy N)` and leaves all
 allocations unchanged. -/
@@ -17286,9 +17289,10 @@ theorem evalValue_load_union_zstArray_field
   refine ⟨m', ?_, ⟨hsh.threads, hsh.active, hsh.allocs⟩⟩
   simp [evalValue, hfp, hload, bind, Except.bind, pure, Except.pure, m']
 
-/-- **Two-sided uninhabited 0-byte union field read UB (`G2`, `kani#5159`)**:
-On a `Shape` state where union local `u` satisfies `MiniRustUnionLocalStorage`
-and field `j` is `mrUninhabitedZstTy`:
+/-- **MiniRust side of an uninhabited 0-byte union field read (`G2`,
+`kani#5159`)**: On a `Shape` state where union local `u` satisfies
+`MiniRustUnionLocalStorage` and field `j` is `mrUninhabitedZstTy`, the read is
+UB. This lemma has no Anneal side:
 `evalValue m (.Load (.Field (.Local (localName u)) (j : Int)))` fails with
 `.error (.ub "load at type but the data in memory violates the language invariant")`,
 even when all `S` bytes of `mrBytes` are initialized! -/
@@ -17314,8 +17318,9 @@ theorem evalValue_load_union_uninhabited_ub
     { ptr := ThinPointer.widen (localPtr ctx u) none, aligned := true } rfl
   simp [evalValue, hfp, hload, bind, Except.bind]
 
-/-- **Two-sided uninitialized scalar union field read UB (`G2`)**:
-On a `Shape` state where union local `u` satisfies `MiniRustUnionLocalStorage`,
+/-- **MiniRust side of an uninitialized integer union field read (`G2`)**;
+this lemma has no Anneal side. On a `Shape` state where union local `u`
+satisfies `MiniRustUnionLocalStorage`,
 field `j` is `.Int it` (`GoodSize it.size.bytes`, `it.size.bytes ≤ S`), and at
 least one byte in `mrBytes.take it.size.bytes` is `.Uninit`:
 `evalValue m (.Load (.Field (.Local (localName u)) (j : Int)))` fails with
@@ -17492,22 +17497,45 @@ def translateBlocksWithUnions (body : CapturedMir) (deinitUnionAgg : Bool := tru
     let rest ← translateBlocksWithUnions body deinitUnionAgg (i + 1) bbs
     some ((bbName i, ⟨slStmts ++ bodyStmts.flatten, term, .Regular⟩) :: rest)
 
-/-- Computed translation of a union-bearing `CapturedMir` body into a MiniRust
-`Gen.Function` (`G2`). -/
+/-- Whether no block of `body` passes control to another block: every
+terminator is `return` or `unreachable`. -/
+def blocksAreExits (body : CapturedMir) : Bool :=
+  body.basicBlocks.all fun bb =>
+    match bb.terminator.kind with
+    | .return_ | .unreachable => true
+    | _ => false
+
+/-- The witnesses' lowering of a union-bearing body (`G2`). It is not
+`minimize`'s translation:
+* each block begins with `StorageLive` of the non-argument locals that its
+  statements mention, so that a run can start at any block of a frame in which
+  only the return place and the arguments are allocated (`Witness.machine`).
+  `minimize` instead keeps the body's `StorageLive`/`StorageDead` statements
+  and adds an `initBlock`.
+* a union aggregate becomes `Deinit` plus a field assignment (only the field
+  assignment when `deinitUnionAgg = false`, the negative control), because
+  `Interp.evalValue` does not implement `minimize`'s `ValueExpr::Union`.
+* `_d = [const (); N]` (`Rvalue::Repeat` of a zero-sized constant), which
+  stores no bytes, is dropped.
+A `StorageLive` of a live local reallocates it uninitialized, so the prologue
+would reset values that flow from one block into another. The lowering
+therefore accepts only bodies whose blocks all end the run (`blocksAreExits`). -/
 def translateFnWithUnions (body : CapturedMir) (deinitUnionAgg : Bool := true) :
-    Option Gen.Function := do
-  let conv ← translateCallConv body.fnAbi.conv
-  let locals ← translateLocalsWithUnions body.layouts 0 body.localDecls
-  let blocks ← translateBlocksWithUnions body deinitUnionAgg 0 body.basicBlocks
-  some {
-    locals := ⟨locals⟩
-    args := (List.range body.argCount).map (fun k => localName (k + 1))
-    ret := localName 0
-    calling_convention := conv
-    blocks := ⟨blocks⟩
-    start := bbName 0
-    implicit_writes := true
-  }
+    Option Gen.Function :=
+  if blocksAreExits body then do
+    let conv ← translateCallConv body.fnAbi.conv
+    let locals ← translateLocalsWithUnions body.layouts 0 body.localDecls
+    let blocks ← translateBlocksWithUnions body deinitUnionAgg 0 body.basicBlocks
+    some {
+      locals := ⟨locals⟩
+      args := (List.range body.argCount).map (fun k => localName (k + 1))
+      ret := localName 0
+      calling_convention := conv
+      blocks := ⟨blocks⟩
+      start := bbName 0
+      implicit_writes := true
+    }
+  else none
 
 /-! ## `TerminatorKind.assert` (`assert cond expected target unwind`)
 

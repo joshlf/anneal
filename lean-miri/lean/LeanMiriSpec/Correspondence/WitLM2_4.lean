@@ -5620,15 +5620,17 @@ theorem lm24_padded_zst_partial_init_whole_copy_and_elem_index_steps :
 
 /-! ### General Step Simulation Theorems for Padded ZST Unions (`G3`) -/
 
-/-- **General uninhabited union field read UB theorem (`G3`, `kani#5159`)**:
+/-- **`lean-miri` side of an uninhabited union field read (`G3`, `kani#5159`)**:
 For any `StateRelLM2_4PaddedZst body s m` and statement
-`⟨.assign ⟨r, .nil⟩ (.use (.copy ⟨u, [.field j voidTy]⟩)), span⟩` where:
-* `voidTy` is uninhabited in Anneal (`tyIsUninhabited body.localDecls body.layouts (resolveTyWithLocalDecls body.localDecls body.layouts voidTy) = true`);
-* `encodeTyId voidTy` is uninhabited in `lean-miri` (`annealEvalOperandLM2_4PaddedZst.isUninhabitedEncodedTyId (encodeTyId voidTy) body.layouts = true`);
-* destination local `r` is live (`get? body.localDecls r = some rDecl`, `get? s.frame.locals r = some rSlot`, `rSlot ≠ .dead`);
-* union local `u` (`isUnionLocal body.localDecls body.layouts u = true`) is memory-backed (`.live (.indirect mp_u)`) in `topFrame`:
-both `stepMirFn body s` and `Step.step (annealStepHooksLM2_4PaddedZst body.localDecls body.layouts) () m`
-fault with undefined behavior (`StepRelLM2_4PaddedZst.ub`). -/
+`⟨.assign ⟨r, .nil⟩ (.use (.copy ⟨u, [.field j voidTy]⟩)), span⟩` whose field
+type encodes as uninhabited (`isUninhabitedEncodedTyId (encodeTyId voidTy)`),
+with `r ≠ u` and the union local `u` memory-backed (`.live (.indirect mp_u)`),
+`Step.step (annealStepHooksLM2_4PaddedZst ..) () m` faults with
+"read of uninhabited union field". Anneal's fault is the hypothesis `hstep_a`,
+not a conclusion; the concrete witness
+`lm24_padded_zst_uninhabited_arm_ub_and_lifecycle_steps` evaluates it on
+`lm24PUBody`. Given `hstep_a`, the two steps are related by
+`StepRelLM2_4PaddedZst.ub`. -/
 theorem step_padded_zst_union_uninhabited_field_read_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRelLM2_4PaddedZst body s m)
@@ -5720,7 +5722,10 @@ theorem step_padded_zst_union_uninhabited_field_read_ub
   rw [hstep_a, hstep_m]
   exact .ub m₀' "read of uninhabited union field"
 
-/-- **General `[(); N][offset of minLen]` element read & OOB UB theorem (`G3`)**:
+/-- **`lean-miri` side of `[(); N][offset of minLen]` element reads (`G3`)**. As
+in `step_padded_zst_union_uninhabited_field_read_ub`, Anneal's fault in item 1
+is the hypothesis `hstep_a`, and item 2 states only the `lean-miri` operand
+read:
 For any `StateRelLM2_4PaddedZst body s m` (with `LiveAllocsNodup m.machine`) and
 statement `⟨.assign ⟨r, .nil⟩ (.use (.copy ⟨u, [.field f_z zstArrTy, .constantIndex offset minLen false]⟩)), span⟩`
 where `_u` is a memory-backed padded ZST union (`WellTypedPaddedZstUnionTy body.layouts uDecl.ty S N f_z zstFlIdx`,
@@ -5887,7 +5892,11 @@ theorem step_padded_zst_union_elem_index_read_simulation
     rw [hop_ok]
     exact hread
 
-/-- **General 0-byte `[(); N]` ZST field write & overlay activation theorem (`G3`)**:
+/-- **`lean-miri` side of a 0-byte `[(); N]` field write (`G3`)**: the memory
+copy is a no-op, and the given Anneal slots relate to the unchanged memory
+under `PaddedZstUnionLocalRel`. That Anneal's step produces those slots is not
+proved here; the concrete witnesses `lm24_padded_zst_field_write_move_and_u32_ub_steps`
+and `lm24_padded_zst_overwrite_payload_retains_bytes_steps` evaluate it:
 Writing a 0-byte `[(); N]` ZST local `z` (`ZstZeroMemRel m.machine mp_z`,
 `zLay.layout.size = Miri.ABI.Size.ZERO`) into field `f_z` (`fLay.layout.size = Miri.ABI.Size.ZERO`)
 of a memory-backed union `u` (`ValidScalarBytes S`, either `PaddedZstUnionUninitMemRel`
@@ -5955,8 +5964,9 @@ theorem step_padded_zst_union_field_write_and_overlay_rel
             (.mk allocId tag baseAddr la msc hprov hmis hmeta hlive hbase hptr hovf hsz hlen hmut
               hp hal hex hnat hkle hmask hsc hprim hf0imm hraw)⟩
 
-/-- **General 0-byte `[(); N]` aggregate `copyOpNoValidate` & ZST-arm activation
-theorem (`G3`)**:
+/-- **`lean-miri` side of a 0-byte `[(); N]` aggregate field copy (`G3`)**: a
+lemma about `annealAggregateHooksLM2_4PaddedZst.copyOpNoValidate`, with no
+Anneal side:
 For any memory-backed union `mp_u` satisfying `PaddedZstUnionUninitMemRel`
 (and `LiveAllocsNodup m.machine`), writing a zero-sized `[(); N]` source operand
 `src` (`src.layout.layout.size.bytes == 0`) into the zero-sized union field
@@ -5992,7 +6002,10 @@ theorem step_padded_zst_union_aggregate_copyOpNoValidate_spec
     simp [hsrc0, hdst0, get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
       hprov, Option.bind, Miri.Memory.Provenance.getAllocId, hfind, pure, EStateM.pure]
 
-/-- **General uninitialized scalar payload field read UB theorem (`G3`)**:
+/-- **`lean-miri` side of an uninitialized scalar payload read (`G3`)**: a
+lemma about `annealReadImmediateLM2_2` on all-uninit union storage, together
+with the all-uninit encoding of Anneal's ZST-initialized union value; it does
+not state Anneal's read:
 For any memory-backed union `mp_u` in `PaddedZstUnionUninitMemRel`
 (and `LiveAllocsNodup m.machine`) and any primitive scalar field layout `fLay`
 of width `w` (`ValidScalarBytes w`, `w ≤ S`,
