@@ -1015,8 +1015,12 @@ impl TrackedProcessTree {
 
     /// Returns true if `root_pid` has already exited (zombie `'Z'`/`'X'`, gone,
     /// or recycled with a different `starttime`) without reaping `Child`.
+    /// Without a recorded `starttime` (no `/proc`, e.g. macOS) exit cannot be
+    /// observed, so this stays `false` and [`terminate_process_tree`] waits out
+    /// its full `SIGTERM` grace period before escalating to `SIGKILL`.
     fn root_has_exited(&self) -> bool {
-        !matches!(self.root_proc_zombie_or_running(), Some(false))
+        self.root_starttime.is_some()
+            && !matches!(self.root_proc_zombie_or_running(), Some(false))
     }
 }
 
@@ -1489,6 +1493,13 @@ struct IsolatedLeanStage<X> {
     results: BTreeMap<String, X>,
     /// Candidates (root fn names) owning at least one case without a result.
     failed_fns: BTreeSet<String>,
+    /// Cases without a result whose most specific failing run (the smallest
+    /// chunk, per-candidate fallback, or bisection slice containing them that
+    /// was actually run) failed inconclusively per
+    /// [`itree_lean_failure_is_inconclusive`] (watchdog kill, Lean resource
+    /// limit, signal, missing toolchain) rather than with a Lean rejection, so
+    /// the case is unchecked rather than refuted.
+    inconclusive_cases: BTreeSet<String>,
     /// Truncated diagnostics for each failed chunk, fallback, or irreducible
     /// single-case bisection run.
     errors: Vec<String>,
@@ -1591,7 +1602,10 @@ fn lean_error_signature(err: &str) -> Vec<String> {
 ///    memory limit recover completely when smaller sub-slices succeed;
 /// 2. an irreducible single case (`slice.len() == 1`) that exceeds limits or
 ///    fails elaboration still lets its healthy siblings into `results`, and
-///    `errors` records an explicit single-case diagnostic;
+///    `errors` records an explicit single-case diagnostic (a case that only
+///    exceeded resource limits also lands in `inconclusive_cases`, so
+///    [`itree_partially_comparable_fns`] keeps comparing its candidate on the
+///    healthy siblings);
 /// 3. a failure that both halves of a slice reproduce as an elaboration error is
 ///    treated as candidate-wide (shared definitions, not one case) and stops
 ///    bisection there, and at most [`itree_bisect_failure_budget`] failing runs
@@ -1646,6 +1660,16 @@ where
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_chunk(label, slice)))
             .unwrap_or_else(|_| Err(format!("Lean {what} worker panicked")))
     };
+    // Whether the most recent (hence most specific: chunk, then fallback, then
+    // ever smaller bisection slices) failing run containing each case failed
+    // inconclusively.
+    let mut last_failure_inconclusive: BTreeMap<String, bool> = BTreeMap::new();
+    let mut note_failure = |slice: &[C], err: &str| {
+        let inconclusive = itree_lean_failure_is_inconclusive(err);
+        for c in slice {
+            last_failure_inconclusive.insert(case_key(c).to_string(), inconclusive);
+        }
+    };
 
     let chunks: Vec<&[C]> = cases.chunks(chunk_size).collect();
     for (wave_idx, wave) in chunks.chunks(jobs).enumerate() {
@@ -1678,6 +1702,7 @@ where
             });
         for (&chunk, (label, res)) in wave.iter().zip(wave_res) {
             if let Err(e) = accept(&mut results, chunk, res, &label) {
+                note_failure(chunk, &e);
                 errors.push(e);
                 failed_chunks.push(chunk);
             }
@@ -1708,6 +1733,7 @@ where
                 }
                 Err(e) => e,
             };
+            note_failure(&fn_cases, &e);
             let failure_kind = classify_itree_lean_failure(&e);
             errors.push(e);
             if fn_cases.len() <= 1 || failure_kind == ItreeLeanFailureKind::MissingToolchain {
@@ -1744,6 +1770,7 @@ where
                         Ok(()) => halves.push((a, b, None)),
                         Err(sub_err) => {
                             failing_runs += 1;
+                            note_failure(slice, &sub_err);
                             let kind = classify_itree_lean_failure(&sub_err);
                             let raw_body = sub_err
                                 .strip_prefix(&format!("{sub_label}: "))
@@ -1833,11 +1860,60 @@ where
         .filter(|&c| !results.contains_key(case_key(c)))
         .filter_map(|c| case_to_fn.get(case_key(c)).cloned())
         .collect();
+    let inconclusive_cases: BTreeSet<String> = cases
+        .iter()
+        .map(&case_key)
+        .filter(|&k| {
+            !results.contains_key(k) && last_failure_inconclusive.get(k).copied().unwrap_or(false)
+        })
+        .map(str::to_string)
+        .collect();
     IsolatedLeanStage {
         results,
         failed_fns,
+        inconclusive_cases,
         errors,
     }
+}
+
+/// Candidates of `stage.failed_fns` that stay comparable on their completed
+/// cases, mapped to how many of their cases are dropped: every case of the
+/// candidate without a result is in [`IsolatedLeanStage::inconclusive_cases`]
+/// (unchecked because of a resource limit / watchdog kill, never refuted by
+/// Lean) and `may_drop` allows dropping it, and at least one case completed.
+/// Every other failed candidate must be dropped whole (a Lean rejection, or no
+/// completed case to compare).
+fn itree_partially_comparable_fns<C, X>(
+    stage: &IsolatedLeanStage<X>,
+    cases: &[C],
+    case_key: impl Fn(&C) -> &str,
+    case_to_fn: &BTreeMap<String, String>,
+    may_drop: impl Fn(&C) -> bool,
+) -> BTreeMap<String, usize> {
+    let mut completed: BTreeSet<&str> = BTreeSet::new();
+    let mut blocked: BTreeSet<&str> = BTreeSet::new();
+    let mut dropped: BTreeMap<&str, usize> = BTreeMap::new();
+    for c in cases {
+        let key = case_key(c);
+        let Some(fn_name) = case_to_fn.get(key) else {
+            continue;
+        };
+        if !stage.failed_fns.contains(fn_name) {
+            continue;
+        }
+        if stage.results.contains_key(key) {
+            completed.insert(fn_name);
+        } else if stage.inconclusive_cases.contains(key) && may_drop(c) {
+            *dropped.entry(fn_name).or_insert(0) += 1;
+        } else {
+            blocked.insert(fn_name);
+        }
+    }
+    dropped
+        .into_iter()
+        .filter(|(f, _)| completed.contains(f) && !blocked.contains(f))
+        .map(|(f, n)| (f.to_string(), n))
+        .collect()
 }
 
 /// Writes `src` to `verify_dir/<label>.lean` and runs `lake env lean -M <mb>`
@@ -2107,6 +2183,13 @@ pub struct ItreeCampaignEvalReport {
     /// `staging_failed`, `empty_trace`, `lean_probe_failed`,
     /// `lean_confirm_failed`).
     pub not_compared_reasons: BTreeMap<String, usize>,
+    /// Compared candidates whose Stage 1 probe or Stage 2 confirmation left
+    /// some distinct traces unchecked because a watchdog / Lean resource limit
+    /// hit the smallest Lean module containing them that was run (never a Lean
+    /// rejection, and never an unconfirmed divergence): candidate -> number of
+    /// such traces, which are excluded from `distinct_traces_checked` while the
+    /// candidate is compared on its remaining traces.
+    pub inconclusive_traces_by_candidate: BTreeMap<String, usize>,
     /// Per-mutator application counts across all generated candidates.
     pub mutator_applications: BTreeMap<String, usize>,
     /// Deterministic, sorted observation-path signatures observed during live
@@ -3363,6 +3446,7 @@ fn evaluate_itree_entries(
         .iter()
         .map(|k| (k.to_string(), 0))
         .collect();
+    let mut inconclusive_traces_by_candidate: BTreeMap<String, usize> = BTreeMap::new();
 
     if opt_level_0_and_2_compiled == 0 {
         return Err(format!(
@@ -3743,7 +3827,28 @@ fn evaluate_itree_entries(
         for err in &probe_stage.errors {
             eprintln!("itree-difftest: Stage 1 Lean probe failure: {err}");
         }
+        // A candidate whose only unprobed traces hit resource limits (in the
+        // smallest module containing them that was run) stays compared on its
+        // probed traces (the unprobed ones are unchecked, like trials never
+        // run); any other failure drops it whole.
+        let probe_partial = itree_partially_comparable_fns(
+            &probe_stage,
+            &batch_cases,
+            batch_case_ident,
+            &case_to_fn,
+            |_| true,
+        );
         for fn_name in &probe_stage.failed_fns {
+            if let Some(&dropped) = probe_partial.get(fn_name) {
+                eprintln!(
+                    "itree-difftest: `{fn_name}` partially compared: {dropped} trace(s) \
+                     inconclusive in Stage 1 Lean probe (watchdog / Lean resource limits)"
+                );
+                *inconclusive_traces_by_candidate
+                    .entry(fn_name.clone())
+                    .or_insert(0) += dropped;
+                continue;
+            }
             if compared_fn_names.remove(fn_name) {
                 eprintln!("itree-difftest: `{fn_name}` not compared: lean_probe_failed");
                 *not_compared_reasons
@@ -3753,9 +3858,10 @@ fn evaluate_itree_entries(
         }
         let probe_map = probe_stage.results;
         batch_cases.retain(|c| {
-            case_to_fn
-                .get(&c.case_ident)
-                .is_some_and(|f| compared_fn_names.contains(f))
+            probe_map.contains_key(&c.case_ident)
+                && case_to_fn
+                    .get(&c.case_ident)
+                    .is_some_and(|f| compared_fn_names.contains(f))
         });
         if batch_cases.is_empty() {
             return Err(format!(
@@ -3837,7 +3943,31 @@ fn evaluate_itree_entries(
         for err in &confirm_stage.errors {
             eprintln!("itree-difftest: Stage 2 Lean kernel confirmation failure: {err}");
         }
+        // A candidate keeps being compared without its unconfirmed traces only
+        // if each of them is a Stage 1 `ok` trace whose confirmation hit
+        // resource limits, and at least one of its traces was kernel-confirmed:
+        // an unconfirmed divergence must never be dropped (that would report
+        // the candidate as agreeing), so it drops the candidate whole, as does
+        // any kernel rejection.
+        let confirm_partial = itree_partially_comparable_fns(
+            &confirm_stage,
+            &confirm_cases,
+            batch_case_ident,
+            &case_to_fn,
+            |c| c.expected_diag_tag.as_deref() == Some("ok"),
+        );
         for fn_name in &confirm_stage.failed_fns {
+            if let Some(&dropped) = confirm_partial.get(fn_name) {
+                eprintln!(
+                    "itree-difftest: `{fn_name}` partially compared: {dropped} `ok` trace(s) \
+                     inconclusive in Stage 2 Lean kernel confirmation (watchdog / Lean \
+                     resource limits)"
+                );
+                *inconclusive_traces_by_candidate
+                    .entry(fn_name.clone())
+                    .or_insert(0) += dropped;
+                continue;
+            }
             if compared_fn_names.remove(fn_name) {
                 eprintln!("itree-difftest: `{fn_name}` not compared: lean_confirm_failed");
                 *not_compared_reasons
@@ -3846,10 +3976,16 @@ fn evaluate_itree_entries(
             }
         }
         let confirmed_theorems: BTreeMap<String, String> = confirm_stage.results;
+        let unconfirmed_selected: BTreeSet<&str> = confirm_cases
+            .iter()
+            .filter(|c| !confirmed_theorems.contains_key(&c.case_ident))
+            .map(|c| c.case_ident.as_str())
+            .collect();
         batch_cases.retain(|c| {
-            case_to_fn
-                .get(&c.case_ident)
-                .is_some_and(|f| compared_fn_names.contains(f))
+            !unconfirmed_selected.contains(c.case_ident.as_str())
+                && case_to_fn
+                    .get(&c.case_ident)
+                    .is_some_and(|f| compared_fn_names.contains(f))
         });
         if batch_cases.is_empty() {
             return Err(format!(
@@ -3952,6 +4088,7 @@ fn evaluate_itree_entries(
         let agree_candidates = compared_candidates.saturating_sub(diverge_candidates);
         let not_compared_candidates = total_candidates.saturating_sub(compared_candidates);
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        inconclusive_traces_by_candidate.retain(|f, _| compared_fn_names.contains(f));
 
         Ok(ItreeCampaignEvalReport {
             mode: mode.to_string(),
@@ -3980,6 +4117,7 @@ fn evaluate_itree_entries(
             per_candidate_distinct_traces,
             diag_tag_counts,
             not_compared_reasons,
+            inconclusive_traces_by_candidate,
             mutator_applications,
             obs_path_signatures: obs_path_signatures_set.into_iter().collect(),
             findings,
@@ -4455,6 +4593,14 @@ pub fn evaluate_itree_candidate_live(
         return Err(format!(
             "`{target_fn}` was not compared (not-compared reasons: {:?})",
             report.not_compared_reasons
+        ));
+    }
+    // A partial comparison gives no judgment: the signature may live on one of
+    // the traces left unchecked by a resource limit.
+    if let Some(dropped) = report.inconclusive_traces_by_candidate.get(&target_fn) {
+        return Err(format!(
+            "`{target_fn}` was only partially compared ({dropped} trace(s) inconclusive \
+             under Lean resource limits)"
         ));
     }
     Ok(ItreeCandidateEvaluation {
@@ -4968,6 +5114,7 @@ pub fn render_itree_eval_report_json(report: &ItreeCampaignEvalReport) -> String
          \x20 \"per_candidate_distinct_traces\": {},\n\
          \x20 \"diag_tag_counts\": {},\n\
          \x20 \"not_compared_reasons\": {},\n\
+         \x20 \"inconclusive_traces_by_candidate\": {},\n\
          \x20 \"mutator_applications\": {},\n\
          \x20 \"obs_path_signatures\": {},\n\
          \x20 \"findings_count\": {},\n\
@@ -5000,6 +5147,7 @@ pub fn render_itree_eval_report_json(report: &ItreeCampaignEvalReport) -> String
         render_usize_map_json(&report.per_candidate_distinct_traces, 2),
         render_usize_map_json(&report.diag_tag_counts, 2),
         render_usize_map_json(&report.not_compared_reasons, 2),
+        render_usize_map_json(&report.inconclusive_traces_by_candidate, 2),
         render_usize_map_json(&report.mutator_applications, 2),
         render_string_list_json(&report.obs_path_signatures, 2),
         report.findings.len(),
@@ -5067,6 +5215,17 @@ pub fn render_itree_eval_report_markdown(report: &ItreeCampaignEvalReport) -> St
     out.push_str("| Reason | Candidates |\n| :--- | ---: |\n");
     for (reason, count) in &report.not_compared_reasons {
         out.push_str(&format!("| `{reason}` | {count} |\n"));
+    }
+
+    if !report.inconclusive_traces_by_candidate.is_empty() {
+        out.push_str("\n## Partially Compared Candidates (Inconclusive Traces)\n\n");
+        out.push_str(
+            "| Candidate Root Function | Traces Unchecked (Lean Resource Limits) |\n\
+             | :--- | ---: |\n",
+        );
+        for (fn_name, count) in &report.inconclusive_traces_by_candidate {
+            out.push_str(&format!("| `{fn_name}` | {count} |\n"));
+        }
     }
 
     out.push_str("\n## Mutator Applications\n\n");
@@ -6344,6 +6503,10 @@ mod tests {
 
         let mut tree = TrackedProcessTree::with_proc_root(30000, &proc_dir, 4);
         assert_eq!(tree.sample_rss_kib(), 400 + 1000 + 2000);
+        // A positively running root has not exited (so `reap_exited_root` must
+        // not `try_wait` it).
+        assert_eq!(tree.root_proc_zombie_or_running(), Some(false));
+        assert!(!tree.root_has_exited());
 
         // Descendant kill order must put newest grandchild (PID 105, starttime 300)
         // before its parent (PID 32700, starttime 200) despite 105 < 32700.
@@ -6367,6 +6530,19 @@ mod tests {
         assert_eq!(tree.sample_rss_kib(), 2400 + 1200);
         assert_eq!(tree.descendant_kill_order(), vec![(40000, 400), (105, 300)]);
         assert!(tree.root_has_exited());
+        assert_eq!(tree.root_proc_zombie_or_running(), Some(true));
+
+        // A root whose `/proc` entry vanished after its `starttime` was recorded
+        // has exited, but one whose `starttime` was never observable (no
+        // `/proc/<pid>`, e.g. a host without procfs) must not be reported as
+        // exited, so `terminate_process_tree` still waits out the full `SIGTERM`
+        // grace period before `SIGKILL`.
+        fs::remove_dir_all(proc_dir.join("30000")).unwrap();
+        assert_eq!(tree.root_proc_zombie_or_running(), None);
+        assert!(tree.root_has_exited());
+        let unobservable = TrackedProcessTree::with_proc_root(31337, &proc_dir, 4);
+        assert_eq!(unobservable.root_proc_zombie_or_running(), None);
+        assert!(!unobservable.root_has_exited());
 
         let _ = fs::remove_dir_all(&proc_dir);
     }
@@ -6506,6 +6682,102 @@ mod tests {
             }),
             "expected explicit irreducible single-case diagnostic in {:?}",
             stage.errors
+        );
+        // The poison case only timed out (unchecked, not refuted), so the
+        // pipeline keeps comparing `cand_one_poison` on its 3 healthy siblings.
+        assert_eq!(
+            stage.inconclusive_cases,
+            BTreeSet::from(["case_cand_one_poison_t2".to_string()])
+        );
+        assert_eq!(
+            itree_partially_comparable_fns(&stage, &cases, ident, &case_to_fn, |_| true),
+            BTreeMap::from([("cand_one_poison".to_string(), 1)])
+        );
+    }
+
+    /// `inconclusive_cases` keeps the most specific failure of each unresolved
+    /// case: a case that only hit a watchdog in isolation is inconclusive, a
+    /// Lean rejection never is, and [`itree_partially_comparable_fns`] keeps a
+    /// candidate only when all of its unresolved cases are inconclusive (and
+    /// droppable) and at least one of its cases completed.
+    #[test]
+    fn isolated_lean_stage_tracks_inconclusive_cases_for_partial_comparison() {
+        let (cases, case_to_fn) = stage_fixture(&[
+            ("cand_timeout_one", 4),
+            ("cand_reject_one", 4),
+            ("cand_all_timeout", 2),
+            ("cand_ok", 2),
+        ]);
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchProbe",
+            &cases,
+            4,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, chunk: &[String]| {
+                let times_out = |c: &String| {
+                    c == "case_cand_timeout_one_t1" || c.starts_with("case_cand_all_timeout")
+                };
+                if chunk.iter().any(times_out) {
+                    return Err(format!(
+                        "[WATCHDOG:TIMEOUT] `/tmp/verify/{label}.lean` exceeded wall-clock timeout"
+                    ));
+                }
+                if chunk.iter().any(|c| c == "case_cand_reject_one_t3") {
+                    return Err(format!(
+                        "`/tmp/verify/{label}.lean` failed:\nstdout:\n\
+                         /tmp/verify/{label}.lean:9:4: error: unknown constant \
+                         'case_cand_reject_one_t3_rawTrace'\nstderr:\n"
+                    ));
+                }
+                ok_all(chunk)
+            },
+        );
+        assert_eq!(
+            stage.failed_fns,
+            BTreeSet::from([
+                "cand_all_timeout".to_string(),
+                "cand_reject_one".to_string(),
+                "cand_timeout_one".to_string(),
+            ])
+        );
+        for healthy in [
+            "case_cand_timeout_one_t0",
+            "case_cand_timeout_one_t2",
+            "case_cand_timeout_one_t3",
+            "case_cand_reject_one_t0",
+            "case_cand_reject_one_t1",
+            "case_cand_reject_one_t2",
+            "case_cand_ok_t0",
+            "case_cand_ok_t1",
+        ] {
+            assert!(stage.results.contains_key(healthy), "{healthy} must be recovered");
+        }
+        // The chunk-level timeout first marked every case of the third chunk, but
+        // `cand_ok`'s fallback succeeded, and the rejected case's most specific
+        // failure (its single-case bisection run) is a Lean rejection.
+        assert_eq!(
+            stage.inconclusive_cases,
+            BTreeSet::from([
+                "case_cand_all_timeout_t0".to_string(),
+                "case_cand_all_timeout_t1".to_string(),
+                "case_cand_timeout_one_t1".to_string(),
+            ])
+        );
+        // Only `cand_timeout_one` stays comparable: `cand_reject_one` has a
+        // refuted case and `cand_all_timeout` has nothing left to compare.
+        assert_eq!(
+            itree_partially_comparable_fns(&stage, &cases, ident, &case_to_fn, |_| true),
+            BTreeMap::from([("cand_timeout_one".to_string(), 1)])
+        );
+        // Stage 2 forbids dropping unconfirmed divergences (`may_drop == false`):
+        // the candidate is then dropped whole.
+        assert!(
+            itree_partially_comparable_fns(&stage, &cases, ident, &case_to_fn, |c| {
+                c != "case_cand_timeout_one_t1"
+            })
+            .is_empty()
         );
     }
 

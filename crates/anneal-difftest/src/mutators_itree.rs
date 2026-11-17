@@ -2109,7 +2109,8 @@ struct ConcolicPinState {
 ///    all earlier calls with identical arguments and returns = `pins.take pinIdx`)
 ///    and reaches call `j` on the same callee with an argument tuple satisfying
 ///    `neg_arg_pin_term` (distinct from the base arguments and from every tuple
-///    already exercised at that prefix). Among such negations the one reaching an
+///    already exercised at that prefix), whether call `j` then returns or its
+///    callee unwinds on the new arguments. Among such negations the one reaching an
 ///    unseen path shape is preferred (the path after call `j` is unconstrained, and
 ///    `cumulative_distinct_obs_paths` ignores call values, so only new shapes add
 ///    observable paths), then one keeping the base's branch decisions. 0-argument
@@ -2246,9 +2247,15 @@ pub fn explore_itree_concolic_trials(
                 if !run.shares_prefix_with(base, ps.pos) || seen_runs.contains(&*run) {
                     continue;
                 }
-                let Some(ItreeConcreteEvent::ExtCall { callee, args, .. }) = run.events.get(ps.pos)
-                else {
-                    continue;
+                // The call may return or unwind on its new arguments: either way
+                // it was made with `arg != prev_arg` under the preserved prefix
+                // (the native recorder logs an unwinding pass-through call as
+                // `ExtCallPanic` with its `raw_args`), and a callee panic is a new
+                // observable outcome that only argument steering can reach.
+                let (callee, args) = match run.events.get(ps.pos) {
+                    Some(ItreeConcreteEvent::ExtCall { callee, args, .. })
+                    | Some(ItreeConcreteEvent::ExtCallPanic { callee, args }) => (callee, args),
+                    _ => continue,
                 };
                 if *callee != ps.pin.callee || !ps.pin.neg_arg_pin_term(args) {
                     continue;
@@ -3117,7 +3124,8 @@ mod tests {
                                 new_arg_tuple,
                                 ..
                             },
-                            ItreeConcreteEvent::ExtCall { callee: c, args, .. },
+                            ItreeConcreteEvent::ExtCall { callee: c, args, .. }
+                            | ItreeConcreteEvent::ExtCallPanic { callee: c, args },
                         ) => {
                             assert!(
                                 !saw_return_phase,
@@ -3463,5 +3471,55 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A negated argument tuple on which the callee itself unwinds is still an
+    /// `argPinTerm` negation: the call happened with `arg != prev_arg` under the
+    /// preserved prefix (the native recorder logs an unwinding pass-through call
+    /// as `ExtCallPanic` with its `raw_args`), and its panic outcome is a new
+    /// observable path that only argument steering reaches, so the explorer must
+    /// accept it and prefer it over same-shape negations.
+    #[test]
+    fn concolic_arg_negation_accepts_callee_panics_on_negated_arguments() {
+        let src = r#"
+            pub fn ext_sub(x: u32) -> u32 { x - 5 }
+            pub fn kernel_step(magic: u32, payload_len: u32) -> u32 {
+                let r: u32 = ext_sub(payload_len);
+                r ^ magic
+            }
+        "#;
+        let dict = MirInputDictionary::from_rust_source(src).unwrap();
+        let ev = ItreeConcreteEvaluator::new(src, "kernel_step").unwrap();
+        let base = ev
+            .run_kernel_step(0x414E_4E4C, 2048, &EnvSchedule::new(), "")
+            .unwrap();
+        assert!(matches!(base.outcome, ItreeConcreteOutcome::Return(_)));
+        let trials =
+            explore_itree_concolic_trials(src, "kernel_step", "", &[(0x414E_4E4C, 2048)], &dict, 1, 3);
+        assert_eq!(trials.len(), 1);
+        let t = &trials[0];
+        let ConcolicTrialPhase::NegateCallArg {
+            callee,
+            new_arg_tuple,
+            ..
+        } = &t.phase
+        else {
+            panic!("expected an argument negation, got {:?}", t.phase);
+        };
+        assert_eq!(callee, "ext_sub");
+        assert!(u32::from_le_bytes(new_arg_tuple[0][..4].try_into().unwrap()) < 5);
+        assert_eq!(t.predicted.outcome, ItreeConcreteOutcome::Panic);
+        assert_eq!(
+            t.predicted.events,
+            vec![ItreeConcreteEvent::ExtCallPanic {
+                callee: "ext_sub".to_string(),
+                args: new_arg_tuple.clone(),
+            }]
+        );
+        assert_eq!(
+            ev.run_kernel_step(t.magic, t.payload_len, &t.schedule, "")
+                .unwrap(),
+            t.predicted
+        );
     }
 }
