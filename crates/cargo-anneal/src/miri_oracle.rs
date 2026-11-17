@@ -1666,19 +1666,8 @@ pub fn run_miri_oracle(
         )
     })?;
 
-    let mut compile_cmd = Command::new(&config.toolchain.rustc_bin);
-    compile_cmd
-        .current_dir(&corpus_root)
-        .arg("--sysroot")
-        .arg(&config.toolchain.miri_sysroot)
-        .arg("--edition=2024")
-        .arg("--crate-type=lib")
-        .arg(format!("--crate-name={crate_name}"))
-        .arg("-Zalways-encode-mir");
-    for flag in expand_flag_tokens(&config.capture_rustflags) {
-        compile_cmd.arg(flag);
-    }
-    compile_cmd.arg("src/lib.rs").arg("-o").arg(&rlib_path);
+    let mut compile_cmd =
+        build_miri_rlib_compile_command(config, &corpus_root, &crate_name, &rlib_path);
 
     let compile_out = compile_cmd.output().map_err(|err| {
         let _ = fs::remove_dir_all(&scratch_dir);
@@ -1699,21 +1688,14 @@ pub fn run_miri_oracle(
 
     let mut outcomes = BTreeMap::new();
     for item in items {
-        let mut miri_cmd = Command::new(&config.toolchain.miri_bin);
-        miri_cmd
-            .current_dir(&corpus_root)
-            .arg("--sysroot")
-            .arg(&config.toolchain.miri_sysroot);
-        for flag in &config.miri_flags {
-            miri_cmd.arg(flag);
-        }
-        miri_cmd
-            .arg("-Zmiri-disable-isolation")
-            .arg("--edition=2024")
-            .arg(&driver_rs_path)
-            .arg("--extern")
-            .arg(format!("{crate_name}={}", rlib_path.display()))
-            .env("MIRI_ORACLE_ITEM", &item.name);
+        let mut miri_cmd = build_miri_item_command(
+            config,
+            &corpus_root,
+            &crate_name,
+            &driver_rs_path,
+            &rlib_path,
+            &item.name,
+        );
 
         let outcome = match miri_cmd.output() {
             Ok(output) => {
@@ -1738,6 +1720,58 @@ pub fn run_miri_oracle(
 
     let _ = fs::remove_dir_all(&scratch_dir);
     Ok(outcomes)
+}
+
+fn build_miri_rlib_compile_command(
+    config: &MiriOracleConfig,
+    corpus_root: &Path,
+    crate_name: &str,
+    rlib_path: &Path,
+) -> Command {
+    let mut compile_cmd = Command::new(&config.toolchain.rustc_bin);
+    compile_cmd
+        .current_dir(corpus_root)
+        .env_remove(ANNEAL_CAPTURE_DIR_ENV)
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+        .arg("--sysroot")
+        .arg(&config.toolchain.miri_sysroot)
+        .arg("--edition=2024")
+        .arg("--crate-type=lib")
+        .arg(format!("--crate-name={crate_name}"))
+        .arg("-Zalways-encode-mir");
+    for flag in expand_flag_tokens(&config.capture_rustflags) {
+        compile_cmd.arg(flag);
+    }
+    compile_cmd.arg("src/lib.rs").arg("-o").arg(rlib_path);
+    compile_cmd
+}
+
+fn build_miri_item_command(
+    config: &MiriOracleConfig,
+    corpus_root: &Path,
+    crate_name: &str,
+    driver_rs_path: &Path,
+    rlib_path: &Path,
+    item_name: &str,
+) -> Command {
+    let mut miri_cmd = Command::new(&config.toolchain.miri_bin);
+    miri_cmd
+        .current_dir(corpus_root)
+        .env_remove(ANNEAL_CAPTURE_DIR_ENV)
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+        .arg("--sysroot")
+        .arg(&config.toolchain.miri_sysroot);
+    for flag in &config.miri_flags {
+        miri_cmd.arg(flag);
+    }
+    miri_cmd
+        .arg("-Zmiri-disable-isolation")
+        .arg("--edition=2024")
+        .arg(driver_rs_path)
+        .arg("--extern")
+        .arg(format!("{crate_name}={}", rlib_path.display()))
+        .env("MIRI_ORACLE_ITEM", item_name);
+    miri_cmd
 }
 
 fn expand_flag_tokens(flags: &[String]) -> Vec<String> {
@@ -3480,5 +3514,43 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
             "process-environment mutation in cargo-anneal sources:\n{}",
             offenders.join("\n")
         );
+    }
+
+    #[test]
+    fn miri_oracle_commands_strip_anneal_capture_env_vars() {
+        let cfg = MiriOracleConfig {
+            corpus_root: PathBuf::from("/tmp/corpus"),
+            capture_rustflags: vec!["-Zmir-opt-level=0".to_string()],
+            miri_flags: vec!["-Zmiri-tree-borrows".to_string()],
+            toolchain: MiriToolchain {
+                rustc_bin: PathBuf::from("/usr/bin/rustc"),
+                miri_bin: PathBuf::from("/usr/bin/miri"),
+                miri_sysroot: PathBuf::from("/tmp/miri-sysroot"),
+            },
+        };
+        let compile_cmd = build_miri_rlib_compile_command(
+            &cfg,
+            Path::new("/tmp/corpus"),
+            "miri_diff_corpus",
+            Path::new("/tmp/scratch/libmiri_diff_corpus.rlib"),
+        );
+        let miri_cmd = build_miri_item_command(
+            &cfg,
+            Path::new("/tmp/corpus"),
+            "miri_diff_corpus",
+            Path::new("/tmp/scratch/miri_driver.rs"),
+            Path::new("/tmp/scratch/libmiri_diff_corpus.rlib"),
+            "cand_item",
+        );
+        for (label, cmd) in [("compile_cmd", &compile_cmd), ("miri_cmd", &miri_cmd)] {
+            let envs: BTreeMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+            for removed in [ANNEAL_CAPTURE_DIR_ENV, ANNEAL_CAPTURE_FILTER_ENV] {
+                assert_eq!(
+                    envs.get(OsStr::new(removed)),
+                    Some(&None),
+                    "{label} must explicitly remove {removed}"
+                );
+            }
+        }
     }
 }

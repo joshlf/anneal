@@ -480,8 +480,12 @@ assert d1["mutator_applications"] != d2["mutator_applications"], (
     assert!(finding_json.contains("\"shrink_status\": \"skipped_replay_mismatch\""));
     assert!(finding_json.contains("\"executed_oracle_runs\": 0"));
 
+    // Pass an ambient `ANNEAL_CAPTURE_DIR` into the `--reproduce` subprocess to
+    // verify that `run_miri_oracle` strips `ANNEAL_CAPTURE_DIR` from the Miri
+    // `.rlib` and `miri` invocations and preserves the oracle split.
     let repro_json = dir.join("repro_neg.json");
     let repro_out = Command::new(bin)
+        .env("ANNEAL_CAPTURE_DIR", dir.join("ambient_capture_dir_leak"))
         .arg("--reproduce")
         .arg(repro_path)
         .arg("--output-json")
@@ -2340,6 +2344,10 @@ const CHAR_SURROGATE_ON_FIELD_FLIP_SEED: &str = r#"pub fn seed_char_surrogate_on
 /// pre-shrink artifact is left on a minimized finding).
 #[test]
 fn seeded_divergent_findings_shrink_live_and_minimized_repros_reproduce() {
+    assert!(
+        std::env::var_os("ANNEAL_CAPTURE_DIR").is_none(),
+        "ANNEAL_CAPTURE_DIR must be unset in the test process environment"
+    );
     let dir = unique_temp_dir("shrink_live");
     let root = repo_root();
     let findings_dir = dir.join("findings_shrink");

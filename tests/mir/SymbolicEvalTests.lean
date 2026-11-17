@@ -4478,6 +4478,35 @@ example (retVal : Value) (mem : Memory) :
       MirStepNode.fail .ub :=
   rfl
 
+/--
+`verifyExternalSpecContractMirSym` discharges a `ModularVerificationResult` for
+a named `MirCallContract` definitionally equal to `externalSpecCallContract`.
+-/
+private def frameReturnConstMir : CapturedMir :=
+  mkMirBody "symbolic_eval_tests::frame_return_const" 0
+    [mkDecl .mut u32MirTy]
+    [{ statements :=
+         [mkStmt (.assign { local_ := 0, projection := [] } (.use (u32ConstOperand 7)))]
+       terminator := mkTerm .return_
+       isCleanup := false }]
+
+private def frameReturnExtContract : MirCallContract :=
+  externalSpecCallContract "symbolic_eval_tests::ext_target" frameReturnConstMir
+    (fun _ => True) (fun _ _ => True)
+
+example :
+    ModularVerificationResult
+      { body := frameReturnConstMir
+        envAssumed := frameReturnExtContract.holdsOn
+        pre := fun args mem =>
+          args = [] ∧ mem.callStack = [] ∧ mem.activeCallee = .none ∧ mem.activeProtectors = []
+        post := fun _ _ retVal _ => retVal = .scalar { bits := 7, sizeBytes := 4 } } := by
+  refine verifyExternalSpecContractMirSym frameReturnExtContract frameReturnConstMir _ _ 3 ?_
+  rintro args ⟨_, _, _, _, _, _, _, _, _, _, _, _, _⟩ ⟨rfl, rfl, rfl, rfl⟩
+  rintro retVal mem' h_out
+  cases h_out
+  rfl
+
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
 /-!

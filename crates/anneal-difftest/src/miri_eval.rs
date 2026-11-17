@@ -1576,6 +1576,19 @@ pub fn resolve_rustc_bin() -> String {
 /// another's output before `rustc` wrote it.
 static SNIPPET_COMPILE_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+fn build_snippet_rustc_command(rustc_bin: &str, out_path: &Path) -> Command {
+    let mut cmd = Command::new(rustc_bin);
+    cmd.env_remove("ANNEAL_CAPTURE_DIR")
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+        .args(["--edition=2024", "--crate-type=lib", "-A", "warnings", "-o"])
+        .arg(out_path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 /// Runs `rustc --edition=2024 --crate-type=lib` on an in-memory Rust source
 /// string and reports whether it compiled.
 pub fn compile_rust_snippet(label: &str, source: &str) -> bool {
@@ -1589,14 +1602,7 @@ pub fn compile_rust_snippet(label: &str, source: &str) -> bool {
     let _ = fs::create_dir_all(&tmp_dir);
     let out_path = tmp_dir.join("libmiri_check.rlib");
 
-    let child_res = Command::new(&rustc_bin)
-        .args(["--edition=2024", "--crate-type=lib", "-A", "warnings", "-o"])
-        .arg(&out_path)
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+    let child_res = build_snippet_rustc_command(&rustc_bin, &out_path).spawn();
 
     let Ok(mut child) = child_res else {
         let _ = fs::remove_dir_all(&tmp_dir);
@@ -2622,13 +2628,16 @@ fn staged_helper_fns_reachable_from_candidates(
     staged_fns_and_aux_reachable_from_candidates(lib_rs, items).0
 }
 
+static STAGING_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+
 fn create_staging_dir(label: &str) -> Result<PathBuf, String> {
+    let seq = STAGING_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let dir = env::temp_dir().join(format!(
-        "anneal_miri_eval_{label}_{}_{stamp}",
+        "anneal_miri_eval_{label}_{}_{seq}_{stamp}",
         std::process::id()
     ));
     fs::create_dir_all(dir.join("src"))
@@ -3118,6 +3127,9 @@ fn ensure_rustc_wrapper(
         let output = Command::new(&cargo_bin)
             .args(["build", "-p", "anneal-rustc-capture", "--locked"])
             .current_dir(root)
+            .env_remove("ANNEAL_CAPTURE_DIR")
+            .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .output()
             .map_err(|e| format!("failed to invoke cargo build for anneal-rustc-capture: {e}"))?;
         if output.status.success() && built.is_file() {
@@ -11851,5 +11863,26 @@ pub fn cand_shadow() -> u32 {
             !extracted.contains("Mir.X.helper_wrong.body"),
             "panic comment in group 0 must not hijack cand_real's namespace: {extracted}"
         );
+    }
+
+    #[test]
+    fn snippet_rustc_and_staging_dir_isolate_capture_env_and_paths() {
+        use std::ffi::OsStr;
+
+        let cmd = build_snippet_rustc_command("rustc", Path::new("/tmp/libmiri_check.rlib"));
+        let envs: BTreeMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+        for removed in ["ANNEAL_CAPTURE_DIR", ANNEAL_CAPTURE_FILTER_ENV] {
+            assert_eq!(
+                envs.get(OsStr::new(removed)),
+                Some(&None),
+                "build_snippet_rustc_command must remove {removed}"
+            );
+        }
+
+        let d1 = create_staging_dir("unit").expect("staging dir 1");
+        let d2 = create_staging_dir("unit").expect("staging dir 2");
+        assert_ne!(d1, d2, "concurrent staging dirs must be distinct");
+        let _ = fs::remove_dir_all(&d1);
+        let _ = fs::remove_dir_all(&d2);
     }
 }
