@@ -2736,7 +2736,7 @@ instance callerFfiAndLenSpec : ModularItemSpec "crate_a::caller_ffi_and_len" :=
 set_option maxRecDepth 100000 in
 theorem callerFfiAndLen_verified :
     ModularVerificationResult Obligations.CrateA.caller_ffi_and_len.modularClaim := by
-  refine Anneal.Rustc.V2026_06_01.SymbolicEval.verifyModularContractWithCalleesMirSym
+  refine Anneal.Rustc.V2026_06_01.SymbolicEval.verifyExternalSpecContractWithCalleesMirSym
     Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
     Mir.CrateA.caller_ffi_and_len.body
     Obligations.CrateA.caller_ffi_and_len.defaultCallees
@@ -2763,7 +2763,7 @@ theorem callerFfiAndLen_verified :
             isUninhabited := false
           })]) := rfl
   change
-    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecFrameModularSym
       Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
       6
       Mir.CrateA.caller_ffi_and_len.body
@@ -2844,7 +2844,7 @@ theorem callerFfiAndLen_verified :
             isUninhabited := false
           })]) := rfl
   change
-    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecFrameModularSym
       Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
       5
       Mir.CrateA.caller_ffi_and_len.body
@@ -2931,7 +2931,7 @@ theorem callerFfiAndLen_verified :
       })
       _
   rw [h_core_len]
-  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecFrameModularSym
   dsimp only [
     Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
     Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
@@ -2943,32 +2943,7 @@ theorem callerFfiAndLen_verified :
   intro ans h_post
   cases ans with
   | returned retVal memAfter =>
-    rcases h_post with ⟨⟨_, h_stack, h_active, _, _⟩, h_ret, _⟩
-    have h_act : memAfter.activeCallee = .some Mir.CrateA.caller_ffi_and_len.body := h_active
-    have h_stk : memAfter.callStack = .nil := h_stack
-    change
-      Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
-        Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
-        1
-        Mir.CrateA.caller_ffi_and_len.body
-        (.running {
-          frame := {
-            blockIdx := 2
-            stmtIdx := 0
-            locals := [.init retVal, .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
-          }
-          memory := memAfter
-        })
-        _
-    unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
-    dsimp only [
-      Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular,
-      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
-      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
-      Anneal.Rustc.V2026_06_01.SymbolicEval.evalTerminatorSymTree,
-      evalTerminator
-    ]
-    rw [h_act, h_stk]
+    rcases h_post with ⟨_, h_ret, _⟩
     intro r m h_out
     cases h_out
     exact ⟨trivial, h_ret⟩
@@ -3055,7 +3030,7 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 
 set_option maxRecDepth 100000 in
 theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_len.modularClaim := by
-  refine Anneal.Rustc.V2026_06_01.SymbolicEval.verifyModularContractWithCalleesMirSym
+  refine Anneal.Rustc.V2026_06_01.SymbolicEval.verifyExternalSpecContractWithCalleesMirSym
     Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
     Mir.CrateA.caller_ffi_and_len.body
     Obligations.CrateA.caller_ffi_and_len.defaultCallees
@@ -3082,7 +3057,7 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
             isUninhabited := false
           })]) := rfl
   change
-    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecFrameModularSym
       Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
       6
       Mir.CrateA.caller_ffi_and_len.body
@@ -3163,7 +3138,7 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
             isUninhabited := false
           })]) := rfl
   change
-    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecFrameModularSym
       Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
       5
       Mir.CrateA.caller_ffi_and_len.body
@@ -3250,7 +3225,7 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
       })
       _
   rw [h_core_len]
-  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecFrameModularSym
   dsimp only [
     Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
     Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
@@ -3262,32 +3237,7 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
   intro ans h_post
   cases ans with
   | returned retVal memAfter =>
-    rcases h_post with ⟨⟨_, h_stack, h_active, _, _⟩, h_ret, _⟩
-    have h_act : memAfter.activeCallee = .some Mir.CrateA.caller_ffi_and_len.body := h_active
-    have h_stk : memAfter.callStack = .nil := h_stack
-    change
-      Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
-        Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
-        1
-        Mir.CrateA.caller_ffi_and_len.body
-        (.running {
-          frame := {
-            blockIdx := 2
-            stmtIdx := 0
-            locals := [.init retVal, .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
-          }
-          memory := memAfter
-        })
-        _
-    unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
-    dsimp only [
-      Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular,
-      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
-      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
-      Anneal.Rustc.V2026_06_01.SymbolicEval.evalTerminatorSymTree,
-      evalTerminator
-    ]
-    rw [h_act, h_stk]
+    rcases h_post with ⟨_, h_ret, _⟩
     intro r m h_out
     cases h_out
     exact ⟨trivial, h_ret⟩

@@ -240,9 +240,12 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
 
     // 2. Live kernel-confirmed Miri vs. Anneal divergence bundle + `--reproduce` +
     // unquarantined / partial-quarantine / full-quarantine verification:
-    // Evaluate a batch with 3 corpus candidates plus a negative-control
-    // candidate (`char` surrogate written through `*mut u32`) through live
-    // `evaluate_miri_batches` to produce a real `repro.rs` bundle on disk.
+    // Evaluate a batch with 3 corpus candidates, `neg_ctrl_char_surrogate_via_ptr__b0_c3`
+    // (a positive regression check confirming that after `DIV-LM-RAW-OVERWRITE-CHAR-COPY`
+    // in `86255c4698`, Miri and Anneal agree that reading a surrogate `char` written
+    // through `*mut u32` is `.ub`), plus a synthetic negative-control candidate
+    // (`neg_ctrl_synthetic_missed_ub__b0_c4`) through live `evaluate_miri_batches`
+    // to produce a real `repro.rs` bundle on disk.
     let root = repo_root();
     let mut div_batch =
         anneal_difftest::mutators_miri::generate_miri_corpus_batch(3, 0x5eed_0001, 0);
@@ -267,17 +270,74 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c3() -> u32 {
         fn_source: neg_fn.to_string(),
         source: anneal_difftest::mutators_miri::build_standalone_candidate_source(neg_fn),
     });
+    let neg_synthetic_fn = "\
+pub fn neg_ctrl_synthetic_missed_ub__b0_c4() -> u32 {
+    struct DropTriggersMiriUb(u32);
+    impl Drop for DropTriggersMiriUb {
+        fn drop(&mut self) {
+            let raw: u8 = 2u8;
+            let _b: bool = unsafe { *(&raw const raw as *const bool) };
+        }
+    }
+    let _g = DropTriggersMiriUb(1u32);
+    1u32
+}
+";
+    div_batch.push(anneal_difftest::mutators_miri::GeneratedMiriCandidate {
+        id: 4,
+        seed_index: 0,
+        seed_name: "ub_transmute_invalid_bool_2".to_string(),
+        fn_name: "neg_ctrl_synthetic_missed_ub__b0_c4".to_string(),
+        seed_u64: 0xDEAD_C0DE,
+        applied_mutators: vec!["BitValidityTransmuteMutator".to_string()],
+        tracked_locals: Vec::new(),
+        fn_source: neg_synthetic_fn.to_string(),
+        source: anneal_difftest::mutators_miri::build_standalone_candidate_source(neg_synthetic_fn),
+    });
     let live_findings_dir = dir.join("live_findings");
     let live_div_eval = anneal_difftest::miri_eval::evaluate_miri_batches(
         "seeded",
         0x5eed_0001,
         &[div_batch],
-        4,
+        5,
         Some(&live_findings_dir),
         Some(&root),
     )
     .expect("evaluate live divergence batch");
+    let char_surrogate_rep = live_div_eval
+        .item_reports
+        .iter()
+        .find(|r| r.name == "neg_ctrl_char_surrogate_via_ptr__b0_c3")
+        .expect("item report for neg_ctrl_char_surrogate_via_ptr__b0_c3");
+    assert_eq!(
+        char_surrogate_rep.verdict,
+        cargo_anneal::ComparisonVerdict::Agree,
+        "after DIV-LM-RAW-OVERWRITE-CHAR-COPY (86255c4698), Miri and Anneal must agree on char surrogate UB: {char_surrogate_rep:?}"
+    );
+    assert!(
+        matches!(char_surrogate_rep.miri, cargo_anneal::MiriOutcome::Ub { .. })
+            && matches!(char_surrogate_rep.anneal, cargo_anneal::AnnealOutcome::Ub { .. }),
+        "neg_ctrl_char_surrogate_via_ptr__b0_c3 must be UB in both Miri and Anneal: {char_surrogate_rep:?}"
+    );
+    let synthetic_div_rep = live_div_eval
+        .item_reports
+        .iter()
+        .find(|r| r.name == "neg_ctrl_synthetic_missed_ub__b0_c4")
+        .expect("item report for neg_ctrl_synthetic_missed_ub__b0_c4");
+    assert!(
+        matches!(
+            synthetic_div_rep.verdict,
+            cargo_anneal::ComparisonVerdict::Diverge(cargo_anneal::DivergenceKind::MissedUb { .. })
+        ) && synthetic_div_rep.kernel_confirmed,
+        "neg_ctrl_synthetic_missed_ub__b0_c4 must produce a kernel-confirmed missed_ub divergence: {synthetic_div_rep:?}"
+    );
     let live_div_payload = anneal_difftest::miri_eval::render_eval_report_json(&live_div_eval);
+    assert!(
+        live_div_payload.contains(
+            "\"neg_ctrl_char_surrogate_via_ptr__b0_c3\": {\"verdict\": \"agree\""
+        ) && live_div_payload.contains("\"anneal_lean_tag\": \"MirDiffTag.ub\""),
+        "rendered eval report JSON must record agreement for neg_ctrl_char_surrogate_via_ptr__b0_c3:\n{live_div_payload}"
+    );
 
     let state_dir_div = dir.join("state_dir_div");
     let out_div = run_campaign_driver(

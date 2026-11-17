@@ -1987,6 +1987,12 @@ theorem lookupSwitchTargetCont_eq
   rw [lookupSwitchTargetCont, SymTree.run_eq_eval, lookupSwitchTargetTree_eval]
 
 /-- Decision-tree symbolic `evalTerminator`. -/
+theorem hasFrameDeallocProtectorConflict_nil_activeProtectors
+    (borrows : List BorrowEntry)
+    (depth nLocals : Nat) :
+    hasFrameDeallocProtectorConflict borrows .nil depth nLocals = false := by
+  cases borrows <;> rfl
+
 def evalTerminatorSymTree
     (s : MachineState)
     (term : Terminator)
@@ -3957,6 +3963,155 @@ theorem evalSymNodeTreeFrameModular_eq
     · exact ih1
 
 /--
+Frame-aware symbolic `evalTerminator` decision tree for `wpMirExecFrameModularSym`:
+when `s.memory.activeProtectors = .nil`, `.return_` short-circuits
+`hasFrameDeallocProtectorConflict` so symbolic post-call borrow lists
+(such as `invalidateDirectDestWriteBorrows`) reduce by WHNF without `List.rec`
+blocking on `borrows`.
+-/
+def evalTerminatorFrameSymTree
+    (s : MachineState)
+    (term : Terminator)
+    (currentBody : CapturedMir) : SymTree MirStepNode :=
+  match term.kind with
+  | .return_ =>
+    .leaf
+      (match s.memory.activeProtectors with
+       | .nil =>
+         match get? s.frame.locals 0 with
+         | .some (.init retVal) =>
+           let depth := length s.memory.callStack
+           let nLocals := length s.frame.locals
+           let borrows₁ := disableFrameBorrows s.memory.borrows depth nLocals
+           match s.memory.callStack with
+           | .nil => MirStepNode.retNormal retVal { s.memory with borrows := borrows₁ }
+           | caller :: restStack =>
+             match caller.isDiverging with
+             | true => MirStepNode.fail .ub
+             | false =>
+               let restoredProtectors := restoreCallerProtectors caller
+               let callerMem : Memory := {
+                 s.memory with
+                 borrows := borrows₁
+                 callStack := restStack
+                 activeCallee := .some caller.callerBody
+                 activeProtectors := restoredProtectors
+               }
+               match
+                 writeReturnDestination
+                   caller.frame.locals
+                   callerMem
+                   caller.destination
+                   retVal
+                   caller.callerBody.localDecls
+                   caller.callerBody.layouts
+               with
+               | .ok updatedCallerLocals mem' =>
+                 MirStepNode.step {
+                   frame := {
+                     caller.frame with
+                     blockIdx := caller.returnTarget
+                     stmtIdx := 0
+                     locals := updatedCallerLocals
+                   }
+                   memory := mem'
+                 }
+               | .ub => MirStepNode.fail .ub
+               | .unsupported => MirStepNode.unsupported
+         | _ => MirStepNode.fail .ub
+       | _ :: _ => evalTerminator s term (some currentBody))
+  | _ => evalTerminatorSymTree s term currentBody
+
+theorem evalTerminatorFrameSymTree_eval_eq
+    (s : MachineState)
+    (term : Terminator)
+    (currentBody : CapturedMir) :
+    (evalTerminatorFrameSymTree s term currentBody).eval =
+      (evalTerminatorSymTree s term currentBody).eval := by
+  rcases term with ⟨kind, span⟩
+  cases kind with
+  | return_ =>
+    dsimp only [evalTerminatorFrameSymTree, evalTerminatorSymTree, evalTerminator]
+    cases s.memory.activeProtectors with
+    | nil =>
+      cases get? s.frame.locals 0 with
+      | none => rfl
+      | some slot =>
+        cases slot with
+        | uninit => rfl
+        | dead => rfl
+        | init retVal =>
+          dsimp only []
+          rw [hasFrameDeallocProtectorConflict_nil_activeProtectors]
+          rfl
+    | cons _ _ => rfl
+  | _ => rfl
+
+def stepMirFrameSymTree
+    (body : CapturedMir)
+    (s : MachineState) : SymTree MirStepNode :=
+  let currentBody := s.memory.activeCallee.getD body
+  match currentBody.phase with
+  | .other _ => .leaf MirStepNode.unsupported
+  | _ =>
+    match get? currentBody.basicBlocks s.frame.blockIdx with
+    | none => .leaf (MirStepNode.fail .ub)
+    | some bb =>
+      match get? bb.statements s.frame.stmtIdx with
+      | some stmt =>
+        evalStmtSymTree s stmt currentBody.localDecls currentBody.layouts
+      | none =>
+        if s.frame.stmtIdx == length bb.statements then
+          evalTerminatorFrameSymTree s bb.terminator currentBody
+        else
+          .leaf (MirStepNode.fail .ub)
+
+theorem stepMirFrameSymTree_eval_eq
+    (body : CapturedMir)
+    (s : MachineState) :
+    (stepMirFrameSymTree body s).eval = (stepMirSymTree body s).eval := by
+  dsimp only [stepMirFrameSymTree, stepMirSymTree]
+  cases (s.memory.activeCallee.getD body).phase with
+  | other _ => rfl
+  | _ =>
+    all_goals
+      dsimp only
+      cases get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx with
+      | none => rfl
+      | some bb =>
+        dsimp only
+        cases get? bb.statements s.frame.stmtIdx with
+        | some _ => rfl
+        | none =>
+          dsimp only
+          split
+          · exact evalTerminatorFrameSymTree_eval_eq s bb.terminator _
+          · rfl
+
+def stepMirExecFrameSymTree
+    (body : CapturedMir)
+    (st : MirExecState) : SymTree MirStepNode :=
+  match st with
+  | .running s => stepMirFrameSymTree body s
+  | .halted out => .leaf (.ret out)
+  | .faulted fk => .leaf (MirStepNode.fail fk)
+
+theorem stepMirExecFrameSymTree_eval_eq
+    (body : CapturedMir)
+    (st : MirExecState) :
+    (stepMirExecFrameSymTree body st).eval = (stepMirExecSymTree body st).eval := by
+  cases st with
+  | running s => exact stepMirFrameSymTree_eval_eq body s
+  | halted _ => rfl
+  | faulted _ => rfl
+
+theorem stepMirExecFrameSymTree_eval
+    (body : CapturedMir)
+    (st : MirExecState) :
+    (stepMirExecFrameSymTree body st).eval = stepMirState body st := by
+  rw [stepMirExecFrameSymTree_eval_eq, stepMirExecSymTree_eval]
+
+/--
 Single-pass fuel-bounded frame-restoring modular symbolic WP over `MirExecState`.
 -/
 def wpMirExecFrameModularSym
@@ -3969,7 +4124,7 @@ def wpMirExecFrameModularSym
     evalSymNodeTreeFrameModular contract
       (fun st' => wpMirExecFrameModularSym contract fuel' body st' post)
       post
-      (stepMirExecSymTree body st)
+      (stepMirExecFrameSymTree body st)
 
 /--
 Single-pass fuel-bounded frame-restoring modular symbolic WP over `MachineState`.
@@ -3999,7 +4154,7 @@ theorem wpMirExecModularSym_of_wpMirExecFrameModularSym
   | succ fuel' ih =>
     unfold wpMirExecFrameModularSym at h
     unfold wpMirExecModularSym
-    rw [evalSymNodeTreeFrameModular_eq] at h
+    rw [evalSymNodeTreeFrameModular_eq, stepMirExecFrameSymTree_eval_eq] at h
     rw [evalSymNodeTreeModular_eq]
     cases h_ev : (stepMirExecSymTree body st).eval with
     | ret out =>
@@ -4156,6 +4311,224 @@ theorem verifyExternalSpecMirSym
         post := post } :=
   verifyExternalSpecWithCalleesMirSym
     targetDefPath sidecarBody extraPre extraPost body .nil pre post fuel h_wp
+
+/--
+Every `MirCallContract` definitionally equal to an `externalSpecCallContract`
+guarantees `ans.framePreserved req.memory` on every call answer `ans` permitted
+by its postcondition.
+-/
+theorem externalSpecContract_framePreserved
+    {targetDefPath : DefPath}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    (contract : MirCallContract)
+    (h_eq :
+      contract =
+        externalSpecCallContract targetDefPath sidecarBody extraPre extraPost := by rfl) :
+    ∀ (req : MirCallReq) (ans : MirCallAns),
+      contract.post req ans → ans.framePreserved req.memory := by
+  subst h_eq
+  exact externalSpecCallContract_framePreserved targetDefPath sidecarBody extraPre extraPost
+
+/--
+Discharge a `ModularVerificationResult` with linked `callees` for a caller
+invoking an `#[external_spec]` contract `contract` (definitionally equal to
+`externalSpecCallContract targetDefPath sidecarBody extraPre extraPost`), using
+frame-restoring `wpMirFrameModularSym` so post-call `resumeExternalCall` and
+`evalTerminator` `.return_` transitions reduce by WHNF without manual
+frame-preservation rewrites.
+-/
+theorem verifyExternalSpecContractWithCalleesMirSym
+    {targetDefPath : DefPath}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    (contract : MirCallContract)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameModularSym contract fuel body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem'))
+    (h_eq :
+      contract =
+        externalSpecCallContract targetDefPath sidecarBody extraPre extraPost := by rfl) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post
+        callees := callees } :=
+  verifyModularFrameContractWithCalleesMirSym
+    contract
+    (externalSpecContract_framePreserved contract h_eq)
+    body callees pre post fuel h_wp
+
+/--
+Discharge a `ModularVerificationResult` without extra `callees` for a caller
+invoking an `#[external_spec]` contract `contract` (definitionally equal to
+`externalSpecCallContract targetDefPath sidecarBody extraPre extraPost`), using
+frame-restoring `wpMirFrameModularSym`.
+-/
+theorem verifyExternalSpecContractMirSym
+    {targetDefPath : DefPath}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    (contract : MirCallContract)
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameModularSym contract fuel body
+          (initMachineStateWithMemory body args mem)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem'))
+    (h_eq :
+      contract =
+        externalSpecCallContract targetDefPath sidecarBody extraPre extraPost := by rfl) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post } :=
+  verifyExternalSpecContractWithCalleesMirSym
+    contract body .nil pre post fuel h_wp h_eq
+
+/--
+Under `callFramePreserved before after`, `resumeExternalCall` on
+`.returned retVal after` is equal to `resumeExternalCall` on
+`.returned retVal (restoreCallFrame before after)`, whose `activeProtectors`,
+`callStack`, `activeCallee`, and `callees` fields are concrete and reduce by
+WHNF.
+-/
+theorem resumeExternalCall_returned_of_callFramePreserved
+    {before after : Memory}
+    (h_frame : callFramePreserved before after)
+    (s : MachineState)
+    (localsAfterArgs : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (retVal : Value) :
+    resumeExternalCall s localsAfterArgs destination targetBb unwind (.returned retVal after) =
+      resumeExternalCall s localsAfterArgs destination targetBb unwind
+        (.returned retVal (restoreCallFrame before after)) := by
+  rw [restoreCallFrame_eq_of_callFramePreserved h_frame]
+
+/--
+Reduce `wpMirExecModularSym` after `resumeExternalCall` on
+`.returned retVal memAfter` by replacing `memAfter` with
+`restoreCallFrame before memAfter` whenever `callFramePreserved before memAfter`
+holds.
+-/
+theorem wpMirExecModularSym_resumeExternalCall_returned_of_callFramePreserved
+    (contract : MirCallContract)
+    (fuel : Nat)
+    (body : CapturedMir)
+    (s : MachineState)
+    (localsAfterArgs : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (retVal : Value)
+    {before memAfter : Memory}
+    (h_frame : callFramePreserved before memAfter)
+    (post : MirOutcome → Prop)
+    (h :
+      wpMirExecModularSym
+        contract
+        fuel
+        body
+        (resumeExternalCall
+          s
+          localsAfterArgs
+          destination
+          targetBb
+          unwind
+          (.returned retVal (restoreCallFrame before memAfter)))
+        post) :
+    wpMirExecModularSym
+      contract
+      fuel
+      body
+      (resumeExternalCall
+        s
+        localsAfterArgs
+        destination
+        targetBb
+        unwind
+        (.returned retVal memAfter))
+      post := by
+  rw [← restoreCallFrame_eq_of_callFramePreserved h_frame]
+  exact h
+
+/--
+When `memAfter.activeProtectors = .nil`, `resumeExternalCall` on a direct local
+destination `{ local_ := dstLocal, projection := .nil }` reduces `evalPlaceWrite`
+directly to `writePlaceValue` and updates `memAfter.borrows` via
+`invalidateDirectDestWriteBorrows`.
+-/
+theorem resumeExternalCall_returned_of_activeProtectors_nil
+    (s : MachineState)
+    (localsAfterArgs : List LocalSlot)
+    (dstLocal : Local)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (retVal : Value)
+    (memAfter : Memory)
+    (h_prot : memAfter.activeProtectors = .nil) :
+    resumeExternalCall
+      s
+      localsAfterArgs
+      { local_ := dstLocal, projection := .nil }
+      targetBb
+      unwind
+      (.returned retVal memAfter) =
+    match
+      writePlaceValue
+        localsAfterArgs
+        memAfter.borrows
+        { local_ := dstLocal, projection := .nil }
+        retVal
+        .nil
+        emptyLayoutTable
+        memAfter.callStack
+    with
+    | .ok updatedLocals =>
+      .running {
+        frame := {
+          s.frame with
+          blockIdx := targetBb
+          stmtIdx := 0
+          locals := updatedLocals
+        }
+        memory := {
+          memAfter with
+          borrows :=
+            (invalidateDirectDestWriteBorrows
+              memAfter
+              localsAfterArgs
+              { local_ := dstLocal, projection := .nil }).borrows
+        }
+      }
+    | .ub => .faulted .ub
+    | .unsupported => .faulted .unsupported := by
+  cases memAfter
+  subst h_prot
+  rfl
 
 theorem restoreCallerMemoryFrame_eq_of_callFrameAndTraitsPreserved
     {before after : Memory}
@@ -6371,7 +6744,7 @@ theorem wpMirExecFrameModularSym_of_reachesModularSafePanicExecBounded
   | zero => nomatch h_check MirCallAnswerStream.unitEmpty
   | succ fuel ih =>
     unfold wpMirExecFrameModularSym
-    rw [evalSymNodeTreeFrameModular_eq, stepMirExecSymTree_eval]
+    rw [evalSymNodeTreeFrameModular_eq, stepMirExecFrameSymTree_eval]
     cases h_step : stepMirState body st with
     | ret out =>
       cases out with
