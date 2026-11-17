@@ -380,6 +380,88 @@ theorem canary_bug1_multi_copy_source_read_freezes_foreign_active :
     } := by
   exact ⟨rfl, rfl⟩
 
+/--
+Canary 1J (type-punned element pointers fail closed): `a : [u8; 4] = [1, 2, 3, 4]`,
+`b : [u16; 2]`, `copy_nonoverlapping::<u16>(&raw const a[0] as *const u16, &raw mut b[0], 2)`.
+The source container's elements are 1-byte `u8`s, not 2-byte `u16`s, so an
+element-wise splice would store two `u8` values into `b` (A0/B1/A1 silently
+produced `b = [1u8, 2u8]`, also inside a struct field `s.0[..]`); the prototype
+fails closed with `.unsupported`, like unpatched `Trusted` on this program.
+-/
+theorem canary_bug1_type_punned_stride_mismatch_unsupported :
+    let sc : Nat → Nat → Value := fun b n => .scalar { bits := b, sizeBytes := n }
+    let decls : List LocalDecl := [
+      { mutability := .mut, ty := { kind := .array (.uint .u8) 4, layoutIdx := 0 }, debugName := none },
+      { mutability := .mut, ty := { kind := .array (.uint .u16) 2, layoutIdx := 0 }, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .not (.uint .u16), layoutIdx := 0 }, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u16), layoutIdx := 0 }, debugName := none }]
+    let locals : List LocalSlot := [
+      .init (.aggregate 0 [sc 1 1, sc 2 1, sc 3 1, sc 4 1]),
+      .init (.aggregate 0 [sc 0 2, sc 0 2]),
+      .init (.ptr { allocId := 70, offsetBytes := 0 } 8),
+      .init (.ptr { allocId := 71, offsetBytes := 0 } 8)]
+    let srcEntry : BorrowEntry :=
+      { tag := 70, targetLocal := 0, targetProjection := [.constantIndex 0 4 false], perm := .cell }
+    let dstEntry : BorrowEntry :=
+      { tag := 71, targetLocal := 1, targetProjection := [.constantIndex 0 2 false], perm := .unique }
+    let s : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 72 }
+    }
+    evalCopyNonOverlappingPermOk
+      s (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls emptyLayoutTable
+      { allocId := 70, offsetBytes := 0 } { allocId := 71, offsetBytes := 0 }
+      srcEntry dstEntry 2 locals = MirStepNode.unsupported ∧
+    evalCopyNonOverlappingPermOkProto
+      s (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls emptyLayoutTable
+      { allocId := 70, offsetBytes := 0 } { allocId := 71, offsetBytes := 0 }
+      srcEntry dstEntry 2 locals = MirStepNode.unsupported := by
+  exact ⟨rfl, rfl⟩
+
+/--
+Canary 1K (aligned sub-element offsets fail closed): `arr : [[u8; 2]; 3]`,
+`copy_nonoverlapping::<[u8; 2]>((&raw const arr as *const u8).add(1) as *const [u8; 2], &raw mut d[0], 1)`.
+Byte offset `1` is not a whole `[u8; 2]` element but is aligned (alignment `1`):
+the copy is valid in Rust (it reads bytes `1..3`) but not representable
+element-wise. Unpatched `Trusted` reinterprets the byte offset as element index
+`1` and writes the *row* `[3, 4]` nested inside `d[0]` (garbage); B1/A1 faulted
+with a false `.ub`; the prototype fails closed with `.unsupported`.
+-/
+theorem canary_bug1_aligned_subelement_offset_unsupported :
+    let sc : Nat → Nat → Value := fun b n => .scalar { bits := b, sizeBytes := n }
+    let row : Nat → Nat → Value := fun x y => .aggregate 0 [sc x 1, sc y 1]
+    let decls : List LocalDecl := [
+      { mutability := .mut, ty := { kind := .array (.array (.uint .u8) 2) 3, layoutIdx := 0 }, debugName := none },
+      { mutability := .mut, ty := { kind := .array (.array (.uint .u8) 2) 1, layoutIdx := 0 }, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .not (.array (.uint .u8) 2), layoutIdx := 0 }, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .mut (.array (.uint .u8) 2), layoutIdx := 0 }, debugName := none }]
+    let locals : List LocalSlot := [
+      .init (.aggregate 0 [row 1 2, row 3 4, row 5 6]),
+      .init (.aggregate 0 [row 0 0]),
+      .init (.ptr { allocId := 80, offsetBytes := 1 } 8),
+      .init (.ptr { allocId := 81, offsetBytes := 0 } 8)]
+    let srcEntry : BorrowEntry := { tag := 80, targetLocal := 0, targetProjection := [], perm := .cell }
+    let dstEntry : BorrowEntry :=
+      { tag := 81, targetLocal := 1, targetProjection := [.constantIndex 0 1 false], perm := .unique }
+    let s : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 82 }
+    }
+    (match
+      evalCopyNonOverlappingPermOk
+        s (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls emptyLayoutTable
+        { allocId := 80, offsetBytes := 1 } { allocId := 81, offsetBytes := 0 }
+        srcEntry dstEntry 1 locals
+     with
+     | .tau (.running s') => get? s'.frame.locals 1
+     | _ => none) =
+      some (.init (.aggregate 0 [.aggregate 0 [row 3 4, sc 0 1]])) ∧
+    evalCopyNonOverlappingPermOkProto
+      s (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls emptyLayoutTable
+      { allocId := 80, offsetBytes := 1 } { allocId := 81, offsetBytes := 0 }
+      srcEntry dstEntry 1 locals = MirStepNode.unsupported := by
+  exact ⟨rfl, rfl⟩
+
 /-! ## 2. Bug 2 Canaries: `DIV-LM-TAILCALL-NOUNWIND-UNWIND` -/
 
 /--
@@ -773,6 +855,10 @@ theorem canary_conservativity_use_keeps_tree_borrows_read :
 #print axioms evalCopyNonOverlappingPermOkProto_sameArray_disjoint_ok
 #print axioms evalCopyNonOverlappingPermOkProto_misaligned_src_ub
 #print axioms canary_bug1_misaligned_byte_offset_faults_ub
+#print axioms evalCopyNonOverlappingPermOkProto_subelement_offset_unsupported
+#print axioms canary_bug1_type_punned_stride_mismatch_unsupported
+#print axioms canary_bug1_aligned_subelement_offset_unsupported
+#print axioms canary_bug1_multi_copy_source_read_freezes_foreign_active
 #print axioms tailCall_leanMiri_nounwind_callee_simulation
 #print axioms tailCall_nounwind_callee_unwindResume_ub
 #print axioms tailCall_nounwind_multihop_monotonicity

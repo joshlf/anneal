@@ -1115,6 +1115,51 @@ def expectedMultiCopyBytes?
       | .none => .none
     | _ => .none
 
+/-- Static element kind of an array / slice container type (`.none` when unknown). -/
+@[reducible]
+def containerElemKind? : Option Ty → Option RigidTy
+  | .some { kind := .array k _, .. } => .some k
+  | .some { kind := .slice k, .. } => .some k
+  | _ => .none
+
+/--
+Element-wise splicing of an `n`-element slice is only meaningful when both
+array containers hold elements of the copied element type. Per container:
+- when the pointee type `ptOpt` and the container's static element kind are both
+  known, the element kind must have the pointee's shape (`sameRigidTyShape`;
+  padded structs and enums are therefore accepted by type, not by value size) or
+  both must be primitives of one byte size held by uniformly sized values
+  (e.g. `f32` elements read through `*const u32`);
+- otherwise (untyped, or a container whose type is not in scope such as a
+  caller-owned referent) every element must have the copied element byte size
+  `elemSz` (the pointee size, or the source element stride) by value
+  (`elemsHaveUniformByteStride`).
+A type-punned element pointer (a `[u8; 4]` read through `*const u16`) or a
+heterogeneous struct/tuple mistaken for an array container fails closed with
+`.unsupported` instead of splicing mis-sized values.
+-/
+@[reducible]
+def copySliceStrideOk
+    (ptOpt : Option Ty)
+    (elemSzOpt : Option Nat)
+    (srcContainerTy dstContainerTy : Option Ty)
+    (srcElems dstElems : List Value) :
+    Bool :=
+  let elemSz :=
+    match elemSzOpt with
+    | .some sz => sz
+    | .none => inferElemListByteStride srcElems
+  let sideOk (containerTy : Option Ty) (elems : List Value) : Bool :=
+    match ptOpt, containerElemKind? containerTy with
+    | .some pt, .some k =>
+      Bool.or
+        (sameRigidTyShape k pt.kind)
+        (match rigidTyKindByteSize k, rigidTyKindByteSize pt.kind with
+         | .some a, .some b => Bool.and (Nat.beq a b) (elemsHaveUniformByteStride elems a)
+         | _, _ => false)
+    | _, _ => elemsHaveUniformByteStride elems elemSz
+  Bool.and (sideOk srcContainerTy srcElems) (sideOk dstContainerTy dstElems)
+
 /--
 Repaired `evalCopyNonOverlappingPermOk` (`Statements.lean:1414-1687`):
 1. Zero-count copies, union endpoints (`Trusted.evalCopyUnionBytes`), and
@@ -1122,9 +1167,10 @@ Repaired `evalCopyNonOverlappingPermOk` (`Statements.lean:1414-1687`):
    exactly `Trusted`'s.
 2. Converts both pointer byte offsets into element offsets of the statically
    known pointee (`resolvePtrElemOffset?`); a byte offset that is not a whole
-   number of elements (a misaligned element pointer) faults with `.ub` instead of
-   being reinterpreted as an element index (`Trusted` uses raw
-   `ProvenancePtr.offsetBytes` as an element index).
+   number of elements is never reinterpreted as an element index (`Trusted` uses
+   raw `ProvenancePtr.offsetBytes` as an element index): it faults with `.ub`
+   when it violates the pointee's alignment (`checkDerefAlign`) and fails closed
+   with `.unsupported` otherwise (aligned sub-element offset).
 3. Peels trailing `.constantIndex` projections of both endpoints via
    `resolveArraySliceEndpoint?`, so `copy_nonoverlapping(&raw const a[i], &raw mut b[j], n)`
    reads and writes `n` elements of the enclosing `.aggregate 0` arrays and writes
@@ -1133,9 +1179,10 @@ Repaired `evalCopyNonOverlappingPermOk` (`Statements.lean:1414-1687`):
    and non-overlap (`sameContainer → srcStart + n ≤ dstStart ∨ dstStart + n ≤ srcStart`),
    allowing disjoint slices of one array while faulting with `.ub` on
    overlapping slices or out-of-bounds counts.
-5. Runs the Tree Borrows read-then-write transition of `Trusted`'s
-   single-element path on the accessed `.subslice` windows
-   (`borrowsAfterCopySliceProto`).
+5. Splices element-wise only when both containers hold elements of the copied
+   element size (`copySliceStrideOk`; `.unsupported` otherwise), running the
+   Tree Borrows read-then-write transition of `Trusted`'s single-element path on
+   the accessed `.subslice` windows (`borrowsAfterCopySliceProto`).
 6. Requires `length bs == n * elemBytes` in the byte-level fallback, so `n > 1`
    on a scalar allocation faults with `.ub` instead of copying one element.
 -/
@@ -1192,6 +1239,10 @@ def evalCopyNonOverlappingPermOkProto
             match dstPtOpt with
             | .some pt => .some pt
             | .none => srcPtOpt
+          let copyElemSzOpt : Option Nat :=
+            match effSrcPtOpt with
+            | .some pt => rigidTyByteSize layouts pt
+            | .none => .none
           match
             resolvePtrElemOffset? srcStartRaw effSrcPtOpt layouts,
             resolvePtrElemOffset? dstStartRaw effDstPtOpt layouts
@@ -1269,14 +1320,14 @@ def evalCopyNonOverlappingPermOkProto
                         match Nat.beq (length bs) expBytes with
                         | true => .some true
                         | false =>
-                          let isCrossFieldWithinRoot : Bool :=
+                          let isSubPlaceWithinRoot : Bool :=
                             match
-                              srcEntry.targetProjection,
+                              stripTransparentProjections srcEntry.targetProjection,
                               encodeUntypedValueToBytes defaultCodecFuel srcRootVal
                             with
-                            | .field _ _ :: _, .some rootBs => Nat.ble expBytes (length rootBs)
+                            | _ :: _, .some rootBs => Nat.ble expBytes (length rootBs)
                             | _, _ => false
-                          match isCrossFieldWithinRoot with
+                          match isSubPlaceWithinRoot with
                           | true => .none
                           | false => .some false
                       | .none => .some true
@@ -1313,6 +1364,13 @@ def evalCopyNonOverlappingPermOkProto
                         match effDstLocalPlaceTy, dstSubVal with
                         | .none, .aggregate 0 _ => true
                         | _, _ => false
+                      let dstSubPlaceWithinRoot : Bool :=
+                        match
+                          stripTransparentProjections effDstPlace.projection,
+                          encodeUntypedValueToBytes defaultCodecFuel dstRootVal
+                        with
+                        | _ :: _, .some rootBs => Nat.ble (length bs) (length rootBs)
+                        | _, _ => false
                       match preferSplicedArray, spliceBytesToDstArray with
                       | true, .some splicedVal => writeDstVal splicedVal
                       | _, _ =>
@@ -1331,7 +1389,10 @@ def evalCopyNonOverlappingPermOkProto
                             | false =>
                               match spliceBytesToDstArray with
                               | .some splicedVal => writeDstVal splicedVal
-                              | .none => MirStepNode.fail .ub
+                              | .none =>
+                                match dstSubPlaceWithinRoot with
+                                | true => MirStepNode.unsupported
+                                | false => MirStepNode.fail .ub
                           | .none =>
                             match spliceBytesToDstArray with
                             | .some splicedVal => writeDstVal splicedVal
@@ -1339,7 +1400,10 @@ def evalCopyNonOverlappingPermOkProto
                         | .none =>
                           match spliceBytesToDstArray with
                           | .some splicedVal => writeDstVal splicedVal
-                          | .none => MirStepNode.fail .ub
+                          | .none =>
+                            match dstSubPlaceWithinRoot with
+                            | true => MirStepNode.unsupported
+                            | false => MirStepNode.fail .ub
             match srcSliceEndOpt, dstSliceEndOpt with
             | .some (srcParentProj, srcStart, srcElems),
               .some (dstParentProj, dstStart, dstElems) =>
@@ -1395,29 +1459,41 @@ def evalCopyNonOverlappingPermOkProto
                 match disjoint with
                 | false => MirStepNode.fail .ub
                 | true =>
-                  let copiedSlice := takeValues n (dropValues srcStart srcElems)
-                  let dstElems' := spliceValues copiedSlice dstStart dstElems
+                  let srcContainerTy : Option Ty :=
+                    match get? locals₃ srcEntry.targetLocal with
+                    | .some _ =>
+                      placeTy localDecls layouts
+                        { local_ := srcEntry.targetLocal, projection := srcParentProj }
+                    | .none => .none
                   match
-                    borrowsAfterCopySliceProto
-                      s.memory.borrows
-                      s.memory.activeProtectors
-                      srcPtr
-                      dstPtr
-                      srcEntry
-                      dstEntry
-                      (copySliceWindowProj srcParentProj srcStart n (length srcElems))
-                      (copySliceWindowProj dstParentProj dstStart n (length dstElems))
+                    copySliceStrideOk
+                      effSrcPtOpt copyElemSzOpt srcContainerTy dstParentTy srcElems dstElems
                   with
-                  | .none => MirStepNode.fail .ub
-                  | .some borrows' =>
-                    writeCopyDstPlaceProto
-                      s
-                      dstParentPlace
-                      locals₃
-                      (.aggregate 0 dstElems')
-                      borrows'
-                      localDecls
-                      layouts
+                  | false => MirStepNode.unsupported
+                  | true =>
+                    let copiedSlice := takeValues n (dropValues srcStart srcElems)
+                    let dstElems' := spliceValues copiedSlice dstStart dstElems
+                    match
+                      borrowsAfterCopySliceProto
+                        s.memory.borrows
+                        s.memory.activeProtectors
+                        srcPtr
+                        dstPtr
+                        srcEntry
+                        dstEntry
+                        (copySliceWindowProj srcParentProj srcStart n (length srcElems))
+                        (copySliceWindowProj dstParentProj dstStart n (length dstElems))
+                    with
+                    | .none => MirStepNode.fail .ub
+                    | .some borrows' =>
+                      writeCopyDstPlaceProto
+                        s
+                        dstParentPlace
+                        locals₃
+                        (.aggregate 0 dstElems')
+                        borrows'
+                        localDecls
+                        layouts
             | .some (_, srcStart, srcElems), .none =>
               match readProjectedValue locals₃ dstRootVal dstEntry.targetProjection with
               | .ok dstSubVal =>
@@ -1493,7 +1569,14 @@ def evalCopyNonOverlappingPermOkProto
                     dstIsAdt
                 | false => MirStepNode.fail .ub
               | _, _ => MirStepNode.fail .ub
-          | _, _ => MirStepNode.fail .ub
+          | _, _ =>
+            match
+              Bool.and
+                (checkDerefAlign localDecls layouts effSrcPtOpt srcStartRaw)
+                (checkDerefAlign localDecls layouts effDstPtOpt dstStartRaw)
+            with
+            | false => MirStepNode.fail .ub
+            | true => MirStepNode.unsupported
         | _, _ => MirStepNode.fail .ub
 
 /--
@@ -3101,7 +3184,8 @@ theorem evalCopyNonOverlappingPermOkProto_subplace_constantIndex_slice
         locals₃ (.aggregate 0 dstElems) [.constantIndex dstIdx minD false] 0 n .none emptyLayoutTable =
       .some (.nil, dstIdx, dstElems))
     (hSrcBounds : Nat.ble (Nat.add srcIdx n) (length srcElems) = true)
-    (hDstBounds : Nat.ble (Nat.add dstIdx n) (length dstElems) = true) :
+    (hDstBounds : Nat.ble (Nat.add dstIdx n) (length dstElems) = true)
+    (hStride : copySliceStrideOk .none .none .none .none srcElems dstElems = true) :
     let srcPtr : ProvenancePtr := { allocId := srcTag, offsetBytes := 0 }
     let dstPtr : ProvenancePtr := { allocId := dstTag, offsetBytes := 0 }
     let srcEntry : BorrowEntry := {
@@ -3171,7 +3255,7 @@ theorem evalCopyNonOverlappingPermOkProto_subplace_constantIndex_slice
     hSrcRoot, hDstRoot, hSrcPt, hDstPt, hOff0, hSrcSlice, hDstSlice,
     srcEntry, dstEntry, hDstSlot,
     hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds,
-    Nat.beq_refl, hDistinctLoc, hTagEq, hDstTagEq, hDistinctTag,
+    Nat.beq_refl, hDistinctLoc, hTagEq, hDstTagEq, hDistinctTag, hStride,
     copiedSlice, dstElems', Bool.and_false, Bool.false_and]
 
 /--
@@ -3349,7 +3433,8 @@ theorem evalCopyNonOverlappingPermOkProto_sameArray_disjoint_ok
       .some (.nil, dstIdx, arrElems))
     (hSrcBounds : Nat.ble (Nat.add srcIdx n) (length arrElems) = true)
     (hDstBounds : Nat.ble (Nat.add dstIdx n) (length arrElems) = true)
-    (hDisjoint : Nat.ble (Nat.add srcIdx n) dstIdx = true) :
+    (hDisjoint : Nat.ble (Nat.add srcIdx n) dstIdx = true)
+    (hStride : copySliceStrideOk .none .none .none .none arrElems arrElems = true) :
     let srcPtr : ProvenancePtr := { allocId := srcTag, offsetBytes := 0 }
     let dstPtr : ProvenancePtr := { allocId := dstTag, offsetBytes := 0 }
     let srcEntry : BorrowEntry := {
@@ -3414,7 +3499,7 @@ theorem evalCopyNonOverlappingPermOkProto_sameArray_disjoint_ok
     hRoot, hSrcPt, hDstPt, hOff0, hSrcSlice, hDstSlice,
     srcEntry, dstEntry, hArrSlot,
     hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds,
-    Nat.beq_refl, hOverlapNil, hDisjoint, Bool.true_or,
+    Nat.beq_refl, hOverlapNil, hDisjoint, Bool.true_or, hStride,
     copiedSlice, arrElems']
 
 /--
@@ -3441,18 +3526,73 @@ theorem evalCopyNonOverlappingPermOkProto_misaligned_src_ub
     (hSrcOffPos : Nat.beq srcPtr.offsetBytes 0 = false)
     (hSrcRoot : resolveCopyEndpointRootSlot s locals₃ srcEntry = .some (.init srcRootVal))
     (hDstRoot : resolveCopyEndpointRootSlot s locals₃ dstEntry = .some (.init dstRootVal))
-    (hMisaligned :
+    (hNotElemMultiple :
       resolvePtrElemOffset? srcPtr.offsetBytes
         (match operandPointeeTy localDecls layouts src with
          | .some pt => .some pt
          | .none => operandPointeeTy localDecls layouts dst)
-        layouts = .none) :
+        layouts = .none)
+    (hMisaligned :
+      checkDerefAlign localDecls layouts
+        (match operandPointeeTy localDecls layouts src with
+         | .some pt => .some pt
+         | .none => operandPointeeTy localDecls layouts dst)
+        srcPtr.offsetBytes = false) :
     evalCopyNonOverlappingPermOkProto
       s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry n locals₃ =
     MirStepNode.fail .ub := by
   unfold evalCopyNonOverlappingPermOkProto
   simp only [hCountPos, hNoUnionSrc, hNoUnionDst, hSrcOffPos, Bool.false_and, Bool.and_false,
-    hSrcRoot, hDstRoot, hMisaligned]
+    hSrcRoot, hDstRoot, hNotElemMultiple, hMisaligned, Bool.false_and]
+
+/--
+**Sub-element offsets are not modeled (fail closed).** When a pointer's byte
+offset is not a whole number of pointee elements but *is* aligned for the
+pointee (e.g. a `[u8; 2]` element pointer at byte offset `1`, alignment `1`),
+the copy is valid in Rust but not representable element-wise: the prototype
+fails closed with `.unsupported` (unpatched `Trusted` reinterprets the byte
+offset as an element index; B1 over-approximated this case as `.ub`).
+-/
+theorem evalCopyNonOverlappingPermOkProto_subelement_offset_unsupported
+    (s : MachineState)
+    (src dst : Operand)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (n : Nat)
+    (locals₃ : List LocalSlot)
+    (srcRootVal dstRootVal : Value)
+    (hCountPos : Nat.beq n 0 = false)
+    (hNoUnionSrc : resolveUnionEndpoint? localDecls layouts locals₃ srcEntry = .none)
+    (hNoUnionDst : resolveUnionEndpoint? localDecls layouts locals₃ dstEntry = .none)
+    (hSrcOffPos : Nat.beq srcPtr.offsetBytes 0 = false)
+    (hSrcRoot : resolveCopyEndpointRootSlot s locals₃ srcEntry = .some (.init srcRootVal))
+    (hDstRoot : resolveCopyEndpointRootSlot s locals₃ dstEntry = .some (.init dstRootVal))
+    (hNotElemMultiple :
+      resolvePtrElemOffset? srcPtr.offsetBytes
+        (match operandPointeeTy localDecls layouts src with
+         | .some pt => .some pt
+         | .none => operandPointeeTy localDecls layouts dst)
+        layouts = .none)
+    (hSrcAligned :
+      checkDerefAlign localDecls layouts
+        (match operandPointeeTy localDecls layouts src with
+         | .some pt => .some pt
+         | .none => operandPointeeTy localDecls layouts dst)
+        srcPtr.offsetBytes = true)
+    (hDstAligned :
+      checkDerefAlign localDecls layouts
+        (match operandPointeeTy localDecls layouts dst with
+         | .some pt => .some pt
+         | .none => operandPointeeTy localDecls layouts src)
+        dstPtr.offsetBytes = true) :
+    evalCopyNonOverlappingPermOkProto
+      s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry n locals₃ =
+    MirStepNode.unsupported := by
+  unfold evalCopyNonOverlappingPermOkProto
+  simp only [hCountPos, hNoUnionSrc, hNoUnionDst, hSrcOffPos, Bool.false_and, Bool.and_false,
+    hSrcRoot, hDstRoot, hNotElemMultiple, hSrcAligned, hDstAligned, Bool.and_self]
 
 /-! ## 9. Universal Simulation Theorems & Witnesses for Bug 2 and Bug 3 -/
 
