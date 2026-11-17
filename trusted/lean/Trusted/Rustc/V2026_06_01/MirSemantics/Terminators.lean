@@ -2968,12 +2968,16 @@ at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 > /// Additionally, note that changing `*dst` in this way can easily lead to undefined behavior (UB)
 > /// later if the written bytes are not a valid representation of some `T`."
 
-Reference (The Rust Reference, "Behavior considered undefined"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+Reference (The Rust Reference, "Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
 
-> "Invalid values in primitive types, even in private fields and locals:
-> - A `bool` that isn't 0 or 1.
-> - A `char` that is a surrogate or above `char::MAX`."
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+
+> "- A bool value must be false (0) or true (1)."
+
+> "- A char value must not be a surrogate (i.e., must not be in the range
+> 0xD800..=0xDFFF) and must be equal to or less than char::MAX."
 
 Reference (`library/core/src/ptr/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
