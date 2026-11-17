@@ -458,8 +458,10 @@ import LeanMiriSpec.Audit
   (including `count == 0`), `Repeat`, and `Aggregate` run with per-operand move
   deinitialization, `Cast.castMoving` deinitializes a moved source after its last
   read and before writing an immediate result (transmute and unsizing copies take
-  over the move latch), `D8` `Assert` and unwinding `Call` cleanup observe moved
-  operands as already deinitialized in `cleanup bb`, a `SwitchInt` on a moved
+  over the move latch), `D8` `Assert`, unwinding `Call` cleanup,
+  `initFnTailCallMoving` (caller deinitialization before `popRaw`/`cleanup` and
+  temporary cleanup on both normal completion and error) and `initDropInPlaceCall`,
+  a `SwitchInt` on a moved
   discriminant branches only after the discriminant is deinitialized (and faults
   when re-reading it), `UnaryOp`/`PtrMetadata` deinitializes its whole moved
   operand before the operator runs, `D7` call destinations are resolved before
@@ -469,9 +471,13 @@ import LeanMiriSpec.Audit
   re-initialization, partial-then-full subslice re-initialization, field swap,
   union byte-window and overlapping-union partial-byte moves, `(*_ptr).field` at a
   non-zero byte offset, the exact `Deref` target among equal values, strides
-  skipping moved-out leaves, and fail-closed moves out of global allocations; the
-  statement-level `Rvalue.discriminant` still reads a partially moved enum), with a
-  root-move simulation between the two, documented known limitations
+  skipping moved-out leaves, fail-closed moves out of global allocations,
+  chained multi-level projections `_1.0.1` / `(_1[i]).0` / `(*_p).0[1..3]` /
+  `((*_fatPtr)[1]).0`, and transparent `.opaqueCast` / `.unwrapUnsafeBinder`
+  wrappers; the statement-level `Rvalue.discriminant` still reads a partially
+  moved enum), with root, indirect, call-argument `Deref`, and projected
+  sub-place move simulations and concrete non-vacuity witnesses between the two,
+  documented known limitations
   (niche-encoded enum tags, untyped offsets over moved-out leaves, reinterpreting
   `Deref` moves) and an axiom audit.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`

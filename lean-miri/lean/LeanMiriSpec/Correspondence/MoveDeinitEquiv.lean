@@ -35,8 +35,14 @@ true)`).
   an array element, exact `Deref` targets when distinct places hold equal values
   (`canary_D5_typed_deref_equal_values_exact_target`), strides skipping nested
   moved-out leaves, fail-closed moves out of non-zero-sized global allocations
-  (and no-op moves of zero-sized ones), and a partial byte-window move out of
-  overlapping union fields (`canary_D3_union_partial_byte_window_move`).
+  (and no-op moves of zero-sized ones), a partial byte-window move out of
+  overlapping union fields (`canary_D3_union_partial_byte_window_move`), and the
+  `ep1-B3` multi-level projection (`_1.0.1`, `(_1[i]).0`, `(*_p).0[1..3]`,
+  `((*_fatPtr)[1]).0`) and transparent `.opaqueCast` / `.unwrapUnsafeBinder`
+  theorems (`deinitMovedSubPlace_opaqueCast_prefix`,
+  `deinitMovedSubPlace_unwrapUnsafeBinder_prefix`,
+  `canary_B3_chained_projections_move_and_reinit`,
+  `canary_B3_transparent_opaqueCast_and_unwrapUnsafeBinder_moves`).
 * **Part 2 (`lean-miri`, `deinitMovedPlace = false`).** `Cast.cast` and
   `Call.evalFnCallArgumentAt`/`evalCalleeAndArgs`/`passArgument`/
   `evalCallTerminator`/`evalTailCallTerminator` are the unchanged source (the
@@ -51,7 +57,9 @@ true)`).
   race-silent deinitialization hooks (contrasted with the source write hook,
   which performs a Tree Borrows `.Write`), the read-then-deinit decomposition of
   `PlaceMachine.readImmediate`, operand-latch behavior of
-  `OperandMachine.evalOperand`, step-boundary latch clearing; universal call
+  `OperandMachine.evalOperand` (including projected immediate moves
+  `operandMachine_evalOperand_move_projected_immediate`), step-boundary latch
+  clearing; universal call
   theorems: every consumer-side argument is an `FnArg.Copy` (one theorem per
   branch of `Call.evalFnCallArgumentMoving`), on which `passArgument` and
   `allocateVarargs` never run `protectArgument`
@@ -71,7 +79,12 @@ true)`).
   `RustCall` tuple argument unpacking and `FnInstance.Virtual` receiver dispatch
   through `Call.evalCallTerminatorMoving`; `D8` `Assert` and unwinding `Call`
   cleanup (`canary_D8_assert_cleanup_moved_cond_ub`,
-  `canary_D8_unwinding_call_moved_arg_ub`, `canary_D8_unwinding_call_unmoved_ok`);
+  `canary_D8_unwinding_call_moved_arg_ub`, `canary_D8_unwinding_call_unmoved_ok`),
+  tail-call (`evalTailCallTerminatorMoving` / `initFnTailCallMoving`: caller
+  deinitialization before `popRaw`/`cleanup` and temporary cleanup on both normal
+  completion and error, `canary_tailCallMoving_deinit_before_pop_and_temp_cleanup`),
+  and `Drop` (`call_initDropInPlaceCall_static_eq`,
+  `canary_dropInPlace_preserves_initialized_and_detects_moved`);
   operand reads `PlaceMachine.readImmediate (← OperandMachine.evalOperandAt …)`
   of moved places (`operandRead_move_indirect`,
   `discriminantRead_move_immediate_root`); the `SwitchInt` terminator of the
@@ -85,8 +98,13 @@ true)`).
   before argument moves (`call_evalCallTerminatorMoving_dest_before_args`,
   `canary_D7_call_dest_resolved_before_arg_move`,
   `canary_D7_call_dest_overlaps_moved_arg`).
-* **Part 4.** A root-move simulation between `LocalAccess.evalOperand`
-  (`deinitMovedPlace = true`) and `evalOperand (deinitProjectedMoves := true)`.
+* **Part 4.** Root, indirect, call-argument `Deref` (including projected
+  `(*_p).restProj`), and projected sub-place move simulations between
+  `lean-miri` (`deinitMovedPlace = true`) and Trusted `evalOperand
+  (deinitProjectedMoves := true)`, together with concrete kernel-checked
+  non-vacuity witnesses (`witness_root_move_simulation`,
+  `witness_projected_subplace_move_simulation`,
+  `witness_d7_call_arg_move_deref_projected_sibling_frozen_simulation`).
 * **Part 5.** An environment audit: no declaration depends on `sorryAx`,
   `Lean.ofReduceBool` or `Lean.trustCompiler`, and the proofs use only `propext`
   and `Quot.sound` (`Classical.choice` reaches statements only through the
@@ -973,6 +991,65 @@ theorem inferElemListByteStride_eq_legacy (elems : List Value)
       rw [hfields]
       rfl
     · rfl
+
+/-- Leading `.opaqueCast` is transparent to `lastStructuralProjection?`. -/
+theorem lastStructuralProjection?_opaqueCast_prefix (ty : Ty) (proj : List ProjectionElem) :
+    lastStructuralProjection? (.opaqueCast ty :: proj) = lastStructuralProjection? proj := by
+  simp only [lastStructuralProjection?]
+  cases lastStructuralProjection? proj <;> rfl
+
+/-- Leading `.unwrapUnsafeBinder` is transparent to `lastStructuralProjection?`. -/
+theorem lastStructuralProjection?_unwrapUnsafeBinder_prefix (ty : Ty) (proj : List ProjectionElem) :
+    lastStructuralProjection? (.unwrapUnsafeBinder ty :: proj) = lastStructuralProjection? proj := by
+  simp only [lastStructuralProjection?]
+  cases lastStructuralProjection? proj <;> rfl
+
+/-- Leading `.opaqueCast` is transparent to `movedMarkerValue`. -/
+theorem movedMarkerValue_opaqueCast_prefix (ty : Ty) (proj : List ProjectionElem) (v : Value) :
+    movedMarkerValue (.opaqueCast ty :: proj) v = movedMarkerValue proj v := by
+  simp only [movedMarkerValue, lastStructuralProjection?_opaqueCast_prefix]
+
+/-- Leading `.unwrapUnsafeBinder` is transparent to `movedMarkerValue`. -/
+theorem movedMarkerValue_unwrapUnsafeBinder_prefix (ty : Ty) (proj : List ProjectionElem)
+    (v : Value) :
+    movedMarkerValue (.unwrapUnsafeBinder ty :: proj) v = movedMarkerValue proj v := by
+  simp only [movedMarkerValue, lastStructuralProjection?_unwrapUnsafeBinder_prefix]
+
+/-- Leading `.opaqueCast` on a non-empty, union-free, deref-free projection
+chain is transparent to `deinitMovedSubPlace`. -/
+theorem deinitMovedSubPlace_opaqueCast_prefix
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (loc : Local) (rootVal fieldVal : Value) (ty : Ty)
+    (head : ProjectionElem) (tail : List ProjectionElem)
+    (hnoDeref : projHasDeref (head :: tail) = false)
+    (hnoUnion₁ : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := .opaqueCast ty :: head :: tail } = false)
+    (hnoUnion₂ : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := head :: tail } = false) :
+    deinitMovedSubPlace locals localDecls layouts loc rootVal
+        (.opaqueCast ty :: head :: tail) fieldVal =
+      deinitMovedSubPlace locals localDecls layouts loc rootVal (head :: tail) fieldVal := by
+  have hnoDeref' : projHasDeref (.opaqueCast ty :: head :: tail) = false := hnoDeref
+  simp only [deinitMovedSubPlace, hnoDeref, hnoDeref', hnoUnion₁, hnoUnion₂,
+    movedMarkerValue_opaqueCast_prefix, writeProjectedValue]
+
+/-- Leading `.unwrapUnsafeBinder` on a non-empty, union-free, deref-free
+projection chain is transparent to `deinitMovedSubPlace`. -/
+theorem deinitMovedSubPlace_unwrapUnsafeBinder_prefix
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (loc : Local) (rootVal fieldVal : Value) (ty : Ty)
+    (head : ProjectionElem) (tail : List ProjectionElem)
+    (hnoDeref : projHasDeref (head :: tail) = false)
+    (hnoUnion₁ : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := .unwrapUnsafeBinder ty :: head :: tail } = false)
+    (hnoUnion₂ : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := head :: tail } = false) :
+    deinitMovedSubPlace locals localDecls layouts loc rootVal
+        (.unwrapUnsafeBinder ty :: head :: tail) fieldVal =
+      deinitMovedSubPlace locals localDecls layouts loc rootVal (head :: tail) fieldVal := by
+  have hnoDeref' : projHasDeref (.unwrapUnsafeBinder ty :: head :: tail) = false := hnoDeref
+  simp only [deinitMovedSubPlace, hnoDeref, hnoDeref', hnoUnion₁, hnoUnion₂,
+    movedMarkerValue_unwrapUnsafeBinder_prefix, writeProjectedValue]
 
 end TrustedPlaces
 
@@ -2067,6 +2144,151 @@ theorem canary_D3_union_partial_byte_window_move :
       a2UnionLayouts [] a2UnionDecls [] = .ok (.scalar ⟨0x3344, 2⟩) a2UnionLocals :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-! #### `ep1-B3`: chained projections (`_1.0.1`, `(_1[i]).0`, `(*_p).0[1..3]`, `((*_fatPtr)[1]).0`) and transparent `.opaqueCast` / `.unwrapUnsafeBinder` -/
+
+/-- `[u8; 4]` and `[u8; 2]` type annotations. -/
+def b3Arr4Ty : Ty := { kind := .array (.uint .u8) 4, layoutIdx := 0 }
+def b3Arr2Ty : Ty := { kind := .array (.uint .u8) 2, layoutIdx := 0 }
+def b3SliceU8Ty : Ty := { kind := .slice (.uint .u8), layoutIdx := 0 }
+
+/-- `_1 : [(u8, u8); 2] = [(10, 11), (20, 21)]`, `_2 : usize = 1` (dynamic index),
+`_3 : *mut [(u8, u8)]` slice fat pointer (`allocId = 2`, `offsetBytes = 0`, `len = 2`). -/
+def b3IdxFatLocals : List LocalSlot :=
+  [.uninit,
+   .init (.aggregate 0 [.aggregate 0 [sc8 10, sc8 11], .aggregate 0 [sc8 20, sc8 21]]),
+   .init (.scalar { bits := 1, sizeBytes := 8 }),
+   .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8,
+     .scalar { bits := 2, sizeBytes := 8 }])]
+
+def b3IdxFatAfterMove : List LocalSlot :=
+  [.uninit,
+   .init (.aggregate 0 [.aggregate 0 [sc8 10, sc8 11], .aggregate 0 [movedUninitValue, sc8 21]]),
+   .init (.scalar { bits := 1, sizeBytes := 8 }),
+   .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8,
+     .scalar { bits := 2, sizeBytes := 8 }])]
+
+/-- `_1 : ([u8; 4], u8) = ([10, 11, 12, 13], 40)`, `_2 = &raw mut _1` (tag `2`),
+`_3 = &_1` (tag `3`, frozen). -/
+def b3PtrFieldSubLocals : List LocalSlot :=
+  [.uninit,
+   .init (.aggregate 0 [.aggregate 0 [sc8 10, sc8 11, sc8 12, sc8 13], sc8 40]),
+   .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+   .init (.ptr { allocId := 3, offsetBytes := 0 } 8)]
+
+def b3PtrFieldSubAfterMove : List LocalSlot :=
+  [.uninit,
+   .init (.aggregate 0 [.aggregate 0 [sc8 10, movedUninitValue, movedUninitValue, sc8 13], sc8 40]),
+   .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+   .init (.ptr { allocId := 3, offsetBytes := 0 } 8)]
+
+/-- **Chained multi-level projections (`ep1-B3`): `move _1.0.1`, `move (_1[i]).0`,
+`move (*_p).0[1..3]`, and `move ((*_fatPtr)[1]).0`.**
+1. `move _1.0.1` on `d3NestedLocals` (`((10, 11), 12)`) delivers `11` and marks
+   only `_1.0.1` moved-out while `_1.0.0 = 10` and `_1.1 = 12` remain readable.
+2. `move (_1[_2]).0` (`[.index 2, .field 0 u8Ty]` with `_2 = 1`) on
+   `b3IdxFatLocals` delivers `20` and marks only `_1[1].0` moved-out (`_1[1].1 = 21`
+   and `_1[0] = (10, 11)` stay readable); `writePlaceValue` at `(_1[_2]).0`
+   re-initializes it.
+3. `move (*_2).0[1..3]` (`[.deref, .field 0 b3Arr4Ty, .subslice 1 3 false]`) on
+   `b3PtrFieldSubLocals` with active + frozen borrows `d5Borrows` delivers
+   `[11, 12]` and marks `_1.0[1]` and `_1.0[2]` element-wise while keeping
+   `(*_3).0[0] = 10`, `(*_3).0[3] = 13`, and `(*_3).1 = 40` readable through the
+   sibling frozen borrow `_3`.
+4. `move ((*_3)[1]).0` (`[.deref, .constantIndex 1 2 false, .field 0 u8Ty]`) on
+   `b3IdxFatLocals` with `d5Borrows` delivers `20` and deinitializes `_1[1].0`
+   while keeping `((*_3)[1]).1 = 21` and `(*_3)[0] = (10, 11)` readable. -/
+theorem canary_B3_chained_projections_move_and_reinit :
+    evalOperand d3NestedLocals (.move (pl 1 [.field 0 tupU8U8Ty, .field 1 u8Ty]))
+      (deinitProjectedMoves := true) =
+      .ok (sc8 11) [.uninit, .init (.aggregate 0 [.aggregate 0 [sc8 10, movedUninitValue], sc8 12])] ∧
+    evalOperand [.uninit, .init (.aggregate 0 [.aggregate 0 [sc8 10, movedUninitValue], sc8 12])]
+      (.copy (pl 1 [.field 0 tupU8U8Ty, .field 0 u8Ty])) (deinitProjectedMoves := true) =
+      .ok (sc8 10) [.uninit, .init (.aggregate 0 [.aggregate 0 [sc8 10, movedUninitValue], sc8 12])] ∧
+    evalOperand [.uninit, .init (.aggregate 0 [.aggregate 0 [sc8 10, movedUninitValue], sc8 12])]
+      (.copy (pl 1 [.field 0 tupU8U8Ty])) (deinitProjectedMoves := true) = .ub ∧
+    evalOperand b3IdxFatLocals (.move (pl 1 [.index 2, .field 0 u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 20) b3IdxFatAfterMove ∧
+    evalOperand b3IdxFatAfterMove (.copy (pl 1 [.index 2, .field 1 u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 21) b3IdxFatAfterMove ∧
+    evalOperand b3IdxFatAfterMove (.copy (pl 1 [.constantIndex 0 2 false])) d5Borrows
+      (deinitProjectedMoves := true) =
+      .ok (.aggregate 0 [sc8 10, sc8 11]) b3IdxFatAfterMove ∧
+    evalOperand b3IdxFatAfterMove (.copy (pl 1 [.index 2, .field 0 u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ub ∧
+    writePlaceValue b3IdxFatAfterMove d5Borrows (pl 1 [.index 2, .field 0 u8Ty]) (sc8 20) =
+      .ok b3IdxFatLocals ∧
+    evalOperand b3PtrFieldSubLocals
+      (.move (pl 2 [.deref, .field 0 b3Arr4Ty, .subslice 1 3 false])) d5Borrows
+      (deinitProjectedMoves := true) =
+      .ok (.aggregate 0 [sc8 11, sc8 12]) b3PtrFieldSubAfterMove ∧
+    evalOperand b3PtrFieldSubAfterMove
+      (.copy (pl 3 [.deref, .field 0 b3Arr4Ty, .constantIndex 0 4 false])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 10) b3PtrFieldSubAfterMove ∧
+    evalOperand b3PtrFieldSubAfterMove
+      (.copy (pl 3 [.deref, .field 0 b3Arr4Ty, .constantIndex 3 4 false])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 13) b3PtrFieldSubAfterMove ∧
+    evalOperand b3PtrFieldSubAfterMove
+      (.copy (pl 3 [.deref, .field 1 u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 40) b3PtrFieldSubAfterMove ∧
+    evalOperand b3PtrFieldSubAfterMove
+      (.copy (pl 3 [.deref, .field 0 b3Arr4Ty, .constantIndex 1 4 false])) d5Borrows
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperand b3IdxFatLocals
+      (.move (pl 3 [.deref, .constantIndex 1 2 false, .field 0 u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 20) b3IdxFatAfterMove ∧
+    evalOperand b3IdxFatAfterMove
+      (.copy (pl 3 [.deref, .constantIndex 1 2 false, .field 1 u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 21) b3IdxFatAfterMove ∧
+    evalOperand b3IdxFatAfterMove
+      (.copy (pl 3 [.deref, .constantIndex 1 2 false, .field 0 u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **Transparent `.opaqueCast` and `.unwrapUnsafeBinder` projections wrapping
+`.field`, `.subslice`, and `.deref` (`ep1-B3`).**
+1. Prefix and suffix `.opaqueCast` / `.unwrapUnsafeBinder` around `.field 0 u8Ty`
+   produce the exact same deinitialized state `d2AfterMove` as `.field 0 u8Ty`,
+   and re-reading through either transparent wrapper faults with `.ub` while the
+   sibling `.field 1` stays readable.
+2. Prefix and suffix `.opaqueCast` / `.unwrapUnsafeBinder` around `.subslice 1 3 false`
+   produce the exact same element-wise deinitialized array `d9AfterSubslice`
+   (preserving the 4-element array length because `lastStructuralProjection?`
+   skips trailing transparent projections).
+3. `.opaqueCast` / `.unwrapUnsafeBinder` on `(*_2)` (thin pointer and slice fat
+   pointer) deinitializes the active-frame target just like an unwrapped `Deref`. -/
+theorem canary_B3_transparent_opaqueCast_and_unwrapUnsafeBinder_moves :
+    evalOperand d2Locals (.move (pl 1 [.opaqueCast tupU8U8Ty, .field 0 u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 2) d2AfterMove ∧
+    evalOperand d2Locals (.move (pl 1 [.field 0 u8Ty, .opaqueCast u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 2) d2AfterMove ∧
+    evalOperand d2Locals (.move (pl 1 [.unwrapUnsafeBinder tupU8U8Ty, .field 0 u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 2) d2AfterMove ∧
+    evalOperand d2Locals (.move (pl 1 [.field 0 u8Ty, .unwrapUnsafeBinder u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 2) d2AfterMove ∧
+    evalOperand d2AfterMove (.copy (pl 1 [.field 0 u8Ty, .opaqueCast u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperand d2AfterMove (.copy (pl 1 [.unwrapUnsafeBinder tupU8U8Ty, .field 1 u8Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 3) d2AfterMove ∧
+    evalOperand d9Locals (.move (pl 1 [.opaqueCast b3Arr4Ty, .subslice 1 3 false])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (.aggregate 0 [sc8 11, sc8 12]) d9AfterSubslice ∧
+    evalOperand d9Locals (.move (pl 1 [.subslice 1 3 false, .opaqueCast b3Arr2Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (.aggregate 0 [sc8 11, sc8 12]) d9AfterSubslice ∧
+    evalOperand d9Locals (.move (pl 1 [.unwrapUnsafeBinder b3Arr4Ty, .subslice 1 3 false])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (.aggregate 0 [sc8 11, sc8 12]) d9AfterSubslice ∧
+    evalOperand d9Locals (.move (pl 1 [.subslice 1 3 false, .unwrapUnsafeBinder b3Arr2Ty])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (.aggregate 0 [sc8 11, sc8 12]) d9AfterSubslice ∧
+    evalOperand d5TypedTupleLocals (.move (pl 2 [.deref, .opaqueCast u8Ty])) d5Borrows []
+      d5TypedTupleLayouts [] d5TypedTupleDecls [] true =
+      .ok (sc8 3) d5TypedTupleAfterMove ∧
+    evalOperand d9SliceFatPtrLocals (.move (pl 2 [.deref, .opaqueCast b3SliceU8Ty])) d5Borrows
+      (deinitProjectedMoves := true) =
+      .ok (.aggregate 0 [sc8 10, sc8 11, sc8 12, sc8 13])
+        [.uninit,
+         .init (.aggregate 0 [movedUninitValue, movedUninitValue, movedUninitValue, movedUninitValue]),
+         .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8,
+           .scalar { bits := 4, sizeBytes := 8 }])] :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end TrustedCanaries
 
 end TrustedPart
@@ -2837,6 +3059,37 @@ theorem operandMachine_evalOperand_move_immediate_root (h : OperandMachine.Hooks
   unfold_named "_private.Miri.Interpreter.OperandMachine.0.Miri.Interpreter.OperandMachine.lift"
   simp only [array_isEmpty_empty, hzst, Bool.false_eq_true, ↓reduceIte, EStateM.bind, hcur, hrep,
     Except.mapError, pure, EStateM.pure, hset, EStateM.modifyGet]
+
+/-- **Projected immediate move, universal.** With `deinitMovedPlace = true`,
+`Move place` on a non-empty projection (`place.projection.isEmpty = false`) of a
+non-zero-sized immediate local materializes the base local (`localToPlace` +
+`forceAllocation`), re-evaluates `place` to `.indirect mplace`, and queues
+`(mplace, true)` in `pendingMoveDeinits`. -/
+theorem operandMachine_evalOperand_move_projected_immediate (h : OperandMachine.Hooks K User C)
+    (c : C) (place : Miri.MIR.Place) (known : Option LocalLayout)
+    (s s₁ s₂ s₃ s₄ : MachineHooks.State K User)
+    (v : Immediate Provenance) (layout layout' : LocalLayout)
+    (basePlace : RuntimePlace Provenance) (forced : MPlaceTy Provenance)
+    (mplace : MemPlace Provenance)
+    (hon : h.deinitMovedPlace = true)
+    (hproj : place.projection.isEmpty = false)
+    (hzst : layout.layout.isZst = false)
+    (heval₁ : OperandMachine.evalPlaceToOp h c place known
+      { s with machine := MachineHooks.clearPendingMoveDeinitFlag s.machine } =
+        .ok ⟨.immediate v, layout⟩ s₁)
+    (hloc : localToPlace h.projection.place c place.localId s₁ = .ok basePlace s₂)
+    (hforce : forceAllocation h.projection.place c basePlace s₂ = .ok forced s₃)
+    (heval₂ : OperandMachine.evalPlaceToOp h c place known s₃ =
+      .ok ⟨.indirect mplace, layout'⟩ s₄) :
+    OperandMachine.evalOperand h c (.Move place) known s =
+      .ok ⟨.indirect mplace, layout'⟩
+        { s₄ with machine := MachineHooks.recordPendingMoveDeinit s₄.machine mplace true } := by
+  simp only [OperandMachine.evalOperand, hon, ↓reduceIte]
+  show (OperandMachine.evalOperandMoving h c (.Move place) known) s = _
+  simp only [OperandMachine.evalOperandMoving, OperandMachine.updateMoveLatch, bind, EStateM.bind,
+    modify, modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, heval₁, hproj, hzst,
+    Bool.false_eq_true, ↓reduceIte, hloc, hforce, heval₂]
+  rfl
 
 end OperandLatch
 
@@ -4699,6 +4952,234 @@ theorem canary_D8_unwinding_call_unmoved_ok :
     d8ReadCaller 2 d8AfterUnwindState.machine = .ok 1 d8AfterUnwindState.machine :=
   rfl
 
+/-- **Consumer-side tail-call terminator (`evalTailCallTerminatorMoving`),
+universal.** Evaluates callee and arguments with `evalCalleeAndArgsMoving`,
+dispatches through `initFnTailCallMoving`, and checks that `frameIndex` did not
+grow. -/
+theorem call_evalTailCallTerminatorMoving_eq
+    {P S C E Other Extern FnABI ArgABI : Type}
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C) (budget : Nat)
+    (src : Miri.MIR.SourceInfo) (func : Miri.MIR.Operand) (args : Array Miri.MIR.SpannedOperand)
+    (fnSpan : Miri.MIR.SpanRef) :
+    Call.evalTailCallTerminatorMoving h choice budget ⟨src, .TailCall func args fnSpan⟩ = (do
+      let oldIndex ← h.frameIndex
+      let (evaluated, temps) ← Call.evalCalleeAndArgsMoving h choice func args
+      Call.initFnTailCallMoving h choice budget evaluated temps
+      srcRequire ((← h.frameIndex) == oldIndex)
+        "evaluating this tail call pushed a new stack frame") := by
+  unfold Call.evalTailCallTerminatorMoving srcRequire
+  unfold_named "_private.Miri.Interpreter.Call.0.Miri.Interpreter.Call.require"
+  rfl
+
+/-- Call hooks for `initFnTailCallMoving`, `evalTailCallTerminatorMoving`, and
+`initDropInPlaceCall`: `popRaw` fails if caller cell `1` was not yet
+deinitialized when `requireCaller1UninitOnPop = true`, proving that argument
+materialization and caller deinitialization run BEFORE `popRaw` and `cleanup`;
+`cleanupAction` controls the `ReturnAction` returned by `cleanup`. -/
+def b3TailDropHooks (requireCaller1UninitOnPop : Bool)
+    (rootOfStack : Bool := false) (cleanupAction : ReturnAction := .normal) :
+    CallHooks Unit ToyD8State Unit Unit Unit Unit Unit Unit :=
+  { d8CallHooks false false with
+    frameIndex := pure 0
+    popRaw := fun _ => do
+      let s ← get
+      if requireCaller1UninitOnPop && (s.callerCells[1]?).join.isSome then
+        throw (.invalidProgram "popRaw ran before caller arg 1 was deinitialized")
+      set { s with inCallee := false }
+      let base := d8Frame s.block s.unwinding
+      pure (if rootOfStack then { base with returnContinuation := .stop true } else base)
+    cleanup := fun _ _ _ => pure cleanupAction
+    resolveDropGlue := fun _ _ => pure ⟨.Item 10, #[]⟩
+    mplaceToMutRef := fun _ m => pure ⟨.indirect m.mplace, m.layout⟩
+    fakeUnitReturn := fun _ => pure (.memory ⟨toyMPlace 0, toyFnLayout⟩)
+    findMirOrEvalFn := fun _ _ _ args _ _ _ => do
+      let copyArgToCallee (arg : FnArg Unit) (calleeSlot : Nat) : CallM ToyD8State Unit := do
+        let s ← get
+        match arg.copyFnArg.op with
+        | .indirect m =>
+          match (s.callerCells[toyCell m]?).join with
+          | some v => set { s with calleeCells := s.calleeCells.set calleeSlot (some v) }
+          | none => throw (.undefinedBehavior "invalidUninitBytes")
+        | .immediate _ =>
+          set { s with calleeCells := s.calleeCells.set calleeSlot (some 99) }
+      match args.size with
+      | 1 =>
+        let some arg0 := args[0]? | throw (.invalidProgram "missing arg 0")
+        copyArgToCallee arg0 1
+      | _ =>
+        let some arg0 := args[0]? | throw (.invalidProgram "missing arg 0")
+        let some arg1 := args[1]? | throw (.invalidProgram "missing arg 1")
+        copyArgToCallee arg0 1
+        copyArgToCallee arg1 2
+      pure none }
+
+private theorem b3TailDropHooks_frameIndex
+    (rootOfStack : Bool := false) (cleanupAction : ReturnAction := .normal) :
+    (b3TailDropHooks true rootOfStack cleanupAction).frameIndex = pure 0 := rfl
+
+private theorem tailCallMoving_evalCalleeAndArgs
+    (rootOfStack : Bool := false) (cleanupAction : ReturnAction := .normal) :
+    Call.evalCalleeAndArgsMoving (b3TailDropHooks true rootOfStack cleanupAction) () toyFn
+        #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩] d8InitState =
+      .ok (⟨.Instance ⟨.Item 10, #[]⟩,
+            #[.Copy ⟨.indirect (toyMPlace 4), toyU8⟩, .Copy ⟨.indirect (toyMPlace 6), toyU8⟩],
+            (), some (), false⟩,
+           #[⟨⟨4⟩, none⟩, ⟨⟨6⟩, none⟩])
+        { d8InitState with
+          callerCells := [none, none, some 3, none, some 2, none, some 3, none],
+          temps := [4, 6] } := by
+  with_unfolding_all rfl
+
+private theorem tailCallMoving_case_normal :
+    Call.evalTailCallTerminatorMoving (b3TailDropHooks true) () 1
+        ⟨⟨⟨0⟩, 0⟩, .TailCall toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩] ⟨0⟩⟩
+        d8InitState =
+      .ok ()
+        { callerCells := [none, none, some 3, none, some 2, none, some 3, none],
+          calleeCells := [none, some 2, some 3, none],
+          temps := [4, 6], freedTemps := [4, 6], inCallee := false, block := 0,
+          unwinding := false, panicCalled := false } := by
+  rw [call_evalTailCallTerminatorMoving_eq]
+  simp only [b3TailDropHooks_frameIndex, bind, EStateM.bind, pure, EStateM.pure,
+    tailCallMoving_evalCalleeAndArgs]
+  with_unfolding_all rfl
+
+private theorem tailCallMoving_case_inPlace :
+    Call.initFnTailCallMoving (b3TailDropHooks true) () 1
+        ⟨.Instance ⟨.Item 10, #[]⟩,
+         #[.InPlace ⟨toyMPlace 1, toyU8⟩, .Copy ⟨.indirect (toyMPlace 6), toyU8⟩],
+         (), some (), false⟩
+        #[⟨⟨6⟩, none⟩]
+        { d8InitState with
+          callerCells := [none, some 2, some 3, none, none, none, some 3, none],
+          temps := [6] } =
+      .ok ()
+        { callerCells := [none, none, some 3, none, none, none, some 3, none].set 6 (some 2),
+          calleeCells := [none, some 2, some 2, none],
+          temps := [6, 6], freedTemps := [6, 6], inCallee := false, block := 0,
+          unwinding := false, panicCalled := false } := by
+  with_unfolding_all rfl
+
+private theorem tailCallMoving_case_rootStop :
+    Call.evalTailCallTerminatorMoving (b3TailDropHooks true true) () 1
+        ⟨⟨⟨0⟩, 0⟩, .TailCall toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩] ⟨0⟩⟩
+        d8InitState =
+      .error (.invalidProgram "cannot tailcall as root of stack")
+        { callerCells := [none, none, some 3, none, some 2, none, some 3, none],
+          calleeCells := [none, none, none, none],
+          temps := [4, 6], freedTemps := [4, 6], inCallee := false, block := 0,
+          unwinding := false, panicCalled := false } := by
+  rw [call_evalTailCallTerminatorMoving_eq]
+  simp only [b3TailDropHooks_frameIndex, bind, EStateM.bind, pure, EStateM.pure,
+    tailCallMoving_evalCalleeAndArgs]
+  with_unfolding_all rfl
+
+private theorem tailCallMoving_case_cleanupErr :
+    Call.evalTailCallTerminatorMoving (b3TailDropHooks true false .noJump) () 1
+        ⟨⟨⟨0⟩, 0⟩, .TailCall toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩] ⟨0⟩⟩
+        d8InitState =
+      .error (.invalidProgram "tailcall cleanup must return Normal")
+        { callerCells := [none, none, some 3, none, some 2, none, some 3, none],
+          calleeCells := [none, some 2, some 3, none],
+          temps := [4, 6], freedTemps := [4, 6], inCallee := false, block := 0,
+          unwinding := false, panicCalled := false } := by
+  rw [call_evalTailCallTerminatorMoving_eq]
+  simp only [b3TailDropHooks_frameIndex, bind, EStateM.bind, pure, EStateM.pure,
+    tailCallMoving_evalCalleeAndArgs]
+  with_unfolding_all rfl
+
+/-- **`evalTailCallTerminatorMoving` & `initFnTailCallMoving` (`ep1-B3`):
+caller places are materialized/deinitialized BEFORE `popRaw`/`cleanup`, and
+`allTemps` are deallocated on both normal dispatch AND error.**
+1. Normal `tailcall f(move _1, copy _2)` via `evalTailCallTerminatorMoving`:
+   `_1 = 2` and `_2 = 3` are snapshotted into temporaries `[4, 6]` and `_1` is
+   deinitialized (`callerCells[1] = none`) BEFORE `popRaw` runs (checked by
+   `requireCaller1UninitOnPop = true`), the tail-callee receives `[2, 3]`, and
+   both temporaries `[4, 6]` are freed (`freedTemps = [4, 6]`).
+2. Direct `initFnTailCallMoving` with an `.InPlace` argument at cell `1`:
+   materializes cell `1` into temporary `4` and deinitializes `callerCells[1]`
+   before `popRaw` runs, copies `[2, 3]` into the tail-callee, and frees `[4, 6]`.
+3. Error during `initFnTailCallMoving` (root-of-stack `.stop` continuation or
+   non-`.normal` `cleanup` return): the `catch` handler still frees all temporary
+   allocations (`freedTemps = [4, 6]`) before propagating the error. -/
+theorem canary_tailCallMoving_deinit_before_pop_and_temp_cleanup :
+    Call.evalTailCallTerminatorMoving (b3TailDropHooks true) () 1
+        ⟨⟨⟨0⟩, 0⟩, .TailCall toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩] ⟨0⟩⟩
+        d8InitState =
+      .ok ()
+        { callerCells := [none, none, some 3, none, some 2, none, some 3, none],
+          calleeCells := [none, some 2, some 3, none],
+          temps := [4, 6], freedTemps := [4, 6], inCallee := false, block := 0,
+          unwinding := false, panicCalled := false } ∧
+    Call.initFnTailCallMoving (b3TailDropHooks true) () 1
+        ⟨.Instance ⟨.Item 10, #[]⟩,
+         #[.InPlace ⟨toyMPlace 1, toyU8⟩, .Copy ⟨.indirect (toyMPlace 6), toyU8⟩],
+         (), some (), false⟩
+        #[⟨⟨6⟩, none⟩]
+        { d8InitState with
+          callerCells := [none, some 2, some 3, none, none, none, some 3, none],
+          temps := [6] } =
+      .ok ()
+        { callerCells := [none, none, some 3, none, none, none, some 3, none].set 6 (some 2),
+          calleeCells := [none, some 2, some 2, none],
+          temps := [6, 6], freedTemps := [6, 6], inCallee := false, block := 0,
+          unwinding := false, panicCalled := false } ∧
+    Call.evalTailCallTerminatorMoving (b3TailDropHooks true true) () 1
+        ⟨⟨⟨0⟩, 0⟩, .TailCall toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩] ⟨0⟩⟩
+        d8InitState =
+      .error (.invalidProgram "cannot tailcall as root of stack")
+        { callerCells := [none, none, some 3, none, some 2, none, some 3, none],
+          calleeCells := [none, none, none, none],
+          temps := [4, 6], freedTemps := [4, 6], inCallee := false, block := 0,
+          unwinding := false, panicCalled := false } ∧
+    Call.evalTailCallTerminatorMoving (b3TailDropHooks true false .noJump) () 1
+        ⟨⟨⟨0⟩, 0⟩, .TailCall toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩] ⟨0⟩⟩
+        d8InitState =
+      .error (.invalidProgram "tailcall cleanup must return Normal")
+        { callerCells := [none, none, some 3, none, some 2, none, some 3, none],
+          calleeCells := [none, some 2, some 3, none],
+          temps := [4, 6], freedTemps := [4, 6], inCallee := false, block := 0,
+          unwinding := false, panicCalled := false } :=
+  ⟨tailCallMoving_case_normal, tailCallMoving_case_inPlace,
+   tailCallMoving_case_rootStop, tailCallMoving_case_cleanupErr⟩
+
+/-- **`Call.initDropInPlaceCall` on a static (non-`dyn`) type, universal.**
+Forces allocation of the dropped place, resolves drop glue, builds `&mut T` via
+`mplaceToMutRef`, and invokes `initFnCall` with `#[.Copy arg]` (never `.InPlace`
+and never arming `pendingMoveDeinit`). -/
+theorem call_initDropInPlaceCall_static_eq
+    {P S C E Other Extern FnABI ArgABI : Type}
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C) (budget : Nat)
+    (place : RuntimeStackPlace P) (originalInstance : CallInstance)
+    (target : Miri.MIR.BasicBlockId) (unwind : Miri.MIR.UnwindAction)
+    (hdbg : h.debugAssertions = false)
+    (hstatic : ∀ ty, h.isDynamic ty = pure false) :
+    Call.initDropInPlaceCall h choice budget place originalInstance target unwind = (do
+      let place ← h.forceAllocation choice place
+      let fnInstance ← h.resolveDropGlue choice place.layout.ty
+      let abi ← h.fnAbiOfInstance choice fnInstance #[]
+      let arg ← h.mplaceToMutRef choice place
+      let ret ← h.fakeUnitReturn choice
+      Call.initFnCall h choice budget ⟨.Instance fnInstance, h.rustAbi, some abi, #[.Copy arg],
+        false, ret, some target, unwind⟩) := by
+  simp only [Call.initDropInPlaceCall, hdbg, hstatic, bind, pure, Bool.false_eq_true, ↓reduceIte]
+  rfl
+
+/-- **`Call.initDropInPlaceCall` (`ep1-B3`): dropping an initialized place keeps
+its bytes initialized for the drop glue, whereas dropping a moved-out place
+faults when the drop glue reads it.** -/
+theorem canary_dropInPlace_preserves_initialized_and_detects_moved :
+    Call.initDropInPlaceCall (b3TailDropHooks false) () 1
+        (.memory ⟨toyMPlace 1, toyU8⟩) ⟨.Item 10, #[]⟩ 0 (.Cleanup 1) d8InitState =
+      .ok ()
+        { d8InitState with calleeCells := [none, some 2, none, none] } ∧
+    Call.initDropInPlaceCall (b3TailDropHooks false) () 1
+        (.memory ⟨toyMPlace 1, toyU8⟩) ⟨.Item 10, #[]⟩ 0 (.Cleanup 1)
+        { d8InitState with callerCells := d8InitState.callerCells.set 1 none } =
+      .error (.undefinedBehavior "invalidUninitBytes")
+        { d8InitState with callerCells := d8InitState.callerCells.set 1 none } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
 end CallUnpackVirtualAndUnwindD8
 
 /-! ### `SwitchInt` move deinitialization through the real `ControlFlow.evalTerminator` -/
@@ -5191,19 +5672,71 @@ theorem indirect_move_simulation {K User C : Type} [DecidableEq K]
       EStateM.pure]
   · rw [evalOperand_move_deinit, ← evalCopyPlaceRead_eq_copy, hcopyT, hdeinitT]
 
+/-- **Call-argument `Deref` move simulation over arbitrary trailing projections
+and borrow tables (`ep1-B3`).** Moving `(*_p).restProj` as a call argument in
+`lean-miri` via `Call.evalFnCallArgumentMoving` (`deinitMovedPlace = true`) and
+in Trusted via `evalOperand ... (.move { local_ := pLocal, projection := .deref ::
+tRestProj }) borrows ... true` both deliver the pointee sub-value and
+deinitialize the target through the borrow-tracker-silent deinitializer, while
+every `.frozen` sibling borrow in `borrows` stays `.frozen` and `passArgument`
+is independent of `protectArgument`. -/
+theorem d7_call_arg_move_deref_projected_sibling_frozen_simulation
+    {P S C E Other Extern FnABI ArgABI : Type}
+    (rel : Trusted.Rustc.V2026_06_01.MirSemantics.Value → MemPlace P → Prop)
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C)
+    (pLocal : Nat) (mRestProj : List Miri.MIR.ProjectionElem)
+    (tRestProj : List Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem)
+    (locals locals' : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (borrows : List Trusted.Rustc.V2026_06_01.MirSemantics.BorrowEntry)
+    (globals : List Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation)
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (callerLocals : List Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (localDecls : List Trusted.Rustc.V2026_06_01.MirAst.LocalDecl)
+    (callStack : List Trusted.Rustc.V2026_06_01.MirSemantics.SavedCallerFrame)
+    (v : Trusted.Rustc.V2026_06_01.MirSemantics.Value)
+    (path : OperandPath) (s s₁ s₂ s₃ s₄ s₅ : S) (rplace : RuntimeStackPlace P)
+    (mplace : MemPlace P) (layout : LocalLayout) (tmp : MPlaceTy P)
+    (hplace : h.evalPlace choice ⟨pLocal, ⟨.Deref :: mRestProj⟩⟩ true s = .ok rplace s₁)
+    (hop : h.placeToOp choice rplace s₁ = .ok ⟨.indirect mplace, layout⟩ s₂)
+    (hsized : layout.layout.isSized = true)
+    (halloc : h.allocateStack choice layout s₂ = .ok tmp s₃)
+    (hcopy : h.withRetagMode choice .None
+      (h.copyToMemory choice ⟨.indirect mplace, layout⟩ tmp) s₃ = .ok () s₄)
+    (hdeinit : h.deinitInPlaceArgument choice ⟨mplace, layout⟩ s₄ = .ok () s₅)
+    (htrusted : Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand locals
+      (.move { local_ := pLocal, projection := .deref :: tRestProj })
+      borrows globals layouts callerLocals localDecls callStack true = .ok v locals')
+    (hrel : rel v tmp.mplace) :
+    Call.evalFnCallArgumentMoving h choice (.Move ⟨pLocal, ⟨.Deref :: mRestProj⟩⟩) path s =
+      .ok (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr) s₅ ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand locals
+      (.move { local_ := pLocal, projection := .deref :: tRestProj })
+      borrows globals layouts callerLocals localDecls callStack true = .ok v locals' ∧
+    rel v tmp.mplace ∧
+    (∀ tag entry,
+      Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow borrows tag = .some entry →
+      entry.perm = .frozen →
+      Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow borrows tag =
+        .some { entry with perm := .frozen }) ∧
+    (∀ (protect : C → MPlaceTy P → CallM S Unit) (callerAbi calleeAbi : ArgABI)
+        (calleeIndex : Nat) (dest : Miri.MIR.Place) (calleeTy : Miri.MIR.TyId) (live : Bool),
+      Call.passArgument { h with protectArgument := protect } choice
+          (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩) callerAbi calleeAbi calleeIndex dest calleeTy
+          live =
+        Call.passArgument h choice (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩) callerAbi calleeAbi
+          calleeIndex dest calleeTy live) :=
+  ⟨call_evalFnCallArgumentMoving_move_indirect h choice ⟨pLocal, ⟨.Deref :: mRestProj⟩⟩
+    path s s₁ s₂ s₃ s₄ s₅ rplace mplace layout tmp hplace hop hsized halloc hcopy hdeinit,
+   htrusted, hrel,
+   fun _ entry hlookup hperm => by rw [hlookup]; cases entry; cases hperm; rfl,
+   fun protect callerAbi calleeAbi calleeIndex dest calleeTy live =>
+     call_passArgument_copy_protect_irrelevant h protect choice _ callerAbi calleeAbi calleeIndex
+       dest calleeTy live⟩
+
 /-- **Call-argument `Deref` move simulation (`d7MoveDerefSiblingFrozen`,
-Finding 11).** Moving `(*_2)` as a call argument in `lean-miri` via
-`Call.evalFnCallArgumentMoving` (`deinitMovedPlace = true`) and in Trusted via
-`evalOperand d5Locals (.move (pl 2 [.deref])) d5Borrows (deinitProjectedMoves :=
-true)` both deliver the pointee value and deinitialize `_1` through the
-borrow-tracker-silent deinitializer (`deinitInPlaceArgument` /
-`PlaceMachine.writeMemoryRawUninit`); the sibling `.frozen` borrow `_3` of
-`d5Borrows` stays `.frozen`. The argument handed to the callee is an
-`FnArg.Copy` of the temporary, on which `passArgument` is independent of
-`protectArgument` (last conjunct, `call_passArgument_copy_protect_irrelevant`):
-no protector retag and no protected `uninit` write (a foreign Tree Borrows
-`.Write` that would disable `_3`) can occur for it. `rel` is a free relation
-whose hypothesis is restated. -/
+Finding 11).** Specialization of
+`d7_call_arg_move_deref_projected_sibling_frozen_simulation` to `(*_2)` on
+`d5Locals`/`d5Borrows`. -/
 theorem d7_call_arg_move_deref_sibling_frozen_simulation
     {P S C E Other Extern FnABI ArgABI : Type}
     (rel : Trusted.Rustc.V2026_06_01.MirSemantics.Value → MemPlace P → Prop)
@@ -5312,6 +5845,136 @@ theorem projected_subplace_move_simulation {Prov Extra State : Type}
       simp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand, hgetT, hnoUnion, hprojRead,
         Trusted.Rustc.V2026_06_01.MirSemantics.evalMoveOperandDeinit, hmoved, htzst,
         Trusted.Rustc.V2026_06_01.MirSemantics.deinitMovedSubPlace, hnoDeref, hprojWrite, hset]
+
+/-- Minimal `LocalAccessHooks` for concrete Part 4 simulation non-vacuity
+witnesses: local `1` starts as an immediate `u8`, and `forceLocalAllocation`
+materializes local `1` to `toyMPlace 10` (with `.Field idx _` projecting to
+`toyMPlace (10 + idx)`). -/
+def b3SimLocalHooks : LocalAccessHooks Unit Unit Unit where
+  layout := fun frame state _ _ => ⟨frame, state, .ok toyU8⟩
+  validationInProgress := fun _ => false
+  afterLocalRead := fun frame state _ => ⟨frame, state, .ok ()⟩
+  project := fun frame state op elem =>
+    match op.op, elem with
+    | .immediate imm, .Field _ _ => ⟨frame, state, .ok ⟨.immediate imm, toyU8⟩⟩
+    | .indirect m, .Field idx _ =>
+      ⟨frame, state, .ok ⟨.indirect (toyMPlace (toyCell m + idx)), toyU8⟩⟩
+    | _, _ => ⟨frame, state, .ok op⟩
+  checkPlaceType := fun frame state _ _ => ⟨frame, state, .ok ()⟩
+  runtimeChecks := fun frame state _ =>
+    ⟨frame, state, .ok ⟨.immediate (.scalar (Scalar.fromBool true)), toyU8⟩⟩
+  constant := fun frame state _ _ => ⟨frame, state, .ok ⟨.immediate .uninit, toyU8⟩⟩
+  deinitMovedPlace := true
+  forceLocalAllocation := fun frame state localId =>
+    match frame.replaceLocalValue localId (.live (.indirect (toyMPlace 10))) with
+    | .ok frame' => ⟨frame', state, .ok ()⟩
+    | .error e => ⟨frame, state, .error (.stack e)⟩
+
+/-- Initial 2-local `Frame` for Part 4 non-vacuity witnesses: `_0` uninitialized,
+`_1` live immediate scalar `true`. -/
+def b3SimFrameInit : Frame Unit LocalLayout Unit :=
+  { d8Frame 0 false with
+    locals := #[⟨.live (.immediate .uninit), some toyU8⟩,
+                ⟨.live (.immediate (.scalar (Scalar.fromBool true))), some toyU8⟩] }
+
+/-- Expected frame after `Move _1` deinitializes root local `_1`. -/
+def b3SimFrameAfterRootMove : Frame Unit LocalLayout Unit :=
+  { d8Frame 0 false with
+    locals := #[⟨.live (.immediate .uninit), some toyU8⟩,
+                ⟨.live (.immediate .uninit), some toyU8⟩] }
+
+/-- Expected frame after `Move _1.0` materializes `_1` to `toyMPlace 10`. -/
+def b3SimFrameAfterForce : Frame Unit LocalLayout Unit :=
+  { d8Frame 0 false with
+    locals := #[⟨.live (.immediate .uninit), some toyU8⟩,
+                ⟨.live (.indirect (toyMPlace 10)), some toyU8⟩] }
+
+/-- **Non-vacuity witness for `root_move_simulation` (`ep1-B3`)** with non-empty
+`d5Borrows`. -/
+theorem witness_root_move_simulation :
+    Miri.Interpreter.evalOperand b3SimLocalHooks b3SimFrameInit () (.Move ⟨1, #[]⟩) none =
+      ⟨b3SimFrameAfterRootMove, (),
+       .ok ⟨.immediate (.scalar (Scalar.fromBool true)), toyU8⟩⟩ ∧
+    ∃ locals',
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand d1Locals
+          (.move { local_ := 1, projection := .nil }) d5Borrows []
+          Trusted.Rustc.V2026_06_01.MirSemantics.emptyLayoutTable [] [] [] true =
+        .ok (sc8 5) locals' ∧
+      True ∧
+      ∃ lv, (b3SimFrameAfterRootMove.locals[1]?).map (·.value) = some lv ∧
+        ∃ slot, Trusted.Sequence.get? locals' 1 = some slot ∧
+          RootSlotRel (fun _ _ => True) slot lv :=
+  root_move_simulation (fun _ _ => True) b3SimLocalHooks
+    b3SimFrameInit b3SimFrameInit b3SimFrameAfterRootMove () () 1 none
+    (.scalar (Scalar.fromBool true)) toyU8 d1Locals (sc8 5) d5Borrows []
+    Trusted.Rustc.V2026_06_01.MirSemantics.emptyLayoutTable [] [] [] rfl rfl rfl rfl rfl trivial rfl rfl
+
+/-- **Non-vacuity witness for `projected_subplace_move_simulation` (`ep1-B3`)**
+over a non-empty projection `_1.0` and non-empty borrow table `d5Borrows`. -/
+theorem witness_projected_subplace_move_simulation :
+    Miri.Interpreter.evalOperand b3SimLocalHooks b3SimFrameInit ()
+        (.Move ⟨1, #[.Field 0 0]⟩) none =
+      ⟨b3SimFrameAfterForce, (), .ok ⟨.indirect (toyMPlace 10), toyU8⟩⟩ ∧
+    ∃ locals',
+      Trusted.Sequence.get? locals' 1 =
+        .some (.init (.aggregate 0 [Trusted.Rustc.V2026_06_01.MirSemantics.movedUninitValue, sc8 3])) ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand d2Locals
+        (.move { local_ := 1, projection := [.field 0 u8Ty] }) d5Borrows []
+        Trusted.Rustc.V2026_06_01.MirSemantics.emptyLayoutTable [] [] [] true =
+        .ok (sc8 2) locals' ∧
+      True :=
+  projected_subplace_move_simulation (fun _ _ => True) b3SimLocalHooks
+    b3SimFrameInit b3SimFrameInit b3SimFrameAfterForce b3SimFrameAfterForce
+    () () () () 1 (.Field 0 0) [] none (.scalar (Scalar.fromBool true))
+    (toyMPlace 10) (toyMPlace 10) toyU8 d2Locals (.field 0 u8Ty) []
+    (.aggregate 0 [sc8 2, sc8 3])
+    (.aggregate 0 [Trusted.Rustc.V2026_06_01.MirSemantics.movedUninitValue, sc8 3])
+    (sc8 2) d5Borrows [] Trusted.Rustc.V2026_06_01.MirSemantics.emptyLayoutTable [] [] []
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl trivial
+
+/-- Initial state for `(*_2).0` call-argument move: cell `2` holds `3` (`_1[1].0`),
+temporaries start at cell `4`. -/
+def b3D7Init : ToyCallState :=
+  { mem := [none, none, some 3, none, none, none, none], resolved := false, nextTmp := 4 }
+
+/-- Post-state after `Call.evalFnCallArgumentMoving` moves `(*_2).0` into
+temporary cell `4` and deinitializes cell `2`. -/
+def b3D7After : ToyCallState :=
+  { mem := [none, none, none, none, some 3, none, none], resolved := false, nextTmp := 5 }
+
+/-- **Non-vacuity witness for
+`d7_call_arg_move_deref_projected_sibling_frozen_simulation` (`ep1-B3`)** over a
+non-empty trailing projection `(*_2).0` (`[.deref, .field 0 u8Ty]`) on
+`a2PairArrLocals` with active + frozen `d5Borrows`. -/
+theorem witness_d7_call_arg_move_deref_projected_sibling_frozen_simulation :
+    Call.evalFnCallArgumentMoving (toyCallHooks true) ()
+        (.Move ⟨2, #[.Deref, .Field 0 0]⟩) #[] b3D7Init =
+      .ok (.Copy ⟨.indirect (toyMPlace 4), toyU8⟩, some ⟨⟨4⟩, none⟩) b3D7After ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand a2PairArrLocals
+      (.move { local_ := 2, projection := [.deref, .field 0 u8Ty] })
+      d5Borrows [] a2PairArrLayouts [] a2PairArrDecls [] true =
+      .ok (sc8 3) a2PairArrAfterMove ∧
+    True ∧
+    (∀ tag entry,
+      Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow d5Borrows tag = .some entry →
+      entry.perm = .frozen →
+      Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow d5Borrows tag =
+        .some { entry with perm := .frozen }) ∧
+    (∀ (protect : Unit → MPlaceTy Unit → CallM ToyCallState Unit) (callerAbi calleeAbi : Unit)
+        (calleeIndex : Nat) (dest : Miri.MIR.Place) (calleeTy : Miri.MIR.TyId) (live : Bool),
+      Call.passArgument { toyCallHooks true with protectArgument := protect } ()
+          (.Copy ⟨.indirect (toyMPlace 4), toyU8⟩) callerAbi calleeAbi calleeIndex dest calleeTy
+          live =
+        Call.passArgument (toyCallHooks true) () (.Copy ⟨.indirect (toyMPlace 4), toyU8⟩)
+          callerAbi calleeAbi calleeIndex dest calleeTy live) :=
+  d7_call_arg_move_deref_projected_sibling_frozen_simulation (fun _ _ => True)
+    (toyCallHooks true) () 2 [.Field 0 0] [.field 0 u8Ty]
+    a2PairArrLocals a2PairArrAfterMove d5Borrows [] a2PairArrLayouts [] a2PairArrDecls []
+    (sc8 3) #[] b3D7Init b3D7Init b3D7Init
+    { mem := [none, none, some 3, none, none, none, none], resolved := false, nextTmp := 5 }
+    { mem := [none, none, some 3, none, some 3, none, none], resolved := false, nextTmp := 5 }
+    b3D7After (.memory ⟨toyMPlace 2, toyU8⟩) (toyMPlace 2) toyU8 ⟨toyMPlace 4, toyU8⟩
+    rfl rfl rfl rfl rfl rfl rfl trivial
 
 end RootMoveSimulation
 

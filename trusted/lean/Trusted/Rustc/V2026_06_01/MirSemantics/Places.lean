@@ -10432,7 +10432,9 @@ def deinitUnionSubPlace
     (layouts : LayoutTable)
     (loc : Local)
     (rootVal : Value)
-    (proj : List ProjectionElem) :
+    (proj : List ProjectionElem)
+    (extraByteOff : Nat := 0)
+    (overrideReqBytesOpt : Option Nat := .none) :
     Option (List LocalSlot) :=
   match get? localDecls loc with
   | .none => .none
@@ -10440,34 +10442,46 @@ def deinitUnionSubPlace
     match splitAtFirstUnionField localDecls layouts decl.ty proj with
     | .none => .none
     | .some (pre, unionTy, post) =>
-      match readProjectedValue locals rootVal pre with
-      | .ok unionVal =>
-        match
-          encodeTypedValueToBytes layouts unionTy unionVal,
-          projectionChainByteOffset? layouts (.some unionTy) .none .none 0 localDecls post,
-          resolveProjectedTyResolved localDecls layouts unionTy post,
-          LayoutTable.lookup layouts unionTy.layoutIdx
-        with
-        | .some bytes, .some off, .some leafTy, .some { fields := .union count, .. } =>
-          match tyByteSize localDecls layouts leafTy with
-          | .some sz =>
-            match
-              decodeUnionBytesWithCountOpt
-                layouts
-                unionTy.layoutIdx
-                count
-                (uninitByteWindow bytes off sz)
-            with
-            | .some unionVal' =>
-              match writeProjectedValue locals rootVal pre unionVal' with
-              | .ok rootVal' => set? locals loc (.init rootVal')
-              | .ub => .none
-              | .unsupported => .none
+      match resolveUnionSubProjIndices locals post with
+      | .none => .none
+      | .some idxPost =>
+        let normPost := normalizeSubsliceProjections idxPost
+        match readProjectedValue locals rootVal pre with
+        | .ok unionVal =>
+          match
+            encodeTypedValueToBytes layouts unionTy unionVal,
+            projectionChainByteOffset? layouts (.some unionTy) .none .none 0 localDecls normPost,
+            resolveProjectedTyResolved localDecls layouts unionTy normPost,
+            LayoutTable.lookup layouts unionTy.layoutIdx
+          with
+          | .some bytes, .some off, .some leafTy, .some { fields := .union count, .. } =>
+            let szOpt : Option Nat :=
+              match overrideReqBytesOpt with
+              | .some reqB => .some reqB
+              | .none => tyByteSize localDecls layouts leafTy
+            match szOpt with
+            | .some sz =>
+              let startOff := Nat.add off extraByteOff
+              match Nat.ble (Nat.add startOff sz) (length bytes) with
+              | false => .none
+              | true =>
+                match
+                  decodeUnionBytesWithCountOpt
+                    layouts
+                    unionTy.layoutIdx
+                    count
+                    (uninitByteWindow bytes startOff sz)
+                with
+                | .some unionVal' =>
+                  match writeProjectedValue locals rootVal pre unionVal' with
+                  | .ok rootVal' => set? locals loc (.init rootVal')
+                  | .ub => .none
+                  | .unsupported => .none
+                | .none => .none
             | .none => .none
-          | .none => .none
-        | _, _, _, _ => .none
-      | .ub => .none
-      | .unsupported => .none
+          | _, _, _, _ => .none
+        | .ub => .none
+        | .unsupported => .none
 
 /--
 Deinitialize the moved place `⟨loc, proj⟩` of the active frame, whose value
@@ -10596,48 +10610,60 @@ def deinitSubPlaceByteWindow
       match unionWindowOpt with
       | .some locals₁ => .some locals₁
       | .none =>
-        match oldSubVal with
-        | .scalar oldSc =>
-          match Nat.ble (Nat.add byteOff reqBytes) oldSc.sizeBytes with
-          | false => .none
-          | true =>
-            match containerProj, Bool.and (Nat.beq byteOff 0) (Nat.beq reqBytes oldSc.sizeBytes) with
-            | .nil, true => set? locals targetLocal .uninit
-            | .nil, false => set? locals targetLocal (.init movedUninitValue)
-            | _ :: _, _ =>
-              match writeProjectedForLocal locals localDecls layouts targetLocal targetRootVal containerProj movedUninitValue with
-              | .ok rootVal' => set? locals targetLocal (.init rootVal')
-              | .ub => .none
-              | .unsupported => .none
-        | .ptr _ pSz =>
-          match Bool.and (Nat.beq byteOff 0) (Nat.beq reqBytes pSz) with
-          | false => .none
-          | true =>
-            deinitMovedSubPlace locals localDecls layouts targetLocal targetRootVal containerProj fieldVal
-        | .aggregate varIdx fields =>
-          let defaultLeafTy : Ty :=
-            { kind := uintRigidTyOfStride reqBytes, layoutIdx := unresolvedLayoutIdx layouts }
-          match
-            resolveAggregateAtByteOffset?
-              8
-              layouts
-              (.aggregate varIdx fields)
-              subTyOpt
-              byteOff
-              reqBytes
-              false
-              defaultLeafTy
-              false
-              localDecls
-          with
-          | .some (innerProj, .zero) =>
-            let fullProj :=
-              match containerProj with
-              | .nil => innerProj
-              | ph :: pt => ph :: appendProjections pt innerProj
-            deinitMovedSubPlace locals localDecls layouts targetLocal targetRootVal fullProj fieldVal
-          | _ => .none
-        | .unit => .none
+        match placeTouchesUnion localDecls layouts { local_ := targetLocal, projection := containerProj } with
+        | true =>
+          deinitUnionSubPlace
+            locals
+            localDecls
+            layouts
+            targetLocal
+            targetRootVal
+            containerProj
+            byteOff
+            (.some reqBytes)
+        | false =>
+          match oldSubVal with
+          | .scalar oldSc =>
+            match Nat.ble (Nat.add byteOff reqBytes) oldSc.sizeBytes with
+            | false => .none
+            | true =>
+              match containerProj, Bool.and (Nat.beq byteOff 0) (Nat.beq reqBytes oldSc.sizeBytes) with
+              | .nil, true => set? locals targetLocal .uninit
+              | .nil, false => set? locals targetLocal (.init movedUninitValue)
+              | _ :: _, _ =>
+                match writeProjectedForLocal locals localDecls layouts targetLocal targetRootVal containerProj movedUninitValue with
+                | .ok rootVal' => set? locals targetLocal (.init rootVal')
+                | .ub => .none
+                | .unsupported => .none
+          | .ptr _ pSz =>
+            match Bool.and (Nat.beq byteOff 0) (Nat.beq reqBytes pSz) with
+            | false => .none
+            | true =>
+              deinitMovedSubPlace locals localDecls layouts targetLocal targetRootVal containerProj fieldVal
+          | .aggregate varIdx fields =>
+            let defaultLeafTy : Ty :=
+              { kind := uintRigidTyOfStride reqBytes, layoutIdx := unresolvedLayoutIdx layouts }
+            match
+              resolveAggregateAtByteOffset?
+                8
+                layouts
+                (.aggregate varIdx fields)
+                subTyOpt
+                byteOff
+                reqBytes
+                false
+                defaultLeafTy
+                false
+                localDecls
+            with
+            | .some (innerProj, .zero) =>
+              let fullProj :=
+                match containerProj with
+                | .nil => innerProj
+                | ph :: pt => ph :: appendProjections pt innerProj
+              deinitMovedSubPlace locals localDecls layouts targetLocal targetRootVal fullProj fieldVal
+            | _ => .none
+          | .unit => .none
     | .ub => .none
     | .unsupported => .none
 
@@ -10686,8 +10712,9 @@ def deinitTypedThinPtrDeref
         let pointeeTyOpt :=
           placeTyResolved localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
         let accessedTyOpt := placeTyResolved localDecls layouts p
+        let cleanRestProj := stripTransparentProjections restProj
         let isSyntheticFieldOnScalarPointee : Bool :=
-          match stripTransparentProjections restProj, pointeeTyOpt with
+          match cleanRestProj, pointeeTyOpt with
           | .field _ _ :: _, .some { kind := .bool, .. } => true
           | .field _ _ :: _, .some { kind := .char, .. } => true
           | .field _ _ :: _, .some { kind := .int _, .. } => true
@@ -10719,7 +10746,7 @@ def deinitTypedThinPtrDeref
             fieldVal
         | _, _ =>
           let scalarSliceOpt : Option (Option (List LocalSlot)) :=
-            match restProj, resolvedAccTyOpt with
+            match cleanRestProj, resolvedAccTyOpt with
             | .nil, .some accTy =>
               match tyScalarBytes accTy with
               | .some reqBytes =>
@@ -10754,7 +10781,7 @@ def deinitTypedThinPtrDeref
           | .some res => res
           | .none =>
             let reqBytesOpt : Option Nat :=
-              match restProj, resolvedAccTyOpt with
+              match cleanRestProj, resolvedAccTyOpt with
               | .nil, .some accTy => tyByteSize localDecls layouts accTy
               | _, _ => .none
             match
@@ -10817,7 +10844,7 @@ def deinitTypedThinPtrDeref
                 reqBytesOpt
                 fieldVal
             | .none =>
-              match restProj with
+              match cleanRestProj with
               | .nil =>
                 deinitSubPlaceByteWindow
                   locals
@@ -10912,7 +10939,7 @@ def deinitSliceFatPtrDeref
                   | false => .none
                   | true =>
                     let marker : Value :=
-                      match restProj with
+                      match stripTransparentProjections restProj with
                       | .nil => movedMarkerValue (.subslice 0 lenSc.bits false :: .nil) fieldVal
                       | _ :: _ => movedMarkerValue restProj fieldVal
                     match
