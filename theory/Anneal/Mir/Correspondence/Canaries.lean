@@ -426,6 +426,80 @@ theorem canary_trusted_D9_legacy_keeps_elems :
     evalOperand trustedD9Locals (.move (tpl 1 [.subslice 1 3 false])) =
       .ok (.aggregate 0 [u8Value 11, u8Value 12]) trustedD9Locals := rfl
 
+/-- **`D3` union field move and re-initialization** on the live `evalOperand`
+(`deinitUnionSubPlace`) with its legacy (`deinitProjectedMoves := false`)
+contrast. -/
+theorem canary_trusted_D3_union_field_move_and_reinit :
+    evalOperand [.uninit, .init (.aggregate 0 [.unit, .scalar ⟨770, 2⟩])]
+        (.move (tpl 1 [.field 0 claimU8Ty])) [] [] claimUnionLayouts [] claimUnionDecls [] true =
+      .ok (u8Value 2) d3TrustedUnionAfterMove ∧
+    evalOperand d3TrustedUnionAfterMove (.copy (tpl 1 [.field 0 claimU8Ty])) [] []
+      claimUnionLayouts [] claimUnionDecls [] true = .ub ∧
+    evalOperand d3TrustedUnionAfterMove (.copy (tpl 1 [.field 1 claimU16Ty])) [] []
+      claimUnionLayouts [] claimUnionDecls [] true = .ub ∧
+    evalOperand d3TrustedUnionAfterMove (.copy (tpl 1 [])) [] [] claimUnionLayouts []
+      claimUnionDecls [] true =
+      .ok (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨0, 0⟩, .scalar ⟨3, 1⟩]])
+        d3TrustedUnionAfterMove ∧
+    writePlaceValue d3TrustedUnionAfterMove [] (tpl 1 [.field 0 claimU8Ty]) (u8Value 9)
+      claimUnionDecls claimUnionLayouts = .ok d3TrustedUnionAfterReinit ∧
+    evalOperand d3TrustedUnionAfterReinit (.copy (tpl 1 [.field 1 claimU16Ty])) [] []
+      claimUnionLayouts [] claimUnionDecls [] true = .ok (.scalar ⟨777, 2⟩) d3TrustedUnionAfterReinit ∧
+    evalOperand [.uninit, .init (.aggregate 0 [.unit, .scalar ⟨770, 2⟩])]
+        (.move (tpl 1 [.field 0 claimU8Ty])) [] [] claimUnionLayouts [] claimUnionDecls [] false =
+      .ok (u8Value 2) [.uninit, .init (.aggregate 0 [.unit, .scalar ⟨770, 2⟩])] :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **`D5` typed thin-pointer `Deref` + field move** (`deinitTypedThinPtrDeref`
+at a non-zero array-element byte offset) with its legacy contrast. -/
+theorem canary_trusted_D5_typed_deref_field_of_array_elem_move :
+    let initLocals : List LocalSlot :=
+      [.uninit,
+        .init (.aggregate 0 [.aggregate 0 [u8Value 1, u8Value 2],
+          .aggregate 0 [u8Value 3, u8Value 4]]),
+        .init (.ptr { allocId := 2, offsetBytes := 2 } 8),
+        .init (.ptr { allocId := 3, offsetBytes := 2 } 8)]
+    evalOperand initLocals (.move (tpl 2 [.deref, .field 0 claimU8Ty])) claimDerefBorrows []
+      claimPairArrLayouts [] claimPairArrDecls [] true =
+      .ok (u8Value 3) d5TrustedTypedDerefAfterMove ∧
+    evalOperand d5TrustedTypedDerefAfterMove (.copy (tpl 2 [.deref, .field 1 claimU8Ty]))
+      claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true =
+      .ok (u8Value 4) d5TrustedTypedDerefAfterMove ∧
+    evalOperand d5TrustedTypedDerefAfterMove (.copy (tpl 3 [.deref, .field 1 claimU8Ty]))
+      claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true =
+      .ok (u8Value 4) d5TrustedTypedDerefAfterMove ∧
+    evalOperand d5TrustedTypedDerefAfterMove (.copy (tpl 2 [.deref, .field 0 claimU8Ty]))
+      claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true = .ub ∧
+    evalOperand initLocals (.move (tpl 2 [.deref, .field 0 claimU8Ty])) claimDerefBorrows []
+      claimPairArrLayouts [] claimPairArrDecls [] false = .ok (u8Value 3) initLocals :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **`D9` slice fat-pointer `Deref` element and subslice moves**
+(`deinitSliceFatPtrDeref`) with legacy contrast. -/
+theorem canary_trusted_D9_slice_fat_ptr_elem_and_subslice_move :
+    let initSliceLocals : List LocalSlot :=
+      [.uninit,
+        .init (.aggregate 0 [u8Value 10, u8Value 11, u8Value 12, u8Value 13]),
+        .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8,
+          .scalar { bits := 4, sizeBytes := 8 }])]
+    evalOperand initSliceLocals (.move (tpl 2 [.deref, .constantIndex 1 4 false]))
+      claimDerefBorrows [] emptyLayoutTable [] [] [] true =
+      .ok (u8Value 11) d9TrustedSliceAfterElem ∧
+    evalOperand d9TrustedSliceAfterElem (.copy (tpl 2 [.deref, .constantIndex 1 4 false]))
+      claimDerefBorrows [] emptyLayoutTable [] [] [] true = .ub ∧
+    evalOperand d9TrustedSliceAfterElem (.copy (tpl 2 [.deref, .constantIndex 0 4 false]))
+      claimDerefBorrows [] emptyLayoutTable [] [] [] true =
+      .ok (u8Value 10) d9TrustedSliceAfterElem ∧
+    evalOperand initSliceLocals (.move (tpl 2 [.deref, .subslice 1 3 false]))
+      claimDerefBorrows [] emptyLayoutTable [] [] [] true =
+      .ok (.aggregate 0 [u8Value 11, u8Value 12]) d9TrustedSliceAfterSub ∧
+    evalOperand d9TrustedSliceAfterSub (.copy (tpl 1 [.constantIndex 1 4 false]))
+      claimDerefBorrows [] emptyLayoutTable [] [] [] true = .ub ∧
+    evalOperand initSliceLocals (.move (tpl 2 [.deref, .subslice 1 3 false]))
+      claimDerefBorrows [] emptyLayoutTable [] [] [] false =
+      .ok (.aggregate 0 [u8Value 11, u8Value 12]) initSliceLocals :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 /-- `evalOperands`: `move _1` followed by `copy _1` in one operand list faults. -/
 theorem canary_trusted_evalOperands_move_then_copy_ub :
     evalOperands trustedD1Locals [.move (tpl 1 []), .copy (tpl 1 [])]

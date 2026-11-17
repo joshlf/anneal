@@ -1498,6 +1498,14 @@ theorem seq_get?_set_ne {α : Type} (xs : List α) {i j : Nat} (y : α) (h : j �
   simp only [Trusted.Sequence.get?]
   exact List.getElem?_set_ne (Ne.symm h)
 
+theorem moveValueIsZeroSized_nil_of_ne_unit (layouts : LayoutTable) (tyOpt : Option Ty) (v : Value)
+    (h : v ≠ .unit) : moveValueIsZeroSized [] layouts tyOpt v = false := by
+  cases v with
+  | unit => exact absurd rfl h
+  | scalar _ => rfl
+  | ptr _ _ => rfl
+  | aggregate _ _ => rfl
+
 theorem trusted_evalOperand_root_move_deinits
     (locals locals' : List LocalSlot) (l : Local) (v : Value)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
@@ -1508,10 +1516,28 @@ theorem trusted_evalOperand_root_move_deinits
     evalOperand locals (.move ⟨l, []⟩) borrows globals layouts callerLocals localDecls callStack =
       .ok v locals' ∧
     evalOperand locals (.copy ⟨l, []⟩) borrows globals layouts callerLocals localDecls callStack =
-      .ok v locals := by
-  constructor
-  · simp [evalOperand, hget, hset]
-  · simp [evalOperand, hget, readProjectedValue]
+      .ok v locals ∧
+    (v ≠ .unit → valueContainsMovedUninit v = false →
+      evalOperand locals (.move ⟨l, []⟩) borrows globals layouts callerLocals [] callStack true =
+        .ok v locals' ∧
+      evalOperand locals (.copy ⟨l, []⟩) borrows globals layouts callerLocals [] callStack true =
+        .ok v locals ∧
+      evalOperand locals' (.copy ⟨l, []⟩) borrows globals layouts callerLocals [] callStack true =
+        .ub) := by
+  have hll := seq_lt_of_get? hget
+  have hsl := seq_set?_of_lt hll LocalSlot.uninit
+  have heq : locals' = locals.set l .uninit := by
+    rw [hsl] at hset; exact (Option.some.inj hset).symm
+  have hget' : Trusted.Sequence.get? locals' l = some .uninit := by
+    rw [heq]; exact seq_get?_set_self hll _
+  refine ⟨by simp [evalOperand, hget, hset], by simp [evalOperand, hget, readProjectedValue], ?_⟩
+  intro hunit hmv
+  have hzst := moveValueIsZeroSized_nil_of_ne_unit layouts (placeTyResolved [] layouts ⟨l, []⟩) v hunit
+  refine ⟨?_, ?_, ?_⟩
+  · simp [evalOperand, evalMoveOperandDeinit, evalCopyPlaceRead, hget, readProjectedValue, hmv,
+      hzst, deinitMovedSubPlace, hset]
+  · simp [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hget, readProjectedValue, hmv]
+  · simp [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hget']
 
 theorem trusted_evalOperand_projected_move_eq_copy
     (locals : List LocalSlot) (l : Local) (e : ProjectionElem) (es : List ProjectionElem)
@@ -1544,14 +1570,6 @@ theorem movedMarkerValue_contains_of_not_subslice (proj : List ProjectionElem) (
   · rename_i a b c elems hl
     exact absurd hl (h a b c)
   · exact movedMarker_fallback_contains _
-
-theorem moveValueIsZeroSized_nil_of_ne_unit (layouts : LayoutTable) (tyOpt : Option Ty) (v : Value)
-    (h : v ≠ .unit) : moveValueIsZeroSized [] layouts tyOpt v = false := by
-  cases v with
-  | unit => exact absurd rfl h
-  | scalar _ => rfl
-  | ptr _ _ => rfl
-  | aggregate _ _ => rfl
 
 /-- **Field moves deinitialize the field (all states, no local declarations).** -/
 theorem trusted_evalOperand_field_move_deinit
@@ -1656,15 +1674,80 @@ theorem trusted_evalOperand_elem_move_deinit
     simp only [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hl', readProjectedValue,
       hble', hw', hmw]
 
+/-- **Dynamic `.index` element moves deinitialize the element (all states, no
+local declarations).** -/
+theorem trusted_evalOperand_index_move_deinit
+    (locals : List LocalSlot) (l idxLocal : Local) (elems : List Value) (idx : Nat) (v : Value)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (callStack : List SavedCallerFrame)
+    (hne : l ≠ idxLocal)
+    (hl : Trusted.Sequence.get? locals l = some (.init (.aggregate 0 elems)))
+    (hidxLocal : Trusted.Sequence.get? locals idxLocal =
+      some (.init (.scalar { bits := idx, sizeBytes := 8 })))
+    (hv : Trusted.Sequence.get? elems idx = some v)
+    (hunit : v ≠ .unit) (hmv : valueContainsMovedUninit v = false) :
+    ∃ locals',
+      evalOperand locals (.move ⟨l, [.index idxLocal]⟩) borrows globals layouts
+        callerLocals [] callStack true = .ok v locals' ∧
+      evalOperand locals' (.copy ⟨l, [.index idxLocal]⟩) borrows globals layouts
+        callerLocals [] callStack true = .ub ∧
+      ∀ (j : Nat) (w : Value), j ≠ idx →
+        Trusted.Sequence.get? elems j = some w → valueContainsMovedUninit w = false →
+        evalOperand locals' (.copy ⟨l, [.constantIndex j 0 false]⟩) borrows globals layouts
+          callerLocals [] callStack true = .ok w locals' := by
+  have hidx := seq_lt_of_get? hv
+  have hll := seq_lt_of_get? hl
+  have hmark : valueContainsMovedUninit (movedMarkerValue [.index idxLocal] v) = true :=
+    movedMarkerValue_contains_of_not_subslice _ v (by intro a b c h; cases h)
+  have hl' : Trusted.Sequence.get?
+      (locals.set l (.init (.aggregate 0
+        (elems.set idx (movedMarkerValue [.index idxLocal] v))))) l =
+      some (.init (.aggregate 0
+        (elems.set idx (movedMarkerValue [.index idxLocal] v)))) :=
+    seq_get?_set_self hll _
+  have hidxLocal' : Trusted.Sequence.get?
+      (locals.set l (.init (.aggregate 0
+        (elems.set idx (movedMarkerValue [.index idxLocal] v))))) idxLocal =
+      some (.init (.scalar { bits := idx, sizeBytes := 8 })) := by
+    rw [seq_get?_set_ne _ _ (Ne.symm hne)]; exact hidxLocal
+  have hm' : Trusted.Sequence.get?
+      (elems.set idx (movedMarkerValue [.index idxLocal] v)) idx =
+      some (movedMarkerValue [.index idxLocal] v) :=
+    seq_get?_set_self hidx _
+  have hble0 : Nat.ble 0 (Trusted.Sequence.length
+      (elems.set idx (movedMarkerValue [.index idxLocal] v))) = true := by
+    simp only [Nat.ble_eq]; omega
+  refine ⟨locals.set l (.init (.aggregate 0
+    (elems.set idx (movedMarkerValue [.index idxLocal] v)))), ?_, ?_, ?_⟩
+  · have hzst := moveValueIsZeroSized_nil_of_ne_unit layouts
+      (placeTyResolved [] layouts ⟨l, [.index idxLocal]⟩) v hunit
+    have hse := seq_set?_of_lt hidx (movedMarkerValue [.index idxLocal] v)
+    have hsl := seq_set?_of_lt hll (LocalSlot.init (.aggregate 0
+      (elems.set idx (movedMarkerValue [.index idxLocal] v))))
+    simp only [evalOperand, evalMoveOperandDeinit, evalCopyPlaceRead, hl, readProjectedValue,
+      hidxLocal, hv, hmv, hzst, deinitMovedSubPlace, projHasDeref, writeProjectedValue, hse, hsl]
+  · simp only [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hl', readProjectedValue,
+      hidxLocal', hm', hmark]
+  · intro j w hj hw hmw
+    have hw' : Trusted.Sequence.get?
+        (elems.set idx (movedMarkerValue [.index idxLocal] v)) j = some w := by
+      rw [seq_get?_set_ne _ _ hj]; exact hw
+    simp only [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hl', readProjectedValue,
+      hble0, hw', hmw]
+
 /-- `_1 = [10, 11, 12, 13]` after `move _1[1..3]`. -/
 def d9TrustedAfterSubslice : List LocalSlot :=
   [.uninit, .init (.aggregate 0 [u8Value 10, movedUninitValue, movedUninitValue, u8Value 13])]
 
-/-- **Subslice move canary** on the live `evalOperand`. -/
+/-- **Subslice move canary** on the live `evalOperand` (`fromEnd := false` and
+`fromEnd := true`). -/
 theorem trusted_evalOperand_subslice_move_deinit :
     ∃ locals' : List LocalSlot,
       evalOperand [.uninit, .init (.aggregate 0 [u8Value 10, u8Value 11, u8Value 12, u8Value 13])]
           (.move ⟨1, [.subslice 1 3 false]⟩) [] [] emptyLayoutTable [] [] [] true =
+        .ok (.aggregate 0 [u8Value 11, u8Value 12]) locals' ∧
+      evalOperand [.uninit, .init (.aggregate 0 [u8Value 10, u8Value 11, u8Value 12, u8Value 13])]
+          (.move ⟨1, [.subslice 1 1 true]⟩) [] [] emptyLayoutTable [] [] [] true =
         .ok (.aggregate 0 [u8Value 11, u8Value 12]) locals' ∧
       evalOperand locals' (.copy ⟨1, [.constantIndex 1 4 false]⟩) [] [] emptyLayoutTable [] [] []
         true = .ub ∧
@@ -1675,7 +1758,37 @@ theorem trusted_evalOperand_subslice_move_deinit :
       evalOperand locals' (.copy ⟨1, [.constantIndex 3 4 false]⟩) [] [] emptyLayoutTable [] [] []
         true = .ok (u8Value 13) locals' ∧
       evalOperand locals' (.copy ⟨1, []⟩) [] [] emptyLayoutTable [] [] [] true = .ub :=
-  ⟨d9TrustedAfterSubslice, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨d9TrustedAfterSubslice, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `_1 = U { b: 0x0302 }` after `move _1.a`. -/
+def d3TrustedUnionAfterMove : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨0, 0⟩, .scalar ⟨3, 1⟩]])]
+
+/-- `_1 = U { b: 0x0302 }` after `move _1.a` and `_1.a = 9`. -/
+def d3TrustedUnionAfterReinit : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [u8Value 9, .unit, .aggregate 0 [u8Value 9, u8Value 3]])]
+
+/-- **Union field move and re-initialization** (`deinitUnionSubPlace`) on the
+live `evalOperand`. -/
+theorem trusted_evalOperand_union_move_deinit :
+    ∃ locals' locals'' : List LocalSlot,
+      evalOperand [.uninit, .init (.aggregate 0 [.unit, .scalar ⟨770, 2⟩])]
+          (.move ⟨1, [.field 0 claimU8Ty]⟩) [] [] claimUnionLayouts [] claimUnionDecls [] true =
+        .ok (u8Value 2) locals' ∧
+      evalOperand locals' (.copy ⟨1, [.field 0 claimU8Ty]⟩) [] [] claimUnionLayouts []
+        claimUnionDecls [] true = .ub ∧
+      evalOperand locals' (.copy ⟨1, [.field 1 claimU16Ty]⟩) [] [] claimUnionLayouts []
+        claimUnionDecls [] true = .ub ∧
+      evalOperand locals' (.copy ⟨1, []⟩) [] [] claimUnionLayouts [] claimUnionDecls [] true =
+        .ok (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨0, 0⟩, .scalar ⟨3, 1⟩]]) locals' ∧
+      writePlaceValue locals' [] ⟨1, [.field 0 claimU8Ty]⟩ (u8Value 9) claimUnionDecls
+        claimUnionLayouts = .ok locals'' ∧
+      evalOperand locals'' (.copy ⟨1, [.field 1 claimU16Ty]⟩) [] [] claimUnionLayouts []
+        claimUnionDecls [] true = .ok (.scalar ⟨777, 2⟩) locals'' ∧
+      evalOperand [.uninit, .init (.aggregate 0 [.unit, .scalar ⟨770, 2⟩])]
+          (.move ⟨1, [.field 0 claimU8Ty]⟩) [] [] claimUnionLayouts [] claimUnionDecls [] false =
+        .ok (u8Value 2) [.uninit, .init (.aggregate 0 [.unit, .scalar ⟨770, 2⟩])] :=
+  ⟨d3TrustedUnionAfterMove, d3TrustedUnionAfterReinit, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- `_1 : u8 = 5; _2 = &raw mut _1` (tag `2`, active); `_3 = &_1` (tag `3`, frozen). -/
 def d5TrustedLocals : List LocalSlot :=
@@ -1683,9 +1796,7 @@ def d5TrustedLocals : List LocalSlot :=
     .init (.ptr { allocId := 3, offsetBytes := 0 } 8)]
 
 /-- Borrow table of `d5TrustedLocals`. -/
-def d5TrustedBorrows : List BorrowEntry :=
-  [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .active },
-    { tag := 3, targetLocal := 1, targetProjection := [], perm := .frozen }]
+def d5TrustedBorrows : List BorrowEntry := claimDerefBorrows
 
 /-- After `move (*_2)`: `_1` is deinitialized; nothing else changes. -/
 def d5TrustedAfterMove : List LocalSlot :=
@@ -1698,21 +1809,98 @@ theorem trusted_evalOperand_deref_move_deinit :
       evalOperand
           [.uninit, .init (u8Value 5), .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
             .init (.ptr { allocId := 3, offsetBytes := 0 } 8)]
-          (.move ⟨2, [.deref]⟩)
-          [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .active },
-            { tag := 3, targetLocal := 1, targetProjection := [], perm := .frozen }]
-          [] emptyLayoutTable [] [] [] true = .ok (u8Value 5) locals' ∧
+          (.move ⟨2, [.deref]⟩) claimDerefBorrows [] emptyLayoutTable [] [] [] true =
+        .ok (u8Value 5) locals' ∧
       Trusted.Sequence.get? locals' 1 = some .uninit ∧
-      evalOperand locals' (.copy ⟨2, [.deref]⟩)
-          [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .active },
-            { tag := 3, targetLocal := 1, targetProjection := [], perm := .frozen }]
-          [] emptyLayoutTable [] [] [] true = .ub ∧
-      evalOperand locals' (.copy ⟨3, [.deref]⟩)
-          [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .active },
-            { tag := 3, targetLocal := 1, targetProjection := [], perm := .frozen }]
-          [] emptyLayoutTable [] [] [] true = .ub ∧
+      evalOperand locals' (.copy ⟨2, [.deref]⟩) claimDerefBorrows [] emptyLayoutTable [] [] []
+        true = .ub ∧
+      evalOperand locals' (.copy ⟨3, [.deref]⟩) claimDerefBorrows [] emptyLayoutTable [] [] []
+        true = .ub ∧
       evalOperand locals' (.copy ⟨1, []⟩) [] [] emptyLayoutTable [] [] [] true = .ub :=
   ⟨d5TrustedAfterMove, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `_1 = [(1, 2), (3, 4)]` after `move (*_2).0` (`_2 = &raw mut _1[1]` at byte offset `2`). -/
+def d5TrustedTypedDerefAfterMove : List LocalSlot :=
+  [.uninit,
+    .init (.aggregate 0 [.aggregate 0 [u8Value 1, u8Value 2],
+      .aggregate 0 [movedUninitValue, u8Value 4]]),
+    .init (.ptr { allocId := 2, offsetBytes := 2 } 8),
+    .init (.ptr { allocId := 3, offsetBytes := 2 } 8)]
+
+/-- **Typed thin-pointer `Deref` + field move** (`deinitTypedThinPtrDeref`) on
+the live `evalOperand`. -/
+theorem trusted_evalOperand_typed_deref_move_deinit :
+    ∃ locals' : List LocalSlot,
+      evalOperand
+          [.uninit,
+            .init (.aggregate 0 [.aggregate 0 [u8Value 1, u8Value 2],
+              .aggregate 0 [u8Value 3, u8Value 4]]),
+            .init (.ptr { allocId := 2, offsetBytes := 2 } 8),
+            .init (.ptr { allocId := 3, offsetBytes := 2 } 8)]
+          (.move ⟨2, [.deref, .field 0 claimU8Ty]⟩) claimDerefBorrows [] claimPairArrLayouts []
+          claimPairArrDecls [] true = .ok (u8Value 3) locals' ∧
+      evalOperand locals' (.copy ⟨2, [.deref, .field 1 claimU8Ty]⟩) claimDerefBorrows []
+        claimPairArrLayouts [] claimPairArrDecls [] true = .ok (u8Value 4) locals' ∧
+      evalOperand locals' (.copy ⟨3, [.deref, .field 1 claimU8Ty]⟩) claimDerefBorrows []
+        claimPairArrLayouts [] claimPairArrDecls [] true = .ok (u8Value 4) locals' ∧
+      evalOperand locals' (.copy ⟨1, [.constantIndex 0 2 false]⟩) claimDerefBorrows []
+        claimPairArrLayouts [] claimPairArrDecls [] true =
+          .ok (.aggregate 0 [u8Value 1, u8Value 2]) locals' ∧
+      evalOperand locals' (.copy ⟨2, [.deref, .field 0 claimU8Ty]⟩) claimDerefBorrows []
+        claimPairArrLayouts [] claimPairArrDecls [] true = .ub ∧
+      evalOperand locals' (.copy ⟨3, [.deref]⟩) claimDerefBorrows [] claimPairArrLayouts []
+        claimPairArrDecls [] true = .ub ∧
+      evalOperand locals' (.copy ⟨1, [.constantIndex 1 2 false]⟩) claimDerefBorrows []
+        claimPairArrLayouts [] claimPairArrDecls [] true = .ub ∧
+      evalOperand locals' (.copy ⟨1, []⟩) claimDerefBorrows [] claimPairArrLayouts []
+        claimPairArrDecls [] true = .ub :=
+  ⟨d5TrustedTypedDerefAfterMove, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `_1 = [10, 11, 12, 13]` and `_2 : *mut [u8]` after `move (*_2)[1]`. -/
+def d9TrustedSliceAfterElem : List LocalSlot :=
+  [.uninit,
+    .init (.aggregate 0 [u8Value 10, movedUninitValue, u8Value 12, u8Value 13]),
+    .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8,
+      .scalar { bits := 4, sizeBytes := 8 }])]
+
+/-- `_1 = [10, 11, 12, 13]` and `_2 : *mut [u8]` after `move (*_2)[1..3]`. -/
+def d9TrustedSliceAfterSub : List LocalSlot :=
+  [.uninit,
+    .init (.aggregate 0 [u8Value 10, movedUninitValue, movedUninitValue, u8Value 13]),
+    .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8,
+      .scalar { bits := 4, sizeBytes := 8 }])]
+
+/-- **Slice fat-pointer `Deref` element and subslice moves**
+(`deinitSliceFatPtrDeref`) on the live `evalOperand`. -/
+theorem trusted_evalOperand_slice_deref_move_deinit :
+    ∃ localsElem localsSub : List LocalSlot,
+      let initSliceLocals : List LocalSlot :=
+        [.uninit,
+          .init (.aggregate 0 [u8Value 10, u8Value 11, u8Value 12, u8Value 13]),
+          .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8,
+            .scalar { bits := 4, sizeBytes := 8 }])]
+      evalOperand initSliceLocals (.move ⟨2, [.deref, .constantIndex 1 4 false]⟩) claimDerefBorrows
+        [] emptyLayoutTable [] [] [] true = .ok (u8Value 11) localsElem ∧
+      evalOperand localsElem (.copy ⟨2, [.deref, .constantIndex 0 4 false]⟩) claimDerefBorrows
+        [] emptyLayoutTable [] [] [] true = .ok (u8Value 10) localsElem ∧
+      evalOperand localsElem (.copy ⟨2, [.deref, .constantIndex 2 4 false]⟩) claimDerefBorrows
+        [] emptyLayoutTable [] [] [] true = .ok (u8Value 12) localsElem ∧
+      evalOperand localsElem (.copy ⟨2, [.deref, .constantIndex 3 4 false]⟩) claimDerefBorrows
+        [] emptyLayoutTable [] [] [] true = .ok (u8Value 13) localsElem ∧
+      evalOperand localsElem (.copy ⟨2, [.deref, .constantIndex 1 4 false]⟩) claimDerefBorrows
+        [] emptyLayoutTable [] [] [] true = .ub ∧
+      evalOperand initSliceLocals (.move ⟨2, [.deref, .subslice 1 3 false]⟩) claimDerefBorrows
+        [] emptyLayoutTable [] [] [] true =
+          .ok (.aggregate 0 [u8Value 11, u8Value 12]) localsSub ∧
+      evalOperand localsSub (.copy ⟨1, [.constantIndex 0 4 false]⟩) claimDerefBorrows
+        [] emptyLayoutTable [] [] [] true = .ok (u8Value 10) localsSub ∧
+      evalOperand localsSub (.copy ⟨1, [.constantIndex 1 4 false]⟩) claimDerefBorrows
+        [] emptyLayoutTable [] [] [] true = .ub ∧
+      evalOperand localsSub (.copy ⟨1, [.constantIndex 2 4 false]⟩) claimDerefBorrows
+        [] emptyLayoutTable [] [] [] true = .ub ∧
+      evalOperand localsSub (.copy ⟨1, [.constantIndex 3 4 false]⟩) claimDerefBorrows
+        [] emptyLayoutTable [] [] [] true = .ok (u8Value 13) localsSub :=
+  ⟨d9TrustedSliceAfterElem, d9TrustedSliceAfterSub, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Any read in `deinitProjectedMoves` mode faults on a value containing a
 moved-out leaf. -/
@@ -1749,8 +1937,12 @@ theorem trustedProjectedMoveDeinitClaim_proof : TrustedProjectedMoveDeinitClaim 
    trusted_evalOperand_projected_move_eq_copy,
    trusted_evalOperand_field_move_deinit,
    trusted_evalOperand_elem_move_deinit,
+   trusted_evalOperand_index_move_deinit,
    trusted_evalOperand_subslice_move_deinit,
+   trusted_evalOperand_union_move_deinit,
    trusted_evalOperand_deref_move_deinit,
+   trusted_evalOperand_typed_deref_move_deinit,
+   trusted_evalOperand_slice_deref_move_deinit,
    trusted_evalOperand_movedUninit_read_ub⟩
 
 /-! ## Part 10c — Fail-closed pointer constants, destination-first

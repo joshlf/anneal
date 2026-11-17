@@ -268,9 +268,16 @@ def make_elf64(
     rpath_tag: int = 29,
     machine: int = 247,
     strtab_outside_load: bool = False,
+    strtab_in_nobits: bool = False,
     unterminated: bool = False,
     strsz_overrun: bool = False,
     omit_strtab: bool = False,
+    phentsize: int = 56,
+    phnum_override: Optional[int] = None,
+    load_filesz_gt_memsz: bool = False,
+    overlapping_loads: bool = False,
+    omit_dt_null: bool = False,
+    dyn_outside_load: bool = False,
 ) -> bytes:
     """Minimal ELF64 little-endian ET_DYN image: one PT_LOAD covering the whole
     file plus a PT_DYNAMIC segment with DT_NEEDED*, DT_RUNPATH (29) / DT_RPATH
@@ -291,28 +298,48 @@ def make_elf64(
         strtab += ":".join(runpath).encode() + b"\0"
     if unterminated:
         del strtab[-1]
-    dyn_off = 64 + 2 * 56
-    dyn_slots = len(dyn) + 3  # + DT_STRTAB, DT_STRSZ, DT_NULL
+    n_phdrs = 3 if overlapping_loads else 2
+    dyn_off = 64 + n_phdrs * phentsize
+    dyn_slots = len(dyn) + (2 if omit_dt_null else 3)  # + DT_STRTAB, DT_STRSZ, [DT_NULL]
     str_off = dyn_off + 16 * dyn_slots
     total = str_off + len(strtab)
     if not omit_strtab:
         dyn.append((5, str_off + (0x100000 if strtab_outside_load else 0)))
         dyn.append((10, len(strtab) + (64 if strsz_overrun else 0)))
-    dyn.append((0, 0))
+    if not omit_dt_null:
+        dyn.append((0, 0))
     body = b"".join(struct.pack("<qQ", tag, val) for tag, val in dyn).ljust(16 * dyn_slots, b"\0")
-    ehdr = struct.pack("<4sBBBBB7sHHIQQQIHHHHHH", b"\x7fELF", 2, 1, 1, 0, 0, bytes(7), 3, machine, 1, 0, 64, 0, 0, 64, 56, 2, 64, 0, 0)
-    ph_load = struct.pack("<IIQQQQQQ", 1, 4, 0, 0, 0, total, total, 0x1000)
-    ph_dyn = struct.pack("<IIQQQQQQ", 2, 6, dyn_off, dyn_off, dyn_off, 16 * dyn_slots, 16 * dyn_slots, 8)
-    return ehdr + ph_load + ph_dyn + body + bytes(strtab)
+    ehdr = struct.pack(
+        "<4sBBBBB7sHHIQQQIHHHHHH",
+        b"\x7fELF", 2, 1, 1, 0, 0, bytes(7), 3, machine, 1, 0, 64, 0, 0, 64,
+        phentsize, phnum_override if phnum_override is not None else n_phdrs, 64, 0, 0,
+    )
+    load_filesz = str_off if strtab_in_nobits else total
+    load_memsz = (load_filesz - 8) if load_filesz_gt_memsz else (total + (64 if strtab_in_nobits else 0))
+    ph_load = struct.pack("<IIQQQQQQ", 1, 4, 0, 0, 0, load_filesz, load_memsz, 0x1000).ljust(phentsize, b"\0")
+    dyn_vaddr = dyn_off + (0x200000 if dyn_outside_load else 0)
+    ph_dyn = struct.pack("<IIQQQQQQ", 2, 6, dyn_off, dyn_vaddr, dyn_vaddr, 16 * dyn_slots, 16 * dyn_slots, 8).ljust(phentsize, b"\0")
+    phdrs_bytes = ph_load + ph_dyn
+    if overlapping_loads:
+        ph_overlap = struct.pack("<IIQQQQQQ", 1, 4, 0, 0x100, 0x100, 64, 64, 0x1000).ljust(phentsize, b"\0")
+        phdrs_bytes += ph_overlap
+    return ehdr + phdrs_bytes + body + bytes(strtab)
 
 
 def malformed_elf_cases() -> List[Tuple[str, bytes, str]]:
     good = make_elf64(["libfoo.so"], ["$ORIGIN"])
     return [
         ("DT_STRTAB outside every PT_LOAD", make_elf64(["libfoo.so"], ["$ORIGIN"], strtab_outside_load=True), "not inside a PT_LOAD"),
+        ("DT_STRTAB in PT_LOAD NOBITS/BSS tail", make_elf64(["libfoo.so"], ["$ORIGIN"], strtab_in_nobits=True), "NOBITS/BSS tail"),
         ("unterminated dynamic string", make_elf64(["libfoo.so"], ["$ORIGIN"], unterminated=True), "unterminated"),
         ("DT_STRSZ overruns PT_LOAD", make_elf64(["libfoo.so"], ["$ORIGIN"], strsz_overrun=True), "overruns"),
         ("DT_NEEDED without DT_STRTAB", make_elf64(["libfoo.so"], ["$ORIGIN"], omit_strtab=True), "without DT_STRTAB"),
+        ("e_phentsize != 56", make_elf64(["libfoo.so"], ["$ORIGIN"], phentsize=64), "malformed ELF program header table"),
+        ("e_phnum == PN_XNUM (0xffff)", make_elf64(["libfoo.so"], ["$ORIGIN"], phnum_override=0xFFFF), "PN_XNUM"),
+        ("PT_LOAD p_filesz > p_memsz", make_elf64(["libfoo.so"], ["$ORIGIN"], load_filesz_gt_memsz=True), "p_filesz > p_memsz"),
+        ("overlapping PT_LOAD segments", make_elf64(["libfoo.so"], ["$ORIGIN"], overlapping_loads=True), "overlapping PT_LOAD"),
+        ("PT_DYNAMIC without DT_NULL", make_elf64(["libfoo.so"], ["$ORIGIN"], omit_dt_null=True), "missing DT_NULL"),
+        ("PT_DYNAMIC outside PT_LOAD", make_elf64(["libfoo.so"], ["$ORIGIN"], dyn_outside_load=True), "PT_DYNAMIC segment is not inside a PT_LOAD"),
         ("ELFCLASS32", good[:4] + b"\x01" + good[5:], "unsupported ELF object"),
         ("big-endian", good[:5] + b"\x02" + good[6:], "unsupported ELF object"),
         ("truncated ELF header", good[:40], "unsupported ELF object"),
@@ -1187,11 +1214,12 @@ class ToolchainTests(TempCase):
         self.assertEqual(self.lib("libleanshared.so").read_bytes(), main_before)
 
     def test_extra_libleanshared_evil_injection_rejected(self) -> None:
-        for name in ("libleanshared_evil.so", "libleanshared_3.so"):
+        for name in ("libleanshared_evil.so", "libleanshared_3.so", "libleanshared.so.evil"):
             with self.subTest(name):
                 self.lib(name).write_bytes(b"evil")
                 os.chmod(self.lib(name), 0o644)
                 self.assertRejected(self.verify, f"unpinned toolchain file added: lib/lean/{name}")
+                self.assertRejected(lambda: self.verify(toolchain_pin_json=None), f"unpinned non-Lean shared library in lib/lean/: lib/lean/{name}")
                 self.lib(name).unlink()
 
     def test_deleted_libleanshared_2_rejected(self) -> None:
@@ -1433,6 +1461,10 @@ class ToolchainTests(TempCase):
         cases = (
             (["libleanshared.so"], [str(outside)], f"bin/lean: DT_RUNPATH entry {str(outside)!r} resolves outside the toolchain root"),
             (["libleanshared.so"], ["$ORIGIN/../.."], "bin/lean: DT_RUNPATH entry '$ORIGIN/../..' resolves outside the toolchain root"),
+            (["libleanshared.so"], ["$ORIGIN/.."], "bin/lean: DT_RUNPATH entry '$ORIGIN/..' resolves outside the toolchain root"),
+            (["libleanshared.so"], ["$ORIGIN/../lib/.."], "bin/lean: DT_RUNPATH entry '$ORIGIN/../lib/..' resolves outside the toolchain root"),
+            (["libleanshared.so"], [f"$ORIGIN/../../{self.tc.name}/lib"], f"bin/lean: DT_RUNPATH entry '$ORIGIN/../../{self.tc.name}/lib' resolves outside the toolchain root"),
+            (["libleanshared.so"], ["${ORIGIN}/../lib:"], "bin/lean: empty DT_RUNPATH/DT_RPATH component"),
             (["libleanshared.so"], ["$LIB/x"], "bin/lean: unsupported DT_RUNPATH entry '$LIB/x'"),
             (["libleanshared.so"], ["lib/lean"], "bin/lean: unsupported DT_RUNPATH entry 'lib/lean'"),
             (["/tmp/evil.so"], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '/tmp/evil.so' is a path"),
@@ -1764,11 +1796,21 @@ class CheckTrustedIntegrationTests(TempCase):
             (lib / "libleanshared_1.so").write_bytes(original + b"\x90")
             self.assertRejectedBeforeExecution(self.checker(root, lean), 2, "toolchain", "SHA-256 mismatch for lib/lean/libleanshared_1.so", "nothing was executed")
             (lib / "libleanshared_1.so").write_bytes(original)
-        for name in ("libleanshared_evil.so", "libleanshared_3.so"):
+        for name in ("libleanshared_evil.so", "libleanshared_3.so", "libleanshared.so.evil"):
             with self.subTest(f"added {name}"):
                 shutil.copy2(lib / "libleanshared_1.so", lib / name)
                 self.assertRejectedBeforeExecution(self.checker(root, lean), 2, "toolchain", f"unpinned toolchain file added: lib/lean/{name}")
                 (lib / name).unlink()
+        with self.subTest("hard-linked companion library"):
+            hard_lib = self.tmp / "hard-libleanshared_1.so"
+            os.link(lib / "libleanshared_1.so", hard_lib)
+            self.assertRejectedBeforeExecution(self.checker(root, lean), 2, "toolchain", "lib/lean/libleanshared_1.so is hard-linked (st_nlink=2")
+            hard_lib.unlink()
+        with self.subTest("hard-linked bin/lean"):
+            hard_lean = self.tmp / "hard-lean"
+            os.link(lean, hard_lean)
+            self.assertRejectedBeforeExecution(self.checker(root, lean), 2, "toolchain", "it is hard-linked (st_nlink=2)")
+            hard_lean.unlink()
         with self.subTest("deleted libleanshared_2.so"):
             saved = self.tmp / "libleanshared_2.so"
             shutil.move(str(lib / "libleanshared_2.so"), str(saved))
@@ -1862,6 +1904,10 @@ class CheckTrustedIntegrationTests(TempCase):
         cases = (
             (["libleanshared.so"], [str(outside)], f"bin/lean: DT_RUNPATH entry {str(outside)!r} resolves outside the toolchain root"),
             (["libleanshared.so"], ["$ORIGIN/../.."], "bin/lean: DT_RUNPATH entry '$ORIGIN/../..' resolves outside the toolchain root"),
+            (["libleanshared.so"], ["$ORIGIN/.."], "bin/lean: DT_RUNPATH entry '$ORIGIN/..' resolves outside the toolchain root"),
+            (["libleanshared.so"], ["$ORIGIN/../lib/.."], "bin/lean: DT_RUNPATH entry '$ORIGIN/../lib/..' resolves outside the toolchain root"),
+            (["libleanshared.so"], [f"$ORIGIN/../../{prefix.name}/lib"], f"bin/lean: DT_RUNPATH entry '$ORIGIN/../../{prefix.name}/lib' resolves outside the toolchain root"),
+            (["libleanshared.so"], ["${ORIGIN}/../lib:"], "bin/lean: empty DT_RUNPATH/DT_RPATH component"),
             (["libleanshared.so"], ["$LIB/x"], "bin/lean: unsupported DT_RUNPATH entry '$LIB/x'"),
             (["libleanshared.so"], ["lib/lean"], "bin/lean: unsupported DT_RUNPATH entry 'lib/lean'"),
             (["libleanshared.so"], ["$ORIGIN/../lib/lean", ""], "bin/lean: empty DT_RUNPATH/DT_RPATH component"),
@@ -2018,6 +2064,11 @@ class CheckTrustedIntegrationTests(TempCase):
             (ws.vendor / ".lake" / "build" / "Miri.olean").write_bytes(b"\x00")
             self.assertRejectedBeforeExecution(self.checker(root, never), 1, "lean-miri-pin", "planted build artifact directory: .lake/")
             shutil.rmtree(ws.vendor / ".lake")
+        with self.subTest("hard-linked vendor file"):
+            hard_vendor = self.tmp / "hard-Size.lean"
+            os.link(ws.path(TAMPER_TARGET), hard_vendor)
+            self.assertRejectedBeforeExecution(self.checker(root, never), 1, "lean-miri-pin", f"hard-linked file (st_nlink=2, writable through another path): {TAMPER_TARGET}")
+            hard_vendor.unlink()
         self.assertEqual(CT.verify_lean_miri_pin(root)["patchedFiles"], 10)
 
     def test_lean_miri_pin_policy_violations_rejected(self) -> None:

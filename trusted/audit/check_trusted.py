@@ -27,7 +27,7 @@ sys.dont_write_bytecode = True  # Public self-test imports must not write checko
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 PARTS = ("olean", "olean.server", "olean.private", "ir.sig", "ir")
 MAX_BYTES = 512 * 1024 * 1024
-CHILD_TIMEOUT_SECS = 180
+CHILD_TIMEOUT_SECS = 600
 
 # Each entry is (module_name, relative_path, direct_imports, role)
 # where role is "theory", "examples", "claim", or "test".
@@ -416,13 +416,18 @@ class Checker:
         return stdout.read_text(encoding="utf-8", errors="strict")
 
     def _get_compiled_inspector(self) -> Path | None:
-        if not self.fast or self.cache_dir is None or self.expected_lean_sha is None:
+        if self.expected_lean_sha is None:
             return None
         if self._compiled_inspector is not None and self._compiled_inspector.is_file():
             return self._compiled_inspector
         leanc = self.lean.parent / "leanc"
         if not leanc.is_file():
             return None
+        base_cache = (
+            self.cache_dir
+            if self.cache_dir is not None
+            else Path(tempfile.gettempdir()) / f"anneal-trusted-cache-{os.getuid()}"
+        )
         bin_key = fingerprint({
             "schema": 1,
             "toolchain": TOOLCHAIN,
@@ -430,7 +435,7 @@ class Checker:
             "leancSha256": digest(leanc),
             "inspectorSha256": getattr(self, "inspector_hash", None),
         })
-        bin_dir = self.cache_dir / "inspector-bin"
+        bin_dir = base_cache / "inspector-bin"
         bin_path = bin_dir / f"TrustedBoundary-{bin_key}"
         if bin_path.is_file() and os.access(bin_path, os.X_OK):
             self._compiled_inspector = bin_path
@@ -948,9 +953,9 @@ class Checker:
                     f"project imports of {module} ({actual_proj}) differ from DOWNSTREAM_TARGETS ({expected_proj})",
                 )
         downstream_flags = (
-            ["-j4", "-M2048", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
+            ["-j4", "-M4096", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
             if self.fast
-            else ["-j1", "-M2048", "-t0", "-DElab.async=false", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
+            else ["-j1", "-M4096", "-t0", "-DElab.async=false", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
         )
         for module, path, _, _ in targets:
             if not self.fast:
@@ -5253,13 +5258,13 @@ LOCKED_LEAN_RELEASE = {
 #: also runs in `--fast` mode). `clang`, `ld.lld`, `llvm-ar` and `cadical` are
 #: digest-pinned only; their closure is the release's own (unpinned) top-level `lib/`.
 LEAN_RELEASE_RUNPATH_BINARIES = ("bin/lean", "bin/lake", "bin/leanc", "bin/leanchecker", "bin/leanir")
-_SHARED_OBJECT_NAME = re.compile(r"\.so(\.[0-9]+)*\Z")
-_LEAN_RUNTIME_SONAME = re.compile(r"\A(libleanshared|libInit_shared|libLake_shared).*\.so(\.[0-9]+)*\Z")
+_SHARED_OBJECT_NAME = re.compile(r"\.so(?:\.[A-Za-z0-9_.+\-]+)?\Z")
+_LEAN_RUNTIME_SONAME = re.compile(r"\A(libleanshared|libInit_shared|libLake_shared).*\.so(?:\.[A-Za-z0-9_.+\-]+)?\Z")
 #: glibc / loader sonames the Lean runtime lists in `DT_NEEDED`: ld.so searches the
 #: toolchain `DT_RUNPATH` before the system directories, so a copy planted in `lib/`
 #: or `lib/lean/` would be loaded into every Lean process.
 _GLIBC_SONAME = re.compile(
-    r"\A(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|ld-linux[\w.\-]*\.so(\.[0-9]+)*)\Z"
+    r"\A(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|ld-linux[\w.\-]*\.so(?:\.[A-Za-z0-9_.+\-]+)?)(?:\.[A-Za-z0-9_.+\-]+)?\Z"
 )
 #: glibc `is_dst`: `$ORIGIN` / `${ORIGIN}` is a dynamic string token only when not
 #: followed by an identifier character (`$ORIGINX/lib` stays a CWD-relative literal).
@@ -5447,7 +5452,7 @@ def _canonical_relpath_problem(name: object) -> str | None:
 
 def _symlink_free_problem(base: Path, rel: str, *, want_dir: bool = False) -> str | None:
     """Why `base/rel` is not a regular file (`want_dir`: a real directory) reached from
-    `base` without any symlink component (None when it is)."""
+    `base` without any symlink, world-writable mode or hardlink (None when it is)."""
     parts = rel.split("/")
     for index in range(1, len(parts) + 1):
         sub = "/".join(parts[:index])
@@ -5460,8 +5465,16 @@ def _symlink_free_problem(base: Path, rel: str, *, want_dir: bool = False) -> st
         if index < len(parts) or want_dir:
             if not stat.S_ISDIR(st.st_mode):
                 return f"is not a directory ({sub})"
+            if st.st_mode & stat.S_IWOTH:
+                return f"is reached through a world-writable directory ({sub})"
         elif not stat.S_ISREG(st.st_mode):
             return "is not a regular file"
+        else:
+            unsafe = _unsafe_mode(st)
+            if unsafe is not None:
+                return f"is {unsafe}"
+            if st.st_nlink != 1:
+                return f"is hard-linked (st_nlink={st.st_nlink}, writable through another path)"
     return None
 
 
@@ -5487,14 +5500,19 @@ def elf_dynamic_info(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]] | No
     components are kept: glibc's `fillin_rpath` searches the current directory for them."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     with os.fdopen(os.open(path, flags), "rb") as fh:
-        size = os.fstat(fh.fileno()).st_size
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("ELF path is not a regular file")
+        size = st.st_size
         ehdr = fh.read(64)
         if ehdr[:4] != b"\x7fELF":
             return None
         if len(ehdr) < 64 or ehdr[4] != 2 or ehdr[5] != 1:
             raise ValueError("unsupported ELF object (only complete ELF64 little-endian headers are parsed)")
         phoff, phentsize, phnum = _le(ehdr, 0x20, 8), _le(ehdr, 0x36, 2), _le(ehdr, 0x38, 2)
-        if phentsize < 56 or phnum > 4096:
+        if phnum == 0xFFFF:
+            raise ValueError("unsupported ELF extended program header numbering (PN_XNUM)")
+        if phentsize != 56 or phnum == 0 or phnum > 4096:
             raise ValueError("malformed ELF program header table")
         if phoff + phentsize * phnum > size:
             raise ValueError("truncated ELF program header table")
@@ -5502,27 +5520,38 @@ def elf_dynamic_info(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]] | No
         phdrs = fh.read(phentsize * phnum)
         if len(phdrs) < phentsize * phnum:
             raise ValueError("truncated ELF program header table")
-        loads: list[tuple[int, int, int]] = []
-        dynamic: tuple[int, int] | None = None
+        loads: list[tuple[int, int, int, int]] = []
+        dynamic: tuple[int, int, int, int] | None = None
         interp: tuple[int, int] | None = None
         for index in range(phnum):
             base = index * phentsize
             p_type = _le(phdrs, base, 4)
-            p_offset, p_vaddr, p_filesz = _le(phdrs, base + 8, 8), _le(phdrs, base + 16, 8), _le(phdrs, base + 32, 8)
+            p_offset, p_vaddr = _le(phdrs, base + 8, 8), _le(phdrs, base + 16, 8)
+            p_filesz, p_memsz = _le(phdrs, base + 32, 8), _le(phdrs, base + 40, 8)
             if p_type == 1:  # PT_LOAD
                 if p_offset + p_filesz > size:
                     raise ValueError("PT_LOAD segment overruns EOF")
-                loads.append((p_vaddr, p_offset, p_filesz))
+                if p_filesz > p_memsz:
+                    raise ValueError("PT_LOAD segment has p_filesz > p_memsz")
+                loads.append((p_vaddr, p_offset, p_filesz, p_memsz))
             elif p_type == 2:  # PT_DYNAMIC
                 if dynamic is not None:
                     raise ValueError("more than one PT_DYNAMIC segment")
-                dynamic = (p_offset, p_filesz)
+                if p_offset + p_filesz > size or p_filesz > p_memsz:
+                    raise ValueError("truncated PT_DYNAMIC segment")
+                dynamic = (p_vaddr, p_offset, p_filesz, p_memsz)
             elif p_type == 3:  # PT_INTERP
                 if interp is not None:
                     raise ValueError("more than one PT_INTERP segment")
                 if p_filesz == 0 or p_filesz > 4096 or p_offset + p_filesz > size:
                     raise ValueError("malformed or truncated PT_INTERP segment")
                 interp = (p_offset, p_filesz)
+        sorted_loads = sorted(loads, key=lambda seg: seg[0])
+        for index in range(len(sorted_loads) - 1):
+            v1, _o1, _f1, m1 = sorted_loads[index]
+            v2, _o2, _f2, _m2 = sorted_loads[index + 1]
+            if m1 > 0 and v1 + m1 > v2:
+                raise ValueError("overlapping PT_LOAD segments")
         if interp is not None:
             fh.seek(interp[0])
             raw = fh.read(interp[1])
@@ -5535,32 +5564,54 @@ def elf_dynamic_info(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]] | No
                 raise ValueError("PT_INTERP present without PT_DYNAMIC")
         if dynamic is None:
             return (), ()
-        if dynamic[1] > (1 << 20):
+        dyn_vaddr, dyn_off, dyn_filesz, _dyn_memsz = dynamic
+        if dyn_filesz > (1 << 20):
             raise ValueError("oversized PT_DYNAMIC segment")
-        fh.seek(dynamic[0])
-        raw = fh.read(dynamic[1])
-        if len(raw) < dynamic[1]:
+        if dyn_filesz < 16:
+            raise ValueError("unterminated PT_DYNAMIC segment (missing DT_NULL)")
+        dyn_backed = False
+        for vaddr, offset, filesz, memsz in loads:
+            if vaddr <= dyn_vaddr < vaddr + memsz:
+                if dyn_vaddr + dyn_filesz > vaddr + filesz:
+                    raise ValueError("PT_DYNAMIC segment overruns PT_LOAD file-backed bytes (NOBITS/BSS tail)")
+                if dyn_off != (dyn_vaddr - vaddr) + offset:
+                    raise ValueError("PT_DYNAMIC p_offset disagrees with its enclosing PT_LOAD mapping")
+                dyn_backed = True
+                break
+        if not dyn_backed:
+            raise ValueError("PT_DYNAMIC segment is not inside a PT_LOAD segment")
+        fh.seek(dyn_off)
+        raw = fh.read(dyn_filesz)
+        if len(raw) < dyn_filesz:
             raise ValueError("truncated PT_DYNAMIC segment")
         entries: list[tuple[int, int]] = []
         strtab = strsz = None
+        saw_dt_null = False
         for offset in range(0, len(raw) - 15, 16):
             tag, value = _le(raw, offset, 8, signed=True), _le(raw, offset + 8, 8)
             if tag == 0:  # DT_NULL
+                saw_dt_null = True
                 break
             entries.append((tag, value))
             if tag == 5:  # DT_STRTAB (virtual address)
+                if strtab is not None and strtab != value:
+                    raise ValueError("conflicting duplicate DT_STRTAB entries")
                 strtab = value
             elif tag == 10:  # DT_STRSZ
+                if strsz is not None and strsz != value:
+                    raise ValueError("conflicting duplicate DT_STRSZ entries")
                 strsz = value
+        if not saw_dt_null:
+            raise ValueError("unterminated PT_DYNAMIC segment (missing DT_NULL)")
         if strtab is None or strsz is None:
             if any(tag in (1, 15, 29) for tag, _ in entries):
                 raise ValueError("DT_NEEDED/DT_RUNPATH present without DT_STRTAB/DT_STRSZ")
             return (), ()
         table = None
-        for vaddr, offset, filesz in loads:
-            if vaddr <= strtab < vaddr + filesz:
-                if strtab + strsz > vaddr + filesz:
-                    raise ValueError("DT_STRTAB/DT_STRSZ overruns its PT_LOAD segment")
+        for vaddr, offset, filesz, memsz in loads:
+            if vaddr <= strtab < vaddr + memsz:
+                if strtab >= vaddr + filesz or strtab + strsz > vaddr + filesz:
+                    raise ValueError("DT_STRTAB/DT_STRSZ overruns its PT_LOAD segment (or falls in NOBITS/BSS tail)")
                 table = strtab - vaddr + offset
                 break
         if table is None:
@@ -5582,6 +5633,51 @@ def elf_dynamic_info(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]] | No
             if tag in (15, 29):  # DT_RPATH, DT_RUNPATH
                 runpath.extend(string_at(value).split(":"))
     return needed, tuple(runpath)
+
+
+def _validate_runpath_entry(entry: str, origin: str, real_root: str) -> tuple[Path | None, str | None]:
+    """Validate one `DT_RUNPATH` / `DT_RPATH` entry against `origin` and `real_root`.
+
+    Returns `(resolved_dir, None)` when valid, or `(None, reason)` where `reason`
+    is `"empty"`, `"unsupported"`, or `"outside"`."""
+    if entry == "":
+        return None, "empty"
+    if "$" in _ORIGIN_DST.sub("", entry):
+        return None, "unsupported"
+    expanded = _ORIGIN_DST.sub(lambda _match: origin, entry)
+    if not expanded.startswith("/"):
+        return None, "unsupported"
+    m = _ORIGIN_DST.match(entry)
+    if m is not None:
+        rest = entry[m.end():]
+        if _ORIGIN_DST.search(rest) is not None:
+            return None, "unsupported"
+        if rest != "":
+            if not rest.startswith("/") or rest.endswith("/") or "//" in rest:
+                return None, "unsupported"
+            curr = os.path.realpath(origin)
+            saw_down = False
+            for part in rest[1:].split("/"):
+                if part in ("", "."):
+                    return None, "unsupported"
+                if part == "..":
+                    if saw_down:
+                        return None, "outside"
+                    curr = os.path.dirname(curr)
+                    if curr != real_root and not curr.startswith(real_root + os.sep):
+                        return None, "outside"
+                else:
+                    saw_down = True
+                    curr = os.path.realpath(os.path.join(curr, part))
+                    if not curr.startswith(real_root + os.sep):
+                        return None, "outside"
+    else:
+        if any(part in (".", "..") for part in expanded.split("/")):
+            return None, "outside"
+    real = os.path.realpath(expanded)
+    if real == real_root or not real.startswith(real_root + os.sep):
+        return None, "outside"
+    return Path(os.path.normpath(expanded)), None
 
 
 def runpath_shadowing_findings(prefix: Path, elf_rels: list[str], pinned: set[str]) -> list[str]:
@@ -5610,21 +5706,16 @@ def runpath_shadowing_findings(prefix: Path, elf_rels: list[str], pinned: set[st
         needed, runpath = info
         origin = str(path.parent)
         for entry in runpath:
-            if entry == "":
+            directory, reason = _validate_runpath_entry(entry, origin, real_root)
+            if reason == "empty":
                 problems.append(f"{rel}: empty DT_RUNPATH/DT_RPATH component (glibc ld.so searches the current working directory)")
                 continue
-            if "$" in _ORIGIN_DST.sub("", entry):
+            if reason == "unsupported":
                 problems.append(f"{rel}: unsupported DT_RUNPATH entry {entry!r}")
                 continue
-            expanded = _ORIGIN_DST.sub(lambda _match: origin, entry)
-            if not expanded.startswith("/"):
-                problems.append(f"{rel}: unsupported DT_RUNPATH entry {entry!r}")
-                continue
-            real = os.path.realpath(expanded)
-            if real != real_root and not real.startswith(real_root + os.sep):
+            if reason == "outside" or directory is None:
                 problems.append(f"{rel}: DT_RUNPATH entry {entry!r} resolves outside the toolchain root")
                 continue
-            directory = Path(os.path.normpath(expanded))
             if directory not in search_dirs:
                 search_dirs.append(directory)
         for soname in needed:
@@ -5705,6 +5796,9 @@ def lean_release_findings(prefix: Path, release: dict | None = None) -> list[str
         if unsafe is not None:
             problems.append(f"{rel} is {unsafe}")
             continue
+        if st.st_nlink != 1:
+            problems.append(f"{rel} is hard-linked (st_nlink={st.st_nlink}, writable through another path)")
+            continue
         try:
             actual = _memo_sha256(path, st)
         except (OSError, ValueError) as error:
@@ -5729,10 +5823,10 @@ def admit_lean_before_execution(selected: Path, lean: Path, lock: dict) -> str:
 
     `selected` is the path as given (already `regular()`), `lean` its resolution. The
     executable must sit in a real (non-symlink) `bin/` directory, must not be
-    world-writable or setuid/setgid, and its SHA-256 must be one of the foundation
-    lock's distributions -- so a trojaned `bin/lean` is rejected before it runs. When it
-    is the locked x86_64 Linux release (selected by that digest, or by an elan
-    `leanprover--lean4---v4.34.1` directory on an x86_64 Linux host),
+    world-writable, setuid/setgid or hard-linked, and its SHA-256 must be one of the
+    foundation lock's distributions -- so a trojaned `bin/lean` is rejected before it
+    runs. When it is the locked x86_64 Linux release (selected by that digest, or by an
+    elan `leanprover--lean4---v4.34.1` directory on an x86_64 Linux host),
     `lean_release_findings` must also admit every companion executable, every Lean
     shared library and the DT_RUNPATH resolution. Raises `Failure(2, "toolchain")`;
     returns the SHA-256 of `lean`."""
@@ -5749,6 +5843,8 @@ def admit_lean_before_execution(selected: Path, lean: Path, lock: dict) -> str:
     unsafe = _unsafe_mode(lean_st)
     if unsafe is not None:
         raise Failure(2, phase, f"refusing to execute {lean}: it is {unsafe}")
+    if lean_st.st_nlink != 1:
+        raise Failure(2, phase, f"refusing to execute {lean}: it is hard-linked (st_nlink={lean_st.st_nlink})")
     try:
         lean_sha = _memo_sha256(lean, lean_st)
     except (OSError, ValueError) as error:
@@ -5951,6 +6047,8 @@ def _scan_vendor_tree(root: Path, problems: list[str]) -> tuple[dict[str, os.sta
                 unsafe = _unsafe_mode(st)
                 if unsafe is not None:
                     problems.append(f"{unsafe} file: {rel}")
+                if st.st_nlink != 1:
+                    problems.append(f"hard-linked file (st_nlink={st.st_nlink}, writable through another path): {rel}")
                 files[rel] = st
     return files, dirs
 

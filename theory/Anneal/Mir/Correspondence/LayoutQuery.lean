@@ -33,11 +33,6 @@ set_option linter.constructorNameAsVariable false
 
 /-! ## Part 4 — Demand-time `LayoutQuery` hook -/
 
-theorem nth?_eq_getElem? {α : Type} : ∀ (xs : List α) (i : Nat), nth? xs i = xs[i]?
-  | [], _ => rfl
-  | _ :: _, 0 => rfl
-  | _ :: xs, i + 1 => by simp [nth?, nth?_eq_getElem? xs i]
-
 /-- `nth? L.entries` *is* Trusted's `LayoutTable.lookup`. -/
 theorem nth?_entries_eq_lookup (L : LayoutTable) (i : Nat) : nth? L.entries i = L.lookup i := by
   simp [LayoutTable.lookup, Trusted.Sequence.get?, nth?_eq_getElem?]
@@ -72,24 +67,47 @@ theorem layoutQuery_scalar_iff (tt : TypeTable) (L : LayoutTable) (t : TyId) (c 
       · rintro ⟨k, l', h1, h2, h3⟩
         cases h1; rw [hc] at h2; cases h2; subst h3; rfl
 
-/-- Out-of-bounds `TyId`s fail closed. -/
+/-- Out-of-bounds `TyId`s fail closed across all per-`TyId` queries. -/
 theorem layoutQuery_oob_fails_closed (tt : TypeTable) (L : LayoutTable) (t : TyId)
     (h : tt.types.length ≤ t) :
     evalLayoutQuery tt L (.localLayout t) = .missingHook ∧
     evalLayoutQuery tt L (.scalarTypeClass t) = .missingHook ∧
     evalLayoutQuery tt L (.pointeeTypes t) = .missingHook ∧
-    evalLayoutQuery tt L (.retagTypeShape t) = .missingHook := by
+    evalLayoutQuery tt L (.retagTypeShape t) = .missingHook ∧
+    ∀ d : TyId, evalLayoutQuery tt L (.castTypeInfo t d) = .missingHook ∧
+      evalLayoutQuery tt L (.castTypeInfo d t) = .missingHook := by
   have hn : nth? tt.types t = none := by
     rw [nth?_eq_getElem?]; exact List.getElem?_eq_none h
-  simp [evalLayoutQuery, tyLayout, hn]
+  have htl : tyLayout tt L t = none := by simp [tyLayout, hn]
+  refine ⟨by simp [evalLayoutQuery, htl], by simp [evalLayoutQuery, htl],
+    by simp [evalLayoutQuery, hn], by simp [evalLayoutQuery, hn], fun d => ⟨?_, ?_⟩⟩
+  · simp [evalLayoutQuery, htl]
+  · simp only [evalLayoutQuery, htl]
+    rcases tyLayout tt L d with _ | ⟨sty, sl⟩ <;> rfl
 
-/-- Dangling `LayoutIdx`s fail closed. -/
+/-- Out-of-bounds `KindId`s fail closed for `builtinLayout`. -/
+theorem layoutQuery_builtin_oob_fails_closed (tt : TypeTable) (L : LayoutTable) (k : KindId)
+    (h : tt.kinds.length ≤ k) :
+    evalLayoutQuery tt L (.builtinLayout k) = .missingHook := by
+  have hn : nth? tt.kinds k = none := by
+    rw [nth?_eq_getElem?]; exact List.getElem?_eq_none h
+  simp [evalLayoutQuery, hn]
+
+/-- Dangling `LayoutIdx`s fail closed across `localLayout`, `scalarTypeClass`,
+and `castTypeInfo`. -/
 theorem layoutQuery_dangling_layout_fails_closed (tt : TypeTable) (L : LayoutTable) (t : TyId)
     (ty : Ty) (h₁ : nth? tt.types t = some ty) (h₂ : L.entries.length ≤ ty.layoutIdx) :
-    evalLayoutQuery tt L (.localLayout t) = .missingHook := by
+    evalLayoutQuery tt L (.localLayout t) = .missingHook ∧
+    evalLayoutQuery tt L (.scalarTypeClass t) = .missingHook ∧
+    ∀ d : TyId, evalLayoutQuery tt L (.castTypeInfo t d) = .missingHook ∧
+      evalLayoutQuery tt L (.castTypeInfo d t) = .missingHook := by
   have hn : nth? L.entries ty.layoutIdx = none := by
     rw [nth?_eq_getElem?]; exact List.getElem?_eq_none h₂
-  simp [evalLayoutQuery, tyLayout, h₁, hn]
+  have htl : tyLayout tt L t = none := by simp [tyLayout, h₁, hn]
+  refine ⟨by simp [evalLayoutQuery, htl], by simp [evalLayoutQuery, htl], fun d => ⟨?_, ?_⟩⟩
+  · simp [evalLayoutQuery, htl]
+  · simp only [evalLayoutQuery, htl]
+    rcases tyLayout tt L d with _ | ⟨sty, sl⟩ <;> rfl
 
 /-- The zero-sized `()` built-in (pre-interned at `KindId 0`) has a 0-byte
 layout in every encoded program, for every layout table. -/
@@ -355,6 +373,7 @@ theorem layoutQueryCorrespondenceClaim_proof : LayoutQueryCorrespondenceClaim :=
   ⟨refProgWellFormed_encodeProg,
    fun p b hb => encodeProg_refResolveTy_agrees p b hb,
    layoutQuery_oob_fails_closed,
+   layoutQuery_builtin_oob_fails_closed,
    layoutQuery_dangling_layout_fails_closed,
    fun _ _ _ _ q a htt hptr hL h => layoutQuery_mono_prefix htt hptr hL q a h,
    layoutQuery_agrees_with_eager,

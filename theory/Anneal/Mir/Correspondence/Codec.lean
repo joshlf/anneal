@@ -847,11 +847,23 @@ theorem encodeStmt_no_dormant_noops (tt : TypeTable) (s : Statement) :
   cases s with
   | mk k sp => cases k <;> simp [encodeStmt, encodeStmtKind]
 
+theorem nth?_eq_getElem? {α : Type} : ∀ (xs : List α) (i : Nat), nth? xs i = xs[i]?
+  | [], _ => rfl
+  | _ :: _, 0 => rfl
+  | _ :: xs, i + 1 => by simp [nth?, nth?_eq_getElem? xs i]
+
+/-- Out-of-bounds `TyId`s fail closed (`none`) in `decodeType`. -/
+theorem decodeType_oob_fails_closed (tt : TypeTable) (t : TyId) (h : tt.types.length ≤ t) :
+    decodeType tt t = none := by
+  simp only [decodeType, nth?_eq_getElem?]
+  exact List.getElem?_eq_none h
+
 /-- **`CodecRoundtripClaim`** (proved here; restated in
 `Anneal.Mir.Correspondence.Claims`). -/
 theorem codecRoundtripClaim_proof : CodecRoundtripClaim := by
   refine ⟨decodeProg_encodeProg, fun _ _ h => encodeProg_injective h, encodeProg_types_good,
-    ?_, ?_, encodeProg_progTys_interned, encodeProg_progTraitKinds_interned⟩
+    ?_, ?_, encodeProg_progTys_interned, encodeProg_progTraitKinds_interned,
+    fun tt s => (encodeStmt_no_dormant_noops tt s).1, decodeType_oob_fails_closed⟩
   · exact fun p => (encodeProg_types_canonical p).2.2.1
   · exact fun p => (encodeProg_types_canonical p).2.2.2.2
 

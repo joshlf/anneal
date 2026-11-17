@@ -328,16 +328,20 @@ _TOOLCHAIN_RE = re.compile(
 )
 _MOVING_CHANNELS = frozenset({"stable", "beta", "nightly", "latest"})
 _REPOSITORY_RE = re.compile(r"\Ahttps://[A-Za-z0-9.\-]+/[A-Za-z0-9._\-/]+\Z")
-_SHARED_OBJECT_RE = re.compile(r"\.so(\.[0-9]+)*\Z")
-_LIBLEANSHARED_RE = re.compile(r"\Alibleanshared.*\.so(\.[0-9]+)*\Z")
-_SHADOW_LEAN_LIB_RE = re.compile(r"\A(libleanshared|libInit_shared|libLake_shared).*\.so(\.[0-9]+)*\Z")
+_SHARED_OBJECT_RE = re.compile(r"\.so(?:\.[A-Za-z0-9_.+\-]+)?\Z")
+_LIBLEANSHARED_RE = re.compile(r"\Alibleanshared.*\.so(?:\.[A-Za-z0-9_.+\-]+)?\Z")
+_SHADOW_LEAN_LIB_RE = re.compile(r"\A(libleanshared|libInit_shared|libLake_shared).*\.so(?:\.[A-Za-z0-9_.+\-]+)?\Z")
+#: Official Lean runtime shared library basenames in `lib/lean/`.
+KNOWN_LEAN_SHARED_LIBS = frozenset(
+    {"libleanshared.so", "libleanshared_1.so", "libleanshared_2.so", "libInit_shared.so", "libLake_shared.so"}
+)
 #: glibc / loader sonames that `bin/lean`, `bin/lake` and `lib/lean/*.so` list in
 #: DT_NEEDED. ld.so searches DT_RUNPATH (`$ORIGIN/../lib`, `$ORIGIN/../lib/lean`,
 #: `$ORIGIN/..`, `$ORIGIN`) *before* the system default directories, so any of
 #: these planted in a toolchain RUNPATH directory is loaded into every Lean
 #: process. (`lib/glibc/` holds link-time stubs and is not on any RUNPATH.)
 _SYSTEM_SONAME_RE = re.compile(
-    r"\A(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|ld-linux[\w.\-]*\.so(\.[0-9]+)*)\Z"
+    r"\A(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|ld-linux[\w.\-]*\.so(?:\.[A-Za-z0-9_.+\-]+)?)(?:\.[A-Za-z0-9_.+\-]+)?\Z"
 )
 #: glibc `is_dst`: `$ORIGIN` / `${ORIGIN}` is a dynamic string token only when
 #: not followed by an identifier character; `$ORIGINX/lib` stays a literal,
@@ -702,21 +706,27 @@ def sha256_file(path: Path) -> str:
     return _hash_open_file(Path(path), want_blob=False)[0]
 
 
-def _read_small_regular_file(path: Path, limit: int = 1 << 24) -> bytes:
+def _read_small_regular_file(path: Path, limit: int = 1 << 24, expect: Optional[os.stat_result] = None) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     fd = os.open(str(path), flags)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise ValueError("not a regular file")
+        if expect is not None and (st.st_dev, st.st_ino) != (expect.st_dev, expect.st_ino):
+            raise ValueError("file was replaced while reading")
         if st.st_size > limit:
             raise ValueError(f"file larger than {limit} bytes")
         chunks = []
+        total = 0
         while True:
             chunk = os.read(fd, CHUNK_SIZE)
             if not chunk:
                 break
+            total += len(chunk)
             chunks.append(chunk)
+        if total != st.st_size:
+            raise ValueError("file changed size while reading")
         return b"".join(chunks)
     finally:
         os.close(fd)
@@ -828,7 +838,7 @@ def _lstat_real_dir(path: Path, label: str, c: _Collector, category: str) -> Opt
 
 
 def _read_pinned_text_file(path: Path, label: str, c: _Collector, category: str) -> Optional[bytes]:
-    """Read a small regular file that must not be a symlink or world-writable."""
+    """Read a small regular file that must not be a symlink, hardlink, or world-writable."""
     try:
         st = os.lstat(path)
     except OSError as exc:
@@ -842,8 +852,10 @@ def _read_pinned_text_file(path: Path, label: str, c: _Collector, category: str)
         return None
     for problem in _mode_problems(st):
         c.err(category, f"{label} is {problem}")
+    if st.st_nlink != 1:
+        c.err(category, f"{label} is hard-linked (st_nlink={st.st_nlink}, writable through another path)")
     try:
-        return _read_small_regular_file(path)
+        return _read_small_regular_file(path, expect=st)
     except (OSError, ValueError) as exc:
         c.err(category, f"cannot read {label}: {exc}")
         return None
@@ -1381,7 +1393,7 @@ def _check_pin_markers(parsed: _ParsedPin, vendor_root: Path, on_disk: Mapping[s
         if rel not in on_disk:
             continue  # reported as missing
         try:
-            content = _read_small_regular_file(vendor_root / rel)
+            content = _read_small_regular_file(vendor_root / rel, expect=on_disk[rel])
         except (OSError, ValueError) as exc:
             c.err("pins", f"cannot read {rel}: {exc}")
             continue
@@ -1391,7 +1403,7 @@ def _check_pin_markers(parsed: _ParsedPin, vendor_root: Path, on_disk: Mapping[s
         c.err("pins", f"upstream_pins.source_lock_sha256 cannot be cross-checked: {SOURCE_LOCK_FILE} is not a vendored aux file")
     elif SOURCE_LOCK_FILE in on_disk:
         try:
-            digest = sha256_file(vendor_root / SOURCE_LOCK_FILE)
+            digest = _hash_open_file(vendor_root / SOURCE_LOCK_FILE, want_blob=False, expect=on_disk[SOURCE_LOCK_FILE])[0]
         except (OSError, ValueError) as exc:
             c.err("pins", f"cannot hash {SOURCE_LOCK_FILE}: {exc}")
         else:
@@ -1633,8 +1645,12 @@ def elf_dynamic_info(path: os.PathLike | str) -> Optional[Tuple[Tuple[str, ...],
     the individual NUL-terminated dynamic strings that are referenced are read:
     the dynamic string table of `libleanshared.so` alone is ~24 MiB (every
     exported symbol name), so it is never slurped."""
-    with open(path, "rb") as fh:
-        file_size = os.fstat(fh.fileno()).st_size
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    with os.fdopen(os.open(path, flags), "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("ELF path is not a regular file")
+        file_size = st.st_size
         ehdr = fh.read(64)
         if ehdr[:4] != b"\x7fELF":
             return None
@@ -1644,7 +1660,9 @@ def elf_dynamic_info(path: os.PathLike | str) -> Optional[Tuple[Tuple[str, ...],
             raise ValueError("unsupported ELF object (only complete ELF64 little-endian headers are parsed)")
         (e_phoff,) = struct.unpack_from("<Q", ehdr, 0x20)
         e_phentsize, e_phnum = struct.unpack_from("<HH", ehdr, 0x36)
-        if e_phentsize < 56 or e_phnum > 4096:
+        if e_phnum == 0xFFFF:
+            raise ValueError("unsupported ELF extended program header numbering (PN_XNUM)")
+        if e_phentsize != 56 or e_phnum == 0 or e_phnum > 4096:
             raise ValueError("malformed ELF program header table")
         if e_phoff + e_phentsize * e_phnum > file_size:
             raise ValueError("truncated ELF program header table")
@@ -1652,27 +1670,37 @@ def elf_dynamic_info(path: os.PathLike | str) -> Optional[Tuple[Tuple[str, ...],
         phdrs = fh.read(e_phentsize * e_phnum)
         if len(phdrs) < e_phentsize * e_phnum:
             raise ValueError("truncated ELF program header table")
-        loads: List[Tuple[int, int, int]] = []
-        dynamic: Optional[Tuple[int, int]] = None
+        loads: List[Tuple[int, int, int, int]] = []
+        dynamic: Optional[Tuple[int, int, int, int]] = None
         interp: Optional[Tuple[int, int]] = None
         for i in range(e_phnum):
-            p_type, _flags, p_offset, p_vaddr, _paddr, p_filesz, _memsz, _align = struct.unpack_from(
+            p_type, _flags, p_offset, p_vaddr, _paddr, p_filesz, p_memsz, _align = struct.unpack_from(
                 "<IIQQQQQQ", phdrs, i * e_phentsize
             )
             if p_type == 1:  # PT_LOAD
                 if p_offset + p_filesz > file_size:
                     raise ValueError("PT_LOAD segment overruns EOF")
-                loads.append((p_vaddr, p_offset, p_filesz))
+                if p_filesz > p_memsz:
+                    raise ValueError("PT_LOAD segment has p_filesz > p_memsz")
+                loads.append((p_vaddr, p_offset, p_filesz, p_memsz))
             elif p_type == 2:  # PT_DYNAMIC
                 if dynamic is not None:
                     raise ValueError("more than one PT_DYNAMIC segment")
-                dynamic = (p_offset, p_filesz)
+                if p_offset + p_filesz > file_size or p_filesz > p_memsz:
+                    raise ValueError("truncated PT_DYNAMIC segment")
+                dynamic = (p_vaddr, p_offset, p_filesz, p_memsz)
             elif p_type == 3:  # PT_INTERP
                 if interp is not None:
                     raise ValueError("more than one PT_INTERP segment")
                 if p_filesz == 0 or p_filesz > 4096 or p_offset + p_filesz > file_size:
                     raise ValueError("malformed or truncated PT_INTERP segment")
                 interp = (p_offset, p_filesz)
+        sorted_loads = sorted(loads, key=lambda seg: seg[0])
+        for i in range(len(sorted_loads) - 1):
+            v1, _o1, _f1, m1 = sorted_loads[i]
+            v2, _o2, _f2, _m2 = sorted_loads[i + 1]
+            if m1 > 0 and v1 + m1 > v2:
+                raise ValueError("overlapping PT_LOAD segments")
         if interp is not None:
             fh.seek(interp[0])
             iraw = fh.read(interp[1])
@@ -1685,32 +1713,54 @@ def elf_dynamic_info(path: os.PathLike | str) -> Optional[Tuple[Tuple[str, ...],
                 raise ValueError("PT_INTERP present without PT_DYNAMIC")
         if dynamic is None:
             return ((), ())
-        if dynamic[1] > (1 << 20):
+        dyn_vaddr, dyn_off, dyn_filesz, _dyn_memsz = dynamic
+        if dyn_filesz > (1 << 20):
             raise ValueError("oversized PT_DYNAMIC segment")
-        fh.seek(dynamic[0])
-        raw = fh.read(dynamic[1])
-        if len(raw) < dynamic[1]:
+        if dyn_filesz < 16:
+            raise ValueError("unterminated PT_DYNAMIC segment (missing DT_NULL)")
+        dyn_backed = False
+        for vaddr, offset, filesz, memsz in loads:
+            if vaddr <= dyn_vaddr < vaddr + memsz:
+                if dyn_vaddr + dyn_filesz > vaddr + filesz:
+                    raise ValueError("PT_DYNAMIC segment overruns PT_LOAD file-backed bytes (NOBITS/BSS tail)")
+                if dyn_off != (dyn_vaddr - vaddr) + offset:
+                    raise ValueError("PT_DYNAMIC p_offset disagrees with its enclosing PT_LOAD mapping")
+                dyn_backed = True
+                break
+        if not dyn_backed:
+            raise ValueError("PT_DYNAMIC segment is not inside a PT_LOAD segment")
+        fh.seek(dyn_off)
+        raw = fh.read(dyn_filesz)
+        if len(raw) < dyn_filesz:
             raise ValueError("truncated PT_DYNAMIC segment")
         entries: List[Tuple[int, int]] = []
         strtab = strsz = None
+        saw_dt_null = False
         for j in range(0, len(raw) - 15, 16):
             tag, val = struct.unpack_from("<qQ", raw, j)
             if tag == 0:  # DT_NULL
+                saw_dt_null = True
                 break
             entries.append((tag, val))
             if tag == 5:  # DT_STRTAB (virtual address)
+                if strtab is not None and strtab != val:
+                    raise ValueError("conflicting duplicate DT_STRTAB entries")
                 strtab = val
             elif tag == 10:  # DT_STRSZ
+                if strsz is not None and strsz != val:
+                    raise ValueError("conflicting duplicate DT_STRSZ entries")
                 strsz = val
+        if not saw_dt_null:
+            raise ValueError("unterminated PT_DYNAMIC segment (missing DT_NULL)")
         if strtab is None or strsz is None:
             if any(t in (1, 15, 29) for t, _ in entries):
                 raise ValueError("DT_NEEDED/DT_RUNPATH present without DT_STRTAB/DT_STRSZ")
             return ((), ())
         file_off = None
-        for vaddr, offset, filesz in loads:
-            if vaddr <= strtab < vaddr + filesz:
-                if strtab + strsz > vaddr + filesz:
-                    raise ValueError("DT_STRTAB/DT_STRSZ overruns its PT_LOAD segment")
+        for vaddr, offset, filesz, memsz in loads:
+            if vaddr <= strtab < vaddr + memsz:
+                if strtab >= vaddr + filesz or strtab + strsz > vaddr + filesz:
+                    raise ValueError("DT_STRTAB/DT_STRSZ overruns its PT_LOAD segment (or falls in NOBITS/BSS tail)")
                 file_off = strtab - vaddr + offset
                 break
         if file_off is None:
@@ -1736,6 +1786,51 @@ def elf_dynamic_info(path: os.PathLike | str) -> Optional[Tuple[Tuple[str, ...],
     return needed, tuple(runpath)
 
 
+def _validate_runpath_entry(entry: str, origin: str, real_root: str) -> Tuple[Optional[Path], Optional[str]]:
+    """Validate one `DT_RUNPATH` / `DT_RPATH` entry against `origin` and `real_root`.
+
+    Returns `(resolved_dir, None)` when valid, or `(None, reason)` where `reason`
+    is `"empty"`, `"unsupported"`, or `"outside"`."""
+    if entry == "":
+        return None, "empty"
+    if "$" in _ORIGIN_DST_RE.sub("", entry):
+        return None, "unsupported"
+    expanded = _ORIGIN_DST_RE.sub(lambda _m: origin, entry)
+    if not os.path.isabs(expanded):
+        return None, "unsupported"
+    m = _ORIGIN_DST_RE.match(entry)
+    if m is not None:
+        rest = entry[m.end():]
+        if _ORIGIN_DST_RE.search(rest) is not None:
+            return None, "unsupported"
+        if rest != "":
+            if not rest.startswith("/") or rest.endswith("/") or "//" in rest:
+                return None, "unsupported"
+            curr = os.path.realpath(origin)
+            saw_down = False
+            for part in rest[1:].split("/"):
+                if part in ("", "."):
+                    return None, "unsupported"
+                if part == "..":
+                    if saw_down:
+                        return None, "outside"
+                    curr = os.path.dirname(curr)
+                    if curr != real_root and not curr.startswith(real_root + os.sep):
+                        return None, "outside"
+                else:
+                    saw_down = True
+                    curr = os.path.realpath(os.path.join(curr, part))
+                    if not curr.startswith(real_root + os.sep):
+                        return None, "outside"
+    else:
+        if any(part in (".", "..") for part in expanded.split("/")):
+            return None, "outside"
+    real = os.path.realpath(expanded)
+    if real == real_root or not real.startswith(real_root + os.sep):
+        return None, "outside"
+    return Path(os.path.normpath(expanded)), None
+
+
 def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequence[str], files: Mapping[str, str], c: _Collector) -> None:
     """Reject any unpinned toolchain file that ld.so could load, via a
     DT_RUNPATH/DT_RPATH directory, for a DT_NEEDED soname of a pinned ELF object.
@@ -1748,10 +1843,11 @@ def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequ
     DT_NEEDED soname of every checked object, so the verdict is independent of
     entry order, of DT_RUNPATH-over-DT_RPATH precedence and of DT_RPATH
     inheritance; every existing entry found must be a pinned/verified file. All
-    RUNPATH/RPATH directories must resolve inside the toolchain root. Entries are
-    interpreted like glibc's `fillin_rpath` / `is_dst`: an empty component means
-    the current working directory and is rejected, and only `$ORIGIN` /
-    `${ORIGIN}` tokens not followed by an identifier character are expanded."""
+    RUNPATH/RPATH directories must resolve strictly inside the toolchain root.
+    Entries are interpreted like glibc's `fillin_rpath` / `is_dst`: an empty
+    component means the current working directory and is rejected, and only
+    `$ORIGIN` / `${ORIGIN}` tokens not followed by an identifier character are
+    expanded."""
     needs: List[Tuple[str, str]] = []
     search_dirs: List[Path] = []
     for rel in elf_rels:
@@ -1766,24 +1862,16 @@ def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequ
         needed, runpath = info
         origin = str(path.parent)
         for entry in runpath:
-            if entry == "":
+            directory, reason = _validate_runpath_entry(entry, origin, real_root)
+            if reason == "empty":
                 c.err("toolchain", f"{rel}: empty DT_RUNPATH/DT_RPATH component (glibc ld.so searches the current working directory)")
                 continue
-            # Only glibc-recognised `$ORIGIN` DSTs are expanded; any other `$`
-            # (`$LIB`, `$PLATFORM`, `$ORIGINX`, `${ORIGIN`) or a relative result
-            # (resolved against the CWD by ld.so) is rejected.
-            if "$" in _ORIGIN_DST_RE.sub("", entry):
+            if reason == "unsupported":
                 c.err("toolchain", f"{rel}: unsupported DT_RUNPATH entry {entry!r}")
                 continue
-            expanded = _ORIGIN_DST_RE.sub(lambda _m: origin, entry)
-            if not os.path.isabs(expanded):
-                c.err("toolchain", f"{rel}: unsupported DT_RUNPATH entry {entry!r}")
-                continue
-            real = os.path.realpath(expanded)
-            if real != real_root and not real.startswith(real_root + os.sep):
+            if reason == "outside" or directory is None:
                 c.err("toolchain", f"{rel}: DT_RUNPATH entry {entry!r} resolves outside the toolchain root")
                 continue
-            directory = Path(os.path.normpath(expanded))
             if directory not in search_dirs:
                 search_dirs.append(directory)
         for soname in needed:
@@ -1989,12 +2077,12 @@ def _verify_toolchain_impl(
         pinned_files = {rel: sha for rel, sha in files.items() if rel in active_pin["files"]}
     else:
         for n in lib_names:
-            if _SHARED_OBJECT_RE.search(n) and not _SHADOW_LEAN_LIB_RE.match(n) and not _SYSTEM_SONAME_RE.match(n):
+            if _SHARED_OBJECT_RE.search(n) and n not in KNOWN_LEAN_SHARED_LIBS and not _SYSTEM_SONAME_RE.match(n):
                 c.err("toolchain", f"unpinned non-Lean shared library in lib/lean/: lib/lean/{n}")
         pinned_files = {
             rel: sha
             for rel, sha in files.items()
-            if rel in RUNPATH_CHECKED_BINARIES or (rel.startswith("lib/lean/") and _SHADOW_LEAN_LIB_RE.match(Path(rel).name))
+            if rel in RUNPATH_CHECKED_BINARIES or (rel.startswith("lib/lean/") and Path(rel).name in KNOWN_LEAN_SHARED_LIBS)
         }
     # Only the Lean-runtime objects are resolved through DT_RUNPATH here; the
     # pinned `clang` / `ld.lld` / `llvm-ar` / `cadical` load the release's own

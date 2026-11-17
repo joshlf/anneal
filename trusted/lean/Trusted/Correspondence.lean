@@ -2330,9 +2330,11 @@ by name. -/
 4. nominal `TyId` equality coincides with structural `Ty` equality on the
    interned types;
 5. the built-in kinds `()`, `bool`, `usize` sit at `KindId`s `0`, `1`, `2`;
-6. every `Ty` occurrence of `p` is interned; and
+6. every `Ty` occurrence of `p` is interned;
 7. every `CapturedMir.traitImpls` `RigidTy` argument has its full bottom-up
-   post-order interned in `kinds`. -/
+   post-order interned in `kinds`;
+8. no statement is laundered into (or out of) a dormant `nop`; and
+9. out-of-bounds `TyId`s fail closed (`none`) in `decodeType`. -/
 def CodecRoundtripClaim : Prop :=
   (∀ p : V2026Prog, decodeProg (encodeProg p) = some p) ∧
   Function.Injective encodeProg ∧
@@ -2345,15 +2347,19 @@ def CodecRoundtripClaim : Prop :=
     nth? (encodeProg p).types.kinds 1 = some .bool ∧
     nth? (encodeProg p).types.kinds 2 = some (.uint .usize)) ∧
   (∀ p : V2026Prog, ∀ ty ∈ progTys p, ty ∈ (encodeProg p).types.types) ∧
-  (∀ p : V2026Prog, ∀ k ∈ progTraitKinds p, rigidTyPostorder k ⊆ (encodeProg p).types.kinds)
+  (∀ p : V2026Prog, ∀ k ∈ progTraitKinds p, rigidTyPostorder k ⊆ (encodeProg p).types.kinds) ∧
+  (∀ (tt : TypeTable) (s : Statement), ((encodeStmt tt s).kind = .nop ↔ s.kind = .nop)) ∧
+  (∀ (tt : TypeTable) (t : TyId), tt.types.length ≤ t → decodeType tt t = none)
 
 /-- **Demand-time layout queries.**
 
 1. `encodeProg` maps well-formed programs to well-formed reference programs;
 2. on every type occurrence of every body, `M_ref`'s demand-time resolution of
    the encoded `TyId` equals `M_anneal`'s deep resolution;
-3. out-of-bounds `TyId`s fail closed (`missingHook`) for every per-type query;
-4. dangling `LayoutIdx`s fail closed;
+3. out-of-bounds `TyId`s and `KindId`s fail closed (`missingHook`) across all
+   six `LayoutQuery` constructors;
+4. dangling `LayoutIdx`s fail closed (`missingHook`) across `localLayout`,
+   `scalarTypeClass`, and `castTypeInfo`;
 5. every successful answer is preserved by prefix extension of the type and
    layout tables (call-cone narrowing / multi-body growth);
 6. `localLayout` refines the eager pre-materialized table pointwise;
@@ -2371,10 +2377,17 @@ def LayoutQueryCorrespondenceClaim : Prop :=
     evalLayoutQuery tt L (.localLayout t) = .missingHook ∧
     evalLayoutQuery tt L (.scalarTypeClass t) = .missingHook ∧
     evalLayoutQuery tt L (.pointeeTypes t) = .missingHook ∧
-    evalLayoutQuery tt L (.retagTypeShape t) = .missingHook) ∧
+    evalLayoutQuery tt L (.retagTypeShape t) = .missingHook ∧
+    ∀ d : TyId, evalLayoutQuery tt L (.castTypeInfo t d) = .missingHook ∧
+      evalLayoutQuery tt L (.castTypeInfo d t) = .missingHook) ∧
+  (∀ (tt : TypeTable) (L : LayoutTable) (k : KindId), tt.kinds.length ≤ k →
+    evalLayoutQuery tt L (.builtinLayout k) = .missingHook) ∧
   (∀ (tt : TypeTable) (L : LayoutTable) (t : TyId) (ty : Ty),
     nth? tt.types t = some ty → L.entries.length ≤ ty.layoutIdx →
-    evalLayoutQuery tt L (.localLayout t) = .missingHook) ∧
+    evalLayoutQuery tt L (.localLayout t) = .missingHook ∧
+    evalLayoutQuery tt L (.scalarTypeClass t) = .missingHook ∧
+    ∀ d : TyId, evalLayoutQuery tt L (.castTypeInfo t d) = .missingHook ∧
+      evalLayoutQuery tt L (.castTypeInfo d t) = .missingHook) ∧
   (∀ (tt tt' : TypeTable) (L L' : LayoutTable) (q : LayoutQuery) (a : LayoutAnswer),
     tt.Extends tt' → L'.pointerBits = L.pointerBits → (∃ l, L'.entries = L.entries ++ l) →
     evalLayoutQuery tt L q = .ok a → evalLayoutQuery tt' L' q = .ok a) ∧
@@ -2534,38 +2547,132 @@ def MiriMoveDeinitWiringClaim : Prop :=
 /-- A `u8` scalar value (used by the concrete witnesses below). -/
 def u8Value (n : Nat) : Value := .scalar { bits := n, sizeBytes := 1 }
 
+/-- `u8` primitive layout (`1` byte) for the live `evalOperand` union and
+typed-pointer bridge claims. -/
+def claimU8Layout : TypeLayout :=
+  { size := { bytes := 1 }, align := { bytes := 1 },
+    backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 }),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+/-- `u16` primitive layout (`2` bytes) for the live `evalOperand` union claim. -/
+def claimU16Layout : TypeLayout :=
+  { size := { bytes := 2 }, align := { bytes := 2 },
+    backendRepr := .scalar (.initialized (.int 16 false) { start := 0, end_ := 65535 }),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+/-- `union U { a: u8, b: u16 }` layout (`2` bytes, both fields at offset `0`). -/
+def claimUnionULayout : TypeLayout :=
+  { size := { bytes := 2 }, align := { bytes := 2 }, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false, fieldLayouts := [0, 1] }
+
+/-- Layout table for `union U { a: u8, b: u16 }`. -/
+def claimUnionLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [claimU8Layout, claimU16Layout, claimUnionULayout] }
+
+/-- `u8` type (`layoutIdx = 0`). -/
+def claimU8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
+
+/-- `u16` type (`layoutIdx = 1`). -/
+def claimU16Ty : Ty := { kind := .uint .u16, layoutIdx := 1 }
+
+/-- Local declarations `_0 : u8, _1 : U` for the union claim. -/
+def claimUnionDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := claimU8Ty, debugName := none },
+   { mutability := .mut, ty := { kind := .adt "U" [], layoutIdx := 2 }, debugName := none }]
+
+/-- `(u8, u8)` tuple layout (`2` bytes, fields at offsets `0` and `1`). -/
+def claimPairLayout : TypeLayout :=
+  { size := ⟨2⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨1⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [0, 0] }
+
+/-- `[(u8, u8); 2]` array layout (`4` bytes, stride `2`). -/
+def claimPairArrLayout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .array ⟨2⟩ 2, variants := .single 0, isUninhabited := false, fieldLayouts := [1] }
+
+/-- Thin-pointer layout (`8` bytes). -/
+def claimPtrLayout : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+
+/-- Layout table for the typed thin-pointer deref claim (`[(u8, u8); 2]`). -/
+def claimPairArrLayouts : LayoutTable :=
+  { emptyLayoutTable with
+    entries := [
+      { size := ⟨1⟩, align := ⟨1⟩, backendRepr := .memory, fields := .primitive,
+        variants := .single 0, isUninhabited := false, fieldLayouts := [] },
+      claimPairLayout, claimPairArrLayout, claimPtrLayout] }
+
+/-- Local declarations `_0 : u8, _1 : [(u8, u8); 2], _2 : *mut (u8, u8), _3 : &(u8, u8)`. -/
+def claimPairArrDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := claimU8Ty, debugName := .none },
+   { mutability := .mut, ty := { kind := .array (.tuple [.uint .u8, .uint .u8]) 2, layoutIdx := 2 },
+     debugName := .none },
+   { mutability := .mut, ty := { kind := .rawPtr .mut (.tuple [.uint .u8, .uint .u8]), layoutIdx := 3 },
+     debugName := .none },
+   { mutability := .not, ty := { kind := .ref .not (.tuple [.uint .u8, .uint .u8]), layoutIdx := 3 },
+     debugName := .none }]
+
+/-- Shared borrow table for the `Deref` move claims (`tag 2` active on `_1`,
+`tag 3` `.frozen` on `_1`). -/
+def claimDerefBorrows : List BorrowEntry :=
+  [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .active },
+   { tag := 3, targetLocal := 1, targetProjection := [], perm := .frozen }]
+
 /-- **Live bridge to `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand`.**
 
-(a) In the default (legacy) mode, moving an unprojected root local returns its
-    value and sets the slot to `.uninit`, while copying it leaves `locals`
-    unchanged.
+(a) Moving an unprojected root local returns its value and sets the slot to
+    `.uninit` in both legacy (`false`) and `deinitProjectedMoves := true` modes
+    (and re-reading it in `true` mode faults with `.ub`), while copying it
+    leaves `locals` unchanged.
 
 (b) In the default mode (`deinitProjectedMoves := false`), moving a projected
     place (field, element, subslice, downcast, cast, or `Deref`) is identical
     to copying it.
 
 (c) With `deinitProjectedMoves := true` (Episode 1), moves genuinely
-    deinitialize projected and dereferenced places:
+    deinitialize projected, union, and dereferenced places:
 
     1. (*field moves, all states*) moving field `idx` of an initialized
        aggregate local (in a context without local declarations) returns the
        field, after which re-reading that field faults with `.ub` while every
        other field (without a moved-out leaf) is still read unchanged;
-    2. (*element moves, all states*) the same for a `constantIndex` element of
-       an initialized array local;
-    3. (*subslice move*) moving `_1[1..3]` out of `_1 = [10, 11, 12, 13]`
-       returns `[11, 12]`; afterwards `_1[1]` and `_1[2]` fault with `.ub`
-       while `_1[0] = 10` and `_1[3] = 13` stay readable, and the whole array
-       faults;
-    4. (*`Deref` move*) with `_2 = &raw mut _1` (active tag `2`) and
+    2. (*`constantIndex` element moves, all states*) the same for a
+       `constantIndex` element of an initialized array local;
+    3. (*dynamic `.index` element moves, all states*) the same for an
+       `.index idxLocal` element of an initialized array local when `idxLocal`
+       holds `usize` index `idx` (`l ≠ idxLocal`);
+    4. (*subslice move*) moving `_1[1..3]` (or `_1[1..-1]` with
+       `fromEnd := true`) out of `_1 = [10, 11, 12, 13]` returns `[11, 12]`;
+       afterwards `_1[1]` and `_1[2]` fault with `.ub` while `_1[0] = 10` and
+       `_1[3] = 13` stay readable, and the whole array faults;
+    5. (*union field move & re-init*) moving `_1.a` (`u8`) out of
+       `union U { a: u8, b: u16 } = U { b: 0x0302 }` returns `2` and
+       deinitializes byte `0` (`deinitUnionSubPlace`): re-reading `_1.a` or the
+       overlapping `_1.b` faults with `.ub`, the whole union remains readable as
+       its raw byte overlay, re-initializing `_1.a = 9` makes `_1.b` read
+       `0x0309`, and legacy `false` mode keeps `_1` unchanged;
+    6. (*untyped `Deref` move*) with `_2 = &raw mut _1` (active tag `2`) and
        `_3 = &_1` (`.frozen` tag `3`), moving `*_2` out of `_1 = 5` returns
        `5` and deinitializes `_1`; afterwards reading `*_2`, `*_3` (whose tag
        is still `.frozen`: the borrow table is untouched) or `_1` faults with
-       `.ub`; and
-    5. (*read guard, all states*) every read in this mode faults on a value
+       `.ub`;
+    7. (*typed thin-pointer `Deref` + field move*) with `_1 = [(1, 2), (3, 4)]`
+       and `_2 : *mut (u8, u8)` at byte offset `2` (`&raw mut _1[1]`), moving
+       `(*_2).0` (`deinitTypedThinPtrDeref`) returns `3` and deinitializes
+       exactly `_1[1].0`: `(*_2).1 = 4`, `(*_3).1 = 4`, and `_1[0] = (1, 2)`
+       stay readable while `(*_2).0`, `*_3`, `_1[1]`, and `_1` fault with `.ub`;
+    8. (*slice fat-pointer `Deref` element and subslice moves*) with
+       `_1 = [10, 11, 12, 13]` and slice fat pointer `_2 : *mut [u8]`, moving
+       `(*_2)[1]` (`deinitSliceFatPtrDeref`) returns `11` and deinitializes
+       `_1[1]`, and moving `(*_2)[1..3]` returns `[11, 12]` and deinitializes
+       `_1[1..3]` while keeping `_1[0] = 10` and `_1[3] = 13` readable; and
+    9. (*read guard, all states*) every read in this mode faults on a value
        that contains a moved-out leaf. -/
 def TrustedProjectedMoveDeinitClaim : Prop :=
-  -- (a)
+  -- (a) root moves (legacy `false` and `deinitProjectedMoves := true`)
   (∀ (locals locals' : List LocalSlot) (l : Local) (v : Value) (borrows : List BorrowEntry)
       (globals : List CapturedAllocation) (layouts : LayoutTable)
       (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
@@ -2575,8 +2682,15 @@ def TrustedProjectedMoveDeinitClaim : Prop :=
     evalOperand locals (.move ⟨l, []⟩) borrows globals layouts callerLocals localDecls callStack =
       .ok v locals' ∧
     evalOperand locals (.copy ⟨l, []⟩) borrows globals layouts callerLocals localDecls callStack =
-      .ok v locals) ∧
-  -- (b)
+      .ok v locals ∧
+    (v ≠ .unit → valueContainsMovedUninit v = false →
+      evalOperand locals (.move ⟨l, []⟩) borrows globals layouts callerLocals [] callStack true =
+        .ok v locals' ∧
+      evalOperand locals (.copy ⟨l, []⟩) borrows globals layouts callerLocals [] callStack true =
+        .ok v locals ∧
+      evalOperand locals' (.copy ⟨l, []⟩) borrows globals layouts callerLocals [] callStack true =
+        .ub)) ∧
+  -- (b) legacy projected move = copy
   (∀ (locals : List LocalSlot) (l : Local) (e : ProjectionElem) (es : List ProjectionElem)
       (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
       (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
@@ -2602,7 +2716,7 @@ def TrustedProjectedMoveDeinitClaim : Prop :=
         Trusted.Sequence.get? fields j = some w → valueContainsMovedUninit w = false →
         evalOperand locals' (.copy ⟨l, [.field j jty]⟩) borrows globals layouts callerLocals []
           callStack true = .ok w locals') ∧
-  -- (c2) element moves
+  -- (c2) constantIndex element moves
   (∀ (locals : List LocalSlot) (l : Local) (elems : List Value) (idx minLen : Nat) (v : Value)
       (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
       (callerLocals : List LocalSlot) (callStack : List SavedCallerFrame),
@@ -2619,10 +2733,31 @@ def TrustedProjectedMoveDeinitClaim : Prop :=
         Trusted.Sequence.get? elems j = some w → valueContainsMovedUninit w = false →
         evalOperand locals' (.copy ⟨l, [.constantIndex j minLen false]⟩) borrows globals layouts
           callerLocals [] callStack true = .ok w locals') ∧
-  -- (c3) subslice move
+  -- (c3) dynamic `.index` element moves
+  (∀ (locals : List LocalSlot) (l idxLocal : Local) (elems : List Value) (idx : Nat) (v : Value)
+      (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
+      (callerLocals : List LocalSlot) (callStack : List SavedCallerFrame),
+    l ≠ idxLocal →
+    Trusted.Sequence.get? locals l = some (.init (.aggregate 0 elems)) →
+    Trusted.Sequence.get? locals idxLocal = some (.init (.scalar { bits := idx, sizeBytes := 8 })) →
+    Trusted.Sequence.get? elems idx = some v →
+    v ≠ .unit → valueContainsMovedUninit v = false →
+    ∃ locals',
+      evalOperand locals (.move ⟨l, [.index idxLocal]⟩) borrows globals layouts
+        callerLocals [] callStack true = .ok v locals' ∧
+      evalOperand locals' (.copy ⟨l, [.index idxLocal]⟩) borrows globals layouts
+        callerLocals [] callStack true = .ub ∧
+      ∀ (j : Nat) (w : Value), j ≠ idx →
+        Trusted.Sequence.get? elems j = some w → valueContainsMovedUninit w = false →
+        evalOperand locals' (.copy ⟨l, [.constantIndex j 0 false]⟩) borrows globals layouts
+          callerLocals [] callStack true = .ok w locals') ∧
+  -- (c4) subslice move (`fromEnd := false` and `fromEnd := true`)
   (∃ locals' : List LocalSlot,
     evalOperand [.uninit, .init (.aggregate 0 [u8Value 10, u8Value 11, u8Value 12, u8Value 13])]
         (.move ⟨1, [.subslice 1 3 false]⟩) [] [] emptyLayoutTable [] [] [] true =
+      .ok (.aggregate 0 [u8Value 11, u8Value 12]) locals' ∧
+    evalOperand [.uninit, .init (.aggregate 0 [u8Value 10, u8Value 11, u8Value 12, u8Value 13])]
+        (.move ⟨1, [.subslice 1 1 true]⟩) [] [] emptyLayoutTable [] [] [] true =
       .ok (.aggregate 0 [u8Value 11, u8Value 12]) locals' ∧
     evalOperand locals' (.copy ⟨1, [.constantIndex 1 4 false]⟩) [] [] emptyLayoutTable [] [] []
       true = .ub ∧
@@ -2633,26 +2768,91 @@ def TrustedProjectedMoveDeinitClaim : Prop :=
     evalOperand locals' (.copy ⟨1, [.constantIndex 3 4 false]⟩) [] [] emptyLayoutTable [] [] []
       true = .ok (u8Value 13) locals' ∧
     evalOperand locals' (.copy ⟨1, []⟩) [] [] emptyLayoutTable [] [] [] true = .ub) ∧
-  -- (c4) `Deref` move with a sibling `.frozen` borrow
+  -- (c5) union field move and re-initialization (`deinitUnionSubPlace`)
+  (∃ locals' locals'' : List LocalSlot,
+    evalOperand [.uninit, .init (.aggregate 0 [.unit, .scalar ⟨770, 2⟩])]
+        (.move ⟨1, [.field 0 claimU8Ty]⟩) [] [] claimUnionLayouts [] claimUnionDecls [] true =
+      .ok (u8Value 2) locals' ∧
+    evalOperand locals' (.copy ⟨1, [.field 0 claimU8Ty]⟩) [] [] claimUnionLayouts []
+      claimUnionDecls [] true = .ub ∧
+    evalOperand locals' (.copy ⟨1, [.field 1 claimU16Ty]⟩) [] [] claimUnionLayouts []
+      claimUnionDecls [] true = .ub ∧
+    evalOperand locals' (.copy ⟨1, []⟩) [] [] claimUnionLayouts [] claimUnionDecls [] true =
+      .ok (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨0, 0⟩, .scalar ⟨3, 1⟩]]) locals' ∧
+    writePlaceValue locals' [] ⟨1, [.field 0 claimU8Ty]⟩ (u8Value 9) claimUnionDecls
+      claimUnionLayouts = .ok locals'' ∧
+    evalOperand locals'' (.copy ⟨1, [.field 1 claimU16Ty]⟩) [] [] claimUnionLayouts []
+      claimUnionDecls [] true = .ok (.scalar ⟨777, 2⟩) locals'' ∧
+    evalOperand [.uninit, .init (.aggregate 0 [.unit, .scalar ⟨770, 2⟩])]
+        (.move ⟨1, [.field 0 claimU8Ty]⟩) [] [] claimUnionLayouts [] claimUnionDecls [] false =
+      .ok (u8Value 2) [.uninit, .init (.aggregate 0 [.unit, .scalar ⟨770, 2⟩])]) ∧
+  -- (c6) untyped `Deref` move with a sibling `.frozen` borrow
   (∃ locals' : List LocalSlot,
     evalOperand
         [.uninit, .init (u8Value 5), .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
           .init (.ptr { allocId := 3, offsetBytes := 0 } 8)]
-        (.move ⟨2, [.deref]⟩)
-        [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .active },
-          { tag := 3, targetLocal := 1, targetProjection := [], perm := .frozen }]
-        [] emptyLayoutTable [] [] [] true = .ok (u8Value 5) locals' ∧
+        (.move ⟨2, [.deref]⟩) claimDerefBorrows [] emptyLayoutTable [] [] [] true =
+      .ok (u8Value 5) locals' ∧
     Trusted.Sequence.get? locals' 1 = some .uninit ∧
-    evalOperand locals' (.copy ⟨2, [.deref]⟩)
-        [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .active },
-          { tag := 3, targetLocal := 1, targetProjection := [], perm := .frozen }]
-        [] emptyLayoutTable [] [] [] true = .ub ∧
-    evalOperand locals' (.copy ⟨3, [.deref]⟩)
-        [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .active },
-          { tag := 3, targetLocal := 1, targetProjection := [], perm := .frozen }]
-        [] emptyLayoutTable [] [] [] true = .ub ∧
+    evalOperand locals' (.copy ⟨2, [.deref]⟩) claimDerefBorrows [] emptyLayoutTable [] [] []
+      true = .ub ∧
+    evalOperand locals' (.copy ⟨3, [.deref]⟩) claimDerefBorrows [] emptyLayoutTable [] [] []
+      true = .ub ∧
     evalOperand locals' (.copy ⟨1, []⟩) [] [] emptyLayoutTable [] [] [] true = .ub) ∧
-  -- (c5) read guard
+  -- (c7) typed thin-pointer `Deref` + field move (`deinitTypedThinPtrDeref`)
+  (∃ locals' : List LocalSlot,
+    evalOperand
+        [.uninit,
+          .init (.aggregate 0 [.aggregate 0 [u8Value 1, u8Value 2],
+            .aggregate 0 [u8Value 3, u8Value 4]]),
+          .init (.ptr { allocId := 2, offsetBytes := 2 } 8),
+          .init (.ptr { allocId := 3, offsetBytes := 2 } 8)]
+        (.move ⟨2, [.deref, .field 0 claimU8Ty]⟩) claimDerefBorrows [] claimPairArrLayouts []
+        claimPairArrDecls [] true = .ok (u8Value 3) locals' ∧
+    evalOperand locals' (.copy ⟨2, [.deref, .field 1 claimU8Ty]⟩) claimDerefBorrows []
+      claimPairArrLayouts [] claimPairArrDecls [] true = .ok (u8Value 4) locals' ∧
+    evalOperand locals' (.copy ⟨3, [.deref, .field 1 claimU8Ty]⟩) claimDerefBorrows []
+      claimPairArrLayouts [] claimPairArrDecls [] true = .ok (u8Value 4) locals' ∧
+    evalOperand locals' (.copy ⟨1, [.constantIndex 0 2 false]⟩) claimDerefBorrows []
+      claimPairArrLayouts [] claimPairArrDecls [] true =
+        .ok (.aggregate 0 [u8Value 1, u8Value 2]) locals' ∧
+    evalOperand locals' (.copy ⟨2, [.deref, .field 0 claimU8Ty]⟩) claimDerefBorrows []
+      claimPairArrLayouts [] claimPairArrDecls [] true = .ub ∧
+    evalOperand locals' (.copy ⟨3, [.deref]⟩) claimDerefBorrows [] claimPairArrLayouts []
+      claimPairArrDecls [] true = .ub ∧
+    evalOperand locals' (.copy ⟨1, [.constantIndex 1 2 false]⟩) claimDerefBorrows []
+      claimPairArrLayouts [] claimPairArrDecls [] true = .ub ∧
+    evalOperand locals' (.copy ⟨1, []⟩) claimDerefBorrows [] claimPairArrLayouts []
+      claimPairArrDecls [] true = .ub) ∧
+  -- (c8) slice fat-pointer `Deref` element and subslice moves (`deinitSliceFatPtrDeref`)
+  (∃ localsElem localsSub : List LocalSlot,
+    let initSliceLocals : List LocalSlot :=
+      [.uninit,
+        .init (.aggregate 0 [u8Value 10, u8Value 11, u8Value 12, u8Value 13]),
+        .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8,
+          .scalar { bits := 4, sizeBytes := 8 }])]
+    evalOperand initSliceLocals (.move ⟨2, [.deref, .constantIndex 1 4 false]⟩) claimDerefBorrows
+      [] emptyLayoutTable [] [] [] true = .ok (u8Value 11) localsElem ∧
+    evalOperand localsElem (.copy ⟨2, [.deref, .constantIndex 0 4 false]⟩) claimDerefBorrows
+      [] emptyLayoutTable [] [] [] true = .ok (u8Value 10) localsElem ∧
+    evalOperand localsElem (.copy ⟨2, [.deref, .constantIndex 2 4 false]⟩) claimDerefBorrows
+      [] emptyLayoutTable [] [] [] true = .ok (u8Value 12) localsElem ∧
+    evalOperand localsElem (.copy ⟨2, [.deref, .constantIndex 3 4 false]⟩) claimDerefBorrows
+      [] emptyLayoutTable [] [] [] true = .ok (u8Value 13) localsElem ∧
+    evalOperand localsElem (.copy ⟨2, [.deref, .constantIndex 1 4 false]⟩) claimDerefBorrows
+      [] emptyLayoutTable [] [] [] true = .ub ∧
+    evalOperand initSliceLocals (.move ⟨2, [.deref, .subslice 1 3 false]⟩) claimDerefBorrows
+      [] emptyLayoutTable [] [] [] true =
+        .ok (.aggregate 0 [u8Value 11, u8Value 12]) localsSub ∧
+    evalOperand localsSub (.copy ⟨1, [.constantIndex 0 4 false]⟩) claimDerefBorrows
+      [] emptyLayoutTable [] [] [] true = .ok (u8Value 10) localsSub ∧
+    evalOperand localsSub (.copy ⟨1, [.constantIndex 1 4 false]⟩) claimDerefBorrows
+      [] emptyLayoutTable [] [] [] true = .ub ∧
+    evalOperand localsSub (.copy ⟨1, [.constantIndex 2 4 false]⟩) claimDerefBorrows
+      [] emptyLayoutTable [] [] [] true = .ub ∧
+    evalOperand localsSub (.copy ⟨1, [.constantIndex 3 4 false]⟩) claimDerefBorrows
+      [] emptyLayoutTable [] [] [] true = .ok (u8Value 13) localsSub) ∧
+  -- (c9) read guard
   (∀ (locals : List LocalSlot) (p : Place) (borrows : List BorrowEntry)
       (globals : List CapturedAllocation) (layouts : LayoutTable)
       (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
