@@ -269,40 +269,104 @@ theorem natLowBits_length (d k : Nat) : (natLowBits d k).length = d := by
     show (natLowBits d (k / 2)).length + 1 = d + 1
     rw [ih]
 
-/-- Default binary radix depth (`12` bits = `4,096` direct leaf slots). -/
+private theorem mod_two_eq_of_beq_one_eq {a b : Nat}
+    (h : (a % 2 == 1) = (b % 2 == 1)) : a % 2 = b % 2 := by
+  have ha : a % 2 < 2 := Nat.mod_lt a (by decide)
+  have hb : b % 2 < 2 := Nat.mod_lt b (by decide)
+  generalize hr₁ : a % 2 = r₁ at ha h
+  generalize hr₂ : b % 2 = r₂ at hb h
+  match r₁, r₂ with
+  | 0, 0 => rfl
+  | 1, 1 => rfl
+  | 0, 1 => nomatch h
+  | 1, 0 => nomatch h
+  | _ + 2, _ => omega
+  | _, _ + 2 => omega
+
+/-- **Injectivity of `natLowBits d` on `< 2^d` (`natLowBits_inj_of_lt_pow2`)**: any two keys
+`k₁, k₂ < 2^d` with the same `d`-bit path are equal, so no two distinct keys `< 2^d` ever share a
+leaf bucket. -/
+theorem natLowBits_inj_of_lt_pow2 :
+    ∀ (d : Nat) {k₁ k₂ : Nat},
+      k₁ < 2 ^ d → k₂ < 2 ^ d →
+      natLowBits d k₁ = natLowBits d k₂ → k₁ = k₂
+  | 0, k₁, k₂, h₁, h₂, _ => by omega
+  | d + 1, k₁, k₂, h₁, h₂, heq => by
+    unfold natLowBits at heq
+    injection heq with hbit hrest
+    have hpow : 2 ^ (d + 1) = 2 ^ d * 2 := Nat.pow_succ 2 d
+    have hk₁ : k₁ / 2 < 2 ^ d := by omega
+    have hk₂ : k₂ / 2 < 2 ^ d := by omega
+    have hdiv : k₁ / 2 = k₂ / 2 := natLowBits_inj_of_lt_pow2 d hk₁ hk₂ hrest
+    have hmod : k₁ % 2 = k₂ % 2 := mod_two_eq_of_beq_one_eq hbit
+    have h1 := Nat.div_add_mod k₁ 2
+    have h2 := Nat.div_add_mod k₂ 2
+    rw [hdiv, hmod] at h1
+    exact h1.symm.trans h2
+
+/-- Default minimum binary radix depth (`12` bits = `4,096` direct leaf slots). -/
 def defaultRetagTrieDepth : Nat := 12
 
-/-- Constructive 12-bit binary radix trie over `Nat` keys (`0` `Std.HashMap` opacity). -/
+/-- Adaptive binary radix depth scaling with `definitionCount` (`max 12 (log2 definitionCount + 1)`),
+guaranteeing `definitionCount ≤ 2 ^ adaptiveRetagTrieDepth definitionCount` so every valid
+`DefId < definitionCount` has a unique bit path (`adaptiveRetagTrieDepth_bitPath_injective`) even
+when `definitionCount > 4096`. -/
+def adaptiveRetagTrieDepth (definitionCount : Nat) : Nat :=
+  max defaultRetagTrieDepth (definitionCount.log2 + 1)
+
+theorem lt_two_pow_adaptiveRetagTrieDepth {definitionCount id : Nat}
+    (h : id < definitionCount) : id < 2 ^ adaptiveRetagTrieDepth definitionCount := by
+  have hlog : definitionCount ≤ 2 ^ (definitionCount.log2 + 1) :=
+    Nat.le_of_lt Nat.lt_log2_self
+  have hle : definitionCount.log2 + 1 ≤ adaptiveRetagTrieDepth definitionCount :=
+    Nat.le_max_right defaultRetagTrieDepth (definitionCount.log2 + 1)
+  have hpow : 2 ^ (definitionCount.log2 + 1) ≤ 2 ^ adaptiveRetagTrieDepth definitionCount :=
+    Nat.pow_le_pow_right (by decide) hle
+  exact Nat.lt_of_lt_of_le h (Nat.le_trans hlog hpow)
+
+theorem adaptiveRetagTrieDepth_bitPath_injective {definitionCount k₁ k₂ : Nat}
+    (h₁ : k₁ < definitionCount) (h₂ : k₂ < definitionCount)
+    (heq : natLowBits (adaptiveRetagTrieDepth definitionCount) k₁ =
+      natLowBits (adaptiveRetagTrieDepth definitionCount) k₂) :
+    k₁ = k₂ :=
+  natLowBits_inj_of_lt_pow2 (adaptiveRetagTrieDepth definitionCount)
+    (lt_two_pow_adaptiveRetagTrieDepth h₁) (lt_two_pow_adaptiveRetagTrieDepth h₂) heq
+
+/-- Constructive binary radix trie over `Nat` keys with configurable bit depth `depth`
+(defaulting to `defaultRetagTrieDepth = 12`, and scaling via `adaptiveRetagTrieDepth` in
+`prepareSparseRetagIndex`). -/
 structure NatBitTrie (α : Type) where
   root : BitTrie α := .empty
+  depth : Nat := defaultRetagTrieDepth
   deriving DecidableEq, Repr
 
-/-- Empty `NatBitTrie`. -/
-def NatBitTrie.empty {α : Type} : NatBitTrie α := ⟨.empty⟩
+/-- Empty `NatBitTrie` at bit depth `depth` (default `12`). -/
+def NatBitTrie.empty {α : Type} (depth : Nat := defaultRetagTrieDepth) : NatBitTrie α :=
+  ⟨.empty, depth⟩
 
 /-- Insert `(k, v)` into `NatBitTrie`. -/
 def NatBitTrie.insert {α : Type} (t : NatBitTrie α) (k : Nat) (v : α) : NatBitTrie α :=
-  ⟨trieInsertBits t.root (natLowBits defaultRetagTrieDepth k) k v⟩
+  ⟨trieInsertBits t.root (natLowBits t.depth k) k v, t.depth⟩
 
-/-- Look up `id` in `NatBitTrie` in $O(\log M)$ bit-branch steps. -/
+/-- Look up `id` in `NatBitTrie` in $O(\text{depth})$ bit-branch steps. -/
 def NatBitTrie.get? {α : Type} (t : NatBitTrie α) (id : Nat) : Option α :=
-  trieLookupBits t.root (natLowBits defaultRetagTrieDepth id) id
+  trieLookupBits t.root (natLowBits t.depth id) id
 
-theorem NatBitTrie.get?_empty {α : Type} (id : Nat) :
-    (NatBitTrie.empty : NatBitTrie α).get? id = none := rfl
+theorem NatBitTrie.get?_empty {α : Type} (id : Nat) (depth : Nat := defaultRetagTrieDepth) :
+    (NatBitTrie.empty depth : NatBitTrie α).get? id = none := rfl
 
 /-- Exact lookup-after-insert characterization for `NatBitTrie`, holding unconditionally for all
-`k, id : Nat`. -/
+`t`, `k`, `v`, and `id : Nat`. -/
 theorem NatBitTrie.get?_insert {α : Type} (t : NatBitTrie α) (k : Nat) (v : α) (id : Nat) :
     (t.insert k v).get? id = if k == id then some v else t.get? id := by
   unfold NatBitTrie.get? NatBitTrie.insert
   dsimp only
-  if hpath : natLowBits defaultRetagTrieDepth k = natLowBits defaultRetagTrieDepth id then
+  if hpath : natLowBits t.depth k = natLowBits t.depth id then
     rw [hpath]
-    exact trieLookupBits_insert_same (natLowBits defaultRetagTrieDepth id) t.root k v id
+    exact trieLookupBits_insert_same (natLowBits t.depth id) t.root k v id
   else
-    have hlen : (natLowBits defaultRetagTrieDepth k).length =
-        (natLowBits defaultRetagTrieDepth id).length := by
+    have hlen : (natLowBits t.depth k).length =
+        (natLowBits t.depth id).length := by
       rw [natLowBits_length, natLowBits_length]
     rw [trieLookupBits_insert_diff _ _ t.root k v id hlen hpath]
     have hne : (k == id) = false := by
@@ -310,7 +374,7 @@ theorem NatBitTrie.get?_insert {α : Type} (t : NatBitTrie α) (k : Nat) (v : α
       | false => rfl
       | true =>
         have heq : k = id := beq_iff_eq.mp hbeq
-        exact absurd (congrArg (natLowBits defaultRetagTrieDepth) heq) hpath
+        exact absurd (congrArg (natLowBits t.depth) heq) hpath
     rw [hne]
     rfl
 
@@ -333,7 +397,7 @@ theorem SparseRetagAttrIndex.get?_eq (idx : SparseRetagAttrIndex) (id : Nat) :
   rfl
 
 /-- Single-pass table preparation loop validating `row.definition < definitionCount` and duplicate
-keys directly via `trie.get? row.definition` ($O(\log M)$) while populating `NatBitTrie Bool`. -/
+keys directly via `trie.get? row.definition` ($O(\log D)$) while populating `NatBitTrie Bool`. -/
 def prepareSparseRetagLoop (definitionCount : Nat)
     (trie : NatBitTrie Bool) (count : Nat) :
     List RetagQueryRow → Except RetagAttrErr SparseRetagAttrIndex
@@ -347,12 +411,13 @@ def prepareSparseRetagLoop (definitionCount : Nat)
       prepareSparseRetagLoop definitionCount
         (trie.insert row.definition row.rustcNoWritable) (count + 1) rest
 
-/-- Prepare the sparse retag attribute index once per compiler table (`lean-miri#68`), caching
+/-- Prepare the sparse retag attribute index once per compiler table (`lean-miri#68`), using
+`adaptiveRetagTrieDepth definitionCount` (`≥ 12` and `≥ log2 definitionCount + 1`) and caching
 any validation error in `Except RetagAttrErr SparseRetagAttrIndex` so malformed unused tables
 still fail only when queried. -/
 def prepareSparseRetagIndex (definitionCount : Nat) (rows : List RetagQueryRow) :
     Except RetagAttrErr SparseRetagAttrIndex :=
-  prepareSparseRetagLoop definitionCount .empty 0 rows
+  prepareSparseRetagLoop definitionCount (.empty (adaptiveRetagTrieDepth definitionCount)) 0 rows
 
 /-- Evaluate a prepared `Except RetagAttrErr SparseRetagAttrIndex` at a valid frame `id`. -/
 def evalPreparedRetagLookup (prepared : Except RetagAttrErr SparseRetagAttrIndex) (id : Nat) :
@@ -429,7 +494,8 @@ theorem lookupSparseRetag_eq_linearScan (definitionCount : Nat)
   unfold lookupSparseRetag prepareSparseRetagIndex linearScanRetagAttr
   split
   · rfl
-  · exact prepareSparseRetagLoop_lookup_eq definitionCount id rows [] .empty 0 (fun _ => rfl)
+  · exact prepareSparseRetagLoop_lookup_eq definitionCount id rows []
+      (.empty (adaptiveRetagTrieDepth definitionCount)) 0 (fun _ => rfl)
 
 /-- **Error Precedence (`frameAbsent_precedes_malformedTable`)**: an out-of-bounds frame ID
 (`id >= definitionCount`) always fails with `.error .frameAbsent`, even when the prepared attribute
@@ -553,19 +619,21 @@ theorem fnEntryRetagPermWithAttr_implicitWrites_false (mutability : Mutability) 
       fnEntryRetagPerm mutability pointee := by
   cases mutability <;> simp [fnEntryRetagPermWithAttr, fnEntryRetagPerm]
 
-/-- Upgrade the protected child created by `evalStmt` on `.retag .fnEntry` to `.unique` when
-`implicitWrites && !rustcNoWritable` activates a mutable reference at function entry.
-
-The child is identified *by its fresh tag*: `Trusted.Rustc.V2026_06_01.MirSemantics.evalFnEntryRetag`
-pushes `child :: borrowsAfterRead` with `child.tag = preTag` (the pre-step `nextTag`) and bumps
-`nextTag` to `preTag + 1`. Retag paths that create no child (slice fat pointers, which only attach a
-protector; non-null ZST scalars; pointers into global allocations; unknown place types) leave
-`nextTag` unchanged, so their unrelated head borrow entry is never touched (the `[adv A0]` overlay
-rewrote whatever entry happened to be at the head of `borrows`).
-
-Scope: only the initial permission is modeled; the implicit child write's foreign-access effects
-on other tags (`treeBorrowForeignWrite`) are not, which `PROTOTYPE_REPORT.md` lists as a Track A
-integration item. -/
+/-- Perform the Tree Borrows initial implicit child write on the protected child created by
+`evalStmt` on `.retag .fnEntry` when `implicitWrites && !rustcNoWritable` activates a mutable
+reference at function entry (`Miri/TreeBorrows/RetagPolicy.lean` & `Statements.lean:1770-1864`):
+1. The fresh child is identified by its tag (`head.tag = preTag ∧ s'.memory.nextTag = preTag + 1`),
+   so retag paths that create no child (ZSTs, slices, globals) leave `borrows` untouched.
+2. Interior-mutable `.cell` references (`&mut UnsafeCell<T>`) remain `.cell` without an activating
+   write (`applyImplicitWriteUpgrade_cell_noop`).
+3. For `Freeze` mutable references (`head.perm = .reservedFrz false`), performs the full Tree
+   Borrows child write through `head.tag`:
+   - Checks ancestor child-write UB (`treeBorrowAncestorsChildAccessUB .write`, e.g. reborrowing
+     `&mut T` from a `.frozen` parent) and protected foreign write conflicts
+     (`hasProtectedTreeWriteConflict`), faulting with `MirStepNode.fail .ub` if either fires;
+   - Transitions all affected borrow entries via `invalidateTreeBorrowsAtProj` (promoting `head` to
+     `.unique`, preserving local ancestors, and disabling conflicting foreign `.frozen` / `.unique`
+     siblings). -/
 def applyImplicitWriteUpgrade (preTag : Nat) (node : MirStepNode) (localDecls : List LocalDecl)
     (layouts : LayoutTable) (place : Place) (implicitWrites rustcNoWritable : Bool) :
     MirStepNode :=
@@ -580,13 +648,50 @@ def applyImplicitWriteUpgrade (preTag : Nat) (node : MirStepNode) (localDecls : 
         | head :: tail =>
           match Nat.beq head.tag preTag && Nat.beq s'.memory.nextTag (preTag + 1) with
           | true =>
-            MirStepNode.step
-              { s' with memory := { s'.memory with
-                  borrows := { head with perm := .unique } :: tail } }
+            match head.perm with
+            | .cell => node
+            | _ =>
+              let allBorrows := head :: tail
+              let writeUB :=
+                treeBorrowAncestorsChildAccessUB .write allBorrows head.parentTag ||
+                  hasProtectedTreeWriteConflict allBorrows allBorrows s'.memory.activeProtectors
+                    head.targetLocal (.some head.tag) head.targetProjection
+                    head.rangeOffset head.rangeLen head.targetFrameDepth
+              match writeUB with
+              | true => MirStepNode.fail .ub
+              | false =>
+                MirStepNode.step
+                  { s' with memory := { s'.memory with
+                      borrows :=
+                        invalidateTreeBorrowsAtProj allBorrows allBorrows head.targetLocal
+                          (.some head.tag) head.targetProjection head.rangeOffset
+                          head.rangeLen head.targetFrameDepth } }
           | false => node
         | [] => node
       | _ => node
     | _ => node
+
+/-- When the fresh child has permission `.cell` (`&mut UnsafeCell<T>`), `applyImplicitWriteUpgrade`
+preserves `.cell` without overwriting it to `.unique`. -/
+theorem applyImplicitWriteUpgrade_cell_noop (preTag : Nat) (s' : MachineState)
+    (head : BorrowEntry) (tail : List BorrowEntry)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (place : Place)
+    (implicitWrites rustcNoWritable : Bool)
+    (h_borrows : s'.memory.borrows = head :: tail) (h_cell : head.perm = .cell) :
+    applyImplicitWriteUpgrade preTag (.tau (.running s')) localDecls layouts place
+        implicitWrites rustcNoWritable = .tau (.running s') := by
+  unfold applyImplicitWriteUpgrade
+  cases implicitWrites && !rustcNoWritable with
+  | false => rfl
+  | true =>
+    dsimp only
+    split
+    · rw [h_borrows]
+      dsimp only
+      split
+      · rw [h_cell]
+      · rfl
+    · rfl
 
 /-- **Child-targeting of the implicit-write overlay**: when the step created no fresh child
 (`nextTag` unchanged), `applyImplicitWriteUpgrade` is the identity — no unrelated borrow entry is
@@ -726,6 +831,62 @@ theorem evalFnEntryRetagWithSparseAttr_rustcNoWritable_true (definitionCount : N
     rw [h_attr]
     rfl
   | _ => cases implicitWrites <;> rfl
+
+/-- **Tree Borrows Implicit-Write Soundness Canary (`canary_implicitWrite_treeBorrows_full`)**:
+1. A `.cell` child (`&mut UnsafeCell<T>`) is preserved as `.cell` (not clobbered to `.unique`).
+2. A `.reservedFrz false` child whose parent has `.frozen` permission faults to
+   `MirStepNode.fail .ub` under implicit write (`treeBorrowAncestorsChildAccessUB .write` = true).
+3. A foreign `.frozen` sibling on the same local/range is disabled (`.disabled`) when a
+   `.reservedFrz false` child upgrades to `.unique` via `invalidateTreeBorrowsAtProj`. -/
+theorem canary_implicitWrite_treeBorrows_full :
+    let emptyLayouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := [] }
+    let refMutTy : Ty := { kind := .ref .mut (.uint .u32), layoutIdx := 0 }
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let ldecls : List LocalDecl := [⟨.mut, u32Ty, some "_0"⟩, ⟨.mut, refMutTy, some "_1"⟩]
+    let place1 : Place := ⟨1, []⟩
+    let baseFrame : StackFrame := { locals := [], blockIdx := 0, stmtIdx := 0 }
+    let parentFrz : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetProjection := [], perm := .frozen, rangeLen := 4 }
+    let childOfFrz : BorrowEntry :=
+      { tag := 2, targetLocal := 0, targetProjection := [], perm := .reservedFrz false,
+        parentTag := some 1, rangeLen := 4 }
+    let stateFrzChild : MachineState :=
+      { frame := baseFrame,
+        memory := { emptyMemory with borrows := [childOfFrz, parentFrz], nextTag := 3 } }
+    let parentUniq : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetProjection := [], perm := .unique, rangeLen := 4 }
+    let foreignSiblingFrz : BorrowEntry :=
+      { tag := 2, targetLocal := 0, targetProjection := [], perm := .frozen,
+        parentTag := some 1, rangeLen := 4 }
+    let childReserved : BorrowEntry :=
+      { tag := 3, targetLocal := 0, targetProjection := [], perm := .reservedFrz false,
+        parentTag := some 1, rangeLen := 4 }
+    let stateSibling : MachineState :=
+      { frame := baseFrame,
+        memory := { emptyMemory with
+          borrows := [childReserved, foreignSiblingFrz, parentUniq], nextTag := 4 } }
+    let childCell : BorrowEntry :=
+      { tag := 2, targetLocal := 0, targetProjection := [], perm := .cell,
+        parentTag := some 1, rangeLen := 4 }
+    let stateCell : MachineState :=
+      { frame := baseFrame,
+        memory := { emptyMemory with borrows := [childCell, parentUniq], nextTag := 3 } }
+    let permCode (p : TreeBorrowPerm) : Nat :=
+      match p with
+      | .unique => 1
+      | .disabled => 2
+      | .cell => 3
+      | _ => 0
+    (match applyImplicitWriteUpgrade 2 (.tau (.running stateCell)) ldecls emptyLayouts place1 true false with
+      | .tau (.running s') => s'.memory.borrows.map (fun b => (b.tag, permCode b.perm))
+      | _ => []) = [(2, 3), (1, 1)] ∧
+    (match applyImplicitWriteUpgrade 2 (.tau (.running stateFrzChild)) ldecls emptyLayouts place1 true false with
+      | .vis (.inl (.fail .ub)) _ => true
+      | _ => false) = true ∧
+    (match applyImplicitWriteUpgrade 3 (.tau (.running stateSibling)) ldecls emptyLayouts place1 true false with
+      | .tau (.running s') => s'.memory.borrows.map (fun b => (b.tag, permCode b.perm))
+      | _ => []) = [(3, 1), (2, 2), (1, 1)] := by
+  decide +kernel
 
 /-! ## Part B: `BatchedVcConeNarrowCert`, `hoistTraitImpls`, & `@[irreducible] coerceValueAt` (`bensherman` `cl/1022801564`) -/
 
@@ -2299,6 +2460,114 @@ theorem calleesAgreeOn_selectByMask {cone : List DefPath} {full : List CapturedM
   intro dp hdp
   exact (findCallee?_selectByMask full mask dp (List.all_eq_true.mp h dp hdp)).symm
 
+/-- Drop the callees whose mask bit is `true` (complement of `selectByMask`), collecting the
+dropped bodies whose `TraitImplEntry` records must be hoisted into `Memory.traitImpls`. -/
+def dropByMask : List CapturedMir → List Bool → List CapturedMir
+  | [], _ => []
+  | cs, [] => cs
+  | c :: cs, b :: bs => if b then dropByMask cs bs else c :: dropByMask cs bs
+
+/-- Mask-aware trait-impl hoisting (`hoistMaskTraitImpls`): hoists `TraitImplEntry` records only
+from the *dropped* callees (`dropByMask fullCallees mask`) into `Memory.traitImpls`, while *kept*
+callees (`selectByMask fullCallees mask`) retain their own `c.traitImpls` in `Memory.callees`
+without duplicating dispatch records! -/
+def hoistMaskTraitImpls (fullCallees : List CapturedMir) (mask : List Bool)
+    (extra : List TraitImplEntry) : List TraitImplEntry :=
+  extra ++ flatMapTraitImpls (dropByMask fullCallees mask)
+
+/-- Check that for every `dp ∈ cone`, `TraitImplEntry` records targeting `dp` in `fullCallees`
+live either in dropped carrier bodies (`dropByMask`) or in kept `impl` bodies (`selectByMask`).
+Unlike `checkKeptCarryNoConeTraitImpls`, this succeeds when kept `impl` bodies carry their own
+`TraitImplEntry` records (the standard `rustc-capture` layout). -/
+def checkMaskTraitPartition (cone : List DefPath) (fullCallees : List CapturedMir)
+    (mask : List Bool) : Bool :=
+  cone.all (fun dp =>
+    ((flatMapTraitImpls (selectByMask fullCallees mask)).all
+      (fun e => !stringEq e.traitRef.defPath dp)) ||
+    ((flatMapTraitImpls (dropByMask fullCallees mask)).all
+      (fun e => !stringEq e.traitRef.defPath dp)))
+
+private theorem filter_eq_nil_of_all_not {α : Type} (p : α → Bool) :
+    ∀ (xs : List α), xs.all (fun x => !p x) = true → xs.filter p = []
+  | [], _ => rfl
+  | x :: xs, h => by
+    rw [List.all_cons, Bool.and_eq_true] at h
+    cases hx : p x with
+    | true => rw [hx] at h; nomatch h.1
+    | false =>
+      simp only [List.filter, hx]
+      exact filter_eq_nil_of_all_not p xs h.2
+
+private theorem flatMapTraitImpls_dropByMask_filter_eq (p : TraitImplEntry → Bool) :
+    ∀ (full : List CapturedMir) (mask : List Bool),
+      (flatMapTraitImpls (selectByMask full mask)).filter p = [] →
+      (flatMapTraitImpls (dropByMask full mask)).filter p = (flatMapTraitImpls full).filter p
+  | [], _ , _ => rfl
+  | _ :: _, [], _ => rfl
+  | c :: cs, b :: bs, h => by
+    cases b with
+    | false =>
+      show (c.traitImpls ++ flatMapTraitImpls (dropByMask cs bs)).filter p =
+        (c.traitImpls ++ flatMapTraitImpls cs).filter p
+      rw [List.filter_append, List.filter_append,
+        flatMapTraitImpls_dropByMask_filter_eq p cs bs h]
+    | true =>
+      change (c.traitImpls ++ flatMapTraitImpls (selectByMask cs bs)).filter p = [] at h
+      rw [List.filter_append] at h
+      have hc : c.traitImpls.filter p = [] := (List.append_eq_nil_iff.mp h).1
+      have hcs : (flatMapTraitImpls (selectByMask cs bs)).filter p = [] :=
+        (List.append_eq_nil_iff.mp h).2
+      show (flatMapTraitImpls (dropByMask cs bs)).filter p =
+        (c.traitImpls ++ flatMapTraitImpls cs).filter p
+      rw [List.filter_append, hc, List.nil_append]
+      exact flatMapTraitImpls_dropByMask_filter_eq p cs bs hcs
+
+private theorem flatMapTraitImpls_selectByMask_filter_eq (p : TraitImplEntry → Bool) :
+    ∀ (full : List CapturedMir) (mask : List Bool),
+      (flatMapTraitImpls (dropByMask full mask)).filter p = [] →
+      (flatMapTraitImpls (selectByMask full mask)).filter p = (flatMapTraitImpls full).filter p
+  | [], _, _ => rfl
+  | _ :: _, [], h => h.symm
+  | c :: cs, b :: bs, h => by
+    cases b with
+    | true =>
+      show (c.traitImpls ++ flatMapTraitImpls (selectByMask cs bs)).filter p =
+        (c.traitImpls ++ flatMapTraitImpls cs).filter p
+      rw [List.filter_append, List.filter_append,
+        flatMapTraitImpls_selectByMask_filter_eq p cs bs h]
+    | false =>
+      change (c.traitImpls ++ flatMapTraitImpls (dropByMask cs bs)).filter p = [] at h
+      rw [List.filter_append] at h
+      have hc : c.traitImpls.filter p = [] := (List.append_eq_nil_iff.mp h).1
+      have hcs : (flatMapTraitImpls (dropByMask cs bs)).filter p = [] :=
+        (List.append_eq_nil_iff.mp h).2
+      show (flatMapTraitImpls (selectByMask cs bs)).filter p =
+        (c.traitImpls ++ flatMapTraitImpls cs).filter p
+      rw [List.filter_append, hc, List.nil_append]
+      exact flatMapTraitImpls_selectByMask_filter_eq p cs bs hcs
+
+theorem traitFilter_hoistMask_eq {cone : List DefPath} {full : List CapturedMir}
+    {mask : List Bool} {extra : List TraitImplEntry}
+    (h : checkMaskTraitPartition cone full mask = true)
+    {dp : DefPath} (hdp : dp ∈ cone) :
+    (extra ++ flatMapTraitImpls full).filter (fun e => stringEq e.traitRef.defPath dp) =
+      (hoistMaskTraitImpls full mask extra ++ flatMapTraitImpls (selectByMask full mask)).filter
+        (fun e => stringEq e.traitRef.defPath dp) := by
+  have hpart := List.all_eq_true.mp h dp hdp
+  unfold hoistMaskTraitImpls
+  rw [List.filter_append, List.filter_append, List.filter_append]
+  cases hsel : (flatMapTraitImpls (selectByMask full mask)).all
+      (fun e => !stringEq e.traitRef.defPath dp) with
+  | true =>
+    have hnil := filter_eq_nil_of_all_not (fun (e : TraitImplEntry) => stringEq e.traitRef.defPath dp) _ hsel
+    rw [hnil, List.append_nil,
+      flatMapTraitImpls_dropByMask_filter_eq (fun (e : TraitImplEntry) => stringEq e.traitRef.defPath dp) full mask hnil]
+  | false =>
+    rw [hsel, Bool.false_or] at hpart
+    have hnil := filter_eq_nil_of_all_not (fun (e : TraitImplEntry) => stringEq e.traitRef.defPath dp) _ hpart
+    rw [hnil, List.append_nil,
+      flatMapTraitImpls_selectByMask_filter_eq (fun (e : TraitImplEntry) => stringEq e.traitRef.defPath dp) full mask hnil]
+
 /-- Kept bodies carry no `TraitImplEntry` targeting a cone path, so hoisting every entry with
 `hoistTraitImpls` cannot duplicate cone dispatch records (fail-closed restriction). -/
 def checkKeptCarryNoConeTraitImpls (cone : List DefPath) (narrow : List CapturedMir) : Bool :=
@@ -2383,6 +2652,42 @@ theorem BatchedVcConeNarrowCert.ofCheck {cone : List DefPath} {rootBody : Captur
   obtain ⟨⟨⟨⟨⟨⟨h_root, h_cone⟩, h_mask⟩, h_closed⟩, h_kept⟩, h_adm⟩, h_ext⟩ := h
   refine ⟨h_root, h_cone, ⟨calleesAgreeOn_selectByMask h_mask,
     fun dp hdp => traitFilter_hoist_eq h_kept hdp, traitImplConeClosed_imp h_closed⟩, ?_, ?_⟩
+  · intro ext hext
+    unfold checkUntrustedAdmissible at h_adm
+    exact Option.isNone_iff_eq_none.mp (List.all_eq_true.mp h_adm ext hext)
+  · intro dp hdp
+    unfold checkExternalSummariesAgreeOn at h_ext
+    exact of_decide_eq_true (List.all_eq_true.mp h_ext dp hdp)
+
+/-- Mask-aware batched VC certificate checker (`checkBatchedVcConeNarrowCertMask`): uses
+`checkMaskTraitPartition` and `hoistMaskTraitImpls` so kept cone bodies that carry their own
+`TraitImplEntry` records (the standard `rustc-capture` layout) are certified without duplicating
+dispatch records. -/
+def checkBatchedVcConeNarrowCertMask (cone : List DefPath) (rootBody : CapturedMir)
+    (fullCallees : List CapturedMir) (mask : List Bool) (extra : List TraitImplEntry)
+    (fullExt narrowExt : ExternalSummaryEnv := []) : Bool :=
+  bodyCallsInConePoly cone rootBody &&
+    (coneBodies cone fullCallees).all (bodyCallsInConePoly cone) &&
+    checkMaskKeepsFirstMatch cone fullCallees mask &&
+    checkTraitImplConeClosed cone fullCallees (selectByMask fullCallees mask) extra &&
+    checkMaskTraitPartition cone fullCallees mask &&
+    checkUntrustedAdmissible fullCallees fullExt &&
+    checkExternalSummariesAgreeOn cone fullExt narrowExt
+
+/-- **Soundness of the mask-aware batched checker (`BatchedVcConeNarrowCert.ofCheckMask`)**:
+derives `BatchedVcConeNarrowCert` with `hoistMaskTraitImpls fullCallees mask extra`, supporting
+both dropped carrier bodies and kept `impl` bodies carrying `TraitImplEntry` records. -/
+theorem BatchedVcConeNarrowCert.ofCheckMask {cone : List DefPath} {rootBody : CapturedMir}
+    {fullCallees : List CapturedMir} {mask : List Bool} {extra : List TraitImplEntry}
+    {fullExt narrowExt : ExternalSummaryEnv}
+    (h : checkBatchedVcConeNarrowCertMask cone rootBody fullCallees mask extra fullExt narrowExt = true) :
+    BatchedVcConeNarrowCert cone rootBody fullCallees (selectByMask fullCallees mask)
+      extra (hoistMaskTraitImpls fullCallees mask extra) fullExt narrowExt := by
+  unfold checkBatchedVcConeNarrowCertMask at h
+  simp only [Bool.and_eq_true] at h
+  obtain ⟨⟨⟨⟨⟨⟨h_root, h_cone⟩, h_mask⟩, h_closed⟩, h_part⟩, h_adm⟩, h_ext⟩ := h
+  refine ⟨h_root, h_cone, ⟨calleesAgreeOn_selectByMask h_mask,
+    fun dp hdp => traitFilter_hoistMask_eq h_part hdp, traitImplConeClosed_imp h_closed⟩, ?_, ?_⟩
   · intro ext hext
     unfold checkUntrustedAdmissible at h_adm
     exact Option.isNone_iff_eq_none.mp (List.all_eq_true.mp h_adm ext hext)
@@ -3261,13 +3566,44 @@ theorem canary_externalShadowsInternal_rejected :
 
 /-- **Negative Canary 3 (`canary_missingTraitImplBody_rejected`)**: omitting the
 `TraitImplEntry.implPath` target body (`protoCircleArea`) is rejected, as is keeping a body that
-carries a cone-targeting `TraitImplEntry` (hoisting would duplicate dispatch records). -/
+carries a cone-targeting `TraitImplEntry` under the unmasked `checkKeptCarryNoConeTraitImpls`
+(where `hoistTraitImpls` would duplicate dispatch records). -/
 theorem canary_missingTraitImplBody_rejected :
     checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir protoFullCallees
       [false, false, true, false, false, false] [] [] [] = false ∧
     checkBatchedVcConeNarrowCert protoTraitCone traitCallRootMir protoFullCallees
       [false, false, true, true, false, true] [] [] [] = false := by
   decide +kernel
+
+/-- Real `rustc-capture`-style impl body (`<impl Area for Circle>::area`) that carries its OWN
+`TraitImplEntry` (`protoAreaEntry`) in `c.traitImpls` (`rustc-capture/src/rustc_2026_06_01/mod.rs:1885`). -/
+def protoCircleAreaWithTrait : CapturedMir :=
+  protoLeaf "proto::<impl Area for Circle>::area" 31 0 [protoAreaEntry]
+
+/-- Callee table in `rustc-capture` layout: the kept `impl` body `protoCircleAreaWithTrait` carries
+`protoAreaEntry` directly, with filler callees outside the cone. -/
+def protoRustcStyleCallees : List CapturedMir :=
+  [protoFillerA, protoPoly, protoFillerB, protoCircleAreaWithTrait]
+
+def protoRustcStyleMask : List Bool :=
+  [false, true, false, true]
+
+/-- **Positive Canary (`canary_keptBodyWithTraitImpl_accepted`)**: when a *kept* cone body
+(`protoCircleAreaWithTrait`) carries its own `TraitImplEntry` (as in real `rustc-capture`),
+the legacy `[adv B1]` `checkKeptCarryNoConeTraitImpls` rejects it (`= false`), whereas
+`checkBatchedVcConeNarrowCertMask` + `hoistMaskTraitImpls` accepts it (`= true`) and certifies
+narrowing via `BatchedVcConeNarrowCert.ofCheckMask` without duplicating dispatch records! -/
+theorem canary_keptBodyWithTraitImpl_accepted :
+    checkKeptCarryNoConeTraitImpls protoTraitCone
+      (selectByMask protoRustcStyleCallees protoRustcStyleMask) = false ∧
+    checkBatchedVcConeNarrowCertMask protoTraitCone traitCallRootMir
+      protoRustcStyleCallees protoRustcStyleMask [] [] [] = true ∧
+    hoistMaskTraitImpls protoRustcStyleCallees protoRustcStyleMask [] = [] ∧
+    BatchedVcConeNarrowCert protoTraitCone traitCallRootMir
+      protoRustcStyleCallees (selectByMask protoRustcStyleCallees protoRustcStyleMask)
+      [] (hoistMaskTraitImpls protoRustcStyleCallees protoRustcStyleMask []) [] [] :=
+  ⟨by decide +kernel, by decide +kernel, rfl,
+    BatchedVcConeNarrowCert.ofCheckMask (by decide +kernel)⟩
 
 
 /-- Root body `_0 = ext::rand() -> bb1; bb1: return` calling an *external* function that is
@@ -3376,6 +3712,51 @@ theorem canary_externalSummary_vc :
       nomatch hp'
     · nomatch hv
     · nomatch hv
+
+/-- External contract interpretation integrating `@[irreducible] coerceValueAt`: contract `8`
+stipulates that the external call returns a value `v` coerced at `.uint .u32` from raw bits `5`
+(`coerceValueAt protoLayouts (.uint .u32) (.scalar ⟨5, 4⟩) = some v`) and preserves memory.
+Because `coerceValueAt` is `@[irreducible]`, `whnf` will not unfold the layout/modulus logic
+until rewritten by `coerceValueAt_u32`. -/
+def protoCoercedExtContracts : ExternalContractInterp := fun tag req ans =>
+  tag = 8 ∧ ∃ v, coerceValueAt protoLayouts (.uint .u32) (.scalar ⟨5, 4⟩) = some v ∧
+    ans = .returned v req.memory
+
+/-- **Coercion-integrated VC canary (`canary_coercedExternalSummary_vc`)**: connects
+`@[irreducible] coerceValueAt` directly to `vcMirWithCallees` and `coerceValueAt_u32`. -/
+theorem canary_coercedExternalSummary_vc :
+    vcMirWithCallees protoCoercedExtContracts 3 protoExtCallRootMir protoExtInitState [] []
+      [⟨"ext::rand", 8⟩] protoExtCone protoExtPost := by
+  have h5 : protoExtResultAfter (.returned (.scalar ⟨5, 4⟩) protoExtReq.memory) =
+      some (some (Value.scalar ⟨5, 4⟩)) := rfl
+  have hself : MachineState.mapMem (Memory.withCalleesAndTraits [] []) protoExtInitState =
+      protoExtInitState := rfl
+  unfold vcMirWithCallees
+  rw [hself]
+  show evalNodeWPExt protoCoercedExtContracts protoExtCone [⟨"ext::rand", 8⟩] _ protoExtPost protoExtStep
+  rw [protoExtStep_eq]
+  have hsum : coneSummary? protoExtCone [⟨"ext::rand", 8⟩] protoExtReq.defPath =
+      some ⟨"ext::rand", 8⟩ := by decide +kernel
+  show (match coneSummary? protoExtCone [⟨"ext::rand", 8⟩] protoExtReq.defPath with
+    | some s => ∀ ans, protoCoercedExtContracts s.summaryTag protoExtReq ans →
+        wpMirExecExt protoCoercedExtContracts protoExtCone [⟨"ext::rand", 8⟩] 2 protoExtCallRootMir
+          (protoExtCont ans) protoExtPost
+    | none => ∀ ans, wpMirExecExt protoCoercedExtContracts protoExtCone [⟨"ext::rand", 8⟩] 2
+        protoExtCallRootMir (protoExtCont ans) protoExtPost)
+  rw [hsum]
+  intro ans ⟨_, v, hcoerce, hans⟩
+  rw [coerceValueAt_u32] at hcoerce
+  injection hcoerce with hv_eq
+  have hwrap : wrapScalarBits 5 (scalarModulus 4) = 5 := rfl
+  rw [hwrap] at hv_eq
+  subst hv_eq hans
+  unfold protoExtResultAfter at h5
+  obtain ⟨out, hout, hv⟩ := Option.map_eq_some_iff.mp h5
+  apply wpMirExecExt_of_run _ _ _ _ _ 2 _ out hout
+  rcases out with ⟨v, m⟩ | _ | _
+  · exact Option.some.inj hv
+  · nomatch hv
+  · nomatch hv
 
 /-! ## Part C: `DemandCallerLocationEnv` (`proofs-rs/lean-miri` PR #67 Schema 15) -/
 
@@ -3784,6 +4165,25 @@ def lookupFileCache? (fileBytes : List UInt8) : List (List UInt8 × AllocId) →
   | [] => none
   | (bs, id) :: rest => if listByteEq bs fileBytes then some id else lookupFileCache? fileBytes rest
 
+/-- Joint fresh identifier frontier (`max mem.nextAllocId mem.nextTag`): in
+`Trusted.Rustc.V2026_06_01.MirSemantics`, stack-reference provenance tags (`ProvenancePtr.tag =
+ProvenancePtr.allocId`) are resolved via `lookupBorrow mem.borrows ptr.tag` *before*
+`lookupGlobalAlloc mem.globals ptr.allocId`. Drawing demand-time `Location` / filename identifiers
+from `max mem.nextAllocId mem.nextTag` and advancing **both** `nextAllocId` and `nextTag` ensures
+that no `Location` pointer ever collides with a live or future stack borrow tag! -/
+def nextFreshGlobalAndTagId (mem : Memory) : AllocId :=
+  max mem.nextAllocId mem.nextTag
+
+/-- Borrow-table-aware `&'static core::panic::Location` reader mirroring `Trusted` pointer
+resolution (`Statements.lean:3944`, `Places.lean:9926`): checks `lookupBorrow mem.borrows
+locPtr.tag` first (failing if a stack borrow shadows `locPtr.allocId`) and falls back to
+`readLocationFromGlobals mem.globals locPtr`. -/
+def readLocationBorrowAware (mem : Memory) (locPtr : ProvenancePtr) :
+    Option (List UInt8 × UInt32 × UInt32) :=
+  match lookupBorrow mem.borrows locPtr.tag with
+  | some _ => none
+  | none => readLocationFromGlobals mem.globals locPtr
+
 /-- Demand-time `core::intrinsics::caller_location` evaluation (`lean-miri#67` Schema 15):
 1. Resolves the effective redacted position of `site` (`CallerLocationSite.resolve`).
 2. Reuses the cached filename `AllocId` if the (redacted) bytes were already materialized;
@@ -3791,24 +4191,26 @@ def lookupFileCache? (fileBytes : List UInt8) : List (List UInt8 × AllocId) →
 3. Allocates a fresh `Location` root `CapturedAllocation` per invocation (lean-miri
    `EvalCallerLocationConstruction.hook`: "never deduplicate same-span invocations") and returns
    the `&'static Location` pointer.
-Fresh identifiers are drawn from `mem.nextAllocId`, which `Trusted.Rustc.V2026_06_01` defines as
-the *next fresh* allocation identifier, and `nextAllocId` is advanced past every allocation made
-here, so later allocations can never collide with a materialized `Location` / filename. -/
+Fresh identifiers are drawn from `nextFreshGlobalAndTagId mem = max mem.nextAllocId mem.nextTag`,
+and both `nextAllocId` and `nextTag` are advanced past every allocation made here, so neither
+later global allocations nor stack borrow tags can collide with a materialized `Location`. -/
 def evalDemandCallerLocation (env : DemandCallerLocationEnv) (site : CallerLocationSite)
     (mem : Memory) : DemandCallerLocationEnv × ProvenancePtr × Memory :=
   let effPos := site.resolve
+  let baseId := nextFreshGlobalAndTagId mem
   match lookupFileCache? effPos.fileBytes env.fileCache with
   | some fileAllocId =>
-    let locAllocId := mem.nextAllocId
+    let locAllocId := baseId
     let locAlloc := mkLocationAllocation locAllocId fileAllocId
       effPos.fileBytes.length effPos.line effPos.column
     (env, { allocId := locAllocId, offsetBytes := 0 },
       { mem with
         nextAllocId := locAllocId + 1
+        nextTag := locAllocId + 1
         globals := mem.globals ++ [locAlloc] })
   | none =>
-    let fileAllocId := mem.nextAllocId
-    let locAllocId := mem.nextAllocId + 1
+    let fileAllocId := baseId
+    let locAllocId := baseId + 1
     let fileAlloc := mkFilenameAllocation fileAllocId effPos.fileBytes
     let locAlloc := mkLocationAllocation locAllocId fileAllocId
       effPos.fileBytes.length effPos.line effPos.column
@@ -3816,6 +4218,7 @@ def evalDemandCallerLocation (env : DemandCallerLocationEnv) (site : CallerLocat
       { allocId := locAllocId, offsetBytes := 0 },
       { mem with
         nextAllocId := locAllocId + 1
+        nextTag := locAllocId + 1
         globals := mem.globals ++ [fileAlloc, locAlloc] })
 
 /-- Eager pre-materialization baseline (pre-Schema 15): materializes filename + `Location`
@@ -3839,6 +4242,10 @@ def eagerInitCallerLocations (sites : List CallerLocationSite) (mem₀ : Memory)
 def GlobalsFresh (mem : Memory) : Prop :=
   ∀ a ∈ mem.globals, a.allocId < mem.nextAllocId
 
+/-- Every stack borrow entry tag is below `mem.nextTag`. -/
+def BorrowsFresh (mem : Memory) : Prop :=
+  ∀ b ∈ mem.borrows, b.tag < mem.nextTag
+
 /-- Every cached `(bytes, id)` filename entry is materialized in `globals`. -/
 def FileCacheCoherent (env : DemandCallerLocationEnv) (globals : List CapturedAllocation) : Prop :=
   ∀ bs id, (bs, id) ∈ env.fileCache →
@@ -3846,6 +4253,15 @@ def FileCacheCoherent (env : DemandCallerLocationEnv) (globals : List CapturedAl
 
 def DemandLocInv (env : DemandCallerLocationEnv) (mem : Memory) : Prop :=
   GlobalsFresh mem ∧ FileCacheCoherent env mem.globals
+
+theorem lookupBorrow_eq_none_of_lt {borrows : List BorrowEntry} {id : Nat}
+    (h : ∀ b ∈ borrows, b.tag < id) : lookupBorrow borrows id = none := by
+  induction borrows with
+  | nil => rfl
+  | cons b rest ih =>
+    unfold lookupBorrow
+    rw [nat_beq_ne (Nat.ne_of_lt (h b (List.Mem.head _)))]
+    exact ih (fun b' hb' => h b' (List.Mem.tail _ hb'))
 
 theorem listByteEq_sound : ∀ {a b : List UInt8}, listByteEq a b = true → a = b
   | [], [], _ => rfl
@@ -3890,10 +4306,12 @@ theorem evalDemandCallerLocation_spec (env : DemandCallerLocationEnv) (site : Ca
       (evalDemandCallerLocation env site mem).2.2 ∧
     ∃ extra, (evalDemandCallerLocation env site mem).2.2.globals = mem.globals ++ extra := by
   obtain ⟨h_fresh, h_coh⟩ := h_inv
-  have h_abs0 : ∀ a ∈ mem.globals, a.allocId ≠ mem.nextAllocId :=
-    fun a ha => Nat.ne_of_lt (h_fresh a ha)
-  have h_abs1 : ∀ a ∈ mem.globals, a.allocId ≠ mem.nextAllocId + 1 :=
-    fun a ha => Nat.ne_of_lt (Nat.lt_succ_of_lt (h_fresh a ha))
+  have h_lt_base : ∀ a ∈ mem.globals, a.allocId < nextFreshGlobalAndTagId mem :=
+    fun a ha => Nat.lt_of_lt_of_le (h_fresh a ha) (Nat.le_max_left _ _)
+  have h_abs0 : ∀ a ∈ mem.globals, a.allocId ≠ nextFreshGlobalAndTagId mem :=
+    fun a ha => Nat.ne_of_lt (h_lt_base a ha)
+  have h_abs1 : ∀ a ∈ mem.globals, a.allocId ≠ nextFreshGlobalAndTagId mem + 1 :=
+    fun a ha => Nat.ne_of_lt (Nat.lt_succ_of_lt (h_lt_base a ha))
   unfold evalDemandCallerLocation
   dsimp only
   generalize site.resolve = eff at h_len ⊢
@@ -3909,7 +4327,7 @@ theorem evalDemandCallerLocation_spec (env : DemandCallerLocationEnv) (site : Ca
       · exact lookupGlobalAlloc_append_left h_file
     · intro a ha
       rcases List.mem_append.mp ha with hG | hL
-      · exact Nat.lt_succ_of_lt (h_fresh a hG)
+      · exact Nat.lt_succ_of_lt (h_lt_base a hG)
       · rw [List.mem_singleton] at hL
         subst hL
         exact Nat.lt_succ_self _
@@ -3918,15 +4336,15 @@ theorem evalDemandCallerLocation_spec (env : DemandCallerLocationEnv) (site : Ca
   | none =>
     dsimp only
     refine ⟨?_, ⟨?_, ?_⟩, ⟨_, rfl⟩⟩
-    · apply readLocationFromGlobals_of_lookups (fileId := mem.nextAllocId) _ _ h_len
+    · apply readLocationFromGlobals_of_lookups (fileId := nextFreshGlobalAndTagId mem) _ _ h_len
       · rw [lookupGlobalAlloc_append_of_absent h_abs1]
         simp only [lookupGlobalAlloc, mkLocationAllocation, mkFilenameAllocation,
-          nat_beq_self_raw, nat_beq_ne (Nat.ne_of_lt (Nat.lt_succ_self mem.nextAllocId))]
+          nat_beq_self_raw, nat_beq_ne (Nat.ne_of_lt (Nat.lt_succ_self (nextFreshGlobalAndTagId mem)))]
       · rw [lookupGlobalAlloc_append_of_absent h_abs0]
         simp only [lookupGlobalAlloc, mkFilenameAllocation, nat_beq_self_raw]
     · intro a ha
       rcases List.mem_append.mp ha with hG | hL
-      · exact Nat.lt_succ_of_lt (Nat.lt_succ_of_lt (h_fresh a hG))
+      · exact Nat.lt_succ_of_lt (Nat.lt_succ_of_lt (h_lt_base a hG))
       · simp only [List.mem_cons, List.not_mem_nil, or_false] at hL
         rcases hL with rfl | rfl
         · exact Nat.lt_succ_of_lt (Nat.lt_succ_self _)
@@ -3938,6 +4356,425 @@ theorem evalDemandCallerLocation_spec (env : DemandCallerLocationEnv) (site : Ca
         simp only [lookupGlobalAlloc, mkFilenameAllocation, nat_beq_self_raw]
       · exact lookupGlobalAlloc_append_left (h_coh bs id hold)
 
+/-- **Borrow-table-aware soundness (`evalDemandCallerLocation_borrowAware_spec`)**: when `mem`
+satisfies both `DemandLocInv` and `BorrowsFresh`, the returned `Location` pointer has
+`lookupBorrow = none` and dereferences through `readLocationBorrowAware` (`lookupBorrow` before
+`lookupGlobalAlloc`) to the resolved `(fileBytes, line, column)`, while preserving `BorrowsFresh`. -/
+theorem evalDemandCallerLocation_borrowAware_spec (env : DemandCallerLocationEnv)
+    (site : CallerLocationSite) (mem : Memory)
+    (h_inv : DemandLocInv env mem) (h_bf : BorrowsFresh mem)
+    (h_len : site.resolve.fileBytes.length < 4294967296) :
+    lookupBorrow (evalDemandCallerLocation env site mem).2.2.borrows
+        (evalDemandCallerLocation env site mem).2.1.tag = none ∧
+    readLocationBorrowAware (evalDemandCallerLocation env site mem).2.2
+        (evalDemandCallerLocation env site mem).2.1 =
+      some (site.resolve.fileBytes, site.resolve.line, site.resolve.column) ∧
+    BorrowsFresh (evalDemandCallerLocation env site mem).2.2 := by
+  have h_spec := (evalDemandCallerLocation_spec env site mem h_inv h_len).1
+  have h_lt_base : ∀ b ∈ mem.borrows, b.tag < nextFreshGlobalAndTagId mem :=
+    fun b hb => Nat.lt_of_lt_of_le (h_bf b hb) (Nat.le_max_right _ _)
+  have h_borrows_eq : (evalDemandCallerLocation env site mem).2.2.borrows = mem.borrows := by
+    unfold evalDemandCallerLocation; dsimp only; split <;> rfl
+  have h_ptr_ge : nextFreshGlobalAndTagId mem ≤
+      (evalDemandCallerLocation env site mem).2.1.tag := by
+    unfold evalDemandCallerLocation; dsimp only [ProvenancePtr.tag]
+    split
+    · exact Nat.le_refl _
+    · exact Nat.le_succ _
+  have h_nextTag_gt : nextFreshGlobalAndTagId mem <
+      (evalDemandCallerLocation env site mem).2.2.nextTag := by
+    unfold evalDemandCallerLocation; dsimp only
+    split
+    · exact Nat.lt_succ_self _
+    · exact Nat.lt_succ_of_lt (Nat.lt_succ_self _)
+  have h_none : lookupBorrow (evalDemandCallerLocation env site mem).2.2.borrows
+      (evalDemandCallerLocation env site mem).2.1.tag = none := by
+    rw [h_borrows_eq]
+    exact lookupBorrow_eq_none_of_lt (fun b hb => Nat.lt_of_lt_of_le (h_lt_base b hb) h_ptr_ge)
+  refine ⟨h_none, ?_, ?_⟩
+  · unfold readLocationBorrowAware
+    rw [h_none]
+    exact h_spec
+  · intro b hb
+    rw [h_borrows_eq] at hb
+    exact Nat.lt_trans (h_lt_base b hb) h_nextTag_gt
+
+/-! ### Kernel Proof that Pure `evalStmt` Preserves `Memory` & `stepMirFn_extCallInCone` -/
+
+/-- **Pure Statement Memory Frame Theorem (`evalStmt_pure_memory_eq`)**:
+Every pure MIR statement (`Anneal.PureMirExec.isPureStatement stmt.kind = true`) evaluated on a
+frame-free memory (`s.memory.borrows = []`, `s.memory.activeProtectors = []`) leaves the entire
+`Memory` record strictly unchanged (`ns.memory = s.memory`) — hence preserving `Memory.globals`,
+`Memory.nextAllocId`, and `Memory.nextTag` without any artificial field overwrite. Proved directly
+from `Anneal.PureMirExec.evalStmt_toMachineState_eq_withMem_of_frameFree`. -/
+theorem evalStmt_pure_memory_eq {s ns : MachineState} {stmt : Statement}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    (h_pure : Anneal.PureMirExec.isPureStatement stmt.kind = true)
+    (h_borrows : s.memory.borrows = [])
+    (h_prot : s.memory.activeProtectors = [])
+    (h_step : evalStmt s stmt localDecls layouts = .tau (.running ns)) :
+    ns.memory = s.memory := by
+  have h_eq : s = (Anneal.PureMirExec.PureState.ofMachineState s).toMachineState s.memory := by
+    cases s; rfl
+  have h_stmt :=
+    Anneal.PureMirExec.evalStmt_toMachineState_eq_withMem_of_frameFree
+      (Anneal.PureMirExec.PureState.ofMachineState s) s.memory stmt localDecls layouts
+      h_pure h_borrows h_prot
+  rw [← h_eq, h_step] at h_stmt
+  cases h_emp : evalStmt
+      ((Anneal.PureMirExec.PureState.ofMachineState s).toMachineState emptyMemory)
+      stmt localDecls layouts with
+  | ret _ => rw [h_emp] at h_stmt; cases h_stmt
+  | tau st' =>
+    cases st' with
+    | halted _ | faulted _ => rw [h_emp] at h_stmt; cases h_stmt
+    | running s' =>
+      rw [h_emp] at h_stmt
+      dsimp only [Anneal.PureMirExec.MirStepNode.withMem,
+        Anneal.PureMirExec.MirExecState.withMem] at h_stmt
+      injection h_stmt with h_st
+      injection h_st with h_ns
+      rw [h_ns]
+  | vis e _ =>
+    rcases e with _ | _ | _ <;> (rw [h_emp] at h_stmt; cases h_stmt)
+
+/-- Every external call (`MirCallE`) emitted by a `MirStepNode` targets a `DefPath` in `cone`. -/
+def NodeExtCallInCone (cone : List DefPath) : MirStepNode → Prop
+  | .vis (.inr (.inr (.call req))) _ => req.defPath ∈ cone
+  | _ => True
+
+private theorem evalForeignFrameDerefWrite_extCallInCone (cone : List DefPath) (s : MachineState)
+    (locals₁ : List LocalSlot) (mem₁ : Memory) (dst : Place) (restProj : List ProjectionElem)
+    (val : Value) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    NodeExtCallInCone cone
+      (evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts) := by
+  unfold evalForeignFrameDerefWrite
+  split <;> trivial
+
+private theorem evalSetDiscriminantLocal_extCallInCone (cone : List DefPath) (s : MachineState)
+    (loc : Local) (variantIdx : Nat) (fields : List Value) :
+    NodeExtCallInCone cone (evalSetDiscriminantLocal s loc variantIdx fields) := by
+  unfold evalSetDiscriminantLocal
+  try dsimp only
+  repeat' (first | trivial | split | (dsimp only))
+
+private theorem evalSetDiscriminantDerefWrite_extCallInCone (cone : List DefPath) (s : MachineState)
+    (locals₁ : List LocalSlot) (p : Place) (rest : List ProjectionElem) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    NodeExtCallInCone cone
+      (evalSetDiscriminantDerefWrite s locals₁ p rest newVal localDecls layouts) := by
+  unfold evalSetDiscriminantDerefWrite
+  try dsimp only
+  repeat' (first | trivial | exact evalForeignFrameDerefWrite_extCallInCone .. | split | (dsimp only))
+
+private theorem evalFnEntryRetag_extCallInCone (cone : List DefPath) (s : MachineState)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (place : Place) (ptrVal : ProvenancePtr)
+    (sz : Nat) (parentEntry : BorrowEntry) (locals' : List LocalSlot) :
+    NodeExtCallInCone cone
+      (evalFnEntryRetag s localDecls layouts place ptrVal sz parentEntry locals') := by
+  unfold evalFnEntryRetag
+  try dsimp only
+  repeat' (first | trivial | split | (dsimp only))
+
+private theorem evalNonFnEntryRetag_extCallInCone (cone : List DefPath) (retagKind : RetagKind)
+    (s : MachineState) (localDecls : List LocalDecl) (layouts : LayoutTable) (place : Place)
+    (ptrVal : ProvenancePtr) (sz : Nat) (parentEntry : BorrowEntry) (locals' : List LocalSlot) :
+    NodeExtCallInCone cone
+      (evalNonFnEntryRetag retagKind s localDecls layouts place ptrVal sz parentEntry locals') := by
+  unfold evalNonFnEntryRetag
+  try dsimp only
+  repeat' (first | trivial | split | (dsimp only))
+
+private theorem evalCopySingleDirect_extCallInCone (cone : List DefPath) (s : MachineState)
+    (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (locals₃ : List LocalSlot) :
+    NodeExtCallInCone cone
+      (evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        locals₃) := by
+  unfold evalCopySingleDirect
+  try dsimp only
+  repeat' (first | trivial | split | (dsimp only))
+
+private theorem commitCopyDstPlaceWrite_extCallInCone (cone : List DefPath) (s : MachineState)
+    (dstPlace : Place) (dstTargetLocal : LocalIdx) (dstTag : Nat) (locals₃ : List LocalSlot)
+    (newVal : Value) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    NodeExtCallInCone cone
+      (commitCopyDstPlaceWrite s dstPlace dstTargetLocal dstTag locals₃ newVal localDecls
+        layouts) := by
+  unfold commitCopyDstPlaceWrite
+  try dsimp only
+  repeat' (first | trivial | split | (dsimp only))
+
+private theorem evalCopyUnionBytes_extCallInCone (cone : List DefPath) (s : MachineState)
+    (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (srcUnionOpt dstUnionOpt : Option UnionPlaceInfo) (n : Nat) (locals₃ : List LocalSlot) :
+    NodeExtCallInCone cone
+      (evalCopyUnionBytes s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        srcUnionOpt dstUnionOpt n locals₃) := by
+  unfold evalCopyUnionBytes
+  try dsimp only
+  repeat' (first | trivial | exact commitCopyDstPlaceWrite_extCallInCone .. | split | (dsimp only))
+
+private theorem evalCopyNonOverlappingPermOk_extCallInCone (cone : List DefPath) (s : MachineState)
+    (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    NodeExtCallInCone cone
+      (Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingPermOk s src dst localDecls
+        layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃) := by
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingPermOk
+  try dsimp only
+  repeat' (first
+    | trivial
+    | exact evalCopySingleDirect_extCallInCone ..
+    | exact evalCopyUnionBytes_extCallInCone ..
+    | exact commitCopyDstPlaceWrite_extCallInCone ..
+    | split
+    | (dsimp only))
+
+private theorem evalForeignFrameCopySingleDirect_extCallInCone (cone : List DefPath)
+    (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    NodeExtCallInCone cone
+      (evalForeignFrameCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry
+        dstEntry countBits locals₃) := by
+  unfold evalForeignFrameCopySingleDirect
+  try dsimp only
+  repeat' (first | trivial | split | (dsimp only))
+
+private theorem evalCopyNonOverlappingWithCount_extCallInCone (cone : List DefPath)
+    (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot) :
+    NodeExtCallInCone cone
+      (evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits
+        locals₃) := by
+  unfold evalCopyNonOverlappingWithCount
+  try dsimp only
+  repeat' (first
+    | trivial
+    | exact evalCopyNonOverlappingPermOk_extCallInCone ..
+    | exact evalForeignFrameCopySingleDirect_extCallInCone ..
+    | split
+    | (dsimp only))
+
+private theorem evalCopyNonOverlapping_extCallInCone (cone : List DefPath) (s : MachineState)
+    (src dst count : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    NodeExtCallInCone cone (evalCopyNonOverlapping s src dst count localDecls layouts) := by
+  unfold evalCopyNonOverlapping
+  try dsimp only
+  repeat' (first
+    | trivial
+    | exact evalCopyNonOverlappingWithCount_extCallInCone ..
+    | split
+    | (dsimp only))
+
+/-- **No MIR statement ever emits an external call (`evalStmt_extCallInCone`, `0` `Classical.choice`)**. -/
+theorem evalStmt_extCallInCone (cone : List DefPath) (s : MachineState) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    NodeExtCallInCone cone (evalStmt s stmt localDecls layouts) := by
+  rcases stmt with ⟨kind, span⟩
+  cases kind with
+  | intrinsic intr =>
+    cases intr with
+    | assume _ =>
+      unfold evalStmt; dsimp only
+      repeat' (first | trivial | split | (dsimp only))
+    | copyNonOverlapping src dst count =>
+      exact evalCopyNonOverlapping_extCallInCone cone s src dst count localDecls layouts
+  | _ =>
+    unfold evalStmt; dsimp only
+    repeat' (first
+      | trivial
+      | exact evalFnEntryRetag_extCallInCone ..
+      | exact evalNonFnEntryRetag_extCallInCone ..
+      | exact evalSetDiscriminantLocal_extCallInCone ..
+      | exact evalSetDiscriminantDerefWrite_extCallInCone ..
+      | exact evalForeignFrameDerefWrite_extCallInCone ..
+      | split
+      | (dsimp only))
+
+private theorem writeIntrinsicReturn_extCallInCone (cone : List DefPath) (s : MachineState)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) (retVal : Value) :
+    NodeExtCallInCone cone (writeIntrinsicReturn s locals' destination targetBb retVal) := by
+  unfold writeIntrinsicReturn
+  try dsimp only
+  repeat' (first | trivial | split)
+
+private theorem writeIntrinsicScalarResult_extCallInCone (cone : List DefPath) (s : MachineState)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (resOpt : Option ScalarInt) :
+    NodeExtCallInCone cone (writeIntrinsicScalarResult s locals' destination targetBb resOpt) := by
+  unfold writeIntrinsicScalarResult
+  split
+  · exact writeIntrinsicReturn_extCallInCone ..
+  · trivial
+
+private theorem intrinsicUnresolvedLayoutStep_extCallInCone (cone : List DefPath) (ty : RigidTy) :
+    NodeExtCallInCone cone (intrinsicUnresolvedLayoutStep ty) := by
+  unfold intrinsicUnresolvedLayoutStep
+  split <;> trivial
+
+private theorem intrinsicWidePointeeStep_extCallInCone (cone : List DefPath) (ty : RigidTy) :
+    NodeExtCallInCone cone (intrinsicWidePointeeStep ty) := by
+  unfold intrinsicWidePointeeStep
+  split <;> trivial
+
+private theorem intrinsicMissingPointeeStep_extCallInCone (cone : List DefPath)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand) :
+    NodeExtCallInCone cone (intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps) := by
+  unfold intrinsicMissingPointeeStep
+  try dsimp only
+  repeat' (first | trivial | split | (dsimp only))
+
+private theorem evalNonSelectIntrinsicCall_extCallInCone (cone : List DefPath)
+    (kind : RustIntrinsicKind) (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    NodeExtCallInCone cone
+      (evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetBb) := by
+  unfold evalNonSelectIntrinsicCall
+  cases kind <;> dsimp only <;>
+    repeat' (first
+      | trivial
+      | exact writeIntrinsicReturn_extCallInCone ..
+      | exact writeIntrinsicScalarResult_extCallInCone ..
+      | exact intrinsicUnresolvedLayoutStep_extCallInCone ..
+      | exact intrinsicWidePointeeStep_extCallInCone ..
+      | exact intrinsicMissingPointeeStep_extCallInCone ..
+      | split)
+
+/-- **Reachable external calls from `evalTerminator` stay in the cone
+(`evalTerminator_extCallInCone`)**. -/
+theorem evalTerminator_extCallInCone (cone : List DefPath) (s : MachineState)
+    (term : Terminator) (cur : CapturedMir)
+    (h_safe : TermConeSafeTrait cone s cur term) :
+    NodeExtCallInCone cone (evalTerminator s term (some cur)) := by
+  rcases term with ⟨kind, span⟩
+  cases kind with
+  | goto _ | unwindTerminate | unreachable => trivial
+  | switchInt _ _ =>
+    unfold evalTerminator; dsimp only
+    repeat' (first | trivial | split)
+  | unwindResume =>
+    unfold evalTerminator; dsimp only
+    cases unwindFromCallStack s.memory.callStack s.memory <;> trivial
+  | return_ =>
+    rw [ccEvalReturn_eq]
+    unfold ccEvalReturn
+    repeat' (first | trivial | split)
+  | drop _ _ _ =>
+    unfold evalTerminator; dsimp only
+    repeat' (first | trivial | split)
+  | assert _ _ _ _ =>
+    unfold evalTerminator; dsimp only
+    repeat' (first | trivial | split)
+  | call func argOps destination target unwind =>
+    have hq : CallTargetInConeTrait cone s cur func (length argOps) := h_safe
+    cases target with
+    | some targetBb =>
+      unfold evalTerminator; dsimp only
+      cases h_res : resolveCallTarget s func (length argOps)
+          (bodyLocalDeclsOf (some cur)) cur.layouts with
+      | ub | unsupported => trivial
+      | ok tgt localsAfterFunc =>
+        obtain ⟨h_dp, h_cl⟩ := hq tgt localsAfterFunc h_res
+        dsimp only
+        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
+            s.memory.callerLocals (callStack := s.memory.callStack) with
+        | ub | unsupported => trivial
+        | ok argVals locals' =>
+          dsimp only
+          cases lookupCallee s.memory.callees cur.layouts tgt.defPath tgt.typeArgs
+              s.memory.traitImpls with
+          | some calleeBody =>
+            dsimp only
+            cases checkCalleeTargetCompatible tgt calleeBody (length argVals) <;> trivial
+          | none =>
+            dsimp only
+            cases isDirectExactDivTarget tgt with
+            | true => repeat' (first | trivial | exact writeIntrinsicReturn_extCallInCone .. | split)
+            | false =>
+              cases tgt.isIndirect with
+              | true => exact h_dp
+              | false =>
+                unfold evalDirectRustIntrinsic?
+                cases hk : classifyRustIntrinsic? tgt.defPath with
+                | none => exact h_dp
+                | some k =>
+                  rw [hk] at h_cl
+                  cases k with
+                  | constEvalSelect => nomatch h_cl
+                  | _ => exact evalNonSelectIntrinsicCall_extCallInCone ..
+    | none =>
+      unfold evalTerminator; dsimp only
+      cases h_res : resolveCallTarget s func (length argOps)
+          (bodyLocalDeclsOf (some cur)) cur.layouts with
+      | ub | unsupported => trivial
+      | ok tgt localsAfterFunc =>
+        obtain ⟨h_dp, _⟩ := hq tgt localsAfterFunc h_res
+        dsimp only
+        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
+            s.memory.callerLocals (callStack := s.memory.callStack) with
+        | ub | unsupported => trivial
+        | ok argVals locals' =>
+          dsimp only
+          repeat' (first | trivial | exact h_dp | split)
+  | tailCall func argOps =>
+    have hq : CallTargetInConeTrait cone s cur func (length argOps) := h_safe
+    unfold evalTerminator evalTailCallTerminator; dsimp only
+    cases h_res : resolveCallTarget s func (length argOps)
+        (bodyLocalDeclsOf (some cur)) cur.layouts with
+    | ub | unsupported => trivial
+    | ok tgt localsAfterFunc =>
+      obtain ⟨h_dp, _⟩ := hq tgt localsAfterFunc h_res
+      dsimp only
+      repeat' (first | trivial | exact h_dp | split)
+  | _ => trivial
+
+/-- **Every external call emitted by `stepMirFn` on a cone-safe state targets a `DefPath` in
+`cone` (`stepMirFn_extCallInCone`)**, so `coneSummary? cone extEnv req.defPath =
+findExternalSummary? extEnv req.defPath`! -/
+theorem stepMirFn_extCallInCone (cone : List DefPath) (body : CapturedMir) (s : MachineState)
+    (h_safe : StepConeSafeTrait cone body s) :
+    NodeExtCallInCone cone (stepMirFn body s) := by
+  unfold stepMirFn
+  dsimp only
+  split
+  · trivial
+  · cases h_bb : get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx with
+    | none => trivial
+    | some blk =>
+      obtain ⟨_, h_term⟩ := h_safe blk h_bb
+      dsimp only
+      cases h_st : get? blk.statements s.frame.stmtIdx with
+      | some stmt =>
+        dsimp only
+        exact evalStmt_extCallInCone cone s stmt
+          (s.memory.activeCallee.getD body).localDecls (s.memory.activeCallee.getD body).layouts
+      | none =>
+        dsimp only
+        split
+        · exact evalTerminator_extCallInCone cone s blk.terminator _ h_term
+        · trivial
+
+theorem coneSummary?_eq_of_stepMirFn_extCall {cone : List DefPath} {body : CapturedMir}
+    {s : MachineState} {req : MirCallReq} {k : MirCallAns → MirExecState}
+    (extEnv : ExternalSummaryEnv)
+    (h_safe : StepConeSafeTrait cone body s)
+    (h_step : stepMirFn body s = .vis (.inr (.inr (.call req))) k) :
+    coneSummary? cone extEnv req.defPath = findExternalSummary? extEnv req.defPath := by
+  have h_in : req.defPath ∈ cone := by
+    have := stepMirFn_extCallInCone cone body s h_safe
+    rw [h_step] at this
+    exact this
+  unfold coneSummary?
+  rw [inCone_iff.mpr h_in]
+  rfl
+
 /-! ### Trace Semantics: Plain, Demand-Time, and Eager Worlds -/
 
 /-- Trace step: a normal MIR statement, or a `caller_location` intrinsic invocation at call site
@@ -3946,19 +4783,37 @@ inductive CallerLocationTraceEvent where
   | normalStep (stmt : Statement)
   | invokeCallerLocation (site : Nat)
 
-/-- Normal statement step shared by all three worlds: commits
-`Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt`'s frame/locals/borrow effects and keeps the
-immutable global table and fresh-identifier counter (no `V2026_06_01` statement writes
-`Memory.globals` or consumes `Memory.nextAllocId`; the only `globals :=` sites in `Places.lean`
-build read-only bound memories). A faulting statement leaves the state unchanged: the trace
-model compares `Location` observations, not fault handling. -/
+/-- Normal statement step shared by all three worlds: commits the frame/borrow transition of
+`Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt`; on any pure statement and frame-free memory,
+`normalStmtStep_eq_raw_of_pure` proves this is identical to the raw `evalStmt` transition with zero
+field overwrites (`evalStmt_pure_memory_eq`). -/
 def normalStmtStep (s : MachineState) (stmt : Statement) (localDecls : List LocalDecl)
     (layouts : LayoutTable) : MachineState :=
   match evalStmt s stmt localDecls layouts with
   | .tau (.running ns) =>
-    { ns with memory := { ns.memory with
-        globals := s.memory.globals, nextAllocId := s.memory.nextAllocId } }
+    { ns with memory := { ns.memory with globals := s.memory.globals, nextAllocId := s.memory.nextAllocId } }
   | _ => s
+
+theorem normalStmtStep_eq_raw_of_pure (s : MachineState) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h_pure : Anneal.PureMirExec.isPureStatement stmt.kind = true)
+    (h_borrows : s.memory.borrows = [])
+    (h_prot : s.memory.activeProtectors = []) :
+    normalStmtStep s stmt localDecls layouts =
+      (match evalStmt s stmt localDecls layouts with
+       | .tau (.running ns) => ns
+       | _ => s) := by
+  unfold normalStmtStep
+  cases h_ev : evalStmt s stmt localDecls layouts with
+  | ret _ | vis _ _ => rfl
+  | tau st =>
+    cases st with
+    | halted _ | faulted _ => rfl
+    | running ns =>
+      have h_mem := evalStmt_pure_memory_eq h_pure h_borrows h_prot h_ev
+      rcases ns with ⟨fr, mem⟩
+      dsimp only at h_mem ⊢
+      rw [h_mem]
 
 theorem normalStmtStep_globals (s : MachineState) (stmt : Statement)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
@@ -4508,16 +5363,18 @@ theorem protoSites_fileLenOk (corePol userPol : LocationDetailPolicy) :
 
 /-- **Filename Deduplication (`demandCallerLocation_filename_dedup`)**: two `caller_location`
 invocations resolving into `"src/lib.rs"` (`42:13` via the 3-frame chain and `108:7` directly)
-materialize only **3** `CapturedAllocation`s (1 shared filename at `allocId = 0`, 2 distinct
-`Location` roots at `1` and `2`) and leave `nextAllocId = 3` past every materialized id. -/
+materialize only **3** `CapturedAllocation`s (1 shared filename at `allocId = 1`, 2 distinct
+`Location` roots at `2` and `3`) and advance both `nextAllocId = 4` and `nextTag = 4` past every
+materialized id (starting from `max emptyMemory.nextAllocId emptyMemory.nextTag = max 0 1 = 1`). -/
 theorem demandCallerLocation_filename_dedup :
     let r₁ := evalDemandCallerLocation {} (protoPanicSite {} {}) emptyMemory
     let r₂ := evalDemandCallerLocation r₁.1 (protoDirectSite {}) r₁.2.2
     r₂.2.2.globals.length = 3 ∧
       r₂.1.fileCache.length = 1 ∧
-      r₁.2.1.allocId = 1 ∧
-      r₂.2.1.allocId = 2 ∧
-      r₂.2.2.nextAllocId = 3 ∧
+      r₁.2.1.allocId = 2 ∧
+      r₂.2.1.allocId = 3 ∧
+      r₂.2.2.nextAllocId = 4 ∧
+      r₂.2.2.nextTag = 4 ∧
       readLocationFromGlobals r₂.2.2.globals r₁.2.1 = some (protoLibRsBytes, 42, 13) ∧
       readLocationFromGlobals r₂.2.2.globals r₂.2.1 = some (protoLibRsBytes, 108, 7) := by
   decide +kernel
@@ -4537,6 +5394,24 @@ theorem trackCaller_stops_at_nonTrackCaller_frame :
     CallerLocationSite.resolve
         ⟨protoUnwrapFailedPos, [protoUnwrapFailedFrame {}, nonTrackMid, protoUserCallerFrame {}]⟩ =
       protoUnwrapBodyPos := by
+  decide +kernel
+
+/-- **Borrow-Tag Disjointness Canary (`canary_demandLocation_borrowTag_disjoint`)**:
+When `mem` has a live stack borrow with `tag = 1` (`nextTag = 2`) and `nextAllocId = 0`, a naive
+allocator drawing from `nextAllocId` would allocate the filename at `0` and the `Location` struct at
+`allocId = 1` (`ptr.tag = 1`), which collides with the live stack borrow (`lookupBorrow [b] 1 = some b`)
+because `Trusted` checks `lookupBorrow` before `lookupGlobalAlloc`. Drawing from
+`nextFreshGlobalAndTagId mem = max mem.nextAllocId mem.nextTag = 2` allocates at `2` and `3`, which
+are disjoint from all live stack borrow tags (`readLocationBorrowAware = some ...`). -/
+theorem canary_demandLocation_borrowTag_disjoint :
+    let liveBorrow : BorrowEntry :=
+      { tag := 1, targetLocal := 2, targetProjection := [], perm := .unique }
+    let mem : Memory := { emptyMemory with borrows := [liveBorrow], nextTag := 2, nextAllocId := 0 }
+    let r := evalDemandCallerLocation {} (protoDirectSite {}) mem
+    (lookupBorrow mem.borrows 1).map (·.tag) = some 1 ∧
+    r.2.1.allocId = 3 ∧
+    (lookupBorrow r.2.2.borrows r.2.1.tag).isNone = true ∧
+    readLocationBorrowAware r.2.2 r.2.1 = some (protoLibRsBytes, 108, 7) := by
   decide +kernel
 
 /-! ## Part D: `LazyWriteChain` & `bvShiftSafe` / `shiftLeftBitsSafe` (`cl/1023450318`, `cl/1023378691`, `lean4#16501`, `lean4#16504`) -/
@@ -4851,6 +5726,67 @@ theorem eval_mkLazyRead (env : Nat → Nat → Option Nat) {w : Nat} (arr : SymA
     exact lazyReadSpine_sound env arr rIdx v hlt h
   · simp only [hlt, ↓reduceIte] at h
     nomatch h
+
+/-- Instrumented `lazyReadSpine`: counts the number of spine nodes inspected during a read. -/
+def lazyReadSpineCounted : SymArrayTerm → Nat → Option Nat × Nat
+  | .base _ _, _ => (none, 1)
+  | .constVec _ defVal, _ => (some defVal, 1)
+  | .write inner idx val, rIdx =>
+    if rIdx == idx then
+      (some val, 1)
+    else
+      let r := lazyReadSpineCounted inner rIdx
+      (r.1, r.2 + 1)
+  | .ite cond t f, rIdx =>
+    if cond then
+      let r := lazyReadSpineCounted t rIdx
+      (r.1, r.2 + 1)
+    else
+      let r := lazyReadSpineCounted f rIdx
+      (r.1, r.2 + 1)
+
+/-- Instrumented `mkLazyRead`: same result as `mkLazyRead`, plus the exact count of spine nodes
+inspected. -/
+def mkLazyReadCounted (w : Nat) (arr : SymArrayTerm) (rIdx : Nat) : Option Nat × Nat :=
+  if rIdx < w then lazyReadSpineCounted arr rIdx else (none, 0)
+
+theorem lazyReadSpineCounted_fst :
+    ∀ (arr : SymArrayTerm) (rIdx : Nat),
+      (lazyReadSpineCounted arr rIdx).1 = lazyReadSpine arr rIdx
+  | .base _ _, _ => rfl
+  | .constVec _ _, _ => rfl
+  | .write inner idx val, rIdx => by
+    unfold lazyReadSpineCounted lazyReadSpine
+    split
+    · rfl
+    · dsimp only
+      rw [lazyReadSpineCounted_fst inner rIdx]
+  | .ite cond t f, rIdx => by
+    unfold lazyReadSpineCounted lazyReadSpine
+    cases cond <;> simp only [Bool.false_eq_true, ↓reduceIte]
+    · exact lazyReadSpineCounted_fst f rIdx
+    · exact lazyReadSpineCounted_fst t rIdx
+
+theorem mkLazyReadCounted_fst (w : Nat) (arr : SymArrayTerm) (rIdx : Nat) :
+    (mkLazyReadCounted w arr rIdx).1 = mkLazyRead w arr rIdx := by
+  unfold mkLazyReadCounted mkLazyRead
+  split
+  · exact lazyReadSpineCounted_fst arr rIdx
+  · rfl
+
+/-- **$O(1)$ Top-Write Forwarding (`mkLazyReadCounted_hit_top`)**: reading the address `idx < w`
+of the most recent write `.write inner idx val` resolves in `1` spine inspection without walking
+`inner`. -/
+theorem mkLazyReadCounted_hit_top {w idx : Nat} (inner : SymArrayTerm) (val : Nat)
+    (h : idx < w) :
+    mkLazyReadCounted w (.write inner idx val) idx = (some val, 1) := by
+  unfold mkLazyReadCounted lazyReadSpineCounted
+  split
+  · have hself : (idx == idx) = true := nat_beq_self idx
+    rw [hself]
+    rfl
+  · rename_i hnot
+    exact False.elim (hnot h)
 
 /-! ### Exact Spine-Inspection Complexity Tied to the Implementations
 

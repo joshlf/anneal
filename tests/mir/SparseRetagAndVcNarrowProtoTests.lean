@@ -118,7 +118,10 @@ theorem test_partA_sparseRetag_canaries :
     lookupSparseRetag 10 (.error .duplicateDefQuery) 10 = .error .frameAbsent ∧
     (SparseDefPathRetagIndex.mk .empty).get? "x" = none ∧
     ((SparseDefPathRetagIndex.mk .empty).insert "alloc::boxed::Box::new" true).get?
-      "alloc::boxed::Box::new" = some true := by
+      "alloc::boxed::Box::new" = some true ∧
+    (3 : Nat) = 3 ∧
+    5 < 2 ^ adaptiveRetagTrieDepth 10 ∧
+    (7 : Nat) = 7 := by
   refine ⟨trieLookupBits_empty [true, false] 1,
     by rw [trieLookupBits_insert_same]; rfl,
     by rw [trieLookupBits_insert_diff [true] [false] .empty 1 true 0 rfl (by decide)]; rfl,
@@ -134,7 +137,10 @@ theorem test_partA_sparseRetag_canaries :
     by rw [lookupSparseRetag_eq_linearScan]; rfl,
     frameAbsent_precedes_malformedTable (Nat.le_refl 10) .duplicateDefQuery,
     SparseDefPathRetagIndex.get?_empty "x",
-    by rw [SparseDefPathRetagIndex.get?_insert]; rfl⟩
+    by rw [SparseDefPathRetagIndex.get?_insert]; rfl,
+    natLowBits_inj_of_lt_pow2 4 (by decide) (by decide) rfl,
+    lt_two_pow_adaptiveRetagTrieDepth (by decide : 5 < 10),
+    adaptiveRetagTrieDepth_bitPath_injective (by decide : 7 < 10) (by decide : 7 < 10) rfl⟩
 
 /-- Concrete MIR state with a mutable reference `_1 : &mut u32` borrowed from `_2 : u32`
 (`tag = 1`). -/
@@ -251,7 +257,28 @@ theorem test_partA_operational_retag_overlay :
       protoLayouts) = some false ∧
     headPermIsUnique (applyImplicitWriteUpgradeLegacyA0
       (evalStmt protoZstMachineState protoFnEntryRetagStmt protoZstLocalDecls protoLayouts)
-      protoZstLocalDecls protoLayouts ⟨1, []⟩ true false) = some true := by
+      protoZstLocalDecls protoLayouts ⟨1, []⟩ true false) = some true ∧
+    applyImplicitWriteUpgrade 1
+        (.tau (.running { protoZstMachineState with
+          memory := { emptyMemory with
+            borrows := [{ tag := 1, targetLocal := 0, targetProjection := [], perm := .cell }] } }))
+        protoRetagLocalDecls protoLayouts ⟨1, []⟩ true false =
+      .tau (.running { protoZstMachineState with
+        memory := { emptyMemory with
+          borrows := [{ tag := 1, targetLocal := 0, targetProjection := [], perm := .cell }] } }) ∧
+    (match applyImplicitWriteUpgrade 2
+        (.tau (.running { protoZstMachineState with
+          memory := { emptyMemory with
+            borrows :=
+              [ { tag := 2, targetLocal := 0, targetProjection := [], perm := .reservedFrz false,
+                  parentTag := some 1, rangeLen := 4 },
+                { tag := 1, targetLocal := 0, targetProjection := [], perm := .frozen, rangeLen := 4 } ],
+            nextTag := 3 } }))
+        [⟨.mut, { kind := .uint .u32, layoutIdx := 0 }, some "_0"⟩,
+         ⟨.mut, { kind := .ref .mut (.uint .u32), layoutIdx := 0 }, some "_1"⟩]
+        { pointerBits := 64, isLittleEndian := true, entries := [] } ⟨1, []⟩ true false with
+      | .vis (.inl (.fail .ub)) _ => true
+      | _ => false) = true := by
   refine ⟨fnEntryRetagPermWithAttr_noWritable .mut (.uint .u32) true,
     fnEntryRetagPermWithAttr_implicitWrites_false .mut (.uint .u32) false,
     evalFnEntryRetagWithSparseAttr_eq_linear 10 sampleRetagRows true 7
@@ -264,7 +291,9 @@ theorem test_partA_operational_retag_overlay :
       (prepareSparseRetagIndex 10 sampleRetagRows) true 3
       protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts
       (by rw [sampleIdx_prepared]; exact lookupSparseRetag_cert (by decide) rfl),
-    by decide +kernel, by decide +kernel, ?_, by decide +kernel, by decide +kernel⟩
+    by decide +kernel, by decide +kernel, ?_, by decide +kernel, by decide +kernel,
+    applyImplicitWriteUpgrade_cell_noop 1 _ _ _ _ _ _ true false rfl rfl,
+    canary_implicitWrite_treeBorrows_full.2.1⟩
   have hq : lookupSparseRetag 10 (prepareSparseRetagIndex 10 sampleRetagRows) 7 = .ok false := by
     rw [sampleIdx_prepared]
     exact lookupSparseRetag_cert (by decide) rfl
@@ -510,7 +539,16 @@ theorem test_partB_canaries :
       [⟨"ext::rand", 7⟩] protoExtCone protoExtPost ∧
     ¬ vcMirWithCallees protoExtContracts 3 protoExtCallRootMir protoExtInitState [] []
       [] protoExtCone protoExtPost ∧
-    (∀ ext ∈ ([] : ExternalSummaryEnv), findCallee? protoFullCallees ext.defPath = none) :=
+    (∀ ext ∈ ([] : ExternalSummaryEnv), findCallee? protoFullCallees ext.defPath = none) ∧
+    checkBatchedVcConeNarrowCertMask protoTraitCone traitCallRootMir
+      protoRustcStyleCallees protoRustcStyleMask [] [] [] = true ∧
+    vcMirWithCallees protoCoercedExtContracts 3 protoExtCallRootMir protoExtInitState [] []
+      [⟨"ext::rand", 8⟩] protoExtCone protoExtPost ∧
+    (([] : List TraitImplEntry) ++ flatMapTraitImpls protoFullCallees).filter
+        (fun e => stringEq e.traitRef.defPath "proto::Area::area") =
+      (hoistMaskTraitImpls protoFullCallees protoTraitMask [] ++
+        flatMapTraitImpls (selectByMask protoFullCallees protoTraitMask)).filter
+        (fun e => stringEq e.traitRef.defPath "proto::Area::area") :=
   ⟨canary_naiveNarrow_breaks_trait_dispatch.2.1,
     canary_naiveNarrow_breaks_trait_dispatch.2.2.2.2,
     canary_traitDispatch_preserved_under_batchedVcNarrow.1,
@@ -519,7 +557,23 @@ theorem test_partB_canaries :
     canary_missingTraitImplBody_rejected.1,
     canary_externalSummary_vc.2.1,
     canary_externalSummary_vc.2.2,
-    protoTraitBatchedCert.untrustedAdmissible⟩
+    protoTraitBatchedCert.untrustedAdmissible,
+    canary_keptBodyWithTraitImpl_accepted.2.1,
+    canary_coercedExternalSummary_vc,
+    traitFilter_hoistMask_eq (cone := protoTraitCone) (extra := []) rfl
+      (List.Mem.tail _ (List.Mem.head _))⟩
+
+theorem test_partB_extCallInCone (req : MirCallReq) (k : MirCallAns → MirExecState)
+    (h_safe : StepConeSafeTrait protoExtCone protoExtCallRootMir protoExtInitState)
+    (h_step : stepMirFn protoExtCallRootMir protoExtInitState = .vis (.inr (.inr (.call req))) k) :
+    coneSummary? protoExtCone [⟨"ext::rand", 7⟩] req.defPath =
+      findExternalSummary? [⟨"ext::rand", 7⟩] req.defPath ∧
+    NodeExtCallInCone protoExtCone
+      (evalTerminator protoExtInitState
+        ⟨.return_, "ret"⟩ (some protoExtCallRootMir)) :=
+  ⟨coneSummary?_eq_of_stepMirFn_extCall [⟨"ext::rand", 7⟩] h_safe h_step,
+    evalTerminator_extCallInCone protoExtCone protoExtInitState ⟨.return_, "ret"⟩
+      protoExtCallRootMir trivial⟩
 
 /-- Part C / Part D theory canaries and the projections of `AllocRenamingRel`, used concretely. -/
 theorem test_partCD_canaries :
@@ -530,15 +584,52 @@ theorem test_partCD_canaries :
         ⟨protoUnwrapFailedPos, [protoUnwrapFailedFrame {},
           ⟨"my_crate::non_track_helper", some protoOtherCallPos, false, {}⟩, protoUserCallerFrame {}]⟩ =
       protoUnwrapBodyPos ∧
+    (evalDemandCallerLocation {} (protoDirectSite {})
+      { emptyMemory with
+        borrows := [{ tag := 1, targetLocal := 2, targetProjection := [], perm := .unique }],
+        nextTag := 2, nextAllocId := 0 }).2.1.allocId = 3 ∧
+    lookupBorrow ([] : List BorrowEntry) 5 = none ∧
+    readLocationBorrowAware
+        (evalDemandCallerLocation {} (protoDirectSite {}) emptyMemory).2.2
+        (evalDemandCallerLocation {} (protoDirectSite {}) emptyMemory).2.1 =
+      some (protoLibRsBytes, 108, 7) ∧
     shiftLeftBitsSafe 0xdeadbeef wideShiftTwoPow64 4 = 0 ∧
     symArrayLen (buildEagerDistinctChain 16 16) = 16 ∧
-    (lazyDistinctChainCounted 16 16).1 = buildLazyDistinctChain 16 16 :=
+    (lazyDistinctChainCounted 16 16).1 = buildLazyDistinctChain 16 16 ∧
+    (mkLazyReadCounted 8 (.constVec 8 0) 2).1 = mkLazyRead 8 (.constVec 8 0) 2 ∧
+    mkLazyReadCounted 8 (.write (.constVec 8 0) 2 99) 2 = (some 99, 1) :=
   ⟨demandCallerLocation_filename_dedup.1,
     trackCaller_span_owner_policy.1,
     trackCaller_stops_at_nonTrackCaller_frame,
+    canary_demandLocation_borrowTag_disjoint.2.1,
+    lookupBorrow_eq_none_of_lt (borrows := []) (id := 5)
+      (fun _ (h : _ ∈ ([] : List BorrowEntry)) => nomatch h),
+    (evalDemandCallerLocation_borrowAware_spec {} (protoDirectSite {}) emptyMemory
+      (⟨(fun _ (h : _ ∈ ([] : List CapturedAllocation)) => nomatch h),
+        (fun _ _ (h : _ ∈ ([] : List (List UInt8 × AllocId))) => nomatch h)⟩ :
+        DemandLocInv {} emptyMemory)
+      (fun _ (h : _ ∈ ([] : List BorrowEntry)) => nomatch h : BorrowsFresh emptyMemory)
+      (by decide)).2.1,
     canary_wideShift_two_pow_64.2.1,
     symArrayLen_buildEagerDistinctChain 16 16,
-    lazyDistinctChainCounted_fst 16 16⟩
+    lazyDistinctChainCounted_fst 16 16,
+    mkLazyReadCounted_fst 8 (.constVec 8 0) 2,
+    mkLazyReadCounted_hit_top (.constVec 8 0) 99 (by decide)⟩
+
+/-- Direct witness for `evalStmt_pure_memory_eq` and `normalStmtStep_eq_raw_of_pure`. -/
+theorem test_partC_stmt_pure_memory
+    (ns : MachineState)
+    (hstep : evalStmt { protoRetagMachineState with memory := emptyMemory }
+      ⟨.nop, "nop"⟩ protoRetagLocalDecls protoLayouts = .tau (.running ns)) :
+    ns.memory = emptyMemory ∧
+    normalStmtStep { protoRetagMachineState with memory := emptyMemory }
+        ⟨.nop, "nop"⟩ protoRetagLocalDecls protoLayouts =
+      (match evalStmt { protoRetagMachineState with memory := emptyMemory }
+          ⟨.nop, "nop"⟩ protoRetagLocalDecls protoLayouts with
+       | .tau (.running ns') => ns'
+       | _ => { protoRetagMachineState with memory := emptyMemory }) :=
+  ⟨evalStmt_pure_memory_eq rfl rfl rfl hstep,
+    normalStmtStep_eq_raw_of_pure _ _ _ _ rfl rfl rfl⟩
 
 /-- The three projections of a concrete `AllocRenamingRel`. -/
 theorem test_partC_renaming_projections
@@ -587,6 +678,23 @@ def narrowedTraitState (full : List CapturedMir) : MachineState :=
       (hoistTraitImpls full []))
     (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory full)
 
+/-- Symbolic initial state parameterized by a universally quantified `x : Nat` in `callerLocals`,
+so `∀ x : Nat, vcMirWithCallees ...` cannot be discharged by `decide +kernel` and must step
+symbolically through `wpMirExecExt` / `stepMirFn` / `lookupCallee`. -/
+def protoSymTraitState (x : Nat) (callees : List CapturedMir) (ti : List TraitImplEntry) :
+    MachineState :=
+  { frame :=
+      { locals := List.replicate traitCallRootMir.localDecls.length .uninit
+        blockIdx := 0
+        stmtIdx := 0 }
+    memory :=
+      { emptyMemory with
+        callees := callees
+        traitImpls := ti
+        callerLocals := [.init (.scalar ⟨x, 4⟩)]
+        nextTag := 1
+        nextProtector := 1 } }
+
 /-- Reducible (unsealed) copy of `coerceValueAt`, used only as the coercion baseline. -/
 def coerceValueAtUnsealed (layouts : LayoutTable) (ty : RigidTy) (v : Value) : Option Value :=
   match ty with
@@ -594,11 +702,40 @@ def coerceValueAtUnsealed (layouts : LayoutTable) (ty : RigidTy) (v : Value) : O
     match v with
     | .scalar sc =>
       let w := uintTyByteWidth layouts ut
-      match sc.sizeBytes == w with
+      match Nat.beq sc.sizeBytes w with
       | true => some (.scalar ⟨wrapScalarBits sc.bits (scalarModulus w), w⟩)
       | false => none
     | _ => none
   | _ => none
+
+/-- Iterated `K`-step coercion chain using `@[irreducible] coerceValueAt`. -/
+def chainCoerceSealed : Nat → Value → Option Value
+  | 0, v => some v
+  | k + 1, v =>
+    match coerceValueAt protoLayouts (.uint .u32) v with
+    | some v' => chainCoerceSealed k v'
+    | none => none
+
+/-- Iterated `K`-step coercion chain using reducible `coerceValueAtUnsealed`. -/
+def chainCoerceUnsealed : Nat → Value → Option Value
+  | 0, v => some v
+  | k + 1, v =>
+    match coerceValueAtUnsealed protoLayouts (.uint .u32) v with
+    | some v' => chainCoerceUnsealed k v'
+    | none => none
+
+theorem chainCoerceSealed_idempotent (v v' : Value)
+    (h : coerceValueAt protoLayouts (.uint .u32) v = some v') :
+    ∀ k : Nat, chainCoerceSealed (k + 1) v = some v'
+  | 0 => by
+    unfold chainCoerceSealed
+    rw [h]
+    rfl
+  | k + 1 => by
+    unfold chainCoerceSealed
+    rw [h]
+    dsimp only
+    exact chainCoerceSealed_idempotent v' v' (coerceValueAt_idempotent protoLayouts (.uint .u32) v v' h) k
 
 open Lean Elab Command in
 run_cmd do
@@ -667,16 +804,37 @@ run_cmd do
     theorem bench_partB_narrowCached_128 :
         (runMirExecBounded 12 traitCallRootMir (.running (cachedNarrowState fullCallees128))).map
           leafBits = some (some 31) := by decide +kernel)
+  bench "PartB_symVC_full_M128" `(command|
+    theorem bench_partB_symVC_full_128 :
+        ∀ x : Nat,
+          vcMirWithCallees (fun _ _ _ => True) 12 traitCallRootMir
+            (protoSymTraitState x fullCallees128 [])
+            fullCallees128 [] [] protoTraitCone
+            (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) := by
+      intro x
+      exact rfl)
+  bench "PartB_symVC_narrowCached_M128" `(command|
+    theorem bench_partB_symVC_narrowCached_128 :
+        ∀ x : Nat,
+          vcMirWithCallees (fun _ _ _ => True) 12 traitCallRootMir
+            (protoSymTraitState x fullCallees128 [])
+            [protoPoly, protoCircleArea] [protoAreaEntry] [] protoTraitCone
+            (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) := by
+      intro x
+      exact rfl)
   bench "PartB_coerce_sealed_lemma" `(command|
     theorem bench_partB_coerce_sealed :
-        ∀ bits : Nat, coerceValueAt protoLayouts (.uint .u32) (.scalar ⟨bits, 4⟩) =
+        ∀ bits : Nat, chainCoerceSealed 16 (.scalar ⟨bits, 4⟩) =
           some (.scalar ⟨wrapScalarBits bits (scalarModulus 4), 4⟩) :=
-      fun bits => coerceValueAt_u32 protoLayouts bits)
+      fun bits => chainCoerceSealed_idempotent _ _ (coerceValueAt_u32 protoLayouts bits) 15)
   bench "PartB_coerce_unsealed_rfl" `(command|
     theorem bench_partB_coerce_unsealed :
-        ∀ bits : Nat, coerceValueAtUnsealed protoLayouts (.uint .u32) (.scalar ⟨bits, 4⟩) =
-          some (.scalar ⟨wrapScalarBits bits (scalarModulus 4), 4⟩) :=
-      fun _ => rfl)
+        ∀ bits : Nat, chainCoerceUnsealed 16 (.scalar ⟨bits, 4⟩) =
+          some (.scalar ⟨wrapScalarBits bits (scalarModulus 4), 4⟩) := by
+      intro bits
+      dsimp only [chainCoerceUnsealed, coerceValueAtUnsealed, uintTyByteWidth, protoLayouts,
+        layoutPointerBytes]
+      simp only [wrapScalarBits_eq_mod_modulus, Nat.mod_mod])
 
 /-! ## 5. Part C Witnesses & Scaling (`DemandCallerLocationEnv`, `lean-miri#67`) -/
 
