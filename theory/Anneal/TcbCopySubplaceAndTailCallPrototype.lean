@@ -1157,8 +1157,9 @@ def borrowRootAllocBytes?
 Remaining bytes of `entry`'s allocation from the first byte of its target place:
 `borrowRootAllocBytes? - borrowPlaceByteOffset?` (`.none` when either is
 unknown), after resolving any dynamic `.index` projections in
-`entry.targetProjection` against `locals` and falling back to `rootVal` for
-unpadded caller-owned referents. Both quantities come from the TCB's own
+`entry.targetProjection` against `locals` and, only for a root local without a
+declared type (a caller-owned referent), falling back to the untyped offset of
+`rootVal` (a declared root whose layout lacks the offset stays unknown). Both quantities come from the TCB's own
 layout-aware size / offset functions, so the result is exact rather than a sum
 of runtime value encodings (which omits padding and assumes declaration order).
 Under Tree Borrows a raw pointer to a sub-place keeps the provenance of the
@@ -1177,13 +1178,27 @@ def borrowTargetRemainingBytes?
     match resolveBorrowProjectionElems locals entry.targetProjection with
     | .some rp => { entry with targetProjection := rp }
     | .none => entry
+  let rootDeclared : Bool :=
+    let declsAndLayouts : List LocalDecl × LayoutTable :=
+      match
+        activeFrameSlot? locals s.memory.callStack resolvedEntry.targetFrameDepth resolvedEntry.targetLocal
+      with
+      | .some _ => (localDecls, layouts)
+      | .none =>
+        foreignFrameDeclsAndLayouts
+          s.memory.callStack layouts resolvedEntry.targetFrameDepth resolvedEntry.targetLocal
+    match get? declsAndLayouts.1 resolvedEntry.targetLocal with
+    | .some _ => true
+    | .none => false
   let offOpt : Option Nat :=
     match
       borrowPlaceByteOffset?
-        locals s.memory.callerLocals localDecls layouts resolvedEntry s.memory.callStack
+        locals s.memory.callerLocals localDecls layouts resolvedEntry s.memory.callStack,
+      rootDeclared
     with
-    | .some off => .some off
-    | .none =>
+    | .some off, _ => .some off
+    | .none, true => .none
+    | .none, false =>
       let normProj :=
         normalizeSubsliceProjections (stripTransparentProjections resolvedEntry.targetProjection)
       projectionChainByteOffset? layouts .none (.some rootVal) .none 0 localDecls normProj
@@ -1222,36 +1237,6 @@ def copyAccessFitsAlloc?
 def accessCertainlyOob : Option Bool → Bool
   | .some false => true
   | _ => false
-
-/--
-Execute a statically zero-sized `copy_nonoverlapping` (`elemSz = 0`, e.g.
-`*const ()` or `*const [T; 0]` with `n ≥ 1` where both endpoints already passed
-`checkDerefAlign`): verifies that a `0`-byte access at `(srcEntry, srcPtr.offsetBytes)`
-and `(dstEntry, dstPtr.offsetBytes)` does not lie outside the allocation
-(`accessCertainlyOob (copyAccessFitsAlloc? ... 0) = true` faults with `.ub`), and
-otherwise advances the statement counter as a zero-byte no-op.
--/
-@[reducible]
-def evalZeroByteCopyStep
-    (s : MachineState)
-    (locals₃ : List LocalSlot)
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (srcPtr dstPtr : ProvenancePtr)
-    (srcEntry dstEntry : BorrowEntry)
-    (srcRootVal dstRootVal : Value) :
-    MirStepNode :=
-  match
-    Bool.or
-      (accessCertainlyOob
-        (copyAccessFitsAlloc? s locals₃ localDecls layouts
-          srcEntry srcRootVal srcPtr.offsetBytes 0))
-      (accessCertainlyOob
-        (copyAccessFitsAlloc? s locals₃ localDecls layouts
-          dstEntry dstRootVal dstPtr.offsetBytes 0))
-  with
-  | true => MirStepNode.fail .ub
-  | false => MirStepNode.step (advanceStmt s locals₃)
 
 /-- `true` iff a (normalized) container projection is the root local itself. -/
 @[reducible]
@@ -1341,6 +1326,13 @@ Repaired `evalCopyNonOverlappingPermOk` (`Statements.lean:1414-1687`):
    byte span that differs from the place it is read from or written to is `.ub`
    only when it certainly leaves the allocation (`copyAccessFitsAlloc?`), and
    fails closed with `.unsupported` otherwise (cross-field or partial writes).
+   The destination is never written at the wrong offset: a whole-value decode
+   is used only when the write starts at the destination place
+   (`effDstStart = 0`), and raw bytes are spliced only into byte containers
+   (`[u8; N]` / `[i8; N]`, or untyped one-byte elements) — `Trusted`'s
+   `copyViaBytes` (`Statements.lean:1557-1587`) splices `u8` values into any
+   non-ADT aggregate, which after peeling would put one-byte scalars inside a
+   `[u32; N]`.
 7. A copy of zero total bytes (a zero-sized pointee, or untyped `.unit`
    elements) is a no-op exactly like `count = 0`: zero-sized accesses are always
    in bounds, never overlap, and perform no Tree Borrows access.
@@ -1531,8 +1523,19 @@ def evalCopyNonOverlappingPermOkProto
                           copySliceWindowProj
                             effDstPlace.projection effDstStart (length bs) (length dstElems)
                         | _ => effDstPlace.projection
+                      let dstByteElems : Bool :=
+                        match dstSubVal with
+                        | .aggregate 0 dstElems =>
+                          match effDstLocalPlaceTy with
+                          | .some { kind := .array (.uint .u8) _, .. } => true
+                          | .some { kind := .array (.int .i8) _, .. } => true
+                          | .some { kind := .slice (.uint .u8), .. } => true
+                          | .some { kind := .slice (.int .i8), .. } => true
+                          | .some _ => false
+                          | .none => elemsMatchByteStride dstElems 1
+                        | _ => false
                       let spliceBytesToDstArray : Option Value :=
-                        match Bool.not effDstIsAdt, dstSubVal with
+                        match Bool.and (Bool.not effDstIsAdt) dstByteElems, dstSubVal with
                         | true, .aggregate 0 dstElems =>
                           match Nat.ble (Nat.add effDstStart (length bs)) (length dstElems) with
                           | false => .none
@@ -1568,7 +1571,7 @@ def evalCopyNonOverlappingPermOkProto
                         | .some dstPt =>
                           match rigidTyByteSize layouts dstPt with
                           | .some dstBytes =>
-                            match Nat.beq (length bs) dstBytes with
+                            match Bool.and (Nat.beq effDstStart 0) (Nat.beq (length bs) dstBytes) with
                             | true =>
                               match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
                               | .some decodedVal => writeDstVal decodedVal effDstPlace.projection
@@ -1600,8 +1603,7 @@ def evalCopyNonOverlappingPermOkProto
               | .none => false
             match zeroByteCopy, srcSliceEndOpt, dstSliceEndOpt with
             | true, _, _ =>
-              evalZeroByteCopyStep
-                s locals₃ localDecls layouts srcPtr dstPtr srcEntry dstEntry srcRootVal dstRootVal
+              MirStepNode.step (advanceStmt s locals₃)
             | false, .some (srcParentProj, srcStart, srcElems),
               .some (dstParentProj, dstStart, dstElems) =>
               let dstParentPlace : Place := {
@@ -1847,8 +1849,7 @@ def evalCopyNonOverlappingPermOkProto
                 | .none => false
               match zeroByteCopy with
               | true =>
-                evalZeroByteCopyStep
-                  s locals₃ localDecls layouts srcPtr dstPtr srcEntry dstEntry srcRootVal dstRootVal
+                MirStepNode.step (advanceStmt s locals₃)
               | false => MirStepNode.unsupported
         | _, _ => MirStepNode.fail .ub
 

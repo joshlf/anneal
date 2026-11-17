@@ -1314,8 +1314,11 @@ out-of-bounds byte offsets): for `_0 : T` (`8` bytes in `b3Layouts`) and
 1. `srcOff = 4` (aligned, inside the `8`-byte allocation `_0`) with `n = 3`
    succeeds as a zero-byte no-op (`MirStepNode.step ...`), whereas B3 checked
    `zeroByteCopy` after `resolvePtrElemOffset?` and returned `.unsupported`.
-2. `srcOff = 9` (`9 > 8`, outside the `8`-byte allocation `_0`) faults with
-   `MirStepNode.fail .ub` (`evalZeroByteCopyStep`).
+2. `srcOff = 9` (`9 > 8`, past the `8`-byte allocation `_0`) is a zero-byte
+   no-op as well: "For memory accesses of size zero, *every* non-null pointer is
+   valid for reads/writes" (`library/core/src/ptr/mod.rs:19-20` at
+   `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`). A3's `evalZeroByteCopyStep`
+   faulted with a false `.ub` here (removed in B4).
 -/
 theorem canary_bug1_zst_nonzero_aligned_offset_and_oob :
     let tTy : Ty := { kind := .adt "T" [], layoutIdx := 0 }
@@ -1330,19 +1333,78 @@ theorem canary_bug1_zst_nonzero_aligned_offset_and_oob :
       .init tVal, .init .unit,
       .init (.ptr { allocId := 620, offsetBytes := 4 } 8),
       .init (.ptr { allocId := 621, offsetBytes := 0 } 8)]
+    let locals9 : List LocalSlot := [
+      .init tVal, .init .unit,
+      .init (.ptr { allocId := 620, offsetBytes := 9 } 8),
+      .init (.ptr { allocId := 621, offsetBytes := 0 } 8)]
     let srcEntry : BorrowEntry := { tag := 620, targetLocal := 0, targetProjection := [], perm := .cell }
     let dstEntry : BorrowEntry := { tag := 621, targetLocal := 1, targetProjection := [], perm := .unique }
     let s4 : MachineState := {
       frame := { blockIdx := 0, stmtIdx := 0, locals := locals4 }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 622 } }
+    let s9 : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals9 }
       memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 622 } }
     evalCopyNonOverlappingPermOkProto
       s4 (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls b3Layouts
       { allocId := 620, offsetBytes := 4 } { allocId := 621, offsetBytes := 0 }
       srcEntry dstEntry 3 locals4 =
       MirStepNode.step { s4 with frame := { blockIdx := 0, stmtIdx := 1, locals := locals4 } } ∧
-    b3Copy tTy unitTy (.tuple []) tVal .unit 0 [] 9 1 [] 0 3 =
-      MirStepNode.fail .ub := by
+    evalCopyNonOverlappingPermOkProto
+      s9 (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls b3Layouts
+      { allocId := 620, offsetBytes := 9 } { allocId := 621, offsetBytes := 0 }
+      srcEntry dstEntry 3 locals9 =
+      MirStepNode.step { s9 with frame := { blockIdx := 0, stmtIdx := 1, locals := locals9 } } := by
   exact ⟨rfl, rfl⟩
+
+/-- The frame locals of a `MirStepNode.step` node (`.none` for any other node). -/
+private def stepLocals? : MirStepNode → Option (List LocalSlot)
+  | .tau (.running s) => .some s.frame.locals
+  | _ => .none
+
+/--
+Canary 4R (The destination is never written at the wrong place): the byte-level
+fallback (`copyViaBytes`) may write only bytes that land where the copy writes.
+1. `copy_nonoverlapping::<u8>(&raw const x as *const u8, &raw mut d[0] as *mut u8, 8)`
+   with `x : u64`, `d : [u32; 16]`: A0–A3 spliced eight one-byte `u8` scalars into
+   the `[u32; 16]` container (a type-confused value; `Trusted` fails closed). Raw
+   bytes are now spliced only into byte containers: `.unsupported`.
+2. `copy_nonoverlapping::<u8>(&raw const x as *const u8, &raw mut d[1], 4)` with
+   `x : u32`, `d : [u8; 4]` writes `d[1..5]`, past `d`: `.ub`. A0–A3 decoded the
+   4 bytes as the whole parent `[u8; 4]` and silently wrote `d[0..4]`.
+3. `copy_nonoverlapping::<u32>(&raw const a[0], (&raw mut t.x).add(1), 1)` with
+   `t : T` (`#[repr(C)] { x: u32, y: u8 }`) writes bytes `4..8` of `t` (in bounds:
+   `.unsupported`). A0–A3 (like `Trusted`) decoded into the place `t.x` itself and
+   overwrote `t.x`, ignoring the byte offset.
+4. Positive: `copy_nonoverlapping::<u8>(&raw const x as *const u8, &raw mut d[1], 2)`
+   with `x : u16 = 0x0201`, `d : [u8; 4]` still splices at index `1`:
+   `d = [0, 1, 2, 0]`.
+-/
+theorem canary_bug1_dst_bytes_never_misplaced :
+    let u64Ty : Ty := { kind := .uint .u64, layoutIdx := noLayout }
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := noLayout }
+    let u16Ty : Ty := { kind := .uint .u16, layoutIdx := noLayout }
+    let d16Ty : Ty := { kind := .array (.uint .u32) 16, layoutIdx := noLayout }
+    let d4Ty : Ty := { kind := .array (.uint .u8) 4, layoutIdx := noLayout }
+    let a2Ty : Ty := { kind := .array (.uint .u32) 2, layoutIdx := noLayout }
+    let tTy : Ty := { kind := .adt "T" [], layoutIdx := 0 }
+    let zeros4 : Value := .aggregate 0 [mkU8 0, mkU8 0, mkU8 0, mkU8 0]
+    let x16 : Value := .scalar { bits := 0x0201, sizeBytes := 2 }
+    b3Copy u64Ty d16Ty (.uint .u8) (.scalar { bits := 0x0807060504030201, sizeBytes := 8 })
+        (.aggregate 0 (List.replicate 16 (mkU32 0))) 0 [] 0 1 [.constantIndex 0 16 false] 0 8 =
+      MirStepNode.unsupported ∧
+    b3Copy u32Ty d4Ty (.uint .u8) (mkU32 0x04030201) zeros4 0 [] 0 1 [.constantIndex 1 4 false] 0 4 =
+      MirStepNode.fail .ub ∧
+    b3Copy a2Ty tTy (.uint .u32) (.aggregate 0 [mkU32 77, mkU32 88]) (.aggregate 0 [mkU32 1, mkU8 2])
+        0 [.constantIndex 0 2 false] 0 1 [.field 0 u32Ty] 4 1 =
+      MirStepNode.unsupported ∧
+    stepLocals? (b3Copy u16Ty d4Ty (.uint .u8) x16 zeros4 0 [] 0 1 [.constantIndex 1 4 false] 0 2) =
+      .some [
+        .init x16,
+        .init (.aggregate 0 [mkU8 0, mkU8 1, mkU8 2, mkU8 0]),
+        .init (.ptr { allocId := 90, offsetBytes := 0 } 8),
+        .init (.ptr { allocId := 91, offsetBytes := 0 } 8)] := by
+  exact ⟨rfl, rfl, rfl, rfl⟩
 
 /-! ## 5. Conservativity Canaries (the prototype is `Trusted` wherever no repair applies) -/
 
@@ -1421,6 +1483,7 @@ theorem canary_conservativity_use_keeps_tree_borrows_read :
 #print axioms canary_bug1_copyViaBytes_runs_full_tree_borrows_read_write
 #print axioms canary_bug1_empty_array_oob_and_zst_mismatch
 #print axioms canary_bug1_zst_nonzero_aligned_offset_and_oob
+#print axioms canary_bug1_dst_bytes_never_misplaced
 #print axioms canary_bug4_opaque_alias_field_shell_uses_cast_type
 #print axioms canary_bug4_call_destination_and_binop_move_opaqueCast
 #print axioms canary_conservativity_use_keeps_tree_borrows_read
