@@ -15,10 +15,12 @@ import Anneal.Mir.Correspondence.MoveDeinit
 
 Part 7 of the correspondence development: kernel-`decide`d canaries on real
 `V2026_06_01` `CapturedMir` bodies, each executed by `M_anneal` and by `M_ref`
-on `encodeProg p` (`deinitMoves = true`) through `bothObs`, plus concrete
-canaries on the live `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand ...
-(deinitProjectedMoves := true)` for `D1` root moves, `D2` field moves, `D5`
-`Deref` moves, and `D9` element / subslice moves, each with its legacy
+on `encodeProg p` (`deinitMoves = true`) through `bothObs` (all 33 prototype
+`D1`–`D9` canaries, statement for statement), plus concrete canaries on the live
+`Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand ...
+(deinitProjectedMoves := true)` for `D1` root moves, `D2` field moves, `D3`
+union field moves, `D5` untyped and typed `Deref` moves, and `D9` element,
+subslice and slice fat-pointer moves, each with its legacy
 (`deinitProjectedMoves := false`) contrast.
 -/
 

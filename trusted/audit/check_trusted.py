@@ -370,10 +370,25 @@ class Checker:
             self.cache_dir = raw_cache.resolve()
             if self.cache_dir == self.checkout or self.checkout in self.cache_dir.parents:
                 raise Failure(2, "admission", f"cache directory must reside outside checkout: {self.cache_dir}")
+            # The default cache path (`/tmp/anneal-trusted-cache-<uid>`) is predictable and
+            # its cached oleans, inspector results and compiled inspector are reused without
+            # re-execution: create it private, and refuse one that another account owns (or
+            # pre-created) or that is world-writable.
+            try:
+                self.cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            except OSError as error:
+                raise Failure(2, "admission", f"cannot create cache directory {self.cache_dir}: {error}") from error
+            cache_problem = _private_cache_problem(self.cache_dir)
+            if cache_problem is not None:
+                raise Failure(2, "admission", f"refusing --fast cache directory {self.cache_dir}: it {cache_problem}")
         self.stage = Path(tempfile.mkdtemp(prefix="anneal-trusted-", dir=temp_parent))
         self.phase, self.execution_began, self.counter = "admission", False, 0
+        # Lean children never see the dynamic-loader variables either: `LD_LIBRARY_PATH` is
+        # searched before `DT_RUNPATH` and `LD_PRELOAD` / `LD_AUDIT` inject code, which would
+        # bypass the pre-execution toolchain admission (`_scrubbed_env` in
+        # `scripts/verify_lean_miri_pin.py` likewise runs `--version` without them).
         self.environment = {k: v for k, v in os.environ.items()
-                            if not k.startswith(("LEAN", "LAKE", "ELAN", "DYLD_"))}
+                            if not k.startswith(("LEAN", "LAKE", "ELAN", "DYLD_", "LD_"))}
         self.environment["PATH"] = os.defpath
         self.artifacts: dict[str, list[list[str]]] = {}
         self.graph: dict = {}
@@ -416,18 +431,21 @@ class Checker:
         return stdout.read_text(encoding="utf-8", errors="strict")
 
     def _get_compiled_inspector(self) -> Path | None:
-        if self.expected_lean_sha is None:
+        # `--fast` only: the authoritative (default) mode always runs the staged,
+        # read-only, `freshness()`-re-hashed `TrustedBoundary.lean` through the admitted
+        # `lean --run`. A compiled binary is reused from the private `--fast` cache only
+        # (never from a shared default location in the full mode, where untrusted
+        # downstream elaboration runs before the audit and nothing re-verifies a cached
+        # executable), and only while that cache passes `_private_cache_problem`.
+        if not self.fast or self.cache_dir is None or self.expected_lean_sha is None:
             return None
         if self._compiled_inspector is not None and self._compiled_inspector.is_file():
             return self._compiled_inspector
         leanc = self.lean.parent / "leanc"
         if not leanc.is_file():
             return None
-        base_cache = (
-            self.cache_dir
-            if self.cache_dir is not None
-            else Path(tempfile.gettempdir()) / f"anneal-trusted-cache-{os.getuid()}"
-        )
+        if _private_cache_problem(self.cache_dir) is not None:
+            return None
         bin_key = fingerprint({
             "schema": 1,
             "toolchain": TOOLCHAIN,
@@ -435,9 +453,10 @@ class Checker:
             "leancSha256": digest(leanc),
             "inspectorSha256": getattr(self, "inspector_hash", None),
         })
-        bin_dir = base_cache / "inspector-bin"
+        bin_dir = self.cache_dir / "inspector-bin"
         bin_path = bin_dir / f"TrustedBoundary-{bin_key}"
-        if bin_path.is_file() and os.access(bin_path, os.X_OK):
+        if (bin_path.is_file() and os.access(bin_path, os.X_OK)
+                and _private_cache_problem(bin_dir) is None and _private_cache_problem(bin_path, leaf=True) is None):
             self._compiled_inspector = bin_path
             return bin_path
         try:
@@ -5382,6 +5401,35 @@ def _unsafe_mode(st: os.stat_result) -> str | None:
     return None
 
 
+def _private_cache_problem(path: Path, *, leaf: bool = False) -> str | None:
+    """Why the `--fast` cache entry `path` cannot be trusted (None when it can, or when a
+    directory `path` does not exist yet): it must be a real directory (`leaf`: a regular
+    file that is not group- or world-writable), not a symlink, not world-writable, and
+    owned by the current user -- so another account cannot pre-create the predictable
+    default `/tmp/anneal-trusted-cache-<uid>` and plant cached oleans, inspector results
+    or a compiled inspector in it."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "is missing" if leaf else None
+    except OSError as error:
+        return f"cannot be inspected ({error.strerror})"
+    if stat.S_ISLNK(st.st_mode):
+        return "is a symlink"
+    if leaf:
+        if not stat.S_ISREG(st.st_mode):
+            return "is not a regular file"
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return "is group- or world-writable"
+    elif not stat.S_ISDIR(st.st_mode):
+        return "is not a directory"
+    elif st.st_mode & stat.S_IWOTH:
+        return "is world-writable"
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        return f"is owned by uid {st.st_uid}, not by the current user (uid {os.getuid()})"
+    return None
+
+
 def _hash_nofollow(path: Path, expect: os.stat_result | None = None, *, git_blob: bool = False,
                    limit: int | None = None) -> tuple[str, str | None, bytes | None]:
     """`(sha256, git blob id or None, bytes or None)` of a regular file opened with
@@ -5838,6 +5886,13 @@ def admit_lean_before_execution(selected: Path, lean: Path, lock: dict) -> str:
     if stat.S_ISLNK(bin_st.st_mode) or not stat.S_ISDIR(bin_st.st_mode):
         raise Failure(2, phase, f"{selected.parent} is a symlink or not a directory "
                                 "(symlinks below the toolchain prefix are forbidden); nothing was executed")
+    if selected.parent.name != "bin" or lean.parent.name != "bin":
+        # `lean_release_findings` inventories `<prefix>/bin/` and resolves the DT_RUNPATH
+        # of `<prefix>/bin/lean`: the executable that runs must be that very file, not a
+        # copy elsewhere (e.g. `<prefix>/to/lean`) whose `$ORIGIN` differs.
+        raise Failure(2, phase, f"refusing to execute {lean}: the Lean executable must sit directly in its "
+                                "toolchain's bin/ directory (the directory the pre-execution admission "
+                                "inventories); nothing was executed")
     if not stat.S_ISREG(lean_st.st_mode):
         raise Failure(2, phase, f"{lean} is not a regular file; nothing was executed")
     unsafe = _unsafe_mode(lean_st)

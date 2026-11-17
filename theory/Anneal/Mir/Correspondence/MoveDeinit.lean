@@ -1930,6 +1930,17 @@ theorem trusted_evalOperand_movedUninit_read_ub
   · rw [hcopy, hread]; simp only [guardMovedUninitRead, hmoved]
   · rw [hmove, hread]; simp only [evalMoveOperandDeinit, hmoved]
 
+/-- **Non-vacuity of the read guard**: after `move _1[1..3]`, a default-mode
+`copy _1` returns the array with its two moved-out leaves (so the premises of
+`trusted_evalOperand_movedUninit_read_ub` are satisfiable). -/
+theorem trusted_evalOperand_movedUninit_read_nonvacuous :
+    ∃ (locals : List LocalSlot) (p : Place) (v : Value) (locals' : List LocalSlot),
+      evalOperand locals (.copy p) [] [] emptyLayoutTable [] [] [] = .ok v locals' ∧
+      valueContainsMovedUninit v = true :=
+  ⟨d9TrustedAfterSubslice, ⟨1, []⟩,
+   .aggregate 0 [u8Value 10, movedUninitValue, movedUninitValue, u8Value 13],
+   d9TrustedAfterSubslice, rfl, rfl⟩
+
 /-- **`TrustedProjectedMoveDeinitClaim`** (proved here; restated in
 `Anneal.Mir.Correspondence.Claims`). -/
 theorem trustedProjectedMoveDeinitClaim_proof : TrustedProjectedMoveDeinitClaim :=
@@ -1943,7 +1954,8 @@ theorem trustedProjectedMoveDeinitClaim_proof : TrustedProjectedMoveDeinitClaim 
    trusted_evalOperand_deref_move_deinit,
    trusted_evalOperand_typed_deref_move_deinit,
    trusted_evalOperand_slice_deref_move_deinit,
-   trusted_evalOperand_movedUninit_read_ub⟩
+   trusted_evalOperand_movedUninit_read_ub,
+   trusted_evalOperand_movedUninit_read_nonvacuous⟩
 
 /-! ## Part 10c — Fail-closed pointer constants, destination-first
 assignments, and a non-vacuity witness for the assignment Tree Borrows theorem -/
@@ -2662,6 +2674,183 @@ def reachableLatchWitness : Bool :=
 theorem reachable_latch_clear_nonvacuous : reachableLatchWitness = true := by
   decide
 
+/-! ### Non-vacuity of the reachable-state latch and Tree Borrows claims
+
+`MiriMoveDeinitWiringClaim` 8–10 exhibit, as `Prop`-level existentials over the
+TCB's own definitions, reachable `D5` states (the entry state plus three
+`M_anneal` steps, or three budgeted `M_ref` steps on `encodeProg`, i.e. just
+before `_4 = move (*_2)`): phase 1 (`refEvalOperand true`) genuinely *sets* the
+latch there and the full step consumes it again, and the Tree Borrows read /
+assignment theorems apply to the `.frozen` sibling borrow `_3 = &_1`, which
+overlaps the moved window `*_2` but not the destination `_4`. Each existential
+is extracted from an executable `Bool` check decided by the kernel. -/
+
+/-- The `D5` latch program (`_1 = 5; _3 = &_1; _2 = &raw mut _1; _4 = move (*_2);
+_0 = copy _4`). -/
+def d5LatchProg : V2026Prog := d5Prog (asg (loc 4) (.use (.move (drf 2)))) (.use (.copy (loc 4)))
+
+/-- The resolved moved place `*_2` of `d5LatchProg`. -/
+def d5MovePlace : SemPlace := ⟨2, (.rawPtr .mut kU8, lay (.rawPtr .mut kU8)), [.deref]⟩
+
+theorem permIsFrozen_eq_true {p : TreeBorrowPerm} (h : permIsFrozen p = true) : p = .frozen := by
+  cases p <;> first | rfl | cases h
+
+/-- Executable check of `MiriMoveDeinitWiringClaim` 8 on `d5LatchProg`. -/
+def annealReachableLatchWitness : Bool :=
+  match annealInit d5LatchProg [] with
+  | .error _ => false
+  | .ok st₀ =>
+    match annealRun d5LatchProg 3 st₀ with
+    | .running st =>
+      match refEvalOperand true 64 st (.move d5MovePlace) with
+      | .ok (.indirect _, _, stMid) =>
+        match annealStep d5LatchProg st with
+        | .running st' => stMid.pendingMoveDeinit && !st'.pendingMoveDeinit
+        | _ => false
+      | _ => false
+    | _ => false
+
+theorem annealReachableLatchWitness_eq_true : annealReachableLatchWitness = true := by
+  decide
+
+/-- **Non-vacuity of the reachable `M_anneal` latch invariant**: a reachable
+state in which phase 1 sets the latch and the full step clears it. -/
+theorem annealReachable_latch_set_nonvacuous :
+    ∃ (p : V2026Prog) (args : List Bytes) (n : Nat) (st₀ st : PState) (pb : Nat) (q : SemPlace)
+      (mp : MPlace) (ty : SemTy) (stMid st' : PState),
+      annealInit p args = .ok st₀ ∧ annealRun p n st₀ = .running st ∧
+      refEvalOperand true pb st (.move q) = .ok (.indirect mp, ty, stMid) ∧
+      stMid.pendingMoveDeinit = true ∧
+      annealStep p st = .running st' ∧ st'.pendingMoveDeinit = false := by
+  have hw := annealReachableLatchWitness_eq_true
+  unfold annealReachableLatchWitness at hw
+  split at hw
+  · cases hw
+  · next st₀ h₀ =>
+    split at hw
+    · next st h₁ =>
+      split at hw
+      · next mp ty stMid h₂ =>
+        split at hw
+        · next st' h₃ =>
+          simp only [Bool.and_eq_true, Bool.not_eq_eq_eq_not, Bool.not_true] at hw
+          exact ⟨d5LatchProg, [], 3, st₀, st, 64, d5MovePlace, mp, ty, stMid, st', h₀, h₁, h₂,
+            hw.1, h₃, hw.2⟩
+        · cases hw
+      · cases hw
+    · cases hw
+
+/-- Executable check of `MiriMoveDeinitWiringClaim` 9 on `encodeProg d5LatchProg`. -/
+def refReachableLatchWitness : Bool :=
+  match refInit (encodeProg d5LatchProg) [] with
+  | .error _ => false
+  | .ok st₀ =>
+    match refRunFuel true (encodeProg d5LatchProg) 3 ⟨st₀, 0, 100⟩ with
+    | .running rs =>
+      match refEvalOperand true 64 rs.core (.move d5MovePlace) with
+      | .ok (.indirect _, _, stMid) =>
+        match refStep true (encodeProg d5LatchProg) rs with
+        | .running rs' => stMid.pendingMoveDeinit && !rs'.core.pendingMoveDeinit
+        | _ => false
+      | _ => false
+    | _ => false
+
+theorem refReachableLatchWitness_eq_true : refReachableLatchWitness = true := by
+  decide
+
+/-- **Non-vacuity of the reachable `M_ref` latch invariant**: a reachable
+budgeted state of `encodeProg d5LatchProg` in which phase 1 sets the latch and
+the full budgeted step clears it. -/
+theorem refReachable_latch_set_nonvacuous :
+    ∃ (p : V2026Prog) (args : List Bytes) (n maxSteps : Nat) (st₀ : PState) (rs rs' : RefState)
+      (pb : Nat) (q : SemPlace) (mp : MPlace) (ty : SemTy) (stMid : PState),
+      refInit (encodeProg p) args = .ok st₀ ∧
+      refRunFuel true (encodeProg p) n ⟨st₀, 0, maxSteps⟩ = .running rs ∧
+      refEvalOperand true pb rs.core (.move q) = .ok (.indirect mp, ty, stMid) ∧
+      stMid.pendingMoveDeinit = true ∧
+      refStep true (encodeProg p) rs = .running rs' ∧ rs'.core.pendingMoveDeinit = false := by
+  have hw := refReachableLatchWitness_eq_true
+  unfold refReachableLatchWitness at hw
+  split at hw
+  · cases hw
+  · next st₀ h₀ =>
+    split at hw
+    · next rs h₁ =>
+      split at hw
+      · next mp ty stMid h₂ =>
+        split at hw
+        · next rs' h₃ =>
+          simp only [Bool.and_eq_true, Bool.not_eq_eq_eq_not, Bool.not_true] at hw
+          exact ⟨d5LatchProg, [], 3, 100, st₀, rs, rs', 64, d5MovePlace, mp, ty, stMid, h₀, h₁,
+            h₂, hw.1, h₃, hw.2⟩
+        · cases hw
+      · cases hw
+    · cases hw
+
+/-- Executable check of `MiriMoveDeinitWiringClaim` 10 on `d5LatchProg`. -/
+def tbReachableWitness : Bool :=
+  match annealInit d5LatchProg [] with
+  | .error _ => false
+  | .ok st₀ =>
+    match annealRun d5LatchProg 3 st₀ with
+    | .running st =>
+      match refEvalOperand true 64 st (.move d5MovePlace) with
+      | .ok (.indirect mp, _, _) =>
+        match twoPhaseReadOperand true 64 st (.move d5MovePlace) with
+        | .ok _ =>
+          match twoPhaseAssignUse true 64 st (.move d5MovePlace) (.imm 4) with
+          | .ok _ =>
+            match nth? st.borrows 0 with
+            | some e =>
+              permIsFrozen e.perm && entryOverlapsDest e (.mem mp) && !entryOverlapsDest e (.imm 4)
+            | none => false
+          | .error _ => false
+        | .error _ => false
+      | _ => false
+    | _ => false
+
+theorem tbReachableWitness_eq_true : tbReachableWitness = true := by
+  decide
+
+/-- **Non-vacuity of the Tree Borrows read and assignment theorems**: in a
+reachable state, moving out of `*_2` succeeds as an operand read and as
+`_4 = move (*_2)`, while the `.frozen` sibling borrow `_3 = &_1` overlaps the
+moved window but not the destination. -/
+theorem tbReachable_nonvacuous :
+    ∃ (p : V2026Prog) (args : List Bytes) (n : Nat) (st₀ st : PState) (pb : Nat) (q : SemPlace)
+      (mp : MPlace) (ty : SemTy) (stMid : PState) (b : Bytes) (st₁ : PState) (d : DestPlace)
+      (st₂ : PState) (i : Nat) (e : BorrowEntry),
+      annealInit p args = .ok st₀ ∧ annealRun p n st₀ = .running st ∧
+      refEvalOperand true pb st (.move q) = .ok (.indirect mp, ty, stMid) ∧
+      twoPhaseReadOperand true pb st (.move q) = .ok (b, st₁) ∧
+      twoPhaseAssignUse true pb st (.move q) d = .ok st₂ ∧
+      nth? st.borrows i = some e ∧ e.perm = .frozen ∧
+      entryOverlapsDest e (.mem mp) = true ∧ entryOverlapsDest e d = false := by
+  have hw := tbReachableWitness_eq_true
+  unfold tbReachableWitness at hw
+  split at hw
+  · cases hw
+  · next st₀ h₀ =>
+    split at hw
+    · next st h₁ =>
+      split at hw
+      · next mp ty stMid h₂ =>
+        split at hw
+        · next r h₃ =>
+          obtain ⟨b, st₁⟩ := r
+          split at hw
+          · next st₂ h₄ =>
+            split at hw
+            · next e h₅ =>
+              simp only [Bool.and_eq_true, Bool.not_eq_eq_eq_not, Bool.not_true] at hw
+              exact ⟨d5LatchProg, [], 3, st₀, st, 64, d5MovePlace, mp, ty, stMid, b, st₁, .imm 4,
+                st₂, 0, e, h₀, h₁, h₂, h₃, h₄, h₅, permIsFrozen_eq_true hw.1.1, hw.1.2, hw.2⟩
+            · cases hw
+          · cases hw
+        · cases hw
+      · cases hw
+    · cases hw
+
 /-! ## Proofs of the correspondence claims -/
 
 /-- **`CorrespondenceClaim`** (proved here; restated in
@@ -2687,6 +2876,8 @@ theorem faultEquivalenceClaim_proof : FaultEquivalenceClaim := by
 theorem miriMoveDeinitWiringClaim_proof : MiriMoveDeinitWiringClaim :=
   ⟨twoPhaseStrategy_true_eq_eager, miriMoveDeinitWiring_holds, deinitMovedPlace_false_id,
    annealReachable_latch_clear, refReachable_latch_clear, refEvalOperand_sets_latch_nonvacuous,
-   deinitMovedPlace_preserves_tb_tags, deinitMovedPlace_assignUse_preserves_tb_tags⟩
+   deinitMovedPlace_preserves_tb_tags, deinitMovedPlace_assignUse_preserves_tb_tags,
+   annealReachable_latch_set_nonvacuous, refReachable_latch_set_nonvacuous,
+   tbReachable_nonvacuous⟩
 
 end Anneal.Mir.Correspondence

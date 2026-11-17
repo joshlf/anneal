@@ -2512,9 +2512,20 @@ def MiriMoveDeinitWiring (dm : Bool) (pb : Nat) (st : PState) : Prop :=
 5. the latch is genuinely set mid-step: some indirect move sets it;
 6. moving out of a place (in particular `*ptr`) is a Tree Borrows read: it
    leaves the borrow table exactly as the corresponding `copy` and keeps every
-   `.frozen` tag `.frozen`; and
+   `.frozen` tag `.frozen`;
 7. an assignment `dest = move p` leaves every `.frozen` entry that does not
-   overlap the destination window literally unchanged. -/
+   overlap the destination window literally unchanged;
+8. (*non-vacuity of 4 for `M_anneal`*) some program reaches, from its entry
+   state, a `.running` `M_anneal` state in which a phase-1 move evaluation
+   (`refEvalOperand true`) *sets* the latch, while the full `M_anneal` step
+   from that state leaves it clear again;
+9. (*non-vacuity of 4 for `M_ref`*) the same for a bounded, budgeted `M_ref`
+   run of `encodeProg p` (`refRunFuel` from the `refInit` entry state, then one
+   `refStep`); and
+10. (*non-vacuity of 6 and 7*) in such a reachable state, moving out of a
+    memory place succeeds both as an operand read and as an assignment
+    `dest = move p`, while a `.frozen` borrow entry overlaps the moved
+    window but not the destination. -/
 def MiriMoveDeinitWiringClaim : Prop :=
   twoPhaseStrategy true = eagerStrategy ∧
   (∀ (dm : Bool) (pb : Nat) (st : PState), MiriMoveDeinitWiring dm pb st) ∧
@@ -2542,7 +2553,32 @@ def MiriMoveDeinitWiringClaim : Prop :=
   (∀ (pb : Nat) (st : PState) (p : SemPlace) (d : DestPlace) (st₁ : PState),
     twoPhaseAssignUse true pb st (.move p) d = .ok st₁ →
     ∀ i e, nth? st.borrows i = some e → e.perm = .frozen → entryOverlapsDest e d = false →
-      nth? st₁.borrows i = some e)
+      nth? st₁.borrows i = some e) ∧
+  -- 8. non-vacuity of 4 for `M_anneal` (reachable state; the latch is set mid-step)
+  (∃ (p : V2026Prog) (args : List Bytes) (n : Nat) (st₀ st : PState) (pb : Nat) (q : SemPlace)
+      (mp : MPlace) (ty : SemTy) (stMid st' : PState),
+    annealInit p args = .ok st₀ ∧ annealRun p n st₀ = .running st ∧
+    refEvalOperand true pb st (.move q) = .ok (.indirect mp, ty, stMid) ∧
+    stMid.pendingMoveDeinit = true ∧
+    annealStep p st = .running st' ∧ st'.pendingMoveDeinit = false) ∧
+  -- 9. non-vacuity of 4 for `M_ref` (reachable budgeted state; the latch is set mid-step)
+  (∃ (p : V2026Prog) (args : List Bytes) (n maxSteps : Nat) (st₀ : PState) (rs rs' : RefState)
+      (pb : Nat) (q : SemPlace) (mp : MPlace) (ty : SemTy) (stMid : PState),
+    refInit (encodeProg p) args = .ok st₀ ∧
+    refRunFuel true (encodeProg p) n ⟨st₀, 0, maxSteps⟩ = .running rs ∧
+    refEvalOperand true pb rs.core (.move q) = .ok (.indirect mp, ty, stMid) ∧
+    stMid.pendingMoveDeinit = true ∧
+    refStep true (encodeProg p) rs = .running rs' ∧ rs'.core.pendingMoveDeinit = false) ∧
+  -- 10. non-vacuity of 6 and 7 (reachable state, `.frozen` sibling over the moved window)
+  (∃ (p : V2026Prog) (args : List Bytes) (n : Nat) (st₀ st : PState) (pb : Nat) (q : SemPlace)
+      (mp : MPlace) (ty : SemTy) (stMid : PState) (b : Bytes) (st₁ : PState) (d : DestPlace)
+      (st₂ : PState) (i : Nat) (e : BorrowEntry),
+    annealInit p args = .ok st₀ ∧ annealRun p n st₀ = .running st ∧
+    refEvalOperand true pb st (.move q) = .ok (.indirect mp, ty, stMid) ∧
+    twoPhaseReadOperand true pb st (.move q) = .ok (b, st₁) ∧
+    twoPhaseAssignUse true pb st (.move q) d = .ok st₂ ∧
+    nth? st.borrows i = some e ∧ e.perm = .frozen ∧
+    entryOverlapsDest e (.mem mp) = true ∧ entryOverlapsDest e d = false)
 
 /-- A `u8` scalar value (used by the concrete witnesses below). -/
 def u8Value (n : Nat) : Value := .scalar { bits := n, sizeBytes := 1 }
@@ -2668,9 +2704,11 @@ def claimDerefBorrows : List BorrowEntry :=
        `_1 = [10, 11, 12, 13]` and slice fat pointer `_2 : *mut [u8]`, moving
        `(*_2)[1]` (`deinitSliceFatPtrDeref`) returns `11` and deinitializes
        `_1[1]`, and moving `(*_2)[1..3]` returns `[11, 12]` and deinitializes
-       `_1[1..3]` while keeping `_1[0] = 10` and `_1[3] = 13` readable; and
+       `_1[1..3]` while keeping `_1[0] = 10` and `_1[3] = 13` readable;
     9. (*read guard, all states*) every read in this mode faults on a value
-       that contains a moved-out leaf. -/
+       that contains a moved-out leaf; and
+   10. (*non-vacuity of 9*) a default-mode copy can indeed return a value
+       containing a moved-out leaf. -/
 def TrustedProjectedMoveDeinitClaim : Prop :=
   -- (a) root moves (legacy `false` and `deinitProjectedMoves := true`)
   (∀ (locals locals' : List LocalSlot) (l : Local) (v : Value) (borrows : List BorrowEntry)
@@ -2863,6 +2901,10 @@ def TrustedProjectedMoveDeinitClaim : Prop :=
     evalOperand locals (.copy p) borrows globals layouts callerLocals localDecls callStack true =
         .ub ∧
       evalOperand locals (.move p) borrows globals layouts callerLocals localDecls callStack
-        true = .ub)
+        true = .ub) ∧
+  -- (c10) non-vacuity of (c9)
+  (∃ (locals : List LocalSlot) (p : Place) (v : Value) (locals' : List LocalSlot),
+    evalOperand locals (.copy p) [] [] emptyLayoutTable [] [] [] = .ok v locals' ∧
+    valueContainsMovedUninit v = true)
 
 end Trusted.Correspondence

@@ -44,6 +44,7 @@ import hashlib  # noqa: E402
 import importlib.util  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
+import random  # noqa: E402
 import re  # noqa: E402
 import shlex  # noqa: E402
 import shutil  # noqa: E402
@@ -244,10 +245,11 @@ def make_fake_toolchain(base: Path, *, version: str = REPO_LEAN_VERSION, name: s
     return root
 
 
-def copy_live_toolchain(dst_parent: Path) -> Path:
+def copy_live_toolchain(dst_parent: Path, name: Optional[str] = None) -> Path:
     """Byte-for-byte copy of every `bin/*` and `lib/lean/*.so*` of the live elan
-    toolchain under `dst_parent/<elan dir name>` (the real toolchain is only read)."""
-    dst = dst_parent / V.toolchain_dir_name(REPO_TOOLCHAIN)
+    toolchain under `dst_parent/<name>` (default: the elan directory name; the real
+    toolchain is only read)."""
+    dst = dst_parent / (name if name is not None else V.toolchain_dir_name(REPO_TOOLCHAIN))
     (dst / "bin").mkdir(parents=True)
     (dst / "lib" / "lean").mkdir(parents=True)
     for entry in sorted((LIVE_TOOLCHAIN_DIR / "bin").iterdir()):
@@ -1030,6 +1032,73 @@ class VendorTamperTests(TempCase):
             "[identity] upstream_git_objects['Miri']",
         )
 
+    def test_build_toolchain_retarget_rejected_by_the_lock_like_check_trusted(self) -> None:
+        """A pin whose `build_lean_toolchain` (and `lean-toolchain`) is retargeted at a
+        release without compiled-in digests used to pass `verify_vendor` (the CLI only
+        warned "digests computed but not pinned"), while `check_trusted.py` rejects it:
+        both verifiers now lock the build toolchain."""
+        ws = self.workspace()
+        pin = ws.pin()
+        pin["build_lean_toolchain"] = "leanprover/lean4:v4.35.0"
+        ws.write_pin(pin)
+        (ws.root / V.LEAN_TOOLCHAIN_RELPATH).write_text("leanprover/lean4:v4.35.0\n", encoding="utf-8")
+        V.verify_vendor(ws.root, allow_deinit_patch=True, locked_identity=None)  # only the lock rejects it
+        self.assertRejected(
+            lambda: V.verify_vendor(ws.root, require_locked_deinit_patch=True),
+            "[identity] build_lean_toolchain 'leanprover/lean4:v4.35.0' is not a toolchain with compiled-in release digests",
+        )
+        with self.assertRaises(CT.Failure) as cm:
+            CT.verify_lean_miri_pin(ws.root)
+        self.assertIn("build_lean_toolchain 'leanprover/lean4:v4.35.0' != locked 'leanprover/lean4:v4.34.1'", str(cm.exception))
+
+    def test_pin_verifiers_agree_on_policy_mutations(self) -> None:
+        """Differential parity: `verify_vendor(require_locked_deinit_patch=True)` and
+        `check_trusted.verify_lean_miri_pin` accept the live pin and reject every
+        policy mutation below (neither may drift into accepting what the other
+        rejects)."""
+        ws = self.workspace()
+        pristine = ws.pin()
+
+        def verdicts() -> Tuple[bool, bool]:
+            try:
+                V.verify_vendor(ws.root, require_locked_deinit_patch=True)
+                v_ok = True
+            except V.PinVerificationError:
+                v_ok = False
+            try:
+                CT.verify_lean_miri_pin(ws.root)
+                ct_ok = True
+            except CT.Failure:
+                ct_ok = False
+            return v_ok, ct_ok
+
+        self.assertEqual(verdicts(), (True, True))
+        mutations: List[Tuple[str, Callable[[Dict[str, Any]], None]]] = [
+            ("build toolchain retarget", lambda p: p.update(build_lean_toolchain="leanprover/lean4:v4.35.0")),
+            ("upstream toolchain", lambda p: p.update(upstream_lean_toolchain="leanprover/lean4:v4.34.1")),
+            ("commit", lambda p: p.update(commit="0" * 40)),
+            ("extra top-level key", lambda p: p.update(extra=1)),
+            ("schema_version float", lambda p: p.update(schema_version=2.0)),
+            ("notes not a list", lambda p: p.update(notes="x")),
+            ("file digest", lambda p: p["vendor_tree"]["files"][7].update(sha256="0" * 64)),
+            ("aux digest", lambda p: p["vendor_aux_files"][0].update(sha256="f" * 64)),
+            ("file_count", lambda p: p["vendor_tree"].update(file_count=609)),
+            ("duplicate aux entry", lambda p: p["vendor_aux_files"].append(dict(p["vendor_aux_files"][0]))),
+            ("patched entry dropped", lambda p: p["patched_files"].pop()),
+            ("patched entry duplicated", lambda p: p["patched_files"].append(dict(p["patched_files"][0]))),
+            ("patched digest", lambda p: p["patched_files"][1].update(patched_sha256="a" * 64)),
+            ("patch reason blank", lambda p: p["patched_files"][0].update(patch_reason="  ")),
+            ("git object dropped", lambda p: p["upstream_git_objects"].pop("Miri.lean")),
+        ]
+        for label, mutate in mutations:
+            with self.subTest(label):
+                pin = json.loads(json.dumps(pristine))
+                mutate(pin)
+                ws.write_pin(pin)
+                self.assertEqual(verdicts(), (False, False))
+        ws.write_pin(pristine)
+        self.assertEqual(verdicts(), (True, True))
+
     def test_upstream_pins_marker_cross_check(self) -> None:
         ws = self.workspace()
         with self.subTest("pin metadata disagrees with vendored marker"):
@@ -1604,6 +1673,48 @@ class ElfDynamicParserTests(TempCase):
                 with self.assertRaisesRegex(ValueError, needle):
                     CT.elf_dynamic_info(self.put(data))
 
+    def test_parser_and_runpath_parity_on_randomized_inputs(self) -> None:
+        """Seeded differential parity of the two ELF64 parsers (on corrupted and
+        truncated synthetic images) and of the two `DT_RUNPATH` entry validators, so
+        the security invariants of `check_trusted.py` and the verifier cannot drift."""
+        rng = random.Random(20261117)
+        names = ["libfoo.so", "libc.so.6", "", "a/b.so", "libleanshared_1.so"]
+        entries = ["$ORIGIN", "$ORIGIN/../lib", "${ORIGIN}/x", "", "/abs", "$LIB", "$ORIGINX"]
+        flags = ("strtab_outside_load", "strtab_in_nobits", "unterminated", "strsz_overrun", "omit_strtab",
+                 "load_filesz_gt_memsz", "overlapping_loads", "omit_dt_null", "dyn_outside_load")
+
+        def outcome(parse: Callable[[Path], Any], path: Path) -> Tuple[str, Any]:
+            try:
+                return "ok", parse(path)
+            except (ValueError, struct.error):
+                return "rejected", None
+
+        for index in range(1500):
+            kw: Dict[str, Any] = {flag: True for flag in flags if rng.random() < 0.08}
+            if rng.random() < 0.05:
+                kw["phentsize"] = rng.choice([0, 32, 55, 57, 64])
+            if rng.random() < 0.05:
+                kw["phnum_override"] = rng.choice([0, 1, 3, 0xFFFF, 5000])
+            data = bytearray(make_elf64(rng.sample(names, rng.randint(0, 3)), rng.sample(entries, rng.randint(0, 3)),
+                                        rpath=rng.sample(entries, rng.randint(0, 2)), **kw))
+            for _ in range(rng.choice([0, 0, 1, 2, 4])):
+                data[rng.randrange(len(data))] = rng.randrange(256)
+            if rng.random() < 0.1:
+                data = data[: rng.randrange(len(data))]
+            path = self.put(bytes(data), f"fuzz{index}")
+            self.assertEqual(outcome(CT.elf_dynamic_info, path), outcome(V.elf_dynamic_info, path), (index, kw))
+        root = self.tmp / "root"
+        (root / "bin").mkdir(parents=True)
+        (root / "lib" / "lean").mkdir(parents=True)
+        os.symlink("/etc", root / "lib" / "escape")
+        real_root, origin = os.path.realpath(root), str(root / "bin")
+        for entry in ("", "$ORIGIN", "${ORIGIN}", "$ORIGIN/..", "$ORIGIN/../lib", "$ORIGIN/../lib/lean", "$ORIGIN/../lib/escape",
+                      "$ORIGIN/../lib/..", "$ORIGIN/../../x", "$ORIGIN//lib", "$ORIGIN/../lib/", "$ORIGIN/./lib", "$ORIGINX",
+                      "${ORIGIN", "$LIB", "/abs", real_root + "/lib", real_root + "/lib/../lib", "$ORIGIN$ORIGIN", "lib",
+                      real_root, real_root + "/", "$ORIGIN/..//lib", "${ORIGIN}/../lib/lean"):
+            with self.subTest(entry=entry):
+                self.assertEqual(CT._validate_runpath_entry(entry, origin, real_root), V._validate_runpath_entry(entry, origin, real_root))
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -1759,6 +1870,10 @@ class CheckTrustedIntegrationTests(TempCase):
         for key in ("repository", "commit", "upstream_lean_toolchain", "upstream_pins", "upstream_git_objects", "vendor_tree.file_count", "vendor_tree.manifest_sha256"):
             self.assertEqual(CT.LOCKED_LEAN_MIRI_PIN[key], identity[key], key)
         self.assertEqual(CT.LOCKED_LEAN_MIRI_PIN["upstream_git_objects"]["Miri"], LOCKED_MIRI_TREE)
+        # The build toolchain is locked identically: check_trusted's `TOOLCHAIN` is the
+        # only toolchain with compiled-in release digests in the verifier.
+        self.assertEqual(sorted(V.LOCKED_TOOLCHAIN_PINS), [CT.LOCKED_LEAN_MIRI_PIN["build_lean_toolchain"]])
+        self.assertEqual(CT.LOCKED_LEAN_MIRI_PIN["build_lean_toolchain"], CT.TOOLCHAIN)
         lock = json.loads((REPO_ROOT / "trusted" / "lean" / "foundation-lock.json").read_text())
         self.assertIn(CT.LOCKED_LEAN_RELEASE["files"]["bin/lean"], lock["distributions"].values())
 
@@ -1857,6 +1972,185 @@ class CheckTrustedIntegrationTests(TempCase):
                 self.assertIn(needles[0], str(error))
                 planted.unlink()
         self.assertEqual(CT.lean_release_findings(prefix), [])
+
+    @NEEDS_LIVE_RELEASE
+    def test_custom_lean_path_with_trojaned_runpath_companions_rejected_before_version_probe(self) -> None:
+        """`--lean /custom/path/<dir>/lean`: a byte-for-byte copy of the locked
+        `bin/lean` (so its SHA-256 *is* a foundation-lock distribution) placed under an
+        arbitrary, non-elan prefix whose `../lib/libleanshared_1.so` (searched first via
+        `$ORIGIN/../lib`), `../lib/libm.so.6` or `../lib/lean/libleanshared_1.so` is
+        trojaned. Admission is keyed by the digest, not by the directory name, so
+        `Checker.tool_admission()` must reject every variant before
+        `/custom/path/.../lean --version` (or anything else) runs."""
+        root = make_check_trusted_fixture(self.tmp)
+        prefix = copy_live_toolchain(self.tmp / "custom", name="path")
+        lean = prefix / "bin" / "lean"
+        self.assertNotIn(CT.LOCKED_LEAN_RELEASE["directory"], (prefix.name, prefix.parent.name))
+        self.assertEqual(CT.lean_release_findings(prefix), [])
+        # Control: the pristine custom-prefix copy is admitted and the first Lean
+        # process is the `--version` probe of exactly that executable.
+        self.assertEqual(self.run_until_first_lean_process(self.checker(root, lean)), [("version", ["--version"])])
+        trojan = b"\x7fELF-trojan: ld.so would run this constructor inside `lean --version`"
+        shadow_cases = (
+            ("lib/libleanshared_1.so", (
+                "RUNPATH shadowing library in lib/ (shadows lib/lean/): lib/libleanshared_1.so",
+                "RUNPATH shadowing: bin/lean needs 'libleanshared_1.so', which ld.so can resolve to the unpinned toolchain file lib/libleanshared_1.so",
+            )),
+            ("lib/libm.so.6", (
+                "system soname planted in a toolchain RUNPATH directory: lib/libm.so.6",
+                "RUNPATH shadowing: bin/lean needs 'libm.so.6', which ld.so can resolve to the unpinned toolchain file lib/libm.so.6",
+            )),
+        )
+        to_dir = prefix / "to"
+        to_dir.mkdir()
+        os.chmod(to_dir, 0o755)
+        shutil.copy2(lean, to_dir / "lean")
+        self.assertEqual(V.sha256_file(to_dir / "lean"), CT.LOCKED_LEAN_RELEASE["files"]["bin/lean"])
+        for planted_rel, needles in shadow_cases:
+            with self.subTest(f"{planted_rel} next to a copy in <prefix>/bin/"):
+                planted = prefix / planted_rel
+                planted.write_bytes(trojan)
+                os.chmod(planted, 0o755)
+                error = self.assertRejectedBeforeExecution(self.checker(root, lean), 2, "toolchain",
+                                                           "pre-execution toolchain admission", "nothing was executed")
+                for needle in needles:
+                    self.assertIn(needle, str(error))
+                self.assertFindings(CT.lean_release_findings(prefix), *needles)
+                with self.subTest(f"{planted_rel} next to a copy in <prefix>/to/ (outside bin/)"):
+                    # `$ORIGIN/../lib` of `<prefix>/to/lean` is the same trojaned `lib/`;
+                    # the copy is outside the inventoried `bin/`, so it is refused outright.
+                    self.assertRejectedBeforeExecution(self.checker(root, to_dir / "lean"), 2, "toolchain",
+                                                       "must sit directly in its toolchain's bin/ directory",
+                                                       "nothing was executed")
+                planted.unlink()
+        with self.subTest("tampered companion lib/lean/libleanshared_1.so"):
+            companion = prefix / "lib" / "lean" / "libleanshared_1.so"
+            original = companion.read_bytes()
+            companion.write_bytes(original + trojan)
+            error = self.assertRejectedBeforeExecution(self.checker(root, lean), 2, "toolchain",
+                                                       "SHA-256 mismatch for lib/lean/libleanshared_1.so", "nothing was executed")
+            companion.write_bytes(original)
+            os.chmod(companion, 0o644)
+        with self.subTest("bare custom prefix: only <prefix>/to/lean and a trojaned ../lib/libleanshared_1.so"):
+            bare = self.tmp / "bare" / "path"
+            (bare / "to").mkdir(parents=True)
+            (bare / "lib").mkdir()
+            shutil.copy2(lean, bare / "to" / "lean")
+            (bare / "lib" / "libleanshared_1.so").write_bytes(trojan)
+            self.assertRejectedBeforeExecution(self.checker(root, bare / "to" / "lean"), 2, "toolchain",
+                                               "must sit directly in its toolchain's bin/ directory")
+            (bare / "bin").mkdir()
+            shutil.move(str(bare / "to" / "lean"), str(bare / "bin" / "lean"))
+            error = self.assertRejectedBeforeExecution(self.checker(root, bare / "bin" / "lean"), 2, "toolchain",
+                                                       "pre-execution toolchain admission")
+            self.assertTrue("lib/lean/ is missing" in str(error) or "pinned toolchain file deleted" in str(error), str(error))
+        shutil.rmtree(to_dir)
+        self.assertEqual(CT.lean_release_findings(prefix), [])
+        self.assertEqual(self.run_until_first_lean_process(self.checker(root, lean)), [("version", ["--version"])])
+
+    def test_lean_children_never_inherit_dynamic_loader_variables(self) -> None:
+        """`LD_LIBRARY_PATH` is searched before `DT_RUNPATH` and `LD_PRELOAD` /
+        `LD_AUDIT` inject code: `Checker` must strip them (like `DYLD_*` and like
+        `_scrubbed_env` in the verifier), or the pre-execution DT_RUNPATH admission
+        would be bypassed when `lean` actually runs."""
+        root = make_check_trusted_fixture(self.tmp)
+        hostile = {"LD_PRELOAD": str(self.tmp / "evil.so"), "LD_LIBRARY_PATH": str(self.tmp),
+                   "LD_AUDIT": str(self.tmp / "audit.so"), "DYLD_INSERT_LIBRARIES": str(self.tmp / "evil.dylib"),
+                   "LEAN_PATH": str(self.tmp)}
+        with mock.patch.dict(os.environ, hostile):
+            checker = self.checker(root, self.tmp / "bin" / "lean")
+        self.assertFalse({key for key in checker.environment if key.startswith(("LD_", "DYLD_", "LEAN"))})
+        self.assertEqual(checker.environment["PATH"], os.defpath)
+        self.assertEqual(set(V._scrubbed_env()), {"PATH", "LC_ALL", "LANG"})
+
+    def test_full_mode_never_executes_a_cached_compiled_inspector(self) -> None:
+        """The authoritative (non-`--fast`) mode runs the staged, `freshness()`-checked
+        `TrustedBoundary.lean` through `lean --run`; it must never reuse a compiled
+        inspector binary from the predictable shared `/tmp/anneal-trusted-cache-<uid>`
+        (which untrusted downstream elaboration, or another account, could plant)."""
+        root = make_check_trusted_fixture(self.tmp)
+        prefix = self.tmp / "fake-prefix"
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "bin" / "leanc").write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(prefix / "bin" / "leanc", 0o755)
+        shared_tmp = self.tmp / "shared-tmp"
+        shared_tmp.mkdir()
+        with mock.patch.object(CT.tempfile, "gettempdir", return_value=str(shared_tmp)):
+            checker = self.checker(root, prefix / "bin" / "lean")
+            checker.lean = prefix / "bin" / "lean"
+            checker.expected_lean_sha = CT.LOCKED_LEAN_RELEASE["files"]["bin/lean"]
+            checker.inspector_hash = "0" * 64
+            bin_key = CT.fingerprint({"schema": 1, "toolchain": CT.TOOLCHAIN, "leanSha256": checker.expected_lean_sha,
+                                      "leancSha256": CT.digest(prefix / "bin" / "leanc"), "inspectorSha256": checker.inspector_hash})
+            for base in (shared_tmp / f"anneal-trusted-cache-{os.getuid()}", shared_tmp):
+                planted = base / "inspector-bin" / f"TrustedBoundary-{bin_key}"
+                planted.parent.mkdir(parents=True, exist_ok=True)
+                planted.write_text('#!/bin/sh\necho \'{"ok": true, "result": {}}\' > "$2"\n')
+                os.chmod(planted, 0o755)
+            with mock.patch.object(CT.subprocess, "run", side_effect=AssertionError("a subprocess was spawned")) as run:
+                self.assertIsNone(checker._get_compiled_inspector())
+            run.assert_not_called()
+            self.assertFalse(checker.fast)
+            self.assertIsNone(checker.cache_dir)
+
+    def test_fast_cache_directory_must_be_private(self) -> None:
+        """`--fast` reuses cached oleans, inspector results and a compiled inspector:
+        a cache directory owned by another account (e.g. a pre-created predictable
+        `/tmp/anneal-trusted-cache-<uid>`), world-writable, or a symlink to such a
+        directory is refused at construction; a fresh one is created private; a cached
+        compiled inspector that is group/world-writable is never executed."""
+        root = make_check_trusted_fixture(self.tmp)
+        lean = self.tmp / "bin" / "lean"
+
+        def fast_checker(cache: Path) -> Any:
+            checker = CT.Checker(root, lean, temp_parent=self.tmp, fast=True, cache_dir=cache)
+            self.addCleanup(CT.make_tree_writable, checker.stage)
+            return checker
+
+        fresh = self.tmp / "fresh-cache"
+        checker = fast_checker(fresh)
+        self.assertEqual(checker.cache_dir, fresh.resolve())
+        self.assertTrue(fresh.is_dir())
+        self.assertFalse(os.lstat(fresh).st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+        open_cache = self.tmp / "world-writable-cache"
+        open_cache.mkdir()
+        os.chmod(open_cache, 0o777)
+        with self.assertRaises(CT.Failure) as cm:
+            fast_checker(open_cache)
+        self.assertEqual((cm.exception.code, cm.exception.phase), (2, "admission"))
+        self.assertIn("is world-writable", str(cm.exception))
+        link = self.tmp / "symlinked-cache"
+        os.symlink(open_cache, link)
+        with self.assertRaises(CT.Failure) as cm:
+            fast_checker(link)
+        self.assertIn("is world-writable", str(cm.exception))
+        foreign = self.tmp / "foreign-cache"
+        foreign.mkdir(mode=0o755)
+        with mock.patch.object(CT.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaises(CT.Failure) as cm:
+                fast_checker(foreign)
+        self.assertIn(f"is owned by uid {os.getuid()}, not by the current user", str(cm.exception))
+        # A planted group-writable compiled inspector in a private cache is not reused.
+        prefix = self.tmp / "fake-prefix"
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "bin" / "leanc").write_text("#!/bin/sh\nexit 0\n")
+        checker.lean = prefix / "bin" / "lean"
+        checker.expected_lean_sha = CT.LOCKED_LEAN_RELEASE["files"]["bin/lean"]
+        checker.inspector_hash = "1" * 64
+        checker.inspector = self.tmp / "TrustedBoundary.lean"
+        bin_key = CT.fingerprint({"schema": 1, "toolchain": CT.TOOLCHAIN, "leanSha256": checker.expected_lean_sha,
+                                  "leancSha256": CT.digest(prefix / "bin" / "leanc"), "inspectorSha256": checker.inspector_hash})
+        planted = fresh / "inspector-bin" / f"TrustedBoundary-{bin_key}"
+        planted.parent.mkdir()
+        planted.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(planted, 0o775)
+        self.assertEqual(CT._private_cache_problem(planted, leaf=True), "is group- or world-writable")
+        failed = subprocess.CompletedProcess(args=[], returncode=1)
+        with mock.patch.object(CT.subprocess, "run", return_value=failed) as run:
+            self.assertIsNone(checker._get_compiled_inspector())
+        self.assertEqual(run.call_args_list[0].args[0][:2], [str(checker.lean), "-c"])  # recompiles; never runs `planted`
+        os.chmod(planted, 0o755)
+        self.assertEqual(checker._get_compiled_inspector(), planted)  # private, owner-only-writable entry is reused
 
     def test_unsafe_lean_executable_and_symlinked_bin_rejected_before_execution(self) -> None:
         root = make_check_trusted_fixture(self.tmp)

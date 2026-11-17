@@ -53,7 +53,9 @@ Vendor checks (`verify_vendor`)
    mapping and `vendor_tree.{file_count,manifest_sha256}` are compiled into
    this verifier, so a forged-but-self-consistent pin (vendored bytes, manifest
    and git ids all recomputed by an attacker) is still rejected. Updating the
-   upstream pin therefore requires a reviewed change to this file as well.
+   upstream pin therefore requires a reviewed change to this file as well. The
+   pin's `build_lean_toolchain` must name a toolchain with compiled-in release
+   digests (`LOCKED_TOOLCHAIN_PINS`), like `check_trusted.py`'s locked `TOOLCHAIN`.
 6. Patch modes. Strict mode (the CLI default) rejects any `patched_files`
    entry and any byte difference from upstream. With `allow_deinit_patch=True`
    (`--allow-deinit-patch`), `patched_files` may overlay a subset of the closed
@@ -1415,6 +1417,14 @@ def _check_locked_identity(raw: Mapping[str, Any], identity: Mapping[str, Any], 
     for key in ("repository", "commit", "upstream_lean_toolchain", "upstream_pins"):
         if raw.get(key) != identity[key]:
             c.err("identity", f"{key} {raw.get(key)!r} != locked upstream identity {identity[key]!r}")
+    # `build_lean_toolchain` is ours, not an upstream fact: it must name a toolchain
+    # whose release digests are compiled in (`LOCKED_TOOLCHAIN_PINS`), exactly as
+    # `trusted/audit/check_trusted.py` locks it to its `TOOLCHAIN` -- otherwise a pin
+    # retargeted (together with `lean-toolchain`) at an unpinned release would only warn.
+    build = raw.get("build_lean_toolchain")
+    if not isinstance(build, str) or build not in LOCKED_TOOLCHAIN_PINS:
+        c.err("identity", f"build_lean_toolchain {build!r} is not a toolchain with compiled-in release digests "
+                          f"{sorted(LOCKED_TOOLCHAIN_PINS)}")
     tree = raw.get("vendor_tree") if isinstance(raw.get("vendor_tree"), dict) else {}
     for key in ("file_count", "manifest_sha256"):
         locked = identity[f"vendor_tree.{key}"]
