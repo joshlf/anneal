@@ -38,8 +38,8 @@ use crate::obligations::{
 };
 use crate::scaffold::{
     MirFragment, MirLiftingProfile, analyze_workspace_lifting_profile,
-    classify_mir_fragment, compute_fragment_spec_digest, detect_authored_item_modules,
-    render_mir_fragment_diagnostic, render_proof_template_with_hints,
+    classify_mir_fragment, compute_fragment_spec_digest, compute_workspace_bundle_fault_census,
+    detect_authored_item_modules, render_mir_fragment_diagnostic, render_proof_template_with_hints,
 };
 
 /// Schema identifier stored in `.anneal/spec-lock.json`.
@@ -2241,6 +2241,15 @@ pub fn render_agent_context(
             bundle.inline_ensures.len(),
             bundle.external_specs.len()
         ));
+        if let Ok(Some((receipt, _verdict))) =
+            compute_workspace_bundle_fault_census(&mir_root, records, bundle)
+        {
+            out.push_str("### Fault-Site Census & Coverage Reconciliation\n\n");
+            for line in receipt.summary_lines() {
+                out.push_str(&format!("- {line}\n"));
+            }
+            out.push('\n');
+        }
         if fragment_class.inferred_fragment > MirFragment::PureBoundedLoop
             && let Some(diagnostic) = render_mir_fragment_diagnostic(def_id, &fragment_class)
         {

@@ -12,9 +12,10 @@ open Trusted.VerificationResult
 /-!
 Stateful specification for `frame_tutor::write_version_mut` (`#100`, `#125`).
 
-Models an `.active` Tree Borrows `BorrowEntry` (`tag = 1`, `targetLocal = 2`,
+Models an `.active` Tree Borrows `BorrowEntry` (`tag = 1`, `targetLocal = 3`,
 `protector = .some 1`, `rangeOffset = 0`, `rangeLen = 1`) in `Memory.borrows`
-with active function-entry protector `1` in `Memory.activeProtectors`. Under
+with active function-entry protector `1` in `Memory.activeProtectors` and the
+caller-owned referent slot at index `3` of `Memory.callerLocals`. Under
 this precondition (`.defined` of `MirStatefulContractSpec`), `*hdr = ver; *hdr`
 overwrites the target byte in place with `2_u8`, preserves the `.active`
 borrow entry in `mem'`, and returns `.scalar { bits := 2, sizeBytes := 1 }`
@@ -24,7 +25,7 @@ without triggering Undefined Behavior.
 def writeVersionBorrow : BorrowEntry where
   tag := 1
   perm := .active
-  targetLocal := 2
+  targetLocal := 3
   targetProjection := List.nil
   protector := .some 1
   rangeOffset := 0
@@ -35,7 +36,12 @@ def writeVersionMem : Memory :=
     borrows := List.cons writeVersionBorrow List.nil
     nextTag := 2
     activeProtectors := List.cons 1 List.nil
-    nextProtector := 2 }
+    nextProtector := 2
+    callerLocals :=
+      List.cons .dead
+        (List.cons .dead
+          (List.cons .dead
+            (List.cons (.init (.scalar { bits := 2, sizeBytes := 1 })) List.nil))) }
 
 instance : StatefulItemSpec "frame_tutor::write_version_mut" where
   pre args mem :=

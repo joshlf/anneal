@@ -210,9 +210,11 @@ theorem safe_noCallWpConverges
   all_goals -- evaluate every segment (entry, iterations, exit) to `bb1`
     dsimp only [
       cfgStepsWP, cfgStateWP, checksumLoopState, mem₀, frame8Mem, hasProtectedLocalBorrow,
-      disableLocalBorrows, placeTouchesUnion, tyProjTouchesUnion, resolveTyWithLocalDecls,
+      disableLocalBorrows, hasFrameDeallocProtectorConflict, disableFrameBorrows,
+      placeTouchesUnion, tyProjTouchesUnion, resolveTyWithLocalDecls,
       isUnresolvedLayoutIdx, isUnionLayout, LayoutTable.lookup, evalOperandFallback,
-      evalOperand, needsThinPtrElemResolution, runCfgToBlock, runCfgUntilAux, cfgAtBlock,
+      evalOperand, activeFrameSlot?, foreignFrameSlot?, foreignFrameTarget?,
+      needsThinPtrElemResolution, runCfgToBlock, runCfgUntilAux, cfgAtBlock,
       Obligations.WireframeDemo.checksum_frame_safe.statefulClaim,
       Trusted.VerificationResult.initMachineStateWithMemoryAndCallees,
       Obligations.WireframeDemo.checksum_frame_safe.defaultCallees,
@@ -235,13 +237,14 @@ theorem safe_noCallWpConverges
       updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux,
       boolToScalar, initMachineStateWithMemory, initLocals, initLocalsAux,
       GetElem?.getElem?, List.get?Internal, List.length, List.set, get?, set?, length,
-      Nat.add, Nat.mod, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not, ite, dite,
+      Nat.add, Nat.mod, Nat.ble, Nat.blt, Nat.beq, Bool.and, Bool.or, Bool.not, ite, dite,
       Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Bool.decEq,
       instDecidableEqBool]
   case entry.nil | entry.cons => -- the temporaries are still uninitialised
     exact ⟨rfl, Nat.zero_le _, .unit, .unit, .unit, .unit, .unit, .unit, .unit, .unit,
       .unit, .unit, .unit, .unit, .unit, .unit, .unit, rfl⟩
-  case exit => exact ⟨rfl, rfl, frame8_post_holds b0 b1 b2 b3 b4 b5 b6 b7 mem₀ rfl⟩
+  case exit =>
+    cases ap <;> exact ⟨rfl, rfl, frame8_post_holds b0 b1 b2 b3 b4 b5 b6 b7 mem₀ rfl⟩
   all_goals -- iterations: `omega` discharges the symbolic overflow checks and bound step
     simp (disch := omega) only [Nat.add_eq, Nat.mul_eq, wrapScalarBits_eq_of_lt,
       bitwiseOrBits_32_mul256_add, nat_ble_eq_false_of_lt]

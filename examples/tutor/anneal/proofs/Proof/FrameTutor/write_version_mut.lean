@@ -38,7 +38,7 @@ theorem verified :
     ⟨rfl, rfl⟩
 
 def writeVersionRawPtr : RawPtrVal where
-  allocId := 2
+  allocId := 3
   offset := 0
   tag := 1
 

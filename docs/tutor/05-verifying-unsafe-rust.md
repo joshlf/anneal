@@ -481,7 +481,7 @@ open Trusted.VerificationResult
 def writeVersionBorrow : BorrowEntry where
   tag := 1
   perm := .active
-  targetLocal := 2
+  targetLocal := 3
   targetProjection := List.nil
   protector := .some 1
   rangeOffset := 0
@@ -492,7 +492,12 @@ def writeVersionMem : Memory :=
     borrows := List.cons writeVersionBorrow List.nil
     nextTag := 2
     activeProtectors := List.cons 1 List.nil
-    nextProtector := 2 }
+    nextProtector := 2
+    callerLocals :=
+      List.cons .dead
+        (List.cons .dead
+          (List.cons .dead
+            (List.cons (.init (.scalar { bits := 2, sizeBytes := 1 })) List.nil))) }
 
 instance : StatefulItemSpec "frame_tutor::write_version_mut" where
   pre args mem :=
@@ -511,8 +516,9 @@ end Specs.FrameTutor.write_version_mut
 
 Notice what `writeVersionBorrow` and `writeVersionMem` model:
 - `writeVersionBorrow` gives provenance tag `1` `.active` Tree Borrows
-  permission over the 1-byte range `[0, 1)` of `targetLocal := 2`, protected by
-  function-entry lifetime protector `.some 1` (`activeProtectors := [1]`).
+  permission over the 1-byte range `[0, 1)` of caller-owned referent
+  `targetLocal := 3` (`callerLocals`), protected by function-entry lifetime
+  protector `.some 1` (`activeProtectors := [1]`).
 - `pre args mem` populates `.defined` of `MirStatefulContractSpec` with `hdr` at
   tag `1`, `ver = 2_u8`, and `mem = writeVersionMem`.
 - `post _ _ ret mem'` asserts inside `.val` that `write_version_mut` returns the
@@ -558,7 +564,7 @@ theorem verified :
     ⟨rfl, rfl⟩
 
 def writeVersionRawPtr : RawPtrVal where
-  allocId := 2
+  allocId := 3
   offset := 0
   tag := 1
 

@@ -102,9 +102,12 @@ private theorem impl_verified
     repeat (
       dsimp only [
         cfgStepsWP, cfgStateWP, fastBb1State, frame8Mem, runCfgToBlock, runCfgUntilAux,
-        cfgAtBlock, hasProtectedLocalBorrow, disableLocalBorrows, placeTouchesUnion,
+        cfgAtBlock, hasProtectedLocalBorrow, disableLocalBorrows,
+        hasFrameDeallocProtectorConflict, disableFrameBorrows, placeTouchesUnion,
         tyProjTouchesUnion, resolveTyWithLocalDecls, isUnresolvedLayoutIdx, isUnionLayout,
-        LayoutTable.lookup, evalOperandFallback, evalOperand, needsThinPtrElemResolution,
+        LayoutTable.lookup, evalOperandFallback, evalOperand,
+        activeFrameSlot?, foreignFrameSlot?, foreignFrameTarget?,
+        needsThinPtrElemResolution,
         Obligations.WireframeDemo.checksum_frame_fast.equivClaim,
         Trusted.VerificationResult.initMachineStateWithMemoryAndCallees,
         Obligations.WireframeDemo.checksum_frame_fast.defaultCallees,
@@ -126,8 +129,8 @@ private theorem impl_verified
         freezeTreeBorrowsOnReadAtProj, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf,
         isBorrowDescendantOrSelfAux, boolToScalar, GetElem?.getElem?, List.get?Internal,
         List.length, List.set, List.replicate, HAppend.hAppend, Append.append, List.append,
-        get?, set?, length, Nat.add, Nat.mod, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
-        ite, dite, Nat.decLt, Nat.decLe, Bool.decEq, instDecidableEqBool]
+        get?, set?, length, Nat.add, Nat.mod, Nat.ble, Nat.blt, Nat.beq, Bool.and, Bool.or,
+        Bool.not, ite, dite, Nat.decLt, Nat.decLe, Bool.decEq, instDecidableEqBool]
       try rw [evalByteCastAfterOperand_frame8])
   case entry.nil | entry.cons => exact ⟨rfl, rfl⟩
   case exit =>
@@ -139,7 +142,7 @@ private theorem impl_verified
       4294967296 := by omega
     rw [wrapScalarBits_eq_of_lt h1, wrapScalarBits_eq_of_lt h2, wrapScalarBits_eq_of_lt h3,
       nat_ble_eq_false_of_lt h1, nat_ble_eq_false_of_lt h2, nat_ble_eq_false_of_lt h3]
-    exact ⟨rfl, rfl, frame8_post_holds b0 b1 b2 b3 b4 b5 b6 b7 _ rfl⟩
+    cases ap <;> exact ⟨rfl, rfl, frame8_post_holds b0 b1 b2 b3 b4 b5 b6 b7 _ rfl⟩
 
 /-- Behavioral-equivalence and total-correctness certificate for
 `checksum_frame_fast`. -/

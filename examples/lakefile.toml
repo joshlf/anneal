@@ -70,6 +70,7 @@ roots = [
   "Anneal.Memory",
   "Anneal.BitValidity",
   "Anneal.ByteCodec",
+  "Anneal.FaultSiteCensus",
   "Anneal.UnsafeObligations",
   "Anneal.SepLogic",
   "Anneal.Rustc.V2026_06_01.Lower",

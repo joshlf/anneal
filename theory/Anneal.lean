@@ -9,6 +9,7 @@ import Anneal.MirLoops
 import Anneal.Scalars
 import Anneal.Memory
 import Anneal.BitValidity
+import Anneal.FaultSiteCensus
 import Anneal.UnsafeObligations
 import Anneal.SepLogic
 import Anneal.Rustc.V2026_06_01.Lower
@@ -71,6 +72,14 @@ export Anneal.ITreeWP (
   dwlp_pure_adequacy dwlp_trace_adequacy dwp_pure_adequacy
   dwp_interp dwlp_interp dwp_interpState dwlp_interpState
   wpCoalBounded dwp_cofix_of_wpCoalBounded dwlp_cofix_of_wpCoalBounded
+)
+
+export Anneal.FaultSiteCensus (
+  MirFaultClass FaultSite PropertyStatus PropertyRegistry
+  allVerifiedRegistry unemittedRegistry registryWithStatus
+  censusMirBodyFaultSites
+  CoverageVerdict reconcileFaultCoverage reconcileFaultCoverageWithRegistry
+  CoverageBatch reconcileCoverageBatch
 )
 
 /-- Smoke-test witness exported from `Anneal`. -/

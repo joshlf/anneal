@@ -24,6 +24,7 @@ extern crate self as cargo_anneal;
 pub mod agent;
 pub mod correspondence_bugs;
 pub mod driver;
+pub mod fault_census;
 pub mod minirust_sync;
 pub mod miri_diff;
 pub mod miri_oracle;
@@ -64,6 +65,17 @@ pub use driver::{
     parse_unit_capture_manifest, resolve_rustc_wrapper, run_cargo_capture,
     serialize_unit_capture_manifest,
 };
+pub use fault_census::{
+    CalleeClosure, CensusScanError, CoverageVerdict, FaultCensusReceipt, FaultMutationProbe,
+    FaultSite, ItemCoverageInput, MirFaultClass, MultiItemCoverageVerdict, ProbeExecutionReport,
+    PropertyDescriptor, PropertyRegistry, PropertyStatus, ProtoBasicBlock, ProtoMirBody,
+    ProtoOperand, ProtoPlace, ProtoProjectionElem, ProtoRvalue, ProtoStatement, ProtoStatementKind,
+    ProtoTerminator, ProtoTerminatorKind, census_lean_mir_def, census_lean_mir_module,
+    census_mir_fault_sites, census_stmt_fault_classes, census_terminator_fault_classes,
+    parse_lean_captured_mir_def, reconcile_lean_mir_coverage, reconcile_multi_item_coverage,
+    reconcile_obligation_coverage, run_all_false_proof_probes, run_false_proof_probe,
+    run_property_registry_unemitted_probe,
+};
 pub use minirust_sync::{
     DeclChangeKind, DeclDiffEntry, ExtractedSpecDecl, LockVerificationReport, LockedSpecFile,
     MiniRustSyncSubcommand, SnapshotDiffReport, SnapshotLockEntry, SpecDeclKind,
@@ -94,21 +106,24 @@ pub use miri_oracle::{
     run_difftest_oracle_pipeline, run_miri_oracle, source_files_match,
 };
 pub use obligations::{
-    AuthoredItemModules, CalleeContractRef, SubjectObligationBundle,
-    derive_item_module_suffix, group_subject_obligations,
-    module_suffix_to_rel_path, render_crate_verify_module,
-    render_obligations_module, render_obligations_module_with_options, render_proof_template,
-    render_proof_template_with_options, render_specs_template, render_verify_module,
-    render_verify_module_with_options,
+    AuthoredItemModules, CalleeContractRef, ObligationSiteKind, SubjectObligationBundle,
+    TaggedObligationSite, compute_bundle_fault_census_receipt,
+    compute_subject_fault_coverage_receipt, derive_item_module_suffix,
+    emit_mir_obligation_fault_sites, emit_obligation_fault_sites_for_body,
+    emit_obligation_tagged_fault_sites_for_body, group_subject_obligations,
+    module_suffix_to_rel_path, render_crate_verify_module, render_obligations_module,
+    render_obligations_module_with_census, render_obligations_module_with_options,
+    render_proof_template, render_proof_template_with_options, render_specs_template,
+    render_verify_module, render_verify_module_with_options,
 };
 pub use scaffold::{
     LEAN_TOOLCHAIN, MirFragment, MirFragmentClassification, MirLiftingProfile, ScaffoldConfig,
     ScaffoldReport, analyze_mir_lifting_profile, analyze_workspace_lifting_profile,
-    classify_mir_fragment, compute_fragment_spec_digest, detect_authored_item_modules,
-    refresh_workspace_assembly, render_lakefile_toml, render_mir_fragment_diagnostic,
-    render_proof_template_with_hints, render_scaffold_lifting_hints,
-    scaffold_init_proof_templates, scaffold_init_spec_templates, scaffold_workspace,
-    scaffold_workspace_with_config,
+    classify_mir_fragment, compute_fragment_spec_digest, compute_workspace_bundle_fault_census,
+    detect_authored_item_modules, refresh_workspace_assembly, render_lakefile_toml,
+    render_mir_fragment_diagnostic, render_proof_template_with_hints,
+    render_scaffold_lifting_hints, scaffold_init_proof_templates, scaffold_init_spec_templates,
+    scaffold_workspace, scaffold_workspace_with_config,
 };
 pub use trace_observer::{
     __anneal_mir_rt_branch, __anneal_mir_rt_call_begin, __anneal_mir_rt_call_end_normal,
@@ -270,6 +285,33 @@ pub enum VerificationStatus {
         /// the transitive constant closure of `Verify.<Item>.verified`.
         axioms: Vec<String>,
     },
+    /// `Verify.<Item>` failed fault-site coverage reconciliation (one or more
+    /// syntactic fault sites were unmapped/undischarged or a required
+    /// `MirFaultClass` is not `PropertyStatus::EmittedAndVerified` in the
+    /// `PropertyRegistry`).
+    UnknownUnmappedFaultSite {
+        /// Fault sites in `census` that were omitted from `discharged` or whose
+        /// fault class is not `PropertyStatus::EmittedAndVerified`.
+        missing_sites: Vec<fault_census::FaultSite>,
+        /// Distinct `MirFaultClass` categories present in `census` whose status
+        /// in `PropertyRegistry` is not `PropertyStatus::EmittedAndVerified`.
+        unemitted_classes: Vec<fault_census::MirFaultClass>,
+        /// Diagnostic summary explaining why coverage reconciliation failed.
+        reason: String,
+    },
+}
+
+impl VerificationStatus {
+    /// Return the canonical status tag for this verification outcome.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::VerifiedUnconditional => "UNCONDITIONAL",
+            Self::VerifiedConditional { .. } => "CONDITIONAL",
+            Self::VerifiedUbException { .. } => "UB_EXCEPTION",
+            Self::ProvisionalNative { .. } => "PROVISIONAL_NATIVE",
+            Self::UnknownUnmappedFaultSite { .. } => "UNKNOWN(UNMAPPED_FAULT_SITE)",
+        }
+    }
 }
 
 /// Per-item verification audit entry returned by `verify_workspace`.
@@ -323,6 +365,12 @@ pub struct VerifyConfig {
     /// Optional comma-separated item filter restricting `lake build` and
     /// `TrustedBoundary` auditing to matching `Verify.<Item>` modules.
     pub item_filter: Option<String>,
+    /// Optional property coverage registry mapping each `MirFaultClass` to its
+    /// verification status (`PropertyRegistry::all_verified()` when `None`).
+    pub property_registry: Option<fault_census::PropertyRegistry>,
+    /// Optional fault sites simulated as dropped from the discharged set
+    /// (for fail-closed negative testing).
+    pub simulated_dropped_fault_sites: std::collections::BTreeSet<FaultSite>,
 }
 
 impl VerifyConfig {
@@ -336,6 +384,8 @@ impl VerifyConfig {
             allow_assumptions: false,
             allow_provisional_native: false,
             item_filter: None,
+            property_registry: None,
+            simulated_dropped_fault_sites: std::collections::BTreeSet::new(),
         }
     }
 
@@ -367,6 +417,22 @@ impl VerifyConfig {
     /// Restrict verification to `Verify.<Item>` modules matching `item_filter`.
     pub fn with_item_filter(mut self, item_filter: Option<String>) -> Self {
         self.item_filter = item_filter;
+        self
+    }
+
+    /// Override the `PropertyRegistry` used by fault-site coverage reconciliation.
+    pub fn with_property_registry(mut self, property_registry: fault_census::PropertyRegistry) -> Self {
+        self.property_registry = Some(property_registry);
+        self
+    }
+
+    /// Simulate dropping specific fault sites from the obligation pipeline's
+    /// `discharged` set during coverage reconciliation.
+    pub fn with_dropped_fault_sites(
+        mut self,
+        dropped: std::collections::BTreeSet<FaultSite>,
+    ) -> Self {
+        self.simulated_dropped_fault_sites = dropped;
         self
     }
 }
@@ -1054,6 +1120,7 @@ pub fn render_verification_report(report: &VerificationReport) -> String {
     let mut conditional_count = 0usize;
     let mut ub_exception_count = 0usize;
     let mut provisional_count = 0usize;
+    let mut unmapped_count = 0usize;
     let mut out = String::new();
     out.push_str("Anneal Verification Summary:\n");
     for item in &report.items {
@@ -1097,6 +1164,20 @@ pub fn render_verification_report(report: &VerificationReport) -> String {
                     ));
                 }
             }
+            VerificationStatus::UnknownUnmappedFaultSite { reason, .. } => {
+                unmapped_count += 1;
+                if reason.is_empty() {
+                    out.push_str(&format!(
+                        "  {}: UNKNOWN(UNMAPPED_FAULT_SITE)\n",
+                        item.verify_module
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  {}: UNKNOWN(UNMAPPED_FAULT_SITE) [{reason}]\n",
+                        item.verify_module
+                    ));
+                }
+            }
         }
     }
     let mut totals = format!("{unconditional_count} unconditional, {conditional_count} conditional");
@@ -1105,6 +1186,9 @@ pub fn render_verification_report(report: &VerificationReport) -> String {
     }
     if provisional_count > 0 {
         totals.push_str(&format!(", {provisional_count} provisional_native"));
+    }
+    if unmapped_count > 0 {
+        totals.push_str(&format!(", {unmapped_count} unknown_unmapped_fault_site"));
     }
     out.push_str(&format!("  Totals: {totals}\n"));
     out.push_str("  TrustedBoundary kernel replay: PASS\n");
@@ -1187,6 +1271,23 @@ pub fn execute_cli(options: &CliOptions) -> Result<(), String> {
         CliSubcommand::Verify | CliSubcommand::AgentVerify => {
             let report = verify_workspace_with_options(options)?;
             print!("{}", render_verification_report(&report));
+            let unmapped: Vec<String> = report
+                .items
+                .iter()
+                .filter_map(|item| match &item.status {
+                    VerificationStatus::UnknownUnmappedFaultSite { reason, .. } => Some(format!(
+                        "{}: UNKNOWN(UNMAPPED_FAULT_SITE) ({reason})",
+                        item.verify_module
+                    )),
+                    _ => None,
+                })
+                .collect();
+            if !unmapped.is_empty() {
+                return Err(format!(
+                    "fault-site coverage reconciliation failed: {}",
+                    unmapped.join(", ")
+                ));
+            }
             Ok(())
         }
         CliSubcommand::AgentSandbox => {
@@ -2353,6 +2454,8 @@ pub fn verify_workspace_with_options(options: &CliOptions) -> Result<Verificatio
         allow_assumptions: effective_allow_assumptions,
         allow_provisional_native: options.allow_provisional_native,
         item_filter: options.item_filter.clone(),
+        property_registry: None,
+        simulated_dropped_fault_sites: std::collections::BTreeSet::new(),
     };
     let report = verify_workspace_with_config(&verify_cfg)?;
 
@@ -2454,7 +2557,8 @@ pub fn verify_workspace(workspace_root: &Path) -> Result<VerificationReport, Str
 }
 
 /// Synchronize generated assembly modules in `<config.workspace_root>/.anneal`,
-/// invoke `lake build`, and run the `TrustedBoundary` anti-cheat audit
+/// invoke `lake build`, and run the `TrustedBoundary` anti-cheat audit plus
+/// fault-site coverage reconciliation (`reconcile_multi_item_coverage`)
 /// according to `config`.
 pub fn verify_workspace_with_config(config: &VerifyConfig) -> Result<VerificationReport, String> {
     let base_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -2487,14 +2591,271 @@ pub fn verify_workspace_with_config(config: &VerifyConfig) -> Result<Verificatio
     } else {
         run_lake_verify(&dot_anneal)?;
     }
-    run_trusted_boundary_verify_audit_with_options(
+    let mut report = run_trusted_boundary_verify_audit_with_options(
         &workspace_root,
         anneal_repo_root.as_deref(),
         config.allow_assumptions,
         config.allow_provisional_native,
         config.item_filter.as_deref(),
         &matched_targets,
-    )
+    )?;
+    let effective_registry = config
+        .property_registry
+        .clone()
+        .unwrap_or_else(PropertyRegistry::all_verified);
+    apply_fault_site_coverage_reconciliation(
+        &workspace_root,
+        &mut report,
+        &effective_registry,
+        &config.simulated_dropped_fault_sites,
+    );
+    Ok(report)
+}
+
+fn extract_default_callee_suffixes_from_obligations(ob_text: &str) -> Vec<String> {
+    let Some(pos) = ob_text.find("def defaultCallees : List CapturedMir :=") else {
+        return Vec::new();
+    };
+    let after = &ob_text[pos..];
+    let end = after.find("\n\n").unwrap_or(after.len());
+    let section = &after[..end];
+    let mut out = Vec::new();
+    let mut rest = section;
+    while let Some(mpos) = rest.find("Mir.") {
+        let after_mir = &rest[mpos + "Mir.".len()..];
+        if let Some(bpos) = after_mir.find(".body") {
+            let candidate = &after_mir[..bpos];
+            if !candidate.is_empty()
+                && candidate
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            {
+                out.push(candidate.to_string());
+                rest = &after_mir[bpos + ".body".len()..];
+                continue;
+            }
+        }
+        rest = &after_mir[1..];
+    }
+    out
+}
+
+fn extract_external_callee_def_paths_from_obligations(
+    ob_text: &str,
+    mir_root: &Path,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    // 1. `externalSpecCallContract "<target_def_id>"`
+    let marker = "externalSpecCallContract";
+    let mut rest = ob_text;
+    while let Some(pos) = rest.find(marker) {
+        let after = &rest[pos + marker.len()..];
+        let trimmed = after.trim_start();
+        if let Some(after_q) = trimmed.strip_prefix('"')
+            && let Some(end_q) = after_q.find('"')
+        {
+            let target = &after_q[..end_q];
+            if !target.is_empty() && !out.iter().any(|s| s == target) {
+                out.push(target.to_string());
+            }
+            rest = &after_q[end_q + 1..];
+        } else {
+            rest = after;
+        }
+    }
+    // 2. `import Obligations.<Callee>` (sibling `#[spec(trusted)]` `called_callees`)
+    for line in ob_text.lines() {
+        if let Some(callee_suffix) = line.trim().strip_prefix("import Obligations.") {
+            let callee_rel = module_suffix_to_rel_path(callee_suffix.trim());
+            let callee_mir_path = mir_root.join(&callee_rel);
+            if let Ok(src) = fs::read_to_string(&callee_mir_path)
+                && let Some(def_path) = extract_lean_mir_def_path(&src)
+                && !out.contains(&def_path)
+            {
+                out.push(def_path);
+            }
+        }
+    }
+    out
+}
+
+fn apply_fault_site_coverage_reconciliation(
+    workspace_root: &Path,
+    report: &mut VerificationReport,
+    registry: &PropertyRegistry,
+    dropped_sites: &std::collections::BTreeSet<FaultSite>,
+) {
+    let generated_root = workspace_root.join(".anneal/generated");
+    let mir_root = generated_root.join("Mir");
+    let obligations_root = generated_root.join("Obligations");
+    let verify_root = generated_root.join("Verify");
+
+    for item in &mut report.items {
+        let is_assumed_or_ub_exc = match &item.status {
+            VerificationStatus::VerifiedConditional { assumptions } => assumptions
+                .iter()
+                .any(|a| a.ends_with(".rust_trusted_contract")),
+            VerificationStatus::VerifiedUbException { .. } => true,
+            _ => false,
+        };
+
+        let suffix = item
+            .verify_module
+            .strip_prefix("Verify.")
+            .unwrap_or(&item.verify_module);
+        let rel_path = module_suffix_to_rel_path(suffix);
+        let mir_path = mir_root.join(&rel_path);
+        let ob_path = obligations_root.join(&rel_path);
+        let ob_text = fs::read_to_string(&ob_path).unwrap_or_default();
+        let fault_census_json_path = generated_root
+            .join("FaultCensus")
+            .join(rel_path.with_extension("json"));
+        let expects_captured_mir_body = ob_text.contains(&format!("Mir.{suffix}.body"))
+            || fault_census_json_path.is_file();
+
+        let subject_mir_src = match fs::read_to_string(&mir_path) {
+            Ok(src) => src,
+            Err(err) => {
+                if expects_captured_mir_body {
+                    item.status = VerificationStatus::UnknownUnmappedFaultSite {
+                        missing_sites: Vec::new(),
+                        unemitted_classes: Vec::new(),
+                        reason: format!("missing MIR module for {suffix}: {err}"),
+                    };
+                }
+                continue;
+            }
+        };
+        if !subject_mir_src.contains("def body : CapturedMir") {
+            if expects_captured_mir_body {
+                item.status = VerificationStatus::UnknownUnmappedFaultSite {
+                    missing_sites: Vec::new(),
+                    unemitted_classes: Vec::new(),
+                    reason: format!(
+                        "MIR module for {suffix} is missing `def body : CapturedMir`"
+                    ),
+                };
+            }
+            continue;
+        }
+        let mut subject_body = match parse_lean_captured_mir_def(&subject_mir_src, "body") {
+            Ok(body) => body,
+            Err(err) => {
+                item.status = VerificationStatus::UnknownUnmappedFaultSite {
+                    missing_sites: Vec::new(),
+                    unemitted_classes: Vec::new(),
+                    reason: format!("MIR fault-census scan error in {suffix}: {err}"),
+                };
+                continue;
+            }
+        };
+        if subject_body.def_path.is_empty() {
+            subject_body.def_path = suffix.to_string();
+        }
+
+        let callee_suffixes = extract_default_callee_suffixes_from_obligations(&ob_text);
+        let explicit_external =
+            extract_external_callee_def_paths_from_obligations(&ob_text, &mir_root);
+
+        let verify_path = verify_root.join(&rel_path);
+        let verify_text = fs::read_to_string(&verify_path).unwrap_or_default();
+        let is_modular_surface = verify_text.contains("ModularVerificationResult")
+            || verify_text.contains("modularClaim")
+            || verify_text.contains("polyModularClaim");
+
+        let mut callee_bodies = Vec::new();
+        let mut scan_err_reasons = Vec::new();
+        for callee_suffix in callee_suffixes {
+            let callee_rel = module_suffix_to_rel_path(&callee_suffix);
+            let callee_mir_path = mir_root.join(&callee_rel);
+            let callee_src = match fs::read_to_string(&callee_mir_path) {
+                Ok(src) => src,
+                Err(err) => {
+                    scan_err_reasons.push(format!(
+                        "missing MIR module for callee {callee_suffix}: {err}"
+                    ));
+                    continue;
+                }
+            };
+            match parse_lean_captured_mir_def(&callee_src, "body") {
+                Ok(mut cbody) => {
+                    if cbody.def_path.is_empty() {
+                        cbody.def_path = callee_suffix;
+                    }
+                    callee_bodies.push(cbody);
+                }
+                Err(err) => {
+                    scan_err_reasons.push(format!(
+                        "MIR fault-census scan error in callee {callee_suffix}: {err}"
+                    ));
+                }
+            }
+        }
+        if !scan_err_reasons.is_empty() {
+            item.status = VerificationStatus::UnknownUnmappedFaultSite {
+                missing_sites: Vec::new(),
+                unemitted_classes: Vec::new(),
+                reason: scan_err_reasons.join("; "),
+            };
+            continue;
+        }
+
+        let filter_dropped = |sites: Vec<FaultSite>| -> Vec<FaultSite> {
+            sites
+                .into_iter()
+                .filter(|s| !dropped_sites.contains(s))
+                .collect()
+        };
+        let mut items = Vec::with_capacity(1 + callee_bodies.len());
+        items.push(ItemCoverageInput {
+            def_path: subject_body.def_path.clone(),
+            body: subject_body.clone(),
+            discharged: filter_dropped(emit_obligation_fault_sites_for_body(&subject_body)),
+        });
+        for callee in &callee_bodies {
+            items.push(ItemCoverageInput {
+                def_path: callee.def_path.clone(),
+                body: callee.clone(),
+                discharged: filter_dropped(emit_obligation_fault_sites_for_body(callee)),
+            });
+        }
+        let closure = obligations::build_batch_callee_closure(
+            &subject_body,
+            &callee_bodies,
+            &explicit_external,
+            is_assumed_or_ub_exc || is_modular_surface,
+        );
+
+        let verdict = reconcile_multi_item_coverage(&items, &closure, registry);
+        if let MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+            failed_items,
+            unsupported_reasons,
+        } = verdict
+        {
+            let mut missing_sites = Vec::new();
+            let mut unemitted_set = std::collections::BTreeSet::new();
+            for (_def_path, item_verdict) in failed_items {
+                if let CoverageVerdict::UnknownUnmappedFaultSite {
+                    missing_sites: m_sites,
+                    unemitted_classes: u_classes,
+                    ..
+                } = item_verdict
+                {
+                    for s in m_sites {
+                        if !missing_sites.contains(&s) {
+                            missing_sites.push(s);
+                        }
+                    }
+                    unemitted_set.extend(u_classes);
+                }
+            }
+            item.status = VerificationStatus::UnknownUnmappedFaultSite {
+                missing_sites,
+                unemitted_classes: unemitted_set.into_iter().collect(),
+                reason: unsupported_reasons.join("; "),
+            };
+        }
+    }
 }
 
 fn resolve_filtered_verify_modules(
@@ -4487,6 +4848,7 @@ mod tests {
             generated_obligation_files: vec![PathBuf::from("o")],
             generated_assumption_files: Vec::new(),
             generated_verify_files: vec![PathBuf::from("v")],
+            generated_fault_census_files: Vec::new(),
             created_spec_files: vec![PathBuf::from("s1")],
             preserved_spec_files: Vec::new(),
             created_proof_files: vec![PathBuf::from("p1")],
@@ -4857,6 +5219,242 @@ end Mir.Core.tuple_and_adt
                 "unsafe extern \"C\" fn external_spec_c_crc32(ptr: *const u8, len: usize) -> u32;"
             ),
             "extern C function must preserve `extern \"C\"` in snippet:\n{ffi_snippet}"
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn fault_census_scaffold_agent_context_and_fail_closed_reconciliation() {
+        use std::collections::BTreeSet;
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let workspace = env::temp_dir().join(format!(
+            "cargo-anneal-fault-census-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+
+        let callee_mir = r#"import Trusted
+
+namespace Mir.Demo.leaf
+open Trusted.MirAst
+def body : CapturedMir :=
+  {
+    defPath := "demo::leaf"
+    phase := MirPhaseTag.runtimePostCleanup
+    role := ContractRole.subject
+    argCount := 1
+    localDecls := []
+    basicBlocks :=
+      (List.cons {
+        statements :=
+          (List.cons { kind := (StatementKind.assign { local_ := 0, projection := List.nil } (Rvalue.binaryOp BinOp.div (Operand.copy { local_ := 1, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 2, sizeBytes := 4 })) }))), span := "src/lib.rs:1:1" } List.nil)
+        terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:1:2" }
+        isCleanup := false
+      } List.nil)
+    fnAbi := { args := [], ret := { layoutIdx := 0, mode := .direct }, conv := .rust, canUnwind := false }
+    layouts := []
+    allocations := []
+  }
+end Mir.Demo.leaf
+"#;
+
+        let caller_mir = r#"import Trusted
+
+namespace Mir.Demo.caller
+open Trusted.MirAst
+def body : CapturedMir :=
+  {
+    defPath := "demo::caller"
+    phase := MirPhaseTag.runtimePostCleanup
+    role := ContractRole.subject
+    argCount := 1
+    localDecls := []
+    basicBlocks :=
+      (List.cons {
+        statements :=
+          (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:2:1" } List.nil)
+        terminator :=
+          { kind := (TerminatorKind.call
+            (Operand.constant { ty := { kind := (RigidTy.fnDef "demo::leaf" List.nil), layoutIdx := 0 }, val := ConstValue.zeroSized })
+            (List.cons (Operand.copy { local_ := 1, projection := List.nil }) List.nil)
+            { local_ := 0, projection := List.nil }
+            (Option.some 1)
+            UnwindAction.continue_), span := "src/lib.rs:2:2" }
+        isCleanup := false
+      } (List.cons {
+        statements :=
+          (List.cons { kind := (StatementKind.storageDead 2), span := "src/lib.rs:2:3" } List.nil)
+        terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:2:4" }
+        isCleanup := false
+      } List.nil))
+    fnAbi := { args := [], ret := { layoutIdx := 0, mode := .direct }, conv := .rust, canUnwind := false }
+    layouts := []
+    allocations := []
+  }
+end Mir.Demo.caller
+"#;
+
+        let units_dir = workspace.join("target/anneal/units/u0");
+        let unit_mir_dir = units_dir.join("Mir/Demo");
+        fs::create_dir_all(&unit_mir_dir).expect("create unit Mir/Demo");
+        fs::write(unit_mir_dir.join("leaf.lean"), callee_mir).expect("write leaf.lean");
+        fs::write(unit_mir_dir.join("caller.lean"), caller_mir).expect("write caller.lean");
+
+        let records = vec![
+            UnitTargetRecord {
+                target: anneal_rustc_capture::CapturedTarget {
+                    def_id: "demo::caller".to_string(),
+                    mir_module_path: "Mir/Demo/caller.lean".to_string(),
+                    mir_module_sha256: anneal_rustc_capture::sha256_hex(caller_mir.as_bytes()),
+                },
+                lean_module_name: "Mir.Demo.caller".to_string(),
+                item_kind: CapturedItemKind::Subject,
+                associated_subject_def_id: None,
+                trait_impls: Vec::new(),
+            },
+            UnitTargetRecord {
+                target: anneal_rustc_capture::CapturedTarget {
+                    def_id: "demo::leaf".to_string(),
+                    mir_module_path: "Mir/Demo/leaf.lean".to_string(),
+                    mir_module_sha256: anneal_rustc_capture::sha256_hex(callee_mir.as_bytes()),
+                },
+                lean_module_name: "Mir.Demo.leaf".to_string(),
+                item_kind: CapturedItemKind::Callee,
+                associated_subject_def_id: None,
+                trait_impls: Vec::new(),
+            },
+        ];
+
+        let scaffold_cfg = ScaffoldConfig::new(&workspace);
+        let scaffold_rep =
+            scaffold_workspace_with_config(&scaffold_cfg, &records).expect("scaffold workspace");
+        assert_eq!(scaffold_rep.generated_fault_census_files.len(), 1);
+        let census_json_path = workspace.join(".anneal/generated/FaultCensus/Demo/caller.json");
+        assert!(census_json_path.is_file(), "FaultCensus/Demo/caller.json must exist");
+        let census_json = fs::read_to_string(&census_json_path).expect("read caller.json");
+        assert!(
+            census_json.contains("\"reconciliation_verdict\": \"VERIFIED\""),
+            "{census_json}"
+        );
+        assert!(census_json.contains("\"demo::leaf\""), "{census_json}");
+
+        let ob_text = fs::read_to_string(workspace.join(".anneal/generated/Obligations/Demo/caller.lean"))
+            .expect("read Obligations/Demo/caller.lean");
+        assert!(
+            ob_text.contains("Fault-site census coverage summary (compiler-generated metadata):"),
+            "{ob_text}"
+        );
+        assert!(ob_text.contains("verdict: VERIFIED"), "{ob_text}");
+        assert!(!ob_text.contains("import Anneal"), "Obligations must never import Anneal");
+
+        let agent_ctx =
+            render_agent_context(&workspace, &records, None).expect("render_agent_context");
+        assert!(
+            agent_ctx.contains("### Fault-Site Census & Coverage Reconciliation"),
+            "{agent_ctx}"
+        );
+        assert!(agent_ctx.contains("verdict: VERIFIED"), "{agent_ctx}");
+
+        // Positive reconciliation on VerificationReport under PropertyRegistry::all_verified()
+        let mut report = VerificationReport {
+            items: vec![ItemVerificationReport {
+                verify_module: "Verify.Demo.caller".to_string(),
+                status: VerificationStatus::VerifiedUnconditional,
+            }],
+        };
+        apply_fault_site_coverage_reconciliation(
+            &workspace,
+            &mut report,
+            &PropertyRegistry::all_verified(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            report.status_for("Verify.Demo.caller"),
+            Some(&VerificationStatus::VerifiedUnconditional)
+        );
+
+        // Negative test 1: Downgrading a required MirFaultClass in callee (`DivRemByZero`)
+        // to `UnemittedGap` fails closed with `VerificationStatus::UnknownUnmappedFaultSite`.
+        let mut reg_gap = PropertyRegistry::all_verified();
+        reg_gap.set_status(MirFaultClass::DivRemByZero, PropertyStatus::UnemittedGap);
+        let mut report_gap = VerificationReport {
+            items: vec![ItemVerificationReport {
+                verify_module: "Verify.Demo.caller".to_string(),
+                status: VerificationStatus::VerifiedUnconditional,
+            }],
+        };
+        apply_fault_site_coverage_reconciliation(
+            &workspace,
+            &mut report_gap,
+            &reg_gap,
+            &BTreeSet::new(),
+        );
+        let status_gap = report_gap
+            .status_for("Verify.Demo.caller")
+            .expect("status for caller");
+        assert_eq!(status_gap.as_str(), "UNKNOWN(UNMAPPED_FAULT_SITE)");
+        let rendered_gap = render_verification_report(&report_gap);
+        assert!(
+            rendered_gap.contains("Verify.Demo.caller: UNKNOWN(UNMAPPED_FAULT_SITE)"),
+            "{rendered_gap}"
+        );
+
+        // Negative test 2: Dropping a fault site from `discharged` fails closed with
+        // `VerificationStatus::UnknownUnmappedFaultSite`.
+        let dropped = BTreeSet::from([FaultSite::new(
+            0,
+            0,
+            MirFaultClass::StorageLiveProtected,
+        )]);
+        let mut report_dropped = VerificationReport {
+            items: vec![ItemVerificationReport {
+                verify_module: "Verify.Demo.caller".to_string(),
+                status: VerificationStatus::VerifiedUnconditional,
+            }],
+        };
+        apply_fault_site_coverage_reconciliation(
+            &workspace,
+            &mut report_dropped,
+            &PropertyRegistry::all_verified(),
+            &dropped,
+        );
+        let status_dropped = report_dropped
+            .status_for("Verify.Demo.caller")
+            .expect("status for caller");
+        assert_eq!(status_dropped.as_str(), "UNKNOWN(UNMAPPED_FAULT_SITE)");
+
+        // Negative test 3: Truncating or deleting a callee's `Mir/<Callee>.lean`
+        // fails closed with `VerificationStatus::UnknownUnmappedFaultSite`.
+        fs::write(
+            workspace.join(".anneal/generated/Mir/Demo/leaf.lean"),
+            "import Trusted\nnamespace Mir.Demo.leaf\ndef body : CapturedMir := {\n",
+        )
+        .expect("truncate leaf.lean");
+        let mut report_truncated = VerificationReport {
+            items: vec![ItemVerificationReport {
+                verify_module: "Verify.Demo.caller".to_string(),
+                status: VerificationStatus::VerifiedUnconditional,
+            }],
+        };
+        apply_fault_site_coverage_reconciliation(
+            &workspace,
+            &mut report_truncated,
+            &PropertyRegistry::all_verified(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            report_truncated
+                .status_for("Verify.Demo.caller")
+                .expect("status for caller")
+                .as_str(),
+            "UNKNOWN(UNMAPPED_FAULT_SITE)"
         );
 
         let _ = fs::remove_dir_all(&workspace);

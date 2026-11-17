@@ -27,12 +27,14 @@ use std::path::{Path, PathBuf};
 use anneal_rustc_capture::lean_emit::render_mir_module_header;
 use anneal_rustc_capture::{CapturedItemKind, CapturedTarget, UnitTargetRecord, sha256_hex};
 
+use crate::fault_census::{FaultCensusReceipt, MultiItemCoverageVerdict, PropertyRegistry};
 use crate::obligations::{
     AuthoredItemModules, CalleeContractRef, ExternalSpecContractRef, SubjectObligationBundle,
     TransitiveCalleeRef,
-    collect_external_spec_contracts, derive_item_module_suffix, group_subject_obligations,
-    module_suffix_to_rel_path, render_crate_verify_module, render_generated_assumptions_module,
-    render_obligations_module_with_options, render_proof_template_with_options,
+    collect_external_spec_contracts, compute_bundle_fault_census_receipt,
+    derive_item_module_suffix, group_subject_obligations, module_suffix_to_rel_path,
+    render_crate_verify_module, render_generated_assumptions_module,
+    render_obligations_module_with_census, render_proof_template_with_options,
     render_specs_template, render_verify_module_with_options,
 };
 
@@ -122,6 +124,8 @@ pub struct ScaffoldReport {
     pub generated_assumption_files: Vec<PathBuf>,
     /// Paths to `.anneal/generated/Verify/<Item>.lean` modules written.
     pub generated_verify_files: Vec<PathBuf>,
+    /// Paths to `.anneal/generated/FaultCensus/<Item>.json` receipts written.
+    pub generated_fault_census_files: Vec<PathBuf>,
     /// Paths to `anneal/proofs/Specs/<Item>.lean` files newly created on this
     /// run.
     pub created_spec_files: Vec<PathBuf>,
@@ -681,6 +685,71 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<(), String> {
         .map_err(|err| format!("failed to write {}: {}", path.display(), err))
 }
 
+/// Compute the `FaultCensusReceipt` and `MultiItemCoverageVerdict` for `bundle`
+/// when a captured `Mir/<Item>.lean` body (`def body : CapturedMir`) is present
+/// under `mir_root` or the workspace's unit directories.
+///
+/// Header-only MIR stubs (emitted when no source MIR file was present) return
+/// `Ok(None)`.
+pub fn compute_workspace_bundle_fault_census(
+    mir_root: &Path,
+    records: &[UnitTargetRecord],
+    bundle: &SubjectObligationBundle,
+) -> Result<Option<(FaultCensusReceipt, MultiItemCoverageVerdict)>, String> {
+    let Some(subject_mir_path) =
+        resolve_workspace_mir_file(mir_root, &bundle.subject, &bundle.item_rel_path)
+    else {
+        return Ok(None);
+    };
+    let Ok(subject_mir_src) = fs::read_to_string(&subject_mir_path) else {
+        return Ok(None);
+    };
+    if !subject_mir_src.contains("def body : CapturedMir")
+        || !subject_mir_src.contains("phase :=")
+    {
+        return Ok(None);
+    }
+
+    let record_by_def_id: BTreeMap<&str, &UnitTargetRecord> = records
+        .iter()
+        .map(|r| (r.target.def_id.as_str(), r))
+        .collect();
+    let mut callee_sources = Vec::new();
+    for callee in &bundle.transitive_callees {
+        let callee_rel = module_suffix_to_rel_path(&callee.item_module_suffix);
+        let callee_path = if let Some(rec) = record_by_def_id.get(callee.def_id.as_str()) {
+            resolve_workspace_mir_file(mir_root, rec, &callee_rel)
+        } else {
+            let direct = mir_root.join(&callee_rel);
+            direct.is_file().then_some(direct)
+        };
+        if let Some(path) = callee_path
+            && let Ok(src) = fs::read_to_string(&path)
+            && src.contains("def body : CapturedMir")
+            && src.contains("phase :=")
+        {
+            callee_sources.push((callee.def_id.clone(), src));
+        }
+    }
+
+    let (receipt, verdict) = compute_bundle_fault_census_receipt(
+        bundle,
+        &subject_mir_src,
+        &callee_sources,
+        &PropertyRegistry::all_verified(),
+        &BTreeSet::new(),
+    )
+    .map_err(|err| {
+        format!(
+            "failed to scan captured MIR for fault-site census of `{}` ({}): {}",
+            bundle.subject.target.def_id,
+            subject_mir_path.display(),
+            err
+        )
+    })?;
+    Ok(Some((receipt, verdict)))
+}
+
 /// Scaffold `.anneal/` and `anneal/proofs/` according to `config` for the
 /// captured `records`.
 ///
@@ -697,6 +766,7 @@ pub fn scaffold_workspace_with_config(
     let mir_root = generated_dir.join("Mir");
     let obligations_root = generated_dir.join("Obligations");
     let verify_root = generated_dir.join("Verify");
+    let fault_census_root = generated_dir.join("FaultCensus");
 
     let proofs_root = config.workspace_root.join("anneal").join("proofs");
     let specs_root = proofs_root.join("Specs");
@@ -708,6 +778,7 @@ pub fn scaffold_workspace_with_config(
         &mir_root,
         &obligations_root,
         &verify_root,
+        &fault_census_root,
         &proofs_root,
     ] {
         fs::create_dir_all(dir)
@@ -848,8 +919,19 @@ pub fn scaffold_workspace_with_config(
             report.generated_assumption_files.push(gen_assumptions_path);
         }
 
+        let census_pair =
+            compute_workspace_bundle_fault_census(&mir_root, &sorted_records, bundle)?;
+        let census_receipt = census_pair.as_ref().map(|(r, _)| r);
+        if let Some(receipt) = census_receipt {
+            let census_rel = bundle.item_rel_path.with_extension("json");
+            let census_path = fault_census_root.join(census_rel);
+            write_if_changed(&census_path, &receipt.to_json_string())?;
+            report.generated_fault_census_files.push(census_path);
+        }
+
         let obligation_path = obligations_root.join(&bundle.item_rel_path);
-        let obligation_contents = render_obligations_module_with_options(bundle, authored);
+        let obligation_contents =
+            render_obligations_module_with_census(bundle, authored, census_receipt);
         write_if_changed(&obligation_path, &obligation_contents)?;
         report.generated_obligation_files.push(obligation_path);
 
@@ -865,6 +947,7 @@ pub fn scaffold_workspace_with_config(
         .chain(&report.generated_obligation_files)
         .chain(&report.generated_assumption_files)
         .chain(&report.generated_verify_files)
+        .chain(&report.generated_fault_census_files)
         .cloned()
         .collect();
     prune_stale_generated_modules(&generated_dir, &generated_this_run)?;
@@ -922,6 +1005,43 @@ fn prune_stale_generated_modules(
             }
         }
         remove_empty_subdirs(&category_root)?;
+    }
+    let fault_census_root = generated_dir.join("FaultCensus");
+    let mut json_files = Vec::new();
+    collect_files_with_ext_recursive(&fault_census_root, "json", &mut json_files)?;
+    for file in json_files {
+        if !keep.contains(&file) {
+            fs::remove_file(&file).map_err(|err| {
+                format!(
+                    "failed to remove stale fault-census receipt {}: {}",
+                    file.display(),
+                    err
+                )
+            })?;
+        }
+    }
+    remove_empty_subdirs(&fault_census_root)?;
+    Ok(())
+}
+
+fn collect_files_with_ext_recursive(
+    dir: &Path,
+    ext: &str,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(dir)
+        .map_err(|err| format!("failed to read directory {}: {}", dir.display(), err))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_with_ext_recursive(&path, ext, out)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
+            out.push(path);
+        }
     }
     Ok(())
 }
@@ -1080,6 +1200,15 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
             let new_verify = render_verify_module_with_options(&synthetic_bundle, authored);
             write_if_changed(verify_path, &new_verify)?;
         }
+
+        if let Ok(Some((receipt, _verdict))) =
+            compute_workspace_bundle_fault_census(&mir_root, &[], &synthetic_bundle)
+        {
+            let fault_census_root = generated_dir.join("FaultCensus");
+            let census_path = fault_census_root.join(rel_path.with_extension("json"));
+            write_if_changed(&census_path, &receipt.to_json_string())?;
+        }
+
         refreshed_bundles.push(synthetic_bundle);
 
         if let Some(ob_text) = ob_text_opt {

@@ -1,5 +1,6 @@
 import Trusted
 import Anneal.Memory
+import Anneal.FaultSiteCensus
 
 namespace Anneal.UnsafeObligations
 
@@ -7,6 +8,7 @@ open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
+open Anneal.FaultSiteCensus
 
 /-!
 Structured proof obligations and operational bridge theorems for `unsafe` Rust
@@ -183,7 +185,9 @@ theorem checkAlignedBool_of_alignedPtr
     (h : AlignedPtr rp alignBytes) :
     checkAlignedBool rp alignBytes = true := by
   rcases h with ⟨hPos, hMod⟩
-  simp [checkAlignedBool, Nat.ble_eq_true_of_le hPos, hMod]
+  unfold checkAlignedBool
+  rw [Nat.ble_eq_true_of_le hPos, Bool.true_and, beq_iff_eq]
+  exact hMod
 
 theorem evalLoadRawPtr_of_obligations
     (mem : Memory) (locals : List LocalValue) (rp : RawPtrVal)
@@ -490,5 +494,220 @@ theorem evalPtrOffset_end_of_validArrayToSliceCast
     evalPtrOffset rp (arrayLen * elemSize) allocLen =
       some { rp with offset := rp.offset + arrayLen * elemSize } :=
   evalPtrOffset_of_validSliceRange _ _ _ (validArrayToSliceCast_inBounds h)
+
+/-! ## 4. `MirFaultClass` Taxonomy & Fault-Site Coverage Bridge Theorems -/
+
+/--
+Enumeration of the five named `unsafe` safety obligations in `Anneal.UnsafeObligations`.
+-/
+inductive UnsafeObligationKind : Type where
+  /-- 1. `AlignedPtr`: pointer offset is aligned for the pointee layout. -/
+  | alignedPtr : UnsafeObligationKind
+  /-- 2. `LiveAllocAt`: target allocation is live and initialized at the pointer offset. -/
+  | liveAllocAt : UnsafeObligationKind
+  /-- 3. `ValidSliceRange`: pointer offset plus slice/offset length lies in bounds. -/
+  | validSliceRange : UnsafeObligationKind
+  /-- 4. `NonOverlappingPtrs`: source and destination pointer ranges are disjoint. -/
+  | nonOverlappingPtrs : UnsafeObligationKind
+  /-- 5. `HasTreeBorrowAccess`: Tree Borrows provenance tag permits the access. -/
+  | hasTreeBorrowAccess : UnsafeObligationKind
+  deriving DecidableEq, Repr, BEq, Inhabited
+
+/--
+Canonical mapping from each of the five `unsafe` safety obligation kinds to the
+`MirFaultClass` categories in `Anneal.FaultSiteCensus` that it discharges.
+-/
+def unsafeObligationFaultClasses : UnsafeObligationKind → List MirFaultClass
+  | .alignedPtr => [.ptrAlignMismatch]
+  | .liveAllocAt => [.ptrDerefInvalid, .uninitRead, .storageLiveProtected]
+  | .validSliceRange => [.arithOverflow, .boundsCheck]
+  | .nonOverlappingPtrs => [.ptrDerefInvalid, .treeBorrowsViolation]
+  | .hasTreeBorrowAccess => [.treeBorrowsViolation]
+
+/--
+Every `MirFaultClass` emitted by `censusProjectionElemFaultClasses .deref`
+is covered by `{.alignedPtr, .liveAllocAt, .hasTreeBorrowAccess}`.
+-/
+theorem deref_faultClasses_subset_unsafeObligations :
+    ∀ cls ∈ censusProjectionElemFaultClasses .deref,
+      cls ∈ unsafeObligationFaultClasses .alignedPtr ++
+            unsafeObligationFaultClasses .liveAllocAt ++
+            unsafeObligationFaultClasses .hasTreeBorrowAccess := by
+  decide
+
+/--
+Every `MirFaultClass` emitted by `censusBinOpFaultClasses .offset`
+is covered by `{.validSliceRange, .liveAllocAt, .hasTreeBorrowAccess}`.
+-/
+theorem offset_faultClasses_subset_unsafeObligations :
+    ∀ cls ∈ censusBinOpFaultClasses .offset,
+      cls ∈ unsafeObligationFaultClasses .validSliceRange ++
+            unsafeObligationFaultClasses .liveAllocAt ++
+            unsafeObligationFaultClasses .hasTreeBorrowAccess := by
+  decide
+
+/--
+Bridge theorem tying `evalOperand_deref_of_obligations` to non-`.ub` execution
+and the exact fault-class census of a dereferencing operand read
+(`Operand.copy { local_ := ptrLocal, projection := [.deref] }`).
+-/
+theorem evalOperand_deref_ne_ub_and_census_of_obligations
+    (mem : Memory) (locals : List LocalValue) (ptrLocal : Local)
+    (rp : RawPtrVal) (sz : Nat) (entry : BorrowEntry) (v : Value)
+    (hPtr : get? locals ptrLocal = some (.init (.ptr rp.toProvenancePtr sz)))
+    (hLookup : lookupBorrow mem.borrows rp.toProvenancePtr.tag = some entry)
+    (hNotDis : entry.perm ≠ .disabled)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? locals entry.targetLocal = some (.init v)) :
+    let op : Operand := .copy { local_ := ptrLocal, projection := [.deref] }
+    evalOperand locals op mem.borrows mem.globals ≠ .ub ∧
+    dedupFaultClasses (censusOperandFaultClasses op) =
+      [.ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation, .uninitRead] := by
+  have hOk := evalOperand_deref_of_obligations
+    mem locals ptrLocal rp sz entry v hPtr hLookup hNotDis hProj hTarget
+  refine ⟨?_, rfl⟩
+  rw [hOk]
+  intro hUb
+  nomatch hUb
+
+/--
+Bridge theorem tying `writePlaceValue_deref_of_obligations` to non-`.ub` execution
+and the exact fault-class census of a dereferencing place write
+(`{ local_ := ptrLocal, projection := [.deref] }`).
+-/
+theorem writePlaceValue_deref_ne_ub_and_census_of_obligations
+    (mem : Memory) (locals locals' : List LocalValue) (ptrLocal : Local)
+    (rp : RawPtrVal) (sz : Nat) (entry : BorrowEntry) (oldVal newVal : Value)
+    (hPtr : get? locals ptrLocal = some (.init (.ptr rp.toProvenancePtr sz)))
+    (hLookup : lookupBorrow mem.borrows rp.toProvenancePtr.tag = some entry)
+    (hWritable : entry.perm = .active ∨ entry.perm = .reserved)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? locals entry.targetLocal = some (.init oldVal))
+    (hSet : set? locals entry.targetLocal (.init newVal) = some locals') :
+    let dst : Place := { local_ := ptrLocal, projection := [.deref] }
+    writePlaceValue locals mem.borrows dst newVal ≠ .ub ∧
+    dedupFaultClasses (censusPlaceWriteFaultClasses dst) =
+      [.ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation, .uninitRead,
+       .storageLiveProtected] := by
+  have hOk := writePlaceValue_deref_of_obligations
+    mem locals locals' ptrLocal rp sz entry oldVal newVal
+    hPtr hLookup hWritable hProj hTarget hSet
+  refine ⟨?_, rfl⟩
+  rw [hOk]
+  intro hUb
+  nomatch hUb
+
+/--
+Bridge theorem tying `evalRvalue_offset_of_validSliceRange` to non-`.ub` execution
+and the exact `BinOp.offset` fault-class census.
+-/
+theorem evalRvalue_offset_ne_ub_and_census_of_validSliceRange
+    (locals : List LocalValue) (mem : Memory) (localDecls : List LocalDecl)
+    (lhsOp rhsOp : Operand) (rp : RawPtrVal) (sz delta totalLen : Nat)
+    (hRange : ValidSliceRange rp delta totalLen)
+    (hLhs :
+      evalOperand locals lhsOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals localDecls
+          mem.callStack =
+        .ok (.ptr rp.toProvenancePtr sz) locals)
+    (hRhs :
+      evalOperand locals rhsOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals localDecls
+          mem.callStack =
+        .ok (.scalar ⟨delta, 8⟩) locals)
+    (hStride : pointeeElemByteStride localDecls emptyLayoutTable lhsOp = .some 1)
+    (hOffset :
+      evalBinOpOffset rp.toProvenancePtr sz ⟨delta, 8⟩ 1
+        (ptrAllocByteBound? locals mem localDecls emptyLayoutTable rp.toProvenancePtr) =
+        .some { rp.toProvenancePtr with
+                offsetBytes := rp.toProvenancePtr.offsetBytes + delta }) :
+    evalRvalue locals (.binaryOp .offset lhsOp rhsOp) mem localDecls ≠ .ub ∧
+    ValidSliceRange rp delta totalLen ∧
+    censusBinOpFaultClasses .offset =
+      [.arithOverflow, .boundsCheck, .ptrDerefInvalid, .treeBorrowsViolation] := by
+  have hEv := (evalRvalue_offset_of_validSliceRange
+    locals mem localDecls lhsOp rhsOp rp sz delta totalLen
+    hRange hLhs hRhs hStride hOffset).1
+  refine ⟨?_, hRange, rfl⟩
+  rw [hEv]
+  intro hUb
+  nomatch hUb
+
+/--
+Bridge theorem tying `evalCopyNonOverlapping_one_of_obligations` to non-`.ub`
+statement execution (`¬ StepNodeExposesUb`) and `reconcileFaultCoverageWithRegistry`
+discharge of the `copyNonOverlapping` intrinsic fault sites at `(blockIdx, stmtIdx)`.
+-/
+theorem evalCopyNonOverlapping_one_not_exposesUb_and_census_of_obligations
+    (s : MachineState) (srcOp dstOp countOp : Operand) (span : String)
+    (blockIdx : BasicBlockIdx) (stmtIdx : Nat)
+    (registry : PropertyRegistry) (discharged : List FaultSite)
+    (src dst : RawPtrVal) (sz : Nat) (srcEntry dstEntry : BorrowEntry)
+    (copiedVal oldDstVal : Value) (locals' : List LocalValue)
+    (hNonoverlap : NonOverlappingPtrs src dst 1)
+    (hSrcOff : src.offset = 0)
+    (hDstOff : dst.offset = 0)
+    (hSrc :
+      evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals
+          (callStack := s.memory.callStack) =
+        .ok (.ptr src.toProvenancePtr sz) s.frame.locals)
+    (hDst :
+      evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals
+          (callStack := s.memory.callStack) =
+        .ok (.ptr dst.toProvenancePtr sz) s.frame.locals)
+    (hCnt :
+      evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals
+          (callStack := s.memory.callStack) =
+        .ok (.scalar ⟨1, 8⟩) s.frame.locals)
+    (hSrcPt : operandPointeeTy [] emptyLayoutTable srcOp = none)
+    (hSrcLookup :
+      lookupBorrow s.memory.borrows src.toProvenancePtr.tag = some srcEntry)
+    (hDstLookup :
+      lookupBorrow s.memory.borrows dst.toProvenancePtr.tag = some dstEntry)
+    (hSrcPerm : srcEntry.perm = .frozen)
+    (hDstPerm : dstEntry.perm = .active)
+    (hTagNe : Nat.beq src.toProvenancePtr.tag dst.toProvenancePtr.tag = false)
+    (hLocNe : Nat.beq srcEntry.targetLocal dstEntry.targetLocal = false)
+    (hSrcProj : srcEntry.targetProjection = [])
+    (hDstProj : dstEntry.targetProjection = [])
+    (hSrcVal : get? s.frame.locals srcEntry.targetLocal = some (.init copiedVal))
+    (hDstVal : get? s.frame.locals dstEntry.targetLocal = some (.init oldDstVal))
+    (hWrite :
+      set? s.frame.locals dstEntry.targetLocal (.init copiedVal) =
+        some locals')
+    (hFrame :
+      copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true)
+    (hRec :
+      reconcileFaultCoverageWithRegistry registry
+        (censusStmtFaultSites blockIdx stmtIdx
+          ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩)
+        discharged = .verified) :
+    ¬ StepNodeExposesUb
+        (evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩
+          [] emptyLayoutTable) ∧
+    NonOverlappingPtrs src dst 1 ∧
+    ∀ cls ∈ [MirFaultClass.arithOverflow, .boundsCheck, .ptrDerefInvalid,
+              .ptrAlignMismatch, .treeBorrowsViolation, .scalarNicheInvalid, .uninitRead],
+      (blockIdx, stmtIdx, cls) ∈ discharged ∧ registry cls = .emittedAndVerified := by
+  have hStep := (evalCopyNonOverlapping_one_of_obligations
+    s srcOp dstOp countOp src dst sz srcEntry dstEntry copiedVal oldDstVal locals'
+    hNonoverlap hSrcOff hDstOff hSrc hDst hCnt hSrcPt hSrcLookup hDstLookup
+    hSrcPerm hDstPerm hTagNe hLocNe hSrcProj hDstProj hSrcVal hDstVal hWrite hFrame).1
+  refine ⟨?_, hNonoverlap, ?_⟩
+  · dsimp only [evalStmt]
+    rw [hStep]
+    intro hUb
+    nomatch hUb
+  · intro cls hCls
+    have hInStmt : cls ∈ censusStmtFaultClasses
+        (.intrinsic (.copyNonOverlapping srcOp dstOp countOp)) := by
+      simp only [censusStmtFaultClasses, censusIntrinsicFaultClasses,
+        mem_dedupFaultClasses_iff, List.mem_append]
+      exact Or.inr hCls
+    have hInSites : (blockIdx, stmtIdx, cls) ∈
+        censusStmtFaultSites blockIdx stmtIdx
+          ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩ := by
+      simp only [censusStmtFaultSites, List.mem_map]
+      exact ⟨cls, hInStmt, rfl⟩
+    exact (reconcileFaultCoverageWithRegistry_verified_iff registry _ discharged).mp
+      hRec (blockIdx, stmtIdx, cls) hInSites
 
 end Anneal.UnsafeObligations

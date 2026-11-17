@@ -2943,9 +2943,13 @@ theorem callerFfiAndLen_verified :
   intro ans h_post
   cases ans with
   | returned retVal memAfter =>
-    rcases h_post with ⟨⟨_, h_stack, h_active, _, _⟩, h_ret, _⟩
+    rcases h_post with ⟨⟨_, h_stack, h_active, h_prot, _⟩, h_ret, _⟩
     have h_act : memAfter.activeCallee = .some Mir.CrateA.caller_ffi_and_len.body := h_active
     have h_stk : memAfter.callStack = .nil := h_stack
+    have h_prt : memAfter.activeProtectors = .nil := h_prot
+    unfold resumeExternalCall
+    dsimp only [evalPlaceWrite]
+    rw [h_prt]
     change
       Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
         Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
@@ -2957,9 +2961,18 @@ theorem callerFfiAndLen_verified :
             stmtIdx := 0
             locals := [.init retVal, .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
           }
-          memory := memAfter
+          memory := {
+            memAfter with
+            borrows :=
+              (invalidateDirectDestWriteBorrows memAfter
+                [.uninit, .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
+                { local_ := 0, projection := [] }).borrows
+            activeProtectors := []
+          }
         })
         _
+    have h_nprot : ∀ b d m, hasFrameDeallocProtectorConflict b [] d m = false := by
+      intro b d m; cases b <;> rfl
     unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
     dsimp only [
       Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular,
@@ -2969,6 +2982,8 @@ theorem callerFfiAndLen_verified :
       evalTerminator
     ]
     rw [h_act, h_stk]
+    dsimp only [Option.getD, Mir.CrateA.caller_ffi_and_len.body, get?, length]
+    rw [h_nprot]
     intro r m h_out
     cases h_out
     exact ⟨trivial, h_ret⟩
@@ -3262,9 +3277,13 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
   intro ans h_post
   cases ans with
   | returned retVal memAfter =>
-    rcases h_post with ⟨⟨_, h_stack, h_active, _, _⟩, h_ret, _⟩
+    rcases h_post with ⟨⟨_, h_stack, h_active, h_prot, _⟩, h_ret, _⟩
     have h_act : memAfter.activeCallee = .some Mir.CrateA.caller_ffi_and_len.body := h_active
     have h_stk : memAfter.callStack = .nil := h_stack
+    have h_prt : memAfter.activeProtectors = .nil := h_prot
+    unfold resumeExternalCall
+    dsimp only [evalPlaceWrite]
+    rw [h_prt]
     change
       Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
         Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
@@ -3276,9 +3295,18 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
             stmtIdx := 0
             locals := [.init retVal, .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
           }
-          memory := memAfter
+          memory := {
+            memAfter with
+            borrows :=
+              (invalidateDirectDestWriteBorrows memAfter
+                [.uninit, .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
+                { local_ := 0, projection := [] }).borrows
+            activeProtectors := []
+          }
         })
         _
+    have h_nprot : ∀ b d m, hasFrameDeallocProtectorConflict b [] d m = false := by
+      intro b d m; cases b <;> rfl
     unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
     dsimp only [
       Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular,
@@ -3288,6 +3316,8 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
       evalTerminator
     ]
     rw [h_act, h_stk]
+    dsimp only [Option.getD, Mir.CrateA.caller_ffi_and_len.body, get?, length]
+    rw [h_nprot]
     intro r m h_out
     cases h_out
     exact ⟨trivial, h_ret⟩

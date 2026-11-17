@@ -15,6 +15,961 @@ use std::path::PathBuf;
 
 use anneal_rustc_capture::{CapturedItemKind, UnitTargetRecord};
 
+use crate::fault_census::{
+    CalleeClosure, CensusScanError, FaultCensusReceipt, FaultSite, ItemCoverageInput,
+    MirFaultClass, MultiItemCoverageVerdict, PropertyRegistry, ProtoAggregateKind, ProtoBinOp,
+    ProtoCastKind, ProtoConstValue, ProtoIntrinsic, ProtoMirBody, ProtoOperand, ProtoPlace,
+    ProtoProjectionElem, ProtoRvalue, ProtoStatementKind, ProtoTerminatorKind, ProtoUnOp,
+    ProtoUnwindAction, census_mir_fault_sites, direct_callee_def_paths,
+    parse_lean_captured_mir_def, reconcile_multi_item_coverage, reified_fn_def_paths,
+};
+
+/// Structural category of a fault site emitted by the `obligations.rs`
+/// obligation pipeline (independent of `fault_census::census_mir_fault_sites`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ObligationSiteKind {
+    /// Place or operand evaluation fault (`UninitRead`, `BoundsCheck`,
+    /// `PtrDerefInvalid`, `PtrAlignMismatch`, `TreeBorrowsViolation`,
+    /// `ScalarNicheInvalid`).
+    PlaceOrMemoryAccess,
+    /// Rvalue arithmetic, cast, or pointer computation fault
+    /// (`ArithOverflow`, `DivRemByZero`, `ShiftOverflow`, `BoundsCheck`,
+    /// `PtrDerefInvalid`, `PtrAlignMismatch`, `TreeBorrowsViolation`,
+    /// `ScalarNicheInvalid`, `UninitRead`, `CallAbiMismatch`).
+    RvalueComputation,
+    /// Statement-level liveness, discriminant, retag, or intrinsic fault
+    /// (`StorageLiveProtected`, `TreeBorrowsViolation`, `ScalarNicheInvalid`,
+    /// `UninitRead`, `BoundsCheck`, `PtrDerefInvalid`, `PtrAlignMismatch`,
+    /// `ArithOverflow`).
+    StatementEffect,
+    /// Terminator-level control-flow, assertion, call, drop, or return fault
+    /// (`ScalarNicheInvalid`, `UnreachableTerminator`, `CallAbiMismatch`,
+    /// `StorageLiveProtected`, `TreeBorrowsViolation`, `UninitRead`,
+    /// `BoundsCheck`, `PtrDerefInvalid`, `ArithOverflow`, `DivRemByZero`,
+    /// `ShiftOverflow`).
+    TerminatorControlFlow,
+}
+
+/// Fault site tagged with its obligation pipeline category.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaggedObligationSite {
+    /// Obligation category that discharges this fault site.
+    pub kind: ObligationSiteKind,
+    /// Underlying `(block_idx, stmt_idx, fault_class)` coordinate.
+    pub site: FaultSite,
+}
+
+fn push_obligation_proj_elem_sites(
+    proj: &ProtoProjectionElem,
+    bb_idx: usize,
+    stmt_idx: usize,
+    out: &mut Vec<TaggedObligationSite>,
+) {
+    let mut push = |fc: MirFaultClass| {
+        out.push(TaggedObligationSite {
+            kind: ObligationSiteKind::PlaceOrMemoryAccess,
+            site: FaultSite::new(bb_idx, stmt_idx, fc),
+        });
+    };
+    match proj {
+        ProtoProjectionElem::Deref => {
+            push(MirFaultClass::PtrDerefInvalid);
+            push(MirFaultClass::PtrAlignMismatch);
+            push(MirFaultClass::TreeBorrowsViolation);
+        }
+        ProtoProjectionElem::Field(_)
+        | ProtoProjectionElem::OpaqueCast
+        | ProtoProjectionElem::UnwrapUnsafeBinder => {}
+        ProtoProjectionElem::Index(_) => {
+            push(MirFaultClass::BoundsCheck);
+            push(MirFaultClass::UninitRead);
+        }
+        ProtoProjectionElem::ConstantIndex { .. } | ProtoProjectionElem::Subslice { .. } => {
+            push(MirFaultClass::BoundsCheck);
+        }
+        ProtoProjectionElem::Downcast(_, _) => {
+            push(MirFaultClass::ScalarNicheInvalid);
+        }
+    }
+}
+
+fn push_obligation_read_projected_sites(
+    proj: &ProtoProjectionElem,
+    bb_idx: usize,
+    stmt_idx: usize,
+    out: &mut Vec<TaggedObligationSite>,
+) {
+    let mut push = |fc: MirFaultClass| {
+        out.push(TaggedObligationSite {
+            kind: ObligationSiteKind::PlaceOrMemoryAccess,
+            site: FaultSite::new(bb_idx, stmt_idx, fc),
+        });
+    };
+    match proj {
+        ProtoProjectionElem::Deref
+        | ProtoProjectionElem::Field(_)
+        | ProtoProjectionElem::OpaqueCast
+        | ProtoProjectionElem::UnwrapUnsafeBinder => {}
+        ProtoProjectionElem::Downcast(_, _) => push(MirFaultClass::ScalarNicheInvalid),
+        ProtoProjectionElem::Subslice { .. } => push(MirFaultClass::BoundsCheck),
+        ProtoProjectionElem::Index(_) | ProtoProjectionElem::ConstantIndex { .. } => {
+            push(MirFaultClass::BoundsCheck);
+            push(MirFaultClass::ScalarNicheInvalid);
+            push(MirFaultClass::UninitRead);
+        }
+    }
+}
+
+fn push_obligation_place_read_sites(
+    place: &ProtoPlace,
+    bb_idx: usize,
+    stmt_idx: usize,
+    out: &mut Vec<TaggedObligationSite>,
+) {
+    out.push(TaggedObligationSite {
+        kind: ObligationSiteKind::PlaceOrMemoryAccess,
+        site: FaultSite::new(bb_idx, stmt_idx, MirFaultClass::UninitRead),
+    });
+    for proj in &place.projection {
+        push_obligation_proj_elem_sites(proj, bb_idx, stmt_idx, out);
+    }
+}
+
+fn push_obligation_place_write_sites(
+    place: &ProtoPlace,
+    bb_idx: usize,
+    stmt_idx: usize,
+    out: &mut Vec<TaggedObligationSite>,
+) {
+    let mut push = |fc: MirFaultClass| {
+        out.push(TaggedObligationSite {
+            kind: ObligationSiteKind::PlaceOrMemoryAccess,
+            site: FaultSite::new(bb_idx, stmt_idx, fc),
+        });
+    };
+    push(MirFaultClass::StorageLiveProtected);
+    push(MirFaultClass::TreeBorrowsViolation);
+    if !place.projection.is_empty() {
+        push(MirFaultClass::UninitRead);
+        for proj in &place.projection {
+            push_obligation_proj_elem_sites(proj, bb_idx, stmt_idx, out);
+        }
+    }
+}
+
+fn push_obligation_place_ref_sites(
+    place: &ProtoPlace,
+    bb_idx: usize,
+    stmt_idx: usize,
+    out: &mut Vec<TaggedObligationSite>,
+) {
+    let mut push = |fc: MirFaultClass| {
+        out.push(TaggedObligationSite {
+            kind: ObligationSiteKind::PlaceOrMemoryAccess,
+            site: FaultSite::new(bb_idx, stmt_idx, fc),
+        });
+    };
+    if !matches!(place.projection.first(), Some(ProtoProjectionElem::Deref)) {
+        if place
+            .projection
+            .iter()
+            .any(|p| matches!(p, ProtoProjectionElem::Subslice { .. }))
+        {
+            push(MirFaultClass::UninitRead);
+            push(MirFaultClass::BoundsCheck);
+            push(MirFaultClass::PtrAlignMismatch);
+        } else {
+            push(MirFaultClass::UninitRead);
+        }
+        return;
+    }
+    push(MirFaultClass::UninitRead);
+    push(MirFaultClass::PtrDerefInvalid);
+    push(MirFaultClass::PtrAlignMismatch);
+    push(MirFaultClass::TreeBorrowsViolation);
+    for proj in &place.projection {
+        push_obligation_proj_elem_sites(proj, bb_idx, stmt_idx, out);
+    }
+}
+
+fn push_obligation_const_sites(
+    cv: &ProtoConstValue,
+    bb_idx: usize,
+    stmt_idx: usize,
+    out: &mut Vec<TaggedObligationSite>,
+) {
+    match cv {
+        ProtoConstValue::Indirect { .. } => {
+            for fc in [
+                MirFaultClass::BoundsCheck,
+                MirFaultClass::ScalarNicheInvalid,
+                MirFaultClass::UninitRead,
+            ] {
+                out.push(TaggedObligationSite {
+                    kind: ObligationSiteKind::PlaceOrMemoryAccess,
+                    site: FaultSite::new(bb_idx, stmt_idx, fc),
+                });
+            }
+        }
+        ProtoConstValue::ParamTypedConst(inner) => {
+            push_obligation_const_sites(inner, bb_idx, stmt_idx, out);
+        }
+        _ => {}
+    }
+}
+
+fn push_obligation_operand_sites(
+    op: &ProtoOperand,
+    bb_idx: usize,
+    stmt_idx: usize,
+    out: &mut Vec<TaggedObligationSite>,
+) {
+    match op {
+        ProtoOperand::Copy(place) | ProtoOperand::Move(place) => {
+            push_obligation_place_read_sites(place, bb_idx, stmt_idx, out);
+        }
+        ProtoOperand::Constant(cv) => {
+            push_obligation_const_sites(cv, bb_idx, stmt_idx, out);
+        }
+    }
+}
+
+fn push_obligation_loaded_operand_sites(
+    op: &ProtoOperand,
+    bb_idx: usize,
+    stmt_idx: usize,
+    out: &mut Vec<TaggedObligationSite>,
+) {
+    match op {
+        ProtoOperand::Copy(place) | ProtoOperand::Move(place) => {
+            push_obligation_place_read_sites(place, bb_idx, stmt_idx, out);
+            out.push(TaggedObligationSite {
+                kind: ObligationSiteKind::PlaceOrMemoryAccess,
+                site: FaultSite::new(bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid),
+            });
+        }
+        ProtoOperand::Constant(cv) => {
+            push_obligation_const_sites(cv, bb_idx, stmt_idx, out);
+        }
+    }
+}
+
+fn obligation_rvalue_is_unevaluated(rv: &ProtoRvalue) -> bool {
+    match rv {
+        ProtoRvalue::ThreadLocalRef(_)
+        | ProtoRvalue::NullaryOp(_)
+        | ProtoRvalue::ShallowInitBox(_) => true,
+        ProtoRvalue::Aggregate(ProtoAggregateKind::Coroutine(_), _) => true,
+        _ => false,
+    }
+}
+
+fn push_rvalue_site(
+    out: &mut Vec<TaggedObligationSite>,
+    bb_idx: usize,
+    stmt_idx: usize,
+    fc: MirFaultClass,
+) {
+    out.push(TaggedObligationSite {
+        kind: ObligationSiteKind::RvalueComputation,
+        site: FaultSite::new(bb_idx, stmt_idx, fc),
+    });
+}
+
+fn push_obligation_rvalue_sites(
+    rv: &ProtoRvalue,
+    bb_idx: usize,
+    stmt_idx: usize,
+    out: &mut Vec<TaggedObligationSite>,
+) {
+    match rv {
+        ProtoRvalue::Use(op) | ProtoRvalue::WrapUnsafeBinder(op) => {
+            push_obligation_loaded_operand_sites(op, bb_idx, stmt_idx, out);
+        }
+        ProtoRvalue::Repeat(op, _) => {
+            push_obligation_operand_sites(op, bb_idx, stmt_idx, out);
+        }
+        ProtoRvalue::Ref { place, .. } | ProtoRvalue::RawPtr { place, .. } => {
+            push_obligation_place_ref_sites(place, bb_idx, stmt_idx, out);
+        }
+        ProtoRvalue::ThreadLocalRef(_)
+        | ProtoRvalue::NullaryOp(_)
+        | ProtoRvalue::ShallowInitBox(_) => {}
+        ProtoRvalue::Len(place) => {
+            push_obligation_place_read_sites(place, bb_idx, stmt_idx, out);
+            push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::BoundsCheck);
+        }
+        ProtoRvalue::Cast(kind, op) => {
+            push_obligation_operand_sites(op, bb_idx, stmt_idx, out);
+            match kind {
+                ProtoCastKind::IntToInt
+                | ProtoCastKind::FloatToInt
+                | ProtoCastKind::FloatToFloat
+                | ProtoCastKind::IntToFloat
+                | ProtoCastKind::PointerExposeProvenance
+                | ProtoCastKind::PointerWithExposedProvenance => {}
+                ProtoCastKind::Transmute | ProtoCastKind::Subtype => {
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid);
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::UninitRead);
+                }
+                ProtoCastKind::PointerCoercion(c) if c == "MutToConstPointer" => {}
+                ProtoCastKind::PointerCoercion(c)
+                    if c == "Unsize" || c == "ArrayToPointer" =>
+                {
+                    for fc in [
+                        MirFaultClass::BoundsCheck,
+                        MirFaultClass::PtrDerefInvalid,
+                        MirFaultClass::PtrAlignMismatch,
+                        MirFaultClass::TreeBorrowsViolation,
+                        MirFaultClass::ScalarNicheInvalid,
+                    ] {
+                        push_rvalue_site(out, bb_idx, stmt_idx, fc);
+                    }
+                }
+                ProtoCastKind::PtrToPtr => {
+                    for fc in [
+                        MirFaultClass::BoundsCheck,
+                        MirFaultClass::PtrDerefInvalid,
+                        MirFaultClass::PtrAlignMismatch,
+                        MirFaultClass::TreeBorrowsViolation,
+                        MirFaultClass::ScalarNicheInvalid,
+                    ] {
+                        push_rvalue_site(out, bb_idx, stmt_idx, fc);
+                    }
+                }
+                ProtoCastKind::PointerCoercion(_) | ProtoCastKind::FnPtrToPtr => {
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::PtrDerefInvalid);
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid);
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::CallAbiMismatch);
+                }
+            }
+        }
+        ProtoRvalue::BinaryOp(op, lhs, rhs) => {
+            push_obligation_operand_sites(lhs, bb_idx, stmt_idx, out);
+            push_obligation_operand_sites(rhs, bb_idx, stmt_idx, out);
+            match op {
+                ProtoBinOp::AddUnchecked
+                | ProtoBinOp::SubUnchecked
+                | ProtoBinOp::MulUnchecked => {
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ArithOverflow);
+                }
+                ProtoBinOp::Div | ProtoBinOp::Rem => {
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ArithOverflow);
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::DivRemByZero);
+                }
+                ProtoBinOp::ShlUnchecked | ProtoBinOp::ShrUnchecked => {
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ShiftOverflow);
+                }
+                ProtoBinOp::Offset => {
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ArithOverflow);
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::BoundsCheck);
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::PtrDerefInvalid);
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::TreeBorrowsViolation);
+                }
+                _ => {}
+            }
+        }
+        ProtoRvalue::UnaryOp(op, val) => {
+            push_obligation_operand_sites(val, bb_idx, stmt_idx, out);
+            match op {
+                ProtoUnOp::Neg => {}
+                ProtoUnOp::Not => {
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid)
+                }
+                ProtoUnOp::PtrMetadata => {
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::PtrDerefInvalid)
+                }
+            }
+        }
+        ProtoRvalue::Discriminant(place) => {
+            push_obligation_place_read_sites(place, bb_idx, stmt_idx, out);
+            push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid);
+        }
+        ProtoRvalue::Aggregate(kind, ops) => {
+            if !matches!(kind, ProtoAggregateKind::Coroutine(_)) {
+                for op in ops {
+                    push_obligation_operand_sites(op, bb_idx, stmt_idx, out);
+                }
+            }
+        }
+        ProtoRvalue::CopyForDeref(place) => {
+            push_obligation_place_read_sites(place, bb_idx, stmt_idx, out);
+        }
+    }
+}
+
+fn obligation_terminator_targets(kind: &ProtoTerminatorKind) -> Vec<usize> {
+    let unwind_bb = |u: ProtoUnwindAction| match u {
+        ProtoUnwindAction::Cleanup(bb) => Some(bb),
+        _ => None,
+    };
+    match kind {
+        ProtoTerminatorKind::Goto(t) => vec![*t],
+        ProtoTerminatorKind::SwitchInt(_, targets) => {
+            let mut v = vec![targets.otherwise];
+            v.extend(targets.branches.iter().map(|(_, t)| *t));
+            v
+        }
+        ProtoTerminatorKind::Drop { target, unwind, .. }
+        | ProtoTerminatorKind::Assert { target, unwind, .. } => {
+            let mut v = vec![*target];
+            v.extend(unwind_bb(*unwind));
+            v
+        }
+        ProtoTerminatorKind::Call {
+            target: Some(t),
+            unwind,
+            ..
+        } => {
+            let mut v = vec![*t];
+            v.extend(unwind_bb(*unwind));
+            v
+        }
+        ProtoTerminatorKind::Call {
+            target: None,
+            unwind,
+            ..
+        } => unwind_bb(*unwind).into_iter().collect(),
+        ProtoTerminatorKind::InlineAsm {
+            targets, unwind, ..
+        } => {
+            let mut v = targets.clone();
+            v.extend(unwind_bb(*unwind));
+            v
+        }
+        ProtoTerminatorKind::UnwindResume
+        | ProtoTerminatorKind::UnwindTerminate
+        | ProtoTerminatorKind::Return
+        | ProtoTerminatorKind::Unreachable
+        | ProtoTerminatorKind::TailCall { .. } => Vec::new(),
+    }
+}
+
+fn push_obligation_callee_intrinsic_sites(
+    def_path: &str,
+    bb_idx: usize,
+    term_idx: usize,
+    out: &mut Vec<TaggedObligationSite>,
+) {
+    let mut push = |fc: MirFaultClass| {
+        out.push(TaggedObligationSite {
+            kind: ObligationSiteKind::TerminatorControlFlow,
+            site: FaultSite::new(bb_idx, term_idx, fc),
+        });
+    };
+    if matches!(
+        def_path,
+        "core::hint::unreachable_unchecked"
+            | "std::hint::unreachable_unchecked"
+            | "core::intrinsics::unreachable"
+    ) {
+        push(MirFaultClass::UnreachableTerminator);
+        return;
+    }
+    if def_path == "core::intrinsics::exact_div" {
+        push(MirFaultClass::ArithOverflow);
+        push(MirFaultClass::DivRemByZero);
+        return;
+    }
+    match def_path.strip_prefix("core::intrinsics::") {
+        Some("arith_offset") => {
+            push(MirFaultClass::PtrDerefInvalid);
+            push(MirFaultClass::ScalarNicheInvalid);
+        }
+        Some("unchecked_add" | "unchecked_sub" | "unchecked_mul") => {
+            push(MirFaultClass::ArithOverflow);
+        }
+        Some("unchecked_div" | "unchecked_rem") => {
+            push(MirFaultClass::ArithOverflow);
+            push(MirFaultClass::DivRemByZero);
+        }
+        Some("unchecked_shl" | "unchecked_shr") => {
+            push(MirFaultClass::ShiftOverflow);
+        }
+        Some("ctlz_nonzero" | "cttz_nonzero") => {
+            push(MirFaultClass::ScalarNicheInvalid);
+        }
+        Some("size_of_val" | "align_of_val") => {
+            push(MirFaultClass::ArithOverflow);
+            push(MirFaultClass::PtrDerefInvalid);
+            push(MirFaultClass::ScalarNicheInvalid);
+        }
+        Some("const_eval_select") => {
+            for fc in [
+                MirFaultClass::ArithOverflow,
+                MirFaultClass::DivRemByZero,
+                MirFaultClass::ShiftOverflow,
+                MirFaultClass::PtrDerefInvalid,
+                MirFaultClass::ScalarNicheInvalid,
+                MirFaultClass::CallAbiMismatch,
+                MirFaultClass::UnreachableTerminator,
+            ] {
+                push(fc);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Emit all obligation-level tagged fault sites for `body` via an independent
+/// AST walk over `body.basic_blocks` (never calling `fault_census::census_*`).
+pub fn emit_obligation_tagged_fault_sites_for_body(
+    body: &ProtoMirBody,
+) -> Vec<TaggedObligationSite> {
+    let num_blocks = body.basic_blocks.len();
+    let mut raw = Vec::new();
+    for (bb_idx, bb) in body.basic_blocks.iter().enumerate() {
+        for (stmt_idx, stmt) in bb.statements.iter().enumerate() {
+            match &stmt.kind {
+                ProtoStatementKind::Nop
+                | ProtoStatementKind::Coverage
+                | ProtoStatementKind::ConstEvalCounter
+                | ProtoStatementKind::BackwardIncompatibleDropHint(_) => {}
+                ProtoStatementKind::StorageLive(_) | ProtoStatementKind::StorageDead(_) => {
+                    raw.push(TaggedObligationSite {
+                        kind: ObligationSiteKind::StatementEffect,
+                        site: FaultSite::new(bb_idx, stmt_idx, MirFaultClass::StorageLiveProtected),
+                    });
+                }
+                ProtoStatementKind::PlaceMention(_) => {
+                    raw.push(TaggedObligationSite {
+                        kind: ObligationSiteKind::PlaceOrMemoryAccess,
+                        site: FaultSite::new(bb_idx, stmt_idx, MirFaultClass::UninitRead),
+                    });
+                }
+                ProtoStatementKind::Deinit(place) => {
+                    if place.projection.is_empty() {
+                        raw.push(TaggedObligationSite {
+                            kind: ObligationSiteKind::StatementEffect,
+                            site: FaultSite::new(
+                                bb_idx,
+                                stmt_idx,
+                                MirFaultClass::StorageLiveProtected,
+                            ),
+                        });
+                    } else {
+                        raw.push(TaggedObligationSite {
+                            kind: ObligationSiteKind::PlaceOrMemoryAccess,
+                            site: FaultSite::new(bb_idx, stmt_idx, MirFaultClass::UninitRead),
+                        });
+                        for proj in &place.projection {
+                            push_obligation_read_projected_sites(proj, bb_idx, stmt_idx, &mut raw);
+                        }
+                    }
+                }
+                ProtoStatementKind::Retag(place) => {
+                    push_obligation_place_read_sites(place, bb_idx, stmt_idx, &mut raw);
+                    for fc in [
+                        MirFaultClass::BoundsCheck,
+                        MirFaultClass::PtrDerefInvalid,
+                        MirFaultClass::TreeBorrowsViolation,
+                    ] {
+                        raw.push(TaggedObligationSite {
+                            kind: ObligationSiteKind::StatementEffect,
+                            site: FaultSite::new(bb_idx, stmt_idx, fc),
+                        });
+                    }
+                }
+                ProtoStatementKind::SetDiscriminant(place, _) => {
+                    if place.projection.is_empty() {
+                        for fc in [
+                            MirFaultClass::ScalarNicheInvalid,
+                            MirFaultClass::UninitRead,
+                        ] {
+                            raw.push(TaggedObligationSite {
+                                kind: ObligationSiteKind::StatementEffect,
+                                site: FaultSite::new(bb_idx, stmt_idx, fc),
+                            });
+                        }
+                    } else {
+                        push_obligation_place_read_sites(place, bb_idx, stmt_idx, &mut raw);
+                        push_obligation_place_write_sites(place, bb_idx, stmt_idx, &mut raw);
+                        raw.push(TaggedObligationSite {
+                            kind: ObligationSiteKind::StatementEffect,
+                            site: FaultSite::new(
+                                bb_idx,
+                                stmt_idx,
+                                MirFaultClass::ScalarNicheInvalid,
+                            ),
+                        });
+                    }
+                }
+                ProtoStatementKind::Intrinsic(ProtoIntrinsic::Assume(op)) => {
+                    push_obligation_operand_sites(op, bb_idx, stmt_idx, &mut raw);
+                    raw.push(TaggedObligationSite {
+                        kind: ObligationSiteKind::StatementEffect,
+                        site: FaultSite::new(bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid),
+                    });
+                }
+                ProtoStatementKind::Intrinsic(ProtoIntrinsic::CopyNonOverlapping {
+                    src,
+                    dst,
+                    count,
+                }) => {
+                    push_obligation_operand_sites(src, bb_idx, stmt_idx, &mut raw);
+                    push_obligation_operand_sites(dst, bb_idx, stmt_idx, &mut raw);
+                    push_obligation_operand_sites(count, bb_idx, stmt_idx, &mut raw);
+                    for fc in [
+                        MirFaultClass::ArithOverflow,
+                        MirFaultClass::BoundsCheck,
+                        MirFaultClass::PtrDerefInvalid,
+                        MirFaultClass::PtrAlignMismatch,
+                        MirFaultClass::TreeBorrowsViolation,
+                        MirFaultClass::ScalarNicheInvalid,
+                        MirFaultClass::UninitRead,
+                    ] {
+                        raw.push(TaggedObligationSite {
+                            kind: ObligationSiteKind::StatementEffect,
+                            site: FaultSite::new(bb_idx, stmt_idx, fc),
+                        });
+                    }
+                }
+                ProtoStatementKind::Assign(dst, rv) => {
+                    if !obligation_rvalue_is_unevaluated(rv) {
+                        push_obligation_place_write_sites(dst, bb_idx, stmt_idx, &mut raw);
+                        push_obligation_rvalue_sites(rv, bb_idx, stmt_idx, &mut raw);
+                    }
+                }
+            }
+        }
+
+        let term_idx = bb.statements.len();
+        let target_oob = obligation_terminator_targets(&bb.terminator.kind)
+            .into_iter()
+            .any(|t| t >= num_blocks);
+        let push_oob = |raw_out: &mut Vec<TaggedObligationSite>| {
+            if target_oob {
+                raw_out.push(TaggedObligationSite {
+                    kind: ObligationSiteKind::TerminatorControlFlow,
+                    site: FaultSite::new(bb_idx, term_idx, MirFaultClass::BoundsCheck),
+                });
+            }
+        };
+
+        match &bb.terminator.kind {
+            ProtoTerminatorKind::Goto(_) => push_oob(&mut raw),
+            ProtoTerminatorKind::UnwindTerminate | ProtoTerminatorKind::InlineAsm { .. } => {}
+            ProtoTerminatorKind::Unreachable => {
+                raw.push(TaggedObligationSite {
+                    kind: ObligationSiteKind::TerminatorControlFlow,
+                    site: FaultSite::new(bb_idx, term_idx, MirFaultClass::UnreachableTerminator),
+                });
+            }
+            ProtoTerminatorKind::UnwindResume => {
+                raw.push(TaggedObligationSite {
+                    kind: ObligationSiteKind::TerminatorControlFlow,
+                    site: FaultSite::new(bb_idx, term_idx, MirFaultClass::CallAbiMismatch),
+                });
+            }
+            ProtoTerminatorKind::Return => {
+                for fc in [
+                    MirFaultClass::UninitRead,
+                    MirFaultClass::TreeBorrowsViolation,
+                    MirFaultClass::CallAbiMismatch,
+                ] {
+                    raw.push(TaggedObligationSite {
+                        kind: ObligationSiteKind::TerminatorControlFlow,
+                        site: FaultSite::new(bb_idx, term_idx, fc),
+                    });
+                }
+            }
+            ProtoTerminatorKind::SwitchInt(discr, _) => {
+                push_obligation_operand_sites(discr, bb_idx, term_idx, &mut raw);
+                raw.push(TaggedObligationSite {
+                    kind: ObligationSiteKind::TerminatorControlFlow,
+                    site: FaultSite::new(bb_idx, term_idx, MirFaultClass::ScalarNicheInvalid),
+                });
+                push_oob(&mut raw);
+            }
+            ProtoTerminatorKind::Drop { place, .. } => {
+                if place.projection.is_empty() {
+                    raw.push(TaggedObligationSite {
+                        kind: ObligationSiteKind::TerminatorControlFlow,
+                        site: FaultSite::new(
+                            bb_idx,
+                            term_idx,
+                            MirFaultClass::StorageLiveProtected,
+                        ),
+                    });
+                } else {
+                    raw.push(TaggedObligationSite {
+                        kind: ObligationSiteKind::PlaceOrMemoryAccess,
+                        site: FaultSite::new(bb_idx, term_idx, MirFaultClass::UninitRead),
+                    });
+                    for proj in &place.projection {
+                        push_obligation_read_projected_sites(proj, bb_idx, term_idx, &mut raw);
+                    }
+                }
+                push_oob(&mut raw);
+            }
+            ProtoTerminatorKind::Assert { cond, unwind, .. } => {
+                push_obligation_operand_sites(cond, bb_idx, term_idx, &mut raw);
+                raw.push(TaggedObligationSite {
+                    kind: ObligationSiteKind::TerminatorControlFlow,
+                    site: FaultSite::new(bb_idx, term_idx, MirFaultClass::ScalarNicheInvalid),
+                });
+                match unwind {
+                    ProtoUnwindAction::Unreachable => {
+                        raw.push(TaggedObligationSite {
+                            kind: ObligationSiteKind::TerminatorControlFlow,
+                            site: FaultSite::new(
+                                bb_idx,
+                                term_idx,
+                                MirFaultClass::UnreachableTerminator,
+                            ),
+                        });
+                    }
+                    ProtoUnwindAction::Continue => {
+                        raw.push(TaggedObligationSite {
+                            kind: ObligationSiteKind::TerminatorControlFlow,
+                            site: FaultSite::new(bb_idx, term_idx, MirFaultClass::CallAbiMismatch),
+                        });
+                    }
+                    ProtoUnwindAction::Cleanup(_) | ProtoUnwindAction::Terminate => {}
+                }
+                push_oob(&mut raw);
+            }
+            ProtoTerminatorKind::Call {
+                func,
+                args,
+                destination,
+                target,
+                unwind,
+            } => {
+                push_obligation_operand_sites(func, bb_idx, term_idx, &mut raw);
+                for arg in args {
+                    push_obligation_operand_sites(arg, bb_idx, term_idx, &mut raw);
+                }
+                if target.is_some() {
+                    push_obligation_place_write_sites(destination, bb_idx, term_idx, &mut raw);
+                }
+                raw.push(TaggedObligationSite {
+                    kind: ObligationSiteKind::TerminatorControlFlow,
+                    site: FaultSite::new(bb_idx, term_idx, MirFaultClass::CallAbiMismatch),
+                });
+                match func.extract_callee_def_path() {
+                    Some(def_path) => {
+                        if target.is_some() {
+                            push_obligation_callee_intrinsic_sites(
+                                def_path, bb_idx, term_idx, &mut raw,
+                            );
+                        } else if matches!(
+                            def_path,
+                            "core::hint::unreachable_unchecked"
+                                | "std::hint::unreachable_unchecked"
+                                | "core::intrinsics::unreachable"
+                        ) {
+                            raw.push(TaggedObligationSite {
+                                kind: ObligationSiteKind::TerminatorControlFlow,
+                                site: FaultSite::new(
+                                    bb_idx,
+                                    term_idx,
+                                    MirFaultClass::UnreachableTerminator,
+                                ),
+                            });
+                        }
+                    }
+                    None => {
+                        raw.push(TaggedObligationSite {
+                            kind: ObligationSiteKind::TerminatorControlFlow,
+                            site: FaultSite::new(bb_idx, term_idx, MirFaultClass::PtrDerefInvalid),
+                        });
+                    }
+                }
+                if matches!(unwind, ProtoUnwindAction::Unreachable) {
+                    raw.push(TaggedObligationSite {
+                        kind: ObligationSiteKind::TerminatorControlFlow,
+                        site: FaultSite::new(
+                            bb_idx,
+                            term_idx,
+                            MirFaultClass::UnreachableTerminator,
+                        ),
+                    });
+                }
+                push_oob(&mut raw);
+            }
+            ProtoTerminatorKind::TailCall { func, args } => {
+                push_obligation_operand_sites(func, bb_idx, term_idx, &mut raw);
+                for arg in args {
+                    push_obligation_operand_sites(arg, bb_idx, term_idx, &mut raw);
+                }
+                for fc in [
+                    MirFaultClass::TreeBorrowsViolation,
+                    MirFaultClass::UninitRead,
+                    MirFaultClass::StorageLiveProtected,
+                    MirFaultClass::CallAbiMismatch,
+                ] {
+                    raw.push(TaggedObligationSite {
+                        kind: ObligationSiteKind::TerminatorControlFlow,
+                        site: FaultSite::new(bb_idx, term_idx, fc),
+                    });
+                }
+                if func.extract_callee_def_path().is_none() {
+                    raw.push(TaggedObligationSite {
+                        kind: ObligationSiteKind::TerminatorControlFlow,
+                        site: FaultSite::new(bb_idx, term_idx, MirFaultClass::PtrDerefInvalid),
+                    });
+                }
+            }
+        }
+    }
+    raw
+}
+
+/// Emit deduplicated, canonically ordered `FaultSite` coordinates from the
+/// `obligations.rs` obligation pipeline (`emit_obligation_tagged_fault_sites_for_body`).
+pub fn emit_obligation_fault_sites_for_body(body: &ProtoMirBody) -> Vec<FaultSite> {
+    let tagged = emit_obligation_tagged_fault_sites_for_body(body);
+    let set: BTreeSet<FaultSite> = tagged.into_iter().map(|t| t.site).collect();
+    set.into_iter().collect()
+}
+
+/// Alias for [`emit_obligation_fault_sites_for_body`] matching the canonical
+/// Brief entry point name.
+pub fn emit_mir_obligation_fault_sites(body: &ProtoMirBody) -> Vec<FaultSite> {
+    emit_obligation_fault_sites_for_body(body)
+}
+
+/// Build the `CalleeClosure` for a multi-item batch (`subject_body` + `callee_bodies`)
+/// given `explicit_external` callees (`#[external_spec]`, `#[spec(trusted)]`,
+/// `called_callees`). When `allow_implicit_external_callees` is `true` (e.g., for
+/// modular `MirCallE` items or `#[spec(trusted)]` subjects), non-inline non-native
+/// callees are also included in `external_callees`; when `false`, only
+/// `explicit_external` are included so any unclosed callee fails closed.
+pub(crate) fn build_batch_callee_closure(
+    subject_body: &ProtoMirBody,
+    callee_bodies: &[ProtoMirBody],
+    explicit_external: &[String],
+    allow_implicit_external_callees: bool,
+) -> CalleeClosure {
+    let batch_paths: BTreeSet<String> = std::iter::once(subject_body.def_path.clone())
+        .chain(callee_bodies.iter().map(|b| b.def_path.clone()))
+        .collect();
+    let mut inline_set: BTreeSet<String> =
+        callee_bodies.iter().map(|b| b.def_path.clone()).collect();
+    let mut external_set: BTreeSet<String> = explicit_external
+        .iter()
+        .filter(|p| !batch_paths.contains(p.as_str()))
+        .cloned()
+        .collect();
+
+    for body in std::iter::once(subject_body).chain(callee_bodies.iter()) {
+        for callee in direct_callee_def_paths(body)
+            .into_iter()
+            .chain(reified_fn_def_paths(body))
+        {
+            if batch_paths.contains(&callee) {
+                inline_set.insert(callee);
+            } else if allow_implicit_external_callees
+                && !crate::fault_census::is_natively_modeled_converging_call_callee(&callee)
+                && !crate::fault_census::is_natively_modeled_diverging_call_callee(&callee)
+            {
+                external_set.insert(callee);
+            }
+        }
+    }
+
+    CalleeClosure {
+        inline_callees: inline_set.into_iter().collect(),
+        external_callees: external_set.into_iter().collect(),
+    }
+}
+
+/// Alias for [`compute_bundle_fault_census_receipt`] matching the canonical
+/// Brief entry point name.
+pub fn compute_subject_fault_coverage_receipt(
+    bundle: &SubjectObligationBundle,
+    mir_lean_src: &str,
+    callee_mir_sources: &[(String, String)],
+    registry: &PropertyRegistry,
+    dropped_sites: &BTreeSet<FaultSite>,
+) -> Result<(FaultCensusReceipt, MultiItemCoverageVerdict), CensusScanError> {
+    compute_bundle_fault_census_receipt(
+        bundle,
+        mir_lean_src,
+        callee_mir_sources,
+        registry,
+        dropped_sites,
+    )
+}
+
+/// Compute the `FaultCensusReceipt` and `MultiItemCoverageVerdict` for `bundle`
+/// from its placed `Mir/<Item>.lean` source and reachable `transitive_callees`
+/// sources, using `emit_obligation_fault_sites_for_body` as the independent
+/// obligation pipeline `discharged` set.
+pub fn compute_bundle_fault_census_receipt(
+    bundle: &SubjectObligationBundle,
+    mir_lean_src: &str,
+    callee_mir_sources: &[(String, String)],
+    registry: &PropertyRegistry,
+    dropped_sites: &BTreeSet<FaultSite>,
+) -> Result<(FaultCensusReceipt, MultiItemCoverageVerdict), CensusScanError> {
+    let mut subject_body = parse_lean_captured_mir_def(mir_lean_src, "body")?;
+    if subject_body.def_path.is_empty() {
+        subject_body.def_path = bundle.subject.target.def_id.clone();
+    }
+    let mut callee_bodies = Vec::with_capacity(callee_mir_sources.len());
+    for (callee_def_id, callee_src) in callee_mir_sources {
+        let mut cbody = parse_lean_captured_mir_def(callee_src, "body")?;
+        if cbody.def_path.is_empty() {
+            cbody.def_path = callee_def_id.clone();
+        }
+        callee_bodies.push(cbody);
+    }
+
+    let filter_dropped = |sites: Vec<FaultSite>| -> Vec<FaultSite> {
+        sites
+            .into_iter()
+            .filter(|s| !dropped_sites.contains(s))
+            .collect()
+    };
+
+    let subject_census = census_mir_fault_sites(&subject_body);
+    let subject_discharged = filter_dropped(emit_obligation_fault_sites_for_body(&subject_body));
+
+    let mut items = Vec::with_capacity(1 + callee_bodies.len());
+    items.push(ItemCoverageInput {
+        def_path: subject_body.def_path.clone(),
+        body: subject_body.clone(),
+        discharged: subject_discharged.clone(),
+    });
+    for callee in &callee_bodies {
+        items.push(ItemCoverageInput {
+            def_path: callee.def_path.clone(),
+            body: callee.clone(),
+            discharged: filter_dropped(emit_obligation_fault_sites_for_body(callee)),
+        });
+    }
+
+    let mut explicit_external: Vec<String> = bundle
+        .external_spec_callees
+        .iter()
+        .map(|e| e.target_def_id.clone())
+        .chain(bundle.called_callees.iter().map(|c| c.def_id.clone()))
+        .collect();
+    explicit_external.sort();
+    explicit_external.dedup();
+    let closure = build_batch_callee_closure(
+        &subject_body,
+        &callee_bodies,
+        &explicit_external,
+        bundle.has_rust_trusted_attr(),
+    );
+
+    let verdict = reconcile_multi_item_coverage(&items, &closure, registry);
+    let receipt = FaultCensusReceipt {
+        def_path: subject_body.def_path,
+        mir_module_sha256: bundle.subject.target.mir_module_sha256.clone(),
+        census_sites: subject_census,
+        discharged_sites: subject_discharged,
+        callee_closure: closure,
+        reconciliation_verdict: verdict.status_code().to_string(),
+        is_verified: verdict.is_verified(),
+        reasons: verdict.reasons().to_vec(),
+    };
+    Ok((receipt, verdict))
+}
+
 /// Presence of optional user-authored Lean modules under `anneal/proofs/` for a
 /// single verification subject `<Item>`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -531,6 +1486,21 @@ pub fn render_obligations_module_with_options(
     bundle: &SubjectObligationBundle,
     authored: AuthoredItemModules,
 ) -> String {
+    render_obligations_module_with_census(bundle, authored, None)
+}
+
+/// Render the disposable `.anneal/generated/Obligations/<Item>.lean` module for
+/// `bundle` and `authored`, optionally embedding `fault_census` coverage
+/// metadata inside the module docstring comment (`/-! ... -/`).
+///
+/// The `import` header remains strictly restricted to `Trusted` and `Mir.*`
+/// (plus `Obligations.<Callee>` and legacy `Specs.<Item>`) so zero `Anneal.*`
+/// constants ever enter `Verify.<Item>.verified`.
+pub fn render_obligations_module_with_census(
+    bundle: &SubjectObligationBundle,
+    authored: AuthoredItemModules,
+    fault_census: Option<&FaultCensusReceipt>,
+) -> String {
     let item = &bundle.item_module_suffix;
     let def_id = &bundle.subject.target.def_id;
     let mut out = String::new();
@@ -653,6 +1623,12 @@ pub fn render_obligations_module_with_options(
                 "- External spec: `{}` (`{}`)\n",
                 ext.target.def_id, ext.lean_module_name
             ));
+        }
+    }
+    if let Some(receipt) = fault_census {
+        out.push_str("\nFault-site census coverage summary (compiler-generated metadata):\n");
+        for line in receipt.summary_lines() {
+            out.push_str(&format!("- {line}\n"));
         }
     }
     out.push_str("-/\n\n");
