@@ -2301,7 +2301,10 @@ pub fn validate_lean_term_expr(expr: &str) -> Result<(), String> {
                 if component == "_" {
                     return Err("wildcard hole `_` is not allowed in Lean term".to_owned());
                 }
-                if is_reserved_lean_ident(&component) {
+                // Lean lexes a dotted name as one identifier, so only a component that does not
+                // follow `.` can be read as a keyword (`Mir.Demo.end.body` is a valid reference
+                // to the body of a captured Rust item named `end`).
+                if prev_kind != 4 && is_reserved_lean_ident(&component) {
                     return Err(format!("reserved Lean keyword `{component}`"));
                 }
                 saw_ident = true;
@@ -2400,6 +2403,9 @@ pub fn validate_lean_term_expr(expr: &str) -> Result<(), String> {
 
 fn validate_lean_dotted_name_syntax(name: &str, reject_reserved: bool) -> Result<(), String> {
     let mut chars = name.chars().peekable();
+    // Only the first component of a dotted name can lex as a keyword (`Mir.Demo.end` is one
+    // identifier), so `reject_reserved` applies to it alone.
+    let mut first = true;
     loop {
         match chars.peek().copied() {
             Some('«') => {
@@ -2430,7 +2436,7 @@ fn validate_lean_dotted_name_syntax(name: &str, reject_reserved: bool) -> Result
                     component.push(c);
                     chars.next();
                 }
-                if component == "_" || (reject_reserved && is_reserved_lean_ident(&component)) {
+                if component == "_" || (reject_reserved && first && is_reserved_lean_ident(&component)) {
                     return Err(format!("invalid component `{component}` in Lean name {name:?}"));
                 }
             }
@@ -2438,7 +2444,7 @@ fn validate_lean_dotted_name_syntax(name: &str, reject_reserved: bool) -> Result
         }
         match chars.next() {
             None => return Ok(()),
-            Some('.') => {}
+            Some('.') => first = false,
             Some(c) => return Err(format!("unexpected character {c:?} in Lean name {name:?}")),
         }
     }
@@ -3890,13 +3896,19 @@ mod opaque_callee_table_tests {
             "Foo.mk 0xff 0b101 0o77 [] ()",
             "x!",
             "is_ok?",
+            // Keyword components after `.` are part of one dotted identifier (live-checked with
+            // `lake env lean`): captured Rust items named `end` / `repeat` / ... stay reachable.
+            "Mir.def.body",
+            "Mir.repeat.body",
+            "Mir.exists.body",
+            "Mir.Demo.end.body",
         ] {
             assert_eq!(validate_lean_term_expr(ok), Ok(()), "{ok:?}");
         }
         for bad in [
             "", "   ", "a\nb", "Mir.X.body\n", "a -- c", "a /- c -/", "\"s\"", "'a'", "a)", "(a",
-            "[a)", "a; b", "a := b", "Mir.def.body", "Mir.repeat.body", "Mir.exists.body",
-            "Mir.elab.body", "sorry", "s!", "_", "Mir._.body", "x end Foo", "«»", "Mir.«».body",
+            "[a)", "a; b", "a := b", "def.body", "repeat", "exists", "Mir.X end",
+            "elab.body", "sorry", "s!", "_", "Mir._.body", "x end Foo", "«»", "Mir.«».body",
             "«a", "«a\nb»", "Mir.«a\u{202e}b».body", "Mir.«a\u{2028}b».body", "a «b «c» »", "a,b",
             "a{b}", "a#b", "a\\b", "a`b", "$x", "a ⟨b⟩", "@", "@ ", "@)", "@(Mir.Demo.leaf.body)",
             "@() x", "a@b", "@@x", ".", ".x", "Mir.", "Mir..body", "Mir.0", "0abc", "123'!", "0x",
@@ -3908,13 +3920,16 @@ mod opaque_callee_table_tests {
 
     #[test]
     fn validate_lean_dotted_name_cases() {
-        for ok in ["Mir", "Mir.Demo.leaf", "Gen._private", "Mir.«my-crate».x", "A'.B"] {
+        for ok in [
+            "Mir", "Mir.Demo.leaf", "Gen._private", "Mir.«my-crate».x", "A'.B", "Mir.end", "Mir.repeat",
+            "Mir.exists", "Mir.elab", "Mir.prelude", "Mir.coinductive", "Mir.Demo.end",
+        ] {
             assert_eq!(validate_lean_dotted_name(ok), Ok(()), "{ok:?}");
         }
         for bad in [
             "", ".", "Mir.", ".Mir", "Mir..Demo", "Mir.Demo\nimport Evil", "Mir Demo", "0Mir",
-            "Mir._", "Mir.end", "Mir.repeat", "Mir.exists", "Mir.elab", "Mir.prelude",
-            "Mir.coinductive", "Mir.«»", "Mir.«a", "Mir.«a\u{202e}b»", "Mir-Demo", "Mir.Demo -- x",
+            "Mir._", "end", "repeat", "end.Mir", "exists",
+            "Mir.«»", "Mir.«a", "Mir.«a\u{202e}b»", "Mir-Demo", "Mir.Demo -- x",
         ] {
             assert!(validate_lean_dotted_name(bad).is_err(), "{bad:?}");
         }
