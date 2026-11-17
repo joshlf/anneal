@@ -1023,7 +1023,13 @@ class Checker:
         trusted_waiver_audit = audit_waivers_and_vacuity(
             [(f"trusted/lean/{rel}", self.source_copy / rel) for rel in self.modules.values()]
         )
-        fault_coverage_audit = audit_checkout_fault_coverage_gate(self.checkout, self.source_copy)
+        fault_coverage_audit = audit_checkout_fault_coverage_gate(
+            self.checkout,
+            self.source_copy,
+            require_source_pins=fault_census_source_pins_required(
+                self.checkout, self.source_copy
+            ),
+        )
         headers = self.inspect("preflight", sources=[(n, str(self.source_copy / p)) for n, p in self.modules.items()]).get("headers")
         if not isinstance(headers, list) or {h["module"] for h in headers} != set(self.modules) or len(headers) != len(self.modules):
             raise Failure(2, "preflight", "incomplete source-header inventory")
@@ -8586,8 +8592,8 @@ def _operand_has_deref(op: tuple[Any, ...]) -> bool:
 
 def _rvalue_has_deref(rv: tuple[Any, ...]) -> bool:
     tag = rv[0]
-    if tag in ("use", "repeat", " unaryOp", "shallowInitBox", "wrapUnsafeBinder"):
-        return _operand_has_deref(rv[1] if tag != "unaryOp" else rv[2])
+    if tag in ("use", "repeat", "shallowInitBox", "wrapUnsafeBinder"):
+        return _operand_has_deref(rv[1])
     if tag == "cast":
         return _operand_has_deref(rv[2])
     if tag == "unaryOp":
@@ -8890,7 +8896,11 @@ def build_probe_scenario(
         raise Failure(
             1, FAULT_COVERAGE_PHASE, f"unknown false-proof mutation probe `{probe}`"
         )
-    baseline = mock_emit_obligations(body, None)
+    # `[adv ep2-B1]`: the baseline is the REAL independent obligation emitter
+    # (`emit_mir_obligation_fault_sites`), never a census-derived mock, so a
+    # regression in the emitter (e.g. dropping call-argument or deref obligations)
+    # fails the probe instead of being masked by `baseline == census` by construction.
+    baseline = emit_mir_obligation_fault_sites(body)
     mutant = mock_emit_obligations(body, probe)
     return (body, baseline, mutant, expected_missing)
 
@@ -8925,7 +8935,8 @@ def run_false_proof_probe(
         census, mutant_discharged, reg
     )
     passed = (
-        baseline_verdict["is_verified"]
+        baseline_discharged == census
+        and baseline_verdict["is_verified"]
         and not mutant_verdict["is_verified"]
         and mutant_verdict["missing_sites"] == expected_missing
         and mutant_verdict["unemitted_classes"] == []
@@ -8933,6 +8944,7 @@ def run_false_proof_probe(
     return {
         "probe": probe,
         "census": census,
+        "baseline_discharged": baseline_discharged,
         "baseline_verdict": baseline_verdict,
         "mutant_verdict": mutant_verdict,
         "expected_missing_sites": expected_missing,
@@ -8940,34 +8952,151 @@ def run_false_proof_probe(
     }
 
 
+def build_all_fault_classes_witness_body() -> dict[str, Any]:
+    """`[adv ep2-B1]` One body whose census reaches every `MIR_FAULT_CLASSES` member.
+
+    The four mutation-probe bodies never reach `shift_overflow`, `bounds_check`, or
+    `unreachable_terminator`, so an obligation emitter (or reconciler) that silently
+    dropped one of those classes passed every probe. This witness is reconciled with
+    the REAL emitter and swept class-by-class by `PropertyRegistryUnemittedProbe`.
+    """
+    return {
+        "def_path": "proto::witness_all_fault_classes",
+        "basic_blocks": [
+            {
+                "statements": [
+                    {"kind": ("storageLive", 1), "span": "proto.rs:60:5"},
+                    {
+                        "kind": (
+                            "assign",
+                            _mk_local_place(0),
+                            (
+                                "binaryOp",
+                                "shlUnchecked",
+                                ("copy", _mk_local_place(1)),
+                                _mk_const_u32(3),
+                            ),
+                        ),
+                        "span": "proto.rs:61:5",
+                    },
+                    {
+                        "kind": (
+                            "assign",
+                            _mk_local_place(0),
+                            (
+                                "binaryOp",
+                                "div",
+                                ("copy", _mk_local_place(1)),
+                                ("copy", _mk_local_place(2)),
+                            ),
+                        ),
+                        "span": "proto.rs:62:5",
+                    },
+                    {
+                        "kind": (
+                            "assign",
+                            _mk_local_place(0),
+                            (
+                                "use",
+                                ("copy", {"local_": 3, "projection": [("index", 4)]}),
+                            ),
+                        ),
+                        "span": "proto.rs:63:5",
+                    },
+                    {
+                        "kind": (
+                            "assign",
+                            _mk_deref_local_place(5),
+                            ("use", ("copy", _mk_deref_local_place(6))),
+                        ),
+                        "span": "proto.rs:64:5",
+                    },
+                ],
+                "terminator": {
+                    "kind": (
+                        "call",
+                        _mk_const_fn("proto::callee_u32"),
+                        [("copy", _mk_local_place(1))],
+                        _mk_local_place(0),
+                        1,
+                        ("continue_",),
+                    ),
+                    "span": "proto.rs:65:5",
+                },
+                "is_cleanup": False,
+            },
+            {
+                "statements": [],
+                "terminator": {"kind": ("unreachable",), "span": "proto.rs:66:5"},
+                "is_cleanup": False,
+            },
+        ],
+    }
+
+
 def run_property_registry_unemitted_probe() -> dict[str, Any]:
-    body, _baseline, _mutant, _expected_missing = build_probe_scenario(
+    body, discharged, _mutant, _expected_missing = build_probe_scenario(
         "DerefAliasProbe"
     )
     census = census_mir_fault_sites(body)
     baseline_verdict = reconcile_obligation_coverage(
-        census, census, PROPERTY_REGISTRY
+        census, discharged, PROPERTY_REGISTRY
     )
     unemitted_reg = {
         cls: dict(desc) for cls, desc in PROPERTY_REGISTRY.items()
     }
     unemitted_reg["tree_borrows_violation"]["status"] = PROPERTY_STATUS_UNEMITTED_GAP
-    mutant_verdict = reconcile_obligation_coverage(census, census, unemitted_reg)
+    mutant_verdict = reconcile_obligation_coverage(census, discharged, unemitted_reg)
     expected_missing = [
         FaultSite(0, 0, "tree_borrows_violation"),
         FaultSite(0, 1, "tree_borrows_violation"),
     ]
     passed = (
-        baseline_verdict["is_verified"]
+        discharged == census
+        and baseline_verdict["is_verified"]
         and not mutant_verdict["is_verified"]
         and mutant_verdict["missing_sites"] == expected_missing
         and mutant_verdict["unemitted_classes"] == ["tree_borrows_violation"]
+    )
+    # `[adv ep2-B1]`: sweep EVERY registry class over a witness body that reaches all
+    # twelve classes: the real emitter must discharge the full census, and flipping
+    # any single class to UNEMITTED_GAP must fail closed on exactly that class's sites.
+    witness = build_all_fault_classes_witness_body()
+    witness_census = census_mir_fault_sites(witness)
+    witness_discharged = emit_mir_obligation_fault_sites(witness)
+    witness_classes = [
+        cls for cls in MIR_FAULT_CLASSES if any(s.fault_class == cls for s in witness_census)
+    ]
+    witness_baseline = reconcile_obligation_coverage(
+        witness_census, witness_discharged, PROPERTY_REGISTRY
+    )
+    per_class: dict[str, bool] = {}
+    for cls in MIR_FAULT_CLASSES:
+        cls_reg = {c: dict(desc) for c, desc in PROPERTY_REGISTRY.items()}
+        cls_reg[cls]["status"] = PROPERTY_STATUS_UNEMITTED_GAP
+        cls_verdict = reconcile_obligation_coverage(
+            witness_census, witness_discharged, cls_reg
+        )
+        per_class[cls] = (
+            not cls_verdict["is_verified"]
+            and cls_verdict["missing_sites"]
+            == [s for s in witness_census if s.fault_class == cls]
+            and cls_verdict["unemitted_classes"] == [cls]
+        )
+    passed = (
+        passed
+        and witness_classes == list(MIR_FAULT_CLASSES)
+        and witness_discharged == witness_census
+        and witness_baseline["is_verified"]
+        and all(per_class.values())
     )
     return {
         "probe": "PropertyRegistryUnemittedProbe",
         "baseline_verdict": baseline_verdict,
         "mutant_verdict": mutant_verdict,
         "expected_missing_sites": expected_missing,
+        "witnessClasses": witness_classes,
+        "perClassFailClosed": per_class,
         "passed": passed,
     }
 
@@ -8978,6 +9107,7 @@ def run_callee_coordinate_mask_probe() -> dict[str, Any]:
     )
     callee_body = build_callee_storage_witness_body()
     callee_census = census_mir_fault_sites(callee_body)
+    callee_discharged = emit_mir_obligation_fault_sites(callee_body)
     closure = {
         "inline_callees": [callee_body["def_path"]],
         "external_callees": [],
@@ -8997,7 +9127,7 @@ def run_callee_coordinate_mask_probe() -> dict[str, Any]:
             {
                 "def_path": callee_body["def_path"],
                 "body": callee_body,
-                "discharged": callee_census,
+                "discharged": callee_discharged,
             },
         ],
         closure,
@@ -9020,7 +9150,9 @@ def run_callee_coordinate_mask_probe() -> dict[str, Any]:
         PROPERTY_REGISTRY,
     )
     passed = (
-        flattened_verdict["is_verified"]
+        callee_discharged == callee_census
+        and caller_discharged == census_mir_fault_sites(caller_body)
+        and flattened_verdict["is_verified"]
         and baseline_batch["is_verified"]
         and not masked_batch["is_verified"]
         and len(masked_batch["failed_items"]) == 1
@@ -9388,10 +9520,51 @@ def check_fault_census_source_pins(
     }
 
 
-def audit_checkout_fault_coverage_gate(
+def fault_census_source_pins_required(
     checkout: Path, staged_source: Path | None = None
+) -> bool:
+    """`[adv ep2-B1]` The cross-language source pins are mandatory whenever the checkout
+    ships any part of the census theory: `theory/Anneal.lean` importing
+    `Anneal.FaultSiteCensus`, or either pinned source (`Terminators.lean`,
+    `theory/Anneal/FaultSiteCensus.lean`) being present, in which case BOTH must be present
+    and agree. Only minimal `--self-test` fixture trees (no census theory at all) skip them.
+    """
+    anneal_root = checkout / "theory/Anneal.lean"
+    if anneal_root.exists() or anneal_root.is_symlink():
+        text = _read_regular_text(anneal_root, "theory/Anneal.lean")
+        if "Anneal.FaultSiteCensus" in _scan_lean_module_imports(text, str(anneal_root)):
+            return True
+    terminators_rel = Path("Trusted/Rustc/V2026_06_01/MirSemantics/Terminators.lean")
+    candidates = [
+        checkout / "theory/Anneal/FaultSiteCensus.lean",
+        checkout / "trusted/lean" / terminators_rel,
+    ]
+    if staged_source is not None:
+        candidates.append(staged_source / terminators_rel)
+    return any(c.exists() or c.is_symlink() for c in candidates)
+
+
+def audit_checkout_fault_coverage_gate(
+    checkout: Path,
+    staged_source: Path | None = None,
+    *,
+    require_source_pins: bool = False,
 ) -> dict[str, Any]:
+    """Run the pure-Python fault-coverage gate (source pins + 4+2 mutation probes).
+
+    `[adv ep2-B1]`: when `require_source_pins` is set (the standalone
+    `--audit-fault-coverage` CLI, and `Checker.run()` on a real checkout that ships
+    `theory/Anneal.lean`), a missing `Terminators.lean` or
+    `theory/Anneal/FaultSiteCensus.lean` fails closed instead of silently skipping
+    the cross-language pins; only minimal `--self-test` fixture trees may skip them.
+    """
     pins = check_fault_census_source_pins(checkout, staged_source)
+    if require_source_pins and not (pins["terminators"] and pins["faultSiteCensus"]):
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"cross-language fault-census source pins could not run (Terminators.lean / theory/Anneal/FaultSiteCensus.lean missing): {pins}",
+        )
     probes = run_false_proof_mutation_probes()
     return {
         **probes,
@@ -9399,27 +9572,124 @@ def audit_checkout_fault_coverage_gate(
     }
 
 
-def _parse_obligations_default_callee_suffixes(ob_text: str, ob_label: str) -> list[str]:
-    try:
-        tokens = tokenize_lean_source(ob_text)
-    except CensusScanError as err:
-        raise Failure(
-            1, FAULT_COVERAGE_PHASE, f"malformed Obligations module {ob_label}: {err}"
-        ) from err
-    def_positions: list[int] = []
+_OB_DEFAULT_CALLEES_SHADOW_KWS: frozenset[str] = frozenset((
+    "abbrev",
+    "theorem",
+    "lemma",
+    "axiom",
+    "opaque",
+    "instance",
+    "example",
+    "structure",
+    "inductive",
+    "class",
+))
+
+_OB_DECL_MODIFIER_KWS: frozenset[str] = frozenset((
+    "private",
+    "protected",
+    "noncomputable",
+    "partial",
+    "unsafe",
+    "nonrec",
+))
+
+
+def _top_level_token_indices(tokens: list[tuple[str, Any]]) -> list[int]:
+    """Indices of tokens at bracket depth 0 (outside every `(`, `{`, and `[`)."""
+    out: list[int] = []
     depth = 0
-    for idx, (tk, val) in enumerate(tokens):
+    for idx, (tk, _val) in enumerate(tokens):
         cur_depth = depth
         if tk in ("LParen", "LBrace", "LBracket"):
             depth += 1
         elif tk in ("RParen", "RBrace", "RBracket"):
             depth = max(0, depth - 1)
-        if cur_depth != 0:
+        if cur_depth == 0:
+            out.append(idx)
+    return out
+
+
+def _tokenize_lean_or_fail(text: str, label: str) -> list[tuple[str, Any]]:
+    try:
+        return tokenize_lean_source(text)
+    except CensusScanError as err:
+        raise Failure(
+            1, FAULT_COVERAGE_PHASE, f"malformed Lean module {label}: {err}"
+        ) from err
+
+
+def _read_regular_text(path: Path, label: str) -> str:
+    if not (path.exists() or path.is_symlink()):
+        raise Failure(1, FAULT_COVERAGE_PHASE, f"missing {label}: {path}")
+    regular(path, FAULT_COVERAGE_PHASE)
+    try:
+        return path.read_text(encoding="utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError) as err:
+        raise Failure(1, FAULT_COVERAGE_PHASE, f"cannot read {path}: {err}") from err
+
+
+def _is_default_callees_name(name: str) -> bool:
+    return name == "defaultCallees" or name.endswith(".defaultCallees")
+
+
+def _parse_obligations_default_callee_suffixes(ob_text: str, ob_label: str) -> list[str]:
+    """`[adv ep2-B1]` Strict port of Rust `parse_obligations_default_callees`.
+
+    Fails closed (instead of returning `[]`) on a missing table, a shadowing or
+    modified declaration (`abbrev defaultCallees`, `private def defaultCallees`,
+    `def X.defaultCallees`), duplicate tables, a header other than
+    `def defaultCallees : List CapturedMir :=`, entries other than
+    `Mir.<Suffix>.body`, or trailing expressions after the table
+    (`[...] ++ [...]`, `[...].drop 1`, ...).
+    """
+    tokens = _tokenize_lean_or_fail(ob_text, ob_label)
+    n = len(tokens)
+    def_positions: list[int] = []
+    for idx in _top_level_token_indices(tokens):
+        tk, val = tokens[idx]
+        if tk != "Ident":
             continue
-        if tk == "Ident" and val == "def" and idx + 1 < len(tokens) and tokens[idx + 1] == ("Ident", "defaultCallees"):
+        nxt = tokens[idx + 1] if idx + 1 < n else None
+        names_default = (
+            nxt is not None and nxt[0] == "Ident" and _is_default_callees_name(str(nxt[1]))
+        )
+        if val in _OB_DEFAULT_CALLEES_SHADOW_KWS and names_default:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"`defaultCallees` declared via `{val}` instead of `def` in {ob_label}",
+            )
+        if val in _OB_DECL_MODIFIER_KWS:
+            j = idx + 1
+            while j < n and tokens[j][0] == "Ident" and tokens[j][1] in _OB_DECL_MODIFIER_KWS:
+                j += 1
+            if (
+                j + 1 < n
+                and tokens[j][0] == "Ident"
+                and (tokens[j][1] == "def" or tokens[j][1] in _OB_DEFAULT_CALLEES_SHADOW_KWS)
+                and tokens[j + 1][0] == "Ident"
+                and _is_default_callees_name(str(tokens[j + 1][1]))
+            ):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`{val}` modifier on `defaultCallees` in {ob_label}",
+                )
+        if val == "def" and names_default:
+            if nxt[1] != "defaultCallees":
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"qualified `def {nxt[1]}` shadows `defaultCallees` in {ob_label}",
+                )
             def_positions.append(idx)
     if not def_positions:
-        return []
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"missing `def defaultCallees : List CapturedMir :=` table in {ob_label}",
+        )
     if len(def_positions) > 1:
         raise Failure(
             1,
@@ -9427,20 +9697,40 @@ def _parse_obligations_default_callee_suffixes(ob_text: str, ob_label: str) -> l
             f"multiple `def defaultCallees` tables in {ob_label}",
         )
     pos = def_positions[0]
-    if pos + 6 >= len(tokens) or tokens[pos + 5][0] != "ColonEq":
+    header_ok = (
+        pos + 6 < n
+        and tokens[pos + 2][0] == "Colon"
+        and tokens[pos + 3][0] == "Ident"
+        and (tokens[pos + 3][1] == "List" or str(tokens[pos + 3][1]).endswith(".List"))
+        and tokens[pos + 4][0] == "Ident"
+        and _is_valid_captured_mir_type(str(tokens[pos + 4][1]))
+        and tokens[pos + 5][0] == "ColonEq"
+    )
+    if not header_ok:
         raise Failure(
             1,
             FAULT_COVERAGE_PHASE,
-            f"malformed `def defaultCallees` header in {ob_label}",
+            f"malformed `def defaultCallees` header in {ob_label} (expected `def defaultCallees : List CapturedMir :=`)",
         )
+
+    def ensure_no_trailing(after_idx: int) -> None:
+        if after_idx < n and not _fc_is_lean_command_start(tokens[after_idx]):
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"unexpected trailing token {tokens[after_idx]!r} after `defaultCallees` table in {ob_label}",
+            )
+
     val_idx = pos + 6
     if tokens[val_idx] in (("Ident", ".nil"), ("Ident", "List.nil")):
+        ensure_no_trailing(val_idx + 1)
         return []
     if (
-        val_idx + 1 < len(tokens)
+        val_idx + 1 < n
         and tokens[val_idx][0] == "Dot"
         and tokens[val_idx + 1] == ("Ident", "nil")
     ):
+        ensure_no_trailing(val_idx + 2)
         return []
     if tokens[val_idx][0] != "LBracket":
         raise Failure(
@@ -9448,45 +9738,416 @@ def _parse_obligations_default_callee_suffixes(ob_text: str, ob_label: str) -> l
             FAULT_COVERAGE_PHASE,
             f"unrecognized `defaultCallees` table in {ob_label}",
         )
-    if val_idx + 1 < len(tokens) and tokens[val_idx + 1][0] == "RBracket":
+    if val_idx + 1 < n and tokens[val_idx + 1][0] == "RBracket":
+        ensure_no_trailing(val_idx + 2)
         return []
     out: list[str] = []
     cur = val_idx + 1
-    while cur < len(tokens):
-        tok = tokens[cur]
-        if tok[0] != "Ident":
+    while True:
+        if cur >= n or tokens[cur][0] != "Ident":
             raise Failure(
                 1,
                 FAULT_COVERAGE_PHASE,
-                f"unrecognized `defaultCallees` entry {tok!r} in {ob_label}",
+                f"unrecognized `defaultCallees` entry {tokens[cur] if cur < n else None!r} in {ob_label}",
             )
-        entry = str(tok[1])
-        if not (entry.startswith("Mir.") and entry.endswith(".body")):
+        entry = str(tokens[cur][1])
+        suffix = (
+            entry[len("Mir.") : -len(".body")]
+            if entry.startswith("Mir.") and entry.endswith(".body")
+            else ""
+        )
+        if not suffix or not all(c.isalnum() or c in "_." for c in suffix):
             raise Failure(
                 1,
                 FAULT_COVERAGE_PHASE,
                 f"unrecognized `defaultCallees` entry `{entry}` in {ob_label}",
             )
-        suffix = entry[len("Mir.") : -len(".body")]
-        if not suffix:
-            raise Failure(
-                1,
-                FAULT_COVERAGE_PHASE,
-                f"empty `defaultCallees` entry `{entry}` in {ob_label}",
-            )
         out.append(suffix)
         cur += 1
-        if cur < len(tokens) and tokens[cur][0] == "Comma":
+        if cur < n and tokens[cur][0] == "Comma":
             cur += 1
-        elif cur < len(tokens) and tokens[cur][0] == "RBracket":
-            break
+            continue
+        if cur < n and tokens[cur][0] == "RBracket":
+            ensure_no_trailing(cur + 1)
+            return out
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"unterminated or malformed `defaultCallees` list in {ob_label}",
+        )
+
+
+def _scan_lean_module_imports(text: str, label: str) -> list[str]:
+    tokens = _tokenize_lean_or_fail(text, label)
+    out: list[str] = []
+    for idx in _top_level_token_indices(tokens):
+        if tokens[idx] == ("Ident", "import"):
+            if idx + 1 >= len(tokens) or tokens[idx + 1][0] != "Ident":
+                raise Failure(
+                    1, FAULT_COVERAGE_PHASE, f"malformed `import` command in {label}"
+                )
+            mod = str(tokens[idx + 1][1])
+            if mod not in out:
+                out.append(mod)
+    return out
+
+
+def _check_single_namespace(
+    tokens: list[tuple[str, Any]], expected_ns: str, label: str
+) -> None:
+    opens = 0
+    closes = 0
+    n = len(tokens)
+    for idx in _top_level_token_indices(tokens):
+        tok = tokens[idx]
+        if tok in (("Ident", "namespace"), ("Ident", "end"), ("Ident", "section")):
+            nxt = tokens[idx + 1] if idx + 1 < n else None
+            if tok[1] == "section":
+                raise Failure(
+                    1, FAULT_COVERAGE_PHASE, f"unexpected `section` command in {label}"
+                )
+            if nxt != ("Ident", expected_ns):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"unexpected `{tok[1]} {nxt[1] if nxt else ''}` in {label} (expected only `{expected_ns}`)",
+                )
+            if tok[1] == "namespace":
+                opens += 1
+            else:
+                closes += 1
+    if opens != 1 or closes != 1:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"{label} must contain exactly one `namespace {expected_ns} ... end {expected_ns}` block",
+        )
+
+
+def _scan_obligations_module(ob_text: str, suffix: str, ob_label: str) -> dict[str, Any]:
+    """`[adv ep2-B1]` Independently extract the callee links of `Obligations/<Item>.lean`:
+    strict `defaultCallees`, imported sibling `Obligations.<Callee>` suffixes, and
+    `externalSpecCallContract "<target>"` targets (never trusting the receipt)."""
+    tokens = _tokenize_lean_or_fail(ob_text, ob_label)
+    _check_single_namespace(tokens, f"Obligations.{suffix}", ob_label)
+    default_callee_suffixes = _parse_obligations_default_callee_suffixes(ob_text, ob_label)
+    imported: list[str] = []
+    for mod in _scan_lean_module_imports(ob_text, ob_label):
+        if mod.startswith("Obligations."):
+            sib = mod[len("Obligations.") :]
+            if sib == suffix:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{ob_label} self-imports `Obligations.{suffix}`",
+                )
+            if sib not in imported:
+                imported.append(sib)
+    ext_targets: list[str] = []
+    for i, tok in enumerate(tokens):
+        if (
+            tok[0] == "Ident"
+            and (tok[1] == "externalSpecCallContract" or str(tok[1]).endswith(".externalSpecCallContract"))
+            and i + 1 < len(tokens)
+            and tokens[i + 1][0] == "StrLit"
+        ):
+            tgt = str(tokens[i + 1][1])
+            if tgt and tgt not in ext_targets:
+                ext_targets.append(tgt)
+    return {
+        "default_callee_suffixes": default_callee_suffixes,
+        "imported_obligation_suffixes": imported,
+        "external_spec_targets": ext_targets,
+    }
+
+
+_VERIFY_MONO_CERT_CLAIMS: dict[str, str] = {
+    "VerificationResult": "claim",
+    "StatefulVerificationResult": "statefulClaim",
+    "TotalVerificationResult": "totalClaim",
+    "StatefulEquivVerificationResult": "equivClaim",
+    "ModularVerificationResult": "modularClaim",
+    "UbExceptionVerificationResult": "ubExceptionClaim",
+}
+
+_VERIFY_POLY_CLAIMS: frozenset[str] = frozenset((
+    "polyClaim",
+    "polyStatefulClaim",
+    "polyTotalClaim",
+    "polyModularClaim",
+    "polyUbExceptionClaim",
+))
+
+
+def _strip_verification_result_qual(name: str) -> str:
+    for prefix in ("_root_.", "Trusted.", "VerificationResult."):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    return name
+
+
+_VERIFY_DISALLOWED_TOP_LEVEL: frozenset[str] = frozenset((
+    "axiom",
+    "opaque",
+    "macro",
+    "macro_rules",
+    "syntax",
+    "notation",
+    "infix",
+    "infixl",
+    "infixr",
+    "prefix",
+    "postfix",
+    "elab",
+    "local",
+    "scoped",
+    "attribute",
+    "class",
+    "structure",
+    "inductive",
+    "unsafe",
+    "partial",
+))
+
+_VERIFY_CERTIFICATE_TYPE_NAMES: frozenset[str] = frozenset((
+    *_VERIFY_MONO_CERT_CLAIMS,
+    "CrateVerificationResult",
+))
+
+_VERIFY_SPEC_CLASS_NAMES: frozenset[str] = frozenset((
+    "ItemSpec",
+    "StatefulItemSpec",
+    "TotalItemSpec",
+    "StatefulEquivItemSpec",
+    "ModularItemSpec",
+    "UbExceptionItemSpec",
+))
+
+_VERIFY_PROOF_CLASS_NAMES: frozenset[str] = frozenset((
+    "ItemProof",
+    "StatefulItemProof",
+    "TotalItemProof",
+    "StatefulEquivItemProof",
+    "ModularItemProof",
+    "UbExceptionItemProof",
+))
+
+_VERIFY_REFINE_SPEC_HELPERS: frozenset[str] = frozenset((
+    "refineSpec",
+    "refineStatefulSpec",
+    "refineSafeSpec",
+    "refineSafeStatefulSpec",
+    "refineTotalSpec",
+    "refineEquivSpec",
+    "refineModularSpec",
+    "refineUbExceptionSpec",
+))
+
+
+def _verify_detect_instance_attribute(tokens: list[tuple[str, Any]]) -> str | None:
+    """Port of Rust `detect_instance_attribute`: `@[... instance ...]` registers a typeclass
+    instance without a top-level `instance` keyword."""
+    i = 0
+    n = len(tokens)
+    while i + 2 < n:
+        if tokens[i] == ("Ident", "@") and tokens[i + 1][0] == "LBracket":
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                tk, val = tokens[j]
+                if tk == "LBracket":
+                    depth += 1
+                elif tk == "RBracket":
+                    depth -= 1
+                elif tk == "Ident" and val in ("instance", "default_instance"):
+                    return str(val)
+                j += 1
+            i = j
         else:
+            i += 1
+    return None
+
+
+def _scan_verify_module_surface(verify_text: str, suffix: str, label: str) -> dict[str, Any]:
+    """`[adv ep2-B1]` Independently derive the certificate surface of `Verify/<Item>.lean`.
+
+    Ports the Rust `inspect_verify_module_certificate` restrictions (import allowlist,
+    single `namespace Verify.<Item>` block, no `axiom` / `opaque` / notation / macro /
+    `attribute` / `@[instance]` / spec-class or non-`*ItemProof` `instance` commands) and
+    additionally rejects declarations shadowing a certificate type or the canonical spec
+    classes. Requires exactly one top-level
+    `theorem verified : <Cert> Obligations.<Item>.<claim> :=` (or
+    `CrateVerificationResult (Obligations.<Item>.polyCertificate Obligations.<Item>.poly*)`),
+    and reports whether the surface is modular, a scoped UB exception, and whether the
+    subject's own body is *assumed*: a UB-exception surface, or the exact generated
+    `spec(trusted)` certificate whose whole proof term is
+    `Assumptions.<Item>.rust_trusted_contract` (with `import Assumptions.<Item>`). Only
+    assumed subjects may carry implicit external callees or unresolved indirect calls.
+    """
+    tokens = _tokenize_lean_or_fail(verify_text, label)
+    _check_single_namespace(tokens, f"Verify.{suffix}", label)
+    attr = _verify_detect_instance_attribute(tokens)
+    if attr is not None:
+        raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {label}")
+    imports = _scan_lean_module_imports(verify_text, label)
+    for mod in imports:
+        own = mod in (
+            f"Obligations.{suffix}",
+            f"Specs.{suffix}",
+            f"Proof.{suffix}",
+            f"Assumptions.{suffix}",
+        )
+        allowed = own or mod.startswith("Mir.") or any(
+            mod == root or mod.startswith(root + ".")
+            for root in ("Init", "Std", "Trusted", "Anneal")
+        )
+        if not allowed:
+            raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `import {mod}` in {label}")
+    n = len(tokens)
+    top = _top_level_token_indices(tokens)
+    top_set = set(top)
+
+    def command_end(start: int) -> int:
+        k = start + 1
+        while k < n and not (k in top_set and _fc_is_lean_command_start(tokens[k])):
+            k += 1
+        return k
+
+    def short_name(ident: str) -> str:
+        for prefix in ("_root_.", "Trusted.", "VerificationResult."):
+            if ident.startswith(prefix):
+                ident = ident[len(prefix) :]
+        return ident
+
+    verified: list[tuple[list[tuple[str, Any]], list[tuple[str, Any]]]] = []
+    for idx in top:
+        tk, val = tokens[idx]
+        if tk != "Ident":
+            continue
+        nxt = tokens[idx + 1] if idx + 1 < n else None
+        if nxt == ("Ident", "verified") and val != "theorem" and val in _LEAN_COMMAND_KEYWORDS:
             raise Failure(
                 1,
                 FAULT_COVERAGE_PHASE,
-                f"unterminated `defaultCallees` list in {ob_label}",
+                f"`verified` declared via `{val}` instead of `theorem` in {label}",
             )
-    return out
+        if val in _VERIFY_DISALLOWED_TOP_LEVEL:
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"disallowed top-level `{val}` command in {label}"
+            )
+        if val in ("def", "abbrev", "lemma", "theorem", "instance", "example"):
+            cmd = tokens[idx : command_end(idx)]
+            if nxt is not None and nxt[0] == "Ident":
+                declared = str(nxt[1])
+                last = declared.rsplit(".", 1)[-1]
+                if (
+                    last in _VERIFY_CERTIFICATE_TYPE_NAMES
+                    or last in _VERIFY_SPEC_CLASS_NAMES
+                    or last in _VERIFY_PROOF_CLASS_NAMES
+                    or "." in declared
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`{val} {declared}` shadows or escapes the certificate namespace in {label}",
+                    )
+            idents = [str(v) for t, v in cmd if t == "Ident"]
+            if val in ("def", "abbrev", "lemma", "instance"):
+                for ident in idents:
+                    if short_name(ident) in _VERIFY_SPEC_CLASS_NAMES:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"{label} references specification class `{ident}` inside `{val}` (specifications live in `Specs.{suffix}`)",
+                        )
+                    if ident.rsplit(".", 1)[-1] in _VERIFY_REFINE_SPEC_HELPERS:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"{label} invokes specification override helper `{ident}` inside `{val}`",
+                        )
+            if val == "instance":
+                header: list[str] = []
+                h_depth = 0
+                for t, v in cmd:
+                    if h_depth == 0 and (t == "ColonEq" or (t, v) == ("Ident", "where")):
+                        break
+                    if t in ("LParen", "LBrace", "LBracket"):
+                        h_depth += 1
+                    elif t in ("RParen", "RBrace", "RBracket"):
+                        h_depth = max(0, h_depth - 1)
+                    if t == "Ident":
+                        header.append(str(v))
+                if not any(short_name(h) in _VERIFY_PROOF_CLASS_NAMES for h in header):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"{label} declares a non-`*ItemProof` `instance` ({header[:6]})",
+                    )
+        if val != "theorem" or nxt != ("Ident", "verified"):
+            continue
+        if idx + 2 >= n or tokens[idx + 2][0] != "Colon":
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"`theorem verified` in {label} must have an explicit `: <Certificate> :=` signature without binders",
+            )
+        j = idx + 3
+        while j < n and not (j in top_set and tokens[j][0] == "ColonEq"):
+            if j in top_set and _fc_is_lean_command_start(tokens[j]):
+                break
+            j += 1
+        if j >= n or tokens[j][0] != "ColonEq":
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"`theorem verified` has no `:=` proof body in {label}"
+            )
+        verified.append((tokens[idx + 3 : j], tokens[j + 1 : command_end(j)]))
+    if len(verified) != 1:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"{label} must declare exactly one `theorem verified` (found {len(verified)})",
+        )
+    ty, proof = verified[0]
+    ob_prefix = f"Obligations.{suffix}."
+    claim: str | None = None
+    if len(ty) == 2 and ty[0][0] == "Ident" and ty[1][0] == "Ident":
+        cert = _strip_verification_result_qual(str(ty[0][1]))
+        ref = str(ty[1][1])
+        expected_claim = _VERIFY_MONO_CERT_CLAIMS.get(cert)
+        if expected_claim is not None and ref == ob_prefix + expected_claim:
+            claim = expected_claim
+    elif (
+        len(ty) == 5
+        and ty[0][0] == "Ident"
+        and ty[1][0] == "LParen"
+        and ty[2][0] == "Ident"
+        and ty[3][0] == "Ident"
+        and ty[4][0] == "RParen"
+        and _strip_verification_result_qual(str(ty[0][1])) == "CrateVerificationResult"
+        and ty[2][1] == ob_prefix + "polyCertificate"
+        and str(ty[3][1]).startswith(ob_prefix)
+        and str(ty[3][1])[len(ob_prefix) :] in _VERIFY_POLY_CLAIMS
+    ):
+        claim = str(ty[3][1])[len(ob_prefix) :]
+    if claim is None:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"{label} proves non-canonical statement {ty!r} instead of `Obligations.{suffix}.<claim>`",
+        )
+    trusted = (
+        proof == [("Ident", f"Assumptions.{suffix}.rust_trusted_contract")]
+        and f"Assumptions.{suffix}" in imports
+    )
+    ub_exception = claim in ("ubExceptionClaim", "polyUbExceptionClaim")
+    modular = claim in ("modularClaim", "polyModularClaim")
+    return {
+        "claim": claim,
+        "modular": modular,
+        "ub_exception": ub_exception,
+        "assumed": ub_exception or trusted,
+    }
 
 
 def _parse_fault_census_receipt_json(receipt_path: Path) -> dict[str, Any]:
@@ -9644,11 +10305,25 @@ def _audit_single_item_receipt(
     mir_meta: dict[str, Any],
     receipt_path: Path,
     mir_by_stem: dict[str, dict[str, Any]],
-    mir_by_def_path: dict[str, dict[str, Any]],
-    receipts_by_def_path: dict[str, dict[str, Any]],
     obligations_root: Path | None,
+    verify_root: Path | None,
+    specs_root: Path | None,
     reg: dict[str, dict[str, str]],
 ) -> dict[str, Any]:
+    """Independently re-audit one `FaultCensus/<Item>.json` receipt.
+
+    `[adv ep2-B1]`: the receipt is cargo-anneal output and therefore untrusted input.
+    Its `census_sites` must equal the independent Python census, its
+    `discharged_sites` must equal the independent Python obligation emitter
+    (`emit_mir_obligation_fault_sites`) and coverage is reconciled against that
+    recomputed set, and its `callee_closure` is never taken at face value:
+    `inline_callees` must equal the `Obligations/<Item>.lean` `defaultCallees`
+    table exactly, inline callee obligations are recomputed (never read from other
+    receipts), and `external_callees` / `allow_unresolved_indirect_calls` are only
+    honoured when `Verify/<Item>.lean` independently proves a modular surface (with
+    every external callee backed by an `externalSpecCallContract` target or an
+    imported sibling `Obligations.<Callee>`) or assumes the subject's own body.
+    """
     receipt = _parse_fault_census_receipt_json(receipt_path)
     actual_sha = digest(mir_path)
     if receipt["mir_module_sha256"] != actual_sha:
@@ -9664,12 +10339,28 @@ def _audit_single_item_receipt(
             FAULT_COVERAGE_PHASE,
             f"FaultCensus receipt def_path `{receipt['def_path']}` does not match Mir `{subject_body['def_path']}` in {receipt_path}",
         )
+    if mir_meta["role"][0] != "subject":
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"FaultCensus receipt {receipt_path} audits Mir module `{rel_stem}` whose role is `{mir_meta['role'][0]}` instead of `subject`",
+        )
     actual_census = census_mir_fault_sites(subject_body)
     if receipt["census_sites"] != actual_census:
         raise Failure(
             1,
             FAULT_COVERAGE_PHASE,
             f"FaultCensus receipt census_sites in {receipt_path} is stale or tampered relative to independent census_lean_mir_module ({len(receipt['census_sites'])} vs {len(actual_census)} sites)",
+        )
+    emitted = emit_mir_obligation_fault_sites(subject_body)
+    if receipt["discharged_sites"] != emitted:
+        missing = [str(s) for s in emitted if s not in set(receipt["discharged_sites"])]
+        extra = [str(s) for s in receipt["discharged_sites"] if s not in set(emitted)]
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"FaultCensus receipt discharged_sites in {receipt_path} does not match the independent obligation emitter "
+            f"(omitted={missing[:8]}, unbacked={extra[:8]}, receipt={len(receipt['discharged_sites'])} vs emitted={len(emitted)} sites)",
         )
     if (
         not receipt["is_verified"]
@@ -9682,9 +10373,7 @@ def _audit_single_item_receipt(
             f"FaultCensus receipt {receipt_path} is not VERIFIED (verdict={receipt['reconciliation_verdict']!r}, is_verified={receipt['is_verified']}, reasons={receipt['reasons']})",
         )
 
-    single_verdict = reconcile_obligation_coverage(
-        actual_census, receipt["discharged_sites"], reg
-    )
+    single_verdict = reconcile_obligation_coverage(actual_census, emitted, reg)
     if not single_verdict["is_verified"]:
         raise Failure(
             1,
@@ -9692,65 +10381,129 @@ def _audit_single_item_receipt(
             f"obligation coverage reconciliation failed for {receipt['def_path']} ({receipt_path}): {'; '.join(single_verdict['reasons'])}",
         )
 
+    suffix = rel_stem.replace("/", ".")
     closure = receipt["callee_closure"]
-    if obligations_root is not None:
-        ob_path = obligations_root / f"{rel_stem}.lean"
-        if ob_path.exists() or ob_path.is_symlink():
-            regular(ob_path, FAULT_COVERAGE_PHASE)
-            try:
-                ob_text = ob_path.read_text(encoding="utf-8", errors="strict")
-            except (OSError, UnicodeDecodeError) as err:
-                raise Failure(
-                    1, FAULT_COVERAGE_PHASE, f"cannot read {ob_path}: {err}"
-                ) from err
-            default_callee_suffixes = _parse_obligations_default_callee_suffixes(
-                ob_text, str(ob_path)
-            )
-            inline_set = set(closure["inline_callees"])
-            for suf in default_callee_suffixes:
-                callee_stem = suf.replace(".", "/")
-                callee_meta = mir_by_stem.get(callee_stem)
-                if callee_meta is None:
-                    raise Failure(
-                        1,
-                        FAULT_COVERAGE_PHASE,
-                        f"Obligations module {ob_path} lists `Mir.{suf}.body` in `defaultCallees`, but `Mir/{callee_stem}.lean` is missing",
-                    )
-                callee_dp = callee_meta["body"]["def_path"]
-                if callee_dp not in inline_set:
-                    raise Failure(
-                        1,
-                        FAULT_COVERAGE_PHASE,
-                        f"Obligations module {ob_path} links inline callee `{callee_dp}` (`Mir.{suf}.body`), which is missing from FaultCensus `callee_closure.inline_callees`",
-                    )
 
+    # 1. `inline_callees` must be exactly the `defaultCallees` installed into
+    #    `s.memory.callees` by `Obligations/<Item>.lean` (both directions).
+    if obligations_root is None:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"missing Obligations directory for FaultCensus receipt {receipt_path}",
+        )
+    ob_path = obligations_root / f"{rel_stem}.lean"
+    ob_text = _read_regular_text(ob_path, f"Obligations module for `{rel_stem}`")
+    ob_scan = _scan_obligations_module(ob_text, suffix, str(ob_path))
+    inline_metas: list[dict[str, Any]] = []
+    for suf in ob_scan["default_callee_suffixes"]:
+        callee_meta = mir_by_stem.get(suf.replace(".", "/"))
+        if callee_meta is None:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"Obligations module {ob_path} lists `Mir.{suf}.body` in `defaultCallees`, but `Mir/{suf.replace('.', '/')}.lean` is missing",
+            )
+        inline_metas.append(callee_meta)
+    expected_inline = [m["body"]["def_path"] for m in inline_metas]
+    if len(set(expected_inline)) != len(expected_inline):
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"duplicate `defaultCallees` entries in {ob_path}: {expected_inline}",
+        )
+    if len(set(closure["inline_callees"])) != len(closure["inline_callees"]) or set(
+        closure["inline_callees"]
+    ) != set(expected_inline):
+        missing_inline = sorted(set(expected_inline) - set(closure["inline_callees"]))
+        extra_inline = sorted(set(closure["inline_callees"]) - set(expected_inline))
+        if missing_inline:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"Obligations module {ob_path} links inline callee(s) {missing_inline} via `defaultCallees`, which are missing from FaultCensus `callee_closure.inline_callees`",
+            )
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"FaultCensus `callee_closure.inline_callees` in {receipt_path} declares {extra_inline or closure['inline_callees']} that `Obligations/{rel_stem}.lean` `defaultCallees` never installs",
+        )
+
+    # 2. `external_callees` / `allow_unresolved_indirect_calls` are only honoured
+    #    for an independently established modular or assumed certificate surface.
+    if verify_root is None:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"missing Verify directory for FaultCensus receipt {receipt_path}",
+        )
+    v_path = verify_root / f"{rel_stem}.lean"
+    v_text = _read_regular_text(v_path, f"Verify module for `{rel_stem}`")
+    surface = _scan_verify_module_surface(v_text, suffix, str(v_path))
+    if closure["allow_unresolved_indirect_calls"] and not surface["assumed"]:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"FaultCensus receipt {receipt_path} sets `allow_unresolved_indirect_calls`, but `Verify/{rel_stem}.lean` proves `{surface['claim']}` without assuming the subject's own body",
+        )
+    if closure["external_callees"] and not surface["assumed"]:
+        if not surface["modular"]:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"FaultCensus receipt {receipt_path} declares external callees {closure['external_callees']}, but `Verify/{rel_stem}.lean` proves non-modular `{surface['claim']}`",
+            )
+        justified: set[str] = set(ob_scan["external_spec_targets"])
+        sibling_suffixes: list[str] = list(ob_scan["imported_obligation_suffixes"])
+        if specs_root is not None:
+            specs_path = specs_root / f"{rel_stem}.lean"
+            if specs_path.exists() or specs_path.is_symlink():
+                specs_text = _read_regular_text(specs_path, f"Specs module for `{rel_stem}`")
+                for mod in _scan_lean_module_imports(specs_text, str(specs_path)):
+                    if mod.startswith("Obligations."):
+                        sib = mod[len("Obligations.") :]
+                        if sib != suffix and sib not in sibling_suffixes:
+                            sibling_suffixes.append(sib)
+        for sib in sibling_suffixes:
+            sib_meta = mir_by_stem.get(sib.replace(".", "/"))
+            if sib_meta is None:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`{rel_stem}` imports sibling `Obligations.{sib}`, but `Mir/{sib.replace('.', '/')}.lean` is missing",
+                )
+            justified.add(sib_meta["body"]["def_path"])
+        unjustified = sorted(set(closure["external_callees"]) - justified)
+        if unjustified:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"FaultCensus receipt {receipt_path} declares external callee(s) {unjustified} that are backed by neither an `externalSpecCallContract` target nor an imported sibling `Obligations.<Callee>`",
+            )
+
+    # 3. Reconcile every inline callee body with independently emitted obligations.
     batch_items: list[dict[str, Any]] = [
         {
             "def_path": subject_body["def_path"],
             "body": subject_body,
-            "discharged": receipt["discharged_sites"],
+            "discharged": emitted,
         }
     ]
     callee_metas: list[dict[str, Any]] = []
-    for inline_dp in closure["inline_callees"]:
-        if inline_dp == subject_body["def_path"]:
+    seen_dps = {subject_body["def_path"]}
+    for c_meta in inline_metas:
+        c_dp = c_meta["body"]["def_path"]
+        if c_dp in seen_dps:
             continue
-        c_meta = mir_by_def_path.get(inline_dp)
-        if c_meta is not None:
-            callee_metas.append(c_meta)
-            c_receipt = receipts_by_def_path.get(inline_dp)
-            c_discharged = (
-                c_receipt["discharged_sites"]
-                if c_receipt is not None
-                else emit_mir_obligation_fault_sites(c_meta["body"])
-            )
-            batch_items.append(
-                {
-                    "def_path": inline_dp,
-                    "body": c_meta["body"],
-                    "discharged": c_discharged,
-                }
-            )
+        seen_dps.add(c_dp)
+        callee_metas.append(c_meta)
+        batch_items.append(
+            {
+                "def_path": c_dp,
+                "body": c_meta["body"],
+                "discharged": emit_mir_obligation_fault_sites(c_meta["body"]),
+            }
+        )
 
     batch_verdict = reconcile_multi_item_coverage(batch_items, closure, reg)
     trait_reasons = _check_trait_impl_closure(mir_meta, callee_metas, closure)
@@ -9828,7 +10581,6 @@ def _audit_manifest_targets_fault_coverage(
     reg = validate_property_registry(registry, require_all_verified=True)
     mir_by_stem: dict[str, dict[str, Any]] = {}
     mir_path_by_stem: dict[str, Path] = {}
-    mir_by_def_path: dict[str, dict[str, Any]] = {}
     generated_root: Path | None = None
 
     for mir_rel, mir_path in lean_audit_targets:
@@ -9873,7 +10625,6 @@ def _audit_manifest_targets_fault_coverage(
                 generated_root = root
         mir_by_stem[stem] = meta
         mir_path_by_stem[stem] = mir_path
-        mir_by_def_path[meta["body"]["def_path"]] = meta
 
     fc_root: Path | None = None
     if generated_root is not None and (generated_root / "FaultCensus").exists():
@@ -9896,7 +10647,6 @@ def _audit_manifest_targets_fault_coverage(
         }
 
     receipt_files = _collect_regular_files_by_suffix(fc_root, ".json")
-    receipts_by_def_path: dict[str, dict[str, Any]] = {}
     for r_stem, r_path in receipt_files.items():
         if r_stem not in mir_by_stem:
             raise Failure(
@@ -9904,21 +10654,54 @@ def _audit_manifest_targets_fault_coverage(
                 FAULT_COVERAGE_PHASE,
                 f"orphan FaultCensus receipt `{r_stem}.json` has no matching Mir target in CaptureManifest.json",
             )
-        parsed_r = _parse_fault_census_receipt_json(r_path)
-        receipts_by_def_path[parsed_r["def_path"]] = parsed_r
+        _parse_fault_census_receipt_json(r_path)
 
-    subject_stems = [
-        stem
-        for stem, meta in sorted(mir_by_stem.items())
-        if meta["role"][0] == "subject"
-    ]
-    for stem in subject_stems:
-        if stem not in receipt_files:
+    # `[adv ep2-B1]`: receipts are produced by scaffolding together with
+    # `Obligations/` and `Verify/`; every `Verify/<Item>.lean` subject needs a
+    # receipt, and inline callee bodies captured with `ContractRole.subject` (which
+    # never get their own receipt) are not mistaken for unaudited subjects.
+    ob_root = (
+        generated_root / "Obligations"
+        if generated_root is not None
+        and (generated_root / "Obligations").is_dir()
+        and not (generated_root / "Obligations").is_symlink()
+        else None
+    )
+    verify_root = (
+        generated_root / "Verify"
+        if generated_root is not None
+        and (generated_root / "Verify").is_dir()
+        and not (generated_root / "Verify").is_symlink()
+        else None
+    )
+    if receipt_files or require_receipts:
+        if verify_root is None:
             raise Failure(
                 1,
                 FAULT_COVERAGE_PHASE,
-                f"subject Mir target `{stem}` is missing FaultCensus receipt `{fc_root / (stem + '.json')}`",
+                f"missing Verify directory next to FaultCensus receipts under {root}",
             )
+        verify_files = _collect_regular_files_by_suffix(verify_root, ".lean")
+        for stem in sorted(verify_files):
+            if stem not in mir_by_stem:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"Verify module `{stem}` has no matching Mir target in CaptureManifest.json",
+                )
+            if stem not in receipt_files:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"subject Verify module `{stem}` is missing FaultCensus receipt `{fc_root / (stem + '.json')}`",
+                )
+        for stem in sorted(receipt_files):
+            if stem not in verify_files:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"FaultCensus receipt `{stem}.json` has no matching `Verify/{stem}.lean` module",
+                )
 
     if require_receipts and not receipt_files:
         raise Failure(
@@ -9926,11 +10709,10 @@ def _audit_manifest_targets_fault_coverage(
             FAULT_COVERAGE_PHASE,
             f"FaultCensus directory {fc_root} contains no `.json` receipts",
         )
-
-    ob_root = (
-        generated_root / "Obligations"
-        if generated_root is not None
-        and (generated_root / "Obligations").is_dir()
+    specs_root = (
+        root / "anneal/proofs/Specs"
+        if generated_root == root / ".anneal/generated"
+        and (root / "anneal/proofs/Specs").is_dir()
         else None
     )
     for stem, r_path in sorted(receipt_files.items()):
@@ -9940,9 +10722,9 @@ def _audit_manifest_targets_fault_coverage(
             mir_by_stem[stem],
             r_path,
             mir_by_stem,
-            mir_by_def_path,
-            receipts_by_def_path,
             ob_root,
+            verify_root,
+            specs_root,
             reg,
         )
 
@@ -10059,7 +10841,6 @@ def audit_fault_coverage(
         )
 
     mir_by_stem: dict[str, dict[str, Any]] = {}
-    mir_by_def_path: dict[str, dict[str, Any]] = {}
     for stem, mir_path in mir_files.items():
         try:
             mir_text = mir_path.read_text(encoding="utf-8", errors="strict")
@@ -10076,9 +10857,7 @@ def audit_fault_coverage(
                 f"Mir module {mir_path} failed strict fault-site census scan: {err}",
             ) from err
         mir_by_stem[stem] = meta
-        mir_by_def_path[meta["body"]["def_path"]] = meta
 
-    receipts_by_def_path: dict[str, dict[str, Any]] = {}
     for r_stem, r_path in receipt_files.items():
         if r_stem not in mir_by_stem:
             raise Failure(
@@ -10086,36 +10865,57 @@ def audit_fault_coverage(
                 FAULT_COVERAGE_PHASE,
                 f"orphan FaultCensus receipt `{r_path}` has no matching `Mir/{r_stem}.lean`",
             )
-        parsed_r = _parse_fault_census_receipt_json(r_path)
-        receipts_by_def_path[parsed_r["def_path"]] = parsed_r
+        _parse_fault_census_receipt_json(r_path)
 
-    # Every subject Mir/<Item>.lean (and every Verify/<Item>.lean if Verify/ exists)
-    # must have a corresponding FaultCensus/<Item>.json receipt.
-    required_stems = {
-        stem for stem, meta in mir_by_stem.items() if meta["role"][0] == "subject"
-    }
+    # `[adv ep2-B1]`: every `Verify/<Item>.lean` subject must have a receipt (and
+    # vice versa). Inline callee bodies are captured with `ContractRole.subject` but
+    # never receive their own receipt, so requiring a receipt for every role-subject
+    # `Mir/` module rejected every realistic workspace with callees, while
+    # `Obligations/` and `Verify/` are mandatory inputs of the independent closure audit.
     verify_root = generated_dir / "Verify"
-    if verify_root.exists() or verify_root.is_symlink():
-        verify_files = _collect_regular_files_by_suffix(verify_root, ".lean")
-        required_stems |= set(verify_files)
-
-    for stem in sorted(required_stems):
+    ob_root = generated_dir / "Obligations"
+    for label, required_dir in (("Verify", verify_root), ("Obligations", ob_root)):
+        if required_dir.is_symlink() or not required_dir.is_dir():
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"missing {label} directory: {required_dir}",
+            )
+    verify_files = _collect_regular_files_by_suffix(verify_root, ".lean")
+    _collect_regular_files_by_suffix(ob_root, ".lean")
+    if not verify_files:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"no `Verify/<Item>.lean` modules found under {verify_root}",
+        )
+    for stem in sorted(verify_files):
+        if stem not in mir_by_stem:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"Verify module `{stem}` has no matching `Mir/{stem}.lean`",
+            )
         if stem not in receipt_files:
             raise Failure(
                 1,
                 FAULT_COVERAGE_PHASE,
                 f"missing FaultCensus receipt `{fc_root / (stem + '.json')}` for subject item `{stem}`",
             )
+    for stem in sorted(receipt_files):
+        if stem not in verify_files:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"FaultCensus receipt `{stem}.json` has no matching `Verify/{stem}.lean` module",
+            )
 
-    ob_root = (
-        generated_dir / "Obligations"
-        if (generated_dir / "Obligations").exists()
-        or (generated_dir / "Obligations").is_symlink()
+    specs_root = (
+        resolved / "anneal/proofs/Specs"
+        if generated_dir == resolved / ".anneal/generated"
+        and (resolved / "anneal/proofs/Specs").is_dir()
         else None
     )
-    if ob_root is not None:
-        _collect_regular_files_by_suffix(ob_root, ".lean")
-
     total_sites = 0
     for stem, r_path in sorted(receipt_files.items()):
         rec = _audit_single_item_receipt(
@@ -10124,9 +10924,9 @@ def audit_fault_coverage(
             mir_by_stem[stem],
             r_path,
             mir_by_stem,
-            mir_by_def_path,
-            receipts_by_def_path,
             ob_root,
+            verify_root,
+            specs_root,
             reg,
         )
         total_sites += len(rec["census_sites"])
@@ -10182,7 +10982,7 @@ def main() -> int:
         try:
             if base_snapshot is not None:
                 verify_base_snapshot(checkout, base_snapshot, tuple(args.expected_tcb_drift))
-            gate_summary = audit_checkout_fault_coverage_gate(checkout)
+            gate_summary = audit_checkout_fault_coverage_gate(checkout, require_source_pins=True)
             target_summary = audit_fault_coverage(args.audit_fault_coverage)
         except Failure as error:
             print(f"Trusted check failed ({error.phase}): {error}", file=sys.stderr)

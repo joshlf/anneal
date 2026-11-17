@@ -838,11 +838,31 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         for probe_name in runner.FAULT_MUTATION_PROBES:
             probe_rep = runner.run_false_proof_probe(probe_name)
             assert probe_rep["passed"] is True
+            assert probe_rep["baseline_discharged"] == probe_rep["census"]
             assert probe_rep["baseline_verdict"]["verdict"] == "VERIFIED"
             assert probe_rep["mutant_verdict"]["verdict"] == "UNKNOWN(UNMAPPED_FAULT_SITE)"
             assert probe_rep["mutant_verdict"]["missing_sites"] == probe_rep["expected_missing_sites"]
-        assert runner.run_property_registry_unemitted_probe()["passed"] is True
+        reg_probe = runner.run_property_registry_unemitted_probe()
+        assert reg_probe["passed"] is True
+        assert reg_probe["witnessClasses"] == list(runner.MIR_FAULT_CLASSES)
+        assert reg_probe["perClassFailClosed"] == {cls: True for cls in runner.MIR_FAULT_CLASSES}
         assert runner.run_callee_coordinate_mask_probe()["passed"] is True
+        # The probe baselines are the real obligation emitter: an emitter that silently drops
+        # any single fault class (e.g. `bounds_check`, never reached by the four mutation
+        # bodies) fails the gate instead of passing `baseline == census` by construction.
+        real_emit = runner.emit_mir_obligation_fault_sites
+        for dropped in runner.MIR_FAULT_CLASSES:
+            with patch.object(runner, "emit_mir_obligation_fault_sites",
+                              lambda body, d=dropped: [s for s in real_emit(body) if s.fault_class != d]):
+                expect_gate_failure = False
+                try:
+                    runner.run_false_proof_mutation_probes()
+                except runner.Failure as error:
+                    expect_gate_failure = error.phase == "fault-coverage"
+                assert expect_gate_failure, f"lossy emitter dropping `{dropped}` passed the probes"
+        with patch.object(runner, "emit_mir_obligation_fault_sites",
+                          lambda body: [s for s in real_emit(body) if s.fault_class != "bounds_check"]):
+            checked(fixture(), expected=1, phase="fault-coverage", executed=False)
         bad_reg = {k: dict(v) for k, v in runner.PROPERTY_REGISTRY.items()}
         bad_reg["tree_borrows_violation"]["status"] = runner.PROPERTY_STATUS_UNEMITTED_GAP
         with patch.object(runner, "PROPERTY_REGISTRY", bad_reg):
@@ -932,6 +952,25 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "terminators": True,
             "faultSiteCensus": True,
         }
+        # Pins are mandatory as soon as a tree ships any census theory; only bare fixture
+        # trees (no `Anneal.FaultSiteCensus` import, neither pinned file) may skip them.
+        assert runner.fault_census_source_pins_required(checkout) is True
+        bare = fixture()
+        assert runner.fault_census_source_pins_required(bare) is False
+        (bare / "theory").mkdir()
+        (bare / "theory/Anneal.lean").write_text("prelude\nimport Trusted\n")
+        assert runner.fault_census_source_pins_required(bare) is False
+        (bare / "theory/Anneal.lean").write_text("import Trusted\nimport Anneal.FaultSiteCensus\n")
+        assert runner.fault_census_source_pins_required(bare) is True
+        expect_failure(lambda: runner.audit_checkout_fault_coverage_gate(bare, require_source_pins=True),
+                       1, "fault-coverage", "could not run")
+        checked(bare, expected=1, phase="fault-coverage", executed=False)
+        (bare / "theory/Anneal.lean").write_text("prelude\nimport Trusted\n")
+        (bare / "theory/Anneal").mkdir()
+        shutil.copyfile(checkout / "theory/Anneal/FaultSiteCensus.lean", bare / "theory/Anneal/FaultSiteCensus.lean")
+        assert runner.fault_census_source_pins_required(bare) is True
+        checked(bare, expected=1, phase="fault-coverage", executed=False)
+        shutil.rmtree(bare)
         term_rel = Path("trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Terminators.lean")
         root = fixture()
         (root / term_rel).parent.mkdir(parents=True, exist_ok=True)
@@ -956,19 +995,32 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         checked(root, expected=1, phase="fault-coverage", executed=False)
 
         # 19d. --audit-fault-coverage workspace & CaptureManifest.json positive and negative checks.
+        # The FaultCensus receipt is cargo-anneal output, i.e. untrusted input: its discharged
+        # sites must equal the independent Python obligation emitter, and its callee closure
+        # must agree with `Obligations/<Item>.lean` and the `Verify/<Item>.lean` surface.
         ws_dir = suite / "fc-workspace"
         gen_dir = ws_dir / ".anneal/generated"
         for sub in ("Mir/Demo", "FaultCensus/Demo", "Obligations/Demo", "Verify/Demo"):
             (gen_dir / sub).mkdir(parents=True, exist_ok=True)
         (ws_dir / "src").mkdir(parents=True, exist_ok=True)
         rs_ws = ws_dir / "src/lib.rs"
-        rs_ws.write_text("pub fn item_1() {}\n")
+        rs_ws.write_text("pub fn item_1() {}\nfn helper() {}\n")
         mir_ws = gen_dir / "Mir/Demo/item_1.lean"
         mir_ws.write_text(valid_mir_mod)
+        # Inline callee bodies are captured with `ContractRole.subject` but never get their
+        # own receipt or `Verify/` module; they must not be mistaken for unaudited subjects.
+        helper_ws = gen_dir / "Mir/Demo/helper.lean"
+        helper_ws.write_text(valid_mir_mod.replace("item_1", "helper"))
         ob_ws = gen_dir / "Obligations/Demo/item_1.lean"
-        ob_ws.write_text("import Trusted\nimport Mir.Demo.item_1\nnamespace Obligations.Demo.item_1\ndef defaultCallees : List CapturedMir := .nil\nend Obligations.Demo.item_1\n")
+        ob_nil = ("import Trusted\nimport Mir.Demo.item_1\nnamespace Obligations.Demo.item_1\n"
+                  "def defaultCallees : List CapturedMir := .nil\nend Obligations.Demo.item_1\n")
+        ob_ws.write_text(ob_nil)
         ver_ws = gen_dir / "Verify/Demo/item_1.lean"
-        ver_ws.write_text("import Trusted\nnamespace Verify.Demo.item_1\ntheorem verified : True := trivial\nend Verify.Demo.item_1\n")
+        ver_claim = ("import Trusted\nimport Mir.Demo.item_1\nimport Obligations.Demo.item_1\n"
+                     "namespace Verify.Demo.item_1\n"
+                     "theorem verified : Trusted.VerificationResult.VerificationResult Obligations.Demo.item_1.claim :=\n"
+                     "  Proof.Demo.item_1.verified\nend Verify.Demo.item_1\n")
+        ver_ws.write_text(ver_claim)
         fc_ws = gen_dir / "FaultCensus/Demo/item_1.json"
         valid_receipt = {
             "def_path": "demo::item_1",
@@ -984,47 +1036,69 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "is_verified": True,
             "reasons": [],
         }
-        fc_ws.write_text(json.dumps(valid_receipt, indent=2))
+
+        def write_receipt(**overrides):
+            fc_ws.write_text(json.dumps({**valid_receipt, **overrides}, indent=2))
+
+        def closure(inline=(), external=(), unresolved=False):
+            return {"inline_callees": list(inline), "external_callees": list(external),
+                    "allow_unresolved_indirect_calls": unresolved}
+
+        write_receipt()
         ws_manifest = ws_dir / "CaptureManifest.json"
         ws_manifest.write_text(json.dumps({
             "schema": 1,
             "compilation_succeeded": True,
             "rust_sources": [["src/lib.rs", runner.digest(rs_ws)]],
             "targets": [{
+                "def_id": "demo::helper",
+                "mir_module_path": ".anneal/generated/Mir/Demo/helper.lean",
+                "mir_module_sha256": runner.digest(helper_ws),
+            }, {
                 "def_id": "demo::item_1",
                 "mir_module_path": ".anneal/generated/Mir/Demo/item_1.lean",
                 "mir_module_sha256": runner.digest(mir_ws),
             }],
         }))
         assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
-        assert runner.audit_fault_coverage(ws_manifest)["targets"] == 1
+        assert runner.audit_fault_coverage(ws_manifest)["targets"] == 2
 
-        # Negative 1: Omitted discharged site fails closed.
-        fc_ws.write_text(json.dumps({**valid_receipt, "discharged_sites": [s.to_dict() for s in expected_sites[:-1]]}))
-        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "unmapped fault site")
-        expect_failure(lambda: runner.verify_capture_manifest(ws_manifest, ws_dir), 1, "fault-coverage", "unmapped fault site")
+        # Negative 1: Omitted or unbacked discharged sites fail closed against the independent
+        # emitter (a receipt can no longer certify `discharged_sites := census_sites`).
+        write_receipt(discharged_sites=[s.to_dict() for s in expected_sites[:-1]])
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "independent obligation emitter")
+        expect_failure(lambda: runner.verify_capture_manifest(ws_manifest, ws_dir), 1, "fault-coverage", "independent obligation emitter")
+        write_receipt(discharged_sites=[s.to_dict() for s in expected_sites]
+                      + [{"block_idx": 7, "stmt_idx": 0, "fault_class": "arith_overflow"}])
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "independent obligation emitter")
+        real_emit = runner.emit_mir_obligation_fault_sites
+        with patch.object(runner, "emit_mir_obligation_fault_sites",
+                          lambda body: [s for s in real_emit(body) if s.fault_class != "call_abi_mismatch"]):
+            write_receipt(discharged_sites=[s.to_dict() for s in expected_sites if s.fault_class != "call_abi_mismatch"])
+            expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "call_abi_mismatch")
 
         # Negative 2: Stale/truncated census_sites in FaultCensus/<Item>.json fails closed.
-        fc_ws.write_text(json.dumps({**valid_receipt, "census_sites": [s.to_dict() for s in expected_sites[:-1]]}))
+        write_receipt(census_sites=[s.to_dict() for s in expected_sites[:-1]])
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "stale or tampered")
 
         # Negative 3: SHA-256 mismatch in FaultCensus/<Item>.json fails closed.
-        fc_ws.write_text(json.dumps({**valid_receipt, "mir_module_sha256": "0" * 64}))
+        write_receipt(mir_module_sha256="0" * 64)
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "SHA-256 mismatch")
 
         # Negative 4: Unverified verdict in FaultCensus/<Item>.json fails closed.
-        fc_ws.write_text(json.dumps({**valid_receipt, "is_verified": False, "reconciliation_verdict": "UNKNOWN(UNMAPPED_FAULT_SITE)"}))
+        write_receipt(is_verified=False, reconciliation_verdict="UNKNOWN(UNMAPPED_FAULT_SITE)")
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "not VERIFIED")
 
         # Negative 5: Unemitted registry class fails closed.
-        fc_ws.write_text(json.dumps(valid_receipt))
+        write_receipt()
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir, registry=bad_reg), 1, "fault-coverage", "tree_borrows_violation")
 
-        # Negative 6: Missing subject receipt fails closed (both via manifest and via generated dir).
+        # Negative 6: Missing subject receipt fails closed (via manifest, workspace, and generated dir).
         fc_ws.unlink()
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "missing FaultCensus receipt")
+        expect_failure(lambda: runner.audit_fault_coverage(ws_manifest), 1, "fault-coverage", "missing FaultCensus receipt")
         expect_failure(lambda: runner.audit_fault_coverage(gen_dir), 1, "fault-coverage", "no `FaultCensus/<Item>.json` receipts")
-        fc_ws.write_text(json.dumps(valid_receipt))
+        write_receipt()
 
         # Negative 7: Orphan receipt without matching Mir/<Item>.lean fails closed.
         orphan_fc = gen_dir / "FaultCensus/Demo/orphan.json"
@@ -1033,8 +1107,106 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         orphan_fc.unlink()
 
         # Negative 8: Unlisted inline callee in Obligations defaultCallees fails closed.
-        ob_ws.write_text("import Trusted\nimport Mir.Demo.item_1\nnamespace Obligations.Demo.item_1\ndef defaultCallees : List CapturedMir := [Mir.Demo.item_1.body]\nend Obligations.Demo.item_1\n")
+        ob_ws.write_text(ob_nil.replace(":= .nil", ":= [Mir.Demo.item_1.body]"))
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "missing from FaultCensus `callee_closure.inline_callees`")
+        ob_ws.write_text(ob_nil.replace(":= .nil", ":= [Mir.Demo.helper.body]"))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "missing from FaultCensus `callee_closure.inline_callees`")
+        write_receipt(callee_closure=closure(inline=["demo::helper"]))
+        assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
+        ob_ws.write_text(ob_nil)
+
+        # Negative 9: A tampered callee closure is never taken at face value.
+        write_receipt(callee_closure=closure(inline=["demo::helper"]))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "never installs")
+        write_receipt(callee_closure=closure(unresolved=True))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "allow_unresolved_indirect_calls")
+        write_receipt(callee_closure=closure(external=["demo::ghost"]))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "non-modular")
+        write_receipt()
+
+        # Negative 10: Missing, shadowed, modified, or extended `defaultCallees` tables fail closed.
+        for bad_ob, needle in (
+            (ob_nil.replace("def defaultCallees : List CapturedMir := .nil\n", ""), "missing `def defaultCallees"),
+            (ob_nil.replace("def defaultCallees", "abbrev defaultCallees"), "via `abbrev`"),
+            (ob_nil.replace("def defaultCallees", "private def defaultCallees"), "modifier"),
+            (ob_nil.replace("def defaultCallees", "def Evil.defaultCallees"), "qualified"),
+            (ob_nil.replace(": List CapturedMir :=", ": List Nat :="), "malformed `def defaultCallees` header"),
+            (ob_nil.replace(":= .nil", ":= [] ++ [Mir.Demo.helper.body]"), "trailing token"),
+            (ob_nil.replace("namespace Obligations.Demo.item_1\n", "namespace Obligations.Demo.item_1\nnamespace Evil\nend Evil\n"), "unexpected `namespace Evil`"),
+            (ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Obligations.Demo.item_1\n"), "self-imports"),
+        ):
+            ob_ws.write_text(bad_ob)
+            expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", needle)
+        ob_ws.unlink()
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "missing Obligations module")
+        ob_ws.write_text(ob_nil)
+
+        # Negative 11: Missing or non-canonical `Verify/<Item>.lean` fails closed.
+        for bad_ver, needle in (
+            ("import Trusted\nnamespace Verify.Demo.item_1\ntheorem verified : True := trivial\nend Verify.Demo.item_1\n", "non-canonical"),
+            (ver_claim.replace("theorem verified", "axiom verified"), "via `axiom`"),
+            (ver_claim + "namespace Verify.Demo.item_1\ntheorem verified : True := trivial\nend Verify.Demo.item_1\n", "exactly one"),
+            # Verify-surface smuggling (ported from the Rust certificate inspector, plus
+            # certificate-type shadowing): axioms, notation, `@[instance]`, spec instances,
+            # foreign imports, and local re-definitions of the certificate types.
+            (ver_claim.replace("theorem verified", "axiom evil : False\ntheorem verified"), "disallowed top-level `axiom`"),
+            (ver_claim.replace("theorem verified", "notation \"ok\" => True\ntheorem verified"), "disallowed top-level `notation`"),
+            (ver_claim.replace("theorem verified", "@[instance] def evilProof : Nat := 0\ntheorem verified"), "`@[instance]`"),
+            (ver_claim.replace("theorem verified", "instance : ItemSpec \"demo::item_1\" := sorry\ntheorem verified"), "specification class"),
+            (ver_claim.replace("theorem verified", "instance evil : Inhabited Nat := ⟨0⟩\ntheorem verified"), "non-`*ItemProof` `instance`"),
+            (ver_claim.replace("import Trusted\n", "import Trusted\nimport Assumptions.Demo.other\n"), "disallowed `import Assumptions.Demo.other`"),
+            (ver_claim.replace("import Trusted\n", "import Trusted\nimport Evil\n"), "disallowed `import Evil`"),
+            (ver_claim.replace("theorem verified", "def VerificationResult (_ : Nat) : Prop := True\ntheorem verified"), "shadows or escapes"),
+            (ver_claim.replace("theorem verified", "def Obligations.Demo.item_1.claim : Nat := 0\ntheorem verified"), "shadows or escapes"),
+        ):
+            ver_ws.write_text(bad_ver)
+            expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", needle)
+        ver_ws.unlink()
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "Verify")
+        expect_failure(lambda: runner.audit_fault_coverage(ws_manifest), 1, "fault-coverage", "Verify")
+
+        # 19e. External callees are honoured only for an independently derived modular surface
+        # backed by `externalSpecCallContract` targets or imported sibling obligations, and
+        # unresolved indirect calls only for an assumed (`spec(trusted)` / UB-exception) body.
+        ver_ws.write_text(ver_claim.replace(
+            "VerificationResult.VerificationResult Obligations.Demo.item_1.claim",
+            "VerificationResult.ModularVerificationResult Obligations.Demo.item_1.modularClaim"))
+        ob_ws.write_text(ob_nil.replace(
+            "end Obligations.Demo.item_1",
+            "def externalCallContract_ext : MirCallContract :=\n"
+            "  externalSpecCallContract \"demo::ext\" Mir.Demo.helper.body (fun _ => True) (fun _ _ => True)\n"
+            "end Obligations.Demo.item_1"))
+        write_receipt(callee_closure=closure(external=["demo::ext"]))
+        assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
+        write_receipt(callee_closure=closure(external=["demo::ext", "demo::ghost"]))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "backed by neither")
+        write_receipt(callee_closure=closure(external=["demo::ext"], unresolved=True))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "allow_unresolved_indirect_calls")
+        ob_ws.write_text(ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Obligations.Demo.helper\n"))
+        write_receipt(callee_closure=closure(external=["demo::helper"]))
+        assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
+        ob_ws.write_text(ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Obligations.Demo.missing\n"))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "Mir/Demo/missing.lean")
+        ob_ws.write_text(ob_nil)
+        ver_trusted = ver_claim.replace(
+            "import Obligations.Demo.item_1\n", "import Obligations.Demo.item_1\nimport Assumptions.Demo.item_1\n"
+        ).replace("Proof.Demo.item_1.verified", "Assumptions.Demo.item_1.rust_trusted_contract")
+        ver_ws.write_text(ver_trusted)
+        write_receipt(callee_closure=closure(external=["demo::anything"], unresolved=True))
+        assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
+        assert runner.audit_fault_coverage(ws_manifest)["targets"] == 2
+        # The subject counts as assumed only for the exact generated `spec(trusted)`
+        # certificate: a wrapped proof term, or one without `import Assumptions.<Item>`,
+        # does not relax the closure.
+        for not_assumed in (
+            ver_trusted.replace("Assumptions.Demo.item_1.rust_trusted_contract",
+                                "(fun h => h) Assumptions.Demo.item_1.rust_trusted_contract"),
+            ver_trusted.replace("import Assumptions.Demo.item_1\n", ""),
+            ver_trusted.replace("Assumptions.Demo.item_1.rust_trusted_contract",
+                                "Proof.Demo.item_1.verified -- Assumptions.Demo.item_1.rust_trusted_contract"),
+        ):
+            ver_ws.write_text(not_assumed)
+            expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "allow_unresolved_indirect_calls")
         shutil.rmtree(ws_dir)
         done("fault-site census, 12-class PropertyRegistry, source pins, 4+2 false-proof mutation probes, and --audit-fault-coverage")
     except BaseException as error:

@@ -787,14 +787,27 @@ pub fn compute_workspace_bundle_fault_census(
         (receipt, verdict)
     };
 
-    let verify_surface_is_modular = if authored.has_proof || authored.has_specs {
-        authored.is_modular
-    } else if !authored.has_assumptions
-        && (bundle.has_rust_trusted_attr() || authored.has_generated_assumptions)
-    {
+    // `[adv ep2-B1]`: mirror `render_verify_module_with_options` exactly, so the
+    // receipt's `CalleeClosure` is no more permissive than the certificate surface
+    // that `Verify/<Item>.lean` actually proves (and that `check_trusted.py
+    // --audit-fault-coverage` independently re-derives): the subject's own body is
+    // assumed only when `Verify` cites `Assumptions.<Item>.rust_trusted_contract`
+    // (no authored `Proof`/`Assumptions`) or proves a scoped UB exception
+    // (`Proof` + `UbExceptionItemSpec`); a `#[spec(trusted)]` item with an authored
+    // `Proof` is verified, not assumed.
+    let verify_uses_rust_trusted_contract = !authored.has_proof
+        && !authored.has_assumptions
+        && (bundle.has_rust_trusted_attr() || authored.has_generated_assumptions);
+    let verify_is_ub_exception = authored.has_proof && authored.is_ub_exception;
+    let subject_is_assumed = verify_uses_rust_trusted_contract || verify_is_ub_exception;
+    let verify_surface_is_modular = if authored.has_proof {
+        !authored.is_ub_exception && authored.is_modular
+    } else if verify_uses_rust_trusted_contract {
         false
     } else {
-        !bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()
+        authored.is_modular
+            || (!authored.has_specs
+                && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()))
     };
     let mut specs_modular_externals: Option<Vec<String>> = if verify_surface_is_modular {
         None
@@ -917,7 +930,7 @@ pub fn compute_workspace_bundle_fault_census(
         &callee_sources,
         specs_modular_externals.as_deref(),
         equiv_mir_src_opt.as_deref(),
-        bundle.has_rust_trusted_attr() || authored.is_ub_exception,
+        subject_is_assumed,
         &PropertyRegistry::all_verified(),
         &BTreeSet::new(),
     );
