@@ -29,14 +29,17 @@ Contents (every claim is checked by the kernel when this file is elaborated):
   outside `MirLiftCore.StepConeSafe`, non-vacuity, necessity of the linked-table hypothesis);
 * the **`Anneal.MirLiftCore` bridge** (`AgreesOn` from raw certificates, `calleesAgreeOn`,
   opaque evaluation → `runCfgWithCallees` → narrowed table, `wpMirExecSym` transfer, the
-  `CalleeInitWf` forms down to the empty table and their necessity, and polymorphic
-  `CallConeClosedPoly` narrowing of a generic callee);
+  `CalleeInitWf` forms down to the empty table and their necessity, polymorphic
+  `CallConeClosedPoly` / `toList`-free `callConeClosed(Poly)` narrowing of a generic callee and
+  of a table with a shadowed duplicate, and `AgreesOn` narrowing of a generic callee);
 * Part B query canaries and the **receiver-driven `charon#1611` dispatch** canaries, including
   the explicit trait-method binding (`expectedTraitMethod?`) for compiler-generated shims versus
-  the fail-closed `implementsCalledMethod` fallback;
+  the fail-closed `implementsCalledMethod` fallback, and the fail-closed / UB edges of dispatch
+  (ill-formed sites, unresolved `dyn` slot targets, vtable metadata off an allocation start);
 * the `BEq`-shadowing demonstration (`ShadowingDemo`);
 * the `run_meta` **opacity witness** on all five sealed `OpaqueCalleeTable` operations;
-* the in-file **heartbeat regression gate** (`M = 4` vs. `M = 32` callees);
+* the in-file **heartbeat regression gate** (monomorphic and polymorphic + trait-dispatch
+  obligations, `M = 4` vs. `M = 32` and `M = 64` callees, with a kernel-unfolding self-test);
 * `#guard_msgs` axiom pins on headline theorems and the bottom-of-file `run_cmd`
   **axiom & namespace audit** over every constant of both library modules.
 -/
@@ -931,6 +934,26 @@ theorem canary_runCfgWithCallees_poly_bridge :
     canary_polyCone_closed.2 (by decide +kernel) rfl rfl, h₁]
   rfl
 
+/-- Initial state of `polyRoot` (no linked callees: the opaque table supplies them). -/
+def polyInit : MachineState := initMachineState polyRoot []
+
+/-- **Opaque cone narrowing of a generic callee from `AgreesOn`**
+(`evalWithOpaqueCallees_cone_narrow_of_agreesOn_poly`): the run demands the *polymorphic* key
+`poly::<u32>` (so the monomorphic `_of_agreesOn` form does not apply), `fx::poly` carries no
+`TraitImplEntry` in either table, and agreement on the one-path cone alone narrows the halting
+run to the canonical cone narrowing. -/
+theorem canary_cone_narrow_of_agreesOn_poly :
+    (demandedKeys polyFullTbl.lookup polyRoot 8 polyInit).any (fun k => !k.typeArgs.isEmpty) =
+        true ∧
+      evalWithOpaqueCallees (polyFullTbl.narrowToCone ["fx::poly"]) polyRoot 8 polyInit =
+        evalWithOpaqueCallees polyFullTbl polyRoot 8 polyInit ∧
+      (evalWithOpaqueCallees polyFullTbl polyRoot 8 polyInit).summary.tag = .halted :=
+  ⟨by decide +kernel,
+    evalWithOpaqueCallees_cone_narrow_of_agreesOn_poly ["fx::poly"] _ _ _ _ _
+      (agreesOn_narrowToCone ["fx::poly"] polyFullTbl).symm (by decide +kernel)
+      (by decide +kernel) (by decide +kernel),
+    by decide +kernel⟩
+
 /-- Shadowed duplicate of `fx::live_f` whose unreachable body calls `"fx::outside_cone"`.
 When placed *after* `fxLiveF` in a callee table, `findCallee?` / `lookupRaw` never selects it,
 yet `MirLiftCore.CallConeClosed` scans every list element with `defPath ∈ cone` and falsely
@@ -1271,6 +1294,33 @@ theorem dyn_step_missing_receiver_ub :
     dynDispatchStep dynEnv13 dynFullTbl { dynSite with vtableLocal := 0 } dynRoot dynAtCall =
       MirStepNode.fail .ub :=
   rfl
+
+/-- `dynRoot` called with a receiver whose `dyn` metadata points 8 bytes *into* vtable
+allocation `7` (reachable only through invalid metadata). -/
+def dynInitOffset : MachineState := initMachineState dynRoot [.ptr ⟨7, 8⟩ 0]
+
+/-- **Vtable metadata must address the start of a vtable allocation**: with the receiver's
+vtable pointer at offset `8` of allocation `7`, `vtablePtr?` rejects it, so the `dyn` call is UB
+(`.faulted .ub`) — never a dispatch through the slots of the containing vtable — while the same
+run with offset `0` (`dynInit`) dispatches to `Circle::area` and halts with `31`
+(`canary_dyn_e2e_full_run_schema13`). -/
+theorem canary_dyn_vtable_offset_is_ub :
+    evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynSite dynRoot 12 dynInitOffset =
+        .faulted .ub [.event 1] ∧
+      (evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynSite dynRoot 12 dynInit).summary.tag =
+        .halted := by
+  decide +kernel
+
+/-- **Conservative `dyn`-instantiation rejection (documented completeness gap)**: a vtable slot
+whose target is a generic impl method instantiated at a `dyn` type
+(`<impl<T: ?Sized + Area> Area for Box<T>>::area` at `T = dyn Area`) fails `vtableTargetAgrees`
+— paths alone cannot tell it from an uninstantiated virtual key — so such a call fails closed
+(`unsupported`), whereas the same impl method at a concrete type is accepted. -/
+theorem canary_dyn_generic_impl_at_dyn_fails_closed :
+    vtableTargetAgrees dynSite ("fx::<impl<T> Area for Box<T>>::area", [.dynamic "fx::Area"]) =
+        false ∧
+      vtableTargetAgrees dynSite ("fx::<impl<T> Area for Box<T>>::area", [fxCircleTy]) = true := by
+  decide
 
 /-- The live `dyn` call is the only demanded key at the call state. -/
 theorem dyn_demandedKey :
@@ -2221,7 +2271,7 @@ run_meta do
   if (← withTransparency .all (whnf carrier)).isConstOf ``OpaqueCalleeTable then
     throwError "opacity witness self-test failed: `.all` did not unfold the carrier type"
 
-/-! ## Heartbeat regression gate (`M = 4` vs. `M = 32` callees)
+/-! ## Heartbeat regression gate (`M = 4` vs. `M = 32` and `M = 64` callees)
 
 The gated obligation is the client pattern the opaque table exists for: a branch-pruned
 multi-step run over an `M`-callee table (`M` fillers, the dead-arm `g_dead`, and the live
@@ -2230,16 +2280,22 @@ narrowing over the narrowed run's keys (`canary_narrow_demandedKeys`, computed o
 dead arm demands nothing) and one `O(1)` key certificate per demanded key
 (`lookupKey_hit_mono`). The raw certificate is a hypothesis (a capture tool emits it once
 per table), so neither the elaborator nor the kernel ever inspects the table: the cost of
-elaborating *and kernel-checking* the proof must not depend on `M`. The gate measures
-`IO.getNumHeartbeats` around synchronous elaboration (`Elab.async false`, kernel check
-included) after a warm-up and requires `Hb(M = 32) ≤ 1.25 × Hb(M = 4)`.
+elaborating *and kernel-checking* the proof must not depend on `M`. A second obligation gates
+the polymorphic + trait-dispatch path the same way: `multiRoot`'s run over an `M`-filler
+`multiGateTbl` (generic `poly::<u32>` through `lookupKey_hit_free_poly_opaque`, and the
+`Area` override through `collectMatchingTraitImplsWith_cons_hit_mono` +
+`lookupKey_trait_hit_cert`, from the per-table `traitImpls` / `lookupRaw` hypotheses). The
+gate measures `IO.getNumHeartbeats` around synchronous elaboration (`Elab.async false`, kernel
+check included) after a warm-up and requires `Hb(M) ≤ 1.25 × Hb(M = 4)` for `M ∈ {32, 64}` on
+both obligations.
 
 Sensitivity self-test: the same obligation proved with a definitional `show` from
 `lookupKey` to `lookup` type-checks in the elaborator without touching the seal, but the
 kernel (which ignores `@[irreducible]`) unfolds the differently-headed sealed operations
-into the `M`-element list scan; the gate requires that variant to grow by at least 40% from
-`M = 4` to `M = 32`, so a regression that makes the certificate path leak `tbl.toList`
-unfolding — in the elaborator or in the kernel — fails this file. -/
+into the `M`-element list scan (about 4.8k heartbeats per callee); the gate requires that
+variant to grow by at least 40% from `M = 4` to `M = 64`, so a regression that makes the
+certificate path leak `tbl.toList` unfolding — in the elaborator or in the kernel — fails
+this file. -/
 
 /-- `m` unrelated captured callees padding a gate table. -/
 def gateFillers (m : Nat) : List CapturedMir :=
@@ -2370,19 +2426,23 @@ run_cmd do
   discard <| measure (← leaky 2)
   let hb4 ← measure (← o1 4)
   let hb32 ← measure (← o1 32)
+  let hb64 ← measure (← o1 64)
   let hbPT4 ← measure (← o1PolyTrait 4)
   let hbPT32 ← measure (← o1PolyTrait 32)
+  let hbPT64 ← measure (← o1PolyTrait 64)
   let lk4 ← measure (← leaky 4)
-  let lk32 ← measure (← leaky 32)
+  let lk64 ← measure (← leaky 64)
   unless 0 < hb4 && 0 < hbPT4 do
     throwError "heartbeat gate: no heartbeats measured for M = 4"
-  unless hb32 * 4 ≤ hb4 * 5 do
-    throwError "heartbeat regression gate (mono) failed: Hb(M = 32) = {hb32} > 1.25 × Hb(M = 4) = {hb4}"
-  unless hbPT32 * 4 ≤ hbPT4 * 5 do
-    throwError "heartbeat regression gate (poly+trait) failed: Hb(M = 32) = {hbPT32} > 1.25 × Hb(M = 4) = {hbPT4}"
-  unless lk4 * 7 ≤ lk32 * 5 do
+  unless hb32 * 4 ≤ hb4 * 5 && hb64 * 4 ≤ hb4 * 5 do
+    throwError "heartbeat regression gate (mono) failed: Hb(M = 4) = {hb4}, \
+      Hb(M = 32) = {hb32}, Hb(M = 64) = {hb64} (limit: 1.25 × Hb(M = 4))"
+  unless hbPT32 * 4 ≤ hbPT4 * 5 && hbPT64 * 4 ≤ hbPT4 * 5 do
+    throwError "heartbeat regression gate (poly+trait) failed: Hb(M = 4) = {hbPT4}, \
+      Hb(M = 32) = {hbPT32}, Hb(M = 64) = {hbPT64} (limit: 1.25 × Hb(M = 4))"
+  unless lk4 * 7 ≤ lk64 * 5 do
     throwError "heartbeat gate self-test failed: the kernel-unfolding variant did not scale \
-      (Hb(M = 4) = {lk4}, Hb(M = 32) = {lk32})"
+      (Hb(M = 4) = {lk4}, Hb(M = 64) = {lk64})"
 
 /-! ## `#guard_msgs` axiom pins on headline theorems
 
@@ -3068,6 +3128,26 @@ constant. -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_registry_theorems_and_unconditional_frames
 
+/-- info: 'Anneal.OpaqueCalleeTable.evalWithOpaqueCallees_cone_narrow_of_agreesOn_poly' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.OpaqueCalleeTable.evalWithOpaqueCallees_cone_narrow_of_agreesOn_poly
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallSite.vtablePtr?_offset' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallSite.vtablePtr?_offset
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_cone_narrow_of_agreesOn_poly' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_cone_narrow_of_agreesOn_poly
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_vtable_offset_is_ub' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_vtable_offset_is_ub
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_generic_impl_at_dyn_fails_closed' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_generic_impl_at_dyn_fails_closed
+
 end Anneal.CompilerQueryAndOpaqueCalleeTests
 
 /-! ## Module-wide axiom and namespace audit
@@ -3080,10 +3160,14 @@ equation lemmas) and fails elaboration unless
    `sorryAx`, no `Lean.ofReduceBool`), and
 2. it lies in the module's own namespace (`Anneal.OpaqueCalleeTable.*` /
    `Anneal.CompilerQueryEnv.*`, after private-name normalization). The only admitted foreign
-   names are Lean's realized equation lemmas of foreign definitions (`eq_<n>`, `eq_def`,
-   `eq_unfold`, `splitter`, `else_eq`, `_sparseCasesOn_<n>`), which are deterministic,
-   statement-identical across modules, and deduplicated at import. An orphan enumeration
-   `deriving instance DecidableEq` (a global `Trusted.….ofNat`) fails here.
+   names are (a) Lean's realized equation lemmas (`eq_<n>`, `eq_def`, `eq_unfold`,
+   `splitter`, `else_eq`, `_sparseCasesOn_<n>`) **about a definition declared in another,
+   imported module** (deterministic, statement-identical across modules, and deduplicated at
+   import), and (b) hygienic auxiliaries (`deriving DecidableEq`'s `match_on_same_ctor`)
+   whose macro scope is **this module's own** (`_@.<module>.`), so they can never collide
+   with another module's. An orphan enumeration `deriving instance DecidableEq` (a global
+   `Trusted.….ofNat`), a hand-written foreign `theorem Trusted.….eq_1` whose base is not an
+   imported declaration, or a foreign hygienic name all fail here.
 
 The test file's own declarations (canaries, fixtures, the shadowing demo) are audited for
 axioms as well. Non-vacuity: the auditor must flag `Classical.choice` (via `Classical.em`),
@@ -3100,12 +3184,51 @@ run_cmd do
       (``Lean.ofReduceBool, ``Lean.ofReduceBool)] do
     unless (← forbiddenOf probe).contains ax do
       throwError "axiom audit self-test failed: {probe} not flagged for {ax}"
-  let isRealizedEq (n : Name) : Bool :=
-    match n.eraseMacroScopes with
-    | .str _ last =>
-      last == "eq_def" || last == "eq_unfold" || last == "splitter" || last == "else_eq" ||
-        last.startsWith "eq_" || last.startsWith "_sparseCasesOn_"
-    | _ => false
+  let isRealizedSuffix (s : String) : Bool :=
+    s == "eq_def" || s == "eq_unfold" || s == "splitter" || s == "else_eq" ||
+      s.startsWith "eq_" || s.startsWith "_sparseCasesOn_"
+  -- The declaration a realized lemma is about (`f.match_1.splitter._sparseCasesOn_3 ↦
+  -- f.match_1`), or `none` for a name that is not a realized-lemma name.
+  let realizedBase? (n : Name) : Option Name := Id.run do
+    let mut m := n
+    let mut stripped := false
+    for _ in [0:4] do
+      match m with
+      | .str p s =>
+        if isRealizedSuffix s then
+          m := p
+          stripped := true
+      | _ => pure ()
+    return if stripped then some m else none
+  -- Admission of a constant of module `mod` (index `idx`) lying outside `mod`'s namespace:
+  -- a hygienic auxiliary of `mod`'s own macro scope, or a realized lemma about a declaration
+  -- of another, imported module.
+  let admitForeign (mod : Name) (idx : ModuleIdx) (un : Name) : Bool :=
+    if un.hasMacroScopes then
+      ((un.toString (escape := false)).splitOn
+        ("_@." ++ mod.toString (escape := false) ++ ".")).length ≥ 2
+    else
+      match realizedBase? un with
+      | some base =>
+        match env.getModuleIdxFor? base with
+        | some j => j != idx
+        | none => false
+      | none => false
+  -- Self-test of the admission rule (independent of the modules' contents).
+  let some octIdx := env.getModuleIdx? `Anneal.OpaqueCalleeTable
+    | throwError "audit: module Anneal.OpaqueCalleeTable is not imported"
+  unless admitForeign `Anneal.OpaqueCalleeTable octIdx
+      `Trusted.Rustc.V2026_06_01.MirSemantics.lookupSwitchTarget.match_1.eq_1 &&
+      admitForeign `Anneal.OpaqueCalleeTable octIdx
+        (Lean.addMacroScope `Anneal.OpaqueCalleeTable `Trusted.aux 7) &&
+      !admitForeign `Anneal.OpaqueCalleeTable octIdx
+        (Lean.addMacroScope `Anneal.MirLiftCore `Trusted.aux 7) &&
+      !admitForeign `Anneal.OpaqueCalleeTable octIdx
+        `Trusted.Rustc.V2026_06_01.MirAst.UintTy.ofNat &&
+      !admitForeign `Anneal.OpaqueCalleeTable octIdx `Trusted.Bogus.eq_1 &&
+      !admitForeign `Anneal.OpaqueCalleeTable octIdx
+        `Anneal.OpaqueCalleeTable.lookupKey_hit_mono.eq_1 do
+    throwError "namespace audit self-test failed: foreign-name admission rule is wrong"
   for (mod, minConsts, minThms) in
       [(`Anneal.OpaqueCalleeTable, 1500, 1000), (`Anneal.CompilerQueryEnv, 1350, 700)] do
     let some idx := env.getModuleIdx? mod
@@ -3120,7 +3243,7 @@ run_cmd do
       if mod.isPrefixOf un then
         inNamespace := inNamespace + 1
       else
-        unless un.hasMacroScopes || isRealizedEq un do
+        unless admitForeign mod idx un do
           leaked := leaked.push un
       if let some (.thmInfo _) := env.find? n then
         theorems := theorems + 1

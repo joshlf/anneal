@@ -2968,6 +2968,31 @@ theorem evalWithOpaqueCallees_cone_narrow_of_agreesOn (cone : List DefPath)
   evalWithOpaqueCallees_cone_narrow narrowTbl fullTbl body fuel s fun k hk =>
     lookupKey_eq_of_agreesOn_mono h (hkeys k hk).1 (hkeys k hk).2
 
+/-- **Cone narrowing of the opaque evaluator from `AgreesOn`, generic callees included**: if
+every key the full-table run demands calls into `cone` and no `dp ∈ cone` is subject to
+`TraitImplEntry` dispatch in either table (checked once per cone over the start state's trait
+impls and the sealed `traitImpls`), raw-lookup agreement on `cone` alone gives an identical run,
+for monomorphic and polymorphic (`CapturedMir.instantiate`) calls alike. Every demanded key
+carries the start state's trait impls (`demandedKeys_extraTraitImpls`), so no per-key
+certificate is needed. -/
+theorem evalWithOpaqueCallees_cone_narrow_of_agreesOn_poly (cone : List DefPath)
+    (narrowTbl fullTbl : OpaqueCalleeTable) (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : OpaqueCalleeTable.AgreesOn cone narrowTbl fullTbl)
+    (hno₁ : ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (s.memory.traitImpls ++ narrowTbl.traitImpls) dp = false)
+    (hno₂ : ∀ dp, dp ∈ cone →
+      hasTraitImplForDefPath (s.memory.traitImpls ++ fullTbl.traitImpls) dp = false)
+    (hkeys : ∀ k ∈ demandedKeys fullTbl.lookup body fuel s, k.defPath ∈ cone) :
+    evalWithOpaqueCallees narrowTbl body fuel s = evalWithOpaqueCallees fullTbl body fuel s :=
+  evalWithOpaqueCallees_cone_narrow narrowTbl fullTbl body fuel s fun k hk => by
+    have hextra := demandedKeys_extraTraitImpls fullTbl.lookup body fuel s k hk
+    have hdp := hkeys k hk
+    refine lookupKey_eq_of_agreesOn_free h hdp ?_ ?_
+    · rw [hextra]
+      exact hno₁ _ hdp
+    · rw [hextra]
+      exact hno₂ _ hdp
+
 /-- A halting iterated trusted run is a halting `MirFuelFree.runMirExecBounded` run (one more
 unit of fuel absorbs the final `.tau (.halted _)` step). -/
 theorem runMirExecBounded_of_runSteps_halted (body : CapturedMir) :

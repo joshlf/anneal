@@ -2562,11 +2562,28 @@ structure DynCallSite : Type where
   deriving DecidableEq
 
 /-- The receiver's runtime vtable pointer at `s`: local `site.vtableLocal` of the
-active frame must hold an initialized pointer (otherwise the `dyn` call is UB). -/
+active frame must hold an initialized pointer to the *start* of an allocation
+(`offsetBytes = 0`); otherwise the `dyn` call is UB. Rust `dyn` metadata always addresses
+the first byte of a vtable allocation (supertrait vtables reached by
+`.vtableSupertraitLookup` are allocations of their own), so a non-zero offset is only
+reachable through invalid metadata: it must never dispatch through the slots of the
+containing allocation (`canary_dyn_vtable_offset_is_ub`). -/
 def DynCallSite.vtablePtr? (site : DynCallSite) (s : MachineState) : Option ProvenancePtr :=
   match get? s.frame.locals site.vtableLocal with
-  | some (.init (.ptr p _)) => some p
+  | some (.init (.ptr p _)) => if p.offsetBytes = 0 then some p else none
   | _ => none
+
+/-- A vtable pointer read by `DynCallSite.vtablePtr?` addresses the start of its allocation. -/
+theorem DynCallSite.vtablePtr?_offset {site : DynCallSite} {s : MachineState}
+    {vt : ProvenancePtr} (h : site.vtablePtr? s = some vt) : vt.offsetBytes = 0 := by
+  unfold DynCallSite.vtablePtr? at h
+  split at h
+  · split at h
+    · injection h with h
+      subst h
+      assumption
+    · nomatch h
+  · nomatch h
 
 /-- The `dyn` trait of a call key: a virtual call `<dyn D as Trait>::method`
 carries `dyn D` as its first generic argument (`none` for non-virtual keys). -/
@@ -2651,7 +2668,12 @@ theorem slotMethodAgrees_of_some {site : DynCallSite} (target : DefPath) {m : De
 /-- **Full vtable target validity**: the resolved `(defPath, typeArgs)` pair must be a concrete
 implementation or concrete default-method instantiation (`(dynSelfTrait? target).isNone`, never
 an uninstantiated `dyn` key that would fall through `stepBranchPruned` to an unlinked external
-call!) and its path must satisfy `slotMethodAgrees`. -/
+call!) and its path must satisfy `slotMethodAgrees`.
+
+The `dyn` test is deliberately conservative: it also rejects a generic impl method instantiated
+at a `dyn` type (e.g. `impl<T: ?Sized + Tr> Tr for Box<T>` at `T = dyn Tr`), since paths alone
+cannot distinguish impl items from trait items; such sites fail closed (`unsupported`, a
+completeness gap, never a soundness one; `canary_dyn_generic_impl_at_dyn_fails_closed`). -/
 def vtableTargetAgrees (site : DynCallSite) (target : DefPath × List RigidTy) : Bool :=
   (dynSelfTrait? target).isNone && slotMethodAgrees site target.1
 
@@ -2730,7 +2752,8 @@ theorem redirectResolver_apply_ne (tbl : OpaqueCalleeTable)
 calling frame) `→ UnOp.vtableMethodLookup → abiCompatible →
 OpaqueCalleeTable.lookup → stepBranchPruned`. An ill-formed site fails closed
 (`MirStepNode.unsupported`: a configuration error, never attributed to the program),
-a receiver without a vtable pointer is UB, missing evidence fails closed, a CFI
+a receiver without a vtable pointer — or whose vtable pointer does not address the start
+of an allocation (`DynCallSite.vtablePtr?`) — is UB, missing evidence fails closed, a CFI
 type-id mismatch is the defined CFI trap (`abort`), and every other semantic error is
 UB. A resolved slot that fails `vtableTargetAgrees` (either still carrying a `dyn`
 receiver type or failing `slotMethodAgrees`) and a slot whose explicit binding names
