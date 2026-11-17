@@ -3835,4 +3835,612 @@ inductive StepRelLM2_4 (body : CapturedMir) (m : AnnealStepState) :
   | ub (m' : AnnealStepState) (msg : String) :
       StepRelLM2_4 body m (MirStepNode.fail .ub) (m', .error (.undefinedBehavior msg))
 
+/-! ## 10. Padded Union with `[(); N]` ZST Array Arm (`kani#5176` / `kani#5159`)
+
+When a `#[repr(C)] union` has a zero-sized `[(); N]` array arm (`N > 0`) alongside
+a larger payload arm of size `S ∈ {1, 2, 4, 8, 16}`:
+* Constructing or writing the `[(); N]` ZST arm (`_u = PU { z: [(); N] }` or
+  `_u.z = [(); N]`) into an uninitialized union activates a 0-byte arm whose
+  Anneal representation is `.init (.aggregate 0 (List.replicate n .unit))`
+  (`unionActiveSlotIsZstPlaceholder = true`) with byte image `replicateUninitBytes S`
+  (all `S` bytes `.uninit`), while `lean-miri` allocates an `S`-byte stack
+  allocation with `InitMask.new (translateSizeBytes S) false`
+  (`PaddedZstUnionUninitMemRel`).
+* Overwriting an already-initialized union (holding scalar `sc` of width
+  `k = sc.sizeBytes ≤ S`) with `_u.z = [(); N]` (`0` bytes) sets the typed
+  slots to `List.replicate n .unit` and attaches the `D13a` raw-byte overlay
+  retaining `[0, k)` initialized and `[k, S)` uninitialized in Anneal, while a
+  0-byte `annealMemCopyOp` in `lean-miri` preserves `UnionMemRel` in place.
+* Whole-union copies and moves (`_w = copy _u`, `_w = move _u`) of a ZST-initialized
+  union preserve `InitMask.new (translateSizeBytes S) false` in `lean-miri`
+  (`union_copy_uninit_alloc_spec`) and `.init (.aggregate 0 (List.replicate n .unit))`
+  in Anneal.
+* Reading the inhabited `[(); N]` ZST arm (`_r = copy _u.z`) or an in-bounds
+  element (`_r = copy _u.z[i]`, `i < N`) succeeds on both all-uninit
+  ZST-initialized unions and payload-initialized unions without reading any
+  uninitialized padding bytes, whereas reading an out-of-bounds element (`i ≥ N`),
+  an uninitialized scalar payload field (`w > 0`), or an uninhabited 0-byte field
+  (`tyIsUninhabited = true`, `kani#5159`) is undefined behavior in both machines. -/
+
+/-- The canonical Anneal value of `()` (`Value.unit`). -/
+def zstUnitVal : Value := .unit
+
+/-- The canonical Anneal value of `[(); N]`: `N` copies of `zstUnitVal`. -/
+def zstArrayVal (N : Nat) : Value := .aggregate 0 (List.replicate N zstUnitVal)
+
+/-- The `n`-slot all-`.unit` Anneal union field list produced when a union is
+initialized via a zero-sized `[(); N]` placeholder arm (`unionActiveSlotIsZstPlaceholder`). -/
+def unionAllUnitFields (n : Nat) : List Value := List.replicate n .unit
+
+/-- A `#[repr(C)] union` of size `S ∈ {1, 2, 4, 8, 16}` with an inhabited
+`[(); N]` ZST array arm at field `f_z < n` (layout index `zstFlIdx`). -/
+structure WellTypedPaddedZstUnionTy
+    (layouts : LayoutTable) (uTy : Ty) (S N f_z zstFlIdx : Nat) : Prop where
+  size_valid : ValidScalarBytes S
+  count_pos : 0 < N
+  fields_union : ∃ n, (translateTy uTy layouts).layout.fields = .Union n ∧ f_z < n
+  size_eq : (translateTy uTy layouts).layout.size = translateSizeBytes S
+  sized : (translateTy uTy layouts).layout.isSized = true
+  align_le : (translateTy uTy layouts).layout.align.abi.pow2 ≤ 29
+  adt_spec : ∃ defPath args tl n zstTl,
+    uTy.kind = .adt defPath args ∧
+    0 < uTy.layoutIdx ∧
+    uTy.layoutIdx < 900 ∧
+    layouts.lookup uTy.layoutIdx = some tl ∧
+    tl.fields = .union n ∧
+    tl.variants = .single 0 ∧
+    tl.isUninhabited = false ∧
+    tl.size.bytes = S ∧
+    tl.fieldLayouts.length = n ∧
+    layouts.pointerBits = 64 ∧
+    layouts.isLittleEndian = true ∧
+    get? tl.fieldLayouts f_z = some zstFlIdx ∧
+    0 < zstFlIdx ∧
+    layouts.lookup zstFlIdx = some zstTl ∧
+    zstTl.isUninhabited = false ∧
+    zstTl.size.bytes = 0 ∧
+    zstTl.fields = .array ⟨0⟩ N ∧
+    zstTl.variants = .single 0 ∧
+    zstTl.fieldLayouts = []
+
+/-- A memory-backed `S`-byte union local `mp` initialized via a 0-byte ZST arm
+(such as `[(); N]`): `mp` points at offset `0` of its own live mutable `S`-byte
+stack allocation whose `initializationMask` is `InitMask.new (translateSizeBytes S) false`
+(all `S` bytes uninitialized). -/
+inductive PaddedZstUnionUninitMemRel
+    (mach : AnnealMachine) (uTy : Ty) (layouts : LayoutTable) (S : Nat)
+    (mp : Miri.Interpreter.MemPlace AnnealProv) : Prop where
+  | mk
+      (allocId : Miri.Memory.AllocId)
+      (tag : Miri.Memory.BorTag)
+      (baseAddr : UInt64)
+      (localAlloc :
+        Miri.Memory.LocalAllocation
+          AnnealProv
+          (Option Miri.TreeBorrows.BorrowTree)
+          Miri.Memory.MiriMemoryKind)
+      (ptr_prov : mp.ptr.provenance = some (.concrete allocId tag))
+      (no_misalign : mp.misaligned = none)
+      (thin_meta : mp.metadata = .none)
+      (live_lookup : (allocId, localAlloc) ∈ mach.memory.live.toList)
+      (base_lookup : mach.lookupBaseAddr allocId = some baseAddr)
+      (ptr_addr_eq : mp.ptr.offset = Miri.ABI.Size.ofBytes baseAddr)
+      (addr_no_overflow : baseAddr.toNat + S < 2 ^ 64)
+      (alloc_size : localAlloc.allocation.byteSize = translateSizeBytes S)
+      (alloc_len : localAlloc.allocation.len = S)
+      (alloc_mut : localAlloc.allocation.mutability = .Mut)
+      (alloc_prov : localAlloc.allocation.provenanceMap = Miri.Memory.ProvenanceMap.new)
+      (alloc_align : localAlloc.allocation.align = (translateTy uTy layouts).layout.align.abi)
+      (alloc_extra : localAlloc.allocation.extra = none)
+      (alloc_native : localAlloc.allocation.nativeBuffer = none)
+      (mask_uninit :
+        localAlloc.allocation.initializationMask =
+          Miri.Memory.InitMask.new (translateSizeBytes S) false) :
+      PaddedZstUnionUninitMemRel mach uTy layouts S mp
+
+theorem PaddedZstUnionUninitMemRel.of_live_base
+    {mach mach' : AnnealMachine} {uTy : Ty} {layouts : LayoutTable} {S : Nat}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (h : PaddedZstUnionUninitMemRel mach uTy layouts S mp)
+    (hlive : ∀ a la, (a, la) ∈ mach.memory.live.toList → (a, la) ∈ mach'.memory.live.toList)
+    (hbase : ∀ a b, mach.lookupBaseAddr a = some b → mach'.lookupBaseAddr a = some b) :
+    PaddedZstUnionUninitMemRel mach' uTy layouts S mp := by
+  cases h with
+  | mk allocId tag baseAddr la hprov hmis hmeta hl hb hptr hovf hsz hlen hmut hp hal hex hnat hmask =>
+    exact .mk allocId tag baseAddr la hprov hmis hmeta (hlive _ _ hl) (hbase _ _ hb)
+      hptr hovf hsz hlen hmut hp hal hex hnat hmask
+
+/-- Any scalar read of width `w ∈ {1, 2, 4, 8, 16}` (`w ≤ S`) from an all-uninit
+ZST-initialized union allocation (`PaddedZstUnionUninitMemRel`) encounters an
+uninitialized byte at offset `0` and fails with `AllocError.invalidUninitBytes`. -/
+theorem PaddedZstUnionUninitMemRel.readScalar_uninit_error
+    {mach : AnnealMachine} {uTy : Ty} {layouts : LayoutTable} {S w : Nat}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (hS : ValidScalarBytes S) (hw : ValidScalarBytes w) (hwS : w ≤ S)
+    (hmem : PaddedZstUnionUninitMemRel mach uTy layouts S mp) :
+    ∃ allocId tag localAlloc badRange,
+      mp.ptr.provenance = some (.concrete allocId tag) ∧
+      (allocId, localAlloc) ∈ mach.memory.live.toList ∧
+      localAlloc.allocation.readScalar annealTargetDataLayout
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes w)) false =
+          .error (.invalidUninitBytes badRange) := by
+  cases hmem with
+  | mk allocId tag baseAddr la hprov _ _ hlive _ _ _ hsz hlen _ _ _ _ _ hmask =>
+    have hbad : la.allocation.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes w)) =
+        .ok (.error (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes w))) := by
+      rw [hmask]
+      rcases hS with rfl | rfl | rfl | rfl | rfl <;>
+        rcases hw with rfl | rfl | rfl | rfl | rfl <;>
+        (try omega) <;>
+        rfl
+    exact ⟨allocId, tag, la, _, hprov, hlive, union_readScalar_uninit hbad⟩
+
+/-- Extended local relation covering `UnionLocalRel` plus padded unions whose
+active arm is a 0-byte `[(); N]` ZST array (`zstUninit` on all-uninit storage,
+`zstOverlay` when `[(); N]` overwrote a scalar-initialized union). -/
+inductive PaddedZstUnionLocalRel
+    (mach : AnnealMachine)
+    (decl : LocalDecl)
+    (layouts : LayoutTable) :
+    LocalSlot →
+    Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout →
+    Prop where
+  | ofUnionLocalRel (slot : LocalSlot)
+      (mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) :
+      UnionLocalRel mach decl layouts slot mls →
+      PaddedZstUnionLocalRel mach decl layouts slot mls
+  | zstUninit (S n N f_z zstFlIdx : Nat)
+      (mp : Miri.Interpreter.MemPlace AnnealProv)
+      (cachedLayout : Option Miri.Interpreter.LocalLayout) :
+      (∀ l ∈ cachedLayout, l = translateTy decl.ty layouts) →
+      WellTypedPaddedZstUnionTy layouts decl.ty S N f_z zstFlIdx →
+      (translateTy decl.ty layouts).layout.fields = .Union n →
+      PaddedZstUnionUninitMemRel mach decl.ty layouts S mp →
+      PaddedZstUnionLocalRel mach decl layouts
+        (.init (.aggregate 0 (List.replicate n .unit)))
+        ⟨.live (.indirect mp), cachedLayout⟩
+  | zstOverlay (S n N f_z zstFlIdx : Nat) (f0Ty : Ty) (sc : MirAst.ScalarInt)
+      (mp : Miri.Interpreter.MemPlace AnnealProv)
+      (cachedLayout : Option Miri.Interpreter.LocalLayout) :
+      (∀ l ∈ cachedLayout, l = translateTy decl.ty layouts) →
+      WellTypedPaddedZstUnionTy layouts decl.ty S N f_z zstFlIdx →
+      (translateTy decl.ty layouts).layout.fields = .Union n →
+      UnionMemRel mach decl.ty layouts S f0Ty sc mp →
+      PaddedZstUnionLocalRel mach decl layouts
+        (.init (.aggregate 0
+          (List.replicate n .unit ++
+            [.aggregate 0
+              (encodeRawAbstractByteVals
+                (encodeLittleEndianBytes sc.bits sc.sizeBytes none ++
+                  replicateUninitBytes (S - sc.sizeBytes)))])))
+        ⟨.live (.indirect mp), cachedLayout⟩
+
+/-- `FrameRelLM2_4` extended with `PaddedZstUnionLocalRel`. -/
+structure FrameRelLM2_4PaddedZst
+    (body : CapturedMir)
+    (mach : AnnealMachine)
+    (af : StackFrame)
+    (mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) : Prop where
+  body_eq : mf.body = translateBody body
+  location_eq : mf.location = .mir ⟨af.blockIdx, af.stmtIdx⟩
+  af_locals_len : af.locals.length = body.localDecls.length
+  mf_locals_size : mf.locals.size = body.localDecls.length
+  locals_rel :
+    ∀ (i : Nat) (decl : LocalDecl) (slot : LocalSlot)
+      (mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout),
+      get? body.localDecls i = some decl →
+      get? af.locals i = some slot →
+      mf.locals[i]? = some mls →
+      PaddedZstUnionLocalRel mach decl body.layouts slot mls
+
+/-- `StateRelLM2_4` extended with `FrameRelLM2_4PaddedZst`. -/
+inductive StateRelLM2_4PaddedZst
+    (body : CapturedMir)
+    (s : MachineState)
+    (m : AnnealStepState) : Prop where
+  | mk
+      (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (frames_eq : m.stack.frames = #[topFrame])
+      (returnContinuation_eq : topFrame.returnContinuation = .stop false)
+      (returnPlace_eq :
+        ∃ retLay,
+          topFrame.returnPlace =
+            .frameLocal 0 0 none retLay topFrame.localsIdentity)
+      (frame_rel : FrameRelLM2_4PaddedZst body m.machine s.frame topFrame)
+      (activeCallee_none : s.memory.activeCallee = none)
+      (callStack_nil : s.memory.callStack = .nil)
+      (borrows_nil : s.memory.borrows = .nil)
+      (activeProtectors_nil : s.memory.activeProtectors = .nil)
+      (callerLocals_nil : s.memory.callerLocals = .nil)
+      (memoryAllocDisjoint : MemoryAllocDisjoint topFrame) :
+      StateRelLM2_4PaddedZst body s m
+
+/-- Every `StateRelLM2_4` embeds into `StateRelLM2_4PaddedZst`. -/
+theorem StateRelLM2_4.toPaddedZst {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (h : StateRelLM2_4 body s m) : StateRelLM2_4PaddedZst body s m := by
+  rcases h with ⟨tf, hf, hrc, hrp, hfr, hcal, hst, hbor, hprot, hcaller, hdisj⟩
+  exact ⟨tf, hf, hrc, hrp,
+    ⟨hfr.body_eq, hfr.location_eq, hfr.af_locals_len, hfr.mf_locals_size,
+      fun i d sl ml hd hs hm => .ofUnionLocalRel sl ml (hfr.locals_rel i d sl ml hd hs hm)⟩,
+    hcal, hst, hbor, hprot, hcaller, hdisj⟩
+
+/-- Every `StateRel` embeds into `StateRelLM2_4PaddedZst`. -/
+theorem StateRel.toPaddedZst {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (h : StateRel body s m) : StateRelLM2_4PaddedZst body s m :=
+  h.toLM2_4.toPaddedZst
+
+/-- `StepRelLM2_4` extended with `StateRelLM2_4PaddedZst`. -/
+inductive StepRelLM2_4PaddedZst (body : CapturedMir) (m : AnnealStepState) :
+    MirStepNode →
+    Miri.Interpreter.StepResult AnnealStepState Bool →
+    Prop where
+  | step (s' : MachineState) (m' : AnnealStepState) :
+      StateRelLM2_4PaddedZst body s' m' →
+      StepRelLM2_4PaddedZst body m (MirStepNode.step s') (m', .ok true)
+  | ub (m' : AnnealStepState) (msg : String) :
+      StepRelLM2_4PaddedZst body m (MirStepNode.fail .ub) (m', .error (.undefinedBehavior msg))
+
+theorem StepRelLM2_4.toPaddedZst {body : CapturedMir} {m : AnnealStepState}
+    {node : MirStepNode} {res : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepRelLM2_4 body m node res) : StepRelLM2_4PaddedZst body m node res := by
+  cases h with
+  | step s' m' hst => exact .step s' m' hst.toPaddedZst
+  | ub m' msg => exact .ub m' msg
+
+/-- For any `N > 0`, `zstArrayVal N` (`[(); N]`) lacks a layout-free byte image
+(`unionSlotLacksLayoutFreeImage = true`), so when its field/operand type is
+statically zero-sized (`tyByteSize = some 0`), `unionActiveSlotIsZstPlaceholder`
+returns `true` (`kani#5176`). -/
+theorem unionActiveSlotIsZstPlaceholder_zstArrayVal
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    {N : Nat} (hN : 0 < N) {zstArrTy : Ty}
+    (hsz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts zstArrTy) = some 0)
+    (fls : List Nat := []) :
+    unionActiveSlotIsZstPlaceholder localDecls layouts (some zstArrTy) (zstArrayVal N) fls = true := by
+  cases N with
+  | zero => exact absurd hN (Nat.lt_irrefl 0)
+  | succ k =>
+    have hlacks : unionSlotLacksLayoutFreeImage layouts (zstArrayVal (k + 1)) = true := rfl
+    unfold unionActiveSlotIsZstPlaceholder
+    rw [hlacks]
+    dsimp only
+    rw [hsz]
+    rfl
+
+/-- Merging `k` `.unit` slots in `mergeUnionTypedSlotsAux` leaves `(buf, bufMask)`
+unchanged. -/
+theorem mergeUnionTypedSlotsAux_allUnits
+    (layouts : LayoutTable)
+    (encodeSlot : Nat → Value → Option (List AbstractByte))
+    (fallbackLayoutIdx : Nat) (hasOverlay : Bool) (unionSize : Nat) :
+    ∀ (k : Nat) (flIdxs : List Nat) (buf : List AbstractByte) (bufMask : List Bool),
+      mergeUnionTypedSlotsAux layouts encodeSlot fallbackLayoutIdx hasOverlay unionSize
+        flIdxs (List.replicate k .unit) buf bufMask = some buf
+  | 0, _, buf, _ => rfl
+  | k + 1, [], buf, bufMask => by
+    simp only [List.replicate_succ, mergeUnionTypedSlotsAux]
+    exact mergeUnionTypedSlotsAux_allUnits layouts encodeSlot fallbackLayoutIdx hasOverlay
+      unionSize k [] buf bufMask
+  | k + 1, _ :: flRest, buf, bufMask => by
+    simp only [List.replicate_succ, mergeUnionTypedSlotsAux]
+    exact mergeUnionTypedSlotsAux_allUnits layouts encodeSlot fallbackLayoutIdx hasOverlay
+      unionSize k flRest buf bufMask
+
+/-- Encoding an `n`-slot all-`.unit` union value `.aggregate 0 (List.replicate n .unit)`
+at a well-typed padded ZST union layout (`WellTypedPaddedZstUnionTy`) produces
+`some (replicateUninitBytes S)` (all `S` bytes `.uninit`). -/
+theorem encodeByLayoutIdxAux_union_allUnits
+    {layouts : LayoutTable} {uTy : Ty} {S N f_z zstFlIdx : Nat}
+    (hwt : WellTypedPaddedZstUnionTy layouts uTy S N f_z zstFlIdx)
+    {n : Nat} (hfields_u : (translateTy uTy layouts).layout.fields = .Union n)
+    (fuel : Nat) :
+    encodeByLayoutIdxAux (fuel + 1) layouts uTy.layoutIdx
+      (.aggregate 0 (List.replicate n .unit)) = some (replicateUninitBytes S) := by
+  obtain ⟨_, _, tl, n', _, hk, _, _, hlookup, hfu, _, huninh, htl_sz, hfl_len, _, _,
+    hgf, _, _, _, _, _, _, _⟩ := hwt.adt_spec
+  have hn_eq : n' = n := by
+    unfold translateTy at hfields_u
+    dsimp only at hfields_u
+    rw [hk, hlookup] at hfields_u
+    dsimp only [translateTypeLayout, translateFieldsShape] at hfields_u
+    rw [hfu] at hfields_u
+    cases hfields_u
+    rfl
+  subst hn_eq
+  have hfls_ne : ∃ a as, tl.fieldLayouts = a :: as := by
+    cases h : tl.fieldLayouts with
+    | nil => rw [h] at hgf; cases hgf
+    | cons a as => exact ⟨a, as, rfl⟩
+  obtain ⟨a, as, hfls_eq⟩ := hfls_ne
+  have hsplit : ∀ k : Nat,
+      splitUnionTypedAndOverlay k (List.replicate k .unit) =
+        some (List.replicate k .unit, none) := by
+    intro k
+    induction k with
+    | zero => rfl
+    | succ k' ih =>
+      simp only [List.replicate_succ, splitUnionTypedAndOverlay, ih]
+  unfold encodeByLayoutIdxAux encodeUnionSlotsIntoBufAux
+  dsimp only
+  rw [hlookup]
+  dsimp only
+  rw [huninh, hfu]
+  dsimp only
+  rw [hsplit n']
+  dsimp only
+  rw [hfls_eq]
+  dsimp only
+  rw [← hfls_eq, htl_sz]
+  exact mergeUnionTypedSlotsAux_allUnits layouts _ _ false S n' tl.fieldLayouts
+    (replicateUninitBytes S) (replicateBool S false)
+
+/-- Reading a zero-sized `zstLayoutData` field from any live memory-backed union
+operand `⟨.indirect mp, { ty := tyId, layout := zstLayoutData }⟩` via
+`annealReadImmediateLM2_2` succeeds immediately with `Immediate.uninit` without
+inspecting `mp`'s allocation bytes or initialization mask. -/
+theorem annealReadImmediate_zstLayoutData
+    {m : AnnealStepState} (hnodup : LiveAllocsNodup m.machine)
+    {mp : Miri.Interpreter.MemPlace AnnealProv} {tyId : Miri.MIR.TyId}
+    {allocId : Miri.Memory.AllocId} {tag : Miri.Memory.BorTag} {baseAddr : UInt64}
+    {la : Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+      Miri.Memory.MiriMemoryKind}
+    (hprov : mp.ptr.provenance = some (.concrete allocId tag))
+    (hlive : (allocId, la) ∈ m.machine.memory.live.toList)
+    (hbase : m.machine.lookupBaseAddr allocId = some baseAddr) :
+    annealReadImmediateLM2_2 ⟨.indirect mp, { ty := tyId, layout := zstLayoutData }⟩ m =
+      .ok ⟨.uninit, { ty := tyId, layout := zstLayoutData }⟩ m := by
+  have hfind := array_find?_of_nodup_fst hnodup hlive
+  rcases la with ⟨kind, alloc⟩
+  unfold annealReadImmediateLM2_2 annealReadIndirectImmediate
+  dsimp only [zstLayoutData]
+  rw [hprov]
+  dsimp only [Option.bind, Miri.Memory.Provenance.getAllocId, get, getThe, MonadStateOf.get,
+    EStateM.get, bind, EStateM.bind]
+  rw [hbase, hfind]
+  rfl
+
+/-- Writing a zero-sized source operand `⟨.indirect zMp, zLay⟩`
+(`zLay.layout.size = Miri.ABI.Size.ZERO`) into a memory-backed union field place
+`⟨.memory mp, fLay⟩` (`fLay.layout.size = Miri.ABI.Size.ZERO`) via
+`annealMemCopyOp` when `mp` points to a live mutable `S`-byte allocation (`ValidScalarBytes S`,
+either `PaddedZstUnionUninitMemRel` or `UnionMemRel`) succeeds as a no-op
+(`.ok () m`), leaving `m`'s stack and memory state unchanged. -/
+theorem annealMemCopyOp_zero_into_union_field
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    {m : AnnealStepState} (hnodup : LiveAllocsNodup m.machine)
+    {S : Nat} (hS : ValidScalarBytes S)
+    {mp zMp : Miri.Interpreter.MemPlace AnnealProv}
+    {allocId srcAllocId : Miri.Memory.AllocId} {tag srcTag : Miri.Memory.BorTag}
+    {baseAddr srcBaseAddr : UInt64}
+    {la srcLa : Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+      Miri.Memory.MiriMemoryKind}
+    (hprov : mp.ptr.provenance = some (.concrete allocId tag))
+    (hlive : (allocId, la) ∈ m.machine.memory.live.toList)
+    (hbase : m.machine.lookupBaseAddr allocId = some baseAddr)
+    (hptr : mp.ptr.offset = Miri.ABI.Size.ofBytes baseAddr)
+    (hsz : la.allocation.byteSize = translateSizeBytes S)
+    (hlen : la.allocation.len = S)
+    (hmut : la.allocation.mutability = .Mut)
+    (hprov_src : zMp.ptr.provenance = some (.concrete srcAllocId srcTag))
+    (hlive_src : (srcAllocId, srcLa) ∈ m.machine.memory.live.toList)
+    (hbase_src : m.machine.lookupBaseAddr srcAllocId = some srcBaseAddr)
+    (hptr_src : zMp.ptr.offset = Miri.ABI.Size.ofBytes srcBaseAddr)
+    (hlen_src : srcLa.allocation.len = srcLa.allocation.byteSize.bytes.toNat)
+    {zLay fLay : Miri.Interpreter.LocalLayout}
+    (hf0 : fLay.layout.size = Miri.ABI.Size.ZERO) :
+    annealMemCopyOp localDecls layouts ⟨.indirect zMp, zLay⟩ ⟨.memory mp, fLay⟩ m =
+      .ok () m := by
+  have hfind_src := array_find?_of_nodup_fst hnodup hlive_src
+  obtain ⟨destIdx, _, hidx_dst, hget_dst, _⟩ := array_findIdx?_of_nodup_fst hnodup hlive
+  have hrel_src : Miri.ABI.Size.ofBytes (zMp.ptr.offset.bytes - srcBaseAddr) = Miri.ABI.Size.ZERO := by
+    have hb : zMp.ptr.offset.bytes = srcBaseAddr := by rw [hptr_src]; rfl
+    rw [hb, UInt64.sub_self]; rfl
+  have hrel_dst : Miri.ABI.Size.ofBytes (mp.ptr.offset.bytes - baseAddr) = Miri.ABI.Size.ZERO := by
+    have hb : mp.ptr.offset.bytes = baseAddr := by rw [hptr]; rfl
+    rw [hb, UInt64.sub_self]; rfl
+  have hlen_dst_nat : la.allocation.len = la.allocation.byteSize.bytes.toNat := by
+    rw [hlen, hsz, translateSizeBytes_toNat_of_valid hS]
+  have hslice_src := getBytesUnchecked_at (A := srcLa.allocation) Miri.ABI.Size.ZERO Miri.ABI.Size.ZERO
+    hlen_src (Nat.zero_le _)
+  have hslice_dst := getBytesUnchecked_at (A := la.allocation) Miri.ABI.Size.ZERO Miri.ABI.Size.ZERO
+    hlen_dst_nat (Nat.zero_le _)
+  have hnz : (la.allocation.byteSize.bytes == 0) = false := by
+    rw [hsz]
+    rcases hS with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have h0 : (Miri.ABI.Size.ZERO.bytes == 0) = true := rfl
+  have hforce : annealForceUnionAllocation localDecls layouts ⟨.memory mp, fLay⟩ m =
+      .ok ⟨mp, fLay⟩ m := rfl
+  rcases la with ⟨kind_d, alloc_d⟩
+  dsimp only at hsz hlen hmut hslice_dst hnz ⊢
+  unfold annealMemCopyOp
+  simp only [bind, EStateM.bind, hforce, get, getThe, MonadStateOf.get, EStateM.get,
+    hprov_src, hprov, Option.bind, Miri.Memory.Provenance.getAllocId,
+    hbase_src, hbase, hfind_src, hidx_dst, hget_dst, hrel_src, hrel_dst, hf0,
+    h0, ↓reduceIte, hslice_src, hslice_dst, hmut, bne_self_eq_false,
+    Bool.false_eq_true, hnz, pure, EStateM.pure]
+
+/-- Additive operand evaluation extending `annealEvalOperandLM2_4` with:
+1. Uninhabited 0-byte union field read detection (`isUninhabitedEncodedTyId fty layouts = true`
+   -> `.error (.undefinedBehavior "read of uninhabited union field")`, `kani#5159`);
+2. Nested indexed element projection on a union's `[(); N]` ZST array arm
+   (`[.Field j fty, .ConstantIndex offset minLen false]`), checking static bounds
+   `minLen ≤ N ∧ offset < N` (`checkStaticSubProjBounds`) and returning
+   `⟨.immediate .uninit, { ty := encodeTyId { kind := .tuple [], layoutIdx := 0 }, layout := zstLayoutData }⟩`
+   when in bounds and `.error (.undefinedBehavior "out-of-bounds union ZST array index")`
+   when out of bounds. -/
+def annealEvalOperandLM2_4PaddedZst
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (op : Miri.MIR.Operand)
+    (expectedLayout : Option Miri.Interpreter.LocalLayout) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.OpTy AnnealProv) := do
+  let place :=
+    match op with
+    | .Copy p | .Move p => some p
+    | _ => none
+  match place with
+  | some p =>
+    if isUnionLocal localDecls layouts p.localId then
+      match p.projection.toList with
+      | [.Field j fty] =>
+        let st ← get
+        if st.stack.currentFrame?.isNone then
+          throw (.stack .emptyStack)
+        let (frame', _) ← annealResolveAndCacheLocalLayout localDecls layouts p.localId none
+        match frame'.getLocalOperand p.localId with
+        | .error (.localExpectedLive _) => throw (.undefinedBehavior "read of dead local")
+        | .error e => throw (.stack e)
+        | .ok (.immediate .uninit) =>
+          throw (.undefinedBehavior "field read of uninitialized union")
+        | .ok (.immediate _) =>
+          throw (.unsupported "union local held as an initialized immediate")
+        | .ok (.indirect _) =>
+          if isUninhabitedEncodedTyId fty layouts then
+            throw (.undefinedBehavior "read of uninhabited union field")
+          else
+            annealEvalUnionField localDecls layouts p.localId j fty
+      | [.Field j fty, .ConstantIndex offset minLen false] =>
+        let st ← get
+        if st.stack.currentFrame?.isNone then
+          throw (.stack .emptyStack)
+        let (frame', uLay) ← annealResolveAndCacheLocalLayout localDecls layouts p.localId none
+        match frame'.getLocalOperand p.localId with
+        | .error (.localExpectedLive _) => throw (.undefinedBehavior "read of dead local")
+        | .error e => throw (.stack e)
+        | .ok (.immediate .uninit) =>
+          throw (.undefinedBehavior "field read of uninitialized union")
+        | .ok (.immediate _) =>
+          throw (.unsupported "union local held as an initialized immediate")
+        | .ok (.indirect mp) =>
+          match uLay.layout.fields with
+          | .Union n =>
+            if j < n then
+              match unionZstArrayElemCount? layouts fty with
+              | some arrLen =>
+                if minLen ≤ arrLen && offset < arrLen then
+                  pure ⟨.indirect mp,
+                    { ty := encodeTyId { kind := .tuple [], layoutIdx := 0 },
+                      layout := zstLayoutData }⟩
+                else
+                  throw (.undefinedBehavior "out-of-bounds union ZST array index")
+              | none =>
+                throw (.unsupported "non-ZST-array union ConstantIndex projection")
+            else
+              throw (.undefinedBehavior "out-of-bounds union field")
+          | _ => throw (.unsupported "non-union local in union ConstantIndex branch")
+      | _ => annealEvalOperandLM2_4 localDecls layouts op expectedLayout
+    else
+      annealEvalOperandLM2_4 localDecls layouts op expectedLayout
+  | none =>
+    annealEvalOperandLM2_4 localDecls layouts op expectedLayout
+where
+  /-- Check whether an encoded field `TyId` refers to an uninhabited layout in `layouts`. -/
+  isUninhabitedEncodedTyId (tyId : Miri.MIR.TyId) (layouts : LayoutTable) : Bool :=
+    if 100 ≤ tyId && tyId < 1000 then
+      match layouts.lookup (tyId - 100) with
+      | some tl => tl.isUninhabited
+      | none => false
+    else false
+  /-- Extract `N` when `tyId` encodes `{ kind := .array (.tuple []) N, layoutIdx := zstFlIdx }`
+  whose layout entry in `layouts` is a 0-byte inhabited `.array ⟨0⟩ N`. -/
+  unionZstArrayElemCount? (layouts : LayoutTable) (tyId : Miri.MIR.TyId) : Option Nat :=
+    if tyId ≥ 1000 && tyId % 100 == 51 then
+      let flIdx := (tyId - 1000) / 100
+      match layouts.lookup flIdx with
+      | some tl =>
+        if !tl.isUninhabited && tl.size.bytes == 0 then
+          match tl.fields with
+          | .array stride cnt => if stride.bytes == 0 then some cnt else none
+          | _ => none
+        else none
+      | none => none
+    else none
+
+/-- Additive aggregate hooks extending `annealAggregateHooksLM2_4` so zero-sized
+array operands (`src.layout.layout.size.bytes == 0`, such as `[(); N]` in
+`_u = PU { z: op_zst }`) succeed as a 0-byte copy into indirect union field
+destinations instead of failing `annealReadImmediateLM2_2`'s `.Arbitrary #[] #[]` check. -/
+def annealAggregateHooksLM2_4PaddedZst
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    Miri.Interpreter.AggregateHooks
+      AnnealProv
+      AnnealStepState
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  let base := annealAggregateHooksLM2_4 localDecls layouts
+  { base with
+    evalOperand := fun _ op known => do
+      let opTy ← annealEvalOperandLM2_4PaddedZst localDecls layouts op known
+      if opTy.layout.layout.size.bytes == 0 then
+        return ⟨.immediate .uninit, opTy.layout⟩
+      else
+        let imm ← annealReadImmediateLM2_2 opTy
+        return ⟨.immediate imm.imm, imm.layout⟩
+    evalOperandAt := fun _ _ op known => do
+      let opTy ← annealEvalOperandLM2_4PaddedZst localDecls layouts op known
+      if opTy.layout.layout.size.bytes == 0 then
+        return ⟨.immediate .uninit, opTy.layout⟩
+      else
+        let imm ← annealReadImmediateLM2_2 opTy
+        return ⟨.immediate imm.imm, imm.layout⟩
+    copyOpNoValidate := fun c src dest b => do
+      if src.layout.layout.size.bytes == 0 && dest.layout.layout.size.bytes == 0 then
+        match dest.1 with
+        | .memory mp =>
+          let st ← get
+          match mp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId with
+          | none => throw (.undefinedBehavior "zero-sized aggregate write without provenance")
+          | some allocId =>
+            match st.machine.memory.live.find? (fun (id, _) => id == allocId) with
+            | none => throw (.undefinedBehavior "zero-sized aggregate write to dead allocation")
+            | some (_, _) => pure ()
+        | .local .. =>
+          base.copyOpNoValidate c src dest b
+      else
+        base.copyOpNoValidate c src dest b }
+
+/-- Additive rvalue hooks extending `annealRvalueHooksLM2_4` with
+`annealEvalOperandLM2_4PaddedZst` and `annealAggregateHooksLM2_4PaddedZst`. -/
+def annealRvalueHooksLM2_4PaddedZst
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    Miri.Interpreter.RvalueHooks
+      AnnealProv
+      AnnealStepState
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  let base := annealRvalueHooksLM2_4 localDecls layouts
+  { base with
+    evalOperand := fun _ op known =>
+      annealEvalOperandLM2_4PaddedZst localDecls layouts op known
+    evalOperandAt := fun _ _ op known =>
+      annealEvalOperandLM2_4PaddedZst localDecls layouts op known
+    evalPlaceToOp := fun _ p known =>
+      annealEvalOperandLM2_4PaddedZst localDecls layouts (.Copy p) known
+    writeAggregate := fun c k os d =>
+      Miri.Interpreter.writeAggregate
+        (annealAggregateHooksLM2_4PaddedZst localDecls layouts) c k os d }
+
+/-- Additive step hooks extending `annealStepHooksLM2_4` with
+`annealRvalueHooksLM2_4PaddedZst` for padded `[(); N]` union ZST array arms
+(`kani#5176` / `kani#5159`). -/
+def annealStepHooksLM2_4PaddedZst
+    (localDecls : List LocalDecl := .nil) (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.StepHooks
+      AnnealProv
+      Miri.Interpreter.LocalLayout
+      Unit
+      AnnealMachine
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  let base := annealStepHooksLM2_4 localDecls layouts
+  { base with
+    assign := fun choice place rvalue state =>
+      if lm24Assign localDecls layouts place rvalue then
+        Miri.Interpreter.runRvalue
+          (Miri.Interpreter.evalRvalueIntoPlace
+            (annealRvalueHooksLM2_4PaddedZst localDecls layouts) choice rvalue place)
+          state
+      else
+        base.assign choice place rvalue state }
+
 end LeanMiriSpec.Correspondence
