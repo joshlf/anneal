@@ -1917,6 +1917,49 @@ fn itree_partially_comparable_fns<C, X>(
         .collect()
 }
 
+/// Stage 2 replacement confirmations for a partial `selected` subset of `pool`:
+/// for every candidate of `stage.failed_fns` none of whose selected cases was
+/// confirmed and all of whose selected cases are Stage 1 `ok` traces (`is_ok`)
+/// that failed inconclusively, the first case of `pool` (in order) owned by
+/// that candidate that was not selected and is a Stage 1 `ok` trace, so a
+/// confirmation that merely hit a resource limit does not cost the candidate
+/// its required kernel-confirmed trace. A candidate with a refuted or divergent
+/// selected case gets no replacement (it is dropped whole).
+fn itree_confirm_replacements<'p, C, X>(
+    stage: &IsolatedLeanStage<X>,
+    selected: &[C],
+    pool: &'p [C],
+    case_key: impl Fn(&C) -> &str,
+    case_to_fn: &BTreeMap<String, String>,
+    is_ok: impl Fn(&C) -> bool,
+) -> Vec<&'p C> {
+    let selected_keys: BTreeSet<&str> = selected.iter().map(&case_key).collect();
+    let mut out = Vec::new();
+    for fn_name in &stage.failed_fns {
+        let owned_by_fn = |c: &&C| case_to_fn.get(case_key(c)) == Some(fn_name);
+        let mut fn_selected = selected.iter().filter(owned_by_fn).peekable();
+        if fn_selected.peek().is_none() {
+            continue;
+        }
+        let needs_replacement = fn_selected.all(|c| {
+            !stage.results.contains_key(case_key(c))
+                && stage.inconclusive_cases.contains(case_key(c))
+                && is_ok(c)
+        });
+        if !needs_replacement {
+            continue;
+        }
+        if let Some(backup) = pool
+            .iter()
+            .filter(owned_by_fn)
+            .find(|c| !selected_keys.contains(case_key(c)) && is_ok(c))
+        {
+            out.push(backup);
+        }
+    }
+    out
+}
+
 /// Writes `src` to `verify_dir/<label>.lean` and runs `lake env lean -M <mb>`
 /// on it from `anneal_dir` under [`run_command_with_watchdog`], bounding
 /// `LEAN_NUM_THREADS`, Lean's internal allocator (`-M`), the process tree's
@@ -2169,14 +2212,18 @@ pub struct ItreeCampaignEvalReport {
     /// `ItreeDiffBatchConfirmChunk*` modules: every trace in identity mode or
     /// when at most [`ITREE_FULL_CONFIRM_MAX_TRACES`] distinct traces were
     /// probed, otherwise every divergence plus the first non-diverging trace of
-    /// each compared candidate (so `agree_candidates + diverge_traces <=
-    /// kernel_confirmed_traces <= distinct_traces_checked`).
+    /// each compared candidate (or, when that trace's confirmation was
+    /// inconclusive, its next non-diverging trace) (so `agree_candidates +
+    /// diverge_traces <= kernel_confirmed_traces <= distinct_traces_checked`).
     pub kernel_confirmed_traces: usize,
     /// Count of diverging traces kernel-confirmed via `by rfl`.
     pub kernel_confirmed_divergences: usize,
     /// Total distinct external-call observation path shapes (`MirObsPathKey`) observed.
     pub distinct_obs_paths: usize,
-    /// Per-candidate distinct trace counts (`b{b_idx}_c{c_idx}__kernel_step -> count`).
+    /// Per-candidate counts of the distinct traces checked in Lean
+    /// (`b{b_idx}_c{c_idx}__kernel_step -> count`), summing to
+    /// `distinct_traces_checked`; traces left unchecked by resource limits are
+    /// counted in `inconclusive_traces_by_candidate` instead.
     pub per_candidate_distinct_traces: BTreeMap<String, usize>,
     /// Trace counts by `TraceReplayDiag.tagName`.
     pub diag_tag_counts: BTreeMap<String, usize>,
@@ -3888,8 +3935,9 @@ fn evaluate_itree_entries(
         // its own `Mir.ItreeDiffStaged.*` modules. Identity-mode runs and batches of
         // `<= ITREE_FULL_CONFIRM_MAX_TRACES` distinct traces confirm every trace;
         // larger batches confirm every divergence plus the first trace of every
-        // candidate. `kernel_confirmed_traces` counts only traces whose theorems were
-        // actually checked by the Lean kernel.
+        // candidate (replaced by its next `ok` trace when that confirmation is
+        // inconclusive). `kernel_confirmed_traces` counts only traces whose
+        // theorems were actually checked by the Lean kernel.
         let mut confirm_cases: Vec<BatchTraceEvalCase> =
             if mode == "identity" || batch_cases.len() <= ITREE_FULL_CONFIRM_MAX_TRACES {
                 batch_cases.clone()
@@ -3943,37 +3991,21 @@ fn evaluate_itree_entries(
         );
         // When `batch_cases.len() > ITREE_FULL_CONFIRM_MAX_TRACES`, each agreeing
         // candidate had only its first `ok` trace selected into `confirm_cases`.
-        // If that trace hit a watchdog / resource limit (`inconclusive_cases`), try
-        // the candidate's remaining Stage-1 `ok` traces so it can still obtain at
-        // least one kernel-confirmed trace.
+        // If that trace hit a watchdog / resource limit (`inconclusive_cases`),
+        // confirm the candidate's next Stage-1 `ok` trace instead so it can still
+        // obtain at least one kernel-confirmed trace.
         if confirm_cases.len() < batch_cases.len() && !confirm_stage.failed_fns.is_empty() {
-            let selected_idents: BTreeSet<String> =
-                confirm_cases.iter().map(|c| c.case_ident.clone()).collect();
-            let mut replacement_cases: Vec<BatchTraceEvalCase> = Vec::new();
-            for fn_name in &confirm_stage.failed_fns {
-                let fn_selected: Vec<&BatchTraceEvalCase> = confirm_cases
-                    .iter()
-                    .filter(|c| case_to_fn.get(&c.case_ident) == Some(fn_name))
-                    .collect();
-                let any_completed = fn_selected
-                    .iter()
-                    .any(|c| confirm_stage.results.contains_key(&c.case_ident));
-                let all_inconclusive_ok = !fn_selected.is_empty()
-                    && fn_selected.iter().all(|c| {
-                        confirm_stage.results.contains_key(&c.case_ident)
-                            || (confirm_stage.inconclusive_cases.contains(&c.case_ident)
-                                && c.expected_diag_tag.as_deref() == Some("ok"))
-                    });
-                if !any_completed && all_inconclusive_ok {
-                    if let Some(backup) = batch_cases.iter().find(|c| {
-                        case_to_fn.get(&c.case_ident) == Some(fn_name)
-                            && !selected_idents.contains(&c.case_ident)
-                            && c.expected_diag_tag.as_deref() == Some("ok")
-                    }) {
-                        replacement_cases.push(backup.clone());
-                    }
-                }
-            }
+            let replacement_cases: Vec<BatchTraceEvalCase> = itree_confirm_replacements(
+                &confirm_stage,
+                &confirm_cases,
+                &batch_cases,
+                batch_case_ident,
+                &case_to_fn,
+                |c| c.expected_diag_tag.as_deref() == Some("ok"),
+            )
+            .into_iter()
+            .cloned()
+            .collect();
             if !replacement_cases.is_empty() {
                 let rep_stage = run_isolated_lean_stage(
                     "ItreeDiffBatchConfirmReplacement",
@@ -6845,6 +6877,76 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    /// Stage 2 replacement selection (large batches confirm a single `ok` trace
+    /// per agreeing candidate): only a candidate whose selected cases all failed
+    /// inconclusively on Stage 1 `ok` traces gets a replacement, namely its first
+    /// unselected `ok` trace; a refuted, divergent, already confirmed, or
+    /// exhausted candidate gets none.
+    #[test]
+    fn confirm_replacements_retry_only_inconclusive_agreeing_selections() {
+        let (pool, case_to_fn) = stage_fixture(&[
+            ("cand_retry", 3),
+            ("cand_skip", 3),
+            ("cand_reject", 2),
+            ("cand_div", 3),
+            ("cand_partial", 3),
+            ("cand_alone", 1),
+            ("cand_done", 2),
+        ]);
+        let selected: Vec<String> = [
+            "case_cand_retry_t0",
+            "case_cand_skip_t0",
+            "case_cand_reject_t0",
+            "case_cand_div_t0",
+            "case_cand_div_t1",
+            "case_cand_partial_t0",
+            "case_cand_partial_t1",
+            "case_cand_alone_t0",
+            "case_cand_done_t0",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let divergent: BTreeSet<&str> = BTreeSet::from(["case_cand_skip_t1", "case_cand_div_t1"]);
+        let stage = IsolatedLeanStage::<usize> {
+            results: BTreeMap::from([
+                ("case_cand_partial_t1".to_string(), 1),
+                ("case_cand_done_t0".to_string(), 1),
+            ]),
+            failed_fns: [
+                "cand_retry",
+                "cand_skip",
+                "cand_reject",
+                "cand_div",
+                "cand_partial",
+                "cand_alone",
+            ]
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+            inconclusive_cases: [
+                "case_cand_retry_t0",
+                "case_cand_skip_t0",
+                "case_cand_div_t0",
+                "case_cand_div_t1",
+                "case_cand_partial_t0",
+                "case_cand_alone_t0",
+            ]
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+            errors: Vec::new(),
+        };
+        let picked = itree_confirm_replacements(
+            &stage,
+            &selected,
+            &pool,
+            ident,
+            &case_to_fn,
+            |c: &String| !divergent.contains(c.as_str()),
+        );
+        assert_eq!(picked, vec!["case_cand_retry_t1", "case_cand_skip_t2"]);
     }
 
     /// The trial builder keeps every fixed probe (including the `PanicOnCall(0)`
