@@ -764,7 +764,16 @@ pub struct IrCapturedMir {
 }
 
 /// Renders the standard file header for a generated `Mir/<Item>.lean` module.
+///
+/// # Panics
+///
+/// Panics if `lean_module_namespace` is not a valid dotted Lean namespace path
+/// (`validate_lean_dotted_name_syntax`), preventing namespace/import injection into trusted
+/// `Mir/<Item>.lean` modules.
 pub fn render_mir_module_header(lean_module_namespace: &str, def_path: &str) -> String {
+    if let Err(err) = validate_lean_dotted_name_syntax(lean_module_namespace, false) {
+        panic!("invalid Mir module namespace: {err}");
+    }
     let def_path = sanitize_block_comment_text(def_path);
     format!(
         "import Trusted\n\n\
@@ -1051,9 +1060,8 @@ pub fn escape_lean_str(s: &str) -> String {
                 debug_assert!(code <= 0xff, "control character {c:?} exceeds `\\xHH`");
                 out.push_str(&format!("\\x{code:02x}"));
             }
-            c if is_disallowed_guillemet_char(c) => {
+            c if is_disallowed_guillemet_char(c) && u32::from(c) <= 0xffff => {
                 let code = u32::from(c);
-                debug_assert!(code <= 0xffff, "format character {c:?} exceeds `\\uHHHH`");
                 out.push_str(&format!("\\u{code:04x}"));
             }
             c => out.push(c),
@@ -2122,18 +2130,32 @@ fn is_disallowed_guillemet_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{2028}'
-                | '\u{2029}'
-                // Trojan-Source BiDi controls: ALM, LRM/RLM (with the zero-width chars),
-                // LRE..RLO, LRI..PDI; plus invisible format chars (Mongolian vowel separator,
-                // word joiner and invisible operators) and the BOM. All BMP, so `\uHHHH` suffices.
+            // Complete Unicode General Category `Cf` (Format) + `Zl` / `Zp` (Line/Paragraph
+            // Separator) across both the BMP (`<= U+FFFF`, escaped as `\uHHHH` in Lean string
+            // literals) and supplementary planes (`> U+FFFF`, including invisible Unicode Tag
+            // characters `U+E0001` and `U+E0020..=U+E007F`, rejected in guillemet identifiers
+            // and scrubbed from generated comments).
+            '\u{00AD}'
+                | '\u{0600}'..='\u{0605}'
                 | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
                 | '\u{180E}'
                 | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
+                | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
+                | '\u{2066}'..='\u{206F}'
                 | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0001}'
+                | '\u{E0020}'..='\u{E007F}'
         )
 }
 
@@ -2376,11 +2398,7 @@ pub fn validate_lean_term_expr(expr: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Checks that `name` is a dotted Lean name (`A.B.C`) whose components are ASCII identifiers
-/// (`[A-Za-z_][A-Za-z0-9_']*`, neither the hole `_` nor a reserved keyword) or non-empty
-/// `«»`-quoted components without control or format characters, so it can be spliced into generated
-/// `import` / `namespace` / `end` lines.
-pub fn validate_lean_dotted_name(name: &str) -> Result<(), String> {
+fn validate_lean_dotted_name_syntax(name: &str, reject_reserved: bool) -> Result<(), String> {
     let mut chars = name.chars().peekable();
     loop {
         match chars.peek().copied() {
@@ -2412,7 +2430,7 @@ pub fn validate_lean_dotted_name(name: &str) -> Result<(), String> {
                     component.push(c);
                     chars.next();
                 }
-                if component == "_" || is_reserved_lean_ident(&component) {
+                if component == "_" || (reject_reserved && is_reserved_lean_ident(&component)) {
                     return Err(format!("invalid component `{component}` in Lean name {name:?}"));
                 }
             }
@@ -2424,6 +2442,14 @@ pub fn validate_lean_dotted_name(name: &str) -> Result<(), String> {
             Some(c) => return Err(format!("unexpected character {c:?} in Lean name {name:?}")),
         }
     }
+}
+
+/// Checks that `name` is a dotted Lean name (`A.B.C`) whose components are ASCII identifiers
+/// (`[A-Za-z_][A-Za-z0-9_']*`, neither the hole `_` nor a reserved keyword) or non-empty
+/// `«»`-quoted components without control or format characters, so it can be spliced into generated
+/// `import` / `namespace` / `end` lines.
+pub fn validate_lean_dotted_name(name: &str) -> Result<(), String> {
+    validate_lean_dotted_name_syntax(name, true)
 }
 
 /// Formats a complete, deterministic proof-side Lean 4 module sealing `entries` into a
@@ -2710,23 +2736,81 @@ fn skip_lean_raw_str_bytes(s: &str, start: usize) -> Option<usize> {
     )
 }
 
-/// Byte offset past a `"`-opened Lean string literal at `s[start..]` (or `s.len()` when unclosed).
-fn skip_lean_quoted_str_bytes(s: &str, start: usize) -> usize {
-    let mut escaped = false;
-    for (rel, c) in s[start + 1..].char_indices() {
-        if escaped {
-            escaped = false;
-        } else if c == '\\' {
-            escaped = true;
+/// True iff `s[quote_start..]` starts with `"` immediately preceded by `<ident>!` (not `»!`,
+/// `123!`, or `'a'!`), forming a Lean 4 `<ident>!"..."` interpolated string literal.
+fn is_lean_interp_quote_at(s: &str, quote_start: usize) -> bool {
+    let prefix = &s[..quote_start];
+    let Some(before_bang) = prefix.strip_suffix('!') else {
+        return false;
+    };
+    if before_bang.ends_with('»') {
+        return false;
+    }
+    let mut ident_chars = before_bang
+        .chars()
+        .rev()
+        .take_while(|&c| is_lean_ident_cont_char(c));
+    let Some(mut first) = ident_chars.next() else {
+        return false;
+    };
+    for ch in ident_chars {
+        first = ch;
+    }
+    first.is_alphabetic() || first == '_'
+}
+
+/// Byte offset past a `«...»` guillemet token starting at `s[start..]`, bounded to the current
+/// line so an unclosed `«` never swallows across `\n`.
+fn skip_lean_guillemet_bytes(s: &str, start: usize) -> usize {
+    let body = &s[start + '«'.len_utf8()..];
+    let line_body = body.find('\n').map_or(body, |nl| &body[..nl]);
+    line_body
+        .find('»')
+        .map_or(start + '«'.len_utf8(), |rel| start + '«'.len_utf8() + rel + '»'.len_utf8())
+}
+
+/// Byte offset past a `"`-opened Lean string or `<ident>!"..."` interpolated string literal at
+/// `s[start..]` (or `s.len()` when unclosed).
+fn skip_lean_str_or_interp_bytes(s: &str, start: usize) -> usize {
+    if !is_lean_interp_quote_at(s, start) {
+        let mut escaped = false;
+        for (rel, c) in s[start + 1..].char_indices() {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                return start + 1 + rel + 1;
+            }
+        }
+        return s.len();
+    }
+    let mut j = start + 1;
+    while j < s.len() {
+        let rest = &s[j..];
+        let c = rest.chars().next().unwrap();
+        if c == '\\' {
+            j += 1;
+            if let Some(esc) = s[j..].chars().next() {
+                j += esc.len_utf8();
+            }
         } else if c == '"' {
-            return start + 1 + rel + 1;
+            return j + 1;
+        } else if c == '{' {
+            match find_matching_delim(rest, '{', '}') {
+                Some(close) => j += close + 1,
+                None => return s.len(),
+            }
+        } else {
+            j += c.len_utf8();
         }
     }
     s.len()
 }
 
 /// Strips Lean `--` line comments and nested `/- ... -/` block comments from `s`, preserving
-/// `"..."` strings, `r#"..."#` raw strings, `'...'` character literals, and `«...»` guillemets.
+/// `"..."` and `<ident>!"..."` strings, `r#"..."#` raw strings, `'...'` character literals, and
+/// single-line `«...»` guillemets.
 fn strip_lean_deriving_comments(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -2756,10 +2840,10 @@ fn strip_lean_deriving_comments(s: &str) -> String {
             i = cur;
             prev_ident = false;
         } else if rest.starts_with('«') {
-            let end = rest.get(2..).and_then(|r| r.find('»')).map_or(s.len(), |rel| i + 2 + rel + 2);
+            let end = skip_lean_guillemet_bytes(s, i);
             out.push_str(&s[i..end]);
+            prev_ident = end > i + '«'.len_utf8();
             i = end;
-            prev_ident = true;
         } else if !prev_ident
             && rest.starts_with('r')
             && let Some(end) = skip_lean_raw_str_bytes(s, i)
@@ -2768,7 +2852,7 @@ fn strip_lean_deriving_comments(s: &str) -> String {
             i = end;
             prev_ident = false;
         } else if rest.starts_with('"') {
-            let end = skip_lean_quoted_str_bytes(s, i);
+            let end = skip_lean_str_or_interp_bytes(s, i);
             out.push_str(&s[i..end]);
             i = end;
             prev_ident = false;
@@ -2790,9 +2874,9 @@ fn strip_lean_deriving_comments(s: &str) -> String {
 }
 
 /// If `s` starts with `open` (`(`, `[`, or `{`) and that opener's matching `close` (`)`, `]`, or
-/// `}`) occurs in `s` (ignoring delimiters inside comments, `"..."` strings, `r#"..."#` raw
-/// strings, `'...'` character literals, and `«...»` guillemets), returns the byte index of that
-/// matching `close`.
+/// `}`) occurs in `s` (ignoring delimiters inside comments, `"..."` / `<ident>!"..."` strings,
+/// `r#"..."#` raw strings, `'...'` character literals, and single-line `«...»` guillemets),
+/// returns the byte index of that matching `close`.
 fn find_matching_delim(s: &str, open: char, close: char) -> Option<usize> {
     if !s.starts_with(open) {
         return None;
@@ -2823,8 +2907,9 @@ fn find_matching_delim(s: &str, open: char, close: char) -> Option<usize> {
             i = cur;
             prev_ident = false;
         } else if rest.starts_with('«') {
-            i = rest.get(2..).and_then(|r| r.find('»')).map_or(s.len(), |rel| i + 2 + rel + 2);
-            prev_ident = true;
+            let end = skip_lean_guillemet_bytes(s, i);
+            prev_ident = end > i + '«'.len_utf8();
+            i = end;
         } else if !prev_ident
             && rest.starts_with('r')
             && let Some(end) = skip_lean_raw_str_bytes(s, i)
@@ -2832,7 +2917,7 @@ fn find_matching_delim(s: &str, open: char, close: char) -> Option<usize> {
             i = end;
             prev_ident = false;
         } else if rest.starts_with('"') {
-            i = skip_lean_quoted_str_bytes(s, i);
+            i = skip_lean_str_or_interp_bytes(s, i);
             prev_ident = false;
         } else if !prev_ident
             && rest.starts_with('\'')
@@ -3081,13 +3166,19 @@ pub fn sanitize_deriving_classes<'a>(classes: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Renders a `deriving` clause over `sanitize_deriving_classes(classes)` (`""` when no class
-/// remains), the only way Lean code generated by this module may spell a `deriving` clause.
+/// remains), stripping `--` / `/- ... -/` comments and flattening newlines/control/format chars per
+/// entry so an inline `--` or unclosed `/-` in one entry can never comment out `, <next_class>` or
+/// inject multiline commands.
 pub fn render_deriving_clause(classes: &[&str]) -> String {
-    let classes = sanitize_deriving_classes(classes);
-    if classes.is_empty() {
+    let rendered: Vec<String> = sanitize_deriving_classes(classes)
+        .into_iter()
+        .map(|entry| sanitize_comment_line(&strip_lean_deriving_comments(entry)))
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if rendered.is_empty() {
         String::new()
     } else {
-        format!("deriving {}", classes.join(", "))
+        format!("deriving {}", rendered.join(", "))
     }
 }
 
@@ -3936,6 +4027,7 @@ mod opaque_callee_table_tests {
                     "(Handler '\"')",
                     "(Handler ')') opt",
                     "(Handler r#\")\"#)",
+                    "(Handler s!\"a {\\\"b\\\"} )\")",
                     "Handler.{0}",
                     "Handler.{ 0 }",
                     "Handler.{1}",
@@ -3952,6 +4044,7 @@ mod opaque_callee_table_tests {
                     "(Handler '\"')",
                     "(Handler ')') opt",
                     "(Handler r#\")\"#)",
+                    "(Handler s!\"a {\\\"b\\\"} )\")",
                     "Handler.{0}",
                     "Handler.{1}",
                     "Handler a b",
@@ -3978,6 +4071,22 @@ mod opaque_callee_table_tests {
             render_deriving_clause(&["BEq", "@[expose] DecidableEq"]),
             "deriving @[expose] DecidableEq"
         );
+        // Inline `--` or unclosed `/-` in an earlier entry must never swallow `, Hashable`:
+        assert_eq!(
+            render_deriving_clause(&["Repr -- note", "BEq /- unclosed", "DecidableEq", "Hashable\n"]),
+            "deriving Repr, DecidableEq, Hashable"
+        );
+        assert_eq!(
+            render_deriving_clause(&["Repr /- unclosed", "Hashable"]),
+            "deriving Repr, Hashable"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid Mir module namespace")]
+    fn mir_emitter_rejects_injected_namespace() {
+        let mir = fixture_mir("demo::x", 0, vec![], 1);
+        emit_mir_lean_module("Mir.Demo.X\nimport Anneal.OpaqueCalleeTable\nnamespace Mir.Demo.X", &mir);
     }
 
     /// Splits a `deriving` class list on top-level commas outside brackets, comments, strings,
@@ -4011,8 +4120,9 @@ mod opaque_callee_table_tests {
                 i = cur;
                 prev_ident = false;
             } else if rest.starts_with('«') {
-                i = rest.get(2..).and_then(|r| r.find('»')).map_or(s.len(), |rel| i + 2 + rel + 2);
-                prev_ident = true;
+                let end = skip_lean_guillemet_bytes(s, i);
+                prev_ident = end > i + '«'.len_utf8();
+                i = end;
             } else if !prev_ident
                 && rest.starts_with('r')
                 && let Some(end) = skip_lean_raw_str_bytes(s, i)
@@ -4020,7 +4130,7 @@ mod opaque_callee_table_tests {
                 i = end;
                 prev_ident = false;
             } else if rest.starts_with('"') {
-                i = skip_lean_quoted_str_bytes(s, i);
+                i = skip_lean_str_or_interp_bytes(s, i);
                 prev_ident = false;
             } else if !prev_ident
                 && rest.starts_with('\'')
@@ -4431,10 +4541,23 @@ mod format_char_escape_tests {
     #[test]
     fn escape_lean_str_escapes_every_bidi_and_invisible_format_char() {
         for c in [
-            '\u{061C}', '\u{180E}', '\u{200B}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202E}',
-            '\u{2028}', '\u{2029}', '\u{2060}', '\u{2064}', '\u{2066}', '\u{2069}', '\u{FEFF}',
+            '\u{0600}', '\u{0605}', '\u{061C}', '\u{06DD}', '\u{070F}', '\u{0890}', '\u{0891}',
+            '\u{08E2}', '\u{180E}', '\u{200B}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202E}',
+            '\u{2028}', '\u{2029}', '\u{2060}', '\u{2064}', '\u{2066}', '\u{2069}', '\u{206A}',
+            '\u{206F}', '\u{FEFF}', '\u{FFF9}', '\u{FFFB}',
         ] {
             assert_eq!(escape_lean_str(&c.to_string()), format!("\\u{:04x}", u32::from(c)), "{c:?}");
+        }
+        // U+00AD SOFT HYPHEN is <= 0xFF and escaped as `\u00ad`.
+        assert_eq!(escape_lean_str("\u{00AD}"), "\\u00ad");
+        // Supplementary-plane format/tag chars (`Cf` > U+FFFF) are rejected in guillemets and
+        // scrubbed from comments without corrupting Lean string literals (which only have 4-digit
+        // `\uHHHH` escapes).
+        for tag in ['\u{E0001}', '\u{E0020}', '\u{E007F}'] {
+            assert!(validate_lean_term_expr(&format!("Mir.«a{tag}b».body")).is_err());
+            assert!(validate_lean_dotted_name(&format!("Mir.«a{tag}b»")).is_err());
+            assert_eq!(sanitize_comment_line(&format!("a{tag}b")), "a b");
+            assert_eq!(escape_lean_str(&tag.to_string()), tag.to_string());
         }
         // Visible non-ASCII text stays verbatim.
         assert_eq!(escape_lean_str("é→ü"), "é→ü");

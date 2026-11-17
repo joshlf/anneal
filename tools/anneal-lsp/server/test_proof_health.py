@@ -5263,6 +5263,35 @@ class TestRule8RedundantBeqDecidableEq(unittest.TestCase):
         )
         self.assertEqual(self._scan8(adj_raw_only), [])
 
+        # Non-reserved Lean 3 / macro words (`constant`, `lemma`, `universes`, `variables`),
+        # `'a'r#"}"#` inside interpolation holes, and unclosed `«` on an earlier line:
+        b3_src = (
+            "def brokenGui := «unclosed\n"
+            "inductive DeclKind where\n"
+            "  | lemma (name : String)\n"
+            "  | constant\n"
+            "  deriving CustomHandler lemma constant universes variables, BEq, DecidableEq\n"
+            "structure constant where\n"
+            "  x : Nat\n"
+            "  deriving BEq, DecidableEq\n"
+            "deriving instance BEq, DecidableEq for constant\n"
+            'def holeCharRaw := s!"{\'a\'r#"}"#} deriving BEq, DecidableEq"\n'
+            "structure CleanBeforeLemma where\n"
+            "  x : Nat\n"
+            "  deriving BEq\n"
+            "lemma nextLemma [DecidableEq α] : True := trivial\n"
+            "deriving BEq, DecidableEq\n"
+        )
+        self.assertEqual(
+            [(f.line, f.symbol) for f in self._scan8(b3_src)],
+            [
+                (5, "DeclKind"),
+                (8, "constant"),
+                (9, "constant"),
+                (15, "BEq,DecidableEq"),
+            ],
+        )
+
     def test_post_edit_deltas_and_v7_cache_upgrade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp) / "cache.json"

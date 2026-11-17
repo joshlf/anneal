@@ -7693,22 +7693,17 @@ _DERIVING_STOP_WORDS: frozenset[str] = frozenset(
         "deriving",
         "inductive",
         "coinductive",
-        "class_inductive",
         "structure",
         "class",
         "def",
         "abbrev",
         "opaque",
         "theorem",
-        "lemma",
         "example",
         "instance",
         "axiom",
-        "constant",
         "variable",
-        "variables",
         "universe",
-        "universes",
         "namespace",
         "section",
         "end",
@@ -7866,13 +7861,16 @@ def _read_lean_dotted_ident(text: str, i: int, limit: int) -> tuple[str, int, bo
     j = i
     while True:
         if j < limit and text[j] == "«":
-            k = text.find("»", j + 1, limit)
+            nl = text.find("\n", j + 1, limit)
+            g_lim = limit if nl == -1 else nl
+            k = text.find("»", j + 1, g_lim)
             if k == -1:
-                part = text[j + 1 : limit]
-                j = limit
-            else:
-                part = text[j + 1 : k]
-                j = k + 1
+                parts.append("«")
+                j += 1
+                plain_bang = False
+                break
+            part = text[j + 1 : k]
+            j = k + 1
             parts.append(f"«{part}»")
             plain_bang = False
         elif j < limit and _is_rbd_ident_start(text[j]):
@@ -7986,7 +7984,11 @@ def _skip_lean_interp_hole(text: str, j: int, limit: int) -> int:
             j = _skip_lean_block_comment(text, j, limit)
         elif (
             c == "r"
-            and (j == 0 or not (_is_rbd_ident_char(text[j - 1]) or text[j - 1] == "."))
+            and (
+                j == 0
+                or not (_is_rbd_ident_char(text[j - 1]) or text[j - 1] == ".")
+                or text[j - 1] == "'"
+            )
             and j + 1 < limit
             and text[j + 1] in '"#'
         ):
@@ -8362,7 +8364,7 @@ def _parse_deriving_instance_targets_cursor(cur: _LeanCursor) -> list[str]:
             else:
                 break
         tk = cur.peek()
-        if tk[0] != "ident" or tk[1] in _DERIVING_STOP_WORDS or tk[1] == "for":
+        if tk[0] != "ident" or tk[1] in _DERIVING_STOP_WORDS or tk[1] == "for" or (tk[1] == "lemma" and tk[4]):
             break
         targets.append(_unquote_lean_ident(tk[1]))
         cur.next()
@@ -8386,7 +8388,7 @@ def _parse_deriving_instance_targets_cursor(cur: _LeanCursor) -> list[str]:
                 break
             if kind == "punct" and val == ",":
                 break
-            if kind == "ident" and (val in _DERIVING_STOP_WORDS or val == "for"):
+            if kind == "ident" and (val in _DERIVING_STOP_WORDS or val == "for" or (val == "lemma" and has_nl)):
                 break
             if kind == "punct" and (val in ("@[", "#", ":=", ":", "|") or val in _RBD_CLOSING_BRACKETS):
                 break
@@ -8443,7 +8445,7 @@ def _parse_deriving_clause_at(text: str, after_deriving: int) -> tuple[bool, lis
                 _consume_balanced_group(cur)
 
         tk = cur.peek()
-        if tk[0] != "ident" or tk[1] in _DERIVING_STOP_WORDS or tk[1] == "for":
+        if tk[0] != "ident" or tk[1] in _DERIVING_STOP_WORDS or tk[1] == "for" or (tk[1] == "lemma" and tk[4]):
             break
         head_name = tk[1]
         saw_any_class = True
@@ -8477,7 +8479,7 @@ def _parse_deriving_clause_at(text: str, after_deriving: int) -> tuple[bool, lis
                 break
             if kind == "punct" and val == ",":
                 break
-            if kind == "ident" and (val in _DERIVING_STOP_WORDS or val == "for"):
+            if kind == "ident" and (val in _DERIVING_STOP_WORDS or val == "for" or (val == "lemma" and has_nl)):
                 break
             if kind == "punct" and (val in ("@[", "#", ":=", ":", "|") or val in _RBD_CLOSING_BRACKETS):
                 break
@@ -8523,6 +8525,7 @@ def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str
 
     cur = _LeanCursor(text, start=best_anchor, end=deriving_pos)
     depth = 0
+    prev_bar = False
     enclosing: str | None = None
     while True:
         kind, val, _, _, has_nl, col = cur.next()
@@ -8535,6 +8538,7 @@ def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str
                 depth -= 1
             elif val == "#" and depth == 0:
                 enclosing = None
+            prev_bar = val == "|" and depth == 0
         elif kind == "ident" and depth == 0:
             if val in _DERIVING_INLINE_DECL_KWS:
                 nxt = cur.peek()
@@ -8545,16 +8549,16 @@ def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str
                     enclosing = _unquote_lean_ident(nxt[1])
                     cur.next()
             elif val in _DERIVING_ENCLOSING_RESET_KWS:
-                if val in ("lemma", "constant", "universes", "variables") and cur.peek()[:2] == (
-                    "punct",
-                    ":",
-                ):
-                    continue
+                enclosing = None
+            elif val == "lemma" and has_nl and not prev_bar and cur.peek()[:2] != ("punct", ":"):
                 enclosing = None
             elif val in ("open", "set_option") and has_nl and col == 0:
                 # Top-level `open` / `set_option` without an `in` continuation resets any prior
                 # declaration; if `in <decl>` follows, `<decl>` immediately sets `enclosing`.
                 enclosing = None
+            prev_bar = False
+        else:
+            prev_bar = False
     return enclosing
 
 
