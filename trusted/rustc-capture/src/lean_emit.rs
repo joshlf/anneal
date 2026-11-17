@@ -2960,16 +2960,19 @@ const LEAN_COMMAND_KEYWORDS: &str = concat!(
     "termination_by theorem universe unsafe unseal variable where",
 );
 
-/// True when `ty` contains a [`LEAN_COMMAND_KEYWORDS`] word or a `#` command (`#eval`).
+/// True when `ty` contains a [`LEAN_COMMAND_KEYWORDS`] word, a `@[...]` attribute prefix, or a `#`
+/// token other than an array literal `#[...]`.
 fn lean_ty_has_command_syntax(ty: &str) -> bool {
-    lean_ident_atoms(ty).any(|atom| {
-        LEAN_COMMAND_KEYWORDS
-            .split_whitespace()
-            .any(|keyword| keyword == atom)
-    }) || ty
-        .split('#')
-        .skip(1)
-        .any(|rest| rest.starts_with(|c: char| c.is_ascii_alphabetic()))
+    ty.contains("@[")
+        || lean_ident_atoms(ty).any(|atom| {
+            LEAN_COMMAND_KEYWORDS
+                .split_whitespace()
+                .any(|keyword| keyword == atom)
+        })
+        || ty
+            .split('#')
+            .skip(1)
+            .any(|rest| !rest.starts_with('['))
 }
 
 fn check_lean_ty(field: &str, lean_ty: &str) -> Result<(), LcnfLayoutError> {
@@ -4590,9 +4593,11 @@ mod lcnf_tests {
             "Nat theorem injected : True",
             "Nat set_option maxRecDepth 100",
             "Nat attribute [simp] Nat.add_comm",
+            "Nat @[reducible]",
             "Nat instance : Inhabited Nat",
             "Nat end",
             "Nat #eval 1",
+            "Nat #\u{ab}eval\u{bb} 1",
             "Nat macro_rules | `(x) => `(x)",
         ] {
             let fields = [
@@ -6064,6 +6069,7 @@ mod lcnf_tests {
         let injected = [
             ("Nat axiom injected : Nat", "#check (injected : Nat)\n"),
             ("Nat deriving Repr", "#eval repr ({ x := 1, y := 2 } : F)\n"),
+            ("Nat @[reducible]", "def nextDecl : Nat := 1\n"),
         ];
         let mut cases = Vec::new();
         for (index, (lean_ty, check)) in injected.iter().enumerate() {
