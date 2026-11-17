@@ -11,7 +11,7 @@
 //! 2. **`PropertyRegistry` & `PropertyStatus`**:
 //!    Explicit per-class verification status (`EmittedAndVerified`,
 //!    `UnsupportedFailClosed`, `UnemittedGap`) ensuring that any un-emitted or
-//!    unsupported UB category fails closed (`UNKNOWN(UNSUPPORTED_CONSTRUCT)`).
+//!    unsupported UB category fails closed (`UNKNOWN(UNMAPPED_FAULT_SITE)`).
 //! 3. **Independent MIR Fault-Site Census (`census_mir_fault_sites` &
 //!    `census_lean_mir_module`)**:
 //!    Enumerates `(block_idx, stmt_idx, fault_class)` fault sites over both
@@ -230,7 +230,7 @@ pub enum PropertyStatus {
     /// checked in the Lean 4 kernel.
     EmittedAndVerified,
     /// The construct or fault class is explicitly marked unsupported and fails
-    /// closed (`UNKNOWN(UNSUPPORTED_CONSTRUCT)`).
+    /// closed (`UNKNOWN(UNMAPPED_FAULT_SITE)`).
     UnsupportedFailClosed,
     /// The obligation generator does not yet emit obligations for this fault
     /// class; any occurrence in a subject's census must fail closed.
@@ -4294,9 +4294,10 @@ pub fn parse_lean_mir_module_body_strict(lean_src: &str) -> Result<ProtoMirBody,
     parse_lean_captured_mir_def(lean_src, "body")
 }
 
-/// `[adv ep1-B1]` Callee links declared by a generated `Obligations/<Item>.lean`
-/// module, scanned with the comment- and string-aware Lean lexer so that text inside
-/// `--` / `/- ... -/` comments or string literals can never add a link.
+/// `[adv ep1-B1]` / `[adv ep1-A1]` Callee links and claim bindings declared by a
+/// generated `Obligations/<Item>.lean` module, scanned with the comment- and
+/// string-aware Lean lexer so that text inside `--` / `/- ... -/` comments or
+/// string literals can never add a link or spoof a claim binding.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObligationsCalleeLinks {
     /// Target `DefPath`s bound by `externalSpecCallContract "<target>" ...`.
@@ -4307,10 +4308,23 @@ pub struct ObligationsCalleeLinks {
     /// such as `Mir.<Item>.body.instantiate`) referenced by the module, reported as
     /// the `<Item>` suffix.
     pub referenced_mir_bodies: Vec<String>,
+    /// `[adv ep1-A1]` Every `<Item>` suffix bound to a `body := Mir.<Item>.body`
+    /// (or `Mir.<Item>.body.instantiate`) or `implBody := Mir.<Item>.body` field
+    /// inside a claim record literal.
+    pub claim_mir_bodies: Vec<String>,
+    /// `[adv ep1-A1]` Any non-`Mir.<Item>.body` token assigned to `body := ...` or
+    /// `implBody := ...` inside a claim record literal (must be empty for a valid
+    /// generated Obligations module).
+    pub non_mir_claim_bodies: Vec<String>,
+    /// `[adv ep1-A1]` Every RHS identifier bound to `callees := ...` or
+    /// `implCallees := ...` inside a claim record literal (every entry must be
+    /// `"defaultCallees"` so a claim cannot bypass `defaultCallees` with `.nil`).
+    pub claim_callees_bindings: Vec<String>,
 }
 
-/// `[adv ep1-B1]` Scan a generated `Obligations/<Item>.lean` module for its callee
-/// links (see [`ObligationsCalleeLinks`]), failing closed on any lexer error.
+/// `[adv ep1-B1]` / `[adv ep1-A1]` Scan a generated `Obligations/<Item>.lean` module
+/// for its callee links and claim bindings (see [`ObligationsCalleeLinks`]), failing
+/// closed on any lexer error.
 pub fn scan_obligations_callee_links(
     ob_text: &str,
 ) -> Result<ObligationsCalleeLinks, CensusScanError> {
@@ -4321,6 +4335,12 @@ pub fn scan_obligations_callee_links(
             out.push(s.to_string());
         }
     };
+    fn extract_mir_item(ident: &str) -> Option<&str> {
+        let rest = ident.strip_prefix("Mir.")?;
+        rest.strip_suffix(".body")
+            .or_else(|| rest.rsplit_once(".body.").map(|(item, _)| item))
+            .filter(|s| !s.is_empty())
+    }
     for (idx, tok) in tokens.iter().enumerate() {
         let LeanToken::Ident(ident) = tok else {
             continue;
@@ -4334,18 +4354,120 @@ pub fn scan_obligations_callee_links(
                     push_unique(&mut links.imported_obligation_suffixes, suffix);
                 }
             }
+            ("body" | "implBody", Some(LeanToken::ColonEq)) => match tokens.get(idx + 2) {
+                Some(LeanToken::Ident(rhs)) => {
+                    if let Some(item) = extract_mir_item(rhs) {
+                        push_unique(&mut links.claim_mir_bodies, item);
+                    } else {
+                        push_unique(&mut links.non_mir_claim_bodies, rhs);
+                    }
+                }
+                other => {
+                    push_unique(&mut links.non_mir_claim_bodies, &format!("{other:?}"));
+                }
+            },
+            ("callees" | "implCallees", Some(LeanToken::ColonEq)) => {
+                match (tokens.get(idx + 2), tokens.get(idx + 3)) {
+                    (Some(LeanToken::Ident(rhs)), _) => {
+                        push_unique(&mut links.claim_callees_bindings, rhs);
+                    }
+                    (Some(LeanToken::Dot), Some(LeanToken::Ident(rhs))) => {
+                        push_unique(&mut links.claim_callees_bindings, &format!(".{rhs}"));
+                    }
+                    (other, _) => {
+                        push_unique(&mut links.claim_callees_bindings, &format!("{other:?}"));
+                    }
+                }
+            }
             _ => {}
         }
-        if let Some(rest) = ident.strip_prefix("Mir.") {
-            let item = rest
-                .strip_suffix(".body")
-                .or_else(|| rest.rsplit_once(".body.").map(|(item, _)| item));
-            if let Some(item) = item {
-                push_unique(&mut links.referenced_mir_bodies, item);
-            }
+        if let Some(item) = extract_mir_item(ident) {
+            push_unique(&mut links.referenced_mir_bodies, item);
         }
     }
     Ok(links)
+}
+
+/// `[adv ep1-A1]` Parse the `def defaultCallees : List CapturedMir := ...` table of a
+/// generated `Obligations/<Item>.lean` module using the comment- and string-aware Lean
+/// lexer (`tokenize_lean_source`), returning the `Mir.<Callee>` module suffixes it links
+/// into `s.memory.callees`.
+///
+/// Comments (`-- def defaultCallees ...`, `/- ... -/`, or comments inside a multi-line
+/// `[Mir.A.body, -- note\n Mir.B.body]` list) are stripped by the lexer, while any
+/// duplicate `def defaultCallees` command, malformed type signature, or entry not of the
+/// exact form `Mir.<Suffix>.body` fails closed with `Err`.
+pub fn parse_obligations_default_callees(ob_text: &str) -> Result<Vec<String>, String> {
+    let tokens = tokenize_lean_source(ob_text)
+        .map_err(|err| format!("failed to tokenize Obligations module: {err}"))?;
+    let mut def_positions = Vec::new();
+    for (idx, tok) in tokens.iter().enumerate() {
+        if matches!(tok, LeanToken::Ident(s) if s == "def")
+            && matches!(tokens.get(idx + 1), Some(LeanToken::Ident(name)) if name == "defaultCallees")
+        {
+            def_positions.push(idx);
+        }
+    }
+    let Some(&pos) = def_positions.first() else {
+        return Ok(Vec::new());
+    };
+    if def_positions.len() > 1 {
+        return Err("multiple `def defaultCallees` tables in Obligations module".to_string());
+    }
+    let header_ok = matches!(tokens.get(pos + 2), Some(LeanToken::Colon))
+        && matches!(tokens.get(pos + 3), Some(LeanToken::Ident(s)) if s == "List" || s.ends_with(".List"))
+        && matches!(tokens.get(pos + 4), Some(LeanToken::Ident(s)) if s == "CapturedMir" || s.ends_with(".CapturedMir"))
+        && matches!(tokens.get(pos + 5), Some(LeanToken::ColonEq));
+    if !header_ok {
+        return Err(
+            "malformed `def defaultCallees` header (expected `def defaultCallees : List CapturedMir :=`)"
+                .to_string(),
+        );
+    }
+    let val_idx = pos + 6;
+    match (tokens.get(val_idx), tokens.get(val_idx + 1)) {
+        (Some(LeanToken::Ident(id)), _) if id == ".nil" || id == "List.nil" => Ok(Vec::new()),
+        (Some(LeanToken::Dot), Some(LeanToken::Ident(id))) if id == "nil" => Ok(Vec::new()),
+        (Some(LeanToken::LBracket), _) => {
+            if matches!(tokens.get(val_idx + 1), Some(LeanToken::RBracket)) {
+                return Ok(Vec::new());
+            }
+            let mut out = Vec::new();
+            let mut cur = val_idx + 1;
+            loop {
+                let Some(LeanToken::Ident(entry)) = tokens.get(cur) else {
+                    return Err(format!(
+                        "unrecognized `defaultCallees` entry `{:?}`",
+                        tokens.get(cur)
+                    ));
+                };
+                let suffix = entry
+                    .strip_prefix("Mir.")
+                    .and_then(|e| e.strip_suffix(".body"))
+                    .filter(|s| {
+                        !s.is_empty()
+                            && s.chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                    })
+                    .ok_or_else(|| format!("unrecognized `defaultCallees` entry `{entry}`"))?;
+                out.push(suffix.to_string());
+                cur += 1;
+                match tokens.get(cur) {
+                    Some(LeanToken::Comma) => {
+                        cur += 1;
+                    }
+                    Some(LeanToken::RBracket) => break,
+                    other => {
+                        return Err(format!(
+                            "unterminated or malformed `defaultCallees` list near `{other:?}`"
+                        ));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        (other, _) => Err(format!("unrecognized `defaultCallees` table `{other:?}`")),
+    }
 }
 
 // ============================================================================
@@ -4359,7 +4481,7 @@ pub enum CoverageVerdict {
     /// fault class in `census` has `PropertyStatus::EmittedAndVerified` in
     /// `PropertyRegistry`.
     Verified,
-    /// Fail-closed downgrade (`UNKNOWN(UNSUPPORTED_CONSTRUCT)`) when one or
+    /// Fail-closed downgrade (`UNKNOWN(UNMAPPED_FAULT_SITE)`) when one or
     /// more fault sites are missing from `discharged`, belong to an un-emitted
     /// or unsupported `MirFaultClass` in `PropertyRegistry`, or when the MIR
     /// module failed census scanning.
@@ -4382,11 +4504,11 @@ impl CoverageVerdict {
     }
 
     /// Canonical machine-readable status code (`"VERIFIED"` vs.
-    /// `"UNKNOWN(UNSUPPORTED_CONSTRUCT)"`).
+    /// `"UNKNOWN(UNMAPPED_FAULT_SITE)"`).
     pub const fn status_code(&self) -> &'static str {
         match self {
             CoverageVerdict::Verified => "VERIFIED",
-            CoverageVerdict::UnknownUnmappedFaultSite { .. } => "UNKNOWN(UNSUPPORTED_CONSTRUCT)",
+            CoverageVerdict::UnknownUnmappedFaultSite { .. } => "UNKNOWN(UNMAPPED_FAULT_SITE)",
         }
     }
 }
@@ -4684,12 +4806,12 @@ impl MultiItemCoverageVerdict {
     }
 
     /// Canonical machine-readable status code (`"VERIFIED"` vs.
-    /// `"UNKNOWN(UNSUPPORTED_CONSTRUCT)"`).
+    /// `"UNKNOWN(UNMAPPED_FAULT_SITE)"`).
     pub const fn status_code(&self) -> &'static str {
         match self {
             MultiItemCoverageVerdict::Verified => "VERIFIED",
             MultiItemCoverageVerdict::UnknownUnmappedFaultSite { .. } => {
-                "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
+                "UNKNOWN(UNMAPPED_FAULT_SITE)"
             }
         }
     }
@@ -4842,6 +4964,11 @@ pub fn reconcile_multi_item_coverage(
                                 ));
                             }
                         }
+                    } else if inline_set.is_empty() && external.is_empty() {
+                        unsupported_reasons.push(format!(
+                            "[{}] bb{bb_idx} indirect call has no classified inline or external target in CalleeClosure",
+                            item.def_path
+                        ));
                     }
                 }
                 ProtoTerminatorKind::Call {
@@ -4858,6 +4985,11 @@ pub fn reconcile_multi_item_coverage(
                                 item.def_path
                             ));
                         }
+                    } else if inline_set.is_empty() && external.is_empty() {
+                        unsupported_reasons.push(format!(
+                            "[{}] bb{bb_idx} indirect diverging call has no classified inline or external target in CalleeClosure",
+                            item.def_path
+                        ));
                     }
                 }
                 ProtoTerminatorKind::TailCall { func, .. } => {
@@ -4870,6 +5002,11 @@ pub fn reconcile_multi_item_coverage(
                                 item.def_path
                             ));
                         }
+                    } else if inline_set.is_empty() && external.is_empty() {
+                        unsupported_reasons.push(format!(
+                            "[{}] bb{bb_idx} indirect tail call has no classified inline or external target in CalleeClosure",
+                            item.def_path
+                        ));
                     }
                 }
                 _ => {}
@@ -5758,7 +5895,7 @@ mod tests {
             assert_eq!(report.baseline_verdict.status_code(), "VERIFIED");
             assert_eq!(
                 report.mutant_verdict.status_code(),
-                "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
+                "UNKNOWN(UNMAPPED_FAULT_SITE)"
             );
         }
     }
@@ -5766,7 +5903,7 @@ mod tests {
     #[test]
     fn test_property_registry_unemitted_and_unsupported_fail_closed() {
         let verdict = run_property_registry_unemitted_probe();
-        assert_eq!(verdict.status_code(), "UNKNOWN(UNSUPPORTED_CONSTRUCT)");
+        assert_eq!(verdict.status_code(), "UNKNOWN(UNMAPPED_FAULT_SITE)");
         match verdict {
             CoverageVerdict::UnknownUnmappedFaultSite {
                 missing_sites,
@@ -5896,7 +6033,7 @@ end Mir.Tricky.«fn--with--dashes»
         assert_eq!(
             reconcile_lean_mir_coverage(empty_src, &[], &PropertyRegistry::all_verified())
                 .status_code(),
-            "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
+            "UNKNOWN(UNMAPPED_FAULT_SITE)"
         );
 
         // 2. Unterminated block comment
@@ -7585,7 +7722,7 @@ end Mir.Probe.item",
         let closure = CalleeClosure::default();
         assert_eq!(
             reconcile_multi_item_coverage(&[], &closure, &reg).status_code(),
-            "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
+            "UNKNOWN(UNMAPPED_FAULT_SITE)"
         );
         let cross_item_mask_attempt =
             reconcile_multi_item_coverage(&[caller_ok.clone(), callee_missing], &closure, &reg);
@@ -7603,7 +7740,7 @@ end Mir.Probe.item",
         assert_eq!(
             reconcile_multi_item_coverage(&[caller_ok.clone(), caller_ok], &closure, &reg)
                 .status_code(),
-            "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
+            "UNKNOWN(UNMAPPED_FAULT_SITE)"
         );
 
         // 5. Verify new `[adv A2]` Lean theorems exist in `theory/Anneal/FaultSiteCensus.lean`.
@@ -8397,12 +8534,95 @@ end Mir.Probe.item",
             "theorem evalRvalue_aggregate_ub_cause",
             "theorem evalRvalue_cast_own_ub_witnesses",
             "theorem evalOperands_ub_implies_mem_censusOperands",
+            "theorem evalRvalue_repeat_ub_iff",
+            "theorem evalRvalue_unary_neg_ub_iff",
+            "theorem evalRvalue_use_ub_cause",
+            "theorem evalRvalue_unaryOp_ub_cause",
+            "theorem evalRvalue_binaryOp_ub_cause",
+            "theorem evalRvalue_ub_implies_mem_censusRvalue",
         ] {
             assert!(
                 LEAN_PROTOTYPE_SRC.contains(decl),
-                "missing `[adv ep1-B1]` Lean census declaration `{decl}`"
+                "missing `[adv ep1-B1]` / `[adv ep1-A1]` Lean census declaration `{decl}`"
             );
         }
+
+        // `[adv ep1-A1]` Indirect `Call` / `TailCall` through a non-constant operand
+        // (e.g. a function-pointer argument `Copy(local(1))`) with an empty
+        // `CalleeClosure` fails closed in `reconcile_multi_item_coverage`.
+        for indirect_term in [
+            ProtoTerminatorKind::Call {
+                func: ProtoOperand::Copy(ProtoPlace::local(1)),
+                args: Vec::new(),
+                destination: ProtoPlace::local(0),
+                target: Some(0),
+                unwind: ProtoUnwindAction::Continue,
+            },
+            ProtoTerminatorKind::Call {
+                func: ProtoOperand::Copy(ProtoPlace::local(1)),
+                args: Vec::new(),
+                destination: ProtoPlace::local(0),
+                target: None,
+                unwind: ProtoUnwindAction::Continue,
+            },
+            ProtoTerminatorKind::TailCall {
+                func: ProtoOperand::Move(ProtoPlace::local(1)),
+                args: Vec::new(),
+            },
+        ] {
+            let indirect_body = ProtoMirBody {
+                def_path: String::from("proto::indirect_caller"),
+                basic_blocks: vec![ProtoBasicBlock {
+                    statements: Vec::new(),
+                    terminator: ProtoTerminator::new(indirect_term),
+                    is_cleanup: false,
+                }],
+            };
+            let indirect_census = census_mir_fault_sites(&indirect_body);
+            let indirect_verdict = reconcile_multi_item_coverage(
+                &[ItemCoverageInput::from_body(indirect_body.clone(), indirect_census.clone())],
+                &CalleeClosure::default(),
+                &PropertyRegistry::all_verified(),
+            );
+            assert!(
+                !indirect_verdict.is_verified()
+                    && indirect_verdict
+                        .reasons()
+                        .iter()
+                        .any(|r| r.contains("indirect") && r.contains("CalleeClosure")),
+                "expected indirect call with empty CalleeClosure to fail closed: {indirect_verdict:?}"
+            );
+            assert_eq!(indirect_verdict.status_code(), "UNKNOWN(UNMAPPED_FAULT_SITE)");
+            let with_external = CalleeClosure {
+                inline_callees: Vec::new(),
+                external_callees: vec![String::from("proto::ext_fn_ptr_target")],
+            };
+            assert!(
+                reconcile_multi_item_coverage(
+                    &[ItemCoverageInput::from_body(indirect_body, indirect_census)],
+                    &with_external,
+                    &PropertyRegistry::all_verified(),
+                )
+                .is_verified()
+            );
+        }
+
+        // `[adv ep1-A1]` Lexer-based `parse_obligations_default_callees` neutralizes
+        // commented-out `def defaultCallees` tables and inline comments, while
+        // `scan_obligations_callee_links` tracks `claim_mir_bodies` and
+        // `claim_callees_bindings`.
+        let ob_with_comment_trap = "-- def defaultCallees : List CapturedMir := [Mir.Evil.body]\n\
+            def defaultCallees : List CapturedMir :=\n  [\n    -- inline comment\n    Mir.Crate.a.body,\n    Mir.Crate.b.body\n  ]\n\
+            def sigPre := Mir.Crate.item.body.argCount\n\
+            def claim : Claim := { body := Mir.Crate.other.body, pre := True, post := True, callees := .nil }\n";
+        assert_eq!(
+            parse_obligations_default_callees(ob_with_comment_trap),
+            Ok(vec![String::from("Crate.a"), String::from("Crate.b")])
+        );
+        let trap_links = scan_obligations_callee_links(ob_with_comment_trap).expect("scan trap");
+        assert!(trap_links.referenced_mir_bodies.contains(&String::from("Crate.item")));
+        assert_eq!(trap_links.claim_mir_bodies, vec![String::from("Crate.other")]);
+        assert_eq!(trap_links.claim_callees_bindings, vec![String::from(".nil")]);
     }
 
     /// `[adv ep1-B1]` The independent obligation-side emitter

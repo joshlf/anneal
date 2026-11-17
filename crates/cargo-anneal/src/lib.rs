@@ -2601,49 +2601,11 @@ pub fn verify_workspace_with_config(config: &VerifyConfig) -> Result<Verificatio
 /// `Obligations/<Item>.lean` module into the `Mir.<Callee>` module suffixes it links
 /// into `s.memory.callees` (`[Mir.<A>.body, Mir.<B>.body]` or `.nil`).
 ///
-/// `[adv ep1-B1]`: the value is read up to the next top-level command (not just the
-/// next blank line) and every entry must be exactly `Mir.<Suffix>.body`; any other
-/// shape (or a duplicated table) is an `Err`, so verify-time reconciliation fails
-/// closed instead of silently dropping a callee whose body Lean links inline.
+/// `[adv ep1-B1]` / `[adv ep1-A1]`: delegates to the comment- and string-aware Lean
+/// lexer parser [`fault_census::parse_obligations_default_callees`] so comments can
+/// never inject or duplicate a `defaultCallees` table.
 fn extract_default_callee_suffixes_from_obligations(ob_text: &str) -> Result<Vec<String>, String> {
-    const HEADER: &str = "def defaultCallees : List CapturedMir :=";
-    let mut found = ob_text.match_indices(HEADER);
-    let Some((pos, _)) = found.next() else {
-        return Ok(Vec::new());
-    };
-    if found.next().is_some() {
-        return Err("multiple `def defaultCallees` tables in Obligations module".to_string());
-    }
-    let mut value = String::new();
-    for (idx, line) in ob_text[pos + HEADER.len()..].split('\n').enumerate() {
-        if idx > 0 && !line.is_empty() && !line.starts_with(char::is_whitespace) {
-            break;
-        }
-        value.push_str(line);
-        value.push(' ');
-    }
-    let value = value.trim();
-    if matches!(value, ".nil" | "[]" | "List.nil") {
-        return Ok(Vec::new());
-    }
-    let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) else {
-        return Err(format!("unrecognized `defaultCallees` table `{value}`"));
-    };
-    let mut out = Vec::new();
-    for entry in inner.split(',') {
-        let entry = entry.trim();
-        let suffix = entry
-            .strip_prefix("Mir.")
-            .and_then(|e| e.strip_suffix(".body"))
-            .filter(|s| {
-                !s.is_empty()
-                    && s.chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-            })
-            .ok_or_else(|| format!("unrecognized `defaultCallees` entry `{entry}`"))?;
-        out.push(suffix.to_string());
-    }
-    Ok(out)
+    fault_census::parse_obligations_default_callees(ob_text)
 }
 
 /// Resolve the explicit external callees of a generated `Obligations/<Item>.lean`
@@ -2788,12 +2750,30 @@ fn apply_fault_site_coverage_reconciliation(
             }
         };
         // The emitted claim must be about this very body: if the Obligations module
-        // never references `Mir.<Item>.body`, nothing in it discharges any site.
-        let claim_covers_subject = links.referenced_mir_bodies.iter().any(|s| s == &suffix);
+        // never references `Mir.<Item>.body` or any claim record binds `body :=` /
+        // `implBody :=` to another body, nothing in it discharges the subject's sites.
+        let claim_covers_subject = links.referenced_mir_bodies.iter().any(|s| s == &suffix)
+            && !links.claim_mir_bodies.is_empty()
+            && links.non_mir_claim_bodies.is_empty()
+            && links.claim_mir_bodies.iter().all(|s| s == &suffix);
         if !claim_covers_subject {
             item.status = unmapped_fault_site_status(format!(
-                "Obligations module for {suffix} never references `Mir.{suffix}.body`, so no \
-                 emitted obligation discharges its fault sites"
+                "Obligations module for {suffix} never references `Mir.{suffix}.body` across all claim definitions (claim_mir_bodies={:?}, non_mir={:?}), so no emitted obligation discharges its fault sites",
+                links.claim_mir_bodies, links.non_mir_claim_bodies
+            ));
+            continue;
+        }
+        // Every claim record must bind `callees := defaultCallees` (or `implCallees := defaultCallees`)
+        // so a claim cannot bypass `defaultCallees` with `.nil` or `[]`.
+        if !links.claim_callees_bindings.is_empty()
+            && !links
+                .claim_callees_bindings
+                .iter()
+                .all(|b| b == "defaultCallees")
+        {
+            item.status = unmapped_fault_site_status(format!(
+                "Obligations module for {suffix} overrides claim `callees` with {:?} instead of `defaultCallees`",
+                links.claim_callees_bindings
             ));
             continue;
         }
@@ -5680,6 +5660,50 @@ end Mir.Demo.caller
             }
             other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
         }
+
+        // Negative test 10 (`[adv ep1-A1]`): detaching ONLY `def claim`'s `body :=`
+        // to `Mir.Demo.leaf.body` while leaving `sigPre` / `defaultCallContract`
+        // referencing `Mir.Demo.caller.body` still fails closed.
+        let single_claim_detached = original_ob.replacen(
+            "{ body := Mir.Demo.caller.body,",
+            "{ body := Mir.Demo.leaf.body,",
+            1,
+        );
+        assert_ne!(single_claim_detached, original_ob);
+        assert!(single_claim_detached.contains("Mir.Demo.caller.body"));
+        fs::write(&caller_ob_path, &single_claim_detached)
+            .expect("detach single claim body in caller obligations");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("claim_mir_bodies"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+
+        // Negative test 11 (`[adv ep1-A1]`): overriding `callees := defaultCallees`
+        // with `callees := .nil` inside `def claim` while leaving
+        // `def defaultCallees : List CapturedMir := [Mir.Demo.leaf.body]` intact
+        // fails closed.
+        let bypassed_callees_ob = original_ob.replacen(
+            "callees := defaultCallees }",
+            "callees := .nil }",
+            1,
+        );
+        assert_ne!(bypassed_callees_ob, original_ob);
+        assert!(bypassed_callees_ob.contains("[Mir.Demo.leaf.body]"));
+        fs::write(&caller_ob_path, &bypassed_callees_ob)
+            .expect("bypass defaultCallees in caller claim");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("overrides claim `callees`"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+
         fs::write(&caller_ob_path, &original_ob).expect("restore caller obligations");
         assert_eq!(
             reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
@@ -5688,10 +5712,11 @@ end Mir.Demo.caller
         );
 
         // Positive control: `extract_default_callee_suffixes_from_obligations` reads
-        // multi-line tables up to the next top-level command.
+        // multi-line tables up to the next top-level command and ignores commented-out
+        // `def defaultCallees` tables.
         assert_eq!(
             extract_default_callee_suffixes_from_obligations(
-                "def defaultCallees : List CapturedMir :=\n  [Mir.A.x.body,\n   Mir.B.y.body]\n\n/-- next -/\ndef z := 1\n"
+                "-- def defaultCallees : List CapturedMir := [Mir.Evil.x.body]\ndef defaultCallees : List CapturedMir :=\n  [Mir.A.x.body,\n   Mir.B.y.body]\n\n/-- next -/\ndef z := 1\n"
             ),
             Ok(vec!["A.x".to_string(), "B.y".to_string()])
         );

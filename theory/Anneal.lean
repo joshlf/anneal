@@ -77,9 +77,12 @@ export Anneal.ITreeWP (
 export Anneal.FaultSiteCensus (
   MirFaultClass FaultSite PropertyStatus PropertyRegistry
   allVerifiedRegistry unemittedRegistry registryWithStatus
-  censusMirBodyFaultSites
+  censusMirBodyFaultSites censusRvalueFaultClasses censusStmtFaultClasses censusTerminatorFaultClasses
+  evalRvalue_ub_implies_mem_censusRvalue
+  stepMirFn_fault_in_census stepMirFn_exposesUb_in_census
   CoverageVerdict reconcileFaultCoverage reconcileFaultCoverageWithRegistry
-  CoverageBatch reconcileCoverageBatch
+  stepMirFn_fault_in_discharged_of_reconciled initMachineState_mirStepsTop_reconciled_safety
+  CoverageBatch reconcileCoverageBatch stepMirFn_exposesUb_in_batch_discharged
 )
 
 /-- Smoke-test witness exported from `Anneal`. -/

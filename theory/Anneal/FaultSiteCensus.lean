@@ -268,7 +268,7 @@ inductive PropertyStatus : Type where
       in the Lean 4 kernel. -/
   | emittedAndVerified : PropertyStatus
   /-- The construct or fault class is explicitly marked unsupported and fails
-      closed (`UNKNOWN(UNSUPPORTED_CONSTRUCT)`). -/
+      closed (`UNKNOWN(UNMAPPED_FAULT_SITE)`). -/
   | unsupportedFailClosed : PropertyStatus
   /-- The obligation generator does not yet emit obligations for this fault
       class; any occurrence in a subject's census must fail closed. -/
@@ -1425,8 +1425,10 @@ theorem evalTerminator_unreachable_ub
     evalTerminator s ⟨.unreachable, span⟩ currentBody = MirStepNode.fail .ub := rfl
 
 /--
-Exact root-frame `Return` `.ub` edge: with an empty call stack, `Return` faults iff
-the return place `_0` does not hold an initialized value (`.uninitRead`).
+Exact root-frame `Return` `.ub` edges: with an empty call stack, `Return` faults iff
+the return place `_0` does not hold an initialized value (`.uninitRead`) or tearing down
+the root frame's locals conflicts with an active function-entry protector
+(`hasFrameDeallocProtectorConflict`, `.treeBorrowsViolation`).
 -/
 theorem evalTerminator_return_root_ub_iff
     (s : MachineState) (span : String) (currentBody : Option CapturedMir)
@@ -1862,7 +1864,7 @@ theorem evalRvalue_cast_mutToConstPointer_ub_iff
     simp
 
 /--
-`[adv A2]` Exact `.ub` characterization for reading an unprojected local operand
+`[adv A2]` / `[adv ep1-A1]` Exact `.ub` characterization for reading an unprojected local operand
 `Operand.copy { local_ := loc, projection := [] }`: `evalOperand` returns `.ub` iff
 `loc` is out of bounds, `.dead`, or `.uninit`, matching
 `censusOperandFaultClasses (.copy { local_ := loc, projection := [] }) = [.uninitRead]`.
@@ -1870,9 +1872,10 @@ theorem evalRvalue_cast_mutToConstPointer_ub_iff
 theorem evalOperand_unprojected_copy_ub_iff
     (locals : List LocalSlot) (loc : LocalIdx)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (layouts : LayoutTable) (callerLocals : List LocalSlot) :
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl := .nil) (callStack : List SavedCallerFrame := .nil) :
     (evalOperand locals (.copy { local_ := loc, projection := [] })
-        borrows globals layouts callerLocals = .ub ↔
+        borrows globals layouts callerLocals localDecls callStack = .ub ↔
       (get? locals loc = none ∨
        get? locals loc = some .dead ∨
        get? locals loc = some .uninit)) ∧
@@ -1889,7 +1892,7 @@ theorem evalOperand_unprojected_copy_ub_iff
     | init v => simp [readProjectedValue]
 
 /--
-`[adv A2]` Exact `.ub` characterization for moving an unprojected local operand
+`[adv A2]` / `[adv ep1-A1]` Exact `.ub` characterization for moving an unprojected local operand
 `Operand.move { local_ := loc, projection := [] }`: `evalOperand` returns `.ub` iff
 `loc` is out of bounds, `.dead`, or `.uninit`, matching
 `censusOperandFaultClasses (.move { local_ := loc, projection := [] }) = [.uninitRead]`.
@@ -1897,9 +1900,10 @@ theorem evalOperand_unprojected_copy_ub_iff
 theorem evalOperand_unprojected_move_ub_iff
     (locals : List LocalSlot) (loc : LocalIdx)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (layouts : LayoutTable) (callerLocals : List LocalSlot) :
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl := .nil) (callStack : List SavedCallerFrame := .nil) :
     (evalOperand locals (.move { local_ := loc, projection := [] })
-        borrows globals layouts callerLocals = .ub ↔
+        borrows globals layouts callerLocals localDecls callStack = .ub ↔
       (get? locals loc = none ∨
        get? locals loc = some .dead ∨
        get? locals loc = some .uninit)) ∧
@@ -2112,6 +2116,332 @@ theorem evalRvalue_cast_own_ub_witnesses (ty : Ty) :
     rfl
   · rfl
   · rfl
+
+/--
+`[adv ep1-A1]` `Rvalue.repeat op count` only faults when evaluating `op` faults
+(`censusRvalueFaultClasses (.repeat op count) = censusOperandFaultClasses op`).
+-/
+theorem evalRvalue_repeat_ub_iff
+    (locals : List LocalSlot) (op : Operand) (count : Nat)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (.repeat op count) mem localDecls layouts = .ub ↔
+      evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+        localDecls mem.callStack = .ub := by
+  dsimp only [evalRvalue]
+  cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+      localDecls mem.callStack <;> simp
+
+/--
+`[adv ep1-A1]` `Rvalue.unaryOp .neg op` only faults when evaluating `op` faults
+(`censusUnOpFaultClasses .neg = []`).
+-/
+theorem evalRvalue_unary_neg_ub_iff
+    (locals : List LocalSlot) (op : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (.unaryOp .neg op) mem localDecls layouts = .ub ↔
+      evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+        localDecls mem.callStack = .ub := by
+  dsimp only [evalRvalue]
+  cases hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+      localDecls mem.callStack with
+  | ub => simp
+  | unsupported => simp
+  | ok v locals' =>
+    cases v with
+    | scalar sc =>
+      dsimp only
+      cases Nat.beq sc.sizeBytes 0 <;> simp
+    | _ => simp
+
+/--
+`[adv ep1-A1]` `Rvalue.use` / `Rvalue.wrapUnsafeBinder` class completeness: a `.use op`
+(or `.wrapUnsafeBinder op ty`) that faults with `.ub` either faulted while evaluating
+`op` (`censusOperandFaultClasses op`) or is a `.copy` / `.move` operand whose
+`censusLoadedOperandFaultClasses op` contains `.scalarNicheInvalid` (and `.uninitRead`).
+-/
+theorem evalRvalue_use_ub_cause
+    (locals : List LocalSlot) (op : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUb : evalRvalue locals (.use op) mem localDecls layouts = .ub) :
+    evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+        localDecls mem.callStack = .ub ∨
+      .scalarNicheInvalid ∈ censusLoadedOperandFaultClasses op := by
+  cases op with
+  | copy p =>
+    right
+    simp [censusLoadedOperandFaultClasses]
+  | move p =>
+    right
+    simp [censusLoadedOperandFaultClasses]
+  | constant c =>
+    left
+    dsimp only [evalRvalue, validateLoadedValue] at hUb
+    revert hUb
+    cases evalOperand locals (.constant c) mem.borrows mem.globals layouts
+        mem.callerLocals localDecls mem.callStack with
+    | ub => intro _; rfl
+    | unsupported => intro h; nomatch h
+    | ok v locals' => intro h; nomatch h
+
+/--
+`[adv ep1-A1]` Unary-operator class completeness against `evalRvalue`: a `.unaryOp op arg`
+that faults with `.ub` either faulted while evaluating `arg` or has non-empty
+`censusUnOpFaultClasses op` (`.not` -> `[.scalarNicheInvalid]`, `.ptrMetadata` ->
+`[.ptrDerefInvalid]`; `.neg` only faults when `arg` does).
+-/
+theorem evalRvalue_unaryOp_ub_cause
+    (locals : List LocalSlot) (op : UnOp) (arg : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUb : evalRvalue locals (.unaryOp op arg) mem localDecls layouts = .ub) :
+    evalOperand locals arg mem.borrows mem.globals layouts mem.callerLocals
+        localDecls mem.callStack = .ub ∨
+      censusUnOpFaultClasses op ≠ [] := by
+  cases op with
+  | not =>
+    right
+    simp [censusUnOpFaultClasses]
+  | ptrMetadata =>
+    right
+    simp [censusUnOpFaultClasses]
+  | neg =>
+    left
+    exact (evalRvalue_unary_neg_ub_iff locals arg mem localDecls layouts).mp hUb
+
+private theorem evalWidePtrRelBinOp_ne_ub_of_census_nil
+    (op : BinOp) (lhsThin lhsMeta rhsThin rhsMeta : Value)
+    (locals₂ : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrBytes : Nat)
+    (hNil : censusBinOpFaultClasses op = []) :
+    evalWidePtrRelBinOp op lhsThin lhsMeta rhsThin rhsMeta
+      locals₂ mem localDecls layouts ptrBytes ≠ .ub := by
+  intro hUb
+  unfold evalWidePtrRelBinOp at hUb
+  split at hUb
+  · split at hUb
+    · exact evalScalarBinOp_ne_ub_of_census_nil op _ _ locals₂ mem false hNil hUb
+    · exact evalScalarBinOp_ne_ub_of_census_nil op _ _ locals₂ mem false hNil hUb
+  · nomatch hUb
+
+private theorem evalWidePtrAggregateRelBinOp_ne_ub_of_census_nil
+    (op : BinOp) (lhsOp : Operand)
+    (lhsVar : Nat) (lhsFields : List Value)
+    (rhsVar : Nat) (rhsFields : List Value)
+    (locals₂ : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hNil : censusBinOpFaultClasses op = []) :
+    evalWidePtrAggregateRelBinOp op lhsOp lhsVar lhsFields rhsVar rhsFields
+      locals₂ mem localDecls layouts ≠ .ub := by
+  intro hUb
+  unfold evalWidePtrAggregateRelBinOp at hUb
+  split at hUb
+  · dsimp only at hUb
+    split at hUb
+    · exact evalWidePtrRelBinOp_ne_ub_of_census_nil op _ _ _ _
+        locals₂ mem localDecls layouts (layoutPointerBytes layouts) hNil hUb
+    · nomatch hUb
+  · nomatch hUb
+
+/--
+`[adv ep1-A1]` Binary-operator class completeness against `evalRvalue`: a
+`.binaryOp op lhs rhs` that faults with `.ub` either faulted while evaluating `lhs`,
+faulted while evaluating `rhs`, or has non-empty `censusBinOpFaultClasses op`.
+-/
+theorem evalRvalue_binaryOp_ub_cause
+    (locals : List LocalSlot) (op : BinOp) (lhs rhs : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUb : evalRvalue locals (.binaryOp op lhs rhs) mem localDecls layouts = .ub) :
+    evalOperand locals lhs mem.borrows mem.globals layouts mem.callerLocals
+        localDecls mem.callStack = .ub ∨
+      (∃ lhsVal locals₁,
+        evalOperand locals lhs mem.borrows mem.globals layouts mem.callerLocals
+          localDecls mem.callStack = .ok lhsVal locals₁ ∧
+        evalOperand locals₁ rhs mem.borrows mem.globals layouts mem.callerLocals
+          localDecls mem.callStack = .ub) ∨
+      censusBinOpFaultClasses op ≠ [] := by
+  cases hNil : censusBinOpFaultClasses op with
+  | cons hd tl =>
+    exact Or.inr (Or.inr (by simp))
+  | nil =>
+    have hNotOff : op ≠ .offset := by
+      intro hEq
+      rw [hEq] at hNil
+      nomatch hNil
+    dsimp only [evalRvalue] at hUb
+    cases hLhs : evalOperand locals lhs mem.borrows mem.globals layouts
+        mem.callerLocals localDecls mem.callStack with
+    | ub => exact Or.inl rfl
+    | unsupported =>
+      rw [hLhs] at hUb
+      nomatch hUb
+    | ok lhsVal locals₁ =>
+      rw [hLhs] at hUb
+      dsimp only at hUb
+      cases hRhs : evalOperand locals₁ rhs mem.borrows mem.globals layouts
+          mem.callerLocals localDecls mem.callStack with
+      | ub => exact Or.inr (Or.inl ⟨lhsVal, locals₁, rfl, hRhs⟩)
+      | unsupported =>
+        rw [hRhs] at hUb
+        nomatch hUb
+      | ok rhsVal locals₂ =>
+        rw [hRhs] at hUb
+        dsimp only at hUb
+        have hNoScalarUb : ∀ a b isSigned,
+            evalScalarBinOp op a b locals₂ mem isSigned ≠ .ub :=
+          fun a b isSigned =>
+            evalScalarBinOp_ne_ub_of_census_nil op a b locals₂ mem isSigned hNil
+        exfalso
+        cases lhsVal with
+        | scalar lhsSc =>
+          cases rhsVal with
+          | scalar rhsSc =>
+            cases op <;> (try exact hNotOff rfl) <;> exact hNoScalarUb _ _ _ hUb
+          | ptr _ _ =>
+            dsimp only at hUb
+            split at hUb
+            · split at hUb
+              · exact hNoScalarUb _ _ _ hUb
+              · contradiction
+            · contradiction
+          | unit | aggregate _ _ => contradiction
+        | ptr _ _ =>
+          cases rhsVal with
+          | scalar _ =>
+            dsimp only at hUb
+            split at hUb
+            · exact hNotOff rfl
+            · split at hUb
+              · split at hUb
+                · exact hNoScalarUb _ _ _ hUb
+                · contradiction
+              · contradiction
+          | ptr _ _ =>
+            dsimp only at hUb
+            split at hUb
+            · split at hUb
+              · exact hNoScalarUb _ _ _ hUb
+              · contradiction
+            · contradiction
+          | unit | aggregate _ _ => contradiction
+        | aggregate _ _ =>
+          cases rhsVal with
+          | aggregate _ _ =>
+            exact evalWidePtrAggregateRelBinOp_ne_ub_of_census_nil
+              op lhs _ _ _ _ locals₂ mem localDecls layouts hNil hUb
+          | unit | scalar _ | ptr _ _ => contradiction
+        | unit =>
+          cases rhsVal <;> contradiction
+
+private theorem mem_censusLoadedOperandFaultClasses_of_mem_censusOperand
+    (op : Operand) (cls : MirFaultClass)
+    (hMem : cls ∈ censusOperandFaultClasses op) :
+    cls ∈ censusLoadedOperandFaultClasses op := by
+  cases op with
+  | copy p =>
+    simp only [censusOperandFaultClasses, censusLoadedOperandFaultClasses, List.mem_append] at hMem ⊢
+    exact Or.inl hMem
+  | move p =>
+    simp only [censusOperandFaultClasses, censusLoadedOperandFaultClasses, List.mem_append] at hMem ⊢
+    exact Or.inl hMem
+  | constant c =>
+    exact hMem
+
+private theorem uninitRead_mem_censusPlaceRefFaultClasses (place : Place) :
+    .uninitRead ∈ censusPlaceRefFaultClasses place := by
+  unfold censusPlaceRefFaultClasses
+  split
+  · simp
+  · split <;> simp
+
+/--
+`[adv ep1-A1]` Universal `Rvalue`-level census completeness against
+`Trusted.MirSemantics.evalRvalue`: whenever `evalRvalue locals rv mem localDecls layouts = .ub`
+(even in isolation from `StatementKind.assign` and even when all operands are
+non-faulting constants), `censusRvalueFaultClasses rv` is non-empty and contains a
+justifying `MirFaultClass`.
+-/
+theorem evalRvalue_ub_implies_mem_censusRvalue
+    (locals : List LocalSlot) (rv : Rvalue)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUb : evalRvalue locals rv mem localDecls layouts = .ub) :
+    ∃ cls : MirFaultClass, cls ∈ censusRvalueFaultClasses rv := by
+  cases rv with
+  | use op =>
+    rcases evalRvalue_use_ub_cause locals op mem localDecls layouts hUb with hOpUb | hMem
+    · rcases evalOperand_ub_implies_mem_censusOperand locals op mem.borrows mem.globals
+        layouts mem.callerLocals localDecls mem.callStack hOpUb with ⟨cls, hCls⟩
+      exact ⟨cls, mem_censusLoadedOperandFaultClasses_of_mem_censusOperand op cls hCls⟩
+    · exact ⟨.scalarNicheInvalid, hMem⟩
+  | wrapUnsafeBinder op ty =>
+    have hUseUb : evalRvalue locals (.use op) mem localDecls layouts = .ub := hUb
+    rcases evalRvalue_use_ub_cause locals op mem localDecls layouts hUseUb with hOpUb | hMem
+    · rcases evalOperand_ub_implies_mem_censusOperand locals op mem.borrows mem.globals
+        layouts mem.callerLocals localDecls mem.callStack hOpUb with ⟨cls, hCls⟩
+      exact ⟨cls, mem_censusLoadedOperandFaultClasses_of_mem_censusOperand op cls hCls⟩
+    · exact ⟨.scalarNicheInvalid, hMem⟩
+  | «repeat» op count =>
+    have hOpUb := (evalRvalue_repeat_ub_iff locals op count mem localDecls layouts).mp hUb
+    exact evalOperand_ub_implies_mem_censusOperand locals op mem.borrows mem.globals
+      layouts mem.callerLocals localDecls mem.callStack hOpUb
+  | ref _ place =>
+    exact ⟨.uninitRead, uninitRead_mem_censusPlaceRefFaultClasses place⟩
+  | rawPtr _ place =>
+    exact ⟨.uninitRead, uninitRead_mem_censusPlaceRefFaultClasses place⟩
+  | threadLocalRef _ => nomatch hUb
+  | len place =>
+    exact ⟨.uninitRead, by simp [censusRvalueFaultClasses, censusPlaceReadFaultClasses]⟩
+  | cast kind op ty =>
+    rcases evalRvalue_cast_ub_cause locals kind op ty mem localDecls layouts hUb with
+      hOpUb | hCastNe
+    · rcases evalOperand_ub_implies_mem_censusOperand locals op mem.borrows mem.globals
+        layouts mem.callerLocals localDecls mem.callStack hOpUb with ⟨cls, hCls⟩
+      exact ⟨cls, by simp [censusRvalueFaultClasses, castKindUnevaluated, hCls]⟩
+    · cases hList : censusCastKindFaultClasses kind with
+      | nil => exact False.elim (hCastNe hList)
+      | cons cls rest =>
+        exact ⟨cls, by simp [censusRvalueFaultClasses, castKindUnevaluated, hList]⟩
+  | binaryOp op lhs rhs =>
+    rcases evalRvalue_binaryOp_ub_cause locals op lhs rhs mem localDecls layouts hUb with
+      hLhsUb | ⟨_, locals₁, _, hRhsUb⟩ | hBinNe
+    · rcases evalOperand_ub_implies_mem_censusOperand locals lhs mem.borrows mem.globals
+        layouts mem.callerLocals localDecls mem.callStack hLhsUb with ⟨cls, hCls⟩
+      exact ⟨cls, by simp [censusRvalueFaultClasses, hCls]⟩
+    · rcases evalOperand_ub_implies_mem_censusOperand locals₁ rhs mem.borrows mem.globals
+        layouts mem.callerLocals localDecls mem.callStack hRhsUb with ⟨cls, hCls⟩
+      exact ⟨cls, by simp [censusRvalueFaultClasses, hCls]⟩
+    · cases hList : censusBinOpFaultClasses op with
+      | nil => exact False.elim (hBinNe hList)
+      | cons cls rest =>
+        exact ⟨cls, by simp [censusRvalueFaultClasses, hList]⟩
+  | nullaryOp _ _ => nomatch hUb
+  | unaryOp op arg =>
+    rcases evalRvalue_unaryOp_ub_cause locals op arg mem localDecls layouts hUb with
+      hArgUb | hUnNe
+    · rcases evalOperand_ub_implies_mem_censusOperand locals arg mem.borrows mem.globals
+        layouts mem.callerLocals localDecls mem.callStack hArgUb with ⟨cls, hCls⟩
+      exact ⟨cls, by simp [censusRvalueFaultClasses, hCls]⟩
+    · cases hList : censusUnOpFaultClasses op with
+      | nil => exact False.elim (hUnNe hList)
+      | cons cls rest =>
+        exact ⟨cls, by simp [censusRvalueFaultClasses, hList]⟩
+  | discriminant place =>
+    exact ⟨.uninitRead, by simp [censusRvalueFaultClasses, censusPlaceReadFaultClasses]⟩
+  | aggregate kind ops =>
+    have hNotCoro : aggregateKindUnevaluated kind = false := by
+      cases kind with
+      | coroutine _ => nomatch hUb
+      | _ => rfl
+    rcases evalRvalue_aggregate_ub_cause locals kind ops mem localDecls layouts hUb with
+      hOpsUb | hAggNe
+    · rcases evalOperands_ub_implies_mem_censusOperands mem.borrows mem.globals
+        layouts mem.callerLocals localDecls mem.callStack locals ops hOpsUb with ⟨cls, hCls⟩
+      exact ⟨cls, by simp [censusRvalueFaultClasses, hNotCoro, hCls]⟩
+    · cases hList : censusAggregateKindFaultClasses kind with
+      | nil => exact False.elim (hAggNe hList)
+      | cons cls rest =>
+        exact ⟨cls, by simp [censusRvalueFaultClasses, hNotCoro, hList]⟩
+  | shallowInitBox _ _ => nomatch hUb
+  | copyForDeref place =>
+    exact ⟨.uninitRead, by simp [censusRvalueFaultClasses, censusPlaceReadFaultClasses]⟩
 
 /--
 `[adv A2]` Exact `.ub` characterization for writing to an unprojected local place
@@ -4605,7 +4935,7 @@ inductive CoverageVerdict : Type where
   | verified : CoverageVerdict
   /-- One or more fault sites in `census` were either omitted from `discharged`
       or belong to an un-emitted / unsupported `MirFaultClass` in `PropertyRegistry`
-      (`UNKNOWN(UNSUPPORTED_CONSTRUCT)`). -/
+      (`UNKNOWN(UNMAPPED_FAULT_SITE)`). -/
   | unknownUnmappedFaultSites (missing : List FaultSite) : CoverageVerdict
   deriving DecidableEq, Repr, Inhabited
 

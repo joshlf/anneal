@@ -728,10 +728,12 @@ pub fn compute_workspace_bundle_fault_census(
         };
         if let Some(path) = callee_path
             && let Ok(src) = fs::read_to_string(&path)
-            && src.contains("def body : CapturedMir")
-            && src.contains("phase :=")
         {
-            callee_sources.push((callee.def_id.clone(), src));
+            if src.contains("def body") {
+                callee_sources.push((callee.def_id.clone(), src));
+            }
+        } else {
+            callee_sources.push((callee.def_id.clone(), String::new()));
         }
     }
 
@@ -1453,19 +1455,31 @@ fn rehydrate_bundle_from_obligations_text(
                 associated_subject_def_id: Some(subject_def_id.clone()),
                 trait_impls: Vec::new(),
             });
-        } else if trimmed == "def defaultCallees : List CapturedMir :="
-            && let Some(list_line) = lines.get(idx + 1)
-        {
-            for suffix in extract_mir_body_suffixes(list_line) {
+        } else if trimmed == "def defaultCallees : List CapturedMir :=" {
+            let mut block = String::new();
+            for &sub_line in lines.iter().skip(idx + 1) {
+                if !sub_line.is_empty() && !sub_line.starts_with(char::is_whitespace) {
+                    break;
+                }
+                block.push_str(sub_line);
+                block.push(' ');
+            }
+            for suffix in extract_mir_body_suffixes(&block) {
                 bundle.transitive_callees.push(TransitiveCalleeRef {
                     def_id: suffix.clone(),
                     item_module_suffix: suffix,
                 });
             }
-        } else if trimmed == "def defaultSpecCallees : List CapturedMir :="
-            && let Some(list_line) = lines.get(idx + 1)
-        {
-            for suffix in extract_mir_body_suffixes(list_line) {
+        } else if trimmed == "def defaultSpecCallees : List CapturedMir :=" {
+            let mut block = String::new();
+            for &sub_line in lines.iter().skip(idx + 1) {
+                if !sub_line.is_empty() && !sub_line.starts_with(char::is_whitespace) {
+                    break;
+                }
+                block.push_str(sub_line);
+                block.push(' ');
+            }
+            for suffix in extract_mir_body_suffixes(&block) {
                 bundle.spec_callees.push(TransitiveCalleeRef {
                     def_id: suffix.clone(),
                     item_module_suffix: suffix,

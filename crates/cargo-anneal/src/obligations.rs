@@ -891,6 +891,19 @@ pub(crate) fn build_batch_callee_closure(
                 external_set.insert(callee);
             }
         }
+        if allow_implicit_external_callees
+            && inline_set.is_empty()
+            && external_set.is_empty()
+            && body.basic_blocks.iter().any(|bb| match &bb.terminator.kind {
+                ProtoTerminatorKind::Call { func, .. }
+                | ProtoTerminatorKind::TailCall { func, .. } => {
+                    func.extract_callee_def_path().is_none()
+                }
+                _ => false,
+            })
+        {
+            external_set.insert("__anneal_assumed_indirect_callee".to_string());
+        }
     }
 
     CalleeClosure {
@@ -4250,10 +4263,10 @@ mod tests {
         assert!(!module.contains("leaf -/"), "{module}");
         let refreshed = refresh_obligations_census_summary(
             &module,
-            Some(&receipt("UNKNOWN(UNSUPPORTED_CONSTRUCT)", "demo::other")),
+            Some(&receipt("UNKNOWN(UNMAPPED_FAULT_SITE)", "demo::other")),
         );
         assert_eq!(refreshed.matches(FAULT_CENSUS_SUMMARY_HEADER).count(), 1, "{refreshed}");
-        assert!(refreshed.contains("verdict: UNKNOWN(UNSUPPORTED_CONSTRUCT)"), "{refreshed}");
+        assert!(refreshed.contains("verdict: UNKNOWN(UNMAPPED_FAULT_SITE)"), "{refreshed}");
         assert!(!refreshed.contains("verdict: VERIFIED"), "{refreshed}");
         assert!(refreshed.contains("- Inline requires: `r` (`Mir.R`)\n"), "{refreshed}");
         assert!(refreshed.ends_with("-/\n\ndef x := 1\n"), "{refreshed}");
