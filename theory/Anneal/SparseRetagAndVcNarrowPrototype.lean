@@ -21,15 +21,17 @@ Anneal's real `Trusted.Rustc.V2026_06_01` and `Anneal.MirLiftCore` types with ze
 `Anneal.SparseRetagAndVcNarrowPrototype`.
 
 * **Part A (`SparseRetagAttrIndex`, `proofs-rs/lean-miri` PR #68)**: binary radix trie over
-  `DefId` (`NatBitTrie`, 12 low bits + exact-key leaf buckets) with `Except`-cached whole-table
+  `DefId` (`NatBitTrie` at depth `adaptiveRetagTrieDepth definitionCount = max 12 (log2 D + 1)`, so
+  valid keys have unique bit paths, plus exact-key leaf buckets) with `Except`-cached whole-table
   duplicate and bounds validation (`prepareSparseRetagIndex`, `lookupSparseRetag`), proved
   unconditionally equivalent (`lookupSparseRetag_eq_linearScan`) to the linear reference oracle
   `linearScanRetagAttr` (which re-validates the table with an `O(M)` duplicate scan per row, i.e.
   `O(M^2)` per query, mirroring `lean-miri`'s `CompilerRetagOptions.rustcNoWritable`), preserving
   exact error precedence (`frameAbsent_precedes_malformedTable`), with hit/miss certificates, a
   `DefPath`-keyed companion index, and an operational `StatementKind.retag .fnEntry` overlay whose
-  implicit-write upgrade targets only the freshly created child tag
-  (`applyImplicitWriteUpgrade_of_no_fresh_child`).
+  implicit write targets only the freshly created child tag
+  (`applyImplicitWriteUpgrade_of_no_fresh_child`) and performs the `Trusted` Tree Borrows child-write
+  transition with its UB checks (`canary_implicitWrite_treeBorrows_full`).
 * **Part B (`BatchedVcConeNarrowCert` + `hoistTraitImpls` + `@[irreducible] coerceValueAt`,
   `bensherman` `cl/1022801564` `#cpp_vc_narrow`)**: ONE Boolean checker
   (`checkBatchedVcConeNarrowCert`, discharged by a single `decide +kernel`) from which every field
@@ -37,15 +39,18 @@ Anneal's real `Trusted.Rustc.V2026_06_01` and `Anneal.MirLiftCore` types with ze
   direct/polymorphic/trait-method call cone, mask-based first-match `findCallee?` preservation
   (duplicate shadowing included, no body equality needed), `TraitImplEntry` target closure with
   `hoistTraitImpls`, and external-contract admissibility (`UntrustedAdmissible`, summary
-  agreement). `computeBatchedVcNarrowCert` / `collectTraitConeBodies` compute the certificate
-  data. Core theorems: `runMirExecBounded_narrow_of_batchedCert`,
+  agreement); `checkBatchedVcConeNarrowCertMask` / `BatchedVcConeNarrowCert.ofCheckMask` hoist only
+  the dropped bodies' `TraitImplEntry`s (`rustc-capture` layout, where kept impl bodies carry their
+  own entries). `computeBatchedVcNarrowCert` / `collectTraitConeBodies` compute the certificate
+  data; `stepMirFn_extCallInCone` shows external calls of cone-safe states stay in the cone. Core theorems: `runMirExecBounded_narrow_of_batchedCert`,
   `wpMirExecSym_narrow_of_batchedCert`, and `vcMirWithCallees_narrow_of_batchedCert` over a
   contract-aware WP (`wpMirExecExt`) in which cone summaries genuinely restrict external-call
   answers (`canary_externalSummary_vc`). `coerceValueAt` is sealed (`@[irreducible]`) with targeted
   rewrite lemmas.
 * **Part C (`DemandCallerLocationEnv`, `proofs-rs/lean-miri` PR #67 Schema 15)**: demand-time
   `#[track_caller]` `core::panic::Location` + deduplicated filename allocation in `Memory.globals`
-  (fresh ids drawn from the *next fresh* `Memory.nextAllocId`), `find_closest_untracked_caller_location`
+  (fresh ids drawn from `max nextAllocId nextTag`, advancing both, so they avoid live borrow tags),
+  `find_closest_untracked_caller_location`
   resolution with per-crate `-Zlocation-detail` policies (all 8 combinations, `Option` call sites),
   and general theorems over ALL call-site tables and traces: `demandCallerLocation_bisim_eager`,
   `demandCallerLocation_no_call_zero_allocs`, `eagerCallerLocation_clutter`, and
@@ -624,16 +629,17 @@ theorem fnEntryRetagPermWithAttr_implicitWrites_false (mutability : Mutability) 
 reference at function entry (`Miri/TreeBorrows/RetagPolicy.lean` & `Statements.lean:1770-1864`):
 1. The fresh child is identified by its tag (`head.tag = preTag ∧ s'.memory.nextTag = preTag + 1`),
    so retag paths that create no child (ZSTs, slices, globals) leave `borrows` untouched.
-2. Interior-mutable `.cell` references (`&mut UnsafeCell<T>`) remain `.cell` without an activating
-   write (`applyImplicitWriteUpgrade_cell_noop`).
-3. For `Freeze` mutable references (`head.perm = .reservedFrz false`), performs the full Tree
-   Borrows child write through `head.tag`:
-   - Checks ancestor child-write UB (`treeBorrowAncestorsChildAccessUB .write`, e.g. reborrowing
+2. In `V2026_06_01` every fn-entry child of a `&mut` is created `.reservedFrz false`
+   (`fnEntryRetagPerm_mut`, independent of `Freeze`), and — as in V2026_08_01
+   `initProtectedReborrowPerm` (mutable ∧ implicit writes ⇒ `.active`) and MiniRust
+   `ReborrowSettings.perm` (`&mut`/`Box` inside the pointee ⇒ `Unique`) — the implicit write is
+   performed uniformly for all `&mut` pointees through `head.tag`:
+   - checks ancestor child-write UB (`treeBorrowAncestorsChildAccessUB .write`, e.g. reborrowing
      `&mut T` from a `.frozen` parent) and protected foreign write conflicts
      (`hasProtectedTreeWriteConflict`), faulting with `MirStepNode.fail .ub` if either fires;
-   - Transitions all affected borrow entries via `invalidateTreeBorrowsAtProj` (promoting `head` to
-     `.unique`, preserving local ancestors, and disabling conflicting foreign `.frozen` / `.unique`
-     siblings). -/
+   - transitions all affected borrow entries via `invalidateTreeBorrowsAtProj` (the child-write
+     transition promotes `head` from a reservation to `.unique`, preserves local ancestors, and
+     disables conflicting foreign `.frozen` / `.unique` entries). -/
 def applyImplicitWriteUpgrade (preTag : Nat) (node : MirStepNode) (localDecls : List LocalDecl)
     (layouts : LayoutTable) (place : Place) (implicitWrites rustcNoWritable : Bool) :
     MirStepNode :=
@@ -648,50 +654,31 @@ def applyImplicitWriteUpgrade (preTag : Nat) (node : MirStepNode) (localDecls : 
         | head :: tail =>
           match Nat.beq head.tag preTag && Nat.beq s'.memory.nextTag (preTag + 1) with
           | true =>
-            match head.perm with
-            | .cell => node
-            | _ =>
-              let allBorrows := head :: tail
-              let writeUB :=
-                treeBorrowAncestorsChildAccessUB .write allBorrows head.parentTag ||
-                  hasProtectedTreeWriteConflict allBorrows allBorrows s'.memory.activeProtectors
-                    head.targetLocal (.some head.tag) head.targetProjection
-                    head.rangeOffset head.rangeLen head.targetFrameDepth
-              match writeUB with
-              | true => MirStepNode.fail .ub
-              | false =>
-                MirStepNode.step
-                  { s' with memory := { s'.memory with
-                      borrows :=
-                        invalidateTreeBorrowsAtProj allBorrows allBorrows head.targetLocal
-                          (.some head.tag) head.targetProjection head.rangeOffset
-                          head.rangeLen head.targetFrameDepth } }
+            let allBorrows := head :: tail
+            let writeUB :=
+              treeBorrowAncestorsChildAccessUB .write allBorrows head.parentTag ||
+                hasProtectedTreeWriteConflict allBorrows allBorrows s'.memory.activeProtectors
+                  head.targetLocal (.some head.tag) head.targetProjection
+                  head.rangeOffset head.rangeLen head.targetFrameDepth
+            match writeUB with
+            | true => MirStepNode.fail .ub
+            | false =>
+              MirStepNode.step
+                { s' with memory := { s'.memory with
+                    borrows :=
+                      invalidateTreeBorrowsAtProj allBorrows allBorrows head.targetLocal
+                        (.some head.tag) head.targetProjection head.rangeOffset
+                        head.rangeLen head.targetFrameDepth } }
           | false => node
         | [] => node
       | _ => node
     | _ => node
 
-/-- When the fresh child has permission `.cell` (`&mut UnsafeCell<T>`), `applyImplicitWriteUpgrade`
-preserves `.cell` without overwriting it to `.unique`. -/
-theorem applyImplicitWriteUpgrade_cell_noop (preTag : Nat) (s' : MachineState)
-    (head : BorrowEntry) (tail : List BorrowEntry)
-    (localDecls : List LocalDecl) (layouts : LayoutTable) (place : Place)
-    (implicitWrites rustcNoWritable : Bool)
-    (h_borrows : s'.memory.borrows = head :: tail) (h_cell : head.perm = .cell) :
-    applyImplicitWriteUpgrade preTag (.tau (.running s')) localDecls layouts place
-        implicitWrites rustcNoWritable = .tau (.running s') := by
-  unfold applyImplicitWriteUpgrade
-  cases implicitWrites && !rustcNoWritable with
-  | false => rfl
-  | true =>
-    dsimp only
-    split
-    · rw [h_borrows]
-      dsimp only
-      split
-      · rw [h_cell]
-      · rfl
-    · rfl
+/-- In `V2026_06_01`, the protected child of a fn-entry retag of a `&mut` is always created
+`.reservedFrz false` (never `.cell`), whatever the pointee's `Freeze`-ness, so the implicit-write
+overlay always starts from a reservation. -/
+theorem fnEntryRetagPerm_mut (pointee : RigidTy) :
+    fnEntryRetagPerm .mut pointee = .reservedFrz false := rfl
 
 /-- **Child-targeting of the implicit-write overlay**: when the step created no fresh child
 (`nextTag` unchanged), `applyImplicitWriteUpgrade` is the identity — no unrelated borrow entry is
@@ -833,7 +820,9 @@ theorem evalFnEntryRetagWithSparseAttr_rustcNoWritable_true (definitionCount : N
   | _ => cases implicitWrites <;> rfl
 
 /-- **Tree Borrows Implicit-Write Soundness Canary (`canary_implicitWrite_treeBorrows_full`)**:
-1. A `.cell` child (`&mut UnsafeCell<T>`) is preserved as `.cell` (not clobbered to `.unique`).
+1. (Synthetic state — `V2026_06_01` never creates a `.cell` fn-entry child for a `&mut`, see
+   `fnEntryRetagPerm_mut`.) The trusted child-write transition itself leaves a `.cell` writer
+   `.cell` and its `.unique` parent `.unique`; no special case is needed in the overlay.
 2. A `.reservedFrz false` child whose parent has `.frozen` permission faults to
    `MirStepNode.fail .ub` under implicit write (`treeBorrowAncestorsChildAccessUB .write` = true).
 3. A foreign `.frozen` sibling on the same local/range is disabled (`.disabled`) when a
@@ -2474,6 +2463,12 @@ without duplicating dispatch records! -/
 def hoistMaskTraitImpls (fullCallees : List CapturedMir) (mask : List Bool)
     (extra : List TraitImplEntry) : List TraitImplEntry :=
   extra ++ flatMapTraitImpls (dropByMask fullCallees mask)
+
+/-- Mask-aware hoisting is the brief's `hoistTraitImpls` applied to the *dropped* callees. -/
+theorem hoistMaskTraitImpls_eq_hoistTraitImpls (fullCallees : List CapturedMir) (mask : List Bool)
+    (extra : List TraitImplEntry) :
+    hoistMaskTraitImpls fullCallees mask extra =
+      hoistTraitImpls (dropByMask fullCallees mask) extra := rfl
 
 /-- Check that for every `dp ∈ cone`, `TraitImplEntry` records targeting `dp` in `fullCallees`
 live either in dropped carrier bodies (`dropByMask`) or in kept `impl` bodies (`selectByMask`).
@@ -4170,7 +4165,10 @@ def lookupFileCache? (fileBytes : List UInt8) : List (List UInt8 × AllocId) →
 ProvenancePtr.allocId`) are resolved via `lookupBorrow mem.borrows ptr.tag` *before*
 `lookupGlobalAlloc mem.globals ptr.allocId`. Drawing demand-time `Location` / filename identifiers
 from `max mem.nextAllocId mem.nextTag` and advancing **both** `nextAllocId` and `nextTag` ensures
-that no `Location` pointer ever collides with a live or future stack borrow tag! -/
+that a fresh `Location` pointer collides with no live tag (`BorrowsFresh`) and with no tag later
+drawn from the advanced `nextTag` counter. (That statements only draw tags from `nextTag` and never
+decrease it is a property of `Trusted` statement semantics that is not proved here, so the
+trace-level theorems below still read `Location`s through `readLocationFromGlobals`.) -/
 def nextFreshGlobalAndTagId (mem : Memory) : AllocId :=
   max mem.nextAllocId mem.nextTag
 

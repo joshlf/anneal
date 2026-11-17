@@ -118,10 +118,7 @@ theorem test_partA_sparseRetag_canaries :
     lookupSparseRetag 10 (.error .duplicateDefQuery) 10 = .error .frameAbsent ∧
     (SparseDefPathRetagIndex.mk .empty).get? "x" = none ∧
     ((SparseDefPathRetagIndex.mk .empty).insert "alloc::boxed::Box::new" true).get?
-      "alloc::boxed::Box::new" = some true ∧
-    (3 : Nat) = 3 ∧
-    5 < 2 ^ adaptiveRetagTrieDepth 10 ∧
-    (7 : Nat) = 7 := by
+      "alloc::boxed::Box::new" = some true := by
   refine ⟨trieLookupBits_empty [true, false] 1,
     by rw [trieLookupBits_insert_same]; rfl,
     by rw [trieLookupBits_insert_diff [true] [false] .empty 1 true 0 rfl (by decide)]; rfl,
@@ -137,10 +134,39 @@ theorem test_partA_sparseRetag_canaries :
     by rw [lookupSparseRetag_eq_linearScan]; rfl,
     frameAbsent_precedes_malformedTable (Nat.le_refl 10) .duplicateDefQuery,
     SparseDefPathRetagIndex.get?_empty "x",
-    by rw [SparseDefPathRetagIndex.get?_insert]; rfl,
-    natLowBits_inj_of_lt_pow2 4 (by decide) (by decide) rfl,
-    lt_two_pow_adaptiveRetagTrieDepth (by decide : 5 < 10),
-    adaptiveRetagTrieDepth_bitPath_injective (by decide : 7 < 10) (by decide : 7 < 10) rfl⟩
+    by rw [SparseDefPathRetagIndex.get?_insert]; rfl⟩
+
+/-- Largest leaf bucket of a `BitTrie` (measurement helper). -/
+def bitTrieMaxBucket {α : Type} : BitTrie α → Nat
+  | .empty => 0
+  | .leaf bucket => bucket.length
+  | .branch l r => max (bitTrieMaxBucket l) (bitTrieMaxBucket r)
+
+/-- A `definitionCount = 5000 > 4096` table whose keys `7` and `4103 = 7 + 4096` share their low
+12 bits. -/
+def bigRetagRows : List RetagQueryRow := [⟨7, "crate::a", true⟩, ⟨4103, "crate::b", false⟩]
+
+def preparedMaxBucket (prepared : Except RetagAttrErr SparseRetagAttrIndex) : Nat :=
+  match prepared with
+  | .ok idx => bitTrieMaxBucket idx.trie.root
+  | .error _ => 0
+
+/-- Adaptive trie depth, exercised where it matters: at the fixed 12-bit depth keys `7` and
+`4103` share a path and a 2-entry leaf bucket; at `adaptiveRetagTrieDepth 5000` their paths differ
+(by `adaptiveRetagTrieDepth_bitPath_injective`) and every leaf of the prepared index holds one key. -/
+theorem test_partA_adaptive_depth :
+    natLowBits 12 7 = natLowBits 12 4103 ∧
+    natLowBits (adaptiveRetagTrieDepth 5000) 7 ≠ natLowBits (adaptiveRetagTrieDepth 5000) 4103 ∧
+    preparedMaxBucket (prepareSparseRetagLoop 5000 (NatBitTrie.empty 12) 0 bigRetagRows) = 2 ∧
+    preparedMaxBucket (prepareSparseRetagIndex 5000 bigRetagRows) = 1 ∧
+    lookupSparseRetag 5000 (prepareSparseRetagIndex 5000 bigRetagRows) 4103 = .ok false ∧
+    lookupSparseRetag 5000 (prepareSparseRetagIndex 5000 bigRetagRows) 7 = .ok true :=
+  ⟨by decide,
+    fun h => absurd (adaptiveRetagTrieDepth_bitPath_injective (by decide) (by decide) h) (by decide),
+    by decide +kernel,
+    by decide +kernel,
+    by rw [lookupSparseRetag_eq_linearScan]; rfl,
+    by rw [lookupSparseRetag_eq_linearScan]; rfl⟩
 
 /-- Concrete MIR state with a mutable reference `_1 : &mut u32` borrowed from `_2 : u32`
 (`tag = 1`). -/
@@ -258,14 +284,7 @@ theorem test_partA_operational_retag_overlay :
     headPermIsUnique (applyImplicitWriteUpgradeLegacyA0
       (evalStmt protoZstMachineState protoFnEntryRetagStmt protoZstLocalDecls protoLayouts)
       protoZstLocalDecls protoLayouts ⟨1, []⟩ true false) = some true ∧
-    applyImplicitWriteUpgrade 1
-        (.tau (.running { protoZstMachineState with
-          memory := { emptyMemory with
-            borrows := [{ tag := 1, targetLocal := 0, targetProjection := [], perm := .cell }] } }))
-        protoRetagLocalDecls protoLayouts ⟨1, []⟩ true false =
-      .tau (.running { protoZstMachineState with
-        memory := { emptyMemory with
-          borrows := [{ tag := 1, targetLocal := 0, targetProjection := [], perm := .cell }] } }) ∧
+    fnEntryRetagPerm .mut protoCircleTy = .reservedFrz false ∧
     (match applyImplicitWriteUpgrade 2
         (.tau (.running { protoZstMachineState with
           memory := { emptyMemory with
@@ -292,7 +311,7 @@ theorem test_partA_operational_retag_overlay :
       protoRetagMachineState protoFnEntryRetagStmt protoRetagLocalDecls protoLayouts
       (by rw [sampleIdx_prepared]; exact lookupSparseRetag_cert (by decide) rfl),
     by decide +kernel, by decide +kernel, ?_, by decide +kernel, by decide +kernel,
-    applyImplicitWriteUpgrade_cell_noop 1 _ _ _ _ _ _ true false rfl rfl,
+    fnEntryRetagPerm_mut protoCircleTy,
     canary_implicitWrite_treeBorrows_full.2.1⟩
   have hq : lookupSparseRetag 10 (prepareSparseRetagIndex 10 sampleRetagRows) 7 = .ok false := by
     rw [sampleIdx_prepared]
@@ -483,14 +502,35 @@ theorem test_partB_batchedVcNarrow_and_coerceValueAt :
     coerceValueAt_idempotent protoLayouts (.uint .u32) (.scalar ⟨42, 4⟩)
       (.scalar ⟨wrapScalarBits 42 (scalarModulus 4), 4⟩) (coerceValueAt_u32 protoLayouts 42)⟩
 
-/-- The plain havoc WP implies the contract-aware VC (summaries only weaken obligations). -/
-theorem test_partB_summary_weakening
-    (h : wpMirExecSym 12 traitCallRootMir (.running protoTraitInitState)
-      (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False)) :
+/-- Postcondition "returned `31 : u32`". -/
+def post31 (out : MirOutcome) : Prop :=
+  match out with
+  | .normal (v, _) => v = Value.scalar ⟨31, 4⟩
+  | _ => False
+
+/-- The full trait-dispatch run returns `31`, so the havoc WP holds (via `wpMirExecExt_of_run` and
+`wpMirExecExt_nil_iff`), and therefore so does the contract-aware VC with summaries (summaries only
+weaken obligations, `wpMirExecExt_of_wpMirExecSym`). No hypotheses are assumed. -/
+theorem test_partB_summary_weakening :
+    wpMirExecSym 12 traitCallRootMir (.running protoTraitInitState) post31 ∧
     wpMirExecExt protoExtContracts protoTraitCone [⟨"proto::poly", 7⟩] 12 traitCallRootMir
-      (.running protoTraitInitState)
-      (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) :=
-  wpMirExecExt_of_wpMirExecSym _ _ _ _ _ 12 _ h
+      (.running protoTraitInitState) post31 := by
+  have hrun : (runMirExecBounded 12 traitCallRootMir (.running protoTraitInitState)).map
+      (fun out => match out with | .normal (v, _) => some v | _ => none) =
+      some (some (Value.scalar ⟨31, 4⟩)) := rfl
+  obtain ⟨out, hout, hv⟩ := Option.map_eq_some_iff.mp hrun
+  have hpost : post31 out := by
+    rcases out with ⟨v, m⟩ | _ | _
+    · exact Option.some.inj hv
+    · nomatch hv
+    · nomatch hv
+  have hsym : wpMirExecSym 12 traitCallRootMir (.running protoTraitInitState) post31 :=
+    (wpMirExecExt_nil_iff protoExtContracts protoTraitCone traitCallRootMir post31 12
+      (.running protoTraitInitState)).mp
+      (wpMirExecExt_of_run protoExtContracts protoTraitCone [] traitCallRootMir post31 12
+        (.running protoTraitInitState) out hout hpost)
+  exact ⟨hsym, wpMirExecExt_of_wpMirExecSym protoExtContracts protoTraitCone [⟨"proto::poly", 7⟩]
+    traitCallRootMir post31 12 (.running protoTraitInitState) hsym⟩
 
 /-- Memory-frame simp lemmas of `Memory.withCalleesAndTraits`, instantiated concretely. -/
 theorem test_partB_memory_frame_lemmas :
@@ -563,17 +603,50 @@ theorem test_partB_canaries :
     traitFilter_hoistMask_eq (cone := protoTraitCone) (extra := []) rfl
       (List.Mem.tail _ (List.Mem.head _))⟩
 
-theorem test_partB_extCallInCone (req : MirCallReq) (k : MirCallAns → MirExecState)
-    (h_safe : StepConeSafeTrait protoExtCone protoExtCallRootMir protoExtInitState)
-    (h_step : stepMirFn protoExtCallRootMir protoExtInitState = .vis (.inr (.inr (.call req))) k) :
-    coneSummary? protoExtCone [⟨"ext::rand", 7⟩] req.defPath =
-      findExternalSummary? [⟨"ext::rand", 7⟩] req.defPath ∧
-    NodeExtCallInCone protoExtCone
-      (evalTerminator protoExtInitState
-        ⟨.return_, "ret"⟩ (some protoExtCallRootMir)) :=
-  ⟨coneSummary?_eq_of_stepMirFn_extCall [⟨"ext::rand", 7⟩] h_safe h_step,
-    evalTerminator_extCallInCone protoExtCone protoExtInitState ⟨.return_, "ret"⟩
-      protoExtCallRootMir trivial⟩
+/-- The mask-aware certificate for the `rustc-capture` layout (a kept impl body carrying its own
+`TraitImplEntry`) is load-bearing: through `runMirExecBounded_narrow_of_batchedCert` the narrowed
+execution returns exactly the full execution's `31`. -/
+theorem test_partB_rustcStyle_narrow_run :
+    hoistMaskTraitImpls protoRustcStyleCallees protoRustcStyleMask [] =
+      hoistTraitImpls [protoFillerA, protoFillerB] [] ∧
+    (runMirExecBounded 12 traitCallRootMir
+        (.running (MachineState.mapMem
+          (Memory.withCalleesAndTraits (selectByMask protoRustcStyleCallees protoRustcStyleMask)
+            (hoistMaskTraitImpls protoRustcStyleCallees protoRustcStyleMask []))
+          (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory
+            protoRustcStyleCallees)))).map leafBits = some (some 31) := by
+  refine ⟨hoistMaskTraitImpls_eq_hoistTraitImpls _ _ _, ?_⟩
+  rw [runMirExecBounded_narrow_of_batchedCert canary_keptBodyWithTraitImpl_accepted.2.2.2 12 _
+    rfl rfl rfl rfl, Option.map_map]
+  have hfun : (leafBits ∘ MirOutcome.mapMem (Memory.withCalleesAndTraits
+      (selectByMask protoRustcStyleCallees protoRustcStyleMask)
+      (hoistMaskTraitImpls protoRustcStyleCallees protoRustcStyleMask []))) = leafBits := by
+    funext out
+    rcases out with ⟨v, m⟩ | _ | _
+    · cases v <;> rfl
+    · rfl
+    · rfl
+  rw [hfun]
+  rfl
+
+/-- The entry state of `protoExtCallRootMir` is cone-safe (discharged, not assumed). -/
+theorem protoExtInitState_coneSafe :
+    StepConeSafeTrait protoExtCone protoExtCallRootMir protoExtInitState :=
+  stepConeSafeTrait_of_closedInvPoly (c₁ := []) (ti₁ := []) (by decide +kernel) rfl
+    (closedInvPoly_entry rfl rfl rfl rfl)
+
+/-- The real external call emitted by `protoExtCallRootMir` stays in the cone, so the cone-filtered
+summary lookup agrees with the unfiltered one at that call. -/
+theorem test_partB_extCallInCone :
+    NodeExtCallInCone protoExtCone (stepMirFn protoExtCallRootMir protoExtInitState) ∧
+    coneSummary? protoExtCone [⟨"ext::rand", 7⟩] protoExtReq.defPath =
+      findExternalSummary? [⟨"ext::rand", 7⟩] protoExtReq.defPath ∧
+    findExternalSummary? [⟨"ext::rand", 7⟩] protoExtReq.defPath = some ⟨"ext::rand", 7⟩ :=
+  ⟨stepMirFn_extCallInCone protoExtCone protoExtCallRootMir protoExtInitState
+      protoExtInitState_coneSafe,
+    coneSummary?_eq_of_stepMirFn_extCall [⟨"ext::rand", 7⟩] protoExtInitState_coneSafe
+      protoExtStep_eq,
+    by decide +kernel⟩
 
 /-- Part C / Part D theory canaries and the projections of `AllocRenamingRel`, used concretely. -/
 theorem test_partCD_canaries :
@@ -616,32 +689,36 @@ theorem test_partCD_canaries :
     mkLazyReadCounted_fst 8 (.constVec 8 0) 2,
     mkLazyReadCounted_hit_top (.constVec 8 0) 99 (by decide)⟩
 
-/-- Direct witness for `evalStmt_pure_memory_eq` and `normalStmtStep_eq_raw_of_pure`. -/
-theorem test_partC_stmt_pure_memory
-    (ns : MachineState)
-    (hstep : evalStmt { protoRetagMachineState with memory := emptyMemory }
-      ⟨.nop, "nop"⟩ protoRetagLocalDecls protoLayouts = .tau (.running ns)) :
-    ns.memory = emptyMemory ∧
-    normalStmtStep { protoRetagMachineState with memory := emptyMemory }
-        ⟨.nop, "nop"⟩ protoRetagLocalDecls protoLayouts =
-      (match evalStmt { protoRetagMachineState with memory := emptyMemory }
-          ⟨.nop, "nop"⟩ protoRetagLocalDecls protoLayouts with
-       | .tau (.running ns') => ns'
-       | _ => { protoRetagMachineState with memory := emptyMemory }) :=
-  ⟨evalStmt_pure_memory_eq rfl rfl rfl hstep,
-    normalStmtStep_eq_raw_of_pure _ _ _ _ rfl rfl rfl⟩
+/-- The actual successor of a `nop` on a frame-free state. -/
+def protoNopAfter : MachineState :=
+  match evalStmt { protoRetagMachineState with memory := emptyMemory } ⟨.nop, "nop"⟩
+      protoRetagLocalDecls protoLayouts with
+  | .tau (.running ns) => ns
+  | _ => { protoRetagMachineState with memory := emptyMemory }
 
-/-- The three projections of a concrete `AllocRenamingRel`. -/
-theorem test_partC_renaming_projections
-    (h : AllocRenamingRel [(1, 4)] emptyMemory emptyMemory [⟨1, 0⟩] [⟨4, 0⟩]) :
-    AllocRenamingWf [(1, 4)] = true ∧
-    [(⟨4, 0⟩ : ProvenancePtr)] = [(⟨1, 0⟩ : ProvenancePtr)].map (relocatePtr [(1, 4)]) ∧
-    LocationPtrObsEq emptyMemory.globals ⟨1, 0⟩ emptyMemory.globals (relocatePtr [(1, 4)] ⟨1, 0⟩) :=
-  ⟨h.wf, h.ptrsMapped, h.obsAgree ⟨1, 0⟩ (List.Mem.head _)⟩
+theorem protoNop_step :
+    evalStmt { protoRetagMachineState with memory := emptyMemory } ⟨.nop, "nop"⟩
+      protoRetagLocalDecls protoLayouts = .tau (.running protoNopAfter) := rfl
+
+/-- Direct (closed) witness for `evalStmt_pure_memory_eq` and `normalStmtStep_eq_raw_of_pure`. -/
+theorem test_partC_stmt_pure_memory :
+    protoNopAfter.memory = emptyMemory ∧
+    normalStmtStep { protoRetagMachineState with memory := emptyMemory }
+        ⟨.nop, "nop"⟩ protoRetagLocalDecls protoLayouts = protoNopAfter :=
+  ⟨evalStmt_pure_memory_eq rfl rfl rfl protoNop_step,
+    by rw [normalStmtStep_eq_raw_of_pure _ _ _ _ rfl rfl rfl, protoNop_step]⟩
 
 theorem test_partC_renaming_witness :
     AllocRenamingRel [(1, 4)] emptyMemory emptyMemory [⟨1, 0⟩] [⟨4, 0⟩] :=
   ⟨by decide, rfl, fun _ hp => by cases hp with | head => rfl | tail _ h => nomatch h⟩
+
+/-- The three projections of a concrete (proved) `AllocRenamingRel`. -/
+theorem test_partC_renaming_projections :
+    AllocRenamingWf [(1, 4)] = true ∧
+    [(⟨4, 0⟩ : ProvenancePtr)] = [(⟨1, 0⟩ : ProvenancePtr)].map (relocatePtr [(1, 4)]) ∧
+    LocationPtrObsEq emptyMemory.globals ⟨1, 0⟩ emptyMemory.globals (relocatePtr [(1, 4)] ⟨1, 0⟩) :=
+  ⟨test_partC_renaming_witness.wf, test_partC_renaming_witness.ptrsMapped,
+    test_partC_renaming_witness.obsAgree ⟨1, 0⟩ (List.Mem.head _)⟩
 
 /-- Part B runs with the narrowed table cached as a literal (steady state after the one-time
 certificate + narrowing), proved equal to the computed narrowing. -/
@@ -677,23 +754,6 @@ def narrowedTraitState (full : List CapturedMir) : MachineState :=
       (selectByMask full (full.map (fun b => inCone protoTraitCone b.defPath)))
       (hoistTraitImpls full []))
     (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory full)
-
-/-- Symbolic initial state parameterized by a universally quantified `x : Nat` in `callerLocals`,
-so `∀ x : Nat, vcMirWithCallees ...` cannot be discharged by `decide +kernel` and must step
-symbolically through `wpMirExecExt` / `stepMirFn` / `lookupCallee`. -/
-def protoSymTraitState (x : Nat) (callees : List CapturedMir) (ti : List TraitImplEntry) :
-    MachineState :=
-  { frame :=
-      { locals := List.replicate traitCallRootMir.localDecls.length .uninit
-        blockIdx := 0
-        stmtIdx := 0 }
-    memory :=
-      { emptyMemory with
-        callees := callees
-        traitImpls := ti
-        callerLocals := [.init (.scalar ⟨x, 4⟩)]
-        nextTag := 1
-        nextProtector := 1 } }
 
 /-- Reducible (unsealed) copy of `coerceValueAt`, used only as the coercion baseline. -/
 def coerceValueAtUnsealed (layouts : LayoutTable) (ty : RigidTy) (v : Value) : Option Value :=
@@ -736,6 +796,11 @@ theorem chainCoerceSealed_idempotent (v v' : Value)
     rw [h]
     dsimp only
     exact chainCoerceSealed_idempotent v' v' (coerceValueAt_idempotent protoLayouts (.uint .u32) v v' h) k
+
+/-- Closed instance of `chainCoerceSealed_idempotent` (16 sealed coercions of `5 : u32`). -/
+theorem test_partB_chain_idempotent :
+    chainCoerceSealed 16 (.scalar ⟨5, 4⟩) = some (.scalar ⟨wrapScalarBits 5 (scalarModulus 4), 4⟩) :=
+  chainCoerceSealed_idempotent _ _ (coerceValueAt_u32 protoLayouts 5) 15
 
 open Lean Elab Command in
 run_cmd do
@@ -804,30 +869,29 @@ run_cmd do
     theorem bench_partB_narrowCached_128 :
         (runMirExecBounded 12 traitCallRootMir (.running (cachedNarrowState fullCallees128))).map
           leafBits = some (some 31) := by decide +kernel)
-  bench "PartB_symVC_full_M128" `(command|
-    theorem bench_partB_symVC_full_128 :
-        ∀ x : Nat,
-          vcMirWithCallees (fun _ _ _ => True) 12 traitCallRootMir
-            (protoSymTraitState x fullCallees128 [])
-            fullCallees128 [] [] protoTraitCone
-            (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) := by
-      intro x
-      exact rfl)
-  bench "PartB_symVC_narrowCached_M128" `(command|
-    theorem bench_partB_symVC_narrowCached_128 :
-        ∀ x : Nat,
-          vcMirWithCallees (fun _ _ _ => True) 12 traitCallRootMir
-            (protoSymTraitState x fullCallees128 [])
-            [protoPoly, protoCircleArea] [protoAreaEntry] [] protoTraitCone
-            (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) := by
-      intro x
-      exact rfl)
-  bench "PartB_coerce_sealed_lemma" `(command|
+  bench "PartB_rflVC_full_M128" `(command|
+    theorem bench_partB_rflVC_full_128 :
+        vcMirWithCallees (fun _ _ _ => True) 12 traitCallRootMir
+          (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory
+            fullCallees128)
+          fullCallees128 [] [] protoTraitCone
+          (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) :=
+      rfl)
+  bench "PartB_rflVC_narrowCached_M128" `(command|
+    theorem bench_partB_rflVC_narrowCached_128 :
+        vcMirWithCallees (fun _ _ _ => True) 12 traitCallRootMir
+          (MirFuelFree.initMachineStateWithMemoryAndCallees traitCallRootMir [] emptyMemory
+            fullCallees128)
+          [protoPoly, protoCircleArea] [protoAreaEntry] [] protoTraitCone
+          (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) :=
+      rfl)
+  bench "PartB_coerce_sealed_simp" `(command|
     theorem bench_partB_coerce_sealed :
         ∀ bits : Nat, chainCoerceSealed 16 (.scalar ⟨bits, 4⟩) =
-          some (.scalar ⟨wrapScalarBits bits (scalarModulus 4), 4⟩) :=
-      fun bits => chainCoerceSealed_idempotent _ _ (coerceValueAt_u32 protoLayouts bits) 15)
-  bench "PartB_coerce_unsealed_rfl" `(command|
+          some (.scalar ⟨wrapScalarBits bits (scalarModulus 4), 4⟩) := by
+      intro bits
+      simp only [chainCoerceSealed, coerceValueAt_u32, wrapScalarBits_eq_mod_modulus, Nat.mod_mod])
+  bench "PartB_coerce_unsealed_simp" `(command|
     theorem bench_partB_coerce_unsealed :
         ∀ bits : Nat, chainCoerceUnsealed 16 (.scalar ⟨bits, 4⟩) =
           some (.scalar ⟨wrapScalarBits bits (scalarModulus 4), 4⟩) := by
@@ -1203,7 +1267,36 @@ run_cmd do
     instantiateMVars e
   unless (probe.find? isPlaceholder).isSome do
     throwError "placeholder detector self-test failed on {probe}"
+  -- Conditional-test detector: a test theorem whose statement assumes a Prop hypothesis (other than
+  -- a bounded-quantifier membership `x ∈ l`) may instantiate prototype theorems vacuously, so such
+  -- theorems only count toward reachability if a closed test witness applies them.
+  let isConditionalThm (ci : ConstantInfo) : CommandElabM Bool := do
+    match ci with
+    | .thmInfo _ =>
+      liftTermElabM <| Meta.forallTelescope ci.type fun xs _ => do
+        let mut cond := false
+        for x in xs do
+          let ty ← Meta.inferType x
+          if (← Meta.isProp ty) && !ty.isAppOf ``Membership.mem then
+            cond := true
+        return cond
+    | _ => return false
+  let probeCond ← liftTermElabM do
+    let stx ← `(term| ∀ (n : Nat), n = 3 → n + 1 = 4)
+    let ty ← Term.elabTerm stx none
+    Term.synthesizeSyntheticMVarsNoPostponing
+    let ty ← instantiateMVars ty
+    Meta.forallTelescope ty fun xs _ => xs.anyM fun x => do
+      let t ← Meta.inferType x
+      return (← Meta.isProp t) && !t.isAppOf ``Membership.mem
+  unless probeCond do
+    throwError "conditional-test detector self-test failed"
+  let mut testSet : NameSet := {}
+  for (n, _) in env.constants.map₂.toList do
+    if testPfx.isPrefixOf n then
+      testSet := testSet.insert n
   let mut placeholders : Array Name := #[]
+  let mut conditionals : Array Name := #[]
   let mut reached : NameSet := {}
   let mut work : Array Name := #[]
   for (n, ci) in env.constants.map₂.toList do
@@ -1218,10 +1311,14 @@ run_cmd do
       if let some v := ci.value? then
         if (v.find? isPlaceholder).isSome then
           placeholders := placeholders.push n
-      for c in ci.getUsedConstantsAsSet do
-        if auditedSet.contains c && !reached.contains c then
-          reached := reached.insert c
-          work := work.push c
+      if ← isConditionalThm ci then
+        conditionals := conditionals.push n
+      else
+        -- closed test witnesses (and test definitions) are the reachability roots
+        for c in ci.getUsedConstantsAsSet do
+          if (auditedSet.contains c || testSet.contains c) && !reached.contains c then
+            reached := reached.insert c
+            work := work.push c
   unless placeholders.isEmpty do
     throwError "placeholder-only prototype theorem uses (`have _ := @thm`) in: {placeholders.toList}"
   while !work.isEmpty do
@@ -1229,12 +1326,15 @@ run_cmd do
     work := work.pop
     if let some ci := env.find? c then
       for d in ci.getUsedConstantsAsSet do
-        if auditedSet.contains d && !reached.contains d then
+        if (auditedSet.contains d || testSet.contains d) && !reached.contains d then
           reached := reached.insert d
           work := work.push d
+  let undischarged := conditionals.filter (fun n => !reached.contains n)
+  unless undischarged.isEmpty do
+    throwError "conditional test theorems never applied by a closed test witness: {undischarged.toList}"
   let unreached := auditedThms.filter (fun n => !reached.contains n)
   unless unreached.isEmpty do
-    throwError "prototype theorems not instantiated/reached by any test witness: {unreached.toList}"
-  logInfo m!"axiom audit passed: {audited} declarations ({theorems} prototype theorems, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 leaked constants, 0 placeholder uses, 100% theorem reachability)"
+    throwError "prototype theorems not instantiated/reached by any closed test witness: {unreached.toList}"
+  logInfo m!"axiom audit passed: {audited} declarations ({theorems} prototype theorems, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 leaked constants, 0 placeholder uses, {conditionals.size} conditional test lemmas all discharged, 100% theorem reachability from closed test witnesses)"
 
 end Anneal.SparseRetagAndVcNarrowProtoTests
