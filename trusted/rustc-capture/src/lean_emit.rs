@@ -765,6 +765,7 @@ pub struct IrCapturedMir {
 
 /// Renders the standard file header for a generated `Mir/<Item>.lean` module.
 pub fn render_mir_module_header(lean_module_namespace: &str, def_path: &str) -> String {
+    let def_path = sanitize_block_comment_text(def_path);
     format!(
         "import Trusted\n\n\
          namespace {lean_module_namespace}\n\n\
@@ -836,6 +837,24 @@ fn sanitize_comment_line(text: &str) -> String {
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+/// Flattens `text` to one line (like `sanitize_comment_line`) and breaks every Lean block-comment
+/// delimiter (`/-` and `-/`) with a space, so captured text spliced into a generated `/-! ... -/`
+/// docstring can neither close the comment early (injecting Lean commands into a trusted
+/// `Mir/<Item>.lean` module) nor open a nested comment that swallows the rest of the module.
+fn sanitize_block_comment_text(text: &str) -> String {
+    let flat = sanitize_comment_line(text);
+    let mut out = String::with_capacity(flat.len());
+    let mut prev: Option<char> = None;
+    for c in flat.chars() {
+        if matches!((prev, c), (Some('/'), '-') | (Some('-'), '/')) {
+            out.push(' ');
+        }
+        out.push(c);
+        prev = Some(c);
+    }
+    out
 }
 
 fn summarize_place(place: &IrPlace) -> String {
@@ -1021,10 +1040,13 @@ pub fn escape_lean_str(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if c.is_control() => {
-                let mut buf = [0u8; 4];
-                for b in c.encode_utf8(&mut buf).as_bytes() {
-                    out.push_str(&format!("\\x{b:02x}"));
-                }
+                // Lean decodes `\xHH` as the *code point* `0xHH` (`Char.ofNat`), not as a UTF-8
+                // byte, so a C1 control (`U+0080..=U+009F`) must be escaped by its code point:
+                // escaping its two UTF-8 bytes would decode to two different characters. Every
+                // `char::is_control` scalar (general category `Cc`) is at most `U+009F`.
+                let code = u32::from(c);
+                debug_assert!(code <= 0xff, "control character {c:?} exceeds `\\xHH`");
+                out.push_str(&format!("\\x{code:02x}"));
             }
             c => out.push(c),
         }
@@ -1848,6 +1870,511 @@ fn render_captured_mir(mir: &IrCapturedMir) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Capture-time pre-indexed `Anneal.OpaqueCalleeTable` certificate modules.
+// ---------------------------------------------------------------------------
+
+/// Identifier-like Lean 4 tokens (term- and command-category keywords, plus `sorry` / `admit`)
+/// that can never be used as a bare identifier. `sanitize_lean_ident` escapes them with a
+/// trailing `_`; `validate_lean_term_expr` and `validate_lean_dotted_name` reject them as name
+/// components. Over-approximating is harmless: escaping a non-keyword still yields a valid name.
+const LEAN_RESERVED_IDENTS: &[&str] = &[
+    "Prop", "Sort", "Type", "abbrev", "admit", "at", "attribute", "axiom", "break", "by", "calc",
+    "catch", "class", "continue", "decreasing_by", "def", "deriving", "do", "else", "end",
+    "example", "export", "extends", "finally", "for", "forall", "from", "fun", "have", "hiding",
+    "if", "import", "in", "include", "inductive", "infix", "infixl", "infixr", "initialize",
+    "instance", "let", "local", "macro", "macro_rules", "match", "meta", "module", "mut", "mutual",
+    "namespace", "noncomputable", "nofun", "nomatch", "nonrec", "notation", "omit", "opaque",
+    "open", "partial", "postfix", "prefix", "private", "protected", "public", "renaming", "return",
+    "scoped", "section", "set_option", "show", "sorry", "structure", "suffices", "syntax",
+    "termination_by", "then", "theorem", "this", "try", "universe", "unless", "unsafe", "using",
+    "variable", "where", "with",
+];
+
+/// One callee of a capture-time `Anneal.OpaqueCalleeTable.OpaqueCalleeTable`, carrying exactly
+/// the `CapturedMir` fields the Episode 1 certificate lemmas of
+/// `theory/Anneal/OpaqueCalleeTable.lean` inspect: `defPath` (raw `findCallee?` lookup),
+/// `typeParamCount` (monomorphic vs. free-generic resolution) and `traitImpls` (the table-wide
+/// `flatMapTraitImpls` projection sealed behind `OpaqueCalleeTable.traitImpls`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrCalleeTableEntry {
+    /// Identifier hint for this callee's certificate names (`cert_lookupRaw_<ident>`, ...). Any
+    /// string is accepted: the emitter sanitizes it with `sanitize_lean_ident` and
+    /// deterministically disambiguates collisions in entry order.
+    pub lean_ident: String,
+    /// Lean term of type `CapturedMir` naming the callee body (e.g. `Mir.Demo.leaf.body`),
+    /// checked by `validate_lean_term_expr` and always emitted parenthesized.
+    pub mir_body_expr: String,
+    /// Exact `CapturedMir.defPath` of the body (emitted through `render_lean_str`).
+    pub def_path: String,
+    /// `CapturedMir.typeParamCount` of the body.
+    pub type_param_count: usize,
+    /// `CapturedMir.traitImpls` of the body, in capture order.
+    pub trait_impls: Vec<IrTraitImplEntry>,
+}
+
+impl IrCalleeTableEntry {
+    /// Builds the table entry for a body emitted by `emit_mir_lean_module` (whose `body`
+    /// definition `mir_body_expr` names), copying its `defPath`, `typeParamCount` and
+    /// `traitImpls` so the generated certificates agree with the emitted body by construction.
+    pub fn from_captured_mir(
+        lean_ident: impl Into<String>,
+        mir_body_expr: impl Into<String>,
+        mir: &IrCapturedMir,
+    ) -> Self {
+        Self {
+            lean_ident: lean_ident.into(),
+            mir_body_expr: mir_body_expr.into(),
+            def_path: mir.def_path.clone(),
+            type_param_count: mir.type_param_count,
+            trait_impls: mir.trait_impls.clone(),
+        }
+    }
+}
+
+/// Sanitizes an identifier hint into a non-empty ASCII Lean 4 identifier that is valid both on
+/// its own and as the suffix of a generated certificate name: every character outside
+/// `[A-Za-z0-9_]` (including `.`, which would open a namespace, and non-ASCII letters) becomes
+/// `_`; an empty or all-underscore result gets a `callee` prefix (a lone `_` is the hole token);
+/// a leading digit gets a `_` prefix; and a reserved Lean keyword gets a trailing `_`.
+pub fn sanitize_lean_ident(hint: &str) -> String {
+    let mut ident: String = hint
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    if ident.bytes().all(|b| b == b'_') {
+        ident.insert_str(0, "callee");
+    }
+    if ident.as_bytes()[0].is_ascii_digit() {
+        ident.insert(0, '_');
+    }
+    if LEAN_RESERVED_IDENTS.contains(&ident.as_str()) {
+        ident.push('_');
+    }
+    ident
+}
+
+/// Injective, deterministic identifier assignment: returns `base` when unused, else the first
+/// unused `base_1`, `base_2`, ... (checked against every identifier assigned so far, including
+/// generated suffixes), and records the result as used.
+fn claim_unique_ident(base: String, used: &mut std::collections::BTreeSet<String>) -> String {
+    let mut candidate = base.clone();
+    let mut n = 1usize;
+    while used.contains(&candidate) {
+        candidate = format!("{base}_{n}");
+        n += 1;
+    }
+    used.insert(candidate.clone());
+    candidate
+}
+
+/// Checks that `expr` is a single-line Lean term built only from identifiers (optionally
+/// `«»`-quoted), numerals, `.`, `@`, spaces and balanced `()` / `[]`, so splicing it into a
+/// generated module can never open a comment, string or char literal, terminate the enclosing
+/// parentheses or start a new command. Reserved keywords (including `sorry` / `admit`) are
+/// rejected as name components.
+pub fn validate_lean_term_expr(expr: &str) -> Result<(), String> {
+    fn end_component(component: &mut String) -> Result<(), String> {
+        if LEAN_RESERVED_IDENTS.contains(&component.as_str()) {
+            return Err(format!("reserved Lean keyword `{component}`"));
+        }
+        component.clear();
+        Ok(())
+    }
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return Err("empty Lean term".to_owned());
+    }
+    let mut brackets: Vec<char> = Vec::new();
+    let mut component = String::new();
+    let mut in_quote = false;
+    let mut prev: Option<char> = None;
+    for c in trimmed.chars() {
+        if in_quote {
+            match c {
+                '»' => in_quote = false,
+                '«' => return Err("nested `«` in Lean term".to_owned()),
+                c if c.is_control() => {
+                    return Err(format!("control character {c:?} inside `«»`"));
+                }
+                _ => {}
+            }
+            prev = Some(c);
+            continue;
+        }
+        let after_ident_char = matches!(
+            prev,
+            Some(p) if p.is_ascii_alphanumeric() || matches!(p, '_' | '\'' | '!' | '?' | '»')
+        );
+        match c {
+            c if c.is_ascii_alphanumeric() || c == '_' => component.push(c),
+            '\'' | '!' | '?' if after_ident_char => component.push(c),
+            '«' => {
+                end_component(&mut component)?;
+                in_quote = true;
+            }
+            '.' | '@' | ' ' => end_component(&mut component)?,
+            '(' | '[' => {
+                end_component(&mut component)?;
+                brackets.push(c);
+            }
+            ')' | ']' => {
+                end_component(&mut component)?;
+                let open = if c == ')' { '(' } else { '[' };
+                if brackets.pop() != Some(open) {
+                    return Err(format!("unbalanced `{c}` in Lean term"));
+                }
+            }
+            _ => return Err(format!("disallowed character {c:?} in Lean term")),
+        }
+        prev = Some(c);
+    }
+    if in_quote {
+        return Err("unterminated `«` in Lean term".to_owned());
+    }
+    end_component(&mut component)?;
+    if !brackets.is_empty() {
+        return Err("unclosed `(` / `[` in Lean term".to_owned());
+    }
+    Ok(())
+}
+
+/// Checks that `name` is a dotted Lean name (`A.B.C`) whose components are ASCII identifiers
+/// (`[A-Za-z_][A-Za-z0-9_']*`, neither the hole `_` nor a reserved keyword) or non-empty
+/// `«»`-quoted components without control characters, so it can be spliced into generated
+/// `import` / `namespace` / `end` lines.
+pub fn validate_lean_dotted_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars().peekable();
+    loop {
+        match chars.peek().copied() {
+            Some('«') => {
+                chars.next();
+                let mut empty = true;
+                loop {
+                    match chars.next() {
+                        Some('»') => break,
+                        None | Some('«') => {
+                            return Err(format!("malformed `«»` component in Lean name {name:?}"));
+                        }
+                        Some(c) if c.is_control() => {
+                            return Err(format!("control character in Lean name {name:?}"));
+                        }
+                        Some(_) => empty = false,
+                    }
+                }
+                if empty {
+                    return Err(format!("empty `«»` component in Lean name {name:?}"));
+                }
+            }
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                let mut component = String::new();
+                while let Some(&c) = chars.peek() {
+                    if !(c.is_ascii_alphanumeric() || c == '_' || c == '\'') {
+                        break;
+                    }
+                    component.push(c);
+                    chars.next();
+                }
+                if component == "_" || LEAN_RESERVED_IDENTS.contains(&component.as_str()) {
+                    return Err(format!("invalid component `{component}` in Lean name {name:?}"));
+                }
+            }
+            _ => return Err(format!("invalid Lean name {name:?}")),
+        }
+        match chars.next() {
+            None => return Ok(()),
+            Some('.') => {}
+            Some(c) => return Err(format!("unexpected character {c:?} in Lean name {name:?}")),
+        }
+    }
+}
+
+/// Formats a complete, deterministic proof-side Lean 4 module sealing `entries` into a
+/// pre-indexed `Anneal.OpaqueCalleeTable.OpaqueCalleeTable` with one-time and per-callee `O(1)`
+/// lookup certificates. Equivalent to `emit_opaque_callee_table_lean_module_with_imports` with
+/// no extra imports (so `mir_body_expr` must then name bodies visible through `Trusted` and
+/// `Anneal.OpaqueCalleeTable`).
+pub fn emit_opaque_callee_table_lean_module(
+    lean_module_namespace: &str,
+    entries: &[IrCalleeTableEntry],
+) -> String {
+    emit_opaque_callee_table_lean_module_with_imports(lean_module_namespace, &[], entries)
+}
+
+/// Formats a complete, deterministic proof-side Lean 4 module sealing `entries` into a
+/// pre-indexed `Anneal.OpaqueCalleeTable.OpaqueCalleeTable`, against the frozen Episode 1
+/// signatures of `theory/Anneal/OpaqueCalleeTable.lean`:
+///
+/// - `import Trusted`, `import Anneal.OpaqueCalleeTable`, then each of `extra_imports` (e.g. the
+///   `Mir.<Crate>.<Item>` modules defining the bodies) once, in order, so the file compiles
+///   standalone. This proof-side module is never imported by a trusted `Mir/<Item>.lean` module,
+///   which keeps importing `Trusted` only.
+/// - Right-nested suffixes `calleeSuffix{M} := List.nil`, `calleeSuffix{k} := List.cons e_k
+///   calleeSuffix{k+1}`, then `calleeList := calleeSuffix0` and
+///   `table := OpaqueCalleeTable.ofList calleeList`, keeping every entry (shadowed ones included)
+///   in capture order, exactly as `findCallee?` and `flatMapTraitImpls` see them.
+/// - `cert_traitImpls : table.traitImpls = <flat traitImpls list>`, proven once per table.
+/// - For the first entry `k` with each `defPath` (a later entry with an equal `defPath` is
+///   shadowed: `findCallee?` resolves the path to entry `k`, so no certificate is emitted for it):
+///   `cert_lookupRaw_<ident>` via `lookupRaw_ofList_append_cons_of_skips` (one kernel-evaluated
+///   `stringEq` skip fact over the prefix plus `rfl` on the body's `defPath`); for a monomorphic
+///   body, `cert_lookup_mono_<ident>` via `lookupCallee_hit_mono`; and for a generic body whose
+///   `defPath` no entry registers as a trait method (`TraitRef.defPath`), `cert_noImpl_<ident>`
+///   and the `tbl.toList`-free `cert_lookup_free_poly_<ident>` (with `extra = []`) via
+///   `lookupCallee_hit_free_poly_opaque`.
+///
+/// Each certificate re-checks the entry against the body it names (`rfl` on `defPath` and
+/// `typeParamCount`, kernel evaluation of the trait-impl facts), so an inconsistent entry makes
+/// the module fail to elaborate rather than state anything false.
+///
+/// # Panics
+///
+/// Panics if `lean_module_namespace` or an extra import is not a valid dotted Lean name
+/// (`validate_lean_dotted_name`), or if an entry's `mir_body_expr` is rejected by
+/// `validate_lean_term_expr`.
+pub fn emit_opaque_callee_table_lean_module_with_imports(
+    lean_module_namespace: &str,
+    extra_imports: &[&str],
+    entries: &[IrCalleeTableEntry],
+) -> String {
+    if let Err(err) = validate_lean_dotted_name(lean_module_namespace) {
+        panic!("invalid OpaqueCalleeTable module namespace: {err}");
+    }
+    let mut imports: Vec<&str> = vec!["Trusted", "Anneal.OpaqueCalleeTable"];
+    for &import in extra_imports {
+        if let Err(err) = validate_lean_dotted_name(import) {
+            panic!("invalid OpaqueCalleeTable module import: {err}");
+        }
+        if !imports.contains(&import) {
+            imports.push(import);
+        }
+    }
+    let bodies: Vec<String> = entries
+        .iter()
+        .enumerate()
+        .map(|(k, entry)| {
+            if let Err(err) = validate_lean_term_expr(&entry.mir_body_expr) {
+                panic!("invalid `mir_body_expr` for OpaqueCalleeTable entry {k}: {err}");
+            }
+            format!("({})", entry.mir_body_expr.trim())
+        })
+        .collect();
+    let m = entries.len();
+
+    let mut out = String::new();
+    for import in &imports {
+        out.push_str(&format!("import {import}\n"));
+    }
+    out.push_str(&format!(
+        "\nnamespace {lean_module_namespace}\n\n\
+         open Trusted.Rustc.{MIR_DIALECT_V2026_06_01}.Layout\n\
+         open Trusted.Rustc.{MIR_DIALECT_V2026_06_01}.MirAst\n\
+         open Trusted.Rustc.{MIR_DIALECT_V2026_06_01}.MirSemantics\n\
+         open Anneal.OpaqueCalleeTable\n\n\
+         /-! Capture-time pre-indexed `OpaqueCalleeTable` over {m} captured callee bodies, with a \
+         one-time `traitImpls` certificate and per-callee `O(1)` lookup certificates. -/\n\n"
+    ));
+
+    out.push_str(&format!("def calleeSuffix{m} : List CapturedMir := List.nil\n"));
+    for k in (0..m).rev() {
+        out.push_str(&format!(
+            "def calleeSuffix{k} : List CapturedMir := List.cons {} calleeSuffix{}\n",
+            bodies[k],
+            k + 1
+        ));
+    }
+    out.push_str(
+        "\ndef calleeList : List CapturedMir := calleeSuffix0\n\n\
+         def table : OpaqueCalleeTable := OpaqueCalleeTable.ofList calleeList\n\n",
+    );
+
+    let flat_trait_impls: Vec<&IrTraitImplEntry> =
+        entries.iter().flat_map(|entry| entry.trait_impls.iter()).collect();
+    out.push_str(&format!(
+        "/-- One-time per-table `traitImpls` certificate. -/\n\
+         theorem cert_traitImpls : table.traitImpls = {} := by\n  \
+         unfold table\n  \
+         rw [traitImpls_ofList]\n  \
+         decide +kernel\n\n",
+        render_list(&flat_trait_impls, |entry| render_trait_impl_entry(entry))
+    ));
+
+    let mut used_idents = std::collections::BTreeSet::new();
+    let mut first_index: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for (k, entry) in entries.iter().enumerate() {
+        if let Some(&j) = first_index.get(entry.def_path.as_str()) {
+            out.push_str(&format!(
+                "-- Callee [{k}] is shadowed by callee [{j}] (equal `defPath`): `lookupRaw` \
+                 resolves to [{j}], so no certificate is emitted for [{k}].\n\n"
+            ));
+            continue;
+        }
+        first_index.insert(entry.def_path.as_str(), k);
+        let ident = claim_unique_ident(sanitize_lean_ident(&entry.lean_ident), &mut used_idents);
+        let def_path = render_lean_str(&entry.def_path);
+        let body = &bodies[k];
+        let next = k + 1;
+        out.push_str(&format!(
+            "/-- Raw `O(1)` lookup certificate for callee [{k}]. -/\n\
+             theorem cert_lookupRaw_{ident} :\n    \
+             table.lookupRaw {def_path} = Option.some {body} :=\n  \
+             lookupRaw_ofList_append_cons_of_skips (pre := {}) (post := calleeSuffix{next})\n    \
+             (by decide +kernel) (rfl : {body}.defPath = {def_path})\n\n",
+            render_list(&bodies[..k], |b| b.clone())
+        ));
+        if entry.type_param_count == 0 {
+            out.push_str(&format!(
+                "/-- Direct `O(1)` monomorphic lookup certificate for callee [{k}]. -/\n\
+                 theorem cert_lookup_mono_{ident} (callerLayouts : LayoutTable)\n    \
+                 (extra : List TraitImplEntry) :\n    \
+                 table.lookup callerLayouts {def_path} List.nil extra = Option.some {body} :=\n  \
+                 lookupCallee_hit_mono cert_lookupRaw_{ident} (rfl : {body}.typeParamCount = 0)\n\n"
+            ));
+        } else if !flat_trait_impls
+            .iter()
+            .any(|impl_entry| impl_entry.trait_ref.def_path == entry.def_path)
+        {
+            let arity = entry.type_param_count;
+            out.push_str(&format!(
+                "/-- No `TraitImplEntry` of the table targets callee [{k}] (`extra = []`). -/\n\
+                 theorem cert_noImpl_{ident} :\n    \
+                 hasTraitImplForDefPath (List.nil ++ table.traitImpls) {def_path} = false := by\n  \
+                 rw [cert_traitImpls]\n  \
+                 decide +kernel\n\n\
+                 /-- `tbl.toList`-free `O(1)` free-generic lookup certificate for callee [{k}] \
+                 (`extra = []`). -/\n\
+                 theorem cert_lookup_free_poly_{ident} (callerLayouts : LayoutTable)\n    \
+                 (firstArg : RigidTy) (restArgs : List RigidTy) (argLayouts : List TypeLayout)\n    \
+                 (harity : (List.cons firstArg restArgs).length = {arity})\n    \
+                 (hlay : instantiationLayouts? callerLayouts (List.cons firstArg restArgs) =\n      \
+                 Option.some argLayouts) :\n    \
+                 table.lookup callerLayouts {def_path} (List.cons firstArg restArgs) List.nil =\n      \
+                 Option.some ({body}.instantiate ((List.cons firstArg restArgs).zip argLayouts)) :=\n  \
+                 lookupCallee_hit_free_poly_opaque rfl cert_noImpl_{ident} cert_lookupRaw_{ident}\n    \
+                 (harity.trans (rfl : {arity} = {body}.typeParamCount)) hlay\n\n"
+            ));
+        }
+    }
+
+    out.push_str(&format!("end {lean_module_namespace}\n"));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// `DecidableEq`-without-redundant-`BEq` (`LawfulBEq`) deriving hygiene.
+// ---------------------------------------------------------------------------
+
+/// The head class reference of one `deriving` class entry: leading `@[...]` attributes (e.g.
+/// `@[expose]`) and balanced outer parentheses are stripped, and trailing class arguments
+/// (`Handler opt (x) [i] {c}`) are dropped.
+fn deriving_class_head(entry: &str) -> &str {
+    let mut s = entry.trim();
+    while let Some(rest) = s.strip_prefix("@[") {
+        match rest.find(']') {
+            Some(close) => s = rest[close + 1..].trim_start(),
+            None => break,
+        }
+    }
+    loop {
+        let t = s.trim();
+        let wrapped = t.len() >= 2 && t.starts_with('(') && t.ends_with(')') && {
+            // `(` at 0 must close at the very end, not earlier (as in `(A) (B)`).
+            let mut depth = 0usize;
+            let mut closes_at_end = false;
+            for (i, c) in t.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            closes_at_end = i + 1 == t.len();
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            closes_at_end
+        };
+        if !wrapped {
+            s = t;
+            break;
+        }
+        s = &t[1..t.len() - 1];
+    }
+    s.split(|c: char| c.is_whitespace() || matches!(c, '(' | '[' | '{' | '⟨' | '⦃'))
+        .next()
+        .unwrap_or("")
+}
+
+/// The unqualified class name of a `deriving` entry (`_root_.BEq`, `Foo.DecidableEq`,
+/// `@[expose] BEq`, `(BEq)` and `Lean.«BEq»` map to `BEq` / `DecidableEq`).
+fn deriving_class_core(entry: &str) -> &str {
+    let head = deriving_class_head(entry);
+    if let Some(stripped) = head.strip_suffix('»') {
+        if let Some(open) = stripped.rfind('«') {
+            return &stripped[open + '«'.len_utf8()..];
+        }
+    }
+    head.rsplit('.').next().unwrap_or(head)
+}
+
+/// Deduplication key of a `deriving` entry: the entry without attributes and outer parentheses,
+/// whitespace-normalized, with a leading `_root_.` dropped.
+fn deriving_class_dedup_key(entry: &str) -> String {
+    let head = deriving_class_head(entry);
+    if head.is_empty() {
+        return String::new();
+    }
+    // `head` is a subslice of `entry`: resume from its exact offset (attributes dropped).
+    let start = head.as_ptr() as usize - entry.as_ptr() as usize;
+    let mut rest = &entry[start..];
+    // Drop the unmatched `)` of stripped outer parentheses from the argument tail.
+    while rest.ends_with(')') && rest.matches('(').count() < rest.matches(')').count() {
+        rest = rest[..rest.len() - 1].trim_end();
+    }
+    let normalized = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.strip_prefix("_root_.").map(str::to_owned).unwrap_or(normalized)
+}
+
+/// Sanitizes the classes of one `deriving` clause (cl/1022563952): whenever `DecidableEq`
+/// (possibly qualified, parenthesized or `@[expose]`-attributed) is present, every `BEq` entry
+/// (in any of those forms) is dropped, so the derived structural `BEq` instance never shadows
+/// `instBEqOfDecidableEq` and core's `instLawfulBEq` (`beq_iff_eq`) keeps applying. Entries are
+/// trimmed, empty entries dropped, and duplicates (same class reference) removed keeping the
+/// first occurrence, preserving order.
+pub fn sanitize_deriving_classes<'a>(classes: &[&'a str]) -> Vec<&'a str> {
+    let has_decidable_eq = classes.iter().any(|class| deriving_class_core(class) == "DecidableEq");
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for &class in classes {
+        let class = class.trim();
+        if deriving_class_head(class).is_empty()
+            || (has_decidable_eq && deriving_class_core(class) == "BEq")
+        {
+            continue;
+        }
+        let key = deriving_class_dedup_key(class);
+        if !seen.contains(&key) {
+            seen.push(key);
+            out.push(class);
+        }
+    }
+    out
+}
+
+/// Renders a `deriving` clause over `sanitize_deriving_classes(classes)` (`""` when no class
+/// remains), the only way Lean code generated by this module may spell a `deriving` clause.
+pub fn render_deriving_clause(classes: &[&str]) -> String {
+    let classes = sanitize_deriving_classes(classes);
+    if classes.is_empty() {
+        String::new()
+    } else {
+        format!("deriving {}", classes.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2044,5 +2571,864 @@ mod tests {
         assert!(code.contains("traitImpls := (List.cons { traitRef := { defPath := \"demo::MyTrait::method\", args := (List.cons (RigidTy.adt \"demo::Wrapper\" (List.cons (RigidTy.param 0 \"T\") List.nil)) List.nil) }, implPath := \"demo::<Wrapper<T> as MyTrait>::method\" } List.nil)"));
         assert!(code.contains("(RigidTy.alias \"demo::MyTrait::Assoc\" (List.cons (RigidTy.param 0 \"T\") List.nil))"));
         assert!(code.contains("fieldLayouts := (List.cons 0 (List.cons 0 List.nil))"));
+    }
+}
+
+#[cfg(test)]
+mod opaque_callee_table_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn u32_layout() -> IrTypeLayout {
+        IrTypeLayout {
+            size: IrSize { bytes: 4 },
+            align: IrAlign { bytes: 4 },
+            backend_repr: IrBackendRepr::Scalar(IrScalarLayout::Initialized {
+                value: IrPrimitiveKind::Int { bits: 32, signed: false },
+                valid_range: IrWrappingRange { start: 0, end_: u32::MAX as u128 },
+            }),
+            fields: IrFieldsShape::Primitive,
+            variants: IrVariantsShape::Single { index: 0 },
+            is_uninhabited: false,
+            field_layouts: vec![],
+        }
+    }
+
+    /// A captured `fn() -> u32 { answer }` body with the given identity fields.
+    fn fixture_mir(
+        def_path: &str,
+        type_param_count: usize,
+        trait_impls: Vec<IrTraitImplEntry>,
+        answer: u128,
+    ) -> IrCapturedMir {
+        let layout = u32_layout();
+        let u32_ty = IrTy { kind: IrRigidTy::Uint(IrUintTy::U32), layout_idx: 0 };
+        IrCapturedMir {
+            def_path: def_path.to_owned(),
+            phase: IrMirPhaseTag::RuntimeOptimized,
+            role: IrContractRole::Subject,
+            type_param_count,
+            generic_params: (0..type_param_count)
+                .map(|i| IrGenericParamDef { index: i as u32, name: format!("T{i}") })
+                .collect(),
+            trait_impls,
+            arg_count: 0,
+            local_decls: vec![IrLocalDecl {
+                mutability: IrMutability::Mut,
+                ty: u32_ty.clone(),
+                debug_name: None,
+            }],
+            basic_blocks: vec![IrBasicBlockData {
+                statements: vec![IrStatement {
+                    kind: IrStatementKind::Assign(
+                        IrPlace { local_: 0, projection: vec![] },
+                        IrRvalue::Use(IrOperand::Constant(IrConstOperand {
+                            ty: u32_ty.clone(),
+                            val: IrConstValue::Scalar(IrConstScalar::Int(IrScalarInt {
+                                bits: answer,
+                                size_bytes: 4,
+                            })),
+                        })),
+                    ),
+                    span: String::from("src/lib.rs:1:1: 1:2"),
+                    comment: None,
+                }],
+                terminator: IrTerminator {
+                    kind: IrTerminatorKind::Return,
+                    span: String::from("src/lib.rs:1:3: 1:3"),
+                    comment: None,
+                },
+                is_cleanup: false,
+            }],
+            fn_abi: IrFnAbi {
+                args: vec![],
+                ret: IrArgAbi { layout: layout.clone(), mode: IrAbiPassMode::Direct },
+                conv: IrCallConv::Rust,
+                can_unwind: true,
+            },
+            layouts: IrLayoutTable { pointer_bits: 64, is_little_endian: true, entries: vec![layout] },
+            allocations: vec![],
+        }
+    }
+
+    fn entry(
+        ident: &str,
+        body: &str,
+        def_path: &str,
+        type_param_count: usize,
+        trait_impls: Vec<IrTraitImplEntry>,
+    ) -> IrCalleeTableEntry {
+        IrCalleeTableEntry {
+            lean_ident: ident.to_owned(),
+            mir_body_expr: body.to_owned(),
+            def_path: def_path.to_owned(),
+            type_param_count,
+            trait_impls,
+        }
+    }
+
+    fn trait_impl(trait_def_path: &str, impl_path: &str) -> IrTraitImplEntry {
+        IrTraitImplEntry {
+            trait_ref: IrTraitRef {
+                def_path: trait_def_path.to_owned(),
+                args: vec![IrRigidTy::Uint(IrUintTy::U32)],
+            },
+            impl_path: impl_path.to_owned(),
+        }
+    }
+
+    /// Names of the `theorem`s of emitted Lean code, in order.
+    fn theorem_names(code: &str) -> Vec<&str> {
+        code.lines()
+            .filter_map(|line| line.strip_prefix("theorem "))
+            .map(|rest| rest.split([' ', ':']).next().unwrap())
+            .collect()
+    }
+
+    /// Decodes a Lean 4 string-literal body exactly like `Lean.Syntax.decodeQuotedChar`
+    /// (`\xHH` / `\uHHHH` denote code points).
+    fn decode_lean_str_body(body: &str) -> String {
+        let mut out = String::new();
+        let mut chars = body.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                assert_ne!(c, '"', "unescaped quote in {body:?}");
+                out.push(c);
+                continue;
+            }
+            let decoded = match chars.next().expect("dangling backslash") {
+                '\\' => '\\',
+                '"' => '"',
+                '\'' => '\'',
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                escape @ ('x' | 'u') => {
+                    let digits = if escape == 'x' { 2 } else { 4 };
+                    let hex: String = chars.by_ref().take(digits).collect();
+                    char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap()
+                }
+                other => panic!("invalid Lean escape `\\{other}` in {body:?}"),
+            };
+            out.push(decoded);
+        }
+        out
+    }
+
+    #[test]
+    fn callee_table_multi_callee_mono_module_shape() {
+        let entries = vec![
+            entry("demo::a", "Mir.Demo.A.body", "demo::a", 0, vec![]),
+            entry("demo::b", " Mir.Demo.B.body ", "demo::b", 0, vec![]),
+            entry("demo::c", "Mir.Demo.C.body", "demo::c", 0, vec![]),
+        ];
+        let code = emit_opaque_callee_table_lean_module("Gen.Demo.Callees", &entries);
+        assert_eq!(code, emit_opaque_callee_table_lean_module("Gen.Demo.Callees", &entries));
+        assert!(code.starts_with(
+            "import Trusted\nimport Anneal.OpaqueCalleeTable\n\nnamespace Gen.Demo.Callees\n\n"
+        ));
+        for open in ["Layout", "MirAst", "MirSemantics"] {
+            assert!(code.contains(&format!("open Trusted.Rustc.{MIR_DIALECT_V2026_06_01}.{open}\n")));
+        }
+        assert!(code.contains("open Anneal.OpaqueCalleeTable\n"));
+        assert!(code.contains(
+            "def calleeSuffix3 : List CapturedMir := List.nil\n\
+             def calleeSuffix2 : List CapturedMir := List.cons (Mir.Demo.C.body) calleeSuffix3\n\
+             def calleeSuffix1 : List CapturedMir := List.cons (Mir.Demo.B.body) calleeSuffix2\n\
+             def calleeSuffix0 : List CapturedMir := List.cons (Mir.Demo.A.body) calleeSuffix1\n\n\
+             def calleeList : List CapturedMir := calleeSuffix0\n\n\
+             def table : OpaqueCalleeTable := OpaqueCalleeTable.ofList calleeList\n"
+        ));
+        assert!(code.contains(
+            "theorem cert_traitImpls : table.traitImpls = List.nil := by\n  unfold table\n  \
+             rw [traitImpls_ofList]\n  decide +kernel\n"
+        ));
+        assert!(code.contains(
+            "theorem cert_lookupRaw_demo__c :\n    \
+             table.lookupRaw \"demo::c\" = Option.some (Mir.Demo.C.body) :=\n  \
+             lookupRaw_ofList_append_cons_of_skips (pre := (List.cons (Mir.Demo.A.body) \
+             (List.cons (Mir.Demo.B.body) List.nil))) (post := calleeSuffix3)\n    \
+             (by decide +kernel) (rfl : (Mir.Demo.C.body).defPath = \"demo::c\")\n"
+        ));
+        assert!(code.contains(
+            "lookupRaw_ofList_append_cons_of_skips (pre := List.nil) (post := calleeSuffix1)\n"
+        ));
+        assert!(code.contains(
+            "theorem cert_lookup_mono_demo__b (callerLayouts : LayoutTable)\n    \
+             (extra : List TraitImplEntry) :\n    \
+             table.lookup callerLayouts \"demo::b\" List.nil extra = Option.some (Mir.Demo.B.body) :=\n  \
+             lookupCallee_hit_mono cert_lookupRaw_demo__b (rfl : (Mir.Demo.B.body).typeParamCount = 0)\n"
+        ));
+        assert_eq!(
+            theorem_names(&code),
+            vec![
+                "cert_traitImpls",
+                "cert_lookupRaw_demo__a",
+                "cert_lookup_mono_demo__a",
+                "cert_lookupRaw_demo__b",
+                "cert_lookup_mono_demo__b",
+                "cert_lookupRaw_demo__c",
+                "cert_lookup_mono_demo__c",
+            ]
+        );
+        assert!(!code.contains("free_poly") && !code.contains("noImpl"));
+        assert!(code.ends_with("end Gen.Demo.Callees\n"));
+    }
+
+    #[test]
+    fn callee_table_generic_free_poly_certificates() {
+        let entries = vec![
+            entry("demo::leaf", "Mir.Demo.Leaf.body", "demo::leaf", 0, vec![]),
+            entry("demo::poly", "Mir.Demo.Poly.body", "demo::poly", 2, vec![]),
+        ];
+        let code = emit_opaque_callee_table_lean_module("Gen.Poly", &entries);
+        assert!(code.contains(
+            "theorem cert_noImpl_demo__poly :\n    \
+             hasTraitImplForDefPath (List.nil ++ table.traitImpls) \"demo::poly\" = false := by\n  \
+             rw [cert_traitImpls]\n  decide +kernel\n"
+        ));
+        assert!(code.contains(
+            "theorem cert_lookup_free_poly_demo__poly (callerLayouts : LayoutTable)\n    \
+             (firstArg : RigidTy) (restArgs : List RigidTy) (argLayouts : List TypeLayout)\n    \
+             (harity : (List.cons firstArg restArgs).length = 2)\n    \
+             (hlay : instantiationLayouts? callerLayouts (List.cons firstArg restArgs) =\n      \
+             Option.some argLayouts) :\n    \
+             table.lookup callerLayouts \"demo::poly\" (List.cons firstArg restArgs) List.nil =\n      \
+             Option.some ((Mir.Demo.Poly.body).instantiate ((List.cons firstArg restArgs).zip argLayouts)) :=\n  \
+             lookupCallee_hit_free_poly_opaque rfl cert_noImpl_demo__poly cert_lookupRaw_demo__poly\n    \
+             (harity.trans (rfl : 2 = (Mir.Demo.Poly.body).typeParamCount)) hlay\n"
+        ));
+        assert_eq!(
+            theorem_names(&code),
+            vec![
+                "cert_traitImpls",
+                "cert_lookupRaw_demo__leaf",
+                "cert_lookup_mono_demo__leaf",
+                "cert_lookupRaw_demo__poly",
+                "cert_noImpl_demo__poly",
+                "cert_lookup_free_poly_demo__poly",
+            ]
+        );
+    }
+
+    #[test]
+    fn callee_table_trait_impls_are_flattened_and_block_free_poly_certificates() {
+        let area_impl = trait_impl("demo::Area::area", "demo::<Square as Area>::area");
+        let show_impl = trait_impl("demo::Show::show", "demo::<Square as Show>::show");
+        let entries = vec![
+            entry(
+                "square_area",
+                "Mir.Demo.SquareArea.body",
+                "demo::<Square as Area>::area",
+                0,
+                vec![area_impl.clone()],
+            ),
+            // Registered as a trait method by another entry.
+            entry("area", "Mir.Demo.AreaMethod.body", "demo::Area::area", 1, vec![]),
+            // Registered as a trait method by its own entry.
+            entry("display", "Mir.Demo.Show.body", "demo::Show::show", 1, vec![show_impl.clone()]),
+            entry("free", "Mir.Demo.Free.body", "demo::free", 1, vec![]),
+        ];
+        let code = emit_opaque_callee_table_lean_module("Gen.Traits", &entries);
+        let flat = render_list(&[area_impl, show_impl], render_trait_impl_entry);
+        assert!(code.contains(&format!("theorem cert_traitImpls : table.traitImpls = {flat} := by\n")));
+        assert_eq!(
+            theorem_names(&code),
+            vec![
+                "cert_traitImpls",
+                "cert_lookupRaw_square_area",
+                "cert_lookup_mono_square_area",
+                "cert_lookupRaw_area",
+                "cert_lookupRaw_display",
+                "cert_lookupRaw_free",
+                "cert_noImpl_free",
+                "cert_lookup_free_poly_free",
+            ]
+        );
+    }
+
+    #[test]
+    fn callee_table_empty_table() {
+        let code = emit_opaque_callee_table_lean_module("Gen.Empty", &[]);
+        assert!(code.contains(
+            "def calleeSuffix0 : List CapturedMir := List.nil\n\n\
+             def calleeList : List CapturedMir := calleeSuffix0\n\n\
+             def table : OpaqueCalleeTable := OpaqueCalleeTable.ofList calleeList\n"
+        ));
+        assert!(code.contains("theorem cert_traitImpls : table.traitImpls = List.nil := by\n"));
+        assert_eq!(theorem_names(&code), vec!["cert_traitImpls"]);
+        assert!(!code.contains("calleeSuffix1"));
+        assert!(code.ends_with("end Gen.Empty\n"));
+    }
+
+    #[test]
+    fn callee_table_shadowed_duplicate_def_path_gets_no_certificate() {
+        let entries = vec![
+            entry("first", "Mir.Demo.Leaf.body", "demo::leaf", 0, vec![]),
+            entry("other", "Mir.Demo.Other.body", "demo::other", 1, vec![]),
+            entry("first", "Mir.Demo.LeafShadow.body", "demo::leaf", 0, vec![]),
+            entry("other", "Mir.Demo.OtherShadow.body", "demo::other", 1, vec![]),
+        ];
+        let code = emit_opaque_callee_table_lean_module("Gen.Shadow", &entries);
+        // Shadowed bodies stay in the sealed list, in capture order.
+        assert!(code.contains(
+            "def calleeSuffix3 : List CapturedMir := List.cons (Mir.Demo.OtherShadow.body) calleeSuffix4\n\
+             def calleeSuffix2 : List CapturedMir := List.cons (Mir.Demo.LeafShadow.body) calleeSuffix3\n"
+        ));
+        assert!(code.contains("-- Callee [2] is shadowed by callee [0] (equal `defPath`)"));
+        assert!(code.contains("-- Callee [3] is shadowed by callee [1] (equal `defPath`)"));
+        assert_eq!(
+            theorem_names(&code),
+            vec![
+                "cert_traitImpls",
+                "cert_lookupRaw_first",
+                "cert_lookup_mono_first",
+                "cert_lookupRaw_other",
+                "cert_noImpl_other",
+                "cert_lookup_free_poly_other",
+            ]
+        );
+        // No certificate ever inspects or returns a shadowed body, and shadowed entries claim
+        // no identifier.
+        assert!(!code.contains("(Mir.Demo.LeafShadow.body)."));
+        assert!(!code.contains("(Mir.Demo.OtherShadow.body)."));
+        assert!(!code.contains("Option.some (Mir.Demo.LeafShadow.body)"));
+        assert!(!code.contains("first_1") && !code.contains("other_1"));
+    }
+
+    #[test]
+    fn sanitize_lean_ident_cases() {
+        for (hint, want) in [
+            ("demo::leaf", "demo__leaf"),
+            ("a_b", "a_b"),
+            ("a.b", "a_b"),
+            ("", "callee"),
+            ("_", "callee_"),
+            ("__", "callee__"),
+            ("0abc", "_0abc"),
+            ("def", "def_"),
+            ("end", "end_"),
+            ("sorry", "sorry_"),
+            ("Type", "Type_"),
+            ("defs", "defs"),
+            ("x'", "x_"),
+            ("théorème", "th_or_me"),
+            ("<T as Tr>::m", "_T_as_Tr___m"),
+        ] {
+            assert_eq!(sanitize_lean_ident(hint), want, "hint {hint:?}");
+        }
+    }
+
+    #[test]
+    fn callee_table_identifier_collisions_and_keywords_are_disambiguated() {
+        let hints = ["a::b", "a__b", "a__b_1", "def", "def_", "", "_"];
+        let entries: Vec<_> = hints
+            .iter()
+            .enumerate()
+            .map(|(k, hint)| entry(hint, &format!("Mir.Demo.E{k}.body"), &format!("demo::e{k}"), 0, vec![]))
+            .collect();
+        let code = emit_opaque_callee_table_lean_module("Gen.Idents", &entries);
+        let names = theorem_names(&code);
+        let raw: Vec<&str> =
+            names.iter().filter_map(|name| name.strip_prefix("cert_lookupRaw_")).collect();
+        assert_eq!(raw, vec!["a__b", "a__b_1", "a__b_1_1", "def_", "def__1", "callee", "callee_"]);
+        let unique: BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+        for name in names {
+            assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'), "{name}");
+        }
+    }
+
+    #[test]
+    fn def_path_escaping_round_trips_through_lean_string_literals() {
+        let tricky = "demo::we\"ird\\path\n\r\t\u{0}\u{1b}\u{7f}\u{85}\u{9f}é→\u{2028}🦀";
+        let escaped = escape_lean_str(tricky);
+        assert!(!escaped.chars().any(|c| c.is_control()), "{escaped:?}");
+        assert_eq!(decode_lean_str_body(&escaped), tricky);
+        // Regression: a C1 control is escaped by code point, not by its UTF-8 bytes `\xc2\x85`.
+        assert_eq!(escape_lean_str("\u{85}"), "\\x85");
+        assert_eq!(escape_lean_str("\u{0}\u{7f}"), "\\x00\\x7f");
+        assert_eq!(escape_lean_str("\"\\"), "\\\"\\\\");
+
+        let code = emit_opaque_callee_table_lean_module(
+            "Gen.Escape",
+            &[entry("weird", "Mir.Demo.Weird.body", tricky, 0, vec![])],
+        );
+        let lit = render_lean_str(tricky);
+        assert!(code.contains(&format!("table.lookupRaw {lit} = Option.some (Mir.Demo.Weird.body)")));
+        assert!(code.contains(&format!("(rfl : (Mir.Demo.Weird.body).defPath = {lit})")));
+        assert!(code.contains(&format!("table.lookup callerLayouts {lit} List.nil extra")));
+        assert!(!code.contains(tricky));
+        assert!(!code.chars().any(|c| c.is_control() && c != '\n'));
+    }
+
+    #[test]
+    fn mir_module_header_neutralizes_comment_delimiters_and_imports_trusted_only() {
+        let mir = fixture_mir("demo::x -/ axiom bad : False /- y\nz", 0, vec![], 1);
+        let code = emit_mir_lean_module("Mir.Demo.X", &mir);
+        let doc = code.lines().find(|line| line.starts_with("/-! ")).unwrap();
+        assert!(doc.ends_with(" -/"), "{doc}");
+        let inner = &doc[3..doc.len() - 2];
+        assert!(!inner.contains("-/") && !inner.contains("/-"), "{doc}");
+        assert!(!code.lines().any(|line| line.starts_with("axiom")));
+        // TrustedBoundary statement-origin isolation: a trusted `Mir/<Item>.lean` module imports
+        // `Trusted` only, never `Anneal.*` (in particular not `Anneal.OpaqueCalleeTable`).
+        let imports: Vec<&str> = code.lines().filter(|line| line.starts_with("import ")).collect();
+        assert_eq!(imports, vec!["import Trusted"]);
+        assert_eq!(sanitize_block_comment_text("a/-/b\n-/"), "a/ - /b - /");
+    }
+
+    #[test]
+    fn validate_lean_term_expr_accepts_references_and_rejects_injection() {
+        for ok in [
+            "Mir.Demo.leaf.body",
+            " Mir.Demo.leaf.body ",
+            "@Mir.Demo.leaf.body",
+            "(Mir.Demo.leaf.body)",
+            "Mir.«my-crate».leaf.body",
+            "Foo.mk 3 (Bar.x') [y]",
+            "x!",
+            "is_ok?",
+        ] {
+            assert_eq!(validate_lean_term_expr(ok), Ok(()), "{ok:?}");
+        }
+        for bad in [
+            "", "   ", "a\nb", "a -- c", "a /- c -/", "\"s\"", "'a'", "a)", "(a", "[a)", "a; b",
+            "a := b", "Mir.def.body", "sorry", "x end Foo", "«a", "«a\nb»", "a «b «c» »", "a,b",
+            "a{b}", "a#b", "a\\b", "a`b", "$x", "a ⟨b⟩",
+        ] {
+            assert!(validate_lean_term_expr(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_lean_dotted_name_cases() {
+        for ok in ["Mir", "Mir.Demo.leaf", "Gen._private", "Mir.«my-crate».x", "A'.B"] {
+            assert_eq!(validate_lean_dotted_name(ok), Ok(()), "{ok:?}");
+        }
+        for bad in [
+            "", ".", "Mir.", ".Mir", "Mir..Demo", "Mir.Demo\nimport Evil", "Mir Demo", "0Mir",
+            "Mir._", "Mir.end", "Mir.«»", "Mir.«a", "Mir-Demo", "Mir.Demo -- x",
+        ] {
+            assert!(validate_lean_dotted_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid `mir_body_expr`")]
+    fn emitter_rejects_injected_body_expr() {
+        emit_opaque_callee_table_lean_module(
+            "Gen.Bad",
+            &[entry("x", "Mir.X.body)\n\naxiom bad : False\n#check (", "demo::x", 0, vec![])],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid OpaqueCalleeTable module namespace")]
+    fn emitter_rejects_invalid_namespace() {
+        emit_opaque_callee_table_lean_module("Gen.Bad\nend Gen.Bad", &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid OpaqueCalleeTable module import")]
+    fn emitter_rejects_invalid_import() {
+        emit_opaque_callee_table_lean_module_with_imports("Gen.Ok", &["Mir.X\naxiom bad : False"], &[]);
+    }
+
+    #[test]
+    fn with_imports_emits_each_import_once_in_order() {
+        let code = emit_opaque_callee_table_lean_module_with_imports(
+            "Gen.Imp",
+            &["Mir.Demo.B", "Trusted", "Mir.Demo.A", "Mir.Demo.B", "Anneal.OpaqueCalleeTable"],
+            &[],
+        );
+        assert!(code.starts_with(
+            "import Trusted\nimport Anneal.OpaqueCalleeTable\nimport Mir.Demo.B\nimport Mir.Demo.A\n\n\
+             namespace Gen.Imp\n"
+        ));
+        assert_eq!(
+            emit_opaque_callee_table_lean_module("Gen.Imp", &[]),
+            emit_opaque_callee_table_lean_module_with_imports("Gen.Imp", &[], &[])
+        );
+    }
+
+    #[test]
+    fn from_captured_mir_copies_identity_fields() {
+        let mir = fixture_mir("demo::poly", 2, vec![trait_impl("demo::Tr::m", "demo::<u32 as Tr>::m")], 7);
+        let built = IrCalleeTableEntry::from_captured_mir("poly", String::from("Mir.Demo.Poly.body"), &mir);
+        assert_eq!(
+            built,
+            IrCalleeTableEntry {
+                lean_ident: "poly".to_owned(),
+                mir_body_expr: "Mir.Demo.Poly.body".to_owned(),
+                def_path: "demo::poly".to_owned(),
+                type_param_count: 2,
+                trait_impls: mir.trait_impls.clone(),
+            }
+        );
+    }
+
+    #[test]
+    fn sanitize_deriving_classes_drops_redundant_beq() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["BEq", "DecidableEq"], &["DecidableEq"]),
+            (&["DecidableEq", "BEq", "Repr"], &["DecidableEq", "Repr"]),
+            (&["Repr", "BEq", "Hashable"], &["Repr", "BEq", "Hashable"]),
+            (&["_root_.BEq", "Foo.DecidableEq"], &["Foo.DecidableEq"]),
+            (&["@[expose] BEq", "@[expose] DecidableEq"], &["@[expose] DecidableEq"]),
+            (&["(BEq)", " DecidableEq "], &["DecidableEq"]),
+            (&["Lean.«BEq»", "«DecidableEq»"], &["«DecidableEq»"]),
+            (&["BEqLike", "DecidableEq", "MyBEq"], &["BEqLike", "DecidableEq", "MyBEq"]),
+            (
+                &["Repr", "Repr", "DecidableEq", "_root_.DecidableEq", "@[expose] DecidableEq"],
+                &["Repr", "DecidableEq"],
+            ),
+            (&["", "  ", "Hashable", "@[expose]"], &["Hashable"]),
+            (&["BEq", "BEq"], &["BEq"]),
+            (
+                &["ToJson (opt := 1)", "ToJson  (opt := 1)", "BEq", "DecidableEq"],
+                &["ToJson (opt := 1)", "DecidableEq"],
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(sanitize_deriving_classes(input), want.to_vec(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn render_deriving_clause_hygiene() {
+        assert_eq!(render_deriving_clause(&[]), "");
+        assert_eq!(render_deriving_clause(&["BEq"]), "deriving BEq");
+        assert_eq!(
+            render_deriving_clause(&["Repr", "BEq", "DecidableEq", "Hashable"]),
+            "deriving Repr, DecidableEq, Hashable"
+        );
+        assert_eq!(
+            render_deriving_clause(&["BEq", "@[expose] DecidableEq"]),
+            "deriving @[expose] DecidableEq"
+        );
+    }
+
+    /// `(1-based line, clause)` of every `deriving` clause in `text` (inline, or
+    /// `deriving [noncomputable] instance ... for`) naming both a `BEq` and a `DecidableEq` class.
+    fn redundant_beq_deriving_clauses(text: &str) -> Vec<(usize, String)> {
+        let keyword = ["der", "iving"].concat();
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '\'';
+        let mut hits = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            let mut from = 0;
+            while let Some(pos) = line[from..].find(&keyword).map(|p| p + from) {
+                from = pos + keyword.len();
+                let standalone = line[..pos].chars().next_back().is_none_or(|c| !is_ident(c))
+                    && line[from..].chars().next().is_none_or(|c| !is_ident(c));
+                if !standalone {
+                    continue;
+                }
+                let mut clause = &line[from..];
+                for stop in ["\"", "\\n"] {
+                    if let Some(end) = clause.find(stop) {
+                        clause = &clause[..end];
+                    }
+                }
+                let mut words = clause.trim_start();
+                for prefix in ["noncomputable ", "instance "] {
+                    if let Some(rest) = words.strip_prefix(prefix) {
+                        words = rest.trim_start();
+                    }
+                }
+                let classes = words.find(" for ").map_or(words, |end| &words[..end]);
+                let cores: Vec<&str> = classes.split(',').map(deriving_class_core).collect();
+                if cores.contains(&"BEq") && cores.contains(&"DecidableEq") {
+                    hits.push((index + 1, clause.trim().to_owned()));
+                }
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn audit_no_generated_deriving_clause_combines_beq_and_decidable_eq() {
+        let kw = ["der", "iving"].concat();
+        // Canaries: the audit detects every spelling it must reject ...
+        for bad in [
+            format!("{kw} BEq, DecidableEq"),
+            format!("  {kw} Repr, _root_.BEq, Hashable, @[expose] DecidableEq"),
+            format!("{kw} instance BEq, DecidableEq for Foo"),
+            format!("{kw} noncomputable instance (BEq), Foo.DecidableEq for Foo α, (Bar β)"),
+            format!("out.push_str(\"{kw} DecidableEq, BEq\\n\")"),
+        ] {
+            assert_eq!(redundant_beq_deriving_clauses(&bad).len(), 1, "{bad}");
+        }
+        // ... and accepts lawful ones.
+        for good in [
+            format!("{kw} DecidableEq, Repr"),
+            format!("{kw} BEq, Hashable"),
+            format!("{kw} instance DecidableEq for Foo"),
+            String::from("omit [DecidableEq α] in theorem t : BEq α := inferInstance"),
+            render_deriving_clause(&["BEq", "DecidableEq"]),
+            format!("re{kw}_x BEq, DecidableEq"),
+        ] {
+            assert!(redundant_beq_deriving_clauses(&good).is_empty(), "{good}");
+        }
+        // Zero Lean templates, docstrings or tests in this file spell a redundant clause ...
+        assert_eq!(redundant_beq_deriving_clauses(include_str!("lean_emit.rs")), vec![]);
+        // ... and neither does any module the emitters produce.
+        let leaf = fixture_mir("demo::leaf", 0, vec![], 1);
+        let poly = fixture_mir("demo::poly", 1, vec![trait_impl("demo::Tr::m", "demo::<u32 as Tr>::m")], 2);
+        let entries = vec![
+            IrCalleeTableEntry::from_captured_mir("leaf", "Mir.Demo.Leaf.body", &leaf),
+            IrCalleeTableEntry::from_captured_mir("poly", "Mir.Demo.Poly.body", &poly),
+        ];
+        for code in [
+            emit_mir_lean_module("Mir.Demo.Leaf", &leaf),
+            emit_mir_lean_module("Mir.Demo.Poly", &poly),
+            emit_opaque_callee_table_lean_module_with_imports(
+                "Gen.Audit",
+                &["Mir.Demo.Leaf", "Mir.Demo.Poly"],
+                &entries,
+            ),
+        ] {
+            assert_eq!(redundant_beq_deriving_clauses(&code), vec![]);
+        }
+    }
+
+    /// Lean toolchain for the end-to-end kernel check: `lake` (`ANNEAL_LAKE`, else elan's
+    /// `~/.elan/bin/lake`, else `PATH`), run from the repository root whose `.lake/build` holds
+    /// the `Trusted` and `Anneal.OpaqueCalleeTable` `.olean`s.
+    struct LeanE2e {
+        lake: PathBuf,
+        repo_root: PathBuf,
+    }
+
+    impl LeanE2e {
+        fn detect() -> Result<Self, String> {
+            let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .map_err(|err| format!("repository root: {err}"))?;
+            for olean in ["Trusted.olean", "Anneal/OpaqueCalleeTable.olean"] {
+                let path = repo_root.join(".lake/build/lib/lean").join(olean);
+                if !path.is_file() {
+                    return Err(format!(
+                        "{} is missing (run `lake build +Anneal.OpaqueCalleeTable`)",
+                        path.display()
+                    ));
+                }
+            }
+            let lake = std::env::var_os("ANNEAL_LAKE")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(|home| PathBuf::from(home).join(".elan/bin/lake"))
+                        .filter(|path| path.is_file())
+                })
+                .or_else(|| {
+                    std::env::var_os("PATH").and_then(|paths| {
+                        std::env::split_paths(&paths)
+                            .map(|dir| dir.join("lake"))
+                            .find(|path| path.is_file())
+                    })
+                })
+                .ok_or_else(|| "no `lake` executable found".to_owned())?;
+            Ok(Self { lake, repo_root })
+        }
+
+        /// `lake env lean <args>` from the repository root with `stage` on `LEAN_PATH`; returns
+        /// whether it succeeded and its combined output.
+        fn lean(&self, stage: &Path, args: &[&OsStr]) -> (bool, String) {
+            let output = Command::new(&self.lake)
+                .arg("env")
+                .arg("lean")
+                .args(args)
+                .current_dir(&self.repo_root)
+                .env("LEAN_PATH", stage)
+                .output()
+                .expect("failed to spawn `lake env lean`");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            (output.status.success(), text)
+        }
+
+        /// Writes `code` to `stage/<module path>.lean` and compiles it to its `.olean`.
+        fn compile(&self, stage: &Path, module: &str, code: &str) -> (bool, String) {
+            let src = stage.join(module.split('.').collect::<PathBuf>()).with_extension("lean");
+            std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+            std::fs::write(&src, code).unwrap();
+            let olean = src.with_extension("olean");
+            let root = format!("--root={}", stage.display());
+            self.lean(stage, &[OsStr::new(&root), OsStr::new("-o"), olean.as_os_str(), src.as_os_str()])
+        }
+    }
+
+    /// Temporary staging directory outside the checkout, removed on drop unless
+    /// `ANNEAL_KEEP_LEAN_E2E_DIR` is set.
+    struct StageDir(PathBuf);
+
+    impl Drop for StageDir {
+        fn drop(&mut self) {
+            if std::env::var_os("ANNEAL_KEEP_LEAN_E2E_DIR").is_none() {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    /// 1-based line numbers of the `<file>:<line>:<col>: error` diagnostics in Lean output.
+    fn lean_error_lines(output: &str, file: &str) -> Vec<usize> {
+        output
+            .lines()
+            .filter_map(|line| {
+                let rest = line.split(file).nth(1)?.strip_prefix(':')?;
+                let (line_no, rest) = rest.split_once(':')?;
+                let (_col, rest) = rest.split_once(':')?;
+                rest.trim_start().starts_with("error").then(|| line_no.parse().ok()).flatten()
+            })
+            .collect()
+    }
+
+    /// End-to-end Lean 4 kernel check: stages emitted `Mir/<Item>.lean` modules and an emitted
+    /// `OpaqueCalleeTable` module in a temporary directory outside the checkout, compiles them
+    /// with `lake env lean` against this checkout's `.lake/build`, exercises the certificates
+    /// from a downstream driver (including their axiom footprint), and checks that certificates
+    /// for entries inconsistent with their bodies are rejected. Skips (with a message) when the
+    /// Lean build is unavailable, unless `ANNEAL_REQUIRE_LEAN_E2E` is set.
+    #[test]
+    fn e2e_lean_kernel_checks_emitted_mir_and_callee_table_modules() {
+        let lean = match LeanE2e::detect() {
+            Ok(lean) => lean,
+            Err(reason) => {
+                assert!(
+                    std::env::var_os("ANNEAL_REQUIRE_LEAN_E2E").is_none(),
+                    "Lean e2e required but unavailable: {reason}"
+                );
+                eprintln!("SKIPPED e2e_lean_kernel_checks_emitted_mir_and_callee_table_modules: {reason}");
+                return;
+            }
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stage_dir = StageDir(
+            std::env::temp_dir().join(format!("anneal-lean-emit-e2e-{}-{nanos}", std::process::id())),
+        );
+        std::fs::create_dir_all(&stage_dir.0).unwrap();
+        let stage = stage_dir.0.canonicalize().unwrap();
+        assert!(!stage.starts_with(&lean.repo_root), "staging dir must be outside the checkout");
+
+        let weird_path = "demo::we\"ird\\path\n\t\u{1}\u{7f}\u{85}é→";
+        let area_impl = trait_impl("demo::Area::area", "demo::<Square as Area>::area");
+        // (module, `lean_ident` hint, captured body)
+        let items = vec![
+            ("Mir.Demo.Leaf", "demo::leaf", fixture_mir("demo::leaf", 0, vec![], 1)),
+            ("Mir.Demo.Poly", "demo::poly", fixture_mir("demo::poly", 2, vec![], 2)),
+            (
+                "Mir.Demo.SquareArea",
+                "demo::<Square as Area>::area",
+                fixture_mir("demo::<Square as Area>::area", 0, vec![area_impl], 3),
+            ),
+            ("Mir.Demo.AreaMethod", "demo::Area::area", fixture_mir("demo::Area::area", 1, vec![], 4)),
+            ("Mir.Demo.LeafShadow", "demo::leaf", fixture_mir("demo::leaf", 0, vec![], 5)),
+            ("Mir.Demo.Collide", "demo::leaf", fixture_mir("demo::leaf_2", 0, vec![], 6)),
+            ("Mir.Demo.Weird", "end", fixture_mir(weird_path, 0, vec![], 7)),
+        ];
+        let mut entries = Vec::new();
+        for (module, hint, mir) in &items {
+            let code = emit_mir_lean_module(module, mir);
+            let (ok, out) = lean.compile(&stage, module, &code);
+            assert!(ok, "emitted {module} failed to elaborate:\n{out}\n--- source ---\n{code}");
+            entries.push(IrCalleeTableEntry::from_captured_mir(*hint, format!("{module}.body"), mir));
+        }
+        let imports: Vec<&str> = items.iter().map(|(module, _, _)| *module).collect();
+
+        let table = emit_opaque_callee_table_lean_module_with_imports("Gen.DemoCallees", &imports, &entries);
+        let names = theorem_names(&table);
+        assert_eq!(
+            names,
+            vec![
+                "cert_traitImpls",
+                "cert_lookupRaw_demo__leaf",
+                "cert_lookup_mono_demo__leaf",
+                "cert_lookupRaw_demo__poly",
+                "cert_noImpl_demo__poly",
+                "cert_lookup_free_poly_demo__poly",
+                "cert_lookupRaw_demo___Square_as_Area___area",
+                "cert_lookup_mono_demo___Square_as_Area___area",
+                "cert_lookupRaw_demo__Area__area",
+                "cert_lookupRaw_demo__leaf_1",
+                "cert_lookup_mono_demo__leaf_1",
+                "cert_lookupRaw_end_",
+                "cert_lookup_mono_end_",
+            ]
+        );
+        let (ok, out) = lean.compile(&stage, "Gen.DemoCallees", &table);
+        assert!(ok, "emitted OpaqueCalleeTable module failed to elaborate:\n{out}\n--- source ---\n{table}");
+        assert!(!out.contains("sorry"), "{out}");
+
+        let weird_chars: Vec<String> =
+            weird_path.chars().map(|c| format!("Char.ofNat {}", u32::from(c))).collect();
+        let axiom_queries: String =
+            names.iter().map(|name| format!("#print axioms Gen.DemoCallees.{name}\n")).collect();
+        let driver = format!(
+            "import Gen.DemoCallees\n\n\
+             open Trusted.Rustc.{MIR_DIALECT_V2026_06_01}.Layout\n\
+             open Trusted.Rustc.{MIR_DIALECT_V2026_06_01}.MirAst\n\
+             open Anneal.OpaqueCalleeTable\n\n\
+             -- Use-site `O(1)` rewriting with an emitted certificate.\n\
+             example (cl : LayoutTable) :\n    \
+             Gen.DemoCallees.table.lookup cl \"demo::leaf\" [] [] = some Mir.Demo.Leaf.body := by\n  \
+             rw [Gen.DemoCallees.cert_lookup_mono_demo__leaf]\n\n\
+             -- Captured def paths survive Lean string escaping character-for-character.\n\
+             example : (Mir.Demo.Weird.body).defPath.toList = [{}] := by decide +kernel\n\n\
+             {axiom_queries}",
+            weird_chars.join(", ")
+        );
+        let driver_path = stage.join("Driver.lean");
+        std::fs::write(&driver_path, &driver).unwrap();
+        let (ok, out) = lean.lean(&stage, &[driver_path.as_os_str()]);
+        assert!(ok, "driver failed:\n{out}\n--- source ---\n{driver}");
+        assert!(!out.contains("error") && !out.contains("sorry"), "{out}");
+        let axiom_reports =
+            out.matches("depends on axioms").count() + out.matches("does not depend on any axioms").count();
+        assert_eq!(axiom_reports, names.len(), "{out}");
+        for forbidden in ["sorryAx", "Classical.choice", "Lean.ofReduceBool", "Lean.trustCompiler"] {
+            assert!(!out.contains(forbidden), "a certificate depends on {forbidden}:\n{out}");
+        }
+
+        // Negative controls: certificates for entries inconsistent with the bodies they name
+        // (wrong `defPath`, wrong `typeParamCount`) are rejected, never silently accepted.
+        let bad_entries = vec![
+            IrCalleeTableEntry {
+                def_path: "demo::leaf".to_owned(),
+                ..IrCalleeTableEntry::from_captured_mir("bad_path", "Mir.Demo.Poly.body", &items[1].2)
+            },
+            IrCalleeTableEntry {
+                type_param_count: 0,
+                ..IrCalleeTableEntry::from_captured_mir("bad_arity", "Mir.Demo.AreaMethod.body", &items[3].2)
+            },
+        ];
+        let bad = emit_opaque_callee_table_lean_module_with_imports("Gen.BadCallees", &imports, &bad_entries);
+        let bad_path = stage.join("BadCallees.lean");
+        std::fs::write(&bad_path, &bad).unwrap();
+        let (ok, out) = lean.lean(&stage, &[bad_path.as_os_str()]);
+        assert!(!ok, "inconsistent certificates were accepted:\n{out}\n--- source ---\n{bad}");
+        for unexpected in ["unknown identifier", "unknown constant", "unexpected token", "unknown namespace"] {
+            assert!(!out.contains(unexpected), "negative control failed for the wrong reason:\n{out}");
+        }
+        let error_lines = lean_error_lines(&out, "BadCallees.lean");
+        let lines: Vec<&str> = bad.lines().collect();
+        for name in ["cert_lookupRaw_bad_path", "cert_lookup_mono_bad_arity"] {
+            let start = 1 + lines.iter().position(|line| line.starts_with(&format!("theorem {name} "))).unwrap();
+            let end = start + lines[start..].iter().position(|line| line.is_empty()).unwrap();
+            assert!(
+                error_lines.iter().any(|line| (start..=end).contains(line)),
+                "no error reported inside {name} (lines {start}..={end}):\n{out}\n--- source ---\n{bad}"
+            );
+        }
     }
 }

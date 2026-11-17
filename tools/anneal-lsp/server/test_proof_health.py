@@ -4013,6 +4013,7 @@ class TestA4FinalHardening(unittest.TestCase):
 
 R6 = proof_health.RULE_UNPINNED_OR_DRIFTED_WAIVER
 R7 = proof_health.RULE_TRIVIAL_OR_VACUOUS_CLAIM
+R8 = proof_health.RULE_REDUNDANT_BEQ_DECIDABLE_EQ
 CHECK_TRUSTED_PATH = REPO_ROOT / "trusted" / "audit" / "check_trusted.py"
 _SHARED_BEGIN = "# ===========================================================================\n# BEGIN SHARED WAIVER-PIN & 3-AXIS AUDITOR\n"
 _SHARED_END = "# END SHARED WAIVER-PIN & 3-AXIS AUDITOR\n# ===========================================================================\n"
@@ -4069,11 +4070,12 @@ class TestRules6And7Integration(unittest.TestCase):
 
     def test_rule_registry_and_cache_format_version(self) -> None:
         self.assertEqual(proof_health.ALL_RULES[:5], (R1, R2, R3, R4, R5))
-        self.assertEqual(proof_health.ALL_RULES[5:], (R6, R7))
-        self.assertGreaterEqual(proof_health.CACHE_FORMAT_VERSION, 7)
+        self.assertEqual(proof_health.ALL_RULES[5:], (R6, R7, R8))
+        self.assertGreaterEqual(proof_health.CACHE_FORMAT_VERSION, 8)
         counts = proof_health.count_findings_by_rule([])
         self.assertEqual(counts[R6], 0)
         self.assertEqual(counts[R7], 0)
+        self.assertEqual(counts[R8], 0)
 
     def test_rule6_waiver_subrules_in_scan_lean_text(self) -> None:
         pinned = pin_lean_decl(_PINNED_DOC, "def pinnedMagic : Nat := 7\n")
@@ -5039,6 +5041,422 @@ class TestA4MultiDocstringInPrefixesAndOperatorTriviality(unittest.TestCase):
                 _rules(proof_health.audit_lean_text(src, vacuity_scope="annotated")),
                 hyp,
             )
+
+
+class TestRule8RedundantBeqDecidableEq(unittest.TestCase):
+    """Rule 8 (`redundant_beq_decidable_eq`): Lean 4.34.1 `deriving` clauses and
+    `deriving [noncomputable] instance ... for ...` commands combining `BEq` and `DecidableEq`."""
+
+    def setUp(self) -> None:
+        proof_health.clear_in_process_caches()
+
+    @staticmethod
+    def _scan8(src: str, **kw) -> list[proof_health.ProofHealthFinding]:
+        return [
+            f
+            for f in proof_health.scan_lean_text(src, scan_siblings=False, **kw)
+            if f.rule == R8
+        ]
+
+    def test_inline_decl_forms_and_multiline_deriving(self) -> None:
+        src = (
+            "inductive Packet where\n"
+            "  | a\n"
+            "  deriving BEq, DecidableEq\n"
+            "@[ext]\n"
+            "protected structure Ns.Header.{u} (α : Type u) [DecidableEq α] extends Base α where\n"
+            "  mk ::\n"
+            "  x : α\n"
+            "  deriving Repr,\n"
+            "    DecidableEq,\n"
+            "    BEq, Hashable\n"
+            "class HasTag (α : Type) where\n"
+            "  tag : Nat\n"
+            "  deriving DecidableEq, BEq\n"
+            "class inductive ClsInd : Type where\n"
+            "  | intro\n"
+            "  deriving BEq, DecidableEq\n"
+            "coinductive CoStream where\n"
+            "  | step\n"
+            "  deriving BEq, DecidableEq\n"
+            "def MyId := Nat\n"
+            "  deriving BEq, DecidableEq\n"
+            "abbrev MyAlias := Nat\n"
+            "  deriving DecidableEq, BEq\n"
+        )
+        got = [(f.line, f.symbol) for f in self._scan8(src)]
+        self.assertEqual(
+            got,
+            [
+                (3, "Packet"),
+                (8, "Ns.Header"),
+                (13, "HasTag"),
+                (16, "ClsInd"),
+                (19, "CoStream"),
+                (21, "MyId"),
+                (23, "MyAlias"),
+            ],
+        )
+        sample = self._scan8(src)[0]
+        self.assertIn("instBEqOfDecidableEq", sample.message)
+        self.assertIn("LawfulBEq", sample.message)
+        self.assertIn("Remove `BEq`", sample.suggestion)
+        self.assertIn("DecidableEq", sample.suggestion)
+
+    def test_mutual_block_and_orphan_fallback_symbol(self) -> None:
+        src = (
+            "mutual\n"
+            "  inductive Even where\n"
+            "    | zero\n"
+            "    | succ : Odd → Even\n"
+            "    deriving BEq, DecidableEq\n"
+            "  inductive CleanMid where\n"
+            "    | one\n"
+            "    deriving DecidableEq, Repr\n"
+            "  inductive Odd where\n"
+            "    | succ : Even → Odd\n"
+            "    deriving DecidableEq, BEq\n"
+            "end\n"
+            "theorem boundary : True := trivial\n"
+            "deriving BEq, DecidableEq\n"
+        )
+        self.assertEqual(
+            [(f.line, f.symbol) for f in self._scan8(src)],
+            [(5, "Even"), (11, "Odd"), (14, "BEq,DecidableEq")],
+        )
+
+    def test_deriving_instance_and_noncomputable_instance_targets(self) -> None:
+        src = (
+            "deriving instance BEq, DecidableEq for Foo, Bar\n"
+            "deriving noncomputable instance DecidableEq, BEq for Option α, (Prod β γ), List (Option δ), Vec [Inhabited α] {n : Nat}\n"
+            "deriving noncomputable instance BEq for Baz\n"
+            "deriving noncomputable instance DecidableEq for Baz\n"
+            "deriving instance BEq, DecidableEq\n"
+        )
+        self.assertEqual(
+            [(f.line, f.symbol) for f in self._scan8(src)],
+            [
+                (1, "Foo,Bar"),
+                (2, "Option,Prod,List,Vec"),
+                (5, "BEq,DecidableEq"),
+            ],
+        )
+
+    def test_expose_attr_qualified_guillemet_and_class_term_arguments(self) -> None:
+        src = (
+            "inductive A where | a\n"
+            "  deriving @[expose] BEq, DecidableEq\n"
+            "inductive B where | b\n"
+            "  deriving Repr, @[expose] DecidableEq, @[expose] BEq\n"
+            "deriving instance @[expose] «BEq», _root_.DecidableEq for «TargetC»\n"
+            "deriving noncomputable instance @[expose] Not.«DecidableEq», ((_root_.«BEq»)) for D\n"
+            "def M := ReaderT Nat Id\n"
+            "  deriving MonadReader Nat, Handler [o1, o2] ⟨a, b⟩ {c} ⦃d⦄ 42 \"cfg\" r#\"raw\"# 'x' ``SomeName @explicit, (BEq), (DecidableEq)\n"
+            "-- Negative controls below:\n"
+            "inductive E where | e\n"
+            "  deriving @[expose] BEq\n"
+            "@[expose] def notAClass : Nat := 1\n"
+            "inductive F where | f\n"
+            "  deriving @[expose] DecidableEq\n"
+            "inductive G where | g\n"
+            "  deriving «Not.BEq», DecidableEq\n"
+            "inductive H where | h\n"
+            "  deriving MyTrait DecidableEq, BEq\n"
+            "structure S where\n"
+            "  x : Nat\n"
+            "  deriving BEq\n"
+            "omit [DecidableEq α] in\n"
+            "theorem t : True := trivial\n"
+            "inductive K where | k\n"
+            "  deriving BEq\n"
+            "unknownCol0Macro arg1, DecidableEq\n"
+            "def nameLit := `deriving\n"
+            "def derivingBEq := DecidableEq\n"
+        )
+        self.assertEqual(
+            [(f.line, f.symbol) for f in self._scan8(src)],
+            [
+                (2, "A"),
+                (4, "B"),
+                (5, "TargetC"),
+                (6, "D"),
+                (8, "M"),
+            ],
+        )
+
+    def test_comments_docstrings_strings_raw_strings_chars_and_interpolations(self) -> None:
+        # Purely commented/quoted occurrences must produce 0 findings.
+        clean = (
+            "-- deriving BEq, DecidableEq\n"
+            "/- outer /- inner deriving BEq, DecidableEq -/ deriving BEq, DecidableEq -/\n"
+            "/-- doc /- nested -/ still doc deriving BEq, DecidableEq -/\n"
+            'def s1 := "deriving BEq, DecidableEq -- /- not a comment"\n'
+            'def s2 := "escaped \\" quote deriving BEq, DecidableEq"\n'
+            'def s3 := r#"deriving BEq, DecidableEq " still raw"#\n'
+            'def s4 := s!"deriving {"BEq"}, DecidableEq {1 + 1}"\n'
+            'def s5 := custom!"hole {\'{\'} {\'\\\'\'} {\'"\'} {\'\\u{7d}\'} {r#"{"#} {«{»} {m!"in {\'}\'}"} deriving BEq, DecidableEq"\n'
+            "def «deriving BEq, DecidableEq» : Nat := 1\n"
+            "inductive OnlyDecEq where | a\n"
+            "  deriving DecidableEq, Repr\n"
+            "inductive OnlyBeq where | b\n"
+            "  deriving BEq, Hashable\n"
+        )
+        self.assertEqual(self._scan8(clean), [])
+
+        # Tricky quotes/interpolations/adjacent char literals followed by a real finding
+        # must preserve exact line numbers and enclosing type names.
+        mixed = (
+            clean
+            + "def adjChars := ('a''\"', '\\'', '\\\"', '«', st'')\n"
+            + "inductive RealAfterTricky where\n"
+            + "  | mk\n"
+            + "  deriving BEq, DecidableEq\n"
+        )
+        expected_line = mixed.count("\n")  # `deriving BEq, DecidableEq` is on the final line
+        self.assertEqual(
+            [(f.line, f.symbol) for f in self._scan8(mixed)],
+            [(expected_line, "RealAfterTricky")],
+        )
+
+    def test_post_edit_deltas_and_v7_cache_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "cache.json"
+            lean = Path(tmp) / "Model.lean"
+
+            # 1. Introducing `BEq` alongside `DecidableEq` triggers a `+1` warning.
+            before = "inductive Flag where\n  | on | off\n  deriving DecidableEq, Repr\n"
+            after = "inductive Flag where\n  | on | off\n  deriving BEq, DecidableEq, Repr\n"
+            lean.write_text(after, encoding="utf-8")
+            res = proof_health.evaluate_post_edit_proof_health(
+                lean, None, after_text=after, before_text=before, cache_path=cache, scan_siblings=False
+            )
+            self.assertEqual(res["deltas"][R8], 1)
+            self.assertIn(R8, res["feedback"])
+            self.assertEqual([(f.line, f.symbol) for f in res["new_findings"]], [(3, "Flag")])
+
+            # 2. Multiline edit where `DecidableEq` is appended on the line below `deriving BEq,`.
+            ml_before = "structure Box where\n  v : Nat\n  deriving BEq,\n    Repr\n"
+            ml_after = "structure Box where\n  v : Nat\n  deriving BEq,\n    DecidableEq\n"
+            lean.write_text(ml_after, encoding="utf-8")
+            ml_res = proof_health.evaluate_post_edit_proof_health(
+                lean,
+                {"tool_input": {"Target": "    Repr", "Replacement": "    DecidableEq"}},
+                after_text=ml_after,
+                before_text=ml_before,
+                cache_path=cache,
+                scan_siblings=False,
+            )
+            self.assertEqual(ml_res["deltas"][R8], 1)
+            self.assertEqual([(f.line, f.symbol) for f in ml_res["new_findings"]], [(3, "Box")])
+
+            # 3. Unrelated edit on a file that already has a finding produces `""`.
+            unrelated = ml_after + "def helper : Nat := 7\n"
+            lean.write_text(unrelated, encoding="utf-8")
+            self.assertEqual(
+                proof_health.check_post_edit_proof_health(
+                    lean,
+                    None,
+                    after_text=unrelated,
+                    before_text=ml_after,
+                    cache_path=cache,
+                    scan_siblings=False,
+                ),
+                "",
+            )
+
+            # 4. Removing `BEq` (`deltas[R8] == -1`) produces `""`.
+            fixed = unrelated.replace("deriving BEq,\n    DecidableEq", "deriving DecidableEq")
+            lean.write_text(fixed, encoding="utf-8")
+            fix_res = proof_health.evaluate_post_edit_proof_health(
+                lean, None, after_text=fixed, before_text=unrelated, cache_path=cache, scan_siblings=False
+            )
+            self.assertEqual(fix_res["deltas"][R8], -1)
+            self.assertEqual(fix_res["feedback"], "")
+
+            # 5. Stale `_ver = 7` cache entry (missing `R8` key) must NOT treat pre-existing
+            # `deriving BEq, DecidableEq` as newly introduced on an unrelated edit.
+            legacy = Path(tmp) / "Legacy.lean"
+            legacy_before = "inductive Old where | a\n  deriving BEq, DecidableEq\ndef k : Nat := 1\n"
+            legacy_after = "inductive Old where | a\n  deriving BEq, DecidableEq\ndef k : Nat := 2\n"
+            legacy.write_text(legacy_after, encoding="utf-8")
+            cache.write_text(
+                json.dumps(
+                    {
+                        str(legacy.resolve()): {
+                            r: 0
+                            for r in proof_health.ALL_RULES
+                            if r != R8
+                        }
+                        | {
+                            "_len": len(legacy_before),
+                            "_crc": proof_health.zlib.crc32(legacy_before.encode("utf-8")),
+                            "_sib": proof_health.zlib.crc32(b""),
+                            "_ver": 7,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            mig = proof_health.evaluate_post_edit_proof_health(
+                legacy,
+                {"tool_input": {"Target": ":= 1", "Replacement": ":= 2"}},
+                after_text=legacy_after,
+                cache_path=cache,
+                scan_siblings=False,
+            )
+            self.assertEqual(mig["deltas"][R8], 0)
+            self.assertEqual(mig["feedback"], "")
+
+    def test_cli_and_json_report_for_rule8(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "BadDeriving.lean"
+            p.write_text("structure BadDeriving where\n  x : Nat\n  deriving BEq, DecidableEq\n", encoding="utf-8")
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                rc = proof_health.main(["--json", str(p)])
+            self.assertEqual(rc, 1)
+            payload = json.loads(buf.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["counts"][R8], 1)
+            self.assertEqual(payload["findings"][0]["rule"], R8)
+            self.assertEqual(payload["findings"][0]["symbol"], "BadDeriving")
+            self.assertEqual(payload["findings"][0]["line"], 3)
+
+            txt_buf = io.StringIO()
+            with patch("sys.stdout", txt_buf):
+                self.assertEqual(proof_health.main([str(p)]), 1)
+            self.assertIn(f"[{R8}] (BadDeriving)", txt_buf.getvalue())
+
+    def test_incremental_splicing_exact_agreement_for_rule8(self) -> None:
+        import random
+
+        head = (
+            "inductive HeadBad where\n  | h\n  deriving BEq, DecidableEq\n\n"
+            + "".join(f"theorem hpad{i} (n : Nat) : n + 0 = n := Nat.add_zero n\n\n" for i in range(320))
+        )
+        mid = (
+            "theorem anchor_before (n : Nat) : n + 0 = n := Nat.add_zero n\n\n"
+            "structure MidClean where\n  x : Nat\n  deriving DecidableEq, Repr\n\n"
+            "theorem anchor_after (n : Nat) : n + 0 = n := Nat.add_zero n\n\n"
+        )
+        tail = (
+            "".join(f"theorem tpad{i} (n : Nat) : n + 0 = n := Nat.add_zero n\n\n" for i in range(320))
+            + "deriving noncomputable instance @[expose] BEq, DecidableEq for TailA, TailB\n"
+        )
+        base = head + mid + tail
+        self.assertGreaterEqual(len(base), 32768)
+
+        spliced_windows: list[bool] = []
+        orig_win = proof_health._find_incremental_lean_window
+
+        def spy_win(*args, **kwargs):
+            res = orig_win(*args, **kwargs)
+            spliced_windows.append(res is not None)
+            return res
+
+        def check_matches_cold(candidate: str) -> list[proof_health.ProofHealthFinding]:
+            inc = proof_health.scan_lean_text(candidate, file_path="BigDeriving.lean", scan_siblings=False)
+            saved = dict(proof_health._LAST_LEAN_SCAN)
+            proof_health.clear_in_process_caches()
+            cold = proof_health.scan_lean_text(candidate, file_path="BigDeriving.lean", scan_siblings=False)
+            proof_health._LAST_LEAN_SCAN.update(saved)
+            self.assertEqual(inc, cold)
+            return inc
+
+        with patch.object(proof_health, "_find_incremental_lean_window", spy_win):
+            proof_health.clear_in_process_caches()
+            init = proof_health.scan_lean_text(base, file_path="BigDeriving.lean", scan_siblings=False)
+            self.assertEqual([(f.symbol) for f in init if f.rule == R8], ["HeadBad", "TailA,TailB"])
+
+            # 1. Mutate `MidClean` inside the splice window to add `BEq` + extra lines (shifting `TailA,TailB`).
+            e1 = base.replace(
+                "structure MidClean where\n  x : Nat\n  deriving DecidableEq, Repr",
+                "structure MidDirty where\n  x : Nat\n  y : Nat\n  deriving @[expose] BEq,\n    DecidableEq, Repr",
+                1,
+            )
+            got1 = [f for f in check_matches_cold(e1) if f.rule == R8]
+            self.assertEqual([f.symbol for f in got1], ["HeadBad", "MidDirty", "TailA,TailB"])
+            self.assertTrue(spliced_windows[-1], "expected active incremental splice")
+
+            # 2. Add `deriving noncomputable instance` inside the splice window.
+            e2 = e1.replace(
+                "theorem anchor_after",
+                "deriving noncomputable instance BEq, _root_.DecidableEq for (WinT α), WinU\n\ntheorem anchor_after",
+                1,
+            )
+            got2 = [f for f in check_matches_cold(e2) if f.rule == R8]
+            self.assertEqual([f.symbol for f in got2], ["HeadBad", "MidDirty", "WinT,WinU", "TailA,TailB"])
+            self.assertTrue(spliced_windows[-1], "expected active incremental splice")
+
+            # 3. Introduce an interpolated string containing `'\"'` inside the window (must fall back cleanly).
+            e3 = e2.replace(
+                "theorem anchor_before (n : Nat) : n + 0 = n := Nat.add_zero n",
+                'def trickyInterp := s!"quote: {\'"\'}"\ntheorem anchor_before (n : Nat) : n + 0 = n := Nat.add_zero n',
+                1,
+            )
+            got3 = [f for f in check_matches_cold(e3) if f.rule == R8]
+            self.assertEqual([f.symbol for f in got3], ["HeadBad", "MidDirty", "WinT,WinU", "TailA,TailB"])
+
+            # 4. Fix `MidDirty` back to `DecidableEq` only.
+            e4 = e2.replace("deriving @[expose] BEq,\n    DecidableEq, Repr", "deriving DecidableEq, Repr", 1)
+            got4 = [f for f in check_matches_cold(e4) if f.rule == R8]
+            self.assertEqual([f.symbol for f in got4], ["HeadBad", "WinT,WinU", "TailA,TailB"])
+
+            # 5. Seeded random edits mixing `deriving`, structures, comments, strings, and interpolations.
+            rnd = random.Random(20261117)
+            mutations = [
+                "\ninductive RndInd where | a\n  deriving BEq, DecidableEq\n",
+                "\nstructure RndStruct where\n  v : Nat\n  deriving @[expose] DecidableEq, BEq\n",
+                "\nderiving instance BEq, DecidableEq for RndTarget\n",
+                "\n-- deriving BEq, DecidableEq\n",
+                '\ndef rndStr := s!"{\'\\\'\'} {\'"\'} deriving BEq, DecidableEq"\n',
+            ]
+            cur_txt = base
+            proof_health.clear_in_process_caches()
+            proof_health.scan_lean_text(cur_txt, file_path="BigDeriving.lean", scan_siblings=False)
+            for step in range(15):
+                idx = rnd.randrange(50, 270)
+                target_thm = f"theorem hpad{idx} (n : Nat) : n + 0 = n := Nat.add_zero n"
+                if target_thm in cur_txt:
+                    cur_txt = cur_txt.replace(target_thm, target_thm + rnd.choice(mutations), 1)
+                    check_matches_cold(cur_txt)
+
+    def test_clean_scan_latency_and_repo_consistency(self) -> None:
+        # 1. Episode 1/2 target Lean files must be 100% clean under all 8 rules and scan in <5 ms warm
+        # (and Rule 8 pass itself in <2 ms on 250 KiB files).
+        for rel in (
+            "theory/Anneal/OpaqueCalleeTable.lean",
+            "theory/Anneal/CompilerQueryEnv.lean",
+            "tests/mir/CompilerQueryAndOpaqueCalleeTests.lean",
+        ):
+            p = REPO_ROOT / rel
+            if not p.is_file():
+                continue
+            self.assertEqual(proof_health.scan_lean_file(p), [], rel)
+            txt = p.read_text(encoding="utf-8")
+            stripped, _ = proof_health._scan_lean_comments_and_strings(txt)
+            r8_ms = best_of_ms(
+                lambda t=txt, s=stripped: proof_health._scan_redundant_beq_decidable_eq(
+                    t, s, proof_health._LineCounter(s)
+                ),
+                budget_ms=2.0,
+            )
+            self.assertLess(r8_ms, 5.0, f"{rel} Rule 8 scan took {r8_ms:.2f} ms")
+
+        # 2. Known redundant `BEq + DecidableEq` clauses in `theory/Correspondence/` are detected with
+        # exact enclosing / target type symbols.
+        fw = REPO_ROOT / "theory" / "Correspondence" / "Framework.lean"
+        if fw.is_file():
+            fw_syms = [f.symbol for f in proof_health.scan_lean_file(fw) if f.rule == R8]
+            self.assertEqual(
+                fw_syms,
+                ["AnnealVer", "MiniRustSnap", "SemanticLayer", "ExpectedTier"],
+            )
+        for ver in ("V2026_06_01", "V2026_08_01"):
+            tb = REPO_ROOT / "theory" / "Correspondence" / ver / "L4_TreeBorrows.lean"
+            if tb.is_file():
+                tb_syms = [f.symbol for f in proof_health.scan_lean_file(tb) if f.rule == R8]
+                self.assertEqual(tb_syms, ["TreeBorrowPerm", "TbAccessKind", "TbLocality"], ver)
 
 
 if __name__ == "__main__":
