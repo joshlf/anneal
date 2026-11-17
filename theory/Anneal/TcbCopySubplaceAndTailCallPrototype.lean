@@ -1426,8 +1426,26 @@ def evalCopyNonOverlappingPermOkProto
                 (effDstLocalPlaceTy : Option Ty)
                 (effDstIsAdt : Bool) :
                 MirStepNode :=
+              let srcContainerTy : Option Ty :=
+                match get? locals₃ srcEntry.targetLocal with
+                | .some _ =>
+                  placeTy localDecls layouts
+                    { local_ := srcEntry.targetLocal, projection := srcParentProj }
+                | .none => .none
+              let srcIsNonArrayAdtOrTuple : Bool :=
+                match srcContainerTy with
+                | .some { kind := .adt _ _, .. } => true
+                | .some { kind := .tuple _, .. } => true
+                | _ => false
+              let srcCanSliceElems : Bool :=
+                match srcIsArraySlice, Bool.not srcIsNonArrayAdtOrTuple, srcSubVal with
+                | true, true, .aggregate 0 srcElems =>
+                  match copyElemSzOpt with
+                  | .some elemSz => elemsMatchByteStride srcElems elemSz
+                  | .none => true
+                | _, _, _ => false
               let srcEffProj : List ProjectionElem :=
-                match srcIsArraySlice, srcSubVal with
+                match srcCanSliceElems, srcSubVal with
                 | true, .aggregate 0 srcElems =>
                   copySliceWindowProj srcParentProj effSrcStart n (length srcElems)
                 | _, _ => srcEntry.targetProjection
@@ -1449,8 +1467,8 @@ def evalCopyNonOverlappingPermOkProto
               | true => MirStepNode.fail .ub
               | false =>
                 let srcSliceVal : Option Value :=
-                  match srcSubVal with
-                  | .aggregate 0 srcElems =>
+                  match srcCanSliceElems, srcSubVal with
+                  | true, .aggregate 0 srcElems =>
                     match Nat.ble (Nat.add effSrcStart n) (length srcElems) with
                     | true =>
                       .some (.aggregate 0 (takeValues n (dropValues effSrcStart srcElems)))
@@ -1458,7 +1476,7 @@ def evalCopyNonOverlappingPermOkProto
                       match Bool.and (Nat.beq effSrcStart 0) (Nat.beq n 1) with
                       | true => .some srcSubVal
                       | false => .none
-                  | _ =>
+                  | _, _ =>
                     match Nat.beq effSrcStart 0 with
                     | true => .some srcSubVal
                     | false => .none

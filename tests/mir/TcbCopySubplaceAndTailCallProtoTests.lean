@@ -1406,6 +1406,40 @@ theorem canary_bug1_dst_bytes_never_misplaced :
         .init (.ptr { allocId := 91, offsetBytes := 0 } 8)] := by
   exact ⟨rfl, rfl, rfl, rfl⟩
 
+/--
+Canary 4S (Source aggregates in `copyViaBytes` are never sliced by element offset
+when they are structs/tuples or have mismatched element stride):
+1. `copy_nonoverlapping::<u8>((&raw const t as *const u8).add(1), &raw mut y, 1)`
+   with `t : T` (`#[repr(C)] struct T { x: u32, y: u8 }`, `t.x = 7`, `t.y = 9`, `8` bytes
+   in `b3Layouts`) and `y : u8`: B4 (`090fd2fa`) treated `t = .aggregate 0 [mkU32 7, mkU8 9]`
+   as a 2-element array, sliced element `1` (`mkU8 9`), and silently wrote `y = 9`
+   (`t.y` at byte offset `4`) instead of byte `1` of `t.x`. Now fails closed with
+   `MirStepNode.unsupported` (while `srcOff = 8` past `t` faults with `MirStepNode.fail .ub`).
+2. `copy_nonoverlapping::<u8>(&raw const pair as *const u8, &raw mut word as *mut u8, 4)`
+   with `pair : T` holding two `u16`s (`.aggregate 0 [0x0201u16, 0x0403u16]`, 4 bytes) and
+   `word : u32`: B4 (`090fd2fa`) tried to take `n = 4` elements out of the 2-field aggregate
+   (`4 <= 2` false) and failed with `.unsupported`. Now reads the whole aggregate at
+   `effSrcStart = 0`, encodes its 4 bytes, and writes `word = 0x04030201`.
+-/
+theorem canary_bug1_struct_source_offset_never_slices_fields :
+    let tTy : Ty := { kind := .adt "T" [], layoutIdx := 0 }
+    let u8Ty : Ty := { kind := .uint .u8, layoutIdx := noLayout }
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := noLayout }
+    let tVal : Value := .aggregate 0 [mkU32 7, mkU8 9]
+    let pairU16Val : Value :=
+      .aggregate 0 [.scalar { bits := 0x0201, sizeBytes := 2 }, .scalar { bits := 0x0403, sizeBytes := 2 }]
+    b3Copy tTy u8Ty (.uint .u8) tVal (mkU8 0) 0 [] 1 1 [] 0 1 =
+      MirStepNode.unsupported ∧
+    b3Copy tTy u8Ty (.uint .u8) tVal (mkU8 0) 0 [] 8 1 [] 0 1 =
+      MirStepNode.fail .ub ∧
+    stepLocals? (b3Copy tTy u32Ty (.uint .u8) pairU16Val (mkU32 0) 0 [] 0 1 [] 0 4) =
+      .some [
+        .init pairU16Val,
+        .init (mkU32 0x04030201),
+        .init (.ptr { allocId := 90, offsetBytes := 0 } 8),
+        .init (.ptr { allocId := 91, offsetBytes := 0 } 8)] := by
+  exact ⟨rfl, rfl, rfl⟩
+
 /-! ## 5. Conservativity Canaries (the prototype is `Trusted` wherever no repair applies) -/
 
 open TailCallCallerReferentWitnesses in
@@ -1484,6 +1518,7 @@ theorem canary_conservativity_use_keeps_tree_borrows_read :
 #print axioms canary_bug1_empty_array_oob_and_zst_mismatch
 #print axioms canary_bug1_zst_nonzero_aligned_offset_and_oob
 #print axioms canary_bug1_dst_bytes_never_misplaced
+#print axioms canary_bug1_struct_source_offset_never_slices_fields
 #print axioms canary_bug4_opaque_alias_field_shell_uses_cast_type
 #print axioms canary_bug4_call_destination_and_binop_move_opaqueCast
 #print axioms canary_conservativity_use_keeps_tree_borrows_read
