@@ -12255,71 +12255,117 @@ theorem execCfg_lookupSwitchTarget_of_matchSwitchCases {cfg : MirCfg} {joinBb : 
     · cases hCases
 
 /-- Path-splitting fallback for an unhinted N-way `switchTable`: evaluates each `(caseVal, targetBb)`
-    and finally `otherwiseBb`, threading the append-only `SymTable` through `combineSplit`. -/
-def evalSwitchTableSplit (evalBlock : BlockId → SymTable → Option (List SymId × SymTable)) :
+    under **that case's path condition** `discrId == wrap64 caseVal` (the same interned
+    `.op2 .eq discrId (.const caseVal)` node `symExecSwitchTableJoin` uses for merged arms), and
+    finally `otherwiseBb` under the outer `pc`, threading the append-only `SymTable` through
+    `combineSplit` (the N-way analogue of the `some (condId, true/false)` split of `switchInt`). -/
+def evalSwitchTableSplit
+    (evalBlock : BlockId → SymTable → PathCond → Option (List SymId × SymTable))
+    (discrId : SymId) (pc : PathCond) :
     List (Nat × BlockId) → BlockId → SymTable → Option (List SymId × SymTable)
-  | [], otherwiseBb, tbl => evalBlock otherwiseBb tbl
-  | (_, targetBb) :: rest, otherwiseBb, tbl =>
-    combineSplit (evalBlock targetBb tbl)
-      (fun tblT => evalSwitchTableSplit evalBlock rest otherwiseBb tblT)
+  | [], otherwiseBb, tbl => evalBlock otherwiseBb tbl pc
+  | (caseVal, targetBb) :: rest, otherwiseBb, tbl =>
+    let resC := internNode tbl (.const caseVal)
+    let resEq := internNode resC.2 (.op2 .eq discrId resC.1)
+    combineSplit (evalBlock targetBb resEq.2 (some (resEq.1, true)))
+      (fun tblT => evalSwitchTableSplit evalBlock discrId pc rest otherwiseBb tblT)
 
 theorem evalSwitchTableSplit_sound {cfg : MirCfg} {fuel : Nat} {st₂ : CanonState SymId}
-    {pc : PathCond} {evalBlock : BlockId → SymTable → Option (List SymId × SymTable)} :
-    ∀ (cases : List (Nat × BlockId)) (otherwiseBb : BlockId) (tbl₁ : SymTable)
-      (rets : List SymId) (tbl' : SymTable),
-      (∀ (targetBb : BlockId) (tblIn : SymTable) (retsOut : List SymId) (tblOut : SymTable),
+    {pc : PathCond} {discrId : SymId}
+    {evalBlock : BlockId → SymTable → PathCond → Option (List SymId × SymTable)}
+    (hBlockSound : ∀ (targetBb : BlockId) (tblIn : SymTable) (pcIn : PathCond)
+        (retsOut : List SymId) (tblOut : SymTable),
         ValidTable tblIn → ValidSymCanonState tblIn.nodes.length st₂ →
-        PathCondValid tblIn.nodes.length pc →
-        evalBlock targetBb tblIn = some (retsOut, tblOut) →
+        PathCondValid tblIn.nodes.length pcIn →
+        evalBlock targetBb tblIn pcIn = some (retsOut, tblOut) →
         ValidTable tblOut ∧ tblIn.Extends tblOut ∧ (∀ r ∈ retsOut, r < tblOut.nodes.length) ∧
           ∀ (env : SymEnv) (cst₂ : CanonState Nat),
-            PathCondHolds tblIn env pc →
+            PathCondHolds tblIn env pcIn →
             StateRefines (evalSymCanonState tblIn env st₂) cst₂ →
-            ∃ r ∈ retsOut, execCfg cfg fuel targetBb cst₂ = .ret (evalSymId tblOut env r)) →
+            ∃ r ∈ retsOut, execCfg cfg fuel targetBb cst₂ = .ret (evalSymId tblOut env r)) :
+    ∀ (cases : List (Nat × BlockId)) (otherwiseBb : BlockId) (tbl₁ : SymTable)
+      (rets : List SymId) (tbl' : SymTable),
       ValidTable tbl₁ →
       ValidSymCanonState tbl₁.nodes.length st₂ →
       PathCondValid tbl₁.nodes.length pc →
-      evalSwitchTableSplit evalBlock cases otherwiseBb tbl₁ = some (rets, tbl') →
+      discrId < tbl₁.nodes.length →
+      evalSwitchTableSplit evalBlock discrId pc cases otherwiseBb tbl₁ = some (rets, tbl') →
       ValidTable tbl' ∧ tbl₁.Extends tbl' ∧ (∀ r ∈ rets, r < tbl'.nodes.length) ∧
-        ∀ (w : Nat) (env : SymEnv) (cst₂ : CanonState Nat),
+        ∀ (env : SymEnv) (cst₂ : CanonState Nat),
           PathCondHolds tbl₁ env pc →
           StateRefines (evalSymCanonState tbl₁ env st₂) cst₂ →
           ∃ r ∈ rets,
-            execCfg cfg fuel (lookupCfgSwitchTarget w cases otherwiseBb) cst₂ =
+            execCfg cfg fuel
+                (lookupCfgSwitchTarget (evalSymId tbl₁ env discrId) cases otherwiseBb) cst₂ =
               .ret (evalSymId tbl' env r)
-  | [], otherwiseBb, tbl₁, rets, tbl', hBlockSound, hV₁, hS₁, hP₁, hSplit => by
-    rcases hBlockSound otherwiseBb tbl₁ rets tbl' hV₁ hS₁ hP₁ hSplit with ⟨hV', hE', hLt', hEv'⟩
-    refine ⟨hV', hE', hLt', ?_⟩
-    intro _ env cst₂ hPc hR
-    exact hEv' env cst₂ hPc hR
-  | (caseVal, targetBb) :: rest, otherwiseBb, tbl₁, rets, tbl', hBlockSound, hV₁, hS₁, hP₁, hSplit => by
+  | [], otherwiseBb, tbl₁, rets, tbl', hV₁, hS₁, hP₁, _, hSplit => by
+    rcases hBlockSound otherwiseBb tbl₁ pc rets tbl' hV₁ hS₁ hP₁ hSplit with ⟨hV', hE', hLt', hEv'⟩
+    exact ⟨hV', hE', hLt', fun env cst₂ hPc hR => hEv' env cst₂ hPc hR⟩
+  | (caseVal, targetBb) :: rest, otherwiseBb, tbl₁, rets, tbl', hV₁, hS₁, hP₁, hD₁, hSplit => by
+    let resC := internNode tbl₁ (.const caseVal)
+    have hNodeC : ValidNode tbl₁.nodes.length (.const caseVal) := trivial
+    have hVC := internNode_valid hV₁ hNodeC
+    have hExtC : tbl₁.Extends resC.2 := internNode_extends tbl₁ (.const caseVal)
+    have hEvalC : ∀ env, evalSymId resC.2 env resC.1 = wrap64 caseVal :=
+      fun env => internNode_eval hV₁ hNodeC env
+    have hDC : discrId < resC.2.nodes.length := Nat.lt_of_lt_of_le hD₁ hExtC.length_le
+    let resEq := internNode resC.2 (.op2 .eq discrId resC.1)
+    have hNodeEq : ValidNode resC.2.nodes.length (.op2 .eq discrId resC.1) := ⟨hDC, hVC.2⟩
+    have hVEq := internNode_valid hVC.1 hNodeEq
+    have hExtEq : resC.2.Extends resEq.2 := internNode_extends resC.2 (.op2 .eq discrId resC.1)
+    have hExt₁₂ : tbl₁.Extends resEq.2 := hExtC.trans hExtEq
+    have hEvalEq : ∀ env,
+        (evalSymId resEq.2 env resEq.1 != 0) = (evalSymId tbl₁ env discrId == wrap64 caseVal) := by
+      intro env
+      have hE := internNode_eval hVC.1 hNodeEq env
+      change evalSymId resEq.2 env resEq.1 =
+        evalSymOp2 .eq (evalSymId resC.2 env discrId) (evalSymId resC.2 env resC.1) at hE
+      rw [hE, ← evalSymId_mono hV₁ hExtC env hD₁, hEvalC env]
+      dsimp [evalSymOp2]
+      cases (evalSymId tbl₁ env discrId == wrap64 caseVal) <;> rfl
+    have hS₂ : ValidSymCanonState resEq.2.nodes.length st₂ :=
+      ValidSymSlots.mono hS₁ hExt₁₂.length_le
+    have hPCase : PathCondValid resEq.2.nodes.length (some (resEq.1, true)) := hVEq.2
+    change combineSplit (evalBlock targetBb resEq.2 (some (resEq.1, true)))
+      (fun tblT => evalSwitchTableSplit evalBlock discrId pc rest otherwiseBb tblT) =
+        some (rets, tbl') at hSplit
     rcases combineSplit_eq_some hSplit with ⟨retsT, tblT, retsF, hT, hF, hRets⟩
     subst hRets
-    rcases hBlockSound targetBb tbl₁ retsT tblT hV₁ hS₁ hP₁ hT with ⟨hVT, hET, hLtT, hEvT⟩
-    have hST : ValidSymCanonState tblT.nodes.length st₂ := ValidSymSlots.mono hS₁ hET.length_le
-    have hPT : PathCondValid tblT.nodes.length pc := hP₁.mono hET.length_le
-    rcases evalSwitchTableSplit_sound rest otherwiseBb tblT retsF tbl' hBlockSound
-      hVT hST hPT hF with ⟨hVF, hEF, hLtF, hEvF⟩
-    refine ⟨hVF, hET.trans hEF, ?_, ?_⟩
+    rcases hBlockSound targetBb resEq.2 (some (resEq.1, true)) retsT tblT hVEq.1 hS₂ hPCase hT with
+      ⟨hVT, hET, hLtT, hEvT⟩
+    have hExt₁T : tbl₁.Extends tblT := hExt₁₂.trans hET
+    have hST : ValidSymCanonState tblT.nodes.length st₂ := ValidSymSlots.mono hS₁ hExt₁T.length_le
+    have hPT : PathCondValid tblT.nodes.length pc := hP₁.mono hExt₁T.length_le
+    have hDT : discrId < tblT.nodes.length := Nat.lt_of_lt_of_le hD₁ hExt₁T.length_le
+    rcases evalSwitchTableSplit_sound hBlockSound rest otherwiseBb tblT retsF tbl' hVT hST hPT hDT
+      hF with ⟨hVF, hEF, hLtF, hEvF⟩
+    refine ⟨hVF, hExt₁T.trans hEF, ?_, ?_⟩
     · intro r hr
       rcases List.mem_append.1 hr with hr | hr
       · exact Nat.lt_of_lt_of_le (hLtT r hr) hEF.length_le
       · exact hLtF r hr
-    · intro w env cst₂ hPc hR
+    · intro env cst₂ hPc hR
       dsimp only [lookupCfgSwitchTarget]
-      cases hMatch : (w == wrap64 caseVal) with
+      cases hMatch : (evalSymId tbl₁ env discrId == wrap64 caseVal) with
       | true =>
-        rcases hEvT env cst₂ hPc hR with ⟨r, hr, hExec⟩
+        have hPcCase : PathCondHolds resEq.2 env (some (resEq.1, true)) := by
+          show (evalSymId resEq.2 env resEq.1 != 0) = true
+          rw [hEvalEq env, hMatch]
+        have hR₂ : StateRefines (evalSymCanonState resEq.2 env st₂) cst₂ := by
+          rw [← evalSymCanonState_mono hV₁ hExt₁₂ env hS₁]
+          exact hR
+        rcases hEvT env cst₂ hPcCase hR₂ with ⟨r, hr, hExec⟩
         refine ⟨r, List.mem_append_left _ hr, ?_⟩
         rw [ite_eq_left rfl, hExec, evalSymId_mono hVT hEF env (hLtT r hr)]
       | false =>
-        have hPcT : PathCondHolds tblT env pc := PathCondHolds.mono hV₁ hET hP₁ hPc
+        have hPcT : PathCondHolds tblT env pc := PathCondHolds.mono hV₁ hExt₁T hP₁ hPc
         have hRT : StateRefines (evalSymCanonState tblT env st₂) cst₂ := by
-          rw [← evalSymCanonState_mono hV₁ hET env hS₁]
+          rw [← evalSymCanonState_mono hV₁ hExt₁T env hS₁]
           exact hR
-        rcases hEvF w env cst₂ hPcT hRT with ⟨r, hr, hExec⟩
+        rcases hEvF env cst₂ hPcT hRT with ⟨r, hr, hExec⟩
         refine ⟨r, List.mem_append_right _ hr, ?_⟩
-        rw [ite_eq_right Bool.false_ne_true, hExec]
+        rw [ite_eq_right Bool.false_ne_true, evalSymId_mono hV₁ hExt₁T env hD₁]
+        exact hExec
 
 /-- Single-continuation compositional symbolic GVN evaluator for multi-block `MirCfg`s.
     Returns the list of returned `SymId`s (one per explored path) in the final append-only
@@ -12394,8 +12440,8 @@ def symEvalCfgGvn (cfg : MirCfg) (hints : JoinHints) :
                 | some (stM, tblM) => symEvalCfgGvn cfg hints f joinBb stM tblM pc
             | none =>
               evalSwitchTableSplit
-                (fun targetBb tblIn => symEvalCfgGvn cfg hints fuel targetBb st₂ tblIn pc)
-                cases otherwiseBb tbl₁
+                (fun targetBb tblIn pcIn => symEvalCfgGvn cfg hints fuel targetBb st₂ tblIn pcIn)
+                discrId pc cases otherwiseBb tbl₁
         | .ret retLoc =>
           match readSymScalar st₁ retLoc with
           | some retSymId => some ([retSymId], tbl₁)
@@ -12770,29 +12816,29 @@ theorem symEvalCfgGvn_under_sound (cfg : MirCfg) (hints : JoinHints) :
               rw [hPlan] at hEval
               dsimp only at hEval
               have hBlockSound :
-                  ∀ (targetBb : BlockId) (tblIn : SymTable) (retsOut : List SymId)
-                    (tblOut : SymTable),
+                  ∀ (targetBb : BlockId) (tblIn : SymTable) (pcIn : PathCond)
+                    (retsOut : List SymId) (tblOut : SymTable),
                     ValidTable tblIn →
                     ValidSymCanonState tblIn.nodes.length (st₁.ownerReadLoc discr) →
-                    PathCondValid tblIn.nodes.length pc →
-                    symEvalCfgGvn cfg hints fuel targetBb (st₁.ownerReadLoc discr) tblIn pc =
+                    PathCondValid tblIn.nodes.length pcIn →
+                    symEvalCfgGvn cfg hints fuel targetBb (st₁.ownerReadLoc discr) tblIn pcIn =
                       some (retsOut, tblOut) →
                     ValidTable tblOut ∧ tblIn.Extends tblOut ∧
                       (∀ r ∈ retsOut, r < tblOut.nodes.length) ∧
                       ∀ (env : SymEnv) (cst₂ : CanonState Nat),
-                        PathCondHolds tblIn env pc →
+                        PathCondHolds tblIn env pcIn →
                         StateRefines (evalSymCanonState tblIn env (st₁.ownerReadLoc discr)) cst₂ →
                         ∃ r ∈ retsOut,
                           execCfg cfg fuel targetBb cst₂ = .ret (evalSymId tblOut env r) :=
-                fun targetBb tblIn retsOut tblOut hV hS hP hE =>
+                fun targetBb tblIn pcIn retsOut tblOut hV hS hP hE =>
                   symEvalCfgGvn_under_sound cfg hints fuel targetBb (st₁.ownerReadLoc discr)
-                    tblIn pc retsOut tblOut hV hS hP hE
-              rcases evalSwitchTableSplit_sound cases otherwiseBb tbl₁ rets tbl' hBlockSound
-                hValid₁ hSt₂ hPcValid₁ hEval with ⟨hV', hE', hLt', hEv'⟩
+                    tblIn pcIn retsOut tblOut hV hS hP hE
+              rcases evalSwitchTableSplit_sound hBlockSound cases otherwiseBb tbl₁ rets tbl'
+                hValid₁ hSt₂ hPcValid₁ hDiscrLt hEval with ⟨hV', hE', hLt', hEv'⟩
               refine ⟨hV', hExt₁.trans hE', hLt', ?_⟩
               intro env cst hPc hR
               rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, hPc₁⟩
-              rcases hEv' (evalSymId tbl₁ env discrId) env (c₁.ownerReadLoc discr)
+              rcases hEv' env (c₁.ownerReadLoc discr)
                 hPc₁ (hR₂ env c₁ hR₁) with ⟨r, hr, hExec⟩
               refine ⟨r, hr, ?_⟩
               rw [hStepT env cst c₁ hC₁ hR₁]
@@ -13237,6 +13283,47 @@ theorem distinctSwitchTable_concrete_sound (env : SymEnv) :
       (evalSymCanonState diamondInitSymTable env diamondInitSymState) =
       .ret (distinctSwitchTableTree.eval env) :=
   checkCfgAgainstTree_sound distinctSwitchTable_verified_rfl diamondInitSymTable_valid
+    diamondInitSymState_valid env _ (StateRefines.refl _)
+
+/-- Unhinted `switchTable` whose `3 =>` arm asserts its own case condition
+    (`_2 := 3; _2 := _1 == _2; assert _2`) before returning `_0`; `otherwise` returns `_0`. -/
+def switchCaseAssertCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [], term := .switchTable 1 [(3, 1)] 2 },
+        { stmts := [ .storageLive 2, .assign 2 (.const 3), .assign 2 (.op2 .eq 1 2), .assert 2,
+            .storageDead 2 ]
+          term := .ret 0 },
+        { stmts := [], term := .ret 0 } ] }
+
+/-- The same `switchTable`, but the `otherwise` arm asserts `_1 == 3`, which is false there. -/
+def switchOtherwiseAssertCfg : MirCfg :=
+  { blocks :=
+      [ { stmts := [], term := .switchTable 1 [(3, 1)] 2 },
+        { stmts := [], term := .ret 0 },
+        { stmts := [ .storageLive 2, .assign 2 (.const 3), .assign 2 (.op2 .eq 1 2), .assert 2,
+            .storageDead 2 ]
+          term := .ret 0 } ] }
+
+/-- **Case path conditions on path-split `switchTable` arms (`switchCase_pathCond_verified`)**:
+    without join hints, the evaluator explores both `switchTable` targets, and the `3 =>` arm is
+    explored under `_1 == 3` (`evalSwitchTableSplit`), so its assertion is discharged and both paths
+    return `_0`; the same assertion in the `otherwise` arm (where it is false) is rejected. -/
+theorem switchCase_pathCond_verified :
+    checkCfgAgainstTree switchCaseAssertCfg noJoinHints 2 0 diamondInitSymState
+        diamondInitSymTable (.var 0) = true ∧
+      (symEvalCfgGvn switchCaseAssertCfg noJoinHints 2 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => res.1.length) = some 2 ∧
+      symEvalCfgGvn switchOtherwiseAssertCfg noJoinHints 2 0 diamondInitSymState
+        diamondInitSymTable = none := by
+  decide +kernel
+
+/-- Concrete corollary: for every `env`, the `3 =>` arm's assertion never fails and the CFG
+    returns `_0`. -/
+theorem switchCaseAssert_concrete_sound (env : SymEnv) :
+    execCfg switchCaseAssertCfg 2 0
+      (evalSymCanonState diamondInitSymTable env diamondInitSymState) =
+      .ret ((ExprTree.var 0).eval env) :=
+  checkCfgAgainstTree_sound switchCase_pathCond_verified.1 diamondInitSymTable_valid
     diamondInitSymState_valid env _ (StateRefines.refl _)
 
 /-- Diamond whose arms compute the same sum with swapped operands:
@@ -14416,14 +14503,18 @@ def SymNode.resultSizeBytes : SymNode → Nat
   | .op2 op _ _ => op.resultSizeBytes
   | _ => 8
 
-/-- Type-aware bridge adapter reading the byte width (`1` for `bool`, `8` for `u64`) from the
-    node at `id` in `tbl`. -/
-def evalSymIdToMirValueTyped (tbl : SymTable) (env : SymEnv) (id : SymId) :
-    Trusted.Rustc.V2026_06_01.MirSemantics.Value :=
-  let sz := match tbl.nodes[id]? with
-    | some node => node.resultSizeBytes
-    | none => 8
-  evalSymIdToMirValueSized sz tbl env id
+/-- **Negative control: a MIR width is a property of the use site, not of the GVN node**
+    (`gvn_node_width_is_not_mir_width`). Peephole GVN folds `x == x` to the hash-consed
+    `.const 1`, whose node-derived width is `8`, while MIR's `Eq` yields a `1`-byte `bool`; the same
+    `.const 1` node is shared with every `u64` constant `1`. Widths must come from the operator or the
+    use site (`evalSymIdToMirValueSized op.resultSizeBytes`, as in
+    `evalSymIdToMirValueSized_internOp2_eq_evalScalarBinOp`), never from `tbl.nodes[id]?`, which is
+    why no node-typed adapter is provided. -/
+theorem gvn_node_width_is_not_mir_width :
+    let res := internOp2 { nodes := [.var 0] } .eq 0 0
+    (res.2.nodes[res.1]?).map SymNode.resultSizeBytes = some 8 ∧
+      SymOp2.resultSizeBytes .eq = 1 := by
+  decide +kernel
 
 /-- Mapping from `SymOp2` to the corresponding `MirAst.BinOp`. -/
 def SymOp2.toMirBinOp : SymOp2 → Trusted.Rustc.V2026_06_01.MirAst.BinOp
