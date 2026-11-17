@@ -26608,16 +26608,17 @@ theorem IsUnsizedSliceDstTy.isUnsizedRawPtrPointee_eq_true {dstTy : RigidTy} {n 
 slice DST at `wide`, for element byte stride `n`:
 - `global`: `bytes` is the live image of `wide.1`'s captured global allocation
   (`LiveSliceImage mem wide bytes`);
-- `borrow`: a live trusted borrow entry `tag` of `mem.borrows` covers the slice window
-  `[wide.1.offsetBytes, wide.1.offsetBytes + wide.2 * n)` with Tree Borrows read permission
-  (the memory half of `ActiveTypedSliceBorrow` / `ActiveTypedSliceMutBorrow`);
+- `borrow`: a live trusted borrow entry at the pointer's own provenance tag `wide.1.tag` in
+  `mem.borrows` covers the slice window `[wide.1.offsetBytes, wide.1.offsetBytes + wide.2 * n)`
+  with Tree Borrows read permission (the memory half of `ActiveTypedSliceBorrow` /
+  `ActiveTypedSliceMutBorrow` at `wide.1.tag`);
 - `zeroSized`: the window is empty (`wide.2 * n = 0`: `len = 0`, or a ZST element type), which
   Rust permits for dangling, well-aligned data pointers and which needs no live allocation.
 -/
 inductive UnsizedSliceDstBacking (n : Nat) (mem : Memory) (wide : WidePtrVal) (bytes : ByteMem) :
     Prop where
   | global (hImg : LiveSliceImage mem wide bytes)
-  | borrow (tag : Nat) (entry : BorrowEntry) (hLookup : lookupBorrow mem.borrows tag = some entry)
+  | borrow (entry : BorrowEntry) (hLookup : lookupBorrow mem.borrows wide.1.tag = some entry)
       (hCov : BorrowRangeCovers entry wide.1.offsetBytes (wide.2 * n))
       (hPerm : TreeBorrowPerm.PermitsRead entry.perm)
   | zeroSized (hZero : wide.2 * n = 0)
@@ -26626,33 +26627,36 @@ namespace UnsizedSliceDstBacking
 
 variable {n : Nat}
 
-/-- The memory half of a shared `ActiveTypedSliceBorrow` lens. -/
+/-- The memory half of a shared `ActiveTypedSliceBorrow` lens at `tag = wide.1.tag`. -/
 theorem of_activeTypedSliceBorrow {α : Type} {c : ByteLensCodec α n} {mem : Memory} {tag : Nat}
     {wide : WidePtrVal} {xs : List α} {bytes : ByteMem}
-    (h : ActiveTypedSliceBorrow c mem.borrows tag wide xs bytes) :
+    (h : ActiveTypedSliceBorrow c mem.borrows tag wide xs bytes)
+    (hTag : tag = wide.1.tag := by rfl) :
     UnsizedSliceDstBacking n mem wide bytes := by
   obtain ⟨_, entry, he, hc, hp⟩ := h
-  exact .borrow tag entry he hc hp
+  rw [hTag] at he
+  exact .borrow entry he hc hp
 
-/-- The memory half of a mutable `ActiveTypedSliceMutBorrow` lens. -/
+/-- The memory half of a mutable `ActiveTypedSliceMutBorrow` lens at `tag = wide.1.tag`. -/
 theorem of_activeTypedSliceMutBorrow {α : Type} {c : ByteLensCodec α n} {mem : Memory}
     {tag : Nat} {wide : WidePtrVal} {xs : List α} {bytes : ByteMem}
-    (h : ActiveTypedSliceMutBorrow c mem.borrows tag wide xs bytes) :
+    (h : ActiveTypedSliceMutBorrow c mem.borrows tag wide xs bytes)
+    (hTag : tag = wide.1.tag := by rfl) :
     UnsizedSliceDstBacking n mem wide bytes :=
-  of_activeTypedSliceBorrow h.toShared
+  of_activeTypedSliceBorrow h.toShared hTag
 
 /-- **Frame rule**: the backing transfers to any `mem'` with the same `globals` that preserves
-every live `lookupBorrow` entry of `mem.borrows`. -/
+any live `lookupBorrow` entry at `wide.1.tag`. -/
 theorem of_frame {mem mem' : Memory} {wide : WidePtrVal} {bytes : ByteMem}
     (h : UnsizedSliceDstBacking n mem wide bytes) (hGlobals : mem'.globals = mem.globals)
-    (hLookup : ∀ tag e, lookupBorrow mem.borrows tag = some e →
-      lookupBorrow mem'.borrows tag = some e) :
+    (hLookup : ∀ e, lookupBorrow mem.borrows wide.1.tag = some e →
+      lookupBorrow mem'.borrows wide.1.tag = some e) :
     UnsizedSliceDstBacking n mem' wide bytes := by
   cases h with
   | global hImg =>
     obtain ⟨alloc, hA, hB⟩ := hImg
     exact .global ⟨alloc, by rw [hGlobals]; exact hA, hB⟩
-  | borrow tag entry he hc hp => exact .borrow tag entry (hLookup tag entry he) hc hp
+  | borrow entry he hc hp => exact .borrow entry (hLookup entry he) hc hp
   | zeroSized hZero => exact .zeroSized hZero
 
 /-- Prefix subslices (`k ≤ wide.2`) inherit the backing. -/
@@ -26662,8 +26666,8 @@ theorem takeElems {mem : Memory} {wide : WidePtrVal} {bytes : ByteMem}
   have hkn : k * n ≤ wide.2 * n := Nat.mul_le_mul_right n hk
   cases h with
   | global hImg => exact .global hImg
-  | borrow tag entry he hc hp =>
-    exact .borrow tag entry he ⟨hc.1, Nat.le_trans (Nat.add_le_add_left hkn _) hc.2⟩ hp
+  | borrow entry he hc hp =>
+    exact .borrow entry he ⟨hc.1, Nat.le_trans (Nat.add_le_add_left hkn _) hc.2⟩ hp
   | zeroSized hZero =>
     rw [hZero] at hkn
     exact .zeroSized (Nat.le_zero.mp hkn)
@@ -26674,10 +26678,10 @@ theorem dropElems {mem : Memory} {wide : WidePtrVal} {bytes : ByteMem}
     UnsizedSliceDstBacking n mem (WidePtrVal.dropElems wide n k) bytes := by
   cases h with
   | global hImg => exact .global hImg
-  | borrow tag entry he hc hp =>
+  | borrow entry he hc hp =>
     have hsum : k * n + (wide.2 - k) * n = wide.2 * n := by
       rw [← Nat.add_mul, Nat.add_sub_of_le hk]
-    refine .borrow tag entry he ⟨Nat.le_trans hc.1 (Nat.le_add_right _ _), ?_⟩ hp
+    refine .borrow entry he ⟨Nat.le_trans hc.1 (Nat.le_add_right _ _), ?_⟩ hp
     show wide.1.offsetBytes + k * n + (wide.2 - k) * n ≤ entry.rangeOffset + entry.rangeLen
     rw [Nat.add_assoc, hsum]
     exact hc.2
@@ -26686,6 +26690,39 @@ theorem dropElems {mem : Memory} {wide : WidePtrVal} {bytes : ByteMem}
     rw [hZero] at hle
     exact .zeroSized (Nat.le_zero.mp hle)
 
+/-- **Non-trivial split reassembly**: for any interior split `0 < k`, `k < wide.2`, and `0 < n`,
+the backings of `takeElems wide k` and `dropElems wide n k` reassemble directly into
+`UnsizedSliceDstBacking n mem wide bytes` without requiring an extra whole-window hypothesis. -/
+theorem of_splitAt_pos {mem : Memory} {wide : WidePtrVal} {bytes : ByteMem} {k : Nat}
+    (hk0 : 0 < k) (hkw : k < wide.2) (hn : 0 < n)
+    (hL : UnsizedSliceDstBacking n mem (WidePtrVal.takeElems wide k) bytes)
+    (hR : UnsizedSliceDstBacking n mem (WidePtrVal.dropElems wide n k) bytes) :
+    UnsizedSliceDstBacking n mem wide bytes := by
+  have hkPos : 0 < k * n := Nat.mul_pos hk0 hn
+  have hSubPos : 0 < (wide.2 - k) * n := Nat.mul_pos (Nat.sub_pos_of_lt hkw) hn
+  cases hL with
+  | global hImgL => exact .global hImgL
+  | zeroSized hZ =>
+    rw [hZ] at hkPos
+    exact False.elim (Nat.lt_irrefl 0 hkPos)
+  | borrow entryL heL hcL hpL =>
+    cases hR with
+    | global hImgR => exact .global hImgR
+    | zeroSized hZ =>
+      rw [hZ] at hSubPos
+      exact False.elim (Nat.lt_irrefl 0 hSubPos)
+    | borrow entryR heR hcR _ =>
+      have heR' : lookupBorrow mem.borrows wide.1.tag = some entryR := heR
+      rw [heL] at heR'
+      injection heR' with hEq
+      subst hEq
+      have hsum : k * n + (wide.2 - k) * n = wide.2 * n := by
+        rw [← Nat.add_mul, Nat.add_sub_of_le (Nat.le_of_lt hkw)]
+      have hUpper : wide.1.offsetBytes + wide.2 * n ≤ entryL.rangeOffset + entryL.rangeLen := by
+        rw [← hsum, ← Nat.add_assoc]
+        exact hcR.2
+      exact .borrow entryL heL ⟨hcL.1, hUpper⟩ hpL
+
 end UnsizedSliceDstBacking
 
 /--
@@ -26693,8 +26730,8 @@ end UnsizedSliceDstBacking
 (`fatVal`), unsized DST `RigidTy` (`dstTy`: `.slice elemTy` or `.str`), `ByteLensCodec α n`,
 and logical element list `elems : List α`, connecting the wide-pointer representation,
 `PtrMetadataOf`, the typed byte view `SliceTypedAt`, and the live backing of `bytes` in `mem`
-(`UnsizedSliceDstBacking`: a captured global allocation image, a live borrow entry as in
-`ActiveTypedSliceBorrow` / `ActiveTypedSliceMutBorrow`, or an empty window).
+(`UnsizedSliceDstBacking`: a captured global allocation image, a live borrow entry at `wide.1.tag`
+as in `ActiveTypedSliceBorrow` / `ActiveTypedSliceMutBorrow`, or an empty window).
 -/
 structure UnsizedSliceDstAt {α : Type} {n : Nat} (c : ByteLensCodec α n)
     (ptrBytes : Nat) (dstTy : RigidTy) (mem : Memory) (wide : WidePtrVal)
@@ -26733,24 +26770,27 @@ theorem of_str_sliceTypedAt (ptrBytes : Nat) (mem : Memory)
     UnsizedStrDstAt ptrBytes mem wide (WidePtrVal.toValue ptrBytes wide) utf8Bytes bytes :=
   ⟨IsUnsizedSliceDstTy.str, rfl, .wide wide, h, .global hImg⟩
 
-/-- Construct `UnsizedSliceDstAt` from a shared `ActiveTypedSliceBorrow` lens in `mem.borrows`. -/
+/-- Construct `UnsizedSliceDstAt` from a shared `ActiveTypedSliceBorrow` lens at `tag = wide.1.tag`
+in `mem.borrows`. -/
 theorem of_borrow (ptrBytes : Nat) {dstTy : RigidTy} {mem : Memory} {tag : Nat}
     {wide : WidePtrVal} {elems : List α} {bytes : ByteMem}
     (hTy : IsUnsizedSliceDstTy dstTy n)
-    (hBorrow : ActiveTypedSliceBorrow c mem.borrows tag wide elems bytes) :
+    (hBorrow : ActiveTypedSliceBorrow c mem.borrows tag wide elems bytes)
+    (hTag : tag = wide.1.tag := by rfl) :
     UnsizedSliceDstAt c ptrBytes dstTy mem wide
       (WidePtrVal.toValue ptrBytes wide) elems bytes :=
-  ⟨hTy, rfl, .wide wide, hBorrow.1, .of_activeTypedSliceBorrow hBorrow⟩
+  ⟨hTy, rfl, .wide wide, hBorrow.1, .of_activeTypedSliceBorrow hBorrow hTag⟩
 
-/-- Construct `UnsizedSliceDstAt` from a mutable `ActiveTypedSliceMutBorrow` lens in
-`mem.borrows`. -/
+/-- Construct `UnsizedSliceDstAt` from a mutable `ActiveTypedSliceMutBorrow` lens at
+`tag = wide.1.tag` in `mem.borrows`. -/
 theorem of_mutBorrow (ptrBytes : Nat) {dstTy : RigidTy} {mem : Memory} {tag : Nat}
     {wide : WidePtrVal} {elems : List α} {bytes : ByteMem}
     (hTy : IsUnsizedSliceDstTy dstTy n)
-    (hMut : ActiveTypedSliceMutBorrow c mem.borrows tag wide elems bytes) :
+    (hMut : ActiveTypedSliceMutBorrow c mem.borrows tag wide elems bytes)
+    (hTag : tag = wide.1.tag := by rfl) :
     UnsizedSliceDstAt c ptrBytes dstTy mem wide
       (WidePtrVal.toValue ptrBytes wide) elems bytes :=
-  ⟨hTy, rfl, .wide wide, hMut.1, .of_activeTypedSliceMutBorrow hMut⟩
+  ⟨hTy, rfl, .wide wide, hMut.1, .of_activeTypedSliceMutBorrow hMut hTag⟩
 
 theorem length_eq {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
@@ -26785,58 +26825,58 @@ theorem unique {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
   SliceTypedAt.unique h₁.slice_typed h₂.slice_typed
 
 /-- **Backing cases**: the bytes of an `UnsizedSliceDstAt` view are the live image of a captured
-global allocation, or are covered by a live shared borrow lens (`ActiveTypedSliceBorrow`) on the
-same view, or the view is an empty (`len = 0` or ZST) window. -/
+global allocation, or are covered by a live shared borrow lens (`ActiveTypedSliceBorrow`) at the
+pointer's own tag `wide.1.tag`, or the view is an empty (`len = 0` or ZST) window. -/
 theorem image_or_activeBorrow_or_zeroSized {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
     (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes) :
     LiveSliceImage mem wide bytes ∨
-      (∃ tag, ActiveTypedSliceBorrow c mem.borrows tag wide elems bytes) ∨
+      ActiveTypedSliceBorrow c mem.borrows wide.1.tag wide elems bytes ∨
       wide.2 * n = 0 := by
   obtain ⟨_, _, _, hs, hb⟩ := h
   cases hb with
   | global hImg => exact Or.inl hImg
-  | borrow tag entry he hc hp => exact Or.inr (Or.inl ⟨tag, hs, entry, he, hc, hp⟩)
+  | borrow entry he hc hp => exact Or.inr (Or.inl ⟨hs, entry, he, hc, hp⟩)
   | zeroSized hZero => exact Or.inr (Or.inr hZero)
 
 /-- **Frame rule**: `UnsizedSliceDstAt` transfers to any `mem'` with the same `globals` that
-preserves every live `lookupBorrow` entry of `mem.borrows`. -/
+preserves any live `lookupBorrow` entry at `wide.1.tag`. -/
 theorem of_frame {ptrBytes : Nat} {dstTy : RigidTy} {mem mem' : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
     (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes)
     (hGlobals : mem'.globals = mem.globals)
-    (hLookup : ∀ tag e, lookupBorrow mem.borrows tag = some e →
-      lookupBorrow mem'.borrows tag = some e) :
+    (hLookup : ∀ e, lookupBorrow mem.borrows wide.1.tag = some e →
+      lookupBorrow mem'.borrows wide.1.tag = some e) :
     UnsizedSliceDstAt c ptrBytes dstTy mem' wide fatVal elems bytes :=
   ⟨h.dst_ty, h.fat_eq, h.meta_of, h.slice_typed, h.backing.of_frame hGlobals hLookup⟩
 
 /-- `UnsizedSliceDstAt` is preserved by a statement-level write of an unprojected local `dstLoc`
-(`invalidateConflictingBorrows`) when no live borrow of `mem.borrows` targets `dstLoc`. -/
+(`invalidateConflictingBorrows`) when no live borrow at `wide.1.tag` targets `dstLoc`. -/
 theorem of_invalidateConflictingBorrows {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem} {dstLoc : Local}
     (writerTag : Option Nat) (targetFrameDepth : Nat)
     (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes)
-    (hNe : ∀ tag e, lookupBorrow mem.borrows tag = some e → e.targetLocal ≠ dstLoc) :
+    (hNe : ∀ e, lookupBorrow mem.borrows wide.1.tag = some e → e.targetLocal ≠ dstLoc) :
     UnsizedSliceDstAt c ptrBytes dstTy
       { mem with
         borrows := invalidateConflictingBorrows mem.borrows dstLoc writerTag targetFrameDepth }
       wide fatVal elems bytes :=
-  h.of_frame rfl (fun tag e he =>
-    lookupBorrow_invalidateConflictingBorrows_of_ne writerTag targetFrameDepth he (hNe tag e he))
+  h.of_frame rfl (fun e he =>
+    lookupBorrow_invalidateConflictingBorrows_of_ne writerTag targetFrameDepth he (hNe e he))
 
 /-- `UnsizedSliceDstAt` is preserved by an intrinsic return write to
 `{ local_ := dstLoc, projection := [] }` (`invalidateDirectDestWriteBorrows`) when no live borrow
-of `mem.borrows` targets `dstLoc`. -/
+at `wide.1.tag` targets `dstLoc`. -/
 theorem of_invalidateDirectDestWriteBorrows {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem} {dstLoc : Local}
     (locals : List LocalSlot)
     (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes)
-    (hNe : ∀ tag e, lookupBorrow mem.borrows tag = some e → e.targetLocal ≠ dstLoc) :
+    (hNe : ∀ e, lookupBorrow mem.borrows wide.1.tag = some e → e.targetLocal ≠ dstLoc) :
     UnsizedSliceDstAt c ptrBytes dstTy
       (invalidateDirectDestWriteBorrows mem locals { local_ := dstLoc, projection := [] })
       wide fatVal elems bytes :=
-  h.of_frame (invalidateDirectDestWriteBorrows_globals mem locals _) (fun tag e he =>
-    lookupBorrow_invalidateDirectDestWriteBorrows_of_ne mem locals he (hNe tag e he))
+  h.of_frame (invalidateDirectDestWriteBorrows_globals mem locals _) (fun e he =>
+    lookupBorrow_invalidateDirectDestWriteBorrows_of_ne mem locals he (hNe e he))
 
 /-- Prefix subslice `WidePtrVal.takeElems wide k` (`k ≤ wide.2`) preserves `UnsizedSliceDstAt`. -/
 theorem takeElems {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
@@ -26872,7 +26912,7 @@ theorem splitAt {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
   ⟨h.takeElems hk, h.dropElems hk, (SliceTypedAt.splitAt h.slice_typed hk).2.2⟩
 
 /-- Reassembling prefix and suffix `UnsizedSliceDstAt` views at `k ≤ wide.2` over a backing
-`hBack` of the whole window (e.g. the parent borrow entry covering both halves). -/
+`hBack` of the whole window (including boundary splits `k = 0` or `k = wide.2`). -/
 theorem of_splitAt {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {k : Nat} {elemsL elemsR : List α} {bytes : ByteMem}
     (hk : k ≤ wide.2)
@@ -26884,6 +26924,20 @@ theorem of_splitAt {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     UnsizedSliceDstAt c ptrBytes dstTy mem wide
       (WidePtrVal.toValue ptrBytes wide) (elemsL ++ elemsR) bytes :=
   ⟨hL.dst_ty, rfl, .wide wide, SliceTypedAt.of_splitAt hk hL.slice_typed hR.slice_typed, hBack⟩
+
+/-- Reassembling prefix and suffix `UnsizedSliceDstAt` views at any interior split `0 < k`,
+`k < wide.2`, and `0 < n` without requiring an external whole-window backing hypothesis. -/
+theorem of_splitAt_pos {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {k : Nat} {elemsL elemsR : List α} {bytes : ByteMem}
+    (hk0 : 0 < k) (hkw : k < wide.2) (hn : 0 < n)
+    (hL : UnsizedSliceDstAt c ptrBytes dstTy mem (WidePtrVal.takeElems wide k)
+      (WidePtrVal.toValue ptrBytes (WidePtrVal.takeElems wide k)) elemsL bytes)
+    (hR : UnsizedSliceDstAt c ptrBytes dstTy mem (WidePtrVal.dropElems wide n k)
+      (WidePtrVal.toValue ptrBytes (WidePtrVal.dropElems wide n k)) elemsR bytes) :
+    UnsizedSliceDstAt c ptrBytes dstTy mem wide
+      (WidePtrVal.toValue ptrBytes wide) (elemsL ++ elemsR) bytes :=
+  of_splitAt (Nat.le_of_lt hkw) hL hR
+    (UnsizedSliceDstBacking.of_splitAt_pos hk0 hkw hn hL.backing hR.backing)
 
 /-- Empty slice instance (`len = 0`) of `UnsizedSliceDstAt`: an empty window needs no live
 backing (dangling well-aligned data pointers are permitted). -/
@@ -26957,6 +27011,47 @@ theorem evalRvalue_aggregate_rawPtr_roundtrip {dstTy : RigidTy} {mem : Memory}
   refine ⟨?_, h⟩
   rw [h.fat_eq]
   exact hEv
+
+/-- **`UnsizedSliceDstAt.evalRvalue_len_and_ptrMetadata_borrow`**: for a borrow-backed
+`UnsizedSliceDstAt` view on `.slice elem`, both dereference-based `Rvalue.len (*place)` and
+non-dereferencing `Rvalue.unaryOp .ptrMetadata ptrOp` evaluate to
+`.ok (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) locals' mem`. -/
+theorem evalRvalue_len_and_ptrMetadata_borrow {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (locals locals' : List LocalSlot) (place : Place) (ptrOp : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (initProj : List ProjectionElem) (elem : RigidTy) (lIdx : LayoutIdx)
+    (entry : BorrowEntry) (aggElems : List Value) (elemOff : Nat)
+    (h : UnsizedSliceDstAt c (layoutPointerBytes layouts) (.slice elem) mem wide fatVal elems bytes)
+    (hTy : placeTy localDecls layouts place = some { kind := .slice elem, layoutIdx := lIdx })
+    (hSplit : splitLastDeref? place.projection = some initProj)
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
+      mem.globals layouts mem.callerLocals localDecls mem.callStack = .ok fatVal locals')
+    (hOp : evalOperand locals ptrOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok fatVal locals')
+    (hBorrow : lookupBorrow mem.borrows wide.1.tag = some entry)
+    (hPerm : TreeBorrowPerm.PermitsRead entry.perm)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? locals' entry.targetLocal = some (.init (.aggregate 0 aggElems)))
+    (hElemOff : byteOffsetToElemIdx? wide.1.offsetBytes (inferElemListByteStride aggElems) =
+      some elemOff)
+    (hFit : elemOff + wide.2 ≤ aggElems.length)
+    (hActive : mem.callStack = [] ∨ entry.targetFrameDepth = length mem.callStack := by
+      exact Or.inl rfl) :
+    evalRvalue locals (.len place) mem localDecls layouts =
+        .ok (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) locals' mem ∧
+      evalRvalue locals (.unaryOp .ptrMetadata ptrOp) mem localDecls layouts =
+        .ok (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) locals' mem := by
+  have hRead' : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
+      mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (WidePtrVal.toValue (layoutPointerBytes layouts) wide) locals' := by
+    rw [← h.fat_eq]
+    exact hRead
+  refine ⟨?_, (h.evalRvalue_ptrMetadata locals locals' ptrOp localDecls layouts hOp).1⟩
+  rw [h.length_eq]
+  exact WidePtrVal.evalRvalue_len_borrow locals locals' place mem localDecls layouts initProj elem
+    lIdx entry aggElems elemOff wide hTy hSplit hRead' hBorrow hPerm hProj hTarget hElemOff hFit
+    hActive
 
 end UnsizedSliceDstAt
 
@@ -27060,7 +27155,7 @@ theorem evalIntrinsic_sizeOfValRaw_slice {α : Type} {n : Nat} {c : ByteLensCode
           invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
     stepMirFn body s = MirStepNode.step s' ∧
     PureMirExec.mirStep body s = .cont s' ∧
-    ((∀ tag e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
+    ((∀ e, lookupBorrow s.memory.borrows wide.1.tag = some e → e.targetLocal ≠ dstLoc) →
       UnsizedSliceDstAt c 8 (.slice elemTy) s'.memory wide fatVal elems bytes) ∧
     (∀ tag, ActiveTypedSliceBorrow c s.memory.borrows tag wide elems bytes →
       (∀ e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
@@ -27118,7 +27213,7 @@ theorem evalIntrinsic_sizeOfValRaw_str
           invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
     stepMirFn body s = MirStepNode.step s' ∧
     PureMirExec.mirStep body s = .cont s' ∧
-    ((∀ tag e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
+    ((∀ e, lookupBorrow s.memory.borrows wide.1.tag = some e → e.targetLocal ≠ dstLoc) →
       UnsizedStrDstAt 8 s'.memory wide fatVal utf8Bytes bytes) := by
   intro s'
   have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
@@ -27173,7 +27268,7 @@ theorem evalIntrinsic_alignOfValRaw_slice {α : Type} {n : Nat} {c : ByteLensCod
           invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
     stepMirFn body s = MirStepNode.step s' ∧
     PureMirExec.mirStep body s = .cont s' ∧
-    ((∀ tag e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
+    ((∀ e, lookupBorrow s.memory.borrows wide.1.tag = some e → e.targetLocal ≠ dstLoc) →
       UnsizedSliceDstAt c 8 (.slice elemTy) s'.memory wide fatVal elems bytes) ∧
     (∀ tag, ActiveTypedSliceBorrow c s.memory.borrows tag wide elems bytes →
       (∀ e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
@@ -27228,7 +27323,7 @@ theorem evalIntrinsic_alignOfValRaw_str
           invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
     stepMirFn body s = MirStepNode.step s' ∧
     PureMirExec.mirStep body s = .cont s' ∧
-    ((∀ tag e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
+    ((∀ e, lookupBorrow s.memory.borrows wide.1.tag = some e → e.targetLocal ≠ dstLoc) →
       UnsizedStrDstAt 8 s'.memory wide fatVal utf8Bytes bytes) := by
   intro s'
   have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts

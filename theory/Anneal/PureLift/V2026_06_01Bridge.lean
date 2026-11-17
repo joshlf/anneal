@@ -7895,6 +7895,77 @@ theorem mirStep_call_alignOfVal_str_preserves_spatialPin
   exact ⟨hMir, spatialPin_and_bindings_of_intrinsic_write tagOf hPin hBind hNePin hNeBind
     hPinLoc hBindLoc hSet rfl⟩
 
+/-- **`mirLocalsRel_of_set?_preserved`**: `mirLocalsRel` is preserved across any write
+`Trusted.Sequence.set? locals_in dstLoc v = some ms'.frame.locals` whenever every unborrowed
+`PureLift` local `i` (`MIR` slot `_(i + 1)`) is distinct from `dstLoc` and unchanged in `locals_in`
+(e.g. when `dstLoc` and any `move` operands are fresh temporaries outside `st.locals`, or when
+all `PureLift` locals in `st.locals` are borrowed). -/
+theorem mirLocalsRel_of_set?_preserved (tagOf : LoanId → Nat)
+    {st : SymState StdVal} {ms ms' : MachineState} {locals_in : List LocalSlot}
+    {dstLoc : Local} {v : LocalSlot}
+    (hLoc : mirLocalsRel tagOf st ms)
+    (hSet : Trusted.Sequence.set? locals_in dstLoc v = some ms'.frame.locals)
+    (hUnb : ∀ (i : Nat) (c : PlaceCell StdVal),
+      st.locals[i]? = some c → getPathPerm [] c.perm = .unborrowed →
+      i + 1 ≠ dstLoc ∧ locals_in[i + 1]? = ms.frame.locals[i + 1]?) :
+    mirLocalsRel tagOf st ms' := by
+  intro i c hc hU
+  obtain ⟨mv, hSlot, hRef⟩ := hLoc i c hc hU
+  obtain ⟨hNe, hIn⟩ := hUnb i c hc hU
+  exact ⟨mv, (getElem?_eq_of_set?_ne hSet hNe).trans (hIn.trans hSlot), hRef⟩
+
+/-- **`mirStateRel_and_spatialPin_of_assign_write`**: full `mirStateRel tagOf bindings st`
+(`spatialBindingsHold` + `mirLocalsRel`) and `spatialPinnedBlockHolds` are jointly preserved
+across any assignment writing to a local `dstLoc` disjoint from `l`, `bindings`, and unborrowed
+`PureLift` locals without unpinning. -/
+theorem mirStateRel_and_spatialPin_of_assign_write (tagOf : LoanId → Nat)
+    {layouts : LayoutTable} {ty : Ty} {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath} {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {ms ms' : MachineState} {locals₁ : List LocalSlot} {v : LocalSlot}
+    (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hRel : mirStateRel tagOf bindings st ms)
+    (hNePin : l ≠ dstLoc) (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hPinLoc : locals₁[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₁[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hUnb : ∀ (i : Nat) (c : PlaceCell StdVal),
+      st.locals[i]? = some c → getPathPerm [] c.perm = .unborrowed →
+      i + 1 ≠ dstLoc ∧ locals₁[i + 1]? = ms.frame.locals[i + 1]?)
+    (hSet : Trusted.Sequence.set? locals₁ dstLoc v = some ms'.frame.locals)
+    (hCaller : ms'.memory.callerLocals = ms.memory.callerLocals)
+    (hBorrows : ms'.memory.borrows =
+      invalidateConflictingBorrows ms.memory.borrows dstLoc writerTag targetFrameDepth) :
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+      mirStateRel tagOf bindings st ms' := by
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf writerTag
+    targetFrameDepth hPin hRel.1 hNePin hNeBind hPinLoc hBindLoc hSet hCaller hBorrows
+  exact ⟨hPin', hBind', mirLocalsRel_of_set?_preserved tagOf hRel.2 hSet hUnb⟩
+
+/-- **`mirStateRel_and_spatialPin_of_intrinsic_write`**: full `mirStateRel tagOf bindings st`
+(`spatialBindingsHold` + `mirLocalsRel`) and `spatialPinnedBlockHolds` are jointly preserved
+across any intrinsic call writing its return value to `{ local_ := dstLoc, projection := [] }`
+disjoint from `l`, `bindings`, and unborrowed `PureLift` locals without unpinning. -/
+theorem mirStateRel_and_spatialPin_of_intrinsic_write (tagOf : LoanId → Nat)
+    {layouts : LayoutTable} {ty : Ty} {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath} {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {ms ms' : MachineState} {locals' : List LocalSlot} {v : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hRel : mirStateRel tagOf bindings st ms)
+    (hNePin : l ≠ dstLoc) (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hUnb : ∀ (i : Nat) (c : PlaceCell StdVal),
+      st.locals[i]? = some c → getPathPerm [] c.perm = .unborrowed →
+      i + 1 ≠ dstLoc ∧ locals'[i + 1]? = ms.frame.locals[i + 1]?)
+    (hSet : Trusted.Sequence.set? locals' dstLoc v = some ms'.frame.locals)
+    (hMem : ms'.memory =
+      invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] }) :
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+      mirStateRel tagOf bindings st ms' := by
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf hPin hRel.1 hNePin
+    hNeBind hPinLoc hBindLoc hSet hMem
+  exact ⟨hPin', hBind', mirLocalsRel_of_set?_preserved tagOf hRel.2 hSet hUnb⟩
+
 end WideSliceDstBridge
 
 end Anneal.PureLift.V2026_06_01Bridge
