@@ -2471,7 +2471,7 @@
     {
       "path": "Miri/Interpreter/Call.lean",
       "upstream_sha256": "4f84e6562232130ab86a9ea057a63e8f1a57c17daef2f91d2bb9ca6251fb0287",
-      "patched_sha256": "df665a361782d1566effcc58d577675b8907a28b5b7ee1e30c52b8b047f98ddb",
+      "patched_sha256": "315de29e02fc5b8d4d0a7e1ef6a0bbfe29e83ea51e4c3f21977776298bfaa470",
       "upstream_git_blob": "1de0bbe80a2620c98cdc9371d7400db9f4a775bd",
       "patch_reason": "deinitMovedPlace: adds the consumer-side evalCallTerminatorMoving / evalTailCallTerminatorMoving / initFnTailCallMoving / evalCalleeAndArgsMoving / evalFnCallArgumentMoving / materializeArgument / deallocateTempArgs / deallocateTempArgsOnError and FnArg.isInPlace (every argument is read and validated into a temporary and every moved source deinitialized without Tree Borrows or race access, all before callee resolution, kani#5172, hence before a tail call's popRaw/cleanup; no argument is passed in place, and initFnTailCallMoving rejects an in-place argument before running the unchanged source initFnTailCall; the temporary snapshots and pre-resolution validations run under RetagMode.None so the callee's FnEntry retag stays the only retag of an argument; temporaries are deallocated on both normal completion and error, with deallocateTempArgsOnError preserving the original error) and CallHooks fields with fail-closed defaults. The source call functions are unchanged; two unused simp arguments (EStateM.pure) of the source zero_entry_immediate/zero_entry_indirect proofs are dropped."
     },
@@ -2513,7 +2513,7 @@
     {
       "path": "Miri/Interpreter/MachineHooks.lean",
       "upstream_sha256": "1df4df7ce4fbc696360b4a7ba0bf4bc921c6b91ed3793cb6c234eb826b8dad36",
-      "patched_sha256": "1a230ff0692fdafc3076c5987b012c7e47d11417d9a3f47f6698d9d81a6fb58f",
+      "patched_sha256": "59df22918a063cac09fd12dba087a03a86a19e7d201c79a9ddac550acb9b15b4",
       "upstream_git_blob": "673eabdf0fbee9a4ea6b08311973c0b5469cb222",
       "patch_reason": "deinitMovedPlace: consumer-side pending-move latch (PendingMoveDeinitState instance field of MachineState) and its helpers."
     },
@@ -2534,7 +2534,7 @@
     {
       "path": "Miri/Interpreter/PlaceMachine.lean",
       "upstream_sha256": "573ff212da394ad9ec43f2f7010b1d6f3050dfcc218785168a66a0ebdc804e96",
-      "patched_sha256": "e6d9cbbf12c2dc7d860f4bcefdbe8eec56bf775595ba517210cc8e63dc3b13ef",
+      "patched_sha256": "7b0211bdaf8dfcc8761b67b322ffc86da57ece261d4a57c2c35ff7b30a9c8250",
       "upstream_git_blob": "1b3e5cedb4ad98392086ef6867f156a15a74ef5f",
       "patch_reason": "deinitMovedPlace: rawAccessHooks / writeMemoryRawUninit (Tree-Borrows- and race-silent uninit writes), read-then-deinitialize readImmediate, overlap query, and the place-dictionary latch; drops the unused simp arguments the build linter reports in the upstream proofs memoryAccess_fresh_write and writeMemory_of_result (proof scripts only)."
     }

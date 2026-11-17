@@ -30,7 +30,9 @@ true)`).
   field-then-element, enum downcast, thin-pointer `Deref`+subslice, offset slice
   fat-pointer access after element `0` move, and union byte-window moves), each
   with its legacy contrast; the element stride is the pre-extension stride on
-  marker-free lists (`inferElemListByteStride_eq_legacy`); and the `ep1-A2`
+  marker-free lists (`inferElemListByteStride_eq_legacy`), and the moved-out
+  marker differs from every scalar respecting the `ScalarInt` range invariant
+  (`movedUninitValue_ne_wellFormed_scalar`, `ep1-A4`); and the `ep1-A2`
   canaries: `(*_ptr).field` through a thin pointer at a non-zero byte offset into
   an array element, exact `Deref` targets when distinct places hold equal values
   (`canary_D5_typed_deref_equal_values_exact_target`), strides skipping nested
@@ -97,7 +99,10 @@ true)`).
   rejected before `popRaw`; `call_initFnTailCallMoving_eq`,
   `call_initFnTailCallMoving_inPlace`,
   `canary_tailCallMoving_deinit_before_pop_inPlace_fail_closed`,
-  `canary_call_error_paths_deallocate_all_temps_and_preserve_error`),
+  `canary_call_error_paths_deallocate_all_temps_and_preserve_error`, and the
+  universal `call_deallocateTempArgsOnError_preserves_error` /
+  `call_tryCatch_deallocateTempArgsOnError`: every error-path guard returns a
+  successful result unchanged and rethrows the exact original error),
   and `Drop` (`call_initDropInPlaceCall_static_eq`,
   `canary_dropInPlace_preserves_initialized_and_detects_moved`);
   operand reads `PlaceMachine.readImmediate (← OperandMachine.evalOperandAt …)`
@@ -152,7 +157,8 @@ true)`).
 * **Error paths (`lean-miri`).** When a later argument of
   `Call.evalCalleeAndArgsMoving` faults, all temporary stack allocations are
   deallocated via `Call.deallocateTempArgsOnError` (without allowing any
-  deallocation failure to replace the original error), while earlier moved
+  deallocation failure to replace the original error,
+  `call_deallocateTempArgsOnError_preserves_error`), while earlier moved
   arguments stay deinitialized; every such fault is terminal for the machine.
 * **Unsizing (`lean-miri`).** `Cast.castMoving` deinitializes the moved fields of an
   unsized struct source, not its padding bytes.
@@ -927,6 +933,29 @@ theorem movedUninit_flags :
     valueContainsMovedUninit (.scalar { bits := 0, sizeBytes := 0 }) = false :=
   ⟨rfl, rfl, fun _ => rfl, rfl⟩
 
+/-- **The moved-out marker is not a well-formed scalar (`ep1-A4`).**
+`movedUninitValue` is `bits = 1` at width `0`, outside the `ScalarInt` range
+invariant `bits < 2^(8 * sizeBytes)`, so every scalar respecting that invariant
+(in particular the raw uninitialized union-overlay byte `.scalar ⟨0, 0⟩`) is
+distinct from it and is not flagged as moved out. -/
+theorem movedUninitValue_ne_wellFormed_scalar (sc : ScalarInt)
+    (hrange : sc.bits < 2 ^ (8 * sc.sizeBytes)) :
+    Value.scalar sc ≠ movedUninitValue ∧ valueContainsMovedUninit (.scalar sc) = false := by
+  obtain ⟨bits, size⟩ := sc
+  cases size with
+  | zero =>
+    have hb : bits = 0 := by simpa using hrange
+    subst hb
+    refine ⟨?_, rfl⟩
+    intro h
+    simp only [movedUninitValue, Value.scalar.injEq, ScalarInt.mk.injEq] at h
+    exact absurd h.1 (by decide)
+  | succ n =>
+    refine ⟨?_, rfl⟩
+    intro h
+    simp only [movedUninitValue, Value.scalar.injEq, ScalarInt.mk.injEq] at h
+    exact Nat.succ_ne_zero n h.2
+
 /-- A successful slot read makes the point update succeed, and the updated
 slot is read back. -/
 theorem get?_set?_isSome {α : Type} (xs : List α) (i : Nat) (x y : α)
@@ -992,8 +1021,10 @@ theorem evalOperand_read_uninit_root_ub
 
 /-- **Backward compatibility of the element stride.** On element lists without
 a moved-out leaf (every list the statement semantics, which never passes
-`deinitProjectedMoves := true`, produces) `inferElemListByteStride`, which skips
-elements holding moved-out leaves, is the pre-extension stride. -/
+`deinitProjectedMoves := true`, produces from well-formed values: the marker
+violates the `ScalarInt` range invariant, `movedUninitValue_ne_wellFormed_scalar`)
+`inferElemListByteStride`, which skips elements holding moved-out leaves, is the
+pre-extension stride. -/
 theorem inferElemListByteStride_eq_legacy (elems : List Value)
     (h : valueListContainsMovedUninit elems = false) :
     inferElemListByteStride elems = legacyInferElemListByteStride elems := by
@@ -5304,15 +5335,73 @@ theorem call_initFnTailCallMoving_inPlace
         (.invalidProgram "deinitMovedPlace: tail-call argument passed in place") := by
   simp only [Call.initFnTailCallMoving, hin, ↓reduceIte]
 
-/-- **`deallocateTempArgsOnError` always preserves the original `err`, universal (`ep1-B4`).**
-After deallocating every temporary in `temps` (ignoring any secondary
-deallocation error), `Call.deallocateTempArgsOnError` throws the exact original
-`err`; in particular on `#[]` it is `throw err`. -/
+/-- **`deallocateTempArgsOnError` without temporaries (`ep1-B4`).** On `#[]` it is
+exactly `throw err`, with the state unchanged; for every array of temporaries see
+`call_deallocateTempArgsOnError_preserves_error`. -/
 theorem call_deallocateTempArgsOnError_empty_eq
     {P S C E Other Extern FnABI ArgABI A : Type}
     (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C)
     (err : StepError) (s : S) :
     (Call.deallocateTempArgsOnError h choice #[] err : CallM S A) s = .error err s := rfl
+
+/-- **`deallocateTempArgsOnError` always throws the original `err`, universal
+(`ep1-B4`, `ep1-A4`).** For every array of temporaries and every
+`deallocateStack` hook (which may succeed or throw on any pointer), the
+deallocation loop absorbs every secondary failure, so the result is exactly
+`.error err`, in the state after the deallocations. -/
+theorem call_deallocateTempArgsOnError_preserves_error
+    {P S C E Other Extern FnABI ArgABI A : Type}
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C)
+    (temps : Array (Pointer (Option P))) (err : StepError) (s : S) :
+    ∃ s', (Call.deallocateTempArgsOnError h choice temps err : CallM S A) s = .error err s' := by
+  have loop : ∀ (l : List (Pointer (Option P))) (s : S), ∃ s',
+      (forIn l PUnit.unit (fun ptr _ => do
+          tryCatch (h.deallocateStack choice ptr) (fun _ => pure ())
+          pure (ForInStep.yield PUnit.unit)) : CallM S PUnit) s = .ok PUnit.unit s' := by
+    intro l
+    induction l with
+    | nil => intro s; exact ⟨s, rfl⟩
+    | cons ptr rest ih =>
+      intro s
+      rw [List.forIn_cons]
+      cases hd : h.deallocateStack choice ptr s with
+      | ok u s₁ =>
+        obtain ⟨s₂, hs₂⟩ := ih s₁
+        refine ⟨s₂, ?_⟩
+        simp only [bind, EStateM.bind, estatem_tryCatch_eq, hd, pure, EStateM.pure]
+        exact hs₂
+      | error e s₁ =>
+        obtain ⟨s₂, hs₂⟩ := ih s₁
+        refine ⟨s₂, ?_⟩
+        simp only [bind, EStateM.bind, estatem_tryCatch_eq, hd, pure, EStateM.pure]
+        exact hs₂
+  obtain ⟨s', hs'⟩ := loop temps.toList s
+  refine ⟨s', ?_⟩
+  unfold Call.deallocateTempArgsOnError
+  rw [← Array.forIn_toList, estatem_bind_of_ok _ _ s s' PUnit.unit hs']
+  rfl
+
+/-- **Error-path guards are transparent, universal (`ep1-A4`).** Every guard of
+the shape `try x catch err => deallocateTempArgsOnError h choice temps err` (in
+`materializeArgument`, `evalFnCallArgumentMoving`, `evalCalleeAndArgsMoving`,
+`evalCallTerminatorMoving` and `initFnTailCallMoving`) returns a successful `x`
+unchanged (result and state) and fails with exactly the error of a failing `x`
+(`call_deallocateTempArgsOnError_preserves_error`): the guards change only the
+post-error state, by freeing the temporaries. -/
+theorem call_tryCatch_deallocateTempArgsOnError
+    {P S C E Other Extern FnABI ArgABI A : Type}
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C)
+    (temps : Array (Pointer (Option P))) (x : CallM S A) (s : S) :
+    (∀ a s₁, x s = .ok a s₁ →
+      (tryCatch x (fun err => Call.deallocateTempArgsOnError h choice temps err) :
+        CallM S A) s = .ok a s₁) ∧
+    (∀ e s₁, x s = .error e s₁ → ∃ s₂,
+      (tryCatch x (fun err => Call.deallocateTempArgsOnError h choice temps err) :
+        CallM S A) s = .error e s₂) := by
+  refine ⟨fun a s₁ hx => ?_, fun e s₁ hx => ?_⟩
+  · rw [estatem_tryCatch_eq, hx]
+  · rw [estatem_tryCatch_eq, hx]
+    exact call_deallocateTempArgsOnError_preserves_error h choice temps e s₁
 
 /-- Call hooks for `initFnTailCallMoving`, `evalTailCallTerminatorMoving`, and
 `initDropInPlaceCall`: `popRaw` fails if caller cell `1` was not yet

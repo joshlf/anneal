@@ -100,8 +100,9 @@ private def finish (config : AccessConfig K User) (hooks : AccessState K User)
 /-- Borrow-tracker-silent and race-silent allocation access hooks: the pointer
 resolution of `accessHooks`, with no diagnostic, data-race, weak-memory, Tree
 Borrows or synchronization effect (`tbSilentAccessHooks`). Used only by the
-consumer-side (`deinitMovedPlace`) move deinitialization and in-place argument
-snapshot/restore, never by an ordinary source access. -/
+consumer-side (`deinitMovedPlace`) move deinitialization (`writeMemoryRawUninit`:
+moved operand reads, copies and casts, zero-length `Repeat` sources and moved
+call-argument sources), never by an ordinary source access. -/
 def rawAccessHooks (config : AccessConfig K User) :
     AllocationAccessHooks Provenance BorrowTree K (AccessState K User) ProvenanceExtra :=
   tbSilentAccessHooks (accessHooks config)
@@ -197,8 +198,9 @@ def mplacesOverlap (config : AccessConfig K User) (src dst : MPlaceTy Provenance
       decide (d.offset.bytes.toNat < s.offset.bytes.toNat + srcSize.bytes.toNat)
   | _, _ => return false
 
-/-- Consumer-side latch consumption for single-operand copies (`Use`, `Cast`,
-`Repeat`): `pure false` (no state access) unless `deinitMovedPlace` is enabled. -/
+/-- Consumer-side latch consumption for single-operand copies (`Use`, `Aggregate`
+fields, `Cast`, `Repeat`): `pure false` (no state access) unless
+`deinitMovedPlace` is enabled. -/
 def takeLastMoveDeinit (enabled : Bool) : M K User Bool :=
   if enabled then do
     let s ← get

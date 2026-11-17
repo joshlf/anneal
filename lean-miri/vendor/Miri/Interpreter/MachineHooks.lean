@@ -28,10 +28,13 @@ structure BorrowState where
 /-- Consumer-side (`deinitMovedPlace`) move-deinitialization latch.
 
 `pendingMoveDeinit` is armed when `OperandMachine.evalOperand` evaluates
-`Operand.Move` on an indirect (`MemPlace`) place in `deinitMovedPlace` mode, and
+`Operand.Move` on an indirect (`MemPlace`) place in `deinitMovedPlace` mode
+(including a projected immediate local once it is materialized), and
 atomically consumed by the corresponding `PlaceMachine.readImmediate`,
 `Place.copyRuntimePlaceNoValidate` or `Cast.castMoving` for that operand (`Use`,
-`UnaryOp`, `BinaryOp`, `Cast`, `SwitchInt`, `Assert`, `CopyNonOverlapping`).
+`UnaryOp`, `BinaryOp`, `Cast`, `Aggregate`, `Repeat`, `SwitchInt`, `Assert`,
+`CopyNonOverlapping`; a zero-length `Repeat`, which copies nothing, consumes it
+in `ExecutionMachine.rvalueHooks`).
 `pendingMoveDeinits` queues `(mplace, isMove)` per indirect operand evaluation so
 multi-operand paths preserve per-operand move-deinit intent across subsequent
 operand evaluations. Call/TailCall operands never use the latch

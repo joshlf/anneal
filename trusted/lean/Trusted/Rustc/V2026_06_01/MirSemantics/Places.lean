@@ -2752,11 +2752,12 @@ def evalGlobalDerefRead
 /--
 Moved-out leaf marker of the consumer-side move deinitialization
 (`evalOperand ... (deinitProjectedMoves := true)`): a scalar with `bits = 1` at
-width `0`. No `ScalarInt` produced by evaluation has width `0` except the raw
-uninitialized union-overlay byte `.scalar ⟨0, 0⟩` (`encodeRawAbstractByteVals`),
-from which this marker is distinct, so reading a union with uninitialized bytes
-stays defined behavior. The marker records no byte width, so byte-size inference
-over runtime values must skip it (`inferElemListByteStride`).
+width `0`. It violates the `ScalarInt` range invariant `bits < 2^(8 * sizeBytes)`
+(a width-`0` scalar has `bits = 0`), so it is distinct from every well-formed
+scalar, in particular from the raw uninitialized union-overlay byte
+`.scalar ⟨0, 0⟩` (`encodeRawAbstractByteVals`), and reading a union with
+uninitialized bytes stays defined behavior. The marker records no byte width, so
+byte-size inference over runtime values must skip it (`inferElemListByteStride`).
 -/
 @[reducible]
 def movedUninitValue : Value := .scalar { bits := 1, sizeBytes := 0 }
@@ -2808,8 +2809,8 @@ no static `pointeeTyOpt` is available, defaulting to `1` byte. A moved-out
 element (`movedUninitValue`) or a variant-`0` aggregate element holding a
 moved-out leaf (a moved field or element) is skipped, since the marker records
 no byte width: the stride is inferred from the next element. On marker-free
-lists (every list the statement semantics produces) this is the first element's
-size.
+lists (every list of well-formed values the statement semantics produces) this
+is the first element's size.
 -/
 @[reducible]
 def inferElemListByteStride : List Value → Nat
@@ -12732,8 +12733,8 @@ def writeStackThinPtrTypedDeref
                       match fullProj, oldSc.sizeBytes, Nat.beq residualBytes 0 with
                       | _ :: _, .zero, true =>
                         -- Re-initialization of a moved-out sub-place: only the
-                        -- consumer-side marker `movedUninitValue` (`bits = 1`),
-                        -- which the statement semantics never creates, is
+                        -- consumer-side marker `movedUninitValue` (`bits = 1` at
+                        -- width `0`, never a well-formed `ScalarInt`) is
                         -- replaced by a same-width store.
                         match Nat.beq oldSc.bits 1 with
                         | false => .none

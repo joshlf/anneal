@@ -152,7 +152,8 @@ structure CallHooks (P S C E Other Extern FnABI ArgABI : Type) where
   validateOperandBeforeCall : C → OpTy P → CallM S Unit := fun _ _ =>
     throw (.invalidProgram "deinitMovedPlace requires a pre-resolution argument validator")
   /-- Deallocate a temporary stack allocation that holds a materialized
-  argument once the call has consumed its arguments. Fails closed. -/
+  argument, once the call has consumed its arguments or on an error path
+  (`Call.deallocateTempArgsOnError`). Fails closed. -/
   deallocateStack : C → Pointer (Option P) → CallM S Unit := fun _ _ =>
     throw (.invalidProgram "deinitMovedPlace requires a temporary argument deallocator")
 
@@ -204,7 +205,9 @@ Both run with retagging disabled (`RetagMode.None`): the temporary is an
 evaluation-order snapshot, not a Rust-level typed copy, so its validation must
 not retag the argument's references (the ambient retag mode between statements
 is `Default`). The callee's `FnEntry` retag in `passArgument` therefore stays the
-only retag of the argument, exactly as in the source call path. -/
+only retag of the argument, exactly as in the source call path. If the validating
+copy fails, the temporary is deallocated and the original error is rethrown
+(`deallocateTempArgsOnError`). -/
 def materializeArgument (h : Hooks) (choice : C) (op : OpTy P) :
     M (FnArg P × Option (Pointer (Option P))) := do
   match op.op with
@@ -234,7 +237,8 @@ argument and the temporary allocation that holds it (if materialized).
 The temporary copy and the pre-resolution validation run with retagging disabled
 (`RetagMode.None`, see `materializeArgument`). No argument is passed in place, so
 no `uninit` is ever written through a protected tag. Unsized by-value arguments
-fail closed. -/
+fail closed. If the snapshot or the source deinitialization fails, the temporary
+is deallocated and the original error is rethrown (`deallocateTempArgsOnError`). -/
 def evalFnCallArgumentMoving (h : Hooks) (choice : C) (operand : MIR.Operand)
     (path : OperandPath) : M (FnArg P × Option (Pointer (Option P))) := do
   match operand with
