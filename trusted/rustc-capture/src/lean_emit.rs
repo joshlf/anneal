@@ -2563,6 +2563,12 @@ impl LcnfCtorLayoutPlan {
     /// the IR-checker limits. Each wrapper level has fewer constructors than the level below,
     /// and the root level has exactly one constructor.
     pub fn validate(&self) -> Result<(), LcnfLayoutError> {
+        let part_budget = LcnfCtorBudget::checked(
+            self.part_budget.max_scalar_bytes,
+            self.part_budget.max_obj_fields,
+        )?;
+        check_field_specs(&self.fields)?;
+        check_fields_fit(&self.fields, part_budget)?;
         let malformed = |reason: String| Err(LcnfLayoutError::MalformedPlan { reason });
         let Some(root_level) = self.levels.last() else {
             return malformed(String::from("no levels"));
@@ -2823,21 +2829,31 @@ fn check_lcnf_emission(
     }
     check_field_specs(&plan.fields)?;
     plan.validate()?;
-    if plan.is_flat() {
-        return Ok(());
-    }
-    let top = plan.levels.len() - 1;
     let mut reserved: HashSet<String> = LEAN_STRUCTURE_AUX_NAMES
         .split_whitespace()
         .map(str::to_owned)
         .collect();
+    if plan.is_flat() {
+        for field in &plan.fields {
+            if reserved.contains(&field.name) {
+                return Err(LcnfLayoutError::ReservedFieldName {
+                    name: field.name.clone(),
+                });
+            }
+        }
+        return Ok(());
+    }
+    let top = plan.levels.len() - 1;
+    let mut generated_types: HashSet<String> = HashSet::new();
     for (level, ctors) in plan.levels[..top].iter().enumerate() {
         for index in 0..ctors.len() {
-            reserved.insert(if level == 0 {
+            let type_name = if level == 0 {
                 format!("Part{}", index + 1)
             } else {
                 format!("Level{level}_Part{}", index + 1)
-            });
+            };
+            reserved.insert(type_name.clone());
+            generated_types.insert(type_name);
         }
     }
     for child in plan.root().children.clone() {
@@ -2855,9 +2871,12 @@ fn check_lcnf_emission(
                 name: field.name.clone(),
             });
         }
-        if let Some(atom) = lean_ident_atoms(&field.lean_ty)
-            .find(|&atom| atom == "self" || atom == struct_leaf || field_names.contains(atom))
-        {
+        if let Some(atom) = lean_ident_atoms(&field.lean_ty).find(|&atom| {
+            atom == "self"
+                || atom == struct_leaf
+                || field_names.contains(atom)
+                || generated_types.contains(atom)
+        }) {
             return Err(LcnfLayoutError::DependentFieldType {
                 field: field.name.clone(),
                 depends_on: atom.to_owned(),
@@ -2998,13 +3017,7 @@ pub fn render_lcnf_guarded_ctor_expr(
     field_exprs: &[(&str, &str)],
     plan: &LcnfCtorLayoutPlan,
 ) -> Result<String, LcnfLayoutError> {
-    if !is_lean_decl_name(struct_name) {
-        return Err(LcnfLayoutError::InvalidLeanName {
-            what: "structure",
-            name: struct_name.to_owned(),
-        });
-    }
-    plan.validate()?;
+    check_lcnf_emission(struct_name, plan, &[])?;
     let index_of: HashMap<&str, usize> = plan
         .fields
         .iter()
@@ -3023,12 +3036,17 @@ pub fn render_lcnf_guarded_ctor_expr(
                 field: name.to_owned(),
             });
         }
-        if expr.trim().is_empty() || expr.chars().any(char::is_control) {
+        let trimmed = expr.trim();
+        if trimmed.is_empty()
+            || expr.chars().any(char::is_control)
+            || trimmed.contains("--")
+            || trimmed.contains("/-")
+        {
             return Err(LcnfLayoutError::InvalidFieldExpr {
                 field: name.to_owned(),
             });
         }
-        exprs[index] = Some(expr.trim());
+        exprs[index] = Some(trimmed);
     }
     let mut complete = Vec::with_capacity(exprs.len());
     for (index, expr) in exprs.into_iter().enumerate() {
@@ -4149,12 +4167,31 @@ mod lcnf_tests {
     fn split_layout_rejects_collisions_and_dependent_types() {
         let flat = vec![
             LcnfFieldSpec::new("part1", "Nat", ObjectRef),
+            LcnfFieldSpec::new("Part1", "Nat", ObjectRef),
             LcnfFieldSpec::new("n", "Nat", ObjectRef),
             LcnfFieldSpec::new("v", "Fin n", ObjectRef),
-            LcnfFieldSpec::new("mk", "Nat", ObjectRef),
         ];
         // A flat structure keeps Lean's own scoping, so these fields are accepted there.
         assert!(emit_lcnf_guarded_structure("Small", &flat, &[]).is_ok());
+
+        // Structure auxiliary names (`mk`, `casesOn`, `rec`, ...) are reserved on both flat and
+        // split structures because Lean always declares them in the structure's namespace.
+        for aux in LEAN_STRUCTURE_AUX_NAMES.split_whitespace() {
+            let flat_aux = [LcnfFieldSpec::new(aux, "Nat", ObjectRef)];
+            assert_eq!(
+                emit_lcnf_guarded_structure("Small", &flat_aux, &[]),
+                Err(LcnfLayoutError::ReservedFieldName {
+                    name: aux.to_owned()
+                })
+            );
+            let plan_aux = default_plan(&flat_aux);
+            assert_eq!(
+                render_lcnf_guarded_ctor_expr("Small", &[(aux, "0")], &plan_aux),
+                Err(LcnfLayoutError::ReservedFieldName {
+                    name: aux.to_owned()
+                })
+            );
+        }
 
         let wide = |extra: &[LcnfFieldSpec]| -> Vec<LcnfFieldSpec> {
             let mut fields = extra.to_vec();
@@ -4169,10 +4206,27 @@ mod lcnf_tests {
                     name: reserved.to_owned()
                 })
             );
+            let plan = default_plan(&fields);
+            let exprs = owned_exprs(&fields);
+            assert_eq!(
+                render_lcnf_guarded_ctor_expr("Wide", &borrowed(&exprs), &plan),
+                Err(LcnfLayoutError::ReservedFieldName {
+                    name: reserved.to_owned()
+                })
+            );
         }
-        let dependent = wide(&flat[1..3]);
+        let dependent = wide(&flat[2..4]);
         assert_eq!(
             emit_lcnf_guarded_structure("Wide", &dependent, &[]),
+            Err(LcnfLayoutError::DependentFieldType {
+                field: String::from("v"),
+                depends_on: String::from("n")
+            })
+        );
+        let dep_plan = default_plan(&dependent);
+        let dep_exprs = owned_exprs(&dependent);
+        assert_eq!(
+            render_lcnf_guarded_ctor_expr("Wide", &borrowed(&dep_exprs), &dep_plan),
             Err(LcnfLayoutError::DependentFieldType {
                 field: String::from("v"),
                 depends_on: String::from("n")
@@ -4183,6 +4237,14 @@ mod lcnf_tests {
             emit_lcnf_guarded_structure("Wide", &uses_self, &[]),
             Err(LcnfLayoutError::DependentFieldType { .. })
         ));
+        let shadows_part = wide(&[LcnfFieldSpec::new("ext_part", "Option Part1", ObjectRef)]);
+        assert_eq!(
+            emit_lcnf_guarded_structure("Wide", &shadows_part, &[]),
+            Err(LcnfLayoutError::DependentFieldType {
+                field: String::from("ext_part"),
+                depends_on: String::from("Part1")
+            })
+        );
         let recursive = wide(&[LcnfFieldSpec::new("next", "Option Node", ObjectRef)]);
         assert_eq!(
             emit_lcnf_guarded_structure("Demo.Node", &recursive, &[]),
@@ -4362,7 +4424,7 @@ mod lcnf_tests {
                 field: String::from("f3")
             })
         );
-        for bad in ["", "  ", "1\n"] {
+        for bad in ["", "  ", "1\n", "1 -- comment", "1 /- comment -/"] {
             let mut invalid = refs.clone();
             invalid[0] = ("f0", bad);
             assert_eq!(
@@ -5136,6 +5198,19 @@ mod lcnf_tests {
                 .map(|index| format!("  z{index} : Z\n"))
                 .collect::<String>()
         );
+        // Alternating `(Bool, UInt64)` pairs test that Lean's IR scalar area packs mixed-width
+        // scalars without inter-field alignment padding: `113 * (1 + 8) + 7 = 1024 B` is accepted
+        // while `113 * (1 + 8) + 8 = 1025 B` is rejected.
+        let mut mixed_align_1024 = Vec::with_capacity(233);
+        for index in 0..113 {
+            mixed_align_1024.push(LcnfFieldSpec::new(format!("b{index}"), "Bool", BOOL));
+            mixed_align_1024.push(LcnfFieldSpec::new(format!("u{index}"), "UInt64", U64));
+        }
+        for index in 0..7 {
+            mixed_align_1024.push(LcnfFieldSpec::new(format!("tail{index}"), "Bool", BOOL));
+        }
+        let mut mixed_align_1025 = mixed_align_1024.clone();
+        mixed_align_1025.push(LcnfFieldSpec::new("tail7", "Bool", BOOL));
         let cases = vec![
             // `PROTOTYPE_REPORT.md` §4.3, in order.
             unguarded_flat_case("flat_130xUInt64_1040B", &u64s(130)),
@@ -5196,11 +5271,21 @@ mod lcnf_tests {
                     LcnfCtorFootprint::of_kinds(zero_relevant_parent),
                 ],
             ),
+            unguarded_flat_case("mixed_align_1024B_accepted", &mixed_align_1024),
+            unguarded_flat_case("mixed_align_1025B_rejected", &mixed_align_1025),
+            guarded_case(
+                "split_mixed_align_1025B_960B",
+                &default_plan(&mixed_align_1025),
+                &["Inhabited"],
+            ),
         ];
         assert_eq!(cases[0].predicted, [IrCtorLimit::Scalar.lean_diagnostic()]);
         assert_eq!(cases[5].predicted, [IrCtorLimit::Fields.lean_diagnostic()]);
         assert_eq!(cases[9].predicted, [IrCtorLimit::Scalar.lean_diagnostic()]);
         assert_eq!(cases[17].predicted, [IrCtorLimit::Fields.lean_diagnostic()]);
+        assert!(cases[18].predicted.is_empty());
+        assert_eq!(cases[19].predicted, [IrCtorLimit::Scalar.lean_diagnostic()]);
+        assert!(cases[20].predicted.is_empty());
         assert!(cases[1].predicted.is_empty() && cases[10].predicted.is_empty());
         assert_lean_matches_model("lcnf_live_lean_probe_matches_model", &cases);
     }

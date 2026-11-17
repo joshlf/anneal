@@ -785,23 +785,75 @@ def resolve_replay_threads(
     return parse_replay_threads(raw, REPLAY_THREADS_ENV), "env"
 
 
-_ENV_OPTIONS_WITH_OPERAND = frozenset({"-u", "--unset", "-C", "--chdir"})
+_ENV_OPTIONS_WITH_OPERAND = frozenset(
+    {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}
+)
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
 _LAKE_OPTIONS_WITH_OPERAND = frozenset({"-d", "--dir", "-f", "--file", "-K"})
-_PYTHON_EXE_RE = re.compile(r"(?:python|pypy)(?:[0-9]+(?:\.[0-9]+)*)?[a-z]*")
+_UV_OPTIONS_WITH_OPERAND = frozenset(
+    {
+        "-p",
+        "--python",
+        "--directory",
+        "--project",
+        "--config-file",
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+        "--env-file",
+        "--index",
+        "--default-index",
+        "--extra-index-url",
+        "-f",
+        "--find-links",
+        "--package",
+        "--group",
+        "--extra",
+        "--color",
+    }
+)
+_LEAN_OPTIONS_WITH_OPERAND = frozenset(
+    {
+        "-M",
+        "--memory",
+        "-j",
+        "--threads",
+        "-t",
+        "--trust",
+        "-D",
+        "-o",
+        "-c",
+        "-b",
+        "--bc",
+        "--load-dynlib",
+        "--plugin",
+        "--deps",
+        "--root",
+        "-R",
+    }
+)
+_PYTHON_EXE_RE = re.compile(
+    r"(?:python|pypy)(?:[0-9]+(?:\.[0-9]+)*)?[a-z]*(?:-(?:dbg|debug))?"
+)
+_COMPILED_INSPECTOR_RE = re.compile(r"TrustedBoundary(?:-[0-9a-f]{64})?")
 _REPLAY_CHECKER_PROGRAMS = frozenset({"leanchecker", "lean4checker"})
 _AUDIT_SCRIPT_NAME = "check_trusted.py"
 _REPLAY_INSPECTOR_NAME = "TrustedBoundary.lean"
 
 
 def _strip_transparent_launchers(cmd: list[str]) -> list[str]:
-    """Drops `env [OPTION|NAME=VALUE]...` and `lake [OPTION]... env|exe|exec` prefixes."""
+    """Drops `env`, `lake env|exe|exec`, `uv run`, and `elan run` prefixes."""
     argv = list(cmd)
     while argv:
         name = posixpath.basename(argv[0])
         if name == "env":
             i = 1
             while i < len(argv):
+                if argv[i] == "--":
+                    i += 1
+                    while i < len(argv) and _ENV_ASSIGNMENT_RE.fullmatch(argv[i]):
+                        i += 1
+                    break
                 if argv[i] in _ENV_OPTIONS_WITH_OPERAND:
                     i += 2
                 elif argv[i].startswith("-") or _ENV_ASSIGNMENT_RE.fullmatch(argv[i]):
@@ -815,8 +867,41 @@ def _strip_transparent_launchers(cmd: list[str]) -> list[str]:
             while i < len(argv) and argv[i].startswith("-"):
                 i += 2 if argv[i] in _LAKE_OPTIONS_WITH_OPERAND else 1
             if i < len(argv) and argv[i] in ("env", "exe", "exec"):
-                argv = argv[i + 1 :]
+                i += 1
+                while i < len(argv) and argv[i].startswith("-"):
+                    if argv[i] == "--":
+                        i += 1
+                        break
+                    i += 2 if argv[i] in _LAKE_OPTIONS_WITH_OPERAND else 1
+                argv = argv[i:]
                 continue
+        if name == "uv":
+            i = 1
+            while i < len(argv) and argv[i].startswith("-"):
+                i += 2 if argv[i] in _UV_OPTIONS_WITH_OPERAND else 1
+            if i < len(argv) and argv[i] == "run":
+                i += 1
+                while i < len(argv) and argv[i].startswith("-"):
+                    if argv[i] == "--":
+                        i += 1
+                        break
+                    i += 2 if argv[i] in _UV_OPTIONS_WITH_OPERAND else 1
+                argv = argv[i:]
+                continue
+        if name == "elan":
+            i = 1
+            while i < len(argv) and argv[i].startswith("-"):
+                i += 1
+            if i < len(argv) and argv[i] == "run":
+                i += 1
+                while i < len(argv) and argv[i].startswith("-"):
+                    i += 1
+                if i < len(argv):
+                    i += 1  # toolchain positional argument
+                    if i < len(argv) and argv[i] == "--":
+                        i += 1
+                    argv = argv[i:]
+                    continue
         break
     return argv
 
@@ -848,13 +933,28 @@ def _python_script_operand(args: list[str]) -> str | None:
     return None
 
 
+def _lean_run_script_operand(args: list[str]) -> str | None:
+    """Returns the Lean file executed by `lean ... --run <file> [args...]`, or None."""
+    if "--run" not in args:
+        return None
+    i = args.index("--run") + 1
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return args[i + 1] if i + 1 < len(args) else None
+        if not arg.startswith("-"):
+            return arg
+        i += 2 if arg in _LEAN_OPTIONS_WITH_OPERAND else 1
+    return None
+
+
 def is_replay_or_audit_command(cmd: list[str]) -> bool:
     """Returns True for kernel replay / TCB audit invocations.
 
-    Recognized, optionally behind `env [NAME=VALUE]...` or `lake [OPTION]... env|exe`:
+    Recognized, optionally behind `env`, `lake env|exe`, `uv run`, or `elan run`:
     - `check_trusted.py`, run directly or as a Python interpreter's script;
     - `leanchecker` / `lean4checker`;
-    - `lean ... --run ... TrustedBoundary.lean` (any directory).
+    - `lean ... --run ... TrustedBoundary.lean` (or its compiled `TrustedBoundary` binary).
     Shell strings (`sh -c '...'`) and other launchers are not parsed; pass
     `--replay-threads` to pin such commands explicitly.
     """
@@ -862,17 +962,18 @@ def is_replay_or_audit_command(cmd: list[str]) -> bool:
     if not argv:
         return False
     program = posixpath.basename(argv[0])
-    if program in _REPLAY_CHECKER_PROGRAMS or program == _AUDIT_SCRIPT_NAME:
+    if (
+        program in _REPLAY_CHECKER_PROGRAMS
+        or program == _AUDIT_SCRIPT_NAME
+        or _COMPILED_INSPECTOR_RE.fullmatch(program) is not None
+    ):
         return True
     if _PYTHON_EXE_RE.fullmatch(program):
         script = _python_script_operand(argv[1:])
         return script is not None and posixpath.basename(script) == _AUDIT_SCRIPT_NAME
-    if program == "lean" and "--run" in argv[1:]:
-        run_at = argv.index("--run", 1)
-        return any(
-            posixpath.basename(arg) == _REPLAY_INSPECTOR_NAME
-            for arg in argv[run_at + 1 :]
-        )
+    if program == "lean":
+        script = _lean_run_script_operand(argv[1:])
+        return script is not None and posixpath.basename(script) == _REPLAY_INSPECTOR_NAME
     return False
 
 
@@ -2201,6 +2302,15 @@ def run_self_test() -> int:
                     "--run", "/tmp/anneal-trusted-x/TrustedBoundary.lean",
                 ],
                 ["/home/u/.elan/toolchains/t/bin/lean", "--run", "TrustedBoundary.lean"],
+                ["lean", "-M", "2048", "-j", "1", "--run", "trusted/audit/TrustedBoundary.lean"],
+                ["lean", "--run", "-M", "2048", "trusted/audit/TrustedBoundary.lean"],
+                ["lake", "env", "--", "lean", "--run", "trusted/audit/TrustedBoundary.lean"],
+                ["lake", "exe", "-q", "leanchecker", "Anneal"],
+                ["env", "--", "FOO=1", "python3-dbg", "trusted/audit/check_trusted.py"],
+                ["uv", "run", "--no-project", "python3", "trusted/audit/check_trusted.py"],
+                ["uv", "run", "--python", "3.12", "--", "trusted/audit/check_trusted.py"],
+                ["elan", "run", "leanprover/lean4:v4.34.1", "leanchecker", "Anneal"],
+                ["/tmp/cache/inspector-bin/TrustedBoundary-" + "a" * 64, "req.json", "res.json"],
             ):
                 with self.subTest(cmd=cmd):
                     self.assertTrue(is_replay_or_audit_command(cmd))
@@ -2219,6 +2329,9 @@ def run_self_test() -> int:
                 ["lean", "trusted/audit/TrustedBoundary.lean"],
                 ["lean", "--run", "Other.lean"],
                 ["lean", "TrustedBoundary.lean", "--run", "Other.lean"],
+                ["lean", "--run", "Other.lean", "trusted/audit/TrustedBoundary.lean"],
+                ["uv", "run", "python3", "scripts/other.py", "trusted/audit/check_trusted.py"],
+                ["elan", "run", "leanprover/lean4:v4.34.1", "lean", "Foo.lean"],
                 ["cargo", "test", "--manifest-path", "trusted/rustc-capture/Cargo.toml"],
                 ["python3", "-c", "import check_trusted"],
                 ["python3", "-m", "check_trusted"],
