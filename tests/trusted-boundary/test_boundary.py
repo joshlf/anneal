@@ -1824,6 +1824,39 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", expected_sub)
         specs_ws.unlink()
         ver_ws.write_text(ver_claim)
+        # `[adv ep2-B4]` The fail-closed field splitter must still accept ordinary field values:
+        # binder commas (`∀ x, ...` / `∃ n, ...`, also inside `{ ... }`), `match ... with`,
+        # `let ...;`, trailing commas, and `False`-valued helpers that no precondition uses.
+        b4_base = (
+            "import Trusted\nnamespace Specs.Demo.item_1\n"
+            "def pre (args : List Value) : Prop := args.length = 1\n"
+            "def unreachable : Prop := False\n"
+            "def post (args : List Value) (ret : Value) : Prop := ¬ unreachable\n"
+            "instance : ItemSpec \"demo::item_1\" := { pre := fun a => ∀ x : Nat, x = x ∧ pre a, post := post, }\n"
+            "instance : StatefulItemSpec \"demo::item_1\" where\n"
+            "  pre := fun args mem => PRE\n"
+            "  post := fun args _ ret _ => post args ret\n"
+            "end Specs.Demo.item_1\n"
+        )
+        for b4_pre in (
+            "∃ n : Nat, args.length = n ∧ mem = emptyMemory",
+            "match args with | [] => False | _ => pre args",
+            "let k := args.length; k = 1",
+            "False ∧ pre args → mem = emptyMemory",
+        ):
+            runner._scan_specs_module(b4_base.replace("PRE", b4_pre), "Demo.item_1", "Specs.Demo.item_1")
+        for b4_bad in (
+            b4_base.replace("PRE", "unreachable"),
+            b4_base.replace("PRE", "pre args ∧ unreachable"),
+            b4_base.replace("post := post, }", "post := post, pre := fun _ => False }").replace(
+                "{ pre := fun a => ∀ x : Nat, x = x ∧ pre a, ", "{ "
+            ).replace("PRE", "pre args"),
+        ):
+            expect_failure(lambda: runner._scan_specs_module(b4_bad, "Demo.item_1", "Specs.Demo.item_1"),
+                           1, "fault-coverage", "vacuous `False` precondition")
+        expect_failure(lambda: runner._scan_specs_module(
+            b4_base.replace("{ pre := fun a", "{ Obligations.Demo.item_1.defaultSpec with pre := fun a").replace(
+                "PRE", "pre args"), "Demo.item_1", "Specs.Demo.item_1"), 1, "fault-coverage", "`with` struct updates")
 
         shutil.rmtree(ws_dir)
         done("fault-site census, 12-class PropertyRegistry, source pins, 4+2 false-proof mutation probes, and --audit-fault-coverage")

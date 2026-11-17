@@ -12930,7 +12930,10 @@ def _split_structure_instance_fields(
     depth_at: list[int] = []
     depth = 0
     for tk, v in body:
-        if depth == 0 and tk == "Ident" and v in ("with", "where"):
+        # `[adv ep2-B4]`: only a depth-0 `where` is rejected here. A depth-0 `with` is the
+        # ordinary `match ... with` of a field value; a `{ s with pre := ... }` struct update
+        # is still rejected below because its body does not start with a field header.
+        if depth == 0 and tk == "Ident" and v == "where":
             return None
         depth_at.append(depth)
         if tk in ("LParen", "LBrace", "LBracket"):
@@ -12984,8 +12987,15 @@ def _split_structure_instance_fields(
             return None
         r = eq + 1
         while r < n:
+            # `[adv ep2-B4]`: a depth-0 `,` / `;` separates fields only when a field header (or
+            # the end of the body) follows; otherwise it belongs to the value
+            # (`fun args mem => ∀ x, P x`, `∃ n, ...`, `let x := e; ...`).
             if depth_at[r] == 0 and (
-                body[r][0] in ("Comma", "Semicolon") or header_colon_eq(r) is not None
+                (
+                    body[r][0] in ("Comma", "Semicolon")
+                    and (r + 1 == n or header_colon_eq(r + 1) is not None)
+                )
+                or header_colon_eq(r) is not None
             ):
                 break
             r += 1
@@ -13223,17 +13233,11 @@ def _scan_specs_module(
                         )
                     sig_tokens = cmd_slice[2:colon_eq_pos]
                     rhs_tokens = list(cmd_slice[colon_eq_pos + 1 :])
-                    param_names, is_prop = _extract_def_binders_and_is_prop(sig_tokens)
-                    if (
-                        is_prop
-                        and decl_name != "strictSafetyPre"
-                        and _is_trivially_false_spec_pre(rhs_tokens, local_defs)
-                    ):
-                        raise Failure(
-                            1,
-                            FAULT_COVERAGE_PHASE,
-                            f"vacuous `False` precondition helper `{val} {decl_name}` in {label}",
-                        )
+                    param_names, _is_prop = _extract_def_binders_and_is_prop(sig_tokens)
+                    # `[adv ep2-B4]`: a `False`-valued `Prop` helper is only vacuous when a
+                    # precondition uses it; every `pre` / `refine*Spec` precondition resolves
+                    # local helpers through `local_defs`, so an unused helper or one used only
+                    # in a postcondition (`post := fun _ _ => ¬ unreachable`) is not rejected.
                     local_defs[decl_name] = (param_names, rhs_tokens)
                     local_defs[f"{expected_ns}.{decl_name}"] = (param_names, rhs_tokens)
                     if decl_name == "envAssumed":

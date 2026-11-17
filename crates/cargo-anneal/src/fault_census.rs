@@ -8510,7 +8510,10 @@ fn split_structure_instance_fields(
     let mut depth_at = Vec::with_capacity(n);
     let mut depth = 0isize;
     for t in body {
-        if depth == 0 && matches!(t, LeanToken::Ident(v) if v == "with" || v == "where") {
+        // `[adv ep2-B4]`: only a depth-0 `where` is rejected here; a depth-0 `with` is the
+        // ordinary `match ... with` of a field value (a `{ s with pre := ... }` struct update is
+        // still rejected because its body does not start with a field header).
+        if depth == 0 && matches!(t, LeanToken::Ident(v) if v == "where") {
             return None;
         }
         depth_at.push(depth);
@@ -8591,8 +8594,12 @@ fn split_structure_instance_fields(
         let eq = header_colon_eq(k)?;
         let mut r = eq + 1;
         while r < n {
+            // `[adv ep2-B4]`: a depth-0 `,` / `;` separates fields only when a field header (or
+            // the end of the body) follows; otherwise it belongs to the value
+            // (`fun args mem => ∀ x, P x`, `∃ n, ...`, `let x := e; ...`).
             if depth_at[r] == 0
-                && (matches!(body[r], LeanToken::Comma | LeanToken::Semicolon)
+                && ((matches!(body[r], LeanToken::Comma | LeanToken::Semicolon)
+                    && (r + 1 == n || header_colon_eq(r + 1).is_some()))
                     || header_colon_eq(r).is_some())
             {
                 break;
@@ -8851,19 +8858,11 @@ pub fn scan_specs_module(
                         };
                         let sig_tokens = &cmd_slice[2..colon_eq_pos];
                         let rhs_tokens = cmd_slice[colon_eq_pos + 1..].to_vec();
-                        let (param_names, is_prop) = extract_def_binders_and_is_prop(sig_tokens);
-                        if is_prop
-                            && decl_name != "strictSafetyPre"
-                            && is_trivially_false_spec_pre(
-                                &rhs_tokens,
-                                &local_defs,
-                                &BTreeSet::new(),
-                            )
-                        {
-                            return Err(format!(
-                                "vacuous `False` precondition helper `{kw} {decl_name}` in Specs.{subject_suffix}"
-                            ));
-                        }
+                        // `[adv ep2-B4]`: a `False`-valued `Prop` helper is only vacuous when a
+                        // precondition uses it; every `pre` / `refine*Spec` precondition resolves
+                        // local helpers through `local_defs`, so unused or postcondition-only
+                        // helpers are not rejected.
+                        let (param_names, _is_prop) = extract_def_binders_and_is_prop(sig_tokens);
                         local_defs.insert(
                             decl_name.clone(),
                             (param_names.clone(), rhs_tokens.clone()),
@@ -14703,6 +14702,47 @@ end Mir.Probe.item",
             assert!(
                 scan_specs_module(vacuous_specs, "Demo.caller").is_err(),
                 "expected vacuous or non-canonical `Specs` to fail closed:\n{vacuous_specs}"
+            );
+        }
+
+        // `[adv ep2-B4]`: the fail-closed field splitter still accepts binder commas
+        // (`∀ x, ...` / `∃ n, ...`, also inside `{ ... }`), `match ... with`, `let ...;`,
+        // trailing commas, and `False`-valued helpers that no precondition uses; a vacuous field
+        // after a comma-bearing field and a `{ s with ... }` struct update still fail closed.
+        let b4_base = "import Trusted\nnamespace Specs.Demo.caller\n\
+            def pre (args : List Value) : Prop := args.length = 1\n\
+            def unreachable : Prop := False\n\
+            def post (args : List Value) (ret : Value) : Prop := ¬ unreachable\n\
+            instance : ItemSpec \"demo::caller\" := { pre := fun a => ∀ x : Nat, x = x ∧ pre a, post := post, }\n\
+            instance : StatefulItemSpec \"demo::caller\" where\n  pre := fun args mem => PRE\n  post := fun args _ ret _ => post args ret\n\
+            end Specs.Demo.caller\n";
+        for b4_pre in [
+            "∃ n : Nat, args.length = n ∧ mem = emptyMemory",
+            "match args with | [] => False | _ => pre args",
+            "let k := args.length; k = 1",
+            "False ∧ pre args → mem = emptyMemory",
+        ] {
+            let src = b4_base.replace("PRE", b4_pre);
+            assert!(
+                scan_specs_module(&src, "Demo.caller").is_ok(),
+                "expected non-vacuous `Specs` to pass: {:?}\n{src}",
+                scan_specs_module(&src, "Demo.caller")
+            );
+        }
+        for b4_bad in [
+            b4_base.replace("PRE", "unreachable"),
+            b4_base.replace("PRE", "pre args ∧ unreachable"),
+            b4_base
+                .replace("post := post, }", "post := post, pre := fun _ => False }")
+                .replace("{ pre := fun a => ∀ x : Nat, x = x ∧ pre a, ", "{ ")
+                .replace("PRE", "pre args"),
+            b4_base
+                .replace("{ pre := fun a", "{ Obligations.Demo.caller.defaultSpec with pre := fun a")
+                .replace("PRE", "pre args"),
+        ] {
+            assert!(
+                scan_specs_module(&b4_bad, "Demo.caller").is_err(),
+                "expected vacuous or struct-update `Specs` to fail closed:\n{b4_bad}"
             );
         }
 
