@@ -2786,74 +2786,133 @@ fn lean_ident_heads(lean_ty: &str) -> impl Iterator<Item = &str> {
         .filter(|head| head.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
 }
 
-/// True when all parentheses, brackets, braces, and string/character literals in `text` are
-/// balanced and closed, so wrapping `text` in `(...)` or `: <text> :=` cannot be broken out of.
+/// Lean `v4.34.1`'s `isLetterLike`: Greek letters other than `λ`, `Π`, and `Σ`, Coptic,
+/// polytonic Greek, the letter-like symbols block, and mathematical script letters.
+fn is_lean_letter_like(c: char) -> bool {
+    let v = u32::from(c);
+    ((0x3b1..=0x3c9).contains(&v) && v != 0x3bb)
+        || ((0x391..=0x3a9).contains(&v) && v != 0x3a0 && v != 0x3a3)
+        || (0x3ca..=0x3fb).contains(&v)
+        || (0x1f00..=0x1ffe).contains(&v)
+        || (0x2100..=0x214f).contains(&v)
+        || (0x1d49c..=0x1d59f).contains(&v)
+}
+
+/// Lean's `isIdFirst`: a character that starts an identifier.
+fn is_lean_id_first(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || is_lean_letter_like(c)
+}
+
+/// Lean's `isIdRest`: a character that continues an identifier (`x'`, `get!`, `x₁`).
+fn is_lean_id_rest(c: char) -> bool {
+    let v = u32::from(c);
+    is_lean_id_first(c)
+        || c.is_ascii_digit()
+        || matches!(c, '\'' | '!' | '?')
+        || (0x2080..=0x2089).contains(&v)
+        || (0x2090..=0x209c).contains(&v)
+        || (0x1d62..=0x1d6a).contains(&v)
+}
+
+/// True when `text` lexes, under a conservative subset of Lean `v4.34.1`'s token rules, with
+/// every string, character, and quoted-identifier (`«...»`) literal closed and every `()`, `[]`,
+/// `{}`, `⟨⟩`, and `⦃⦄` pair balanced, so emitting it inside `( ... )` or after `: ` cannot
+/// close a delimiter of the surrounding text.
+///
+/// A `'` that continues an identifier is a prime (`x'`, `α'`, `get!'`); any other `'` starts a
+/// character literal. Constructs this scanner does not lex the way Lean does are rejected: raw
+/// strings (`r"..."`, `r#"..."#`, in which `\` is no escape), interpolated strings (`s!"..."`,
+/// whose `{...}` holds code), and a `'` right after a numeric literal (whose end, as in `0x1F`
+/// or `1e3`, the scanner does not model).
 fn has_balanced_lean_delimiters(text: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Prev {
+        /// Start, whitespace, punctuation, or a closed literal.
+        Gap,
+        /// An identifier, `raw` when it is exactly `r` and `bang` when it ends in `!`.
+        Ident { raw: bool, bang: bool },
+        /// A numeric literal.
+        Number,
+    }
+    fn hex_digits(chars: &mut std::str::Chars<'_>, count: usize) -> bool {
+        (0..count).all(|_| chars.next().is_some_and(|d| d.is_ascii_hexdigit()))
+    }
     let mut stack: Vec<char> = Vec::new();
+    let mut prev = Prev::Gap;
     let mut chars = text.chars();
-    let mut prev_ident = false;
     while let Some(c) = chars.next() {
-        if c == '"' {
-            let mut closed = false;
-            while let Some(sc) = chars.next() {
-                if sc == '\\' {
-                    if chars.next().is_none() {
-                        return false;
-                    }
-                } else if sc == '"' {
-                    closed = true;
-                    break;
-                }
-            }
-            if !closed {
+        prev = match (prev, c) {
+            (Prev::Ident { raw: true, .. }, '"' | '#') | (Prev::Ident { bang: true, .. }, '"') => {
                 return false;
             }
-            prev_ident = false;
-            continue;
-        }
-        if c == '\'' && !prev_ident {
-            let Some(first) = chars.next() else {
-                return false;
-            };
-            if first == '\'' {
-                return false;
+            (Prev::Ident { .. }, c) if is_lean_id_rest(c) => Prev::Ident {
+                raw: false,
+                bang: c == '!',
+            },
+            (Prev::Number, '\'') => return false,
+            (Prev::Number, c) if c.is_ascii_alphanumeric() || matches!(c, '_' | '.') => {
+                Prev::Number
             }
-            if first == '\\' {
-                let mut closed = false;
-                let mut escaped_len = 0usize;
-                for esc in chars.by_ref() {
-                    if esc == '\'' && escaped_len > 0 {
-                        closed = true;
-                        break;
-                    }
-                    escaped_len += 1;
-                    if escaped_len > 6 {
-                        return false;
+            (_, '"') => {
+                loop {
+                    match chars.next() {
+                        None => return false,
+                        Some('\\') => {
+                            if chars.next().is_none() {
+                                return false;
+                            }
+                        }
+                        Some('"') => break,
+                        Some(_) => {}
                     }
                 }
-                if !closed {
+                Prev::Gap
+            }
+            (_, '\'') => {
+                let closed_char = match chars.next() {
+                    None | Some('\'') => false,
+                    Some('\\') => match chars.next() {
+                        Some('\\' | '"' | '\'' | 'n' | 't' | 'r') => true,
+                        Some('x') => hex_digits(&mut chars, 2),
+                        Some('u') => hex_digits(&mut chars, 4),
+                        _ => false,
+                    },
+                    Some(_) => true,
+                };
+                if !closed_char || chars.next() != Some('\'') {
                     return false;
                 }
-            } else if chars.next() != Some('\'') {
-                return false;
+                Prev::Gap
             }
-            prev_ident = false;
-            continue;
-        }
-        prev_ident = c.is_ascii_alphanumeric() || c == '_' || c == '\'';
-        match c {
-            '(' => stack.push(')'),
-            '[' => stack.push(']'),
-            '{' => stack.push('}'),
-            '\u{27e8}' => stack.push('\u{27e9}'),
-            '\u{2983}' => stack.push('\u{2984}'),
-            ')' | ']' | '}' | '\u{27e9}' | '\u{2984}' => {
+            (_, '\u{ab}') => {
+                if !chars.by_ref().any(|q| q == '\u{bb}') {
+                    return false;
+                }
+                Prev::Gap
+            }
+            (_, c) if is_lean_id_first(c) => Prev::Ident {
+                raw: c == 'r',
+                bang: false,
+            },
+            (_, c) if c.is_ascii_digit() => Prev::Number,
+            (_, '(' | '[' | '{' | '\u{27e8}' | '\u{2983}') => {
+                stack.push(match c {
+                    '(' => ')',
+                    '[' => ']',
+                    '{' => '}',
+                    '\u{27e8}' => '\u{27e9}',
+                    _ => '\u{2984}',
+                });
+                Prev::Gap
+            }
+            (_, ')' | ']' | '}' | '\u{27e9}' | '\u{2984}') => {
                 if stack.pop() != Some(c) {
                     return false;
                 }
+                Prev::Gap
             }
-            _ => {}
-        }
+            _ => Prev::Gap,
+        };
     }
     stack.is_empty()
 }
@@ -2963,7 +3022,11 @@ fn check_lcnf_emission(
         .map(|field| field.name.as_str())
         .collect();
     for field in &plan.fields {
-        if reserved.contains(&field.name) {
+        // `deriving C` on a generated structure `<struct_name>.<T>` declares the instance
+        // `<struct_name>.instC<T>` (`Wide.instReprPart1`), which an accessor would collide with.
+        let derived_instance = field.name.starts_with("inst")
+            && generated_types.iter().any(|ty| field.name.ends_with(ty.as_str()));
+        if reserved.contains(&field.name) || derived_instance {
             return Err(LcnfLayoutError::ReservedFieldName {
                 name: field.name.clone(),
             });
@@ -2999,11 +3062,16 @@ fn check_lcnf_emission(
 /// `abbrev <struct_name>.<field> (self : <struct_name>) : <type> := self.<path>` accessor per
 /// original field, so `s.<field>` keeps working and reads exactly the original field.
 ///
-/// Every split part whose fields are all [`LcnfFieldKind::Irrelevant`] is declared
-/// `structure <struct_name>.Part<j> : Type _ where`. Lean would otherwise infer `Prop` for a
-/// part of proofs, erase it in its wrapper (violating [`CtorReprKind::Erased`] -> `ObjectRef`
-/// and possibly unboxing the wrapper), and fail to derive `Repr`, `BEq`, `Hashable`, or `Ord`
-/// for it.
+/// The split layout keeps the universe of the flat structure. When the structure has a relevant
+/// field (the flat structure is a `Type`), a part whose fields are all
+/// [`LcnfFieldKind::Irrelevant`] is declared `structure <struct_name>.Part<j> : Type _ where`:
+/// Lean would otherwise infer `Prop` for a part of proofs, erase it in its wrapper (possibly
+/// unboxing the wrapper, see [`CtorReprKind::Erased`]), and fail to derive `Repr` or `BEq` for
+/// it. A structure without relevant fields is emitted without annotations, so Lean infers the
+/// universe of every part and of the root exactly as for the flat structure: a structure of
+/// proofs stays a proposition (with proof irrelevance), on which Lean derives `Repr` and `BEq`
+/// neither for the flat structure nor for its parts, and has no unboxed scalar whose
+/// accounting an erased part could change.
 pub fn render_lcnf_guarded_structure(
     struct_name: &str,
     plan: &LcnfCtorLayoutPlan,
@@ -3015,14 +3083,17 @@ pub fn render_lcnf_guarded_structure(
     } else {
         format!("  deriving {}\n", derives.join(", "))
     };
+    let has_relevant_field = plan.fields.iter().any(|field| field.kind.is_relevant());
     let mut out = String::new();
     for (level, ctors) in plan.levels.iter().enumerate() {
         for (index, ctor) in ctors.iter().enumerate() {
             if !out.is_empty() {
                 out.push('\n');
             }
-            let irrelevant_part =
-                level == 0 && !plan.is_flat() && ctor.repr == CtorReprKind::Erased;
+            let irrelevant_part = level == 0
+                && !plan.is_flat()
+                && has_relevant_field
+                && ctor.repr == CtorReprKind::Erased;
             out.push_str(&format!(
                 "structure {}{} where\n",
                 plan.ctor_lean_name(struct_name, level, index),
@@ -3923,13 +3994,15 @@ mod lcnf_tests {
             assert_eq!(out.contains(&format!("structure Mixed.{part}\n")), declared, "{part}");
         }
 
-        // Even when no field is relevant (`300 x True`), split parts are declared `: Type _` so
-        // `CtorReprKind::Erased -> ObjectRef` holds and `Repr`/`BEq`/`Hashable` can be derived.
+        // Without a relevant field, the flat structure is a proposition when its fields are
+        // proofs, and so are the unannotated parts and root (checked against Lean by
+        // `lcnf_live_lean_split_layout_keeps_the_flat_universe`): nothing is declared `: Type _`.
         let proofs = uniform(300, "h", "True", Irrelevant);
         let out = emit_lcnf_guarded_structure("Proofs", &proofs, &[]).unwrap();
         assert!(
-            out.contains("structure Proofs.Part1 : Type _ where\n")
-                && out.contains("structure Proofs.Part2 : Type _ where\n")
+            out.contains("structure Proofs.Part1 where\n")
+                && out.contains("structure Proofs.Part2 where\n")
+                && !out.contains("Type _")
         );
         // Flat structures are never annotated.
         let flat = [
@@ -4369,6 +4442,74 @@ mod lcnf_tests {
     }
 
     #[test]
+    fn lean_delimiter_scanner_follows_lean_tokens() {
+        for accepted in [
+            "Nat",
+            "Fin (n + 1)",
+            "x' + y''",
+            // `α' → β₁'`: Lean identifiers continue with letter-like and subscript characters.
+            "\u{3b1}' \u{2192} \u{3b2}\u{2081}'",
+            "get!' x",
+            "'a' :: '\\n' :: '\\x41' :: '\\u03B1' :: ['\\'', '\"', ')']",
+            "\"a)b\\\"(\" ++ \"\"",
+            // `«end» «a"b)»`: quoted identifiers end at the first `»`.
+            "\u{ab}end\u{bb} \u{ab}a\"b)\u{bb}",
+            "\u{27e8}1, 2\u{27e9} \u{2983}x\u{2984}",
+            "{ x := 1 }",
+            "1.5 + 0x1F + 2",
+            "(if ')' == '(' then 0 else 1)",
+        ] {
+            assert!(has_balanced_lean_delimiters(accepted), "{accepted}");
+        }
+        for rejected in [
+            "(Nat",
+            "Nat)",
+            "Array [Nat)",
+            "\"unclosed",
+            "'ab'",
+            "''",
+            "'\\q'",
+            "'\\x4'",
+            "\u{ab}unclosed",
+            // Lean reads `«a"») , g := («b"»` as `«a"»`, `)`, `, g := (`, `«b"»`: the `)` would
+            // close the surrounding parenthesis.
+            "\u{ab}a\"\u{bb}) , g := (\u{ab}b\"\u{bb}",
+            // Raw strings have no escapes: Lean reads `r"\"` as a complete literal.
+            "r\"\\\") , g := (r\"\\\"\"",
+            "r#\"a\"#",
+            // Interpolated strings hold code in `{...}`.
+            "s!\"{x}\"",
+            // Where a numeric literal ends (`0x1`, then `'"'`) is not modeled.
+            "0x1'\"'",
+            "1'a'",
+        ] {
+            assert!(!has_balanced_lean_delimiters(rejected), "{rejected}");
+        }
+        // The quoted-identifier breakout is refused for field expressions and types alike.
+        let fields = [
+            LcnfFieldSpec::new("f", "Nat", ObjectRef),
+            LcnfFieldSpec::new("g", "Nat", ObjectRef),
+        ];
+        let plan = default_plan(&fields);
+        let breakout = "\u{ab}a\"\u{bb}) , g := (\u{ab}b\"\u{bb}";
+        assert_eq!(
+            render_lcnf_guarded_ctor_expr("T", &[("f", breakout), ("g", "0")], &plan),
+            Err(LcnfLayoutError::InvalidFieldExpr {
+                field: String::from("f")
+            })
+        );
+        let typed = [LcnfFieldSpec::new(
+            "f",
+            "\u{ab}a\"\u{bb}) (x : \u{ab}b\"\u{bb}",
+            ObjectRef,
+        )];
+        assert!(matches!(
+            plan_lcnf_ctor_layout_levels(&typed, 960, 240),
+            Err(LcnfLayoutError::InvalidLeanType { .. })
+        ));
+    }
+
+    #[test]
     fn split_layout_rejects_collisions_and_dependent_types() {
         let flat = vec![
             LcnfFieldSpec::new("part1", "Nat", ObjectRef),
@@ -4403,7 +4544,16 @@ mod lcnf_tests {
             fields.extend(u64s(130));
             fields
         };
-        for reserved in ["part1", "part2", "Part1", "Part2", "mk", "casesOn"] {
+        for reserved in [
+            "part1",
+            "part2",
+            "Part1",
+            "Part2",
+            "mk",
+            "casesOn",
+            "instReprPart1",
+            "instBEqPart2",
+        ] {
             let fields = wide(&[LcnfFieldSpec::new(reserved, "Nat", ObjectRef)]);
             assert_eq!(
                 emit_lcnf_guarded_structure("Wide", &fields, &[]),
@@ -4491,6 +4641,8 @@ mod lcnf_tests {
         let fine = wide(&[
             LcnfFieldSpec::new("part", "Nat", ObjectRef),
             LcnfFieldSpec::new("v", "Fin 3", ObjectRef),
+            LcnfFieldSpec::new("instances", "Nat", ObjectRef),
+            LcnfFieldSpec::new("below", "Nat", ObjectRef),
         ]);
         assert!(emit_lcnf_guarded_structure("Wide", &fine, &[]).is_ok());
     }
@@ -5646,16 +5798,61 @@ mod lcnf_tests {
                 &default_plan(&fields),
                 &["Inhabited", "Repr", "BEq", "Hashable"],
             ),
-            guarded_case(
-                "guarded_all_proof_fields_derive",
-                &default_plan(&uniform(300, "h", "True", Irrelevant)),
-                &["Inhabited", "Repr", "BEq", "Hashable"],
-            ),
         ];
         assert!(cases[0].predicted.is_empty());
         assert_eq!(cases[1].predicted, [IrCtorLimit::Scalar.lean_diagnostic()]);
         assert!(cases[2..].iter().all(|case| case.predicted.is_empty()));
         assert_lean_matches_model("lcnf_live_lean_irrelevant_parts_stay_boxed_types", &cases);
+    }
+
+    #[test]
+    fn lcnf_live_lean_split_layout_keeps_the_flat_universe() {
+        let proofs = uniform(300, "h", "True", Irrelevant);
+        let flat_proofs = default_plan(&proofs[..240]);
+        let split_proofs = default_plan(&proofs);
+        let mut with_data = nats(240);
+        with_data.extend(uniform(300, "h", "True", Irrelevant));
+        let split_data = default_plan(&with_data);
+        assert!(flat_proofs.is_flat() && !split_proofs.is_flat() && !split_data.is_flat());
+        let structure = |plan: &LcnfCtorLayoutPlan, derives: &[&str]| {
+            render_lcnf_guarded_structure("S", plan, derives).expect("guarded structure")
+        };
+        // `S` is a proposition: it is a `Prop`, its values are definitionally equal, and a
+        // `theorem` can state it.
+        let proposition = |plan: &LcnfCtorLayoutPlan| {
+            let exprs: Vec<(&str, &str)> = plan
+                .fields()
+                .iter()
+                .map(|field| (field.name.as_str(), "trivial"))
+                .collect();
+            let value = render_lcnf_guarded_ctor_expr("S", &exprs, plan).expect("value");
+            format!(
+                "\nexample : Prop := S\nexample (a b : S) : a = b := rfl\ntheorem value : S := {value}\n"
+            )
+        };
+        // Annotating the parts of a structure of proofs would turn it into a `Type`.
+        let annotated = structure(&split_proofs, &[]).replace(" where\n  h", " : Type _ where\n  h");
+        assert_eq!(annotated.matches(" : Type _ where").count(), 2);
+        let cases = [
+            ("flat_proofs_are_prop", structure(&flat_proofs, &["Inhabited"]) + &proposition(&flat_proofs), true),
+            ("split_proofs_are_prop", structure(&split_proofs, &["Inhabited"]) + &proposition(&split_proofs), true),
+            ("split_data_is_type", structure(&split_data, &["Inhabited"]) + "\nexample : Type := S\n", true),
+            ("annotated_split_proofs_are_no_prop", annotated + "\nexample : Prop := S\n", false),
+            // Lean derives no `Repr` for a proposition, flat or split.
+            ("flat_proofs_derive_no_repr", structure(&flat_proofs, &["Repr"]), false),
+            ("split_proofs_derive_no_repr", structure(&split_proofs, &["Repr"]), false),
+        ];
+        let probes: Vec<LeanProbeCase> = cases
+            .iter()
+            .map(|(name, body, _)| LeanProbeCase::new(name, body, &[]))
+            .collect();
+        let Some(errors) = run_lean_probe("lcnf_live_lean_split_layout_keeps_the_flat_universe", &probes)
+        else {
+            return;
+        };
+        for ((name, _, accepted), case_errors) in cases.iter().zip(&errors) {
+            assert_eq!(case_errors.is_empty(), *accepted, "{name}: {case_errors:?}");
+        }
     }
 
     #[test]
