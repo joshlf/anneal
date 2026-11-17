@@ -5934,18 +5934,9 @@ _MIR_AST_TYPE_NAMES: frozenset[str] = frozenset((
     "ConstScalar",
     "ConstValue",
     "ContractRole",
-    "CrateClaim",
-    "CrateVerificationResult",
-    "ItemProof",
-    "ItemSpec",
     "List",
     "LocalDecl",
-    "MirCallContract",
     "MirPhaseTag",
-    "ModularItemProof",
-    "ModularItemSpec",
-    "ModularVerificationClaim",
-    "ModularVerificationResult",
     "Mutability",
     "Nat",
     "NonDivergingIntrinsic",
@@ -5961,6 +5952,30 @@ _MIR_AST_TYPE_NAMES: frozenset[str] = frozenset((
     "ScalarInt",
     "Statement",
     "StatementKind",
+    "SwitchTargets",
+    "Terminator",
+    "TerminatorKind",
+    "Ty",
+    "UnOp",
+    "UnwindAction",
+))
+
+# `[adv ep2-B2]` `Trusted.VerificationResult` names that a strict `Mir/<Item>.lean`
+# declaration may not reuse. Kept separate from `_MIR_AST_TYPE_NAMES` so that the
+# namespace-segment check (which sees the CamelCase crate name, e.g. a crate named
+# `item_spec` -> `Mir.ItemSpec.<item>`) does not reject legitimate crates; qualified
+# (`_root_.` / dotted) declarations are rejected outright, so these plain names can never
+# leak out of the module's own `Mir.<Item>` namespace anyway.
+_MIR_SHADOW_DECL_NAMES: frozenset[str] = _MIR_AST_TYPE_NAMES | frozenset((
+    "CrateClaim",
+    "CrateVerificationResult",
+    "ItemProof",
+    "ItemSpec",
+    "MirCallContract",
+    "ModularItemProof",
+    "ModularItemSpec",
+    "ModularVerificationClaim",
+    "ModularVerificationResult",
     "StatefulEquivClaim",
     "StatefulEquivItemProof",
     "StatefulEquivItemSpec",
@@ -5969,20 +5984,14 @@ _MIR_AST_TYPE_NAMES: frozenset[str] = frozenset((
     "StatefulItemSpec",
     "StatefulVerificationClaim",
     "StatefulVerificationResult",
-    "SwitchTargets",
-    "Terminator",
-    "TerminatorKind",
     "TotalItemProof",
     "TotalItemSpec",
     "TotalVerificationClaim",
     "TotalVerificationResult",
-    "Ty",
     "UbExceptionClaim",
     "UbExceptionItemProof",
     "UbExceptionItemSpec",
     "UbExceptionVerificationResult",
-    "UnOp",
-    "UnwindAction",
     "VerificationClaim",
     "VerificationResult",
 ))
@@ -6059,6 +6068,10 @@ def _fc_is_lean_command_start(tok: tuple[str, Any]) -> bool:
 
 def _shadows_mir_ast_name(name: str) -> bool:
     return any(seg in _MIR_AST_TYPE_NAMES for seg in name.split("."))
+
+
+def _shadows_mir_decl_name(name: str) -> bool:
+    return any(seg in _MIR_SHADOW_DECL_NAMES for seg in name.split("."))
 
 
 class _MirTokenCursor:
@@ -7324,7 +7337,7 @@ def check_strict_mir_module_grammar(tokens: list[tuple[str, Any]]) -> None:
                 raise CensusScanError(
                     "malformed_syntax", "`def` without a plain identifier name"
                 )
-            if _shadows_mir_ast_name(name) or _fc_is_lean_command_start(tokens[i + 1]):
+            if _shadows_mir_decl_name(name) or _fc_is_lean_command_start(tokens[i + 1]):
                 raise CensusScanError(
                     "malformed_syntax",
                     f"declaration `{name}` shadows a MIR AST name or keyword",
@@ -7333,6 +7346,14 @@ def check_strict_mir_module_grammar(tokens: list[tuple[str, Any]]) -> None:
                 raise CensusScanError(
                     "malformed_syntax",
                     f"qualified `def {name}` is not allowed in strict Mir module (expected bare `def body`)",
+                )
+            if "." in name:
+                # `[adv ep2-B2]`: `def _root_.X` / `def A.B` escapes the module's own
+                # `Mir.<Item>` namespace and can shadow names resolved inside the
+                # `Obligations` / `Verify` namespaces of every importing module.
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"qualified `def {name}` is not allowed in strict Mir module (declarations must be plain identifiers)",
                 )
             if i + 2 >= n or tokens[i + 2][0] != "Colon":
                 raise CensusScanError(
@@ -9864,6 +9885,127 @@ def _scan_lean_module_imports(text: str, label: str) -> list[str]:
     return out
 
 
+_DECL_COMMAND_KWS: frozenset[str] = frozenset((
+    "def",
+    "abbrev",
+    "theorem",
+    "lemma",
+    "instance",
+    "opaque",
+    "axiom",
+    "structure",
+    "inductive",
+    "class",
+    "example",
+))
+
+
+def _check_module_scope_confinement(
+    tokens: list[tuple[str, Any]],
+    own_ns: str,
+    label: str,
+    *,
+    allow_nested: bool = False,
+    allow_sections: bool = False,
+) -> None:
+    """`[adv ep2-B2]` Confine every declaration of an audited workspace module to its own
+    namespace.
+
+    Lean resolves an identifier inside `namespace N` by trying every prefix of `N` BEFORE
+    any `open`ed namespace, so a declaration named e.g. `Verify.<Item>.VerificationResult`
+    or `Verify.Obligations.<Item>.claim` in ANY module imported by `Verify/<Item>.lean`
+    (its `Specs`, `Proof`, `Assumptions`, `Obligations`, or `Mir` cone) silently replaces
+    the canonical certificate statement while every token of `Verify/<Item>.lean` still
+    looks canonical. Require the first namespace to be exactly `own_ns` (child namespaces
+    only when `allow_nested`), every declaration to appear inside it, no `_root_`-qualified
+    declaration or namespace, and no `export` aliasing.
+    """
+    stack: list[tuple[str, str | None]] = []
+    n = len(tokens)
+    for idx in _top_level_token_indices(tokens):
+        tk, val = tokens[idx]
+        if tk != "Ident":
+            continue
+        nxt = tokens[idx + 1] if idx + 1 < n else None
+        nxt_name = (
+            str(nxt[1])
+            if nxt is not None and nxt[0] == "Ident" and not _fc_is_lean_command_start(nxt)
+            else None
+        )
+        if val == "export":
+            raise Failure(
+                1, FAULT_COVERAGE_PHASE, f"`export` aliasing is not allowed in {label}"
+            )
+        if val == "namespace":
+            if nxt_name is None:
+                raise Failure(
+                    1, FAULT_COVERAGE_PHASE, f"`namespace` without a name in {label}"
+                )
+            if "_root_" in nxt_name.split("."):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`namespace {nxt_name}` escapes the module namespace via `_root_` in {label}",
+                )
+            inside = any(kind == "namespace" for kind, _ in stack)
+            if not inside:
+                if nxt_name != own_ns and not (
+                    allow_nested and nxt_name.startswith(own_ns + ".")
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`namespace {nxt_name}` in {label} escapes its own namespace `{own_ns}`",
+                    )
+            elif not allow_nested:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"nested `namespace {nxt_name}` is not allowed in {label}",
+                )
+            stack.append(("namespace", nxt_name))
+        elif val == "section":
+            if not allow_sections:
+                raise Failure(
+                    1, FAULT_COVERAGE_PHASE, f"unexpected `section` command in {label}"
+                )
+            stack.append(("section", nxt_name))
+        elif val == "mutual":
+            stack.append(("mutual", None))
+        elif val == "end":
+            if not stack:
+                raise Failure(
+                    1, FAULT_COVERAGE_PHASE, f"unmatched `end` in {label}"
+                )
+            stack.pop()
+        elif val in _DECL_COMMAND_KWS:
+            if not any(kind == "namespace" for kind, _ in stack):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`{val}` declaration outside `namespace {own_ns}` in {label}",
+                )
+            if nxt_name is not None and nxt_name.split(".")[0] == "_root_":
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`{val} {nxt_name}` escapes the module namespace via `_root_` in {label}",
+                )
+    if stack:
+        raise Failure(
+            1, FAULT_COVERAGE_PHASE, f"unclosed `{stack[-1][0]}` scope in {label}"
+        )
+
+
+def _check_mir_module_namespace_binding(mir_text: str, stem: str, label: str) -> None:
+    """`[adv ep2-B2]` `Mir/<A>/<B>.lean` must declare everything inside exactly
+    `namespace Mir.<A>.<B>`: otherwise a sibling `Mir/` module could define
+    `Mir.<Subject>.body` (the body every `Obligations`/`Verify` claim actually binds) while
+    the audit census reads the file named after the subject."""
+    tokens = _tokenize_lean_or_fail(mir_text, label)
+    _check_module_scope_confinement(tokens, "Mir." + stem.replace("/", "."), label)
+
+
 def _check_single_namespace(
     tokens: list[tuple[str, Any]], expected_ns: str, label: str
 ) -> None:
@@ -10362,18 +10504,180 @@ def _parse_record_literal_fields(
     return fields
 
 
+_OB_POLY_FORALL = (
+    "∀ (typeArgs : Trusted.MirAst.TypeSubst), "
+    "typeArgs.length = Mir.{S}.body.typeParamCount → "
+)
+
+# `[adv ep2-B2]` Exact generated forms (`render_obligations_module` in
+# `crates/cargo-anneal/src/obligations.rs`) of every canonical claim / certificate helper
+# of `Obligations/<Item>.lean`, compared token-for-token (whitespace/comment-insensitive)
+# with `{S}` = item suffix, `{DID}` = subject `defPath`, `{SHA}` = `Mir/<Item>.lean` SHA-256.
+# Field-wise checks of only `body` / `callees` let a tampered claim keep those while
+# binding `pre := fun _ => False` (a vacuous claim that `Verify` proves trivially), adding
+# fields, or rewriting the instantiated `pre`/`post` of the polymorphic `*ClaimFor` claims.
+_OB_CANONICAL_DEF_TEMPLATES: dict[str, tuple[str, ...]] = {
+    "claim": (
+        'def claim [spec : ItemSpec "{DID}"] : Claim := { body := Mir.{S}.body, pre := spec.pre, '
+        "post := spec.post, callees := defaultCallees }",
+    ),
+    "statefulClaim": (
+        'def statefulClaim [spec : StatefulItemSpec "{DID}"] : StatefulClaim := { body := Mir.{S}.body, '
+        "pre := spec.pre, post := spec.post, callees := defaultCallees }",
+    ),
+    "totalClaim": (
+        'def totalClaim [spec : TotalItemSpec "{DID}"] : TotalClaim := { body := Mir.{S}.body, '
+        "pre := spec.pre, post := spec.post, callees := defaultCallees }",
+    ),
+    "equivClaim": (
+        'def equivClaim [spec : StatefulEquivItemSpec "{DID}"] : StatefulEquivClaim := { implBody := '
+        "Mir.{S}.body, specBody := spec.specBody, pre := spec.pre, post := spec.post, implCallees := "
+        "defaultCallees, specCallees := defaultCallees }",
+    ),
+    "modularClaim": (
+        'def modularClaim [spec : ModularItemSpec "{DID}"] : ModularClaim := { body := Mir.{S}.body, '
+        "envAssumed := spec.envAssumed, pre := spec.pre, post := spec.post, callees := defaultCallees }",
+    ),
+    "ubExceptionClaim": (
+        'def ubExceptionClaim [spec : UbExceptionItemSpec "{DID}"] : UbExceptionClaim := { body := '
+        "Mir.{S}.body, pre := spec.pre, strictSafetyPre := spec.strictSafetyPre, post := spec.post, "
+        "callees := defaultCallees }",
+    ),
+    "claimFor": tuple(
+        f'def claimFor [{binder} : ItemSpec "{{DID}}"] (typeArgs : Trusted.MirAst.TypeSubst) : Claim := '
+        "{ body := Mir.{S}.body.instantiate typeArgs "
+        f"pre := fun args => And ({pre_head}) (Trusted.VerificationResult.argsMatchSignature "
+        "(Mir.{S}.body.instantiate typeArgs) args (initMachineState (Mir.{S}.body.instantiate typeArgs) "
+        "args).memory) "
+        f"post := fun args ret => And ({post_head}) (Trusted.VerificationResult.retMatchesSignature "
+        "(Mir.{S}.body.instantiate typeArgs) ret (initMachineState (Mir.{S}.body.instantiate typeArgs) "
+        "args).memory) callees := defaultCallees }"
+        for binder, pre_head, post_head in (
+            ("spec", "spec.pre args", "spec.post args ret"),
+            ("_spec", "defaultPreFor typeArgs args", "defaultPostFor typeArgs args ret"),
+        )
+    ),
+    "statefulClaimFor": (
+        "def statefulClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : StatefulClaim := "
+        "{ body := Mir.{S}.body.instantiate typeArgs pre := fun args mem => sigPre typeArgs args mem "
+        "post := fun args _ ret mem => sigPost typeArgs args ret mem callees := defaultCallees }",
+    ),
+    "totalClaimFor": (
+        "def totalClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : TotalClaim := "
+        "{ body := Mir.{S}.body.instantiate typeArgs pre := fun args mem => And (And (defaultPreFor "
+        "typeArgs args) (mem = (initMachineState (Mir.{S}.body.instantiate typeArgs) args).memory)) "
+        "(Trusted.VerificationResult.argsMatchSignature (Mir.{S}.body.instantiate typeArgs) args mem) "
+        "post := fun args _ ret mem => sigPost typeArgs args ret mem callees := defaultCallees }",
+    ),
+    "modularClaimFor": (
+        'def modularClaimFor [spec : ModularItemSpec "{DID}"] (typeArgs : Trusted.MirAst.TypeSubst) : '
+        "ModularClaim := { body := Mir.{S}.body.instantiate typeArgs envAssumed := spec.envAssumed "
+        "pre := fun args mem => sigPre typeArgs args mem post := fun args _ ret m1 => sigPost typeArgs "
+        "args ret m1 callees := defaultCallees }",
+    ),
+    "ubExceptionClaimFor": (
+        'def ubExceptionClaimFor [spec : UbExceptionItemSpec "{DID}"] (typeArgs : '
+        "Trusted.MirAst.TypeSubst) : UbExceptionClaim := { body := Mir.{S}.body.instantiate typeArgs "
+        "pre := fun args mem => sigPre typeArgs args mem strictSafetyPre := spec.strictSafetyPre "
+        "post := fun args _ ret m1 => sigPost typeArgs args ret m1 callees := defaultCallees }",
+    ),
+    "polyClaim": (
+        'def polyClaim [spec : ItemSpec "{DID}"] : Prop := '
+        + _OB_POLY_FORALL
+        + "VerificationResult (claimFor typeArgs)",
+    ),
+    "polyStatefulClaim": (
+        "def polyStatefulClaim : Prop := "
+        + _OB_POLY_FORALL
+        + "StatefulVerificationResult (statefulClaimFor typeArgs)",
+    ),
+    "polyTotalClaim": (
+        "def polyTotalClaim : Prop := "
+        + _OB_POLY_FORALL
+        + "TotalVerificationResult (totalClaimFor typeArgs)",
+    ),
+    "polyModularClaim": (
+        'def polyModularClaim [spec : ModularItemSpec "{DID}"] : Prop := '
+        + _OB_POLY_FORALL
+        + "ModularVerificationResult (modularClaimFor typeArgs)",
+    ),
+    "polyUbExceptionClaim": (
+        'def polyUbExceptionClaim [spec : UbExceptionItemSpec "{DID}"] : Prop := '
+        + _OB_POLY_FORALL
+        + "UbExceptionVerificationResult (ubExceptionClaimFor typeArgs)",
+    ),
+    "artifactIdentity": (
+        'def artifactIdentity : ArtifactIdentity where defPath := "{DID}" mirDialect := '
+        '"V2026_06_01" mirModuleSha256 := "{SHA}"',
+    ),
+    "polyCertificate": (
+        'def polyCertificate (P : Prop) : CrateClaim where crateName := "{DID}" mirDialect := '
+        '"V2026_06_01" items := [{ identity := artifactIdentity, certificate := P }]',
+    ),
+}
+
+_OB_TEMPLATE_DID = "__ANNEAL_TEMPLATE_DEF_PATH__"
+_OB_TEMPLATE_SHA = "__ANNEAL_TEMPLATE_MIR_SHA256__"
+
+
+def _check_canonical_obligation_def(
+    name: str,
+    cmd_tokens: list[tuple[str, Any]],
+    suffix: str,
+    expected_def_path: str | None,
+    expected_mir_sha256: str | None,
+    label: str,
+) -> None:
+    """`[adv ep2-B2]` Require `def <name>` to equal one of its generated templates."""
+    for template in _OB_CANONICAL_DEF_TEMPLATES[name]:
+        text = (
+            template.replace("{S}", suffix)
+            .replace("{DID}", _OB_TEMPLATE_DID)
+            .replace("{SHA}", _OB_TEMPLATE_SHA)
+        )
+        expected = tokenize_lean_source(text)
+        if len(expected) != len(cmd_tokens):
+            continue
+        ok = True
+        for exp_tok, act_tok in zip(expected, cmd_tokens):
+            if exp_tok == ("StrLit", _OB_TEMPLATE_DID):
+                ok = act_tok[0] == "StrLit" and (
+                    expected_def_path is None or act_tok[1] == expected_def_path
+                )
+            elif exp_tok == ("StrLit", _OB_TEMPLATE_SHA):
+                ok = (
+                    act_tok[0] == "StrLit"
+                    and re.fullmatch(r"[0-9a-f]{64}", str(act_tok[1])) is not None
+                    and (expected_mir_sha256 is None or act_tok[1] == expected_mir_sha256)
+                )
+            else:
+                ok = exp_tok == act_tok
+            if not ok:
+                break
+        if ok:
+            return
+    raise Failure(
+        1,
+        FAULT_COVERAGE_PHASE,
+        f"canonical `def {name}` in {label} differs from its generated form (claims must bind exactly "
+        f"`Mir.{suffix}.body`, the spec's `pre`/`post`, and `defaultCallees`)",
+    )
+
+
 def _scan_obligations_module(
     ob_text: str,
     suffix: str,
     ob_label: str,
     *,
     expected_def_path: str | None = None,
+    expected_mir_sha256: str | None = None,
 ) -> dict[str, Any]:
     """`[adv ep2-A1]` Independently verify the claim definitions, `defaultCallees`,
     `defaultModularSpec.envAssumed`, `externalSpecCallContract` sidecar bindings,
     `defaultCallContract`, and `rustEquivSpec` of `Obligations/<Item>.lean`."""
     tokens = _tokenize_lean_or_fail(ob_text, ob_label)
     _check_single_namespace(tokens, f"Obligations.{suffix}", ob_label)
+    _check_module_scope_confinement(tokens, f"Obligations.{suffix}", ob_label)
     attr = _verify_detect_instance_attribute(tokens)
     if attr is not None:
         raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {ob_label}")
@@ -10446,6 +10750,7 @@ def _scan_obligations_module(
         return k
 
     claim_defs: dict[str, list[tuple[str, Any]]] = {}
+    canonical_def_cmds: dict[str, list[tuple[str, Any]]] = {}
     claim_sigs: dict[str, list[tuple[str, Any]]] = {}
     helper_cmds: dict[str, list[tuple[str, Any]]] = {}
     linked_ext_positions: set[int] = set()
@@ -10708,6 +11013,14 @@ def _scan_obligations_module(
                     f"reserved identifier `{def_name}` shadowed as `def` in {ob_label}",
                 )
             cmd_e = command_end(idx)
+            if def_name in _OB_CANONICAL_DEF_TEMPLATES:
+                if def_name in canonical_def_cmds:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"duplicate `def {def_name}` in {ob_label}",
+                    )
+                canonical_def_cmds[def_name] = tokens[idx:cmd_e]
             if def_name in _OB_RESERVED_HELPER_DEFS:
                 if def_name in helper_cmds:
                     raise Failure(
@@ -11067,6 +11380,16 @@ def _scan_obligations_module(
                     f"`def {helper_name}` in {ob_label} does not bind `{field_name} := {field_name}`",
                 )
 
+    for canon_name, canon_cmd in canonical_def_cmds.items():
+        _check_canonical_obligation_def(
+            canon_name,
+            canon_cmd,
+            suffix,
+            expected_def_path,
+            expected_mir_sha256,
+            ob_label,
+        )
+
     referenced_callee_contracts: list[str] = []
     referenced_ext_idents: list[str] = []
     for stem in raw_holds_on_stems:
@@ -11128,6 +11451,7 @@ def _scan_obligations_module(
         "has_legacy_spec_override": has_legacy_spec_override,
         "declared_claims": set(claim_defs),
         "declared_helpers": set(helper_cmds),
+        "declared_canonical_defs": set(canonical_def_cmds),
     }
 
 
@@ -11143,6 +11467,7 @@ def _scan_verify_module_surface(verify_text: str, suffix: str, label: str) -> di
     """
     tokens = _tokenize_lean_or_fail(verify_text, label)
     _check_single_namespace(tokens, f"Verify.{suffix}", label)
+    _check_module_scope_confinement(tokens, f"Verify.{suffix}", label)
     attr = _verify_detect_instance_attribute(tokens)
     if attr is not None:
         raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {label}")
@@ -11344,6 +11669,7 @@ def _scan_specs_module(
     `*ItemSpec` instances, `ModularItemSpec.envAssumed` contracts, and
     `StatefulEquivItemSpec.specBody` reference MIR bodies."""
     tokens = _tokenize_lean_or_fail(specs_text, label)
+    _check_module_scope_confinement(tokens, f"Specs.{subject_suffix}", label)
     attr = _verify_detect_instance_attribute(tokens)
     if attr is not None:
         raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {label}")
@@ -11746,7 +12072,7 @@ def _scan_specs_module(
                         if t_f in ("LParen", "LBrace", "LBracket"):
                             f_depth += 1
                         elif t_f in ("RParen", "RBrace", "RBracket"):
-                            f_depth = max(0, r_depth - 1)
+                            f_depth = max(0, f_depth - 1)
                         f_idx += 1
                     if extracted_ref is None:
                         raise Failure(
@@ -11892,6 +12218,11 @@ def _validate_auxiliary_module_no_spec_override(
     that `Proof/<X>.lean` or `Assumptions/<X>.lean` introduces no `*ItemSpec` overrides,
     `@[instance]`, `attribute`, `local`, `scoped`, or unauthorized imports."""
     tokens = _tokenize_lean_or_fail(aux_text, aux_label)
+    # `[adv ep2-B2]`: `aux_label` is the module name (`Proof.<X>` / `Assumptions.<X>`), so
+    # it is also the namespace every declaration of this module must live under.
+    _check_module_scope_confinement(
+        tokens, aux_label, aux_label, allow_nested=True, allow_sections=True
+    )
     attr = _verify_detect_instance_attribute(tokens)
     if attr is not None:
         raise Failure(1, FAULT_COVERAGE_PHASE, f"disallowed `@[{attr}]` attribute in {aux_label}")
@@ -12284,7 +12615,11 @@ def _audit_single_item_receipt(
     ob_path = obligations_root / f"{rel_stem}.lean"
     ob_text = _read_regular_text(ob_path, f"Obligations module for `{rel_stem}`")
     ob_scan = _scan_obligations_module(
-        ob_text, suffix, str(ob_path), expected_def_path=subject_body["def_path"]
+        ob_text,
+        suffix,
+        str(ob_path),
+        expected_def_path=subject_body["def_path"],
+        expected_mir_sha256=actual_sha,
     )
     inline_metas: list[dict[str, Any]] = []
     for suf in ob_scan["default_callee_suffixes"]:
@@ -12360,6 +12695,7 @@ def _audit_single_item_receipt(
         if (
             claim_for_name not in ob_scan["declared_claims"]
             or "polyCertificate" not in ob_scan["declared_helpers"]
+            or "artifactIdentity" not in ob_scan["declared_canonical_defs"]
         ):
             raise Failure(
                 1,
@@ -12831,6 +13167,7 @@ def _audit_manifest_targets_fault_coverage(
                 FAULT_COVERAGE_PHASE,
                 f"duplicate Mir module stem `{stem}` in CaptureManifest.json",
             )
+        _check_mir_module_namespace_binding(mir_text, stem, mir_rel)
         mir_by_stem[stem] = meta
         mir_path_by_stem[stem] = mir_path
 
@@ -13091,6 +13428,7 @@ def audit_fault_coverage(
                 FAULT_COVERAGE_PHASE,
                 f"Mir module {mir_path} failed strict fault-site census scan: {err}",
             ) from err
+        _check_mir_module_namespace_binding(mir_text, stem, str(mir_path))
         mir_by_stem[stem] = meta
 
     for r_stem, r_path in receipt_files.items():

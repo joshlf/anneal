@@ -2515,7 +2515,7 @@ fn is_valid_captured_mir_type(ty: &str) -> bool {
 /// interprets. Strict module scanning rejects any declaration or namespace that
 /// reuses one of these names, because a local `def TerminatorKind.goto` would
 /// shadow the real constructor for every `TerminatorKind.goto` written in the module.
-const MIR_AST_TYPE_NAMES: [&str; 62] = [
+const MIR_AST_TYPE_NAMES: [&str; 35] = [
     "AggregateKind",
     "BasicBlockData",
     "BinOp",
@@ -2527,18 +2527,9 @@ const MIR_AST_TYPE_NAMES: [&str; 62] = [
     "ConstScalar",
     "ConstValue",
     "ContractRole",
-    "CrateClaim",
-    "CrateVerificationResult",
-    "ItemProof",
-    "ItemSpec",
     "List",
     "LocalDecl",
-    "MirCallContract",
     "MirPhaseTag",
-    "ModularItemProof",
-    "ModularItemSpec",
-    "ModularVerificationClaim",
-    "ModularVerificationResult",
     "Mutability",
     "Nat",
     "NonDivergingIntrinsic",
@@ -2554,6 +2545,29 @@ const MIR_AST_TYPE_NAMES: [&str; 62] = [
     "ScalarInt",
     "Statement",
     "StatementKind",
+    "SwitchTargets",
+    "Terminator",
+    "TerminatorKind",
+    "Ty",
+    "UnOp",
+    "UnwindAction",
+];
+
+/// `[adv ep2-B2]` `Trusted.VerificationResult` names a strict `Mir/<Item>.lean` declaration
+/// may not reuse. Kept out of `MIR_AST_TYPE_NAMES` so the namespace-segment check (which sees
+/// the CamelCase crate name, e.g. crate `item_spec` -> `Mir.ItemSpec.<item>`) does not reject
+/// legitimate crates; qualified (`_root_.` / dotted) declarations are rejected outright, so
+/// these plain names can never leak out of the module's own `Mir.<Item>` namespace.
+const MIR_SHADOW_DECL_API_NAMES: [&str; 27] = [
+    "CrateClaim",
+    "CrateVerificationResult",
+    "ItemProof",
+    "ItemSpec",
+    "MirCallContract",
+    "ModularItemProof",
+    "ModularItemSpec",
+    "ModularVerificationClaim",
+    "ModularVerificationResult",
     "StatefulEquivClaim",
     "StatefulEquivItemProof",
     "StatefulEquivItemSpec",
@@ -2562,20 +2576,14 @@ const MIR_AST_TYPE_NAMES: [&str; 62] = [
     "StatefulItemSpec",
     "StatefulVerificationClaim",
     "StatefulVerificationResult",
-    "SwitchTargets",
-    "Terminator",
-    "TerminatorKind",
     "TotalItemProof",
     "TotalItemSpec",
     "TotalVerificationClaim",
     "TotalVerificationResult",
-    "Ty",
     "UbExceptionClaim",
     "UbExceptionItemProof",
     "UbExceptionItemSpec",
     "UbExceptionVerificationResult",
-    "UnOp",
-    "UnwindAction",
     "VerificationClaim",
     "VerificationResult",
 ];
@@ -4193,6 +4201,12 @@ fn shadows_mir_ast_name(name: &str) -> bool {
     name.split('.').any(|seg| MIR_AST_TYPE_NAMES.contains(&seg))
 }
 
+/// `[adv ep2-B2]` Declaration names additionally may not reuse `Trusted.VerificationResult` names.
+fn shadows_mir_decl_name(name: &str) -> bool {
+    name.split('.')
+        .any(|seg| MIR_AST_TYPE_NAMES.contains(&seg) || MIR_SHADOW_DECL_API_NAMES.contains(&seg))
+}
+
 /// Strict `[adv B1]` / `[adv A1]` / `[adv A2]` grammar check for an `anneal-rustc-capture`
 /// `Mir/<Item>.lean` module: only `import Trusted*`, balanced `namespace`/`section`/`end`,
 /// `open Trusted*` lists, `set_option`, and `def <name> : <type> := <single balanced term>`
@@ -4316,7 +4330,7 @@ fn check_strict_mir_module_grammar<'a>(tokens: &'a [LeanToken]) -> Result<(), Ce
             "def" => {
                 let name = ident_at(i + 1)
                     .ok_or_else(|| malformed("`def` without a plain identifier name".into()))?;
-                if shadows_mir_ast_name(name) || is_lean_command_start(&tokens[i + 1]) {
+                if shadows_mir_decl_name(name) || is_lean_command_start(&tokens[i + 1]) {
                     return Err(malformed(format!(
                         "declaration `{name}` shadows a MIR AST name or keyword"
                     )));
@@ -4324,6 +4338,14 @@ fn check_strict_mir_module_grammar<'a>(tokens: &'a [LeanToken]) -> Result<(), Ce
                 if name.ends_with(".body") {
                     return Err(malformed(format!(
                         "qualified `def {name}` is not allowed in strict Mir module (expected bare `def body`)"
+                    )));
+                }
+                if name.contains('.') {
+                    // `[adv ep2-B2]`: `def _root_.X` / `def A.B` escapes the module's own
+                    // `Mir.<Item>` namespace and can shadow names resolved inside the
+                    // `Obligations` / `Verify` namespaces of every importing module.
+                    return Err(malformed(format!(
+                        "qualified `def {name}` is not allowed in strict Mir module (declarations must be plain identifiers)"
                     )));
                 }
                 if tokens.get(i + 2) != Some(&LeanToken::Colon) {
@@ -5545,6 +5567,107 @@ pub fn validate_obligations_canonical_claims(
     validate_obligations_canonical_claims_for_def_path(ob_text, subject_suffix, None)
 }
 
+/// `[adv ep2-B2]` Confine every declaration of an audited workspace module to its own
+/// namespace.
+///
+/// Lean resolves an identifier inside `namespace N` by trying every prefix of `N` before any
+/// `open`ed namespace, so a declaration named e.g. `Verify.<Item>.VerificationResult` or
+/// `Verify.Obligations.<Item>.claim` in ANY module imported by `Verify/<Item>.lean` (its
+/// `Specs`, `Proof`, `Assumptions`, or `Obligations` cone) silently replaces the canonical
+/// certificate statement while every token of `Verify/<Item>.lean` still looks canonical.
+/// Require the first namespace to be exactly `own_ns` (child namespaces only when
+/// `allow_nested`), every declaration to appear inside it, no `_root_`-qualified declaration
+/// or namespace, and no `export` aliasing.
+fn check_module_scope_confinement(
+    tokens: &[LeanToken],
+    own_ns: &str,
+    label: &str,
+    allow_nested: bool,
+    allow_sections: bool,
+) -> Result<(), String> {
+    let mut stack: Vec<&'static str> = Vec::new();
+    let mut depth = 0isize;
+    for (idx, tok) in tokens.iter().enumerate() {
+        let cur_depth = depth;
+        match tok {
+            LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+            LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                depth = (depth - 1).max(0);
+            }
+            _ => {}
+        }
+        if cur_depth != 0 {
+            continue;
+        }
+        let LeanToken::Ident(kw) = tok else {
+            continue;
+        };
+        let nxt_name: Option<&str> = match tokens.get(idx + 1) {
+            Some(t @ LeanToken::Ident(n)) if !is_lean_command_start(t) => Some(n.as_str()),
+            _ => None,
+        };
+        let inside_ns = stack.contains(&"namespace");
+        match kw.as_str() {
+            "export" => return Err(format!("`export` aliasing is not allowed in {label}")),
+            "namespace" => {
+                let name =
+                    nxt_name.ok_or_else(|| format!("`namespace` without a name in {label}"))?;
+                if name.split('.').any(|seg| seg == "_root_") {
+                    return Err(format!(
+                        "`namespace {name}` escapes the module namespace via `_root_` in {label}"
+                    ));
+                }
+                if !inside_ns {
+                    let nested_ok = allow_nested
+                        && name
+                            .strip_prefix(own_ns)
+                            .is_some_and(|rest| rest.starts_with('.'));
+                    if name != own_ns && !nested_ok {
+                        return Err(format!(
+                            "`namespace {name}` in {label} escapes its own namespace `{own_ns}`"
+                        ));
+                    }
+                } else if !allow_nested {
+                    return Err(format!("nested `namespace {name}` is not allowed in {label}"));
+                }
+                stack.push("namespace");
+            }
+            "section" => {
+                if !allow_sections {
+                    return Err(format!("unexpected `section` command in {label}"));
+                }
+                stack.push("section");
+            }
+            "mutual" => stack.push("mutual"),
+            "end" => {
+                if stack.pop().is_none() {
+                    return Err(format!("unmatched `end` in {label}"));
+                }
+            }
+            "def" | "abbrev" | "theorem" | "lemma" | "instance" | "opaque" | "axiom"
+            | "structure" | "inductive" | "class" | "example" => {
+                if !inside_ns {
+                    return Err(format!(
+                        "`{kw}` declaration outside `namespace {own_ns}` in {label}"
+                    ));
+                }
+                if let Some(name) = nxt_name
+                    && name.split('.').next() == Some("_root_")
+                {
+                    return Err(format!(
+                        "`{kw} {name}` escapes the module namespace via `_root_` in {label}"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(kind) = stack.last() {
+        return Err(format!("unclosed `{kind}` scope in {label}"));
+    }
+    Ok(())
+}
+
 /// `[adv ep1-B4]` Variant of [`validate_obligations_canonical_claims`] that additionally
 /// pins every `defaultCallContract`, `defaultModularSpec`, `rustEquivSpec`, and canonical
 /// claim typeclass binder in `Obligations/<subject_suffix>.lean` to `expected_def_path`.
@@ -5585,6 +5708,13 @@ pub fn validate_obligations_canonical_claims_for_def_path(
         ));
     }
     let expected_ns = format!("Obligations.{subject_suffix}");
+    check_module_scope_confinement(
+        &tokens,
+        &expected_ns,
+        &format!("Obligations module for {subject_suffix}"),
+        false,
+        false,
+    )?;
     let mut ns_opens = 0usize;
     let mut ns_closes = 0usize;
     let mut claim_defs: BTreeMap<String, Vec<LeanToken>> = BTreeMap::new();
@@ -5814,8 +5944,16 @@ pub fn validate_obligations_canonical_claims_for_def_path(
         ));
     }
 
-    let check_record_claim =
-        |def_name: &str, expected_fields: &[(&str, Vec<LeanToken>)]| -> Result<(), String> {
+    // `[adv ep2-B2]`: the canonical claim records carry exactly the generated field set.
+    // Checking only `body` / `callees` let a tampered claim keep those while binding a
+    // vacuous `pre := fun _ => False` (which `Verify` then proves trivially) or adding fields;
+    // mono claims must bind the spec's own `pre` / `post` (/ `strictSafetyPre`), and the
+    // instantiated `*ClaimFor` claims may carry nothing beyond `pre` / `post`
+    // (their exact generated form is pinned token-for-token by `check_trusted.py`).
+    let check_record_claim = |def_name: &str,
+                              expected_fields: &[(&str, Vec<LeanToken>)],
+                              extra_fields: &[&str]|
+     -> Result<(), String> {
             let rhs = claim_defs.get(def_name).ok_or_else(|| {
                 format!(
                     "missing canonical `def {def_name}` in Obligations module for {subject_suffix}"
@@ -5923,6 +6061,21 @@ pub fn validate_obligations_canonical_claims_for_def_path(
                     }
                 }
             }
+            for extra in extra_fields {
+                if !fields.contains_key(*extra) {
+                    return Err(format!(
+                        "canonical `def {def_name}` in Obligations module for {subject_suffix} omits required field `{extra}`"
+                    ));
+                }
+            }
+            if let Some(unexpected) = fields.keys().find(|k| {
+                !expected_fields.iter().any(|(n, _)| n == &k.as_str())
+                    && !extra_fields.contains(&k.as_str())
+            }) {
+                return Err(format!(
+                    "canonical `def {def_name}` in Obligations module for {subject_suffix} binds unexpected field `{unexpected}`"
+                ));
+            }
             Ok(())
         };
 
@@ -5934,52 +6087,75 @@ pub fn validate_obligations_canonical_claims_for_def_path(
     let default_callees_tok = vec![LeanToken::Ident("defaultCallees".to_string())];
     let spec_env_tok = vec![LeanToken::Ident("spec.envAssumed".to_string())];
     let spec_body_tok = vec![LeanToken::Ident("spec.specBody".to_string())];
+    let spec_pre_tok = vec![LeanToken::Ident("spec.pre".to_string())];
+    let spec_post_tok = vec![LeanToken::Ident("spec.post".to_string())];
+    let spec_strict_tok = vec![LeanToken::Ident("spec.strictSafetyPre".to_string())];
 
-    for mono_name in [
-        "claim",
-        "statefulClaim",
-        "totalClaim",
-        "ubExceptionClaim",
-    ] {
+    for mono_name in ["claim", "statefulClaim", "totalClaim"] {
         check_record_claim(
             mono_name,
             &[
                 ("body", mir_body_tok.clone()),
+                ("pre", spec_pre_tok.clone()),
+                ("post", spec_post_tok.clone()),
                 ("callees", default_callees_tok.clone()),
             ],
+            &[],
         )?;
     }
+    check_record_claim(
+        "ubExceptionClaim",
+        &[
+            ("body", mir_body_tok.clone()),
+            ("pre", spec_pre_tok.clone()),
+            ("strictSafetyPre", spec_strict_tok.clone()),
+            ("post", spec_post_tok.clone()),
+            ("callees", default_callees_tok.clone()),
+        ],
+        &[],
+    )?;
     check_record_claim(
         "modularClaim",
         &[
             ("body", mir_body_tok.clone()),
             ("envAssumed", spec_env_tok.clone()),
+            ("pre", spec_pre_tok.clone()),
+            ("post", spec_post_tok.clone()),
             ("callees", default_callees_tok.clone()),
         ],
+        &[],
     )?;
     check_record_claim(
         "equivClaim",
         &[
             ("implBody", mir_body_tok),
             ("specBody", spec_body_tok),
+            ("pre", spec_pre_tok),
+            ("post", spec_post_tok),
             ("implCallees", default_callees_tok.clone()),
             ("specCallees", default_callees_tok.clone()),
         ],
+        &[],
     )?;
-    for inst_name in [
-        "claimFor",
-        "statefulClaimFor",
-        "totalClaimFor",
-        "ubExceptionClaimFor",
-    ] {
+    for inst_name in ["claimFor", "statefulClaimFor", "totalClaimFor"] {
         check_record_claim(
             inst_name,
             &[
                 ("body", mir_inst_tok.clone()),
                 ("callees", default_callees_tok.clone()),
             ],
+            &["pre", "post"],
         )?;
     }
+    check_record_claim(
+        "ubExceptionClaimFor",
+        &[
+            ("body", mir_inst_tok.clone()),
+            ("strictSafetyPre", spec_strict_tok),
+            ("callees", default_callees_tok.clone()),
+        ],
+        &["pre", "post"],
+    )?;
     check_record_claim(
         "modularClaimFor",
         &[
@@ -5987,6 +6163,7 @@ pub fn validate_obligations_canonical_claims_for_def_path(
             ("envAssumed", spec_env_tok),
             ("callees", default_callees_tok),
         ],
+        &["pre", "post"],
     )?;
 
     let expected_tp_count = format!("Mir.{subject_suffix}.body.typeParamCount");
@@ -6061,7 +6238,21 @@ pub fn validate_obligations_canonical_claims_for_def_path(
     let poly_cert_cmd = helper_cmds.get("polyCertificate").ok_or_else(|| {
         format!("missing canonical `def polyCertificate` in Obligations module for {subject_suffix}")
     })?;
-    let poly_cert_ok = poly_cert_cmd.len() >= 21
+    // `[adv ep2-B2]`: the generated certificate is exactly
+    // `(P : Prop) : CrateClaim where crateName := "<defId>" mirDialect := "V2026_06_01"
+    //  items := [{ identity := artifactIdentity, certificate := P }]` (27 tokens); a looser
+    // prefix/suffix match left the fields between `where` and `items` unconstrained.
+    let poly_cert_ok = poly_cert_cmd.len() == 27
+        && matches!(poly_cert_cmd.get(7), Some(LeanToken::Ident(w)) if w == "where")
+        && matches!(poly_cert_cmd.get(8), Some(LeanToken::Ident(cn)) if cn == "crateName")
+        && poly_cert_cmd.get(9) == Some(&LeanToken::ColonEq)
+        && matches!(
+            poly_cert_cmd.get(10),
+            Some(LeanToken::StrLit(did)) if expected_def_path.is_none_or(|exp| did == exp)
+        )
+        && matches!(poly_cert_cmd.get(11), Some(LeanToken::Ident(md)) if md == "mirDialect")
+        && poly_cert_cmd.get(12) == Some(&LeanToken::ColonEq)
+        && matches!(poly_cert_cmd.get(13), Some(LeanToken::StrLit(d)) if d == "V2026_06_01")
         && poly_cert_cmd.first() == Some(&LeanToken::LParen)
         && matches!(poly_cert_cmd.get(1), Some(LeanToken::Ident(p)) if p == "P")
         && poly_cert_cmd.get(2) == Some(&LeanToken::Colon)
@@ -6367,6 +6558,13 @@ pub fn inspect_verify_module_certificate(
         ));
     }
     let expected_ns = format!("Verify.{subject_suffix}");
+    check_module_scope_confinement(
+        &tokens,
+        &expected_ns,
+        &format!("Verify module for {subject_suffix}"),
+        false,
+        false,
+    )?;
     let mut ns_opens = 0usize;
     let mut ns_closes = 0usize;
     let mut imported_own_obligations = false;
@@ -6813,6 +7011,9 @@ pub fn validate_auxiliary_module_no_spec_override(
     if let Some(attr) = detect_instance_attribute(&tokens) {
         return Err(format!("disallowed `@[{attr}]` attribute in {aux_label}"));
     }
+    // `aux_label` is the module name (`Proof.<X>` / `Assumptions.<X>`), so it is also the
+    // namespace every declaration of this module must live under.
+    check_module_scope_confinement(&tokens, aux_label, aux_label, true, true)?;
     let mut out = AuxiliaryModuleImports::default();
     let push_unique = |vec: &mut Vec<String>, val: &str| {
         if !val.is_empty() && !vec.iter().any(|x| x == val) {
@@ -7193,6 +7394,13 @@ pub fn scan_specs_module(
     }
     let mut out = SpecsModuleLinks::default();
     let expected_ns = format!("Specs.{subject_suffix}");
+    check_module_scope_confinement(
+        &tokens,
+        &expected_ns,
+        &format!("Specs module for {subject_suffix}"),
+        false,
+        false,
+    )?;
     let mut ns_opens = 0usize;
     let mut ns_closes = 0usize;
     let mut local_env_assumed_def: Option<Vec<LeanToken>> = None;
@@ -12958,6 +13166,43 @@ end Mir.Probe.item",
                 "ModularItemSpec \"demo::caller\"",
                 "ModularItemSpec \"demo::other\"",
             ),
+            // `[adv ep2-B2]`: a claim keeping `body` / `callees` but binding a vacuous
+            // `pre`, a weakened `post`, an extra field, or a tampered certificate header.
+            (
+                "claim pre vacuous",
+                "Claim :=\n  { body := Mir.Demo.caller.body, pre := spec.pre,",
+                "Claim :=\n  { body := Mir.Demo.caller.body, pre := fun _ => False,",
+            ),
+            (
+                "claim post weakened",
+                "pre := spec.pre, post := spec.post, callees := defaultCallees }",
+                "pre := spec.pre, post := fun _ _ => True, callees := defaultCallees }",
+            ),
+            (
+                "ubExceptionClaim strictSafetyPre tampered",
+                "strictSafetyPre := spec.strictSafetyPre, post := spec.post",
+                "strictSafetyPre := fun _ _ => True, post := spec.post",
+            ),
+            (
+                "claim extra field",
+                "post := spec.post, callees := defaultCallees }",
+                "post := spec.post, callees := defaultCallees, fuel := 0 }",
+            ),
+            (
+                "claimFor extra field",
+                "    callees := defaultCallees }\n\n/-- Universally quantified polymorphic verification proposition",
+                "    callees := defaultCallees\n    fuel := 0 }\n\n/-- Universally quantified polymorphic verification proposition",
+            ),
+            (
+                "polyCertificate extra field",
+                "mirDialect := \"V2026_06_01\"\n  items :=",
+                "mirDialect := \"V2026_06_01\"\n  extra := P\n  items :=",
+            ),
+            (
+                "polyCertificate crateName tampered",
+                "crateName := \"demo::caller\"",
+                "crateName := \"demo::other\"",
+            ),
         ] {
             let mutated = canon_ob.replacen(needle, replacement, 1);
             assert_ne!(mutated, canon_ob, "mutation `{label}` did not match `{needle}`");
@@ -12970,6 +13215,27 @@ end Mir.Probe.item",
                 .is_err(),
                 "expected `{label}` mutation in Obligations to fail closed"
             );
+        }
+
+        // `[adv ep2-B2]`: qualified (`_root_.` / dotted) Mir declarations escape the module's own
+        // namespace and are rejected; crate names that CamelCase into `Trusted.VerificationResult`
+        // type names (`item_spec` -> `Mir.ItemSpec.<item>`) remain legitimate namespaces.
+        let mir_with = |ns: &str, extra: &str| {
+            format!(
+                "import Trusted\nnamespace {ns}\n{extra}def body : CapturedMir :=\n  {{ defPath := \"demo::item\"\n  , phase := MirPhaseTag.runtimePostCleanup\n  , role := ContractRole.subject\n  , argCount := 0\n  , localDecls := List.nil\n  , basicBlocks := (List.cons {{ statements := List.nil, terminator := {{ kind := TerminatorKind.return_, span := \"src/lib.rs:1:1\" }}, isCleanup := false }} List.nil)\n  , fnAbi := {{ args := List.nil, ret := {{ layout := {{ size := {{ bytes := 0 }}, align := {{ bytes := 1 }}, backendRepr := BackendRepr.memory, fields := FieldsShape.primitive, variants := VariantsShape.empty, isUninhabited := false }}, mode := AbiPassMode.ignore }}, conv := CallConv.rust, canUnwind := false }}\n  , layouts := {{ entries := List.nil }}\n  , allocations := List.nil\n  }}\nend {ns}\n"
+            )
+        };
+        census_lean_mir_module(&mir_with("Mir.Demo.item", ""))
+            .expect("baseline strict Mir module must scan");
+        census_lean_mir_module(&mir_with("Mir.ItemSpec.item", ""))
+            .expect("crate namespaces named like VerificationResult API types are legitimate");
+        for qualified in ["_root_.Verify.Demo.item.impl", "Obligations.Demo.item.claim", "_root_.layouts"] {
+            let err = census_lean_mir_module(&mir_with(
+                "Mir.Demo.item",
+                &format!("def {qualified} : Nat := 0\n"),
+            ))
+            .expect_err("qualified Mir declaration must be rejected");
+            assert!(format!("{err:?}").contains("qualified"), "{qualified}: {err:?}");
         }
 
         // 4. `const_eval_select` 2-arg malformed arity fails closed, 3-arg diverging panic `rt`

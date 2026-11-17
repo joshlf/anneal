@@ -1672,6 +1672,39 @@ print(f"REAL_MIR_CENSUS_PARITY_OK {{len(cases)}}")
         "detached Obligations claim callees",
         "overrides claim `callees :=",
     );
+    // `[adv ep2-B2]` A claim keeping `body` / `callees` but binding a vacuous `pre` (which
+    // `Verify` would prove trivially) fails closed against the generated claim template.
+    tamper(
+        ob_calls_helper_path.clone(),
+        ob_calls_helper.replacen("pre := spec.pre, post := spec.post", "pre := fun _ => False, post := spec.post", 1),
+        "vacuous Obligations claim precondition",
+        "differs from its generated form",
+    );
+    // Declarations outside `namespace Obligations.<Item>` can shadow the certificate type
+    // that Lean resolves inside `namespace Verify.<Item>` (namespace prefixes win over `open`).
+    tamper(
+        ob_calls_helper_path.clone(),
+        ob_calls_helper.replacen(
+            "namespace Obligations.CrateA.calls_local_helper\n",
+            "def Verify.CrateA.calls_local_helper.VerificationResult (_ : Nat) : Prop := True\n\
+             namespace Obligations.CrateA.calls_local_helper\n",
+            1,
+        ),
+        "Verify certificate hijack declared outside the Obligations namespace",
+        "outside `namespace Obligations.CrateA.calls_local_helper`",
+    );
+    // A callee `Mir/` module declaring a different namespace than its own stem could
+    // define another module's `Mir.<X>.body`; every Mir module is bound to its stem.
+    let mir_leaf_path = gen_dir.join("Mir/CrateB/inner_leaf.lean");
+    let mir_leaf = read(&mir_leaf_path);
+    tamper(
+        mir_leaf_path.clone(),
+        mir_leaf
+            .replace("namespace Mir.CrateB.inner_leaf\n", "namespace Mir.CrateB.inner_leaf_spoof\n")
+            .replace("end Mir.CrateB.inner_leaf\n", "end Mir.CrateB.inner_leaf_spoof\n"),
+        "callee Mir module namespace not bound to its file stem",
+        "escapes its own namespace `Mir.CrateB.inner_leaf`",
+    );
     // Unlinked `externalSpecCallContract` (dropped from `defaultModularSpec.envAssumed`) fails closed.
     let ob_ext_path = gen_dir.join("Obligations/CrateA/caller_with_external_specs.lean");
     let ob_ext_src = read(&ob_ext_path);

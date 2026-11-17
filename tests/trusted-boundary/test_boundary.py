@@ -1022,12 +1022,12 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "ModularItemSpec \"demo::item_1\" where\n"
             "  pre := spec.pre\n  post := spec.post\n"
             "  envAssumed := fun _ => True\n"
-            "def claim [spec : ItemSpec \"demo::item_1\"] : VerificationObligation :=\n"
-            "  { body := Mir.Demo.item_1.body, callees := defaultCallees, "
-            "pre := spec.pre, post := spec.post }\n"
-            "def modularClaim [spec : ModularItemSpec \"demo::item_1\"] : ModularVerificationObligation :=\n"
-            "  { body := Mir.Demo.item_1.body, callees := defaultCallees, "
-            "envAssumed := spec.envAssumed, pre := spec.pre, post := spec.post }\n"
+            "def claim [spec : ItemSpec \"demo::item_1\"] : Claim :=\n"
+            "  { body := Mir.Demo.item_1.body, pre := spec.pre, post := spec.post, "
+            "callees := defaultCallees }\n"
+            "def modularClaim [spec : ModularItemSpec \"demo::item_1\"] : ModularClaim :=\n"
+            "  { body := Mir.Demo.item_1.body, envAssumed := spec.envAssumed, pre := spec.pre, "
+            "post := spec.post, callees := defaultCallees }\n"
             "end Obligations.Demo.item_1\n"
         )
         ob_ws.write_text(ob_nil)
@@ -1163,13 +1163,39 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             (ob_nil.replace(":= .nil", ":= [] ++ [Mir.Demo.helper.body]"), "trailing token"),
             (ob_nil.replace("namespace Obligations.Demo.item_1\n", "namespace Obligations.Demo.item_1\nnamespace Evil\nend Evil\n"), "unexpected `namespace Evil`"),
             (ob_nil.replace("import Mir.Demo.item_1\n", "import Mir.Demo.item_1\nimport Obligations.Demo.item_1\n"), "self-imports"),
-            (ob_nil.replace("def claim [spec : ItemSpec \"demo::item_1\"] : VerificationObligation :=\n"
-                            "  { body := Mir.Demo.item_1.body, callees := defaultCallees, "
-                            "pre := spec.pre, post := spec.post }\n", ""), "is not defined"),
-            (ob_nil.replace("{ body := Mir.Demo.item_1.body, callees := defaultCallees,",
-                            "{ body := Mir.Demo.helper.body, callees := defaultCallees,"), "instead of `Mir.Demo.item_1.body`"),
-            (ob_nil.replace("{ body := Mir.Demo.item_1.body, callees := defaultCallees,",
-                            "{ body := Mir.Demo.item_1.body, callees := [],"), "overrides claim `callees :="),
+            (ob_nil.replace("def claim [spec : ItemSpec \"demo::item_1\"] : Claim :=\n"
+                            "  { body := Mir.Demo.item_1.body, pre := spec.pre, post := spec.post, "
+                            "callees := defaultCallees }\n", ""), "is not defined"),
+            (ob_nil.replace("{ body := Mir.Demo.item_1.body, pre := spec.pre,",
+                            "{ body := Mir.Demo.helper.body, pre := spec.pre,"), "instead of `Mir.Demo.item_1.body`"),
+            (ob_nil.replace("post := spec.post, callees := defaultCallees }",
+                            "post := spec.post, callees := [] }"), "overrides claim `callees :="),
+            # `[adv ep2-B2]`: claims are pinned token-for-token to their generated form, so a
+            # claim keeping `body`/`callees` but binding a vacuous `pre`, a weakened `post`,
+            # an extra field, or a different claim structure fails closed.
+            (ob_nil.replace("{ body := Mir.Demo.item_1.body, pre := spec.pre,",
+                            "{ body := Mir.Demo.item_1.body, pre := fun _ => False,"), "differs from its generated form"),
+            (ob_nil.replace("pre := spec.pre, post := spec.post, callees := defaultCallees }",
+                            "pre := spec.pre, post := fun _ _ => True, callees := defaultCallees }"), "differs from its generated form"),
+            (ob_nil.replace("] : Claim :=", "] : StatefulClaim :="), "differs from its generated form"),
+            (ob_nil.replace("end Obligations.Demo.item_1",
+                            "def artifactIdentity : ArtifactIdentity where\n  defPath := \"demo::item_1\"\n"
+                            "  mirDialect := \"V2026_06_01\"\n  mirModuleSha256 := \"" + "0" * 64 + "\"\n"
+                            "end Obligations.Demo.item_1"), "differs from its generated form"),
+            (ob_nil.replace("end Obligations.Demo.item_1",
+                            "def polyCertificate (P : Prop) : CrateClaim where\n  crateName := \"demo::item_1\"\n"
+                            "  mirDialect := \"V2026_06_01\"\n  extra := P\n"
+                            "  items := [{ identity := artifactIdentity, certificate := P }]\n"
+                            "end Obligations.Demo.item_1"), "polyCertificate"),
+            # Declarations outside `namespace Obligations.<Item>` (or `_root_`-qualified) can
+            # shadow names Lean resolves inside the `Verify.<Item>` / `Obligations.<Item>`
+            # namespaces of every importing module.
+            (ob_nil.replace("namespace Obligations.Demo.item_1\n",
+                            "def Verify.Demo.item_1.VerificationResult (_ : Nat) : Prop := True\n"
+                            "namespace Obligations.Demo.item_1\n"), "outside `namespace Obligations.Demo.item_1`"),
+            (ob_nil.replace("end Obligations.Demo.item_1",
+                            "def _root_.Verify.Demo.item_1.VerificationResult (_ : Nat) : Prop := True\n"
+                            "end Obligations.Demo.item_1"), "_root_"),
             (ob_nil.replace("{ body := Mir.Demo.item_1.body,",
                             "{ base with body := Mir.Demo.item_1.body,"), "struct-update"),
             (ob_nil.replace("namespace Obligations.Demo.item_1\n",
@@ -1223,8 +1249,81 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         ver_ws.write_text(ver_claim.replace("import Obligations.Demo.item_1\n",
                                             "import Obligations.Demo.item_1\nimport Proof.Demo.item_1\n"))
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "specification override instance")
+        # `[adv ep2-B2]` Lean resolves `VerificationResult` / `Obligations.<Item>.claim` inside
+        # `namespace Verify.<Item>` against `Verify.<Item>.*` / `Verify.*` BEFORE the `open`ed
+        # `Trusted` namespace, so a module in the `Verify` import cone that declares such a name
+        # replaces the certificate statement while `Verify/<Item>.lean` stays canonical. Every
+        # audited module must confine its declarations to its own namespace.
+        proof_ok = ("import Trusted\nimport Obligations.Demo.item_1\nnamespace Proof.Demo.item_1\n"
+                    "section Helpers\ntheorem helper : True := trivial\nend Helpers\n"
+                    "namespace Lemmas\ntheorem helper2 : True := trivial\nend Lemmas\n"
+                    "theorem verified : True := trivial\nend Proof.Demo.item_1\n")
+        proof_ws.write_text(proof_ok)
+        assert runner.audit_fault_coverage(ws_dir)["receiptsAudited"] == 1
+        for bad_proof, needle in (
+            (proof_ok.replace("end Proof.Demo.item_1\n",
+                              "end Proof.Demo.item_1\nnamespace Verify.Demo.item_1\n"
+                              "def VerificationResult (_ : Claim) : Prop := True\nend Verify.Demo.item_1\n"),
+             "escapes its own namespace `Proof.Demo.item_1`"),
+            (proof_ok.replace("namespace Proof.Demo.item_1\n",
+                              "def Verify.Demo.item_1.VerificationResult (_ : Claim) : Prop := True\n"
+                              "namespace Proof.Demo.item_1\n"),
+             "outside `namespace Proof.Demo.item_1`"),
+            (proof_ok.replace("theorem verified",
+                              "def _root_.Verify.Obligations.Demo.item_1.claim : Claim := sorry\ntheorem verified"),
+             "_root_"),
+            (proof_ok.replace("theorem verified", "export Trusted.VerificationResult (Claim)\ntheorem verified"),
+             "`export`"),
+        ):
+            proof_ws.write_text(bad_proof)
+            expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", needle)
         proof_ws.unlink()
         ver_ws.write_text(ver_claim)
+        specs_hijack_ws = ws_dir / "anneal/proofs/Specs/Demo/item_1.lean"
+        specs_hijack_ws.parent.mkdir(parents=True, exist_ok=True)
+        specs_hijack_ws.write_text(
+            "import Trusted\nimport Obligations.Demo.item_1\n"
+            "def Verify.Demo.item_1.VerificationResult (_ : Claim) : Prop := True\n"
+            "namespace Specs.Demo.item_1\nend Specs.Demo.item_1\n"
+        )
+        ver_ws.write_text(ver_claim.replace("import Obligations.Demo.item_1\n",
+                                            "import Obligations.Demo.item_1\nimport Specs.Demo.item_1\n"))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "outside `namespace Specs.Demo.item_1`")
+        specs_hijack_ws.unlink()
+        ver_ws.write_text(ver_claim)
+        # A `Mir/` module must declare everything inside exactly `namespace Mir.<its stem>`:
+        # otherwise a sibling module can define the `Mir.<Subject>.body` every claim binds
+        # while the census reads the file named after the subject. Qualified Mir `def`s are
+        # rejected by the strict grammar itself.
+        helper_ws.write_text(valid_mir_mod.replace("item_1", "helper")
+                             .replace("namespace Mir.Demo.«helper»", "namespace Mir.Demo.«item_1»")
+                             .replace("end Mir.Demo.«helper»", "end Mir.Demo.«item_1»"))
+        write_manifest()
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "escapes its own namespace `Mir.Demo.helper`")
+        expect_failure(lambda: runner.audit_fault_coverage(ws_manifest), 1, "fault-coverage", "escapes its own namespace `Mir.Demo.helper`")
+        helper_ws.write_text(valid_mir_mod.replace("item_1", "helper"))
+        write_manifest()
+        for qualified in ("_root_.Verify.Demo.item_1.impl", "Obligations.Demo.item_1.claim", "_root_.layouts"):
+            try:
+                runner.census_lean_mir_module(valid_mir_mod.replace(
+                    "def emptyLayoutTable", f"def {qualified} : Nat := 0\ndef emptyLayoutTable"))
+            except runner.CensusScanError as error:
+                assert "qualified" in str(error), error
+            else:
+                raise AssertionError(f"qualified Mir declaration `{qualified}` was accepted")
+        # Crate names that CamelCase into `Trusted.VerificationResult` type names (`item_spec`
+        # -> `Mir.ItemSpec.<item>`) are legitimate namespaces.
+        assert runner.census_lean_mir_module(
+            valid_mir_mod.replace("Mir.Demo.«item_1»", "Mir.ItemSpec.«item_1»")) == expected_sites
+        # A `where`-form `StatefulEquivItemSpec` with nested brackets before `specBody` scans
+        # cleanly (it used to crash with `UnboundLocalError`).
+        equiv_where = runner._scan_specs_module(
+            "import Trusted\nimport Mir.Demo.ref_impl\nnamespace Specs.Demo.item_1\n"
+            "instance : StatefulEquivItemSpec \"demo::item_1\" where\n"
+            "  pre := (fun _ _ => (True))\n  specBody := Mir.Demo.ref_impl.body\n"
+            "  post := fun _ _ _ _ => True\nend Specs.Demo.item_1\n",
+            "Demo.item_1", "Specs.Demo.item_1")
+        assert equiv_where["equiv_spec_body_suffix"] == "Demo.ref_impl"
 
         # 19e. External callees are honoured only for an independently derived modular surface
         # backed by verified `externalSpecCallContract` sidecars or verified sibling obligations
@@ -1333,8 +1432,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         ob_helper_ws.write_text(
             ob_nil.replace("item_1", "helper").replace(
                 "end Obligations.Demo.helper",
-                "def statefulClaim [spec : StatefulItemSpec \"demo::helper\"] : StatefulVerificationObligation :=\n"
-                "  { body := Mir.Demo.helper.body, callees := defaultCallees, pre := spec.pre, post := spec.post }\n"
+                "def statefulClaim [spec : StatefulItemSpec \"demo::helper\"] : StatefulClaim :=\n"
+                "  { body := Mir.Demo.helper.body, pre := spec.pre, post := spec.post, callees := defaultCallees }\n"
                 "end Obligations.Demo.helper",
             )
         )
@@ -1397,10 +1496,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                 "end Obligations.Demo.item_1",
                 "instance (priority := low) rustEquivSpec : StatefulEquivItemSpec \"demo::item_1\" :=\n"
                 "  refineEquivSpec Mir.Demo.ref_impl.body (fun _ _ => True) (fun _ _ _ _ => True)\n"
-                "def equivClaim [spec : StatefulEquivItemSpec \"demo::item_1\"] : StatefulEquivObligation :=\n"
-                "  { implBody := Mir.Demo.item_1.body, specBody := spec.specBody, "
-                "implCallees := defaultCallees, specCallees := defaultCallees, "
-                "frame := spec.frame, argRel := spec.argRel, retRel := spec.retRel }\n"
+                "def equivClaim [spec : StatefulEquivItemSpec \"demo::item_1\"] : StatefulEquivClaim :=\n"
+                "  { implBody := Mir.Demo.item_1.body, specBody := spec.specBody, pre := spec.pre, "
+                "post := spec.post, implCallees := defaultCallees, specCallees := defaultCallees }\n"
                 "end Obligations.Demo.item_1",
             )
         )
