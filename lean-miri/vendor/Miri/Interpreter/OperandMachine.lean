@@ -131,6 +131,9 @@ def evalOperandMoving (h : Hooks K User C) (c : C) (operand : MIR.Operand)
         MachineHooks.setCurrentFrame updated
         updateMoveLatch MachineHooks.clearPendingMoveDeinitFlag
         return result
+      else if result.layout.layout.isZst then
+        updateMoveLatch MachineHooks.clearPendingMoveDeinitFlag
+        return result
       else
         let basePlace ← localToPlace h.projection.place c place.localId
         let _ ← forceAllocation h.projection.place c basePlace

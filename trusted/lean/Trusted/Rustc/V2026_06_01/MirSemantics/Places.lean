@@ -10261,22 +10261,39 @@ def lastStructuralProjection? : List ProjectionElem → Option ProjectionElem
       | .unwrapUnsafeBinder _ => .none
       | _ => .some elem
 
+mutual
 /--
-Mark every non-`.unit` element of a moved subslice window as moved out.
+Mark every non-`.unit` leaf of a moved value as moved out (`movedUninitValue`),
+preserving non-empty `.aggregate` spines so sibling or nested sub-places can be
+re-initialized field-by-field or element-by-element after a move.
+-/
+def markMovedValue : Value → Value
+  | .unit => .unit
+  | .aggregate varIdx (v :: rest) => .aggregate varIdx (markMovedValue v :: markMovedElems rest)
+  | _ => movedUninitValue
+
+/--
+Mark every non-`.unit` element of a moved value list as moved out.
 -/
 def markMovedElems : List Value → List Value
   | .nil => .nil
-  | .unit :: rest => .unit :: markMovedElems rest
-  | _ :: rest => movedUninitValue :: markMovedElems rest
+  | v :: rest => markMovedValue v :: markMovedElems rest
+end
 
 /--
 The value written over a moved sub-place reached by `proj`: an element-wise
-marked window for a trailing `.subslice`, and `movedUninitValue` otherwise.
+marked window for a trailing `.subslice`, and `markMovedValue fieldVal`
+(falling back to `movedUninitValue` when `fieldVal` has no non-`.unit` leaf,
+such as an empty variant `.aggregate k .nil`) otherwise.
 -/
 def movedMarkerValue (proj : List ProjectionElem) (fieldVal : Value) : Value :=
   match lastStructuralProjection? proj, fieldVal with
   | .some (.subslice _ _ _), .aggregate 0 elems => .aggregate 0 (markMovedElems elems)
-  | _, _ => movedUninitValue
+  | _, _ =>
+    let marked := markMovedValue fieldVal
+    match valueContainsMovedUninit marked with
+    | true => marked
+    | false => movedUninitValue
 
 /--
 Set the bytes `[off, off + len)` of `bytes` to `AbstractByte.uninit`.
@@ -10503,6 +10520,345 @@ def moveDerefTarget?
   | _ => .none
 
 /--
+Deinitialize the byte window `[byteOff, byteOff + reqBytes)` inside the
+active-frame sub-place `(targetLocal, containerProj)` after a typed thin-pointer
+dereference move (`evalStackThinPtrTypedDerefRead`).
+-/
+def deinitSubPlaceByteWindow
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (targetLocal : Local)
+    (targetRootVal : Value)
+    (containerProj : List ProjectionElem)
+    (byteOff : Nat)
+    (reqBytesOpt : Option Nat)
+    (fieldVal : Value) :
+    Option (List LocalSlot) :=
+  let reqBytes : Nat :=
+    match reqBytesOpt with
+    | .some n => n
+    | .none =>
+      match inferValueByteSizeAux 8 fieldVal with
+      | .some n => n
+      | .none => 0
+  match Nat.ble 1 reqBytes with
+  | false => .some locals
+  | true =>
+    match readProjectedForLocal locals localDecls layouts targetLocal targetRootVal containerProj with
+    | .ok oldSubVal =>
+      let subTyOpt :=
+        placeTyResolved localDecls layouts { local_ := targetLocal, projection := containerProj }
+      let unionWindowOpt : Option (List LocalSlot) :=
+        match subTyOpt with
+        | .some subTy =>
+          let rSubTy := resolveTyWithLocalDecls localDecls layouts subTy
+          match LayoutTable.lookup layouts rSubTy.layoutIdx with
+          | .some { fields := .union count, .. } =>
+            match encodeTypedValueToBytes layouts rSubTy oldSubVal with
+            | .some bytes =>
+              match
+                decodeUnionBytesWithCountOpt
+                  layouts
+                  rSubTy.layoutIdx
+                  count
+                  (uninitByteWindow bytes byteOff reqBytes)
+              with
+              | .some unionVal' =>
+                match containerProj with
+                | .nil => set? locals targetLocal (.init unionVal')
+                | _ :: _ =>
+                  match writeProjectedForLocal locals localDecls layouts targetLocal targetRootVal containerProj unionVal' with
+                  | .ok rootVal' => set? locals targetLocal (.init rootVal')
+                  | .ub => .none
+                  | .unsupported => .none
+              | .none => .none
+            | .none => .none
+          | _ => .none
+        | .none => .none
+      match unionWindowOpt with
+      | .some locals₁ => .some locals₁
+      | .none =>
+        match oldSubVal with
+        | .scalar oldSc =>
+          match Nat.ble (Nat.add byteOff reqBytes) oldSc.sizeBytes with
+          | false => .none
+          | true =>
+            match containerProj, Bool.and (Nat.beq byteOff 0) (Nat.beq reqBytes oldSc.sizeBytes) with
+            | .nil, true => set? locals targetLocal .uninit
+            | .nil, false => set? locals targetLocal (.init movedUninitValue)
+            | _ :: _, _ =>
+              match writeProjectedForLocal locals localDecls layouts targetLocal targetRootVal containerProj movedUninitValue with
+              | .ok rootVal' => set? locals targetLocal (.init rootVal')
+              | .ub => .none
+              | .unsupported => .none
+        | .ptr _ pSz =>
+          match Bool.and (Nat.beq byteOff 0) (Nat.beq reqBytes pSz) with
+          | false => .none
+          | true =>
+            deinitMovedSubPlace locals localDecls layouts targetLocal targetRootVal containerProj fieldVal
+        | .aggregate varIdx fields =>
+          let defaultLeafTy : Ty :=
+            { kind := uintRigidTyOfStride reqBytes, layoutIdx := unresolvedLayoutIdx layouts }
+          match
+            resolveAggregateAtByteOffset?
+              8
+              layouts
+              (.aggregate varIdx fields)
+              subTyOpt
+              byteOff
+              reqBytes
+              false
+              defaultLeafTy
+              false
+              localDecls
+          with
+          | .some (innerProj, .zero) =>
+            let fullProj :=
+              match containerProj with
+              | .nil => innerProj
+              | ph :: pt => ph :: appendProjections pt innerProj
+            deinitMovedSubPlace locals localDecls layouts targetLocal targetRootVal fullProj fieldVal
+          | _ => .none
+        | .unit => .none
+    | .ub => .none
+    | .unsupported => .none
+
+/--
+Deinitialize the active-frame target of a typed thin-pointer dereference move
+`Operand.move (*p).restProj` when `localDecls` is non-empty, using
+`resolveStackThinPtrTargetProjWithResidual?` and `deinitSubPlaceByteWindow`.
+-/
+def deinitTypedThinPtrDeref
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (borrows : List BorrowEntry)
+    (callStack : List SavedCallerFrame)
+    (p : Place)
+    (ptrVal : ProvenancePtr)
+    (restProj : List ProjectionElem)
+    (fieldVal : Value) :
+    Option (List LocalSlot) :=
+  match lookupBorrow borrows ptrVal.tag with
+  | .some entry =>
+    match entry.perm with
+    | .disabled => .none
+    | _ =>
+      match activeFrameSlot? locals callStack entry.targetFrameDepth entry.targetLocal with
+      | .some (.init targetRootVal) =>
+        let pointeeTyOpt :=
+          placeTyResolved localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
+        let accessedTyOpt := placeTyResolved localDecls layouts p
+        let resolvedAccTyOpt : Option Ty :=
+          match accessedTyOpt with
+          | .some accTy => .some (resolveTyWithLocalDecls localDecls layouts accTy)
+          | .none => .none
+        let effPointeeTyOpt : Option Ty :=
+          match pointeeTyOpt with
+          | .some pt => .some (resolveTyWithLocalDecls localDecls layouts pt)
+          | .none => .none
+        let reqBytesOpt : Option Nat :=
+          match resolvedAccTyOpt with
+          | .some accTy => tyByteSize localDecls layouts accTy
+          | .none => .none
+        match
+          resolveStackThinPtrTargetProjWithResidual?
+            locals
+            targetRootVal
+            entry
+            ptrVal
+            restProj
+            localDecls
+            layouts
+            effPointeeTyOpt
+            reqBytesOpt
+            localDecls
+            layouts
+        with
+        | .some (fullProj, .zero) =>
+          match
+            readProjectedForLocal
+              locals
+              localDecls
+              layouts
+              entry.targetLocal
+              targetRootVal
+              fullProj
+          with
+          | .ok subVal =>
+            match valueStructEq subVal fieldVal with
+            | true =>
+              deinitMovedSubPlace
+                locals
+                localDecls
+                layouts
+                entry.targetLocal
+                targetRootVal
+                fullProj
+                fieldVal
+            | false =>
+              deinitSubPlaceByteWindow
+                locals
+                localDecls
+                layouts
+                entry.targetLocal
+                targetRootVal
+                fullProj
+                0
+                reqBytesOpt
+                fieldVal
+          | .ub => .none
+          | .unsupported => .none
+        | .some (fullProj, .succ r) =>
+          deinitSubPlaceByteWindow
+            locals
+            localDecls
+            layouts
+            entry.targetLocal
+            targetRootVal
+            fullProj
+            (.succ r)
+            reqBytesOpt
+            fieldVal
+        | .none =>
+          match restProj with
+          | .nil =>
+            deinitSubPlaceByteWindow
+              locals
+              localDecls
+              layouts
+              entry.targetLocal
+              targetRootVal
+              entry.targetProjection
+              ptrVal.offsetBytes
+              reqBytesOpt
+              fieldVal
+          | _ :: _ => .none
+      | _ => .none
+  | .none => .none
+
+/--
+Deinitialize the active-frame target of a slice fat-pointer dereference move
+`Operand.move (*p).restProj`, where `p` holds
+`Value.aggregate 0 [Value.ptr ptrVal ptrSz, Value.scalar lenSc]`.
+-/
+def deinitSliceFatPtrDeref
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (borrows : List BorrowEntry)
+    (callStack : List SavedCallerFrame)
+    (p : Place)
+    (ptrVal : ProvenancePtr)
+    (ptrSz : Nat)
+    (lenSc : ScalarInt)
+    (restProj : List ProjectionElem)
+    (fieldVal : Value) :
+    Option (List LocalSlot) :=
+  let ptrBytes := layoutPointerBytes layouts
+  match Bool.and (Nat.beq ptrSz ptrBytes) (Nat.beq lenSc.sizeBytes ptrBytes) with
+  | false => .none
+  | true =>
+    match lookupBorrow borrows ptrVal.tag with
+    | .some entry =>
+      match entry.perm with
+      | .disabled => .none
+      | _ =>
+        match activeFrameSlot? locals callStack entry.targetFrameDepth entry.targetLocal with
+        | .some (.init targetRootVal) =>
+          let pointeeTyOpt :=
+            placeTyResolved localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
+          let elemKind : RigidTy :=
+            match pointeeTyOpt with
+            | .some { kind := .slice ek, .. } => ek
+            | .some { kind := .array ek _, .. } => ek
+            | .some { kind := .str, .. } => .uint .u8
+            | _ =>
+              match LayoutTable.lookup layouts 0 with
+              | .some l =>
+                match l.fields with
+                | .primitive => uintRigidTyOfStride l.size.bytes
+                | .array stride _ => uintRigidTyOfStride stride.bytes
+                | _ => .uint .u8
+              | .none => .uint .u8
+          let expSzOpt : Option Nat :=
+            match pointeeTyOpt with
+            | .some _ => rigidTyKindByteSize elemKind
+            | .none => .none
+          match
+            readSliceBackingAggregate?
+              locals
+              targetRootVal
+              entry.targetProjection
+              lenSc.bits
+              expSzOpt
+          with
+          | .some (containerProj, baseIdx, elems) =>
+            let elemSz :=
+              match pointeeTyOpt with
+              | .some _ =>
+                match rigidTyKindByteSize elemKind with
+                | .some n => n
+                | .none => inferElemListByteStride elems
+              | .none => inferElemListByteStride elems
+            match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+            | .none => .none
+            | .some rawElemOffset =>
+              let elemOffset := Nat.add rawElemOffset baseIdx
+              let endOffset := Nat.add elemOffset lenSc.bits
+              match Nat.ble endOffset (length elems) with
+              | false => .none
+              | true =>
+                let sliceElems := takeValues lenSc.bits (dropValues elemOffset elems)
+                match readProjectedValue locals (.aggregate 0 sliceElems) restProj with
+                | .ok structVal =>
+                  match valueStructEq structVal fieldVal with
+                  | false => .none
+                  | true =>
+                    let marker : Value :=
+                      match restProj with
+                      | .nil => movedMarkerValue (.subslice 0 lenSc.bits false :: .nil) fieldVal
+                      | _ :: _ => movedMarkerValue restProj fieldVal
+                    match
+                      writeProjectedValue
+                        locals
+                        (.aggregate 0 sliceElems)
+                        restProj
+                        marker
+                    with
+                    | .ok (.aggregate 0 updatedSliceElems) =>
+                      match
+                        replaceSubslice
+                          elems
+                          elemOffset
+                          endOffset
+                          false
+                          updatedSliceElems
+                      with
+                      | .some elems' =>
+                        match
+                          writeProjectedValue
+                            locals
+                            targetRootVal
+                            containerProj
+                            (.aggregate 0 elems')
+                        with
+                        | .ok targetRootVal' =>
+                          set? locals entry.targetLocal (.init targetRootVal')
+                        | .ub => .none
+                        | .unsupported => .none
+                      | .none => .none
+                    | .ok _ => .none
+                    | .ub => .none
+                    | .unsupported => .none
+                | .ub => .none
+                | .unsupported => .none
+          | .none => .none
+        | _ => .none
+    | .none => .none
+
+/--
 `deinitProjectedMoves` semantics of `Operand.move p`, given `readResult`, the
 result of reading `p` exactly as `Operand.copy p` does
 (`evalCopyPlaceRead`):
@@ -10511,9 +10867,8 @@ result of reading `p` exactly as `Operand.copy p` does
 * a zero-sized moved value leaves the source initialized;
 * otherwise the moved source place is deinitialized (`deinitMovedSubPlace`): the
   root/projected place of `p`, or, for `(*q).restProj`, the active-frame target
-  of the thin stack pointer `q` after checking that the target place holds
-  exactly the value that was read. The borrow table is never consulted for
-  writing, so sibling `Frozen` borrows of the target stay `Frozen`.
+  of the thin stack pointer or slice fat pointer `q`. The borrow table is never
+  consulted for writing, so sibling `Frozen` borrows of the target stay `Frozen`.
 
 Sources that cannot be deinitialized in the active frame fail closed with
 `.unsupported`.
@@ -10536,13 +10891,13 @@ def evalMoveOperandDeinit
       | false =>
         match p.projection with
         | .deref :: restProj =>
-          match moveDerefTarget? locals₀ p restProj borrows callStack with
-          | .some (targetLocal, targetRootVal, fullProj) =>
-            match readProjectedValue locals₀ targetRootVal fullProj with
-            | .ok structVal =>
-              match valueStructEq structVal fieldVal with
-              | true =>
-                match
+          let untypedOpt : Option (List LocalSlot) :=
+            match moveDerefTarget? locals₀ p restProj borrows callStack with
+            | .some (targetLocal, targetRootVal, fullProj) =>
+              match readProjectedForLocal locals₀ localDecls layouts targetLocal targetRootVal fullProj with
+              | .ok structVal =>
+                match valueStructEq structVal fieldVal with
+                | true =>
                   deinitMovedSubPlace
                     locals₀
                     localDecls
@@ -10551,13 +10906,50 @@ def evalMoveOperandDeinit
                     targetRootVal
                     fullProj
                     fieldVal
+                | false => .none
+              | .ub => .none
+              | .unsupported => .none
+            | .none => .none
+          match untypedOpt with
+          | .some locals₁ => .ok fieldVal locals₁
+          | .none =>
+            match get? locals₀ p.local_ with
+            | .some (.init (.ptr ptrVal _)) =>
+              match localDecls with
+              | .nil => .unsupported
+              | _ :: _ =>
+                match
+                  deinitTypedThinPtrDeref
+                    locals₀
+                    localDecls
+                    layouts
+                    borrows
+                    callStack
+                    p
+                    ptrVal
+                    restProj
+                    fieldVal
                 with
                 | .some locals₁ => .ok fieldVal locals₁
                 | .none => .unsupported
-              | false => .unsupported
-            | .ub => .unsupported
-            | .unsupported => .unsupported
-          | .none => .unsupported
+            | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+              match
+                deinitSliceFatPtrDeref
+                  locals₀
+                  localDecls
+                  layouts
+                  borrows
+                  callStack
+                  p
+                  ptrVal
+                  ptrSz
+                  lenSc
+                  restProj
+                  fieldVal
+              with
+              | .some locals₁ => .ok fieldVal locals₁
+              | .none => .unsupported
+            | _ => .unsupported
         | _ =>
           match get? locals₀ p.local_ with
           | .some (.init rootVal) =>

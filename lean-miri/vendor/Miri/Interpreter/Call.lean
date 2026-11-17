@@ -230,10 +230,11 @@ def evalFnCallArgumentMoving (h : Hooks) (choice : C) (operand : MIR.Operand)
       return (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr)
     | .immediate _ =>
       h.validateOperandBeforeCall choice op
-      if place.projection.isEmpty then
-        let deinitVal : Operand P := if op.layout.layout.isZst then op.op else .immediate .uninit
+      if op.layout.layout.isZst then
+        pure ()
+      else if place.projection.isEmpty then
         let frame ← h.getFrame
-        match frame.replaceLocalValue place.localId (.live deinitVal) with
+        match frame.replaceLocalValue place.localId (.live (.immediate .uninit)) with
         | .ok frame' => h.setFrame frame'
         | .error e => throw (.stack e)
       else
@@ -261,28 +262,23 @@ def evalFnCallArgument (h : Hooks) (choice : C) (operand : MIR.Operand)
 /-- Consumer-side (`deinitMovedPlace`) `eval_callee_and_args`: the callee and
 every argument are evaluated, validated and consumed, in order, before the
 function signature, kind or instance are queried, so an uninitialized or
-moved-out argument faults before `resolve` (kani#5172). A moved memory-backed
-callee is consumed like a moved argument. Also returns the temporary stack
-allocations to deallocate once the call has consumed its arguments. -/
+moved-out callee or argument faults before `resolve` (kani#5172). Also returns
+the temporary stack allocations to deallocate once the call has consumed its
+arguments. -/
 def evalCalleeAndArgsMoving (h : Hooks) (choice : C) (func : MIR.Operand)
     (args : Array SpannedOperand) :
     M (EvaluatedCall P Other Extern FnABI × Array (Pointer (Option P))) := do
   let mut temps : Array (Pointer (Option P)) := #[]
-  let mut funcOp ← h.evalOperandAt choice (OperandPath.instruction "function") func
-  if let .Move _ := func then
-    if let .indirect mplace := funcOp.op then
-      let tmp ← h.allocateStack choice funcOp.layout
-      h.copyToMemory choice funcOp tmp
-      h.deinitInPlaceArgument choice ⟨mplace, funcOp.layout⟩
-      temps := temps.push tmp.mplace.ptr
-      funcOp := ⟨.indirect tmp.mplace, tmp.layout⟩
+  let (funcArg, funcTmp?) ←
+    evalFnCallArgumentMoving h choice func (OperandPath.instruction "function")
+  if let some tmp := funcTmp? then temps := temps.push tmp
+  let func := funcArg.copyFnArg
   let mut evaluated := #[]
   for index in [:args.size] do
     let some arg := args[index]? | throw (.invalidProgram "missing source call argument")
     let (fnArg, tmp?) ← evalFnCallArgumentMoving h choice arg.operand (OperandPath.argument index)
     if let some tmp := tmp? then temps := temps.push tmp
     evaluated := evaluated.push fnArg
-  let func := funcOp
   let (inputCount, externAbi) ← h.functionSignature choice func.layout
   require (inputCount ≤ evaluated.size) "call has fewer args than normalized signature"
   let extra := (evaluated.extract inputCount evaluated.size).map fun arg => arg.layout.ty

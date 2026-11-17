@@ -145,6 +145,8 @@ def evalOperandMoving (hooks : LocalAccessHooks Prov Extra State)
           match res.frame.replaceLocalValue place.localId (.live deinitVal) with
           | .ok frame' => ⟨frame', res.state, .ok op⟩
           | .error e => ⟨res.frame, res.state, .error (.stack e)⟩
+        else if op.layout.layout.isZst then
+          res
         else
           let forced := hooks.forceLocalAllocation res.frame res.state place.localId
           match forced.outcome with

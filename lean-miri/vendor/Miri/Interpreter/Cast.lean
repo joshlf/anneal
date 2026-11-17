@@ -364,6 +364,107 @@ def cast [PointerProvenance P] (h : CastHooks P S C V) (choice : C) (fuel : Nat)
       h.derefPointer choice ⟨.immediate pointer.imm, pointer.layout⟩
     h.copyAllowTransmute choice source dest
 
+/-- Consumer-side (`deinitMovedPlace`) pointer unsizing: reads the source
+pointer/fat-pointer, deinitializes the moved source via `deinitSource` before
+writing the destination, and then writes the unsized fat pointer to `dest`. -/
+def unsizeIntoPointerMoving [PointerProvenance P] (h : CastHooks P S C V) (choice : C)
+    (source : OpTy P) (dest : V) (sourceTy targetTy : TyId) : RvalueM S Unit := do
+  let (sourceTail, targetTail) ← h.lockstepTails choice sourceTy targetTy
+  let sourceKind ← h.typeInfo choice sourceTail
+  let targetKind ← h.typeInfo choice targetTail
+  match sourceKind, targetKind with
+  | .array _ length, .slice _ =>
+    let pointer ← readPointer h choice source
+    let value ← liftResult (Immediate.newSlice pointer length h.target |>.mapError ScalarOps.immediateError)
+    h.deinitSource choice source
+    h.writeImmediate choice value dest
+  | .dynamic actual, .dynamic expected =>
+    let value ← h.readImmediate choice source
+    if actual == expected then
+      h.deinitSource choice source
+      h.writeImmediate choice value.imm dest
+    else do
+      let (oldData, oldVptr) ← liftResult (value.imm.toScalarPair |>.mapError ScalarOps.immediateError)
+      let oldData ← liftResult (oldData.toPointer h.target |>.mapError ScalarOps.scalarError)
+      let oldVptr ← liftResult (oldVptr.toPointer h.target |>.mapError ScalarOps.scalarError)
+      let ty ← h.vtableType choice oldVptr (some actual)
+      let slot ← h.supertraitSlot choice sourceTail targetTail
+      let principal ← h.principal choice actual
+      let entries ← h.vtableEntries choice principal ty
+      if let some index := slot then
+        let some (.traitVPtr traitRef) := entries[index]? | invalid "invalid vtable entry in dyn upcast"
+        let erased ← h.eraseSelfTraitRef choice traitRef
+        let normalized ← h.normalizePrincipal choice expected
+        if normalized != some erased then invalid "dyn upcast principal mismatch"
+      else
+        let principal ← h.principal choice expected
+        let targetEntries ← h.vtableEntries choice principal ty
+        if targetEntries.size > entries.size then invalid "dyn upcast target vtable exceeds prefix"
+        for index in [:targetEntries.size] do
+          let some a := entries[index]? | invalid "missing source vtable prefix entry"
+          let some b := targetEntries[index]? | invalid "missing target vtable prefix entry"
+          if !entryEq a b then invalid "dyn upcast vtable prefix mismatch"
+      let vptr ← h.vtablePointer choice ty expected
+      let value ← liftResult (Immediate.newDynTrait oldData vptr h.target |>.mapError ScalarOps.immediateError)
+      h.deinitSource choice source
+      h.writeImmediate choice value dest
+  | _, .dynamic expected =>
+    let vtable ← h.vtablePointer choice sourceTail expected
+    let pointer ← readPointer h choice source
+    let value ← liftResult (Immediate.newDynTrait pointer vtable h.target |>.mapError ScalarOps.immediateError)
+    h.deinitSource choice source
+    h.writeImmediate choice value dest
+  | _, _ =>
+    h.ensureMonomorphic choice source.layout.ty
+    h.ensureMonomorphic choice targetTy
+    invalid "invalid pointer unsizing"
+
+/-- Consumer-side (`deinitMovedPlace`) recursive aggregate/pointer unsizing when
+the source operand is moved: unchanged ADT fields hand the move latch to
+`copyNoValidate`, and the unsized pointer leaf deinitializes its moved source
+before writing the destination. -/
+def unsizeIntoMoving [PointerProvenance P] (h : CastHooks P S C V) (choice : C) (fuel : Nat)
+    (source : OpTy P) (target : TyAndLayout TyId) (dest : V) : RvalueM S Unit := do
+  match fuel with
+  | 0 => throw (.resourceExhaustion "cast unsizing recursion fuel")
+  | fuel + 1 =>
+    let sourceKind ← h.typeInfo choice source.layout.ty
+    let targetKind ← h.typeInfo choice target.ty
+    match sourceKind, targetKind with
+    | .pattern _ patternA, .pattern inner patternB =>
+      if patternA == patternB then
+        let source ← h.projectRead choice source 0
+        let dest ← h.projectWrite choice dest 0
+        let target ← h.layoutOf choice inner
+        unsizeIntoMoving h choice fuel source target dest
+      else
+        h.ensureMonomorphic choice source.layout.ty
+        h.ensureMonomorphic choice target.ty
+        invalid "invalid pattern unsizing"
+    | .reference sourceTy, .reference targetTy
+    | .reference sourceTy, .rawPointer targetTy
+    | .rawPointer sourceTy, .rawPointer targetTy =>
+      unsizeIntoPointerMoving h choice source dest sourceTy targetTy
+    | .adt a, .adt b =>
+      if a != b then invalid "unsizing requires identical ADT definitions"
+      let mut found := false
+      for index in [:source.layout.layout.fields.count] do
+        let targetField ← h.fieldLayout choice target index
+        let sourceField ← h.projectRead choice source index
+        let destField ← h.projectWrite choice dest index
+        if sourceField.layout.layout.is1zst && targetField.layout.is1zst then pure ()
+        else if sourceField.layout.ty == targetField.ty then
+          h.restorePendingMoveDeinit true
+          h.copyNoValidate choice sourceField destField false
+        else
+          if found then invalid "unsize_into: more than one field to cast"
+          found := true
+          unsizeIntoMoving h choice fuel sourceField targetField destField
+    | _, _ =>
+      h.ensureMonomorphic choice source.layout.ty
+      h.ensureMonomorphic choice target.ty
+      invalid "invalid unsizing conversion"
+
 /-- Consumer-side (`deinitMovedPlace`) cast, selected by `ExecutionMachine` only
 when `deinitMovedPlace = true` (the source `cast` above is unchanged). The move
 latch of the source operand is consumed first, so that the validity and value
@@ -389,8 +490,8 @@ def castMoving [PointerProvenance P] (h : CastHooks P S C V) (choice : C) (fuel 
       | _ => invalid "unexpected input type in non-transmute/unsize cast"
   match kind with
   | .PointerCoercion .Unsize _ =>
-    unsizeInto h choice fuel source target dest
-    if shouldDeinit then h.deinitSource choice source
+    if shouldDeinit then unsizeIntoMoving h choice fuel source target dest
+    else unsizeInto h choice fuel source target dest
     if ← h.enforceValidity choice destLayout then
       let recursive ← h.enforceValidityRecursively choice destLayout
       h.validatePlace choice dest recursive true

@@ -138,13 +138,21 @@ def takePendingMoveDeinitFor (m : MachineState K User)
 
 /-- Consume the most recently evaluated operand's move-deinit flag for
 single-operand consumers (`copyRuntimePlaceNoValidate`, `Cast`, zero-length
-`Repeat`). -/
+`Repeat`). When `pendingMoveDeinit` was re-armed by `setPendingMoveDeinitFlag`
+(`Cast` transmute hand-off) without a matching back-of-queue move record, an
+earlier non-move record in `pendingMoveDeinits` is preserved. -/
 def takeLastPendingMoveDeinit (m : MachineState K User) :
     MachineState K User × Bool :=
-  let isMove := match m.pendingMoveDeinits.back? with
-    | some (_, b) => b || m.pendingMoveDeinit
-    | none => m.pendingMoveDeinit
-  (m.withPendingMoves false m.pendingMoveDeinits.pop, isMove)
+  if m.pendingMoveDeinit then
+    let queue' := match m.pendingMoveDeinits.back? with
+      | some (_, true) => m.pendingMoveDeinits.pop
+      | _ => m.pendingMoveDeinits
+    (m.withPendingMoves false queue', true)
+  else
+    let isMove := match m.pendingMoveDeinits.back? with
+      | some (_, b) => b
+      | none => false
+    (m.withPendingMoves false m.pendingMoveDeinits.pop, isMove)
 
 abbrev State (K User : Type) := StepState Provenance LocalLayout FrameExtra (MachineState K User)
 abbrev M (K User A : Type) := EStateM StepError (State K User) A
