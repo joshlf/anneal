@@ -25,10 +25,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arbitrary::Unstructured;
 use cargo_anneal::{
     BatchTraceEvalCase, CaptureDriverConfig, RecordedEvent, RecordedOutcome, RecordedRawTrace,
-    ScaffoldConfig, TraceCheckModuleConfig, decode_recorded_raw_trace_hex,
-    encode_recorded_raw_trace_hex, parse_batch_trace_probe_output,
+    ScaffoldConfig, TraceCheckModuleConfig, build_lake_build_command,
+    decode_recorded_raw_trace_hex, encode_recorded_raw_trace_hex, parse_batch_trace_probe_output,
     render_batch_trace_eval_lean_module, render_batch_trace_probe_lean_module, run_cargo_capture,
-    run_lake_verify_targets, scaffold_workspace_with_config,
+    scaffold_workspace_with_config,
 };
 
 use crate::input_gen::{
@@ -1960,6 +1960,110 @@ fn itree_confirm_replacements<'p, C, X>(
     out
 }
 
+fn resolve_itree_lake_bin() -> PathBuf {
+    if let Ok(lake_env) = env::var("LAKE")
+        && !lake_env.trim().is_empty()
+    {
+        return PathBuf::from(lake_env);
+    }
+    if let Some(toolchain_root) = cargo_anneal::setup::resolve_installed_toolchain() {
+        let bundled = toolchain_root.join("lean/bin/lake");
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        let pinned = PathBuf::from(home)
+            .join(".elan/toolchains/leanprover--lean4---v4.34.1/bin/lake");
+        if pinned.is_file() {
+            return pinned;
+        }
+    }
+    PathBuf::from("lake")
+}
+
+/// Runs `lake build <targets...>` in `dot_anneal_dir` under
+/// [`run_command_with_watchdog`], preserving `LAKE_CACHE_ENV_DEFAULTS` while
+/// bounding `LEAN_NUM_THREADS`, the process tree's physical RSS, and wall-clock
+/// runtime.
+fn run_itree_lake_build_targets(dot_anneal_dir: &Path, targets: &[String]) -> Result<(), String> {
+    let lake_bin = resolve_itree_lake_bin();
+    let mut cmd = build_lake_build_command(&lake_bin, dot_anneal_dir);
+    let (_lean_max_mb, rss_limit_kib) = resolve_itree_lean_rss_budget_kib(1);
+    let lean_threads = resolve_itree_lean_threads(1);
+    let has_explicit_lake_jobs = env::var("CARGO_ANNEAL_LAKE_JOBS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .is_some_and(|n| n >= 1);
+    if !has_explicit_lake_jobs {
+        cmd.env("LEAN_NUM_THREADS", lean_threads.to_string());
+    }
+    for target in targets {
+        cmd.arg(target);
+    }
+    let timeout = resolve_itree_lean_timeout_for_cases(targets.len().max(1));
+    let out = run_command_with_watchdog(
+        cmd,
+        rss_limit_kib,
+        timeout,
+        ITREE_WATCHDOG_POLL_INTERVAL,
+    )
+    .map_err(|e| {
+        format!(
+            "failed to execute '{}' in {}: {}",
+            lake_bin.display(),
+            dot_anneal_dir.display(),
+            e
+        )
+    })?;
+
+    match out.watchdog_killed {
+        Some(ItreeLeanFailureKind::RssWatchdogExceeded) => {
+            return Err(format!(
+                "[WATCHDOG:RSS_EXCEEDED] `lake build` in {} exceeded RSS limit ({} KiB > {} KiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+                dot_anneal_dir.display(),
+                out.peak_rss_kib,
+                rss_limit_kib,
+                lean_threads,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Some(ItreeLeanFailureKind::WallClockTimeout) => {
+            return Err(format!(
+                "[WATCHDOG:TIMEOUT] `lake build` in {} exceeded wall-clock timeout ({:?} for {} target(s), peak RSS {} KiB / {} KiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+                dot_anneal_dir.display(),
+                timeout,
+                targets.len(),
+                out.peak_rss_kib,
+                rss_limit_kib,
+                lean_threads,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        _ => {}
+    }
+
+    if !out.exit_success {
+        let signal_note = if out.signal_terminated {
+            "[LEAN:RESOURCE_EXHAUSTED] terminated by a signal (e.g. the cgroup OOM killer) "
+        } else {
+            ""
+        };
+        return Err(format!(
+            "{signal_note}lake build failed in {} (peak RSS {} KiB / {} KiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+            dot_anneal_dir.display(),
+            out.peak_rss_kib,
+            rss_limit_kib,
+            lean_threads,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
 /// Writes `src` to `verify_dir/<label>.lean` and runs `lake env lean -M <mb>`
 /// on it from `anneal_dir` under [`run_command_with_watchdog`], bounding
 /// `LEAN_NUM_THREADS`, Lean's internal allocator (`-M`), the process tree's
@@ -1979,7 +2083,7 @@ fn run_itree_lean_module_with_workers(
     let lean_threads = resolve_itree_lean_threads(active_workers);
     let timeout = resolve_itree_lean_timeout_for_cases(cases);
 
-    let mut cmd = Command::new("lake");
+    let mut cmd = Command::new(resolve_itree_lake_bin());
     cmd.args(["env", "lean", "-M", &lean_max_mb.to_string()])
         .arg(&file)
         .current_dir(anneal_dir)
@@ -3623,9 +3727,9 @@ fn evaluate_itree_entries(
         let mut raw_trace_count_by_fn: BTreeMap<String, usize> = BTreeMap::new();
         let mut obs_records_by_fn: BTreeMap<
             String,
-            Vec<(crate::input_gen::MirObsPathKey, Vec<u8>)>,
+            Vec<(String, crate::input_gen::MirObsPathKey, Vec<u8>)>,
         > = BTreeMap::new();
-        let mut obs_sigs_by_fn: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut obs_sigs_by_fn: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         let mut compared_fn_names: BTreeSet<String> = BTreeSet::new();
         let mut per_candidate_distinct_traces: BTreeMap<String, usize> = BTreeMap::new();
         let mut batch_cases: Vec<BatchTraceEvalCase> = Vec::new();
@@ -3662,9 +3766,15 @@ fn evaluate_itree_entries(
             };
 
             let mut fn_obs_records = Vec::with_capacity(raw_traces.len());
-            let mut fn_obs_sigs = BTreeSet::new();
+            let mut fn_obs_sigs = Vec::with_capacity(raw_traces.len());
+            let mut seen_keys: BTreeSet<String> = BTreeSet::new();
+            let mut distinct_for_cand: Vec<RecordedRawTrace> = Vec::new();
 
-            for tr in &raw_traces {
+            for tr in raw_traces {
+                let mut sig_trace = tr.clone();
+                sig_trace.raw_args.clear();
+                let dedup_key = encode_recorded_raw_trace_hex(&sig_trace);
+
                 let mut call_seq = Vec::new();
                 let mut branch_tags = Vec::new();
                 for (idx, ev) in tr.events.iter().enumerate() {
@@ -3687,10 +3797,12 @@ fn evaluate_itree_entries(
                 };
                 let shape_hash =
                     compute_itree_obs_shape_hash(prefix, &branch_tags, &call_seq);
-                fn_obs_sigs.insert(format!(
-                    "itree:{template_and_chain}:{shape_hash}:{outcome_kind}"
+                fn_obs_sigs.push((
+                    dedup_key.clone(),
+                    format!("itree:{template_and_chain}:{shape_hash}:{outcome_kind}"),
                 ));
                 fn_obs_records.push((
+                    dedup_key.clone(),
                     crate::input_gen::MirObsPathKey {
                         fn_name: fn_name.clone(),
                         branch_tags,
@@ -3699,21 +3811,14 @@ fn evaluate_itree_entries(
                     },
                     tr.raw_args.iter().flatten().copied().collect(),
                 ));
-            }
-            obs_records_by_fn.insert(fn_name.clone(), fn_obs_records);
-            obs_sigs_by_fn.insert(fn_name.clone(), fn_obs_sigs);
 
-            // Deduplicate distinct traces per candidate by observable (events, outcome).
-            let mut seen_keys: BTreeSet<String> = BTreeSet::new();
-            let mut distinct_for_cand: Vec<RecordedRawTrace> = Vec::new();
-            for tr in raw_traces {
-                let mut sig_trace = tr.clone();
-                sig_trace.raw_args.clear();
-                let key = encode_recorded_raw_trace_hex(&sig_trace);
-                if seen_keys.insert(key) {
+                // Deduplicate distinct traces per candidate by observable (events, outcome).
+                if seen_keys.insert(dedup_key) {
                     distinct_for_cand.push(tr);
                 }
             }
+            obs_records_by_fn.insert(fn_name.clone(), fn_obs_records);
+            obs_sigs_by_fn.insert(fn_name.clone(), fn_obs_sigs);
             per_candidate_distinct_traces.insert(fn_name.clone(), distinct_for_cand.len());
 
             let default_root_mir = format!("Mir.ItreeDiffStaged.{fn_name}");
@@ -3795,7 +3900,7 @@ fn evaluate_itree_entries(
                         }
                     }
                 }
-                run_lake_verify_targets(&anneal_dir, &targets)?;
+                run_itree_lake_build_targets(&anneal_dir, &targets)?;
                 Ok(chunk.iter().map(|(f, _)| (f.clone(), ())).collect())
             },
         );
@@ -3991,10 +4096,12 @@ fn evaluate_itree_entries(
         );
         // When `batch_cases.len() > ITREE_FULL_CONFIRM_MAX_TRACES`, each agreeing
         // candidate had only its first `ok` trace selected into `confirm_cases`.
-        // If that trace hit a watchdog / resource limit (`inconclusive_cases`),
-        // confirm the candidate's next Stage-1 `ok` trace instead so it can still
-        // obtain at least one kernel-confirmed trace.
-        if confirm_cases.len() < batch_cases.len() && !confirm_stage.failed_fns.is_empty() {
+        // While any candidate's selected `ok` trace(s) all hit a watchdog /
+        // resource limit (`inconclusive_cases`), confirm the candidate's next
+        // unselected Stage-1 `ok` trace so it can still obtain at least one
+        // kernel-confirmed trace even if multiple `ok` traces time out.
+        let mut rep_round = 0usize;
+        while confirm_cases.len() < batch_cases.len() && !confirm_stage.failed_fns.is_empty() {
             let replacement_cases: Vec<BatchTraceEvalCase> = itree_confirm_replacements(
                 &confirm_stage,
                 &confirm_cases,
@@ -4006,28 +4113,35 @@ fn evaluate_itree_entries(
             .into_iter()
             .cloned()
             .collect();
-            if !replacement_cases.is_empty() {
-                let rep_stage = run_isolated_lean_stage(
-                    "ItreeDiffBatchConfirmReplacement",
-                    &replacement_cases,
-                    confirm_chunk_size,
-                    lean_jobs,
-                    batch_case_ident,
-                    &case_to_fn,
-                    run_confirm_chunk,
-                );
-                confirm_cases.extend(replacement_cases);
-                confirm_stage.results.extend(rep_stage.results);
-                confirm_stage
-                    .inconclusive_cases
-                    .extend(rep_stage.inconclusive_cases);
-                confirm_stage.errors.extend(rep_stage.errors);
-                confirm_stage.failed_fns = confirm_cases
-                    .iter()
-                    .filter(|c| !confirm_stage.results.contains_key(&c.case_ident))
-                    .filter_map(|c| case_to_fn.get(&c.case_ident).cloned())
-                    .collect();
+            if replacement_cases.is_empty() {
+                break;
             }
+            let stage_label = if rep_round == 0 {
+                "ItreeDiffBatchConfirmReplacement".to_string()
+            } else {
+                format!("ItreeDiffBatchConfirmReplacement{}", rep_round + 1)
+            };
+            rep_round += 1;
+            let rep_stage = run_isolated_lean_stage(
+                &stage_label,
+                &replacement_cases,
+                confirm_chunk_size,
+                lean_jobs,
+                batch_case_ident,
+                &case_to_fn,
+                run_confirm_chunk,
+            );
+            confirm_cases.extend(replacement_cases);
+            confirm_stage.results.extend(rep_stage.results);
+            confirm_stage
+                .inconclusive_cases
+                .extend(rep_stage.inconclusive_cases);
+            confirm_stage.errors.extend(rep_stage.errors);
+            confirm_stage.failed_fns = confirm_cases
+                .iter()
+                .filter(|c| !confirm_stage.results.contains_key(&c.case_ident))
+                .filter_map(|c| case_to_fn.get(&c.case_ident).cloned())
+                .collect();
         }
         for err in &confirm_stage.errors {
             eprintln!("itree-difftest: Stage 2 Lean kernel confirmation failure: {err}");
@@ -4093,6 +4207,7 @@ fn evaluate_itree_entries(
             .filter_map(|f| raw_trace_count_by_fn.get(f))
             .sum();
         per_candidate_distinct_traces.clear();
+        let mut checked_dedup_keys_by_fn: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for case in &batch_cases {
             if let Some(fn_name) = case_to_fn.get(&case.case_ident)
                 && compared_fn_names.contains(fn_name)
@@ -4100,19 +4215,34 @@ fn evaluate_itree_entries(
                 *per_candidate_distinct_traces
                     .entry(fn_name.clone())
                     .or_insert(0) += 1;
+                let mut sig_trace = case.trace.clone();
+                sig_trace.raw_args.clear();
+                checked_dedup_keys_by_fn
+                    .entry(fn_name.clone())
+                    .or_default()
+                    .insert(encode_recorded_raw_trace_hex(&sig_trace));
             }
         }
 
         let mut obs_path_set = MirObsPathSet::new();
         let mut obs_path_signatures_set = BTreeSet::new();
         for fn_name in &compared_fn_names {
+            let Some(checked_keys) = checked_dedup_keys_by_fn.get(fn_name) else {
+                continue;
+            };
             if let Some(records) = obs_records_by_fn.get(fn_name) {
-                for (key, args) in records {
-                    obs_path_set.record_execution(key.clone(), args.clone());
+                for (dedup_key, key, args) in records {
+                    if checked_keys.contains(dedup_key) {
+                        obs_path_set.record_execution(key.clone(), args.clone());
+                    }
                 }
             }
             if let Some(sigs) = obs_sigs_by_fn.get(fn_name) {
-                obs_path_signatures_set.extend(sigs.iter().cloned());
+                for (dedup_key, sig) in sigs {
+                    if checked_keys.contains(dedup_key) {
+                        obs_path_signatures_set.insert(sig.clone());
+                    }
+                }
             }
         }
 
@@ -5003,7 +5133,7 @@ pub fn reproduce_itree_finding(
         let anneal_dir = staging_dir.join(".anneal");
         let mut lake_targets = vec!["Anneal".to_string(), root_mir_module];
         lake_targets.extend(callee_sig_modules);
-        run_lake_verify_targets(&anneal_dir, &lake_targets)?;
+        run_itree_lake_build_targets(&anneal_dir, &lake_targets)?;
 
         let verify_dir = anneal_dir.join("generated/Verify/ItreeDiffStaged");
         fs::create_dir_all(&verify_dir)
@@ -6947,6 +7077,26 @@ mod tests {
             |c: &String| !divergent.contains(c.as_str()),
         );
         assert_eq!(picked, vec!["case_cand_retry_t1", "case_cand_skip_t2"]);
+
+        // If `case_cand_retry_t1` also hits a resource limit while
+        // `case_cand_skip_t2` succeeds, a second replacement pass selects
+        // `case_cand_retry_t2` and stops for `cand_skip`.
+        let mut selected2 = selected;
+        selected2.extend(picked.into_iter().cloned());
+        let mut stage2 = stage;
+        stage2.results.insert("case_cand_skip_t2".to_string(), 1);
+        stage2
+            .inconclusive_cases
+            .insert("case_cand_retry_t1".to_string());
+        let picked2 = itree_confirm_replacements(
+            &stage2,
+            &selected2,
+            &pool,
+            ident,
+            &case_to_fn,
+            |c: &String| !divergent.contains(c.as_str()),
+        );
+        assert_eq!(picked2, vec!["case_cand_retry_t2"]);
     }
 
     /// The trial builder keeps every fixed probe (including the `PanicOnCall(0)`
