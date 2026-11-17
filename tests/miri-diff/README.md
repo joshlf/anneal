@@ -132,34 +132,24 @@ of a `Drop` impl. The call-chain tests therefore check reference passing,
 reborrow return, frame cleanup, and unwinding into cleanup landing pads, but
 not Anneal's `FnEntry` protector enforcement or `Drop::drop` calls.
 
-**Frame-relative pointer resolution.** A borrow entry's `targetLocal` is a
-local index into the *running* frame (`get? locals entry.targetLocal`, falling
-back to `memory.callerLocals`, which `pushCalleeFrame` never populates). Inside
-a callee, a reference or raw pointer to the caller's local `_k` therefore
-resolves to the callee's own local `_k`:
+**Frame-relative pointer resolution (fixed).** Before `DIV-MR-CALL-TARGET-LOCAL`
+and `DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL` were repaired (`86255c4698`), a
+borrow entry's `targetLocal` resolved against the *running* frame, so inside a
+callee a pointer to the caller's local `_k` reached the callee's own local
+`_k`. A borrow entry now also records the depth of the frame that owns
+`targetLocal`, and the former witnesses are pinned as exact agreements: a callee
+read through a raw pointer to `x` (`10`), a callee write through it (`11`), a
+callee write through a pointer argument that shares `x`'s local index (`9`), and
+a callee dereference of a reference argument (`fn f(r: &u32, bonus: u32) -> u32
+{ *r + bonus }` called as `f(&x, 1)`, `11`).
 
-- Silent wrong values (`wrong_value`, `value_mismatch`): when the caller's `x`
-  and a `u32` parameter `pad2` of the callee are both local `_3`, a callee read
-  through a raw pointer to `x` returns `pad2` (Anneal `200`, Miri `10`), and a
-  callee write through it lands in `pad2` and leaves `x` unchanged (Anneal `13`,
-  Miri `11`). When the caller's `x` and the callee's pointer argument `alias`
-  are both local `_1`, the callee's write through `alias` overwrites `alias`
-  itself and is lost the same way (Anneal `13`, Miri `9`).
-- False UB (`false_positive_ub`): a callee dereferencing a reference argument
-  (`fn f(r: &u32, bonus: u32) -> u32 { *r + bonus }` called as `f(&x, 1)`, with
-  `x` and `r` both local `_1`) reads its own 8-byte `r` as a `u32` and faults.
-- Missed UB (`missed_ub`, `unsound_missed_fault`): Miri reports a
-  `RetagKind::FnEntry` protector violation when a callee writes through `raw`
-  while `&*raw` (or `&mut *raw`) is one of its arguments. In Anneal the write
-  lands in the callee's local with `x`'s index (the pin pads the callee so that
-  local is a `u32`), never reaching `x` or its borrow tree; the MIR capture
-  also emits no `Retag(FnEntry)`, so no protector would exist anyway. When the
-  colliding local is instead an 8-byte reference whose `ScalarLayout` has
-  `validRange.end_ = u64::MAX`, the 4-byte write sends the Lean kernel's
-  `by rfl` confirmation into byte-level re-decoding, which exhausts memory.
-  Passing `&x` or `&mut x` directly agrees with Miri (both report UB at the
-  write), but only because creating `&x` freezes `raw` (see the next
-  paragraph), not because of a protector.
+One related gap remains (`missed_ub`, `unsound_missed_fault`): Miri reports a
+`RetagKind::FnEntry` protector violation when a callee writes through `raw`
+while `&*raw` (or `&mut *raw`) is one of its arguments. Anneal's write now
+reaches `x` (Anneal `11`), but the MIR capture emits no `Retag(FnEntry)`, so no
+protector exists to forbid it. Passing `&x` or `&mut x` directly agrees with
+Miri (both report UB at the write), but only because creating `&x` freezes
+`raw` (see the next paragraph), not because of a protector.
 
 **Raw-pointer sibling roots (no call needed).** `evalRvalueRawPtr` mints a
 separate root `BorrowEntry` (`perm = .active`) for `raw = &raw mut x`, while
@@ -173,7 +163,7 @@ tag and the write only disables `&x`:
   UB at the write.
 - In a callee: the caller holds `let _r = &x;` and passes `raw`, and the callee
   writes through it. Without `_r`, `raw` stays `.active` and the callee's write
-  is silently lost instead (the frame-relative item above).
+  reaches `x`, agreeing with Miri (the frame-relative item above).
 - After a call: `&x` is a call argument and the caller writes through `raw`
   once the callee has returned. This also reproduces with a callee whose only
   locals are `_0` and `_r`, so it does not depend on local-index collisions.

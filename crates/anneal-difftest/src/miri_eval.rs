@@ -107,7 +107,7 @@ pub const WITNESS_POLARITY_NAMES: [&str; 4] = [
 ///   (`ub_location_mismatch`, `panic_site_mismatch`). The class is not
 ///   directional, but it is not benign either: a `wrong_value` means Anneal
 ///   computed a result the program does not produce (for example, through the
-///   Category 9 frame-relative pointer gap in `tests/miri-diff/README.md`), so
+///   Category 9 skipped `Drop` side effect in `tests/miri-diff/README.md`), so
 ///   any value-level claim resting on it is unsound and needs triage.
 /// - [`WitnessPolarity::HarnessOrExtractionError`]
 ///   (`"harness_or_extraction_error"`): no semantic comparison was possible: a

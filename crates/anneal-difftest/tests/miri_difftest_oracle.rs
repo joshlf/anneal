@@ -397,26 +397,38 @@ assert d1["mutator_applications"] != d2["mutator_applications"], (
         String::from_utf8_lossy(&check_out.stderr)
     );
 
-    // Negative control: evaluate a candidate that writes a surrogate code point
-    // (0xD800) into a `char` local via `*mut u32` and loads it as `u32`,
-    // verifying finding bundle generation (`repro.rs`, `finding.json`,
-    // `SUMMARY.md`) and standalone `--reproduce` round-tripping.
+    // Negative control: evaluate an oracle-separated candidate whose divergence
+    // does not depend on any `trusted/` semantic gap, verifying finding bundle
+    // generation (`repro.rs`, `finding.json`, `SUMMARY.md`) and standalone
+    // `--reproduce` round-tripping. `ANNEAL_CAPTURE_DIR` is set for every
+    // `anneal-rustc-capture` compilation (the capture wrapper records nothing
+    // without it) and never for the plain `rustc` compilation of the Miri `.rlib`,
+    // so Anneal returns `2` (kernel-confirmed by `rfl`) while Miri reads an
+    // invalid `bool` (`missed_ub`). (The previous control, a surrogate `char`
+    // written through `*mut u32`, agrees since `DIV-LM-RAW-OVERWRITE-CHAR-COPY` was
+    // fixed; `cfg(miri)` cannot split the oracles because the `.rlib` is compiled
+    // without `--cfg miri`.)
+    assert!(
+        std::env::var_os("ANNEAL_CAPTURE_DIR").is_none(),
+        "ANNEAL_CAPTURE_DIR must be unset: it would reach the Miri `.rlib` compilation"
+    );
     let root = repo_root();
-    let neg_fn = "\
-pub fn neg_ctrl_char_surrogate_via_ptr__b0_c0() -> u32 {
-    let mut c: char = 'a';
-    let p: *mut u32 = (&raw mut c) as *mut u32;
-    unsafe {
-        *p = 0xD800u32;
+    let neg_fn = r#"pub fn neg_ctrl_capture_split_invalid_bool__b0_c0() -> u32 {
+    const ANNEAL_CAPTURE: bool = option_env!("ANNEAL_CAPTURE_DIR").is_some();
+    if ANNEAL_CAPTURE {
+        2u32
+    } else {
+        let raw: u8 = 2u8;
+        let b: bool = unsafe { *(&raw const raw as *const bool) };
+        b as u32
     }
-    c as u32
 }
-";
+"#;
     let neg_cand = GeneratedMiriCandidate {
         id: 0,
         seed_index: 0,
-        seed_name: "ub_transmute_invalid_char_surrogate".to_string(),
-        fn_name: "neg_ctrl_char_surrogate_via_ptr__b0_c0".to_string(),
+        seed_name: "ub_transmute_invalid_bool_through_ptr".to_string(),
+        fn_name: "neg_ctrl_capture_split_invalid_bool__b0_c0".to_string(),
         seed_u64: 0xDEAD_BEEF,
         applied_mutators: vec!["BitValidityTransmuteMutator".to_string()],
         tracked_locals: Vec::new(),
@@ -604,22 +616,34 @@ pub fn agree_helper_call__b0_c0() -> u32 {
         source: build_standalone_candidate_source(agree_fn),
     };
 
-    let div_fn = "\
-pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
+    // The diverging negative control steps through `helper_add_ten()` in both
+    // oracles, then splits them without relying on any `trusted/` semantic gap:
+    // `ANNEAL_CAPTURE_DIR` is set for every `anneal-rustc-capture` compilation and
+    // never for the plain `rustc` compilation of the Miri `.rlib`, so Anneal
+    // returns `base` (`10`, kernel-confirmed) while Miri reads an invalid `bool`
+    // (`missed_ub`). (A surrogate `char` written through `*mut u32` agrees since
+    // `DIV-LM-RAW-OVERWRITE-CHAR-COPY` was fixed.)
+    assert!(
+        std::env::var_os("ANNEAL_CAPTURE_DIR").is_none(),
+        "ANNEAL_CAPTURE_DIR must be unset: it would reach the Miri `.rlib` compilation"
+    );
+    let div_fn = r#"pub fn neg_ctrl_helper_call_capture_split__b0_c1() -> u32 {
+    const ANNEAL_CAPTURE: bool = option_env!("ANNEAL_CAPTURE_DIR").is_some();
     let base: u32 = helper_add_ten();
-    let mut c: char = 'a';
-    let p: *mut u32 = (&raw mut c) as *mut u32;
-    unsafe {
-        *p = 0xD800u32;
+    if ANNEAL_CAPTURE {
+        base
+    } else {
+        let raw: u8 = 2u8;
+        let b: bool = unsafe { *(&raw const raw as *const bool) };
+        base + (b as u32)
     }
-    base + (c as u32)
 }
-";
+"#;
     let div_cand = GeneratedMiriCandidate {
         id: 1,
         seed_index: 0,
         seed_name: "pass_direct_fn_call".to_string(),
-        fn_name: "neg_ctrl_helper_call_surrogate__b0_c1".to_string(),
+        fn_name: "neg_ctrl_helper_call_capture_split__b0_c1".to_string(),
         seed_u64: 0x3333_4444,
         applied_mutators: vec!["BitValidityTransmuteMutator".to_string()],
         tracked_locals: Vec::new(),
@@ -655,7 +679,7 @@ pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
     assert_eq!(report.findings.len(), 1);
 
     let f = &report.findings[0];
-    assert_eq!(f.fn_name, "neg_ctrl_helper_call_surrogate__b0_c1");
+    assert_eq!(f.fn_name, "neg_ctrl_helper_call_capture_split__b0_c1");
     assert!(f.kernel_confirmed);
     assert!(
         f.kernel_confirm_theorems
@@ -2269,39 +2293,44 @@ pub fn early_ret_ep2_live(b_static: &'static [u8], flag: bool) -> u32 {
     assert!(repro_report.kernel_confirmed);
 }
 
-/// Seed whose unmutated program the live engine gets wrong: it writes the
-/// surrogate code point `0xD800` into a `char` through a `*mut u32` and loads it
-/// as `u32`. Miri reports the invalid `char`; Anneal returns `0xD800`
-/// (`missed_ub`). When the engine learns `char` validity, this test (like the
-/// negative control above) must switch to another divergent seed.
-const CHAR_SURROGATE_SEED: &str = "\
-pub fn seed_char_surrogate_via_ptr() -> u32 {
+/// Seed whose unmutated program diverges (`missed_ub`) independently of any
+/// `trusted/` semantic gap: it writes the surrogate code point `0xD800` into a
+/// `char` through a `*mut u32` and then branches on `ANNEAL_CAPTURE_DIR`, which
+/// is set for every `anneal-rustc-capture` compilation (the capture wrapper
+/// records nothing without it) and never for the plain `rustc` compilation of
+/// the Miri `.rlib`. Miri loads `c` as a `char` and reports the invalid value;
+/// Anneal loads the raw `u32` through `p` and returns `0xD800`. (Since
+/// `DIV-LM-RAW-OVERWRITE-CHAR-COPY` was fixed, Anneal itself rejects the
+/// surrogate `char` load, so an unsplit seed agrees with Miri.)
+const CHAR_SURROGATE_SEED: &str = r#"pub fn seed_char_surrogate_via_ptr() -> u32 {
+    const ANNEAL_CAPTURE: bool = option_env!("ANNEAL_CAPTURE_DIR").is_some();
     let mut c: char = 'a';
     let p: *mut u32 = (&raw mut c) as *mut u32;
     unsafe {
         *p = 0xD800u32;
     }
-    c as u32
+    if ANNEAL_CAPTURE { unsafe { *p } } else { c as u32 }
 }
-";
+"#;
 
 /// Seed whose unmutated program (`[]`) writes the valid code point `pair.a`
 /// (`0x0061`, `'a'`) and therefore agrees between Miri and Anneal, but diverges
 /// (`missed_ub`) when `PlaceProjectionWrapper` flips `pair.a` -> `pair.b`
-/// (`0xD800`). A multi-pass candidate containing that flip alongside other
-/// `Pass`/`PerturbAst` passes shrinks live from `k >= 2` down to the non-empty
-/// 1-minimal chain `["PlaceProjectionWrapper"]`.
-const CHAR_SURROGATE_ON_FIELD_FLIP_SEED: &str = "\
-pub fn seed_char_surrogate_on_field_flip() -> u32 {
+/// (`0xD800`), with the same `ANNEAL_CAPTURE_DIR` oracle split as
+/// `CHAR_SURROGATE_SEED`. A multi-pass candidate containing that flip alongside
+/// other `Pass`/`PerturbAst` passes shrinks live from `k >= 2` down to the
+/// non-empty 1-minimal chain `["PlaceProjectionWrapper"]`.
+const CHAR_SURROGATE_ON_FIELD_FLIP_SEED: &str = r#"pub fn seed_char_surrogate_on_field_flip() -> u32 {
+    const ANNEAL_CAPTURE: bool = option_env!("ANNEAL_CAPTURE_DIR").is_some();
     let pair: PairU32 = PairU32 { a: 0x0061u32, b: 0xD800u32 };
     let mut c: char = 'a';
     let p: *mut u32 = (&raw mut c) as *mut u32;
     unsafe {
         *p = pair.a;
     }
-    c as u32
+    if ANNEAL_CAPTURE { unsafe { *p } } else { c as u32 }
 }
-";
+"#;
 
 /// Live end-to-end shrinking in `evaluate_miri_batches_with_options`: mutated
 /// candidates of a divergent seed (`k -> 0`) and a mutator-triggered divergent
@@ -2477,34 +2506,24 @@ fn cat9_line_of(haystack: &str, needle: &str) -> u32 {
 /// classified by `WitnessPolarity`, and `witness_polarity_counts` satisfies the
 /// accounting identity.
 ///
-/// Frame-relative pointer resolution: `BorrowEntry.targetLocal` is an index
-/// into the *running* frame's locals (`get? locals entry.targetLocal`, falling
-/// back to `memory.callerLocals`, which `pushCalleeFrame` never populates), so
-/// inside a callee a pointer to the caller's local `_k` resolves to the
-/// callee's own local `_k`:
-/// - `cat9_gap_callee_raw_read_wrong_value` / `cat9_gap_callee_raw_write_wrong_value`
-///   (`wrong_value`, `value_mismatch`): with the caller's `x` and the callee's
-///   `u32` parameter `pad2` both at local `_3`, the callee reads `pad2` (`200`)
-///   instead of `x` (`10`), and its write lands in `pad2`, leaving `x`
-///   unchanged (Anneal `13` vs Miri `11`): silent wrong values.
-/// - `cat9_gap_callee_raw_write_collides_with_ptr_arg` (`wrong_value`,
-///   `value_mismatch`): the caller's `x` and the callee's pointer argument
-///   `alias` are both local `_1`, so the callee's write through `alias`
-///   overwrites `alias` itself and `x` stays `10` (Anneal `13` vs Miri `9`).
-/// - `cat9_gap_callee_deref_ref_arg` (`false_positive_ub`,
-///   `sound_conservative_abstraction`): `x` and the reference argument `r` are
-///   both local `_1`, so `*r` reads the callee's own 8-byte `r` as a `u32` and
-///   faults.
-/// - `cat9_gap_callee_raw_write_with_caller_borrow` (`false_positive_ub`): see
-///   the raw-pointer sibling roots below; without the caller's `&x` the
-///   callee's write proceeds but is misdirected into its own frame, as in
-///   `cat9_gap_callee_raw_write_collides_with_ptr_arg`.
-/// - `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub` (`missed_ub`,
-///   `unsound_missed_fault`): Miri reports the `FnEntry` protector violation of
-///   writing through `raw` while `&*raw` is a protected argument; in Anneal the
-///   write lands in the callee's `_slot_pad` (local `_3`, like `x`), so it never
-///   reaches `x` or its borrow tree (and the capture emits no
-///   `Retag(FnEntry)`, so no protector exists either).
+/// Frame-relative pointer resolution (fixed by `DIV-MR-CALL-TARGET-LOCAL` and
+/// `DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL` in `86255c4698`): a borrow entry now
+/// records the depth of the frame owning `targetLocal`, so inside a callee a
+/// pointer to the caller's local `_k` resolves to the caller's `_k`, not the
+/// callee's own `_k`. The former gaps stay pinned as exact agreements:
+/// - `cat9_gap_callee_raw_read_wrong_value` (`10`) and
+///   `cat9_gap_callee_raw_write_wrong_value` (`11`): the caller's `x` and the
+///   callee's `u32` parameter `pad2` are both local `_3`.
+/// - `cat9_gap_callee_raw_write_collides_with_ptr_arg` (`9`): the caller's `x`
+///   and the callee's pointer argument `alias` are both local `_1`.
+/// - `cat9_gap_callee_deref_ref_arg` (`11`): `x` and the reference argument `r`
+///   are both local `_1`.
+///
+/// `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub` (`missed_ub`,
+/// `unsound_missed_fault`) still diverges: Miri reports the `FnEntry` protector
+/// violation of writing through `raw` while `&*raw` is a protected argument.
+/// Anneal's write now reaches `x` (Anneal `11`), but the capture emits no
+/// `Retag(FnEntry)`, so no protector exists to forbid it.
 ///
 /// Raw-pointer sibling roots (no call needed): `&raw mut x` mints its own root
 /// borrow entry, and creating a later `&x` (a sibling root whose retag reads
@@ -2887,14 +2906,14 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
 
     assert_eq!(report.total_candidates, 19);
     assert_eq!(report.compiled_candidates, 19);
-    assert_eq!(report.agree_count, 6, "agreements: {:?}", report.item_reports);
-    assert_eq!(report.diverge_count, 13, "divergences: {:?}", report.item_reports);
+    assert_eq!(report.agree_count, 10, "agreements: {:?}", report.item_reports);
+    assert_eq!(report.diverge_count, 9, "divergences: {:?}", report.item_reports);
     assert_eq!(report.not_compared_count, 0);
     assert!(witness_polarity_accounting_holds(&report));
     for (slug, expected) in [
         ("unsound_missed_fault", 4usize),
-        ("sound_conservative_abstraction", 5),
-        ("value_mismatch", 4),
+        ("sound_conservative_abstraction", 4),
+        ("value_mismatch", 1),
         ("harness_or_extraction_error", 0),
     ] {
         assert_eq!(
@@ -2904,8 +2923,8 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
             report.witness_polarity_counts
         );
     }
-    assert_eq!(report.findings.len(), 13);
-    assert_eq!(report.kernel_confirmed_divergences, 13);
+    assert_eq!(report.findings.len(), 9);
+    assert_eq!(report.kernel_confirmed_divergences, 9);
     // With no shrinkable mutator chain, every finding reports its original
     // candidate, so each original item report is itself kernel-confirmed.
     for f in &report.findings {
@@ -2996,37 +3015,39 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
     assert_eq!(
         prot_rep.anneal,
         AnnealOutcome::PassScalar {
-            bits: 13,
+            bits: 11,
             size_bytes: 4
-        }
+        },
+        "known Category 9 `FnEntry` protector gap changed (fixed?); update the pin and \
+         tests/miri-diff/README.md"
     );
 
-    // Frame-relative pointer resolution yields silent wrong values: the callee
-    // reads (and writes) its own `pad2` at local `_3` instead of the caller's
-    // `x` at local `_3`.
-    for (name, miri_bits, anneal_bits) in [
-        ("cat9_gap_callee_raw_read_wrong_value", 10u128, 200u128),
-        ("cat9_gap_callee_raw_write_wrong_value", 11, 13),
-        ("cat9_gap_callee_raw_write_collides_with_ptr_arg", 9, 13),
+    // Frame-relative pointer resolution agrees with Miri since
+    // `DIV-MR-CALL-TARGET-LOCAL` / `DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL`: a
+    // callee access through a pointer to the caller's `x` reaches `x`, not the
+    // callee's local of the same index.
+    for (name, bits) in [
+        ("cat9_gap_callee_raw_read_wrong_value", 10u128),
+        ("cat9_gap_callee_raw_write_wrong_value", 11),
+        ("cat9_gap_callee_raw_write_collides_with_ptr_arg", 9),
+        ("cat9_gap_callee_deref_ref_arg", 11),
     ] {
-        let f = finding(name);
-        assert_eq!(f.divergence_class, "wrong_value", "`{name}`");
-        assert_eq!(f.witness_polarity, "value_mismatch", "`{name}`");
         let rep = item(name);
+        assert_eq!(rep.verdict, ComparisonVerdict::Agree, "`{name}` must agree");
         assert_eq!(
             (&rep.miri, &rep.anneal),
             (
                 &MiriOutcome::PassScalar {
-                    bits: miri_bits,
+                    bits,
                     size_bytes: 4
                 },
                 &AnnealOutcome::PassScalar {
-                    bits: anneal_bits,
+                    bits,
                     size_bytes: 4
                 }
             ),
-            "known Category 9 frame-relative pointer gap `{name}` changed (fixed?); update the \
-             pin and tests/miri-diff/README.md"
+            "fixed Category 9 frame-relative pointer case `{name}` regressed; see \
+             tests/miri-diff/README.md"
         );
     }
 
@@ -3034,7 +3055,6 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
     // documented statement.
     for (name, miri_bits, ub_marker) in [
         ("cat9_in_scope_move_raw_read_conservative", 30u128, "let leaked: u32 = unsafe { *raw };"),
-        ("cat9_gap_callee_deref_ref_arg", 11, "    *r + bonus"),
         ("cat9_gap_callee_raw_write_with_caller_borrow", 10, "        *alias = 7u32;"),
         ("cat9_gap_post_return_raw_write_after_ref_arg", 10, "        *raw = 7u32 + seen;"),
         ("cat9_gap_raw_write_after_unused_shared_borrow", 11, "        *raw = 11u32;"),

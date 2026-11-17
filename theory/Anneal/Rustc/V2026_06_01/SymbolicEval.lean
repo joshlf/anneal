@@ -1986,13 +1986,20 @@ theorem lookupSwitchTargetCont_eq
       k (lookupSwitchTarget val branches otherwise) := by
   rw [lookupSwitchTargetCont, SymTree.run_eq_eval, lookupSwitchTargetTree_eval]
 
-/-- Decision-tree symbolic `evalTerminator`. -/
+/--
+`hasFrameDeallocProtectorConflict` is `false` when no function-entry protector
+is active, for every (possibly symbolic) `borrows` list. The definition is
+structurally recursive on `borrows`, so its leading `activeProtectors = .nil`
+case only reduces by WHNF once `borrows` is a constructor application; this
+lemma discharges the case split on `borrows`.
+-/
 theorem hasFrameDeallocProtectorConflict_nil_activeProtectors
     (borrows : List BorrowEntry)
     (depth nLocals : Nat) :
     hasFrameDeallocProtectorConflict borrows .nil depth nLocals = false := by
   cases borrows <;> rfl
 
+/-- Decision-tree symbolic `evalTerminator`. -/
 def evalTerminatorSymTree
     (s : MachineState)
     (term : Terminator)
@@ -3963,11 +3970,17 @@ theorem evalSymNodeTreeFrameModular_eq
     · exact ih1
 
 /--
-Frame-aware symbolic `evalTerminator` decision tree for `wpMirExecFrameModularSym`:
-when `s.memory.activeProtectors = .nil`, `.return_` short-circuits
-`hasFrameDeallocProtectorConflict` so symbolic post-call borrow lists
-(such as `invalidateDirectDestWriteBorrows`) reduce by WHNF without `List.rec`
-blocking on `borrows`.
+Frame-aware symbolic `evalTerminator` decision tree for the frame-restoring
+modular WPs (`wpMirExecFrameModularSym` and
+`wpMirExecFrameAndTraitsModularSym`): when
+`s.memory.activeProtectors = .nil`, `.return_` skips
+`hasFrameDeallocProtectorConflict` (which is `false` then, by
+`hasFrameDeallocProtectorConflict_nil_activeProtectors`), so a return whose
+borrow list is symbolic (such as the post-call
+`invalidateDirectDestWriteBorrows` borrows) reduces by WHNF instead of blocking
+on `List.rec` over `borrows`. Every other case is `evalTerminatorSymTree`, and
+`evalTerminatorFrameSymTree_eval_eq` ties the `.nil`-protector branch to the
+trusted `.return_` transition, so it cannot drift from `evalTerminator`.
 -/
 def evalTerminatorFrameSymTree
     (s : MachineState)
@@ -4047,6 +4060,11 @@ theorem evalTerminatorFrameSymTree_eval_eq
     | cons _ _ => rfl
   | _ => rfl
 
+/--
+One-step decision-tree symbolic MIR transition from `MachineState` for the
+frame-restoring modular WPs: `stepMirSymTree` with terminators evaluated by
+`evalTerminatorFrameSymTree`.
+-/
 def stepMirFrameSymTree
     (body : CapturedMir)
     (s : MachineState) : SymTree MirStepNode :=
@@ -4088,6 +4106,10 @@ theorem stepMirFrameSymTree_eval_eq
           · exact evalTerminatorFrameSymTree_eval_eq s bb.terminator _
           · rfl
 
+/--
+One-step decision-tree symbolic MIR transition from `MirExecState` for the
+frame-restoring modular WPs (`stepMirExecSymTree` over `stepMirFrameSymTree`).
+-/
 def stepMirExecFrameSymTree
     (body : CapturedMir)
     (st : MirExecState) : SymTree MirStepNode :=
@@ -4475,61 +4497,6 @@ theorem wpMirExecModularSym_resumeExternalCall_returned_of_callFramePreserved
   rw [← restoreCallFrame_eq_of_callFramePreserved h_frame]
   exact h
 
-/--
-When `memAfter.activeProtectors = .nil`, `resumeExternalCall` on a direct local
-destination `{ local_ := dstLocal, projection := .nil }` reduces `evalPlaceWrite`
-directly to `writePlaceValue` and updates `memAfter.borrows` via
-`invalidateDirectDestWriteBorrows`.
--/
-theorem resumeExternalCall_returned_of_activeProtectors_nil
-    (s : MachineState)
-    (localsAfterArgs : List LocalSlot)
-    (dstLocal : Local)
-    (targetBb : BasicBlockIdx)
-    (unwind : UnwindAction)
-    (retVal : Value)
-    (memAfter : Memory)
-    (h_prot : memAfter.activeProtectors = .nil) :
-    resumeExternalCall
-      s
-      localsAfterArgs
-      { local_ := dstLocal, projection := .nil }
-      targetBb
-      unwind
-      (.returned retVal memAfter) =
-    match
-      writePlaceValue
-        localsAfterArgs
-        memAfter.borrows
-        { local_ := dstLocal, projection := .nil }
-        retVal
-        .nil
-        emptyLayoutTable
-        memAfter.callStack
-    with
-    | .ok updatedLocals =>
-      .running {
-        frame := {
-          s.frame with
-          blockIdx := targetBb
-          stmtIdx := 0
-          locals := updatedLocals
-        }
-        memory := {
-          memAfter with
-          borrows :=
-            (invalidateDirectDestWriteBorrows
-              memAfter
-              localsAfterArgs
-              { local_ := dstLocal, projection := .nil }).borrows
-        }
-      }
-    | .ub => .faulted .ub
-    | .unsupported => .faulted .unsupported := by
-  cases memAfter
-  subst h_prot
-  rfl
-
 theorem restoreCallerMemoryFrame_eq_of_callFrameAndTraitsPreserved
     {before after : Memory}
     (h : callFrameAndTraitsPreserved before after) :
@@ -4677,7 +4644,7 @@ def wpMirExecFrameAndTraitsModularSym
     evalSymNodeTreeFrameAndTraitsModular contract
       (fun st' => wpMirExecFrameAndTraitsModularSym contract fuel' body st' post)
       post
-      (stepMirExecSymTree body st)
+      (stepMirExecFrameSymTree body st)
 
 /--
 Single-pass fuel-bounded frame-and-`traitImpls`-restoring modular symbolic WP
@@ -4708,7 +4675,7 @@ theorem wpMirExecModularSym_of_wpMirExecFrameAndTraitsModularSym
   | succ fuel' ih =>
     unfold wpMirExecFrameAndTraitsModularSym at h
     unfold wpMirExecModularSym
-    rw [evalSymNodeTreeFrameAndTraitsModular_eq] at h
+    rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecFrameSymTree_eval_eq] at h
     rw [evalSymNodeTreeModular_eq]
     cases h_ev : (stepMirExecSymTree body st).eval with
     | ret out =>

@@ -1995,7 +1995,7 @@ private theorem step_modular_tau
     (h_next : wpMirExecFrameAndTraitsModularSym contract fuel body (.running s') post) :
     wpMirExecFrameAndTraitsModularSym contract (fuel + 1) body (.running s) post := by
   unfold wpMirExecFrameAndTraitsModularSym
-  rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecSymTree_eval]
+  rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecFrameSymTree_eval]
   dsimp only [stepMirState]
   rw [h]
   exact h_next
@@ -2007,7 +2007,7 @@ private theorem step_modular_retNormal
     (h_next : post (.normal (v, m))) :
     wpMirExecFrameAndTraitsModularSym contract (fuel + 1) body (.running s) post := by
   unfold wpMirExecFrameAndTraitsModularSym
-  rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecSymTree_eval]
+  rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecFrameSymTree_eval]
   dsimp only [stepMirState]
   rw [h]
   exact h_next
@@ -4394,6 +4394,89 @@ theorem v26AddTwoRegsPinnedAuto_verified :
 theorem v26AddTwoRegsEq2U32_verified : VerificationResult v26AddTwoRegsClaim :=
   dischargeRustEq2U32FuelFree
     v26AddTwoRegsClaim v26AddTwoRegsReqMir v26AddTwoRegsEnsMir 10 20
+
+/-! ## 15. Frame-Restoring Modular `.return_` Over Symbolic Borrows (`evalTerminatorFrameSymTree`) -/
+
+/--
+Single-block body whose terminator returns `_0`, run from a state whose
+`_0` slot is already initialized.
+-/
+private def frameReturnMir : CapturedMir :=
+  mkMirBody "symbolic_eval_tests::frame_return" 0
+    [mkDecl .mut u32MirTy]
+    [{ statements := [], terminator := mkTerm .return_, isCleanup := false }]
+
+/-- No function-entry protector is active: no frame-deallocation conflict, for
+any symbolic `borrows`. -/
+example (borrows : List BorrowEntry) (depth nLocals : Nat) :
+    hasFrameDeallocProtectorConflict borrows [] depth nLocals = false :=
+  hasFrameDeallocProtectorConflict_nil_activeProtectors borrows depth nLocals
+
+/--
+Regression for the post-external-call `.return_` of
+`crates/cargo-anneal/src/driver.rs`'s `caller_ffi_and_len` proof: with
+concrete frame fields but an arbitrary (symbolic) `mem.borrows`, a root
+`.return_` reduces by WHNF in `wpMirExecFrameModularSym` (so the continuation is
+closed by `exact`, without rewriting `hasFrameDeallocProtectorConflict`).
+-/
+example
+    (contract : MirCallContract) (fuel : Nat) (retVal : Value) (mem : Memory)
+    (post : MirOutcome → Prop)
+    (h :
+      post
+        (.normal
+          (retVal,
+           { mem with
+             callStack := []
+             activeCallee := .none
+             activeProtectors := []
+             borrows := disableFrameBorrows mem.borrows 0 1 }))) :
+    wpMirExecFrameModularSym contract (fuel + 1) frameReturnMir
+      (.running
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init retVal] }
+          memory := { mem with callStack := [], activeCallee := .none, activeProtectors := [] } })
+      post :=
+  h
+
+/-- The same WHNF reduction holds for `wpMirExecFrameAndTraitsModularSym`. -/
+example
+    (contract : MirCallContract) (fuel : Nat) (retVal : Value) (mem : Memory)
+    (post : MirOutcome → Prop)
+    (h :
+      post
+        (.normal
+          (retVal,
+           { mem with
+             callStack := []
+             activeCallee := .none
+             activeProtectors := []
+             borrows := disableFrameBorrows mem.borrows 0 1 }))) :
+    wpMirExecFrameAndTraitsModularSym contract (fuel + 1) frameReturnMir
+      (.running
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init retVal] }
+          memory := { mem with callStack := [], activeCallee := .none, activeProtectors := [] } })
+      post :=
+  h
+
+/--
+With an active protector, `.return_` keeps the trusted protector check:
+`evalTerminatorFrameSymTree` is `evalTerminator` itself, so a protected local
+borrow still faults.
+-/
+example (retVal : Value) (mem : Memory) :
+    (stepMirExecFrameSymTree frameReturnMir
+      (.running
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init retVal] }
+          memory :=
+            { mem with
+              borrows :=
+                [{ tag := 1, targetLocal := 0, targetProjection := [], perm := .unique
+                   protector := .some 7 }]
+              callStack := []
+              activeCallee := .none
+              activeProtectors := [7] } })).eval =
+      MirStepNode.fail .ub :=
+  rfl
 
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 

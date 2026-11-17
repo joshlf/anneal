@@ -2933,8 +2933,8 @@ theorem callerFfiAndLen_verified :
   rw [h_core_len]
   unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecFrameModularSym
   dsimp only [
-    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
-    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecFrameSymTree,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirFrameSymTree,
     Option.getD,
     Mir.Core.slice_impl_T_len.body,
     CapturedMir.instantiate
@@ -3227,8 +3227,8 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
   rw [h_core_len]
   unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecFrameModularSym
   dsimp only [
-    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
-    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecFrameSymTree,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirFrameSymTree,
     Option.getD,
     Mir.Core.slice_impl_T_len.body,
     CapturedMir.instantiate
