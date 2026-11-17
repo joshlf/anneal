@@ -73,7 +73,8 @@ theorem readProjectedValue_proj (decls : List LocalDecl) (locals : List LocalSlo
     (proj : ProjectionElem) (hproj : projOk decls count proj = true) :
     (∀ idx, projIdx locals count proj = some idx →
       ∃ v, elems[idx]? = some v ∧
-        readProjectedValue locals (.aggregate 0 elems) [proj] = .ok v) ∧
+        (valueContainsUninit v = false →
+          readProjectedValue locals (.aggregate 0 elems) [proj] = .ok v)) ∧
     (projIdx locals count proj = none →
       readProjectedValue locals (.aggregate 0 elems) [proj] = .ub) := by
   match proj, hproj with
@@ -95,7 +96,7 @@ theorem readProjectedValue_proj (decls : List LocalDecl) (locals : List LocalSlo
             simp [hlt] at hidx
             subst hidx
             exact ⟨elems[sc.bits], List.getElem?_eq_getElem hlt',
-              by simp [List.getElem?_eq_getElem hlt', readProjectedValue]⟩
+              fun hv => by simp [List.getElem?_eq_getElem hlt', readProjectedValue, hv]⟩
           · have hge : elems.length ≤ sc.bits := by omega
             simp [hlt, List.getElem?_eq_none hge]
         | _ => simp
@@ -112,7 +113,7 @@ theorem readProjectedValue_proj (decls : List LocalDecl) (locals : List LocalSlo
         simp [hlt] at hidx
         subst hidx
         exact ⟨elems[offset], List.getElem?_eq_getElem hlt',
-          by simp [List.getElem?_eq_getElem hlt', readProjectedValue]⟩
+          fun hv => by simp [List.getElem?_eq_getElem hlt', readProjectedValue, hv]⟩
       · have hge : elems.length ≤ offset := by omega
         simp [hlt, List.getElem?_eq_none hge]
     · by_cases hlt : count - offset < count
@@ -121,7 +122,7 @@ theorem readProjectedValue_proj (decls : List LocalDecl) (locals : List LocalSlo
         simp [hlt] at hidx
         subst hidx
         exact ⟨elems[count - offset], List.getElem?_eq_getElem hlt',
-          by simp [List.getElem?_eq_getElem hlt', readProjectedValue]⟩
+          fun hv => by simp [List.getElem?_eq_getElem hlt', readProjectedValue, hv]⟩
       · have hge : elems.length ≤ count - offset := by omega
         simp [hlt, List.getElem?_eq_none hge]
 
@@ -647,7 +648,7 @@ theorem evalOperand_array_proj {layouts : Layout.LayoutTable} (decls : List Loca
             simp [hv] at hb
             subst hb
             rw [evalOperand_copy_nonDeref locals ⟨j, [proj]⟩ hnd borrows globals layouts callerLocals decls hnu]
-            simp [get?, hs, hrv, ← hsz]
+            simp [get?, hs, hrv rfl, ← hsz]
           | _ => exact False.elim hvok
 
 /-- Evaluating a fragment operand of fragment type `T` (stored like `it`) in
@@ -4034,12 +4035,23 @@ theorem evalRvalue_array_frag {layouts : Layout.LayoutTable} (decls : List Local
       match slot, hslot with
       | .dead, _ => simp [arrayRvElems, evalRvalue, evalOperand, get?, hs]
       | .uninit, _ => simp [arrayRvElems, evalRvalue, evalOperand, get?, hs]
-      | .init (.aggregate 0 elems), ⟨_, _⟩ =>
+      | .init (.aggregate 0 elems), ⟨_, he⟩ =>
         refine ⟨fun ys hys => ?_, fun hnone => by simp [arrayRvElems, hs] at hnone⟩
         simp [arrayRvElems, hs] at hys
         subst hys
         obtain ⟨ek, hk⟩ := arrayTypeOf_kind hty
-        exact evalRvalue_use_ok (by simp [evalOperand, get?, hs, readProjectedValue])
+        have hElemsInit : valueListContainsUninit elems = false := by
+          induction elems with
+          | nil => rfl
+          | cons x xs ih =>
+            have hx := he x List.mem_cons_self
+            cases x with
+            | scalar _ =>
+              simp [valueListContainsUninit, valueContainsUninit,
+                ih (fun y hy => he y (List.mem_cons_of_mem _ hy))]
+            | _ => exact False.elim hx
+        exact evalRvalue_use_ok
+          (by simp [evalOperand, get?, hs, readProjectedValue, valueContainsUninit, hElemsInit])
           (validateLoadedValue_of_operandTy (ty := d.ty)
             (by simp [MirSemantics.operandTy, MirSemantics.placeTy, get?, hd,
               MirSemantics.resolveProjectedTy])
@@ -5334,7 +5346,7 @@ theorem placeTouchesUnion_false_of_writeFieldPath_slotOk {layouts : Layout.Layou
   generalize decls[i] = d at hd
   have hslot := hslots i d (.init rootVal) hd hsl
   cases rootVal with
-  | scalar _ | ptr _ _ | unit => simp [writeFieldPath] at hwpath
+  | scalar _ | ptr _ _ | unit | uninit => simp [writeFieldPath] at hwpath
   | aggregate vi vals =>
     cases vi with
     | succ _ => simp [writeFieldPath] at hwpath
@@ -5357,16 +5369,16 @@ theorem placeTouchesUnion_false_of_writeFieldPath_slotOk {layouts : Layout.Layou
             rw [htyOf] at hslot
             rcases scalarTypeOf_cases hT with ⟨_, rfl⟩ | ⟨_, _, rfl⟩ | ⟨_, rfl⟩ | ⟨tupIt, htup, rfl⟩
             · rcases vals with _ | ⟨v0, _ | ⟨v1, _ | _⟩⟩ <;>
-                (try rcases v0 with _ | _ | _ | _) <;>
-                (try rcases v1 with _ | _ | _ | _) <;>
+                (try cases v0) <;>
+                (try cases v1) <;>
                 simp [SlotOk, tupleIntOfTy] at hslot
             · rcases vals with _ | ⟨v0, _ | ⟨v1, _ | _⟩⟩ <;>
-                (try rcases v0 with _ | _ | _ | _) <;>
-                (try rcases v1 with _ | _ | _ | _) <;>
+                (try cases v0) <;>
+                (try cases v1) <;>
                 simp [SlotOk, tupleIntOfTy] at hslot
             · rcases vals with _ | ⟨v0, _ | ⟨v1, _ | _⟩⟩ <;>
-                (try rcases v0 with _ | _ | _ | _) <;>
-                (try rcases v1 with _ | _ | _ | _) <;>
+                (try cases v0) <;>
+                (try cases v1) <;>
                 simp [SlotOk, orderingTy, tupleIntOfTy] at hslot
             · rcases vals with _ | ⟨v0, _ | ⟨v1, _ | _⟩⟩
               · simp [SlotOk] at hslot
@@ -5385,7 +5397,7 @@ theorem placeTouchesUnion_false_of_writeFieldPath_slotOk {layouts : Layout.Layou
                     exact placeTouchesUnion_field_of_intBoolTupleOf decls layouts hd htup idx fieldTy
                   | _ => simp [SlotOk] at hslot
                 | _ => simp [SlotOk] at hslot
-              · rcases v0 with _ | _ | _ | _ <;> rcases v1 with _ | _ | _ | _ <;>
+              · cases v0 <;> cases v1 <;>
                   simp [SlotOk] at hslot
           | false =>
             rw [hsc] at hslot
@@ -5465,8 +5477,8 @@ theorem placeTouchesUnion_false_of_writeFieldPath_slotOk {layouts : Layout.Layou
                           | _ => rw [hk] at hbx; cases hbx
                         | none => rfl
                   rcases vals with _ | ⟨v0, _ | ⟨v1, _ | _⟩⟩ <;>
-                    (try rcases v0 with _ | _ | _ | _) <;>
-                    (try rcases v1 with _ | _ | _ | _) <;>
+                    (try cases v0) <;>
+                    (try cases v1) <;>
                     simp [SlotOk, htupNone] at hslot
 
 theorem evalStmt_assign_field_scalar (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
@@ -6008,6 +6020,7 @@ theorem readProjectedValue_allFields_frame (L L' : List LocalSlot) (v : Value)
       cases idx with
       | zero => simp only [readProjectedValue]; exact ih .unit hf
       | succ _ => rfl
+    | uninit => rfl
 
 theorem readProjectedValue_simpleProj_frame (L L' : List LocalSlot) (j : Nat) (v : Value)
     (projs : List ProjectionElem) (hs : simpleProj projs = true)
@@ -6728,6 +6741,7 @@ theorem readProjectedValue_congr_scalar {L L' : List LocalSlot}
         cases idx with
         | zero => exact ih .unit
         | succ _ => rfl
+      | uninit => rfl
     | downcast _ variantIdx =>
       cases v with
       | aggregate actualVariant fields =>
@@ -7560,14 +7574,14 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
       | aggregate idx fields =>
         rcases fields with _ | ⟨e1, _ | ⟨e2, _ | ⟨e3, rest⟩⟩⟩ <;>
           rcases idx with _ | idx <;>
-          (try rcases e1 with _ | _ | _ | _) <;>
-          (try rcases e2 with _ | _ | _ | _) <;>
+          (try rcases e1 with _ | _ | _ | _ | _) <;>
+          (try rcases e2 with _ | _ | _ | _ | _) <;>
           first
           | rfl
           | (simp only []
              repeat' (first | (simp only []) | split)
              all_goals first | rfl | exact hframe' _ _ _ _ (by simp_all) | simp_all)
-      | unit => rfl
+      | unit | uninit => rfl
     | ub => rfl
     | unsupported => rfl
   | .cast .transmute op ty, _, _ =>

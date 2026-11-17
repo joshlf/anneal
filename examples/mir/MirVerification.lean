@@ -122,14 +122,15 @@ private theorem pureMirConverges_of_straightLine
     (h_eval : Anneal.MirLiftCore.evalPureStmtsN body 0 stmts stmts.length 0
       (Anneal.MirLiftCore.initPureEnv body args) = some env' := by rfl)
     (h_ret : Trusted.Sequence.get? env' 0 = some (.init val) := by rfl)
-    (h_post : post val := by rfl) :
+    (h_post : post val := by rfl)
+    (h_init : Trusted.Rustc.V2026_06_01.MirSemantics.valueContainsUninit val = false := by rfl) :
     Anneal.PureMirExec.PureMirConverges body (Anneal.PureMirExec.initPureState body args)
       post :=
   Anneal.MirLiftCore.lift_PureMirConverges h_pure <|
     Anneal.MirLiftCore.LiftBlock.of_lookup h_bb <|
       Anneal.MirLiftCore.LiftStmtsTerminator.eval_n h_bb (.inl h_phase) h_eval <|
         Anneal.MirLiftCore.LiftStmtsTerminator.term_return h_bb (.inl h_phase)
-          (Nat.zero_add _) h_ret h_post
+          (Nat.zero_add _) h_ret h_post h_init
 
 /-! ## 1. Checked `u32` Addition vs. Unchecked Overflow UB & 2. Boolean Specs -/
 

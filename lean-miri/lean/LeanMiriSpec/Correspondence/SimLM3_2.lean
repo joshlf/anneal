@@ -11504,7 +11504,7 @@ theorem step_safeRef_deref_read_tree_simulation
       | uninit => exact .refl _
       | init val =>
         cases val with
-        | unit => exact .refl _
+        | unit | uninit => exact .refl _
         | scalar _ => exact .refl _
         | aggregate _ _ => exact .refl _
         | ptr ptrVal sz =>
@@ -11863,7 +11863,7 @@ theorem step_safeRef_deref_write_tree_simulation
       | uninit => exact .refl _
       | init val =>
         cases val with
-        | unit => exact .refl _
+        | unit | uninit => exact .refl _
         | scalar _ => exact .refl _
         | aggregate _ _ => exact .refl _
         | ptr ptrVal sz =>

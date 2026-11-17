@@ -234,10 +234,10 @@ concrete real-step instances in the `Wit*` modules:
   the return and aliases caller locals, whereas `Stack.cleanupStackFrame`
   deallocates the callee's locals.
 * `H3` (`canonical_drop_no_glue_preserves_local_divergence`,
-  `step_terminator_drop_projected_uninit_divergence`): Anneal's `Drop`
-  deinitializes an unprojected local and validates projected `Drop` initialization;
-  canonical `lean-miri` treats `Drop` without glue as `goToBlock` and keeps the
-  value.
+  `step_terminator_drop_projected_init_no_glue_divergence`): Anneal's `Drop`
+  deinitializes both unprojected locals and projected sub-places (matching
+  `rustc` `syntax.rs:1177-1190`); canonical `lean-miri` treats `Drop` without
+  glue as `goToBlock` and keeps the value.
 * `H1` (`wit_lm4_1_zst_unit_return_simulation`): a zero-sized `_0` returns as
   `.init .unit` in Anneal and as `.live (.immediate .uninit)` in `lean-miri`
   (`RemoveZsts`), a representation difference the relations absorb.

@@ -48,6 +48,14 @@ theorem TupleSpec.encodeVal_unit (spec : TupleSpec) :
   | scalar it => rfl
   | tuple fields size align => rfl
 
+/-- `TupleSpec.encodeVal` encodes `Value.uninit` at any `TupleSpec` (scalar or nested tuple) as
+`List.replicate spec.size .Uninit`. -/
+theorem TupleSpec.encodeVal_uninit (spec : TupleSpec) :
+    spec.encodeVal .uninit = List.replicate spec.size .Uninit := by
+  cases spec with
+  | scalar it => rfl
+  | tuple fields size align => rfl
+
 /-- Overwriting a `Value` along the same `.field` projection chain `projs` twice is idempotent:
 if `writeFieldPath rootVal projs v₁ = some midVal`, then
 `writeFieldPath midVal projs v₂ = writeFieldPath rootVal projs v₂`. -/
@@ -309,8 +317,126 @@ theorem spliceAt_eq_self {α : Type} (xs : List α) (off : Nat) (bs : List α)
       simp [hk1, hk2, ← hget]
     · simp [hk1, hk2]
 
-/-- Trusted's `evalStmt` on a projected `TupleSpec` field `Deinit(_i.f1...fk)` steps as a frame
-no-op (`advanceStmt s s.frame.locals`) whenever `_i` holds a well-formed `TupleSpec` value. -/
+/-- **Projected `TupleSpec` Deinitialization with `Value.uninit` (`resolveFieldPath_deinit_uninit`)**:
+writing `Value.uninit` at a resolved field path `projs` of a well-formed `TupleSpec` root value
+`rootVal` agrees with Trusted's `deinitProjectedValue`, splices `List.replicate leafSpec.size .Uninit`
+at `totalOff` in `rootSpec.encodeVal rootVal`, and subsequently writing any valid `newLeafVal` at
+`projs` produces the exact same `newRootVal` as writing `newLeafVal` directly into `rootVal`. -/
+theorem resolveFieldPath_deinit_uninit {layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable}
+    {rootSpec leafSpec : TupleSpec} {projs : List ProjectionElem} {totalOff : Nat} {rootVal : Value}
+    (hwf : rootSpec.wf = true) (hval : rootSpec.valOk rootVal = true)
+    (hres : resolveFieldPath layouts rootSpec projs = some (totalOff, leafSpec)) :
+    ∃ deinitVal,
+      writeFieldPath rootVal projs .uninit = some deinitVal ∧
+      rootSpec.encodeVal deinitVal =
+        spliceAt (rootSpec.encodeVal rootVal) totalOff (List.replicate leafSpec.size .Uninit) ∧
+      (∀ locals, deinitProjectedValue locals rootVal projs = .ok deinitVal) ∧
+      ∀ newLeafVal, leafSpec.valOk newLeafVal = true →
+        ∃ newRootVal,
+          writeFieldPath deinitVal projs newLeafVal = some newRootVal ∧
+          writeFieldPath rootVal projs newLeafVal = some newRootVal ∧
+          rootSpec.valOk newRootVal = true ∧
+          rootSpec.encodeVal newRootVal =
+            spliceAt (rootSpec.encodeVal deinitVal) totalOff (leafSpec.encodeVal newLeafVal) := by
+  have hEnc : ∀ (projs' : List ProjectionElem) (rSpec : TupleSpec) (tOff : Nat) (rVal : Value),
+      rSpec.wf = true → rSpec.valOk rVal = true →
+      resolveFieldPath layouts rSpec projs' = some (tOff, leafSpec) →
+      ∃ dVal,
+        writeFieldPath rVal projs' .uninit = some dVal ∧
+        rSpec.encodeVal dVal =
+          spliceAt (rSpec.encodeVal rVal) tOff (leafSpec.encodeVal .uninit) ∧
+        ∀ locals, deinitProjectedValue locals rVal projs' = .ok dVal := by
+    intro projs'
+    induction projs' with
+    | nil =>
+      intro rSpec tOff rVal hrWf _ hrRes
+      simp [resolveFieldPath] at hrRes
+      rcases hrRes with ⟨rfl, rfl⟩
+      have hlen1 := TupleSpec.encodeVal_length rSpec rVal hrWf
+      have hlen2 := TupleSpec.encodeVal_length rSpec .uninit hrWf
+      refine ⟨.uninit, rfl, ?_, fun _ => rfl⟩
+      rw [spliceAt_zero_full _ _ (by omega)]
+    | cons p rest ih =>
+      intro rSpec tOff rVal hrWf hrVal hrRes
+      cases rSpec with
+      | scalar _ => cases p <;> simp [resolveFieldPath] at hrRes
+      | tuple fields size align =>
+        cases p with
+        | field idx fieldTy =>
+          simp only [resolveFieldPath, Option.bind_eq_bind] at hrRes
+          cases hf : fields[idx]? with
+          | none => simp [hf] at hrRes
+          | some pair =>
+            obtain ⟨off, subSpec⟩ := pair
+            simp only [hf, Option.bind_some] at hrRes
+            cases hexp : specOfRigidTy layouts fieldTy.kind fieldTy.layoutIdx with
+            | none => simp [hexp] at hrRes
+            | some expectedSpec =>
+              simp only [hexp, Option.bind_some] at hrRes
+              by_cases heq : subSpec = expectedSpec
+              · simp only [heq, ↓reduceIte] at hrRes
+                cases hrest : resolveFieldPath layouts expectedSpec rest with
+                | none => simp [hrest] at hrRes
+                | some rpair =>
+                  obtain ⟨restOff, leafSpec'⟩ := rpair
+                  simp [hrest] at hrRes
+                  rcases hrRes with ⟨rfl, rfl⟩
+                  subst heq
+                  cases rVal with
+                  | aggregate vIdx vals =>
+                    cases vIdx with
+                    | zero =>
+                      simp only [TupleSpec.wf, Bool.and_eq_true, decide_eq_true_eq] at hrWf
+                      simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hrVal
+                      obtain ⟨fv, hfv, hfvOk⟩ := TupleSpec.fieldsValOk_getElem? hrVal.2 hf
+                      have hslice := TupleSpec.encodeFields_field_slice size align fields vals
+                        (List.replicate size .Uninit) idx off subSpec fv hrWf.2 (by simp) hf hfv
+                      obtain ⟨hleafWf, hrestBound⟩ := resolveFieldPath_wf hslice.1 hrest
+                      obtain ⟨newFv, hwrite, hnewFvEnc, hprojDeinit⟩ := ih subSpec restOff fv hslice.1 hfvOk hrest
+                      have hidx_lt : idx < vals.length := (List.getElem?_eq_some_iff.mp hfv).1
+                      refine ⟨.aggregate 0 (vals.set idx newFv), ?_, ?_, ?_⟩
+                      · simp [writeFieldPath, hfv, hwrite]
+                      · simp only [TupleSpec.encodeVal]
+                        rw [TupleSpec.encodeFields_set size align fields vals
+                          (List.replicate size .Uninit) idx off subSpec newFv hrWf.2 (by simp) hrVal.1 hf,
+                          hnewFvEnc, ← hslice.2.2.2.2]
+                        have htotLen :
+                            (TupleSpec.encodeFields fields vals (List.replicate size .Uninit)).length = size :=
+                          TupleSpec.encodeFields_length size align fields vals
+                            (List.replicate size .Uninit) hrWf.2 (by simp)
+                        have hleafLen : (leafSpec'.encodeVal .uninit).length = leafSpec'.size :=
+                          TupleSpec.encodeVal_length leafSpec' .uninit hleafWf
+                        have hoffBound : off + subSpec.size ≤ size := hslice.2.1
+                        exact spliceAt_nested
+                          (TupleSpec.encodeFields fields vals (List.replicate size .Uninit))
+                          off subSpec.size restOff (leafSpec'.encodeVal .uninit)
+                          (by omega) (by omega)
+                      · intro locals
+                        have hfv' : vals[idx] = fv :=
+                          Option.some.inj (by rw [← hfv, List.getElem?_eq_getElem hidx_lt])
+                        simp [deinitProjectedValue, Trusted.Sequence.get?, Trusted.Sequence.set?,
+                          hidx_lt, hfv', hprojDeinit locals]
+                    | succ _ => simp [TupleSpec.valOk] at hrVal
+                  | _ => simp [TupleSpec.valOk] at hrVal
+              · simp [heq] at hrRes
+        | _ => simp [resolveFieldPath] at hrRes
+  obtain ⟨deinitVal, hwUninit, hEncUninit, hDeinit⟩ := hEnc projs rootSpec totalOff rootVal hwf hval hres
+  refine ⟨deinitVal, hwUninit, ?_, hDeinit, fun newLeafVal hnew => ?_⟩
+  · rw [hEncUninit, TupleSpec.encodeVal_uninit]
+  · obtain ⟨newRootVal, hwNew, hnewOk, hnewEnc, _⟩ := resolveFieldPath_write hwf hval hres hnew
+    have hwIdem := writeFieldPath_idem projs rootVal deinitVal .uninit newLeafVal hwUninit
+    obtain ⟨hleafWf, hrelBound⟩ := resolveFieldPath_wf hwf hres
+    have hlenRoot := TupleSpec.encodeVal_length rootSpec rootVal hwf
+    have hlenUninit := TupleSpec.encodeVal_length leafSpec .uninit hleafWf
+    have hlenNew := TupleSpec.encodeVal_length leafSpec newLeafVal hleafWf
+    refine ⟨newRootVal, hwIdem.trans hwNew, hwNew, hnewOk, ?_⟩
+    rw [hnewEnc, hEncUninit, spliceAt_same (rootSpec.encodeVal rootVal) totalOff
+      (leafSpec.encodeVal .uninit) (leafSpec.encodeVal newLeafVal)
+      (by omega) (by omega)]
+
+/-- Trusted's `evalStmt` on a projected `TupleSpec` field `Deinit(_i.f1...fk)` overwrites the
+projected field in local `i` with `Value.uninit` (`writeFieldPath rootVal (proj :: rest) .uninit`),
+splicing `List.replicate leafSpec.size .Uninit` at `totalOff` in `TupleSpec.encodeVal`. -/
 theorem evalStmt_deinit_field {layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable}
     (s : MachineState) (decls : List LocalDecl) (i : Nat) (d : LocalDecl)
     (rootFields : List (Nat × TupleSpec)) (rootSize rootAlign totalOff : Nat)
@@ -322,11 +448,240 @@ theorem evalStmt_deinit_field {layouts : Trusted.Rustc.V2026_06_01.Layout.Layout
     (hs : s.frame.locals[i]? = some (.init rootVal))
     (hres : resolveFieldPath layouts (.tuple rootFields rootSize rootAlign) (proj :: rest) =
       some (totalOff, leafSpec)) :
-    evalStmt s ⟨.deinit ⟨i, proj :: rest⟩, span⟩ decls layouts =
-      .tau (.running (advanceStmt s s.frame.locals)) := by
+    ∃ deinitVal,
+      writeFieldPath rootVal (proj :: rest) .uninit = some deinitVal ∧
+      (TupleSpec.tuple rootFields rootSize rootAlign).encodeVal deinitVal =
+        spliceAt ((TupleSpec.tuple rootFields rootSize rootAlign).encodeVal rootVal) totalOff
+          (List.replicate leafSpec.size .Uninit) ∧
+      evalStmt s ⟨.deinit ⟨i, proj :: rest⟩, span⟩ decls layouts =
+        .tau (.running (advanceStmt s (s.frame.locals.set i (.init deinitVal)))) := by
   obtain ⟨hwf, hval⟩ := (DeclSlotOk_of_tupleTypeOf ht (.init rootVal)).mp (hslots i d (.init rootVal) hd hs)
-  obtain ⟨leafVal, _, _, _, hprojRead⟩ := resolveFieldPath_read hwf hval hres
-  simp [evalStmt, Trusted.Sequence.get?, hs, hprojRead s.frame.locals, MirStepNode.step]
+  obtain ⟨deinitVal, hw, henc, hdeinit, _⟩ := resolveFieldPath_deinit_uninit hwf hval hres
+  have hi_lt : i < s.frame.locals.length := (List.getElem?_eq_some_iff.mp hs).1
+  have hnu := placeTouchesUnion_false_of_tupleTypeOf decls ht ⟨i, proj :: rest⟩
+  refine ⟨deinitVal, hw, henc, ?_⟩
+  simp [evalStmt, deinitProjectedForLocal, hnu, Trusted.Sequence.get?, Trusted.Sequence.set?,
+    hs, hi_lt, hdeinit s.frame.locals, MirStepNode.step]
+
+private theorem scalar_wf_size_pos {it : Gen.IntType} (hwf : (TupleSpec.scalar it).wf = true) :
+    0 < it.size.bytes := by
+  simp only [TupleSpec.wf] at hwf
+  have hgood := (goodAlignBytes_iff it.size.bytes).mp hwf
+  rcases hgood with h | h | h | h | h <;> omega
+
+/-- Writing `newLeafVal` at a scalar field path `ps'` at offset `off` into `deinitVal` (obtained by
+writing `.uninit` at a scalar field path `ps` at the **same** offset `off`) produces the exact same
+`writeProjectedValue` result as writing directly into `rootVal`. -/
+theorem resolveFieldPath_same_off_writeProjectedValue
+    {layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable}
+    {rootSpec : TupleSpec} {ps ps' : List ProjectionElem} {off : Nat}
+    {it₀ it : Gen.IntType} {rootVal deinitVal : Value}
+    (hwf : rootSpec.wf = true) (hval : rootSpec.valOk rootVal = true)
+    (hres : resolveFieldPath layouts rootSpec ps = some (off, .scalar it₀))
+    (hres' : resolveFieldPath layouts rootSpec ps' = some (off, .scalar it))
+    (hw : writeFieldPath rootVal ps .uninit = some deinitVal) :
+    ∀ newLeafVal,
+      writeFieldPath deinitVal ps' newLeafVal = writeFieldPath rootVal ps' newLeafVal ∧
+      ∀ locals,
+        MirSemantics.writeProjectedValue locals deinitVal ps' newLeafVal =
+          MirSemantics.writeProjectedValue locals rootVal ps' newLeafVal := by
+  induction ps' generalizing ps rootSpec off rootVal deinitVal with
+  | nil =>
+    intro _
+    exact ⟨rfl, fun _ => rfl⟩
+  | cons p' rest' ih =>
+    cases rootSpec with
+    | scalar _ => cases p' <;> simp [resolveFieldPath] at hres'
+    | tuple fields size align =>
+      cases p' with
+      | field idx₂ fTy₂ =>
+        cases ps with
+        | nil => simp [resolveFieldPath] at hres
+        | cons p rest =>
+          cases p with
+          | field idx₁ fTy₁ =>
+            simp only [resolveFieldPath, Option.bind_eq_bind] at hres hres'
+            cases hf₁ : fields[idx₁]? with
+            | none => simp [hf₁] at hres
+            | some pair₁ =>
+              obtain ⟨off₁, sub₁⟩ := pair₁
+              simp only [hf₁, Option.bind_some] at hres
+              cases hexp₁ : specOfRigidTy layouts fTy₁.kind fTy₁.layoutIdx with
+              | none => simp [hexp₁] at hres
+              | some exp₁ =>
+                simp only [hexp₁, Option.bind_some] at hres
+                by_cases heq₁ : sub₁ = exp₁
+                · simp only [heq₁, ↓reduceIte] at hres
+                  subst heq₁
+                  cases hrest₁ : resolveFieldPath layouts sub₁ rest with
+                  | none => simp [hrest₁] at hres
+                  | some rpair₁ =>
+                    obtain ⟨restOff₁, leaf₁⟩ := rpair₁
+                    simp [hrest₁] at hres
+                    rcases hres with ⟨hoff₁, rfl⟩
+                    cases hf₂ : fields[idx₂]? with
+                    | none => simp [hf₂] at hres'
+                    | some pair₂ =>
+                      obtain ⟨off₂, sub₂⟩ := pair₂
+                      simp only [hf₂, Option.bind_some] at hres'
+                      cases hexp₂ : specOfRigidTy layouts fTy₂.kind fTy₂.layoutIdx with
+                      | none => simp [hexp₂] at hres'
+                      | some exp₂ =>
+                        simp only [hexp₂, Option.bind_some] at hres'
+                        by_cases heq₂ : sub₂ = exp₂
+                        · simp only [heq₂, ↓reduceIte] at hres'
+                          subst heq₂
+                          cases hrest₂ : resolveFieldPath layouts sub₂ rest' with
+                          | none => simp [hrest₂] at hres'
+                          | some rpair₂ =>
+                            obtain ⟨restOff₂, leaf₂⟩ := rpair₂
+                            simp [hrest₂] at hres'
+                            rcases hres' with ⟨hoff₂, rfl⟩
+                            simp only [TupleSpec.wf, Bool.and_eq_true] at hwf
+                            have hfwf₁ := TupleSpec.fieldsWf_getElem? hwf.2 hf₁
+                            have hfwf₂ := TupleSpec.fieldsWf_getElem? hwf.2 hf₂
+                            obtain ⟨hlwf₁, hb₁⟩ := resolveFieldPath_wf hfwf₁.1 hrest₁
+                            obtain ⟨hlwf₂, hb₂⟩ := resolveFieldPath_wf hfwf₂.1 hrest₂
+                            have hpos₁ := scalar_wf_size_pos hlwf₁
+                            have hpos₂ := scalar_wf_size_pos hlwf₂
+                            have hidxEq : idx₁ = idx₂ := by
+                              by_contra hne
+                              have hdisj := TupleSpec.fieldsWf_disjoint hwf.2 hf₁ hf₂ hne
+                              simp only [TupleSpec.size] at hb₁ hb₂
+                              omega
+                            subst hidxEq
+                            rw [hf₁] at hf₂
+                            simp only [Option.some.injEq, Prod.mk.injEq] at hf₂
+                            rcases hf₂ with ⟨rfl, rfl⟩
+                            have hroff : restOff₁ = restOff₂ := by omega
+                            subst hroff
+                            cases rootVal with
+                            | aggregate vIdx vals =>
+                              cases vIdx with
+                              | zero =>
+                                simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hval
+                                obtain ⟨fv, hfv, hfvOk⟩ := TupleSpec.fieldsValOk_getElem? hval.2 hf₁
+                                simp only [writeFieldPath, hfv] at hw
+                                cases hwSub : writeFieldPath fv rest .uninit with
+                                | none => simp [hwSub] at hw
+                                | some deinitFv =>
+                                  simp only [hwSub, Option.some.injEq] at hw
+                                  subst hw
+                                  intro newLeafVal
+                                  have hlt : idx₁ < vals.length := (List.getElem?_eq_some_iff.mp hfv).1
+                                  obtain ⟨hwPathEq, hwProjEq⟩ := ih hfwf₁.1 hfvOk hrest₁ hrest₂ hwSub newLeafVal
+                                  refine ⟨?_, fun locals => ?_⟩
+                                  · simp only [writeFieldPath, List.getElem?_set_self hlt, hfv, hwPathEq]
+                                    cases writeFieldPath fv rest' newLeafVal <;> simp [List.set_set]
+                                  · simp only [MirSemantics.writeProjectedValue, Trusted.Sequence.get?,
+                                      List.getElem?_set_self hlt, hfv, hwProjEq locals]
+                                    cases MirSemantics.writeProjectedValue locals fv rest' newLeafVal <;>
+                                      simp [setOrExtendFields_of_lt, hlt, List.set_set]
+                              | succ _ => simp [TupleSpec.valOk] at hval
+                            | _ => simp [TupleSpec.valOk] at hval
+                        · simp [heq₂] at hres'
+                · simp [heq₁] at hres
+          | _ => simp [resolveFieldPath] at hres
+      | _ => simp [resolveFieldPath] at hres'
+
+/-- Reading a byte-disjoint scalar field path `ps'` from `deinitVal` (obtained by writing `.uninit`
+at field path `ps` of `rootVal`) produces the exact same `readProjectedValue` result as reading
+directly from `rootVal`. -/
+theorem resolveFieldPath_disjoint_readProjectedValue
+    {layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable}
+    {rootSpec leaf : TupleSpec} {ps ps' : List ProjectionElem} {off off' : Nat}
+    {it' : Gen.IntType} {rootVal deinitVal : Value}
+    (hwf : rootSpec.wf = true) (hval : rootSpec.valOk rootVal = true)
+    (hres : resolveFieldPath layouts rootSpec ps = some (off, leaf))
+    (hres' : resolveFieldPath layouts rootSpec ps' = some (off', .scalar it'))
+    (hdis : off' + it'.size.bytes ≤ off ∨ off + leaf.size ≤ off')
+    (hw : writeFieldPath rootVal ps .uninit = some deinitVal) :
+    ∀ locals,
+      MirSemantics.readProjectedValue locals deinitVal ps' =
+        MirSemantics.readProjectedValue locals rootVal ps' := by
+  induction ps generalizing ps' rootSpec off off' rootVal deinitVal with
+  | nil =>
+    simp [resolveFieldPath] at hres
+    rcases hres with ⟨rfl, rfl⟩
+    obtain ⟨hlwf', hb'⟩ := resolveFieldPath_wf hwf hres'
+    have hpos' := scalar_wf_size_pos hlwf'
+    simp only [TupleSpec.size] at hb'
+    omega
+  | cons p rest ih =>
+    cases rootSpec with
+    | scalar _ => cases p <;> simp [resolveFieldPath] at hres
+    | tuple fields size align =>
+      cases p with
+      | field idx₁ fTy₁ =>
+        cases ps' with
+        | nil => simp [resolveFieldPath] at hres'
+        | cons p' rest' =>
+          cases p' with
+          | field idx₂ fTy₂ =>
+            simp only [resolveFieldPath, Option.bind_eq_bind] at hres hres'
+            cases hf₁ : fields[idx₁]? with
+            | none => simp [hf₁] at hres
+            | some pair₁ =>
+              obtain ⟨off₁, sub₁⟩ := pair₁
+              simp only [hf₁, Option.bind_some] at hres
+              cases hexp₁ : specOfRigidTy layouts fTy₁.kind fTy₁.layoutIdx with
+              | none => simp [hexp₁] at hres
+              | some exp₁ =>
+                simp only [hexp₁, Option.bind_some] at hres
+                by_cases heq₁ : sub₁ = exp₁
+                · simp only [heq₁, ↓reduceIte] at hres
+                  subst heq₁
+                  cases hrest₁ : resolveFieldPath layouts sub₁ rest with
+                  | none => simp [hrest₁] at hres
+                  | some rpair₁ =>
+                    obtain ⟨restOff₁, leaf₁⟩ := rpair₁
+                    simp [hrest₁] at hres
+                    rcases hres with ⟨rfl, rfl⟩
+                    cases rootVal with
+                    | aggregate vIdx vals =>
+                      cases vIdx with
+                      | zero =>
+                        simp only [TupleSpec.wf, Bool.and_eq_true] at hwf
+                        simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hval
+                        obtain ⟨fv, hfv, hfvOk⟩ := TupleSpec.fieldsValOk_getElem? hval.2 hf₁
+                        simp only [writeFieldPath, hfv] at hw
+                        cases hwSub : writeFieldPath fv rest .uninit with
+                        | none => simp [hwSub] at hw
+                        | some deinitFv =>
+                          simp only [hwSub, Option.some.injEq] at hw
+                          subst hw
+                          intro locals
+                          by_cases hidx : idx₁ = idx₂
+                          · subst hidx
+                            simp only [hf₁, Option.bind_some] at hres'
+                            cases hexp₂ : specOfRigidTy layouts fTy₂.kind fTy₂.layoutIdx with
+                            | none => simp [hexp₂] at hres'
+                            | some exp₂ =>
+                              simp only [hexp₂, Option.bind_some] at hres'
+                              by_cases heq₂ : sub₁ = exp₂
+                              · simp only [heq₂, ↓reduceIte] at hres'
+                                subst heq₂
+                                cases hrest₂ : resolveFieldPath layouts sub₁ rest' with
+                                | none => simp [hrest₂] at hres'
+                                | some rpair₂ =>
+                                  obtain ⟨restOff₂, leaf₂⟩ := rpair₂
+                                  simp [hrest₂] at hres'
+                                  rcases hres' with ⟨rfl, rfl⟩
+                                  have hfwf₁ := TupleSpec.fieldsWf_getElem? hwf.2 hf₁
+                                  have hlt : idx₁ < vals.length := (List.getElem?_eq_some_iff.mp hfv).1
+                                  have hdis' : restOff₂ + it'.size.bytes ≤ restOff₁ ∨
+                                      restOff₁ + leaf₁.size ≤ restOff₂ := by omega
+                                  simp [MirSemantics.readProjectedValue, Trusted.Sequence.get?,
+                                    List.getElem?_set_self hlt, hfv,
+                                    ih hfwf₁.1 hfvOk hrest₁ hrest₂ hdis' hwSub locals]
+                              · simp [heq₂] at hres'
+                          · simp [MirSemantics.readProjectedValue, Trusted.Sequence.get?,
+                              List.getElem?_set_ne hidx]
+                      | succ _ => simp [TupleSpec.valOk] at hval
+                    | _ => simp [TupleSpec.valOk] at hval
+                · simp [heq₁] at hres
+          | _ => simp [resolveFieldPath] at hres'
+      | _ => simp [resolveFieldPath] at hres
 
 /-- Stage-1 Trusted's `evalStmt` on a projected `TupleSpec` scalar field `Retag(kind, _i.f1...fk)`
 steps as a frame and memory no-op (`advanceStmt s s.frame.locals`) whenever `_i` holds a well-formed

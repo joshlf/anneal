@@ -11820,7 +11820,8 @@ theorem wpCoalBounded_of_symIsReturnSymArg0
     (st : SymState)
     (P : Value → Prop)
     (hRet : symIsReturnSymArg0 body st = true)
-    (hP : P v) :
+    (hP : P v)
+    (hVInit : valueContainsUninit v = false := by rfl) :
     wpCoalBounded (.succ fuel) mirDefaultWP (stepMirState body)
       (fun out _ => ∀ retVal mem', out = .normal (retVal, mem') → P retVal)
       (.running (concretizeSymState body [v] st)) PUnit.unit := by
@@ -11870,7 +11871,9 @@ theorem wpCoalBounded_of_symIsReturnSymArg0
                   | succ _ => nomatch hRet
                   | zero =>
                     rw [hasFrameDeallocProtectorConflict.eq_1]
-                    dsimp only [concretizeSymSlot, get?, MirStepNode.retNormal, mirDefaultWP]
+                    dsimp only [concretizeSymSlot, get?, List.getElem?_cons_zero]
+                    rw [hVInit]
+                    dsimp only [MirStepNode.retNormal, mirDefaultWP]
                     intro retVal mem' hOut
                     injection hOut with hPair
                     injection hPair with hRv _
@@ -11903,7 +11906,7 @@ theorem wpCoalBounded_of_checkSymReturnsSymArg0 :
     cases hStep : symStepConcreteInBounds body st with
     | none =>
       rw [hStep] at hCheck
-      exact wpCoalBounded_of_symIsReturnSymArg0 fuel body v st P hCheck hP
+      exact wpCoalBounded_of_symIsReturnSymArg0 fuel body v st P hCheck hP hVInit
     | some st' =>
       rw [hStep] at hCheck
       have hRec := wpCoalBounded_of_checkSymReturnsSymArg0 fuel body v st' P hArg1 hVInit hCheck hP

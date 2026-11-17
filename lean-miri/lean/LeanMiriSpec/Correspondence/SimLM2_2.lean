@@ -276,6 +276,7 @@ private theorem readProjectedValue_ne_unsupported_of_fields
       cases fIdx with
       | zero => exact readProjectedValue_ne_unsupported_of_fields locals ps .unit hall'
       | succ _ => nofun
+    | uninit => nofun
 
 theorem SyntacticFieldOperand.evalOperand_shape
     {locals : List LocalSlot} {op : MirAst.Operand}

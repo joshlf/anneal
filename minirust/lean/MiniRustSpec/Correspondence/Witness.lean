@@ -13506,18 +13506,20 @@ theorem evalStmt_retag_scalar_noop (s : MachineState) (decls : List LocalDecl)
   · rename_i heq; rw [hTy] at heq; nomatch heq
   · rfl
 
-/-- Anneal's `Deinit` of a projected place whose root is initialized and whose
-projected value is readable keeps every slot (it steps to the next statement
-with the same `locals`), whereas MiniRust's `Statement::Deinit` overwrites the
-projected bytes with `Uninit` (`paddedDeinitRead_minirust_ub`). -/
-theorem evalStmt_deinit_proj_keeps (s : MachineState) (decls : List LocalDecl)
+/-- Anneal's `Deinit` of a projected place whose root is initialized evaluates
+`deinitProjectedForLocal` (overwriting the projected sub-place with
+`Value.uninit`, or faulting on union/deref/invalid paths) and updates local `i`,
+matching MiniRust's `Statement::Deinit` (`paddedDeinitRead_anneal_ub`,
+`paddedDeinitRead_minirust_ub`). -/
+theorem evalStmt_deinit_proj_deinits (s : MachineState) (decls : List LocalDecl)
     (layouts : LayoutTable) (i : Nat) (pe : ProjectionElem) (rest : List ProjectionElem)
-    (span : String) (rootVal v : Value)
+    (span : String) (rootVal rootVal' : Value) (newLocals : List LocalSlot)
     (hs : s.frame.locals[i]? = some (.init rootVal))
-    (hr : readProjectedValue s.frame.locals rootVal (pe :: rest) = .ok v) :
+    (hd : deinitProjectedForLocal s.frame.locals decls layouts i rootVal (pe :: rest) = .ok rootVal')
+    (hset : Trusted.Sequence.set? s.frame.locals i (.init rootVal') = some newLocals) :
     evalStmt s ⟨.deinit ⟨i, pe :: rest⟩, span⟩ decls layouts =
-      MirStepNode.step (advanceStmt s s.frame.locals) := by
-  simp [evalStmt, Trusted.Sequence.get?, hs, hr]
+      MirStepNode.step (advanceStmt s newLocals) := by
+  simp [evalStmt, Trusted.Sequence.get?, hs, hd, hset]
 
 /-- The ABI of a function with one `Padded(u8, u32, u16)` argument returning
 `u32`. -/
@@ -13601,12 +13603,11 @@ def paddedDeinitReadMInit : Mach :=
   machineWithCtx ctxPadded2 paddedDeinitRead paddedDeinitReadFn paddedDeinitReadS0.frame.locals
     paddedDeinitReadFn.start
 
-/-- Anneal's projected `Deinit` keeps `_1` initialized: the function returns
-the old field `99` (computed by the kernel). -/
-theorem paddedDeinitRead_anneal_ret :
-    ReachesRet (mirCallTree paddedDeinitRead paddedDeinitReadArgs) []
-      (.normal (.scalar ⟨99, 4⟩, paddedDeinitReadS0.memory)) :=
-  runA_sound paddedDeinitRead 10 _ _ _ rfl
+/-- Anneal's projected `Deinit(_1.1)` marks `_1.1` as `Value.uninit`, so the
+subsequent load `copy _1.1` faults with UB (computed by the kernel). -/
+theorem paddedDeinitRead_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree paddedDeinitRead paddedDeinitReadArgs) tr u ∧ FaultNow u :=
+  faultsA_sound paddedDeinitRead 10 _ (by decide)
 
 /-- MiniRust's `Deinit(_1.1)` overwrites exactly bytes `4..8` of `_1` with
 `Uninit` (keeping field `0`, field `2`, and the padding), and the following
@@ -14232,15 +14233,14 @@ def paddedDeinitRetagHoleMInit : Mach :=
   machineWithCtx ctxPadded2 paddedDeinitRetagHole paddedDeinitRetagHoleFn
     paddedDeinitRetagHoleS0.frame.locals paddedDeinitRetagHoleFn.start
 
-/-- **Overlapping `Retag(_1.1)` on an open `Deinit(_1.1)` hole diverges (`paddedDeinitRetagHole_diverges`)**:
-Stage-1 Anneal returns `42` (because `Deinit(_1.1)` keeps `_1` initialized and `Retag(_1.1)` is a
-no-op), whereas MiniRust's `Validate(_1.1)` at step `3` faults with UB loading the `Uninit` bytes
-`4..8`, justifying `siblingRetagOk`'s disjointness requirement. -/
-theorem paddedDeinitRetagHole_diverges :
-    ReachesRet (mirCallTree paddedDeinitRetagHole paddedDeinitReadArgs) []
-      (.normal (.scalar ⟨42, 4⟩, paddedDeinitRetagHoleS0.memory)) ∧
+/-- **Overlapping `Retag(_1.1)` on an open `Deinit(_1.1)` hole faults in both
+engines (`paddedDeinitRetagHole_both_ub`)**: Anneal's `Deinit(_1.1)` marks `_1.1`
+as `Value.uninit` so `Retag(_1.1)`'s operand read faults with UB, and MiniRust's
+`Validate(_1.1)` at step `3` faults with UB loading the `Uninit` bytes `4..8`. -/
+theorem paddedDeinitRetagHole_both_ub :
+    (∃ tr u, Reaches (mirCallTree paddedDeinitRetagHole paddedDeinitReadArgs) tr u ∧ FaultNow u) ∧
     ∃ msg, Interp.steps 3 paddedDeinitRetagHoleMInit = .error (.ub msg) :=
-  ⟨runA_sound paddedDeinitRetagHole 12 _ _ _ rfl, _, rfl⟩
+  ⟨faultsA_sound paddedDeinitRetagHole 12 _ (by decide), _, rfl⟩
 
 /-- **The committed `paddedDeinitSiblingReinit` is admitted by `inFragmentD`** (its window
 check used to fail): its open-hole window is the sibling read through an integer cast
@@ -14910,14 +14910,14 @@ def paddedDeinitHoleBinOpMInit : Mach :=
   machineWithCtx ctxPadded2 paddedDeinitHoleBinOp paddedDeinitHoleBinOpFn
     paddedDeinitHoleBinOpS0.frame.locals paddedDeinitHoleBinOpFn.start
 
-/-- The divergence the window check prevents (computed by the kernel): Anneal's projected `Deinit`
-keeps `_1.1 = 99`, so Anneal returns `100`, whereas MiniRust's `BinOp` loads the `Uninit` hole and
-the third step (init `Goto`, `Deinit`, the re-initialization) is UB. -/
-theorem paddedDeinitHoleBinOp_diverges :
-    ReachesRet (mirCallTree paddedDeinitHoleBinOp paddedDeinitReadArgs) []
-        (.normal (.scalar ⟨100, 4⟩, paddedDeinitHoleBinOpS0.memory)) ∧
+/-- Both Anneal and MiniRust fault with UB when the `BinOp` re-initialization
+reads the open `Deinit(_1.1)` hole (`paddedDeinitHoleBinOp_both_ub`, computed by
+the kernel): Anneal's `copy _1.1` faults on `Value.uninit`, and MiniRust's
+`BinOp` loads the `Uninit` hole at step `3`. -/
+theorem paddedDeinitHoleBinOp_both_ub :
+    (∃ tr u, Reaches (mirCallTree paddedDeinitHoleBinOp paddedDeinitReadArgs) tr u ∧ FaultNow u) ∧
       ∃ msg, Interp.steps 3 paddedDeinitHoleBinOpMInit = .error (.ub msg) :=
-  ⟨runA_sound paddedDeinitHoleBinOp 10 _ _ _ rfl, _, rfl⟩
+  ⟨faultsA_sound paddedDeinitHoleBinOp 10 _ (by decide), _, rfl⟩
 
 /-- MIR of
 ```rust
@@ -14987,14 +14987,14 @@ def paddedDeinitHoleCastReadMInit : Mach :=
   machineWithCtx ctxPadded3 paddedDeinitHoleCastRead paddedDeinitHoleCastReadFn
     paddedDeinitHoleCastReadS0.frame.locals paddedDeinitHoleCastReadFn.start
 
-/-- The divergence the disjointness check prevents (computed by the kernel): Anneal reads the stale
-`_1.1 = 99` through the cast and returns `99`, whereas MiniRust's cast loads the `Uninit` hole and
-the fourth step (init `Goto`, `StorageLive(_2)`, `Deinit`, the cast read) is UB. -/
-theorem paddedDeinitHoleCastRead_diverges :
-    ReachesRet (mirCallTree paddedDeinitHoleCastRead paddedDeinitReadArgs) []
-        (.normal (.scalar ⟨99, 4⟩, paddedDeinitHoleCastReadS0.memory)) ∧
+/-- Both Anneal and MiniRust fault with UB when an integer cast reads the open
+`Deinit(_1.1)` hole (`paddedDeinitHoleCastRead_both_ub`, computed by the kernel):
+Anneal's `copy _1.1` faults on `Value.uninit`, and MiniRust's cast loads the
+`Uninit` hole at step `4`. -/
+theorem paddedDeinitHoleCastRead_both_ub :
+    (∃ tr u, Reaches (mirCallTree paddedDeinitHoleCastRead paddedDeinitReadArgs) tr u ∧ FaultNow u) ∧
       ∃ msg, Interp.steps 4 paddedDeinitHoleCastReadMInit = .error (.ub msg) :=
-  ⟨runA_sound paddedDeinitHoleCastRead 12 _ _ _ rfl, _, rfl⟩
+  ⟨faultsA_sound paddedDeinitHoleCastRead 12 _ (by decide), _, rfl⟩
 
 /-- `ctxPadded3` is well formed for a body whose locals are `_0: u32`, `_1: Padded`, `_2: u32`,
 and `_3: u32` (with `argCount = 1`). -/

@@ -73,7 +73,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   dropValues takeValues extractSubslice readProjectedValue readContainerProjectedValue
   appendValueList replaceSubslice
   setOrExtendFields writeProjectedValue
-  projListHasDeref deinitTailOk deinitProjectedValue deinitProjectedForLocal checkProjectedDropValue
+  projListHasDeref deinitTailOk deinitProjectedValue deinitProjectedForLocal
   sliceConstElemKind isScalarCompatibleProj uintRigidTyOfStride
   inferValueByteSizeAux inferElemListByteStride exactByteDivAux byteOffsetToElemIdx?
   splitLastConstantIndex? readSliceBackingAggregate? splitLastSubslice? endsWithSubslice needsThinPtrElemResolution

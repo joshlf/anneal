@@ -205,7 +205,7 @@ struct whose leaves are its scalar fields, the layout size exceeds this count
 exactly by the number of inter-field and trailing padding bytes
 (`ValidStructLayout.sumFieldBytes_lt_iff_exists_padding`). -/
 def valueLeafBytes : Value → Nat
-  | .unit => 0
+  | .unit | .uninit => 0
   | .scalar sc => sc.sizeBytes
   | .ptr _ _ => 8
   | .aggregate _ fs => valueLeafBytesList fs

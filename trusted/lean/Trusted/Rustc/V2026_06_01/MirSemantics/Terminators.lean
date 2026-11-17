@@ -3795,6 +3795,28 @@ def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Op
 Evaluate basic-block `Terminator` `term` in `s`, producing the next
 `MirStepNode` transition.
 
+- `TerminatorKind.return_`: fails closed with `MirStepNode.fail .ub` whenever
+  `_0` is `.dead`, `.uninit`, or `.init retVal` with
+  `valueContainsUninit retVal = true` (rejecting both leaf `.uninit` and
+  partially initialized aggregates containing `.uninit`).
+- `TerminatorKind.drop`: enforces live storage (`LocalSlot.dead` -> `.ub`),
+  marks bare `place.projection = .nil` locals `.uninit`, and deinitializes
+  projected `place.projection = proj :: rest` sub-places to `Value.uninit` via
+  `deinitProjectedForLocal` (or `deinitTailOk` when the root local is already
+  live `.uninit`), rejecting projected drops through initialized unions with
+  `.unsupported`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "Producing an invalid value is undefined behavior. An invalid value is any
+> value that is not valid for its type.
+> ...
+> An uninitialized value is not valid for any type that has any validity
+> constraints (including `bool`, `char`, integers, floats, raw pointers,
+> references, function pointers, `str`, arrays of types with validity
+> constraints, tuples with fields that have validity constraints, etc.)."
+
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L724-L800>
@@ -3802,6 +3824,16 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 > "/// Returns from the function.
 > ...
 > Return,
+> ...
+> /// Drops the destination
+> Drop {
+>     place: Place<'tcx>,
+>     target: BasicBlock,
+>     unwind: UnwindAction,
+>     replace: bool,
+>     drop: Option<BasicBlock>,
+>     async_fut: Option<Local>,
+> },
 > ...
 > /// Roughly speaking, evaluates the `func` operand and the arguments, and starts execution of
 > /// the referred to function.
@@ -3866,43 +3898,54 @@ def evalTerminator
       | false =>
         let borrows₁ := disableFrameBorrows s.memory.borrows depth nLocals
         match s.memory.callStack with
-        | .nil => MirStepNode.retNormal retVal { s.memory with borrows := borrows₁ }
+        | .nil =>
+          match valueContainsUninit retVal with
+          | true => MirStepNode.fail .ub
+          | false => MirStepNode.retNormal retVal { s.memory with borrows := borrows₁ }
         | caller :: restStack =>
           match caller.isDiverging with
           | true => MirStepNode.fail .ub
           | false =>
-            let restoredProtectors := restoreCallerProtectors caller
-            let callerMem : Memory := {
-              s.memory with
-              borrows := borrows₁
-              callStack := restStack
-              activeCallee := .some caller.callerBody
-              activeProtectors := restoredProtectors
-            }
-            match
-              writeReturnDestination
-                caller.frame.locals
-                callerMem
-                caller.destination
-                retVal
-                caller.callerBody.localDecls
-                caller.callerBody.layouts
-            with
-            | .ok updatedCallerLocals mem' =>
-              MirStepNode.step {
-                frame := {
-                  caller.frame with
-                  blockIdx := caller.returnTarget
-                  stmtIdx := 0
-                  locals := updatedCallerLocals
-                }
-                memory := mem'
+            match valueContainsUninit retVal with
+            | true => MirStepNode.fail .ub
+            | false =>
+              let restoredProtectors := restoreCallerProtectors caller
+              let callerMem : Memory := {
+                s.memory with
+                borrows := borrows₁
+                callStack := restStack
+                activeCallee := .some caller.callerBody
+                activeProtectors := restoredProtectors
               }
-            | .ub => MirStepNode.fail .ub
-            | .unsupported => MirStepNode.unsupported
+              match
+                writeReturnDestination
+                  caller.frame.locals
+                  callerMem
+                  caller.destination
+                  retVal
+                  caller.callerBody.localDecls
+                  caller.callerBody.layouts
+              with
+              | .ok updatedCallerLocals mem' =>
+                MirStepNode.step {
+                  frame := {
+                    caller.frame with
+                    blockIdx := caller.returnTarget
+                    stmtIdx := 0
+                    locals := updatedCallerLocals
+                  }
+                  memory := mem'
+                }
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .unreachable => MirStepNode.fail .ub
   | .drop place target _ =>
+    let bodyLocalDecls := bodyLocalDeclsOf currentBody
+    let bodyLayouts : LayoutTable :=
+      match currentBody with
+      | .some b => b.layouts
+      | .none => emptyLayoutTable
     match get? s.frame.locals place.local_ with
     | .none => MirStepNode.fail .ub
     | .some .dead => MirStepNode.fail .ub
@@ -3917,18 +3960,39 @@ def evalTerminator
           }
         | .none => MirStepNode.fail .ub
       | proj :: rest =>
-        let rootVal :=
-          match slot with
-          | .init v => v
-          | _ => .uninit
-        match checkProjectedDropValue s.frame.locals rootVal (proj :: rest) with
-        | .ok _ =>
-          MirStepNode.step {
-            s with
-            frame := { s.frame with blockIdx := target, stmtIdx := 0 }
-          }
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
+        match slot with
+        | .init rootVal =>
+          match
+            deinitProjectedForLocal
+              s.frame.locals
+              bodyLocalDecls
+              bodyLayouts
+              place.local_
+              rootVal
+              (proj :: rest)
+          with
+          | .ok rootVal' =>
+            match set? s.frame.locals place.local_ (.init rootVal') with
+            | .some locals' =>
+              MirStepNode.step {
+                s with
+                frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
+              }
+            | .none => MirStepNode.fail .ub
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
+        | .uninit =>
+          match deinitTailOk s.frame.locals (proj :: rest) with
+          | true =>
+            MirStepNode.step {
+              s with
+              frame := { s.frame with blockIdx := target, stmtIdx := 0 }
+            }
+          | false =>
+            match projectionHasDeref (proj :: rest) with
+            | true => MirStepNode.unsupported
+            | false => MirStepNode.fail .ub
+        | .dead => MirStepNode.fail .ub
   | .call func argOps destination (.some targetBb) unwind =>
     let bodyLocalDecls := bodyLocalDeclsOf currentBody
     let bodyLayouts : LayoutTable :=

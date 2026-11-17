@@ -822,6 +822,7 @@ theorem mir_evalTerminator_return_root_and_caller
     (s : MachineState) (span : String) (currentBody : Option CapturedMir) :
     (∀ retVal : Value,
       get? s.frame.locals 0 = .some (.init retVal) →
+      valueContainsUninit retVal = false →
       s.memory.callStack = .nil →
       hasFrameDeallocProtectorConflict
           s.memory.borrows s.memory.activeProtectors 0 (length s.frame.locals) = false →
@@ -832,6 +833,7 @@ theorem mir_evalTerminator_return_root_and_caller
     (∀ (retVal : Value) (caller : SavedCallerFrame) (restStack : List SavedCallerFrame)
        (updatedCallerLocals : List LocalSlot) (mem' : Memory),
       get? s.frame.locals 0 = .some (.init retVal) →
+      valueContainsUninit retVal = false →
       s.memory.callStack = caller :: restStack →
       hasFrameDeallocProtectorConflict
           s.memory.borrows
@@ -883,23 +885,28 @@ theorem mir_evalTerminator_return_root_and_caller
           (length s.memory.callStack)
           (length s.frame.locals) = true →
       evalTerminator s ⟨.return_, span⟩ currentBody = MirStepNode.fail .ub) ∧
+    (∀ retVal : Value,
+      get? s.frame.locals 0 = .some (.init retVal) →
+      valueContainsUninit retVal = true →
+      evalTerminator s ⟨.return_, span⟩ currentBody = MirStepNode.fail .ub) ∧
     (get? s.frame.locals 0 = .some .uninit →
       evalTerminator s ⟨.return_, span⟩ currentBody = MirStepNode.fail .ub) ∧
     (get? s.frame.locals 0 = .some .dead →
       evalTerminator s ⟨.return_, span⟩ currentBody = MirStepNode.fail .ub) := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
-  · intro retVal hRet hStack hNoConflict
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro retVal hRet hInit hStack hNoConflict
     have hDepth : length s.memory.callStack = 0 := by
       rw [hStack]
       rfl
     simp only [evalTerminator, hRet, hDepth, hNoConflict]
     rw [hStack]
-  · intro retVal caller restStack updatedCallerLocals mem' hRet hStack hNoConflict hDiv hProt
+    simp only [hInit]
+  · intro retVal caller restStack updatedCallerLocals mem' hRet hInit hStack hNoConflict hDiv hProt
       hWrite
     refine ⟨?_, rfl⟩
     simp only [evalTerminator, hRet, hNoConflict]
     rw [hStack] at hWrite ⊢
-    simp only [hDiv, restoreCallerProtectors, hProt, hWrite]
+    simp only [hDiv, hInit, restoreCallerProtectors, hProt, hWrite]
   · intro retVal caller restStack hRet hStack hDiv
     simp only [evalTerminator, hRet]
     rw [hStack]
@@ -907,6 +914,18 @@ theorem mir_evalTerminator_return_root_and_caller
     split <;> rfl
   · intro retVal hRet hConflict
     simp only [evalTerminator, hRet, hConflict]
+  · intro retVal hRet hUninitVal
+    simp only [evalTerminator, hRet]
+    cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+        (length s.memory.callStack) (length s.frame.locals) with
+    | true => rfl
+    | false =>
+      cases s.memory.callStack with
+      | nil => simp [hUninitVal]
+      | cons caller restStack =>
+        cases caller.isDiverging with
+        | true => rfl
+        | false => simp [hUninitVal]
   · intro hUninit
     simp [evalTerminator, hUninit]
   · intro hDead

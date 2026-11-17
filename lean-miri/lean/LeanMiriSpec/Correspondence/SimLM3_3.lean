@@ -1045,7 +1045,7 @@ theorem sim_lm3_3_interpreter_deref_write_step
         | uninit => exact sameAllocSkeleton_actAllocEntry_symm treeMap
         | init v =>
           cases v with
-          | unit => exact sameAllocSkeleton_actAllocEntry_symm treeMap
+          | unit | uninit => exact sameAllocSkeleton_actAllocEntry_symm treeMap
           | scalar _ => exact sameAllocSkeleton_actAllocEntry_symm treeMap
           | aggregate _ _ => exact sameAllocSkeleton_actAllocEntry_symm treeMap
           | ptr ptrVal sz =>

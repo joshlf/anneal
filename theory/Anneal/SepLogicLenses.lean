@@ -2764,6 +2764,7 @@ inductive LiftLensBlock (body : CapturedMir) :
       LiftLensStmts body.localDecls body.layouts
         env entries bb.statements env' entries' →
       get? env' 0 = .some (.init retVal) →
+      (hInit : valueContainsUninit retVal = false := by rfl) →
       LiftLensBlock body bbIdx env entries retVal entries'
   | goto
       {bbIdx target : BasicBlockIdx} {bb : BasicBlockData} {env env₁ : PureEnv}
@@ -4155,7 +4156,8 @@ theorem mirWpConverges_return_of_lens
     (hStack : m.callStack = [])
     (hCallee : m.activeCallee = .none)
     (hAbove : ∀ b ∈ m.borrows, env.length ≤ b.targetLocal)
-    (hPost : Φ (.normal (retVal, m))) :
+    (hPost : Φ (.normal (retVal, m)))
+    (hInit : valueContainsUninit retVal = false := by rfl) :
     MirWpConverges body
       { frame := {
           blockIdx := bbIdx
@@ -4180,8 +4182,10 @@ theorem mirWpConverges_return_of_lens
   dsimp only at hStack
   subst hStack
   dsimp only [evalTerminator, length]
-  rw [hRet,
-    hasFrameDeallocProtectorConflict_eq_false_of_lt_frame _ hAbove,
+  rw [hRet]
+  dsimp only
+  rw [hasFrameDeallocProtectorConflict_eq_false_of_lt_frame _ hAbove,
+    hInit,
     disableFrameBorrows_eq_self_of_lt_frame hAbove]
   rfl
 
@@ -4481,7 +4485,7 @@ theorem mirWpConverges_of_liftLensBlock
           memory := m }
         Φ := by
   induction hBlock with
-  | return_ hPhase hBb hTerm hStmts hRet =>
+  | return_ hPhase hBb hTerm hStmts hRet hInit =>
     intro entries₀ m₀ m Φ hInv hFrame hKeys hPost
     have hLen := hStmts.length_eq
     exact mirWpConverges_of_liftLensStmts hPhase hBb hStmts [] m₀ m Φ
@@ -4489,7 +4493,7 @@ theorem mirWpConverges_of_liftLensBlock
       (fun m' hInv' hFrame' _ =>
         mirWpConverges_return_of_lens hPhase hBb hTerm hRet
           hInv'.callStack_nil hInv'.activeCallee_none hInv'.borrows_above_frame
-          (hPost m' (by rw [← hLen]; exact hInv') hFrame'))
+          (hPost m' (by rw [← hLen]; exact hInv') hFrame') hInit)
   | goto hPhase hBb hTerm hStmts _ ih =>
     intro entries₀ m₀ m Φ hInv hFrame hKeys hPost
     have hLen := hStmts.length_eq
@@ -5702,9 +5706,8 @@ private theorem eq_of_readProjectedValue_nil
     (h : readProjectedValue locals fVal [] = .ok v) :
     fVal = v := by
   dsimp only [readProjectedValue] at h
-  cases hU : valueContainsUninit fVal <;> rw [hU] at h
-  · injection h with hEq; exact hEq
-  · nomatch h
+  cases hU : valueContainsUninit fVal <;> simp [hU] at h
+  exact h
 
 /--
 Alias erasure for projected dereference field reads `(*p).fieldIdx`: when `rp`
@@ -8283,10 +8286,10 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           simp [ProvenancePtr.tag, hLookB, hPerm, hP]
           rw [hEnvNone, hT, hCaller]
           cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
-          | none => simp [hFT, hInit]
+          | none => simp [hInit]
           | some ft =>
             cases ft with
-            | callerReferent _ => simp [hFT, hInit]
+            | callerReferent _ => simp [hInit]
             | savedFrame _ _ => nomatch hFT
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
@@ -8323,10 +8326,10 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           dsimp only [appendProjections, readProjectedValue]
           rw [hEl]
           cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
-          | none => simp [hFT, hInit]
+          | none => simp [hInit]
           | some ft =>
             cases ft with
-            | callerReferent _ => simp [hFT, hInit]
+            | callerReferent _ => simp [hInit]
             | savedFrame _ _ => nomatch hFT
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
@@ -8366,10 +8369,10 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           simp [ProvenancePtr.tag, hLookB, hPerm, hP]
           rw [hEnvNone, hT, hCaller]
           cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
-          | none => simp [hFT, hInit]
+          | none => simp [hInit]
           | some ft =>
             cases ft with
-            | callerReferent _ => simp [hFT, hInit]
+            | callerReferent _ => simp [hInit]
             | savedFrame _ _ => nomatch hFT
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
@@ -8406,10 +8409,10 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
           dsimp only [appendProjections, readProjectedValue]
           rw [hEl]
           cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
-          | none => simp [hFT, hInit]
+          | none => simp [hInit]
           | some ft =>
             cases ft with
-            | callerReferent _ => simp [hFT, hInit]
+            | callerReferent _ => simp [hInit]
             | savedFrame _ _ => nomatch hFT
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
@@ -9896,7 +9899,7 @@ theorem mirWpConverges_of_liftLensBlock_subplace
           memory := m }
         Φ := by
   induction hBlock with
-  | return_ hPhase hBb hTerm hStmts hRet =>
+  | return_ hPhase hBb hTerm hStmts hRet hInit =>
     intro entries₀ m₀ m Φ hInv hFrame hKeys hPost
     have hLen := hStmts.length_eq
     exact mirWpConverges_of_liftLensStmts_subplace hPhase hBb hStmts [] m₀ m Φ
@@ -9904,7 +9907,7 @@ theorem mirWpConverges_of_liftLensBlock_subplace
       (fun m' hInv' hFrame' _ =>
         mirWpConverges_return_of_lens hPhase hBb hTerm hRet
           hInv'.callStack_nil hInv'.activeCallee_none hInv'.borrows_above_frame
-          (hPost m' (by rw [← hLen]; exact hInv') hFrame'))
+          (hPost m' (by rw [← hLen]; exact hInv') hFrame') hInit)
   | goto hPhase hBb hTerm hStmts _ ih =>
     intro entries₀ m₀ m Φ hInv hFrame hKeys hPost
     have hLen := hStmts.length_eq
@@ -21876,10 +21879,11 @@ theorem LiftLensBlockToJoin.toReturn {body : CapturedMir} {bbIdx retBb : BasicBl
     (hRetNil : retBlock.statements = [])
     (hPath : LiftLensBlockToJoin body bbIdx env entries retBb
       (fun envJ entriesJ =>
-        get? envJ 0 = .some (.init retVal) ∧ entriesJ = entriesFinal)) :
+        get? envJ 0 = .some (.init retVal) ∧ entriesJ = entriesFinal))
+    (hInit : valueContainsUninit retVal = false := by rfl) :
     LiftLensBlock body bbIdx env entries retVal entriesFinal :=
   hPath retVal entriesFinal fun _ _ ⟨hRet, hEq⟩ =>
-    hEq ▸ .return_ hPhase hRetBb hRetTerm (hRetNil ▸ .nil) hRet
+    hEq ▸ .return_ hPhase hRetBb hRetTerm (hRetNil ▸ .nil) hRet hInit
 
 /-- Compose a single `goto retBb` predecessor directly with a statement-free
 `return` block (for genuine multi-predecessor sharing of `retBb`, use
@@ -21894,10 +21898,11 @@ theorem LiftLensBlock.goto_return {body : CapturedMir} {bbIdx retBb : BasicBlock
     (hRetBb : get? body.basicBlocks retBb = .some retBlock)
     (hRetTerm : retBlock.terminator.kind = .return_)
     (hRetNil : retBlock.statements = [])
-    (hRet : get? env' 0 = .some (.init retVal)) :
+    (hRet : get? env' 0 = .some (.init retVal))
+    (hInit : valueContainsUninit retVal = false := by rfl) :
     LiftLensBlock body bbIdx env entries retVal entries' :=
   LiftLensBlockToJoin.toReturn hPhase hRetBb hRetTerm hRetNil
-    (.goto hPhase hBb hTerm hStmts (.refl ⟨hRet, rfl⟩))
+    (.goto hPhase hBb hTerm hStmts (.refl ⟨hRet, rfl⟩)) hInit
 
 /-! ### Constructive `MirBoolPredicateHolds` adequacy & signature combinators -/
 

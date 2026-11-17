@@ -227,15 +227,16 @@ theorem LiftStmtsTerminator.term_return {body : CapturedMir} {bbIdx : BasicBlock
   (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
   (h_end : stmtIdx = List.length stmts)
   (h_ret : Trusted.Sequence.get? env 0 = some (.init val))
-  (h_post : post val) :
+  (h_post : post val)
+  (h_init : valueContainsUninit val = false := by rfl) :
   LiftStmtsTerminator body bbIdx stmtIdx env stmts { kind := .return_, span := span } post 1 := by
   subst h_end
   rcases h_phase with hp | hp
   · dsimp [LiftStmtsTerminator, wpMirExecSym, evalSymNodeTree, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
-    simp [hp, h_bb, get_length_none_seq, get_length_none_list, ite_length_eq, evalTerminatorSymTree, evalTerminator, h_ret]
+    simp [hp, h_bb, get_length_none_seq, get_length_none_list, ite_length_eq, evalTerminatorSymTree, evalTerminator, h_ret, h_init]
     exact h_post
   · dsimp [LiftStmtsTerminator, wpMirExecSym, evalSymNodeTree, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
-    simp [hp, h_bb, get_length_none_seq, get_length_none_list, ite_length_eq, evalTerminatorSymTree, evalTerminator, h_ret]
+    simp [hp, h_bb, get_length_none_seq, get_length_none_list, ite_length_eq, evalTerminatorSymTree, evalTerminator, h_ret, h_init]
     exact h_post
 
 def LiftLoop (body : CapturedMir) (bbIdx : BasicBlockIdx) (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
@@ -1021,11 +1022,12 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
   /-- Drop of a projected place (`place.projection = proj :: rest`). -/
   | dropProjected {place : Place} {target : BasicBlockIdx}
       {unwind : UnwindAction} {span : String} {proj : ProjectionElem}
-      {rest : List ProjectionElem} {rootVal projVal : Value} :
+      {rest : List ProjectionElem} {rootVal rootVal' : Value} {env' : PureEnv} :
       get? env place.local_ = some (.init rootVal) →
       place.projection = proj :: rest →
-      checkProjectedDropValue env rootVal (proj :: rest) = .ok projVal →
-      post (.frame target 0 env mem) →
+      deinitProjectedForLocal env cur.localDecls cur.layouts place.local_ rootVal (proj :: rest) = .ok rootVal' →
+      set? env place.local_ (.init rootVal') = some env' →
+      post (.frame target 0 env' mem) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .drop place target unwind, span := span }
   /--
@@ -1034,6 +1036,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
   -/
   | return_ {span : String} {retVal : Value} :
       get? env 0 = some (.init retVal) →
+      valueContainsUninit retVal = false →
       mem.callStack = [] →
       hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
           0 (length env) = false →
@@ -1049,6 +1052,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
   | returnToCaller {span : String} {retVal : Value} {caller : SavedCallerFrame}
       {rest : List SavedCallerFrame} {callerEnv : PureEnv} {mem' : Memory} :
       get? env 0 = some (.init retVal) →
+      valueContainsUninit retVal = false →
       mem.callStack = caller :: rest →
       hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
           (length mem.callStack) (length env) = false →
@@ -1641,16 +1645,18 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
       dsimp only []
       rw [h_set]
       exact h_next
-  | dropProjected h_get h_proj h_read h_next =>
+  | dropProjected h_get h_proj h_deinit h_set h_next =>
     unfold evalTerminator
-    dsimp only [PureState.toMachineState]
+    dsimp only [PureState.toMachineState, bodyLocalDeclsOf]
     rw [h_get]
     dsimp only []
     rw [h_proj]
     dsimp only []
-    rw [h_read]
+    rw [h_deinit]
+    dsimp only []
+    rw [h_set]
     exact h_next
-  | return_ h_ret h_stack h_noDealloc h_post =>
+  | return_ h_ret h_init h_stack h_noDealloc h_post =>
     unfold evalTerminator
     dsimp only [PureState.toMachineState]
     rw [h_ret]
@@ -1658,8 +1664,10 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
     rw [h_stack]
     dsimp only [Trusted.Sequence.length, List.length] at h_noDealloc ⊢
     rw [h_noDealloc]
+    dsimp only []
+    rw [h_init]
     exact h_post
-  | returnToCaller h_ret h_stack h_noDealloc h_div h_write h_next =>
+  | returnToCaller h_ret h_init h_stack h_noDealloc h_div h_write h_next =>
     unfold evalTerminator
     dsimp only [PureState.toMachineState]
     rw [h_ret]
@@ -1671,6 +1679,8 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
     rw [h_stack]
     dsimp only []
     rw [h_div]
+    dsimp only []
+    rw [h_init]
     dsimp only []
     intro h_write
     rw [h_write]
@@ -2160,7 +2170,8 @@ theorem PureMirModularConverges.return_
     (h_end : ps.stmtIdx = length bb.statements)
     (h_term : bb.terminator.kind = .return_)
     (h_ret : get? ps.env 0 = some (.init retVal))
-    (h_post : post retVal) :
+    (h_post : post retVal)
+    (h_init : valueContainsUninit retVal = false := by rfl) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   intro m hm
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
@@ -2185,6 +2196,8 @@ theorem PureMirModularConverges.return_
     rw [h_term]
     dsimp only [evalTerminator]
     rw [h_ret]
+    dsimp only
+    rw [h_init]
     dsimp only
     rw [hasFrameDeallocProtectorConflict_of_eq_nil hm.2.2.2.2, hm.2.2.1]
     dsimp only [MirStepNode.retNormal,
@@ -4325,12 +4338,14 @@ private theorem evalDrop_pure_sim
         | some _ => exact ⟨_, rfl, rfl⟩
       | cons hd tl =>
         dsimp only at h_wp ⊢
-        cases h_rd : checkProjectedDropValue s₁.frame.locals .uninit (hd :: tl) with
-        | ub => rw [h_rd] at h_wp; exact False.elim h_wp
-        | unsupported => rw [h_rd] at h_wp; exact False.elim h_wp
-        | ok _ => exact ⟨_, rfl, rfl⟩
+        cases h_tl : deinitTailOk s₁.frame.locals (hd :: tl) with
+        | false =>
+          rw [h_tl] at h_wp
+          dsimp only at h_wp
+          cases h_pd : projectionHasDeref (hd :: tl) <;> (rw [h_pd] at h_wp; exact False.elim h_wp)
+        | true =>
+          exact ⟨_, rfl, rfl⟩
     | init rv =>
-      dsimp only at h_wp ⊢
       cases pProj with
       | nil =>
         dsimp only at h_wp ⊢
@@ -4338,11 +4353,29 @@ private theorem evalDrop_pure_sim
         | none => rw [h_s] at h_wp; exact False.elim h_wp
         | some _ => exact ⟨_, rfl, rfl⟩
       | cons hd tl =>
-        dsimp only at h_wp ⊢
-        cases h_rd : checkProjectedDropValue s₁.frame.locals rv (hd :: tl) with
-        | ub => rw [h_rd] at h_wp; exact False.elim h_wp
-        | unsupported => rw [h_rd] at h_wp; exact False.elim h_wp
-        | ok _ => exact ⟨_, rfl, rfl⟩
+        cases bodyOpt with
+        | none =>
+          dsimp only [bodyLocalDeclsOf] at h_wp ⊢
+          cases h_dp : deinitProjectedForLocal s₁.frame.locals [] emptyLayoutTable pLoc rv (hd :: tl) with
+          | ub => rw [h_dp] at h_wp; exact False.elim h_wp
+          | unsupported => rw [h_dp] at h_wp; exact False.elim h_wp
+          | ok rv' =>
+            rw [h_dp] at h_wp
+            dsimp only at h_wp ⊢
+            cases h_s : set? s₁.frame.locals pLoc (.init rv') with
+            | none => rw [h_s] at h_wp; exact False.elim h_wp
+            | some _ => exact ⟨_, rfl, rfl⟩
+        | some b =>
+          dsimp only [bodyLocalDeclsOf] at h_wp ⊢
+          cases h_dp : deinitProjectedForLocal s₁.frame.locals b.localDecls b.layouts pLoc rv (hd :: tl) with
+          | ub => rw [h_dp] at h_wp; exact False.elim h_wp
+          | unsupported => rw [h_dp] at h_wp; exact False.elim h_wp
+          | ok rv' =>
+            rw [h_dp] at h_wp
+            dsimp only at h_wp ⊢
+            cases h_s : set? s₁.frame.locals pLoc (.init rv') with
+            | none => rw [h_s] at h_wp; exact False.elim h_wp
+            | some _ => exact ⟨_, rfl, rfl⟩
 
 private theorem evalSwitchInt_pure_sim
     {s₁ s₂ : MachineState} {discr : Operand} {targets : SwitchTargets} {tspan : String}
@@ -5033,19 +5066,24 @@ private theorem pureCallee_pushCalleeFrame_step_pureTerm
         cases h_cs : s₁.memory.callStack with
         | nil =>
           rw [h_cs] at h_wp
-          dsimp only [MirStepNode.retNormal, evalNodeNoCallWP, mirNormalPost] at h_wp
-          rcases h_wp with ⟨h_act₁, hp₁⟩
-          let memOut₁ := { s₁.memory with callStack := [], borrows := disableFrameBorrows s₁.memory.borrows (length ([] : List SavedCallerFrame)) (length s₁.frame.locals) }
-          let memOut₂ := s₂.memory
-          have h_meq' : StackedCallFrameAndTraits outerBody body (caller :: restStack) memOut₁ memOut₂ :=
-            StackedCallFrameAndTraits_eq h_meq_full (by rw [h_cs]) rfl rfl rfl rfl rfl rfl rfl rfl rfl
-          rcases h_cont retVal memOut₁ memOut₂ (length s₁.frame.locals) h_act₁ hp₁ h_meq' h_ap2 with ⟨updLocals, memResumed, h_wr, h_mid⟩
-          dsimp only [List.nil_append]
-          rw [h_div_caller, h_prot_caller]
-          dsimp only
-          rw [h_wr]
-          dsimp only [MirStepNode.step, evalNodeNoCallWP]
-          exact wpMirExecStepsUpToSym_of_mid h_mid
+          dsimp only at h_wp
+          cases h_u : valueContainsUninit retVal with
+          | true => rw [h_u] at h_wp; exact False.elim h_wp
+          | false =>
+            rw [h_u] at h_wp
+            dsimp only [MirStepNode.retNormal, evalNodeNoCallWP, mirNormalPost] at h_wp
+            rcases h_wp with ⟨h_act₁, hp₁⟩
+            let memOut₁ := { s₁.memory with callStack := [], borrows := disableFrameBorrows s₁.memory.borrows (length ([] : List SavedCallerFrame)) (length s₁.frame.locals) }
+            let memOut₂ := s₂.memory
+            have h_meq' : StackedCallFrameAndTraits outerBody body (caller :: restStack) memOut₁ memOut₂ :=
+              StackedCallFrameAndTraits_eq h_meq_full (by rw [h_cs]) rfl rfl rfl rfl rfl rfl rfl rfl rfl
+            rcases h_cont retVal memOut₁ memOut₂ (length s₁.frame.locals) h_act₁ hp₁ h_meq' h_ap2 with ⟨updLocals, memResumed, h_wr, h_mid⟩
+            dsimp only [List.nil_append]
+            rw [h_div_caller, h_prot_caller]
+            dsimp only
+            rw [h_wr]
+            dsimp only [MirStepNode.step, evalNodeNoCallWP]
+            exact wpMirExecStepsUpToSym_of_mid h_mid
         | cons c_frame rest =>
           rw [h_cs] at h_wp h_step_inv h_dst_stk
           dsimp only at h_wp h_step_inv ⊢
@@ -5054,48 +5092,53 @@ private theorem pureCallee_pushCalleeFrame_step_pureTerm
           | false =>
             rw [h_div] at h_wp h_step_inv
             dsimp only at h_wp h_step_inv ⊢
-            have h_cdst : isPurePlace c_frame.destination = true :=
-              h_dst_stk c_frame (List.Mem.head rest)
-            have h_hd := h_stack c_frame (by rw [h_cs]; exact List.Mem.head rest)
-            have h_prot_nil : restoreCallerProtectors c_frame = [] := by
-              rcases h_hd with ⟨hp1, hp2, _⟩
-              simp [restoreCallerProtectors, hp1, hp2]
-            rw [h_prot_nil] at h_wp h_step_inv
-            let memPop₁ : Memory :=
-              { s₁.memory with
-                borrows := disableFrameBorrows s₁.memory.borrows (length (c_frame :: rest)) (length s₁.frame.locals)
-                callStack := rest
-                activeCallee := .some c_frame.callerBody
-                activeProtectors := [] }
-            let memPop₂ : Memory :=
-              { s₂.memory with
-                borrows := disableFrameBorrows s₂.memory.borrows (length (c_frame :: (rest ++ caller :: restStack))) (length s₁.frame.locals)
-                callStack := rest ++ (caller :: restStack)
-                activeCallee := .some c_frame.callerBody
-                activeProtectors := [] }
-            rcases writeReturnDestination_pure_eq_withMem
-              c_frame.frame.locals memPop₂ c_frame.destination retVal
-              c_frame.callerBody.localDecls c_frame.callerBody.layouts
-              h_cdst rfl with ⟨bs₂, h_w2⟩
-            rcases writeReturnDestination_pure_eq_withMem
-              c_frame.frame.locals memPop₁ c_frame.destination retVal
-              c_frame.callerBody.localDecls c_frame.callerBody.layouts
-              h_cdst rfl with ⟨bs₁, h_w1⟩
-            dsimp only [List.cons_append]
-            rw [h_div, h_prot_nil]
-            dsimp only
-            rw [h_w2]
-            rw [h_w1] at h_wp h_step_inv
-            cases h_w : writeReturnDestination c_frame.frame.locals emptyMemory
-                c_frame.destination retVal c_frame.callerBody.localDecls
-                c_frame.callerBody.layouts with
-            | ub => rw [h_w] at h_wp; exact False.elim h_wp
-            | unsupported => rw [h_w] at h_wp; exact False.elim h_wp
-            | ok updL _ =>
-              rw [h_w] at h_wp h_step_inv
-              dsimp only [FrameWriteResult.withMem] at h_wp h_step_inv ⊢
-              exact ih_run h_wp ⟨h_step_inv, fun f hf => h_dst_stk f (List.Mem.tail c_frame hf)⟩
-                ⟨rfl, ⟨rfl, mf_cal, mf_tr, rfl, rfl⟩⟩
+            cases h_u : valueContainsUninit retVal with
+            | true => rw [h_u] at h_wp; exact False.elim h_wp
+            | false =>
+              rw [h_u] at h_wp h_step_inv
+              dsimp only at h_wp h_step_inv ⊢
+              have h_cdst : isPurePlace c_frame.destination = true :=
+                h_dst_stk c_frame (List.Mem.head rest)
+              have h_hd := h_stack c_frame (by rw [h_cs]; exact List.Mem.head rest)
+              have h_prot_nil : restoreCallerProtectors c_frame = [] := by
+                rcases h_hd with ⟨hp1, hp2, _⟩
+                simp [restoreCallerProtectors, hp1, hp2]
+              rw [h_prot_nil] at h_wp h_step_inv
+              let memPop₁ : Memory :=
+                { s₁.memory with
+                  borrows := disableFrameBorrows s₁.memory.borrows (length (c_frame :: rest)) (length s₁.frame.locals)
+                  callStack := rest
+                  activeCallee := .some c_frame.callerBody
+                  activeProtectors := [] }
+              let memPop₂ : Memory :=
+                { s₂.memory with
+                  borrows := disableFrameBorrows s₂.memory.borrows (length (c_frame :: (rest ++ caller :: restStack))) (length s₁.frame.locals)
+                  callStack := rest ++ (caller :: restStack)
+                  activeCallee := .some c_frame.callerBody
+                  activeProtectors := [] }
+              rcases writeReturnDestination_pure_eq_withMem
+                c_frame.frame.locals memPop₂ c_frame.destination retVal
+                c_frame.callerBody.localDecls c_frame.callerBody.layouts
+                h_cdst rfl with ⟨bs₂, h_w2⟩
+              rcases writeReturnDestination_pure_eq_withMem
+                c_frame.frame.locals memPop₁ c_frame.destination retVal
+                c_frame.callerBody.localDecls c_frame.callerBody.layouts
+                h_cdst rfl with ⟨bs₁, h_w1⟩
+              dsimp only [List.cons_append]
+              rw [h_div, h_prot_nil]
+              dsimp only
+              rw [h_w2]
+              rw [h_w1] at h_wp h_step_inv
+              cases h_w : writeReturnDestination c_frame.frame.locals emptyMemory
+                  c_frame.destination retVal c_frame.callerBody.localDecls
+                  c_frame.callerBody.layouts with
+              | ub => rw [h_w] at h_wp; exact False.elim h_wp
+              | unsupported => rw [h_w] at h_wp; exact False.elim h_wp
+              | ok updL _ =>
+                rw [h_w] at h_wp h_step_inv
+                dsimp only [FrameWriteResult.withMem] at h_wp h_step_inv ⊢
+                exact ih_run h_wp ⟨h_step_inv, fun f hf => h_dst_stk f (List.Mem.tail c_frame hf)⟩
+                  ⟨rfl, ⟨rfl, mf_cal, mf_tr, rfl, rfl⟩⟩
   | switchInt discr targets =>
     dsimp only [isPureTerminator] at h_pt
     rcases evalSwitchInt_pure_sim (s₂ := s₂) h_fr h_pt h_wp with ⟨obs, f', h_s1, h_s2⟩
@@ -5660,17 +5703,22 @@ private theorem sameExceptBorrows_step_pureTerm
         cases h_cs : s₁.memory.callStack with
         | nil =>
           rw [h_cs] at h_wp
-          dsimp only [MirStepNode.retNormal, evalNodeNoCallWP, mirNormalPost] at h_wp ⊢
-          rcases h_wp with ⟨h_act₁, hp₁⟩
-          refine ⟨?_, hp₁⟩
-          dsimp only [ModularCalleeOutMemory]
-          rw [mf_cal, mf_tr, mf_ap]
-          rcases h_act₁ with h_eq1 | ⟨_, h_eq1⟩ <;>
-            (have hc := congrArg Memory.callees h_eq1;
-             have ht := congrArg Memory.traitImpls h_eq1;
-             have hap := congrArg Memory.activeProtectors h_eq1;
-             rw [hc, ht, hap];
-             exact ⟨rfl, rfl, rfl, rfl⟩)
+          dsimp only at h_wp ⊢
+          cases h_u : valueContainsUninit retVal with
+          | true => rw [h_u] at h_wp; exact False.elim h_wp
+          | false =>
+            rw [h_u] at h_wp
+            dsimp only [MirStepNode.retNormal, evalNodeNoCallWP, mirNormalPost] at h_wp ⊢
+            rcases h_wp with ⟨h_act₁, hp₁⟩
+            refine ⟨?_, hp₁⟩
+            dsimp only [ModularCalleeOutMemory]
+            rw [mf_cal, mf_tr, mf_ap]
+            rcases h_act₁ with h_eq1 | ⟨_, h_eq1⟩ <;>
+              (have hc := congrArg Memory.callees h_eq1;
+               have ht := congrArg Memory.traitImpls h_eq1;
+               have hap := congrArg Memory.activeProtectors h_eq1;
+               rw [hc, ht, hap];
+               exact ⟨rfl, rfl, rfl, rfl⟩)
         | cons caller rest =>
           rw [h_cs] at h_wp h_step_inv h_dst_stk
           dsimp only at h_wp h_step_inv ⊢
@@ -5679,45 +5727,50 @@ private theorem sameExceptBorrows_step_pureTerm
           | false =>
             rw [h_div] at h_wp h_step_inv
             dsimp only at h_wp h_step_inv ⊢
-            have h_cdst : isPurePlace caller.destination = true :=
-              h_dst_stk caller (List.Mem.head rest)
-            have h_hd := h_stack caller (by rw [h_cs]; exact List.Mem.head rest)
-            have h_prot_nil : restoreCallerProtectors caller = [] := by
-              rcases h_hd with ⟨hp1, hp2, _⟩
-              simp [restoreCallerProtectors, hp1, hp2]
-            rw [h_prot_nil] at h_wp h_step_inv ⊢
-            let memPop₁ : Memory :=
-              { s₁.memory with
-                borrows := disableFrameBorrows s₁.memory.borrows (length (caller :: rest)) (length s₁.frame.locals)
-                callStack := rest
-                activeCallee := .some caller.callerBody
-                activeProtectors := [] }
-            let memPop₂ : Memory :=
-              { s₂.memory with
-                borrows := disableFrameBorrows s₂.memory.borrows (length (caller :: rest)) (length s₁.frame.locals)
-                callStack := rest
-                activeCallee := .some caller.callerBody
-                activeProtectors := [] }
-            rcases writeReturnDestination_pure_eq_withMem
-              caller.frame.locals memPop₂ caller.destination retVal
-              caller.callerBody.localDecls caller.callerBody.layouts
-              h_cdst rfl with ⟨bs₂, h_w2⟩
-            rcases writeReturnDestination_pure_eq_withMem
-              caller.frame.locals memPop₁ caller.destination retVal
-              caller.callerBody.localDecls caller.callerBody.layouts
-              h_cdst rfl with ⟨bs₁, h_w1⟩
-            rw [h_w2]
-            rw [h_w1] at h_wp h_step_inv
-            cases h_w : writeReturnDestination caller.frame.locals emptyMemory
-                caller.destination retVal caller.callerBody.localDecls
-                caller.callerBody.layouts with
-            | ub => rw [h_w] at h_wp; exact False.elim h_wp
-            | unsupported => rw [h_w] at h_wp; exact False.elim h_wp
-            | ok updL _ =>
-              rw [h_w] at h_wp h_step_inv
-              dsimp only [FrameWriteResult.withMem] at h_wp h_step_inv ⊢
-              exact ih_run h_wp ⟨h_step_inv, fun f hf => h_dst_stk f (List.Mem.tail caller hf)⟩
-                ⟨rfl, mf_cal, mf_tr, rfl, rfl, rfl⟩
+            cases h_u : valueContainsUninit retVal with
+            | true => rw [h_u] at h_wp; exact False.elim h_wp
+            | false =>
+              rw [h_u] at h_wp h_step_inv
+              dsimp only at h_wp h_step_inv ⊢
+              have h_cdst : isPurePlace caller.destination = true :=
+                h_dst_stk caller (List.Mem.head rest)
+              have h_hd := h_stack caller (by rw [h_cs]; exact List.Mem.head rest)
+              have h_prot_nil : restoreCallerProtectors caller = [] := by
+                rcases h_hd with ⟨hp1, hp2, _⟩
+                simp [restoreCallerProtectors, hp1, hp2]
+              rw [h_prot_nil] at h_wp h_step_inv ⊢
+              let memPop₁ : Memory :=
+                { s₁.memory with
+                  borrows := disableFrameBorrows s₁.memory.borrows (length (caller :: rest)) (length s₁.frame.locals)
+                  callStack := rest
+                  activeCallee := .some caller.callerBody
+                  activeProtectors := [] }
+              let memPop₂ : Memory :=
+                { s₂.memory with
+                  borrows := disableFrameBorrows s₂.memory.borrows (length (caller :: rest)) (length s₁.frame.locals)
+                  callStack := rest
+                  activeCallee := .some caller.callerBody
+                  activeProtectors := [] }
+              rcases writeReturnDestination_pure_eq_withMem
+                caller.frame.locals memPop₂ caller.destination retVal
+                caller.callerBody.localDecls caller.callerBody.layouts
+                h_cdst rfl with ⟨bs₂, h_w2⟩
+              rcases writeReturnDestination_pure_eq_withMem
+                caller.frame.locals memPop₁ caller.destination retVal
+                caller.callerBody.localDecls caller.callerBody.layouts
+                h_cdst rfl with ⟨bs₁, h_w1⟩
+              rw [h_w2]
+              rw [h_w1] at h_wp h_step_inv
+              cases h_w : writeReturnDestination caller.frame.locals emptyMemory
+                  caller.destination retVal caller.callerBody.localDecls
+                  caller.callerBody.layouts with
+              | ub => rw [h_w] at h_wp; exact False.elim h_wp
+              | unsupported => rw [h_w] at h_wp; exact False.elim h_wp
+              | ok updL _ =>
+                rw [h_w] at h_wp h_step_inv
+                dsimp only [FrameWriteResult.withMem] at h_wp h_step_inv ⊢
+                exact ih_run h_wp ⟨h_step_inv, fun f hf => h_dst_stk f (List.Mem.tail caller hf)⟩
+                  ⟨rfl, mf_cal, mf_tr, rfl, rfl, rfl⟩
   | switchInt discr targets =>
     dsimp only [isPureTerminator] at h_pt
     rcases evalSwitchInt_pure_sim (s₂ := s₂) h_fr h_pt h_wp with ⟨obs, f', h_s1, h_s2⟩
@@ -6327,17 +6380,20 @@ theorem PureMirModularConverges.step_drop
             rfl
         | cons hd tl =>
           dsimp only at h_eval ⊢
-          cases h_rd : checkProjectedDropValue ps.env .uninit (hd :: tl) with
-          | ub => rw [h_rd] at h_eval; nomatch h_eval
-          | unsupported => rw [h_rd] at h_eval; nomatch h_eval
-          | ok _ =>
-            rw [h_rd] at h_eval
+          cases h_tl : deinitTailOk ps.env (hd :: tl) with
+          | false =>
+            rw [h_tl] at h_eval
+            dsimp only at h_eval
+            cases h_pd : projectionHasDeref (hd :: tl) <;> (rw [h_pd] at h_eval; nomatch h_eval)
+          | true =>
+            rw [h_tl] at h_eval
             dsimp only at h_eval ⊢
             injection h_eval with h_se
             injection h_se with h_eq
             subst h_eq
             rfl
       | init rv =>
+        dsimp only [bodyLocalDeclsOf] at h_eval ⊢
         cases proj with
         | nil =>
           dsimp only at h_eval ⊢
@@ -6352,16 +6408,21 @@ theorem PureMirModularConverges.step_drop
             rfl
         | cons hd tl =>
           dsimp only at h_eval ⊢
-          cases h_rd : checkProjectedDropValue ps.env rv (hd :: tl) with
-          | ub => rw [h_rd] at h_eval; nomatch h_eval
-          | unsupported => rw [h_rd] at h_eval; nomatch h_eval
-          | ok _ =>
-            rw [h_rd] at h_eval
+          cases h_dp : deinitProjectedForLocal ps.env body.localDecls body.layouts loc rv (hd :: tl) with
+          | ub => rw [h_dp] at h_eval; nomatch h_eval
+          | unsupported => rw [h_dp] at h_eval; nomatch h_eval
+          | ok rv' =>
+            rw [h_dp] at h_eval
             dsimp only at h_eval ⊢
-            injection h_eval with h_se
-            injection h_se with h_eq
-            subst h_eq
-            rfl
+            cases h_s : set? ps.env loc (.init rv') with
+            | none => rw [h_s] at h_eval; nomatch h_eval
+            | some _ =>
+              rw [h_s] at h_eval
+              dsimp only at h_eval ⊢
+              injection h_eval with h_se
+              injection h_se with h_eq
+              subst h_eq
+              rfl
   change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
   rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
   dsimp only [stepMirState]
@@ -13215,10 +13276,13 @@ def evalTerminatorSymTreeFast
           with
           | true => MirStepNode.fail .ub
           | false =>
-            MirStepNode.retNormal retVal
-              { s.memory with
-                borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
-                  (length s.frame.locals) })
+            match valueContainsUninit retVal with
+            | true => MirStepNode.fail .ub
+            | false =>
+              MirStepNode.retNormal retVal
+                { s.memory with
+                  borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+                    (length s.frame.locals) })
       | _ => .leaf (MirStepNode.fail .ub)
     | _ :: _ => evalTerminatorFallback s term body
   | .switchInt discr targets =>
@@ -13268,9 +13332,13 @@ theorem evalTerminatorSymTreeFast_eq
         cases slot with
         | dead => rfl
         | uninit => rfl
-        | init _ =>
+        | init retVal =>
+          dsimp only
           cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
-              0 (length s.frame.locals) <;> rfl
+              (length ([] : List SavedCallerFrame)) (length s.frame.locals) with
+          | true => rfl
+          | false =>
+            cases valueContainsUninit retVal <;> rfl
     | cons _ _ => rfl
   | switchInt discr targets =>
     show evalTerminatorSymTreeFast body s { kind := .switchInt discr targets, span := span } =
@@ -13804,11 +13872,14 @@ def evalTerminatorCfg
         with
         | true => .faulted
         | false =>
-          .halted ok
-            (.normal (retVal,
-              { s.memory with
-                borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
-                  (length s.frame.locals) }))
+          match valueContainsUninit retVal with
+          | true => .faulted
+          | false =>
+            .halted ok
+              (.normal (retVal,
+                { s.memory with
+                  borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack)
+                    (length s.frame.locals) }))
       | _ => .faulted
     | _ :: _ => .faulted
   | .switchInt discr targets =>
@@ -13935,9 +14006,13 @@ theorem cfgOk_evalTerminatorCfg_false
         cases slot with
         | dead => rfl
         | uninit => rfl
-        | init _ =>
+        | init retVal =>
+          dsimp only
           cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
-              (length ([] : List SavedCallerFrame)) (length s.frame.locals) <;> rfl
+              (length ([] : List SavedCallerFrame)) (length s.frame.locals) with
+          | true => rfl
+          | false =>
+            cases valueContainsUninit retVal <;> rfl
   | switchInt discr targets =>
     dsimp only [evalTerminatorCfg]
     cases evalOperandFast body s.frame.locals discr s.memory.borrows s.memory.globals
@@ -14124,14 +14199,19 @@ theorem wpCoalBounded_evalTerminatorCfg
         | dead => rintro ⟨⟩ _
         | uninit => rintro ⟨⟩ _
         | init retVal =>
+          dsimp only
           cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
               (length ([] : List SavedCallerFrame)) (length s.frame.locals) with
           | true => rintro ⟨⟩ _
           | false =>
-            intro _ h_wp
-            dsimp only [stepNodeWP, MirStepNode.retNormal] at h_wp ⊢
-            rw [runCfgSteps_halted] at h_wp
-            exact h_wp.2
+            dsimp only
+            cases valueContainsUninit retVal with
+            | true => rintro ⟨⟩ _
+            | false =>
+              intro _ h_wp
+              dsimp only [stepNodeWP, MirStepNode.retNormal] at h_wp ⊢
+              rw [runCfgSteps_halted] at h_wp
+              exact h_wp.2
   | switchInt discr targets =>
     dsimp only [evalTerminatorCfg, evalTerminator]
     rw [evalOperandFast_eq]
@@ -14613,14 +14693,19 @@ theorem wpMirExecStepsSym_evalTerminatorCfg
         | dead => rintro ⟨⟩ _
         | uninit => rintro ⟨⟩ _
         | init retVal =>
+          dsimp only
           cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
               (length ([] : List SavedCallerFrame)) (length s.frame.locals) with
           | true => rintro ⟨⟩ _
           | false =>
-            intro _ h_wp
-            dsimp only [stepNodeStepsWP, MirStepNode.retNormal] at h_wp ⊢
-            rw [runCfgSteps_halted] at h_wp
-            exact h_wp.2
+            dsimp only
+            cases valueContainsUninit retVal with
+            | true => rintro ⟨⟩ _
+            | false =>
+              intro _ h_wp
+              dsimp only [stepNodeStepsWP, MirStepNode.retNormal] at h_wp ⊢
+              rw [runCfgSteps_halted] at h_wp
+              exact h_wp.2
   | switchInt discr targets =>
     dsimp only [evalTerminatorCfg, evalTerminator]
     rw [evalOperandFast_eq]
@@ -16078,11 +16163,12 @@ theorem LiftStmtsTerminator.term_return_ready {body : CapturedMir}
     (h_term : bb.terminator = { kind := .return_, span := span })
     (h_end : stmtIdx = List.length bb.statements)
     (h_ret : Trusted.Sequence.get? env 0 = some (.init val))
-    (h_post : post val) :
+    (h_post : post val)
+    (h_init : valueContainsUninit val = false := by rfl) :
     LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post 1 := by
   have h_bb' := lookup_cleanup_false_of_mirLiftReady h_ready h_bb
   rw [h_term] at h_bb' ⊢
-  exact LiftStmtsTerminator.term_return h_bb' (phase_of_mirLiftReady h_ready) h_end h_ret h_post
+  exact LiftStmtsTerminator.term_return h_bb' (phase_of_mirLiftReady h_ready) h_end h_ret h_post h_init
 
 /--
 Readiness-discharged `term_goto` rule: extracts `h_phase` and
@@ -19685,9 +19771,10 @@ theorem LiftStmtsConverges.term_return {body : CapturedMir}
     (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
     (h_end : stmtIdx = List.length stmts)
     (h_ret : Trusted.Sequence.get? env 0 = some (.init val))
-    (h_post : post val) :
+    (h_post : post val)
+    (h_init : valueContainsUninit val = false := by rfl) :
     LiftStmtsConverges body bbIdx stmtIdx env stmts { kind := .return_, span := span } post :=
-  ⟨1, LiftStmtsTerminator.term_return h_bb h_phase h_end h_ret h_post⟩
+  ⟨1, LiftStmtsTerminator.term_return h_bb h_phase h_end h_ret h_post h_init⟩
 
 theorem LiftStmtsConverges.term_return_ready {body : CapturedMir}
     {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv}
@@ -19697,9 +19784,10 @@ theorem LiftStmtsConverges.term_return_ready {body : CapturedMir}
     (h_term : bb.terminator = { kind := .return_, span := span })
     (h_end : stmtIdx = List.length bb.statements)
     (h_ret : Trusted.Sequence.get? env 0 = some (.init val))
-    (h_post : post val) :
+    (h_post : post val)
+    (h_init : valueContainsUninit val = false := by rfl) :
     LiftStmtsConverges body bbIdx stmtIdx env bb.statements bb.terminator post :=
-  ⟨1, LiftStmtsTerminator.term_return_ready h_ready h_bb h_term h_end h_ret h_post⟩
+  ⟨1, LiftStmtsTerminator.term_return_ready h_ready h_bb h_term h_end h_ret h_post h_init⟩
 
 theorem LiftStmtsConverges.term_goto {body : CapturedMir}
     {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv}

@@ -3296,7 +3296,7 @@ private theorem declSlotOk_valueShapeEq {layouts : Layout.LayoutTable} {d : Loca
       simp only [SlotOk, tyBytes] at hs
       simp only [canonicalDeclVal, hit]
       exact .scalar sc ⟨0, it.size.bytes⟩ hs.1
-    | unit => exact False.elim hs
+    | unit | uninit => exact False.elim hs
     | ptr _ _ => exact False.elim hs
     | aggregate v0 fs =>
       simp only [SlotOk] at hs
@@ -3864,7 +3864,7 @@ private theorem readProjectedValue_scalar_of_ptrTargetSpec {body : CapturedMir}
     | scalar sc =>
       simp only [SlotOk, tyBytes] at hslot
       exact ⟨dk, sc, hdk, hvsh, hslot.1, hpos, by rw [hproj]; rfl⟩
-    | unit => exact False.elim hslot
+    | unit | uninit => exact False.elim hslot
     | ptr _ _ => exact False.elim hslot
     | aggregate v0 fs =>
       simp only [SlotOk] at hslot
@@ -3905,7 +3905,7 @@ private theorem readProjectedValue_scalar_of_ptrTargetSpec {body : CapturedMir}
       have hvok := he v (List.mem_of_getElem? hv)
       cases v with
       | scalar sc =>
-        exact ⟨dk, sc, hdk, hvsh, hvok.1, hpos, hrv⟩
+        exact ⟨dk, sc, hdk, hvsh, hvok.1, hpos, hrv rfl⟩
       | _ => exact False.elim hvok
   · have hvsh := declSlotOk_valueShapeEq (hslots q.local_ dk _ hdk ht)
       (.inr (.inr ⟨fields, size, align, htu⟩))

@@ -2694,16 +2694,18 @@ def annealControlHooksLM4_1
   advances to `(target, 0)` via `ControlFlow.goToBlock target state` without
   deinitializing `localId`.
 
-Notes on Stage-1 `Trusted` vs. canonical `lean-miri`:
-* (`H3`) on an *unprojected* drop `place = ⟨localId, .nil⟩`, Stage-1 `Trusted`
+Notes on `Trusted` vs. canonical `lean-miri`:
+* (`H3`) on an *unprojected* drop `place = ⟨localId, .nil⟩`, `Trusted`
   deinitializes `localId` to `.uninit` whereas canonical `lean-miri` with
   `dropGlue = none` leaves `localId`'s value intact (certified in
   `canonical_drop_no_glue_preserves_local_divergence` and
   `step_terminator_drop_canonical_no_glue_step_divergence`);
-* on a *projected* drop of an uninitialized root local, Stage-1 `Trusted`
-  faults (`Terminators.lean:3066`: the root slot must be `.init`), whereas
-  canonical `lean-miri` (and this hook) only evaluates the place and jumps
-  (certified in `step_terminator_drop_projected_uninit_divergence`). -/
+* on a *projected* drop of an uninitialized root local, both `Trusted` and
+  canonical `lean-miri` (and this hook) evaluate the place tail and jump without
+  faulting (`step_terminator_drop_projected_simulation`), whereas on an
+  initialized 2-field aggregate `Trusted` deinitializes the dropped field to
+  `Value.uninit` while canonical no-glue `lean-miri` leaves `.scalarPair` intact
+  (certified in `step_terminator_drop_projected_init_no_glue_divergence`). -/
 def annealEvalDropLM4_1
     (place : Miri.MIR.Place)
     (target : Miri.MIR.BasicBlockId)

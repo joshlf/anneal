@@ -21068,7 +21068,7 @@ open LeanMiriSpec.Correspondence in
   step_terminator_drop_noop_simulation
   canonical_drop_no_glue_preserves_local_divergence
   step_terminator_drop_projected_simulation
-  step_terminator_drop_projected_uninit_divergence
+  step_terminator_drop_projected_init_no_glue_divergence
   step_terminator_drop_canonical_no_glue_step_divergence
   annealControlHooks_returnOperand_cleanup_live_back
   step_terminator_return_root_simulation
@@ -21511,8 +21511,7 @@ example
     (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
     (hroot :
       get? s.frame.locals localId = some .dead ∨
-        ∃ sc₁ sc₂,
-          get? s.frame.locals localId = some (.init (.aggregate 0 [.scalar sc₁, .scalar sc₂]))) :
+        get? s.frame.locals localId = some .uninit) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
@@ -21527,7 +21526,7 @@ example
     (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
     {bb : BasicBlockData} {localId : Local} {fieldIdx : Nat} {fieldTy : Ty}
     {target : BasicBlockIdx} {unwind : MirAst.UnwindAction}
-    {decl : MirAst.LocalDecl}
+    {decl : MirAst.LocalDecl} {sc₁ sc₂ : MirAst.ScalarInt}
     (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
     (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
     (hstmt_len : s.frame.stmtIdx = length bb.statements)
@@ -21535,17 +21534,27 @@ example
     (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
     (hfield : fieldIdx = 0 ∨ fieldIdx = 1)
     (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
-    (huninit : get? s.frame.locals localId = some .uninit) :
-    stepMirFn rootBody s = .fail .ub ∧
-    ∃ m' tf',
+    (hpair : get? s.frame.locals localId = some (.init (.aggregate 0 [.scalar sc₁, .scalar sc₂])))
+    (hNoUnion : placeTouchesUnion (activeMirBody rootBody s).localDecls
+      (activeMirBody rootBody s).layouts ⟨localId, [.field fieldIdx fieldTy]⟩ = false) :
+    let deinitPair : Value :=
+      if fieldIdx = 0 then .aggregate 0 [.uninit, .scalar sc₂]
+      else .aggregate 0 [.scalar sc₁, .uninit]
+    (∃ s',
+      stepMirFn rootBody s = .step s' ∧
+      s'.frame.blockIdx = target ∧
+      get? s'.frame.locals localId = some (.init deinitPair) ∧
+      readProjectedValue s'.frame.locals deinitPair [.field fieldIdx fieldTy] = .ub) ∧
+    ∃ m' tf' msc₁ msc₂ lay,
       Miri.Interpreter.Step.step
         (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m =
         (m', .ok true) ∧
       m'.stack.frames.back? = some tf' ∧
       tf'.location = .mir ⟨target, 0⟩ ∧
-      ∃ lay, tf'.locals[localId]? = some ⟨.live (.immediate .uninit), lay⟩ :=
-  step_terminator_drop_projected_uninit_divergence
-    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm huninit fnPtrs
+      tf'.locals[localId]? =
+        some ⟨.live (.immediate (.scalarPair (.fromScalarInt msc₁) (.fromScalarInt msc₂))), lay⟩ :=
+  step_terminator_drop_projected_init_no_glue_divergence
+    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm hpair hNoUnion fnPtrs
 
 example
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}

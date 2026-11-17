@@ -5853,10 +5853,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   statementOk_retag_proj
   evalStmt_retag_scalar_ub
   evalStmt_retag_scalar_noop
-  evalStmt_deinit_proj_keeps
+  evalStmt_deinit_proj_deinits
   paddedDeinitRead_not_inFragment
   paddedDeinitRead_translate
-  paddedDeinitRead_anneal_ret
+  paddedDeinitRead_anneal_ub
   paddedDeinitRead_minirust_ub
   paddedRetagRead_not_inFragment
   paddedRetagRead_translate
@@ -5898,7 +5898,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   paddedDeinitSiblingRetagReinit_anneal_ret
   paddedDeinitSiblingRetagReinit_minirust_ret_from_start
   paddedDeinitRetagHole_not_inFragmentD
-  paddedDeinitRetagHole_diverges
+  paddedDeinitRetagHole_both_ub
   deinitSiblingReinit_inFragmentD
   deinitSiblingReinit_minirust_ret_from_start
   deinitSiblingReinit_minirust_noUB
@@ -5943,10 +5943,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   paddedDeinitBinOpDivZero_minirust_ub_direct
   paddedDeinitHoleBinOp_not_inFragmentD
   paddedDeinitHoleBinOp_translate
-  paddedDeinitHoleBinOp_diverges
+  paddedDeinitHoleBinOp_both_ub
   paddedDeinitHoleCastRead_not_inFragmentD
   paddedDeinitHoleCastRead_translate
-  paddedDeinitHoleCastRead_diverges
+  paddedDeinitHoleCastRead_both_ub
   ctxPadded3_ok_u32_u32
   deinitSiblingBinOpWindowReinit_inFragmentD
   deinitSiblingBinOpWindowReinit_not_inFragment
