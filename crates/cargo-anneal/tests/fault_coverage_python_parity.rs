@@ -1680,6 +1680,58 @@ print(f"REAL_MIR_CENSUS_PARITY_OK {{len(cases)}}")
         "vacuous Obligations claim precondition",
         "differs from its generated form",
     );
+    // `[adv ep2-A2]` Guillemet-dot spoofing (`«spec.pre»`), guillemet-keyword (`«section»`)
+    // root-namespace hijack, unpinned spec-chain tampers below canonical claims (`defaultPre := False`,
+    // `sigPre := False`, `rustRequires := fun _ => False`, `defaultSpec` without `(priority := low)`),
+    // and tampered `externalSpecCallContract` `extraPost := (fun _ _ => False)` all fail closed!
+    tamper(
+        ob_calls_helper_path.clone(),
+        ob_calls_helper.replacen("pre := spec.pre, post := spec.post", "pre := «spec.pre», post := spec.post", 1),
+        "guillemet-dot «spec.pre» spoof in Obligations claim",
+        "guillemet",
+    );
+    tamper(
+        ob_calls_helper_path.clone(),
+        ob_calls_helper.replacen(
+            "def sigPre\n    (typeArgs : Trusted.MirAst.TypeSubst)\n    (args : List Value)\n    (mem : Memory) : Prop :=",
+            "def sigPre\n    (typeArgs : Trusted.MirAst.TypeSubst)\n    (args : List Value)\n    (mem : Memory) : Prop := False --",
+            1,
+        ),
+        "vacuous sigPre := False in Obligations",
+        "sigPre",
+    );
+    tamper(
+        ob_calls_helper_path.clone(),
+        ob_calls_helper.replacen(
+            "instance (priority := low) defaultSpec",
+            "instance defaultSpec",
+            1,
+        ),
+        "defaultSpec without (priority := low) in Obligations",
+        "defaultSpec",
+    );
+    tamper(
+        ob_calls_helper_path.clone(),
+        ob_calls_helper.replacen(
+            "pre args := And (rustRequires args) (extraPre args)",
+            "pre args := False",
+            1,
+        ),
+        "tampered refineSpec pre := False in Obligations",
+        "refineSpec",
+    );
+    let ob_ext_for_tamper = gen_dir.join("Obligations/CrateA/caller_with_external_specs.lean");
+    let ob_ext_orig_for_tamper = read(&ob_ext_for_tamper);
+    tamper(
+        ob_ext_for_tamper,
+        ob_ext_orig_for_tamper.replacen(
+            "(List.append args (List.cons ret List.nil)))",
+            "[])",
+            1,
+        ),
+        "externalSpecCallContract extraPost tampered",
+        "externalCallContract_",
+    );
     // Declarations outside `namespace Obligations.<Item>` can shadow the certificate type
     // that Lean resolves inside `namespace Verify.<Item>` (namespace prefixes win over `open`).
     tamper(

@@ -1515,6 +1515,98 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "declares a `StatefulEquivItemSpec`")
         ref_ws.unlink()
         write_manifest()
+
+        # `[adv ep2-A2]`: Guillemet-dot (`«spec.pre»`) and guillemet-keyword (`«section»` / `«end»`)
+        # spoofing, multi-segment `end helper.Sub` escape, unpinned spec-chain tampers below
+        # canonical claims (`defaultPre := False`, `sigPre := False`, `rustRequires := fun _ => False`,
+        # `defaultSpec` without `(priority := low)`), and vacuous `False` preconditions in `Specs`
+        # all fail closed.
+        ver_ws.write_text(ver_claim)
+        write_receipt()
+        for bad_ob_src, expected_sub in (
+            (
+                ob_nil.replace("pre := spec.pre", "pre := «spec.pre»"),
+                "guillemet",
+            ),
+            (
+                ob_nil.replace(
+                    "namespace Obligations.Demo.item_1\n",
+                    "namespace Obligations.Demo.item_1\ndef «section» : Nat := 0\nend Obligations.Demo.item_1\n"
+                    "def Verify.Demo.item_1.VerificationResult (_ : Prop) : Prop := True\n"
+                    "namespace Obligations.Demo.item_1\n",
+                ),
+                "guillemet",
+            ),
+            (
+                ob_nil.replace(
+                    "end Obligations.Demo.item_1",
+                    "def sigPre (args : List Value) : Prop := False\nend Obligations.Demo.item_1",
+                ),
+                "sigPre",
+            ),
+            (
+                ob_nil.replace(
+                    "end Obligations.Demo.item_1",
+                    "abbrev rustRequires : List Value → Prop := fun _ => False\nend Obligations.Demo.item_1",
+                ),
+                "rustRequires",
+            ),
+            (
+                ob_nil.replace(
+                    "end Obligations.Demo.item_1",
+                    "def defaultPre (args : List Value) : Prop := And (sigPre args) (And (rustRequires args) False)\n"
+                    "end Obligations.Demo.item_1",
+                ),
+                "defaultPre",
+            ),
+            (
+                ob_nil.replace(
+                    "instance (priority := low) defaultModularSpec",
+                    "instance defaultModularSpec",
+                ),
+                "defaultModularSpec",
+            ),
+            (
+                ob_nil.replace(
+                    "pre := spec.pre\n  post := spec.post",
+                    "pre := fun _ _ => False\n  post := spec.post",
+                ),
+                "defaultModularSpec",
+            ),
+        ):
+            ob_ws.write_text(bad_ob_src)
+            expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", expected_sub)
+        ob_ws.write_text(ob_nil)
+
+        # Partial multi-segment `end helper.Sub` escape in `Proof` fails closed.
+        proof_ws = ws_dir / "anneal/proofs/Proof/Demo/item_1.lean"
+        proof_ws.parent.mkdir(parents=True, exist_ok=True)
+        proof_ws.write_text(
+            "import Trusted\nnamespace Proof.Demo.item_1\nnamespace Sub\nend item_1.Sub\n"
+            "def other.hijack : Nat := 0\nend Proof.Demo\n"
+        )
+        ver_ws.write_text(ver_claim.replace("import Trusted\n", "import Trusted\nimport Proof.Demo.item_1\n"))
+        expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "partially closes")
+        proof_ws.unlink()
+        ver_ws.write_text(ver_claim)
+
+        # Vacuous `False` precondition in `Specs` (`where pre := fun _ => False` or `refineSpec (fun _ => False)`) fails closed.
+        specs_ws = ws_dir / "anneal/proofs/Specs/Demo/item_1.lean"
+        specs_ws.parent.mkdir(parents=True, exist_ok=True)
+        ver_ws.write_text(ver_claim.replace("import Trusted\n", "import Trusted\nimport Specs.Demo.item_1\n"))
+        for vacuous_spec in (
+            "import Trusted\nnamespace Specs.Demo.item_1\n"
+            "instance : ItemSpec \"demo::item_1\" where\n  pre := fun _ => False\n  post := fun _ _ => True\n"
+            "end Specs.Demo.item_1\n",
+            "import Trusted\nimport Obligations.Demo.item_1\nnamespace Specs.Demo.item_1\n"
+            "instance : ItemSpec \"demo::item_1\" :=\n  Obligations.Demo.item_1.refineSpec (fun _ => False) (fun _ _ => True)\n"
+            "end Specs.Demo.item_1\n",
+        ):
+            specs_ws.write_text(vacuous_spec)
+            expect_failure(lambda: runner.audit_fault_coverage(ws_dir), 1, "fault-coverage", "vacuous `False` precondition")
+        specs_ws.unlink()
+        ver_ws.write_text(ver_claim)
+
         shutil.rmtree(ws_dir)
         done("fault-site census, 12-class PropertyRegistry, source pins, 4+2 false-proof mutation probes, and --audit-fault-coverage")
     except BaseException as error:

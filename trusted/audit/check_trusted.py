@@ -5505,7 +5505,9 @@ def _is_lean_ident_continue(ch: str) -> bool:
     return ch.isalnum() or ch in ("_", "'", "!", "?")
 
 
-def _lex_dotted_ident(src: str, start: int) -> tuple[str, int]:
+def _lex_dotted_ident(
+    src: str, start: int, *, allow_any_guillemet: bool = False
+) -> tuple[str, int]:
     n = len(src)
     i = start
     parts: list[str] = []
@@ -5520,7 +5522,18 @@ def _lex_dotted_ident(src: str, start: int) -> tuple[str, int]:
                     "unterminated_guillemet_ident",
                     "unterminated or multi-line Lean guillemet identifier `«...»`",
                 )
-            parts.append(src[seg_start:i])
+            seg = src[seg_start:i]
+            if not allow_any_guillemet and (
+                not seg
+                or "." in seg
+                or any(c.isspace() for c in seg)
+                or seg in _LEAN_GUILLEMET_FORBIDDEN_SEGMENTS
+            ):
+                raise CensusScanError(
+                    "malformed_syntax",
+                    f"disallowed guillemet identifier segment `«{seg}»`",
+                )
+            parts.append(seg)
             i += 1
         else:
             seg_start = i
@@ -5700,7 +5713,9 @@ def _lex_interpolated_string(src: str, after_open_quote: int) -> tuple[str, int]
                         i = next_i
                         continue
                 if src[i] == "«":
-                    ident, next_i = _lex_dotted_ident(src, i)
+                    ident, next_i = _lex_dotted_ident(
+                        src, i, allow_any_guillemet=True
+                    )
                     out.append(f"«{ident}»")
                     i = next_i
                     continue
@@ -6031,7 +6046,27 @@ _LEAN_COMMAND_KEYWORDS: frozenset[str] = frozenset((
     "syntax",
     "notation",
     "elab",
+    "elab_rules",
     "deriving",
+    "initialize",
+    "builtin_initialize",
+))
+
+_LEAN_GUILLEMET_FORBIDDEN_SEGMENTS: frozenset[str] = _LEAN_COMMAND_KEYWORDS | frozenset((
+    "_root_",
+    "where",
+    "with",
+    "in",
+    "fun",
+    "forall",
+    "match",
+    "let",
+    "have",
+    "by",
+    "do",
+    "if",
+    "then",
+    "else",
 ))
 
 
@@ -9908,23 +9943,32 @@ def _check_module_scope_confinement(
     allow_nested: bool = False,
     allow_sections: bool = False,
 ) -> None:
-    """`[adv ep2-B2]` Confine every declaration of an audited workspace module to its own
-    namespace.
+    """`[adv ep2-B2]` / `[adv ep2-A2]` Confine every declaration of an audited workspace
+    module to its own namespace using Lean 4's exact multi-segment scope stack.
 
     Lean resolves an identifier inside `namespace N` by trying every prefix of `N` BEFORE
-    any `open`ed namespace, so a declaration named e.g. `Verify.<Item>.VerificationResult`
-    or `Verify.Obligations.<Item>.claim` in ANY module imported by `Verify/<Item>.lean`
-    (its `Specs`, `Proof`, `Assumptions`, `Obligations`, or `Mir` cone) silently replaces
-    the canonical certificate statement while every token of `Verify/<Item>.lean` still
-    looks canonical. Require the first namespace to be exactly `own_ns` (child namespaces
-    only when `allow_nested`), every declaration to appear inside it, no `_root_`-qualified
-    declaration or namespace, and no `export` aliasing.
+    any `open`ed namespace, and `namespace A.B` / `end A.B` push/pop multiple scope frames
+    at once. Track each individual namespace/section/mutual frame so multi-segment `end`
+    commands cannot pop out of `own_ns` into a parent prefix (`Proof.Demo` or `_root_`),
+    require every declaration to sit at `own_ns` (or `own_ns.<child>` when `allow_nested`),
+    and reject `_root_` escapes, dotted declarations when `not allow_nested`, and `export`.
     """
     stack: list[tuple[str, str | None]] = []
     n = len(tokens)
-    for idx in _top_level_token_indices(tokens):
+    top = _top_level_token_indices(tokens)
+
+    def active_ns() -> str:
+        return ".".join(seg for kind, seg in stack if kind == "namespace" and seg is not None)
+
+    def ns_allowed(ns: str) -> bool:
+        return ns == own_ns or (allow_nested and ns.startswith(own_ns + "."))
+
+    pos = 0
+    while pos < len(top):
+        idx = top[pos]
         tk, val = tokens[idx]
         if tk != "Ident":
+            pos += 1
             continue
         nxt = tokens[idx + 1] if idx + 1 < n else None
         nxt_name = (
@@ -9941,56 +9985,105 @@ def _check_module_scope_confinement(
                 raise Failure(
                     1, FAULT_COVERAGE_PHASE, f"`namespace` without a name in {label}"
                 )
-            if "_root_" in nxt_name.split("."):
+            segs = nxt_name.split(".")
+            if "_root_" in segs or any(not s for s in segs):
                 raise Failure(
                     1,
                     FAULT_COVERAGE_PHASE,
                     f"`namespace {nxt_name}` escapes the module namespace via `_root_` in {label}",
                 )
-            inside = any(kind == "namespace" for kind, _ in stack)
-            if not inside:
-                if nxt_name != own_ns and not (
-                    allow_nested and nxt_name.startswith(own_ns + ".")
-                ):
-                    raise Failure(
-                        1,
-                        FAULT_COVERAGE_PHASE,
-                        f"`namespace {nxt_name}` in {label} escapes its own namespace `{own_ns}`",
-                    )
-            elif not allow_nested:
+            had_ns = any(kind == "namespace" for kind, _ in stack)
+            if had_ns and not allow_nested:
                 raise Failure(
                     1,
                     FAULT_COVERAGE_PHASE,
                     f"nested `namespace {nxt_name}` is not allowed in {label}",
                 )
-            stack.append(("namespace", nxt_name))
-        elif val == "section":
+            for seg in segs:
+                stack.append(("namespace", seg))
+            cur = active_ns()
+            if not ns_allowed(cur):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`namespace {nxt_name}` in {label} escapes its own namespace `{own_ns}`",
+                )
+            pos += 2 if pos + 1 < len(top) and top[pos + 1] == idx + 1 else 1
+            continue
+        if val == "section":
             if not allow_sections:
                 raise Failure(
                     1, FAULT_COVERAGE_PHASE, f"unexpected `section` command in {label}"
                 )
-            stack.append(("section", nxt_name))
-        elif val == "mutual":
-            stack.append(("mutual", None))
-        elif val == "end":
-            if not stack:
+            if nxt_name is not None:
+                segs = nxt_name.split(".")
+                if "_root_" in segs or any(not s for s in segs):
+                    raise Failure(
+                        1, FAULT_COVERAGE_PHASE, f"invalid `section {nxt_name}` in {label}"
+                    )
+                for seg in segs:
+                    stack.append(("section", seg))
+                pos += 2 if pos + 1 < len(top) and top[pos + 1] == idx + 1 else 1
+            else:
+                stack.append(("section", None))
+                pos += 1
+            continue
+        if val == "mutual":
+            if not allow_sections:
                 raise Failure(
-                    1, FAULT_COVERAGE_PHASE, f"unmatched `end` in {label}"
+                    1, FAULT_COVERAGE_PHASE, f"disallowed top-level `mutual` command in {label}"
                 )
-            stack.pop()
-        elif val in _DECL_COMMAND_KWS:
-            if not any(kind == "namespace" for kind, _ in stack):
+            stack.append(("mutual", None))
+            pos += 1
+            continue
+        if val == "end":
+            if nxt_name is None:
+                if not stack or stack[-1][0] not in ("section", "mutual") or stack[-1][1] is not None:
+                    raise Failure(
+                        1, FAULT_COVERAGE_PHASE, f"unmatched or unnamed `end` in {label}"
+                    )
+                stack.pop()
+                pos += 1
+            else:
+                for seg in reversed(nxt_name.split(".")):
+                    if not stack or stack[-1][0] not in ("namespace", "section") or stack[-1][1] != seg:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"mismatched `end {nxt_name}` in {label} (expected `{own_ns}`)",
+                        )
+                    stack.pop()
+                pos += 2 if pos + 1 < len(top) and top[pos + 1] == idx + 1 else 1
+            cur = active_ns()
+            if cur and not ns_allowed(cur):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"`end {nxt_name or ''}` in {label} partially closes `{own_ns}` into `{cur}`",
+                )
+            continue
+        if val in _DECL_COMMAND_KWS:
+            cur = active_ns()
+            if not cur or not ns_allowed(cur):
                 raise Failure(
                     1,
                     FAULT_COVERAGE_PHASE,
                     f"`{val}` declaration outside `namespace {own_ns}` in {label}",
                 )
-            if nxt_name is not None and nxt_name.split(".")[0] == "_root_":
-                raise Failure(
-                    1,
-                    FAULT_COVERAGE_PHASE,
-                    f"`{val} {nxt_name}` escapes the module namespace via `_root_` in {label}",
-                )
+            if nxt_name is not None:
+                if "_root_" in nxt_name.split("."):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`{val} {nxt_name}` escapes the module namespace via `_root_` in {label}",
+                    )
+                if not allow_nested and "." in nxt_name:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"qualified `{val} {nxt_name}` shadows or escapes the module namespace in {label}",
+                    )
+        pos += 1
     if stack:
         raise Failure(
             1, FAULT_COVERAGE_PHASE, f"unclosed `{stack[-1][0]}` scope in {label}"
@@ -10084,9 +10177,40 @@ _OB_CANONICAL_CLAIM_NAMES: frozenset[str] = frozenset((
 
 _OB_RESERVED_HELPER_DEFS: frozenset[str] = frozenset((
     "defaultCallContract",
+    "defaultSpecCallees",
+    "defaultPre",
+    "defaultPost",
+    "defaultPreFor",
+    "defaultPostFor",
+    "rustRequires",
+    "rustEnsures",
+    "sigPre",
+    "sigPost",
+    "artifactIdentity",
     "polyCertificate",
+    "refineSpec",
+    "refineStatefulSpec",
+    "refineSafeSpec",
+    "refineSafeStatefulSpec",
+    "refineTotalSpec",
     "refineEquivSpec",
     "refineModularSpec",
+    "refineUbExceptionSpec",
+))
+
+_OB_DEFAULT_SPEC_INSTANCE_NAMES: frozenset[str] = frozenset((
+    "defaultSpec",
+    "defaultStatefulSpec",
+    "defaultTotalSpec",
+    "defaultModularSpec",
+    "defaultUbExceptionSpec",
+))
+
+_OB_ALL_SPEC_INSTANCE_NAMES: frozenset[str] = _OB_DEFAULT_SPEC_INSTANCE_NAMES | frozenset((
+    "rustSafeTotalSpec",
+    "rustSafeTotalStatefulSpec",
+    "rustEquivSpec",
+    "legacySpec",
 ))
 
 _CLAIM_EXPECTED_SPEC_CLASS: dict[str, str] = {
@@ -10125,6 +10249,11 @@ _VERIFY_DISALLOWED_TOP_LEVEL: frozenset[str] = frozenset((
     "prefix",
     "postfix",
     "elab",
+    "elab_rules",
+    "deriving",
+    "initialize",
+    "builtin_initialize",
+    "mutual",
     "local",
     "scoped",
     "attribute",
@@ -10154,6 +10283,11 @@ _OB_DISALLOWED_TOP_LEVEL: frozenset[str] = frozenset((
     "prefix",
     "postfix",
     "elab",
+    "elab_rules",
+    "deriving",
+    "initialize",
+    "builtin_initialize",
+    "mutual",
     "local",
     "scoped",
     "attribute",
@@ -10614,22 +10748,135 @@ _OB_CANONICAL_DEF_TEMPLATES: dict[str, tuple[str, ...]] = {
         'def polyCertificate (P : Prop) : CrateClaim where crateName := "{DID}" mirDialect := '
         '"V2026_06_01" items := [{ identity := artifactIdentity, certificate := P }]',
     ),
+    "sigPre": (
+        "def sigPre (typeArgs : Trusted.MirAst.TypeSubst) (args : List Value) (mem : Memory) : Prop := "
+        "And (defaultPreFor typeArgs args) (Trusted.VerificationResult.argsMatchSignature "
+        "(Mir.{S}.body.instantiate typeArgs) args mem)",
+    ),
+    "sigPost": (
+        "def sigPost (typeArgs : Trusted.MirAst.TypeSubst) (args : List Value) (ret : Value) "
+        "(mem : Memory) : Prop := And (defaultPostFor typeArgs args ret) "
+        "(Trusted.VerificationResult.retMatchesSignature (Mir.{S}.body.instantiate typeArgs) ret mem)",
+    ),
+    "refineSpec": (
+        'def refineSpec (extraPre : List Value → Prop) (extraPost : List Value → Value → Prop) : '
+        'ItemSpec "{DID}" where pre args := And (rustRequires args) (extraPre args) '
+        "post args ret := And (rustEnsures args ret) (extraPost args ret)",
+    ),
+    "refineStatefulSpec": (
+        "def refineStatefulSpec (extraPre : List Value → Memory → Prop) "
+        "(extraPost : List Value → Memory → Value → Memory → Prop) : "
+        'StatefulItemSpec "{DID}" where pre args m := And (rustRequires args) (extraPre args m) '
+        "post args m0 ret m1 := And (rustEnsures args ret) (extraPost args m0 ret m1)",
+    ),
+    "refineSafeSpec": (
+        "def refineSafeSpec (safetyDomain : List Value → Prop) (extraPre : List Value → Prop) "
+        '(extraPost : List Value → Value → Prop) : ItemSpec "{DID}" where '
+        "pre args := safetyDomain args post args ret := And (rustRequires args) (extraPre args) → "
+        "And (rustEnsures args ret) (extraPost args ret)",
+    ),
+    "refineSafeStatefulSpec": (
+        "def refineSafeStatefulSpec (safetyDomain : List Value → Memory → Prop) "
+        "(extraPre : List Value → Memory → Prop) "
+        "(extraPost : List Value → Memory → Value → Memory → Prop) : "
+        'StatefulItemSpec "{DID}" where pre args m := safetyDomain args m '
+        "post args m0 ret m1 := And (rustRequires args) (extraPre args m0) → "
+        "And (rustEnsures args ret) (extraPost args m0 ret m1)",
+    ),
+    "refineTotalSpec": (
+        "def refineTotalSpec (extraPre : List Value → Memory → Prop) "
+        "(extraPost : List Value → Memory → Value → Memory → Prop) : "
+        'TotalItemSpec "{DID}" where pre args m := And (rustRequires args) (extraPre args m) '
+        "post args m0 ret m1 := And (rustEnsures args ret) (extraPost args m0 ret m1)",
+    ),
+    "refineEquivSpec": (
+        "def refineEquivSpec (specBody : CapturedMir) (extraPre : List Value → Memory → Prop) "
+        "(extraPost : List Value → Memory → Value → Memory → Prop) : "
+        'StatefulEquivItemSpec "{DID}" where specBody := specBody '
+        "pre args m := And (rustRequires args) (extraPre args m) "
+        "post args m0 ret m1 := And (rustEnsures args ret) (extraPost args m0 ret m1)",
+    ),
+    "refineModularSpec": (
+        "def refineModularSpec (envAssumed : ExternalCallHandler → Prop) "
+        "(extraPre : List Value → Memory → Prop) "
+        "(extraPost : List Value → Memory → Value → Memory → Prop) : "
+        'ModularItemSpec "{DID}" where envAssumed := envAssumed '
+        "pre args m := And (rustRequires args) (extraPre args m) "
+        "post args m0 ret m1 := And (rustEnsures args ret) (extraPost args m0 ret m1)",
+    ),
+    "refineUbExceptionSpec": (
+        "def refineUbExceptionSpec (strictSafetyPre : List Value → Memory → Prop) "
+        "(extraPre : List Value → Memory → Prop) "
+        "(extraPost : List Value → Memory → Value → Memory → Prop) : "
+        'UbExceptionItemSpec "{DID}" where pre args m := And (rustRequires args) (extraPre args m) '
+        "strictSafetyPre := strictSafetyPre "
+        "post args m0 ret m1 := And (rustEnsures args ret) (extraPost args m0 ret m1)",
+    ),
+}
+
+_OB_SPEC_INSTANCE_TEMPLATES: dict[str, tuple[str, ...]] = {
+    "defaultSpec": (
+        'instance (priority := low) defaultSpec : ItemSpec "{DID}" where '
+        "pre := defaultPre post := defaultPost",
+        'instance (priority := low) defaultSpec : ItemSpec "{DID}" where '
+        "pre := fun args => And (defaultPre args) "
+        "(Trusted.VerificationResult.argsMatchCalleeParamTys Mir.{S}.body args) "
+        "post := defaultPost",
+    ),
+    "defaultStatefulSpec": (
+        'instance (priority := low) defaultStatefulSpec : StatefulItemSpec "{DID}" where '
+        "pre := fun args mem => sigPre List.nil args mem "
+        "post := fun args _ ret mem => sigPost List.nil args ret mem",
+    ),
+    "defaultTotalSpec": (
+        'instance (priority := low) defaultTotalSpec : TotalItemSpec "{DID}" where '
+        "pre := fun args mem => And (And (defaultPre args) "
+        "(mem = (initMachineState Mir.{S}.body args).memory)) "
+        "(Trusted.VerificationResult.argsMatchSignature (Mir.{S}.body.instantiate List.nil) args mem) "
+        "post := fun args _ ret _ => defaultPost args ret",
+    ),
+    "defaultUbExceptionSpec": (
+        'instance (priority := low) defaultUbExceptionSpec : UbExceptionItemSpec "{DID}" where '
+        "pre := fun args mem => sigPre List.nil args mem "
+        "strictSafetyPre := fun _ _ => False "
+        "post := fun args _ ret mem => sigPost List.nil args ret mem",
+    ),
+    "rustSafeTotalSpec": (
+        'instance rustSafeTotalSpec : ItemSpec "{DID}" := refineSafeSpec '
+        "(fun args => Trusted.Sequence.length args = Mir.{S}.body.argCount) "
+        "(fun _ => True) (fun _ _ => True)",
+        'instance (priority := low) rustSafeTotalSpec : ItemSpec "{DID}" := refineSafeSpec '
+        "(fun args => Trusted.Sequence.length args = Mir.{S}.body.argCount) "
+        "(fun _ => True) (fun _ _ => True)",
+    ),
+    "rustSafeTotalStatefulSpec": (
+        'instance rustSafeTotalStatefulSpec : StatefulItemSpec "{DID}" := refineSafeStatefulSpec '
+        "(fun args _ => Trusted.Sequence.length args = Mir.{S}.body.argCount) "
+        "(fun _ _ => True) (fun _ _ _ _ => True)",
+        'instance (priority := low) rustSafeTotalStatefulSpec : StatefulItemSpec "{DID}" := refineSafeStatefulSpec '
+        "(fun args _ => Trusted.Sequence.length args = Mir.{S}.body.argCount) "
+        "(fun _ _ => True) (fun _ _ _ _ => True)",
+    ),
+    "legacySpec": (
+        'instance legacySpec : ItemSpec "{DID}" where '
+        "pre := Specs.{S}.pre post := Specs.{S}.post",
+        'instance (priority := low) legacySpec : ItemSpec "{DID}" where '
+        "pre := Specs.{S}.pre post := Specs.{S}.post",
+    ),
 }
 
 _OB_TEMPLATE_DID = "__ANNEAL_TEMPLATE_DEF_PATH__"
 _OB_TEMPLATE_SHA = "__ANNEAL_TEMPLATE_MIR_SHA256__"
 
 
-def _check_canonical_obligation_def(
-    name: str,
+def _matches_obligation_template(
+    templates: tuple[str, ...],
     cmd_tokens: list[tuple[str, Any]],
     suffix: str,
     expected_def_path: str | None,
     expected_mir_sha256: str | None,
-    label: str,
-) -> None:
-    """`[adv ep2-B2]` Require `def <name>` to equal one of its generated templates."""
-    for template in _OB_CANONICAL_DEF_TEMPLATES[name]:
+) -> bool:
+    for template in templates:
         text = (
             template.replace("{S}", suffix)
             .replace("{DID}", _OB_TEMPLATE_DID)
@@ -10655,13 +10902,264 @@ def _check_canonical_obligation_def(
             if not ok:
                 break
         if ok:
-            return
+            return True
+    return False
+
+
+def _check_canonical_obligation_def(
+    name: str,
+    cmd_tokens: list[tuple[str, Any]],
+    suffix: str,
+    expected_def_path: str | None,
+    expected_mir_sha256: str | None,
+    label: str,
+) -> None:
+    """`[adv ep2-B2]` / `[adv ep2-A2]` Require `def <name>` to equal one of its generated templates."""
+    if _matches_obligation_template(
+        _OB_CANONICAL_DEF_TEMPLATES[name],
+        cmd_tokens,
+        suffix,
+        expected_def_path,
+        expected_mir_sha256,
+    ):
+        return
     raise Failure(
         1,
         FAULT_COVERAGE_PHASE,
         f"canonical `def {name}` in {label} differs from its generated form (claims must bind exactly "
         f"`Mir.{suffix}.body`, the spec's `pre`/`post`, and `defaultCallees`)",
     )
+
+
+def _check_canonical_obligation_instance(
+    name: str,
+    cmd_tokens: list[tuple[str, Any]],
+    suffix: str,
+    expected_def_path: str | None,
+    label: str,
+) -> None:
+    """`[adv ep2-A2]` Require `instance <name>` in `Obligations` to equal one of its generated templates."""
+    if _matches_obligation_template(
+        _OB_SPEC_INSTANCE_TEMPLATES[name],
+        cmd_tokens,
+        suffix,
+        expected_def_path,
+        None,
+    ):
+        return
+    raise Failure(
+        1,
+        FAULT_COVERAGE_PHASE,
+        f"canonical `instance {name}` in {label} differs from its generated form",
+    )
+
+
+def _validate_companion_predicate_clause(
+    clause: list[tuple[str, Any]],
+    *,
+    is_post: bool,
+    is_poly: bool,
+    suffix: str,
+    imported_mir: list[str],
+    label: str,
+    context: str,
+) -> list[str]:
+    """`[adv ep2-A2]` Validate an `And`-tree of lowered `#[spec]` / `#[external_spec]`
+    companion predicate clauses (`defaultPre`, `defaultPost`, `defaultPreFor`, `defaultPostFor`),
+    rejecting `False` or arbitrary predicates and returning referenced companion suffixes."""
+    clause = _strip_enclosing_parens_tokens(clause)
+    if not clause:
+        raise Failure(1, FAULT_COVERAGE_PHASE, f"empty `{context}` clause in {label}")
+    if clause == [("Ident", "True")]:
+        return []
+    if clause[0] == ("Ident", "And"):
+        args2 = _take_exact_n_balanced_args(clause[1:], 2)
+        if args2 is None:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"malformed `And` clause in `{context}` of {label}",
+            )
+        lhs = _strip_enclosing_parens_tokens(args2[0])
+        rhs = _strip_enclosing_parens_tokens(args2[1])
+        if lhs == [("Ident", "True")] or rhs == [("Ident", "True")]:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"unsimplified `True` conjunct in `{context}` of {label}",
+            )
+        return _validate_companion_predicate_clause(
+            lhs,
+            is_post=is_post,
+            is_poly=is_poly,
+            suffix=suffix,
+            imported_mir=imported_mir,
+            label=label,
+            context=context,
+        ) + _validate_companion_predicate_clause(
+            rhs,
+            is_post=is_post,
+            is_poly=is_poly,
+            suffix=suffix,
+            imported_mir=imported_mir,
+            label=label,
+            context=context,
+        )
+    if not is_post:
+        len_mono = tokenize_lean_source(
+            f"Trusted.Sequence.length args = Mir.{suffix}.body.argCount"
+        )
+        len_poly = tokenize_lean_source(
+            f"Trusted.Sequence.length args = (Mir.{suffix}.body.instantiate typeArgs).argCount"
+        )
+        if clause == (len_poly if is_poly else len_mono):
+            return []
+    expected_args = (
+        tokenize_lean_source("(List.append args (List.cons ret List.nil))")
+        if is_post
+        else [("Ident", "args")]
+    )
+    head = str(clause[0][1]) if clause[0][0] == "Ident" else ""
+    short_head = _strip_verification_result_qual(head)
+    if short_head == "MirBoolPredicateHolds":
+        args_pred = _take_exact_n_balanced_args(clause[1:], 2)
+        if args_pred is None or args_pred[1] != expected_args:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"malformed `MirBoolPredicateHolds` in `{context}` of {label}",
+            )
+        body_arg = args_pred[0]
+    elif short_head == "MirBoolPredicateHoldsWithCallees":
+        args_pred = _take_exact_n_balanced_args(clause[1:], 3)
+        if (
+            args_pred is None
+            or args_pred[1] != [("Ident", "defaultSpecCallees")]
+            or args_pred[2] != expected_args
+        ):
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"malformed `MirBoolPredicateHoldsWithCallees` in `{context}` of {label}",
+            )
+        body_arg = args_pred[0]
+    else:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"canonical `def {context}` in {label} differs from its generated form",
+        )
+    body_stripped = _strip_enclosing_parens_tokens(body_arg)
+    comp_suf = ""
+    if not is_poly and len(body_stripped) == 1 and body_stripped[0][0] == "Ident":
+        b_s = str(body_stripped[0][1])
+        if b_s.startswith("Mir.") and b_s.endswith(".body"):
+            comp_suf = b_s[len("Mir.") : -len(".body")]
+    elif (
+        is_poly
+        and len(body_stripped) == 2
+        and body_stripped[0][0] == "Ident"
+        and body_stripped[1] == ("Ident", "typeArgs")
+    ):
+        b_s = str(body_stripped[0][1])
+        if b_s.startswith("Mir.") and b_s.endswith(".body.instantiate"):
+            comp_suf = b_s[len("Mir.") : -len(".body.instantiate")]
+    if not comp_suf or comp_suf == suffix or comp_suf not in imported_mir:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"`def {context}` in {label} references unimported or invalid companion `Mir.{comp_suf}.body`",
+        )
+    req_marker = "__anodized_fn_ensures_" if is_post else "__anodized_fn_requires_"
+    if req_marker not in comp_suf:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"`def {context}` in {label} references non-companion `Mir.{comp_suf}.body`",
+        )
+    return [comp_suf]
+
+
+def _validate_default_pre_post_def(
+    name: str,
+    cmd_tokens: list[tuple[str, Any]],
+    suffix: str,
+    imported_mir: list[str],
+    label: str,
+) -> list[str]:
+    header_map = {
+        "defaultPre": "def defaultPre (args : List Value) : Prop :=",
+        "defaultPost": "def defaultPost (args : List Value) (ret : Value) : Prop :=",
+        "defaultPreFor": "def defaultPreFor (typeArgs : Trusted.MirAst.TypeSubst) (args : List Value) : Prop :=",
+        "defaultPostFor": "def defaultPostFor (typeArgs : Trusted.MirAst.TypeSubst) (args : List Value) (ret : Value) : Prop :=",
+    }
+    expected_hdr = tokenize_lean_source(header_map[name])
+    if len(cmd_tokens) <= len(expected_hdr) or cmd_tokens[: len(expected_hdr)] != expected_hdr:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"canonical `def {name}` in {label} differs from its generated form",
+        )
+    rhs = cmd_tokens[len(expected_hdr) :]
+    return _validate_companion_predicate_clause(
+        rhs,
+        is_post=name in ("defaultPost", "defaultPostFor"),
+        is_poly=name in ("defaultPreFor", "defaultPostFor"),
+        suffix=suffix,
+        imported_mir=imported_mir,
+        label=label,
+        context=name,
+    )
+
+
+def _validate_external_spec_extra_clause(
+    arg_tokens: list[tuple[str, Any]],
+    *,
+    is_post: bool,
+    sidecar_suf: str,
+    imported_mir: list[str],
+    label: str,
+    def_name: str,
+) -> str | None:
+    """`[adv ep2-A2]` Validate `<extraPre>` / `<extraPost>` in `externalSpecCallContract`."""
+    stripped = _strip_enclosing_parens_tokens(arg_tokens)
+    if not is_post and stripped in (
+        tokenize_lean_source("fun _ => True"),
+        tokenize_lean_source("fun args => True"),
+    ):
+        return None
+    if is_post and stripped in (
+        tokenize_lean_source("fun _ _ => True"),
+        tokenize_lean_source("fun args ret => True"),
+    ):
+        return None
+    prefix = (
+        tokenize_lean_source("fun args ret =>")
+        if is_post
+        else tokenize_lean_source("fun args =>")
+    )
+    if len(stripped) <= len(prefix) or stripped[: len(prefix)] != prefix:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"`externalSpecCallContract` `{def_name}` in {label} has non-canonical `{'extraPost' if is_post else 'extraPre'}`",
+        )
+    comps = _validate_companion_predicate_clause(
+        stripped[len(prefix) :],
+        is_post=is_post,
+        is_poly=False,
+        suffix=sidecar_suf,
+        imported_mir=imported_mir,
+        label=label,
+        context=def_name,
+    )
+    if len(comps) != 1:
+        raise Failure(
+            1,
+            FAULT_COVERAGE_PHASE,
+            f"`externalSpecCallContract` `{def_name}` in {label} must reference at most one companion predicate",
+        )
+    return comps[0]
 
 
 def _scan_obligations_module(
@@ -10751,6 +11249,12 @@ def _scan_obligations_module(
 
     claim_defs: dict[str, list[tuple[str, Any]]] = {}
     canonical_def_cmds: dict[str, list[tuple[str, Any]]] = {}
+    default_pre_post_cmds: dict[str, list[tuple[str, Any]]] = {}
+    declared_spec_instances: set[str] = set()
+    declared_abbrevs: set[str] = set()
+    default_modular_uses_default_pre_post = False
+    referenced_companion_mir_suffixes: set[str] = set()
+    default_spec_callee_suffixes: list[str] = []
     claim_sigs: dict[str, list[tuple[str, Any]]] = {}
     helper_cmds: dict[str, list[tuple[str, Any]]] = {}
     linked_ext_positions: set[int] = set()
@@ -10781,7 +11285,8 @@ def _scan_obligations_module(
                 if (
                     next_name in _OB_CANONICAL_CLAIM_NAMES
                     or next_name in _OB_RESERVED_HELPER_DEFS
-                    or next_name in ("defaultModularSpec", "externalSpecCallContract")
+                    or next_name in _OB_ALL_SPEC_INSTANCE_NAMES
+                    or next_name == "externalSpecCallContract"
                 ):
                     raise Failure(
                         1,
@@ -10793,9 +11298,9 @@ def _scan_obligations_module(
                 nm = str(tokens[idx + 1][1])
                 if (
                     nm in _OB_CANONICAL_CLAIM_NAMES
-                    or nm in _OB_RESERVED_HELPER_DEFS
+                    or (nm in _OB_RESERVED_HELPER_DEFS and not (val == "abbrev" and nm in ("rustRequires", "rustEnsures")))
                     or nm == "externalSpecCallContract"
-                    or (val != "instance" and nm == "defaultModularSpec")
+                    or (val != "instance" and nm in _OB_ALL_SPEC_INSTANCE_NAMES)
                 ):
                     raise Failure(
                         1,
@@ -10815,7 +11320,43 @@ def _scan_obligations_module(
                 elif t_h in ("RParen", "RBrace", "RBracket"):
                     h_depth = max(0, h_depth - 1)
             header = cmd_slice[:header_end]
-            if any((t_h, v_h) == ("Ident", "legacySpec") for t_h, v_h in header):
+            inst_name = next(
+                (
+                    str(v_h)
+                    for t_h, v_h in header
+                    if t_h == "Ident" and str(v_h) in _OB_ALL_SPEC_INSTANCE_NAMES
+                ),
+                None,
+            )
+            if inst_name is not None:
+                if inst_name in declared_spec_instances:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"duplicate `instance {inst_name}` in {ob_label}",
+                    )
+                declared_spec_instances.add(inst_name)
+                if inst_name in _OB_DEFAULT_SPEC_INSTANCE_NAMES:
+                    prio_low = [
+                        ("LParen", "("),
+                        ("Ident", "priority"),
+                        ("ColonEq", ":="),
+                        ("Ident", "low"),
+                        ("RParen", ")"),
+                    ]
+                    if not any(
+                        header[p : p + 5] == prio_low for p in range(max(0, len(header) - 4))
+                    ):
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"`instance {inst_name}` in {ob_label} must carry `(priority := low)`",
+                        )
+                if inst_name in _OB_SPEC_INSTANCE_TEMPLATES:
+                    _check_canonical_obligation_instance(
+                        inst_name, cmd_slice, suffix, expected_def_path, ob_label
+                    )
+            if inst_name == "legacySpec":
                 has_legacy_spec_override = True
             spec_cls_opt: tuple[str, str | None] | None = None
             for h_pos, (t_h, v_h) in enumerate(header):
@@ -10831,20 +11372,7 @@ def _scan_obligations_module(
                         break
             if spec_cls_opt is not None:
                 cls_name, did_opt = spec_cls_opt
-                allowed_inst_names = {
-                    "defaultSpec",
-                    "defaultStatefulSpec",
-                    "defaultTotalSpec",
-                    "defaultModularSpec",
-                    "defaultUbExceptionSpec",
-                    "rustSafeTotalSpec",
-                    "rustSafeTotalStatefulSpec",
-                    "rustEquivSpec",
-                    "legacySpec",
-                }
-                if not any(
-                    t_h == "Ident" and str(v_h) in allowed_inst_names for t_h, v_h in header
-                ):
+                if inst_name is None:
                     raise Failure(
                         1,
                         FAULT_COVERAGE_PHASE,
@@ -10862,9 +11390,9 @@ def _scan_obligations_module(
                         FAULT_COVERAGE_PHASE,
                         f"`{cls_name}` instance in {ob_label} binds `{did_opt}` instead of `{expected_def_path}`",
                     )
-            is_default_modular = any(
-                (t_h, v_h) == ("Ident", "defaultModularSpec") for t_h, v_h in header
-            ) or (spec_cls_opt is not None and spec_cls_opt[0] == "ModularItemSpec")
+            is_default_modular = inst_name == "defaultModularSpec" or (
+                spec_cls_opt is not None and spec_cls_opt[0] == "ModularItemSpec"
+            )
             if is_default_modular:
                 default_modular_spec_count += 1
                 if default_modular_spec_count > 1:
@@ -10886,53 +11414,80 @@ def _scan_obligations_module(
                         FAULT_COVERAGE_PHASE,
                         f"nested `where` clause is forbidden inside `defaultModularSpec` in {ob_label}",
                     )
-                env_count = 0
+                mod_fields: dict[str, list[tuple[str, Any]]] = {}
                 b_idx = 0
-                b_depth = 0
                 while b_idx < len(body_tokens):
                     t_b, v_b = body_tokens[b_idx]
-                    if b_depth == 0 and (t_b, v_b) == ("Ident", "envAssumed"):
-                        env_count += 1
-                        if b_idx + 1 >= len(body_tokens) or body_tokens[b_idx + 1][0] != "ColonEq":
-                            raise Failure(
-                                1,
-                                FAULT_COVERAGE_PHASE,
-                                f"`defaultModularSpec.envAssumed` in {ob_label} must use `envAssumed := ...` without binders",
-                            )
-                        rhs_start = idx + header_end + 1 + b_idx + 2
-                        rhs_end = find_field_rhs_end(rhs_start)
-                        scan_k = rhs_start
-                        scan_d = 0
-                        while scan_k < rhs_end:
-                            tk_s, val_s = tokens[scan_k]
-                            if (
-                                scan_d == 0
-                                and scan_k > rhs_start
-                                and tk_s == "Ident"
-                                and val_s in ("pre", "post", "envAssumed")
-                            ):
-                                rhs_end = scan_k
-                                break
-                            if tk_s in ("LParen", "LBrace", "LBracket"):
-                                scan_d += 1
-                            elif tk_s in ("RParen", "RBrace", "RBracket"):
-                                scan_d = max(0, scan_d - 1)
-                            scan_k += 1
-                        for st in _parse_env_assumed_holds_on_stems(
-                            tokens[rhs_start:rhs_end], ob_label
+                    if t_b != "Ident" or v_b not in ("envAssumed", "pre", "post"):
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"unexpected token {body_tokens[b_idx]!r} in `defaultModularSpec` of {ob_label}",
+                        )
+                    fname_m = str(v_b)
+                    if fname_m in mod_fields:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"duplicate `{fname_m}` field in `defaultModularSpec` of {ob_label}",
+                        )
+                    if b_idx + 1 >= len(body_tokens) or body_tokens[b_idx + 1][0] != "ColonEq":
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"`defaultModularSpec.{fname_m}` in {ob_label} must use `{fname_m} := ...` without binders",
+                        )
+                    rhs_s = b_idx + 2
+                    scan_k = rhs_s
+                    scan_d = 0
+                    while scan_k < len(body_tokens):
+                        tk_s, val_s = body_tokens[scan_k]
+                        if (
+                            scan_d == 0
+                            and scan_k > rhs_s
+                            and tk_s == "Ident"
+                            and val_s in ("pre", "post", "envAssumed")
                         ):
-                            if st not in raw_holds_on_stems:
-                                raw_holds_on_stems.append(st)
-                    if t_b in ("LParen", "LBrace", "LBracket"):
-                        b_depth += 1
-                    elif t_b in ("RParen", "RBrace", "RBracket"):
-                        b_depth = max(0, b_depth - 1)
-                    b_idx += 1
-                if env_count != 1:
+                            break
+                        if tk_s in ("LParen", "LBrace", "LBracket"):
+                            scan_d += 1
+                        elif tk_s in ("RParen", "RBrace", "RBracket"):
+                            scan_d = max(0, scan_d - 1)
+                        scan_k += 1
+                    mod_fields[fname_m] = body_tokens[rhs_s:scan_k]
+                    b_idx = scan_k
+                if set(mod_fields) != {"envAssumed", "pre", "post"}:
                     raise Failure(
                         1,
                         FAULT_COVERAGE_PHASE,
-                        f"`defaultModularSpec` in {ob_label} must bind `envAssumed :=` once (found {env_count})",
+                        f"`defaultModularSpec` in {ob_label} must bind exactly `envAssumed`, `pre`, and `post`",
+                    )
+                for st in _parse_env_assumed_holds_on_stems(
+                    mod_fields["envAssumed"], ob_label
+                ):
+                    if st not in raw_holds_on_stems:
+                        raw_holds_on_stems.append(st)
+                canon_mod_pre = tokenize_lean_source(
+                    f"fun args mem => And (And (defaultPre args) "
+                    f"(mem = (initMachineState Mir.{suffix}.body args).memory)) "
+                    f"(Trusted.VerificationResult.argsMatchSignature (Mir.{suffix}.body.instantiate List.nil) args mem)"
+                )
+                canon_mod_post = tokenize_lean_source(
+                    "fun args _ ret _ => defaultPost args ret"
+                )
+                if (
+                    mod_fields["pre"] == canon_mod_pre
+                    and mod_fields["post"] == canon_mod_post
+                ):
+                    default_modular_uses_default_pre_post = True
+                elif not (
+                    mod_fields["pre"] == [("Ident", "spec.pre")]
+                    and mod_fields["post"] == [("Ident", "spec.post")]
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`defaultModularSpec` `pre`/`post` in {ob_label} differs from its generated form",
                     )
             if spec_cls_opt is not None and spec_cls_opt[0] == "StatefulEquivItemSpec":
                 if rust_equiv_spec_body_suffix is not None:
@@ -10965,6 +11520,16 @@ def _scan_obligations_module(
                         f"`StatefulEquivItemSpec` instance in {ob_label} must use `refineEquivSpec Mir.<Ref>.body <pre> <post>` with exact 3 arguments",
                     )
                 mir_arg = _strip_enclosing_parens_tokens(args3[0])
+                pre_arg = _strip_enclosing_parens_tokens(args3[1])
+                post_arg = _strip_enclosing_parens_tokens(args3[2])
+                if pre_arg != tokenize_lean_source(
+                    "fun _ _ => True"
+                ) or post_arg != tokenize_lean_source("fun _ _ _ _ => True"):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"`rustEquivSpec` in {ob_label} differs from its generated `(fun _ _ => True) (fun _ _ _ _ => True)` form",
+                    )
                 if (
                     len(mir_arg) == 1
                     and mir_arg[0][0] == "Ident"
@@ -10984,35 +11549,131 @@ def _scan_obligations_module(
                         f"`StatefulEquivItemSpec` in {ob_label} binds non-`Mir.<Ref>.body` reference {mir_arg!r}",
                     )
 
-        if val == "abbrev" and idx + 5 < n:
-            if (
-                tokens[idx + 1] == ("Ident", "defaultExternalCallContract")
-                and tokens[idx + 2][0] == "Colon"
-                and tokens[idx + 3][0] == "Ident"
-                and _strip_verification_result_qual(str(tokens[idx + 3][1])) == "MirCallContract"
-                and tokens[idx + 4][0] == "ColonEq"
-                and tokens[idx + 5][0] == "Ident"
-            ):
-                cmd_e = command_end(idx)
-                if cmd_e != idx + 6:
+        if val == "abbrev" and idx + 1 < n and tokens[idx + 1][0] == "Ident":
+            ab_name = str(tokens[idx + 1][1])
+            cmd_e = command_end(idx)
+            if ab_name in declared_abbrevs:
+                raise Failure(
+                    1, FAULT_COVERAGE_PHASE, f"duplicate `abbrev {ab_name}` in {ob_label}"
+                )
+            declared_abbrevs.add(ab_name)
+            if ab_name == "defaultExternalCallContract":
+                if not (
+                    idx + 5 < n
+                    and cmd_e == idx + 6
+                    and tokens[idx + 2][0] == "Colon"
+                    and tokens[idx + 3][0] == "Ident"
+                    and _strip_verification_result_qual(str(tokens[idx + 3][1])) == "MirCallContract"
+                    and tokens[idx + 4][0] == "ColonEq"
+                    and tokens[idx + 5][0] == "Ident"
+                ):
                     raise Failure(
                         1,
                         FAULT_COVERAGE_PHASE,
-                        f"`abbrev defaultExternalCallContract` in {ob_label} has unexpected trailing tokens",
+                        f"`abbrev defaultExternalCallContract` in {ob_label} has non-canonical form or trailing tokens",
                     )
                 default_ext_alias = str(tokens[idx + 5][1])
+            elif ab_name == "rustRequires":
+                if tokens[idx:cmd_e] != tokenize_lean_source(
+                    "abbrev rustRequires : List Value → Prop := defaultPre"
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"canonical `abbrev rustRequires` in {ob_label} differs from `abbrev rustRequires : List Value → Prop := defaultPre`",
+                    )
+            elif ab_name == "rustEnsures":
+                if tokens[idx:cmd_e] != tokenize_lean_source(
+                    "abbrev rustEnsures : List Value → Value → Prop := defaultPost"
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"canonical `abbrev rustEnsures` in {ob_label} differs from `abbrev rustEnsures : List Value → Value → Prop := defaultPost`",
+                    )
 
         if val == "def":
             if idx + 1 >= n or tokens[idx + 1][0] != "Ident":
                 raise Failure(1, FAULT_COVERAGE_PHASE, f"malformed `def` in {ob_label}")
             def_name = str(tokens[idx + 1][1])
-            if def_name in ("defaultModularSpec", "externalSpecCallContract"):
+            if def_name in (
+                "defaultModularSpec",
+                "externalSpecCallContract",
+                "rustRequires",
+                "rustEnsures",
+                *_OB_ALL_SPEC_INSTANCE_NAMES,
+            ):
                 raise Failure(
                     1,
                     FAULT_COVERAGE_PHASE,
                     f"reserved identifier `{def_name}` shadowed as `def` in {ob_label}",
                 )
             cmd_e = command_end(idx)
+            if def_name in ("defaultPre", "defaultPost", "defaultPreFor", "defaultPostFor"):
+                if def_name in default_pre_post_cmds:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"duplicate `def {def_name}` in {ob_label}",
+                    )
+                default_pre_post_cmds[def_name] = tokens[idx:cmd_e]
+                for c_suf in _validate_default_pre_post_def(
+                    def_name, tokens[idx:cmd_e], suffix, imported_mir, ob_label
+                ):
+                    referenced_companion_mir_suffixes.add(c_suf)
+            if def_name == "defaultSpecCallees":
+                # Validate `def defaultSpecCallees : List CapturedMir := [Mir.<c>.body, ...]`
+                if (
+                    idx + 5 >= cmd_e
+                    or tokens[idx + 2][0] != "Colon"
+                    or tokens[idx + 3] != ("Ident", "List")
+                    or tokens[idx + 4] != ("Ident", "CapturedMir")
+                    or tokens[idx + 5][0] != "ColonEq"
+                ):
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"malformed `def defaultSpecCallees` header in {ob_label}",
+                    )
+                sc_rhs = tokens[idx + 6 : cmd_e]
+                if len(sc_rhs) < 2 or sc_rhs[0][0] != "LBracket" or sc_rhs[-1][0] != "RBracket":
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"unrecognized `defaultSpecCallees` table in {ob_label}",
+                    )
+                sc_inner = sc_rhs[1:-1]
+                sc_pos = 0
+                while sc_pos < len(sc_inner):
+                    if sc_inner[sc_pos][0] != "Ident":
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"unrecognized `defaultSpecCallees` entry in {ob_label}",
+                        )
+                    sc_entry = str(sc_inner[sc_pos][1])
+                    sc_suf = (
+                        sc_entry[len("Mir.") : -len(".body")]
+                        if sc_entry.startswith("Mir.") and sc_entry.endswith(".body")
+                        else ""
+                    )
+                    if not sc_suf or sc_suf not in imported_mir:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"{ob_label} lists `Mir.{sc_suf}.body` in `defaultSpecCallees` without `import Mir.{sc_suf}`",
+                        )
+                    if sc_suf not in default_spec_callee_suffixes:
+                        default_spec_callee_suffixes.append(sc_suf)
+                    sc_pos += 1
+                    if sc_pos < len(sc_inner):
+                        if sc_inner[sc_pos][0] != "Comma":
+                            raise Failure(
+                                1,
+                                FAULT_COVERAGE_PHASE,
+                                f"malformed `defaultSpecCallees` list in {ob_label}",
+                            )
+                        sc_pos += 1
             if def_name in _OB_CANONICAL_DEF_TEMPLATES:
                 if def_name in canonical_def_cmds:
                     raise Failure(
@@ -11153,7 +11814,8 @@ def _scan_obligations_module(
                     if sidecar_expr.startswith("Mir.") and sidecar_expr.endswith(".body")
                     else ""
                 )
-                if sidecar_suf and _take_exact_n_balanced_args(tokens[idx + 6 : cmd_e], 4) is not None:
+                args4 = _take_exact_n_balanced_args(tokens[idx + 6 : cmd_e], 4)
+                if sidecar_suf and args4 is not None:
                     if sidecar_suf == suffix:
                         raise Failure(
                             1,
@@ -11166,6 +11828,26 @@ def _scan_obligations_module(
                             FAULT_COVERAGE_PHASE,
                             f"{ob_label} binds `externalSpecCallContract` `{def_name}` to `Mir.{sidecar_suf}.body` without `import Mir.{sidecar_suf}`",
                         )
+                    ext_req = _validate_external_spec_extra_clause(
+                        args4[2],
+                        is_post=False,
+                        sidecar_suf=sidecar_suf,
+                        imported_mir=imported_mir,
+                        label=ob_label,
+                        def_name=def_name,
+                    )
+                    ext_ens = _validate_external_spec_extra_clause(
+                        args4[3],
+                        is_post=True,
+                        sidecar_suf=sidecar_suf,
+                        imported_mir=imported_mir,
+                        label=ob_label,
+                        def_name=def_name,
+                    )
+                    if ext_req is not None:
+                        referenced_companion_mir_suffixes.add(ext_req)
+                    if ext_ens is not None:
+                        referenced_companion_mir_suffixes.add(ext_ens)
                     linked_ext_positions.add(idx + 5)
                     external_spec_contracts.append(
                         {
@@ -11390,6 +12072,80 @@ def _scan_obligations_module(
             ob_label,
         )
 
+    # Verify spec-chain completeness and imported companion coverage (`[adv ep2-A2]`)
+    if (
+        "defaultSpec" in declared_spec_instances
+        or "defaultTotalSpec" in declared_spec_instances
+        or default_modular_uses_default_pre_post
+    ):
+        for req_helper in ("defaultPre", "defaultPost"):
+            if req_helper not in default_pre_post_cmds:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{ob_label} references `{req_helper}` in default spec instance without declaring `def {req_helper}`",
+                )
+    if (
+        "defaultStatefulSpec" in declared_spec_instances
+        or "defaultUbExceptionSpec" in declared_spec_instances
+        or any(
+            c in claim_defs
+            for c in ("statefulClaimFor", "modularClaimFor", "ubExceptionClaimFor")
+        )
+    ):
+        for req_helper in ("sigPre", "sigPost"):
+            if req_helper not in canonical_def_cmds:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{ob_label} references `{req_helper}` without declaring canonical `def {req_helper}`",
+                )
+        for req_helper in ("defaultPreFor", "defaultPostFor"):
+            if req_helper not in default_pre_post_cmds:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{ob_label} references `{req_helper}` via `sigPre`/`sigPost` without declaring `def {req_helper}`",
+                )
+    if "totalClaimFor" in claim_defs:
+        if "sigPost" not in canonical_def_cmds:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"{ob_label} declares `totalClaimFor` without canonical `def sigPost`",
+            )
+        for req_helper in ("defaultPreFor", "defaultPostFor"):
+            if req_helper not in default_pre_post_cmds:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{ob_label} declares `totalClaimFor` without `def {req_helper}`",
+                )
+    if any(r in canonical_def_cmds for r in _VERIFY_REFINE_SPEC_HELPERS):
+        for req_ab in ("rustRequires", "rustEnsures"):
+            if req_ab not in declared_abbrevs:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{ob_label} declares `refine*Spec` helpers without `abbrev {req_ab}`",
+                )
+        for req_helper in ("defaultPre", "defaultPost"):
+            if req_helper not in default_pre_post_cmds:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{ob_label} declares `refine*Spec` helpers without `def {req_helper}`",
+                )
+    for m_suf in imported_mir:
+        last_seg = m_suf.rsplit(".", 1)[-1]
+        if last_seg.startswith(("__anodized_fn_requires_", "__anodized_fn_ensures_")):
+            if m_suf not in referenced_companion_mir_suffixes:
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"{ob_label} imports companion `Mir.{m_suf}` without linking it in `defaultPre`/`defaultPost` or `externalSpecCallContract`",
+                )
+
     referenced_callee_contracts: list[str] = []
     referenced_ext_idents: list[str] = []
     for stem in raw_holds_on_stems:
@@ -11440,6 +12196,7 @@ def _scan_obligations_module(
 
     return {
         "default_callee_suffixes": default_callee_suffixes,
+        "default_spec_callee_suffixes": default_spec_callee_suffixes,
         "imported_mir_suffixes": imported_mir,
         "imported_obligation_suffixes": imported_obligations,
         "referenced_callee_contracts": referenced_callee_contracts,
@@ -11662,12 +12419,46 @@ def _is_allowed_aux_import(module: str) -> bool:
     return _is_allowed_specs_import(module) or module.startswith(("Proof.", "Assumptions."))
 
 
+def _is_trivially_false_spec_pre(tokens_slice: list[tuple[str, Any]]) -> bool:
+    """`[adv ep2-A2]` Detect a vacuous `False` precondition (`False`, `fun ... => False`,
+    `And False ...`, `And ... False`, `False ∧ ...`, `... ∧ False`) in `Specs/<Item>.lean`."""
+    s = _strip_enclosing_parens_tokens(tokens_slice)
+    if not s:
+        return True
+    if s[0] == ("Ident", "fun"):
+        arrow_idx = next(
+            (i for i, (tk, v) in enumerate(s) if tk == "Ident" and v in ("=>", "↦")),
+            -1,
+        )
+        if arrow_idx >= 0:
+            return _is_trivially_false_spec_pre(s[arrow_idx + 1 :])
+    if len(s) == 1 and s[0][0] == "Ident" and str(s[0][1]) in ("False", "_root_.False"):
+        return True
+    if s[0] == ("Ident", "And"):
+        args2 = _take_exact_n_balanced_args(s[1:], 2)
+        if args2 is not None:
+            return _is_trivially_false_spec_pre(args2[0]) or _is_trivially_false_spec_pre(
+                args2[1]
+            )
+    depth = 0
+    for idx, (tk, val) in enumerate(s):
+        if tk in ("LParen", "LBrace", "LBracket"):
+            depth += 1
+        elif tk in ("RParen", "RBrace", "RBracket"):
+            depth = max(0, depth - 1)
+        elif tk == "Ident" and depth == 0 and val == "∧":
+            return _is_trivially_false_spec_pre(s[:idx]) or _is_trivially_false_spec_pre(
+                s[idx + 1 :]
+            )
+    return False
+
+
 def _scan_specs_module(
     specs_text: str, subject_suffix: str, label: str
 ) -> dict[str, Any]:
-    """`[adv ep2-A1]` Port of Rust `scan_specs_module`: scan `Specs/<Item>.lean` for
-    `*ItemSpec` instances, `ModularItemSpec.envAssumed` contracts, and
-    `StatefulEquivItemSpec.specBody` reference MIR bodies."""
+    """`[adv ep2-A1]` / `[adv ep2-A2]` Port of Rust `scan_specs_module`: scan `Specs/<Item>.lean` for
+    `*ItemSpec` instances, `ModularItemSpec.envAssumed` contracts,
+    `StatefulEquivItemSpec.specBody` reference MIR bodies, and vacuous `False` preconditions."""
     tokens = _tokenize_lean_or_fail(specs_text, label)
     _check_module_scope_confinement(tokens, f"Specs.{subject_suffix}", label)
     attr = _verify_detect_instance_attribute(tokens)
@@ -11717,6 +12508,11 @@ def _scan_specs_module(
             "prefix",
             "postfix",
             "elab",
+            "elab_rules",
+            "deriving",
+            "initialize",
+            "builtin_initialize",
+            "mutual",
             "local",
             "scoped",
             "attribute",
@@ -11886,6 +12682,80 @@ def _scan_specs_module(
                     f"every `instance` in {label} must declare an explicit `<*ItemSpec> \"<defId>\"` header",
                 )
             cls0 = header_spec_classes[0]
+            # `[adv ep2-A2]`: Reject vacuous `False` preconditions in any `*ItemSpec` instance.
+            inst_body_slice = cmd_slice[header_end + 1 :] if header_end < len(cmd_slice) else []
+            if header_end < len(cmd_slice) and cmd_slice[header_end][0] == "ColonEq":
+                rhs_spec = _strip_enclosing_parens_tokens(inst_body_slice)
+                if len(rhs_spec) >= 2 and rhs_spec[0][0] == "LBrace" and rhs_spec[-1][0] == "RBrace":
+                    inst_body_slice = rhs_spec[1:-1]
+                elif rhs_spec and rhs_spec[0][0] == "Ident":
+                    short_ref = str(rhs_spec[0][1]).rsplit(".", 1)[-1]
+                    if short_ref in _VERIFY_REFINE_SPEC_HELPERS:
+                        n_args = 2 if short_ref in ("refineSpec", "refineStatefulSpec", "refineTotalSpec") else 3
+                        r_args = _take_exact_n_balanced_args(rhs_spec[1:], n_args)
+                        if r_args is None:
+                            raise Failure(
+                                1,
+                                FAULT_COVERAGE_PHASE,
+                                f"`{short_ref}` in {label} must take exactly {n_args} balanced arguments",
+                            )
+                        pre_indices = (
+                            (0, 1)
+                            if short_ref in ("refineSafeSpec", "refineSafeStatefulSpec")
+                            else ((1,) if short_ref in ("refineEquivSpec", "refineModularSpec", "refineUbExceptionSpec") else (0,))
+                        )
+                        for p_i in pre_indices:
+                            if _is_trivially_false_spec_pre(r_args[p_i]):
+                                raise Failure(
+                                    1,
+                                    FAULT_COVERAGE_PHASE,
+                                    f"vacuous `False` precondition in `{short_ref}` of {label}",
+                                )
+                        inst_body_slice = []
+            if inst_body_slice:
+                p_idx = 0
+                p_depth = 0
+                while p_idx < len(inst_body_slice):
+                    t_p, v_p = inst_body_slice[p_idx]
+                    if p_depth == 0 and t_p == "Ident" and v_p == "pre":
+                        c_idx = p_idx + 1
+                        while c_idx < len(inst_body_slice) and inst_body_slice[c_idx][0] != "ColonEq":
+                            c_idx += 1
+                        if c_idx < len(inst_body_slice):
+                            rhs_p = c_idx + 1
+                            end_p = rhs_p
+                            d_p = 0
+                            while end_p < len(inst_body_slice):
+                                tk_e, val_e = inst_body_slice[end_p]
+                                if d_p == 0:
+                                    if tk_e in ("Comma", "Semicolon", "RBrace"):
+                                        break
+                                    if end_p > rhs_p and tk_e == "Ident" and (
+                                        val_e in ("pre", "post", "envAssumed", "specBody", "strictSafetyPre")
+                                        or (
+                                            end_p + 1 < len(inst_body_slice)
+                                            and inst_body_slice[end_p + 1][0] == "ColonEq"
+                                        )
+                                    ):
+                                        break
+                                if tk_e in ("LParen", "LBrace", "LBracket"):
+                                    d_p += 1
+                                elif tk_e in ("RParen", "RBrace", "RBracket"):
+                                    d_p = max(0, d_p - 1)
+                                end_p += 1
+                            if _is_trivially_false_spec_pre(inst_body_slice[rhs_p:end_p]):
+                                raise Failure(
+                                    1,
+                                    FAULT_COVERAGE_PHASE,
+                                    f"vacuous `False` precondition in `{cls0}` instance of {label}",
+                                )
+                            p_idx = end_p
+                            continue
+                    if t_p in ("LParen", "LBrace", "LBracket"):
+                        p_depth += 1
+                    elif t_p in ("RParen", "RBrace", "RBracket"):
+                        p_depth = max(0, p_depth - 1)
+                    p_idx += 1
             if cls0 == "ModularItemSpec":
                 if has_modular_spec_instance:
                     raise Failure(
@@ -12254,6 +13124,10 @@ def _validate_auxiliary_module_no_spec_override(
             "prefix",
             "postfix",
             "elab",
+            "elab_rules",
+            "deriving",
+            "initialize",
+            "builtin_initialize",
             "local",
             "scoped",
             "attribute",
@@ -12670,6 +13544,30 @@ def _audit_single_item_receipt(
                 1,
                 FAULT_COVERAGE_PHASE,
                 f"sidecar `Mir.{ext['sidecar_mir_suffix']}` for `externalSpecCallContract \"{ext['target_def_path']}\"` has role `{sidecar_meta['role']}` instead of `ContractRole.externalSpec \"{ext['target_def_path']}\"`",
+            )
+
+    # `[adv ep2-A2]`: Validate every imported `Mir.<Suffix>` and `defaultSpecCallees` entry
+    # in `Obligations/<Item>.lean` exists in `mir_by_stem` and reconciles cleanly.
+    for aux_mir_suf in [*ob_scan["imported_mir_suffixes"], *ob_scan["default_spec_callee_suffixes"]]:
+        aux_mir_stem = aux_mir_suf.replace(".", "/")
+        aux_mir_meta = mir_by_stem.get(aux_mir_stem)
+        if aux_mir_meta is None:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"Obligations module {ob_path} references `Mir.{aux_mir_suf}`, but `Mir/{aux_mir_stem}.lean` is missing",
+            )
+        aux_body = aux_mir_meta["body"]
+        aux_verdict = reconcile_obligation_coverage(
+            census_mir_fault_sites(aux_body),
+            emit_mir_obligation_fault_sites(aux_body),
+            reg,
+        )
+        if not aux_verdict["is_verified"]:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"imported `Mir.{aux_mir_suf}` in {ob_path} failed obligation coverage reconciliation: {'; '.join(aux_verdict['reasons'])}",
             )
 
     # 2. Verify `Verify/<Item>.lean` surface, active claim binding in `Obligations/<Item>.lean`,
