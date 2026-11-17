@@ -2471,9 +2471,9 @@
     {
       "path": "Miri/Interpreter/Call.lean",
       "upstream_sha256": "4f84e6562232130ab86a9ea057a63e8f1a57c17daef2f91d2bb9ca6251fb0287",
-      "patched_sha256": "76fe47c71f0c3eea3141e4f8aedb6b21e3eb5365e2dcf67107da862146602e49",
+      "patched_sha256": "df665a361782d1566effcc58d577675b8907a28b5b7ee1e30c52b8b047f98ddb",
       "upstream_git_blob": "1de0bbe80a2620c98cdc9371d7400db9f4a775bd",
-      "patch_reason": "deinitMovedPlace: adds the consumer-side evalCallTerminatorMoving / evalTailCallTerminatorMoving / initFnTailCallMoving / evalCalleeAndArgsMoving / evalFnCallArgumentMoving / materializeArgument / deallocateTempArgs and FnArg.isInPlace (every argument is read and validated into a temporary and every moved source deinitialized without Tree Borrows or race access, all before callee resolution, kani#5172, hence before a tail call's popRaw/cleanup; no argument is passed in place, and initFnTailCallMoving rejects an in-place argument before running the unchanged source initFnTailCall; the temporary snapshots and pre-resolution validations run under RetagMode.None so the callee's FnEntry retag stays the only retag of an argument; temporaries are deallocated after a successful dispatch, a fault being terminal) and CallHooks fields with fail-closed defaults. The source call functions are unchanged; two unused simp arguments (EStateM.pure) of the source zero_entry_immediate/zero_entry_indirect proofs are dropped."
+      "patch_reason": "deinitMovedPlace: adds the consumer-side evalCallTerminatorMoving / evalTailCallTerminatorMoving / initFnTailCallMoving / evalCalleeAndArgsMoving / evalFnCallArgumentMoving / materializeArgument / deallocateTempArgs / deallocateTempArgsOnError and FnArg.isInPlace (every argument is read and validated into a temporary and every moved source deinitialized without Tree Borrows or race access, all before callee resolution, kani#5172, hence before a tail call's popRaw/cleanup; no argument is passed in place, and initFnTailCallMoving rejects an in-place argument before running the unchanged source initFnTailCall; the temporary snapshots and pre-resolution validations run under RetagMode.None so the callee's FnEntry retag stays the only retag of an argument; temporaries are deallocated on both normal completion and error, with deallocateTempArgsOnError preserving the original error) and CallHooks fields with fail-closed defaults. The source call functions are unchanged; two unused simp arguments (EStateM.pure) of the source zero_entry_immediate/zero_entry_indirect proofs are dropped."
     },
     {
       "path": "Miri/Interpreter/Cast.lean",
@@ -2485,9 +2485,9 @@
     {
       "path": "Miri/Interpreter/ExecutionCalls.lean",
       "upstream_sha256": "0e401e0f72d5ac5dcb13ebb794e2e2affe742f25a8557fd68a4440dc15cf33d8",
-      "patched_sha256": "e8c7d01c66044cf798df5001cbcd47e39ed88a4c936026b6a490230ce3c1e932",
+      "patched_sha256": "1bbd8cf0553ae0560c8e3ecc57d70bee3aeec70ee854ed3b25cb7caa55bb5c58",
       "upstream_git_blob": "512a0af720bfab4b1cb36f9ad1cc31c29fa9f53a",
-      "patch_reason": "deinitMovedPlace: wires call-argument deinitialization (writeMemoryRawUninit), pre-resolution validation, temporary deallocation, and latch disarming after call operands."
+      "patch_reason": "deinitMovedPlace: wires call-argument deinitialization (writeMemoryRawUninit), pre-resolution validation (deallocating the validation temporary on both success and error), temporary deallocation, and latch disarming after call operands."
     },
     {
       "path": "Miri/Interpreter/ExecutionCast.lean",

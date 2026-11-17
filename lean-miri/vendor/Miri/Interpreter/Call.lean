@@ -189,6 +189,14 @@ def deallocateTempArgs (h : Hooks) (choice : C) (temps : Array (Pointer (Option 
   for ptr in temps do
     h.deallocateStack choice ptr
 
+/-- Consumer-side (`deinitMovedPlace`): deallocate temporary argument copies on an
+error path without allowing any deallocation failure to replace `err`. -/
+def deallocateTempArgsOnError {A : Type} (h : Hooks) (choice : C)
+    (temps : Array (Pointer (Option P))) (err : StepError) : M A := do
+  for ptr in temps do
+    try h.deallocateStack choice ptr catch _ => pure ()
+  throw err
+
 /-- Consumer-side (`deinitMovedPlace`): validate an immediate argument, or copy an
 indirect one into a fresh temporary with the validating `copyToMemory`, so that
 later same-call moves of the same place cannot change the value passed here.
@@ -207,7 +215,10 @@ def materializeArgument (h : Hooks) (choice : C) (op : OpTy P) :
     if !op.layout.layout.isSized then
       throw (.unsupported "deinitMovedPlace: unsized by-value call argument")
     let tmp ← h.allocateStack choice op.layout
-    h.withRetagMode choice .None (h.copyToMemory choice op tmp)
+    try
+      h.withRetagMode choice .None (h.copyToMemory choice op tmp)
+    catch err =>
+      deallocateTempArgsOnError h choice #[tmp.mplace.ptr] err
     return (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr)
 
 /-- Consumer-side (`deinitMovedPlace`) argument evaluation, returning the
@@ -237,8 +248,11 @@ def evalFnCallArgumentMoving (h : Hooks) (choice : C) (operand : MIR.Operand)
     match op.op with
     | .indirect mplace =>
       let tmp ← h.allocateStack choice op.layout
-      h.withRetagMode choice .None (h.copyToMemory choice op tmp)
-      h.deinitInPlaceArgument choice ⟨mplace, op.layout⟩
+      try
+        h.withRetagMode choice .None (h.copyToMemory choice op tmp)
+        h.deinitInPlaceArgument choice ⟨mplace, op.layout⟩
+      catch err =>
+        deallocateTempArgsOnError h choice #[tmp.mplace.ptr] err
       return (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr)
     | .immediate _ =>
       h.withRetagMode choice .None (h.validateOperandBeforeCall choice op)
@@ -276,7 +290,8 @@ every argument are evaluated, validated and consumed, in order, before the
 function signature, kind or instance are queried, so an uninitialized or
 moved-out callee or argument faults before `resolve` (kani#5172). Also returns
 the temporary stack allocations to deallocate once the call has consumed its
-arguments. -/
+arguments; any temporary allocations created before an error are deallocated via
+`deallocateTempArgsOnError` before the error is propagated. -/
 def evalCalleeAndArgsMoving (h : Hooks) (choice : C) (func : MIR.Operand)
     (args : Array SpannedOperand) :
     M (EvaluatedCall P Other Extern FnABI × Array (Pointer (Option P))) := do
@@ -287,29 +302,37 @@ def evalCalleeAndArgsMoving (h : Hooks) (choice : C) (func : MIR.Operand)
   let func := funcArg.copyFnArg
   let mut evaluated := #[]
   for index in [:args.size] do
-    let some arg := args[index]? | throw (.invalidProgram "missing source call argument")
-    let (fnArg, tmp?) ← evalFnCallArgumentMoving h choice arg.operand (OperandPath.argument index)
+    let some arg := args[index]?
+      | deallocateTempArgsOnError h choice temps (.invalidProgram "missing source call argument")
+    let (fnArg, tmp?) ←
+      try
+        evalFnCallArgumentMoving h choice arg.operand (OperandPath.argument index)
+      catch err =>
+        deallocateTempArgsOnError h choice temps err
     if let some tmp := tmp? then temps := temps.push tmp
     evaluated := evaluated.push fnArg
-  let (inputCount, externAbi) ← h.functionSignature choice func.layout
-  require (inputCount ≤ evaluated.size) "call has fewer args than normalized signature"
-  let extra := (evaluated.extract inputCount evaluated.size).map fun arg => arg.layout.ty
-  match ← h.functionKind func.layout.ty with
-  | .FnPtr =>
-    let fnPtr ← h.readPointer choice func
-    let fnVal ← h.getPtrFn choice fnPtr
-    let abi ← h.fnAbiOfFnPtr choice func.layout extra
-    return (⟨fnVal, evaluated, externAbi, some abi, false⟩, temps)
-  | .FnDef definition args =>
-    let fnInstance ← h.resolve choice definition args
-    let abi ← match fnInstance.kind with
-      | .LlvmIntrinsic _ => pure none
-      | .Intrinsic definition =>
-        pure (some (← h.fnAbiOfInstance choice ⟨.Item definition, fnInstance.args⟩ extra))
-      | _ => pure (some (← h.fnAbiOfInstance choice fnInstance extra))
-    return (⟨.Instance fnInstance, evaluated, externAbi, abi, ← h.requiresCallerLocation fnInstance⟩,
-      temps)
-  | .invalid => throw (.invalidProgram "invalid callee type")
+  try
+    let (inputCount, externAbi) ← h.functionSignature choice func.layout
+    require (inputCount ≤ evaluated.size) "call has fewer args than normalized signature"
+    let extra := (evaluated.extract inputCount evaluated.size).map fun arg => arg.layout.ty
+    match ← h.functionKind func.layout.ty with
+    | .FnPtr =>
+      let fnPtr ← h.readPointer choice func
+      let fnVal ← h.getPtrFn choice fnPtr
+      let abi ← h.fnAbiOfFnPtr choice func.layout extra
+      return (⟨fnVal, evaluated, externAbi, some abi, false⟩, temps)
+    | .FnDef definition args =>
+      let fnInstance ← h.resolve choice definition args
+      let abi ← match fnInstance.kind with
+        | .LlvmIntrinsic _ => pure none
+        | .Intrinsic definition =>
+          pure (some (← h.fnAbiOfInstance choice ⟨.Item definition, fnInstance.args⟩ extra))
+        | _ => pure (some (← h.fnAbiOfInstance choice fnInstance extra))
+      return (⟨.Instance fnInstance, evaluated, externAbi, abi, ← h.requiresCallerLocation fnInstance⟩,
+        temps)
+    | .invalid => throw (.invalidProgram "invalid callee type")
+  catch err =>
+    deallocateTempArgsOnError h choice temps err
 
 def evalCalleeAndArgs (h : Hooks) (choice : C) (func : MIR.Operand)
     (args : Array SpannedOperand) (dest : Place) : M (EvaluatedCall P Other Extern FnABI) := do
@@ -609,7 +632,7 @@ def evalTailCallTerminator (h : Hooks) (choice : C) (budget : Nat) (terminator :
 `evalCalleeAndArgsMoving`: every argument is read and validated into a fresh
 temporary and every moved source is deinitialized without Tree Borrows or race
 access, all before callee resolution (kani#5172); no argument is passed in
-place. The temporaries are released once the callee frame holds the copies. -/
+place. The temporaries are released on both normal dispatch and error. -/
 def evalCallTerminatorMoving (h : Hooks) (choice : C) (budget : Nat) (terminator : Terminator) :
     M Unit := do
   match terminator.kind with
@@ -618,9 +641,12 @@ def evalCallTerminatorMoving (h : Hooks) (choice : C) (budget : Nat) (terminator
     let oldLoc := (← h.getFrame).location
     let destPlace ← h.evalPlace choice dest false
     let (evaluated, temps) ← evalCalleeAndArgsMoving h choice func args
-    initFnCall h choice budget ⟨evaluated.callee, evaluated.callerAbi, evaluated.fnAbi, evaluated.args,
-      evaluated.withCallerLocation, destPlace, target,
-      if evaluated.fnAbi.any h.abiCanUnwind then unwind else .Unreachable⟩
+    try
+      initFnCall h choice budget ⟨evaluated.callee, evaluated.callerAbi, evaluated.fnAbi, evaluated.args,
+        evaluated.withCallerLocation, destPlace, target,
+        if evaluated.fnAbi.any h.abiCanUnwind then unwind else .Unreachable⟩
+    catch err =>
+      deallocateTempArgsOnError h choice temps err
     deallocateTempArgs h choice temps
     if target.isSome then
       if (← h.frameIndex) == oldIndex then
@@ -635,17 +661,20 @@ temporary snapshot, and every moved caller source was already deinitialized
 unchanged source `initFnTailCall` pops the caller frame (`popRaw`) and frees the
 caller's locals (`cleanup`). An `FnArg.InPlace` argument would skip that
 pre-resolution validation and deinitialization, so it fails closed before
-`popRaw`. The temporary snapshots are deallocated once `initFnTailCall`
-(including `cleanup`) has succeeded. As on every consumer-side call path, a fault
-is terminal and leaves the temporaries allocated: no cleanup runs after an error,
-so no cleanup failure can replace the original error. -/
+`popRaw`. Temporary snapshots are deallocated on both normal completion and error
+(with `deallocateTempArgsOnError` preserving the original error). -/
 def initFnTailCallMoving (h : Hooks) (choice : C) (budget : Nat)
     (evaluated : EvaluatedCall P Other Extern FnABI) (temps : Array (Pointer (Option P))) :
     M Unit := do
   if evaluated.args.any FnArg.isInPlace then
-    throw (.invalidProgram "deinitMovedPlace: tail-call argument passed in place")
-  initFnTailCall h choice budget evaluated
-  deallocateTempArgs h choice temps
+    deallocateTempArgsOnError h choice temps
+      (.invalidProgram "deinitMovedPlace: tail-call argument passed in place")
+  else
+    try
+      initFnTailCall h choice budget evaluated
+    catch err =>
+      deallocateTempArgsOnError h choice temps err
+    deallocateTempArgs h choice temps
 
 /-- Consumer-side (`deinitMovedPlace`) tail-call terminator, selected by
 `ExecutionMachine.stepHooks` only when `deinitMovedPlace = true`; arguments as

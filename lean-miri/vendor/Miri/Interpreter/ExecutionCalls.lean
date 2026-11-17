@@ -160,7 +160,11 @@ def make [DecidableEq K] (leaves : ExecutionCallLeaves.Hooks (State K U) C Other
       if operand.layout.layout.isZst || !operand.layout.layout.isSized then return
       modify fun s => { s with machine := MachineHooks.clearPendingMoveDeinits s.machine }
       let tmp ← PlaceMachine.allocateStack allocation operand.layout
-      copyRuntimePlace place copy c operand ⟨.memory tmp.mplace, tmp.layout⟩ false
+      try
+        copyRuntimePlace place copy c operand ⟨.memory tmp.mplace, tmp.layout⟩ false
+      catch err =>
+        try lifecycle.storage.deallocateStack tmp.mplace.ptr catch _ => pure ()
+        throw err
       lifecycle.storage.deallocateStack tmp.mplace.ptr
    deallocateStack := fun _ ptr => lifecycle.storage.deallocateStack ptr}
 /-- Actual helpers.rs call/thread-root helper dictionary. Origin mutations

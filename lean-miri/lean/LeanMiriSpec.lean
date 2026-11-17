@@ -460,8 +460,9 @@ import LeanMiriSpec.Audit
   read and before writing an immediate result (transmute and unsizing copies take
   over the move latch), `D8` `Assert`, unwinding `Call` cleanup,
   `initFnTailCallMoving` (the unchanged source `initFnTailCall` after the
-  pre-resolution caller deinitialization, temporaries freed after `cleanup`,
-  in-place arguments rejected before `popRaw`) and `initDropInPlaceCall`,
+  pre-resolution caller deinitialization, temporaries freed on both normal
+  completion and error, with `deallocateTempArgsOnError` preserving the original
+  error, and in-place arguments rejected before `popRaw`) and `initDropInPlaceCall`,
   zero-sized moves deinitialize nothing, the moved copy of
   `Place.copyRuntimePlaceNoValidate` reads, then deinitializes, then writes (so
   `D6` self-moves keep their value on the immediate path and are overlapping-copy

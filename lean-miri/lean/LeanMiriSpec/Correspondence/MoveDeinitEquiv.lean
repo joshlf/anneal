@@ -92,10 +92,12 @@ true)`).
   `canary_D8_unwinding_call_moved_arg_ub`, `canary_D8_unwinding_call_unmoved_ok`),
   tail-call (`evalTailCallTerminatorMoving` / `initFnTailCallMoving`: the
   unchanged source `initFnTailCall` after the pre-resolution caller
-  deinitialization, temporaries freed after `cleanup`, in-place arguments
-  rejected before `popRaw`, faults terminal; `call_initFnTailCallMoving_eq`,
+  deinitialization, temporaries freed on both normal completion and error with
+  `deallocateTempArgsOnError` preserving the original error, in-place arguments
+  rejected before `popRaw`; `call_initFnTailCallMoving_eq`,
   `call_initFnTailCallMoving_inPlace`,
-  `canary_tailCallMoving_deinit_before_pop_inPlace_fail_closed`),
+  `canary_tailCallMoving_deinit_before_pop_inPlace_fail_closed`,
+  `canary_call_error_paths_deallocate_all_temps_and_preserve_error`),
   and `Drop` (`call_initDropInPlaceCall_static_eq`,
   `canary_dropInPlace_preserves_initialized_and_detects_moved`);
   operand reads `PlaceMachine.readImmediate (← OperandMachine.evalOperandAt …)`
@@ -148,12 +150,10 @@ true)`).
   default `false` (`canary_D2_enum_downcast_discriminant_after_move`), so the two
   semantics disagree on this program shape; Part 4 relates root moves only.
 * **Error paths (`lean-miri`).** When a later argument of
-  `Call.evalCalleeAndArgsMoving` faults, the snapshots of the earlier arguments are
-  not deallocated and earlier moved arguments stay deinitialized; likewise a fault
-  after the arguments were consumed (in `initFnCall` or the tail call's
-  `popRaw`/`cleanup`) leaves the temporaries allocated. Every such fault is
-  terminal for the machine, and since no cleanup runs after it, no cleanup failure
-  can replace the original error.
+  `Call.evalCalleeAndArgsMoving` faults, all temporary stack allocations are
+  deallocated via `Call.deallocateTempArgsOnError` (without allowing any
+  deallocation failure to replace the original error), while earlier moved
+  arguments stay deinitialized; every such fault is terminal for the machine.
 * **Unsizing (`lean-miri`).** `Cast.castMoving` deinitializes the moved fields of an
   unsized struct source, not its padding bytes.
 * **Moved-out leaves have no byte width (Trusted).** Untyped (`localDecls = []`)
@@ -3414,6 +3414,17 @@ theorem call_evalFnCallArgumentMoving_move_immediate
   simp only [EStateM.bind, hget, hrep, hset]
   rfl
 
+/-- Definitional unfolding of `try ... catch` (`tryCatch`) in `EStateM`. -/
+theorem estatem_tryCatch_eq {ε σ α : Type} (x : EStateM ε σ α) (handle : ε → EStateM ε σ α)
+    (s : σ) :
+    tryCatch x handle s =
+      match x s with
+      | .ok a s' => .ok a s'
+      | .error e s' => handle e s' := by
+  change EStateM.tryCatch x handle s = _
+  unfold EStateM.tryCatch
+  cases x s <;> rfl
+
 /-- **Moved memory-backed call argument, universal.** With `deinitMovedPlace =
 true`, `move p` of a memory place is copied (validating, with retagging disabled)
 into a fresh temporary, then the source is deinitialized with the silent
@@ -3433,8 +3444,8 @@ theorem call_evalFnCallArgumentMoving_move_indirect
     Call.evalFnCallArgumentMoving h choice (.Move place) path s =
       .ok (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr) s₅ := by
   simp only [Call.evalFnCallArgumentMoving, bind, EStateM.bind, hplace, hop, hsized,
-    Bool.not_true, Bool.false_eq_true, ↓reduceIte, halloc, hcopy, hdeinit]
-  rfl
+    Bool.not_true, Bool.false_eq_true, ↓reduceIte, halloc, estatem_tryCatch_eq, hcopy, hdeinit,
+    pure, EStateM.pure]
 
 /-- A failing pre-resolution validation of a moved immediate argument aborts
 before the caller's local is touched. -/
@@ -3484,7 +3495,10 @@ theorem call_materializeArgument_indirect_eq
     (layout : LocalLayout) (hsized : layout.layout.isSized = true) :
     Call.materializeArgument h choice ⟨.indirect mplace, layout⟩ = (do
       let tmp ← h.allocateStack choice layout
-      h.withRetagMode choice .None (h.copyToMemory choice ⟨.indirect mplace, layout⟩ tmp)
+      try
+        h.withRetagMode choice .None (h.copyToMemory choice ⟨.indirect mplace, layout⟩ tmp)
+      catch err =>
+        Call.deallocateTempArgsOnError h choice #[tmp.mplace.ptr] err
       return (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr)) := by
   simp only [Call.materializeArgument, hsized, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
 
@@ -5255,36 +5269,50 @@ theorem call_evalTailCallTerminatorMoving_eq
   unfold_named "_private.Miri.Interpreter.Call.0.Miri.Interpreter.Call.require"
   rfl
 
-/-- **`initFnTailCallMoving` on consumer-side arguments, universal (`ep1-A3`).**
+/-- **`initFnTailCallMoving` on consumer-side arguments, universal (`ep1-A3`, `ep1-B4`).**
 When no argument is passed in place (every argument array produced by
 `evalCalleeAndArgsMoving`: `call_evalFnCallArgumentMoving_move_immediate`,
 `_move_indirect`, `_move_zst`, `_move_projected_immediate` and
-`call_materializeArgument_*_eq`), the consumer-side tail-call dispatch is exactly
-the unchanged source `initFnTailCall` (`popRaw`, `initFnCall`, `cleanup`)
-followed by the deallocation of the argument temporaries. -/
+`call_materializeArgument_*_eq`), the consumer-side tail-call dispatch runs the
+unchanged source `initFnTailCall` (`popRaw`, `initFnCall`, `cleanup`) and
+deallocates the argument temporaries on both normal completion and error. -/
 theorem call_initFnTailCallMoving_eq
     {P S C E Other Extern FnABI ArgABI : Type}
     (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C) (budget : Nat)
     (evaluated : EvaluatedCall P Other Extern FnABI) (temps : Array (Pointer (Option P)))
     (hcopy : evaluated.args.any FnArg.isInPlace = false) :
     Call.initFnTailCallMoving h choice budget evaluated temps = (do
-      Call.initFnTailCall h choice budget evaluated
+      try
+        Call.initFnTailCall h choice budget evaluated
+      catch err =>
+        Call.deallocateTempArgsOnError h choice temps err
       Call.deallocateTempArgs h choice temps) := by
   simp only [Call.initFnTailCallMoving, hcopy, Bool.false_eq_true, ↓reduceIte]
 
-/-- **An in-place tail-call argument fails closed, universal (`ep1-A3`).** An
+/-- **An in-place tail-call argument fails closed and frees `temps`, universal (`ep1-A3`, `ep1-B4`).** An
 `FnArg.InPlace` argument would bypass the pre-resolution snapshot and the
 borrow-tracker-silent deinitialization of `evalCalleeAndArgsMoving`, so
-`initFnTailCallMoving` rejects it before `popRaw`, with the state unchanged. -/
+`initFnTailCallMoving` rejects it before `popRaw` and frees `temps` via
+`deallocateTempArgsOnError`. -/
 theorem call_initFnTailCallMoving_inPlace
     {P S C E Other Extern FnABI ArgABI : Type}
     (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C) (budget : Nat)
     (evaluated : EvaluatedCall P Other Extern FnABI) (temps : Array (Pointer (Option P)))
-    (s : S) (hin : evaluated.args.any FnArg.isInPlace = true) :
-    Call.initFnTailCallMoving h choice budget evaluated temps s =
-      .error (.invalidProgram "deinitMovedPlace: tail-call argument passed in place") s := by
+    (hin : evaluated.args.any FnArg.isInPlace = true) :
+    Call.initFnTailCallMoving h choice budget evaluated temps =
+      Call.deallocateTempArgsOnError h choice temps
+        (.invalidProgram "deinitMovedPlace: tail-call argument passed in place") := by
   simp only [Call.initFnTailCallMoving, hin, ↓reduceIte]
-  rfl
+
+/-- **`deallocateTempArgsOnError` always preserves the original `err`, universal (`ep1-B4`).**
+After deallocating every temporary in `temps` (ignoring any secondary
+deallocation error), `Call.deallocateTempArgsOnError` throws the exact original
+`err`; in particular on `#[]` it is `throw err`. -/
+theorem call_deallocateTempArgsOnError_empty_eq
+    {P S C E Other Extern FnABI ArgABI A : Type}
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C)
+    (err : StepError) (s : S) :
+    (Call.deallocateTempArgsOnError h choice #[] err : CallM S A) s = .error err s := rfl
 
 /-- Call hooks for `initFnTailCallMoving`, `evalTailCallTerminatorMoving`, and
 `initDropInPlaceCall`: `popRaw` fails if caller cell `1` was not yet
@@ -5371,7 +5399,7 @@ private theorem tailCallMoving_case_inPlace :
       .error (.invalidProgram "deinitMovedPlace: tail-call argument passed in place")
         { d8InitState with
           callerCells := [none, some 2, some 3, none, none, none, some 3, none],
-          temps := [6] } := by
+          temps := [6], freedTemps := [6] } := by
   with_unfolding_all rfl
 
 private theorem tailCallMoving_case_rootStop :
@@ -5381,7 +5409,7 @@ private theorem tailCallMoving_case_rootStop :
       .error (.invalidProgram "cannot tailcall as root of stack")
         { callerCells := [none, none, some 3, none, some 2, none, some 3, none],
           calleeCells := [none, none, none, none],
-          temps := [4, 6], freedTemps := [], inCallee := false, block := 0,
+          temps := [4, 6], freedTemps := [4, 6], inCallee := false, block := 0,
           unwinding := false, panicCalled := false } := by
   rw [call_evalTailCallTerminatorMoving_eq]
   simp only [b3TailDropHooks_frameIndex, bind, EStateM.bind, pure, EStateM.pure,
@@ -5395,7 +5423,7 @@ private theorem tailCallMoving_case_cleanupErr :
       .error (.invalidProgram "tailcall cleanup must return Normal")
         { callerCells := [none, none, some 3, none, some 2, none, some 3, none],
           calleeCells := [none, some 2, some 3, none],
-          temps := [4, 6], freedTemps := [], inCallee := false, block := 0,
+          temps := [4, 6], freedTemps := [4, 6], inCallee := false, block := 0,
           unwinding := false, panicCalled := false } := by
   rw [call_evalTailCallTerminatorMoving_eq]
   simp only [b3TailDropHooks_frameIndex, bind, EStateM.bind, pure, EStateM.pure,
@@ -5403,8 +5431,10 @@ private theorem tailCallMoving_case_cleanupErr :
   with_unfolding_all rfl
 
 /-- **`evalTailCallTerminatorMoving` & `initFnTailCallMoving` (`ep1-B3`,
-`ep1-A3`): caller places are snapshotted and deinitialized BEFORE `popRaw` and
-`cleanup`, an in-place argument fails closed, and faults are terminal.**
+`ep1-A3`, `ep1-B4`): caller places are snapshotted and deinitialized BEFORE
+`popRaw` and `cleanup`, an in-place argument fails closed, and all temporary
+allocations are freed on both normal dispatch and error while preserving the
+original error.**
 1. Normal `tailcall f(move _1, copy _2)` via `evalTailCallTerminatorMoving`:
    `_1 = 2` and `_2 = 3` are snapshotted into temporaries `[4, 6]` and `_1` is
    deinitialized (`callerCells[1] = none`) BEFORE `popRaw` runs (checked by
@@ -5413,12 +5443,12 @@ private theorem tailCallMoving_case_cleanupErr :
    (`freedTemps = [4, 6]`).
 2. Direct `initFnTailCallMoving` with an `.InPlace` argument (which would bypass
    the pre-resolution snapshot and deinitialization of
-   `evalCalleeAndArgsMoving`) fails closed before `popRaw` and leaves the state
-   unchanged (`callerCells[1] = some 2`, nothing freed).
+   `evalCalleeAndArgsMoving`) fails closed before `popRaw` (`callerCells[1] =
+   some 2`) and frees any temporary snapshots (`freedTemps = [6]`).
 3. A fault after the arguments were consumed (a root-of-stack `.stop`
-   continuation, or a non-`.normal` `cleanup` result) is terminal and propagates
-   unchanged: no cleanup runs after it (`freedTemps = []`), so no deallocation
-   failure can replace the original error. -/
+   continuation, or a non-`.normal` `cleanup` result) frees the temporary
+   snapshots (`freedTemps = [4, 6]`) via `deallocateTempArgsOnError` and
+   propagates the original error unchanged. -/
 theorem canary_tailCallMoving_deinit_before_pop_inPlace_fail_closed :
     Call.evalTailCallTerminatorMoving (b3TailDropHooks true) () 1
         ⟨⟨⟨0⟩, 0⟩, .TailCall toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩] ⟨0⟩⟩
@@ -5439,14 +5469,14 @@ theorem canary_tailCallMoving_deinit_before_pop_inPlace_fail_closed :
       .error (.invalidProgram "deinitMovedPlace: tail-call argument passed in place")
         { d8InitState with
           callerCells := [none, some 2, some 3, none, none, none, some 3, none],
-          temps := [6] } ∧
+          temps := [6], freedTemps := [6] } ∧
     Call.evalTailCallTerminatorMoving (b3TailDropHooks true true) () 1
         ⟨⟨⟨0⟩, 0⟩, .TailCall toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩] ⟨0⟩⟩
         d8InitState =
       .error (.invalidProgram "cannot tailcall as root of stack")
         { callerCells := [none, none, some 3, none, some 2, none, some 3, none],
           calleeCells := [none, none, none, none],
-          temps := [4, 6], freedTemps := [], inCallee := false, block := 0,
+          temps := [4, 6], freedTemps := [4, 6], inCallee := false, block := 0,
           unwinding := false, panicCalled := false } ∧
     Call.evalTailCallTerminatorMoving (b3TailDropHooks true false .noJump) () 1
         ⟨⟨⟨0⟩, 0⟩, .TailCall toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩] ⟨0⟩⟩
@@ -5454,10 +5484,50 @@ theorem canary_tailCallMoving_deinit_before_pop_inPlace_fail_closed :
       .error (.invalidProgram "tailcall cleanup must return Normal")
         { callerCells := [none, none, some 3, none, some 2, none, some 3, none],
           calleeCells := [none, some 2, some 3, none],
-          temps := [4, 6], freedTemps := [], inCallee := false, block := 0,
+          temps := [4, 6], freedTemps := [4, 6], inCallee := false, block := 0,
           unwinding := false, panicCalled := false } :=
   ⟨tailCallMoving_case_normal, tailCallMoving_case_inPlace,
    tailCallMoving_case_rootStop, tailCallMoving_case_cleanupErr⟩
+
+/-- **Zero temporary leaks and error preservation across all consumer-side call
+error paths (`ep1-B4`).**
+1. In `evalCalleeAndArgsMoving` on `f(move _1, copy _1)` where arg 0 (`move _1`)
+   snapshots into temporary `4` and deinitializes `_1`, and arg 1 (`copy _1`)
+   allocates temporary `6` and faults in `copyToMemory` (`invalidUninitBytes`):
+   `materializeArgument` frees temporary `6` and `evalCalleeAndArgsMoving` frees
+   temporary `4` (`temps = [4, 6]`, `freedTemps = [6, 4]`).
+2. In `evalCallTerminatorMoving` when `initFnCall` faults after argument
+   evaluation (`budget = 0`: `call dispatch budget exhausted`), `temps = [4, 6]`
+   are freed (`freedTemps = [4, 6]`).
+3. Even when `deallocateStack` itself throws an error on every pointer,
+   `deallocateTempArgsOnError` catches the deallocation failure and propagates
+   the original `cannot tailcall as root of stack` error unchanged. -/
+theorem canary_call_error_paths_deallocate_all_temps_and_preserve_error :
+    Call.evalCalleeAndArgsMoving (b3TailDropHooks true) () toyFn
+        #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨1, #[]⟩⟩] d8InitState =
+      .error (.undefinedBehavior "invalidUninitBytes")
+        { d8InitState with
+          callerCells := [none, none, some 3, none, some 2, none, none, none],
+          temps := [4, 6], freedTemps := [6, 4] } ∧
+    Call.evalCallTerminatorMoving (b3TailDropHooks true) () 0
+        ⟨⟨⟨0⟩, 0⟩, .Call toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩]
+          toyDest (some 0) (.Cleanup 1) .Normal ⟨0⟩⟩
+        d8InitState =
+      .error (.resourceExhaustion "call dispatch budget exhausted")
+        { d8InitState with
+          callerCells := [none, none, some 3, none, some 2, none, some 3, none],
+          temps := [4, 6], freedTemps := [4, 6] } ∧
+    Call.evalTailCallTerminatorMoving
+        { b3TailDropHooks true true with
+          deallocateStack := fun _ _ => throw (.invalidProgram "dealloc failed") }
+        () 1
+        ⟨⟨⟨0⟩, 0⟩, .TailCall toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩] ⟨0⟩⟩
+        d8InitState =
+      .error (.invalidProgram "cannot tailcall as root of stack")
+        { d8InitState with
+          callerCells := [none, none, some 3, none, some 2, none, some 3, none],
+          temps := [4, 6], freedTemps := [] } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl, by with_unfolding_all rfl⟩
 
 /-- **`Call.initDropInPlaceCall` on a static (non-`dyn`) type, universal.**
 Forces allocation of the dropped place, resolves drop glue, builds `&mut T` via
@@ -5602,9 +5672,12 @@ theorem call_evalCallTerminatorMoving_dest_before_args
       let oldLoc := (← h.getFrame).location
       let destPlace ← h.evalPlace choice dest false
       let (evaluated, temps) ← Call.evalCalleeAndArgsMoving h choice func args
-      Call.initFnCall h choice budget ⟨evaluated.callee, evaluated.callerAbi, evaluated.fnAbi,
-        evaluated.args, evaluated.withCallerLocation, destPlace, target,
-        if evaluated.fnAbi.any h.abiCanUnwind then unwind else .Unreachable⟩
+      try
+        Call.initFnCall h choice budget ⟨evaluated.callee, evaluated.callerAbi, evaluated.fnAbi,
+          evaluated.args, evaluated.withCallerLocation, destPlace, target,
+          if evaluated.fnAbi.any h.abiCanUnwind then unwind else .Unreachable⟩
+      catch err =>
+        Call.deallocateTempArgsOnError h choice temps err
       Call.deallocateTempArgs h choice temps
       if target.isSome then
         if (← h.frameIndex) == oldIndex then
