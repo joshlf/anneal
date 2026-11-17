@@ -990,6 +990,19 @@ impl TrackedProcessTree {
             let _ = grace_period;
         }
     }
+    /// Returns true only on a *positive* `/proc` observation that `root_pid` is an
+    /// un-reaped zombie with its recorded `starttime` (never on a failed read), so
+    /// the caller may still signal `-pgid` (reserved by the zombie) before reaping.
+    fn root_is_zombie(&self) -> bool {
+        let Some(root_st) = self.root_starttime else {
+            return false;
+        };
+        matches!(
+            proc_state_ppid_starttime_in(&self.proc_root, self.root_pid),
+            Some(('Z', _, actual_st)) if actual_st == root_st
+        )
+    }
+
     /// Returns true if `root_pid` has already exited (zombie `'Z'`/`'X'`, gone,
     /// or recycled with a different `starttime`) without reaping `Child`.
     fn root_has_exited(&self) -> bool {
@@ -1001,6 +1014,61 @@ impl TrackedProcessTree {
             Some((state, _, actual_st))
                 if actual_st == root_st && state != 'Z' && state != 'X'
         )
+    }
+}
+
+/// Sends `sig` to process group `pgid` (`kill(-pgid, sig)`); a no-op for
+/// `pgid <= 1` and on non-Unix targets.
+fn signal_process_group(pgid: u32, sig: i32) {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        if let Ok(pg) = i32::try_from(pgid)
+            && pg > 1
+        {
+            // SAFETY: `kill(2)` takes plain integers and has no memory-safety
+            // preconditions; callers only pass the group of a still un-reaped
+            // root, whose id therefore cannot have been recycled.
+            unsafe {
+                let _ = kill(-pg, sig);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pgid, sig);
+    }
+}
+
+/// Returns `Some(status)` once the root has exited on its own (`None` while it
+/// runs). Where `/proc` shows the root as a zombie with its recorded
+/// `starttime`, its process group (`pgid == root_pid`, still reserved by the
+/// un-reaped zombie) is `SIGKILL`ed before the root is reaped, so a stray group
+/// member spawned after the last `(pid, starttime)` scan can neither keep
+/// running nor hold the output pipes open; tracked descendants that left the
+/// group are killed by `(pid, starttime)`. Without `/proc` this falls back to
+/// `try_wait` plus tracked-descendant cleanup.
+fn reap_exited_root(
+    child: &mut Child,
+    tree: &mut TrackedProcessTree,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    const SIGKILL: i32 = 9;
+    if tree.root_is_zombie() {
+        let _ = tree.sample_rss_kib();
+        signal_process_group(tree.root_pid, SIGKILL);
+        tree.kill_descendants(Duration::ZERO);
+        return child.wait().map(Some);
+    }
+    match child.try_wait()? {
+        Some(status) => {
+            // Already reaped: only `(pid, starttime)`-verified descendants may be
+            // signaled now (never `-pgid`).
+            tree.kill_descendants(Duration::ZERO);
+            Ok(Some(status))
+        }
+        None => Ok(None),
     }
 }
 
@@ -1249,7 +1317,10 @@ impl WatchdogPipeReader {
 ///
 /// Before killing for RSS or timeout, the root is re-polled so a process that
 /// exited while `/proc` was being scanned keeps its genuine exit status (like
-/// `miri_eval::run_lean_with_rss_budget`). The call returns within roughly
+/// `miri_eval::run_lean_with_rss_budget`). A root that exits on its own is
+/// observed as a zombie and its whole group is killed before it is reaped
+/// ([`reap_exited_root`]), so no stray group member outlives the run. The call
+/// returns within roughly
 /// `timeout + ITREE_WATCHDOG_KILL_GRACE + ITREE_WATCHDOG_PIPE_DRAIN_GRACE` even if
 /// an escaped descendant keeps an output pipe open (`pipes_drained == false`).
 ///
@@ -1287,14 +1358,8 @@ pub fn run_command_with_watchdog(
     let mut peak_rss_kib = tree.sample_rss_kib();
     let mut watchdog_killed: Option<ItreeLeanFailureKind> = None;
     let (exit_success, signal_terminated) = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Clean up any stray background descendants using `(pid,
-                // starttime)` checks only (never `-pgid` after `root_pid` has
-                // been reaped).
-                tree.kill_descendants(Duration::ZERO);
-                break (status.success(), status.code().is_none());
-            }
+        match reap_exited_root(&mut child, &mut tree) {
+            Ok(Some(status)) => break (status.success(), status.code().is_none()),
             Ok(None) => {}
             Err(e) => {
                 terminate_process_tree(&mut child, &mut tree, ITREE_WATCHDOG_KILL_GRACE);
@@ -1318,8 +1383,7 @@ pub fn run_command_with_watchdog(
             // Re-check before killing: a root that exited while `/proc` was
             // scanned keeps its genuine exit status instead of being
             // misattributed to the watchdog.
-            if let Ok(Some(status)) = child.try_wait() {
-                tree.kill_descendants(Duration::ZERO);
+            if let Ok(Some(status)) = reap_exited_root(&mut child, &mut tree) {
                 break (status.success(), status.code().is_none());
             }
             watchdog_killed = Some(kind);
@@ -1461,6 +1525,25 @@ fn itree_lean_stage_concurrency(default: usize) -> usize {
 fn itree_bisect_failure_budget(n: usize) -> usize {
     let ceil_log2 = (usize::BITS - n.max(1).saturating_sub(1).leading_zeros()) as usize;
     2 * ceil_log2 + 2
+}
+
+/// Normalized, sorted, deduplicated Lean `error:` messages of a failed run: the
+/// text after each `error:` marker, so the `<file>:<line>:<col>:` location (which
+/// names the per-slice module), the harness header (peak RSS, `-M`, thread
+/// count), and non-error output are dropped. Two bisection halves failing with the
+/// same non-empty signature reproduce one candidate-wide failure.
+fn lean_error_signature(err: &str) -> Vec<String> {
+    let mut messages: Vec<String> = err
+        .lines()
+        .filter_map(|line| {
+            let idx = line.find("error:")?;
+            let msg = line[idx + "error:".len()..].trim();
+            (!msg.is_empty()).then(|| msg.to_string())
+        })
+        .collect();
+    messages.sort();
+    messages.dedup();
+    messages
 }
 
 /// Runs one chunked Lean stage with failure isolation and multi-case bisection.
@@ -1642,6 +1725,10 @@ where
                                 .iter()
                                 .any(|c| raw_body.contains(case_key(c)))
                                 || itree_lean_failure_is_inconclusive(&raw_body);
+                            // Compare halves by their normalized Lean `error:` messages:
+                            // the raw bodies embed the per-slice module path / label and
+                            // peak-RSS figures, so they never compare equal verbatim.
+                            let raw_body = lean_error_signature(&raw_body).join("\n");
                             if slice.len() == 1 {
                                 errors.push(format!(
                                     "{sub_label} (irreducible single case `{}` of `{fn_name}`): {}",
@@ -1659,7 +1746,7 @@ where
                     [
                         (_, _, Some((ItreeLeanFailureKind::ElaborationOrOutputFailure, b0, false))),
                         (_, _, Some((ItreeLeanFailureKind::ElaborationOrOutputFailure, b1, false))),
-                    ] => b0 == b1,
+                    ] => !b0.is_empty() && b0 == b1,
                     _ => false,
                 };
                 if candidate_wide_elaboration {
@@ -6620,9 +6707,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn watchdog_returns_promptly_when_an_untracked_descendant_holds_the_output_pipe() {
-        // The root exits at once while a backgrounded `sleep` keeps stdout open.
+        // The root exits at once while a backgrounded `sleep` (in the root's
+        // process group, possibly never sampled by `(pid, starttime)` tracking)
+        // keeps stdout open.
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("sleep 6 & echo started; exit 0");
+        cmd.arg("-c").arg("sleep 6 & echo started $!; exit 0");
         let start = Instant::now();
         let out = run_command_with_watchdog(
             cmd,
@@ -6639,7 +6728,23 @@ mod tests {
         assert!(out.exit_success);
         assert_eq!(out.watchdog_killed, None);
         assert!(!out.signal_terminated);
-        assert!(String::from_utf8_lossy(&out.stdout).contains("started"));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(stdout.contains("started"));
+        if Path::new("/proc/self/stat").exists() {
+            // The exited root is observed as a zombie and its group is killed
+            // before reaping, so the stray `sleep` dies and the pipe drains.
+            assert!(out.pipes_drained, "group kill must release the held pipe");
+            let stray: u32 = stdout
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .expect("stray sleep pid");
+            let state = proc_state_ppid_starttime_in(Path::new("/proc"), stray);
+            assert!(
+                state.is_none() || matches!(state, Some(('Z' | 'X', _, _))),
+                "stray group member {stray} must not outlive the run: {state:?}"
+            );
+        }
         // A short-lived root is reaped well within one capped poll interval.
         let mut quick = Command::new("sh");
         quick.arg("-c").arg("exit 3");
@@ -6691,6 +6796,40 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 4, "{:?}", calls.lock().unwrap());
         assert_eq!(stage.failed_fns, BTreeSet::from(["cand_systematic".to_string()]));
         assert!(stage.errors.iter().any(|e| e.contains("candidate-wide")));
+
+        // 1b. The same failure as real `run_itree_lean_module_with_workers` output:
+        //     each half's error names its own module path / label and peak RSS, so
+        //     only the normalized Lean `error:` messages coincide.
+        let (cases, case_to_fn) = stage_fixture(&[("cand_systematic_real", 8)]);
+        let calls = Mutex::new(0usize);
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchProbe",
+            &cases,
+            64,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, chunk: &[String]| -> Result<BTreeMap<String, usize>, String> {
+                let n = {
+                    let mut c = calls.lock().unwrap();
+                    *c += 1;
+                    *c
+                };
+                Err(format!(
+                    "`/tmp/verify/{label}.lean` failed (peak RSS {} KiB / 8388608 KiB, -M 8192 MiB, \
+                     LEAN_NUM_THREADS=2):\nstdout:\n/tmp/verify/{label}.lean:{}:0: error: unknown \
+                     constant 'Mir.ItreeDiffStaged.b0_c0__kernel_step.body'\nstderr:\n",
+                    100_000 + n * 7,
+                    10 + chunk.len()
+                ))
+            },
+        );
+        assert_eq!(*calls.lock().unwrap(), 4, "chunk + fallback + one pair of halves");
+        assert!(stage.errors.iter().any(|e| e.contains("candidate-wide")));
+        assert_eq!(
+            lean_error_signature("x.lean:3:1: error: foo\nnoise\ny.lean:9:2: error: foo\n"),
+            vec!["foo".to_string()]
+        );
 
         // 2. Every slice times out: failing bisection runs stay within the budget.
         let (cases, case_to_fn) = stage_fixture(&[("cand_slow", 12)]);

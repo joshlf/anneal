@@ -2037,6 +2037,23 @@ fn concolic_path_shape(run: &ItreeConcreteRun) -> Vec<(u32, u128, &str)> {
         .collect()
 }
 
+/// Owned [`concolic_path_shape`]: the run's observable path skeleton (branch
+/// decisions and callee sequence, call values erased) — the evaluator-side
+/// analogue of the native `compute_itree_obs_shape_hash` that
+/// `cumulative_distinct_obs_paths` counts (which also ignores call values).
+type ConcolicShape = Vec<(u32, u128, String)>;
+
+fn concolic_owned_shape(run: &ItreeConcreteRun) -> ConcolicShape {
+    concolic_path_shape(run)
+        .into_iter()
+        .map(|(site, tag, callee)| (site, tag, callee.to_string()))
+        .collect()
+}
+
+/// Maximum number of prefix-preserving argument negations examined per pin and
+/// round while looking for one that also reaches an unseen path shape.
+const ITREE_CONCOLIC_SHAPE_SEARCH_LIMIT: usize = 128;
+
 /// Ordered `(site, tag)` sequence of all branch decisions in `run`.
 fn concolic_branch_decisions(run: &ItreeConcreteRun) -> Vec<(u32, u128)> {
     run.events
@@ -2087,12 +2104,15 @@ struct ConcolicPinState {
 ///    all earlier calls with identical arguments and returns = `pins.take pinIdx`)
 ///    and reaches call `j` on the same callee with an argument tuple satisfying
 ///    `neg_arg_pin_term` (distinct from the base arguments and from every tuple
-///    already exercised at that prefix). 0-argument calls are skipped
-///    (`negArgPinTerm` is `false`), and calls whose argument domain is exhausted or
-///    that no candidate input can steer fall back.
+///    already exercised at that prefix). Among such negations the one reaching an
+///    unseen path shape is preferred (the path after call `j` is unconstrained, and
+///    `cumulative_distinct_obs_paths` ignores call values, so only new shapes add
+///    observable paths), then one keeping the base's branch decisions. 0-argument
+///    calls are skipped (`negArgPinTerm` is `false`), and calls whose argument
+///    domain is exhausted or that no candidate input can steer fall back.
 /// 2. **Oracle return perturbation**, strictly after every argument negation:
 ///    the base input with prefix-return pins plus a perturbed return for call `j`
-///    (identical arguments), preferring returns that change the downstream path.
+///    (identical arguments), preferring returns that reach an unseen path shape.
 /// 3. **Branch flips** with any remaining budget.
 ///
 /// Every emitted trial's predicted run is distinct from all base runs and earlier
@@ -2114,11 +2134,16 @@ pub fn explore_itree_concolic_trials(
         return out;
     };
     let empty = EnvSchedule::new();
-    let mut run_cache: BTreeMap<(u32, u32), Option<ItreeConcreteRun>> = BTreeMap::new();
-    let mut run_plain = |m: u32, p: u32| -> Option<ItreeConcreteRun> {
+    let mut run_cache: BTreeMap<(u32, u32), Option<std::rc::Rc<ItreeConcreteRun>>> =
+        BTreeMap::new();
+    let mut run_plain = |m: u32, p: u32| -> Option<std::rc::Rc<ItreeConcreteRun>> {
         run_cache
             .entry((m, p))
-            .or_insert_with(|| ev.run_kernel_step(m, p, &empty, callee_key_prefix).ok())
+            .or_insert_with(|| {
+                ev.run_kernel_step(m, p, &empty, callee_key_prefix)
+                    .ok()
+                    .map(std::rc::Rc::new)
+            })
             .clone()
     };
 
@@ -2128,10 +2153,14 @@ pub fn explore_itree_concolic_trials(
             continue;
         }
         if let Some(run) = run_plain(m, p) {
-            bases.push((idx, m, p, run));
+            bases.push((idx, m, p, (*run).clone()));
         }
     }
     let mut seen_runs: BTreeSet<ItreeConcreteRun> = bases.iter().map(|b| b.3.clone()).collect();
+    // Path shapes already covered (bases and accepted trials): the coverage
+    // metric `cumulative_distinct_obs_paths` only grows on a new shape.
+    let mut seen_shapes: BTreeSet<ConcolicShape> =
+        bases.iter().map(|b| concolic_owned_shape(&b.3)).collect();
     let mut used_plain_inputs: BTreeSet<(u32, u32)> = bases.iter().map(|b| (b.1, b.2)).collect();
     let mut seen_args: BTreeMap<ConcolicArgKey, BTreeSet<Vec<Vec<u8>>>> = BTreeMap::new();
     for b in &bases {
@@ -2192,10 +2221,16 @@ pub fn explore_itree_concolic_trials(
                 ps.exhausted = Some(ArgPinFallbackReason::DomainExhausted);
                 continue;
             }
+            // Among prefix-preserving negations prefer, in order: one reaching an
+            // unseen path shape (downstream of call `j` the path is unconstrained by
+            // `relaxPinConstraint`, and only a new shape adds an observable path),
+            // then one keeping the base's branch decisions, then the first found.
             let base_branches = concolic_branch_decisions(base);
-            let mut fallback_found: Option<(u32, u32, Vec<Vec<u8>>, ItreeConcreteRun)> = None;
-            let mut branch_preserving_found: Option<(u32, u32, Vec<Vec<u8>>, ItreeConcreteRun)> =
-                None;
+            type Found = (u32, u32, Vec<Vec<u8>>, std::rc::Rc<ItreeConcreteRun>);
+            let mut new_shape_found: Option<Found> = None;
+            let mut branch_preserving_found: Option<Found> = None;
+            let mut first_found: Option<Found> = None;
+            let mut satisfying = 0usize;
             for &(m, p) in &pools[ps.base] {
                 if used_plain_inputs.contains(&(m, p)) {
                     continue;
@@ -2203,29 +2238,42 @@ pub fn explore_itree_concolic_trials(
                 let Some(run) = run_plain(m, p) else {
                     continue;
                 };
-                if !run.shares_prefix_with(base, ps.pos) || seen_runs.contains(&run) {
+                if !run.shares_prefix_with(base, ps.pos) || seen_runs.contains(&*run) {
                     continue;
                 }
-                if let Some(ItreeConcreteEvent::ExtCall { callee, args, .. }) =
-                    run.events.get(ps.pos)
-                    && *callee == ps.pin.callee
-                    && ps.pin.neg_arg_pin_term(args)
+                let Some(ItreeConcreteEvent::ExtCall { callee, args, .. }) = run.events.get(ps.pos)
+                else {
+                    continue;
+                };
+                if *callee != ps.pin.callee || !ps.pin.neg_arg_pin_term(args) {
+                    continue;
+                }
+                let args = args.clone();
+                if !seen_shapes.contains(&concolic_owned_shape(&run)) {
+                    new_shape_found = Some((m, p, args, run));
+                    break;
+                }
+                if branch_preserving_found.is_none()
+                    && concolic_branch_decisions(&run) == base_branches
                 {
-                    if concolic_branch_decisions(&run) == base_branches {
-                        branch_preserving_found = Some((m, p, args.clone(), run));
-                        break;
-                    }
-                    if fallback_found.is_none() {
-                        fallback_found = Some((m, p, args.clone(), run));
-                    }
+                    branch_preserving_found = Some((m, p, args.clone(), run.clone()));
+                }
+                if first_found.is_none() {
+                    first_found = Some((m, p, args, run));
+                }
+                satisfying += 1;
+                if satisfying >= ITREE_CONCOLIC_SHAPE_SEARCH_LIMIT {
+                    break;
                 }
             }
-            let found = branch_preserving_found.or(fallback_found);
+            let found = new_shape_found.or(branch_preserving_found).or(first_found);
             match found {
                 Some((m, p, new_args, run)) => {
+                    let run = (*run).clone();
                     register_concolic_args(&mut seen_args, &run);
                     ps.pin.record_excluded_arg_tuple(new_args.clone());
                     used_plain_inputs.insert((m, p));
+                    seen_shapes.insert(concolic_owned_shape(&run));
                     seen_runs.insert(run.clone());
                     out.push(ItreeConcolicTrial {
                         magic: m,
@@ -2339,7 +2387,7 @@ pub fn explore_itree_concolic_trials(
                 if !follows || seen_runs.contains(&run) {
                     continue;
                 }
-                if concolic_path_shape(&run) != concolic_path_shape(base) {
+                if !seen_shapes.contains(&concolic_owned_shape(&run)) {
                     chosen = Some((bytes, sched, run));
                     break;
                 }
@@ -2349,6 +2397,7 @@ pub fn explore_itree_concolic_trials(
             }
             if let Some((bytes, sched, run)) = chosen.or(fallback) {
                 used.insert(bytes);
+                seen_shapes.insert(concolic_owned_shape(&run));
                 seen_runs.insert(run.clone());
                 out.push(ItreeConcolicTrial {
                     magic: m0,
@@ -2390,15 +2439,17 @@ pub fn explore_itree_concolic_trials(
                         Some(ItreeConcreteEvent::Branch { site: s, tag: t })
                             if s == site && t != tag
                     );
-                (flipped && !seen_runs.contains(&run)).then_some((m, p, run))
+                (flipped && !seen_runs.contains(&*run)).then_some((m, p, run))
             });
             if let Some((m, p, run)) = found {
+                let run = (*run).clone();
                 let new_tag = match run.events[pos] {
                     ItreeConcreteEvent::Branch { tag, .. } => tag,
                     _ => *tag,
                 };
                 used_plain_inputs.insert((m, p));
                 register_concolic_args(&mut seen_args, &run);
+                seen_shapes.insert(concolic_owned_shape(&run));
                 seen_runs.insert(run.clone());
                 out.push(ItreeConcolicTrial {
                     magic: m,
@@ -3304,15 +3355,8 @@ mod tests {
             "all 3 boundary calls (stage1, stage2, ext_oracle) must be negatable under prefix pins"
         );
         for t in &trials {
-            if let ConcolicTrialPhase::NegateCallArg { pin_idx, .. } = &t.phase {
+            if let ConcolicTrialPhase::NegateCallArg { .. } = &t.phase {
                 assert!(t.predicted.shares_prefix_with(&base_run, t.target_event_pos));
-                if *pin_idx == 0 {
-                    assert_eq!(
-                        concolic_branch_decisions(&t.predicted),
-                        concolic_branch_decisions(&base_run),
-                        "pin_idx = 0 negation should preserve downstream branch decisions when possible"
-                    );
-                }
             }
         }
 
@@ -3337,5 +3381,40 @@ mod tests {
             BTreeSet::from([0, 1]),
             "both injected oracle and seed ext_oracle must be negatable under prefix pins"
         );
+    }
+
+    /// Downstream of the negated call the path is unconstrained, and the coverage
+    /// metric ignores call values: among prefix-preserving negations the explorer
+    /// must prefer one that reaches an unseen path shape over the first (same-shape)
+    /// candidate in pool order.
+    #[test]
+    fn concolic_arg_negation_prefers_unseen_path_shapes_for_coverage() {
+        let src = r#"
+            pub fn ext_a(x: u32) -> u32 { x >> 1 }
+            pub fn kernel_step(magic: u32, payload_len: u32) -> u32 {
+                let a: u32 = ext_a(payload_len);
+                if a > 5000 { magic } else { 2 }
+            }
+        "#;
+        let dict = MirInputDictionary::from_rust_source(src).unwrap();
+        let ev = ItreeConcreteEvaluator::new(src, "kernel_step").unwrap();
+        let base = ev
+            .run_kernel_step(0x414E_4E4C, 2048, &EnvSchedule::new(), "")
+            .unwrap();
+        assert_eq!(base.events.last(), Some(&branch(0, 0)));
+        // The first pool candidate (`payload_len + 1`) negates `ext_a`'s argument but
+        // stays on the else-branch; the explorer keeps scanning for the then-branch.
+        let first_pool = ev
+            .run_kernel_step(0x414E_4E4C, 2049, &EnvSchedule::new(), "")
+            .unwrap();
+        assert_eq!(concolic_owned_shape(&first_pool), concolic_owned_shape(&base));
+        let trials =
+            explore_itree_concolic_trials(src, "kernel_step", "", &[(0x414E_4E4C, 2048)], &dict, 1, 5);
+        assert_eq!(trials.len(), 1);
+        let t = &trials[0];
+        assert!(matches!(t.phase, ConcolicTrialPhase::NegateCallArg { .. }));
+        assert!(t.predicted.shares_prefix_with(&base, t.target_event_pos));
+        assert_ne!(concolic_owned_shape(&t.predicted), concolic_owned_shape(&base));
+        assert_eq!(t.predicted.events.last(), Some(&branch(0, 1)));
     }
 }
