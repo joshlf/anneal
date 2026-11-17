@@ -346,7 +346,11 @@ def stepHooks [DecidableEq K] (h : Config K U C O X Host) (limits : Limits) :
   let panic := {h.panic with
     evalOperand := eval
     evalOperandAt := fun c path op => OperandMachine.evalOperandAt operands c path op none
-    driver := FunctionCalls.bindUnwind h.panic.driver helpers}
+    driver :=
+      let d := FunctionCalls.bindUnwind h.panic.driver helpers
+      if h.access.deinitMovedPlace then
+        { d with readImmediate := fun _ => PlaceMachine.readImmediate h.access }
+      else d}
   let control := ExecutionControl.hooks h.control.bodySpan h.lifecycle h.access
     (projectionHooks h).place h.copy h.retag helpers h.unwindTerminateFunction
   let discr := discriminantHooks h

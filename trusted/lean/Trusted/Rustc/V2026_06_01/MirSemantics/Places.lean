@@ -2773,7 +2773,13 @@ no static `pointeeTyOpt` is available, defaulting to `1` byte.
 -/
 @[reducible]
 def inferElemListByteStride : List Value → Nat
-  | .scalar sc :: _ => sc.sizeBytes
+  | .scalar sc :: rest =>
+    match sc.sizeBytes with
+    | .zero =>
+      match Nat.beq sc.bits 1 with
+      | true => inferElemListByteStride rest
+      | false => 0
+    | .succ n => .succ n
   | .ptr _ sz :: _ => sz
   | .unit :: _ => 0
   | .aggregate 0 fields :: _ =>
@@ -12548,7 +12554,24 @@ def writeStackThinPtrTypedDeref
                   | .scalar oldSc =>
                     match spliceScalarSlice? oldSc residualBytes wSc with
                     | .some mergedSc => .some (.scalar mergedSc)
-                    | .none => .none
+                    | .none =>
+                      match fullProj, oldSc.sizeBytes, Nat.beq residualBytes 0 with
+                      | _ :: _, .zero, true =>
+                        match subTyOpt with
+                        | .some subTy =>
+                          match
+                            tyByteSize
+                              effTargetDecls
+                              targetLayouts
+                              (resolveTyWithLocalDecls effTargetDecls targetLayouts subTy)
+                          with
+                          | .some subB =>
+                            match Nat.beq wSc.sizeBytes subB with
+                            | true => .some (.scalar wSc)
+                            | false => .none
+                          | .none => .some (.scalar wSc)
+                        | .none => .some (.scalar wSc)
+                      | _, _, _ => .none
                   | _ =>
                     spliceSubValueAtByteOffset?
                       localDecls

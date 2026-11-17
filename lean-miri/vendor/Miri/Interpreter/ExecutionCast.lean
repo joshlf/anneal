@@ -69,6 +69,7 @@ def hooks [DecidableEq K] (queries : Leaves (State K U) C)
     (validationRecursive : C → LocalLayout → M K U Bool)
     (retagBudget validationBudget : Nat) :
     CastHooks Provenance (State K U) C (RuntimePlace Provenance) :=
+  let _ := allocation
   let place := projection.place
   {
     typeInfo := queries.typeInfo

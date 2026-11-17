@@ -2492,16 +2492,16 @@
     {
       "path": "Miri/Interpreter/ExecutionCast.lean",
       "upstream_sha256": "037c6660d02ec418bc48a12f5465c322c8e9ddd666f7e8d2edbd2bdade54298b",
-      "patched_sha256": "6cf5da42022b0eb75085ad9eb5f06ffa0452ad3c816a2819dcdb4830edee7a73",
+      "patched_sha256": "59a329b3c016e80c94cfcea915f57ddecfe1c4bffcb06e3ae82bc3c41964ce2f",
       "upstream_git_blob": "67f877548d3a5d2c600b5e144a58b91c4aed16bc",
       "patch_reason": "deinitMovedPlace: wires the cast latch, latch restoration, and Tree-Borrows-silent source deinitialization to the place dictionary."
     },
     {
       "path": "Miri/Interpreter/ExecutionMachine.lean",
       "upstream_sha256": "e601f25d2c9c87014984ec580979cb8d8beb052b4c7c63507b1d98c7098a8796",
-      "patched_sha256": "6c96601cd31f72b6baad5f6b631cf2bc34af5c045449f9ee12cbcfbdd35de846",
+      "patched_sha256": "8cfa22538b2e34e74b157b1e3b138d9fded41f8d237985a23082ffdf2b4d15b1",
       "upstream_git_blob": "66048728edfdb3295f3cfcefb97b041236715bfa",
-      "patch_reason": "deinitMovedPlace: configuration flag; place-dictionary latch, silent uninit writer and overlap query; selects Cast.castMoving and the moving call terminators only when the flag is on; zero-length Repeat source deinitialization; per-step latch clearing."
+      "patch_reason": "deinitMovedPlace: configuration flag; place-dictionary latch, silent uninit writer and overlap query; selects Cast.castMoving, the moving call terminators, and PlaceMachine.readImmediate on panic driver diagnostic reads only when the flag is on; zero-length Repeat source deinitialization; per-step latch clearing."
     },
     {
       "path": "Miri/Interpreter/LocalAccess.lean",

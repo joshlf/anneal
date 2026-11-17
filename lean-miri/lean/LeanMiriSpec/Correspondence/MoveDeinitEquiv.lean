@@ -23,11 +23,13 @@ true)`).
 
 * **Part 1 (Trusted `Places`).** `deinitProjectedMoves = false` is definitionally
   the pre-extension `evalOperand`/`evalOperands` (verbatim `Legacy` copies);
-  universal decomposition and root-move theorems; `D1`/`D2`/`D3`/`D5`/`D9`
-  canaries (root, zero-sized, field, re-initialization, Tree-Borrows-silent
-  `Deref`, element and subslice moves, nested field-then-element, enum downcast,
-  thin-pointer `Deref`+subslice and union byte-window moves), each with its legacy
-  contrast.
+  universal decomposition and root-move theorems; `D1`/`D2`/`D3`/`D5`/`D6`/`D9`
+  canaries (root, zero-sized, field, re-initialization including typed `Deref`
+  write-back and partial-then-full subslice re-initialization, self-aggregate
+  field swap, Tree-Borrows-silent `Deref`, element and subslice moves, nested
+  field-then-element, enum downcast, thin-pointer `Deref`+subslice, offset slice
+  fat-pointer access after element `0` move, and union byte-window moves), each
+  with its legacy contrast.
 * **Part 2 (`lean-miri`, `deinitMovedPlace = false`).** `Cast.cast` and
   `Call.evalFnCallArgumentAt`/`evalCalleeAndArgs`/`passArgument`/
   `evalCallTerminator`/`evalTailCallTerminator` are the unchanged source (the
@@ -44,17 +46,25 @@ true)`).
   `PlaceMachine.readImmediate`, operand-latch behavior of
   `OperandMachine.evalOperand`, step-boundary latch clearing; universal call
   theorems: every consumer-side argument is an `FnArg.Copy` (one theorem per
-  branch of `Call.evalFnCallArgumentMoving`), on which `passArgument` never runs
-  `protectArgument` (`call_passArgument_copy_protect_irrelevant`), and argument
-  snapshots run under `RetagMode.None` (`call_materializeArgument_indirect_eq`);
-  concrete runs of the real `Call.evalCalleeAndArgsMoving` showing that a moved
-  immediate argument is deinitialized, that `f(move _1, copy _1)` and
-  `(move _1)(copy _1)` fault, and that `call unresolved(move _uninit)` faults
-  before callee resolution (kani#5172); concrete `D4` runs of the real
-  `evalRvalueIntoPlace` (`copy _1 + move _1` succeeds, `move _1 + copy _1` and
-  `move _1 + move _1` fault, for memory-backed, immediate and projected-immediate
-  locals); and the event order of the real `Cast.castMoving` (read, then
-  deinitialize, then write; latch hand-off to transmute and unsizing copies).
+  branch of `Call.evalFnCallArgumentMoving`), on which `passArgument` and
+  `allocateVarargs` never run `protectArgument`
+  (`call_passArgument_copy_protect_irrelevant`,
+  `call_allocateVarargs_protect_irrelevant`), and argument snapshots run under
+  `RetagMode.None` (`call_materializeArgument_indirect_eq`); concrete runs of the
+  real `Call.evalCalleeAndArgsMoving` showing that a moved immediate argument is
+  deinitialized, that `f(move _1, copy _1)` and `(move _1)(copy _1)` fault, and
+  that `call unresolved(move _uninit)` faults before callee resolution
+  (kani#5172); concrete `D4` runs of the real `evalRvalueIntoPlace`
+  (`copy _1 + move _1` succeeds, `move _1 + copy _1` and `move _1 + move _1`
+  fault, for memory-backed, immediate and projected-immediate locals); the event
+  order of the real `Cast.castMoving` (read, then deinitialize, then write; latch
+  hand-off to transmute and unsizing copies); `CopyNonOverlapping` FIFO latch
+  reordering (`prependLastPendingMoveDeinit`, including `count == 0`), `Repeat`
+  (`length == 0` and `length > 0`) and `Aggregate` move deinitialization;
+  `RustCall` tuple argument unpacking and `FnInstance.Virtual` receiver dispatch
+  through `Call.evalCallTerminatorMoving`; and `D8` `Assert` and unwinding `Call`
+  cleanup (`canary_D8_assert_cleanup_moved_cond_ub`,
+  `canary_D8_unwinding_call_moved_arg_ub`, `canary_D8_unwinding_call_unmoved_ok`).
 * **Part 4.** A root-move simulation between `LocalAccess.evalOperand`
   (`deinitMovedPlace = true`) and `evalOperand (deinitProjectedMoves := true)`.
 * **Part 5.** An environment audit: no declaration depends on `sorryAx`,
@@ -90,12 +100,19 @@ verbatim source copy in Part 2. -/
 elab "unfold_named " n:str : tactic => do
   let env ← getEnv
   let target := n.getString
-  let mut found := false
-  for (name, _) in env.constants.map₁.toList do
-    if name.toString == target then
-      found := true
-      evalTactic (← `(tactic| unfold $(mkIdent name):ident))
-  unless found do throwError "constant {target} not found"
+  let parsed := (target.splitOn ".").foldl (init := Name.anonymous) fun acc part =>
+    match part.toNat? with
+    | some k => Name.mkNum acc k
+    | none => Name.mkStr acc part
+  if env.contains parsed then
+    evalTactic (← `(tactic| unfold $(mkIdent parsed):ident))
+  else
+    let mut found := false
+    for (name, _) in env.constants.map₁.toList do
+      if name.toString == target then
+        found := true
+        evalTactic (← `(tactic| unfold $(mkIdent name):ident))
+    unless found do throwError "constant {target} not found"
 
 end LeanMiriSpec.Correspondence.MoveDeinitEquivTactic
 
@@ -1260,6 +1277,132 @@ theorem canary_D6_evalOperands_field_swap :
       [] (pl 1 []) (.aggregate 0 [sc8 3, sc8 2]) =
       .ok [.uninit, .init (.aggregate 0 [sc8 3, sc8 2])] := ⟨rfl, rfl⟩
 
+/-- **`D6` self-aggregate field swap (`_1 = (move _1.1, move _1.0)`) and same-list
+move/copy combinations on the real `Places.evalOperands`.**
+1. First `.move _1.1` reads `3` and marks `_1.1` uninit while leaving `_1.0 = 2`
+   intact; second `.move _1.0` reads `2` and marks `_1.0` uninit; writing
+   `.aggregate 0 [sc8 3, sc8 2]` to `_1` re-initializes `_1` so reading `_1`,
+   `_1.0`, and `_1.1` in `deinitProjectedMoves` mode returns `(3, 2)`, `3`, and
+   `2`.
+2. In a single `evalOperands` list: `[.move _1, .copy _1]` faults with `.ub`,
+   `[.copy _1, .move _1]` succeeds (`D4`), `[.move _1.0, .copy _1.0]` faults with
+   `.ub`, and `[.move _1.0, .copy _1.1]` succeeds. -/
+theorem canary_D6_field_swap_self_aggregate_ok :
+    evalOperand d2Locals (.move (pl 1 [.field 1 u8Ty])) (deinitProjectedMoves := true) =
+      .ok (sc8 3) [.uninit, .init (.aggregate 0 [sc8 2, movedUninitValue])] ∧
+    evalOperand [.uninit, .init (.aggregate 0 [sc8 2, movedUninitValue])]
+      (.move (pl 1 [.field 0 u8Ty])) (deinitProjectedMoves := true) =
+      .ok (sc8 2) [.uninit, .init (.aggregate 0 [movedUninitValue, movedUninitValue])] ∧
+    evalOperands d2Locals [.move (pl 1 [.field 1 u8Ty]), .move (pl 1 [.field 0 u8Ty])]
+      (deinitProjectedMoves := true) =
+      .ok [sc8 3, sc8 2]
+        [.uninit, .init (.aggregate 0 [movedUninitValue, movedUninitValue])] ∧
+    writePlaceValue
+      [.uninit, .init (.aggregate 0 [movedUninitValue, movedUninitValue])]
+      [] (pl 1 []) (.aggregate 0 [sc8 3, sc8 2]) =
+      .ok [.uninit, .init (.aggregate 0 [sc8 3, sc8 2])] ∧
+    evalOperand [.uninit, .init (.aggregate 0 [sc8 3, sc8 2])] (.copy (pl 1 []))
+      (deinitProjectedMoves := true) =
+      .ok (.aggregate 0 [sc8 3, sc8 2]) [.uninit, .init (.aggregate 0 [sc8 3, sc8 2])] ∧
+    evalOperand [.uninit, .init (.aggregate 0 [sc8 3, sc8 2])] (.copy (pl 1 [.field 0 u8Ty]))
+      (deinitProjectedMoves := true) =
+      .ok (sc8 3) [.uninit, .init (.aggregate 0 [sc8 3, sc8 2])] ∧
+    evalOperand [.uninit, .init (.aggregate 0 [sc8 3, sc8 2])] (.copy (pl 1 [.field 1 u8Ty]))
+      (deinitProjectedMoves := true) =
+      .ok (sc8 2) [.uninit, .init (.aggregate 0 [sc8 3, sc8 2])] ∧
+    evalOperands d1Locals [.move (pl 1 []), .copy (pl 1 [])] (deinitProjectedMoves := true) = .ub ∧
+    evalOperands d1Locals [.copy (pl 1 []), .move (pl 1 [])] (deinitProjectedMoves := true) =
+      .ok [sc8 5, sc8 5] [.uninit, .uninit] ∧
+    evalOperands d2Locals [.move (pl 1 [.field 0 u8Ty]), .copy (pl 1 [.field 0 u8Ty])]
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperands d2Locals [.move (pl 1 [.field 0 u8Ty]), .copy (pl 1 [.field 1 u8Ty])]
+      (deinitProjectedMoves := true) = .ok [sc8 2, sc8 3] d2AfterMove :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `d5TypedTupleAfterMove` after re-initializing `_1.1 = 99`. -/
+def d5TypedTupleAfterReinit : List LocalSlot :=
+  [.uninit,
+   .init (.aggregate 0 [sc8 2, sc8 99]),
+   .init (.ptr { allocId := 2, offsetBytes := 1 } 8),
+   .init (.ptr { allocId := 3, offsetBytes := 1 } 8)]
+
+/-- **`D3` write-back / re-initialization completeness (projected field write,
+root assignment, and typed pointer dereference write `*_2 = 99`).** After moving
+`_1.1` out of `_1 : (u8, u8) = (2, 3)` (`d5TypedTupleAfterMove`), re-initializing
+via `_1.1 = 99`, `_1 = (2, 99)`, or `*_2 = 99` (where `_2 : *mut u8` points at
+byte offset `1` of `_1`) all succeed and produce `d5TypedTupleAfterReinit`, where
+`valueContainsMovedUninit` is `false` on both `_1` and `_1.1` and subsequent
+reads of `_1`, `_1.1`, `*_2`, and `*_3` all succeed. -/
+theorem canary_D3_typed_deref_reinit_after_field_move :
+    writePlaceValue d5TypedTupleAfterMove d5Borrows (pl 1 [.field 1 u8Ty]) (sc8 99)
+      d5TypedTupleDecls d5TypedTupleLayouts = .ok d5TypedTupleAfterReinit ∧
+    writePlaceValue d5TypedTupleAfterMove d5Borrows (pl 1 []) (.aggregate 0 [sc8 2, sc8 99])
+      d5TypedTupleDecls d5TypedTupleLayouts = .ok d5TypedTupleAfterReinit ∧
+    writePlaceValue d5TypedTupleAfterMove d5Borrows (pl 2 [.deref]) (sc8 99)
+      d5TypedTupleDecls d5TypedTupleLayouts = .ok d5TypedTupleAfterReinit ∧
+    valueContainsMovedUninit (.aggregate 0 [sc8 2, sc8 99]) = false ∧
+    valueContainsMovedUninit (sc8 99) = false ∧
+    evalOperand d5TypedTupleAfterReinit (.copy (pl 1 [])) d5Borrows []
+      d5TypedTupleLayouts [] d5TypedTupleDecls [] true =
+      .ok (.aggregate 0 [sc8 2, sc8 99]) d5TypedTupleAfterReinit ∧
+    evalOperand d5TypedTupleAfterReinit (.copy (pl 1 [.field 1 u8Ty])) d5Borrows []
+      d5TypedTupleLayouts [] d5TypedTupleDecls [] true =
+      .ok (sc8 99) d5TypedTupleAfterReinit ∧
+    evalOperand d5TypedTupleAfterReinit (.copy (pl 2 [.deref])) d5Borrows []
+      d5TypedTupleLayouts [] d5TypedTupleDecls [] true =
+      .ok (sc8 99) d5TypedTupleAfterReinit ∧
+    evalOperand d5TypedTupleAfterReinit (.copy (pl 3 [.deref])) d5Borrows []
+      d5TypedTupleLayouts [] d5TypedTupleDecls [] true =
+      .ok (sc8 99) d5TypedTupleAfterReinit :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `d9AfterSubslice` after re-initializing only `_1[1] = 50` (`_1[2]` still moved-out). -/
+def d9AfterHalfReinit : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [sc8 10, sc8 50, movedUninitValue, sc8 13]),
+    .init (.scalar { bits := 1, sizeBytes := 8 })]
+
+/-- `d9AfterSubslice` after completing re-initialization with `_1[2] = 60`. -/
+def d9AfterFullReinit : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [sc8 10, sc8 50, sc8 60, sc8 13]),
+    .init (.scalar { bits := 1, sizeBytes := 8 })]
+
+/-- **`D3`/`D9` partial-then-full subslice re-initialization.** After
+`move _1[1..3]` on `_1 : [u8; 4] = [10, 11, 12, 13]` (`d9AfterSubslice`):
+1. Writing `_1[1] = 50` re-initializes only element `1`: reading `_1[1]` now
+   succeeds with `50` (and `_1[0] = 10`, `_1[3] = 13`), while reading `_1[2]`,
+   the subslice `_1[1..3]`, or the whole array `_1` still faults with `.ub`.
+2. Writing `_1[2] = 60` (or assigning `_1[1..3] = [50, 60]` directly) completes
+   re-initialization so `_1[2]`, `_1[1..3]`, and `_1` are all readable again. -/
+theorem canary_D3_subslice_partial_then_full_reinit :
+    writePlaceValue d9AfterSubslice [] (pl 1 [.constantIndex 1 4 false]) (sc8 50) =
+      .ok d9AfterHalfReinit ∧
+    evalOperand d9AfterHalfReinit (.copy (pl 1 [.constantIndex 1 4 false]))
+      (deinitProjectedMoves := true) = .ok (sc8 50) d9AfterHalfReinit ∧
+    evalOperand d9AfterHalfReinit (.copy (pl 1 [.constantIndex 0 4 false]))
+      (deinitProjectedMoves := true) = .ok (sc8 10) d9AfterHalfReinit ∧
+    evalOperand d9AfterHalfReinit (.copy (pl 1 [.constantIndex 3 4 false]))
+      (deinitProjectedMoves := true) = .ok (sc8 13) d9AfterHalfReinit ∧
+    evalOperand d9AfterHalfReinit (.copy (pl 1 [.constantIndex 2 4 false]))
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperand d9AfterHalfReinit (.copy (pl 1 [.subslice 1 3 false]))
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperand d9AfterHalfReinit (.copy (pl 1 []))
+      (deinitProjectedMoves := true) = .ub ∧
+    writePlaceValue d9AfterHalfReinit [] (pl 1 [.constantIndex 2 4 false]) (sc8 60) =
+      .ok d9AfterFullReinit ∧
+    writePlaceValue d9AfterSubslice [] (pl 1 [.subslice 1 3 false])
+      (.aggregate 0 [sc8 50, sc8 60]) = .ok d9AfterFullReinit ∧
+    valueContainsMovedUninit (.aggregate 0 [sc8 10, sc8 50, sc8 60, sc8 13]) = false ∧
+    evalOperand d9AfterFullReinit (.copy (pl 1 [.constantIndex 2 4 false]))
+      (deinitProjectedMoves := true) = .ok (sc8 60) d9AfterFullReinit ∧
+    evalOperand d9AfterFullReinit (.copy (pl 1 [.subslice 1 3 false]))
+      (deinitProjectedMoves := true) =
+      .ok (.aggregate 0 [sc8 50, sc8 60]) d9AfterFullReinit ∧
+    evalOperand d9AfterFullReinit (.copy (pl 1 []))
+      (deinitProjectedMoves := true) =
+      .ok (.aggregate 0 [sc8 10, sc8 50, sc8 60, sc8 13]) d9AfterFullReinit :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 /-- `_1 : [u8; 4] = [10, 11, 12, 13]` and `_2 : *mut [u8]` slice fat pointer
 (`.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8, .scalar { bits := 4, sizeBytes := 8 }]`). -/
 def d9SliceFatPtrLocals : List LocalSlot :=
@@ -1314,6 +1457,32 @@ theorem canary_D9_slice_fat_ptr_subslice_move :
     evalOperand d9SliceFatPtrAfterSubslice (.copy (pl 1 [.constantIndex 3 4 false]))
       d5Borrows (deinitProjectedMoves := true) = .ok (sc8 13) d9SliceFatPtrAfterSubslice :=
   ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `_1 : [u8; 4] = [movedUninitValue, 11, 12, 13]` (after `move _1[0]`) and
+`_2 : *mut [u8]` slice fat pointer at `offsetBytes = 1`, `len = 2` (`&mut _1[1..3]`). -/
+def d9OffsetSliceAfterElem0Move : List LocalSlot :=
+  [.uninit,
+   .init (.aggregate 0 [movedUninitValue, sc8 11, sc8 12, sc8 13]),
+   .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 1 } 8,
+     .scalar { bits := 2, sizeBytes := 8 }])]
+
+/-- **`D9` offset slice fat-pointer access after element `0` was moved.** Even
+when `_1[0]` holds `movedUninitValue` (`sizeBytes = 0`), `inferElemListByteStride`
+skips the moved-out sentinel and infers the `1`-byte element stride from the
+remaining elements, so a slice fat pointer at `offsetBytes = 1, len = 2`
+(`_1[1..3]`) still reads `(*_2)[0] = 11` and re-initializes `(*_2)[0] = 77`. -/
+theorem canary_D9_slice_fat_ptr_offset_after_elem0_move :
+    inferElemListByteStride [movedUninitValue, sc8 11, sc8 12, sc8 13] = 1 ∧
+    evalOperand d9OffsetSliceAfterElem0Move (.copy (pl 2 [.deref, .constantIndex 0 2 false]))
+      d5Borrows (deinitProjectedMoves := true) =
+      .ok (sc8 11) d9OffsetSliceAfterElem0Move ∧
+    writePlaceValue d9OffsetSliceAfterElem0Move d5Borrows
+      (pl 2 [.deref, .constantIndex 0 2 false]) (sc8 77) =
+      .ok [.uninit,
+           .init (.aggregate 0 [movedUninitValue, sc8 77, sc8 12, sc8 13]),
+           .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 1 } 8,
+             .scalar { bits := 2, sizeBytes := 8 }])] :=
+  ⟨rfl, rfl, rfl⟩
 
 /-! #### `ep1-A1`: nested, downcast, thin-pointer subslice and union moves -/
 
@@ -3171,6 +3340,676 @@ theorem canary_castMoving_unsize_adt :
   ⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩
 
 end CastToy
+
+/-! ### `CopyNonOverlapping`, `Repeat`, `Aggregate`, `RustCall`/`Virtual` & `D8` Unwind Cleanup -/
+
+section CopyNonOverlappingAndRepeatToy
+
+open Miri.ABI Miri.Memory Miri.Interpreter
+
+local instance toyPointerProvenanceCno : PointerProvenance Unit := ⟨false, none, fun _ => none⟩
+
+/-- **`OperandMachine.evalOperandAt` on `CopyNonOverlapping`'s `count` path, universal.**
+When `deinitMovedPlace = true` and `path = OperandPath.instruction "count"`,
+evaluating `Operand.Move place` to `⟨.indirect mplace, layout⟩` records
+`(mplace, true)` and then runs `MachineHooks.prependLastPendingMoveDeinit` so the
+`count` entry moves to the front of `pendingMoveDeinits` (matching
+`Intrinsics.copyWith`'s read order: `count`, then `src`, then `dst`). -/
+theorem operandMachine_evalOperandAt_count_prepends_latch {K User C : Type}
+    (h : OperandMachine.Hooks K User C) (c : C) (place : Miri.MIR.Place)
+    (known : Option LocalLayout) (s s₁ : MachineHooks.State K User)
+    (mplace : MemPlace Provenance) (layout : LocalLayout)
+    (hon : h.deinitMovedPlace = true)
+    (heval : OperandMachine.evalPlaceToOp h c place known
+      { s with machine := MachineHooks.clearPendingMoveDeinitFlag s.machine } =
+        .ok ⟨.indirect mplace, layout⟩ s₁) :
+    OperandMachine.evalOperandAt h c (OperandPath.instruction "count") (.Move place) known s =
+      .ok ⟨.indirect mplace, layout⟩
+        { s₁ with
+          machine :=
+            MachineHooks.prependLastPendingMoveDeinit
+              (MachineHooks.recordPendingMoveDeinit s₁.machine mplace true) } := by
+  have hpath : (OperandPath.instruction "count" == OperandPath.instruction "count") = true := rfl
+  simp only [OperandMachine.evalOperandAt, hon, ↓reduceIte, OperandMachine.evalOperandAtMoving,
+    OperandMachine.evalOperandMoving, OperandMachine.updateMoveLatch, bind, EStateM.bind,
+    modify, modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, heval, hpath, pure, EStateM.pure]
+
+/-- Prepending the last queued entry moves `count` ahead of `src` and `dst`. -/
+theorem prependLastPendingMoveDeinit_three {K User : Type}
+    (m : MachineHooks.MachineState K User)
+    (src dst cnt : MemPlace Provenance × Bool) (flag : Bool) :
+    (MachineHooks.prependLastPendingMoveDeinit
+      (m.withPendingMoves flag #[src, dst, cnt])).pendingMoveDeinits =
+      #[cnt, src, dst] := rfl
+
+/-- **Universal decomposition of `Intrinsics.evalNondivergingWith` on `CopyNonOverlapping`.**
+`evalNondivergingWith` evaluates `src`, then `dst`, then `count` via
+`evalOperandAt` (whose `count` path prepends `count`'s latch entry to the front
+of `pendingMoveDeinits`, `operandMachine_evalOperandAt_count_prepends_latch`),
+and then invokes `Intrinsics.copyWith` (which reads `count`, then `src`, then
+`dst`). -/
+theorem intrinsics_evalNondivergingWith_copyNonOverlapping_eq
+    {P S C : Type} [PointerProvenance P] (h : MemoryIntrinsicHooks P S C)
+    (evalOpAt : C → OperandPath → Miri.MIR.Operand → RvalueM S (OpTy P)) (choice : C)
+    (args : Miri.MIR.CopyNonOverlapping) :
+    Intrinsics.evalNondivergingWith h evalOpAt choice (.CopyNonOverlapping args) = (do
+      let source ← evalOpAt choice (OperandPath.instruction "src") args.source
+      let dest ← evalOpAt choice (OperandPath.instruction "dst") args.destination
+      let count ← evalOpAt choice (OperandPath.instruction "count") args.count
+      Intrinsics.copyWith h choice source dest count true) := by
+  with_unfolding_all rfl
+
+/-- `OperandMachine.evalOperandAtMoving` over `ToyRvState`: prepends the last
+queued entry when `path == OperandPath.instruction "count"`. -/
+def toyRvEvalAt (_ : Unit) (path : OperandPath) (operand : Miri.MIR.Operand) :
+    RvalueM ToyRvState (OpTy Unit) := do
+  let res ← toyRvEval operand
+  if path == OperandPath.instruction "count" then
+    if let .indirect _ := res.op then
+      modify fun s =>
+        match s.queue.getLast? with
+        | none => s
+        | some last => { s with queue := last :: s.queue.dropLast }
+  return res
+
+/-- Concrete `CopyNonOverlapping` runner matching
+`intrinsics_evalNondivergingWith_copyNonOverlapping_eq` + `Intrinsics.copyWith`'s
+read order (`count`, then `src`, then `dst`). -/
+def toyEvalCopyNonOverlapping (args : Miri.MIR.CopyNonOverlapping) :
+    RvalueM ToyRvState Unit := do
+  let source ← toyRvEvalAt () (OperandPath.instruction "src") args.source
+  let dest ← toyRvEvalAt () (OperandPath.instruction "dst") args.destination
+  let count ← toyRvEvalAt () (OperandPath.instruction "count") args.count
+  let _ ← toyRvRead count
+  let _ ← toyRvRead source
+  let _ ← toyRvRead dest
+  modify fun s => { s with written := true }
+
+/-- `_1 = 16` (`src`), `_2 = 32` (`dst`), `_3 = 0` (`count == 0`), all memory-backed. -/
+def cnoZeroState : ToyRvState :=
+  { slots := [.mem, .mem, .mem, .mem],
+    cells := [none, some 16, some 32, some 0],
+    queue := [], reads := [], written := false }
+
+/-- **`CopyNonOverlapping` move deinitialization (including `count == 0`).**
+1. `copy_nonoverlapping(move _1, copy _2, move _3)` with `_3 = 0`: `evalOperandAt`
+   evaluates `src` (`_1`), `dst` (`_2`), `count` (`_3`) and moves `_3` to the
+   front of the latch queue; `copyWith` then reads `count` (`0`), `src` (`16`),
+   `dst` (`32`) in order, consuming all three FIFO entries and deinitializing
+   both moved operands (`_3` and `_1`) while leaving `_2 = 32` intact — even
+   when `count == 0`!
+2. `copy_nonoverlapping(move _1, copy _1, copy _3)` faults with
+   `invalidUninitBytes` when reading `dst` after `src = move _1` deinitialized
+   `_1`.
+3. `copy_nonoverlapping(copy _1, move _1, copy _3)` succeeds (`src` reads `16`
+   without deinitializing `_1`, then `dst` reads `16` and deinitializes `_1`). -/
+theorem canary_copyNonOverlapping_move_deinit :
+    toyEvalCopyNonOverlapping ⟨.Move ⟨1, #[]⟩, .Copy ⟨2, #[]⟩, .Move ⟨3, #[]⟩⟩
+        cnoZeroState =
+      .ok () { cnoZeroState with
+               cells := [none, none, some 32, none],
+               queue := [], reads := [0, 16, 32], written := true } ∧
+    toyEvalCopyNonOverlapping ⟨.Move ⟨1, #[]⟩, .Copy ⟨1, #[]⟩, .Copy ⟨3, #[]⟩⟩
+        cnoZeroState =
+      .error (.undefinedBehavior "invalidUninitBytes")
+        { cnoZeroState with
+          cells := [none, none, some 32, some 0],
+          queue := [], reads := [0, 16], written := false } ∧
+    toyEvalCopyNonOverlapping ⟨.Copy ⟨1, #[]⟩, .Move ⟨1, #[]⟩, .Copy ⟨3, #[]⟩⟩
+        cnoZeroState =
+      .ok () { cnoZeroState with
+               cells := [none, none, some 32, some 0],
+               queue := [], reads := [0, 16, 16], written := true } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
+/-- `AggregateHooks` driving the real `Miri.Interpreter.writeAggregate` and the
+consumer-side `writeRepeat` of `ExecutionMachine.rvalueHooks`. -/
+def toyAggHooks (repeatLen : UInt64) : AggregateHooks Unit ToyRvState Unit Nat where
+  target := ⟨.little, .w64⟩
+  placeLayout := fun _ => toyU8
+  evalOperand := fun _ op _ => toyRvEval op
+  evalOperandAt := fun _ _ op _ => toyRvEval op
+  readPointer := fun _ _ => throw (.unsupported "toy")
+  readScalar := fun _ _ => throw (.unsupported "toy")
+  projectDowncast := fun _ d _ => pure d
+  projectField := fun _ d idx => pure (d + idx)
+  copyOp := fun _ op dst => do
+    let s ← get
+    match op.op with
+    | .indirect m =>
+      let n := toyCell m
+      let (queue, isMove) := toyTake s.queue n
+      match (s.cells[n]?).join with
+      | none =>
+        set { s with queue }
+        throw (.undefinedBehavior "invalidUninitBytes")
+      | some v =>
+        let cells := if isMove then s.cells.set n none else s.cells
+        set { s with queue, reads := s.reads ++ [v], cells := cells.set dst (some v) }
+    | _ => throw (.unsupported "toy")
+  copyOpNoValidate := fun _ op dst _ => do
+    let s ← get
+    match op.op with
+    | .indirect m =>
+      let n := toyCell m
+      let (queue, isMove) := toyTake s.queue n
+      match (s.cells[n]?).join with
+      | none =>
+        set { s with queue }
+        throw (.undefinedBehavior "invalidUninitBytes")
+      | some v =>
+        let cells := if isMove then s.cells.set n none else s.cells
+        set { s with queue, reads := s.reads ++ [v], cells := cells.set dst (some v) }
+    | _ => throw (.unsupported "toy")
+  writeDiscriminant := fun _ _ _ => pure ()
+  enforceValidity := fun _ _ => pure false
+  validate := fun _ _ => pure ()
+  forceAllocation := fun _ d => pure d
+  length := fun _ _ => pure repeatLen
+  getPlaceAllocMut := fun _ _ => pure ()
+  projectIndex := fun _ d idx => pure (d + idx.toNat)
+  placePointer := fun d => .ok ⟨⟨d.toUInt64⟩, none⟩
+  wrappingOffset := fun p sz => .ok ⟨⟨(p.offset.bytes.toNat + sz.bytes.toNat).toUInt64⟩, none⟩
+  memCopyRepeatedly := fun _ src dst _ _ _ => do
+    let s ← get
+    let v := (s.cells[src.offset.bytes.toNat]?).join
+    let base := dst.offset.bytes.toNat
+    let cells := (s.cells.set base v).set (base + 1) v
+    set { s with cells, written := true }
+
+/-- Consumer-side `writeRepeat` of `ExecutionMachine.rvalueHooks` over `toyAggHooks`. -/
+def toyWriteRepeatMoving (repeatLen : UInt64) (operand : Miri.MIR.Operand) (dest : Nat) :
+    RvalueM ToyRvState Unit := do
+  let aggregate := toyAggHooks repeatLen
+  let source ← aggregate.evalOperandAt () (OperandPath.rvalue "operand") operand none
+  if !source.layout.layout.isSized then throw (.invalidProgram "repeat source is unsized")
+  let dest ← aggregate.forceAllocation () dest
+  let length ← aggregate.length () dest
+  if length == 0 then
+    aggregate.getPlaceAllocMut () dest
+    let s ← get
+    let (queue, isMove) :=
+      match s.queue.getLast? with
+      | some (_, mv) => (s.queue.dropLast, mv)
+      | none => ([], false)
+    if isMove then
+      if let .indirect mplace := source.op then
+        set { s with queue, cells := s.cells.set (toyCell mplace) none }
+      else set { s with queue }
+    else set { s with queue }
+  else
+    let first ← aggregate.projectIndex () dest 0
+    aggregate.copyOp () source first
+    let elemSize := (aggregate.placeLayout first).layout.size
+    let .ok firstPtr := aggregate.placePointer first | throw (.invalidProgram "ptr")
+    let .ok restPtr := aggregate.wrappingOffset firstPtr elemSize | throw (.invalidProgram "off")
+    aggregate.memCopyRepeatedly () firstPtr restPtr elemSize 2 true
+
+/-- `_1 = 5` at cell 1; destination array at cells 2..5. -/
+def repeatInitState : ToyRvState :=
+  { slots := [.mem, .mem], cells := [none, some 5, none, none, none],
+    queue := [], reads := [], written := false }
+
+/-- **`Rvalue.Repeat` move deinitialization for `count == 0` and `count == 3`.**
+1. `Repeat (.Move _1) 0` (`length == 0`): consumes the move latch and
+   deinitializes `_1` via TB-silent `deinitMemoryRaw` without reading or writing
+   elements.
+2. `Repeat (.Copy _1) 0` (`length == 0`): consumes the non-move latch (`false`),
+   leaving `_1 = 5` initialized and the queue empty.
+3. `Repeat (.Move _1) 3` (`length == 3`): `copyOp` copies `5` into `dest[0]`
+   (cell 2) and deinitializes `_1` (cell 1), then `memCopyRepeatedly` replicates
+   `dest[0]` into `dest[1]` and `dest[2]` (cells 3 and 4). -/
+theorem canary_repeat_move_deinit_zero_and_nonzero :
+    toyWriteRepeatMoving 0 (.Move ⟨1, #[]⟩) 2 repeatInitState =
+      .ok () { repeatInitState with cells := [none, none, none, none, none], queue := [] } ∧
+    toyWriteRepeatMoving 0 (.Copy ⟨1, #[]⟩) 2 repeatInitState =
+      .ok () { repeatInitState with cells := [none, some 5, none, none, none], queue := [] } ∧
+    toyWriteRepeatMoving 3 (.Move ⟨1, #[]⟩) 2 repeatInitState =
+      .ok () { repeatInitState with
+               cells := [none, none, some 5, some 5, some 5],
+               queue := [], reads := [5], written := true } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
+/-- `_1 = (2, 3)` at cells 1 and 2; destination tuple at cells 3 and 4. -/
+def aggPairState : ToyRvState :=
+  { slots := [.mem, .mem], cells := [none, some 2, some 3, none, none],
+    queue := [], reads := [], written := false }
+
+/-- **`Rvalue.Aggregate` move deinitialization through the real `writeAggregate`.**
+1. `.Tuple #[.Move _1.1, .Move _1.0]` copies `3` into field `0` and deinitializes
+   `_1.1`, then copies `2` into field `1` and deinitializes `_1.0`.
+2. `.Tuple #[.Move _1.0, .Copy _1.0]` deinitializes `_1.0` on field `0` and
+   faults with `invalidUninitBytes` on field `1`. -/
+theorem canary_aggregate_move_deinit :
+    writeAggregate (toyAggHooks 0) () .Tuple
+        #[.Move ⟨1, #[.Field 1 0]⟩, .Move ⟨1, #[.Field 0 0]⟩] 3 aggPairState =
+      .ok () { aggPairState with
+               cells := [none, none, none, some 3, some 2],
+               queue := [], reads := [3, 2] } ∧
+    writeAggregate (toyAggHooks 0) () .Tuple
+        #[.Move ⟨1, #[.Field 0 0]⟩, .Copy ⟨1, #[.Field 0 0]⟩] 3 aggPairState =
+      .error (.undefinedBehavior "invalidUninitBytes")
+        { aggPairState with
+          cells := [none, none, some 3, some 2, none],
+          queue := [], reads := [2] } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
+end CopyNonOverlappingAndRepeatToy
+
+section CallUnpackVirtualAndUnwindD8
+
+open Miri.ABI Miri.Memory Miri.Interpreter
+
+/-- **`Call.allocateVarargs` on consumer-side `FnArg.Copy` arguments, universal.**
+Since `Call.evalFnCallArgumentMoving` produces only `FnArg.Copy` arguments,
+`Call.allocateVarargs` is independent of `protectArgument`. -/
+theorem call_allocateVarargs_protect_irrelevant
+    {P S C E Other Extern FnABI ArgABI : Type}
+    (h : CallHooks P S C E Other Extern FnABI ArgABI)
+    (protect : C → MPlaceTy P → CallM S Unit)
+    (choice : C) (args : Array (FnArg P × ArgABI)) (calleeAbis : Array ArgABI) :
+    Call.allocateVarargs { h with protectArgument := protect } choice args calleeAbis =
+      Call.allocateVarargs h choice args calleeAbis := rfl
+
+/-- Extended call/unwind state for end-to-end `RustCall` tuple unpacking,
+`FnInstance.Virtual` receiver dispatch, and `D8` unwinding call / `Assert`
+cleanup. -/
+structure ToyD8State where
+  callerCells : List (Option Nat)
+  calleeCells : List (Option Nat)
+  temps : List Nat
+  freedTemps : List Nat
+  inCallee : Bool
+  block : Miri.MIR.BasicBlockId
+  unwinding : Bool
+  panicCalled : Bool
+
+/-- Read a cell from `callerCells`. -/
+def d8ReadCaller (l : Nat) : EStateM StepError ToyD8State Nat := do
+  let s ← get
+  match (s.callerCells[l]?).join with
+  | some v => pure v
+  | none => throw (.undefinedBehavior "invalidUninitBytes")
+
+/-- Minimal MIR body with two blocks (`0` normal, `1` cleanup). -/
+def d8DummyBlock (isCleanup : Bool) : Miri.MIR.BasicBlock :=
+  { statements := #[],
+    terminator := ⟨⟨⟨0⟩, 0⟩, .Return⟩,
+    cleanup := isCleanup }
+
+def d8DummyBody (argCount : Nat) (spread : Option Nat := none) : Miri.Interpreter.LoadedBody :=
+  { identity := .ofCanonicalIndex 0,
+    body :=
+      { phase := .Runtime .PostCleanup,
+        basicBlocks := #[d8DummyBlock false, d8DummyBlock true],
+        locals := #[0, 0, 0, 0],
+        argumentCount := argCount,
+        spreadArgument := spread } }
+
+def d8Frame (blk : Nat) (unw : Bool) (argCount : Nat := 1) :
+    Frame Unit LocalLayout Unit :=
+  { bodyIdentity := .ofCanonicalIndex 0,
+    functionInstance := ⟨.Item 1, #[]⟩,
+    body := (d8DummyBody argCount).body,
+    returnPlace := .frameLocal 0 0 none toyU8 (.ofAllocationToken 0),
+    returnContinuation := .goto (some 0) (.Cleanup 1),
+    location := if unw then .unwinding ⟨0⟩ else .mir ⟨blk, 0⟩,
+    locals := #[],
+    localsIdentity := .ofAllocationToken 0,
+    trackCallerArg := none,
+    vaList := #[],
+    extra := () }
+
+/-- Call hooks supporting `RustCall` tuple unpacking (`defId = 10`) and
+`FnInstance.Virtual` dispatch (`defId = 20`) into `initStackFrame`. -/
+def d8CallHooks (isRustCallMode : Bool) (isVirtualMode : Bool) :
+    CallHooks Unit ToyD8State Unit Unit Unit Unit Unit Unit where
+  debugAssertions := false
+  getFrame := do
+    let s ← get
+    pure (d8Frame s.block s.unwinding (if isRustCallMode then 1 else 2))
+  setFrame := fun f => modify fun s =>
+    match f.location with
+    | .unwinding _ => { s with unwinding := true }
+    | .mir loc => { s with block := loc.block, unwinding := false }
+  frameIndex := do
+    let s ← get
+    pure (if s.inCallee then 1 else 0)
+  evalOperand := fun _ op =>
+    match op with
+    | .Copy ⟨0, _⟩ => pure ⟨.immediate .uninit, toyFnLayout⟩
+    | .Copy p | .Move p => pure ⟨.indirect (toyMPlace p.localId), toyU8⟩
+    | _ => pure ⟨.immediate .uninit, toyU8⟩
+  evalPlace := fun _ p _ => pure (.memory ⟨toyMPlace p.localId, toyU8⟩)
+  placeToOp := fun _ rp =>
+    match rp with
+    | .memory m => pure ⟨.indirect m.mplace, m.layout⟩
+    | _ => throw (.unsupported "d8")
+  forceAllocation := fun _ rp =>
+    match rp with
+    | .memory m => pure m
+    | _ => throw (.unsupported "d8")
+  functionSignature := fun _ _ => pure (if isRustCallMode then 1 else 2, ())
+  functionKind := fun _ => pure (.FnDef (if isVirtualMode then 20 else 10) #[])
+  readPointer := fun _ _ => throw (.unsupported "d8")
+  getPtrFn := fun _ _ => throw (.unsupported "d8")
+  resolve := fun _ defId _ =>
+    if defId == 20 then pure ⟨.Virtual 20 0, #[]⟩
+    else pure ⟨.Item defId, #[]⟩
+  fnAbiOfFnPtr := fun _ _ _ => pure ()
+  fnAbiOfInstance := fun _ _ _ => pure ()
+  requiresCallerLocation := fun _ => pure false
+  callerLocation := pure ⟨0⟩
+  abiCanUnwind := fun _ => true
+  abiVariadic := fun _ => false
+  abiFixedCount := fun _ => 0
+  abiArgs := fun _ => if isRustCallMode then #[(), ()] else #[(), ()]
+  abiReturn := fun _ => ()
+  sameConvention := fun _ _ => true
+  isRustCall := fun _ => isRustCallMode
+  rustAbi := ()
+  argLayout := fun _ => toyU8
+  argIsIgnore := fun _ => false
+  isOneZst := fun _ => false
+  checkArgumentCompat := fun _ _ _ => pure true
+  checkTargetFeatures := fun _ _ => pure ()
+  tupleFields := fun _ => pure #[0, 0]
+  projectFnArg := fun _ arg idx =>
+    match arg with
+    | .Copy op =>
+      match op.op with
+      | .indirect m => pure (.Copy ⟨.indirect (toyMPlace (toyCell m + idx)), toyU8⟩)
+      | _ => pure (.Copy op)
+    | .InPlace _ => throw (.invalidProgram "expected FnArg.Copy")
+  localLayout := fun _ _ => pure toyU8
+  localSpan := fun _ _ => pure ⟨0⟩
+  storageLiveDyn := fun _ _ _ => pure ()
+  copyAllowTransmute := fun _ src dst => do
+    let s ← get
+    match src.op, dst with
+    | .indirect m, .memory d =>
+      let cellIdx := toyCell m
+      let v ← match (s.callerCells[cellIdx]?).join with
+        | some v => pure v
+        | none => throw (.undefinedBehavior "invalidUninitBytes")
+      set { s with calleeCells := s.calleeCells.set (toyCell d.mplace) (some v) }
+    | .immediate _, .memory d =>
+      set { s with calleeCells := s.calleeCells.set (toyCell d.mplace) (some 99) }
+    | _, _ => throw (.unsupported "d8 copyAllowTransmute")
+  protectArgument := fun _ m =>
+    if toyCell m.mplace == 0 then pure ()
+    else throw (.invalidProgram "protectArgument must not run on FnArg.Copy")
+  withRetagMode := fun _ _ action => action
+  nonCapturingClosure := fun _ _ _ => pure false
+  allocateStack := fun _ layout => do
+    let s ← get
+    let tmpCell := 4 + s.temps.length * 2
+    set { s with temps := s.temps ++ [tmpCell] }
+    pure ⟨toyMPlace tmpCell, layout⟩
+  copyToMemory := fun _ src dst => do
+    let s ← get
+    match src.op with
+    | .indirect m =>
+      let c := toyCell m
+      let d := toyCell dst.mplace
+      if isRustCallMode then
+        match (s.callerCells[c]?).join, (s.callerCells[c + 1]?).join with
+        | some v0, some v1 =>
+          set { s with callerCells := (s.callerCells.set d (some v0)).set (d + 1) (some v1) }
+        | _, _ => throw (.undefinedBehavior "invalidUninitBytes")
+      else
+        match (s.callerCells[c]?).join with
+        | some v => set { s with callerCells := s.callerCells.set d (some v) }
+        | none => throw (.undefinedBehavior "invalidUninitBytes")
+    | _ => throw (.unsupported "d8 copyToMemory")
+  vaListPtr := fun _ _ => throw (.unsupported "d8")
+  writeZeroBytes := fun _ _ _ => throw (.unsupported "d8")
+  vaListKeyField := fun _ _ => throw (.unsupported "d8")
+  writePointerToMemory := fun _ _ _ => throw (.unsupported "d8")
+  pushRaw := fun _ _ _ _ _ => modify fun s => { s with inCallee := true, unwinding := true }
+  pushDone := fun _ => modify fun s => { s with unwinding := false }
+  popRaw := fun _ => do
+    let s ← get
+    set { s with inCallee := false }
+    pure (d8Frame s.block s.unwinding)
+  cleanup := fun _ _ _ => pure .normal
+  afterFrameInit := fun _ => pure ()
+  callExtra := fun _ _ _ _ _ _ _ => throw (.unsupported "d8")
+  callIntrinsic := fun _ _ _ _ _ _ => throw (.unsupported "d8")
+  callLlvmIntrinsic := fun _ _ _ _ _ => throw (.unsupported "d8")
+  findMirOrEvalFn := fun _ _ _ args _ _ _ => do
+    let copyArgToCallee (arg : FnArg Unit) (calleeSlot : Nat) : CallM ToyD8State Unit := do
+      let s ← get
+      match arg.copyFnArg.op with
+      | .indirect m =>
+        match (s.callerCells[toyCell m]?).join with
+        | some v => set { s with calleeCells := s.calleeCells.set calleeSlot (some v) }
+        | none => throw (.undefinedBehavior "invalidUninitBytes")
+      | .immediate _ =>
+        set { s with calleeCells := s.calleeCells.set calleeSlot (some 99) }
+    if isRustCallMode then
+      let some tupleArg := args[0]? | throw (.invalidProgram "missing RustCall tuple")
+      let .Copy op := tupleArg | throw (.invalidProgram "expected FnArg.Copy")
+      let .indirect m := op.op | throw (.invalidProgram "expected indirect tuple")
+      copyArgToCallee (.Copy ⟨.indirect (toyMPlace (toyCell m)), toyU8⟩) 1
+      copyArgToCallee (.Copy ⟨.indirect (toyMPlace (toyCell m + 1)), toyU8⟩) 2
+    else
+      let some arg0 := args[0]? | throw (.invalidProgram "missing arg 0")
+      let some arg1 := args[1]? | throw (.invalidProgram "missing arg 1")
+      copyArgToCallee arg0 1
+      copyArgToCallee arg1 2
+    modify fun s => { s with inCallee := true }
+    pure none
+  resolveVirtual := fun _ _ _ _ abi args => do
+    let thinReceiver : FnArg Unit := .Copy ⟨.immediate (.scalar (Scalar.fromBool true)), toyU8⟩
+    pure (⟨.Item 10, #[]⟩, abi, args.set! 0 thinReceiver)
+  isDynamic := fun _ => pure false
+  unpackDynForDrop := fun _ _ => throw (.unsupported "d8")
+  resolveDropGlue := fun _ _ => throw (.unsupported "d8")
+  mplaceToMutRef := fun _ _ => throw (.unsupported "d8")
+  fakeUnitReturn := fun _ => throw (.unsupported "d8")
+  deinitMovedPlace := true
+  deinitInPlaceArgument := fun _ m => modify fun s =>
+    let c := toyCell m.mplace
+    if isRustCallMode then
+      { s with callerCells := (s.callerCells.set c none).set (c + 1) none }
+    else
+      { s with callerCells := s.callerCells.set c none }
+  validateOperandBeforeCall := fun _ _ => pure ()
+  deallocateStack := fun _ ptr => modify fun s =>
+    { s with freedTemps := s.freedTemps ++ [ptr.offset.bytes.toNat] }
+
+/-- Initial state for `RustCall` (`_1 = (2, 3)` at caller cells 1 and 2) and
+`Virtual` (`_1 = 2`, `_2 = 3`). -/
+def d8InitState : ToyD8State :=
+  { callerCells := [none, some 2, some 3, none, none, none, none, none],
+    calleeCells := [none, none, none, none],
+    temps := [], freedTemps := [], inCallee := false, block := 0,
+    unwinding := false, panicCalled := false }
+
+/-- **`RustCall` tuple argument unpacking and `FnInstance.Virtual` receiver
+dispatch through the real `Call.evalCallTerminatorMoving`.**
+1. In `RustCall` mode (`call f(move _1)` where `_1 = (2, 3)` at caller cells 1
+   and 2): `evalFnCallArgumentMoving` snapshots the whole tuple into temporary
+   cells `(4, 5)` and deinitializes BOTH caller fields (`callerCells[1] = none`,
+   `callerCells[2] = none`) without invoking `protectArgument`; `initFnCallStep`
+   unpacks the snapshot via `projectFnArg` into two `FnArg.Copy` arguments that
+   `initStackFrame` copies into callee locals `_1 = 2` and `_2 = 3`; and
+   `deallocateTempArgs` frees temporary `4`.
+2. In `Virtual` mode (`call Trait::method(move _1, move _2)`): both `_1` and
+   `_2` are snapshotted into temporaries `4` and `6` and deinitialized in the
+   caller (`callerCells[1] = none`, `callerCells[2] = none`); `resolveVirtual`
+   replaces `args[0]` with the thin receiver pointer (`99`) while `args[1]` stays
+   `3`; and `deallocateTempArgs` still frees both original temporary allocations
+   `[4, 6]`. -/
+theorem canary_call_rustCall_tuple_move_unpack_and_virtual :
+    Call.evalCallTerminatorMoving (d8CallHooks true false) () 1
+        ⟨⟨⟨0⟩, 0⟩, .Call toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩] toyDest (some 0) (.Cleanup 1) .Normal ⟨0⟩⟩
+        d8InitState =
+      .ok ()
+        { callerCells := [none, none, none, none, some 2, some 3, none, none],
+          calleeCells := [none, some 2, some 3, none],
+          temps := [4], freedTemps := [4], inCallee := true, block := 0,
+          unwinding := false, panicCalled := false } ∧
+    Call.evalCallTerminatorMoving (d8CallHooks false true) () 2
+        ⟨⟨⟨0⟩, 0⟩, .Call toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Move ⟨2, #[]⟩⟩]
+          toyDest (some 0) (.Cleanup 1) .Normal ⟨0⟩⟩
+        d8InitState =
+      .ok ()
+        { callerCells := [none, none, none, none, some 2, none, some 3, none],
+          calleeCells := [none, some 99, some 3, none],
+          temps := [4, 6], freedTemps := [4, 6], inCallee := true, block := 0,
+          unwinding := false, panicCalled := false } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
+/-- `ControlFlow.ControlHooks` over `StepState Unit LocalLayout Unit ToyD8State`
+for `D8` unwinding call and `Assert` cleanup runs. -/
+def d8ControlHooks :
+    ControlHooks Unit LocalLayout Unit ToyD8State Unit Unit where
+  bodySpan := fun _ => .ok ⟨0⟩
+  returnOperand := fun _ state => (state, .ok ())
+  popFrame := fun _ state =>
+    let popped := d8Frame 1 true
+    let callerFrame := d8Frame 0 false
+    ({ stack := ⟨#[callerFrame]⟩, machine := { state.machine with inCallee := false } }, .ok popped)
+  copyReturn := fun _ _ _ state =>
+    ({ state with machine := { state.machine with callerCells := state.machine.callerCells.set 0 (some 77) } },
+     .ok ())
+  cleanupFrame := fun _ _ _ state => (state, .ok .normal)
+  unwindTerminate := fun _ _ state => (state, .ok ())
+
+/-- `ControlFlow.TerminatorHooks` driving the real `ControlFlow.evalTerminator`
+on `TerminatorKind.Assert` and `TerminatorKind.Call` / `TerminatorKind.UnwindResume`. -/
+def d8TerminatorHooks :
+    TerminatorHooks Unit LocalLayout Unit ToyD8State Unit Unit Bool where
+  toControlHooks := d8ControlHooks
+  evalDiscriminant := fun _ _ state => (state, .ok false)
+  compareSwitchCase := fun _ _ _ state => (state, .ok false)
+  call := fun _ term state =>
+    match Call.evalCallTerminatorMoving (d8CallHooks false false) () 1 term state.machine with
+    | .ok () m' =>
+      let calleeFrame := d8Frame 1 true
+      ({ stack := ⟨#[d8Frame 0 false, calleeFrame]⟩, machine := m' }, .ok ())
+    | .error e m' => ({ state with machine := m' }, .error e)
+  tailCall := fun _ _ state => (state, .error (.unsupported "d8"))
+  drop := fun _ _ _ _ state => (state, .error (.unsupported "d8"))
+  ignoreOptionalOverflowChecks := fun _ => false
+  readAssertCondition := fun _ op state =>
+    match op with
+    | .Move p =>
+      match (state.machine.callerCells[p.localId]?).join with
+      | some v =>
+        let m' := { state.machine with callerCells := state.machine.callerCells.set p.localId none }
+        ({ state with machine := m' }, .ok (v != 0))
+      | none => (state, .error (.undefinedBehavior "invalidUninitBytes"))
+    | .Copy p =>
+      match (state.machine.callerCells[p.localId]?).join with
+      | some v => (state, .ok (v != 0))
+      | none => (state, .error (.undefinedBehavior "invalidUninitBytes"))
+    | _ => (state, .error (.unsupported "d8"))
+  assertPanic := fun _ _ unwind state =>
+    let state' := { state with machine := { state.machine with panicCalled := true } }
+    ControlFlow.unwindToBlock d8ControlHooks () unwind state'
+
+/-- Initial `StepState` for `D8` runs: caller frame at block `0`, `_1 = 0` (`false`),
+`_2 = 1` (`true`). -/
+def d8StepInit : StepState Unit LocalLayout Unit ToyD8State :=
+  { stack := ⟨#[d8Frame 0 false]⟩,
+    machine :=
+      { callerCells := [none, some 0, some 1, none, none, none, none, none],
+        calleeCells := [none, none, none, none],
+        temps := [], freedTemps := [], inCallee := false, block := 0,
+        unwinding := false, panicCalled := false } }
+
+/-- Expected `StepState` after `TerminatorKind.Assert (.Move ⟨1, #[]⟩) true ... (.Cleanup 1)`
+panics and unwinds to cleanup block `1`. -/
+def d8AfterAssertState : StepState Unit LocalLayout Unit ToyD8State :=
+  { stack := ⟨#[d8Frame 1 false]⟩,
+    machine :=
+      { callerCells := [none, none, some 1, none, none, none, none, none],
+        calleeCells := [none, none, none, none],
+        temps := [], freedTemps := [], inCallee := false, block := 0,
+        unwinding := false, panicCalled := true } }
+
+/-- Expected `StepState` right after `Call.evalCallTerminatorMoving` enters the
+callee frame with `_1` moved and `_2` copied. -/
+def d8AfterCallState : StepState Unit LocalLayout Unit ToyD8State :=
+  { stack := ⟨#[d8Frame 0 false, d8Frame 1 true]⟩,
+    machine :=
+      { callerCells := [none, none, some 1, none, some 0, none, some 1, none],
+        calleeCells := [none, some 0, some 1, none],
+        temps := [4, 6], freedTemps := [4, 6], inCallee := true, block := 0,
+        unwinding := false, panicCalled := false } }
+
+/-- Expected `StepState` after `TerminatorKind.UnwindResume` pops the panicking
+callee frame and unwinds the caller frame to cleanup block `1`. -/
+def d8AfterUnwindState : StepState Unit LocalLayout Unit ToyD8State :=
+  { stack := ⟨#[d8Frame 1 false]⟩,
+    machine :=
+      { callerCells := [none, none, some 1, none, some 0, none, some 1, none],
+        calleeCells := [none, some 0, some 1, none],
+        temps := [4, 6], freedTemps := [4, 6], inCallee := false, block := 0,
+        unwinding := false, panicCalled := false } }
+
+/-- **`D8` `Assert` cleanup after a moved condition (`canary_D8_assert_cleanup_moved_cond_ub`).**
+When `TerminatorKind.Assert (.Move ⟨1, #[]⟩) true msg 0 (.Cleanup 1)` runs on
+`_1 = false` (`0`) and `_2 = true` (`1`):
+1. `ControlFlow.evalTerminator` reads and deinitializes `_1` via
+   `readAssertCondition`, then invokes `assertPanic` and jumps to cleanup block
+   `1` (`.mir ⟨1, 0⟩`);
+2. In cleanup block `1`, reading the moved condition local `_1` faults with
+   `.undefinedBehavior "invalidUninitBytes"`, whereas reading the unmoved local
+   `_2` succeeds (`1`). -/
+theorem canary_D8_assert_cleanup_moved_cond_ub :
+    ControlFlow.evalTerminator d8TerminatorHooks ()
+        ⟨⟨⟨0⟩, 0⟩, .Assert (.Move ⟨1, #[]⟩) true .NullPointerDereference 0 (.Cleanup 1)⟩
+        d8StepInit =
+      (d8AfterAssertState, .ok ()) ∧
+    d8AfterAssertState.machine.panicCalled = true ∧
+    (d8AfterAssertState.stack.currentFrame?.map (·.location)) = some (.mir ⟨1, 0⟩) ∧
+    d8ReadCaller 1 d8AfterAssertState.machine =
+      .error (.undefinedBehavior "invalidUninitBytes") d8AfterAssertState.machine ∧
+    d8ReadCaller 2 d8AfterAssertState.machine = .ok 1 d8AfterAssertState.machine :=
+  ⟨by with_unfolding_all rfl, rfl, by with_unfolding_all rfl, rfl, rfl⟩
+
+/-- **`D8` unwinding `Call` cleanup (`canary_D8_unwinding_call_moved_arg_ub` and
+`canary_D8_unwinding_call_unmoved_ok`).**
+Run `TerminatorKind.Call func #[⟨span, .Move ⟨1, #[]⟩⟩, ⟨span, .Copy ⟨2, #[]⟩⟩]
+dest (some 0) (.Cleanup 1)` through `ControlFlow.evalTerminator` (which calls
+`Call.evalCallTerminatorMoving`), followed by `TerminatorKind.UnwindResume` in
+the panicking callee (`ControlFlow.returnFromCurrentFrame ... true`):
+1. `evalCallTerminatorMoving` snapshots both arguments, deinitializes the moved
+   caller local `_1` while leaving the copied caller local `_2` intact, pushes
+   the callee frame, and frees the argument snapshots;
+2. `UnwindResume` pops the callee frame without writing `dest` (`callerCells[0] = none`)
+   and unwinds the caller frame to cleanup block `1` (`.mir ⟨1, 0⟩`);
+3. In cleanup block `1`, reading the moved argument local `_1` faults with
+   `.undefinedBehavior "invalidUninitBytes"` (`canary_D8_unwinding_call_moved_arg_ub`),
+   while reading the unmoved local `_2` succeeds (`canary_D8_unwinding_call_unmoved_ok`). -/
+theorem canary_D8_unwinding_call_moved_arg_ub :
+    ControlFlow.evalTerminator d8TerminatorHooks ()
+        ⟨⟨⟨0⟩, 0⟩, .Call toyFn #[⟨toySpan, .Move ⟨1, #[]⟩⟩, ⟨toySpan, .Copy ⟨2, #[]⟩⟩]
+          toyDest (some 0) (.Cleanup 1) .Normal ⟨0⟩⟩
+        d8StepInit =
+      (d8AfterCallState, .ok ()) ∧
+    ControlFlow.evalTerminator d8TerminatorHooks ()
+        ⟨⟨⟨0⟩, 0⟩, .UnwindResume⟩
+        d8AfterCallState =
+      (d8AfterUnwindState, .ok ()) ∧
+    (d8AfterUnwindState.stack.currentFrame?.map (·.location)) = some (.mir ⟨1, 0⟩) ∧
+    d8AfterUnwindState.machine.callerCells[0]? = some none ∧
+    d8ReadCaller 1 d8AfterUnwindState.machine =
+      .error (.undefinedBehavior "invalidUninitBytes") d8AfterUnwindState.machine :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl, by with_unfolding_all rfl, rfl, rfl⟩
+
+/-- Companion to `canary_D8_unwinding_call_moved_arg_ub`: unmoved caller locals
+remain initialized and readable in the caller's cleanup block after an unwinding
+call. -/
+theorem canary_D8_unwinding_call_unmoved_ok :
+    d8ReadCaller 2 d8AfterUnwindState.machine = .ok 1 d8AfterUnwindState.machine :=
+  rfl
+
+end CallUnpackVirtualAndUnwindD8
 
 /-! ## Part 4: root-move simulation between `lean-miri` and Trusted `Places` -/
 

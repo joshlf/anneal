@@ -453,13 +453,19 @@ import LeanMiriSpec.Audit
   unpatched source when the flag is off; with the flag on, moved sources are
   deinitialized without Tree Borrows or race access, call arguments are validated
   before callee resolution (kani#5172), snapshot without retagging and always
-  passed as `FnArg.Copy` (never protected), multi-operand `BinaryOp`s run through
-  the real `evalRvalueIntoPlace` (`D4`: `copy _1 + move _1` succeeds,
-  `move _1 + copy _1` faults), `Cast.castMoving` reads before it deinitializes and
-  deinitializes before it writes, and Trusted `evalOperand
+  passed as `FnArg.Copy` (never protected, including `RustCall` tuple unpacking,
+  `Virtual` calls, and varargs), multi-operand `BinaryOp`s, `CopyNonOverlapping`
+  (including `count == 0`), `Repeat`, and `Aggregate` run with per-operand move
+  deinitialization, `Cast.castMoving` deinitializes a moved source after its last
+  read and before writing an immediate result (transmute and unsizing copies take
+  over the move latch), `D8` `Assert` and unwinding `Call` cleanup observe moved
+  operands as already deinitialized in `cleanup bb`, and Trusted `evalOperand
   (deinitProjectedMoves := true)` deinitializes moved places (`D1`–`D9` canaries,
-  including nested, enum-downcast, thin-pointer subslice and union byte-window
-  moves), with a root-move simulation between the two and an axiom audit.
+  including nested, enum-downcast, thin-pointer subslice, typed `Deref`
+  re-initialization, partial-then-full subslice re-initialization, field swap, and
+  union byte-window moves; the statement-level `Rvalue.discriminant` still reads a
+  partially moved enum), with a root-move simulation between the two, documented
+  known limitations (niche-encoded enum tags) and an axiom audit.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
