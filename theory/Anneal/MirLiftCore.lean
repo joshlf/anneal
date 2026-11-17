@@ -21518,6 +21518,319 @@ theorem evalRvalue_aggregate_rawPtr_wide_vtableMeta_ub (locals locals₁ locals�
   dsimp only [evalOperands]
   rw [hWide]
 
+/-- **`wrapScalarBits_eq_of_lt`**: when `val < modulus`, `wrapScalarBits val modulus` reduces
+constructively to `val`. -/
+theorem wrapScalarBits_eq_of_lt {val modulus : Nat} (h : val < modulus) :
+    wrapScalarBits val modulus = val := by
+  unfold wrapScalarBits
+  cases hb : Nat.ble modulus val with
+  | false => rfl
+  | true => exact False.elim (Nat.not_le.mpr h (Nat.le_of_ble_eq_true hb))
+
+/-- **`evalRvalue_unaryOp_ptrMetadata_wide_scalarAddr_of_lt`**: bounded form of
+`evalRvalue_unaryOp_ptrMetadata_wide_scalarAddr` when `len < scalarModulus (layoutPointerBytes layouts)`,
+reducing `wrapScalarBits` directly to `.scalar ⟨len, layoutPointerBytes layouts⟩`. -/
+theorem evalRvalue_unaryOp_ptrMetadata_wide_scalarAddr_of_lt (locals locals' : List LocalSlot)
+    (op : Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (addr len : Nat)
+    (hTy : isNonWidePtrAggregateTy (operandTy localDecls layouts op) = false)
+    (hLen : len < scalarModulus (layoutPointerBytes layouts))
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes layouts⟩,
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals') :
+    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
+      .ok (.scalar ⟨len, layoutPointerBytes layouts⟩) locals' mem := by
+  rw [evalRvalue_unaryOp_ptrMetadata_wide_scalarAddr locals locals' op mem localDecls layouts addr
+    len hTy hOp, wrapScalarBits_eq_of_lt hLen]
+
+/-- **`evalRvalue_aggregate_rawPtr_wide_scalarAddr_of_lt`**: bounded form of
+`evalRvalue_aggregate_rawPtr_wide_scalarAddr` when `addr, len < scalarModulus (layoutPointerBytes layouts)`,
+reducing `wrapScalarBits` directly to `.aggregate 0 [.scalar ⟨addr, ptrBytes⟩, .scalar ⟨len, ptrBytes⟩]`. -/
+theorem evalRvalue_aggregate_rawPtr_wide_scalarAddr_of_lt (locals locals₁ locals₂ : List LocalSlot)
+    (pointeeTy : Ty) (mutability : Mutability) (dataOp metaOp : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (addr len : Nat)
+    (hWide : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hAddr : addr < scalarModulus (layoutPointerBytes layouts))
+    (hLen : len < scalarModulus (layoutPointerBytes layouts))
+    (hData : evalOperand locals dataOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.scalar ⟨addr, layoutPointerBytes layouts⟩) locals₁)
+    (hMeta : evalOperand locals₁ metaOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.scalar ⟨len, layoutPointerBytes layouts⟩) locals₂) :
+    evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]) mem
+      localDecls layouts =
+        .ok (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes layouts⟩,
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals₂ mem := by
+  rw [evalRvalue_aggregate_rawPtr_wide_scalarAddr locals locals₁ locals₂ pointeeTy mutability
+    dataOp metaOp mem localDecls layouts addr len hWide hData hMeta,
+    wrapScalarBits_eq_of_lt hAddr, wrapScalarBits_eq_of_lt hLen]
+
+/-- **`evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip_scalarAddr`**: `to_raw_parts` +
+`AggregateKind.rawPtr` round-trip on a provenance-free (integer-address) wide pointer
+`.aggregate 0 [.scalar ⟨addr, ptrBytes⟩, .scalar ⟨len, ptrBytes⟩]` with
+`addr, len < scalarModulus ptrBytes`. -/
+theorem evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip_scalarAddr (locals : List LocalSlot)
+    (loc : Local) (pointeeTy dataTy metaTy : Ty) (mutability : Mutability)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (addr len : Nat)
+    (hWide : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hAddr : addr < scalarModulus (layoutPointerBytes layouts))
+    (hLen : len < scalarModulus (layoutPointerBytes layouts))
+    (hSlot : get? locals loc =
+      some (.init (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes layouts⟩,
+        .scalar ⟨len, layoutPointerBytes layouts⟩])))
+    (hNoUnion0 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 0 dataTy] } = false)
+    (hNoUnion1 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 1 metaTy] } = false) :
+    evalRvalue locals
+      (.aggregate (.rawPtr pointeeTy mutability)
+        [.copy { local_ := loc, projection := [.field 0 dataTy] },
+         .copy { local_ := loc, projection := [.field 1 metaTy] }])
+      mem localDecls layouts =
+        .ok (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes layouts⟩,
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals mem :=
+  evalRvalue_aggregate_rawPtr_wide_scalarAddr_of_lt locals locals locals pointeeTy mutability
+    (.copy { local_ := loc, projection := [.field 0 dataTy] })
+    (.copy { local_ := loc, projection := [.field 1 metaTy] })
+    mem localDecls layouts addr len hWide hAddr hLen
+    (evalOperand_copy_widePtr_field0 locals loc dataTy _ _ mem.borrows mem.globals layouts
+      mem.callerLocals localDecls mem.callStack hSlot hNoUnion0)
+    (evalOperand_copy_widePtr_field1 locals loc metaTy _ _ mem.borrows mem.globals layouts
+      mem.callerLocals localDecls mem.callStack hSlot hNoUnion1)
+
+/-- Runtime representations of `()` metadata accepted by `evalAggregateRawPtr` for sized pointees:
+both `.unit` (`ConstantValue.zeroSized`) and `.aggregate 0 []` (`Rvalue.aggregate .tuple []`). -/
+@[reducible]
+def IsThinRawPtrMetaVal (v : Value) : Prop :=
+  v = .unit ∨ v = .aggregate 0 []
+
+/-- **`evalRvalue_aggregate_rawPtr_thin_of_isThinMeta`**: `AggregateKind.rawPtr` on a sized pointee
+(`isUnsizedRawPtrPointee pointeeTy = false`) with a provenance-carrying data pointer `.ptr p ptrBytes`
+and either `.unit` or `.aggregate 0 []` (`Tuple([])`) metadata returns `.ok (.ptr p ptrBytes) locals₂ mem`. -/
+theorem evalRvalue_aggregate_rawPtr_thin_of_isThinMeta (locals locals₁ locals₂ : List LocalSlot)
+    (pointeeTy : Ty) (mutability : Mutability) (dataOp unitOp : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (p : ProvenancePtr) (unitVal : Value)
+    (hSized : isUnsizedRawPtrPointee pointeeTy = false)
+    (hMetaVal : IsThinRawPtrMetaVal unitVal)
+    (hData : evalOperand locals dataOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.ptr p (layoutPointerBytes layouts)) locals₁)
+    (hUnit : evalOperand locals₁ unitOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok unitVal locals₂) :
+    evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) [dataOp, unitOp]) mem
+      localDecls layouts = .ok (.ptr p (layoutPointerBytes layouts)) locals₂ mem := by
+  rcases hMetaVal with rfl | rfl <;> {
+    show evalAggregateRawPtr locals pointeeTy [dataOp, unitOp] mem localDecls layouts = _
+    unfold evalAggregateRawPtr evalOperands
+    rw [hData]
+    dsimp only [evalOperands]
+    rw [hUnit]
+    simp only [hSized, Nat.beq_refl]
+  }
+
+/-- **`evalRvalue_aggregate_rawPtr_thin_scalarAddr`**: `AggregateKind.rawPtr` on a sized pointee
+(`isUnsizedRawPtrPointee pointeeTy = false`) from a provenance-free integer address
+`.scalar ⟨addr, ptrBytes⟩` (`addr < scalarModulus ptrBytes`) and `.unit` or `.aggregate 0 []`
+metadata returns `.ok (.scalar ⟨addr, ptrBytes⟩) locals₂ mem`. -/
+theorem evalRvalue_aggregate_rawPtr_thin_scalarAddr (locals locals₁ locals₂ : List LocalSlot)
+    (pointeeTy : Ty) (mutability : Mutability) (dataOp unitOp : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (addr : Nat) (unitVal : Value)
+    (hSized : isUnsizedRawPtrPointee pointeeTy = false)
+    (hAddr : addr < scalarModulus (layoutPointerBytes layouts))
+    (hMetaVal : IsThinRawPtrMetaVal unitVal)
+    (hData : evalOperand locals dataOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.scalar ⟨addr, layoutPointerBytes layouts⟩) locals₁)
+    (hUnit : evalOperand locals₁ unitOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok unitVal locals₂) :
+    evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) [dataOp, unitOp]) mem
+      localDecls layouts =
+        .ok (.scalar ⟨addr, layoutPointerBytes layouts⟩) locals₂ mem := by
+  rcases hMetaVal with rfl | rfl <;> {
+    show evalAggregateRawPtr locals pointeeTy [dataOp, unitOp] mem localDecls layouts = _
+    unfold evalAggregateRawPtr evalOperands
+    rw [hData]
+    dsimp only [evalOperands]
+    rw [hUnit]
+    simp only [hSized, Nat.beq_refl, wrapScalarBits_eq_of_lt hAddr]
+  }
+
+/-- **`evalRvalue_unaryOp_ptrMetadata_thin_scalarAddr`**: `Rvalue.unaryOp .ptrMetadata op` on a
+provenance-free thin pointer `.scalar ⟨addr, ptrBytes⟩` returns `.ok .unit locals' mem` when
+`isThinPtrMetadataOperandTy (operandTy localDecls layouts op) = true`. -/
+theorem evalRvalue_unaryOp_ptrMetadata_thin_scalarAddr (locals locals' : List LocalSlot)
+    (op : Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (addr : Nat)
+    (hThinTy : isThinPtrMetadataOperandTy (operandTy localDecls layouts op) = true)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.scalar ⟨addr, layoutPointerBytes layouts⟩) locals') :
+    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
+      .ok .unit locals' mem := by
+  show evalUnaryPtrMetadata locals op mem localDecls layouts = _
+  unfold evalUnaryPtrMetadata
+  simp only [hOp, hThinTy, Nat.beq_refl, Bool.and_self]
+
+/-- Negative: `Rvalue.unaryOp .ptrMetadata op` faults with `.ub` when a scalar `.scalar sc` is
+evaluated for an operand whose static type is a wide pointer/reference
+(`isThinPtrMetadataOperandTy (operandTy localDecls layouts op) = false`). -/
+theorem evalRvalue_unaryOp_ptrMetadata_scalar_wideTy_ub (locals locals' : List LocalSlot)
+    (op : Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (sc : ScalarInt)
+    (hNotThin : isThinPtrMetadataOperandTy (operandTy localDecls layouts op) = false)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.scalar sc) locals') :
+    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts = .ub := by
+  show evalUnaryPtrMetadata locals op mem localDecls layouts = _
+  unfold evalUnaryPtrMetadata
+  simp only [hOp, hNotThin, Bool.and_false]
+
+/-- **`mirStep_call_sizeOfVal_str_ptrSz_ne_ub`**: `stepMirFn` and `mirStep` fault with `.ub`
+when `core::intrinsics::size_of_val` on `.str` receives a wide pointer with `ptrSz ≠ 8`. -/
+theorem mirStep_call_sizeOfVal_str_ptrSz_ne_ub {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {p : ProvenancePtr} {ptrSz : Nat} {lenSc : ScalarInt}
+    {locals' : List LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack =
+        .ok (.aggregate 0 [.ptr p ptrSz, .scalar lenSc]) locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some .str)
+    (hNe : ptrSz ≠ 8) :
+    stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
+  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) =
+        .ok [.aggregate 0 [.ptr p ptrSz, .scalar lenSc]] locals' := by
+    unfold evalOperands
+    rw [hArg]
+    rfl
+  have hFail := (evalNonSelectIntrinsicCall_str_ptrSz_ne_ub s _ cur.localDecls cur.layouts [ptrOp]
+    locals' destination targetBb p ptrSz lenSc hPt hNe).1
+  exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
+    rfl rfl rfl hFail
+
+/-- **`mirStep_call_alignOfVal_str_ptrSz_ne_ub`**: `stepMirFn` and `mirStep` fault with `.ub`
+when `core::intrinsics::align_of_val` on `.str` receives a wide pointer with `ptrSz ≠ 8`. -/
+theorem mirStep_call_alignOfVal_str_ptrSz_ne_ub {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {p : ProvenancePtr} {ptrSz : Nat} {lenSc : ScalarInt}
+    {locals' : List LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack =
+        .ok (.aggregate 0 [.ptr p ptrSz, .scalar lenSc]) locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::align_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some .str)
+    (hNe : ptrSz ≠ 8) :
+    stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
+  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) =
+        .ok [.aggregate 0 [.ptr p ptrSz, .scalar lenSc]] locals' := by
+    unfold evalOperands
+    rw [hArg]
+    rfl
+  have hFail := (evalNonSelectIntrinsicCall_str_ptrSz_ne_ub s _ cur.localDecls cur.layouts [ptrOp]
+    locals' destination targetBb p ptrSz lenSc hPt hNe).2
+  exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
+    rfl rfl rfl hFail
+
+/-- **`mirStep_call_sizeOfVal_unsized_scalarAddr_ub`**: `stepMirFn` and `mirStep` fault with `.ub`
+when `core::intrinsics::size_of_val` on an unsized `.slice elemTy` or `.str` receives a
+provenance-free wide pointer `.aggregate 0 [.scalar addrSc, .scalar lenSc]`. -/
+theorem mirStep_call_sizeOfVal_unsized_scalarAddr_ub {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {dstTy : RigidTy} {addrSc lenSc : ScalarInt}
+    {locals' : List LocalSlot}
+    (hDstTy : (∃ elemTy, dstTy = .slice elemTy) ∨ dstTy = .str)
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack =
+        .ok (.aggregate 0 [.scalar addrSc, .scalar lenSc]) locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some dstTy) :
+    stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
+  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) =
+        .ok [.aggregate 0 [.scalar addrSc, .scalar lenSc]] locals' := by
+    unfold evalOperands
+    rw [hArg]
+    rfl
+  have hFail := (evalNonSelectIntrinsicCall_unsized_scalarAddr_ub s _ cur.localDecls cur.layouts
+    [ptrOp] locals' destination targetBb dstTy addrSc lenSc hDstTy hPt).1
+  exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
+    rfl rfl rfl hFail
+
+/-- **`mirStep_call_alignOfVal_unsized_scalarAddr_ub`**: `stepMirFn` and `mirStep` fault with `.ub`
+when `core::intrinsics::align_of_val` on an unsized `.slice elemTy` or `.str` receives a
+provenance-free wide pointer `.aggregate 0 [.scalar addrSc, .scalar lenSc]`. -/
+theorem mirStep_call_alignOfVal_unsized_scalarAddr_ub {body cur : CapturedMir} {s : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {dstTy : RigidTy} {addrSc lenSc : ScalarInt}
+    {locals' : List LocalSlot}
+    (hDstTy : (∃ elemTy, dstTy = .slice elemTy) ∨ dstTy = .str)
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack =
+        .ok (.aggregate 0 [.scalar addrSc, .scalar lenSc]) locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::align_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some dstTy) :
+    stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
+  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack) =
+        .ok [.aggregate 0 [.scalar addrSc, .scalar lenSc]] locals' := by
+    unfold evalOperands
+    rw [hArg]
+    rfl
+  have hFail := (evalNonSelectIntrinsicCall_unsized_scalarAddr_ub s _ cur.localDecls cur.layouts
+    [ptrOp] locals' destination targetBb dstTy addrSc lenSc hDstTy hPt).2
+  exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
+    rfl rfl rfl hFail
+
 end UnsizedDstMetadataLifters
 
 end Anneal.MirLiftCore

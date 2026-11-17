@@ -365,6 +365,8 @@ theorem rawPtr_from_raw_parts_and_roundtrip_with_borrow_write :
     [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩] 0
     rfl rfl rfl rfl rfl rfl rfl rfl rfl
     (by decide) (Or.inl rfl)
+  have _ := hDst77.evalOperand_field0 backingArrLocals 1 ptrU32Ty [] layouts64 rfl rfl
+  have _ := hDst77.evalOperand_field1 backingArrLocals 1 usizeTy [] layouts64 rfl rfl
   refine ⟨hDst77.evalRvalue_aggregate_rawPtr_roundtrip backingArrLocals 1 0 ptrU32Ty usizeTy .mut
       [] layouts64 rfl rfl rfl,
     rfl⟩
@@ -850,6 +852,13 @@ def pinLocals5 : List LocalSlot :=
    .init (WidePtrVal.toValue 8 wide77), .init pinArrVal, .init (.scalar ⟨99, 4⟩),
    .uninit, .uninit, .uninit, .uninit]
 
+/-- Non-trivial per-block `extra` invariant for `mirCfgStateRel` carrying both the spatial pin on
+`_2 : [u32; 4]` and the borrow-backed `UnsizedSliceDstAt` lens of `wide77`. -/
+def pinCfgExtra (_ : Nat) (st : SymState StdVal) (ms : MachineState) : Prop :=
+  spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] st ms ∧
+    UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) ms.memory wide77
+      (WidePtrVal.toValue 8 wide77) xs4 (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4)
+
 /-- **End-to-end multi-step `MirWpConverges` + spatial-pin + unsized-lens preservation** with an
 active protector (`activeProtectors = [5]`): steps across
 `UnOp.ptrMetadata`, `AggregateKind.rawPtr` (`from_raw_parts`, with a `move` metadata operand),
@@ -859,8 +868,9 @@ active protector (`activeProtectors = [5]`): steps across
 `MirWpConverges` transports of the `*_preserves_spatialPin` lemmas into the final `return`), that
 the spatial pin on `_2 : [u32; 4]`, the loan binding on `_3` (`mirStateRel` at the exit), the
 borrow-backed `UnsizedSliceDstAt` lens of the raw slice pointer into the pinned array, and its
-`ActiveTypedSliceMutBorrow` all remain intact after every step, and that the `align_of_val`
-block `bb1` is a `BlockCfg` segment re-establishing `mirCfgStateRel` at block entry `bb2`. -/
+`ActiveTypedSliceMutBorrow` all remain intact after every step, and that both `bb0` (3-step
+multi-statement + `size_of_val` block) and `bb1` (`align_of_val` block) are `BlockCfg` segments
+re-establishing `mirCfgStateRel` with the non-trivial `pinCfgExtra` invariant. -/
 theorem dst_metadata_and_layout_converges_preserving_spatialPin :
     Anneal.MirFuelFree.MirWpConverges pinBody pinMs0
       (fun out =>
@@ -882,6 +892,9 @@ theorem dst_metadata_and_layout_converges_preserving_spatialPin :
       spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt ms3 ∧
       UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) ms3.memory wide77
         (WidePtrVal.toValue 8 wide77) xs4 (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4) ∧
+      PureMirExec.StepsTo (PureMirExec.mirStep pinBody) pinMs0
+        (mirCfgStateRel tagOfLoan (fun _ => [(1, 3, [])]) id pinCfgExtra
+          ⟨some, 1, pinSt, 0⟩) ∧
       PureMirExec.mirStep pinBody ms3 = .cont ms4 ∧
       spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt ms4 ∧
       spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 3, [])] pinSt ms4 ∧
@@ -890,7 +903,7 @@ theorem dst_metadata_and_layout_converges_preserving_spatialPin :
       ActiveTypedSliceMutBorrow ByteLensCodec.u32LE ms4.memory.borrows 77 wide77 xs4
         (ByteLensCodec.encodeElems ByteLensCodec.u32LE xs4) ∧
       PureMirExec.StepsTo (PureMirExec.mirStep pinBody) ms3
-        (mirCfgStateRel tagOfLoan (fun _ => [(1, 3, [])]) id (fun _ _ _ => True)
+        (mirCfgStateRel tagOfLoan (fun _ => [(1, 3, [])]) id pinCfgExtra
           ⟨some, 2, pinSt, 0⟩) ∧
       PureMirExec.mirStep pinBody ms4 = .cont ms5 ∧
       spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 2 [] pinSt ms5 ∧
@@ -1044,14 +1057,17 @@ theorem dst_metadata_and_layout_converges_preserving_spatialPin :
     hS1, hPin1, hBind1, hDst1,
     hS2, hPin2, hBind2, hDst2,
     hS3, hPin3, hBind3, hDst3,
+    mirCfgStateRel_stepsTo_of_steps tagOfLoan (bb := 0) (nextBb := 1)
+      (by unfold mirCfgStateRel; exact ⟨subIdWrap_some, rfl, rfl, hRel0, hPin0, pinDst77⟩)
+      (.step hS1 (.step hS2 (.step hS3 (.refl rfl)))) rfl rfl hRel3 ⟨hPin3, hDst3⟩,
     hS4, hPin4, hBind4, hDst4, pinMutLens77,
     mirCfgStateRel_stepsTo_of_intrinsic_write tagOfLoan (bb := 1) (nextBb := 2)
       (locals' := pinLocals3Moved) (updatedLocals := pinLocals4) (dstLoc := 7)
       (v := .init (.scalar ⟨4, 8⟩))
-      (by unfold mirCfgStateRel; exact ⟨subIdWrap_some, rfl, rfl, hRel3, trivial⟩) hS4 rfl
+      (by unfold mirCfgStateRel; exact ⟨subIdWrap_some, rfl, rfl, hRel3, hPin3, hDst3⟩) hS4 rfl
       (hNeBind 7 (by decide))
       (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
-      (hUnbPin 7 _ _ (by decide) rfl) rfl trivial,
+      (hUnbPin 7 _ _ (by decide) rfl) rfl ⟨hPin4, hDst4⟩,
     hS5, hPin5, hBind5, hRel5, hDst5⟩
 
 /-! ## 6. Negative UB-Rejection Canaries & Metadata-Without-Deref Contrast -/
@@ -1289,29 +1305,54 @@ theorem size_and_align_stepMirFn_boundary_canaries :
       (p := p9) (ptrSz := 4) (lenSc := ⟨4, 4⟩)
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl (by decide)⟩
 
-/-- **Provenance-free (dangling) wide pointers and remaining fail-closed shapes**:
+/-- **Provenance-free (dangling) wide and thin pointers, `.aggregate 0 []` unit metadata, and
+remaining fail-closed shapes**:
 - `ptr::slice_from_raw_parts(ptr::without_provenance(4), 0)` (`AggregateKind.rawPtr` from an
   integer address) builds the provenance-free empty slice `.aggregate 0 [.scalar ⟨4, 8⟩,
-  .scalar ⟨0, 8⟩]`, and `UnOp.ptrMetadata` reads its length `0` without touching memory;
-- the trusted `size_of_val::<[u32]>` and `align_of_val::<[u32]>` nevertheless fault `.ub` on that
-  pointer at `stepMirFn` level (they require a provenance-carrying `.ptr _ 8` data pointer, a
-  model limitation: Rust defines `size_of_val` of a dangling empty slice as `0`);
+  .scalar ⟨0, 8⟩]`, `to_raw_parts` + `from_raw_parts` round-trips it identically, and
+  `UnOp.ptrMetadata` reads its length `0` without touching memory;
+- `AggregateKind.rawPtr` on sized `u32` accepts both `.unit` and `.aggregate 0 []` (`Tuple([])`)
+  metadata for both provenance-carrying `.ptr p9 8` and provenance-free `.scalar ⟨4, 8⟩` data
+  pointers, and `UnOp.ptrMetadata` on `.scalar ⟨4, 8⟩` returns `.unit` when typed as `*const u32`
+  while faulting `.ub` when typed as `*const [u32]`;
+- the trusted `size_of_val::<[u32]>` and `align_of_val::<[u32]>` fault `.ub` on a provenance-free
+  wide pointer at `stepMirFn` level (they require a provenance-carrying `.ptr _ 8` data pointer);
 - `from_raw_parts::<[u32]>` with vtable-pointer metadata fails closed with `.ub`;
 - a 32-bit (`ptrSz = 4`) data pointer in a `&str` faults `.ub` for both `size_of_val` and
   `align_of_val` at `stepMirFn` level. -/
 theorem provenanceFree_and_failClosed_canaries :
     let bodyU32 := sizeAlignSliceCallerMir (.uint .u32)
     let bodyStr := sizeAlignStrCallerMir
-    let addrLocals : List LocalSlot := [.init (.scalar ⟨4, 8⟩), .init (.scalar ⟨0, 8⟩)]
+    let addrLocals : List LocalSlot :=
+      [.init (.scalar ⟨4, 8⟩), .init (.scalar ⟨0, 8⟩), .init (.aggregate 0 []), .init (.ptr p9 8)]
     let danglingVal : Value := .aggregate 0 [.scalar ⟨4, 8⟩, .scalar ⟨0, 8⟩]
     let danglingLocals : List LocalSlot := (dstLocals 8).set 1 (.init danglingVal)
+    let scalarAsWideLocals : List LocalSlot := (dstLocals 8).set 1 (.init (.scalar ⟨4, 8⟩))
+    let scalarAsThinLocals : List LocalSlot := (dstLocals 8).set 5 (.init (.scalar ⟨4, 8⟩))
     let str32 : Value := .aggregate 0 [.ptr p10 4, .scalar ⟨5, 4⟩]
     evalRvalue addrLocals
         (.aggregate (.rawPtr sliceU32Ty .not)
           [.copy { local_ := 0, projection := [] }, .copy { local_ := 1, projection := [] }])
         mem0 [] layouts64 = .ok danglingVal addrLocals mem0 ∧
+    evalRvalue danglingLocals
+        (.aggregate (.rawPtr sliceU32Ty .not)
+          [.copy { local_ := 1, projection := [.field 0 ptrU32Ty] },
+           .copy { local_ := 1, projection := [.field 1 usizeTy] }])
+        mem0 dstDecls layouts64 = .ok danglingVal danglingLocals mem0 ∧
     evalRvalue danglingLocals (.unaryOp .ptrMetadata (.copy { local_ := 1, projection := [] }))
         mem0 dstDecls layouts64 = .ok (.scalar ⟨0, 8⟩) danglingLocals mem0 ∧
+    evalRvalue addrLocals
+        (.aggregate (.rawPtr { kind := .uint .u32, layoutIdx := 0 } .not)
+          [.copy { local_ := 3, projection := [] }, .copy { local_ := 2, projection := [] }])
+        mem0 [] layouts64 = .ok (.ptr p9 8) addrLocals mem0 ∧
+    evalRvalue addrLocals
+        (.aggregate (.rawPtr { kind := .uint .u32, layoutIdx := 0 } .not)
+          [.copy { local_ := 0, projection := [] }, .copy { local_ := 2, projection := [] }])
+        mem0 [] layouts64 = .ok (.scalar ⟨4, 8⟩) addrLocals mem0 ∧
+    evalRvalue scalarAsThinLocals (.unaryOp .ptrMetadata (.copy { local_ := 5, projection := [] }))
+        mem0 dstDecls layouts64 = .ok .unit scalarAsThinLocals mem0 ∧
+    evalRvalue scalarAsWideLocals (.unaryOp .ptrMetadata (.copy { local_ := 1, projection := [] }))
+        mem0 dstDecls layouts64 = .ub ∧
     (stepMirFn bodyU32 (ubState danglingVal 0) = MirStepNode.fail .ub ∧
       PureMirExec.mirStep bodyU32 (ubState danglingVal 0) = .fault) ∧
     (stepMirFn bodyU32 (ubState danglingVal 1) = MirStepNode.fail .ub ∧
@@ -1324,51 +1365,43 @@ theorem provenanceFree_and_failClosed_canaries :
       PureMirExec.mirStep bodyStr (ubState str32 0) = .fault) ∧
     (stepMirFn bodyStr (ubState str32 1) = MirStepNode.fail .ub ∧
       PureMirExec.mirStep bodyStr (ubState str32 1) = .fault) := by
-  intro bodyU32 bodyStr addrLocals danglingVal danglingLocals str32
-  have hDangSz := evalNonSelectIntrinsicCall_unsized_scalarAddr_ub (ubState danglingVal 0)
-    { defPath := "core::intrinsics::size_of_val", typeArgs := [.slice (.uint .u32)],
-      fnSig := none, isIndirect := false }
-    bodyU32.localDecls bodyU32.layouts [.copy { local_ := 1, projection := [] }]
-    (ubState danglingVal 0).frame.locals { local_ := 2, projection := [] } 1
-    (.slice (.uint .u32)) ⟨4, 8⟩ ⟨0, 8⟩ (Or.inl ⟨_, rfl⟩) rfl
-  have hDangAl := evalNonSelectIntrinsicCall_unsized_scalarAddr_ub (ubState danglingVal 1)
-    { defPath := "core::intrinsics::align_of_val", typeArgs := [],
-      fnSig := none, isIndirect := false }
-    bodyU32.localDecls bodyU32.layouts [.copy { local_ := 1, projection := [] }]
-    (ubState danglingVal 1).frame.locals { local_ := 3, projection := [] } 2
-    (.slice (.uint .u32)) ⟨4, 8⟩ ⟨0, 8⟩ (Or.inl ⟨_, rfl⟩) rfl
-  have hStrSz := evalNonSelectIntrinsicCall_str_ptrSz_ne_ub (ubState str32 0)
-    { defPath := "core::intrinsics::size_of_val", typeArgs := [.str],
-      fnSig := none, isIndirect := false }
-    bodyStr.localDecls bodyStr.layouts [.copy { local_ := 1, projection := [] }]
-    (ubState str32 0).frame.locals { local_ := 2, projection := [] } 1
-    p10 4 ⟨5, 4⟩ rfl (by decide)
-  have hStrAl := evalNonSelectIntrinsicCall_str_ptrSz_ne_ub (ubState str32 1)
-    { defPath := "core::intrinsics::align_of_val", typeArgs := [],
-      fnSig := none, isIndirect := false }
-    bodyStr.localDecls bodyStr.layouts [.copy { local_ := 1, projection := [] }]
-    (ubState str32 1).frame.locals { local_ := 3, projection := [] } 2
-    p10 4 ⟨5, 4⟩ rfl (by decide)
-  exact ⟨evalRvalue_aggregate_rawPtr_wide_scalarAddr addrLocals addrLocals addrLocals sliceU32Ty
-      .not (.copy { local_ := 0, projection := [] }) (.copy { local_ := 1, projection := [] })
-      mem0 [] layouts64 4 0 rfl rfl rfl,
-    evalRvalue_unaryOp_ptrMetadata_wide_scalarAddr danglingLocals danglingLocals
-      (.copy { local_ := 1, projection := [] }) mem0 dstDecls layouts64 4 0 rfl rfl,
-    mirStep_call_nonSelectIntrinsic_fail (body := bodyU32) (cur := bodyU32)
-      (s := ubState danglingVal 0)
-      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl hDangSz.1,
-    mirStep_call_nonSelectIntrinsic_fail (body := bodyU32) (cur := bodyU32)
-      (s := ubState danglingVal 1)
-      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl hDangAl.2,
+  intro bodyU32 bodyStr addrLocals danglingVal danglingLocals scalarAsWideLocals scalarAsThinLocals
+    str32
+  exact ⟨evalRvalue_aggregate_rawPtr_wide_scalarAddr_of_lt addrLocals addrLocals addrLocals
+      sliceU32Ty .not (.copy { local_ := 0, projection := [] })
+      (.copy { local_ := 1, projection := [] }) mem0 [] layouts64 4 0 rfl (by decide) (by decide)
+      rfl rfl,
+    evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip_scalarAddr danglingLocals 1 sliceU32Ty
+      ptrU32Ty usizeTy .not mem0 dstDecls layouts64 4 0 rfl (by decide) (by decide) rfl rfl rfl,
+    evalRvalue_unaryOp_ptrMetadata_wide_scalarAddr_of_lt danglingLocals danglingLocals
+      (.copy { local_ := 1, projection := [] }) mem0 dstDecls layouts64 4 0 rfl (by decide) rfl,
+    evalRvalue_aggregate_rawPtr_thin_of_isThinMeta addrLocals addrLocals addrLocals
+      { kind := .uint .u32, layoutIdx := 0 } .not (.copy { local_ := 3, projection := [] })
+      (.copy { local_ := 2, projection := [] }) mem0 [] layouts64 p9 (.aggregate 0 []) rfl
+      (Or.inr rfl) rfl rfl,
+    evalRvalue_aggregate_rawPtr_thin_scalarAddr addrLocals addrLocals addrLocals
+      { kind := .uint .u32, layoutIdx := 0 } .not (.copy { local_ := 0, projection := [] })
+      (.copy { local_ := 2, projection := [] }) mem0 [] layouts64 4 (.aggregate 0 []) rfl
+      (by decide) (Or.inr rfl) rfl rfl,
+    evalRvalue_unaryOp_ptrMetadata_thin_scalarAddr scalarAsThinLocals scalarAsThinLocals
+      (.copy { local_ := 5, projection := [] }) mem0 dstDecls layouts64 4 rfl rfl,
+    evalRvalue_unaryOp_ptrMetadata_scalar_wideTy_ub scalarAsWideLocals scalarAsWideLocals
+      (.copy { local_ := 1, projection := [] }) mem0 dstDecls layouts64 ⟨4, 8⟩ rfl rfl,
+    mirStep_call_sizeOfVal_unsized_scalarAddr_ub (body := bodyU32) (cur := bodyU32)
+      (s := ubState danglingVal 0) (dstTy := .slice (.uint .u32)) (addrSc := ⟨4, 8⟩)
+      (lenSc := ⟨0, 8⟩) (Or.inl ⟨_, rfl⟩) rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl,
+    mirStep_call_alignOfVal_unsized_scalarAddr_ub (body := bodyU32) (cur := bodyU32)
+      (s := ubState danglingVal 1) (dstTy := .slice (.uint .u32)) (addrSc := ⟨4, 8⟩)
+      (lenSc := ⟨0, 8⟩) (Or.inl ⟨_, rfl⟩) rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl,
     evalRvalue_aggregate_rawPtr_wide_vtableMeta_ub (dstLocals 8) (dstLocals 8) (dstLocals 8)
       sliceU32Ty .not (.copy { local_ := 5, projection := [] })
       (.copy { local_ := 5, projection := [] }) mem0 dstDecls layouts64 p9 p9 8 8 rfl rfl rfl,
-    mirStep_call_nonSelectIntrinsic_fail (body := bodyStr) (cur := bodyStr)
-      (s := ubState str32 0)
-      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl hStrSz.1,
-    mirStep_call_nonSelectIntrinsic_fail (body := bodyStr) (cur := bodyStr)
-      (s := ubState str32 1)
-      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl hStrAl.2⟩
+    mirStep_call_sizeOfVal_str_ptrSz_ne_ub (body := bodyStr) (cur := bodyStr)
+      (s := ubState str32 0) (p := p10) (ptrSz := 4) (lenSc := ⟨5, 4⟩)
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl (by decide),
+    mirStep_call_alignOfVal_str_ptrSz_ne_ub (body := bodyStr) (cur := bodyStr)
+      (s := ubState str32 1) (p := p10) (ptrSz := 4) (lenSc := ⟨5, 4⟩)
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl (by decide)⟩
 
 /-- **Bounded symbolic `wpMirExecSym` composes with the lifters**: the `size_of_val::<[u32]>` step
 of the live caller body shifts `wpMirExecSym` fuel by exactly one. -/
@@ -1403,7 +1436,10 @@ def sizedCallerMir : CapturedMir :=
        { mutability := .mut, ty := usizeTy, debugName := some "sz" },
        { mutability := .mut, ty := usizeTy, debugName := some "al" },
        { mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 },
-         debugName := some "thin_meta" }]
+         debugName := some "thin_meta" },
+       { mutability := .mut, ty := pinArrTy, debugName := some "pinned_arr" },
+       { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 },
+         debugName := some "bound_u32" }]
       [{ statements := []
          terminator :=
            { kind := .call (sizeOfValFn [.uint .u32])
@@ -1434,54 +1470,113 @@ def sizedCallerMir : CapturedMir :=
             span := "mk_layout_tuple" }]]) with
     layouts := layouts64 }
 
+def sizedPinBorrows : List BorrowEntry :=
+  [{ tag := 77, targetLocal := 5, targetProjection := [], perm := .unique,
+     rangeOffset := 0, rangeLen := 16 },
+   { tag := 78, targetLocal := 6, targetProjection := [], perm := .unique,
+     rangeOffset := 0, rangeLen := 4 }]
+
 /-- Sized `size_of_val::<u32>` (`4`), `align_of_val::<u32>` (`4`), `mirStep_assign_ptrMetadata_thin`
-(`.unit`), and `mirStep_assign_aggregate_rawPtr_thin` one-step lifters. -/
+(`.unit`), and `mirStep_assign_aggregate_rawPtr_thin` one-step lifters, plus their `PureLift`
+spatial-pin preserving counterparts (`mirStep_call_sizeOfVal_sized_preserves_spatialPin`,
+`mirStep_call_alignOfVal_sized_preserves_spatialPin`, and
+`mirStep_assign_aggregate_rawPtr_thin_preserves_spatialPin`). -/
 theorem size_and_align_sized_lifters :
+    let m0 : Memory := { mem0 with borrows := sizedPinBorrows }
     let s0 : MachineState :=
       { frame := { blockIdx := 0, stmtIdx := 0,
-                   locals := [.uninit, .init (.ptr p9 8), .uninit, .uninit, .uninit] }
-        memory := mem0 }
+                   locals := [.uninit, .init (.ptr p9 8), .uninit, .uninit, .uninit,
+                              .init pinArrVal, .init (.scalar ⟨99, 4⟩)] }
+        memory := m0 }
     let s1 : MachineState :=
       { frame := { blockIdx := 1, stmtIdx := 0,
-                   locals := [.uninit, .init (.ptr p9 8), .init (.scalar ⟨4, 8⟩), .uninit, .uninit] }
-        memory := mem0 }
+                   locals := [.uninit, .init (.ptr p9 8), .init (.scalar ⟨4, 8⟩), .uninit, .uninit,
+                              .init pinArrVal, .init (.scalar ⟨99, 4⟩)] }
+        memory := m0 }
     let s2 : MachineState :=
       { frame := { blockIdx := 2, stmtIdx := 0,
                    locals := [.uninit, .init (.ptr p9 8), .init (.scalar ⟨4, 8⟩),
-                              .init (.scalar ⟨4, 8⟩), .uninit] }
-        memory := mem0 }
+                              .init (.scalar ⟨4, 8⟩), .uninit,
+                              .init pinArrVal, .init (.scalar ⟨99, 4⟩)] }
+        memory := m0 }
     let s3 : MachineState :=
       { frame := { blockIdx := 2, stmtIdx := 1,
                    locals := [.uninit, .init (.ptr p9 8), .init (.scalar ⟨4, 8⟩),
-                              .init (.scalar ⟨4, 8⟩), .init .unit] }
-        memory := mem0 }
+                              .init (.scalar ⟨4, 8⟩), .init .unit,
+                              .init pinArrVal, .init (.scalar ⟨99, 4⟩)] }
+        memory := m0 }
     let s4 : MachineState :=
       { frame := { blockIdx := 2, stmtIdx := 2,
                    locals := [.uninit, .init (.ptr p9 8), .init (.scalar ⟨4, 8⟩),
-                              .init (.scalar ⟨4, 8⟩), .uninit] }
-        memory := mem0 }
+                              .init (.scalar ⟨4, 8⟩), .uninit,
+                              .init pinArrVal, .init (.scalar ⟨99, 4⟩)] }
+        memory := m0 }
     PureMirExec.mirStep sizedCallerMir s0 = .cont s1 ∧
     PureMirExec.mirStep sizedCallerMir s1 = .cont s2 ∧
     PureMirExec.mirStep sizedCallerMir s2 = .cont s3 ∧
-    PureMirExec.mirStep sizedCallerMir s3 = .cont s4 := by
-  intro s0 s1 s2 s3 s4
+    PureMirExec.mirStep sizedCallerMir s3 = .cont s4 ∧
+    spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 5 [] pinSt s4 ∧
+    spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 6, [])] pinSt s4 := by
+  intro m0 s0 s1 s2 s3 s4
+  have hPin0 : spatialPinnedBlockHolds tagOfLoan layouts64 pinArrTy 0 0 pinCodec 5 [] pinSt s0 :=
+    ⟨_, _, [], _, rfl, ⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+      ⟨_, rfl, rfl, rfl, rfl⟩⟩
+  have hBind0 : spatialBindingsHold (mirSpatialModel tagOfLoan) [(1, 6, [])] pinSt s0 :=
+    ⟨⟨trivial, trivial⟩,
+      ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩
+  have hNeBind : ∀ d, d ≠ 6 → ∀ b, b ∈ [(1, 6, ([] : SubPath))] → b.2.1 ≠ d := by
+    intro d hd b hb
+    cases hb with
+    | head => exact fun h => hd h.symm
+    | tail _ h => cases h
   obtain ⟨_, h1, _, _⟩ := mirStep_call_sizeOfVal_sized (body := sizedCallerMir)
     (cur := sizedCallerMir) (s := s0) (p := p9) (locals' := s0.frame.locals)
     (updatedLocals := s1.frame.locals)
     rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
+  obtain ⟨_, hPin1, hBind1, _⟩ :=
+    mirStep_call_sizeOfVal_sized_preserves_spatialPin tagOfLoan (body := sizedCallerMir)
+      (cur := sizedCallerMir) (ms := s0) (dstLoc := 2) (p := p9)
+      (locals' := s0.frame.locals) (updatedLocals := s1.frame.locals)
+      hPin0 hBind0 (by decide) (hNeBind 2 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl rfl rfl (by decide) rfl rfl rfl
   obtain ⟨_, h2, _, _⟩ := mirStep_call_alignOfVal_sized (body := sizedCallerMir)
     (cur := sizedCallerMir) (s := s1) (p := p9) (locals' := s1.frame.locals)
     (updatedLocals := s2.frame.locals)
     rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+  obtain ⟨_, hPin2, hBind2, _⟩ :=
+    mirStep_call_alignOfVal_sized_preserves_spatialPin tagOfLoan (body := sizedCallerMir)
+      (cur := sizedCallerMir) (dstLoc := 3) (p := p9)
+      (locals' := s1.frame.locals) (updatedLocals := s2.frame.locals)
+      hPin1 hBind1 (by decide) (hNeBind 3 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl rfl rfl rfl rfl rfl
   obtain ⟨_, h3, _, _⟩ := mirStep_assign_ptrMetadata_thin (body := sizedCallerMir)
     (cur := sizedCallerMir) (s := s2) (p := p9) (locals₁ := s2.frame.locals)
     (locals₂ := s3.frame.locals)
     rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl
+  obtain ⟨_, hPin3, hBind3, _⟩ :=
+    mirStep_assign_ptrMetadata_preserves_spatialPin tagOfLoan (body := sizedCallerMir)
+      (cur := sizedCallerMir) (dstLoc := 4) (locals₁ := s2.frame.locals)
+      (locals₂ := s3.frame.locals) hPin2 hBind2 (by decide) (hNeBind 4 (by decide))
+      rfl (Or.inl rfl) rfl rfl (PtrMetadataOf.thin p9) rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl rfl
   obtain ⟨_, h4, _, _⟩ := mirStep_assign_aggregate_rawPtr_thin (body := sizedCallerMir)
     (cur := sizedCallerMir) (s := s3) (p := p9) (locals₁ := s3.frame.locals)
     (locals₂ := s2.frame.locals) (locals₃ := s4.frame.locals)
     rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl rfl
-  exact ⟨h1, h2, h3, h4⟩
+  obtain ⟨_, hPin4, hBind4, _⟩ :=
+    mirStep_assign_aggregate_rawPtr_thin_preserves_spatialPin tagOfLoan (body := sizedCallerMir)
+      (cur := sizedCallerMir) (dstLoc := 1) (p := p9) (locals₁ := s3.frame.locals)
+      (locals₂ := s2.frame.locals) (locals₃ := s4.frame.locals)
+      hPin3 hBind3 (by decide) (hNeBind 1 (by decide))
+      rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+      (by intro b hb; cases hb with | head => rfl | tail _ h => cases h)
+      rfl rfl rfl rfl
+  exact ⟨h1, h2, h3, h4, hPin4, hBind4⟩
 
 /-- Callee memory in which the borrow `77` of `_2` is protected by the active protector `5`. -/
 def protMem : Memory :=

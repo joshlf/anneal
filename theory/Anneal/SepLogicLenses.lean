@@ -26984,6 +26984,46 @@ theorem evalRvalue_ptrMetadata {dstTy : RigidTy} {mem : Memory}
       UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes :=
   ⟨h.meta_of_length.evalRvalue_ptrMetadata hOp, h⟩
 
+/-- **`UnsizedSliceDstAt.evalOperand_field0`**: projecting `.field 0` (`to_raw_parts` data pointer)
+of an `UnsizedSliceDstAt` view at `loc` evaluates to `.ok (.ptr wide.1 ptrBytes) locals`. -/
+theorem evalOperand_field0 {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (locals : List LocalSlot) (loc : Local) (dataTy : Ty)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes)
+    (hSlot : get? locals loc = some (.init fatVal))
+    (hNoUnion0 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 0 dataTy] } = false) :
+    evalOperand locals (.copy { local_ := loc, projection := [.field 0 dataTy] })
+      mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.ptr wide.1 ptrBytes) locals := by
+  have hSlot' : get? locals loc =
+      some (.init (.aggregate 0 [.ptr wide.1 ptrBytes, .scalar ⟨elems.length, ptrBytes⟩])) := by
+    rw [← h.ptr_eq]
+    exact hSlot
+  exact evalOperand_copy_widePtr_field0 locals loc dataTy _ _ mem.borrows mem.globals layouts
+    mem.callerLocals localDecls mem.callStack hSlot' hNoUnion0
+
+/-- **`UnsizedSliceDstAt.evalOperand_field1`**: projecting `.field 1` (`to_raw_parts` metadata)
+of an `UnsizedSliceDstAt` view at `loc` evaluates to `.ok (.scalar ⟨elems.length, ptrBytes⟩) locals`. -/
+theorem evalOperand_field1 {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (locals : List LocalSlot) (loc : Local) (metaTy : Ty)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes)
+    (hSlot : get? locals loc = some (.init fatVal))
+    (hNoUnion1 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 1 metaTy] } = false) :
+    evalOperand locals (.copy { local_ := loc, projection := [.field 1 metaTy] })
+      mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.scalar ⟨elems.length, ptrBytes⟩) locals := by
+  have hSlot' : get? locals loc =
+      some (.init (.aggregate 0 [.ptr wide.1 ptrBytes, .scalar ⟨elems.length, ptrBytes⟩])) := by
+    rw [← h.ptr_eq]
+    exact hSlot
+  exact evalOperand_copy_widePtr_field1 locals loc metaTy _ _ mem.borrows mem.globals layouts
+    mem.callerLocals localDecls mem.callStack hSlot' hNoUnion1
+
 /-- **`UnsizedSliceDstAt.evalRvalue_aggregate_rawPtr_roundtrip`**: decomposing `fatVal` at `loc`
 via `.field 0` and `.field 1` (`to_raw_parts`) and reassembling via
 `Rvalue.aggregate (.rawPtr { kind := dstTy, layoutIdx := lIdx } mutability)` returns
