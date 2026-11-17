@@ -91,6 +91,15 @@ export Anneal.FaultSiteCensus (
   initMachineState_mirStepsInterproc_wellFormed_batch_safety
 )
 
+export Anneal.UnsafeObligations (
+  evalOperand_deref_reconciled_of_obligations
+  writePlaceValue_deref_reconciled_of_obligations
+  evalStmt_offset_reconciled_of_validSliceRange
+  evalCopyNonOverlapping_one_not_exposesUb_and_census_of_obligations
+  evalStmt_deref_load_reconciled_of_obligations
+  evalStmt_deref_store_reconciled_of_obligations
+)
+
 /-- Smoke-test witness exported from `Anneal`. -/
 theorem trivial_witness : True := trivial
 

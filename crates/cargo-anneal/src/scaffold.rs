@@ -787,7 +787,20 @@ pub fn compute_workspace_bundle_fault_census(
         (receipt, verdict)
     };
 
-    let mut specs_modular_externals: Option<Vec<String>> = None;
+    let verify_surface_is_modular = if authored.has_proof || authored.has_specs {
+        authored.is_modular
+    } else if !authored.has_assumptions
+        && (bundle.has_rust_trusted_attr() || authored.has_generated_assumptions)
+    {
+        false
+    } else {
+        !bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()
+    };
+    let mut specs_modular_externals: Option<Vec<String>> = if verify_surface_is_modular {
+        None
+    } else {
+        Some(Vec::new())
+    };
     let mut specs_equiv_ref_suffix: Option<String> = None;
     if authored.has_specs
         && let Some(ref pr) = proofs_root
@@ -796,8 +809,16 @@ pub fn compute_workspace_bundle_fault_census(
         if let Ok(specs_src) = fs::read_to_string(&specs_path) {
             match crate::fault_census::scan_specs_module(&specs_src, &bundle.item_module_suffix) {
                 Ok(specs_links) => {
+                    for did in &specs_links.declared_spec_def_ids {
+                        if did != &bundle.subject.target.def_id {
+                            return Ok(Some(fail_closed_receipt(format!(
+                                "Specs.{} declares an `*ItemSpec` instance for `{did}` instead of subject `{}`",
+                                bundle.item_module_suffix, bundle.subject.target.def_id
+                            ))));
+                        }
+                    }
                     specs_equiv_ref_suffix = specs_links.equiv_spec_body_suffix;
-                    if authored.is_modular && specs_links.has_modular_spec_instance {
+                    if verify_surface_is_modular && specs_links.has_modular_spec_instance {
                         let mut exts = Vec::new();
                         if specs_links.delegates_to_default_modular_spec_env {
                             exts.extend(

@@ -2711,12 +2711,12 @@ fn extract_external_callee_def_paths_from_obligations(
             ));
         }
         let callee_ob_path = obligations_root.join(module_suffix_to_rel_path(callee_suffix));
-        if !callee_ob_path.is_file() {
-            return Err(format!(
-                "missing sibling Obligations module {} for `import Obligations.{callee_suffix}`",
+        let callee_ob_text = fs::read_to_string(&callee_ob_path).map_err(|err| {
+            format!(
+                "missing sibling Obligations module {} for `import Obligations.{callee_suffix}`: {err}",
                 callee_ob_path.display()
-            ));
-        }
+            )
+        })?;
         let callee_mir_path = mir_root.join(module_suffix_to_rel_path(callee_suffix));
         let src = fs::read_to_string(&callee_mir_path).map_err(|err| {
             format!(
@@ -2735,6 +2735,7 @@ fn extract_external_callee_def_paths_from_obligations(
                 callee_mir_path.display()
             ));
         }
+        validate_sibling_obligations_module(&callee_ob_text, callee_suffix, &cbody.def_path)?;
         if !out.contains(&cbody.def_path) {
             out.push(cbody.def_path);
         }
@@ -2751,6 +2752,46 @@ fn extract_external_callee_def_paths_from_obligations(
         }
     }
     Ok(out)
+}
+
+/// `[adv ep1-B4]` Verify that a referenced sibling `.anneal/generated/Obligations/<Callee>.lean`
+/// module defines canonical claims for `callee_suffix` bound to `Mir.<Callee>.body`,
+/// `defaultCallees`, and `callee_def_path` (rejecting forged stubs or detached sibling claims).
+fn validate_sibling_obligations_module(
+    callee_ob_text: &str,
+    callee_suffix: &str,
+    callee_def_path: &str,
+) -> Result<(), String> {
+    let _ = extract_default_callee_suffixes_from_obligations(callee_ob_text)
+        .map_err(|err| format!("sibling Obligations.{callee_suffix}: {err}"))?;
+    let clinks = fault_census::scan_obligations_callee_links(callee_ob_text).map_err(|err| {
+        format!("sibling Obligations.{callee_suffix} failed the Lean lexer: {err}")
+    })?;
+    let covers = clinks.referenced_mir_bodies.iter().any(|s| s == callee_suffix)
+        && !clinks.claim_mir_bodies.is_empty()
+        && clinks.non_mir_claim_bodies.is_empty()
+        && clinks.claim_mir_bodies.iter().all(|s| s == callee_suffix);
+    if !covers {
+        return Err(format!(
+            "sibling Obligations.{callee_suffix} does not bind all canonical claims to `Mir.{callee_suffix}.body`"
+        ));
+    }
+    if clinks.claim_callees_bindings.is_empty()
+        || clinks.claim_body_field_count != clinks.claim_callees_field_count
+        || !clinks
+            .claim_callees_bindings
+            .iter()
+            .all(|b| b == "defaultCallees")
+    {
+        return Err(format!(
+            "sibling Obligations.{callee_suffix} overrides claim `callees` instead of `defaultCallees`"
+        ));
+    }
+    fault_census::validate_obligations_canonical_claims_for_def_path(
+        callee_ob_text,
+        callee_suffix,
+        Some(callee_def_path),
+    )
 }
 
 fn unmapped_fault_site_status(reason: String) -> VerificationStatus {
@@ -2787,605 +2828,845 @@ pub fn ensure_fault_site_coverage_reconciled(report: &VerificationReport) -> Res
     }
 }
 
+#[derive(Clone, Debug)]
+struct SubjectReconciliationOutcome {
+    cert_info: Option<fault_census::VerifiedCertificateInfo>,
+    sibling_modular_deps: Vec<(String, fault_census::SiblingModularContractKind)>,
+    failure_status: Option<VerificationStatus>,
+}
+
+fn reconcile_subject_by_suffix(
+    workspace_root: &Path,
+    suffix: &str,
+    initial_status_opt: Option<&VerificationStatus>,
+    registry: &PropertyRegistry,
+    dropped_sites: &std::collections::BTreeSet<FaultSite>,
+) -> SubjectReconciliationOutcome {
+    let generated_root = workspace_root.join(".anneal/generated");
+    let mir_root = generated_root.join("Mir");
+    let obligations_root = generated_root.join("Obligations");
+    let rel_path = module_suffix_to_rel_path(suffix);
+    let mir_path = mir_root.join(&rel_path);
+    let ob_path = obligations_root.join(&rel_path);
+    let verify_path = generated_root.join("Verify").join(&rel_path);
+
+    let fail_early = |reason: String| SubjectReconciliationOutcome {
+        cert_info: None,
+        sibling_modular_deps: Vec::new(),
+        failure_status: Some(unmapped_fault_site_status(reason)),
+    };
+
+    if let Some(status @ VerificationStatus::UnknownUnmappedFaultSite { .. }) = initial_status_opt
+    {
+        let cert_info = fs::read_to_string(&verify_path)
+            .ok()
+            .and_then(|vt| fault_census::inspect_verify_module_certificate(&vt, suffix).ok());
+        return SubjectReconciliationOutcome {
+            cert_info,
+            sibling_modular_deps: Vec::new(),
+            failure_status: Some(status.clone()),
+        };
+    }
+
+    let subject_mir_src = match fs::read_to_string(&mir_path) {
+        Ok(src) => src,
+        Err(err) => {
+            return fail_early(format!(
+                "missing MIR module {} for {suffix}: {err}",
+                mir_path.display()
+            ));
+        }
+    };
+    let subject_meta = match fault_census::parse_lean_mir_module_metadata_strict(&subject_mir_src) {
+        Ok(meta) => meta,
+        Err(err) => {
+            return fail_early(format!("MIR fault-census scan error in {suffix}: {err}"));
+        }
+    };
+    if subject_meta.body.def_path.is_empty() {
+        return fail_early(format!(
+            "subject MIR module {} for {suffix} has an empty `defPath`",
+            mir_path.display()
+        ));
+    }
+
+    let verify_text = match fs::read_to_string(&verify_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return fail_early(format!(
+                "missing Verify module {} for {suffix}: {err}",
+                verify_path.display()
+            ));
+        }
+    };
+    let cert_info = match fault_census::inspect_verify_module_certificate(&verify_text, suffix) {
+        Ok(info) => info,
+        Err(err) => return fail_early(err),
+    };
+
+    let own_trusted_contract = format!("Assumptions.{suffix}.rust_trusted_contract");
+    let subject_is_assumed = match initial_status_opt {
+        Some(VerificationStatus::VerifiedConditional { assumptions }) => {
+            assumptions.iter().any(|a| a == &own_trusted_contract)
+        }
+        Some(VerificationStatus::VerifiedUbException { .. }) => true,
+        Some(_) => false,
+        None => {
+            cert_info.surface.is_ub_exception()
+                || (cert_info
+                    .imported_assumptions_suffixes
+                    .iter()
+                    .any(|a| a == suffix)
+                    && verify_text.contains(&own_trusted_contract))
+        }
+    };
+
+    let fail_with_cert =
+        |cert: fault_census::VerifiedCertificateInfo, reason: String| SubjectReconciliationOutcome {
+            cert_info: Some(cert),
+            sibling_modular_deps: Vec::new(),
+            failure_status: Some(unmapped_fault_site_status(reason)),
+        };
+
+    let ob_text = match fs::read_to_string(&ob_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return fail_with_cert(
+                cert_info,
+                format!(
+                    "missing Obligations module {} for {suffix}: {err}",
+                    ob_path.display()
+                ),
+            );
+        }
+    };
+
+    let specs_imported_by_verify = cert_info
+        .imported_specs_suffixes
+        .iter()
+        .any(|s| s == suffix);
+    let mut specs_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let specs_links_opt = if specs_imported_by_verify {
+        let specs_path = workspace_root
+            .join("anneal/proofs/Specs")
+            .join(&rel_path);
+        let specs_text = match fs::read_to_string(&specs_path) {
+            Ok(text) => text,
+            Err(err) => {
+                return fail_with_cert(
+                    cert_info,
+                    format!(
+                        "Verify.{suffix} imports `Specs.{suffix}`, but {} could not be read: {err}",
+                        specs_path.display()
+                    ),
+                );
+            }
+        };
+        match fault_census::scan_specs_module(&specs_text, suffix) {
+            Ok(sl) => {
+                for did in &sl.declared_spec_def_ids {
+                    if did != &subject_meta.body.def_path {
+                        return fail_with_cert(
+                            cert_info,
+                            format!(
+                                "Specs.{suffix} declares an `*ItemSpec` instance for `{did}` instead of subject `{}`",
+                                subject_meta.body.def_path
+                            ),
+                        );
+                    }
+                }
+                for sib in &sl.imported_specs_suffixes {
+                    specs_queue.push_back(sib.clone());
+                }
+                Some(sl)
+            }
+            Err(err) => return fail_with_cert(cert_info, err),
+        }
+    } else {
+        None
+    };
+
+    // `[adv ep1-B4]`: traverse the FULL transitive import cone (`Proof.*`,
+    // `Assumptions.*` across both `anneal/proofs/Assumptions` and
+    // `.anneal/generated/Assumptions`, and `Specs.*`) with visited sets so multi-hop
+    // `Proof -> Proof`, `Specs -> Specs`, or `Specs -> Proof` overrides can never hide.
+    let mut proof_queue: std::collections::VecDeque<String> = cert_info
+        .imported_proof_suffixes
+        .iter()
+        .cloned()
+        .collect();
+    let mut assump_queue: std::collections::VecDeque<String> = cert_info
+        .imported_assumptions_suffixes
+        .iter()
+        .cloned()
+        .collect();
+    let mut visited_proof = std::collections::BTreeSet::new();
+    let mut visited_assump = std::collections::BTreeSet::new();
+    let mut visited_sib_specs = std::collections::BTreeSet::new();
+
+    while !proof_queue.is_empty() || !assump_queue.is_empty() || !specs_queue.is_empty() {
+        while let Some(proof_suf) = proof_queue.pop_front() {
+            if !visited_proof.insert(proof_suf.clone()) {
+                continue;
+            }
+            let proof_path = workspace_root
+                .join("anneal/proofs/Proof")
+                .join(module_suffix_to_rel_path(&proof_suf));
+            let proof_text = match fs::read_to_string(&proof_path) {
+                Ok(t) => t,
+                Err(err) => {
+                    return fail_with_cert(
+                        cert_info,
+                        format!(
+                            "transitive import `Proof.{proof_suf}` of `Verify.{suffix}` ({}) could not be read: {err}",
+                            proof_path.display()
+                        ),
+                    );
+                }
+            };
+            let aux = match fault_census::validate_auxiliary_module_no_spec_override(
+                &proof_text,
+                &format!("Proof.{proof_suf}"),
+                suffix,
+                specs_imported_by_verify,
+            ) {
+                Ok(a) => a,
+                Err(err) => return fail_with_cert(cert_info, err),
+            };
+            for sib in aux.imported_sibling_specs {
+                specs_queue.push_back(sib);
+            }
+            for next_p in aux.imported_proof_suffixes {
+                proof_queue.push_back(next_p);
+            }
+            for next_a in aux.imported_assumptions_suffixes {
+                assump_queue.push_back(next_a);
+            }
+        }
+        while let Some(assump_suf) = assump_queue.pop_front() {
+            if !visited_assump.insert(assump_suf.clone()) {
+                continue;
+            }
+            let rel_assump = module_suffix_to_rel_path(&assump_suf);
+            let authored_assump = workspace_root
+                .join("anneal/proofs/Assumptions")
+                .join(&rel_assump);
+            let gen_assump = generated_root.join("Assumptions").join(&rel_assump);
+            let mut candidate_paths = Vec::new();
+            if authored_assump.is_file() {
+                candidate_paths.push(authored_assump.clone());
+            }
+            if gen_assump.is_file() {
+                candidate_paths.push(gen_assump.clone());
+            }
+            if candidate_paths.is_empty() {
+                return fail_with_cert(
+                    cert_info,
+                    format!(
+                        "transitive import `Assumptions.{assump_suf}` of `Verify.{suffix}` ({} / {}) could not be read",
+                        authored_assump.display(),
+                        gen_assump.display()
+                    ),
+                );
+            }
+            for cand_path in candidate_paths {
+                let assump_text = match fs::read_to_string(&cand_path) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        return fail_with_cert(
+                            cert_info,
+                            format!(
+                                "transitive import `Assumptions.{assump_suf}` ({}) could not be read: {err}",
+                                cand_path.display()
+                            ),
+                        );
+                    }
+                };
+                let aux = match fault_census::validate_auxiliary_module_no_spec_override(
+                    &assump_text,
+                    &format!("Assumptions.{assump_suf}"),
+                    suffix,
+                    specs_imported_by_verify,
+                ) {
+                    Ok(a) => a,
+                    Err(err) => return fail_with_cert(cert_info, err),
+                };
+                for sib in aux.imported_sibling_specs {
+                    specs_queue.push_back(sib);
+                }
+                for next_p in aux.imported_proof_suffixes {
+                    proof_queue.push_back(next_p);
+                }
+                for next_a in aux.imported_assumptions_suffixes {
+                    assump_queue.push_back(next_a);
+                }
+            }
+        }
+        while let Some(sib_suf) = specs_queue.pop_front() {
+            if sib_suf == suffix {
+                if !specs_imported_by_verify {
+                    return fail_with_cert(
+                        cert_info,
+                        format!(
+                            "import cone of `Verify.{suffix}` transitively imports `Specs.{suffix}`, which is not imported by `Verify.{suffix}`"
+                        ),
+                    );
+                }
+                continue;
+            }
+            if !visited_sib_specs.insert(sib_suf.clone()) {
+                continue;
+            }
+            let sib_path = workspace_root
+                .join("anneal/proofs/Specs")
+                .join(module_suffix_to_rel_path(&sib_suf));
+            let sib_text = match fs::read_to_string(&sib_path) {
+                Ok(t) => t,
+                Err(err) => {
+                    return fail_with_cert(
+                        cert_info,
+                        format!(
+                            "imported sibling `Specs.{sib_suf}` ({}) could not be read: {err}",
+                            sib_path.display()
+                        ),
+                    );
+                }
+            };
+            let next_specs = match fault_census::validate_sibling_specs_no_subject_override(
+                &sib_text,
+                &sib_suf,
+                &subject_meta.body.def_path,
+            ) {
+                Ok(ns) => ns,
+                Err(err) => return fail_with_cert(cert_info, err),
+            };
+            for next_s in next_specs {
+                specs_queue.push_back(next_s);
+            }
+        }
+    }
+
+    let callee_suffixes = match extract_default_callee_suffixes_from_obligations(&ob_text) {
+        Ok(suffixes) => suffixes,
+        Err(err) => return fail_with_cert(cert_info, format!("{suffix}: {err}")),
+    };
+    let links = match fault_census::scan_obligations_callee_links(&ob_text) {
+        Ok(links) => links,
+        Err(err) => {
+            return fail_with_cert(
+                cert_info,
+                format!("Obligations module for {suffix} failed the Lean lexer: {err}"),
+            );
+        }
+    };
+    let claim_covers_subject = links.referenced_mir_bodies.iter().any(|s| s == suffix)
+        && !links.claim_mir_bodies.is_empty()
+        && links.non_mir_claim_bodies.is_empty()
+        && links.claim_mir_bodies.iter().all(|s| s == suffix);
+    if !claim_covers_subject {
+        return fail_with_cert(
+            cert_info,
+            format!(
+                "Obligations module for {suffix} never references `Mir.{suffix}.body` across all claim definitions (claim_mir_bodies={:?}, non_mir={:?}), so no emitted obligation discharges its fault sites",
+                links.claim_mir_bodies, links.non_mir_claim_bodies
+            ),
+        );
+    }
+    if links.claim_callees_bindings.is_empty()
+        || links.claim_body_field_count != links.claim_callees_field_count
+        || !links
+            .claim_callees_bindings
+            .iter()
+            .all(|b| b == "defaultCallees")
+    {
+        return fail_with_cert(
+            cert_info,
+            format!(
+                "Obligations module for {suffix} overrides claim `callees` (bindings={:?}, body_fields={}, callees_fields={}) instead of `defaultCallees`",
+                links.claim_callees_bindings,
+                links.claim_body_field_count,
+                links.claim_callees_field_count
+            ),
+        );
+    }
+    if let Err(err) = fault_census::validate_obligations_canonical_claims_for_def_path(
+        &ob_text,
+        suffix,
+        Some(&subject_meta.body.def_path),
+    ) {
+        return fail_with_cert(cert_info, err);
+    }
+    let ob_explicit_external = match extract_external_callee_def_paths_from_obligations(
+        suffix,
+        &links,
+        &mir_root,
+        &obligations_root,
+    ) {
+        Ok(ext) => ext,
+        Err(err) => return fail_with_cert(cert_info, err),
+    };
+
+    let mut sibling_modular_deps: Vec<(String, fault_census::SiblingModularContractKind)> =
+        Vec::new();
+    let push_sibling_dep =
+        |deps: &mut Vec<(String, fault_census::SiblingModularContractKind)>,
+         csuf: &str,
+         kind: fault_census::SiblingModularContractKind| {
+            if !deps.iter().any(|(c, k)| c == csuf && *k == kind) {
+                deps.push((csuf.to_string(), kind));
+            }
+        };
+
+    let explicit_external = if !cert_info.surface.is_modular() {
+        Vec::new()
+    } else if let Some(ref sl) = specs_links_opt
+        && sl.has_modular_spec_instance
+    {
+        let mut specs_ext = if sl.delegates_to_default_modular_spec_env {
+            for csuf in &links.referenced_callee_contracts {
+                push_sibling_dep(
+                    &mut sibling_modular_deps,
+                    csuf,
+                    fault_census::SiblingModularContractKind::DefaultCallContract,
+                );
+            }
+            ob_explicit_external.clone()
+        } else {
+            Vec::new()
+        };
+        for (csuf, kind) in &sl.sibling_modular_contracts {
+            push_sibling_dep(&mut sibling_modular_deps, csuf, *kind);
+        }
+        for callee_suffix in &sl.referenced_modular_callee_suffixes {
+            let callee_ob_path =
+                obligations_root.join(module_suffix_to_rel_path(callee_suffix));
+            let callee_ob_text = match fs::read_to_string(&callee_ob_path) {
+                Ok(t) => t,
+                Err(err) => {
+                    return fail_with_cert(
+                        cert_info,
+                        format!(
+                            "missing sibling Obligations module {} for `Specs.{suffix}` contract `Obligations.{callee_suffix}`: {err}",
+                            callee_ob_path.display()
+                        ),
+                    );
+                }
+            };
+            let callee_mir_path = mir_root.join(module_suffix_to_rel_path(callee_suffix));
+            let src = match fs::read_to_string(&callee_mir_path) {
+                Ok(s) => s,
+                Err(err) => {
+                    return fail_with_cert(
+                        cert_info,
+                        format!(
+                            "missing MIR module {} for `Specs.{suffix}` sibling `Obligations.{callee_suffix}`: {err}",
+                            callee_mir_path.display()
+                        ),
+                    );
+                }
+            };
+            match parse_lean_mir_module_body_strict(&src) {
+                Ok(cbody) if !cbody.def_path.is_empty() => {
+                    if let Err(err) = validate_sibling_obligations_module(
+                        &callee_ob_text,
+                        callee_suffix,
+                        &cbody.def_path,
+                    ) {
+                        return fail_with_cert(cert_info, err);
+                    }
+                    if !specs_ext.contains(&cbody.def_path) {
+                        specs_ext.push(cbody.def_path);
+                    }
+                }
+                Ok(_) => {
+                    return fail_with_cert(
+                        cert_info,
+                        format!(
+                            "sibling callee {callee_suffix} referenced by `Specs.{suffix}` has an empty `defPath`"
+                        ),
+                    );
+                }
+                Err(err) => {
+                    return fail_with_cert(
+                        cert_info,
+                        format!(
+                            "MIR fault-census scan error in `Specs.{suffix}` sibling callee {callee_suffix}: {err}"
+                        ),
+                    );
+                }
+            }
+        }
+        for ext_ident in &sl.referenced_subject_external_contract_idents {
+            let resolved_ident = if ext_ident == "defaultExternalCallContract" {
+                links.default_external_contract_alias.as_deref()
+            } else {
+                Some(ext_ident.as_str())
+            };
+            let matched = resolved_ident.and_then(|id| {
+                links
+                    .external_spec_contracts
+                    .iter()
+                    .find(|c| c.def_ident == id)
+            });
+            match matched {
+                Some(ext_link) => {
+                    if !specs_ext.contains(&ext_link.target_def_path) {
+                        specs_ext.push(ext_link.target_def_path.clone());
+                    }
+                }
+                None => {
+                    return fail_with_cert(
+                        cert_info,
+                        format!(
+                            "`Specs.{suffix}` `ModularItemSpec.envAssumed` references unknown external contract `{ext_ident}.holdsOn`"
+                        ),
+                    );
+                }
+            }
+        }
+        specs_ext
+    } else {
+        for csuf in &links.referenced_callee_contracts {
+            push_sibling_dep(
+                &mut sibling_modular_deps,
+                csuf,
+                fault_census::SiblingModularContractKind::DefaultCallContract,
+            );
+        }
+        ob_explicit_external
+    };
+
+    let equiv_spec_meta_opt = if cert_info.surface.is_equiv() {
+        let ref_suffix_res = if let Some(ref sl) = specs_links_opt
+            && sl.has_equiv_spec_instance
+        {
+            sl.equiv_spec_body_suffix.clone().ok_or_else(|| {
+                format!(
+                    "`Verify.{suffix}` proves `equivClaim` with `Specs.{suffix}`, which declares no `StatefulEquivItemSpec` instance"
+                )
+            })
+        } else {
+            match links.rust_equiv_spec_body_suffix.clone() {
+                Some(ref_suf)
+                    if ref_suf == suffix
+                        || links.imported_mir_suffixes.iter().any(|m| m == &ref_suf) =>
+                {
+                    Ok(ref_suf)
+                }
+                Some(ref_suf) => Err(format!(
+                    "Obligations module for {suffix} binds `rustEquivSpec` to `Mir.{ref_suf}.body` without `import Mir.{ref_suf}`"
+                )),
+                None => Err(format!(
+                    "`Verify.{suffix}` proves `equivClaim`, but neither `Specs.{suffix}` nor `Obligations.{suffix}` declares a `StatefulEquivItemSpec` reference body"
+                )),
+            }
+        };
+        let ref_suffix = match ref_suffix_res {
+            Ok(r) => r,
+            Err(err) => return fail_with_cert(cert_info, err),
+        };
+        let ref_mir_path = mir_root.join(module_suffix_to_rel_path(&ref_suffix));
+        let ref_mir_src = match fs::read_to_string(&ref_mir_path) {
+            Ok(src) => src,
+            Err(err) => {
+                return fail_with_cert(
+                    cert_info,
+                    format!(
+                        "missing reference MIR module {} (`Mir.{ref_suffix}.body`) for `equivClaim` of {suffix}: {err}",
+                        ref_mir_path.display()
+                    ),
+                );
+            }
+        };
+        match fault_census::parse_lean_mir_module_metadata_strict(&ref_mir_src) {
+            Ok(rmeta) if !rmeta.body.def_path.is_empty() => Some(rmeta),
+            Ok(_) => {
+                return fail_with_cert(
+                    cert_info,
+                    format!(
+                        "reference MIR module {} (`Mir.{ref_suffix}.body`) for `equivClaim` of {suffix} has an empty `defPath`",
+                        ref_mir_path.display()
+                    ),
+                );
+            }
+            Err(err) => {
+                return fail_with_cert(
+                    cert_info,
+                    format!(
+                        "MIR fault-census scan error in `equivClaim` reference `Mir.{ref_suffix}` for {suffix}: {err}"
+                    ),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut callee_metas = Vec::new();
+    let mut scan_err_reasons = Vec::new();
+    for callee_suffix in callee_suffixes {
+        let callee_rel = module_suffix_to_rel_path(&callee_suffix);
+        let callee_mir_path = mir_root.join(&callee_rel);
+        let callee_src = match fs::read_to_string(&callee_mir_path) {
+            Ok(src) => src,
+            Err(err) => {
+                scan_err_reasons.push(format!(
+                    "missing MIR module for callee {callee_suffix}: {err}"
+                ));
+                continue;
+            }
+        };
+        match fault_census::parse_lean_mir_module_metadata_strict(&callee_src) {
+            Ok(cmeta) => {
+                if cmeta.body.def_path.is_empty() {
+                    scan_err_reasons.push(format!(
+                        "MIR module for callee {callee_suffix} has an empty `defPath`"
+                    ));
+                    continue;
+                }
+                callee_metas.push(cmeta);
+            }
+            Err(err) => {
+                scan_err_reasons.push(format!(
+                    "MIR fault-census scan error in callee {callee_suffix}: {err}"
+                ));
+            }
+        }
+    }
+    if !scan_err_reasons.is_empty() {
+        return fail_with_cert(cert_info, scan_err_reasons.join("; "));
+    }
+
+    let callee_bodies: Vec<fault_census::ProtoMirBody> =
+        callee_metas.iter().map(|m| m.body.clone()).collect();
+    let closure = obligations::build_batch_callee_closure(
+        &subject_meta.body,
+        &callee_bodies,
+        &explicit_external,
+        subject_is_assumed,
+    );
+    let (items, mut extra_reasons) = obligations::assemble_batch_items_and_check_trait_closure(
+        &subject_meta,
+        &callee_metas,
+        &closure,
+        dropped_sites,
+    );
+    let mut verdict = reconcile_multi_item_coverage(&items, &closure, registry);
+    if let Some(ref ref_meta) = equiv_spec_meta_opt {
+        let spec_closure = obligations::build_batch_callee_closure(
+            &ref_meta.body,
+            &callee_bodies,
+            &explicit_external,
+            subject_is_assumed,
+        );
+        let (spec_items, spec_extra) = obligations::assemble_batch_items_and_check_trait_closure(
+            ref_meta,
+            &callee_metas,
+            &spec_closure,
+            dropped_sites,
+        );
+        extra_reasons.extend(spec_extra);
+        let spec_verdict = reconcile_multi_item_coverage(&spec_items, &spec_closure, registry);
+        if let MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+            failed_items: spec_failed,
+            unsupported_reasons: spec_reasons,
+        } = spec_verdict
+        {
+            match &mut verdict {
+                MultiItemCoverageVerdict::Verified => {
+                    verdict = MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+                        failed_items: spec_failed,
+                        unsupported_reasons: spec_reasons,
+                    };
+                }
+                MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+                    failed_items,
+                    unsupported_reasons,
+                } => {
+                    failed_items.extend(spec_failed);
+                    unsupported_reasons.extend(spec_reasons);
+                }
+            }
+        }
+    }
+    if !extra_reasons.is_empty() {
+        match &mut verdict {
+            MultiItemCoverageVerdict::Verified => {
+                verdict = MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+                    failed_items: Vec::new(),
+                    unsupported_reasons: extra_reasons,
+                };
+            }
+            MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+                unsupported_reasons,
+                ..
+            } => {
+                unsupported_reasons.extend(extra_reasons);
+            }
+        }
+    }
+    let failure_status = if let MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+        failed_items,
+        unsupported_reasons,
+    } = verdict
+    {
+        let mut missing_sites = Vec::new();
+        let mut unemitted_set = std::collections::BTreeSet::new();
+        for (_def_path, item_verdict) in failed_items {
+            if let CoverageVerdict::UnknownUnmappedFaultSite {
+                missing_sites: m_sites,
+                unemitted_classes: u_classes,
+                ..
+            } = item_verdict
+            {
+                for s in m_sites {
+                    if !missing_sites.contains(&s) {
+                        missing_sites.push(s);
+                    }
+                }
+                unemitted_set.extend(u_classes);
+            }
+        }
+        Some(VerificationStatus::UnknownUnmappedFaultSite {
+            missing_sites,
+            unemitted_classes: unemitted_set.into_iter().collect(),
+            reason: unsupported_reasons.join("; "),
+        })
+    } else {
+        None
+    };
+
+    SubjectReconciliationOutcome {
+        cert_info: Some(cert_info),
+        sibling_modular_deps,
+        failure_status,
+    }
+}
+
 fn apply_fault_site_coverage_reconciliation(
     workspace_root: &Path,
     report: &mut VerificationReport,
     registry: &PropertyRegistry,
     dropped_sites: &std::collections::BTreeSet<FaultSite>,
 ) {
-    let generated_root = workspace_root.join(".anneal/generated");
-    let mir_root = generated_root.join("Mir");
-    let obligations_root = generated_root.join("Obligations");
+    let mut outcomes: std::collections::BTreeMap<String, SubjectReconciliationOutcome> =
+        std::collections::BTreeMap::new();
+    let mut dep_worklist: std::collections::VecDeque<String> =
+        std::collections::VecDeque::new();
 
-    for item in &mut report.items {
+    for item in &report.items {
         // Crate-level rollups (`CrateVerify`) carry no subject body of their own;
         // every item they aggregate is reconciled through its own `Verify.<Item>`.
         let Some(suffix) = item.verify_module.strip_prefix("Verify.").map(str::to_string) else {
             continue;
         };
-        // `[adv ep1-B1]`: only the subject's *own* `#[spec(trusted)]` contract
-        // (`Assumptions.<Item>.rust_trusted_contract`) or a UB-exception claim relaxes
-        // callee closure. An item that merely depends on some trusted callee's
-        // contract is still strictly reconciled against `Mir/<Item>.lean` +
-        // `defaultCallees`, and modular (`MirCallE`) items get no implicit externals:
-        // every non-inline callee must be an `#[external_spec]` contract or an
-        // imported sibling `Obligations.<Callee>`.
-        let own_trusted_contract = format!("Assumptions.{suffix}.rust_trusted_contract");
-        let subject_is_assumed = match &item.status {
-            VerificationStatus::VerifiedConditional { assumptions } => {
-                assumptions.iter().any(|a| a == &own_trusted_contract)
-            }
-            VerificationStatus::VerifiedUbException { .. } => true,
-            _ => false,
-        };
-
-        let rel_path = module_suffix_to_rel_path(&suffix);
-        let mir_path = mir_root.join(&rel_path);
-        let ob_path = obligations_root.join(&rel_path);
-        let verify_path = generated_root.join("Verify").join(&rel_path);
-
-        // Fail closed: every audited per-item module must have its captured body.
-        let subject_mir_src = match fs::read_to_string(&mir_path) {
-            Ok(src) => src,
-            Err(err) => {
-                item.status = unmapped_fault_site_status(format!(
-                    "missing MIR module {} for {suffix}: {err}",
-                    mir_path.display()
-                ));
-                continue;
-            }
-        };
-        let subject_meta = match fault_census::parse_lean_mir_module_metadata_strict(&subject_mir_src)
-        {
-            Ok(meta) => meta,
-            Err(err) => {
-                item.status = unmapped_fault_site_status(format!(
-                    "MIR fault-census scan error in {suffix}: {err}"
-                ));
-                continue;
-            }
-        };
-        if subject_meta.body.def_path.is_empty() {
-            item.status = unmapped_fault_site_status(format!(
-                "subject MIR module {} for {suffix} has an empty `defPath`",
-                mir_path.display()
-            ));
-            continue;
-        }
-        let verify_text = match fs::read_to_string(&verify_path) {
-            Ok(text) => text,
-            Err(err) => {
-                item.status = unmapped_fault_site_status(format!(
-                    "missing Verify module {} for {suffix}: {err}",
-                    verify_path.display()
-                ));
-                continue;
-            }
-        };
-        let cert_info =
-            match fault_census::inspect_verify_module_certificate(&verify_text, &suffix) {
-                Ok(info) => info,
-                Err(err) => {
-                    item.status = unmapped_fault_site_status(err);
-                    continue;
-                }
-            };
-        let ob_text = match fs::read_to_string(&ob_path) {
-            Ok(text) => text,
-            Err(err) => {
-                item.status = unmapped_fault_site_status(format!(
-                    "missing Obligations module {} for {suffix}: {err}",
-                    ob_path.display()
-                ));
-                continue;
-            }
-        };
-
-        let specs_imported_by_verify = cert_info
-            .imported_specs_suffixes
-            .iter()
-            .any(|s| s == &suffix);
-        let mut sibling_specs_to_check: Vec<String> = Vec::new();
-        let specs_links_opt = if specs_imported_by_verify {
-            let specs_path = workspace_root
-                .join("anneal/proofs/Specs")
-                .join(&rel_path);
-            let specs_text = match fs::read_to_string(&specs_path) {
-                Ok(text) => text,
-                Err(err) => {
-                    item.status = unmapped_fault_site_status(format!(
-                        "Verify.{suffix} imports `Specs.{suffix}`, but {} could not be read: {err}",
-                        specs_path.display()
-                    ));
-                    continue;
-                }
-            };
-            match fault_census::scan_specs_module(&specs_text, &suffix) {
-                Ok(sl) => {
-                    for sib in &sl.imported_specs_suffixes {
-                        if !sibling_specs_to_check.iter().any(|s| s == sib) {
-                            sibling_specs_to_check.push(sib.clone());
-                        }
-                    }
-                    Some(sl)
-                }
-                Err(err) => {
-                    item.status = unmapped_fault_site_status(err);
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-
-        // `[adv ep1-A3]`: inspect any `Proof.<Item>` / `Assumptions.<Item>` imported by
-        // `Verify.<Item>` so specification typeclass instances (`ModularItemSpec`,
-        // `StatefulEquivItemSpec`, etc.) or un-mirrored `import Specs.<Item>` cannot be
-        // smuggled transitively outside `Specs.<Item>`.
-        let mut aux_override_err: Option<String> = None;
-        for proof_suf in &cert_info.imported_proof_suffixes {
-            let proof_path = workspace_root
-                .join("anneal/proofs/Proof")
-                .join(module_suffix_to_rel_path(proof_suf));
-            let proof_text = match fs::read_to_string(&proof_path) {
-                Ok(t) => t,
-                Err(err) => {
-                    aux_override_err = Some(format!(
-                        "Verify.{suffix} imports `Proof.{proof_suf}`, but {} could not be read: {err}",
-                        proof_path.display()
-                    ));
-                    break;
-                }
-            };
-            match fault_census::validate_auxiliary_module_no_spec_override(
-                &proof_text,
-                &format!("Proof.{proof_suf}"),
-                &suffix,
-                specs_imported_by_verify,
-            ) {
-                Ok(sibs) => {
-                    for sib in sibs {
-                        if !sibling_specs_to_check.iter().any(|s| s == &sib) {
-                            sibling_specs_to_check.push(sib);
-                        }
-                    }
-                }
-                Err(err) => {
-                    aux_override_err = Some(err);
-                    break;
-                }
-            }
-        }
-        if aux_override_err.is_none() {
-            for assump_suf in &cert_info.imported_assumptions_suffixes {
-                let rel_assump = module_suffix_to_rel_path(assump_suf);
-                let authored_assump = workspace_root
-                    .join("anneal/proofs/Assumptions")
-                    .join(&rel_assump);
-                let gen_assump = generated_root.join("Assumptions").join(&rel_assump);
-                let assump_path = if authored_assump.is_file() {
-                    authored_assump
-                } else {
-                    gen_assump
-                };
-                let assump_text = match fs::read_to_string(&assump_path) {
-                    Ok(t) => t,
-                    Err(err) => {
-                        aux_override_err = Some(format!(
-                            "Verify.{suffix} imports `Assumptions.{assump_suf}`, but {} could not be read: {err}",
-                            assump_path.display()
-                        ));
-                        break;
-                    }
-                };
-                match fault_census::validate_auxiliary_module_no_spec_override(
-                    &assump_text,
-                    &format!("Assumptions.{assump_suf}"),
-                    &suffix,
-                    specs_imported_by_verify,
-                ) {
-                    Ok(sibs) => {
-                        for sib in sibs {
-                            if !sibling_specs_to_check.iter().any(|s| s == &sib) {
-                                sibling_specs_to_check.push(sib);
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        aux_override_err = Some(err);
-                        break;
-                    }
-                }
-            }
-        }
-        if aux_override_err.is_none() {
-            for sib_suf in &sibling_specs_to_check {
-                let sib_path = workspace_root
-                    .join("anneal/proofs/Specs")
-                    .join(module_suffix_to_rel_path(sib_suf));
-                let sib_text = match fs::read_to_string(&sib_path) {
-                    Ok(t) => t,
-                    Err(err) => {
-                        aux_override_err = Some(format!(
-                            "imported sibling `Specs.{sib_suf}` ({}) could not be read: {err}",
-                            sib_path.display()
-                        ));
-                        break;
-                    }
-                };
-                if let Err(err) = fault_census::validate_sibling_specs_no_subject_override(
-                    &sib_text,
-                    sib_suf,
-                    &subject_meta.body.def_path,
-                ) {
-                    aux_override_err = Some(err);
-                    break;
-                }
-            }
-        }
-        if let Some(err) = aux_override_err {
-            item.status = unmapped_fault_site_status(err);
-            continue;
-        }
-
-        let callee_suffixes = match extract_default_callee_suffixes_from_obligations(&ob_text) {
-            Ok(suffixes) => suffixes,
-            Err(err) => {
-                item.status = unmapped_fault_site_status(format!("{suffix}: {err}"));
-                continue;
-            }
-        };
-        let links = match fault_census::scan_obligations_callee_links(&ob_text) {
-            Ok(links) => links,
-            Err(err) => {
-                item.status = unmapped_fault_site_status(format!(
-                    "Obligations module for {suffix} failed the Lean lexer: {err}"
-                ));
-                continue;
-            }
-        };
-        // The emitted claim must be about this very body: if the Obligations module
-        // never references `Mir.<Item>.body` or any claim record binds `body :=` /
-        // `implBody :=` to another body, nothing in it discharges the subject's sites.
-        let claim_covers_subject = links.referenced_mir_bodies.iter().any(|s| s == &suffix)
-            && !links.claim_mir_bodies.is_empty()
-            && links.non_mir_claim_bodies.is_empty()
-            && links.claim_mir_bodies.iter().all(|s| s == &suffix);
-        if !claim_covers_subject {
-            item.status = unmapped_fault_site_status(format!(
-                "Obligations module for {suffix} never references `Mir.{suffix}.body` across all claim definitions (claim_mir_bodies={:?}, non_mir={:?}), so no emitted obligation discharges its fault sites",
-                links.claim_mir_bodies, links.non_mir_claim_bodies
-            ));
-            continue;
-        }
-        // Every claim record must bind `callees := defaultCallees` (or `implCallees := defaultCallees`,
-        // `specCallees := defaultCallees`) and `claim_body_field_count == claim_callees_field_count`
-        // so a claim cannot omit `callees` / `specCallees` or bypass `defaultCallees` with `.nil`,
-        // `[]`, or a trailing expression (`defaultCallees.drop 1`).
-        if links.claim_callees_bindings.is_empty()
-            || links.claim_body_field_count != links.claim_callees_field_count
-            || !links
-                .claim_callees_bindings
-                .iter()
-                .all(|b| b == "defaultCallees")
-        {
-            item.status = unmapped_fault_site_status(format!(
-                "Obligations module for {suffix} overrides claim `callees` (bindings={:?}, body_fields={}, callees_fields={}) instead of `defaultCallees`",
-                links.claim_callees_bindings,
-                links.claim_body_field_count,
-                links.claim_callees_field_count
-            ));
-            continue;
-        }
-        // `[adv ep1-B3]` / `[adv ep1-A3]`: enforce per-definition canonical claim structure across
-        // all 16 monomorphic, equivalence, instantiated (`*For`), and polymorphic (`poly*`)
-        // claim definitions plus `defaultModularSpec` and `rustEquivSpec` structure.
-        if let Err(err) = fault_census::validate_obligations_canonical_claims(&ob_text, &suffix) {
-            item.status = unmapped_fault_site_status(err);
-            continue;
-        }
-        let ob_explicit_external = match extract_external_callee_def_paths_from_obligations(
+        let outcome = reconcile_subject_by_suffix(
+            workspace_root,
             &suffix,
-            &links,
-            &mir_root,
-            &obligations_root,
-        ) {
-            Ok(ext) => ext,
-            Err(err) => {
-                item.status = unmapped_fault_site_status(err);
-                continue;
-            }
-        };
-
-        // `[adv ep1-A3]`: only `ModularClaim` / `PolyModularClaim` certificates dispatch
-        // unresolved calls through `ModularItemSpec.envAssumed`. When `Specs.<Item>`
-        // overrides `defaultModularSpec` with a normal-priority `ModularItemSpec`
-        // instance, resolve the active external callees strictly from `Specs.<Item>`'s
-        // `ModularItemSpec.envAssumed` (including `defaultModularSpec.envAssumed`
-        // delegation when present).
-        let explicit_external = if !cert_info.surface.is_modular() {
-            Vec::new()
-        } else if let Some(ref sl) = specs_links_opt
-            && sl.has_modular_spec_instance
-        {
-            let mut specs_ext = if sl.delegates_to_default_modular_spec_env {
-                ob_explicit_external.clone()
-            } else {
-                Vec::new()
-            };
-            let mut specs_err: Option<String> = None;
-            for callee_suffix in &sl.referenced_modular_callee_suffixes {
-                let callee_ob_path =
-                    obligations_root.join(module_suffix_to_rel_path(callee_suffix));
-                if !callee_ob_path.is_file() {
-                    specs_err = Some(format!(
-                        "missing sibling Obligations module {} for `Specs.{suffix}` contract `Obligations.{callee_suffix}`",
-                        callee_ob_path.display()
-                    ));
-                    break;
-                }
-                let callee_mir_path = mir_root.join(module_suffix_to_rel_path(callee_suffix));
-                let src = match fs::read_to_string(&callee_mir_path) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        specs_err = Some(format!(
-                            "missing MIR module {} for `Specs.{suffix}` sibling `Obligations.{callee_suffix}`: {err}",
-                            callee_mir_path.display()
-                        ));
-                        break;
-                    }
-                };
-                match parse_lean_mir_module_body_strict(&src) {
-                    Ok(cbody) if !cbody.def_path.is_empty() => {
-                        if !specs_ext.contains(&cbody.def_path) {
-                            specs_ext.push(cbody.def_path);
-                        }
-                    }
-                    Ok(_) => {
-                        specs_err = Some(format!(
-                            "sibling callee {callee_suffix} referenced by `Specs.{suffix}` has an empty `defPath`"
-                        ));
-                        break;
-                    }
-                    Err(err) => {
-                        specs_err = Some(format!(
-                            "MIR fault-census scan error in `Specs.{suffix}` sibling callee {callee_suffix}: {err}"
-                        ));
-                        break;
-                    }
-                }
-            }
-            if specs_err.is_none() {
-                for ext_ident in &sl.referenced_subject_external_contract_idents {
-                    let resolved_ident = if ext_ident == "defaultExternalCallContract" {
-                        links.default_external_contract_alias.as_deref()
-                    } else {
-                        Some(ext_ident.as_str())
-                    };
-                    let matched = resolved_ident.and_then(|id| {
-                        links
-                            .external_spec_contracts
-                            .iter()
-                            .find(|c| c.def_ident == id)
-                    });
-                    match matched {
-                        Some(ext_link) => {
-                            if !specs_ext.contains(&ext_link.target_def_path) {
-                                specs_ext.push(ext_link.target_def_path.clone());
-                            }
-                        }
-                        None => {
-                            specs_err = Some(format!(
-                                "`Specs.{suffix}` `ModularItemSpec.envAssumed` references unknown external contract `{ext_ident}.holdsOn`"
-                            ));
-                            break;
-                        }
-                    }
-                }
-            }
-            if let Some(err) = specs_err {
-                item.status = unmapped_fault_site_status(err);
-                continue;
-            }
-            specs_ext
-        } else {
-            ob_explicit_external
-        };
-
-        let equiv_spec_meta_opt = if cert_info.surface.is_equiv() {
-            let ref_suffix_res = if let Some(ref sl) = specs_links_opt
-                && sl.has_equiv_spec_instance
-            {
-                sl.equiv_spec_body_suffix.clone().ok_or_else(|| {
-                    format!(
-                        "`Verify.{suffix}` proves `equivClaim` with `Specs.{suffix}`, which declares no `StatefulEquivItemSpec` instance"
-                    )
-                })
-            } else {
-                match links.rust_equiv_spec_body_suffix.clone() {
-                    Some(ref_suf)
-                        if ref_suf == suffix
-                            || links.imported_mir_suffixes.iter().any(|m| m == &ref_suf) =>
-                    {
-                        Ok(ref_suf)
-                    }
-                    Some(ref_suf) => Err(format!(
-                        "Obligations module for {suffix} binds `rustEquivSpec` to `Mir.{ref_suf}.body` without `import Mir.{ref_suf}`"
-                    )),
-                    None => Err(format!(
-                        "`Verify.{suffix}` proves `equivClaim`, but neither `Specs.{suffix}` nor `Obligations.{suffix}` declares a `StatefulEquivItemSpec` reference body"
-                    )),
-                }
-            };
-            let ref_suffix = match ref_suffix_res {
-                Ok(r) => r,
-                Err(err) => {
-                    item.status = unmapped_fault_site_status(err);
-                    continue;
-                }
-            };
-            let ref_mir_path = mir_root.join(module_suffix_to_rel_path(&ref_suffix));
-            let ref_mir_src = match fs::read_to_string(&ref_mir_path) {
-                Ok(src) => src,
-                Err(err) => {
-                    item.status = unmapped_fault_site_status(format!(
-                        "missing reference MIR module {} (`Mir.{ref_suffix}.body`) for `equivClaim` of {suffix}: {err}",
-                        ref_mir_path.display()
-                    ));
-                    continue;
-                }
-            };
-            match fault_census::parse_lean_mir_module_metadata_strict(&ref_mir_src) {
-                Ok(rmeta) if !rmeta.body.def_path.is_empty() => Some(rmeta),
-                Ok(_) => {
-                    item.status = unmapped_fault_site_status(format!(
-                        "reference MIR module {} (`Mir.{ref_suffix}.body`) for `equivClaim` of {suffix} has an empty `defPath`",
-                        ref_mir_path.display()
-                    ));
-                    continue;
-                }
-                Err(err) => {
-                    item.status = unmapped_fault_site_status(format!(
-                        "MIR fault-census scan error in `equivClaim` reference `Mir.{ref_suffix}` for {suffix}: {err}"
-                    ));
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-
-        let mut callee_metas = Vec::new();
-        let mut scan_err_reasons = Vec::new();
-        for callee_suffix in callee_suffixes {
-            let callee_rel = module_suffix_to_rel_path(&callee_suffix);
-            let callee_mir_path = mir_root.join(&callee_rel);
-            let callee_src = match fs::read_to_string(&callee_mir_path) {
-                Ok(src) => src,
-                Err(err) => {
-                    scan_err_reasons.push(format!(
-                        "missing MIR module for callee {callee_suffix}: {err}"
-                    ));
-                    continue;
-                }
-            };
-            match fault_census::parse_lean_mir_module_metadata_strict(&callee_src) {
-                Ok(cmeta) => {
-                    if cmeta.body.def_path.is_empty() {
-                        scan_err_reasons.push(format!(
-                            "MIR module for callee {callee_suffix} has an empty `defPath`"
-                        ));
-                        continue;
-                    }
-                    callee_metas.push(cmeta);
-                }
-                Err(err) => {
-                    scan_err_reasons.push(format!(
-                        "MIR fault-census scan error in callee {callee_suffix}: {err}"
-                    ));
-                }
-            }
-        }
-        if !scan_err_reasons.is_empty() {
-            item.status = unmapped_fault_site_status(scan_err_reasons.join("; "));
-            continue;
-        }
-
-        let callee_bodies: Vec<fault_census::ProtoMirBody> =
-            callee_metas.iter().map(|m| m.body.clone()).collect();
-        let closure = obligations::build_batch_callee_closure(
-            &subject_meta.body,
-            &callee_bodies,
-            &explicit_external,
-            subject_is_assumed,
-        );
-        let (items, mut extra_reasons) = obligations::assemble_batch_items_and_check_trait_closure(
-            &subject_meta,
-            &callee_metas,
-            &closure,
+            Some(&item.status),
+            registry,
             dropped_sites,
         );
-        let mut verdict = reconcile_multi_item_coverage(&items, &closure, registry);
-        if let Some(ref ref_meta) = equiv_spec_meta_opt {
-            let spec_closure = obligations::build_batch_callee_closure(
-                &ref_meta.body,
-                &callee_bodies,
-                &explicit_external,
-                subject_is_assumed,
-            );
-            let (spec_items, spec_extra) = obligations::assemble_batch_items_and_check_trait_closure(
-                ref_meta,
-                &callee_metas,
-                &spec_closure,
-                dropped_sites,
-            );
-            extra_reasons.extend(spec_extra);
-            let spec_verdict = reconcile_multi_item_coverage(&spec_items, &spec_closure, registry);
-            if let MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
-                failed_items: spec_failed,
-                unsupported_reasons: spec_reasons,
-            } = spec_verdict
-            {
-                match &mut verdict {
-                    MultiItemCoverageVerdict::Verified => {
-                        verdict = MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
-                            failed_items: spec_failed,
-                            unsupported_reasons: spec_reasons,
-                        };
-                    }
-                    MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
-                        failed_items,
-                        unsupported_reasons,
-                    } => {
-                        failed_items.extend(spec_failed);
-                        unsupported_reasons.extend(spec_reasons);
-                    }
-                }
-            }
+        for (callee_suf, _) in &outcome.sibling_modular_deps {
+            dep_worklist.push_back(callee_suf.clone());
         }
-        if !extra_reasons.is_empty() {
-            match &mut verdict {
-                MultiItemCoverageVerdict::Verified => {
-                    verdict = MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
-                        failed_items: Vec::new(),
-                        unsupported_reasons: extra_reasons,
-                    };
-                }
-                MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
-                    unsupported_reasons,
-                    ..
-                } => {
-                    unsupported_reasons.extend(extra_reasons);
-                }
-            }
+        outcomes.insert(suffix, outcome);
+    }
+
+    // `[adv ep1-B4]`: reconcile any out-of-report sibling `Obligations.<Callee>` on
+    // demand (e.g., when `--item` filtered `report.items` to only the caller) so its
+    // `Verify.<Callee>` surface and fault-site coverage are still strictly enforced.
+    while let Some(callee_suf) = dep_worklist.pop_front() {
+        if outcomes.contains_key(&callee_suf) {
+            continue;
         }
-        if let MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
-            failed_items,
-            unsupported_reasons,
-        } = verdict
-        {
-            let mut missing_sites = Vec::new();
-            let mut unemitted_set = std::collections::BTreeSet::new();
-            for (_def_path, item_verdict) in failed_items {
-                if let CoverageVerdict::UnknownUnmappedFaultSite {
-                    missing_sites: m_sites,
-                    unemitted_classes: u_classes,
-                    ..
-                } = item_verdict
+        let outcome = reconcile_subject_by_suffix(
+            workspace_root,
+            &callee_suf,
+            None,
+            registry,
+            dropped_sites,
+        );
+        for (next_suf, _) in &outcome.sibling_modular_deps {
+            dep_worklist.push_back(next_suf.clone());
+        }
+        outcomes.insert(callee_suf, outcome);
+    }
+
+    // `[adv ep1-B4]`: fixpoint propagation — if a modular caller assumes a sibling
+    // `Obligations.<Callee>` whose `Verify.<Callee>` is missing, has an incompatible
+    // certificate surface, or failed fault-site coverage reconciliation, fail closed
+    // on the caller as well.
+    loop {
+        let mut updates: Vec<(String, VerificationStatus)> = Vec::new();
+        for (caller_suf, outcome) in &outcomes {
+            if outcome.failure_status.is_some() {
+                continue;
+            }
+            for (callee_suf, contract_kind) in &outcome.sibling_modular_deps {
+                let Some(callee_outcome) = outcomes.get(callee_suf) else {
+                    updates.push((
+                        caller_suf.clone(),
+                        unmapped_fault_site_status(format!(
+                            "modular caller Verify.{caller_suf} assumes missing sibling `Verify.{callee_suf}`"
+                        )),
+                    ));
+                    break;
+                };
+                if let Some(VerificationStatus::UnknownUnmappedFaultSite { ref reason, .. }) =
+                    callee_outcome.failure_status
                 {
-                    for s in m_sites {
-                        if !missing_sites.contains(&s) {
-                            missing_sites.push(s);
-                        }
-                    }
-                    unemitted_set.extend(u_classes);
+                    updates.push((
+                        caller_suf.clone(),
+                        unmapped_fault_site_status(format!(
+                            "modular caller Verify.{caller_suf} assumes `Obligations.{callee_suf}` ({contract_kind:?}), which failed fault-site coverage reconciliation: {reason}"
+                        )),
+                    ));
+                    break;
+                }
+                let Some(ref callee_cert) = callee_outcome.cert_info else {
+                    updates.push((
+                        caller_suf.clone(),
+                        unmapped_fault_site_status(format!(
+                            "modular caller Verify.{caller_suf} assumes `Obligations.{callee_suf}`, which has no valid `Verify.{callee_suf}` certificate"
+                        )),
+                    ));
+                    break;
+                };
+                let callee_imports_specs = !callee_cert.imported_specs_suffixes.is_empty();
+                if !callee_cert
+                    .surface
+                    .supports_sibling_modular_contract(*contract_kind, callee_imports_specs)
+                {
+                    updates.push((
+                        caller_suf.clone(),
+                        unmapped_fault_site_status(format!(
+                            "modular caller Verify.{caller_suf} assumes `Obligations.{callee_suf}` ({contract_kind:?}), which is incompatible with `Verify.{callee_suf}` surface {:?} (imports_specs={callee_imports_specs})",
+                            callee_cert.surface
+                        )),
+                    ));
+                    break;
                 }
             }
-            item.status = VerificationStatus::UnknownUnmappedFaultSite {
-                missing_sites,
-                unemitted_classes: unemitted_set.into_iter().collect(),
-                reason: unsupported_reasons.join("; "),
-            };
+        }
+        if updates.is_empty() {
+            break;
+        }
+        for (caller_suf, fail_status) in updates {
+            if let Some(entry) = outcomes.get_mut(&caller_suf) {
+                entry.failure_status = Some(fail_status);
+            }
+        }
+    }
+
+    for item in &mut report.items {
+        let Some(suffix) = item.verify_module.strip_prefix("Verify.") else {
+            continue;
+        };
+        if let Some(outcome) = outcomes.get(suffix)
+            && let Some(ref fail_status) = outcome.failure_status
+        {
+            item.status = fail_status.clone();
         }
     }
 }
@@ -6492,25 +6773,26 @@ end Mir.Demo.caller
 
         // (b) Authored `Specs/Demo/caller.lean` declaring `ModularItemSpec` with
         //     `Obligations.Demo.leaf.ubExceptionClaim.callContract.holdsOn` reconciles
-        //     to `VerifiedUnconditional` on `ModularVerificationResult`, whereas overriding
-        //     `envAssumed := fun _ => True` in `Specs/Demo/caller.lean` fails closed!
+        //     to `VerifiedUnconditional` ONLY when `Obligations/Demo/leaf.lean` is a
+        //     canonical Obligations module AND `Verify/Demo/leaf.lean` proves
+        //     `UbExceptionVerificationResult` and itself reconciles cleanly; a forged
+        //     stub, surface mismatch, or `envAssumed := fun _ => True` fails closed!
         fs::write(&caller_ob_path, &unlinked_ob).expect("write unlinked modular obligations");
         let leaf_ob_path = workspace.join(".anneal/generated/Obligations/Demo/leaf.lean");
+        let leaf_verify_path = workspace.join(".anneal/generated/Verify/Demo/leaf.lean");
         fs::create_dir_all(leaf_ob_path.parent().expect("parent")).expect("mkdir leaf ob");
-        fs::write(&leaf_ob_path, "-- sibling obligations stub\n").expect("write leaf.lean ob");
+        fs::create_dir_all(leaf_verify_path.parent().expect("parent")).expect("mkdir leaf verify");
+        fs::write(&leaf_ob_path, "-- sibling obligations stub\n").expect("write leaf.lean stub");
         let specs_caller_path = workspace.join("anneal/proofs/Specs/Demo/caller.lean");
         fs::create_dir_all(specs_caller_path.parent().expect("parent")).expect("mkdir Specs");
-        fs::write(
-            &specs_caller_path,
-            "import Trusted\nimport Mir.Demo.caller\nimport Obligations.Demo.caller\nimport Obligations.Demo.leaf\n\
+        let valid_ub_caller_specs = "import Trusted\nimport Mir.Demo.caller\nimport Obligations.Demo.caller\nimport Obligations.Demo.leaf\n\
              namespace Specs.Demo.caller\n\
              instance : ModularItemSpec \"demo::caller\" where\n  \
                envAssumed := Obligations.Demo.leaf.ubExceptionClaim.callContract.holdsOn\n  \
                pre := fun _ _ => True\n  \
                post := fun _ _ _ _ => True\n\
-             end Specs.Demo.caller\n",
-        )
-        .expect("write Specs/Demo/caller.lean");
+             end Specs.Demo.caller\n";
+        fs::write(&specs_caller_path, valid_ub_caller_specs).expect("write Specs/Demo/caller.lean");
         let modular_verify_with_specs = "\
             -- @anneal-def-id: demo::caller\n\
             import Trusted\n\
@@ -6522,11 +6804,108 @@ end Mir.Demo.caller
             end Verify.Demo.caller\n";
         fs::write(&caller_verify_path, modular_verify_with_specs)
             .expect("write modular Verify with Specs");
+        // `[adv ep1-B4]`: forged stub `Obligations/Demo/leaf.lean` without canonical claims
+        // and `Verify/Demo/leaf.lean` MUST fail closed!
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller")
+                .expect("caller")
+                .as_str(),
+            unknown,
+            "forged stub sibling Obligations/Demo/leaf.lean must fail closed"
+        );
+        let leaf_bundles = crate::obligations::group_subject_obligations(&vec![
+            anneal_rustc_capture::UnitTargetRecord {
+                target: anneal_rustc_capture::CapturedTarget {
+                    def_id: "demo::leaf".to_string(),
+                    mir_module_path: String::new(),
+                    mir_module_sha256: "00".to_string(),
+                },
+                lean_module_name: "Mir.Demo.leaf".to_string(),
+                item_kind: anneal_rustc_capture::CapturedItemKind::Subject,
+                associated_subject_def_id: None,
+                trait_impls: Vec::new(),
+            },
+        ]);
+        let canonical_leaf_ob = crate::obligations::render_obligations_module(&leaf_bundles[0]);
+        let canonical_leaf_ub_verify = "\
+            -- @anneal-def-id: demo::leaf\n\
+            import Trusted\n\
+            import Mir.Demo.leaf\n\
+            import Obligations.Demo.leaf\n\
+            namespace Verify.Demo.leaf\n\
+            theorem verified : Trusted.VerificationResult.UbExceptionVerificationResult Obligations.Demo.leaf.ubExceptionClaim := Proof.Demo.leaf.verified\n\
+            end Verify.Demo.leaf\n";
+        fs::write(&leaf_ob_path, &canonical_leaf_ob).expect("write canonical leaf.lean ob");
+        fs::write(&leaf_verify_path, canonical_leaf_ub_verify)
+            .expect("write canonical leaf.lean ub verify");
         assert_eq!(
             reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
                 .status_for("Verify.Demo.caller"),
             Some(&VerificationStatus::VerifiedUnconditional),
-            "authored `Specs` ModularItemSpec linking `ubExceptionClaim.callContract.holdsOn` must reconcile"
+            "authored `Specs` ModularItemSpec linking verified `ubExceptionClaim.callContract.holdsOn` must reconcile"
+        );
+        // Surface mismatch (`Verify.Demo.leaf` proves `claim` instead of `ubExceptionClaim`) fails closed!
+        let mismatched_leaf_claim_verify = "\
+            -- @anneal-def-id: demo::leaf\n\
+            import Trusted\n\
+            import Mir.Demo.leaf\n\
+            import Obligations.Demo.leaf\n\
+            namespace Verify.Demo.leaf\n\
+            theorem verified : Trusted.VerificationResult.VerificationResult Obligations.Demo.leaf.claim := Proof.Demo.leaf.verified\n\
+            end Verify.Demo.leaf\n";
+        fs::write(&leaf_verify_path, mismatched_leaf_claim_verify)
+            .expect("write mismatched claim leaf verify");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller")
+                .expect("caller")
+                .as_str(),
+            unknown,
+            "assuming `ubExceptionClaim.callContract` when `Verify.Demo.leaf` only proves `claim` must fail closed"
+        );
+        fs::write(&leaf_verify_path, canonical_leaf_ub_verify)
+            .expect("restore canonical leaf ub verify");
+        // Failure propagation: when `Verify.Demo.leaf` fails reconciliation (in-report or
+        // out-of-report via `reg_gap`), `Verify.Demo.caller` is ALSO downgraded!
+        let mut multi_report = VerificationReport {
+            items: vec![
+                ItemVerificationReport {
+                    verify_module: "Verify.Demo.caller".to_string(),
+                    status: VerificationStatus::VerifiedUnconditional,
+                },
+                ItemVerificationReport {
+                    verify_module: "Verify.Demo.leaf".to_string(),
+                    status: unmapped_fault_site_status("leaf failed".to_string()),
+                },
+            ],
+        };
+        apply_fault_site_coverage_reconciliation(
+            &workspace,
+            &mut multi_report,
+            &PropertyRegistry::all_verified(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            multi_report.status_for("Verify.Demo.caller").expect("caller").as_str(),
+            unknown,
+            "failed sibling `Verify.Demo.leaf` must propagate failure to modular caller"
+        );
+        let mut filtered_caller_only =
+            single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional);
+        apply_fault_site_coverage_reconciliation(
+            &workspace,
+            &mut filtered_caller_only,
+            &reg_gap,
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            filtered_caller_only
+                .status_for("Verify.Demo.caller")
+                .expect("caller")
+                .as_str(),
+            unknown,
+            "out-of-report sibling `Verify.Demo.leaf` failing `DivRemByZero` under `--item` filtering must propagate failure to modular caller"
         );
         fs::write(
             &specs_caller_path,
@@ -6686,6 +7065,80 @@ end Mir.Demo.caller
         let _ = fs::remove_file(&proof_caller_path);
         let _ = fs::remove_file(&specs_caller_path);
         let _ = fs::remove_file(&leaf_ob_path);
+        let _ = fs::remove_file(&leaf_verify_path);
+
+        // Negative & positive tests 19 (`[adv ep1-B4]`):
+        // (a) Direct `ModularItemSpec` smuggled inside `Verify/Demo/caller.lean` fails closed.
+        let inline_spec_verify = "\
+            -- @anneal-def-id: demo::caller\n\
+            import Trusted\n\
+            import Mir.Demo.caller\n\
+            import Obligations.Demo.caller\n\
+            namespace Verify.Demo.caller\n\
+            instance : ModularItemSpec \"demo::caller\" where\n\
+              envAssumed := fun _ => True\n  pre := fun _ _ => True\n  post := fun _ _ _ _ => True\n\
+            theorem verified : Trusted.VerificationResult.ModularVerificationResult Obligations.Demo.caller.modularClaim := sorry\n\
+            end Verify.Demo.caller\n";
+        fs::write(&caller_verify_path, inline_spec_verify).expect("write inline spec Verify");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller")
+                .expect("caller")
+                .as_str(),
+            unknown,
+            "inline ModularItemSpec inside Verify/Demo/caller.lean must fail closed"
+        );
+
+        // (b) Multi-hop `Proof.Demo.caller -> Proof.Demo.helper -> Specs.Demo.evil` overriding
+        //     `demo::caller` (or `@[instance]` in `Proof.Demo.helper`) fails closed, whereas
+        //     legitimate helper-proof imports (`Proof.Demo.caller -> Proof.Demo.helper`)
+        //     reconcile cleanly!
+        let proof_helper_path = workspace.join("anneal/proofs/Proof/Demo/helper.lean");
+        let specs_evil_path = workspace.join("anneal/proofs/Specs/Demo/evil.lean");
+        fs::write(
+            &proof_caller_path,
+            "import Trusted\nimport Obligations.Demo.caller\nimport Proof.Demo.helper\n\
+             namespace Proof.Demo.caller\ntheorem helper_ok : True := Proof.Demo.helper.ok\nend Proof.Demo.caller\n",
+        )
+        .expect("write Proof/Demo/caller.lean");
+        fs::write(
+            &proof_helper_path,
+            "import Trusted\nimport Specs.Demo.evil\n\
+             namespace Proof.Demo.helper\ntheorem ok : True := True.intro\nend Proof.Demo.helper\n",
+        )
+        .expect("write Proof/Demo/helper.lean");
+        fs::write(
+            &specs_evil_path,
+            "import Trusted\nnamespace Specs.Demo.evil\n\
+             instance : ModularItemSpec \"demo::caller\" where\n\
+               envAssumed := fun _ => True\n  pre := fun _ _ => True\n  post := fun _ _ _ _ => True\n\
+             end Specs.Demo.evil\n",
+        )
+        .expect("write Specs/Demo/evil.lean");
+        fs::write(&caller_verify_path, smuggled_proof_verify).expect("write Proof-importing Verify");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller")
+                .expect("caller")
+                .as_str(),
+            unknown,
+            "2-hop `Proof -> Proof -> Specs.evil` subject override must fail closed"
+        );
+        fs::write(
+            &proof_helper_path,
+            "import Trusted\nnamespace Proof.Demo.helper\ntheorem ok : True := True.intro\nend Proof.Demo.helper\n",
+        )
+        .expect("write clean Proof/Demo/helper.lean");
+        let _ = fs::remove_file(&specs_evil_path);
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller"),
+            Some(&VerificationStatus::VerifiedUnconditional),
+            "legitimate multi-hop `Proof.Demo.caller -> Proof.Demo.helper` must reconcile cleanly"
+        );
+        let _ = fs::remove_file(&proof_helper_path);
+        let _ = fs::remove_file(&proof_caller_path);
+
         fs::write(&caller_mir_path, &original_caller).expect("restore caller.lean");
         fs::write(&caller_ob_path, &original_ob).expect("restore caller obligations");
         fs::write(&caller_verify_path, &original_verify).expect("restore caller verify");

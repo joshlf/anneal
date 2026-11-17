@@ -981,9 +981,11 @@ theorem evalStmt_deref_load_reconciled_of_obligations
       nomatch hUb
 
 /--
-`[adv ep1-A3]` Full statement-step (`¬ StepNodeExposesUb`) deref-store reconciliation bridge:
-when `evalPlaceWrite` succeeds on `*ptrLocal = rv` with no Tree Borrows / union-protector
-write conflict, `evalStmt` never exposes `.ub` (`¬ StepNodeExposesUb`) and every deref-store
+`[adv ep1-A3]` / `[adv ep1-B4]` Full statement-step (`¬ StepNodeExposesUb`) deref-store
+reconciliation bridge: when `writePlaceValue_deref_of_obligations` holds at the root
+frame (`callStack = []`, `activeProtectors = []`) with no Tree Borrows write conflict,
+`evalPlaceWrite` reduces to `writePlaceValue = .ok locals'`, `evalStmt` on
+`*ptrLocal = rv` never exposes `.ub` (`¬ StepNodeExposesUb`), and every deref-store
 `MirFaultClass` at `(blockIdx, stmtIdx)` is discharged in `discharged` with
 `.emittedAndVerified` status.
 -/
@@ -1002,17 +1004,11 @@ theorem evalStmt_deref_store_reconciled_of_obligations
     (hProj : entry.targetProjection = [])
     (hTarget : get? s.frame.locals entry.targetLocal = some (.init oldVal))
     (hSet : set? s.frame.locals entry.targetLocal (.init newVal) = some locals')
-    (hPlaceWrite :
-      evalPlaceWrite s.frame.locals s.memory.borrows
-        { local_ := ptrLocal, projection := [.deref] }
-        newVal s.memory.activeProtectors [] emptyLayoutTable s.memory.callStack = .ok locals')
+    (hStack : s.memory.callStack = [])
+    (hNoProt : s.memory.activeProtectors = [])
     (hNoTreeUb :
       derefWriteTreeUB s.frame.locals s.memory.borrows
         { local_ := ptrLocal, projection := [.deref] } = false)
-    (hNoUnionUb :
-      derefWriteUnionProtectorUB [] emptyLayoutTable s.frame.locals s.memory.borrows
-        s.memory.activeProtectors { local_ := ptrLocal, projection := [.deref] } []
-        s.memory.callStack = false)
     (hRec :
       reconcileFaultCoverageWithRegistry registry
         (censusStmtFaultSites blockIdx stmtIdx
@@ -1035,10 +1031,10 @@ theorem evalStmt_deref_store_reconciled_of_obligations
   refine ⟨?_, hWp, hDis⟩
   dsimp only [evalStmt]
   rw [hRv]
-  dsimp only []
-  rw [hPlaceWrite]
-  dsimp only []
-  rw [hNoTreeUb, hNoUnionUb]
+  dsimp only [evalPlaceWrite]
+  rw [hNoProt, hStack, hWp]
+  dsimp only [derefWriteUnionProtectorUB]
+  rw [hNoTreeUb]
   intro hUb
   nomatch hUb
 

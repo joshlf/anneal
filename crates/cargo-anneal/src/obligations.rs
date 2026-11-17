@@ -890,15 +890,30 @@ pub(crate) fn build_batch_callee_closure(
 
     if allow_implicit_external_callees {
         for body in std::iter::once(subject_body).chain(callee_bodies.iter()) {
-            for callee in direct_callee_def_paths(body)
-                .into_iter()
-                .chain(reified_fn_def_paths(body))
-            {
+            for callee in direct_callee_def_paths(body) {
                 if batch_paths.contains(&callee) {
                     inline_set.insert(callee);
                 } else if !crate::fault_census::is_natively_modeled_converging_call_callee(&callee)
                     && !crate::fault_census::is_natively_modeled_diverging_call_callee(&callee)
                 {
+                    external_set.insert(callee);
+                }
+            }
+            // `[adv ep1-B4]`: `reified_fn_def_paths` and `TailCall` targets are never
+            // natively modeled inline by `evalTerminator`, so an assumed subject that
+            // reifies or tail-calls a function item (even an intrinsic path) needs it
+            // in `external_set` when not in `batch_paths`.
+            for callee in reified_fn_def_paths(body).into_iter().chain(
+                body.basic_blocks.iter().filter_map(|bb| match &bb.terminator.kind {
+                    crate::fault_census::ProtoTerminatorKind::TailCall { func, .. } => {
+                        func.extract_callee_def_path().map(str::to_string)
+                    }
+                    _ => None,
+                }),
+            ) {
+                if batch_paths.contains(&callee) {
+                    inline_set.insert(callee);
+                } else {
                     external_set.insert(callee);
                 }
             }
