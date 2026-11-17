@@ -26484,6 +26484,610 @@ theorem ActiveTypedSliceMutBorrow.derefWriteWithLayouts_single {α : Type} {n : 
   · exact ActiveTypedSliceMutBorrow.conflictingAtProj_self _ _ _ _ h hs'
       (targetFrameDepth := entry.targetFrameDepth)
 
+/-! ### Unsized DST Pointer Metadata Lenses (`PtrMetadataOf`, `UnsizedSliceDstAt`) & Dynamic Layout Bridges -/
+
+/-- Data-pointer `Value` component of a wide pointer (`.ptr wide.1 ptrBytes`). -/
+@[reducible]
+def WidePtrVal.dataVal (ptrBytes : Nat) (wide : WidePtrVal) : Value :=
+  .ptr wide.1 ptrBytes
+
+/-- Metadata `Value` component of a wide slice/`str` pointer (`.scalar ⟨wide.2, ptrBytes⟩`). -/
+@[reducible]
+def WidePtrVal.metaVal (ptrBytes : Nat) (wide : WidePtrVal) : Value :=
+  .scalar ⟨wide.2, ptrBytes⟩
+
+@[simp]
+theorem WidePtrVal.dataVal_mk (ptrBytes : Nat) (p : ProvenancePtr) (len : Nat) :
+    WidePtrVal.dataVal ptrBytes (WidePtrVal.mk p len) = .ptr p ptrBytes := rfl
+
+@[simp]
+theorem WidePtrVal.metaVal_mk (ptrBytes : Nat) (p : ProvenancePtr) (len : Nat) :
+    WidePtrVal.metaVal ptrBytes (WidePtrVal.mk p len) = .scalar ⟨len, ptrBytes⟩ := rfl
+
+@[simp]
+theorem WidePtrVal.dataVal_takeElems (ptrBytes : Nat) (wide : WidePtrVal) (k : Nat) :
+    WidePtrVal.dataVal ptrBytes (WidePtrVal.takeElems wide k) =
+      WidePtrVal.dataVal ptrBytes wide := rfl
+
+@[simp]
+theorem WidePtrVal.metaVal_takeElems (ptrBytes : Nat) (wide : WidePtrVal) (k : Nat) :
+    WidePtrVal.metaVal ptrBytes (WidePtrVal.takeElems wide k) = .scalar ⟨k, ptrBytes⟩ := rfl
+
+@[simp]
+theorem WidePtrVal.dataVal_dropElems (ptrBytes : Nat) (wide : WidePtrVal) (n k : Nat) :
+    WidePtrVal.dataVal ptrBytes (WidePtrVal.dropElems wide n k) =
+      .ptr (WidePtrVal.elemPtr wide n k) ptrBytes := rfl
+
+@[simp]
+theorem WidePtrVal.metaVal_dropElems (ptrBytes : Nat) (wide : WidePtrVal) (n k : Nat) :
+    WidePtrVal.metaVal ptrBytes (WidePtrVal.dropElems wide n k) =
+      .scalar ⟨wide.2 - k, ptrBytes⟩ := rfl
+
+theorem WidePtrVal.toValue_eq_dataVal_metaVal (ptrBytes : Nat) (wide : WidePtrVal) :
+    WidePtrVal.toValue ptrBytes wide =
+      .aggregate 0 [WidePtrVal.dataVal ptrBytes wide, WidePtrVal.metaVal ptrBytes wide] := rfl
+
+/--
+**`PtrMetadataOf`**: characterizes the runtime metadata `Value` extracted by `UnOp.ptrMetadata`
+at pointer byte width `ptrBytes`:
+- wide `[T]` / `str` pointers (`WidePtrVal.toValue ptrBytes wide`) have metadata
+  `WidePtrVal.metaVal ptrBytes wide = .scalar ⟨wide.2, ptrBytes⟩`;
+- thin pointers (`.ptr p ptrBytes`) have metadata `.unit`.
+-/
+inductive PtrMetadataOf (ptrBytes : Nat) : Value → Value → Prop where
+  | wide (wide : WidePtrVal) :
+      PtrMetadataOf ptrBytes (WidePtrVal.toValue ptrBytes wide) (.scalar ⟨wide.2, ptrBytes⟩)
+  | thin (p : ProvenancePtr) :
+      PtrMetadataOf ptrBytes (.ptr p ptrBytes) .unit
+
+theorem PtrMetadataOf.wide_mk (ptrBytes : Nat) (p : ProvenancePtr) (len : Nat) :
+    PtrMetadataOf ptrBytes (WidePtrVal.toValue ptrBytes (WidePtrVal.mk p len))
+      (.scalar ⟨len, ptrBytes⟩) :=
+  .wide (WidePtrVal.mk p len)
+
+/-- `PtrMetadataOf` uniquely determines the extracted metadata `Value`. -/
+theorem PtrMetadataOf.unique {ptrBytes : Nat} {ptrVal m₁ m₂ : Value}
+    (h₁ : PtrMetadataOf ptrBytes ptrVal m₁) (h₂ : PtrMetadataOf ptrBytes ptrVal m₂) :
+    m₁ = m₂ := by
+  cases h₁ with
+  | wide w₁ =>
+    generalize hVal : WidePtrVal.toValue ptrBytes w₁ = v at h₂
+    cases h₂ with
+    | wide w₂ =>
+      have hw : w₁ = w₂ := WidePtrVal.toValue_injective hVal
+      rw [hw]
+    | thin p₂ => cases hVal
+  | thin p₁ =>
+    generalize hVal : Value.ptr p₁ ptrBytes = v at h₂
+    cases h₂ with
+    | wide w₂ => cases hVal
+    | thin p₂ => rfl
+
+/-- **`PtrMetadataOf.evalRvalue_ptrMetadata`**: unified ground-MIR theorem for `UnOp.ptrMetadata`
+across both wide slice/`str` pointers and thin pointers. -/
+theorem PtrMetadataOf.evalRvalue_ptrMetadata {locals locals' : List LocalSlot} {op : Operand}
+    {mem : Memory} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {ptrVal metaVal : Value}
+    (hMeta : PtrMetadataOf (layoutPointerBytes layouts) ptrVal metaVal)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok ptrVal locals') :
+    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
+      .ok metaVal locals' mem := by
+  cases hMeta with
+  | wide wide =>
+    exact WidePtrVal.evalRvalue_ptrMetadata locals locals' op mem localDecls layouts wide hOp
+  | thin p =>
+    exact evalRvalue_unaryOp_ptrMetadata_thin locals locals' op mem localDecls layouts p hOp
+
+/-- Predicate characterizing an unsized slice-like DST `RigidTy` (`.slice elemTy` for element
+byte stride `n`, or `.str` with `n = 1`). -/
+@[reducible]
+def IsUnsizedSliceDstTy (dstTy : RigidTy) (n : Nat) : Prop :=
+  (∃ elemTy, dstTy = .slice elemTy) ∨ (dstTy = .str ∧ n = 1)
+
+theorem IsUnsizedSliceDstTy.slice (elemTy : RigidTy) (n : Nat) :
+    IsUnsizedSliceDstTy (.slice elemTy) n :=
+  Or.inl ⟨elemTy, rfl⟩
+
+theorem IsUnsizedSliceDstTy.str :
+    IsUnsizedSliceDstTy .str 1 :=
+  Or.inr ⟨rfl, rfl⟩
+
+theorem IsUnsizedSliceDstTy.wideAggregatePointeeIsDyn_eq_some_false {dstTy : RigidTy} {n : Nat}
+    (h : IsUnsizedSliceDstTy dstTy n) (lIdx : LayoutIdx) :
+    wideAggregatePointeeIsDyn? { kind := dstTy, layoutIdx := lIdx } = some false := by
+  rcases h with ⟨elemTy, rfl⟩ | ⟨rfl, _⟩ <;> rfl
+
+theorem IsUnsizedSliceDstTy.isUnsizedRawPtrPointee_eq_true {dstTy : RigidTy} {n : Nat}
+    (h : IsUnsizedSliceDstTy dstTy n) (lIdx : LayoutIdx) :
+    isUnsizedRawPtrPointee { kind := dstTy, layoutIdx := lIdx } = true := by
+  rcases h with ⟨elemTy, rfl⟩ | ⟨rfl, _⟩ <;> rfl
+
+/--
+**`UnsizedSliceDstAt`**: relational lens over `Memory` (`mem`), runtime wide-pointer `Value`
+(`fatVal`), unsized DST `RigidTy` (`dstTy`: `.slice elemTy` or `.str`), `ByteLensCodec α n`,
+and logical element list `elems : List α`, connecting the wide-pointer representation,
+`PtrMetadataOf`, and the backing `ByteMem` (`SliceTypedAt`).
+-/
+structure UnsizedSliceDstAt {α : Type} {n : Nat} (c : ByteLensCodec α n)
+    (ptrBytes : Nat) (dstTy : RigidTy) (mem : Memory) (wide : WidePtrVal)
+    (fatVal : Value) (elems : List α) (bytes : ByteMem) : Prop where
+  dst_ty : IsUnsizedSliceDstTy dstTy n
+  fat_eq : fatVal = WidePtrVal.toValue ptrBytes wide
+  meta_of : PtrMetadataOf ptrBytes fatVal (.scalar ⟨wide.2, ptrBytes⟩)
+  slice_typed : SliceTypedAt c wide elems bytes
+
+/-- Canonical `str` specialization of `UnsizedSliceDstAt` over `ByteLensCodec.u8`. -/
+@[reducible]
+def UnsizedStrDstAt (ptrBytes : Nat) (mem : Memory) (wide : WidePtrVal)
+    (fatVal : Value) (utf8Bytes : List UInt8) (bytes : ByteMem) : Prop :=
+  UnsizedSliceDstAt ByteLensCodec.u8 ptrBytes .str mem wide fatVal utf8Bytes bytes
+
+namespace UnsizedSliceDstAt
+
+variable {α : Type} {n : Nat} {c : ByteLensCodec α n}
+
+/-- Construct `UnsizedSliceDstAt` for `.slice elemTy` from `SliceTypedAt`. -/
+theorem of_sliceTypedAt (ptrBytes : Nat) (elemTy : RigidTy) (mem : Memory)
+    {wide : WidePtrVal} {elems : List α} {bytes : ByteMem}
+    (h : SliceTypedAt c wide elems bytes) :
+    UnsizedSliceDstAt c ptrBytes (.slice elemTy) mem wide
+      (WidePtrVal.toValue ptrBytes wide) elems bytes :=
+  ⟨IsUnsizedSliceDstTy.slice elemTy n, rfl, .wide wide, h⟩
+
+/-- Construct `UnsizedStrDstAt` for `.str` from `SliceTypedAt ByteLensCodec.u8`. -/
+theorem of_str_sliceTypedAt (ptrBytes : Nat) (mem : Memory)
+    {wide : WidePtrVal} {utf8Bytes : List UInt8} {bytes : ByteMem}
+    (h : SliceTypedAt ByteLensCodec.u8 wide utf8Bytes bytes) :
+    UnsizedStrDstAt ptrBytes mem wide (WidePtrVal.toValue ptrBytes wide) utf8Bytes bytes :=
+  ⟨IsUnsizedSliceDstTy.str, rfl, .wide wide, h⟩
+
+/-- Construct `UnsizedSliceDstAt` from a shared `ActiveTypedSliceBorrow` lens. -/
+theorem of_borrow (ptrBytes : Nat) {dstTy : RigidTy} {mem : Memory} {tag : Nat}
+    {wide : WidePtrVal} {elems : List α} {bytes : ByteMem}
+    (hTy : IsUnsizedSliceDstTy dstTy n)
+    (hBorrow : ActiveTypedSliceBorrow c mem.borrows tag wide elems bytes) :
+    UnsizedSliceDstAt c ptrBytes dstTy mem wide
+      (WidePtrVal.toValue ptrBytes wide) elems bytes :=
+  ⟨hTy, rfl, .wide wide, hBorrow.1⟩
+
+/-- Construct `UnsizedSliceDstAt` from a mutable `ActiveTypedSliceMutBorrow` lens. -/
+theorem of_mutBorrow (ptrBytes : Nat) {dstTy : RigidTy} {mem : Memory} {tag : Nat}
+    {wide : WidePtrVal} {elems : List α} {bytes : ByteMem}
+    (hTy : IsUnsizedSliceDstTy dstTy n)
+    (hMut : ActiveTypedSliceMutBorrow c mem.borrows tag wide elems bytes) :
+    UnsizedSliceDstAt c ptrBytes dstTy mem wide
+      (WidePtrVal.toValue ptrBytes wide) elems bytes :=
+  ⟨hTy, rfl, .wide wide, hMut.1⟩
+
+theorem length_eq {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes) :
+    elems.length = wide.2 :=
+  h.slice_typed.length_eq
+
+theorem ptr_eq {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (_h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes) :
+    WidePtrVal.dataVal ptrBytes wide = .ptr wide.1 ptrBytes := rfl
+
+theorem meta_eq {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes) :
+    WidePtrVal.metaVal ptrBytes wide = .scalar ⟨elems.length, ptrBytes⟩ := by
+  unfold WidePtrVal.metaVal
+  rw [h.length_eq]
+
+theorem meta_of_length {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes) :
+    PtrMetadataOf ptrBytes fatVal (.scalar ⟨elems.length, ptrBytes⟩) := by
+  rw [h.length_eq]
+  exact h.meta_of
+
+theorem unique {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems₁ elems₂ : List α} {bytes : ByteMem}
+    (h₁ : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems₁ bytes)
+    (h₂ : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems₂ bytes) :
+    elems₁ = elems₂ :=
+  SliceTypedAt.unique h₁.slice_typed h₂.slice_typed
+
+/-- `UnsizedSliceDstAt` transfers across any memory transition when `bytes` is unchanged. -/
+theorem of_mem_change {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory} (mem' : Memory)
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes) :
+    UnsizedSliceDstAt c ptrBytes dstTy mem' wide fatVal elems bytes :=
+  ⟨h.dst_ty, h.fat_eq, h.meta_of, h.slice_typed⟩
+
+/-- Prefix subslice `WidePtrVal.takeElems wide k` (`k ≤ wide.2`) preserves `UnsizedSliceDstAt`. -/
+theorem takeElems {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes)
+    {k : Nat} (hk : k ≤ wide.2) :
+    UnsizedSliceDstAt c ptrBytes dstTy mem (WidePtrVal.takeElems wide k)
+      (WidePtrVal.toValue ptrBytes (WidePtrVal.takeElems wide k)) (elems.take k) bytes :=
+  ⟨h.dst_ty, rfl, .wide (WidePtrVal.takeElems wide k), (SliceTypedAt.splitAt h.slice_typed hk).1⟩
+
+/-- Suffix subslice `WidePtrVal.dropElems wide n k` (`k ≤ wide.2`) preserves `UnsizedSliceDstAt`. -/
+theorem dropElems {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes)
+    {k : Nat} (hk : k ≤ wide.2) :
+    UnsizedSliceDstAt c ptrBytes dstTy mem (WidePtrVal.dropElems wide n k)
+      (WidePtrVal.toValue ptrBytes (WidePtrVal.dropElems wide n k)) (elems.drop k) bytes :=
+  ⟨h.dst_ty, rfl, .wide (WidePtrVal.dropElems wide n k),
+    (SliceTypedAt.splitAt h.slice_typed hk).2.1⟩
+
+/-- Splitting `UnsizedSliceDstAt` at `k ≤ wide.2` produces `takeElems` and `dropElems` views with
+disjoint byte windows. -/
+theorem splitAt {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes)
+    {k : Nat} (hk : k ≤ wide.2) :
+    UnsizedSliceDstAt c ptrBytes dstTy mem (WidePtrVal.takeElems wide k)
+        (WidePtrVal.toValue ptrBytes (WidePtrVal.takeElems wide k)) (elems.take k) bytes ∧
+      UnsizedSliceDstAt c ptrBytes dstTy mem (WidePtrVal.dropElems wide n k)
+        (WidePtrVal.toValue ptrBytes (WidePtrVal.dropElems wide n k)) (elems.drop k) bytes ∧
+      DisjointSlice wide.1.offsetBytes (k * n) (wide.1.offsetBytes + k * n) ((wide.2 - k) * n) :=
+  ⟨h.takeElems hk, h.dropElems hk, (SliceTypedAt.splitAt h.slice_typed hk).2.2⟩
+
+/-- Reassembling prefix and suffix `UnsizedSliceDstAt` views at `k ≤ wide.2`. -/
+theorem of_splitAt {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {k : Nat} {elemsL elemsR : List α} {bytes : ByteMem}
+    (hk : k ≤ wide.2)
+    (hL : UnsizedSliceDstAt c ptrBytes dstTy mem (WidePtrVal.takeElems wide k)
+      (WidePtrVal.toValue ptrBytes (WidePtrVal.takeElems wide k)) elemsL bytes)
+    (hR : UnsizedSliceDstAt c ptrBytes dstTy mem (WidePtrVal.dropElems wide n k)
+      (WidePtrVal.toValue ptrBytes (WidePtrVal.dropElems wide n k)) elemsR bytes) :
+    UnsizedSliceDstAt c ptrBytes dstTy mem wide
+      (WidePtrVal.toValue ptrBytes wide) (elemsL ++ elemsR) bytes :=
+  ⟨hL.dst_ty, rfl, .wide wide, SliceTypedAt.of_splitAt hk hL.slice_typed hR.slice_typed⟩
+
+/-- Empty slice instance (`len = 0`) of `UnsizedSliceDstAt`. -/
+theorem empty_slice (c : ByteLensCodec α n) (ptrBytes : Nat) (elemTy : RigidTy)
+    (mem : Memory) (p : ProvenancePtr) (bytes : ByteMem) (hOff : p.offsetBytes ≤ bytes.length) :
+    UnsizedSliceDstAt c ptrBytes (.slice elemTy) mem (WidePtrVal.mk p 0)
+      (WidePtrVal.toValue ptrBytes (WidePtrVal.mk p 0)) [] bytes :=
+  of_sliceTypedAt ptrBytes elemTy mem (sliceTypedAt_empty c p bytes hOff)
+
+/-- Empty `str` instance (`len = 0`) of `UnsizedStrDstAt`. -/
+theorem empty_str (ptrBytes : Nat) (mem : Memory) (p : ProvenancePtr) (bytes : ByteMem)
+    (hOff : p.offsetBytes ≤ bytes.length) :
+    UnsizedStrDstAt ptrBytes mem (WidePtrVal.mk p 0)
+      (WidePtrVal.toValue ptrBytes (WidePtrVal.mk p 0)) [] bytes :=
+  of_str_sliceTypedAt ptrBytes mem (sliceTypedAt_empty ByteLensCodec.u8 p bytes hOff)
+
+/-- Zero-sized element (`n = 0`) instance of `UnsizedSliceDstAt` for arbitrary `len : Nat`. -/
+theorem zst_unit_replicate (ptrBytes : Nat) (elemTy : RigidTy) (mem : Memory)
+    (p : ProvenancePtr) (len : Nat) (bytes : ByteMem) (hOff : p.offsetBytes ≤ bytes.length) :
+    UnsizedSliceDstAt ByteLensCodec.unit ptrBytes (.slice elemTy) mem (WidePtrVal.mk p len)
+      (WidePtrVal.toValue ptrBytes (WidePtrVal.mk p len)) (List.replicate len ()) bytes :=
+  of_sliceTypedAt ptrBytes elemTy mem (sliceTypedAt_unit_replicate p len bytes hOff)
+
+/-- **`UnsizedSliceDstAt.evalRvalue_ptrMetadata`**: evaluating `Rvalue.unaryOp .ptrMetadata op`
+on `fatVal` returns `.ok (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) locals' mem` and
+preserves `UnsizedSliceDstAt` without dereferencing memory. -/
+theorem evalRvalue_ptrMetadata {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (locals locals' : List LocalSlot) (op : Operand) (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (h : UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok fatVal locals') :
+    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
+        .ok (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) locals' mem ∧
+      UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes :=
+  ⟨h.meta_of_length.evalRvalue_ptrMetadata hOp, h⟩
+
+/-- **`UnsizedSliceDstAt.evalRvalue_aggregate_rawPtr_roundtrip`**: decomposing `fatVal` at `loc`
+via `.field 0` and `.field 1` (`to_raw_parts`) and reassembling via
+`Rvalue.aggregate (.rawPtr { kind := dstTy, layoutIdx := lIdx } mutability)` returns
+`.ok fatVal locals mem` and preserves `UnsizedSliceDstAt`. -/
+theorem evalRvalue_aggregate_rawPtr_roundtrip {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (locals : List LocalSlot) (loc : Local) (lIdx : LayoutIdx) (dataTy metaTy : Ty)
+    (mutability : Mutability) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h : UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes)
+    (hSlot : get? locals loc = some (.init fatVal))
+    (hNoUnion0 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 0 dataTy] } = false)
+    (hNoUnion1 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 1 metaTy] } = false) :
+    evalRvalue locals
+        (.aggregate (.rawPtr { kind := dstTy, layoutIdx := lIdx } mutability)
+          [.copy { local_ := loc, projection := [.field 0 dataTy] },
+           .copy { local_ := loc, projection := [.field 1 metaTy] }])
+        mem localDecls layouts = .ok fatVal locals mem ∧
+      UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes := by
+  have hSlot' : get? locals loc =
+      some (.init (WidePtrVal.toValue (layoutPointerBytes layouts) wide)) := by
+    rw [← h.fat_eq]
+    exact hSlot
+  have hEv := evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip locals loc
+    { kind := dstTy, layoutIdx := lIdx } dataTy metaTy mutability mem localDecls layouts
+    wide.1 wide.2 (h.dst_ty.wideAggregatePointeeIsDyn_eq_some_false lIdx)
+    hSlot' hNoUnion0 hNoUnion1
+  refine ⟨?_, h⟩
+  rw [h.fat_eq]
+  exact hEv
+
+end UnsizedSliceDstAt
+
+/-- Writing to a local `dstLoc` disjoint from `entry.targetLocal` (`entry.targetLocal ≠ dstLoc`)
+preserves `ActiveTypedSliceBorrow` across `invalidateConflictingBorrows`. -/
+theorem ActiveTypedSliceBorrow.of_invalidateConflictingBorrows_ne {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {borrows : List BorrowEntry} {tag : Nat} {wide : WidePtrVal}
+    {xs : List α} {bytes : ByteMem} {dstLoc : Local}
+    (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (h : ActiveTypedSliceBorrow c borrows tag wide xs bytes)
+    (hNe : ∀ e, lookupBorrow borrows tag = some e → e.targetLocal ≠ dstLoc) :
+    ActiveTypedSliceBorrow c
+      (invalidateConflictingBorrows borrows dstLoc writerTag targetFrameDepth) tag wide xs bytes := by
+  obtain ⟨hs, entry, he, hc, hp⟩ := h
+  exact ⟨hs, entry,
+    lookupBorrow_invalidateConflictingBorrows_of_ne writerTag targetFrameDepth he (hNe entry he),
+    hc, hp⟩
+
+/-- Writing to a local `dstLoc` disjoint from `entry.targetLocal` (`entry.targetLocal ≠ dstLoc`)
+preserves `ActiveTypedSliceMutBorrow` across `invalidateConflictingBorrows`. -/
+theorem ActiveTypedSliceMutBorrow.of_invalidateConflictingBorrows_ne {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {borrows : List BorrowEntry} {tag : Nat} {wide : WidePtrVal}
+    {xs : List α} {bytes : ByteMem} {dstLoc : Local}
+    (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (h : ActiveTypedSliceMutBorrow c borrows tag wide xs bytes)
+    (hNe : ∀ e, lookupBorrow borrows tag = some e → e.targetLocal ≠ dstLoc) :
+    ActiveTypedSliceMutBorrow c
+      (invalidateConflictingBorrows borrows dstLoc writerTag targetFrameDepth) tag wide xs bytes := by
+  obtain ⟨hs, entry, he, hc, hp⟩ := h
+  exact ⟨hs, entry,
+    lookupBorrow_invalidateConflictingBorrows_of_ne writerTag targetFrameDepth he (hNe entry he),
+    hc, hp⟩
+
+/-- Writing an intrinsic return to `{ local_ := dstLoc, projection := [] }` disjoint from
+`entry.targetLocal` preserves `ActiveTypedSliceBorrow` across `invalidateDirectDestWriteBorrows`. -/
+theorem ActiveTypedSliceBorrow.of_invalidateDirectDestWriteBorrows_ne {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {mem : Memory} (locals : List LocalSlot) {tag : Nat}
+    {wide : WidePtrVal} {xs : List α} {bytes : ByteMem} {dstLoc : Local}
+    (h : ActiveTypedSliceBorrow c mem.borrows tag wide xs bytes)
+    (hNe : ∀ e, lookupBorrow mem.borrows tag = some e → e.targetLocal ≠ dstLoc) :
+    ActiveTypedSliceBorrow c
+      (invalidateDirectDestWriteBorrows mem locals { local_ := dstLoc, projection := [] }).borrows
+      tag wide xs bytes := by
+  obtain ⟨hs, entry, he, hc, hp⟩ := h
+  exact ⟨hs, entry,
+    lookupBorrow_invalidateDirectDestWriteBorrows_of_ne mem locals he (hNe entry he),
+    hc, hp⟩
+
+/-- Writing an intrinsic return to `{ local_ := dstLoc, projection := [] }` disjoint from
+`entry.targetLocal` preserves `ActiveTypedSliceMutBorrow` across `invalidateDirectDestWriteBorrows`. -/
+theorem ActiveTypedSliceMutBorrow.of_invalidateDirectDestWriteBorrows_ne {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} {mem : Memory} (locals : List LocalSlot) {tag : Nat}
+    {wide : WidePtrVal} {xs : List α} {bytes : ByteMem} {dstLoc : Local}
+    (h : ActiveTypedSliceMutBorrow c mem.borrows tag wide xs bytes)
+    (hNe : ∀ e, lookupBorrow mem.borrows tag = some e → e.targetLocal ≠ dstLoc) :
+    ActiveTypedSliceMutBorrow c
+      (invalidateDirectDestWriteBorrows mem locals { local_ := dstLoc, projection := [] }).borrows
+      tag wide xs bytes := by
+  obtain ⟨hs, entry, he, hc, hp⟩ := h
+  exact ⟨hs, entry,
+    lookupBorrow_invalidateDirectDestWriteBorrows_of_ne mem locals he (hNe entry he),
+    hc, hp⟩
+
+/-- **`evalIntrinsic_sizeOfValRaw_slice`**: ground-MIR `size_of_val` / `size_of_val_raw` lens bridge
+on `.slice elemTy`: under `wide.2 * n < signedHalfModulus 8` (`2^63`), `stepMirFn` and `mirStep`
+step cleanly to `targetBb`, write `.scalar ⟨elems.length * n, 8⟩` (`= .scalar ⟨wide.2 * n, 8⟩`)
+to `dstLoc`, and preserve `UnsizedSliceDstAt`, `ActiveTypedSliceBorrow`, and `ActiveTypedSliceMutBorrow`
+when `dstLoc` is disjoint from the borrowed target local. -/
+theorem evalIntrinsic_sizeOfValRaw_slice {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    {body cur : CapturedMir} {s : MachineState} {blk : BasicBlockData}
+    {func ptrOp : Operand} {dstLoc : Local} {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction} {span : String} {typeArgs : List RigidTy}
+    {elemTy : RigidTy} {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hDst : UnsizedSliceDstAt c 8 (.slice elemTy) s.memory wide fatVal elems bytes)
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack = .ok fatVal locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some (.slice elemTy))
+    (hSz : intrinsicRigidTyByteSize cur.localDecls cur.layouts elemTy = some n)
+    (hLt : wide.2 * n < signedHalfModulus 8)
+    (hSlot : get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : set? locals' dstLoc (.init (.scalar ⟨elems.length * n, 8⟩)) = some updatedLocals) :
+    let s' : MachineState :=
+      { frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
+    stepMirFn body s = MirStepNode.step s' ∧
+    PureMirExec.mirStep body s = .cont s' ∧
+    UnsizedSliceDstAt c 8 (.slice elemTy) s'.memory wide fatVal elems bytes ∧
+    (∀ tag, ActiveTypedSliceBorrow c s.memory.borrows tag wide elems bytes →
+      (∀ e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
+      ActiveTypedSliceBorrow c s'.memory.borrows tag wide elems bytes) ∧
+    (∀ tag, ActiveTypedSliceMutBorrow c s.memory.borrows tag wide elems bytes →
+      (∀ e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
+      ActiveTypedSliceMutBorrow c s'.memory.borrows tag wide elems bytes) := by
+  intro s'
+  have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack =
+        .ok (WidePtrVal.toValue 8 wide) locals' := by
+    rw [← hDst.fat_eq]
+    exact hArg
+  have hSet' : set? locals' dstLoc (.init (.scalar ⟨wide.2 * n, 8⟩)) = some updatedLocals := by
+    rw [← hDst.length_eq]
+    exact hSet
+  obtain ⟨hStep, hMir, _, _⟩ := mirStep_call_sizeOfVal_slice hCur hPhase hBb hEnd hTerm hCallee
+    hArg' hNoOverride hPt hSz hLt hSlot hLive hSet'
+  refine ⟨hStep, hMir, hDst.of_mem_change s'.memory,
+    fun tag hB hNe => hB.of_invalidateDirectDestWriteBorrows_ne locals' hNe,
+    fun tag hM hNe => hM.of_invalidateDirectDestWriteBorrows_ne locals' hNe⟩
+
+/-- **`evalIntrinsic_sizeOfValRaw_str`**: ground-MIR `size_of_val` / `size_of_val_raw` lens bridge
+on `.str` (`wide.2 < signedHalfModulus 8`). -/
+theorem evalIntrinsic_sizeOfValRaw_str
+    {body cur : CapturedMir} {s : MachineState} {blk : BasicBlockData}
+    {func ptrOp : Operand} {dstLoc : Local} {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction} {span : String} {typeArgs : List RigidTy}
+    {wide : WidePtrVal} {fatVal : Value} {utf8Bytes : List UInt8} {bytes : ByteMem}
+    {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hDst : UnsizedStrDstAt 8 s.memory wide fatVal utf8Bytes bytes)
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack = .ok fatVal locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some .str)
+    (hLt : wide.2 < signedHalfModulus 8)
+    (hSlot : get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : set? locals' dstLoc (.init (.scalar ⟨utf8Bytes.length, 8⟩)) = some updatedLocals) :
+    let s' : MachineState :=
+      { frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
+    stepMirFn body s = MirStepNode.step s' ∧
+    PureMirExec.mirStep body s = .cont s' ∧
+    UnsizedStrDstAt 8 s'.memory wide fatVal utf8Bytes bytes := by
+  intro s'
+  have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack =
+        .ok (WidePtrVal.toValue 8 wide) locals' := by
+    rw [← hDst.fat_eq]
+    exact hArg
+  have hSet' : set? locals' dstLoc (.init (.scalar ⟨wide.2, 8⟩)) = some updatedLocals := by
+    rw [← hDst.length_eq]
+    exact hSet
+  obtain ⟨hStep, hMir, _, _⟩ := mirStep_call_sizeOfVal_str hCur hPhase hBb hEnd hTerm hCallee
+    hArg' hNoOverride hPt hLt hSlot hLive hSet'
+  exact ⟨hStep, hMir, hDst.of_mem_change s'.memory⟩
+
+/-- **`evalIntrinsic_alignOfValRaw_slice`**: ground-MIR `align_of_val` / `align_of_val_raw` lens
+bridge on `.slice elemTy`: under `wide.2 * n < signedHalfModulus 8`, steps to `targetBb`, writes
+`.scalar ⟨alignBytes, 8⟩` to `dstLoc`, and preserves `UnsizedSliceDstAt`, `ActiveTypedSliceBorrow`,
+and `ActiveTypedSliceMutBorrow`. -/
+theorem evalIntrinsic_alignOfValRaw_slice {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    {body cur : CapturedMir} {s : MachineState} {blk : BasicBlockData}
+    {func ptrOp : Operand} {dstLoc : Local} {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction} {span : String} {typeArgs : List RigidTy}
+    {elemTy : RigidTy} {alignBytes : Nat}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hDst : UnsizedSliceDstAt c 8 (.slice elemTy) s.memory wide fatVal elems bytes)
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack = .ok fatVal locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::align_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some (.slice elemTy))
+    (hSz : intrinsicRigidTyByteSize cur.localDecls cur.layouts elemTy = some n)
+    (hAlign : intrinsicRigidTyAlign cur.localDecls cur.layouts elemTy = some alignBytes)
+    (hLt : wide.2 * n < signedHalfModulus 8)
+    (hSlot : get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : set? locals' dstLoc (.init (.scalar ⟨alignBytes, 8⟩)) = some updatedLocals) :
+    let s' : MachineState :=
+      { frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
+    stepMirFn body s = MirStepNode.step s' ∧
+    PureMirExec.mirStep body s = .cont s' ∧
+    UnsizedSliceDstAt c 8 (.slice elemTy) s'.memory wide fatVal elems bytes ∧
+    (∀ tag, ActiveTypedSliceBorrow c s.memory.borrows tag wide elems bytes →
+      (∀ e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
+      ActiveTypedSliceBorrow c s'.memory.borrows tag wide elems bytes) ∧
+    (∀ tag, ActiveTypedSliceMutBorrow c s.memory.borrows tag wide elems bytes →
+      (∀ e, lookupBorrow s.memory.borrows tag = some e → e.targetLocal ≠ dstLoc) →
+      ActiveTypedSliceMutBorrow c s'.memory.borrows tag wide elems bytes) := by
+  intro s'
+  have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack =
+        .ok (WidePtrVal.toValue 8 wide) locals' := by
+    rw [← hDst.fat_eq]
+    exact hArg
+  obtain ⟨hStep, hMir, _, _⟩ := mirStep_call_alignOfVal_slice hCur hPhase hBb hEnd hTerm hCallee
+    hArg' hNoOverride hPt hSz hAlign hLt hSlot hLive hSet
+  refine ⟨hStep, hMir, hDst.of_mem_change s'.memory,
+    fun tag hB hNe => hB.of_invalidateDirectDestWriteBorrows_ne locals' hNe,
+    fun tag hM hNe => hM.of_invalidateDirectDestWriteBorrows_ne locals' hNe⟩
+
+/-- **`evalIntrinsic_alignOfValRaw_str`**: ground-MIR `align_of_val` / `align_of_val_raw` lens
+bridge on `.str` (`wide.2 < signedHalfModulus 8`), writing `.scalar ⟨1, 8⟩` to `dstLoc`. -/
+theorem evalIntrinsic_alignOfValRaw_str
+    {body cur : CapturedMir} {s : MachineState} {blk : BasicBlockData}
+    {func ptrOp : Operand} {dstLoc : Local} {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction} {span : String} {typeArgs : List RigidTy}
+    {wide : WidePtrVal} {fatVal : Value} {utf8Bytes : List UInt8} {bytes : ByteMem}
+    {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hDst : UnsizedStrDstAt 8 s.memory wide fatVal utf8Bytes bytes)
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hEnd : s.frame.stmtIdx = length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
+    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack = .ok fatVal locals')
+    (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
+      typeArgs s.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::align_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some .str)
+    (hLt : wide.2 < signedHalfModulus 8)
+    (hSlot : get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : set? locals' dstLoc (.init (.scalar ⟨1, 8⟩)) = some updatedLocals) :
+    let s' : MachineState :=
+      { frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows s.memory locals' { local_ := dstLoc, projection := [] } }
+    stepMirFn body s = MirStepNode.step s' ∧
+    PureMirExec.mirStep body s = .cont s' ∧
+    UnsizedStrDstAt 8 s'.memory wide fatVal utf8Bytes bytes := by
+  intro s'
+  have hArg' : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals .nil s.memory.callStack =
+        .ok (WidePtrVal.toValue 8 wide) locals' := by
+    rw [← hDst.fat_eq]
+    exact hArg
+  obtain ⟨hStep, hMir, _, _⟩ := mirStep_call_alignOfVal_str hCur hPhase hBb hEnd hTerm hCallee
+    hArg' hNoOverride hPt hLt hSlot hLive hSet
+  exact ⟨hStep, hMir, hDst.of_mem_change s'.memory⟩
+
 end SliceWidePtrLenses
 
 end Anneal.SepLogicLenses

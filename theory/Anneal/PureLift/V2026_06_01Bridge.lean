@@ -7008,4 +7008,757 @@ theorem u8U32Padded_freeze_refused {layouts : LayoutTable} {idx : Nat}
     40 u8U32Embed u8U32Embed? u8U32Embed_embed? alg lid hLoan hPlace
     (fun _ hWin => placeByteWindow?_u8U32Padded_not_init hLookup hSize hFields hWin)
 
+/-! ## 9. Wide-Slice DST Refinement (`stdWideSliceVal`, `UnsizedSliceDstAt`) & Spatial-Pin Framing -/
+
+section WideSliceDstBridge
+
+open Anneal.SepLogicLenses
+open Anneal.MirLiftCore
+
+/-- Symbolic `PureLift` representation of a wide `[T]` or `str` pointer:
+`StdVal.pair (.refVal lid []) (.nat len)` pairing the borrow handle `.refVal lid []`
+(field `0`) with the element length `.nat len` (field `1`). -/
+@[reducible]
+def stdWideSliceVal (lid : LoanId) (len : Nat) : StdVal :=
+  .pair (.refVal lid []) (.nat len)
+
+@[simp]
+theorem stdWideSliceVal_getField_zero (lid : LoanId) (len : Nat) :
+    stdValAlg.getField 0 (stdWideSliceVal lid len) = some (.refVal lid []) := rfl
+
+@[simp]
+theorem stdWideSliceVal_getField_one (lid : LoanId) (len : Nat) :
+    stdValAlg.getField 1 (stdWideSliceVal lid len) = some (.nat len) := rfl
+
+/-- **`StdValRefines.wideSlice`**: `stdWideSliceVal lid wide.2` is refined by the runtime
+wide pointer `WidePtrVal.toValue ptrBytes wide` whenever `wide.1.allocId = tagOf lid`,
+`wide.1.offsetBytes = 0`, and `wide.2 < 256 ^ ptrBytes`. -/
+theorem StdValRefines.wideSlice (tagOf : LoanId → Nat) (lid : LoanId)
+    (ptrBytes : Nat) (wide : WidePtrVal)
+    (hAlloc : wide.1.allocId = tagOf lid) (hOff : wide.1.offsetBytes = 0)
+    (hLen : wide.2 < 256 ^ ptrBytes) :
+    StdValRefines tagOf (stdWideSliceVal lid wide.2) (WidePtrVal.toValue ptrBytes wide) :=
+  .pair (.ref rfl hAlloc hOff) (.nat hLen)
+
+/-- 64-bit specialization (`ptrBytes = 8`) of `StdValRefines.wideSlice`. -/
+theorem StdValRefines.wideSlice8 (tagOf : LoanId → Nat) (lid : LoanId) (wide : WidePtrVal)
+    (hAlloc : wide.1.allocId = tagOf lid) (hOff : wide.1.offsetBytes = 0)
+    (hLen : wide.2 < 256 ^ 8) :
+    StdValRefines tagOf (stdWideSliceVal lid wide.2) (WidePtrVal.toValue 8 wide) :=
+  StdValRefines.wideSlice tagOf lid 8 wide hAlloc hOff hLen
+
+/-- Component-wise refinement of `.1` (`WidePtrVal.dataVal`) and `.2` (`WidePtrVal.metaVal`). -/
+theorem StdValRefines.wideSlice_data_and_meta (tagOf : LoanId → Nat) (lid : LoanId)
+    (ptrBytes : Nat) (wide : WidePtrVal)
+    (hAlloc : wide.1.allocId = tagOf lid) (hOff : wide.1.offsetBytes = 0)
+    (hLen : wide.2 < 256 ^ ptrBytes) :
+    StdValRefines tagOf (.refVal lid []) (WidePtrVal.dataVal ptrBytes wide) ∧
+      StdValRefines tagOf (.nat wide.2) (WidePtrVal.metaVal ptrBytes wide) :=
+  ⟨.ref rfl hAlloc hOff, .nat hLen⟩
+
+/-- **`StdValRefines.wideSlice_inv`**: inversion of `StdValRefines` on `stdWideSliceVal lid len`. -/
+theorem StdValRefines.wideSlice_inv {tagOf : LoanId → Nat} {lid : LoanId} {len : Nat}
+    {mv : Value} (h : StdValRefines tagOf (stdWideSliceVal lid len) mv) :
+    Exists fun p => Exists fun ptrSz => Exists fun metaSz =>
+      mv = .aggregate 0 [.ptr p ptrSz, .scalar ⟨len, metaSz⟩] ∧
+      p.allocId = tagOf lid ∧ p.offsetBytes = 0 ∧ len < 256 ^ metaSz := by
+  obtain ⟨ma, mb, hmv, hRef, hNat⟩ := h.pair_inv (a := .refVal lid []) (b := .nat len) rfl
+  obtain ⟨_, p, ptrSz, hma, hAlloc, hOff⟩ := hRef.ref_inv (lid := lid) (path := []) rfl
+  obtain ⟨metaSz, hmb, hLt⟩ := hNat.nat_inv (n := len) rfl
+  subst hmv hma hmb
+  exact ⟨p, ptrSz, metaSz, rfl, hAlloc, hOff, hLt⟩
+
+/-- **`StdValRefines.wideSlice_toValue_inv`**: inversion of `StdValRefines` on
+`WidePtrVal.toValue ptrBytes wide`. -/
+theorem StdValRefines.wideSlice_toValue_inv {tagOf : LoanId → Nat} {lid : LoanId}
+    {len ptrBytes : Nat} {wide : WidePtrVal}
+    (h : StdValRefines tagOf (stdWideSliceVal lid len) (WidePtrVal.toValue ptrBytes wide)) :
+    wide.1.allocId = tagOf lid ∧ wide.1.offsetBytes = 0 ∧ wide.2 = len ∧ len < 256 ^ ptrBytes := by
+  obtain ⟨p, ptrSz, metaSz, hEq, hAlloc, hOff, hLt⟩ := h.wideSlice_inv
+  simp only [WidePtrVal.toValue, Value.aggregate.injEq, List.cons.injEq, Value.ptr.injEq,
+    Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at hEq
+  obtain ⟨_, ⟨hp, _⟩, ⟨hLenEq, hMetaSz⟩⟩ := hEq
+  rw [hp, hAlloc, hOff, hLenEq, hMetaSz]
+  exact ⟨rfl, rfl, rfl, hLt⟩
+
+/-- **`StdValRefines.of_unsizedSliceDstAt`**: an `UnsizedSliceDstAt` view whose pointer tag is
+`tagOf lid` at byte offset `0` refines `stdWideSliceVal lid elems.length`. -/
+theorem StdValRefines.of_unsizedSliceDstAt {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    (tagOf : LoanId → Nat) (lid : LoanId) {ptrBytes : Nat} {dstTy : RigidTy}
+    {mem : Memory} {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (hDst : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes)
+    (hAlloc : wide.1.allocId = tagOf lid) (hOff : wide.1.offsetBytes = 0)
+    (hLen : elems.length < 256 ^ ptrBytes) :
+    StdValRefines tagOf (stdWideSliceVal lid elems.length) fatVal := by
+  rw [hDst.fat_eq, hDst.length_eq]
+  exact StdValRefines.wideSlice tagOf lid ptrBytes wide hAlloc hOff
+    (by rw [← hDst.length_eq]; exact hLen)
+
+/-- **`StdValRefines.wideSlice_ptrMetadata_refines`**: evaluating `Rvalue.unaryOp .ptrMetadata`
+on a wide pointer refining `stdWideSliceVal lid wide.2` under `UnsizedSliceDstAt` produces a
+scalar refining `.nat elems.length`. -/
+theorem StdValRefines.wideSlice_ptrMetadata_refines {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    (tagOf : LoanId → Nat) {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (locals locals' : List LocalSlot) (op : Operand) (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hDst : UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes)
+    (hLen : elems.length < 256 ^ (layoutPointerBytes layouts))
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok fatVal locals') :
+    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
+        .ok (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) locals' mem ∧
+      StdValRefines tagOf (.nat elems.length)
+        (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) :=
+  ⟨(hDst.evalRvalue_ptrMetadata locals locals' op localDecls layouts hOp).1, .nat hLen⟩
+
+/-- **`StdValRefines.wideSlice_from_raw_parts_roundtrip`**: decomposing `fatVal` at `loc` via
+`to_raw_parts` (`.field 0` and `.field 1`) and reassembling via `AggregateKind.rawPtr` preserves
+both `StdValRefines tagOf (stdWideSliceVal lid elems.length)` and `UnsizedSliceDstAt`. -/
+theorem StdValRefines.wideSlice_from_raw_parts_roundtrip {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} (tagOf : LoanId → Nat) (lid : LoanId)
+    {dstTy : RigidTy} {mem : Memory} {wide : WidePtrVal} {fatVal : Value}
+    {elems : List α} {bytes : ByteMem}
+    (locals : List LocalSlot) (loc : Local) (lIdx : LayoutIdx) (dataTy metaTy : Ty)
+    (mutability : Mutability) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hDst : UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes)
+    (hRef : StdValRefines tagOf (stdWideSliceVal lid elems.length) fatVal)
+    (hSlot : Trusted.Sequence.get? locals loc = some (.init fatVal))
+    (hNoUnion0 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 0 dataTy] } = false)
+    (hNoUnion1 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 1 metaTy] } = false) :
+    evalRvalue locals
+        (.aggregate (.rawPtr { kind := dstTy, layoutIdx := lIdx } mutability)
+          [.copy { local_ := loc, projection := [.field 0 dataTy] },
+           .copy { local_ := loc, projection := [.field 1 metaTy] }])
+        mem localDecls layouts = .ok fatVal locals mem ∧
+      StdValRefines tagOf (stdWideSliceVal lid elems.length) fatVal ∧
+      UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes := by
+  obtain ⟨hEv, hDst'⟩ := hDst.evalRvalue_aggregate_rawPtr_roundtrip locals loc lIdx dataTy metaTy
+    mutability localDecls layouts hSlot hNoUnion0 hNoUnion1
+  exact ⟨hEv, hRef, hDst'⟩
+
+/-! ### Spatial-Pin & Loan-Binding Preservation Across Live Metadata & Layout Queries -/
+
+/-- `findBorrowEntry?` is preserved across `invalidateConflictingBorrows` for any entry whose
+`targetLocal ≠ dstLoc`. -/
+theorem findBorrowEntry?_invalidateConflictingBorrows_of_ne {borrows : List BorrowEntry}
+    {tag : Nat} {e : BorrowEntry} {dstLoc : Local}
+    (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (hFind : findBorrowEntry? tag borrows = some e) (hNe : e.targetLocal ≠ dstLoc) :
+    findBorrowEntry? tag (invalidateConflictingBorrows borrows dstLoc writerTag targetFrameDepth) =
+      some e := by
+  rw [findBorrowEntry?_eq_lookupBorrow] at hFind ⊢
+  exact lookupBorrow_invalidateConflictingBorrows_of_ne writerTag targetFrameDepth hFind hNe
+
+/-- `findBorrowEntry?` is preserved across `invalidateDirectDestWriteBorrows` on
+`{ local_ := dstLoc, projection := [] }` for any entry whose `targetLocal ≠ dstLoc`. -/
+theorem findBorrowEntry?_invalidateDirectDestWriteBorrows_of_ne (mem : Memory)
+    (locals : List LocalSlot) {tag : Nat} {e : BorrowEntry} {dstLoc : Local}
+    (hFind : findBorrowEntry? tag mem.borrows = some e) (hNe : e.targetLocal ≠ dstLoc) :
+    findBorrowEntry? tag
+      (invalidateDirectDestWriteBorrows mem locals { local_ := dstLoc, projection := [] }).borrows =
+      some e := by
+  rw [findBorrowEntry?_eq_lookupBorrow] at hFind ⊢
+  exact lookupBorrow_invalidateDirectDestWriteBorrows_of_ne mem locals hFind hNe
+
+/-- `BorrowAt` at local `l` is preserved across `invalidateConflictingBorrows` on `dstLoc ≠ l`. -/
+theorem BorrowAt.of_invalidateConflictingBorrows_ne {ms : MachineState} {tag : Nat}
+    {l dstLoc : Local} {path : SubPath} {ok : TreeBorrowPerm → Bool}
+    (frame' : StackFrame) (mem' : Memory) (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (h : BorrowAt ms tag l path ok) (hNe : l ≠ dstLoc)
+    (hBorrows : mem'.borrows =
+      invalidateConflictingBorrows ms.memory.borrows dstLoc writerTag targetFrameDepth) :
+    BorrowAt { frame := frame', memory := mem' } tag l path ok := by
+  obtain ⟨e, hFind, hTarget, hPath, hOk⟩ := h
+  have hNeE : e.targetLocal ≠ dstLoc := by rw [hTarget]; exact hNe
+  refine ⟨e, ?_, hTarget, hPath, hOk⟩
+  dsimp only
+  rw [hBorrows]
+  exact findBorrowEntry?_invalidateConflictingBorrows_of_ne writerTag targetFrameDepth hFind hNeE
+
+/-- `BorrowAt` at local `l` is preserved across `invalidateDirectDestWriteBorrows` on
+`{ local_ := dstLoc, projection := [] }` when `l ≠ dstLoc`. -/
+theorem BorrowAt.of_invalidateDirectDestWriteBorrows_ne {ms : MachineState} {tag : Nat}
+    {l dstLoc : Local} {path : SubPath} {ok : TreeBorrowPerm → Bool}
+    (frame' : StackFrame) (locals' : List LocalSlot)
+    (h : BorrowAt ms tag l path ok) (hNe : l ≠ dstLoc) :
+    BorrowAt
+      { frame := frame'
+        memory :=
+          invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] } }
+      tag l path ok := by
+  obtain ⟨e, hFind, hTarget, hPath, hOk⟩ := h
+  have hNeE : e.targetLocal ≠ dstLoc := by rw [hTarget]; exact hNe
+  exact ⟨e, findBorrowEntry?_invalidateDirectDestWriteBorrows_of_ne ms.memory locals' hFind hNeE,
+    hTarget, hPath, hOk⟩
+
+private theorem ite_some_none_eq_some {α : Type} {c : Prop} [inst : Decidable c] {x y : α}
+    (h : @ite _ c inst (some x) none = some y) : x = y := by
+  cases inst with
+  | isFalse _ => cases h
+  | isTrue _ => injection h
+
+private theorem getElem?_eq_of_set?_ne {α : Type} :
+    ∀ {xs ys : List α} {dstLoc l : Nat} {v : α},
+      Trusted.Sequence.set? xs dstLoc v = some ys → l ≠ dstLoc → ys[l]? = xs[l]?
+  | xs, ys, dstLoc, l, v, hSet, hNe => by
+    have hYs : xs.set dstLoc v = ys := ite_some_none_eq_some hSet
+    rw [← hYs]
+    exact List.getElem?_set_ne hNe.symm
+
+/-- Updating `dstLoc` via `set?` leaves `lookupLocalSlot?` at every other local `l ≠ dstLoc`
+unchanged whenever `callerLocals` is preserved. -/
+theorem lookupLocalSlot?_of_set?_ne {ms ms' : MachineState} {locals₁ : List LocalSlot}
+    {dstLoc l : Local} {slot : LocalSlot}
+    (hLocs1 : locals₁[l]? = ms.frame.locals[l]?)
+    (hSet : Trusted.Sequence.set? locals₁ dstLoc slot = some ms'.frame.locals)
+    (hCaller : ms'.memory.callerLocals = ms.memory.callerLocals)
+    (hNe : l ≠ dstLoc) :
+    lookupLocalSlot? ms' l = lookupLocalSlot? ms l := by
+  unfold lookupLocalSlot?
+  rw [getElem?_eq_of_set?_ne hSet hNe, hLocs1, hCaller]
+
+/-- `placeValue?` is preserved when `lookupLocalSlot?` is preserved. -/
+theorem placeValue?_of_lookupLocalSlot?_eq {ms ms' : MachineState} {l : Local} (path : SubPath)
+    (hSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l) :
+    placeValue? ms' l path = placeValue? ms l path := by
+  unfold placeValue?
+  rw [hSlot]
+
+/-- `placeByteWindow?` is preserved when `lookupLocalSlot?` is preserved. -/
+theorem placeByteWindow?_of_lookupLocalSlot?_eq (layouts : LayoutTable) (ty : Ty)
+    {ms ms' : MachineState} {l : Local} (path : SubPath)
+    (hSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l) :
+    placeByteWindow? layouts ty ms' l path = placeByteWindow? layouts ty ms l path := by
+  unfold placeByteWindow?
+  rw [hSlot]
+
+/-- `ownSubPlace` of `mirSpatialModel` at `(l, path)` is preserved across any write to a
+disjoint local `dstLoc ≠ l` that updates borrows via `invalidateConflictingBorrows`. -/
+theorem mirSpatialModel_ownSubPlace_of_invalidateConflictingBorrows_ne (tagOf : LoanId → Nat)
+    {ms ms' : MachineState} {l dstLoc : Local} {path : SubPath} {owner : LoanId}
+    {perm : PermTree} {v : StdVal} (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (hNe : l ≠ dstLoc)
+    (hPlace : placeValue? ms' l path = placeValue? ms l path)
+    (hBorrows : ms'.memory.borrows =
+      invalidateConflictingBorrows ms.memory.borrows dstLoc writerTag targetFrameDepth)
+    (h : (mirSpatialModel tagOf).ownSubPlace ms l path owner perm v) :
+    (mirSpatialModel tagOf).ownSubPlace ms' l path owner perm v := by
+  have hAt : ∀ tag ok, BorrowAt ms tag l path ok → BorrowAt ms' tag l path ok := by
+    intro tag ok hB
+    rcases ms' with ⟨f', m'⟩
+    exact hB.of_invalidateConflictingBorrows_ne f' m' writerTag targetFrameDepth hNe hBorrows
+  obtain ⟨hVal, hPerm⟩ := h
+  refine ⟨by rw [hPlace]; exact hVal, ?_⟩
+  cases hG : getPathPerm [] perm with
+  | unborrowed =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+  | mutLocked lid =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+  | mutJoined mLids sLids =>
+    rw [hG] at hPerm
+    rcases hPerm with ⟨lid, hEl, hB⟩ | ⟨lid, hEl, hB⟩
+    · exact Or.inl ⟨lid, hEl, hAt _ _ hB⟩
+    · exact Or.inr ⟨lid, hEl, hAt _ _ hB⟩
+  | shared lids =>
+    rw [hG] at hPerm
+    exact fun lid hEl => hAt _ _ (hPerm lid hEl)
+  | split _ =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+
+/-- `ownSubPlace` of `mirSpatialModel` at `(l, path)` is preserved across any write to a
+disjoint local `dstLoc ≠ l` that updates memory via `invalidateDirectDestWriteBorrows`. -/
+theorem mirSpatialModel_ownSubPlace_of_invalidateDirectDestWriteBorrows_ne (tagOf : LoanId → Nat)
+    {ms ms' : MachineState} {locals' : List LocalSlot} {l dstLoc : Local} {path : SubPath}
+    {owner : LoanId} {perm : PermTree} {v : StdVal}
+    (hNe : l ≠ dstLoc)
+    (hPlace : placeValue? ms' l path = placeValue? ms l path)
+    (hMem : ms'.memory =
+      invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] })
+    (h : (mirSpatialModel tagOf).ownSubPlace ms l path owner perm v) :
+    (mirSpatialModel tagOf).ownSubPlace ms' l path owner perm v := by
+  have hAt : ∀ tag ok, BorrowAt ms tag l path ok → BorrowAt ms' tag l path ok := by
+    intro tag ok hB
+    rcases ms' with ⟨f', m'⟩
+    dsimp only at hMem
+    subst hMem
+    exact hB.of_invalidateDirectDestWriteBorrows_ne f' locals' hNe
+  obtain ⟨hVal, hPerm⟩ := h
+  refine ⟨by rw [hPlace]; exact hVal, ?_⟩
+  cases hG : getPathPerm [] perm with
+  | unborrowed =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+  | mutLocked lid =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+  | mutJoined mLids sLids =>
+    rw [hG] at hPerm
+    rcases hPerm with ⟨lid, hEl, hB⟩ | ⟨lid, hEl, hB⟩
+    · exact Or.inl ⟨lid, hEl, hAt _ _ hB⟩
+    · exact Or.inr ⟨lid, hEl, hAt _ _ hB⟩
+  | shared lids =>
+    rw [hG] at hPerm
+    exact fun lid hEl => hAt _ _ (hPerm lid hEl)
+  | split _ =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+
+/-- **`spatialPinnedBlockHolds_of_invalidateConflictingBorrows_ne`**: `spatialPinnedBlockHolds`
+at `(l, path)` is preserved across any statement writing to a disjoint local `dstLoc ≠ l`
+without unpinning the spatial borrow. -/
+theorem spatialPinnedBlockHolds_of_invalidateConflictingBorrows_ne
+    {tagOf : LoanId → Nat} {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath} {st st' : SymState StdVal} {ms ms' : MachineState}
+    (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hLoans : findLoan lid st'.loans = findLoan lid st.loans)
+    (hSpatial : st'.spatial = st.spatial)
+    (hNe : l ≠ dstLoc)
+    (hSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l)
+    (hBorrows : ms'.memory.borrows =
+      invalidateConflictingBorrows ms.memory.borrows dstLoc writerTag targetFrameDepth) :
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st' ms' := by
+  obtain ⟨e, blk, rest, bs, hFind, hPhase, hBlk, hOrig, hPerm, hTag, hSplits, hBytes, hWin,
+    hBorrow⟩ := hPin
+  rcases ms' with ⟨f', m'⟩
+  refine ⟨e, blk, rest, bs, by rw [hLoans]; exact hFind, hPhase,
+    by rw [hSpatial]; exact hBlk, hOrig, hPerm, hTag, hSplits, hBytes,
+    by rw [placeByteWindow?_of_lookupLocalSlot?_eq layouts ty path hSlot]; exact hWin,
+    hBorrow.of_invalidateConflictingBorrows_ne f' m' writerTag targetFrameDepth hNe hBorrows⟩
+
+/-- **`spatialPinnedBlockHolds_of_invalidateDirectDestWriteBorrows_ne`**: `spatialPinnedBlockHolds`
+at `(l, path)` is preserved across any intrinsic call writing its return value to a disjoint
+local `dstLoc ≠ l` without unpinning the spatial borrow. -/
+theorem spatialPinnedBlockHolds_of_invalidateDirectDestWriteBorrows_ne
+    {tagOf : LoanId → Nat} {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath} {st st' : SymState StdVal} {ms ms' : MachineState}
+    (locals' : List LocalSlot)
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hLoans : findLoan lid st'.loans = findLoan lid st.loans)
+    (hSpatial : st'.spatial = st.spatial)
+    (hNe : l ≠ dstLoc)
+    (hSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l)
+    (hMem : ms'.memory =
+      invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] }) :
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st' ms' := by
+  obtain ⟨e, blk, rest, bs, hFind, hPhase, hBlk, hOrig, hPerm, hTag, hSplits, hBytes, hWin,
+    hBorrow⟩ := hPin
+  rcases ms' with ⟨f', m'⟩
+  have hWin' : placeByteWindow? layouts ty { frame := f', memory := m' } l path = some bs := by
+    rw [placeByteWindow?_of_lookupLocalSlot?_eq layouts ty path hSlot]
+    exact hWin
+  dsimp only at hMem
+  subst hMem
+  exact ⟨e, blk, rest, bs, by rw [hLoans]; exact hFind, hPhase,
+    by rw [hSpatial]; exact hBlk, hOrig, hPerm, hTag, hSplits, hBytes, hWin',
+    hBorrow.of_invalidateDirectDestWriteBorrows_ne f' locals' hNe⟩
+
+/-- **`spatialBindingsHold_of_invalidateConflictingBorrows_ne`**: `spatialBindingsHold` is
+preserved across any statement writing to a local `dstLoc` disjoint from all bound places
+(`∀ b ∈ bindings, b.2.1 ≠ dstLoc`). -/
+theorem spatialBindingsHold_of_invalidateConflictingBorrows_ne (tagOf : LoanId → Nat)
+    {st st' : SymState StdVal} {ms ms' : MachineState} {dstLoc : Local}
+    (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (hBorrows : ms'.memory.borrows =
+      invalidateConflictingBorrows ms.memory.borrows dstLoc writerTag targetFrameDepth) :
+    ∀ bindings : List (LoanId × Local × SubPath),
+      (∀ b, b ∈ bindings → findLoan b.1 st'.loans = findLoan b.1 st.loans) →
+      (∀ b, b ∈ bindings → b.2.1 ≠ dstLoc) →
+      (∀ b, b ∈ bindings → placeValue? ms' b.2.1 b.2.2 = placeValue? ms b.2.1 b.2.2) →
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st ms →
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st' ms'
+  | [], _, _, _, h => h
+  | (lid, l, path) :: bs, hL, hNe, hP, h => by
+    obtain ⟨hDisj, hFold⟩ := h
+    have hDisjTail : spatialBindingsDisjoint (mirSpatialModel tagOf) bs := by
+      have h' := hDisj
+      unfold spatialBindingsDisjoint at h'
+      rw [listFold_cons] at h'
+      exact h'.2
+    rw [listFold_cons] at hFold
+    obtain ⟨hHead, hTail⟩ := hFold
+    have ih := spatialBindingsHold_of_invalidateConflictingBorrows_ne tagOf writerTag
+      targetFrameDepth hBorrows bs
+      (fun b hb => hL b (List.mem_cons_of_mem _ hb))
+      (fun b hb => hNe b (List.mem_cons_of_mem _ hb))
+      (fun b hb => hP b (List.mem_cons_of_mem _ hb))
+      ⟨hDisjTail, hTail⟩
+    refine ⟨hDisj, ?_⟩
+    rw [listFold_cons]
+    refine ⟨?_, ih.2⟩
+    have hLid : findLoan lid st'.loans = findLoan lid st.loans :=
+      hL (lid, l, path) (List.mem_cons_self ..)
+    have hNeHead : l ≠ dstLoc :=
+      hNe (lid, l, path) (List.mem_cons_self ..)
+    have hPl : placeValue? ms' l path = placeValue? ms l path :=
+      hP (lid, l, path) (List.mem_cons_self ..)
+    rw [hLid]
+    cases hF : findLoan lid st.loans with
+    | none => rw [hF] at hHead; exact hHead
+    | some e =>
+      rw [hF] at hHead
+      exact ⟨hHead.1,
+        mirSpatialModel_ownSubPlace_of_invalidateConflictingBorrows_ne tagOf writerTag
+          targetFrameDepth hNeHead hPl hBorrows hHead.2⟩
+
+/-- **`spatialBindingsHold_of_invalidateDirectDestWriteBorrows_ne`**: `spatialBindingsHold` is
+preserved across any intrinsic call writing to a local `dstLoc` disjoint from all bound places
+(`∀ b ∈ bindings, b.2.1 ≠ dstLoc`). -/
+theorem spatialBindingsHold_of_invalidateDirectDestWriteBorrows_ne (tagOf : LoanId → Nat)
+    {st st' : SymState StdVal} {ms ms' : MachineState} (locals' : List LocalSlot)
+    {dstLoc : Local}
+    (hMem : ms'.memory =
+      invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] }) :
+    ∀ bindings : List (LoanId × Local × SubPath),
+      (∀ b, b ∈ bindings → findLoan b.1 st'.loans = findLoan b.1 st.loans) →
+      (∀ b, b ∈ bindings → b.2.1 ≠ dstLoc) →
+      (∀ b, b ∈ bindings → placeValue? ms' b.2.1 b.2.2 = placeValue? ms b.2.1 b.2.2) →
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st ms →
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st' ms'
+  | [], _, _, _, h => h
+  | (lid, l, path) :: bs, hL, hNe, hP, h => by
+    obtain ⟨hDisj, hFold⟩ := h
+    have hDisjTail : spatialBindingsDisjoint (mirSpatialModel tagOf) bs := by
+      have h' := hDisj
+      unfold spatialBindingsDisjoint at h'
+      rw [listFold_cons] at h'
+      exact h'.2
+    rw [listFold_cons] at hFold
+    obtain ⟨hHead, hTail⟩ := hFold
+    have ih := spatialBindingsHold_of_invalidateDirectDestWriteBorrows_ne tagOf locals' hMem bs
+      (fun b hb => hL b (List.mem_cons_of_mem _ hb))
+      (fun b hb => hNe b (List.mem_cons_of_mem _ hb))
+      (fun b hb => hP b (List.mem_cons_of_mem _ hb))
+      ⟨hDisjTail, hTail⟩
+    refine ⟨hDisj, ?_⟩
+    rw [listFold_cons]
+    refine ⟨?_, ih.2⟩
+    have hLid : findLoan lid st'.loans = findLoan lid st.loans :=
+      hL (lid, l, path) (List.mem_cons_self ..)
+    have hNeHead : l ≠ dstLoc :=
+      hNe (lid, l, path) (List.mem_cons_self ..)
+    have hPl : placeValue? ms' l path = placeValue? ms l path :=
+      hP (lid, l, path) (List.mem_cons_self ..)
+    rw [hLid]
+    cases hF : findLoan lid st.loans with
+    | none => rw [hF] at hHead; exact hHead
+    | some e =>
+      rw [hF] at hHead
+      exact ⟨hHead.1,
+        mirSpatialModel_ownSubPlace_of_invalidateDirectDestWriteBorrows_ne tagOf hNeHead
+          hPl hMem hHead.2⟩
+
+/-- **`mirStep_assign_ptrMetadata_preserves_spatialPin`**: executing `dstLoc = PtrMetadata(op)`
+on a wide pointer into a local `dstLoc` disjoint from `l` and `bindings` steps `PureMirExec.mirStep`
+and preserves `spatialPinnedBlockHolds` and `spatialBindingsHold` without unpinning! -/
+theorem mirStep_assign_ptrMetadata_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {op : Operand} {span : String}
+    {p : ProvenancePtr} {len : Nat} {locals₂ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] } (.unaryOp .ptrMetadata op),
+             span := span })
+    (hOp : evalOperand ms.frame.locals op ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.aggregate 0 [.ptr p (layoutPointerBytes cur.layouts),
+          .scalar ⟨len, layoutPointerBytes cur.layouts⟩]) ms.frame.locals)
+    (hProt : ms.memory.activeProtectors = [])
+    (hSlot : Trusted.Sequence.get? ms.frame.locals dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? ms.frame.locals dstLoc
+      (.init (.scalar ⟨len, layoutPointerBytes cur.layouts⟩)) = some locals₂) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₂ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+  intro ms'
+  obtain ⟨_, hMir, _, _⟩ := mirStep_assign_ptrMetadata_wide hCur hPhase hBb hStmt hOp hProt
+    hSlot hLive hSet
+  have hPinSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l :=
+    lookupLocalSlot?_of_set?_ne rfl hSet rfl hNePin
+  refine ⟨hMir,
+    spatialPinnedBlockHolds_of_invalidateConflictingBorrows_ne .none
+      (Trusted.Sequence.length ms.memory.callStack) hPin rfl rfl hNePin hPinSlot rfl,
+    spatialBindingsHold_of_invalidateConflictingBorrows_ne tagOf .none
+      (Trusted.Sequence.length ms.memory.callStack) rfl bindings
+      (fun _ _ => rfl) hNeBind
+      (fun b hb => placeValue?_of_lookupLocalSlot?_eq b.2.2
+        (lookupLocalSlot?_of_set?_ne rfl hSet rfl (hNeBind b hb)))
+      hBind⟩
+
+/-- **`mirStep_assign_aggregate_rawPtr_preserves_spatialPin`**: executing
+`dstLoc = AggregateKind.rawPtr pointeeTy mutability [dataOp, metaOp]` into a local `dstLoc`
+disjoint from `l` and `bindings` steps `PureMirExec.mirStep` and preserves
+`spatialPinnedBlockHolds` and `spatialBindingsHold` without unpinning. -/
+theorem mirStep_assign_aggregate_rawPtr_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {pointeeTy : Ty} {mutability : Mutability}
+    {dataOp metaOp : Operand} {span : String}
+    {p : ProvenancePtr} {len : Nat} {locals₃ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] }
+               (.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]),
+             span := span })
+    (hWide : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hData : evalOperand ms.frame.locals dataOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.ptr p (layoutPointerBytes cur.layouts)) ms.frame.locals)
+    (hMeta : evalOperand ms.frame.locals metaOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.scalar ⟨len, layoutPointerBytes cur.layouts⟩) ms.frame.locals)
+    (hProt : ms.memory.activeProtectors = [])
+    (hSlot : Trusted.Sequence.get? ms.frame.locals dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? ms.frame.locals dstLoc
+      (.init (.aggregate 0 [.ptr p (layoutPointerBytes cur.layouts),
+        .scalar ⟨len, layoutPointerBytes cur.layouts⟩])) = some locals₃) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₃ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+  intro ms'
+  obtain ⟨_, hMir, _, _⟩ := mirStep_assign_aggregate_rawPtr_wide hCur hPhase hBb hStmt hWide
+    hData hMeta hProt hSlot hLive hSet
+  have hPinSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l :=
+    lookupLocalSlot?_of_set?_ne rfl hSet rfl hNePin
+  refine ⟨hMir,
+    spatialPinnedBlockHolds_of_invalidateConflictingBorrows_ne .none
+      (Trusted.Sequence.length ms.memory.callStack) hPin rfl rfl hNePin hPinSlot rfl,
+    spatialBindingsHold_of_invalidateConflictingBorrows_ne tagOf .none
+      (Trusted.Sequence.length ms.memory.callStack) rfl bindings
+      (fun _ _ => rfl) hNeBind
+      (fun b hb => placeValue?_of_lookupLocalSlot?_eq b.2.2
+        (lookupLocalSlot?_of_set?_ne rfl hSet rfl (hNeBind b hb)))
+      hBind⟩
+
+/-- **`mirStep_assign_layout_tuple_preserves_spatialPin`**: executing
+`dstLoc = (sizeOp, alignOp)` (`Layout::for_value(_raw)` tuple assembly) into a local `dstLoc`
+disjoint from `l` and `bindings` steps `PureMirExec.mirStep` and preserves
+`spatialPinnedBlockHolds` and `spatialBindingsHold` without unpinning! -/
+theorem mirStep_assign_layout_tuple_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {sizeOp alignOp : Operand} {span : String}
+    {vSize vAlign : Value} {locals₃ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] }
+               (.aggregate .tuple [sizeOp, alignOp]),
+             span := span })
+    (hSize : evalOperand ms.frame.locals sizeOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack = .ok vSize ms.frame.locals)
+    (hAlign : evalOperand ms.frame.locals alignOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack = .ok vAlign ms.frame.locals)
+    (hProt : ms.memory.activeProtectors = [])
+    (hSlot : Trusted.Sequence.get? ms.frame.locals dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? ms.frame.locals dstLoc (.init (.aggregate 0 [vSize, vAlign])) =
+      some locals₃) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₃ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+  intro ms'
+  obtain ⟨_, hMir, _, _⟩ := mirStep_assign_layout_tuple hCur hPhase hBb hStmt hSize hAlign hProt
+    hSlot hLive hSet
+  have hPinSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l :=
+    lookupLocalSlot?_of_set?_ne rfl hSet rfl hNePin
+  refine ⟨hMir,
+    spatialPinnedBlockHolds_of_invalidateConflictingBorrows_ne .none
+      (Trusted.Sequence.length ms.memory.callStack) hPin rfl rfl hNePin hPinSlot rfl,
+    spatialBindingsHold_of_invalidateConflictingBorrows_ne tagOf .none
+      (Trusted.Sequence.length ms.memory.callStack) rfl bindings
+      (fun _ _ => rfl) hNeBind
+      (fun b hb => placeValue?_of_lookupLocalSlot?_eq b.2.2
+        (lookupLocalSlot?_of_set?_ne rfl hSet rfl (hNeBind b hb)))
+      hBind⟩
+
+/-- **`mirStep_call_sizeOfVal_slice_preserves_spatialPin`**: calling `core::intrinsics::size_of_val`
+on `.slice elemTy` into a destination local `dstLoc` disjoint from `l` and `bindings` steps
+`PureMirExec.mirStep` and preserves `spatialPinnedBlockHolds` and `spatialBindingsHold`
+without unpinning! -/
+theorem mirStep_call_sizeOfVal_slice_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {elemTy : RigidTy} {elemSz : Nat}
+    {p : ProvenancePtr} {len : Nat} {updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hEnd : ms.frame.stmtIdx = Trusted.Sequence.length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals .nil ms.memory.callStack =
+        .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) ms.frame.locals)
+    (hNoOverride : lookupCallee ms.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs ms.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some (.slice elemTy))
+    (hSz : intrinsicRigidTyByteSize cur.localDecls cur.layouts elemTy = some elemSz)
+    (hLt : len * elemSz < signedHalfModulus 8)
+    (hSlot : Trusted.Sequence.get? ms.frame.locals dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? ms.frame.locals dstLoc (.init (.scalar ⟨len * elemSz, 8⟩)) =
+      some updatedLocals) :
+    let ms' : MachineState :=
+      { frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory := invalidateDirectDestWriteBorrows ms.memory ms.frame.locals
+          { local_ := dstLoc, projection := [] } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+  intro ms'
+  obtain ⟨_, hMir, _, _⟩ := mirStep_call_sizeOfVal_slice hCur hPhase hBb hEnd hTerm hCallee
+    hArg hNoOverride hPt hSz hLt hSlot hLive hSet
+  have hCaller : ms'.memory.callerLocals = ms.memory.callerLocals := by
+    change (invalidateDirectDestWriteBorrows ms.memory ms.frame.locals
+      { local_ := dstLoc, projection := [] }).callerLocals = ms.memory.callerLocals
+    unfold invalidateDirectDestWriteBorrows
+    cases ms.memory.borrows <;> rfl
+  have hPinSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l :=
+    lookupLocalSlot?_of_set?_ne rfl hSet hCaller hNePin
+  refine ⟨hMir,
+    spatialPinnedBlockHolds_of_invalidateDirectDestWriteBorrows_ne ms.frame.locals hPin rfl rfl
+      hNePin hPinSlot rfl,
+    spatialBindingsHold_of_invalidateDirectDestWriteBorrows_ne tagOf ms.frame.locals rfl bindings
+      (fun _ _ => rfl) hNeBind
+      (fun b hb => placeValue?_of_lookupLocalSlot?_eq b.2.2
+        (lookupLocalSlot?_of_set?_ne rfl hSet hCaller (hNeBind b hb)))
+      hBind⟩
+
+/-- **`mirStep_call_alignOfVal_slice_preserves_spatialPin`**: calling `core::intrinsics::align_of_val`
+on `.slice elemTy` into a destination local `dstLoc` disjoint from `l` and `bindings` steps
+`PureMirExec.mirStep` and preserves `spatialPinnedBlockHolds` and `spatialBindingsHold`
+without unpinning! -/
+theorem mirStep_call_alignOfVal_slice_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {elemTy : RigidTy} {elemSz alignBytes : Nat}
+    {p : ProvenancePtr} {len : Nat} {updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hEnd : ms.frame.stmtIdx = Trusted.Sequence.length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
+    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals .nil ms.memory.callStack =
+        .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) ms.frame.locals)
+    (hNoOverride : lookupCallee ms.memory.callees cur.layouts "core::intrinsics::align_of_val"
+      typeArgs ms.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::align_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some (.slice elemTy))
+    (hSz : intrinsicRigidTyByteSize cur.localDecls cur.layouts elemTy = some elemSz)
+    (hAlign : intrinsicRigidTyAlign cur.localDecls cur.layouts elemTy = some alignBytes)
+    (hLt : len * elemSz < signedHalfModulus 8)
+    (hSlot : Trusted.Sequence.get? ms.frame.locals dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? ms.frame.locals dstLoc (.init (.scalar ⟨alignBytes, 8⟩)) =
+      some updatedLocals) :
+    let ms' : MachineState :=
+      { frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory := invalidateDirectDestWriteBorrows ms.memory ms.frame.locals
+          { local_ := dstLoc, projection := [] } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+  intro ms'
+  obtain ⟨_, hMir, _, _⟩ := mirStep_call_alignOfVal_slice hCur hPhase hBb hEnd hTerm hCallee
+    hArg hNoOverride hPt hSz hAlign hLt hSlot hLive hSet
+  have hCaller : ms'.memory.callerLocals = ms.memory.callerLocals := by
+    change (invalidateDirectDestWriteBorrows ms.memory ms.frame.locals
+      { local_ := dstLoc, projection := [] }).callerLocals = ms.memory.callerLocals
+    unfold invalidateDirectDestWriteBorrows
+    cases ms.memory.borrows <;> rfl
+  have hPinSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l :=
+    lookupLocalSlot?_of_set?_ne rfl hSet hCaller hNePin
+  refine ⟨hMir,
+    spatialPinnedBlockHolds_of_invalidateDirectDestWriteBorrows_ne ms.frame.locals hPin rfl rfl
+      hNePin hPinSlot rfl,
+    spatialBindingsHold_of_invalidateDirectDestWriteBorrows_ne tagOf ms.frame.locals rfl bindings
+      (fun _ _ => rfl) hNeBind
+      (fun b hb => placeValue?_of_lookupLocalSlot?_eq b.2.2
+        (lookupLocalSlot?_of_set?_ne rfl hSet hCaller (hNeBind b hb)))
+      hBind⟩
+
+end WideSliceDstBridge
+
 end Anneal.PureLift.V2026_06_01Bridge
