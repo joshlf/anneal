@@ -6833,6 +6833,32 @@ theorem commitCopyDstPlaceWrite_isStmtNode
       (commitCopyDstPlaceWrite s dstPlace dstLoc dstTag locals₃ newVal localDecls layouts) :=
   copyWriteDstVal_isStmtNode s locals₃ dstPlace dstLoc dstTag newVal localDecls layouts
 
+theorem commitWriteBytesDstPlaceWrite_pushBaseStack
+    (calleeBody : CapturedMir) (s : MachineState) (dstPlace : Place)
+    (dstTag : Nat) (locals₃ : List LocalSlot) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    commitWriteBytesDstPlaceWrite (MachineState.pushBaseStack calleeBody [] s) dstPlace dstTag
+        locals₃ newVal localDecls layouts =
+      MirStepNode.pushBaseStack calleeBody []
+        (commitWriteBytesDstPlaceWrite s dstPlace dstTag locals₃ newVal localDecls layouts) := by
+  unfold commitWriteBytesDstPlaceWrite
+  dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
+  repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
+
+theorem commitWriteBytesDstPlaceWrite_isStmtNode
+    (s : MachineState) (dstPlace : Place) (dstTag : Nat)
+    (locals₃ : List LocalSlot) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    IsStmtNode
+      (commitWriteBytesDstPlaceWrite s dstPlace dstTag locals₃ newVal localDecls layouts) := by
+  unfold commitWriteBytesDstPlaceWrite
+  dsimp only
+  repeat' (first
+    | exact Or.inl ⟨_, rfl⟩
+    | exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | exact Or.inr (Or.inr rfl)
+    | split)
+
 /-- With no Tree Borrows entries, a `write_bytes` call never writes: its destination pointer has
 no borrow entry, so `writeBytesAction` faults. -/
 theorem writeBytesAction_borrows_nil (frameDepth : Nat) (target : ResolvedCallTarget)
@@ -6934,23 +6960,28 @@ theorem evalCopyNonOverlappingCall_pushBaseStack_of_noCallWP
     try exact False.elim h_st
   · -- exactly three operands and values, the last a `count` scalar
     dsimp only at h_st ⊢
-    rcases evalCopyNonOverlappingWithCount_isStmtNode ms srcOp dstOp bodyLocalDecls bodyLayouts
-        srcVal dstVal countSc.bits locals' with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
-    · rcases h_bor with rfl | h_nil
-      · rw [hs'] at h_st
-        rw [evalCopyNonOverlappingWithCount_pushBaseStack, hs']
-        exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody []
-          { ms with memory := s'.memory } s'.frame.locals destination targetBb .unit h_st
-          (Or.inl rfl)
-      · rcases evalCopyNonOverlappingWithCount_borrows_nil ms srcOp dstOp bodyLocalDecls
-            bodyLayouts srcVal dstVal countSc.bits locals' h_nil with ⟨h_c, h_eq⟩ | ⟨fk, hf⟩
-        · rw [h_eq] at h_st ⊢
-          rw [evalCopyNonOverlappingWithCount_eq, h_c]
-          exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody baseStack ms locals'
-            destination targetBb .unit h_st (Or.inr h_nil)
-        · rw [hf] at h_st; exact False.elim h_st
-    · rw [hf] at h_st; exact False.elim h_st
-    · rw [hu] at h_st; exact False.elim h_st
+    cases h_w : Nat.beq countSc.sizeBytes (layoutPointerBytes bodyLayouts) with
+    | false => rw [h_w] at h_st; exact False.elim h_st
+    | true =>
+      rw [h_w] at h_st
+      dsimp only at h_st ⊢
+      rcases evalCopyNonOverlappingWithCount_isStmtNode ms srcOp dstOp bodyLocalDecls bodyLayouts
+          srcVal dstVal countSc.bits locals' with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
+      · rcases h_bor with rfl | h_nil
+        · rw [hs'] at h_st
+          rw [evalCopyNonOverlappingWithCount_pushBaseStack, hs']
+          exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody []
+            { ms with memory := s'.memory } s'.frame.locals destination targetBb .unit h_st
+            (Or.inl rfl)
+        · rcases evalCopyNonOverlappingWithCount_borrows_nil ms srcOp dstOp bodyLocalDecls
+              bodyLayouts srcVal dstVal countSc.bits locals' h_nil with ⟨h_c, h_eq⟩ | ⟨fk, hf⟩
+          · rw [h_eq] at h_st ⊢
+            rw [evalCopyNonOverlappingWithCount_eq, h_c]
+            exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody baseStack ms locals'
+              destination targetBb .unit h_st (Or.inr h_nil)
+          · rw [hf] at h_st; exact False.elim h_st
+      · rw [hf] at h_st; exact False.elim h_st
+      · rw [hu] at h_st; exact False.elim h_st
 
 /-- Call-form `write_bytes` commutes with `MachineState.pushBaseStack` on every successful
 (call-free) step. -/
@@ -6987,11 +7018,11 @@ theorem evalWriteBytesCall_pushBaseStack_of_noCallWP
       rw [h_a] at h_st
       exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody [] ms locals' destination
         targetBb .unit h_st (Or.inl rfl)
-    | store dstPlace dstLoc dstTag newVal =>
+    | store dstPlace _ dstTag newVal =>
       rw [h_a] at h_st
       dsimp only at h_st ⊢
-      rw [commitCopyDstPlaceWrite_pushBaseStack]
-      rcases commitCopyDstPlaceWrite_isStmtNode ms dstPlace dstLoc dstTag locals' newVal
+      rw [commitWriteBytesDstPlaceWrite_pushBaseStack]
+      rcases commitWriteBytesDstPlaceWrite_isStmtNode ms dstPlace dstTag locals' newVal
           bodyLocalDecls bodyLayouts with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
       · rw [hs'] at h_st ⊢
         exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody []
@@ -9294,16 +9325,59 @@ private theorem evalCopyNonOverlappingCall_borrows_ne_nil_of_noCallWP
     try exact False.elim h_st
   · -- exactly three operands and values, the last a `count` scalar
     dsimp only at h_st ⊢
-    have h_sn := evalCopyNonOverlappingWithCount_ne_nil (src := srcOp) (dst := dstOp)
-      (ld := bodyLocalDecls) (ly := bodyLayouts) (sv := srcVal) (dv := dstVal)
-      (cnt := countSc.bits) (l3 := locals') h_ne
-    rcases evalCopyNonOverlappingWithCount_isStmtNode ms srcOp dstOp bodyLocalDecls bodyLayouts
-        srcVal dstVal countSc.bits locals' with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
-    · rw [hs'] at h_st ⊢
-      exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP { ms with memory := s'.memory }
-        s'.frame.locals destination targetBb .unit (h_sn s' hs') h_st
-    · rw [hf] at h_st; exact False.elim h_st
-    · rw [hu] at h_st; exact False.elim h_st
+    cases h_w : Nat.beq countSc.sizeBytes (layoutPointerBytes bodyLayouts) with
+    | false => rw [h_w] at h_st; exact False.elim h_st
+    | true =>
+      rw [h_w] at h_st
+      dsimp only at h_st ⊢
+      have h_sn := evalCopyNonOverlappingWithCount_ne_nil (src := srcOp) (dst := dstOp)
+        (ld := bodyLocalDecls) (ly := bodyLayouts) (sv := srcVal) (dv := dstVal)
+        (cnt := countSc.bits) (l3 := locals') h_ne
+      rcases evalCopyNonOverlappingWithCount_isStmtNode ms srcOp dstOp bodyLocalDecls bodyLayouts
+          srcVal dstVal countSc.bits locals' with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
+      · rw [hs'] at h_st ⊢
+        exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP { ms with memory := s'.memory }
+          s'.frame.locals destination targetBb .unit (h_sn s' hs') h_st
+      · rw [hf] at h_st; exact False.elim h_st
+      · rw [hu] at h_st; exact False.elim h_st
+
+private theorem borrowsAfterWriteBytes_ne_nil
+    {bs bs' : List BorrowEntry} {ap : List Nat} {dt : Nat} {de : BorrowEntry}
+    (h : bs ≠ [])
+    (hok : borrowsAfterWriteBytes bs ap dt de = some bs') :
+    bs' ≠ [] := by
+  unfold borrowsAfterWriteBytes at hok
+  have h1 := opt_guard_eq_some hok
+  have h2 := opt_guard_eq_some h1
+  have h3 := opt_guard_eq_some h2
+  rw [← Option.some.inj h3]
+  rcases bs with _ | ⟨b1, _ | ⟨b2, br⟩⟩
+  · exact False.elim (h rfl)
+  · cases de.targetProjection with
+    | nil =>
+      cases de.rangeLen.beq 0 <;> nofun
+    | cons _ _ => nofun
+  · nofun
+
+private theorem commitWriteBytesDstPlaceWrite_ne_nil
+    {s : MachineState} {dp : Place} {dt : Nat} {l3 : List LocalSlot} {nv : Value}
+    {ld : List LocalDecl} {ly : LayoutTable}
+    (h : s.memory.borrows ≠ []) :
+    stmtStepBorrowsNeNil (commitWriteBytesDstPlaceWrite s dp dt l3 nv ld ly) := by
+  unfold commitWriteBytesDstPlaceWrite
+  cases lookupBorrow s.memory.borrows dt with
+  | none => exact sn_unsup
+  | some dstEntry =>
+    dsimp only
+    cases hbw : borrowsAfterWriteBytes s.memory.borrows s.memory.activeProtectors dt dstEntry with
+    | none => exact sn_fail
+    | some borrows' =>
+      dsimp only
+      have hne' := borrowsAfterWriteBytes_ne_nil h hbw
+      cases writePlaceValue l3 s.memory.borrows dp nv ld ly with
+      | ok locals4 => exact sn_step hne'
+      | unsupported => exact sn_unsup
+      | ub => exact sn_fail
 
 private theorem evalWriteBytesCall_borrows_ne_nil_of_noCallWP
     (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
@@ -9327,15 +9401,14 @@ private theorem evalWriteBytesCall_borrows_ne_nil_of_noCallWP
     rw [h_a] at h_st
     exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP ms locals' destination targetBb .unit
       h_ne h_st
-  | store dstPlace dstLoc dstTag newVal =>
+  | store dstPlace _ dstTag newVal =>
     rw [h_a] at h_st
     dsimp only at h_st ⊢
     have h_sn : stmtStepBorrowsNeNil
-        (commitCopyDstPlaceWrite ms dstPlace dstLoc dstTag locals' newVal bodyLocalDecls
+        (commitWriteBytesDstPlaceWrite ms dstPlace dstTag locals' newVal bodyLocalDecls
           bodyLayouts) :=
-      copyWriteDstVal_ne_nil (s := ms) (l3 := locals') (dp := dstPlace) (dl := dstLoc)
-        (dt := dstTag) (nv := newVal) (ld := bodyLocalDecls) (ly := bodyLayouts) h_ne
-    rcases commitCopyDstPlaceWrite_isStmtNode ms dstPlace dstLoc dstTag locals' newVal
+      commitWriteBytesDstPlaceWrite_ne_nil h_ne
+    rcases commitWriteBytesDstPlaceWrite_isStmtNode ms dstPlace dstTag locals' newVal
         bodyLocalDecls bodyLayouts with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
     · rw [hs'] at h_st ⊢
       exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP { ms with memory := s'.memory }
@@ -10796,8 +10869,12 @@ theorem extCallAbortsProp_evalCopyNonOverlappingCall
     rcases argVals with
       _ | ⟨srcVal, _ | ⟨dstVal, _ | ⟨_ | countSc | _ | _ | _, _ | _⟩⟩⟩ <;>
     try trivial
-  · exact extCallAbortsProp_finishMemIntrinsicCall _ _ _ _
-      (evalCopyNonOverlappingWithCount_isStmtNode _ _ _ _ _ _ _ _ _)
+  · dsimp only
+    cases Nat.beq countSc.sizeBytes (layoutPointerBytes bodyLayouts) with
+    | false => trivial
+    | true =>
+      exact extCallAbortsProp_finishMemIntrinsicCall _ _ _ _
+        (evalCopyNonOverlappingWithCount_isStmtNode _ _ _ _ _ _ _ _ _)
 
 theorem extCallAbortsProp_evalWriteBytesCall
     (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
@@ -10813,7 +10890,7 @@ theorem extCallAbortsProp_evalWriteBytesCall
   | noWrite => exact extCallAbortsProp_writeIntrinsicReturn _ _ _ _ _
   | store _ _ _ _ =>
     exact extCallAbortsProp_finishMemIntrinsicCall _ _ _ _
-      (commitCopyDstPlaceWrite_isStmtNode _ _ _ _ _ _ _ _)
+      (commitWriteBytesDstPlaceWrite_isStmtNode _ _ _ _ _ _ _)
 
 theorem extCallAbortsProp_evalDirectRustIntrinsic?
     (s : MachineState) (currentBody : Option CapturedMir)

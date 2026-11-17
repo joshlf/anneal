@@ -12024,14 +12024,27 @@ theorem evalWrapUnsafeBinder_wrap_eq_evalRvalue {slots : List LocalSlotState}
     dsimp only
     cases scalarValidRangeOk l v <;> simp [hDistinct]
 
-/-- **`ShallowInitBox` rejects wrong-width pointers and non-raw-pointer operand types
-(`evalShallowInitBox_wrongWidth_or_nonRawPtr_unsupported`)**:
+/-- Lower a `Trusted` static operand type `opTy?` into Anneal's `Option (RawPtrTy RigidTy)` for
+`evalShallowInitBox`: `some ⟨.rawPtr .mut pt, _⟩` lowers to `some ⟨pt, true⟩`,
+`some ⟨.rawPtr .not pt, _⟩` lowers to `some ⟨pt, false⟩`, and any non-raw-pointer type (or `none`)
+lowers to `none`. -/
+def lowerShallowInitBoxOpTy : Option Ty → Option (RawPtrTy RigidTy)
+  | some ⟨.rawPtr .mut pt, _⟩ => some ⟨pt, true⟩
+  | some ⟨.rawPtr .not pt, _⟩ => some ⟨pt, false⟩
+  | _ => none
+
+/-- **`ShallowInitBox` rejects wrong-width pointers and non-raw-pointer operand types, and agrees
+on raw-pointer operand types (`evalShallowInitBox_wrongWidth_or_nonRawPtr_unsupported`)**:
 1. If `v = .ptr p sz` has a pointer width `sz ≠ layoutPointerBytes layouts`, Trusted's
    `evalRvalue (.shallowInitBox (.copy place) contentTy)` fails closed with `.unsupported`.
 2. If `operandTy localDecls layouts (.copy place) = some opTy` is not a raw pointer
-   (`∀ m pt, opTy.kind ≠ .rawPtr m pt`), both Anneal's `evalShallowInitBox` (`operandTy = none`)
-   and Trusted's `evalRvalue (.shallowInitBox (.copy place) contentTy)` reject the operand. -/
-theorem evalShallowInitBox_wrongWidth_or_nonRawPtr_unsupported {τ : Type}
+   (`∀ m pt, opTy.kind ≠ .rawPtr m pt`), lowering that same static type through
+   `lowerShallowInitBoxOpTy` produces `none`, so both Anneal's `evalShallowInitBox` and Trusted's
+   `evalRvalue (.shallowInitBox (.copy place) contentTy)` reject the operand.
+3. Conversely, when `operandTy localDecls layouts (.copy place) = some ⟨.rawPtr m pt, idx⟩` and
+   `v = .ptr p (layoutPointerBytes layouts)` with `a.addr < 2 ^ ptrBits`, both sides accept that
+   same static operand type and preserve the pointer. -/
+theorem evalShallowInitBox_wrongWidth_or_nonRawPtr_unsupported
     {slots : List LocalSlotState} {locals : List LocalSlot} {place : Place}
     {v : Value} (hRel : SlotsRefine SlotBelow slots locals)
     (hRead : readPlaceState slots place = .ok v) (contentTy : Ty) (mem : Memory)
@@ -12042,14 +12055,26 @@ theorem evalShallowInitBox_wrongWidth_or_nonRawPtr_unsupported {τ : Type}
     (∀ p sz, v = .ptr p sz → sz ≠ layoutPointerBytes layouts →
       evalRvalue locals (.shallowInitBox (.copy place) contentTy) mem localDecls layouts =
         .unsupported) ∧
-    (∀ (opTy : Ty) (ptrBits : Nat) (inner : τ) (a : APtr),
+    (∀ (opTy : Ty) (ptrBits : Nat) (inner : RigidTy) (a : APtr),
       operandTy localDecls layouts (.copy place) = some opTy →
       (∀ m pt, opTy.kind ≠ .rawPtr m pt) →
-      evalShallowInitBox ptrBits (none : Option (RawPtrTy τ)) inner a = none ∧
+      lowerShallowInitBoxOpTy (operandTy localDecls layouts (.copy place)) = none ∧
+      evalShallowInitBox ptrBits
+        (lowerShallowInitBoxOpTy (operandTy localDecls layouts (.copy place))) inner a = none ∧
       evalRvalue locals (.shallowInitBox (.copy place) contentTy) mem localDecls layouts =
-        .unsupported) := by
+        .unsupported) ∧
+    (∀ (m : Mutability) (pt : RigidTy) (idx : LayoutIdx) (p : ProvenancePtr)
+        (ptrBits : Nat) (inner : RigidTy) (a : APtr),
+      v = .ptr p (layoutPointerBytes layouts) →
+      operandTy localDecls layouts (.copy place) = some ⟨.rawPtr m pt, idx⟩ →
+      a.addr < 2 ^ ptrBits →
+      evalShallowInitBox ptrBits
+        (lowerShallowInitBoxOpTy (operandTy localDecls layouts (.copy place))) inner a =
+          some (a, ⟨inner, true⟩) ∧
+      evalRvalue locals (.shallowInitBox (.copy place) contentTy) mem localDecls layouts =
+        .ok (.ptr p (layoutPointerBytes layouts)) locals mem) := by
   have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
-  refine ⟨?_, ?_⟩
+  refine ⟨?_, ?_, ?_⟩
   · intro p sz hV hNe
     subst hV
     have hBeq : Nat.beq sz (layoutPointerBytes layouts) = false := by
@@ -12067,7 +12092,13 @@ theorem evalShallowInitBox_wrongWidth_or_nonRawPtr_unsupported {τ : Type}
       rcases ty with ⟨k, idx⟩
       cases k <;> (dsimp only; try rw [hBeq])
   · intro opTy ptrBits inner a hOpTy hNotRaw
-    refine ⟨rfl, ?_⟩
+    have hLow : lowerShallowInitBoxOpTy (some opTy) = none := by
+      rcases opTy with ⟨k, idx⟩
+      cases k with
+      | rawPtr m pt => exact absurd rfl (hNotRaw m pt)
+      | _ => rfl
+    rw [hOpTy]
+    refine ⟨hLow, by rw [hLow]; rfl, ?_⟩
     show Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox locals (.copy place) contentTy
         mem localDecls layouts = .unsupported
     unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox
@@ -12076,6 +12107,20 @@ theorem evalShallowInitBox_wrongWidth_or_nonRawPtr_unsupported {τ : Type}
     cases k with
     | rawPtr m pt => exact absurd rfl (hNotRaw m pt)
     | _ => rfl
+  · intro m pt idx p ptrBits inner a hV hOpTy hInW
+    subst hV
+    rw [hOpTy]
+    have hAnneal :
+        evalShallowInitBox ptrBits (lowerShallowInitBoxOpTy (some ⟨.rawPtr m pt, idx⟩)) inner a =
+          some (a, ⟨inner, true⟩) := by
+      cases m <;> simp [lowerShallowInitBoxOpTy, evalShallowInitBox, Nat.mod_eq_of_lt hInW]
+    refine ⟨hAnneal, ?_⟩
+    show Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox locals (.copy place) contentTy
+        mem localDecls layouts = .ok (.ptr p (layoutPointerBytes layouts)) locals mem
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox
+    rw [hUse, hOpTy]
+    dsimp only
+    rw [Nat.beq_refl]
 
 /-- **`*(ShallowInitBox(p, T))` dereference round-trip (`evalShallowInitBox_deref_read_roundtrip`)**:
 when `evalRvalue locals (.shallowInitBox (.copy srcPlace) contentTy) mem localDecls layouts`
@@ -12127,6 +12172,44 @@ theorem evalShallowInitBox_deref_read_roundtrip
       | _ => dsimp only at hEval; nomatch hEval
   subst hBoxEq
   exact ⟨rfl, rfl, rfl⟩
+
+/-- **End-to-end `Box::new` shallow-init -> `(*_box) = val` -> `*(*_box)` round-trip
+(`evalShallowInitBox_box_init_write_read_roundtrip`)**:
+for `_0 : u32` (initially `.uninit`, representing the newly allocated uninitialized box payload with
+mutable Tree Borrows tag `1`), `_1 : *mut u8` holding `.ptr ⟨1, 0⟩ 8`, and
+`_2 : alloc::boxed::Box<u32>`:
+1. `evalRvalue` on `.shallowInitBox (.copy _1) u32` succeeds **without** reading uninitialized `_0`,
+   producing `.ptr ⟨1, 0⟩ 8`;
+2. `placeTyResolved` resolves `(*_2)` (`⟨2, [.deref]⟩`) to `u32` via `pointeeTyOf` on
+   `alloc::boxed::Box<u32>`;
+3. initializing `(*_2) = 0xDEADBEEF_u32` via `writePlaceValue` writes `.scalar ⟨0xDEADBEEF, 4⟩` into
+   backing slot `_0`;
+4. reading `(*_2)` via `evalPlaceRead` returns `.ok (.scalar ⟨0xDEADBEEF, 4⟩)`. -/
+theorem evalShallowInitBox_box_init_write_read_roundtrip :
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let rawU8Ty : Ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }
+    let boxU32Ty : Ty := { kind := .adt "alloc::boxed::Box" [.uint .u32], layoutIdx := 0 }
+    let decls : List LocalDecl :=
+      [ { mutability := .mut, ty := u32Ty, debugName := some "alloc_slot" }
+      , { mutability := .not, ty := rawU8Ty, debugName := some "raw_ptr" }
+      , { mutability := .mut, ty := boxU32Ty, debugName := some "boxed" } ]
+    let boxPtr : Value := .ptr { allocId := 1, offsetBytes := 0 } 8
+    let locals0 : List LocalSlot := [.uninit, .init boxPtr, .uninit]
+    let localsBoxed : List LocalSlot := [.uninit, .init boxPtr, .init boxPtr]
+    let localsInit : List LocalSlot :=
+      [.init (.scalar ⟨0xDEADBEEF, 4⟩), .init boxPtr, .init boxPtr]
+    let mem : Memory :=
+      { emptyMemory with
+        borrows := [{ tag := 1, targetLocal := 0, targetProjection := [], perm := .unique }] }
+    evalRvalue locals0 (.shallowInitBox (.copy ⟨1, []⟩) u32Ty) mem decls emptyLayoutTable =
+        .ok boxPtr locals0 mem ∧
+      placeTyResolved decls emptyLayoutTable ⟨2, [.deref]⟩ = some u32Ty ∧
+      writePlaceValue localsBoxed mem.borrows ⟨2, [.deref]⟩ (.scalar ⟨0xDEADBEEF, 4⟩) decls
+          emptyLayoutTable = .ok localsInit ∧
+      evalPlaceRead localsInit ⟨2, [.deref]⟩ mem.borrows mem.globals emptyLayoutTable
+          mem.callerLocals decls mem.callStack =
+        .ok (.scalar ⟨0xDEADBEEF, 4⟩) localsInit :=
+  ⟨rfl, rfl, rfl, rfl⟩
 
 /-- **`WrapUnsafeBinder` two-sided niche agreement (`evalWrapUnsafeBinder_niche_iff_evalRvalue`)**:
 bridging Anneal's `ScalarValidRange.contains` to Trusted's `scalarValidRangeOk`
@@ -26515,10 +26598,11 @@ theorem witness_multi_callee_two_deep_and_unwind :
   (its docstring claimed otherwise). The adapter now mirrors Episode 1 exactly, for every `DefPath`
   (`lowerIntrinsicKind_V2026_06_01_eq_ep1Table`).
 - **Premise elimination.** `trustedSupportsIntrinsicDefPath` (the intrinsic conjunct of
-  `LTerminator.Refinable` / `LTerminator.MultiRefinable`) holds exactly for the adapter's non-memory
-  intrinsics (`trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind`), so the refinement theorems
-  cover every direct inline-intrinsic call Episode 1 lowers except the call forms of
-  `copy_nonoverlapping` / `write_bytes` (which `Terminators.lean` leaves as external calls).
+  `LTerminator.Refinable` / `LTerminator.MultiRefinable`) holds across every intrinsic the adapter
+  lowers, including the call forms of `copy_nonoverlapping` and `write_bytes`
+  (`trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind`), so the refinement theorems cover every
+  direct inline-intrinsic call lowered by the adapter (`evalCopyNonOverlappingCall`,
+  `evalWriteBytesCall`).
 - **Fault parity.** Whenever Anneal rejects a value intrinsic, Trusted faults with `.ub` or is
   `.unsupported` (`evalLIntrinsicValue_none_trusted_fault`), lifted to the terminator for all 25
   value-returning intrinsics including `exact_div`
@@ -26968,7 +27052,8 @@ theorem writeBytesAction_and_call_corner_cases
             bodyLayouts argOps argVals = .noWrite ∧
         evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
             destination targetBb = writeIntrinsicReturn s locals' destination targetBb .unit) ∧
-      -- (5) Aligned single-element primitive scalar store -> .store with repeatByteBits
+      -- (5) Aligned single-element primitive scalar store -> .store with repeatByteBits when bit-valid,
+      --     and fail-closed .fault .unsupported when bit-invalid (e.g. 2 in bool)
       (count = 1 →
         Nat.beq elemSize 0 = false →
         dstPtr.offsetBytes = 0 →
@@ -26977,10 +27062,18 @@ theorem writeBytesAction_and_call_corner_cases
           intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts dstPlaceTy.kind = some elemSize) →
         rigidTyEq dstPlaceTy.kind elemTy = true →
         isPrimitiveScalarKind elemTy = true →
-        writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
-            bodyLayouts argOps argVals =
-          .store ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ dstEntry.targetLocal dstPtr.tag
-            (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩))) := by
+        (validateValueForTy? bodyLayouts (some dstPlaceTy)
+            (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩) = true →
+          writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+              bodyLayouts argOps argVals =
+            .store ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ dstEntry.targetLocal dstPtr.tag
+              (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩)) ∧
+        (validateValueForTy? bodyLayouts (some dstPlaceTy)
+            (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩) = false →
+          writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+              bodyLayouts argOps argVals = .fault .unsupported ∧
+          evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
+              destination targetBb = MirStepNode.unsupported))) := by
   intro ptrBytes maxObjSize target argVals
   have hValBlt : Nat.blt valBits 256 = true := Nat.blt_eq.mpr hValLt
   have hPtrBeq : Nat.beq ptrBytes ptrBytes = true := Nat.beq_refl ptrBytes
@@ -27070,50 +27163,197 @@ theorem writeBytesAction_and_call_corner_cases
       have hMod0 : Nat.beq (Nat.mod 0 elemAlign) 0 = true := by
         show Nat.beq (0 % elemAlign) 0 = true
         rw [Nat.zero_mod]; rfl
+      have hBase :
+          writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+              bodyLayouts argOps argVals =
+            match validateValueForTy? bodyLayouts (some dstPlaceTy)
+                (.scalar ⟨writeBytesFillBits valBits elemSize, elemSize⟩) with
+            | true =>
+              .store ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ dstEntry.targetLocal dstPtr.tag
+                (.scalar ⟨writeBytesFillBits valBits elemSize, elemSize⟩)
+            | false => .fault .unsupported := by
+        cases hProj : dstEntry.targetProjection with
+        | nil =>
+          have hPlaceSz : intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts dstPlaceTy.kind =
+              some elemSize := by
+            rcases hInB with hNe | hSz
+            · exact absurd hProj hNe
+            · exact hSz
+          have hAdd0 : Nat.add 0 elemSize = elemSize := Nat.zero_add elemSize
+          have hNotLt : Nat.blt elemSize elemSize = false := by
+            cases h : Nat.blt elemSize elemSize with
+            | false => rfl
+            | true => exact absurd (Nat.blt_eq.mp h) (Nat.lt_irrefl _)
+          unfold writeBytesAction
+          dsimp only [target, argVals, ptrBytes]
+          rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
+          dsimp only
+          rw [hBle, hLk]
+          dsimp only
+          rw [hDepth, hPlaceTy]
+          dsimp only
+          rw [hPlaceAl]
+          dsimp only
+          rw [hAlNz, hAlDiv, hOff0, hMod0, hAddr, hMul1, hSzNz, hProj]
+          dsimp only
+          rw [hPlaceSz]
+          dsimp only
+          rw [hAdd0, hNotLt]
+          dsimp only
+          rw [hTyEq, hPrim]
+          cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
+        | cons hd tl =>
+          unfold writeBytesAction
+          dsimp only [target, argVals, ptrBytes]
+          rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
+          dsimp only
+          rw [hBle, hLk]
+          dsimp only
+          rw [hDepth, hPlaceTy]
+          dsimp only
+          rw [hPlaceAl]
+          dsimp only
+          rw [hAlNz, hAlDiv, hOff0, hMod0, hAddr, hMul1, hSzNz, hProj, hTyEq, hPrim]
+          cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
       rw [repeatByteBits_eq_writeBytesFillBits]
-      cases hProj : dstEntry.targetProjection with
-      | nil =>
-        have hPlaceSz : intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts dstPlaceTy.kind =
-            some elemSize := by
-          rcases hInB with hNe | hSz
-          · exact absurd hProj hNe
-          · exact hSz
-        have hAdd0 : Nat.add 0 elemSize = elemSize := Nat.zero_add elemSize
-        have hNotLt : Nat.blt elemSize elemSize = false := by
-          cases h : Nat.blt elemSize elemSize with
-          | false => rfl
-          | true => exact absurd (Nat.blt_eq.mp h) (Nat.lt_irrefl _)
-        unfold writeBytesAction
-        dsimp only [target, argVals, ptrBytes]
-        rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
-        dsimp only
-        rw [hBle, hLk]
-        dsimp only
-        rw [hDepth, hPlaceTy]
-        dsimp only
-        rw [hPlaceAl]
-        dsimp only
-        rw [hAlNz, hAlDiv, hOff0, hMod0, hAddr, hMul1, hSzNz, hProj]
-        dsimp only
-        rw [hPlaceSz]
-        dsimp only
-        rw [hAdd0, hNotLt]
-        dsimp only
-        rw [hTyEq, hPrim]
-        cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
-      | cons hd tl =>
-        unfold writeBytesAction
-        dsimp only [target, argVals, ptrBytes]
-        rw [hPtrBeq, hValBlt, hElemSz, hElemAl]
-        dsimp only
-        rw [hBle, hLk]
-        dsimp only
-        rw [hDepth, hPlaceTy]
-        dsimp only
-        rw [hPlaceAl]
-        dsimp only
-        rw [hAlNz, hAlDiv, hOff0, hMod0, hAddr, hMul1, hSzNz, hProj, hTyEq, hPrim]
-        cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
+      refine ⟨fun hVOk => by rw [hBase, hVOk], fun hVBad => ?_⟩
+      have hActUnsup :
+          writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+              bodyLayouts argOps argVals = .fault .unsupported := by
+        rw [hBase, hVBad]
+      exact ⟨hActUnsup, by unfold evalWriteBytesCall; rw [hActUnsup]; rfl⟩
+
+/-- **Call-form `copy_nonoverlapping` rejects non-`usize` count widths as undefined behavior
+(`evalCopyNonOverlappingCall_wrongCountWidth_ub`)**:
+in `core::intrinsics::copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize)`, passing a
+scalar `countSc` whose width `countSc.sizeBytes` differs from `layoutPointerBytes bodyLayouts`
+(even when `countSc.bits = 0`) faults with `MirStepNode.fail .ub`. -/
+theorem evalCopyNonOverlappingCall_wrongCountWidth_ub
+    (s : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (srcOp dstOp cntOp : Operand) (srcVal dstVal : Value) (countSc : ScalarInt)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (hBadWidth : Nat.beq countSc.sizeBytes (layoutPointerBytes bodyLayouts) = false) :
+    evalCopyNonOverlappingCall s bodyLocalDecls bodyLayouts [srcOp, dstOp, cntOp]
+        [srcVal, dstVal, .scalar countSc] locals' destination targetBb =
+      MirStepNode.fail .ub := by
+  unfold evalCopyNonOverlappingCall
+  dsimp only
+  rw [hBadWidth]
+
+/-- **Tree Borrows ancestor, active-protector (`noalias`), sibling-field preservation, and
+`bool` bit-validity behavior of `evalWriteBytesCall`
+(`evalWriteBytesCall_tree_borrows_and_bool_validity`)**:
+1. **Frozen ancestor UB**: writing via a `.unique` child tag (`tag = 2`, `parentTag = some 1`)
+   reborrowed from a `.frozen` parent (`tag = 1`) faults with `MirStepNode.fail .ub`.
+2. **Active function-entry protector (`noalias`) UB**: writing via `tag = 1` (`.unique`) while a
+   foreign overlapping borrow `tag = 2` (`.frozen`, `protector = some 7`) is protected
+   (`activeProtectors = [7]`) faults with `MirStepNode.fail .ub`.
+3. **Protected conflicted 2-phase reservation UB**: writing via `tag = 1` (`.reservedFrz true`,
+   `protector = some 7`, `activeProtectors = [7]`) faults with `MirStepNode.fail .ub`.
+4. **Sub-place sibling borrow preservation**: writing via `&raw mut _1.0` (`tag = 1`,
+   `targetProjection = [.field 0 u32]`) disables an overlapping unprotected foreign borrow on
+   `_1.0` (`tag = 2`) while preserving a disjoint sibling `&mut _1.1` borrow (`tag = 3`, `.unique`).
+5. **`bool` bit-validity fail-closed discipline**: `write_bytes::<bool>(&raw mut _1, 1, 1)` stores
+   `true` (`⟨1, 1⟩`), whereas `write_bytes::<bool>(&raw mut _1, 2, 1)` fails closed with
+   `MirStepNode.unsupported` (neither misclassifying deferred Rust validity as eager `.ub` nor
+   storing an unvalidated typed `bool`). -/
+theorem evalWriteBytesCall_tree_borrows_and_bool_validity :
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let boolTy : Ty := { kind := .bool, layoutIdx := 0 }
+    let unitTy : Ty := { kind := .tuple [], layoutIdx := 0 }
+    let pairTy : Ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 }
+    let tgtU32 : ResolvedCallTarget :=
+      { defPath := "core::intrinsics::write_bytes", typeArgs := [.uint .u32], isIndirect := false }
+    let tgtBool : ResolvedCallTarget :=
+      { defPath := "core::intrinsics::write_bytes", typeArgs := [.bool], isIndirect := false }
+    let declsU32 : List LocalDecl :=
+      [ { mutability := .mut, ty := unitTy, debugName := none }
+      , { mutability := .mut, ty := u32Ty, debugName := none } ]
+    let declsPair : List LocalDecl :=
+      [ { mutability := .mut, ty := unitTy, debugName := none }
+      , { mutability := .mut, ty := pairTy, debugName := none } ]
+    let declsBool : List LocalDecl :=
+      [ { mutability := .mut, ty := unitTy, debugName := none }
+      , { mutability := .mut, ty := boolTy, debugName := none } ]
+    let localsU32 : List LocalSlot := [.uninit, .init (.scalar ⟨0, 4⟩)]
+    let localsPair0 : List LocalSlot :=
+      [.uninit, .init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩])]
+    let localsBool0 : List LocalSlot := [.uninit, .init (.scalar ⟨0, 1⟩)]
+    -- (1) Frozen parent ancestor -> .ub
+    let sFrozenAnc : MachineState :=
+      { frame := ⟨0, 0, localsU32⟩
+        memory :=
+          { emptyMemory with
+            borrows :=
+              [ { tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen }
+              , { tag := 2, targetLocal := 1, targetProjection := [], perm := .unique,
+                  parentTag := some 1 } ] } }
+    -- (2) Foreign borrow with active protector -> .ub
+    let sProtForeign : MachineState :=
+      { frame := ⟨0, 0, localsU32⟩
+        memory :=
+          { emptyMemory with
+            activeProtectors := [7]
+            borrows :=
+              [ { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }
+              , { tag := 2, targetLocal := 1, targetProjection := [], perm := .frozen,
+                  protector := some 7 } ] } }
+    -- (3) Protected conflicted 2-phase reservation -> .ub
+    let sProtResFrz : MachineState :=
+      { frame := ⟨0, 0, localsU32⟩
+        memory :=
+          { emptyMemory with
+            activeProtectors := [7]
+            borrows :=
+              [ { tag := 1, targetLocal := 1, targetProjection := [], perm := .reservedFrz true,
+                  protector := some 7 } ] } }
+    -- (4) Sub-place write disables overlapping tag 2 on .0 and preserves disjoint tag 3 (.unique) on .1
+    let sSib0 : MachineState :=
+      { frame := ⟨0, 0, localsPair0⟩
+        memory :=
+          { emptyMemory with
+            borrows :=
+              [ { tag := 1, targetLocal := 1, targetProjection := [.field 0 u32Ty], perm := .unique }
+              , { tag := 2, targetLocal := 1, targetProjection := [.field 0 u32Ty], perm := .frozen }
+              , { tag := 3, targetLocal := 1, targetProjection := [.field 1 u32Ty], perm := .unique } ] } }
+    let sSib1 : MachineState :=
+      { frame := ⟨1, 0, [.init .unit, .init (.aggregate 0 [.scalar ⟨0xABABABAB, 4⟩, .scalar ⟨20, 4⟩])]⟩
+        memory :=
+          { emptyMemory with
+            borrows :=
+              [ { tag := 1, targetLocal := 1, targetProjection := [.field 0 u32Ty], perm := .unique }
+              , { tag := 2, targetLocal := 1, targetProjection := [.field 0 u32Ty], perm := .disabled }
+              , { tag := 3, targetLocal := 1, targetProjection := [.field 1 u32Ty], perm := .unique } ] } }
+    -- (5) bool write_bytes: 1 -> .step storing true; 2 -> .unsupported
+    let sBool0 : MachineState :=
+      { frame := ⟨0, 0, localsBool0⟩
+        memory :=
+          { emptyMemory with
+            borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }] } }
+    let sBool1 : MachineState :=
+      { frame := ⟨1, 0, [.init .unit, .init (.scalar ⟨1, 1⟩)]⟩
+        memory :=
+          { emptyMemory with
+            borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }] } }
+    evalWriteBytesCall sFrozenAnc tgtU32 declsU32 emptyLayoutTable []
+        [.ptr ⟨2, 0⟩ 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩] localsU32 ⟨0, []⟩ 1 =
+      MirStepNode.fail .ub ∧
+    evalWriteBytesCall sProtForeign tgtU32 declsU32 emptyLayoutTable []
+        [.ptr ⟨1, 0⟩ 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩] localsU32 ⟨0, []⟩ 1 =
+      MirStepNode.fail .ub ∧
+    evalWriteBytesCall sProtResFrz tgtU32 declsU32 emptyLayoutTable []
+        [.ptr ⟨1, 0⟩ 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩] localsU32 ⟨0, []⟩ 1 =
+      MirStepNode.fail .ub ∧
+    evalWriteBytesCall sSib0 tgtU32 declsPair emptyLayoutTable []
+        [.ptr ⟨1, 0⟩ 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩] localsPair0 ⟨0, []⟩ 1 =
+      MirStepNode.step sSib1 ∧
+    evalWriteBytesCall sBool0 tgtBool declsBool emptyLayoutTable []
+        [.ptr ⟨1, 0⟩ 8, .scalar ⟨1, 1⟩, .scalar ⟨1, 8⟩] localsBool0 ⟨0, []⟩ 1 =
+      MirStepNode.step sBool1 ∧
+    evalWriteBytesCall sBool0 tgtBool declsBool emptyLayoutTable []
+        [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 1⟩, .scalar ⟨1, 8⟩] localsBool0 ⟨0, []⟩ 1 =
+      MirStepNode.unsupported :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Layouts for the `write_bytes` packed-field witness: entry `1` is
 `#[repr(packed)] struct WbPacked { a: u8, b: u32 }` (size `5`, align `1`, `b` at byte

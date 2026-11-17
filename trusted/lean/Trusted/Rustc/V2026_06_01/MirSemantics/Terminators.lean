@@ -2731,14 +2731,24 @@ def finishMemIntrinsicCall
 Evaluate a direct call `copy_nonoverlapping::<T>(src, dst, count)` whose
 argument operands `argOps` evaluated to `argVals` (with frame `locals'`).
 
-The memory effect is exactly the statement form
+The memory effect is the statement form
 `StatementKind.intrinsic (.copyNonOverlapping src dst count)`
-(`evalCopyNonOverlappingWithCount`, in `Statements.lean`): the same pointer,
-Tree Borrows permission, frame, overlap (`projectionsOverlap`), and typed or
-byte-level copy checks on the same source and destination operands. The call
-then writes `()` to `destination` and continues at `targetBb`
-(`finishMemIntrinsicCall`). An argument list that is not two values and a
-scalar `count` faults with `.ub`.
+(`evalCopyNonOverlappingWithCount`, in `Statements.lean`) after checking that
+`count` is a `usize`-width scalar (`countSc.sizeBytes == layoutPointerBytes
+bodyLayouts`): the same pointer, Tree Borrows permission, frame, overlap
+(`projectionsOverlap`), and typed or byte-level copy checks on the same source
+and destination operands. The call then writes `()` to `destination` and
+continues at `targetBb` (`finishMemIntrinsicCall`). An argument list that is not
+two values and a `usize`-width scalar `count` faults with `.ub` (calling a
+function with ABI-incompatible arguments).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L3019-L3028>
+
+> "/// This is an accidentally-stable alias to [`ptr::copy_nonoverlapping`]; use that instead.
+> ...
+> pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize);"
 
 Reference (`core::ptr::copy_nonoverlapping` documentation,
 `library/core/src/ptr/mod.rs` at commit
@@ -2774,20 +2784,23 @@ def evalCopyNonOverlappingCall
     MirStepNode :=
   match argOps, argVals with
   | srcOp :: dstOp :: _ :: .nil, srcVal :: dstVal :: .scalar countSc :: .nil =>
-    finishMemIntrinsicCall
-      s
-      (evalCopyNonOverlappingWithCount
+    match Nat.beq countSc.sizeBytes (layoutPointerBytes bodyLayouts) with
+    | false => MirStepNode.fail .ub
+    | true =>
+      finishMemIntrinsicCall
         s
-        srcOp
-        dstOp
-        bodyLocalDecls
-        bodyLayouts
-        srcVal
-        dstVal
-        countSc.bits
-        locals')
-      destination
-      targetBb
+        (evalCopyNonOverlappingWithCount
+          s
+          srcOp
+          dstOp
+          bodyLocalDecls
+          bodyLayouts
+          srcVal
+          dstVal
+          countSc.bits
+          locals')
+        destination
+        targetBb
   | _, _ => MirStepNode.fail .ub
 
 /--
@@ -2925,11 +2938,19 @@ Checks, in order:
    that extends past the end of that local is `.ub`: the pointer is not
    dereferenceable for `count * size_of::<T>()` bytes.
 8. One element (`count = 1`) at offset `0` of a place of type `T`, where `T` is
-   a primitive scalar type, stores the scalar whose `size_of::<T>()` bytes all
-   equal `val` (`writeBytesFillBits`); an invalid bit pattern for `T` (e.g. `2`
-   in a `bool`) is stored and faults only when it is read, as documented.
+   a primitive scalar type and the filled value `writeBytesFillBits val
+   (size_of::<T>())` satisfies `validateValueForTy?` for `T`, stores that scalar
+   (`.store`). When `T` is `bool` or `char` and the repeated byte pattern is not
+   a valid bit representation of `T` (e.g. `2` in a `bool` or `0xFF` repeated in
+   a `char`), `write_bytes` itself is not immediate UB in Rust unless the bytes
+   are subsequently read at type `T`, whereas Anneal's non-union local slots
+   store typed `Value`s without re-validating root locals on `Operand.copy`;
+   `writeBytesAction` therefore fails closed with `.fault .unsupported` rather
+   than either misreporting immediate `.ub` or storing an unvalidated typed
+   scalar.
 9. Every other shape (multi-element writes, aggregate `T`, interior offsets,
-   and writes past the end of a sub-place) is unsupported.
+   bit-invalid `bool`/`char` fills, and writes past the end of a sub-place) is
+   unsupported.
 
 Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
 at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -2946,6 +2967,13 @@ at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 > ///
 > /// Additionally, note that changing `*dst` in this way can easily lead to undefined behavior (UB)
 > /// later if the written bytes are not a valid representation of some `T`."
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Invalid values in primitive types, even in private fields and locals:
+> - A `bool` that isn't 0 or 1.
+> - A `char` that is a surrogate or above `char::MAX`."
 
 Reference (`library/core/src/ptr/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -3064,8 +3092,14 @@ def writeBytesAction
                                         (isPrimitiveScalarKind elemTy)))
                                 with
                                 | true =>
-                                  .store dstPlace dstEntry.targetLocal dstPtr.tag
-                                    (.scalar ⟨writeBytesFillBits valSc.bits elemSize, elemSize⟩)
+                                  let fillVal : Value :=
+                                    .scalar ⟨writeBytesFillBits valSc.bits elemSize, elemSize⟩
+                                  match
+                                    validateValueForTy? bodyLayouts (.some dstPlaceTy) fillVal
+                                  with
+                                  | true =>
+                                    .store dstPlace dstEntry.targetLocal dstPtr.tag fillVal
+                                  | false => .fault .unsupported
                                 | false => .fault .unsupported
         | _, _ =>
           match isUnsizedRigidTy 8 elemTy with
@@ -3074,14 +3108,203 @@ def writeBytesAction
   | _ => .fault .ub
 
 /--
+Tree Borrows write check and permission transition for a non-zero `write_bytes`
+store to `(dstTag, dstEntry)` in `Runtime(PostCleanup)` MIR (Rust 1.98.0, paired
+with Anneal's Tree Borrows aliasing model; mirrors the write phase of
+`Statements.borrowsAfterCopySingleDirect`):
+1. Rejects `.frozen`, `.disabled`, and protected conflicted two-phase
+   reservations (`.reservedFrz true` with `isBorrowProtected activeProtectors
+   dstEntry = true`).
+2. Checks ancestor child-write permissions across multi-tag borrow trees
+   (`treeBorrowAncestorsChildAccessUB .write`), rejecting writes through tags
+   reborrowed from `.frozen` or `.disabled` ancestors.
+3. Checks active function-entry lifetime protectors on overlapping foreign
+   borrows (`hasProtectedTreeWriteConflict` / `hasProtectedWriteConflict`),
+   rejecting writes that would disable a protected borrow (`noalias` violation).
+4. Applies the projection- and byte-range-aware Tree Borrows write transition
+   (`invalidateTreeBorrowsAtProj` / `invalidateConflictingBorrowsAtProj` /
+   `invalidateConflictingBorrows`), activating two-phase reservations on the
+   written tag and disabling overlapping foreign borrows without clobbering
+   disjoint sibling sub-place borrows.
+Returns `.none` on any Tree Borrows undefined behavior.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/perms.rs` and `tree.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L179-L198>
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/tree.rs#L157-L159>
+
+> "ReservedFrz { conflicted: true } if protected => return None,
+> ReservedFrz { .. } | ReservedIM | Unique => Unique,
+> Frozen | Disabled => return None,"
+
+> "if protected && self.accessed && transition.produces_disabled() {
+>     return Err(TransitionError::ProtectedDisabled(old_perm));
+> }"
+-/
+def borrowsAfterWriteBytes
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (dstTag : Nat)
+    (dstEntry : BorrowEntry) :
+    Option (List BorrowEntry) :=
+  let childWriteUB : Bool :=
+    match dstEntry.perm with
+    | .frozen | .disabled => true
+    | .reservedFrz true => isBorrowProtected activeProtectors dstEntry
+    | _ => false
+  match childWriteUB with
+  | true => .none
+  | false =>
+    let ancWriteUB : Bool :=
+      match borrows with
+      | _ :: _ :: _ =>
+        treeBorrowAncestorsChildAccessUB .write borrows dstEntry.parentTag
+      | _ => false
+    match ancWriteUB with
+    | true => .none
+    | false =>
+      let protConflict : Bool :=
+        match activeProtectors with
+        | .nil => false
+        | _ :: _ =>
+          match borrows with
+          | b₁ :: b₂ :: restBorrows =>
+            let allBorrows := b₁ :: b₂ :: restBorrows
+            hasProtectedTreeWriteConflict
+              allBorrows
+              allBorrows
+              activeProtectors
+              dstEntry.targetLocal
+              (.some dstTag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+          | _ =>
+            hasProtectedWriteConflict
+              borrows
+              activeProtectors
+              dstEntry.targetLocal
+              (.some dstTag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+      match protConflict with
+      | true => .none
+      | false =>
+        let borrows' : List BorrowEntry :=
+          match borrows with
+          | .nil => .nil
+          | single :: .nil =>
+            let b := single :: .nil
+            match dstEntry.targetProjection with
+            | .nil =>
+              match Nat.beq dstEntry.rangeLen 0 with
+              | true =>
+                invalidateConflictingBorrows
+                  b
+                  dstEntry.targetLocal
+                  (.some dstTag)
+                  dstEntry.targetFrameDepth
+              | false =>
+                invalidateConflictingBorrowsAtProj
+                  b
+                  dstEntry.targetLocal
+                  (.some dstTag)
+                  .nil
+                  dstEntry.rangeOffset
+                  dstEntry.rangeLen
+                  dstEntry.targetFrameDepth
+            | pHead :: pTail =>
+              invalidateConflictingBorrowsAtProj
+                b
+                dstEntry.targetLocal
+                (.some dstTag)
+                (pHead :: pTail)
+                dstEntry.rangeOffset
+                dstEntry.rangeLen
+                dstEntry.targetFrameDepth
+          | b₁ :: b₂ :: restBorrows =>
+            let allBorrows := b₁ :: b₂ :: restBorrows
+            invalidateTreeBorrowsAtProj
+              allBorrows
+              allBorrows
+              dstEntry.targetLocal
+              (.some dstTag)
+              dstEntry.targetProjection
+              dstEntry.rangeOffset
+              dstEntry.rangeLen
+              dstEntry.targetFrameDepth
+        .some borrows'
+
+/--
+Commit a non-zero single-element `write_bytes` store of `newVal` to `dstPlace`
+through Tree Borrows tag `dstTag` in active-frame `locals₃`: runs the Tree
+Borrows ancestor, active-protector, and sub-place invalidation transition
+(`borrowsAfterWriteBytes`), writes `newVal` to `dstPlace` (`writePlaceValue`),
+and advances `s` (`advanceStmt`). Missing borrow entries fail closed with
+`MirStepNode.unsupported`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+def commitWriteBytesDstPlaceWrite
+    (s : MachineState)
+    (dstPlace : Place)
+    (dstTag : Nat)
+    (locals₃ : List LocalSlot)
+    (newVal : Value)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    MirStepNode :=
+  match lookupBorrow s.memory.borrows dstTag with
+  | .none => MirStepNode.unsupported
+  | .some dstEntry =>
+    match
+      borrowsAfterWriteBytes
+        s.memory.borrows
+        s.memory.activeProtectors
+        dstTag
+        dstEntry
+    with
+    | .none => MirStepNode.fail .ub
+    | .some borrows' =>
+      match
+        writePlaceValue
+          locals₃
+          s.memory.borrows
+          dstPlace
+          newVal
+          localDecls
+          layouts
+      with
+      | .ok locals₄ =>
+        MirStepNode.step
+          (advanceStmt
+            s
+            locals₄
+            { s.memory with borrows := borrows' })
+      | .unsupported => MirStepNode.unsupported
+      | .ub => MirStepNode.fail .ub
+
+/--
 Evaluate a direct call `write_bytes::<T>(dst, val, count)` whose argument
 operands `argOps` evaluated to `argVals` (with frame `locals'`): validate it
 against the current Tree Borrows state and active frame (`writeBytesAction`),
 then fault, leave memory unchanged, or store the filled element at the
-destination sub-place through `commitCopyDstPlaceWrite` (the destination write
-and Tree Borrows invalidation of the `copy_nonoverlapping` statement). The call
-then writes `()` to `destination` and continues at `targetBb`
-(`writeIntrinsicReturn`, `finishMemIntrinsicCall`).
+destination sub-place through `commitWriteBytesDstPlaceWrite` (enforcing Tree
+Borrows ancestor permissions, active function-entry protectors, and sub-place
+borrow invalidation). The call then writes `()` to `destination` and continues
+at `targetBb` (`writeIntrinsicReturn`, `finishMemIntrinsicCall`).
 
 Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
 at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -3116,13 +3339,12 @@ def evalWriteBytesCall
   with
   | .fault kind => MirStepNode.fail kind
   | .noWrite => writeIntrinsicReturn s locals' destination targetBb .unit
-  | .store dstPlace dstTargetLocal dstTag newVal =>
+  | .store dstPlace _ dstTag newVal =>
     finishMemIntrinsicCall
       s
-      (commitCopyDstPlaceWrite
+      (commitWriteBytesDstPlaceWrite
         s
         dstPlace
-        dstTargetLocal
         dstTag
         locals'
         newVal

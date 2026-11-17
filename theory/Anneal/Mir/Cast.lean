@@ -12810,6 +12810,179 @@ theorem evalByteCast_adt_multiple_enum_signed_negative_and_u128_agreement
     exact hStep
 
 /--
+**Two-sided `Enum -> Scalar` and signed negative `#[repr(i128)]` (`-1_i128 = 2^128 - 1`) explicit-discriminant `evalByteCast` round-trip (`evalByteCast_adt_multiple_enum_to_scalar_and_i128_roundtrip`).**
+Complements `evalByteCast_adt_multiple_enum_signed_negative_and_u128_agreement` with:
+1. **Reverse direction (`#[repr(i8)]` Enum `-> i8`)**: for `#[repr(i8)] enum Neg { A = -1, B = 1 }` (`l8.variantDiscriminants = [255, 1]`), `evalByteCast` and `evalRvalue (.cast .transmute ...)` map `.aggregate 0 []` to `255` (`-1_i8`) and `.aggregate 1 []` to `1` (`1_i8`);
+2. **Signed negative 16-byte `#[repr(i128)]` (`-1_i128 = scalarModulus 16 - 1`) two-sided round-trip and gap rejection**: for `#[repr(i128)] enum Neg128 { A = -1, B = 1 }` (`l128.variantDiscriminants = [scalarModulus 16 - 1, 1]`, wrapping range `⟨scalarModulus 16 - 1, 1⟩`):
+   - `i128 -> Neg128` maps `scalarModulus 16 - 1` to `.aggregate 0 []`, maps `1` to `.aggregate 1 []`, and rejects the undeclared gap `0` (despite `wrappingRangeContains ⟨scalarModulus 16 - 1, 1⟩ 0 = true`) with `ub`;
+   - `Neg128 -> i128` maps `.aggregate 0 []` back to `scalarModulus 16 - 1` (`-1_i128`) and `.aggregate 1 []` back to `1`.
+-/
+theorem evalByteCast_adt_multiple_enum_to_scalar_and_i128_roundtrip
+    (locals locals' : List LocalSlot) (opEnum8 opI128 opEnum128 : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (m : Mutability) (pointee : RigidTy) (enumLIdx8 i8LIdx enumLIdx128 i128LIdx : LayoutIdx)
+    (defPath8 defPath128 : DefPath) (args8 args128 : List RigidTy)
+    (l8 l128 : TypeLayout) (memoryOrder vm0 vm1 vm128_0 vm128_1 : List Nat)
+    (hEnumLIdx8 : enumLIdx8 ≠ 0)
+    (hLookup8 : LayoutTable.lookup layouts enumLIdx8 = some l8)
+    (hInhab8 : l8.isUninhabited = false)
+    (hVar8 : l8.variants =
+      .multiple (.initialized (.int 8 true) ⟨255, 1⟩) 0 [.arbitrary [] vm0, .arbitrary [] vm1])
+    (hFields8 : l8.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hSz8 : l8.size.bytes = 1)
+    (hDiscr8 : l8.variantDiscriminants = [255, 1])
+    (hTyEnum8 : operandTy localDecls layouts opEnum8 =
+      some { kind := .adt defPath8 args8, layoutIdx := enumLIdx8 })
+    (hEnumLIdx128 : enumLIdx128 ≠ 0)
+    (hLookup128 : LayoutTable.lookup layouts enumLIdx128 = some l128)
+    (hInhab128 : l128.isUninhabited = false)
+    (hVar128 : l128.variants =
+      .multiple (.initialized (.int 128 true) ⟨scalarModulus 16 - 1, 1⟩) 0
+        [.arbitrary [] vm128_0, .arbitrary [] vm128_1])
+    (hFields128 : l128.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hSz128 : l128.size.bytes = 16)
+    (hDiscr128 : l128.variantDiscriminants = [scalarModulus 16 - 1, 1])
+    (hTyI128 : operandTy localDecls layouts opI128 =
+      some { kind := ScalarTy.i128.toTrustedRigidTy m pointee, layoutIdx := i128LIdx })
+    (hTyEnum128 : operandTy localDecls layouts opEnum128 =
+      some { kind := .adt defPath128 args128, layoutIdx := enumLIdx128 }) :
+    let i8Ty : Ty := { kind := ScalarTy.i8.toTrustedRigidTy m pointee, layoutIdx := i8LIdx }
+    let enum128Ty : Ty := { kind := .adt defPath128 args128, layoutIdx := enumLIdx128 }
+    let i128Ty : Ty := { kind := ScalarTy.i128.toTrustedRigidTy m pointee, layoutIdx := i128LIdx }
+    let neg1_128 : Nat := scalarModulus 16 - 1
+    -- (1a) Neg::A (variant 0) -> -1_i8 (255)
+    (evalOperand locals opEnum8 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.aggregate 0 []) locals' →
+      evalByteCast locals opEnum8 i8Ty mem localDecls layouts = ok (.scalar ⟨255, 1⟩) locals' mem ∧
+      evalRvalue locals (.cast .transmute opEnum8 i8Ty) mem localDecls layouts =
+        ok (.scalar ⟨255, 1⟩) locals' mem) ∧
+    -- (1b) Neg::B (variant 1) -> 1_i8 (1)
+    (evalOperand locals opEnum8 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.aggregate 1 []) locals' →
+      evalByteCast locals opEnum8 i8Ty mem localDecls layouts = ok (.scalar ⟨1, 1⟩) locals' mem ∧
+      evalRvalue locals (.cast .transmute opEnum8 i8Ty) mem localDecls layouts =
+        ok (.scalar ⟨1, 1⟩) locals' mem) ∧
+    -- (2a) -1_i128 (2^128 - 1) -> Neg128::A (variant 0)
+    (evalOperand locals opI128 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.scalar ⟨neg1_128, 16⟩) locals' →
+      evalByteCast locals opI128 enum128Ty mem localDecls layouts =
+        ok (.aggregate 0 []) locals' mem) ∧
+    -- (2b) 1_i128 (1) -> Neg128::B (variant 1)
+    (evalOperand locals opI128 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.scalar ⟨1, 16⟩) locals' →
+      evalByteCast locals opI128 enum128Ty mem localDecls layouts =
+        ok (.aggregate 1 []) locals' mem) ∧
+    -- (2c) gap 0_i128 (inside wrapping range ⟨2^128 - 1, 1⟩) -> ub
+    (evalOperand locals opI128 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.scalar ⟨0, 16⟩) locals' →
+      wrappingRangeContains ⟨neg1_128, 1⟩ 0 = true ∧
+      evalByteCast locals opI128 enum128Ty mem localDecls layouts = ub) ∧
+    -- (2d) Neg128::A (variant 0) -> -1_i128 (2^128 - 1) and Neg128::B (variant 1) -> 1_i128 (1)
+    (evalOperand locals opEnum128 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.aggregate 0 []) locals' →
+      evalByteCast locals opEnum128 i128Ty mem localDecls layouts =
+        ok (.scalar ⟨neg1_128, 16⟩) locals' mem) ∧
+    (evalOperand locals opEnum128 mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
+        .ok (.aggregate 1 []) locals' →
+      evalByteCast locals opEnum128 i128Ty mem localDecls layouts =
+        ok (.scalar ⟨1, 16⟩) locals' mem) := by
+  intro i8Ty enum128Ty i128Ty neg1_128
+  have hW8 : primitiveKindByteWidth (.int 8 true) = some l8.size.bytes :=
+    congrArg some hSz8.symm
+  have hW128 : primitiveKindByteWidth (.int 128 true) = some l128.size.bytes :=
+    congrArg some hSz128.symm
+  have hFieldless128 :
+      ∀ tag < scalarModulus l128.size.bytes,
+        wrappingRangeContains ⟨neg1_128, 1⟩ tag = true →
+        ∀ varIdx, resolveEnumVariantIdxByTag l128.variantDiscriminants tag = some varIdx →
+        ∃ varMemOrder,
+          Trusted.Sequence.get?
+              ([FieldsShape.arbitrary [] vm128_0, FieldsShape.arbitrary [] vm128_1] : List FieldsShape)
+              varIdx =
+            some (FieldsShape.arbitrary [] varMemOrder) := by
+    intro tag _ _ varIdx hRes
+    rw [hDiscr128] at hRes
+    unfold resolveEnumVariantIdxByTag findDiscriminantVariantIdx? at hRes
+    dsimp only at hRes
+    cases hN : Nat.beq (scalarModulus 16 - 1) tag <;> rw [hN] at hRes
+    · dsimp only at hRes
+      unfold findDiscriminantVariantIdx? at hRes
+      cases h1 : Nat.beq 1 tag <;> rw [h1] at hRes
+      · dsimp only at hRes
+        unfold findDiscriminantVariantIdx? at hRes
+        nomatch hRes
+      · injection hRes with hEq; subst hEq; exact ⟨vm128_1, rfl⟩
+    · injection hRes with hEq; subst hEq; exact ⟨vm128_0, rfl⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro hOp0
+    exact evalByteCast_adt_multiple_enum_explicit_to_scalar_ok
+      locals locals' opEnum8 mem localDecls layouts defPath8 args8 enumLIdx8 i8LIdx l8
+      8 0 255 true ⟨255, 1⟩ [FieldsShape.arbitrary [] vm0, FieldsShape.arbitrary [] vm1]
+      memoryOrder vm0 m pointee .i8 rfl (by decide) rfl hEnumLIdx8 hLookup8 hInhab8 hVar8
+      hFields8 hSz8 hW8 rfl (by rw [hSz8, hDiscr8]; decide) (by rw [hDiscr8])
+      hOp0 hTyEnum8
+  · intro hOp1
+    exact evalByteCast_adt_multiple_enum_explicit_to_scalar_ok
+      locals locals' opEnum8 mem localDecls layouts defPath8 args8 enumLIdx8 i8LIdx l8
+      8 1 1 true ⟨255, 1⟩ [FieldsShape.arbitrary [] vm0, FieldsShape.arbitrary [] vm1]
+      memoryOrder vm1 m pointee .i8 rfl (by decide) rfl hEnumLIdx8 hLookup8 hInhab8 hVar8
+      hFields8 hSz8 hW8 rfl (by rw [hSz8, hDiscr8]; decide) (by rw [hDiscr8])
+      hOp1 hTyEnum8
+  · intro hOpNeg128
+    have hStep := (tryTransmute_adt_multiple_enum_explicit_discriminants_eq
+      locals locals' opI128 mem localDecls layouts m pointee .i128 i128LIdx defPath128 args128
+      enumLIdx128 l128 128 neg1_128 true ⟨neg1_128, 1⟩
+      [FieldsShape.arbitrary [] vm128_0, FieldsShape.arbitrary [] vm128_1] memoryOrder rfl
+      ⟨by decide, trivial⟩ hEnumLIdx128 hLookup128 hInhab128 hVar128 hFields128 hSz128 hW128
+      hFieldless128 hOpNeg128 hTyI128).2.1
+    rw [hDiscr128] at hStep
+    have hWrap : wrappingRangeContains ⟨neg1_128, 1⟩ neg1_128 = true := by decide
+    have hRes0 : resolveEnumVariantIdxByTag [scalarModulus 16 - 1, 1] neg1_128 = some 0 := by decide
+    rw [hWrap, hRes0] at hStep
+    exact hStep
+  · intro hOpPos128
+    have hStep := (tryTransmute_adt_multiple_enum_explicit_discriminants_eq
+      locals locals' opI128 mem localDecls layouts m pointee .i128 i128LIdx defPath128 args128
+      enumLIdx128 l128 128 1 true ⟨neg1_128, 1⟩
+      [FieldsShape.arbitrary [] vm128_0, FieldsShape.arbitrary [] vm128_1] memoryOrder rfl
+      ⟨by decide, trivial⟩ hEnumLIdx128 hLookup128 hInhab128 hVar128 hFields128 hSz128 hW128
+      hFieldless128 hOpPos128 hTyI128).2.1
+    rw [hDiscr128] at hStep
+    have hWrap : wrappingRangeContains ⟨neg1_128, 1⟩ 1 = true := by decide
+    have hRes1 : resolveEnumVariantIdxByTag [scalarModulus 16 - 1, 1] 1 = some 1 := by decide
+    rw [hWrap, hRes1] at hStep
+    exact hStep
+  · intro hOpGap128
+    have hWrap0 : wrappingRangeContains ⟨neg1_128, 1⟩ 0 = true := by decide
+    refine ⟨hWrap0, ?_⟩
+    have hStep := (tryTransmute_adt_multiple_enum_explicit_discriminants_eq
+      locals locals' opI128 mem localDecls layouts m pointee .i128 i128LIdx defPath128 args128
+      enumLIdx128 l128 128 0 true ⟨neg1_128, 1⟩
+      [FieldsShape.arbitrary [] vm128_0, FieldsShape.arbitrary [] vm128_1] memoryOrder rfl
+      ⟨by decide, trivial⟩ hEnumLIdx128 hLookup128 hInhab128 hVar128 hFields128 hSz128 hW128
+      hFieldless128 hOpGap128 hTyI128).2.1
+    rw [hDiscr128] at hStep
+    have hResNone : resolveEnumVariantIdxByTag [scalarModulus 16 - 1, 1] 0 = none := by decide
+    rw [hWrap0, hResNone] at hStep
+    exact hStep
+  · intro hOpE0
+    exact (evalByteCast_adt_multiple_enum_explicit_to_scalar_ok
+      locals locals' opEnum128 mem localDecls layouts defPath128 args128 enumLIdx128 i128LIdx l128
+      128 0 neg1_128 true ⟨neg1_128, 1⟩
+      [FieldsShape.arbitrary [] vm128_0, FieldsShape.arbitrary [] vm128_1]
+      memoryOrder vm128_0 m pointee .i128 rfl (by decide) (by decide) hEnumLIdx128 hLookup128
+      hInhab128 hVar128 hFields128 hSz128 hW128 rfl (by rw [hSz128, hDiscr128]; decide)
+      (by rw [hDiscr128]; decide) hOpE0 hTyEnum128).1
+  · intro hOpE1
+    exact (evalByteCast_adt_multiple_enum_explicit_to_scalar_ok
+      locals locals' opEnum128 mem localDecls layouts defPath128 args128 enumLIdx128 i128LIdx l128
+      128 1 1 true ⟨neg1_128, 1⟩
+      [FieldsShape.arbitrary [] vm128_0, FieldsShape.arbitrary [] vm128_1]
+      memoryOrder vm128_1 m pointee .i128 rfl (by decide) (by decide) hEnumLIdx128 hLookup128
+      hInhab128 hVar128 hFields128 hSz128 hW128 rfl (by rw [hSz128, hDiscr128]; decide)
+      (by rw [hDiscr128]; decide) hOpE1 hTyEnum128).1
+
+/--
 **Niche-aware decidable-certificate corollary (`evalByteCast_ok_of_checkIntoFromBytesNicheAware`).**
 Discharges `Trusted.MirSemantics.evalByteCast` from `checkIntoBytes` and
 `checkFromBytesNicheAware` on the `localDecls`-resolved source and destination types (plus the
