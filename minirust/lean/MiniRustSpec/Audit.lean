@@ -6166,6 +6166,14 @@ open MiniRustSpec.Correspondence.WideSliceDst
   wideSliceTreeBorrowsDisabledVsMetadataOk_three_way
   wideSliceSizeAndAlignOfVal_u32_str_empty_zst_witnesses
   wideSliceIsizeMaxBoundary_and_scalarAddrDivergence_canaries
+  compute_size_and_align_slice_eq
+  x86_64_valid_size_nat_eq
+  computeSize_computeAlign_slice_total
+  checkPtr_rawSlice_ok
+  sliceSizeOverflow_minirust_ub_locus
+  minirust_interp_metadata_unops_unsupported
+  div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total
+  wideSliceParentWrite_aliasingDivergence_and_metadata_three_way
 
 namespace WideSliceDstStatementPins
 
@@ -6211,6 +6219,83 @@ example :
     MirNoUBTree
       (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) :=
   wideSliceTreeBorrowsDisabledVsMetadataOk_three_way
+
+/- MiniRust's `isize::MAX` UB is raised only by `check_ptr` on safe references; raw wide pointers
+and `compute_size` / `compute_align` are total. -/
+example (m : Mach) (thin : Ptr) (mutbl : MirAst.Mutability) (elemSz elemAlign : Nat)
+    (freeze : Bool) (len : Nat)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hLen : len < scalarModulus 8)
+    (hOverflow : signedHalfModulus 8 ≤ len * elemSz) :
+    checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len))))
+        (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) (some m) =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") ∧
+    checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))) (.Raw .ElementCount)
+        (some m) = .ok () ∧
+    computeSize m (.Slice ⟨elemSz⟩ ⟨elemAlign⟩) (some (.ElementCount (Int.ofNat len))) =
+      .ok ⟨len * elemSz⟩ ∧
+    computeAlign m (.Slice ⟨elemSz⟩ ⟨elemAlign⟩) (some (.ElementCount (Int.ofNat len))) =
+      .ok ⟨elemAlign⟩ :=
+  sliceSizeOverflow_minirust_ub_locus m thin mutbl elemSz elemAlign freeze len hAddr hLen hOverflow
+
+/- `DIV-MR-RAW-SLICE-SIZE-OF-VAL-ISIZE-MAX`. -/
+example :
+    (∃ tr u, Reaches
+      (mirTree u32SliceOverflowMir (initMachineState u32SliceOverflowMir [.scalar ⟨0, 4⟩])) tr u ∧
+      FaultNow u) ∧
+    computeSize wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩)
+        (some (.ElementCount (Int.ofNat u32SliceOverflowLen))) = .ok ⟨2 ^ 63⟩ ∧
+    computeAlign wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩)
+        (some (.ElementCount (Int.ofNat u32SliceOverflowLen))) = .ok ⟨4⟩ ∧
+    checkPtr overflowingU32SlicePtr (.Raw .ElementCount) (some wideRawPartsMInit) = .ok () ∧
+    checkPtr overflowingU32SlicePtr (sliceRefPtrType .not ⟨4⟩ ⟨4⟩) (some wideRawPartsMInit) =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") ∧
+    evalRvalue [.uninit, .init (annealWideScalarPtrVal 4 0 8)]
+        (.unaryOp .ptrMetadata (.copy (local_ 1))) emptyMemory
+        [u32Decl, rawConstSliceU32Decl] emptyLayoutTable =
+      .ok (.scalar ⟨0, 8⟩) [.uninit, .init (annealWideScalarPtrVal 4 0 8)] emptyMemory ∧
+    PointerMetaKind.encode_as_value .ElementCount danglingEmptyU32SlicePtr.metadata =
+      .ok (.Int 0) ∧
+    evalRvalue [.uninit, .init (annealWideScalarPtrVal 4 0 8)]
+        (.cast .ptrToPtr (.copy (local_ 1)) rawConstUnitTy) emptyMemory
+        [u32Decl, rawConstSliceU32Decl] emptyLayoutTable =
+      .ok (.scalar ⟨4, 8⟩) [.uninit, .init (annealWideScalarPtrVal 4 0 8)] emptyMemory ∧
+    evalUnOp .GetThinPointer (Value.Ptr danglingEmptyU32SlicePtr, .Ptr (.Raw .ElementCount)) =
+      .ok (Value.Ptr (ThinPointer.widen { addr := 4, provenance := none } none),
+        .Ptr (.Raw .None)) :=
+  div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total
+
+/- `DIV-MR-RAW-PARENT-WRITE-SB-VS-TB` plus the `Mach` / `MachTB` metadata agreement. -/
+example :
+    (∃ tr u, Reaches (mirTree wideSliceDisabledDerefUbMir wideSliceDisabledDerefUbS0) tr u ∧
+      FaultNow u) ∧
+    (Interp.steps 12 wideSliceRawParentWriteMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 1 }, [1]) ∧
+    (Interp.stepsTB 12 wideSliceRawParentWriteTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 1 ∧
+    (Interp.steps 13 wideSliceDisabledDerefUbMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 1 }, [1]) ∧
+    stopAfterTB wideSliceDisabledDerefUbTBInit 12 =
+      some (.ub "Tree Borrows: local read of Disabled reference") ∧
+    (∃ mem, ReachesRet
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) []
+      (.normal (.scalar ⟨4, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) ∧
+    (Interp.steps 14 wideSliceMetadataAfterParentWriteMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 4 }, [1]) ∧
+    (Interp.stepsTB 14 wideSliceMetadataAfterParentWriteTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 4 :=
+  wideSliceParentWrite_aliasingDivergence_and_metadata_three_way
 
 end WideSliceDstStatementPins
 

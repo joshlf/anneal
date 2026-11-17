@@ -42,9 +42,21 @@ unsized DST pointer-metadata operations:
 3. **Symbolic Lockstep Correspondence (`core::intrinsics::size_of_val` & `align_of_val`)**:
    - Anneal's `evalSliceSizeOfVal elemSz ⟨len, 8⟩` (`Nat.blt (len * elemSz) (signedHalfModulus 8)`)
      and `evalNonSelectIntrinsicCall` (`.sizeOfVal` / `.alignOfVal`) match MiniRust's
-     `LayoutStrategy.compute_size_and_align` + `x86_64.valid_size` (`inBounds size.bytes .Signed
-     x86_64.PTR_SIZE`, i.e. `len * elemSz < 2^63 = isize::MAX + 1`) across `[T]`, `str`
-     (`elemSz = 1, align = 1`), empty slices (`len = 0`), and ZST slices (`elemSz = 0`).
+     `LayoutStrategy.compute_size_and_align` (`Machine::compute_size` / `compute_align`) on every
+     in-bounds length across `[T]`, `str` (`elemSz = 1, align = 1`), empty slices (`len = 0`), and
+     ZST slices (`elemSz = 0`).
+   - **Honest UB locus (§6)**: MiniRust's `UnOp::ComputeSize` / `ComputeAlign` are *total* (no
+     `isize::MAX` check, `computeSize_computeAlign_slice_total`); MiniRust's `isize::MAX` bound
+     (`x86_64.valid_size`, `inBounds size .Signed x86_64.PTR_SIZE`) is enforced only by
+     `check_ptr` on *safe* pointers (`&[T]` / `&mut [T]` / `&str`). Anneal's `.ub` at
+     `len * elemSz ≥ 2^63` therefore agrees with MiniRust for references
+     (`sliceSizeOverflow_minirust_ub_locus`) and is strictly more restrictive (fail-closed, like
+     Miri's `InvalidMeta(SliceTooBig)`) for raw `*const [T]` pointers
+     (`div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total`). The executable Lean
+     `MiniRustSpec.Interp` does not implement `GetMetadata` / `ComputeSize` / `ComputeAlign`
+     (`minirust_interp_metadata_unops_unsupported`), so the MiniRust side of those operations is
+     stated against the spec functions they denote (`PointerMetaKind.encode_as_value`,
+     `computeSize`, `computeAlign`) or lowered via `Transmute` to `mrWidePairTupleTy`.
 4. **Symbolic & Concrete `slice::from_raw_parts(_mut)` (`&*p` / `&mut *p`), `Rvalue.len (*s)`,
    Checked Slice Indexing `(*s)[i]`, and Tree Borrows `Frozen` / `Unique` / `Disabled` UB**:
    - Reborrowing `*wide_raw_ptr` to `&[T]` / `&mut [T]`, reading `Rvalue.len (*s)` and `(*s)[i]`,
@@ -55,6 +67,12 @@ unsized DST pointer-metadata operations:
      Anneal, `Mach`, and `MachTB`, including the exact `isize::MAX` (`len = 2^61 - 1` vs.
      `len = 2^61` for `[u32]`) boundary and the documented Stage-1 `Trusted` fail-closed
      provenance-free `.scalar`-address `size_of_val` divergence on empty slices (`len = 0`).
+   - **Aliasing-model divergence (§6)**: on the *faithful* MiniRust translation of the
+     raw-pointer parent-write program (`&raw mut _2[0]` + `slice_from_raw_parts_mut`, direct
+     write to `_2`, read `(*_4)[0]`), Anneal's Stacked-Borrows-style borrow tracker faults while
+     both `Mach` and `MachTB` return `1` (Tree Borrows raw pointers inherit the parent tag, and
+     `BasicMemory` has no aliasing model); Tree Borrows `Disabled` UB is only reachable through a
+     retagged `&mut` reference (`wideSliceParentWrite_aliasingDivergence_and_metadata_three_way`).
 -/
 
 namespace MiniRustSpec.Correspondence.WideSliceDst
@@ -142,15 +160,6 @@ def slicePointeeInfo (elemSize : LibSpecr.Size) (elemAlign : LibSpecr.Align)
 def sliceRefPtrType (mutbl : MirAst.Mutability) (elemSize : LibSpecr.Size)
     (elemAlign : LibSpecr.Align) (freeze : Bool := true) : Gen.PtrType :=
   .Ref (translateMutbl mutbl) (slicePointeeInfo elemSize elemAlign freeze)
-
-/-- Value-level correspondence between an Anneal 64-bit wide slice pointer `annealVal` and a
-MiniRust wide slice pointer `mrVal` with thin pointer `thin` and element count `len`. -/
-def WideSlicePtrRel (p : ProvenancePtr) (len : Nat) (thin : Ptr)
-    (annealVal : MirSemantics.Value) (mrVal : Val) : Prop :=
-  annealVal = annealWidePtrVal p len 8 ∧
-  mrVal = mrWidePtrVal thin (Int.ofNat len) ∧
-  0 ≤ thin.addr ∧ thin.addr < 2 ^ 64 ∧
-  len < scalarModulus 8
 
 /-- Both raw wide slice pointers (`PtrType.Raw .ElementCount`) and safe slice references
 (`sliceRefPtrType mutbl elemSize elemAlign freeze`) have `meta_kind = .ElementCount` and expand to
@@ -494,15 +503,20 @@ For any slice element byte size `elemSz`, alignment `elemAlign`, and element cou
    (some (.ElementCount (Int.ofNat len)))` returns `.ok (⟨len * elemSz⟩, ⟨elemAlign⟩)`.
 2. MiniRust's `x86_64.valid_size ⟨len * elemSz⟩` (`inBounds (len * elemSz) .Signed x86_64.PTR_SIZE`,
    checking `len * elemSz ≤ isize::MAX = 2^63 - 1`) equals `decide (len * elemSz < signedHalfModulus 8)`
-   (`2^63`) — matching the boolean condition of Anneal's `evalSliceSizeOfVal elemSz ⟨len, 8⟩`!
+   (`2^63`) — matching the boolean condition of Anneal's `evalSliceSizeOfVal elemSz ⟨len, 8⟩`.
+   NOTE: MiniRust evaluates this bound only in `check_ptr` on *safe* pointers (`&[T]`) and in
+   allocation; its `ComputeSize` / `ComputeAlign` (`computeSize` / `computeAlign`) are total and
+   never consult it (`computeSize_computeAlign_slice_total`).
 3. **Normal agreement (`len * elemSz < signedHalfModulus 8`)**:
    `x86_64.valid_size ⟨len * elemSz⟩ = true`, `evalSliceSizeOfVal elemSz ⟨len, 8⟩ = some ⟨len * elemSz, 8⟩`,
    Anneal's `evalNonSelectIntrinsicCall .sizeOfVal` writes `.scalar ⟨len * elemSz, 8⟩`, and
    Anneal's `evalNonSelectIntrinsicCall .alignOfVal` writes `.scalar ⟨elemAlign, 8⟩`.
-4. **Overflow UB agreement (`signedHalfModulus 8 ≤ len * elemSz`)**:
+4. **Overflow (`signedHalfModulus 8 ≤ len * elemSz`)**:
    `x86_64.valid_size ⟨len * elemSz⟩ = false`, `evalSliceSizeOfVal elemSz ⟨len, 8⟩ = none`, and
    BOTH Anneal's `evalNonSelectIntrinsicCall .sizeOfVal` and `evalNonSelectIntrinsicCall .alignOfVal`
-   fault with `MirStepNode.fail .ub`! -/
+   fault with `MirStepNode.fail .ub`. MiniRust raises the matching UB only when the wide pointer is
+   (or is retagged as) a safe reference (`sliceSizeOverflow_minirust_ub_locus`); for raw pointers
+   Anneal is strictly more restrictive (`div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total`). -/
 theorem sizeOfVal_and_alignOfVal_slice_lockstep
     (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
     (bodyLayouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
@@ -1073,14 +1087,20 @@ def arrU32_4PointeeInfo : Gen.PointeeInfo :=
     unpin := true }
 
 /-- **Witness 3 (`wideSliceTreeBorrowsDisabledVsMetadataOk_three_way`)**:
-Tree Borrows `Disabled` UB on dereferencing a wide slice reference after a conflicting parent write,
+Borrow-invalidation UB on dereferencing a wide slice pointer after a conflicting parent write,
 contrasted with `UnOp.ptrMetadata` succeeding without dereferencing:
-1. `_3 = &mut _2` (or raw slice pointer `_4` over `_2 : [u32; 4]`),
-2. Overwriting `_2` directly disables the slice borrow tag,
-3. Dereferencing `(*_4)[0]` faults with UB in Anneal and
-   `some (.ub "Tree Borrows: local read of Disabled reference")` in `MachTB`,
-4. Whereas extracting `UnOp.ptrMetadata(_4)` after the parent write (`wideSliceMetadataAfterParentWriteMir`)
-   succeeds and returns `4` across Anneal, `Mach`, and `MachTB`! -/
+1. Anneal (`wideSliceDisabledDerefUbMir`): `_3 = &raw mut _2[0]`, `_4 = slice_from_raw_parts_mut(_3, 4)`,
+   direct write `_2 = [1, 2, 3, 4]` (disables `_4`'s borrow tag), then `(*_4)[0]` faults with UB.
+2. MiniRust `MachTB` (`wideSliceDisabledDerefUbFn`) runs a *different*, reference-based program:
+   `_3 = &mut _2` (retagged `Reserved`), `_4 = transmute((_3 as *mut (), 4)) : &mut [u32]`, an
+   activating write `(*_4)[0] = 77` (`Reserved -> Unique`), the parent write (`Foreign Write ->
+   Disabled`), then the read faults with `"Tree Borrows: local read of Disabled reference"`.
+   The *faithful* raw-pointer translation of the Anneal program does NOT fault in `MachTB` (nor in
+   `Mach`); that aliasing-model divergence, `Mach`'s behaviour on this program, and the
+   `Mach` / `MachTB` executions of the metadata companion are witnessed by
+   `wideSliceParentWrite_aliasingDivergence_and_metadata_three_way` (§6).
+3. Extracting `UnOp.ptrMetadata(_4)` after the parent write (`wideSliceMetadataAfterParentWriteMir`)
+   succeeds and returns `4` in Anneal (MiniRust `Mach` / `MachTB` agreement: §6). -/
 def wideSliceDisabledDerefUbMir : CapturedMir :=
   ptrBody "witness::wide_slice_disabled_deref_ub"
     [u32Decl, u32Decl, arrU32_4Decl, ptrMutU32Decl, rawMutSliceU32Decl, usizeMirDecl]
@@ -1185,7 +1205,9 @@ theorem wideSliceTreeBorrowsDisabledVsMetadataOk_three_way :
 
 /-- **Witness 4 (`wideSliceSizeAndAlignOfVal_u32_str_empty_zst_witnesses`)**:
 Concrete ground-truth agreement between Anneal (`stepMirFn` / `evalNonSelectIntrinsicCall`) and
-MiniRust (`LayoutStrategy.compute_size_and_align` / `x86_64.valid_size`) on:
+MiniRust's `Machine::compute_size` / `compute_align` (`computeSize` / `computeAlign`, the spec
+functions behind `UnOp::ComputeSize` / `ComputeAlign`, which the executable `Interp` leaves
+`unsupported` — see `minirust_interp_metadata_unops_unsupported`) on:
 1. `[u32]` (`len = 4`, `elemSz = 4`, `elemAlign = 4` $\mapsto$ `size = 16, align = 4`),
 2. `str` (`len = 5` $\mapsto$ `size = 5, align = 1`),
 3. empty `[u32]` (`len = 0` $\mapsto$ `size = 0, align = 4`), and
@@ -1434,17 +1456,21 @@ set_option maxHeartbeats 800000 in
    - At `len = 2^61` (`len * 4 = 2^63 = signedHalfModulus 8`), Anneal's
      `wideSliceSizeAlignMir (.uint .u32) (2^61)` faults with UB (`FaultNow`), and MiniRust's
      `x86_64.valid_size ⟨2^61 * 4⟩ = false` and `checkPtr` on `&[u32]` with `len = 2^61` returns
-     `.error (.ub "Value::Ptr: total size exeeds isize::MAX")`!
+     `.error (.ub "Value::Ptr: total size exeeds isize::MAX")` (MiniRust's only `isize::MAX` check;
+     on a raw `*const [u32]` MiniRust is total — see
+     `div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total`).
 2. **Provenance-free empty slice (`ptr::slice_from_raw_parts(4 as *const u32, 0)`)**:
-   - `UnOp.ptrMetadata` on `annealWideScalarPtrVal 4 0 8` and MiniRust `checkPtr` on `&[u32]` with
-     `addr = 4, provenance = none, len = 0` (`size = 0`) BOTH succeed without UB!
+   - MiniRust `checkPtr` on `&[u32]` with `addr = 4, provenance = none, len = 0` (`size = 0`)
+     succeeds without UB (the matching Anneal / MiniRust `ptr::metadata` agreement on this
+     provenance-free pointer is `div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total`).
    - **Documented Stage-1 `Trusted` fail-closed divergence**: while MiniRust's `computeSize` and
      `checkPtr` on `&[u32]` (`len = 0`) accept `provenance = none` (`size = 0`), Stage-1 `Trusted`
      (`evalNonSelectIntrinsicCall`) requires a provenance-carrying `.ptr p 8` data pointer for
      `size_of_val` / `align_of_val` and fails closed with `MirStepNode.fail .ub` on
      `annealWideScalarPtrVal 4 0 8`. -/
 theorem wideSliceIsizeMaxBoundary_and_scalarAddrDivergence_canaries :
-    -- (1) `len = 2^61 - 1` succeeds; `len = 2^61` faults `.ub` in both Anneal and MiniRust
+    -- (1) `len = 2^61 - 1` succeeds; `len = 2^61` faults `.ub` in Anneal and in MiniRust's
+    -- `&[u32]` validity check (`checkPtr`)
     evalSliceSizeOfVal 4 ⟨u32SliceMaxOkLen, 8⟩ = some ⟨u32SliceMaxOkLen * 4, 8⟩ ∧
     x86_64.valid_size ⟨u32SliceMaxOkLen * 4⟩ = true ∧
     evalSliceSizeOfVal 4 ⟨u32SliceOverflowLen, 8⟩ = none ∧
@@ -1469,5 +1495,316 @@ theorem wideSliceIsizeMaxBoundary_and_scalarAddrDivergence_canaries :
     checkPtr_sliceRef_empty_ok { addr := 4, provenance := none } .not 4 4 true
       (by decide) (by decide) (by decide),
     rfl⟩
+
+/-! ## 6. Honest MiniRust Fragment Boundaries & Divergence Canaries
+
+The executable Lean `MiniRustSpec.Interp` implements `UnOp::{Int, Cast, GetThinPointer}` only, so
+`UnOp::GetMetadata`, `UnOp::ComputeSize`, and `UnOp::ComputeAlign` — the MiniRust lowering of
+`ptr::metadata`, `size_of_val`, and `align_of_val` — are `unsupported` there. The MiniRust side of
+§2–§3 is therefore stated against the spec functions those operators denote
+(`PointerMetaKind.encode_as_value`, `Machine::compute_size` / `compute_align`), and this section
+pins down exactly where MiniRust's `isize::MAX` UB lives (only `check_ptr` on safe pointers), plus
+the aliasing-model divergence on the faithful raw-pointer translation of Witness 3. -/
+
+/-- `LayoutStrategy::compute_size_and_align` on a slice layout is total: for every vtable lookup,
+element size, alignment, and element count, it returns `(len * elemSz, elemAlign)` — with NO
+`isize::MAX` (`x86_64.valid_size`) check. -/
+theorem compute_size_and_align_slice_eq (lookup : Ptr → Interp VTable)
+    (elemSz elemAlign len : Nat) :
+    LayoutStrategy.compute_size_and_align lookup (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+        (some (.ElementCount (Int.ofNat len))) =
+      .ok (⟨len * elemSz⟩, ⟨elemAlign⟩) := by
+  have hProdNonneg : (0 : Int) ≤ Int.ofNat len * (elemSz : Int) :=
+    Int.mul_nonneg (Int.natCast_nonneg len) (Int.natCast_nonneg elemSz)
+  have hToNat : (Int.ofNat len * (elemSz : Int)).toNat = len * elemSz := rfl
+  unfold LayoutStrategy.compute_size_and_align
+  dsimp only
+  rw [ite_eq_left_iff.mpr (fun h => absurd hProdNonneg h), hToNat]
+  rfl
+
+/-- MiniRust's `x86_64::valid_size` on a natural byte count is exactly Anneal's
+`n < signedHalfModulus 8` (`2^63 = isize::MAX + 1`) bound. -/
+theorem x86_64_valid_size_nat_eq (n : Nat) :
+    x86_64.valid_size ⟨n⟩ = decide (n < signedHalfModulus 8) := by
+  have hHalf : (2 : Int) ^ (8 * x86_64.PTR_SIZE.bytes - 1) =
+      ((signedHalfModulus 8 : Nat) : Int) := by
+    decide
+  unfold x86_64.valid_size inBounds Size.bits
+  rw [hHalf]
+  have h1 : decide (-((signedHalfModulus 8 : Nat) : Int) ≤ ((n : Nat) : Int)) = true :=
+    decide_eq_true (Int.le_trans (by decide : -((signedHalfModulus 8 : Nat) : Int) ≤ 0)
+      (Int.natCast_nonneg n))
+  have h2 : decide (((n : Nat) : Int) < ((signedHalfModulus 8 : Nat) : Int)) =
+      decide (n < signedHalfModulus 8) := by
+    by_cases h : n < signedHalfModulus 8
+    · rw [decide_eq_true h]
+      exact decide_eq_true (by omega)
+    · rw [decide_eq_false h]
+      exact decide_eq_false (by omega)
+  rw [h1, h2, Bool.true_and]
+
+/-- **MiniRust `Machine::compute_size` / `compute_align` are total on slices
+(`computeSize_computeAlign_slice_total`)**: for every machine and every element count — including
+counts whose byte size exceeds `isize::MAX` — MiniRust's `UnOp::ComputeSize` / `ComputeAlign`
+semantics return `len * elemSz` / `elemAlign` without raising UB. -/
+theorem computeSize_computeAlign_slice_total (m : Mach) (elemSz elemAlign len : Nat) :
+    computeSize m (.Slice ⟨elemSz⟩ ⟨elemAlign⟩) (some (.ElementCount (Int.ofNat len))) =
+      .ok ⟨len * elemSz⟩ ∧
+    computeAlign m (.Slice ⟨elemSz⟩ ⟨elemAlign⟩) (some (.ElementCount (Int.ofNat len))) =
+      .ok ⟨elemAlign⟩ := by
+  refine ⟨?_, ?_⟩
+  · unfold computeSize
+    rw [compute_size_and_align_slice_eq]
+    rfl
+  · unfold computeAlign
+    rw [compute_size_and_align_slice_eq]
+    rfl
+
+/-- MiniRust's `check_ptr` accepts every in-bounds raw wide slice pointer (`*const [T]` /
+`*mut [T]` / `*const str`) whose element count is a valid `usize`, regardless of the pointee's
+total byte size and of provenance: raw pointers carry no dereferenceability or size obligation. -/
+theorem checkPtr_rawSlice_ok (thin : Ptr) (len : Nat) (m : Option Mach)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hLen : len < scalarModulus 8) :
+    checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))) (.Raw .ElementCount)
+        m =
+      .ok () := by
+  have hAddrOk :
+      ensureElseUb (inBounds thin.addr .Unsigned x86_64.PTR_SIZE)
+        "Value::Ptr: pointer out-of-bounds" = Except.ok () := by
+    unfold ensureElseUb; rw [hAddr]; rfl
+  have hMeta :
+      checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount = Except.ok () :=
+    (checkPtrMetadata_elementCount_iff_anneal_usize len).1.mpr hLen
+  simp only [checkPtr, ThinPointer.widen, PtrType.meta_kind, PtrType.safe_pointee, hAddrOk, hMeta]
+  rfl
+
+/-- **Where MiniRust's `size_of_val` `isize::MAX` UB lives (`sliceSizeOverflow_minirust_ub_locus`)**:
+whenever `signedHalfModulus 8 ≤ len * elemSz` (the exact condition under which Anneal's
+`size_of_val` / `align_of_val` fault, `sizeOfVal_and_alignOfVal_slice_lockstep`):
+1. MiniRust's `check_ptr` on the safe reference `&[T]` / `&mut [T]` faults with
+   `"Value::Ptr: total size exeeds isize::MAX"` — agreeing with Anneal's `.ub`;
+2. yet `check_ptr` on the raw pointer `*const [T]` succeeds, and
+3. MiniRust's `compute_size` / `compute_align` still return `len * elemSz` / `elemAlign`.
+So for raw wide pointers Anneal's fault is strictly stricter than MiniRust (fail-closed, and the
+same verdict as vendored Miri's `InvalidMeta(SliceTooBig)` in `LeanMiriSpec`). -/
+theorem sliceSizeOverflow_minirust_ub_locus (m : Mach) (thin : Ptr) (mutbl : MirAst.Mutability)
+    (elemSz elemAlign : Nat) (freeze : Bool) (len : Nat)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hLen : len < scalarModulus 8)
+    (hOverflow : signedHalfModulus 8 ≤ len * elemSz) :
+    checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len))))
+        (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) (some m) =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") ∧
+    checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))) (.Raw .ElementCount)
+        (some m) = .ok () ∧
+    computeSize m (.Slice ⟨elemSz⟩ ⟨elemAlign⟩) (some (.ElementCount (Int.ofNat len))) =
+      .ok ⟨len * elemSz⟩ ∧
+    computeAlign m (.Slice ⟨elemSz⟩ ⟨elemAlign⟩) (some (.ElementCount (Int.ofNat len))) =
+      .ok ⟨elemAlign⟩ := by
+  have hValid : x86_64.valid_size ⟨len * elemSz⟩ = false := by
+    rw [x86_64_valid_size_nat_eq]
+    exact decide_eq_false (Nat.not_lt.mpr hOverflow)
+  exact ⟨checkPtr_sliceRef_overflow_ub thin mutbl elemSz elemAlign freeze len (some m) hAddr hLen
+      hValid,
+    checkPtr_rawSlice_ok thin len (some m) hAddr hLen,
+    computeSize_computeAlign_slice_total m elemSz elemAlign len⟩
+
+/-- **Fragment-boundary canary (`minirust_interp_metadata_unops_unsupported`)**: the executable
+Lean MiniRust interpreter (`evalUnOp` on `BasicMemory`, `evalUnOpM` on `TreeBorrowsMemory`) does
+not implement `UnOp::GetMetadata`, `UnOp::ComputeSize`, or `UnOp::ComputeAlign`. This is why the
+witnesses lower `ptr::metadata` via `Transmute` to `mrWidePairTupleTy` + `.Field 1` and state
+`size_of_val` / `align_of_val` against `computeSize` / `computeAlign`; the canary breaks (and
+forces those statements to be revisited) as soon as upstream adds executable support. -/
+theorem minirust_interp_metadata_unops_unsupported (sty ty : Gen.Type) (v : Val)
+    (m : Option Mach) (vTB : Gen.Value TBM) (mTB : Option MachTB) :
+    evalUnOp .GetMetadata (v, ty) m =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
+    evalUnOp (.ComputeSize sty) (v, ty) m =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
+    evalUnOp (.ComputeAlign sty) (v, ty) m =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
+    evalUnOpM (M := TBM) .GetMetadata (vTB, ty) mTB =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
+    evalUnOpM (M := TBM) (.ComputeSize sty) (vTB, ty) mTB =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
+    evalUnOpM (M := TBM) (.ComputeAlign sty) (vTB, ty) mTB =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+set_option maxHeartbeats 800000 in
+/-- **Divergence canary `DIV-MR-RAW-SLICE-SIZE-OF-VAL-ISIZE-MAX`
+(`div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total`)**:
+1. At `len = 2^61` on `[u32]` (`len * 4 = 2^63`), Anneal's `size_of_val::<[u32]>` program faults
+   with UB, while MiniRust's `compute_size` returns `2^63`, `compute_align` returns `4`, and
+   `check_ptr` accepts the raw `*const [u32]` — MiniRust raises the `isize::MAX` UB only for the
+   safe reference `&[u32]`. Anneal is fail-closed (stricter) on raw wide pointers.
+2. On the provenance-free empty slice `ptr::slice_from_raw_parts(4 as *const u32, 0)`, Anneal's
+   `UnOp.ptrMetadata` / wide-to-thin `CastKind.ptrToPtr` and MiniRust's metadata encoding /
+   `UnOp::GetThinPointer` agree (`0` and address `4`) without touching memory. -/
+theorem div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total :
+    (∃ tr u, Reaches
+      (mirTree u32SliceOverflowMir (initMachineState u32SliceOverflowMir [.scalar ⟨0, 4⟩])) tr u ∧
+      FaultNow u) ∧
+    computeSize wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩)
+        (some (.ElementCount (Int.ofNat u32SliceOverflowLen))) = .ok ⟨2 ^ 63⟩ ∧
+    computeAlign wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩)
+        (some (.ElementCount (Int.ofNat u32SliceOverflowLen))) = .ok ⟨4⟩ ∧
+    checkPtr overflowingU32SlicePtr (.Raw .ElementCount) (some wideRawPartsMInit) = .ok () ∧
+    checkPtr overflowingU32SlicePtr (sliceRefPtrType .not ⟨4⟩ ⟨4⟩) (some wideRawPartsMInit) =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") ∧
+    evalRvalue [.uninit, .init (annealWideScalarPtrVal 4 0 8)]
+        (.unaryOp .ptrMetadata (.copy (local_ 1))) emptyMemory
+        [u32Decl, rawConstSliceU32Decl] emptyLayoutTable =
+      .ok (.scalar ⟨0, 8⟩) [.uninit, .init (annealWideScalarPtrVal 4 0 8)] emptyMemory ∧
+    PointerMetaKind.encode_as_value .ElementCount danglingEmptyU32SlicePtr.metadata =
+      .ok (.Int 0) ∧
+    evalRvalue [.uninit, .init (annealWideScalarPtrVal 4 0 8)]
+        (.cast .ptrToPtr (.copy (local_ 1)) rawConstUnitTy) emptyMemory
+        [u32Decl, rawConstSliceU32Decl] emptyLayoutTable =
+      .ok (.scalar ⟨4, 8⟩) [.uninit, .init (annealWideScalarPtrVal 4 0 8)] emptyMemory ∧
+    evalUnOp .GetThinPointer (Value.Ptr danglingEmptyU32SlicePtr, .Ptr (.Raw .ElementCount)) =
+      .ok (Value.Ptr (ThinPointer.widen { addr := 4, provenance := none } none),
+        .Ptr (.Raw .None)) := by
+  refine ⟨faultsA_sound u32SliceOverflowMir 12 _ (by decide +kernel), rfl, rfl,
+    checkPtr_rawSlice_ok _ _ _ (by decide) (by decide),
+    (sliceSizeOverflow_minirust_ub_locus wideRawPartsMInit { addr := 256, provenance := some (⟨1⟩, ()) }
+      .not 4 4 true u32SliceOverflowLen (by decide) (by decide) (by decide)).1,
+    rfl, rfl, rfl, rfl⟩
+
+/-- Faithful MiniRust translation of `wideSliceDisabledDerefUbMir`: a raw element pointer
+`_3 = &raw mut _2` (no retag), a raw wide pointer `_4 = transmute((_3, 4)) : *mut [u32]`, the
+direct parent write `_2 = [1, 2, 3, 4]`, and the read `_0 = (*_4)[0]`. -/
+def wideSliceRawParentWriteFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, .Array (.Int u32) 4),
+    (localName 3, .Ptr (.Raw .None)),
+    (localName 4, .Ptr (.Raw .ElementCount)),
+    (localName 5, .Int IntType.usize_ty)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .StorageLive (localName 4), .StorageLive (localName 5),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 10) (.Int u32), .Constant (.Int 20) (.Int u32),
+                 .Constant (.Int 30) (.Int u32), .Constant (.Int 40) (.Int u32)]
+          (.Array (.Int u32) 4)),
+      .Assign (.Local (localName 3)) (.AddrOf (.Local (localName 2)) (.Raw .None)),
+      .Assign (.Local (localName 4))
+        (.UnOp (.Cast (.Transmute (.Ptr (.Raw .ElementCount))))
+          (.Tuple [.Load (.Local (localName 3)), .Constant (.Int 4) (.Int IntType.usize_ty)]
+            mrWidePairTupleTy)),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 1) (.Int u32), .Constant (.Int 2) (.Int u32),
+                 .Constant (.Int 3) (.Int u32), .Constant (.Int 4) (.Int u32)]
+          (.Array (.Int u32) 4)),
+      .Assign (.Local (localName 5)) (.Constant (.Int 0) (.Int IntType.usize_ty)),
+      .Assign (.Local (localName 0))
+        (.Load (.Index (.Deref (.Load (.Local (localName 4))) (.Slice (.Int u32)))
+          (.Load (.Local (localName 5)))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+def wideSliceRawParentWriteMInit : Mach :=
+  machine wideSliceDisabledDerefUbMir wideSliceRawParentWriteFn
+    wideSliceDisabledDerefUbS0.frame.locals wideSliceRawParentWriteFn.start
+def wideSliceRawParentWriteTBInit : MachTB := liftMachToTB wideSliceRawParentWriteMInit
+
+/-- MiniRust translation of `wideSliceMetadataAfterParentWriteMir`, lowering
+`_5 = PtrMetadata(_4)` (no executable `UnOp::GetMetadata`) to `_6 = transmute(_4) :
+mrWidePairTupleTy; _5 = _6.1`. -/
+def wideSliceMetadataAfterParentWriteFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, .Array (.Int u32) 4),
+    (localName 3, .Ptr (.Raw .None)),
+    (localName 4, .Ptr (.Raw .ElementCount)),
+    (localName 5, .Int IntType.usize_ty),
+    (localName 6, mrWidePairTupleTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .StorageLive (localName 4), .StorageLive (localName 5), .StorageLive (localName 6),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 10) (.Int u32), .Constant (.Int 20) (.Int u32),
+                 .Constant (.Int 30) (.Int u32), .Constant (.Int 40) (.Int u32)]
+          (.Array (.Int u32) 4)),
+      .Assign (.Local (localName 3)) (.AddrOf (.Local (localName 2)) (.Raw .None)),
+      .Assign (.Local (localName 4))
+        (.UnOp (.Cast (.Transmute (.Ptr (.Raw .ElementCount))))
+          (.Tuple [.Load (.Local (localName 3)), .Constant (.Int 4) (.Int IntType.usize_ty)]
+            mrWidePairTupleTy)),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 1) (.Int u32), .Constant (.Int 2) (.Int u32),
+                 .Constant (.Int 3) (.Int u32), .Constant (.Int 4) (.Int u32)]
+          (.Array (.Int u32) 4)),
+      .Assign (.Local (localName 6))
+        (.UnOp (.Cast (.Transmute mrWidePairTupleTy)) (.Load (.Local (localName 4)))),
+      .Assign (.Local (localName 5)) (.Load (.Field (.Local (localName 6)) 1)),
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 5))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+def wideSliceMetadataAfterParentWriteMInit : Mach :=
+  machine wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteFn
+    wideSliceMetadataAfterParentWriteS0.frame.locals wideSliceMetadataAfterParentWriteFn.start
+def wideSliceMetadataAfterParentWriteTBInit : MachTB :=
+  liftMachToTB wideSliceMetadataAfterParentWriteMInit
+
+/-- **Aliasing-model divergence + metadata agreement
+(`wideSliceParentWrite_aliasingDivergence_and_metadata_three_way`)**, completing Witness 3:
+1. **Faithful raw-pointer program** (`DIV-MR-RAW-PARENT-WRITE-SB-VS-TB`): Anneal's
+   Stacked-Borrows-style tracker disables `_4`'s borrow on the direct write to `_2` and faults on
+   `(*_4)[0]`, whereas MiniRust returns `1` on BOTH `Mach` (no aliasing model) and `MachTB` (Tree
+   Borrows raw pointers inherit the parent tag, so the parent write does not disable them).
+   Anneal is fail-closed (stricter) here.
+2. **Reference-based program** (`wideSliceDisabledDerefUbFn`): `MachTB` faults with
+   `"Tree Borrows: local read of Disabled reference"` while `Mach` returns `1`.
+3. **Metadata after the parent write**: Anneal, `Mach`, and `MachTB` all return `4` — `ptr::metadata`
+   never dereferences, so the invalidated borrow is irrelevant. -/
+theorem wideSliceParentWrite_aliasingDivergence_and_metadata_three_way :
+    (∃ tr u, Reaches (mirTree wideSliceDisabledDerefUbMir wideSliceDisabledDerefUbS0) tr u ∧
+      FaultNow u) ∧
+    (Interp.steps 12 wideSliceRawParentWriteMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 1 }, [1]) ∧
+    (Interp.stepsTB 12 wideSliceRawParentWriteTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 1 ∧
+    (Interp.steps 13 wideSliceDisabledDerefUbMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 1 }, [1]) ∧
+    stopAfterTB wideSliceDisabledDerefUbTBInit 12 =
+      some (.ub "Tree Borrows: local read of Disabled reference") ∧
+    (∃ mem, ReachesRet
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) []
+      (.normal (.scalar ⟨4, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) ∧
+    (Interp.steps 14 wideSliceMetadataAfterParentWriteMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 4 }, [1]) ∧
+    (Interp.stepsTB 14 wideSliceMetadataAfterParentWriteTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 4 := by
+  refine ⟨faultsA_sound wideSliceDisabledDerefUbMir 30 _ rfl,
+    by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    ⟨_, runA_sound wideSliceMetadataAfterParentWriteMir 30 _ _ _ rfl⟩,
+    runA_noUB wideSliceMetadataAfterParentWriteMir 30 _ _ _ rfl,
+    by decide +kernel, by decide +kernel⟩
 
 end MiniRustSpec.Correspondence.WideSliceDst
