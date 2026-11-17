@@ -28,10 +28,14 @@ sys.dont_write_bytecode = True  # Public self-test imports must not write checko
 TOOLCHAIN = "leanprover/lean4:v4.34.1"
 PARTS = ("olean", "olean.server", "olean.private", "ir.sig", "ir")
 MAX_BYTES = 512 * 1024 * 1024
-CHILD_TIMEOUT_SECS = 180
+# Wall-clock bound of one direct Lean child. The single-threaded (`-j1`) compile of the largest
+# downstream module (`theory/Anneal/PureMirExec.lean`) takes 165-197 s on an 8-vCPU host under
+# load, so 180 s timed out intermittently.
+CHILD_TIMEOUT_SECS = 300
 # `LEAN_NUM_THREADS` for every Lean child. Ambient `LEAN*` variables are stripped, so this
-# validated knob is the only way to set it. Kernel replay is single-threaded; the value sizes
-# the runtime task pool of children without an explicit `-j` (`lean -c`, compiled inspector).
+# validated knob is the only way to set it. Kernel replay is single-threaded (`-j1`); the value
+# is the `-j` of `--fast` compiles and sizes the runtime task pool of children without an
+# explicit `-j` (`lean -c`, compiled inspector).
 AUDIT_LEAN_THREADS_ENV = "ANNEAL_AUDIT_LEAN_THREADS"
 DEFAULT_AUDIT_LEAN_THREADS = 2
 MAX_AUDIT_LEAN_THREADS = 64
@@ -969,8 +973,13 @@ class Checker:
                     "preflight",
                     f"project imports of {module} ({actual_proj}) differ from DOWNSTREAM_TARGETS ({expected_proj})",
                 )
+        # `--fast` compiles downstream modules with the validated audit thread count (default 2)
+        # but without asynchronous elaboration: with `Elab.async=true`, `Anneal.PureMirExec`
+        # intermittently exceeds the shared `-M2048` heap on top of fast-built imports (at `-j4`,
+        # `-j2`, and `-j1` alike), while `Elab.async=false` stays within it.
+        fast_threads = f"-j{self.environment['LEAN_NUM_THREADS']}"
         downstream_flags = (
-            ["-j4", "-M2048", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
+            [fast_threads, "-M2048", "-t0", "-DElab.async=false", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
             if self.fast
             else ["-j1", "-M2048", "-t0", "-DElab.async=false", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
         )
@@ -1060,7 +1069,7 @@ class Checker:
         if self.fast:
             self.freshness()
         trusted_flags = (
-            ["-j4", "-M2048", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false"]
+            [f"-j{self.environment['LEAN_NUM_THREADS']}", "-M2048", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false"]
             if self.fast
             else ["-j1", "-M2048", "-t0", "-DElab.async=false", "-Ddebug.skipKernelTC=false"]
         )

@@ -13541,15 +13541,18 @@ theorem triangle6_verified_rfl :
       diamondInitSymTable (buildTriangleTree 6) = true := by
   decide +kernel
 
-/-- Single-continuation vs. path-splitting shape witness for triangles at `k = 6`: with join hints
-    the evaluator returns **1** path and a `21`-node table; without hints it explores all **64**
-    paths, and since the two sides of a triangle compute different values GVN cannot share them
-    (`129` nodes); with non-pruning hints the merge is rejected (`_2` live vs. dead). -/
+/-- Single-continuation vs. path-splitting shape witness for triangles: with join hints the
+    evaluator returns **1** path and a `21`-node table at `k = 6`; with non-pruning hints the
+    `k = 6` merge is rejected (`_2` live vs. dead). Without hints it explores every path, and
+    since the two sides of a triangle compute different values GVN cannot share them: the
+    split comparison runs at `k = 4` (**16** paths, `33` nodes), because the unhinted `k = 6`
+    evaluation (`64` paths, `129` nodes) exceeds the `-M2048` memory budget of the audit's
+    kernel replay (`trusted/audit/check_trusted.py`). -/
 theorem triangle6_join_vs_split_witness :
     (symEvalCfgGvn (mkTriangleCfg 6) triangleJoinHints 13 0 diamondInitSymState
         diamondInitSymTable).map (fun res => (res.1.length, res.2.nodes.length)) = some (1, 21) ∧
-      (symEvalCfgGvn (mkTriangleCfg 6) noJoinHints 13 0 diamondInitSymState
-        diamondInitSymTable).map (fun res => (res.1.length, res.2.nodes.length)) = some (64, 129) ∧
+      (symEvalCfgGvn (mkTriangleCfg 4) noJoinHints 9 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => (res.1.length, res.2.nodes.length)) = some (16, 33) ∧
       symEvalCfgGvn (mkTriangleCfg 6) triangleNoPruneHints 13 0 diamondInitSymState
         diamondInitSymTable = none := by
   decide +kernel
