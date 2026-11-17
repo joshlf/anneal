@@ -452,9 +452,14 @@ import LeanMiriSpec.Audit
   deinitialization: the patched `lean-miri` interpreter (`deinitMovedPlace`) is the
   unpatched source when the flag is off; with the flag on, moved sources are
   deinitialized without Tree Borrows or race access, call arguments are validated
-  before callee resolution (kani#5172), and Trusted `evalOperand
-  (deinitProjectedMoves := true)` deinitializes moved places (`D1`/`D2`/`D3`/`D5`/`D9`
-  canaries), with a root-move simulation between the two and an axiom audit.
+  before callee resolution (kani#5172), snapshot without retagging and always
+  passed as `FnArg.Copy` (never protected), multi-operand `BinaryOp`s run through
+  the real `evalRvalueIntoPlace` (`D4`: `copy _1 + move _1` succeeds,
+  `move _1 + copy _1` faults), `Cast.castMoving` reads before it deinitializes and
+  deinitializes before it writes, and Trusted `evalOperand
+  (deinitProjectedMoves := true)` deinitializes moved places (`D1`–`D9` canaries,
+  including nested, enum-downcast, thin-pointer subslice and union byte-window
+  moves), with a root-move simulation between the two and an axiom audit.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

@@ -2471,9 +2471,9 @@
     {
       "path": "Miri/Interpreter/Call.lean",
       "upstream_sha256": "4f84e6562232130ab86a9ea057a63e8f1a57c17daef2f91d2bb9ca6251fb0287",
-      "patched_sha256": "3075610db73ba6895978cfb93af7e45fd56901dca2dfd34f20f847d79c5eddde",
+      "patched_sha256": "42f89de2d1f7672d9a7f064f985ad62e36069b86984779844e97bb4a9d175cc0",
       "upstream_git_blob": "1de0bbe80a2620c98cdc9371d7400db9f4a775bd",
-      "patch_reason": "deinitMovedPlace: adds the consumer-side evalCallTerminatorMoving / evalTailCallTerminatorMoving / evalCalleeAndArgsMoving / evalFnCallArgumentMoving (every argument is read and validated into a temporary and every moved source deinitialized without Tree Borrows or race access, all before callee resolution, kani#5172; no argument is passed in place) and CallHooks fields with fail-closed defaults. The source call functions are unchanged."
+      "patch_reason": "deinitMovedPlace: adds the consumer-side evalCallTerminatorMoving / evalTailCallTerminatorMoving / evalCalleeAndArgsMoving / evalFnCallArgumentMoving (every argument is read and validated into a temporary and every moved source deinitialized without Tree Borrows or race access, all before callee resolution, kani#5172; no argument is passed in place; the temporary snapshots and pre-resolution validations run under RetagMode.None so the callee's FnEntry retag stays the only retag of an argument) and CallHooks fields with fail-closed defaults. The source call functions are unchanged; two unused simp arguments (EStateM.pure) of the source zero_entry_immediate/zero_entry_indirect proofs are dropped."
     },
     {
       "path": "Miri/Interpreter/Cast.lean",
@@ -2513,7 +2513,7 @@
     {
       "path": "Miri/Interpreter/MachineHooks.lean",
       "upstream_sha256": "1df4df7ce4fbc696360b4a7ba0bf4bc921c6b91ed3793cb6c234eb826b8dad36",
-      "patched_sha256": "ed1f434a007dae2ea3b052f0a4ec9273492a5b5caf9fb62356a79f7eaad3597c",
+      "patched_sha256": "1a230ff0692fdafc3076c5987b012c7e47d11417d9a3f47f6698d9d81a6fb58f",
       "upstream_git_blob": "673eabdf0fbee9a4ea6b08311973c0b5469cb222",
       "patch_reason": "deinitMovedPlace: consumer-side pending-move latch (PendingMoveDeinitState instance field of MachineState) and its helpers."
     },

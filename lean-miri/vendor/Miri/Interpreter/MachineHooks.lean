@@ -30,12 +30,15 @@ structure BorrowState where
 `pendingMoveDeinit` is armed when `OperandMachine.evalOperand` evaluates
 `Operand.Move` on an indirect (`MemPlace`) place in `deinitMovedPlace` mode, and
 atomically consumed by the corresponding `PlaceMachine.readImmediate`,
-`Place.copyRuntimePlaceNoValidate` or `Cast.cast` for that operand (`Use`,
+`Place.copyRuntimePlaceNoValidate` or `Cast.castMoving` for that operand (`Use`,
 `UnaryOp`, `BinaryOp`, `Cast`, `SwitchInt`, `Assert`, `CopyNonOverlapping`).
 `pendingMoveDeinits` queues `(mplace, isMove)` per indirect operand evaluation so
 multi-operand paths preserve per-operand move-deinit intent across subsequent
-operand evaluations. Call/TailCall arguments use `FnArg.InPlace` and
-`CallHooks.deinitInPlaceArgument` instead.
+operand evaluations. Call/TailCall operands never use the latch
+(`ExecutionCalls.make` disarms it after every call operand evaluation):
+`Call.evalCalleeAndArgsMoving` snapshots every argument into a temporary passed
+as `FnArg.Copy` (never `FnArg.InPlace`) and deinitializes a moved source with
+`CallHooks.deinitInPlaceArgument`.
 
 The latch is a `class` so that `MachineState` can carry it as an
 instance-implicit field: anonymous constructors outside the consumer patch

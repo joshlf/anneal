@@ -186,18 +186,23 @@ def deallocateTempArgs (h : Hooks) (choice : C) (temps : Array (Pointer (Option 
 
 /-- Consumer-side (`deinitMovedPlace`): validate an immediate argument, or copy an
 indirect one into a fresh temporary with the validating `copyToMemory`, so that
-later same-call moves of the same place cannot change the value passed here. -/
+later same-call moves of the same place cannot change the value passed here.
+Both run with retagging disabled (`RetagMode.None`): the temporary is an
+evaluation-order snapshot, not a Rust-level typed copy, so its validation must
+not retag the argument's references (the ambient retag mode between statements
+is `Default`). The callee's `FnEntry` retag in `passArgument` therefore stays the
+only retag of the argument, exactly as in the source call path. -/
 def materializeArgument (h : Hooks) (choice : C) (op : OpTy P) :
     M (FnArg P × Option (Pointer (Option P))) := do
   match op.op with
   | .immediate _ =>
-    h.validateOperandBeforeCall choice op
+    h.withRetagMode choice .None (h.validateOperandBeforeCall choice op)
     return (.Copy op, none)
   | .indirect _ =>
     if !op.layout.layout.isSized then
       throw (.unsupported "deinitMovedPlace: unsized by-value call argument")
     let tmp ← h.allocateStack choice op.layout
-    h.copyToMemory choice op tmp
+    h.withRetagMode choice .None (h.copyToMemory choice op tmp)
     return (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr)
 
 /-- Consumer-side (`deinitMovedPlace`) argument evaluation, returning the
@@ -210,8 +215,10 @@ argument and the temporary allocation that holds it (if materialized).
 * `Move` of an immediate local: the value is validated, then the local slot is
   deinitialized (zero-sized values are preserved); a projected immediate local is
   materialized first and only the moved bytes are deinitialized.
-No argument is passed in place, so no `uninit` is ever written through a
-protected tag. Unsized by-value arguments fail closed. -/
+The temporary copy and the pre-resolution validation run with retagging disabled
+(`RetagMode.None`, see `materializeArgument`). No argument is passed in place, so
+no `uninit` is ever written through a protected tag. Unsized by-value arguments
+fail closed. -/
 def evalFnCallArgumentMoving (h : Hooks) (choice : C) (operand : MIR.Operand)
     (path : OperandPath) : M (FnArg P × Option (Pointer (Option P))) := do
   match operand with
@@ -225,11 +232,11 @@ def evalFnCallArgumentMoving (h : Hooks) (choice : C) (operand : MIR.Operand)
     match op.op with
     | .indirect mplace =>
       let tmp ← h.allocateStack choice op.layout
-      h.copyToMemory choice op tmp
+      h.withRetagMode choice .None (h.copyToMemory choice op tmp)
       h.deinitInPlaceArgument choice ⟨mplace, op.layout⟩
       return (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr)
     | .immediate _ =>
-      h.validateOperandBeforeCall choice op
+      h.withRetagMode choice .None (h.validateOperandBeforeCall choice op)
       if op.layout.layout.isZst then
         pure ()
       else if place.projection.isEmpty then
@@ -768,7 +775,7 @@ def zeroImmediateCore (h : ZeroHooks P S C E Other Extern) (choice : C)
       zeroImmediateCore h choice fnInstance body abi destination cont cached := by
   simp only [initStackFrame,zeroImmediateCore,requires,instanceAbi,features,closure,variadic,
     convention,arguments,ret,count,require,setSpan,bind_assoc,pure_bind]
-  simp [bind,Bind.bind,EStateM.bind,pure,Pure.pure,EStateM.pure,immediate]
+  simp [bind,Bind.bind,EStateM.bind,pure,Pure.pure,immediate]
   rfl
 
 
@@ -810,7 +817,7 @@ def zeroIndirectCore (h : ZeroHooks P S C E Other Extern) (choice : C) (fnInstan
       zeroIndirectCore h choice fnInstance body abi destination memory cont cached := by
   simp only [initStackFrame,zeroIndirectCore,requires,instanceAbi,features,closure,variadic,
     convention,arguments,ret,count,require,setSpan,bind_assoc,pure_bind]
-  simp [bind,Bind.bind,EStateM.bind,pure,Pure.pure,EStateM.pure,indirect]
+  simp [bind,Bind.bind,EStateM.bind,pure,Pure.pure,indirect]
   rfl
 
 end Miri.Interpreter.Call

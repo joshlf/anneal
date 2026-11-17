@@ -25,7 +25,9 @@ true)`).
   the pre-extension `evalOperand`/`evalOperands` (verbatim `Legacy` copies);
   universal decomposition and root-move theorems; `D1`/`D2`/`D3`/`D5`/`D9`
   canaries (root, zero-sized, field, re-initialization, Tree-Borrows-silent
-  `Deref`, element and subslice moves), each with its legacy contrast.
+  `Deref`, element and subslice moves, nested field-then-element, enum downcast,
+  thin-pointer `Deref`+subslice and union byte-window moves), each with its legacy
+  contrast.
 * **Part 2 (`lean-miri`, `deinitMovedPlace = false`).** `Cast.cast` and
   `Call.evalFnCallArgumentAt`/`evalCalleeAndArgs`/`passArgument`/
   `evalCallTerminator`/`evalTailCallTerminator` are the unchanged source (the
@@ -40,16 +42,42 @@ true)`).
   race-silent deinitialization hooks (contrasted with the source write hook,
   which performs a Tree Borrows `.Write`), the read-then-deinit decomposition of
   `PlaceMachine.readImmediate`, operand-latch behavior of
-  `OperandMachine.evalOperand`, step-boundary latch clearing, and concrete runs of
-  the real `Call.evalCalleeAndArgsMoving` showing that a moved immediate argument is
-  deinitialized, that `f(move _1, copy _1)` faults, and that
-  `call unresolved(move _uninit)` faults before callee resolution (kani#5172).
+  `OperandMachine.evalOperand`, step-boundary latch clearing; universal call
+  theorems: every consumer-side argument is an `FnArg.Copy` (one theorem per
+  branch of `Call.evalFnCallArgumentMoving`), on which `passArgument` never runs
+  `protectArgument` (`call_passArgument_copy_protect_irrelevant`), and argument
+  snapshots run under `RetagMode.None` (`call_materializeArgument_indirect_eq`);
+  concrete runs of the real `Call.evalCalleeAndArgsMoving` showing that a moved
+  immediate argument is deinitialized, that `f(move _1, copy _1)` and
+  `(move _1)(copy _1)` fault, and that `call unresolved(move _uninit)` faults
+  before callee resolution (kani#5172); concrete `D4` runs of the real
+  `evalRvalueIntoPlace` (`copy _1 + move _1` succeeds, `move _1 + copy _1` and
+  `move _1 + move _1` fault, for memory-backed, immediate and projected-immediate
+  locals); and the event order of the real `Cast.castMoving` (read, then
+  deinitialize, then write; latch hand-off to transmute and unsizing copies).
 * **Part 4.** A root-move simulation between `LocalAccess.evalOperand`
   (`deinitMovedPlace = true`) and `evalOperand (deinitProjectedMoves := true)`.
 * **Part 5.** An environment audit: no declaration depends on `sorryAx`,
   `Lean.ofReduceBool` or `Lean.trustCompiler`, and the proofs use only `propext`
   and `Quot.sound` (`Classical.choice` reaches statements only through the
   vendored `lean-miri` machine definitions they mention).
+
+## Known limitations
+
+* **Niche-encoded enums (`lean-miri`, `deinitMovedPlace = true`).** Moving an enum
+  payload (`move (_1 as Some).0`) deinitializes the payload bytes, including the
+  bytes that carry a niche-encoded tag (for example the pointer of
+  `Option<Box<T>>`), so the `discriminant(_1)` read that drop elaboration emits
+  after such a partial move faults on valid Rust. The Trusted semantics keeps the
+  variant index outside the payload and its `Rvalue.discriminant` reads with the
+  default `false` (`canary_D2_enum_downcast_discriminant_after_move`), so the two
+  semantics disagree on this program shape; Part 4 relates root moves only.
+* **Error paths (`lean-miri`).** When a later argument of
+  `Call.evalCalleeAndArgsMoving` faults, the snapshots of the earlier arguments are
+  not deallocated and earlier moved arguments stay deinitialized; every such fault
+  is terminal for the machine.
+* **Unsizing (`lean-miri`).** `Cast.castMoving` deinitializes the moved fields of an
+  unsized struct source, not its padding bytes.
 -/
 
 namespace LeanMiriSpec.Correspondence.MoveDeinitEquivTactic
@@ -1201,6 +1229,16 @@ theorem canary_evalOperands_move_then_copy_ub :
     evalOperands d1Locals [.move (pl 1 []), .copy (pl 1 [])] (deinitProjectedMoves := true) =
       .ub := rfl
 
+/-- **`D4` on the Trusted side.** `[copy _1, move _1]` delivers `5` twice and then
+deinitializes `_1` (the copy is read before the move), whereas `[move _1, move _1]`
+faults on the second operand: the operand-list counterpart of the `lean-miri`
+`D4` runs of the real `evalRvalueIntoPlace` (`canary_D4_mem_binaryOp`). -/
+theorem canary_evalOperands_D4_copy_then_move_ok_move_then_move_ub :
+    evalOperands d1Locals [.copy (pl 1 []), .move (pl 1 [])] (deinitProjectedMoves := true) =
+      .ok [sc8 5, sc8 5] [.uninit, .uninit] ∧
+    evalOperands d1Locals [.move (pl 1 []), .move (pl 1 [])] (deinitProjectedMoves := true) =
+      .ub := ⟨rfl, rfl⟩
+
 theorem canary_evalOperands_field_move_then_sibling_ok :
     evalOperands d2Locals [.move (pl 1 [.field 0 u8Ty]), .copy (pl 1 [.field 1 u8Ty])]
       (deinitProjectedMoves := true) = .ok [sc8 2, sc8 3] d2AfterMove := rfl
@@ -1276,6 +1314,182 @@ theorem canary_D9_slice_fat_ptr_subslice_move :
     evalOperand d9SliceFatPtrAfterSubslice (.copy (pl 1 [.constantIndex 3 4 false]))
       d5Borrows (deinitProjectedMoves := true) = .ok (sc8 13) d9SliceFatPtrAfterSubslice :=
   ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-! #### `ep1-A1`: nested, downcast, thin-pointer subslice and union moves -/
+
+/-- `[u8; 3]` field annotation. -/
+def arr3Ty : Ty := { kind := .array (.uint .u8) 3, layoutIdx := 0 }
+
+/-- `_1 : ([u8; 3], u8) = ([1, 2, 3], 4)`. -/
+def dNestLocals : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [.aggregate 0 [sc8 1, sc8 2, sc8 3], sc8 4])]
+
+/-- `_1` after `move _1.0[1]`. -/
+def dNestAfterMove : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [.aggregate 0 [sc8 1, movedUninitValue, sc8 3], sc8 4])]
+
+/-- `_1` after `_1.0[1] = 9`. -/
+def dNestReinit : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [.aggregate 0 [sc8 1, sc8 9, sc8 3], sc8 4])]
+
+/-- **`D2`/`D3` nested field-then-element move `move _1.0[1]`.** Only the moved
+element of the array field is marked; its array neighbours and the sibling field
+stay readable, the enclosing array field and `_1` fault, and writing the element
+back re-initializes the whole local. -/
+theorem canary_D2_nested_field_elem_move :
+    evalOperand dNestLocals (.move (pl 1 [.field 0 arr3Ty, .constantIndex 1 3 false]))
+      (deinitProjectedMoves := true) = .ok (sc8 2) dNestAfterMove ∧
+    evalOperand dNestAfterMove (.copy (pl 1 [.field 0 arr3Ty, .constantIndex 0 3 false]))
+      (deinitProjectedMoves := true) = .ok (sc8 1) dNestAfterMove ∧
+    evalOperand dNestAfterMove (.copy (pl 1 [.field 0 arr3Ty, .constantIndex 2 3 false]))
+      (deinitProjectedMoves := true) = .ok (sc8 3) dNestAfterMove ∧
+    evalOperand dNestAfterMove (.copy (pl 1 [.field 1 u8Ty]))
+      (deinitProjectedMoves := true) = .ok (sc8 4) dNestAfterMove ∧
+    evalOperand dNestAfterMove (.copy (pl 1 [.field 0 arr3Ty, .constantIndex 1 3 false]))
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperand dNestAfterMove (.copy (pl 1 [.field 0 arr3Ty]))
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperand dNestAfterMove (.copy (pl 1 [])) (deinitProjectedMoves := true) = .ub ∧
+    writePlaceValue dNestAfterMove [] (pl 1 [.field 0 arr3Ty, .constantIndex 1 3 false]) (sc8 9) =
+      .ok dNestReinit ∧
+    evalOperand dNestReinit (.copy (pl 1 [])) (deinitProjectedMoves := true) =
+      .ok (.aggregate 0 [.aggregate 0 [sc8 1, sc8 9, sc8 3], sc8 4]) dNestReinit :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `_1 : Option<u8> = Some(5)` (variant `1`). -/
+def dEnumLocals : List LocalSlot := [.uninit, .init (.aggregate 1 [sc8 5])]
+
+/-- `_1` after `move (_1 as Some).0`. -/
+def dEnumAfterMove : List LocalSlot := [.uninit, .init (.aggregate 1 [movedUninitValue])]
+
+/-- **`D2` enum downcast field move `move (_1 as Some).0`.** The payload is marked
+inside the variant (the variant index is kept), so re-reading the payload or the
+whole enum faults, writing the payload re-initializes it, and the legacy
+semantics keeps the payload. A discriminant read through this mode's
+`Operand.copy` of the whole enum also faults (unlike the statement semantics'
+`Rvalue.discriminant`, which reads with the default `false`:
+`canary_D2_enum_downcast_discriminant_after_move`). -/
+theorem canary_D2_enum_downcast_field_move :
+    evalOperand dEnumLocals (.move (pl 1 [.downcast (.some "Some") 1, .field 0 u8Ty]))
+      (deinitProjectedMoves := true) = .ok (sc8 5) dEnumAfterMove ∧
+    evalOperand dEnumAfterMove (.copy (pl 1 [.downcast (.some "Some") 1, .field 0 u8Ty]))
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperand dEnumAfterMove (.copy (pl 1 [])) (deinitProjectedMoves := true) = .ub ∧
+    writePlaceValue dEnumAfterMove [] (pl 1 [.downcast (.some "Some") 1, .field 0 u8Ty]) (sc8 7) =
+      .ok [.uninit, .init (.aggregate 1 [sc8 7])] ∧
+    evalOperand dEnumLocals (.move (pl 1 [.downcast (.some "Some") 1, .field 0 u8Ty])) =
+      .ok (sc8 5) dEnumLocals :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **`discriminant(_1)` after `move (_1 as Some).0`.** Drop elaboration reads the
+discriminant of a partially moved enum (`open_drop_for_multivariant`). The
+statement semantics' `Rvalue.discriminant` reads the place with the default
+`deinitProjectedMoves := false`, so after a consumer-side payload move it still
+returns the kept variant index `1`, exactly as before the move. That read is
+marker-tolerant by design: a `false` read does not detect moved-out markers at
+all, so the plain statement-level `Rvalue.use (copy (_1 as Some).0)` returns the
+marker itself as a value. The statement semantics never creates markers (it never
+passes `true`); a consumer that enables the flag must therefore enable it for
+every operand read except this discriminant read. -/
+theorem canary_D2_enum_downcast_discriminant_after_move :
+    evalRvalue dEnumLocals (.discriminant (pl 1 [])) =
+      .ok (.scalar ⟨1, 8⟩) dEnumLocals emptyMemory ∧
+    evalRvalue dEnumAfterMove (.discriminant (pl 1 [])) =
+      .ok (.scalar ⟨1, 8⟩) dEnumAfterMove emptyMemory ∧
+    evalRvalue dEnumAfterMove (.use (.copy (pl 1 [.downcast (.some "Some") 1, .field 0 u8Ty]))) =
+      .ok movedUninitValue dEnumAfterMove emptyMemory :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- `_1 : [u8; 4] = [10, 11, 12, 13]` and the thin pointer `_2 = &raw mut _1`
+(tag `2`, active). -/
+def dThinLocals : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [sc8 10, sc8 11, sc8 12, sc8 13]),
+    .init (.ptr { allocId := 2, offsetBytes := 0 } 8)]
+
+/-- After `move (*_2)[1..3]`. -/
+def dThinAfter : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [sc8 10, movedUninitValue, movedUninitValue, sc8 13]),
+    .init (.ptr { allocId := 2, offsetBytes := 0 } 8)]
+
+/-- **`D9` thin-pointer `Deref` + subslice move `move (*_2)[1..3]`.** The window
+of the active-frame target `_1` is marked element-wise, keeping the array length
+and the neighbours `_1[0]`/`_1[3]` readable through the pointer. -/
+theorem canary_D9_thin_ptr_deref_subslice_move :
+    evalOperand dThinLocals (.move (pl 2 [.deref, .subslice 1 3 false])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (.aggregate 0 [sc8 11, sc8 12]) dThinAfter ∧
+    evalOperand dThinAfter (.copy (pl 2 [.deref, .constantIndex 0 4 false])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 10) dThinAfter ∧
+    evalOperand dThinAfter (.copy (pl 2 [.deref, .constantIndex 3 4 false])) d5Borrows
+      (deinitProjectedMoves := true) = .ok (sc8 13) dThinAfter ∧
+    evalOperand dThinAfter (.copy (pl 2 [.deref, .constantIndex 1 4 false])) d5Borrows
+      (deinitProjectedMoves := true) = .ub ∧
+    evalOperand dThinAfter (.copy (pl 1 [])) d5Borrows (deinitProjectedMoves := true) = .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `u8` layout of the union canary. -/
+def d3UnionU8Layout : TypeLayout :=
+  { size := { bytes := 1 }, align := { bytes := 1 },
+    backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 }),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+/-- `u16` layout of the union canary. -/
+def d3UnionU16Layout : TypeLayout :=
+  { size := { bytes := 2 }, align := { bytes := 2 },
+    backendRepr := .scalar (.initialized (.int 16 false) { start := 0, end_ := 65535 }),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+/-- `union U { a: u8, b: u16 }`: two bytes, both fields at offset `0`. -/
+def d3UnionULayout : TypeLayout :=
+  { size := { bytes := 2 }, align := { bytes := 2 }, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false, fieldLayouts := [0, 1] }
+
+def d3UnionLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [d3UnionU8Layout, d3UnionU16Layout, d3UnionULayout] }
+
+def d3UnionU8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
+def d3UnionU16Ty : Ty := { kind := .uint .u16, layoutIdx := 1 }
+
+/-- `_0 : u8`, `_1 : U`. -/
+def d3UnionDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := d3UnionU8Ty, debugName := none },
+   { mutability := .mut, ty := { kind := .adt "U" [], layoutIdx := 2 }, debugName := none }]
+
+/-- `_1 = U { b: 0x0302 }` (the value of the `U { b: const 0x0302_u16 }` aggregate). -/
+def d3UnionLocals : List LocalSlot := [.uninit, .init (.aggregate 0 [.unit, .scalar ⟨770, 2⟩])]
+
+/-- `_1` after `move _1.a`: byte `0` uninitialized, byte `1 = 0x03` kept (raw
+overlay). -/
+def d3UnionAfterMoveA : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨0, 0⟩, .scalar ⟨3, 1⟩]])]
+
+/-- `_1` after `_1.a = 9`. -/
+def d3UnionAfterReinit : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [sc8 9, .unit, .aggregate 0 [sc8 9, sc8 3]])]
+
+/-- **`D3` union field move and re-initialization.** Moving `_1.a` (`u8`) out of
+`_1 = U { b: 0x0302 }` delivers the low byte `2` and deinitializes exactly byte
+`0`: re-reading `_1.a` or the overlapping `_1.b` faults, while the whole union
+(which may hold uninitialized bytes) is still readable — its raw uninitialized
+byte is not the moved-out marker. Writing `_1.a = 9` re-initializes byte `0`, so
+`_1.b` reads `0x0309`; the legacy semantics keeps the union intact. -/
+theorem canary_D3_union_field_move_and_reinit :
+    evalOperand d3UnionLocals (.move (pl 1 [.field 0 d3UnionU8Ty])) [] [] d3UnionLayouts []
+      d3UnionDecls [] true = .ok (sc8 2) d3UnionAfterMoveA ∧
+    evalOperand d3UnionAfterMoveA (.copy (pl 1 [.field 0 d3UnionU8Ty])) [] [] d3UnionLayouts []
+      d3UnionDecls [] true = .ub ∧
+    evalOperand d3UnionAfterMoveA (.copy (pl 1 [.field 1 d3UnionU16Ty])) [] [] d3UnionLayouts []
+      d3UnionDecls [] true = .ub ∧
+    evalOperand d3UnionAfterMoveA (.copy (pl 1 [])) [] [] d3UnionLayouts [] d3UnionDecls [] true =
+      .ok (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨0, 0⟩, .scalar ⟨3, 1⟩]])
+        d3UnionAfterMoveA ∧
+    writePlaceValue d3UnionAfterMoveA [] (pl 1 [.field 0 d3UnionU8Ty]) (sc8 9) d3UnionDecls
+      d3UnionLayouts = .ok d3UnionAfterReinit ∧
+    evalOperand d3UnionAfterReinit (.copy (pl 1 [.field 1 d3UnionU16Ty])) [] [] d3UnionLayouts []
+      d3UnionDecls [] true = .ok (.scalar ⟨777, 2⟩) d3UnionAfterReinit ∧
+    evalOperand d3UnionLocals (.move (pl 1 [.field 0 d3UnionU8Ty])) [] [] d3UnionLayouts []
+      d3UnionDecls [] = .ok (sc8 2) d3UnionLocals :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end TrustedCanaries
 
@@ -2088,8 +2302,9 @@ variable {P S C E Other Extern FnABI ArgABI : Type}
 
 /-- **Moved immediate call argument (`d7Imm`, Finding 11a), universal.** With
 `deinitMovedPlace = true`, `move _l` of a non-zero-sized immediate local is
-validated at its type, then the caller's local is replaced by
-`.live (.immediate .uninit)` (`setFrame`), and the read value is passed by copy. -/
+validated at its type (with retagging disabled, `RetagMode.None`), then the
+caller's local is replaced by `.live (.immediate .uninit)` (`setFrame`), and the
+read value is passed by copy. -/
 theorem call_evalFnCallArgumentMoving_move_immediate
     (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C) (l : Miri.MIR.LocalId)
     (path : OperandPath) (s s₁ s₂ s₃ s₄ s₅ : S) (rplace : RuntimeStackPlace P)
@@ -2097,7 +2312,8 @@ theorem call_evalFnCallArgumentMoving_move_immediate
     (hplace : h.evalPlace choice ⟨l, #[]⟩ true s = .ok rplace s₁)
     (hop : h.placeToOp choice rplace s₁ = .ok ⟨.immediate v, layout⟩ s₂)
     (hsized : layout.layout.isSized = true) (hzst : layout.layout.isZst = false)
-    (hval : h.validateOperandBeforeCall choice ⟨.immediate v, layout⟩ s₂ = .ok () s₃)
+    (hval : h.withRetagMode choice .None
+      (h.validateOperandBeforeCall choice ⟨.immediate v, layout⟩) s₂ = .ok () s₃)
     (hget : h.getFrame s₃ = .ok frame s₄)
     (hrep : frame.replaceLocalValue l (.live (.immediate .uninit)) = .ok frame')
     (hset : h.setFrame frame' s₄ = .ok () s₅) :
@@ -2109,10 +2325,10 @@ theorem call_evalFnCallArgumentMoving_move_immediate
   rfl
 
 /-- **Moved memory-backed call argument, universal.** With `deinitMovedPlace =
-true`, `move p` of a memory place is copied (validating) into a fresh temporary,
-then the source is deinitialized with the silent `deinitInPlaceArgument`, and the
-temporary is passed by copy: no argument is passed in place, so no protected
-`uninit` write can occur. -/
+true`, `move p` of a memory place is copied (validating, with retagging disabled)
+into a fresh temporary, then the source is deinitialized with the silent
+`deinitInPlaceArgument`, and the temporary is passed by copy: no argument is passed
+in place, so no protected `uninit` write can occur. -/
 theorem call_evalFnCallArgumentMoving_move_indirect
     (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C) (place : Miri.MIR.Place)
     (path : OperandPath) (s s₁ s₂ s₃ s₄ s₅ : S) (rplace : RuntimeStackPlace P)
@@ -2121,7 +2337,8 @@ theorem call_evalFnCallArgumentMoving_move_indirect
     (hop : h.placeToOp choice rplace s₁ = .ok ⟨.indirect mplace, layout⟩ s₂)
     (hsized : layout.layout.isSized = true)
     (halloc : h.allocateStack choice layout s₂ = .ok tmp s₃)
-    (hcopy : h.copyToMemory choice ⟨.indirect mplace, layout⟩ tmp s₃ = .ok () s₄)
+    (hcopy : h.withRetagMode choice .None
+      (h.copyToMemory choice ⟨.indirect mplace, layout⟩ tmp) s₃ = .ok () s₄)
     (hdeinit : h.deinitInPlaceArgument choice ⟨mplace, layout⟩ s₄ = .ok () s₅) :
     Call.evalFnCallArgumentMoving h choice (.Move place) path s =
       .ok (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr) s₅ := by
@@ -2138,7 +2355,8 @@ theorem call_evalFnCallArgumentMoving_move_immediate_invalid
     (hplace : h.evalPlace choice ⟨l, #[]⟩ true s = .ok rplace s₁)
     (hop : h.placeToOp choice rplace s₁ = .ok ⟨.immediate v, layout⟩ s₂)
     (hsized : layout.layout.isSized = true)
-    (hval : h.validateOperandBeforeCall choice ⟨.immediate v, layout⟩ s₂ = .error err s₃) :
+    (hval : h.withRetagMode choice .None
+      (h.validateOperandBeforeCall choice ⟨.immediate v, layout⟩) s₂ = .error err s₃) :
     Call.evalFnCallArgumentMoving h choice (.Move ⟨l, #[]⟩) path s = .error err s₃ := by
   simp only [Call.evalFnCallArgumentMoving, bind, EStateM.bind, hplace, hop, hsized, hval,
     Bool.not_true, Bool.false_eq_true, ↓reduceIte]
@@ -2155,11 +2373,91 @@ theorem call_evalFnCallArgumentMoving_move_zst
     (hplace : h.evalPlace choice place true s = .ok rplace s₁)
     (hop : h.placeToOp choice rplace s₁ = .ok ⟨.immediate v, layout⟩ s₂)
     (hsized : layout.layout.isSized = true) (hzst : layout.layout.isZst = true)
-    (hval : h.validateOperandBeforeCall choice ⟨.immediate v, layout⟩ s₂ = .ok () s₃) :
+    (hval : h.withRetagMode choice .None
+      (h.validateOperandBeforeCall choice ⟨.immediate v, layout⟩) s₂ = .ok () s₃) :
     Call.evalFnCallArgumentMoving h choice (.Move place) path s =
       .ok (.Copy ⟨.immediate v, layout⟩, none) s₃ := by
   simp only [Call.evalFnCallArgumentMoving, bind, EStateM.bind, hplace, hop, hsized, hval,
     hzst, Bool.not_true, Bool.false_eq_true, ↓reduceIte, pure, EStateM.pure]
+
+/-- **Retag-free argument snapshots (`ep1-A1`), universal.** The consumer-side
+temporary copy of an indirect argument, and the pre-resolution validation of an
+immediate one, run under `RetagMode.None`. Between statements the ambient retag
+mode is `Default`, and the validating copy (`copyRuntimePlace` → `validatePlace`
+with `resetProvenanceAndPadding = true`) retags every reference it validates in
+the current mode, so without this scope the snapshot would add a `Default` retag
+(a fresh child tag plus its retag access) on top of the callee's `FnEntry` retag
+of `passArgument`; with it the `FnEntry` retag remains the only one, exactly as in
+the source call path. -/
+theorem call_materializeArgument_indirect_eq
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C) (mplace : MemPlace P)
+    (layout : LocalLayout) (hsized : layout.layout.isSized = true) :
+    Call.materializeArgument h choice ⟨.indirect mplace, layout⟩ = (do
+      let tmp ← h.allocateStack choice layout
+      h.withRetagMode choice .None (h.copyToMemory choice ⟨.indirect mplace, layout⟩ tmp)
+      return (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr)) := by
+  simp only [Call.materializeArgument, hsized, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+
+/-- The immediate counterpart of `call_materializeArgument_indirect_eq`. -/
+theorem call_materializeArgument_immediate_eq
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C) (v : Immediate P)
+    (layout : LocalLayout) :
+    Call.materializeArgument h choice ⟨.immediate v, layout⟩ = (do
+      h.withRetagMode choice .None (h.validateOperandBeforeCall choice ⟨.immediate v, layout⟩)
+      return (.Copy ⟨.immediate v, layout⟩, none)) := rfl
+
+/-- `RetagMode.None` creates no new permission: the `newPermission` query of the
+retag driver (`TypedRetag.retagPtrValue`) returns `none` immediately, so a retag
+in that mode leaves the pointer and the borrow tree unchanged. -/
+theorem typedRetag_newPermission_none {K User : Type} (h : TypedRetag.Hooks K User)
+    (pointee : Miri.MIR.TyId) (kind : Miri.TreeBorrows.RetagPolicy.ReferenceKind) :
+    TypedRetag.newPermission h pointee kind .None = pure none := rfl
+
+/-- **Moved projected immediate call argument, universal.** With
+`deinitMovedPlace = true`, `move _l.f` of a non-zero-sized field of an immediate
+local is validated (with retagging disabled), the local is then materialized
+(`forceAllocation`) and exactly the moved bytes are deinitialized with the silent
+`deinitInPlaceArgument`, and the validated value is passed by copy. Together with
+`call_evalFnCallArgumentMoving_move_immediate`/`_move_indirect`/`_move_zst` (the
+other `Move` branches) and `call_materializeArgument_immediate_eq`/`_indirect_eq`
+(the `Copy`/`Constant`/`RuntimeChecks` branch), every successful consumer-side
+argument is an `FnArg.Copy`: `FnArg.InPlace` never reaches `passArgument`. -/
+theorem call_evalFnCallArgumentMoving_move_projected_immediate
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C) (place : Miri.MIR.Place)
+    (path : OperandPath) (s s₁ s₂ s₃ s₄ s₅ : S) (rplace : RuntimeStackPlace P)
+    (v : Immediate P) (layout : LocalLayout) (moved : MPlaceTy P)
+    (hplace : h.evalPlace choice place true s = .ok rplace s₁)
+    (hop : h.placeToOp choice rplace s₁ = .ok ⟨.immediate v, layout⟩ s₂)
+    (hsized : layout.layout.isSized = true) (hzst : layout.layout.isZst = false)
+    (hproj : place.projection.isEmpty = false)
+    (hval : h.withRetagMode choice .None
+      (h.validateOperandBeforeCall choice ⟨.immediate v, layout⟩) s₂ = .ok () s₃)
+    (hforce : h.forceAllocation choice rplace s₃ = .ok moved s₄)
+    (hdeinit : h.deinitInPlaceArgument choice moved s₄ = .ok () s₅) :
+    Call.evalFnCallArgumentMoving h choice (.Move place) path s =
+      .ok (.Copy ⟨.immediate v, layout⟩, none) s₅ := by
+  simp only [Call.evalFnCallArgumentMoving, bind, EStateM.bind, hplace, hop, hsized, hval,
+    hzst, hproj, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+  simp only [hforce, hdeinit]
+  rfl
+
+/-- **No protector on a copied argument, universal.** `Call.passArgument` on an
+`FnArg.Copy` argument never runs `protectArgument` (the hook that retags an
+in-place argument with a protector and writes `uninit` through it, a foreign Tree
+Borrows `.Write` that would disable sibling `Frozen` borrows): replacing the hook
+by any other leaves `passArgument` unchanged. Since every consumer-side argument
+is an `FnArg.Copy` (`call_evalFnCallArgumentMoving_move_projected_immediate`), no
+consumer-side moved argument is ever protected or deinitialized through a
+protected tag. -/
+theorem call_passArgument_copy_protect_irrelevant
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (protect : C → MPlaceTy P → CallM S Unit)
+    (choice : C) (op : OpTy P) (callerAbi calleeAbi : ArgABI) (calleeIndex : Nat)
+    (dest : Miri.MIR.Place) (calleeTy : Miri.MIR.TyId) (alreadyLive : Bool) :
+    Call.passArgument { h with protectArgument := protect } choice (.Copy op) callerAbi calleeAbi
+        calleeIndex dest calleeTy alreadyLive =
+      Call.passArgument h choice (.Copy op) callerAbi calleeAbi calleeIndex dest calleeTy
+        alreadyLive :=
+  rfl
 
 /-- **Memory-path overlapping move rejected with UB (`Finding 4`), universal.**
 When `h.takePendingMoveDeinit` returns `true` on a padded/memory-path copy whose
@@ -2394,6 +2692,18 @@ theorem canary_call_copy_func_then_move_func_arg_ok :
         { mem := [none, none, none, none, some 5, some 5, none], resolved := true, nextTmp := 6 } := by
   with_unfolding_all rfl
 
+/-- **`(move _1)(copy _1)` when `_1` is memory-backed (`ep1-A1`).** The callee
+operand is consumed first: `move _1` snapshots `5` into temporary cell 4 and
+deinitializes `_1` *before* any argument is evaluated, so the argument
+`copy _1` faults with `invalidUninitBytes` — before callee resolution
+(`resolved = false`). Contrast `canary_call_copy_func_then_move_func_arg_ok`. -/
+theorem canary_call_move_func_then_copy_func_arg_ub :
+    Call.evalCalleeAndArgsMoving (toyCallHooks true) () (.Move ⟨1, #[]⟩)
+        #[⟨toySpan, .Copy ⟨1, #[]⟩⟩] toyInit =
+      .error (.undefinedBehavior "invalidUninitBytes")
+        { mem := [none, none, none, none, some 5, none, none], resolved := false, nextTmp := 6 } := by
+  with_unfolding_all rfl
+
 /-- `_1 = (2, 3)` stored at cells 1 (`_1.0`) and 2 (`_1.1`). -/
 def toyPairInit : ToyCallState :=
   { mem := [none, some 2, some 3, none, none, none, none], resolved := false, nextTmp := 4 }
@@ -2462,6 +2772,405 @@ theorem canary_call_uninit_arg_source_order :
   with_unfolding_all rfl
 
 end CallToy
+
+/-! ### `D4`: multi-operand `BinaryOp` through the real `evalRvalueIntoPlace`
+
+The real dispatcher `evalRvalueIntoPlace` (pinned `step.rs`) evaluates *and
+reads* the left operand before it evaluates the right one
+(`evalRvalueIntoPlace_binaryOp`). With the consumer-side latch, a moved indirect
+operand is queued by `OperandMachine.evalOperand`
+(`operandMachine_evalOperand_move_indirect`) and deinitialized by its own read
+(`placeMachine_readImmediate_moving`, `takePendingMoveDeinitFor_front`), while a
+moved unprojected immediate local is deinitialized at evaluation
+(`operandMachine_evalOperand_move_immediate_root`), and a moved projected
+immediate local is first materialized (`forceAllocation`) and then queued. A
+small hook dictionary implementing exactly these transitions over memory cells,
+immediate locals and the latch queue drives the real `evalRvalueIntoPlace`:
+`copy _1 + move _1` succeeds with both operands reading `5` (and `_1`
+deinitialized afterwards), while `move _1 + copy _1` and `move _1 + move _1` fault
+on the second read — for memory-backed, immediate and projected-immediate
+(`_1.0` of a scalar pair) locals alike. The toy carries an immediate operand's
+value in its layout's type id (`toyImmOp`). -/
+
+section BinaryOpToy
+
+open Miri.ABI Miri.Memory Miri.Interpreter
+
+variable {P S C : Type}
+
+/-- A public copy of the private `assertRvalueLayout` of `Rvalue.lean`. -/
+def rvalueLayoutCheck (actual expected : TyAndLayout Miri.MIR.TyId) : RvalueM S Unit :=
+  if actual == expected then pure () else throw (.invalidProgram "rvalue result layout mismatch")
+
+/-- The part of the `BinaryOp` arm of `evalRvalueIntoPlace` after both operands
+have been read. -/
+def binaryOpTail {V : Type} (h : RvalueHooks P S C V) (choice : C) (operator : Miri.MIR.BinOp)
+    (layout : TyAndLayout Miri.MIR.TyId) (dest : V) (left right : RvalueImmTy P) :
+    RvalueM S Unit := do
+  let result ← h.binaryOp choice operator left right
+  rvalueLayoutCheck result.layout layout
+  h.writeImmediate choice result.imm dest
+
+/-- **Operand order of `BinaryOp`, universal.** `evalRvalueIntoPlace` reads the
+left operand (`readImmediate`, which consumes its latch record) before it
+evaluates the right operand: there is never more than one pending operand record
+in a binary operation. -/
+theorem evalRvalueIntoPlace_binaryOp {V : Type} (h : RvalueHooks P S C V) (choice : C)
+    (operator : Miri.MIR.BinOp) (l r : Miri.MIR.Operand) (place : Miri.MIR.Place) :
+    evalRvalueIntoPlace h choice (.BinaryOp operator l r) place = (do
+      let dest ← h.evalPlace choice place true
+      let layout := h.placeLayout dest
+      let left ← h.evalOperandAt choice (OperandPath.rvalue "left") l
+        (if operator.leftHomogeneous then some layout else none)
+      let left ← h.readImmediate choice left
+      let right ← h.evalOperandAt choice (OperandPath.rvalue "right") r
+        (if operator.rightHomogeneous then some left.layout else none)
+      let right ← h.readImmediate choice right
+      binaryOpTail h choice operator layout dest left right) := by
+  unfold evalRvalueIntoPlace binaryOpTail rvalueLayoutCheck
+  unfold_named "_private.Miri.Interpreter.Rvalue.0.Miri.Interpreter.assertRvalueLayout"
+  rfl
+
+/-- Representation of a local in the `D4` toy. -/
+inductive ToySlot where
+  /-- Memory-backed: the value of `_l.i` lives in memory cell `l + i`. -/
+  | mem
+  /-- Immediate scalar local (`none` = uninitialized). -/
+  | imm (v : Option Nat)
+  /-- Immediate scalar-pair local. -/
+  | immPair (a b : Option Nat)
+
+/-- Toy rvalue state: locals, memory cells (`none` = uninitialized), the latch
+queue of `(cell, isMove)` records, the values read so far, and whether the
+destination was written. -/
+structure ToyRvState where
+  slots : List ToySlot
+  cells : List (Option Nat)
+  queue : List (Nat × Bool)
+  reads : List Nat
+  written : Bool
+
+/-- An immediate operand carrying `v` (in its layout's type id) or `uninit`. -/
+def toyImmOp : Option Nat → OpTy Unit
+  | some v => ⟨.immediate (.scalar (Scalar.fromBool true)), ⟨v, toyByteLayout⟩⟩
+  | none => ⟨.immediate .uninit, toyU8⟩
+
+/-- The field index of a toy place, if projected. -/
+def toyField (place : Miri.MIR.Place) : Option Nat :=
+  match (place.projection[0]? : Option Miri.MIR.ProjectionElem) with
+  | some (Miri.MIR.ProjectionElem.Field idx _) => some idx
+  | _ => none
+
+/-- The memory operand of a toy place. -/
+def toyMemOperand (place : Miri.MIR.Place) : OpTy Unit :=
+  ⟨.indirect (toyMPlace (toyPlaceCell place)), toyU8⟩
+
+/-- `OperandMachine.evalOperandMoving` over the toy state: `Copy`/`Move` of a
+memory place queues `(cell, false/true)`; `Copy` of an immediate (field) is a
+value snapshot; `Move` of an unprojected immediate local deinitializes it at once;
+`Move` of a field of an immediate pair materializes the pair (`forceAllocation`)
+and queues the moved field. -/
+def toyRvEval (operand : Miri.MIR.Operand) : RvalueM ToyRvState (OpTy Unit) := do
+  let s ← get
+  match operand with
+  | .Copy place =>
+    match s.slots[place.localId]?, toyField place with
+    | some (.imm v), none => pure (toyImmOp v)
+    | some (.immPair a _), some 0 => pure (toyImmOp a)
+    | some (.immPair _ b), some 1 => pure (toyImmOp b)
+    | some .mem, _ =>
+      set { s with queue := s.queue ++ [(toyPlaceCell place, false)] }
+      pure (toyMemOperand place)
+    | _, _ => throw (.unsupported "toy operand")
+  | .Move place =>
+    match s.slots[place.localId]?, toyField place with
+    | some (.imm v), none =>
+      set { s with slots := s.slots.set place.localId (.imm none) }
+      pure (toyImmOp v)
+    | some (.immPair a b), some _ =>
+      set { s with
+        slots := s.slots.set place.localId .mem
+        cells := (s.cells.set place.localId a).set (place.localId + 1) b
+        queue := s.queue ++ [(toyPlaceCell place, true)] }
+      pure (toyMemOperand place)
+    | some .mem, _ =>
+      set { s with queue := s.queue ++ [(toyPlaceCell place, true)] }
+      pure (toyMemOperand place)
+    | _, _ => throw (.unsupported "toy operand")
+  | _ => throw (.unsupported "toy operand")
+
+/-- `MachineHooks.takePendingMoveDeinitFor` over the toy queue: consume the
+earliest record of the read cell (the front one in every run below). -/
+def toyTake : List (Nat × Bool) → Nat → List (Nat × Bool) × Bool
+  | [], _ => ([], false)
+  | (c, mv) :: rest, n =>
+    if c == n then (rest, mv) else
+      let (rest', mv') := toyTake rest n
+      ((c, mv) :: rest', mv')
+
+/-- `PlaceMachine.readImmediateMoving` over the toy state: an uninitialized
+immediate faults; a memory read consumes its record, faults on an uninitialized
+cell, and deinitializes the cell after the read exactly when the record is a move. -/
+def toyRvRead (op : OpTy Unit) : RvalueM ToyRvState (RvalueImmTy Unit) := do
+  let s ← get
+  match op.op with
+  | .immediate .uninit => throw (.undefinedBehavior "invalidUninitBytes")
+  | .immediate imm =>
+    set { s with reads := s.reads ++ [op.layout.ty] }
+    pure ⟨imm, toyU8⟩
+  | .indirect m =>
+    let n := toyCell m
+    let (queue, isMove) := toyTake s.queue n
+    match (s.cells[n]?).join with
+    | none =>
+      set { s with queue }
+      throw (.undefinedBehavior "invalidUninitBytes")
+    | some v =>
+      set { s with queue, reads := s.reads ++ [v],
+                   cells := if isMove then s.cells.set n none else s.cells }
+      pure ⟨.scalar (Scalar.fromBool true), toyU8⟩
+
+/-- The toy rvalue hooks. -/
+def toyRvHooks : RvalueHooks Unit ToyRvState Unit Unit where
+  placeLayout := fun _ => toyU8
+  evalPlace := fun _ _ _ => pure ()
+  evalOperand := fun _ op _ => toyRvEval op
+  evalOperandAt := fun _ _ op _ => toyRvEval op
+  evalPlaceToOp := fun _ _ _ => throw (.unsupported "toy")
+  readImmediate := fun _ op => toyRvRead op
+  writeImmediate := fun _ _ _ => modify fun s => { s with written := true }
+  writePointer := fun _ _ _ => throw (.unsupported "toy")
+  threadLocalPointer := fun _ _ => throw (.unsupported "toy")
+  withRetagMode := fun _ _ action => action
+  copyOp := fun _ _ _ => throw (.unsupported "toy")
+  copyOpAllowTransmute := fun _ _ _ => throw (.unsupported "toy")
+  binaryOp := fun _ _ _ _ => pure ⟨.scalar (Scalar.fromBool true), toyU8⟩
+  unaryOp := fun _ _ _ => throw (.unsupported "toy")
+  writeAggregate := fun _ _ _ _ => throw (.unsupported "toy")
+  writeRepeat := fun _ _ _ => throw (.unsupported "toy")
+  forceAllocation := fun _ _ => throw (.unsupported "toy")
+  toRef := fun _ _ => throw (.unsupported "toy")
+  enforceValidity := fun _ _ => pure false
+  retagPtrValue := fun _ _ _ => pure none
+  placeBaseRaw := fun _ _ => pure false
+  normalize := fun _ ty => pure ty
+  cast := fun _ _ _ _ _ => throw (.unsupported "toy")
+  readDiscriminant := fun _ _ => throw (.unsupported "toy")
+  discriminantForVariant := fun _ _ _ => throw (.unsupported "toy")
+
+/-- `_1 = 5`, memory-backed (cell 1). -/
+def d4Mem : ToyRvState :=
+  { slots := [.mem, .mem, .mem], cells := [none, some 5, none], queue := [], reads := [],
+    written := false }
+
+/-- `_1 = 5`, an immediate local. -/
+def d4Imm : ToyRvState :=
+  { slots := [.mem, .imm (some 5), .mem], cells := [none, none, none], queue := [], reads := [],
+    written := false }
+
+/-- `_1 = (5, 6)`, an immediate scalar pair. -/
+def d4Pair : ToyRvState :=
+  { slots := [.mem, .immPair (some 5) (some 6), .mem], cells := [none, none, none], queue := [],
+    reads := [], written := false }
+
+def d4P1 : Miri.MIR.Place := ⟨1, #[]⟩
+def d4P10 : Miri.MIR.Place := ⟨1, #[.Field 0 0]⟩
+def d4P11 : Miri.MIR.Place := ⟨1, #[.Field 1 0]⟩
+def d4Add (l r : Miri.MIR.Operand) : Miri.MIR.Rvalue := .BinaryOp .Add l r
+def d4Dest : Miri.MIR.Place := ⟨0, #[]⟩
+
+/-- **`D4`, memory-backed `_1`.** `_0 = Add(copy _1, move _1)` reads `5` twice and
+leaves `_1` deinitialized; `Add(move _1, copy _1)` and `Add(move _1, move _1)`
+fault on the second read; `Add(copy _1, copy _1)` leaves `_1` intact. -/
+theorem canary_D4_mem_binaryOp :
+    evalRvalueIntoPlace toyRvHooks () (d4Add (.Copy d4P1) (.Move d4P1)) d4Dest d4Mem =
+      .ok () { d4Mem with cells := [none, none, none], reads := [5, 5], written := true } ∧
+    evalRvalueIntoPlace toyRvHooks () (d4Add (.Move d4P1) (.Copy d4P1)) d4Dest d4Mem =
+      .error (.undefinedBehavior "invalidUninitBytes")
+        { d4Mem with cells := [none, none, none], reads := [5] } ∧
+    evalRvalueIntoPlace toyRvHooks () (d4Add (.Move d4P1) (.Move d4P1)) d4Dest d4Mem =
+      .error (.undefinedBehavior "invalidUninitBytes")
+        { d4Mem with cells := [none, none, none], reads := [5] } ∧
+    evalRvalueIntoPlace toyRvHooks () (d4Add (.Copy d4P1) (.Copy d4P1)) d4Dest d4Mem =
+      .ok () { d4Mem with reads := [5, 5], written := true } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl, by with_unfolding_all rfl,
+   by with_unfolding_all rfl⟩
+
+/-- **`D4`, immediate `_1`.** The moved immediate local is deinitialized at
+evaluation, so `Add(copy _1, move _1)` reads `5` twice, whereas
+`Add(move _1, copy _1)` reads the `uninit` immediate and faults. -/
+theorem canary_D4_imm_binaryOp :
+    evalRvalueIntoPlace toyRvHooks () (d4Add (.Copy d4P1) (.Move d4P1)) d4Dest d4Imm =
+      .ok () { d4Imm with slots := [.mem, .imm none, .mem], reads := [5, 5], written := true } ∧
+    evalRvalueIntoPlace toyRvHooks () (d4Add (.Move d4P1) (.Copy d4P1)) d4Dest d4Imm =
+      .error (.undefinedBehavior "invalidUninitBytes")
+        { d4Imm with slots := [.mem, .imm none, .mem], reads := [5] } ∧
+    evalRvalueIntoPlace toyRvHooks () (d4Add (.Move d4P1) (.Move d4P1)) d4Dest d4Imm =
+      .error (.undefinedBehavior "invalidUninitBytes")
+        { d4Imm with slots := [.mem, .imm none, .mem], reads := [5] } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
+/-- **`D4`, projected field of an immediate pair `_1 = (5, 6)`.** The copy of
+`_1.0` evaluated first is a value snapshot taken before `move _1.0` materializes
+`_1`, so `Add(copy _1.0, move _1.0)` reads `5` twice and leaves only `_1.0`
+deinitialized (`_1.1 = 6` survives in cell 2); `Add(move _1.0, copy _1.0)` faults,
+and `Add(move _1.0, copy _1.1)` reads the sibling `6`. -/
+theorem canary_D4_pair_field_binaryOp :
+    evalRvalueIntoPlace toyRvHooks () (d4Add (.Copy d4P10) (.Move d4P10)) d4Dest d4Pair =
+      .ok () { d4Pair with slots := [.mem, .mem, .mem], cells := [none, none, some 6],
+                           reads := [5, 5], written := true } ∧
+    evalRvalueIntoPlace toyRvHooks () (d4Add (.Move d4P10) (.Copy d4P10)) d4Dest d4Pair =
+      .error (.undefinedBehavior "invalidUninitBytes")
+        { d4Pair with slots := [.mem, .mem, .mem], cells := [none, none, some 6], reads := [5] } ∧
+    evalRvalueIntoPlace toyRvHooks () (d4Add (.Move d4P10) (.Copy d4P11)) d4Dest d4Pair =
+      .ok () { d4Pair with slots := [.mem, .mem, .mem], cells := [none, none, some 6],
+                           reads := [5, 6], written := true } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
+end BinaryOpToy
+
+/-! ### Consumer-side casts: the real `Cast.castMoving` event order
+
+A logging hook dictionary drives the real `Cast.castMoving`. Its latch flag
+models the pending move record of the cast's source operand
+(`takePendingMoveDeinit` consumes it; `restorePendingMoveDeinit true` re-arms it,
+as `ExecutionCast.hooks` does; the logging `copyAllowTransmute`/`copyNoValidate`
+consume it, as `copyRuntimePlaceNoValidate` does). -/
+
+section CastToy
+
+open Miri.ABI Miri.Memory Miri.Interpreter
+
+/-- `Unit` provenance for the cast toy (no allocation identities). -/
+local instance toyPointerProvenance : PointerProvenance Unit := ⟨false, none, fun _ => none⟩
+
+/-- Toy cast state: the latch flag and the event log. -/
+structure ToyCastState where
+  armed : Bool
+  log : List String
+
+/-- A two-field, memory-represented ADT layout. -/
+def toyAdtLayout : LayoutData :=
+  { toyByteLayout with fields := .Arbitrary #[⟨0⟩, ⟨1⟩] #[0, 1], size := ⟨2⟩ }
+
+/-- Append an event. -/
+def toyLog (e : String) : RvalueM ToyCastState Unit :=
+  modify fun s => { s with log := s.log ++ [e] }
+
+/-- Logging cast hooks. Type ids: `0` a raw pointer; `10`/`11` the source/target
+ADT (`.adt 1`), whose field `0` keeps type `20` and whose field `1` changes from
+`30` (`*const dyn`, pointee tail `40`) to `31` (pointee tail `41`), both tails the
+same `dyn` (`.dynamic 3`). -/
+def toyCastHooks : CastHooks Unit ToyCastState Unit Unit where
+  target := ⟨.little, .w64⟩
+  typeInfo := fun _ ty =>
+    match ty with
+    | 10 | 11 => pure (.adt 1)
+    | 30 => pure (.rawPointer 40)
+    | 31 => pure (.rawPointer 41)
+    | 40 | 41 => pure (.dynamic 3)
+    | _ => pure (.rawPointer 0)
+  layoutOf := fun _ ty => pure (if ty == 11 then ⟨11, toyAdtLayout⟩ else toyU8)
+  destLayout := fun _ => toyU8
+  readImmediate := fun _ op => do
+    toyLog "read"
+    pure ⟨.scalar (Scalar.fromBool true), op.layout⟩
+  writeImmediate := fun _ _ _ => toyLog "write"
+  writePointer := fun _ _ _ => toyLog "writePointer"
+  enforceValidity := fun _ _ => pure false
+  enforceValidityRecursively := fun _ _ => pure false
+  validatePlace := fun _ _ _ _ => toyLog "validate"
+  derefPointer := fun _ _ => throw (.unsupported "toy")
+  checkFunctionPointer := fun _ _ => throw (.unsupported "toy")
+  exposeProvenance := fun _ _ => throw (.unsupported "toy")
+  pointerFromExposedAddress := fun _ _ => throw (.unsupported "toy")
+  usizeLayout := fun _ => throw (.unsupported "toy")
+  floatOps :=
+    { integerKindOf := fun _ _ => throw (.unsupported "toy")
+      formatOf := fun _ _ => throw (.unsupported "toy")
+      boolLayout := fun _ => throw (.unsupported "toy")
+      floatNondeterministic := false
+      chooseNaN := fun _ _ => throw (.unsupported "toy") }
+  ensureMonomorphic := fun _ _ => pure ()
+  requireNoBoundVars := fun _ _ => pure ()
+  resolveFunction := fun _ _ _ => throw (.unsupported "toy")
+  resolveClosureFnOnce := fun _ _ _ => throw (.unsupported "toy")
+  functionPointer := fun _ _ => throw (.unsupported "toy")
+  builtinDeref := fun _ _ _ => throw (.unsupported "toy")
+  boxLayout := fun _ _ => throw (.unsupported "toy")
+  validateImmediateABI := fun _ _ => .ok ()
+  copyAllowTransmute := fun _ _ _ => do
+    let s ← get
+    set { s with armed := false,
+                 log := s.log ++ [if s.armed then "copyAllowTransmute+deinit" else "copyAllowTransmute"] }
+  copyNoValidate := fun _ _ _ _ => do
+    let s ← get
+    set { s with armed := false,
+                 log := s.log ++ [if s.armed then "copyNoValidate+deinit" else "copyNoValidate"] }
+  projectRead := fun _ op i => pure ⟨op.op, ⟨if i == 0 then 20 else 30, toyByteLayout⟩⟩
+  projectWrite := fun _ _ _ => pure ()
+  fieldLayout := fun _ _ i => pure ⟨if i == 0 then 20 else 31, toyByteLayout⟩
+  lockstepTails := fun _ a b => pure (a, b)
+  vtableType := fun _ _ _ => throw (.unsupported "toy")
+  vtablePointer := fun _ _ _ => throw (.unsupported "toy")
+  principal := fun _ _ => throw (.unsupported "toy")
+  vtableEntries := fun _ _ _ => throw (.unsupported "toy")
+  supertraitSlot := fun _ _ _ => throw (.unsupported "toy")
+  eraseSelfTraitRef := fun _ _ => throw (.unsupported "toy")
+  normalizePrincipal := fun _ _ => throw (.unsupported "toy")
+  takePendingMoveDeinit := do
+    let s ← get
+    set { s with armed := false, log := s.log ++ ["take"] }
+    pure s.armed
+  restorePendingMoveDeinit := fun flag =>
+    if flag then modify fun s => { s with armed := true, log := s.log ++ ["restore"] } else pure ()
+  deinitSource := fun _ source =>
+    match source.op with
+    | .immediate _ => pure ()
+    | .indirect _ => toyLog "deinit"
+
+/-- A memory-backed pointer source operand. -/
+def toyCastSrc : OpTy Unit := ⟨.indirect (toyMPlace 1), toyU8⟩
+
+/-- A memory-backed ADT source operand (type id `10`). -/
+def toyCastAdtSrc : OpTy Unit := ⟨.indirect (toyMPlace 1), ⟨10, toyAdtLayout⟩⟩
+
+/-- **`PtrToPtr` of a moved source.** The latch is consumed first, the source is
+read, then deinitialized, and only then is the destination written (so a
+self-assignment `_1 = move _1 as *const T` keeps its value); with a disarmed
+latch (a `copy` source) nothing is deinitialized. -/
+theorem canary_castMoving_ptrToPtr :
+    Cast.castMoving toyCastHooks () 4 toyCastSrc .PtrToPtr 0 () { armed := true, log := [] } =
+      .ok () { armed := false, log := ["take", "read", "deinit", "write"] } ∧
+    Cast.castMoving toyCastHooks () 4 toyCastSrc .PtrToPtr 0 () { armed := false, log := [] } =
+      .ok () { armed := false, log := ["take", "read", "write"] } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
+/-- **`Transmute` of a moved source.** The latch is handed on to the consuming
+`copyAllowTransmute` (`restore`), which therefore deinitializes the source. -/
+theorem canary_castMoving_transmute :
+    Cast.castMoving toyCastHooks () 4 toyCastSrc .Transmute 0 () { armed := true, log := [] } =
+      .ok () { armed := false, log := ["take", "restore", "copyAllowTransmute+deinit"] } ∧
+    Cast.castMoving toyCastHooks () 4 toyCastSrc .Transmute 0 () { armed := false, log := [] } =
+      .ok () { armed := false, log := ["take", "copyAllowTransmute"] } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
+/-- **Unsizing an ADT whose second field is a moved `*const dyn` pointer.** The
+unchanged field receives the latch (`restore`) and is copied-and-deinitialized
+by `copyNoValidate`; the unsized pointer leaf is read, then deinitialized, then
+written. With a disarmed latch (`copy` source) the source `unsizeInto` runs and
+nothing is deinitialized. -/
+theorem canary_castMoving_unsize_adt :
+    Cast.castMoving toyCastHooks () 4 toyCastAdtSrc (.PointerCoercion .Unsize .AsCast) 11 ()
+        { armed := true, log := [] } =
+      .ok () { armed := false,
+               log := ["take", "restore", "copyNoValidate+deinit", "read", "deinit", "write"] } ∧
+    Cast.castMoving toyCastHooks () 4 toyCastAdtSrc (.PointerCoercion .Unsize .AsCast) 11 ()
+        { armed := false, log := [] } =
+      .ok () { armed := false, log := ["take", "copyNoValidate", "read", "write"] } :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
+end CastToy
 
 /-! ## Part 4: root-move simulation between `lean-miri` and Trusted `Places` -/
 
@@ -2553,9 +3262,12 @@ moves).** Run `Move` of an indirect (`MemPlace`) place in `lean-miri` through
    `mplace` via `PlaceMachine.writeMemoryRawUninit` (`tbSilentAccessHooks`, zero
    Tree Borrows or race writes);
 3. `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand ... (.move tPlace) ... true`
-   runs `evalCopyPlaceRead` (leaving `borrows` and every `.frozen` tag unchanged)
-   followed by `evalMoveOperandDeinit`, returning the related value `v` (`rel v
-   val.imm`) and the deinitialized `locals'`. -/
+   runs `evalCopyPlaceRead` followed by `evalMoveOperandDeinit`, returning the
+   related value `v` (`rel v val.imm`, a hypothesis restated for convenience) and
+   the deinitialized `locals'`. Trusted `evalOperand` takes the borrow table as an
+   input only (its `PlaceReadResult` carries no borrow table), so a move can never
+   update a `.frozen` entry; the last conjunct merely records that every `.frozen`
+   entry is still looked up as `.frozen`. -/
 theorem indirect_move_simulation {K User C : Type} [DecidableEq K]
     (rel : Trusted.Rustc.V2026_06_01.MirSemantics.Value → Immediate Provenance → Prop)
     (opHooks : OperandMachine.Hooks K User C) (config : PlaceMachine.AccessConfig K User)
@@ -2618,10 +3330,15 @@ theorem indirect_move_simulation {K User C : Type} [DecidableEq K]
 Finding 11).** Moving `(*_2)` as a call argument in `lean-miri` via
 `Call.evalFnCallArgumentMoving` (`deinitMovedPlace = true`) and in Trusted via
 `evalOperand d5Locals (.move (pl 2 [.deref])) d5Borrows (deinitProjectedMoves :=
-true)` both deliver the pointee value, deinitialize `_1` through the
+true)` both deliver the pointee value and deinitialize `_1` through the
 borrow-tracker-silent deinitializer (`deinitInPlaceArgument` /
-`PlaceMachine.writeMemoryRawUninit`, never calling `protectArgument`), and
-preserve the sibling `.frozen` borrow `_3` in `d5Borrows`. -/
+`PlaceMachine.writeMemoryRawUninit`); the sibling `.frozen` borrow `_3` of
+`d5Borrows` stays `.frozen`. The argument handed to the callee is an
+`FnArg.Copy` of the temporary, on which `passArgument` is independent of
+`protectArgument` (last conjunct, `call_passArgument_copy_protect_irrelevant`):
+no protector retag and no protected `uninit` write (a foreign Tree Borrows
+`.Write` that would disable `_3`) can occur for it. `rel` is a free relation
+whose hypothesis is restated. -/
 theorem d7_call_arg_move_deref_sibling_frozen_simulation
     {P S C E Other Extern FnABI ArgABI : Type}
     (rel : Trusted.Rustc.V2026_06_01.MirSemantics.Value → MemPlace P → Prop)
@@ -2632,7 +3349,8 @@ theorem d7_call_arg_move_deref_sibling_frozen_simulation
     (hop : h.placeToOp choice rplace s₁ = .ok ⟨.indirect mplace, layout⟩ s₂)
     (hsized : layout.layout.isSized = true)
     (halloc : h.allocateStack choice layout s₂ = .ok tmp s₃)
-    (hcopy : h.copyToMemory choice ⟨.indirect mplace, layout⟩ tmp s₃ = .ok () s₄)
+    (hcopy : h.withRetagMode choice .None
+      (h.copyToMemory choice ⟨.indirect mplace, layout⟩ tmp) s₃ = .ok () s₄)
     (hdeinit : h.deinitInPlaceArgument choice ⟨mplace, layout⟩ s₄ = .ok () s₅)
     (hrel : rel (sc8 5) tmp.mplace) :
     Call.evalFnCallArgumentMoving h choice (.Move ⟨2, #[.Deref]⟩) path s =
@@ -2642,10 +3360,20 @@ theorem d7_call_arg_move_deref_sibling_frozen_simulation
       .ok (sc8 5) d5AfterMove ∧
     rel (sc8 5) tmp.mplace ∧
     Trusted.Rustc.V2026_06_01.MirSemantics.lookupBorrow d5Borrows 3 =
-      .some { tag := 3, targetLocal := 1, targetProjection := [], perm := .frozen } :=
+      .some { tag := 3, targetLocal := 1, targetProjection := [], perm := .frozen } ∧
+    (∀ (protect : C → MPlaceTy P → CallM S Unit) (callerAbi calleeAbi : ArgABI)
+        (calleeIndex : Nat) (dest : Miri.MIR.Place) (calleeTy : Miri.MIR.TyId) (live : Bool),
+      Call.passArgument { h with protectArgument := protect } choice
+          (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩) callerAbi calleeAbi calleeIndex dest calleeTy
+          live =
+        Call.passArgument h choice (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩) callerAbi calleeAbi
+          calleeIndex dest calleeTy live) :=
   ⟨call_evalFnCallArgumentMoving_move_indirect h choice ⟨2, #[.Deref]⟩ path s s₁ s₂ s₃ s₄ s₅
     rplace mplace layout tmp hplace hop hsized halloc hcopy hdeinit,
-   canary_D5_deref_move_delivers_value, hrel, rfl⟩
+   canary_D5_deref_move_delivers_value, hrel, rfl,
+   fun protect callerAbi calleeAbi calleeIndex dest calleeTy live =>
+     call_passArgument_copy_protect_irrelevant h protect choice _ callerAbi calleeAbi calleeIndex
+       dest calleeTy live⟩
 
 /-- **Projected sub-place move simulation (`D2` / `D9`).** Moving a non-empty
 projected sub-place `⟨l, proj⟩` in `lean-miri` via `LocalAccess.evalOperand`
