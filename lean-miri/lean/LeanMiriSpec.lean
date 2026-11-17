@@ -459,9 +459,14 @@ import LeanMiriSpec.Audit
   deinitialization, `Cast.castMoving` deinitializes a moved source after its last
   read and before writing an immediate result (transmute and unsizing copies take
   over the move latch), `D8` `Assert`, unwinding `Call` cleanup,
-  `initFnTailCallMoving` (caller deinitialization before `popRaw`/`cleanup` and
-  temporary cleanup on both normal completion and error) and `initDropInPlaceCall`,
-  a `SwitchInt` on a moved
+  `initFnTailCallMoving` (the unchanged source `initFnTailCall` after the
+  pre-resolution caller deinitialization, temporaries freed after `cleanup`,
+  in-place arguments rejected before `popRaw`) and `initDropInPlaceCall`,
+  zero-sized moves deinitialize nothing, the moved copy of
+  `Place.copyRuntimePlaceNoValidate` reads, then deinitializes, then writes (so
+  `D6` self-moves keep their value on the immediate path and are overlapping-copy
+  UB on the padded memory path, and `D9` subslice windows are deinitialized
+  exactly), a `SwitchInt` on a moved
   discriminant branches only after the discriminant is deinitialized (and faults
   when re-reading it), `UnaryOp`/`PtrMetadata` deinitializes its whole moved
   operand before the operator runs, `D7` call destinations are resolved before
@@ -469,6 +474,7 @@ import LeanMiriSpec.Audit
   (deinitProjectedMoves := true)` deinitializes moved places (`D1`–`D9` canaries,
   including nested, enum-downcast, thin-pointer subslice, typed `Deref`
   re-initialization, partial-then-full subslice re-initialization, field swap,
+  root and projected self-move round trips,
   union byte-window and overlapping-union partial-byte moves, `(*_ptr).field` at a
   non-zero byte offset, the exact `Deref` target among equal values, strides
   skipping moved-out leaves, fail-closed moves out of global allocations,

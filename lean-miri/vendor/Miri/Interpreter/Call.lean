@@ -24,6 +24,11 @@ def layout : FnArg P → LocalLayout
 def copyFnArg : FnArg P → OpTy P
   | .Copy op => op
   | .InPlace place => ⟨.indirect place.mplace, place.layout⟩
+
+/-- Consumer-side (`deinitMovedPlace`): whether an argument is passed in place. -/
+def isInPlace : FnArg P → Bool
+  | .Copy _ => false
+  | .InPlace _ => true
 end FnArg
 
 inductive FnVal (Other : Type) where
@@ -623,41 +628,24 @@ def evalCallTerminatorMoving (h : Hooks) (choice : C) (budget : Nat) (terminator
           throw (.invalidProgram "evaluating this call made no progress")
   | _ => throw (.invalidProgram "call hook received a non-Call terminator")
 
-/-- Consumer-side (`deinitMovedPlace`) `init_fn_tail_call`: any remaining
-in-place arguments are materialized into temporary stack allocations and their
-caller sources are deinitialized (without Tree Borrows or race writes) BEFORE
-`popRaw` pops the caller frame and `cleanup` frees the caller's locals, and all
-temporary stack allocations (`allTemps`) are deallocated both on normal
-tail-call dispatch AND on any error. -/
+/-- Consumer-side (`deinitMovedPlace`) `init_fn_tail_call`. Every argument of
+`evalCalleeAndArgsMoving` is an `FnArg.Copy` of a validated immediate or of a
+temporary snapshot, and every moved caller source was already deinitialized
+(without Tree Borrows or race writes) before callee resolution, hence before the
+unchanged source `initFnTailCall` pops the caller frame (`popRaw`) and frees the
+caller's locals (`cleanup`). An `FnArg.InPlace` argument would skip that
+pre-resolution validation and deinitialization, so it fails closed before
+`popRaw`. The temporary snapshots are deallocated once `initFnTailCall`
+(including `cleanup`) has succeeded. As on every consumer-side call path, a fault
+is terminal and leaves the temporaries allocated: no cleanup runs after an error,
+so no cleanup failure can replace the original error. -/
 def initFnTailCallMoving (h : Hooks) (choice : C) (budget : Nat)
-    (evaluated : EvaluatedCall P Other Extern FnABI)
-    (temps : Array (Pointer (Option P)) := #[]) : M Unit := do
-  let mut allTemps := temps
-  let mut args : Array (FnArg P) := #[]
-  try
-    for arg in evaluated.args do
-      match arg with
-      | .Copy op => args := args.push (.Copy op)
-      | .InPlace place =>
-        if !place.layout.layout.isSized then
-          throw (.unsupported "deinitMovedPlace: unsized by-value call argument")
-        let tmp ← h.allocateStack choice place.layout
-        allTemps := allTemps.push tmp.mplace.ptr
-        h.withRetagMode choice .None (h.copyToMemory choice ⟨.indirect place.mplace, place.layout⟩ tmp)
-        h.deinitInPlaceArgument choice place
-        args := args.push (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩)
-    let frame ← h.popRaw choice
-    let (ret, unwind) ← match frame.returnContinuation with
-      | .goto ret unwind => pure (ret, unwind)
-      | .stop _ => throw (.invalidProgram "cannot tailcall as root of stack")
-    initFnCall h choice budget ⟨evaluated.callee, evaluated.callerAbi, evaluated.fnAbi, args,
-      evaluated.withCallerLocation, frame.returnPlace, ret, unwind⟩
-    let action ← h.cleanup choice false frame
-    require (action == .normal) "tailcall cleanup must return Normal"
-  catch err =>
-    deallocateTempArgs h choice allTemps
-    throw err
-  deallocateTempArgs h choice allTemps
+    (evaluated : EvaluatedCall P Other Extern FnABI) (temps : Array (Pointer (Option P))) :
+    M Unit := do
+  if evaluated.args.any FnArg.isInPlace then
+    throw (.invalidProgram "deinitMovedPlace: tail-call argument passed in place")
+  initFnTailCall h choice budget evaluated
+  deallocateTempArgs h choice temps
 
 /-- Consumer-side (`deinitMovedPlace`) tail-call terminator, selected by
 `ExecutionMachine.stepHooks` only when `deinitMovedPlace = true`; arguments as

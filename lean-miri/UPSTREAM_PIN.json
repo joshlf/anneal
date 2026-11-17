@@ -2471,16 +2471,16 @@
     {
       "path": "Miri/Interpreter/Call.lean",
       "upstream_sha256": "4f84e6562232130ab86a9ea057a63e8f1a57c17daef2f91d2bb9ca6251fb0287",
-      "patched_sha256": "97218031a2f7c7a90bd826acde208116cbac66ad9b70f44bf0b77d6495a2f4df",
+      "patched_sha256": "76fe47c71f0c3eea3141e4f8aedb6b21e3eb5365e2dcf67107da862146602e49",
       "upstream_git_blob": "1de0bbe80a2620c98cdc9371d7400db9f4a775bd",
-      "patch_reason": "deinitMovedPlace: adds the consumer-side evalCallTerminatorMoving / evalTailCallTerminatorMoving / initFnTailCallMoving / evalCalleeAndArgsMoving / evalFnCallArgumentMoving (every argument is read and validated into a temporary and every moved source deinitialized without Tree Borrows or race access, all before callee resolution or tail-call popRaw/cleanup, kani#5172; no argument is passed in place; the temporary snapshots and pre-resolution validations run under RetagMode.None so the callee's FnEntry retag stays the only retag of an argument; tail-call temporary allocations are deallocated on both normal completion and error) and CallHooks fields with fail-closed defaults. The source call functions are unchanged; two unused simp arguments (EStateM.pure) of the source zero_entry_immediate/zero_entry_indirect proofs are dropped."
+      "patch_reason": "deinitMovedPlace: adds the consumer-side evalCallTerminatorMoving / evalTailCallTerminatorMoving / initFnTailCallMoving / evalCalleeAndArgsMoving / evalFnCallArgumentMoving / materializeArgument / deallocateTempArgs and FnArg.isInPlace (every argument is read and validated into a temporary and every moved source deinitialized without Tree Borrows or race access, all before callee resolution, kani#5172, hence before a tail call's popRaw/cleanup; no argument is passed in place, and initFnTailCallMoving rejects an in-place argument before running the unchanged source initFnTailCall; the temporary snapshots and pre-resolution validations run under RetagMode.None so the callee's FnEntry retag stays the only retag of an argument; temporaries are deallocated after a successful dispatch, a fault being terminal) and CallHooks fields with fail-closed defaults. The source call functions are unchanged; two unused simp arguments (EStateM.pure) of the source zero_entry_immediate/zero_entry_indirect proofs are dropped."
     },
     {
       "path": "Miri/Interpreter/Cast.lean",
       "upstream_sha256": "34d19a23f5128f4d00301bc3d9655e0b8a1e83c4877ae8adf188ddba57952661",
       "patched_sha256": "b602d3c23ab8c0ef333747cdb50566aa3ea9dc9cab43fe33aae901ca51488157",
       "upstream_git_blob": "787f482061f213dade377a0a360637bc7a3ed0c3",
-      "patch_reason": "deinitMovedPlace: adds Cast.castMoving (consumes the move latch before the validity and value reads, then deinitializes a moved source through the place dictionary's Tree-Borrows-silent writer before the destination write; transmutes hand the latch to the consuming copy) and CastHooks fields with neutral defaults. Cast.cast is unchanged."
+      "patch_reason": "deinitMovedPlace: adds Cast.castMoving with unsizeIntoMoving / unsizeIntoPointerMoving (consumes the move latch before the validity and value reads, then deinitializes a moved source through the place dictionary's Tree-Borrows-silent writer before the destination write; transmutes and the unchanged fields of unsizing copies hand the latch to the consuming copy) and CastHooks fields with neutral defaults. Cast.cast is unchanged."
     },
     {
       "path": "Miri/Interpreter/ExecutionCalls.lean",
@@ -2508,7 +2508,7 @@
       "upstream_sha256": "051fe91f8ceee3bcb583332585dfdfe19187db5e4d8d9dc4cb9a552430d9d0eb",
       "patched_sha256": "9f416048aa310ef9690433935789e4b34c4725be902da0398c5f9c0dcde3b574",
       "upstream_git_blob": "7a032dfea7048c153c07f263cfb88e19ccf9ac22",
-      "patch_reason": "deinitMovedPlace: local-access Move deinitialization (unprojected immediate locals; memory places written through tbSilentAccessHooks, which keep pointer resolution and perform no Tree Borrows or race access)."
+      "patch_reason": "deinitMovedPlace: LocalAccessHooks.deinitMovedPlace (default false) and forceLocalAllocation (fail-closed default); evalOperandMoving deinitializes a moved unprojected immediate local (zero-sized values are preserved) and materializes a moved projected immediate local; evalOperandImmediate deinitializes a moved memory place after its read through tbSilentAccessHooks, which keep pointer resolution and perform no Tree Borrows or race access. The source theorem copy_move_same gains the hypothesis deinitMovedPlace = false (discharged by rfl by default)."
     },
     {
       "path": "Miri/Interpreter/MachineHooks.lean",
@@ -2522,7 +2522,7 @@
       "upstream_sha256": "ee81c3890c4c8ac0e3e8812b7e5754855c80716c8d5d262157dec3866d00d9a5",
       "patched_sha256": "77e437f1e43abb55e0116faab37035033f229870b3883920dbd2c174d6e20c99",
       "upstream_git_blob": "579beda13592aad81242dea8b9a4d86201e29a92",
-      "patch_reason": "deinitMovedPlace: Move/Copy operand evaluation records latch entries; unprojected immediate moves deinitialize the local slot, projected ones materialize the local first."
+      "patch_reason": "deinitMovedPlace: Hooks.deinitMovedPlace (default false); Move/Copy operand evaluation records latch entries; unprojected immediate moves deinitialize the local slot and projected ones materialize the local first, zero-sized moves deinitializing nothing; evalOperandAtMoving moves the record of CopyNonOverlapping's count operand (evaluated third, read first) to the front of the latch queue."
     },
     {
       "path": "Miri/Interpreter/Place.lean",
