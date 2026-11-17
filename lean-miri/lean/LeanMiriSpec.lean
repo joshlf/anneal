@@ -459,13 +459,21 @@ import LeanMiriSpec.Audit
   deinitialization, `Cast.castMoving` deinitializes a moved source after its last
   read and before writing an immediate result (transmute and unsizing copies take
   over the move latch), `D8` `Assert` and unwinding `Call` cleanup observe moved
-  operands as already deinitialized in `cleanup bb`, and Trusted `evalOperand
+  operands as already deinitialized in `cleanup bb`, a `SwitchInt` on a moved
+  discriminant branches only after the discriminant is deinitialized (and faults
+  when re-reading it), `UnaryOp`/`PtrMetadata` deinitializes its whole moved
+  operand before the operator runs, `D7` call destinations are resolved before
+  argument moves (`*_2 = f(move _2)`, `_1 = f(move _1)`), and Trusted `evalOperand
   (deinitProjectedMoves := true)` deinitializes moved places (`D1`–`D9` canaries,
   including nested, enum-downcast, thin-pointer subslice, typed `Deref`
-  re-initialization, partial-then-full subslice re-initialization, field swap, and
-  union byte-window moves; the statement-level `Rvalue.discriminant` still reads a
-  partially moved enum), with a root-move simulation between the two, documented
-  known limitations (niche-encoded enum tags) and an axiom audit.
+  re-initialization, partial-then-full subslice re-initialization, field swap,
+  union byte-window and overlapping-union partial-byte moves, `(*_ptr).field` at a
+  non-zero byte offset, the exact `Deref` target among equal values, strides
+  skipping moved-out leaves, and fail-closed moves out of global allocations; the
+  statement-level `Rvalue.discriminant` still reads a partially moved enum), with a
+  root-move simulation between the two, documented known limitations
+  (niche-encoded enum tags, untyped offsets over moved-out leaves, reinterpreting
+  `Deref` moves) and an axiom audit.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

@@ -29,7 +29,14 @@ true)`).
   field swap, Tree-Borrows-silent `Deref`, element and subslice moves, nested
   field-then-element, enum downcast, thin-pointer `Deref`+subslice, offset slice
   fat-pointer access after element `0` move, and union byte-window moves), each
-  with its legacy contrast.
+  with its legacy contrast; the element stride is the pre-extension stride on
+  marker-free lists (`inferElemListByteStride_eq_legacy`); and the `ep1-A2`
+  canaries: `(*_ptr).field` through a thin pointer at a non-zero byte offset into
+  an array element, exact `Deref` targets when distinct places hold equal values
+  (`canary_D5_typed_deref_equal_values_exact_target`), strides skipping nested
+  moved-out leaves, fail-closed moves out of non-zero-sized global allocations
+  (and no-op moves of zero-sized ones), and a partial byte-window move out of
+  overlapping union fields (`canary_D3_union_partial_byte_window_move`).
 * **Part 2 (`lean-miri`, `deinitMovedPlace = false`).** `Cast.cast` and
   `Call.evalFnCallArgumentAt`/`evalCalleeAndArgs`/`passArgument`/
   `evalCallTerminator`/`evalTailCallTerminator` are the unchanged source (the
@@ -62,9 +69,22 @@ true)`).
   reordering (`prependLastPendingMoveDeinit`, including `count == 0`), `Repeat`
   (`length == 0` and `length > 0`) and `Aggregate` move deinitialization;
   `RustCall` tuple argument unpacking and `FnInstance.Virtual` receiver dispatch
-  through `Call.evalCallTerminatorMoving`; and `D8` `Assert` and unwinding `Call`
+  through `Call.evalCallTerminatorMoving`; `D8` `Assert` and unwinding `Call`
   cleanup (`canary_D8_assert_cleanup_moved_cond_ub`,
-  `canary_D8_unwinding_call_moved_arg_ub`, `canary_D8_unwinding_call_unmoved_ok`).
+  `canary_D8_unwinding_call_moved_arg_ub`, `canary_D8_unwinding_call_unmoved_ok`);
+  operand reads `PlaceMachine.readImmediate (← OperandMachine.evalOperandAt …)`
+  of moved places (`operandRead_move_indirect`,
+  `discriminantRead_move_immediate_root`); the `SwitchInt` terminator of the
+  assembled `ExecutionMachine.stepHooks` faults with a faulting discriminant read
+  and branches from the post-read state (`stepHooks_switchInt_discriminant_error`,
+  `stepHooks_switchInt_otherwise`), with a concrete `SwitchInt` run through the
+  real `ControlFlow.evalTerminator` (`canary_switchInt_move_deinit`); `UnaryOp`
+  (including `PtrMetadata` of a wide pointer) reads and deinitializes its whole
+  operand before the operator runs (`evalRvalueIntoPlace_unaryOp`,
+  `rvalueHooks_unaryOp_move_indirect`); and `D7` call destinations are resolved
+  before argument moves (`call_evalCallTerminatorMoving_dest_before_args`,
+  `canary_D7_call_dest_resolved_before_arg_move`,
+  `canary_D7_call_dest_overlaps_moved_arg`).
 * **Part 4.** A root-move simulation between `LocalAccess.evalOperand`
   (`deinitMovedPlace = true`) and `evalOperand (deinitProjectedMoves := true)`.
 * **Part 5.** An environment audit: no declaration depends on `sorryAx`,
@@ -88,6 +108,15 @@ true)`).
   is terminal for the machine.
 * **Unsizing (`lean-miri`).** `Cast.castMoving` deinitializes the moved fields of an
   unsized struct source, not its padding bytes.
+* **Moved-out leaves have no byte width (Trusted).** Untyped (`localDecls = []`)
+  byte-offset inference reads sizes off runtime values; element strides skip
+  moved-out leaves (`inferElemListByteStride`), but other untyped offset
+  resolutions over a container holding a moved-out leaf (for example a thin
+  pointer resolved element-wise past a moved element) fault conservatively.
+* **Reinterpreting `Deref` moves (Trusted).** A typed thin-pointer move whose read
+  decodes the pointee bytes instead of reaching a structural sub-place (a
+  pointer cast into the middle of an aggregate followed by a projection, or a
+  whole `[u8; 2]` pointee inside a `[u8; 4]`) fails closed with `.unsupported`.
 -/
 
 namespace LeanMiriSpec.Correspondence.MoveDeinitEquivTactic
@@ -706,6 +735,18 @@ def legacyEvalOperands
     | .ub => .ub
     | .unsupported => .unsupported
 
+/-- Verbatim copy of `Trusted.Rustc.V2026_06_01.MirSemantics.inferElemListByteStride`
+before the `deinitProjectedMoves` extension (base commit `b91fc2aa`). -/
+def legacyInferElemListByteStride : List Value → Nat
+  | .scalar sc :: _ => sc.sizeBytes
+  | .ptr _ sz :: _ => sz
+  | .unit :: _ => 0
+  | .aggregate 0 fields :: _ =>
+    match inferValueByteSizeAux 8 (.aggregate 0 fields) with
+    | .some sz => sz
+    | .none => 1
+  | _ => 1
+
 end Legacy
 
 section TrustedPlaces
@@ -786,7 +827,7 @@ theorem evalOperand_move_deinit
     (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
     (callStack : List SavedCallerFrame) :
     evalOperand locals (.move p) borrows globals layouts callerLocals localDecls callStack true =
-      evalMoveOperandDeinit p borrows layouts localDecls callStack
+      evalMoveOperandDeinit p borrows globals layouts callerLocals localDecls callStack
         (evalOperand locals (.copy p) borrows globals layouts callerLocals localDecls callStack) :=
   rfl
 
@@ -900,6 +941,38 @@ theorem evalOperand_read_uninit_root_ub
   cases deinit <;>
     simp only [evalOperand, evalCopyPlaceRead, hget, guardMovedUninitRead, evalMoveOperandDeinit,
       and_self]
+
+/-- **Backward compatibility of the element stride.** On element lists without
+a moved-out leaf (every list the statement semantics, which never passes
+`deinitProjectedMoves := true`, produces) `inferElemListByteStride`, which skips
+elements holding moved-out leaves, is the pre-extension stride. -/
+theorem inferElemListByteStride_eq_legacy (elems : List Value)
+    (h : valueListContainsMovedUninit elems = false) :
+    inferElemListByteStride elems = legacyInferElemListByteStride elems := by
+  cases elems with
+  | nil => rfl
+  | cons v rest =>
+    have hv : valueContainsMovedUninit v = false := by
+      cases hc : valueContainsMovedUninit v
+      · rfl
+      · simp only [valueListContainsMovedUninit, hc] at h
+        exact absurd h (by decide)
+    rcases v with _ | ⟨bits, _ | n⟩ | ⟨p, sz⟩ | ⟨_ | k, fields⟩
+    · rfl
+    · have hbits : Nat.beq bits 1 = false := hv
+      simp only [inferElemListByteStride, legacyInferElemListByteStride, hbits]
+    · rfl
+    · rfl
+    · have hfields : valueListContainsMovedUninit fields = false := hv
+      show (match valueListContainsMovedUninit fields with
+        | true => inferElemListByteStride rest
+        | false =>
+          match inferValueByteSizeAux 8 (.aggregate 0 fields) with
+          | .some sz => sz
+          | .none => 1) = _
+      rw [hfields]
+      rfl
+    · rfl
 
 end TrustedPlaces
 
@@ -1659,6 +1732,340 @@ theorem canary_D3_union_field_move_and_reinit :
     evalOperand d3UnionLocals (.move (pl 1 [.field 0 d3UnionU8Ty])) [] [] d3UnionLayouts []
       d3UnionDecls [] = .ok (sc8 2) d3UnionLocals :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! #### `ep1-A2`: exact `Deref` targets, strides, global pointees and union byte windows -/
+
+/-- One-byte primitive layout. -/
+def a2U8Layout : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+
+/-- `(u8, u8)` layout (fields at offsets `0` and `1`). -/
+def a2PairLayout : TypeLayout :=
+  { size := ⟨2⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨1⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [0, 0] }
+
+/-- `[(u8, u8); 2]` layout (stride `2`). -/
+def a2PairArrLayout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .array ⟨2⟩ 2, variants := .single 0, isUninhabited := false, fieldLayouts := [1] }
+
+/-- A thin-pointer layout. -/
+def a2PtrLayout : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+
+/-- Layouts of the array-of-pairs canaries. -/
+def a2PairArrLayouts : LayoutTable :=
+  { emptyLayoutTable with entries := [a2U8Layout, a2PairLayout, a2PairArrLayout, a2PtrLayout] }
+
+/-- `(u8, u8)`. -/
+def a2PairTy : Ty := { kind := .tuple [.uint .u8, .uint .u8], layoutIdx := 1 }
+
+/-- `_1 : [(u8, u8); 2]`, `_2 : *mut (u8, u8)`, `_3 : &(u8, u8)`. -/
+def a2PairArrDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := u8Ty, debugName := .none },
+   { mutability := .mut, ty := { kind := .array (.tuple [.uint .u8, .uint .u8]) 2, layoutIdx := 2 },
+     debugName := .none },
+   { mutability := .mut, ty := { kind := .rawPtr .mut (.tuple [.uint .u8, .uint .u8]), layoutIdx := 3 },
+     debugName := .none },
+   { mutability := .not, ty := { kind := .ref .not (.tuple [.uint .u8, .uint .u8]), layoutIdx := 3 },
+     debugName := .none }]
+
+/-- `_1 = [(1, 2), (3, 4)]`; `_2 = &raw mut _1[1]` (tag `2`, active) and
+`_3 = &_1[1]` (tag `3`, frozen), both at byte offset `2` of `_1`. -/
+def a2PairArrLocals : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [.aggregate 0 [sc8 1, sc8 2], .aggregate 0 [sc8 3, sc8 4]]),
+    .init (.ptr { allocId := 2, offsetBytes := 2 } 8), .init (.ptr { allocId := 3, offsetBytes := 2 } 8)]
+
+/-- After `move (*_2).0`: only `_1[1].0` is moved out. -/
+def a2PairArrAfterMove : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [.aggregate 0 [sc8 1, sc8 2], .aggregate 0 [movedUninitValue, sc8 4]]),
+    .init (.ptr { allocId := 2, offsetBytes := 2 } 8), .init (.ptr { allocId := 3, offsetBytes := 2 } 8)]
+
+/-- Typed `deinitProjectedMoves` evaluation over the array-of-pairs canary. -/
+def a2EvalPairArr (locals : List LocalSlot) (op : Operand) : PlaceReadResult :=
+  evalOperand locals op d5Borrows [] a2PairArrLayouts [] a2PairArrDecls [] true
+
+/-- **`(*_ptr).field` through a thin pointer at a non-zero byte offset into an
+array element (`ep1-A2`).** With `_2 : *mut (u8, u8)` pointing at `_1[1]` (byte
+offset `2`), `move (*_2).0` delivers `3` and deinitializes exactly `_1[1].0`: the
+sibling field `(*_2).1` stays readable through `_2` and through the frozen shared
+borrow `_3`, the sibling element `_1[0] = (1, 2)` is untouched, while `(*_2).0`,
+`*_3`, `_1[1]` and `_1` fault; the typed write `(*_2).0 = 9` re-initializes it. -/
+theorem canary_D5_typed_deref_field_of_array_elem_move :
+    a2EvalPairArr a2PairArrLocals (.move (pl 2 [.deref, .field 0 u8Ty])) =
+      .ok (sc8 3) a2PairArrAfterMove ∧
+    a2EvalPairArr a2PairArrAfterMove (.copy (pl 2 [.deref, .field 1 u8Ty])) =
+      .ok (sc8 4) a2PairArrAfterMove ∧
+    a2EvalPairArr a2PairArrAfterMove (.copy (pl 3 [.deref, .field 1 u8Ty])) =
+      .ok (sc8 4) a2PairArrAfterMove ∧
+    a2EvalPairArr a2PairArrAfterMove (.copy (pl 1 [.constantIndex 0 2 false])) =
+      .ok (.aggregate 0 [sc8 1, sc8 2]) a2PairArrAfterMove ∧
+    a2EvalPairArr a2PairArrAfterMove (.copy (pl 2 [.deref, .field 0 u8Ty])) = .ub ∧
+    a2EvalPairArr a2PairArrAfterMove (.copy (pl 3 [.deref])) = .ub ∧
+    a2EvalPairArr a2PairArrAfterMove (.copy (pl 1 [.constantIndex 1 2 false])) = .ub ∧
+    a2EvalPairArr a2PairArrAfterMove (.copy (pl 1 [])) = .ub ∧
+    writePlaceValue a2PairArrAfterMove d5Borrows (pl 2 [.deref, .field 0 u8Ty]) (sc8 9)
+        a2PairArrDecls a2PairArrLayouts =
+      .ok [.uninit, .init (.aggregate 0 [.aggregate 0 [sc8 1, sc8 2], .aggregate 0 [sc8 9, sc8 4]]),
+        .init (.ptr { allocId := 2, offsetBytes := 2 } 8),
+        .init (.ptr { allocId := 3, offsetBytes := 2 } 8)] :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `[u8; 4]` layout (stride `1`). -/
+def a2U8x4Layout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .array ⟨1⟩ 4, variants := .single 0, isUninhabited := false, fieldLayouts := [0] }
+
+/-- `[u8; 2]` layout (stride `1`). -/
+def a2U8x2Layout : TypeLayout :=
+  { size := ⟨2⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .array ⟨1⟩ 2, variants := .single 0, isUninhabited := false, fieldLayouts := [0] }
+
+/-- Layouts of the equal-values canary. -/
+def a2EqLayouts : LayoutTable :=
+  { emptyLayoutTable with entries := [a2U8Layout, a2U8x4Layout, a2PtrLayout, a2U8x2Layout] }
+
+/-- `_1 : [u8; 4]`, `_2 : *mut [u8; 2]`. -/
+def a2EqDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := u8Ty, debugName := .none },
+   { mutability := .mut, ty := { kind := .array (.uint .u8) 4, layoutIdx := 1 }, debugName := .none },
+   { mutability := .mut, ty := { kind := .rawPtr .mut (.array (.uint .u8) 2), layoutIdx := 2 },
+     debugName := .none }]
+
+/-- `_1 = [7, 7, 7, 7]` and `_2 = &raw mut _1[2] as *mut [u8; 2]` (tag `2`, byte
+offset `2`). -/
+def a2EqLocals : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [sc8 7, sc8 7, sc8 7, sc8 7]),
+    .init (.ptr { allocId := 2, offsetBytes := 2 } 8)]
+
+/-- Typed `deinitProjectedMoves` evaluation over the equal-values canary. -/
+def a2EvalEq (locals : List LocalSlot) (op : Operand) : PlaceReadResult :=
+  evalOperand locals op d5Borrows [] a2EqLayouts [] a2EqDecls [] true
+
+/-- `(u8, u8, u8, u8)` layout. -/
+def a2QuadLayout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨1⟩, ⟨2⟩, ⟨3⟩] [0, 1, 2, 3], variants := .single 0,
+    isUninhabited := false, fieldLayouts := [0, 0, 0, 0] }
+
+/-- `_1 : (u8, u8, u8, u8)`, `_2 : *mut (u8, u8)`. -/
+def a2QuadDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := u8Ty, debugName := .none },
+   { mutability := .mut,
+     ty := { kind := .tuple [.uint .u8, .uint .u8, .uint .u8, .uint .u8], layoutIdx := 2 },
+     debugName := .none },
+   { mutability := .mut, ty := { kind := .rawPtr .mut (.tuple [.uint .u8, .uint .u8]), layoutIdx := 3 },
+     debugName := .none }]
+
+/-- `_1 = (7, 7, 7, 7)` and `_2 = &raw mut _1.2 as *mut (u8, u8)` (byte offset `2`). -/
+def a2QuadLocals : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [sc8 7, sc8 7, sc8 7, sc8 7]),
+    .init (.ptr { allocId := 2, offsetBytes := 2 } 8)]
+
+/-- **A `Deref` move deinitializes the place the read accessed, never another
+place holding an equal value (`ep1-A2` regression).** With `_1 = [7, 7, 7, 7]` and
+`_2 = &raw mut _1[2] as *mut [u8; 2]`, `move (*_2)[1]` reads `_1[3]` and
+deinitializes exactly `_1[3]` (`move (*_2)[0]` exactly `_1[2]`), leaving `_1[1]`
+readable; resolving the target by value equality had deinitialized `_1[1]` (resp.
+`_1[0]`) and left the moved `_1[3]` initialized. A pointer cast into the middle of
+a tuple whose typed read decodes the pointee bytes (`(*_2).1` with
+`_2 = &raw mut _1.2 as *mut (u8, u8)`) has no structural target: the move fails
+closed instead of deinitializing the equal-valued `_1.1`. -/
+theorem canary_D5_typed_deref_equal_values_exact_target :
+    a2EvalEq a2EqLocals (.move (pl 2 [.deref, .constantIndex 1 2 false])) =
+      .ok (sc8 7) [.uninit, .init (.aggregate 0 [sc8 7, sc8 7, sc8 7, movedUninitValue]),
+        .init (.ptr { allocId := 2, offsetBytes := 2 } 8)] ∧
+    a2EvalEq a2EqLocals (.move (pl 2 [.deref, .constantIndex 0 2 false])) =
+      .ok (sc8 7) [.uninit, .init (.aggregate 0 [sc8 7, sc8 7, movedUninitValue, sc8 7]),
+        .init (.ptr { allocId := 2, offsetBytes := 2 } 8)] ∧
+    a2EvalEq [.uninit, .init (.aggregate 0 [sc8 7, sc8 7, sc8 7, movedUninitValue]),
+        .init (.ptr { allocId := 2, offsetBytes := 2 } 8)] (.copy (pl 1 [.constantIndex 1 4 false])) =
+      .ok (sc8 7) [.uninit, .init (.aggregate 0 [sc8 7, sc8 7, sc8 7, movedUninitValue]),
+        .init (.ptr { allocId := 2, offsetBytes := 2 } 8)] ∧
+    a2EvalEq [.uninit, .init (.aggregate 0 [sc8 7, sc8 7, sc8 7, movedUninitValue]),
+        .init (.ptr { allocId := 2, offsetBytes := 2 } 8)]
+        (.copy (pl 2 [.deref, .constantIndex 1 2 false])) = .ub ∧
+    evalOperand a2QuadLocals (.copy (pl 2 [.deref, .field 1 u8Ty])) d5Borrows []
+      { emptyLayoutTable with entries := [a2U8Layout, a2PairLayout, a2QuadLayout, a2PtrLayout] } []
+      a2QuadDecls [] true = .ok (sc8 7) a2QuadLocals ∧
+    evalOperand a2QuadLocals (.move (pl 2 [.deref, .field 1 u8Ty])) d5Borrows []
+      { emptyLayoutTable with entries := [a2U8Layout, a2PairLayout, a2QuadLayout, a2PtrLayout] } []
+      a2QuadDecls [] true = .unsupported :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `_1 = [(1, 2), (3, 4)]` and the slice fat pointer `_2 = &raw mut _1[1..]`
+(`len = 1`, byte offset `2`, tag `2`). -/
+def a2StrideLocals : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [.aggregate 0 [sc8 1, sc8 2], .aggregate 0 [sc8 3, sc8 4]]),
+    .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 2 } 8,
+      .scalar { bits := 1, sizeBytes := 8 }])]
+
+/-- After `move _1[0].0`. -/
+def a2StrideAfterMove : List LocalSlot :=
+  [.uninit,
+    .init (.aggregate 0 [.aggregate 0 [movedUninitValue, sc8 2], .aggregate 0 [sc8 3, sc8 4]]),
+    .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 2 } 8,
+      .scalar { bits := 1, sizeBytes := 8 }])]
+
+/-- **Element strides skip nested moved-out leaves (`ep1-A2` regression of the
+`ep1-B2` stride fix).** After `move _1[0].0` on `_1 = [(1, 2), (3, 4)]`, the first
+element holds a moved-out leaf of no byte width, so its inferred size (`1`) is
+not the element stride; `inferElemListByteStride` infers the stride `2` from the
+first element without a moved-out leaf, so the slice fat pointer `_2 = &_1[1..]`
+at byte offset `2` still reads `(*_2)[0].1 = 4`, moves it, and writes it (the
+`ep1-B2` stride faulted on all three because only a moved scalar element was
+skipped). -/
+theorem canary_D9_slice_stride_skips_nested_moved_leaf :
+    inferElemListByteStride
+      [.aggregate 0 [movedUninitValue, sc8 2], .aggregate 0 [sc8 3, sc8 4]] = 2 ∧
+    evalOperand a2StrideLocals (.move (pl 1 [.constantIndex 0 2 false, .field 0 u8Ty]))
+      (deinitProjectedMoves := true) = .ok (sc8 1) a2StrideAfterMove ∧
+    evalOperand a2StrideAfterMove (.copy (pl 2 [.deref, .constantIndex 0 1 false, .field 1 u8Ty]))
+      d5Borrows (deinitProjectedMoves := true) = .ok (sc8 4) a2StrideAfterMove ∧
+    evalOperand a2StrideAfterMove (.move (pl 2 [.deref, .constantIndex 0 1 false, .field 1 u8Ty]))
+      d5Borrows (deinitProjectedMoves := true) =
+      .ok (sc8 4) [.uninit,
+        .init (.aggregate 0 [.aggregate 0 [movedUninitValue, sc8 2],
+          .aggregate 0 [sc8 3, movedUninitValue]]),
+        .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 2 } 8,
+          .scalar { bits := 1, sizeBytes := 8 }])] ∧
+    writePlaceValue a2StrideAfterMove d5Borrows
+        (pl 2 [.deref, .constantIndex 0 1 false, .field 1 u8Ty]) (sc8 9) =
+      .ok [.uninit,
+        .init (.aggregate 0 [.aggregate 0 [movedUninitValue, sc8 2], .aggregate 0 [sc8 3, sc8 9]]),
+        .init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 2 } 8,
+          .scalar { bits := 1, sizeBytes := 8 }])] :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- An immutable 4-byte global holding `0x11223344` (little-endian). -/
+def a2GlobalU32 : CapturedAllocation :=
+  { allocId := 7, bytes := [some 0x44, some 0x33, some 0x22, some 0x11], relocations := [],
+    align := ⟨4⟩, mutability := .not }
+
+/-- An immutable zero-sized global. -/
+def a2GlobalZst : CapturedAllocation :=
+  { allocId := 8, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }
+
+/-- `_1 = &GLOBAL_U32` and `_2 = &GLOBAL_ZST`: pointers with no borrow-table entry. -/
+def a2GlobalLocals : List LocalSlot :=
+  [.uninit, .init (.ptr { allocId := 7, offsetBytes := 0 } 4),
+    .init (.ptr { allocId := 8, offsetBytes := 0 } 0)]
+
+/-- `_1 : &u32`, `_2 : &()`. -/
+def a2GlobalDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := u8Ty, debugName := .none },
+   { mutability := .mut, ty := { kind := .ref .not (.uint .u32), layoutIdx := 0 }, debugName := .none },
+   { mutability := .mut, ty := { kind := .ref .not (.tuple []), layoutIdx := 0 }, debugName := .none }]
+
+/-- **Moves out of global allocations fail closed (`ep1-A2`).** `*_1` (a
+non-zero-sized immutable global, no borrow-table entry) reads `0x11223344`, but
+`move (*_1)` with `deinitProjectedMoves := true` is `.unsupported`, untyped and
+typed alike: it never succeeds as a silent copy that leaves the moved bytes
+initialized (the legacy semantics, which never deinitializes, does return the
+value). Moving the zero-sized global `*_2` moves no bytes and succeeds without
+changing any local. -/
+theorem canary_global_deref_move_fails_closed :
+    evalOperand a2GlobalLocals (.copy (pl 1 [.deref])) [] [a2GlobalU32, a2GlobalZst]
+      (deinitProjectedMoves := true) = .ok (.scalar ⟨0x11223344, 4⟩) a2GlobalLocals ∧
+    evalOperand a2GlobalLocals (.move (pl 1 [.deref])) [] [a2GlobalU32, a2GlobalZst]
+      (deinitProjectedMoves := true) = .unsupported ∧
+    evalOperand a2GlobalLocals (.move (pl 1 [.deref])) [] [a2GlobalU32, a2GlobalZst]
+      emptyLayoutTable [] a2GlobalDecls [] true = .unsupported ∧
+    evalOperand a2GlobalLocals (.move (pl 1 [.deref])) [] [a2GlobalU32, a2GlobalZst] =
+      .ok (.scalar ⟨0x11223344, 4⟩) a2GlobalLocals ∧
+    evalOperand a2GlobalLocals (.move (pl 2 [.deref])) [] [a2GlobalU32, a2GlobalZst]
+      (deinitProjectedMoves := true) = .ok .unit a2GlobalLocals ∧
+    evalOperand a2GlobalLocals (.move (pl 2 [.deref])) [] [a2GlobalU32, a2GlobalZst]
+      emptyLayoutTable [] a2GlobalDecls [] true = .ok .unit a2GlobalLocals :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `u16` layout of the overlapping-union canary. -/
+def a2U16Layout : TypeLayout :=
+  { size := { bytes := 2 }, align := { bytes := 2 },
+    backendRepr := .scalar (.initialized (.int 16 false) { start := 0, end_ := 65535 }),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+/-- `u32` layout of the overlapping-union canary. -/
+def a2U32Layout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 },
+    backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 }),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+/-- `(u16, u16)` layout (fields at offsets `0` and `2`). -/
+def a2U16PairLayout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 2 }, backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨2⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [0, 0] }
+
+/-- `union W { f0: u32, f1: (u16, u16) }`: four bytes, both fields at offset `0`. -/
+def a2UnionWLayout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false, fieldLayouts := [1, 2] }
+
+def a2UnionLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [a2U16Layout, a2U32Layout, a2U16PairLayout, a2UnionWLayout] }
+
+def a2U16Ty : Ty := { kind := .uint .u16, layoutIdx := 0 }
+def a2U32Ty : Ty := { kind := .uint .u32, layoutIdx := 1 }
+def a2U16PairTy : Ty := { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 2 }
+
+/-- `_0 : u16`, `_1 : W`. -/
+def a2UnionDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := a2U16Ty, debugName := none },
+   { mutability := .mut, ty := { kind := .adt "W" [], layoutIdx := 3 }, debugName := none }]
+
+/-- `_1 = W { f0: 0x11223344 }`. -/
+def a2UnionLocals : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [.scalar ⟨0x11223344, 4⟩, .unit])]
+
+/-- `_1` after `move _1.f1.0`: bytes `[0, 2)` uninitialized, bytes `[2, 4)` kept
+(`0x22`, `0x11`, raw overlay). -/
+def a2UnionAfterMove : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [.unit, .unit,
+    .aggregate 0 [.scalar ⟨0, 0⟩, .scalar ⟨0, 0⟩, .scalar ⟨0x22, 1⟩, .scalar ⟨0x11, 1⟩]])]
+
+/-- `_1` after re-initializing `_1.f1.0 = 0x5566`. -/
+def a2UnionAfterReinit : List LocalSlot :=
+  [.uninit, .init (.aggregate 0 [.unit, .aggregate 0 [.scalar ⟨0x5566, 2⟩, .scalar ⟨0x1122, 2⟩]])]
+
+/-- Typed `deinitProjectedMoves` evaluation over the overlapping-union canary. -/
+def a2EvalUnion (locals : List LocalSlot) (op : Operand) : PlaceReadResult :=
+  evalOperand locals op [] [] a2UnionLayouts [] a2UnionDecls [] true
+
+/-- **Partial byte-window move out of overlapping union fields (`ep1-A2`).** For
+`_1 = W { f0: 0x11223344 }` with `f1 : (u16, u16)` overlapping `f0`,
+`move _1.f1.0` delivers the low half `0x3344` and deinitializes exactly bytes
+`[0, 2)`: `_1.f1.1` still reads `0x1122` (bytes `[2, 4)`), while `_1.f1.0`, the
+overlapping `_1.f0` and the pair `_1.f1` fault; the whole union (which may hold
+uninitialized bytes) reads as its raw byte image. Re-initializing `_1.f1.0 =
+0x5566` makes `_1.f0` read `0x11225566`; moving the high half `_1.f1.1` instead
+deinitializes bytes `[2, 4)` only; the legacy semantics keeps the union intact. -/
+theorem canary_D3_union_partial_byte_window_move :
+    a2EvalUnion a2UnionLocals (.move (pl 1 [.field 1 a2U16PairTy, .field 0 a2U16Ty])) =
+      .ok (.scalar ⟨0x3344, 2⟩) a2UnionAfterMove ∧
+    a2EvalUnion a2UnionAfterMove (.copy (pl 1 [.field 1 a2U16PairTy, .field 1 a2U16Ty])) =
+      .ok (.scalar ⟨0x1122, 2⟩) a2UnionAfterMove ∧
+    a2EvalUnion a2UnionAfterMove (.copy (pl 1 [.field 1 a2U16PairTy, .field 0 a2U16Ty])) = .ub ∧
+    a2EvalUnion a2UnionAfterMove (.copy (pl 1 [.field 0 a2U32Ty])) = .ub ∧
+    a2EvalUnion a2UnionAfterMove (.copy (pl 1 [.field 1 a2U16PairTy])) = .ub ∧
+    a2EvalUnion a2UnionAfterMove (.copy (pl 1 [])) =
+      .ok (.aggregate 0 [.unit, .unit,
+        .aggregate 0 [.scalar ⟨0, 0⟩, .scalar ⟨0, 0⟩, .scalar ⟨0x22, 1⟩, .scalar ⟨0x11, 1⟩]])
+        a2UnionAfterMove ∧
+    writePlaceValue a2UnionAfterMove [] (pl 1 [.field 1 a2U16PairTy, .field 0 a2U16Ty])
+        (.scalar ⟨0x5566, 2⟩) a2UnionDecls a2UnionLayouts = .ok a2UnionAfterReinit ∧
+    a2EvalUnion a2UnionAfterReinit (.copy (pl 1 [.field 0 a2U32Ty])) =
+      .ok (.scalar ⟨0x11225566, 4⟩) a2UnionAfterReinit ∧
+    a2EvalUnion a2UnionLocals (.move (pl 1 [.field 1 a2U16PairTy, .field 1 a2U16Ty])) =
+      .ok (.scalar ⟨0x1122, 2⟩) [.uninit, .init (.aggregate 0 [.unit, .unit,
+        .aggregate 0 [.scalar ⟨0x44, 1⟩, .scalar ⟨0x33, 1⟩, .scalar ⟨0, 0⟩, .scalar ⟨0, 0⟩]])] ∧
+    evalOperand a2UnionLocals (.move (pl 1 [.field 1 a2U16PairTy, .field 0 a2U16Ty])) [] []
+      a2UnionLayouts [] a2UnionDecls [] = .ok (.scalar ⟨0x3344, 2⟩) a2UnionLocals :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end TrustedCanaries
 
@@ -2433,6 +2840,106 @@ theorem operandMachine_evalOperand_move_immediate_root (h : OperandMachine.Hooks
 
 end OperandLatch
 
+/-! ### Operand reads: `evalOperandAt` followed by `readImmediate`
+
+`ExecutionMachine.stepHooks` reads the `SwitchInt` discriminant and the `Assert`
+condition, and `evalRvalueIntoPlace` reads `UnaryOp`/`BinaryOp` operands, as
+`PlaceMachine.readImmediate (← OperandMachine.evalOperandAt …)`. -/
+
+section OperandReads
+
+open Miri.ABI Miri.Memory Miri.Interpreter
+
+variable {K User C : Type}
+
+/-- **Non-`count` operand paths.** With `deinitMovedPlace = true`,
+`OperandMachine.evalOperandAt` on every path other than `CopyNonOverlapping`'s
+`count` (in particular the `SwitchInt` discriminant, the `Assert` condition and
+rvalue operands) evaluates a moved place exactly as `OperandMachine.evalOperand`. -/
+theorem operandMachine_evalOperandAt_move_eq_evalOperand (h : OperandMachine.Hooks K User C) (c : C)
+    (path : OperandPath) (place : Miri.MIR.Place) (known : Option LocalLayout)
+    (hon : h.deinitMovedPlace = true)
+    (hpath : (path == OperandPath.instruction "count") = false) :
+    OperandMachine.evalOperandAt h c path (.Move place) known =
+      OperandMachine.evalOperand h c (.Move place) known := by
+  simp only [OperandMachine.evalOperandAt, OperandMachine.evalOperand, hon, ↓reduceIte,
+    OperandMachine.evalOperandAtMoving, hpath, Bool.false_eq_true, bind_pure]
+
+/-- **Operand read of a moved memory place (`SwitchInt` discriminant, `Assert`
+condition, `UnaryOp`/`BinaryOp` operands), universal.** With
+`deinitMovedPlace = true` on both dictionaries, `move place` of a memory place
+queues `(mplace, true)` (`OperandMachine.evalOperandAt` on a non-`count` path is
+`OperandMachine.evalOperand`), and
+`PlaceMachine.readImmediate` consumes the record, performs the unchanged source
+read, and deinitializes the whole moved place `⟨mplace, layout⟩` with the
+Tree-Borrows-silent `writeMemoryRawUninit`: the state the read returns, from
+which `ExecutionMachine.stepHooks` branches (`stepHooks_switchInt_otherwise`), has
+the moved place deinitialized. -/
+theorem operandRead_move_indirect [DecidableEq K]
+    (opHooks : OperandMachine.Hooks K User C) (config : PlaceMachine.AccessConfig K User)
+    (c : C) (path : OperandPath) (place : Miri.MIR.Place) (known : Option LocalLayout)
+    (s s₁ s₂ s₃ : MachineHooks.State K User) (mplace : MemPlace Provenance) (layout : LocalLayout)
+    (val : RvalueImmTy Provenance)
+    (hopOn : opHooks.deinitMovedPlace = true) (hcfgOn : config.deinitMovedPlace = true)
+    (hpath : (path == OperandPath.instruction "count") = false)
+    (hqueueEmpty : s₁.machine.pendingMoveDeinits = #[])
+    (hevalPlace : OperandMachine.evalPlaceToOp opHooks c place known
+      { s with machine := MachineHooks.clearPendingMoveDeinitFlag s.machine } =
+        .ok ⟨.indirect mplace, layout⟩ s₁)
+    (hreadMiri : srcReadImmediate config ⟨.indirect mplace, layout⟩
+      { s₁ with
+        machine :=
+          MachineHooks.MachineState.withPendingMoves
+            (MachineHooks.MachineState.withPendingMoves s₁.machine true #[(mplace, true)])
+            false
+            ((#[(mplace, true)] : Array (MemPlace Provenance × Bool)).eraseIdxIfInBounds 0) } =
+        .ok val s₂)
+    (hdeinitMiri : PlaceMachine.writeMemoryRawUninit config ⟨mplace, layout⟩ s₂ = .ok () s₃) :
+    (do
+      let op ← OperandMachine.evalOperandAt opHooks c path (.Move place) known
+      PlaceMachine.readImmediate config op) s = .ok val s₃ := by
+  rw [operandMachine_evalOperandAt_move_eq_evalOperand opHooks c path place known hopOn hpath]
+  have hop := operandMachine_evalOperand_move_indirect opHooks c place known s s₁ mplace layout
+    hopOn hevalPlace
+  simp only [bind, EStateM.bind, hop]
+  rw [placeMachine_readImmediate_moving config ⟨.indirect mplace, layout⟩ hcfgOn]
+  simp only [MachineHooks.recordPendingMoveDeinit, hqueueEmpty, Array.push_empty]
+  have htake := takePendingMoveDeinitFor_front s₁.machine mplace true true []
+  simp only [bind, EStateM.bind, get, getThe, MonadStateOf.get, EStateM.get, set,
+    MonadStateOf.set, EStateM.set, htake, ↓reduceIte, hreadMiri, hdeinitMiri, pure,
+    EStateM.pure]
+
+/-- **`SwitchInt` discriminant read of a moved unprojected immediate local,
+universal.** The local is replaced by `.live (.immediate .uninit)` at evaluation
+(`operandMachine_evalOperand_move_immediate_root`), before the read, which then
+reads the returned immediate without any memory deinitialization
+(`takePendingMoveDeinitFor_immediate`). -/
+theorem discriminantRead_move_immediate_root [DecidableEq K]
+    (opHooks : OperandMachine.Hooks K User C) (config : PlaceMachine.AccessConfig K User)
+    (c : C) (path : OperandPath) (l : Miri.MIR.LocalId)
+    (s s₁ s₂ : MachineHooks.State K User) (v : Immediate Provenance) (layout : LocalLayout)
+    (frame frame' : Frame Provenance LocalLayout MachineHooks.FrameExtra)
+    (hopOn : opHooks.deinitMovedPlace = true)
+    (hpath : (path == OperandPath.instruction "count") = false)
+    (heval : OperandMachine.evalPlaceToOp opHooks c ⟨l, #[]⟩ none
+      { s with machine := MachineHooks.clearPendingMoveDeinitFlag s.machine } =
+        .ok ⟨.immediate v, layout⟩ s₁)
+    (hzst : layout.layout.isZst = false)
+    (hcur : MachineHooks.currentFrame s₁ = .ok frame s₁)
+    (hrep : frame.replaceLocalValue l (.live (.immediate .uninit)) = .ok frame')
+    (hset : MachineHooks.setCurrentFrame frame' s₁ = .ok () s₂) :
+    (do
+      let op ← OperandMachine.evalOperandAt opHooks c path (.Move ⟨l, #[]⟩) none
+      PlaceMachine.readImmediate config op) s =
+      PlaceMachine.readImmediate config ⟨.immediate v, layout⟩
+        { s₂ with machine := MachineHooks.clearPendingMoveDeinitFlag s₂.machine } := by
+  rw [operandMachine_evalOperandAt_move_eq_evalOperand opHooks c path ⟨l, #[]⟩ none hopOn hpath]
+  have hop := operandMachine_evalOperand_move_immediate_root opHooks c l none s s₁ s₂ v layout
+    frame frame' hopOn heval hzst hcur hrep hset
+  simp only [bind, EStateM.bind, hop]
+
+end OperandReads
+
 /-! ### Step boundaries -/
 
 section StepLatch
@@ -2460,6 +2967,69 @@ theorem step_ignores_entry_latch [DecidableEq K]
         { state with machine := MachineHooks.clearPendingMoveDeinits state.machine } := rfl
 
 end StepLatch
+
+/-! ### `SwitchInt` in the assembled executor -/
+
+section SwitchIntWiring
+
+open Miri.ABI Miri.Memory Miri.Interpreter
+
+variable {K U C O X Host : Type}
+
+/-- The `SwitchInt` discriminant read of `ExecutionMachine.stepHooks`. -/
+def stepSwitchDiscriminantRead [DecidableEq K] (h : ExecutionMachine.Config K U C O X Host)
+    (limits : ExecutionMachine.Limits) (c : C) (discr : Miri.MIR.Operand) :
+    MachineHooks.M K U (RvalueImmTy Provenance) := do
+  let op ← OperandMachine.evalOperandAt
+    (ExecutionMachine.operandHooks (ExecutionMachine.withValidation h limits)) c
+    (OperandPath.instruction "discriminant") discr none
+  PlaceMachine.readImmediate (ExecutionMachine.withValidation h limits).access op
+
+/-- **A faulting discriminant read faults the `SwitchInt` terminator of the
+assembled executor, universal.** `ExecutionMachine.stepHooks` evaluates the
+discriminant with the consumer-side `OperandMachine.evalOperandAt` and reads it with
+`PlaceMachine.readImmediate` (`stepSwitchDiscriminantRead`), whatever the
+configuration: a discriminant read that faults — for example re-reading a place
+deinitialized by an earlier move — faults the terminator with the read's state,
+and no branch is taken. -/
+theorem stepHooks_switchInt_discriminant_error [DecidableEq K]
+    (h : ExecutionMachine.Config K U C O X Host) (limits : ExecutionMachine.Limits) (c : C)
+    (src : Miri.MIR.SourceInfo) (discr : Miri.MIR.Operand) (targets : Miri.MIR.SwitchTargets)
+    (state state' : MachineHooks.State K U) (e : StepError)
+    (hread : stepSwitchDiscriminantRead h limits c discr state = .error e state') :
+    (ExecutionMachine.stepHooks h limits).terminator c ⟨src, .SwitchInt discr targets⟩ state =
+      (state', .error e) := by
+  have hrun : MachineHooks.run (stepSwitchDiscriminantRead h limits c discr) state =
+      (state', .error e) := by
+    simp only [MachineHooks.run, Call.run, hread]
+  unfold stepSwitchDiscriminantRead at hrun
+  unfold ExecutionMachine.stepHooks
+  dsimp only
+  split <;> (simp only [ControlFlow.evalTerminator]; rw [hrun]; rfl)
+
+/-- **The `SwitchInt` branch of the assembled executor is taken from the state
+after the discriminant read, universal.** When the discriminant read
+(`stepSwitchDiscriminantRead`) succeeds with state `state'` — for `move place`, the
+state in which `place` is deinitialized (`operandRead_move_indirect`,
+`discriminantRead_move_immediate_root`) — a `SwitchInt` without matching cases
+jumps to `otherwise` in exactly that state. -/
+theorem stepHooks_switchInt_otherwise [DecidableEq K]
+    (h : ExecutionMachine.Config K U C O X Host) (limits : ExecutionMachine.Limits) (c : C)
+    (src : Miri.MIR.SourceInfo) (discr : Miri.MIR.Operand) (targets : Miri.MIR.SwitchTargets)
+    (state state' : MachineHooks.State K U) (v : RvalueImmTy Provenance)
+    (hread : stepSwitchDiscriminantRead h limits c discr state = .ok v state')
+    (hcases : targets.cases = #[]) :
+    (ExecutionMachine.stepHooks h limits).terminator c ⟨src, .SwitchInt discr targets⟩ state =
+      ControlFlow.goToBlock targets.otherwise state' := by
+  have hrun : MachineHooks.run (stepSwitchDiscriminantRead h limits c discr) state =
+      (state', .ok v) := by
+    simp only [MachineHooks.run, Call.run, hread]
+  unfold stepSwitchDiscriminantRead at hrun
+  unfold ExecutionMachine.stepHooks
+  dsimp only
+  split <;> (simp only [ControlFlow.evalTerminator]; rw [hrun]; simp only [hcases]; rfl)
+
+end SwitchIntWiring
 
 /-! ### Call arguments: consumption, deinitialization and pre-resolution validation -/
 
@@ -3197,6 +3767,126 @@ theorem canary_D4_pair_field_binaryOp :
   ⟨by with_unfolding_all rfl, by with_unfolding_all rfl, by with_unfolding_all rfl⟩
 
 end BinaryOpToy
+
+/-! ### `UnaryOp` (including `PtrMetadata`) reads its whole operand before the operator -/
+
+section UnaryOpA2
+
+open Miri.ABI Miri.Memory Miri.Interpreter
+
+variable {P S C : Type}
+
+/-- The part of the `UnaryOp` arm of `evalRvalueIntoPlace` after its operand has
+been read. -/
+def unaryOpTail {V : Type} (h : RvalueHooks P S C V) (choice : C) (operator : Miri.MIR.UnOp)
+    (layout : TyAndLayout Miri.MIR.TyId) (dest : V) (val : RvalueImmTy P) : RvalueM S Unit := do
+  let result ← h.unaryOp choice operator val
+  rvalueLayoutCheck result.layout layout
+  h.writeImmediate choice result.imm dest
+
+/-- **Operand order of `UnaryOp` (including `PtrMetadata`), universal.**
+`evalRvalueIntoPlace` evaluates the operand and reads it *whole* with
+`readImmediate` (which consumes its move record and, for a moved memory place,
+deinitializes the entire operand layout) before the unary operator runs on the
+read immediate: `PtrMetadata(move p)` of a wide pointer deinitializes both
+halves of `p`, never only its metadata. -/
+theorem evalRvalueIntoPlace_unaryOp {V : Type} (h : RvalueHooks P S C V) (choice : C)
+    (operator : Miri.MIR.UnOp) (operand : Miri.MIR.Operand) (place : Miri.MIR.Place) :
+    evalRvalueIntoPlace h choice (.UnaryOp operator operand) place = (do
+      let dest ← h.evalPlace choice place true
+      let layout := h.placeLayout dest
+      let val ← h.evalOperandAt choice (OperandPath.rvalue "operand") operand
+        (if operator.homogeneous then some layout else none)
+      let val ← h.readImmediate choice val
+      unaryOpTail h choice operator layout dest val) := by
+  unfold evalRvalueIntoPlace unaryOpTail rvalueLayoutCheck
+  unfold_named "_private.Miri.Interpreter.Rvalue.0.Miri.Interpreter.assertRvalueLayout"
+  rfl
+
+end UnaryOpA2
+
+section UnaryOpWiring
+
+open Miri.ABI Miri.Memory Miri.Interpreter
+
+/-- An `EStateM` bind whose first action succeeds continues from its result. -/
+theorem estatem_bind_of_ok {ε σ α β : Type} (m : EStateM ε σ α) (f : α → EStateM ε σ β)
+    (s s' : σ) (a : α) (h : m s = .ok a s') : (m >>= f) s = f a s' := by
+  simp only [bind, EStateM.bind, h]
+
+variable {K U C O X Host : Type}
+
+/-- The executor's expression dictionary evaluates operands with the
+consumer-side `OperandMachine.evalOperandAt`, reads them with
+`PlaceMachine.readImmediate` over the validated access configuration, and applies
+`ScalarOps.unary` (whose `PtrMetadata` arm reads no memory: it checks the read
+immediate and extracts its metadata). -/
+theorem rvalueHooks_operand_wiring [DecidableEq K] (h : ExecutionMachine.Config K U C O X Host)
+    (limits : ExecutionMachine.Limits) :
+    (ExecutionMachine.rvalueHooks h limits).evalOperandAt =
+      OperandMachine.evalOperandAt
+        (ExecutionMachine.operandHooks (ExecutionMachine.withValidation h limits)) ∧
+    (ExecutionMachine.rvalueHooks h limits).readImmediate =
+      (fun _ => PlaceMachine.readImmediate (ExecutionMachine.withValidation h limits).access) ∧
+    (ExecutionMachine.rvalueHooks h limits).unaryOp =
+      ScalarOps.unary (ExecutionMachine.scalarHooks (ExecutionMachine.withValidation h limits)) ∧
+    (ExecutionMachine.rvalueHooks h limits).placeLayout = RuntimePlace.layout :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- With the configuration flag on, both the operand dictionary and the
+validated access configuration of the executor are in `deinitMovedPlace` mode. -/
+theorem withValidation_deinit_flags [DecidableEq K] (h : ExecutionMachine.Config K U C O X Host)
+    (limits : ExecutionMachine.Limits) (hon : h.deinitMovedPlace = true) :
+    (ExecutionMachine.operandHooks
+      (ExecutionMachine.withValidation h limits)).deinitMovedPlace = true ∧
+    (ExecutionMachine.withValidation h limits).access.deinitMovedPlace = true := by
+  simp [ExecutionMachine.operandHooks, ExecutionMachine.withValidation, hon]
+
+/-- **`UnaryOp` (including `PtrMetadata`) of a moved memory place in the real
+executor dictionary, universal.** With `deinitMovedPlace = true`, the assignment
+`dest = UnaryOp(op, move place)` evaluates the destination, queues the moved
+operand, reads it whole and deinitializes the *entire* moved place
+`⟨mplace, layout⟩` (the layout of `place` itself, for a wide pointer both its data
+pointer and its metadata) before the unary operator runs; the operator and the
+destination write then start from the deinitialized state. -/
+theorem rvalueHooks_unaryOp_move_indirect [DecidableEq K]
+    (h : ExecutionMachine.Config K U C O X Host) (limits : ExecutionMachine.Limits) (c : C)
+    (operator : Miri.MIR.UnOp) (place destPlace : Miri.MIR.Place)
+    (s s₀ s₁ s₂ s₃ : MachineHooks.State K U) (dest : ExecutionMachine.Value)
+    (mplace : MemPlace Provenance) (layout : LocalLayout) (val : RvalueImmTy Provenance)
+    (hon : h.deinitMovedPlace = true)
+    (hdest : (ExecutionMachine.rvalueHooks h limits).evalPlace c destPlace true s = .ok dest s₀)
+    (hqueueEmpty : s₁.machine.pendingMoveDeinits = #[])
+    (hevalPlace : OperandMachine.evalPlaceToOp
+      (ExecutionMachine.operandHooks (ExecutionMachine.withValidation h limits)) c place
+      (if operator.homogeneous then some dest.layout else none)
+      { s₀ with machine := MachineHooks.clearPendingMoveDeinitFlag s₀.machine } =
+        .ok ⟨.indirect mplace, layout⟩ s₁)
+    (hreadMiri : srcReadImmediate (ExecutionMachine.withValidation h limits).access
+      ⟨.indirect mplace, layout⟩
+      { s₁ with
+        machine :=
+          MachineHooks.MachineState.withPendingMoves
+            (MachineHooks.MachineState.withPendingMoves s₁.machine true #[(mplace, true)])
+            false
+            ((#[(mplace, true)] : Array (MemPlace Provenance × Bool)).eraseIdxIfInBounds 0) } =
+        .ok val s₂)
+    (hdeinitMiri : PlaceMachine.writeMemoryRawUninit (ExecutionMachine.withValidation h limits).access
+      ⟨mplace, layout⟩ s₂ = .ok () s₃) :
+    evalRvalueIntoPlace (ExecutionMachine.rvalueHooks h limits) c (.UnaryOp operator (.Move place))
+        destPlace s =
+      unaryOpTail (ExecutionMachine.rvalueHooks h limits) c operator dest.layout dest val s₃ := by
+  obtain ⟨hopOn, hcfgOn⟩ := withValidation_deinit_flags h limits hon
+  obtain ⟨hEval, hRead, -, hLayout⟩ := rvalueHooks_operand_wiring h limits
+  have hread := operandRead_move_indirect
+    (ExecutionMachine.operandHooks (ExecutionMachine.withValidation h limits))
+    (ExecutionMachine.withValidation h limits).access c (OperandPath.rvalue "operand") place
+    (if operator.homogeneous then some dest.layout else none) s₀ s₁ s₂ s₃ mplace layout val
+    hopOn hcfgOn rfl hqueueEmpty hevalPlace hreadMiri hdeinitMiri
+  rw [evalRvalueIntoPlace_unaryOp, estatem_bind_of_ok _ _ s s₀ dest hdest, hEval, hRead, hLayout,
+    ← bind_assoc, estatem_bind_of_ok _ _ s₀ s₃ val hread]
+
+end UnaryOpWiring
 
 /-! ### Consumer-side casts: the real `Cast.castMoving` event order
 
@@ -4011,6 +4701,342 @@ theorem canary_D8_unwinding_call_unmoved_ok :
 
 end CallUnpackVirtualAndUnwindD8
 
+/-! ### `SwitchInt` move deinitialization through the real `ControlFlow.evalTerminator` -/
+
+section SwitchIntToy
+
+open Miri.ABI Miri.Memory Miri.Interpreter
+
+/-- Control hooks of the `SwitchInt` toy: a `SwitchInt` only jumps
+(`ControlFlow.goToBlock`), so every frame transition fails. -/
+def swControlHooks : ControlHooks Unit LocalLayout Unit ToyRvState Unit Unit where
+  bodySpan := fun _ => .ok ⟨0⟩
+  returnOperand := fun _ state => (state, .error (.unsupported "sw"))
+  popFrame := fun _ state => (state, .error (.unsupported "sw"))
+  copyReturn := fun _ _ _ state => (state, .error (.unsupported "sw"))
+  cleanupFrame := fun _ _ _ state => (state, .error (.unsupported "sw"))
+  unwindTerminate := fun _ _ state => (state, .error (.unsupported "sw"))
+
+/-- `ControlFlow.TerminatorHooks` whose `SwitchInt` discriminant read composes the
+`D4` toy's consumer-side operand evaluation and typed read (`toyRvEval`, then
+`toyRvRead`: a moved memory place is queued and deinitialized by its own read, a
+moved immediate local is deinitialized at evaluation), exactly as
+`ExecutionMachine.stepHooks` composes `OperandMachine.evalOperandAt` and
+`PlaceMachine.readImmediate` (`stepSwitchDiscriminantRead`); a case matches when it
+equals the value read. -/
+def swTerminatorHooks :
+    TerminatorHooks Unit LocalLayout Unit ToyRvState Unit Unit (RvalueImmTy Unit) where
+  toControlHooks := swControlHooks
+  evalDiscriminant := fun _ op state =>
+    match (do let o ← toyRvEval op; toyRvRead o) state.machine with
+    | .ok v m => ({ state with machine := m }, .ok v)
+    | .error e m => ({ state with machine := m }, .error e)
+  compareSwitchCase := fun _ _ bits state =>
+    (state, .ok (state.machine.reads.getLast? == some bits))
+  call := fun _ _ state => (state, .error (.unsupported "sw"))
+  tailCall := fun _ _ state => (state, .error (.unsupported "sw"))
+  drop := fun _ _ _ _ state => (state, .error (.unsupported "sw"))
+  ignoreOptionalOverflowChecks := fun _ => false
+  readAssertCondition := fun _ _ state => (state, .error (.unsupported "sw"))
+  assertPanic := fun _ _ _ state => (state, .error (.unsupported "sw"))
+
+/-- The single-frame step state of the `SwitchInt` toy at block `blk`. -/
+def swState (blk : Nat) (m : ToyRvState) : StepState Unit LocalLayout Unit ToyRvState :=
+  { stack := ⟨#[d8Frame blk false]⟩, machine := m }
+
+/-- `switchInt(op) -> [1: bb1, otherwise: bb0]`. -/
+def swTerm (op : Miri.MIR.Operand) : Miri.MIR.Terminator :=
+  ⟨⟨⟨0⟩, 0⟩, .SwitchInt op ⟨#[.Case 1 1], 0⟩⟩
+
+/-- `_1 = v`, memory-backed (cell 1). -/
+def swMem (v : Nat) : ToyRvState :=
+  { slots := [.mem, .mem], cells := [none, some v], queue := [], reads := [], written := false }
+
+/-- `_1 = 1`, an immediate local. -/
+def swImm : ToyRvState :=
+  { slots := [.mem, .imm (some 1)], cells := [none, none], queue := [], reads := [], written := false }
+
+/-- **Concrete `SwitchInt` move deinitialization through the real
+`ControlFlow.evalTerminator` (`ep1-A2`).** For
+`switchInt(move _1) -> [1: bb1, otherwise: bb0]`:
+1. memory-backed `_1 = 1`: the discriminant read consumes the move record,
+   deinitializes `_1` and only then branches to `bb1`; with `_1 = 5` it branches
+   to `bb0`, again with `_1` deinitialized;
+2. an immediate local `_1 = 1` is deinitialized at evaluation and the branch to
+   `bb1` is taken;
+3. a later `switchInt(copy _1)` in the target block faults on the moved local,
+   whereas `switchInt(copy _1)` leaves `_1` initialized. -/
+theorem canary_switchInt_move_deinit :
+    ControlFlow.evalTerminator swTerminatorHooks () (swTerm (.Move ⟨1, #[]⟩)) (swState 0 (swMem 1)) =
+      (swState 1 { swMem 1 with cells := [none, none], reads := [1] }, .ok ()) ∧
+    ControlFlow.evalTerminator swTerminatorHooks () (swTerm (.Move ⟨1, #[]⟩)) (swState 0 (swMem 5)) =
+      (swState 0 { swMem 5 with cells := [none, none], reads := [5] }, .ok ()) ∧
+    ControlFlow.evalTerminator swTerminatorHooks () (swTerm (.Move ⟨1, #[]⟩)) (swState 0 swImm) =
+      (swState 1 { swImm with slots := [.mem, .imm none], reads := [1] }, .ok ()) ∧
+    ControlFlow.evalTerminator swTerminatorHooks () (swTerm (.Copy ⟨1, #[]⟩))
+        (swState 1 { swMem 1 with cells := [none, none], reads := [1] }) =
+      (swState 1 { swMem 1 with cells := [none, none], reads := [1] },
+        .error (.undefinedBehavior "invalidUninitBytes")) ∧
+    ControlFlow.evalTerminator swTerminatorHooks () (swTerm (.Copy ⟨1, #[]⟩)) (swState 0 (swMem 1)) =
+      (swState 1 { swMem 1 with reads := [1] }, .ok ()) :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl, by with_unfolding_all rfl,
+   by with_unfolding_all rfl, by with_unfolding_all rfl⟩
+
+end SwitchIntToy
+
+/-! ### `D7`: call destinations overlapping moved arguments -/
+
+section CallDestA2
+
+open Miri.ABI Miri.Memory Miri.Interpreter
+
+/-- **Destination before arguments, universal.** The consumer-side call
+terminator evaluates the destination place before it evaluates (and moves) the
+callee and the arguments, exactly as the source `evalCallTerminator`. -/
+theorem call_evalCallTerminatorMoving_dest_before_args
+    {P S C E Other Extern FnABI ArgABI : Type}
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C) (budget : Nat)
+    (src : Miri.MIR.SourceInfo) (func : Miri.MIR.Operand) (args : Array Miri.MIR.SpannedOperand)
+    (dest : Miri.MIR.Place) (target : Option Miri.MIR.BasicBlockId) (unwind : Miri.MIR.UnwindAction)
+    (callSource : Miri.MIR.CallSource) (fnSpan : Miri.MIR.SpanRef) :
+    Call.evalCallTerminatorMoving h choice budget
+        ⟨src, .Call func args dest target unwind callSource fnSpan⟩ = (do
+      let oldIndex ← h.frameIndex
+      let oldLoc := (← h.getFrame).location
+      let destPlace ← h.evalPlace choice dest false
+      let (evaluated, temps) ← Call.evalCalleeAndArgsMoving h choice func args
+      Call.initFnCall h choice budget ⟨evaluated.callee, evaluated.callerAbi, evaluated.fnAbi,
+        evaluated.args, evaluated.withCallerLocation, destPlace, target,
+        if evaluated.fnAbi.any h.abiCanUnwind then unwind else .Unreachable⟩
+      Call.deallocateTempArgs h choice temps
+      if target.isSome then
+        if (← h.frameIndex) == oldIndex then
+          if (← h.getFrame).location == oldLoc then
+            throw (.invalidProgram "evaluating this call made no progress")) := rfl
+
+/-- Toy call state for destination/argument overlap: caller memory cells (`none`
+= uninitialized; a pointer local holds the cell it points to), the argument
+values the callee received, the return place recorded at call entry, the
+temporaries, and whether the callee frame is active. -/
+structure ToyD7State where
+  cells : List (Option Nat)
+  calleeArgs : List Nat
+  ret : Option (RuntimeStackPlace Unit)
+  temps : List Nat
+  freed : List Nat
+  inCallee : Bool
+
+/-- The cell read of the `D7` toy. -/
+def d7Read (s : ToyD7State) (n : Nat) : Option Nat := (s.cells[n]?).join
+
+/-- Call hooks of the `D7` toy: `evalPlace` of `*_l` loads the pointer held by
+`_l` (faulting when `_l` is uninitialized); `findMirOrEvalFn` records the return
+place and the argument values handed to the callee. -/
+def d7CallHooks : CallHooks Unit ToyD7State Unit Unit Unit Unit Unit Unit where
+  debugAssertions := false
+  getFrame := pure (d8Frame 0 false)
+  setFrame := fun _ => pure ()
+  frameIndex := do pure (if (← get).inCallee then 1 else 0)
+  evalOperand := fun _ op =>
+    match op with
+    | .Copy ⟨0, _⟩ => pure ⟨.immediate .uninit, toyFnLayout⟩
+    | .Copy p | .Move p => pure ⟨.indirect (toyMPlace p.localId), toyU8⟩
+    | _ => throw (.unsupported "d7")
+  evalPlace := fun _ p _ => do
+    let s ← get
+    match (p.projection[0]? : Option Miri.MIR.ProjectionElem) with
+    | some .Deref =>
+      match d7Read s p.localId with
+      | some target => pure (.memory ⟨toyMPlace target, toyU8⟩)
+      | none => throw (.undefinedBehavior "invalidUninitBytes")
+    | _ => pure (.memory ⟨toyMPlace p.localId, toyU8⟩)
+  placeToOp := fun _ rp =>
+    match rp with
+    | .memory m => pure ⟨.indirect m.mplace, m.layout⟩
+    | _ => throw (.unsupported "d7")
+  forceAllocation := fun _ rp =>
+    match rp with
+    | .memory m => pure m
+    | _ => throw (.unsupported "d7")
+  functionSignature := fun _ _ => pure (1, ())
+  functionKind := fun _ => pure (.FnDef 10 #[])
+  readPointer := fun _ _ => throw (.unsupported "d7")
+  getPtrFn := fun _ _ => throw (.unsupported "d7")
+  resolve := fun _ defId _ => pure ⟨.Item defId, #[]⟩
+  fnAbiOfFnPtr := fun _ _ _ => pure ()
+  fnAbiOfInstance := fun _ _ _ => pure ()
+  requiresCallerLocation := fun _ => pure false
+  callerLocation := pure ⟨0⟩
+  abiCanUnwind := fun _ => true
+  abiVariadic := fun _ => false
+  abiFixedCount := fun _ => 0
+  abiArgs := fun _ => #[()]
+  abiReturn := fun _ => ()
+  sameConvention := fun _ _ => true
+  isRustCall := fun _ => false
+  rustAbi := ()
+  argLayout := fun _ => toyU8
+  argIsIgnore := fun _ => false
+  isOneZst := fun _ => false
+  checkArgumentCompat := fun _ _ _ => pure true
+  checkTargetFeatures := fun _ _ => pure ()
+  tupleFields := fun _ => pure #[]
+  projectFnArg := fun _ _ _ => throw (.unsupported "d7")
+  localLayout := fun _ _ => pure toyU8
+  localSpan := fun _ _ => pure ⟨0⟩
+  storageLiveDyn := fun _ _ _ => pure ()
+  copyAllowTransmute := fun _ _ _ => throw (.unsupported "d7")
+  protectArgument := fun _ _ => throw (.invalidProgram "protectArgument must not run on FnArg.Copy")
+  withRetagMode := fun _ _ action => action
+  nonCapturingClosure := fun _ _ _ => pure false
+  allocateStack := fun _ layout => do
+    let s ← get
+    let cell := 6 + s.temps.length
+    set { s with temps := s.temps ++ [cell] }
+    pure ⟨toyMPlace cell, layout⟩
+  copyToMemory := fun _ src dst => do
+    let s ← get
+    match src.op with
+    | .indirect m =>
+      match d7Read s (toyCell m) with
+      | some v => set { s with cells := s.cells.set (toyCell dst.mplace) (some v) }
+      | none => throw (.undefinedBehavior "invalidUninitBytes")
+    | _ => throw (.unsupported "d7")
+  vaListPtr := fun _ _ => throw (.unsupported "d7")
+  writeZeroBytes := fun _ _ _ => throw (.unsupported "d7")
+  vaListKeyField := fun _ _ => throw (.unsupported "d7")
+  writePointerToMemory := fun _ _ _ => throw (.unsupported "d7")
+  pushRaw := fun _ _ _ _ _ => throw (.unsupported "d7")
+  pushDone := fun _ => throw (.unsupported "d7")
+  popRaw := fun _ => throw (.unsupported "d7")
+  cleanup := fun _ _ _ => throw (.unsupported "d7")
+  afterFrameInit := fun _ => pure ()
+  callExtra := fun _ _ _ _ _ _ _ => throw (.unsupported "d7")
+  callIntrinsic := fun _ _ _ _ _ _ => throw (.unsupported "d7")
+  callLlvmIntrinsic := fun _ _ _ _ _ => throw (.unsupported "d7")
+  findMirOrEvalFn := fun _ _ _ args destination _ _ => do
+    let s ← get
+    let argVals := args.toList.filterMap fun arg =>
+      match arg.copyFnArg.op with
+      | .indirect m => d7Read s (toyCell m)
+      | .immediate _ => none
+    set { s with ret := some destination, calleeArgs := argVals, inCallee := true }
+    pure none
+  resolveVirtual := fun _ _ _ _ _ _ => throw (.unsupported "d7")
+  isDynamic := fun _ => pure false
+  unpackDynForDrop := fun _ _ => throw (.unsupported "d7")
+  resolveDropGlue := fun _ _ => throw (.unsupported "d7")
+  mplaceToMutRef := fun _ _ => throw (.unsupported "d7")
+  fakeUnitReturn := fun _ => throw (.unsupported "d7")
+  deinitMovedPlace := true
+  deinitInPlaceArgument := fun _ m => modify fun s =>
+    { s with cells := s.cells.set (toyCell m.mplace) none }
+  validateOperandBeforeCall := fun _ _ => pure ()
+  deallocateStack := fun _ ptr => modify fun s =>
+    { s with freed := s.freed ++ [ptr.offset.bytes.toNat] }
+
+/-- `call callee(move _2) -> [return: bb1, unwind: bb1]` writing `dest`. -/
+def d7Call (dest : Miri.MIR.Place) (arg : Nat) : Miri.MIR.Terminator :=
+  ⟨⟨⟨0⟩, 0⟩, .Call toyFn #[⟨toySpan, .Move ⟨arg, #[]⟩⟩] dest (some 1) (.Cleanup 1) .Normal ⟨0⟩⟩
+
+/-- `_2 = &raw mut _5` (cell 2 holds `5`), `_5 = 42`. -/
+def d7DerefInit : ToyD7State :=
+  { cells := [none, none, some 5, none, none, some 42, none, none],
+    calleeArgs := [], ret := none, temps := [], freed := [], inCallee := false }
+
+/-- After `*_2 = callee(move _2)` entered the callee. -/
+def d7DerefAfter : ToyD7State :=
+  { cells := [none, none, none, none, none, some 42, some 5, none],
+    calleeArgs := [5], ret := some (.memory ⟨toyMPlace 5, toyU8⟩), temps := [6], freed := [6],
+    inCallee := true }
+
+/-- **`*_2 = callee(move _2)`: the destination is resolved before the moved
+argument is deinitialized (`canary_D7_call_dest_resolved_before_arg_move`).** The
+real `Call.evalCallTerminatorMoving` resolves `*_2` through the pointer held by
+`_2` (return place: cell `5`) first, then snapshots `move _2` for the callee
+(which receives the pointer `5`) and deinitializes `_2`. Resolving the
+destination after the move would load the deinitialized pointer and fault. -/
+theorem canary_D7_call_dest_resolved_before_arg_move :
+    Call.evalCallTerminatorMoving d7CallHooks () 1 (d7Call ⟨2, #[.Deref]⟩ 2) d7DerefInit =
+      .ok () d7DerefAfter ∧
+    d7DerefAfter.ret = some (.memory ⟨toyMPlace 5, toyU8⟩) ∧
+    d7Read d7DerefAfter 2 = none ∧
+    d7CallHooks.evalPlace () ⟨2, #[.Deref]⟩ false d7DerefAfter =
+      .error (.undefinedBehavior "invalidUninitBytes") d7DerefAfter :=
+  ⟨by with_unfolding_all rfl, rfl, rfl, by with_unfolding_all rfl⟩
+
+/-- Control hooks of the `D7` toy: `popFrame` pops the callee frame and
+`copyReturn` stores the returned value `77` into the popped frame's return
+place. -/
+def d7ControlHooks : ControlHooks Unit LocalLayout Unit ToyD7State Unit Unit where
+  bodySpan := fun _ => .ok ⟨0⟩
+  returnOperand := fun _ state => (state, .ok ())
+  popFrame := fun _ state =>
+    match state.stack.currentFrame? with
+    | some frame =>
+      ({ stack := ⟨state.stack.frames.pop⟩, machine := { state.machine with inCallee := false } },
+        .ok frame)
+    | none => (state, .error (.stack .emptyStack))
+  copyReturn := fun _ _ rp state =>
+    match rp with
+    | .memory m =>
+      ({ state with machine :=
+          { state.machine with cells := state.machine.cells.set (toyCell m.mplace) (some 77) } },
+        .ok ())
+    | _ => (state, .error (.unsupported "d7"))
+  cleanupFrame := fun _ _ _ state => (state, .ok .normal)
+  unwindTerminate := fun _ _ state => (state, .error (.unsupported "d7"))
+
+/-- `ControlFlow.TerminatorHooks` of the `D7` toy (only `Return` is used). -/
+def d7TerminatorHooks : TerminatorHooks Unit LocalLayout Unit ToyD7State Unit Unit Bool where
+  toControlHooks := d7ControlHooks
+  evalDiscriminant := fun _ _ state => (state, .error (.unsupported "d7"))
+  compareSwitchCase := fun _ _ _ state => (state, .error (.unsupported "d7"))
+  call := fun _ _ state => (state, .error (.unsupported "d7"))
+  tailCall := fun _ _ state => (state, .error (.unsupported "d7"))
+  drop := fun _ _ _ _ state => (state, .error (.unsupported "d7"))
+  ignoreOptionalOverflowChecks := fun _ => false
+  readAssertCondition := fun _ _ state => (state, .error (.unsupported "d7"))
+  assertPanic := fun _ _ _ state => (state, .error (.unsupported "d7"))
+
+/-- The callee frame pushed for return place `rp`, returning to `bb1`. -/
+def d7CalleeFrame (rp : RuntimeStackPlace Unit) : Frame Unit LocalLayout Unit :=
+  { d8Frame 0 false with returnPlace := rp, returnContinuation := .goto (some 1) (.Cleanup 1) }
+
+/-- `_1 = 7`. -/
+def d7RootInit : ToyD7State :=
+  { cells := [none, some 7, none, none, none, none, none, none],
+    calleeArgs := [], ret := none, temps := [], freed := [], inCallee := false }
+
+/-- After `_1 = callee(move _1)` entered the callee. -/
+def d7RootAfter : ToyD7State :=
+  { cells := [none, none, none, none, none, none, some 7, none],
+    calleeArgs := [7], ret := some (.memory ⟨toyMPlace 1, toyU8⟩), temps := [6], freed := [6],
+    inCallee := true }
+
+/-- **`_1 = callee(move _1)`: the moved argument is deinitialized at call entry
+and the return value lands in `_1` (`canary_D7_call_dest_overlaps_moved_arg`).**
+The real `Call.evalCallTerminatorMoving` resolves the destination `_1`, snapshots
+`move _1` (the callee receives `7`) and deinitializes `_1` before the callee
+runs, so `_1` is uninitialized during the call; on `Return` the real
+`ControlFlow.evalTerminator` pops the callee frame, writes the returned value
+into the recorded return place `_1` and resumes the caller at `bb1`. -/
+theorem canary_D7_call_dest_overlaps_moved_arg :
+    Call.evalCallTerminatorMoving d7CallHooks () 1 (d7Call ⟨1, #[]⟩ 1) d7RootInit =
+      .ok () d7RootAfter ∧
+    d7Read d7RootAfter 1 = none ∧
+    ControlFlow.evalTerminator d7TerminatorHooks () ⟨⟨⟨0⟩, 0⟩, .Return⟩
+        { stack := ⟨#[d8Frame 0 false,
+            d7CalleeFrame (d7RootAfter.ret.getD (.memory ⟨toyMPlace 0, toyU8⟩))]⟩,
+          machine := d7RootAfter } =
+      ({ stack := ⟨#[d8Frame 1 false]⟩,
+         machine := { d7RootAfter with
+           cells := [none, some 77, none, none, none, none, some 7, none], inCallee := false } },
+        .ok ()) :=
+  ⟨by with_unfolding_all rfl, rfl, by with_unfolding_all rfl⟩
+
+end CallDestA2
+
 /-! ## Part 4: root-move simulation between `lean-miri` and Trusted `Places` -/
 
 section RootMoveSimulation
@@ -4140,7 +5166,7 @@ theorem indirect_move_simulation {K User C : Type} [DecidableEq K]
     (hcopyT : Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyPlaceRead locals tPlace borrows
       globals layouts callerLocals localDecls callStack = .ok v locals₀)
     (hdeinitT : Trusted.Rustc.V2026_06_01.MirSemantics.evalMoveOperandDeinit tPlace borrows
-      layouts localDecls callStack (.ok v locals₀) = .ok v locals₁)
+      globals layouts callerLocals localDecls callStack (.ok v locals₀) = .ok v locals₁)
     (hrel : rel v val.imm) :
     (do
       let op ← OperandMachine.evalOperand opHooks c (.Move mPlace) known

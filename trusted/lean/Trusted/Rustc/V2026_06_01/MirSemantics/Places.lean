@@ -2750,6 +2750,41 @@ def evalGlobalDerefRead
           | .none => .ub
 
 /--
+Moved-out leaf marker of the consumer-side move deinitialization
+(`evalOperand ... (deinitProjectedMoves := true)`): a scalar with `bits = 1` at
+width `0`. No `ScalarInt` produced by evaluation has width `0` except the raw
+uninitialized union-overlay byte `.scalar ⟨0, 0⟩` (`encodeRawAbstractByteVals`),
+from which this marker is distinct, so reading a union with uninitialized bytes
+stays defined behavior. The marker records no byte width, so byte-size inference
+over runtime values must skip it (`inferElemListByteStride`).
+-/
+@[reducible]
+def movedUninitValue : Value := .scalar { bits := 1, sizeBytes := 0 }
+
+mutual
+/--
+`true` when `v` contains the moved-out leaf marker `movedUninitValue`.
+-/
+def valueContainsMovedUninit : Value → Bool
+  | .scalar sc =>
+    match sc.sizeBytes with
+    | .zero => Nat.beq sc.bits 1
+    | .succ _ => false
+  | .aggregate _ fs => valueListContainsMovedUninit fs
+  | _ => false
+
+/--
+`true` when some element of `vs` contains the moved-out leaf marker.
+-/
+def valueListContainsMovedUninit : List Value → Bool
+  | .nil => false
+  | v :: rest =>
+    match valueContainsMovedUninit v with
+    | true => true
+    | false => valueListContainsMovedUninit rest
+end
+
+/--
 Compute the total byte size of a runtime `Value` using structural recursion on
 `fuel` (supporting nested tuple, struct, and multi-dimensional array
 aggregates).
@@ -2769,7 +2804,12 @@ def inferValueByteSizeAux : Nat → Value → Option Nat
 
 /--
 Infer the element byte stride of a runtime array/slice element list `elems` when
-no static `pointeeTyOpt` is available, defaulting to `1` byte.
+no static `pointeeTyOpt` is available, defaulting to `1` byte. A moved-out
+element (`movedUninitValue`) or a variant-`0` aggregate element holding a
+moved-out leaf (a moved field or element) is skipped, since the marker records
+no byte width: the stride is inferred from the next element. On marker-free
+lists (every list the statement semantics produces) this is the first element's
+size.
 -/
 @[reducible]
 def inferElemListByteStride : List Value → Nat
@@ -2782,10 +2822,13 @@ def inferElemListByteStride : List Value → Nat
     | .succ n => .succ n
   | .ptr _ sz :: _ => sz
   | .unit :: _ => 0
-  | .aggregate 0 fields :: _ =>
-    match inferValueByteSizeAux 8 (.aggregate 0 fields) with
-    | .some sz => sz
-    | .none => 1
+  | .aggregate 0 fields :: rest =>
+    match valueListContainsMovedUninit fields with
+    | true => inferElemListByteStride rest
+    | false =>
+      match inferValueByteSizeAux 8 (.aggregate 0 fields) with
+      | .some sz => sz
+      | .none => 1
   | _ => 1
 
 /--
@@ -10139,50 +10182,18 @@ the moved place of every `Operand.move`, not only an unprojected root local:
 * a union-touching projected place has exactly its byte window
   `[offset, offset + size)` inside the first enclosing union set to
   `AbstractByte.uninit`, and the union value is rebuilt from that byte image;
-* a dereferenced thin stack pointer deinitializes its active-frame target place,
-  without consulting or updating the borrow table (a move has the Tree Borrows
-  effect of the corresponding read only);
+* a dereferenced thin stack pointer or slice fat pointer deinitializes its
+  active-frame target place, resolved exactly as the read of the moved place
+  resolves it, without consulting or updating the borrow table (a move has the
+  Tree Borrows effect of the corresponding read only);
 * zero-sized moved values are left initialized.
 
 Every `Operand.copy`/`Operand.move` read in this mode faults (`.ub`) when the
 read value contains a moved-out leaf. Moves whose source cannot be deinitialized
-in the active frame (foreign-frame or global pointees, slice fat pointers,
-projections through an inner `Deref`, unrepresentable union images) fail closed
-with `.unsupported`.
+in the active frame (foreign-frame or global pointees, projections through an
+inner `Deref`, unrepresentable union images, `Deref` deinitializations that a
+re-read of the moved place does not observe) fail closed with `.unsupported`.
 -/
-
-/--
-Moved-out leaf marker of the consumer-side move deinitialization: a scalar with
-`bits = 1` at width `0`. No `ScalarInt` produced by evaluation has width `0`
-except the raw uninitialized union-overlay byte `.scalar ⟨0, 0⟩`
-(`encodeRawAbstractByteVals`), from which this marker is distinct, so reading a
-union with uninitialized bytes stays defined behavior.
--/
-@[reducible]
-def movedUninitValue : Value := .scalar { bits := 1, sizeBytes := 0 }
-
-mutual
-/--
-`true` when `v` contains the moved-out leaf marker `movedUninitValue`.
--/
-def valueContainsMovedUninit : Value → Bool
-  | .scalar sc =>
-    match sc.sizeBytes with
-    | .zero => Nat.beq sc.bits 1
-    | .succ _ => false
-  | .aggregate _ fs => valueListContainsMovedUninit fs
-  | _ => false
-
-/--
-`true` when some element of `vs` contains the moved-out leaf marker.
--/
-def valueListContainsMovedUninit : List Value → Bool
-  | .nil => false
-  | v :: rest =>
-    match valueContainsMovedUninit v with
-    | true => true
-    | false => valueListContainsMovedUninit rest
-end
 
 /--
 Fault on a successful read whose value contains a moved-out leaf: reading a
@@ -10632,8 +10643,27 @@ def deinitSubPlaceByteWindow
 
 /--
 Deinitialize the active-frame target of a typed thin-pointer dereference move
-`Operand.move (*p).restProj` when `localDecls` is non-empty, using
-`resolveStackThinPtrTargetProjWithResidual?` and `deinitSubPlaceByteWindow`.
+`Operand.move (*p).restProj` when `localDecls` is non-empty. The target place is
+resolved exactly as the typed read `evalStackThinPtrTypedDerefRead` (reached
+from `evalCopyPlaceRead` with the same `pointeeTyOpt`/`accessedTyOpt`) resolves
+it, branch for branch:
+
+* a synthetic `.field` projection on a scalar pointee with an unprojected borrow
+  reads `restProj` directly on the target root, so that sub-place is
+  deinitialized;
+* the scalar-slice fast path (unprojected access of a scalar type inside a
+  scalar target) reads a byte window of that scalar, so the window is
+  deinitialized (`deinitSubPlaceByteWindow`);
+* otherwise `resolveStackThinPtrTargetProjWithResidual?` (with the read's
+  pointee type and its byte requirement, which is only known for an unprojected
+  access) gives the resolved sub-place and residual byte offset, and the read
+  value is a structural sub-value (deinitialized with `deinitMovedSubPlace`) or
+  a byte window of it (`deinitSubPlaceByteWindow`); an unresolved unprojected
+  access decodes the bytes at the borrow target offset, whose window is
+  deinitialized.
+
+No place is ever chosen by comparing values, so a different place holding an
+equal value is never deinitialized.
 -/
 def deinitTypedThinPtrDeref
     (locals : List LocalSlot)
@@ -10656,54 +10686,126 @@ def deinitTypedThinPtrDeref
         let pointeeTyOpt :=
           placeTyResolved localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
         let accessedTyOpt := placeTyResolved localDecls layouts p
+        let isSyntheticFieldOnScalarPointee : Bool :=
+          match stripTransparentProjections restProj, pointeeTyOpt with
+          | .field _ _ :: _, .some { kind := .bool, .. } => true
+          | .field _ _ :: _, .some { kind := .char, .. } => true
+          | .field _ _ :: _, .some { kind := .int _, .. } => true
+          | .field _ _ :: _, .some { kind := .uint _, .. } => true
+          | .field _ _ :: _, .some { kind := .float _, .. } => true
+          | _, _ => false
+        let effPointeeTyOpt : Option Ty :=
+          match isSyntheticFieldOnScalarPointee, pointeeTyOpt with
+          | true, _ => .none
+          | false, .some pt => .some (resolveTyWithLocalDecls localDecls layouts pt)
+          | false, .none => .none
         let resolvedAccTyOpt : Option Ty :=
           match accessedTyOpt with
           | .some accTy => .some (resolveTyWithLocalDecls localDecls layouts accTy)
           | .none => .none
-        let effPointeeTyOpt : Option Ty :=
-          match pointeeTyOpt with
-          | .some pt => .some (resolveTyWithLocalDecls localDecls layouts pt)
-          | .none => .none
-        let reqBytesOpt : Option Nat :=
-          match resolvedAccTyOpt with
-          | .some accTy => tyByteSize localDecls layouts accTy
-          | .none => .none
-        match
-          resolveStackThinPtrTargetProjWithResidual?
+        let rawFullProj :=
+          match entry.targetProjection with
+          | .nil => restProj
+          | ph :: pt => ph :: appendProjections pt restProj
+        match isSyntheticFieldOnScalarPointee, entry.targetProjection with
+        | true, .nil =>
+          deinitMovedSubPlace
             locals
+            localDecls
+            layouts
+            entry.targetLocal
             targetRootVal
-            entry
-            ptrVal
-            restProj
-            localDecls
-            layouts
-            effPointeeTyOpt
-            reqBytesOpt
-            localDecls
-            layouts
-        with
-        | .some (fullProj, .zero) =>
-          match
-            readProjectedForLocal
-              locals
-              localDecls
-              layouts
-              entry.targetLocal
-              targetRootVal
-              fullProj
-          with
-          | .ok subVal =>
-            match valueStructEq subVal fieldVal with
-            | true =>
-              deinitMovedSubPlace
+            rawFullProj
+            fieldVal
+        | _, _ =>
+          let scalarSliceOpt : Option (Option (List LocalSlot)) :=
+            match restProj, resolvedAccTyOpt with
+            | .nil, .some accTy =>
+              match tyScalarBytes accTy with
+              | .some reqBytes =>
+                match
+                  readProjectedForLocal
+                    locals
+                    localDecls
+                    layouts
+                    entry.targetLocal
+                    targetRootVal
+                    rawFullProj
+                with
+                | .ok (.scalar sc) =>
+                  match extractScalarSlice? sc ptrVal.offsetBytes reqBytes with
+                  | .some _ =>
+                    .some
+                      (deinitSubPlaceByteWindow
+                        locals
+                        localDecls
+                        layouts
+                        entry.targetLocal
+                        targetRootVal
+                        rawFullProj
+                        ptrVal.offsetBytes
+                        (.some reqBytes)
+                        fieldVal)
+                  | .none => .none
+                | _ => .none
+              | .none => .none
+            | _, _ => .none
+          match scalarSliceOpt with
+          | .some res => res
+          | .none =>
+            let reqBytesOpt : Option Nat :=
+              match restProj, resolvedAccTyOpt with
+              | .nil, .some accTy => tyByteSize localDecls layouts accTy
+              | _, _ => .none
+            match
+              resolveStackThinPtrTargetProjWithResidual?
                 locals
+                targetRootVal
+                entry
+                ptrVal
+                restProj
                 localDecls
                 layouts
-                entry.targetLocal
-                targetRootVal
-                fullProj
-                fieldVal
-            | false =>
+                effPointeeTyOpt
+                reqBytesOpt
+                localDecls
+                layouts
+            with
+            | .some (fullProj, .zero) =>
+              match
+                readProjectedForLocal
+                  locals
+                  localDecls
+                  layouts
+                  entry.targetLocal
+                  targetRootVal
+                  fullProj
+              with
+              | .ok subVal =>
+                match valueStructEq subVal fieldVal with
+                | true =>
+                  deinitMovedSubPlace
+                    locals
+                    localDecls
+                    layouts
+                    entry.targetLocal
+                    targetRootVal
+                    fullProj
+                    fieldVal
+                | false =>
+                  deinitSubPlaceByteWindow
+                    locals
+                    localDecls
+                    layouts
+                    entry.targetLocal
+                    targetRootVal
+                    fullProj
+                    0
+                    reqBytesOpt
+                    fieldVal
+              | .ub => .none
+              | .unsupported => .none
+            | .some (fullProj, .succ r) =>
               deinitSubPlaceByteWindow
                 locals
                 localDecls
@@ -10711,36 +10813,23 @@ def deinitTypedThinPtrDeref
                 entry.targetLocal
                 targetRootVal
                 fullProj
-                0
+                (.succ r)
                 reqBytesOpt
                 fieldVal
-          | .ub => .none
-          | .unsupported => .none
-        | .some (fullProj, .succ r) =>
-          deinitSubPlaceByteWindow
-            locals
-            localDecls
-            layouts
-            entry.targetLocal
-            targetRootVal
-            fullProj
-            (.succ r)
-            reqBytesOpt
-            fieldVal
-        | .none =>
-          match restProj with
-          | .nil =>
-            deinitSubPlaceByteWindow
-              locals
-              localDecls
-              layouts
-              entry.targetLocal
-              targetRootVal
-              entry.targetProjection
-              ptrVal.offsetBytes
-              reqBytesOpt
-              fieldVal
-          | _ :: _ => .none
+            | .none =>
+              match restProj with
+              | .nil =>
+                deinitSubPlaceByteWindow
+                  locals
+                  localDecls
+                  layouts
+                  entry.targetLocal
+                  targetRootVal
+                  entry.targetProjection
+                  ptrVal.offsetBytes
+                  reqBytesOpt
+                  fieldVal
+              | _ :: _ => .none
       | _ => .none
   | .none => .none
 
@@ -10863,117 +10952,6 @@ def deinitSliceFatPtrDeref
           | .none => .none
         | _ => .none
     | .none => .none
-
-/--
-`deinitProjectedMoves` semantics of `Operand.move p`, given `readResult`, the
-result of reading `p` exactly as `Operand.copy p` does
-(`evalCopyPlaceRead`):
-
-* a read value containing a moved-out leaf faults (`.ub`);
-* a zero-sized moved value leaves the source initialized;
-* otherwise the moved source place is deinitialized (`deinitMovedSubPlace`): the
-  root/projected place of `p`, or, for `(*q).restProj`, the active-frame target
-  of the thin stack pointer or slice fat pointer `q`. The borrow table is never
-  consulted for writing, so sibling `Frozen` borrows of the target stay `Frozen`.
-
-Sources that cannot be deinitialized in the active frame fail closed with
-`.unsupported`.
--/
-def evalMoveOperandDeinit
-    (p : Place)
-    (borrows : List BorrowEntry)
-    (layouts : LayoutTable)
-    (localDecls : List LocalDecl)
-    (callStack : List SavedCallerFrame)
-    (readResult : PlaceReadResult) :
-    PlaceReadResult :=
-  match readResult with
-  | .ok fieldVal locals₀ =>
-    match valueContainsMovedUninit fieldVal with
-    | true => .ub
-    | false =>
-      match moveValueIsZeroSized localDecls layouts (placeTyResolved localDecls layouts p) fieldVal with
-      | true => .ok fieldVal locals₀
-      | false =>
-        match p.projection with
-        | .deref :: restProj =>
-          let untypedOpt : Option (List LocalSlot) :=
-            match moveDerefTarget? locals₀ p restProj borrows callStack with
-            | .some (targetLocal, targetRootVal, fullProj) =>
-              match readProjectedForLocal locals₀ localDecls layouts targetLocal targetRootVal fullProj with
-              | .ok structVal =>
-                match valueStructEq structVal fieldVal with
-                | true =>
-                  deinitMovedSubPlace
-                    locals₀
-                    localDecls
-                    layouts
-                    targetLocal
-                    targetRootVal
-                    fullProj
-                    fieldVal
-                | false => .none
-              | .ub => .none
-              | .unsupported => .none
-            | .none => .none
-          match untypedOpt with
-          | .some locals₁ => .ok fieldVal locals₁
-          | .none =>
-            match get? locals₀ p.local_ with
-            | .some (.init (.ptr ptrVal _)) =>
-              match localDecls with
-              | .nil => .unsupported
-              | _ :: _ =>
-                match
-                  deinitTypedThinPtrDeref
-                    locals₀
-                    localDecls
-                    layouts
-                    borrows
-                    callStack
-                    p
-                    ptrVal
-                    restProj
-                    fieldVal
-                with
-                | .some locals₁ => .ok fieldVal locals₁
-                | .none => .unsupported
-            | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
-              match
-                deinitSliceFatPtrDeref
-                  locals₀
-                  localDecls
-                  layouts
-                  borrows
-                  callStack
-                  p
-                  ptrVal
-                  ptrSz
-                  lenSc
-                  restProj
-                  fieldVal
-              with
-              | .some locals₁ => .ok fieldVal locals₁
-              | .none => .unsupported
-            | _ => .unsupported
-        | _ =>
-          match get? locals₀ p.local_ with
-          | .some (.init rootVal) =>
-            match
-              deinitMovedSubPlace
-                locals₀
-                localDecls
-                layouts
-                p.local_
-                rootVal
-                p.projection
-                fieldVal
-            with
-            | .some locals₁ => .ok fieldVal locals₁
-            | .none => .unsupported
-          | _ => .ub
-  | .ub => .ub
-  | .unsupported => .unsupported
 
 /--
 The `Operand.copy p` read of `evalOperand` (`evalOperand` with
@@ -11255,6 +11233,173 @@ def evalCopyPlaceRead
     | .none => .ub
 
 /--
+`true` when re-reading the moved place `p` from the deinitialized locals
+`locals₁` (exactly as `Operand.copy p` reads it, `evalCopyPlaceRead`) observes
+the move deinitialization: the re-read faults, or returns a value that differs
+structurally from the moved value `fieldVal` (for example the raw byte image of
+a union whose moved byte window is now uninitialized). This is the
+post-condition of every `Deref` move deinitialization in
+`evalMoveOperandDeinit`: a deinitialization that leaves the read of `p`
+unchanged did not deinitialize the place that read accessed, and fails closed.
+-/
+def moveDeinitObserved
+    (locals₁ : List LocalSlot)
+    (p : Place)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame)
+    (fieldVal : Value) :
+    Bool :=
+  match evalCopyPlaceRead locals₁ p borrows globals layouts callerLocals localDecls callStack with
+  | .ok v _ => Bool.not (valueStructEq v fieldVal)
+  | .ub => true
+  | .unsupported => false
+
+/--
+Keep a candidate deinitialized frame of a `Deref` move only when re-reading `p`
+from it observes the deinitialization (`moveDeinitObserved`).
+-/
+def acceptObservedMoveDeinit
+    (p : Place)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame)
+    (fieldVal : Value)
+    (candidate : Option (List LocalSlot)) :
+    Option (List LocalSlot) :=
+  match candidate with
+  | .some locals₁ =>
+    match moveDeinitObserved locals₁ p borrows globals layouts callerLocals localDecls callStack fieldVal with
+    | true => .some locals₁
+    | false => .none
+  | .none => .none
+
+/--
+`deinitProjectedMoves` semantics of `Operand.move p`, given `readResult`, the
+result of reading `p` exactly as `Operand.copy p` does
+(`evalCopyPlaceRead`):
+
+* a read value containing a moved-out leaf faults (`.ub`);
+* a zero-sized moved value leaves the source initialized;
+* otherwise the moved source place is deinitialized (`deinitMovedSubPlace`): the
+  root/projected place of `p`, or, for `(*q).restProj`, the active-frame target
+  of the thin stack pointer or slice fat pointer `q`. The borrow table is never
+  consulted for writing, so sibling `Frozen` borrows of the target stay `Frozen`.
+  A `Deref` target is resolved exactly as the read of `p` resolves it (the
+  untyped read through `moveDerefTarget?`, the typed thin-pointer read through
+  `deinitTypedThinPtrDeref`, the slice fat-pointer read through
+  `deinitSliceFatPtrDeref`), never by searching for a place holding an equal value
+  (which could deinitialize `_1[1]` instead of `_1[3]` for `move (*_2)[1]` with
+  `_2 = &raw mut _1[2]` and `_1 = [7, 7, 7, 7]`), and the deinitialized frame is
+  kept only when re-reading `p` from it observes the deinitialization
+  (`acceptObservedMoveDeinit`).
+
+Sources that cannot be deinitialized in the active frame fail closed with
+`.unsupported`.
+-/
+def evalMoveOperandDeinit
+    (p : Place)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame)
+    (readResult : PlaceReadResult) :
+    PlaceReadResult :=
+  match readResult with
+  | .ok fieldVal locals₀ =>
+    match valueContainsMovedUninit fieldVal with
+    | true => .ub
+    | false =>
+      match moveValueIsZeroSized localDecls layouts (placeTyResolved localDecls layouts p) fieldVal with
+      | true => .ok fieldVal locals₀
+      | false =>
+        match p.projection with
+        | .deref :: restProj =>
+          let candidateOpt : Option (List LocalSlot) :=
+            match get? locals₀ p.local_ with
+            | .some (.init (.ptr ptrVal _)) =>
+              match localDecls with
+              | .nil =>
+                -- The untyped read resolves the target exactly as `moveDerefTarget?`.
+                match moveDerefTarget? locals₀ p restProj borrows callStack with
+                | .some (targetLocal, targetRootVal, fullProj) =>
+                  match readProjectedForLocal locals₀ localDecls layouts targetLocal targetRootVal fullProj with
+                  | .ok structVal =>
+                    match valueStructEq structVal fieldVal with
+                    | true =>
+                      deinitMovedSubPlace
+                        locals₀
+                        localDecls
+                        layouts
+                        targetLocal
+                        targetRootVal
+                        fullProj
+                        fieldVal
+                    | false => .none
+                  | .ub => .none
+                  | .unsupported => .none
+                | .none => .none
+              | _ :: _ =>
+                -- The typed read (`evalStackThinPtrTypedDerefRead`) resolves the
+                -- target exactly as `deinitTypedThinPtrDeref`.
+                deinitTypedThinPtrDeref
+                  locals₀
+                  localDecls
+                  layouts
+                  borrows
+                  callStack
+                  p
+                  ptrVal
+                  restProj
+                  fieldVal
+            | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+              deinitSliceFatPtrDeref
+                locals₀
+                localDecls
+                layouts
+                borrows
+                callStack
+                p
+                ptrVal
+                ptrSz
+                lenSc
+                restProj
+                fieldVal
+            | _ => .none
+          match
+            acceptObservedMoveDeinit p borrows globals layouts callerLocals localDecls callStack
+              fieldVal candidateOpt
+          with
+          | .some locals₁ => .ok fieldVal locals₁
+          | .none => .unsupported
+        | _ =>
+          match get? locals₀ p.local_ with
+          | .some (.init rootVal) =>
+            match
+              deinitMovedSubPlace
+                locals₀
+                localDecls
+                layouts
+                p.local_
+                rootVal
+                p.projection
+                fieldVal
+            with
+            | .some locals₁ => .ok fieldVal locals₁
+            | .none => .unsupported
+          | _ => .ub
+  | .ub => .ub
+  | .unsupported => .unsupported
+
+/--
 Evaluate an `Operand` in `locals` with active borrow table `borrows`, global
 allocations `globals`, and layout table `layouts`, supporting root locals
 (`projection = []`), dereferences (`ProjectionElem.deref` resolved through
@@ -11310,7 +11455,9 @@ def evalOperand
     evalMoveOperandDeinit
       p
       borrows
+      globals
       layouts
+      callerLocals
       localDecls
       callStack
       (evalCopyPlaceRead locals p borrows globals layouts callerLocals localDecls callStack)
@@ -12557,20 +12704,27 @@ def writeStackThinPtrTypedDeref
                     | .none =>
                       match fullProj, oldSc.sizeBytes, Nat.beq residualBytes 0 with
                       | _ :: _, .zero, true =>
-                        match subTyOpt with
-                        | .some subTy =>
-                          match
-                            tyByteSize
-                              effTargetDecls
-                              targetLayouts
-                              (resolveTyWithLocalDecls effTargetDecls targetLayouts subTy)
-                          with
-                          | .some subB =>
-                            match Nat.beq wSc.sizeBytes subB with
-                            | true => .some (.scalar wSc)
-                            | false => .none
+                        -- Re-initialization of a moved-out sub-place: only the
+                        -- consumer-side marker `movedUninitValue` (`bits = 1`),
+                        -- which the statement semantics never creates, is
+                        -- replaced by a same-width store.
+                        match Nat.beq oldSc.bits 1 with
+                        | false => .none
+                        | true =>
+                          match subTyOpt with
+                          | .some subTy =>
+                            match
+                              tyByteSize
+                                effTargetDecls
+                                targetLayouts
+                                (resolveTyWithLocalDecls effTargetDecls targetLayouts subTy)
+                            with
+                            | .some subB =>
+                              match Nat.beq wSc.sizeBytes subB with
+                              | true => .some (.scalar wSc)
+                              | false => .none
+                            | .none => .some (.scalar wSc)
                           | .none => .some (.scalar wSc)
-                        | .none => .some (.scalar wSc)
                       | _, _, _ => .none
                   | _ =>
                     spliceSubValueAtByteOffset?

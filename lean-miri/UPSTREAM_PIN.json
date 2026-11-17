@@ -2534,9 +2534,9 @@
     {
       "path": "Miri/Interpreter/PlaceMachine.lean",
       "upstream_sha256": "573ff212da394ad9ec43f2f7010b1d6f3050dfcc218785168a66a0ebdc804e96",
-      "patched_sha256": "a10e43a6bbb061d5378363499e51413a24d8d5527bc2433d91414ee859d1c660",
+      "patched_sha256": "e6d9cbbf12c2dc7d860f4bcefdbe8eec56bf775595ba517210cc8e63dc3b13ef",
       "upstream_git_blob": "1b3e5cedb4ad98392086ef6867f156a15a74ef5f",
-      "patch_reason": "deinitMovedPlace: rawAccessHooks / writeMemoryRawUninit (Tree-Borrows- and race-silent uninit writes), read-then-deinitialize readImmediate, overlap query, and the place-dictionary latch."
+      "patch_reason": "deinitMovedPlace: rawAccessHooks / writeMemoryRawUninit (Tree-Borrows- and race-silent uninit writes), read-then-deinitialize readImmediate, overlap query, and the place-dictionary latch; drops the unused simp arguments the build linter reports in the upstream proofs memoryAccess_fresh_write and writeMemory_of_result (proof scripts only)."
     }
   ],
   "vendor_aux_files": [

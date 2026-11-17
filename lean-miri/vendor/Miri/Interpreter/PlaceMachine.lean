@@ -451,16 +451,16 @@ theorem memoryAccess_fresh_write (config : AccessConfig K User)
   unfold memoryAccess bridge
   dsimp only [Id.run]
   rw [diagnostic]
-  simp only [Id.run,bind,Bind.bind,pure,Pure.pure,MachineHooks.memoryRaceAccess,noClocks]
+  simp only [Id.run,pure,Pure.pure,MachineHooks.memoryRaceAccess,noClocks]
   rw [weak]
   cases tracked : machine.borrowTracker with
-  | none => simp [tracked,sync,bind,Bind.bind,pure,Pure.pure]
+  | none => simp [sync]
   | some tracker =>
     have tree := BorrowTree.fresh_root_full_write tag size tracker.global.protectedTags
-    simp only [tracked,allocRange,↓reduceIte]
+    simp only [allocRange,↓reduceIte]
     rw [tree.1,tree.2]
     simp only [allocRange] at sync
-    simp [sync,bind,Bind.bind,pure,Pure.pure]
+    simp [sync]
 /-- An internal exact resolver equation lifted through the production bridge. -/
 theorem resolvePointer_ok (config : AccessConfig K User) (memory : MemoryState Provenance BorrowTree K)
     (machine : Machine K User) (pointer : Pointer (Option Provenance)) (amount : Int)
@@ -485,6 +485,6 @@ theorem writeMemory_of_result [DecidableEq K] (config : AccessConfig K User)
   simp only [get,getThe,MonadStateOf.get,EStateM.get,bind,Bind.bind,EStateM.bind]
   rw [operand]
   simp [commit,finish,retain,modify,modifyGet,MonadStateOf.modifyGet,EStateM.modifyGet,
-    pure,Pure.pure,EStateM.pure,bind,Bind.bind,EStateM.bind]
+    pure,Pure.pure,EStateM.pure]
 
 end Miri.Interpreter.PlaceMachine
