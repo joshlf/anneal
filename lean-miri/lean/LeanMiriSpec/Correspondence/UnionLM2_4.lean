@@ -3976,9 +3976,37 @@ theorem PaddedZstUnionUninitMemRel.readScalar_uninit_error
         rfl
     exact ⟨allocId, tag, la, _, hprov, hlive, union_readScalar_uninit hbad⟩
 
+/-- A 0-byte memory-backed ZST place `mp` (such as a `[(); N]` local): `mp`
+points at offset `0` of a live mutable 0-byte allocation (`byteSize = Size.ZERO`,
+`len = 0`). -/
+inductive ZstZeroMemRel
+    (mach : AnnealMachine)
+    (mp : Miri.Interpreter.MemPlace AnnealProv) : Prop where
+  | mk
+      (allocId : Miri.Memory.AllocId)
+      (tag : Miri.Memory.BorTag)
+      (baseAddr : UInt64)
+      (localAlloc :
+        Miri.Memory.LocalAllocation
+          AnnealProv
+          (Option Miri.TreeBorrows.BorrowTree)
+          Miri.Memory.MiriMemoryKind)
+      (ptr_prov : mp.ptr.provenance = some (.concrete allocId tag))
+      (no_misalign : mp.misaligned = none)
+      (thin_meta : mp.metadata = .none)
+      (live_lookup : (allocId, localAlloc) ∈ mach.memory.live.toList)
+      (base_lookup : mach.lookupBaseAddr allocId = some baseAddr)
+      (ptr_addr_eq : mp.ptr.offset = Miri.ABI.Size.ofBytes baseAddr)
+      (alloc_size : localAlloc.allocation.byteSize = Miri.ABI.Size.ZERO)
+      (alloc_len : localAlloc.allocation.len = 0)
+      (alloc_mut : localAlloc.allocation.mutability = .Mut) :
+      ZstZeroMemRel mach mp
+
 /-- Extended local relation covering `UnionLocalRel` plus padded unions whose
 active arm is a 0-byte `[(); N]` ZST array (`zstUninit` on all-uninit storage,
-`zstOverlay` when `[(); N]` overwrote a scalar-initialized union). -/
+`zstOverlay` when `[(); N]` overwrote a scalar-initialized union), pre-allocated
+uninitialized unions (`uninitIndirect`), and 0-byte `[(); N]` ZST array locals
+(`zstArrayIndirect`). -/
 inductive PaddedZstUnionLocalRel
     (mach : AnnealMachine)
     (decl : LocalDecl)
@@ -3990,6 +4018,27 @@ inductive PaddedZstUnionLocalRel
       (mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) :
       UnionLocalRel mach decl layouts slot mls →
       PaddedZstUnionLocalRel mach decl layouts slot mls
+  | uninitIndirect (S n N f_z zstFlIdx : Nat)
+      (mp : Miri.Interpreter.MemPlace AnnealProv)
+      (cachedLayout : Option Miri.Interpreter.LocalLayout) :
+      (∀ l ∈ cachedLayout, l = translateTy decl.ty layouts) →
+      WellTypedPaddedZstUnionTy layouts decl.ty S N f_z zstFlIdx →
+      (translateTy decl.ty layouts).layout.fields = .Union n →
+      PaddedZstUnionUninitMemRel mach decl.ty layouts S mp →
+      PaddedZstUnionLocalRel mach decl layouts
+        .uninit
+        ⟨.live (.indirect mp), cachedLayout⟩
+  | zstArrayIndirect (N : Nat) (slot : LocalSlot)
+      (mp : Miri.Interpreter.MemPlace AnnealProv)
+      (cachedLayout : Option Miri.Interpreter.LocalLayout) :
+      (∀ l ∈ cachedLayout, l = translateTy decl.ty layouts) →
+      decl.ty.kind = .array (.tuple []) N →
+      (translateTy decl.ty layouts).layout.size = Miri.ABI.Size.ZERO →
+      (slot = .uninit ∨ slot = .init (zstArrayVal N)) →
+      ZstZeroMemRel mach mp →
+      PaddedZstUnionLocalRel mach decl layouts
+        slot
+        ⟨.live (.indirect mp), cachedLayout⟩
   | zstUninit (S n N f_z zstFlIdx : Nat)
       (mp : Miri.Interpreter.MemPlace AnnealProv)
       (cachedLayout : Option Miri.Interpreter.LocalLayout) :
@@ -4294,23 +4343,23 @@ def annealEvalOperandLM2_4PaddedZst
   | some p =>
     if isUnionLocal localDecls layouts p.localId then
       match p.projection.toList with
-      | [.Field j fty] =>
-        let st ← get
-        if st.stack.currentFrame?.isNone then
-          throw (.stack .emptyStack)
-        let (frame', _) ← annealResolveAndCacheLocalLayout localDecls layouts p.localId none
-        match frame'.getLocalOperand p.localId with
-        | .error (.localExpectedLive _) => throw (.undefinedBehavior "read of dead local")
-        | .error e => throw (.stack e)
-        | .ok (.immediate .uninit) =>
-          throw (.undefinedBehavior "field read of uninitialized union")
-        | .ok (.immediate _) =>
-          throw (.unsupported "union local held as an initialized immediate")
-        | .ok (.indirect _) =>
-          if isUninhabitedEncodedTyId fty layouts then
+      | [.Field _ fty] =>
+        if isUninhabitedEncodedTyId fty layouts then
+          let st ← get
+          if st.stack.currentFrame?.isNone then
+            throw (.stack .emptyStack)
+          let (frame', _) ← annealResolveAndCacheLocalLayout localDecls layouts p.localId none
+          match frame'.getLocalOperand p.localId with
+          | .error (.localExpectedLive _) => throw (.undefinedBehavior "read of dead local")
+          | .error e => throw (.stack e)
+          | .ok (.immediate .uninit) =>
+            throw (.undefinedBehavior "field read of uninitialized union")
+          | .ok (.immediate _) =>
+            throw (.unsupported "union local held as an initialized immediate")
+          | .ok (.indirect _) =>
             throw (.undefinedBehavior "read of uninhabited union field")
-          else
-            annealEvalUnionField localDecls layouts p.localId j fty
+        else
+          annealEvalOperandLM2_4 localDecls layouts op expectedLayout
       | [.Field j fty, .ConstantIndex offset minLen false] =>
         let st ← get
         if st.stack.currentFrame?.isNone then
@@ -4409,6 +4458,29 @@ theorem annealEvalOperandLM2_4PaddedZst_eq_of_projection
       · rfl
     · rfl
 
+/-- `annealEvalOperandLM2_4PaddedZst` is definitionally equal to
+`annealEvalOperandLM2_4` on every inhabited `[Field j fty]` union field read
+(`isUninhabitedEncodedTyId fty layouts = false`, `G4`). -/
+theorem annealEvalOperandLM2_4PaddedZst_eq_of_inhabited_field
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (p : Miri.MIR.Place) (j : Nat) (fty : Miri.MIR.TyId)
+    (expectedLayout : Option Miri.Interpreter.LocalLayout)
+    (hproj : p.projection.toList = [.Field j fty])
+    (hinh : annealEvalOperandLM2_4PaddedZst.isUninhabitedEncodedTyId fty layouts = false) :
+    annealEvalOperandLM2_4PaddedZst localDecls layouts (.Copy p) expectedLayout =
+        annealEvalOperandLM2_4 localDecls layouts (.Copy p) expectedLayout ∧
+      annealEvalOperandLM2_4PaddedZst localDecls layouts (.Move p) expectedLayout =
+        annealEvalOperandLM2_4 localDecls layouts (.Move p) expectedLayout := by
+  unfold annealEvalOperandLM2_4PaddedZst
+  constructor <;>
+  · dsimp only
+    split
+    · rw [hproj]
+      dsimp only
+      rw [hinh]
+      rfl
+    · rfl
+
 /-- Additive aggregate hooks extending `annealAggregateHooksLM2_4` so zero-sized
 array operands (`src.layout.layout.size.bytes == 0`, such as `[(); N]` in
 `_u = PU { z: op_zst }`) succeed as a 0-byte copy into indirect union field
@@ -4495,5 +4567,45 @@ def annealStepHooksLM2_4PaddedZst
           state
       else
         base.assign choice place rvalue state }
+
+/-- For any `.Use op` rvalue where `annealEvalOperandLM2_4PaddedZst` agrees with
+`annealEvalOperandLM2_4` (including all non-union operands, all `[]`-projected
+union copies/moves, and all inhabited `[Field j fty]` union field reads by
+`annealEvalOperandLM2_4PaddedZst_eq_of_inhabited_field`), `evalRvalueIntoPlace`
+and `StepHooks.assign` under `annealStepHooksLM2_4PaddedZst` are identical to
+`annealStepHooksLM2_4` (`G4`). -/
+theorem annealStepHooksLM2_4PaddedZst_assign_use_eq
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (choice : Unit) (place : Miri.MIR.Place) (op : Miri.MIR.Operand)
+    (retag : Miri.MIR.WithRetag) (state : AnnealStepState)
+    (hop : ∀ known,
+      annealEvalOperandLM2_4PaddedZst localDecls layouts op known =
+        annealEvalOperandLM2_4 localDecls layouts op known) :
+    (annealStepHooksLM2_4PaddedZst localDecls layouts).assign choice place (.Use op retag) state =
+      (annealStepHooksLM2_4 localDecls layouts).assign choice place (.Use op retag) state := by
+  have hrv : Miri.Interpreter.evalRvalueIntoPlace
+      (annealRvalueHooksLM2_4PaddedZst localDecls layouts) choice (.Use op retag) place =
+    Miri.Interpreter.evalRvalueIntoPlace
+      (annealRvalueHooksLM2_4 localDecls layouts) choice (.Use op retag) place := by
+    unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooksLM2_4PaddedZst annealRvalueHooksLM2_4
+    dsimp only
+    congr 1
+    funext dest
+    rw [hop]
+  unfold annealStepHooksLM2_4PaddedZst annealStepHooksLM2_4
+  dsimp only
+  split
+  · rw [hrv]
+  · rfl
+
+@[simp] theorem annealStepHooksLM2_4PaddedZst_storageLive_eq
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    (annealStepHooksLM2_4PaddedZst localDecls layouts).storageLive =
+      (annealStepHooksLM2_4 localDecls layouts).storageLive := rfl
+
+@[simp] theorem annealStepHooksLM2_4PaddedZst_storageDead_eq
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    (annealStepHooksLM2_4PaddedZst localDecls layouts).storageDead =
+      (annealStepHooksLM2_4 localDecls layouts).storageDead := rfl
 
 end LeanMiriSpec.Correspondence

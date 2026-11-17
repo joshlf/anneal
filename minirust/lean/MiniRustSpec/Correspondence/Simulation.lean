@@ -4813,7 +4813,7 @@ function `translateFn body` satisfies both (`step_correspondence_N`); so does
 the translation of a body that differs from `body` only in statements other
 than the current one (used for projected `Deinit` in
 `MiniRustSpec.Correspondence.DeinitWindow`). -/
-theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : inFragment body = true)
+theorem step_correspondence_NF_at (body : CapturedMir) (f : Gen.Function) (hfrag : inFragment body = true)
     (hfl : FnLocalsSpec body f) (ctx : Ctx) (s : MachineState) (m : Mach)
     (hblk : ∀ bb, body.basicBlocks[s.frame.blockIdx]? = some bb →
       ∃ tb, mapGet f.blocks (bbName s.frame.blockIdx) = some tb ∧
@@ -4821,7 +4821,8 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
         (∀ st, bb.statements[s.frame.stmtIdx]? = some st →
           ∃ st', translateStatement body.localDecls st body.layouts = some st' ∧
             tb.statements[s.frame.stmtIdx]? = some st') ∧
-        translateTerminator body.layouts body.localDecls bb.terminator = some tb.terminator)
+        (s.frame.stmtIdx = bb.statements.length →
+          translateTerminator body.layouts body.localDecls bb.terminator = some tb.terminator))
     (hrel : StateRelN body f ctx s m) :
     StepRelN body f ctx s (stepMirFn body s) (Interp.step m) := by
   obtain ⟨view, lm, hrel, hthr, hlo, hns, hbo⟩ := hrel
@@ -6604,6 +6605,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
           exact StepRelN.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
   · ----------------------------------------------------------------- terminator
     have heq : s.frame.stmtIdx = bb.statements.length := by omega
+    have htermspec := htermspec heq
     have hif : ((s.frame.stmtIdx : Nat) : Int) = (tb.statements.length : Int) := by rw [hlen, heq]
     rw [stepMirFn_term body s bb hrel.activeCallee hphase hbb heq]
     simp only [hif, ↓reduceIte]
@@ -6725,6 +6727,21 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
         exact StepRelN.ret' m' (by simp [htt, Interp.evalTerminator, hm', check_after hs'])
           ⟨r0, a0, d0, R, hd0, hv0', hp, hr0, hs'.threads, hs'.allocs, hR⟩
 
+theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : inFragment body = true)
+    (hfl : FnLocalsSpec body f) (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hblk : ∀ bb, body.basicBlocks[s.frame.blockIdx]? = some bb →
+      ∃ tb, mapGet f.blocks (bbName s.frame.blockIdx) = some tb ∧
+        tb.statements.length = bb.statements.length ∧
+        (∀ st, bb.statements[s.frame.stmtIdx]? = some st →
+          ∃ st', translateStatement body.localDecls st body.layouts = some st' ∧
+            tb.statements[s.frame.stmtIdx]? = some st') ∧
+        translateTerminator body.layouts body.localDecls bb.terminator = some tb.terminator)
+    (hrel : StateRelN body f ctx s m) :
+    StepRelN body f ctx s (stepMirFn body s) (Interp.step m) :=
+  step_correspondence_NF_at body f hfrag hfl ctx s m
+    (fun bb hbb => let ⟨tb, h1, h2, h3, h4⟩ := hblk bb hbb; ⟨tb, h1, h2, h3, fun _ => h4⟩)
+    hrel
+
 /-- **Correspondence theorem (one step, preserving `StateRelN`).** For a
 fragment body `body`, its `minimize`-style translation `f`, and related states
 (`StateRelN`), one Anneal MIR step and one MiniRust `Machine::step` correspond
@@ -6737,7 +6754,7 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
     (fun bb hbb => by
       obtain ⟨tb, htb, hgetb⟩ := (translateFn_spec body f hf).2.2 _ bb hbb
       obtain ⟨hlen, hstspec, htermspec⟩ := translateBlock_spec _ _ bb tb htb
-      exact ⟨tb, hgetb, hlen, fun st hst => hstspec _ st hst, htermspec⟩)
+      exact ⟨tb, htb ▸ hgetb, hlen, fun st hst => hstspec _ st hst, htermspec⟩)
     hrel
 
 /-- **Correspondence theorem (one step).** For a fragment body `body`, its
@@ -17016,6 +17033,482 @@ theorem evalPlace_field_mrUnionTy {m m' : Mach} {root : Gen.PlaceExpr} {rootPlac
     ptrOffsetInbounds_zero m' _ haddr0 haddrMax, hsized, LayoutStrategy.is_sized, bind,
     Except.bind, pure, Except.pure]
 
+/-! ### Union Local Storage Relation, Two-Sided Step Simulation, and Computed Translation (`G2`) -/
+
+/-- A 0-byte store at `mrUnitTy` to an aligned place succeeds and leaves all
+allocations unchanged. -/
+theorem placeStore_mrUnitTy (m : Mach) (place : Gen.Place BM) (haligned : place.aligned = true) :
+    placeStore m place (.Tuple []) mrUnitTy =
+      .ok { m with mem := { m.mem with accesses :=
+        m.mem.accesses ++ [⟨.Store, .None, place.ptr.thin_pointer.addr, ⟨0⟩⟩] } } := by
+  simp [placeStore, haligned, typedStore, checkValue_mrUnitTy,
+    Type_encode_mrUnitTy, CM.store, BM.store, Align.is_aligned, BM.check_ptr,
+    bind, Except.bind, pure, Except.pure]
+
+private theorem mapM_replicate_ok_local {α β : Type} (f : α → Interp β) (a : α) (b : β)
+    (hf : f a = .ok b) :
+    ∀ n, List.mapM f (List.replicate n a) = .ok (List.replicate n b)
+  | 0 => rfl
+  | n + 1 => by
+    rw [List.replicate_succ, List.mapM_cons, hf, mapM_replicate_ok_local f a b hf n]
+    rfl
+
+private theorem replicate_nil_flatten : ∀ n : Nat, (List.replicate n ([] : List Byte)).flatten = []
+  | 0 => rfl
+  | n + 1 => by rw [List.replicate_succ, List.flatten_cons, List.nil_append, replicate_nil_flatten n]
+
+theorem Type_encode_mrZstArrayTy (N : Nat) :
+    Interp.Type.encode (mrZstArrayTy N) (.Tuple (List.replicate N (.Tuple []))) = .ok [] := by
+  simp only [mrZstArrayTy, Interp.Type.encode, List.length_replicate, ne_eq, not_true_eq_false, ↓reduceIte]
+  let f := fun value : Gen.Value BM => do
+    let bytes ← Interp.Type.encode mrUnitTy value
+    let elemLayout ← Interp.Type.layout mrUnitTy
+    let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
+    if bytes.length ≠ elemSize.bytes then specPanic "encode: Type::Array element byte length mismatch"
+    else pure bytes
+  have hm : List.mapM f (List.replicate N (.Tuple [])) = .ok (List.replicate N ([] : List Byte)) :=
+    mapM_replicate_ok_local f (.Tuple []) [] rfl N
+  change (do let encoded ← List.mapM f (List.replicate N (.Tuple [])); pure encoded.flatten) = .ok []
+  rw [hm]
+  simp [replicate_nil_flatten N, bind, Except.bind, pure, Except.pure]
+
+/-- A 0-byte store at `mrZstArrayTy N` (`[(); N]`) to an aligned place succeeds
+and leaves all allocations (including any union payload and `.Uninit` padding
+bytes behind `place`) unchanged. -/
+theorem placeStore_mrZstArrayTy (N : Nat) (m : Mach) (place : Gen.Place BM)
+    (haligned : place.aligned = true) :
+    placeStore m place (.Tuple (List.replicate N (.Tuple []))) (mrZstArrayTy N) =
+      .ok { m with mem := { m.mem with accesses :=
+        m.mem.accesses ++ [⟨.Store, .None, place.ptr.thin_pointer.addr, ⟨0⟩⟩] } } := by
+  simp [placeStore, haligned, typedStore, checkValue_mrZstArrayTy,
+    Type_encode_mrZstArrayTy, CM.store, BM.store, Align.is_aligned, BM.check_ptr,
+    bind, Except.bind, pure, Except.pure]
+
+/-- Loading `localPtr ctx u` at `mrUnionTy fields S al` on a `Shape` machine
+whose allocation `L[u]` holds `mrBytes` (`mrBytes.length = S`, `0 < S`) succeeds
+with `.ok (.Union [mrBytes], m')` and preserves `Shape`, even when `mrBytes`
+contains `.Uninit` bytes. -/
+theorem typedLoad_local_mrUnionTy {m : Mach} {ctx : Ctx} {frames : List Frame}
+    {L : List Gen.Allocation} (h : Shape m ctx frames (ctx.base ++ L))
+    (u : Nat) (fields : List (Gen.Offset × Gen.«Type»)) (S al : Nat)
+    (hpos : 0 < S) {mrBytes : List Byte} (hlen : mrBytes.length = S)
+    (hL : L[u]? = some (localAlloc ctx u ⟨.Unsigned, ⟨al⟩⟩ mrBytes))
+    (align : Align) (hal : Align.is_aligned align (ctx.addrs.getD u 0) = true) :
+    ∃ m', typedLoad m (localPtr ctx u) (mrUnionTy fields S al) align .None =
+        .ok (.Union [mrBytes], m') ∧
+      Shape m' ctx frames (ctx.base ++ L) := by
+  obtain ⟨hu, hLu⟩ := List.getElem?_eq_some_iff.mp hL
+  have hset := set_self_of_getElem? L u _ hL
+  have htk : mrBytes.take S = mrBytes := List.take_of_length_le (by omega)
+  have hcm : CM.load m.mem (localPtr ctx u) ⟨S⟩ align .None =
+      .ok (mrBytes, (withMem m (ctx.base ++ L) ⟨.Load, .None, ctx.addrs.getD u 0, ⟨S⟩⟩).mem) := by
+    simp only [CM.load, BM.load, hal, BM.check_ptr, localPtr, listIndex, h.allocs]
+    simp [Nat.ne_of_gt hpos, hu, hLu, Allocation.size, hlen, listSet, subsliceWithLength,
+      hset, htk, withMem]
+  refine ⟨withMem m (ctx.base ++ L) ⟨.Load, .None, ctx.addrs.getD u 0, ⟨S⟩⟩, ?_, withMem_shape h _⟩
+  exact typedLoad_of_ok (Type_layout_mrUnionTy fields S al) hcm
+    (Type_decode_mrUnionTy fields S al hlen) (checkValue_mrUnionTy fields S al hlen _)
+
+/-- Storing `.Union [mrBytes]` at `mrUnionTy fields S al` into `localPtr ctx w`
+on a `Shape` machine whose allocation `L[w]` has length `S` (`0 < S`) writes
+`mrBytes` (including any `.Uninit` bytes) into `L[w]` and preserves `Shape`. -/
+theorem typedStore_local_mrUnionTy {m : Mach} {ctx : Ctx} {frames : List Frame}
+    {L : List Gen.Allocation} (h : Shape m ctx frames (ctx.base ++ L))
+    (w : Nat) (fields : List (Gen.Offset × Gen.«Type»)) (S al : Nat)
+    (hpos : 0 < S) {oldData mrBytes : List Byte}
+    (hold : oldData.length = S) (hlen : mrBytes.length = S)
+    (hL : L[w]? = some (localAlloc ctx w ⟨.Unsigned, ⟨al⟩⟩ oldData))
+    (align : Align) (hal : Align.is_aligned align (ctx.addrs.getD w 0) = true) :
+    typedStore m (localPtr ctx w) (.Union [mrBytes]) (mrUnionTy fields S al) align .None =
+      .ok (withMem m (ctx.base ++ L.set w (localAlloc ctx w ⟨.Unsigned, ⟨al⟩⟩ mrBytes))
+            ⟨.Store, .None, ctx.addrs.getD w 0, ⟨S⟩⟩) := by
+  obtain ⟨hw, hLw⟩ := List.getElem?_eq_some_iff.mp hL
+  have hck := checkValue_mrUnionTy fields S al hlen (some m)
+  have henc := Type_encode_mrUnionTy fields S al hlen
+  have hne : mrBytes ≠ [] := List.ne_nil_of_length_pos (by omega)
+  have hdrop : oldData.drop S = [] := List.drop_eq_nil_of_le (by omega)
+  simp only [typedStore, hck, henc, CM.store, BM.store, hal, BM.check_ptr, localPtr,
+    listIndex, h.allocs]
+  simp [hne, hw, hLw, localAlloc, stackAlloc, Allocation.size, hold, hlen,
+    writeSubsliceAtIndex, listSet, withMem, hdrop]
+
+/-- Local storage invariant tying an Anneal union local `u` (`slot`) to its
+MiniRust allocation `L[u]` on `Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] (ctx.base ++ L)`:
+* `f.locals` maps `localName u` to `mrUnionTy fields S al` (`0 < S`);
+* `lm` maps `localName u` to `localPtr ctx u` with aligned in-bounds address;
+* `L[u]` is `localAlloc ctx u ⟨.Unsigned, ⟨al⟩⟩ mrBytes` (`mrBytes.length = S`),
+  where `mrBytes = List.replicate S .Uninit` when `slot = .uninit`, and
+  `MiniRustUnionBytesRel layouts uTy S val mrBytes` when `slot = .init val`. -/
+structure MiniRustUnionLocalStorage (ctx : Ctx) (L : List Gen.Allocation)
+    (f : Gen.Function) (lm : Map Gen.LocalName Ptr) (layouts : Layout.LayoutTable)
+    (u : Nat) (uTy : MirAst.Ty) (fields : List (Gen.Offset × Gen.«Type»))
+    (S al : Nat) (slot : LocalSlot) (mrBytes : List Byte) : Prop where
+  pos_size : 0 < S
+  align_ok : Align.is_aligned ⟨al⟩ (ctx.addrs.getD u 0) = true
+  addr_nonneg : 0 ≤ ctx.addrs.getD u 0
+  addr_lt : ctx.addrs.getD u 0 + (S : Int) < 2 ^ 64
+  fn_local : mapGet f.locals (localName u) = some (mrUnionTy fields S al)
+  lm_ptr : mapGet lm (localName u) = some (localPtr ctx u)
+  bytes_len : mrBytes.length = S
+  alloc_eq : L[u]? = some (localAlloc ctx u ⟨.Unsigned, ⟨al⟩⟩ mrBytes)
+  slot_rel :
+    match slot with
+    | .uninit => mrBytes = List.replicate S .Uninit
+    | .init val => MiniRustUnionBytesRel layouts uTy S val mrBytes
+    | .dead => False
+
+/-- **Two-sided whole-union copy simulation (`G2`)**:
+Given a `Shape` state where union local `u` holds `.init val` with bytes
+`mrBytes` (`MiniRustUnionLocalStorage ... (.init val) mrBytes`, including any
+`.Uninit` padding bytes) and union local `w` has `MiniRustUnionLocalStorage ... wSlot oldBytes`:
+1. In Anneal (`s.memory.borrows = []`, `s.memory.activeProtectors = []`,
+   `s.memory.callerLocals = []`), `evalStmt s ⟨.assign ⟨w, []⟩ (.use (.copy ⟨u, []⟩)), span⟩`
+   steps to `advanceStmt s (s.frame.locals.set w (.init val)) s.memory`;
+2. In MiniRust, `evalStatement (resetPick m) (.Assign (.Local (localName w)) (.Load (.Local (localName u))))`
+   and `Interp.step m` step to `m'`, copying `mrBytes` into `L[w]` and
+   establishing `MiniRustUnionLocalStorage ctx (L.set w (localAlloc ctx w ⟨.Unsigned, ⟨al⟩⟩ mrBytes)) f lm body.layouts w uTy fields S al (.init val) mrBytes`! -/
+theorem step_union_whole_copy_minirust_simulation
+    {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {lm : Map Gen.LocalName Ptr} {L : List Gen.Allocation}
+    {s : MachineState} {m : Mach} {tb : Gen.BasicBlock}
+    {u w : Nat} {uTy : MirAst.Ty} {fields : List (Gen.Offset × Gen.«Type»)}
+    {S al : Nat} {val : MirSemantics.Value} {wSlot : LocalSlot}
+    {mrBytes oldBytes : List Byte} {span : String}
+    (hsh : Shape m ctx [ctx.caller, calleeFrameL f ctx lm s.frame.blockIdx s.frame.stmtIdx]
+      (ctx.base ++ L))
+    (hu : MiniRustUnionLocalStorage ctx L f lm body.layouts u uTy fields S al (.init val) mrBytes)
+    (hw : MiniRustUnionLocalStorage ctx L f lm body.layouts w uTy fields S al wSlot oldBytes)
+    (hu_slot : s.frame.locals[u]? = some (.init val))
+    (hw_live : s.frame.locals[w]? = some wSlot)
+    (hw_not_dead : wSlot ≠ .dead)
+    (hbor : s.memory.borrows = [])
+    (hprot : s.memory.activeProtectors = [])
+    (_hcaller : s.memory.callerLocals = [])
+    (htb : mapGet f.blocks (bbName s.frame.blockIdx) = some tb)
+    (hlt_tb : s.frame.stmtIdx < tb.statements.length)
+    (htst : tb.statements[s.frame.stmtIdx]? =
+      some (.Assign (.Local (localName w)) (.Load (.Local (localName u)))))
+    (hval : MirSemantics.validateLoadedValue body.layouts body.localDecls (.copy ⟨u, []⟩) val = true := by decide) :
+    evalStmt s ⟨.assign ⟨w, []⟩ (.use (.copy ⟨u, []⟩)), span⟩ body.localDecls body.layouts =
+      MirStepNode.step (advanceStmt s (s.frame.locals.set w (.init val)) s.memory) ∧
+    ∃ m',
+      Interp.step m = .ok m' ∧
+      Shape m' ctx [ctx.caller, calleeFrameL f ctx lm s.frame.blockIdx (s.frame.stmtIdx + 1)]
+        (ctx.base ++ L.set w (localAlloc ctx w ⟨.Unsigned, ⟨al⟩⟩ mrBytes)) ∧
+      MiniRustUnionLocalStorage ctx
+        (L.set w (localAlloc ctx w ⟨.Unsigned, ⟨al⟩⟩ mrBytes))
+        f lm body.layouts w uTy fields S al (.init val) mrBytes := by
+  have hw_lt_af : w < s.frame.locals.length := (List.getElem?_eq_some_iff.mp hw_live).1
+  have hA : evalStmt s ⟨.assign ⟨w, []⟩ (.use (.copy ⟨u, []⟩)), span⟩
+      body.localDecls body.layouts =
+      MirStepNode.step (advanceStmt s (s.frame.locals.set w (.init val)) s.memory) := by
+    have hop : evalOperand s.frame.locals (.copy ⟨u, []⟩) s.memory.borrows s.memory.globals
+        body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
+        .ok val s.frame.locals := by
+      simp [evalOperand, get?, hu_slot, readProjectedValue]
+    have hrv := evalRvalue_use_ok hop hval rfl
+    have hinv : MirSemantics.invalidateConflictingBorrows s.memory.borrows w .none
+        s.memory.callStack.length = s.memory.borrows := by
+      rw [hbor]; rfl
+    simp only [evalStmt, hrv, get?, hw_live, set?, Trusted.Sequence.length, hw_lt_af, ↓reduceIte, hprot, hinv]
+    cases wSlot with
+    | dead => exact absurd rfl hw_not_dead
+    | uninit | init _ =>
+      rw [memory_mk_nil_prot s.memory hprot]
+  have hsh0 := resetPick_shape hsh
+  have hpl_w := evalPlace_local_some hsh0 w (mrUnionTy fields S al) hw.fn_local
+    (localPtr ctx w) hw.lm_ptr
+  have hpl_u := evalPlace_local_some hsh0 u (mrUnionTy fields S al) hu.fn_local
+    (localPtr ctx u) hu.lm_ptr
+  obtain ⟨m1, hload, hsh1⟩ := typedLoad_local_mrUnionTy hsh0 u fields S al
+    hu.pos_size hu.bytes_len hu.alloc_eq ⟨1⟩ (by simp [Align.is_aligned])
+  have hev_u : evalValue (resetPick m) (.Load (.Local (localName u))) =
+      .ok ((.Union [mrBytes], mrUnionTy fields S al), m1) := by
+    simp [evalValue, hpl_u, placeLoad, hload, bind, Except.bind, pure, Except.pure]
+  have hstore := typedStore_local_mrUnionTy hsh1 w fields S al
+    hw.pos_size hw.bytes_len hu.bytes_len hw.alloc_eq ⟨1⟩ (by simp [Align.is_aligned])
+  let m2 := withMem m1 (ctx.base ++ L.set w (localAlloc ctx w ⟨.Unsigned, ⟨al⟩⟩ mrBytes))
+    ⟨.Store, .None, ctx.addrs.getD w 0, ⟨S⟩⟩
+  have hsh2 : Shape m2 ctx [ctx.caller, calleeFrameL f ctx lm s.frame.blockIdx s.frame.stmtIdx]
+      (ctx.base ++ L.set w (localAlloc ctx w ⟨.Unsigned, ⟨al⟩⟩ mrBytes)) :=
+    withMem_shape hsh1 _
+  have hev_st : evalStatement (resetPick m)
+      (.Assign (.Local (localName w)) (.Load (.Local (localName u)))) = .ok m2 := by
+    simp [evalStatement, hpl_w, hev_u, placeStore, hstore, bind, Except.bind, m2]
+  obtain ⟨m3, hm3, hsh3⟩ := bumpStmt_callee hsh2
+  have hne : ((s.frame.stmtIdx : Nat) : Int) ≠ (tb.statements.length : Int) := by omega
+  have hstepM : Interp.step m = .ok m3 := by
+    rw [step_callee hsh tb htb]
+    simp [hne, listIndex_nat _ _ _ htst, hev_st, hm3, check_after hsh3]
+  have hw_lt_L : w < L.length := (List.getElem?_eq_some_iff.mp hw.alloc_eq).1
+  refine ⟨hA, m3, hstepM, hsh3, {
+    pos_size := hw.pos_size
+    align_ok := hw.align_ok
+    addr_nonneg := hw.addr_nonneg
+    addr_lt := hw.addr_lt
+    fn_local := hw.fn_local
+    lm_ptr := hw.lm_ptr
+    bytes_len := hu.bytes_len
+    alloc_eq := List.getElem?_set_self hw_lt_L
+    slot_rel := hu.slot_rel }⟩
+
+/-- **Two-sided 0-byte `[(); N]` ZST union field read simulation (`G2`, `kani#5176`)**:
+On a `Shape` state where union local `u` satisfies `MiniRustUnionLocalStorage`
+(whether `.uninit` or `.init val` with uninitialized padding bytes!) and field
+`j` of `mrUnionTy fields S al` is `mrZstArrayTy N`:
+`evalValue m (.Load (.Field (.Local (localName u)) (j : Int)))` succeeds with
+`(.Tuple (List.replicate N (.Tuple [])), mrZstArrayTy N)` and leaves all
+allocations unchanged. -/
+theorem evalValue_load_union_zstArray_field
+    {m : Mach} {ctx : Ctx} {f : Gen.Function} {lm : Map Gen.LocalName Ptr}
+    {L : List Gen.Allocation} {layouts : Layout.LayoutTable}
+    {blk stmt u j N : Nat} {uTy : MirAst.Ty}
+    {fields : List (Gen.Offset × Gen.«Type»)} {S al : Nat}
+    {slot : LocalSlot} {mrBytes : List Byte}
+    (hsh : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] (ctx.base ++ L))
+    (hu : MiniRustUnionLocalStorage ctx L f lm layouts u uTy fields S al slot mrBytes)
+    (hfld : fields[j]? = some (⟨0⟩, mrZstArrayTy N)) :
+    ∃ m',
+      evalValue m (.Load (.Field (.Local (localName u)) (j : Int))) =
+        .ok ((.Tuple (List.replicate N (.Tuple [])), mrZstArrayTy N), m') ∧
+      Shape m' ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] (ctx.base ++ L) := by
+  have hroot := evalPlace_local_some hsh u (mrUnionTy fields S al) hu.fn_local
+    (localPtr ctx u) hu.lm_ptr
+  have haddrMax : (localPtr ctx u).addr < 2 ^ 64 := by
+    change ctx.addrs.getD u 0 < 2 ^ 64
+    have h1 := hu.pos_size; have h2 := hu.addr_lt; omega
+  have hfp := evalPlace_field_mrUnionTy hroot hfld (Type_layout_mrZstArrayTy N)
+    rfl hu.addr_nonneg haddrMax
+  have hload := placeLoad_mrZstArrayTy N m
+    { ptr := ThinPointer.widen (localPtr ctx u) none, aligned := true } rfl
+  let m' : Mach := { m with mem := { m.mem with accesses :=
+    m.mem.accesses ++ [⟨.Load, .None, (ThinPointer.widen (localPtr ctx u) none).thin_pointer.addr, ⟨0⟩⟩] } }
+  refine ⟨m', ?_, ⟨hsh.threads, hsh.active, hsh.allocs⟩⟩
+  simp [evalValue, hfp, hload, bind, Except.bind, pure, Except.pure, m']
+
+/-- **Two-sided uninhabited 0-byte union field read UB (`G2`, `kani#5159`)**:
+On a `Shape` state where union local `u` satisfies `MiniRustUnionLocalStorage`
+and field `j` is `mrUninhabitedZstTy`:
+`evalValue m (.Load (.Field (.Local (localName u)) (j : Int)))` fails with
+`.error (.ub "load at type but the data in memory violates the language invariant")`,
+even when all `S` bytes of `mrBytes` are initialized! -/
+theorem evalValue_load_union_uninhabited_ub
+    {m : Mach} {ctx : Ctx} {f : Gen.Function} {lm : Map Gen.LocalName Ptr}
+    {L : List Gen.Allocation} {layouts : Layout.LayoutTable}
+    {blk stmt u j : Nat} {uTy : MirAst.Ty}
+    {fields : List (Gen.Offset × Gen.«Type»)} {S al : Nat}
+    {slot : LocalSlot} {mrBytes : List Byte}
+    (hsh : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] (ctx.base ++ L))
+    (hu : MiniRustUnionLocalStorage ctx L f lm layouts u uTy fields S al slot mrBytes)
+    (hfld : fields[j]? = some (⟨0⟩, mrUninhabitedZstTy)) :
+    evalValue m (.Load (.Field (.Local (localName u)) (j : Int))) =
+      .error (.ub "load at type but the data in memory violates the language invariant") := by
+  have hroot := evalPlace_local_some hsh u (mrUnionTy fields S al) hu.fn_local
+    (localPtr ctx u) hu.lm_ptr
+  have haddrMax : (localPtr ctx u).addr < 2 ^ 64 := by
+    change ctx.addrs.getD u 0 < 2 ^ 64
+    have h1 := hu.pos_size; have h2 := hu.addr_lt; omega
+  have hlay : Interp.Type.layout mrUninhabitedZstTy = .ok (.Sized ⟨0⟩ ⟨1⟩) := rfl
+  have hfp := evalPlace_field_mrUnionTy hroot hfld hlay rfl hu.addr_nonneg haddrMax
+  have hload := placeLoad_mrUninhabitedZstTy m
+    { ptr := ThinPointer.widen (localPtr ctx u) none, aligned := true } rfl
+  simp [evalValue, hfp, hload, bind, Except.bind]
+
+/-- **Two-sided uninitialized scalar union field read UB (`G2`)**:
+On a `Shape` state where union local `u` satisfies `MiniRustUnionLocalStorage`,
+field `j` is `.Int it` (`GoodSize it.size.bytes`, `it.size.bytes ≤ S`), and at
+least one byte in `mrBytes.take it.size.bytes` is `.Uninit`:
+`evalValue m (.Load (.Field (.Local (localName u)) (j : Int)))` fails with
+`.error (.ub "load at type but the data in memory violates the language invariant")`. -/
+theorem evalValue_load_union_int_uninit_ub
+    {m : Mach} {ctx : Ctx} {f : Gen.Function} {lm : Map Gen.LocalName Ptr}
+    {L : List Gen.Allocation} {layouts : Layout.LayoutTable}
+    {blk stmt u j : Nat} {uTy : MirAst.Ty}
+    {fields : List (Gen.Offset × Gen.«Type»)} {S al : Nat}
+    {slot : LocalSlot} {mrBytes : List Byte} {it : Gen.IntType}
+    (hsh : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] (ctx.base ++ L))
+    (hu : MiniRustUnionLocalStorage ctx L f lm layouts u uTy fields S al slot mrBytes)
+    (hfld : fields[j]? = some (⟨0⟩, .Int it))
+    (hgood : GoodSize it.size.bytes)
+    (hle : it.size.bytes ≤ S)
+    (huninit : Gen.AbstractByte.Uninit ∈ mrBytes.take it.size.bytes) :
+    evalValue m (.Load (.Field (.Local (localName u)) (j : Int))) =
+      .error (.ub "load at type but the data in memory violates the language invariant") := by
+  have hpos := hgood.pos
+  have hroot := evalPlace_local_some hsh u (mrUnionTy fields S al) hu.fn_local
+    (localPtr ctx u) hu.lm_ptr
+  have haddrMax : (localPtr ctx u).addr < 2 ^ 64 := by
+    change ctx.addrs.getD u 0 < 2 ^ 64
+    have h1 := hu.pos_size; have h2 := hu.addr_lt; omega
+  have hfp := evalPlace_field_mrUnionTy hroot hfld (layout_eq it hgood) rfl hu.addr_nonneg haddrMax
+  obtain ⟨hu_lt, hLu⟩ := List.getElem?_eq_some_iff.mp hu.alloc_eq
+  have hlen_take : (mrBytes.take it.size.bytes).length = it.size.bytes := by
+    rw [List.length_take, hu.bytes_len, Nat.min_eq_left hle]
+  have hdec := Type_decode_int_of_uninit it hlen_take huninit
+  have hle_int : (it.size.bytes : Int) ≤ (S : Int) := by omega
+  have hnot_lt_int : ¬ ((S : Int) < (it.size.bytes : Int)) := by omega
+  simp only [evalValue, hfp, placeLoad, typedLoad, layout_eq it hgood,
+    LayoutStrategy.expect_size, CM.load, BM.load, Align.is_aligned, BM.check_ptr,
+    ThinPointer.widen, localPtr, listIndex, hsh.allocs, bind, Except.bind, pure, Except.pure]
+  simp [Nat.ne_of_gt hpos, hu_lt, hLu, localAlloc, stackAlloc, Allocation.size, hu.bytes_len,
+    hle_int, hnot_lt_int, listSet, subsliceWithLength, hdec, ub]
+
+/-! ### Computed Lowering for Union Bodies (`translateFnWithUnions`, `G2`) -/
+
+/-- Translate a MIR `Ty` (including `()`, `[(); N]`, `VoidZst`, `ManuallyDrop<T>`,
+and single-chunk `#[repr(C)] union` ADTs) to a MiniRust `Gen.Type`. -/
+def translateTyWithUnions (layouts : Layout.LayoutTable) (fuel : Nat) (ty : MirAst.Ty) :
+    Option Gen.«Type» :=
+  match fuel with
+  | 0 => none
+  | fuel' + 1 =>
+    match translateTy layouts ty with
+    | some T => some T
+    | none =>
+      match ty.kind with
+      | .tuple [] => some mrUnitTy
+      | .array (.tuple []) n => some (mrZstArrayTy n)
+      | .adt _ _ =>
+        match layouts.lookup ty.layoutIdx with
+        | none => none
+        | some tl =>
+          if tl.isUninhabited && tl.size.bytes == 0 then
+            some mrUninhabitedZstTy
+          else
+            match tl.fields with
+            | .arbitrary [⟨0⟩] [0] =>
+              match tl.fieldLayouts with
+              | [flIdx] => do
+                let inner ← translateLayoutEntryWithUnions layouts fuel' flIdx
+                some (mrManuallyDropTy inner tl.size.bytes tl.align.bytes)
+              | _ => none
+            | .union _ => do
+              let fTys ← tl.fieldLayouts.mapM (translateLayoutEntryWithUnions layouts fuel')
+              some (mrUnionTy (fTys.map (fun t => (⟨0⟩, t))) tl.size.bytes tl.align.bytes)
+            | _ => none
+      | _ => none
+where
+  translateLayoutEntryWithUnions (layouts : Layout.LayoutTable) (fuel : Nat) (idx : Nat) :
+      Option Gen.«Type» :=
+    match fuel with
+    | 0 => none
+    | fuel' + 1 =>
+      match layouts.lookup idx with
+      | none => none
+      | some tl =>
+        if tl.isUninhabited && tl.size.bytes == 0 then
+          some mrUninhabitedZstTy
+        else
+          match tl.fields with
+          | .primitive =>
+            match tl.backendRepr with
+            | .scalar (.initialized (.int bits signed) _) =>
+              some (.Int ⟨if signed then .Signed else .Unsigned, ⟨bits / 8⟩⟩)
+            | _ => none
+          | .arbitrary [] [] => some mrUnitTy
+          | .arbitrary [⟨0⟩] [0] =>
+            match tl.fieldLayouts with
+            | [flIdx] => do
+              let inner ← translateLayoutEntryWithUnions layouts fuel' flIdx
+              some (mrManuallyDropTy inner tl.size.bytes tl.align.bytes)
+            | _ => none
+          | .array ⟨0⟩ n => some (mrZstArrayTy n)
+          | _ => none
+
+def translateLocalsWithUnions (layouts : Layout.LayoutTable) :
+    Nat → List LocalDecl → Option (List (Gen.LocalName × Gen.«Type»))
+  | _, [] => some []
+  | i, d :: ds => do
+    let ty ← translateTyWithUnions layouts 4 d.ty
+    let rest ← translateLocalsWithUnions layouts (i + 1) ds
+    some ((localName i, ty) :: rest)
+
+def translateOperandWithUnions (decls : List LocalDecl) (op : MirAst.Operand) :
+    Option Gen.ValueExpr :=
+  match op with
+  | .copy p | .move p => do
+    let pe ← translatePlace decls p
+    some (.Load pe)
+  | .constant c =>
+    match c.val with
+    | .zeroSized =>
+      match c.ty.kind with
+      | .tuple [] => some (.Tuple [] mrUnitTy)
+      | _ => translateOperand decls op
+    | _ => translateOperand decls op
+
+/-- Lower a MIR statement on union, `ManuallyDrop`, and ZST locals to MiniRust
+statements (`ValueExpr::Union` lowered to `Deinit` + field assignment when
+`deinitUnionAgg = true`, or field assignment when `deinitUnionAgg = false`). -/
+def translateStatementWithUnions (layouts : Layout.LayoutTable) (decls : List LocalDecl)
+    (deinitUnionAgg : Bool := true) (st : MirAst.Statement) : Option (List Gen.Statement) :=
+  match st.kind with
+  | .assign ⟨u, []⟩ (.aggregate (.adt _ 0 (some fIdx)) [op]) => do
+    let val ← translateOperandWithUnions decls op
+    let assignStmt := Gen.Statement.Assign (.Field (.Local (localName u)) (fIdx : Int)) val
+    if deinitUnionAgg then
+      some [.Deinit (.Local (localName u)), assignStmt]
+    else
+      some [assignStmt]
+  | .assign dst (.aggregate (.adt _ 0 none) ops) => do
+    let pe ← translatePlace decls dst
+    let d ← decls[dst.local_]?
+    let ty ← translateTyWithUnions layouts 4 d.ty
+    let vals ← ops.mapM (translateOperandWithUnions decls)
+    some [.Assign pe (.Tuple vals ty)]
+  | .assign _ (.repeat (.constant { val := .zeroSized, .. }) _) =>
+    -- In `minimize`/MiniRust, a `[(); N]` local allocated by `StorageLive`
+    -- already decodes to `N` unit values from `0` bytes (`placeLoad_mrZstArrayTy`),
+    -- so initializing a `[(); N]` temporary from `[(); N]` is a zero-byte no-op.
+    some []
+  | .assign dst (.use op) => do
+    let pe ← translatePlace decls dst
+    let val ← translateOperandWithUnions decls op
+    some [.Assign pe val]
+  | .assign dst (.cast .intToInt op targetTy) => do
+    let pe ← translatePlace decls dst
+    let val ← translateOperandWithUnions decls op
+    let it ← intTypeOf targetTy
+    some [.Assign pe (.UnOp (.Cast (.IntToInt it)) val)]
+  | _ => do
+    let st' ← translateStatement decls st layouts
+    some [st']
+
+/-- Non-return locals (`1 ≤ i < decls.length`) mentioned in `bb.statements`. -/
+def blockMentionedLocals (body : CapturedMir) (bb : BasicBlockData) : List Nat :=
+  (List.range body.localDecls.length).filter fun i =>
+    decide (body.argCount + 1 ≤ i) &&
+    bb.statements.any (fun s => (stmtLocals s).contains i)
+
+def translateBlocksWithUnions (body : CapturedMir) (deinitUnionAgg : Bool := true) :
+    Nat → List BasicBlockData → Option (List (Gen.BbName × Gen.BasicBlock))
+  | _, [] => some []
+  | i, bb :: bbs => do
+    let liveLocs := blockMentionedLocals body bb
+    let slStmts := liveLocs.map (fun loc => Gen.Statement.StorageLive (localName loc))
+    let bodyStmts ← bb.statements.mapM
+      (translateStatementWithUnions body.layouts body.localDecls deinitUnionAgg)
+    let term ← translateTerminator body.layouts body.localDecls bb.terminator
+    let rest ← translateBlocksWithUnions body deinitUnionAgg (i + 1) bbs
+    some ((bbName i, ⟨slStmts ++ bodyStmts.flatten, term, .Regular⟩) :: rest)
+
+/-- Computed translation of a union-bearing `CapturedMir` body into a MiniRust
+`Gen.Function` (`G2`). -/
+def translateFnWithUnions (body : CapturedMir) (deinitUnionAgg : Bool := true) :
+    Option Gen.Function := do
+  let conv ← translateCallConv body.fnAbi.conv
+  let locals ← translateLocalsWithUnions body.layouts 0 body.localDecls
+  let blocks ← translateBlocksWithUnions body deinitUnionAgg 0 body.basicBlocks
+  some {
+    locals := ⟨locals⟩
+    args := (List.range body.argCount).map (fun k => localName (k + 1))
+    ret := localName 0
+    calling_convention := conv
+    blocks := ⟨blocks⟩
+    start := bbName 0
+    implicit_writes := true
+  }
+
 /-! ## `TerminatorKind.assert` (`assert cond expected target unwind`)
 
 `minimize` lowers `TerminatorKind::Assert` to a two-way `Switch` on the checked
@@ -17229,7 +17722,7 @@ the fresh blocks `extra`, all of which `f` contains (`hextra`):
    `build::abort()` block that stands for `mk_start_fn`'s unwind block and
    reaches `Interp.steps 2 m = .error .abort`. -/
 theorem step_terminator_assert_simulation
-    {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {body : CapturedMir} {bMove : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {view : List LocalSlot} {lm : Map Gen.LocalName Ptr}
     {s : MachineState} {m : Mach} {bb : BasicBlockData} {tb : Gen.BasicBlock}
     {cond : Operand} {expected : Bool} {target : BasicBlockIdx} {unwind : UnwindAction}
@@ -17254,8 +17747,8 @@ theorem step_terminator_assert_simulation
     (hfl : FnLocalsSpec body f)
     (hlo : LocalsOk body (ctxWithBorrows body ctx s.memory.borrows) view lm m.mem.memory.allocations)
     (hns : NonScalarLive body view lm)
-    (hstale : StaleOk body s.frame.locals view s.frame.blockIdx s.frame.stmtIdx)
-    (hreads : readsOk (movedBefore body s.frame.blockIdx bb.statements.length) [cond] = true) :
+    (hstale : StaleOk bMove s.frame.locals view s.frame.blockIdx s.frame.stmtIdx)
+    (hreads : readsOk (movedBefore bMove s.frame.blockIdx bb.statements.length) [cond] = true) :
     (opBits view (copyOp cond) = none →
       stepMirFn body s = MirStepNode.fail .ub ∧
       ∃ msg, Interp.step m = .error (.ub msg)) ∧
@@ -17310,7 +17803,7 @@ theorem step_terminator_assert_simulation
     obtain ⟨htt, -, hex⟩ := htt
     obtain ⟨hokT, hMok, hMnone⟩ := assert_discr_spec hframe expected hdok hv
     have hsimple : simpleOp cond = true := (readsOk_spec hreads cond (by simp)).1
-    have hstale_end : StaleOk body s.frame.locals view s.frame.blockIdx bb.statements.length := by
+    have hstale_end : StaleOk bMove s.frame.locals view s.frame.blockIdx bb.statements.length := by
       rw [← hstmt_end]; exact hstale
     have hbitsEq : opBits s.frame.locals (copyOp cond) = opBits view (copyOp cond) :=
       opBits_frame _ (by
@@ -17505,5 +17998,916 @@ def translateFnWithAssert (body : CapturedMir) : Option Gen.Function := do
     start := bbName n
     implicit_writes := true
   }
+
+/-! ### `inFragmentWithAssert`, `StepRelWithAssert`, and Whole-Execution Lift (`G1`) -/
+
+/-- Replace `.assert cond expected target unwind` by a `.switchInt` terminator
+with the same operand reads, moves, and in-body successor targets (`[target, cleanupBb]`
+for `.cleanup cleanupBb`, `[target]` otherwise), so all `inFragment` dataflow
+analyses (`movesOk`, `mentionsOk`, `storageDeadOk`, `ptrAliasingOk`, `livenessOk`,
+`tupleInitOk`) apply directly to `eraseAssert body`. -/
+def eraseAssertSwitchTargets (expected : Bool) (target : BasicBlockIdx)
+    (unwind : UnwindAction) : MirAst.SwitchTargets :=
+  { branches := [(if expected then 1 else 0, target)]
+    otherwise := match unwind with | .cleanup cleanupBb => cleanupBb | _ => target }
+
+def eraseAssertTerm (t : MirAst.Terminator) : MirAst.Terminator :=
+  match t.kind with
+  | .assert cond expected target unwind =>
+    { t with kind := .switchInt cond (eraseAssertSwitchTargets expected target unwind) }
+  | _ => t
+
+def isAssertTerm (t : MirAst.Terminator) : Bool :=
+  match t.kind with
+  | .assert .. => true
+  | _ => false
+
+theorem eraseAssertTerm_of_not {t : MirAst.Terminator} (h : isAssertTerm t = false) :
+    eraseAssertTerm t = t := by
+  obtain ⟨kind, span⟩ := t
+  cases kind <;> first | rfl | simp [isAssertTerm] at h
+
+def eraseAssertBlock (bb : BasicBlockData) : BasicBlockData :=
+  { bb with terminator := eraseAssertTerm bb.terminator, isCleanup := false }
+
+def eraseAssert (body : CapturedMir) : CapturedMir :=
+  { body with basicBlocks := body.basicBlocks.map eraseAssertBlock }
+
+@[simp] theorem eraseAssert_localDecls (body : CapturedMir) :
+    (eraseAssert body).localDecls = body.localDecls := rfl
+
+@[simp] theorem eraseAssert_layouts (body : CapturedMir) :
+    (eraseAssert body).layouts = body.layouts := rfl
+
+@[simp] theorem eraseAssert_argCount (body : CapturedMir) :
+    (eraseAssert body).argCount = body.argCount := rfl
+
+@[simp] theorem eraseAssert_phase (body : CapturedMir) :
+    (eraseAssert body).phase = body.phase := rfl
+
+@[simp] theorem eraseAssert_length (body : CapturedMir) :
+    (eraseAssert body).basicBlocks.length = body.basicBlocks.length := by
+  simp [eraseAssert]
+
+theorem eraseAssert_block {body : CapturedMir} {blk : Nat} {bb : BasicBlockData}
+    (h : body.basicBlocks[blk]? = some bb) :
+    (eraseAssert body).basicBlocks[blk]? = some (eraseAssertBlock bb) := by
+  simp [eraseAssert, h]
+
+@[simp] theorem eraseAssertBlock_statements (bb : BasicBlockData) :
+    (eraseAssertBlock bb).statements = bb.statements := rfl
+
+@[simp] theorem hasStorageMarker_eraseAssert (body : CapturedMir) (loc : Nat) :
+    hasStorageMarker (eraseAssert body) loc = hasStorageMarker body loc := by
+  simp [hasStorageMarker, eraseAssert, Function.comp_def]
+
+@[simp] theorem alwaysStorageLiveLocals_eraseAssert (body : CapturedMir) :
+    alwaysStorageLiveLocals (eraseAssert body) = alwaysStorageLiveLocals body := by
+  unfold alwaysStorageLiveLocals
+  congr 1
+  funext loc
+  rw [hasStorageMarker_eraseAssert]
+  rfl
+
+theorem LocalsOk.toEraseAssert {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
+    {lm : Map Gen.LocalName Ptr} {allocs : List Gen.Allocation}
+    (h : LocalsOk body ctx locals lm allocs) :
+    LocalsOk (eraseAssert body) ctx locals lm allocs :=
+  ⟨h.nlocals, h.slots, h.base, h.keysNodup, h.keysLocal,
+    fun i slot hs => by rw [alwaysStorageLiveLocals_eraseAssert]; exact h.live i slot hs,
+    h.storage, h.inj, h.owned⟩
+
+theorem LocalsOk.ofEraseAssert {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
+    {lm : Map Gen.LocalName Ptr} {allocs : List Gen.Allocation}
+    (h : LocalsOk (eraseAssert body) ctx locals lm allocs) :
+    LocalsOk body ctx locals lm allocs :=
+  ⟨h.nlocals, h.slots, h.base, h.keysNodup, h.keysLocal,
+    fun i slot hs => by rw [← alwaysStorageLiveLocals_eraseAssert]; exact h.live i slot hs,
+    h.storage, h.inj, h.owned⟩
+
+@[simp] theorem initBlock_eraseAssert (body : CapturedMir) :
+    initBlock (eraseAssert body) = initBlock body := by
+  simp [initBlock]
+
+@[simp] theorem initLen_eraseAssert (body : CapturedMir) :
+    initLen (eraseAssert body) = initLen body := by
+  simp [initLen]
+
+@[simp] theorem bodyAddrTakenLocals_eraseAssert (body : CapturedMir) :
+    bodyAddrTakenLocals (eraseAssert body) = bodyAddrTakenLocals body := by
+  simp [bodyAddrTakenLocals, eraseAssert, List.flatMap_map]
+
+@[simp] theorem nonScalarSlotsInit_eraseAssert (body : CapturedMir) (locals : List LocalSlot) :
+    nonScalarSlotsInit (eraseAssert body) locals = nonScalarSlotsInit body locals := by
+  simp [nonScalarSlotsInit]
+
+@[simp] theorem initMachineState_eraseAssert (body : CapturedMir) (args : List Value) :
+    initMachineState (eraseAssert body) args = initMachineState body args := rfl
+
+@[simp] theorem argsOk_eraseAssert (body : CapturedMir) (args : List Value) :
+    argsOk (eraseAssert body) args = argsOk body args := rfl
+
+theorem CtxOk.toEraseAssert {body : CapturedMir} {ctx : Ctx} (h : CtxOk body ctx) :
+    CtxOk (eraseAssert body) ctx :=
+  ⟨h.addrs, h.ret, h.baseLow⟩
+
+theorem StartRel.toEraseAssert {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {s : MachineState} {mInit : Mach} (h : StartRel body f ctx s mInit) :
+    StartRel (eraseAssert body) f ctx s mInit where
+  threads := h.threads
+  active := h.active
+  allocs := h.allocs
+  blk0 := h.blk0
+  stmt0 := h.stmt0
+  hasBlocks := by simpa using h.hasBlocks
+  nlocals := h.nlocals
+  slots := h.slots
+  argsLive := h.argsLive
+  tempsDead := h.tempsDead
+  addrs := h.addrs
+  ret := h.ret
+  baseLow := h.baseLow
+  borrows := h.borrows
+  nextTag_pos := h.nextTag_pos
+  callStack := h.callStack
+  activeCallee := h.activeCallee
+  protectors := h.protectors
+  callerLocals := h.callerLocals
+
+theorem StartRel.ofEraseAssert {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {s : MachineState} {mInit : Mach} (h : StartRel (eraseAssert body) f ctx s mInit) :
+    StartRel body f ctx s mInit where
+  threads := h.threads
+  active := h.active
+  allocs := h.allocs
+  blk0 := h.blk0
+  stmt0 := h.stmt0
+  hasBlocks := by simpa using h.hasBlocks
+  nlocals := h.nlocals
+  slots := h.slots
+  argsLive := h.argsLive
+  tempsDead := h.tempsDead
+  addrs := h.addrs
+  ret := h.ret
+  baseLow := h.baseLow
+  borrows := h.borrows
+  nextTag_pos := h.nextTag_pos
+  callStack := h.callStack
+  activeCallee := h.activeCallee
+  protectors := h.protectors
+  callerLocals := h.callerLocals
+
+/-- Fragment check for bodies that may contain `TerminatorKind.assert`:
+`eraseAssert body` satisfies `inFragment`, and every `.assert` terminator
+satisfies `assertTerminatorOk`. -/
+def inFragmentWithAssert (body : CapturedMir) : Bool :=
+  inFragment (eraseAssert body) &&
+  body.basicBlocks.all fun bb =>
+    match bb.terminator.kind with
+    | .assert .. =>
+      assertTerminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator
+    | _ => true
+
+theorem inFragmentWithAssert_spec {body : CapturedMir} (h : inFragmentWithAssert body = true) :
+    inFragment (eraseAssert body) = true ∧
+    ∀ bb ∈ body.basicBlocks,
+      isAssertTerm bb.terminator = true →
+      assertTerminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator = true := by
+  simp only [inFragmentWithAssert, Bool.and_eq_true, List.all_eq_true] at h
+  refine ⟨h.1, fun bb hbb ha => ?_⟩
+  have hb := h.2 bb hbb
+  cases hk : bb.terminator.kind <;> simp_all [isAssertTerm]
+
+/-- State relation for `inFragmentWithAssert`: `StateRelN` of `eraseAssert body`. -/
+abbrev StateRelWithAssert (body : CapturedMir) (f : Gen.Function) (ctx : Ctx)
+    (s : MachineState) (m : Mach) : Prop :=
+  StateRelN (eraseAssert body) f ctx s m
+
+/-- Step relation for `inFragmentWithAssert` bodies, covering 1-step `.tau`
+(statements, `goto`, passing `assert`, and failing `assert` with `.cleanup`),
+1-step `.emit` (`switchInt`), 1-step `.ret (.normal _)`, 1- or 2-step `.ub`
+(1 step on statement/switch/uninit-assert-cond UB, 2 steps on failing `assert`
+with `.unreachable`), and 2-step `.abort` on failing `assert` with `.terminate`
+or `.continue_`. -/
+def StepRelWithAssert (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : MachineState)
+    (a : MirStepNode) (m : Mach) : Prop :=
+  match a with
+  | .tau (.running s') => ∃ m', Interp.step m = .ok m' ∧ StateRelWithAssert body f ctx s' m'
+  | .vis (.inr (.inl (.emit _))) k =>
+    ∃ s' m', k PUnit.unit = .running s' ∧ Interp.step m = .ok m' ∧
+      StateRelWithAssert body f ctx s' m'
+  | .ret (.normal (v, _)) => ∃ m', Interp.step m = .ok m' ∧ ReturnRel body ctx s v m'
+  | .vis (.inl (.fail .ub)) _ =>
+    ∃ k msg, (k = 1 ∨ k = 2) ∧ Interp.steps k m = .error (.ub msg)
+  | .ret .abort => Interp.steps 2 m = .error .abort
+  | .ret .panic => Interp.steps 2 m = .error .abort
+  | _ => False
+
+theorem StepRelN.toStepRelWithAssert {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {s : MachineState} {m : Mach} {n : MirStepNode}
+    (h : StepRelN (eraseAssert body) f ctx s n (Interp.step m)) :
+    StepRelWithAssert body f ctx s n m := by
+  unfold StepRelN at h
+  unfold StepRelWithAssert
+  split at h
+  · exact h
+  · exact h
+  · obtain ⟨m', hr, hret⟩ := h
+    obtain ⟨r0, a0, d0, R, hd0, hv0, hp, hr0, hthr, hallocs, hR⟩ := hret
+    exact ⟨m', hr, ⟨r0, a0, d0, R, hd0, hv0, hp, hr0, hthr, hallocs, hR⟩⟩
+  · obtain ⟨msg, hr⟩ := h
+    exact ⟨1, msg, .inl rfl, steps_one_error hr⟩
+  · exact h.elim
+where
+  steps_one_error {m : Mach} {e : Stop} (hr : Interp.step m = .error e) :
+      Interp.steps 1 m = .error e := by
+    simp [Interp.steps, hr]
+
+theorem translateFnWithAssert_locals {body : CapturedMir} {f : Gen.Function}
+    (hf : translateFnWithAssert body = some f) :
+    FnLocalsSpec body f ∧ FnLocalsSpec (eraseAssert body) f := by
+  have hfl : FnLocalsSpec body f := by
+    simp only [translateFnWithAssert, Option.bind_eq_bind] at hf
+    cases hC : translateCallConv body.fnAbi.conv with
+    | none => simp [hC] at hf
+    | some conv =>
+      cases hL : translateLocals body.layouts 0 body.localDecls with
+      | none => simp [hC, hL] at hf
+      | some L =>
+        cases hB : translateBlocksWithAssert body.layouts body.localDecls 0
+            (body.basicBlocks.length + 1) body.basicBlocks with
+        | none => simp [hC, hL, hB] at hf
+        | some Bpair =>
+          rcases Bpair with ⟨blocks, extra⟩
+          simp only [hC, hL, hB, Option.bind_some, Option.pure_def, Option.some.injEq] at hf
+          subst hf
+          refine ⟨rfl, fun i d hd => ?_⟩
+          obtain ⟨T, hT, hget⟩ := translateLocals_get body.layouts 0 body.localDecls L hL i d hd
+          rw [tyOf_of_translateTy hT]
+          exact ⟨hT, by simpa using hget⟩
+  exact ⟨hfl, hfl⟩
+
+private theorem assertFailTarget_keys (nextFresh : Nat) (unwind : UnwindAction) :
+    nextFresh < (assertFailTarget nextFresh unwind).2.1 ∧
+    ((assertFailTarget nextFresh unwind).2.2.map Prod.fst).Nodup ∧
+    ∀ b blk, (b, blk) ∈ (assertFailTarget nextFresh unwind).2.2 →
+      ∃ k, b = bbName k ∧ nextFresh ≤ k ∧ k < (assertFailTarget nextFresh unwind).2.1 := by
+  cases unwind with
+  | cleanup cleanupBb =>
+    dsimp [assertFailTarget]
+    refine ⟨by omega, List.nodup_nil, fun _ _ h => by simp at h⟩
+  | unreachable | terminate | continue_ =>
+    dsimp [assertFailTarget]
+    refine ⟨by omega, by simp, fun b blk h => ?_⟩
+    simp only [List.mem_singleton, Prod.mk.injEq] at h
+    exact ⟨nextFresh, h.1, Nat.le_refl _, by omega⟩
+
+private theorem translateTerminatorWithAssert_keys (layouts : Layout.LayoutTable)
+    (decls : List LocalDecl) (nextFresh nextFresh' : Nat) (t : MirAst.Terminator)
+    (term : Gen.Terminator) (extra : List (Gen.BbName × Gen.BasicBlock))
+    (h : translateTerminatorWithAssert layouts decls nextFresh t =
+      some (term, nextFresh', extra)) :
+    nextFresh ≤ nextFresh' ∧
+    (extra.map Prod.fst).Nodup ∧
+    (∀ b blk, (b, blk) ∈ extra → ∃ k, b = bbName k ∧ nextFresh ≤ k ∧ k < nextFresh') ∧
+    (isAssertTerm t = false →
+      translateTerminator layouts decls t = some term ∧ nextFresh' = nextFresh ∧ extra = []) := by
+  unfold translateTerminatorWithAssert at h
+  split at h
+  · next cond expected target unwind hk =>
+    simp only [translateTerminatorAssert, hk, Option.bind_eq_bind] at h
+    cases hv : translateOperand decls (copyOp cond) with
+    | none => simp [hv] at h
+    | some v =>
+      simp only [hv, Option.bind_some, Option.some.injEq, Prod.mk.injEq] at h
+      obtain ⟨_, rfl, rfl⟩ := h
+      obtain ⟨hlt, hnd, hmem⟩ := assertFailTarget_keys nextFresh unwind
+      exact ⟨Nat.le_of_lt hlt, hnd, hmem, fun hna => by simp [isAssertTerm, hk] at hna⟩
+  · next hna =>
+    simp only [Option.bind_eq_bind] at h
+    cases ht : translateTerminator layouts decls t with
+    | none => simp [ht] at h
+    | some tm =>
+      simp only [ht, Option.bind_some, Option.pure_def, Option.some.injEq, Prod.mk.injEq] at h
+      obtain ⟨rfl, rfl, rfl⟩ := h
+      exact ⟨Nat.le_refl _, List.nodup_nil, fun _ _ hm => by simp at hm,
+        fun _ => ⟨rfl, rfl, rfl⟩⟩
+
+private theorem mapGet_of_mem_nodup_local {K V : Type} [DecidableEq K]
+    {entries : List (K × V)} (hnd : (entries.map Prod.fst).Nodup)
+    {k : K} {v : V} (hmem : (k, v) ∈ entries) :
+    mapGet ⟨entries⟩ k = some v := by
+  induction entries with
+  | nil => simp at hmem
+  | cons p rest ih =>
+    obtain ⟨k0, v0⟩ := p
+    simp only [List.map_cons, List.nodup_cons, List.mem_map] at hnd
+    obtain ⟨hne, hndRest⟩ := hnd
+    simp only [mapGet, List.find?_cons]
+    rcases List.mem_cons.mp hmem with hEq | hRest
+    · injection hEq with hk hv
+      subst hk hv
+      simp
+    · have hk0 : decide (k0 = k) = false :=
+        decide_eq_false (fun hkk => by subst hkk; exact hne ⟨(k0, v), hRest, rfl⟩)
+      rw [hk0]
+      exact ih hndRest hRest
+
+private theorem nodup_append_of_disjoint {α : Type} {xs ys : List α}
+    (hx : xs.Nodup) (hy : ys.Nodup) (hdisj : ∀ a ∈ xs, a ∉ ys) :
+    (xs ++ ys).Nodup :=
+  List.nodup_append.mpr ⟨hx, hy, fun a ha b hb hEq => by subst hEq; exact hdisj a ha hb⟩
+
+private theorem translateBlocksWithAssert_spec (layouts : Layout.LayoutTable)
+    (decls : List LocalDecl) :
+    ∀ (i nextFresh : Nat) (bbs : List BasicBlockData)
+      (blocks extra : List (Gen.BbName × Gen.BasicBlock)),
+      translateBlocksWithAssert layouts decls i nextFresh bbs = some (blocks, extra) →
+      ∃ nextFresh_end,
+        nextFresh ≤ nextFresh_end ∧
+        blocks.length = bbs.length ∧
+        (blocks.map Prod.fst).Nodup ∧
+        (extra.map Prod.fst).Nodup ∧
+        (∀ b blk, (b, blk) ∈ blocks → ∃ m, b = bbName m ∧ i ≤ m ∧ m < i + bbs.length) ∧
+        (∀ b blk, (b, blk) ∈ extra → ∃ m, b = bbName m ∧ nextFresh ≤ m ∧ m < nextFresh_end) ∧
+        (∀ (k : Nat) bb, bbs[k]? = some bb →
+          ∃ tb nf nf' ext,
+            (bbName (i + k), tb) ∈ blocks ∧
+            tb.statements.length = bb.statements.length ∧
+            (∀ (sIdx : Nat) st, bb.statements[sIdx]? = some st →
+              ∃ st', translateStatement decls st layouts = some st' ∧
+                tb.statements[sIdx]? = some st') ∧
+            translateTerminatorWithAssert layouts decls nf bb.terminator =
+              some (tb.terminator, nf', ext) ∧
+            (∀ p ∈ ext, p ∈ extra))
+  | i, nextFresh, [], blocks, extra, h => by
+    simp [translateBlocksWithAssert] at h
+    obtain ⟨rfl, rfl⟩ := h
+    exact ⟨nextFresh, Nat.le_refl _, rfl, List.nodup_nil, List.nodup_nil,
+      fun _ _ hm => by simp at hm, fun _ _ hm => by simp at hm, fun k _ hk => by simp at hk⟩
+  | i, nextFresh, bb :: bbs, blocks, extra, h => by
+    simp only [translateBlocksWithAssert, Option.bind_eq_bind] at h
+    cases hs : bb.statements.mapM (translateStatement decls · layouts) with
+    | none => simp [hs] at h
+    | some stmts =>
+      cases ht : translateTerminatorWithAssert layouts decls nextFresh bb.terminator with
+      | none => simp [hs, ht] at h
+      | some t =>
+        rcases t with ⟨term, nextFresh', ext⟩
+        cases hrest : translateBlocksWithAssert layouts decls (i + 1) nextFresh' bbs with
+        | none => simp [hs, ht, hrest] at h
+        | some rpair =>
+          rcases rpair with ⟨restBlocks, restExtra⟩
+          simp only [hs, ht, hrest, Option.bind_some, Option.pure_def, Option.some.injEq, Prod.mk.injEq] at h
+          obtain ⟨rfl, rfl⟩ := h
+          obtain ⟨hlenS, hgetS⟩ := mapM_option_spec (translateStatement decls · layouts)
+            bb.statements stmts hs
+          obtain ⟨hnf1, hndExt, hmemExt, _⟩ :=
+            translateTerminatorWithAssert_keys layouts decls nextFresh nextFresh'
+              bb.terminator term ext ht
+          obtain ⟨nfEnd, hnf2, hlenR, hndR, hndRExt, hmemR, hmemRExt, hgetR⟩ :=
+            translateBlocksWithAssert_spec layouts decls (i + 1) nextFresh' bbs
+              restBlocks restExtra hrest
+          refine ⟨nfEnd, Nat.le_trans hnf1 hnf2, by simp [hlenR], ?_, ?_, ?_, ?_, ?_⟩
+          · simp only [List.map_cons, List.nodup_cons, List.mem_map]
+            refine ⟨?_, hndR⟩
+            rintro ⟨⟨b, blk⟩, hmem, hbEq⟩
+            obtain ⟨m, rfl, hm1, _⟩ := hmemR b blk hmem
+            have := (localName_inj m i).mp (by simpa [bbName, localName] using hbEq)
+            omega
+          · rw [List.map_append]
+            refine nodup_append_of_disjoint hndExt hndRExt ?_
+            intro b hb1 hb2
+            obtain ⟨⟨b1, blk1⟩, hm1, rfl⟩ := List.mem_map.mp hb1
+            obtain ⟨⟨b2, blk2⟩, hm2, hbEq⟩ := List.mem_map.mp hb2
+            obtain ⟨m1, rfl, _, hm1_lt⟩ := hmemExt b1 blk1 hm1
+            obtain ⟨m2, rfl, hm2_le, _⟩ := hmemRExt b2 blk2 hm2
+            have := (localName_inj m2 m1).mp (by simpa [bbName, localName] using hbEq)
+            omega
+          · intro b blk hmem
+            rcases List.mem_cons.mp hmem with hEq | hRest
+            · injection hEq with hb _
+              exact ⟨i, hb, Nat.le_refl _, by simp⟩
+            · obtain ⟨m, rfl, hm1, hm2⟩ := hmemR b blk hRest
+              exact ⟨m, rfl, by omega, by simp; omega⟩
+          · intro b blk hmem
+            rcases List.mem_append.mp hmem with h1 | h2
+            · obtain ⟨m, rfl, hm1, hm2⟩ := hmemExt b blk h1
+              exact ⟨m, rfl, hm1, Nat.lt_of_lt_of_le hm2 hnf2⟩
+            · obtain ⟨m, rfl, hm1, hm2⟩ := hmemRExt b blk h2
+              exact ⟨m, rfl, Nat.le_trans hnf1 hm1, hm2⟩
+          · intro k bb' hk
+            cases k with
+            | zero =>
+              simp at hk; subst hk
+              exact ⟨⟨stmts, term, .Regular⟩, nextFresh, nextFresh', ext,
+                by simp, hlenS, hgetS, ht, fun p hp => List.mem_append_left _ hp⟩
+            | succ k' =>
+              simp only [List.getElem?_cons_succ] at hk
+              obtain ⟨tb, nf, nf', ext', hmemB, hlenB, hstB, httB, hextB⟩ := hgetR k' bb' hk
+              have hik : i + 1 + k' = i + (k' + 1) := by omega
+              rw [hik] at hmemB
+              exact ⟨tb, nf, nf', ext', List.mem_cons_of_mem _ hmemB, hlenB, hstB, httB,
+                fun p hp => List.mem_append_right _ (hextB p hp)⟩
+
+theorem translateFnWithAssert_spec {body : CapturedMir} {f : Gen.Function}
+    (hf : translateFnWithAssert body = some f) :
+    FnLocalsSpec body f ∧
+    (f.start = bbName body.basicBlocks.length ∧
+      mapGet f.blocks (bbName body.basicBlocks.length) = some (initBlock body)) ∧
+    (∀ (blk : Nat) bb, body.basicBlocks[blk]? = some bb →
+      ∃ tb nf nf' extra,
+        mapGet f.blocks (bbName blk) = some tb ∧
+        tb.statements.length = bb.statements.length ∧
+        (∀ (sIdx : Nat) st, bb.statements[sIdx]? = some st →
+          ∃ st', translateStatement body.localDecls st body.layouts = some st' ∧
+            tb.statements[sIdx]? = some st') ∧
+        translateTerminatorWithAssert body.layouts body.localDecls nf bb.terminator =
+          some (tb.terminator, nf', extra) ∧
+        (∀ b bblk, (b, bblk) ∈ extra → mapGet f.blocks b = some bblk)) := by
+  have hfl := (translateFnWithAssert_locals hf).1
+  simp only [translateFnWithAssert, Option.bind_eq_bind] at hf
+  cases hC : translateCallConv body.fnAbi.conv with
+  | none => simp [hC] at hf
+  | some conv =>
+    cases hL : translateLocals body.layouts 0 body.localDecls with
+    | none => simp [hC, hL] at hf
+    | some L =>
+      cases hB : translateBlocksWithAssert body.layouts body.localDecls 0
+          (body.basicBlocks.length + 1) body.basicBlocks with
+      | none => simp [hC, hL, hB] at hf
+      | some Bpair =>
+        rcases Bpair with ⟨blocks, extra⟩
+        simp only [hC, hL, hB, Option.bind_some, Option.pure_def, Option.some.injEq] at hf
+        subst hf
+        dsimp only
+        obtain ⟨nfEnd, _, _, hndB, hndE, hmemB, hmemE, hgetB⟩ :=
+          translateBlocksWithAssert_spec body.layouts body.localDecls 0
+            (body.basicBlocks.length + 1) body.basicBlocks blocks extra hB
+        let n := body.basicBlocks.length
+        have hndAll : ((blocks ++ [(bbName n, initBlock body)] ++ extra).map Prod.fst).Nodup := by
+          rw [List.map_append, List.map_append]
+          refine nodup_append_of_disjoint ?_ hndE ?_
+          · refine nodup_append_of_disjoint hndB (by simp) ?_
+            intro b hb1 hb2
+            obtain ⟨⟨b1, blk1⟩, hm1, rfl⟩ := List.mem_map.mp hb1
+            simp only [List.map_cons, List.map_nil, List.mem_singleton] at hb2
+            obtain ⟨m, rfl, _, hm_lt⟩ := hmemB b1 blk1 hm1
+            have := (localName_inj m n).mp (by simpa [bbName, localName] using hb2)
+            omega
+          · intro b hb1 hb2
+            obtain ⟨⟨b2, blk2⟩, hm2, hbEq⟩ := List.mem_map.mp hb2
+            obtain ⟨m2, rfl, hm2_le, _⟩ := hmemE b2 blk2 hm2
+            rcases List.mem_append.mp hb1 with hbB | hbI
+            · obtain ⟨⟨b1, blk1⟩, hm1, rfl⟩ := List.mem_map.mp hbB
+              obtain ⟨m1, rfl, _, hm1_lt⟩ := hmemB b1 blk1 hm1
+              have := (localName_inj m2 m1).mp (by simpa [bbName, localName] using hbEq)
+              omega
+            · simp only [List.map_cons, List.map_nil, List.mem_singleton] at hbI
+              subst hbI
+              have := (localName_inj m2 n).mp (by simpa [bbName, localName] using hbEq)
+              omega
+        refine ⟨hfl, ⟨rfl, mapGet_of_mem_nodup_local hndAll
+            (List.mem_append_left _ (List.mem_append_right _ (List.mem_singleton.mpr rfl)))⟩,
+          fun blk bb hbb => ?_⟩
+        obtain ⟨tb, nf, nf', ext, hmemTb, hlenTb, hstTb, httTb, hextTb⟩ := hgetB blk bb hbb
+        rw [Nat.zero_add] at hmemTb
+        refine ⟨tb, nf, nf', ext,
+          mapGet_of_mem_nodup_local hndAll (List.mem_append_left _ (List.mem_append_left _ hmemTb)),
+          hlenTb, hstTb, httTb, fun b bblk hmemExt =>
+            mapGet_of_mem_nodup_local hndAll (List.mem_append_right _ (hextTb (b, bblk) hmemExt))⟩
+
+private theorem stepMirFn_eraseAssert_stmt {body : CapturedMir} {s : MachineState}
+    {bb : BasicBlockData} {st : MirAst.Statement}
+    (hcal : s.memory.activeCallee = none) (hphase : body.phase = .runtimePostCleanup)
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hst : bb.statements[s.frame.stmtIdx]? = some st) :
+    stepMirFn body s = stepMirFn (eraseAssert body) s := by
+  have hbbE := eraseAssert_block hbb
+  have hstE : (eraseAssertBlock bb).statements[s.frame.stmtIdx]? = some st := hst
+  rw [stepMirFn_stmt body s bb st hcal hphase hbb hst,
+    stepMirFn_stmt (eraseAssert body) s (eraseAssertBlock bb) st hcal hphase hbbE hstE]
+  rfl
+
+private theorem stepMirFn_eraseAssert_term_nonAssert {body : CapturedMir} {s : MachineState}
+    {bb : BasicBlockData}
+    (hcal : s.memory.activeCallee = none) (hphase : body.phase = .runtimePostCleanup)
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (heq : s.frame.stmtIdx = bb.statements.length)
+    (hterm : terminatorOk body.layouts body.localDecls body.basicBlocks.length
+      (eraseAssertBlock bb).terminator = true)
+    (hna : isAssertTerm bb.terminator = false) :
+    stepMirFn body s = stepMirFn (eraseAssert body) s := by
+  have hbbE := eraseAssert_block hbb
+  have heqE : s.frame.stmtIdx = (eraseAssertBlock bb).statements.length := heq
+  have htEq : (eraseAssertBlock bb).terminator = bb.terminator := eraseAssertTerm_of_not hna
+  rw [stepMirFn_term body s bb hcal hphase hbb heq,
+    stepMirFn_term (eraseAssert body) s (eraseAssertBlock bb) hcal hphase hbbE heqE, htEq]
+  rw [htEq] at hterm
+  rcases hbt : bb.terminator with ⟨kind, span⟩
+  rw [hbt] at hterm
+  cases kind with
+  | goto _ | switchInt _ _ | unreachable | return_ => rfl
+  | _ => simp [terminatorOk] at hterm
+
+/-- **One-step correspondence for `inFragmentWithAssert` bodies (`G1`)**:
+For any `body` in `inFragmentWithAssert` and its translation
+`translateFnWithAssert body = some f`, every step from `StateRelWithAssert`
+satisfies `StepRelWithAssert` (and when `bb.terminator` is `.assert ..` with
+`unwind = .continue_`, requires `s.memory.callStack = []`, which `StateRelWithAssert`
+already guarantees via `StateRelAt.callStack`). -/
+theorem step_correspondence_withAssert (body : CapturedMir) (f : Gen.Function)
+    (hfragA : inFragmentWithAssert body = true)
+    (hf : translateFnWithAssert body = some f) (ctx : Ctx)
+    (s : MachineState) (m : Mach) (hrel : StateRelWithAssert body f ctx s m) :
+    StepRelWithAssert body f ctx s (stepMirFn body s) m := by
+  obtain ⟨hfragE, hasserts⟩ := inFragmentWithAssert_spec hfragA
+  obtain ⟨hfl, _, hblkSpec⟩ := translateFnWithAssert_spec hf
+  have hflE := (translateFnWithAssert_locals hf).2
+  obtain ⟨hphaseE, _, _, _, hdeclsOk, _, hbbsE, _, hmvOkE, _⟩ := inFragment_spec _ hfragE
+  have hphase : body.phase = .runtimePostCleanup := hphaseE
+  obtain ⟨hpaE, _⟩ := inFragment_ptr _ hfragE
+  obtain ⟨view, lm, hrelA, hthr, hlo, hns, hbo⟩ := hrel
+  have hblk_lt : s.frame.blockIdx < body.basicBlocks.length := by simpa using hrelA.blk
+  obtain ⟨bb, hbb⟩ : ∃ bb, body.basicBlocks[s.frame.blockIdx]? = some bb :=
+    ⟨_, List.getElem?_eq_getElem hblk_lt⟩
+  have hbbmem : bb ∈ body.basicBlocks := List.mem_of_getElem? hbb
+  have hbbE := eraseAssert_block hbb
+  have hle : s.frame.stmtIdx ≤ bb.statements.length := hrelA.stmt (eraseAssertBlock bb) hbbE
+  rcases Nat.lt_or_ge s.frame.stmtIdx bb.statements.length with hlt | hge
+  · obtain ⟨st, hst⟩ : ∃ st, bb.statements[s.frame.stmtIdx]? = some st :=
+      ⟨_, List.getElem?_eq_getElem hlt⟩
+    rw [stepMirFn_eraseAssert_stmt hrelA.activeCallee hphase hbb hst]
+    apply StepRelN.toStepRelWithAssert
+    refine step_correspondence_NF_at (eraseAssert body) f hfragE hflE ctx s m ?_
+      ⟨view, lm, hrelA, hthr, hlo, hns, hbo⟩
+    intro bb' hbb'
+    rw [hbbE] at hbb'; cases hbb'
+    obtain ⟨tb, nf, nf', ext, hgetb, hlen, hstB, _, _⟩ := hblkSpec _ bb hbb
+    exact ⟨tb, hgetb, hlen, fun st' hst' => hstB _ st' hst', fun heq => by dsimp [eraseAssertBlock] at heq; omega⟩
+  · have heq : s.frame.stmtIdx = bb.statements.length := by omega
+    obtain ⟨tb, nf, nf', ext, hgetb, hlen, hstB, htt, hextra⟩ := hblkSpec _ bb hbb
+    by_cases ha : isAssertTerm bb.terminator = true
+    · obtain ⟨cond, expected, target, unwind, hk⟩ :
+          ∃ cond expected target unwind,
+            bb.terminator.kind = .assert cond expected target unwind := by
+        cases htk : bb.terminator.kind <;> first | exact ⟨_, _, _, _, rfl⟩ | simp [isAssertTerm, htk] at ha
+      have hok : assertTerminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator = true :=
+        hasserts bb hbbmem ha
+      obtain ⟨_, htarget_lt, hclean_lt⟩ := assertTerminatorOk_spec hok hk
+      have httA : translateTerminatorAssert body.localDecls nf bb.terminator =
+          some (tb.terminator, nf', ext) := by
+        simpa [translateTerminatorWithAssert, hk] using htt
+      obtain ⟨_, hmvT, hmvEdge⟩ := movesOk_spec hmvOkE hbbE
+      have hreads : readsOk (movedBefore (eraseAssert body) s.frame.blockIdx bb.statements.length)
+          [cond] = true := by
+        simpa [eraseAssertBlock, eraseAssertTerm, eraseAssertSwitchTargets, hk, termReadsOk] using hmvT
+      have hshape : Shape m (ctxWithBorrows body ctx s.memory.borrows)
+          [(ctxWithBorrows body ctx s.memory.borrows).caller,
+            calleeFrameL f (ctxWithBorrows body ctx s.memory.borrows) lm s.frame.blockIdx
+              s.frame.stmtIdx]
+          m.mem.memory.allocations := ⟨hthr, hrelA.active, rfl⟩
+      have hstale_end : StaleOk (eraseAssert body) s.frame.locals view s.frame.blockIdx
+          bb.statements.length := by
+        rw [← heq]; exact hrelA.stale
+      obtain ⟨hnone, hpass, hclean, hunreach, htermA, hcont⟩ :=
+        step_terminator_assert_simulation (body := body) (bMove := eraseAssert body)
+          hphase hrelA.activeCallee hdeclsOk hbb heq hk hok hgetb hlen httA hextra
+          hshape hfl hlo.ofEraseAssert hns hrelA.stale hreads
+      cases hb : opBits view (copyOp cond) with
+      | none =>
+        obtain ⟨hA, msg, hM⟩ := hnone hb
+        rw [hA]
+        exact ⟨1, msg, .inl rfl, by simp [Interp.steps, hM]⟩
+      | some bits =>
+        by_cases hpassB : (decide (bits = 1) == expected) = true
+        · obtain ⟨hA, m', hM, hsh', hlo', hns'⟩ := hpass bits hb hpassB
+          rw [hA]
+          have htMem : target ∈ termTargets (eraseAssertBlock bb).terminator := by
+            simp [eraseAssertBlock, eraseAssertTerm, eraseAssertSwitchTargets, hk, termTargets]
+          have hsub : ∀ j ∈ moveOut (movedBefore (eraseAssert body) s.frame.blockIdx bb.statements.length) cond,
+              j ∈ movedBefore (eraseAssert body) target 0 := by
+            have hm := hmvEdge target htMem
+            simpa [eraseAssertBlock, eraseAssertTerm, eraseAssertSwitchTargets, hk, termMoved] using hm
+          exact ⟨m', hM, hrelA.jumpN hfragE lm target (by simpa using htarget_lt) _
+            hsh'.threads hsh'.active hlo'.toEraseAssert hns'
+            (hstale_end.toBlockMove cond hsub)
+            (hbo.jump hpaE hbbE hge target htMem _)⟩
+        · have hfailB : (decide (bits = 1) == expected) = false :=
+            Bool.eq_false_iff.mpr hpassB
+          cases unwind with
+          | cleanup cleanupBb =>
+            obtain ⟨hA, m', hM, hsh', hlo', hns'⟩ := hclean bits cleanupBb hb hfailB rfl
+            rw [hA]
+            have hcMem : cleanupBb ∈ termTargets (eraseAssertBlock bb).terminator := by
+              simp [eraseAssertBlock, eraseAssertTerm, eraseAssertSwitchTargets, hk, termTargets]
+            have hsub : ∀ j ∈ moveOut (movedBefore (eraseAssert body) s.frame.blockIdx bb.statements.length) cond,
+                j ∈ movedBefore (eraseAssert body) cleanupBb 0 := by
+              have hm := hmvEdge cleanupBb hcMem
+              simpa [eraseAssertBlock, eraseAssertTerm, eraseAssertSwitchTargets, hk, termMoved] using hm
+            exact ⟨m', hM, hrelA.jumpN hfragE lm cleanupBb
+              (by simpa using hclean_lt cleanupBb rfl) _
+              hsh'.threads hsh'.active hlo'.toEraseAssert hns'
+              (hstale_end.toBlockMove cond hsub)
+              (hbo.jump hpaE hbbE hge cleanupBb hcMem _)⟩
+          | unreachable =>
+            obtain ⟨hA, hM⟩ := hunreach bits hb hfailB rfl
+            rw [hA]
+            exact ⟨2, "reached unreachable code", .inr rfl, hM⟩
+          | terminate =>
+            obtain ⟨hA, hM⟩ := htermA bits hb hfailB rfl
+            rw [hA]
+            exact hM
+          | continue_ =>
+            obtain ⟨hA, hM⟩ := hcont bits hb hfailB rfl hrelA.callStack
+            rw [hA]
+            exact hM
+    · have hna : isAssertTerm bb.terminator = false := Bool.eq_false_iff.mpr ha
+      have htermE := (hbbsE _ (List.mem_of_getElem? hbbE)).2.2
+      simp only [eraseAssert_layouts, eraseAssert_localDecls, eraseAssert_length] at htermE
+      rw [stepMirFn_eraseAssert_term_nonAssert hrelA.activeCallee hphase hbb heq htermE hna]
+      apply StepRelN.toStepRelWithAssert
+      refine step_correspondence_NF_at (eraseAssert body) f hfragE hflE ctx s m ?_
+        ⟨view, lm, hrelA, hthr, hlo, hns, hbo⟩
+      intro bb' hbb'
+      rw [hbbE] at hbb'; cases hbb'
+      have httE : translateTerminator body.layouts body.localDecls
+          (eraseAssertBlock bb).terminator = some tb.terminator := by
+        rw [eraseAssertBlock, eraseAssertTerm_of_not hna]
+        exact ((translateTerminatorWithAssert_keys body.layouts body.localDecls nf nf'
+          bb.terminator tb.terminator ext htt).2.2.2 hna).1
+      exact ⟨tb, hgetb, hlen, fun st' hst' => hstB _ st' hst', fun _ => httE⟩
+
+/-- **Init block (`StateRelWithAssert`)**: from `StartRel` at `f.start`,
+`initLen body` MiniRust steps land in `StateRelWithAssert`. -/
+theorem step_start_withAssert {body : CapturedMir} {f : Gen.Function}
+    (hfragA : inFragmentWithAssert body = true)
+    (hf : translateFnWithAssert body = some f) {ctx : Ctx} {s : MachineState} {mInit : Mach}
+    (hstart : StartRel body f ctx s mInit)
+    (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
+    ∃ m0, Interp.steps (initLen body) mInit = .ok m0 ∧ StateRelWithAssert body f ctx s m0 := by
+  have hfragE := (inFragmentWithAssert_spec hfragA).1
+  obtain ⟨_, hst0, _⟩ := translateFnWithAssert_spec hf
+  have hst0E : f.start = bbName (eraseAssert body).basicBlocks.length ∧
+      mapGet f.blocks (bbName (eraseAssert body).basicBlocks.length) =
+        some (initBlock (eraseAssert body)) := by
+    rw [eraseAssert_length, initBlock_eraseAssert]
+    exact hst0
+  obtain ⟨m0, hm0, hrel0⟩ := step_start_NF hfragE (translateFnWithAssert_locals hf).2
+    hst0E hstart.toEraseAssert (by rw [nonScalarSlotsInit_eraseAssert]; exact hns)
+  rw [initLen_eraseAssert] at hm0
+  exact ⟨m0, hm0, hrel0⟩
+
+private theorem mirTree_observe_local (body : CapturedMir) (s : MachineState) :
+    (mirTree body s).observe = (stepMirFn body s).map (Trusted.ITree.ITree.cofix (stepMirState body)) := by
+  simp [mirTree, Trusted.ITree.ITree.observe_cofix, stepMirState]
+
+private theorem tauStar_reaches_local {t u : Trusted.ITree.ITree MirEffect MirOutcome}
+    (h : Trusted.ITree.TauStar t u) : Trusted.ITree.Reaches t [] u := by
+  induction h with
+  | refl t => exact .refl t
+  | step hobs _ ih => exact .tau hobs ih
+
+/-- Every Anneal execution prefix `Reaches (mirTree body s) tr u` on an
+`inFragmentWithAssert` body is matched by MiniRust steps to a
+`StateRelWithAssert`-related state. -/
+theorem reaches_rel_withAssert {body : CapturedMir} {f : Gen.Function}
+    (hfragA : inFragmentWithAssert body = true)
+    (hf : translateFnWithAssert body = some f) (ctx : Ctx)
+    {t u : Trusted.ITree.ITree MirEffect MirOutcome}
+    {tr : List (Trusted.Effect.Event MirEffect)} (h : Trusted.ITree.Reaches t tr u) :
+    ∀ (s : MachineState) (m : Mach), t = mirTree body s → StateRelWithAssert body f ctx s m →
+      ∃ (n : Nat) (s' : MachineState) (m' : Mach), Interp.steps n m = .ok m' ∧
+        StateRelWithAssert body f ctx s' m' ∧ u = mirTree body s' := by
+  induction h with
+  | refl t =>
+    intro s m ht hrel
+    exact ⟨0, s, m, rfl, hrel, ht⟩
+  | tau hobs _ ih =>
+    intro s m ht hrel
+    subst ht
+    have hsr := step_correspondence_withAssert body f hfragA hf ctx s m hrel
+    rw [mirTree_observe_local] at hobs
+    generalize stepMirFn body s = node at hsr hobs
+    cases node with
+    | ret r => simp [Trusted.ITree.ITreeF.map] at hobs
+    | vis i k => simp [Trusted.ITree.ITreeF.map] at hobs
+    | tau x =>
+      simp only [Trusted.ITree.ITreeF.map, Trusted.ITree.ITreeF.tau.injEq] at hobs
+      cases x with
+      | running s1 =>
+        obtain ⟨m1, hm1, hrel1⟩ := hsr
+        obtain ⟨n, s', m', hsteps, hrel', hu⟩ := ih s1 m1 hobs.symm hrel1
+        exact ⟨n + 1, s', m', by simp [Interp.steps, hm1, hsteps], hrel', hu⟩
+      | halted _ => exact False.elim hsr
+      | faulted _ => exact False.elim hsr
+  | vis hobs hnf o _ ih =>
+    intro s m ht hrel
+    subst ht
+    have hsr := step_correspondence_withAssert body f hfragA hf ctx s m hrel
+    rw [mirTree_observe_local] at hobs
+    generalize stepMirFn body s = node at hsr hobs
+    cases node with
+    | ret r => simp [Trusted.ITree.ITreeF.map] at hobs
+    | tau x => simp [Trusted.ITree.ITreeF.map] at hobs
+    | vis i0 k0 =>
+      simp only [Trusted.ITree.ITreeF.map] at hobs
+      injection hobs with hi hk
+      subst hi
+      have hk' := eq_of_heq hk
+      subst hk'
+      cases i0 with
+      | inl a => exact False.elim (hnf trivial)
+      | inr b =>
+        cases b with
+        | inr c => exact False.elim hsr
+        | inl ob =>
+          obtain ⟨s1, m1, hk1, hm1, hrel1⟩ := hsr
+          cases o
+          have ht' : Trusted.ITree.ITree.cofix (stepMirState body) (k0 PUnit.unit) =
+              mirTree body s1 := by
+            rw [hk1]; rfl
+          obtain ⟨n, s', m', hsteps, hrel', hu⟩ := ih s1 m1 ht' hrel1
+          exact ⟨n + 1, s', m', by simp [Interp.steps, hm1, hsteps], hrel', hu⟩
+
+/-- **Whole-execution normal return for `inFragmentWithAssert` (`G1`)**:
+If Anneal's semantics of `body` from `s` returns `.normal (v, mem)`, MiniRust
+from a `StateRelWithAssert`-related state reaches `ReturnRel` after finitely
+many steps. -/
+theorem run_ret_withAssert {body : CapturedMir} {f : Gen.Function}
+    (hfragA : inFragmentWithAssert body = true)
+    (hf : translateFnWithAssert body = some f) (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hrel : StateRelWithAssert body f ctx s m)
+    {tr : List (Trusted.Effect.Event MirEffect)} {v : Value} {mem : MirSemantics.Memory}
+    (hret : Trusted.ITree.ReachesRet (mirTree body s) tr (.normal (v, mem))) :
+    ∃ (n : Nat) (s' : MachineState) (m' : Mach),
+      Interp.steps n m = .ok m' ∧ ReturnRel body ctx s' v m' := by
+  obtain ⟨u, hreach, hu⟩ := hret
+  obtain ⟨n, s', m', hsteps, hrel', rfl⟩ :=
+    reaches_rel_withAssert hfragA hf ctx hreach s m rfl hrel
+  have hsr := step_correspondence_withAssert body f hfragA hf ctx s' m' hrel'
+  rw [mirTree_observe_local] at hu
+  generalize stepMirFn body s' = node at hsr hu
+  cases node with
+  | tau x => simp [Trusted.ITree.ITreeF.map] at hu
+  | vis i k => simp [Trusted.ITree.ITreeF.map] at hu
+  | ret r =>
+    simp only [Trusted.ITree.ITreeF.map, Trusted.ITree.ITreeF.ret.injEq] at hu
+    subst hu
+    obtain ⟨m'', hm'', hret'⟩ := hsr
+    exact ⟨n + 1, s', m'', by rw [steps_add, hsteps]; simp [Interp.steps, hm''], hret'⟩
+
+/-- **Whole-execution UB for `inFragmentWithAssert` (`G1`)**:
+If Anneal's semantics of `body` from `s` reaches `FaultNow` (either a 1-step
+UB or a failing `assert` with `unwind = .unreachable`), MiniRust from a
+`StateRelWithAssert`-related state stops with `.error (.ub msg)` after finitely
+many steps. -/
+theorem run_ub_withAssert {body : CapturedMir} {f : Gen.Function}
+    (hfragA : inFragmentWithAssert body = true)
+    (hf : translateFnWithAssert body = some f) (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hrel : StateRelWithAssert body f ctx s m)
+    {tr : List (Trusted.Effect.Event MirEffect)} {u : Trusted.ITree.ITree MirEffect MirOutcome}
+    (hreach : Trusted.ITree.Reaches (mirTree body s) tr u)
+    (hfault : Trusted.ITree.FaultNow u) :
+    ∃ (n : Nat) (msg : String), Interp.steps n m = .error (.ub msg) := by
+  obtain ⟨t', i, k, htau, hobs, hfi⟩ := hfault
+  obtain ⟨n1, s1, m1, h1, hrel1, rfl⟩ :=
+    reaches_rel_withAssert hfragA hf ctx hreach s m rfl hrel
+  obtain ⟨n2, s2, m2, h2, hrel2, rfl⟩ :=
+    reaches_rel_withAssert hfragA hf ctx (tauStar_reaches_local htau) s1 m1 rfl hrel1
+  have hsr := step_correspondence_withAssert body f hfragA hf ctx s2 m2 hrel2
+  rw [mirTree_observe_local] at hobs
+  generalize stepMirFn body s2 = node at hsr hobs
+  cases node with
+  | ret r => simp [Trusted.ITree.ITreeF.map] at hobs
+  | tau x => simp [Trusted.ITree.ITreeF.map] at hobs
+  | vis i0 k0 =>
+    simp only [Trusted.ITree.ITreeF.map] at hobs
+    injection hobs with hi _
+    subst hi
+    cases i0 with
+    | inr b =>
+      cases b with
+      | inl _ => exact False.elim hfi
+      | inr _ => exact False.elim hfi
+    | inl f0 =>
+      cases f0 with
+      | fail reason =>
+        cases reason with
+        | ub =>
+          obtain ⟨kStep, msg, _, hkStep⟩ := hsr
+          exact ⟨(n1 + n2) + kStep, msg, by rw [steps_add, steps_add, h1, ok_bind, h2, ok_bind, hkStep]⟩
+        | unsupported | outOfFuel => exact False.elim hsr
+
+/-- **Whole-execution abort/panic for `inFragmentWithAssert` (`G1`)**:
+If Anneal's semantics of `body` from `s` reaches `.abort` (failing `assert`
+with `unwind = .terminate`) or `.panic` (failing `assert` with
+`unwind = .continue_`), MiniRust from a `StateRelWithAssert`-related state
+reaches `.error .abort` after finitely many steps. -/
+theorem run_abort_or_panic_withAssert {body : CapturedMir} {f : Gen.Function}
+    (hfragA : inFragmentWithAssert body = true)
+    (hf : translateFnWithAssert body = some f) (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hrel : StateRelWithAssert body f ctx s m)
+    {tr : List (Trusted.Effect.Event MirEffect)} {o : MirOutcome}
+    (hret : Trusted.ITree.ReachesRet (mirTree body s) tr o)
+    (ho : o = .abort ∨ o = .panic) :
+    ∃ (n : Nat), Interp.steps n m = .error .abort := by
+  obtain ⟨u, hreach, hu⟩ := hret
+  obtain ⟨n, s', m', hsteps, hrel', rfl⟩ :=
+    reaches_rel_withAssert hfragA hf ctx hreach s m rfl hrel
+  have hsr := step_correspondence_withAssert body f hfragA hf ctx s' m' hrel'
+  rw [mirTree_observe_local] at hu
+  generalize stepMirFn body s' = node at hsr hu
+  cases node with
+  | tau x => simp [Trusted.ITree.ITreeF.map] at hu
+  | vis i k => simp [Trusted.ITree.ITreeF.map] at hu
+  | ret r =>
+    simp only [Trusted.ITree.ITreeF.map, Trusted.ITree.ITreeF.ret.injEq] at hu
+    subst hu
+    rcases ho with rfl | rfl <;> exact ⟨n + 2, by rw [steps_add, hsteps, ok_bind, hsr]⟩
+
+/-- **Call-tree normal return from `f.start` for `inFragmentWithAssert` (`G1`)**. -/
+theorem mirCall_ret_withAssert {body : CapturedMir} {f : Gen.Function}
+    (hfragA : inFragmentWithAssert body = true)
+    (hf : translateFnWithAssert body = some f) (ctx : Ctx) (hctx : CtxOk body ctx)
+    (args : List Value) (hargs : argsOk body args = true) (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals body.layouts)
+    {tr : List (Trusted.Effect.Event MirEffect)} {v : Value} {mem : MirSemantics.Memory}
+    (hret : Trusted.ITree.ReachesRet (mirCallTree body args) tr (.normal (v, mem))) :
+    ∃ (n : Nat) (s' : MachineState) (m' : Mach),
+      Interp.steps n mInit = .ok m' ∧ ReturnRel body ctx s' v m' := by
+  have hfragE := (inFragmentWithAssert_spec hfragA).1
+  have hstart : StartRel body f ctx (initMachineState body args) mInit :=
+    (initMachineState_startRel hfragE ctx hctx.toEraseAssert args hargs mInit
+      hthreads hactive hallocs).ofEraseAssert
+  have hns : nonScalarSlotsInit body (initMachineState body args).frame.locals = true := by
+    rw [← nonScalarSlotsInit_eraseAssert]
+    exact initMachineState_nonScalar hfragE args hargs
+  obtain ⟨m0, hm0, hrel0⟩ := step_start_withAssert hfragA hf hstart hns
+  obtain ⟨n, s', m', hsteps, hret'⟩ :=
+    run_ret_withAssert hfragA hf ctx (initMachineState body args) m0 hrel0 hret
+  exact ⟨initLen body + n, s', m', by rw [steps_add, hm0, ok_bind, hsteps], hret'⟩
+
+/-- **Call-tree UB from `f.start` for `inFragmentWithAssert` (`G1`)**. -/
+theorem mirCall_ub_withAssert {body : CapturedMir} {f : Gen.Function}
+    (hfragA : inFragmentWithAssert body = true)
+    (hf : translateFnWithAssert body = some f) (ctx : Ctx) (hctx : CtxOk body ctx)
+    (args : List Value) (hargs : argsOk body args = true) (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals body.layouts)
+    {tr : List (Trusted.Effect.Event MirEffect)} {u : Trusted.ITree.ITree MirEffect MirOutcome}
+    (hreach : Trusted.ITree.Reaches (mirCallTree body args) tr u)
+    (hfault : Trusted.ITree.FaultNow u) :
+    ∃ (n : Nat) (msg : String), Interp.steps n mInit = .error (.ub msg) := by
+  have hfragE := (inFragmentWithAssert_spec hfragA).1
+  have hstart : StartRel body f ctx (initMachineState body args) mInit :=
+    (initMachineState_startRel hfragE ctx hctx.toEraseAssert args hargs mInit
+      hthreads hactive hallocs).ofEraseAssert
+  have hns : nonScalarSlotsInit body (initMachineState body args).frame.locals = true := by
+    rw [← nonScalarSlotsInit_eraseAssert]
+    exact initMachineState_nonScalar hfragE args hargs
+  obtain ⟨m0, hm0, hrel0⟩ := step_start_withAssert hfragA hf hstart hns
+  obtain ⟨n, msg, hsteps⟩ :=
+    run_ub_withAssert hfragA hf ctx (initMachineState body args) m0 hrel0 hreach hfault
+  exact ⟨initLen body + n, msg, by rw [steps_add, hm0, ok_bind, hsteps]⟩
+
+/-- **Call-tree abort/panic from `f.start` for `inFragmentWithAssert` (`G1`)**. -/
+theorem mirCall_abort_or_panic_withAssert {body : CapturedMir} {f : Gen.Function}
+    (hfragA : inFragmentWithAssert body = true)
+    (hf : translateFnWithAssert body = some f) (ctx : Ctx) (hctx : CtxOk body ctx)
+    (args : List Value) (hargs : argsOk body args = true) (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals body.layouts)
+    {tr : List (Trusted.Effect.Event MirEffect)} {o : MirOutcome}
+    (hret : Trusted.ITree.ReachesRet (mirCallTree body args) tr o)
+    (ho : o = .abort ∨ o = .panic) :
+    ∃ (n : Nat), Interp.steps n mInit = .error .abort := by
+  have hfragE := (inFragmentWithAssert_spec hfragA).1
+  have hstart : StartRel body f ctx (initMachineState body args) mInit :=
+    (initMachineState_startRel hfragE ctx hctx.toEraseAssert args hargs mInit
+      hthreads hactive hallocs).ofEraseAssert
+  have hns : nonScalarSlotsInit body (initMachineState body args).frame.locals = true := by
+    rw [← nonScalarSlotsInit_eraseAssert]
+    exact initMachineState_nonScalar hfragE args hargs
+  obtain ⟨m0, hm0, hrel0⟩ := step_start_withAssert hfragA hf hstart hns
+  obtain ⟨n, hsteps⟩ :=
+    run_abort_or_panic_withAssert hfragA hf ctx (initMachineState body args) m0 hrel0 hret ho
+  exact ⟨initLen body + n, by rw [steps_add, hm0, ok_bind, hsteps]⟩
 
 end MiniRustSpec.Correspondence

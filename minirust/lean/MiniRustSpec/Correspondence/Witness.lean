@@ -15672,6 +15672,215 @@ theorem union_reaggregate_needs_deinit_witness :
       some (some (scalarBytes u32 0x01020355)) :=
   ⟨⟨_, _, rfl, rfl, rfl⟩, rfl, rfl⟩
 
+/-! ### Computed Union Translation (`translateFnWithUnions`) and Two-Sided Union Step Simulation Instantiations (`G2`) -/
+
+/-- `translateFnWithUnions` computes a MiniRust `Gen.Function` directly from
+`wMaybeUninitMir`, `wUnionReaggMir`, and `wUnionWitnessMir` without hand-writing
+any MiniRust blocks. -/
+def wMaybeUninitAutoFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, mrMUU32), (localName 2, mrMDU32)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 1), .StorageLive (localName 2),
+      .Assign (.Local (localName 2)) (.Tuple [.Load (.Local (localName 2))] mrMDU32),
+      .Deinit (.Local (localName 1)),
+      .Assign (.Field (.Local (localName 1)) 1) (.Load (.Local (localName 2))),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Field (.Local (localName 1)) 1) 0))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[
+      .StorageLive (localName 1),
+      .Deinit (.Local (localName 1)),
+      .Assign (.Field (.Local (localName 1)) 0) (.Tuple [] mrUnitTy),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Field (.Local (localName 1)) 1) 0))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .StorageLive (localName 2),
+      .Assign (.Local (localName 2)) (.Tuple [.Constant (.Int 7) (.Int u32)] mrMDU32),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 2)) 0))],
+      .Return, .Regular⟩)]⟩
+  start := bbName 0
+  implicit_writes := true
+
+def wUnionReaggAutoFn (deinit : Bool) : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, mrPU)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[(bbName 0, ⟨[.StorageLive (localName 1)] ++
+    (if deinit then [.Deinit (.Local (localName 1))] else []) ++
+    [.Assign (.Field (.Local (localName 1)) 2) (.Constant (.Int 0x01020304) (.Int u32))] ++
+    (if deinit then [.Deinit (.Local (localName 1))] else []) ++
+    [.Assign (.Field (.Local (localName 1)) 1) (.Constant (.Int 0x55) (.Int u8)),
+     .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 2))],
+    .Return, .Regular⟩)]⟩
+  start := bbName 0
+  implicit_writes := true
+
+theorem wUnionReaggAutoFn_eq_true :
+    translateFnWithUnions wUnionReaggMir true = some (wUnionReaggAutoFn true) := rfl
+
+theorem wUnionReaggAutoFn_eq_false :
+    translateFnWithUnions wUnionReaggMir false = some (wUnionReaggAutoFn false) := rfl
+
+theorem wUnionReaggAutoFn_witness :
+    Interp.steps 6 (machine wUnionReaggMir (wUnionReaggAutoFn true) wUnionReaggS0.frame.locals (bbName 0)) =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    (Interp.steps 4 (machine wUnionReaggMir (wUnionReaggAutoFn false) wUnionReaggS0.frame.locals (bbName 0))).toOption.map
+        (fun m => m.mem.memory.allocations[1]?.map (·.data)) =
+      some (some (scalarBytes u32 0x01020355)) :=
+  ⟨rfl, rfl⟩
+
+/-- Concrete `Ctx`, `lm`, and `L` for instantiating `MiniRustUnionLocalStorage`
+and `step_union_whole_copy_minirust_simulation` on `wUnionWitnessMir` /
+`wUnionWitnessFn` (`bb2` at statement `5`, `_5 = copy _4`). -/
+def wUnionCtx2 : Ctx :=
+  { caller := callerFrame
+    payloads := []
+    base := [retAlloc]
+    addrs := [128, 256, 384, 512, 640, 768, 896, 1024]
+    nextBlock := bbName 7
+    unwindBlock := none
+    retPtr := retPtr }
+
+def wUnionAllocs2 : List Gen.Allocation :=
+  [localAlloc wUnionCtx2 0 u32 (List.replicate 4 .Uninit),
+   localAlloc wUnionCtx2 1 ⟨.Unsigned, ⟨4⟩⟩ (List.replicate 4 .Uninit),
+   localAlloc wUnionCtx2 2 ⟨.Unsigned, ⟨4⟩⟩ (List.replicate 4 .Uninit),
+   localAlloc wUnionCtx2 3 ⟨.Unsigned, ⟨1⟩⟩ [],
+   localAlloc wUnionCtx2 4 ⟨.Unsigned, ⟨4⟩⟩ [.Init 0x55 none, .Uninit, .Uninit, .Uninit],
+   localAlloc wUnionCtx2 5 ⟨.Unsigned, ⟨4⟩⟩ (List.replicate 4 .Uninit),
+   localAlloc wUnionCtx2 6 u8 (List.replicate 1 .Uninit),
+   localAlloc wUnionCtx2 7 ⟨.Unsigned, ⟨1⟩⟩ []]
+
+def wUnionMidAnneal2 : MachineState :=
+  { frame :=
+      { blockIdx := 2
+        stmtIdx := 5
+        locals := [.uninit, .uninit, .uninit, .init wZstArr4Val,
+                   .init (.aggregate 0 [.unit, .scalar ⟨0x55, 1⟩, .unit, .unit]),
+                   .uninit, .uninit, .uninit] }
+    memory := (wUnionS0 2).memory }
+
+def wUnionMidMach2 : Mach :=
+  { prog := emptyProg
+    mem := { memory := { allocations := wUnionCtx2.base ++ wUnionAllocs2, _phantom := {} },
+             accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads := [thread1 wUnionCtx2
+      [wUnionCtx2.caller, calleeFrameL wUnionWitnessFn wUnionCtx2 (localsMap wUnionCtx2 8) 2 5]]
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[]⟩
+    vtable_ptrs := ⟨[]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+theorem wUnionMid2_shape :
+    Shape wUnionMidMach2 wUnionCtx2
+      [wUnionCtx2.caller, calleeFrameL wUnionWitnessFn wUnionCtx2 (localsMap wUnionCtx2 8) 2 5]
+      (wUnionCtx2.base ++ wUnionAllocs2) :=
+  ⟨rfl, rfl, rfl⟩
+
+theorem wUnionMid2_storage4 :
+    MiniRustUnionLocalStorage wUnionCtx2 wUnionAllocs2 wUnionWitnessFn
+      (localsMap wUnionCtx2 8) wUnionLayouts 4 wPUTy
+      [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u8), (⟨0⟩, .Int u32), (⟨0⟩, mrUninhabitedZstTy)]
+      4 4 (.init (.aggregate 0 [.unit, .scalar ⟨0x55, 1⟩, .unit, .unit]))
+      [.Init 0x55 none, .Uninit, .Uninit, .Uninit] where
+  pos_size := by decide
+  align_ok := by decide
+  addr_nonneg := by decide
+  addr_lt := by decide
+  fn_local := rfl
+  lm_ptr := rfl
+  bytes_len := rfl
+  alloc_eq := rfl
+  slot_rel := ⟨rfl, _, rfl, rfl, rfl⟩
+
+theorem wUnionMid2_storage5 :
+    MiniRustUnionLocalStorage wUnionCtx2 wUnionAllocs2 wUnionWitnessFn
+      (localsMap wUnionCtx2 8) wUnionLayouts 5 wPUTy
+      [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u8), (⟨0⟩, .Int u32), (⟨0⟩, mrUninhabitedZstTy)]
+      4 4 .uninit (List.replicate 4 .Uninit) where
+  pos_size := by decide
+  align_ok := by decide
+  addr_nonneg := by decide
+  addr_lt := by decide
+  fn_local := rfl
+  lm_ptr := rfl
+  bytes_len := rfl
+  alloc_eq := rfl
+  slot_rel := rfl
+
+/-- **Direct instantiation of `step_union_whole_copy_minirust_simulation`,
+`evalValue_load_union_zstArray_field`, `evalValue_load_union_uninhabited_ub`,
+and `evalValue_load_union_int_uninit_ub` (`G2`)** on `wUnionMidAnneal2` /
+`wUnionMidMach2`:
+1. `_5 = copy _4` steps in lockstep via `step_union_whole_copy_minirust_simulation`,
+   establishing `MiniRustUnionLocalStorage` on `_5` with
+   `[.Init 0x55 none, .Uninit, .Uninit, .Uninit]`;
+2. Reading the `[(); 4]` ZST arm (`_4.0`) succeeds via
+   `evalValue_load_union_zstArray_field`;
+3. Reading the uninhabited `VoidZst` arm (`_4.3`) faults with `.ub` via
+   `evalValue_load_union_uninhabited_ub`;
+4. Reading the `u32` arm (`_4.2`) across the 3 `.Uninit` padding bytes faults
+   with `.ub` via `evalValue_load_union_int_uninit_ub`. -/
+theorem wUnionMid2_two_sided_step_simulations :
+    (evalStmt wUnionMidAnneal2 (mkStmt (.assign (local_ 5) (.use (.copy (local_ 4)))))
+        wUnionWitnessMir.localDecls wUnionWitnessMir.layouts =
+      MirStepNode.step (advanceStmt wUnionMidAnneal2
+        (wUnionMidAnneal2.frame.locals.set 5
+          (.init (.aggregate 0 [.unit, .scalar ⟨0x55, 1⟩, .unit, .unit])))
+        wUnionMidAnneal2.memory) ∧
+     ∃ m',
+       Interp.step wUnionMidMach2 = .ok m' ∧
+       Shape m' wUnionCtx2
+         [wUnionCtx2.caller, calleeFrameL wUnionWitnessFn wUnionCtx2 (localsMap wUnionCtx2 8) 2 6]
+         (wUnionCtx2.base ++ wUnionAllocs2.set 5
+           (localAlloc wUnionCtx2 5 ⟨.Unsigned, ⟨4⟩⟩ [.Init 0x55 none, .Uninit, .Uninit, .Uninit])) ∧
+       MiniRustUnionLocalStorage wUnionCtx2
+         (wUnionAllocs2.set 5
+           (localAlloc wUnionCtx2 5 ⟨.Unsigned, ⟨4⟩⟩ [.Init 0x55 none, .Uninit, .Uninit, .Uninit]))
+         wUnionWitnessFn (localsMap wUnionCtx2 8) wUnionLayouts 5 wPUTy
+         [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u8), (⟨0⟩, .Int u32), (⟨0⟩, mrUninhabitedZstTy)]
+         4 4 (.init (.aggregate 0 [.unit, .scalar ⟨0x55, 1⟩, .unit, .unit]))
+         [.Init 0x55 none, .Uninit, .Uninit, .Uninit]) ∧
+    (∃ m',
+      evalValue wUnionMidMach2 (.Load (.Field (.Local (localName 4)) 0)) =
+        .ok ((.Tuple (List.replicate 4 (.Tuple [])), mrZstArrayTy 4), m')) ∧
+    evalValue wUnionMidMach2 (.Load (.Field (.Local (localName 4)) 3)) =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    evalValue wUnionMidMach2 (.Load (.Field (.Local (localName 4)) 2)) =
+      .error (.ub "load at type but the data in memory violates the language invariant") := by
+  refine ⟨step_union_whole_copy_minirust_simulation (body := wUnionWitnessMir)
+      (s := wUnionMidAnneal2)
+      wUnionMid2_shape wUnionMid2_storage4 wUnionMid2_storage5
+      rfl rfl nofun rfl rfl rfl
+      (tb := ⟨[.StorageLive (localName 3), .StorageLive (localName 4), .StorageLive (localName 5),
+               .StorageLive (localName 6),
+               .Assign (.Field (.Local (localName 4)) 1) (.Constant (.Int 0x55) (.Int u8)),
+               .Assign (.Local (localName 5)) (.Load (.Local (localName 4))),
+               .Assign (.Field (.Local (localName 5)) 0) (.Load (.Field (.Local (localName 4)) 0)),
+               .Assign (.Local (localName 3)) (.Load (.Field (.Local (localName 5)) 0)),
+               .Assign (.Local (localName 6)) (.Load (.Field (.Local (localName 5)) 1)),
+               .Assign (.Local (localName 0)) (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 6)))),
+               .StorageDead (localName 6), .StorageDead (localName 5),
+               .StorageDead (localName 4), .StorageDead (localName 3)],
+              .Return, .Regular⟩)
+      rfl (by decide) rfl,
+    ?_,
+    evalValue_load_union_uninhabited_ub wUnionMid2_shape wUnionMid2_storage4 rfl,
+    evalValue_load_union_int_uninit_ub wUnionMid2_shape wUnionMid2_storage4 rfl
+      (.inr (.inr (.inl rfl))) (by decide) (by decide)⟩
+  obtain ⟨m', hm', _⟩ :=
+    evalValue_load_union_zstArray_field wUnionMid2_shape wUnionMid2_storage4 (j := 0) (N := 4) rfl
+  exact ⟨m', hm'⟩
+
 /-! ## `TerminatorKind.assert` (`assert cond expected target unwind`) Witnesses
 
 `translateFnWithAssert` computes `assertWitnessFn` from `assertWitnessMir`
@@ -15868,5 +16077,220 @@ theorem assert_fail_continue_witness :
       some [some (bbName 12)] ∧
     Interp.steps 2 mCont = .error .abort :=
   ⟨rfl, rfl, rfl⟩
+
+/-! ### Run-Level Correspondence Instantiations for `assertWitnessMir` (`G1`) -/
+
+theorem assertWitnessMir_inFragmentWithAssert :
+    inFragmentWithAssert assertWitnessMir = true := by decide
+
+theorem ctx0_ok_u32_bool {body : CapturedMir} (h : body.localDecls = [u32Decl, boolDecl]) :
+    CtxOk body ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
+    | _ + 2, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
+
+def assertPassS0 : MachineState := initMachineState assertWitnessMir [.scalar ⟨1, 1⟩]
+def assertPassMInit : Mach :=
+  machine assertWitnessMir assertWitnessFn assertPassS0.frame.locals assertWitnessFn.start
+
+def assertCleanupS0 : MachineState := initMachineState assertWitnessMir [.scalar ⟨0, 1⟩]
+def assertCleanupMInit : Mach :=
+  machine assertWitnessMir assertWitnessFn assertCleanupS0.frame.locals assertWitnessFn.start
+
+theorem assertPass_anneal_ret :
+    ReachesRet (mirCallTree assertWitnessMir [.scalar ⟨1, 1⟩]) []
+      (.normal (.scalar ⟨42, 4⟩, assertPassS0.memory)) :=
+  runA_sound assertWitnessMir 5 _ _ _ rfl
+
+theorem assertCleanup_anneal_ret :
+    ReachesRet (mirCallTree assertWitnessMir [.scalar ⟨0, 1⟩]) []
+      (.normal (.scalar ⟨99, 4⟩, assertCleanupS0.memory)) :=
+  runA_sound assertWitnessMir 5 _ _ _ rfl
+
+/-- **End-to-end `mirCall_ret_withAssert` instantiation (passing `assert` -> `42_u32`)**:
+Discharges `inFragmentWithAssert`, `translateFnWithAssert`, `CtxOk`, `argsOk`,
+and `assertPass_anneal_ret` to conclude via `mirCall_ret_withAssert` that
+MiniRust started at `assertWitnessFn.start` reaches `ReturnRel` writing
+`scalarBytes u32 42` into `retAlloc`. -/
+theorem assertPass_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n assertPassMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 42 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret_withAssert assertWitnessMir_inFragmentWithAssert assertWitnessFn_eq
+      ctx0 (ctx0_ok_u32_bool rfl) [.scalar ⟨1, 1⟩] (by decide) assertPassMInit
+      rfl rfl rfl assertPass_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [assertWitnessMir] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+/-- **End-to-end `mirCall_ret_withAssert` instantiation (failing `assert` with
+`.cleanup 2` -> `99_u32`)**:
+Discharges `mirCall_ret_withAssert` on `assertWitnessMir` with `_1 = false`
+(`⟨0, 1⟩`) to conclude that MiniRust started at `assertWitnessFn.start` steps
+through the `.cleanup 2` edge and writes `scalarBytes u32 99` into `retAlloc`. -/
+theorem assertCleanup_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n assertCleanupMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 99 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret_withAssert assertWitnessMir_inFragmentWithAssert assertWitnessFn_eq
+      ctx0 (ctx0_ok_u32_bool rfl) [.scalar ⟨0, 1⟩] (by decide) assertCleanupMInit
+      rfl rfl rfl assertCleanup_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [assertWitnessMir] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+/-- Multi-arm `inFragmentWithAssert` body routing `mode : u32` (`_1`) and
+`flag : bool` (`_2`) from `bb0` into `unwind = .unreachable` (`bb1`),
+`unwind = .terminate` (`bb2`), and `unwind = .continue_` (`bb3`), so
+`mirCall_ub_withAssert` and `mirCall_abort_or_panic_withAssert` are
+instantiated from `f.start`. -/
+def assertAllOutcomesMir : CapturedMir where
+  defPath := "witness::assert_all_outcomes"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, boolDecl]
+  basicBlocks := [
+    -- `bb0`: `switchInt(copy _1) -> [0: bb1, 1: bb2, _: bb3]`
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (local_ 1))
+        { branches := [(0, 1), (1, 2)], otherwise := 3 }),
+      isCleanup := false },
+    -- `bb1`: `assert(copy _2 == true) -> [success: bb4, unwind: unreachable]`
+    { statements := [],
+      terminator := mkTerm (.assert (.copy (local_ 2)) true 4 .unreachable),
+      isCleanup := false },
+    -- `bb2`: `assert(copy _2 == false) -> [success: bb4, unwind: terminate]`
+    { statements := [],
+      terminator := mkTerm (.assert (.copy (local_ 2)) false 4 .terminate),
+      isCleanup := false },
+    -- `bb3`: `assert(copy _2 == true) -> [success: bb4, unwind: continue]`
+    { statements := [],
+      terminator := mkTerm (.assert (.copy (local_ 2)) true 4 .continue_),
+      isCleanup := false },
+    -- `bb4`: `_0 = 42_u32; return`
+    { statements := [mkStmt (.assign (local_ 0) (.use (constU32 42)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := { args := [{ layout := u32Layout, mode := .direct },
+                      { layout := wU8Layout, mode := .direct }],
+             ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := true }
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem assertAllOutcomesMir_inFragmentWithAssert :
+    inFragmentWithAssert assertAllOutcomesMir = true := by decide
+
+def assertAllOutcomesFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Bool)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[], .Switch (.Load (.Local (localName 1)))
+      ⟨[(0, bbName 1), (1, bbName 2)]⟩ (bbName 3), .Regular⟩),
+    (bbName 1, ⟨[], .Switch (assertDiscrExpr true (.Load (.Local (localName 2))))
+      ⟨[(1, bbName 4)]⟩ (bbName 6), .Regular⟩),
+    (bbName 2, ⟨[], .Switch (assertDiscrExpr false (.Load (.Local (localName 2))))
+      ⟨[(1, bbName 4)]⟩ (bbName 8), .Regular⟩),
+    (bbName 3, ⟨[], .Switch (assertDiscrExpr true (.Load (.Local (localName 2))))
+      ⟨[(1, bbName 4)]⟩ (bbName 10), .Regular⟩),
+    (bbName 4, ⟨[.Assign (.Local (localName 0)) (.Constant (.Int 42) (.Int u32))],
+      .Return, .Regular⟩),
+    (bbName 5, ⟨[], .Goto (bbName 0), .Regular⟩),
+    (bbName 6, ⟨[], .Unreachable, .Regular⟩),
+    (bbName 8, ⟨[], abortTerminator, .Regular⟩),
+    (bbName 10, ⟨[], abortTerminator, .Regular⟩)]⟩
+  start := bbName 5
+  implicit_writes := true
+
+theorem assertAllOutcomesFn_eq :
+    translateFnWithAssert assertAllOutcomesMir = some assertAllOutcomesFn := rfl
+
+def ctx0_3 : Ctx :=
+  { ctx0 with addrs := [128, 256, 384] }
+
+theorem ctx0_ok_u32_u32_bool {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, u32Decl, boolDecl]) :
+    CtxOk body ctx0_3 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 2, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
+
+def assertUnreachCallS0 : MachineState :=
+  initMachineState assertAllOutcomesMir [.scalar ⟨0, 4⟩, .scalar ⟨0, 1⟩]
+def assertUnreachCallMInit : Mach :=
+  machineWithCtx ctx0_3 assertAllOutcomesMir assertAllOutcomesFn assertUnreachCallS0.frame.locals assertAllOutcomesFn.start
+
+def assertTermCallS0 : MachineState :=
+  initMachineState assertAllOutcomesMir [.scalar ⟨1, 4⟩, .scalar ⟨1, 1⟩]
+def assertTermCallMInit : Mach :=
+  machineWithCtx ctx0_3 assertAllOutcomesMir assertAllOutcomesFn assertTermCallS0.frame.locals assertAllOutcomesFn.start
+
+def assertContCallS0 : MachineState :=
+  initMachineState assertAllOutcomesMir [.scalar ⟨2, 4⟩, .scalar ⟨0, 1⟩]
+def assertContCallMInit : Mach :=
+  machineWithCtx ctx0_3 assertAllOutcomesMir assertAllOutcomesFn assertContCallS0.frame.locals assertAllOutcomesFn.start
+
+theorem assertUnreachCall_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree assertAllOutcomesMir [.scalar ⟨0, 4⟩, .scalar ⟨0, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound assertAllOutcomesMir 5 _ (by decide)
+
+/-- **End-to-end `mirCall_ub_withAssert` instantiation (failing `assert` with
+`unwind = .unreachable` from `f.start`)**. -/
+theorem assertUnreachCall_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n assertUnreachCallMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := assertUnreachCall_anneal_ub
+  exact mirCall_ub_withAssert assertAllOutcomesMir_inFragmentWithAssert assertAllOutcomesFn_eq
+    ctx0_3 (ctx0_ok_u32_u32_bool rfl) [.scalar ⟨0, 4⟩, .scalar ⟨0, 1⟩] (by decide)
+    assertUnreachCallMInit rfl rfl rfl hr hf
+
+theorem assertTermCall_anneal_abort :
+    ReachesRet (mirCallTree assertAllOutcomesMir [.scalar ⟨1, 4⟩, .scalar ⟨1, 1⟩])
+      [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩] .abort :=
+  runA_sound assertAllOutcomesMir 5 _ _ _ rfl
+
+theorem assertContCall_anneal_panic :
+    ReachesRet (mirCallTree assertAllOutcomesMir [.scalar ⟨2, 4⟩, .scalar ⟨0, 1⟩])
+      [⟨.inr (.inl (.emit (.event 2))), PUnit.unit⟩] .panic :=
+  runA_sound assertAllOutcomesMir 5 _ _ _ rfl
+
+/-- **End-to-end `mirCall_abort_or_panic_withAssert` instantiations (failing
+`assert` with `unwind = .terminate` and `unwind = .continue_` from `f.start`)**. -/
+theorem assertTermAndContCall_minirust_abort_from_start :
+    (∃ n, Interp.steps n assertTermCallMInit = .error .abort) ∧
+    (∃ n, Interp.steps n assertContCallMInit = .error .abort) :=
+  ⟨mirCall_abort_or_panic_withAssert assertAllOutcomesMir_inFragmentWithAssert assertAllOutcomesFn_eq
+     ctx0_3 (ctx0_ok_u32_u32_bool rfl) [.scalar ⟨1, 4⟩, .scalar ⟨1, 1⟩] (by decide)
+     assertTermCallMInit rfl rfl rfl assertTermCall_anneal_abort (.inl rfl),
+   mirCall_abort_or_panic_withAssert assertAllOutcomesMir_inFragmentWithAssert assertAllOutcomesFn_eq
+     ctx0_3 (ctx0_ok_u32_u32_bool rfl) [.scalar ⟨2, 4⟩, .scalar ⟨0, 1⟩] (by decide)
+     assertContCallMInit rfl rfl rfl assertContCall_anneal_panic (.inr rfl)⟩
 
 end MiniRustSpec.Correspondence.Witness
