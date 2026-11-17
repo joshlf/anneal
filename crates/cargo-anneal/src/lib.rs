@@ -2611,22 +2611,68 @@ fn extract_default_callee_suffixes_from_obligations(ob_text: &str) -> Result<Vec
 /// Resolve the explicit external callees of a generated `Obligations/<Item>.lean`
 /// module: `#[external_spec]` targets bound by `externalSpecCallContract` and the
 /// `DefPath`s of sibling `called_callees` imported as `Obligations.<Callee>`
-/// (including `#[spec(trusted)]` siblings), read from their `Mir/<Callee>.lean`.
+/// (including `#[spec(trusted)]` siblings), read strictly from their
+/// `Mir/<Callee>.lean`.
+///
+/// `[adv ep1-A2]`: fails closed (`Err`) on self-imports (`Obligations.<Item>`),
+/// unused `import Obligations.<Callee>` headers without a corresponding
+/// `Obligations.<Callee>.defaultCallContract` reference (or vice versa), and
+/// missing or malformed/comment-spoofed sibling `Mir/<Callee>.lean` modules.
 fn extract_external_callee_def_paths_from_obligations(
+    subject_suffix: &str,
     links: &fault_census::ObligationsCalleeLinks,
     mir_root: &Path,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let mut out = links.external_spec_targets.clone();
     for callee_suffix in &links.imported_obligation_suffixes {
-        let callee_mir_path = mir_root.join(module_suffix_to_rel_path(callee_suffix));
-        if let Ok(src) = fs::read_to_string(&callee_mir_path)
-            && let Some(def_path) = extract_lean_mir_def_path(&src)
-            && !out.contains(&def_path)
+        if callee_suffix == subject_suffix {
+            return Err(format!(
+                "Obligations module for {subject_suffix} self-imports `Obligations.{callee_suffix}`"
+            ));
+        }
+        if !links
+            .referenced_callee_contracts
+            .iter()
+            .any(|c| c == callee_suffix)
         {
-            out.push(def_path);
+            return Err(format!(
+                "Obligations module for {subject_suffix} imports `Obligations.{callee_suffix}` without referencing `Obligations.{callee_suffix}.defaultCallContract`"
+            ));
+        }
+        let callee_mir_path = mir_root.join(module_suffix_to_rel_path(callee_suffix));
+        let src = fs::read_to_string(&callee_mir_path).map_err(|err| {
+            format!(
+                "missing MIR module {} for imported sibling `Obligations.{callee_suffix}`: {err}",
+                callee_mir_path.display()
+            )
+        })?;
+        let cbody = parse_lean_mir_module_body_strict(&src).map_err(|err| {
+            format!(
+                "MIR fault-census scan error in imported sibling callee {callee_suffix}: {err}"
+            )
+        })?;
+        if cbody.def_path.is_empty() {
+            return Err(format!(
+                "imported sibling callee {callee_suffix} has an empty `defPath` in {}",
+                callee_mir_path.display()
+            ));
+        }
+        if !out.contains(&cbody.def_path) {
+            out.push(cbody.def_path);
         }
     }
-    out
+    for contract_callee in &links.referenced_callee_contracts {
+        if !links
+            .imported_obligation_suffixes
+            .iter()
+            .any(|c| c == contract_callee)
+        {
+            return Err(format!(
+                "Obligations module for {subject_suffix} references `Obligations.{contract_callee}.defaultCallContract` without `import Obligations.{contract_callee}`"
+            ));
+        }
+    }
+    Ok(out)
 }
 
 fn unmapped_fault_site_status(reason: String) -> VerificationStatus {
@@ -2763,21 +2809,33 @@ fn apply_fault_site_coverage_reconciliation(
             ));
             continue;
         }
-        // Every claim record must bind `callees := defaultCallees` (or `implCallees := defaultCallees`)
-        // so a claim cannot bypass `defaultCallees` with `.nil` or `[]`.
-        if !links.claim_callees_bindings.is_empty()
-            && !links
+        // Every claim record must bind `callees := defaultCallees` (or `implCallees := defaultCallees`,
+        // `specCallees := defaultCallees`) and `claim_body_field_count == claim_callees_field_count`
+        // so a claim cannot omit `callees`, construct a `Claim` via positional `Claim.mk`, or
+        // bypass `defaultCallees` with `.nil`, `[]`, or a trailing expression (`defaultCallees.drop 1`).
+        if links.claim_callees_bindings.is_empty()
+            || links.claim_body_field_count != links.claim_callees_field_count
+            || !links
                 .claim_callees_bindings
                 .iter()
                 .all(|b| b == "defaultCallees")
         {
             item.status = unmapped_fault_site_status(format!(
-                "Obligations module for {suffix} overrides claim `callees` with {:?} instead of `defaultCallees`",
-                links.claim_callees_bindings
+                "Obligations module for {suffix} overrides claim `callees` (bindings={:?}, body_fields={}, callees_fields={}) instead of `defaultCallees`",
+                links.claim_callees_bindings,
+                links.claim_body_field_count,
+                links.claim_callees_field_count
             ));
             continue;
         }
-        let explicit_external = extract_external_callee_def_paths_from_obligations(&links, &mir_root);
+        let explicit_external =
+            match extract_external_callee_def_paths_from_obligations(&suffix, &links, &mir_root) {
+                Ok(ext) => ext,
+                Err(err) => {
+                    item.status = unmapped_fault_site_status(err);
+                    continue;
+                }
+            };
 
         let mut callee_bodies = Vec::new();
         let mut scan_err_reasons = Vec::new();
@@ -5700,6 +5758,59 @@ end Mir.Demo.caller
         {
             Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
                 assert!(reason.contains("overrides claim `callees`"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+
+        fs::write(&caller_ob_path, &original_ob).expect("restore caller obligations");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller"),
+            Some(&VerificationStatus::VerifiedUnconditional)
+        );
+
+        // Negative test 11b (`[adv ep1-A2]`): trailing tokens after `defaultCallees`
+        // (`callees := defaultCallees.drop 1`), omitting `callees := defaultCallees` from
+        // a claim record, or adding an unused `import Obligations.Demo.leaf` header
+        // without `Obligations.Demo.leaf.defaultCallContract` all fail closed.
+        let trailing_callees_ob = original_ob.replacen(
+            "callees := defaultCallees }",
+            "callees := defaultCallees.drop 1 }",
+            1,
+        );
+        assert_ne!(trailing_callees_ob, original_ob);
+        fs::write(&caller_ob_path, &trailing_callees_ob).expect("write trailing callees");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("overrides claim `callees`"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+
+        let omitted_callees_ob = original_ob.replacen(", callees := defaultCallees }", " }", 1);
+        assert_ne!(omitted_callees_ob, original_ob);
+        fs::write(&caller_ob_path, &omitted_callees_ob).expect("write omitted callees");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("overrides claim `callees`"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+
+        let unused_import_ob = format!("import Obligations.Demo.leaf\n{unlinked_ob}");
+        fs::write(&caller_ob_path, &unused_import_ob).expect("write unused import obligations");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(
+                    reason.contains("imports `Obligations.Demo.leaf` without referencing"),
+                    "{reason}"
+                );
             }
             other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
         }

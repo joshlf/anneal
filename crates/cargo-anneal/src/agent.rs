@@ -35,7 +35,7 @@ use anneal_rustc_capture::{CapturedItemKind, CapturedTarget, UnitTargetRecord};
 use crate::fault_census::PropertyRegistry;
 use crate::obligations::{
     AuthoredItemModules, SubjectObligationBundle, derive_item_module_suffix,
-    group_subject_obligations, module_suffix_to_rel_path, render_obligations_module_with_options,
+    group_subject_obligations, module_suffix_to_rel_path, render_obligations_module_with_census,
 };
 use crate::scaffold::{
     MirFragment, MirLiftingProfile, analyze_workspace_lifting_profile,
@@ -2243,7 +2243,8 @@ pub fn render_agent_context(
             bundle.external_specs.len()
         ));
         out.push_str("### Fault-Site Census & Coverage Reconciliation\n\n");
-        match compute_workspace_bundle_fault_census(&mir_root, records, bundle) {
+        let computed_census = compute_workspace_bundle_fault_census(&mir_root, records, bundle);
+        match &computed_census {
             Ok(Some((receipt, _verdict))) => {
                 for line in receipt.summary_lines() {
                     out.push_str(&format!("- {line}\n"));
@@ -2287,7 +2288,11 @@ pub fn render_agent_context(
                 format!("failed to read {}: {}", obligations_disk.display(), err)
             })?
         } else {
-            render_obligations_module_with_options(bundle, authored)
+            let receipt_opt = computed_census
+                .as_ref()
+                .ok()
+                .and_then(|opt| opt.as_ref().map(|(r, _)| r));
+            render_obligations_module_with_census(bundle, authored, receipt_opt)
         };
         out.push_str(&format!(
             "### Generated Obligations (`.anneal/generated/Obligations/{rel_lean}`)\n\n```lean\n{}\n```\n\n",

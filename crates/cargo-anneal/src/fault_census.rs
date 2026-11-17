@@ -4294,37 +4294,46 @@ pub fn parse_lean_mir_module_body_strict(lean_src: &str) -> Result<ProtoMirBody,
     parse_lean_captured_mir_def(lean_src, "body")
 }
 
-/// `[adv ep1-B1]` / `[adv ep1-A1]` Callee links and claim bindings declared by a
-/// generated `Obligations/<Item>.lean` module, scanned with the comment- and
-/// string-aware Lean lexer so that text inside `--` / `/- ... -/` comments or
-/// string literals can never add a link or spoof a claim binding.
+/// `[adv ep1-B1]` / `[adv ep1-A1]` / `[adv ep1-A2]` Callee links and claim bindings
+/// declared by a generated `Obligations/<Item>.lean` module, scanned with the
+/// comment- and string-aware Lean lexer so that text inside `--` / `/- ... -/`
+/// comments or string literals can never add a link or spoof a claim binding.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObligationsCalleeLinks {
     /// Target `DefPath`s bound by `externalSpecCallContract "<target>" ...`.
     pub external_spec_targets: Vec<String>,
     /// `<Callee>` module suffixes of `import Obligations.<Callee>` commands.
     pub imported_obligation_suffixes: Vec<String>,
+    /// `[adv ep1-A2]` `<Callee>` module suffixes referenced via
+    /// `Obligations.<Callee>.defaultCallContract` (or `.defaultCallContract.holdsOn`).
+    pub referenced_callee_contracts: Vec<String>,
     /// Every dotted identifier of the form `Mir.<Item>.body` (or a projection of it,
     /// such as `Mir.<Item>.body.instantiate`) referenced by the module, reported as
     /// the `<Item>` suffix.
     pub referenced_mir_bodies: Vec<String>,
-    /// `[adv ep1-A1]` Every `<Item>` suffix bound to a `body := Mir.<Item>.body`
-    /// (or `Mir.<Item>.body.instantiate`) or `implBody := Mir.<Item>.body` field
-    /// inside a claim record literal.
+    /// `[adv ep1-A1]` Every `<Item>` suffix bound to an exact `body := Mir.<Item>.body`
+    /// (or `Mir.<Item>.body.instantiate typeArgs`) or `implBody := Mir.<Item>.body`
+    /// field inside a claim record literal.
     pub claim_mir_bodies: Vec<String>,
-    /// `[adv ep1-A1]` Any non-`Mir.<Item>.body` token assigned to `body := ...` or
-    /// `implBody := ...` inside a claim record literal (must be empty for a valid
-    /// generated Obligations module).
+    /// `[adv ep1-A1]` / `[adv ep1-A2]` Any non-`Mir.<Item>.body` token sequence assigned
+    /// to `body := ...` or `implBody := ...` inside a claim record literal (must be
+    /// empty for a valid generated Obligations module).
     pub non_mir_claim_bodies: Vec<String>,
-    /// `[adv ep1-A1]` Every RHS identifier bound to `callees := ...` or
-    /// `implCallees := ...` inside a claim record literal (every entry must be
-    /// `"defaultCallees"` so a claim cannot bypass `defaultCallees` with `.nil`).
+    /// `[adv ep1-A1]` / `[adv ep1-A2]` Every RHS expression bound to `callees := ...`,
+    /// `implCallees := ...`, or `specCallees := ...` inside a claim record literal
+    /// (every entry must be `"defaultCallees"` with no trailing tokens).
     pub claim_callees_bindings: Vec<String>,
+    /// `[adv ep1-A2]` Total number of `body :=` / `implBody :=` claim field bindings.
+    pub claim_body_field_count: usize,
+    /// `[adv ep1-A2]` Total number of `callees :=` / `implCallees :=` claim field
+    /// bindings (must equal `claim_body_field_count` so no claim record can omit
+    /// `callees := defaultCallees` or construct a `Claim` via positional `Claim.mk`).
+    pub claim_callees_field_count: usize,
 }
 
-/// `[adv ep1-B1]` / `[adv ep1-A1]` Scan a generated `Obligations/<Item>.lean` module
-/// for its callee links and claim bindings (see [`ObligationsCalleeLinks`]), failing
-/// closed on any lexer error.
+/// `[adv ep1-B1]` / `[adv ep1-A1]` / `[adv ep1-A2]` Scan a generated
+/// `Obligations/<Item>.lean` module for its callee links and claim bindings (see
+/// [`ObligationsCalleeLinks`]), failing closed on any lexer error.
 pub fn scan_obligations_callee_links(
     ob_text: &str,
 ) -> Result<ObligationsCalleeLinks, CensusScanError> {
@@ -4341,6 +4350,40 @@ pub fn scan_obligations_callee_links(
             .or_else(|| rest.rsplit_once(".body.").map(|(item, _)| item))
             .filter(|s| !s.is_empty())
     }
+    fn extract_callee_contract(ident: &str) -> Option<&str> {
+        let rest = ident.strip_prefix("Obligations.")?;
+        rest.strip_suffix(".defaultCallContract")
+            .or_else(|| rest.strip_suffix(".defaultCallContract.holdsOn"))
+            .filter(|s| !s.is_empty())
+    }
+    let find_field_rhs_end = |start: usize| -> usize {
+        let mut depth = 0isize;
+        let mut k = start;
+        while k < tokens.len() {
+            if depth == 0 {
+                if matches!(tokens[k], LeanToken::Comma | LeanToken::RBrace)
+                    || is_lean_command_start(&tokens[k])
+                {
+                    break;
+                }
+                if k > start
+                    && matches!(tokens.get(k), Some(LeanToken::Ident(_)))
+                    && tokens.get(k + 1) == Some(&LeanToken::ColonEq)
+                {
+                    break;
+                }
+            }
+            match tokens[k] {
+                LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+                LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                    depth = (depth - 1).max(0);
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        k
+    };
     for (idx, tok) in tokens.iter().enumerate() {
         let LeanToken::Ident(ident) = tok else {
             continue;
@@ -4354,27 +4397,54 @@ pub fn scan_obligations_callee_links(
                     push_unique(&mut links.imported_obligation_suffixes, suffix);
                 }
             }
-            ("body" | "implBody", Some(LeanToken::ColonEq)) => match tokens.get(idx + 2) {
-                Some(LeanToken::Ident(rhs)) => {
-                    if let Some(item) = extract_mir_item(rhs) {
-                        push_unique(&mut links.claim_mir_bodies, item);
-                    } else {
-                        push_unique(&mut links.non_mir_claim_bodies, rhs);
+            ("body" | "implBody", Some(LeanToken::ColonEq)) => {
+                links.claim_body_field_count += 1;
+                let end = find_field_rhs_end(idx + 2);
+                let rhs_slice = &tokens[idx + 2..end];
+                match rhs_slice {
+                    [LeanToken::Ident(rhs)] => {
+                        if let Some(item) =
+                            rhs.strip_prefix("Mir.").and_then(|r| r.strip_suffix(".body"))
+                            && !item.is_empty()
+                        {
+                            push_unique(&mut links.claim_mir_bodies, item);
+                        } else {
+                            push_unique(&mut links.non_mir_claim_bodies, rhs);
+                        }
+                    }
+                    [LeanToken::Ident(rhs), LeanToken::Ident(arg)] if arg == "typeArgs" => {
+                        if let Some(item) = rhs
+                            .strip_prefix("Mir.")
+                            .and_then(|r| r.strip_suffix(".body.instantiate"))
+                            && !item.is_empty()
+                        {
+                            push_unique(&mut links.claim_mir_bodies, item);
+                        } else {
+                            push_unique(
+                                &mut links.non_mir_claim_bodies,
+                                &format!("{rhs} {arg}"),
+                            );
+                        }
+                    }
+                    other => {
+                        push_unique(&mut links.non_mir_claim_bodies, &format!("{other:?}"));
                     }
                 }
-                other => {
-                    push_unique(&mut links.non_mir_claim_bodies, &format!("{other:?}"));
+            }
+            ("callees" | "implCallees" | "specCallees", Some(LeanToken::ColonEq)) => {
+                if ident == "callees" || ident == "implCallees" {
+                    links.claim_callees_field_count += 1;
                 }
-            },
-            ("callees" | "implCallees", Some(LeanToken::ColonEq)) => {
-                match (tokens.get(idx + 2), tokens.get(idx + 3)) {
-                    (Some(LeanToken::Ident(rhs)), _) => {
+                let end = find_field_rhs_end(idx + 2);
+                let rhs_slice = &tokens[idx + 2..end];
+                match rhs_slice {
+                    [LeanToken::Ident(rhs)] => {
                         push_unique(&mut links.claim_callees_bindings, rhs);
                     }
-                    (Some(LeanToken::Dot), Some(LeanToken::Ident(rhs))) => {
+                    [LeanToken::Dot, LeanToken::Ident(rhs)] => {
                         push_unique(&mut links.claim_callees_bindings, &format!(".{rhs}"));
                     }
-                    (other, _) => {
+                    other => {
                         push_unique(&mut links.claim_callees_bindings, &format!("{other:?}"));
                     }
                 }
@@ -4383,6 +4453,9 @@ pub fn scan_obligations_callee_links(
         }
         if let Some(item) = extract_mir_item(ident) {
             push_unique(&mut links.referenced_mir_bodies, item);
+        }
+        if let Some(callee) = extract_callee_contract(ident) {
+            push_unique(&mut links.referenced_callee_contracts, callee);
         }
     }
     Ok(links)
@@ -8564,6 +8637,11 @@ end Mir.Probe.item",
             "theorem evalRvalue_binaryOp_ub_cause",
             "theorem evalRvalue_ub_implies_mem_censusRvalue",
             "theorem evalStmt_assign_rvalue_ub_justified",
+            "theorem evalStmt_assume_operand_ub_justified",
+            "theorem evalTerminator_switchInt_discr_ub_justified",
+            "theorem evalTerminator_assert_cond_ub_justified",
+            "theorem evalTerminator_call_args_ub_justified",
+            "theorem evalTerminator_tailCall_args_ub_justified",
         ] {
             assert!(
                 LEAN_PROTOTYPE_SRC.contains(decl),

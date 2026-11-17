@@ -729,9 +729,7 @@ pub fn compute_workspace_bundle_fault_census(
         if let Some(path) = callee_path
             && let Ok(src) = fs::read_to_string(&path)
         {
-            if src.contains("def body") {
-                callee_sources.push((callee.def_id.clone(), src));
-            }
+            callee_sources.push((callee.def_id.clone(), src));
         } else {
             callee_sources.push((callee.def_id.clone(), String::new()));
         }
