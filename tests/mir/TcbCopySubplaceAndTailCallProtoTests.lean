@@ -665,6 +665,77 @@ theorem canary_bug4_opaque_alias_field_shell_uses_cast_type :
       } := by
   exact ⟨rfl, rfl, rfl⟩
 
+/--
+Canary 4D (Cross-field struct byte-span copy fails closed with `.unsupported`, while
+out-of-allocation struct read faults with `.ub`):
+on an 8-byte `PairU32 { a: u32, b: u32 }`, copying `n = 2` `u32`s (`8` bytes <= `8`
+bytes of the root struct) starting at `&raw const pair.0` returns
+`MirStepNode.unsupported` (avoiding a false-positive `.ub` on a valid cross-field
+`#[repr(C)]` read), whereas `n = 3` (`12` bytes > `8` bytes of the root struct)
+faults with `MirStepNode.fail .ub`.
+-/
+theorem canary_bug1_cross_field_span_unsupported_vs_oob_ub :
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let pairVal : Value := .aggregate 0 [mkU32 10, mkU32 20]
+    let dstArr : Value := .aggregate 0 [mkU32 0, mkU32 0, mkU32 0]
+    let locals : List LocalSlot := [.init pairVal, .init dstArr]
+    let srcEntry : BorrowEntry :=
+      { tag := 70, targetLocal := 0, targetProjection := [.field 0 u32Ty], perm := .cell }
+    let dstEntry : BorrowEntry :=
+      { tag := 71, targetLocal := 1, targetProjection := [], perm := .unique }
+    let s : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 72 }
+    }
+    evalCopyNonOverlappingPermOkProto
+      s (.copy ⟨0, []⟩) (.copy ⟨1, []⟩) [] emptyLayoutTable
+      { allocId := 70, offsetBytes := 0 } { allocId := 71, offsetBytes := 0 }
+      srcEntry dstEntry 2 locals =
+      MirStepNode.unsupported ∧
+    evalCopyNonOverlappingPermOkProto
+      s (.copy ⟨0, []⟩) (.copy ⟨1, []⟩) [] emptyLayoutTable
+      { allocId := 70, offsetBytes := 0 } { allocId := 71, offsetBytes := 0 }
+      srcEntry dstEntry 3 locals =
+      MirStepNode.fail .ub := by
+  exact ⟨rfl, rfl⟩
+
+open TailCallCallerReferentWitnesses in
+/--
+Canary 4E (`.opaqueCast` on `.call` return destination and `move` argument, plus
+non-`Use` binaryOp `move (_1 as u32)`):
+1. Calling `hadd(move (_1 as *mut u32))` returning into `(_0 as u32)` when `_0` is
+   `.uninit` faults with `.ub` under unpatched `execN` (`writeReturnDestination`
+   takes the projected branch on `.uninit` `_0`), whereas `execNProto` succeeds
+   and returns `43`.
+2. Evaluating `_0 = Add(move (_1 as u32), 10)` de-initializes `_1` under
+   `evalStmtProto`, whereas unpatched `evalStmt` leaves `_1` initialized.
+-/
+theorem canary_bug4_call_destination_and_binop_move_opaqueCast :
+    let fCallCastBody : CapturedMir :=
+      mkBody "w::fcallcast" 1 [u32Decl "_0", ptrDecl "p"]
+        [blk [] (.call (fnItem "w::hadd") [.move ⟨1, [.opaqueCast tyPtrMutU32]⟩]
+            ⟨0, [.opaqueCast tyU32]⟩ (some 1) .continue_),
+         blk [] .return_]
+    let sBin : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init (mkU32 32)] }
+      memory := emptyMemory
+    }
+    let binStmt : Statement :=
+      st (.assign (lc 0) (.binaryOp .add (.move ⟨1, [.opaqueCast tyU32]⟩) (cU32 10)))
+    execN fCallCastBody 6 (crInit fCallCastBody) = some (.faulted .ub) ∧
+    haltedVal? (execNProto fCallCastBody 6 (crInit fCallCastBody)) = some (.scalar ⟨43, 4⟩) ∧
+    evalStmt sBin binStmt [] emptyLayoutTable =
+      MirStepNode.step {
+        sBin with
+        frame := { blockIdx := 0, stmtIdx := 1, locals := [.init (mkU32 42), .init (mkU32 32)] }
+      } ∧
+    evalStmtProto sBin binStmt [] emptyLayoutTable =
+      MirStepNode.step {
+        sBin with
+        frame := { blockIdx := 0, stmtIdx := 1, locals := [.init (mkU32 42), .uninit] }
+      } := by
+  exact ⟨rfl, rfl, rfl, rfl⟩
+
 /-! ## 5. Conservativity Canaries (the prototype is `Trusted` wherever no repair applies) -/
 
 open TailCallCallerReferentWitnesses in
@@ -719,11 +790,15 @@ theorem canary_conservativity_use_keeps_tree_borrows_read :
 #print axioms TailCallCallerReferentWitnesses.tailCall_repaired_caller_referent_write_and_reborrow
 #print axioms TailCallCallerReferentWitnesses.tailCall_repaired_caller_referent_multihop
 #print axioms TailCallCallerReferentWitnesses.tailCall_repaired_dangling_frame_local_faults_ub
+#print axioms TailCallCallerReferentWitnesses.tailCall_repaired_wide_narrow_wide_dead_local_not_relocated
 #print axioms opaqueCast_trusted_root_dispatch_simulation
 #print axioms opaqueCast_typed_root_write_validates_cast_type
 #print axioms opaqueCast_uninit_field_shell_is_cast_type_shell
 #print axioms opaqueCast_before_deref_stays_unsupported
+#print axioms writeReturnDestinationProto_pure_opaqueCast_simulation
+#print axioms canary_bug1_cross_field_span_unsupported_vs_oob_ub
 #print axioms canary_bug4_opaque_alias_field_shell_uses_cast_type
+#print axioms canary_bug4_call_destination_and_binop_move_opaqueCast
 #print axioms canary_conservativity_use_keeps_tree_borrows_read
 
 end Anneal.TcbCopySubplaceAndTailCallProtoTests
