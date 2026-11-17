@@ -3979,7 +3979,8 @@ private theorem ptrAllocByteBound?_spec {body : CapturedMir}
         have hsloti := (DeclSlotOk_of_arrayTypeOf ha (.init targetRootVal)).mp
           (hslots entry.targetLocal dk _ hdk ht)
         match targetRootVal, hsloti with
-        | .aggregate 0 elems, ⟨hlenE, _⟩ =>
+        | .aggregate 0 elems, ⟨hlenE, he⟩ =>
+          have hinit := valueListContainsUninit_of_elemOk he
           rw [hproj] at hb hpr
           cases fromEnd with
           | false =>
@@ -3987,7 +3988,8 @@ private theorem ptrAllocByteBound?_spec {body : CapturedMir}
               body.localDecls body.layouts entry.targetLocal hdk elems []).trans hstride
             simp only [MirSemantics.stripTransparentProjections,
               MirSemantics.normalizeAdjacentSubslices, MirSemantics.normalizeAdjacentSubslicesAux,
-              MirSemantics.splitLastConstantIndex?, readProjectedValue, hstr_el] at hb
+              MirSemantics.splitLastConstantIndex?, readProjectedValue, valueContainsUninit,
+              hinit, hstr_el] at hb
             split at hb
             · simp only [Option.some.injEq] at hb; omega
             · simp only [Nat.sub_eq, Nat.mul_eq, Option.some.injEq] at hb
@@ -4053,7 +4055,8 @@ private theorem ptrAllocByteBound?_spec {body : CapturedMir}
       have hsloti := (DeclSlotOk_of_arrayTypeOf ha (.init targetRootVal)).mp
         (hslots entry.targetLocal dk _ hdk ht)
       match targetRootVal, hsloti with
-      | .aggregate 0 elems, ⟨hlenE, _⟩ =>
+      | .aggregate 0 elems, ⟨hlenE, he⟩ =>
+        have hinit := valueListContainsUninit_of_elemOk he
         rw [hproj] at hpr ⊢
         have hmin : minLen ≤ count := by
           simp only [projOk, Bool.and_eq_true, decide_eq_true_eq] at hpok
@@ -4068,8 +4071,8 @@ private theorem ptrAllocByteBound?_spec {body : CapturedMir}
             simp [Nat.ble_eq, hmin, Nat.le_of_lt hlt_off]
           simp only [MirSemantics.stripTransparentProjections,
             MirSemantics.normalizeAdjacentSubslices, MirSemantics.normalizeAdjacentSubslicesAux,
-            MirSemantics.splitLastConstantIndex?, readProjectedValue, hstr_el,
-            mirValue_length_eq, hlenE, hble, Nat.sub_eq, Nat.mul_eq]
+            MirSemantics.splitLastConstantIndex?, readProjectedValue, valueContainsUninit,
+            hinit, hstr_el, mirValue_length_eq, hlenE, hble, Nat.sub_eq, Nat.mul_eq]
           exact ⟨(count - offset) * pointeeIt.size.bytes, rfl, by
             have : 1 ≤ count - offset := by omega
             exact Nat.le_trans (by simp) (Nat.mul_le_mul_right pointeeIt.size.bytes this)⟩
@@ -4083,6 +4086,7 @@ private theorem ptrAllocByteBound?_spec {body : CapturedMir}
     · dsimp only at hproj hd'; rw [hdk] at hd'; injection hd' with hd_eq; subst hd_eq
       have hsloti := (DeclSlotOk_of_tupleTypeOf htu (.init targetRootVal)).mp
         (hslots entry.targetLocal dk _ hdk ht)
+      have hinit := TupleSpec.valueContainsUninit_of_valOk hsloti.2
       obtain ⟨_, hrel_le⟩ := resolveFieldPath_wf hsloti.1 hres
       dsimp only [TupleSpec.size] at hrel_le
       have hts := htspec
@@ -4119,8 +4123,138 @@ private theorem ptrAllocByteBound?_spec {body : CapturedMir}
       dsimp only
       rw [normalizeSubsliceProjections_allFields hall]
       have hble_rel : Nat.ble relOff size = true := Nat.ble_eq.mpr (by omega)
-      simp only [readProjectedValue, hpl_root, hsz, hchain, hble_rel, Nat.sub_eq]
+      simp only [readProjectedValue, hinit, hpl_root, hsz, hchain, hble_rel, Nat.sub_eq]
       exact ⟨size - relOff, rfl, by omega⟩
+
+private theorem readContainerProjectedValue_of_readProjectedValue_ok
+    (locals : List LocalSlot) :
+    ∀ (projs : List ProjectionElem) (val outVal : Value),
+      readProjectedValue locals val projs = .ok outVal →
+      MirSemantics.readContainerProjectedValue locals val projs = .ok outVal
+  | [], val, outVal, h => by
+    cases hU : valueContainsUninit val <;> simp [readProjectedValue, hU] at h
+    subst h
+    cases val with
+    | uninit => nomatch hU
+    | _ => rfl
+  | p :: rest, val, outVal, h => by
+    cases p with
+    | field idx fty =>
+      cases val with
+      | uninit => nomatch h
+      | aggregate _ fields =>
+        simp only [readProjectedValue] at h
+        rw [MirSemantics.readContainerProjectedValue.eq_3]
+        cases hG : get? fields idx with
+        | none => rw [hG] at h; nomatch h
+        | some fv =>
+          rw [hG] at h
+          exact readContainerProjectedValue_of_readProjectedValue_ok locals rest fv outVal h
+      | scalar sc =>
+        cases idx with
+        | zero =>
+          exact readContainerProjectedValue_of_readProjectedValue_ok locals rest (.scalar sc) outVal h
+        | succ _ => nomatch h
+      | ptr pv sz =>
+        cases idx with
+        | zero =>
+          exact readContainerProjectedValue_of_readProjectedValue_ok locals rest (.ptr pv sz) outVal h
+        | succ _ => nomatch h
+      | unit =>
+        cases idx with
+        | zero =>
+          exact readContainerProjectedValue_of_readProjectedValue_ok locals rest .unit outVal h
+        | succ _ => nomatch h
+    | downcast _ variantIdx =>
+      cases val with
+      | aggregate actualVariant fields =>
+        simp only [readProjectedValue] at h
+        rw [MirSemantics.readContainerProjectedValue.eq_8]
+        cases hB : Nat.beq actualVariant variantIdx with
+        | false => rw [hB] at h; nomatch h
+        | true =>
+          rw [hB] at h
+          exact readContainerProjectedValue_of_readProjectedValue_ok locals rest _ outVal h
+      | _ => nomatch h
+    | index idxLocal =>
+      cases val with
+      | aggregate varIdx fields =>
+        rcases varIdx with _ | _
+        · simp only [readProjectedValue] at h
+          rw [MirSemantics.readContainerProjectedValue.eq_10]
+          cases hG : get? locals idxLocal with
+          | none => rw [hG] at h; nomatch h
+          | some s =>
+            rw [hG] at h
+            cases s with
+            | init iv =>
+              cases iv with
+              | scalar sc =>
+                dsimp only at h ⊢
+                cases hE : get? fields sc.bits with
+                | none => rw [hE] at h; nomatch h
+                | some ev =>
+                  rw [hE] at h
+                  exact readContainerProjectedValue_of_readProjectedValue_ok locals rest ev outVal h
+              | _ => nomatch h
+            | _ => nomatch h
+        · nomatch h
+      | _ => nomatch h
+    | constantIndex offset minLen fromEnd =>
+      cases val with
+      | aggregate varIdx fields =>
+        rcases varIdx with _ | _
+        · cases fromEnd
+          · simp only [readProjectedValue] at h
+            rw [MirSemantics.readContainerProjectedValue.eq_13]
+            cases hBle : Nat.ble minLen (length fields) <;> rw [hBle] at h
+            · nomatch h
+            · dsimp only at h ⊢
+              cases hE : get? fields offset with
+              | none => rw [hE] at h; nomatch h
+              | some ev =>
+                rw [hE] at h
+                exact readContainerProjectedValue_of_readProjectedValue_ok locals rest ev outVal h
+          · simp only [readProjectedValue] at h
+            rw [MirSemantics.readContainerProjectedValue.eq_12]
+            cases hBle : Nat.ble minLen (length fields) <;> rw [hBle] at h
+            · nomatch h
+            · dsimp only at h ⊢
+              cases hE : get? fields (Nat.sub (length fields) offset) with
+              | none => rw [hE] at h; nomatch h
+              | some ev =>
+                rw [hE] at h
+                exact readContainerProjectedValue_of_readProjectedValue_ok locals rest ev outVal h
+        · nomatch h
+      | _ => nomatch h
+    | subslice fromIdx toIdx fromEnd =>
+      cases val with
+      | aggregate varIdx fields =>
+        rcases varIdx with _ | _
+        · simp only [readProjectedValue] at h
+          rw [MirSemantics.readContainerProjectedValue.eq_15]
+          cases hS : MirSemantics.extractSubslice fields fromIdx toIdx fromEnd with
+          | none => rw [hS] at h; nomatch h
+          | some sub =>
+            rw [hS] at h
+            exact readContainerProjectedValue_of_readProjectedValue_ok locals rest (.aggregate 0 sub) outVal h
+        · nomatch h
+      | _ => nomatch h
+    | deref => cases val <;> nomatch h
+    | opaqueCast _ =>
+      cases val with
+      | uninit =>
+        have ih := readContainerProjectedValue_of_readProjectedValue_ok locals rest .uninit outVal h
+        rw [MirSemantics.readContainerProjectedValue.eq_1] at ih
+        nomatch ih
+      | _ => exact readContainerProjectedValue_of_readProjectedValue_ok locals rest _ outVal h
+    | unwrapUnsafeBinder _ =>
+      cases val with
+      | uninit =>
+        have ih := readContainerProjectedValue_of_readProjectedValue_ok locals rest .uninit outVal h
+        rw [MirSemantics.readContainerProjectedValue.eq_1] at ih
+        nomatch ih
+      | _ => exact readContainerProjectedValue_of_readProjectedValue_ok locals rest _ outVal h
 
 private theorem checkSafeRefDerefOk_of_ptrTargetSpec {body : CapturedMir}
     (hdlo : ptrDeclLayoutsOk body = true)
@@ -4465,9 +4599,10 @@ private theorem resolveRefDerefTarget?_of_ptrTargetSpec {body : CapturedMir}
       | .never => false | _ => true) = true := by
     cases hk : (MirSemantics.resolveTyWithLocalDecls body.localDecls body.layouts pTy).kind <;>
       rw [hk] at hnot_bad <;> simp_all
-  have hrd_norm : readProjectedValue s.frame.locals targetRootVal
+  have hrd_norm : MirSemantics.readContainerProjectedValue s.frame.locals targetRootVal
       (MirSemantics.normalizeSubsliceProjections
         (MirSemantics.stripTransparentProjections parentEntry.targetProjection)) = .ok (.scalar sc) := by
+    apply readContainerProjectedValue_of_readProjectedValue_ok
     obtain ⟨_, hcases⟩ := ptrTargetSpec_cases hdeclsOk htspec
     rcases hcases with ⟨hproj, _, _, _⟩ | ⟨_, _, _, _, _, hproj, _, _, _, _⟩ |
       ⟨_, _, _, hproj, _, _, _, _, _, _, _, _, _, hres⟩
@@ -4615,8 +4750,10 @@ private theorem evalOperand_deref_eq_target_typed {body : CapturedMir}
     cases hproj : entry.targetProjection with
     | nil =>
       rw [hproj] at hrd
-      simp only [readProjectedValue, ProjReadResult.ok.injEq] at hrd
-      subst hrd
+      have hrootEq : targetRootVal = .scalar sc := by
+        cases hU : valueContainsUninit targetRootVal <;> simp [readProjectedValue, hU] at hrd
+        exact hrd
+      subst hrootEq
       simp [evalOperand, get?, ht, readProjectedValue]
     | cons ph pt =>
       have hnd : ∀ rest, (ph :: pt) ≠ .deref :: rest := by
@@ -4668,10 +4805,13 @@ private theorem evalOperand_deref_eq_target_typed {body : CapturedMir}
     dsimp only [MirSemantics.stripTransparentProjections]
     cases hproj : entry.targetProjection with
     | nil =>
-      have hrd' : readProjectedValue locals targetRootVal [] = .ok (.scalar sc) := hproj ▸ hrd
-      dsimp only [MirSemantics.readProjectedForLocal]
-      rw [hrd']
-      dsimp only [MirSemantics.stripTransparentProjections]
+      rw [hproj] at hrd
+      have hrootEq : targetRootVal = .scalar sc := by
+        cases hU : valueContainsUninit targetRootVal <;> simp [readProjectedValue, hU] at hrd
+        exact hrd
+      subst hrootEq
+      dsimp only [MirSemantics.readProjectedForLocal, MirSemantics.readContainerProjectedValue,
+        MirSemantics.stripTransparentProjections]
       rw [hextract]
       dsimp only [MirSemantics.stripTransparentProjections]
       rw [hval_ok]
@@ -6712,10 +6852,11 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
         obtain ⟨msg, hmsg⟩ := hRet.2 hs0
         exact StepRelN.ub' msg (by simp [htt, Interp.evalTerminator, hmsg])
       | .init v, hv0, hs0, hsA =>
+        have hvInit := declSlotOk_valueContainsUninit hv0
         have hA : evalTerminator s bb.terminator (some body) =
             MirStepNode.retNormal v { s.memory with
               borrows := MirSemantics.disableFrameBorrows s.memory.borrows 0 s.frame.locals.length } := by
-          simp [MirSemantics.evalTerminator, hk, get?, hsA, hrel.callStack, hrel.protectors,
+          simp [MirSemantics.evalTerminator, hk, get?, hsA, hvInit, hrel.callStack, hrel.protectors,
             MirSemantics.hasFrameDeallocProtectorConflict]
           rfl
         rw [hA]
@@ -8836,13 +8977,14 @@ theorem slotOk_tuple_of_isTupleLocal {decls : List LocalDecl} {i : Nat} {v : Val
     rw [(tyOf_tuple hit).1] at hv
     match v, hv with
     | .scalar sc, ⟨_, hvb⟩ => simp [intBoolTupleTy, ValidBits] at hvb
-    | .unit, hv | .ptr _ _, hv => simp [SlotOk] at hv
+    | .unit, hv | .ptr _ _, hv | .uninit, hv => simp [SlotOk] at hv
     | .aggregate 0 [.scalar sc0, .scalar sc1], _ => exact ⟨sc0, sc1, rfl⟩
     | .aggregate (_ + 1) _, hv | .aggregate 0 [], hv | .aggregate 0 [_], hv
     | .aggregate 0 (_ :: _ :: _ :: _), hv
-    | .aggregate 0 [.unit, _], hv | .aggregate 0 [.ptr _ _, _], hv
+    | .aggregate 0 [.unit, _], hv | .aggregate 0 [.ptr _ _, _], hv | .aggregate 0 [.uninit, _], hv
     | .aggregate 0 [.aggregate _ _, _], hv
     | .aggregate 0 [.scalar _, .unit], hv | .aggregate 0 [.scalar _, .ptr _ _], hv
+    | .aggregate 0 [.scalar _, .uninit], hv
     | .aggregate 0 [.scalar _, .aggregate _ _], hv => simp [SlotOk] at hv
 
 theorem dropMovedFrom_mem {ti : List Nat} {ops : List Operand} {j : Nat}
@@ -10507,10 +10649,11 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
               simp [hif, htt, Interp.evalTerminator, hmsg]
             exact MultiStepRel.ub' msg hstep
           | .init v, hv0, hs0, hsA =>
+            have hvInit := declSlotOk_valueContainsUninit hv0
             have hA : MirSemantics.evalTerminator s bb.terminator (some curBody) =
                 MirStepNode.retNormal v { s.memory with
                   borrows := MirSemantics.disableFrameBorrows s.memory.borrows 0 s.frame.locals.length } := by
-              simp [MirSemantics.evalTerminator, hk, get?, hsA, hcs, hrel.protectors,
+              simp [MirSemantics.evalTerminator, hk, get?, hsA, hvInit, hcs, hrel.protectors,
                 MirSemantics.hasFrameDeallocProtectorConflict]
               rfl
             rw [hA]
@@ -10555,8 +10698,8 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
               rw [step_callee_stack hshape tb hgetb]
               simp [hif, htt, Interp.evalTerminator, hmsg]
             exact MultiStepRel.ub' msg hstep
-          | .init retVal, _, hs0, hsA =>
-            rw [hTermEq, hAokRet retVal hsA]
+          | .init retVal, hv0, hs0, hsA =>
+            rw [hTermEq, hAokRet retVal hsA (declSlotOk_valueContainsUninit hv0)]
             obtain ⟨callerView', m', hm', hsh', hp', hfp', hcvLen, hdstEq, hdstLive',
               hneView, hneAct, hloCaller⟩ := hMRet.1 retVal hs0
             have hstep : Interp.step m = .ok m' := by
@@ -15957,7 +16100,8 @@ theorem ptrTargetPlaceSpan_lt_page {body : CapturedMir}
       simp only [projOk, Bool.and_eq_true, decide_eq_true_eq] at hpok
       exact hpok.1.1
     match v, hsloti with
-    | .aggregate 0 elems, ⟨hlenE, _⟩ =>
+    | .aggregate 0 elems, ⟨hlenE, he⟩ =>
+      have hinit := valueListContainsUninit_of_elemOk he
       cases fromEnd with
       | false =>
         simp only [Bool.false_eq_true, ↓reduceIte] at hbounds_fe hboff_eq
@@ -15986,8 +16130,8 @@ theorem ptrTargetPlaceSpan_lt_page {body : CapturedMir}
             simp only [hget_v, hb_rlen, Nat.beq_refl, hproj,
               MirSemantics.stripTransparentProjections,
               MirSemantics.normalizeAdjacentSubslices, MirSemantics.normalizeAdjacentSubslicesAux,
-              MirSemantics.splitLastConstantIndex?, readProjectedValue, hstr_el,
-              mirValue_length_eq, hlenE, hble, Nat.sub_eq, Nat.mul_eq]
+              MirSemantics.splitLastConstantIndex?, readProjectedValue, valueContainsUninit,
+              hinit, hstr_el, mirValue_length_eq, hlenE, hble, Nat.sub_eq, Nat.mul_eq]
           · rw [hboff_eq, ← Nat.add_mul, Nat.add_sub_of_le (Nat.le_of_lt hlt_off)]
             exact hfit_sz
       | true =>
@@ -16026,6 +16170,7 @@ theorem ptrTargetPlaceSpan_lt_page {body : CapturedMir}
     obtain ⟨hdlo, hfit_dk, dk', v, hdk', hsv, hdslot⟩ := hsub hne
     rw [hdk] at hdk'; injection hdk' with hdk_eq; subst hdk_eq
     have hsloti := (DeclSlotOk_of_tupleTypeOf htu (.init v)).mp hdslot
+    have hinit := TupleSpec.valueContainsUninit_of_valOk hsloti.2
     have hvsh := declSlotOk_valueShapeEq hdslot (.inr (.inr ⟨fields, size, align, htu⟩))
     obtain ⟨_, hrel_le⟩ := resolveFieldPath_wf hsloti.1 hres
     dsimp only [TupleSpec.size] at hrel_le
@@ -16087,7 +16232,7 @@ theorem ptrTargetPlaceSpan_lt_page {body : CapturedMir}
         hslf, splitAfterLastSeqProj_allFields hall]
       dsimp only
       rw [normalizeSubsliceProjections_allFields hall]
-      simp only [readProjectedValue, hpl_root, hsz, hchain, hble_rel, Nat.sub_eq]
+      simp only [readProjectedValue, hinit, hpl_root, hsz, hchain, hble_rel, Nat.sub_eq]
 
 /-- Standalone borrow-table derivation of `NoCompetingExposedBorrow` for
 `exposedTags ≠ []` when every previously exposed borrow `b ∈ s.memory.borrows`

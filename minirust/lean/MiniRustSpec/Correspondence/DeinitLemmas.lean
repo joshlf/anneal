@@ -458,10 +458,12 @@ theorem evalStmt_deinit_field {layouts : Trusted.Rustc.V2026_06_01.Layout.Layout
   obtain ⟨hwf, hval⟩ := (DeclSlotOk_of_tupleTypeOf ht (.init rootVal)).mp (hslots i d (.init rootVal) hd hs)
   obtain ⟨deinitVal, hw, henc, hdeinit, _⟩ := resolveFieldPath_deinit_uninit hwf hval hres
   have hi_lt : i < s.frame.locals.length := (List.getElem?_eq_some_iff.mp hs).1
+  have hElem : s.frame.locals[i]'hi_lt = .init rootVal :=
+    Option.some.inj ((List.getElem?_eq_getElem hi_lt).symm.trans hs)
   have hnu := placeTouchesUnion_false_of_tupleTypeOf decls ht ⟨i, proj :: rest⟩
   refine ⟨deinitVal, hw, henc, ?_⟩
   simp [evalStmt, deinitProjectedForLocal, hnu, Trusted.Sequence.get?, Trusted.Sequence.set?,
-    hs, hi_lt, hdeinit s.frame.locals, MirStepNode.step]
+    hi_lt, hElem, hdeinit s.frame.locals, MirStepNode.step]
 
 private theorem scalar_wf_size_pos {it : Gen.IntType} (hwf : (TupleSpec.scalar it).wf = true) :
     0 < it.size.bytes := by
@@ -483,8 +485,8 @@ theorem resolveFieldPath_same_off_writeProjectedValue
     ∀ newLeafVal,
       writeFieldPath deinitVal ps' newLeafVal = writeFieldPath rootVal ps' newLeafVal ∧
       ∀ locals,
-        MirSemantics.writeProjectedValue locals deinitVal ps' newLeafVal =
-          MirSemantics.writeProjectedValue locals rootVal ps' newLeafVal := by
+        writeProjectedValue locals deinitVal ps' newLeafVal =
+          writeProjectedValue locals rootVal ps' newLeafVal := by
   induction ps' generalizing ps rootSpec off rootVal deinitVal with
   | nil =>
     intro _
@@ -544,11 +546,12 @@ theorem resolveFieldPath_same_off_writeProjectedValue
                             obtain ⟨hlwf₂, hb₂⟩ := resolveFieldPath_wf hfwf₂.1 hrest₂
                             have hpos₁ := scalar_wf_size_pos hlwf₁
                             have hpos₂ := scalar_wf_size_pos hlwf₂
-                            have hidxEq : idx₁ = idx₂ := by
-                              by_contra hne
-                              have hdisj := TupleSpec.fieldsWf_disjoint hwf.2 hf₁ hf₂ hne
-                              simp only [TupleSpec.size] at hb₁ hb₂
-                              omega
+                            have hidxEq : idx₁ = idx₂ :=
+                              Classical.byContradiction fun hne => by
+                                have hdisj := TupleSpec.fieldsWf_disjoint hwf.2 hf₁ hf₂ hne
+                                have hsz₁ : (TupleSpec.scalar it₀).size = it₀.size.bytes := rfl
+                                have hsz₂ : (TupleSpec.scalar it).size = it.size.bytes := rfl
+                                omega
                             subst hidxEq
                             rw [hf₁] at hf₂
                             simp only [Option.some.injEq, Prod.mk.injEq] at hf₂
@@ -573,10 +576,10 @@ theorem resolveFieldPath_same_off_writeProjectedValue
                                   refine ⟨?_, fun locals => ?_⟩
                                   · simp only [writeFieldPath, List.getElem?_set_self hlt, hfv, hwPathEq]
                                     cases writeFieldPath fv rest' newLeafVal <;> simp [List.set_set]
-                                  · simp only [MirSemantics.writeProjectedValue, Trusted.Sequence.get?,
+                                  · simp only [writeProjectedValue, Trusted.Sequence.get?,
                                       List.getElem?_set_self hlt, hfv, hwProjEq locals]
-                                    cases MirSemantics.writeProjectedValue locals fv rest' newLeafVal <;>
-                                      simp [setOrExtendFields_of_lt, hlt, List.set_set]
+                                    cases writeProjectedValue locals fv rest' newLeafVal <;>
+                                      simp [Trusted.Sequence.set?, hlt, List.set_set]
                               | succ _ => simp [TupleSpec.valOk] at hval
                             | _ => simp [TupleSpec.valOk] at hval
                         · simp [heq₂] at hres'
@@ -597,15 +600,15 @@ theorem resolveFieldPath_disjoint_readProjectedValue
     (hdis : off' + it'.size.bytes ≤ off ∨ off + leaf.size ≤ off')
     (hw : writeFieldPath rootVal ps .uninit = some deinitVal) :
     ∀ locals,
-      MirSemantics.readProjectedValue locals deinitVal ps' =
-        MirSemantics.readProjectedValue locals rootVal ps' := by
+      readProjectedValue locals deinitVal ps' =
+        readProjectedValue locals rootVal ps' := by
   induction ps generalizing ps' rootSpec off off' rootVal deinitVal with
   | nil =>
     simp [resolveFieldPath] at hres
     rcases hres with ⟨rfl, rfl⟩
     obtain ⟨hlwf', hb'⟩ := resolveFieldPath_wf hwf hres'
     have hpos' := scalar_wf_size_pos hlwf'
-    simp only [TupleSpec.size] at hb'
+    have hsz' : (TupleSpec.scalar it').size = it'.size.bytes := rfl
     omega
   | cons p rest ih =>
     cases rootSpec with
@@ -671,11 +674,11 @@ theorem resolveFieldPath_disjoint_readProjectedValue
                                   have hlt : idx₁ < vals.length := (List.getElem?_eq_some_iff.mp hfv).1
                                   have hdis' : restOff₂ + it'.size.bytes ≤ restOff₁ ∨
                                       restOff₁ + leaf₁.size ≤ restOff₂ := by omega
-                                  simp [MirSemantics.readProjectedValue, Trusted.Sequence.get?,
+                                  simp [readProjectedValue, Trusted.Sequence.get?,
                                     List.getElem?_set_self hlt, hfv,
                                     ih hfwf₁.1 hfvOk hrest₁ hrest₂ hdis' hwSub locals]
                               · simp [heq₂] at hres'
-                          · simp [MirSemantics.readProjectedValue, Trusted.Sequence.get?,
+                          · simp [readProjectedValue, Trusted.Sequence.get?,
                               List.getElem?_set_ne hidx]
                       | succ _ => simp [TupleSpec.valOk] at hval
                     | _ => simp [TupleSpec.valOk] at hval

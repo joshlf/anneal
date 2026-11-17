@@ -1455,7 +1455,7 @@ open MiniRustSpec.Correspondence.Witness in
   storageDeadRet_minirust_panics
   projectedDeinit_rejected
   projectedDeinit_translate
-  projectedDeinit_anneal_ret
+  projectedDeinit_anneal_ub
   projectedDeinit_minirust_ub
   projAssignMoveReuse_movesOk
   sameRvalueMoveReuse_movesOk
@@ -2588,7 +2588,7 @@ open MiniRustSpec.Correspondence.Witness in
   storageDeadRet_minirust_panics
   projectedDeinit_rejected
   projectedDeinit_translate
-  projectedDeinit_anneal_ret
+  projectedDeinit_anneal_ub
   projectedDeinit_minirust_ub
   projAssignMoveReuse_movesOk
   sameRvalueMoveReuse_movesOk

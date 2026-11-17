@@ -3158,7 +3158,7 @@ theorem derefWriteTreeUB_false_of_ancestors_writable (locals : List LocalSlot)
             exact treeBorrowChainChildAccessUBAux_write_false _ entry.parentTag
               (fun pTag hp anc hmem hanc =>
                 hw ptrVal sz hloc anc hmem (IsBorrowAncestorOrSelf.step hlk hp hanc))
-        | unit | scalar _ | aggregate _ _ => rfl
+        | unit | uninit | scalar _ | aggregate _ _ => rfl
 
 /-- Concrete meaning of `PtrLocalState` for local `p` at runtime slots `view`
 and Anneal borrow table `borrows`:

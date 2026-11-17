@@ -5990,9 +5990,9 @@ theorem storageDeadRet_minirust_panics :
   decide +kernel
 
 /-- `Deinit(_1.0); _0 = copy (_1.0); return` on `_1: (u32, bool)` is rejected by
-`statementOk`: Anneal's projected `Deinit` checks `_1.0` and leaves `_1`
-initialized (returning `42`), whereas MiniRust overwrites `_1.0` with `Uninit`
-bytes so the subsequent load raises UB. -/
+`statementOk`: both Anneal's projected `Deinit` (`Value.uninit` in `_1.0`) and
+MiniRust (`Uninit` bytes in `_1.0`) deinitialize `_1.0` so the subsequent load
+raises UB. -/
 def projectedDeinit : CapturedMir where
   defPath := "witness::projected_deinit"
   phase := .runtimePostCleanup
@@ -6032,10 +6032,9 @@ theorem projectedDeinit_translate :
 def projectedDeinitArgs : List Value := [.aggregate 0 [.scalar ⟨42, 4⟩, .scalar ⟨1, 1⟩]]
 def projectedDeinitS0 : MachineState := initMachineState projectedDeinit projectedDeinitArgs
 
-theorem projectedDeinit_anneal_ret :
-    ReachesRet (mirTree projectedDeinit projectedDeinitS0) []
-      (.normal (.scalar ⟨42, 4⟩, projectedDeinitS0.memory)) :=
-  runA_sound projectedDeinit 10 _ _ _ rfl
+theorem projectedDeinit_anneal_ub :
+    ∃ tr u, Reaches (mirTree projectedDeinit projectedDeinitS0) tr u ∧ FaultNow u :=
+  faultsA_sound projectedDeinit 10 _ (by decide)
 
 theorem projectedDeinit_minirust_ub :
     (match Interp.steps 3 (machine projectedDeinit projectedDeinitFn projectedDeinitS0.frame.locals

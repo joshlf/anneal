@@ -781,6 +781,21 @@ theorem StepRelN.toStepRelD {body : CapturedMir} {f : Gen.Function} {ctx : Ctx} 
   · exact h
   · exact h.elim
 
+/-- A `StepRelN` whose MiniRust side errors with UB gives a `StepRelD` for any MiniRust result
+that also errors with UB. -/
+theorem StepRelN.toStepRelD_ub {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {s : MachineState} {a : MirStepNode} {msg0 msg : String}
+    (h : StepRelN (eraseDeinit body) f ctx s a (.error (.ub msg0))) :
+    StepRelD body f ctx s a (.error (.ub msg)) := by
+  unfold StepRelN at h
+  unfold StepRelD
+  split at h
+  · obtain ⟨_, hr, _⟩ := h; cases hr
+  · obtain ⟨_, _, _, hr, _⟩ := h; cases hr
+  · obtain ⟨_, hr, _⟩ := h; cases hr
+  · exact ⟨msg, rfl⟩
+  · exact h.elim
+
 
 /-! ## The projected `Deinit` and projected `Retag` steps -/
 
@@ -1290,7 +1305,7 @@ theorem StepRelN.toStepRelD_hole {body : CapturedMir} {f : Gen.Function} {ctx : 
     StepRelD body f ctx s a (.ok m4h) := by
   unfold StepRelN at h
   split at h
-  · rename_i s0' heq0
+  · rename_i _ s0'
     obtain ⟨m', hr, hN'⟩ := h
     cases hr
     obtain ⟨haEq, hs0't⟩ := ha.1 s0' rfl
@@ -1303,7 +1318,7 @@ theorem StepRelN.toStepRelD_hole {body : CapturedMir} {f : Gen.Function} {ctx : 
       by rw [← hb, ← hs]; exact hhole, htgt, hN', hs0't, hw, rfl,
       lm, p, k, a_alloc, off, sz, ?_, hp, hpk, ha0, hrng, hthrH, hactH, hallocH⟩⟩
     rw [hthr4, ← hb, ← hs]
-  · rename_i ob k0 heq0
+  · rename_i _ ob k0
     exact absurd rfl (ha.2 ob k0)
   · obtain ⟨m', hr, h'⟩ := h
     cases hr
@@ -1470,17 +1485,19 @@ private theorem readProjectedValue_of_allFields (l1 l2 : List LocalSlot) (v : Va
   induction projs generalizing v with
   | nil => rfl
   | cons p rest ih =>
-    cases p <;> simp only [allFields] at hf
-    cases v with
-    | aggregate _ fields =>
-      simp only [MirSemantics.readProjectedValue]
-      cases Trusted.Sequence.get? fields _ with
-      | none => rfl
-      | some fv => exact ih fv hf
-    | scalar _ | ptr _ _ | unit =>
-      rename_i idx _
-      cases idx <;> simp [MirSemantics.readProjectedValue, ih _ hf]
-    | uninit => rfl
+    cases p with
+    | field idx _ =>
+      simp only [allFields] at hf
+      cases v with
+      | aggregate _ fields =>
+        simp only [MirSemantics.readProjectedValue]
+        cases Trusted.Sequence.get? fields idx with
+        | none => rfl
+        | some fv => exact ih fv hf
+      | scalar _ | ptr _ _ | unit =>
+        cases idx <;> simp [MirSemantics.readProjectedValue, ih _ hf]
+      | uninit => rfl
+    | _ => simp [allFields] at hf
 
 private theorem writeProjectedValue_of_allFields (l1 l2 : List LocalSlot) (v newV : Value)
     {projs : List ProjectionElem} (hf : allFields projs = true) :
@@ -1489,20 +1506,19 @@ private theorem writeProjectedValue_of_allFields (l1 l2 : List LocalSlot) (v new
   induction projs generalizing v with
   | nil => rfl
   | cons p rest ih =>
-    cases p <;> simp only [allFields] at hf
-    cases v with
-    | uninit => simp [MirSemantics.writeProjectedValue, ih .uninit hf]
-    | aggregate vi fields =>
-      cases vi with
-      | zero =>
+    cases p with
+    | field idx _ =>
+      simp only [allFields] at hf
+      cases v with
+      | uninit => rfl
+      | aggregate vi fields =>
         simp only [MirSemantics.writeProjectedValue]
-        cases Trusted.Sequence.get? fields _ with
+        cases Trusted.Sequence.get? fields idx with
         | none => simp [ih .uninit hf]
         | some fv => simp [ih fv hf]
-      | succ _ => rfl
-    | scalar _ | ptr _ _ | unit =>
-      rename_i idx _
-      cases idx <;> simp [MirSemantics.writeProjectedValue, ih _ hf]
+      | scalar _ | ptr _ _ | unit =>
+        cases idx <;> simp [MirSemantics.writeProjectedValue, ih _ hf]
+    | _ => simp [allFields] at hf
 
 private theorem resolveBorrowProjectionElems_of_allFields (l1 l2 : List LocalSlot)
     {projs : List ProjectionElem} (hf : allFields projs = true) :
@@ -1511,8 +1527,11 @@ private theorem resolveBorrowProjectionElems_of_allFields (l1 l2 : List LocalSlo
   induction projs with
   | nil => rfl
   | cons p rest ih =>
-    cases p <;> simp only [allFields] at hf
-    simp [MirSemantics.resolveBorrowProjectionElems, ih hf]
+    cases p with
+    | field idx fty =>
+      simp only [allFields] at hf
+      simp [MirSemantics.resolveBorrowProjectionElems, ih hf]
+    | _ => simp [allFields] at hf
 
 private def OpAgrees (l0 lH : List LocalSlot) (op : Operand) (m : Memory)
     (decls : List LocalDecl) (layouts : Layout.LayoutTable) : Prop :=
@@ -1528,7 +1547,7 @@ private theorem opAgrees_const (l0 lH : List LocalSlot) (c : ConstOperand) (m : 
     (decls : List LocalDecl) (layouts : Layout.LayoutTable) :
     OpAgrees l0 lH (.constant c) m decls layouts := by
   unfold OpAgrees evalOperand
-  cases evalConstOperand c m.globals layouts <;> simp
+  (repeat' split) <;> simp_all
 
 private theorem opAgrees_copy_other (l0 : List LocalSlot) {t q : Nat} (hqt : q ≠ t)
     (vH : Value) (m : Memory) (decls : List LocalDecl) (layouts : Layout.LayoutTable) :
@@ -1545,8 +1564,7 @@ private theorem opAgrees_copy_other (l0 : List LocalSlot) {t q : Nat} (hqt : q �
     cases sl with
     | dead | uninit => simp
     | init v =>
-      rw [readProjectedValue_of_allFields (l0.set t (.init vH)) l0 v rfl]
-      cases MirSemantics.readProjectedValue l0 v [] <;> simp
+      cases hU : MirSemantics.valueContainsUninit v <;> simp [MirSemantics.readProjectedValue, hU]
 
 private theorem opAgrees_copy_disjoint {layouts : Layout.LayoutTable}
     (l0 : List LocalSlot) {decls : List LocalDecl} {t : Nat} {d : LocalDecl}
@@ -1589,35 +1607,21 @@ private theorem rvalAgrees_use_nonDeref {l0 lH : List LocalSlot} {op : Operand} 
     (hop : OpAgrees l0 lH op m decls layouts)
     (hnd : ∀ loc tl, op ≠ .copy ⟨loc, .deref :: tl⟩ ∧ op ≠ .move ⟨loc, .deref :: tl⟩) :
     RvalAgrees l0 lH (.use op) m decls layouts := by
-  have hnoDeref : ∀ (l : List LocalSlot) (v : Value) (l' : List LocalSlot),
-      (match op, m.borrows with
-        | .copy { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
-          match MirSemantics.derefReadTreeUB l ptrLoc restProj (b₁ :: b₂ :: restBorrows) m.activeProtectors with
-          | true => RvalueEvalResult.ub
-          | false => RvalueEvalResult.ok v l'
-              { m with borrows := MirSemantics.freezeDerefReadBorrowsAt l ptrLoc restProj (b₁ :: b₂ :: restBorrows) m.activeProtectors }
-        | .move { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
-          match MirSemantics.derefReadTreeUB l ptrLoc restProj (b₁ :: b₂ :: restBorrows) m.activeProtectors with
-          | true => RvalueEvalResult.ub
-          | false => RvalueEvalResult.ok v l'
-              { m with borrows := MirSemantics.freezeDerefReadBorrowsAt l ptrLoc restProj (b₁ :: b₂ :: restBorrows) m.activeProtectors }
-        | _, _ => RvalueEvalResult.ok v l' m) = .ok v l' m := by
-    intro l v l'
-    rcases op with ⟨loc, _ | ⟨p, tl⟩⟩ | ⟨loc, _ | ⟨p, tl⟩⟩ | _
-    · rfl
-    · cases p <;> try rfl
-      exact absurd rfl (hnd loc tl).1
-    · rfl
-    · cases p <;> try rfl
-      exact absurd rfl (hnd loc tl).2
-    · rfl
   unfold RvalAgrees evalRvalue
+  dsimp only
   rcases h0 : evalOperand l0 op m.borrows m.globals layouts m.callerLocals decls m.callStack with
       ⟨v, l'⟩ | _ | _
   · obtain ⟨rfl, hH⟩ := hop.1 v l' h0
-    rw [hH]
-    dsimp only
-    cases MirSemantics.validateLoadedValue layouts decls op v <;> simp [hnoDeref]
+    simp only [hH]
+    cases MirSemantics.validateLoadedValue layouts decls op v
+    · simp
+    · dsimp only
+      rcases op with ⟨loc, _ | ⟨p, tl⟩⟩ | ⟨loc, _ | ⟨p, tl⟩⟩ | _
+      · simp
+      · cases p <;> first | simp | exact absurd rfl (hnd loc tl).1
+      · simp
+      · cases p <;> first | simp | exact absurd rfl (hnd loc tl).2
+      · simp
   · simp [hop.2.1 h0]
   · simp [hop.2.2 h0]
 
@@ -1626,17 +1630,22 @@ private theorem rvalAgrees_cast_intToInt {l0 lH : List LocalSlot} {op : Operand}
     (hop : OpAgrees l0 lH op m decls layouts) :
     RvalAgrees l0 lH (.cast .intToInt op castTy) m decls layouts := by
   unfold RvalAgrees evalRvalue
+  dsimp only
   rcases h0 : evalOperand l0 op m.borrows m.globals layouts m.callerLocals decls m.callStack with
       ⟨v, l'⟩ | _ | _
-  · obtain ⟨rfl, hH⟩ := hop.1 v l' h0
-    rw [hH]
-    cases v <;> simp
-    split <;> simp
-    split <;> simp
+  · obtain ⟨hl', hH⟩ := hop.1 v l' h0
+    subst l'
+    simp only [hH]
+    cases v with
+    | scalar sc =>
+      dsimp only
+      cases sc.sizeBytes.beq 0 <;> simp
+      cases MirSemantics.intCastTargetBytes castTy.kind <;> simp
+    | _ => simp
   · simp [hop.2.1 h0]
   · simp [hop.2.2 h0]
 
-private theorem evalScalarBinOp_locals (op : MirAst.BinOp) (lhs rhs : ScalarInt)
+private theorem evalScalarBinOp_agrees (op : MirAst.BinOp) (lhs rhs : ScalarInt)
     (l0 lH : List LocalSlot) (m : Memory) (b : Bool) :
     (∀ v l' m', MirSemantics.evalScalarBinOp op lhs rhs l0 m b = .ok v l' m' →
       l' = l0 ∧ MirSemantics.evalScalarBinOp op lhs rhs lH m b = .ok v lH m') ∧
@@ -1644,11 +1653,9 @@ private theorem evalScalarBinOp_locals (op : MirAst.BinOp) (lhs rhs : ScalarInt)
       MirSemantics.evalScalarBinOp op lhs rhs lH m b = .ub) ∧
     (MirSemantics.evalScalarBinOp op lhs rhs l0 m b = .unsupported →
       MirSemantics.evalScalarBinOp op lhs rhs lH m b = .unsupported) := by
-  unfold MirSemantics.evalScalarBinOp
-  split
-  · simp
-  · dsimp only
-    cases op <;> (repeat (first | split | simp))
+  rw [evalScalarBinOp_locals op lhs rhs l0 lH m b]
+  have hself := evalScalarBinOp_locals op lhs rhs l0 l0 m b
+  cases h : MirSemantics.evalScalarBinOp op lhs rhs l0 m b <;> simp_all [rvWithLocals]
 
 private theorem rvalAgrees_binaryOp_int {layouts : Layout.LayoutTable}
     {decls : List LocalDecl} {l0 : List LocalSlot} {t q : Nat} {dq : LocalDecl}
@@ -1680,10 +1687,12 @@ private theorem rvalAgrees_binaryOp_int {layouts : Layout.LayoutTable}
         | ptr _ _ => simp at hcop
       | _ => simp at hcop
   unfold RvalAgrees evalRvalue
+  dsimp only
   rcases hL0 : evalOperand l0 (.copy ⟨q, []⟩) m.borrows m.globals layouts m.callerLocals
       decls m.callStack with ⟨vL, l1⟩ | _ | _
-  · obtain ⟨rfl, hLH⟩ := hopL.1 vL l1 hL0
-    rw [hLH]
+  · obtain ⟨hl1, hLH⟩ := hopL.1 vL l1 hL0
+    subst l1
+    simp only [hLH]
     have hvLSc : ∃ sc, vL = .scalar sc := by
       have hnd : ∀ tl, ([] : List ProjectionElem) ≠ .deref :: tl := fun _ h => nomatch h
       have hnu : MirSemantics.placeTouchesUnion decls layouts ⟨q, []⟩ = false := by
@@ -1701,7 +1710,8 @@ private theorem rvalAgrees_binaryOp_int {layouts : Layout.LayoutTable}
           dsimp only [MirSemantics.readProjectedValue] at hL0
           cases hu : MirSemantics.valueContainsUninit val <;> rw [hu] at hL0
           · simp only [PlaceReadResult.ok.injEq] at hL0
-            rcases hL0 with ⟨rfl, _⟩
+            rcases hL0 with ⟨hvalEq, _⟩
+            subst val
             have hsc := scalarTypeOf_int hitq
             have hsl := (DeclSlotOk_of_scalarTypeOf hsc (.init vL)).mp (hslots0 q dq (.init vL) hdq hsq)
             obtain ⟨hTq, _⟩ := tyOf_int (layouts := layouts) hitq
@@ -1716,24 +1726,19 @@ private theorem rvalAgrees_binaryOp_int {layouts : Layout.LayoutTable}
     obtain ⟨lhsSc, rfl⟩ := hvLSc
     rcases hR0 : evalOperand l0 (.constant c) m.borrows m.globals layouts m.callerLocals
         decls m.callStack with ⟨vR, l2⟩ | _ | _
-    · obtain ⟨rfl, hRH⟩ := hopR.1 vR l2 hR0
-      rw [hRH]
+    · obtain ⟨hl2, hRH⟩ := hopR.1 vR l2 hR0
+      subst l2
+      simp only [hRH]
       have hvRSc : ∃ sc, vR = .scalar sc := by
         obtain ⟨sc0, hcv⟩ := hcSc
         rcases c with ⟨cty, cval⟩
         dsimp only at hcv; subst hcv
-        simp only [evalOperand, evalConstOperand, evalConstValue] at hR0
-        cases isBoolTy cty <;> simp at hR0
-        · exact ⟨_, hR0.1.symm⟩
-        · split at hR0 <;> simp at hR0
-          exact ⟨_, hR0.1.symm⟩
+        simp only [evalOperand, MirSemantics.evalConstValue] at hR0
+        (repeat' split at hR0) <;> simp_all <;> exact ⟨_, hR0.symm⟩
       obtain ⟨rhsSc, rfl⟩ := hvRSc
-      have hNotOffMatch : ∀ (res : RvalueEvalResult) (offRes : RvalueEvalResult),
-          (match op with | .offset => offRes | _ => res) = res := by
-        intro res offRes; cases op <;> (try rfl); exact absurd rfl hnotOff
-      simp only [hNotOffMatch]
-      exact evalScalarBinOp_locals op lhsSc rhsSc l0 (l0.set t (.init vH)) m
-        (MirSemantics.operandIsSigned decls (.copy ⟨q, []⟩) layouts)
+      cases op <;> (try exact absurd rfl hnotOff) <;>
+        exact evalScalarBinOp_agrees _ lhsSc rhsSc l0 (l0.set t (.init vH)) m
+          (MirSemantics.operandIsSigned decls (.copy ⟨q, []⟩) layouts)
     · simp [hopR.2.1 hR0]
     · simp [hopR.2.2 hR0]
   · simp [hopL.2.1 hL0]
@@ -1764,7 +1769,7 @@ private theorem stepMirFn_reinit_setLocalVal {body : CapturedMir} {s0 : MachineS
     {rv : Rvalue} {span : String} {d : LocalDecl} {fields : List (Nat × TupleSpec)}
     {size align off : Nat} {it₀ it : Gen.IntType} {rootVal0 deinitVal : Value}
     (hcal : s0.memory.activeCallee = none)
-    (hphase : isRuntimeMirPhase body.phase = true)
+    (hphase : (eraseDeinit body).phase = .runtimePostCleanup)
     (hbb : body.basicBlocks[s0.frame.blockIdx]? = some bb)
     (hst : bb.statements[s0.frame.stmtIdx]? =
       some ⟨.assign ⟨t, .field idx fTy :: rest⟩ rv, span⟩)
@@ -1786,7 +1791,8 @@ private theorem stepMirFn_reinit_setLocalVal {body : CapturedMir} {s0 : MachineS
   obtain ⟨hwf, hval0⟩ :=
     (DeclSlotOk_of_tupleTypeOf ht (.init rootVal0)).mp (hslots0 t d (.init rootVal0) hd hs0)
   have hdumOk : (TupleSpec.scalar it).valOk (.scalar ⟨0, it.size.bytes⟩) = true := by
-    simp [TupleSpec.valOk, two_pow_pos]
+    simp [TupleSpec.valOk]
+    exact Nat.two_pow_pos _
   obtain ⟨dumRoot, hwdum0, _, _, _⟩ := resolveFieldPath_write hwf hval0 hres' hdumOk
   have hsame := DeinitBridge.resolveFieldPath_same_off_writeProjectedValue hwf hval0 hres hres' hw
   have hwdumH : writeFieldPath deinitVal (.field idx fTy :: rest) (.scalar ⟨0, it.size.bytes⟩) =
@@ -1803,7 +1809,7 @@ private theorem stepMirFn_reinit_setLocalVal {body : CapturedMir} {s0 : MachineS
       MirSemantics.resolveBorrowWriteLocalProj body.localDecls body.layouts
       s0.frame.locals t (.field idx fTy :: rest) := by
     simp [MirSemantics.resolveBorrowWriteLocalProj,
-      resolveBorrowProjectionElems_of_allFields _ _ hf]
+      resolveBorrowProjectionElems_of_allFields (s0.frame.locals.set t (.init deinitVal)) s0.frame.locals hf]
   unfold evalStmt
   dsimp only [setLocalVal]
   rcases hrv0 : evalRvalue s0.frame.locals rv s0.memory body.localDecls body.layouts with
@@ -1811,7 +1817,9 @@ private theorem stepMirFn_reinit_setLocalVal {body : CapturedMir} {s0 : MachineS
   · obtain ⟨rfl, hrvH⟩ := hrv.1 val l1 mem1 hrv0
     rw [hrvH]
     dsimp only [Trusted.Sequence.get?, MirSemantics.writeProjectedForLocal]
-    rw [List.getElem?_set_self hlt, hs0, hshellH, hshell0, hnu]
+    rw [List.getElem?_set_self hlt, hs0]
+    dsimp only
+    rw [hnu, hshellH, hshell0]
     dsimp only
     rw [(hsame val).2, writeProjectedValue_of_allFields _ s0.frame.locals rootVal0 val hf]
     cases MirSemantics.writeProjectedValue s0.frame.locals rootVal0 (.field idx fTy :: rest) val with
@@ -1826,7 +1834,7 @@ private theorem assign_other_setLocalVal_rel {body : CapturedMir} {s0 : MachineS
     {bb : BasicBlockData} {t r : Nat} {rv : Rvalue} {span : String}
     {rootVal0 deinitVal : Value}
     (hcal : s0.memory.activeCallee = none)
-    (hphase : isRuntimeMirPhase body.phase = true)
+    (hphase : (eraseDeinit body).phase = .runtimePostCleanup)
     (hbb : body.basicBlocks[s0.frame.blockIdx]? = some bb)
     (hst : bb.statements[s0.frame.stmtIdx]? = some ⟨.assign ⟨r, []⟩ rv, span⟩)
     (hrt : r ≠ t) (hs0 : s0.frame.locals[t]? = some (.init rootVal0))
@@ -1853,41 +1861,47 @@ private theorem assign_other_setLocalVal_rel {body : CapturedMir} {s0 : MachineS
   dsimp only [setLocalVal]
   rcases hrv0 : evalRvalue s0.frame.locals rv s0.memory body.localDecls body.layouts with
       ⟨val, l1, mem1⟩ | _ | _
-  · obtain ⟨rfl, hrvH⟩ := hrv.1 val l1 mem1 hrv0
-    rw [hrvH]
+  · obtain ⟨hl1, hrvH⟩ := hrv.1 val l1 mem1 hrv0
+    subst l1
+    simp only [hrvH]
     dsimp only [Trusted.Sequence.get?]
     rw [List.getElem?_set_ne hrt.symm]
     cases hsr : s0.frame.locals[r]? with
     | none =>
-      refine ⟨⟨fun _ h => by nomatch h, fun _ _ h => by nomatch h⟩, fun h => h.toStepRelD_ub⟩
+      dsimp only [MirStepNode.fail]
+      exact ⟨And.intro (fun _ h => by cases h) (fun _ _ h => by cases h), fun h => h.toStepRelD_ub⟩
     | some slr =>
       cases slr with
       | dead =>
-        refine ⟨⟨fun _ h => by nomatch h, fun _ _ h => by nomatch h⟩, fun h => h.toStepRelD_ub⟩
+        dsimp only [MirStepNode.fail]
+        exact ⟨And.intro (fun _ h => by cases h) (fun _ _ h => by cases h), fun h => h.toStepRelD_ub⟩
       | uninit | init _ =>
         have hlt : r < s0.frame.locals.length := (List.getElem?_eq_some_iff.mp hsr).1
         simp only [Trusted.Sequence.set?, List.length_set, hlt, ↓reduceIte,
-          List.set_comm _ _ hrt]
+          List.set_comm _ _ hrt.symm]
         cases mem1.activeProtectors with
         | nil =>
-          refine ⟨⟨fun s0' h => ?_, fun _ _ h => by nomatch h⟩, fun h => ?_⟩
-          · simp only [MirStepNode.step, ITreeF.tau.injEq, MirExecState.running.injEq] at h
-            subst h
+          dsimp only [MirStepNode.step]
+          refine ⟨And.intro (fun s0' h => ?_) (fun _ _ h => by cases h), fun h => ?_⟩
+          · injection h with h; injection h with h; subst h
             exact ⟨rfl, by simp [advanceStmt, List.getElem?_set_ne hrt, hs0]⟩
           · unfold StepRelN at h; obtain ⟨_, hr, _⟩ := h; cases hr
         | cons pH pT =>
           dsimp only
           split
-          · refine ⟨⟨fun _ h => by nomatch h, fun _ _ h => by nomatch h⟩, fun h => h.toStepRelD_ub⟩
-          · refine ⟨⟨fun s0' h => ?_, fun _ _ h => by nomatch h⟩, fun h => ?_⟩
-            · simp only [MirStepNode.step, ITreeF.tau.injEq, MirExecState.running.injEq] at h
-              subst h
+          · dsimp only [MirStepNode.fail]
+            exact ⟨And.intro (fun _ h => by cases h) (fun _ _ h => by cases h), fun h => h.toStepRelD_ub⟩
+          · dsimp only [MirStepNode.step]
+            refine ⟨And.intro (fun s0' h => ?_) (fun _ _ h => by cases h), fun h => ?_⟩
+            · injection h with h; injection h with h; subst h
               exact ⟨rfl, by simp [advanceStmt, List.getElem?_set_ne hrt, hs0]⟩
             · unfold StepRelN at h; obtain ⟨_, hr, _⟩ := h; cases hr
-  · rw [hrv.2.1 hrv0]
-    exact ⟨⟨fun _ h => by nomatch h, fun _ _ h => by nomatch h⟩, fun h => h.toStepRelD_ub⟩
-  · rw [hrv.2.2 hrv0]
-    exact ⟨⟨fun _ h => by nomatch h, fun _ _ h => by nomatch h⟩, fun h => h.elim⟩
+  · simp only [hrv.2.1 hrv0]
+    dsimp only [MirStepNode.fail]
+    exact ⟨And.intro (fun _ h => by cases h) (fun _ _ h => by cases h), fun h => h.toStepRelD_ub⟩
+  · simp only [hrv.2.2 hrv0]
+    dsimp only [MirStepNode.unsupported]
+    exact ⟨And.intro (fun _ h => by cases h) (fun _ _ h => by cases h), fun h => h.elim⟩
 
 theorem step_window_reinit {body : CapturedMir} {f : Gen.Function}
     (hfrag : inFragment (eraseDeinit body) = true) (hf : translateFn body = some f)
@@ -1911,7 +1925,6 @@ theorem step_window_reinit {body : CapturedMir} {f : Gen.Function}
   obtain ⟨view, lm, p, k, rootVal, off, sz, hthr0, _, _, hp, hpk, haddr0, haddrMax, hrootWf,
     _, hD0, hA0, hrng, hthrE, hactE, hallocE⟩ := holeLocal_spec hN0 hHR hd ht
   obtain ⟨it₀, hres0⟩ := deinitTargetOk_scalar htgt hd ht hrng
-    _, hD0, hA0, hrng, hthrE, hactE, hallocE⟩ := holeLocal_spec hN0 hHR hd ht
   have hr' : holeRange body t ps' = some (off', it.size.bytes) := by
     simp [holeRange, hd, ht, hres', TupleSpec.size]
   rw [hr', hrng] at hrange
@@ -1994,8 +2007,10 @@ theorem step_window_reinit {body : CapturedMir} {f : Gen.Function}
         rfl
       have hNF := step_correspondence_NF (eraseDeinit body) f hfrag (fnLocalsSpec_eraseDeinit hf)
         ctx s m0 (blk_eraseDeinit hf hbb hnd) hN0
+      have hslots0 : SlotsOk body.layouts body.localDecls s.frame.locals :=
+        hrel0.stale.slots hlo0.slots
       rw [stepMirFn_reinit_setLocalVal hrel0.activeCallee hphase hbb hst hd ht
-          (hrel0.stale.slots hlo0.slots) hs0 hw0 hres0 hres'
+          hslots0 hs0 hw0 hres0 hres'
           (rvalAgrees_use_nonDeref (opAgrees_const _ _ _ _ _ _) (fun _ _ => ⟨by simp, by simp⟩)),
         hstepH]
       rw [hstep0] at hNF
@@ -2022,7 +2037,7 @@ theorem step_window_read {body : CapturedMir} {f : Gen.Function}
     (hsib : siblingReadOk body t r ps ps' = true) :
     StepRelD body f ctx (setLocalVal s t deinitVal) (stepMirFn body (setLocalVal s t deinitVal))
       (Interp.step m) := by
-  obtain ⟨_, _, hrel0, _, _, _, _⟩ := id hN0
+  obtain ⟨_, _, hrel0, _, hlo00, _, _⟩ := id hN0
   obtain ⟨hphase, _, _, _, _, _, _, _, _, _⟩ := inFragment_spec _ hfrag
   obtain ⟨hrt, dr, d, fields, size, align, it, off0, leaf, off', hdr, hd, hit, ht, hres, hres',
     hdis⟩ := siblingReadOk_spec hsib
@@ -2104,8 +2119,10 @@ theorem step_window_read {body : CapturedMir} {f : Gen.Function}
           rfl
         have hNF := step_correspondence_NF (eraseDeinit body) f hfrag
           (fnLocalsSpec_eraseDeinit hf) ctx s m0 (blk_eraseDeinit hf hbb hnd) hN0
+        have hslots0 : SlotsOk body.layouts body.localDecls s.frame.locals :=
+          hrel0.stale.slots hlo00.slots
         obtain ⟨_, hval0⟩ :=
-          (DeclSlotOk_of_tupleTypeOf ht (.init rootVal0)).mp ((hrel0.stale.slots hlo0.slots) t d _ hd hs0)
+          (DeclSlotOk_of_tupleTypeOf ht (.init rootVal0)).mp (hslots0 t d _ hd hs0)
         have hrelS := assign_other_setLocalVal_rel (deinitVal := deinitVal)
           hrel0.activeCallee hphase hbb hst hrt hs0
           (rvalAgrees_use_nonDeref
@@ -2267,21 +2284,6 @@ theorem evalStatement_reinitCopy_any {m : Mach} {ctx : Ctx} {f : Gen.Function}
       ⟨.Store, .None, (offsetPtr p off).addr, ⟨it.size.bytes⟩⟩, ?_, withMem_shape h1 _⟩
     simp [evalStatement, hpeEval, evalValue, hplacer, placeLoad, hm1, placeStore, hst]
 
-/-- A `StepRelN` whose MiniRust side errors with UB gives a `StepRelD` for any MiniRust result
-that also errors with UB. -/
-theorem StepRelN.toStepRelD_ub {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
-    {s : MachineState} {a : MirStepNode} {msg0 msg : String}
-    (h : StepRelN (eraseDeinit body) f ctx s a (.error (.ub msg0))) :
-    StepRelD body f ctx s a (.error (.ub msg)) := by
-  unfold StepRelN at h
-  unfold StepRelD
-  split at h
-  · obtain ⟨_, hr, _⟩ := h; cases hr
-  · obtain ⟨_, _, _, hr, _⟩ := h; cases hr
-  · obtain ⟨_, hr, _⟩ := h; cases hr
-  · exact ⟨msg, rfl⟩
-  · exact h.elim
-
 /-- **Local-copy re-initialization step.** While `_t.ps` is a hole, `_t.ps' = copy _r` (where
 `r ≠ t` is an integer local of the leaf's type and `ps'` has the hole's byte range) either faults
 on `_r` in both machines or stores `_r`'s bytes over the hole in both machines, closing the hole
@@ -2303,7 +2305,7 @@ theorem step_window_reinit_copy {body : CapturedMir} {f : Gen.Function}
     (hrange : holeRange body t ps' = holeRange body t ps) :
     StepRelD body f ctx (setLocalVal s t deinitVal) (stepMirFn body (setLocalVal s t deinitVal))
       (Interp.step m) := by
-  obtain ⟨_, _, hrel0, _, _, _, _⟩ := id hN0
+  obtain ⟨_, _, hrel0, _, hlo00, _, _⟩ := id hN0
   obtain ⟨hphase, _, _, _, _, _, _, _, _, _⟩ := inFragment_spec _ hfrag
   obtain ⟨hrt, dr, d, fields, size, align, off', it, hdr, hd, hit, ht, hres', _⟩ :=
     reinitCopyOk_spec hrc
@@ -2367,8 +2369,10 @@ theorem step_window_reinit_copy {body : CapturedMir} {f : Gen.Function}
         intro st hst2; rw [hst] at hst2; cases hst2; rfl
       have hNF := step_correspondence_NF (eraseDeinit body) f hfrag
         (fnLocalsSpec_eraseDeinit hf) ctx s m0 (blk_eraseDeinit hf hbb hnd) hN0
+      have hslots0 : SlotsOk body.layouts body.localDecls s.frame.locals :=
+        hrel0.stale.slots hlo00.slots
       rw [stepMirFn_reinit_setLocalVal hrel0.activeCallee hphase hbb hst hd ht
-          (hrel0.stale.slots hlo0.slots) hs00 hw0 hres0 hres'
+          hslots0 hs00 hw0 hres0 hres'
           (rvalAgrees_use_nonDeref (opAgrees_copy_other _ hrt _ _ _ _)
             (fun _ _ => ⟨by simp, by simp⟩))]
       cases hpr : mapGet lm (localName r) with
@@ -2566,7 +2570,7 @@ theorem step_window_local_copy {body : CapturedMir} {f : Gen.Function}
     (hlc : localCopyWindowOk body t r q = true) :
     StepRelD body f ctx (setLocalVal s t deinitVal) (stepMirFn body (setLocalVal s t deinitVal))
       (Interp.step m) := by
-  obtain ⟨_, _, hrel0, _, _, _, _⟩ := id hN0
+  obtain ⟨_, _, hrel0, _, hlo00, _, _⟩ := id hN0
   obtain ⟨hphase, _, _, _, _, _, _, _, _, _⟩ := inFragment_spec _ hfrag
   obtain ⟨hrt, hqt, _hrq, dr, dq, d, fields, size, align, it, hdr, hdq, hd, hit, hitq, ht, _,
     hgood⟩ := localCopyWindowOk_spec hlc
@@ -3000,7 +3004,7 @@ theorem step_window_cast_read {body : CapturedMir} {f : Gen.Function}
     (hcsib : castSiblingReadOk body t r ps ps' castTy = true) :
     StepRelD body f ctx (setLocalVal s t deinitVal) (stepMirFn body (setLocalVal s t deinitVal))
       (Interp.step m) := by
-  obtain ⟨_, _, hrel0, _, _, _, _⟩ := id hN0
+  obtain ⟨_, _, hrel0, _, hlo00, _, _⟩ := id hN0
   obtain ⟨hphase, _, _, _, _, _, _, _, _, _⟩ := inFragment_spec _ hfrag
   obtain ⟨hrt, ⟨it'', hopTy⟩, dr, d, fields, size, align, it, it', off0, leaf, off', hdr, hd, hit,
     hct, ht, hgood, hres, hres', hdis⟩ := castSiblingReadOk_spec hcsib
@@ -3084,8 +3088,10 @@ theorem step_window_cast_read {body : CapturedMir} {f : Gen.Function}
           rfl
         have hNF := step_correspondence_NF (eraseDeinit body) f hfrag
           (fnLocalsSpec_eraseDeinit hf) ctx s m0 (blk_eraseDeinit hf hbb hnd) hN0
+        have hslots0 : SlotsOk body.layouts body.localDecls s.frame.locals :=
+          hrel0.stale.slots hlo00.slots
         obtain ⟨_, hval0⟩ :=
-          (DeclSlotOk_of_tupleTypeOf ht (.init rootVal0)).mp ((hrel0.stale.slots hlo0.slots) t d _ hd hs0)
+          (DeclSlotOk_of_tupleTypeOf ht (.init rootVal0)).mp (hslots0 t d _ hd hs0)
         have hrelS := assign_other_setLocalVal_rel (deinitVal := deinitVal)
           hrel0.activeCallee hphase hbb hst hrt hs0
           (rvalAgrees_cast_intToInt
@@ -3169,7 +3175,7 @@ theorem step_window_reinit_binop {body : CapturedMir} {f : Gen.Function}
     (hrange : holeRange body t ps' = holeRange body t ps) :
     StepRelD body f ctx (setLocalVal s t deinitVal) (stepMirFn body (setLocalVal s t deinitVal))
       (Interp.step m) := by
-  obtain ⟨_, _, hrel0, _, _, _, _⟩ := id hN0
+  obtain ⟨_, _, hrel0, _, hlo00, _, _⟩ := id hN0
   obtain ⟨hphase, _, _, _, _, _, _, _, _, _⟩ := inFragment_spec _ hfrag
   obtain ⟨hqt, hrel, dq, d, fields, size, align, off', it, iop, cbits, hdq, hd, hitq, ht, hres',
     _, hiop, _, hcop⟩ := reinitBinOpOk_spec hrb
@@ -3241,9 +3247,11 @@ theorem step_window_reinit_binop {body : CapturedMir} {f : Gen.Function}
         intro st hst2; rw [hst] at hst2; cases hst2; rfl
       have hNF := step_correspondence_NF (eraseDeinit body) f hfrag
         (fnLocalsSpec_eraseDeinit hf) ctx s m0 (blk_eraseDeinit hf hbb hnd) hN0
+      have hslots0 : SlotsOk body.layouts body.localDecls s.frame.locals :=
+        hrel0.stale.slots hlo00.slots
       rw [stepMirFn_reinit_setLocalVal hrel0.activeCallee hphase hbb hst hd ht
-          (hrel0.stale.slots hlo0.slots) hs00 hw0 hres0 hres'
-          (rvalAgrees_binaryOp_int (hrel0.stale.slots hlo0.slots) hdq hitq hqt hiop hcop)]
+          hslots0 hs00 hw0 hres0 hres'
+          (rvalAgrees_binaryOp_int hslots0 hdq hitq hqt hiop hcop)]
       cases hpq : mapGet lm (localName q) with
       | none =>
         have hs0 : Interp.step m0 = .error (.ub "access to a dead local") := by
@@ -3508,7 +3516,7 @@ theorem step_window_binop_local {body : CapturedMir} {f : Gen.Function}
     (hbw : binOpWindowOk body t r q op c = true) :
     StepRelD body f ctx (setLocalVal s t deinitVal) (stepMirFn body (setLocalVal s t deinitVal))
       (Interp.step m) := by
-  obtain ⟨_, _, hrel0, _, _, _, _⟩ := id hN0
+  obtain ⟨_, _, hrel0, _, hlo00, _, _⟩ := id hN0
   obtain ⟨hphase, _, _, _, _, _, _, _, _, _⟩ := inFragment_spec _ hfrag
   obtain ⟨hrt, hqt, _hrq, hrel, dr, dq, d, fields, size, align, it, iop, cbits, hdr, hdq, hd, hit,
     hitq, ht, _, hgood, hiop, _, hcop⟩ := binOpWindowOk_spec hbw
@@ -3551,9 +3559,11 @@ theorem step_window_binop_local {body : CapturedMir} {f : Gen.Function}
     intro st hst2; rw [hst] at hst2; cases hst2; rfl
   have hNF := step_correspondence_NF (eraseDeinit body) f hfrag
     (fnLocalsSpec_eraseDeinit hf) ctx s m0 (blk_eraseDeinit hf hbb hnd) hN0
+  have hslots0 : SlotsOk body.layouts body.localDecls s.frame.locals :=
+    hrel0.stale.slots hlo00.slots
   have hrelS := assign_other_setLocalVal_rel (deinitVal := deinitVal)
     hrel0.activeCallee hphase hbb hst hrt hs00
-    (rvalAgrees_binaryOp_int (hrel0.stale.slots hlo0.slots) hdq hitq hqt hiop hcop)
+    (rvalAgrees_binaryOp_int hslots0 hdq hitq hqt hiop hcop)
   cases hpr : mapGet lm (localName r) with
   | none =>
     have hs0 : Interp.step m0 = .error (.ub "access to a dead local") := by
@@ -3740,13 +3750,17 @@ theorem step_window_retag {body : CapturedMir} {f : Gen.Function}
   subst hkk
   rw [ha] at hA0
   cases hA0
+  have hsA : s.frame.locals[t]? = some (.init rootVal) :=
+    (hrel0.stale.agree hnm').trans hsV
+  have hrvEq : rootVal0 = rootVal := by rw [hs0] at hsA; injection hsA with h1; injection h1
+  subst hrvEq
   obtain ⟨hrootWf, hrootVal⟩ :=
-    (DeclSlotOk_of_tupleTypeOf ht (.init rootVal)).mp (hlo0.slots t d _ hd hsV)
+    (DeclSlotOk_of_tupleTypeOf ht (.init rootVal0)).mp (hlo0.slots t d _ hd hsV)
   obtain ⟨hTd, _⟩ := tyOf_tupleSpec ht
   rw [hTd] at haddrMax
   simp only [TupleSpec.toMiniRustTy, tyBytes] at haddrMax
-  have hD0 : ((TupleSpec.tuple fields size align).encodeVal rootVal).length = size :=
-    TupleSpec.encodeVal_length _ rootVal hrootWf
+  have hD0 : ((TupleSpec.tuple fields size align).encodeVal rootVal0).length = size :=
+    TupleSpec.encodeVal_length _ rootVal0 hrootWf
   have hr0 : holeRange body t ps = some (off0, leaf.size) := by
     simp [holeRange, hd, ht, hres]
   rw [hr0] at hrng
@@ -3763,7 +3777,7 @@ theorem step_window_retag {body : CapturedMir} {f : Gen.Function}
       simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hleafOk
       exact hleafOk.2
     simp only [TupleSpec.size, TupleSpec.encodeVal, valBytes] at hslice0
-    have hsliceH : ((spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal) off
+    have hsliceH : ((spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal0) off
         (List.replicate leaf.size .Uninit)).drop off').take it'.size.bytes =
         scalarBytes it' sc.bits := by
       rw [spliceAt_drop_take_disjoint _ _ _ _ _ (by rw [List.length_replicate, hD0]; exact hoffb)
@@ -3774,10 +3788,6 @@ theorem step_window_retag {body : CapturedMir} {f : Gen.Function}
     | cons pe0 rest =>
       cases pe0 with
       | field idx fTy =>
-        have hsA : s.frame.locals[t]? = some (.init rootVal) :=
-          (hrel0.stale.agree hnm').trans hsV
-        have hrvEq : rootVal0 = rootVal := by rw [hs0] at hsA; injection hsA with h1; injection h1
-        subst hrvEq
         obtain ⟨leafTy, _, hprojTy, hleafSpec⟩ :=
           resolveFieldPath_ty (specOfRigidTy_of_tupleTypeOf ht) hres'
         have hit := intTypeOf_of_specOfRigidTy_scalar hleafSpec
