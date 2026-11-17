@@ -2466,6 +2466,111 @@ theorem canary_dynDispatchStep_step_spec :
     cases hr
     exact hstep
 
+/-- Root making an *indirect* function-pointer call `_0 = (copy _2)()` while `_1` holds a valid
+`Circle` vtable pointer (`vt = 7`). -/
+def fnPtrSpoofRoot : CapturedMir :=
+  { defPath := "fx::fnptr_spoof", phase := .runtimePostCleanup, role := .subject, argCount := 2,
+    localDecls := [
+      ⟨.mut, fxU32Ty, some "_0"⟩,
+      ⟨.not, fxVtPtrTy, some "unrelated_vt"⟩,
+      ⟨.not, ⟨.fnPtr [] (.uint .u32) .safe .rust, 0⟩, some "fn_ptr"⟩ ],
+    basicBlocks := [
+      ⟨[], ⟨.call (.copy ⟨2, []⟩) [] fxRetPlace (some 1) .continue_, "fnptr:call"⟩, false⟩,
+      ⟨[], ⟨.return_, "fnptr:ret"⟩, false⟩ ],
+    fnAbi := fxRetU32Abi, layouts := fxLayouts, allocations := [] }
+
+/-- Entry state where `_2` points to `FnPtrEntry 50` carrying the uninstantiated virtual key
+`("fx::Area::area", [dyn Area])`, while `_1` holds `Circle`'s vtable `7`. -/
+def fnPtrVirtInit : MachineState :=
+  let s₀ := initMachineState fnPtrSpoofRoot [.ptr ⟨7, 0⟩ 0, .ptr ⟨50, 0⟩ 8]
+  { s₀ with
+    memory :=
+      { s₀.memory with
+        fnPtrs := [
+          ⟨50, "fx::Area::area", [.dynamic "fx::Area"], none⟩,
+          ⟨51, "fx::live_f", [], none⟩ ] } }
+
+/-- Entry state where `_2` points to `FnPtrEntry 51` carrying concrete `"fx::live_f"`. -/
+def fnPtrConcreteInit : MachineState :=
+  let s₀ := initMachineState fnPtrSpoofRoot [.ptr ⟨7, 0⟩ 0, .ptr ⟨51, 0⟩ 8]
+  { s₀ with
+    memory :=
+      { s₀.memory with
+        fnPtrs := [
+          ⟨50, "fx::Area::area", [.dynamic "fx::Area"], none⟩,
+          ⟨51, "fx::live_f", [], none⟩ ] } }
+
+/-- **Indirect `FnPtr` calls never hijack `DynCallSite`**:
+1. At `fnPtrVirtInit`, `demandedKey?` returns `("fx::Area::area", [dyn Area])` (`dynSite.dynKey`!),
+   so without `isDirectCallAt` gating, `dynSite` hijacked `_0 = (_2)()`, read the unrelated `_1`
+   (`Circle` vtable `7`), and returned `31`.
+2. With `isDirectCallAt`, `demandsDynSite = false` and `demandsUnregisteredDyn = true`, so both
+   `evalDynWithOpaqueCallees` and `evalDynRegistryWithOpaqueCallees` fail closed
+   (`.faulted .unsupported []`).
+3. Concrete indirect `FnPtr` calls (`fnPtrConcreteInit`, `fnPtrs[51] = "fx::live_f"`) still
+   dispatch cleanly through `OpaqueCalleeTable` and halt returning `7`. -/
+theorem canary_indirect_fnptr_virtual_key_not_hijacked :
+    demandedKey? fnPtrSpoofRoot fnPtrVirtInit =
+      some ⟨fxLayouts, "fx::Area::area", [.dynamic "fx::Area"], []⟩ ∧
+    isDirectCallAt fnPtrSpoofRoot fnPtrVirtInit = false ∧
+    demandsDynSite dynSite fnPtrSpoofRoot fnPtrVirtInit = false ∧
+    demandsUnregisteredDyn dynSite fnPtrSpoofRoot fnPtrVirtInit = true ∧
+    evalDynWithOpaqueCallees dynEnv13 dynFullTbl dynSite fnPtrSpoofRoot 12 fnPtrVirtInit =
+      .faulted .unsupported [] ∧
+    evalDynRegistryWithOpaqueCallees dynEnv13 dynFullTbl [dynSite] fnPtrSpoofRoot 12
+        fnPtrVirtInit =
+      .faulted .unsupported [] ∧
+    (evalDynRegistryWithOpaqueCallees dynEnv13 canaryFullTbl [dynSite] fnPtrSpoofRoot 12
+        fnPtrConcreteInit).summary =
+      ⟨.halted, [], some 7, none⟩ := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- **Exhaustive `StepView` soundness of `stepDynTerminator`, `dynRegistryStep`, and `dynDemandStep`**:
+1. `stepDynTerminator` never fabricates `.ret out` or `.cont obs (.halted out)` at *any* state or
+   terminator (`stepDynTerminator_ne_ret`, `stepDynTerminator_view_ne_halted`).
+2. Whenever `dynRegistryStep` or `dynDemandStep` produces a normal return (`.ret (.normal p)` or
+   `.cont obs (.halted (.normal p))`), it is literally `stepBranchPruned tbl.lookup` — never a
+   virtual dispatch step (`dynRegistryStep_normal_return_eq_branchPruned`,
+   `dynDemandStep_normal_return_eq_branchPruned`). -/
+theorem canary_dyn_exhaustive_view_spec :
+    (∀ resolve site target s term cb out,
+      stepDynTerminator resolve site target s term cb ≠ .ret out) ∧
+    (∀ resolve site target s term cb obs out,
+      viewStepNode (stepDynTerminator resolve site target s term cb) ≠ .cont obs (.halted out)) ∧
+    (∀ env tbl reg body s p,
+      viewStepNode (dynRegistryStep env tbl reg body s) = .ret (.normal p) →
+        dynRegistryStep env tbl reg body s = stepBranchPruned tbl.lookup body s) ∧
+    (∀ env tbl site body s p,
+      viewStepNode (dynDemandStep env tbl site body s) = .ret (.normal p) →
+        dynDemandStep env tbl site body s = stepBranchPruned tbl.lookup body s) :=
+  ⟨stepDynTerminator_ne_ret, stepDynTerminator_view_ne_halted,
+    fun env tbl reg body s p h =>
+      dynRegistryStep_normal_return_eq_branchPruned env tbl reg body s p (Or.inl h),
+    fun env tbl site body s p h =>
+      dynDemandStep_normal_return_eq_branchPruned env tbl site body s p (Or.inl h)⟩
+
+/-- **`scopedWellFormed` subsumption of `wellFormed` & overlapping scoped-site fail-closed canary**:
+1. Every `wellFormed` registry is `scopedWellFormed` (`scopedWellFormed_of_wellFormed`), and on
+   unscoped registries the two predicates are identical (`scopedWellFormed_eq_wellFormed_of_unscoped`).
+2. Mixing an unscoped fallback site `dynSite` with a block-scoped site `ssaSite0` for the same
+   `dynKey` overlaps at `ssaInit` (`("fx::ssa_dyn_root", 0)`), so `scopedWellFormed = false`,
+   `findSiteAt? = none` (`findSiteAt?_eq_none_of_overlapping`), and execution fails closed
+   (`.faulted .unsupported []`). -/
+theorem canary_scoped_registry_overlap_and_subsumption :
+    dynTwoSiteRegistry.scopedWellFormed = true ∧
+    DynCallRegistry.scopedWellFormed [dynSite, dynDuplicateSite] =
+      DynCallRegistry.wellFormed [dynSite, dynDuplicateSite] ∧
+    (DynCallRegistry.scopedWellFormed ([] ++ dynSite :: [] ++ ssaSite0 :: []) = false ∧
+      DynCallRegistry.findSiteAt? ([] ++ dynSite :: [] ++ ssaSite0 :: []) ssaDynRoot ssaInit
+        dynSite.dynKey = none) ∧
+    evalDynRegistryWithOpaqueCallees dynEnv13 dynFullTbl [dynSite, ssaSite0] ssaDynRoot 16
+        ssaInit = .faulted .unsupported [] :=
+  ⟨DynCallRegistry.scopedWellFormed_of_wellFormed (by decide),
+    DynCallRegistry.scopedWellFormed_eq_wellFormed_of_unscoped _ (by decide),
+    DynCallRegistry.findSiteAt?_eq_none_of_overlapping [] [] [] rfl rfl rfl (by decide),
+    by decide +kernel⟩
+
 
 /-! ## Part C: worked `BEq`-shadowing demonstration (`tholenst` cl/1022563952) -/
 
@@ -2691,6 +2796,30 @@ theorem multiNarrow_areaKey_cert :
   exact lookupKey_trait_hit_cert (winner := fxAreaEntry) rfl (by decide) multiNarrowTbl_traitImpls
     hcolN (by decide) himplN (by decide) rfl
 
+/-- Dynamic-dispatch gate table (`m` fillers + dead `g_dead` + `Square::area` + `Circle::area`). -/
+def dynGateTbl (m : Nat) : OpaqueCalleeTable :=
+  .ofList (gateFillers m ++ [fxGDead, fxSquareArea, fxCircleArea])
+
+/-- Key of the vtable-resolved `<impl Area for Circle>::area` call. -/
+def dynCircleKey : CalleeKey := ⟨fxLayouts, "fx::<impl Area for Circle>::area", [], []⟩
+
+/-- One-time narrow query-demand certificate for `dynRoot` (zero `fullTbl` occurrences). -/
+theorem canary_dyn_narrow_demandedQueries :
+    dynRegistryDemandedQueries dynEnv13Sync dynNarrowTbl [dynSite] dynRoot 12 dynInit =
+      [(dynSite, ⟨7, 0⟩)] := by
+  decide +kernel
+
+/-- One-time narrow redirected callee-key certificate for `dynRoot` (zero `fullTbl` occurrences). -/
+theorem canary_dyn_narrow_demandedCalleeKeys :
+    dynRegistryDemandedCalleeKeys dynEnv13Sync dynNarrowTbl [dynSite] dynRoot 12 dynInit =
+      [dynCircleKey] := by
+  decide +kernel
+
+/-- `fxCircleArea`'s raw certificate in `dynNarrowTbl`. -/
+theorem dynNarrowTbl_lookupRaw_circle :
+    dynNarrowTbl.lookupRaw "fx::<impl Area for Circle>::area" = some fxCircleArea :=
+  lookupRaw_ofList_cons_hit rfl
+
 open Lean Elab Command in
 run_cmd do
   let o1 : Nat → CommandElabM (TSyntax `command) := fun m => do
@@ -2738,6 +2867,29 @@ run_cmd do
           rw [multiNarrow_areaKey_cert,
             lookupKey_trait_hit_cert (winner := fxAreaEntry) rfl (by decide) htraits
               hcol (by decide) harea (by decide) rfl])
+  let o1Dyn : Nat → CommandElabM (TSyntax `command) := fun m => do
+    let mLit := Syntax.mkNumLit (toString m)
+    `(command|
+      set_option Elab.async false in
+      example
+          (hcircle : (dynGateTbl $mLit).lookupRaw "fx::<impl Area for Circle>::area" =
+            some fxCircleArea) :
+          evalDynRegistryWithOpaqueCallees dynEnv13Sync dynNarrowTbl [dynSite] dynRoot 12 dynInit =
+            evalDynRegistryWithOpaqueCallees dynEnv13 (dynGateTbl $mLit) [dynSite] dynRoot 12
+              dynInit := by
+        apply evalDynRegistryWithOpaqueCallees_cone_narrow_of_demands dyn_envExtends_13_sync
+        · rw [canary_dyn_narrow_demandedQueries]
+          intro p hp
+          simp only [List.mem_singleton] at hp
+          subst hp
+          rw [dyn_schema13_resolves]
+          exact fun _ h => nomatch h
+        · rw [canary_dyn_narrow_demandedCalleeKeys]
+          intro ck hck
+          simp only [List.mem_singleton] at hck
+          subst hck
+          rw [lookupKey_hit_mono dynNarrowTbl_lookupRaw_circle rfl rfl,
+            lookupKey_hit_mono hcircle rfl rfl])
   let leaky : Nat → CommandElabM (TSyntax `command) := fun m => do
     let mLit := Syntax.mkNumLit (toString m)
     `(command|
@@ -2762,6 +2914,7 @@ run_cmd do
   -- Warm-up (one-time equation lemmas, instance and simp caches).
   discard <| measure (← o1 2)
   discard <| measure (← o1PolyTrait 2)
+  discard <| measure (← o1Dyn 2)
   discard <| measure (← leaky 2)
   let hb4 ← measure (← o1 4)
   let hb32 ← measure (← o1 32)
@@ -2769,9 +2922,12 @@ run_cmd do
   let hbPT4 ← measure (← o1PolyTrait 4)
   let hbPT32 ← measure (← o1PolyTrait 32)
   let hbPT64 ← measure (← o1PolyTrait 64)
+  let hbDyn4 ← measure (← o1Dyn 4)
+  let hbDyn32 ← measure (← o1Dyn 32)
+  let hbDyn64 ← measure (← o1Dyn 64)
   let lk4 ← measure (← leaky 4)
   let lk64 ← measure (← leaky 64)
-  unless 0 < hb4 && 0 < hbPT4 do
+  unless 0 < hb4 && 0 < hbPT4 && 0 < hbDyn4 do
     throwError "heartbeat gate: no heartbeats measured for M = 4"
   unless hb32 * 4 ≤ hb4 * 5 && hb64 * 4 ≤ hb4 * 5 do
     throwError "heartbeat regression gate (mono) failed: Hb(M = 4) = {hb4}, \
@@ -2779,6 +2935,9 @@ run_cmd do
   unless hbPT32 * 4 ≤ hbPT4 * 5 && hbPT64 * 4 ≤ hbPT4 * 5 do
     throwError "heartbeat regression gate (poly+trait) failed: Hb(M = 4) = {hbPT4}, \
       Hb(M = 32) = {hbPT32}, Hb(M = 64) = {hbPT64} (limit: 1.25 × Hb(M = 4))"
+  unless hbDyn32 * 4 ≤ hbDyn4 * 5 && hbDyn64 * 4 ≤ hbDyn4 * 5 do
+    throwError "heartbeat regression gate (dyn) failed: Hb(M = 4) = {hbDyn4}, \
+      Hb(M = 32) = {hbDyn32}, Hb(M = 64) = {hbDyn64} (limit: 1.25 × Hb(M = 4))"
   unless lk4 * 7 ≤ lk64 * 5 do
     throwError "heartbeat gate self-test failed: the kernel-unfolding variant did not scale \
       (Hb(M = 4) = {lk4}, Hb(M = 64) = {lk64})"
@@ -3566,6 +3725,62 @@ constant. -/
 /-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dynDispatchStep_step_spec' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dynDispatchStep_step_spec
+
+/-- info: 'Anneal.CompilerQueryEnv.stepDynTerminator_view_spec' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.stepDynTerminator_view_spec
+
+/-- info: 'Anneal.CompilerQueryEnv.stepDynTerminator_ne_ret' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.stepDynTerminator_ne_ret
+
+/-- info: 'Anneal.CompilerQueryEnv.stepDynTerminator_view_ne_halted' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.stepDynTerminator_view_ne_halted
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.scopedWellFormed_of_wellFormed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.scopedWellFormed_of_wellFormed
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.scopedWellFormed_eq_wellFormed_of_unscoped' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.scopedWellFormed_eq_wellFormed_of_unscoped
+
+/-- info: 'Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_none_of_overlapping' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.DynCallRegistry.findSiteAt?_eq_none_of_overlapping
+
+/-- info: 'Anneal.CompilerQueryEnv.dynRegistryStep_view_spec' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.dynRegistryStep_view_spec
+
+/-- info: 'Anneal.CompilerQueryEnv.dynRegistryStep_normal_return_eq_branchPruned' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.dynRegistryStep_normal_return_eq_branchPruned
+
+/-- info: 'Anneal.CompilerQueryEnv.dynDemandStep_normal_return_eq_branchPruned' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.dynDemandStep_normal_return_eq_branchPruned
+
+/-- info: 'Anneal.CompilerQueryEnv.evalDynRegistryWithOpaqueCallees_cone_narrow_of_demands' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.evalDynRegistryWithOpaqueCallees_cone_narrow_of_demands
+
+/-- info: 'Anneal.CompilerQueryEnv.evalDynWithOpaqueCallees_cone_narrow_of_demands' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryEnv.evalDynWithOpaqueCallees_cone_narrow_of_demands
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_indirect_fnptr_virtual_key_not_hijacked' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_indirect_fnptr_virtual_key_not_hijacked
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_exhaustive_view_spec' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_dyn_exhaustive_view_spec
+
+/-- info: 'Anneal.CompilerQueryAndOpaqueCalleeTests.canary_scoped_registry_overlap_and_subsumption' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.CompilerQueryAndOpaqueCalleeTests.canary_scoped_registry_overlap_and_subsumption
 
 end Anneal.CompilerQueryAndOpaqueCalleeTests
 

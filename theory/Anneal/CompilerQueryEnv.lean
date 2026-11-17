@@ -3160,6 +3160,59 @@ theorem stepTerminatorWith_of_stepDynTerminator_step {resolve : CalleeResolver}
     simp only [stepDynTerminator] at h
     simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
 
+/-- **Exhaustive `StepView` classification of `stepDynTerminator`** (unconditional, with no output
+hypothesis): at *every* state and terminator, `stepDynTerminator` exclusively:
+1. faults (`.fault fk`, i.e. fail-closed `.unsupported` or `.ub`),
+2. emits an unlinked external call to the vtable-resolved `target = (req.defPath, req.typeArgs)`, or
+3. takes a silent running step (`MirStepNode.step s'`) identical to the resolver-parametric trusted
+   `stepTerminatorWith true resolve s term (some cb)`.
+
+Unlike `stepTerminatorWith_of_stepDynTerminator_step` alone (which would hold vacuously if
+`stepDynTerminator` fabricated `.ret out`, `.emitStep`, or `.tau (.halted out)`), this theorem rules
+out every non-call outcome unconditionally. -/
+theorem stepDynTerminator_view_spec (resolve : CalleeResolver) (site : DynCallSite)
+    (target : DefPath × List RigidTy) (s : MachineState) (term : Terminator) (cb : CapturedMir) :
+    (∃ fk, viewStepNode (stepDynTerminator resolve site target s term cb) = .fault fk) ∨
+    (∃ req, viewStepNode (stepDynTerminator resolve site target s term cb) = .external req ∧
+      req.defPath = target.1 ∧ req.typeArgs = target.2) ∨
+    (∃ s', stepDynTerminator resolve site target s term cb = MirStepNode.step s' ∧
+      stepTerminatorWith true resolve s term (some cb) = MirStepNode.step s') := by
+  have h : stepDynTerminator resolve site target s term cb =
+      stepDynTerminator resolve site target s term cb := rfl
+  conv at h => rhs; unfold stepDynTerminator
+  repeat' ((try dsimp only at h); split at h)
+  all_goals
+    try dsimp only at h
+    first
+    | exact Or.inl ⟨.ub, by rw [h]; rfl⟩
+    | exact Or.inl ⟨.unsupported, by rw [h]; rfl⟩
+    | exact Or.inr (Or.inl ⟨_, by rw [h]; rfl, rfl, rfl⟩)
+    | exact Or.inr (Or.inr ⟨_, h, stepTerminatorWith_of_stepDynTerminator_step true h⟩)
+
+/-- `stepDynTerminator` never produces a terminal `.ret out` node. -/
+theorem stepDynTerminator_ne_ret (resolve : CalleeResolver) (site : DynCallSite)
+    (target : DefPath × List RigidTy) (s : MachineState) (term : Terminator) (cb : CapturedMir)
+    (out : MirOutcome) :
+    stepDynTerminator resolve site target s term cb ≠ .ret out := by
+  intro h
+  rcases stepDynTerminator_view_spec resolve site target s term cb with
+    ⟨fk, hv⟩ | ⟨req, hv, _, _⟩ | ⟨s', hs, _⟩
+  · rw [h] at hv; nomatch hv
+  · rw [h] at hv; nomatch hv
+  · rw [h] at hs; nomatch hs
+
+/-- `stepDynTerminator` never transitions directly to `.halted out`. -/
+theorem stepDynTerminator_view_ne_halted (resolve : CalleeResolver) (site : DynCallSite)
+    (target : DefPath × List RigidTy) (s : MachineState) (term : Terminator) (cb : CapturedMir)
+    (obs : Option MirObs) (out : MirOutcome) :
+    viewStepNode (stepDynTerminator resolve site target s term cb) ≠ .cont obs (.halted out) := by
+  intro h
+  rcases stepDynTerminator_view_spec resolve site target s term cb with
+    ⟨fk, hv⟩ | ⟨req, hv, _, _⟩ | ⟨s', hs, _⟩
+  · rw [h] at hv; nomatch hv
+  · rw [h] at hv; nomatch hv
+  · rw [hs] at h; simp [MirStepNode.step, viewStepNode] at h
+
 /-- **Unified dynamic-dispatch step**: receiver vtable pointer (read from the
 calling frame) `→ UnOp.vtableMethodLookup → abiCompatible →
 OpaqueCalleeTable.lookup → stepDynPruned`. An ill-formed site fails closed
@@ -3344,11 +3397,38 @@ theorem dynDispatchStep_frames (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable
 
 /-! ### Demand-gated dynamic dispatch -/
 
-/-- Whether the next step at `s` demands the `dyn` call site `site` (matching both `site.dynKey`
-and `site.matchesLoc body s`). -/
+/-- Whether the call / tail-call terminator `term` at `s` resolves as a *direct* (`FnDef`) call
+(`target.isIndirect = false`), rather than an indirect `FnPtr` call through `s.memory.fnPtrs`. -/
+def isDirectTerminatorCall (s : MachineState) (term : Terminator)
+    (currentBody : CapturedMir) : Bool :=
+  match term.kind with
+  | .call func argOps _ _ _ =>
+    match resolveCallTarget s func (length argOps) currentBody.localDecls currentBody.layouts with
+    | .ok target _ => !target.isIndirect
+    | _ => false
+  | .tailCall func argOps =>
+    match resolveCallTarget s func (length argOps) currentBody.localDecls currentBody.layouts with
+    | .ok target _ => !target.isIndirect
+    | _ => false
+  | _ => false
+
+/-- Whether the active step at `(body, s)` is a direct (`FnDef`) call terminator. Lowered
+`charon#1611` virtual calls are always direct trait-method calls (`isIndirect = false`); gating
+`DynCallSite` matching on `isDirectCallAt` prevents an indirect `FnPtr` call whose `FnPtrEntry`
+carries a virtual key from hijacking a `DynCallSite` and reading an unrelated `vtableLocal`
+(`canary_indirect_fnptr_virtual_key_not_hijacked`). -/
+def isDirectCallAt (body : CapturedMir) (s : MachineState) : Bool :=
+  match activeTerminator? body s with
+  | some (term, cb) => isDirectTerminatorCall s term cb
+  | none => false
+
+/-- Whether the next step at `s` demands the `dyn` call site `site` (a direct call matching both
+`site.dynKey` and `site.matchesLoc body s`). -/
 def demandsDynSite (site : DynCallSite) (body : CapturedMir) (s : MachineState) : Bool :=
   match demandedKey? body s with
-  | some k => decide ((k.defPath, k.typeArgs) = site.dynKey) && site.matchesLoc body s
+  | some k =>
+    isDirectCallAt body s && decide ((k.defPath, k.typeArgs) = site.dynKey) &&
+      site.matchesLoc body s
   | none => false
 
 /-- Whether the next step at `s` demands a *virtual* call key (first generic argument
@@ -3633,7 +3713,8 @@ def dynStepPreservedB (env₁ : CompilerQueryEnv) (narrowTbl fullTbl : OpaqueCal
   match demandedKey? body s with
   | none => true
   | some k =>
-    if decide ((k.defPath, k.typeArgs) = site.dynKey) && site.matchesLoc body s then
+    if isDirectCallAt body s && decide ((k.defPath, k.typeArgs) = site.dynKey) &&
+        site.matchesLoc body s then
       if site.wellFormed then
         match site.vtablePtr? s with
         | none => true
@@ -3666,7 +3747,8 @@ theorem dynStepPreserved_of_check {env₁ : CompilerQueryEnv} {narrowTbl fullTbl
   | some k =>
     rw [hk] at hc
     dsimp only at hc
-    cases hm : (decide ((k.defPath, k.typeArgs) = site.dynKey) && site.matchesLoc body s) with
+    cases hm : (isDirectCallAt body s && decide ((k.defPath, k.typeArgs) = site.dynKey) &&
+        site.matchesLoc body s) with
     | true =>
       simp only [hm, ite_true] at hc
       refine ⟨fun hwf _ vt hvt m hunsup => ?_, fun hwf _ vt target hvt hr hta k' hk' => ?_,
@@ -4000,17 +4082,112 @@ theorem DynCallRegistry.findSiteAt?_spec {reg : DynCallRegistry} {body : Capture
       simp only [Bool.and_eq_true, decide_eq_true_eq] at hp
       exact ⟨hmem, hp.1, hp.2⟩
     | cons b rest' => rw [hf] at h; nomatch h
-/-- Multi-site demand-gated dynamic-dispatch step (location-aware via `findSiteAt?`):
-- if the active step at `s` demands a call key uniquely resolved at `(body, s)` in `reg`,
+
+/-- Distinct `dynKey`s imply `noOverlaps`. -/
+theorem DynCallRegistry.noOverlaps_of_nodup :
+    ∀ (reg : DynCallRegistry), (reg.map (·.dynKey)).Nodup → reg.noOverlaps = true
+  | [], _ => rfl
+  | s :: rest, hnd => by
+    rw [List.map_cons, List.nodup_cons] at hnd
+    unfold DynCallRegistry.noOverlaps
+    rw [Bool.and_eq_true, List.all_eq_true]
+    refine ⟨fun s' hs' => ?_, noOverlaps_of_nodup rest hnd.2⟩
+    have hne : s.dynKey ≠ s'.dynKey :=
+      fun he => hnd.1 (he ▸ List.mem_map_of_mem hs')
+    simp [DynCallSite.overlaps, hne]
+
+/-- `scopedWellFormed` strictly generalizes `wellFormed`: every key-disjoint well-formed registry
+is also `scopedWellFormed`. -/
+theorem DynCallRegistry.scopedWellFormed_of_wellFormed {reg : DynCallRegistry}
+    (hwf : reg.wellFormed = true) : reg.scopedWellFormed = true := by
+  obtain ⟨hall, hnd⟩ := (DynCallRegistry.wellFormed_iff reg).mp hwf
+  unfold DynCallRegistry.scopedWellFormed
+  rw [Bool.and_eq_true, List.all_eq_true]
+  exact ⟨hall, DynCallRegistry.noOverlaps_of_nodup reg hnd⟩
+
+theorem DynCallRegistry.nodup_of_noOverlaps_unscoped :
+    ∀ (reg : DynCallRegistry),
+      reg.all (fun site => site.callSiteLoc?.isNone) = true →
+      reg.noOverlaps = true →
+      (reg.map (·.dynKey)).Nodup
+  | [], _, _ => List.Pairwise.nil
+  | s :: rest, hun, hno => by
+    simp only [List.all_cons, Bool.and_eq_true] at hun
+    unfold DynCallRegistry.noOverlaps at hno
+    rw [Bool.and_eq_true, List.all_eq_true] at hno
+    rw [List.map_cons, List.nodup_cons]
+    refine ⟨fun hk => ?_, nodup_of_noOverlaps_unscoped rest hun.2 hno.2⟩
+    obtain ⟨s', hs', heq⟩ := List.mem_map.mp hk
+    have hov := hno.1 s' hs'
+    cases hloc : s.callSiteLoc? with
+    | some _ => rw [hloc] at hun; nomatch hun.1
+    | none =>
+      simp [DynCallSite.overlaps, hloc, heq] at hov
+
+/-- On unscoped registries (`callSiteLoc? = none` everywhere), `scopedWellFormed` coincides
+exactly with `wellFormed`. -/
+theorem DynCallRegistry.scopedWellFormed_eq_wellFormed_of_unscoped (reg : DynCallRegistry)
+    (hun : reg.all (fun site => site.callSiteLoc?.isNone) = true) :
+    reg.scopedWellFormed = reg.wellFormed := by
+  cases hwf : reg.wellFormed with
+  | true => exact DynCallRegistry.scopedWellFormed_of_wellFormed hwf
+  | false =>
+    cases hswf : reg.scopedWellFormed with
+    | false => rfl
+    | true =>
+      unfold DynCallRegistry.scopedWellFormed at hswf
+      rw [Bool.and_eq_true, List.all_eq_true] at hswf
+      have hwf' : reg.wellFormed = true :=
+        (DynCallRegistry.wellFormed_iff reg).mpr
+          ⟨hswf.1, DynCallRegistry.nodup_of_noOverlaps_unscoped reg hun hswf.2⟩
+      rw [hwf] at hwf'
+      nomatch hwf'
+
+/-- **Overlapping scoped registrations fail closed** (the location-scoped analogue of
+`DynCallRegistry.findSite?_eq_none_of_duplicate`): if two entries in `pre ++ s₁ :: mid ++ s₂ :: post`
+share `dynKey = key` and both match `(body, s)` (for example, an unscoped fallback site colliding
+with a block-scoped site at that block), then `scopedWellFormed = false` and
+`findSiteAt? body s key = none`. -/
+theorem DynCallRegistry.findSiteAt?_eq_none_of_overlapping
+    (pre mid post : List DynCallSite) {s₁ s₂ : DynCallSite}
+    {body : CapturedMir} {s : MachineState} {key : DefPath × List RigidTy}
+    (hk₁ : s₁.dynKey = key) (hk₂ : s₂.dynKey = key)
+    (hm₁ : s₁.matchesLoc body s = true) (hm₂ : s₂.matchesLoc body s = true) :
+    DynCallRegistry.scopedWellFormed (pre ++ s₁ :: mid ++ s₂ :: post) = false ∧
+      DynCallRegistry.findSiteAt? (pre ++ s₁ :: mid ++ s₂ :: post) body s key = none := by
+  have hlen : 2 ≤ ((pre ++ s₁ :: mid ++ s₂ :: post).filter
+      (fun x => decide (x.dynKey = key) && x.matchesLoc body s)).length := by
+    simp [List.filter_append, hk₁, hk₂, hm₁, hm₂]
+    omega
+  have hfind : DynCallRegistry.findSiteAt? (pre ++ s₁ :: mid ++ s₂ :: post) body s key = none := by
+    unfold DynCallRegistry.findSiteAt?
+    cases hf : (pre ++ s₁ :: mid ++ s₂ :: post).filter
+        (fun x => decide (x.dynKey = key) && x.matchesLoc body s) with
+    | nil => rfl
+    | cons a rest =>
+      cases rest with
+      | nil => rw [hf] at hlen; simp at hlen
+      | cons b rest' => rfl
+  refine ⟨?_, hfind⟩
+  cases hswf : DynCallRegistry.scopedWellFormed (pre ++ s₁ :: mid ++ s₂ :: post) with
+  | false => rfl
+  | true =>
+    have hs₁ := (DynCallRegistry.findSiteAt?_eq_some_of_scopedWellFormed body s hswf
+      (by simp : s₁ ∈ pre ++ s₁ :: mid ++ s₂ :: post) hm₁).1
+    rw [hk₁, hfind] at hs₁
+    nomatch hs₁
+
+/-- Multi-site demand-gated dynamic-dispatch step (location-aware via `findSiteAt?` on direct calls):
+- if the active step at `s` is a direct call uniquely resolved at `(body, s)` in `reg`,
   dispatch via that site's `dynDispatchStep`;
-- if it demands an unregistered (or ambiguously registered) virtual call key
+- if it demands an unregistered, ambiguously registered, or indirect (`FnPtr`) virtual call key
   (`dynSelfTrait?.isSome`), fail closed (`MirStepNode.unsupported`);
 - otherwise step directly via `stepBranchPruned tbl.lookup`. -/
 def dynRegistryStep (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable) (reg : DynCallRegistry)
     (body : CapturedMir) (s : MachineState) : MirStepNode :=
   match demandedKey? body s with
   | some k =>
-    match reg.findSiteAt? body s (k.defPath, k.typeArgs) with
+    match if isDirectCallAt body s then reg.findSiteAt? body s (k.defPath, k.typeArgs) else none with
     | some site => dynDispatchStep env tbl site body s
     | none =>
       if (dynSelfTrait? (k.defPath, k.typeArgs)).isSome then
@@ -4029,31 +4206,161 @@ theorem dynRegistryStep_frames (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable
   | none => exact stepBranchPruned_frames tbl.lookup body s
   | some k =>
     dsimp only
-    cases reg.findSiteAt? body s (k.defPath, k.typeArgs) with
+    cases (if isDirectCallAt body s then reg.findSiteAt? body s (k.defPath, k.typeArgs) else none) with
     | some site => exact dynDispatchStep_frames env tbl site body s
     | none =>
       cases (dynSelfTrait? (k.defPath, k.typeArgs)).isSome with
       | true => exact True.intro
       | false => exact stepBranchPruned_frames tbl.lookup body s
 
-/-- When the active step demands a uniquely matching site `site` at `(body, s)`,
+/-- When the active step is a direct call demanding a uniquely matching site `site` at `(body, s)`,
 `dynRegistryStep` is `dynDispatchStep env tbl site body s`. -/
 theorem dynRegistryStep_eq_dynDispatchStep_of_findSite (env : CompilerQueryEnv)
     (tbl : OpaqueCalleeTable) (reg : DynCallRegistry) (body : CapturedMir) (s : MachineState)
-    {k : CalleeKey} {site : DynCallSite} (hk : demandedKey? body s = some k)
+    {k : CalleeKey} {site : DynCallSite} (hdir : isDirectCallAt body s = true)
+    (hk : demandedKey? body s = some k)
     (hfind : reg.findSiteAt? body s (k.defPath, k.typeArgs) = some site) :
     dynRegistryStep env tbl reg body s = dynDispatchStep env tbl site body s := by
-  simp [dynRegistryStep, hk, hfind]
+  simp [dynRegistryStep, hdir, hk, hfind]
 
-/-- Any virtual call key without a unique matching entry in `reg` at `(body, s)` (unregistered or
-ambiguous) fails closed (`MirStepNode.unsupported`). -/
+/-- Any virtual call key without a unique direct-call entry in `reg` at `(body, s)` (unregistered,
+ambiguous, or indirect `FnPtr`) fails closed (`MirStepNode.unsupported`). -/
 theorem dynRegistryStep_of_unregistered (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
     (reg : DynCallRegistry) (body : CapturedMir) (s : MachineState) {k : CalleeKey}
     (hk : demandedKey? body s = some k)
-    (hfind : reg.findSiteAt? body s (k.defPath, k.typeArgs) = none)
+    (hfind : (if isDirectCallAt body s then reg.findSiteAt? body s (k.defPath, k.typeArgs)
+      else none) = none)
     (hdyn : (dynSelfTrait? (k.defPath, k.typeArgs)).isSome = true) :
     dynRegistryStep env tbl reg body s = MirStepNode.unsupported := by
   simp [dynRegistryStep, hk, hfind, hdyn]
+
+/-- **Exhaustive `StepView` classification of `dynRegistryStep`** (unconditional): at *every*
+state `s`, `dynRegistryStep` exclusively:
+1. equals the branch-pruned trusted step `stepBranchPruned tbl.lookup body s` (hence `stepMirFn`
+   under `tbl.toList = s.memory.callees`),
+2. faults (`.fault fk`, fail-closed `.unsupported` or `.ub`),
+3. traps on a Schema-13 CFI type-id mismatch (`.ret .abort`) at a uniquely resolved well-formed
+   site,
+4. emits an unlinked external call to the vtable-resolved `target = (req.defPath, req.typeArgs)` of
+   a uniquely resolved well-formed site, or
+5. takes a validated redirected `.step s'` equal to
+   `stepBranchPruned (redirectResolver tbl site.dynKey target) body s`.
+
+In particular, a virtual dispatch step can **never** fabricate a normal return `.ret (.normal _)`
+or `.cont _ (.halted _)`. -/
+theorem dynRegistryStep_view_spec (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    (reg : DynCallRegistry) (body : CapturedMir) (s : MachineState) :
+    dynRegistryStep env tbl reg body s = stepBranchPruned tbl.lookup body s ∨
+    (∃ fk, viewStepNode (dynRegistryStep env tbl reg body s) = .fault fk) ∨
+    (∃ k site vt, isDirectCallAt body s = true ∧ demandedKey? body s = some k ∧
+      reg.findSiteAt? body s (k.defPath, k.typeArgs) = some site ∧ site.wellFormed = true ∧
+      site.vtablePtr? s = some vt ∧ resolveDynTarget env site vt = .err .cfiTypeIdMismatch ∧
+      dynRegistryStep env tbl reg body s = MirStepNode.retOutcome .abort) ∨
+    (∃ k site vt target req, isDirectCallAt body s = true ∧ demandedKey? body s = some k ∧
+      reg.findSiteAt? body s (k.defPath, k.typeArgs) = some site ∧ site.wellFormed = true ∧
+      site.vtablePtr? s = some vt ∧ resolveDynTarget env site vt = .ok target ∧
+      vtableTargetAgrees site target = true ∧
+      viewStepNode (dynRegistryStep env tbl reg body s) = .external req ∧
+      req.defPath = target.1 ∧ req.typeArgs = target.2) ∨
+    (∃ k site vt target s', isDirectCallAt body s = true ∧ demandedKey? body s = some k ∧
+      reg.findSiteAt? body s (k.defPath, k.typeArgs) = some site ∧ site.wellFormed = true ∧
+      site.vtablePtr? s = some vt ∧ resolveDynTarget env site vt = .ok target ∧
+      vtableTargetAgrees site target = true ∧
+      dynRegistryStep env tbl reg body s = MirStepNode.step s' ∧
+      stepBranchPruned (redirectResolver tbl site.dynKey target) body s = MirStepNode.step s') := by
+  unfold dynRegistryStep
+  cases hk : demandedKey? body s with
+  | none => exact Or.inl rfl
+  | some k =>
+    dsimp only
+    cases hdir : isDirectCallAt body s with
+    | false =>
+      simp only [Bool.false_eq_true, ite_false]
+      cases hv : (dynSelfTrait? (k.defPath, k.typeArgs)).isSome with
+      | true => exact Or.inr (Or.inl ⟨.unsupported, by simp [MirStepNode.unsupported, MirStepNode.fail, viewStepNode]⟩)
+      | false => exact Or.inl rfl
+    | true =>
+      simp only [ite_true]
+      cases hf : reg.findSiteAt? body s (k.defPath, k.typeArgs) with
+      | none =>
+        cases hv : (dynSelfTrait? (k.defPath, k.typeArgs)).isSome with
+        | true => exact Or.inr (Or.inl ⟨.unsupported, by simp [MirStepNode.unsupported, MirStepNode.fail, viewStepNode]⟩)
+        | false => exact Or.inl rfl
+      | some site =>
+        dsimp only
+        have hkey : site.dynKey = (k.defPath, k.typeArgs) :=
+          (DynCallRegistry.findSiteAt?_spec hf).2.1
+        have hdk : demandsDynKey site.dynKey body s = true := by
+          simp [demandsDynKey, hk, hkey]
+        unfold dynDispatchStep
+        cases hwf : site.wellFormed with
+        | false =>
+          exact Or.inr (Or.inl ⟨.unsupported, by simp [MirStepNode.unsupported, MirStepNode.fail, viewStepNode]⟩)
+        | true =>
+          simp only [ite_true]
+          cases hvt : site.vtablePtr? s with
+          | none =>
+            exact Or.inr (Or.inl ⟨.ub, by simp [MirStepNode.fail, viewStepNode]⟩)
+          | some vt =>
+            dsimp only
+            cases hr : resolveDynTarget env site vt with
+            | unsupported _ =>
+              exact Or.inr (Or.inl ⟨.unsupported, by simp [MirStepNode.unsupported, MirStepNode.fail, viewStepNode]⟩)
+            | err e =>
+              cases e with
+              | cfiTypeIdMismatch =>
+                exact Or.inr (Or.inr (Or.inl ⟨k, site, vt, by simp, rfl,
+                  by simp [hf], by simp [hwf], by simp [hvt], by simp [hr], rfl⟩))
+              | vtableSlotMethodMismatch _ =>
+                exact Or.inr (Or.inl ⟨.unsupported, by simp [MirStepNode.unsupported, MirStepNode.fail, viewStepNode]⟩)
+              | _ =>
+                exact Or.inr (Or.inl ⟨.ub, by simp [MirStepNode.fail, viewStepNode]⟩)
+            | ok target =>
+              dsimp only
+              cases hta : vtableTargetAgrees site target with
+              | false =>
+                exact Or.inr (Or.inl ⟨.unsupported, by simp [MirStepNode.unsupported, MirStepNode.fail, viewStepNode]⟩)
+              | true =>
+                simp only [ite_true]
+                have hact_some : ∃ term cb, activeTerminator? body s = some (term, cb) := by
+                  unfold demandedKey? at hk
+                  cases hact : activeTerminator? body s with
+                  | none => rw [hact] at hk; nomatch hk
+                  | some p => exact ⟨p.1, p.2, rfl⟩
+                obtain ⟨term, cb, hact⟩ := hact_some
+                have hdp : stepDynPruned tbl site target body s =
+                    stepDynTerminator (redirectResolver tbl site.dynKey target) site target s
+                      term cb := by
+                  simp [stepDynPruned, hdk, hact]
+                rcases stepDynTerminator_view_spec (redirectResolver tbl site.dynKey target) site
+                    target s term cb with ⟨fk, hfk⟩ | ⟨req, hreq, hd1, hd2⟩ | ⟨s', hs1, hs2⟩
+                · exact Or.inr (Or.inl ⟨fk, by rw [hdp]; exact hfk⟩)
+                · exact Or.inr (Or.inr (Or.inr (Or.inl ⟨k, site, vt, target, req, by simp,
+                    rfl, by simp [hf], by simp [hwf], by simp [hvt], by simp [hr],
+                    by simp [hta], by rw [hdp]; exact hreq, hd1, hd2⟩)))
+                · have hsp : stepDynPruned tbl site target body s = MirStepNode.step s' := by
+                    rw [hdp]; exact hs1
+                  exact Or.inr (Or.inr (Or.inr (Or.inr ⟨k, site, vt, target, s', by simp,
+                    rfl, by simp [hf], by simp [hwf], by simp [hvt], by simp [hr],
+                    by simp [hta], hsp, stepBranchPruned_redirect_of_stepDynPruned_step hsp⟩)))
+
+/-- **Normal returns in `dynRegistryStep` come exclusively from the trusted machine**: whenever
+`dynRegistryStep` produces `.ret (.normal p)` or `.cont obs (.halted (.normal p))`, the step is
+literally `stepBranchPruned tbl.lookup body s` (never a virtual dispatch step). -/
+theorem dynRegistryStep_normal_return_eq_branchPruned (env : CompilerQueryEnv)
+    (tbl : OpaqueCalleeTable) (reg : DynCallRegistry) (body : CapturedMir) (s : MachineState)
+    (p : Value × Memory)
+    (h : viewStepNode (dynRegistryStep env tbl reg body s) = .ret (.normal p) ∨
+      ∃ obs, viewStepNode (dynRegistryStep env tbl reg body s) = .cont obs (.halted (.normal p))) :
+    dynRegistryStep env tbl reg body s = stepBranchPruned tbl.lookup body s := by
+  rcases dynRegistryStep_view_spec env tbl reg body s with
+    heq | ⟨fk, hv⟩ | ⟨_, _, _, _, _, _, _, _, _, hab⟩ | ⟨_, _, _, _, req, _, _, _, _, _, _, _, hv, _, _⟩ |
+      ⟨_, _, _, _, s', _, _, _, _, _, _, _, hs, _⟩
+  · exact heq
+  · rcases h with hr | ⟨_, hr⟩ <;> (rw [hv] at hr; nomatch hr)
+  · rcases h with hr | ⟨_, hr⟩ <;> (rw [hab] at hr; simp [MirStepNode.retOutcome, viewStepNode] at hr)
+  · rcases h with hr | ⟨_, hr⟩ <;> (rw [hv] at hr; nomatch hr)
+  · rcases h with hr | ⟨_, hr⟩ <;> (rw [hs] at hr; simp [MirStepNode.step, viewStepNode] at hr)
 
 /-- Fuel-bounded multi-step evaluation with a `DynCallRegistry`. -/
 def evalDynRegistryWithOpaqueCallees (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
@@ -4061,7 +4368,7 @@ def evalDynRegistryWithOpaqueCallees (env : CompilerQueryEnv) (tbl : OpaqueCalle
   runSteps (dynRegistryStep env tbl reg body) fuel s []
 
 /-- A singleton registry `[site]` steps identically to single-site `dynDemandStep` (for both
-unscoped and `callSiteLoc?`-scoped sites). -/
+unscoped and `callSiteLoc?`-scoped sites, including `isDirectCallAt` gating). -/
 theorem dynRegistryStep_singleton (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
     (site : DynCallSite) (body : CapturedMir) (s : MachineState) :
     dynRegistryStep env tbl [site] body s = dynDemandStep env tbl site body s := by
@@ -4070,17 +4377,32 @@ theorem dynRegistryStep_singleton (env : CompilerQueryEnv) (tbl : OpaqueCalleeTa
   | none => rfl
   | some k =>
     dsimp only
-    have hcomm : (decide (site.dynKey = (k.defPath, k.typeArgs)) && site.matchesLoc body s) =
-        (decide ((k.defPath, k.typeArgs) = site.dynKey) && site.matchesLoc body s) := by
-      congr 1
-      by_cases heq : (k.defPath, k.typeArgs) = site.dynKey
-      · simp [heq]
-      · have hne : site.dynKey ≠ (k.defPath, k.typeArgs) := fun h => heq h.symm
-        simp [heq, hne]
-    rw [List.filter_cons, List.filter_nil, hcomm]
-    by_cases hb : (decide ((k.defPath, k.typeArgs) = site.dynKey) && site.matchesLoc body s) = true
-    · simp [hb]
-    · simp [hb]
+    cases hdir : isDirectCallAt body s with
+    | false =>
+      simp only [Bool.false_and, Bool.false_eq_true, ite_false, Bool.not_false, Bool.and_true]
+    | true =>
+      simp only [Bool.true_and, ite_true]
+      have hcomm : (decide (site.dynKey = (k.defPath, k.typeArgs)) && site.matchesLoc body s) =
+          (decide ((k.defPath, k.typeArgs) = site.dynKey) && site.matchesLoc body s) := by
+        congr 1
+        by_cases heq : (k.defPath, k.typeArgs) = site.dynKey
+        · simp [heq]
+        · have hne : site.dynKey ≠ (k.defPath, k.typeArgs) := fun h => heq h.symm
+          simp [heq, hne]
+      rw [List.filter_cons, List.filter_nil, hcomm]
+      by_cases hb : (decide ((k.defPath, k.typeArgs) = site.dynKey) && site.matchesLoc body s) = true
+      · simp [hb]
+      · simp [hb]
+
+/-- Single-site corollary of `dynRegistryStep_normal_return_eq_branchPruned`. -/
+theorem dynDemandStep_normal_return_eq_branchPruned (env : CompilerQueryEnv)
+    (tbl : OpaqueCalleeTable) (site : DynCallSite) (body : CapturedMir) (s : MachineState)
+    (p : Value × Memory)
+    (h : viewStepNode (dynDemandStep env tbl site body s) = .ret (.normal p) ∨
+      ∃ obs, viewStepNode (dynDemandStep env tbl site body s) = .cont obs (.halted (.normal p))) :
+    dynDemandStep env tbl site body s = stepBranchPruned tbl.lookup body s := by
+  rw [← dynRegistryStep_singleton] at h ⊢
+  exact dynRegistryStep_normal_return_eq_branchPruned env tbl [site] body s p h
 
 /-- Multi-step evaluation with a singleton registry `[site]` equals `evalDynWithOpaqueCallees`. -/
 theorem evalDynRegistryWithOpaqueCallees_singleton (env : CompilerQueryEnv)
@@ -4105,7 +4427,7 @@ theorem dynRegistryStep_eq_trusted_of_no_dyn (env : CompilerQueryEnv) (tbl : Opa
   | none => exact stepBranchPruned_eq_trusted tbl body s hframe
   | some k =>
     obtain ⟨hfind, hvirt⟩ := hnone k hk
-    simp only [hfind, hvirt, Bool.false_eq_true, ite_false]
+    simp only [hfind, ite_self, hvirt, Bool.false_eq_true, ite_false]
     exact stepBranchPruned_eq_trusted tbl body s hframe
 
 /-- **Unconditional multi-step trusted agreement for non-`dyn` registry runs**: when no visited
@@ -4129,7 +4451,7 @@ theorem evalDynRegistryWithOpaqueCallees_eq_trusted_of_no_dyn_unconditional
     | none => rfl
     | some k =>
       obtain ⟨hfind, hvirt⟩ := hnodyn s' hs' k hk
-      simp only [hfind, hvirt, Bool.false_eq_true, ite_false]
+      simp only [hfind, ite_self, hvirt, Bool.false_eq_true, ite_false]
   rw [h_opaque]
   exact evalWithOpaqueCallees_eq_trusted_unconditional tbl body fuel s hcallees
 
@@ -4139,7 +4461,7 @@ def dynRegistryStepPreservedB (env₁ : CompilerQueryEnv) (narrowTbl fullTbl : O
   match demandedKey? body s with
   | none => true
   | some k =>
-    match reg.findSiteAt? body s (k.defPath, k.typeArgs) with
+    match if isDirectCallAt body s then reg.findSiteAt? body s (k.defPath, k.typeArgs) else none with
     | some site =>
       if site.wellFormed then
         match site.vtablePtr? s with
@@ -4172,7 +4494,8 @@ theorem dynRegistryStep_preserved_of_check {env₁ env₂ : CompilerQueryEnv}
   | some k =>
     rw [hk] at hc
     dsimp only at hc ⊢
-    cases hf : reg.findSiteAt? body s (k.defPath, k.typeArgs) with
+    cases hf : (if isDirectCallAt body s then reg.findSiteAt? body s (k.defPath, k.typeArgs)
+        else none) with
     | some site =>
       rw [hf] at hc
       dsimp only at hc
@@ -4210,6 +4533,161 @@ theorem evalDynRegistryWithOpaqueCallees_preserved_of_narrow_check
   symm
   exact runSteps_congr_visited fuel s []
     (fun s' hs' => (dynRegistryStep_preserved_of_check h (List.all_eq_true.mp hcheck s' hs')).symm)
+
+/-! #### `O(1)` certificate-driven dynamic-dispatch cone narrowing (`fullTbl`-free demand collection)
+
+`dynStepPreservedB` and `dynRegistryStepPreservedB` embed `fullTbl` inside a Boolean check, which is
+convenient on tiny fixture tables (`decide +kernel`) but unfolds `fullTbl.toList` in the kernel (`O(M)`
+heartbeats). The collectors below depend *only* on `(env₂, narrowTbl, reg)` (zero occurrences of
+`env₁` or `fullTbl`), so a client computes the demanded `(site, vt)` query pairs and redirected
+concrete `CalleeKey`s once over `narrowTbl` and discharges `narrowTbl.lookupKey ck = fullTbl.lookupKey ck`
+in `O(1)` heartbeats via `OpaqueCalleeTable` certificates (`o1Dyn` in the heartbeat gate). -/
+
+/-- The `(site, vt)` query demand issued by `dynRegistryStep` at `s` (if any). -/
+def dynRegistryStepQuery? (reg : DynCallRegistry) (body : CapturedMir) (s : MachineState) :
+    Option (DynCallSite × ProvenancePtr) :=
+  match demandedKey? body s with
+  | some k =>
+    match if isDirectCallAt body s then reg.findSiteAt? body s (k.defPath, k.typeArgs) else none with
+    | some site =>
+      if site.wellFormed then (site.vtablePtr? s).map (fun vt => (site, vt)) else none
+    | none => none
+  | none => none
+
+/-- The effective `CalleeKey` consulted in `OpaqueCalleeTable` by `dynRegistryStep` at `s` (already
+redirected to `(target.1, target.2)` on a validated resolved virtual call). -/
+def dynRegistryStepCalleeKey? (env : CompilerQueryEnv) (reg : DynCallRegistry)
+    (body : CapturedMir) (s : MachineState) : Option CalleeKey :=
+  match demandedKey? body s with
+  | some k =>
+    match if isDirectCallAt body s then reg.findSiteAt? body s (k.defPath, k.typeArgs) else none with
+    | some site =>
+      if site.wellFormed then
+        match site.vtablePtr? s with
+        | some vt =>
+          match resolveDynTarget env site vt with
+          | .ok target =>
+            if vtableTargetAgrees site target then
+              some ⟨k.callerLayouts, target.1, target.2, k.extraTraitImpls⟩
+            else none
+          | _ => none
+        | none => none
+      else none
+    | none =>
+      if (dynSelfTrait? (k.defPath, k.typeArgs)).isSome then none else some k
+  | none => none
+
+/-- All `(site, vt)` query demands issued along `evalDynRegistryWithOpaqueCallees env tbl reg`. -/
+def dynRegistryDemandedQueries (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    (reg : DynCallRegistry) (body : CapturedMir) (fuel : Nat) (s : MachineState) :
+    List (DynCallSite × ProvenancePtr) :=
+  (runVisited (dynRegistryStep env tbl reg body) fuel s).filterMap
+    (dynRegistryStepQuery? reg body)
+
+/-- All effective `CalleeKey`s consulted in `tbl` along `evalDynRegistryWithOpaqueCallees env tbl reg`. -/
+def dynRegistryDemandedCalleeKeys (env : CompilerQueryEnv) (tbl : OpaqueCalleeTable)
+    (reg : DynCallRegistry) (body : CapturedMir) (fuel : Nat) (s : MachineState) :
+    List CalleeKey :=
+  (runVisited (dynRegistryStep env tbl reg body) fuel s).filterMap
+    (dynRegistryStepCalleeKey? env reg body)
+
+theorem mem_filterMap_of_eq {α β : Type} {f : α → Option β} {a : α} {b : β} :
+    ∀ {xs : List α}, a ∈ xs → f a = some b → b ∈ xs.filterMap f
+  | [], hmem, _ => nomatch hmem
+  | x :: xs, hmem, hf => by
+    rcases List.mem_cons.mp hmem with rfl | hrest
+    · rw [List.filterMap_cons_some hf]
+      exact List.Mem.head _
+    · have ih := mem_filterMap_of_eq hrest hf
+      cases hfx : f x with
+      | none =>
+        rw [List.filterMap_cons_none hfx]
+        exact ih
+      | some _ =>
+        rw [List.filterMap_cons_some hfx]
+        exact List.Mem.tail _ ih
+
+/-- Single-step preservation of `dynRegistryStep` from propositional per-step query & key agreement. -/
+theorem dynRegistryStep_preserved_of_stepDemands {env₁ env₂ : CompilerQueryEnv}
+    {narrowTbl fullTbl : OpaqueCalleeTable} {reg : DynCallRegistry}
+    {body : CapturedMir} {s : MachineState} (h : EnvExtends env₁ env₂)
+    (hsup : ∀ p, dynRegistryStepQuery? reg body s = some p →
+      ∀ m, resolveDynTarget env₁ p.1 p.2 ≠ .unsupported m)
+    (hkey : ∀ ck, dynRegistryStepCalleeKey? env₂ reg body s = some ck →
+      narrowTbl.lookupKey ck = fullTbl.lookupKey ck) :
+    dynRegistryStep env₂ narrowTbl reg body s = dynRegistryStep env₁ fullTbl reg body s := by
+  unfold dynRegistryStep
+  cases hk : demandedKey? body s with
+  | none =>
+    exact stepBranchPruned_congr body s (fun k hk' => by rw [hk] at hk'; nomatch hk')
+  | some k =>
+    dsimp only
+    cases hf : (if isDirectCallAt body s then reg.findSiteAt? body s (k.defPath, k.typeArgs)
+        else none) with
+    | none =>
+      cases hv : (dynSelfTrait? (k.defPath, k.typeArgs)).isSome with
+      | true => rfl
+      | false =>
+        simp only [Bool.false_eq_true, ite_false]
+        apply stepBranchPruned_congr body s
+        intro k' hk'
+        rw [hk] at hk'
+        cases hk'
+        exact hkey k (by simp [dynRegistryStepCalleeKey?, hk, hf, hv])
+    | some site =>
+      have hfind : reg.findSiteAt? body s (k.defPath, k.typeArgs) = some site := by
+        cases hdir : isDirectCallAt body s <;> simp_all
+      have hdkey : (k.defPath, k.typeArgs) = site.dynKey :=
+        (DynCallRegistry.findSiteAt?_spec hfind).2.1.symm
+      apply dynDispatchStep_preserved h
+      · intro hwf vt hvt
+        exact hsup (site, vt) (by simp [dynRegistryStepQuery?, hk, hf, hwf, hvt])
+      · intro hwf vt target hvt hr₁ hta k' hk'
+        rw [hk] at hk'
+        cases hk'
+        have hr₂ : resolveDynTarget env₂ site vt = .ok target :=
+          (resolveDynTarget_mono h site vt
+            (hsup (site, vt) (by simp [dynRegistryStepQuery?, hk, hf, hwf, hvt]))).trans hr₁
+        rw [redirectResolver_apply_hit narrowTbl site.dynKey target hdkey,
+          redirectResolver_apply_hit fullTbl site.dynKey target hdkey]
+        exact hkey ⟨k.callerLayouts, target.1, target.2, k.extraTraitImpls⟩
+          (by simp [dynRegistryStepCalleeKey?, hk, hf, hwf, hvt, hr₂, hta])
+
+/-- **`O(1)` certificate-compatible dynamic-dispatch cone narrowing (`DynCallRegistry`)**:
+neither `dynRegistryDemandedQueries` nor `dynRegistryDemandedCalleeKeys` mentions `env₁` or
+`fullTbl`, so each demanded key's `narrowTbl.lookupKey ck = fullTbl.lookupKey ck` obligation can be
+discharged in `O(1)` heartbeats via `OpaqueCalleeTable` lookup certificates without ever unfolding
+`fullTbl.toList`. -/
+theorem evalDynRegistryWithOpaqueCallees_cone_narrow_of_demands
+    {env₁ env₂ : CompilerQueryEnv} {narrowTbl fullTbl : OpaqueCalleeTable}
+    {reg : DynCallRegistry} {body : CapturedMir}
+    (h : EnvExtends env₁ env₂) (fuel : Nat) (s : MachineState)
+    (hsup : ∀ p ∈ dynRegistryDemandedQueries env₂ narrowTbl reg body fuel s,
+      ∀ m, resolveDynTarget env₁ p.1 p.2 ≠ .unsupported m)
+    (hkeys : ∀ ck ∈ dynRegistryDemandedCalleeKeys env₂ narrowTbl reg body fuel s,
+      narrowTbl.lookupKey ck = fullTbl.lookupKey ck) :
+    evalDynRegistryWithOpaqueCallees env₂ narrowTbl reg body fuel s =
+      evalDynRegistryWithOpaqueCallees env₁ fullTbl reg body fuel s := by
+  symm
+  refine runSteps_congr_visited fuel s [] fun s' hs' => ?_
+  symm
+  exact dynRegistryStep_preserved_of_stepDemands h
+    (fun p hp => hsup p (mem_filterMap_of_eq hs' hp))
+    (fun ck hck => hkeys ck (mem_filterMap_of_eq hs' hck))
+
+/-- Single-site corollary of `evalDynRegistryWithOpaqueCallees_cone_narrow_of_demands`. -/
+theorem evalDynWithOpaqueCallees_cone_narrow_of_demands
+    {env₁ env₂ : CompilerQueryEnv} {narrowTbl fullTbl : OpaqueCalleeTable}
+    {site : DynCallSite} {body : CapturedMir}
+    (h : EnvExtends env₁ env₂) (fuel : Nat) (s : MachineState)
+    (hsup : ∀ p ∈ dynRegistryDemandedQueries env₂ narrowTbl [site] body fuel s,
+      ∀ m, resolveDynTarget env₁ p.1 p.2 ≠ .unsupported m)
+    (hkeys : ∀ ck ∈ dynRegistryDemandedCalleeKeys env₂ narrowTbl [site] body fuel s,
+      narrowTbl.lookupKey ck = fullTbl.lookupKey ck) :
+    evalDynWithOpaqueCallees env₂ narrowTbl site body fuel s =
+      evalDynWithOpaqueCallees env₁ fullTbl site body fuel s := by
+  rw [← evalDynRegistryWithOpaqueCallees_singleton, ← evalDynRegistryWithOpaqueCallees_singleton]
+  exact evalDynRegistryWithOpaqueCallees_cone_narrow_of_demands h fuel s hsup hkeys
 
 
 end Anneal.CompilerQueryEnv
