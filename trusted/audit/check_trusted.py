@@ -65,7 +65,12 @@ DOWNSTREAM_TARGETS = [
     ("Anneal.PureLift.MirLiftCoreInterop", "theory/Anneal/PureLift/MirLiftCoreInterop.lean", ["Anneal.BitValidity", "Anneal.MirLiftCore", "Anneal.SepLogicLenses", "Anneal.PureLift.BlockCfg", "Anneal.PureLift.Canaries"], "theory"),
     ("Anneal.PureLift.V2026_06_01Bridge", "theory/Anneal/PureLift/V2026_06_01Bridge.lean", ["Anneal.PureLift.MirLiftCoreInterop"], "theory"),
     ("Anneal.PureLift", "theory/Anneal/PureLift.lean", ["Anneal.PureLift.Lens", "Anneal.PureLift.PermTree", "Anneal.PureLift.LoanGraph", "Anneal.PureLift.SpatialPin", "Anneal.PureLift.Plan", "Anneal.PureLift.BlockCfg", "Anneal.PureLift.Adapter", "Anneal.PureLift.Canaries", "Anneal.PureLift.MirLiftCoreInterop", "Anneal.PureLift.V2026_06_01Bridge"], "theory"),
-    ("Anneal", "theory/Anneal.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.MirLoops", "Anneal.Scalars", "Anneal.Memory", "Anneal.BitValidity", "Anneal.UnsafeObligations", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower", "Anneal.Rustc.V2026_06_01.SymbolicEval", "Anneal.Rustc.V2026_06_01.SymReflect", "Anneal.Rustc.V2026_06_01.TraceCheck", "Anneal.FunctionalTranslation", "Anneal.MirFuelFree", "Anneal.PureMirExec", "Anneal.MirLiftCore", "Anneal.MirLiftBench", "Anneal.SepLogicLenses", "Anneal.PureLift"], "theory"),
+    ("Anneal.Mir.Correspondence.Codec", "theory/Anneal/Mir/Correspondence/Codec.lean", ["Trusted.Correspondence"], "theory"),
+    ("Anneal.Mir.Correspondence.LayoutQuery", "theory/Anneal/Mir/Correspondence/LayoutQuery.lean", ["Trusted.Correspondence", "Anneal.Mir.Correspondence.Codec"], "theory"),
+    ("Anneal.Mir.Correspondence.MoveDeinit", "theory/Anneal/Mir/Correspondence/MoveDeinit.lean", ["Trusted.Correspondence", "Anneal.Mir.Correspondence.Codec", "Anneal.Mir.Correspondence.LayoutQuery"], "theory"),
+    ("Anneal.Mir.Correspondence.Canaries", "theory/Anneal/Mir/Correspondence/Canaries.lean", ["Trusted.Correspondence", "Anneal.Mir.Correspondence.MoveDeinit"], "theory"),
+    ("Anneal.Mir.Correspondence.Claims", "theory/Anneal/Mir/Correspondence/Claims.lean", ["Trusted.Correspondence", "Anneal.Mir.Correspondence.Codec", "Anneal.Mir.Correspondence.LayoutQuery", "Anneal.Mir.Correspondence.MoveDeinit", "Anneal.Mir.Correspondence.Canaries"], "claim"),
+    ("Anneal", "theory/Anneal.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.MirLoops", "Anneal.Scalars", "Anneal.Memory", "Anneal.BitValidity", "Anneal.UnsafeObligations", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower", "Anneal.Rustc.V2026_06_01.SymbolicEval", "Anneal.Rustc.V2026_06_01.SymReflect", "Anneal.Rustc.V2026_06_01.TraceCheck", "Anneal.FunctionalTranslation", "Anneal.MirFuelFree", "Anneal.PureMirExec", "Anneal.MirLiftCore", "Anneal.MirLiftBench", "Anneal.SepLogicLenses", "Anneal.PureLift", "Anneal.Mir.Correspondence.Claims"], "theory"),
     ("Smoke", "examples/Smoke.lean", ["Anneal"], "examples"),
     ("ToyYDiagram", "examples/refinement/ToyYDiagram.lean", ["Anneal.Refinement"], "examples"),
     ("ToyMachine", "examples/step-result/ToyMachine.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass"], "examples"),
@@ -374,6 +379,7 @@ class Checker:
         self.graph: dict = {}
         self.expected_artifacts: dict[str, str] = {}
         self.last_status = None
+        self.preflight: dict[str, dict] = {}
 
     def budget(self) -> None:
         size = sum(p.stat().st_size for p in self.stage.rglob("*") if p.is_file())
@@ -795,7 +801,12 @@ class Checker:
         if toolchain_text != TOOLCHAIN:
             raise Failure(1, "lock", "lean-toolchain differs from lock")
         regular(self.lean, "toolchain")
-        self.lean = self.lean.resolve()
+        selected, self.lean = self.lean, self.lean.resolve()
+        # Admit the executable BEFORE it ever runs: its SHA-256 must be a locked
+        # distribution, and for the locked x86_64 Linux release every companion
+        # executable, Lean shared library and DT_RUNPATH resolution is verified too.
+        # Pure Python: a rejection leaves `execution_began` False and no status file.
+        admit_lean_before_execution(selected, self.lean, self.lock)
         actual_version = self.process("version", ["--version"]).strip()
         expected_lean_sha = self.lock["distributions"].get(actual_version)
         if expected_lean_sha is None:
@@ -998,6 +1009,15 @@ class Checker:
             if self.base_snapshot is not None
             else None
         )
+        # `trusted/root-manifest.sha256` and the `lean-miri` vendor pin (when present),
+        # pure Python and before any Lean process: a mismatch is `Failure(1, ...)` with
+        # `execution_began` still False.
+        root_manifest = verify_root_manifest(self.checkout)
+        lean_miri_pin = verify_lean_miri_pin(self.checkout)
+        self.preflight = {name: summary for name, summary in (("rootManifest", root_manifest),
+                                                              ("leanMiriPin", lean_miri_pin)) if summary}
+        preflight_hashes = {rel: summary["sha256"] for rel, summary in ((ROOT_MANIFEST_RELPATH, root_manifest),
+                                                                      (LEAN_MIRI_PIN_RELPATH, lean_miri_pin)) if summary}
         cargo_hashes = check_cargo_boundary(self.checkout) if (self.checkout / "Cargo.toml").exists() else {}
         rust_waiver_audit = audit_waivers_and_vacuity(rustc_capture_sources(self.checkout), vacuity=False)
         self.tool_admission()
@@ -1076,10 +1096,12 @@ class Checker:
             report["downstream"] = downstream
         self.freshness()
         report.update(sourceSha256=fingerprint(self.initial),
-                      toolsSha256=fingerprint({**self.tool_hashes, **cargo_hashes}),
+                      toolsSha256=fingerprint({**self.tool_hashes, **cargo_hashes, **preflight_hashes}),
                       toolchain=self.version,
                       guarantee="kernel dependency closure, statement-origin separation, and Cargo DAG boundary")
         report["waiverVacuityAudit"] = {"trusted": trusted_waiver_audit, "rustcCapture": rust_waiver_audit}
+        if self.preflight:
+            report["preflight"] = self.preflight
         if base_hashes is not None:
             report["baseSnapshotSha256"] = fingerprint(base_hashes)
         (self.stage / "report.json").write_text(json.dumps(report, indent=2))
@@ -5177,6 +5199,933 @@ def waiver_vacuity_gate(checkout: Path) -> dict[str, dict[str, int]]:
     return {"trusted": trusted, "rustcCapture": rust, "downstream": downstream}
 
 
+# ---------------------------------------------------------------------------
+# Pre-execution toolchain admission, `trusted/root-manifest.sha256`, and the
+# `lean-miri` vendor pin.
+#
+# Standalone and stdlib-only on purpose: `tests/trusted-boundary/test_boundary.py`
+# copies only this file (plus the inspector and the Trusted lock inputs) into its
+# fixtures, so nothing here may import `scripts/verify_lean_miri_pin.py`;
+# `scripts/test_verify_lean_miri_pin.py` cross-checks that both files carry the same
+# locked constants. Pure Python: no subprocess is spawned (`execution_began` stays
+# False on any failure and `--fast` status-file counts are unaffected).
+# ---------------------------------------------------------------------------
+
+TOOLCHAIN_PHASE = "toolchain"
+ROOT_MANIFEST_PHASE = "root-manifest"
+LEAN_MIRI_PIN_PHASE = "lean-miri-pin"
+ROOT_MANIFEST_RELPATH = "trusted/root-manifest.sha256"
+LEAN_MIRI_PIN_RELPATH = "lean-miri/UPSTREAM_PIN.json"
+LEAN_MIRI_VENDOR_RELPATH = "lean-miri/vendor"
+_PREFLIGHT_CHUNK = 1 << 20
+_PREFLIGHT_MAX_SHOWN = 8
+
+#: The official `leanprover/lean4:v4.34.1` `x86_64-unknown-linux-gnu` release that
+#: elan installs (`lean-4.34.1-linux.tar.zst`, sha256 `47bf4bbd...`, also pinned by
+#: `flake.nix`): every `bin/*` executable and every `lib/lean/*.so*` shared object,
+#: each checked against the GitHub release asset. Same table as
+#: `LOCKED_TOOLCHAIN_PINS` in `scripts/verify_lean_miri_pin.py`.
+LOCKED_LEAN_RELEASE = {
+    "toolchain": TOOLCHAIN,
+    "directory": "leanprover--lean4---v4.34.1",
+    "platform": ("linux", "x86_64"),
+    "files": {
+        "bin/cadical": "8e92f427cfb72072fc605ec6d5f641443c35921b29c39ab2f027776cd533afce",
+        "bin/clang": "9fcd5fc4baeea9c449bcc9ca4b9db7714465107669498b0056a853f22f5f4def",
+        "bin/lake": "6f53827dab18010d6c690d14c8401cacabc1db958edb3552a877ed4cf1dd995d",
+        "bin/ld.lld": "d32d5121d96810b624306e48faacc75e41f7302ad0e4865be63c3bbf8f4cd810",
+        "bin/lean": "e8baaa71855a616dc351028f3ad2200051b0671f423a1696a100e809302d5550",
+        "bin/leanc": "68a45f8329e2d79133cdcc7b1fa494e37844282d7b5f8908ce1deda7cfdf161a",
+        "bin/leanchecker": "ccef1bfe9bfeecea65137d94a69033c1a89f360711f50fa3178e7ba3e696fcbe",
+        "bin/leanir": "ccfab978605f2b346cc8b82374917468aa6bc02498337b0013737dec2cb194e9",
+        "bin/leanmake": "07c96082b95fce057ed9656cc80da50477d596250973cfdd414f74e7631eb56d",
+        "bin/leantar": "06d613dffd2a6fd996b095bfd835c2bb720886f9eb7e13ed2adddd7df4507bf3",
+        "bin/llvm-ar": "697c4da3ff7080716bf591ddf38d02fb093f3173e12188ddd4243304228004ad",
+        "lib/lean/libInit_shared.so": "07f8c1156271ab6ec36c14c3031b5572329325d5f73dde3e89a1615d88f4e5cb",
+        "lib/lean/libLake_shared.so": "ef0eb8942cd68ffb61ae573850a7181f70860580959e296c6e1a0e31ec50a38a",
+        "lib/lean/libleanshared.so": "6b30cc963d065fc9d2f87f7e9cbe0682b23000ae5425bccd769c5d477fa74f13",
+        "lib/lean/libleanshared_1.so": "69e900c025f40bf05c14f5b9ec48071b3130e34c96a7c45ee2eb5b6f307e19e6",
+        "lib/lean/libleanshared_2.so": "38d0a03750b2e8d51161885ad597a8b4f6d3b85215c5a52aecd2b3753273cf3f",
+    },
+}
+#: Executables whose `DT_NEEDED` x `DT_RUNPATH`/`DT_RPATH` resolution is checked
+#: together with every locked `lib/lean/*.so*`: the Lean-runtime programs (`leanc`
+#: also runs in `--fast` mode). `clang`, `ld.lld`, `llvm-ar` and `cadical` are
+#: digest-pinned only; their closure is the release's own (unpinned) top-level `lib/`.
+LEAN_RELEASE_RUNPATH_BINARIES = ("bin/lean", "bin/lake", "bin/leanc", "bin/leanchecker", "bin/leanir")
+_SHARED_OBJECT_NAME = re.compile(r"\.so(\.[0-9]+)*\Z")
+_LEAN_RUNTIME_SONAME = re.compile(r"\A(libleanshared|libInit_shared|libLake_shared).*\.so(\.[0-9]+)*\Z")
+#: glibc / loader sonames the Lean runtime lists in `DT_NEEDED`: ld.so searches the
+#: toolchain `DT_RUNPATH` before the system directories, so a copy planted in `lib/`
+#: or `lib/lean/` would be loaded into every Lean process.
+_GLIBC_SONAME = re.compile(
+    r"\A(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|ld-linux[\w.\-]*\.so(\.[0-9]+)*)\Z"
+)
+#: glibc `is_dst`: `$ORIGIN` / `${ORIGIN}` is a dynamic string token only when not
+#: followed by an identifier character (`$ORIGINX/lib` stays a CWD-relative literal).
+_ORIGIN_DST = re.compile(r"\$(?:\{ORIGIN\}|ORIGIN(?![A-Za-z0-9_]))")
+
+#: Upstream identity of the vendored `proofs-rs/lean-miri` sources (same values as
+#: `LOCKED_UPSTREAM_IDENTITY` in `scripts/verify_lean_miri_pin.py`).
+LOCKED_LEAN_MIRI_PIN = {
+    "schema_version": 2,
+    "repository": "https://github.com/proofs-rs/lean-miri.git",
+    "commit": "c92d1d9754c9dd585b6b9d6949ae67e5e4665d6a",
+    "upstream_lean_toolchain": "leanprover/lean4:v4.35.0",
+    "build_lean_toolchain": TOOLCHAIN,
+    "upstream_pins": {
+        "miri_commit": "7fa591d7d4dd9af8154becbc8332f8096f8323b1",
+        "rustc_commit": "8144389c895da997dbdecaa635e41d6a50be6ffd",
+        "rustc_apfloat_commit": "eeaacad81247af65d4043cb3e32d023a652d7951",
+        "aes_commit": "c1534361e7549e29a16c3505f45a04c92d26b62a",
+        "source_lock_sha256": "371f3b91e61ff027121b9706a15aac9b6f272ef1cb5ce0d150707a9cf8883873",
+    },
+    "vendor_tree.file_count": 608,
+    "vendor_tree.manifest_sha256": "081747a37a96c7443997ba12b02565f45c9642dd0dec9e3dcb3a30e7053c8d16",
+    "upstream_git_objects": {
+        "Miri": "ef473f04eed9bbfed474a7b5f6f91a2f6350c41b",
+        "Miri.lean": "4c2b87b06a1786f369cc6ae26e94b3cc72652d85",
+        "LICENSE-APACHE": "1b5ec8b78e237b5c3b3d812a7c0a6589d0f7161d",
+        "LICENSE-MIT": "31aa79387f27e730e33d871925e152e35e428031",
+        "tools/check_implementation_ledger.py": "e1879ecc717b1ec24d8f4d51fa84835693b6d69b",
+        "tools/check_semantic_sources.py": "7a9d8f8628d536ac3eab665c578fa7901c3efb09",
+        "upstream/.pins/aes.commit": "2aadc7ac8eb1930b6dbdf28d4c6443f805038d6a",
+        "upstream/.pins/miri.commit": "3dff1349544fc7ef71be7266ee7437817efa0b18",
+        "upstream/.pins/rustc.commit": "60438fb681c3b95d7163a689a5e2cb0d54cc1ef3",
+        "upstream/.pins/rustc_apfloat.commit": "e3e2ad8b3762b9b9dffa17c6ec9f9ad3544d54f5",
+        "upstream/source-lock.json": "503d1c21ca5096c1cdbec40d235da58c1f12efd0",
+    },
+}
+#: The reviewed Episode 1 `deinitMovedPlace` overlay (`[adv ep1-A4]`): the only
+#: accepted `patched_files`, entry for entry (same table as
+#: `LOCKED_DEINIT_PATCHED_FILES` in `scripts/verify_lean_miri_pin.py`).
+LOCKED_DEINIT_PATCHED_FILES = {
+    "Miri/Interpreter/Call.lean": {
+        "upstream_sha256": "4f84e6562232130ab86a9ea057a63e8f1a57c17daef2f91d2bb9ca6251fb0287",
+        "patched_sha256": "315de29e02fc5b8d4d0a7e1ef6a0bbfe29e83ea51e4c3f21977776298bfaa470",
+        "upstream_git_blob": "1de0bbe80a2620c98cdc9371d7400db9f4a775bd",
+    },
+    "Miri/Interpreter/Cast.lean": {
+        "upstream_sha256": "34d19a23f5128f4d00301bc3d9655e0b8a1e83c4877ae8adf188ddba57952661",
+        "patched_sha256": "b602d3c23ab8c0ef333747cdb50566aa3ea9dc9cab43fe33aae901ca51488157",
+        "upstream_git_blob": "787f482061f213dade377a0a360637bc7a3ed0c3",
+    },
+    "Miri/Interpreter/ExecutionCalls.lean": {
+        "upstream_sha256": "0e401e0f72d5ac5dcb13ebb794e2e2affe742f25a8557fd68a4440dc15cf33d8",
+        "patched_sha256": "1bbd8cf0553ae0560c8e3ecc57d70bee3aeec70ee854ed3b25cb7caa55bb5c58",
+        "upstream_git_blob": "512a0af720bfab4b1cb36f9ad1cc31c29fa9f53a",
+    },
+    "Miri/Interpreter/ExecutionCast.lean": {
+        "upstream_sha256": "037c6660d02ec418bc48a12f5465c322c8e9ddd666f7e8d2edbd2bdade54298b",
+        "patched_sha256": "59a329b3c016e80c94cfcea915f57ddecfe1c4bffcb06e3ae82bc3c41964ce2f",
+        "upstream_git_blob": "67f877548d3a5d2c600b5e144a58b91c4aed16bc",
+    },
+    "Miri/Interpreter/ExecutionMachine.lean": {
+        "upstream_sha256": "e601f25d2c9c87014984ec580979cb8d8beb052b4c7c63507b1d98c7098a8796",
+        "patched_sha256": "8cfa22538b2e34e74b157b1e3b138d9fded41f8d237985a23082ffdf2b4d15b1",
+        "upstream_git_blob": "66048728edfdb3295f3cfcefb97b041236715bfa",
+    },
+    "Miri/Interpreter/LocalAccess.lean": {
+        "upstream_sha256": "051fe91f8ceee3bcb583332585dfdfe19187db5e4d8d9dc4cb9a552430d9d0eb",
+        "patched_sha256": "9f416048aa310ef9690433935789e4b34c4725be902da0398c5f9c0dcde3b574",
+        "upstream_git_blob": "7a032dfea7048c153c07f263cfb88e19ccf9ac22",
+    },
+    "Miri/Interpreter/MachineHooks.lean": {
+        "upstream_sha256": "1df4df7ce4fbc696360b4a7ba0bf4bc921c6b91ed3793cb6c234eb826b8dad36",
+        "patched_sha256": "59df22918a063cac09fd12dba087a03a86a19e7d201c79a9ddac550acb9b15b4",
+        "upstream_git_blob": "673eabdf0fbee9a4ea6b08311973c0b5469cb222",
+    },
+    "Miri/Interpreter/OperandMachine.lean": {
+        "upstream_sha256": "ee81c3890c4c8ac0e3e8812b7e5754855c80716c8d5d262157dec3866d00d9a5",
+        "patched_sha256": "77e437f1e43abb55e0116faab37035033f229870b3883920dbd2c174d6e20c99",
+        "upstream_git_blob": "579beda13592aad81242dea8b9a4d86201e29a92",
+    },
+    "Miri/Interpreter/Place.lean": {
+        "upstream_sha256": "75ed68eb91c983532dcf3184bf590e32993aef961c2f709051b7d1844bb0b9ab",
+        "patched_sha256": "b57b04136b40c0c01c85e69c48fbffb9dc6944098cf791715f7e93740df24ddd",
+        "upstream_git_blob": "327fd613c9852fef27d764e591060d6a335ca191",
+    },
+    "Miri/Interpreter/PlaceMachine.lean": {
+        "upstream_sha256": "573ff212da394ad9ec43f2f7010b1d6f3050dfcc218785168a66a0ebdc804e96",
+        "patched_sha256": "7b0211bdaf8dfcc8761b67b322ffc86da57ece261d4a57c2c35ff7b30a9c8250",
+        "upstream_git_blob": "1b3e5cedb4ad98392086ef6867f156a15a74ef5f",
+    },
+}
+_LEAN_MIRI_PIN_KEYS = frozenset({
+    "schema_version", "repository", "commit", "upstream_lean_toolchain", "build_lean_toolchain",
+    "upstream_pins", "notes", "upstream_git_objects", "vendor_tree", "vendor_aux_files", "patched_files",
+})
+_PATCHED_ENTRY_KEYS = frozenset({"path", "upstream_sha256", "patched_sha256", "upstream_git_blob", "patch_reason"})
+_VENDOR_ARTIFACT_SUFFIXES = (".olean", ".ilean", ".ir", ".c", ".ltar", ".hash", ".trace", ".o", ".a", ".so",
+                             ".dylib", ".dll", ".exe", ".pyc", ".pyo")
+_VENDOR_ARTIFACT_INFIXES = (".olean.", ".ilean.", ".so.")
+_VENDOR_ARTIFACT_DIRS = frozenset({".lake", "lake-packages", "__pycache__", ".git"})
+_VENDOR_PATH = re.compile(r"[A-Za-z0-9_.+\-]+(?:/[A-Za-z0-9_.+\-]+)*")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _summarize(problems: list[str]) -> str:
+    more = f" (+{len(problems) - _PREFLIGHT_MAX_SHOWN} more)" if len(problems) > _PREFLIGHT_MAX_SHOWN else ""
+    return f"{len(problems)} problem(s): " + "; ".join(problems[:_PREFLIGHT_MAX_SHOWN]) + more
+
+
+def _unsafe_mode(st: os.stat_result) -> str | None:
+    if st.st_mode & stat.S_IWOTH:
+        return "world-writable"
+    if st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+        return "setuid/setgid"
+    return None
+
+
+def _hash_nofollow(path: Path, expect: os.stat_result | None = None, *, git_blob: bool = False,
+                   limit: int | None = None) -> tuple[str, str | None, bytes | None]:
+    """`(sha256, git blob id or None, bytes or None)` of a regular file opened with
+    `O_NOFOLLOW` (so a symlink swapped in after `lstat` raises), re-checked with `fstat`
+    against `expect`. `limit` keeps (and bounds) the file bytes for small inputs."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("not a regular file")
+        if expect is not None and (st.st_dev, st.st_ino) != (expect.st_dev, expect.st_ino):
+            raise ValueError("file was replaced while it was being verified")
+        if limit is not None and st.st_size > limit:
+            raise ValueError(f"larger than {limit} bytes")
+        sha = hashlib.sha256()
+        blob = hashlib.sha1(b"blob %d\0" % st.st_size) if git_blob else None
+        kept: list[bytes] | None = [] if limit is not None else None
+        total = 0
+        while chunk := os.read(fd, _PREFLIGHT_CHUNK):
+            total += len(chunk)
+            sha.update(chunk)
+            if blob is not None:
+                blob.update(chunk)
+            if kept is not None:
+                kept.append(chunk)
+        if total != st.st_size:
+            raise ValueError("file changed size while it was being hashed")
+    finally:
+        os.close(fd)
+    return sha.hexdigest(), (blob.hexdigest() if blob is not None else None), (b"".join(kept) if kept is not None else None)
+
+
+#: In-process memo of toolchain digests keyed by `(path, st_dev, st_ino, st_size,
+#: st_mtime_ns, st_ctime_ns)`. Only files whose mtime and ctime predate the hash by more
+#: than `_DIGEST_MEMO_SETTLE_NS` are memoized (git's "racy timestamp" rule): any later
+#: write moves ctime past the recorded value even on filesystems with coarse timestamps,
+#: so a memo hit cannot mask a modification. It only matters to processes that admit
+#: the same toolchain repeatedly (`--self-test`); a gate run hashes every file once.
+_DIGEST_MEMO: dict[tuple, str] = {}
+_DIGEST_MEMO_SETTLE_NS = 2_000_000_000
+
+
+def _memo_sha256(path: Path, st: os.stat_result) -> str:
+    key = (str(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    cached = _DIGEST_MEMO.get(key)
+    if cached is not None:
+        return cached
+    started = time.time_ns()
+    sha = _hash_nofollow(path, st)[0]
+    if max(st.st_mtime_ns, st.st_ctime_ns) < started - _DIGEST_MEMO_SETTLE_NS:
+        _DIGEST_MEMO[key] = sha
+    return sha
+
+
+def _canonical_relpath_problem(name: object) -> str | None:
+    """Why `name` is not a canonical checkout-relative POSIX path (None when it is)."""
+    if not isinstance(name, str) or not name:
+        return "is not a non-empty string"
+    if name.startswith("/"):
+        return "is absolute"
+    if "\\" in name or "\0" in name:
+        return "contains a backslash or NUL byte"
+    if any(part in ("", ".", "..") for part in name.split("/")):
+        return "is not canonical (empty, '.' or '..' component)"
+    return None
+
+
+def _symlink_free_problem(base: Path, rel: str, *, want_dir: bool = False) -> str | None:
+    """Why `base/rel` is not a regular file (`want_dir`: a real directory) reached from
+    `base` without any symlink component (None when it is)."""
+    parts = rel.split("/")
+    for index in range(1, len(parts) + 1):
+        sub = "/".join(parts[:index])
+        try:
+            st = os.lstat(base.joinpath(*parts[:index]))
+        except OSError as error:
+            return f"is missing or unreadable ({sub}: {error.strerror})"
+        if stat.S_ISLNK(st.st_mode):
+            return f"is reached through a symlink ({sub})"
+        if index < len(parts) or want_dir:
+            if not stat.S_ISDIR(st.st_mode):
+                return f"is not a directory ({sub})"
+        elif not stat.S_ISREG(st.st_mode):
+            return "is not a regular file"
+    return None
+
+
+def _host_platform() -> tuple[str, str]:
+    system = "linux" if sys.platform.startswith("linux") else sys.platform
+    machine = os.uname().machine if hasattr(os, "uname") else ""
+    return system, machine
+
+
+def _le(data: bytes, offset: int, size: int, *, signed: bool = False) -> int:
+    if offset < 0 or offset + size > len(data):
+        raise ValueError("truncated ELF structure")
+    return int.from_bytes(data[offset:offset + size], "little", signed=signed)
+
+
+def elf_dynamic_info(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """`(DT_NEEDED sonames, DT_RPATH + DT_RUNPATH components)` of a 64-bit little-endian
+    ELF object, or None without ELF magic (e.g. a shell script); malformed or unsupported
+    ELF objects raise ValueError (same contract as `elf_dynamic_info` in
+    `scripts/verify_lean_miri_pin.py`, written without `struct`). Only the headers, the
+    PT_INTERP / PT_DYNAMIC segments and the referenced dynamic strings are read (the
+    dynamic string table of `libleanshared.so` alone is ~24 MiB). Empty RUNPATH
+    components are kept: glibc's `fillin_rpath` searches the current directory for them."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    with os.fdopen(os.open(path, flags), "rb") as fh:
+        size = os.fstat(fh.fileno()).st_size
+        ehdr = fh.read(64)
+        if ehdr[:4] != b"\x7fELF":
+            return None
+        if len(ehdr) < 64 or ehdr[4] != 2 or ehdr[5] != 1:
+            raise ValueError("unsupported ELF object (only complete ELF64 little-endian headers are parsed)")
+        phoff, phentsize, phnum = _le(ehdr, 0x20, 8), _le(ehdr, 0x36, 2), _le(ehdr, 0x38, 2)
+        if phentsize < 56 or phnum > 4096:
+            raise ValueError("malformed ELF program header table")
+        if phoff + phentsize * phnum > size:
+            raise ValueError("truncated ELF program header table")
+        fh.seek(phoff)
+        phdrs = fh.read(phentsize * phnum)
+        if len(phdrs) < phentsize * phnum:
+            raise ValueError("truncated ELF program header table")
+        loads: list[tuple[int, int, int]] = []
+        dynamic: tuple[int, int] | None = None
+        interp: tuple[int, int] | None = None
+        for index in range(phnum):
+            base = index * phentsize
+            p_type = _le(phdrs, base, 4)
+            p_offset, p_vaddr, p_filesz = _le(phdrs, base + 8, 8), _le(phdrs, base + 16, 8), _le(phdrs, base + 32, 8)
+            if p_type == 1:  # PT_LOAD
+                if p_offset + p_filesz > size:
+                    raise ValueError("PT_LOAD segment overruns EOF")
+                loads.append((p_vaddr, p_offset, p_filesz))
+            elif p_type == 2:  # PT_DYNAMIC
+                if dynamic is not None:
+                    raise ValueError("more than one PT_DYNAMIC segment")
+                dynamic = (p_offset, p_filesz)
+            elif p_type == 3:  # PT_INTERP
+                if interp is not None:
+                    raise ValueError("more than one PT_INTERP segment")
+                if p_filesz == 0 or p_filesz > 4096 or p_offset + p_filesz > size:
+                    raise ValueError("malformed or truncated PT_INTERP segment")
+                interp = (p_offset, p_filesz)
+        if interp is not None:
+            fh.seek(interp[0])
+            raw = fh.read(interp[1])
+            if not raw.endswith(b"\0") or b"\0" in raw[:-1]:
+                raise ValueError("unterminated or embedded-NUL PT_INTERP path")
+            interp_path = raw[:-1].decode("utf-8", "surrogateescape")
+            if not interp_path.startswith("/") or ".." in interp_path.split("/"):
+                raise ValueError(f"invalid PT_INTERP path {interp_path!r}")
+            if dynamic is None:
+                raise ValueError("PT_INTERP present without PT_DYNAMIC")
+        if dynamic is None:
+            return (), ()
+        if dynamic[1] > (1 << 20):
+            raise ValueError("oversized PT_DYNAMIC segment")
+        fh.seek(dynamic[0])
+        raw = fh.read(dynamic[1])
+        if len(raw) < dynamic[1]:
+            raise ValueError("truncated PT_DYNAMIC segment")
+        entries: list[tuple[int, int]] = []
+        strtab = strsz = None
+        for offset in range(0, len(raw) - 15, 16):
+            tag, value = _le(raw, offset, 8, signed=True), _le(raw, offset + 8, 8)
+            if tag == 0:  # DT_NULL
+                break
+            entries.append((tag, value))
+            if tag == 5:  # DT_STRTAB (virtual address)
+                strtab = value
+            elif tag == 10:  # DT_STRSZ
+                strsz = value
+        if strtab is None or strsz is None:
+            if any(tag in (1, 15, 29) for tag, _ in entries):
+                raise ValueError("DT_NEEDED/DT_RUNPATH present without DT_STRTAB/DT_STRSZ")
+            return (), ()
+        table = None
+        for vaddr, offset, filesz in loads:
+            if vaddr <= strtab < vaddr + filesz:
+                if strtab + strsz > vaddr + filesz:
+                    raise ValueError("DT_STRTAB/DT_STRSZ overruns its PT_LOAD segment")
+                table = strtab - vaddr + offset
+                break
+        if table is None:
+            raise ValueError("DT_STRTAB is not inside a PT_LOAD segment")
+
+        def string_at(index: int) -> str:
+            if index >= strsz:
+                raise ValueError("dynamic string index out of DT_STRSZ bounds")
+            fh.seek(table + index)
+            chunk = fh.read(min(4096, strsz - index))
+            end = chunk.find(b"\0")
+            if end < 0:
+                raise ValueError("unterminated (or > 4 KiB) dynamic string")
+            return chunk[:end].decode("utf-8", "surrogateescape")
+
+        needed = tuple(string_at(value) for tag, value in entries if tag == 1)  # DT_NEEDED
+        runpath: list[str] = []
+        for tag, value in entries:
+            if tag in (15, 29):  # DT_RPATH, DT_RUNPATH
+                runpath.extend(string_at(value).split(":"))
+    return needed, tuple(runpath)
+
+
+def runpath_shadowing_findings(prefix: Path, elf_rels: list[str], pinned: set[str]) -> list[str]:
+    """Every unpinned toolchain file that ld.so could load, through a DT_RUNPATH/DT_RPATH
+    directory, for a DT_NEEDED soname of an object in `elf_rels` (empty when none).
+
+    Over-approximates glibc: every RUNPATH/RPATH directory of every object is searched
+    for every DT_NEEDED soname of every object, so the verdict is independent of entry
+    order, DT_RUNPATH-over-DT_RPATH precedence and DT_RPATH inheritance. Entries follow
+    glibc's `fillin_rpath` / `is_dst`: an empty component (the current directory), a
+    `$` other than a `$ORIGIN` / `${ORIGIN}` DST, a relative result, or a directory
+    resolving outside the toolchain root is rejected; a DT_NEEDED path is rejected."""
+    problems: list[str] = []
+    real_root = os.path.realpath(prefix)
+    needs: list[tuple[str, str]] = []
+    search_dirs: list[Path] = []
+    for rel in elf_rels:
+        path = prefix / rel
+        try:
+            info = elf_dynamic_info(path)
+        except (OSError, ValueError) as error:
+            problems.append(f"cannot parse the ELF dynamic section of {rel}: {error}")
+            continue
+        if info is None:
+            continue
+        needed, runpath = info
+        origin = str(path.parent)
+        for entry in runpath:
+            if entry == "":
+                problems.append(f"{rel}: empty DT_RUNPATH/DT_RPATH component (glibc ld.so searches the current working directory)")
+                continue
+            if "$" in _ORIGIN_DST.sub("", entry):
+                problems.append(f"{rel}: unsupported DT_RUNPATH entry {entry!r}")
+                continue
+            expanded = _ORIGIN_DST.sub(lambda _match: origin, entry)
+            if not expanded.startswith("/"):
+                problems.append(f"{rel}: unsupported DT_RUNPATH entry {entry!r}")
+                continue
+            real = os.path.realpath(expanded)
+            if real != real_root and not real.startswith(real_root + os.sep):
+                problems.append(f"{rel}: DT_RUNPATH entry {entry!r} resolves outside the toolchain root")
+                continue
+            directory = Path(os.path.normpath(expanded))
+            if directory not in search_dirs:
+                search_dirs.append(directory)
+        for soname in needed:
+            if "/" in soname or soname in ("", ".", ".."):
+                problems.append(f"{rel}: DT_NEEDED entry {soname!r} is a path")
+                continue
+            needs.append((rel, soname))
+    for rel, soname in needs:
+        for directory in search_dirs:
+            hit = directory / soname
+            if os.path.lexists(hit):
+                hit_rel = os.path.relpath(hit, prefix).replace(os.sep, "/")
+                if hit_rel not in pinned:
+                    problems.append(f"RUNPATH shadowing: {rel} needs {soname!r}, which ld.so can resolve to the unpinned toolchain file {hit_rel}")
+    return problems
+
+
+def lean_release_findings(prefix: Path, release: dict | None = None) -> list[str]:
+    """Pre-execution problems of the toolchain installed at `prefix` against `release`
+    (default `LOCKED_LEAN_RELEASE`); empty when it is admitted. Nothing is executed.
+
+    `bin/`, `lib/` and `lib/lean/` must be real directories; the `bin/*` entries and the
+    `lib/lean/*.so*` shared objects must be exactly the release's (no added
+    `libleanshared_3.so` / `libleanshared_evil.so`, no deleted `libleanshared_2.so`),
+    each a regular non-symlink, non-world-writable, non-setuid/setgid file with the
+    locked SHA-256; glibc and Lean-runtime sonames planted in the `lib/` / `lib/lean/`
+    RUNPATH directories are rejected; and `runpath_shadowing_findings` must find nothing
+    for the release's Lean-runtime ELF objects."""
+    release = LOCKED_LEAN_RELEASE if release is None else release
+    files: dict[str, str] = release["files"]
+    problems: list[str] = []
+    for rel in ("bin", "lib", "lib/lean"):
+        try:
+            st = os.lstat(prefix / rel)
+        except OSError as error:
+            problems.append(f"{rel}/ is missing or unreadable in the toolchain: {error.strerror}")
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            problems.append(f"{rel}/ is a symlink or not a directory (symlinks below the toolchain prefix are forbidden)")
+        elif st.st_mode & stat.S_IWOTH:
+            problems.append(f"{rel}/ is world-writable")
+    if problems:
+        return problems
+    listing: dict[str, list[str]] = {}
+    for directory in ("bin", "lib", "lib/lean"):
+        try:
+            listing[directory] = sorted(entry.name for entry in os.scandir(prefix / directory))
+        except OSError as error:
+            problems.append(f"cannot list {directory}/ in the toolchain: {error.strerror}")
+            listing[directory] = []
+    on_disk = {f"bin/{name}" for name in listing["bin"]}
+    on_disk |= {f"lib/lean/{name}" for name in listing["lib/lean"] if _SHARED_OBJECT_NAME.search(name)}
+    expected = {rel for rel in files if rel.startswith(("bin/", "lib/lean/"))}
+    for rel in sorted(on_disk - expected):
+        problems.append(f"unpinned toolchain file added: {rel}")
+    for rel in sorted(expected - on_disk):
+        problems.append(f"pinned toolchain file deleted: {rel}")
+    regular_files: set[str] = set()
+    for rel in sorted(on_disk & expected):
+        path = prefix / rel
+        try:
+            st = os.lstat(path)
+        except OSError as error:
+            problems.append(f"cannot inspect {rel}: {error.strerror}")
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                target = os.readlink(path)
+            except OSError:
+                target = "?"
+            problems.append(f"symlink forbidden: {rel} -> {target}")
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            problems.append(f"{rel} is not a regular file")
+            continue
+        regular_files.add(rel)
+        unsafe = _unsafe_mode(st)
+        if unsafe is not None:
+            problems.append(f"{rel} is {unsafe}")
+            continue
+        try:
+            actual = _memo_sha256(path, st)
+        except (OSError, ValueError) as error:
+            problems.append(f"cannot hash {rel}: {error}")
+            continue
+        if actual != files[rel]:
+            problems.append(f"SHA-256 mismatch for {rel}: locked {files[rel]}, actual {actual}")
+    for directory in ("lib", "lib/lean"):
+        for name in listing[directory]:
+            if directory == "lib" and _LEAN_RUNTIME_SONAME.match(name):
+                problems.append(f"RUNPATH shadowing library in lib/ (shadows lib/lean/): lib/{name}")
+            if _GLIBC_SONAME.match(name):
+                problems.append(f"system soname planted in a toolchain RUNPATH directory: {directory}/{name}")
+    elf_rels = [rel for rel in sorted(regular_files)
+                if rel in LEAN_RELEASE_RUNPATH_BINARIES or rel.startswith("lib/lean/")]
+    problems += runpath_shadowing_findings(prefix, elf_rels, expected)
+    return problems
+
+
+def admit_lean_before_execution(selected: Path, lean: Path, lock: dict) -> str:
+    """Admit the Lean executable before its first execution (the `--version` probe).
+
+    `selected` is the path as given (already `regular()`), `lean` its resolution. The
+    executable must sit in a real (non-symlink) `bin/` directory, must not be
+    world-writable or setuid/setgid, and its SHA-256 must be one of the foundation
+    lock's distributions -- so a trojaned `bin/lean` is rejected before it runs. When it
+    is the locked x86_64 Linux release (selected by that digest, or by an elan
+    `leanprover--lean4---v4.34.1` directory on an x86_64 Linux host),
+    `lean_release_findings` must also admit every companion executable, every Lean
+    shared library and the DT_RUNPATH resolution. Raises `Failure(2, "toolchain")`;
+    returns the SHA-256 of `lean`."""
+    phase = TOOLCHAIN_PHASE
+    try:
+        bin_st, lean_st = os.lstat(selected.parent), os.lstat(lean)
+    except OSError as error:
+        raise Failure(2, phase, f"cannot inspect {selected}: {error}") from error
+    if stat.S_ISLNK(bin_st.st_mode) or not stat.S_ISDIR(bin_st.st_mode):
+        raise Failure(2, phase, f"{selected.parent} is a symlink or not a directory "
+                                "(symlinks below the toolchain prefix are forbidden); nothing was executed")
+    if not stat.S_ISREG(lean_st.st_mode):
+        raise Failure(2, phase, f"{lean} is not a regular file; nothing was executed")
+    unsafe = _unsafe_mode(lean_st)
+    if unsafe is not None:
+        raise Failure(2, phase, f"refusing to execute {lean}: it is {unsafe}")
+    try:
+        lean_sha = _memo_sha256(lean, lean_st)
+    except (OSError, ValueError) as error:
+        raise Failure(2, phase, f"cannot hash {lean}: {error}") from error
+    if lean_sha not in set(lock["distributions"].values()):
+        raise Failure(2, phase, f"unsupported toolchain distribution/launcher bytes: SHA-256 {lean_sha} of {lean} "
+                                "is not a foundation-lock distribution; it was not executed")
+    release = LOCKED_LEAN_RELEASE
+    prefix = lean.parent.parent
+    if lean_sha == release["files"]["bin/lean"] or (
+            release["directory"] in (selected.parent.parent.name, prefix.name)
+            and _host_platform() == release["platform"]):
+        problems = lean_release_findings(prefix, release)
+        if problems:
+            raise Failure(2, phase, f"pre-execution toolchain admission of {prefix} failed (nothing was executed); "
+                                    + _summarize(problems))
+    return lean_sha
+
+
+def verify_root_manifest(checkout: Path) -> dict:
+    """Verify `trusted/root-manifest.sha256` (when present) before any Lean process.
+
+    The manifest must be a regular, non-empty file reached without symlinks, made of
+    `sha256sum` lines (`#` comments and blank lines allowed; the format
+    `ci/update_root_manifest.py` refreshes) naming at least one canonical relative path,
+    each at most once and never the manifest itself; every covered file must be a
+    regular file reached without symlinks whose SHA-256 matches. Raises
+    `Failure(1, "root-manifest")`. Returns `{"sha256": ..., "coveredFiles": n}`, or {}
+    when the checkout has no manifest (the `test_boundary.py` fixtures)."""
+    phase = ROOT_MANIFEST_PHASE
+    if not os.path.lexists(checkout / ROOT_MANIFEST_RELPATH):
+        return {}
+    problem = _symlink_free_problem(checkout, ROOT_MANIFEST_RELPATH)
+    if problem is not None:
+        raise Failure(1, phase, f"{ROOT_MANIFEST_RELPATH} {problem}")
+    try:
+        manifest_sha, _, data = _hash_nofollow(checkout / ROOT_MANIFEST_RELPATH, limit=1 << 20)
+    except (OSError, ValueError) as error:
+        raise Failure(1, phase, f"cannot read {ROOT_MANIFEST_RELPATH}: {error}") from error
+    assert data is not None
+    problems: list[str] = []
+    covered: dict[str, str] = {}
+    for number, line in enumerate(data.splitlines(keepends=True), 1):
+        if line.startswith(b"#") or not line.strip():
+            continue
+        match = re.fullmatch(rb"([0-9a-f]{64})( [ *])([^\r\n]+)(\r?\n)?", line)
+        if match is None:
+            problems.append(f"line {number}: malformed checksum entry")
+            continue
+        try:
+            name = match[3].decode("utf-8")
+        except UnicodeDecodeError:
+            problems.append(f"line {number}: path is not UTF-8")
+            continue
+        bad = _canonical_relpath_problem(name)
+        if bad is not None:
+            problems.append(f"line {number}: covered path {name!r} {bad}")
+        elif name == ROOT_MANIFEST_RELPATH:
+            problems.append(f"line {number}: the manifest cannot cover itself")
+        elif name in covered:
+            problems.append(f"line {number}: duplicate covered file {name}")
+        else:
+            covered[name] = match[1].decode("ascii")
+    if not covered and not problems:
+        problems.append("contains no checksum entries")
+    for name, expected in covered.items():
+        bad = _symlink_free_problem(checkout, name)
+        if bad is not None:
+            problems.append(f"covered file {name} {bad}")
+            continue
+        try:
+            actual = _hash_nofollow(checkout / name)[0]
+        except (OSError, ValueError) as error:
+            problems.append(f"cannot hash covered file {name}: {error}")
+            continue
+        if actual != expected:
+            problems.append(f"SHA-256 mismatch for {name}: manifest {expected}, actual {actual}")
+    if problems:
+        raise Failure(1, phase, f"{ROOT_MANIFEST_RELPATH}: " + _summarize(problems))
+    return {"sha256": manifest_sha, "coveredFiles": len(covered)}
+
+
+def _strict_json(data: bytes):
+    def pairs(items):
+        out = {}
+        for key, value in items:
+            if key in out:
+                raise ValueError(f"duplicate JSON object key {key!r}")
+            out[key] = value
+        return out
+
+    def constant(name):
+        raise ValueError(f"non-finite JSON number {name}")
+
+    try:
+        return json.loads(data.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant)
+    except RecursionError:
+        raise ValueError("JSON nesting too deep") from None
+
+
+def _pin_file_list(value, *, lean: bool, where: str, problems: list[str]) -> list[tuple[str, str]]:
+    if not isinstance(value, list):
+        problems.append(f"{where} must be a list")
+        return []
+    out: list[tuple[str, str]] = []
+    for index, entry in enumerate(value):
+        label = f"{where}[{index}]"
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
+            problems.append(f"{label} must be an object with exactly the keys path and sha256")
+            continue
+        path, digest_hex = entry["path"], entry["sha256"]
+        bad = _canonical_relpath_problem(path)
+        if bad is None and not _VENDOR_PATH.fullmatch(path):
+            bad = "has characters outside [A-Za-z0-9_.+-]"
+        if bad is not None:
+            problems.append(f"{label}: path {path!r} {bad}")
+        elif path.endswith(".lean") != lean:
+            problems.append(f"{label}: {path!r} belongs in {'vendor_aux_files' if lean else 'vendor_tree.files'}")
+        elif not isinstance(digest_hex, str) or not _HEX64.fullmatch(digest_hex):
+            problems.append(f"{label}: sha256 for {path!r} is not 64 lowercase hex digits")
+        else:
+            out.append((path, digest_hex))
+    return out
+
+
+def _git_tree_id(entries: dict[str, tuple[str, str]]) -> str:
+    """Recursive git tree id of `{relpath: (mode, blob id)}` (directories sort as `name/`)."""
+    root: dict = {}
+    for rel, leaf in entries.items():
+        node = root
+        parts = rel.split("/")
+        for component in parts[:-1]:
+            child = node.setdefault(component, {})
+            if not isinstance(child, dict):
+                raise ValueError(f"path {rel!r} nests below a file")
+            node = child
+        if parts[-1] in node:
+            raise ValueError(f"duplicate tree entry {rel!r}")
+        node[parts[-1]] = leaf
+
+    def tree(node: dict) -> str:
+        items = []
+        for name, child in node.items():
+            raw = name.encode("utf-8")
+            if isinstance(child, dict):
+                items.append((raw + b"/", b"40000 " + raw + b"\0" + bytes.fromhex(tree(child))))
+            else:
+                items.append((raw, child[0].encode("ascii") + b" " + raw + b"\0" + bytes.fromhex(child[1])))
+        body = b"".join(item for _, item in sorted(items))
+        return hashlib.sha1(b"tree %d\0" % len(body) + body).hexdigest()
+
+    return tree(root)
+
+
+def _scan_vendor_tree(root: Path, problems: list[str]) -> tuple[dict[str, os.stat_result], set[str]]:
+    """`os.walk(followlinks=False)` + `lstat` inventory of `lean-miri/vendor/`."""
+    files: dict[str, os.stat_result] = {}
+    dirs: set[str] = set()
+
+    def walk_error(error: OSError) -> None:
+        problems.append(f"cannot scan {error.filename}: {error.strerror}")
+
+    for directory, dirnames, filenames in os.walk(root, followlinks=False, onerror=walk_error):
+        rel_dir = os.path.relpath(directory, root)
+        prefix = "" if rel_dir == "." else rel_dir.replace(os.sep, "/") + "/"
+        kept = []
+        for name in sorted(dirnames):
+            rel = prefix + name
+            try:
+                st = os.lstat(os.path.join(directory, name))
+            except OSError as error:
+                problems.append(f"cannot inspect directory {rel}: {error.strerror}")
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                problems.append(f"symlink forbidden (directory symlink): {rel}")
+            elif not stat.S_ISDIR(st.st_mode):
+                problems.append(f"non-regular entry: {rel}")
+            elif name in _VENDOR_ARTIFACT_DIRS:
+                problems.append(f"planted build artifact directory: {rel}/")
+            else:
+                if st.st_mode & stat.S_IWOTH:
+                    problems.append(f"world-writable directory: {rel}/")
+                dirs.add(rel)
+                kept.append(name)
+        dirnames[:] = kept
+        for name in sorted(filenames):
+            rel = prefix + name
+            try:
+                st = os.lstat(os.path.join(directory, name))
+            except OSError as error:
+                problems.append(f"cannot inspect {rel}: {error.strerror}")
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                problems.append(f"symlink forbidden (file symlink): {rel}")
+            elif not stat.S_ISREG(st.st_mode):
+                problems.append(f"non-regular file (device, FIFO or socket): {rel}")
+            elif name.endswith(_VENDOR_ARTIFACT_SUFFIXES) or any(i in name for i in _VENDOR_ARTIFACT_INFIXES):
+                problems.append(f"planted build artifact: {rel}")
+            else:
+                unsafe = _unsafe_mode(st)
+                if unsafe is not None:
+                    problems.append(f"{unsafe} file: {rel}")
+                files[rel] = st
+    return files, dirs
+
+
+def verify_lean_miri_pin(checkout: Path) -> dict:
+    """Verify `lean-miri/UPSTREAM_PIN.json` and `lean-miri/vendor/` (when either exists)
+    before any Lean process, fail-closed.
+
+    The pin must be strict JSON with exactly the locked keys and the compiled-in upstream
+    identity (`LOCKED_LEAN_MIRI_PIN`: repository, commit, toolchains, `upstream_pins`,
+    every `upstream_git_objects` id, `vendor_tree.file_count` and the recomputed canonical
+    `vendor_tree.manifest_sha256`); `patched_files` must be exactly the reviewed 10-file
+    Episode 1 overlay (`LOCKED_DEINIT_PATCHED_FILES`, entry for entry), with the manifest
+    still pinning the upstream bytes. The vendored tree must be in exact bijection with
+    the pin (no unlisted, missing or symlinked file or directory, no world-writable or
+    setuid/setgid mode, no planted `.olean` / `.ilean` / `.lake/` build artifact); every
+    file must hash to its pinned SHA-256 (patched files to their locked
+    `patched_sha256`), and every locked git blob id and the recursive `Miri` git tree id
+    (`ef473f04...`, recomputed from the vendored bytes and modes with the upstream blob
+    ids substituted for the 10 patched files) must match. Raises
+    `Failure(1, "lean-miri-pin")`; returns `{"sha256": ..., "vendorFiles": ...,
+    "auxFiles": ..., "patchedFiles": 10}`, or {} without `lean-miri/` inputs."""
+    phase = LEAN_MIRI_PIN_PHASE
+    vendor = checkout / LEAN_MIRI_VENDOR_RELPATH
+    if not (os.path.lexists(checkout / LEAN_MIRI_PIN_RELPATH) or os.path.lexists(vendor)):
+        return {}
+    problems: list[str] = []
+
+    def fail() -> Failure:
+        return Failure(1, phase, f"{LEAN_MIRI_PIN_RELPATH} / {LEAN_MIRI_VENDOR_RELPATH}/: " + _summarize(problems))
+
+    for rel, want_dir in ((LEAN_MIRI_VENDOR_RELPATH, True), (LEAN_MIRI_PIN_RELPATH, False)):
+        bad = _symlink_free_problem(checkout, rel, want_dir=want_dir)
+        if bad is not None:
+            problems.append(f"{rel} {bad}")
+    if problems:
+        raise fail()
+    try:
+        pin_sha, _, data = _hash_nofollow(checkout / LEAN_MIRI_PIN_RELPATH, limit=1 << 24)
+        assert data is not None
+        pin = _strict_json(data)
+    except (OSError, ValueError) as error:
+        problems.append(f"cannot read or parse {LEAN_MIRI_PIN_RELPATH}: {error}")
+        raise fail() from error
+    if not isinstance(pin, dict):
+        problems.append("the pin's top level must be a JSON object")
+        raise fail()
+    for key in sorted(_LEAN_MIRI_PIN_KEYS - set(pin)):
+        problems.append(f"missing key {key!r}")
+    for key in sorted(set(pin) - _LEAN_MIRI_PIN_KEYS):
+        problems.append(f"unknown key {key!r}")
+    if type(pin.get("schema_version")) is not int:
+        problems.append("schema_version must be an integer")
+    for key in ("schema_version", "repository", "commit", "upstream_lean_toolchain", "build_lean_toolchain",
+                "upstream_pins", "upstream_git_objects"):
+        if pin.get(key) != LOCKED_LEAN_MIRI_PIN[key]:
+            problems.append(f"{key} {pin.get(key)!r} != locked {LOCKED_LEAN_MIRI_PIN[key]!r}")
+    notes = pin.get("notes")
+    if not isinstance(notes, list) or not all(isinstance(note, str) for note in notes):
+        problems.append("notes must be a list of strings")
+    tree = pin.get("vendor_tree")
+    if not isinstance(tree, dict) or set(tree) != {"file_count", "manifest_sha256", "files"}:
+        problems.append("vendor_tree must be an object with exactly the keys file_count, manifest_sha256 and files")
+        raise fail()
+    lean_entries = _pin_file_list(tree["files"], lean=True, where="vendor_tree.files", problems=problems)
+    aux_entries = _pin_file_list(pin.get("vendor_aux_files"), lean=False, where="vendor_aux_files", problems=problems)
+    if problems:
+        raise fail()
+    folded: dict[str, str] = {}
+    for path, _ in lean_entries + aux_entries:
+        if path.casefold() in folded:
+            problems.append(f"duplicate or case-colliding listed path {path!r} ({folded[path.casefold()]!r})")
+        folded[path.casefold()] = path
+    count = tree["file_count"]
+    if type(count) is not int or count != len(lean_entries) or count != LOCKED_LEAN_MIRI_PIN["vendor_tree.file_count"]:
+        problems.append(f"vendor_tree.file_count {count!r} must equal the {len(lean_entries)} listed files and the locked "
+                        f"{LOCKED_LEAN_MIRI_PIN['vendor_tree.file_count']}")
+    paths = [path for path, _ in lean_entries]
+    if paths != sorted(paths, key=lambda path: (len(path.split("/")) > 1, path.split("/"))):
+        problems.append("vendor_tree.files is not in canonical order (root-level files first, then path-component order)")
+    manifest = hashlib.sha256("".join(f"{sha}  {path}\n" for path, sha in lean_entries).encode("utf-8")).hexdigest()
+    locked_manifest = LOCKED_LEAN_MIRI_PIN["vendor_tree.manifest_sha256"]
+    if manifest != tree["manifest_sha256"] or manifest != locked_manifest:
+        problems.append(f"vendor_tree.manifest_sha256: pinned {tree['manifest_sha256']!r}, recomputed {manifest}, "
+                        f"locked {locked_manifest}")
+    patched = pin.get("patched_files")
+    declared: set[str] = set()
+    if not isinstance(patched, list):
+        problems.append("patched_files must be a list (the reviewed 10-file deinitMovedPlace overlay is required)")
+    else:
+        for index, entry in enumerate(patched):
+            label = f"patched_files[{index}]"
+            if not isinstance(entry, dict) or set(entry) != _PATCHED_ENTRY_KEYS:
+                problems.append(f"{label} must be an object with exactly the keys {sorted(_PATCHED_ENTRY_KEYS)}")
+                continue
+            path = entry["path"]
+            locked = LOCKED_DEINIT_PATCHED_FILES.get(path) if isinstance(path, str) else None
+            if locked is None:
+                problems.append(f"{label}: {path!r} is not in the reviewed 10-file deinitMovedPlace overlay")
+                continue
+            if path in declared:
+                problems.append(f"{label}: duplicate patched_files entry for {path!r}")
+                continue
+            declared.add(path)
+            for key in ("upstream_sha256", "patched_sha256", "upstream_git_blob"):
+                if entry[key] != locked[key]:
+                    problems.append(f"{label}: {key} {entry[key]!r} for {path!r} != reviewed Episode 1 {key} {locked[key]}")
+            if not isinstance(entry["patch_reason"], str) or not entry["patch_reason"].strip():
+                problems.append(f"{label}: patch_reason for {path!r} must be a non-empty string")
+        for path in sorted(set(LOCKED_DEINIT_PATCHED_FILES) - declared):
+            problems.append(f"patched_files is missing the reviewed overlay entry for {path!r}")
+    listed = dict(lean_entries)
+    for path, locked in sorted(LOCKED_DEINIT_PATCHED_FILES.items()):
+        if listed.get(path) != locked["upstream_sha256"]:
+            problems.append(f"vendor_tree entry for {path} must pin the upstream bytes {locked['upstream_sha256']}")
+    if problems:
+        raise fail()
+
+    expected = dict(lean_entries)
+    expected.update(aux_entries)
+    on_disk, on_disk_dirs = _scan_vendor_tree(vendor, problems)
+    for rel in sorted(set(on_disk) - set(expected)):
+        problems.append(f"unlisted {'.lean' if rel.endswith('.lean') else 'auxiliary'} file (not in the pin): {rel}")
+    needed_dirs = {"/".join(rel.split("/")[:i]) for rel in expected for i in range(1, rel.count("/") + 1)}
+    for rel in sorted(on_disk_dirs - needed_dirs):
+        problems.append(f"extraneous directory (contains no pinned file): {rel}/")
+    git_inputs: dict[str, tuple[str, str]] = {}
+    for rel, pinned in sorted(expected.items()):
+        st = on_disk.get(rel)
+        if st is None:
+            problems.append(f"missing pinned file: {rel}")
+            continue
+        try:
+            actual, blob, _ = _hash_nofollow(vendor / rel, st, git_blob=True)
+        except (OSError, ValueError) as error:
+            problems.append(f"cannot hash {rel}: {error}")
+            continue
+        assert blob is not None
+        locked = LOCKED_DEINIT_PATCHED_FILES.get(rel)
+        if locked is not None:
+            if actual != locked["patched_sha256"]:
+                problems.append(f"{rel}: on-disk SHA-256 {actual} != reviewed Episode 1 patched_sha256 {locked['patched_sha256']}")
+            blob = locked["upstream_git_blob"]  # git ids describe the upstream bytes
+        elif actual != pinned:
+            problems.append(f"SHA-256 mismatch for {rel}: pinned {pinned}, on disk {actual}")
+        git_inputs[rel] = ("100755" if st.st_mode & stat.S_IXUSR else "100644", blob)
+    objects = LOCKED_LEAN_MIRI_PIN["upstream_git_objects"]
+    for key, pinned in sorted(objects.items()):
+        if key in expected:
+            if key in git_inputs and git_inputs[key][1] != pinned:
+                problems.append(f"git blob SHA-1 mismatch for {key}: locked {pinned}, recomputed {git_inputs[key][1]}")
+            continue
+        members = [rel for rel in expected if rel.startswith(key + "/")]
+        if not members:
+            problems.append(f"locked git object {key!r} matches no vendored file or directory")
+            continue
+        if any(rel not in git_inputs for rel in members):
+            continue  # already reported as missing or unreadable
+        try:
+            actual_tree = _git_tree_id({rel[len(key) + 1:]: git_inputs[rel] for rel in members})
+        except ValueError as error:
+            problems.append(f"cannot recompute the git tree for {key}/: {error}")
+            continue
+        if actual_tree != pinned:
+            problems.append(f"git tree SHA-1 mismatch for {key}/: locked {pinned}, recomputed {actual_tree}")
+    for rel in sorted(expected):
+        parts = rel.split("/")
+        if not any("/".join(parts[:i]) in objects for i in range(1, len(parts) + 1)):
+            problems.append(f"vendored file {rel} is not covered by a locked git object")
+    if problems:
+        raise fail()
+    return {"sha256": pin_sha, "vendorFiles": len(lean_entries), "auxFiles": len(aux_entries),
+            "patchedFiles": len(declared)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lean", type=Path, help="absolute path to an already installed pinned Lean executable")
@@ -5245,6 +6194,13 @@ def main() -> int:
           f"Waiver pins and annotated-claim vacuity: {staged_lean} staged Lean files, "
           f"{audited.get('rustcCapture', {}).get('rustFiles', 0)} trusted/rustc-capture Rust files\n"
           f"{report['toolchain']}")
+    preflight = report.get("preflight", {})
+    if "rootManifest" in preflight:
+        print(f"Root manifest: {preflight['rootManifest']['coveredFiles']} covered files verified")
+    if "leanMiriPin" in preflight:
+        pin = preflight["leanMiriPin"]
+        print(f"lean-miri vendor pin: {pin['vendorFiles']} .lean + {pin['auxFiles']} auxiliary files with the "
+              f"{pin['patchedFiles']}-file locked deinitMovedPlace overlay verified")
     if report["kernelDeclarations"] == 0:
         print("0 Trusted declarations; no semantics")
     make_tree_writable(checker.stage)

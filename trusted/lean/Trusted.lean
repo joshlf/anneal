@@ -8,6 +8,7 @@ import Trusted.MirAst
 import Trusted.MirSemantics
 import Trusted.Rustc.V2026_08_01.MirSemantics.Machine
 import Trusted.VerificationResult
+import Trusted.Correspondence
 
 namespace Trusted
 

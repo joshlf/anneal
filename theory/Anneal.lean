@@ -22,6 +22,7 @@ import Anneal.MirLiftCore
 import Anneal.MirLiftBench
 import Anneal.SepLogicLenses
 import Anneal.PureLift
+import Anneal.Mir.Correspondence.Claims
 
 namespace Anneal
 
