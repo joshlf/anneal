@@ -17,11 +17,12 @@ use anneal_rustc_capture::{CapturedItemKind, UnitTargetRecord};
 
 use crate::fault_census::{
     CalleeClosure, CensusScanError, FaultCensusReceipt, FaultSite, ItemCoverageInput,
-    MirFaultClass, MultiItemCoverageVerdict, PropertyRegistry, ProtoAggregateKind, ProtoBinOp,
-    ProtoCastKind, ProtoConstValue, ProtoIntrinsic, ProtoMirBody, ProtoOperand, ProtoPlace,
-    ProtoProjectionElem, ProtoRvalue, ProtoStatementKind, ProtoTerminatorKind, ProtoUnOp,
-    ProtoUnwindAction, census_mir_fault_sites, direct_callee_def_paths,
-    parse_lean_mir_module_body_strict, reconcile_multi_item_coverage, reified_fn_def_paths,
+    MirFaultClass, MultiItemCoverageVerdict, ParsedMirModuleMetadata, PropertyRegistry,
+    ProtoAggregateKind, ProtoBinOp, ProtoCastKind, ProtoConstValue, ProtoIntrinsic, ProtoMirBody,
+    ProtoOperand, ProtoPlace, ProtoProjectionElem, ProtoRvalue, ProtoStatementKind,
+    ProtoTerminatorKind, ProtoUnOp, ProtoUnwindAction, census_mir_fault_sites,
+    direct_callee_def_paths, parse_lean_mir_module_metadata_strict, reconcile_multi_item_coverage,
+    reified_fn_def_paths,
 };
 
 /// Structural category of a fault site emitted by the `obligations.rs`
@@ -869,29 +870,37 @@ pub(crate) fn build_batch_callee_closure(
     explicit_external: &[String],
     allow_implicit_external_callees: bool,
 ) -> CalleeClosure {
+    let callee_paths: BTreeSet<String> = callee_bodies.iter().map(|b| b.def_path.clone()).collect();
     let batch_paths: BTreeSet<String> = std::iter::once(subject_body.def_path.clone())
-        .chain(callee_bodies.iter().map(|b| b.def_path.clone()))
+        .chain(callee_paths.iter().cloned())
         .collect();
-    let mut inline_set: BTreeSet<String> =
-        callee_bodies.iter().map(|b| b.def_path.clone()).collect();
+    // `[adv ep1-B3]`: `s.memory.callees` is populated strictly from `defaultCallees`
+    // (`callee_bodies`), NOT `subject_body`! For a strictly verified subject
+    // (`allow_implicit_external_callees == false`), a recursive or mutually recursive
+    // call to `subject_body.def_path` is only inline when `Mir.<Subject>.body` is
+    // actually present in `callee_bodies` (`defaultCallees`), and `explicit_external`
+    // is passed through unfiltered so `reconcile_multi_item_coverage` catches any
+    // contradictory inline+external or subject-as-external declaration.
+    let mut inline_set: BTreeSet<String> = callee_paths;
     let mut external_set: BTreeSet<String> = explicit_external
         .iter()
-        .filter(|p| !batch_paths.contains(p.as_str()))
+        .filter(|p| !allow_implicit_external_callees || !batch_paths.contains(p.as_str()))
         .cloned()
         .collect();
 
-    for body in std::iter::once(subject_body).chain(callee_bodies.iter()) {
-        for callee in direct_callee_def_paths(body)
-            .into_iter()
-            .chain(reified_fn_def_paths(body))
-        {
-            if batch_paths.contains(&callee) {
-                inline_set.insert(callee);
-            } else if allow_implicit_external_callees
-                && !crate::fault_census::is_natively_modeled_converging_call_callee(&callee)
-                && !crate::fault_census::is_natively_modeled_diverging_call_callee(&callee)
+    if allow_implicit_external_callees {
+        for body in std::iter::once(subject_body).chain(callee_bodies.iter()) {
+            for callee in direct_callee_def_paths(body)
+                .into_iter()
+                .chain(reified_fn_def_paths(body))
             {
-                external_set.insert(callee);
+                if batch_paths.contains(&callee) {
+                    inline_set.insert(callee);
+                } else if !crate::fault_census::is_natively_modeled_converging_call_callee(&callee)
+                    && !crate::fault_census::is_natively_modeled_diverging_call_callee(&callee)
+                {
+                    external_set.insert(callee);
+                }
             }
         }
     }
@@ -901,6 +910,92 @@ pub(crate) fn build_batch_callee_closure(
         external_callees: external_set.into_iter().collect(),
         allow_unresolved_indirect_calls: allow_implicit_external_callees,
     }
+}
+
+/// `[adv ep1-B3]` Assemble the deduplicated per-body `ItemCoverageInput` batch for
+/// `(subject_meta, callee_metas)` (handling legitimate self-recursive and mutually
+/// recursive subjects whose own `Mir.<Subject>.body` appears in `defaultCallees`
+/// without falsely triggering duplicate-`def_path` errors while still rejecting
+/// mismatched self-callee bodies, empty `defPath`s, duplicate `defaultCallees`
+/// entries, and unclosed `TraitImplEntry` overrides).
+pub(crate) fn assemble_batch_items_and_check_trait_closure(
+    subject_meta: &ParsedMirModuleMetadata,
+    callee_metas: &[ParsedMirModuleMetadata],
+    closure: &CalleeClosure,
+    dropped_sites: &BTreeSet<FaultSite>,
+) -> (Vec<ItemCoverageInput>, Vec<String>) {
+    let filter_dropped = |sites: Vec<FaultSite>| -> Vec<FaultSite> {
+        sites
+            .into_iter()
+            .filter(|s| !dropped_sites.contains(s))
+            .collect()
+    };
+    let mut extra_reasons = Vec::new();
+    if subject_meta.body.def_path.is_empty() {
+        extra_reasons.push("subject MIR body has an empty `defPath`".to_string());
+    }
+    let mut items = Vec::with_capacity(1 + callee_metas.len());
+    items.push(ItemCoverageInput {
+        def_path: subject_meta.body.def_path.clone(),
+        body: subject_meta.body.clone(),
+        discharged: filter_dropped(emit_obligation_fault_sites_for_body(&subject_meta.body)),
+    });
+
+    let mut seen_callee_paths: BTreeSet<&str> = BTreeSet::new();
+    for callee_meta in callee_metas {
+        if callee_meta.body.def_path.is_empty() {
+            extra_reasons.push("inline callee MIR body in `defaultCallees` has an empty `defPath`".to_string());
+        }
+        if !seen_callee_paths.insert(callee_meta.body.def_path.as_str()) {
+            extra_reasons.push(format!(
+                "duplicate callee def_path `{}` in `defaultCallees`",
+                callee_meta.body.def_path
+            ));
+            continue;
+        }
+        if callee_meta.body.def_path == subject_meta.body.def_path {
+            if callee_meta != subject_meta {
+                extra_reasons.push(format!(
+                    "recursive `defaultCallees` entry for `{}` does not match the subject MIR body",
+                    subject_meta.body.def_path
+                ));
+            }
+            continue;
+        }
+        items.push(ItemCoverageInput {
+            def_path: callee_meta.body.def_path.clone(),
+            body: callee_meta.body.clone(),
+            discharged: filter_dropped(emit_obligation_fault_sites_for_body(&callee_meta.body)),
+        });
+    }
+
+    if !closure.allow_unresolved_indirect_calls {
+        let mut referenced_callees: BTreeSet<String> = BTreeSet::new();
+        for body in std::iter::once(&subject_meta.body).chain(callee_metas.iter().map(|m| &m.body))
+        {
+            referenced_callees.extend(direct_callee_def_paths(body));
+            referenced_callees.extend(reified_fn_def_paths(body));
+        }
+        for meta in std::iter::once(subject_meta).chain(callee_metas.iter()) {
+            for entry in &meta.trait_impls {
+                if referenced_callees.contains(&entry.trait_method_def_path)
+                    && entry.impl_path != entry.trait_method_def_path
+                    && !closure.inline_callees.contains(&entry.impl_path)
+                    && !closure.external_callees.contains(&entry.impl_path)
+                {
+                    let msg = format!(
+                        "[{}] TraitImplEntry for `{}` redirects `lookupCallee` to `{}` which is neither an inline callee nor an external callee in CalleeClosure",
+                        meta.body.def_path, entry.trait_method_def_path, entry.impl_path
+                    );
+                    if !extra_reasons.contains(&msg) {
+                        extra_reasons.push(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    (items, extra_reasons)
 }
 
 /// Alias for [`compute_bundle_fault_census_receipt`] matching the canonical
@@ -932,20 +1027,15 @@ pub fn compute_bundle_fault_census_receipt(
     registry: &PropertyRegistry,
     dropped_sites: &BTreeSet<FaultSite>,
 ) -> Result<(FaultCensusReceipt, MultiItemCoverageVerdict), CensusScanError> {
-    // `[adv ep1-B1]`: enforce the strict `Mir/<Item>.lean` module grammar before
-    // trusting the scanned body (the same entry point as `census_lean_mir_module`).
-    let mut subject_body = parse_lean_mir_module_body_strict(mir_lean_src)?;
-    if subject_body.def_path.is_empty() {
-        subject_body.def_path = bundle.subject.target.def_id.clone();
+    // `[adv ep1-B1]` / `[adv ep1-B3]`: enforce the strict `Mir/<Item>.lean` module
+    // grammar and extract `ContractRole` + `traitImpls` metadata.
+    let subject_meta = parse_lean_mir_module_metadata_strict(mir_lean_src)?;
+    let mut callee_metas = Vec::with_capacity(callee_mir_sources.len());
+    for (_callee_def_id, callee_src) in callee_mir_sources {
+        let cmeta = parse_lean_mir_module_metadata_strict(callee_src)?;
+        callee_metas.push(cmeta);
     }
-    let mut callee_bodies = Vec::with_capacity(callee_mir_sources.len());
-    for (callee_def_id, callee_src) in callee_mir_sources {
-        let mut cbody = parse_lean_mir_module_body_strict(callee_src)?;
-        if cbody.def_path.is_empty() {
-            cbody.def_path = callee_def_id.clone();
-        }
-        callee_bodies.push(cbody);
-    }
+    let callee_bodies: Vec<ProtoMirBody> = callee_metas.iter().map(|m| m.body.clone()).collect();
 
     let filter_dropped = |sites: Vec<FaultSite>| -> Vec<FaultSite> {
         sites
@@ -954,22 +1044,9 @@ pub fn compute_bundle_fault_census_receipt(
             .collect()
     };
 
-    let subject_census = census_mir_fault_sites(&subject_body);
-    let subject_discharged = filter_dropped(emit_obligation_fault_sites_for_body(&subject_body));
-
-    let mut items = Vec::with_capacity(1 + callee_bodies.len());
-    items.push(ItemCoverageInput {
-        def_path: subject_body.def_path.clone(),
-        body: subject_body.clone(),
-        discharged: subject_discharged.clone(),
-    });
-    for callee in &callee_bodies {
-        items.push(ItemCoverageInput {
-            def_path: callee.def_path.clone(),
-            body: callee.clone(),
-            discharged: filter_dropped(emit_obligation_fault_sites_for_body(callee)),
-        });
-    }
+    let subject_census = census_mir_fault_sites(&subject_meta.body);
+    let subject_discharged =
+        filter_dropped(emit_obligation_fault_sites_for_body(&subject_meta.body));
 
     let mut explicit_external: Vec<String> = bundle
         .external_spec_callees
@@ -980,15 +1057,37 @@ pub fn compute_bundle_fault_census_receipt(
     explicit_external.sort();
     explicit_external.dedup();
     let closure = build_batch_callee_closure(
-        &subject_body,
+        &subject_meta.body,
         &callee_bodies,
         &explicit_external,
         bundle.has_rust_trusted_attr(),
     );
 
-    let verdict = reconcile_multi_item_coverage(&items, &closure, registry);
+    let (items, extra_reasons) = assemble_batch_items_and_check_trait_closure(
+        &subject_meta,
+        &callee_metas,
+        &closure,
+        dropped_sites,
+    );
+    let mut verdict = reconcile_multi_item_coverage(&items, &closure, registry);
+    if !extra_reasons.is_empty() {
+        match &mut verdict {
+            MultiItemCoverageVerdict::Verified => {
+                verdict = MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+                    failed_items: Vec::new(),
+                    unsupported_reasons: extra_reasons,
+                };
+            }
+            MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+                unsupported_reasons,
+                ..
+            } => {
+                unsupported_reasons.extend(extra_reasons);
+            }
+        }
+    }
     let receipt = FaultCensusReceipt {
-        def_path: subject_body.def_path,
+        def_path: subject_meta.body.def_path,
         mir_module_sha256: bundle.subject.target.mir_module_sha256.clone(),
         census_sites: subject_census,
         discharged_sites: subject_discharged,

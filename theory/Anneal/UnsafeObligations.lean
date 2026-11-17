@@ -632,6 +632,187 @@ theorem evalRvalue_offset_ne_ub_and_census_of_validSliceRange
   nomatch hUb
 
 /--
+`[adv ep1-B3]` Statement-level bridge theorem tying `evalOperand_deref_of_obligations`
+to `evalOperand ≠ .ub` and `reconcileFaultCoverageWithRegistry` discharge of all
+deref-load and destination-write `MirFaultClass`es at `(blockIdx, stmtIdx)`.
+-/
+theorem evalOperand_deref_reconciled_of_obligations
+    (mem : Memory) (locals : List LocalValue) (dstLocal ptrLocal : Local) (span : String)
+    (blockIdx : BasicBlockIdx) (stmtIdx : Nat)
+    (registry : PropertyRegistry) (discharged : List FaultSite)
+    (rp : RawPtrVal) (sz : Nat) (entry : BorrowEntry) (v : Value)
+    (hPtr : get? locals ptrLocal = some (.init (.ptr rp.toProvenancePtr sz)))
+    (hLookup : lookupBorrow mem.borrows rp.toProvenancePtr.tag = some entry)
+    (hNotDis : entry.perm ≠ .disabled)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? locals entry.targetLocal = some (.init v))
+    (hRec :
+      reconcileFaultCoverageWithRegistry registry
+        (censusStmtFaultSites blockIdx stmtIdx
+          ⟨.assign { local_ := dstLocal, projection := [] }
+            (.use (.copy { local_ := ptrLocal, projection := [.deref] })), span⟩)
+        discharged = .verified) :
+    evalOperand locals (.copy { local_ := ptrLocal, projection := [.deref] })
+      mem.borrows mem.globals ≠ .ub ∧
+    ∀ cls ∈ [MirFaultClass.ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation,
+              .uninitRead, .storageLiveProtected],
+      (blockIdx, stmtIdx, cls) ∈ discharged ∧ registry cls = .emittedAndVerified := by
+  have hNeUb := (evalOperand_deref_ne_ub_and_census_of_obligations
+    mem locals ptrLocal rp sz entry v hPtr hLookup hNotDis hProj hTarget).1
+  refine ⟨hNeUb, ?_⟩
+  intro cls hCls
+  have hInStmt : cls ∈ censusStmtFaultClasses
+      (.assign { local_ := dstLocal, projection := [] }
+        (.use (.copy { local_ := ptrLocal, projection := [.deref] }))) := by
+    have hEq : censusStmtFaultClasses
+        (.assign { local_ := dstLocal, projection := [] }
+          (.use (.copy { local_ := ptrLocal, projection := [.deref] }))) =
+        [.ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation,
+         .scalarNicheInvalid, .uninitRead, .storageLiveProtected] := rfl
+    rw [hEq]
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hCls
+    rcases hCls with rfl | rfl | rfl | rfl | rfl <;> decide
+  have hInSites : (blockIdx, stmtIdx, cls) ∈
+      censusStmtFaultSites blockIdx stmtIdx
+        ⟨.assign { local_ := dstLocal, projection := [] }
+          (.use (.copy { local_ := ptrLocal, projection := [.deref] })), span⟩ := by
+    simp only [censusStmtFaultSites, List.mem_map]
+    exact ⟨cls, hInStmt, rfl⟩
+  exact (reconcileFaultCoverageWithRegistry_verified_iff registry _ discharged).mp
+    hRec (blockIdx, stmtIdx, cls) hInSites
+
+/--
+`[adv ep1-B3]` Statement-level bridge theorem tying `writePlaceValue_deref_of_obligations`
+to `writePlaceValue ≠ .ub` and `reconcileFaultCoverageWithRegistry` discharge of all
+deref-store `MirFaultClass`es at `(blockIdx, stmtIdx)`.
+-/
+theorem writePlaceValue_deref_reconciled_of_obligations
+    (mem : Memory) (locals locals' : List LocalValue) (ptrLocal : Local)
+    (rv : Rvalue) (span : String)
+    (blockIdx : BasicBlockIdx) (stmtIdx : Nat)
+    (registry : PropertyRegistry) (discharged : List FaultSite)
+    (rp : RawPtrVal) (sz : Nat) (entry : BorrowEntry) (oldVal newVal : Value)
+    (hEvalRv : rvalueUnevaluated rv = false)
+    (hPtr : get? locals ptrLocal = some (.init (.ptr rp.toProvenancePtr sz)))
+    (hLookup : lookupBorrow mem.borrows rp.toProvenancePtr.tag = some entry)
+    (hWritable : entry.perm = .active ∨ entry.perm = .reserved)
+    (hProj : entry.targetProjection = [])
+    (hTarget : get? locals entry.targetLocal = some (.init oldVal))
+    (hSet : set? locals entry.targetLocal (.init newVal) = some locals')
+    (hRec :
+      reconcileFaultCoverageWithRegistry registry
+        (censusStmtFaultSites blockIdx stmtIdx
+          ⟨.assign { local_ := ptrLocal, projection := [.deref] } rv, span⟩)
+        discharged = .verified) :
+    writePlaceValue locals mem.borrows { local_ := ptrLocal, projection := [.deref] } newVal ≠ .ub ∧
+    ∀ cls ∈ [MirFaultClass.ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation,
+              .uninitRead, .storageLiveProtected],
+      (blockIdx, stmtIdx, cls) ∈ discharged ∧ registry cls = .emittedAndVerified := by
+  have hNeUb := (writePlaceValue_deref_ne_ub_and_census_of_obligations
+    mem locals locals' ptrLocal rp sz entry oldVal newVal
+    hPtr hLookup hWritable hProj hTarget hSet).1
+  refine ⟨hNeUb, ?_⟩
+  intro cls hCls
+  have hInWrite : cls ∈ censusPlaceWriteFaultClasses
+      { local_ := ptrLocal, projection := [.deref] } := by
+    dsimp only [censusPlaceWriteFaultClasses, censusProjectionElemFaultClasses]
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hCls
+    rcases hCls with rfl | rfl | rfl | rfl | rfl <;> decide
+  have hInStmt : cls ∈ censusStmtFaultClasses
+      (.assign { local_ := ptrLocal, projection := [.deref] } rv) := by
+    dsimp only [censusStmtFaultClasses]
+    rw [hEvalRv, mem_dedupFaultClasses_iff]
+    exact List.mem_append_left _ hInWrite
+  have hInSites : (blockIdx, stmtIdx, cls) ∈
+      censusStmtFaultSites blockIdx stmtIdx
+        ⟨.assign { local_ := ptrLocal, projection := [.deref] } rv, span⟩ := by
+    simp only [censusStmtFaultSites, List.mem_map]
+    exact ⟨cls, hInStmt, rfl⟩
+  exact (reconcileFaultCoverageWithRegistry_verified_iff registry _ discharged).mp
+    hRec (blockIdx, stmtIdx, cls) hInSites
+
+/--
+`[adv ep1-B3]` Statement-level bridge theorem tying `evalRvalue_offset_of_validSliceRange`
+to non-`.ub` statement execution (`¬ StepNodeExposesUb`) and `reconcileFaultCoverageWithRegistry`
+discharge of all pointer-offset and destination-write `MirFaultClass`es at `(blockIdx, stmtIdx)`.
+-/
+theorem evalStmt_offset_reconciled_of_validSliceRange
+    (s : MachineState) (localDecls : List LocalDecl) (dstLocal : Local)
+    (lhsOp rhsOp : Operand) (span : String)
+    (blockIdx : BasicBlockIdx) (stmtIdx : Nat)
+    (registry : PropertyRegistry) (discharged : List FaultSite)
+    (rp : RawPtrVal) (sz delta totalLen : Nat) (locals' : List LocalValue)
+    (hRange : ValidSliceRange rp delta totalLen)
+    (hLhs :
+      evalOperand s.frame.locals lhsOp s.memory.borrows s.memory.globals emptyLayoutTable
+          s.memory.callerLocals localDecls s.memory.callStack =
+        .ok (.ptr rp.toProvenancePtr sz) s.frame.locals)
+    (hRhs :
+      evalOperand s.frame.locals rhsOp s.memory.borrows s.memory.globals emptyLayoutTable
+          s.memory.callerLocals localDecls s.memory.callStack =
+        .ok (.scalar ⟨delta, 8⟩) s.frame.locals)
+    (hStride : pointeeElemByteStride localDecls emptyLayoutTable lhsOp = .some 1)
+    (hOffset :
+      evalBinOpOffset rp.toProvenancePtr sz ⟨delta, 8⟩ 1
+        (ptrAllocByteBound? s.frame.locals s.memory localDecls emptyLayoutTable rp.toProvenancePtr) =
+        .some { rp.toProvenancePtr with
+                offsetBytes := rp.toProvenancePtr.offsetBytes + delta })
+    (hDstSlot : get? s.frame.locals dstLocal = some .uninit)
+    (hSet :
+      set? s.frame.locals dstLocal
+        (.init (.ptr { rp.toProvenancePtr with
+                       offsetBytes := rp.toProvenancePtr.offsetBytes + delta } sz)) =
+        some locals')
+    (hNoProt : s.memory.activeProtectors = [])
+    (hRec :
+      reconcileFaultCoverageWithRegistry registry
+        (censusStmtFaultSites blockIdx stmtIdx
+          ⟨.assign { local_ := dstLocal, projection := [] } (.binaryOp .offset lhsOp rhsOp), span⟩)
+        discharged = .verified) :
+    ¬ StepNodeExposesUb
+        (evalStmt s
+          ⟨.assign { local_ := dstLocal, projection := [] } (.binaryOp .offset lhsOp rhsOp), span⟩
+          localDecls emptyLayoutTable) ∧
+    ValidSliceRange rp delta totalLen ∧
+    ∀ cls ∈ [MirFaultClass.arithOverflow, .boundsCheck, .ptrDerefInvalid,
+              .treeBorrowsViolation, .storageLiveProtected],
+      (blockIdx, stmtIdx, cls) ∈ discharged ∧ registry cls = .emittedAndVerified := by
+  have hRv := (evalRvalue_offset_of_validSliceRange
+    s.frame.locals s.memory localDecls lhsOp rhsOp rp sz delta totalLen
+    hRange hLhs hRhs hStride hOffset).1
+  refine ⟨?_, hRange, ?_⟩
+  · dsimp only [evalStmt]
+    rw [hRv]
+    dsimp only []
+    rw [hDstSlot]
+    dsimp only []
+    rw [hSet]
+    dsimp only []
+    rw [hNoProt]
+    intro hUb
+    nomatch hUb
+  · intro cls hCls
+    have hInStmt : cls ∈ censusStmtFaultClasses
+        (.assign { local_ := dstLocal, projection := [] } (.binaryOp .offset lhsOp rhsOp)) := by
+      dsimp only [censusStmtFaultClasses, rvalueUnevaluated, censusPlaceWriteFaultClasses,
+        censusRvalueFaultClasses, censusBinOpFaultClasses]
+      rw [mem_dedupFaultClasses_iff]
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at hCls
+      rcases hCls with rfl | rfl | rfl | rfl | rfl
+      · exact List.mem_append_right _ (List.mem_append_right _ (by decide))
+      · exact List.mem_append_right _ (List.mem_append_right _ (by decide))
+      · exact List.mem_append_right _ (List.mem_append_right _ (by decide))
+      · exact List.mem_append_left _ (by decide)
+      · exact List.mem_append_left _ (by decide)
+    have hInSites : (blockIdx, stmtIdx, cls) ∈
+        censusStmtFaultSites blockIdx stmtIdx
+          ⟨.assign { local_ := dstLocal, projection := [] } (.binaryOp .offset lhsOp rhsOp), span⟩ := by
+      simp only [censusStmtFaultSites, List.mem_map]
+      exact ⟨cls, hInStmt, rfl⟩
+    exact (reconcileFaultCoverageWithRegistry_verified_iff registry _ discharged).mp
+      hRec (blockIdx, stmtIdx, cls) hInSites
+
+/--
 Bridge theorem tying `evalCopyNonOverlapping_one_of_obligations` to non-`.ub`
 statement execution (`¬ StepNodeExposesUb`) and `reconcileFaultCoverageWithRegistry`
 discharge of the `copyNonOverlapping` intrinsic fault sites at `(blockIdx, stmtIdx)`.

@@ -6536,6 +6536,69 @@ theorem initMachineState_mirStepsInterproc_batch_reconciled_safety
       hBatch hItem hPc hUb with ⟨cls, hInDis, hReg⟩
   exact ⟨discharged, cls, hItem, hInDis, hReg⟩
 
+/--
+`[adv ep1-B3]` Well-formed fail-closed batch reconciler enforcing both per-body census
+reconciliation (`reconcileCoverageBatch`) and structural CFG / generic-callee invariants
+(`cfgTargetsInBounds` and `bodyHasNoParamCallConst`) on every body in `batch`, mirroring
+the verify-time checks in `reconcile_multi_item_coverage` (`crates/cargo-anneal`).
+
+Without `cfgTargetsInBounds`, a body with `basicBlocks = []` has `censusMirBodyFaultSites = []`
+(so `reconcileCoverageBatch` returns `true` even under `unemittedRegistry`), yet
+`stepMirFn` immediately steps to `MirStepNode.fail .ub` at entry PC `(0, 0)`. Similarly,
+an out-of-bounds branch target `t ≥ length body.basicBlocks` steps to PC `(t, 0)` where
+`stepMirFn` faults with `.ub` outside `0 .. length body.basicBlocks - 1`.
+-/
+def reconcileCoverageBatchWellFormed (registry : PropertyRegistry) (batch : CoverageBatch) : Bool :=
+  reconcileCoverageBatch registry batch &&
+  batch.all (fun item => cfgTargetsInBounds item.1 && bodyHasNoParamCallConst item.1)
+
+/--
+`[adv ep1-B3]` Soundness and completeness of `reconcileCoverageBatchWellFormed`.
+-/
+theorem reconcileCoverageBatchWellFormed_iff
+    (registry : PropertyRegistry) (batch : CoverageBatch) :
+    reconcileCoverageBatchWellFormed registry batch = true ↔
+      (batch ≠ [] ∧
+       ∀ item ∈ batch,
+         reconcileFaultCoverageWithRegistry registry
+           (censusMirBodyFaultSites item.1) item.2 = .verified ∧
+         cfgTargetsInBounds item.1 = true ∧
+         bodyHasNoParamCallConst item.1 = true) := by
+  unfold reconcileCoverageBatchWellFormed
+  rw [Bool.and_eq_true, reconcileCoverageBatch_iff, List.all_eq_true]
+  constructor
+  · rintro ⟨⟨hNe, hRec⟩, hWf⟩
+    refine ⟨hNe, fun item hMem => ?_⟩
+    rcases Bool.and_eq_true_iff.mp (hWf item hMem) with ⟨hCfg, hNoParam⟩
+    exact ⟨hRec item hMem, hCfg, hNoParam⟩
+  · rintro ⟨hNe, hAll⟩
+    refine ⟨⟨hNe, fun item hMem => (hAll item hMem).1⟩, fun item hMem => ?_⟩
+    exact Bool.and_eq_true_iff.mpr ⟨(hAll item hMem).2.1, (hAll item hMem).2.2⟩
+
+/--
+`[adv ep1-B3]` Self-contained interprocedural reconciled batch safety under
+`reconcileCoverageBatchWellFormed`: unlike `initMachineState_mirStepsInterproc_batch_reconciled_safety`,
+no external `cfgTargetsInBounds` side-condition is required, and every body in `batch` also
+carries `bodyHasNoParamCallConst = true` for `CapturedMir.instantiate` census invariance.
+-/
+theorem initMachineState_mirStepsInterproc_wellFormed_batch_safety
+    (registry : PropertyRegistry) (batch : CoverageBatch)
+    (body : CapturedMir) (d₀ : List FaultSite) (args : List Value) (s : MachineState)
+    (hBatchWf : reconcileCoverageBatchWellFormed registry batch = true)
+    (hRootMem : (body, d₀) ∈ batch)
+    (hSteps : MirStepsInterproc batch body (initMachineState body args) s)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ (discharged : List FaultSite) (cls : MirFaultClass),
+      (s.memory.activeCallee.getD body, discharged) ∈ batch ∧
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ discharged ∧
+      registry cls = .emittedAndVerified := by
+  have hWf := (reconcileCoverageBatchWellFormed_iff registry batch).mp hBatchWf
+  have hBatch : reconcileCoverageBatch registry batch = true :=
+    (reconcileCoverageBatch_iff registry batch).mpr ⟨hWf.1, fun item hMem => (hWf.2 item hMem).1⟩
+  have hCfg : cfgTargetsInBounds body = true := (hWf.2 (body, d₀) hRootMem).2.1
+  exact initMachineState_mirStepsInterproc_batch_reconciled_safety
+    registry batch body d₀ args s hBatch hRootMem hCfg hSteps hUb
+
 /-! ## 10. Compile-Time Kernel-Checked Witness Bodies & 4 False-Proof Mutation Probes (`0` `native_decide`)
 
 `[adv B1]`: every witness body now declares well-typed `localDecls` for every local
@@ -7406,5 +7469,31 @@ theorem witnessInterproc_call_and_return_nonvacuous :
   refine MirStepsInterproc.stepStmt (s₂ := s₃) rfl rfl rfl rfl (Or.inl rfl) ?_
   exact MirStepsInterproc.returnInline "proto.rs:21:15" rfl rfl
     (MirStepsInterproc.refl _)
+
+/--
+`[adv ep1-B3]` Degenerate MIR body with `basicBlocks = []` demonstrating why
+`reconcileCoverageBatchWellFormed` (and Rust's `reconcile_multi_item_coverage`) must
+enforce `cfgTargetsInBounds`: its syntactic census is empty (`[]`), yet `stepMirFn`
+immediately faults with `MirStepNode.fail .ub` at entry PC `(0, 0)`.
+-/
+def witnessEmptyBlocksBody : CapturedMir :=
+  { witnessPureNoopBody with
+    defPath := "proto::witness_empty_blocks"
+    basicBlocks := List.nil }
+
+/--
+`[adv ep1-B3]` Separation witness for `reconcileCoverageBatchWellFormed`:
+`witnessEmptyBlocksBody` immediately faults with `MirStepNode.fail .ub` from
+`initMachineState` and has an empty syntactic census (`[]`), so `reconcileCoverageBatch`
+accepts it even under `unemittedRegistry`, whereas `reconcileCoverageBatchWellFormed`
+fails closed (`false`) even under `allVerifiedRegistry`.
+-/
+theorem witnessEmptyBlocks_ub_and_wellFormed_batch_rejects :
+    stepMirFn witnessEmptyBlocksBody (initMachineState witnessEmptyBlocksBody []) =
+      MirStepNode.fail .ub ∧
+    censusMirBodyFaultSites witnessEmptyBlocksBody = [] ∧
+    reconcileCoverageBatch unemittedRegistry [(witnessEmptyBlocksBody, [])] = true ∧
+    reconcileCoverageBatchWellFormed allVerifiedRegistry [(witnessEmptyBlocksBody, [])] = false :=
+  ⟨rfl, rfl, rfl, rfl⟩
 
 end Anneal.FaultSiteCensus

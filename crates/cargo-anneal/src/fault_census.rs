@@ -777,6 +777,46 @@ impl ProtoMirBody {
                 _ => true,
             })
     }
+
+    /// `[adv ep1-B3]` `true` iff `self.basic_blocks` is non-empty and every syntactic
+    /// successor block index in every basic block's terminator is
+    /// `< self.basic_blocks.len()`, mirroring `Anneal.FaultSiteCensus.cfgTargetsInBounds`
+    /// 1-to-1.
+    pub fn cfg_targets_in_bounds(&self) -> bool {
+        let num_blocks = self.basic_blocks.len();
+        num_blocks > 0
+            && self.basic_blocks.iter().all(|bb| {
+                terminator_targets(&bb.terminator.kind)
+                    .into_iter()
+                    .all(|t| t < num_blocks)
+            })
+    }
+}
+
+/// `[adv ep1-B3]` Parsed `Trusted.MirAst.ContractRole` tag from a `CapturedMir` record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProtoContractRole {
+    Subject,
+    Model,
+    Requires(String),
+    Ensures(String),
+    ExternalSpec(String),
+}
+
+/// `[adv ep1-B3]` Parsed `Trusted.MirAst.TraitImplEntry` record from `CapturedMir.traitImpls`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProtoTraitImplEntry {
+    pub trait_method_def_path: String,
+    pub impl_path: String,
+}
+
+/// `[adv ep1-B3]` Strictly scanned `Mir/<Item>.lean` `CapturedMir` body together with its
+/// `ContractRole` and `traitImpls` table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedMirModuleMetadata {
+    pub body: ProtoMirBody,
+    pub role: ProtoContractRole,
+    pub trait_impls: Vec<ProtoTraitImplEntry>,
 }
 
 /// Deduplicate and canonically order fault classes by `MirFaultClass::rank` (`0..11`),
@@ -2970,16 +3010,17 @@ impl<'a> TokenCursor<'a> {
         })
     }
 
-    fn parse_captured_mir(&mut self) -> Result<ProtoMirBody, CensusScanError> {
+    fn parse_captured_mir_metadata(&mut self) -> Result<ParsedMirModuleMetadata, CensusScanError> {
         let mut def_path: Option<String> = None;
         let mut has_phase = false;
-        let mut has_role = false;
+        let mut role: Option<ProtoContractRole> = None;
         let mut has_arg_count = false;
         let mut has_local_decls = false;
         let mut basic_blocks: Option<Vec<ProtoBasicBlock>> = None;
         let mut has_fn_abi = false;
         let mut has_layouts = false;
         let mut has_allocations = false;
+        let mut trait_impls: Vec<ProtoTraitImplEntry> = Vec::new();
 
         self.parse_record(|field, cur| {
             match field {
@@ -2991,8 +3032,7 @@ impl<'a> TokenCursor<'a> {
                     has_phase = true;
                 }
                 "role" => {
-                    cur.parse_contract_role()?;
-                    has_role = true;
+                    role = Some(cur.parse_contract_role()?);
                 }
                 "argCount" => {
                     let _ = cur.parse_usize()?;
@@ -3020,8 +3060,11 @@ impl<'a> TokenCursor<'a> {
                 "typeParamCount" => {
                     let _ = cur.parse_usize()?;
                 }
-                "genericParams" | "traitImpls" => {
+                "genericParams" => {
                     let _ = cur.parse_list(|c| c.skip_atomic_expr())?;
+                }
+                "traitImpls" => {
+                    trait_impls = cur.parse_list(|c| c.parse_trait_impl_entry())?;
                 }
                 other => {
                     return Err(CensusScanError::MalformedCapturedMirSyntax(format!(
@@ -3037,9 +3080,13 @@ impl<'a> TokenCursor<'a> {
                 "CapturedMir record is missing required `defPath` field".to_string(),
             )
         })?;
+        let role = role.ok_or_else(|| {
+            CensusScanError::MalformedCapturedMirSyntax(
+                "CapturedMir record is missing required `role` field".to_string(),
+            )
+        })?;
         for (present, name) in [
             (has_phase, "phase"),
-            (has_role, "role"),
             (has_arg_count, "argCount"),
             (has_local_decls, "localDecls"),
             (has_fn_abi, "fnAbi"),
@@ -3058,9 +3105,13 @@ impl<'a> TokenCursor<'a> {
             )
         })?;
 
-        Ok(ProtoMirBody {
-            def_path,
-            basic_blocks,
+        Ok(ParsedMirModuleMetadata {
+            body: ProtoMirBody {
+                def_path,
+                basic_blocks,
+            },
+            role,
+            trait_impls,
         })
     }
 
@@ -3081,25 +3132,84 @@ impl<'a> TokenCursor<'a> {
         })
     }
 
-    fn parse_contract_role(&mut self) -> Result<(), CensusScanError> {
+    fn parse_contract_role(&mut self) -> Result<ProtoContractRole, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
             check_ctor_qualifier(&full, &short, "ContractRole")?;
-            // `[adv ep1-B1]`: exactly the `Trusted.MirAst.ContractRole` constructors
-            // (`subject`, `model`, and the `DefPath`-carrying `requires` / `ensures` /
-            // `externalSpec`); there is no `precondition` constructor.
+            // `[adv ep1-B1]` / `[adv ep1-B3]`: exactly the `Trusted.MirAst.ContractRole`
+            // constructors (`subject`, `model`, and the mandatory `DefPath`-carrying
+            // `requires` / `ensures` / `externalSpec`).
             match short.as_str() {
-                "subject" | "model" => Ok(()),
-                "ensures" | "requires" | "externalSpec" => {
-                    if matches!(cur.peek(), Some(LeanToken::StrLit(_))) {
-                        let _ = cur.parse_string()?;
-                    }
-                    Ok(())
-                }
+                "subject" => Ok(ProtoContractRole::Subject),
+                "model" => Ok(ProtoContractRole::Model),
+                "requires" => Ok(ProtoContractRole::Requires(cur.parse_string()?)),
+                "ensures" => Ok(ProtoContractRole::Ensures(cur.parse_string()?)),
+                "externalSpec" => Ok(ProtoContractRole::ExternalSpec(cur.parse_string()?)),
                 _ => Err(CensusScanError::MalformedCapturedMirSyntax(format!(
                     "unknown ContractRole constructor `{full}`"
                 ))),
             }
+        })
+    }
+
+    fn parse_trait_impl_entry(&mut self) -> Result<ProtoTraitImplEntry, CensusScanError> {
+        let mut trait_method_def_path: Option<String> = None;
+        let mut impl_path: Option<String> = None;
+        self.parse_record(|field, cur| {
+            match field {
+                "traitRef" => {
+                    let mut def_path: Option<String> = None;
+                    let mut has_args = false;
+                    cur.parse_record(|tr_field, tr_cur| {
+                        match tr_field {
+                            "defPath" => {
+                                def_path = Some(tr_cur.parse_string()?);
+                            }
+                            "args" => {
+                                let _ = tr_cur.parse_list(|c| c.skip_atomic_expr())?;
+                                has_args = true;
+                            }
+                            other => {
+                                return Err(CensusScanError::MalformedCapturedMirSyntax(format!(
+                                    "unknown TraitRef field `{other}`"
+                                )));
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    if !has_args {
+                        return Err(CensusScanError::MalformedCapturedMirSyntax(
+                            "TraitRef missing `args` field".to_string(),
+                        ));
+                    }
+                    trait_method_def_path = Some(def_path.ok_or_else(|| {
+                        CensusScanError::MalformedCapturedMirSyntax(
+                            "TraitRef missing `defPath` field".to_string(),
+                        )
+                    })?);
+                }
+                "implPath" => {
+                    impl_path = Some(cur.parse_string()?);
+                }
+                other => {
+                    return Err(CensusScanError::MalformedCapturedMirSyntax(format!(
+                        "unknown TraitImplEntry field `{other}`"
+                    )));
+                }
+            }
+            Ok(())
+        })?;
+        Ok(ProtoTraitImplEntry {
+            trait_method_def_path: trait_method_def_path.ok_or_else(|| {
+                CensusScanError::MalformedCapturedMirSyntax(
+                    "TraitImplEntry missing `traitRef` field".to_string(),
+                )
+            })?,
+            impl_path: impl_path.ok_or_else(|| {
+                CensusScanError::MalformedCapturedMirSyntax(
+                    "TraitImplEntry missing `implPath` field".to_string(),
+                )
+            })?,
         })
     }
 
@@ -3970,8 +4080,15 @@ pub fn parse_lean_captured_mir_def(
     lean_src: &str,
     def_name: &str,
 ) -> Result<ProtoMirBody, CensusScanError> {
+    parse_lean_captured_mir_def_metadata(lean_src, def_name).map(|m| m.body)
+}
+
+fn parse_lean_captured_mir_def_metadata(
+    lean_src: &str,
+    def_name: &str,
+) -> Result<ParsedMirModuleMetadata, CensusScanError> {
     let tokens = tokenize_lean_source(lean_src)?;
-    let mut found_body: Option<ProtoMirBody> = None;
+    let mut found_body: Option<ParsedMirModuleMetadata> = None;
 
     let mut idx = 0;
     let mut delim_depth = 0isize;
@@ -4007,7 +4124,7 @@ pub fn parse_lean_captured_mir_def(
                 tokens: &tokens,
                 pos: idx + 5,
             };
-            let parsed = cursor.parse_captured_mir()?;
+            let parsed = cursor.parse_captured_mir_metadata()?;
             // `[adv B1]`: the record must be the *entire* definition body. Anything
             // applied to it (`|> mutate`, `.withBlocks evil`, `++ extra`) would change
             // the elaborated `CapturedMir` in Lean while being ignored here.
@@ -4289,19 +4406,48 @@ pub fn census_lean_mir_module(lean_src: &str) -> Result<Vec<FaultSite>, CensusSc
 /// commands (constructor shadowing, extra namespaces, macros) make Lean elaborate
 /// a different `CapturedMir` than the one scanned here.
 pub fn parse_lean_mir_module_body_strict(lean_src: &str) -> Result<ProtoMirBody, CensusScanError> {
-    let tokens = tokenize_lean_source(lean_src)?;
-    check_strict_mir_module_grammar(&tokens)?;
-    parse_lean_captured_mir_def(lean_src, "body")
+    parse_lean_mir_module_metadata_strict(lean_src).map(|m| m.body)
 }
 
-/// `[adv ep1-B1]` / `[adv ep1-A1]` / `[adv ep1-A2]` Callee links and claim bindings
-/// declared by a generated `Obligations/<Item>.lean` module, scanned with the
+/// `[adv ep1-B3]` Parse the unique `def body : CapturedMir` together with its
+/// `ContractRole` and `traitImpls` table after enforcing `check_strict_mir_module_grammar`.
+pub fn parse_lean_mir_module_metadata_strict(
+    lean_src: &str,
+) -> Result<ParsedMirModuleMetadata, CensusScanError> {
+    let tokens = tokenize_lean_source(lean_src)?;
+    check_strict_mir_module_grammar(&tokens)?;
+    parse_lean_captured_mir_def_metadata(lean_src, "body")
+}
+
+/// `[adv ep1-B3]` Structured `externalSpecCallContract` binding declared in a generated
+/// `Obligations/<Item>.lean` module (`def <def_ident> : MirCallContract :=
+/// externalSpecCallContract "<target_def_path>" Mir.<sidecar_mir_suffix>.body ...`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalSpecContractLink {
+    pub def_ident: String,
+    pub target_def_path: String,
+    pub sidecar_mir_suffix: String,
+}
+
+/// `[adv ep1-B1]` / `[adv ep1-A1]` / `[adv ep1-A2]` / `[adv ep1-B3]` Callee links and claim
+/// bindings declared by a generated `Obligations/<Item>.lean` module, scanned with the
 /// comment- and string-aware Lean lexer so that text inside `--` / `/- ... -/`
 /// comments or string literals can never add a link or spoof a claim binding.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObligationsCalleeLinks {
     /// Target `DefPath`s bound by `externalSpecCallContract "<target>" ...`.
     pub external_spec_targets: Vec<String>,
+    /// `[adv ep1-B3]` Structured `def <ident> : MirCallContract := externalSpecCallContract ...`
+    /// definitions in the module.
+    pub external_spec_contracts: Vec<ExternalSpecContractLink>,
+    /// `[adv ep1-B3]` Any `externalSpecCallContract` token not bound as the head of a
+    /// canonical `def <ident> : MirCallContract := externalSpecCallContract "<target>" Mir.<sidecar>.body ...`.
+    pub unlinked_external_spec_errors: Vec<String>,
+    /// `[adv ep1-B3]` Contract identifiers referenced via `<ident>.holdsOn` (including
+    /// resolution of `abbrev defaultExternalCallContract : MirCallContract := <ident>`).
+    pub referenced_external_contract_idents: Vec<String>,
+    /// `[adv ep1-B3]` `<Suffix>` module suffixes of `import Mir.<Suffix>` commands.
+    pub imported_mir_suffixes: Vec<String>,
     /// `<Callee>` module suffixes of `import Obligations.<Callee>` commands.
     pub imported_obligation_suffixes: Vec<String>,
     /// `[adv ep1-A2]` `<Callee>` module suffixes referenced via
@@ -4323,15 +4469,16 @@ pub struct ObligationsCalleeLinks {
     /// `implCallees := ...`, or `specCallees := ...` inside a claim record literal
     /// (every entry must be `"defaultCallees"` with no trailing tokens).
     pub claim_callees_bindings: Vec<String>,
-    /// `[adv ep1-A2]` Total number of `body :=` / `implBody :=` claim field bindings.
+    /// `[adv ep1-A2]` / `[adv ep1-B3]` Expected callee-table field count implied by
+    /// `body :=` (+1) and `implBody :=` (+2, for `implCallees` and `specCallees` on
+    /// `StatefulEquivClaim`).
     pub claim_body_field_count: usize,
-    /// `[adv ep1-A2]` Total number of `callees :=` / `implCallees :=` claim field
-    /// bindings (must equal `claim_body_field_count` so no claim record can omit
-    /// `callees := defaultCallees` or construct a `Claim` via positional `Claim.mk`).
+    /// `[adv ep1-A2]` / `[adv ep1-B3]` Total number of `callees :=`, `implCallees :=`,
+    /// and `specCallees :=` claim field bindings.
     pub claim_callees_field_count: usize,
 }
 
-/// `[adv ep1-B1]` / `[adv ep1-A1]` / `[adv ep1-A2]` Scan a generated
+/// `[adv ep1-B1]` / `[adv ep1-A1]` / `[adv ep1-A2]` / `[adv ep1-B3]` Scan a generated
 /// `Obligations/<Item>.lean` module for its callee links and claim bindings (see
 /// [`ObligationsCalleeLinks`]), failing closed on any lexer error.
 pub fn scan_obligations_callee_links(
@@ -4384,21 +4531,89 @@ pub fn scan_obligations_callee_links(
         }
         k
     };
+
+    let mut linked_ext_contract_positions: BTreeSet<usize> = BTreeSet::new();
+    let mut default_ext_alias_target: Option<String> = None;
+    let mut raw_holds_on_refs: Vec<String> = Vec::new();
+    let mut top_depth = 0isize;
+    for idx in 0..tokens.len() {
+        let cur_depth = top_depth;
+        match tokens[idx] {
+            LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => top_depth += 1,
+            LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                top_depth = (top_depth - 1).max(0);
+            }
+            _ => {}
+        }
+        if cur_depth != 0 {
+            continue;
+        }
+        if let (
+            Some(LeanToken::Ident(kw)),
+            Some(LeanToken::Ident(def_ident)),
+            Some(LeanToken::Colon),
+            Some(LeanToken::Ident(ty)),
+            Some(LeanToken::ColonEq),
+        ) = (
+            tokens.get(idx),
+            tokens.get(idx + 1),
+            tokens.get(idx + 2),
+            tokens.get(idx + 3),
+            tokens.get(idx + 4),
+        ) {
+            let is_mir_call_contract =
+                ty == "MirCallContract" || ty == "Trusted.VerificationResult.MirCallContract";
+            if kw == "def"
+                && is_mir_call_contract
+                && matches!(tokens.get(idx + 5), Some(LeanToken::Ident(fn_id)) if fn_id == "externalSpecCallContract")
+                && let Some(LeanToken::StrLit(target)) = tokens.get(idx + 6)
+                && let Some(LeanToken::Ident(sidecar_expr)) = tokens.get(idx + 7)
+                && let Some(sidecar_suffix) = sidecar_expr
+                    .strip_prefix("Mir.")
+                    .and_then(|s| s.strip_suffix(".body"))
+                    .filter(|s| !s.is_empty())
+            {
+                linked_ext_contract_positions.insert(idx + 5);
+                links.external_spec_contracts.push(ExternalSpecContractLink {
+                    def_ident: def_ident.clone(),
+                    target_def_path: target.clone(),
+                    sidecar_mir_suffix: sidecar_suffix.to_string(),
+                });
+            } else if kw == "abbrev"
+                && def_ident == "defaultExternalCallContract"
+                && is_mir_call_contract
+                && let Some(LeanToken::Ident(alias_target)) = tokens.get(idx + 5)
+            {
+                default_ext_alias_target = Some(alias_target.clone());
+            }
+        }
+    }
+
     for (idx, tok) in tokens.iter().enumerate() {
         let LeanToken::Ident(ident) = tok else {
             continue;
         };
-        match (ident.as_str(), tokens.get(idx + 1)) {
-            ("externalSpecCallContract", Some(LeanToken::StrLit(target))) => {
+        if ident == "externalSpecCallContract" {
+            if let Some(LeanToken::StrLit(target)) = tokens.get(idx + 1) {
                 push_unique(&mut links.external_spec_targets, target);
             }
+            if !linked_ext_contract_positions.contains(&idx) {
+                links.unlinked_external_spec_errors.push(format!(
+                    "unlinked or malformed `externalSpecCallContract` expression near {:?}",
+                    tokens.get(idx + 1)
+                ));
+            }
+        }
+        match (ident.as_str(), tokens.get(idx + 1)) {
             ("import", Some(LeanToken::Ident(module))) => {
                 if let Some(suffix) = module.strip_prefix("Obligations.") {
                     push_unique(&mut links.imported_obligation_suffixes, suffix);
+                } else if let Some(suffix) = module.strip_prefix("Mir.") {
+                    push_unique(&mut links.imported_mir_suffixes, suffix);
                 }
             }
             ("body" | "implBody", Some(LeanToken::ColonEq)) => {
-                links.claim_body_field_count += 1;
+                links.claim_body_field_count += if ident == "implBody" { 2 } else { 1 };
                 let end = find_field_rhs_end(idx + 2);
                 let rhs_slice = &tokens[idx + 2..end];
                 match rhs_slice {
@@ -4432,9 +4647,7 @@ pub fn scan_obligations_callee_links(
                 }
             }
             ("callees" | "implCallees" | "specCallees", Some(LeanToken::ColonEq)) => {
-                if ident == "callees" || ident == "implCallees" {
-                    links.claim_callees_field_count += 1;
-                }
+                links.claim_callees_field_count += 1;
                 let end = find_field_rhs_end(idx + 2);
                 let rhs_slice = &tokens[idx + 2..end];
                 match rhs_slice {
@@ -4457,32 +4670,654 @@ pub fn scan_obligations_callee_links(
         if let Some(callee) = extract_callee_contract(ident) {
             push_unique(&mut links.referenced_callee_contracts, callee);
         }
+        if let Some(stem) = ident.strip_suffix(".holdsOn")
+            && extract_callee_contract(ident).is_none()
+        {
+            let short = stem.rsplit('.').next().unwrap_or(stem);
+            if !short.is_empty() {
+                push_unique(&mut raw_holds_on_refs, short);
+            }
+        }
+    }
+    for r in raw_holds_on_refs {
+        if r == "defaultExternalCallContract" {
+            if let Some(ref target_ident) = default_ext_alias_target {
+                push_unique(&mut links.referenced_external_contract_idents, target_ident);
+            }
+        } else {
+            push_unique(&mut links.referenced_external_contract_idents, &r);
+        }
     }
     Ok(links)
 }
 
-/// `[adv ep1-A1]` Parse the `def defaultCallees : List CapturedMir := ...` table of a
-/// generated `Obligations/<Item>.lean` module using the comment- and string-aware Lean
-/// lexer (`tokenize_lean_source`), returning the `Mir.<Callee>` module suffixes it links
-/// into `s.memory.callees`.
+/// `[adv ep1-B3]` Verify that a generated `Obligations/<Item>.lean` module defines every
+/// canonical monomorphic, equivalence, instantiated (`*For`), and polymorphic (`poly*`)
+/// claim for `subject_suffix` with exact `{ ... }` record syntax (no positional
+/// `Claim.mk` / `⟨...⟩` constructors, no `{ ... with ... }` record updates, no missing or
+/// shadowed claim declarations, and exact `Mir.<subject_suffix>.body` + `defaultCallees`
+/// bindings on every claim).
+pub fn validate_obligations_canonical_claims(
+    ob_text: &str,
+    subject_suffix: &str,
+) -> Result<(), String> {
+    const CANONICAL_NAMES: &[&str] = &[
+        "claim",
+        "statefulClaim",
+        "totalClaim",
+        "equivClaim",
+        "modularClaim",
+        "ubExceptionClaim",
+        "claimFor",
+        "statefulClaimFor",
+        "totalClaimFor",
+        "modularClaimFor",
+        "ubExceptionClaimFor",
+        "polyClaim",
+        "polyStatefulClaim",
+        "polyTotalClaim",
+        "polyModularClaim",
+        "polyUbExceptionClaim",
+    ];
+    let tokens = tokenize_lean_source(ob_text)
+        .map_err(|err| format!("failed to tokenize Obligations module for {subject_suffix}: {err}"))?;
+    let expected_ns = format!("Obligations.{subject_suffix}");
+    let mut ns_opens = 0usize;
+    let mut ns_closes = 0usize;
+    let mut claim_defs: BTreeMap<String, Vec<LeanToken>> = BTreeMap::new();
+
+    let mut idx = 0usize;
+    let mut depth = 0isize;
+    while idx < tokens.len() {
+        let cur_depth = depth;
+        match tokens[idx] {
+            LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+            LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                depth = (depth - 1).max(0);
+            }
+            _ => {}
+        }
+        if cur_depth != 0 {
+            idx += 1;
+            continue;
+        }
+        let LeanToken::Ident(kw) = &tokens[idx] else {
+            idx += 1;
+            continue;
+        };
+        match kw.as_str() {
+            "namespace" => {
+                match tokens.get(idx + 1) {
+                    Some(LeanToken::Ident(ns)) if ns == &expected_ns => ns_opens += 1,
+                    other => {
+                        return Err(format!(
+                            "unexpected `namespace {other:?}` in Obligations module for {subject_suffix}"
+                        ));
+                    }
+                }
+            }
+            "end" => {
+                match tokens.get(idx + 1) {
+                    Some(LeanToken::Ident(ns)) if ns == &expected_ns => ns_closes += 1,
+                    other => {
+                        return Err(format!(
+                            "unexpected `end {other:?}` in Obligations module for {subject_suffix}"
+                        ));
+                    }
+                }
+            }
+            "axiom" | "opaque" | "macro" | "macro_rules" | "syntax" | "notation" | "elab"
+            | "local" | "unsafe" | "partial" => {
+                return Err(format!(
+                    "disallowed top-level `{kw}` command in Obligations module for {subject_suffix}"
+                ));
+            }
+            "private" | "protected" | "noncomputable" => {
+                if let Some(LeanToken::Ident(next_name)) = tokens.get(idx + 2)
+                    && CANONICAL_NAMES.contains(&next_name.as_str())
+                {
+                    return Err(format!(
+                        "`{kw}` modifier on canonical claim `{next_name}` in Obligations module for {subject_suffix}"
+                    ));
+                }
+            }
+            "abbrev" | "theorem" | "lemma" | "instance" | "structure" | "inductive" | "class" => {
+                if let Some(LeanToken::Ident(name)) = tokens.get(idx + 1)
+                    && CANONICAL_NAMES.contains(&name.as_str())
+                {
+                    return Err(format!(
+                        "canonical claim `{name}` shadowed as `{kw}` in Obligations module for {subject_suffix}"
+                    ));
+                }
+            }
+            "def" => {
+                if let Some(LeanToken::Ident(name)) = tokens.get(idx + 1)
+                    && CANONICAL_NAMES.contains(&name.as_str())
+                {
+                    if claim_defs.contains_key(name) {
+                        return Err(format!(
+                            "duplicate `def {name}` in Obligations module for {subject_suffix}"
+                        ));
+                    }
+                    let mut j = idx + 2;
+                    let mut sig_depth = 0isize;
+                    while j < tokens.len() {
+                        if sig_depth == 0 {
+                            if tokens[j] == LeanToken::ColonEq {
+                                break;
+                            }
+                            if is_lean_command_start(&tokens[j]) {
+                                return Err(format!(
+                                    "`def {name}` has no `:=` body in Obligations module for {subject_suffix}"
+                                ));
+                            }
+                        }
+                        match tokens[j] {
+                            LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => {
+                                sig_depth += 1;
+                            }
+                            LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                                sig_depth = (sig_depth - 1).max(0);
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if j >= tokens.len() {
+                        return Err(format!(
+                            "`def {name}` has no `:=` body in Obligations module for {subject_suffix}"
+                        ));
+                    }
+                    let rhs_start = j + 1;
+                    let mut k = rhs_start;
+                    let mut rhs_depth = 0isize;
+                    while k < tokens.len() {
+                        if rhs_depth == 0 && is_lean_command_start(&tokens[k]) {
+                            break;
+                        }
+                        match tokens[k] {
+                            LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => {
+                                rhs_depth += 1;
+                            }
+                            LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                                rhs_depth = (rhs_depth - 1).max(0);
+                            }
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    claim_defs.insert(name.clone(), tokens[rhs_start..k].to_vec());
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    if ns_opens != 1 || ns_closes != 1 {
+        return Err(format!(
+            "Obligations module for {subject_suffix} must contain a single `namespace {expected_ns} ... end {expected_ns}` block"
+        ));
+    }
+
+    let check_record_claim =
+        |def_name: &str, expected_fields: &[(&str, Vec<LeanToken>)]| -> Result<(), String> {
+            let rhs = claim_defs.get(def_name).ok_or_else(|| {
+                format!(
+                    "missing canonical `def {def_name}` in Obligations module for {subject_suffix}"
+                )
+            })?;
+            if rhs.len() < 2
+                || rhs.first() != Some(&LeanToken::LBrace)
+                || rhs.last() != Some(&LeanToken::RBrace)
+            {
+                return Err(format!(
+                    "canonical `def {def_name}` in Obligations module for {subject_suffix} must be a `{{ ... }}` record literal (positional constructors and trailing expressions are forbidden)"
+                ));
+            }
+            let mut bal = 0isize;
+            for (pos, t) in rhs.iter().enumerate() {
+                match t {
+                    LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => bal += 1,
+                    LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => bal -= 1,
+                    _ => {}
+                }
+                if bal <= 0 && pos + 1 < rhs.len() {
+                    return Err(format!(
+                        "canonical `def {def_name}` in Obligations module for {subject_suffix} has trailing tokens after closing `}}`"
+                    ));
+                }
+            }
+            if bal != 0 {
+                return Err(format!(
+                    "unbalanced delimiters in `def {def_name}` of Obligations module for {subject_suffix}"
+                ));
+            }
+            let inner = &rhs[1..rhs.len() - 1];
+            let mut fields: BTreeMap<String, Vec<LeanToken>> = BTreeMap::new();
+            let mut p = 0usize;
+            while p < inner.len() {
+                let Some(LeanToken::Ident(fname)) = inner.get(p) else {
+                    return Err(format!(
+                        "unexpected token {:?} in record literal of `def {def_name}` for {subject_suffix}",
+                        inner.get(p)
+                    ));
+                };
+                if fname == "with" {
+                    return Err(format!(
+                        "struct-update `with` syntax is forbidden in `def {def_name}` for {subject_suffix}"
+                    ));
+                }
+                if inner.get(p + 1) != Some(&LeanToken::ColonEq) {
+                    return Err(format!(
+                        "expected `:=` after field `{fname}` in `def {def_name}` for {subject_suffix} (struct-update syntax is forbidden)"
+                    ));
+                }
+                let val_start = p + 2;
+                let mut q = val_start;
+                let mut fdepth = 0isize;
+                while q < inner.len() {
+                    if fdepth == 0 {
+                        if matches!(inner[q], LeanToken::Comma | LeanToken::Semicolon) {
+                            break;
+                        }
+                        if q > val_start
+                            && matches!(inner.get(q), Some(LeanToken::Ident(_)))
+                            && inner.get(q + 1) == Some(&LeanToken::ColonEq)
+                        {
+                            break;
+                        }
+                        if matches!(&inner[q], LeanToken::Ident(w) if w == "with") {
+                            return Err(format!(
+                                "struct-update `with` syntax is forbidden in `def {def_name}` for {subject_suffix}"
+                            ));
+                        }
+                    }
+                    match inner[q] {
+                        LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => fdepth += 1,
+                        LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                            fdepth = (fdepth - 1).max(0);
+                        }
+                        _ => {}
+                    }
+                    q += 1;
+                }
+                if fields.contains_key(fname) {
+                    return Err(format!(
+                        "duplicate field `{fname}` in `def {def_name}` for {subject_suffix}"
+                    ));
+                }
+                fields.insert(fname.clone(), inner[val_start..q].to_vec());
+                p = if matches!(inner.get(q), Some(LeanToken::Comma | LeanToken::Semicolon)) {
+                    q + 1
+                } else {
+                    q
+                };
+            }
+            for (req_name, req_val) in expected_fields {
+                match fields.get(*req_name) {
+                    Some(actual) if actual == req_val => {}
+                    Some(actual) => {
+                        return Err(format!(
+                            "canonical `def {def_name}` in Obligations module for {subject_suffix} binds `{req_name} := {actual:?}` instead of `{req_val:?}`"
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "canonical `def {def_name}` in Obligations module for {subject_suffix} omits required field `{req_name}`"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        };
+
+    let mir_body_tok = vec![LeanToken::Ident(format!("Mir.{subject_suffix}.body"))];
+    let mir_inst_tok = vec![
+        LeanToken::Ident(format!("Mir.{subject_suffix}.body.instantiate")),
+        LeanToken::Ident("typeArgs".to_string()),
+    ];
+    let default_callees_tok = vec![LeanToken::Ident("defaultCallees".to_string())];
+
+    for mono_name in [
+        "claim",
+        "statefulClaim",
+        "totalClaim",
+        "modularClaim",
+        "ubExceptionClaim",
+    ] {
+        check_record_claim(
+            mono_name,
+            &[
+                ("body", mir_body_tok.clone()),
+                ("callees", default_callees_tok.clone()),
+            ],
+        )?;
+    }
+    check_record_claim(
+        "equivClaim",
+        &[
+            ("implBody", mir_body_tok),
+            ("implCallees", default_callees_tok.clone()),
+            ("specCallees", default_callees_tok.clone()),
+        ],
+    )?;
+    for inst_name in [
+        "claimFor",
+        "statefulClaimFor",
+        "totalClaimFor",
+        "modularClaimFor",
+        "ubExceptionClaimFor",
+    ] {
+        check_record_claim(
+            inst_name,
+            &[
+                ("body", mir_inst_tok.clone()),
+                ("callees", default_callees_tok.clone()),
+            ],
+        )?;
+    }
+
+    let expected_tp_count = format!("Mir.{subject_suffix}.body.typeParamCount");
+    for (poly_name, cert_short, claim_for_name) in [
+        ("polyClaim", "VerificationResult", "claimFor"),
+        (
+            "polyStatefulClaim",
+            "StatefulVerificationResult",
+            "statefulClaimFor",
+        ),
+        ("polyTotalClaim", "TotalVerificationResult", "totalClaimFor"),
+        (
+            "polyModularClaim",
+            "ModularVerificationResult",
+            "modularClaimFor",
+        ),
+        (
+            "polyUbExceptionClaim",
+            "UbExceptionVerificationResult",
+            "ubExceptionClaimFor",
+        ),
+    ] {
+        let rhs = claim_defs.get(poly_name).ok_or_else(|| {
+            format!(
+                "missing canonical `def {poly_name}` in Obligations module for {subject_suffix}"
+            )
+        })?;
+        let poly_ok = match rhs.as_slice() {
+            [
+                LeanToken::Ident(forall_kw),
+                LeanToken::LParen,
+                LeanToken::Ident(ta1),
+                LeanToken::Colon,
+                LeanToken::Ident(ts_ty),
+                LeanToken::RParen,
+                LeanToken::Comma,
+                LeanToken::Ident(ta_len),
+                LeanToken::Ident(eq_op),
+                LeanToken::Ident(mir_tp),
+                LeanToken::Ident(arrow_op),
+                LeanToken::Ident(cert_ty),
+                LeanToken::LParen,
+                LeanToken::Ident(cf_name),
+                LeanToken::Ident(ta2),
+                LeanToken::RParen,
+            ] => {
+                let short_cert = cert_ty
+                    .strip_prefix("Trusted.VerificationResult.")
+                    .unwrap_or(cert_ty.as_str());
+                (forall_kw == "∀" || forall_kw == "forall")
+                    && ta1 == "typeArgs"
+                    && (ts_ty == "Trusted.MirAst.TypeSubst" || ts_ty == "TypeSubst")
+                    && ta_len == "typeArgs.length"
+                    && eq_op == "="
+                    && mir_tp == &expected_tp_count
+                    && (arrow_op == "→" || arrow_op == "->")
+                    && short_cert == cert_short
+                    && cf_name == claim_for_name
+                    && ta2 == "typeArgs"
+            }
+            _ => false,
+        };
+        if !poly_ok {
+            return Err(format!(
+                "canonical `def {poly_name}` in Obligations module for {subject_suffix} does not wrap `({claim_for_name} typeArgs)` in `{cert_short}`"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// `[adv ep1-B3]` Verify that `.anneal/generated/Verify/<Item>.lean` defines a single
+/// `theorem verified` inside `namespace Verify.<subject_suffix>` whose statement proves
+/// one of the canonical `Obligations.<subject_suffix>` certificate types (and introduces
+/// no `axiom`, `opaque`, `macro`, `elab`, or `notation` commands).
+pub fn validate_verify_module_certificate(
+    verify_text: &str,
+    subject_suffix: &str,
+) -> Result<(), String> {
+    let tokens = tokenize_lean_source(verify_text)
+        .map_err(|err| format!("failed to tokenize Verify module for {subject_suffix}: {err}"))?;
+    let expected_ns = format!("Verify.{subject_suffix}");
+    let mut ns_opens = 0usize;
+    let mut ns_closes = 0usize;
+    let mut verified_types: Vec<Vec<LeanToken>> = Vec::new();
+
+    let mut idx = 0usize;
+    let mut depth = 0isize;
+    while idx < tokens.len() {
+        let cur_depth = depth;
+        match tokens[idx] {
+            LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+            LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                depth = (depth - 1).max(0);
+            }
+            _ => {}
+        }
+        if cur_depth != 0 {
+            idx += 1;
+            continue;
+        }
+        let LeanToken::Ident(kw) = &tokens[idx] else {
+            idx += 1;
+            continue;
+        };
+        match kw.as_str() {
+            "namespace" => match tokens.get(idx + 1) {
+                Some(LeanToken::Ident(ns)) if ns == &expected_ns => ns_opens += 1,
+                other => {
+                    return Err(format!(
+                        "unexpected `namespace {other:?}` in Verify module for {subject_suffix}"
+                    ));
+                }
+            },
+            "end" => match tokens.get(idx + 1) {
+                Some(LeanToken::Ident(ns)) if ns == &expected_ns => ns_closes += 1,
+                other => {
+                    return Err(format!(
+                        "unexpected `end {other:?}` in Verify module for {subject_suffix}"
+                    ));
+                }
+            },
+            "axiom" | "opaque" | "macro" | "macro_rules" | "syntax" | "notation" | "elab"
+            | "local" | "unsafe" | "partial" => {
+                return Err(format!(
+                    "disallowed top-level `{kw}` command in Verify module for {subject_suffix}"
+                ));
+            }
+            "def" | "abbrev" | "lemma" | "instance" => {
+                if matches!(tokens.get(idx + 1), Some(LeanToken::Ident(n)) if n == "verified") {
+                    return Err(format!(
+                        "`verified` declared as `{kw}` instead of `theorem` in Verify module for {subject_suffix}"
+                    ));
+                }
+            }
+            "theorem" => {
+                if matches!(tokens.get(idx + 1), Some(LeanToken::Ident(n)) if n == "verified") {
+                    if tokens.get(idx + 2) != Some(&LeanToken::Colon) {
+                        return Err(format!(
+                            "`theorem verified` in Verify module for {subject_suffix} must have an explicit `: <CertificateType> :=` signature without binders"
+                        ));
+                    }
+                    let ty_start = idx + 3;
+                    let mut j = ty_start;
+                    let mut tdepth = 0isize;
+                    while j < tokens.len() {
+                        if tdepth == 0 {
+                            if tokens[j] == LeanToken::ColonEq {
+                                break;
+                            }
+                            if is_lean_command_start(&tokens[j]) {
+                                return Err(format!(
+                                    "`theorem verified` has no `:=` proof body in Verify module for {subject_suffix}"
+                                ));
+                            }
+                        }
+                        match tokens[j] {
+                            LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => {
+                                tdepth += 1;
+                            }
+                            LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                                tdepth = (tdepth - 1).max(0);
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if j >= tokens.len() {
+                        return Err(format!(
+                            "`theorem verified` has no `:=` proof body in Verify module for {subject_suffix}"
+                        ));
+                    }
+                    verified_types.push(tokens[ty_start..j].to_vec());
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    if ns_opens != 1 || ns_closes != 1 {
+        return Err(format!(
+            "Verify module for {subject_suffix} must contain a single `namespace {expected_ns} ... end {expected_ns}` block"
+        ));
+    }
+    if verified_types.len() != 1 {
+        return Err(format!(
+            "Verify module for {subject_suffix} must declare exactly one `theorem verified` (found {})",
+            verified_types.len()
+        ));
+    }
+    let ty_slice = &verified_types[0];
+    let ob_prefix = format!("Obligations.{subject_suffix}.");
+    let cert_ok = match ty_slice.as_slice() {
+        [LeanToken::Ident(cert_ty), LeanToken::Ident(claim_ref)] => {
+            let short_cert = cert_ty
+                .strip_prefix("Trusted.VerificationResult.")
+                .unwrap_or(cert_ty.as_str());
+            match claim_ref.strip_prefix(&ob_prefix) {
+                Some("claim") => short_cert == "VerificationResult",
+                Some("statefulClaim") => short_cert == "StatefulVerificationResult",
+                Some("totalClaim") => short_cert == "TotalVerificationResult",
+                Some("equivClaim") => short_cert == "StatefulEquivVerificationResult",
+                Some("modularClaim") => short_cert == "ModularVerificationResult",
+                Some("ubExceptionClaim") => short_cert == "UbExceptionVerificationResult",
+                _ => false,
+            }
+        }
+        [
+            LeanToken::Ident(cert_ty),
+            LeanToken::LParen,
+            LeanToken::Ident(poly_cert),
+            LeanToken::Ident(poly_prop),
+            LeanToken::RParen,
+        ] => {
+            let short_cert = cert_ty
+                .strip_prefix("Trusted.VerificationResult.")
+                .unwrap_or(cert_ty.as_str());
+            short_cert == "CrateVerificationResult"
+                && poly_cert == &format!("{ob_prefix}polyCertificate")
+                && matches!(
+                    poly_prop.strip_prefix(&ob_prefix),
+                    Some(
+                        "polyClaim"
+                            | "polyStatefulClaim"
+                            | "polyTotalClaim"
+                            | "polyModularClaim"
+                            | "polyUbExceptionClaim"
+                    )
+                )
+        }
+        _ => false,
+    };
+    if !cert_ok {
+        return Err(format!(
+            "Verify module for {subject_suffix} proves non-canonical statement `{ty_slice:?}` instead of `Obligations.{subject_suffix}.<claim>`"
+        ));
+    }
+    Ok(())
+}
+
+/// `[adv ep1-A1]` / `[adv ep1-B3]` Parse the `def defaultCallees : List CapturedMir := ...`
+/// table of a generated `Obligations/<Item>.lean` module using the comment- and
+/// string-aware Lean lexer (`tokenize_lean_source`), returning the `Mir.<Callee>` module
+/// suffixes it links into `s.memory.callees`.
 ///
 /// Comments (`-- def defaultCallees ...`, `/- ... -/`, or comments inside a multi-line
-/// `[Mir.A.body, -- note\n Mir.B.body]` list) are stripped by the lexer, while any
-/// duplicate `def defaultCallees` command, malformed type signature, or entry not of the
-/// exact form `Mir.<Suffix>.body` fails closed with `Err`.
+/// `[Mir.A.body, -- note\n Mir.B.body]` list) are stripped by the lexer, while missing,
+/// shadowed (`abbrev defaultCallees`), or duplicate `def defaultCallees` commands,
+/// malformed type signatures, entries not of the exact form `Mir.<Suffix>.body`, or
+/// trailing expressions (`[] ++ [...]`, `[Mir.A.body].drop 1`, etc.) fail closed with `Err`.
 pub fn parse_obligations_default_callees(ob_text: &str) -> Result<Vec<String>, String> {
     let tokens = tokenize_lean_source(ob_text)
         .map_err(|err| format!("failed to tokenize Obligations module: {err}"))?;
     let mut def_positions = Vec::new();
+    let mut depth = 0isize;
     for (idx, tok) in tokens.iter().enumerate() {
-        if matches!(tok, LeanToken::Ident(s) if s == "def")
-            && matches!(tokens.get(idx + 1), Some(LeanToken::Ident(name)) if name == "defaultCallees")
-        {
-            def_positions.push(idx);
+        let cur_depth = depth;
+        match tok {
+            LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+            LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                depth = (depth - 1).max(0);
+            }
+            _ => {}
+        }
+        if cur_depth != 0 {
+            continue;
+        }
+        if let LeanToken::Ident(kw) = tok {
+            if matches!(
+                kw.as_str(),
+                "abbrev"
+                    | "theorem"
+                    | "lemma"
+                    | "axiom"
+                    | "opaque"
+                    | "instance"
+            ) && matches!(tokens.get(idx + 1), Some(LeanToken::Ident(name)) if name == "defaultCallees")
+            {
+                return Err(format!(
+                    "`defaultCallees` declared via `{kw}` instead of `def` in Obligations module"
+                ));
+            }
+            if matches!(kw.as_str(), "private" | "protected" | "noncomputable")
+                && matches!(tokens.get(idx + 2), Some(LeanToken::Ident(name)) if name == "defaultCallees")
+            {
+                return Err(format!(
+                    "`{kw}` modifier on `defaultCallees` in Obligations module"
+                ));
+            }
+            if kw == "def"
+                && matches!(tokens.get(idx + 1), Some(LeanToken::Ident(name)) if name == "defaultCallees")
+            {
+                def_positions.push(idx);
+            }
         }
     }
     let Some(&pos) = def_positions.first() else {
-        return Ok(Vec::new());
+        return Err(
+            "missing `def defaultCallees : List CapturedMir :=` table in Obligations module"
+                .to_string(),
+        );
     };
     if def_positions.len() > 1 {
         return Err("multiple `def defaultCallees` tables in Obligations module".to_string());
@@ -4497,12 +5332,29 @@ pub fn parse_obligations_default_callees(ob_text: &str) -> Result<Vec<String>, S
                 .to_string(),
         );
     }
+    let ensure_no_trailing = |after_idx: usize| -> Result<(), String> {
+        if let Some(next_tok) = tokens.get(after_idx)
+            && !is_lean_command_start(next_tok)
+        {
+            return Err(format!(
+                "unexpected trailing token `{next_tok:?}` after `defaultCallees` table"
+            ));
+        }
+        Ok(())
+    };
     let val_idx = pos + 6;
     match (tokens.get(val_idx), tokens.get(val_idx + 1)) {
-        (Some(LeanToken::Ident(id)), _) if id == ".nil" || id == "List.nil" => Ok(Vec::new()),
-        (Some(LeanToken::Dot), Some(LeanToken::Ident(id))) if id == "nil" => Ok(Vec::new()),
+        (Some(LeanToken::Ident(id)), _) if id == ".nil" || id == "List.nil" => {
+            ensure_no_trailing(val_idx + 1)?;
+            Ok(Vec::new())
+        }
+        (Some(LeanToken::Dot), Some(LeanToken::Ident(id))) if id == "nil" => {
+            ensure_no_trailing(val_idx + 2)?;
+            Ok(Vec::new())
+        }
         (Some(LeanToken::LBracket), _) => {
             if matches!(tokens.get(val_idx + 1), Some(LeanToken::RBracket)) {
+                ensure_no_trailing(val_idx + 2)?;
                 return Ok(Vec::new());
             }
             let mut out = Vec::new();
@@ -4537,6 +5389,7 @@ pub fn parse_obligations_default_callees(ob_text: &str) -> Result<Vec<String>, S
                     }
                 }
             }
+            ensure_no_trailing(cur + 1)?;
             Ok(out)
         }
         (other, _) => Err(format!("unrecognized `defaultCallees` table `{other:?}`")),
@@ -5008,6 +5861,12 @@ pub fn reconcile_multi_item_coverage(
         if !item.body.has_no_param_call_const() {
             unsupported_reasons.push(format!(
                 "[{}] body contains a `Call` or `TailCall` terminator whose `func` operand is a `RigidTy.param`-typed constant (`bodyHasNoParamCallConst` violated)",
+                item.def_path
+            ));
+        }
+        if !item.body.cfg_targets_in_bounds() {
+            unsupported_reasons.push(format!(
+                "[{}] body violates `cfgTargetsInBounds` (empty `basicBlocks` or out-of-bounds terminator/unwind target)",
                 item.def_path
             ));
         }
@@ -8831,6 +9690,237 @@ end Mir.Probe.item",
                     | ProtoRvalue::Aggregate(ProtoAggregateKind::Adt(_, _, None), _)
             );
             assert_eq!(!own_rvalue_classes.is_empty(), expect_own, "{rv:?}: {census:?}");
+        }
+    }
+
+    /// `[adv ep1-B3]` Regression suite for `cfgTargetsInBounds` enforcement,
+    /// `parse_obligations_default_callees` missing/trailing-expression rejection,
+    /// recursive subject batch assembly & closure, `TraitImplEntry` override closure,
+    /// and new Lean bridge theorems.
+    #[test]
+    fn test_ep1_b3_cfg_bounds_recursion_default_callees_and_lean_bridges() {
+        let reg = PropertyRegistry::all_verified();
+
+        // 1. Empty-`basicBlocks` and out-of-bounds target bodies fail closed in
+        //    `reconcile_multi_item_coverage` (`cfgTargetsInBounds`).
+        let empty_blocks = ProtoMirBody {
+            def_path: String::from("proto::empty_blocks"),
+            basic_blocks: Vec::new(),
+        };
+        assert!(!empty_blocks.cfg_targets_in_bounds());
+        assert!(census_mir_fault_sites(&empty_blocks).is_empty());
+        let empty_verdict = reconcile_multi_item_coverage(
+            &[ItemCoverageInput::from_body(empty_blocks, Vec::new())],
+            &CalleeClosure::default(),
+            &reg,
+        );
+        assert!(
+            !empty_verdict.is_verified()
+                && empty_verdict
+                    .reasons()
+                    .iter()
+                    .any(|r| r.contains("cfgTargetsInBounds")),
+            "{empty_verdict:?}"
+        );
+
+        let oob_goto = ProtoMirBody {
+            def_path: String::from("proto::oob_goto"),
+            basic_blocks: vec![ProtoBasicBlock {
+                statements: Vec::new(),
+                terminator: ProtoTerminator::new(ProtoTerminatorKind::Goto(3)),
+                is_cleanup: false,
+            }],
+        };
+        assert!(!oob_goto.cfg_targets_in_bounds());
+        let oob_census = census_mir_fault_sites(&oob_goto);
+        let oob_verdict = reconcile_multi_item_coverage(
+            &[ItemCoverageInput::from_body(oob_goto, oob_census)],
+            &CalleeClosure::default(),
+            &reg,
+        );
+        assert!(
+            !oob_verdict.is_verified()
+                && oob_verdict
+                    .reasons()
+                    .iter()
+                    .any(|r| r.contains("cfgTargetsInBounds")),
+            "{oob_verdict:?}"
+        );
+
+        // 2. `parse_obligations_default_callees` rejects missing/shadowed tables and
+        //    trailing expressions after `.nil` / `List.nil` / `[]` / `[...]`.
+        for bad_ob in [
+            "namespace Obligations.Demo.f\nend Obligations.Demo.f\n",
+            "abbrev defaultCallees : List CapturedMir := [Mir.Demo.leaf.body]\n",
+            "private def defaultCallees : List CapturedMir := .nil\n",
+            "def defaultCallees : List CapturedMir := .nil ++ [Mir.Demo.leaf.body]\n",
+            "def defaultCallees : List CapturedMir := List.nil ++ [Mir.Demo.leaf.body]\n",
+            "def defaultCallees : List CapturedMir := [] ++ [Mir.Demo.leaf.body]\n",
+            "def defaultCallees : List CapturedMir := [Mir.Demo.fake.body].drop 1 ++ [Mir.Demo.real.body]\n",
+        ] {
+            assert!(
+                parse_obligations_default_callees(bad_ob).is_err(),
+                "expected fail-closed error for `{bad_ob}`"
+            );
+        }
+
+        // 3. Recursive subject batch assembly & closure:
+        //    - Unlinked recursive subject (`callee_bodies = []`, non-assumed) fails closed.
+        //    - Linked recursive subject (`callee_bodies = [rec_meta.body]`) deduplicates
+        //      `items` and reconciles to `Verified`.
+        //    - Assumed (`#[spec(trusted)]`) recursive subject (`callee_bodies = []`,
+        //      `allow_implicit_external_callees = true`) reconciles to `Verified`.
+        let rec_body = ProtoMirBody {
+            def_path: String::from("demo::rec_fn"),
+            basic_blocks: vec![ProtoBasicBlock {
+                statements: Vec::new(),
+                terminator: ProtoTerminator::new(ProtoTerminatorKind::Call {
+                    func: ProtoOperand::const_fn("demo::rec_fn"),
+                    args: Vec::new(),
+                    destination: ProtoPlace::local(0),
+                    target: Some(0),
+                    unwind: ProtoUnwindAction::Continue,
+                }),
+                is_cleanup: false,
+            }],
+        };
+        let rec_meta = ParsedMirModuleMetadata {
+            body: rec_body.clone(),
+            role: ProtoContractRole::Subject,
+            trait_impls: Vec::new(),
+        };
+        let unlinked_rec_closure =
+            crate::obligations::build_batch_callee_closure(&rec_body, &[], &[], false);
+        assert!(unlinked_rec_closure.inline_callees.is_empty());
+        let (unlinked_items, unlinked_extra) =
+            crate::obligations::assemble_batch_items_and_check_trait_closure(
+                &rec_meta,
+                &[],
+                &unlinked_rec_closure,
+                &BTreeSet::new(),
+            );
+        assert!(unlinked_extra.is_empty());
+        assert!(
+            !reconcile_multi_item_coverage(&unlinked_items, &unlinked_rec_closure, &reg)
+                .is_verified()
+        );
+
+        let linked_rec_closure = crate::obligations::build_batch_callee_closure(
+            &rec_body,
+            std::slice::from_ref(&rec_body),
+            &[],
+            false,
+        );
+        assert_eq!(
+            linked_rec_closure.inline_callees,
+            vec![String::from("demo::rec_fn")]
+        );
+        let (linked_items, linked_extra) =
+            crate::obligations::assemble_batch_items_and_check_trait_closure(
+                &rec_meta,
+                std::slice::from_ref(&rec_meta),
+                &linked_rec_closure,
+                &BTreeSet::new(),
+            );
+        assert!(linked_extra.is_empty());
+        assert_eq!(linked_items.len(), 1);
+        assert!(
+            reconcile_multi_item_coverage(&linked_items, &linked_rec_closure, &reg).is_verified()
+        );
+
+        let assumed_rec_closure =
+            crate::obligations::build_batch_callee_closure(&rec_body, &[], &[], true);
+        let (assumed_items, assumed_extra) =
+            crate::obligations::assemble_batch_items_and_check_trait_closure(
+                &rec_meta,
+                &[],
+                &assumed_rec_closure,
+                &BTreeSet::new(),
+            );
+        assert!(assumed_extra.is_empty());
+        assert!(
+            reconcile_multi_item_coverage(&assumed_items, &assumed_rec_closure, &reg).is_verified()
+        );
+
+        // 4. `TraitImplEntry` redirecting a called default trait method to an unlinked
+        //    `implPath` fails closed.
+        let trait_caller = ParsedMirModuleMetadata {
+            body: ProtoMirBody {
+                def_path: String::from("demo::calls_trait"),
+                basic_blocks: vec![ProtoBasicBlock {
+                    statements: Vec::new(),
+                    terminator: ProtoTerminator::new(ProtoTerminatorKind::Call {
+                        func: ProtoOperand::const_fn("demo::MyTrait::method"),
+                        args: Vec::new(),
+                        destination: ProtoPlace::local(0),
+                        target: Some(0),
+                        unwind: ProtoUnwindAction::Continue,
+                    }),
+                    is_cleanup: false,
+                }],
+            },
+            role: ProtoContractRole::Subject,
+            trait_impls: vec![ProtoTraitImplEntry {
+                trait_method_def_path: String::from("demo::MyTrait::method"),
+                impl_path: String::from("demo::<Concrete as MyTrait>::method"),
+            }],
+        };
+        let default_trait_callee = ParsedMirModuleMetadata {
+            body: ProtoMirBody {
+                def_path: String::from("demo::MyTrait::method"),
+                basic_blocks: vec![ProtoBasicBlock {
+                    statements: Vec::new(),
+                    terminator: ProtoTerminator::new(ProtoTerminatorKind::Return),
+                    is_cleanup: false,
+                }],
+            },
+            role: ProtoContractRole::Subject,
+            trait_impls: Vec::new(),
+        };
+        let trait_closure = crate::obligations::build_batch_callee_closure(
+            &trait_caller.body,
+            std::slice::from_ref(&default_trait_callee.body),
+            &[],
+            false,
+        );
+        let (_trait_items, trait_reasons) =
+            crate::obligations::assemble_batch_items_and_check_trait_closure(
+                &trait_caller,
+                std::slice::from_ref(&default_trait_callee),
+                &trait_closure,
+                &BTreeSet::new(),
+            );
+        assert!(
+            trait_reasons
+                .iter()
+                .any(|r| r.contains("TraitImplEntry") && r.contains("Concrete as MyTrait")),
+            "{trait_reasons:?}"
+        );
+
+        // 5. Pin `[adv ep1-B3]` Lean theorems in `FaultSiteCensus.lean` and `UnsafeObligations.lean`.
+        for decl in [
+            "def reconcileCoverageBatchWellFormed",
+            "theorem reconcileCoverageBatchWellFormed_iff",
+            "theorem initMachineState_mirStepsInterproc_wellFormed_batch_safety",
+            "def witnessEmptyBlocksBody",
+            "theorem witnessEmptyBlocks_ub_and_wellFormed_batch_rejects",
+        ] {
+            assert!(
+                LEAN_PROTOTYPE_SRC.contains(decl),
+                "missing `[adv ep1-B3]` Lean declaration `{decl}`"
+            );
+        }
+        const UNSAFE_OBLIGATIONS_SRC: &str =
+            include_str!("../../../theory/Anneal/UnsafeObligations.lean");
+        for decl in [
+            "theorem evalOperand_deref_reconciled_of_obligations",
+            "theorem writePlaceValue_deref_reconciled_of_obligations",
+            "theorem evalStmt_offset_reconciled_of_validSliceRange",
+        ] {
+            assert!(
+                UNSAFE_OBLIGATIONS_SRC.contains(decl),
+                "missing `[adv ep1-B3]` UnsafeObligations bridge `{decl}`"
+            );
         }
     }
 }

@@ -2622,8 +2622,79 @@ fn extract_external_callee_def_paths_from_obligations(
     subject_suffix: &str,
     links: &fault_census::ObligationsCalleeLinks,
     mir_root: &Path,
+    obligations_root: &Path,
 ) -> Result<Vec<String>, String> {
-    let mut out = links.external_spec_targets.clone();
+    if !links.unlinked_external_spec_errors.is_empty()
+        || links.external_spec_contracts.len() < links.external_spec_targets.len()
+    {
+        return Err(format!(
+            "Obligations module for {subject_suffix} contains unlinked or malformed `externalSpecCallContract` expressions: {:?}",
+            links.unlinked_external_spec_errors
+        ));
+    }
+    let mut out = Vec::new();
+    for ext in &links.external_spec_contracts {
+        if ext.sidecar_mir_suffix == subject_suffix {
+            return Err(format!(
+                "Obligations module for {subject_suffix} binds `externalSpecCallContract` `{}` to its own MIR body `Mir.{subject_suffix}.body`",
+                ext.def_ident
+            ));
+        }
+        if !links
+            .imported_mir_suffixes
+            .iter()
+            .any(|m| m == &ext.sidecar_mir_suffix)
+        {
+            return Err(format!(
+                "Obligations module for {subject_suffix} binds `externalSpecCallContract` `{}` to `Mir.{}.body` without `import Mir.{}`",
+                ext.def_ident, ext.sidecar_mir_suffix, ext.sidecar_mir_suffix
+            ));
+        }
+        if !links
+            .referenced_external_contract_idents
+            .iter()
+            .any(|r| r == &ext.def_ident)
+        {
+            return Err(format!(
+                "Obligations module for {subject_suffix} declares `def {}` (`externalSpecCallContract \"{}\"`) without referencing `{}.holdsOn`",
+                ext.def_ident, ext.target_def_path, ext.def_ident
+            ));
+        }
+        let sidecar_mir_path = mir_root.join(module_suffix_to_rel_path(&ext.sidecar_mir_suffix));
+        let sidecar_src = fs::read_to_string(&sidecar_mir_path).map_err(|err| {
+            format!(
+                "missing sidecar MIR module {} for `externalSpecCallContract` `{}`: {err}",
+                sidecar_mir_path.display(),
+                ext.def_ident
+            )
+        })?;
+        let sidecar_meta = fault_census::parse_lean_mir_module_metadata_strict(&sidecar_src)
+            .map_err(|err| {
+                format!(
+                    "MIR fault-census scan error in sidecar {}: {err}",
+                    ext.sidecar_mir_suffix
+                )
+            })?;
+        if sidecar_meta.body.def_path.is_empty() {
+            return Err(format!(
+                "sidecar MIR module {} has an empty `defPath`",
+                sidecar_mir_path.display()
+            ));
+        }
+        match &sidecar_meta.role {
+            fault_census::ProtoContractRole::ExternalSpec(role_target)
+                if role_target == &ext.target_def_path => {}
+            other_role => {
+                return Err(format!(
+                    "sidecar `Mir.{}` for `externalSpecCallContract \"{}\"` has role `{other_role:?}` instead of `ContractRole.externalSpec \"{}\"`",
+                    ext.sidecar_mir_suffix, ext.target_def_path, ext.target_def_path
+                ));
+            }
+        }
+        if !out.contains(&ext.target_def_path) {
+            out.push(ext.target_def_path.clone());
+        }
+    }
     for callee_suffix in &links.imported_obligation_suffixes {
         if callee_suffix == subject_suffix {
             return Err(format!(
@@ -2637,6 +2708,13 @@ fn extract_external_callee_def_paths_from_obligations(
         {
             return Err(format!(
                 "Obligations module for {subject_suffix} imports `Obligations.{callee_suffix}` without referencing `Obligations.{callee_suffix}.defaultCallContract`"
+            ));
+        }
+        let callee_ob_path = obligations_root.join(module_suffix_to_rel_path(callee_suffix));
+        if !callee_ob_path.is_file() {
+            return Err(format!(
+                "missing sibling Obligations module {} for `import Obligations.{callee_suffix}`",
+                callee_ob_path.display()
             ));
         }
         let callee_mir_path = mir_root.join(module_suffix_to_rel_path(callee_suffix));
@@ -2744,6 +2822,7 @@ fn apply_fault_site_coverage_reconciliation(
         let rel_path = module_suffix_to_rel_path(&suffix);
         let mir_path = mir_root.join(&rel_path);
         let ob_path = obligations_root.join(&rel_path);
+        let verify_path = generated_root.join("Verify").join(&rel_path);
 
         // Fail closed: every audited per-item module must have its captured body.
         let subject_mir_src = match fs::read_to_string(&mir_path) {
@@ -2756,8 +2835,9 @@ fn apply_fault_site_coverage_reconciliation(
                 continue;
             }
         };
-        let mut subject_body = match parse_lean_mir_module_body_strict(&subject_mir_src) {
-            Ok(body) => body,
+        let subject_meta = match fault_census::parse_lean_mir_module_metadata_strict(&subject_mir_src)
+        {
+            Ok(meta) => meta,
             Err(err) => {
                 item.status = unmapped_fault_site_status(format!(
                     "MIR fault-census scan error in {suffix}: {err}"
@@ -2765,8 +2845,26 @@ fn apply_fault_site_coverage_reconciliation(
                 continue;
             }
         };
-        if subject_body.def_path.is_empty() {
-            subject_body.def_path = suffix.clone();
+        if subject_meta.body.def_path.is_empty() {
+            item.status = unmapped_fault_site_status(format!(
+                "subject MIR module {} for {suffix} has an empty `defPath`",
+                mir_path.display()
+            ));
+            continue;
+        }
+        let verify_text = match fs::read_to_string(&verify_path) {
+            Ok(text) => text,
+            Err(err) => {
+                item.status = unmapped_fault_site_status(format!(
+                    "missing Verify module {} for {suffix}: {err}",
+                    verify_path.display()
+                ));
+                continue;
+            }
+        };
+        if let Err(err) = fault_census::validate_verify_module_certificate(&verify_text, &suffix) {
+            item.status = unmapped_fault_site_status(err);
+            continue;
         }
         let ob_text = match fs::read_to_string(&ob_path) {
             Ok(text) => text,
@@ -2811,8 +2909,8 @@ fn apply_fault_site_coverage_reconciliation(
         }
         // Every claim record must bind `callees := defaultCallees` (or `implCallees := defaultCallees`,
         // `specCallees := defaultCallees`) and `claim_body_field_count == claim_callees_field_count`
-        // so a claim cannot omit `callees`, construct a `Claim` via positional `Claim.mk`, or
-        // bypass `defaultCallees` with `.nil`, `[]`, or a trailing expression (`defaultCallees.drop 1`).
+        // so a claim cannot omit `callees` / `specCallees` or bypass `defaultCallees` with `.nil`,
+        // `[]`, or a trailing expression (`defaultCallees.drop 1`).
         if links.claim_callees_bindings.is_empty()
             || links.claim_body_field_count != links.claim_callees_field_count
             || !links
@@ -2828,16 +2926,29 @@ fn apply_fault_site_coverage_reconciliation(
             ));
             continue;
         }
-        let explicit_external =
-            match extract_external_callee_def_paths_from_obligations(&suffix, &links, &mir_root) {
-                Ok(ext) => ext,
-                Err(err) => {
-                    item.status = unmapped_fault_site_status(err);
-                    continue;
-                }
-            };
+        // `[adv ep1-B3]`: enforce per-definition canonical claim structure across all 16
+        // monomorphic, equivalence, instantiated (`*For`), and polymorphic (`poly*`)
+        // claim definitions so positional `Claim.mk` / `⟨...⟩` constructors, `{ ... with ... }`
+        // struct updates, or tampered `poly*Claim` propositions cannot slip past global
+        // field-count equality.
+        if let Err(err) = fault_census::validate_obligations_canonical_claims(&ob_text, &suffix) {
+            item.status = unmapped_fault_site_status(err);
+            continue;
+        }
+        let explicit_external = match extract_external_callee_def_paths_from_obligations(
+            &suffix,
+            &links,
+            &mir_root,
+            &obligations_root,
+        ) {
+            Ok(ext) => ext,
+            Err(err) => {
+                item.status = unmapped_fault_site_status(err);
+                continue;
+            }
+        };
 
-        let mut callee_bodies = Vec::new();
+        let mut callee_metas = Vec::new();
         let mut scan_err_reasons = Vec::new();
         for callee_suffix in callee_suffixes {
             let callee_rel = module_suffix_to_rel_path(&callee_suffix);
@@ -2851,12 +2962,15 @@ fn apply_fault_site_coverage_reconciliation(
                     continue;
                 }
             };
-            match parse_lean_mir_module_body_strict(&callee_src) {
-                Ok(mut cbody) => {
-                    if cbody.def_path.is_empty() {
-                        cbody.def_path = callee_suffix;
+            match fault_census::parse_lean_mir_module_metadata_strict(&callee_src) {
+                Ok(cmeta) => {
+                    if cmeta.body.def_path.is_empty() {
+                        scan_err_reasons.push(format!(
+                            "MIR module for callee {callee_suffix} has an empty `defPath`"
+                        ));
+                        continue;
                     }
-                    callee_bodies.push(cbody);
+                    callee_metas.push(cmeta);
                 }
                 Err(err) => {
                     scan_err_reasons.push(format!(
@@ -2870,31 +2984,24 @@ fn apply_fault_site_coverage_reconciliation(
             continue;
         }
 
-        let filter_dropped = |sites: Vec<FaultSite>| -> Vec<FaultSite> {
-            sites
-                .into_iter()
-                .filter(|s| !dropped_sites.contains(s))
-                .collect()
-        };
-        let mut items = Vec::with_capacity(1 + callee_bodies.len());
-        items.push(ItemCoverageInput {
-            def_path: subject_body.def_path.clone(),
-            body: subject_body.clone(),
-            discharged: filter_dropped(emit_obligation_fault_sites_for_body(&subject_body)),
-        });
-        for callee in &callee_bodies {
-            items.push(ItemCoverageInput {
-                def_path: callee.def_path.clone(),
-                body: callee.clone(),
-                discharged: filter_dropped(emit_obligation_fault_sites_for_body(callee)),
-            });
-        }
+        let callee_bodies: Vec<fault_census::ProtoMirBody> =
+            callee_metas.iter().map(|m| m.body.clone()).collect();
         let closure = obligations::build_batch_callee_closure(
-            &subject_body,
+            &subject_meta.body,
             &callee_bodies,
             &explicit_external,
             subject_is_assumed,
         );
+        let (items, extra_reasons) = obligations::assemble_batch_items_and_check_trait_closure(
+            &subject_meta,
+            &callee_metas,
+            &closure,
+            dropped_sites,
+        );
+        if !extra_reasons.is_empty() {
+            item.status = unmapped_fault_site_status(extra_reasons.join("; "));
+            continue;
+        }
 
         let verdict = reconcile_multi_item_coverage(&items, &closure, registry);
         if let MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
@@ -5867,6 +5974,141 @@ end Mir.Demo.caller
                 "def defaultCallees : List CapturedMir :=\n  .nil\n\n"
             ),
             Ok(Vec::new())
+        );
+
+        // Negative test 13 (`[adv ep1-B3]`): rewriting `def claim` with a positional
+        // constructor (`Claim.mk ... .nil`) drops both `body :=` and `callees :=` by 1
+        // (leaving global field counts equal across the other 10 claims), yet
+        // `validate_obligations_canonical_claims` fails closed.
+        let positional_claim_ob = original_ob.replacen(
+            "{ body := Mir.Demo.caller.body, pre := spec.pre, post := spec.post, callees := defaultCallees }",
+            "Claim.mk Mir.Demo.caller.body spec.pre spec.post List.nil",
+            1,
+        );
+        assert_ne!(positional_claim_ob, original_ob);
+        fs::write(&caller_ob_path, &positional_claim_ob).expect("write positional claim");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("canonical `def claim`"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+
+        // Negative test 14 (`[adv ep1-B3]`): omitting `, specCallees := defaultCallees`
+        // from `equivClaim` (`StatefulEquivClaim.specCallees` defaults to `.nil` in Lean)
+        // fails closed.
+        let omitted_spec_callees_ob = original_ob.replacen(
+            ", implCallees := defaultCallees, specCallees := defaultCallees }",
+            ", implCallees := defaultCallees }",
+            1,
+        );
+        assert_ne!(omitted_spec_callees_ob, original_ob);
+        fs::write(&caller_ob_path, &omitted_spec_callees_ob)
+            .expect("write omitted specCallees obligations");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("overrides claim `callees`"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+
+        // Negative test 15 (`[adv ep1-B3]`): tampering with `polyClaim` in
+        // `Obligations/Demo/caller.lean` or rewriting `theorem verified` in
+        // `Verify/Demo/caller.lean` to prove a non-canonical claim fails closed.
+        let tampered_poly_ob = original_ob.replacen(
+            "VerificationResult (claimFor typeArgs)",
+            "VerificationResult (Claim.mk (Mir.Demo.caller.body.instantiate typeArgs) (fun _ => True) (fun _ _ => True) List.nil)",
+            1,
+        );
+        assert_ne!(tampered_poly_ob, original_ob);
+        fs::write(&caller_ob_path, &tampered_poly_ob).expect("write tampered polyClaim");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("polyClaim"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+        fs::write(&caller_ob_path, &original_ob).expect("restore caller obligations");
+
+        let tampered_verify = original_verify.replacen(
+            "VerificationResult Obligations.Demo.caller.claim",
+            "VerificationResult { body := Mir.Demo.leaf.body, pre := fun _ => True, post := fun _ _ => True, callees := .nil }",
+            1,
+        );
+        assert_ne!(tampered_verify, original_verify, "{original_verify}");
+        fs::write(&caller_verify_path, &tampered_verify).expect("write tampered Verify");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("non-canonical statement"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+        fs::write(&caller_verify_path, &original_verify).expect("restore caller Verify");
+
+        // Negative test 16 (`[adv ep1-B3]`): injecting an unused or non-sidecar
+        // `externalSpecCallContract "demo::leaf" Mir.Demo.caller.body ...` into
+        // `Obligations/Demo/caller.lean` while unlinking `defaultCallees` fails closed.
+        let fake_ext_ob = unlinked_ob.replacen(
+            "end Obligations.Demo.caller",
+            "def fakeExt : MirCallContract := externalSpecCallContract \"demo::leaf\" Mir.Demo.caller.body (fun _ => True) (fun _ _ => True)\nend Obligations.Demo.caller",
+            1,
+        );
+        assert_ne!(fake_ext_ob, unlinked_ob);
+        fs::write(&caller_ob_path, &fake_ext_ob).expect("write fake externalSpecCallContract");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("externalSpecCallContract"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+        fs::write(&caller_ob_path, &original_ob).expect("restore caller obligations");
+
+        // Negative test 17 (`[adv ep1-B3]`): recursive self-call in `Mir.Demo.caller`:
+        // fails closed when `defaultCallees := .nil`, and succeeds when
+        // `defaultCallees := [Mir.Demo.caller.body]` without triggering a false
+        // duplicate-`def_path` error.
+        let recursive_caller = original_caller.replacen(
+            "(RigidTy.fnDef \"demo::leaf\" List.nil)",
+            "(RigidTy.fnDef \"demo::caller\" List.nil)",
+            1,
+        );
+        assert_ne!(recursive_caller, original_caller);
+        fs::write(&caller_mir_path, &recursive_caller).expect("write recursive caller");
+        fs::write(&caller_ob_path, &unlinked_ob).expect("write unlinked recursive obligations");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller")
+                .expect("caller")
+                .as_str(),
+            unknown
+        );
+        let linked_rec_ob = original_ob.replacen(
+            "[Mir.Demo.leaf.body]",
+            "[Mir.Demo.caller.body]",
+            1,
+        );
+        fs::write(&caller_ob_path, &linked_rec_ob).expect("write linked recursive obligations");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller"),
+            Some(&VerificationStatus::VerifiedUnconditional)
+        );
+        fs::write(&caller_mir_path, &original_caller).expect("restore caller.lean");
+        fs::write(&caller_ob_path, &original_ob).expect("restore caller obligations");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller"),
+            Some(&VerificationStatus::VerifiedUnconditional)
         );
 
         let _ = fs::remove_dir_all(&workspace);

@@ -86,6 +86,8 @@ export Anneal.FaultSiteCensus (
   CoverageVerdict reconcileFaultCoverage reconcileFaultCoverageWithRegistry
   stepMirFn_fault_in_discharged_of_reconciled initMachineState_mirStepsTop_reconciled_safety
   CoverageBatch reconcileCoverageBatch stepMirFn_exposesUb_in_batch_discharged
+  reconcileCoverageBatchWellFormed reconcileCoverageBatchWellFormed_iff
+  initMachineState_mirStepsInterproc_wellFormed_batch_safety
 )
 
 /-- Smoke-test witness exported from `Anneal`. -/
