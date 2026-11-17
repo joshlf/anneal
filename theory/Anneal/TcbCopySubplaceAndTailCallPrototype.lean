@@ -16,46 +16,73 @@ import Anneal.Rustc.V2026_06_01.SymbolicEval
 # Track P Prototype: Multi-Element Subplace `copy_nonoverlapping`, `tailCall` Unwind & Caller-Referent Isolation, and `opaqueCast` Root Dispatch
 
 This prototype module (`ws-proto-tcb-copy-subplace-and-tailcall-opaquecast`)
-mechanizes and kernel-certifies off `unstable` all four TCB ground-semantics
+mechanizes and kernel-certifies off `unstable` the four TCB ground-semantics
 repairs slated for paired Track A workstream
-`ws-tcb-copy-subplace-and-tailcall-opaquecast-correspondence`:
+`ws-tcb-copy-subplace-and-tailcall-opaquecast-correspondence`.
+
+**Conservativity discipline.** Every repaired step function below is
+`Trusted.Rustc.V2026_06_01.MirSemantics` *plus exactly one repair*: wherever a
+repair does not apply, the prototype delegates to the unmodified `Trusted`
+function (`evalRvalue`, `evalOperand`, `evalPlaceWrite`, `evalCallerPlaceWrite`,
+`evalForeignFrameDerefWrite`, `evalCopySingleDirect`, `evalTerminator`,
+`unwindFromCallStack`, `resumeExternalTailCall`, ...), so the prototype keeps
+`Trusted`'s Tree Borrows read transitions (`derefReadTreeUB` /
+`freezeDerefReadBorrowsAt`), `validateLoadedValue`, and frame-qualified borrow
+resolution everywhere (see `conservativity_*` canaries in the test file).
 
 1. **Bug 1 — Multi-Element Subplace `copy_nonoverlapping` (`RawPtrOffsetMutator:wrong_value:MirDiffTag.normalScalar`)**:
    - Peels trailing `.constantIndex` array-element projections into element
-     offsets over the enclosing `.aggregate 0` array container when `n > 1` or
-     `ptrElemOffset > 0` (`peelArrayElementProjForMultiCopy`,
-     `resolveArraySliceEndpoint?`), converts pointer byte offsets to element
-     indices via `resolvePtrElemOffset?`, writes updated array slices back to
-     the peeled parent projection `{ local_ := dstEntry.targetLocal, projection := dstParentProj }`,
-     scopes Tree Borrows read/write transitions and active-protector conflict
-     checks to the accessed `.subslice` window, and closes the `copyViaBytes`
-     silent-truncation hole by requiring `length bs == n * elemBytes`.
+     offsets over the enclosing `.aggregate 0` array container
+     (`peelArrayElementProjForMultiCopy`, `resolveArraySliceEndpoint?`),
+     converts pointer byte offsets to element indices via `resolvePtrElemOffset?`
+     (faulting with `.ub` on a byte offset that is not a whole number of
+     elements of the statically known pointee, i.e. a misaligned pointer), writes
+     the updated array slice back to the peeled parent projection
+     `{ local_ := dstEntry.targetLocal, projection := dstParentProj }`, and runs
+     the same Tree Borrows read-then-write transition as `Trusted`'s
+     single-element path (`borrowsAfterCopySingleDirect`) scoped to the
+     accessed `.subslice` windows (`borrowsAfterCopySliceProto`).
+   - Closes the `copyViaBytes` silent-truncation hole by requiring
+     `length bs == n * elemBytes`.
    - Kernel-certifies (`by rfl`) both Campaign #14
      (`pass_transmute_u32_byte_array_le__b0_c6`: `19 -> 112`) and Campaign #15
      (`pass_enum_discriminant_valid__b2_c9`: `70 -> 4`) against live Miri.
 
 2. **Bug 2 — `DIV-LM-TAILCALL-NOUNWIND-UNWIND` (`Terminators.lean:846`)**:
-   - Rewrites the top `SavedCallerFrame.returnUnwind` on `Memory.callStack` to
-     `.unreachable` when a `TerminatorKind.tailCall` enters a callee with
-     `calleeBody.fnAbi.canUnwind = false` (or a non-unwinding call-site ABI),
-     matching Miri's `initStackFrame` (`Call.lean:261-264`) and preserving
-     multi-hop unwind narrowing monotonicity across arbitrarily many subsequent
-     tail calls.
+   - Nested tail call (`callStack = caller :: rest`): rewrites the inherited
+     `caller.returnUnwind` to `.unreachable` when the tail callee cannot unwind
+     (`narrowCallStackForTailCallee`, Miri `init_fn_call`), monotonically across
+     arbitrarily many subsequent tail calls.
+   - Modular-root tail call (`callStack = []`): the root activation inherits its
+     external caller's unwind continuation, which Miri narrows the same way. The
+     prototype tracks this *root unwind ceiling* (Track A field
+     `Memory.rootUnwindCeiling : Bool := true`) in the `fnAbi.canUnwind` of the
+     active root activation body (a field `Trusted` never reads), so a panic that
+     escapes a root tail callee that cannot unwind (or any later tail callee of
+     it) faults with `.ub` instead of `.halted .panic`, while the root's *own*
+     panics keep the `MODEL-LM-TAILCALL-MODULAR-ROOT` convention
+     (`guardRootUnwindCeiling`).
 
-3. **Bug 3 — `DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW` (`State.lean`, `Places.lean`, `Terminators.lean`)**:
-   - Distinguishes external caller-owned referents in `Memory.callerLocals` from
-     frame-owned locals across root `TerminatorKind.tailCall` transitions so a
-     tail callee with more locals than the root caller never shadows
-     `callerLocals` on dereference reads, dereference writes, reborrows, local
-     writes/deallocations, or multi-hop tail-call teardowns.
+3. **Bug 3 — `DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW`**:
+   - `Trusted` addresses the modular root's caller-owned referents as depth-`0`
+     slots *past* the root frame (`Memory.callerLocals`, `targetLocal ≥ length
+     locals`). A root tail call into a wider callee breaks that representation
+     invariant. `relocateRootCallerReferents` restores it at the tail call: every
+     caller-owned referent borrow and its `callerLocals` slot move past the new
+     frame, so *every unmodified* `Trusted` lookup (`activeFrameSlot?`,
+     `foreignFrameSlot?`, `foreignFrameTarget?`, `readFrameLocalSlot`,
+     `writeFrameLocalSlot`, `disableFrameBorrows`, ...) — and hence every read,
+     write, reborrow, `BinOp.offset`, `copy_nonoverlapping`, Tree Borrows
+     transition, inline call, and root return built on them — resolves the
+     referent in `callerLocals` and never in the callee's own locals.
 
 4. **Bug 4 — `DIV-TR-OPAQUECAST-ROOT-DISPATCH` (`Places.lean`, `Statements.lean`, `Terminators.lean`)**:
    - Strips leading `ProjectionElem.opaqueCast` projections before root-vs-projected
-     (`[]` vs `proj :: rest`) dispatch in `evalOperand (.move)`,
-     `writePlaceValue`, `uninitFieldWriteShell?`, `evalStmt (.assign / .deinit / .setDiscriminant)`,
-     `writeReturnDestination`, and `TerminatorKind.drop`, while preserving
-     fail-closed `.unsupported` on ill-formed `.opaqueCast _ :: .deref :: _`
-     paths and preserving type-switched validity checks.
+     (`[]` vs `proj :: rest`) dispatch in `evalOperand (.move)` (inside
+     `Rvalue.use`), `writePlaceValue`, `uninitFieldWriteShell?`,
+     `evalStmt (.assign / .deinit / .setDiscriminant)`, and `TerminatorKind.drop`,
+     while preserving fail-closed `.unsupported` on ill-formed
+     `.opaqueCast _ :: .deref :: _` paths and type-switched validity checks.
 -/
 
 namespace Anneal.TcbCopySubplaceAndTailCallPrototype
@@ -208,359 +235,332 @@ theorem writeProjectedValue_stripLeadingOpaqueCast (locals : List LocalSlot) :
   | .downcast _ _ :: _, _, _ => rfl
   | .unwrapUnsafeBinder _ :: _, _, _ => rfl
 
-/--
-Repaired `uninitFieldWriteShell?`: strips leading `.opaqueCast` projections
-before matching on `.field fieldIdx fieldTy :: rest'`, so `(_l as T).f = rv` on
-a live `.uninit` struct, union, or tuple local materializes the exact same
-aggregate shell as `_l.f = rv`.
--/
-def uninitFieldWriteShellProto?
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (loc : Local)
-    (proj : ProjectionElem)
-    (rest : List ProjectionElem := .nil) :
-    Option Value :=
-  match stripLeadingOpaqueCast (proj :: rest) with
-  | .field fieldIdx fieldTy :: rest' =>
-    uninitFieldWriteShell? localDecls layouts loc (.field fieldIdx fieldTy) rest'
-  | _ => .none
 
-@[simp]
-theorem uninitFieldWriteShellProto?_opaqueCast
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (loc : Local)
-    (t : Ty)
-    (proj : ProjectionElem)
-    (rest : List ProjectionElem) :
-    uninitFieldWriteShellProto? localDecls layouts loc (.opaqueCast t) (proj :: rest) =
-      uninitFieldWriteShellProto? localDecls layouts loc proj rest := rfl
-
-@[simp]
-theorem uninitFieldWriteShellProto?_field
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (loc : Local)
-    (fieldIdx : FieldIdx)
-    (fieldTy : Ty)
-    (rest : List ProjectionElem) :
-    uninitFieldWriteShellProto? localDecls layouts loc (.field fieldIdx fieldTy) rest =
-      uninitFieldWriteShell? localDecls layouts loc (.field fieldIdx fieldTy) rest := rfl
-
-/-! ## 2. Bug 3: Root Caller-Owned Referent Isolation (`DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW`) -/
+/-! ## 2. Bug 3: Root Caller-Owned Referent Relocation (`DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW`) -/
 
 /--
-Sentinel frame-depth tag (`65535`) used to distinguish external caller-owned
-referent borrows backed by `Memory.callerLocals` from stack-frame-owned borrows
-at depth `0 .. length callStack` inside `Trusted.BorrowEntry` (without modifying
-`trusted/lean/Trusted/.../State.lean` during Track P prototyping).
-
-In paired Track A workstream `ws-tcb-copy-subplace-and-tailcall-opaquecast-correspondence`,
-this corresponds 1-to-1 to `BorrowEntry.isCallerReferent : Bool := false` (see
-`ProtoBorrowEntry` and `protoBorrowEntry_iso` below).
+`Trusted`'s representation invariant for the modular root's caller-owned
+referents (`State.lean` `Memory.callerLocals`, `activeFrameSlot?`,
+`foreignFrameSlot?`, `foreignFrameTarget?`): a depth-`0` borrow whose
+`targetLocal` is at or past the root frame's local count `nRoot` names the slot
+`Memory.callerLocals[targetLocal]`; every other depth-`0` borrow names a local of
+the root frame itself.
 -/
 @[reducible]
-def callerReferentFrameDepth : Nat := 255
+def isRootCallerReferentBorrow (nRoot : Nat) (entry : BorrowEntry) : Bool :=
+  Bool.and (Nat.beq entry.targetFrameDepth 0) (Nat.ble nRoot entry.targetLocal)
 
-/--
-Explicit TCB target representation of `BorrowEntry` with a dedicated
-`isCallerReferent : Bool := false` origin flag.
--/
-structure ProtoBorrowEntry : Type where
-  tag : Nat
-  targetLocal : LocalIdx
-  targetProjection : List ProjectionElem
-  perm : TreeBorrowPerm
-  rangeOffset : Nat := 0
-  rangeLen : Nat := 0
-  protector : Option Nat := .none
-  parentTag : Option Nat := .none
-  targetFrameDepth : Nat := 0
-  allocDead : Bool := false
-  /-- `true` when `targetLocal` indexes `Memory.callerLocals` (external caller
-      referent of the modular root) rather than a stack frame's `frame.locals`. -/
-  isCallerReferent : Bool := false
+/-- Whether some borrow of `borrows` is a root caller-owned referent of a root frame with `nRoot` locals. -/
+def anyRootCallerReferentBorrow (nRoot : Nat) : List BorrowEntry → Bool
+  | .nil => false
+  | entry :: rest =>
+    match isRootCallerReferentBorrow nRoot entry with
+    | true => true
+    | false => anyRootCallerReferentBorrow nRoot rest
 
-/-- Convert a `ProtoBorrowEntry` into a `Trusted.BorrowEntry` using `callerReferentFrameDepth`. -/
+/-- Shift `entry.targetLocal` by `delta` iff `entry` is a root caller-owned referent (`nRoot`). -/
 @[reducible]
-def ProtoBorrowEntry.toBorrowEntry (e : ProtoBorrowEntry) : BorrowEntry :=
-  { tag := e.tag
-    targetLocal := e.targetLocal
-    targetProjection := e.targetProjection
-    perm := e.perm
-    rangeOffset := e.rangeOffset
-    rangeLen := e.rangeLen
-    protector := e.protector
-    parentTag := e.parentTag
-    targetFrameDepth :=
-      match e.isCallerReferent with
-      | true => callerReferentFrameDepth
-      | false => e.targetFrameDepth
-    allocDead := e.allocDead }
+def shiftRootCallerReferentBorrow (nRoot delta : Nat) (entry : BorrowEntry) : BorrowEntry :=
+  match isRootCallerReferentBorrow nRoot entry with
+  | true => { entry with targetLocal := Nat.add entry.targetLocal delta }
+  | false => entry
 
-/-- Recover a `ProtoBorrowEntry` from a `Trusted.BorrowEntry`. -/
-@[reducible]
-def ProtoBorrowEntry.ofBorrowEntry (e : BorrowEntry) : ProtoBorrowEntry :=
-  let isCr := Nat.beq e.targetFrameDepth callerReferentFrameDepth
-  { tag := e.tag
-    targetLocal := e.targetLocal
-    targetProjection := e.targetProjection
-    perm := e.perm
-    rangeOffset := e.rangeOffset
-    rangeLen := e.rangeLen
-    protector := e.protector
-    parentTag := e.parentTag
-    targetFrameDepth :=
-      match isCr with
-      | true => 0
-      | false => e.targetFrameDepth
-    allocDead := e.allocDead
-    isCallerReferent := isCr }
-
-theorem ProtoBorrowEntry.ofBorrowEntry_toBorrowEntry
-    (e : ProtoBorrowEntry)
-    (hDepth : e.isCallerReferent = true → e.targetFrameDepth = 0)
-    (hNotSentinel : e.isCallerReferent = false →
-      Nat.beq e.targetFrameDepth callerReferentFrameDepth = false) :
-    ProtoBorrowEntry.ofBorrowEntry e.toBorrowEntry = e := by
-  cases e with
-  | mk tag targetLocal targetProjection perm rangeOffset rangeLen protector
-      parentTag targetFrameDepth allocDead isCallerReferent =>
-    cases isCallerReferent with
-    | false =>
-      have hNS : Nat.beq targetFrameDepth callerReferentFrameDepth = false :=
-        hNotSentinel rfl
-      simp [ProtoBorrowEntry.ofBorrowEntry, hNS]
-    | true =>
-      have hD : targetFrameDepth = 0 := hDepth rfl
-      subst hD
-      rfl
-
-/--
-Test whether a `BorrowEntry` targets an external caller-owned referent in
-`Memory.callerLocals`.
--/
-@[reducible]
-def isCallerReferentBorrow (entry : BorrowEntry) : Bool :=
-  Nat.beq entry.targetFrameDepth callerReferentFrameDepth
-
-@[simp]
-theorem isCallerReferentBorrow_zero
-    (tag : Nat) (targetLocal : LocalIdx) (targetProjection : List ProjectionElem)
-    (perm : TreeBorrowPerm) (rangeOffset rangeLen : Nat)
-    (protector parentTag : Option Nat) (allocDead : Bool) :
-    isCallerReferentBorrow
-      { tag := tag, targetLocal := targetLocal, targetProjection := targetProjection,
-        perm := perm, rangeOffset := rangeOffset, rangeLen := rangeLen,
-        protector := protector, parentTag := parentTag,
-        targetFrameDepth := 0, allocDead := allocDead } = false := rfl
-
-theorem isCallerReferentBorrow_sentinel
-    (tag : Nat) (targetLocal : LocalIdx) (targetProjection : List ProjectionElem)
-    (perm : TreeBorrowPerm) (rangeOffset rangeLen : Nat)
-    (protector parentTag : Option Nat) (allocDead : Bool) :
-    isCallerReferentBorrow
-      { tag := tag, targetLocal := targetLocal, targetProjection := targetProjection,
-        perm := perm, rangeOffset := rangeOffset, rangeLen := rangeLen,
-        protector := protector, parentTag := parentTag,
-        targetFrameDepth := callerReferentFrameDepth, allocDead := allocDead } = true := by
-  exact Nat.beq_refl callerReferentFrameDepth
-
-/--
-Stamp root caller-owned referent borrows (`targetFrameDepth == 0` and
-`targetLocal >= rootLocalCount` with `allocDead == false`) with
-`callerReferentFrameDepth` so that replacing the root frame on a root
-`TerminatorKind.tailCall` by a wider callee never shadows `Memory.callerLocals`.
--/
-@[reducible]
-def promoteRootCallerReferentBorrows
-    (borrows : List BorrowEntry)
-    (rootLocalCount : Nat) :
-    List BorrowEntry :=
-  match borrows with
+/-- Shift every root caller-owned referent borrow of `borrows` by `delta` slots. -/
+def shiftRootCallerReferentBorrows (nRoot delta : Nat) : List BorrowEntry → List BorrowEntry
   | .nil => .nil
   | entry :: rest =>
-    let promote :=
-      Bool.and
-        (Bool.not entry.allocDead)
-        (Bool.and
-          (Nat.beq entry.targetFrameDepth 0)
-          (Nat.ble rootLocalCount entry.targetLocal))
-    match promote with
-    | true =>
-      { entry with targetFrameDepth := callerReferentFrameDepth } ::
-        promoteRootCallerReferentBorrows rest rootLocalCount
+    shiftRootCallerReferentBorrow nRoot delta entry ::
+      shiftRootCallerReferentBorrows nRoot delta rest
+
+/-- Prepend `k` `.dead` slots to `slots` (never named by any frame-owned borrow). -/
+def padDeadSlots : Nat → List LocalSlot → List LocalSlot
+  | .zero, slots => slots
+  | .succ k, slots => .dead :: padDeadSlots k slots
+
+/--
+Repaired root `TerminatorKind.tailCall` memory transition
+(`DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW`). When the modular root frame of
+`nOld` locals is replaced by a tail callee frame of `nNew > nOld` locals while
+some borrow names a caller-owned referent, shift every caller-owned referent
+borrow (`isRootCallerReferentBorrow nOld`) *and* the `callerLocals` slots by
+`nNew - nOld`: each referent again lies past the (wider) root frame, so
+`Trusted`'s own frame-qualified lookups keep resolving it in `callerLocals`
+(`relocateRootCallerReferents_readFrameLocalSlot`). Borrow tags (the provenance
+carried by pointer values), permissions, protectors, and `parentTag` links are
+unchanged, so aliasing and Tree Borrows identity are preserved. Otherwise
+(`nNew ≤ nOld`, or no caller-owned referent borrow) the memory is unchanged.
+
+In Track A this is the only TCB change needed for Bug 3: one call in
+`evalTailCallTerminator` (`Terminators.lean:3307-3378`) when
+`s.memory.callStack = []`.
+-/
+def relocateRootCallerReferents (mem : Memory) (nOld nNew : Nat) : Memory :=
+  match Bool.and (Nat.blt nOld nNew) (anyRootCallerReferentBorrow nOld mem.borrows) with
+  | false => mem
+  | true =>
+    { mem with
+      borrows := shiftRootCallerReferentBorrows nOld (Nat.sub nNew nOld) mem.borrows
+      callerLocals := padDeadSlots (Nat.sub nNew nOld) mem.callerLocals }
+
+/-- The relocation applied to a single borrow by `relocateRootCallerReferents mem nOld nNew`. -/
+@[reducible]
+def relocatedRootBorrow (mem : Memory) (nOld nNew : Nat) (entry : BorrowEntry) : BorrowEntry :=
+  match Bool.and (Nat.blt nOld nNew) (anyRootCallerReferentBorrow nOld mem.borrows) with
+  | false => entry
+  | true => shiftRootCallerReferentBorrow nOld (Nat.sub nNew nOld) entry
+
+theorem get?_padDeadSlots_add (slots : List LocalSlot) (i : Nat) :
+    ∀ k : Nat, get? (padDeadSlots k slots) (Nat.add i k) = get? slots i
+  | .zero => rfl
+  | .succ k => by
+    have ih := get?_padDeadSlots_add slots i k
+    simp only [get?] at ih ⊢
+    show (LocalSlot.dead :: padDeadSlots k slots)[Nat.add i k + 1]? = slots[i]?
+    rw [List.getElem?_cons_succ]
+    exact ih
+
+theorem anyRootCallerReferentBorrow_of_mem (nRoot : Nat) (entry : BorrowEntry)
+    (hCr : isRootCallerReferentBorrow nRoot entry = true) :
+    ∀ borrows : List BorrowEntry, entry ∈ borrows →
+      anyRootCallerReferentBorrow nRoot borrows = true
+  | .nil, hMem => absurd hMem List.not_mem_nil
+  | e :: rest, hMem => by
+    unfold anyRootCallerReferentBorrow
+    cases hE : isRootCallerReferentBorrow nRoot e with
+    | true => rfl
     | false =>
-      entry :: promoteRootCallerReferentBorrows rest rootLocalCount
+      rcases List.mem_cons.mp hMem with hEq | hRest
+      · subst hEq
+        rw [hCr] at hE
+        exact absurd hE (by decide)
+      · exact anyRootCallerReferentBorrow_of_mem nRoot entry hCr rest hRest
+
+theorem mem_shiftRootCallerReferentBorrows (nRoot delta : Nat) (entry : BorrowEntry) :
+    ∀ borrows : List BorrowEntry, entry ∈ borrows →
+      shiftRootCallerReferentBorrow nRoot delta entry ∈
+        shiftRootCallerReferentBorrows nRoot delta borrows
+  | .nil, hMem => absurd hMem List.not_mem_nil
+  | e :: rest, hMem => by
+    unfold shiftRootCallerReferentBorrows
+    rcases List.mem_cons.mp hMem with hEq | hRest
+    · subst hEq
+      exact List.mem_cons_self
+    · exact List.mem_cons_of_mem _ (mem_shiftRootCallerReferentBorrows nRoot delta entry rest hRest)
+
+/-- Every borrow of the relocated table is the relocation of a borrow of the original table. -/
+theorem mem_relocateRootCallerReferents (mem : Memory) (nOld nNew : Nat) (entry : BorrowEntry)
+    (hMem : entry ∈ mem.borrows) :
+    relocatedRootBorrow mem nOld nNew entry ∈
+      (relocateRootCallerReferents mem nOld nNew).borrows := by
+  unfold relocatedRootBorrow relocateRootCallerReferents
+  cases Bool.and (Nat.blt nOld nNew) (anyRootCallerReferentBorrow nOld mem.borrows) with
+  | false => exact hMem
+  | true => exact mem_shiftRootCallerReferentBorrows nOld (Nat.sub nNew nOld) entry mem.borrows hMem
 
 /--
-Repaired `activeFrameSlot?`: checks `Nat.beq d (length callStack)` even when
-`callStack = .nil`, so caller-owned referents (`d = callerReferentFrameDepth`)
-never resolve to the active frame's `locals` even after a root `tailCall` into a
-wider callee.
+**Bug 3 representation-invariant preservation.** Shifting by `nNew - nOld`
+(`nOld ≤ nNew`) maps the root caller-owned referents of the old root frame
+(`nOld` locals) *exactly* onto the root caller-owned referents of the new root
+frame (`nNew` locals): referents stay referents, and frame-owned borrows (of the
+torn-down frame, `targetLocal < nOld`, or of other frames) never become
+referents.
 -/
-@[reducible]
-def activeFrameSlotProto?
-    (locals : List LocalSlot)
-    (callStack : List SavedCallerFrame)
-    (d loc : Nat) :
-    Option LocalSlot :=
-  match Nat.beq d (length callStack) with
-  | true => get? locals loc
-  | false => .none
-
-/--
-Repaired `foreignFrameSlot?`: resolves caller-owned referents
-(`d == callerReferentFrameDepth` or root-depth fallback) directly to
-`get? callerLocals loc` regardless of how many locals the current root frame or
-suspended depth-`0` frame has.
--/
-@[reducible]
-def foreignFrameSlotProto?
-    (callStack : List SavedCallerFrame)
-    (callerLocals : List LocalSlot)
-    (d loc : Nat) :
-    Option LocalSlot :=
-  match Nat.beq d callerReferentFrameDepth with
-  | true => get? callerLocals loc
+theorem isRootCallerReferentBorrow_shift (nOld nNew : Nat) (hle : nOld ≤ nNew)
+    (entry : BorrowEntry) :
+    isRootCallerReferentBorrow nNew
+        (shiftRootCallerReferentBorrow nOld (Nat.sub nNew nOld) entry) =
+      isRootCallerReferentBorrow nOld entry := by
+  unfold shiftRootCallerReferentBorrow
+  cases hCr : isRootCallerReferentBorrow nOld entry with
+  | true =>
+    simp only [isRootCallerReferentBorrow, Bool.and_eq_true, Nat.beq_eq, Nat.ble_eq] at hCr ⊢
+    exact ⟨hCr.1, by simp only [Nat.add_eq, Nat.sub_eq]; omega⟩
   | false =>
-    match callStack with
-    | .nil => get? callerLocals loc
-    | _ :: _ =>
-      match savedFrameAtDepth? callStack d with
-      | .some sf =>
-        match get? sf.frame.locals loc with
-        | .some slot => .some slot
-        | .none =>
-          match d with
-          | .zero => get? callerLocals loc
-          | .succ _ => .none
-      | .none => .none
-
-/--
-Repaired `foreignFrameTarget?`: routes `d == callerReferentFrameDepth` directly
-to `.some (.callerReferent callerLocals)` even when a suspended frame at depth
-`0` has more locals than `loc`.
--/
-@[reducible]
-def foreignFrameTargetProto?
-    (callStack : List SavedCallerFrame)
-    (callerLocals : List LocalSlot)
-    (d loc : Nat) :
-    Option ForeignFrameTarget :=
-  match Nat.beq d callerReferentFrameDepth with
-  | true => .some (.callerReferent callerLocals)
-  | false => foreignFrameTarget? callStack callerLocals d loc
-
-/--
-Repaired `readFrameLocalSlot` using `activeFrameSlotProto?` and
-`foreignFrameSlotProto?`.
--/
-@[reducible]
-def readFrameLocalSlotProto
-    (locals : List LocalSlot)
-    (callStack : List SavedCallerFrame)
-    (callerLocals : List LocalSlot)
-    (d loc : Nat) :
-    Option LocalSlot :=
-  match activeFrameSlotProto? locals callStack d loc with
-  | .some slot => .some slot
-  | .none => foreignFrameSlotProto? callStack callerLocals d loc
-
-/--
-Repaired `writeFrameLocalSlot` using `activeFrameSlotProto?` and
-`foreignFrameTargetProto?`.
--/
-@[reducible]
-def writeFrameLocalSlotProto
-    (locals : List LocalSlot)
-    (callStack : List SavedCallerFrame)
-    (callerLocals : List LocalSlot)
-    (d loc : Nat)
-    (slot : LocalSlot) :
-    Option (List LocalSlot × List SavedCallerFrame × List LocalSlot) :=
-  match activeFrameSlotProto? locals callStack d loc with
-  | .some _ =>
-    match set? locals loc slot with
-    | .some locals' => .some (locals', callStack, callerLocals)
-    | .none => .none
-  | .none =>
-    match foreignFrameTargetProto? callStack callerLocals d loc with
-    | .some (.savedFrame idx frameLocals) =>
-      match set? frameLocals loc slot, get? callStack idx with
-      | .some frameLocals', .some sf =>
-        match set? callStack idx { sf with frame := { sf.frame with locals := frameLocals' } } with
-        | .some callStack' => .some (locals, callStack', callerLocals)
-        | .none => .none
-      | _, _ => .none
-    | .some (.callerReferent referents) =>
-      match set? referents loc slot with
-      | .some referents' => .some (locals, callStack, referents')
-      | .none => .none
-    | .none => .none
-
-/--
-Repaired `disableFrameBorrows`:
-- Disables and marks `allocDead := true` every borrow of the torn-down frame's
-  own locals (`entry.targetFrameDepth == depth && entry.targetLocal < nLocals`),
-- At the root frame (`depth == 0`), stamps surviving external caller-owned
-  referent borrows (`entry.targetFrameDepth == 0 && entry.targetLocal >= nLocals && !entry.allocDead`)
-  with `targetFrameDepth := callerReferentFrameDepth` so they are never shadowed
-  or disabled by any subsequent wider tail-callee frame!
--/
-def disableFrameBorrowsProto
-    (borrows : List BorrowEntry)
-    (depth nLocals : Nat) :
-    List BorrowEntry :=
-  match borrows with
-  | .nil => .nil
-  | entry :: rest =>
-    match
-      Bool.and
-        (Nat.beq entry.targetFrameDepth depth)
-        (Nat.blt entry.targetLocal nLocals)
-    with
+    simp only [isRootCallerReferentBorrow] at hCr ⊢
+    cases hD : Nat.beq entry.targetFrameDepth 0 with
+    | false => rfl
     | true =>
-      { entry with perm := .disabled, allocDead := true } ::
-        disableFrameBorrowsProto rest depth nLocals
-    | false =>
-      let promoteCallerReferent :=
-        Bool.and
-          (Bool.not entry.allocDead)
-          (Bool.and
-            (Nat.beq depth 0)
-            (Nat.beq entry.targetFrameDepth 0))
-      match promoteCallerReferent with
+      rw [hD, Bool.true_and] at hCr
+      rw [Bool.true_and]
+      have hlt : entry.targetLocal < nOld := by
+        apply Nat.lt_of_not_le
+        intro h
+        rw [← Nat.ble_eq] at h
+        rw [h] at hCr
+        cases hCr
+      cases hB : Nat.ble nNew entry.targetLocal with
+      | false => rfl
       | true =>
-        { entry with targetFrameDepth := callerReferentFrameDepth } ::
-          disableFrameBorrowsProto rest depth nLocals
-      | false =>
-        entry :: disableFrameBorrowsProto rest depth nLocals
+        exact absurd (Nat.lt_of_lt_of_le hlt (Nat.le_trans hle (Nat.le_of_ble_eq_true hB)))
+          (Nat.lt_irrefl _)
 
 /--
-Repaired `disableFramesAbove`: when unwinding pops frames above `depth`,
-preserves caller-owned referents (`targetFrameDepth == callerReferentFrameDepth`),
-which live in the external caller of the modular root (`depth < 0`) rather than
-above `depth`.
+**Bug 3 universal non-shadowing theorem (root frame active).** Let `entry` be
+any caller-owned referent borrow (`isRootCallerReferentBorrow nOld entry`) of
+the pre-tail-call borrow table, and let the root tail call replace the root
+frame of `nOld` locals by the callee frame `calleeLocals` (of *any* width).
+After `relocateRootCallerReferents`, `Trusted`'s own, unmodified frame-qualified
+lookup `readFrameLocalSlot` — on which every `Trusted` dereference read, write,
+reborrow, `copy_nonoverlapping`, and `BinOp.offset` bounds computation is built —
+resolves the relocated borrow to the original caller-owned slot
+`mem.callerLocals[entry.targetLocal]`, never to a local of the callee, and the
+relocated borrow is still a caller-owned referent of the new root frame (so the
+callee's teardown at its next tail call or return, `disableFrameBorrows … 0
+(length calleeLocals)`, keeps it live).
 -/
-def disableFramesAboveProto
-    (borrows : List BorrowEntry)
-    (depth : Nat) :
-    List BorrowEntry :=
-  match borrows with
-  | .nil => .nil
-  | entry :: rest =>
-    match
-      Bool.and
-        (Bool.not (Nat.beq entry.targetFrameDepth callerReferentFrameDepth))
-        (Nat.blt depth entry.targetFrameDepth)
-    with
+theorem relocateRootCallerReferents_readFrameLocalSlot
+    (mem : Memory) (nOld : Nat) (calleeLocals : List LocalSlot) (entry : BorrowEntry)
+    (hMem : entry ∈ mem.borrows)
+    (hCr : isRootCallerReferentBorrow nOld entry = true) :
+    let mem' := relocateRootCallerReferents mem nOld (length calleeLocals)
+    let entry' := relocatedRootBorrow mem nOld (length calleeLocals) entry
+    entry' ∈ mem'.borrows ∧
+    isRootCallerReferentBorrow (length calleeLocals) entry' = true ∧
+    readFrameLocalSlot calleeLocals .nil mem'.callerLocals
+        entry'.targetFrameDepth entry'.targetLocal =
+      get? mem.callerLocals entry.targetLocal := by
+  intro mem' entry'
+  have hAny := anyRootCallerReferentBorrow_of_mem nOld entry hCr mem.borrows hMem
+  have hCr' := hCr
+  simp only [isRootCallerReferentBorrow, Bool.and_eq_true, Nat.beq_eq, Nat.ble_eq] at hCr'
+  refine ⟨mem_relocateRootCallerReferents mem nOld (length calleeLocals) entry hMem, ?_, ?_⟩
+  · show isRootCallerReferentBorrow (length calleeLocals)
+      (relocatedRootBorrow mem nOld (length calleeLocals) entry) = true
+    unfold relocatedRootBorrow
+    rw [hAny, Bool.and_true]
+    cases hW : Nat.blt nOld (length calleeLocals) with
     | true =>
-      { entry with perm := .disabled, allocDead := true } ::
-        disableFramesAboveProto rest depth
+      have hle : nOld ≤ length calleeLocals := by
+        have := Nat.blt_eq.mp hW
+        omega
+      rw [isRootCallerReferentBorrow_shift nOld (length calleeLocals) hle entry]
+      exact hCr
     | false =>
-      entry :: disableFramesAboveProto rest depth
+      have hge : length calleeLocals ≤ nOld := by
+        apply Nat.le_of_not_lt
+        intro h
+        rw [← Nat.blt_eq] at h
+        rw [h] at hW
+        cases hW
+      simp only [isRootCallerReferentBorrow, Bool.and_eq_true, Nat.beq_eq, Nat.ble_eq]
+      exact ⟨hCr'.1, by omega⟩
+  · show readFrameLocalSlot calleeLocals .nil
+        (relocateRootCallerReferents mem nOld (length calleeLocals)).callerLocals
+        (relocatedRootBorrow mem nOld (length calleeLocals) entry).targetFrameDepth
+        (relocatedRootBorrow mem nOld (length calleeLocals) entry).targetLocal =
+      get? mem.callerLocals entry.targetLocal
+    unfold relocatedRootBorrow relocateRootCallerReferents
+    rw [hAny, Bool.and_true]
+    cases hW : Nat.blt nOld (length calleeLocals) with
+    | true =>
+      simp only [shiftRootCallerReferentBorrow, hCr]
+      have hOob : get? calleeLocals (Nat.add entry.targetLocal (Nat.sub (length calleeLocals) nOld)) =
+          .none := by
+        simp only [get?, length] at hW ⊢
+        apply List.getElem?_eq_none
+        have := Nat.blt_eq.mp hW
+        simp only [Nat.add_eq, Nat.sub_eq]
+        omega
+      simp only [readFrameLocalSlot, activeFrameSlot?, foreignFrameSlot?, hOob]
+      exact get?_padDeadSlots_add mem.callerLocals entry.targetLocal _
+    | false =>
+      have hge : length calleeLocals ≤ nOld := by
+        apply Nat.le_of_not_lt
+        intro h
+        rw [← Nat.blt_eq] at h
+        rw [h] at hW
+        cases hW
+      have hOob : get? calleeLocals entry.targetLocal = .none := by
+        simp only [get?]
+        apply List.getElem?_eq_none
+        exact Nat.le_trans hge hCr'.2
+      simp only [readFrameLocalSlot, activeFrameSlot?, foreignFrameSlot?, hOob]
+
+/--
+**Bug 3 universal non-shadowing theorem (root frame suspended).** The same
+resolution holds after the relocated root activation makes inline calls: with
+the root frame saved at the bottom of the call stack (`rest ++ [rootSaved]`, any
+`activeLocals` for the callee frame on top), `Trusted`'s `readFrameLocalSlot`
+resolves the relocated caller-owned referent borrow through the depth-`0`
+`foreignFrameSlot?` fallback to `callerLocals[entry.targetLocal]`.
+-/
+theorem relocateRootCallerReferents_readFrameLocalSlot_suspended
+    (mem : Memory) (nOld : Nat) (rootSaved : SavedCallerFrame) (rest : List SavedCallerFrame)
+    (activeLocals : List LocalSlot) (entry : BorrowEntry)
+    (hCr : isRootCallerReferentBorrow nOld entry = true)
+    (hWider : Nat.blt nOld (length rootSaved.frame.locals) = true)
+    (hAny : anyRootCallerReferentBorrow nOld mem.borrows = true) :
+    let n := length rootSaved.frame.locals
+    let mem' := relocateRootCallerReferents mem nOld n
+    let entry' := relocatedRootBorrow mem nOld n entry
+    readFrameLocalSlot activeLocals (rest ++ [rootSaved]) mem'.callerLocals
+        entry'.targetFrameDepth entry'.targetLocal =
+      get? mem.callerLocals entry.targetLocal := by
+  intro n mem' entry'
+  have hCr' := hCr
+  simp only [isRootCallerReferentBorrow, Bool.and_eq_true, Nat.beq_eq, Nat.ble_eq] at hCr'
+  show readFrameLocalSlot activeLocals (rest ++ [rootSaved])
+      (relocateRootCallerReferents mem nOld n).callerLocals
+      (relocatedRootBorrow mem nOld n entry).targetFrameDepth
+      (relocatedRootBorrow mem nOld n entry).targetLocal =
+    get? mem.callerLocals entry.targetLocal
+  unfold relocatedRootBorrow relocateRootCallerReferents
+  simp only [n] at hWider ⊢
+  rw [hWider, hAny, Bool.and_self]
+  simp only [shiftRootCallerReferentBorrow, hCr, hCr'.1]
+  have hLen : length (rest ++ [rootSaved]) = Nat.succ (length rest) := by
+    simp [length]
+  have hNotActive : Nat.beq 0 (length (rest ++ [rootSaved])) = false := by
+    rw [hLen]
+    rfl
+  have hSaved : savedFrameAtDepth? (rest ++ [rootSaved]) 0 = .some rootSaved := by
+    unfold savedFrameAtDepth?
+    rw [hLen]
+    simp only [frameIndexOfDepth, get?]
+    show (match Nat.blt 0 (Nat.succ (length rest)) with
+      | true => (rest ++ [rootSaved])[length rest]?
+      | false => none) = some rootSaved
+    have hBlt : Nat.blt 0 (Nat.succ (length rest)) = true := Nat.blt_eq.mpr (Nat.succ_pos _)
+    rw [hBlt]
+    simp [length]
+  have hOob : get? rootSaved.frame.locals
+      (Nat.add entry.targetLocal (Nat.sub (length rootSaved.frame.locals) nOld)) = .none := by
+    simp only [get?, length] at hWider ⊢
+    apply List.getElem?_eq_none
+    have := Nat.blt_eq.mp hWider
+    simp only [Nat.add_eq, Nat.sub_eq]
+    omega
+  cases hRest : rest ++ [rootSaved] with
+  | nil => simp at hRest
+  | cons hd tl =>
+    rw [hRest] at hNotActive hSaved
+    simp only [readFrameLocalSlot, activeFrameSlot?, hNotActive, foreignFrameSlot?, hSaved, hOob]
+    exact get?_padDeadSlots_add mem.callerLocals entry.targetLocal _
+
+/-- No relocation happens when the tail callee is not wider than the tail caller. -/
+theorem relocateRootCallerReferents_not_wider (mem : Memory) (nOld nNew : Nat)
+    (hNarrow : Nat.blt nOld nNew = false) :
+    relocateRootCallerReferents mem nOld nNew = mem := by
+  unfold relocateRootCallerReferents
+  rw [hNarrow, Bool.false_and]
+
+/-- No relocation happens when no borrow names a caller-owned referent (e.g. no pointer arguments). -/
+theorem relocateRootCallerReferents_no_referents (mem : Memory) (nOld nNew : Nat)
+    (hNone : anyRootCallerReferentBorrow nOld mem.borrows = false) :
+    relocateRootCallerReferents mem nOld nNew = mem := by
+  unfold relocateRootCallerReferents
+  rw [hNone, Bool.and_false]
+
+/--
+Frame-owned borrows (of the torn-down tail-caller frame or any other frame) are
+never moved, so `disableFrameBorrows`' dangling-pointer verdicts are untouched
+(`fDangle` still faults with `.ub`).
+-/
+theorem shiftRootCallerReferentBorrow_frameOwned (nRoot delta : Nat) (entry : BorrowEntry)
+    (hOwned : isRootCallerReferentBorrow nRoot entry = false) :
+    shiftRootCallerReferentBorrow nRoot delta entry = entry := by
+  unfold shiftRootCallerReferentBorrow
+  rw [hOwned]
 
 /-! ## 3. Bug 1: Multi-Element Subplace `copy_nonoverlapping` (`peelArrayElementProjForMultiCopy`) -/
 
@@ -752,12 +752,29 @@ def resolveArraySliceEndpoint?
       | _ => .none
 
 /--
-Tree Borrows read-then-write check and permission transition for a `copy_nonoverlapping`
-operating at effective source projection `srcEffProj` and effective destination
-projection `dstEffProj` (e.g. `parentProj ++ [.subslice start (start + n) false]`
-for a multi-element array slice copy).
+Tree Borrows read-then-write check and permission transition for a
+multi-element `copy_nonoverlapping` slice copy. This is exactly
+`Trusted.borrowsAfterCopySingleDirect` (`Statements.lean:1720-1864`, the
+transition `Trusted` already runs for single-element copies) evaluated at the
+accessed windows `srcEffProj` / `dstEffProj`
+(`parentProj ++ [.subslice start (start + n) false]`) with *unranged* accesses
+(`rangeOffset = rangeLen = 0`): a borrow's own byte range (`entry.rangeLen`,
+typically one element) would under-approximate an `n`-element access, so the
+accessed window is described by the `.subslice` projection alone and
+`borrowEntryOverlapsWrite` / `projectionsOverlap` compare projections.
+
+1. `hasTreeReadUB` on the source window (read through `srcPtr.tag`),
+2. the source read transition (`freezeTreeBorrowsOnReadAtProj` /
+   `updateBorrowPermOnReadAtProj`: foreign `.unique` borrows of the source
+   window become `.frozen`),
+3. destination write UB (`.frozen` / `.disabled` destination tag after the read,
+   or an ancestor child-write UB),
+4. active function-entry protector conflicts on the destination window,
+5. the destination write transition (`invalidateTreeBorrowsAtProj` /
+   `invalidateConflictingBorrowsAtProj` / `invalidateConflictingBorrows`), which
+   disables exactly the foreign borrows overlapping the written window.
 -/
-def borrowsAfterCopyAtProj
+def borrowsAfterCopySliceProto
     (borrows : List BorrowEntry)
     (activeProtectors : List Nat)
     (srcPtr dstPtr : ProvenancePtr)
@@ -775,8 +792,8 @@ def borrowsAfterCopyAtProj
         srcEntry.targetLocal
         (.some srcPtr.tag)
         srcEffProj
-        srcEntry.rangeOffset
-        srcEntry.rangeLen
+        0
+        0
         srcEntry.targetFrameDepth
     | _ => false
   match readUB with
@@ -792,8 +809,8 @@ def borrowsAfterCopyAtProj
           srcEntry.targetLocal
           (.some srcPtr.tag)
           srcEffProj
-          srcEntry.rangeOffset
-          srcEntry.rangeLen
+          0
+          0
           activeProtectors
           srcEntry.targetFrameDepth :: .nil
       | b₁ :: b₂ :: restBorrows =>
@@ -804,8 +821,8 @@ def borrowsAfterCopyAtProj
           srcEntry.targetLocal
           (.some srcPtr.tag)
           srcEffProj
-          srcEntry.rangeOffset
-          srcEntry.rangeLen
+          0
+          0
           activeProtectors
           srcEntry.targetFrameDepth
     let dstWriteTreeUB : Bool :=
@@ -843,8 +860,8 @@ def borrowsAfterCopyAtProj
               dstEntry.targetLocal
               (.some dstPtr.tag)
               dstEffProj
-              dstEntry.rangeOffset
-              dstEntry.rangeLen
+              0
+              0
               dstEntry.targetFrameDepth
           | _ =>
             hasProtectedWriteConflict
@@ -853,8 +870,8 @@ def borrowsAfterCopyAtProj
               dstEntry.targetLocal
               (.some dstPtr.tag)
               dstEffProj
-              dstEntry.rangeOffset
-              dstEntry.rangeLen
+              0
+              0
               dstEntry.targetFrameDepth
       match protConflict with
       | true => .none
@@ -866,30 +883,19 @@ def borrowsAfterCopyAtProj
             let b := single :: .nil
             match dstEffProj with
             | .nil =>
-              match Nat.beq dstEntry.rangeLen 0 with
-              | true =>
-                invalidateConflictingBorrows
-                  b
-                  dstEntry.targetLocal
-                  (.some dstPtr.tag)
-                  dstEntry.targetFrameDepth
-              | false =>
-                invalidateConflictingBorrowsAtProj
-                  b
-                  dstEntry.targetLocal
-                  (.some dstPtr.tag)
-                  .nil
-                  dstEntry.rangeOffset
-                  dstEntry.rangeLen
-                  dstEntry.targetFrameDepth
+              invalidateConflictingBorrows
+                b
+                dstEntry.targetLocal
+                (.some dstPtr.tag)
+                dstEntry.targetFrameDepth
             | pHead :: pTail =>
               invalidateConflictingBorrowsAtProj
                 b
                 dstEntry.targetLocal
                 (.some dstPtr.tag)
                 (pHead :: pTail)
-                dstEntry.rangeOffset
-                dstEntry.rangeLen
+                0
+                0
                 dstEntry.targetFrameDepth
           | b₁ :: b₂ :: restBorrows =>
             let allBorrows := b₁ :: b₂ :: restBorrows
@@ -899,122 +905,40 @@ def borrowsAfterCopyAtProj
               dstEntry.targetLocal
               (.some dstPtr.tag)
               dstEffProj
-              dstEntry.rangeOffset
-              dstEntry.rangeLen
+              0
+              0
               dstEntry.targetFrameDepth
         .some borrows'
 
 /--
-Write `newVal` to `dstPlace` (the peeled parent array place or subplace) in the
-owning frame (`locals₃`, `s.memory.callStack`, or `s.memory.callerLocals`) and
-invalidate conflicting Tree Borrows tags at `dstInvalProj` (checking active
-protectors when `s.memory.activeProtectors` is non-empty).
+Write `newVal` to `dstPlace` in the frame owning it — the active frame
+(`writePlaceValue`), or a modular root's caller-owned referent slot past the
+active frame (`Memory.callerLocals`) — committing the already-transitioned
+borrow table `borrows'`. This is exactly the write path of
+`Trusted.commitCopyDstPlaceWrite` (`Statements.lean:834-916`), with the borrow
+update supplied by the caller.
 -/
-def commitCopyDstPlaceWriteProto
+def writeCopyDstPlaceProto
     (s : MachineState)
     (dstPlace : Place)
-    (dstEntry : BorrowEntry)
-    (dstTag : Nat)
     (locals₃ : List LocalSlot)
     (newVal : Value)
+    (borrows' : List BorrowEntry)
     (localDecls : List LocalDecl := .nil)
-    (layouts : LayoutTable := emptyLayoutTable)
-    (dstInvalProjOpt : Option (List ProjectionElem) := .none) :
+    (layouts : LayoutTable := emptyLayoutTable) :
     MirStepNode :=
-  let effProj :=
-    match dstInvalProjOpt with
-    | .some p => p
-    | .none => dstPlace.projection
-  let protConflict : Bool :=
-    match s.memory.activeProtectors with
-    | .nil => false
-    | _ :: _ =>
-      hasProtectedWriteConflict
-        s.memory.borrows
-        s.memory.activeProtectors
-        dstEntry.targetLocal
-        (.some dstTag)
-        effProj
-        dstEntry.rangeOffset
-        dstEntry.rangeLen
-        dstEntry.targetFrameDepth
-  match protConflict with
-  | true => MirStepNode.fail .ub
-  | false =>
-    let computeBorrows (depth : Nat) : List BorrowEntry :=
-      match effProj with
-      | .nil =>
-        invalidateConflictingBorrows
-          s.memory.borrows
-          dstEntry.targetLocal
-          (.some dstTag)
-          depth
-      | pHead :: pTail =>
-        invalidateConflictingBorrowsAtProj
-          s.memory.borrows
-          dstEntry.targetLocal
-          (.some dstTag)
-          (pHead :: pTail)
-          dstEntry.rangeOffset
-          dstEntry.rangeLen
-          depth
-    match isCallerReferentBorrow dstEntry with
-    | false =>
-      match
-        writePlaceValue
-          locals₃
-          s.memory.borrows
-          dstPlace
-          newVal
-          localDecls
-          layouts
-          s.memory.callStack
-      with
-      | .ok locals₄ =>
-        let borrows' := computeBorrows (length s.memory.callStack)
-        MirStepNode.step
-          (advanceStmt s locals₄ { s.memory with borrows := borrows' })
-      | .unsupported => MirStepNode.unsupported
-      | .ub =>
-        match get? locals₃ dstPlace.local_ with
-        | .some _ => MirStepNode.fail .ub
-        | .none =>
-          let callerIdx :=
-            match get? s.memory.callerLocals dstPlace.local_ with
-            | .some _ => dstPlace.local_
-            | .none => Nat.sub dstPlace.local_ (length locals₃)
-          let callerWriteRes : PlaceWriteResult :=
-            match dstPlace.projection with
-            | .nil =>
-              match get? s.memory.callerLocals callerIdx with
-              | .some .dead => .ub
-              | .some _ =>
-                match set? s.memory.callerLocals callerIdx (.init newVal) with
-                | .some callerLocals' => .ok callerLocals'
-                | .none => .ub
-              | .none => .ub
-            | .deref :: _ => .ub
-            | proj :: rest =>
-              match get? s.memory.callerLocals callerIdx with
-              | .some (.init rootVal) =>
-                match writeProjectedValue locals₃ rootVal (proj :: rest) newVal with
-                | .ok rootVal' =>
-                  match set? s.memory.callerLocals callerIdx (.init rootVal') with
-                  | .some callerLocals' => .ok callerLocals'
-                  | .none => .ub
-                | .ub => .ub
-                | .unsupported => .unsupported
-              | _ => .ub
-          match callerWriteRes with
-          | .ub => MirStepNode.fail .ub
-          | .unsupported => MirStepNode.unsupported
-          | .ok callerLocals' =>
-            let borrows' := computeBorrows 0
-            MirStepNode.step
-              (advanceStmt s locals₃
-                { s.memory with borrows := borrows', callerLocals := callerLocals' })
-    | true =>
-      let callerIdx := dstPlace.local_
+  match writePlaceValue locals₃ s.memory.borrows dstPlace newVal localDecls layouts with
+  | .ok locals₄ =>
+    MirStepNode.step (advanceStmt s locals₄ { s.memory with borrows := borrows' })
+  | .unsupported => MirStepNode.unsupported
+  | .ub =>
+    match get? locals₃ dstPlace.local_ with
+    | .some _ => MirStepNode.fail .ub
+    | .none =>
+      let callerIdx :=
+        match get? s.memory.callerLocals dstPlace.local_ with
+        | .some _ => dstPlace.local_
+        | .none => Nat.sub dstPlace.local_ (length locals₃)
       let callerWriteRes : PlaceWriteResult :=
         match dstPlace.projection with
         | .nil =>
@@ -1041,14 +965,66 @@ def commitCopyDstPlaceWriteProto
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
       | .ok callerLocals' =>
-        let borrows' := computeBorrows callerReferentFrameDepth
         MirStepNode.step
           (advanceStmt s locals₃
             { s.memory with borrows := borrows', callerLocals := callerLocals' })
 
 /--
-Resolve the root slot of `entry` across `locals₃` and `s.memory.callerLocals`,
-respecting `isCallerReferentBorrow entry`.
+Destination commit for the byte-level `copyViaBytes` fallback of
+`evalCopyNonOverlappingPermOkProto`: checks active function-entry protectors and
+applies the foreign-write transition scoped to `dstPlace.projection` (unranged),
+then writes through `writeCopyDstPlaceProto`. (`Trusted.commitCopyDstPlaceWrite`
+invalidates the whole local and skips protector checks.)
+-/
+def commitCopyDstPlaceWriteProto
+    (s : MachineState)
+    (dstPlace : Place)
+    (dstEntry : BorrowEntry)
+    (dstTag : Nat)
+    (locals₃ : List LocalSlot)
+    (newVal : Value)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    MirStepNode :=
+  let protConflict : Bool :=
+    match s.memory.activeProtectors with
+    | .nil => false
+    | _ :: _ =>
+      hasProtectedWriteConflict
+        s.memory.borrows
+        s.memory.activeProtectors
+        dstEntry.targetLocal
+        (.some dstTag)
+        dstPlace.projection
+        0
+        0
+        dstEntry.targetFrameDepth
+  match protConflict with
+  | true => MirStepNode.fail .ub
+  | false =>
+    let borrows' : List BorrowEntry :=
+      match dstPlace.projection with
+      | .nil =>
+        invalidateConflictingBorrows
+          s.memory.borrows
+          dstEntry.targetLocal
+          (.some dstTag)
+          dstEntry.targetFrameDepth
+      | pHead :: pTail =>
+        invalidateConflictingBorrowsAtProj
+          s.memory.borrows
+          dstEntry.targetLocal
+          (.some dstTag)
+          (pHead :: pTail)
+          0
+          0
+          dstEntry.targetFrameDepth
+    writeCopyDstPlaceProto s dstPlace locals₃ newVal borrows' localDecls layouts
+
+/--
+Root slot of a `copy_nonoverlapping` endpoint borrow `entry`: the active
+frame's slot, else the modular root's caller-owned referent slot (exactly the
+`srcRootSlot` / `dstRootSlot` lookup of `Trusted.evalCopyNonOverlappingPermOk`).
 -/
 @[reducible]
 def resolveCopyEndpointRootSlot
@@ -1056,93 +1032,29 @@ def resolveCopyEndpointRootSlot
     (locals₃ : List LocalSlot)
     (entry : BorrowEntry) :
     Option LocalSlot :=
-  match isCallerReferentBorrow entry with
-  | true => get? s.memory.callerLocals entry.targetLocal
-  | false =>
-    match get? locals₃ entry.targetLocal with
+  match get? locals₃ entry.targetLocal with
+  | .some slot => .some slot
+  | .none =>
+    match get? s.memory.callerLocals entry.targetLocal with
     | .some slot => .some slot
     | .none =>
-      match get? s.memory.callerLocals entry.targetLocal with
-      | .some slot => .some slot
-      | .none =>
-        get? s.memory.callerLocals (Nat.sub entry.targetLocal (length locals₃))
+      get? s.memory.callerLocals (Nat.sub entry.targetLocal (length locals₃))
 
 /--
-Repaired `evalCopySingleDirect` that respects `isCallerReferentBorrow` on both
-`srcEntry` and `dstEntry` while remaining definitionally identical to
-`Trusted.evalCopySingleDirect` when neither entry is marked with
-`callerReferentFrameDepth`.
+Effective Tree Borrows access window of `n` elements starting at `start` in the
+array container `parentProj` holding `len` elements (`.nil` when the window is the
+whole top-level array).
 -/
-def evalCopySingleDirectProto
-    (s : MachineState)
-    (src dst : Operand)
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (srcPtr dstPtr : ProvenancePtr)
-    (srcEntry dstEntry : BorrowEntry)
-    (locals₃ : List LocalSlot) :
-    MirStepNode :=
-  match
-    Bool.or
-      (isCallerReferentBorrow srcEntry)
-      (isCallerReferentBorrow dstEntry)
-  with
-  | false =>
-    evalCopySingleDirect
-      s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃
-  | true =>
-    let overlaps :=
-      match Nat.beq srcPtr.tag dstPtr.tag with
-      | true => true
-      | false =>
-        match
-          Bool.and
-            (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
-            (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
-        with
-        | false => false
-        | true =>
-          projectionsOverlap
-            srcEntry.targetProjection
-            dstEntry.targetProjection
-    match overlaps with
-    | true => MirStepNode.fail .ub
-    | false =>
-      match resolveCopyEndpointRootSlot s locals₃ srcEntry with
-      | .some (.init srcRootVal) =>
-        match readProjectedValue locals₃ srcRootVal srcEntry.targetProjection with
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
-        | .ok copiedVal =>
-          let dstPlace : Place := {
-            local_ := dstEntry.targetLocal
-            projection := dstEntry.targetProjection
-          }
-          let convertedOpt : Option Value :=
-            match
-              operandPointeeTy localDecls layouts src,
-              operandPointeeTy localDecls layouts dst
-            with
-            | .some srcPt, .some dstPt =>
-              match sameRigidTyShape srcPt.kind dstPt.kind with
-              | true => .some copiedVal
-              | false =>
-                match rigidTyByteSize layouts srcPt, rigidTyByteSize layouts dstPt with
-                | .some sSz, .some dSz =>
-                  match Nat.beq sSz dSz with
-                  | false => .none
-                  | true =>
-                    match encodeValueToBytes defaultCodecFuel layouts srcPt copiedVal with
-                    | .some bs => decodeValueFromBytes defaultCodecFuel layouts dstPt bs
-                    | .none => .none
-                | _, _ => .some copiedVal
-            | _, _ => .some copiedVal
-          match convertedOpt with
-          | .none => MirStepNode.fail .ub
-          | .some finalVal =>
-            commitCopyDstPlaceWriteProto
-              s dstPlace dstEntry dstPtr.tag locals₃ finalVal localDecls layouts
-      | _ => MirStepNode.fail .ub
+@[reducible]
+def copySliceWindowProj
+    (parentProj : List ProjectionElem)
+    (start n len : Nat) :
+    List ProjectionElem :=
+  match parentProj, Bool.and (Nat.beq start 0) (Nat.beq n len) with
+  | .nil, true => .nil
+  | _, _ =>
+    normalizeSubsliceProjections
+      (appendProjections parentProj (.subslice start (Nat.add start n) false :: .nil))
 
 /--
 Determine the required total byte length `n * elemBytes` for a `copyViaBytes`
@@ -1182,21 +1094,28 @@ def expectedMultiCopyBytes?
     | _ => .none
 
 /--
-Repaired `evalCopyNonOverlappingPermOk`:
-1. Delegates single-element zero-offset copies (`n == 1 && srcStart == 0 && dstStart == 0`)
-   to `evalCopySingleDirectProto`.
-2. Peels trailing `.constantIndex` projections on `srcEntry.targetProjection`
-   and `dstEntry.targetProjection` via `resolveArraySliceEndpoint?` so
-   multi-element copies (`copy_nonoverlapping(&raw const arr[i], &raw mut dst[j], n)`)
-   read and write `n` elements of the enclosing `.aggregate 0` array container
-   and write back to `{ local_ := dstEntry.targetLocal, projection := dstParentProj }`.
-3. Checks bounds (`srcStart + n <= length srcElems` and `dstStart + n <= length dstElems`)
-   and non-overlap (`sameContainer -> srcStart + n <= dstStart || dstStart + n <= srcStart`),
-   allowing disjoint slices of the same array while faulting with `.ub` on
-   overlapping slices or out-of-bounds element counts.
-4. Enforces `length bs == expectedCopyBytes` in `copyViaBytes` so `n > 1` on a
-   scalar subplace always faults with `MirStepNode.fail .ub` instead of silently
-   copying 1 element.
+Repaired `evalCopyNonOverlappingPermOk` (`Statements.lean:1414-1687`):
+1. Zero-count copies, union endpoints (`Trusted.evalCopyUnionBytes`), and
+   single-element zero-offset copies (`Trusted.evalCopySingleDirect`) are
+   exactly `Trusted`'s.
+2. Converts both pointer byte offsets into element offsets of the statically
+   known pointee (`resolvePtrElemOffset?`); a byte offset that is not a whole
+   number of elements (a misaligned element pointer) faults with `.ub` instead of
+   being reinterpreted as an element index (`Trusted` uses raw
+   `ProvenancePtr.offsetBytes` as an element index).
+3. Peels trailing `.constantIndex` projections of both endpoints via
+   `resolveArraySliceEndpoint?`, so `copy_nonoverlapping(&raw const a[i], &raw mut b[j], n)`
+   reads and writes `n` elements of the enclosing `.aggregate 0` arrays and writes
+   back to `{ local_ := dstEntry.targetLocal, projection := dstParentProj }`.
+4. Checks bounds (`srcStart + n ≤ length srcElems`, `dstStart + n ≤ length dstElems`)
+   and non-overlap (`sameContainer → srcStart + n ≤ dstStart ∨ dstStart + n ≤ srcStart`),
+   allowing disjoint slices of one array while faulting with `.ub` on
+   overlapping slices or out-of-bounds counts.
+5. Runs the Tree Borrows read-then-write transition of `Trusted`'s
+   single-element path on the accessed `.subslice` windows
+   (`borrowsAfterCopySliceProto`).
+6. Requires `length bs == n * elemBytes` in the byte-level fallback, so `n > 1`
+   on a scalar allocation faults with `.ub` instead of copying one element.
 -/
 def evalCopyNonOverlappingPermOkProto
     (s : MachineState)
@@ -1234,7 +1153,7 @@ def evalCopyNonOverlappingPermOkProto
           (Bool.and (Nat.beq srcStartRaw 0) (Nat.beq dstStartRaw 0))
       match isSingleDirect with
       | true =>
-        evalCopySingleDirectProto
+        evalCopySingleDirect
           s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃
       | false =>
         let srcRootSlot := resolveCopyEndpointRootSlot s locals₃ srcEntry
@@ -1251,305 +1170,301 @@ def evalCopyNonOverlappingPermOkProto
             match dstPtOpt with
             | .some pt => .some pt
             | .none => srcPtOpt
-          let srcSliceEndOpt :=
-            resolveArraySliceEndpoint?
-              locals₃ srcRootVal srcEntry.targetProjection srcStartRaw n effSrcPtOpt layouts
-          let dstSliceEndOpt :=
-            resolveArraySliceEndpoint?
-              locals₃ dstRootVal dstEntry.targetProjection dstStartRaw n effDstPtOpt layouts
-          let dstRawPlace : Place := {
-            local_ := dstEntry.targetLocal
-            projection := dstEntry.targetProjection
-          }
-          let dstLocalPlaceTy : Option Ty :=
-            match isCallerReferentBorrow dstEntry, get? locals₃ dstRawPlace.local_ with
-            | false, .some _ => placeTy localDecls layouts dstRawPlace
-            | _, _ => .none
-          let dstIsAdt : Bool :=
-            match dstLocalPlaceTy with
-            | .some { kind := .adt _ _, .. } => true
-            | _ => false
-          let copyViaBytes
-              (srcSubVal dstSubVal : Value)
-              (effSrcStart effDstStart : Nat)
-              (effDstPlace : Place)
-              (effDstLocalPlaceTy : Option Ty)
-              (effDstIsAdt : Bool) :
-              MirStepNode :=
-            let overlaps :=
-              match Nat.beq srcPtr.tag dstPtr.tag with
-              | true => true
-              | false =>
-                match
-                  Bool.and
-                    (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
-                    (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
-                with
-                | false => false
-                | true =>
-                  projectionsOverlap
-                    srcEntry.targetProjection
-                    effDstPlace.projection
-            match overlaps with
-            | true => MirStepNode.fail .ub
-            | false =>
-              let srcSliceVal : Option Value :=
-                match srcSubVal with
-                | .aggregate 0 srcElems =>
-                  match Nat.ble (Nat.add effSrcStart n) (length srcElems) with
+          match
+            resolvePtrElemOffset? srcStartRaw effSrcPtOpt layouts,
+            resolvePtrElemOffset? dstStartRaw effDstPtOpt layouts
+          with
+          | .some srcElemOff, .some dstElemOff =>
+            let srcSliceEndOpt :=
+              resolveArraySliceEndpoint?
+                locals₃ srcRootVal srcEntry.targetProjection srcStartRaw n effSrcPtOpt layouts
+            let dstSliceEndOpt :=
+              resolveArraySliceEndpoint?
+                locals₃ dstRootVal dstEntry.targetProjection dstStartRaw n effDstPtOpt layouts
+            let dstRawPlace : Place := {
+              local_ := dstEntry.targetLocal
+              projection := dstEntry.targetProjection
+            }
+            let dstLocalPlaceTy : Option Ty :=
+              match get? locals₃ dstRawPlace.local_ with
+              | .some _ => placeTy localDecls layouts dstRawPlace
+              | .none => .none
+            let dstIsAdt : Bool :=
+              match dstLocalPlaceTy with
+              | .some { kind := .adt _ _, .. } => true
+              | _ => false
+            let copyViaBytes
+                (srcSubVal dstSubVal : Value)
+                (effSrcStart effDstStart : Nat)
+                (effDstPlace : Place)
+                (effDstLocalPlaceTy : Option Ty)
+                (effDstIsAdt : Bool) :
+                MirStepNode :=
+              let overlaps :=
+                match Nat.beq srcPtr.tag dstPtr.tag with
+                | true => true
+                | false =>
+                  match
+                    Bool.and
+                      (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
+                      (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
+                  with
+                  | false => false
                   | true =>
-                    .some (.aggregate 0 (takeValues n (dropValues effSrcStart srcElems)))
-                  | false =>
-                    match Bool.and (Nat.beq effSrcStart 0) (Nat.beq n 1) with
+                    projectionsOverlap
+                      srcEntry.targetProjection
+                      effDstPlace.projection
+              match overlaps with
+              | true => MirStepNode.fail .ub
+              | false =>
+                let srcSliceVal : Option Value :=
+                  match srcSubVal with
+                  | .aggregate 0 srcElems =>
+                    match Nat.ble (Nat.add effSrcStart n) (length srcElems) with
+                    | true =>
+                      .some (.aggregate 0 (takeValues n (dropValues effSrcStart srcElems)))
+                    | false =>
+                      match Bool.and (Nat.beq effSrcStart 0) (Nat.beq n 1) with
+                      | true => .some srcSubVal
+                      | false => .none
+                  | _ =>
+                    match Nat.beq effSrcStart 0 with
                     | true => .some srcSubVal
                     | false => .none
-                | _ =>
-                  match Nat.beq effSrcStart 0 with
-                  | true => .some srcSubVal
-                  | false => .none
-              let dstTargetTyOpt : Option Ty :=
-                match effDstLocalPlaceTy with
-                | .some t => .some t
-                | .none => effDstPtOpt
-              match srcSliceVal with
-              | .none => MirStepNode.fail .ub
-              | .some sVal =>
-                match encodeUntypedValueToBytes defaultCodecFuel sVal with
-                | .none => MirStepNode.unsupported
-                | .some bs =>
-                  let byteCountMatches : Bool :=
-                    match expectedMultiCopyBytes? localDecls layouts src dst srcSubVal n with
-                    | .some expBytes => Nat.beq (length bs) expBytes
-                    | .none => true
-                  match byteCountMatches with
-                  | false => MirStepNode.fail .ub
-                  | true =>
-                    let writeDstVal (newVal : Value) : MirStepNode :=
-                      commitCopyDstPlaceWriteProto
-                        s effDstPlace dstEntry dstPtr.tag locals₃ newVal localDecls layouts
-                    let spliceBytesToDstArray : Option Value :=
-                      match Bool.not effDstIsAdt, dstSubVal with
-                      | true, .aggregate 0 dstElems =>
-                        match Nat.ble (Nat.add effDstStart (length bs)) (length dstElems) with
-                        | false => .none
-                        | true =>
-                          match
-                            decodeArrayChunksWith
-                              (fun chunk =>
-                                decodeValueFromBytes
-                                  defaultCodecFuel
-                                  layouts
-                                  { kind := .uint .u8, layoutIdx := 0 }
-                                  chunk)
-                              1
-                              (length bs)
-                              bs
-                          with
-                          | .some copiedBytes =>
-                            .some (.aggregate 0 (spliceValues copiedBytes effDstStart dstElems))
-                          | .none => .none
-                      | _, _ => .none
-                    let preferSplicedArray : Bool :=
-                      match effDstLocalPlaceTy, dstSubVal with
-                      | .none, .aggregate 0 _ => true
-                      | _, _ => false
-                    match preferSplicedArray, spliceBytesToDstArray with
-                    | true, .some splicedVal => writeDstVal splicedVal
-                    | _, _ =>
-                      match dstTargetTyOpt with
-                      | .some dstPt =>
-                        match rigidTyByteSize layouts dstPt with
-                        | .some dstBytes =>
-                          match Nat.beq (length bs) dstBytes with
+                let dstTargetTyOpt : Option Ty :=
+                  match effDstLocalPlaceTy with
+                  | .some t => .some t
+                  | .none => effDstPtOpt
+                match srcSliceVal with
+                | .none => MirStepNode.fail .ub
+                | .some sVal =>
+                  match encodeUntypedValueToBytes defaultCodecFuel sVal with
+                  | .none => MirStepNode.unsupported
+                  | .some bs =>
+                    let byteCountMatches : Bool :=
+                      match expectedMultiCopyBytes? localDecls layouts src dst srcSubVal n with
+                      | .some expBytes => Nat.beq (length bs) expBytes
+                      | .none => true
+                    match byteCountMatches with
+                    | false => MirStepNode.fail .ub
+                    | true =>
+                      let writeDstVal (newVal : Value) : MirStepNode :=
+                        commitCopyDstPlaceWriteProto
+                          s effDstPlace dstEntry dstPtr.tag locals₃ newVal localDecls layouts
+                      let spliceBytesToDstArray : Option Value :=
+                        match Bool.not effDstIsAdt, dstSubVal with
+                        | true, .aggregate 0 dstElems =>
+                          match Nat.ble (Nat.add effDstStart (length bs)) (length dstElems) with
+                          | false => .none
                           | true =>
-                            match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
-                            | .some decodedVal => writeDstVal decodedVal
-                            | .none =>
+                            match
+                              decodeArrayChunksWith
+                                (fun chunk =>
+                                  decodeValueFromBytes
+                                    defaultCodecFuel
+                                    layouts
+                                    { kind := .uint .u8, layoutIdx := 0 }
+                                    chunk)
+                                1
+                                (length bs)
+                                bs
+                            with
+                            | .some copiedBytes =>
+                              .some (.aggregate 0 (spliceValues copiedBytes effDstStart dstElems))
+                            | .none => .none
+                        | _, _ => .none
+                      let preferSplicedArray : Bool :=
+                        match effDstLocalPlaceTy, dstSubVal with
+                        | .none, .aggregate 0 _ => true
+                        | _, _ => false
+                      match preferSplicedArray, spliceBytesToDstArray with
+                      | true, .some splicedVal => writeDstVal splicedVal
+                      | _, _ =>
+                        match dstTargetTyOpt with
+                        | .some dstPt =>
+                          match rigidTyByteSize layouts dstPt with
+                          | .some dstBytes =>
+                            match Nat.beq (length bs) dstBytes with
+                            | true =>
+                              match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
+                              | .some decodedVal => writeDstVal decodedVal
+                              | .none =>
+                                match spliceBytesToDstArray with
+                                | .some splicedVal => writeDstVal splicedVal
+                                | .none => MirStepNode.fail .ub
+                            | false =>
                               match spliceBytesToDstArray with
                               | .some splicedVal => writeDstVal splicedVal
                               | .none => MirStepNode.fail .ub
-                          | false =>
+                          | .none =>
                             match spliceBytesToDstArray with
                             | .some splicedVal => writeDstVal splicedVal
-                            | .none => MirStepNode.fail .ub
+                            | .none => MirStepNode.unsupported
                         | .none =>
                           match spliceBytesToDstArray with
                           | .some splicedVal => writeDstVal splicedVal
-                          | .none => MirStepNode.unsupported
-                      | .none =>
-                        match spliceBytesToDstArray with
-                        | .some splicedVal => writeDstVal splicedVal
-                        | .none => MirStepNode.fail .ub
-          match srcSliceEndOpt, dstSliceEndOpt with
-          | .some (srcParentProj, srcStart, srcElems),
-            .some (dstParentProj, dstStart, dstElems) =>
-            let dstParentPlace : Place := {
-              local_ := dstEntry.targetLocal
-              projection := dstParentProj
-            }
-            let dstParentTy : Option Ty :=
-              match isCallerReferentBorrow dstEntry, get? locals₃ dstParentPlace.local_ with
-              | false, .some _ => placeTy localDecls layouts dstParentPlace
-              | _, _ => .none
-            let dstParentIsAdt : Bool :=
-              match dstParentTy with
-              | .some { kind := .adt _ _, .. } => true
-              | _ => false
-            let inBounds :=
-              Bool.and
-                (Bool.not dstParentIsAdt)
-                (Bool.and
-                  (Nat.ble (Nat.add srcStart n) (length srcElems))
-                  (Nat.ble (Nat.add dstStart n) (length dstElems)))
-            match inBounds with
-            | false =>
-              match
+                          | .none => MirStepNode.fail .ub
+            match srcSliceEndOpt, dstSliceEndOpt with
+            | .some (srcParentProj, srcStart, srcElems),
+              .some (dstParentProj, dstStart, dstElems) =>
+              let dstParentPlace : Place := {
+                local_ := dstEntry.targetLocal
+                projection := dstParentProj
+              }
+              let dstParentTy : Option Ty :=
+                match get? locals₃ dstParentPlace.local_ with
+                | .some _ => placeTy localDecls layouts dstParentPlace
+                | .none => .none
+              let dstParentIsAdt : Bool :=
+                match dstParentTy with
+                | .some { kind := .adt _ _, .. } => true
+                | _ => false
+              let inBounds :=
                 Bool.and
-                  (Nat.beq dstStart 0)
-                  (Nat.ble (Nat.add srcStart n) (length srcElems))
-              with
+                  (Bool.not dstParentIsAdt)
+                  (Bool.and
+                    (Nat.ble (Nat.add srcStart n) (length srcElems))
+                    (Nat.ble (Nat.add dstStart n) (length dstElems)))
+              match inBounds with
+              | false =>
+                match
+                  Bool.and
+                    (Nat.beq dstStart 0)
+                    (Nat.ble (Nat.add srcStart n) (length srcElems))
+                with
+                | true =>
+                  copyViaBytes
+                    (.aggregate 0 srcElems)
+                    (.aggregate 0 dstElems)
+                    srcStart
+                    dstStart
+                    dstParentPlace
+                    dstParentTy
+                    dstParentIsAdt
+                | false => MirStepNode.fail .ub
               | true =>
+                let sameContainer :=
+                  Bool.and
+                    (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
+                    (Bool.and
+                      (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
+                      (projectionsOverlap srcParentProj dstParentProj))
+                let disjoint :=
+                  match sameContainer with
+                  | false => Bool.not (Nat.beq srcPtr.tag dstPtr.tag)
+                  | true =>
+                    Bool.or
+                      (Nat.ble (Nat.add srcStart n) dstStart)
+                      (Nat.ble (Nat.add dstStart n) srcStart)
+                match disjoint with
+                | false => MirStepNode.fail .ub
+                | true =>
+                  let copiedSlice := takeValues n (dropValues srcStart srcElems)
+                  let dstElems' := spliceValues copiedSlice dstStart dstElems
+                  match
+                    borrowsAfterCopySliceProto
+                      s.memory.borrows
+                      s.memory.activeProtectors
+                      srcPtr
+                      dstPtr
+                      srcEntry
+                      dstEntry
+                      (copySliceWindowProj srcParentProj srcStart n (length srcElems))
+                      (copySliceWindowProj dstParentProj dstStart n (length dstElems))
+                  with
+                  | .none => MirStepNode.fail .ub
+                  | .some borrows' =>
+                    writeCopyDstPlaceProto
+                      s
+                      dstParentPlace
+                      locals₃
+                      (.aggregate 0 dstElems')
+                      borrows'
+                      localDecls
+                      layouts
+            | .some (_, srcStart, srcElems), .none =>
+              match readProjectedValue locals₃ dstRootVal dstEntry.targetProjection with
+              | .ok dstSubVal =>
                 copyViaBytes
                   (.aggregate 0 srcElems)
-                  (.aggregate 0 dstElems)
+                  dstSubVal
                   srcStart
+                  dstElemOff
+                  dstRawPlace
+                  dstLocalPlaceTy
+                  dstIsAdt
+              | .ub =>
+                match Nat.beq dstElemOff 0 with
+                | true =>
+                  copyViaBytes
+                    (.aggregate 0 srcElems)
+                    .unit
+                    srcStart
+                    0
+                    dstRawPlace
+                    dstLocalPlaceTy
+                    dstIsAdt
+                | false => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+            | .none, .some (dstParentProj, dstStart, dstElems) =>
+              let dstParentPlace : Place := {
+                local_ := dstEntry.targetLocal
+                projection := dstParentProj
+              }
+              let dstParentTy : Option Ty :=
+                match get? locals₃ dstParentPlace.local_ with
+                | .some _ => placeTy localDecls layouts dstParentPlace
+                | .none => .none
+              let dstParentIsAdt : Bool :=
+                match dstParentTy with
+                | .some { kind := .adt _ _, .. } => true
+                | _ => false
+              match readProjectedValue locals₃ srcRootVal srcEntry.targetProjection with
+              | .ok srcSubVal =>
+                copyViaBytes
+                  srcSubVal
+                  (.aggregate 0 dstElems)
+                  srcElemOff
                   dstStart
                   dstParentPlace
                   dstParentTy
                   dstParentIsAdt
-              | false => MirStepNode.fail .ub
-            | true =>
-              let sameContainer :=
-                Bool.and
-                  (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
-                  (Bool.and
-                    (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
-                    (projectionsOverlap srcParentProj dstParentProj))
-              let disjoint :=
-                match sameContainer with
-                | false => Bool.not (Nat.beq srcPtr.tag dstPtr.tag)
-                | true =>
-                  Bool.or
-                    (Nat.ble (Nat.add srcStart n) dstStart)
-                    (Nat.ble (Nat.add dstStart n) srcStart)
-              match disjoint with
-              | false => MirStepNode.fail .ub
-              | true =>
-                let copiedSlice := takeValues n (dropValues srcStart srcElems)
-                let dstElems' := spliceValues copiedSlice dstStart dstElems
-                let dstSliceInvalProj :=
-                  match dstParentProj, Nat.beq dstStart 0 && Nat.beq n (length dstElems) with
-                  | .nil, true => .nil
-                  | _, _ =>
-                    normalizeSubsliceProjections
-                      (appendProjections
-                        dstParentProj
-                        (.subslice dstStart (Nat.add dstStart n) false :: .nil))
-                commitCopyDstPlaceWriteProto
-                  s
-                  dstParentPlace
-                  dstEntry
-                  dstPtr.tag
-                  locals₃
-                  (.aggregate 0 dstElems')
-                  localDecls
-                  layouts
-                  (.some dstSliceInvalProj)
-          | .some (_, srcStart, srcElems), .none =>
-            match readProjectedValue locals₃ dstRootVal dstEntry.targetProjection with
-            | .ok dstSubVal =>
-              copyViaBytes
-                (.aggregate 0 srcElems)
-                dstSubVal
-                srcStart
-                dstStartRaw
-                dstRawPlace
-                dstLocalPlaceTy
-                dstIsAdt
-            | .ub =>
-              match Nat.beq dstStartRaw 0 with
-              | true =>
-                copyViaBytes
-                  (.aggregate 0 srcElems)
-                  .unit
-                  srcStart
-                  0
-                  dstRawPlace
-                  dstLocalPlaceTy
-                  dstIsAdt
-              | false => MirStepNode.fail .ub
-            | .unsupported => MirStepNode.unsupported
-          | .none, .some (dstParentProj, dstStart, dstElems) =>
-            let dstParentPlace : Place := {
-              local_ := dstEntry.targetLocal
-              projection := dstParentProj
-            }
-            let dstParentTy : Option Ty :=
-              match isCallerReferentBorrow dstEntry, get? locals₃ dstParentPlace.local_ with
-              | false, .some _ => placeTy localDecls layouts dstParentPlace
-              | _, _ => .none
-            let dstParentIsAdt : Bool :=
-              match dstParentTy with
-              | .some { kind := .adt _ _, .. } => true
-              | _ => false
-            match readProjectedValue locals₃ srcRootVal srcEntry.targetProjection with
-            | .ok srcSubVal =>
-              copyViaBytes
-                srcSubVal
-                (.aggregate 0 dstElems)
-                srcStartRaw
-                dstStart
-                dstParentPlace
-                dstParentTy
-                dstParentIsAdt
-            | _ => MirStepNode.fail .ub
-          | .none, .none =>
-            match
-              readProjectedValue locals₃ srcRootVal srcEntry.targetProjection,
-              readProjectedValue locals₃ dstRootVal dstEntry.targetProjection
-            with
-            | .ok srcSubVal, .ok dstSubVal =>
-              copyViaBytes
-                srcSubVal
-                dstSubVal
-                srcStartRaw
-                dstStartRaw
-                dstRawPlace
-                dstLocalPlaceTy
-                dstIsAdt
-            | .ok srcSubVal, .ub =>
-              match Nat.beq dstStartRaw 0 with
-              | true =>
+              | _ => MirStepNode.fail .ub
+            | .none, .none =>
+              match
+                readProjectedValue locals₃ srcRootVal srcEntry.targetProjection,
+                readProjectedValue locals₃ dstRootVal dstEntry.targetProjection
+              with
+              | .ok srcSubVal, .ok dstSubVal =>
                 copyViaBytes
                   srcSubVal
-                  .unit
-                  srcStartRaw
-                  0
+                  dstSubVal
+                  srcElemOff
+                  dstElemOff
                   dstRawPlace
                   dstLocalPlaceTy
                   dstIsAdt
-              | false => MirStepNode.fail .ub
-            | _, _ => MirStepNode.fail .ub
+              | .ok srcSubVal, .ub =>
+                match Nat.beq dstElemOff 0 with
+                | true =>
+                  copyViaBytes
+                    srcSubVal
+                    .unit
+                    srcElemOff
+                    0
+                    dstRawPlace
+                    dstLocalPlaceTy
+                    dstIsAdt
+                | false => MirStepNode.fail .ub
+              | _, _ => MirStepNode.fail .ub
+          | _, _ => MirStepNode.fail .ub
         | _, _ => MirStepNode.fail .ub
 
 /--
-Check whether `srcEntry` and `dstEntry` both target the active frame (or root
-`callerLocals` when `callStack` is empty).
--/
-def copyEntriesTargetActiveFrameProto
-    (callStack : List SavedCallerFrame)
-    (srcEntry dstEntry : BorrowEntry) :
-    Bool :=
-  match callStack with
-  | .nil => true
-  | _ :: _ =>
-    Bool.and
-      (Nat.beq srcEntry.targetFrameDepth (length callStack))
-      (Nat.beq dstEntry.targetFrameDepth (length callStack))
-
-/--
-Repaired `evalCopyNonOverlappingWithCount` delegating to
-`evalCopyNonOverlappingPermOkProto`.
+Repaired `evalCopyNonOverlappingWithCount` (`Statements.lean:2036-2088`)
+delegating active-frame copies to `evalCopyNonOverlappingPermOkProto` (foreign
+frame copies stay `Trusted.evalForeignFrameCopySingleDirect`, which fails closed
+with `.unsupported` on multi-element counts).
 -/
 def evalCopyNonOverlappingWithCountProto
     (s : MachineState)
@@ -1575,7 +1490,7 @@ def evalCopyNonOverlappingWithCountProto
         | _, .frozen => MirStepNode.fail .ub
         | _, .disabled => MirStepNode.fail .ub
         | _, _ =>
-          match copyEntriesTargetActiveFrameProto s.memory.callStack srcEntry dstEntry with
+          match copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry with
           | false =>
             evalForeignFrameCopySingleDirect
               s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃
@@ -1586,7 +1501,7 @@ def evalCopyNonOverlappingWithCountProto
     | _, _ => MirStepNode.fail .ub
 
 /--
-Repaired `evalCopyNonOverlapping` delegating to
+Repaired `evalCopyNonOverlapping` (`Statements.lean:2102`) delegating to
 `evalCopyNonOverlappingWithCountProto`.
 -/
 def evalCopyNonOverlappingProto
@@ -1649,100 +1564,93 @@ def evalCopyNonOverlappingProto
           locals₃
       | .ok _ _ => MirStepNode.fail .ub
 
-/-! ## 4. Repaired Place Read, Operand, Rvalue, Place Write, and Statement Evaluation -/
+/-! ## 4. Bug 4: Repaired Place Read, Operand, Rvalue, Place Write, and Statement Evaluation -/
 
 /--
-Dereference read helper for a pointer whose `BorrowEntry` has
-`isCallerReferentBorrow entry = true` (targeting `callerLocals[entry.targetLocal]`
-even when `entry.targetLocal < length locals`).
--/
-def evalCallerReferentDerefRead
-    (locals : List LocalSlot)
-    (callerLocals : List LocalSlot)
-    (entry : BorrowEntry)
-    (ptrVal : ProvenancePtr)
-    (restProj : List ProjectionElem)
-    (localDecls : List LocalDecl := .nil)
-    (layouts : LayoutTable := emptyLayoutTable)
-    (_pointeeTyOpt : Option Ty := .none)
-    (accessedTyOpt : Option Ty := .none) :
-    PlaceReadResult :=
-  match entry.perm with
-  | .disabled => .ub
-  | _ =>
-    match get? callerLocals entry.targetLocal with
-    | .some (.init targetRootVal) =>
-      match
-        needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
-      with
-      | false =>
-        let fullProj :=
-          match entry.targetProjection with
-          | .nil => restProj
-          | ph :: pt => ph :: appendProjections pt restProj
-        match readProjectedValue locals targetRootVal fullProj with
-        | .ok fieldVal =>
-          match localDecls with
-          | .nil => .ok fieldVal locals
-          | _ :: _ =>
-            match validateValueForTy? layouts accessedTyOpt fieldVal with
-            | true => .ok fieldVal locals
-            | false => .ub
-        | .ub => .ub
-        | .unsupported => .unsupported
-      | true =>
-        match
-          resolveStackThinPtrTargetProj?
-            locals
-            targetRootVal
-            entry
-            ptrVal
-            restProj
-        with
-        | .none => .ub
-        | .some fullProj =>
-          match readProjectedValue locals targetRootVal fullProj with
-          | .ok fieldVal =>
-            match localDecls with
-            | .nil => .ok fieldVal locals
-            | _ :: _ =>
-              match validateValueForTy? layouts accessedTyOpt fieldVal with
-              | true => .ok fieldVal locals
-              | false => .ub
-          | .ub => .ub
-          | .unsupported => .unsupported
-    | _ => .ub
-
-/--
-Check whether `p` is a dereferencing place `⟨ptrLoc, .deref :: restProj⟩` whose
-pointer in `locals` resolves to a caller-owned referent borrow
-(`isCallerReferentBorrow entry = true`).
+Leading `.opaqueCast` prefix of a projection path (the complement of
+`stripLeadingOpaqueCast`).
 -/
 @[reducible]
-def derefLookupCallerReferent?
-    (locals : List LocalSlot)
-    (borrows : List BorrowEntry)
-    (p : Place) :
-    Option (ProvenancePtr × BorrowEntry × List ProjectionElem) :=
-  match p.projection with
-  | .deref :: restProj =>
-    match get? locals p.local_ with
-    | .some (.init (.ptr ptrVal _)) =>
-      match lookupBorrow borrows ptrVal.tag with
-      | .some entry =>
-        match isCallerReferentBorrow entry with
-        | true => .some (ptrVal, entry, restProj)
-        | false => .none
-      | .none => .none
+def takeLeadingOpaqueCast : List ProjectionElem → List ProjectionElem
+  | .opaqueCast t :: rest => .opaqueCast t :: takeLeadingOpaqueCast rest
+  | _ => .nil
+
+/--
+Repaired `uninitFieldWriteShell?` (`Statements.lean:2852-2873`): strips leading
+`.opaqueCast` projections before matching `.field fieldIdx fieldTy :: rest'`, and
+builds the field shell for the type *after* the casts
+(`placeTy localDecls layouts ⟨loc, takeLeadingOpaqueCast (proj :: rest)⟩`), so
+`(_l as T).f = rv` on a live `.uninit` local of opaque type materializes the
+same `T` shell as its post-borrowck erasure `_l.f = rv` with `_l : T`. Without a
+leading cast this is exactly `Trusted.uninitFieldWriteShell?`.
+-/
+def uninitFieldWriteShellProto?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem := .nil) :
+    Option Value :=
+  match stripLeadingOpaqueCast (proj :: rest) with
+  | .field fieldIdx fieldTy :: rest' =>
+    match
+      placeTy localDecls layouts
+        { local_ := loc, projection := takeLeadingOpaqueCast (proj :: rest) }
+    with
+    | .some { kind := .adt _ _, .. } =>
+      .some (ensureNestedFieldShells (.aggregate 0 .nil) (.field fieldIdx fieldTy :: rest'))
+    | .some { kind := .tuple _, .. } =>
+      .some (ensureNestedFieldShells (.aggregate 0 .nil) (.field fieldIdx fieldTy :: rest'))
     | _ => .none
   | _ => .none
 
 /--
-Repaired `evalPlaceRead`:
-- Routes dereferences of caller-owned referents (`isCallerReferentBorrow entry = true`)
-  directly to `callerLocals[entry.targetLocal]` instead of `locals[entry.targetLocal]`.
-- Strips leading `.opaqueCast` projections before root-vs-projected (`[]` vs `proj :: rest`)
-  dispatch while keeping `placeTy` / `placeTyResolved` on the original `Place` `p`.
+`localDecls` with local `loc` retyped to the type reached after the leading
+`.opaqueCast` chain of `proj` — the declared type of `loc` in the post-borrowck
+erasure (`_l : T` for `(_l as T)`). Without a leading cast (or an undeclared
+`loc`) this is `localDecls` unchanged. Used for the type-directed projected
+write of `(_l as T).f = rv` (`writeProjectedForLocal`,
+`resolveBorrowWriteLocalProj`), which `Trusted` keys on the declared type.
+-/
+def eraseLeadingOpaqueCastDecls
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (proj : List ProjectionElem) :
+    List LocalDecl :=
+  match takeLeadingOpaqueCast proj with
+  | .nil => localDecls
+  | ph :: pt =>
+    match
+      get? localDecls loc,
+      placeTy localDecls layouts { local_ := loc, projection := ph :: pt }
+    with
+    | .some decl, .some castTy => localDecls.set loc { decl with ty := castTy }
+    | _, _ => localDecls
+
+theorem eraseLeadingOpaqueCastDecls_no_cast
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (proj : List ProjectionElem) (hNo : takeLeadingOpaqueCast proj = .nil) :
+    eraseLeadingOpaqueCastDecls localDecls layouts loc proj = localDecls := by
+  unfold eraseLeadingOpaqueCastDecls
+  rw [hNo]
+
+@[simp]
+theorem uninitFieldWriteShellProto?_field
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (rest : List ProjectionElem) :
+    uninitFieldWriteShellProto? localDecls layouts loc (.field fieldIdx fieldTy) rest =
+      uninitFieldWriteShell? localDecls layouts loc (.field fieldIdx fieldTy) rest := rfl
+
+/--
+Repaired `evalPlaceRead`: a pure `.opaqueCast` chain on a local
+(`p.projection ≠ []`, `stripLeadingOpaqueCast p.projection = []`) reads the root
+local exactly like `⟨l, []⟩`, validating against the cast type
+`placeTy localDecls layouts p`; every other place is `Trusted.evalPlaceRead`.
 -/
 def evalPlaceReadProto
     (locals : List LocalSlot)
@@ -1754,38 +1662,29 @@ def evalPlaceReadProto
     (localDecls : List LocalDecl := .nil)
     (callStack : List SavedCallerFrame := .nil) :
     PlaceReadResult :=
-  match derefLookupCallerReferent? locals borrows p with
-  | .some (ptrVal, entry, restProj) =>
-    let accessedTyOpt := placeTyResolved localDecls layouts p
-    let pointeeTyOpt :=
-      placeTyResolved localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
-    evalCallerReferentDerefRead
-      locals callerLocals entry ptrVal restProj localDecls layouts pointeeTyOpt accessedTyOpt
-  | .none =>
-    match p.projection with
-    | .deref :: _ =>
-      evalPlaceRead locals p borrows globals layouts callerLocals localDecls callStack
-    | _ =>
-      match stripLeadingOpaqueCast p.projection with
-      | .nil =>
-        match get? locals p.local_ with
-        | .some (.init rootVal) =>
-          match validateValueForTy? layouts (placeTy localDecls layouts p) rootVal with
-          | true => .ok rootVal locals
-          | false => .ub
-        | .some .uninit => .ub
-        | .some .dead => .ub
-        | .none => .ub
-      | _ :: _ =>
-        evalPlaceRead locals p borrows globals layouts callerLocals localDecls callStack
+  match p.projection with
+  | .nil => evalPlaceRead locals p borrows globals layouts callerLocals localDecls callStack
+  | .deref :: _ => evalPlaceRead locals p borrows globals layouts callerLocals localDecls callStack
+  | _ :: _ =>
+    match stripLeadingOpaqueCast p.projection with
+    | .nil =>
+      match get? locals p.local_ with
+      | .some (.init rootVal) =>
+        match validateValueForTy? layouts (placeTy localDecls layouts p) rootVal with
+        | true => .ok rootVal locals
+        | false => .ub
+      | .some .uninit => .ub
+      | .some .dead => .ub
+      | .none => .ub
+    | _ :: _ => evalPlaceRead locals p borrows globals layouts callerLocals localDecls callStack
 
 /--
-Repaired `evalOperand`:
-- Strips leading `.opaqueCast` projections on `Operand.move p` before
-  root-vs-projected dispatch so `move (_l as T)` de-initializes `_l` to `.uninit`
-  just like `move _l`.
-- Routes dereferences of caller-owned referents (`isCallerReferentBorrow entry = true`)
-  directly to `callerLocals[entry.targetLocal]`.
+Repaired `evalOperand`: `Operand.move p` with a pure `.opaqueCast` chain
+(`p.projection ≠ []`, `stripLeadingOpaqueCast p.projection = []`) moves the root
+local exactly like `move ⟨l, []⟩` (de-initializing `_l`), validating against the
+cast type when `localDecls` is non-empty; every other operand is
+`Trusted.evalOperand` (in particular an ordinary `move ⟨l, []⟩` is *not*
+re-validated, exactly as in `Trusted`).
 -/
 def evalOperandProto
     (locals : List LocalSlot)
@@ -1798,58 +1697,35 @@ def evalOperandProto
     (callStack : List SavedCallerFrame := .nil) :
     PlaceReadResult :=
   match op with
-  | .constant _ =>
-    evalOperand locals op borrows globals layouts callerLocals localDecls callStack
-  | .copy p =>
-    match derefLookupCallerReferent? locals borrows p with
-    | .some (ptrVal, entry, restProj) =>
-      let accessedTyOpt := placeTyResolved localDecls layouts p
-      let pointeeTyOpt :=
-        placeTyResolved localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
-      evalCallerReferentDerefRead
-        locals callerLocals entry ptrVal restProj localDecls layouts pointeeTyOpt accessedTyOpt
-    | .none =>
-      evalOperand locals (.copy p) borrows globals layouts callerLocals localDecls callStack
   | .move p =>
-    match derefLookupCallerReferent? locals borrows p with
-    | .some (ptrVal, entry, restProj) =>
-      let accessedTyOpt := placeTyResolved localDecls layouts p
-      let pointeeTyOpt :=
-        placeTyResolved localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
-      evalCallerReferentDerefRead
-        locals callerLocals entry ptrVal restProj localDecls layouts pointeeTyOpt accessedTyOpt
-    | .none =>
-      match p.projection with
-      | .deref :: _ =>
-        evalOperand locals (.move p) borrows globals layouts callerLocals localDecls callStack
-      | _ =>
-        match stripLeadingOpaqueCast p.projection with
-        | .nil =>
-          let tyValid :=
-            match localDecls with
-            | .nil => true
-            | _ :: _ =>
-              match get? locals p.local_ with
-              | .some (.init v) =>
-                validateValueForTy? layouts (placeTy localDecls layouts p) v
-              | _ => true
-          match tyValid with
-          | false => .ub
-          | true =>
+    match p.projection with
+    | .nil => evalOperand locals op borrows globals layouts callerLocals localDecls callStack
+    | .deref :: _ => evalOperand locals op borrows globals layouts callerLocals localDecls callStack
+    | _ :: _ =>
+      match stripLeadingOpaqueCast p.projection with
+      | .nil =>
+        let tyValid :=
+          match localDecls with
+          | .nil => true
+          | _ :: _ =>
             match get? locals p.local_ with
-            | .some (.init v) =>
-              match set? locals p.local_ .uninit with
-              | .some locals' => .ok v locals'
-              | .none => .ub
-            | .some .uninit => .ub
-            | .some .dead => .ub
+            | .some (.init v) => validateValueForTy? layouts (placeTy localDecls layouts p) v
+            | _ => true
+        match tyValid with
+        | false => .ub
+        | true =>
+          match get? locals p.local_ with
+          | .some (.init v) =>
+            match set? locals p.local_ .uninit with
+            | .some locals' => .ok v locals'
             | .none => .ub
-        | _ :: _ =>
-          evalOperand locals (.move p) borrows globals layouts callerLocals localDecls callStack
+          | .some .uninit => .ub
+          | .some .dead => .ub
+          | .none => .ub
+      | _ :: _ => evalOperand locals op borrows globals layouts callerLocals localDecls callStack
+  | _ => evalOperand locals op borrows globals layouts callerLocals localDecls callStack
 
-/--
-Evaluate a list of `Operand`s left-to-right using `evalOperandProto`.
--/
+/-- Evaluate a list of `Operand`s left-to-right using `evalOperandProto` (cf. `Trusted.evalOperands`). -/
 def evalOperandsProto
     (locals : List LocalSlot)
     (ops : List Operand)
@@ -1873,15 +1749,11 @@ def evalOperandsProto
     | .unsupported => .unsupported
 
 /--
-Repaired `writePlaceValue`:
-- Strips leading `.opaqueCast` projections before root-vs-projected (`[]` vs `proj :: rest`)
-  dispatch so `writePlaceValue` on `⟨l, [.opaqueCast t]⟩` initializes an `.uninit`
-  local `l` just like `⟨l, []⟩` (while still validating `val` against
-  `placeTy localDecls layouts dst` when `localDecls` is non-empty, and still
-  returning `.unsupported` on `.opaqueCast _ :: .deref :: _`).
-- Returns `.ub` when dereferencing a caller-owned referent (`isCallerReferentBorrow entry = true`)
-  so caller-local dereference writes fall through cleanly to `foreignFrameDerefWriteProto`
-  instead of overwriting `locals[entry.targetLocal]`.
+Repaired `writePlaceValue`: a pure `.opaqueCast` chain on a local initializes
+the root local exactly like `⟨l, []⟩` (validating `val` against the cast type
+`placeTy localDecls layouts dst` when `localDecls` is non-empty); every other
+place (including `.opaqueCast _ :: .deref :: _`, which stays `.unsupported`) is
+`Trusted.writePlaceValue`.
 -/
 def writePlaceValueProto
     (locals : List LocalSlot)
@@ -1892,266 +1764,35 @@ def writePlaceValueProto
     (layouts : LayoutTable := emptyLayoutTable)
     (callStack : List SavedCallerFrame := .nil) :
     PlaceWriteResult :=
-  match derefLookupCallerReferent? locals borrows dst with
-  | .some _ => .ub
-  | .none =>
-    match dst.projection with
-    | .deref :: _ =>
-      writePlaceValue locals borrows dst val localDecls layouts callStack
-    | _ =>
-      match stripLeadingOpaqueCast dst.projection with
-      | .nil =>
-        let tyValid :=
-          match localDecls with
-          | .nil => true
-          | _ :: _ => validateValueForTy? layouts (placeTy localDecls layouts dst) val
-        match tyValid with
-        | false => .ub
-        | true =>
-          match get? locals dst.local_ with
-          | .some .dead => .ub
-          | .some _ =>
-            match set? locals dst.local_ (.init val) with
-            | .some locals' => .ok locals'
-            | .none => .ub
-          | .none => .ub
-      | _ :: _ =>
-        writePlaceValue locals borrows dst val localDecls layouts callStack
-
-/--
-Repaired `evalPlaceWrite` using `writePlaceValueProto`.
--/
-def evalPlaceWriteProto
-    (locals : List LocalSlot)
-    (borrows : List BorrowEntry)
-    (dst : Place)
-    (val : Value)
-    (activeProtectors : List Nat := .nil)
-    (localDecls : List LocalDecl := .nil)
-    (layouts : LayoutTable := emptyLayoutTable)
-    (callStack : List SavedCallerFrame := .nil) :
-    PlaceWriteResult :=
-  match derefLookupCallerReferent? locals borrows dst with
-  | .some _ => .ub
-  | .none =>
-    match activeProtectors with
-    | .nil => writePlaceValueProto locals borrows dst val localDecls layouts callStack
-    | protHead :: protTail =>
-      let prots := protHead :: protTail
-      match dst.projection with
-      | .deref :: _ =>
-        evalPlaceWrite locals borrows dst val prots localDecls layouts callStack
-      | _ =>
-        match stripLeadingOpaqueCast dst.projection with
-        | .nil =>
-          match
-            hasProtectedWriteConflict
-              borrows prots dst.local_ .none .nil 0 0 (length callStack)
-          with
-          | true => .ub
-          | false => writePlaceValueProto locals borrows dst val localDecls layouts callStack
-        | proj :: rest =>
-          let resolvedProj :=
-            match resolveBorrowProjectionElems locals (proj :: rest) with
-            | .some rp => rp
-            | .none => proj :: rest
-          match
-            hasProtectedWriteConflict
-              borrows prots dst.local_ .none resolvedProj 0 0 (length callStack)
-          with
-          | true => .ub
-          | false => writePlaceValueProto locals borrows dst val localDecls layouts callStack
-
-/--
-Dereference write helper for a pointer whose `BorrowEntry` has
-`isCallerReferentBorrow entry = true` (targeting `callerLocals[entry.targetLocal]`
-even when `entry.targetLocal < length frameLocals` and `callStack = .nil`).
--/
-def evalCallerReferentDerefWrite
-    (frameLocals : List LocalSlot)
-    (callerLocals : List LocalSlot)
-    (borrows : List BorrowEntry)
-    (entry : BorrowEntry)
-    (ptrVal : ProvenancePtr)
-    (restProj : List ProjectionElem)
-    (val : Value)
-    (activeProtectors : List Nat := .nil) :
-    PlaceWriteResult :=
-  match entry.perm with
-  | .frozen | .disabled => .ub
-  | _ =>
-    let fullProjOpt : Option (List ProjectionElem) :=
-      match needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes with
-      | false =>
-        .some
-          (match entry.targetProjection with
-           | .nil => restProj
-           | ph :: pt => ph :: appendProjections pt restProj)
+  match dst.projection with
+  | .nil => writePlaceValue locals borrows dst val localDecls layouts callStack
+  | .deref :: _ => writePlaceValue locals borrows dst val localDecls layouts callStack
+  | _ :: _ =>
+    match stripLeadingOpaqueCast dst.projection with
+    | .nil =>
+      let tyValid :=
+        match localDecls with
+        | .nil => true
+        | _ :: _ => validateValueForTy? layouts (placeTy localDecls layouts dst) val
+      match tyValid with
+      | false => .ub
       | true =>
-        match get? callerLocals entry.targetLocal with
-        | .some (.init targetRootVal) =>
-          resolveStackThinPtrTargetProj? frameLocals targetRootVal entry ptrVal restProj
-        | _ => .none
-    match fullProjOpt with
-    | .none => .ub
-    | .some fullProj =>
-      let protConflict : Bool :=
-        match activeProtectors with
-        | .nil => false
-        | _ :: _ =>
-          hasProtectedWriteConflict
-            borrows
-            activeProtectors
-            entry.targetLocal
-            (.some ptrVal.tag)
-            fullProj
-            entry.rangeOffset
-            entry.rangeLen
-            entry.targetFrameDepth
-      match protConflict with
-      | true => .ub
-      | false =>
-        match fullProj with
-        | .nil =>
-          match get? callerLocals entry.targetLocal with
-          | .some .dead => .ub
-          | .some _ =>
-            match set? callerLocals entry.targetLocal (.init val) with
-            | .some callerLocals' => .ok callerLocals'
-            | .none => .ub
+        match get? locals dst.local_ with
+        | .some .dead => .ub
+        | .some _ =>
+          match set? locals dst.local_ (.init val) with
+          | .some locals' => .ok locals'
           | .none => .ub
-        | pHead :: pTail =>
-          match get? callerLocals entry.targetLocal with
-          | .some (.init targetRootVal) =>
-            match writeProjectedValue frameLocals targetRootVal (pHead :: pTail) val with
-            | .ok targetRootVal' =>
-              match set? callerLocals entry.targetLocal (.init targetRootVal') with
-              | .some callerLocals' => .ok callerLocals'
-              | .none => .ub
-            | .ub => .ub
-            | .unsupported => .unsupported
-          | _ => .ub
+        | .none => .ub
+    | _ :: _ => writePlaceValue locals borrows dst val localDecls layouts callStack
 
 /--
-Repaired `foreignFrameDerefWrite` that routes caller-owned referents
-(`isCallerReferentBorrow entry = true`) to `mem₁.callerLocals` even when
-`mem₁.callStack` is empty and `entry.targetLocal < length locals₁`.
--/
-def foreignFrameDerefWriteProto
-    (locals₁ : List LocalSlot)
-    (mem₁ : Memory)
-    (dst : Place)
-    (restProj : List ProjectionElem)
-    (val : Value)
-    (localDecls : List LocalDecl := .nil)
-    (layouts : LayoutTable := emptyLayoutTable) :
-    FrameWriteResult :=
-  match get? locals₁ dst.local_ with
-  | .some (.init ptrOrFatVal) =>
-    match extractDerefPtrVal? ptrOrFatVal with
-    | .some ptrVal =>
-      match lookupBorrow mem₁.borrows ptrVal.tag with
-      | .some entry =>
-        match activeFrameSlotProto? locals₁ mem₁.callStack entry.targetFrameDepth entry.targetLocal with
-        | .some _ => .ub
-        | .none =>
-          match
-            foreignFrameTargetProto?
-              mem₁.callStack
-              mem₁.callerLocals
-              entry.targetFrameDepth
-              entry.targetLocal
-          with
-          | .none => .ub
-          | .some target =>
-            let writeRes : PlaceWriteResult :=
-              match isCallerReferentBorrow entry with
-              | true =>
-                evalCallerReferentDerefWrite
-                  locals₁
-                  target.locals
-                  mem₁.borrows
-                  entry
-                  ptrVal
-                  restProj
-                  val
-                  mem₁.activeProtectors
-              | false =>
-                let (writeDecls, writeLayouts) :=
-                  match target with
-                  | .savedFrame _ _ => (localDecls, layouts)
-                  | .callerReferent _ => (.nil, emptyLayoutTable)
-                evalCallerPlaceWrite
-                  locals₁
-                  target.locals
-                  mem₁.borrows
-                  dst
-                  val
-                  mem₁.activeProtectors
-                  writeDecls
-                  writeLayouts
-                  mem₁.callStack
-            match writeRes with
-            | .ok targetLocals' =>
-              let (targetDecls, targetLayouts) :=
-                match isCallerReferentBorrow entry with
-                | true => (.nil, layouts)
-                | false =>
-                  foreignFrameDeclsAndLayouts
-                    mem₁.callStack
-                    layouts
-                    entry.targetFrameDepth
-                    entry.targetLocal
-              match
-                Bool.or
-                  (derefWriteTreeUB locals₁ mem₁.borrows dst)
-                  (derefWriteUnionProtectorUB
-                    targetDecls
-                    targetLayouts
-                    locals₁
-                    mem₁.borrows
-                    mem₁.activeProtectors
-                    dst
-                    restProj
-                    mem₁.callStack)
-              with
-              | true => .ub
-              | false =>
-                let borrows' :=
-                  match targetDecls with
-                  | .nil =>
-                    invalidateDerefWriteBorrows
-                      locals₁
-                      mem₁.borrows
-                      dst
-                      restProj
-                      mem₁.callerLocals
-                      mem₁.callStack
-                  | _ :: _ =>
-                    invalidateDerefWriteBorrowsWithLayouts
-                      targetDecls
-                      targetLayouts
-                      locals₁
-                      mem₁.borrows
-                      dst
-                      restProj
-                      mem₁.callStack
-                match commitForeignFrameLocals mem₁ target targetLocals' with
-                | .some mem₂ => .ok locals₁ { mem₂ with borrows := borrows' }
-                | .none => .ub
-            | .ub => .ub
-            | .unsupported => .unsupported
-      | .none => .ub
-    | .none => .ub
-  | _ => .ub
-
-/--
-Repaired `evalRvalue`:
-- Uses `evalOperandProto` for `Rvalue.use`.
-- Propagates `callerReferentFrameDepth` (`isCallerReferentBorrow`) across child
-  reborrows (`Rvalue.ref` and `Rvalue.rawPtr` on `.deref :: restProj`) and resolves
-  the referent root value from `mem.callerLocals[parentEntry.targetLocal]` even
-  when `parentEntry.targetLocal < length locals`.
+Repaired `evalRvalue`: only `Rvalue.use (Operand.move p)` with a pure
+`.opaqueCast` chain differs from `Trusted.evalRvalue` — it moves the root local
+(`evalOperandProto`) and then applies `Trusted`'s `validateLoadedValue` check.
+Every other rvalue, including every other `Rvalue.use`, is `Trusted.evalRvalue`,
+so `Trusted`'s load validation and Tree Borrows dereference-read semantics
+(`derefReadTreeUB` / `freezeDerefReadBorrowsAt`) are kept.
 -/
 def evalRvalueProto
     (locals : List LocalSlot)
@@ -2161,113 +1802,39 @@ def evalRvalueProto
     (layouts : LayoutTable := emptyLayoutTable) :
     RvalueEvalResult :=
   match rv with
-  | .use op =>
-    match
-      evalOperandProto
-        locals
-        op
-        mem.borrows
-        mem.globals
-        layouts
-        mem.callerLocals
-        localDecls
-        mem.callStack
-    with
-    | .ok v locals' => .ok v locals' mem
-    | .ub => .ub
-    | .unsupported => .unsupported
-  | .ref borrowKind place =>
-    match derefLookupCallerReferent? locals mem.borrows place with
-    | .some (parentPtr, parentEntry, restProj) =>
-      let perm :=
-        match borrowKind with
-        | .shared => sharedBorrowPerm localDecls layouts place
-        | .mut _ => mutableBorrowPerm localDecls layouts place
-      let ptrBytes := layoutPointerBytes layouts
-      match parentEntry.perm, borrowKind with
-      | .disabled, _ => .ub
-      | .frozen, .mut _ => .ub
-      | _, _ =>
-        match resolveBorrowProjectionElems locals restProj with
-        | .none => .ub
-        | .some resolvedRest =>
-          match get? mem.callerLocals parentEntry.targetLocal with
-          | .some (.init targetRootVal) =>
-            let rawFull :=
-              match parentEntry.targetProjection with
-              | .nil => resolvedRest
-              | ph :: pt => ph :: appendProjections pt resolvedRest
-            match readProjectedValue locals targetRootVal rawFull with
-            | .ok _ =>
-              let tag := mem.nextTag
-              let entry : BorrowEntry := {
-                tag := tag
-                targetLocal := parentEntry.targetLocal
-                targetFrameDepth := parentEntry.targetFrameDepth
-                allocDead := parentEntry.allocDead
-                targetProjection := rawFull
-                perm := perm
-                rangeOffset := parentEntry.rangeOffset
-                rangeLen := parentEntry.rangeLen
-                parentTag := .some parentPtr.tag
-              }
-              let mem' := {
-                mem with
-                borrows := entry :: mem.borrows
-                nextTag := Nat.add tag 1
-              }
-              .ok (.ptr { allocId := tag, offsetBytes := parentPtr.offsetBytes } ptrBytes) locals mem'
-            | .ub => .ub
-            | .unsupported => .unsupported
-          | _ => .ub
-    | .none =>
-      evalRvalue locals (.ref borrowKind place) mem localDecls layouts
-  | .rawPtr mutability place =>
-    match derefLookupCallerReferent? locals mem.borrows place with
-    | .some (parentPtr, parentEntry, restProj) =>
-      let ptrBytes := layoutPointerBytes layouts
-      let cleanRest := stripTransparentProjections restProj
-      match cleanRest with
-      | .nil => .ok (.ptr parentPtr ptrBytes) locals mem
-      | _ :: _ =>
-        match resolveBorrowProjectionElems locals restProj with
-        | .none => .ub
-        | .some resolvedRest =>
-          let rawFull :=
-            match parentEntry.targetProjection with
-            | .nil => resolvedRest
-            | ph :: pt => ph :: appendProjections pt resolvedRest
-          let tag := mem.nextTag
-          let entry : BorrowEntry := {
-            tag := tag
-            targetLocal := parentEntry.targetLocal
-            targetFrameDepth := parentEntry.targetFrameDepth
-            allocDead := parentEntry.allocDead
-            targetProjection := rawFull
-            perm := parentEntry.perm
-            rangeOffset := parentEntry.rangeOffset
-            rangeLen := parentEntry.rangeLen
-            parentTag := .some parentPtr.tag
-          }
-          let mem' := {
-            mem with
-            borrows := entry :: mem.borrows
-            nextTag := Nat.add tag 1
-          }
-          .ok (.ptr { allocId := tag, offsetBytes := parentPtr.offsetBytes } ptrBytes) locals mem'
-    | .none =>
-      evalRvalue locals (.rawPtr mutability place) mem localDecls layouts
-  | _ =>
-    evalRvalue locals rv mem localDecls layouts
+  | .use (.move p) =>
+    match p.projection with
+    | .nil => evalRvalue locals rv mem localDecls layouts
+    | .deref :: _ => evalRvalue locals rv mem localDecls layouts
+    | _ :: _ =>
+      match stripLeadingOpaqueCast p.projection with
+      | .nil =>
+        match
+          evalOperandProto
+            locals (.move p) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack
+        with
+        | .ok v locals' =>
+          match validateLoadedValue layouts localDecls (.move p) v with
+          | false => .ub
+          | true => .ok v locals' mem
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | _ :: _ => evalRvalue locals rv mem localDecls layouts
+  | _ => evalRvalue locals rv mem localDecls layouts
 
 /--
-Repaired `evalStmt` combining:
+Repaired `evalStmt` (`Statements.lean:3906-4570`), equal to `Trusted.evalStmt`
+except for:
 - Bug 1: `evalCopyNonOverlappingProto` on `StatementKind.intrinsic (.copyNonOverlapping ...)`,
-- Bug 3: `foreignFrameDerefWriteProto` / `evalRvalueProto` / `evalOperandProto`
-  for caller-owned referents after root tail calls,
 - Bug 4: `stripLeadingOpaqueCast` before root-vs-projected dispatch in
-  `StatementKind.assign`, `StatementKind.deinit`, and `StatementKind.setDiscriminant`,
-  plus `uninitFieldWriteShellProto?` for `(_l as T).f = rv` on `.uninit` locals.
+  `StatementKind.assign`, `StatementKind.deinit`, and
+  `StatementKind.setDiscriminant`, `uninitFieldWriteShellProto?` for
+  `(_l as T).f = rv` on `.uninit` locals, the erased declaration
+  `eraseLeadingOpaqueCastDecls` for the type-directed projected write of
+  `(_l as T).f = rv`, and `evalRvalueProto` for `Rvalue.use (move (_l as T))`.
+The `.deref :: _` destination branch of `.assign` is `Trusted`'s verbatim
+(`evalPlaceWrite`, then `evalCallerPlaceWrite` at a modular root or
+`evalForeignFrameDerefWrite` in a callee).
 -/
 def evalStmtProto
     (s : MachineState)
@@ -2312,7 +1879,7 @@ def evalStmtProto
       match dst.projection with
       | .deref :: restProj =>
         match
-          evalPlaceWriteProto
+          evalPlaceWrite
             locals₁
             mem₁.borrows
             dst
@@ -2350,10 +1917,42 @@ def evalStmtProto
             MirStepNode.step
               (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | .ub =>
-          match foreignFrameDerefWriteProto locals₁ mem₁ dst restProj val localDecls layouts with
-          | .ok locals₂ mem₂ => MirStepNode.step (advanceStmt s locals₂ mem₂)
-          | .ub => MirStepNode.fail .ub
-          | .unsupported => MirStepNode.unsupported
+          match mem₁.callStack with
+          | .nil =>
+            match mem₁.callerLocals with
+            | .nil => MirStepNode.fail .ub
+            | _ :: _ =>
+              match
+                evalCallerPlaceWrite
+                  locals₁
+                  mem₁.callerLocals
+                  mem₁.borrows
+                  dst
+                  val
+                  mem₁.activeProtectors
+              with
+              | .ok callerLocals' =>
+                match derefWriteTreeUB locals₁ mem₁.borrows dst with
+                | true => MirStepNode.fail .ub
+                | false =>
+                  let borrows' :=
+                    invalidateDerefWriteBorrows
+                      locals₁
+                      mem₁.borrows
+                      dst
+                      restProj
+                      mem₁.callerLocals
+                  MirStepNode.step
+                    (advanceStmt
+                      s
+                      locals₁
+                      { mem₁ with
+                        borrows := borrows'
+                        callerLocals := callerLocals' })
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+          | _ :: _ =>
+            evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts
         | .unsupported => MirStepNode.unsupported
       | _ =>
         match stripLeadingOpaqueCast dst.projection with
@@ -2391,16 +1990,26 @@ def evalStmtProto
                     (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
             | .none => MirStepNode.fail .ub
           | .none => MirStepNode.fail .ub
-        | proj :: rest =>
-          match get? locals₁ dst.local_ with
-          | .some (.init rootVal) =>
+        | _ :: _ =>
+          let writeDecls := eraseLeadingOpaqueCastDecls localDecls layouts dst.local_ dst.projection
+          let rootOpt : Option Value :=
+            match get? locals₁ dst.local_ with
+            | .some (.init rootVal) => .some (ensureNestedFieldShells rootVal dst.projection)
+            | .some .uninit =>
+              match dst.projection with
+              | p0 :: ps => uninitFieldWriteShellProto? localDecls layouts dst.local_ p0 ps
+              | .nil => .none
+            | _ => .none
+          match rootOpt with
+          | .none => MirStepNode.fail .ub
+          | .some rootVal =>
             match
               writeProjectedForLocal
                 locals₁
-                localDecls
+                writeDecls
                 layouts
                 dst.local_
-                (ensureNestedFieldShells rootVal dst.projection)
+                rootVal
                 dst.projection
                 val
             with
@@ -2409,7 +2018,7 @@ def evalStmtProto
               | .some locals₂ =>
                 let resolvedLocalProj :=
                   resolveBorrowWriteLocalProj
-                    localDecls
+                    writeDecls
                     layouts
                     locals₁
                     dst.local_
@@ -2455,84 +2064,18 @@ def evalStmtProto
               | .none => MirStepNode.fail .ub
             | .ub => MirStepNode.fail .ub
             | .unsupported => MirStepNode.unsupported
-          | .some .uninit =>
-            match uninitFieldWriteShellProto? localDecls layouts dst.local_ proj rest with
-            | .some rootVal =>
-              match
-                writeProjectedForLocal
-                  locals₁
-                  localDecls
-                  layouts
-                  dst.local_
-                  rootVal
-                  dst.projection
-                  val
-              with
-              | .ok rootVal' =>
-                match set? locals₁ dst.local_ (.init rootVal') with
-                | .some locals₂ =>
-                  let resolvedLocalProj :=
-                    resolveBorrowWriteLocalProj
-                      localDecls
-                      layouts
-                      locals₁
-                      dst.local_
-                      dst.projection
-                  match mem₁.activeProtectors with
-                  | .nil =>
-                    let borrows' :=
-                      invalidateConflictingBorrowsAtProj
-                        mem₁.borrows
-                        dst.local_
-                        .none
-                        resolvedLocalProj
-                        0
-                        0
-                        (length mem₁.callStack)
-                    MirStepNode.step
-                      (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
-                  | protHead :: protTail =>
-                    match
-                      hasProtectedWriteConflict
-                        mem₁.borrows
-                        (protHead :: protTail)
-                        dst.local_
-                        .none
-                        resolvedLocalProj
-                        0
-                        0
-                        (length mem₁.callStack)
-                    with
-                    | true => MirStepNode.fail .ub
-                    | false =>
-                      let borrows' :=
-                        invalidateConflictingBorrowsAtProj
-                          mem₁.borrows
-                          dst.local_
-                          .none
-                          resolvedLocalProj
-                          0
-                          0
-                          (length mem₁.callStack)
-                      MirStepNode.step
-                        (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
-                | .none => MirStepNode.fail .ub
-              | .ub => MirStepNode.fail .ub
-              | .unsupported => MirStepNode.unsupported
-            | .none => MirStepNode.fail .ub
-          | .some .dead => MirStepNode.fail .ub
-          | .none => MirStepNode.fail .ub
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
   | _ => evalStmt s stmt localDecls layouts
 
-/-! ## 5. Bug 2 & Bug 3: Repaired `TerminatorKind.tailCall` (`enterTailCalleeFrameProto`, `evalTailCallTerminatorProto`, `evalTerminatorProto`) -/
+/-! ## 5. Bug 2 & Bug 3: Repaired `TerminatorKind.tailCall` (`narrowCallStackForTailCallee`, root unwind ceiling, `relocateRootCallerReferents`) -/
 
 /--
 Narrow the inherited caller frame's `returnUnwind` on `callStack` to
 `.unreachable` when a `TerminatorKind.tailCall` enters a callee that cannot
-unwind (`canUnwind = false`), matching Miri's `initStackFrame`
-(`lean-miri/vendor/Miri/Interpreter/Call.lean:261-264`).
+unwind (`canUnwind = false`), matching Miri's `init_fn_call`
+(`if !callee_fn_abi.can_unwind { unwind = Unreachable }` on the continuation the
+tail call inherits; LeanMiri `initFnTailCall` with `nounwindAs := some .unreachable`).
 -/
 @[reducible]
 def narrowCallStackForTailCallee
@@ -2583,16 +2126,93 @@ theorem narrowCallStackForTailCallee_idempotent_after_false
   | cons caller rest => cases canUnwind₂ <;> rfl
 
 /--
-Repaired `enterTailCalleeFrame`:
-- Enters `calleeBody` at `bb0[0]` with `initLocals calleeBody argVals` without
-  pushing onto `mem.callStack`,
-- Narrows the top `SavedCallerFrame.returnUnwind` on `mem.callStack` to
-  `.unreachable` when `calleeBody.fnAbi.canUnwind == false`
-  (`DIV-LM-TAILCALL-NOUNWIND-UNWIND`).
+Set the unwind ceiling of an activation body. The prototype stores the modular
+root's unwind ceiling (Track A: `Memory.rootUnwindCeiling : Bool := true`) in
+the `fnAbi.canUnwind` field of the active root activation body, a field that no
+`Trusted.Rustc.V2026_06_01.MirSemantics` step function reads (call
+compatibility only reads `fnAbi.conv`).
 -/
+@[reducible]
+def withUnwindCeiling (canUnwind : Bool) (b : CapturedMir) : CapturedMir :=
+  { b with fnAbi := { b.fnAbi with canUnwind := canUnwind } }
+
+/--
+The modular root's own activation: its external caller's unwind continuation
+starts un-narrowed (`MODEL-LM-TAILCALL-MODULAR-ROOT`: a panic escaping the root
+function itself halts with `.halted .panic`), whatever the root's own ABI.
+-/
+@[reducible]
+def rootActivationBody (body : CapturedMir) : CapturedMir :=
+  withUnwindCeiling true body
+
+/-- The bottom (depth-`0`, root activation) saved frame's body, if any frame is saved. -/
+def bottomCallerBody? : List SavedCallerFrame → Option CapturedMir
+  | .nil => .none
+  | caller :: rest =>
+    match bottomCallerBody? rest with
+    | .some b => .some b
+    | .none => .some caller.callerBody
+
+/--
+Unwind ceiling of the modular root activation of `s`: `false` iff a root tail
+call entered a callee that cannot unwind (directly or through earlier hops),
+so the root activation's inherited external continuation is `Unreachable`.
+-/
+def rootUnwindCeiling (rootBody : CapturedMir) (s : MachineState) : Bool :=
+  match bottomCallerBody? s.memory.callStack with
+  | .some b => b.fnAbi.canUnwind
+  | .none => (s.memory.activeCallee.getD rootBody).fnAbi.canUnwind
+
+/--
+Root unwind-ceiling guard (`DIV-LM-TAILCALL-NOUNWIND-UNWIND` at a modular
+root): when the root activation's ceiling is narrowed, a panic that escapes the
+root (`.ret .panic`, in-table or through an external callee's `.panicked`
+answer) is undefined behavior ("unwinding past a frame that does not allow
+unwinding") instead of `.halted .panic`. The identity when `ceiling = true`.
+-/
+def guardRootUnwindCeiling (ceiling : Bool) (node : MirStepNode) : MirStepNode :=
+  match ceiling with
+  | true => node
+  | false =>
+    match node with
+    | .ret .panic => MirStepNode.fail .ub
+    | .vis (.inr (.inr (.call req))) k =>
+      MirStepNode.extCall req (fun ans =>
+        match k ans with
+        | .halted .panic => .faulted .ub
+        | st => st)
+    | other => other
+
 @[simp]
+theorem guardRootUnwindCeiling_true (node : MirStepNode) :
+    guardRootUnwindCeiling true node = node := rfl
+
+/--
+Body stored as the active callee of a tail call: at a modular root it carries
+the narrowed root unwind ceiling `ceiling && calleeBody.fnAbi.canUnwind`; in a
+callee frame (`callStack ≠ []`) it is `calleeBody` (the narrowing lives in the
+top `SavedCallerFrame.returnUnwind`).
+-/
+@[reducible]
+def tailCalleeActivationBody
+    (callStack : List SavedCallerFrame)
+    (ceiling : Bool)
+    (calleeBody : CapturedMir) :
+    CapturedMir :=
+  match callStack with
+  | .nil => withUnwindCeiling (Bool.and ceiling calleeBody.fnAbi.canUnwind) calleeBody
+  | _ :: _ => calleeBody
+
+/--
+Repaired `enterTailCalleeFrame` (`Terminators.lean:846-860`): enters `calleeBody`
+at `bb0[0]` with `initLocals calleeBody argVals` without pushing, narrowing the
+inherited unwind continuation when `calleeBody.fnAbi.canUnwind = false` — the top
+`SavedCallerFrame.returnUnwind` in a callee frame, the root unwind ceiling at a
+modular root (`DIV-LM-TAILCALL-NOUNWIND-UNWIND`).
+-/
 def enterTailCalleeFrameProto
     (mem : Memory)
+    (ceiling : Bool)
     (calleeBody : CapturedMir)
     (argVals : List Value) :
     MachineState :=
@@ -2604,77 +2224,18 @@ def enterTailCalleeFrameProto
     memory := {
       mem with
       callStack := narrowCallStackForTailCallee mem.callStack calleeBody.fnAbi.canUnwind
-      activeCallee := .some calleeBody
+      activeCallee := .some (tailCalleeActivationBody mem.callStack ceiling calleeBody)
     }
   }
 
 /--
-Repaired frame-teardown memory transition for `TerminatorKind.tailCall`:
-applies `disableFrameBorrowsProto` at `(length s.memory.callStack, length s.frame.locals)`,
-which disables the popped tail-caller's own locals while promoting any surviving
-root caller-owned referents (`depth == 0, targetLocal >= nLocals`) to
-`callerReferentFrameDepth` (`DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW`).
--/
-@[reducible]
-def frameTeardownMemProto (s : MachineState) : Memory :=
-  { s.memory with
-    borrows :=
-      disableFrameBorrowsProto
-        s.memory.borrows
-        (length s.memory.callStack)
-        (length s.frame.locals) }
-
-/--
-Repaired `unwindFromCallStack` using `disableFramesAboveProto` so caller-owned
-referents (`callerReferentFrameDepth`) remain live when an inner frame catches an
-unwind via `.cleanup cleanupBb`.
--/
-@[simp]
-def unwindFromCallStackProto : List SavedCallerFrame → Memory → MirExecState
-  | .nil, _ => .halted .panic
-  | caller :: restStack, memAfter =>
-    let memCaller : Memory := {
-      memAfter with
-      callStack := restStack
-      activeCallee := .some caller.callerBody
-      activeProtectors := restoreCallerProtectors caller
-    }
-    match caller.returnUnwind with
-    | .unreachable => .faulted .ub
-    | .terminate => .halted .abort
-    | .continue_ => unwindFromCallStackProto restStack memCaller
-    | .cleanup cleanupBb =>
-      .running {
-        frame := {
-          caller.frame with
-          blockIdx := cleanupBb
-          stmtIdx := 0
-        }
-        memory := {
-          memCaller with
-          borrows := disableFramesAboveProto memCaller.borrows (length restStack)
-        }
-      }
-
-/--
-Repaired `resumeExternalTailCall` using `unwindFromCallStackProto`.
--/
-def resumeExternalTailCallProto (ans : MirCallAns) : MirExecState :=
-  match ans with
-  | .returned retVal memAfter =>
-    resumeExternalTailCall (.returned retVal memAfter)
-  | .panicked memAfter =>
-    unwindFromCallStackProto memAfter.callStack memAfter
-  | .aborted => .halted .abort
-
-/--
-Repaired `evalTailCallTerminator`:
-- Evaluates `func` and `argOps` via `evalOperandsProto`,
-- Checks `hasFrameDeallocProtectorConflict`,
-- Tears down the tail-caller frame via `disableFrameBorrowsProto` (preserving and
-  isolating root caller-owned referents via `callerReferentFrameDepth`),
-- Enters `calleeBody` via `enterTailCalleeFrameProto` (narrowing `returnUnwind`
-  to `.unreachable` when `calleeBody.fnAbi.canUnwind = false`).
+Repaired `evalTailCallTerminator` (`Terminators.lean:3307-3378`), equal to
+`Trusted.evalTailCallTerminator` except that:
+- argument operands go through `evalOperandsProto` (Bug 4; `localDecls` stays
+  `.nil` exactly as in `Trusted`),
+- at a modular root (`callStack = []`) the torn-down memory is relocated by
+  `relocateRootCallerReferents` (Bug 3) before entering the callee,
+- the callee is entered with `enterTailCalleeFrameProto` (Bug 2).
 -/
 def evalTailCallTerminatorProto
     (s : MachineState)
@@ -2687,6 +2248,10 @@ def evalTailCallTerminatorProto
     match currentBody with
     | .some b => b.layouts
     | .none => emptyLayoutTable
+  let ceiling : Bool :=
+    match currentBody with
+    | .some b => b.fnAbi.canUnwind
+    | .none => true
   match
     resolveCallTarget
       s
@@ -2706,7 +2271,7 @@ def evalTailCallTerminatorProto
         s.memory.globals
         bodyLayouts
         s.memory.callerLocals
-        bodyLocalDecls
+        .nil
         s.memory.callStack
     with
     | .ub => MirStepNode.fail .ub
@@ -2724,7 +2289,7 @@ def evalTailCallTerminatorProto
       | true => MirStepNode.fail .ub
       | false =>
         let memAfterTeardown : Memory :=
-          { s.memory with borrows := disableFrameBorrowsProto s.memory.borrows depth nLocals }
+          { s.memory with borrows := disableFrameBorrows s.memory.borrows depth nLocals }
         match
           lookupCallee
             s.memory.callees
@@ -2737,20 +2302,25 @@ def evalTailCallTerminatorProto
           match checkCalleeTargetCompatible target calleeBody (length argVals) with
           | false => MirStepNode.fail .ub
           | true =>
-            MirStepNode.step (enterTailCalleeFrameProto memAfterTeardown calleeBody argVals)
+            let memEntered : Memory :=
+              match s.memory.callStack with
+              | .nil =>
+                relocateRootCallerReferents
+                  memAfterTeardown nLocals (length (initLocals calleeBody argVals))
+              | _ :: _ => memAfterTeardown
+            MirStepNode.step (enterTailCalleeFrameProto memEntered ceiling calleeBody argVals)
         | .none =>
           MirStepNode.extCall
             { defPath := target.defPath
               typeArgs := target.typeArgs
               args := argVals
               memory := memAfterTeardown }
-            resumeExternalTailCallProto
+            resumeExternalTailCall
 
 /--
-Repaired `evalTerminator`:
-- Dispatches `.tailCall` to `evalTailCallTerminatorProto`,
-- Dispatches `.unwindResume` to `unwindFromCallStackProto`,
-- Strips leading `.opaqueCast` in `.drop` before root-vs-projected dispatch.
+Repaired `evalTerminator` (`Terminators.lean:3379-3704`), equal to
+`Trusted.evalTerminator` except for `.tailCall` (`evalTailCallTerminatorProto`)
+and `.drop` (Bug 4: `stripLeadingOpaqueCast` before root-vs-projected dispatch).
 -/
 def evalTerminatorProto
     (s : MachineState)
@@ -2760,11 +2330,6 @@ def evalTerminatorProto
   match term.kind with
   | .tailCall func argOps =>
     evalTailCallTerminatorProto s func argOps currentBody
-  | .unwindResume =>
-    match unwindFromCallStackProto s.memory.callStack s.memory with
-    | .running nextState => MirStepNode.step nextState
-    | .halted out => MirStepNode.retOutcome out
-    | .faulted fk => MirStepNode.fail fk
   | .drop place target _ =>
     match get? s.frame.locals place.local_ with
     | .none => MirStepNode.fail .ub
@@ -2796,41 +2361,28 @@ def evalTerminatorProto
 /-! ## 6. Unified Prototype Step Evaluator & Bounded Differential Runner -/
 
 /--
-Initialize `MachineState` for `body` with incoming `args` and `mem`, promoting
-any initial caller-owned referent borrows (`targetFrameDepth == 0` and
-`targetLocal >= length body.localDecls`) to `callerReferentFrameDepth`.
--/
-def initMachineStateWithMemoryProto
-    (body : CapturedMir) (args : List Value) (mem : Memory) : MachineState :=
-  { frame := {
-      blockIdx := 0
-      stmtIdx := 0
-      locals := initLocals body args
-    }
-    memory := {
-      mem with
-      borrows := promoteRootCallerReferentBorrows mem.borrows (length body.localDecls)
-    }
-  }
-
-/--
-One-step prototype MIR coalgebra transition from an active `MachineState`.
+One-step prototype MIR coalgebra transition from an active `MachineState`
+(`Machine.lean` `stepMirFn` with the repaired statement / terminator evaluators,
+the root activation body `rootActivationBody body`, and the root unwind-ceiling
+guard).
 -/
 def stepMirFnProto (body : CapturedMir) (s : MachineState) : MirStepNode :=
-  let currentBody := s.memory.activeCallee.getD body
-  match currentBody.phase with
-  | .other _ => MirStepNode.unsupported
-  | _ =>
-    match get? currentBody.basicBlocks s.frame.blockIdx with
-    | none => MirStepNode.fail .ub
-    | some bb =>
-      match get? bb.statements s.frame.stmtIdx with
-      | some stmt => evalStmtProto s stmt currentBody.localDecls currentBody.layouts
-      | none =>
-        if s.frame.stmtIdx == length bb.statements then
-          evalTerminatorProto s bb.terminator (some currentBody)
-        else
-          MirStepNode.fail .ub
+  let rootBody := rootActivationBody body
+  let currentBody := s.memory.activeCallee.getD rootBody
+  guardRootUnwindCeiling (rootUnwindCeiling rootBody s)
+    (match currentBody.phase with
+     | .other _ => MirStepNode.unsupported
+     | _ =>
+       match get? currentBody.basicBlocks s.frame.blockIdx with
+       | none => MirStepNode.fail .ub
+       | some bb =>
+         match get? bb.statements s.frame.stmtIdx with
+         | some stmt => evalStmtProto s stmt currentBody.localDecls currentBody.layouts
+         | none =>
+           if s.frame.stmtIdx == length bb.statements then
+             evalTerminatorProto s bb.terminator (some currentBody)
+           else
+             MirStepNode.fail .ub)
 
 /-- Total `ITreeF` coalgebra step over `MirExecState` using `stepMirFnProto`. -/
 def stepMirStateProto (body : CapturedMir) : MirExecState → MirStepNode
@@ -2911,7 +2463,6 @@ def probeMirDiffExecBoundedProto
       probeMirDiffExecBoundedProto fuel' body (k PUnit.unit)
     | .vis (.inr (.inr (.call req))) _ =>
       (.externalCall req.defPath, activeMirSpan body st)
-
 
 /-! ## 7. Campaign #14 & #15 Minimized Miri Divergence Witnesses (`by rfl`) -/
 
@@ -3089,9 +2640,9 @@ theorem evalCopyNonOverlappingWithCountProto_zero
     MirStepNode.step (advanceStmt s locals₃) := rfl
 
 /--
-Single-element zero-offset `copy_nonoverlapping` (`countBits == 1`,
-`srcPtr.offsetBytes == 0`, `dstPtr.offsetBytes == 0`) delegates directly to
-`evalCopySingleDirectProto`.
+`n = 1` agreement: a single-element zero-offset `copy_nonoverlapping`
+(`countBits == 1`, `srcPtr.offsetBytes == 0`, `dstPtr.offsetBytes == 0`, no union
+endpoint) is *exactly* `Trusted.evalCopySingleDirect`.
 -/
 theorem evalCopyNonOverlappingPermOkProto_singleDirect_eq
     (s : MachineState)
@@ -3107,7 +2658,7 @@ theorem evalCopyNonOverlappingPermOkProto_singleDirect_eq
     (hNoUnionDst : resolveUnionEndpoint? localDecls layouts locals₃ dstEntry = .none) :
     evalCopyNonOverlappingPermOkProto
       s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry 1 locals₃ =
-    evalCopySingleDirectProto
+    evalCopySingleDirect
       s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃ := by
   unfold evalCopyNonOverlappingPermOkProto
   simp [hSrcOff, hDstOff, hNoUnionSrc, hNoUnionDst]
@@ -3141,12 +2692,12 @@ theorem resolveArraySliceEndpoint?_constantIndex_zeroOff
 
 /--
 Universal multi-element subplace slice copy characterization:
-For any two distinct local array slots `srcLoc ≠ dstLoc` holding `.aggregate 0 srcElems`
-and `.aggregate 0 dstElems`, when `srcEntry` targets `{ local_ := srcLoc, projection := [.constantIndex srcIdx minS false] }`
-and `dstEntry` targets `{ local_ := dstLoc, projection := [.constantIndex dstIdx minD false] }`
-with zero pointer offsets, `n ≥ 2` (`Nat.beq n 0 = false`, `Nat.beq n 1 = false`),
-and in-bounds slices (`srcIdx + n ≤ length srcElems` and `dstIdx + n ≤ length dstElems`),
-`evalCopyNonOverlappingPermOkProto` writes
+for any two distinct local array slots `srcLoc ≠ dstLoc` holding
+`.aggregate 0 srcElems` / `.aggregate 0 dstElems`, endpoint borrows
+`[.constantIndex srcIdx minS false]` / `[.constantIndex dstIdx minD false]` with
+zero pointer offsets, `n ≥ 2`, and in-bounds slices,
+`evalCopyNonOverlappingPermOkProto` runs the Tree Borrows read-then-write
+transition on the accessed windows and writes
 `.aggregate 0 (spliceValues (takeValues n (dropValues srcIdx srcElems)) dstIdx dstElems)`
 back to the parent array local `dstLoc` (`projection := []`).
 -/
@@ -3161,7 +2712,6 @@ theorem evalCopyNonOverlappingPermOkProto_subplace_constantIndex_slice
     (hNotSingle : Nat.beq n 1 = false)
     (hDistinctTag : Nat.beq srcTag dstTag = false)
     (hDistinctLoc : Nat.beq srcLoc dstLoc = false)
-    (_hCallStackNil : s.memory.callStack = .nil)
     (hSrcPt : operandPointeeTy .nil emptyLayoutTable src = .none)
     (hDstPt : operandPointeeTy .nil emptyLayoutTable dst = .none)
     (hSrcSlot : get? locals₃ srcLoc = .some (.init (.aggregate 0 srcElems)))
@@ -3202,24 +2752,30 @@ theorem evalCopyNonOverlappingPermOkProto_subplace_constantIndex_slice
     }
     let copiedSlice := takeValues n (dropValues srcIdx srcElems)
     let dstElems' := spliceValues copiedSlice dstIdx dstElems
-    let dstSliceInvalProj :=
-      match Nat.beq dstIdx 0 && Nat.beq n (length dstElems) with
-      | true => .nil
-      | false =>
-        normalizeSubsliceProjections [.subslice dstIdx (Nat.add dstIdx n) false]
     evalCopyNonOverlappingPermOkProto
       s src dst .nil emptyLayoutTable srcPtr dstPtr srcEntry dstEntry n locals₃ =
-    commitCopyDstPlaceWriteProto
-      s
-      { local_ := dstLoc, projection := .nil }
-      dstEntry
-      dstTag
-      locals₃
-      (.aggregate 0 dstElems')
-      .nil
-      emptyLayoutTable
-      (.some dstSliceInvalProj) := by
-  intro srcPtr dstPtr srcEntry dstEntry copiedSlice dstElems' dstSliceInvalProj
+    (match
+      borrowsAfterCopySliceProto
+        s.memory.borrows
+        s.memory.activeProtectors
+        srcPtr
+        dstPtr
+        srcEntry
+        dstEntry
+        (copySliceWindowProj .nil srcIdx n (length srcElems))
+        (copySliceWindowProj .nil dstIdx n (length dstElems))
+    with
+    | .none => MirStepNode.fail .ub
+    | .some borrows' =>
+      writeCopyDstPlaceProto
+        s
+        { local_ := dstLoc, projection := .nil }
+        locals₃
+        (.aggregate 0 dstElems')
+        borrows'
+        .nil
+        emptyLayoutTable) := by
+  intro srcPtr dstPtr srcEntry dstEntry copiedSlice dstElems'
   unfold evalCopyNonOverlappingPermOkProto
   have hSrcRoot :
       resolveCopyEndpointRootSlot s locals₃ srcEntry =
@@ -3234,13 +2790,13 @@ theorem evalCopyNonOverlappingPermOkProto_subplace_constantIndex_slice
     simp [placeTy, get?]
   have hTagEq : srcPtr.tag = srcTag := rfl
   have hDstTagEq : dstPtr.tag = dstTag := rfl
-  cases hFull : (Nat.beq dstIdx 0 && Nat.beq n (length dstElems)) <;>
-    simp only [hCountPos, hNotSingle, srcPtr, dstPtr, Bool.false_and,
-      hSrcRoot, hDstRoot, hSrcPt, hDstPt, hSrcSlice, hDstSlice,
-      srcEntry, dstEntry, isCallerReferentBorrow_zero, hDstSlot,
-      hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds,
-      Nat.beq_refl, hDistinctLoc, hTagEq, hDstTagEq, hDistinctTag,
-      copiedSlice, dstElems', dstSliceInvalProj, appendProjections, hFull]
+  have hOff0 : ∀ pt, resolvePtrElemOffset? 0 pt emptyLayoutTable = .some 0 := fun _ => rfl
+  simp only [hCountPos, hNotSingle, srcPtr, dstPtr, Bool.false_and,
+    hSrcRoot, hDstRoot, hSrcPt, hDstPt, hOff0, hSrcSlice, hDstSlice,
+    srcEntry, dstEntry, hDstSlot,
+    hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds,
+    Nat.beq_refl, hDistinctLoc, hTagEq, hDstTagEq, hDistinctTag,
+    copiedSlice, dstElems', Bool.and_false, Bool.false_and]
 
 /--
 Out-of-bounds multi-element subplace copy (`srcIdx + n > length srcElems`)
@@ -3255,7 +2811,6 @@ theorem evalCopyNonOverlappingPermOkProto_subplace_src_oob_ub
     (locals₃ : List LocalSlot)
     (hCountPos : Nat.beq n 0 = false)
     (hNotSingle : Nat.beq n 1 = false)
-    (_hCallStackNil : s.memory.callStack = .nil)
     (hSrcPt : operandPointeeTy .nil emptyLayoutTable src = .none)
     (hDstPt : operandPointeeTy .nil emptyLayoutTable dst = .none)
     (hSrcSlot : get? locals₃ srcLoc = .some (.init (.aggregate 0 srcElems)))
@@ -3309,14 +2864,15 @@ theorem evalCopyNonOverlappingPermOkProto_subplace_src_oob_ub
   have hPlaceTyNil : ∀ p, placeTy .nil emptyLayoutTable p = .none := by
     intro p
     simp [placeTy, get?]
+  have hOff0 : ∀ pt, resolvePtrElemOffset? 0 pt emptyLayoutTable = .some 0 := fun _ => rfl
   simp only [hCountPos, hNotSingle, srcPtr, dstPtr, Bool.false_and,
-    hSrcRoot, hDstRoot, hSrcPt, hDstPt, hSrcSlice, hDstSlice,
-    srcEntry, dstEntry, isCallerReferentBorrow_zero, hDstSlot,
+    hSrcRoot, hDstRoot, hSrcPt, hDstPt, hOff0, hSrcSlice, hDstSlice,
+    srcEntry, dstEntry, hDstSlot,
     hPlaceTyNil, Bool.not_false, hSrcOob, Bool.and_false]
 
 /--
 Overlapping multi-element subplace copy within the same array container
-(`srcLoc == dstLoc`, `srcParentProj == dstParentProj`, and the index intervals
+(`srcLoc == dstLoc`, both parents `[]`, and the index intervals
 `[srcIdx, srcIdx + n)` and `[dstIdx, dstIdx + n)` overlap) always faults with
 `MirStepNode.fail .ub`.
 -/
@@ -3329,7 +2885,6 @@ theorem evalCopyNonOverlappingPermOkProto_sameArray_overlap_ub
     (locals₃ : List LocalSlot)
     (hCountPos : Nat.beq n 0 = false)
     (hNotSingle : Nat.beq n 1 = false)
-    (_hCallStackNil : s.memory.callStack = .nil)
     (hSrcPt : operandPointeeTy .nil emptyLayoutTable src = .none)
     (hDstPt : operandPointeeTy .nil emptyLayoutTable dst = .none)
     (hArrSlot : get? locals₃ arrLoc = .some (.init (.aggregate 0 arrElems)))
@@ -3382,18 +2937,19 @@ theorem evalCopyNonOverlappingPermOkProto_sameArray_overlap_ub
     intro p
     simp [placeTy, get?]
   have hOverlapNil : projectionsOverlap .nil .nil = true := rfl
+  have hOff0 : ∀ pt, resolvePtrElemOffset? 0 pt emptyLayoutTable = .some 0 := fun _ => rfl
   simp only [hCountPos, hNotSingle, srcPtr, dstPtr, Bool.false_and,
-    hRoot, hSrcPt, hDstPt, hSrcSlice, hDstSlice,
-    srcEntry, dstEntry, isCallerReferentBorrow_zero, hArrSlot,
+    hRoot, hSrcPt, hDstPt, hOff0, hSrcSlice, hDstSlice,
+    srcEntry, dstEntry, hArrSlot,
     hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds,
     Nat.beq_refl, hOverlapNil, hOverlap1, hOverlap2, Bool.or_false]
 
 /--
 Disjoint multi-element subplace copy within the same array container
-(`srcLoc == dstLoc`, `srcParentProj == dstParentProj = []`, and
-`srcIdx + n ≤ dstIdx`) succeeds and splices `[srcIdx, srcIdx + n)` into
-`[dstIdx, dstIdx + n)` of the same array local `arrLoc`, even when `srcPtr` and
-`dstPtr` share the same provenance tag (`p` and `p.add(k)`).
+(`srcLoc == dstLoc`, both parents `[]`, `srcIdx + n ≤ dstIdx`) succeeds — even
+when `srcPtr` and `dstPtr` share one provenance tag (`p` and `p.add(k)`) — running
+the Tree Borrows transition on the accessed windows and splicing
+`[srcIdx, srcIdx + n)` into `[dstIdx, dstIdx + n)` of the array local `arrLoc`.
 -/
 theorem evalCopyNonOverlappingPermOkProto_sameArray_disjoint_ok
     (s : MachineState)
@@ -3404,7 +2960,6 @@ theorem evalCopyNonOverlappingPermOkProto_sameArray_disjoint_ok
     (locals₃ : List LocalSlot)
     (hCountPos : Nat.beq n 0 = false)
     (hNotSingle : Nat.beq n 1 = false)
-    (_hCallStackNil : s.memory.callStack = .nil)
     (hSrcPt : operandPointeeTy .nil emptyLayoutTable src = .none)
     (hDstPt : operandPointeeTy .nil emptyLayoutTable dst = .none)
     (hArrSlot : get? locals₃ arrLoc = .some (.init (.aggregate 0 arrElems)))
@@ -3445,24 +3000,30 @@ theorem evalCopyNonOverlappingPermOkProto_sameArray_disjoint_ok
     }
     let copiedSlice := takeValues n (dropValues srcIdx arrElems)
     let arrElems' := spliceValues copiedSlice dstIdx arrElems
-    let dstSliceInvalProj :=
-      match Nat.beq dstIdx 0 && Nat.beq n (length arrElems) with
-      | true => .nil
-      | false =>
-        normalizeSubsliceProjections [.subslice dstIdx (Nat.add dstIdx n) false]
     evalCopyNonOverlappingPermOkProto
       s src dst .nil emptyLayoutTable srcPtr dstPtr srcEntry dstEntry n locals₃ =
-    commitCopyDstPlaceWriteProto
-      s
-      { local_ := arrLoc, projection := .nil }
-      dstEntry
-      dstTag
-      locals₃
-      (.aggregate 0 arrElems')
-      .nil
-      emptyLayoutTable
-      (.some dstSliceInvalProj) := by
-  intro srcPtr dstPtr srcEntry dstEntry copiedSlice arrElems' dstSliceInvalProj
+    (match
+      borrowsAfterCopySliceProto
+        s.memory.borrows
+        s.memory.activeProtectors
+        srcPtr
+        dstPtr
+        srcEntry
+        dstEntry
+        (copySliceWindowProj .nil srcIdx n (length arrElems))
+        (copySliceWindowProj .nil dstIdx n (length arrElems))
+    with
+    | .none => MirStepNode.fail .ub
+    | .some borrows' =>
+      writeCopyDstPlaceProto
+        s
+        { local_ := arrLoc, projection := .nil }
+        locals₃
+        (.aggregate 0 arrElems')
+        borrows'
+        .nil
+        emptyLayoutTable) := by
+  intro srcPtr dstPtr srcEntry dstEntry copiedSlice arrElems'
   unfold evalCopyNonOverlappingPermOkProto
   have hRoot :
       resolveCopyEndpointRootSlot s locals₃ srcEntry =
@@ -3472,324 +3033,515 @@ theorem evalCopyNonOverlappingPermOkProto_sameArray_disjoint_ok
     intro p
     simp [placeTy, get?]
   have hOverlapNil : projectionsOverlap .nil .nil = true := rfl
-  have hDstTagEq : dstPtr.tag = dstTag := rfl
-  cases hFull : (Nat.beq dstIdx 0 && Nat.beq n (length arrElems)) <;>
-    simp only [hCountPos, hNotSingle, srcPtr, dstPtr, Bool.false_and,
-      hRoot, hSrcPt, hDstPt, hSrcSlice, hDstSlice,
-      srcEntry, dstEntry, isCallerReferentBorrow_zero, hArrSlot,
-      hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds,
-      Nat.beq_refl, hOverlapNil, hDisjoint, Bool.true_or, hDstTagEq,
-      copiedSlice, arrElems', dstSliceInvalProj, appendProjections, hFull]
+  have hOff0 : ∀ pt, resolvePtrElemOffset? 0 pt emptyLayoutTable = .some 0 := fun _ => rfl
+  simp only [hCountPos, hNotSingle, srcPtr, dstPtr, Bool.false_and,
+    hRoot, hSrcPt, hDstPt, hOff0, hSrcSlice, hDstSlice,
+    srcEntry, dstEntry, hArrSlot,
+    hPlaceTyNil, Bool.not_false, Bool.true_and, hSrcBounds, hDstBounds,
+    Nat.beq_refl, hOverlapNil, hDisjoint, Bool.true_or,
+    copiedSlice, arrElems']
+
+/--
+Misaligned element pointer (Rust `copy_nonoverlapping` precondition: "Both
+`src` and `dst` must be properly aligned"): when the statically known pointee has
+byte size `elemSz` and a pointer's byte offset is not a whole number of elements
+(`resolvePtrElemOffset? = .none`), a non-zero-count, non-union, not-single-direct
+`copy_nonoverlapping` between initialized endpoints faults with `.ub` instead of
+reinterpreting the byte offset as an element index.
+-/
+theorem evalCopyNonOverlappingPermOkProto_misaligned_src_ub
+    (s : MachineState)
+    (src dst : Operand)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (n : Nat)
+    (locals₃ : List LocalSlot)
+    (srcRootVal dstRootVal : Value)
+    (hCountPos : Nat.beq n 0 = false)
+    (hNoUnionSrc : resolveUnionEndpoint? localDecls layouts locals₃ srcEntry = .none)
+    (hNoUnionDst : resolveUnionEndpoint? localDecls layouts locals₃ dstEntry = .none)
+    (hSrcOffPos : Nat.beq srcPtr.offsetBytes 0 = false)
+    (hSrcRoot : resolveCopyEndpointRootSlot s locals₃ srcEntry = .some (.init srcRootVal))
+    (hDstRoot : resolveCopyEndpointRootSlot s locals₃ dstEntry = .some (.init dstRootVal))
+    (hMisaligned :
+      resolvePtrElemOffset? srcPtr.offsetBytes
+        (match operandPointeeTy localDecls layouts src with
+         | .some pt => .some pt
+         | .none => operandPointeeTy localDecls layouts dst)
+        layouts = .none) :
+    evalCopyNonOverlappingPermOkProto
+      s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry n locals₃ =
+    MirStepNode.fail .ub := by
+  unfold evalCopyNonOverlappingPermOkProto
+  simp only [hCountPos, hNoUnionSrc, hNoUnionDst, hSrcOffPos, Bool.false_and, Bool.and_false,
+    hSrcRoot, hDstRoot, hMisaligned]
 
 /-! ## 9. Universal Simulation Theorems & Witnesses for Bug 2 and Bug 3 -/
 
 /--
-**Bug 2 Universal Theorem (`tailCall_leanMiri_nounwind_callee_simulation`)**:
-For any caller frame `caller` on `mem.callStack` (whatever its original
-`caller.returnUnwind : UnwindAction` was: `.cleanup bb`, `.continue_`,
-`.unreachable`, or `.terminate`) and any tail callee `calleeBody` with
-`calleeBody.fnAbi.canUnwind = false`, entering `calleeBody` via
-`enterTailCalleeFrameProto` and subsequently unwinding from the resulting
-`callStack` via `unwindFromCallStackProto` unconditionally faults with
-`MirExecState.faulted .ub` — matching Lean-Miri's `initStackFrame` narrowing
-(`lean-miri/vendor/Miri/Interpreter/Call.lean:261-264`) without requiring any
-caller-side hypothesis `hCallerNoUnwind`.
+**Bug 2 universal theorem, nested tail call (`tailCall_leanMiri_nounwind_callee_simulation`).**
+For any caller frame `caller` on `mem.callStack` — whatever its original
+`caller.returnUnwind : UnwindAction` (`.cleanup bb`, `.continue_`,
+`.unreachable`, `.terminate`) — and any tail callee with
+`calleeBody.fnAbi.canUnwind = false`, entering it via
+`enterTailCalleeFrameProto` makes `Trusted`'s own, unmodified unwinder
+`unwindFromCallStack` (used by `TerminatorKind.unwindResume`, by
+`resumeExternalTailCall (.panicked …)`, and by `applyUnwindAction .continue_`)
+fault with `.faulted .ub`, matching LeanMiri `initFnTailCall` with
+`nounwindAs := some .unreachable` followed by `unwindResume`. No hypothesis on
+`caller.returnUnwind` is needed (`tailCall_leanMiri_nounwind_callee`'s `↔ u = ur`
+collapses to unconditional agreement).
 -/
 theorem tailCall_leanMiri_nounwind_callee_simulation
     (caller : SavedCallerFrame)
     (restStack : List SavedCallerFrame)
     (mem : Memory)
+    (ceiling : Bool)
     (calleeBody : CapturedMir)
     (argVals : List Value)
     (memAtUnwind : Memory)
     (hCalleeNoUnwind : calleeBody.fnAbi.canUnwind = false)
     (hStack : mem.callStack = caller :: restStack) :
-    let stEntered := enterTailCalleeFrameProto mem calleeBody argVals
-    unwindFromCallStackProto stEntered.memory.callStack memAtUnwind = .faulted .ub := by
+    let stEntered := enterTailCalleeFrameProto mem ceiling calleeBody argVals
+    unwindFromCallStack stEntered.memory.callStack memAtUnwind = .faulted .ub := by
   intro stEntered
   simp [stEntered, enterTailCalleeFrameProto, hStack, hCalleeNoUnwind,
-    narrowCallStackForTailCallee, unwindFromCallStackProto]
+    narrowCallStackForTailCallee, unwindFromCallStack]
 
 /--
-**Bug 2 Multi-Hop Monotonicity (`tailCall_nounwind_multihop_monotonicity`)**:
-If `caller` calls `f` (`mem.callStack = caller :: restStack`), `f` tail-calls
-`g` with `g.fnAbi.canUnwind = false`, and `g` subsequently tail-calls `h` with
-arbitrary `h.fnAbi.canUnwind : Bool` (including `canUnwind = true`), unwinding
-from `h` still unconditionally faults with `.faulted .ub` because the `.unreachable`
-narrowing on `caller.returnUnwind` is monotone across arbitrary subsequent tail
-calls.
+End-to-end form: an `UnwindResume` executed by the non-unwinding tail callee
+(under the repaired terminator evaluator) faults with `.ub` for every inherited
+action.
+-/
+theorem tailCall_nounwind_callee_unwindResume_ub
+    (caller : SavedCallerFrame)
+    (restStack : List SavedCallerFrame)
+    (mem : Memory)
+    (ceiling : Bool)
+    (calleeBody : CapturedMir)
+    (argVals : List Value)
+    (f : StackFrame)
+    (span : String)
+    (cb : Option CapturedMir)
+    (hCalleeNoUnwind : calleeBody.fnAbi.canUnwind = false)
+    (hStack : mem.callStack = caller :: restStack) :
+    evalTerminatorProto
+      ⟨f, (enterTailCalleeFrameProto mem ceiling calleeBody argVals).memory⟩
+      ⟨.unwindResume, span⟩ cb = MirStepNode.fail .ub := by
+  simp [evalTerminatorProto, evalTerminator, enterTailCalleeFrameProto, hStack, hCalleeNoUnwind,
+    narrowCallStackForTailCallee, unwindFromCallStack]
+
+/--
+**Bug 2 multi-hop monotonicity (`tailCall_nounwind_multihop_monotonicity`).** If
+`caller` calls `f`, `f` tail-calls `g` with `g.fnAbi.canUnwind = false`, and `g`
+tail-calls `h` with arbitrary `h.fnAbi.canUnwind` (including `true`), unwinding
+from `h` still faults with `.faulted .ub`: `g` irreversibly narrowed the
+inherited continuation.
 -/
 theorem tailCall_nounwind_multihop_monotonicity
     (caller : SavedCallerFrame)
     (restStack : List SavedCallerFrame)
     (mem : Memory)
+    (ceilingG ceilingH : Bool)
     (gBody hBody : CapturedMir)
     (gArgs hArgs : List Value)
     (memAtUnwind : Memory)
     (hGNoUnwind : gBody.fnAbi.canUnwind = false)
     (hStack : mem.callStack = caller :: restStack) :
-    let stG := enterTailCalleeFrameProto mem gBody gArgs
-    let stH := enterTailCalleeFrameProto stG.memory hBody hArgs
-    unwindFromCallStackProto stH.memory.callStack memAtUnwind = .faulted .ub := by
+    let stG := enterTailCalleeFrameProto mem ceilingG gBody gArgs
+    let stH := enterTailCalleeFrameProto stG.memory ceilingH hBody hArgs
+    unwindFromCallStack stH.memory.callStack memAtUnwind = .faulted .ub := by
   intro stG stH
   cases hCan : hBody.fnAbi.canUnwind <;>
     simp [stG, stH, enterTailCalleeFrameProto, hStack, hGNoUnwind, hCan,
-      narrowCallStackForTailCallee, unwindFromCallStackProto]
+      narrowCallStackForTailCallee, unwindFromCallStack]
 
 /--
-**Bug 3 Universal Theorem (`tailCall_witness_root_caller_referent_simulation`)**:
-For any root-frame borrow `entry` of a caller-owned referent in `callerLocals`
-(`entry.targetFrameDepth = 0`, `entry.targetLocal ≥ nLocals` or already promoted
- via `promoteRootCallerReferentBorrows`, `entry.allocDead = false`,
- `entry.perm ≠ .disabled`):
-1. Tearing down the tail-caller frame via `disableFrameBorrowsProto` stamps
-   `entry` with `callerReferentFrameDepth` (`isCallerReferentBorrow = true`) and
-   preserves its permission `entry.perm`.
-2. Even when the tail callee's frame has `length calleeLocals > entry.targetLocal`
-   (so `calleeLocals[entry.targetLocal]` exists and holds an unrelated value `shadowVal`),
-   dereference reads (`evalPlaceReadProto`, `evalOperandProto (.copy)` / `(.move)`)
-   through a pointer to `entry.tag` resolve to `callerLocals[entry.targetLocal]`
-   rather than `calleeLocals[entry.targetLocal]`.
-3. Writes to the tail callee's own local `calleeLocals[entry.targetLocal]` via
-   `invalidateConflictingBorrows` at depth `0` do not invalidate `entry`.
-4. Subsequent multi-hop tail-call teardowns (`disableFrameBorrowsProto` at any
-   `calleeNLocals`, even `calleeNLocals > entry.targetLocal`) preserve `entry`
-   unchanged.
+**Bug 2 at a modular root: unwind-ceiling narrowing.** A root tail call
+(`mem.callStack = []`) records the narrowed root unwind ceiling
+`ceiling && calleeBody.fnAbi.canUnwind` in the entered state, so a callee that
+cannot unwind narrows it to `false` and every later root tail call keeps it
+`false` (monotone, since the next hop's `ceiling` is read back from the active
+root activation body).
 -/
-theorem tailCall_witness_root_caller_referent_simulation
-    (tag targetLocal nLocals calleeNLocals ptrLoc : Nat)
-    (perm : TreeBorrowPerm)
-    (rangeOffset rangeLen : Nat)
-    (parentTag : Option Nat)
-    (calleeLocals callerLocals : List LocalSlot)
-    (callerVal : Value)
-    (hCallerOwned : Nat.blt targetLocal nLocals = false)
-    (hPermLive : perm ≠ .disabled)
-    (hPtrSlot : get? calleeLocals ptrLoc =
-      .some (.init (.ptr { allocId := tag, offsetBytes := 0 } 8)))
-    (hCallerSlot : get? callerLocals targetLocal = .some (.init callerVal)) :
-    let rawEntry : BorrowEntry := {
-      tag := tag
-      targetLocal := targetLocal
-      targetFrameDepth := 0
-      allocDead := false
-      targetProjection := .nil
-      perm := perm
-      rangeOffset := rangeOffset
-      rangeLen := rangeLen
-      parentTag := parentTag
-    }
-    let borrowsAfterTail1 := disableFrameBorrowsProto [rawEntry] 0 nLocals
-    let borrowsAfterLocalWrite :=
-      invalidateConflictingBorrows borrowsAfterTail1 targetLocal .none 0
-    let borrowsAfterTail2 :=
-      disableFrameBorrowsProto borrowsAfterLocalWrite 0 calleeNLocals
-    evalPlaceReadProto
-      calleeLocals
-      { local_ := ptrLoc, projection := [.deref] }
-      borrowsAfterTail1
-      .nil
-      emptyLayoutTable
-      callerLocals
-      .nil
-      .nil = .ok callerVal calleeLocals ∧
-    borrowsAfterLocalWrite = borrowsAfterTail1 ∧
-    borrowsAfterTail2 = borrowsAfterTail1 := by
-  intro rawEntry borrowsAfterTail1 borrowsAfterLocalWrite borrowsAfterTail2
-  have hTeardown1 :
-      borrowsAfterTail1 = [{ rawEntry with targetFrameDepth := callerReferentFrameDepth }] := by
-    simp [borrowsAfterTail1, disableFrameBorrowsProto, rawEntry, hCallerOwned]
-  have hNonConflict :
-      borrowsAfterLocalWrite = borrowsAfterTail1 := by
-    simp [borrowsAfterLocalWrite, hTeardown1, invalidateConflictingBorrows,
-      rawEntry, callerReferentFrameDepth]
-  have hSentinelNotZero : Nat.beq callerReferentFrameDepth 0 = false := rfl
-  have hTeardown2 :
-      borrowsAfterTail2 = borrowsAfterTail1 := by
-    simp [borrowsAfterTail2, hNonConflict, hTeardown1, disableFrameBorrowsProto,
-      hSentinelNotZero, rawEntry]
-  refine ⟨?_, hNonConflict, hTeardown2⟩
-  rw [hTeardown1]
-  cases perm <;>
-    first
-    | exact False.elim (hPermLive rfl)
-    | simp [evalPlaceReadProto, derefLookupCallerReferent?, hPtrSlot,
-        lookupBorrow, ProvenancePtr.tag, isCallerReferentBorrow,
-        callerReferentFrameDepth, evalCallerReferentDerefRead,
-        hCallerSlot, readProjectedValue, rawEntry]
+theorem tailCall_root_unwind_ceiling
+    (rootBody : CapturedMir)
+    (mem : Memory)
+    (ceiling : Bool)
+    (calleeBody : CapturedMir)
+    (argVals : List Value)
+    (hRoot : mem.callStack = []) :
+    rootUnwindCeiling rootBody (enterTailCalleeFrameProto mem ceiling calleeBody argVals) =
+      Bool.and ceiling calleeBody.fnAbi.canUnwind := by
+  simp [rootUnwindCeiling, enterTailCalleeFrameProto, hRoot, narrowCallStackForTailCallee,
+    tailCalleeActivationBody, withUnwindCeiling, bottomCallerBody?]
+
+/--
+The modular root's own activation starts with an un-narrowed ceiling, whatever
+its own ABI (`MODEL-LM-TAILCALL-MODULAR-ROOT`: the root's own panic escapes to its
+external caller).
+-/
+theorem rootUnwindCeiling_initial
+    (body : CapturedMir) (s : MachineState)
+    (hRoot : s.memory.callStack = []) (hActive : s.memory.activeCallee = .none) :
+    rootUnwindCeiling (rootActivationBody body) s = true := by
+  simp [rootUnwindCeiling, hRoot, hActive, bottomCallerBody?, rootActivationBody, withUnwindCeiling]
+
+/--
+At a modular root, `UnwindResume` reaches `Trusted`'s `.halted .panic`
+(`unwindFromCallStack [] = .halted .panic`), which the unwind-ceiling guard
+turns into `.ub` exactly when the root ceiling is narrowed.
+-/
+theorem root_unwindResume_guarded
+    (s : MachineState) (span : String) (cb : Option CapturedMir) (ceiling : Bool)
+    (hRoot : s.memory.callStack = []) :
+    guardRootUnwindCeiling ceiling (evalTerminatorProto s ⟨.unwindResume, span⟩ cb) =
+      match ceiling with
+      | true => MirStepNode.retOutcome .panic
+      | false => MirStepNode.fail .ub := by
+  cases ceiling <;>
+    simp [guardRootUnwindCeiling, evalTerminatorProto, evalTerminator, hRoot, unwindFromCallStack,
+      MirStepNode.retOutcome]
 
 namespace TailCallCallerReferentWitnesses
 
-private def wTy : Ty := { kind := .uint .u64, layoutIdx := 0 }
-private def wPtrTy : Ty := { kind := .rawPtr .mut (.uint .u64), layoutIdx := 0 }
-
-private def wFnAbi : FnAbi := {
-  args := []
-  ret := {
-    layout := {
-      size := { bytes := 8 }
-      align := { bytes := 8 }
-      backendRepr := .memory
-      fields := .primitive
-      variants := .single 0
-      isUninhabited := false
-    }
-    mode := .direct
-  }
-  conv := .rust
-  canUnwind := false
-}
-
-private def wDecl : LocalDecl := { mutability := .mut, ty := wTy, debugName := none }
-private def wPtrDecl : LocalDecl := { mutability := .mut, ty := wPtrTy, debugName := none }
-private def wSpan : String := "TcbCopySubplaceAndTailCallPrototype.lean"
-
-private def mkSc (n : Nat) : Value := .scalar { bits := n, sizeBytes := 8 }
-
-private def mkConstOp (n : Nat) : Operand :=
-  .constant { ty := wTy, val := .scalar (.int { bits := n, sizeBytes := 8 }) }
-
-private def mkFnOp (path : String) : Operand :=
-  .constant { ty := { kind := .fnDef path [], layoutIdx := 0 }, val := .zeroSized }
-
-/--
-Tail callee `g_read(p: *mut u64, y: u64) -> u64` with 3 locals (`_0`, `_1 = p`, `_2 = y`)
-that returns `*p` (matching `MirUntestedVariantCorrespondenceTests.lean:2441`).
+/-!
+Exact replicas of the `MirUntestedVariantCorrespondenceTests.lean` builders and
+witnesses (`tyU32`, `wFnAbi`, `mkBody`, `gReadBody`, `fDangleBody`, `fCrBody`,
+`fRdBody`, `crMem` at lines 469-504, 2221-2222, 2435-2451, 2633-2648), plus
+new non-vacuity witnesses for the paths A0's caller-referent sentinel missed.
 -/
-def gReadBody : CapturedMir := {
-  defPath := "test::g_read"
-  phase := .runtimeOptimized
-  role := .subject
-  argCount := 2
-  localDecls := [wDecl, wPtrDecl, wDecl]
-  basicBlocks := [
-    { statements := [
-        ⟨.assign ⟨0, []⟩ (.use (.copy ⟨1, [.deref]⟩)), wSpan⟩
-      ]
-      terminator := ⟨.return_, wSpan⟩
-      isCleanup := false }
-  ]
-  fnAbi := wFnAbi
-  layouts := emptyLayoutTable
-  allocations := []
-}
+
+def tyU32 : Ty := { kind := .uint .u32, layoutIdx := 0 }
+
+def u32Layout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+
+def wFnAbi : FnAbi :=
+  { args := [], ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+def wLayouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := [] }
+
+/-- A `Runtime(PostCleanup)` body with the given locals and blocks. -/
+def mkBody (dp : DefPath) (argCount : Nat) (decls : List LocalDecl)
+    (bbs : List BasicBlockData) : CapturedMir :=
+  { defPath := dp, argCount, localDecls := decls, basicBlocks := bbs,
+    phase := .runtimePostCleanup, role := .subject, fnAbi := wFnAbi, layouts := wLayouts,
+    allocations := [] }
+
+def u32Decl (name : String) : LocalDecl := { mutability := .mut, ty := tyU32, debugName := some name }
+
+def cU32 (v : Nat) : Operand := .constant { ty := tyU32, val := .scalar (.int ⟨v, 4⟩) }
+
+def lc (i : Nat) : Place := { local_ := i, projection := [] }
+
+def st (k : StatementKind) : Statement := { kind := k, span := "w" }
+
+def assignU32 (dst v : Nat) : Statement := st (.assign (lc dst) (.use (cU32 v)))
+
+def blk (stmts : List Statement) (t : TerminatorKind) : BasicBlockData :=
+  { statements := stmts, terminator := { kind := t, span := "w" }, isCleanup := false }
+
+def fnItem (dp : String) : Operand :=
+  .constant { ty := { kind := .fnDef dp [], layoutIdx := 0 }, val := .zeroSized }
+
+/-- `*mut u32`. -/
+def tyPtrMutU32 : Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
+
+def ptrDecl (name : String) : LocalDecl :=
+  { mutability := .mut, ty := tyPtrMutU32, debugName := some name }
+
+/-- `fn gread(p: *mut u32, y: u32) -> u32 { _0 = copy (*p); return }`. -/
+def gReadBody : CapturedMir :=
+  mkBody "w::gread" 2 [u32Decl "_0", ptrDecl "p", u32Decl "y"]
+    [blk [st (.assign (lc 0) (.use (.copy ⟨1, [.deref]⟩)))] .return_]
+
+/-- `fn fdangle() -> u32 { let mut x = 42; let p = &raw mut x; become gread(p, 137) }`. -/
+def fDangleBody : CapturedMir :=
+  mkBody "w::fdangle" 0 [u32Decl "_0", ptrDecl "p", u32Decl "x"]
+    [blk [st (.storageLive 1), st (.storageLive 2), assignU32 2 42,
+          st (.assign (lc 1) (.rawPtr .mut (lc 2)))]
+      (.tailCall (fnItem "w::gread") [.copy (lc 1), cU32 137])]
+
+/-- `fn fcr(p: *mut u32) -> u32 { become gread(copy p, 137) }`. -/
+def fCrBody : CapturedMir :=
+  mkBody "w::fcr" 1 [u32Decl "_0", ptrDecl "p"]
+    [blk [] (.tailCall (fnItem "w::gread") [.copy (lc 1), cU32 137])]
+
+/-- `fn frd(p: *mut u32) -> u32 { _0 = copy (*p); return }`. -/
+def fRdBody : CapturedMir :=
+  mkBody "w::frd" 1 [u32Decl "_0", ptrDecl "p"]
+    [blk [st (.assign (lc 0) (.use (.copy ⟨1, [.deref]⟩)))] .return_]
+
+/-- `fn gadd(p: *mut u32, y: u32) -> u32 { _0 = Add(copy (*p), 0); return }` (a non-`Use` read). -/
+def gAddBody : CapturedMir :=
+  mkBody "w::gadd" 2 [u32Decl "_0", ptrDecl "p", u32Decl "y"]
+    [blk [st (.assign (lc 0) (.binaryOp .add (.copy ⟨1, [.deref]⟩) (cU32 0)))] .return_]
+
+/-- `fn fcradd(p: *mut u32) -> u32 { become gadd(copy p, 137) }`. -/
+def fCrAddBody : CapturedMir :=
+  mkBody "w::fcradd" 1 [u32Decl "_0", ptrDecl "p"]
+    [blk [] (.tailCall (fnItem "w::gadd") [.copy (lc 1), cU32 137])]
+
+/-- `fn hadd(p: *mut u32) -> u32 { _0 = Add(copy (*p), 1); return }`. -/
+def hAddBody : CapturedMir :=
+  mkBody "w::hadd" 1 [u32Decl "_0", ptrDecl "p"]
+    [blk [st (.assign (lc 0) (.binaryOp .add (.copy ⟨1, [.deref]⟩) (cU32 1)))] .return_]
+
+/-- `fn fcall(p: *mut u32) -> u32 { _0 = hadd(copy p) -> bb1; bb1: return }` (no tail call). -/
+def fCallBody : CapturedMir :=
+  mkBody "w::fcall" 1 [u32Decl "_0", ptrDecl "p"]
+    [blk [] (.call (fnItem "w::hadd") [.copy (lc 1)] (lc 0) (some 1) .continue_),
+     blk [] .return_]
+
+/-- `fn gcall(p: *mut u32, y: u32) -> u32 { _0 = hadd(copy p) -> bb1; bb1: return }`. -/
+def gCallBody : CapturedMir :=
+  mkBody "w::gcall" 2 [u32Decl "_0", ptrDecl "p", u32Decl "y"]
+    [blk [] (.call (fnItem "w::hadd") [.copy (lc 1)] (lc 0) (some 1) .continue_),
+     blk [] .return_]
+
+/-- `fn fcrcall(p: *mut u32) -> u32 { become gcall(copy p, 137) }`. -/
+def fCrCallBody : CapturedMir :=
+  mkBody "w::fcrcall" 1 [u32Decl "_0", ptrDecl "p"]
+    [blk [] (.tailCall (fnItem "w::gcall") [.copy (lc 1), cU32 137])]
 
 /--
-Root function `f_cr(p: *mut u64) -> u64` (`2` locals: `_0`, `_1 = p`) that
-tail-calls `g_read(copy _1, 137)` where `p` points to `callerLocals[2] = 42`.
+`fn gwr(p: *mut u32, y: u32) -> u32 { _2 = 137; *p = 77; let r = &mut *p; _0 = *r; return }`
+(4 locals: the callee's own `_2` would shadow the referent slot `2`).
 -/
-def fCrBody : CapturedMir := {
-  defPath := "test::f_cr"
-  phase := .runtimeOptimized
-  role := .subject
-  argCount := 1
-  localDecls := [wDecl, wPtrDecl]
-  basicBlocks := [
-    { statements := []
-      terminator := ⟨.tailCall (mkFnOp "test::g_read") [.copy ⟨1, []⟩, mkConstOp 137], wSpan⟩
-      isCleanup := false }
-  ]
-  fnAbi := wFnAbi
-  layouts := emptyLayoutTable
-  allocations := []
-}
+def gWriteReborrowBody : CapturedMir :=
+  mkBody "w::gwr" 2 [u32Decl "_0", ptrDecl "p", u32Decl "y", ptrDecl "r"]
+    [blk [st (.storageLive 3),
+          assignU32 2 137,
+          st (.assign ⟨1, [.deref]⟩ (.use (cU32 77))),
+          st (.assign (lc 3) (.ref (.mut false) ⟨1, [.deref]⟩)),
+          st (.assign (lc 0) (.use (.copy ⟨3, [.deref]⟩)))] .return_]
+
+/-- `fn fcrwr(p: *mut u32) -> u32 { become gwr(copy p, 137) }`. -/
+def fCrWriteBody : CapturedMir :=
+  mkBody "w::fcrwr" 1 [u32Decl "_0", ptrDecl "p"]
+    [blk [] (.tailCall (fnItem "w::gwr") [.copy (lc 1), cU32 137])]
+
+/-- `fn hwide(p: *mut u32, a: u32, b: u32, c: u32) -> u32 { _0 = copy (*p); return }` (5 locals). -/
+def hWideBody : CapturedMir :=
+  mkBody "w::hwide" 4 [u32Decl "_0", ptrDecl "p", u32Decl "a", u32Decl "b", u32Decl "c"]
+    [blk [st (.assign (lc 0) (.use (.copy ⟨1, [.deref]⟩)))] .return_]
+
+/-- `fn gmid(p: *mut u32, y: u32) -> u32 { become hwide(copy p, 1, 2, 3) }` (3 locals). -/
+def gMidBody : CapturedMir :=
+  mkBody "w::gmid" 2 [u32Decl "_0", ptrDecl "p", u32Decl "y"]
+    [blk [] (.tailCall (fnItem "w::hwide") [.copy (lc 1), cU32 1, cU32 2, cU32 3])]
+
+/-- `fn fhop(p: *mut u32) -> u32 { become gmid(copy p, 137) }` (2 locals; two widening root hops). -/
+def fHopBody : CapturedMir :=
+  mkBody "w::fhop" 1 [u32Decl "_0", ptrDecl "p"]
+    [blk [] (.tailCall (fnItem "w::gmid") [.copy (lc 1), cU32 137])]
 
 /--
-Root function `f_rd(p: *mut u64) -> u64` (`2` locals: `_0`, `_1 = p`) that
-directly reads `*p` without a tail call.
+The modular root's external caller owns `*p = 42` as caller-owned referent slot
+`2` of depth `0`, borrowed by tag `1` (exactly `crMem`), with every witness
+callee linked.
 -/
-def fRdBody : CapturedMir := {
-  defPath := "test::f_rd"
-  phase := .runtimeOptimized
-  role := .subject
-  argCount := 1
-  localDecls := [wDecl, wPtrDecl]
-  basicBlocks := [
-    { statements := [⟨.assign ⟨0, []⟩ (.use (.copy ⟨1, [.deref]⟩)), wSpan⟩]
-      terminator := ⟨.return_, wSpan⟩
-      isCleanup := false }
-  ]
-  fnAbi := wFnAbi
-  layouts := emptyLayoutTable
-  allocations := []
-}
+def crMem : Memory :=
+  { callees := [gReadBody, gAddBody, hAddBody, gCallBody, gWriteReborrowBody, hWideBody, gMidBody],
+    callerLocals := [.uninit, .uninit, .init (.scalar ⟨42, 4⟩)],
+    borrows := [{ tag := 1, targetLocal := 2, targetProjection := [], perm := .unique }],
+    nextTag := 2 }
+
+/-- The pointer argument `p` (provenance tag `1`). -/
+def crPtrArg : Value := .ptr ⟨1, 0⟩ 8
+
+/-- One `Trusted` coalgebra step (the correspondence suite's `execStep`). -/
+def execStep (body : CapturedMir) (s : MirExecState) : Option MirExecState :=
+  match stepMirState body s with
+  | .ret out => some (.halted out)
+  | .tau s' => some s'
+  | .vis (.inl (.fail k)) _ => some (.faulted k)
+  | .vis (.inr (.inl _)) k => some (k PUnit.unit)
+  | .vis (.inr (.inr _)) _ => none
+
+/-- `n` `Trusted` coalgebra steps (the correspondence suite's `execN`). -/
+def execN (body : CapturedMir) : Nat → MirExecState → Option MirExecState
+  | 0, s => some s
+  | n + 1, s => (execStep body s).bind (execN body n)
+
+/-- The returned value of a halted state. -/
+def haltedVal? : Option MirExecState → Option Value
+  | some (.halted (.normal (v, _))) => some v
+  | _ => none
+
+/-- Root initial state of a caller-referent witness. -/
+def crInit (body : CapturedMir) : MirExecState :=
+  .running (Trusted.VerificationResult.initMachineStateWithMemory body [crPtrArg] crMem)
 
 /--
-Root function `f_dangle() -> u64` (`3` locals: `_0`, `_1 = p`, `_2 = 99`)
-that takes a raw pointer to its own local `_2` and tail-calls `g_read(copy _1, 137)`.
--/
-def fDangleBody : CapturedMir := {
-  defPath := "test::f_dangle"
-  phase := .runtimeOptimized
-  role := .subject
-  argCount := 0
-  localDecls := [wDecl, wPtrDecl, wDecl]
-  basicBlocks := [
-    { statements := [
-        ⟨.storageLive 1, wSpan⟩,
-        ⟨.storageLive 2, wSpan⟩,
-        ⟨.assign ⟨2, []⟩ (.use (mkConstOp 99)), wSpan⟩,
-        ⟨.assign ⟨1, []⟩ (.rawPtr .mut ⟨2, []⟩), wSpan⟩
-      ]
-      terminator := ⟨.tailCall (mkFnOp "test::g_read") [.copy ⟨1, []⟩, mkConstOp 137], wSpan⟩
-      isCleanup := false }
-  ]
-  fnAbi := wFnAbi
-  layouts := emptyLayoutTable
-  allocations := []
-}
-
-/--
-Initial `Memory` with `callerLocals[2] = 42` and borrow tag `0` pointing to
-`(depth := 0, targetLocal := 2)`, matching `MirUntestedVariantCorrespondenceTests.lean:2645`.
--/
-def crMem : Memory := {
-  emptyMemory with
-  callees := [gReadBody]
-  callerLocals := [.uninit, .uninit, .init (mkSc 42)]
-  borrows := [{
-    tag := 0
-    targetLocal := 2
-    targetFrameDepth := 0
-    allocDead := false
-    targetProjection := []
-    perm := .unique
-    rangeOffset := 0
-    rangeLen := 8
-    parentTag := none
-  }]
-  nextTag := 1
-}
-
-def crPtrArg : Value := .ptr { allocId := 0, offsetBytes := 0 } 8
-
-/--
-Under `execNProto`, `fCrBody` (`f_cr(p) -> tailCall g_read(p, 137)`) reads
-`callerLocals[2] = 42` instead of `gReadBody`'s shadowed local `_2 = 137`,
-agreeing with `fRdBody` on the returned scalar `42`.
+**Bug 3 reproduction and repair on the exact correspondence witnesses.**
+Unpatched `Trusted` returns `gread`'s own `_2 = 137` for `fcr(p)`
+(`tailCall_witness_root_caller_referent_divergence`), the repaired prototype
+returns the caller's `*p = 42`, agreeing with the tail-call-free `frd(p)` under
+both semantics.
 -/
 theorem tailCall_repaired_root_caller_referent_returns_42 :
-    (match execNProto fCrBody 3 (.running (initMachineStateWithMemoryProto fCrBody [crPtrArg] crMem)) with
-     | some (.halted (.normal (v, _))) => some v
-     | _ => none) =
-    (match execNProto fRdBody 2 (.running (initMachineStateWithMemoryProto fRdBody [crPtrArg] crMem)) with
-     | some (.halted (.normal (v, _))) => some v
-     | _ => none) ∧
-    (match execNProto fCrBody 3 (.running (initMachineStateWithMemoryProto fCrBody [crPtrArg] crMem)) with
-     | some (.halted (.normal (v, _))) => some v
-     | _ => none) = some (mkSc 42) :=
-  ⟨rfl, rfl⟩
+    haltedVal? (execN fCrBody 3 (crInit fCrBody)) = some (.scalar ⟨137, 4⟩) ∧
+    haltedVal? (execNProto fCrBody 3 (crInit fCrBody)) = some (.scalar ⟨42, 4⟩) ∧
+    haltedVal? (execN fRdBody 2 (crInit fRdBody)) = some (.scalar ⟨42, 4⟩) ∧
+    haltedVal? (execNProto fRdBody 2 (crInit fRdBody)) = some (.scalar ⟨42, 4⟩) := by
+  exact ⟨rfl, rfl, rfl, rfl⟩
 
 /--
-Dangling-pointer soundness preserved: `fDangleBody` (`_1 = &raw mut _2; tailCall g_read(_1, 137)`)
-still faults with `.faulted .ub` when `g_read` dereferences `_1` after `fDangleBody`'s
-frame is popped.
+**Non-`Use` reads are repaired too.** `gadd` reads `*p` inside `BinOp.add`
+(`Trusted.evalRvalue`'s own operand evaluation, which the repair never
+re-implements): unpatched `Trusted` (and A0's sentinel prototype) still returned
+`137`; the relocation makes `Trusted`'s own lookup return `42`.
+-/
+theorem tailCall_repaired_root_caller_referent_binop :
+    haltedVal? (execN fCrAddBody 3 (crInit fCrAddBody)) = some (.scalar ⟨137, 4⟩) ∧
+    haltedVal? (execNProto fCrAddBody 3 (crInit fCrAddBody)) = some (.scalar ⟨42, 4⟩) := by
+  exact ⟨rfl, rfl⟩
+
+/--
+**No regression on inline calls.** A root that inline-calls `hadd(p)` (no tail
+call at all) returns `43` under unpatched `Trusted` and under the prototype (A0's
+init-time sentinel promotion made this program fault with `.ub`), and a root tail
+call followed by an inline call (`fcrcall -> become gcall -> hadd`) also returns
+`43` through the suspended relocated root frame.
+-/
+theorem tailCall_repaired_caller_referent_inline_calls :
+    haltedVal? (execN fCallBody 6 (crInit fCallBody)) = some (.scalar ⟨43, 4⟩) ∧
+    haltedVal? (execNProto fCallBody 6 (crInit fCallBody)) = some (.scalar ⟨43, 4⟩) ∧
+    haltedVal? (execNProto fCrCallBody 7 (crInit fCrCallBody)) = some (.scalar ⟨43, 4⟩) := by
+  exact ⟨rfl, rfl, rfl⟩
+
+/--
+**Write-through and child reborrow in the tail callee.** `gwr` (4 locals, its own
+`_2 = 137`) writes `*p = 77`, reborrows `r = &mut *p`, and returns `*r`: the
+prototype returns `77`, leaves the callee's `_2` alone, and the caller's referent
+— reached from the provenance tag `1` of the argument, exactly as
+`VerificationResult` reads `mem.callerLocals[entry.targetLocal]` — holds `77`
+(relocated to slot `4 = 2 + (4 - 2)` past the callee frame).
+-/
+theorem tailCall_repaired_caller_referent_write_and_reborrow :
+    (match execNProto fCrWriteBody 7 (crInit fCrWriteBody) with
+     | some (.halted (.normal (v, memOut))) =>
+       some (v,
+         (lookupBorrow memOut.borrows 1).bind (fun e => get? memOut.callerLocals e.targetLocal),
+         (lookupBorrow memOut.borrows 1).map (·.targetLocal))
+     | _ => none) =
+    some (.scalar ⟨77, 4⟩, some (.init (.scalar ⟨77, 4⟩)), some 4) := by
+  rfl
+
+/--
+**Multi-hop root tail calls.** `fhop` (2 locals) → `gmid` (3 locals) → `hwide`
+(5 locals): each widening hop relocates the referent again (`2 → 3 → 5`), and
+`hwide` reads `42`. Unpatched `Trusted` is worse than shadowing here: the second
+hop's teardown (`disableFrameBorrows … 0 3`) treats the caller-owned slot `2` as
+`gmid`'s own local and *disables* the caller's borrow, so `hwide`'s `*p` faults
+with a false `.ub`.
+-/
+theorem tailCall_repaired_caller_referent_multihop :
+    execN fHopBody 4 (crInit fHopBody) = some (.faulted .ub) ∧
+    haltedVal? (execNProto fHopBody 4 (crInit fHopBody)) = some (.scalar ⟨42, 4⟩) := by
+  exact ⟨rfl, rfl⟩
+
+/--
+**Dangling-pointer soundness preserved.** `fdangle`'s own local `_2` is
+frame-owned (`2 < 3`), so it is disabled and dead after the tail call and never
+relocated: `gread`'s `*p` faults with `.ub` under both semantics.
 -/
 theorem tailCall_repaired_dangling_frame_local_faults_ub :
-    execNProto fDangleBody 6
-      (.running (initMachineStateWithMemoryProto fDangleBody [] { emptyMemory with callees := [gReadBody] })) =
-    some (.faulted .ub) := by
-  rfl
+    execN fDangleBody 6 (.running (initMachineStateWithCallees fDangleBody [] [gReadBody])) =
+      some (.faulted .ub) ∧
+    execNProto fDangleBody 6 (.running (initMachineStateWithCallees fDangleBody [] [gReadBody])) =
+      some (.faulted .ub) := by
+  exact ⟨rfl, rfl⟩
+
+/-! ### Bug 2 witnesses at a modular root -/
+
+/-- `wFnAbi` with `canUnwind := true`. -/
+def unwFnAbi : FnAbi := { wFnAbi with canUnwind := true }
+
+/-- `fn gunw() -> u32 { resume }` (`canUnwind = false`, the correspondence suite's `gUnwindBody`). -/
+def gUnwindBody : CapturedMir := mkBody "w::gunw" 0 [u32Decl "_0"] [blk [] .unwindResume]
+
+/-- `fn funw() -> u32 { become gunw() }` (the correspondence suite's `fUnwindBody`). -/
+def fUnwindBody : CapturedMir :=
+  mkBody "w::funw" 0 [u32Decl "_0"] [blk [] (.tailCall (fnItem "w::gunw") [])]
+
+/-- An unwinding (`canUnwind = true`) variant of `gunw`. -/
+def gUnwindCanBody : CapturedMir :=
+  { mkBody "w::gunwcan" 0 [u32Decl "_0"] [blk [] .unwindResume] with fnAbi := unwFnAbi }
+
+/-- `fn funwcan() -> u32 { become gunwcan() }` (unwinding root and callee). -/
+def fUnwindCanBody : CapturedMir :=
+  { mkBody "w::funwcan" 0 [u32Decl "_0"] [blk [] (.tailCall (fnItem "w::gunwcan") [])] with
+    fnAbi := unwFnAbi }
+
+/-- `fn gmidnu() -> u32 { become gunwcan() }` (`canUnwind = false` middle hop). -/
+def gMidNoUnwindBody : CapturedMir :=
+  mkBody "w::gmidnu" 0 [u32Decl "_0"] [blk [] (.tailCall (fnItem "w::gunwcan") [])]
+
+/-- `fn fhopnu() -> u32 { become gmidnu() }` (unwinding root, `!canUnwind` middle, unwinding last hop). -/
+def fHopNoUnwindBody : CapturedMir :=
+  { mkBody "w::fhopnu" 0 [u32Decl "_0"] [blk [] (.tailCall (fnItem "w::gmidnu") [])] with
+    fnAbi := unwFnAbi }
+
+/-- `fn kunw() -> u32 { resume }` (unwinding inline callee). -/
+def kUnwindBody : CapturedMir :=
+  { mkBody "w::kunw" 0 [u32Decl "_0"] [blk [] .unwindResume] with fnAbi := unwFnAbi }
+
+/-- `fn gcallunw() -> u32 { _0 = kunw() -> [return: bb1, unwind: continue]; bb1: return }` (`!canUnwind`). -/
+def gCallUnwindBody : CapturedMir :=
+  mkBody "w::gcallunw" 0 [u32Decl "_0"]
+    [blk [] (.call (fnItem "w::kunw") [] (lc 0) (some 1) .continue_), blk [] .return_]
+
+/-- `fn fcallunw() -> u32 { become gcallunw() }` (unwinding root). -/
+def fCallUnwindBody : CapturedMir :=
+  { mkBody "w::fcallunw" 0 [u32Decl "_0"] [blk [] (.tailCall (fnItem "w::gcallunw") [])] with
+    fnAbi := unwFnAbi }
+
+/-- `fn rootunw() -> u32 { resume }` (a non-unwinding root that unwinds by itself). -/
+def rootUnwindBody : CapturedMir := mkBody "w::rootunw" 0 [u32Decl "_0"] [blk [] .unwindResume]
+
+/-- All Bug 2 witness callees. -/
+def unwCallees : List CapturedMir :=
+  [gUnwindBody, gUnwindCanBody, gMidNoUnwindBody, kUnwindBody, gCallUnwindBody]
+
+/--
+**Bug 2 at a modular root.**
+1. `funw → become gunw()` with a non-unwinding `gunw` that unwinds: unpatched
+   `Trusted` halts with `.panic` (`tailCall_leanMiri_witness_unwind`), the
+   prototype faults with `.ub` (Miri: the inherited continuation is
+   `Unreachable` — and at a 1-frame stack also "unwinding past the topmost
+   stack frame").
+2. Multi-hop: unwinding root → `!canUnwind` middle → unwinding last hop still
+   faults with `.ub` (monotone ceiling).
+3. A panic of an inline callee of a narrowed root tail callee unwinds through
+   the root and faults with `.ub`.
+4. `MODEL-LM-TAILCALL-MODULAR-ROOT` is preserved where no narrowing happened:
+   an unwinding root tail-calling an unwinding callee, and a non-unwinding root
+   that unwinds by itself, both halt with `.panic`.
+-/
+theorem tailCall_root_nounwind_callee_unwind_ub :
+    execN fUnwindBody 2 (.running (initMachineStateWithCallees fUnwindBody [] unwCallees)) =
+      some (.halted .panic) ∧
+    execNProto fUnwindBody 2 (.running (initMachineStateWithCallees fUnwindBody [] unwCallees)) =
+      some (.faulted .ub) ∧
+    execNProto fHopNoUnwindBody 3
+        (.running (initMachineStateWithCallees fHopNoUnwindBody [] unwCallees)) =
+      some (.faulted .ub) ∧
+    execNProto fCallUnwindBody 3
+        (.running (initMachineStateWithCallees fCallUnwindBody [] unwCallees)) =
+      some (.faulted .ub) ∧
+    execNProto fUnwindCanBody 2
+        (.running (initMachineStateWithCallees fUnwindCanBody [] unwCallees)) =
+      some (.halted .panic) ∧
+    execNProto rootUnwindBody 1
+        (.running (initMachineStateWithCallees rootUnwindBody [] unwCallees)) =
+      some (.halted .panic) := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end TailCallCallerReferentWitnesses
 
@@ -3813,23 +3565,39 @@ theorem placeTy_nil_localDecls (layouts : LayoutTable) (p : Place) :
     placeTy .nil layouts p = .none := by
   simp [placeTy, get?]
 
+/-- A stacked chain of `.opaqueCast` projections `(… (_l as t₁) … as tₖ)`. -/
+def opaqueCastChain : List Ty → List ProjectionElem
+  | .nil => .nil
+  | t :: ts => .opaqueCast t :: opaqueCastChain ts
+
+@[simp]
+theorem stripLeadingOpaqueCast_opaqueCastChain :
+    ∀ ts : List Ty, stripLeadingOpaqueCast (opaqueCastChain ts) = .nil
+  | .nil => rfl
+  | _ :: ts => stripLeadingOpaqueCast_opaqueCastChain ts
+
+theorem stripLeadingOpaqueCast_opaqueCastChain_append (rest : List ProjectionElem) :
+    ∀ ts : List Ty,
+      stripLeadingOpaqueCast (appendProjections (opaqueCastChain ts) rest) =
+        stripLeadingOpaqueCast rest
+  | .nil => by cases rest <;> rfl
+  | _ :: ts => stripLeadingOpaqueCast_opaqueCastChain_append rest ts
+
 /--
-**Bug 4 Universal Simulation Theorem (`opaqueCast_trusted_root_dispatch_simulation`)**:
-For any local index `l`, cast type `ty`, value `val`, rvalue `rv`, variant index
-`variantIdx`, target block `targetBb`, unwind action `unwind`, and machine state `s`
-with `localDecls = []`:
-1. **Move operand (`evalOperandProto (.move)`)**:
-   `evalOperandProto locals (.move ⟨l, [.opaqueCast ty]⟩) ... = evalOperandProto locals (.move ⟨l, []⟩) ...`
-   (both return `.ok v locals'` with `locals'[l] = .uninit`).
-2. **Root place write (`writePlaceValueProto`)**:
-   `writePlaceValueProto locals borrows ⟨l, [.opaqueCast ty]⟩ val = writePlaceValueProto locals borrows ⟨l, []⟩ val`
-   (both succeed on `.uninit` and `.init _` locals).
-3. **Root assignment (`evalStmtProto (.assign ⟨l, [.opaqueCast ty]⟩ rv)`)**:
-   `evalStmtProto s ⟨.assign ⟨l, [.opaqueCast ty]⟩ rv, span⟩ = evalStmtProto s ⟨.assign ⟨l, []⟩ rv, span⟩`.
-4. **Field-shell assignment on `.uninit` (`uninitFieldWriteShellProto?`)**:
-   `uninitFieldWriteShellProto? localDecls layouts l (.opaqueCast ty) (.field idx fTy :: rest) = uninitFieldWriteShellProto? localDecls layouts l (.field idx fTy) rest`.
-5. **Deinit & SetDiscriminant & Drop (`evalStmtProto (.deinit)` / `(.setDiscriminant)` / `evalTerminatorProto (.drop)`)**:
-   `⟨l, [.opaqueCast ty]⟩` steps identically to `⟨l, []⟩`.
+**Bug 4 universal simulation theorem (`opaqueCast_trusted_root_dispatch_simulation`).**
+For every stacked chain `(… (_l as t₁) … as tₖ)` (`k ≥ 1`), every machine state,
+locals, borrows, globals, layouts, caller locals, call stack, value, rvalue,
+variant index, drop target, and unwind action, the `.opaqueCast` place behaves
+exactly like its post-borrowck erasure `_l` evaluated by **unmodified
+`Trusted`** (`evalOperand`, `writePlaceValue`, `evalStmt`, `evalTerminator`):
+1. `move (_l as T…)` (untyped `localDecls = []`) = `Trusted.evalOperand (move _l)`
+   (de-initializes `_l`),
+2. root write on `.uninit`/`.init` locals = `Trusted.writePlaceValue _l`,
+3. `(_l as T…) = rv` = `_l = rv` under the repaired `evalStmtProto`,
+4. `Deinit((_l as T…))` = `Trusted` `Deinit(_l)` for *every* `localDecls`,
+5. `SetDiscriminant((_l as T…), v)` = `Trusted` `SetDiscriminant(_l, v)` for
+   *every* `localDecls`,
+6. `Drop((_l as T…))` = `Trusted` `Drop(_l)`.
 -/
 theorem opaqueCast_trusted_root_dispatch_simulation
     (s : MachineState)
@@ -3840,32 +3608,92 @@ theorem opaqueCast_trusted_root_dispatch_simulation
     (callerLocals : List LocalSlot)
     (callStack : List SavedCallerFrame)
     (localDecls : List LocalDecl)
-    (l idx variantIdx targetBb : Nat)
-    (ty fTy : Ty)
-    (rest : List ProjectionElem)
+    (l variantIdx targetBb : Nat)
+    (t : Ty)
+    (ts : List Ty)
     (val : Value)
     (rv : Rvalue)
     (unwind : UnwindAction)
-    (span : String) :
+    (span : String)
+    (cb : Option CapturedMir) :
+    let ocs := opaqueCastChain (t :: ts)
     (evalOperandProto
-        locals (.move ⟨l, [.opaqueCast ty]⟩) borrows globals layouts callerLocals .nil callStack =
-      evalOperandProto
+        locals (.move ⟨l, ocs⟩) borrows globals layouts callerLocals .nil callStack =
+      evalOperand
         locals (.move ⟨l, []⟩) borrows globals layouts callerLocals .nil callStack) ∧
-    (writePlaceValueProto locals borrows ⟨l, [.opaqueCast ty]⟩ val .nil layouts callStack =
-      writePlaceValueProto locals borrows ⟨l, []⟩ val .nil layouts callStack) ∧
-    (evalStmtProto s ⟨.assign ⟨l, [.opaqueCast ty]⟩ rv, span⟩ .nil layouts =
+    (writePlaceValueProto locals borrows ⟨l, ocs⟩ val .nil layouts callStack =
+      writePlaceValue locals borrows ⟨l, []⟩ val .nil layouts callStack) ∧
+    (evalStmtProto s ⟨.assign ⟨l, ocs⟩ rv, span⟩ .nil layouts =
       evalStmtProto s ⟨.assign ⟨l, []⟩ rv, span⟩ .nil layouts) ∧
-    (uninitFieldWriteShellProto? localDecls layouts l (.opaqueCast ty) (.field idx fTy :: rest) =
-      uninitFieldWriteShellProto? localDecls layouts l (.field idx fTy) rest) ∧
-    (evalStmtProto s ⟨.deinit ⟨l, [.opaqueCast ty]⟩, span⟩ localDecls layouts =
-      evalStmtProto s ⟨.deinit ⟨l, []⟩, span⟩ localDecls layouts) ∧
-    (evalStmtProto s ⟨.setDiscriminant ⟨l, [.opaqueCast ty]⟩ variantIdx, span⟩ localDecls layouts =
-      evalStmtProto s ⟨.setDiscriminant ⟨l, []⟩ variantIdx, span⟩ localDecls layouts) ∧
-    (evalTerminatorProto s ⟨.drop ⟨l, [.opaqueCast ty]⟩ targetBb unwind, span⟩ .none =
-      evalTerminatorProto s ⟨.drop ⟨l, []⟩ targetBb unwind, span⟩ .none) := by
-  refine ⟨rfl, rfl, ?_, rfl, rfl, rfl, rfl⟩
-  unfold evalStmtProto
-  cases evalRvalueProto s.frame.locals rv s.memory .nil layouts <;> rfl
+    (evalStmtProto s ⟨.deinit ⟨l, ocs⟩, span⟩ localDecls layouts =
+      evalStmt s ⟨.deinit ⟨l, []⟩, span⟩ localDecls layouts) ∧
+    (evalStmtProto s ⟨.setDiscriminant ⟨l, ocs⟩ variantIdx, span⟩ localDecls layouts =
+      evalStmt s ⟨.setDiscriminant ⟨l, []⟩ variantIdx, span⟩ localDecls layouts) ∧
+    (evalTerminatorProto s ⟨.drop ⟨l, ocs⟩ targetBb unwind, span⟩ cb =
+      evalTerminator s ⟨.drop ⟨l, []⟩ targetBb unwind, span⟩ cb) := by
+  intro ocs
+  have hStrip : stripLeadingOpaqueCast (opaqueCastChain ts) = .nil :=
+    stripLeadingOpaqueCast_opaqueCastChain ts
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · simp only [ocs, opaqueCastChain, evalOperandProto, hStrip]
+    rfl
+  · simp only [ocs, opaqueCastChain, writePlaceValueProto, hStrip]
+    rfl
+  · simp only [ocs, opaqueCastChain, evalStmtProto, hStrip]
+  · simp only [ocs, opaqueCastChain, evalStmtProto, hStrip]
+    rfl
+  · simp only [ocs, opaqueCastChain, evalStmtProto, hStrip]
+  · simp only [ocs, opaqueCastChain, evalTerminatorProto, hStrip]
+    rfl
+
+/--
+**Bug 4 with typed locals: validity is preserved, against the cast type.** For a
+stacked chain on a declared local, the repaired root write validates `val`
+against the type *after* the casts (`tₖ`, the erased local's type) and otherwise
+performs `Trusted`'s erased root write; an invalid value still faults with `.ub`.
+-/
+theorem opaqueCast_typed_root_write_validates_cast_type
+    (locals : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (layouts : LayoutTable)
+    (callStack : List SavedCallerFrame)
+    (decl : LocalDecl)
+    (declsTail : List LocalDecl)
+    (l : Nat)
+    (t : Ty)
+    (ts : List Ty)
+    (val : Value) :
+    writePlaceValueProto locals borrows ⟨l, opaqueCastChain (t :: ts)⟩ val (decl :: declsTail)
+        layouts callStack =
+      match validateValueForTy? layouts
+          (placeTy (decl :: declsTail) layouts ⟨l, opaqueCastChain (t :: ts)⟩) val with
+      | false => .ub
+      | true => writePlaceValue locals borrows ⟨l, []⟩ val .nil layouts callStack := by
+  have hStrip : stripLeadingOpaqueCast (opaqueCastChain ts) = .nil :=
+    stripLeadingOpaqueCast_opaqueCastChain ts
+  simp only [opaqueCastChain, writePlaceValueProto, hStrip]
+  cases validateValueForTy? layouts
+      (placeTy (decl :: declsTail) layouts ⟨l, .opaqueCast t :: opaqueCastChain ts⟩) val <;> rfl
+
+/--
+**Bug 4 field shell through a cast: the shell of the erased local's type.**
+`(_l as T).f = rv` on an `.uninit` declared local builds exactly the field shell
+that `Trusted.uninitFieldWriteShell?` builds for a local of type `T` (the
+post-borrowck erasure `_l : T`), whatever `_l`'s declared (opaque) type is.
+-/
+theorem opaqueCast_uninit_field_shell_is_cast_type_shell
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (l idx : Nat)
+    (t fTy : Ty)
+    (rest : List ProjectionElem)
+    (decl : LocalDecl)
+    (hDecl : get? localDecls l = .some decl) :
+    uninitFieldWriteShellProto? localDecls layouts l (.opaqueCast t) (.field idx fTy :: rest) =
+      uninitFieldWriteShell? [{ decl with ty := t }] layouts 0 (.field idx fTy) rest := by
+  simp only [uninitFieldWriteShellProto?, uninitFieldWriteShell?,
+    placeTy, hDecl, resolveProjectedTy]
+  rfl
 
 /--
 Ill-formed `.opaqueCast ty :: .deref :: rest` projections continue to evaluate to
@@ -3895,3 +3723,4 @@ theorem opaqueCast_before_deref_stays_unsupported
   · simp [writePlaceValueProto, writePlaceValue, hSlot, writeProjectedForLocal, hWrite]
 
 end Anneal.TcbCopySubplaceAndTailCallPrototype
+

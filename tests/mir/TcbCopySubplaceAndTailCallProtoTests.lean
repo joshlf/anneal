@@ -3,7 +3,8 @@ import Anneal.TcbCopySubplaceAndTailCallPrototype
 /-!
 # TCB Subplace `copy_nonoverlapping` & `tailCall` / `opaqueCast` Prototype Canary Suite
 
-Positive and negative non-vacuity canaries, edge-case regression tests, and
+Positive and negative non-vacuity canaries, conservativity (no-regression)
+canaries against unmodified `Trusted`, edge-case regression tests, and
 `#print axioms` audits for `Anneal.TcbCopySubplaceAndTailCallPrototype`.
 -/
 
@@ -287,51 +288,146 @@ theorem canary_bug1_scalar_multi_count_faults_ub :
     MirStepNode.fail .ub := by
   rfl
 
+/--
+Canary 1H (Misaligned element pointer, typed program): copying `1` `u32` from
+`(&raw const a as *const u8).add(2) as *const u32` (byte offset `2`, not a whole
+`u32`) into `dst[0]`. Unpatched `Trusted` reinterprets the byte offset `2` as an
+*element* index and silently copies `a[2] = 30`; the prototype faults with
+`.ub` (Rust: `copy_nonoverlapping` requires aligned pointers).
+-/
+theorem canary_bug1_misaligned_byte_offset_faults_ub :
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let arrTy : Ty := { kind := .array (.uint .u32) 4, layoutIdx := 0 }
+    let decls : List LocalDecl := [
+      { mutability := .mut, ty := arrTy, debugName := none },
+      { mutability := .mut, ty := arrTy, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 0 }, debugName := none },
+      { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }, debugName := none }
+    ]
+    let srcArr : Value := .aggregate 0 [mkU32 10, mkU32 20, mkU32 30, mkU32 40]
+    let dstArr : Value := .aggregate 0 [mkU32 0, mkU32 0, mkU32 0, mkU32 0]
+    let locals : List LocalSlot := [.init srcArr, .init dstArr,
+      .init (.ptr { allocId := 60, offsetBytes := 2 } 8), .init (.ptr { allocId := 61, offsetBytes := 0 } 8)]
+    let srcEntry : BorrowEntry := {
+      tag := 60, targetLocal := 0, targetProjection := [], perm := .cell }
+    let dstEntry : BorrowEntry := {
+      tag := 61, targetLocal := 1, targetProjection := [.constantIndex 0 4 false], perm := .unique }
+    let s : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry], nextTag := 62 }
+    }
+    let _ := u32Ty
+    (match
+      evalCopyNonOverlappingPermOk
+        s (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls emptyLayoutTable
+        { allocId := 60, offsetBytes := 2 } { allocId := 61, offsetBytes := 0 }
+        srcEntry dstEntry 1 locals
+     with
+     | .tau (.running s') => get? s'.frame.locals 1
+     | _ => none) =
+      some (.init (.aggregate 0 [mkU32 30, mkU32 0, mkU32 0, mkU32 0])) ∧
+    evalCopyNonOverlappingPermOkProto
+      s (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) decls emptyLayoutTable
+      { allocId := 60, offsetBytes := 2 } { allocId := 61, offsetBytes := 0 }
+      srcEntry dstEntry 1 locals =
+      MirStepNode.fail .ub := by
+  exact ⟨rfl, rfl⟩
+
+/--
+Canary 1I (Tree Borrows source-read transition on a multi-element copy):
+copying `2` elements from `src[0..2]` through tag `40` is a read of the source
+window, and the activated sibling borrow `tag = 45` of `src` (`.unique`) is a
+foreign borrow for that read, so it becomes `.frozen` (Tree Borrows
+`Active --foreign read--> Frozen`), exactly as `Trusted`'s single-element path
+(`borrowsAfterCopySingleDirect`) does; the destination `dst[0..2]` receives
+`[70, 80]`. (A0's `borrowsAfterCopyAtProj` read transition was dead code, so
+`tag = 45` stayed `.unique`; unpatched `Trusted` faults with a false `.ub` on this
+untyped subplace copy.)
+-/
+theorem canary_bug1_multi_copy_source_read_freezes_foreign_active :
+    let srcArr : Value := .aggregate 0 [mkU32 70, mkU32 80]
+    let dstArr : Value := .aggregate 0 [mkU32 1, mkU32 2, mkU32 3, mkU32 4]
+    let locals : List LocalSlot := [.init srcArr, .init dstArr]
+    let srcEntry : BorrowEntry :=
+      { tag := 40, targetLocal := 0, targetProjection := [.constantIndex 0 2 false], perm := .cell }
+    let dstEntry : BorrowEntry :=
+      { tag := 41, targetLocal := 1, targetProjection := [.constantIndex 0 4 false], perm := .unique }
+    let activeSib : BorrowEntry :=
+      { tag := 45, targetLocal := 0, targetProjection := [], perm := .unique }
+    let s : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := { emptyMemory with borrows := [srcEntry, dstEntry, activeSib], nextTag := 46 }
+    }
+    evalCopyNonOverlappingPermOk
+      s dummySrcOp dummyDstOp [] emptyLayoutTable
+      { allocId := 40, offsetBytes := 0 } { allocId := 41, offsetBytes := 0 }
+      srcEntry dstEntry 2 locals = MirStepNode.fail .ub ∧
+    evalCopyNonOverlappingPermOkProto
+      s dummySrcOp dummyDstOp [] emptyLayoutTable
+      { allocId := 40, offsetBytes := 0 } { allocId := 41, offsetBytes := 0 }
+      srcEntry dstEntry 2 locals =
+    MirStepNode.step {
+      s with
+      frame := {
+        blockIdx := 0
+        stmtIdx := 1
+        locals := [.init srcArr, .init (.aggregate 0 [mkU32 70, mkU32 80, mkU32 3, mkU32 4])]
+      }
+      memory := {
+        s.memory with
+        borrows := [srcEntry, dstEntry, { activeSib with perm := .frozen }]
+      }
+    } := by
+  exact ⟨rfl, rfl⟩
+
 /-! ## 2. Bug 2 Canaries: `DIV-LM-TAILCALL-NOUNWIND-UNWIND` -/
 
 /--
 Canary 2A: All 4 caller `UnwindAction` variants (`.cleanup 3`, `.continue_`,
-`.unreachable`, `.terminate`) are narrowed to `.unreachable` when `enterTailCalleeFrameProto`
-enters a `canUnwind = false` tail callee, causing `unwindFromCallStackProto` to
-fault with `.faulted .ub`.
+`.unreachable`, `.terminate`) are narrowed to `.unreachable` when
+`enterTailCalleeFrameProto` enters a `canUnwind = false` tail callee, so
+`Trusted`'s own `unwindFromCallStack` faults with `.faulted .ub`.
 -/
 theorem canary_bug2_all_four_caller_unwind_actions_fault_ub
     (caller : SavedCallerFrame)
     (rest : List SavedCallerFrame)
     (mem memAtUnwind : Memory)
+    (ceiling : Bool)
     (calleeBody : CapturedMir)
     (args : List Value)
     (hNoUnwind : calleeBody.fnAbi.canUnwind = false) :
-    (unwindFromCallStackProto
+    (unwindFromCallStack
       (enterTailCalleeFrameProto
         { mem with callStack := { caller with returnUnwind := .cleanup 3 } :: rest }
-        calleeBody args).memory.callStack
+        ceiling calleeBody args).memory.callStack
       memAtUnwind = .faulted .ub) ∧
-    (unwindFromCallStackProto
+    (unwindFromCallStack
       (enterTailCalleeFrameProto
         { mem with callStack := { caller with returnUnwind := .continue_ } :: rest }
-        calleeBody args).memory.callStack
+        ceiling calleeBody args).memory.callStack
       memAtUnwind = .faulted .ub) ∧
-    (unwindFromCallStackProto
+    (unwindFromCallStack
       (enterTailCalleeFrameProto
         { mem with callStack := { caller with returnUnwind := .unreachable } :: rest }
-        calleeBody args).memory.callStack
+        ceiling calleeBody args).memory.callStack
       memAtUnwind = .faulted .ub) ∧
-    (unwindFromCallStackProto
+    (unwindFromCallStack
       (enterTailCalleeFrameProto
         { mem with callStack := { caller with returnUnwind := .terminate } :: rest }
-        calleeBody args).memory.callStack
+        ceiling calleeBody args).memory.callStack
       memAtUnwind = .faulted .ub) :=
-  ⟨tailCall_leanMiri_nounwind_callee_simulation _ rest _ calleeBody args memAtUnwind hNoUnwind rfl,
-   tailCall_leanMiri_nounwind_callee_simulation _ rest _ calleeBody args memAtUnwind hNoUnwind rfl,
-   tailCall_leanMiri_nounwind_callee_simulation _ rest _ calleeBody args memAtUnwind hNoUnwind rfl,
-   tailCall_leanMiri_nounwind_callee_simulation _ rest _ calleeBody args memAtUnwind hNoUnwind rfl⟩
+  ⟨tailCall_leanMiri_nounwind_callee_simulation _ rest _ ceiling calleeBody args memAtUnwind hNoUnwind rfl,
+   tailCall_leanMiri_nounwind_callee_simulation _ rest _ ceiling calleeBody args memAtUnwind hNoUnwind rfl,
+   tailCall_leanMiri_nounwind_callee_simulation _ rest _ ceiling calleeBody args memAtUnwind hNoUnwind rfl,
+   tailCall_leanMiri_nounwind_callee_simulation _ rest _ ceiling calleeBody args memAtUnwind hNoUnwind rfl⟩
 
 /-!
-Canary 2B (End-to-end execution of `caller -> call f (canUnwind := true, returnUnwind := .cleanup 1) -> tailCall g (canUnwind := false) -> unwindResume`):
-- Under unpatched `Trusted` (`execN`), `g` unwinding enters `caller`'s cleanup block `bb1` and returns `999` (`.halted (.normal (999, _))`) instead of faulting!
-- Under repaired `execNProto`, `g` unwinding immediately faults with `.faulted .ub`.
-- Meanwhile, at the modular root (`callStack = []`), `f -> tailCall g -> unwindResume` still halts with `.halted .panic` (`MODEL-LM-TAILCALL-MODULAR-ROOT` preserved).
+Canary 2B (end-to-end, `caller -> call f (canUnwind, unwind: cleanup bb1) -> become g (!canUnwind) -> resume`):
+- Unpatched `Trusted`: `g`'s unwind enters `caller`'s cleanup block `bb1` and returns `999`.
+- Repaired prototype: `g`'s unwind faults with `.faulted .ub`.
+- Modular root `f -> become g -> resume`: unpatched `Trusted` halts with
+  `.panic`; the prototype narrows the root unwind ceiling and faults with `.ub`
+  (A0's prototype kept `.panic` here).
 -/
 section Bug2EndToEndCanary
 
@@ -410,149 +506,66 @@ def callerWithCleanupBody : CapturedMir := {
   allocations := []
 }
 
-theorem canary_bug2_nested_tailcall_nounwind_faults_ub :
-    let mem0 : Memory := { emptyMemory with callees := [fCanUnwindBody, gNoUnwindBody] }
-    let s0 := initMachineStateWithMemoryProto callerWithCleanupBody [] mem0
-    execNProto callerWithCleanupBody 3 (.running s0) = some (.faulted .ub) ∧
+private def mem0 : Memory := { emptyMemory with callees := [fCanUnwindBody, gNoUnwindBody] }
+
+theorem canary_bug2_nested_and_root_tailcall_nounwind_faults_ub :
+    (match TailCallCallerReferentWitnesses.execN callerWithCleanupBody 5
+        (.running (initMachineStateWithMemory callerWithCleanupBody [] mem0)) with
+     | some (.halted (.normal (v, _))) => some v
+     | _ => none) = some (.scalar { bits := 999, sizeBytes := 8 }) ∧
+    execNProto callerWithCleanupBody 3
+      (.running (initMachineStateWithMemory callerWithCleanupBody [] mem0)) = some (.faulted .ub) ∧
+    TailCallCallerReferentWitnesses.execN fCanUnwindBody 2
+      (.running (initMachineStateWithMemory fCanUnwindBody [] mem0)) = some (.halted .panic) ∧
     execNProto fCanUnwindBody 2
-      (.running (initMachineStateWithMemoryProto fCanUnwindBody [] mem0)) =
-      some (.halted .panic) := by
-  exact ⟨rfl, rfl⟩
+      (.running (initMachineStateWithMemory fCanUnwindBody [] mem0)) = some (.faulted .ub) := by
+  exact ⟨rfl, rfl, rfl, rfl⟩
 
 end Bug2EndToEndCanary
 
 /-! ## 3. Bug 3 Canaries: `DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW` -/
 
+open TailCallCallerReferentWitnesses in
 /--
-Canary 3A: Witness confirmation on `fCrBody`, `fRdBody`, and `fDangleBody`.
+Canary 3A: the exact correspondence witnesses (`fcr`/`frd`/`fdangle`/`crMem`),
+the non-`Use` read, inline calls, write-through + reborrow, and multi-hop.
 -/
-theorem canary_bug3_caller_referent_read_and_dangling_ub :
-    (match execNProto
-        TailCallCallerReferentWitnesses.fCrBody 3
-        (.running (initMachineStateWithMemoryProto
-          TailCallCallerReferentWitnesses.fCrBody
-          [TailCallCallerReferentWitnesses.crPtrArg]
-          TailCallCallerReferentWitnesses.crMem)) with
-     | some (.halted (.normal (v, _))) => some v
-     | _ => none) = some (.scalar { bits := 42, sizeBytes := 8 }) ∧
-    execNProto
-      TailCallCallerReferentWitnesses.fDangleBody 6
-      (.running (initMachineStateWithMemoryProto
-        TailCallCallerReferentWitnesses.fDangleBody []
-        { emptyMemory with callees := [TailCallCallerReferentWitnesses.gReadBody] })) =
+theorem canary_bug3_caller_referent_suite :
+    haltedVal? (execNProto fCrBody 3 (crInit fCrBody)) = some (.scalar ⟨42, 4⟩) ∧
+    haltedVal? (execNProto fCrAddBody 3 (crInit fCrAddBody)) = some (.scalar ⟨42, 4⟩) ∧
+    haltedVal? (execNProto fCallBody 6 (crInit fCallBody)) = some (.scalar ⟨43, 4⟩) ∧
+    haltedVal? (execNProto fCrCallBody 7 (crInit fCrCallBody)) = some (.scalar ⟨43, 4⟩) ∧
+    haltedVal? (execNProto fHopBody 4 (crInit fHopBody)) = some (.scalar ⟨42, 4⟩) ∧
+    execNProto fDangleBody 6 (.running (initMachineStateWithCallees fDangleBody [] [gReadBody])) =
       some (.faulted .ub) :=
-  ⟨TailCallCallerReferentWitnesses.tailCall_repaired_root_caller_referent_returns_42.2,
-   TailCallCallerReferentWitnesses.tailCall_repaired_dangling_frame_local_faults_ub⟩
-
-/-!
-Canary 3B (Write-through & Child Reborrow on Caller-Owned Referent in Tail Callee):
-When `f_cr` tail-calls `g_write_and_reborrow(p)` where `p` targets `callerLocals[2] = 42`
-and `g_write_and_reborrow` has its own local `_2 = 137`:
-1. Writing `*p = 77` updates `callerLocals[2]` to `77` while leaving `g`'s local `_2 = 137` untouched!
-2. Reborrowing `let r = &mut *p` (`_3 = &mut (*_1)`) and reading `*r` returns `77` (not `137`)!
--/
-section Bug3WriteAndReborrowCanary
-
-private def u64Ty3 : Ty := { kind := .uint .u64, layoutIdx := 0 }
-private def u64PtrTy3 : Ty := { kind := .rawPtr .mut (.uint .u64), layoutIdx := 0 }
-private def u64Decl3 : LocalDecl := { mutability := .mut, ty := u64Ty3, debugName := none }
-private def u64PtrDecl3 : LocalDecl := { mutability := .mut, ty := u64PtrTy3, debugName := none }
-private def u64Const3 (n : Nat) : Operand :=
-  .constant { ty := u64Ty3, val := .scalar (.int { bits := n, sizeBytes := 8 }) }
-private def fnConst3 (path : String) : Operand :=
-  .constant { ty := { kind := .fnDef path [], layoutIdx := 0 }, val := .zeroSized }
-
-private def abi3 : FnAbi := {
-  args := []
-  ret := {
-    layout := {
-      size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := .memory
-      fields := .primitive, variants := .single 0, isUninhabited := false
-    }
-    mode := .direct
-  }
-  conv := .rust
-  canUnwind := false
-}
+  ⟨tailCall_repaired_root_caller_referent_returns_42.2.1,
+   tailCall_repaired_root_caller_referent_binop.2,
+   tailCall_repaired_caller_referent_inline_calls.2.1,
+   tailCall_repaired_caller_referent_inline_calls.2.2,
+   tailCall_repaired_caller_referent_multihop.2,
+   tailCall_repaired_dangling_frame_local_faults_ub.2⟩
 
 /--
-Tail callee `g_write_reborrow(p: *mut u64) -> u64` (`4` locals: `_0`, `_1 = p`, `_2`, `_3`):
-- `StorageLive(_2); StorageLive(_3)`
-- `_2 = 137` (writes to its own local `_2`)
-- `*_1 = 77` (writes through caller-referent pointer `p` into `callerLocals[2]`)
-- `_3 = &mut (*_1)` (reborrows `*p`)
-- `_0 = *_3` (returns `77` via `*_3` read while `_2 = 137`).
+Canary 3B (relocation is the identity when the tail callee is not wider, or when
+no borrow names a caller-owned referent, e.g. Campaign-style roots without
+pointer arguments).
 -/
-def gWriteReborrowBody : CapturedMir := {
-  defPath := "test::g_write_reborrow"
-  phase := .runtimeOptimized
-  role := .subject
-  argCount := 1
-  localDecls := [u64Decl3, u64PtrDecl3, u64Decl3, u64PtrDecl3]
-  basicBlocks := [
-    { statements := [
-        ⟨.storageLive 2, "sl2"⟩,
-        ⟨.storageLive 3, "sl3"⟩,
-        ⟨.assign ⟨2, []⟩ (.use (u64Const3 137)), "s0"⟩,
-        ⟨.assign ⟨1, [.deref]⟩ (.use (u64Const3 77)), "s1"⟩,
-        ⟨.assign ⟨3, []⟩ (.ref (.mut false) ⟨1, [.deref]⟩), "s2"⟩,
-        ⟨.assign ⟨0, []⟩ (.use (.copy ⟨3, [.deref]⟩)), "s3"⟩
-      ]
-      terminator := ⟨.return_, "ret"⟩
-      isCleanup := false }
-  ]
-  fnAbi := abi3
-  layouts := emptyLayoutTable
-  allocations := []
-}
-
-def fCallWriteReborrowBody : CapturedMir := {
-  defPath := "test::f_call_write_reborrow"
-  phase := .runtimeOptimized
-  role := .subject
-  argCount := 1
-  localDecls := [u64Decl3, u64PtrDecl3]
-  basicBlocks := [
-    { statements := []
-      terminator := ⟨.tailCall (fnConst3 "test::g_write_reborrow") [.move ⟨1, []⟩], "tail"⟩
-      isCleanup := false }
-  ]
-  fnAbi := abi3
-  layouts := emptyLayoutTable
-  allocations := []
-}
-
-theorem canary_bug3_write_through_and_reborrow_caller_referent :
-    let mem0 : Memory := {
-      TailCallCallerReferentWitnesses.crMem with
-      callees := [gWriteReborrowBody]
-    }
-    let s0 :=
-      initMachineStateWithMemoryProto
-        fCallWriteReborrowBody
-        [TailCallCallerReferentWitnesses.crPtrArg]
-        mem0
-    (match execNProto fCallWriteReborrowBody 8 (.running s0) with
-     | some (.halted (.normal (retVal, memOut))) =>
-       some (retVal, get? memOut.callerLocals 2)
-     | _ => none) =
-    some (.scalar { bits := 77, sizeBytes := 8 },
-          some (.init (.scalar { bits := 77, sizeBytes := 8 }))) := by
-  rfl
-
-end Bug3WriteAndReborrowCanary
+theorem canary_bug3_relocation_identity_cases (mem : Memory) :
+    relocateRootCallerReferents mem 3 3 = mem ∧
+    relocateRootCallerReferents mem 5 2 = mem ∧
+    relocateRootCallerReferents { mem with borrows := [] } 1 9 = { mem with borrows := [] } :=
+  ⟨relocateRootCallerReferents_not_wider mem 3 3 rfl,
+   relocateRootCallerReferents_not_wider mem 5 2 rfl,
+   relocateRootCallerReferents_no_referents { mem with borrows := [] } 1 9 rfl⟩
 
 /-! ## 4. Bug 4 Canaries: `DIV-TR-OPAQUECAST-ROOT-DISPATCH` -/
 
 /--
-Canary 4A (Stacked `.opaqueCast` on `.uninit` local assignment, move operand,
-field-shell initialization, deinit, setDiscriminant, and drop):
-1. Assigning `(_0 as u64 as u64) = 55` when `_0` is `.uninit` initializes `_0` to `.init 55`
-   (whereas unpatched `evalStmt` faults with `MirStepNode.fail .ub`).
-2. `evalOperandProto [.init 55] (.move ⟨0, [.opaqueCast u64, .opaqueCast u64]⟩)` returns
-   `.ok 55 [.uninit]` (whereas unpatched `evalOperand` leaves `_0` as `[.init 55]`).
-3. `(_0 as PairU32).0 = 11` on `.uninit` `_0` initializes `_0` to `.aggregate 0 [11, .uninit]`
-   via `uninitFieldWriteShellProto?`.
+Canary 4A (Stacked `.opaqueCast` on `.uninit` local assignment and move):
+1. Assigning `(_0 as u64 as u64) = 55` when `_0` is `.uninit` initializes `_0`
+   (unpatched `evalStmt` faults with `MirStepNode.fail .ub`).
+2. `evalOperandProto [.init 55] (.move ⟨0, [.opaqueCast u64, .opaqueCast u64]⟩)`
+   de-initializes `_0` (unpatched `evalOperand` leaves it initialized).
 -/
 theorem canary_bug4_stacked_opaqueCast_uninit_assign_and_move :
     let ty : Ty := { kind := .uint .u64, layoutIdx := 0 }
@@ -576,28 +589,29 @@ theorem canary_bug4_stacked_opaqueCast_uninit_assign_and_move :
       .ok v55 [.uninit] := by
   exact ⟨rfl, rfl, rfl, rfl⟩
 
+private def pairLayouts : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [
+    { size := { bytes := 4 }, align := { bytes := 4 }
+      backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
+      fields := .primitive, variants := .single 0, isUninhabited := false },
+    { size := { bytes := 8 }, align := { bytes := 4 }
+      backendRepr := .memory
+      fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1]
+      variants := .single 0, isUninhabited := false
+      fieldLayouts := [0, 0] }
+  ]
+}
+
 /--
 Canary 4B (Field-shell initialization on `.uninit` struct local through `.opaqueCast`):
-Writing `(_0 as PairU32).0 = 11` when `_0` is `.uninit` and `localDecls[0]` is a
-2-field ADT constructs the 2-field `.uninit` shell and writes field `0`.
+writing `(_0 as PairU32).1 = 11` when `_0` is `.uninit` and declared `PairU32`
+constructs the 2-field `.uninit` shell and writes field `1`.
 -/
 theorem canary_bug4_uninit_field_shell_through_opaqueCast :
     let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
     let pairTy : Ty := { kind := .adt "PairU32" [], layoutIdx := 1 }
-    let layouts : LayoutTable := {
-      pointerBits := 64
-      isLittleEndian := true
-      entries := [
-        { size := { bytes := 4 }, align := { bytes := 4 }
-          backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
-          fields := .primitive, variants := .single 0, isUninhabited := false },
-        { size := { bytes := 8 }, align := { bytes := 4 }
-          backendRepr := .memory
-          fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1]
-          variants := .single 0, isUninhabited := false
-          fieldLayouts := [0, 0] }
-      ]
-    }
     let decls : List LocalDecl := [{ mutability := .mut, ty := pairTy, debugName := none }]
     let sUninit : MachineState := {
       frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit] }
@@ -606,8 +620,8 @@ theorem canary_bug4_uninit_field_shell_through_opaqueCast :
     let const11 : Operand := .constant { ty := u32Ty, val := .scalar (.int { bits := 11, sizeBytes := 4 }) }
     let stmt : Statement :=
       ⟨.assign ⟨0, [.opaqueCast pairTy, .field 1 u32Ty]⟩ (.use const11), "s"⟩
-    evalStmt sUninit stmt decls layouts = MirStepNode.fail .ub ∧
-    evalStmtProto sUninit stmt decls layouts =
+    evalStmt sUninit stmt decls pairLayouts = MirStepNode.fail .ub ∧
+    evalStmtProto sUninit stmt decls pairLayouts =
       MirStepNode.step {
         sUninit with
         frame := {
@@ -618,20 +632,98 @@ theorem canary_bug4_uninit_field_shell_through_opaqueCast :
       } := by
   exact ⟨rfl, rfl⟩
 
-/-! ## 5. Axiom Hygiene Audit (`#print axioms`) -/
+/--
+Canary 4C (the realistic opaque-type case): `_0` is declared with an *opaque
+alias* type (`impl Trait`, `RigidTy.alias`) and `(_0 as PairU32).1 = 11` writes
+into its revealed hidden type. The field shell must come from the cast type
+`PairU32` (the post-borrowck erasure has `_0 : PairU32`): the prototype builds
+it, whereas a shell keyed on the declared (alias) type — unpatched `Trusted`,
+and A0's `uninitFieldWriteShellProto?` — faults with `.ub`.
+-/
+theorem canary_bug4_opaque_alias_field_shell_uses_cast_type :
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let pairTy : Ty := { kind := .adt "PairU32" [], layoutIdx := 1 }
+    let aliasTy : Ty := { kind := .alias "test::Opaque::{opaque#0}" [], layoutIdx := 1 }
+    let decls : List LocalDecl := [{ mutability := .mut, ty := aliasTy, debugName := none }]
+    let sUninit : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit] }
+      memory := emptyMemory
+    }
+    let const11 : Operand := .constant { ty := u32Ty, val := .scalar (.int { bits := 11, sizeBytes := 4 }) }
+    let stmt : Statement :=
+      ⟨.assign ⟨0, [.opaqueCast pairTy, .field 1 u32Ty]⟩ (.use const11), "s"⟩
+    evalStmt sUninit stmt decls pairLayouts = MirStepNode.fail .ub ∧
+    uninitFieldWriteShell? decls pairLayouts 0 (.field 1 u32Ty) [] = .none ∧
+    evalStmtProto sUninit stmt decls pairLayouts =
+      MirStepNode.step {
+        sUninit with
+        frame := {
+          blockIdx := 0
+          stmtIdx := 1
+          locals := [.init (.aggregate 0 [.unit, .scalar { bits := 11, sizeBytes := 4 }])]
+        }
+      } := by
+  exact ⟨rfl, rfl, rfl⟩
+
+/-! ## 5. Conservativity Canaries (the prototype is `Trusted` wherever no repair applies) -/
+
+open TailCallCallerReferentWitnesses in
+/--
+Canary 5A (Tree Borrows read through `Rvalue::Use` is kept): `x = 5; r = &mut x;
+*r = 6; p = &raw const x; y = *p; *r = 7`. The read through `p` is a foreign
+read for the activated `r`, which becomes `Frozen`, so `*r = 7` is UB in
+Tree Borrows (Miri) and in `Trusted` (`freezeDerefReadBorrowsAt` in
+`evalRvalue (.use)`). The prototype agrees; A0's `evalRvalueProto (.use)`
+bypassed `Trusted.evalRvalue` and returned `6`.
+-/
+theorem canary_conservativity_use_keeps_tree_borrows_read :
+    let tbBody : CapturedMir :=
+      mkBody "w::tb" 0 [u32Decl "_0", u32Decl "x", ptrDecl "r", ptrDecl "p", u32Decl "y"]
+        [blk [st (.storageLive 1), st (.storageLive 2), st (.storageLive 3), st (.storageLive 4),
+              st (.assign (lc 1) (.use (cU32 5))),
+              st (.assign (lc 2) (.ref (.mut false) (lc 1))),
+              st (.assign ⟨2, [.deref]⟩ (.use (cU32 6))),
+              st (.assign (lc 3) (.rawPtr .not (lc 1))),
+              st (.assign (lc 4) (.use (.copy ⟨3, [.deref]⟩))),
+              st (.assign ⟨2, [.deref]⟩ (.use (cU32 7))),
+              st (.assign (lc 0) (.use (.copy (lc 4))))] .return_]
+    execN tbBody 13 (.running (initMachineState tbBody [])) = some (.faulted .ub) ∧
+    execNProto tbBody 13 (.running (initMachineState tbBody [])) = some (.faulted .ub) := by
+  exact ⟨rfl, rfl⟩
+
+/-! ## 6. Axiom Hygiene Audit (`#print axioms`) -/
 
 #print axioms Campaign14_pass_transmute_u32_byte_array_le__b0_c6.confirm_repaired_tag_pass_transmute_u32_byte_array_le__b0_c6
 #print axioms Campaign15_pass_enum_discriminant_valid__b2_c9.confirm_repaired_tag_pass_enum_discriminant_valid__b2_c9
+#print axioms evalCopyNonOverlappingPermOkProto_singleDirect_eq
 #print axioms evalCopyNonOverlappingPermOkProto_subplace_constantIndex_slice
 #print axioms evalCopyNonOverlappingPermOkProto_subplace_src_oob_ub
 #print axioms evalCopyNonOverlappingPermOkProto_sameArray_overlap_ub
 #print axioms evalCopyNonOverlappingPermOkProto_sameArray_disjoint_ok
+#print axioms evalCopyNonOverlappingPermOkProto_misaligned_src_ub
+#print axioms canary_bug1_misaligned_byte_offset_faults_ub
 #print axioms tailCall_leanMiri_nounwind_callee_simulation
+#print axioms tailCall_nounwind_callee_unwindResume_ub
 #print axioms tailCall_nounwind_multihop_monotonicity
-#print axioms tailCall_witness_root_caller_referent_simulation
+#print axioms tailCall_root_unwind_ceiling
+#print axioms rootUnwindCeiling_initial
+#print axioms root_unwindResume_guarded
+#print axioms TailCallCallerReferentWitnesses.tailCall_root_nounwind_callee_unwind_ub
+#print axioms canary_bug2_nested_and_root_tailcall_nounwind_faults_ub
+#print axioms isRootCallerReferentBorrow_shift
+#print axioms relocateRootCallerReferents_readFrameLocalSlot
+#print axioms relocateRootCallerReferents_readFrameLocalSlot_suspended
 #print axioms TailCallCallerReferentWitnesses.tailCall_repaired_root_caller_referent_returns_42
+#print axioms TailCallCallerReferentWitnesses.tailCall_repaired_root_caller_referent_binop
+#print axioms TailCallCallerReferentWitnesses.tailCall_repaired_caller_referent_inline_calls
+#print axioms TailCallCallerReferentWitnesses.tailCall_repaired_caller_referent_write_and_reborrow
+#print axioms TailCallCallerReferentWitnesses.tailCall_repaired_caller_referent_multihop
 #print axioms TailCallCallerReferentWitnesses.tailCall_repaired_dangling_frame_local_faults_ub
 #print axioms opaqueCast_trusted_root_dispatch_simulation
+#print axioms opaqueCast_typed_root_write_validates_cast_type
+#print axioms opaqueCast_uninit_field_shell_is_cast_type_shell
 #print axioms opaqueCast_before_deref_stays_unsupported
+#print axioms canary_bug4_opaque_alias_field_shell_uses_cast_type
+#print axioms canary_conservativity_use_keeps_tree_borrows_read
 
 end Anneal.TcbCopySubplaceAndTailCallProtoTests
