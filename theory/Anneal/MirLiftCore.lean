@@ -21831,6 +21831,50 @@ theorem mirStep_call_alignOfVal_unsized_scalarAddr_ub {body cur : CapturedMir} {
   exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
     rfl rfl rfl hFail
 
+/-! ### 6. `CastKind.ptrToPtr` on Wide Pointers (`ptr.cast()`, rustc's `to_raw_parts` Lowering) -/
+
+/-- **`evalRvalue_cast_ptrToPtr_wide_to_thin`** (`p.cast::<U>()`, the data half of
+`<*const [T]>::to_raw_parts` as rustc lowers it: `(p as *const (), PtrMetadata(p))`): a
+`CastKind.ptrToPtr` from a wide `[T]` / `str` pointer `.aggregate 0 [.ptr q ptrBytes,
+.scalar ⟨len, ptrBytes⟩]` to a thin raw pointer type returns the bare data pointer
+`.ptr q ptrBytes` with `mem` unchanged when the data pointer carries no live borrow
+(`lookupBorrow mem.borrows q.tag = none`, e.g. a pointer into a captured global); borrow-backed
+pointers instead derive a child element pointer (`deriveStackElemThinPtr`). -/
+theorem evalRvalue_cast_ptrToPtr_wide_to_thin (locals locals' : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (q : ProvenancePtr) (len : Nat)
+    (hThin : isThinRawPtrTy targetTy = true)
+    (hNoBorrow : lookupBorrow mem.borrows q.tag = none)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (.aggregate 0 [.ptr q (layoutPointerBytes layouts),
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals') :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      .ok (.ptr q (layoutPointerBytes layouts)) locals' mem := by
+  show evalCastPtrToPtr locals op targetTy mem localDecls layouts = _
+  unfold evalCastPtrToPtr
+  simp only [hOp, Nat.beq_refl, Bool.and_self, hThin, hNoBorrow]
+
+/-- **`evalRvalue_cast_ptrToPtr_wide_to_wide`**: a `CastKind.ptrToPtr` between non-`dyn` wide raw
+pointer types (`*const [T] as *mut [T]`, `*const [u8] as *const [U]`, `*const str as
+*const [u8]`) keeps both the data pointer and the element-count metadata unchanged (the byte
+extent changes with the element type, the length does not). -/
+theorem evalRvalue_cast_ptrToPtr_wide_to_wide (locals locals' : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (q : ProvenancePtr) (len : Nat)
+    (hNotThin : isThinRawPtrTy targetTy = false)
+    (hWide : wideRawPtrIsDyn? targetTy = some false)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (.aggregate 0 [.ptr q (layoutPointerBytes layouts),
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals') :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      .ok (.aggregate 0 [.ptr q (layoutPointerBytes layouts),
+        .scalar ⟨len, layoutPointerBytes layouts⟩]) locals' mem := by
+  show evalCastPtrToPtr locals op targetTy mem localDecls layouts = _
+  unfold evalCastPtrToPtr
+  simp only [hOp, Nat.beq_refl, Bool.and_self, hNotThin, hWide]
+
 end UnsizedDstMetadataLifters
 
 end Anneal.MirLiftCore

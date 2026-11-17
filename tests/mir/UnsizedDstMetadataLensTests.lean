@@ -698,6 +698,101 @@ theorem size_and_align_positive_witnesses :
       sStr_0.frame.locals { local_ := 3, projection := [] } 1 (.uint .u32) 4 p9
       rfl rfl rfl rfl⟩
 
+/-- `let (data, len) = (p.cast::<()>(), ptr::metadata(p)); let q = ptr::from_raw_parts(data, len)`
+exactly as rustc lowers `to_raw_parts` / `from_raw_parts` (`PtrToPtr` cast, `PtrMetadata`,
+`AggregateKind.rawPtr`), not via field projections. -/
+def rawPartsBody : CapturedMir :=
+  { (Anneal.MirLoops.mkMirBody "test::to_raw_parts_from_raw_parts" 1
+      [{ mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 }, debugName := some "_0" },
+       { mutability := .not, ty := { kind := .rawPtr .not (.slice (.uint .u32)), layoutIdx := 1 },
+         debugName := some "p" },
+       { mutability := .mut, ty := { kind := .rawPtr .not (.tuple []), layoutIdx := 0 },
+         debugName := some "data" },
+       { mutability := .mut, ty := usizeTy, debugName := some "len" },
+       { mutability := .mut, ty := { kind := .rawPtr .not (.slice (.uint .u32)), layoutIdx := 1 },
+         debugName := some "q" }]
+      [retBlock
+        [{ kind := .assign { local_ := 2, projection := [] }
+             (.cast .ptrToPtr (.copy { local_ := 1, projection := [] })
+               { kind := .rawPtr .not (.tuple []), layoutIdx := 0 })
+           span := "p_cast_unit" },
+         { kind := .assign { local_ := 3, projection := [] }
+             (.unaryOp .ptrMetadata (.copy { local_ := 1, projection := [] }))
+           span := "ptr_metadata" },
+         { kind := .assign { local_ := 4, projection := [] }
+             (.aggregate (.rawPtr sliceU32Ty .not)
+               [.copy { local_ := 2, projection := [] }, .copy { local_ := 3, projection := [] }])
+           span := "from_raw_parts" }]]) with
+    layouts := layouts64 }
+
+def rawPartsLocals0 : List LocalSlot :=
+  [.init .unit, .init (WidePtrVal.toValue 8 wide4), .uninit, .uninit, .uninit]
+
+def rawPartsLocals1 : List LocalSlot :=
+  [.init .unit, .init (WidePtrVal.toValue 8 wide4), .init (.ptr p9 8), .uninit, .uninit]
+
+def rawPartsLocals2 : List LocalSlot :=
+  [.init .unit, .init (WidePtrVal.toValue 8 wide4), .init (.ptr p9 8), .init (.scalar ⟨4, 8⟩),
+   .uninit]
+
+def rawPartsLocals3 : List LocalSlot :=
+  [.init .unit, .init (WidePtrVal.toValue 8 wide4), .init (.ptr p9 8), .init (.scalar ⟨4, 8⟩),
+   .init (WidePtrVal.toValue 8 wide4)]
+
+/-- **Realistic `to_raw_parts` / `from_raw_parts` round trip (rustc lowering)** on the
+global-backed `*const [u32]` `_1` (no borrow at `p9`'s tag): `_2 = copy _1 as *const ()`
+(`PtrToPtr`, the data half), `_3 = PtrMetadata(copy _1)`, and
+`_4 = *const [u32] from (copy _2, copy _3)` step through the lifters and rebuild `_1`'s wide pointer
+exactly, the global-backed `UnsizedSliceDstAt` lens still holds in the final memory, and a
+`*const [u32] as *mut [u32]` cast keeps the wide pointer unchanged. -/
+theorem realistic_to_raw_parts_from_raw_parts_roundtrip :
+    let s0 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := rawPartsLocals0 }, memory := mem0 }
+    ∃ s1 s2 s3,
+      PureMirExec.mirStep rawPartsBody s0 = .cont s1 ∧
+      PureMirExec.mirStep rawPartsBody s1 = .cont s2 ∧
+      PureMirExec.mirStep rawPartsBody s2 = .cont s3 ∧
+      s3.frame.locals = rawPartsLocals3 ∧
+      get? s3.frame.locals 4 = get? s0.frame.locals 1 ∧
+      UnsizedSliceDstAt ByteLensCodec.u32LE 8 (.slice (.uint .u32)) s3.memory wide4
+        (WidePtrVal.toValue 8 wide4) xs4 bytes16 ∧
+      evalRvalue rawPartsLocals0
+          (.cast .ptrToPtr (.copy { local_ := 1, projection := [] })
+            { kind := .rawPtr .mut (.slice (.uint .u32)), layoutIdx := 1 })
+          mem0 rawPartsBody.localDecls layouts64 =
+        .ok (WidePtrVal.toValue 8 wide4) rawPartsLocals0 mem0 := by
+  intro s0
+  let s1 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1, locals := rawPartsLocals1 }, memory := mem0 }
+  let s2 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 2, locals := rawPartsLocals2 }, memory := mem0 }
+  let s3 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 3, locals := rawPartsLocals3 }, memory := mem0 }
+  obtain ⟨_, h1, _, _⟩ := mirStep_assign_local (body := rawPartsBody) (cur := rawPartsBody)
+    (s := s0) (dstLoc := 2) (val := .ptr p9 8) (locals₁ := rawPartsLocals0) (mem₁ := mem0)
+    (locals₂ := rawPartsLocals1) rfl (Or.inl rfl) rfl rfl
+    (evalRvalue_cast_ptrToPtr_wide_to_thin rawPartsLocals0 rawPartsLocals0
+      (.copy { local_ := 1, projection := [] }) _ mem0 rawPartsBody.localDecls layouts64 p9 4
+      rfl rfl rfl)
+    rfl rfl rfl rfl
+  obtain ⟨_, h2, _, _⟩ := mirStep_assign_local (body := rawPartsBody) (cur := rawPartsBody)
+    (s := s1) (dstLoc := 3) (val := .scalar ⟨4, 8⟩) (locals₁ := rawPartsLocals1) (mem₁ := mem0)
+    (locals₂ := rawPartsLocals2) rfl (Or.inl rfl) rfl rfl
+    (evalRvalue_unaryOp_ptrMetadata_slice rawPartsLocals1 rawPartsLocals1
+      (.copy { local_ := 1, projection := [] }) mem0 rawPartsBody.localDecls layouts64 wide4 rfl)
+    rfl rfl rfl rfl
+  obtain ⟨_, h3, _, _⟩ := mirStep_assign_local (body := rawPartsBody) (cur := rawPartsBody)
+    (s := s2) (dstLoc := 4) (val := WidePtrVal.toValue 8 wide4) (locals₁ := rawPartsLocals2)
+    (mem₁ := mem0) (locals₂ := rawPartsLocals3) rfl (Or.inl rfl) rfl rfl
+    (evalRvalue_aggregate_rawPtr_slice rawPartsLocals2 rawPartsLocals2 rawPartsLocals2 (.uint .u32)
+      0 .not (.copy { local_ := 2, projection := [] }) (.copy { local_ := 3, projection := [] })
+      mem0 rawPartsBody.localDecls layouts64 p9 4 rfl rfl)
+    rfl rfl rfl rfl
+  exact ⟨s1, s2, s3, h1, h2, h3, rfl, rfl, arr_unsizedDst64,
+    evalRvalue_cast_ptrToPtr_wide_to_wide rawPartsLocals0 rawPartsLocals0
+      (.copy { local_ := 1, projection := [] }) _ mem0 rawPartsBody.localDecls layouts64 p9 4
+      rfl rfl rfl⟩
+
 /-! ## 5. End-to-End `MirWpConverges` & `PureLift.V2026_06_01Bridge` Spatial-Pin Preservation -/
 
 def tagOfLoan (lid : LoanId) : Nat := lid + 77
