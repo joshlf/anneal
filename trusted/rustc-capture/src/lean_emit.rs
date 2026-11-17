@@ -2786,6 +2786,78 @@ fn lean_ident_heads(lean_ty: &str) -> impl Iterator<Item = &str> {
         .filter(|head| head.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
 }
 
+/// True when all parentheses, brackets, braces, and string/character literals in `text` are
+/// balanced and closed, so wrapping `text` in `(...)` or `: <text> :=` cannot be broken out of.
+fn has_balanced_lean_delimiters(text: &str) -> bool {
+    let mut stack: Vec<char> = Vec::new();
+    let mut chars = text.chars();
+    let mut prev_ident = false;
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            let mut closed = false;
+            while let Some(sc) = chars.next() {
+                if sc == '\\' {
+                    if chars.next().is_none() {
+                        return false;
+                    }
+                } else if sc == '"' {
+                    closed = true;
+                    break;
+                }
+            }
+            if !closed {
+                return false;
+            }
+            prev_ident = false;
+            continue;
+        }
+        if c == '\'' && !prev_ident {
+            let Some(first) = chars.next() else {
+                return false;
+            };
+            if first == '\'' {
+                return false;
+            }
+            if first == '\\' {
+                let mut closed = false;
+                let mut escaped_len = 0usize;
+                for esc in chars.by_ref() {
+                    if esc == '\'' && escaped_len > 0 {
+                        closed = true;
+                        break;
+                    }
+                    escaped_len += 1;
+                    if escaped_len > 6 {
+                        return false;
+                    }
+                }
+                if !closed {
+                    return false;
+                }
+            } else if chars.next() != Some('\'') {
+                return false;
+            }
+            prev_ident = false;
+            continue;
+        }
+        prev_ident = c.is_ascii_alphanumeric() || c == '_' || c == '\'';
+        match c {
+            '(' => stack.push(')'),
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            '\u{27e8}' => stack.push('\u{27e9}'),
+            '\u{2983}' => stack.push('\u{2984}'),
+            ')' | ']' | '}' | '\u{27e9}' | '\u{2984}' => {
+                if stack.pop() != Some(c) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    stack.is_empty()
+}
+
 fn check_lean_ty(field: &str, lean_ty: &str) -> Result<(), LcnfLayoutError> {
     let ty = lean_ty.trim();
     if ty.is_empty()
@@ -2793,6 +2865,7 @@ fn check_lean_ty(field: &str, lean_ty: &str) -> Result<(), LcnfLayoutError> {
         || ty.contains("--")
         || ty.contains("/-")
         || ty.contains(":=")
+        || !has_balanced_lean_delimiters(ty)
     {
         return Err(LcnfLayoutError::InvalidLeanType {
             field: field.to_owned(),
@@ -2926,11 +2999,11 @@ fn check_lcnf_emission(
 /// `abbrev <struct_name>.<field> (self : <struct_name>) : <type> := self.<path>` accessor per
 /// original field, so `s.<field>` keeps working and reads exactly the original field.
 ///
-/// When the structure has a relevant field, a part whose fields are all
-/// [`LcnfFieldKind::Irrelevant`] is declared `structure <struct_name>.Part<j> : Type _ where`.
-/// Lean would otherwise infer `Prop` for a part of proofs, erase it in its wrapper (possibly
-/// unboxing the wrapper, see [`CtorReprKind::Erased`]), and fail to derive `Repr`, `BEq`, or
-/// `Ord` for it, none of which happens to the flat structure, which is a `Type`.
+/// Every split part whose fields are all [`LcnfFieldKind::Irrelevant`] is declared
+/// `structure <struct_name>.Part<j> : Type _ where`. Lean would otherwise infer `Prop` for a
+/// part of proofs, erase it in its wrapper (violating [`CtorReprKind::Erased`] -> `ObjectRef`
+/// and possibly unboxing the wrapper), and fail to derive `Repr`, `BEq`, `Hashable`, or `Ord`
+/// for it.
 pub fn render_lcnf_guarded_structure(
     struct_name: &str,
     plan: &LcnfCtorLayoutPlan,
@@ -2942,17 +3015,14 @@ pub fn render_lcnf_guarded_structure(
     } else {
         format!("  deriving {}\n", derives.join(", "))
     };
-    let has_relevant_field = plan.fields.iter().any(|field| field.kind.is_relevant());
     let mut out = String::new();
     for (level, ctors) in plan.levels.iter().enumerate() {
         for (index, ctor) in ctors.iter().enumerate() {
             if !out.is_empty() {
                 out.push('\n');
             }
-            let irrelevant_part = level == 0
-                && !plan.is_flat()
-                && has_relevant_field
-                && ctor.repr == CtorReprKind::Erased;
+            let irrelevant_part =
+                level == 0 && !plan.is_flat() && ctor.repr == CtorReprKind::Erased;
             out.push_str(&format!(
                 "structure {}{} where\n",
                 plan.ctor_lean_name(struct_name, level, index),
@@ -3083,6 +3153,7 @@ pub fn render_lcnf_guarded_ctor_expr(
             || expr.chars().any(char::is_control)
             || trimmed.contains("--")
             || trimmed.contains("/-")
+            || !has_balanced_lean_delimiters(trimmed)
         {
             return Err(LcnfLayoutError::InvalidFieldExpr {
                 field: name.to_owned(),
@@ -3852,11 +3923,14 @@ mod lcnf_tests {
             assert_eq!(out.contains(&format!("structure Mixed.{part}\n")), declared, "{part}");
         }
 
-        // Without a relevant field, the flat structure is a proposition when its fields are
-        // proofs, and so are the parts: nothing is declared `: Type _`.
+        // Even when no field is relevant (`300 x True`), split parts are declared `: Type _` so
+        // `CtorReprKind::Erased -> ObjectRef` holds and `Repr`/`BEq`/`Hashable` can be derived.
         let proofs = uniform(300, "h", "True", Irrelevant);
         let out = emit_lcnf_guarded_structure("Proofs", &proofs, &[]).unwrap();
-        assert!(out.contains("structure Proofs.Part1 where\n") && !out.contains("Type _"));
+        assert!(
+            out.contains("structure Proofs.Part1 : Type _ where\n")
+                && out.contains("structure Proofs.Part2 : Type _ where\n")
+        );
         // Flat structures are never annotated.
         let flat = [
             LcnfFieldSpec::new("h", "True", Irrelevant),
@@ -4243,6 +4317,11 @@ mod lcnf_tests {
             "Nat /- c -/",
             "Nat\nNat",
             "Nat := 0",
+            "(Nat",
+            "Nat)",
+            "Array [Nat)",
+            "\"unclosed",
+            "'ab'",
         ] {
             let fields = [LcnfFieldSpec::new("x", lean_ty, ObjectRef)];
             assert!(
@@ -4580,7 +4659,18 @@ mod lcnf_tests {
                 field: String::from("f3")
             })
         );
-        for bad in ["", "  ", "1\n", "1 -- comment", "1 /- comment -/"] {
+        for bad in [
+            "",
+            "  ",
+            "1\n",
+            "1 -- comment",
+            "1 /- comment -/",
+            "0), f1 := (1",
+            "(1",
+            "1)",
+            "\"unclosed",
+            "'\\'",
+        ] {
             let mut invalid = refs.clone();
             invalid[0] = ("f0", bad);
             assert_eq!(
@@ -4590,6 +4680,10 @@ mod lcnf_tests {
                 })
             );
         }
+        // Balanced delimiters, identifier primes, and quoted parens are accepted.
+        let mut valid_delims = refs.clone();
+        valid_delims[0] = ("f0", "(x' + (if ')' == '(' then 0 else 1))");
+        assert!(render_lcnf_guarded_ctor_expr("T", &valid_delims, &plan).is_ok());
         assert!(matches!(
             render_lcnf_guarded_ctor_expr("T.", &refs, &plan),
             Err(LcnfLayoutError::InvalidLeanName { .. })
@@ -5550,6 +5644,11 @@ mod lcnf_tests {
             guarded_case(
                 "guarded_proof_parts_derive",
                 &default_plan(&fields),
+                &["Inhabited", "Repr", "BEq", "Hashable"],
+            ),
+            guarded_case(
+                "guarded_all_proof_fields_derive",
+                &default_plan(&uniform(300, "h", "True", Irrelevant)),
                 &["Inhabited", "Repr", "BEq", "Hashable"],
             ),
         ];
