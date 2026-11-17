@@ -8350,19 +8350,23 @@ def tyIsUninhabited (layouts : LayoutTable) (ty : Ty) : Bool :=
 `true` when walking the deref-free sub-projection chain `proj` from `curTy`
 reaches an uninhabited type (`tyIsUninhabited`) after some projection step,
 i.e. when the projected place is, or lies inside, a place of uninhabited type.
-Each step resolves the next type exactly like `checkStaticSubProjBounds`:
-`.field` through the resolved current type's `fieldLayouts`, `.constantIndex`
-through the array's element layout, `.subslice` as the sub-array type, and
-`.opaqueCast` / `.unwrapUnsafeBinder` as their target type. The walk stops with
-`false` at `.index`, `.downcast`, and `.deref` (and at array projections on a
-non-array type), which `readProjectedValueUnionAware` resolves or rejects
-before consulting this check.
+Each step resolves the next type from the resolved current type: `.field`
+through its `fieldLayouts` (as `checkStaticSubProjBounds` does), `.constantIndex`
+through the array's element layout, `.subslice` as the sub-array type resolved
+through `localDecls` (as `resolveProjectedTyResolved` does, continuing at the
+enclosing array type when the window spans the whole array or is followed by a
+`.constantIndex`, so the element layout is never lost), and `.opaqueCast` /
+`.unwrapUnsafeBinder` as their target type. The walk stops with `false` at
+`.index`, `.downcast`, and `.deref` (and at array projections on a non-array
+type), which `readProjectedValueUnionAware` resolves or rejects before
+consulting this check.
 
-`readProjectedValueUnionAware` uses it to fault on a 0-byte read through an
-inactive union field that passes through an uninhabited 0-byte container, such
-as `_u.pair.1` with `pair : (Infallible, ())` (the union's storage holds no
-value of the container's type, exactly as the whole-field decode of a
-positive-sized container fails).
+`readProjectedValueUnionAware` uses it to fault on a statically bounded read
+through an inactive union field that passes through an uninhabited container,
+whether 0-byte (`_u.pair.1` with `pair : (Infallible, ())`) or positive-sized
+(`_u.pair.1` with `pair : (Infallible, u32)`): the union's storage holds no
+value of the container's type, exactly as the whole-field decode of such a
+container fails.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.never>

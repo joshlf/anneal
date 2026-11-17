@@ -3053,3 +3053,94 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
         assert_eq!(state.get_init(Local(0)), Some(&init));
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Adversarial round ep1-A3 regression tests
+// ---------------------------------------------------------------------------------------------
+
+/// `kani#5159` through `copy` / `move` operands, mirroring `AdtAndControl.lean`'s
+/// `kani5159_witness_evalPlaceRead` (`Trusted.MirSemantics`' `evalPlaceRead`, the read behind
+/// both operands): assigning from an uninhabited zero-sized union field, or from a place through
+/// an uninhabited container, fails and leaves the destination and the union untouched, while
+/// inhabited zero-sized fields and sub-places assign their unique value.
+#[test]
+fn a3_kani_5159_operand_reads_of_uninhabited_zero_sized_union_fields_fail() {
+    let inf = infallible();
+    let pair = Ty::Tuple(vec![inf.clone(), unit()]);
+    let (phantom_def, phantom_ty) = adt(AdtDef::new_struct("core::marker::PhantomData", vec![]));
+    // `union K { val: u32, inf: Infallible, pair: (Infallible, ()), phantom:
+    // PhantomData<Infallible>, zarr: [(); 3] }`.
+    let fields = vec![
+        u32_ty(),
+        inf.clone(),
+        pair.clone(),
+        phantom_ty.clone(),
+        arr(unit(), 3),
+    ];
+    let (u_def, u_ty) = adt(AdtDef::new_union("K", fields.clone()));
+    let f = |idx: usize| field(idx, fields[idx].clone());
+    for pw in PWS {
+        let decls = vec![
+            u_ty.clone(),
+            inf.clone(),
+            unit(),
+            phantom_ty.clone(),
+            arr(unit(), 3),
+        ];
+        let mut state = StatementEvalState::from_local_decls(decls, pw);
+        let init = MirValue::union_value(&u_def, 0, MirValue::unsigned(42, UintTy::U32, pw));
+        state.slots[0] = LocalSlotState::Init(init.clone());
+        let inactive = |requested_field: usize| {
+            Err(RvalueEvalError::InactiveUnionField {
+                active_field: 0,
+                requested_field,
+            })
+        };
+        let before = |state: &StatementEvalState, l: usize| state.get_local(Local(l)).cloned();
+        let (dst1, dst2) = (before(&state, 1), before(&state, 2));
+        // `_1 = copy _0.inf`, `_2 = copy _0.pair.1`, and `_2 = move _0.pair.1` are undefined
+        // behavior: `Infallible` has no value, and `()` is read through `(Infallible, ())`.
+        assert_eq!(
+            run(assign(local(1), copy_of(proj(0, vec![f(1)]))), &mut state),
+            inactive(1),
+            "{pw:?}"
+        );
+        assert_eq!(
+            run(
+                assign(local(2), copy_of(proj(0, vec![f(2), field(1, unit())]))),
+                &mut state
+            ),
+            inactive(2),
+            "{pw:?}"
+        );
+        assert_eq!(
+            run(
+                assign(
+                    local(2),
+                    Rvalue::Use(Operand::Move(proj(0, vec![f(2), field(1, unit())])))
+                ),
+                &mut state
+            ),
+            inactive(2),
+            "{pw:?}"
+        );
+        assert_eq!(before(&state, 1), dst1, "{pw:?}");
+        assert_eq!(before(&state, 2), dst2, "{pw:?}");
+        // `_3 = copy _0.phantom`, `_4 = copy _0.zarr`, and `_2 = copy _0.zarr[2]` assign the
+        // unique values of the inhabited zero-sized field and sub-place.
+        run(assign(local(3), copy_of(proj(0, vec![f(3)]))), &mut state).unwrap();
+        assert_eq!(
+            state.get_init(Local(3)),
+            Some(&MirValue::adt(&phantom_def, 0, vec![]))
+        );
+        run(assign(local(4), copy_of(proj(0, vec![f(4)]))), &mut state).unwrap();
+        assert_eq!(state.get_init(Local(4)), Some(&units(3)));
+        run(
+            assign(local(2), copy_of(proj(0, vec![f(4), cidx(2, 3)]))),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.get_init(Local(2)), Some(&MirValue::Unit));
+        assert_eq!(state.get_init(Local(0)), Some(&init));
+    }
+}
