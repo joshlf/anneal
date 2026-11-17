@@ -16713,29 +16713,40 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_spaced_of_inFra
 
 /-! ## `Type.Union` (`MaybeUninit<T>`, `ManuallyDrop<T>`, and Padded `[(); N]` ZST-Arm Unions)
 
-MiniRust's `Type.Union fields chunks size align` (`MiniRustSpec.Interp`)
-represents unions at the byte level via `Value.Union chunkData`:
-* `Type.decode (.Union fields [(⟨0⟩, size)] size align) bytes` extracts the
-  union's `size.bytes`-byte slice as `Value.Union [bytes]` without rejecting
-  `AbstractByte.Uninit` padding or uninitialized bytes;
-* `checkValue (.Union [bytes]) (.Union fields [(⟨0⟩, size)] size align)` checks
-  only `bytes.length == size.bytes`;
-* `Type.encode (.Union fields [(⟨0⟩, size)] size align) (.Union [bytes])`
-  writes `bytes` back into `[0, size.bytes)`, preserving every `.Init` and
-  `.Uninit` byte across whole-union loads, stores, copies, and moves;
-* Projecting `PlaceExpr.Field (.Local u) j` resolves field `j` at offset `0`
-  (`fieldPlace`) with type `fieldTy_j`:
-  - Loading an inhabited 0-byte ZST arm (`mrUnitTy` for `()` in `MaybeUninit<T>`
-    or `mrZstArrayTy N` for `[(); N]` in `kani#5176`) loads `0` bytes via
-    `BasicMemory.check_ptr` (`len.bytes = 0 => pure none`), succeeding even when
-    the union allocation is all-`.Uninit` or partially initialized;
-  - Loading a scalar arm `.Int it` (`it.size.bytes > 0`) when any byte in
-    `[0, it.size.bytes)` is `.Uninit` fails `Type.decodeInt` (`none`) and raises
-    `Stop.ub "load at type but the data in memory violates the language invariant"`,
-    matching Anneal's `.ub`;
-  - Loading an uninhabited 0-byte arm (`mrUninhabitedZstTy = .Enum ⟨[]⟩ ⟨0⟩ .Invalid ⟨0⟩ ⟨1⟩`)
-    fails `decodeDiscriminant` (`.Invalid => none`) and raises `Stop.ub`,
-    matching Anneal's `kani#5159` uninhabited-ZST check. -/
+MiniRust represents a union value as the bytes of its chunks
+(`Value.Union chunkData`). This section covers single-chunk unions
+(`mrUnionTy fields S al`, one chunk `[(0, S)]`):
+
+* `Type_decode_mrUnionTy`, `checkValue_mrUnionTy`, and `Type_encode_mrUnionTy`:
+  a whole-union load accepts any `S` bytes, `.Uninit` ones included, and a
+  whole-union store writes them back unchanged, so whole-union copies and
+  moves preserve uninitialized padding bytes.
+* `evalPlace_field_mrUnionTy`: projecting a field at offset `0` is an address
+  computation that reads no byte of the union.
+* `placeLoad_mrUnitTy` and `placeLoad_mrZstArrayTy`: a load at `()` or
+  `[(); N]` reads no allocation, so reading an inhabited 0-byte arm succeeds
+  however many of the union's bytes are uninitialized (`kani#5176`).
+* `placeLoad_mrUninhabitedZstTy`: a load at an uninhabited 0-byte type
+  (`mrUninhabitedZstTy`) is UB, whatever the union's bytes are (`kani#5159`).
+* `Type_decode_int_of_uninit`: a load at an integer type is UB when one of the
+  bytes it reads is `.Uninit`.
+
+Two modeling choices are not `minimize`'s:
+
+* `minimize`'s union chunks come from `calc_chunks`
+  (`tooling/minimize/src/chunks.rs`), which marks only the data bytes of the
+  fields, not their padding. They form the single chunk `[(0, S)]` exactly when
+  the fields' data bytes together cover `[0, S)`, as the `u32` field alone does
+  in `MaybeUninit<u32>` and in the witnesses' `PU`. If no field covers some
+  byte, that byte lies outside every chunk, and MiniRust's whole-union copy
+  resets it to `.Uninit`.
+* `minimize` lowers a union aggregate `_u = U { f: op }` to
+  `ValueExpr::Union { field, expr, union_ty }` (`tooling/minimize/src/rvalue.rs`),
+  which `Interp.evalValue` does not implement. Its value is `S` uninitialized
+  bytes with `op`'s encoding written at field `f`'s offset
+  (`spec/lang/step/expressions.md`), so storing it has the effect of
+  `Deinit(_u)` followed by the field assignment `_u.f = op`; the witnesses in
+  `Witness.lean` lower union aggregates that way. -/
 
 /-- MiniRust `()` type (`0` bytes, alignment `1`). -/
 def mrUnitTy : Gen.«Type» := .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none
@@ -16753,9 +16764,10 @@ def mrManuallyDropTy (innerTy : Gen.«Type») (sizeBytes alignBytes : Nat) : Gen
   .Tuple [(⟨0⟩, innerTy)] ⟨⟨sizeBytes⟩, ⟨alignBytes⟩, none⟩ none
 
 /-- Single-chunk MiniRust `Type.Union` of size `sizeBytes` and alignment
-`alignBytes`, with chunk `[(⟨0⟩, ⟨sizeBytes⟩)]` covering `[0, sizeBytes)` so
+`alignBytes`, with chunk `[(⟨0⟩, ⟨sizeBytes⟩)]` covering `[0, sizeBytes)`, so
 whole-union `Type.decode` and `Type.encode` preserve all `.Init` and `.Uninit`
-bytes (including uninitialized trailing padding). -/
+bytes. `minimize` gives a union this chunk list only when its fields' data
+bytes together cover `[0, sizeBytes)` (see the section comment). -/
 def mrUnionTy (fields : List (Gen.Offset × Gen.«Type»)) (sizeBytes alignBytes : Nat) : Gen.«Type» :=
   .Union fields [(⟨0⟩, ⟨sizeBytes⟩)] ⟨sizeBytes⟩ ⟨alignBytes⟩
 
@@ -16889,14 +16901,173 @@ theorem transmute_mrUnionTy_to_int_spec
     simp [Interp.transmute, Type_layout_mrUnionTy, hlay, LayoutStrategy.expect_size,
       henc, hdec, ub, pure, Except.pure, bind, Except.bind]
 
+/-! ### Union field projections and loads at the union's field types -/
+
+theorem mapM_const_ok {α β : Type} (b : β) :
+    ∀ l : List α, List.mapM (fun _ => (Except.ok b : Interp β)) l = .ok (List.replicate l.length b)
+  | [] => rfl
+  | _ :: l => by
+    simp [List.mapM_cons, mapM_const_ok b l, List.replicate_succ, bind, Except.bind, pure, Except.pure]
+
+theorem tryMapM_replicate_ok {α β : Type} (f : α → Interp (Option β)) (a : α) (b : β)
+    (hf : f a = .ok (some b)) :
+    ∀ n, tryMapM f (List.replicate n a) = .ok (some (List.replicate n b))
+  | 0 => rfl
+  | n + 1 => by
+    simp [tryMapM, List.replicate_succ, hf, tryMapM_replicate_ok f a b hf n, bind, Except.bind,
+      pure, Except.pure]
+
+theorem forM_replicate_ok {α : Type} (f : α → Interp Unit) (a : α) (hf : f a = .ok ()) :
+    ∀ n, forM (List.replicate n a) f = .ok ()
+  | 0 => rfl
+  | n + 1 => by
+    rw [List.replicate_succ, List.forM_cons, hf]
+    exact forM_replicate_ok f a hf n
+
+/-- `[(); N]` decodes from zero bytes to `N` unit values. -/
+theorem Type_decode_mrZstArrayTy (N : Nat) :
+    Interp.Type.decode (mrZstArrayTy N) [] = .ok (some (.Tuple (List.replicate N (.Tuple [])))) := by
+  have h0 : subsliceWithLength ([] : List Byte) 0 0 = .ok [] := rfl
+  have ht := tryMapM_replicate_ok (Interp.Type.decode mrUnitTy) [] (.Tuple []) Type_decode_mrUnitTy N
+  simp only [mrZstArrayTy, Interp.Type.decode, Type_layout_mrUnitTy]
+  simp [LayoutStrategy.expect_size, Size.mulInt, Size.from_bytes, h0, mapM_const_ok, bind,
+    Except.bind, pure, Except.pure]
+  rw [ht]
+  rfl
+
+theorem checkValue_mrZstArrayTy (N : Nat) (m : Option Mach := none) :
+    Interp.checkValue (.Tuple (List.replicate N (.Tuple []))) (mrZstArrayTy N) m = .ok () := by
+  have hf := forM_replicate_ok (fun val => Interp.checkValue val mrUnitTy m) (Gen.Value.Tuple [])
+    (checkValue_mrUnitTy m) N
+  simp [mrZstArrayTy, Interp.checkValue, ensureElseUb, hf, bind, Except.bind, pure, Except.pure]
+
+/-- A load at `()` from any aligned place reads no allocation: it succeeds
+with `()` and only appends the zero-length access to the access log, whatever
+the bytes behind the place are. -/
+theorem placeLoad_mrUnitTy (m : Mach) (place : Gen.Place BM) (haligned : place.aligned = true) :
+    placeLoad m place mrUnitTy =
+      .ok (.Tuple [], { m with mem := { m.mem with accesses :=
+        m.mem.accesses ++ [⟨.Load, .None, place.ptr.thin_pointer.addr, ⟨0⟩⟩] } }) := by
+  simp [placeLoad, haligned, typedLoad, Type_layout_mrUnitTy, LayoutStrategy.expect_size, CM.load,
+    BM.load, Align.is_aligned, BM.check_ptr, Type_decode_mrUnitTy,
+    checkValue_mrUnitTy, bind, Except.bind, pure, Except.pure]
+
+/-- A load at `[(); N]` from any aligned place reads no allocation
+(`kani#5176`): it succeeds with `N` unit values whatever the bytes behind the
+place are, all-`.Uninit` union storage included. -/
+theorem placeLoad_mrZstArrayTy (N : Nat) (m : Mach) (place : Gen.Place BM)
+    (haligned : place.aligned = true) :
+    placeLoad m place (mrZstArrayTy N) =
+      .ok (.Tuple (List.replicate N (.Tuple [])), { m with mem := { m.mem with accesses :=
+        m.mem.accesses ++ [⟨.Load, .None, place.ptr.thin_pointer.addr, ⟨0⟩⟩] } }) := by
+  simp [placeLoad, haligned, typedLoad, Type_layout_mrZstArrayTy, LayoutStrategy.expect_size, CM.load,
+    BM.load, Align.is_aligned, BM.check_ptr, Type_decode_mrZstArrayTy,
+    checkValue_mrZstArrayTy, bind, Except.bind, pure, Except.pure]
+
+/-- A load at an uninhabited 0-byte type from any aligned place is UB
+(`kani#5159`), whatever the bytes behind the place are: zero bytes never decode
+at an enum without variants. -/
+theorem placeLoad_mrUninhabitedZstTy (m : Mach) (place : Gen.Place BM)
+    (haligned : place.aligned = true) :
+    placeLoad m place mrUninhabitedZstTy =
+      .error (.ub "load at type but the data in memory violates the language invariant") := by
+  simp [placeLoad, haligned, typedLoad, mrUninhabitedZstTy, Interp.Type.layout,
+    LayoutStrategy.expect_size, CM.load, BM.load, Align.is_aligned, BM.check_ptr, bind,
+    Except.bind, pure, Except.pure, ub]
+  rfl
+
+theorem mapM_data_none_of_uninit {bytes : List Byte} (hu : Gen.AbstractByte.Uninit ∈ bytes) :
+    bytes.mapM AbstractByte.data = none := by
+  induction bytes with
+  | nil => simp at hu
+  | cons b bs ih =>
+    rcases List.mem_cons.mp hu with h | h
+    · subst h; simp [List.mapM_cons, AbstractByte.data]
+    · cases hb : AbstractByte.data b <;> simp [List.mapM_cons, hb, ih h]
+
+/-- Bytes containing an `.Uninit` byte do not decode at an integer type, so a
+load of an integer union field that covers an uninitialized byte is UB
+(`typedLoad`'s `none` arm). -/
+theorem Type_decode_int_of_uninit (it : Gen.IntType) {bytes : List Byte}
+    (hlen : bytes.length = it.size.bytes) (hu : Gen.AbstractByte.Uninit ∈ bytes) :
+    Interp.Type.decode (.Int it) bytes = .ok none := by
+  obtain ⟨signed, size⟩ := it
+  simp [Interp.Type.decode, Type.decodeInt, hlen, mapM_data_none_of_uninit hu, pure, Except.pure]
+
+/-- Projecting field `j` of a single-chunk union whose field `j` sits at offset
+`0` keeps the union's thin pointer and alignment flag, and reads no byte of the
+union: MiniRust's `eval_place` for `PlaceExpr::Field` on `Type::Union` is
+`fields[field]` plus an in-bounds offset of `0`. -/
+theorem evalPlace_field_mrUnionTy {m m' : Mach} {root : Gen.PlaceExpr} {rootPlace : Gen.Place BM}
+    {fields : List (Gen.Offset × Gen.«Type»)} {S al : Nat} {j : Nat} {fty : Gen.«Type»}
+    {fsz : Size} {fal : Align}
+    (hroot : evalPlace m root = .ok ((rootPlace, mrUnionTy fields S al), m'))
+    (hfield : fields[j]? = some (⟨0⟩, fty))
+    (hsized : Interp.Type.layout fty = .ok (.Sized fsz fal))
+    (hmeta : rootPlace.ptr.metadata = none)
+    (haddr0 : 0 ≤ rootPlace.ptr.thin_pointer.addr)
+    (haddrMax : rootPlace.ptr.thin_pointer.addr < 2 ^ 64) :
+    evalPlace m (.Field root (j : Int)) =
+      .ok (({ rootPlace with ptr := ThinPointer.widen rootPlace.ptr.thin_pointer none }, fty), m') := by
+  have hidx : listIndex fields (j : Int) "fields[field]" = .ok (⟨0⟩, fty) := by
+    simp [listIndex, hfield]
+  have hlay : Interp.Type.layout (.Union fields [(⟨0⟩, ⟨S⟩)] ⟨S⟩ ⟨al⟩) = .ok (.Sized ⟨S⟩ ⟨al⟩) := rfl
+  simp [evalPlace, hroot, mrUnionTy, hidx, hlay, computeSize, hmeta,
+    ptrOffsetInbounds_zero m' _ haddr0 haddrMax, hsized, LayoutStrategy.is_sized, bind,
+    Except.bind, pure, Except.pure]
+
 /-! ## `TerminatorKind.assert` (`assert cond expected target unwind`)
 
-`minimize` lowers `TerminatorKind.assert cond expected target unwind` to a
-`Terminator.Switch` on `assertDiscrExpr expected v` (`boolToU8 v` when
-`expected = true`, `boolToU8 (boolNot v)` when `expected = false`) with branch
-`[(1, bbName target)]` and fallback `failTarget` (`bbName cleanupBb` when
-`unwind = .cleanup cleanupBb`, or `bbName panicBlockIdx` for
-`.unreachable` / `.terminate` / `.continue_`). -/
+`minimize` lowers `TerminatorKind::Assert` to a two-way `Switch` on the checked
+condition (`tooling/minimize/src/bb.rs` at the pinned commit):
+> "rs::TerminatorKind::Assert { cond, expected, target, unwind, .. } => {
+>      let mut condition = self.translate_operand(cond, span);
+>      ..
+>      if !expected {
+>          condition = build::not(condition);
+>      }
+>      // Create panic block in case of `expected != condition`
+>      let terminator = self.translate_panic(*unwind, bb);
+>      let panic_block_name = self.fresh_bb_name();
+>      ..
+>      Terminator::Switch {
+>          value: build::bool_to_int::<u8>(condition),
+>          cases: [(Int::from(1), next_block)].into_iter().collect(),
+>          fallback: panic_block_name,
+>      }
+>  }"
+Under `panic = unwind`, `translate_panic` returns
+`Terminator::StartUnwind { unwind_payload: build::unit_ptr(), unwind_block }`,
+where `unwind_block` comes from `translate_unwind_action`
+(`translateUnwindAction`): the cleanup block itself for `Cleanup(bb)`, and a
+fresh `Unreachable`, `build::abort()`, or `ResumeUnwind` block for
+`Unreachable`, `Terminate`, and `Continue`.
+
+`MiniRustSpec.Interp.evalTerminator` implements neither `StartUnwind` nor
+`ResumeUnwind` (both fall into its `unsupported` arm), so the failure edge
+cannot run as `minimize` emits it. `translateTerminatorAssert` keeps the
+condition (`assertDiscrExpr`) and the success edge, and sends the failure edge
+straight to the block that `StartUnwind` would jump to
+(`spec/lang/step/terminators.md`: "self.jump_to_block(unwind_block)?"); see
+`assertFailTarget`:
+
+* `Cleanup(bb)`: the `Switch` falls back to `bbName bb`.
+* `Unreachable` and `Terminate`: the `Switch` falls back to a fresh block with
+  `translate_unwind_action`'s terminator (`Unreachable`, `build::abort()`).
+* `Continue`: `translate_unwind_action`'s `ResumeUnwind` block would pop the
+  frame. The caller of an entry function is `minimize`'s `mk_start_fn`, whose
+  unwind block aborts (`mkStartFn`'s `b2`: "If `entry` unwinds, we jump here
+  and abort"), so the fresh block holds that `build::abort()`. This case
+  therefore models only an entry function (`s.memory.callStack = []` in
+  `step_terminator_assert_simulation`).
+
+The model drops one effect of `StartUnwind`, pushing the unwind payload, which
+only `ResumeUnwind` and `StopUnwind` read; `Interp` supports neither. MiniRust
+requires a `Switch` target to have the kind of the `Switch`'s own block
+(`checkNextBlock`), so the fresh blocks are `Regular`, not `Cleanup`;
+`Interp.step` never reads a block's kind.
+`assertFailTarget_eq_translateUnwindAction` and `assertFailTarget_continue`
+state exactly how the model differs from `translateUnwindAction`. -/
 
 /-- The MiniRust `u8` switch discriminant expression for `assert(cond == expected)`:
 `boolToU8 v` when `expected = true`, and `boolToU8 (boolNot v)` when
@@ -16905,18 +17076,60 @@ theorem transmute_mrUnionTy_to_int_spec
 def assertDiscrExpr (expected : Bool) (v : Gen.ValueExpr) : Gen.ValueExpr :=
   if expected then boolToU8 v else boolToU8 (boolNot v)
 
-/-- Translate a `TerminatorKind.assert cond expected target unwind` into its
-MiniRust `Terminator.Switch` lowering. -/
-def translateTerminatorAssert (panicBlock : Gen.BbName) (decls : List LocalDecl)
-    (t : MirAst.Terminator) : Option Gen.Terminator :=
+/-- The failure edge of `translateTerminatorAssert` for unwind action `unwind`,
+given the next fresh block number `nextFresh`: the `Switch` fallback, the next
+fresh block number after the edge, and the fresh blocks (see the section
+comment). `minimize` names the `StartUnwind` block after the
+`translate_unwind_action` block, and this model skips that name too, so later
+fresh blocks keep `minimize`'s names. -/
+def assertFailTarget (nextFresh : Nat) :
+    UnwindAction → Gen.BbName × Nat × List (Gen.BbName × Gen.BasicBlock)
+  | .cleanup cleanupBb => (bbName cleanupBb, nextFresh + 1, [])
+  | .unreachable =>
+    (bbName nextFresh, nextFresh + 2, [(bbName nextFresh, ⟨[], .Unreachable, .Regular⟩)])
+  | .terminate =>
+    (bbName nextFresh, nextFresh + 2, [(bbName nextFresh, ⟨[], abortTerminator, .Regular⟩)])
+  | .continue_ =>
+    (bbName nextFresh, nextFresh + 2, [(bbName nextFresh, ⟨[], abortTerminator, .Regular⟩)])
+
+/-- Outside `Continue`, `assertFailTarget` is `minimize`'s
+`translateUnwindAction` with one more fresh number (the skipped `StartUnwind`
+block) and its fresh block relabeled `Regular`. -/
+theorem assertFailTarget_eq_translateUnwindAction (nextFresh : Nat)
+    {unwind : UnwindAction} (hu : unwind ≠ .continue_) :
+    assertFailTarget nextFresh unwind =
+      ((translateUnwindAction nextFresh unwind).1,
+        (translateUnwindAction nextFresh unwind).2.1 + 1,
+        (translateUnwindAction nextFresh unwind).2.2.map
+          (fun p => (p.1, { p.2 with kind := .Regular }))) := by
+  cases unwind with
+  | continue_ => exact absurd rfl hu
+  | _ => rfl
+
+/-- For `Continue`, `assertFailTarget` uses `translateUnwindAction`'s block name
+and fresh number, but its fresh block holds the terminator of `mkStartFn`'s
+`Catch` block `b2`, which aborts when the entry function unwinds. -/
+theorem assertFailTarget_continue (nextFresh entryIdx : Nat) :
+    ∃ b2, mapGet (mkStartFn entryIdx).blocks (bbName 2) = some b2 ∧ b2.kind = .Catch ∧
+      assertFailTarget nextFresh .continue_ =
+        ((translateUnwindAction nextFresh .continue_).1,
+          (translateUnwindAction nextFresh .continue_).2.1 + 1,
+          [((translateUnwindAction nextFresh .continue_).1, { b2 with kind := .Regular })]) :=
+  ⟨_, rfl, rfl, rfl⟩
+
+/-- `minimize`'s lowering of `TerminatorKind.assert cond expected target unwind`,
+with the failure edge modeled by `assertFailTarget` (see the section comment):
+the `Switch` on `assertDiscrExpr expected v`, the next fresh block number, and
+the fresh blocks, numbered from `nextFresh`. -/
+def translateTerminatorAssert (decls : List LocalDecl) (nextFresh : Nat)
+    (t : MirAst.Terminator) :
+    Option (Gen.Terminator × Nat × List (Gen.BbName × Gen.BasicBlock)) :=
   match t.kind with
   | .assert cond expected target unwind => do
     let v ← translateOperand decls (copyOp cond)
-    let failTarget :=
-      match unwind with
-      | .cleanup cleanupBb => bbName cleanupBb
-      | _ => panicBlock
-    some (.Switch (assertDiscrExpr expected v) ⟨[(1, bbName target)]⟩ failTarget)
+    some (.Switch (assertDiscrExpr expected v) ⟨[(1, bbName target)]⟩
+        (assertFailTarget nextFresh unwind).1,
+      (assertFailTarget nextFresh unwind).2.1, (assertFailTarget nextFresh unwind).2.2)
   | _ => none
 
 /-- Fragment check for `TerminatorKind.assert`: `cond` is a valid boolean
@@ -16992,37 +17205,37 @@ theorem assert_discr_spec {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
 (`assert cond expected target unwind`)**:
 Given a block `bb` at `s.frame.blockIdx` whose statements have finished
 (`s.frame.stmtIdx = bb.statements.length`) and whose terminator is
-`.assert cond expected target unwind` translated by
-`translateTerminatorAssert (bbName panicBlockIdx)`:
-1. **Passing branch (`(decide (bits = 1) == expected) = true`)**:
+`.assert cond expected target unwind`, translated by
+`translateTerminatorAssert body.localDecls nextFresh` into `tb.terminator` and
+the fresh blocks `extra`, all of which `f` contains (`hextra`):
+1. **Uninitialized or invalid `cond` (`opBits view (copyOp cond) = none`)**:
+   Anneal returns `MirStepNode.fail .ub` and MiniRust returns `Interp.step m = .error (.ub msg)`;
+2. **Passing branch (`(decide (bits = 1) == expected) = true`)**:
    Anneal (`stepMirFn`) and MiniRust (`Interp.step`) both step in 1 lockstep step
    to `target` with `opPost s.frame.locals cond`;
-2. **Uninitialized or invalid `cond` (`opBits view (copyOp cond) = none`)**:
-   Anneal returns `MirStepNode.fail .ub` and MiniRust returns `Interp.step m = .error (.ub msg)`;
-3. **Failing branch with `unwind = .cleanup cleanupBb` (`(decide (bits = 1) == expected) = false`)**:
+3. **Failing branch with `unwind = .cleanup cleanupBb`**:
    Anneal (`applyUnwindAction`) and MiniRust (`Interp.step`) both step in 1 lockstep
    step to `cleanupBb` with `opPost s.frame.locals cond`;
-4. **Failing branch with `unwind = .unreachable` (`(decide (bits = 1) == expected) = false`)**:
-   When `mapGet f.blocks (bbName panicBlockIdx) = some ⟨[], .Unreachable, .Regular⟩`,
-   Anneal returns `MirStepNode.fail .ub` and MiniRust reaches
+4. **Failing branch with `unwind = .unreachable`**:
+   Anneal returns `MirStepNode.fail .ub`, and MiniRust jumps to the fresh
+   `Unreachable` block and reaches
    `Interp.steps 2 m = .error (.ub "reached unreachable code")`;
-5. **Failing branch with `unwind = .terminate` (`(decide (bits = 1) == expected) = false`)**:
-   When `mapGet f.blocks (bbName panicBlockIdx) = some ⟨[], abortTerminator, .Regular⟩`,
-   Anneal returns `MirStepNode.retOutcome .abort` and MiniRust reaches
-   `Interp.steps 2 m = .error .abort`;
-6. **Failing branch with `unwind = .continue_` (`(decide (bits = 1) == expected) = false`)**:
-   When `mapGet f.blocks (bbName panicBlockIdx) = some ⟨[], abortTerminator, .Regular⟩`
-   (and `s.memory.callStack = []`), Anneal returns `MirStepNode.retOutcome .panic`
-   and MiniRust reaches `Interp.steps 2 m = .error .abort`. -/
+5. **Failing branch with `unwind = .terminate`**:
+   Anneal returns `MirStepNode.retOutcome .abort`, and MiniRust jumps to the
+   fresh `build::abort()` block and reaches `Interp.steps 2 m = .error .abort`;
+6. **Failing branch with `unwind = .continue_` in an entry function
+   (`s.memory.callStack = []`)**: Anneal unwinds out of the root frame
+   (`MirStepNode.retOutcome .panic`), and MiniRust jumps to the fresh
+   `build::abort()` block that stands for `mk_start_fn`'s unwind block and
+   reaches `Interp.steps 2 m = .error .abort`. -/
 theorem step_terminator_assert_simulation
     {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {view : List LocalSlot} {lm : Map Gen.LocalName Ptr}
     {s : MachineState} {m : Mach} {bb : BasicBlockData} {tb : Gen.BasicBlock}
     {cond : Operand} {expected : Bool} {target : BasicBlockIdx} {unwind : UnwindAction}
-    {panicBlockIdx : Nat}
+    {nextFresh nextFresh' : Nat} {extra : List (Gen.BbName × Gen.BasicBlock)}
     (hphase : body.phase = .runtimePostCleanup)
     (hcal : s.memory.activeCallee = none)
-    (hcs : s.memory.callStack = [])
     (hdeclsOk : ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true)
     (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
     (hstmt_end : s.frame.stmtIdx = bb.statements.length)
@@ -17030,7 +17243,9 @@ theorem step_terminator_assert_simulation
     (hok : assertTerminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator = true)
     (hgetb : mapGet f.blocks (bbName s.frame.blockIdx) = some tb)
     (hlen : tb.statements.length = bb.statements.length)
-    (htt : translateTerminatorAssert (bbName panicBlockIdx) body.localDecls bb.terminator = some tb.terminator)
+    (htt : translateTerminatorAssert body.localDecls nextFresh bb.terminator =
+      some (tb.terminator, nextFresh', extra))
+    (hextra : ∀ b blk, (b, blk) ∈ extra → mapGet f.blocks b = some blk)
     (hshape : Shape m (ctxWithBorrows body ctx s.memory.borrows)
       [(ctxWithBorrows body ctx s.memory.borrows).caller,
         calleeFrameL f (ctxWithBorrows body ctx s.memory.borrows) lm s.frame.blockIdx
@@ -17068,19 +17283,17 @@ theorem step_terminator_assert_simulation
     (∀ bits, opBits view (copyOp cond) = some bits →
       (decide (bits = 1) == expected) = false →
       unwind = .unreachable →
-      mapGet f.blocks (bbName panicBlockIdx) = some ⟨[], .Unreachable, .Regular⟩ →
       stepMirFn body s = MirStepNode.fail .ub ∧
       Interp.steps 2 m = .error (.ub "reached unreachable code")) ∧
     (∀ bits, opBits view (copyOp cond) = some bits →
       (decide (bits = 1) == expected) = false →
       unwind = .terminate →
-      mapGet f.blocks (bbName panicBlockIdx) = some ⟨[], abortTerminator, .Regular⟩ →
       stepMirFn body s = MirStepNode.retOutcome .abort ∧
       Interp.steps 2 m = .error .abort) ∧
     (∀ bits, opBits view (copyOp cond) = some bits →
       (decide (bits = 1) == expected) = false →
       unwind = .continue_ →
-      mapGet f.blocks (bbName panicBlockIdx) = some ⟨[], abortTerminator, .Regular⟩ →
+      s.memory.callStack = [] →
       stepMirFn body s = MirStepNode.retOutcome .panic ∧
       Interp.steps 2 m = .error .abort) := by
   obtain ⟨hdok, _, _⟩ := assertTerminatorOk_spec hok hk
@@ -17093,7 +17306,8 @@ theorem step_terminator_assert_simulation
   cases hv : translateOperand body.localDecls (copyOp cond) with
   | none => simp [hv] at htt
   | some v =>
-    simp only [hv, Option.bind_some, Option.some.injEq] at htt
+    simp only [hv, Option.bind_some, Option.some.injEq, Prod.mk.injEq] at htt
+    obtain ⟨htt, -, hex⟩ := htt
     obtain ⟨hokT, hMok, hMnone⟩ := assert_discr_spec hframe expected hdok hv
     have hsimple : simpleOp cond = true := (readsOk_spec hreads cond (by simp)).1
     have hstale_end : StaleOk body s.frame.locals view s.frame.blockIdx bb.statements.length := by
@@ -17116,8 +17330,8 @@ theorem step_terminator_assert_simulation
     have hmap1 : mapGet ⟨[(1, bbName target)]⟩ (1 : Int) = some (bbName target) := rfl
     have hmap0 : mapGet ⟨[(1, bbName target)]⟩ (0 : Int) = none := rfl
     refine ⟨fun hb => ?_, fun bits hb hpass => ?_, fun bits cleanupBb hb hfail hu => ?_,
-      fun bits hb hfail hu hpanic => ?_, fun bits hb hfail hu hpanic => ?_,
-      fun bits hb hfail hu hpanic => ?_⟩
+      fun bits hb hfail hu => ?_, fun bits hb hfail hu => ?_,
+      fun bits hb hfail hu hcs => ?_⟩
     · refine ⟨?_, ?_⟩
       · rw [hstepA_eq]
         simp [MirSemantics.evalTerminator, hk, hmove, hdeq, hAnone (hbitsEq.trans hb), opWithLocals]
@@ -17158,7 +17372,8 @@ theorem step_terminator_assert_simulation
       obtain ⟨m4, hm4, h4⟩ := jumpToBlock_callee h3.shape cleanupBb
       have hM : Interp.step m = .ok m4 := by
         rw [hstepM_eq]
-        simp [hif, ← htt, Interp.evalTerminator, hm3, hfail, ok_bind, hmap0, Option.getD, hm4, check_after h4]
+        simp [hif, ← htt, Interp.evalTerminator, hm3, hfail, ok_bind, hmap0, Option.getD,
+          assertFailTarget, hm4, check_after h4]
       exact ⟨hA, m4, hM, ⟨h4.threads, h4.active, rfl⟩, by rw [h4.allocs]; exact h3.locs, h3.nonScalar⟩
     · subst hu
       obtain ⟨hb2, m3, hm3, h3⟩ := hMok bits hb
@@ -17174,10 +17389,13 @@ theorem step_terminator_assert_simulation
         rw [hcond_eval]
         rcases (by omega : bits = 0 ∨ bits = 1) with rfl | rfl <;>
           cases expected <;> first | (exfalso; revert hfail; decide) | rfl
-      obtain ⟨m4, hm4, h4⟩ := jumpToBlock_callee h3.shape panicBlockIdx
+      have hpanic : mapGet f.blocks (bbName nextFresh) = some ⟨[], .Unreachable, .Regular⟩ :=
+        hextra _ _ (by rw [← hex]; simp [assertFailTarget])
+      obtain ⟨m4, hm4, h4⟩ := jumpToBlock_callee h3.shape nextFresh
       have hstep1 : Interp.step m = .ok m4 := by
         rw [hstepM_eq]
-        simp [hif, ← htt, Interp.evalTerminator, hm3, hfail, ok_bind, hmap0, Option.getD, hm4, check_after h4]
+        simp [hif, ← htt, Interp.evalTerminator, hm3, hfail, ok_bind, hmap0, Option.getD,
+          assertFailTarget, hm4, check_after h4]
       have hstep2 : Interp.step m4 = .error (.ub "reached unreachable code") := by
         rw [step_callee h4 ⟨[], .Unreachable, .Regular⟩ hpanic]
         rfl
@@ -17196,10 +17414,13 @@ theorem step_terminator_assert_simulation
         rw [hcond_eval]
         rcases (by omega : bits = 0 ∨ bits = 1) with rfl | rfl <;>
           cases expected <;> first | (exfalso; revert hfail; decide) | rfl
-      obtain ⟨m4, hm4, h4⟩ := jumpToBlock_callee h3.shape panicBlockIdx
+      have hpanic : mapGet f.blocks (bbName nextFresh) = some ⟨[], abortTerminator, .Regular⟩ :=
+        hextra _ _ (by rw [← hex]; simp [assertFailTarget])
+      obtain ⟨m4, hm4, h4⟩ := jumpToBlock_callee h3.shape nextFresh
       have hstep1 : Interp.step m = .ok m4 := by
         rw [hstepM_eq]
-        simp [hif, ← htt, Interp.evalTerminator, hm3, hfail, ok_bind, hmap0, Option.getD, hm4, check_after h4]
+        simp [hif, ← htt, Interp.evalTerminator, hm3, hfail, ok_bind, hmap0, Option.getD,
+          assertFailTarget, hm4, check_after h4]
       have hstep2 : Interp.step m4 = .error .abort := by
         rw [step_callee h4 ⟨[], abortTerminator, .Regular⟩ hpanic]
         rfl
@@ -17219,13 +17440,70 @@ theorem step_terminator_assert_simulation
         rcases (by omega : bits = 0 ∨ bits = 1) with rfl | rfl <;>
           cases expected <;> first | (exfalso; revert hfail; decide) |
             simp [MirSemantics.applyUnwindAction, MirSemantics.unwindFromCallStack, hcs]
-      obtain ⟨m4, hm4, h4⟩ := jumpToBlock_callee h3.shape panicBlockIdx
+      have hpanic : mapGet f.blocks (bbName nextFresh) = some ⟨[], abortTerminator, .Regular⟩ :=
+        hextra _ _ (by rw [← hex]; simp [assertFailTarget])
+      obtain ⟨m4, hm4, h4⟩ := jumpToBlock_callee h3.shape nextFresh
       have hstep1 : Interp.step m = .ok m4 := by
         rw [hstepM_eq]
-        simp [hif, ← htt, Interp.evalTerminator, hm3, hfail, ok_bind, hmap0, Option.getD, hm4, check_after h4]
+        simp [hif, ← htt, Interp.evalTerminator, hm3, hfail, ok_bind, hmap0, Option.getD,
+          assertFailTarget, hm4, check_after h4]
       have hstep2 : Interp.step m4 = .error .abort := by
         rw [step_callee h4 ⟨[], abortTerminator, .Regular⟩ hpanic]
         rfl
       exact ⟨hA, by simp [Interp.steps, hstep1, hstep2]⟩
+
+/-! ### Whole-function translation with `assert` terminators
+
+`translateFn` translates terminators with `translateTerminator`, which rejects
+`assert`. The definitions below translate a function whose terminators are
+fragment terminators or `assert`s: each `assert` goes through
+`translateTerminatorAssert`, and the fresh blocks it creates follow
+`initBlock`, numbered from `n + 1` for a body of `n` blocks, as
+`translateFnInProg` numbers the fresh blocks of call unwind edges. The
+witnesses in `Witness.lean` compute their MiniRust functions with
+`translateFnWithAssert` rather than writing them by hand. -/
+
+/-- `translateTerminator`, with `translateTerminatorAssert` for `assert`:
+the MiniRust terminator, the next fresh block number, and the fresh blocks. -/
+def translateTerminatorWithAssert (layouts : Layout.LayoutTable) (decls : List LocalDecl)
+    (nextFresh : Nat) (t : MirAst.Terminator) :
+    Option (Gen.Terminator × Nat × List (Gen.BbName × Gen.BasicBlock)) :=
+  match t.kind with
+  | .assert .. => translateTerminatorAssert decls nextFresh t
+  | _ => do
+    let term ← translateTerminator layouts decls t
+    pure (term, nextFresh, [])
+
+/-- `translateBlocks` with `translateTerminatorWithAssert`: the translated
+blocks (named `bbName i` from `i`) and the fresh blocks (numbered from
+`nextFresh`). -/
+def translateBlocksWithAssert (layouts : Layout.LayoutTable) (decls : List LocalDecl) :
+    Nat → Nat → List BasicBlockData →
+      Option (List (Gen.BbName × Gen.BasicBlock) × List (Gen.BbName × Gen.BasicBlock))
+  | _, _, [] => some ([], [])
+  | i, nextFresh, bb :: bbs => do
+    let stmts ← bb.statements.mapM (translateStatement decls · layouts)
+    let (term, nextFresh', extra) ←
+      translateTerminatorWithAssert layouts decls nextFresh bb.terminator
+    let (rest, restExtra) ← translateBlocksWithAssert layouts decls (i + 1) nextFresh' bbs
+    pure ((bbName i, ⟨stmts, term, .Regular⟩) :: rest, extra ++ restExtra)
+
+/-- `translateFn` with `translateBlocksWithAssert`; the fresh blocks follow
+`initBlock`. -/
+def translateFnWithAssert (body : CapturedMir) : Option Gen.Function := do
+  let conv ← translateCallConv body.fnAbi.conv
+  let locals ← translateLocals body.layouts 0 body.localDecls
+  let n := body.basicBlocks.length
+  let (blocks, extra) ←
+    translateBlocksWithAssert body.layouts body.localDecls 0 (n + 1) body.basicBlocks
+  pure {
+    locals := ⟨locals⟩
+    args := (List.range body.argCount).map (fun k => localName (k + 1))
+    ret := localName 0
+    calling_convention := conv
+    blocks := ⟨blocks ++ [(bbName n, initBlock body)] ++ extra⟩
+    start := bbName n
+    implicit_writes := true
+  }
 
 end MiniRustSpec.Correspondence

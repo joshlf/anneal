@@ -4260,15 +4260,27 @@ theorem annealMemCopyOp_zero_into_union_field
     h0, ↓reduceIte, hslice_src, hslice_dst, hmut, bne_self_eq_false,
     Bool.false_eq_true, hnz, pure, EStateM.pure]
 
-/-- Additive operand evaluation extending `annealEvalOperandLM2_4` with:
-1. Uninhabited 0-byte union field read detection (`isUninhabitedEncodedTyId fty layouts = true`
-   -> `.error (.undefinedBehavior "read of uninhabited union field")`, `kani#5159`);
-2. Nested indexed element projection on a union's `[(); N]` ZST array arm
-   (`[.Field j fty, .ConstantIndex offset minLen false]`), checking static bounds
-   `minLen ≤ N ∧ offset < N` (`checkStaticSubProjBounds`) and returning
-   `⟨.immediate .uninit, { ty := encodeTyId { kind := .tuple [], layoutIdx := 0 }, layout := zstLayoutData }⟩`
-   when in bounds and `.error (.undefinedBehavior "out-of-bounds union ZST array index")`
-   when out of bounds. -/
+/-- Operand evaluation that extends `annealEvalOperandLM2_4` on two shapes of
+union-local operands and agrees with it elsewhere
+(`annealEvalOperandLM2_4PaddedZst_eq_of_not_unionLocal`):
+1. A field read `[.Field j fty]` whose field type is uninhabited
+   (`isUninhabitedEncodedTyId fty layouts = true`) is
+   `.error (.undefinedBehavior "read of uninhabited union field")` (`kani#5159`).
+   This changes a defined outcome of the pinned `annealEvalOperandLM2_4`, which
+   copies the 0-byte field without validation and succeeds
+   (`lm24_padded_zst_uninhabited_arm_base_adapter_accepts` in `WitLM2_4.lean`).
+   rustc and Miri validate a typed copy, and the vendored validity visitor
+   rejects a value of a type without variants ("zero-variant enum value",
+   `Miri/Interpreter/ValidityVisitor.lean`); this hook performs that rejection
+   for union field reads only, keyed on the encoded field type.
+2. An element read `[.Field j fty, .ConstantIndex offset minLen false]` of a
+   `[(); N]` arm, which `annealEvalOperandLM2_4` does not support, returns the
+   union's place at the zero-sized `()` layout when `minLen ≤ N ∧ offset < N`,
+   and `.error (.undefinedBehavior "out-of-bounds union ZST array index")`
+   otherwise. rustc's interpreter also reports UB when `minLen > N`, but it
+   asserts `offset < min_length` instead of reporting UB, and rustc only emits
+   `ConstantIndex` with `offset < minLen`; a projection with `offset ≥ minLen`
+   is ill-formed MIR. -/
 def annealEvalOperandLM2_4PaddedZst
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (op : Miri.MIR.Operand)
@@ -4334,9 +4346,13 @@ def annealEvalOperandLM2_4PaddedZst
   | none =>
     annealEvalOperandLM2_4 localDecls layouts op expectedLayout
 where
-  /-- Check whether an encoded field `TyId` refers to an uninhabited layout in `layouts`. -/
+  /-- Whether an encoded field `TyId` (`encodeTyId`) is uninhabited: the never
+  type (`50`), or a type encoded through its layout index (`100 + layoutIdx`)
+  whose layout entry is uninhabited. Scalar types and arrays of scalars, the
+  other encodings, are inhabited. -/
   isUninhabitedEncodedTyId (tyId : Miri.MIR.TyId) (layouts : LayoutTable) : Bool :=
-    if 100 ≤ tyId && tyId < 1000 then
+    if tyId == 50 then true
+    else if 100 ≤ tyId && tyId < 1000 then
       match layouts.lookup (tyId - 100) with
       | some tl => tl.isUninhabited
       | none => false
@@ -4355,6 +4371,43 @@ where
         else none
       | none => none
     else none
+
+/-- `annealEvalOperandLM2_4PaddedZst` is `annealEvalOperandLM2_4` on every
+operand that does not read a union local. -/
+theorem annealEvalOperandLM2_4PaddedZst_eq_of_not_unionLocal
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (op : Miri.MIR.Operand) (expectedLayout : Option Miri.Interpreter.LocalLayout)
+    (h : ∀ p, (op = .Copy p ∨ op = .Move p) → isUnionLocal localDecls layouts p.localId = false) :
+    annealEvalOperandLM2_4PaddedZst localDecls layouts op expectedLayout =
+      annealEvalOperandLM2_4 localDecls layouts op expectedLayout := by
+  unfold annealEvalOperandLM2_4PaddedZst
+  cases op with
+  | Copy p => simp [h p (.inl rfl)]
+  | Move p => simp [h p (.inr rfl)]
+  | _ => rfl
+
+/-- `annealEvalOperandLM2_4PaddedZst` is `annealEvalOperandLM2_4` on a
+union-local operand whose projection is neither `[Field j fty]` nor
+`[Field j fty, ConstantIndex ..]`. -/
+theorem annealEvalOperandLM2_4PaddedZst_eq_of_projection
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (p : Miri.MIR.Place) (expectedLayout : Option Miri.Interpreter.LocalLayout)
+    (hproj : ∀ j fty, p.projection.toList ≠ [.Field j fty])
+    (hidx : ∀ j fty offset minLen,
+      p.projection.toList ≠ [.Field j fty, .ConstantIndex offset minLen false]) :
+    annealEvalOperandLM2_4PaddedZst localDecls layouts (.Copy p) expectedLayout =
+        annealEvalOperandLM2_4 localDecls layouts (.Copy p) expectedLayout ∧
+      annealEvalOperandLM2_4PaddedZst localDecls layouts (.Move p) expectedLayout =
+        annealEvalOperandLM2_4 localDecls layouts (.Move p) expectedLayout := by
+  unfold annealEvalOperandLM2_4PaddedZst
+  constructor <;>
+  · dsimp only
+    split
+    · split
+      · rename_i j fty hp; exact absurd hp (hproj j fty)
+      · rename_i j fty offset minLen hp; exact absurd hp (hidx j fty offset minLen)
+      · rfl
+    · rfl
 
 /-- Additive aggregate hooks extending `annealAggregateHooksLM2_4` so zero-sized
 array operands (`src.layout.layout.size.bytes == 0`, such as `[(); N]` in

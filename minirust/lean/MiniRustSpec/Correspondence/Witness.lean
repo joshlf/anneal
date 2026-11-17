@@ -15153,10 +15153,20 @@ theorem deinitSiblingBinOpWindowReinit_minirust_noUB {n : Nat} {e : Stop}
 
 /-! ## `Type.Union` (`MaybeUninit<u32>`, `ManuallyDrop<u32>`, and Padded `[(); 4]` ZST-Arm Unions)
 
-This section provides kernel-checked end-to-end witnesses and negative controls
-for MiniRust `Type.Union` (`mrMaybeUninitTy`, `mrManuallyDropTy`,
-`mrPaddedZstUnionTy`, `MiniRustUnionBytesRel`) paired with Anneal's
-`MirSemantics` (`stepMirFn`, `runA_sound`, `faultsA_sound`). -/
+Kernel-checked witnesses and negative controls that run Anneal's `MirSemantics`
+(`stepMirFn`, `runA_sound`) and `MiniRustSpec.Interp` on the same union
+programs. The MiniRust functions are lowered by hand, because `Translate.lean`
+has no union types: a union aggregate becomes `Deinit` plus a field assignment
+(see the `Type.Union` section of `Simulation.lean`; on a freshly allocated
+local the `Deinit` is a no-op, and `wUnionWitnessFn` omits it).
+
+* `wUnionWitnessMir` uses `MaybeUninitShaped`, a union `{ [(); 4], u32 }` whose
+  MIR type is named `MaybeUninit`, and the padded union `PU`
+  (`{ [(); 4], u8, u32, VoidZst }`, `kani#5176` and `kani#5159`).
+* `wMaybeUninitMir` uses the real `MaybeUninit<u32>`
+  (`union { uninit: (), value: ManuallyDrop<u32> }`) and `ManuallyDrop<u32>`.
+* `wUnionReaggMir` re-aggregates an initialized union and shows why the
+  lowering needs `Deinit`. -/
 
 def wU8Layout : TypeLayout :=
   { size := { bytes := 1 }, align := { bytes := 1 },
@@ -15208,7 +15218,9 @@ def wMaybeUninitU32Decl : LocalDecl := { mutability := .mut, ty := wMaybeUninitU
 def wConstU32 (n : Nat) : Operand := .constant { ty := wU32Ty, val := .scalar (.int ⟨n, 4⟩) }
 def wZstArr4Val : Value := .aggregate 0 [.aggregate 0 [], .aggregate 0 [], .aggregate 0 [], .aggregate 0 []]
 
-/-- Anneal MIR body exercising `MaybeUninit<u32>` and padded `[(); 4]` union `PU`:
+/-- Anneal MIR body exercising `MaybeUninitShaped` (`_1`, `_2`: a union whose MIR
+type is named `MaybeUninit<u32>` but whose layout has the fields `[(); 4]` and
+`u32`) and the padded `[(); 4]` union `PU`:
 * `bb0` (init via payload, whole-union copy, field read):
   `_1 = MaybeUninit { value: 42_u32 }; _2 = copy _1; _0 = copy (_2.1: u32); return`
 * `bb1` (init via ZST arm, whole-union copy, ZST read, then uninit scalar read UB):
@@ -15276,9 +15288,8 @@ def wUnionWitnessMir : CapturedMir where
   layouts := wUnionLayouts
   allocations := []
 
-/-- Corresponding MiniRust `Gen.Function` for `wUnionWitnessMir` using
-`Type.Union` (`mrMaybeUninitTy`, `mrPaddedZstUnionTy`), `PlaceExpr.Field`,
-`ValueExpr.Load`, `Statement.Assign`, and `CastOp.Transmute`. -/
+/-- The MiniRust type of `MaybeUninitShaped`: the union `{ [(); 4], u32 }`, not
+`mrMaybeUninitTy` (for the real `MaybeUninit<u32>`, see `wMaybeUninitFn`). -/
 def mrMaybeUninitU32 : Gen.«Type» :=
   mrUnionTy [(⟨0⟩, mrZstArrayTy 4), (⟨0⟩, .Int u32)] 4 4
 
@@ -15398,21 +15409,31 @@ copy preserving `.Uninit` padding bytes, `[(); 4]` ZST arm overwrite retaining
 payload byte `0`, ZST read, and `u8` payload read)**:
 In `bb2`, both Anneal (`ReachesRet` returning `0x55_u32`) and MiniRust
 (`Interp.steps 15` returning `scalarBytes u32 0x55` in `retAlloc`) execute the
-entire 7-statement padded-union pipeline without UB, and in MiniRust `_5`'s
-stack allocation data is `[.Init 0x55 none, .Uninit, .Uninit, .Uninit]`
-(`MiniRustUnionBytesRel`). -/
+entire 7-statement padded-union pipeline without UB. The run itself shows the
+padding bytes: after `_5 = copy _4` (step 6), both `_4`'s allocation (index 3)
+and `_5`'s (index 4) hold `[.Init 0x55 none, .Uninit, .Uninit, .Uninit]`, and
+the 0-byte write `_5.0 = copy _3` (step 7) leaves `_5`'s bytes unchanged. The
+Anneal value of `_4` relates to those bytes (`MiniRustUnionBytesRel`). -/
 theorem paddedZstUnion_copy_zst_overwrite_and_read_witness :
     ReachesRet (mirTree wUnionWitnessMir (wUnionS0 2)) []
       (.normal (.scalar ⟨0x55, 4⟩, (wUnionS0 2).memory)) ∧
     MiniRustUnionBytesRel wUnionLayouts wPUTy 4
       (.aggregate 0 [.unit, .scalar ⟨0x55, 1⟩, .unit, .unit])
       [.Init 0x55 none, .Uninit, .Uninit, .Uninit] ∧
+    (Interp.steps 6 (wUnionMach 2)).toOption.map
+        (fun m => (m.mem.memory.allocations[3]?.map (·.data),
+          m.mem.memory.allocations[4]?.map (·.data))) =
+      some (some [.Init 0x55 none, .Uninit, .Uninit, .Uninit],
+        some [.Init 0x55 none, .Uninit, .Uninit, .Uninit]) ∧
+    (Interp.steps 7 (wUnionMach 2)).toOption.map
+        (fun m => m.mem.memory.allocations[4]?.map (·.data)) =
+      some (some [.Init 0x55 none, .Uninit, .Uninit, .Uninit]) ∧
     (Interp.steps 15 (wUnionMach 2)).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 0x55 }, [1]) :=
   ⟨runA_sound wUnionWitnessMir 15 _ _ _ rfl,
    ⟨rfl, _, rfl, rfl, rfl⟩,
-   rfl⟩
+   rfl, rfl, rfl⟩
 
 /-- **Witness 4 (Negative control: reading wider `u32` arm across uninitialized
 trailing padding bytes `[1, 4)` of a copied padded union `PU`)**:
@@ -15443,23 +15464,239 @@ theorem paddedZstUnion_uninhabited_zst_arm_ub_witness :
       .error (.ub "load at type but the data in memory violates the language invariant") :=
   ⟨⟨_, rfl, rfl⟩, rfl, rfl⟩
 
+/-! ### The real `MaybeUninit<u32>` and `ManuallyDrop<u32>`
+
+`MaybeUninit<u32>` is `union { uninit: (), value: ManuallyDrop<u32> }`, and
+`ManuallyDrop<u32>` is the struct `{ value: u32 }`. On the MiniRust side they
+are `mrMaybeUninitTy (.Int u32) 4 4` and `mrManuallyDropTy (.Int u32) 4 4`, and
+`assume_init` reads the nested field `_1.1.0`. -/
+
+def wMUUnitLayout : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .arbitrary [] [], variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+
+def wMDU32Layout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 },
+    backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 }),
+    fields := .arbitrary [{ bytes := 0 }] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [1] }
+
+def wMUU32Layout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false, fieldLayouts := [0, 2] }
+
+def wMULayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [wMUUnitLayout, wU32Layout, wMDU32Layout, wMUU32Layout] }
+
+def wMUUnitTy : Ty := { kind := .tuple [], layoutIdx := 0 }
+def wMUU32Ty : Ty := { kind := .uint .u32, layoutIdx := 1 }
+def wMDU32Ty : Ty :=
+  { kind := .adt "core::mem::manually_drop::ManuallyDrop" [.uint .u32], layoutIdx := 2 }
+def wMUTy : Ty :=
+  { kind := .adt "core::mem::maybe_uninit::MaybeUninit" [.uint .u32], layoutIdx := 3 }
+def wMUConstU32 (n : Nat) : Operand := .constant { ty := wMUU32Ty, val := .scalar (.int ⟨n, 4⟩) }
+
+/-- Anneal MIR body for `MaybeUninit<u32>` and `ManuallyDrop<u32>`
+(`_0: u32`, `_1: MaybeUninit<u32>`, `_2: ManuallyDrop<u32>`):
+* `bb0` (`MaybeUninit::new(42).assume_init()`):
+  `_2 = ManuallyDrop { value: 42_u32 }; _1 = MaybeUninit { value: move _2 };
+  _0 = copy ((_1.1: ManuallyDrop<u32>).0: u32); return`
+* `bb1` (`MaybeUninit::uninit().assume_init()`, UB):
+  `_1 = MaybeUninit { uninit: const () }; _0 = copy ((_1.1: ManuallyDrop<u32>).0: u32)`
+* `bb2` (`ManuallyDrop::into_inner(ManuallyDrop::new(7))`):
+  `_2 = ManuallyDrop { value: 7_u32 }; _0 = copy (_2.0: u32); return` -/
+def wMaybeUninitMir : CapturedMir where
+  defPath := "witness::maybe_uninit_manually_drop"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [
+    { mutability := .mut, ty := wMUU32Ty, debugName := none },
+    { mutability := .mut, ty := wMUTy, debugName := none },
+    { mutability := .mut, ty := wMDU32Ty, debugName := none }]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 2)
+          (.aggregate (.adt "core::mem::manually_drop::ManuallyDrop" 0 none) [wMUConstU32 42])),
+        mkStmt (.assign (local_ 1)
+          (.aggregate (.adt "core::mem::maybe_uninit::MaybeUninit" 0 (some 1)) [.move (local_ 2)])),
+        mkStmt (.assign (local_ 0) (.use (.copy ⟨1, [.field 1 wMDU32Ty, .field 0 wMUU32Ty]⟩)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 1)
+          (.aggregate (.adt "core::mem::maybe_uninit::MaybeUninit" 0 (some 0))
+            [.constant { ty := wMUUnitTy, val := .zeroSized }])),
+        mkStmt (.assign (local_ 0) (.use (.copy ⟨1, [.field 1 wMDU32Ty, .field 0 wMUU32Ty]⟩)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 2)
+          (.aggregate (.adt "core::mem::manually_drop::ManuallyDrop" 0 none) [wMUConstU32 7])),
+        mkStmt (.assign (local_ 0) (.use (.copy ⟨2, [.field 0 wMUU32Ty]⟩)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 0
+  layouts := wMULayouts
+  allocations := []
+
+def mrMDU32 : Gen.«Type» := mrManuallyDropTy (.Int u32) 4 4
+def mrMUU32 : Gen.«Type» := mrMaybeUninitTy (.Int u32) 4 4
+
+/-- The MiniRust lowering of `wMaybeUninitMir`: the struct aggregate is a
+`ValueExpr::Tuple`, and each union aggregate is `Deinit` plus a field
+assignment. -/
+def wMaybeUninitFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, mrMUU32), (localName 2, mrMDU32)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 1), .StorageLive (localName 2),
+      .Assign (.Local (localName 2)) (.Tuple [.Constant (.Int 42) (.Int u32)] mrMDU32),
+      .Deinit (.Local (localName 1)),
+      .Assign (.Field (.Local (localName 1)) 1) (.Load (.Local (localName 2))),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Field (.Local (localName 1)) 1) 0)),
+      .StorageDead (localName 2), .StorageDead (localName 1)], .Return, .Regular⟩),
+    (bbName 1, ⟨[
+      .StorageLive (localName 1),
+      .Deinit (.Local (localName 1)),
+      .Assign (.Field (.Local (localName 1)) 0) (.Tuple [] mrUnitTy),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Field (.Local (localName 1)) 1) 0))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .StorageLive (localName 2),
+      .Assign (.Local (localName 2)) (.Tuple [.Constant (.Int 7) (.Int u32)] mrMDU32),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 2)) 0)),
+      .StorageDead (localName 2)], .Return, .Regular⟩)]⟩
+  start := bbName 0
+  implicit_writes := true
+
+def wMUS0 (b : Nat) : MachineState :=
+  { (initMachineState wMaybeUninitMir []) with
+    frame := { blockIdx := b, stmtIdx := 0, locals := List.replicate 3 .uninit } }
+
+def wMUMach (b : Nat) : Mach :=
+  machine wMaybeUninitMir wMaybeUninitFn (wMUS0 b).frame.locals (bbName b)
+
+/-- **Witness (`MaybeUninit<u32>`: `new(42).assume_init()`, and
+`uninit().assume_init()` UB)**: In `bb0`, both Anneal and MiniRust
+(`Interp.steps 9`) return `42_u32` through the nested field `_1.1.0`. In
+`bb1`, reading `_1.1.0` after initializing only the `()` arm faults with `.ub`
+in both, in Anneal's second step and MiniRust's fourth. -/
+theorem maybeUninitU32_new_assume_init_and_uninit_ub_witness :
+    ReachesRet (mirTree wMaybeUninitMir (wMUS0 0)) []
+      (.normal (.scalar ⟨42, 4⟩, (wMUS0 0).memory)) ∧
+    (Interp.steps 9 (wMUMach 0)).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
+    (∃ s1, stepMirFn wMaybeUninitMir (wMUS0 1) = .step s1 ∧
+      stepMirFn wMaybeUninitMir s1 = .fail .ub) ∧
+    (Interp.steps 3 (wMUMach 1)).isOk = true ∧
+    Interp.steps 4 (wMUMach 1) =
+      .error (.ub "load at type but the data in memory violates the language invariant") :=
+  ⟨runA_sound wMaybeUninitMir 10 _ _ _ rfl, rfl, ⟨_, rfl, rfl⟩, rfl, rfl⟩
+
+/-- **Witness (`ManuallyDrop<u32>`)**: In `bb2`, both Anneal and MiniRust
+(`Interp.steps 5`) build `ManuallyDrop { value: 7 }` and return `7_u32` from its
+field. -/
+theorem manuallyDropU32_new_into_inner_witness :
+    ReachesRet (mirTree wMaybeUninitMir (wMUS0 2)) []
+      (.normal (.scalar ⟨7, 4⟩, (wMUS0 2).memory)) ∧
+    (Interp.steps 5 (wMUMach 2)).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 7 }, [1]) :=
+  ⟨runA_sound wMaybeUninitMir 10 _ _ _ rfl, rfl⟩
+
+/-! ### Re-aggregating an initialized union
+
+`_1 = PU { b: 0x01020304 }; _1 = PU { a: 0x55 }; _0 = copy (_1.2: u32)` reads
+the `u32` arm after the second aggregate has replaced the whole union: Anneal
+faults, because bytes `[1, 4)` are uninitialized again. MiniRust agrees only if
+the second aggregate is lowered with `Deinit`, as `ValueExpr::Union`'s value
+dictates; a bare field assignment keeps the stale bytes and returns
+`0x01020355`. -/
+
+/-- Anneal MIR body that re-aggregates the padded union `PU`. -/
+def wUnionReaggMir : CapturedMir where
+  defPath := "witness::union_reaggregate"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [wU32Decl, wPUDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 1) (.aggregate (.adt "PU" 0 (some 2)) [wConstU32 0x01020304])),
+        mkStmt (.assign (local_ 1) (.aggregate (.adt "PU" 0 (some 1)) [constU8 0x55])),
+        mkStmt (.assign (local_ 0) (.use (.copy ⟨1, [.field 2 wU32Ty]⟩)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 0
+  layouts := wUnionLayouts
+  allocations := []
+
+/-- The MiniRust lowering of `wUnionReaggMir`: with `deinit = true`, each union
+aggregate is `Deinit` plus a field assignment; with `deinit = false`, it is the
+bare field assignment. -/
+def wUnionReaggFn (deinit : Bool) : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, mrPU)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[(bbName 0, ⟨[.StorageLive (localName 1)] ++
+    (if deinit then [.Deinit (.Local (localName 1))] else []) ++
+    [.Assign (.Field (.Local (localName 1)) 2) (.Constant (.Int 0x01020304) (.Int u32))] ++
+    (if deinit then [.Deinit (.Local (localName 1))] else []) ++
+    [.Assign (.Field (.Local (localName 1)) 1) (.Constant (.Int 0x55) (.Int u8)),
+     .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 2)),
+     .StorageDead (localName 1)], .Return, .Regular⟩)]⟩
+  start := bbName 0
+  implicit_writes := true
+
+def wUnionReaggS0 : MachineState :=
+  { (initMachineState wUnionReaggMir []) with
+    frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] } }
+
+def wUnionReaggMach (deinit : Bool) : Mach :=
+  machine wUnionReaggMir (wUnionReaggFn deinit) wUnionReaggS0.frame.locals (bbName 0)
+
+/-- **Witness (union re-aggregation needs `Deinit`)**: Anneal faults on the
+third statement. The `Deinit` lowering faults in MiniRust too (step 6). The
+negative control without `Deinit` keeps the stale bytes `[1, 4)` and stores
+`0x01020355` into `_0` (step 6) instead of faulting. -/
+theorem union_reaggregate_needs_deinit_witness :
+    (∃ s1 s2, stepMirFn wUnionReaggMir wUnionReaggS0 = .step s1 ∧
+      stepMirFn wUnionReaggMir s1 = .step s2 ∧ stepMirFn wUnionReaggMir s2 = .fail .ub) ∧
+    Interp.steps 6 (wUnionReaggMach true) =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    (Interp.steps 6 (wUnionReaggMach false)).toOption.map
+        (fun m => m.mem.memory.allocations[1]?.map (·.data)) =
+      some (some (scalarBytes u32 0x01020355)) :=
+  ⟨⟨_, _, rfl, rfl, rfl⟩, rfl, rfl⟩
+
 /-! ## `TerminatorKind.assert` (`assert cond expected target unwind`) Witnesses
 
-This section provides kernel-checked witnesses for `TerminatorKind.assert`
-(`translateTerminatorAssert`, `assertTerminatorOk`, `step_terminator_assert_simulation`)
-covering:
-1. Passing `assert(cond == true)` and `assert(cond == false)` -> normal jump & return;
-2. Uninitialized `cond` -> 1-step `.ub` in both Anneal and MiniRust;
-3. Failing `assert` with `unwind = .cleanup cleanupBb` -> 1-step jump to `cleanupBb` in both;
-4. Failing `assert` with `unwind = .unreachable` -> `.ub` in Anneal and MiniRust;
-5. Failing `assert` with `unwind = .terminate` / `.continue_` -> `retUnwind` in Anneal and `.abort` in MiniRust. -/
+`translateFnWithAssert` computes `assertWitnessFn` from `assertWitnessMir`
+(`assertWitnessFn_eq`), and `assertWitnessFn` passes MiniRust's control-flow
+well-formedness check (`assertWitnessFn_wf`). The witnesses cover:
+1. passing `assert(cond == true)` and `assert(cond == false)`: a jump to the
+   success block and a return;
+2. an uninitialized `cond`: `.ub` in 1 step in both Anneal and MiniRust;
+3. a failing `assert` with `unwind = .cleanup 2`: a 1-step jump to `bb2` in both;
+4. a failing `assert` with `unwind = .unreachable`: `.ub` in both;
+5. a failing `assert` with `unwind = .terminate`: an abort in both;
+6. a failing `assert` with `unwind = .continue_` in the entry function: Anneal
+   unwinds out of its root frame (`.panic`), and MiniRust aborts, as
+   `mk_start_fn`'s unwind block does. -/
 
 /-- Anneal MIR body exercising `TerminatorKind.assert`:
 * `bb0`: `assert(copy _1 == true) -> [success: bb1, unwind: cleanup(bb2)]`
-* `bb1`: `_0 = const 42_u32; return` (normal success target)
-* `bb2`: `_0 = const 99_u32; return` (cleanup target)
-* `bb3`: `assert(copy _1 == true) -> [success: bb1, unwind: unreachable]` (`_1` uninit -> UB; or `_1 = false` -> unreachable UB)
-* `bb4`: `assert(copy _1 == false) -> [success: bb1, unwind: terminate]` (`expected = false`: passes when `_1 = false`, aborts when `_1 = true`) -/
+* `bb1`: `_0 = const 42_u32; return` (the success target)
+* `bb2`: `_0 = const 99_u32; return` (the cleanup target). rustc's MIR validator
+  rejects `return` in a cleanup block, but Anneal's semantics and the
+  translation accept it, and it makes the cleanup edge observable as a return
+  value.
+* `bb3`: `assert(copy _1 == true) -> [success: bb1, unwind: unreachable]`
+* `bb4`: `assert(copy _1 == false) -> [success: bb1, unwind: terminate]`
+* `bb5`: `assert(copy _1 == true) -> [success: bb1, unwind: continue]` -/
 def assertWitnessMir : CapturedMir where
   defPath := "witness::assert_terminator"
   phase := .runtimePostCleanup
@@ -15484,6 +15721,10 @@ def assertWitnessMir : CapturedMir where
     -- `bb4`: `assert(copy _1 == false) -> [success: bb1, unwind: terminate]`
     { statements := [],
       terminator := mkTerm (.assert (.copy (local_ 1)) false 1 .terminate),
+      isCleanup := false },
+    -- `bb5`: `assert(copy _1 == true) -> [success: bb1, unwind: continue]`
+    { statements := [],
+      terminator := mkTerm (.assert (.copy (local_ 1)) true 1 .continue_),
       isCleanup := false }]
   fnAbi := { args := [{ layout := wU8Layout, mode := .direct }],
              ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := true }
@@ -15496,12 +15737,16 @@ theorem assertWitness_terms_ok :
     assertTerminatorOk assertWitnessMir.layouts assertWitnessMir.localDecls
       assertWitnessMir.basicBlocks.length (assertWitnessMir.basicBlocks[3]'(by decide)).terminator = true ∧
     assertTerminatorOk assertWitnessMir.layouts assertWitnessMir.localDecls
-      assertWitnessMir.basicBlocks.length (assertWitnessMir.basicBlocks[4]'(by decide)).terminator = true :=
-  ⟨rfl, rfl, rfl⟩
+      assertWitnessMir.basicBlocks.length (assertWitnessMir.basicBlocks[4]'(by decide)).terminator = true ∧
+    assertTerminatorOk assertWitnessMir.layouts assertWitnessMir.localDecls
+      assertWitnessMir.basicBlocks.length (assertWitnessMir.basicBlocks[5]'(by decide)).terminator = true :=
+  ⟨rfl, rfl, rfl, rfl⟩
 
-/-- MiniRust function translated from `assertWitnessMir` via `translateTerminatorAssert`
-with `bbName 5` as the `.Unreachable` panic block and `bbName 6` as the `.Abort`
-terminate block. -/
+/-- The MiniRust function that `translateFnWithAssert` computes from
+`assertWitnessMir` (`assertWitnessFn_eq`). `bb6` is `initBlock`. The failure
+blocks of `bb3`, `bb4`, and `bb5` are the fresh blocks `bb8`, `bb10`, and
+`bb12`; `assertFailTarget` skips `bb7`, `bb9`, `bb11`, and `bb13`, the names
+`minimize` gives the `StartUnwind` blocks. -/
 def assertWitnessFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Bool)]⟩
   args := [localName 1]
@@ -15515,25 +15760,26 @@ def assertWitnessFn : Gen.Function where
     (bbName 2, ⟨[.Assign (.Local (localName 0)) (.Constant (.Int 99) (.Int u32))],
       .Return, .Regular⟩),
     (bbName 3, ⟨[], .Switch (assertDiscrExpr true (.Load (.Local (localName 1))))
-      ⟨[(1, bbName 1)]⟩ (bbName 5), .Regular⟩),
+      ⟨[(1, bbName 1)]⟩ (bbName 8), .Regular⟩),
     (bbName 4, ⟨[], .Switch (assertDiscrExpr false (.Load (.Local (localName 1))))
-      ⟨[(1, bbName 1)]⟩ (bbName 6), .Regular⟩),
-    (bbName 5, ⟨[], .Unreachable, .Regular⟩),
-    (bbName 6, ⟨[], abortTerminator, .Regular⟩)]⟩
-  start := bbName 0
+      ⟨[(1, bbName 1)]⟩ (bbName 10), .Regular⟩),
+    (bbName 5, ⟨[], .Switch (assertDiscrExpr true (.Load (.Local (localName 1))))
+      ⟨[(1, bbName 1)]⟩ (bbName 12), .Regular⟩),
+    (bbName 6, ⟨[], .Goto (bbName 0), .Regular⟩),
+    (bbName 8, ⟨[], .Unreachable, .Regular⟩),
+    (bbName 10, ⟨[], abortTerminator, .Regular⟩),
+    (bbName 12, ⟨[], abortTerminator, .Regular⟩)]⟩
+  start := bbName 6
   implicit_writes := true
 
-theorem assertWitness_translate_terms :
-    translateTerminatorAssert (bbName 5) assertWitnessMir.localDecls
-      (assertWitnessMir.basicBlocks[0]'(by decide)).terminator =
-      some (.Switch (assertDiscrExpr true (.Load (.Local (localName 1)))) ⟨[(1, bbName 1)]⟩ (bbName 2)) ∧
-    translateTerminatorAssert (bbName 5) assertWitnessMir.localDecls
-      (assertWitnessMir.basicBlocks[3]'(by decide)).terminator =
-      some (.Switch (assertDiscrExpr true (.Load (.Local (localName 1)))) ⟨[(1, bbName 1)]⟩ (bbName 5)) ∧
-    translateTerminatorAssert (bbName 6) assertWitnessMir.localDecls
-      (assertWitnessMir.basicBlocks[4]'(by decide)).terminator =
-      some (.Switch (assertDiscrExpr false (.Load (.Local (localName 1)))) ⟨[(1, bbName 1)]⟩ (bbName 6)) :=
-  ⟨rfl, rfl, rfl⟩
+/-- `assertWitnessFn` is the translation of `assertWitnessMir`, not a
+hand-written program. -/
+theorem assertWitnessFn_eq : translateFnWithAssert assertWitnessMir = some assertWitnessFn := rfl
+
+/-- `assertWitnessFn` is well formed: every `Switch` target has its source
+block's kind (all `Regular`), and the locals, blocks, and start block are
+consistent (`funcCfgWf`, MiniRust's `Function::check_wf` CFG clauses). -/
+theorem assertWitnessFn_wf : funcCfgWf assertWitnessFn = true := by decide
 
 def assertWitnessState (b : Nat) (locals : List LocalSlot) : MachineState :=
   { (initMachineState assertWitnessMir [.scalar ⟨1, 1⟩]) with
@@ -15607,5 +15853,20 @@ theorem assert_uninit_unreachable_and_terminate_witness :
     stepMirFn assertWitnessMir sTerm = .retOutcome .abort ∧
     Interp.steps 2 mTerm = .error .abort :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **Witness 4 (Failing `assert` with `unwind = .continue_` in the entry
+function)**: From `bb5` with `_1 = false` (`⟨0, 1⟩`), `assert(copy _1 == true)`
+fails. Anneal unwinds out of its root frame (`MirStepNode.retOutcome .panic`);
+MiniRust's `Switch` falls back to the fresh `build::abort()` block `bb12`, which
+stands for `mk_start_fn`'s unwind block, and aborts in its second step. -/
+theorem assert_fail_continue_witness :
+    let sCont := assertWitnessState 5 [.uninit, .init (.scalar ⟨0, 1⟩)]
+    let mCont := assertWitnessMach 5 [.uninit, .init (.scalar ⟨0, 1⟩)]
+    stepMirFn assertWitnessMir sCont = .retOutcome .panic ∧
+    (Interp.step mCont).toOption.map
+        (fun m => m.threads.map (fun t => t.stack.getLast?.map (·.next_block))) =
+      some [some (bbName 12)] ∧
+    Interp.steps 2 mCont = .error .abort :=
+  ⟨rfl, rfl, rfl⟩
 
 end MiniRustSpec.Correspondence.Witness

@@ -4342,12 +4342,16 @@ theorem lm24_padded_zst_overwrite_payload_retains_bytes_steps :
   all_goals with_unfolding_all rfl
 
 set_option maxRecDepth 200000 in
-/-- Kernel-checked 3-step execution of `bb3` in `lm24PUBody`:
+/-- Kernel-checked 3-step execution of `bb3` in `lm24PUBody` under
+`annealStepHooksLM2_4PaddedZst` (the pinned `annealStepHooksLM2_4` supports
+neither the `[(); 4]` aggregate nor the `ConstantIndex` read):
 1. `_1 = PU { z: copy _5 }` constructs `PU` via its `[(); 4]` ZST arm;
 2. `_7 = copy (_1.0[2 of 4]: ())` reads in-bounds ZST element `2 < 4`, succeeding
-   in both Anneal (`zstUnitVal`) and `lean-miri` (`Immediate.uninit`);
-3. `_7 = copy (_1.0[4 of 4]: ())` reads out-of-bounds element `4 ≥ 4`, faulting
-   with `.ub` in both Anneal and `lean-miri`. -/
+   in both Anneal (`zstUnitVal`) and `lean-miri` (the union's place at the
+   zero-sized `()` layout);
+3. `_7 = copy (_1.0[4 of 4]: ())` faults with `.ub` in both Anneal and
+   `lean-miri`. Its projection has `offset = min_length`, which rustc never
+   emits, so this step checks agreement on an ill-formed projection only. -/
 theorem lm24_padded_zst_elem_index_and_oob_ub_steps :
     let s₀ := lm24PUInitAnneal 3
     let s₁ := lm24PUAnnealState 3 1
@@ -4379,7 +4383,10 @@ set_option maxRecDepth 200000 in
 storage lifecycle (`bb5` in `lm24PUBody`):
 1. In `bb4`, `_1 = PU { b: 0x01020304_u32 }` initializes all 4 bytes of `_1`,
    and reading the uninhabited 0-byte field `_8 = copy (_1.3: VoidZst)` faults
-   with `.ub` in both Anneal and `lean-miri` (`tyIsUninhabited = true`);
+   with `.ub` in Anneal (`tyIsUninhabited = true`) and in `lean-miri` under
+   `annealStepHooksLM2_4PaddedZst`. The fault comes from that adapter's
+   `isUninhabitedEncodedTyId` check: the pinned `annealStepHooksLM2_4` accepts
+   the same read (`lm24_padded_zst_uninhabited_arm_base_adapter_accepts`);
 2. In `bb5`, `_1 = PU { z: copy _5 }`, `StorageDead(_1)`, and `StorageLive(_1)`
    step in lockstep (freeing `_1`'s 4-byte allocation and re-activating `_1` as
    an uninitialized immediate), after which `_6 = copy (_1.0: [(); 4])` on the
@@ -4447,5 +4454,21 @@ theorem lm24_padded_zst_uninhabited_arm_ub_and_lifecycle_steps :
     by with_unfolding_all rfl,
     miri_step_eq hooks m5₃ _ (by with_unfolding_all rfl),
     by with_unfolding_all rfl⟩
+
+/-- The pinned adapter `annealStepHooksLM2_4` accepts the read of the
+uninhabited field `_8 = copy (_1.3: VoidZst)` in `bb4`: it copies the 0-byte
+field without validation, and the step succeeds. Anneal faults there
+(`lm24_padded_zst_uninhabited_arm_ub_and_lifecycle_steps`), and so does rustc's
+validated typed copy, which rejects a value of a type without variants
+("zero-variant enum value" in the vendored `ValidityVisitor.lean`). The
+`lean-miri` fault in that witness therefore comes from
+`annealStepHooksLM2_4PaddedZst`'s `isUninhabitedEncodedTyId` check, not from
+the pinned adapter. -/
+theorem lm24_padded_zst_uninhabited_arm_base_adapter_accepts :
+    let hooks_base := annealStepHooksLM2_4 lm24PUBody.localDecls lm24PUBody.layouts
+    (Miri.Interpreter.Step.step hooks_base () (lm24PUInitMiri 4)).2 = .ok true ∧
+    (Miri.Interpreter.Step.step hooks_base ()
+        (Miri.Interpreter.Step.step hooks_base () (lm24PUInitMiri 4)).1).2 = .ok true :=
+  ⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩
 
 end LeanMiriSpec.Correspondence.Witness
