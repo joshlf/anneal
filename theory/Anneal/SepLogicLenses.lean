@@ -26798,10 +26798,14 @@ theorem length_eq {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     elems.length = wide.2 :=
   h.slice_typed.length_eq
 
+/-- The runtime fat pointer of an `UnsizedSliceDstAt` view decomposes into its data pointer
+`WidePtrVal.dataVal ptrBytes wide = .ptr wide.1 ptrBytes` and the logical element count
+`.scalar ⟨elems.length, ptrBytes⟩`. -/
 theorem ptr_eq {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
-    (_h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes) :
-    WidePtrVal.dataVal ptrBytes wide = .ptr wide.1 ptrBytes := rfl
+    (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes) :
+    fatVal = .aggregate 0 [WidePtrVal.dataVal ptrBytes wide, .scalar ⟨elems.length, ptrBytes⟩] := by
+  rw [h.fat_eq, h.length_eq]
 
 theorem meta_eq {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}

@@ -7521,7 +7521,8 @@ yielding `.scalar ⟨len, ptrBytes⟩`, thin pointers yielding `.unit`) into a l
 disjoint from `l` and `bindings` steps `PureMirExec.mirStep` and preserves
 `spatialPinnedBlockHolds` and `spatialBindingsHold` without unpinning, for `copy` or `move`
 operands that leave the pinned and bound locals untouched and under the trusted protector side
-condition. -/
+condition; the final conjunct transports fuel-free `MirWpConverges` across the step (as for every
+`*_preserves_spatialPin` lemma below). -/
 theorem mirStep_assign_ptrMetadata_preserves_spatialPin
     (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
     {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
@@ -7557,13 +7558,16 @@ theorem mirStep_assign_ptrMetadata_preserves_spatialPin
             (Trusted.Sequence.length ms.memory.callStack) } }
     PureMirExec.mirStep body ms = .cont ms' ∧
     spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
-    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
   intro ms'
-  obtain ⟨_, hMir, _, _⟩ := mirStep_assign_local hCur hPhase hBb hStmt
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_local hCur hPhase hBb hStmt
     (hMeta.evalRvalue_ptrMetadata hOp) hProt hSlot hLive hSet
-  exact ⟨hMir, spatialPin_and_bindings_of_assign_write tagOf .none
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
     (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
-    rfl rfl⟩
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
 
 /-- **`mirStep_assign_aggregate_rawPtr_preserves_spatialPin`**: executing
 `dstLoc = AggregateKind.rawPtr pointeeTy mutability [dataOp, metaOp]` (`ptr::from_raw_parts`)
@@ -7613,13 +7617,16 @@ theorem mirStep_assign_aggregate_rawPtr_preserves_spatialPin
             (Trusted.Sequence.length ms.memory.callStack) } }
     PureMirExec.mirStep body ms = .cont ms' ∧
     spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
-    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
   intro ms'
-  obtain ⟨_, hMir, _, _⟩ := mirStep_assign_aggregate_rawPtr_wide hCur hPhase hBb hStmt hWide
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_aggregate_rawPtr_wide hCur hPhase hBb hStmt hWide
     hData hMetaOp hProt hSlot hLive hSet
-  exact ⟨hMir, spatialPin_and_bindings_of_assign_write tagOf .none
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
     (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
-    rfl rfl⟩
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
 
 /-- **`mirStep_assign_layout_tuple_preserves_spatialPin`**: executing
 `dstLoc = (sizeOp, alignOp)` (`Layout::for_value(_raw)` tuple assembly) into a local `dstLoc`
@@ -7663,13 +7670,16 @@ theorem mirStep_assign_layout_tuple_preserves_spatialPin
             (Trusted.Sequence.length ms.memory.callStack) } }
     PureMirExec.mirStep body ms = .cont ms' ∧
     spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
-    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
   intro ms'
-  obtain ⟨_, hMir, _, _⟩ := mirStep_assign_layout_tuple hCur hPhase hBb hStmt hSize hAlign hProt
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_layout_tuple hCur hPhase hBb hStmt hSize hAlign hProt
     hSlot hLive hSet
-  exact ⟨hMir, spatialPin_and_bindings_of_assign_write tagOf .none
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
     (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
-    rfl rfl⟩
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
 
 /-- **`mirStep_call_sizeOfVal_slice_preserves_spatialPin`**: calling
 `core::intrinsics::size_of_val` on `.slice elemTy` into a destination local `dstLoc` disjoint
@@ -7721,12 +7731,16 @@ theorem mirStep_call_sizeOfVal_slice_preserves_spatialPin
           { local_ := dstLoc, projection := [] } }
     PureMirExec.mirStep body ms = .cont ms' ∧
     spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
-    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
   intro ms'
-  obtain ⟨_, hMir, _, _⟩ := mirStep_call_sizeOfVal_slice hCur hPhase hBb hEnd hTerm hCallee
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_call_sizeOfVal_slice hCur hPhase hBb hEnd hTerm hCallee
     hArg hNoOverride hPt hSz hLt hSlot hLive hSet
-  exact ⟨hMir, spatialPin_and_bindings_of_intrinsic_write tagOf hPin hBind hNePin hNeBind
-    hPinLoc hBindLoc hSet rfl⟩
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf (ms' := ms') hPin
+    hBind hNePin
+    hNeBind hPinLoc hBindLoc hSet rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
 
 /-- **`mirStep_call_sizeOfVal_str_preserves_spatialPin`**: calling
 `core::intrinsics::size_of_val` on `str` into a destination local `dstLoc` disjoint from `l` and
@@ -7776,12 +7790,16 @@ theorem mirStep_call_sizeOfVal_str_preserves_spatialPin
           { local_ := dstLoc, projection := [] } }
     PureMirExec.mirStep body ms = .cont ms' ∧
     spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
-    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
   intro ms'
-  obtain ⟨_, hMir, _, _⟩ := mirStep_call_sizeOfVal_str hCur hPhase hBb hEnd hTerm hCallee
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_call_sizeOfVal_str hCur hPhase hBb hEnd hTerm hCallee
     hArg hNoOverride hPt hLt hSlot hLive hSet
-  exact ⟨hMir, spatialPin_and_bindings_of_intrinsic_write tagOf hPin hBind hNePin hNeBind
-    hPinLoc hBindLoc hSet rfl⟩
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf (ms' := ms') hPin
+    hBind hNePin
+    hNeBind hPinLoc hBindLoc hSet rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
 
 /-- **`mirStep_call_alignOfVal_slice_preserves_spatialPin`**: calling
 `core::intrinsics::align_of_val` on `.slice elemTy` into a destination local `dstLoc` disjoint
@@ -7833,12 +7851,16 @@ theorem mirStep_call_alignOfVal_slice_preserves_spatialPin
           { local_ := dstLoc, projection := [] } }
     PureMirExec.mirStep body ms = .cont ms' ∧
     spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
-    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
   intro ms'
-  obtain ⟨_, hMir, _, _⟩ := mirStep_call_alignOfVal_slice hCur hPhase hBb hEnd hTerm hCallee
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_call_alignOfVal_slice hCur hPhase hBb hEnd hTerm hCallee
     hArg hNoOverride hPt hSz hAlign hLt hSlot hLive hSet
-  exact ⟨hMir, spatialPin_and_bindings_of_intrinsic_write tagOf hPin hBind hNePin hNeBind
-    hPinLoc hBindLoc hSet rfl⟩
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf (ms' := ms') hPin
+    hBind hNePin
+    hNeBind hPinLoc hBindLoc hSet rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
 
 /-- **`mirStep_call_alignOfVal_str_preserves_spatialPin`**: calling
 `core::intrinsics::align_of_val` on `str` into a destination local `dstLoc` disjoint from `l`
@@ -7888,12 +7910,16 @@ theorem mirStep_call_alignOfVal_str_preserves_spatialPin
           { local_ := dstLoc, projection := [] } }
     PureMirExec.mirStep body ms = .cont ms' ∧
     spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
-    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
   intro ms'
-  obtain ⟨_, hMir, _, _⟩ := mirStep_call_alignOfVal_str hCur hPhase hBb hEnd hTerm hCallee
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_call_alignOfVal_str hCur hPhase hBb hEnd hTerm hCallee
     hArg hNoOverride hPt hLt hSlot hLive hSet
-  exact ⟨hMir, spatialPin_and_bindings_of_intrinsic_write tagOf hPin hBind hNePin hNeBind
-    hPinLoc hBindLoc hSet rfl⟩
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf (ms' := ms') hPin
+    hBind hNePin
+    hNeBind hPinLoc hBindLoc hSet rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
 
 /-- **`mirLocalsRel_of_set?_preserved`**: `mirLocalsRel` is preserved across any write
 `Trusted.Sequence.set? locals_in dstLoc v = some ms'.frame.locals` whenever every unborrowed
@@ -7965,6 +7991,53 @@ theorem mirStateRel_and_spatialPin_of_intrinsic_write (tagOf : LoanId → Nat)
   obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf hPin hRel.1 hNePin
     hNeBind hPinLoc hBindLoc hSet hMem
   exact ⟨hPin', hBind', mirLocalsRel_of_set?_preserved tagOf hRel.2 hSet hUnb⟩
+
+/-- **`BlockCfg` compatibility for dynamic-layout intrinsic calls**: an intrinsic call terminator
+(`size_of_val` / `align_of_val` / ...) executed from block entry `bb` that writes its return value
+to a local `dstLoc` disjoint from the loan bindings and the unborrowed `PureLift` locals, and
+jumps to `mirBb nextBb`, realizes the `PureLift` block transition `.jump nextBb st` with an
+unchanged symbolic state: `mirCfgStateRel` is re-established at block entry `nextBb` in one
+`mirStep`, which is exactly the per-block segment obligation consumed by
+`mirCfg_forwardSim_of_waitFree`. -/
+theorem mirCfgStateRel_stepsTo_of_intrinsic_write (tagOf : LoanId → Nat) {body : CapturedMir}
+    {bindingsAt : Nat → List (LoanId × Local × SubPath)} {mirBb : Nat → BasicBlockIdx}
+    {extra : Nat → SymState StdVal → MachineState → Prop}
+    {wrap : FuncOut StdVal → Option (FuncOut StdVal)} {bb nextBb : Nat} {st : SymState StdVal}
+    {ms : MachineState} {locals' updatedLocals : List LocalSlot} {dstLoc : Local} {v : LocalSlot}
+    (hRel : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, bb, st, 0⟩ ms)
+    (hMir : PureMirExec.mirStep body ms = .cont
+      { frame := { ms.frame with blockIdx := mirBb nextBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] } })
+    (hBindNext : bindingsAt nextBb = bindingsAt bb)
+    (hNeBind : ∀ b, b ∈ bindingsAt bb → b.2.1 ≠ dstLoc)
+    (hBindLoc : ∀ b, b ∈ bindingsAt bb → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hUnb : ∀ (i : Nat) (c : PlaceCell StdVal),
+      st.locals[i]? = some c → getPathPerm [] c.perm = .unborrowed →
+      i + 1 ≠ dstLoc ∧ locals'[i + 1]? = ms.frame.locals[i + 1]?)
+    (hSet : Trusted.Sequence.set? locals' dstLoc v = some updatedLocals)
+    (hExtra : extra nextBb st
+      { frame := { ms.frame with blockIdx := mirBb nextBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] } }) :
+    PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+      (mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, nextBb, st, 0⟩) := by
+  unfold mirCfgStateRel mirStateRel at hRel
+  obtain ⟨hWrap, _, _, ⟨hBind, hLoc⟩, _⟩ := hRel
+  have hCaller : (invalidateDirectDestWriteBorrows ms.memory locals'
+      { local_ := dstLoc, projection := [] }).callerLocals = ms.memory.callerLocals :=
+    invalidateDirectDestWriteBorrows_callerLocals ms.memory locals' _
+  refine .step hMir (.refl ?_)
+  unfold mirCfgStateRel mirStateRel
+  refine ⟨hWrap, rfl, rfl, ⟨?_, ?_⟩, hExtra⟩
+  · show spatialBindingsHold (mirSpatialModel tagOf) (bindingsAt nextBb) st _
+    rw [hBindNext]
+    exact spatialBindingsHold_of_invalidateDirectDestWriteBorrows_ne tagOf locals' rfl
+      (bindingsAt bb) (fun _ _ => rfl) hNeBind
+      (fun b hb => placeValue?_of_lookupLocalSlot?_eq b.2.2
+        (lookupLocalSlot?_of_set?_ne (hBindLoc b hb) hSet hCaller (hNeBind b hb)))
+      hBind
+  · exact mirLocalsRel_of_set?_preserved tagOf hLoc hSet hUnb
 
 end WideSliceDstBridge
 

@@ -21380,6 +21380,144 @@ theorem mirStep_call_alignOfVal_slice_ptrSz_ne_ub {body cur : CapturedMir} {s : 
   exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
     rfl rfl rfl hFail
 
+/-! ### 5. `MirWpConverges` / `wpMirExecSym` Combinators, Provenance-Free Wide Pointers, and
+Remaining Fail-Closed Characterizations -/
+
+/-- **`mirWpConverges_of_stepMirFn_step`**: a silent trusted step `stepMirFn body s = .step s'`
+transports fuel-free `MirWpConverges` backwards from `s'` to `s` and shifts bounded symbolic
+`wpMirExecSym` fuel by exactly one, so every `stepMirFn` lifter in this section composes into
+`MirWpConverges` / `wpMirExecSym` obligations without evaluating `wpMirSym` by computation. -/
+theorem mirWpConverges_of_stepMirFn_step {body : CapturedMir} {s s' : MachineState}
+    (hStep : stepMirFn body s = MirStepNode.step s') :
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body s' post →
+      Anneal.MirFuelFree.MirWpConverges body s post) ∧
+    (∀ fuel post,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym (fuel + 1) body (.running s) post ↔
+        Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym fuel body (.running s') post) := by
+  refine ⟨fun post h => Anneal.MirFuelFree.MirWpConverges.step_tau hStep h, ?_⟩
+  intro fuel post
+  have key : ∀ (k : MirExecState → Prop) (post' : MirOutcome → Prop),
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTree k post'
+          (Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree body (.running s)) ↔
+        k (.running s') := by
+    intro k post'
+    rw [Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTree_eq,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree_eval,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalNodeWP_eq]
+    dsimp only [stepMirState]
+    rw [hStep]
+    exact Iff.rfl
+  exact key (fun st' => Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym fuel body st' post) post
+
+/-- **`evalRvalue_unaryOp_ptrMetadata_wide_scalarAddr`**: `Rvalue.unaryOp .ptrMetadata op` on a
+provenance-free wide pointer `.aggregate 0 [.scalar addrSc, .scalar metaSc]` (the trusted
+representation of `ptr::slice_from_raw_parts(ptr::null(), len)` /
+`NonNull::slice_from_raw_parts(NonNull::dangling(), len)`, whose data pointer is an integer
+address) returns the wrapped length `.scalar ⟨metaSc.bits mod 2^(8·ptrBytes), ptrBytes⟩` with
+`mem` unchanged, provided the operand is not statically typed as a non-wide aggregate. -/
+theorem evalRvalue_unaryOp_ptrMetadata_wide_scalarAddr (locals locals' : List LocalSlot)
+    (op : Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (addr len : Nat)
+    (hTy : isNonWidePtrAggregateTy (operandTy localDecls layouts op) = false)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes layouts⟩,
+          .scalar ⟨len, layoutPointerBytes layouts⟩]) locals') :
+    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
+      .ok (.scalar ⟨wrapScalarBits len (scalarModulus (layoutPointerBytes layouts)),
+        layoutPointerBytes layouts⟩) locals' mem := by
+  show evalUnaryPtrMetadata locals op mem localDecls layouts = _
+  unfold evalUnaryPtrMetadata
+  simp only [hOp, hTy, Nat.beq_refl, Bool.and_self]
+
+/-- **`evalRvalue_aggregate_rawPtr_wide_scalarAddr`**: `AggregateKind.rawPtr` on a non-`dyn`
+wide pointee (`[T]` / `str`) from a provenance-free integer address `.scalar ⟨addr, ptrBytes⟩`
+and length `.scalar ⟨len, ptrBytes⟩` (`ptr::slice_from_raw_parts(ptr::null(), len)`) assembles
+the wrapped provenance-free wide pointer with `mem` unchanged. -/
+theorem evalRvalue_aggregate_rawPtr_wide_scalarAddr (locals locals₁ locals₂ : List LocalSlot)
+    (pointeeTy : Ty) (mutability : Mutability) (dataOp metaOp : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (addr len : Nat)
+    (hWide : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hData : evalOperand locals dataOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.scalar ⟨addr, layoutPointerBytes layouts⟩) locals₁)
+    (hMeta : evalOperand locals₁ metaOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.scalar ⟨len, layoutPointerBytes layouts⟩) locals₂) :
+    evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]) mem
+      localDecls layouts =
+        .ok (.aggregate 0
+          [.scalar ⟨wrapScalarBits addr (scalarModulus (layoutPointerBytes layouts)),
+             layoutPointerBytes layouts⟩,
+           .scalar ⟨wrapScalarBits len (scalarModulus (layoutPointerBytes layouts)),
+             layoutPointerBytes layouts⟩]) locals₂ mem := by
+  show evalAggregateRawPtr locals pointeeTy [dataOp, metaOp] mem localDecls layouts = _
+  unfold evalAggregateRawPtr evalOperands
+  rw [hData]
+  dsimp only [evalOperands]
+  rw [hMeta]
+  dsimp only [evalOperands]
+  rw [hWide, Nat.beq_refl, Bool.and_self]
+
+/-- **Fail-closed (trusted limitation)**: `size_of_val` and `align_of_val` on `[T]` / `str` only
+accept wide pointers whose data component is a provenance-carrying `.ptr _ 8`; a provenance-free
+wide pointer `.aggregate 0 [.scalar addrSc, .scalar lenSc]` (e.g. a dangling empty slice built
+from `NonNull::dangling()`) faults with `MirStepNode.fail .ub` even for `len = 0`, although
+`UnOp.ptrMetadata` accepts it (`evalRvalue_unaryOp_ptrMetadata_wide_scalarAddr`). -/
+theorem evalNonSelectIntrinsicCall_unsized_scalarAddr_ub (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (dstTy : RigidTy) (addrSc lenSc : ScalarInt)
+    (hDstTy : (∃ elemTy, dstTy = .slice elemTy) ∨ dstTy = .str)
+    (hPt : resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps = some dstTy) :
+    evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts argOps
+        [.aggregate 0 [.scalar addrSc, .scalar lenSc]] locals' destination targetBb =
+      MirStepNode.fail .ub ∧
+    evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts argOps
+        [.aggregate 0 [.scalar addrSc, .scalar lenSc]] locals' destination targetBb =
+      MirStepNode.fail .ub := by
+  rcases hDstTy with ⟨elemTy, rfl⟩ | rfl <;>
+    refine ⟨?_, ?_⟩ <;> (unfold evalNonSelectIntrinsicCall; simp only [hPt])
+
+/-- **UB Characterization (`ptrSz ≠ 8` on `str`)**: a non-64-bit data pointer in a `&str` /
+`*const str` wide pointer faults with `.fail .ub` in both `size_of_val` and `align_of_val`. -/
+theorem evalNonSelectIntrinsicCall_str_ptrSz_ne_ub (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (p : ProvenancePtr) (ptrSz : Nat) (lenSc : ScalarInt)
+    (hPt : resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps = some .str)
+    (hNe : ptrSz ≠ 8) :
+    evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts argOps
+      [.aggregate 0 [.ptr p ptrSz, .scalar lenSc]] locals' destination targetBb =
+        MirStepNode.fail .ub ∧
+    evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts argOps
+      [.aggregate 0 [.ptr p ptrSz, .scalar lenSc]] locals' destination targetBb =
+        MirStepNode.fail .ub := by
+  have hBeq : Nat.beq ptrSz 8 = false := by
+    cases hb : Nat.beq ptrSz 8 with
+    | false => rfl
+    | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hb))
+  refine ⟨?_, ?_⟩ <;> (unfold evalNonSelectIntrinsicCall; simp only [hPt, hBeq])
+
+/-- Negative: `AggregateKind.rawPtr` on a non-`dyn` wide pointee (`[T]` / `str`) with
+vtable-pointer metadata `.ptr vtPtr vtSz` (non-scalar metadata) fails closed with `.ub`. -/
+theorem evalRvalue_aggregate_rawPtr_wide_vtableMeta_ub (locals locals₁ locals₂ : List LocalSlot)
+    (pointeeTy : Ty) (mutability : Mutability) (dataOp metaOp : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (p vtPtr : ProvenancePtr) (ptrSz vtSz : Nat)
+    (hWide : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hData : evalOperand locals dataOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.ptr p ptrSz) locals₁)
+    (hMeta : evalOperand locals₁ metaOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok (.ptr vtPtr vtSz) locals₂) :
+    evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]) mem
+      localDecls layouts = .ub := by
+  show evalAggregateRawPtr locals pointeeTy [dataOp, metaOp] mem localDecls layouts = _
+  unfold evalAggregateRawPtr evalOperands
+  rw [hData]
+  dsimp only [evalOperands]
+  rw [hMeta]
+  dsimp only [evalOperands]
+  rw [hWide]
+
 end UnsizedDstMetadataLifters
 
 end Anneal.MirLiftCore
