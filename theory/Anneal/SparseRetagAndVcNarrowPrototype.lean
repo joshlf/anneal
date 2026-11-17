@@ -47,11 +47,15 @@ Anneal's real `Trusted.Rustc.V2026_06_01` and `Anneal.MirLiftCore` types with ze
   theorems: `runMirExecBounded_narrow_of_batchedCert`, `wpMirExecSym_narrow_of_batchedCert`, and
   `vcMirWithCallees_narrow_of_batchedCert` over a contract-aware WP (`wpMirExecExt`) in which cone
   summaries genuinely restrict external-call answers (`canary_externalSummary_vc`). Cone filtering
-  is conservative for every execution (`wpMirExecExt_mono_cone`) and lossless both per step
-  (`stepMirFn_extCallInCone`, `stepMirFn_extCallSafe`, with cone safety surviving
-  `resumeExternalCall`, `resumeExternalDivergingCall`, and `resumeExternalTailCall` for
-  code-frame-preserving answers) and across whole executions (`wpMirExecExt_cone_iff_unfiltered_of_summarized`
-  and `wpMirExecExtCF_cone_iff_unfiltered`). A symbolic VC over the whole non-overflowing `u32` input range
+  is conservative for every execution (`wpMirExecExt_mono_cone`). It is lossless per step
+  (`stepMirFn_extCallInCone`, `stepMirFn_extCallSafe`: cone safety survives `resumeExternalCall`,
+  `resumeExternalDivergingCall`, and `resumeExternalTailCall` for code-frame-preserving answers).
+  Whole-execution losslessness is proved for the standard WP only when every cone path is
+  summarized, which admissibility restricts to all-external cones
+  (`wpMirExecExt_cone_iff_unfiltered_of_summarized`, `summarizedCone_has_no_internal_body`). For the
+  code-frame WP `wpMirExecExtCF` it is proved in general (`wpMirExecExtCF_cone_iff_unfiltered`). That WP
+  is weaker than the standard one (`wpMirExecExt_imp_wpMirExecExtCF`) and has no narrowing theorem.
+  A symbolic VC over the whole non-overflowing `u32` input range
   (`symTrait_vc_narrow_of_lt`) and its overflow canary exercise the narrowing on symbolic inputs.
   `coerceValueAt` is sealed (`@[irreducible]`) with targeted rewrite lemmas.
 * **Part C (`DemandCallerLocationEnv`, `proofs-rs/lean-miri` PR #67 Schema 15)**: demand-time
@@ -6423,12 +6427,37 @@ def StateClosedInvPoly (cone : List DefPath) (root : CapturedMir)
   | .running s => ClosedInvPoly cone root c₁ ti₁ s
   | _ => True
 
-/-- **Whole-Execution Lossless Cone Filtering for Summarized Cone Externals
-(`wpMirExecExt_cone_iff_unfiltered_of_summarized`)**:
-Whenever `root` and `c₁` are cone-closed, every external `dp ∈ cone` has a summary in `extEnv`, and
-every summary contract implies `AnsPreservesCodeFrame`, cone-filtered `wpMirExecExt` is logically
-equivalent (`↔`) to unfiltered `wpMirExecExtUnfiltered` across **all** `fuel` steps (regardless of
-any out-of-cone summaries in `extEnv`)! -/
+/-- **Limitation of `wpMirExecExt_cone_iff_unfiltered_of_summarized`
+(`summarizedCone_has_no_internal_body`)**: if every path of `cone` has a summary in `extEnv`
+(that theorem's `h_sum`) and no summary shadows a linked body (`UntrustedAdmissible`, a field of
+every `BatchedVcConeNarrowCert`), then no path of `cone` has a linked body. So the standard-WP
+losslessness theorem applies only to cones made entirely of external paths, never to the call cone
+of a program that calls an internal function (`test_partB_summarized_lossless_inapplicable`). -/
+theorem summarizedCone_has_no_internal_body {cone : List DefPath} {callees : List CapturedMir}
+    {extEnv : ExternalSummaryEnv}
+    (h_adm : ∀ s ∈ extEnv, findCallee? callees s.defPath = none)
+    (h_sum : ∀ dp ∈ cone, (findExternalSummary? extEnv dp).isSome = true) :
+    ∀ dp ∈ cone, findCallee? callees dp = none := by
+  intro dp hdp
+  have hs := h_sum dp hdp
+  unfold findExternalSummary? at hs
+  cases hf : extEnv.find? (fun s => stringEq s.defPath dp) with
+  | none =>
+    rw [hf] at hs
+    nomatch hs
+  | some sm =>
+    have h1 := List.find?_some hf
+    have heq : sm.defPath = dp := coneStringEq_iff.mp h1
+    rw [← heq]
+    exact h_adm sm (List.mem_of_find?_eq_some hf)
+
+/-- **Whole-Execution Lossless Cone Filtering when every cone path is summarized
+(`wpMirExecExt_cone_iff_unfiltered_of_summarized`)**: if `root` and `c₁` are cone-closed, *every*
+`dp ∈ cone` (internal or external) has a summary in `extEnv` (`h_sum`), and every summary contract
+implies `AnsPreservesCodeFrame`, then cone-filtered `wpMirExecExt` is equivalent (`↔`) to unfiltered
+`wpMirExecExtUnfiltered` for all `fuel` (out-of-cone summaries in `extEnv` are irrelevant). Because
+admissible summaries never cover linked bodies, `h_sum` forces the cone to be all-external
+(`summarizedCone_has_no_internal_body`). -/
 theorem wpMirExecExt_cone_iff_unfiltered_of_summarized {cone : List DefPath} {root : CapturedMir}
     {c₁ : CalleeEnv} {ti₁ : List TraitImplEntry} (contracts : ExternalContractInterp)
     (extEnv : ExternalSummaryEnv) (post : MirOutcome → Prop)
@@ -6636,19 +6665,52 @@ theorem wpMirExecExtCF_cone_iff_unfiltered {cone : List DefPath} {root : Capture
         | none =>
           exact forall_congr' (fun ans => imp_congr_right (fun hans => h_ans_iff ans hans))
 
-/-- Verification condition with code-frame-preserving external calls (`vcMirWithCalleesCF`). -/
-def vcMirWithCalleesCF (contracts : ExternalContractInterp) (fuel : Nat) (rootBody : CapturedMir)
-    (s : MachineState) (callees : List CapturedMir) (traitImpls : List TraitImplEntry)
-    (extEnv : ExternalSummaryEnv) (cone : List DefPath) (post : MirOutcome → Prop) : Prop :=
-  wpMirExecExtCF contracts cone extEnv fuel rootBody
-    (.running (MachineState.mapMem (Memory.withCalleesAndTraits callees traitImpls) s)) post
+/-- **The standard WP implies the code-frame WP (`wpMirExecExt_imp_wpMirExecExtCF`)**:
+`wpMirExecExtCF` only removes answers from the quantifiers (it keeps the answers satisfying
+`AnsPreservesCodeFrame`), so every VC proved with `wpMirExecExt` also holds for `wpMirExecExtCF`.
+The converse fails in general: a VC proved only with `wpMirExecExtCF` says nothing about runs in
+which external code replaces `callees`, `traitImpls`, `activeCallee`, or caller bodies. It is sound for
+real executions only under that assumption about external code. -/
+theorem wpMirExecExt_imp_wpMirExecExtCF (contracts : ExternalContractInterp)
+    (cone : List DefPath) (extEnv : ExternalSummaryEnv) (body : CapturedMir)
+    (post : MirOutcome → Prop) :
+    ∀ (fuel : Nat) (st : MirExecState),
+      wpMirExecExt contracts cone extEnv fuel body st post →
+        wpMirExecExtCF contracts cone extEnv fuel body st post
+  | 0, _, h => h
+  | fuel + 1, st, h => by
+    change evalNodeWPExt contracts cone extEnv _ post (stepMirState body st) at h
+    show evalNodeWPExtCF contracts cone extEnv _ post (stepMirState body st)
+    revert h
+    cases stepMirState body st with
+    | ret out => exact id
+    | tau st' => exact wpMirExecExt_imp_wpMirExecExtCF contracts cone extEnv body post fuel st'
+    | vis e k =>
+      rcases e with fk | obs | ⟨req⟩
+      · exact id
+      · exact wpMirExecExt_imp_wpMirExecExtCF contracts cone extEnv body post fuel (k PUnit.unit)
+      · cases req with | call req => ?_
+        have ih := wpMirExecExt_imp_wpMirExecExtCF contracts cone extEnv body post fuel
+        show (match coneSummary? cone extEnv req.defPath with
+          | some s => ∀ ans, contracts s.summaryTag req ans →
+              wpMirExecExt contracts cone extEnv fuel body (k ans) post
+          | none => ∀ ans, wpMirExecExt contracts cone extEnv fuel body (k ans) post) →
+          (match coneSummary? cone extEnv req.defPath with
+          | some s => ∀ ans, AnsPreservesCodeFrame req.memory ans → contracts s.summaryTag req ans →
+              wpMirExecExtCF contracts cone extEnv fuel body (k ans) post
+          | none => ∀ ans, AnsPreservesCodeFrame req.memory ans →
+              wpMirExecExtCF contracts cone extEnv fuel body (k ans) post)
+        cases coneSummary? cone extEnv req.defPath with
+        | some _ => exact fun h ans _ hc => ih (k ans) (h ans hc)
+        | none => exact fun h ans _ => ih (k ans) (h ans)
 
-/-- **Whole-Execution Unfiltered Narrowing Theorem (`vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert`)**:
-Combines `BatchedVcConeNarrowCert` with `wpMirExecExtCF_cone_iff_unfiltered`: under a valid
-`BatchedVcConeNarrowCert`, the narrowed cone-filtered `vcMirWithCalleesCF` on
-`(narrowCallees, extra₂, narrowExt)` is equivalent (`↔`) to the **unfiltered**
-`wpMirExecExtCFUnfiltered` on the full `(fullCallees, extra₁, fullExt)` environment! -/
-theorem vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert {cone : List DefPath}
+/-- **Cone filtering in the code-frame WP at a certified entry state
+(`wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert`)**: `wpMirExecExtCF_cone_iff_unfiltered`
+instantiated at the entry state of a `BatchedVcConeNarrowCert` (the certificate supplies the cone
+closure). This is about the *full* callee table only. No narrowing theorem for `wpMirExecExtCF` is
+proved: in a narrowed run, `AnsPreservesCodeFrame` refers to the narrowed callee table, so the
+narrowed and full code-frame WPs quantify over different answers. -/
+theorem wpMirExecExtCF_entry_cone_iff_unfiltered_of_batchedCert {cone : List DefPath}
     {rootBody : CapturedMir} {fullCallees narrowCallees : List CapturedMir}
     {extra₁ extra₂ : List TraitImplEntry} {fullExt narrowExt : ExternalSummaryEnv}
     (h_cert : BatchedVcConeNarrowCert cone rootBody fullCallees narrowCallees
