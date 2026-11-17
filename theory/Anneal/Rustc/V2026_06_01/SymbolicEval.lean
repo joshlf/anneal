@@ -11668,6 +11668,116 @@ theorem diamondMergePlan_spec {cfg : MirCfg} {hints : JoinHints} {thenBb elseBb 
     · cases h
   · cases h
 
+/-- Triangle plan with the arm on the `then` side: the `then` successor is an arm block ending in
+    `goto elseBb`, and the `else` successor **is** the (hinted) join block. -/
+def triangleThenPlan (cfg : MirCfg) (hints : JoinHints) (thenBb elseBb : BlockId) :
+    Option (List MirStmt × List MirStmt × BlockId × List Bool) :=
+  match cfg.blocks[thenBb]? with
+  | some tBlk =>
+    match armGoto? tBlk with
+    | some j =>
+      if j = elseBb then
+        match hints elseBb with
+        | some mask => some (tBlk.stmts, [], elseBb, mask)
+        | none => none
+      else none
+    | none => none
+  | none => none
+
+/-- Triangle plan with the arm on the `else` side: the `else` successor is an arm block ending in
+    `goto thenBb`, and the `then` successor **is** the (hinted) join block. -/
+def triangleElsePlan (cfg : MirCfg) (hints : JoinHints) (thenBb elseBb : BlockId) :
+    Option (List MirStmt × List MirStmt × BlockId × List Bool) :=
+  match cfg.blocks[elseBb]? with
+  | some eBlk =>
+    match armGoto? eBlk with
+    | some j =>
+      if j = thenBb then
+        match hints thenBb with
+        | some mask => some ([], eBlk.stmts, thenBb, mask)
+        | none => none
+      else none
+    | none => none
+  | none => none
+
+/-- Triangle merge plan (`if c { arm }` without `else`, the shape post-`SimplifyCfg` MIR gives every
+    `if` without `else` and most sequential bounds/bit-validity fix-ups): returns
+    `(thenStmts, elseStmts, joinBb, mask)` with `[]` on the side that jumps straight to the join, so
+    `symExecDiamondJoin` / `wpJoinBlock_sound` apply unchanged and the join is evaluated once. -/
+def triangleMergePlan (cfg : MirCfg) (hints : JoinHints) (thenBb elseBb : BlockId) :
+    Option (List MirStmt × List MirStmt × BlockId × List Bool) :=
+  match triangleThenPlan cfg hints thenBb elseBb with
+  | some plan => some plan
+  | none => triangleElsePlan cfg hints thenBb elseBb
+
+theorem triangleThenPlan_spec {cfg : MirCfg} {hints : JoinHints} {thenBb elseBb joinBb : BlockId}
+    {thenStmts elseStmts : List MirStmt} {mask : List Bool}
+    (h : triangleThenPlan cfg hints thenBb elseBb = some (thenStmts, elseStmts, joinBb, mask)) :
+    ∃ tBlk, cfg.blocks[thenBb]? = some tBlk ∧ tBlk.stmts = thenStmts ∧
+      tBlk.term = .goto joinBb ∧ elseBb = joinBb ∧ elseStmts = [] := by
+  unfold triangleThenPlan at h
+  split at h
+  · rename_i tBlk hT
+    split at h
+    · rename_i j hj
+      split at h
+      · rename_i hjE
+        subst hjE
+        split at h
+        · injection h with h1
+          injection h1 with hS1 h2
+          injection h2 with hS2 h3
+          injection h3 with hJ _
+          subst hS1 hS2 hJ
+          exact ⟨tBlk, hT, rfl, armGoto?_spec hj, rfl, rfl⟩
+        · cases h
+      · cases h
+    · cases h
+  · cases h
+
+theorem triangleElsePlan_spec {cfg : MirCfg} {hints : JoinHints} {thenBb elseBb joinBb : BlockId}
+    {thenStmts elseStmts : List MirStmt} {mask : List Bool}
+    (h : triangleElsePlan cfg hints thenBb elseBb = some (thenStmts, elseStmts, joinBb, mask)) :
+    ∃ eBlk, cfg.blocks[elseBb]? = some eBlk ∧ eBlk.stmts = elseStmts ∧
+      eBlk.term = .goto joinBb ∧ thenBb = joinBb ∧ thenStmts = [] := by
+  unfold triangleElsePlan at h
+  split at h
+  · rename_i eBlk hE
+    split at h
+    · rename_i j hj
+      split at h
+      · rename_i hjT
+        subst hjT
+        split at h
+        · injection h with h1
+          injection h1 with hS1 h2
+          injection h2 with hS2 h3
+          injection h3 with hJ _
+          subst hS1 hS2 hJ
+          exact ⟨eBlk, hE, rfl, armGoto?_spec hj, rfl, rfl⟩
+        · cases h
+      · cases h
+    · cases h
+  · cases h
+
+theorem triangleMergePlan_spec {cfg : MirCfg} {hints : JoinHints} {thenBb elseBb joinBb : BlockId}
+    {thenStmts elseStmts : List MirStmt} {mask : List Bool}
+    (h : triangleMergePlan cfg hints thenBb elseBb = some (thenStmts, elseStmts, joinBb, mask)) :
+    (∃ tBlk, cfg.blocks[thenBb]? = some tBlk ∧ tBlk.stmts = thenStmts ∧
+        tBlk.term = .goto joinBb ∧ elseBb = joinBb ∧ elseStmts = []) ∨
+      (∃ eBlk, cfg.blocks[elseBb]? = some eBlk ∧ eBlk.stmts = elseStmts ∧
+        eBlk.term = .goto joinBb ∧ thenBb = joinBb ∧ thenStmts = []) := by
+  unfold triangleMergePlan at h
+  cases hT : triangleThenPlan cfg hints thenBb elseBb with
+  | some plan =>
+    rw [hT] at h
+    injection h with hEq
+    subst hEq
+    exact Or.inl (triangleThenPlan_spec hT)
+  | none =>
+    rw [hT] at h
+    exact Or.inr (triangleElsePlan_spec h)
+
 /-- Execute both diamond arms symbolically from `(st, tbl)` under their respective branch
     path conditions (`some (condId, true)` for `thenStmts`, `some (condId, false)` for
     `elseStmts`), prune both post-states with the (untrusted) join mask, and merge them into
@@ -11807,12 +11917,63 @@ theorem combineSplit_eq_some {resT : Option (List SymId × SymTable)}
       subst hR hTb
       exact ⟨retsT, tblT, retsF, rfl, hF, rfl⟩
 
+/-- One spare unit of fuel never changes a **returning** mask-free concrete execution (fuel only
+    bounds the number of executed blocks). Used for the direct side of a merged triangle, whose
+    concrete path reaches the join one block earlier than the arm side. -/
+theorem execCfg_ret_succ (cfg : MirCfg) :
+    ∀ (fuel : Nat) (bb : BlockId) (st : CanonState Nat) (v : Nat),
+      execCfg cfg fuel bb st = .ret v → execCfg cfg (fuel + 1) bb st = .ret v
+  | 0, _, _, _, h => by cases h
+  | fuel + 1, bb, st, v, h => by
+    rw [execCfg] at h ⊢
+    cases hBlk : cfg.blocks[bb]? with
+    | none => rw [hBlk] at h; cases h
+    | some blk =>
+      rw [hBlk] at h
+      dsimp only at h ⊢
+      cases hS : execStmts st blk.stmts with
+      | none => rw [hS] at h; cases h
+      | some st₁ =>
+        rw [hS] at h
+        dsimp only at h ⊢
+        cases hT : blk.term with
+        | goto t =>
+          rw [hT] at h
+          exact execCfg_ret_succ cfg fuel t st₁ v h
+        | switchInt d t e =>
+          rw [hT] at h
+          dsimp only at h ⊢
+          cases hR : readConcreteScalar st₁ d with
+          | none => rw [hR] at h; cases h
+          | some w =>
+            rw [hR] at h
+            dsimp only at h ⊢
+            cases hW : (w != 0) with
+            | true =>
+              rw [hW, ite_eq_left rfl] at h
+              rw [ite_eq_left rfl]
+              exact execCfg_ret_succ cfg fuel t _ v h
+            | false =>
+              rw [hW, ite_eq_right Bool.false_ne_true] at h
+              rw [ite_eq_right Bool.false_ne_true]
+              exact execCfg_ret_succ cfg fuel e _ v h
+        | ret r =>
+          rw [hT] at h
+          exact h
+        | unreachable =>
+          rw [hT] at h
+          cases h
+
 /-- Single-continuation compositional symbolic GVN evaluator for multi-block `MirCfg`s.
     Returns the list of returned `SymId`s (one per explored path) in the final append-only
     table. At a symbolic `switchInt` whose arms form a diamond with a hinted join block, both
     arms are executed, pruned with the join mask (`joinCanon`), merged (`mergeJoinStates`,
     GVN + `ite c v v ↦ v`), and the join continuation is evaluated **once** (consuming one
-    extra unit of fuel for the arm block, exactly as the concrete execution does). Without a
+    extra unit of fuel for the arm block, exactly as the concrete execution does). A hinted
+    **triangle** (`if c { arm }` without `else`: one successor is an arm block ending in `goto j`
+    and the other successor is `j` itself, the shape post-`SimplifyCfg` MIR gives every
+    `if` without `else`) is merged the same way with an empty statement list on the direct side
+    (whose concrete path reaches `j` with one spare unit of fuel, `execCfg_ret_succ`). Without a
     hint it path-splits. CPS spine forcing (`forceCanonState`) is applied at every block. -/
 def symEvalCfgGvn (cfg : MirCfg) (hints : JoinHints) :
     Nat → BlockId → CanonState SymId → SymTable → (pc : PathCond := none) →
@@ -11847,8 +12008,17 @@ def symEvalCfgGvn (cfg : MirCfg) (hints : JoinHints) :
                   | none => none
                   | some (stM, tblM) => symEvalCfgGvn cfg hints f joinBb stM tblM pc
               | none =>
-                combineSplit (symEvalCfgGvn cfg hints fuel thenBb st₂ tbl₁ (some (condId, true)))
-                  (fun tblT => symEvalCfgGvn cfg hints fuel elseBb st₂ tblT (some (condId, false)))
+                match triangleMergePlan cfg hints thenBb elseBb with
+                | some (thenStmts, elseStmts, joinBb, mask) =>
+                  match fuel with
+                  | 0 => none
+                  | f + 1 =>
+                    match symExecDiamondJoin st₂ tbl₁ condId thenStmts elseStmts mask with
+                    | none => none
+                    | some (stM, tblM) => symEvalCfgGvn cfg hints f joinBb stM tblM pc
+                | none =>
+                  combineSplit (symEvalCfgGvn cfg hints fuel thenBb st₂ tbl₁ (some (condId, true)))
+                    (fun tblT => symEvalCfgGvn cfg hints fuel elseBb st₂ tblT (some (condId, false)))
         | .ret retLoc =>
           match readSymScalar st₁ retLoc with
           | some retSymId => some ([retSymId], tbl₁)
@@ -12045,7 +12215,77 @@ theorem symEvalCfgGvn_under_sound (cfg : MirCfg) (hints : JoinHints) :
               cases hPlan : diamondMergePlan cfg hints thenBb elseBb with
               | none =>
                 rw [hPlan] at hEval
-                exact hSplitCase hEval
+                dsimp only at hEval
+                cases hTri : triangleMergePlan cfg hints thenBb elseBb with
+                | none =>
+                  rw [hTri] at hEval
+                  exact hSplitCase hEval
+                | some plan =>
+                  rcases plan with ⟨thenStmts, elseStmts, joinBb, mask⟩
+                  rw [hTri] at hEval
+                  cases fuel with
+                  | zero => cases hEval
+                  | succ f =>
+                    dsimp only at hEval
+                    cases hJoin : symExecDiamondJoin (st₁.ownerReadLoc discr) tbl₁ condId
+                        thenStmts elseStmts mask with
+                    | none => rw [hJoin] at hEval; cases hEval
+                    | some pM =>
+                      rcases pM with ⟨stM, tblM⟩
+                      rw [hJoin] at hEval
+                      dsimp only at hEval
+                      rcases wpJoinBlock_sound hValid₁ hSt₂ hCondLt hJoin with
+                        ⟨hVM, hEM, hStM, hJoinC⟩
+                      have hPcValidM : PathCondValid tblM.nodes.length pc :=
+                        hPcValid₁.mono hEM.length_le
+                      rcases symEvalCfgGvn_under_sound cfg hints f joinBb stM tblM pc rets tbl'
+                        hVM hStM hPcValidM hEval with ⟨hV', hE', hLt', hEv'⟩
+                      refine ⟨hV', (hExt₁.trans hEM).trans hE', hLt', ?_⟩
+                      intro env cst hPc hR
+                      rcases hPrefix env cst hPc hR with ⟨c₁, hC₁, hR₁, hPc₁⟩
+                      rcases hJoinC env (c₁.ownerReadLoc discr) (hR₂ env c₁ hR₁) with
+                        ⟨c₂, hC₂, hR₂'⟩
+                      have hPcM : PathCondHolds tblM env pc :=
+                        PathCondHolds.mono hValid₁ hEM hPcValid₁ hPc₁
+                      rcases hEv' env c₂ hPcM hR₂' with ⟨r, hr, hExec⟩
+                      refine ⟨r, hr, ?_⟩
+                      rw [hStepC env cst c₁ hC₁ hR₁]
+                      rcases triangleMergePlan_spec hTri with
+                        ⟨tBlk, hTB, hTS, hTT, hEJ, hES⟩ | ⟨eBlk, hEB, hES, hET, hTJ, hTS⟩
+                      · -- Arm on the `then` side; the `else` successor is the join itself.
+                        cases hB : (evalSymId tbl₁ env condId != 0) with
+                        | true =>
+                          rw [hB, ite_eq_left rfl] at hC₂
+                          rw [ite_eq_left rfl]
+                          dsimp only [execCfg]
+                          rw [hTB]
+                          dsimp only
+                          rw [hTS, hC₂]
+                          dsimp only
+                          rw [hTT]
+                          exact hExec
+                        | false =>
+                          rw [hB, ite_eq_right Bool.false_ne_true, hES] at hC₂
+                          have hc : c₁.ownerReadLoc discr = c₂ := Option.some.inj hC₂
+                          rw [ite_eq_right Bool.false_ne_true, hEJ, hc]
+                          exact execCfg_ret_succ cfg f joinBb c₂ _ hExec
+                      · -- Arm on the `else` side; the `then` successor is the join itself.
+                        cases hB : (evalSymId tbl₁ env condId != 0) with
+                        | true =>
+                          rw [hB, ite_eq_left rfl, hTS] at hC₂
+                          have hc : c₁.ownerReadLoc discr = c₂ := Option.some.inj hC₂
+                          rw [ite_eq_left rfl, hTJ, hc]
+                          exact execCfg_ret_succ cfg f joinBb c₂ _ hExec
+                        | false =>
+                          rw [hB, ite_eq_right Bool.false_ne_true] at hC₂
+                          rw [ite_eq_right Bool.false_ne_true]
+                          dsimp only [execCfg]
+                          rw [hEB]
+                          dsimp only
+                          rw [hES, hC₂]
+                          dsimp only
+                          rw [hET]
+                          exact hExec
               | some plan =>
                 rcases plan with ⟨thenStmts, elseStmts, joinBb, mask⟩
                 rw [hPlan] at hEval
@@ -12328,6 +12568,78 @@ theorem diamond6_cfg_concrete_sound (env : SymEnv) :
     execCfg (mkDiamondCfg 6) 13 0 (evalSymCanonState diamondInitSymTable env diamondInitSymState) =
       .ret ((buildDiamondTree 6).eval env) :=
   checkCfgAgainstTree_sound diamond6_verified_rfl diamondInitSymTable_valid
+    diamondInitSymState_valid env _ (StateRefines.refl _)
+
+/-- Triangle `i` of the `if`-without-`else` benchmark CFG (blocks `2i`, `2i+1`, joining at `2i+2`),
+    the shape post-`SimplifyCfg` MIR gives `if c { … }` (no empty `else` block survives):
+    - head `2i`: `switchInt _1 → 2i+1 | 2i+2` — the `else` successor **is** the join block,
+    - arm `2i+1`: `StorageLive(_2); _2 := xor(_0, i+1); _0 := _2 + _2; goto 2i+2` (the temporary
+      `_2` is left **live**, so only join-point pruning lets the two incoming states merge). -/
+def mkTriangleBlocks (i : Nat) : List MirBlock :=
+  [ { stmts := [], term := .switchInt 1 (2 * i + 1) (2 * i + 2) },
+    { stmts := [ .storageLive 2, .assign 2 (.op1 (.xorConst (i + 1)) 0),
+        .assign 0 (.op2 .add 2 2) ]
+      term := .goto (2 * i + 2) } ]
+
+/-- `count` triangles starting at triangle index `i`, followed by the same reflexive-assertion
+    return block as `mkDiamondBlocksAux`. -/
+def mkTriangleBlocksAux : Nat → Nat → List MirBlock
+  | _, 0 =>
+    [ { stmts := [ .storageLive 2, .assign 2 (.op2 .eq 0 0), .assert 2, .storageDead 2 ]
+        term := .ret 0 } ]
+  | i, count + 1 => mkTriangleBlocks i ++ mkTriangleBlocksAux (i + 1) count
+
+/-- The `k`-triangle MIR CFG (`2k + 1` blocks, `2^k` concrete paths of different lengths). -/
+def mkTriangleCfg (k : Nat) : MirCfg :=
+  { blocks := mkTriangleBlocksAux 0 k }
+
+/-- Untrusted join hints for `mkTriangleCfg`: every join block `2(i+1)` gets live mask
+    `[true, true, false]` (`_0`, `_1` live; `_2` dead). -/
+def triangleJoinHints : JoinHints := fun bb =>
+  if bb % 2 == 0 && bb != 0 then some [true, true, false] else none
+
+/-- Hints that keep every local live: the triangle merge fails on the `_2` shape mismatch. -/
+def triangleNoPruneHints : JoinHints := fun bb =>
+  if bb % 2 == 0 && bb != 0 then some [true, true, true] else none
+
+/-- Functional spec of the `k`-triangle CFG: triangle `i + 1` replaces `_0` by
+    `xor(_0, i+1) + xor(_0, i+1)` when `_1 ≠ 0` and keeps it otherwise. -/
+def buildTriangleTree : Nat → ExprTree
+  | 0 => .var 0
+  | i + 1 =>
+    let prev := buildTriangleTree i
+    let br := ExprTree.op1 (.xorConst (i + 1)) prev
+    .ite (.var 1) (.op2 .add br br) prev
+
+/-- **6-Triangle Verification Benchmark (`triangle6_verified_rfl`)**: one symbolic pass
+    (`2 * 6 + 1 = 13` blocks of fuel) proves the `if`-without-`else` CFG (`2^6 = 64` concrete paths)
+    returns exactly `(buildTriangleTree 6).eval env`; the hinted triangle merge
+    (`triangleMergePlan`) evaluates every join once. -/
+theorem triangle6_verified_rfl :
+    checkCfgAgainstTree (mkTriangleCfg 6) triangleJoinHints 13 0 diamondInitSymState
+      diamondInitSymTable (buildTriangleTree 6) = true := by
+  decide +kernel
+
+/-- Single-continuation vs. path-splitting shape witness for triangles at `k = 6`: with join hints
+    the evaluator returns **1** path and a `21`-node table; without hints it explores all **64**
+    paths, and since the two sides of a triangle compute different values GVN cannot share them
+    (`129` nodes); with non-pruning hints the merge is rejected (`_2` live vs. dead). -/
+theorem triangle6_join_vs_split_witness :
+    (symEvalCfgGvn (mkTriangleCfg 6) triangleJoinHints 13 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => (res.1.length, res.2.nodes.length)) = some (1, 21) ∧
+      (symEvalCfgGvn (mkTriangleCfg 6) noJoinHints 13 0 diamondInitSymState
+        diamondInitSymTable).map (fun res => (res.1.length, res.2.nodes.length)) = some (64, 129) ∧
+      symEvalCfgGvn (mkTriangleCfg 6) triangleNoPruneHints 13 0 diamondInitSymState
+        diamondInitSymTable = none := by
+  decide +kernel
+
+/-- **End-to-End Concrete Corollary (`triangle6_cfg_concrete_sound`)**: for every `env`, the
+    mask-free concrete execution of the 6-triangle CFG returns `(buildTriangleTree 6).eval env`,
+    although its paths consume between `7` and `13` blocks of the `13` available. -/
+theorem triangle6_cfg_concrete_sound (env : SymEnv) :
+    execCfg (mkTriangleCfg 6) 13 0 (evalSymCanonState diamondInitSymTable env diamondInitSymState) =
+      .ret ((buildTriangleTree 6).eval env) :=
+  checkCfgAgainstTree_sound triangle6_verified_rfl diamondInitSymTable_valid
     diamondInitSymState_valid env _ (StateRefines.refl _)
 
 /-- Diamond whose arms compute the same sum with swapped operands:
@@ -13674,9 +13986,12 @@ theorem dwlp_of_wpMirUntilJoinSym
          the join block see a single `.init (.scalar ⟨_, sz⟩)` constructor and never re-split on `cond`;
       2. when the arms differ in slot kind or width (e.g., a branch-local scratch temporary `_3` left
          `.init` or `.uninit` in one arm and `.dead` in the other), the merged slot places
-         `if cond then sT else sF` at that slot index — allowing a join block that either never reads
-         the dead scratch slot or cleans it up via `StorageDead`/`StorageLive` to step once by `rfl`,
-         while still faulting if the join block attempts to read a dead/uninitialized scratch slot!
+         `if cond then sT else sF` at that slot index. A join block that never reads that slot, or
+         overwrites it first, still steps once by `rfl`: `StorageLive`/`StorageDead` only check that
+         the slot index exists (`get?`) and never inspect the slot's value. A join block that *reads*
+         such a slot cannot be discharged by evaluation for a symbolic `cond` (the read is stuck on
+         the `ite`), and faults for every concrete `cond` that selects a dead/uninitialized arm
+         (`mirJoinAsymmetricScratch_read_dead_slot3_rejected`).
     The hint is never trusted: `mergeMirJoinState_eq_ite` only fires under `MirArmsAgree`, and the
     join cut (`evalJoinDiamondWP`) independently checks that each arm reaches the merged state. -/
 def mergeMirScalarSlot (cond differs : Bool) (sT sF : LocalSlot) : LocalSlot :=
@@ -14540,6 +14855,115 @@ theorem mirSeqTwoDiamond_verified_witness (x flag1 flag2 : Nat) :
       PUnit.unit :=
   (dwp_of_wpMirSym (mirSeqTwoDiamond_wpMirSym_witness x flag1 flag2)).toDWLP
 
+/-- **`if`-without-`else` (triangle) `CapturedMir` witness body (`mirJoinTriangleBody`)**, the
+    shape post-`SimplifyCfg` MIR gives `if c { … }`: on one side the `SwitchInt` jumps **directly** to
+    the join block, so the two incoming paths have different lengths.
+    - `bb0`: `_0 := _1 + 1; SwitchInt(_2)` (`0 -> bb2`, the join itself; `otherwise -> bb1`),
+    - `bb1` (arm): `_0 := _0 + 10; goto bb2`,
+    - `bb2` (join): `_0 := _0 + _1; return`. -/
+def mirJoinTriangleBody : CapturedMir :=
+  { mirJoinDiamondBody with
+    defPath := "sym_eval::mir_join_triangle_witness"
+    basicBlocks :=
+      [ { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 1, projection := [] })
+                    (u64JoinConstOp 1))
+                span := "SymbolicEval.lean" } ]
+          terminator :=
+            { kind := .switchInt (.copy { local_ := 2, projection := [] })
+                { branches := [(0, 2)], otherwise := 1 }
+              span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 0, projection := [] })
+                    (u64JoinConstOp 10))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .goto 2, span := "SymbolicEval.lean" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind := .assign { local_ := 0, projection := [] }
+                  (.binaryOp .add
+                    (.copy { local_ := 0, projection := [] })
+                    (.copy { local_ := 1, projection := [] }))
+                span := "SymbolicEval.lean" } ]
+          terminator := { kind := .return_, span := "SymbolicEval.lean" }
+          isCleanup := false } ] }
+
+/-- Join-entry state of `mirJoinTriangleBody` at `bb2` (`stmtIdx = 0`) with `_0 = joinVal`. -/
+def mirJoinTriangleArmState (x flag joinVal : Nat) : MachineState :=
+  let sInit := initMachineState mirJoinTriangleBody [.scalar ⟨x, 8⟩, .scalar ⟨flag, 8⟩]
+  { sInit with
+    frame :=
+      { blockIdx := 2
+        stmtIdx := 0
+        locals :=
+          [ .init (.scalar ⟨joinVal, 8⟩)
+          , .init (.scalar ⟨x, 8⟩)
+          , .init (.scalar ⟨flag, 8⟩)
+          , .dead ] } }
+
+/-- `_0` on the direct path (`flag = 0`: `bb0 -> bb2`). -/
+def mirJoinTriangleDirectVal (x : Nat) : Nat := wrapScalarBits (Nat.add x 1) (scalarModulus 8)
+
+/-- `_0` on the arm path (`flag ≠ 0`: `bb0 -> bb1 -> bb2`). -/
+def mirJoinTriangleArmVal (x : Nat) : Nat :=
+  wrapScalarBits (Nat.add (mirJoinTriangleDirectVal x) 10) (scalarModulus 8)
+
+/-- State-level `ite` over the two incoming states: what the prefix of `mirJoinTriangleBody`
+    reaches at `bb2`. -/
+def mirJoinTriangleArmResult (x flag : Nat) : MachineState :=
+  if Nat.beq flag 0 then mirJoinTriangleArmState x flag (mirJoinTriangleDirectVal x)
+  else mirJoinTriangleArmState x flag (mirJoinTriangleArmVal x)
+
+/-- Merged triangle join state: only `_0` (hinted) carries `if Nat.beq flag 0 then _ else _` bits. -/
+def mirJoinTriangleMergedState (x flag : Nat) : MachineState :=
+  mergeMirJoinState (Nat.beq flag 0) mirJoinDiamondDiffers
+    (mirJoinTriangleArmState x flag (mirJoinTriangleDirectVal x))
+    (mirJoinTriangleArmState x flag (mirJoinTriangleArmVal x))
+
+theorem mirJoinTriangle_arms_agree (x flag : Nat) :
+    MirArmsAgree mirJoinDiamondDiffers
+      (mirJoinTriangleArmState x flag (mirJoinTriangleDirectVal x))
+      (mirJoinTriangleArmState x flag (mirJoinTriangleArmVal x)) :=
+  ⟨rfl, rfl, rfl, ⟨trivial, rfl, rfl, rfl, rfl⟩⟩
+
+/-- **Triangle join-cut witness (`mirJoinTriangle_evalJoinDiamondWP`)**: the production combinator
+    `wpMirJoinDiamond_merge_sound` also covers `if`-without-`else` CFGs. The direct path reaches
+    `bb2` straight from the `SwitchInt` and the arm path through `bb1`; both are cut at `bb2`, and
+    `bb2` is evaluated **once** on the merged state, for all `x, flag : Nat`. -/
+theorem mirJoinTriangle_evalJoinDiamondWP (x flag : Nat) :
+    let joinVal :=
+      if Nat.beq flag 0 then mirJoinTriangleDirectVal x else mirJoinTriangleArmVal x
+    let expectedRet := wrapScalarBits (Nat.add joinVal x) (scalarModulus 8)
+    evalJoinDiamondWP 6 3 mirJoinTriangleBody 2
+      (initMachineState mirJoinTriangleBody [.scalar ⟨x, 8⟩, .scalar ⟨flag, 8⟩])
+      (mirJoinTriangleMergedState x flag)
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨expectedRet, 8⟩)) := by
+  intro joinVal expectedRet
+  refine wpMirJoinDiamond_merge_sound ?_ (mirJoinTriangle_arms_agree x flag) ?_
+  · -- Prefix cut at `bb2` along both the direct and the arm path.
+    show wpMirUntilJoinSym 6 mirJoinTriangleBody 2 _
+      (fun s' => s' = mirJoinTriangleArmResult x flag) _
+    (repeat' ((conv => whnf); split)); all_goals
+      (rename_i hCond; change Nat.beq flag 0 = _ at hCond;
+       dsimp only [mirJoinTriangleArmResult]; rw [hCond]; rfl)
+  · -- Join `bb2` evaluated ONCE on the merged state:
+    rfl
+
+/-- Fuel-level (`wpMirSym`, `Classical.choice`-free) end-to-end triangle witness. -/
+theorem mirJoinTriangle_wpMirSym_witness (x flag : Nat) :
+    let joinVal :=
+      if Nat.beq flag 0 then mirJoinTriangleDirectVal x else mirJoinTriangleArmVal x
+    let expectedRet := wrapScalarBits (Nat.add joinVal x) (scalarModulus 8)
+    wpMirSym 9 mirJoinTriangleBody
+      (initMachineState mirJoinTriangleBody [.scalar ⟨x, 8⟩, .scalar ⟨flag, 8⟩])
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨expectedRet, 8⟩)) :=
+  wpMirSym_of_evalJoinDiamondWP (mirJoinTriangle_evalJoinDiamondWP x flag)
+
 end MirJoinDiamondWitness
 
 /-!
@@ -14557,8 +14981,8 @@ the corollaries whose *statements* mention `Anneal.ITreeWP.DWLP`/`DWP`
 with `coinductive_fixpoint`/`inductive_fixpoint` and themselves depend on `Classical.choice`, so no
 proof of such a statement can avoid it, while their fuel-level premises (`wpMirSym_of_evalJoinDiamondWP`,
 `wpMirJoinDiamond_merge_sound`, `mirJoinDiamond_wpMirSym_witness`,
-`mirJoinAsymmetricScratch_wpMirSym_witness`, `mirSeqTwoDiamond_wpMirSym_witness`) stay
-`Classical.choice`-free.
+`mirJoinAsymmetricScratch_wpMirSym_witness`, `mirSeqTwoDiamond_wpMirSym_witness`,
+`mirJoinTriangle_wpMirSym_witness`) stay `Classical.choice`-free.
 `trusted/audit/TrustedBoundary.lean` admits no `#guard_msgs`/`#print` commands in audited modules,
 so this inventory is checked out-of-file by `#print axioms` over the declarations above.
 -/
