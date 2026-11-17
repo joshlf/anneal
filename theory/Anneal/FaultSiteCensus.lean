@@ -503,13 +503,21 @@ def censusReadProjectedFaultClasses : ProjectionElem → List MirFaultClass
 Fault classes that can be triggered by a `CastKind` in `evalRvalue (.cast kind op ty)`
 (excluding the operand evaluation itself).
 
-`[adv B1]` / `[adv A1]` precision & soundness fixes:
-- `.intToInt` truncates/sign-extends and `.pointerExposeProvenance` /
-  `.pointerWithExposedProvenance` re-encode the address without any `.ub` edge (`[]`).
-- Float casts (`.floatToInt`, `.floatToFloat`, `.intToFloat`) have no `evalRvalue`
-  arm (`.unsupported`, `[]`).
-- `.pointerCoercion "MutToConstPointer"` (`evalReifyFnPointer`) never faults beyond
-  evaluating its operand (`[]`).
+`[adv B1]` / `[adv A1]` / `[adv ep1-B1]` precision & soundness fixes (kernel-checked
+by `evalRvalue_cast_ub_cause`, which proves that every `.ub` of a cast whose operand
+evaluated successfully is justified by a non-empty `censusCastKindFaultClasses kind`):
+- `.intToInt` truncates/sign-extends and never faults beyond its operand (`[]`).
+- IEEE-754 float casts (`.floatToInt`, `.floatToFloat`, `.intToFloat`) are evaluated by
+  `evalFloatCastRvalue`, which only faults when its operand does (`[]`,
+  `evalRvalue_cast_float_ub_iff`).
+- `.pointerExposeProvenance` (`evalPointerExposeProvenance`) faults on an ill-typed
+  source/target, a non-pointer operand value, or a pointer/scalar whose width differs
+  from `layoutPointerBytes` (`.ptrDerefInvalid`, `.scalarNicheInvalid`).
+- `.pointerWithExposedProvenance` (`evalPointerWithExposedProvenance`) faults on an
+  ill-typed source/target or a non-scalar operand value (`.scalarNicheInvalid`).
+- `.pointerCoercion "MutToConstPointer"` (`evalReifyFnPointer`) faults when the
+  operand value is not a thin/wide pointer (or address scalar) of pointer width whose
+  shape matches `mutToConstTargetShape?` (`.ptrDerefInvalid`, `.scalarNicheInvalid`).
 - `.pointerCoercion ("Unsize" | "ArrayToPointer")` and `.ptrToPtr` call
   `evalUnsizeCoercion` / `deriveStackElemThinPtr`, which check Tree Borrows tags
   (`.disabled` / `.frozen` -> `.ub`), allocation bounds, pointer validity, and
@@ -521,10 +529,11 @@ Fault classes that can be triggered by a `CastKind` in `evalRvalue (.cast kind o
 -/
 def censusCastKindFaultClasses : CastKind → List MirFaultClass
   | .intToInt | .floatToInt | .floatToFloat | .intToFloat => []
-  | .pointerExposeProvenance | .pointerWithExposedProvenance => []
+  | .pointerExposeProvenance => [.ptrDerefInvalid, .scalarNicheInvalid]
+  | .pointerWithExposedProvenance => [.scalarNicheInvalid]
   | .transmute | .subtype =>
     [.scalarNicheInvalid, .uninitRead]
-  | .pointerCoercion "MutToConstPointer" => []
+  | .pointerCoercion "MutToConstPointer" => [.ptrDerefInvalid, .scalarNicheInvalid]
   | .pointerCoercion "Unsize" | .pointerCoercion "ArrayToPointer" | .ptrToPtr =>
     [ .boundsCheck
     , .ptrDerefInvalid
@@ -538,6 +547,11 @@ def censusCastKindFaultClasses : CastKind → List MirFaultClass
 /--
 True for the `CastKind`s that `evalRvalue` never evaluates (no matching arm, so the
 cast steps to `.unsupported` before its operand is read).
+
+`[adv ep1-B1]`: every `CastKind` (including the IEEE-754 float casts, which are
+evaluated by `evalFloatCastRvalue`) now has an `evalRvalue` arm, so this predicate is
+constantly `false`; it is retained so `rvalueUnevaluated` keeps its shape in lockstep
+with the Rust `cast_kind_unevaluated` mirror.
 -/
 def castKindUnevaluated : CastKind → Bool
   | _ => false
@@ -550,6 +564,23 @@ def castKindUnevaluated : CastKind → Bool
 def aggregateKindUnevaluated : AggregateKind → Bool
   | .coroutine _ => true
   | _ => false
+
+/--
+`[adv ep1-B1]` Fault classes that an evaluated `.aggregate kind ops` can trigger
+beyond evaluating its operands (kernel-checked by `evalRvalue_aggregate_ub_cause`):
+- `.adt _ _ (some _)` (union construction, `evalAggregateAdt`) faults when the active
+  field's value cannot be overlaid onto the union layout
+  (`evalAggregateAdtUnionValue? = none`, `.scalarNicheInvalid`);
+- `.rawPtr _ _` (`ptr::from_raw_parts`, `evalAggregateRawPtr`) faults on a data
+  pointer / metadata whose width differs from `layoutPointerBytes` or whose thin/wide
+  shape does not match the pointee (`.ptrDerefInvalid`, `.scalarNicheInvalid`);
+- `.tuple`, `.array _`, `.closure _`, and struct/enum `.adt _ _ none` only fault while
+  evaluating their operands (`[]`); `.coroutine _` is unevaluated (`[]`).
+-/
+def censusAggregateKindFaultClasses : AggregateKind → List MirFaultClass
+  | .adt _ _ (some _) => [.scalarNicheInvalid]
+  | .rawPtr _ _ => [.ptrDerefInvalid, .scalarNicheInvalid]
+  | _ => []
 
 /--
 `[adv A1]` True for `Rvalue` forms that `evalRvalue` never evaluates (immediately
@@ -566,11 +597,13 @@ def rvalueUnevaluated : Rvalue → Bool
 /--
 Fault classes that can be triggered by evaluating an `Rvalue`.
 
-`[adv B1]` / `[adv A1]` precision fixes: `.threadLocalRef`, `.nullaryOp`,
-`.shallowInitBox`, float casts, and `.aggregate (.coroutine _) _` have no
-`evalRvalue` arm (`.unsupported`, operand never evaluated) and emit `[]`; `.repeat`
-and every evaluated `.aggregate` only fault while evaluating their operands;
-`.copyForDeref` only faults while reading its place.
+`[adv B1]` / `[adv A1]` / `[adv ep1-B1]` precision fixes: `.threadLocalRef`,
+`.nullaryOp`, `.shallowInitBox`, and `.aggregate (.coroutine _) _` have no `evalRvalue`
+arm (`.unsupported`, operand never evaluated) and emit `[]`; `.repeat` only faults
+while evaluating its operand; every evaluated `.aggregate` faults while evaluating its
+operands or on its own `censusAggregateKindFaultClasses`; casts fault while evaluating
+their operand or on their own `censusCastKindFaultClasses`; `.copyForDeref` only
+faults while reading its place.
 -/
 def censusRvalueFaultClasses : Rvalue → List MirFaultClass
   | .use op => censusLoadedOperandFaultClasses op
@@ -591,7 +624,7 @@ def censusRvalueFaultClasses : Rvalue → List MirFaultClass
   | .discriminant place => censusPlaceReadFaultClasses place ++ [.scalarNicheInvalid]
   | .aggregate kind ops =>
     if aggregateKindUnevaluated kind then []
-    else ops.flatMap censusOperandFaultClasses
+    else ops.flatMap censusOperandFaultClasses ++ censusAggregateKindFaultClasses kind
   | .shallowInitBox _ _ => []
   | .copyForDeref place => censusPlaceReadFaultClasses place
   | .wrapUnsafeBinder op _ => censusLoadedOperandFaultClasses op
@@ -1140,9 +1173,11 @@ theorem evalOperand_constant_non_indirect_ne_ub
     (locals : List LocalSlot) (c : ConstOperand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
     (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl) (callStack : List SavedCallerFrame)
     (hNonIndirect : ∀ allocId offset, c.val ≠ .indirect allocId offset) :
     censusOperandFaultClasses (.constant c) = [] ∧
-    evalOperand locals (.constant c) borrows globals layouts callerLocals ≠ .ub := by
+    evalOperand locals (.constant c) borrows globals layouts callerLocals
+      localDecls callStack ≠ .ub := by
   rcases c with ⟨ty, val⟩
   cases val with
   | zeroSized =>
@@ -1790,8 +1825,12 @@ theorem evalTerminator_drop_unprojected_ub_iff
       simp [hSet, MirStepNode.step, MirStepNode.fail]
 
 /--
-`[adv A1]` `CastKind.pointerCoercion "MutToConstPointer"` (`evalReifyFnPointer`) never
-faults beyond evaluating its operand (`censusCastKindFaultClasses (.pointerCoercion "MutToConstPointer") = []`).
+`[adv A1]` / `[adv ep1-B1]` `CastKind.pointerCoercion "MutToConstPointer"`
+(`evalReifyFnPointer`) never faults beyond evaluating its operand *when the cast is
+well-shaped* (`mutToConstTargetShape? = some none` and the operand evaluates to a thin
+pointer of pointer width). Ill-shaped casts do fault (`evalRvalue_cast_own_ub_witnesses`),
+which is why `censusCastKindFaultClasses (.pointerCoercion "MutToConstPointer")` is
+`[.ptrDerefInvalid, .scalarNicheInvalid]` rather than `[]`.
 -/
 theorem evalRvalue_cast_mutToConstPointer_ub_iff
     (locals : List LocalSlot) (op : Operand) (ty : Ty)
@@ -1889,7 +1928,9 @@ theorem evalOperand_ub_implies_mem_censusOperand
     (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
     (layouts : LayoutTable) (callerLocals : List LocalSlot)
-    (hUb : evalOperand locals op borrows globals layouts callerLocals = .ub) :
+    (localDecls : List LocalDecl) (callStack : List SavedCallerFrame)
+    (hUb : evalOperand locals op borrows globals layouts callerLocals
+      localDecls callStack = .ub) :
     ∃ cls : MirFaultClass, cls ∈ censusOperandFaultClasses op := by
   cases op with
   | copy p =>
@@ -1902,9 +1943,175 @@ theorem evalOperand_ub_implies_mem_censusOperand
       exact ⟨.boundsCheck, by simp [censusOperandFaultClasses, censusConstValueFaultClasses, hVal]⟩
     | zeroSized | scalar _ | slice _ _ | unevaluated _ =>
       have hNe := evalOperand_constant_non_indirect_ne_ub
-        locals c borrows globals layouts callerLocals
+        locals c borrows globals layouts callerLocals localDecls callStack
         (by intro allocId offset hEq; rw [hVal] at hEq; nomatch hEq)
       exact absurd hUb hNe.2
+
+/--
+`[adv ep1-B1]` List-level operand census completeness: whenever `evalOperands`
+returns `.ub` (left-to-right, threading `locals`), some operand of `ops` contributes a
+justifying class to `ops.flatMap censusOperandFaultClasses`.
+-/
+theorem evalOperands_ub_implies_mem_censusOperands
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl) (callStack : List SavedCallerFrame) :
+    ∀ (locals : List LocalSlot) (ops : List Operand),
+      evalOperands locals ops borrows globals layouts callerLocals localDecls callStack = .ub →
+      ∃ cls : MirFaultClass, cls ∈ ops.flatMap censusOperandFaultClasses
+  | _, [], hUb => by nomatch hUb
+  | locals, op :: rest, hUb => by
+    dsimp only [evalOperands] at hUb
+    cases hOp : evalOperand locals op borrows globals layouts callerLocals
+        localDecls callStack with
+    | ub =>
+      rcases evalOperand_ub_implies_mem_censusOperand locals op borrows globals layouts
+        callerLocals localDecls callStack hOp with ⟨cls, hCls⟩
+      exact ⟨cls, by simp only [List.flatMap_cons, List.mem_append]; exact Or.inl hCls⟩
+    | unsupported =>
+      rw [hOp] at hUb
+      nomatch hUb
+    | ok v locals₁ =>
+      rw [hOp] at hUb
+      dsimp only at hUb
+      cases hRest : evalOperands locals₁ rest borrows globals layouts callerLocals
+          localDecls callStack with
+      | ub =>
+        rcases evalOperands_ub_implies_mem_censusOperands borrows globals layouts
+          callerLocals localDecls callStack locals₁ rest hRest with ⟨cls, hCls⟩
+        exact ⟨cls, by simp only [List.flatMap_cons, List.mem_append]; exact Or.inr hCls⟩
+      | ok vs locals₂ =>
+        rw [hRest] at hUb
+        nomatch hUb
+      | unsupported =>
+        rw [hRest] at hUb
+        nomatch hUb
+
+/--
+`[adv ep1-B1]` Cast-level class completeness against `Trusted.MirSemantics.evalRvalue`:
+a cast `.cast kind op ty` that faults with `.ub` either faulted while evaluating its
+operand (covered by `censusOperandFaultClasses op`) or faulted in the cast itself, in
+which case `censusCastKindFaultClasses kind` is non-empty. This pins the census for
+every `CastKind` (including the IEEE-754 float casts, `MutToConstPointer`, and the
+exposed-provenance casts, whose own `.ub` edges an `[]` entry would silently drop).
+-/
+theorem evalRvalue_cast_ub_cause
+    (locals : List LocalSlot) (kind : CastKind) (op : Operand) (ty : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUb : evalRvalue locals (.cast kind op ty) mem localDecls layouts = .ub) :
+    evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+        localDecls mem.callStack = .ub ∨
+      censusCastKindFaultClasses kind ≠ [] := by
+  cases kind with
+  | intToInt =>
+    left
+    dsimp only [evalRvalue] at hUb
+    revert hUb
+    cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+        localDecls mem.callStack with
+    | ub => intro _; rfl
+    | unsupported => intro h; nomatch h
+    | ok v locals' =>
+      cases v with
+      | scalar sc =>
+        dsimp only
+        intro h
+        split at h
+        · nomatch h
+        · split at h
+          · nomatch h
+          · nomatch h
+      | _ => intro h; nomatch h
+  | floatToInt =>
+    exact Or.inl ((evalRvalue_cast_float_ub_iff locals .floatToInt op ty mem localDecls
+      layouts (Or.inl rfl)).mp hUb)
+  | floatToFloat =>
+    exact Or.inl ((evalRvalue_cast_float_ub_iff locals .floatToFloat op ty mem localDecls
+      layouts (Or.inr (Or.inl rfl))).mp hUb)
+  | intToFloat =>
+    exact Or.inl ((evalRvalue_cast_float_ub_iff locals .intToFloat op ty mem localDecls
+      layouts (Or.inr (Or.inr rfl))).mp hUb)
+  | pointerCoercion s =>
+    right
+    clear hUb
+    unfold censusCastKindFaultClasses
+    split <;> simp_all
+  | _ =>
+    right
+    simp [censusCastKindFaultClasses]
+
+/--
+`[adv ep1-B1]` Aggregate-level class completeness against `evalRvalue`: an evaluated
+`.aggregate kind ops` that faults with `.ub` either faulted while evaluating its
+operands (covered by `ops.flatMap censusOperandFaultClasses`) or faulted while
+assembling the aggregate, in which case `censusAggregateKindFaultClasses kind` is
+non-empty (union `.adt _ _ (some _)` overlay and `.rawPtr` width/shape checks).
+-/
+theorem evalRvalue_aggregate_ub_cause
+    (locals : List LocalSlot) (kind : AggregateKind) (ops : List Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUb : evalRvalue locals (.aggregate kind ops) mem localDecls layouts = .ub) :
+    evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals
+        localDecls mem.callStack = .ub ∨
+      censusAggregateKindFaultClasses kind ≠ [] := by
+  cases kind with
+  | tuple | array _ | closure _ =>
+    left
+    dsimp only [evalRvalue] at hUb
+    revert hUb
+    cases evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals
+        localDecls mem.callStack with
+    | ub => intro _; rfl
+    | ok _ _ => intro h; nomatch h
+    | unsupported => intro h; nomatch h
+  | adt defPath variantIdx activeField =>
+    cases activeField with
+    | some _ =>
+      right
+      simp [censusAggregateKindFaultClasses]
+    | none =>
+      left
+      dsimp only [evalRvalue, evalAggregateAdt] at hUb
+      revert hUb
+      cases evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals
+          localDecls mem.callStack with
+      | ub => intro _; rfl
+      | ok _ _ => intro h; nomatch h
+      | unsupported => intro h; nomatch h
+  | rawPtr _ _ =>
+    right
+    simp [censusAggregateKindFaultClasses]
+  | coroutine _ =>
+    dsimp only [evalRvalue] at hUb
+    nomatch hUb
+
+/--
+`[adv ep1-B1]` Non-vacuity of the cast classes added in `[adv ep1-B1]`: each of
+`MutToConstPointer`, `PointerExposeProvenance`, and `PointerWithExposedProvenance`
+faults with `.ub` on an ill-shaped cast whose (non-`.indirect` constant) operand does
+not fault, so by `evalRvalue_cast_ub_cause` an `[]` census entry for any of them
+would be unsound.
+-/
+theorem evalRvalue_cast_own_ub_witnesses (ty : Ty) :
+    let op : Operand := .constant { ty := ty, val := .scalar (.int ⟨0, 1⟩) }
+    let boolTy : Ty := { kind := .bool, layoutIdx := 0 }
+    evalOperand [] op [] [] emptyLayoutTable [] [] [] ≠ .ub ∧
+    evalRvalue [] (.cast (.pointerCoercion "MutToConstPointer") op ty) = .ub ∧
+    evalRvalue [] (.cast .pointerExposeProvenance op boolTy) = .ub ∧
+    evalRvalue [] (.cast .pointerWithExposedProvenance op boolTy) = .ub := by
+  intro op boolTy
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro h
+    nomatch h
+  · have h1 : isReifyFnPointerCoercion "MutToConstPointer" = false := by decide
+    have h2 : stringEq "MutToConstPointer" "Unsize" = false := by decide
+    have h3 : stringEq "MutToConstPointer" "ArrayToPointer" = false := by decide
+    have h4 : stringEq "MutToConstPointer" "MutToConstPointer" = true := by decide
+    dsimp only [evalRvalue, evalReifyFnPointer]
+    rw [h1, h2, h3, h4]
+    rfl
+  · rfl
+  · rfl
 
 /--
 `[adv A2]` Exact `.ub` characterization for writing to an unprojected local place
@@ -5124,6 +5331,14 @@ private theorem aggregateKindUnevaluated_instantiate
       aggregateKindUnevaluated k := by
   cases k <;> rfl
 
+private theorem censusAggregateKindFaultClasses_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (k : AggregateKind) :
+    censusAggregateKindFaultClasses (AggregateKind.instantiate tbl subst k) =
+      censusAggregateKindFaultClasses k := by
+  cases k with
+  | adt _ _ activeField => cases activeField <;> rfl
+  | _ => rfl
+
 theorem rvalueUnevaluated_instantiate
     (tbl : LayoutTable) (subst : TypeSubst) (rv : Rvalue) :
     rvalueUnevaluated (Rvalue.instantiate tbl subst rv) = rvalueUnevaluated rv := by
@@ -5161,7 +5376,8 @@ theorem censusRvalueFaultClasses_instantiate
   | aggregate kind ops =>
     dsimp only [Rvalue.instantiate, censusRvalueFaultClasses]
     rw [aggregateKindUnevaluated_instantiate tbl subst kind,
-        censusOperandFaultClasses_instantiateList tbl subst ops]
+        censusOperandFaultClasses_instantiateList tbl subst ops,
+        censusAggregateKindFaultClasses_instantiate tbl subst kind]
   | shallowInitBox _ _ => rfl
   | copyForDeref p => exact censusPlaceReadFaultClasses_instantiate tbl subst p
   | wrapUnsafeBinder op _ => exact censusLoadedOperandFaultClasses_instantiate tbl subst op

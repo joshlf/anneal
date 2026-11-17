@@ -72,7 +72,8 @@ pub use fault_census::{
     ProtoOperand, ProtoPlace, ProtoProjectionElem, ProtoRvalue, ProtoStatement, ProtoStatementKind,
     ProtoTerminator, ProtoTerminatorKind, census_lean_mir_def, census_lean_mir_module,
     census_mir_fault_sites, census_stmt_fault_classes, census_terminator_fault_classes,
-    parse_lean_captured_mir_def, reconcile_lean_mir_coverage, reconcile_multi_item_coverage,
+    parse_lean_captured_mir_def, parse_lean_mir_module_body_strict, reconcile_lean_mir_coverage,
+    reconcile_multi_item_coverage,
     reconcile_obligation_coverage, run_all_false_proof_probes, run_false_proof_probe,
     run_property_registry_unemitted_probe,
 };
@@ -1271,23 +1272,7 @@ pub fn execute_cli(options: &CliOptions) -> Result<(), String> {
         CliSubcommand::Verify | CliSubcommand::AgentVerify => {
             let report = verify_workspace_with_options(options)?;
             print!("{}", render_verification_report(&report));
-            let unmapped: Vec<String> = report
-                .items
-                .iter()
-                .filter_map(|item| match &item.status {
-                    VerificationStatus::UnknownUnmappedFaultSite { reason, .. } => Some(format!(
-                        "{}: UNKNOWN(UNMAPPED_FAULT_SITE) ({reason})",
-                        item.verify_module
-                    )),
-                    _ => None,
-                })
-                .collect();
-            if !unmapped.is_empty() {
-                return Err(format!(
-                    "fault-site coverage reconciliation failed: {}",
-                    unmapped.join(", ")
-                ));
-            }
+            ensure_fault_site_coverage_reconciled(&report)?;
             Ok(())
         }
         CliSubcommand::AgentSandbox => {
@@ -2612,71 +2597,108 @@ pub fn verify_workspace_with_config(config: &VerifyConfig) -> Result<Verificatio
     Ok(report)
 }
 
-fn extract_default_callee_suffixes_from_obligations(ob_text: &str) -> Vec<String> {
-    let Some(pos) = ob_text.find("def defaultCallees : List CapturedMir :=") else {
-        return Vec::new();
+/// Parse the `def defaultCallees : List CapturedMir := ...` table of a generated
+/// `Obligations/<Item>.lean` module into the `Mir.<Callee>` module suffixes it links
+/// into `s.memory.callees` (`[Mir.<A>.body, Mir.<B>.body]` or `.nil`).
+///
+/// `[adv ep1-B1]`: the value is read up to the next top-level command (not just the
+/// next blank line) and every entry must be exactly `Mir.<Suffix>.body`; any other
+/// shape (or a duplicated table) is an `Err`, so verify-time reconciliation fails
+/// closed instead of silently dropping a callee whose body Lean links inline.
+fn extract_default_callee_suffixes_from_obligations(ob_text: &str) -> Result<Vec<String>, String> {
+    const HEADER: &str = "def defaultCallees : List CapturedMir :=";
+    let mut found = ob_text.match_indices(HEADER);
+    let Some((pos, _)) = found.next() else {
+        return Ok(Vec::new());
     };
-    let after = &ob_text[pos..];
-    let end = after.find("\n\n").unwrap_or(after.len());
-    let section = &after[..end];
-    let mut out = Vec::new();
-    let mut rest = section;
-    while let Some(mpos) = rest.find("Mir.") {
-        let after_mir = &rest[mpos + "Mir.".len()..];
-        if let Some(bpos) = after_mir.find(".body") {
-            let candidate = &after_mir[..bpos];
-            if !candidate.is_empty()
-                && candidate
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-            {
-                out.push(candidate.to_string());
-                rest = &after_mir[bpos + ".body".len()..];
-                continue;
-            }
+    if found.next().is_some() {
+        return Err("multiple `def defaultCallees` tables in Obligations module".to_string());
+    }
+    let mut value = String::new();
+    for (idx, line) in ob_text[pos + HEADER.len()..].split('\n').enumerate() {
+        if idx > 0 && !line.is_empty() && !line.starts_with(char::is_whitespace) {
+            break;
         }
-        rest = &after_mir[1..];
+        value.push_str(line);
+        value.push(' ');
+    }
+    let value = value.trim();
+    if matches!(value, ".nil" | "[]" | "List.nil") {
+        return Ok(Vec::new());
+    }
+    let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) else {
+        return Err(format!("unrecognized `defaultCallees` table `{value}`"));
+    };
+    let mut out = Vec::new();
+    for entry in inner.split(',') {
+        let entry = entry.trim();
+        let suffix = entry
+            .strip_prefix("Mir.")
+            .and_then(|e| e.strip_suffix(".body"))
+            .filter(|s| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            })
+            .ok_or_else(|| format!("unrecognized `defaultCallees` entry `{entry}`"))?;
+        out.push(suffix.to_string());
+    }
+    Ok(out)
+}
+
+/// Resolve the explicit external callees of a generated `Obligations/<Item>.lean`
+/// module: `#[external_spec]` targets bound by `externalSpecCallContract` and the
+/// `DefPath`s of sibling `called_callees` imported as `Obligations.<Callee>`
+/// (including `#[spec(trusted)]` siblings), read from their `Mir/<Callee>.lean`.
+fn extract_external_callee_def_paths_from_obligations(
+    links: &fault_census::ObligationsCalleeLinks,
+    mir_root: &Path,
+) -> Vec<String> {
+    let mut out = links.external_spec_targets.clone();
+    for callee_suffix in &links.imported_obligation_suffixes {
+        let callee_mir_path = mir_root.join(module_suffix_to_rel_path(callee_suffix));
+        if let Ok(src) = fs::read_to_string(&callee_mir_path)
+            && let Some(def_path) = extract_lean_mir_def_path(&src)
+            && !out.contains(&def_path)
+        {
+            out.push(def_path);
+        }
     }
     out
 }
 
-fn extract_external_callee_def_paths_from_obligations(
-    ob_text: &str,
-    mir_root: &Path,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    // 1. `externalSpecCallContract "<target_def_id>"`
-    let marker = "externalSpecCallContract";
-    let mut rest = ob_text;
-    while let Some(pos) = rest.find(marker) {
-        let after = &rest[pos + marker.len()..];
-        let trimmed = after.trim_start();
-        if let Some(after_q) = trimmed.strip_prefix('"')
-            && let Some(end_q) = after_q.find('"')
-        {
-            let target = &after_q[..end_q];
-            if !target.is_empty() && !out.iter().any(|s| s == target) {
-                out.push(target.to_string());
-            }
-            rest = &after_q[end_q + 1..];
-        } else {
-            rest = after;
-        }
+fn unmapped_fault_site_status(reason: String) -> VerificationStatus {
+    VerificationStatus::UnknownUnmappedFaultSite {
+        missing_sites: Vec::new(),
+        unemitted_classes: Vec::new(),
+        reason,
     }
-    // 2. `import Obligations.<Callee>` (sibling `#[spec(trusted)]` `called_callees`)
-    for line in ob_text.lines() {
-        if let Some(callee_suffix) = line.trim().strip_prefix("import Obligations.") {
-            let callee_rel = module_suffix_to_rel_path(callee_suffix.trim());
-            let callee_mir_path = mir_root.join(&callee_rel);
-            if let Ok(src) = fs::read_to_string(&callee_mir_path)
-                && let Some(def_path) = extract_lean_mir_def_path(&src)
-                && !out.contains(&def_path)
-            {
-                out.push(def_path);
-            }
-        }
+}
+
+/// Fail closed (`Err`) when any audited item was downgraded to
+/// `VerificationStatus::UnknownUnmappedFaultSite` by fault-site coverage
+/// reconciliation, so `cargo anneal verify` / `agent-verify` never exit
+/// successfully on an unreconciled item.
+pub fn ensure_fault_site_coverage_reconciled(report: &VerificationReport) -> Result<(), String> {
+    let unmapped: Vec<String> = report
+        .items
+        .iter()
+        .filter_map(|item| match &item.status {
+            VerificationStatus::UnknownUnmappedFaultSite { reason, .. } => Some(format!(
+                "{}: UNKNOWN(UNMAPPED_FAULT_SITE) ({reason})",
+                item.verify_module
+            )),
+            _ => None,
+        })
+        .collect();
+    if unmapped.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "fault-site coverage reconciliation failed: {}",
+            unmapped.join(", ")
+        ))
     }
-    out
 }
 
 fn apply_fault_site_coverage_reconciliation(
@@ -2688,80 +2710,94 @@ fn apply_fault_site_coverage_reconciliation(
     let generated_root = workspace_root.join(".anneal/generated");
     let mir_root = generated_root.join("Mir");
     let obligations_root = generated_root.join("Obligations");
-    let verify_root = generated_root.join("Verify");
 
     for item in &mut report.items {
-        let is_assumed_or_ub_exc = match &item.status {
-            VerificationStatus::VerifiedConditional { assumptions } => assumptions
-                .iter()
-                .any(|a| a.ends_with(".rust_trusted_contract")),
+        // Crate-level rollups (`CrateVerify`) carry no subject body of their own;
+        // every item they aggregate is reconciled through its own `Verify.<Item>`.
+        let Some(suffix) = item.verify_module.strip_prefix("Verify.").map(str::to_string) else {
+            continue;
+        };
+        // `[adv ep1-B1]`: only the subject's *own* `#[spec(trusted)]` contract
+        // (`Assumptions.<Item>.rust_trusted_contract`) or a UB-exception claim relaxes
+        // callee closure. An item that merely depends on some trusted callee's
+        // contract is still strictly reconciled against `Mir/<Item>.lean` +
+        // `defaultCallees`, and modular (`MirCallE`) items get no implicit externals:
+        // every non-inline callee must be an `#[external_spec]` contract or an
+        // imported sibling `Obligations.<Callee>`.
+        let own_trusted_contract = format!("Assumptions.{suffix}.rust_trusted_contract");
+        let subject_is_assumed = match &item.status {
+            VerificationStatus::VerifiedConditional { assumptions } => {
+                assumptions.iter().any(|a| a == &own_trusted_contract)
+            }
             VerificationStatus::VerifiedUbException { .. } => true,
             _ => false,
         };
 
-        let suffix = item
-            .verify_module
-            .strip_prefix("Verify.")
-            .unwrap_or(&item.verify_module);
-        let rel_path = module_suffix_to_rel_path(suffix);
+        let rel_path = module_suffix_to_rel_path(&suffix);
         let mir_path = mir_root.join(&rel_path);
         let ob_path = obligations_root.join(&rel_path);
-        let ob_text = fs::read_to_string(&ob_path).unwrap_or_default();
-        let fault_census_json_path = generated_root
-            .join("FaultCensus")
-            .join(rel_path.with_extension("json"));
-        let expects_captured_mir_body = ob_text.contains(&format!("Mir.{suffix}.body"))
-            || fault_census_json_path.is_file();
 
+        // Fail closed: every audited per-item module must have its captured body.
         let subject_mir_src = match fs::read_to_string(&mir_path) {
             Ok(src) => src,
             Err(err) => {
-                if expects_captured_mir_body {
-                    item.status = VerificationStatus::UnknownUnmappedFaultSite {
-                        missing_sites: Vec::new(),
-                        unemitted_classes: Vec::new(),
-                        reason: format!("missing MIR module for {suffix}: {err}"),
-                    };
-                }
+                item.status = unmapped_fault_site_status(format!(
+                    "missing MIR module {} for {suffix}: {err}",
+                    mir_path.display()
+                ));
                 continue;
             }
         };
-        if !subject_mir_src.contains("def body : CapturedMir") {
-            if expects_captured_mir_body {
-                item.status = VerificationStatus::UnknownUnmappedFaultSite {
-                    missing_sites: Vec::new(),
-                    unemitted_classes: Vec::new(),
-                    reason: format!(
-                        "MIR module for {suffix} is missing `def body : CapturedMir`"
-                    ),
-                };
-            }
-            continue;
-        }
-        let mut subject_body = match parse_lean_captured_mir_def(&subject_mir_src, "body") {
+        let mut subject_body = match parse_lean_mir_module_body_strict(&subject_mir_src) {
             Ok(body) => body,
             Err(err) => {
-                item.status = VerificationStatus::UnknownUnmappedFaultSite {
-                    missing_sites: Vec::new(),
-                    unemitted_classes: Vec::new(),
-                    reason: format!("MIR fault-census scan error in {suffix}: {err}"),
-                };
+                item.status = unmapped_fault_site_status(format!(
+                    "MIR fault-census scan error in {suffix}: {err}"
+                ));
                 continue;
             }
         };
         if subject_body.def_path.is_empty() {
-            subject_body.def_path = suffix.to_string();
+            subject_body.def_path = suffix.clone();
         }
+        let ob_text = match fs::read_to_string(&ob_path) {
+            Ok(text) => text,
+            Err(err) => {
+                item.status = unmapped_fault_site_status(format!(
+                    "missing Obligations module {} for {suffix}: {err}",
+                    ob_path.display()
+                ));
+                continue;
+            }
+        };
 
-        let callee_suffixes = extract_default_callee_suffixes_from_obligations(&ob_text);
-        let explicit_external =
-            extract_external_callee_def_paths_from_obligations(&ob_text, &mir_root);
-
-        let verify_path = verify_root.join(&rel_path);
-        let verify_text = fs::read_to_string(&verify_path).unwrap_or_default();
-        let is_modular_surface = verify_text.contains("ModularVerificationResult")
-            || verify_text.contains("modularClaim")
-            || verify_text.contains("polyModularClaim");
+        let callee_suffixes = match extract_default_callee_suffixes_from_obligations(&ob_text) {
+            Ok(suffixes) => suffixes,
+            Err(err) => {
+                item.status = unmapped_fault_site_status(format!("{suffix}: {err}"));
+                continue;
+            }
+        };
+        let links = match fault_census::scan_obligations_callee_links(&ob_text) {
+            Ok(links) => links,
+            Err(err) => {
+                item.status = unmapped_fault_site_status(format!(
+                    "Obligations module for {suffix} failed the Lean lexer: {err}"
+                ));
+                continue;
+            }
+        };
+        // The emitted claim must be about this very body: if the Obligations module
+        // never references `Mir.<Item>.body`, nothing in it discharges any site.
+        let claim_covers_subject = links.referenced_mir_bodies.iter().any(|s| s == &suffix);
+        if !claim_covers_subject {
+            item.status = unmapped_fault_site_status(format!(
+                "Obligations module for {suffix} never references `Mir.{suffix}.body`, so no \
+                 emitted obligation discharges its fault sites"
+            ));
+            continue;
+        }
+        let explicit_external = extract_external_callee_def_paths_from_obligations(&links, &mir_root);
 
         let mut callee_bodies = Vec::new();
         let mut scan_err_reasons = Vec::new();
@@ -2777,7 +2813,7 @@ fn apply_fault_site_coverage_reconciliation(
                     continue;
                 }
             };
-            match parse_lean_captured_mir_def(&callee_src, "body") {
+            match parse_lean_mir_module_body_strict(&callee_src) {
                 Ok(mut cbody) => {
                     if cbody.def_path.is_empty() {
                         cbody.def_path = callee_suffix;
@@ -2792,11 +2828,7 @@ fn apply_fault_site_coverage_reconciliation(
             }
         }
         if !scan_err_reasons.is_empty() {
-            item.status = VerificationStatus::UnknownUnmappedFaultSite {
-                missing_sites: Vec::new(),
-                unemitted_classes: Vec::new(),
-                reason: scan_err_reasons.join("; "),
-            };
+            item.status = unmapped_fault_site_status(scan_err_reasons.join("; "));
             continue;
         }
 
@@ -2823,7 +2855,7 @@ fn apply_fault_site_coverage_reconciliation(
             &subject_body,
             &callee_bodies,
             &explicit_external,
-            is_assumed_or_ub_exc || is_modular_surface,
+            subject_is_assumed,
         );
 
         let verdict = reconcile_multi_item_coverage(&items, &closure, registry);
@@ -5361,6 +5393,37 @@ end Mir.Demo.caller
             "{agent_ctx}"
         );
         assert!(agent_ctx.contains("verdict: VERIFIED"), "{agent_ctx}");
+        assert!(
+            agent_ctx.contains("- Property registry: 12/12 MirFaultClass EmittedAndVerified"),
+            "{agent_ctx}"
+        );
+        let mut gap_registry = PropertyRegistry::all_verified();
+        gap_registry.set_status(MirFaultClass::DivRemByZero, PropertyStatus::UnemittedGap);
+        assert_eq!(
+            gap_registry.summary_line(),
+            "11/12 MirFaultClass EmittedAndVerified; not verified (fail-closed): \
+             div_rem_by_zero=UnemittedGap"
+        );
+
+        // `[adv ep1-B1]` `refresh_workspace_assembly` (run by every `verify`) keeps the
+        // JSON receipt and the Obligations docstring summary fresh and unique.
+        refresh_workspace_assembly(&workspace).expect("refresh_workspace_assembly");
+        let refreshed_json = fs::read_to_string(&census_json_path).expect("json after refresh");
+        assert!(
+            refreshed_json.contains("\"reconciliation_verdict\": \"VERIFIED\""),
+            "{refreshed_json}"
+        );
+        let refreshed_ob =
+            fs::read_to_string(workspace.join(".anneal/generated/Obligations/Demo/caller.lean"))
+                .expect("read refreshed caller obligations");
+        assert_eq!(
+            refreshed_ob
+                .matches("Fault-site census coverage summary (compiler-generated metadata):")
+                .count(),
+            1,
+            "{refreshed_ob}"
+        );
+        assert!(refreshed_ob.contains("verdict: VERIFIED"), "{refreshed_ob}");
 
         // Positive reconciliation on VerificationReport under PropertyRegistry::all_verified()
         let mut report = VerificationReport {
@@ -5455,6 +5518,188 @@ end Mir.Demo.caller
                 .expect("status for caller")
                 .as_str(),
             "UNKNOWN(UNMAPPED_FAULT_SITE)"
+        );
+
+        // `[adv ep1-B1]` additional fail-closed regressions on the restored workspace.
+        fs::write(
+            workspace.join(".anneal/generated/Mir/Demo/leaf.lean"),
+            callee_mir,
+        )
+        .expect("restore leaf.lean");
+        let single = |module: &str, status: VerificationStatus| VerificationReport {
+            items: vec![ItemVerificationReport {
+                verify_module: module.to_string(),
+                status,
+            }],
+        };
+        let reconcile = |mut report: VerificationReport| -> VerificationReport {
+            apply_fault_site_coverage_reconciliation(
+                &workspace,
+                &mut report,
+                &PropertyRegistry::all_verified(),
+                &BTreeSet::new(),
+            );
+            report
+        };
+        let unknown = "UNKNOWN(UNMAPPED_FAULT_SITE)";
+        let restored = reconcile(single(
+            "Verify.Demo.caller",
+            VerificationStatus::VerifiedUnconditional,
+        ));
+        assert_eq!(
+            restored.status_for("Verify.Demo.caller"),
+            Some(&VerificationStatus::VerifiedUnconditional)
+        );
+
+        // Negative test 4: `execute_cli` (`verify` / `agent-verify`) fails closed on
+        // any `UnknownUnmappedFaultSite` item and passes a fully reconciled report.
+        let cli_err = ensure_fault_site_coverage_reconciled(&report_gap)
+            .expect_err("unmapped item must fail the CLI");
+        assert!(cli_err.contains("Verify.Demo.caller: UNKNOWN(UNMAPPED_FAULT_SITE)"), "{cli_err}");
+        assert!(ensure_fault_site_coverage_reconciled(&restored).is_ok());
+
+        // Negative test 5: a missing subject `Mir/<Item>.lean` fails closed with no
+        // escape hatch, while crate-level rollups (`CrateVerify`) are not subjects.
+        let missing = reconcile(VerificationReport {
+            items: vec![
+                ItemVerificationReport {
+                    verify_module: "Verify.Demo.ghost".to_string(),
+                    status: VerificationStatus::VerifiedUnconditional,
+                },
+                ItemVerificationReport {
+                    verify_module: "CrateVerify".to_string(),
+                    status: VerificationStatus::VerifiedUnconditional,
+                },
+            ],
+        });
+        assert_eq!(
+            missing.status_for("Verify.Demo.ghost").expect("ghost").as_str(),
+            unknown
+        );
+        assert_eq!(missing.items[1].verify_module, "CrateVerify");
+        assert_eq!(
+            missing.items[1].status,
+            VerificationStatus::VerifiedUnconditional
+        );
+
+        // Negative test 6: the verify-time scan enforces the strict `Mir/<Item>.lean`
+        // grammar. A constructor-shadowing declaration is invisible to the lenient
+        // `parse_lean_captured_mir_def` but changes what Lean elaborates.
+        let caller_mir_path = workspace.join(".anneal/generated/Mir/Demo/caller.lean");
+        let original_caller = fs::read_to_string(&caller_mir_path).expect("read caller.lean");
+        let shadowed = original_caller.replacen(
+            "def body : CapturedMir :=",
+            "def TerminatorKind.return_ : Nat := 0\ndef body : CapturedMir :=",
+            1,
+        );
+        assert_ne!(shadowed, original_caller);
+        assert!(parse_lean_captured_mir_def(&shadowed, "body").is_ok());
+        assert!(parse_lean_mir_module_body_strict(&shadowed).is_err());
+        fs::write(&caller_mir_path, &shadowed).expect("write shadowed caller.lean");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller")
+                .expect("caller")
+                .as_str(),
+            unknown
+        );
+        fs::write(&caller_mir_path, &original_caller).expect("restore caller.lean");
+
+        // Negative test 7: an unclosed callee fails closed even for modular surfaces
+        // and for items that merely depend on some *callee's* trusted contract; only
+        // the subject's own `#[spec(trusted)]` contract relaxes callee closure.
+        let caller_ob_path = workspace.join(".anneal/generated/Obligations/Demo/caller.lean");
+        let original_ob = fs::read_to_string(&caller_ob_path).expect("read caller obligations");
+        let unlinked_ob = original_ob.replacen("[Mir.Demo.leaf.body]", ".nil", 1);
+        assert_ne!(unlinked_ob, original_ob, "{original_ob}");
+        fs::write(&caller_ob_path, &unlinked_ob).expect("unlink defaultCallees");
+        let caller_verify_path = workspace.join(".anneal/generated/Verify/Demo/caller.lean");
+        let original_verify = fs::read_to_string(&caller_verify_path).unwrap_or_default();
+        fs::write(
+            &caller_verify_path,
+            format!("{original_verify}\n-- ModularVerificationResult modularClaim\n"),
+        )
+        .expect("mark caller verify module as modular");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller")
+                .expect("caller")
+                .as_str(),
+            unknown
+        );
+        let callee_trusted = VerificationStatus::VerifiedConditional {
+            assumptions: vec!["Assumptions.Demo.leaf.rust_trusted_contract".to_string()],
+        };
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", callee_trusted))
+                .status_for("Verify.Demo.caller")
+                .expect("caller")
+                .as_str(),
+            unknown
+        );
+        let own_trusted = VerificationStatus::VerifiedConditional {
+            assumptions: vec!["Assumptions.Demo.caller.rust_trusted_contract".to_string()],
+        };
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", own_trusted.clone()))
+                .status_for("Verify.Demo.caller"),
+            Some(&own_trusted)
+        );
+
+        // Negative test 8: a `defaultCallees` table that is not exactly
+        // `[Mir.<Callee>.body, ...]` fails closed instead of dropping entries.
+        let mangled_ob = original_ob.replacen(
+            "[Mir.Demo.leaf.body]",
+            "[Mir.Demo.leaf.body, extraCalleeBody]",
+            1,
+        );
+        fs::write(&caller_ob_path, &mangled_ob).expect("mangle defaultCallees");
+        let mangled = reconcile(single(
+            "Verify.Demo.caller",
+            VerificationStatus::VerifiedUnconditional,
+        ));
+        match mangled.status_for("Verify.Demo.caller") {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("defaultCallees"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+        fs::write(&caller_ob_path, &original_ob).expect("restore caller obligations");
+        fs::write(&caller_verify_path, &original_verify).expect("restore caller verify");
+
+        // Negative test 9: an Obligations module whose claims never reference the
+        // subject's own `Mir.<Item>.body` discharges nothing and fails closed.
+        let detached_ob = original_ob.replace("Mir.Demo.caller.body", "Mir.Demo.leaf.body");
+        assert_ne!(detached_ob, original_ob);
+        fs::write(&caller_ob_path, &detached_ob).expect("detach caller claim");
+        match reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+            .status_for("Verify.Demo.caller")
+        {
+            Some(VerificationStatus::UnknownUnmappedFaultSite { reason, .. }) => {
+                assert!(reason.contains("never references `Mir.Demo.caller.body`"), "{reason}");
+            }
+            other => panic!("expected UNKNOWN(UNMAPPED_FAULT_SITE), got {other:?}"),
+        }
+        fs::write(&caller_ob_path, &original_ob).expect("restore caller obligations");
+        assert_eq!(
+            reconcile(single("Verify.Demo.caller", VerificationStatus::VerifiedUnconditional))
+                .status_for("Verify.Demo.caller"),
+            Some(&VerificationStatus::VerifiedUnconditional)
+        );
+
+        // Positive control: `extract_default_callee_suffixes_from_obligations` reads
+        // multi-line tables up to the next top-level command.
+        assert_eq!(
+            extract_default_callee_suffixes_from_obligations(
+                "def defaultCallees : List CapturedMir :=\n  [Mir.A.x.body,\n   Mir.B.y.body]\n\n/-- next -/\ndef z := 1\n"
+            ),
+            Ok(vec!["A.x".to_string(), "B.y".to_string()])
+        );
+        assert_eq!(
+            extract_default_callee_suffixes_from_obligations(
+                "def defaultCallees : List CapturedMir :=\n  .nil\n\n"
+            ),
+            Ok(Vec::new())
         );
 
         let _ = fs::remove_dir_all(&workspace);

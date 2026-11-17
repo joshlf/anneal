@@ -27,13 +27,16 @@ use std::path::{Path, PathBuf};
 use anneal_rustc_capture::lean_emit::render_mir_module_header;
 use anneal_rustc_capture::{CapturedItemKind, CapturedTarget, UnitTargetRecord, sha256_hex};
 
-use crate::fault_census::{FaultCensusReceipt, MultiItemCoverageVerdict, PropertyRegistry};
+use crate::fault_census::{
+    CalleeClosure, FaultCensusReceipt, MultiItemCoverageVerdict, PropertyRegistry,
+};
 use crate::obligations::{
     AuthoredItemModules, CalleeContractRef, ExternalSpecContractRef, SubjectObligationBundle,
     TransitiveCalleeRef,
     collect_external_spec_contracts, compute_bundle_fault_census_receipt,
     derive_item_module_suffix, group_subject_obligations, module_suffix_to_rel_path,
-    render_crate_verify_module, render_generated_assumptions_module,
+    refresh_obligations_census_summary, render_crate_verify_module,
+    render_generated_assumptions_module,
     render_obligations_module_with_census, render_proof_template_with_options,
     render_specs_template, render_verify_module_with_options,
 };
@@ -732,22 +735,43 @@ pub fn compute_workspace_bundle_fault_census(
         }
     }
 
-    let (receipt, verdict) = compute_bundle_fault_census_receipt(
+    let scanned = compute_bundle_fault_census_receipt(
         bundle,
         &subject_mir_src,
         &callee_sources,
         &PropertyRegistry::all_verified(),
         &BTreeSet::new(),
-    )
-    .map_err(|err| {
-        format!(
-            "failed to scan captured MIR for fault-site census of `{}` ({}): {}",
-            bundle.subject.target.def_id,
-            subject_mir_path.display(),
-            err
-        )
-    })?;
-    Ok(Some((receipt, verdict)))
+    );
+    match scanned {
+        Ok((receipt, verdict)) => Ok(Some((receipt, verdict))),
+        Err(err) => {
+            // `[adv ep1-B1]`: a module that fails the strict `Mir/<Item>.lean` grammar
+            // must not abort scaffolding (the item simply cannot be reconciled); record
+            // a fail-closed receipt so `agent-context` and the JSON report surface the
+            // reason, and `verify` independently downgrades the item.
+            let reason = format!(
+                "failed to scan captured MIR for fault-site census of `{}` ({}): {}",
+                bundle.subject.target.def_id,
+                subject_mir_path.display(),
+                err
+            );
+            let verdict = MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+                failed_items: Vec::new(),
+                unsupported_reasons: vec![reason.clone()],
+            };
+            let receipt = FaultCensusReceipt {
+                def_path: bundle.subject.target.def_id.clone(),
+                mir_module_sha256: bundle.subject.target.mir_module_sha256.clone(),
+                census_sites: Vec::new(),
+                discharged_sites: Vec::new(),
+                callee_closure: CalleeClosure::default(),
+                reconciliation_verdict: verdict.status_code().to_string(),
+                is_verified: false,
+                reasons: vec![reason],
+            };
+            Ok(Some((receipt, verdict)))
+        }
+    }
 }
 
 /// Scaffold `.anneal/` and `anneal/proofs/` according to `config` for the
@@ -1201,13 +1225,30 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
             write_if_changed(verify_path, &new_verify)?;
         }
 
-        if let Ok(Some((receipt, _verdict))) =
-            compute_workspace_bundle_fault_census(&mir_root, &[], &synthetic_bundle)
-        {
-            let fault_census_root = generated_dir.join("FaultCensus");
-            let census_path = fault_census_root.join(rel_path.with_extension("json"));
-            write_if_changed(&census_path, &receipt.to_json_string())?;
-        }
+        let census_path = generated_dir
+            .join("FaultCensus")
+            .join(rel_path.with_extension("json"));
+        let refreshed_receipt =
+            match compute_workspace_bundle_fault_census(&mir_root, &[], &synthetic_bundle) {
+                Ok(Some((receipt, _verdict))) => {
+                    write_if_changed(&census_path, &receipt.to_json_string())?;
+                    Some(receipt)
+                }
+                // `[adv ep1-B1]`: never leave a stale receipt behind for an item whose
+                // census can no longer be computed (header-only stub or unreadable MIR).
+                Ok(None) | Err(_) => {
+                    if census_path.is_file() {
+                        fs::remove_file(&census_path).map_err(|err| {
+                            format!(
+                                "failed to remove stale fault-census receipt {}: {}",
+                                census_path.display(),
+                                err
+                            )
+                        })?;
+                    }
+                    None
+                }
+            };
 
         refreshed_bundles.push(synthetic_bundle);
 
@@ -1218,6 +1259,8 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
                 &def_id,
                 authored.has_legacy_specs_defs,
             );
+            let updated_ob =
+                refresh_obligations_census_summary(&updated_ob, refreshed_receipt.as_ref());
             write_if_changed(&obligation_path, &updated_ob)?;
         }
     }

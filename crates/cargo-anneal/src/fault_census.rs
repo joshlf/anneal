@@ -358,6 +358,27 @@ impl PropertyRegistry {
     pub fn entries(&self) -> impl Iterator<Item = &PropertyDescriptor> {
         self.entries.values()
     }
+
+    /// `[adv ep1-B1]` One-line registry summary for `agent-context`: how many of the
+    /// 12 `MirFaultClass`es are `EmittedAndVerified`, plus every non-verified class
+    /// with its status (absent classes report the fail-closed `UnemittedGap`).
+    pub fn summary_line(&self) -> String {
+        let total = MirFaultClass::ALL.len();
+        let not_verified: Vec<String> = MirFaultClass::ALL
+            .into_iter()
+            .filter(|cls| !self.status(*cls).is_verified())
+            .map(|cls| format!("{}={:?}", cls.as_str(), self.status(cls)))
+            .collect();
+        let verified = total - not_verified.len();
+        if not_verified.is_empty() {
+            format!("{verified}/{total} MirFaultClass EmittedAndVerified")
+        } else {
+            format!(
+                "{verified}/{total} MirFaultClass EmittedAndVerified; not verified (fail-closed): {}",
+                not_verified.join(", ")
+            )
+        }
+    }
 }
 
 const fn default_class_description(cls: MirFaultClass) -> &'static str {
@@ -964,18 +985,27 @@ pub fn census_read_projected_fault_classes(proj: &ProtoProjectionElem) -> Vec<Mi
 }
 
 /// Fault classes triggered by a `ProtoCastKind` (`censusCastKindFaultClasses`).
+///
+/// `[adv ep1-B1]`: `MutToConstPointer`, `PointerExposeProvenance`, and
+/// `PointerWithExposedProvenance` have their own `.ub` edges in `evalRvalue`
+/// (ill-shaped operands / pointer-width mismatches), pinned in Lean by
+/// `evalRvalue_cast_ub_cause` and `evalRvalue_cast_own_ub_witnesses`.
 pub fn census_cast_kind_fault_classes(kind: &ProtoCastKind) -> Vec<MirFaultClass> {
     match kind {
         ProtoCastKind::IntToInt
         | ProtoCastKind::FloatToInt
         | ProtoCastKind::FloatToFloat
-        | ProtoCastKind::IntToFloat
-        | ProtoCastKind::PointerExposeProvenance
-        | ProtoCastKind::PointerWithExposedProvenance => Vec::new(),
+        | ProtoCastKind::IntToFloat => Vec::new(),
+        ProtoCastKind::PointerExposeProvenance => {
+            vec![MirFaultClass::PtrDerefInvalid, MirFaultClass::ScalarNicheInvalid]
+        }
+        ProtoCastKind::PointerWithExposedProvenance => vec![MirFaultClass::ScalarNicheInvalid],
         ProtoCastKind::Transmute | ProtoCastKind::Subtype => {
             vec![MirFaultClass::ScalarNicheInvalid, MirFaultClass::UninitRead]
         }
-        ProtoCastKind::PointerCoercion(coercion) if coercion == "MutToConstPointer" => Vec::new(),
+        ProtoCastKind::PointerCoercion(coercion) if coercion == "MutToConstPointer" => {
+            vec![MirFaultClass::PtrDerefInvalid, MirFaultClass::ScalarNicheInvalid]
+        }
         ProtoCastKind::PointerCoercion(coercion)
             if coercion == "Unsize" || coercion == "ArrayToPointer" =>
         {
@@ -1003,6 +1033,9 @@ pub fn census_cast_kind_fault_classes(kind: &ProtoCastKind) -> Vec<MirFaultClass
 }
 
 /// True for the cast kinds that `evalRvalue` never evaluates (`castKindUnevaluated`).
+///
+/// Every `CastKind` (including IEEE-754 float casts, evaluated by
+/// `evalFloatCastRvalue`) has an `evalRvalue` arm, so this is constantly `false`.
 pub const fn cast_kind_unevaluated(_kind: &ProtoCastKind) -> bool {
     false
 }
@@ -1011,6 +1044,25 @@ pub const fn cast_kind_unevaluated(_kind: &ProtoCastKind) -> bool {
 /// (`aggregateKindUnevaluated` in Lean).
 pub const fn aggregate_kind_unevaluated(kind: &ProtoAggregateKind) -> bool {
     matches!(kind, ProtoAggregateKind::Coroutine(_))
+}
+
+/// `[adv ep1-B1]` Fault classes an evaluated aggregate can trigger beyond its
+/// operands (`censusAggregateKindFaultClasses` in Lean, pinned by
+/// `evalRvalue_aggregate_ub_cause`): union construction (`Adt(_, _, Some(_))`)
+/// can fail the active-field overlay, and `RawPtr` validates pointer/metadata
+/// widths and thin/wide shape.
+pub fn census_aggregate_kind_fault_classes(kind: &ProtoAggregateKind) -> Vec<MirFaultClass> {
+    match kind {
+        ProtoAggregateKind::Adt(_, _, Some(_)) => vec![MirFaultClass::ScalarNicheInvalid],
+        ProtoAggregateKind::RawPtr(_) => {
+            vec![MirFaultClass::PtrDerefInvalid, MirFaultClass::ScalarNicheInvalid]
+        }
+        ProtoAggregateKind::Array
+        | ProtoAggregateKind::Tuple
+        | ProtoAggregateKind::Adt(_, _, None)
+        | ProtoAggregateKind::Closure(_)
+        | ProtoAggregateKind::Coroutine(_) => Vec::new(),
+    }
 }
 
 /// `[adv A1]` True for `ProtoRvalue` forms that `evalRvalue` never evaluates
@@ -1073,6 +1125,7 @@ pub fn census_rvalue_fault_classes(rv: &ProtoRvalue) -> Vec<MirFaultClass> {
             for op in ops {
                 out.extend(census_operand_fault_classes(op));
             }
+            out.extend(census_aggregate_kind_fault_classes(kind));
             out
         }
         ProtoRvalue::ShallowInitBox(_) => Vec::new(),
@@ -3032,9 +3085,12 @@ impl<'a> TokenCursor<'a> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
             check_ctor_qualifier(&full, &short, "ContractRole")?;
+            // `[adv ep1-B1]`: exactly the `Trusted.MirAst.ContractRole` constructors
+            // (`subject`, `model`, and the `DefPath`-carrying `requires` / `ensures` /
+            // `externalSpec`); there is no `precondition` constructor.
             match short.as_str() {
                 "subject" | "model" => Ok(()),
-                "ensures" | "precondition" | "requires" | "externalSpec" => {
+                "ensures" | "requires" | "externalSpec" => {
                     if matches!(cur.peek(), Some(LeanToken::StrLit(_))) {
                         let _ = cur.parse_string()?;
                     }
@@ -4220,9 +4276,76 @@ fn check_strict_mir_module_grammar<'a>(tokens: &'a [LeanToken]) -> Result<(), Ce
 /// `Mir/<Item>.lean` module (`def body : CapturedMir := ...`), first enforcing the
 /// strict module grammar (`check_strict_mir_module_grammar`).
 pub fn census_lean_mir_module(lean_src: &str) -> Result<Vec<FaultSite>, CensusScanError> {
+    let body = parse_lean_mir_module_body_strict(lean_src)?;
+    Ok(census_mir_fault_sites(&body))
+}
+
+/// `[adv ep1-B1]` Parse the unique `def body : CapturedMir` of an
+/// `anneal-rustc-capture` `Mir/<Item>.lean` module *after* enforcing the strict
+/// module grammar (`check_strict_mir_module_grammar`): exactly the body that
+/// `census_lean_mir_module` censuses. Verify-time and scaffold-time coverage
+/// reconciliation must use this entry point rather than the lenient
+/// `parse_lean_captured_mir_def`, which would accept a module whose other
+/// commands (constructor shadowing, extra namespaces, macros) make Lean elaborate
+/// a different `CapturedMir` than the one scanned here.
+pub fn parse_lean_mir_module_body_strict(lean_src: &str) -> Result<ProtoMirBody, CensusScanError> {
     let tokens = tokenize_lean_source(lean_src)?;
     check_strict_mir_module_grammar(&tokens)?;
-    census_lean_mir_def(lean_src, "body")
+    parse_lean_captured_mir_def(lean_src, "body")
+}
+
+/// `[adv ep1-B1]` Callee links declared by a generated `Obligations/<Item>.lean`
+/// module, scanned with the comment- and string-aware Lean lexer so that text inside
+/// `--` / `/- ... -/` comments or string literals can never add a link.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObligationsCalleeLinks {
+    /// Target `DefPath`s bound by `externalSpecCallContract "<target>" ...`.
+    pub external_spec_targets: Vec<String>,
+    /// `<Callee>` module suffixes of `import Obligations.<Callee>` commands.
+    pub imported_obligation_suffixes: Vec<String>,
+    /// Every dotted identifier of the form `Mir.<Item>.body` (or a projection of it,
+    /// such as `Mir.<Item>.body.instantiate`) referenced by the module, reported as
+    /// the `<Item>` suffix.
+    pub referenced_mir_bodies: Vec<String>,
+}
+
+/// `[adv ep1-B1]` Scan a generated `Obligations/<Item>.lean` module for its callee
+/// links (see [`ObligationsCalleeLinks`]), failing closed on any lexer error.
+pub fn scan_obligations_callee_links(
+    ob_text: &str,
+) -> Result<ObligationsCalleeLinks, CensusScanError> {
+    let tokens = tokenize_lean_source(ob_text)?;
+    let mut links = ObligationsCalleeLinks::default();
+    let push_unique = |out: &mut Vec<String>, s: &str| {
+        if !s.is_empty() && !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    };
+    for (idx, tok) in tokens.iter().enumerate() {
+        let LeanToken::Ident(ident) = tok else {
+            continue;
+        };
+        match (ident.as_str(), tokens.get(idx + 1)) {
+            ("externalSpecCallContract", Some(LeanToken::StrLit(target))) => {
+                push_unique(&mut links.external_spec_targets, target);
+            }
+            ("import", Some(LeanToken::Ident(module))) => {
+                if let Some(suffix) = module.strip_prefix("Obligations.") {
+                    push_unique(&mut links.imported_obligation_suffixes, suffix);
+                }
+            }
+            _ => {}
+        }
+        if let Some(rest) = ident.strip_prefix("Mir.") {
+            let item = rest
+                .strip_suffix(".body")
+                .or_else(|| rest.rsplit_once(".body.").map(|(item, _)| item));
+            if let Some(item) = item {
+                push_unique(&mut links.referenced_mir_bodies, item);
+            }
+        }
+    }
+    Ok(links)
 }
 
 // ============================================================================
@@ -7112,7 +7235,10 @@ end Mir.Probe.item",
         );
 
         // 4. `CastKind` precision & soundness:
-        //    - `PointerCoercion("MutToConstPointer")` emits `[]`.
+        //    - `PointerCoercion("MutToConstPointer")`, `PointerExposeProvenance`, and
+        //      `PointerWithExposedProvenance` have their own ill-shaped-operand `.ub`
+        //      edges (`[adv ep1-B1]`, Lean `evalRvalue_cast_own_ub_witnesses`), so
+        //      they must never emit `[]`; only `IntToInt` and float casts do.
         //    - `PointerCoercion("Unsize" | "ArrayToPointer")` and `PtrToPtr` include `TreeBorrowsViolation`.
         //    - `PointerCoercion("ReifyFnPointer")` and `FnPtrToPtr` include `CallAbiMismatch` and
         //      do not emit `BoundsCheck` or `PtrAlignMismatch`.
@@ -7120,7 +7246,53 @@ end Mir.Probe.item",
             census_cast_kind_fault_classes(&ProtoCastKind::PointerCoercion(String::from(
                 "MutToConstPointer"
             ))),
-            Vec::<MirFaultClass>::new()
+            vec![MirFaultClass::PtrDerefInvalid, MirFaultClass::ScalarNicheInvalid]
+        );
+        assert_eq!(
+            census_cast_kind_fault_classes(&ProtoCastKind::PointerExposeProvenance),
+            vec![MirFaultClass::PtrDerefInvalid, MirFaultClass::ScalarNicheInvalid]
+        );
+        assert_eq!(
+            census_cast_kind_fault_classes(&ProtoCastKind::PointerWithExposedProvenance),
+            vec![MirFaultClass::ScalarNicheInvalid]
+        );
+        for ck in [
+            ProtoCastKind::IntToInt,
+            ProtoCastKind::FloatToInt,
+            ProtoCastKind::FloatToFloat,
+            ProtoCastKind::IntToFloat,
+        ] {
+            assert!(census_cast_kind_fault_classes(&ck).is_empty(), "{ck:?}");
+            assert!(!cast_kind_unevaluated(&ck), "{ck:?}");
+        }
+        assert_eq!(
+            census_aggregate_kind_fault_classes(&ProtoAggregateKind::Adt(
+                String::from("demo::U"),
+                0,
+                Some(1)
+            )),
+            vec![MirFaultClass::ScalarNicheInvalid]
+        );
+        assert_eq!(
+            census_aggregate_kind_fault_classes(&ProtoAggregateKind::RawPtr(false)),
+            vec![MirFaultClass::PtrDerefInvalid, MirFaultClass::ScalarNicheInvalid]
+        );
+        assert!(
+            census_aggregate_kind_fault_classes(&ProtoAggregateKind::Adt(
+                String::from("demo::S"),
+                0,
+                None
+            ))
+            .is_empty()
+        );
+        // A raw-pointer aggregate of two constant operands still faults on its own
+        // width/shape checks, so its rvalue census must be non-empty.
+        assert_eq!(
+            census_rvalue_fault_classes(&ProtoRvalue::Aggregate(
+                ProtoAggregateKind::RawPtr(false),
+                Vec::new()
+            )),
+            vec![MirFaultClass::PtrDerefInvalid, MirFaultClass::ScalarNicheInvalid]
         );
         for ck in [
             ProtoCastKind::PtrToPtr,
@@ -8163,6 +8335,150 @@ end Mir.Probe.item",
                 LEAN_PROTOTYPE_SRC.contains(decl),
                 "missing `[adv A4]` Lean declaration `{decl}`"
             );
+        }
+    }
+
+    /// `[adv ep1-B1]` Verify-time callee links are scanned with the Lean lexer:
+    /// commented-out or string-embedded `externalSpecCallContract` / `import
+    /// Obligations.*` text can never add an external callee, and the scanner fails
+    /// closed on lexer errors. Also pins the strict-vs-lenient MIR body parsers and
+    /// the `[adv ep1-B1]` cast/aggregate census classes declared in the Lean source.
+    #[test]
+    fn test_ep1_b1_obligations_link_scanner_strict_body_and_cast_census_lockstep() {
+        let src = "import Trusted\nimport Obligations.Crate.a\n\
+                   -- import Obligations.Crate.evil\n\
+                   /- externalSpecCallContract \"evil::x\"\nimport Obligations.Crate.evil2 -/\n\n\
+                   def c : MirCallContract :=\n  externalSpecCallContract\n    \"crate::ext\"\n    \
+                   Mir.Crate.ext_spec.body\n    (fun _ => True)\n    (fun _ _ => True)\n\n\
+                   def s : String := \"externalSpecCallContract \\\"evil::y\\\"\"\n\
+                   def claim := { body := Mir.Crate.item.body.instantiate t }\n";
+        let links = scan_obligations_callee_links(src).expect("scan obligations");
+        assert_eq!(links.external_spec_targets, vec![String::from("crate::ext")]);
+        assert_eq!(links.imported_obligation_suffixes, vec![String::from("Crate.a")]);
+        assert!(links.referenced_mir_bodies.iter().any(|s| s == "Crate.item"));
+        assert!(links.referenced_mir_bodies.iter().any(|s| s == "Crate.ext_spec"));
+        assert!(!links.referenced_mir_bodies.iter().any(|s| s.contains("evil")));
+        assert!(scan_obligations_callee_links("def x := 1\n/- unterminated").is_err());
+
+        // The strict module parser rejects constructor shadowing that the lenient
+        // named-def parser cannot see.
+        let module = witness_as_strict_module("witnessPureNoopBody");
+        assert!(parse_lean_mir_module_body_strict(&module).is_ok());
+        let shadowed = module.replacen(
+            "def body : CapturedMir :=",
+            "def StatementKind.nop : Nat := 0\ndef body : CapturedMir :=",
+            1,
+        );
+        assert_ne!(shadowed, module);
+        assert!(parse_lean_captured_mir_def(&shadowed, "body").is_ok());
+        assert!(parse_lean_mir_module_body_strict(&shadowed).is_err());
+        assert!(census_lean_mir_module(&shadowed).is_err());
+        // Only real `ContractRole` constructors are accepted.
+        for (role, ok) in [
+            ("ContractRole.model", true),
+            ("(ContractRole.requires \"demo::f\")", true),
+            ("(ContractRole.externalSpec \"demo::f\")", true),
+            ("ContractRole.precondition", false),
+        ] {
+            let with_role = module.replacen("role := ContractRole.subject", &format!("role := {role}"), 1);
+            assert_ne!(with_role, module);
+            assert_eq!(parse_lean_mir_module_body_strict(&with_role).is_ok(), ok, "{role}");
+        }
+
+        // Lean/Rust lockstep for the cast and aggregate classes added in this pass.
+        for decl in [
+            "| .pointerExposeProvenance => [.ptrDerefInvalid, .scalarNicheInvalid]",
+            "| .pointerWithExposedProvenance => [.scalarNicheInvalid]",
+            "| .pointerCoercion \"MutToConstPointer\" => [.ptrDerefInvalid, .scalarNicheInvalid]",
+            "| .adt _ _ (some _) => [.scalarNicheInvalid]",
+            "| .rawPtr _ _ => [.ptrDerefInvalid, .scalarNicheInvalid]",
+            "else ops.flatMap censusOperandFaultClasses ++ censusAggregateKindFaultClasses kind",
+            "theorem evalRvalue_cast_ub_cause",
+            "theorem evalRvalue_aggregate_ub_cause",
+            "theorem evalRvalue_cast_own_ub_witnesses",
+            "theorem evalOperands_ub_implies_mem_censusOperands",
+        ] {
+            assert!(
+                LEAN_PROTOTYPE_SRC.contains(decl),
+                "missing `[adv ep1-B1]` Lean census declaration `{decl}`"
+            );
+        }
+    }
+
+    /// `[adv ep1-B1]` The independent obligation-side emitter
+    /// (`obligations::emit_obligation_fault_sites_for_body`) must agree with the
+    /// census site-for-site on randomized retag-stripped bodies and on every
+    /// construct whose classes changed in `[adv ep1-B1]`, so a census rule change
+    /// can never silently leave the emitter behind (or vice versa).
+    #[test]
+    fn test_ep1_b1_obligation_emitter_matches_census_on_randomized_bodies() {
+        let mut rng = FuzzRng(0x5EED_0B11_6A71_00E5);
+        for case in 0..600 {
+            let ir = fuzz_captured_mir(&mut rng);
+            let proto = ProtoMirBody::from_ir_captured_mir(&ir, true);
+            let census: BTreeSet<FaultSite> =
+                census_mir_fault_sites(&proto).into_iter().collect();
+            let emitted: BTreeSet<FaultSite> =
+                crate::obligations::emit_obligation_fault_sites_for_body(&proto)
+                    .into_iter()
+                    .collect();
+            assert_eq!(census, emitted, "case {case}: emitter/census divergence");
+        }
+
+        let constant_operand = || ProtoOperand::const_u32(0);
+        let rvalues = vec![
+            ProtoRvalue::Cast(
+                ProtoCastKind::PointerCoercion(String::from("MutToConstPointer")),
+                constant_operand(),
+            ),
+            ProtoRvalue::Cast(ProtoCastKind::PointerExposeProvenance, constant_operand()),
+            ProtoRvalue::Cast(ProtoCastKind::PointerWithExposedProvenance, constant_operand()),
+            ProtoRvalue::Cast(ProtoCastKind::FloatToInt, constant_operand()),
+            ProtoRvalue::Aggregate(
+                ProtoAggregateKind::Adt(String::from("demo::U"), 0, Some(0)),
+                vec![constant_operand()],
+            ),
+            ProtoRvalue::Aggregate(ProtoAggregateKind::RawPtr(true), vec![constant_operand()]),
+            ProtoRvalue::Aggregate(
+                ProtoAggregateKind::Adt(String::from("demo::S"), 0, None),
+                vec![constant_operand()],
+            ),
+        ];
+        for rv in rvalues {
+            let body = ProtoMirBody {
+                def_path: String::from("demo::ep1_b1"),
+                basic_blocks: vec![ProtoBasicBlock {
+                    statements: vec![ProtoStatement::new(ProtoStatementKind::Assign(
+                        ProtoPlace::local(0),
+                        rv.clone(),
+                    ))],
+                    terminator: ProtoTerminator::new(ProtoTerminatorKind::Return),
+                    is_cleanup: false,
+                }],
+            };
+            let census: BTreeSet<FaultSite> = census_mir_fault_sites(&body).into_iter().collect();
+            let emitted: BTreeSet<FaultSite> =
+                crate::obligations::emit_obligation_fault_sites_for_body(&body)
+                    .into_iter()
+                    .collect();
+            assert_eq!(census, emitted, "{rv:?}");
+            let own_rvalue_classes: BTreeSet<MirFaultClass> = census
+                .iter()
+                .filter(|s| s.stmt_idx == 0)
+                .map(|s| s.fault_class)
+                .filter(|c| {
+                    !matches!(
+                        c,
+                        MirFaultClass::StorageLiveProtected | MirFaultClass::TreeBorrowsViolation
+                    )
+                })
+                .collect();
+            let expect_own = !matches!(
+                rv,
+                ProtoRvalue::Cast(ProtoCastKind::FloatToInt, _)
+                    | ProtoRvalue::Aggregate(ProtoAggregateKind::Adt(_, _, None), _)
+            );
+            assert_eq!(!own_rvalue_classes.is_empty(), expect_own, "{rv:?}: {census:?}");
         }
     }
 }

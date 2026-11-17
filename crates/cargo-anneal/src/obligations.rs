@@ -21,7 +21,7 @@ use crate::fault_census::{
     ProtoCastKind, ProtoConstValue, ProtoIntrinsic, ProtoMirBody, ProtoOperand, ProtoPlace,
     ProtoProjectionElem, ProtoRvalue, ProtoStatementKind, ProtoTerminatorKind, ProtoUnOp,
     ProtoUnwindAction, census_mir_fault_sites, direct_callee_def_paths,
-    parse_lean_captured_mir_def, reconcile_multi_item_coverage, reified_fn_def_paths,
+    parse_lean_mir_module_body_strict, reconcile_multi_item_coverage, reified_fn_def_paths,
 };
 
 /// Structural category of a fault site emitted by the `obligations.rs`
@@ -305,14 +305,22 @@ fn push_obligation_rvalue_sites(
                 ProtoCastKind::IntToInt
                 | ProtoCastKind::FloatToInt
                 | ProtoCastKind::FloatToFloat
-                | ProtoCastKind::IntToFloat
-                | ProtoCastKind::PointerExposeProvenance
-                | ProtoCastKind::PointerWithExposedProvenance => {}
+                | ProtoCastKind::IntToFloat => {}
+                ProtoCastKind::PointerExposeProvenance => {
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::PtrDerefInvalid);
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid);
+                }
+                ProtoCastKind::PointerWithExposedProvenance => {
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid);
+                }
                 ProtoCastKind::Transmute | ProtoCastKind::Subtype => {
                     push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid);
                     push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::UninitRead);
                 }
-                ProtoCastKind::PointerCoercion(c) if c == "MutToConstPointer" => {}
+                ProtoCastKind::PointerCoercion(c) if c == "MutToConstPointer" => {
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::PtrDerefInvalid);
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid);
+                }
                 ProtoCastKind::PointerCoercion(c)
                     if c == "Unsize" || c == "ArrayToPointer" =>
                 {
@@ -390,6 +398,22 @@ fn push_obligation_rvalue_sites(
                 for op in ops {
                     push_obligation_operand_sites(op, bb_idx, stmt_idx, out);
                 }
+            }
+            match kind {
+                ProtoAggregateKind::Adt(_, _, Some(_)) => {
+                    // Union construction: active-field overlay may fail.
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid);
+                }
+                ProtoAggregateKind::RawPtr(_) => {
+                    // `ptr::from_raw_parts`: pointer/metadata width and shape checks.
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::PtrDerefInvalid);
+                    push_rvalue_site(out, bb_idx, stmt_idx, MirFaultClass::ScalarNicheInvalid);
+                }
+                ProtoAggregateKind::Array
+                | ProtoAggregateKind::Tuple
+                | ProtoAggregateKind::Adt(_, _, None)
+                | ProtoAggregateKind::Closure(_)
+                | ProtoAggregateKind::Coroutine(_) => {}
             }
         }
         ProtoRvalue::CopyForDeref(place) => {
@@ -904,13 +928,15 @@ pub fn compute_bundle_fault_census_receipt(
     registry: &PropertyRegistry,
     dropped_sites: &BTreeSet<FaultSite>,
 ) -> Result<(FaultCensusReceipt, MultiItemCoverageVerdict), CensusScanError> {
-    let mut subject_body = parse_lean_captured_mir_def(mir_lean_src, "body")?;
+    // `[adv ep1-B1]`: enforce the strict `Mir/<Item>.lean` module grammar before
+    // trusting the scanned body (the same entry point as `census_lean_mir_module`).
+    let mut subject_body = parse_lean_mir_module_body_strict(mir_lean_src)?;
     if subject_body.def_path.is_empty() {
         subject_body.def_path = bundle.subject.target.def_id.clone();
     }
     let mut callee_bodies = Vec::with_capacity(callee_mir_sources.len());
     for (callee_def_id, callee_src) in callee_mir_sources {
-        let mut cbody = parse_lean_captured_mir_def(callee_src, "body")?;
+        let mut cbody = parse_lean_mir_module_body_strict(callee_src)?;
         if cbody.def_path.is_empty() {
             cbody.def_path = callee_def_id.clone();
         }
@@ -968,6 +994,49 @@ pub fn compute_bundle_fault_census_receipt(
         reasons: verdict.reasons().to_vec(),
     };
     Ok((receipt, verdict))
+}
+
+/// Header line of the fault-site census summary embedded in the
+/// `Obligations/<Item>.lean` module docstring.
+pub(crate) const FAULT_CENSUS_SUMMARY_HEADER: &str =
+    "Fault-site census coverage summary (compiler-generated metadata):";
+
+/// `[adv ep1-B1]` Defang one line of compiler-generated metadata for embedding inside
+/// a Lean `/-! ... -/` docstring: a literal `-/` would close the comment early (and
+/// let the remainder of the line be elaborated as Lean commands) and a stray `/-`
+/// would open a nested comment that swallows the rest of the module.
+pub(crate) fn docstring_safe_line(line: &str) -> String {
+    line.replace("-/", "- /").replace("/-", "/ -")
+}
+
+/// Render the census summary block (header plus one `- ` bullet per summary line).
+pub(crate) fn render_fault_census_summary_block(receipt: &FaultCensusReceipt) -> String {
+    let mut out = format!("{FAULT_CENSUS_SUMMARY_HEADER}\n");
+    for line in receipt.summary_lines() {
+        out.push_str(&format!("- {}\n", docstring_safe_line(&line)));
+    }
+    out
+}
+
+/// `[adv ep1-B1]` Replace (or, when `receipt` is `None`, remove) the census summary
+/// block of an existing `Obligations/<Item>.lean` module so that
+/// `refresh_workspace_assembly` never leaves a stale verdict in the docstring.
+/// Modules rendered without a summary block are returned unchanged.
+pub(crate) fn refresh_obligations_census_summary(
+    ob_text: &str,
+    receipt: Option<&FaultCensusReceipt>,
+) -> String {
+    let Some(start) = ob_text.find(FAULT_CENSUS_SUMMARY_HEADER) else {
+        return ob_text.to_string();
+    };
+    let line_start = ob_text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let next_line = |from: usize| ob_text[from..].find('\n').map_or(ob_text.len(), |i| from + i + 1);
+    let mut end = next_line(start);
+    while end < ob_text.len() && ob_text[end..].starts_with("- ") {
+        end = next_line(end);
+    }
+    let replacement = receipt.map(render_fault_census_summary_block).unwrap_or_default();
+    format!("{}{}{}", &ob_text[..line_start], replacement, &ob_text[end..])
 }
 
 /// Presence of optional user-authored Lean modules under `anneal/proofs/` for a
@@ -1626,10 +1695,8 @@ pub fn render_obligations_module_with_census(
         }
     }
     if let Some(receipt) = fault_census {
-        out.push_str("\nFault-site census coverage summary (compiler-generated metadata):\n");
-        for line in receipt.summary_lines() {
-            out.push_str(&format!("- {line}\n"));
-        }
+        out.push('\n');
+        out.push_str(&render_fault_census_summary_block(receipt));
     }
     out.push_str("-/\n\n");
 
@@ -4153,5 +4220,46 @@ mod tests {
             ),
             "verify module with authored ModularItemSpec and no Proof must target modularClaim:\n{verify_mod}"
         );
+    }
+
+    /// `[adv ep1-B1]` Census summaries embedded in `Obligations/<Item>.lean`
+    /// docstrings are defanged against comment injection and refreshed in place.
+    #[test]
+    fn fault_census_summary_docstring_is_defanged_and_refreshable() {
+        assert_eq!(
+            docstring_safe_line("callee `evil -/ theorem x /- y`"),
+            "callee `evil - / theorem x / - y`"
+        );
+        let receipt = |verdict: &str, callee: &str| FaultCensusReceipt {
+            def_path: String::from("demo::caller"),
+            mir_module_sha256: String::new(),
+            census_sites: Vec::new(),
+            discharged_sites: Vec::new(),
+            callee_closure: CalleeClosure {
+                inline_callees: vec![callee.to_string()],
+                external_callees: Vec::new(),
+            },
+            reconciliation_verdict: verdict.to_string(),
+            is_verified: verdict == "VERIFIED",
+            reasons: Vec::new(),
+        };
+        let module = format!(
+            "/-!\nDisposable verification obligations for `demo::caller`.\n- Inline requires: `r` (`Mir.R`)\n\n{}-/\n\ndef x := 1\n",
+            render_fault_census_summary_block(&receipt("VERIFIED", "demo::leaf -/ evil"))
+        );
+        assert!(!module.contains("leaf -/"), "{module}");
+        let refreshed = refresh_obligations_census_summary(
+            &module,
+            Some(&receipt("UNKNOWN(UNSUPPORTED_CONSTRUCT)", "demo::other")),
+        );
+        assert_eq!(refreshed.matches(FAULT_CENSUS_SUMMARY_HEADER).count(), 1, "{refreshed}");
+        assert!(refreshed.contains("verdict: UNKNOWN(UNSUPPORTED_CONSTRUCT)"), "{refreshed}");
+        assert!(!refreshed.contains("verdict: VERIFIED"), "{refreshed}");
+        assert!(refreshed.contains("- Inline requires: `r` (`Mir.R`)\n"), "{refreshed}");
+        assert!(refreshed.ends_with("-/\n\ndef x := 1\n"), "{refreshed}");
+        let removed = refresh_obligations_census_summary(&module, None);
+        assert!(!removed.contains(FAULT_CENSUS_SUMMARY_HEADER), "{removed}");
+        assert!(removed.ends_with("-/\n\ndef x := 1\n"), "{removed}");
+        assert_eq!(refresh_obligations_census_summary("def y := 2\n", None), "def y := 2\n");
     }
 }

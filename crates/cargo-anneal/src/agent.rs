@@ -32,6 +32,7 @@ use std::path::{Component, Path, PathBuf};
 use anneal_rustc_capture::manifest::{escape_json, sha256_hex};
 use anneal_rustc_capture::{CapturedItemKind, CapturedTarget, UnitTargetRecord};
 
+use crate::fault_census::PropertyRegistry;
 use crate::obligations::{
     AuthoredItemModules, SubjectObligationBundle, derive_item_module_suffix,
     group_subject_obligations, module_suffix_to_rel_path, render_obligations_module_with_options,
@@ -2241,15 +2242,36 @@ pub fn render_agent_context(
             bundle.inline_ensures.len(),
             bundle.external_specs.len()
         ));
-        if let Ok(Some((receipt, _verdict))) =
-            compute_workspace_bundle_fault_census(&mir_root, records, bundle)
-        {
-            out.push_str("### Fault-Site Census & Coverage Reconciliation\n\n");
-            for line in receipt.summary_lines() {
-                out.push_str(&format!("- {line}\n"));
+        out.push_str("### Fault-Site Census & Coverage Reconciliation\n\n");
+        match compute_workspace_bundle_fault_census(&mir_root, records, bundle) {
+            Ok(Some((receipt, _verdict))) => {
+                for line in receipt.summary_lines() {
+                    out.push_str(&format!("- {line}\n"));
+                }
+                // `[adv ep1-B1]`: surface why a batch is not reconciled (unmapped
+                // sites, unclosed callees, scan errors) instead of only the verdict.
+                for reason in receipt.reasons.iter().take(8) {
+                    out.push_str(&format!("  - reason: {reason}\n"));
+                }
+                if receipt.reasons.len() > 8 {
+                    out.push_str(&format!(
+                        "  - ... {} more reason(s) in `.anneal/generated/FaultCensus/{}`\n",
+                        receipt.reasons.len() - 8,
+                        bundle.item_rel_path.with_extension("json").display()
+                    ));
+                }
             }
-            out.push('\n');
+            Ok(None) => out.push_str(
+                "- Fault-site census: unavailable (no captured `def body : CapturedMir` in \
+                 `Mir/<Item>.lean`); `cargo anneal verify` fails closed with \
+                 UNKNOWN(UNMAPPED_FAULT_SITE) for this item\n",
+            ),
+            Err(err) => out.push_str(&format!("- Fault-site census: unavailable ({err})\n")),
         }
+        out.push_str(&format!(
+            "- Property registry: {}\n\n",
+            PropertyRegistry::all_verified().summary_line()
+        ));
         if fragment_class.inferred_fragment > MirFragment::PureBoundedLoop
             && let Some(diagnostic) = render_mir_fragment_diagnostic(def_id, &fragment_class)
         {
