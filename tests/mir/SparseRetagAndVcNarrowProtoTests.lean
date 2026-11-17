@@ -779,6 +779,92 @@ theorem test_partB_diverging_external_call :
    canary_divergingExternalCall_coneSafe.2.1,
    canary_divergingExternalCall_coneSafe.2.2.2.2⟩
 
+/-- External tail call (`canary_tailExternalCall_coneSafe`): `proto::tail_helper` tail-calls external
+`ext::tail_seed`; on `.returned (.scalar ⟨11, 4⟩) protoTailExtReq.memory`, `resumeExternalTailCall`
+pops the caller frame of `protoTailExtRootMir` and resumes in `bb1` in a cone-safe state
+(`stepConeSafeTrait_of_resumeExternalTailCall`). -/
+theorem test_partB_tail_external_call :
+    protoTailExtStep = .vis (.inr (.inr (.call protoTailExtReq))) protoTailExtCont ∧
+    protoTailExtReq.defPath = "ext::tail_seed" ∧
+    protoTailExtCont (.returned (.scalar ⟨11, 4⟩) protoTailExtReq.memory) =
+      .running protoTailExtStateAfterReturn ∧
+    protoTailExtStateAfterReturn.frame.blockIdx = 1 ∧
+    protoTailExtStateAfterReturn.memory.callStack = [] ∧
+    StepConeSafeTrait protoTailExtCone protoTailExtRootMir protoTailExtStateAfterReturn :=
+  ⟨protoTailExtStep_eq,
+   canary_tailExternalCall_coneSafe.1,
+   canary_tailExternalCall_coneSafe.2.1,
+   canary_tailExternalCall_coneSafe.2.2.1,
+   canary_tailExternalCall_coneSafe.2.2.2.1,
+   canary_tailExternalCall_coneSafe.2.2.2.2⟩
+
+/-- Whole-execution lossless cone filtering (`wpMirExecExt_cone_iff_unfiltered_of_summarized`,
+`wpMirExecExtCF_cone_iff_unfiltered`, and `vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert`):
+1. On `protoTwoExtCallsRootMir` with an extra out-of-cone summary `⟨"ext::unrelated", 99⟩`,
+   cone-filtered `wpMirExecExt` is logically equivalent (`↔`) to unfiltered `wpMirExecExtUnfiltered`
+   over the entire 4-step 2-call execution.
+2. Under `protoTraitBatchedCert`, `wpMirExecExtCF` on `traitCallRootMir` is logically equivalent
+   (`↔`) to unfiltered `wpMirExecExtCFUnfiltered` for arbitrary summary environments (including
+   out-of-cone summaries and unsummarized havoc). -/
+theorem test_partB_whole_exec_lossless :
+    (wpMirExecExt protoTwoExtContracts protoTwoExtCone
+        (protoTwoExtSummaries ++ [⟨"ext::unrelated", 99⟩]) 4
+        protoTwoExtCallsRootMir (.running protoTwoExtInitState) protoTwoExtPost ↔
+      wpMirExecExtUnfiltered protoTwoExtContracts
+        (protoTwoExtSummaries ++ [⟨"ext::unrelated", 99⟩]) 4
+        protoTwoExtCallsRootMir (.running protoTwoExtInitState) protoTwoExtPost) ∧
+    wpMirExecExtUnfiltered protoTwoExtContracts
+      (protoTwoExtSummaries ++ [⟨"ext::unrelated", 99⟩]) 4
+      protoTwoExtCallsRootMir (.running protoTwoExtInitState) protoTwoExtPost ∧
+    (wpMirExecExtCF protoTwoExtContracts protoTraitCone [⟨"ext::unrelated", 99⟩] 12
+        traitCallRootMir (.running protoTraitInitState)
+        (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False) ↔
+      wpMirExecExtCFUnfiltered protoTwoExtContracts [⟨"ext::unrelated", 99⟩] 12
+        traitCallRootMir (.running protoTraitInitState)
+        (fun out => match out with | .normal (v, _) => v = Value.scalar ⟨31, 4⟩ | _ => False)) := by
+  have h_iff := wpMirExecExt_cone_iff_unfiltered_of_summarized
+    (cone := protoTwoExtCone) (root := protoTwoExtCallsRootMir) (c₁ := []) (ti₁ := [])
+    protoTwoExtContracts (protoTwoExtSummaries ++ [⟨"ext::unrelated", 99⟩]) protoTwoExtPost
+    (by decide +kernel) (by decide +kernel)
+    (fun _ _ _ he => nomatch he)
+    (fun dp hdp => by
+      cases hdp with
+      | head => rfl
+      | tail _ hdp2 =>
+        cases hdp2 with
+        | head => rfl
+        | tail _ hnil => nomatch hnil)
+    (fun tag req ans hc => by
+      rcases hc with ⟨_, rfl⟩ | ⟨_, _, rfl⟩ <;> exact ⟨rfl, rfl, rfl, CallerBodiesEq.refl _⟩)
+    4 (.running protoTwoExtInitState)
+    (closedInvPoly_entry rfl rfl rfl rfl)
+  have h_vc_ext : wpMirExecExt protoTwoExtContracts protoTwoExtCone
+      (protoTwoExtSummaries ++ [⟨"ext::unrelated", 99⟩]) 4
+      protoTwoExtCallsRootMir (.running protoTwoExtInitState) protoTwoExtPost := by
+    exact (wpMirExecExt_congr_ext protoTwoExtContracts protoTwoExtCone
+      (ext₁ := protoTwoExtSummaries)
+      (ext₂ := protoTwoExtSummaries ++ [⟨"ext::unrelated", 99⟩])
+      (fun dp => by
+        unfold coneSummary?
+        by_cases h : inCone protoTwoExtCone dp = true
+        · simp only [h, ↓reduceIte]
+          cases inCone_iff.mp h with
+          | head => rfl
+          | tail _ h2 =>
+            cases h2 with
+            | head => rfl
+            | tail _ hnil => nomatch hnil
+        · simp only [h, Bool.false_eq_true, ↓reduceIte])
+      protoTwoExtCallsRootMir protoTwoExtPost 4 (.running protoTwoExtInitState)).mpr
+      canary_twoExternalCalls_vc.2.2.1
+  exact ⟨h_iff, h_iff.mp h_vc_ext,
+    vcMirWithCalleesCF_narrow_unfiltered_of_batchedCert
+      (BatchedVcConeNarrowCert.ofCheckGeneral
+        (by decide +kernel :
+          checkBatchedVcConeNarrowCertGeneral protoTraitCone traitCallRootMir
+            protoFullCallees protoTraitMask [] [⟨"ext::unrelated", 99⟩] [] = true))
+      protoTwoExtContracts 12 protoTraitInitState rfl rfl rfl rfl _⟩
+
 /- Meta-level non-reducibility audit confirming that `rfl` / `isDefEq` CANNOT discharge the symbolic
 VC `symTrait_vc_narrow` because `Nat.ble 4294967296 ((x % 1000) + 7)` and
 `Nat.ble 4294967296 (((x % 1000) + 7) + 24)` are not definitionally equal to `false`, and
@@ -1097,6 +1183,54 @@ run_cmd do
         checkBatchedVcConeNarrowCert protoSymCone symTraitRootMir symFullCallees128
           (symFullCallees128.map (fun b => inCone protoSymCone b.defPath)) [] [] [] = true := by
       decide +kernel)
+  bench "PartB_symVC_narrowCached2_M128" `(command|
+    theorem $(mkIdent `bench_partB_symVC_narrowCached2_128) (x : Nat) :
+        vcMirWithCallees protoSymContracts 8 symTraitRootMir
+          (symTraitInitState (x % 65536) symFullCallees128)
+          [protoSymPoly, protoSymCircleArea] [protoAreaEntry] [] protoSymCone
+          (symTraitPost (x % 65536)) := by
+      have h_ovf1 : Nat.ble 4294967296 (Nat.add (x % 65536) 7) = false := by
+        rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]; change ¬(4294967296 ≤ (x % 65536) + 7); omega
+      have h_ovf2 : Nat.ble 4294967296 (Nat.add (Nat.add (x % 65536) 7) 24) = false := by
+        rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]; change ¬(4294967296 ≤ ((x % 65536) + 7) + 24); omega
+      unfold vcMirWithCallees
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau
+        (stepMirState_assign_local _ _ _ _ _ _ _ _ _ _ _ rfl rfl rfl rfl
+          (evalRvalue_addUnchecked_u32 _ _ _ rfl h_ovf1) rfl rfl rfl) ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau
+        (stepMirState_assign_local _ _ _ _ _ _ _ _ _ _ _ rfl rfl rfl rfl
+          (evalRvalue_addUnchecked_u32 _ _ _ rfl h_ovf2) rfl rfl rfl) ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_ret rfl ?_
+      exact congrArg (fun n => Value.scalar ⟨n, 4⟩)
+        (by change ((x % 65536) + 7) + 24 = (x % 65536) + 31; omega))
+  bench "PartB_symVC_narrowCached3_M128" `(command|
+    theorem $(mkIdent `bench_partB_symVC_narrowCached3_128) (x : Nat) :
+        vcMirWithCallees protoSymContracts 8 symTraitRootMir
+          (symTraitInitState (x % 1000000) symFullCallees128)
+          [protoSymPoly, protoSymCircleArea] [protoAreaEntry] [] protoSymCone
+          (symTraitPost (x % 1000000)) := by
+      have h_ovf1 : Nat.ble 4294967296 (Nat.add (x % 1000000) 7) = false := by
+        rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]; change ¬(4294967296 ≤ (x % 1000000) + 7); omega
+      have h_ovf2 : Nat.ble 4294967296 (Nat.add (Nat.add (x % 1000000) 7) 24) = false := by
+        rw [Bool.eq_false_iff, ne_eq, Nat.ble_eq]; change ¬(4294967296 ≤ ((x % 1000000) + 7) + 24); omega
+      unfold vcMirWithCallees
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau
+        (stepMirState_assign_local _ _ _ _ _ _ _ _ _ _ _ rfl rfl rfl rfl
+          (evalRvalue_addUnchecked_u32 _ _ _ rfl h_ovf1) rfl rfl rfl) ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_tau
+        (stepMirState_assign_local _ _ _ _ _ _ _ _ _ _ _ rfl rfl rfl rfl
+          (evalRvalue_addUnchecked_u32 _ _ _ rfl h_ovf2) rfl rfl rfl) ?_
+      refine wpMirExecExt_step_tau rfl ?_
+      refine wpMirExecExt_step_ret rfl ?_
+      exact congrArg (fun n => Value.scalar ⟨n, 4⟩)
+        (by change ((x % 1000000) + 7) + 24 = (x % 1000000) + 31; omega))
   bench "PartB_coerce_sealed_simp" `(command|
     theorem bench_partB_coerce_sealed :
         ∀ bits : Nat, chainCoerceSealed 16 (.scalar ⟨bits, 4⟩) =
@@ -1133,6 +1267,33 @@ theorem test_partB_symVC_transfer_128 (x : Nat) :
     (symTraitPost (x % 1000))
     (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl)
     (fun _ _ _ => Iff.rfl)).mp (bench_partB_symVC_narrowCached_128 x)
+
+/-- Amortized 3-VC batch transfer at `M = 128`: three distinct symbolic VCs (`x % 1000`, `x % 65536`,
+and `x % 1000000`) proved on the cached narrowed table share the SINGLE `bench_partB_symVC_cert_128`
+certificate (`1 × cert + 3 × narrowCached < 3 × full`) and transfer to the full 128-entry table! -/
+theorem test_partB_symVC_batch3_transfer_128 (x : Nat) :
+    vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState (x % 1000) symFullCallees128)
+      symFullCallees128 [] [] protoSymCone (symTraitPost (x % 1000)) ∧
+    vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState (x % 65536) symFullCallees128)
+      symFullCallees128 [] [] protoSymCone (symTraitPost (x % 65536)) ∧
+    vcMirWithCallees protoSymContracts 8 symTraitRootMir
+      (symTraitInitState (x % 1000000) symFullCallees128)
+      symFullCallees128 [] [] protoSymCone (symTraitPost (x % 1000000)) := by
+  have hcert := BatchedVcConeNarrowCert.ofCheck bench_partB_symVC_cert_128.2
+  rw [symCachedNarrow_eq_computed_128.1, symCachedNarrow_eq_computed_128.2] at hcert
+  refine ⟨test_partB_symVC_transfer_128 x, ?_, ?_⟩
+  · exact (vcMirWithCallees_narrow_of_batchedCert hcert protoSymContracts 8
+      (symTraitInitState (x % 65536) symFullCallees128) rfl rfl rfl rfl
+      (symTraitPost (x % 65536))
+      (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl)
+      (fun _ _ _ => Iff.rfl)).mp (bench_partB_symVC_narrowCached2_128 x)
+  · exact (vcMirWithCallees_narrow_of_batchedCert hcert protoSymContracts 8
+      (symTraitInitState (x % 1000000) symFullCallees128) rfl rfl rfl rfl
+      (symTraitPost (x % 1000000))
+      (fun out => by rcases out with ⟨v, m⟩ | _ | _ <;> exact Iff.rfl)
+      (fun _ _ _ => Iff.rfl)).mp (bench_partB_symVC_narrowCached3_128 x)
 
 /-! ## 5. Part C Witnesses & Scaling (`DemandCallerLocationEnv`, `lean-miri#67`) -/
 
@@ -1323,6 +1484,60 @@ theorem test_partC_borrowMonotone_and_trace_borrowAware :
       protoRetagLocalDecls protoLayouts protoBorrowMonotoneTrace (by decide +kernel)
       protoLocState_fresh protoLocState_borrowsFresh (protoSites_fileLenOk pol pol)).1
 
+/-- Interprocedural terminator + borrow-monotone trace (`protoCallReturnBorrowTrace`) combining:
+- `StorageLive(_2)`, `_2 = 42`, `_1 = &mut _2`, `Retag([fn entry] _1)` (minting tags `2, 1`),
+- `.terminatorStep ⟨.goto 2, "goto2"⟩ none`,
+- `.invokeCallerLocation 2`,
+- `Retag([default] _1)` (minting fresh stack borrow tag after `caller_location`),
+- `.terminatorStep ⟨.drop ⟨2, []⟩ 0 .continue_, "drop2"⟩ none`,
+- `.invokeCallerLocation 0`. -/
+def protoCallReturnBorrowTrace : List CallerLocationTraceEvent :=
+  [ .normalStep ⟨.storageLive 2, "sl2"⟩,
+    .normalStep ⟨.assign ⟨2, []⟩ (.use (protoU32Const 42)), "init2"⟩,
+    .normalStep ⟨.assign ⟨1, []⟩ (.ref (.mut false) ⟨2, []⟩), "ref1"⟩,
+    .normalStep protoFnEntryRetagStmt,
+    .terminatorStep ⟨.goto 2, "goto2"⟩ none,
+    .invokeCallerLocation 2,
+    .normalStep protoDefaultRetagStmt,
+    .terminatorStep ⟨.drop ⟨2, []⟩ 0 .continue_, "drop2"⟩ none,
+    .invokeCallerLocation 0 ]
+
+/-- Closed witness for `evalTerminator_borrowMonotone_frame`,
+`normalTerminatorStep_eq_raw_of_borrowMonotone`, and
+`demandCallerLocation_bisim_eager_borrowAware` on `protoCallReturnBorrowTrace` (which steps `.goto`
+and `.drop` terminators alongside `&mut _2` borrow creation, `.retag`, and `.invokeCallerLocation`). -/
+theorem test_partC_terminator_trace_borrowAware :
+    (normalTerminatorStep protoLocState ⟨.goto 2, "goto2"⟩ none).frame.blockIdx = 2 ∧
+    readLocationsBorrowAware
+        (runDemandCallerLocationTrace (protoSites {} {}) {} protoLocState protoRetagLocalDecls
+          protoLayouts protoCallReturnBorrowTrace).2.2.memory
+        (runDemandCallerLocationTrace (protoSites {} {}) {} protoLocState protoRetagLocalDecls
+          protoLayouts protoCallReturnBorrowTrace).2.1 =
+      [ some (protoLibRsBytes, 42, 13), some (protoLibRsBytes, 108, 7) ] ∧
+    (∀ pol ∈ allLocationDetailPolicies,
+      readLocationsBorrowAware
+          (runDemandCallerLocationTrace (protoSites pol pol) {} protoLocState protoRetagLocalDecls
+            protoLayouts protoCallReturnBorrowTrace).2.2.memory
+          (runDemandCallerLocationTrace (protoSites pol pol) {} protoLocState protoRetagLocalDecls
+            protoLayouts protoCallReturnBorrowTrace).2.1 =
+        readLocationsBorrowAware
+          (runEagerCallerLocationWorld (protoSites pol pol) protoLocState protoRetagLocalDecls
+            protoLayouts protoCallReturnBorrowTrace).2.memory
+          (runEagerCallerLocationWorld (protoSites pol pol) protoLocState protoRetagLocalDecls
+            protoLayouts protoCallReturnBorrowTrace).1) := by
+  refine ⟨?_, ?_, ?_⟩
+  · rw [normalTerminatorStep_eq_raw_of_borrowMonotone _ _ _ rfl]
+    rfl
+  · have h_ba := (demandCallerLocation_bisim_eager_borrowAware (protoSites {} {}) protoLocState
+      protoRetagLocalDecls protoLayouts protoCallReturnBorrowTrace (by decide +kernel)
+      protoLocState_fresh protoLocState_borrowsFresh (protoSites_fileLenOk {} {})).2
+    rw [h_ba]
+    decide +kernel
+  · intro pol _
+    exact (demandCallerLocation_bisim_eager_borrowAware (protoSites pol pol) protoLocState
+      protoRetagLocalDecls protoLayouts protoCallReturnBorrowTrace (by decide +kernel)
+      protoLocState_fresh protoLocState_borrowsFresh (protoSites_fileLenOk pol pol)).1
+
 def buildCandidateSites : Nat → List CallerLocationSite
   | 0 => []
   | k + 1 =>
@@ -1510,20 +1725,47 @@ run_cmd do
   let testPfx := `Anneal.SparseRetagAndVcNarrowProtoTests
   let some modIdx := env.getModuleIdx? protoMod
     | throwError "module {protoMod} not imported"
+  let collectAxiomsFrom (roots : Array Name) : CommandElabM (Array Name) := do
+    let mut visited : NameSet := {}
+    let mut axioms : NameSet := {}
+    let mut work : Array Name := roots
+    while !work.isEmpty do
+      let c := work.back!
+      work := work.pop
+      unless visited.contains c do
+        visited := visited.insert c
+        let modIdx? := env.getModuleIdxFor? c
+        if modIdx?.isSome && modIdx? != some modIdx then
+          for ax in (← Lean.collectAxioms c) do
+            axioms := axioms.insert ax
+        else
+          match env.find? c with
+          | some (.axiomInfo v) =>
+            axioms := axioms.insert c
+            for d in v.type.getUsedConstants do
+              unless visited.contains d do work := work.push d
+          | some (.inductInfo v) =>
+            for d in v.type.getUsedConstants do
+              unless visited.contains d do work := work.push d
+            for ctor in v.ctors do
+              unless visited.contains ctor do work := work.push ctor
+          | some ci =>
+            for d in ci.getUsedConstantsAsSet do
+              unless visited.contains d do work := work.push d
+          | none => pure ()
+    return axioms.toArray
   let mut audited : Nat := 0
   let mut theorems : Nat := 0
   let mut auditedSet : NameSet := {}
   let mut auditedThmSet : NameSet := {}
   let mut auditedThms : Array Name := #[]
   let mut leaked : Array Name := #[]
+  let mut protoRoots : Array Name := #[]
   for (n, ci) in env.constants.map₁.toList do
     if env.getModuleIdxFor? n == some modIdx then
       if ci.isUnsafe then
         throwError "unsafe declaration in {protoMod}: {n}"
-      let axs ← collectAxioms n
-      for a in axs do
-        unless allowed.contains a do
-          throwError "{n} in {protoMod} depends on disallowed axiom {a}"
+      protoRoots := protoRoots.push n
       let un := (Lean.privateToUserName? n).getD n
       if protoMod.isPrefixOf un then
         audited := audited + 1
@@ -1549,6 +1791,9 @@ run_cmd do
             last.startsWith "eq_" || last.startsWith "_sparseCasesOn_"
         unless un.hasMacroScopes || isRealizedEq do
           leaked := leaked.push un
+  for a in (← collectAxiomsFrom protoRoots) do
+    unless allowed.contains a do
+      throwError "{protoMod} depends on disallowed axiom {a}"
   unless leaked.isEmpty do
     throwError "leaked constants outside {protoMod}: {leaked}"
   -- Placeholder detector: a `have _ := @thm` (elaborated as `let`/`letFun`) whose value is a bare
@@ -1610,14 +1855,12 @@ run_cmd do
   let mut conditionals : Array Name := #[]
   let mut reached : NameSet := {}
   let mut work : Array Name := #[]
+  let mut testRoots : Array Name := #[]
   for (n, ci) in env.constants.map₂.toList do
     if testPfx.isPrefixOf n then
       if ci.isUnsafe then
         throwError "unsafe declaration in {testPfx}: {n}"
-      let axs ← collectAxioms n
-      for a in axs do
-        unless allowed.contains a do
-          throwError "{n} in {testPfx} depends on disallowed axiom {a}"
+      testRoots := testRoots.push n
       audited := audited + 1
       if let some v := ci.value? then
         if (v.find? isPlaceholder).isSome then
@@ -1630,6 +1873,9 @@ run_cmd do
           if (auditedSet.contains c || testSet.contains c) && !reached.contains c then
             reached := reached.insert c
             work := work.push c
+  for a in (← collectAxiomsFrom testRoots) do
+    unless allowed.contains a do
+      throwError "{testPfx} depends on disallowed axiom {a}"
   unless placeholders.isEmpty do
     throwError "placeholder-only prototype theorem uses (`have _ := @thm`) in: {placeholders.toList}"
   while !work.isEmpty do
