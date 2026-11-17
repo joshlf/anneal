@@ -34,6 +34,7 @@ structure AccessConfig (K User : Type) where
   syncAccess : Bool → AllocId → AllocRange → MachineM K User Unit
   retainTouched : Machine K User → Option (AllocationAccessRef Provenance BorrowTree) → Machine K User
   memoryError : MemoryOperandError → StepError
+  deinitMovedPlace : Bool := false
 
 private def treeError (status : BorrowTree.BorrowTreeAccessStatus) : StepError :=
   match status with
@@ -96,8 +97,54 @@ private def finish (config : AccessConfig K User) (hooks : AccessState K User)
   | .ok value => return value
   | .error error => throw (hooks.pendingError.getD (config.memoryError error))
 
-def readImmediate [DecidableEq K] (config : AccessConfig K User) (operand : OpTy Provenance) :
+/-- Borrow-tracker-silent and race-silent allocation access hooks: the pointer
+resolution of `accessHooks`, with no diagnostic, data-race, weak-memory, Tree
+Borrows or synchronization effect (`tbSilentAccessHooks`). Used only by the
+consumer-side (`deinitMovedPlace`) move deinitialization and in-place argument
+snapshot/restore, never by an ordinary source access. -/
+def rawAccessHooks (config : AccessConfig K User) :
+    AllocationAccessHooks Provenance BorrowTree K (AccessState K User) ProvenanceExtra :=
+  tbSilentAccessHooks (accessHooks config)
+
+/-- Consumer-side move deinitialization: write `uninit` over `place` through
+`rawAccessHooks`, so no Tree Borrows `.Write` (sibling `Frozen` shared borrows
+stay `Frozen`) and no race-detector write is performed. -/
+def writeMemoryRawUninit [DecidableEq K] (config : AccessConfig K User)
+    (place : MPlaceTy Provenance) : M K User Unit := do
+  let state ← get
+  let result := writeImmediateToMplaceNoValidate state.machine.memory ⟨state.machine, none⟩ .uninit
+    ⟨place.mplace, localMemoryLayout place.layout⟩ config.runtime config.ghostMode config.globalKind
+    config.globalHooks (rawAccessHooks config) config.dynamicLayout (fun _ => false)
+  modify fun s => { s with machine := { result.hooks.machine with memory := result.memory } }
+  finish config result.hooks result.outcome
+
+/-- Consumer-side (`deinitMovedPlace`) typed read: consume the latch record of
+this operand, perform the unchanged source read (including its Tree Borrows and
+race read accesses), then deinitialize a moved indirect source with
+`writeMemoryRawUninit`. The Tree Borrows effect of a move is therefore exactly
+the read effect of the corresponding copy. -/
+def readImmediateMoving [DecidableEq K] (config : AccessConfig K User) (operand : OpTy Provenance) :
     M K User (RvalueImmTy Provenance) := do
+  let state ← get
+  let (machine', shouldDeinit) :=
+    match operand.op with
+    | .indirect mplace => MachineHooks.takePendingMoveDeinitFor state.machine (some mplace)
+    | .immediate _ => MachineHooks.takePendingMoveDeinitFor state.machine none
+  set { state with machine := machine' }
+  let state ← get
+  let result := Miri.Interpreter.readImmediate state.machine.memory ⟨state.machine, none⟩ operand.op
+    (localMemoryLayout operand.layout) config.runtime config.ghostMode config.globalKind
+    config.globalHooks (accessHooks config) config.dynamicLayout
+  commit config result.memory result.hooks result.touched
+  let value ← finish config result.hooks result.outcome
+  if shouldDeinit then
+    if let .indirect mplace := operand.op then
+      writeMemoryRawUninit config ⟨mplace, operand.layout⟩
+  return ⟨value.value, operand.layout⟩
+
+def readImmediate [DecidableEq K] (config : AccessConfig K User) (operand : OpTy Provenance) :
+    M K User (RvalueImmTy Provenance) :=
+  if config.deinitMovedPlace then readImmediateMoving config operand else do
   let state ← get
   let result := Miri.Interpreter.readImmediate state.machine.memory ⟨state.machine, none⟩ operand.op
     (localMemoryLayout operand.layout) config.runtime config.ghostMode config.globalKind
@@ -124,6 +171,41 @@ def writeMemory [DecidableEq K] (config : AccessConfig K User)
     config.globalHooks (accessHooks config) config.dynamicLayout willValidate
   commit config result.memory result.hooks result.touched
   finish config result.hooks result.outcome
+
+/-- Whether two memory places resolve into the same allocation with intersecting
+non-empty byte ranges. Used to reject an overlapping moved memory-path copy like
+rustc's `mem_copy(.., nonoverlapping = true)`. Pointer resolution is a pure query
+(its machine effects are discarded); unresolvable pointers report no overlap and
+are diagnosed by the copy itself. -/
+def mplacesOverlap (config : AccessConfig K User) (src dst : MPlaceTy Provenance) :
+    M K User Bool := do
+  let srcSize := src.layout.layout.size
+  let dstSize := dst.layout.layout.size
+  if !src.layout.layout.isSized || !dst.layout.layout.isSized ||
+      srcSize.bytes == 0 || dstSize.bytes == 0 then
+    return false
+  let state ← get
+  let resolve := fun (place : MPlaceTy Provenance) (size : Size) =>
+    match config.resolvePointer state.machine.memory place.mplace.ptr (Int.ofNat size.bytes.toNat)
+        state.machine with
+    | .ok (.ok resolved) _ => some resolved
+    | _ => none
+  match resolve src srcSize, resolve dst dstSize with
+  | some s, some d =>
+    return s.allocId == d.allocId &&
+      decide (s.offset.bytes.toNat < d.offset.bytes.toNat + dstSize.bytes.toNat) &&
+      decide (d.offset.bytes.toNat < s.offset.bytes.toNat + srcSize.bytes.toNat)
+  | _, _ => return false
+
+/-- Consumer-side latch consumption for single-operand copies (`Use`, `Cast`,
+`Repeat`): `pure false` (no state access) unless `deinitMovedPlace` is enabled. -/
+def takeLastMoveDeinit (enabled : Bool) : M K User Bool :=
+  if enabled then do
+    let s ← get
+    let (machine', pendingFlag) := MachineHooks.takeLastPendingMoveDeinit s.machine
+    set { s with machine := machine' }
+    return pendingFlag
+  else pure false
 
 /-- The canonical zero-sized unit write preserves the entire machine and stack.
 No allocation lookup, pointer resolution or permission transition is assumed.
@@ -291,7 +373,10 @@ def placeHooks [DecidableEq K] (access : AccessConfig K User) (allocation : Allo
   memoryOffset := compiler.memoryOffset
   writeLocalImmediate := fun _ => placeWriteLocalImmediate MachineHooks.currentFrame MachineHooks.setCurrentFrame
     compiler.validationInProgress MachineHooks.afterLocalWrite compiler.debugAbiCheck
-  enforceValidity := compiler.enforceValidity, validate := compiler.validate }
+  enforceValidity := compiler.enforceValidity, validate := compiler.validate
+  takePendingMoveDeinit := takeLastMoveDeinit access.deinitMovedPlace
+  deinitMemoryRaw := fun _ memory => writeMemoryRawUninit access memory
+  moveCopyOverlaps := fun _ src dst => mplacesOverlap access src dst }
 
 /-- Compiler/type/layout preparation remains fallible; the write-uninit stage
 is supplied by the actual typed memory writer below, including races and TB. -/

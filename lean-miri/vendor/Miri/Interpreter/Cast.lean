@@ -64,6 +64,9 @@ structure CastHooks (P S C V : Type) where
   supertraitSlot : C → TyId → TyId → RvalueM S (Option Nat)
   eraseSelfTraitRef : C → Nat → RvalueM S Nat
   normalizePrincipal : C → Nat → RvalueM S (Option Nat)
+  takePendingMoveDeinit : RvalueM S Bool := pure false
+  restorePendingMoveDeinit : Bool → RvalueM S Unit := fun _ => pure ()
+  deinitSource : C → OpTy P → RvalueM S Unit := fun _ _ => pure ()
 
 namespace Cast
 private def invalid (message : String) : RvalueM S A := throw (.invalidProgram message)
@@ -359,6 +362,119 @@ def cast [PointerProvenance P] (h : CastHooks P S C V) (choice : C) (fuel : Nat)
       let box ← h.boxLayout choice pointee
       let pointer ← transmuteImmediate h pointer box
       h.derefPointer choice ⟨.immediate pointer.imm, pointer.layout⟩
+    h.copyAllowTransmute choice source dest
+
+/-- Consumer-side (`deinitMovedPlace`) cast, selected by `ExecutionMachine` only
+when `deinitMovedPlace = true` (the source `cast` above is unchanged). The move
+latch of the source operand is consumed first, so that the validity and value
+reads below never deinitialize it; a moved source is then deinitialized through
+`deinitSource` (the place dictionary's Tree-Borrows-silent writer) after its last
+read and before the destination write. Transmutes hand the latch on to the
+consuming `copyAllowTransmute`. With a disarmed latch this is `cast`. -/
+def castMoving [PointerProvenance P] (h : CastHooks P S C V) (choice : C) (fuel : Nat)
+    (source : OpTy P) (kind : CastKind) (castTy : TyId) (dest : V) : RvalueM S Unit := do
+  let shouldDeinit ← h.takePendingMoveDeinit
+  let destLayout := h.destLayout dest
+  let target ← if castTy == destLayout.ty then pure destLayout else h.layoutOf choice castTy
+  let skipValidity := match kind with
+    | .Transmute | .Subtype | .BoxDerefTransmute | .PointerCoercion .Unsize _ => true | _ => false
+  unless skipValidity do
+    if ← h.enforceValidity choice source.layout then
+      match ← h.typeInfo choice source.layout.ty with
+      | .rawPointer _ =>
+        if (match source.layout.layout.backendRepr with | .ScalarPair => true | _ => false) then h.derefPointer choice source
+      | .fnPointer => h.checkFunctionPointer choice (← readPointer h choice source)
+      | .closure _ _ upvars => if upvars != 0 then invalid "capturing closure in pointer cast"
+      | .integer _ | .floating _ | .boolean | .character | .fnDefinition _ _ => pure ()
+      | _ => invalid "unexpected input type in non-transmute/unsize cast"
+  match kind with
+  | .PointerCoercion .Unsize _ =>
+    unsizeInto h choice fuel source target dest
+    if shouldDeinit then h.deinitSource choice source
+    if ← h.enforceValidity choice destLayout then
+      let recursive ← h.enforceValidityRecursively choice destLayout
+      h.validatePlace choice dest recursive true
+  | .PointerExposeProvenance =>
+    let value ← h.readImmediate choice source
+    let result ← pointerExposeProvenance h choice value target
+    if shouldDeinit then h.deinitSource choice source
+    h.writeImmediate choice result.imm dest
+  | .PointerWithExposedProvenance =>
+    let value ← h.readImmediate choice source
+    let result ← pointerWithExposedProvenance h choice value target
+    if shouldDeinit then h.deinitSource choice source
+    h.writeImmediate choice result.imm dest
+  | .IntToInt | .IntToFloat =>
+    let value ← h.readImmediate choice source
+    let sourceKind ← h.typeInfo choice value.layout.ty
+    match sourceKind with
+    | .integer _ | .boolean | .character => pure ()
+    | _ => invalid "IntToInt/IntToFloat source type is not integer-like"
+    match ← h.typeInfo choice target.ty with
+    | .integer _ | .floating _ | .character => pure ()
+    | _ => invalid "IntToInt/IntToFloat destination type is not integer/float/char"
+    let result ← castFromIntLike h choice (← scalarOf value) value.layout target
+    if shouldDeinit then h.deinitSource choice source
+    h.writeImmediate choice result.imm dest
+  | .FloatToFloat | .FloatToInt =>
+    let value ← h.readImmediate choice source
+    let .floating _ ← h.typeInfo choice value.layout.ty | invalid "float cast source type is not float"
+    -- Source converts the input float payload before matching destination kind.
+    let bits ← FloatOps.readBits h.floatOps choice value
+    let scalar ← match ← h.typeInfo choice target.ty with
+      | .floating format => do
+        let converted ← liftResult (bits.convert format |>.mapError fun e => .invalidProgram s!"{repr e}")
+        let converted ← FloatOps.adjustNaN h.floatOps choice converted [bits]
+        if target.layout.size != format.size then invalid "float cast target size mismatch"
+        liftResult (Memory.Scalar.fromUInt converted.bits format.size |>.mapError ScalarOps.scalarError)
+      | .integer integerKind => do
+        let width ← liftResult (target.layout.size.bitsNat |>.mapError fun e => .invalidProgram (toString e))
+        let integer ← liftResult (bits.toInteger width integerKind.signed |>.mapError fun e => .invalidProgram s!"{repr e}")
+        if integerKind.signed then
+          liftResult (Memory.Scalar.fromInt integer target.layout.size |>.mapError ScalarOps.scalarError)
+        else liftResult (Memory.Scalar.fromUInt (BitVec.ofInt 128 integer) target.layout.size |>.mapError ScalarOps.scalarError)
+      | _ => invalid "invalid float cast destination"
+    if shouldDeinit then h.deinitSource choice source
+    h.writeImmediate choice (.scalar scalar) dest
+  | .FnPtrToPtr | .PtrToPtr =>
+    let value ← h.readImmediate choice source
+    let result ← ptrToPtr h choice value target
+    if shouldDeinit then h.deinitSource choice source
+    h.writeImmediate choice result.imm dest
+  | .PointerCoercion .MutToConstPointer _ | .PointerCoercion .ArrayToPointer _ =>
+    invalid "borrowck-only pointer coercion in runtime MIR"
+  | .PointerCoercion (.ReifyFnPointer _) _ =>
+    h.ensureMonomorphic choice source.layout.ty
+    let .fnDefinition definition args ← h.typeInfo choice source.layout.ty | invalid "reify fn pointer on non-function definition"
+    h.requireNoBoundVars choice args
+    let some fnInstance ← h.resolveFunction choice definition args | invalid "TooGeneric"
+    let ptr ← h.functionPointer choice fnInstance
+    if shouldDeinit then h.deinitSource choice source
+    h.writePointer choice ptr dest
+  | .PointerCoercion .UnsafeFnPointer _ =>
+    let value ← h.readImmediate choice source
+    let .fnPointer ← h.typeInfo choice castTy | invalid "unsafe fn pointer target is not fn pointer"
+    if shouldDeinit then h.deinitSource choice source
+    h.writeImmediate choice value.imm dest
+  | .PointerCoercion (.ClosureFnPointer _) _ =>
+    h.ensureMonomorphic choice source.layout.ty
+    let .closure definition args _ ← h.typeInfo choice source.layout.ty | invalid "closure fn pointer on non-closure"
+    let fnInstance ← h.resolveClosureFnOnce choice definition args
+    let ptr ← h.functionPointer choice fnInstance
+    if shouldDeinit then h.deinitSource choice source
+    h.writePointer choice ptr dest
+  | .Transmute | .Subtype | .BoxDerefTransmute =>
+    if !source.layout.layout.isSized || !destLayout.layout.isSized then invalid "transmute requires sized types"
+    if castTy != destLayout.ty then invalid "transmute target type differs from destination"
+    if source.layout.layout.size != destLayout.layout.size then throw (.undefinedBehavior "transmute size mismatch")
+    if kind == .BoxDerefTransmute then
+      let pointer ← h.readImmediate choice source
+      let some pointee ← h.builtinDeref choice castTy true
+        | invalid "BoxDerefTransmute target is not dereferenceable"
+      let box ← h.boxLayout choice pointee
+      let pointer ← transmuteImmediate h pointer box
+      h.derefPointer choice ⟨.immediate pointer.imm, pointer.layout⟩
+    h.restorePendingMoveDeinit shouldDeinit
     h.copyAllowTransmute choice source dest
 
 end Cast

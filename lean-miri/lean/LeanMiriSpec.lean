@@ -57,6 +57,7 @@ import LeanMiriSpec.Correspondence.SimLM4_2
 import LeanMiriSpec.Correspondence.WitLM4_2
 import LeanMiriSpec.Correspondence.Safety
 import LeanMiriSpec.Correspondence.MiriDiffWitnesses
+import LeanMiriSpec.Correspondence.MoveDeinitEquiv
 import LeanMiriSpec.Audit
 
 /-!
@@ -447,6 +448,13 @@ import LeanMiriSpec.Audit
   boundary of `write_bytes` and `rotate_left`: `w6_write_bytes_extCall_boundary`,
   `w6_write_bytes_read_extCall_divergence`, `w6_write_bytes_oob_extCall_divergence`,
   `w6_rotate_left_extCall_boundary`) (`LM-4.3`).
+* `LeanMiriSpec.Correspondence.MoveDeinitEquiv`: consumer-side runtime move
+  deinitialization: the patched `lean-miri` interpreter (`deinitMovedPlace`) is the
+  unpatched source when the flag is off; with the flag on, moved sources are
+  deinitialized without Tree Borrows or race access, call arguments are validated
+  before callee resolution (kani#5172), and Trusted `evalOperand
+  (deinitProjectedMoves := true)` deinitializes moved places (`D1`/`D2`/`D3`/`D5`/`D9`
+  canaries), with a root-move simulation between the two and an axiom audit.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

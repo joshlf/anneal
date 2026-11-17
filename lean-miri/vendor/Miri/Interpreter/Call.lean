@@ -132,6 +132,24 @@ structure CallHooks (P S C E Other Extern FnABI ArgABI : Type) where
   resolveDropGlue : C → TyId → CallM S CallInstance
   mplaceToMutRef : C → MPlaceTy P → CallM S (OpTy P)
   fakeUnitReturn : C → CallM S (RuntimeStackPlace P)
+  /-- Consumer-side runtime move deinitialization of call arguments (default
+  `false`: unchanged source behavior). Every argument is read and validated at
+  its type before callee resolution (kani#5172), a moved argument is consumed
+  before later same-call arguments are evaluated, its source is deinitialized
+  without any Tree Borrows or race access, and no argument is passed in place. -/
+  deinitMovedPlace : Bool := false
+  /-- Tree-Borrows-silent and race-silent deinitialization of a moved argument
+  source (`PlaceMachine.writeMemoryRawUninit`). The default fails closed. -/
+  deinitInPlaceArgument : C → MPlaceTy P → CallM S Unit := fun _ _ =>
+    throw (.invalidProgram "deinitMovedPlace requires a borrow-tracker-silent argument deinitializer")
+  /-- Read and validate an immediate argument at its type before callee
+  resolution, as the argument copy of `passArgument` would. Fails closed. -/
+  validateOperandBeforeCall : C → OpTy P → CallM S Unit := fun _ _ =>
+    throw (.invalidProgram "deinitMovedPlace requires a pre-resolution argument validator")
+  /-- Deallocate a temporary stack allocation that holds a materialized
+  argument once the call has consumed its arguments. Fails closed. -/
+  deallocateStack : C → Pointer (Option P) → CallM S Unit := fun _ _ =>
+    throw (.invalidProgram "deinitMovedPlace requires a temporary argument deallocator")
 
 namespace Call
 variable {P S C E Other Extern FnABI ArgABI : Type}
@@ -161,6 +179,68 @@ def moveDefinitelyDisjoint (args : Array SpannedOperand) (dest : Place) : Bool :
     seen := seen.push place.localId
   return true
 
+/-- Consumer-side (`deinitMovedPlace`): deallocate temporary argument copies. -/
+def deallocateTempArgs (h : Hooks) (choice : C) (temps : Array (Pointer (Option P))) : M Unit := do
+  for ptr in temps do
+    h.deallocateStack choice ptr
+
+/-- Consumer-side (`deinitMovedPlace`): validate an immediate argument, or copy an
+indirect one into a fresh temporary with the validating `copyToMemory`, so that
+later same-call moves of the same place cannot change the value passed here. -/
+def materializeArgument (h : Hooks) (choice : C) (op : OpTy P) :
+    M (FnArg P × Option (Pointer (Option P))) := do
+  match op.op with
+  | .immediate _ =>
+    h.validateOperandBeforeCall choice op
+    return (.Copy op, none)
+  | .indirect _ =>
+    if !op.layout.layout.isSized then
+      throw (.unsupported "deinitMovedPlace: unsized by-value call argument")
+    let tmp ← h.allocateStack choice op.layout
+    h.copyToMemory choice op tmp
+    return (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr)
+
+/-- Consumer-side (`deinitMovedPlace`) argument evaluation, returning the
+argument and the temporary allocation that holds it (if materialized).
+* `Copy`/`Constant`/`RuntimeChecks`: `materializeArgument`.
+* `Move` of a memory place: the value is copied into a fresh temporary with the
+  validating `copyToMemory` (the ordinary Tree Borrows and race read of the
+  source), then the source is deinitialized with `deinitInPlaceArgument`, which
+  performs no Tree Borrows or race access.
+* `Move` of an immediate local: the value is validated, then the local slot is
+  deinitialized (zero-sized values are preserved); a projected immediate local is
+  materialized first and only the moved bytes are deinitialized.
+No argument is passed in place, so no `uninit` is ever written through a
+protected tag. Unsized by-value arguments fail closed. -/
+def evalFnCallArgumentMoving (h : Hooks) (choice : C) (operand : MIR.Operand)
+    (path : OperandPath) : M (FnArg P × Option (Pointer (Option P))) := do
+  match operand with
+  | .Copy _ | .Constant _ | .RuntimeChecks _ =>
+    materializeArgument h choice (← h.evalOperandAt choice path operand)
+  | .Move place =>
+    let rplace ← h.evalPlace choice place true
+    let op ← h.placeToOp choice rplace
+    if !op.layout.layout.isSized then
+      throw (.unsupported "deinitMovedPlace: unsized by-value call argument")
+    match op.op with
+    | .indirect mplace =>
+      let tmp ← h.allocateStack choice op.layout
+      h.copyToMemory choice op tmp
+      h.deinitInPlaceArgument choice ⟨mplace, op.layout⟩
+      return (.Copy ⟨.indirect tmp.mplace, tmp.layout⟩, some tmp.mplace.ptr)
+    | .immediate _ =>
+      h.validateOperandBeforeCall choice op
+      if place.projection.isEmpty then
+        let deinitVal : Operand P := if op.layout.layout.isZst then op.op else .immediate .uninit
+        let frame ← h.getFrame
+        match frame.replaceLocalValue place.localId (.live deinitVal) with
+        | .ok frame' => h.setFrame frame'
+        | .error e => throw (.stack e)
+      else
+        let moved ← h.forceAllocation choice rplace
+        h.deinitInPlaceArgument choice moved
+      return (.Copy op, none)
+
 def evalFnCallArgumentAt (h : Hooks) (choice : C) (operand : MIR.Operand)
     (disjoint : Bool) (path : OperandPath) : M (FnArg P) := do
   match operand with
@@ -177,6 +257,51 @@ def evalFnCallArgumentAt (h : Hooks) (choice : C) (operand : MIR.Operand)
 def evalFnCallArgument (h : Hooks) (choice : C) (operand : MIR.Operand)
     (disjoint : Bool) : M (FnArg P) :=
   evalFnCallArgumentAt h choice operand disjoint #[]
+
+/-- Consumer-side (`deinitMovedPlace`) `eval_callee_and_args`: the callee and
+every argument are evaluated, validated and consumed, in order, before the
+function signature, kind or instance are queried, so an uninitialized or
+moved-out argument faults before `resolve` (kani#5172). A moved memory-backed
+callee is consumed like a moved argument. Also returns the temporary stack
+allocations to deallocate once the call has consumed its arguments. -/
+def evalCalleeAndArgsMoving (h : Hooks) (choice : C) (func : MIR.Operand)
+    (args : Array SpannedOperand) :
+    M (EvaluatedCall P Other Extern FnABI × Array (Pointer (Option P))) := do
+  let mut temps : Array (Pointer (Option P)) := #[]
+  let mut funcOp ← h.evalOperandAt choice (OperandPath.instruction "function") func
+  if let .Move _ := func then
+    if let .indirect mplace := funcOp.op then
+      let tmp ← h.allocateStack choice funcOp.layout
+      h.copyToMemory choice funcOp tmp
+      h.deinitInPlaceArgument choice ⟨mplace, funcOp.layout⟩
+      temps := temps.push tmp.mplace.ptr
+      funcOp := ⟨.indirect tmp.mplace, tmp.layout⟩
+  let mut evaluated := #[]
+  for index in [:args.size] do
+    let some arg := args[index]? | throw (.invalidProgram "missing source call argument")
+    let (fnArg, tmp?) ← evalFnCallArgumentMoving h choice arg.operand (OperandPath.argument index)
+    if let some tmp := tmp? then temps := temps.push tmp
+    evaluated := evaluated.push fnArg
+  let func := funcOp
+  let (inputCount, externAbi) ← h.functionSignature choice func.layout
+  require (inputCount ≤ evaluated.size) "call has fewer args than normalized signature"
+  let extra := (evaluated.extract inputCount evaluated.size).map fun arg => arg.layout.ty
+  match ← h.functionKind func.layout.ty with
+  | .FnPtr =>
+    let fnPtr ← h.readPointer choice func
+    let fnVal ← h.getPtrFn choice fnPtr
+    let abi ← h.fnAbiOfFnPtr choice func.layout extra
+    return (⟨fnVal, evaluated, externAbi, some abi, false⟩, temps)
+  | .FnDef definition args =>
+    let fnInstance ← h.resolve choice definition args
+    let abi ← match fnInstance.kind with
+      | .LlvmIntrinsic _ => pure none
+      | .Intrinsic definition =>
+        pure (some (← h.fnAbiOfInstance choice ⟨.Item definition, fnInstance.args⟩ extra))
+      | _ => pure (some (← h.fnAbiOfInstance choice fnInstance extra))
+    return (⟨.Instance fnInstance, evaluated, externAbi, abi, ← h.requiresCallerLocation fnInstance⟩,
+      temps)
+  | .invalid => throw (.invalidProgram "invalid callee type")
 
 def evalCalleeAndArgs (h : Hooks) (choice : C) (func : MIR.Operand)
     (args : Array SpannedOperand) (dest : Place) : M (EvaluatedCall P Other Extern FnABI) := do
@@ -467,6 +592,45 @@ def evalTailCallTerminator (h : Hooks) (choice : C) (budget : Nat) (terminator :
     let oldIndex ← h.frameIndex
     let evaluated ← evalCalleeAndArgs h choice func args ⟨0, #[]⟩
     initFnTailCall h choice budget evaluated
+    require ((← h.frameIndex) == oldIndex) "evaluating this tail call pushed a new stack frame"
+  | _ => throw (.invalidProgram "tailCall hook received a non-TailCall terminator")
+
+/-- Consumer-side (`deinitMovedPlace`) call terminator, selected by
+`ExecutionMachine.stepHooks` only when `deinitMovedPlace = true` (the source
+`evalCallTerminator` above is unchanged). Callee and arguments are evaluated by
+`evalCalleeAndArgsMoving`: every argument is read and validated into a fresh
+temporary and every moved source is deinitialized without Tree Borrows or race
+access, all before callee resolution (kani#5172); no argument is passed in
+place. The temporaries are released once the callee frame holds the copies. -/
+def evalCallTerminatorMoving (h : Hooks) (choice : C) (budget : Nat) (terminator : Terminator) :
+    M Unit := do
+  match terminator.kind with
+  | .Call func args dest target unwind _ _ =>
+    let oldIndex ← h.frameIndex
+    let oldLoc := (← h.getFrame).location
+    let destPlace ← h.evalPlace choice dest false
+    let (evaluated, temps) ← evalCalleeAndArgsMoving h choice func args
+    initFnCall h choice budget ⟨evaluated.callee, evaluated.callerAbi, evaluated.fnAbi, evaluated.args,
+      evaluated.withCallerLocation, destPlace, target,
+      if evaluated.fnAbi.any h.abiCanUnwind then unwind else .Unreachable⟩
+    deallocateTempArgs h choice temps
+    if target.isSome then
+      if (← h.frameIndex) == oldIndex then
+        if (← h.getFrame).location == oldLoc then
+          throw (.invalidProgram "evaluating this call made no progress")
+  | _ => throw (.invalidProgram "call hook received a non-Call terminator")
+
+/-- Consumer-side (`deinitMovedPlace`) tail-call terminator, selected by
+`ExecutionMachine.stepHooks` only when `deinitMovedPlace = true`; arguments as
+in `evalCallTerminatorMoving`. -/
+def evalTailCallTerminatorMoving (h : Hooks) (choice : C) (budget : Nat) (terminator : Terminator) :
+    M Unit := do
+  match terminator.kind with
+  | .TailCall func args _ =>
+    let oldIndex ← h.frameIndex
+    let (evaluated, temps) ← evalCalleeAndArgsMoving h choice func args
+    initFnTailCall h choice budget evaluated
+    deallocateTempArgs h choice temps
     require ((← h.frameIndex) == oldIndex) "evaluating this tail call pushed a new stack frame"
   | _ => throw (.invalidProgram "tailCall hook received a non-TailCall terminator")
 

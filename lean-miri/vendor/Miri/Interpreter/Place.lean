@@ -29,6 +29,21 @@ structure PlaceHooks (P S C E : Type) where
   writeLocalImmediate : C → MIR.LocalId → LocalLayout → Immediate P → PlaceM S Unit
   enforceValidity : C → LocalLayout → PlaceM S Bool
   validate : C → RuntimePlace P → PlaceM S Unit
+  /-- Consumer-side (`deinitMovedPlace`) latch: whether the source operand of
+  the current copy was produced by `Operand.Move` of an indirect place. The
+  default never requests deinitialization (unpatched source behavior). -/
+  takePendingMoveDeinit : PlaceM S Bool := pure false
+  /-- Consumer-side move deinitialization of the moved source bytes, without any
+  Tree Borrows or data-race access (`PlaceMachine.writeMemoryRawUninit`). Only
+  invoked after `takePendingMoveDeinit` returned `true`; the default fails closed
+  so that a latch can never fall back to a borrow-tracker-visible write. -/
+  deinitMemoryRaw : C → MPlaceTy P → PlaceM S Unit := fun _ _ =>
+    throw (.invalidProgram "move deinitialization requires a borrow-tracker-silent deinitMemoryRaw hook")
+  /-- Whether a moved memory-path source overlaps its copy destination (same
+  allocation, intersecting non-empty byte ranges). Only invoked for moves; the
+  default fails closed. -/
+  moveCopyOverlaps : C → MPlaceTy P → MPlaceTy P → PlaceM S Bool := fun _ _ _ =>
+    throw (.invalidProgram "memory-path move requires a moveCopyOverlaps hook")
 
 private def placeLift (value : Except StepError A) : PlaceM S A :=
   match value with | .ok value => pure value | .error error => throw error
@@ -343,12 +358,18 @@ structure PlaceCopyHooks (P S C : Type) where
   validateSource : C → LocalLayout → RuntimePlace P → PlaceM S Unit
 
 /-- Connected copy_op_no_validate, with materialization through forceAllocation.
-All type identity stays canonical; the memory read result supplies only bytes. -/
+All type identity stays canonical; the memory read result supplies only bytes.
+Consumer-side move deinitialization (`takePendingMoveDeinit = true`): the
+immediate path deinitializes the source before writing the destination (so
+`x = move x` keeps its value); the memory path rejects overlapping moves like
+rustc's `mem_copy(.., nonoverlapping = true)` and deinitializes the source after
+copying. Both deinitializations are Tree-Borrows-silent (`deinitMemoryRaw`). -/
 def copyRuntimePlaceNoValidate (h : PlaceHooks P S C E) (copy : PlaceCopyHooks P S C)
     (choice : C) (source : OpTy P) (dest : RuntimePlace P) (allowTransmute : Bool) : PlaceM S Unit := do
   let compatible ← placeLift (copy.compatible source.layout dest.layout)
   if !compatible && !allowTransmute then throw (.invalidProgram "copy type mismatch")
   let padding ← placeLift (copy.hasPadding source.layout)
+  let shouldDeinit ← h.takePendingMoveDeinit
   let value ← if padding then pure (match source.op with
       | .immediate value => ImmediateOrPlace.immediate ⟨value, localMemoryLayout source.layout⟩
       | .indirect mplace => .place ⟨mplace, localMemoryLayout source.layout⟩)
@@ -359,13 +380,21 @@ def copyRuntimePlaceNoValidate (h : PlaceHooks P S C E) (copy : PlaceCopyHooks P
       throw (.invalidProgram "copy immediate is unsized")
     if source.layout.layout.size != dest.layout.layout.size then
       throw (.invalidProgram "copy immediate size mismatch")
+    if shouldDeinit then
+      if let .indirect mplace := source.op then
+        h.deinitMemoryRaw choice ⟨mplace, source.layout⟩
     if compatible then writePlaceImmediateNoValidate h choice value.value dest
     else
       let memory ← forceAllocation h choice dest
       h.writeMemoryNoValidate choice value.value ⟨memory.mplace, source.layout⟩
   | .place memory =>
     let target ← forceAllocation h choice dest
+    if shouldDeinit then
+      if ← h.moveCopyOverlaps choice ⟨memory.mplace, source.layout⟩ target then
+        throw (.undefinedBehavior "copy_nonoverlapping called on overlapping ranges")
     copy.memoryCopy choice ⟨memory.mplace, source.layout⟩ target
+    if shouldDeinit then
+      h.deinitMemoryRaw choice ⟨memory.mplace, source.layout⟩
 
 def copyRuntimePlace (h : PlaceHooks P S C E) (copy : PlaceCopyHooks P S C)
     (choice : C) (source : OpTy P) (dest : RuntimePlace P) (allowTransmute : Bool) : PlaceM S Unit := do

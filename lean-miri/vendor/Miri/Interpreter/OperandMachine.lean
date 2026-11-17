@@ -17,6 +17,7 @@ structure Hooks (K User C : Type) where
   boolLayout : C → M K User LocalLayout
   constant : C → ConstOperand → Option LocalLayout → M K User (OpTy Provenance)
   constantAt : C → OperandPath → ConstOperand → Option LocalLayout → M K User (OpTy Provenance) := fun c _ => constant c
+  deinitMovedPlace : Bool := false
 
 private def lift (result : Except StepError A) : M K User A :=
   match result with | .ok value => pure value | .error error => throw error
@@ -94,8 +95,72 @@ def evalPlaceToOp (h : Hooks K User C) (c : C) (place : Place) (known : Option L
   h.checkPlaceType c place op
   return op
 
-/-- Copy and Move share source behavior; no invented move invalidation. -/
-def evalOperand (h : Hooks K User C) (c : C) (operand : MIR.Operand) (known : Option LocalLayout) : M K User (OpTy Provenance) := do
+/-- Update the consumer-side move-deinitialization latch of the machine. -/
+def updateMoveLatch (f : MachineHooks.MachineState K User → MachineHooks.MachineState K User) :
+    M K User Unit :=
+  modify fun s => { s with machine := f s.machine }
+
+/-- `deinitMovedPlace` operand evaluation (consumer-side, never selected when
+`deinitMovedPlace = false`). The latch flag is disarmed before every evaluation;
+`Copy`/`Constant` indirect results queue a non-move record; `Move` of an
+unprojected immediate local deinitializes the local slot in place (zero-sized
+values are preserved); `Move` of a projected immediate local first materializes
+the local (`forceAllocation`) so that only the moved bytes are deinitialized;
+`Move` of an indirect place queues a move record that the consuming
+read/copy/cast discharges with a Tree-Borrows-silent and race-silent write. -/
+def evalOperandMoving (h : Hooks K User C) (c : C) (operand : MIR.Operand)
+    (known : Option LocalLayout) : M K User (OpTy Provenance) := do
+  match operand with
+  | .Copy place =>
+    updateMoveLatch MachineHooks.clearPendingMoveDeinitFlag
+    let result ← evalPlaceToOp h c place known
+    match result.op with
+    | .indirect mplace => updateMoveLatch (MachineHooks.recordPendingMoveDeinit · mplace false)
+    | .immediate _ => updateMoveLatch MachineHooks.clearPendingMoveDeinitFlag
+    return result
+  | .Move place =>
+    updateMoveLatch MachineHooks.clearPendingMoveDeinitFlag
+    let result ← evalPlaceToOp h c place known
+    match result.op with
+    | .immediate _ =>
+      if place.projection.isEmpty then
+        let deinitVal : Operand Provenance :=
+          if result.layout.layout.isZst then result.op else .immediate .uninit
+        let frame ← MachineHooks.currentFrame
+        let updated ← stack (frame.replaceLocalValue place.localId (.live deinitVal))
+        MachineHooks.setCurrentFrame updated
+        updateMoveLatch MachineHooks.clearPendingMoveDeinitFlag
+        return result
+      else
+        let basePlace ← localToPlace h.projection.place c place.localId
+        let _ ← forceAllocation h.projection.place c basePlace
+        let result ← evalPlaceToOp h c place known
+        match result.op with
+        | .indirect mplace =>
+          updateMoveLatch (MachineHooks.recordPendingMoveDeinit · mplace true)
+          return result
+        | .immediate _ =>
+          throw (.invalidProgram "moved projected local did not materialize in memory")
+    | .indirect mplace =>
+      updateMoveLatch (MachineHooks.recordPendingMoveDeinit · mplace true)
+      return result
+  | .Constant value =>
+    updateMoveLatch MachineHooks.clearPendingMoveDeinitFlag
+    let result ← h.constant c value known
+    if let .indirect mplace := result.op then
+      updateMoveLatch (MachineHooks.recordPendingMoveDeinit · mplace false)
+    return result
+  | .RuntimeChecks checks =>
+    updateMoveLatch MachineHooks.clearPendingMoveDeinitFlag
+    let value ← h.runtimeChecks c checks
+    let layout ← h.boolLayout c
+    return ⟨.immediate (.scalar (.fromBool value)),layout⟩
+
+/-- Copy and Move share source behavior; no invented move invalidation. The
+consumer-side `deinitMovedPlace` mode (`evalOperandMoving`) deinitializes moved
+places; with `deinitMovedPlace = false` this is the unpatched source dispatch. -/
+def evalOperand (h : Hooks K User C) (c : C) (operand : MIR.Operand) (known : Option LocalLayout) : M K User (OpTy Provenance) :=
+  if h.deinitMovedPlace then evalOperandMoving h c operand known else do
   match operand with
   | .Copy place | .Move place => evalPlaceToOp h c place known
   | .Constant value => h.constant c value known
@@ -103,9 +168,29 @@ def evalOperand (h : Hooks K User C) (c : C) (operand : MIR.Operand) (known : Op
     let value ← h.runtimeChecks c checks
     let layout ← h.boolLayout c
     return ⟨.immediate (.scalar (.fromBool value)),layout⟩
+
+/-- `deinitMovedPlace` variant of `evalOperandAt`. `CopyNonOverlapping`'s
+`count` operand is evaluated third but read first, so its queued record is moved
+to the front of the latch queue. -/
+def evalOperandAtMoving (h : Hooks K User C) (c : C) (path : OperandPath)
+    (operand : MIR.Operand) (known : Option LocalLayout) : M K User (OpTy Provenance) := do
+  let result ← match operand with
+    | .Constant value =>
+      updateMoveLatch MachineHooks.clearPendingMoveDeinitFlag
+      let result ← h.constantAt c (path.push (.field "constant")) value known
+      if let .indirect mplace := result.op then
+        updateMoveLatch (MachineHooks.recordPendingMoveDeinit · mplace false)
+      pure result
+    | _ => evalOperandMoving h c operand known
+  if path == OperandPath.instruction "count" then
+    if let .indirect _ := result.op then
+      updateMoveLatch MachineHooks.prependLastPendingMoveDeinit
+  return result
+
 /-- The path is carried by the structural caller, not recovered from the operand. -/
 def evalOperandAt (h : Hooks K User C) (c : C) (path : OperandPath)
     (operand : MIR.Operand) (known : Option LocalLayout) : M K User (OpTy Provenance) :=
+  if h.deinitMovedPlace then evalOperandAtMoving h c path operand known else
   match operand with
   | .Constant value =>
     -- OperandPath identifies the field holding the MIR Operand. Exported

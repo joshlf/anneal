@@ -69,8 +69,19 @@ def make [DecidableEq K] (leaves : ExecutionCallLeaves.Hooks (State K U) C Other
    setFrame := MachineHooks.setCurrentFrame
    frameIndex := do match (← get).stack.frameIndex with
       | .ok index => pure index | .error error => throw (.stack error)
-   evalOperand := fun c operand => OperandMachine.evalOperand operands c operand none
-   evalOperandAt := fun c path operand => OperandMachine.evalOperandAt operands c path operand none
+   evalOperand := fun c operand =>
+      if operands.deinitMovedPlace then do
+        -- Consumer-side: call operands never consume the latch; disarm it.
+        let op ← OperandMachine.evalOperand operands c operand none
+        modify fun s => { s with machine := MachineHooks.clearPendingMoveDeinits s.machine }
+        return op
+      else OperandMachine.evalOperand operands c operand none
+   evalOperandAt := fun c path operand =>
+      if operands.deinitMovedPlace then do
+        let op ← OperandMachine.evalOperandAt operands c path operand none
+        modify fun s => { s with machine := MachineHooks.clearPendingMoveDeinits s.machine }
+        return op
+      else OperandMachine.evalOperandAt operands c path operand none
    evalPlace := fun c dest skip => return (← PlaceDynamic.evalPlace projection c dest skip).stackView
    placeToOp := fun c dest => placeToOp place c dest.toRuntimePlace
    forceAllocation := fun c dest => forceAllocation place c dest.toRuntimePlace
@@ -138,7 +149,20 @@ def make [DecidableEq K] (leaves : ExecutionCallLeaves.Hooks (State K U) C Other
       let layout ← virtual.compiler.unitLayout
       match FunctionCalls.fakeAllocZst layout with
       | .ok memory => pure (.memory memory)
-      | .error error => throw error}
+      | .error error => throw error
+   -- Consumer-side (`deinitMovedPlace`) runtime move deinitialization.
+   deinitMovedPlace := operands.deinitMovedPlace
+   deinitInPlaceArgument := fun _ memory => PlaceMachine.writeMemoryRawUninit access memory
+   validateOperandBeforeCall := fun c operand => do
+      -- The validating copy of `copyToMemory` into a fresh temporary reads the
+      -- argument at its type before callee resolution (kani#5172). Zero-sized
+      -- and unsized operands carry no bytes to validate here.
+      if operand.layout.layout.isZst || !operand.layout.layout.isSized then return
+      modify fun s => { s with machine := MachineHooks.clearPendingMoveDeinits s.machine }
+      let tmp ← PlaceMachine.allocateStack allocation operand.layout
+      copyRuntimePlace place copy c operand ⟨.memory tmp.mplace, tmp.layout⟩ false
+      lifecycle.storage.deallocateStack tmp.mplace.ptr
+   deallocateStack := fun _ ptr => lifecycle.storage.deallocateStack ptr}
 /-- Actual helpers.rs call/thread-root helper dictionary. Origin mutations
 keep all other thread/stack fields, including saved full frame identities. -/
 def helpers (leaves : ExecutionCallLeaves.Helpers (State K U) C Extern)

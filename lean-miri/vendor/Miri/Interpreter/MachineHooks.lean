@@ -25,6 +25,30 @@ structure BorrowState where
   global : Miri.TreeBorrows.GlobalState
   retagMode : RetagMode
 
+/-- Consumer-side (`deinitMovedPlace`) move-deinitialization latch.
+
+`pendingMoveDeinit` is armed when `OperandMachine.evalOperand` evaluates
+`Operand.Move` on an indirect (`MemPlace`) place in `deinitMovedPlace` mode, and
+atomically consumed by the corresponding `PlaceMachine.readImmediate`,
+`Place.copyRuntimePlaceNoValidate` or `Cast.cast` for that operand (`Use`,
+`UnaryOp`, `BinaryOp`, `Cast`, `SwitchInt`, `Assert`, `CopyNonOverlapping`).
+`pendingMoveDeinits` queues `(mplace, isMove)` per indirect operand evaluation so
+multi-operand paths preserve per-operand move-deinit intent across subsequent
+operand evaluations. Call/TailCall arguments use `FnArg.InPlace` and
+`CallHooks.deinitInPlaceArgument` instead.
+
+The latch is a `class` so that `MachineState` can carry it as an
+instance-implicit field: anonymous constructors outside the consumer patch
+(`Miri.Input.InitialMachine`) keep their upstream arity and receive the empty
+latch (`instEmptyPendingMoveDeinitState`) by instance synthesis. With
+`deinitMovedPlace = false` the latch is never armed. -/
+class PendingMoveDeinitState where
+  pendingMoveDeinit : Bool := false
+  pendingMoveDeinits : Array (MemPlace Provenance × Bool) := #[]
+
+/-- The empty (disarmed) move-deinitialization latch. -/
+instance instEmptyPendingMoveDeinitState : PendingMoveDeinitState := {}
+
 /-- Allocation race extras are keyed by the same canonical AllocId as live
 memory; this external index composes with the existing BorrowTree extra type.
 Allocation lifecycle adapters must install/remove entries with their allocation. -/
@@ -36,6 +60,91 @@ structure MachineState (K User : Type) where
   raceAllocations : Array (AllocId × Miri.Concurrency.VClockAlloc)
   allocationSpans : Array (AllocId × SpanRef × Option SpanRef)
   user : User
+  /-- Consumer-side move-deinitialization latch (see `PendingMoveDeinitState`).
+  Instance-implicit, so upstream anonymous constructors receive the empty latch. -/
+  [pendingMoves : PendingMoveDeinitState]
+
+/-- The armed move-deinitialization flag of the latch. -/
+def MachineState.pendingMoveDeinit (m : MachineState K User) : Bool :=
+  m.pendingMoves.pendingMoveDeinit
+
+/-- The queued `(mplace, isMove)` entries of the latch. -/
+def MachineState.pendingMoveDeinits (m : MachineState K User) :
+    Array (MemPlace Provenance × Bool) :=
+  m.pendingMoves.pendingMoveDeinits
+
+/-- Replace the latch. -/
+def MachineState.withPendingMoves (m : MachineState K User)
+    (flag : Bool) (queue : Array (MemPlace Provenance × Bool)) : MachineState K User :=
+  { m with pendingMoves := { pendingMoveDeinit := flag, pendingMoveDeinits := queue } }
+
+/-- Disarm the latch flag, keeping queued entries for unread indirect operands. -/
+def clearPendingMoveDeinitFlag (m : MachineState K User) : MachineState K User :=
+  m.withPendingMoves false m.pendingMoveDeinits
+
+/-- Arm the latch flag without queueing an entry (`Cast` transmute hand-off). -/
+def setPendingMoveDeinitFlag (m : MachineState K User) : MachineState K User :=
+  m.withPendingMoves true m.pendingMoveDeinits
+
+/-- Disarm the latch completely (operand-evaluation and step boundaries). -/
+def clearPendingMoveDeinits (m : MachineState K User) : MachineState K User :=
+  m.withPendingMoves false #[]
+
+/-- Record whether an indirect operand evaluation in `deinitMovedPlace` mode
+originated from `Operand.Move` (`isMove = true`) or `Operand.Copy` /
+`Operand.Constant` (`isMove = false`). -/
+def recordPendingMoveDeinit (m : MachineState K User)
+    (mplace : MemPlace Provenance) (isMove : Bool) : MachineState K User :=
+  m.withPendingMoves isMove (m.pendingMoveDeinits.push (mplace, isMove))
+
+/-- Move the most recently recorded indirect operand entry to the front of
+`pendingMoveDeinits`. Used for `CopyNonOverlapping`'s `count` operand, which is
+evaluated third (`src`, `dst`, `count`) in `Intrinsics.evalNondivergingWith`
+but read first (`count`, `src`, `dst`) in `Intrinsics.copyWith`, so that
+consumption order in `takePendingMoveDeinitFor` is strictly FIFO even when
+`count` and `src`/`dst` alias the same `MemPlace`. -/
+def prependLastPendingMoveDeinit (m : MachineState K User) :
+    MachineState K User :=
+  match m.pendingMoveDeinits.back? with
+  | none => m
+  | some last =>
+    m.withPendingMoves m.pendingMoveDeinit (#[last] ++ m.pendingMoveDeinits.pop)
+
+/-- Consume the front queued `(mplace, isMove)` entry in strict FIFO consumption
+order when it matches `mplace?` (or fall back to the earliest matching entry).
+Reading an `.immediate` operand (`mplace? = none`) disarms the flag without
+discarding queued entries for unread `.indirect` operands. A read of an
+indirect place with no queued entry never deinitializes it: only an explicit
+`Operand.Move` record can request deinitialization. -/
+def takePendingMoveDeinitFor (m : MachineState K User)
+    (mplace? : Option (MemPlace Provenance)) : MachineState K User × Bool :=
+  match mplace? with
+  | none =>
+    (clearPendingMoveDeinitFlag m, false)
+  | some mplace =>
+    match m.pendingMoveDeinits[0]? with
+    | some (frontMplace, isMove) =>
+      if frontMplace == mplace then
+        (m.withPendingMoves false (m.pendingMoveDeinits.eraseIdxIfInBounds 0), isMove)
+      else
+        match m.pendingMoveDeinits.findIdx? (fun entry => entry.1 == mplace) with
+        | some idx =>
+          let isMove := (m.pendingMoveDeinits[idx]?.map Prod.snd).getD false
+          (m.withPendingMoves false (m.pendingMoveDeinits.eraseIdxIfInBounds idx), isMove)
+        | none =>
+          (clearPendingMoveDeinitFlag m, false)
+    | none =>
+      (clearPendingMoveDeinitFlag m, false)
+
+/-- Consume the most recently evaluated operand's move-deinit flag for
+single-operand consumers (`copyRuntimePlaceNoValidate`, `Cast`, zero-length
+`Repeat`). -/
+def takeLastPendingMoveDeinit (m : MachineState K User) :
+    MachineState K User × Bool :=
+  let isMove := match m.pendingMoveDeinits.back? with
+    | some (_, b) => b || m.pendingMoveDeinit
+    | none => m.pendingMoveDeinit
+  (m.withPendingMoves false m.pendingMoveDeinits.pop, isMove)
 
 abbrev State (K User : Type) := StepState Provenance LocalLayout FrameExtra (MachineState K User)
 abbrev M (K User A : Type) := EStateM StepError (State K User) A

@@ -112,5 +112,15 @@ def hooks [DecidableEq K] (queries : Leaves (State K U) C)
     copyAllowTransmute := fun c source dest => copyRuntimePlace place copy c source dest true
     copyNoValidate := copyRuntimePlaceNoValidate place copy
     projectRead := projectRead
-    projectWrite := PlaceDynamic.field projection }
+    projectWrite := PlaceDynamic.field projection
+    -- Consumer-side (`deinitMovedPlace`) move deinitialization: the latch and
+    -- the borrow-tracker-silent writer both come from the place dictionary.
+    takePendingMoveDeinit := place.takePendingMoveDeinit
+    restorePendingMoveDeinit := fun flag =>
+      if flag then modify fun s => { s with machine := MachineHooks.setPendingMoveDeinitFlag s.machine }
+      else pure ()
+    deinitSource := fun c source =>
+      match source.op with
+      | .immediate _ => pure ()
+      | .indirect mplace => place.deinitMemoryRaw c ⟨mplace, source.layout⟩ }
 end Miri.Interpreter.ExecutionCast

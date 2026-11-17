@@ -69,6 +69,7 @@ structure Config (K User C Other Extern Host : Type) where
   pointeeLayout : C → TyId → M K User LocalLayout
   terminators : TerminatorMachine.Hooks K User Host
   preemptionChoice : C → M K User Bool
+  deinitMovedPlace : Bool := false
 
 private def lift (result : Except StepError A) : M K U A :=
   match result with | .ok value => pure value | .error error => throw error
@@ -90,14 +91,17 @@ def scalarHooks (h : Config K U C O X Host) : ScalarOpsHooks Provenance (State K
 /-- Close raw reads, dynamically sized physical copies, and validation with
 actual source implementations before constructing any expression dictionary. -/
 def withValidation [DecidableEq K] (h : Config K U C O X Host) (limits : Limits) : Config K U C O X Host :=
+  -- Consumer-side (`deinitMovedPlace`): the configuration flag enables move
+  -- deinitialization in the access configuration; otherwise it is unchanged.
+  let access := if h.deinitMovedPlace then {h.access with deinitMovedPlace := true} else h.access
   let retag := h.retag
   let copy := {h.copy with
-    readRaw := fun _ => PlaceMachine.readRaw h.access
-    memoryCopy := GlobalMemoryCopyMachine.typedCopy h.access h.addresses h.arithmetic
+    readRaw := fun _ => PlaceMachine.readRaw access
+    memoryCopy := GlobalMemoryCopyMachine.typedCopy access h.addresses h.arithmetic
       h.projection.dynamic h.projection.dynamicFuel h.compiler.debugAssertions}
   let (compiler,copy) := TypedMachineBindings.bindValidation h.compiler copy h.validity retag
     limits.retag limits.validation h.validationRecursive
-  {h with compiler,copy,retag}
+  {h with access,compiler,copy,retag}
 
 private def operandBase (h : Config K U C O X Host) : OperandMachine.Hooks K U C where
   compiler := h.compiler
@@ -114,7 +118,15 @@ def projectionHooks [DecidableEq K] (h : Config K U C O X Host) :
     PlaceProjectionHooks Provenance (State K U) C FrameExtra :=
   -- The source-owned projection contains the live ghost-mode read/write
   -- scopes. Reconstructing a generic PlaceHooks here would erase them.
-  {h.projection with target := h.access.runtime.base}
+  -- Consumer-side (`deinitMovedPlace`) move deinitialization extends that same
+  -- place dictionary with the latch and borrow-tracker-silent writers only.
+  {h.projection with
+    target := h.access.runtime.base
+    place := {h.projection.place with
+      takePendingMoveDeinit :=
+        PlaceMachine.takeLastMoveDeinit (h.deinitMovedPlace || h.access.deinitMovedPlace)
+      deinitMemoryRaw := fun _ memory => PlaceMachine.writeMemoryRawUninit h.access memory
+      moveCopyOverlaps := fun _ src dst => PlaceMachine.mplacesOverlap h.access src dst}}
 
 /-- Projection/place/operand dictionaries share actual frame-local clocks,
 canonical layouts and source typed dereference; no read forces allocation. -/
@@ -122,7 +134,8 @@ def operandHooks [DecidableEq K] (h : Config K U C O X Host) : OperandMachine.Ho
   {operandBase h with
     projection := projectionHooks h
     checkPlaceType := fun c place value => do
-      if h.compiler.debugAssertions then h.operands.checkPlaceType c place value}
+      if h.compiler.debugAssertions then h.operands.checkPlaceType c place value
+    deinitMovedPlace := h.deinitMovedPlace || h.access.deinitMovedPlace}
 
 private def mutableAccess [DecidableEq K] (h : Config K U C O X Host) (c : C) (dest : Value) : M K U Unit := do
   let .memory memory := dest.ref | throw (.invalidProgram "repeat mutable access requires memory")
@@ -228,8 +241,31 @@ def rvalueHooks [DecidableEq K] (h : Config K U C O X Host) (limits : Limits) :
     binaryOp := ScalarOps.binary (scalarHooks h)
     unaryOp := ScalarOps.unary (scalarHooks h)
     writeAggregate := writeAggregate aggregate
-    writeRepeat := writeRepeat aggregate
-    cast := fun c op kind ty dest => Cast.cast casts c limits.casts op kind ty dest
+    writeRepeat := if !h.access.deinitMovedPlace then writeRepeat aggregate else
+      -- Consumer-side (`deinitMovedPlace`): the source `write_repeat`, plus the
+      -- move deinitialization of a zero-length repeat's (never read) source.
+      fun c operand dest => do
+        let source ← aggregate.evalOperandAt c (OperandPath.rvalue "operand") operand none
+        if !source.layout.layout.isSized then throw (.invalidProgram "repeat source is unsized")
+        let dest ← aggregate.forceAllocation c dest
+        let length ← aggregate.length c dest
+        if length == 0 then
+          aggregate.getPlaceAllocMut c dest
+          if ← place.takePendingMoveDeinit then
+            if let .indirect mplace := source.op then
+              place.deinitMemoryRaw c ⟨mplace, source.layout⟩
+        else
+          let first ← aggregate.projectIndex c dest 0
+          aggregate.copyOp c source first
+          let elemSize := (aggregate.placeLayout first).layout.size
+          let firstPtr ← lift (aggregate.placePointer first)
+          let restPtr ← lift (aggregate.wrappingOffset firstPtr elemSize)
+          aggregate.memCopyRepeatedly c firstPtr restPtr elemSize (length - 1) true
+    cast := fun c op kind ty dest =>
+      -- Consumer-side (`deinitMovedPlace`) casts consume the move latch.
+      if h.deinitMovedPlace || h.access.deinitMovedPlace then
+        Cast.castMoving casts c limits.casts op kind ty dest
+      else Cast.cast casts c limits.casts op kind ty dest
     readDiscriminant := Discriminant.readDiscriminant discr
     discriminantForVariant := Discriminant.discriminantForVariant discr}
 
@@ -337,6 +373,15 @@ def stepHooks [DecidableEq K] (h : Config K U C O X Host) (limits : Limits) :
     ignoreOptionalOverflowChecks := fun _ => h.ignoreOptionalOverflowChecks
     readAssertCondition := fun c op => MachineHooks.run do lift ((← scalar (← read c (OperandPath.instruction "condition") op)).toBool.mapError ScalarOps.scalarError)
     assertPanic := fun c message unwind => MachineHooks.run (Panic.assertPanic panic c message unwind) }
+  -- Consumer-side (`deinitMovedPlace`) call terminators: arguments are read and
+  -- validated into temporaries and moved sources deinitialized before callee
+  -- resolution. The source terminators above are used unchanged otherwise.
+  let terminators := if calls.deinitMovedPlace then {terminators with
+      call := fun c terminator =>
+        MachineHooks.run (Call.evalCallTerminatorMoving calls c limits.callDispatch terminator)
+      tailCall := fun c terminator =>
+        MachineHooks.run (Call.evalTailCallTerminatorMoving calls c limits.callDispatch terminator) }
+    else terminators
   {
     assign := fun c dest value => MachineHooks.run (evalRvalueIntoPlace (rvalueHooks h limits) c value dest)
     evalPlace := fun c dest skip => MachineHooks.run (PlaceDynamic.evalPlace (projectionHooks h) c dest skip)
@@ -362,8 +407,13 @@ def stepHooks [DecidableEq K] (h : Config K U C O X Host) (limits : Limits) :
     beforeTerminator := fun c => MachineHooks.run (TerminatorMachine.beforeTerminatorWithChoice h.terminators (h.preemptionChoice c))
     terminator := ControlFlow.evalTerminator terminators }
 
+/-- The consumer-side move-deinitialization latch is disarmed at entry and exit
+of every step, so no armed record can cross a step boundary. -/
 def step [DecidableEq K] (h : Config K U C O X Host) (limits : Limits) (c : C) (state : State K U) :
-    StepResult (State K U) Bool := Step.step (stepHooks h limits) c state
+    StepResult (State K U) Bool :=
+  let (state', out) := Step.step (stepHooks h limits) c
+    { state with machine := MachineHooks.clearPendingMoveDeinits state.machine }
+  ({ state' with machine := MachineHooks.clearPendingMoveDeinits state'.machine }, out)
 
 /-- Quantify runner resources as well as source choices. A bounded successful
 run alone establishes no unrestricted UB-freedom claim. -/
