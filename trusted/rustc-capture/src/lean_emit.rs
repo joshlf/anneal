@@ -2124,8 +2124,14 @@ fn is_disallowed_guillemet_char(c: char) -> bool {
             c,
             '\u{2028}'
                 | '\u{2029}'
+                // Trojan-Source BiDi controls: ALM, LRM/RLM (with the zero-width chars),
+                // LRE..RLO, LRI..PDI; plus invisible format chars (Mongolian vowel separator,
+                // word joiner and invisible operators) and the BOM. All BMP, so `\uHHHH` suffices.
+                | '\u{061C}'
+                | '\u{180E}'
                 | '\u{200B}'..='\u{200F}'
                 | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{2069}'
                 | '\u{FEFF}'
         )
@@ -4415,5 +4421,22 @@ mod opaque_callee_table_tests {
                 "no error reported inside {name} (lines {start}..={end}):\n{out}\n--- source ---\n{bad}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod format_char_escape_tests {
+    use super::*;
+
+    #[test]
+    fn escape_lean_str_escapes_every_bidi_and_invisible_format_char() {
+        for c in [
+            '\u{061C}', '\u{180E}', '\u{200B}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202E}',
+            '\u{2028}', '\u{2029}', '\u{2060}', '\u{2064}', '\u{2066}', '\u{2069}', '\u{FEFF}',
+        ] {
+            assert_eq!(escape_lean_str(&c.to_string()), format!("\\u{:04x}", u32::from(c)), "{c:?}");
+        }
+        // Visible non-ASCII text stays verbatim.
+        assert_eq!(escape_lean_str("é→ü"), "é→ü");
     }
 }
