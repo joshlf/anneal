@@ -16,19 +16,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arbitrary::Unstructured;
 use cargo_anneal::{
     BatchTraceEvalCase, CaptureDriverConfig, RecordedEvent, RecordedOutcome, RecordedRawTrace,
-    ScaffoldConfig, TraceCheckModuleConfig, decode_recorded_raw_trace_hex,
-    encode_recorded_raw_trace_hex, parse_batch_trace_probe_output,
+    ScaffoldConfig, TraceCheckModuleConfig, build_lake_build_command,
+    decode_recorded_raw_trace_hex, encode_recorded_raw_trace_hex, parse_batch_trace_probe_output,
     render_batch_trace_eval_lean_module, render_batch_trace_probe_lean_module, run_cargo_capture,
-    run_lake_verify_targets, scaffold_workspace_with_config,
+    scaffold_workspace_with_config,
 };
 
 use crate::input_gen::{
@@ -38,8 +38,9 @@ use crate::input_gen::{
 use crate::instrument::EnvSchedule;
 use crate::miri_eval::{json_escape, resolve_rustc_bin};
 use crate::mutators_itree::{
-    GeneratedItreeCandidate, ItreeMutationStep, StagedItreeCandidate,
-    annotate_itree_external_callees, contains_unsafe_token, itree_candidate_replay_is_faithful,
+    GeneratedItreeCandidate, ItreeConcreteEvaluator, ItreeConcreteRun, ItreeMutationStep,
+    StagedItreeCandidate, annotate_itree_external_callees, contains_unsafe_token,
+    explore_itree_concolic_trials, itree_candidate_replay_is_faithful,
     reconstruct_itree_mutation_steps, replay_itree_mutation_steps, stage_itree_candidate_items,
 };
 use crate::mutators_miri::DetRng;
@@ -209,8 +210,45 @@ pub const DEFAULT_ITREE_TRIALS_PER_CANDIDATE: usize = 12;
 /// `checkRawByteTraceObsErasedBounded_sound`.
 pub const ITREE_TRACE_CHECK_FUEL: usize = 240;
 
+/// Default per-invocation wall-clock timeout for a single `lake env lean` chunk
+/// or fallback module (override via `ANNEAL_ITREE_LEAN_TIMEOUT_SECS` or
+/// `ANNEAL_ITREE_LEAN_TIMEOUT_MS`).
+pub const DEFAULT_ITREE_LEAN_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Default per-worker process-tree physical RSS limit in KiB (`8 GiB`).
+pub const DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB: u64 = 8 * 1024 * 1024;
+
+/// Minimum auto-computed per-worker process-tree physical RSS limit in KiB
+/// (`512 MiB`). Explicit `ANNEAL_ITREE_MAX_RSS_KIB` overrides may set smaller
+/// values in unit tests.
+pub const MIN_ITREE_LEAN_RSS_LIMIT_KIB: u64 = 512 * 1024;
+
+/// Grace period between `SIGTERM` and `SIGKILL` when the watchdog terminates a
+/// `lake env lean` process tree.
+const ITREE_WATCHDOG_KILL_GRACE: Duration = Duration::from_millis(100);
+
+/// Maximum poll interval of the `lake env lean` RSS + wall-clock watchdog loop.
+/// Polling starts at [`ITREE_WATCHDOG_MIN_POLL_INTERVAL`] (so short runs are
+/// reaped promptly) and doubles up to this cap: every tick scans all of
+/// `/proc/*/stat`, and up to 8 workers poll concurrently, so a fixed 25 ms
+/// cadence would burn a measurable share of a core per worker on busy hosts.
+/// At Lean's observed ~280 MB/s kernel-reduction growth a 200 ms tick
+/// overshoots the RSS ceiling by at most ~56 MB (`miri_eval` polls at 200 ms).
+const ITREE_WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// First (shortest) poll interval of the watchdog loop.
+const ITREE_WATCHDOG_MIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// How long [`run_command_with_watchdog`] waits, after the root has exited and
+/// its tracked descendants were killed, for the stdout / stderr readers to reach
+/// EOF before abandoning them (a write end held open by a descendant that
+/// escaped both the process group and `(pid, starttime)` tracking must not
+/// block the harness forever).
+const ITREE_WATCHDOG_PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 /// Parses `(MemTotal, MemAvailable)` in KiB from `/proc/meminfo` contents.
-fn parse_meminfo_kib(meminfo: &str) -> (Option<u64>, Option<u64>) {
+/// Falls back to `MemFree + Buffers + Cached` when `MemAvailable:` is absent.
+pub fn parse_meminfo_kib(meminfo: &str) -> (Option<u64>, Option<u64>) {
     let field = |name: &str| {
         meminfo.lines().find_map(|line| {
             line.strip_prefix(name)?
@@ -220,14 +258,21 @@ fn parse_meminfo_kib(meminfo: &str) -> (Option<u64>, Option<u64>) {
                 .ok()
         })
     };
-    (field("MemTotal:"), field("MemAvailable:"))
+    let total = field("MemTotal:");
+    let avail = field("MemAvailable:").or_else(|| {
+        let free = field("MemFree:")?;
+        let buffers = field("Buffers:").unwrap_or(0);
+        let cached = field("Cached:").unwrap_or(0);
+        Some(free.saturating_add(buffers).saturating_add(cached))
+    });
+    (total, avail)
 }
 
 fn read_u64_file(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()
 }
 
-fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+fn min_opt<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
     match (a, b) {
         (Some(x), Some(y)) => Some(x.min(y)),
         (x, None) => x,
@@ -235,38 +280,164 @@ fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-/// Returns `(limit_kib, headroom_kib)` for the tightest cgroup v2 `memory.max`
-/// between this process's cgroup (`0::<path>` in `proc_self_cgroup`) and
-/// `cgroup_root`, where headroom is `memory.max - memory.current`.
-///
-/// `anneal-lean-run` confines commands to a transient `systemd-run --scope`
-/// whose `MemoryMax` is far below host `MemAvailable` (and parent slices may be
-/// capped too), so `/proc/meminfo` alone overestimates how many concurrent
-/// `lake env lean` workers fit before the cgroup OOM killer fires.
-fn cgroup_memory_limits_kib(
-    cgroup_root: &Path,
-    proc_self_cgroup: &str,
-) -> (Option<u64>, Option<u64>) {
-    let Some(rel) = proc_self_cgroup
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-    else {
-        return (None, None);
+/// Normalizes the `<path>` of a `/proc/self/cgroup` line relative to a cgroup
+/// mount: strips a ` (deleted)` suffix and leading `/`, and rejects any path
+/// with `..` / root / prefix components (so the ancestor walk can never leave
+/// the mount via a lexically-prefixed path such as `<root>/../..`).
+fn sanitize_cgroup_rel(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let rel = trimmed
+        .strip_suffix(" (deleted)")
+        .unwrap_or(trimmed)
+        .trim()
+        .trim_start_matches('/');
+    let escapes = Path::new(rel).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    });
+    (!escapes).then_some(rel)
+}
+
+/// Visits every existing directory from `base/rel` up to and including `base`
+/// (a missing leaf, as in a container that sees its own cgroup as the mount
+/// root, still walks up to `base`).
+fn walk_cgroup_ancestors(base: &Path, rel: &str, visit: &mut dyn FnMut(&Path)) {
+    if !base.is_dir() {
+        return;
+    }
+    let mut dir = if rel.is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(rel)
     };
-    let mut dir = cgroup_root.join(rel.trim().trim_start_matches('/'));
-    let mut limit_kib: Option<u64> = None;
-    let mut headroom_kib: Option<u64> = None;
-    while dir.starts_with(cgroup_root) {
-        if let Some(max) = read_u64_file(&dir.join("memory.max")) {
-            let current = read_u64_file(&dir.join("memory.current")).unwrap_or(0);
-            limit_kib = min_opt(limit_kib, Some(max / 1024));
-            headroom_kib = min_opt(headroom_kib, Some(max.saturating_sub(current) / 1024));
+    while dir.starts_with(base) {
+        if dir.is_dir() {
+            visit(&dir);
         }
-        if dir == cgroup_root || !dir.pop() {
+        if dir == base || !dir.pop() {
             break;
         }
     }
-    (limit_kib, headroom_kib)
+}
+
+/// Returns `(limit_kib, headroom_kib)` for the tightest cgroup v2 (`memory.max`
+/// / `memory.high` minus `memory.stat` `anon + shmem`) or cgroup v1
+/// (`memory.limit_in_bytes` / `hierarchical_memory_limit` minus `total_rss +
+/// total_shmem`, under `<cgroup_root>/memory`) ancestor of this process's
+/// cgroup in `proc_self_cgroup`.
+///
+/// Delegates to `cargo_anneal`'s hardened walkers — the same ones
+/// `miri-difftest` uses through `probe_effective_memory_kib` — so both difftest
+/// harnesses share one set of safety invariants (`max` / unlimited sentinels,
+/// ` (deleted)` paths, `..` rejection, missing container leaves, and
+/// descendant usage propagation).
+///
+/// `anneal-lean-run` confines commands to a transient `systemd-run --scope`
+/// whose `MemoryMax` / `MemoryHigh` is far below host `MemAvailable` (and parent
+/// slices may be capped too), so `/proc/meminfo` alone overestimates how many
+/// concurrent `lake env lean` workers and how much per-worker RSS fit before
+/// throttling or the cgroup OOM killer fires.
+pub fn cgroup_memory_limits_kib(
+    cgroup_root: &Path,
+    proc_self_cgroup: &str,
+) -> (Option<u64>, Option<u64>) {
+    let (v2_limit, v2_headroom) =
+        cargo_anneal::cgroup_memory_limits_kib(cgroup_root, proc_self_cgroup);
+    let (v1_limit, v1_headroom) =
+        cargo_anneal::cgroup_v1_memory_limits_kib(&cgroup_root.join("memory"), proc_self_cgroup);
+    (min_opt(v2_limit, v1_limit), min_opt(v2_headroom, v1_headroom))
+}
+
+/// Parses a cgroup v2 `cpu.max` string (`"<quota> <period>"` or `"max <period>"`)
+/// into an integer core ceiling `ceil(quota / period)`. Returns `None` when
+/// unconstrained (`"max"`) or malformed.
+pub fn parse_cpu_max_quota_cores(cpu_max: &str) -> Option<usize> {
+    let mut parts = cpu_max.split_whitespace();
+    let quota_str = parts.next()?;
+    if quota_str == "max" {
+        return None;
+    }
+    let period_str = parts.next().unwrap_or("100000");
+    let quota = quota_str.parse::<u64>().ok()?;
+    let period = period_str.parse::<u64>().ok()?;
+    if quota == 0 || period == 0 {
+        return None;
+    }
+    Some(quota.div_ceil(period).max(1) as usize)
+}
+
+/// Returns the tightest CPU core ceiling across the enclosing cgroup v2
+/// (`cpu.max`) and cgroup v1 (`cpu.cfs_quota_us` / `cpu.cfs_period_us` under
+/// `<cgroup_root>/cpu,cpuacct` or `<cgroup_root>/cpu`) hierarchy of this
+/// process's cgroup in `proc_self_cgroup`.
+pub fn cgroup_cpu_quota_cores(cgroup_root: &Path, proc_self_cgroup: &str) -> Option<usize> {
+    let mut tightest: Option<usize> = None;
+
+    // 1. Cgroup v2 (`0::<path>`).
+    if let Some(rel) = proc_self_cgroup
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("0::"))
+        .and_then(sanitize_cgroup_rel)
+    {
+        walk_cgroup_ancestors(cgroup_root, rel, &mut |dir| {
+            if let Ok(raw) = fs::read_to_string(dir.join("cpu.max"))
+                && let Some(cores) = parse_cpu_max_quota_cores(&raw)
+            {
+                tightest = min_opt(tightest, Some(cores));
+            }
+        });
+    }
+
+    // 2. Cgroup v1 (`<id>:cpu,cpuacct:<path>` or `<id>:cpu:<path>`).
+    let v1_rel = proc_self_cgroup
+        .lines()
+        .map(str::trim)
+        .find_map(|line| {
+            let mut parts = line.splitn(3, ':');
+            let (_id, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
+            controllers
+                .split(',')
+                .any(|c| c == "cpu")
+                .then_some(path)
+        })
+        .and_then(sanitize_cgroup_rel);
+    if let Some(rel) = v1_rel {
+        let mut visited_bases: Vec<PathBuf> = Vec::new();
+        for base in [cgroup_root.join("cpu,cpuacct"), cgroup_root.join("cpu")] {
+            // `cpu` is usually a symlink to `cpu,cpuacct`: walk each mount once.
+            let canonical = fs::canonicalize(&base).unwrap_or_else(|_| base.clone());
+            if visited_bases.contains(&canonical) {
+                continue;
+            }
+            visited_bases.push(canonical);
+            walk_cgroup_ancestors(&base, rel, &mut |dir| {
+                if let Ok(q_raw) = fs::read_to_string(dir.join("cpu.cfs_quota_us"))
+                    && let Ok(quota) = q_raw.trim().parse::<i64>()
+                    && quota > 0
+                {
+                    let period = read_u64_file(&dir.join("cpu.cfs_period_us")).unwrap_or(100_000);
+                    if period > 0 {
+                        let cores = (quota as u64).div_ceil(period).max(1) as usize;
+                        tightest = min_opt(tightest, Some(cores));
+                    }
+                }
+            });
+        }
+    }
+
+    tightest
+}
+
+/// Effective `(MemTotal, MemAvailable)` in KiB: host `/proc/meminfo` intersected
+/// with the enclosing cgroup v1/v2 limits (`cargo_anneal::probe_effective_memory_kib`,
+/// shared with `miri-difftest`).
+fn effective_memory_limits_kib() -> (Option<u64>, Option<u64>) {
+    cargo_anneal::probe_effective_memory_kib()
 }
 
 /// Maps effective total / available memory (KiB) to a `lake env lean` worker
@@ -295,7 +466,7 @@ pub fn itree_lean_jobs_for_memory(total_kib: Option<u64>, avail_kib: Option<u64>
 
 /// Resolve the maximum number of concurrent `lake env lean` chunk workers for
 /// `itree-difftest` from `ANNEAL_ITREE_LEAN_JOBS` (capped at 8) or, by default,
-/// from host `/proc/meminfo` intersected with the enclosing cgroup v2 memory
+/// from host `/proc/meminfo` intersected with the enclosing cgroup v1/v2 memory
 /// limits (see [`itree_lean_jobs_for_memory`]).
 pub fn resolve_itree_lean_jobs() -> usize {
     if let Ok(val) = env::var("ANNEAL_ITREE_LEAN_JOBS")
@@ -304,16 +475,959 @@ pub fn resolve_itree_lean_jobs() -> usize {
     {
         return parsed.min(8);
     }
-    let (mut total_kib, mut avail_kib) = fs::read_to_string("/proc/meminfo")
-        .map(|s| parse_meminfo_kib(&s))
-        .unwrap_or((None, None));
-    if let Ok(self_cgroup) = fs::read_to_string("/proc/self/cgroup") {
-        let (cg_limit, cg_headroom) =
-            cgroup_memory_limits_kib(Path::new("/sys/fs/cgroup"), &self_cgroup);
-        total_kib = min_opt(total_kib, cg_limit);
-        avail_kib = min_opt(avail_kib, cg_headroom);
-    }
+    let (total_kib, avail_kib) = effective_memory_limits_kib();
     itree_lean_jobs_for_memory(total_kib, avail_kib)
+}
+
+/// Computes `LEAN_NUM_THREADS` for one `lake env lean` worker given the host's
+/// logical core count, optional cgroup CPU quota ceiling, effective available
+/// memory in KiB, and number of concurrent `lake env lean` workers (`active_workers`).
+pub fn itree_lean_threads_for_resources(
+    host_cores: usize,
+    cgroup_cores: Option<usize>,
+    avail_kib: Option<u64>,
+    active_workers: usize,
+) -> usize {
+    const GIB: u64 = 1024 * 1024;
+    let workers = active_workers.max(1);
+    let effective_cores = min_opt(Some(host_cores.max(1)), cgroup_cores).unwrap_or(1);
+    let by_cpu = (effective_cores / workers).clamp(1, 8);
+    let by_mem = match avail_kib.map(|a| a / (workers as u64)) {
+        Some(per_worker_kib) if per_worker_kib < 4 * GIB => 1,
+        Some(per_worker_kib) if per_worker_kib < 8 * GIB => 2,
+        Some(per_worker_kib) if per_worker_kib < 16 * GIB => 4,
+        _ => 8,
+    };
+    by_cpu.min(by_mem).max(1)
+}
+
+/// Computes `(lean_max_mb, rss_limit_kib)` for one `lake env lean` worker from
+/// effective `(total_kib, avail_kib)` and `active_workers`.
+///
+/// Reserves `min(20% of available, 2 GiB)` for the rest of the system / test
+/// runner, divides the remaining budget across `active_workers`, and clamps to
+/// `[MIN_ITREE_LEAN_RSS_LIMIT_KIB, DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB]`.
+pub fn itree_lean_rss_budget_kib(
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    active_workers: usize,
+) -> (u64, u64) {
+    const TWO_GIB_KIB: u64 = 2 * 1024 * 1024;
+    let workers = (active_workers.max(1)) as u64;
+    let mut rss_kib = DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB;
+
+    if let Some(avail) = avail_kib {
+        let reserve = (avail / 5).min(TWO_GIB_KIB);
+        let usable = avail.saturating_sub(reserve) / workers;
+        rss_kib = rss_kib.min(usable);
+    }
+    if let Some(total) = total_kib {
+        let usable_total = (total.saturating_mul(3) / 4) / workers;
+        rss_kib = rss_kib.min(usable_total);
+    }
+    let rss_limit_kib = rss_kib.clamp(
+        MIN_ITREE_LEAN_RSS_LIMIT_KIB,
+        DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB,
+    );
+    let lean_max_mb = (rss_limit_kib / 1024).clamp(256, 8192);
+    (lean_max_mb, rss_limit_kib)
+}
+
+fn parse_positive_env_u64(raw: Option<&str>, min: u64) -> Option<u64> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n >= min)
+}
+
+/// Pure helper for [`resolve_itree_lean_threads`]:
+///
+/// - an explicit `ANNEAL_ITREE_LEAN_THREADS` (`>= 1`, capped at 16) is the
+///   per-worker value;
+/// - otherwise the per-worker budget is [`itree_lean_threads_for_resources`],
+///   lowered (never raised) by a caller's `LEAN_NUM_THREADS`, which — as set by
+///   `anneal-lean-run` for the whole command — is the budget shared by all
+///   `active_workers` concurrent `lake env lean` workers (so `jobs` workers
+///   never multiply it).
+pub fn resolve_itree_lean_threads_with_env(
+    anneal_itree_lean_threads: Option<&str>,
+    caller_lean_num_threads: Option<&str>,
+    host_cores: usize,
+    cgroup_cores: Option<usize>,
+    avail_kib: Option<u64>,
+    active_workers: usize,
+) -> usize {
+    if let Some(n) = parse_positive_env_u64(anneal_itree_lean_threads, 1) {
+        return n.min(16) as usize;
+    }
+    let computed =
+        itree_lean_threads_for_resources(host_cores, cgroup_cores, avail_kib, active_workers);
+    match parse_positive_env_u64(caller_lean_num_threads, 1) {
+        Some(caller) => {
+            let share = (caller as usize / active_workers.max(1)).max(1);
+            computed.min(share)
+        }
+        None => computed,
+    }
+}
+
+/// Resolves `LEAN_NUM_THREADS` for one of `active_workers` concurrent
+/// `lake env lean` workers from `ANNEAL_ITREE_LEAN_THREADS`, the caller's
+/// `LEAN_NUM_THREADS`, and host + cgroup CPU quota and memory headroom (see
+/// [`resolve_itree_lean_threads_with_env`]).
+pub fn resolve_itree_lean_threads(active_workers: usize) -> usize {
+    let host_cores = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let cgroup_cores = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|cg| cgroup_cpu_quota_cores(Path::new("/sys/fs/cgroup"), &cg));
+    let (_total_kib, avail_kib) = effective_memory_limits_kib();
+    resolve_itree_lean_threads_with_env(
+        env::var("ANNEAL_ITREE_LEAN_THREADS").ok().as_deref(),
+        env::var("LEAN_NUM_THREADS").ok().as_deref(),
+        host_cores,
+        cgroup_cores,
+        avail_kib,
+        active_workers,
+    )
+}
+
+/// Pure helper for [`resolve_itree_lean_rss_budget_kib`]: starts from
+/// [`itree_lean_rss_budget_kib`]; an explicit `ANNEAL_ITREE_LEAN_MAX_MB`
+/// (`>= 64`, capped at 16384) sets Lean's `-M` (and, absent an RSS override, the
+/// RSS ceiling); an explicit `ANNEAL_ITREE_MAX_RSS_KIB` (`>= 1024`) sets the RSS
+/// ceiling and derives `-M` from it only when `-M` was not set explicitly.
+pub fn resolve_itree_lean_rss_budget_with_env(
+    anneal_itree_lean_max_mb: Option<&str>,
+    anneal_itree_max_rss_kib: Option<&str>,
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    active_workers: usize,
+) -> (u64, u64) {
+    let (mut lean_max_mb, mut rss_limit_kib) =
+        itree_lean_rss_budget_kib(total_kib, avail_kib, active_workers);
+    let explicit_mb = parse_positive_env_u64(anneal_itree_lean_max_mb, 64).map(|mb| mb.min(16_384));
+    if let Some(mb) = explicit_mb {
+        lean_max_mb = mb;
+        rss_limit_kib = mb.saturating_mul(1024);
+    }
+    if let Some(kib) = parse_positive_env_u64(anneal_itree_max_rss_kib, 1024) {
+        rss_limit_kib = kib;
+        if explicit_mb.is_none() {
+            lean_max_mb = (kib / 1024).clamp(64, 16_384);
+        }
+    }
+    (lean_max_mb, rss_limit_kib)
+}
+
+/// Resolves `(lean_max_mb, rss_limit_kib)` for one of `active_workers`
+/// concurrent `lake env lean` workers, honoring `ANNEAL_ITREE_LEAN_MAX_MB` and
+/// `ANNEAL_ITREE_MAX_RSS_KIB` (see [`resolve_itree_lean_rss_budget_with_env`]).
+pub fn resolve_itree_lean_rss_budget_kib(active_workers: usize) -> (u64, u64) {
+    let (total_kib, avail_kib) = effective_memory_limits_kib();
+    resolve_itree_lean_rss_budget_with_env(
+        env::var("ANNEAL_ITREE_LEAN_MAX_MB").ok().as_deref(),
+        env::var("ANNEAL_ITREE_MAX_RSS_KIB").ok().as_deref(),
+        total_kib,
+        avail_kib,
+        active_workers,
+    )
+}
+
+/// Wall-clock allowance per trace case beyond the first in one `lake env lean`
+/// module, on top of [`DEFAULT_ITREE_LEAN_TIMEOUT`], so a full 64-case probe
+/// chunk is not held to a single trace's budget while a bisected single case
+/// still is.
+pub const ITREE_LEAN_TIMEOUT_PER_CASE: Duration = Duration::from_secs(5);
+
+/// Pure helper for [`resolve_itree_lean_timeout_for_cases`]: an explicit
+/// `ANNEAL_ITREE_LEAN_TIMEOUT_MS` (`>= 10`) or `ANNEAL_ITREE_LEAN_TIMEOUT_SECS`
+/// (`>= 1`) is a flat per-invocation timeout; otherwise
+/// `DEFAULT_ITREE_LEAN_TIMEOUT + (cases - 1) * ITREE_LEAN_TIMEOUT_PER_CASE`.
+pub fn resolve_itree_lean_timeout_with_env(
+    timeout_ms: Option<&str>,
+    timeout_secs: Option<&str>,
+    cases: usize,
+) -> Duration {
+    if let Some(ms) = parse_positive_env_u64(timeout_ms, 10) {
+        return Duration::from_millis(ms);
+    }
+    if let Some(secs) = parse_positive_env_u64(timeout_secs, 1) {
+        return Duration::from_secs(secs);
+    }
+    let extra_cases = u32::try_from(cases.saturating_sub(1)).unwrap_or(u32::MAX);
+    DEFAULT_ITREE_LEAN_TIMEOUT
+        .saturating_add(ITREE_LEAN_TIMEOUT_PER_CASE.saturating_mul(extra_cases))
+}
+
+/// Resolves the wall-clock timeout for one `lake env lean` module holding
+/// `cases` trace cases (see [`resolve_itree_lean_timeout_with_env`]).
+pub fn resolve_itree_lean_timeout_for_cases(cases: usize) -> Duration {
+    resolve_itree_lean_timeout_with_env(
+        env::var("ANNEAL_ITREE_LEAN_TIMEOUT_MS").ok().as_deref(),
+        env::var("ANNEAL_ITREE_LEAN_TIMEOUT_SECS").ok().as_deref(),
+        cases,
+    )
+}
+
+/// Resolves the per-invocation wall-clock timeout for a single-case `lake env
+/// lean` module.
+pub fn resolve_itree_lean_timeout() -> Duration {
+    resolve_itree_lean_timeout_for_cases(1)
+}
+
+/// Parses `(state, ppid, starttime_ticks)` from `/proc/<pid>/stat` contents.
+///
+/// The `comm` field (field 2) is enclosed in `(` and `)` and may contain spaces,
+/// parentheses, or newlines, so we locate the last `)` before splitting the
+/// remaining fields by whitespace.
+/// After `)`:
+/// - token 0 is field 3 (`state`, e.g. `'R'`, `'S'`, `'Z'`),
+/// - token 1 is field 4 (`ppid`),
+/// - token 19 is field 22 (`starttime` in clock ticks since boot).
+pub fn parse_proc_stat_state_ppid_starttime(stat: &str) -> Option<(char, u32, u64)> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let after_comm = stat.get(close + 1..)?.trim_start();
+    let mut fields = after_comm.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let ppid = fields.next()?.parse::<u32>().ok()?;
+    let starttime = fields.nth(17)?.parse::<u64>().ok()?;
+    Some((state, ppid, starttime))
+}
+
+fn proc_state_ppid_starttime_in(proc_root: &Path, pid: u32) -> Option<(char, u32, u64)> {
+    let stat_path = proc_root.join(pid.to_string()).join("stat");
+    let stat = fs::read_to_string(stat_path).ok()?;
+    parse_proc_stat_state_ppid_starttime(&stat)
+}
+
+fn proc_starttime_in(proc_root: &Path, pid: u32) -> Option<u64> {
+    proc_state_ppid_starttime_in(proc_root, pid).map(|(_, _, st)| st)
+}
+
+fn host_page_size_kib() -> u64 {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn sysconf(name: i32) -> std::ffi::c_long;
+        }
+        #[cfg(target_os = "linux")]
+        const SC_PAGESIZE: i32 = 30;
+        #[cfg(target_os = "macos")]
+        const SC_PAGESIZE: i32 = 29;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        const SC_PAGESIZE: i32 = 30;
+        let bytes = unsafe { sysconf(SC_PAGESIZE) };
+        if bytes > 0 {
+            return (bytes as u64 / 1024).max(1);
+        }
+    }
+    4
+}
+
+/// Reads physical resident set size (RSS) in KiB for `pid` under `proc_root`,
+/// preferring `<proc_root>/<pid>/statm` (field 2 = resident pages) and falling
+/// back to `VmRSS:` in `<proc_root>/<pid>/status`.
+pub fn proc_rss_kib_in(proc_root: &Path, pid: u32, page_size_kib: u64) -> Option<u64> {
+    let pid_dir = proc_root.join(pid.to_string());
+    if let Ok(statm) = fs::read_to_string(pid_dir.join("statm"))
+        && let Some(res_pages_str) = statm.split_whitespace().nth(1)
+        && let Ok(res_pages) = res_pages_str.parse::<u64>()
+    {
+        return Some(res_pages.saturating_mul(page_size_kib.max(1)));
+    }
+    let status = fs::read_to_string(pid_dir.join("status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kib_str = rest.split_whitespace().next()?;
+            return kib_str.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+/// Tracks a root `lake env lean` process and all of its descendants across
+/// polling ticks by `(pid, starttime)` so that:
+/// 1. grandchildren whose intermediate parent exits and are reparented to PID 1
+///    or a subreaper remain tracked in the tree,
+/// 2. PID reuse after a child exits cannot cause the watchdog to misattribute
+///    RSS or signal an unrelated process whose `starttime` differs, and
+/// 3. descendants can be signaled in reverse-creation order (`(starttime, seq)`
+///    descending) even when Linux PID numbers wrap around `pid_max`.
+#[derive(Debug, Clone)]
+pub struct TrackedProcessTree {
+    root_pid: u32,
+    root_starttime: Option<u64>,
+    /// Map from `pid` to `(starttime_ticks, discovery_seq)` for every live
+    /// process known to belong to this process tree.
+    tracked: BTreeMap<u32, (u64, u64)>,
+    next_seq: u64,
+    proc_root: PathBuf,
+    page_size_kib: u64,
+}
+
+impl TrackedProcessTree {
+    /// Creates a new process-tree tracker rooted at `root_pid` using `/proc`.
+    pub fn new(root_pid: u32) -> Self {
+        Self::with_proc_root(root_pid, Path::new("/proc"), host_page_size_kib())
+    }
+
+    /// Creates a new process-tree tracker rooted at `root_pid` reading from a
+    /// custom `proc_root` and `page_size_kib` (used by deterministic unit tests).
+    pub fn with_proc_root(root_pid: u32, proc_root: &Path, page_size_kib: u64) -> Self {
+        let root_starttime = proc_starttime_in(proc_root, root_pid);
+        let mut tracked = BTreeMap::new();
+        let mut next_seq = 0u64;
+        if let Some(st) = root_starttime {
+            tracked.insert(root_pid, (st, next_seq));
+            next_seq += 1;
+        }
+        Self {
+            root_pid,
+            root_starttime,
+            tracked,
+            next_seq,
+            proc_root: proc_root.to_path_buf(),
+            page_size_kib: page_size_kib.max(1),
+        }
+    }
+
+    /// Refreshes the tracked process tree from `self.proc_root` and returns the
+    /// summed physical RSS (in KiB) of all live non-zombie processes in the tree.
+    pub fn sample_rss_kib(&mut self) -> u64 {
+        let Some(root_st) = self.root_starttime.or_else(|| {
+            let st = proc_starttime_in(&self.proc_root, self.root_pid)?;
+            self.root_starttime = Some(st);
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            self.tracked.insert(self.root_pid, (st, seq));
+            Some(st)
+        }) else {
+            return 0;
+        };
+
+        let Ok(entries) = fs::read_dir(&self.proc_root) else {
+            return proc_rss_kib_in(&self.proc_root, self.root_pid, self.page_size_kib)
+                .unwrap_or(0);
+        };
+
+        let mut children_by_ppid: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut live_meta: BTreeMap<u32, (char, u64)> = BTreeMap::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            if let Some((state, ppid, st)) = proc_state_ppid_starttime_in(&self.proc_root, pid) {
+                children_by_ppid.entry(ppid).or_default().push(pid);
+                live_meta.insert(pid, (state, st));
+            }
+        }
+
+        // If `root_pid` exited or was recycled for an unrelated process, do not
+        // attribute `root_pid`'s own RSS; if `root_pid` is a zombie with matching
+        // `starttime`, still expand its children before pruning `'Z'`/`'X'`.
+        let root_matches = matches!(
+            live_meta.get(&self.root_pid),
+            Some(&(_, st)) if st == root_st
+        );
+        if !root_matches {
+            self.tracked.remove(&self.root_pid);
+        }
+
+        // Seed expansion from all tracked PIDs whose `starttime` still matches
+        // (including a just-zombied parent whose un-reaped PID is still its
+        // live children's `ppid`).
+        let mut stack: Vec<u32> = self
+            .tracked
+            .iter()
+            .filter_map(|(&pid, &(expected_st, _))| {
+                matches!(
+                    live_meta.get(&pid),
+                    Some(&(_, actual_st)) if actual_st == expected_st
+                )
+                .then_some(pid)
+            })
+            .collect();
+        if root_matches && !stack.contains(&self.root_pid) {
+            stack.push(self.root_pid);
+        }
+
+        // Prune any tracked PID that exited, turned into a zombie, or was reused
+        // with a different `starttime`.
+        self.tracked.retain(|&pid, &mut (expected_st, _seq)| {
+            matches!(
+                live_meta.get(&pid),
+                Some(&(state, actual_st)) if actual_st == expected_st && state != 'Z' && state != 'X'
+            )
+        });
+
+        // Expand from all verified tracked members to discover any new children
+        // or grandchildren (including descendants reparented before their parent
+        // exited).
+        while let Some(pid) = stack.pop() {
+            if let Some(children) = children_by_ppid.get(&pid) {
+                for &child_pid in children {
+                    if self.tracked.contains_key(&child_pid) {
+                        continue;
+                    }
+                    if let Some(&(state, child_st)) = live_meta.get(&child_pid)
+                        && state != 'Z'
+                        && state != 'X'
+                    {
+                        let seq = self.next_seq;
+                        self.next_seq += 1;
+                        self.tracked.insert(child_pid, (child_st, seq));
+                        stack.push(child_pid);
+                    }
+                }
+            }
+        }
+        if self.tracked.is_empty() {
+            return 0;
+        }
+
+        let mut total_rss_kib = 0u64;
+        for (&pid, &(expected_st, _seq)) in &self.tracked {
+            if let Some(&(state, actual_st)) = live_meta.get(&pid)
+                && actual_st == expected_st
+                && state != 'Z'
+                && state != 'X'
+            {
+                total_rss_kib = total_rss_kib.saturating_add(
+                    proc_rss_kib_in(&self.proc_root, pid, self.page_size_kib).unwrap_or(0),
+                );
+            }
+        }
+        total_rss_kib
+    }
+
+    /// Returns tracked descendants (excluding `root_pid`) ordered newest-first
+    /// (`(starttime, discovery_seq)` descending) so children are signaled before
+    /// parents even when PID numbers wrap around `pid_max`.
+    pub fn descendant_kill_order(&self) -> Vec<(u32, u64)> {
+        let mut order: Vec<(u32, u64, u64)> = self
+            .tracked
+            .iter()
+            .filter(|&(&pid, _)| pid != self.root_pid)
+            .map(|(&pid, &(st, seq))| (pid, st, seq))
+            .collect();
+        order.sort_by(|a, b| (b.1, b.2).cmp(&(a.1, a.2)));
+        order.into_iter().map(|(pid, st, _)| (pid, st)).collect()
+    }
+
+    /// Returns true if any tracked descendant (excluding `root_pid`) is still
+    /// alive (and not a zombie) with its recorded `starttime`.
+    pub fn has_live_descendants(&self) -> bool {
+        self.tracked.iter().any(|(&pid, &(expected_st, _))| {
+            pid != self.root_pid
+                && matches!(
+                    proc_state_ppid_starttime_in(&self.proc_root, pid),
+                    Some((state, _, actual_st))
+                        if actual_st == expected_st && state != 'Z' && state != 'X'
+                )
+        })
+    }
+
+    /// Signals all tracked descendants whose current `starttime` still matches
+    /// (`SIGTERM` followed by `SIGKILL` after `grace_period` if any remain).
+    pub fn kill_descendants(&mut self, grace_period: Duration) {
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            const SIGTERM: i32 = 15;
+            const SIGKILL: i32 = 9;
+
+            let order = self.descendant_kill_order();
+            if order.is_empty() {
+                return;
+            }
+            for &(pid, expected_st) in &order {
+                if let Ok(ip) = i32::try_from(pid)
+                    && ip > 1
+                    && matches!(
+                        proc_state_ppid_starttime_in(&self.proc_root, pid),
+                        Some((state, _, actual_st))
+                            if actual_st == expected_st && state != 'Z' && state != 'X'
+                    )
+                {
+                    unsafe {
+                        let _ = kill(ip, SIGTERM);
+                    }
+                }
+            }
+            if !grace_period.is_zero() {
+                let deadline = Instant::now() + grace_period;
+                while Instant::now() < deadline {
+                    if !self.has_live_descendants() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            for &(pid, expected_st) in &order {
+                if let Ok(ip) = i32::try_from(pid)
+                    && ip > 1
+                    && matches!(
+                        proc_state_ppid_starttime_in(&self.proc_root, pid),
+                        Some((state, _, actual_st))
+                            if actual_st == expected_st && state != 'Z' && state != 'X'
+                    )
+                {
+                    unsafe {
+                        let _ = kill(ip, SIGKILL);
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = grace_period;
+        }
+    }
+    /// Classifies `root_pid`'s `/proc/<root_pid>/stat` state against its
+    /// recorded `starttime` without reaping `Child`:
+    /// - `Some(true)`: positively observed as an un-reaped zombie (`'Z'`), so
+    ///   `pgid == root_pid` is still reserved and `-pgid` can be signaled before
+    ///   `wait()`.
+    /// - `Some(false)`: positively observed as still running (non-`'Z'`/`'X'`)
+    ///   with matching `starttime`, so `try_wait()` must NOT be called right
+    ///   after (avoiding the race where `root_pid` exits between `/proc` read
+    ///   and `try_wait()` and gets reaped without signaling `-pgid`).
+    /// - `None`: `/proc` unavailable/unreadable or `root_pid` no longer present.
+    fn root_proc_zombie_or_running(&self) -> Option<bool> {
+        let root_st = self.root_starttime?;
+        match proc_state_ppid_starttime_in(&self.proc_root, self.root_pid) {
+            Some(('Z', _, actual_st)) if actual_st == root_st => Some(true),
+            Some((state, _, actual_st))
+                if actual_st == root_st && state != 'Z' && state != 'X' =>
+            {
+                Some(false)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns true if `root_pid` has already exited (zombie `'Z'`/`'X'`, gone,
+    /// or recycled with a different `starttime`) without reaping `Child`.
+    /// Without a recorded `starttime` (no `/proc`, e.g. macOS) exit cannot be
+    /// observed, so this stays `false` and [`terminate_process_tree`] waits out
+    /// its full `SIGTERM` grace period before escalating to `SIGKILL`.
+    fn root_has_exited(&self) -> bool {
+        self.root_starttime.is_some()
+            && !matches!(self.root_proc_zombie_or_running(), Some(false))
+    }
+}
+
+/// Sends `sig` to process group `pgid` (`kill(-pgid, sig)`); a no-op for
+/// `pgid <= 1` and on non-Unix targets.
+fn signal_process_group(pgid: u32, sig: i32) {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        if let Ok(pg) = i32::try_from(pgid)
+            && pg > 1
+        {
+            // SAFETY: `kill(2)` takes plain integers and has no memory-safety
+            // preconditions; callers only pass the group of a still un-reaped
+            // root, whose id therefore cannot have been recycled.
+            unsafe {
+                let _ = kill(-pg, sig);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pgid, sig);
+    }
+}
+
+/// Returns `Some(status)` once the root has exited on its own (`None` while it
+/// runs). Where `/proc` positively shows the root as a zombie with its recorded
+/// `starttime`, its process group (`pgid == root_pid`, still reserved by the
+/// un-reaped zombie) is `SIGKILL`ed before the root is reaped, so a stray group
+/// member spawned after the last `(pid, starttime)` scan can neither keep
+/// running nor hold the output pipes open; tracked descendants that left the
+/// group are killed by `(pid, starttime)`. When `/proc` positively shows the
+/// root still running, `try_wait` is skipped so `root_pid` cannot exit and get
+/// reaped in the window between the `/proc` read and `try_wait`. Without `/proc`
+/// this falls back to `try_wait` plus tracked-descendant cleanup.
+fn reap_exited_root(
+    child: &mut Child,
+    tree: &mut TrackedProcessTree,
+    peak_rss_kib: &mut u64,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    const SIGKILL: i32 = 9;
+    match tree.root_proc_zombie_or_running() {
+        Some(true) => {
+            *peak_rss_kib = (*peak_rss_kib).max(tree.sample_rss_kib());
+            signal_process_group(tree.root_pid, SIGKILL);
+            tree.kill_descendants(Duration::ZERO);
+            return child.wait().map(Some);
+        }
+        Some(false) => return Ok(None),
+        None => {}
+    }
+    match child.try_wait()? {
+        Some(status) => {
+            // Already reaped: only `(pid, starttime)`-verified descendants may be
+            // signaled now (never `-pgid`).
+            *peak_rss_kib = (*peak_rss_kib).max(tree.sample_rss_kib());
+            tree.kill_descendants(Duration::ZERO);
+            Ok(Some(status))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Terminates `child` (spawned with `.process_group(0)` so `pgid == root_pid`)
+/// and all tracked descendants cleanly:
+/// 1. Refreshes `tree` while `child` is still un-reaped (`root_pid` cannot be
+///    reused before `wait()`).
+/// 2. Sends `SIGTERM` to `-pgid` and to all `(pid, starttime)`-verified
+///    descendants (in case a grandchild called `setsid` / `setpgid`).
+/// 3. Polls up to `grace_period` for `child` (via `/proc` zombie state without
+///    reaping so `pgid == root_pid` stays reserved) and all non-zombie
+///    descendants to exit.
+/// 4. Escalates to `SIGKILL` on `-pgid` and any surviving verified descendants,
+///    and only then reaps `child` via `child.wait()` so no zombie is left behind.
+fn terminate_process_tree(child: &mut Child, tree: &mut TrackedProcessTree, grace_period: Duration) {
+    let _ = tree.sample_rss_kib();
+
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGTERM: i32 = 15;
+        const SIGKILL: i32 = 9;
+
+        let pgid = i32::try_from(tree.root_pid).ok().filter(|&p| p > 1);
+        if let Some(pg) = pgid {
+            unsafe {
+                let _ = kill(-pg, SIGTERM);
+            }
+        }
+        for (pid, expected_st) in tree.descendant_kill_order() {
+            if let Ok(ip) = i32::try_from(pid)
+                && ip > 1
+                && proc_starttime_in(&tree.proc_root, pid) == Some(expected_st)
+            {
+                unsafe {
+                    let _ = kill(ip, SIGTERM);
+                }
+            }
+        }
+
+        let deadline = Instant::now() + grace_period;
+        while Instant::now() < deadline {
+            let _ = tree.sample_rss_kib();
+            if tree.root_has_exited() && !tree.has_live_descendants() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        if let Some(pg) = pgid {
+            unsafe {
+                let _ = kill(-pg, SIGKILL);
+            }
+        }
+        for (pid, expected_st) in tree.descendant_kill_order() {
+            if let Ok(ip) = i32::try_from(pid)
+                && ip > 1
+                && proc_starttime_in(&tree.proc_root, pid) == Some(expected_st)
+            {
+                unsafe {
+                    let _ = kill(ip, SIGKILL);
+                }
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Classification of a `lake env lean` failure so `run_isolated_lean_stage` and
+/// callers can distinguish RSS/timeout watchdog terminations and Lean-internal
+/// memory exhaustion from genuine Lean elaboration errors or missing-toolchain
+/// failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItreeLeanFailureKind {
+    /// Killed by the process-tree RSS watchdog (`rss_kib > rss_limit_kib`).
+    RssWatchdogExceeded,
+    /// Killed by the wall-clock timeout watchdog (`elapsed >= timeout`).
+    WallClockTimeout,
+    /// Lean's own memory cap (`-M`: `excessive memory consumption` / `out of
+    /// memory`) or a root terminated by a signal (e.g. the cgroup OOM killer):
+    /// resource exhaustion that smaller modules may avoid, not a rejection.
+    LeanMemoryExhausted,
+    /// Missing binary / systematic host setup failure (`command not found`).
+    MissingToolchain,
+    /// Lean elaboration / kernel / missing-output failure.
+    ElaborationOrOutputFailure,
+}
+
+/// Lowercased markers of Lean memory exhaustion (mirroring `miri_eval`'s
+/// `LEAN_RESOURCE_MARKERS`) plus the signal-termination tag emitted by
+/// [`run_itree_lean_module_with_workers`].
+const ITREE_LEAN_MEMORY_MARKERS: [&str; 4] = [
+    "out of memory",
+    "excessive memory consumption",
+    "memory allocation failed",
+    "[lean:resource_exhausted]",
+];
+
+/// Lowercased markers of Lean's other per-declaration resource limits, which
+/// bisection cannot relieve but which still are not kernel rejections.
+const ITREE_LEAN_LIMIT_MARKERS: [&str; 5] = [
+    "(deterministic) timeout",
+    "maximum number of heartbeats",
+    "maximum recursion depth",
+    "deep recursion",
+    "stack overflow",
+];
+
+/// Classifies an error string returned by `run_itree_lean_module` or a chunk
+/// runner closure.
+pub fn classify_itree_lean_failure(err: &str) -> ItreeLeanFailureKind {
+    let lower = err.to_ascii_lowercase();
+    if err.contains("[WATCHDOG:RSS_EXCEEDED]") || err.contains("exceeded RSS limit") {
+        ItreeLeanFailureKind::RssWatchdogExceeded
+    } else if err.contains("[WATCHDOG:TIMEOUT]") || err.contains("exceeded wall-clock timeout") {
+        ItreeLeanFailureKind::WallClockTimeout
+    } else if err.contains("command not found") || err.contains("No such file or directory") {
+        ItreeLeanFailureKind::MissingToolchain
+    } else if ITREE_LEAN_MEMORY_MARKERS.iter().any(|m| lower.contains(m)) {
+        ItreeLeanFailureKind::LeanMemoryExhausted
+    } else {
+        ItreeLeanFailureKind::ElaborationOrOutputFailure
+    }
+}
+
+/// Whether a failed `lake env lean` run ran out of a resource or could not run
+/// at all (watchdog kill, Lean memory cap or other limit, signal, missing
+/// toolchain) rather than rejecting a theorem, so a kernel confirmation that
+/// failed this way is inconclusive instead of `kernel_confirmed = false`.
+pub fn itree_lean_failure_is_inconclusive(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    classify_itree_lean_failure(err) != ItreeLeanFailureKind::ElaborationOrOutputFailure
+        || ITREE_LEAN_LIMIT_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Result of running a `Command` under [`run_command_with_watchdog`].
+#[derive(Debug, Clone)]
+pub struct WatchdogCommandOutput {
+    /// Whether the root process exited successfully (`false` when killed by the
+    /// watchdog).
+    pub exit_success: bool,
+    /// Captured standard output.
+    pub stdout: Vec<u8>,
+    /// Captured standard error.
+    pub stderr: Vec<u8>,
+    /// Peak process-tree physical RSS observed (in KiB).
+    pub peak_rss_kib: u64,
+    /// Watchdog termination reason if the process tree was killed by the
+    /// watchdog (`Some(ItreeLeanFailureKind::RssWatchdogExceeded | WallClockTimeout)`).
+    pub watchdog_killed: Option<ItreeLeanFailureKind>,
+    /// The root exited because of a signal it did not catch (outside the
+    /// watchdog), e.g. the cgroup OOM killer.
+    pub signal_terminated: bool,
+    /// `false` when a stdout / stderr write end was still held open
+    /// [`ITREE_WATCHDOG_PIPE_DRAIN_GRACE`] after the root exited and its tracked
+    /// descendants were killed (the readers were abandoned, so the captured
+    /// output may be incomplete).
+    pub pipes_drained: bool,
+}
+
+/// Upper bound on bytes buffered per child output stream (`stdout` / `stderr`)
+/// in [`WatchdogPipeReader`] (`16 MiB`), so a runaway child spewing unbounded
+/// output cannot exhaust host memory before the watchdog fires.
+const MAX_WATCHDOG_PIPE_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Background reader that drains one child pipe into a shared buffer, so the
+/// captured prefix stays available even if the reader has to be abandoned.
+struct WatchdogPipeReader {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    abandoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WatchdogPipeReader {
+    fn spawn<R: Read + Send + 'static>(pipe: Option<R>) -> Self {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = pipe.map(|mut pipe| {
+            let sink = std::sync::Arc::clone(&buf);
+            let stop = std::sync::Arc::clone(&abandoned);
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+                            if guard.len() < MAX_WATCHDOG_PIPE_CAPTURE_BYTES {
+                                let take = (MAX_WATCHDOG_PIPE_CAPTURE_BYTES - guard.len()).min(n);
+                                guard.extend_from_slice(&chunk[..take]);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+        });
+        Self {
+            buf,
+            abandoned,
+            handle,
+        }
+    }
+
+    /// Waits until `deadline` for EOF and returns the bytes read so far plus
+    /// whether EOF was reached (an unfinished reader is signaled to stop and
+    /// detached).
+    fn finish(self, deadline: Instant) -> (Vec<u8>, bool) {
+        let drained = match self.handle {
+            None => true,
+            Some(handle) => {
+                while !handle.is_finished() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let finished = handle.is_finished();
+                if finished {
+                    let _ = handle.join();
+                } else {
+                    self.abandoned
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                finished
+            }
+        };
+        let bytes = self.buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (bytes, drained)
+    }
+}
+
+/// Spawns `cmd` in its own Unix process group (`.process_group(0)`, so the whole
+/// `lake` -> `lean` tree is signaled atomically via `kill(-pgid)`), drains
+/// stdout / stderr concurrently on background threads so a child filling a
+/// 64 KiB pipe buffer never deadlocks against the polling loop, and polls the
+/// tree's `(pid, starttime)`-verified `/proc` RSS and the wall-clock elapsed time.
+///
+/// Before killing for RSS or timeout, the root is re-polled so a process that
+/// exited while `/proc` was being scanned keeps its genuine exit status (like
+/// `miri_eval::run_lean_with_rss_budget`). A root that exits on its own is
+/// observed as a zombie and its whole group is killed before it is reaped
+/// ([`reap_exited_root`]), so no stray group member outlives the run. The call
+/// returns within roughly
+/// `timeout + ITREE_WATCHDOG_KILL_GRACE + ITREE_WATCHDOG_PIPE_DRAIN_GRACE` even if
+/// an escaped descendant keeps an output pipe open (`pipes_drained == false`).
+///
+/// Process-group trade-off: unlike `miri_eval` (which keeps `lake env lean` in
+/// the harness's group so terminal `Ctrl-C` reaches it), the tree lives in its
+/// own group, so a harness that dies without running this function's cleanup
+/// (e.g. `SIGKILL`) does not take the tree with it; `anneal-lean-run`'s
+/// cgroup-scoped `MemoryMax` still bounds such an orphan.
+pub fn run_command_with_watchdog(
+    mut cmd: Command,
+    rss_limit_kib: u64,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<WatchdogCommandOutput, String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn command: {e}"))?;
+    let root_pid = child.id();
+    let mut tree = TrackedProcessTree::new(root_pid);
+    let stdout_reader = WatchdogPipeReader::spawn(child.stdout.take());
+    let stderr_reader = WatchdogPipeReader::spawn(child.stderr.take());
+    let max_poll = poll_interval.max(ITREE_WATCHDOG_MIN_POLL_INTERVAL);
+    let mut poll = ITREE_WATCHDOG_MIN_POLL_INTERVAL.min(max_poll);
+
+    let start = Instant::now();
+    let mut peak_rss_kib = tree.sample_rss_kib();
+    let mut watchdog_killed: Option<ItreeLeanFailureKind> = None;
+    let (exit_success, signal_terminated) = loop {
+        match reap_exited_root(&mut child, &mut tree, &mut peak_rss_kib) {
+            Ok(Some(status)) => break (status.success(), status.code().is_none()),
+            Ok(None) => {}
+            Err(e) => {
+                terminate_process_tree(&mut child, &mut tree, ITREE_WATCHDOG_KILL_GRACE);
+                let deadline = Instant::now() + ITREE_WATCHDOG_PIPE_DRAIN_GRACE;
+                let _ = stdout_reader.finish(deadline);
+                let _ = stderr_reader.finish(deadline);
+                return Err(format!("failed polling child process {root_pid}: {e}"));
+            }
+        }
+
+        let rss_kib = tree.sample_rss_kib();
+        peak_rss_kib = peak_rss_kib.max(rss_kib);
+        let verdict = if rss_kib > rss_limit_kib {
+            Some(ItreeLeanFailureKind::RssWatchdogExceeded)
+        } else if start.elapsed() >= timeout {
+            Some(ItreeLeanFailureKind::WallClockTimeout)
+        } else {
+            None
+        };
+        if let Some(kind) = verdict {
+            // Re-check before killing: a root that exited while `/proc` was
+            // scanned keeps its genuine exit status instead of being
+            // misattributed to the watchdog.
+            if let Ok(Some(status)) = reap_exited_root(&mut child, &mut tree, &mut peak_rss_kib) {
+                break (status.success(), status.code().is_none());
+            }
+            watchdog_killed = Some(kind);
+            terminate_process_tree(&mut child, &mut tree, ITREE_WATCHDOG_KILL_GRACE);
+            break (false, false);
+        }
+        std::thread::sleep(poll);
+        poll = poll.saturating_mul(2).min(max_poll);
+    };
+
+    let deadline = Instant::now() + ITREE_WATCHDOG_PIPE_DRAIN_GRACE;
+    let (stdout, stdout_drained) = stdout_reader.finish(deadline);
+    let (mut stderr, stderr_drained) = stderr_reader.finish(deadline);
+    let pipes_drained = stdout_drained && stderr_drained;
+    if !pipes_drained {
+        stderr.extend_from_slice(
+            b"\n[WATCHDOG:PIPE_HELD] output pipe still held open by an untracked descendant; \
+              captured output may be incomplete\n",
+        );
+    }
+    Ok(WatchdogCommandOutput {
+        exit_success,
+        stdout,
+        stderr,
+        peak_rss_kib,
+        watchdog_killed,
+        signal_terminated,
+        pipes_drained,
+    })
 }
 
 fn fnv1a_64_update(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -374,25 +1488,132 @@ fn truncate_lean_diag(msg: &str) -> String {
 /// Outcome of [`run_isolated_lean_stage`].
 #[derive(Debug)]
 struct IsolatedLeanStage<X> {
-    /// Per-case results for every case whose chunk or per-candidate fallback
-    /// module succeeded.
+    /// Per-case results for every case whose chunk, per-candidate fallback, or
+    /// bisected sub-chunk succeeded.
     results: BTreeMap<String, X>,
     /// Candidates (root fn names) owning at least one case without a result.
     failed_fns: BTreeSet<String>,
-    /// Truncated diagnostics for each failed chunk or fallback run.
+    /// Cases without a result whose most specific failing run (the smallest
+    /// chunk, per-candidate fallback, or bisection slice containing them that
+    /// was actually run) failed inconclusively per
+    /// [`itree_lean_failure_is_inconclusive`] (watchdog kill, Lean resource
+    /// limit, signal, missing toolchain) rather than with a Lean rejection, so
+    /// the case is unchecked rather than refuted.
+    inconclusive_cases: BTreeSet<String>,
+    /// Truncated diagnostics for each failed chunk, fallback, or irreducible
+    /// single-case bisection run.
     errors: Vec<String>,
 }
 
-/// Runs one chunked Lean stage with failure isolation.
+thread_local! {
+    /// Number of `lake env lean` workers that [`run_isolated_lean_stage`] runs
+    /// concurrently with the current thread (`0` outside a stage).
+    static ITREE_LEAN_STAGE_CONCURRENCY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Sets [`ITREE_LEAN_STAGE_CONCURRENCY`] for the current thread and restores the
+/// previous value on drop (including when a chunk runner panics).
+struct ItreeLeanConcurrencyGuard(usize);
+
+impl ItreeLeanConcurrencyGuard {
+    fn enter(concurrency: usize) -> Self {
+        Self(ITREE_LEAN_STAGE_CONCURRENCY.with(|c| c.replace(concurrency.max(1))))
+    }
+}
+
+impl Drop for ItreeLeanConcurrencyGuard {
+    fn drop(&mut self) {
+        ITREE_LEAN_STAGE_CONCURRENCY.with(|c| c.set(self.0));
+    }
+}
+
+/// Number of `lake env lean` workers running concurrently with the calling
+/// thread inside [`run_isolated_lean_stage`]: the current wave's width for
+/// chunk workers and `1` for the sequential per-candidate fallback and
+/// bisection runs (so those get the whole memory / thread budget instead of a
+/// `jobs`-way share), or `default` outside a stage.
+fn itree_lean_stage_concurrency(default: usize) -> usize {
+    match ITREE_LEAN_STAGE_CONCURRENCY.with(std::cell::Cell::get) {
+        0 => default.max(1),
+        n => n,
+    }
+}
+
+/// Maximum number of *failing* bisection runs spent on one candidate with `n`
+/// cases: `2 * ceil(log2 n)` isolates one irreducible case (one failing half per
+/// level, plus its failing sibling at the bottom) and `+ 2` leaves room for a
+/// second offender, so a candidate whose every sub-slice fails (e.g. every
+/// case times out) costs `O(log n)` Lean runs instead of `2n - 2`.
+fn itree_bisect_failure_budget(n: usize) -> usize {
+    let ceil_log2 = (usize::BITS - n.max(1).saturating_sub(1).leading_zeros()) as usize;
+    2 * ceil_log2 + 2
+}
+
+/// Normalized, sorted, deduplicated Lean `error:` blocks of a failed run: the
+/// text after each `error:` marker together with any immediately following
+/// indented continuation lines, so the `<file>:<line>:<col>:` location (which
+/// names the per-slice module), the harness header (peak RSS, `-M`, thread
+/// count), and non-error output are dropped while multi-line tactic / type-mismatch
+/// payloads stay intact.
+fn lean_error_signature(err: &str) -> Vec<String> {
+    let mut messages: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in err.lines() {
+        if let Some(idx) = line.find("error:") {
+            if let Some(prev) = current.take() {
+                messages.push(prev);
+            }
+            let msg = line[idx + "error:".len()..].trim();
+            if !msg.is_empty() {
+                current = Some(msg.to_string());
+            }
+        } else if (line.starts_with(' ') || line.starts_with('\t'))
+            && !line.trim().is_empty()
+            && let Some(cur) = current.as_mut()
+        {
+            cur.push('\n');
+            cur.push_str(line.trim());
+        } else if let Some(prev) = current.take() {
+            messages.push(prev);
+        }
+    }
+    if let Some(prev) = current.take() {
+        messages.push(prev);
+    }
+    messages.sort();
+    messages.dedup();
+    messages
+}
+
+/// Runs one chunked Lean stage with failure isolation and multi-case bisection.
 ///
 /// `cases` are split into chunks of at most `chunk_size`, evaluated by
 /// `run_chunk(label, chunk)` in waves of at most `jobs` concurrent workers.
 /// A chunk only counts as successful if `run_chunk` returns a result for every
 /// case in it; a failed, incomplete, or panicking chunk is re-run one candidate
-/// at a time (`{stage_label}Fallback_<fn>`), so only the offending candidate(s)
-/// end up in `failed_fns`. After [`ITREE_FALLBACK_CIRCUIT_BREAKER`] consecutive
-/// fallback failures without any fallback success, remaining fallbacks are
-/// skipped (their candidates fail) to bound the cost of systematic failures.
+/// at a time (`{stage_label}Fallback_<fn>`). Inside `run_chunk`,
+/// [`itree_lean_stage_concurrency`] reports how many Lean workers run alongside
+/// (the wave width, or `1` for fallback and bisection runs).
+///
+/// When a multi-case candidate fallback (`fn_cases.len() > 1`) fails for any
+/// reason other than a missing toolchain, `fn_cases` is bisected
+/// (`{stage_label}Bisect_<fn>_...`) so that:
+/// 1. candidates whose combined trace module exceeded an RSS / timeout / Lean
+///    memory limit recover completely when smaller sub-slices succeed;
+/// 2. an irreducible single case (`slice.len() == 1`) that exceeds limits or
+///    fails elaboration still lets its healthy siblings into `results`, and
+///    `errors` records an explicit single-case diagnostic (a case that only
+///    exceeded resource limits also lands in `inconclusive_cases`, so
+///    [`itree_partially_comparable_fns`] keeps comparing its candidate on the
+///    healthy siblings);
+/// 3. a failure that both halves of a slice reproduce as an elaboration error is
+///    treated as candidate-wide (shared definitions, not one case) and stops
+///    bisection there, and at most [`itree_bisect_failure_budget`] failing runs
+///    are spent per candidate, bounding the cost of systematic failures.
+///
+/// After [`ITREE_FALLBACK_CIRCUIT_BREAKER`] consecutive candidate fallback
+/// failures without any recovery, remaining fallbacks are skipped to bound the
+/// cost of systematic failures.
 fn run_isolated_lean_stage<C, X, K, F>(
     stage_label: &str,
     cases: &[C],
@@ -433,9 +1654,26 @@ where
         }
         Ok(())
     };
+    // Sequential (fallback / bisection) runs own the whole Lean budget.
+    let run_sequential = |label: &str, slice: &[C], what: &str| {
+        let _concurrency = ItreeLeanConcurrencyGuard::enter(1);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_chunk(label, slice)))
+            .unwrap_or_else(|_| Err(format!("Lean {what} worker panicked")))
+    };
+    // Whether the most recent (hence most specific: chunk, then fallback, then
+    // ever smaller bisection slices) failing run containing each case failed
+    // inconclusively.
+    let mut last_failure_inconclusive: BTreeMap<String, bool> = BTreeMap::new();
+    let mut note_failure = |slice: &[C], err: &str| {
+        let inconclusive = itree_lean_failure_is_inconclusive(err);
+        for c in slice {
+            last_failure_inconclusive.insert(case_key(c).to_string(), inconclusive);
+        }
+    };
 
     let chunks: Vec<&[C]> = cases.chunks(chunk_size).collect();
     for (wave_idx, wave) in chunks.chunks(jobs).enumerate() {
+        let wave_width = wave.len();
         let wave_res: Vec<(String, Result<BTreeMap<String, X>, String>)> =
             std::thread::scope(|s| {
                 let handles: Vec<_> = wave
@@ -445,7 +1683,10 @@ where
                         let label = format!("{stage_label}Chunk{}", wave_idx * jobs + i);
                         let run_chunk = &run_chunk;
                         let worker_label = label.clone();
-                        let handle = s.spawn(move || run_chunk(&worker_label, chunk));
+                        let handle = s.spawn(move || {
+                            let _concurrency = ItreeLeanConcurrencyGuard::enter(wave_width);
+                            run_chunk(&worker_label, chunk)
+                        });
                         (label, handle)
                     })
                     .collect();
@@ -480,19 +1721,131 @@ where
         for (fn_name, fn_cases) in by_fn {
             if fallback_successes == 0 && fallback_failures >= ITREE_FALLBACK_CIRCUIT_BREAKER {
                 skipped_fallbacks += 1;
+                note_failure(&fn_cases, "");
                 continue;
             }
             let label = format!("{stage_label}Fallback_{fn_name}");
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_chunk(&label, &fn_cases)
-            }))
-            .unwrap_or_else(|_| Err("Lean fallback worker panicked".to_string()));
-            match accept(&mut results, &fn_cases, res, &label) {
-                Ok(()) => fallback_successes += 1,
-                Err(e) => {
-                    fallback_failures += 1;
-                    errors.push(e);
+            let res = run_sequential(&label, &fn_cases, "fallback");
+            let e = match accept(&mut results, &fn_cases, res, &label) {
+                Ok(()) => {
+                    fallback_successes += 1;
+                    continue;
                 }
+                Err(e) => e,
+            };
+            note_failure(&fn_cases, &e);
+            let failure_kind = classify_itree_lean_failure(&e);
+            errors.push(e);
+            if fn_cases.len() <= 1 || failure_kind == ItreeLeanFailureKind::MissingToolchain {
+                fallback_failures += 1;
+                continue;
+            }
+
+            let recovered_before = results.len();
+            let budget = itree_bisect_failure_budget(fn_cases.len());
+            let mut failing_runs = 0usize;
+            let mut unresolved_by_budget = 0usize;
+            // Every stack entry is a slice of `fn_cases` already known to fail.
+            let mut stack: Vec<(usize, usize)> = vec![(0, fn_cases.len())];
+            while let Some((lo, hi)) = stack.pop() {
+                let mid = lo + (hi - lo) / 2;
+                let mut halves: Vec<(
+                    usize,
+                    usize,
+                    Option<(ItreeLeanFailureKind, String, bool)>,
+                )> = Vec::new();
+                for (a, b) in [(lo, mid), (mid, hi)] {
+                    if failing_runs >= budget {
+                        unresolved_by_budget += b - a;
+                        note_failure(&fn_cases[a..b], "");
+                        continue;
+                    }
+                    let slice = &fn_cases[a..b];
+                    let sub_label = if slice.len() == 1 {
+                        format!("{stage_label}Bisect_{fn_name}_{}", case_key(&slice[0]))
+                    } else {
+                        format!("{stage_label}Bisect_{fn_name}_{a}_{b}")
+                    };
+                    let sub_res = run_sequential(&sub_label, slice, "bisect");
+                    match accept(&mut results, slice, sub_res, &sub_label) {
+                        Ok(()) => halves.push((a, b, None)),
+                        Err(sub_err) => {
+                            failing_runs += 1;
+                            note_failure(slice, &sub_err);
+                            let kind = classify_itree_lean_failure(&sub_err);
+                            let raw_body = sub_err
+                                .strip_prefix(&format!("{sub_label}: "))
+                                .unwrap_or(&sub_err)
+                                .to_string();
+                            let error_line_count =
+                                raw_body.lines().filter(|l| l.contains("error:")).count();
+                            let lower_body = raw_body.to_ascii_lowercase();
+                            let is_partial_tactic_or_type_err = error_line_count > 0
+                                && error_line_count < slice.len()
+                                && (lower_body.contains("tactic '")
+                                    || lower_body.contains("tactic `")
+                                    || lower_body.contains("type mismatch"));
+                            let case_or_limit_specific = slice
+                                .iter()
+                                .any(|c| raw_body.contains(case_key(c)))
+                                || itree_lean_failure_is_inconclusive(&raw_body)
+                                || is_partial_tactic_or_type_err;
+                            // Compare halves by their normalized Lean `error:` messages:
+                            // the raw bodies embed the per-slice module path / label and
+                            // peak-RSS figures, so they never compare equal verbatim.
+                            let raw_body = lean_error_signature(&raw_body).join("\n");
+                            if slice.len() == 1 {
+                                errors.push(format!(
+                                    "{sub_label} (irreducible single case `{}` of `{fn_name}`): {}",
+                                    case_key(&slice[0]),
+                                    truncate_lean_diag(&sub_err)
+                                ));
+                            } else {
+                                errors.push(sub_err);
+                            }
+                            halves.push((a, b, Some((kind, raw_body, case_or_limit_specific))));
+                        }
+                    }
+                }
+                let candidate_wide_elaboration = match halves.as_slice() {
+                    [
+                        (_, _, Some((ItreeLeanFailureKind::ElaborationOrOutputFailure, b0, false))),
+                        (_, _, Some((ItreeLeanFailureKind::ElaborationOrOutputFailure, b1, false))),
+                    ] => !b0.is_empty() && b0 == b1,
+                    _ => false,
+                };
+                if candidate_wide_elaboration {
+                    errors.push(format!(
+                        "{stage_label}Bisect_{fn_name}: both halves of cases {lo}..{hi} fail \
+                         elaboration; treating the failure as candidate-wide and stopping bisection"
+                    ));
+                    continue;
+                }
+                for (a, b, failure) in halves.iter().rev() {
+                    if let Some((kind, _, _)) = failure
+                        && b - a > 1
+                        && *kind != ItreeLeanFailureKind::MissingToolchain
+                    {
+                        stack.push((*a, *b));
+                    }
+                }
+            }
+            if unresolved_by_budget > 0 {
+                errors.push(format!(
+                    "{stage_label}Bisect_{fn_name}: bisection failure budget ({budget} failing \
+                     run(s)) exhausted with {unresolved_by_budget} case(s) unresolved"
+                ));
+            }
+            let recovered = results.len() - recovered_before;
+            if recovered == fn_cases.len() {
+                // All cases of `fn_name` succeeded once split into smaller
+                // modules (e.g. the combined module exceeded RSS / timeout).
+                fallback_successes += 1;
+            } else {
+                if recovered > 0 {
+                    fallback_successes += 1;
+                }
+                fallback_failures += 1;
             }
         }
     }
@@ -508,39 +1861,299 @@ where
         .filter(|&c| !results.contains_key(case_key(c)))
         .filter_map(|c| case_to_fn.get(case_key(c)).cloned())
         .collect();
+    let inconclusive_cases: BTreeSet<String> = cases
+        .iter()
+        .map(&case_key)
+        .filter(|&k| {
+            !results.contains_key(k) && last_failure_inconclusive.get(k).copied().unwrap_or(false)
+        })
+        .map(str::to_string)
+        .collect();
     IsolatedLeanStage {
         results,
         failed_fns,
+        inconclusive_cases,
         errors,
     }
 }
 
-/// Writes `src` to `verify_dir/<label>.lean` and runs `lake env lean -M 8192`
-/// on it from `anneal_dir`, returning stdout on success.
+/// Candidates of `stage.failed_fns` that stay comparable on their completed
+/// cases, mapped to how many of their cases are dropped: every case of the
+/// candidate without a result is in [`IsolatedLeanStage::inconclusive_cases`]
+/// (unchecked because of a resource limit / watchdog kill, never refuted by
+/// Lean) and `may_drop` allows dropping it, and at least one case completed.
+/// Every other failed candidate must be dropped whole (a Lean rejection, or no
+/// completed case to compare).
+fn itree_partially_comparable_fns<C, X>(
+    stage: &IsolatedLeanStage<X>,
+    cases: &[C],
+    case_key: impl Fn(&C) -> &str,
+    case_to_fn: &BTreeMap<String, String>,
+    may_drop: impl Fn(&C) -> bool,
+) -> BTreeMap<String, usize> {
+    let mut completed: BTreeSet<&str> = BTreeSet::new();
+    let mut blocked: BTreeSet<&str> = BTreeSet::new();
+    let mut dropped: BTreeMap<&str, usize> = BTreeMap::new();
+    for c in cases {
+        let key = case_key(c);
+        let Some(fn_name) = case_to_fn.get(key) else {
+            continue;
+        };
+        if !stage.failed_fns.contains(fn_name) {
+            continue;
+        }
+        if stage.results.contains_key(key) {
+            completed.insert(fn_name);
+        } else if stage.inconclusive_cases.contains(key) && may_drop(c) {
+            *dropped.entry(fn_name).or_insert(0) += 1;
+        } else {
+            blocked.insert(fn_name);
+        }
+    }
+    dropped
+        .into_iter()
+        .filter(|(f, _)| completed.contains(f) && !blocked.contains(f))
+        .map(|(f, n)| (f.to_string(), n))
+        .collect()
+}
+
+/// Stage 2 replacement confirmations for a partial `selected` subset of `pool`:
+/// for every candidate of `stage.failed_fns` none of whose selected cases was
+/// confirmed and all of whose selected cases are Stage 1 `ok` traces (`is_ok`)
+/// that failed inconclusively, the first case of `pool` (in order) owned by
+/// that candidate that was not selected and is a Stage 1 `ok` trace, so a
+/// confirmation that merely hit a resource limit does not cost the candidate
+/// its required kernel-confirmed trace. A candidate with a refuted or divergent
+/// selected case gets no replacement (it is dropped whole).
+fn itree_confirm_replacements<'p, C, X>(
+    stage: &IsolatedLeanStage<X>,
+    selected: &[C],
+    pool: &'p [C],
+    case_key: impl Fn(&C) -> &str,
+    case_to_fn: &BTreeMap<String, String>,
+    is_ok: impl Fn(&C) -> bool,
+) -> Vec<&'p C> {
+    let selected_keys: BTreeSet<&str> = selected.iter().map(&case_key).collect();
+    let mut out = Vec::new();
+    for fn_name in &stage.failed_fns {
+        let owned_by_fn = |c: &&C| case_to_fn.get(case_key(c)) == Some(fn_name);
+        let mut fn_selected = selected.iter().filter(owned_by_fn).peekable();
+        if fn_selected.peek().is_none() {
+            continue;
+        }
+        let needs_replacement = fn_selected.all(|c| {
+            !stage.results.contains_key(case_key(c))
+                && stage.inconclusive_cases.contains(case_key(c))
+                && is_ok(c)
+        });
+        if !needs_replacement {
+            continue;
+        }
+        if let Some(backup) = pool
+            .iter()
+            .filter(owned_by_fn)
+            .find(|c| !selected_keys.contains(case_key(c)) && is_ok(c))
+        {
+            out.push(backup);
+        }
+    }
+    out
+}
+
+fn resolve_itree_lake_bin() -> PathBuf {
+    if let Ok(lake_env) = env::var("LAKE")
+        && !lake_env.trim().is_empty()
+    {
+        return PathBuf::from(lake_env);
+    }
+    if let Some(toolchain_root) = cargo_anneal::setup::resolve_installed_toolchain() {
+        let bundled = toolchain_root.join("lean/bin/lake");
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        let pinned = PathBuf::from(home)
+            .join(".elan/toolchains/leanprover--lean4---v4.34.1/bin/lake");
+        if pinned.is_file() {
+            return pinned;
+        }
+    }
+    PathBuf::from("lake")
+}
+
+/// Runs `lake build <targets...>` in `dot_anneal_dir` under
+/// [`run_command_with_watchdog`], preserving `LAKE_CACHE_ENV_DEFAULTS` while
+/// bounding `LEAN_NUM_THREADS`, the process tree's physical RSS, and wall-clock
+/// runtime.
+fn run_itree_lake_build_targets(dot_anneal_dir: &Path, targets: &[String]) -> Result<(), String> {
+    let lake_bin = resolve_itree_lake_bin();
+    let mut cmd = build_lake_build_command(&lake_bin, dot_anneal_dir);
+    let (_lean_max_mb, rss_limit_kib) = resolve_itree_lean_rss_budget_kib(1);
+    let lean_threads = resolve_itree_lean_threads(1);
+    let has_explicit_lake_jobs = env::var("CARGO_ANNEAL_LAKE_JOBS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .is_some_and(|n| n >= 1);
+    if !has_explicit_lake_jobs {
+        cmd.env("LEAN_NUM_THREADS", lean_threads.to_string());
+    }
+    for target in targets {
+        cmd.arg(target);
+    }
+    let timeout = resolve_itree_lean_timeout_for_cases(targets.len().max(1));
+    let out = run_command_with_watchdog(
+        cmd,
+        rss_limit_kib,
+        timeout,
+        ITREE_WATCHDOG_POLL_INTERVAL,
+    )
+    .map_err(|e| {
+        format!(
+            "failed to execute '{}' in {}: {}",
+            lake_bin.display(),
+            dot_anneal_dir.display(),
+            e
+        )
+    })?;
+
+    match out.watchdog_killed {
+        Some(ItreeLeanFailureKind::RssWatchdogExceeded) => {
+            return Err(format!(
+                "[WATCHDOG:RSS_EXCEEDED] `lake build` in {} exceeded RSS limit ({} KiB > {} KiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+                dot_anneal_dir.display(),
+                out.peak_rss_kib,
+                rss_limit_kib,
+                lean_threads,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Some(ItreeLeanFailureKind::WallClockTimeout) => {
+            return Err(format!(
+                "[WATCHDOG:TIMEOUT] `lake build` in {} exceeded wall-clock timeout ({:?} for {} target(s), peak RSS {} KiB / {} KiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+                dot_anneal_dir.display(),
+                timeout,
+                targets.len(),
+                out.peak_rss_kib,
+                rss_limit_kib,
+                lean_threads,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        _ => {}
+    }
+
+    if !out.exit_success {
+        let signal_note = if out.signal_terminated {
+            "[LEAN:RESOURCE_EXHAUSTED] terminated by a signal (e.g. the cgroup OOM killer) "
+        } else {
+            ""
+        };
+        return Err(format!(
+            "{signal_note}lake build failed in {} (peak RSS {} KiB / {} KiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+            dot_anneal_dir.display(),
+            out.peak_rss_kib,
+            rss_limit_kib,
+            lean_threads,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Writes `src` to `verify_dir/<label>.lean` and runs `lake env lean -M <mb>`
+/// on it from `anneal_dir` under [`run_command_with_watchdog`], bounding
+/// `LEAN_NUM_THREADS`, Lean's internal allocator (`-M`), the process tree's
+/// physical RSS, and wall-clock runtime for one of `active_workers` concurrent
+/// workers evaluating a module of `cases` trace cases.
+fn run_itree_lean_module_with_workers(
+    verify_dir: &Path,
+    anneal_dir: &Path,
+    label: &str,
+    src: &str,
+    active_workers: usize,
+    cases: usize,
+) -> Result<String, String> {
+    let file = verify_dir.join(format!("{label}.lean"));
+    fs::write(&file, src).map_err(|e| format!("failed to write {}: {e}", file.display()))?;
+    let (lean_max_mb, rss_limit_kib) = resolve_itree_lean_rss_budget_kib(active_workers);
+    let lean_threads = resolve_itree_lean_threads(active_workers);
+    let timeout = resolve_itree_lean_timeout_for_cases(cases);
+
+    let mut cmd = Command::new(resolve_itree_lake_bin());
+    cmd.args(["env", "lean", "-M", &lean_max_mb.to_string()])
+        .arg(&file)
+        .current_dir(anneal_dir)
+        .env("LEAN_NUM_THREADS", lean_threads.to_string());
+
+    let out = run_command_with_watchdog(
+        cmd,
+        rss_limit_kib,
+        timeout,
+        ITREE_WATCHDOG_POLL_INTERVAL,
+    )
+    .map_err(|e| format!("failed to run `lake env lean` on {}: {e}", file.display()))?;
+
+    match out.watchdog_killed {
+        Some(ItreeLeanFailureKind::RssWatchdogExceeded) => {
+            return Err(format!(
+                "[WATCHDOG:RSS_EXCEEDED] `{}` exceeded RSS limit ({} KiB > {} KiB, -M {} MiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+                file.display(),
+                out.peak_rss_kib,
+                rss_limit_kib,
+                lean_max_mb,
+                lean_threads,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Some(ItreeLeanFailureKind::WallClockTimeout) => {
+            return Err(format!(
+                "[WATCHDOG:TIMEOUT] `{}` exceeded wall-clock timeout ({:?} for {cases} case(s), peak RSS {} KiB / {} KiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+                file.display(),
+                timeout,
+                out.peak_rss_kib,
+                rss_limit_kib,
+                lean_threads,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        _ => {}
+    }
+
+    if !out.exit_success {
+        let signal_note = if out.signal_terminated {
+            "[LEAN:RESOURCE_EXHAUSTED] terminated by a signal (e.g. the cgroup OOM killer) "
+        } else {
+            ""
+        };
+        return Err(format!(
+            "{signal_note}`{}` failed (peak RSS {} KiB / {} KiB, -M {} MiB, LEAN_NUM_THREADS={}):\nstdout:\n{}\nstderr:\n{}",
+            file.display(),
+            out.peak_rss_kib,
+            rss_limit_kib,
+            lean_max_mb,
+            lean_threads,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Writes `src` to `verify_dir/<label>.lean` and runs a single-case `lake env
+/// lean` module under the RSS + wall-clock watchdog with concurrency `1`.
 fn run_itree_lean_module(
     verify_dir: &Path,
     anneal_dir: &Path,
     label: &str,
     src: &str,
 ) -> Result<String, String> {
-    let file = verify_dir.join(format!("{label}.lean"));
-    fs::write(&file, src).map_err(|e| format!("failed to write {}: {e}", file.display()))?;
-    let out = Command::new("lake")
-        .args(["env", "lean", "-M", "8192"])
-        .arg(&file)
-        .current_dir(anneal_dir)
-        .output()
-        .map_err(|e| format!("failed to run `lake env lean` on {}: {e}", file.display()))?;
-    if !out.status.success() {
-        return Err(format!(
-            "`{}` failed ({}):\nstdout:\n{}\nstderr:\n{}",
-            file.display(),
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    run_itree_lean_module_with_workers(verify_dir, anneal_dir, label, src, 1, 1)
 }
 
 fn batch_case_ident(case: &BatchTraceEvalCase) -> &str {
@@ -703,14 +2316,18 @@ pub struct ItreeCampaignEvalReport {
     /// `ItreeDiffBatchConfirmChunk*` modules: every trace in identity mode or
     /// when at most [`ITREE_FULL_CONFIRM_MAX_TRACES`] distinct traces were
     /// probed, otherwise every divergence plus the first non-diverging trace of
-    /// each compared candidate (so `agree_candidates + diverge_traces <=
-    /// kernel_confirmed_traces <= distinct_traces_checked`).
+    /// each compared candidate (or, when that trace's confirmation was
+    /// inconclusive, its next non-diverging trace) (so `agree_candidates +
+    /// diverge_traces <= kernel_confirmed_traces <= distinct_traces_checked`).
     pub kernel_confirmed_traces: usize,
     /// Count of diverging traces kernel-confirmed via `by rfl`.
     pub kernel_confirmed_divergences: usize,
     /// Total distinct external-call observation path shapes (`MirObsPathKey`) observed.
     pub distinct_obs_paths: usize,
-    /// Per-candidate distinct trace counts (`b{b_idx}_c{c_idx}__kernel_step -> count`).
+    /// Per-candidate counts of the distinct traces checked in Lean
+    /// (`b{b_idx}_c{c_idx}__kernel_step -> count`), summing to
+    /// `distinct_traces_checked`; traces left unchecked by resource limits are
+    /// counted in `inconclusive_traces_by_candidate` instead.
     pub per_candidate_distinct_traces: BTreeMap<String, usize>,
     /// Trace counts by `TraceReplayDiag.tagName`.
     pub diag_tag_counts: BTreeMap<String, usize>,
@@ -718,6 +2335,13 @@ pub struct ItreeCampaignEvalReport {
     /// `staging_failed`, `empty_trace`, `lean_probe_failed`,
     /// `lean_confirm_failed`).
     pub not_compared_reasons: BTreeMap<String, usize>,
+    /// Compared candidates whose Stage 1 probe or Stage 2 confirmation left
+    /// some distinct traces unchecked because a watchdog / Lean resource limit
+    /// hit the smallest Lean module containing them that was run (never a Lean
+    /// rejection, and never an unconfirmed divergence): candidate -> number of
+    /// such traces, which are excluded from `distinct_traces_checked` while the
+    /// candidate is compared on its remaining traces.
+    pub inconclusive_traces_by_candidate: BTreeMap<String, usize>,
     /// Per-mutator application counts across all generated candidates.
     pub mutator_applications: BTreeMap<String, usize>,
     /// Deterministic, sorted observation-path signatures observed during live
@@ -1236,11 +2860,25 @@ struct CandidateTrialInput {
 
 /// Generate `trials` deterministic `(magic, payload_len, EnvSchedule)` trials
 /// for `cand`, combining `MirInputDictionary::from_rust_source(&cand.source)`
-/// and `MirInputDictionary::from_lean_mir(lean_mir_source)` with
-/// `LayoutAwareByteBuilder` (using a named `LayoutSpec::Struct` so `"magic"`
-/// and `"payload_len"` field hints are consulted), `EnvScheduleGenerator`, and
-/// boundary probes that exercise all `magic & 3`, `payload_len & 3`, and
-/// threshold branches.
+/// and `MirInputDictionary::from_lean_mir(lean_mir_source)` with fixed boundary
+/// probes that exercise all `magic & 3`, `payload_len & 3`, threshold, and
+/// `PanicOnCall(0)` branches, evaluator-verified concolic trials
+/// ([`explore_itree_concolic_trials`]), and `LayoutAwareByteBuilder` (using a
+/// named `LayoutSpec::Struct` so `"magic"` and `"payload_len"` field hints are
+/// consulted) + `EnvScheduleGenerator` fill.
+///
+/// Slot order:
+/// 1. the fixed probes (each slot `idx` with `idx + 2 <= trials`); identity
+///    candidates keep every probe verbatim (the calibration baseline whose
+///    per-seed distinct-trace counts reflect seed structure), while mutated
+///    candidates drop a probe whose predicted `(events, outcome)` duplicates an
+///    earlier trial's (the harness would deduplicate its trace anyway);
+/// 2. concolic trials relaxing the probes' boundary-call pins: `argPinTerm`
+///    negations (`arg != prev_arg` under identical prefix branch decisions and
+///    earlier calls) before oracle return perturbations (prefix-return pins plus
+///    one perturbed return), then branch flips;
+/// 3. byte-builder trials (odd ones with a reactive `EnvScheduleGenerator`
+///    schedule), skipping predicted duplicates for a bounded number of draws.
 fn build_candidate_trial_inputs(
     cand: &GeneratedItreeCandidate,
     staged: &StagedItreeCandidate,
@@ -1292,24 +2930,76 @@ fn build_candidate_trial_inputs(
         (0x414E_4E4C, 2048, true),
     ];
 
-    let mut out = Vec::with_capacity(count);
-    let mut rng = DetRng::new(cand.seed_u64 ^ batch_seed);
-    let mut dynamic_idx = 0usize;
-    for idx in 0..count {
-        if idx < fixed_probes.len() && idx + 2 <= count {
-            let (magic, payload_len, inject_panic) = fixed_probes[idx];
-            let schedule = if inject_panic {
-                EnvSchedule::new().with_panic_on_call(0)
-            } else {
-                EnvSchedule::new()
-            };
-            out.push(CandidateTrialInput {
-                magic,
-                payload_len,
-                schedule,
-            });
+    let evaluator = ItreeConcreteEvaluator::new(&cand.source, "kernel_step").ok();
+    let predict = |magic: u32, payload_len: u32, schedule: &EnvSchedule| {
+        evaluator.as_ref().and_then(|ev| {
+            ev.run_kernel_step(magic, payload_len, schedule, &staged.cand_prefix)
+                .ok()
+        })
+    };
+    let is_identity = cand.applied_mutators.is_empty();
+    let mut predicted_seen: BTreeSet<ItreeConcreteRun> = BTreeSet::new();
+    let mut out: Vec<CandidateTrialInput> = Vec::with_capacity(count);
+
+    // 1. Fixed boundary probes.
+    let probe_slots = fixed_probes.len().min(count.saturating_sub(1));
+    for &(magic, payload_len, inject_panic) in &fixed_probes[..probe_slots] {
+        let schedule = if inject_panic {
+            EnvSchedule::new().with_panic_on_call(0)
+        } else {
+            EnvSchedule::new()
+        };
+        if let Some(run) = predict(magic, payload_len, &schedule)
+            && !predicted_seen.insert(run)
+            && !is_identity
+        {
             continue;
         }
+        out.push(CandidateTrialInput {
+            magic,
+            payload_len,
+            schedule,
+        });
+    }
+
+    // 2. Evaluator-verified concolic trials relaxing the probes' call pins.
+    let mut bases: Vec<(u32, u32)> = Vec::new();
+    for &(magic, payload_len, inject_panic) in fixed_probes {
+        if !inject_panic && !bases.contains(&(magic, payload_len)) {
+            bases.push((magic, payload_len));
+        }
+    }
+    if out.len() < count {
+        // Concolic trials never reproduce a probe's predicted run (the explorer
+        // excludes every base run), so only the free slots need synthesizing.
+        for t in explore_itree_concolic_trials(
+            &cand.source,
+            "kernel_step",
+            &staged.cand_prefix,
+            &bases,
+            &dict,
+            count - out.len(),
+            cand.seed_u64 ^ batch_seed,
+        ) {
+            if out.len() >= count {
+                break;
+            }
+            if !predicted_seen.insert(t.predicted) {
+                continue;
+            }
+            out.push(CandidateTrialInput {
+                magic: t.magic,
+                payload_len: t.payload_len,
+                schedule: t.schedule,
+            });
+        }
+    }
+
+    // 3. Byte-builder + reactive oracle-schedule fill.
+    let mut rng = DetRng::new(cand.seed_u64 ^ batch_seed);
+    let mut dynamic_idx = 0usize;
+    let max_dedup_draws = count.saturating_mul(4);
+    while out.len() < count {
         let mut entropy = [0u8; 64];
         for chunk in entropy.chunks_exact_mut(8) {
             chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
@@ -1324,6 +3014,12 @@ fn build_candidate_trial_inputs(
             EnvSchedule::new()
         };
         dynamic_idx += 1;
+        if let Some(run) = predict(magic, payload_len, &schedule)
+            && !predicted_seen.insert(run)
+            && dynamic_idx <= max_dedup_draws
+        {
+            continue;
+        }
         out.push(CandidateTrialInput {
             magic,
             payload_len,
@@ -1902,6 +3598,7 @@ fn evaluate_itree_entries(
         .iter()
         .map(|k| (k.to_string(), 0))
         .collect();
+    let mut inconclusive_traces_by_candidate: BTreeMap<String, usize> = BTreeMap::new();
 
     if opt_level_0_and_2_compiled == 0 {
         return Err(format!(
@@ -2030,9 +3727,9 @@ fn evaluate_itree_entries(
         let mut raw_trace_count_by_fn: BTreeMap<String, usize> = BTreeMap::new();
         let mut obs_records_by_fn: BTreeMap<
             String,
-            Vec<(crate::input_gen::MirObsPathKey, Vec<u8>)>,
+            Vec<(String, crate::input_gen::MirObsPathKey, Vec<u8>)>,
         > = BTreeMap::new();
-        let mut obs_sigs_by_fn: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut obs_sigs_by_fn: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         let mut compared_fn_names: BTreeSet<String> = BTreeSet::new();
         let mut per_candidate_distinct_traces: BTreeMap<String, usize> = BTreeMap::new();
         let mut batch_cases: Vec<BatchTraceEvalCase> = Vec::new();
@@ -2069,9 +3766,15 @@ fn evaluate_itree_entries(
             };
 
             let mut fn_obs_records = Vec::with_capacity(raw_traces.len());
-            let mut fn_obs_sigs = BTreeSet::new();
+            let mut fn_obs_sigs = Vec::with_capacity(raw_traces.len());
+            let mut seen_keys: BTreeSet<String> = BTreeSet::new();
+            let mut distinct_for_cand: Vec<RecordedRawTrace> = Vec::new();
 
-            for tr in &raw_traces {
+            for tr in raw_traces {
+                let mut sig_trace = tr.clone();
+                sig_trace.raw_args.clear();
+                let dedup_key = encode_recorded_raw_trace_hex(&sig_trace);
+
                 let mut call_seq = Vec::new();
                 let mut branch_tags = Vec::new();
                 for (idx, ev) in tr.events.iter().enumerate() {
@@ -2094,10 +3797,12 @@ fn evaluate_itree_entries(
                 };
                 let shape_hash =
                     compute_itree_obs_shape_hash(prefix, &branch_tags, &call_seq);
-                fn_obs_sigs.insert(format!(
-                    "itree:{template_and_chain}:{shape_hash}:{outcome_kind}"
+                fn_obs_sigs.push((
+                    dedup_key.clone(),
+                    format!("itree:{template_and_chain}:{shape_hash}:{outcome_kind}"),
                 ));
                 fn_obs_records.push((
+                    dedup_key.clone(),
                     crate::input_gen::MirObsPathKey {
                         fn_name: fn_name.clone(),
                         branch_tags,
@@ -2106,21 +3811,14 @@ fn evaluate_itree_entries(
                     },
                     tr.raw_args.iter().flatten().copied().collect(),
                 ));
-            }
-            obs_records_by_fn.insert(fn_name.clone(), fn_obs_records);
-            obs_sigs_by_fn.insert(fn_name.clone(), fn_obs_sigs);
 
-            // Deduplicate distinct traces per candidate by observable (events, outcome).
-            let mut seen_keys: BTreeSet<String> = BTreeSet::new();
-            let mut distinct_for_cand: Vec<RecordedRawTrace> = Vec::new();
-            for tr in raw_traces {
-                let mut sig_trace = tr.clone();
-                sig_trace.raw_args.clear();
-                let key = encode_recorded_raw_trace_hex(&sig_trace);
-                if seen_keys.insert(key) {
+                // Deduplicate distinct traces per candidate by observable (events, outcome).
+                if seen_keys.insert(dedup_key) {
                     distinct_for_cand.push(tr);
                 }
             }
+            obs_records_by_fn.insert(fn_name.clone(), fn_obs_records);
+            obs_sigs_by_fn.insert(fn_name.clone(), fn_obs_sigs);
             per_candidate_distinct_traces.insert(fn_name.clone(), distinct_for_cand.len());
 
             let default_root_mir = format!("Mir.ItreeDiffStaged.{fn_name}");
@@ -2202,7 +3900,7 @@ fn evaluate_itree_entries(
                         }
                     }
                 }
-                run_lake_verify_targets(&anneal_dir, &targets)?;
+                run_itree_lake_build_targets(&anneal_dir, &targets)?;
                 Ok(chunk.iter().map(|(f, _)| (f.clone(), ())).collect())
             },
         );
@@ -2259,7 +3957,14 @@ fn evaluate_itree_entries(
             &case_to_fn,
             |label: &str, chunk: &[BatchTraceEvalCase]| {
                 let src = render_batch_trace_probe_lean_module(&format!("Proof.{label}"), chunk);
-                let stdout = run_itree_lean_module(&verify_dir, &anneal_dir, label, &src)?;
+                let stdout = run_itree_lean_module_with_workers(
+                    &verify_dir,
+                    &anneal_dir,
+                    label,
+                    &src,
+                    itree_lean_stage_concurrency(lean_jobs),
+                    chunk.len(),
+                )?;
                 let parsed = parse_batch_trace_probe_output(&stdout);
                 for c in chunk {
                     if !parsed.contains_key(&c.case_ident) {
@@ -2275,7 +3980,28 @@ fn evaluate_itree_entries(
         for err in &probe_stage.errors {
             eprintln!("itree-difftest: Stage 1 Lean probe failure: {err}");
         }
+        // A candidate whose only unprobed traces hit resource limits (in the
+        // smallest module containing them that was run) stays compared on its
+        // probed traces (the unprobed ones are unchecked, like trials never
+        // run); any other failure drops it whole.
+        let probe_partial = itree_partially_comparable_fns(
+            &probe_stage,
+            &batch_cases,
+            batch_case_ident,
+            &case_to_fn,
+            |_| true,
+        );
         for fn_name in &probe_stage.failed_fns {
+            if let Some(&dropped) = probe_partial.get(fn_name) {
+                eprintln!(
+                    "itree-difftest: `{fn_name}` partially compared: {dropped} trace(s) \
+                     inconclusive in Stage 1 Lean probe (watchdog / Lean resource limits)"
+                );
+                *inconclusive_traces_by_candidate
+                    .entry(fn_name.clone())
+                    .or_insert(0) += dropped;
+                continue;
+            }
             if compared_fn_names.remove(fn_name) {
                 eprintln!("itree-difftest: `{fn_name}` not compared: lean_probe_failed");
                 *not_compared_reasons
@@ -2285,9 +4011,10 @@ fn evaluate_itree_entries(
         }
         let probe_map = probe_stage.results;
         batch_cases.retain(|c| {
-            case_to_fn
-                .get(&c.case_ident)
-                .is_some_and(|f| compared_fn_names.contains(f))
+            probe_map.contains_key(&c.case_ident)
+                && case_to_fn
+                    .get(&c.case_ident)
+                    .is_some_and(|f| compared_fn_names.contains(f))
         });
         if batch_cases.is_empty() {
             return Err(format!(
@@ -2313,9 +4040,10 @@ fn evaluate_itree_entries(
         // its own `Mir.ItreeDiffStaged.*` modules. Identity-mode runs and batches of
         // `<= ITREE_FULL_CONFIRM_MAX_TRACES` distinct traces confirm every trace;
         // larger batches confirm every divergence plus the first trace of every
-        // candidate. `kernel_confirmed_traces` counts only traces whose theorems were
-        // actually checked by the Lean kernel.
-        let confirm_cases: Vec<BatchTraceEvalCase> =
+        // candidate (replaced by its next `ok` trace when that confirmation is
+        // inconclusive). `kernel_confirmed_traces` counts only traces whose
+        // theorems were actually checked by the Lean kernel.
+        let mut confirm_cases: Vec<BatchTraceEvalCase> =
             if mode == "identity" || batch_cases.len() <= ITREE_FULL_CONFIRM_MAX_TRACES {
                 batch_cases.clone()
             } else {
@@ -2337,32 +4065,112 @@ fn evaluate_itree_entries(
         let confirm_chunk_size = options
             .confirm_chunk_size
             .clamp(1, ITREE_MAX_CONFIRM_CHUNK_SIZE);
-        let confirm_stage = run_isolated_lean_stage(
+        let run_confirm_chunk = |label: &str, chunk: &[BatchTraceEvalCase]| {
+            let src = render_batch_trace_eval_lean_module(&format!("Proof.{label}"), chunk, false);
+            run_itree_lean_module_with_workers(
+                &verify_dir,
+                &anneal_dir,
+                label,
+                &src,
+                itree_lean_stage_concurrency(lean_jobs),
+                chunk.len(),
+            )?;
+            Ok(chunk
+                .iter()
+                .map(|c| {
+                    (
+                        c.case_ident.clone(),
+                        extract_itree_confirm_theorem(&src, &c.case_ident),
+                    )
+                })
+                .collect::<BTreeMap<String, String>>())
+        };
+        let mut confirm_stage = run_isolated_lean_stage(
             "ItreeDiffBatchConfirm",
             &confirm_cases,
             confirm_chunk_size,
             lean_jobs,
             batch_case_ident,
             &case_to_fn,
-            |label: &str, chunk: &[BatchTraceEvalCase]| {
-                let src =
-                    render_batch_trace_eval_lean_module(&format!("Proof.{label}"), chunk, false);
-                run_itree_lean_module(&verify_dir, &anneal_dir, label, &src)?;
-                Ok(chunk
-                    .iter()
-                    .map(|c| {
-                        (
-                            c.case_ident.clone(),
-                            extract_itree_confirm_theorem(&src, &c.case_ident),
-                        )
-                    })
-                    .collect::<BTreeMap<String, String>>())
-            },
+            run_confirm_chunk,
         );
+        // When `batch_cases.len() > ITREE_FULL_CONFIRM_MAX_TRACES`, each agreeing
+        // candidate had only its first `ok` trace selected into `confirm_cases`.
+        // While any candidate's selected `ok` trace(s) all hit a watchdog /
+        // resource limit (`inconclusive_cases`), confirm the candidate's next
+        // unselected Stage-1 `ok` trace so it can still obtain at least one
+        // kernel-confirmed trace even if multiple `ok` traces time out.
+        let mut rep_round = 0usize;
+        while confirm_cases.len() < batch_cases.len() && !confirm_stage.failed_fns.is_empty() {
+            let replacement_cases: Vec<BatchTraceEvalCase> = itree_confirm_replacements(
+                &confirm_stage,
+                &confirm_cases,
+                &batch_cases,
+                batch_case_ident,
+                &case_to_fn,
+                |c| c.expected_diag_tag.as_deref() == Some("ok"),
+            )
+            .into_iter()
+            .cloned()
+            .collect();
+            if replacement_cases.is_empty() {
+                break;
+            }
+            let stage_label = if rep_round == 0 {
+                "ItreeDiffBatchConfirmReplacement".to_string()
+            } else {
+                format!("ItreeDiffBatchConfirmReplacement{}", rep_round + 1)
+            };
+            rep_round += 1;
+            let rep_stage = run_isolated_lean_stage(
+                &stage_label,
+                &replacement_cases,
+                confirm_chunk_size,
+                lean_jobs,
+                batch_case_ident,
+                &case_to_fn,
+                run_confirm_chunk,
+            );
+            confirm_cases.extend(replacement_cases);
+            confirm_stage.results.extend(rep_stage.results);
+            confirm_stage
+                .inconclusive_cases
+                .extend(rep_stage.inconclusive_cases);
+            confirm_stage.errors.extend(rep_stage.errors);
+            confirm_stage.failed_fns = confirm_cases
+                .iter()
+                .filter(|c| !confirm_stage.results.contains_key(&c.case_ident))
+                .filter_map(|c| case_to_fn.get(&c.case_ident).cloned())
+                .collect();
+        }
         for err in &confirm_stage.errors {
             eprintln!("itree-difftest: Stage 2 Lean kernel confirmation failure: {err}");
         }
+        // A candidate keeps being compared without its unconfirmed traces only
+        // if each of them is a Stage 1 `ok` trace whose confirmation hit
+        // resource limits, and at least one of its traces was kernel-confirmed:
+        // an unconfirmed divergence must never be dropped (that would report
+        // the candidate as agreeing), so it drops the candidate whole, as does
+        // any kernel rejection.
+        let confirm_partial = itree_partially_comparable_fns(
+            &confirm_stage,
+            &confirm_cases,
+            batch_case_ident,
+            &case_to_fn,
+            |c| c.expected_diag_tag.as_deref() == Some("ok"),
+        );
         for fn_name in &confirm_stage.failed_fns {
+            if let Some(&dropped) = confirm_partial.get(fn_name) {
+                eprintln!(
+                    "itree-difftest: `{fn_name}` partially compared: {dropped} `ok` trace(s) \
+                     inconclusive in Stage 2 Lean kernel confirmation (watchdog / Lean \
+                     resource limits)"
+                );
+                *inconclusive_traces_by_candidate
+                    .entry(fn_name.clone())
+                    .or_insert(0) += dropped;
+                continue;
+            }
             if compared_fn_names.remove(fn_name) {
                 eprintln!("itree-difftest: `{fn_name}` not compared: lean_confirm_failed");
                 *not_compared_reasons
@@ -2371,10 +4179,16 @@ fn evaluate_itree_entries(
             }
         }
         let confirmed_theorems: BTreeMap<String, String> = confirm_stage.results;
+        let unconfirmed_selected: BTreeSet<&str> = confirm_cases
+            .iter()
+            .filter(|c| !confirmed_theorems.contains_key(&c.case_ident))
+            .map(|c| c.case_ident.as_str())
+            .collect();
         batch_cases.retain(|c| {
-            case_to_fn
-                .get(&c.case_ident)
-                .is_some_and(|f| compared_fn_names.contains(f))
+            !unconfirmed_selected.contains(c.case_ident.as_str())
+                && case_to_fn
+                    .get(&c.case_ident)
+                    .is_some_and(|f| compared_fn_names.contains(f))
         });
         if batch_cases.is_empty() {
             return Err(format!(
@@ -2392,18 +4206,43 @@ fn evaluate_itree_entries(
             .iter()
             .filter_map(|f| raw_trace_count_by_fn.get(f))
             .sum();
-        per_candidate_distinct_traces.retain(|f, _| compared_fn_names.contains(f));
+        per_candidate_distinct_traces.clear();
+        let mut checked_dedup_keys_by_fn: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for case in &batch_cases {
+            if let Some(fn_name) = case_to_fn.get(&case.case_ident)
+                && compared_fn_names.contains(fn_name)
+            {
+                *per_candidate_distinct_traces
+                    .entry(fn_name.clone())
+                    .or_insert(0) += 1;
+                let mut sig_trace = case.trace.clone();
+                sig_trace.raw_args.clear();
+                checked_dedup_keys_by_fn
+                    .entry(fn_name.clone())
+                    .or_default()
+                    .insert(encode_recorded_raw_trace_hex(&sig_trace));
+            }
+        }
 
         let mut obs_path_set = MirObsPathSet::new();
         let mut obs_path_signatures_set = BTreeSet::new();
         for fn_name in &compared_fn_names {
+            let Some(checked_keys) = checked_dedup_keys_by_fn.get(fn_name) else {
+                continue;
+            };
             if let Some(records) = obs_records_by_fn.get(fn_name) {
-                for (key, args) in records {
-                    obs_path_set.record_execution(key.clone(), args.clone());
+                for (dedup_key, key, args) in records {
+                    if checked_keys.contains(dedup_key) {
+                        obs_path_set.record_execution(key.clone(), args.clone());
+                    }
                 }
             }
             if let Some(sigs) = obs_sigs_by_fn.get(fn_name) {
-                obs_path_signatures_set.extend(sigs.iter().cloned());
+                for (dedup_key, sig) in sigs {
+                    if checked_keys.contains(dedup_key) {
+                        obs_path_signatures_set.insert(sig.clone());
+                    }
+                }
             }
         }
 
@@ -2477,6 +4316,7 @@ fn evaluate_itree_entries(
         let agree_candidates = compared_candidates.saturating_sub(diverge_candidates);
         let not_compared_candidates = total_candidates.saturating_sub(compared_candidates);
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        inconclusive_traces_by_candidate.retain(|f, _| compared_fn_names.contains(f));
 
         Ok(ItreeCampaignEvalReport {
             mode: mode.to_string(),
@@ -2505,6 +4345,7 @@ fn evaluate_itree_entries(
             per_candidate_distinct_traces,
             diag_tag_counts,
             not_compared_reasons,
+            inconclusive_traces_by_candidate,
             mutator_applications,
             obs_path_signatures: obs_path_signatures_set.into_iter().collect(),
             findings,
@@ -2982,6 +4823,14 @@ pub fn evaluate_itree_candidate_live(
             report.not_compared_reasons
         ));
     }
+    // A partial comparison gives no judgment: the signature may live on one of
+    // the traces left unchecked by a resource limit.
+    if let Some(dropped) = report.inconclusive_traces_by_candidate.get(&target_fn) {
+        return Err(format!(
+            "`{target_fn}` was only partially compared ({dropped} trace(s) inconclusive \
+             under Lean resource limits)"
+        ));
+    }
     Ok(ItreeCandidateEvaluation {
         divergent_traces: report
             .findings
@@ -3284,7 +5133,7 @@ pub fn reproduce_itree_finding(
         let anneal_dir = staging_dir.join(".anneal");
         let mut lake_targets = vec!["Anneal".to_string(), root_mir_module];
         lake_targets.extend(callee_sig_modules);
-        run_lake_verify_targets(&anneal_dir, &lake_targets)?;
+        run_itree_lake_build_targets(&anneal_dir, &lake_targets)?;
 
         let verify_dir = anneal_dir.join("generated/Verify/ItreeDiffStaged");
         fs::create_dir_all(&verify_dir)
@@ -3294,23 +5143,14 @@ pub fn reproduce_itree_finding(
             "Proof.ItreeDiffReproProbe",
             std::slice::from_ref(&case),
         );
-        let probe_file = verify_dir.join("ItreeDiffReproProbe.lean");
-        fs::write(&probe_file, &probe_src)
-            .map_err(|e| format!("failed to write {}: {e}", probe_file.display()))?;
-        let probe_out = Command::new("lake")
-            .args(["env", "lean", "-M", "4096"])
-            .arg(&probe_file)
-            .current_dir(&anneal_dir)
-            .output()
-            .map_err(|e| format!("failed to run probe in repro: {e}"))?;
-        if !probe_out.status.success() {
-            return Err(format!(
-                "repro probe failed:\n{}",
-                String::from_utf8_lossy(&probe_out.stderr)
-            ));
-        }
-        let probe_map =
-            parse_batch_trace_probe_output(&String::from_utf8_lossy(&probe_out.stdout));
+        let probe_stdout = run_itree_lean_module(
+            &verify_dir,
+            &anneal_dir,
+            "ItreeDiffReproProbe",
+            &probe_src,
+        )
+        .map_err(|e| format!("repro probe failed:\n{e}"))?;
+        let probe_map = parse_batch_trace_probe_output(&probe_stdout);
         let (diag_tag, diag_repr) = probe_map
             .get("repro_case")
             .cloned()
@@ -3322,16 +5162,24 @@ pub fn reproduce_itree_finding(
             std::slice::from_ref(&case),
             false,
         );
-        let confirm_file = verify_dir.join("ItreeDiffRepro.lean");
-        fs::write(&confirm_file, &confirm_src)
-            .map_err(|e| format!("failed to write {}: {e}", confirm_file.display()))?;
-        let confirm_out = Command::new("lake")
-            .args(["env", "lean", "-M", "4096"])
-            .arg(&confirm_file)
-            .current_dir(&anneal_dir)
-            .output()
-            .map_err(|e| format!("failed to run confirm in repro: {e}"))?;
-        let kernel_confirmed = confirm_out.status.success();
+        // A watchdog kill, Lean resource limit, signal, or missing toolchain is
+        // inconclusive, never a kernel rejection (`kernel_confirmed = false`).
+        let kernel_confirmed = match run_itree_lean_module(
+            &verify_dir,
+            &anneal_dir,
+            "ItreeDiffRepro",
+            &confirm_src,
+        ) {
+            Ok(_) => true,
+            Err(e) if itree_lean_failure_is_inconclusive(&e) => {
+                return Err(format!(
+                    "repro kernel confirmation inconclusive (resource or toolchain failure, \
+                     not a kernel rejection):\n{}",
+                    truncate_lean_diag(&e)
+                ));
+            }
+            Err(_) => false,
+        };
         let verdict = if diag_tag == "ok" {
             "agree".to_string()
         } else {
@@ -3494,6 +5342,7 @@ pub fn render_itree_eval_report_json(report: &ItreeCampaignEvalReport) -> String
          \x20 \"per_candidate_distinct_traces\": {},\n\
          \x20 \"diag_tag_counts\": {},\n\
          \x20 \"not_compared_reasons\": {},\n\
+         \x20 \"inconclusive_traces_by_candidate\": {},\n\
          \x20 \"mutator_applications\": {},\n\
          \x20 \"obs_path_signatures\": {},\n\
          \x20 \"findings_count\": {},\n\
@@ -3526,6 +5375,7 @@ pub fn render_itree_eval_report_json(report: &ItreeCampaignEvalReport) -> String
         render_usize_map_json(&report.per_candidate_distinct_traces, 2),
         render_usize_map_json(&report.diag_tag_counts, 2),
         render_usize_map_json(&report.not_compared_reasons, 2),
+        render_usize_map_json(&report.inconclusive_traces_by_candidate, 2),
         render_usize_map_json(&report.mutator_applications, 2),
         render_string_list_json(&report.obs_path_signatures, 2),
         report.findings.len(),
@@ -3593,6 +5443,17 @@ pub fn render_itree_eval_report_markdown(report: &ItreeCampaignEvalReport) -> St
     out.push_str("| Reason | Candidates |\n| :--- | ---: |\n");
     for (reason, count) in &report.not_compared_reasons {
         out.push_str(&format!("| `{reason}` | {count} |\n"));
+    }
+
+    if !report.inconclusive_traces_by_candidate.is_empty() {
+        out.push_str("\n## Partially Compared Candidates (Inconclusive Traces)\n\n");
+        out.push_str(
+            "| Candidate Root Function | Traces Unchecked (Lean Resource Limits) |\n\
+             | :--- | ---: |\n",
+        );
+        for (fn_name, count) in &report.inconclusive_traces_by_candidate {
+            out.push_str(&format!("| `{fn_name}` | {count} |\n"));
+        }
     }
 
     out.push_str("\n## Mutator Applications\n\n");
@@ -4727,6 +6588,1046 @@ mod tests {
             covered.len(),
             MARKERS.len(),
             "expected ITree ddmin coverage of both Episode 1 variants, covered {covered:?}"
+        );
+    }
+
+    #[test]
+    fn cgroup_v1_v2_memory_and_cpu_quotas_and_lean_budgets_respect_tightest_limits() {
+        let root = std::env::temp_dir().join(format!(
+            "anneal-itree-cg-v1v2-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let v2_leaf = root.join("v2/user.slice/run.scope");
+        fs::create_dir_all(&v2_leaf).expect("create v2 cgroup tree");
+        // user.slice: memory.max = 24 GiB, memory.high = 16 GiB (tighter than max),
+        // memory.stat anon=3 GiB, shmem=1 GiB, file=8 GiB (reclaimable page cache
+        // ignored in working-set calculation) -> 16 - 4 = 12 GiB headroom.
+        fs::write(
+            root.join("v2/user.slice/memory.max"),
+            format!("{}\n", 24 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            root.join("v2/user.slice/memory.high"),
+            format!("{}\n", 16 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            root.join("v2/user.slice/memory.stat"),
+            format!(
+                "anon {}\nfile {}\nshmem {}\n",
+                3 * GIB_KIB * 1024,
+                8 * GIB_KIB * 1024,
+                GIB_KIB * 1024
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("v2/user.slice/cpu.max"), "600000 100000\n").unwrap();
+        // run.scope: memory.max = max, memory.high = 10 GiB, memory.stat anon=2 GiB -> 8 GiB headroom,
+        // cpu.max = 250000 100000 -> ceil(2.5) = 3 cores.
+        fs::write(v2_leaf.join("memory.max"), "max\n").unwrap();
+        fs::write(
+            v2_leaf.join("memory.high"),
+            format!("{}\n", 10 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            v2_leaf.join("memory.stat"),
+            format!("anon {}\nshmem 0\n", 2 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(v2_leaf.join("cpu.max"), "250000 100000\n").unwrap();
+
+        let (v2_limit, v2_headroom) =
+            cgroup_memory_limits_kib(&root.join("v2"), "0::/user.slice/run.scope\n");
+        assert_eq!(v2_limit, Some(10 * GIB_KIB));
+        assert_eq!(v2_headroom, Some(8 * GIB_KIB));
+        assert_eq!(
+            cgroup_cpu_quota_cores(&root.join("v2"), "0::/user.slice/run.scope\n"),
+            Some(3)
+        );
+
+        // Cgroup v1 hierarchy with hierarchical_memory_limit and cfs_quota_us.
+        let v1_mem = root.join("v1/memory/kubepods/pod1");
+        let v1_cpu = root.join("v1/cpu,cpuacct/kubepods/pod1");
+        fs::create_dir_all(&v1_mem).unwrap();
+        fs::create_dir_all(&v1_cpu).unwrap();
+        fs::write(
+            v1_mem.join("memory.limit_in_bytes"),
+            format!("{}\n", 12 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            v1_mem.join("memory.stat"),
+            format!(
+                "hierarchical_memory_limit {}\ntotal_rss {}\ntotal_shmem {}\n",
+                8 * GIB_KIB * 1024,
+                2 * GIB_KIB * 1024,
+                GIB_KIB * 1024
+            ),
+        )
+        .unwrap();
+        fs::write(v1_cpu.join("cpu.cfs_quota_us"), "400000\n").unwrap();
+        fs::write(v1_cpu.join("cpu.cfs_period_us"), "100000\n").unwrap();
+
+        let v1_cg_text = "6:cpu,cpuacct:/kubepods/pod1\n12:memory:/kubepods/pod1\n";
+        let (v1_limit, v1_headroom) = cgroup_memory_limits_kib(&root.join("v1"), v1_cg_text);
+        assert_eq!(v1_limit, Some(8 * GIB_KIB));
+        assert_eq!(v1_headroom, Some(5 * GIB_KIB));
+        assert_eq!(
+            cgroup_cpu_quota_cores(&root.join("v1"), v1_cg_text),
+            Some(4)
+        );
+
+        // Thread & RSS budget calculations.
+        assert_eq!(
+            itree_lean_threads_for_resources(16, Some(4), Some(12 * GIB_KIB), 2),
+            2
+        );
+        assert_eq!(
+            itree_lean_threads_for_resources(16, None, Some(3 * GIB_KIB), 1),
+            1
+        );
+        let (lean_mb, rss_kib) =
+            itree_lean_rss_budget_kib(Some(10 * GIB_KIB), Some(5 * GIB_KIB), 2);
+        // 5 GiB avail -> reserve 1 GiB -> 4 GiB usable / 2 workers = 2 GiB per worker.
+        assert_eq!(rss_kib, 2 * GIB_KIB);
+        assert_eq!(lean_mb, 2048);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tracked_process_tree_measures_rss_handles_pid_wraparound_and_rejects_pid_reuse() {
+        let proc_dir = std::env::temp_dir().join(format!(
+            "anneal-itree-proc-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&proc_dir).unwrap();
+
+        let write_proc = |pid: u32, comm: &str, state: char, ppid: u32, st: u64, pages: u64| {
+            let d = proc_dir.join(pid.to_string());
+            fs::create_dir_all(&d).unwrap();
+            // 19 fields after `)`: state(0), ppid(1), pgrp..itrealvalue(17 fields), starttime(19).
+            let zeros = vec!["0"; 17].join(" ");
+            let stat = format!("{pid} ({comm}) {state} {ppid} {zeros} {st} 0 0\n");
+            fs::write(d.join("stat"), stat).unwrap();
+            fs::write(d.join("statm"), format!("1000 {pages} 0 0 0 0 0\n")).unwrap();
+        };
+
+        // Root PID 30000 (100 pages = 400 KiB), child PID 32700 (starttime 200, 250 pages = 1000 KiB),
+        // grandchild PID 105 (wrapped around pid_max, starttime 300, 500 pages = 2000 KiB).
+        write_proc(30000, "lake (env)", 'S', 1, 100, 100);
+        write_proc(32700, "lean worker)", 'R', 30000, 200, 250);
+        write_proc(105, "lean (child)", 'R', 32700, 300, 500);
+
+        let mut tree = TrackedProcessTree::with_proc_root(30000, &proc_dir, 4);
+        assert_eq!(tree.sample_rss_kib(), 400 + 1000 + 2000);
+        // A positively running root has not exited (so `reap_exited_root` must
+        // not `try_wait` it).
+        assert_eq!(tree.root_proc_zombie_or_running(), Some(false));
+        assert!(!tree.root_has_exited());
+
+        // Descendant kill order must put newest grandchild (PID 105, starttime 300)
+        // before its parent (PID 32700, starttime 200) despite 105 < 32700.
+        assert_eq!(tree.descendant_kill_order(), vec![(105, 300), (32700, 200)]);
+
+        // Now simulate intermediate parent PID 32700 exiting and its PID being
+        // immediately reused by an unrelated process (starttime 999, 5000 pages),
+        // while grandchild PID 105 is reparented to PID 1.
+        write_proc(32700, "unrelated", 'R', 1, 999, 5000);
+        write_proc(105, "lean (child)", 'R', 1, 300, 600);
+
+        // `sample_rss_kib` must prune the reused PID 32700 (starttime 999 != 200)
+        // while retaining reparented grandchild PID 105 (400 + 2400 = 2800 KiB).
+        assert_eq!(tree.sample_rss_kib(), 400 + 2400);
+        assert_eq!(tree.descendant_kill_order(), vec![(105, 300)]);
+
+        // Now simulate root PID 30000 becoming an un-reaped zombie ('Z') right
+        // after spawning a new worker PID 40000 (ppid = 30000, starttime 400, 300 pages = 1200 KiB).
+        write_proc(30000, "lake (env)", 'Z', 1, 100, 0);
+        write_proc(40000, "lean late worker", 'R', 30000, 400, 300);
+        assert_eq!(tree.sample_rss_kib(), 2400 + 1200);
+        assert_eq!(tree.descendant_kill_order(), vec![(40000, 400), (105, 300)]);
+        assert!(tree.root_has_exited());
+        assert_eq!(tree.root_proc_zombie_or_running(), Some(true));
+
+        // A root whose `/proc` entry vanished after its `starttime` was recorded
+        // has exited, but one whose `starttime` was never observable (no
+        // `/proc/<pid>`, e.g. a host without procfs) must not be reported as
+        // exited, so `terminate_process_tree` still waits out the full `SIGTERM`
+        // grace period before `SIGKILL`.
+        fs::remove_dir_all(proc_dir.join("30000")).unwrap();
+        assert_eq!(tree.root_proc_zombie_or_running(), None);
+        assert!(tree.root_has_exited());
+        let unobservable = TrackedProcessTree::with_proc_root(31337, &proc_dir, 4);
+        assert_eq!(unobservable.root_proc_zombie_or_running(), None);
+        assert!(!unobservable.root_has_exited());
+
+        let _ = fs::remove_dir_all(&proc_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_kills_runaway_process_tree_on_timeout_and_rss_and_cleans_up_children() {
+        // 1. Wall-clock timeout test with a child that spawns a background grandchild.
+        let pid_file = std::env::temp_dir().join(format!(
+            "anneal-itree-watchdog-grandchild-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "sleep 60 & echo $! > {}; wait",
+                pid_file.display()
+            ));
+        let out = run_command_with_watchdog(
+            cmd,
+            DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB,
+            Duration::from_millis(150),
+            Duration::from_millis(15),
+        )
+        .expect("run command under timeout watchdog");
+        assert_eq!(
+            out.watchdog_killed,
+            Some(ItreeLeanFailureKind::WallClockTimeout)
+        );
+        if let Ok(gc_pid_str) = fs::read_to_string(&pid_file)
+            && let Ok(gc_pid) = gc_pid_str.trim().parse::<u32>()
+        {
+            // Grandchild must be dead (or not running `sleep`).
+            let state = proc_state_ppid_starttime_in(Path::new("/proc"), gc_pid);
+            assert!(
+                state.is_none() || matches!(state, Some(('Z' | 'X', _, _))),
+                "grandchild PID {gc_pid} should have been terminated by watchdog, got {state:?}"
+            );
+        }
+        let _ = fs::remove_file(&pid_file);
+
+        // 2. RSS watchdog test: set an artificially tight 1 KiB RSS ceiling so any
+        //    live child exceeds it immediately and is killed with `RssWatchdogExceeded`.
+        let mut rss_cmd = Command::new("sh");
+        rss_cmd.arg("-c").arg("sleep 30");
+        let rss_out = run_command_with_watchdog(
+            rss_cmd,
+            1, // 1 KiB ceiling -> guaranteed immediate RSS watchdog trigger
+            Duration::from_secs(30),
+            Duration::from_millis(10),
+        )
+        .expect("run command under RSS watchdog");
+        assert_eq!(
+            rss_out.watchdog_killed,
+            Some(ItreeLeanFailureKind::RssWatchdogExceeded)
+        );
+        assert!(rss_out.peak_rss_kib > 1);
+    }
+
+    #[test]
+    fn isolated_lean_stage_bisects_watchdog_failures_and_isolates_irreducible_single_case() {
+        let (cases, case_to_fn) = stage_fixture(&[
+            ("cand_batch_heavy", 4),
+            ("cand_one_poison", 4),
+            ("cand_healthy", 2),
+        ]);
+        // Scenario:
+        // - `cand_batch_heavy` fails with `[WATCHDOG:RSS_EXCEEDED]` whenever > 2 of
+        //   its cases are evaluated in one module, but succeeds when bisected into
+        //   2-case sub-modules! So `cand_batch_heavy` must be 100% recovered.
+        // - `cand_one_poison` has one irreducible poison case `case_cand_one_poison_t2`
+        //   that always hits `[WATCHDOG:TIMEOUT]`, while `t0`, `t1`, and `t3` succeed
+        //   once isolated by bisection.
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchConfirm",
+            &cases,
+            6,
+            2,
+            ident,
+            &case_to_fn,
+            |_label: &str, chunk: &[String]| {
+                let heavy_count = chunk
+                    .iter()
+                    .filter(|c| case_to_fn[*c] == "cand_batch_heavy")
+                    .count();
+                if heavy_count > 2 {
+                    return Err(
+                        "[WATCHDOG:RSS_EXCEEDED] module exceeded RSS limit (9000000 KiB > 8388608 KiB)"
+                            .to_string(),
+                    );
+                }
+                if chunk.iter().any(|c| c == "case_cand_one_poison_t2") {
+                    return Err(
+                        "[WATCHDOG:TIMEOUT] module exceeded wall-clock timeout (180s)"
+                            .to_string(),
+                    );
+                }
+                ok_all(chunk)
+            },
+        );
+
+        // `cand_batch_heavy` (all 4 cases) and `cand_healthy` (all 2 cases) must
+        // be completely recovered, plus the 3 healthy cases of `cand_one_poison`.
+        assert_eq!(
+            stage.failed_fns,
+            BTreeSet::from(["cand_one_poison".to_string()]),
+            "only cand_one_poison has an unrecovered case; cand_batch_heavy recovered via bisection"
+        );
+        for t in 0..4 {
+            assert!(
+                stage
+                    .results
+                    .contains_key(&format!("case_cand_batch_heavy_t{t}")),
+                "cand_batch_heavy case t{t} should be recovered by bisection"
+            );
+        }
+        for t in [0, 1, 3] {
+            assert!(
+                stage
+                    .results
+                    .contains_key(&format!("case_cand_one_poison_t{t}")),
+                "cand_one_poison healthy sibling case t{t} should be recovered by bisection"
+            );
+        }
+        assert!(
+            !stage.results.contains_key("case_cand_one_poison_t2"),
+            "irreducible poison case must not be in results"
+        );
+        assert!(
+            stage.errors.iter().any(|e| {
+                e.contains("irreducible single case `case_cand_one_poison_t2` of `cand_one_poison`")
+                    && e.contains("[WATCHDOG:TIMEOUT]")
+            }),
+            "expected explicit irreducible single-case diagnostic in {:?}",
+            stage.errors
+        );
+        // The poison case only timed out (unchecked, not refuted), so the
+        // pipeline keeps comparing `cand_one_poison` on its 3 healthy siblings.
+        assert_eq!(
+            stage.inconclusive_cases,
+            BTreeSet::from(["case_cand_one_poison_t2".to_string()])
+        );
+        assert_eq!(
+            itree_partially_comparable_fns(&stage, &cases, ident, &case_to_fn, |_| true),
+            BTreeMap::from([("cand_one_poison".to_string(), 1)])
+        );
+    }
+
+    /// `inconclusive_cases` keeps the most specific failure of each unresolved
+    /// case: a case that only hit a watchdog in isolation is inconclusive, a
+    /// Lean rejection never is, and [`itree_partially_comparable_fns`] keeps a
+    /// candidate only when all of its unresolved cases are inconclusive (and
+    /// droppable) and at least one of its cases completed.
+    #[test]
+    fn isolated_lean_stage_tracks_inconclusive_cases_for_partial_comparison() {
+        let (cases, case_to_fn) = stage_fixture(&[
+            ("cand_timeout_one", 4),
+            ("cand_reject_one", 4),
+            ("cand_all_timeout", 2),
+            ("cand_ok", 2),
+        ]);
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchProbe",
+            &cases,
+            4,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, chunk: &[String]| {
+                let times_out = |c: &String| {
+                    c == "case_cand_timeout_one_t1" || c.starts_with("case_cand_all_timeout")
+                };
+                if chunk.iter().any(times_out) {
+                    return Err(format!(
+                        "[WATCHDOG:TIMEOUT] `/tmp/verify/{label}.lean` exceeded wall-clock timeout"
+                    ));
+                }
+                if chunk.iter().any(|c| c == "case_cand_reject_one_t3") {
+                    return Err(format!(
+                        "`/tmp/verify/{label}.lean` failed:\nstdout:\n\
+                         /tmp/verify/{label}.lean:9:4: error: unknown constant \
+                         'case_cand_reject_one_t3_rawTrace'\nstderr:\n"
+                    ));
+                }
+                ok_all(chunk)
+            },
+        );
+        assert_eq!(
+            stage.failed_fns,
+            BTreeSet::from([
+                "cand_all_timeout".to_string(),
+                "cand_reject_one".to_string(),
+                "cand_timeout_one".to_string(),
+            ])
+        );
+        for healthy in [
+            "case_cand_timeout_one_t0",
+            "case_cand_timeout_one_t2",
+            "case_cand_timeout_one_t3",
+            "case_cand_reject_one_t0",
+            "case_cand_reject_one_t1",
+            "case_cand_reject_one_t2",
+            "case_cand_ok_t0",
+            "case_cand_ok_t1",
+        ] {
+            assert!(stage.results.contains_key(healthy), "{healthy} must be recovered");
+        }
+        // The chunk-level timeout first marked every case of the third chunk, but
+        // `cand_ok`'s fallback succeeded, and the rejected case's most specific
+        // failure (its single-case bisection run) is a Lean rejection.
+        assert_eq!(
+            stage.inconclusive_cases,
+            BTreeSet::from([
+                "case_cand_all_timeout_t0".to_string(),
+                "case_cand_all_timeout_t1".to_string(),
+                "case_cand_timeout_one_t1".to_string(),
+            ])
+        );
+        // Only `cand_timeout_one` stays comparable: `cand_reject_one` has a
+        // refuted case and `cand_all_timeout` has nothing left to compare.
+        assert_eq!(
+            itree_partially_comparable_fns(&stage, &cases, ident, &case_to_fn, |_| true),
+            BTreeMap::from([("cand_timeout_one".to_string(), 1)])
+        );
+        // Stage 2 forbids dropping unconfirmed divergences (`may_drop == false`):
+        // the candidate is then dropped whole.
+        assert!(
+            itree_partially_comparable_fns(&stage, &cases, ident, &case_to_fn, |c| {
+                c != "case_cand_timeout_one_t1"
+            })
+            .is_empty()
+        );
+    }
+
+    /// Stage 2 replacement selection (large batches confirm a single `ok` trace
+    /// per agreeing candidate): only a candidate whose selected cases all failed
+    /// inconclusively on Stage 1 `ok` traces gets a replacement, namely its first
+    /// unselected `ok` trace; a refuted, divergent, already confirmed, or
+    /// exhausted candidate gets none.
+    #[test]
+    fn confirm_replacements_retry_only_inconclusive_agreeing_selections() {
+        let (pool, case_to_fn) = stage_fixture(&[
+            ("cand_retry", 3),
+            ("cand_skip", 3),
+            ("cand_reject", 2),
+            ("cand_div", 3),
+            ("cand_partial", 3),
+            ("cand_alone", 1),
+            ("cand_done", 2),
+        ]);
+        let selected: Vec<String> = [
+            "case_cand_retry_t0",
+            "case_cand_skip_t0",
+            "case_cand_reject_t0",
+            "case_cand_div_t0",
+            "case_cand_div_t1",
+            "case_cand_partial_t0",
+            "case_cand_partial_t1",
+            "case_cand_alone_t0",
+            "case_cand_done_t0",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let divergent: BTreeSet<&str> = BTreeSet::from(["case_cand_skip_t1", "case_cand_div_t1"]);
+        let stage = IsolatedLeanStage::<usize> {
+            results: BTreeMap::from([
+                ("case_cand_partial_t1".to_string(), 1),
+                ("case_cand_done_t0".to_string(), 1),
+            ]),
+            failed_fns: [
+                "cand_retry",
+                "cand_skip",
+                "cand_reject",
+                "cand_div",
+                "cand_partial",
+                "cand_alone",
+            ]
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+            inconclusive_cases: [
+                "case_cand_retry_t0",
+                "case_cand_skip_t0",
+                "case_cand_div_t0",
+                "case_cand_div_t1",
+                "case_cand_partial_t0",
+                "case_cand_alone_t0",
+            ]
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+            errors: Vec::new(),
+        };
+        let picked = itree_confirm_replacements(
+            &stage,
+            &selected,
+            &pool,
+            ident,
+            &case_to_fn,
+            |c: &String| !divergent.contains(c.as_str()),
+        );
+        assert_eq!(picked, vec!["case_cand_retry_t1", "case_cand_skip_t2"]);
+
+        // If `case_cand_retry_t1` also hits a resource limit while
+        // `case_cand_skip_t2` succeeds, a second replacement pass selects
+        // `case_cand_retry_t2` and stops for `cand_skip`.
+        let mut selected2 = selected;
+        selected2.extend(picked.into_iter().cloned());
+        let mut stage2 = stage;
+        stage2.results.insert("case_cand_skip_t2".to_string(), 1);
+        stage2
+            .inconclusive_cases
+            .insert("case_cand_retry_t1".to_string());
+        let picked2 = itree_confirm_replacements(
+            &stage2,
+            &selected2,
+            &pool,
+            ident,
+            &case_to_fn,
+            |c: &String| !divergent.contains(c.as_str()),
+        );
+        assert_eq!(picked2, vec!["case_cand_retry_t2"]);
+    }
+
+    /// The trial builder keeps every fixed probe (including the `PanicOnCall(0)`
+    /// probe) for identity candidates, drops only evaluator-predicted duplicate
+    /// probes for mutated candidates, and fills the freed / dynamic slots with
+    /// the evaluator-verified concolic trials (`argPinTerm` negations first),
+    /// deterministically.
+    #[test]
+    fn build_candidate_trial_inputs_keeps_probes_and_fills_slots_with_verified_concolic_trials() {
+        let fixed_pairs: [(u32, u32); 8] = crate::mutators_itree::ITREE_CONCOLIC_BASE_INPUTS;
+        let mut checked = 0usize;
+        for cand in generate_itree_batch(ITREE_SAFE_SEEDS, 12, 0xABCD_1234) {
+            if !cand
+                .applied_mutators
+                .iter()
+                .any(|m| m == "CallBoundaryOutliner" || m == "ExtOracleInjector")
+            {
+                continue;
+            }
+            let staged =
+                stage_itree_candidate_items(&cand.source, "b0_c0__", "kernel_step").expect("stage");
+            let trials = build_candidate_trial_inputs(&cand, &staged, None, 12, 0xABCD_1234);
+            assert_eq!(trials.len(), 12);
+            let again = build_candidate_trial_inputs(&cand, &staged, None, 12, 0xABCD_1234);
+            assert!(
+                trials.iter().zip(&again).all(|(a, b)| a.magic == b.magic
+                    && a.payload_len == b.payload_len
+                    && a.schedule == b.schedule),
+                "trial synthesis must be deterministic"
+            );
+            // The injected / outlined call runs first on every input, so the
+            // `PanicOnCall(0)` probe is never a predicted duplicate.
+            assert!(trials.iter().any(|t| (t.magic, t.payload_len) == (0x414E_4E4C, 2048)
+                && t.schedule.global_panic_on_call == Some(0)));
+
+            let ev = ItreeConcreteEvaluator::new(&cand.source, "kernel_step").unwrap();
+            let predicted: Vec<ItreeConcreteRun> = trials
+                .iter()
+                .map(|t| {
+                    ev.run_kernel_step(t.magic, t.payload_len, &t.schedule, "b0_c0__")
+                        .unwrap()
+                })
+                .collect();
+            let distinct: BTreeSet<&ItreeConcreteRun> = predicted.iter().collect();
+            assert_eq!(
+                distinct.len(),
+                trials.len(),
+                "mutated candidates must not waste trials on predicted-duplicate traces"
+            );
+            // The first concolic trial is an `argPinTerm` negation verified against
+            // its base probe: same prefix, same callee, different arguments.
+            let dict = MirInputDictionary::from_rust_source(&cand.source).unwrap();
+            let concolic = explore_itree_concolic_trials(
+                &cand.source,
+                "kernel_step",
+                "b0_c0__",
+                &fixed_pairs,
+                &dict,
+                12,
+                cand.seed_u64 ^ 0xABCD_1234,
+            );
+            let first = concolic.first().expect("concolic trial");
+            assert!(matches!(
+                first.phase,
+                crate::input_gen::ConcolicTrialPhase::NegateCallArg { .. }
+            ));
+            assert!(trials.iter().any(|t| t.magic == first.magic
+                && t.payload_len == first.payload_len
+                && t.schedule == first.schedule));
+            let (bm, bp) = fixed_pairs[first.base_index];
+            let base = ev
+                .run_kernel_step(bm, bp, &EnvSchedule::new(), "b0_c0__")
+                .unwrap();
+            assert!(first.predicted.shares_prefix_with(&base, first.target_event_pos));
+            assert_ne!(
+                first.predicted.events[first.target_event_pos],
+                base.events[first.target_event_pos]
+            );
+            checked += 1;
+        }
+        assert!(checked >= 2);
+
+        // Identity candidates keep all 9 probes verbatim (calibration baseline).
+        for cand in generate_itree_identity_batch(ITREE_SAFE_SEEDS) {
+            let staged =
+                stage_itree_candidate_items(&cand.source, "b0_c0__", "kernel_step").expect("stage");
+            let trials = build_candidate_trial_inputs(&cand, &staged, None, 12, 0x1DE4_7171);
+            assert_eq!(trials.len(), 12);
+            for (i, &(m, p)) in fixed_pairs.iter().enumerate() {
+                assert_eq!((trials[i].magic, trials[i].payload_len), (m, p));
+                assert_eq!(trials[i].schedule, EnvSchedule::new());
+            }
+            assert_eq!(
+                (trials[8].magic, trials[8].payload_len, trials[8].schedule.global_panic_on_call),
+                (0x414E_4E4C, 2048, Some(0))
+            );
+        }
+    }
+
+    #[test]
+    fn lean_thread_rss_and_timeout_budgets_honor_env_overrides_and_worker_partitioning() {
+        // Caller `LEAN_NUM_THREADS` is the whole command's budget: 8 threads across
+        // 4 workers -> at most 2 each; it lowers but never raises the computed value.
+        assert_eq!(
+            resolve_itree_lean_threads_with_env(None, Some("8"), 64, None, Some(256 * GIB_KIB), 4),
+            2
+        );
+        assert_eq!(
+            resolve_itree_lean_threads_with_env(None, Some("64"), 8, None, Some(256 * GIB_KIB), 4),
+            2,
+            "8 cores / 4 workers"
+        );
+        assert_eq!(
+            resolve_itree_lean_threads_with_env(None, Some("2"), 64, None, Some(256 * GIB_KIB), 4),
+            1
+        );
+        assert_eq!(
+            resolve_itree_lean_threads_with_env(Some("12"), Some("2"), 64, None, None, 4),
+            12,
+            "explicit ANNEAL_ITREE_LEAN_THREADS wins"
+        );
+        assert_eq!(
+            resolve_itree_lean_threads_with_env(
+                Some("0"),
+                None,
+                64,
+                Some(4),
+                Some(256 * GIB_KIB),
+                1
+            ),
+            4,
+            "invalid explicit value falls back to cgroup-capped cores"
+        );
+
+        // `-M` stays explicit even when the RSS ceiling is overridden.
+        assert_eq!(
+            resolve_itree_lean_rss_budget_with_env(Some("4096"), Some("9000000"), None, None, 1),
+            (4096, 9_000_000)
+        );
+        assert_eq!(
+            resolve_itree_lean_rss_budget_with_env(None, Some("2097152"), None, None, 1),
+            (2048, 2_097_152)
+        );
+        assert_eq!(
+            resolve_itree_lean_rss_budget_with_env(Some("1024"), None, None, None, 1),
+            (1024, 1024 * 1024)
+        );
+
+        // Timeouts scale with the module's case count unless set explicitly.
+        assert_eq!(resolve_itree_lean_timeout_with_env(None, None, 1), DEFAULT_ITREE_LEAN_TIMEOUT);
+        assert_eq!(
+            resolve_itree_lean_timeout_with_env(None, None, 64),
+            DEFAULT_ITREE_LEAN_TIMEOUT + ITREE_LEAN_TIMEOUT_PER_CASE * 63
+        );
+        assert_eq!(
+            resolve_itree_lean_timeout_with_env(Some("250"), Some("9"), 64),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            resolve_itree_lean_timeout_with_env(None, Some("9"), 64),
+            Duration::from_secs(9)
+        );
+    }
+
+    #[test]
+    fn cgroup_parsing_walks_up_from_missing_container_leaves_and_rejects_escaping_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "anneal-itree-cg-container-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // cgroup v1 container without a cgroup namespace: `/proc/self/cgroup`
+        // names the host path, but the container's own limit sits at the mount root.
+        fs::create_dir_all(root.join("memory")).unwrap();
+        fs::create_dir_all(root.join("cpu,cpuacct")).unwrap();
+        fs::write(
+            root.join("memory/memory.limit_in_bytes"),
+            format!("{}\n", 6 * GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(
+            root.join("memory/memory.stat"),
+            format!("total_rss {}\ntotal_shmem 0\n", GIB_KIB * 1024),
+        )
+        .unwrap();
+        fs::write(root.join("cpu,cpuacct/cpu.cfs_quota_us"), "150000\n").unwrap();
+        fs::write(root.join("cpu,cpuacct/cpu.cfs_period_us"), "100000\n").unwrap();
+        let cg = "9:memory:/docker/0123abcd\n7:cpu,cpuacct:/docker/0123abcd (deleted)\n";
+        assert_eq!(
+            cgroup_memory_limits_kib(&root, cg),
+            (Some(6 * GIB_KIB), Some(5 * GIB_KIB))
+        );
+        assert_eq!(cgroup_cpu_quota_cores(&root, cg), Some(2));
+        // A `..` path can never walk out of the mount.
+        fs::write(root.join("cpu.max"), "100000 100000\n").unwrap();
+        assert_eq!(
+            cgroup_cpu_quota_cores(&root.join("cpu,cpuacct"), "0::/../../x\n"),
+            None
+        );
+        assert_eq!(sanitize_cgroup_rel("/a/b (deleted)"), Some("a/b"));
+        assert_eq!(sanitize_cgroup_rel("/a/../../b"), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lean_failure_classification_separates_resource_exhaustion_from_rejection() {
+        assert_eq!(
+            classify_itree_lean_failure("[WATCHDOG:TIMEOUT] x exceeded wall-clock timeout"),
+            ItreeLeanFailureKind::WallClockTimeout
+        );
+        assert_eq!(
+            classify_itree_lean_failure("error: (kernel) excessive memory consumption detected"),
+            ItreeLeanFailureKind::LeanMemoryExhausted
+        );
+        assert_eq!(
+            classify_itree_lean_failure("[LEAN:RESOURCE_EXHAUSTED] terminated by a signal"),
+            ItreeLeanFailureKind::LeanMemoryExhausted
+        );
+        assert_eq!(
+            classify_itree_lean_failure("error: (deterministic) timeout at `whnf`"),
+            ItreeLeanFailureKind::ElaborationOrOutputFailure
+        );
+        assert!(itree_lean_failure_is_inconclusive(
+            "error: (deterministic) timeout at `whnf`, maximum number of heartbeats"
+        ));
+        assert!(itree_lean_failure_is_inconclusive("[WATCHDOG:RSS_EXCEEDED] exceeded RSS limit"));
+        assert!(!itree_lean_failure_is_inconclusive(
+            "error: Tactic `rfl` failed: type mismatch"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_returns_promptly_when_an_untracked_descendant_holds_the_output_pipe() {
+        // The root exits at once while a backgrounded `sleep` (in the root's
+        // process group, possibly never sampled by `(pid, starttime)` tracking)
+        // keeps stdout open.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 6 & echo started $!; exit 0");
+        let start = Instant::now();
+        let out = run_command_with_watchdog(
+            cmd,
+            DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB,
+            Duration::from_secs(30),
+            Duration::from_millis(20),
+        )
+        .expect("run command under watchdog");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "watchdog must not block on a pipe held by a stray descendant ({:?})",
+            start.elapsed()
+        );
+        assert!(out.exit_success);
+        assert_eq!(out.watchdog_killed, None);
+        assert!(!out.signal_terminated);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(stdout.contains("started"));
+        if Path::new("/proc/self/stat").exists() {
+            // The exited root is observed as a zombie and its group is killed
+            // before reaping, so the stray `sleep` dies and the pipe drains.
+            assert!(out.pipes_drained, "group kill must release the held pipe");
+            let stray: u32 = stdout
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .expect("stray sleep pid");
+            let state = proc_state_ppid_starttime_in(Path::new("/proc"), stray);
+            assert!(
+                state.is_none() || matches!(state, Some(('Z' | 'X', _, _))),
+                "stray group member {stray} must not outlive the run: {state:?}"
+            );
+        }
+        // A short-lived root is reaped well within one capped poll interval.
+        let mut quick = Command::new("sh");
+        quick.arg("-c").arg("exit 3");
+        let start = Instant::now();
+        let out = run_command_with_watchdog(
+            quick,
+            DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB,
+            Duration::from_secs(30),
+            ITREE_WATCHDOG_POLL_INTERVAL,
+        )
+        .unwrap();
+        assert!(!out.exit_success);
+        assert!(out.pipes_drained);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // Signal termination outside the watchdog is reported (cgroup OOM kills).
+        let mut killed = Command::new("sh");
+        killed.arg("-c").arg("kill -9 $$");
+        let out = run_command_with_watchdog(
+            killed,
+            DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB,
+            Duration::from_secs(30),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert!(!out.exit_success);
+        assert!(out.signal_terminated);
+        assert_eq!(out.watchdog_killed, None);
+    }
+
+    #[test]
+    fn isolated_lean_stage_bounds_bisection_of_systematic_and_repeated_watchdog_failures() {
+        use std::sync::Mutex;
+        // 1. Candidate-wide elaboration failure (e.g. its shared MIR definitions do
+        //    not elaborate): chunk + fallback + one pair of halves, then stop.
+        let (cases, case_to_fn) = stage_fixture(&[("cand_systematic", 8)]);
+        let calls = Mutex::new(Vec::<String>::new());
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchProbe",
+            &cases,
+            64,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, _chunk: &[String]| -> Result<BTreeMap<String, usize>, String> {
+                calls.lock().unwrap().push(label.to_string());
+                Err("error: unknown identifier 'Mir.ItreeDiffStaged.cand_systematic'".to_string())
+            },
+        );
+        assert_eq!(calls.lock().unwrap().len(), 4, "{:?}", calls.lock().unwrap());
+        assert_eq!(stage.failed_fns, BTreeSet::from(["cand_systematic".to_string()]));
+        assert!(stage.errors.iter().any(|e| e.contains("candidate-wide")));
+
+        // 1b. The same failure as real `run_itree_lean_module_with_workers` output:
+        //     each half's error names its own module path / label and peak RSS, so
+        //     only the normalized Lean `error:` messages coincide.
+        let (cases, case_to_fn) = stage_fixture(&[("cand_systematic_real", 8)]);
+        let calls = Mutex::new(0usize);
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchProbe",
+            &cases,
+            64,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, chunk: &[String]| -> Result<BTreeMap<String, usize>, String> {
+                let n = {
+                    let mut c = calls.lock().unwrap();
+                    *c += 1;
+                    *c
+                };
+                Err(format!(
+                    "`/tmp/verify/{label}.lean` failed (peak RSS {} KiB / 8388608 KiB, -M 8192 MiB, \
+                     LEAN_NUM_THREADS=2):\nstdout:\n/tmp/verify/{label}.lean:{}:0: error: unknown \
+                     constant 'Mir.ItreeDiffStaged.b0_c0__kernel_step.body'\nstderr:\n",
+                    100_000 + n * 7,
+                    10 + chunk.len()
+                ))
+            },
+        );
+        assert_eq!(*calls.lock().unwrap(), 4, "chunk + fallback + one pair of halves");
+        assert!(stage.errors.iter().any(|e| e.contains("candidate-wide")));
+        assert_eq!(
+            lean_error_signature("x.lean:3:1: error: foo\nnoise\ny.lean:9:2: error: foo\n"),
+            vec!["foo".to_string()]
+        );
+
+        // 2. Every slice times out: failing bisection runs stay within the budget.
+        let (cases, case_to_fn) = stage_fixture(&[("cand_slow", 12)]);
+        let calls = Mutex::new(0usize);
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchConfirm",
+            &cases,
+            16,
+            1,
+            ident,
+            &case_to_fn,
+            |_label: &str, _chunk: &[String]| -> Result<BTreeMap<String, usize>, String> {
+                *calls.lock().unwrap() += 1;
+                Err("[WATCHDOG:TIMEOUT] module exceeded wall-clock timeout".to_string())
+            },
+        );
+        let budget = itree_bisect_failure_budget(12);
+        assert_eq!(budget, 10);
+        assert_eq!(*calls.lock().unwrap(), 2 + budget, "chunk + fallback + budget");
+        assert!(stage.errors.iter().any(|e| e.contains("bisection failure budget")));
+
+        // 3. Lean workers see the wave width inside chunk runs and the whole
+        //    budget (`1`) inside sequential fallback / bisection runs.
+        let (cases, case_to_fn) = stage_fixture(&[("cand_a", 2), ("cand_b", 2), ("cand_c", 2)]);
+        let seen = Mutex::new(BTreeMap::<String, usize>::new());
+        let _stage = run_isolated_lean_stage(
+            "ItreeDiffBatchProbe",
+            &cases,
+            2,
+            2,
+            ident,
+            &case_to_fn,
+            |label: &str, chunk: &[String]| {
+                seen.lock()
+                    .unwrap()
+                    .insert(label.to_string(), itree_lean_stage_concurrency(99));
+                if label.contains("Chunk") && chunk.iter().any(|c| case_to_fn[c] == "cand_a") {
+                    return Err("[WATCHDOG:RSS_EXCEEDED] exceeded RSS limit".to_string());
+                }
+                ok_all(chunk)
+            },
+        );
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(seen["ItreeDiffBatchProbeChunk0"], 2);
+        assert_eq!(seen["ItreeDiffBatchProbeChunk1"], 2);
+        assert_eq!(seen["ItreeDiffBatchProbeChunk2"], 1, "last wave holds one chunk");
+        assert_eq!(seen["ItreeDiffBatchProbeFallback_cand_a"], 1);
+        assert_eq!(itree_lean_stage_concurrency(99), 99, "guard restores outside a stage");
+
+        // 4. Two case-specific elaboration / missing-result failures in opposite
+        //    halves (`t1` in `0..4` and `t6` in `4..8`) must NOT be mistaken for a
+        //    candidate-wide failure: bisection isolates both poison cases and
+        //    recovers all 6 healthy siblings.
+        let (cases, case_to_fn) = stage_fixture(&[("cand_two_poison", 8)]);
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchProbe",
+            &cases,
+            64,
+            1,
+            ident,
+            &case_to_fn,
+            |_label: &str, chunk: &[String]| {
+                let mut map = ok_all(chunk)?;
+                map.remove("case_cand_two_poison_t1");
+                map.remove("case_cand_two_poison_t6");
+                Ok(map)
+            },
+        );
+        for t in [0, 2, 3, 4, 5, 7] {
+            assert!(
+                stage
+                    .results
+                    .contains_key(&format!("case_cand_two_poison_t{t}")),
+                "healthy sibling t{t} must be recovered even when both halves have a poison case"
+            );
+        }
+        assert!(!stage.results.contains_key("case_cand_two_poison_t1"));
+        assert!(!stage.results.contains_key("case_cand_two_poison_t6"));
+        assert!(
+            !stage.errors.iter().any(|e| e.contains("candidate-wide")),
+            "distinct case failures in opposite halves must not trigger candidate-wide stop: {:?}",
+            stage.errors
+        );
+
+        // 5. Two Stage 2 `tactic 'rfl' failed` failures in opposite halves (`t1`
+        //    in `0..4` and `t6` in `4..8`) where Lean's `error:` line does not
+        //    include the theorem identifier (`case_...`) and puts the mismatched
+        //    terms on indented continuation lines must ALSO bisect and recover all
+        //    6 healthy siblings.
+        let (cases, case_to_fn) = stage_fixture(&[("cand_two_rfl_poison", 8)]);
+        let stage_rfl = run_isolated_lean_stage(
+            "ItreeDiffBatchConfirm",
+            &cases,
+            16,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, chunk: &[String]| {
+                let mut errs = Vec::new();
+                if chunk.iter().any(|c| c == "case_cand_two_rfl_poison_t1") {
+                    errs.push(format!(
+                        "/tmp/verify/{label}.lean:18:42: error: tactic 'rfl' failed, the left-hand side\n  \"branch_tag_mismatch\"\nis not definitionally equal to the right-hand side\n  \"ok\""
+                    ));
+                }
+                if chunk.iter().any(|c| c == "case_cand_two_rfl_poison_t6") {
+                    errs.push(format!(
+                        "/tmp/verify/{label}.lean:42:42: error: tactic 'rfl' failed, the left-hand side\n  \"branch_tag_mismatch\"\nis not definitionally equal to the right-hand side\n  \"ok\""
+                    ));
+                }
+                if !errs.is_empty() {
+                    return Err(format!(
+                        "`/tmp/verify/{label}.lean` failed (peak RSS 120000 KiB / 8388608 KiB, -M 8192 MiB, LEAN_NUM_THREADS=2):\nstdout:\n{}\nstderr:\n",
+                        errs.join("\n")
+                    ));
+                }
+                ok_all(chunk)
+            },
+        );
+        for t in [0, 2, 3, 4, 5, 7] {
+            assert!(
+                stage_rfl
+                    .results
+                    .contains_key(&format!("case_cand_two_rfl_poison_t{t}")),
+                "healthy sibling t{t} must be recovered when t1 and t6 fail tactic 'rfl'"
+            );
+        }
+        assert!(!stage_rfl.results.contains_key("case_cand_two_rfl_poison_t1"));
+        assert!(!stage_rfl.results.contains_key("case_cand_two_rfl_poison_t6"));
+        assert!(!stage_rfl.errors.iter().any(|e| e.contains("candidate-wide")));
+
+        // 6. Cases whose bisection slice was skipped because the failure budget ran
+        //    out (`cand_slow` above) or whose per-candidate fallback was skipped by
+        //    `ITREE_FALLBACK_CIRCUIT_BREAKER` must NOT be marked in
+        //    `inconclusive_cases` (otherwise a candidate split across chunks could
+        //    silently drop an un-isolated kernel rejection).
+        let (cb_cases, cb_map) = stage_fixture(&[
+            ("cand_split", 2),
+            ("cand_f0", 1),
+            ("cand_f1", 1),
+            ("cand_f2", 1),
+            ("cand_f3", 1),
+            ("cand_split_tail", 1),
+        ]);
+        // Re-map `case_cand_split_tail_t0` to `cand_split` so `cand_split` spans
+        // Chunk 0 (which succeeds) and Chunk 1 (which fails with a watchdog error
+        // and hits the circuit breaker before `cand_split` runs its fallback in
+        // Chunk 1, because `cand_f0..f3` sort before `cand_split`!).
+        let mut cb_case_to_fn = cb_map;
+        cb_case_to_fn.insert("case_cand_split_tail_t0".to_string(), "cand_split".to_string());
+        let cb_stage = run_isolated_lean_stage(
+            "ItreeDiffBatchConfirm",
+            &cb_cases,
+            2,
+            1,
+            ident,
+            &cb_case_to_fn,
+            |label: &str, chunk: &[String]| {
+                if label == "ItreeDiffBatchConfirmChunk0" {
+                    return ok_all(chunk);
+                }
+                Err("[WATCHDOG:RSS_EXCEEDED] exceeded RSS limit".to_string())
+            },
+        );
+        assert!(
+            !cb_stage.inconclusive_cases.contains("case_cand_split_tail_t0"),
+            "fallback skipped by circuit breaker must not mark un-tested case as inconclusive"
+        );
+        assert!(
+            itree_partially_comparable_fns(&cb_stage, &cb_cases, ident, &cb_case_to_fn, |_| true)
+                .is_empty(),
+            "cand_split must not be partially compared when its Chunk 3 fallback was skipped"
         );
     }
 }
