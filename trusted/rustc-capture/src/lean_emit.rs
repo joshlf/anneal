@@ -768,10 +768,10 @@ pub struct IrCapturedMir {
 /// # Panics
 ///
 /// Panics if `lean_module_namespace` is not a valid dotted Lean namespace path
-/// (`validate_lean_dotted_name_syntax`), preventing namespace/import injection into trusted
-/// `Mir/<Item>.lean` modules.
+/// (`validate_lean_dotted_name`), preventing namespace/import injection into trusted
+/// `Mir/<Item>.lean` modules while permitting captured item stems like `Mir.Demo.end`.
 pub fn render_mir_module_header(lean_module_namespace: &str, def_path: &str) -> String {
-    if let Err(err) = validate_lean_dotted_name_syntax(lean_module_namespace, false) {
+    if let Err(err) = validate_lean_dotted_name(lean_module_namespace) {
         panic!("invalid Mir module namespace: {err}");
     }
     let def_path = sanitize_block_comment_text(def_path);
@@ -2401,10 +2401,14 @@ pub fn validate_lean_term_expr(expr: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_lean_dotted_name_syntax(name: &str, reject_reserved: bool) -> Result<(), String> {
+/// Checks that `name` is a dotted Lean name (`A.B.C`) whose components are ASCII identifiers
+/// (`[A-Za-z_][A-Za-z0-9_']*`, not `_`, with reserved keywords rejected on the first component
+/// where Lean can lex them as keywords) or non-empty `«»`-quoted components without control or
+/// format characters, so it can be spliced into generated `import` / `namespace` / `end` lines.
+pub fn validate_lean_dotted_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars().peekable();
     // Only the first component of a dotted name can lex as a keyword (`Mir.Demo.end` is one
-    // identifier), so `reject_reserved` applies to it alone.
+    // identifier), so reserved-keyword rejection applies to it alone.
     let mut first = true;
     loop {
         match chars.peek().copied() {
@@ -2436,7 +2440,7 @@ fn validate_lean_dotted_name_syntax(name: &str, reject_reserved: bool) -> Result
                     component.push(c);
                     chars.next();
                 }
-                if component == "_" || (reject_reserved && first && is_reserved_lean_ident(&component)) {
+                if component == "_" || (first && is_reserved_lean_ident(&component)) {
                     return Err(format!("invalid component `{component}` in Lean name {name:?}"));
                 }
             }
@@ -2448,14 +2452,6 @@ fn validate_lean_dotted_name_syntax(name: &str, reject_reserved: bool) -> Result
             Some(c) => return Err(format!("unexpected character {c:?} in Lean name {name:?}")),
         }
     }
-}
-
-/// Checks that `name` is a dotted Lean name (`A.B.C`) whose components are ASCII identifiers
-/// (`[A-Za-z_][A-Za-z0-9_']*`, neither the hole `_` nor a reserved keyword) or non-empty
-/// `«»`-quoted components without control or format characters, so it can be spliced into generated
-/// `import` / `namespace` / `end` lines.
-pub fn validate_lean_dotted_name(name: &str) -> Result<(), String> {
-    validate_lean_dotted_name_syntax(name, true)
 }
 
 /// Formats a complete, deterministic proof-side Lean 4 module sealing `entries` into a
@@ -3116,11 +3112,14 @@ fn deriving_class_dedup_key(entry: &str) -> String {
         .iter()
         .map(|&comp| {
             let unq = unwrap_guillemet_component(comp);
+            // In Lean 4 `Name`, `«foo»` and `foo` denote the identical name component `.str _ "foo"`
+            // whenever `foo` contains no `.` (including keyword components such as `Foo.«end».H` vs
+            // `Foo.end.H` and `«end»` vs `_root_.end`); keep guillemets only when `unq` would
+            // introduce a `.` split or empty/hole/non-ident ambiguity.
             let is_plain_ident = !unq.is_empty()
                 && unq.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'')
                 && !unq.as_bytes()[0].is_ascii_digit()
-                && unq != "_"
-                && !is_reserved_lean_ident(unq);
+                && unq != "_";
             if is_plain_ident {
                 unq.to_owned()
             } else {
@@ -4051,6 +4050,11 @@ mod opaque_callee_table_tests {
                     "((Handler a)) b",
                     "(Handler a ) b",
                     "Handler (a b)",
+                    "Foo.«end».Handler",
+                    "Foo.end.Handler",
+                    "«end»",
+                    "_root_.end",
+                    "_root_.«end»",
                     "(UnclosedHandler",
                     "/- only comment -/",
                     "DecidableEq.{0}",
@@ -4064,6 +4068,8 @@ mod opaque_callee_table_tests {
                     "Handler.{1}",
                     "Handler a b",
                     "Handler (a b)",
+                    "Foo.«end».Handler",
+                    "«end»",
                     "(UnclosedHandler",
                     "DecidableEq.{0}",
                 ],
@@ -4102,6 +4108,13 @@ mod opaque_callee_table_tests {
     fn mir_emitter_rejects_injected_namespace() {
         let mir = fixture_mir("demo::x", 0, vec![], 1);
         emit_mir_lean_module("Mir.Demo.X\nimport Anneal.OpaqueCalleeTable\nnamespace Mir.Demo.X", &mir);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid Mir module namespace")]
+    fn mir_emitter_rejects_standalone_keyword_namespace() {
+        let mir = fixture_mir("demo::x", 0, vec![], 1);
+        emit_mir_lean_module("end", &mir);
     }
 
     /// Splits a `deriving` class list on top-level commas outside brackets, comments, strings,
@@ -4424,7 +4437,7 @@ mod opaque_callee_table_tests {
             ("Mir.Demo.AreaMethod", "demo::Area::area", fixture_mir("demo::Area::area", 1, vec![], 4)),
             ("Mir.Demo.LeafShadow", "demo::leaf", fixture_mir("demo::leaf", 0, vec![], 5)),
             ("Mir.Demo.Collide", "demo::leaf", fixture_mir("demo::leaf_2", 0, vec![], 6)),
-            ("Mir.Demo.Weird", "end", weird_mir),
+            ("Mir.Demo.end", "end", weird_mir),
         ];
         let mut entries = Vec::new();
         for (module, hint, mir) in &items {
@@ -4494,8 +4507,9 @@ mod opaque_callee_table_tests {
              Gen.DemoCallees.cert_lookup_free_poly_extra_demo__poly sampleCallerLayouts\n    \
              (RigidTy.uint UintTy.u32) [RigidTy.bool] [sampleUnrelatedImpl] samplePolyLayouts\n    \
              (by decide +kernel) rfl (by decide +kernel)\n\n\
-             -- Captured def paths survive Lean string escaping character-for-character.\n\
-             example : (Mir.Demo.Weird.body).defPath.toList = [{}] := by decide +kernel\n\n\
+             -- Captured def paths survive Lean string escaping character-for-character (including\n\
+             -- inside a module/body whose final component is a Lean keyword `Mir.Demo.end`).\n\
+             example : (Mir.Demo.end.body).defPath.toList = [{}] := by decide +kernel\n\n\
              {axiom_queries}",
             weird_chars.join(", ")
         );

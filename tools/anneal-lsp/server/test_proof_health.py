@@ -5292,6 +5292,26 @@ class TestRule8RedundantBeqDecidableEq(unittest.TestCase):
             ],
         )
 
+        # Parenthesized & leading-dot projections ending in keywords (`.for`, `(sp).for`,
+        # `(sp).end`, `(sp).def y`, `.end`, `.def y`) must neither truncate `deriving` / `for`
+        # lists nor corrupt the enclosing declaration symbol:
+        b4_src = (
+            "structure ProjDefaults where\n"
+            "  a : Nat := (sp).end\n"
+            "  b : Nat := (sp).def otherName\n"
+            "  c : Kw := .end\n"
+            "  d : Kw := .def anotherName\n"
+            "  deriving CustomHandler (sp).for .end (sp).def, BEq, DecidableEq\n"
+            "deriving instance BEq, DecidableEq for Wrap (sp).for .end, TargetAfterProj\n"
+        )
+        self.assertEqual(
+            [(f.line, f.symbol) for f in self._scan8(b4_src)],
+            [
+                (6, "ProjDefaults"),
+                (7, "Wrap,TargetAfterProj"),
+            ],
+        )
+
     def test_post_edit_deltas_and_v7_cache_upgrade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp) / "cache.json"

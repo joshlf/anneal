@@ -8370,6 +8370,7 @@ def _parse_deriving_instance_targets_cursor(cur: _LeanCursor) -> list[str]:
         cur.next()
 
         # Consume remaining outer parens from `(Foo α)` and optional type arguments.
+        prev_dot = False
         while True:
             tk = cur.peek()
             kind, val, _, _, has_nl, col = tk
@@ -8383,18 +8384,25 @@ def _parse_deriving_instance_targets_cursor(cur: _LeanCursor) -> list[str]:
                     _consume_balanced_group(cur)
                 else:
                     cur.next()
+                prev_dot = False
                 continue
             if has_nl and col == 0:
                 break
             if kind == "punct" and val == ",":
                 break
-            if kind == "ident" and (val in _DERIVING_STOP_WORDS or val == "for" or (val == "lemma" and has_nl)):
+            if (
+                kind == "ident"
+                and not prev_dot
+                and (val in _DERIVING_STOP_WORDS or val == "for" or (val == "lemma" and has_nl))
+            ):
                 break
             if kind == "punct" and (val in ("@[", "#", ":=", ":", "|") or val in _RBD_CLOSING_BRACKETS):
                 break
             if kind == "punct" and val in _RBD_BRACKETS:
                 _consume_balanced_group(cur)
+                prev_dot = False
             elif kind in ("ident", "lit") or (kind == "punct" and val in ("@", ".")):
+                prev_dot = kind == "punct" and val == "."
                 cur.next()
             else:
                 break
@@ -8452,12 +8460,14 @@ def _parse_deriving_clause_at(text: str, after_deriving: int) -> tuple[bool, lis
         cur.next()
 
         has_term_arg = False
+        prev_dot = False
         if cur.peek()[:2] == ("punct", "."):
             cur.next()
             if cur.peek()[:2] == ("punct", "{"):
                 _consume_balanced_group(cur)
             else:
                 has_term_arg = True
+                prev_dot = True
 
         while True:
             tk = cur.peek()
@@ -8474,20 +8484,27 @@ def _parse_deriving_clause_at(text: str, after_deriving: int) -> tuple[bool, lis
                 else:
                     has_term_arg = True
                     cur.next()
+                prev_dot = False
                 continue
             if has_nl and col == 0:
                 break
             if kind == "punct" and val == ",":
                 break
-            if kind == "ident" and (val in _DERIVING_STOP_WORDS or val == "for" or (val == "lemma" and has_nl)):
+            if (
+                kind == "ident"
+                and not prev_dot
+                and (val in _DERIVING_STOP_WORDS or val == "for" or (val == "lemma" and has_nl))
+            ):
                 break
             if kind == "punct" and (val in ("@[", "#", ":=", ":", "|") or val in _RBD_CLOSING_BRACKETS):
                 break
             if kind == "punct" and val in _RBD_BRACKETS:
                 has_term_arg = True
                 _consume_balanced_group(cur)
+                prev_dot = False
             elif kind in ("ident", "lit") or (kind == "punct" and val in ("@", ".")):
                 has_term_arg = True
+                prev_dot = kind == "punct" and val == "."
                 cur.next()
             else:
                 break
@@ -8526,6 +8543,7 @@ def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str
     cur = _LeanCursor(text, start=best_anchor, end=deriving_pos)
     depth = 0
     prev_bar = False
+    prev_dot = False
     enclosing: str | None = None
     while True:
         kind, val, _, _, has_nl, col = cur.next()
@@ -8539,7 +8557,12 @@ def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str
             elif val == "#" and depth == 0:
                 enclosing = None
             prev_bar = val == "|" and depth == 0
+            prev_dot = val == "." and depth == 0
         elif kind == "ident" and depth == 0:
+            if prev_dot:
+                prev_dot = False
+                prev_bar = False
+                continue
             if val in _DERIVING_INLINE_DECL_KWS:
                 nxt = cur.peek()
                 if val == "class" and nxt[:2] == ("ident", "inductive"):
@@ -8557,8 +8580,10 @@ def _extract_enclosing_decl_name(text: str, code: str, deriving_pos: int) -> str
                 # declaration; if `in <decl>` follows, `<decl>` immediately sets `enclosing`.
                 enclosing = None
             prev_bar = False
+            prev_dot = False
         else:
             prev_bar = False
+            prev_dot = False
     return enclosing
 
 
