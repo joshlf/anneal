@@ -30812,9 +30812,10 @@ fields (`()`, `PhantomData<Infallible>`, `[Infallible; 0]`, `[(); 3]`, `[(); 3][
 `V` and `V.y`) read their values, while the uninhabited fields `!`, `Infallible`,
 `(Infallible, ())`, `[Infallible; 1]`, `ManuallyDrop<Infallible>`, `(Infallible, u32)`, and the
 sub-places `pair.1`, `arr1[0]`, `md.value`, `V.p`, `V.p.1`, `pair_u32.0`, `pair_u32.1` (whose
-`u32` leaf is positive-sized), and `arr2_v[0..-1][0].p.1` (whose `(CustomVoid, ())` container has
-unresolved `layoutIdx = 0` and is reached after a `fromEnd = true` subslice + `constantIndex`)
-fault with `.ub`. -/
+`u32` leaf is positive-sized), and `arr2_v[0..-1][0].p.1` (which faults via the 0-byte field-root
+path and whose `(CustomVoid, ())` container with unresolved `layoutIdx = 0` is also caught by
+`subProjTouchesUninhabited` after a `fromEnd = true` subslice + `constantIndex`) fault with
+`.ub`. -/
 theorem kani5159_witness_reads :
     readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 0 wU32Ty] =
         .ok (.scalar ⟨42, 4⟩) ∧
@@ -30858,7 +30859,11 @@ theorem kani5159_witness_reads :
 
 /-- Non-vacuity of the general field-root and sub-projection theorems on `wUVal`. -/
 theorem kani5159_witness_general_instances :
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 0 wU32Ty] =
+      .ok (.scalar ⟨42, 4⟩) ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 1 wUnitTy] = .ok .unit ∧
     readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 3 wInfTy] = .ub ∧
+    tyIsUninhabited wLayouts (unionFieldReadTy wDecls wLayouts wULayout 3 wInfTy) = true ∧
     readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 4 wPairTy] = .ub ∧
     readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 7 wPhTy] =
       .ok (zeroByteValue wLayouts wPhTy) ∧
@@ -30883,10 +30888,17 @@ theorem kani5159_witness_general_instances :
     obtain ⟨j, rfl⟩ : ∃ j, i = j + 1 := ⟨i - 1, by omega⟩
     unfold get?
     simpa using get?_replicateValue 12 j .unit (by omega)
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl⟩
-  · exact kani5159_uninhabited_field_root_ub [] wDecls wLayouts wUTy wInfTy _ 3 13 wULayout "U" [] rfl rfl
+  have hInfUb : readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 3 wInfTy] = .ub :=
+    kani5159_uninhabited_field_root_ub [] wDecls wLayouts wUTy wInfTy _ 3 13 wULayout "U" [] rfl rfl
       rfl (by decide) (Or.inl rfl) (hSlot 3 (by decide) (by decide) _ (by intro h; cases h) (by intro p a h; cases h))
       rfl (Or.inl rfl)
+  refine ⟨?_, ?_, hInfUb, ?_, ?_, ?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl⟩
+  · exact readUnion_activeSlot_root [] wDecls wLayouts wUTy wU32Ty _ 0 13 wULayout "U" [] rfl rfl rfl
+      (by decide) rfl (.scalar ⟨42, 4⟩) rfl (by intro h; cases h)
+  · exact readUnion_unitKind_unitSlot_root [] wDecls wLayouts wUTy wUnitTy _ 1 13 wULayout "U" [] rfl
+      rfl rfl (by decide) (Or.inl rfl) rfl (Or.inl rfl)
+  · exact readUnion_zeroByte_root_ub_imp_uninhabited [] wDecls wLayouts wUTy wInfTy _ 3 13 wULayout
+      "U" [] rfl rfl rfl (by decide) rfl rfl hInfUb
   · exact kani5159_uninhabited_field_root_ub [] wDecls wLayouts wUTy wPairTy _ 4 13 wULayout "U" [] rfl
       rfl rfl (by decide) (Or.inl rfl)
       (hSlot 4 (by decide) (by decide) _ (by intro h; cases h) (by intro p a h; cases h)) rfl (Or.inr rfl)
@@ -30898,10 +30910,11 @@ theorem kani5159_witness_general_instances :
       (by decide) (Or.inl rfl)
       (hSlot 10 (by decide) (by decide) _ (by intro h; cases h) (by intro p a h; cases h))
       (.field 0 wPairTy) [] [.field 0 wPairTy] rfl rfl 0 rfl wPairTy rfl rfl
-  · exact kani5159_uninhabited_subProj_ub [] wDecls wLayouts wUTy wPairU32Ty _ 11 13 wULayout "U" [] rfl
-      rfl rfl (by decide) (Or.inl rfl)
+  · have hPos := readUnion_posLeaf_subProj [] wDecls wLayouts wUTy wPairU32Ty _ 11 13 wULayout "U" [] rfl
+      rfl rfl (by decide)
       (hSlot 11 (by decide) (by decide) _ (by intro h; cases h) (by intro p a h; cases h))
-      (.field 1 wU32Ty) [] [.field 1 wU32Ty] rfl rfl 0 rfl wU32Ty rfl rfl
+      _ rfl (.field 1 wU32Ty) [] [.field 1 wU32Ty] rfl rfl 0 rfl wU32Ty rfl 3 rfl
+    exact hPos
   · exact (readUnion_zeroByte_subProj_iff [] wDecls wLayouts wUTy wVTy _ 10 13 wULayout "U" [] rfl rfl
       rfl (by decide) (Or.inl rfl) (hSlot 10 (by decide) (by decide) _ (by intro h; cases h)
         (by intro p a h; cases h))
@@ -30997,9 +31010,14 @@ theorem kani5176_witness_general_instances :
       (by intro b hb; simp at hb; rcases hb with rfl | rfl <;> trivial) 3 rfl rfl
 
 /-- **`kani#5159` at the MIR place-read level.** `evalPlaceRead` (the read behind
-`copy`/`move` operands) of `wUVal`'s uninhabited 0-byte fields and sub-places faults with `.ub`,
-while its inhabited 0-byte fields and sub-places read their canonical values. -/
+`copy`/`move` operands) of `wUVal`'s uninhabited fields and sub-places (including the positive-sized
+`u32` leaf of `(Infallible, u32)`) faults with `.ub`, while its active field and inhabited 0-byte
+fields and sub-places read their values. -/
 theorem kani5159_witness_evalPlaceRead :
+    evalPlaceRead [.init wUVal] ⟨0, [.field 0 wU32Ty]⟩ [] [] wLayouts [] wDecls =
+      .ok (.scalar ⟨42, 4⟩) [.init wUVal] ∧
+    evalPlaceRead [.init wUVal] ⟨0, [.field 1 wUnitTy]⟩ [] [] wLayouts [] wDecls =
+      .ok .unit [.init wUVal] ∧
     evalPlaceRead [.init wUVal] ⟨0, [.field 3 wInfTy]⟩ [] [] wLayouts [] wDecls = .ub ∧
     evalPlaceRead [.init wUVal] ⟨0, [.field 4 wPairTy]⟩ [] [] wLayouts [] wDecls = .ub ∧
     evalPlaceRead [.init wUVal] ⟨0, [.field 4 wPairTy, .field 1 wUnitTy]⟩ [] [] wLayouts []
@@ -31008,13 +31026,15 @@ theorem kani5159_witness_evalPlaceRead :
       wDecls = .ub ∧
     evalPlaceRead [.init wUVal] ⟨0, [.field 10 wVTy, .field 0 wPairTy, .field 1 wUnitTy]⟩ [] []
       wLayouts [] wDecls = .ub ∧
+    evalPlaceRead [.init wUVal] ⟨0, [.field 11 wPairU32Ty, .field 1 wU32Ty]⟩ [] []
+      wLayouts [] wDecls = .ub ∧
     evalPlaceRead [.init wUVal] ⟨0, [.field 7 wPhTy]⟩ [] [] wLayouts [] wDecls =
       .ok (.aggregate 0 []) [.init wUVal] ∧
     evalPlaceRead [.init wUVal] ⟨0, [.field 9 wZArrTy, .constantIndex 2 3 false]⟩ [] [] wLayouts []
       wDecls = .ok .unit [.init wUVal] ∧
     evalPlaceRead [.init wUVal] ⟨0, [.field 10 wVTy, .field 1 wUnitTy]⟩ [] [] wLayouts [] wDecls =
       .ok .unit [.init wUVal] := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> rfl
 
 /-! `readUnion_zeroByte_fieldRoot` witness: `enum E { A(()), B(Infallible) }`, zero-sized because
 `B` is absent (laid out as `A`'s fields), in `union UE { e: E, x: u32 }`. A downcast is not

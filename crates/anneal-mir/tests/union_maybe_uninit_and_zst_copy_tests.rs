@@ -3058,24 +3058,37 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
 // Adversarial round ep1-A3 regression tests
 // ---------------------------------------------------------------------------------------------
 
-/// `kani#5159` through `copy` / `move` operands, mirroring `AdtAndControl.lean`'s
-/// `kani5159_witness_evalPlaceRead` (`Trusted.MirSemantics`' `evalPlaceRead`, the read behind
-/// both operands): assigning from an uninhabited zero-sized union field, or from a place through
-/// an uninhabited container, fails and leaves the destination and the union untouched, while
-/// inhabited zero-sized fields and sub-places assign their unique value.
+/// `kani#5159` through `copy` / `move` operands and non-static enum `Downcast` sub-projections,
+/// mirroring `AdtAndControl.lean`'s `kani5159_witness_evalPlaceRead` and
+/// `kani5159_witness_fieldRoot_downcast` (`Trusted.MirSemantics`' `evalPlaceRead` and
+/// `readUnion_zeroByte_fieldRoot`): assigning from an uninhabited union field, from a place
+/// (0-byte or positive-sized) through an uninhabited container, or from an uninhabited variant of
+/// an inhabited 0-byte enum union field fails and leaves the destination and the union untouched,
+/// while inhabited 0-byte fields, sub-places, and present enum variants assign their unique value.
 #[test]
 fn a3_kani_5159_operand_reads_of_uninhabited_zero_sized_union_fields_fail() {
     let inf = infallible();
     let pair = Ty::Tuple(vec![inf.clone(), unit()]);
+    let pair_u32 = Ty::Tuple(vec![inf.clone(), u32_ty()]);
     let (phantom_def, phantom_ty) = adt(AdtDef::new_struct("core::marker::PhantomData", vec![]));
+    let (e_def, e_ty) = adt(AdtDef::new_enum(
+        "E",
+        None,
+        vec![
+            VariantDef::new("A", vec![unit()]),
+            VariantDef::new("B", vec![inf.clone()]),
+        ],
+    ));
     // `union K { val: u32, inf: Infallible, pair: (Infallible, ()), phantom:
-    // PhantomData<Infallible>, zarr: [(); 3] }`.
+    // PhantomData<Infallible>, zarr: [(); 3], pair_u32: (Infallible, u32), e: E }`.
     let fields = vec![
         u32_ty(),
         inf.clone(),
         pair.clone(),
         phantom_ty.clone(),
         arr(unit(), 3),
+        pair_u32.clone(),
+        e_ty.clone(),
     ];
     let (u_def, u_ty) = adt(AdtDef::new_union("K", fields.clone()));
     let f = |idx: usize| field(idx, fields[idx].clone());
@@ -3086,6 +3099,8 @@ fn a3_kani_5159_operand_reads_of_uninhabited_zero_sized_union_fields_fail() {
             unit(),
             phantom_ty.clone(),
             arr(unit(), 3),
+            u32_ty(),
+            e_ty.clone(),
         ];
         let mut state = StatementEvalState::from_local_decls(decls, pw);
         let init = MirValue::union_value(&u_def, 0, MirValue::unsigned(42, UintTy::U32, pw));
@@ -3097,9 +3112,10 @@ fn a3_kani_5159_operand_reads_of_uninhabited_zero_sized_union_fields_fail() {
             })
         };
         let before = |state: &StatementEvalState, l: usize| state.get_local(Local(l)).cloned();
-        let (dst1, dst2) = (before(&state, 1), before(&state, 2));
-        // `_1 = copy _0.inf`, `_2 = copy _0.pair.1`, and `_2 = move _0.pair.1` are undefined
-        // behavior: `Infallible` has no value, and `()` is read through `(Infallible, ())`.
+        let (dst1, dst2, dst5) = (before(&state, 1), before(&state, 2), before(&state, 5));
+        // `_1 = copy _0.inf`, `_2 = copy _0.pair.1`, `_2 = move _0.pair.1`,
+        // `_5 = copy _0.pair_u32.1`, and `_5 = move _0.pair_u32.1` are undefined behavior:
+        // `Infallible` has no value, and `()` / `u32` are read through uninhabited tuples.
         assert_eq!(
             run(assign(local(1), copy_of(proj(0, vec![f(1)]))), &mut state),
             inactive(1),
@@ -3124,10 +3140,49 @@ fn a3_kani_5159_operand_reads_of_uninhabited_zero_sized_union_fields_fail() {
             inactive(2),
             "{pw:?}"
         );
+        assert_eq!(
+            run(
+                assign(local(5), copy_of(proj(0, vec![f(5), field(1, u32_ty())]))),
+                &mut state
+            ),
+            inactive(5),
+            "{pw:?}"
+        );
+        assert_eq!(
+            run(
+                assign(
+                    local(5),
+                    Rvalue::Use(Operand::Move(proj(0, vec![f(5), field(1, u32_ty())])))
+                ),
+                &mut state
+            ),
+            inactive(5),
+            "{pw:?}"
+        );
+        // `(_0.e as B).0` downcasts the inhabited 0-byte enum `E` to its uninhabited variant `B`.
+        assert_eq!(
+            run(
+                assign(
+                    local(1),
+                    copy_of(proj(
+                        0,
+                        vec![f(6), ProjectionElem::Downcast(1), field(0, inf.clone())]
+                    ))
+                ),
+                &mut state
+            ),
+            Err(RvalueEvalError::InactiveVariantProjection {
+                expected: 1,
+                actual: 0,
+            }),
+            "{pw:?}"
+        );
         assert_eq!(before(&state, 1), dst1, "{pw:?}");
         assert_eq!(before(&state, 2), dst2, "{pw:?}");
-        // `_3 = copy _0.phantom`, `_4 = copy _0.zarr`, and `_2 = copy _0.zarr[2]` assign the
-        // unique values of the inhabited zero-sized field and sub-place.
+        assert_eq!(before(&state, 5), dst5, "{pw:?}");
+        // `_3 = copy _0.phantom`, `_4 = copy _0.zarr`, `_2 = copy _0.zarr[2]`, `_6 = copy _0.e`,
+        // and `_2 = copy (_0.e as A).0` assign the unique values of the inhabited zero-sized
+        // fields and sub-places.
         run(assign(local(3), copy_of(proj(0, vec![f(3)]))), &mut state).unwrap();
         assert_eq!(
             state.get_init(Local(3)),
@@ -3137,6 +3192,23 @@ fn a3_kani_5159_operand_reads_of_uninhabited_zero_sized_union_fields_fail() {
         assert_eq!(state.get_init(Local(4)), Some(&units(3)));
         run(
             assign(local(2), copy_of(proj(0, vec![f(4), cidx(2, 3)]))),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.get_init(Local(2)), Some(&MirValue::Unit));
+        run(assign(local(6), copy_of(proj(0, vec![f(6)]))), &mut state).unwrap();
+        assert_eq!(
+            state.get_init(Local(6)),
+            Some(&MirValue::adt(&e_def, 0, vec![MirValue::Unit]))
+        );
+        run(
+            assign(
+                local(2),
+                copy_of(proj(
+                    0,
+                    vec![f(6), ProjectionElem::Downcast(0), field(0, unit())],
+                )),
+            ),
             &mut state,
         )
         .unwrap();
