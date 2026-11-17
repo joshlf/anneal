@@ -3059,12 +3059,13 @@ fn a2_kani_5159_uninhabited_zero_sized_union_fields_and_subplaces_fault() {
 // ---------------------------------------------------------------------------------------------
 
 /// `kani#5159` through `copy` / `move` operands and non-static enum `Downcast` sub-projections,
-/// mirroring `AdtAndControl.lean`'s `kani5159_witness_evalPlaceRead` and
-/// `kani5159_witness_fieldRoot_downcast` (`Trusted.MirSemantics`' `evalPlaceRead` and
-/// `readUnion_zeroByte_fieldRoot`): assigning from an uninhabited union field, from a place
-/// (0-byte or positive-sized) through an uninhabited container, or from an uninhabited variant of
-/// an inhabited 0-byte enum union field fails and leaves the destination and the union untouched,
-/// while inhabited 0-byte fields, sub-places, and present enum variants assign their unique value.
+/// mirroring `AdtAndControl.lean`'s `kani5159_witness_evalPlaceRead` (reads through
+/// `Trusted.MirSemantics`' `evalPlaceRead`, the read behind both operands) and
+/// `kani5159_witness_fieldRoot_downcast` (an instance of `readUnion_zeroByte_fieldRoot`): assigning
+/// from an uninhabited union field, from a place (0-byte or positive-sized) through an uninhabited
+/// container, or from an uninhabited variant of an inhabited 0-byte enum union field fails and
+/// leaves the destination and the union untouched, while inhabited 0-byte fields, sub-places, and
+/// present enum variants assign their unique value.
 #[test]
 fn a3_kani_5159_operand_reads_of_uninhabited_zero_sized_union_fields_fail() {
     let inf = infallible();

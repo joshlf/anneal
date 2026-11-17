@@ -359,8 +359,8 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      and otherwise returns its canonical value (`readUnion_zeroByte_root`,
      `readUnion_zeroByte_root_ub_iff`, `readUnion_zeroByte_root_ok_iff`); the remaining slot
      states (`()` / function-item `.unit` slots, active slots) never fault
-     (`readUnion_unitKind_unitSlot_root`, `readUnion_activeSlot_root`), so `.ub` at a 0-byte
-     field root implies uninhabitedness for every slot state
+     (`readUnion_unitKind_unitSlot_root`, `readUnion_activeSlot_root`), and `.ub` at a 0-byte
+     field root implies uninhabitedness for every union value and slot state
      (`readUnion_zeroByte_root_ub_imp_uninhabited`); an uninhabited field of undetermined size
      such as `(Infallible, ())` faults as well (`readUnion_unsized_root`,
      `kani5159_uninhabited_field_root_ub`); a statically bounded sub-place faults when the field,
@@ -375,7 +375,8 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      `kani5176_uninit_storage_int_field_ub`).
    - Kernel-checked witnesses on `rustc`-shaped layout tables (`kani5159_witness_reads`,
      `kani5159_witness_general_instances`, `kani5159_witness_evalPlaceRead` at the MIR place-read
-     level, `kani5159_witness_fieldRoot_downcast`, `kani5176_witness_reads`,
+     level, `kani5159_witness_fieldRoot_downcast` and `kani5159_witness_arr2v_fieldRoot_path` on
+     the non-static field-root path, `kani5176_witness_reads`,
      `kani5176_witness_general_instances`), mirrored by
      `crates/anneal-mir/tests/union_maybe_uninit_and_zst_copy_tests.rs`.
 -/
@@ -30037,11 +30038,13 @@ theorem readUnion_activeSlot_root
   | ptr _ _ => rfl
   | aggregate _ _ => rfl
 
-/-- **`kani#5159`, no spurious `.ub` at a 0-byte field root.** On a union value that needs no
-consistency check, a 0-byte field read faults with `.ub` only if the field is uninhabited —
-whatever the slot holds (absent, the `.unit` placeholder, or an active value). Together with
-`readUnion_zeroByte_root_ub_iff` (inactive slots: `.ub` iff uninhabited) this pins `.ub` to
-uninhabitedness exactly. -/
+/-- **`kani#5159`, no spurious `.ub` at a 0-byte field root.** For every union value, a 0-byte
+field read faults with `.ub` only if the field is uninhabited. This holds whatever the slot holds
+(absent, the `.unit` placeholder, or an active value) and whether or not the value needs a
+consistency check: a failed image gate is `.unsupported`, an active slot (or a `()` / function-item
+`.unit` slot) is returned as stored, and only the inactive 0-byte arm faults, exactly on
+`tyIsUninhabited`. Together with `readUnion_zeroByte_root_ub_iff` (inactive slots of well-formed
+values: `.ub` iff uninhabited) this pins `.ub` to uninhabitedness exactly. -/
 theorem readUnion_zeroByte_root_ub_imp_uninhabited
     (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (baseTy fieldTy : Ty) (fields : List Value) (idx count : Nat) (l : TypeLayout)
@@ -30051,29 +30054,32 @@ theorem readUnion_zeroByte_root_ub_imp_uninhabited
       some l)
     (hFields : l.fields = .union count)
     (hIdx : idx < count)
-    (hCons : unionNeedsConsistencyCheck count fields = false)
     (hSz : tyByteSize localDecls layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = some 0)
     (hUb : readProjectedValueUnionAware locals localDecls layouts (.aggregate 0 fields) baseTy
         [.field idx fieldTy] = .ub) :
     tyIsUninhabited layouts (unionFieldReadTy localDecls layouts l idx fieldTy) = true := by
-  cases hS : get? fields idx with
-  | none =>
-    exact (readUnion_zeroByte_root_ub_iff locals localDecls layouts baseTy fieldTy fields idx count
-      l d args hKind hLookup hFields hIdx (Or.inl hCons) (Or.inl hS) hSz).mp hUb
-  | some fv =>
-    by_cases hU : fv = .unit
-    · subst hU
-      by_cases hUnit : fieldTy.kind = .tuple [] ∨ ∃ p a, fieldTy.kind = .fnDef p a
-      · rw [readUnion_unitKind_unitSlot_root locals localDecls layouts baseTy fieldTy fields idx count
-          l d args hKind hLookup hFields hIdx (Or.inl hCons) hS hUnit] at hUb
-        nomatch hUb
-      · have hNU : fieldTy.kind ≠ .tuple [] := fun h => hUnit (Or.inl h)
-        have hNF : ∀ p a, fieldTy.kind ≠ .fnDef p a := fun p a h => hUnit (Or.inr ⟨p, a, h⟩)
-        exact (readUnion_zeroByte_root_ub_iff locals localDecls layouts baseTy fieldTy fields idx
-          count l d args hKind hLookup hFields hIdx (Or.inl hCons) (Or.inr ⟨hS, hNU, hNF⟩) hSz).mp hUb
-    · rw [readUnion_activeSlot_root locals localDecls layouts baseTy fieldTy fields idx count l d args
-        hKind hLookup hFields hIdx hCons fv hS hU] at hUb
-      nomatch hUb
+  have hBle : Nat.ble (idx + 1) count = true := Nat.ble_eq.mpr hIdx
+  unfold readProjectedValueUnionAware at hUb
+  dsimp only at hUb
+  rw [hKind, hLookup] at hUb
+  dsimp only at hUb
+  rw [hFields] at hUb
+  dsimp only at hUb
+  rw [hBle] at hUb
+  simp only [] at hUb
+  unfold unionFieldReadTy at hSz ⊢
+  cases hg : get? l.fieldLayouts idx <;>
+    cases hu : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;>
+    simp only [hu, hg] at hSz hUb ⊢
+  all_goals
+    split at hUb
+    · nomatch hUb
+    · simp [readProjectedValueUnionAware] at hUb
+    · rw [hSz] at hUb
+      simp only [] at hUb
+      split at hUb
+      · assumption
+      · simp [readProjectedValueUnionAware] at hUb
 
 /-! ### Section 6c: Offset-0 decoding of positive-sized union fields -/
 
@@ -30812,10 +30818,9 @@ fields (`()`, `PhantomData<Infallible>`, `[Infallible; 0]`, `[(); 3]`, `[(); 3][
 `V` and `V.y`) read their values, while the uninhabited fields `!`, `Infallible`,
 `(Infallible, ())`, `[Infallible; 1]`, `ManuallyDrop<Infallible>`, `(Infallible, u32)`, and the
 sub-places `pair.1`, `arr1[0]`, `md.value`, `V.p`, `V.p.1`, `pair_u32.0`, `pair_u32.1` (whose
-`u32` leaf is positive-sized), and `arr2_v[0..-1][0].p.1` (which faults via the 0-byte field-root
-path and whose `(CustomVoid, ())` container with unresolved `layoutIdx = 0` is also caught by
-`subProjTouchesUninhabited` after a `fromEnd = true` subslice + `constantIndex`) fault with
-`.ub`. -/
+`u32` leaf is positive-sized), and `arr2_v[0..-1][0].p.1` fault with `.ub`. The last read is not
+statically bounded, so it takes the 0-byte field-root path and faults in `V`'s own union read of
+`p.1` (`kani5159_witness_arr2v_fieldRoot_path`). -/
 theorem kani5159_witness_reads :
     readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy [.field 0 wU32Ty] =
         .ok (.scalar ⟨42, 4⟩) ∧
@@ -30898,7 +30903,7 @@ theorem kani5159_witness_general_instances :
   · exact readUnion_unitKind_unitSlot_root [] wDecls wLayouts wUTy wUnitTy _ 1 13 wULayout "U" [] rfl
       rfl rfl (by decide) (Or.inl rfl) rfl (Or.inl rfl)
   · exact readUnion_zeroByte_root_ub_imp_uninhabited [] wDecls wLayouts wUTy wInfTy _ 3 13 wULayout
-      "U" [] rfl rfl rfl (by decide) rfl rfl hInfUb
+      "U" [] rfl rfl rfl (by decide) rfl hInfUb
   · exact kani5159_uninhabited_field_root_ub [] wDecls wLayouts wUTy wPairTy _ 4 13 wULayout "U" [] rfl
       rfl rfl (by decide) (Or.inl rfl)
       (hSlot 4 (by decide) (by decide) _ (by intro h; cases h) (by intro p a h; cases h)) rfl (Or.inr rfl)
@@ -31077,6 +31082,56 @@ theorem kani5159_witness_fieldRoot_downcast :
   exact readUnion_zeroByte_fieldRoot [] wDeclsE wLayoutsE wUETy wETy _ 0 2 wUELayout "UE" [] rfl rfl
     rfl (by decide) (Or.inl rfl) (Or.inr ⟨rfl, (by intro h; cases h), (by intro p a h; cases h)⟩) rfl
     (.downcast (some "A") 0) [.field 0 wUnitTy] [.downcast (some "A") 0, .field 0 wUnitTy] rfl rfl
+
+/-- **`arr2_v[0..-1][0].p.1` and `arr2_v[0..-1][0].y`, step by step.** The sub-projection after
+`arr2_v` is not statically bounded: the `fromEnd = true` subslice's synthesized `[V; 1]` type has
+no captured layout, so `checkStaticSubProjBounds` cannot reach `V`'s fields. The read therefore
+takes the 0-byte field-root path (`readUnion_zeroByte_fieldRoot`, here on a subslice rather than a
+downcast): the inhabited `[V; 2]` is decoded from zero bytes as two all-inactive `V` values, and
+the subslice and constant index select one `V`. `V`'s own union read of `p.1` then faults, because
+`p`'s unresolved `(CustomVoid, ())` type resolves through `V`'s `fieldLayouts` to an uninhabited
+layout (`kani5159_uninhabited_subProj_ub`). `y` reads `()`. `subProjTouchesUninhabited` would
+also flag the whole chain (`kani5159_witness_general_instances`), but this path never consults it.
+`crates/anneal-mir` agrees: the same `p.1` read fails in `V` (`InactiveUnionField` with
+`requested_field: 0`) and `y` reads `MirValue::Unit`. -/
+theorem kani5159_witness_arr2v_fieldRoot_path :
+    checkStaticSubProjBounds wDecls wLayouts wArr2VTy
+        (normalizeSubsliceProjections (stripTransparentProjections
+          [.subslice 0 1 true, .constantIndex 0 1 false, .field 0 wVoidPairUnresolvedTy,
+           .field 1 wUnitTy])) = false ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
+        [.field 12 wArr2VTy, .subslice 0 1 true, .constantIndex 0 1 false,
+         .field 0 wVoidPairUnresolvedTy, .field 1 wUnitTy] =
+      (match tyIsUninhabited wLayouts (unionFieldReadTy wDecls wLayouts wULayout 12 wArr2VTy) with
+      | true => .ub
+      | false =>
+        readProjectedValueUnionAware [] wDecls wLayouts
+          (zeroByteValue wLayouts (unionFieldReadTy wDecls wLayouts wULayout 12 wArr2VTy))
+          (unionFieldReadTy wDecls wLayouts wULayout 12 wArr2VTy)
+          [.subslice 0 1 true, .constantIndex 0 1 false, .field 0 wVoidPairUnresolvedTy,
+           .field 1 wUnitTy]) ∧
+    tyIsUninhabited wLayouts (unionFieldReadTy wDecls wLayouts wULayout 12 wArr2VTy) = false ∧
+    zeroByteValue wLayouts wArr2VTy =
+      .aggregate 0 [.aggregate 0 [.unit, .unit], .aggregate 0 [.unit, .unit]] ∧
+    readProjectedValueUnionAware [] wDecls wLayouts (.aggregate 0 [.unit, .unit]) wVTy
+        [.field 0 wVoidPairUnresolvedTy, .field 1 wUnitTy] = .ub ∧
+    tyIsUninhabited wLayouts
+      (unionFieldReadTy wDecls wLayouts (wZstLayout (.union 2) (.single 0) false [4, 1]) 0
+        wVoidPairUnresolvedTy) = true ∧
+    readProjectedValueUnionAware [] wDecls wLayouts wUVal wUTy
+        [.field 12 wArr2VTy, .subslice 0 1 true, .constantIndex 0 1 false, .field 1 wUnitTy] =
+      .ok .unit := by
+  refine ⟨rfl, ?_, rfl, rfl, ?_, rfl, rfl⟩
+  · exact readUnion_zeroByte_fieldRoot [] wDecls wLayouts wUTy wArr2VTy _ 12 13 wULayout "U" [] rfl rfl
+      rfl (by decide) (Or.inl rfl) (Or.inr ⟨rfl, (by intro h; cases h), (by intro p a h; cases h)⟩)
+      rfl (.subslice 0 1 true)
+      [.constantIndex 0 1 false, .field 0 wVoidPairUnresolvedTy, .field 1 wUnitTy]
+      [.subslice 0 1 true, .constantIndex 0 1 false, .field 0 wVoidPairUnresolvedTy, .field 1 wUnitTy]
+      rfl rfl
+  · exact kani5159_uninhabited_subProj_ub [] wDecls wLayouts wVTy wVoidPairUnresolvedTy [.unit, .unit] 0 2
+      (wZstLayout (.union 2) (.single 0) false [4, 1]) "V" [] rfl rfl rfl (by decide) (Or.inl rfl)
+      (Or.inr ⟨rfl, (by intro h; cases h), (by intro p a h; cases h)⟩)
+      (.field 1 wUnitTy) [] [.field 1 wUnitTy] rfl rfl 0 rfl wUnitTy rfl rfl
 
 end UnionZst
 
