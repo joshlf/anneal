@@ -1919,6 +1919,261 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertTrue(marker.is_file(), "same-group child was SIGKILLed before grace window")
             self.assertEqual(marker.read_text(), "grace-ok")
 
+    def test_flip_direction_guard_hardens_parser_tautology_pin_and_transition_bypasses(self) -> None:
+        div_id = "DIV-LM-ENUM-SET-DISCR-UNINIT"
+        sym = "step_setDiscriminant_uninit_simulation"
+        lm23 = "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+        pin_div = "DIV-MR-CALL-TARGET-LOCAL"
+        pin_sym = "callerRefMutSilentWrongLocal_simulation"
+        stmt = SYNTH_STMT
+
+        # 1. Guillemet-escaped / `_root_`-qualified logicals, tautological self-implications,
+        #    contradictory hypotheses, prefix connectives, vacuous existentials, literal
+        #    contradictions, nested holes, tactic-typed binders, `where` modifier/attribute
+        #    helpers, `in`-scoped tactic commands, and `mutual` sibling holes are all rejected.
+        bypass_theorems: list[tuple[str, set[str]]] = [
+            (": «True» := trivial", {"vacuous_statement", "closed_trivial_statement"}),
+            (": _root_.True := trivial", {"vacuous_statement", "closed_trivial_statement"}),
+            (f": «False» → {stmt} := fun h => h.elim", {"vacuous_statement"}),
+            (f": _root_.False → {stmt} := fun h => h.elim", {"vacuous_statement"}),
+            (f": {stmt} := «sorryAx» _ false", {"sorry_or_admit"}),
+            (f": {stmt} := by native_decide", {"sorry_or_admit"}),
+            # Circular / tautological hypotheses and excluded middle.
+            (f"(h : {stmt}) : {stmt} := h", {"vacuous_statement"}),
+            (f": {stmt} → {stmt} := id", {"vacuous_statement"}),
+            (
+                ": ∀ x, annealOutcome x = miriOutcome x → stepMirFn x = .ub → "
+                "annealOutcome x = miriOutcome x := fun _ h _ => h",
+                {"vacuous_statement"},
+            ),
+            (
+                f": ({stmt} ∧ stepMirFn fooProg = .ub) → {stmt} := And.left",
+                {"vacuous_statement"},
+            ),
+            (
+                f"(h : {stmt}) : {stmt} ∨ stepMirFn fooProg = .ub := Or.inl h",
+                {"vacuous_statement"},
+            ),
+            (
+                ": annealOutcome fooProg = miriOutcome fooProg ∨ "
+                "annealOutcome fooProg ≠ miriOutcome fooProg := Classical.em _",
+                {"vacuous_statement"},
+            ),
+            (
+                f"(h1 : stepMirFn fooProg = .ub) (h2 : stepMirFn fooProg ≠ .ub) : {stmt} := "
+                "absurd h1 h2",
+                {"vacuous_statement"},
+            ),
+            (
+                f"(h : stepMirFn fooProg = .ub ∧ ¬(stepMirFn fooProg = .ub)) : {stmt} := "
+                "absurd h.1 h.2",
+                {"vacuous_statement"},
+            ),
+            # Prefix logicals, uninhabited/trivial types, and distinct literal contradictions.
+            (": Eq (annealOutcome fooProg) (annealOutcome fooProg) := rfl", {"vacuous_statement"}),
+            (": @Eq Nat (annealOutcome fooProg) (annealOutcome fooProg) := rfl", {"vacuous_statement"}),
+            (f": Iff ({stmt}) ({stmt}) := Iff.rfl", {"vacuous_statement"}),
+            (f": Or True ({stmt}) := Or.inl trivial", {"vacuous_statement"}),
+            (f": And False ({stmt}) → {stmt} := fun h => h.1.elim", {"vacuous_statement"}),
+            (f"(h : Fin 0) : {stmt} := h.elim0", {"vacuous_statement"}),
+            (f"(h : ULift False) : {stmt} := h.down.elim", {"vacuous_statement"}),
+            (": PLift True := ⟨trivial⟩", {"vacuous_statement", "closed_trivial_statement"}),
+            (f": (0 = 1) → {stmt} := nofun", {"vacuous_statement"}),
+            (f": (true = false) → {stmt} := nofun", {"vacuous_statement"}),
+            (f": (Bool.true = Bool.false) → {stmt} := nofun", {"vacuous_statement"}),
+            (": 0 ≠ 1 := by decide", {"vacuous_statement", "closed_trivial_statement"}),
+            # Auto-param default on a vacuous binder.
+            (f"(h : False := nomatch) : {stmt} := h.elim", {"vacuous_statement"}),
+            # Vacuous existentials.
+            (": ∃ (_ : CapturedMir), True := ⟨fooProg, trivial⟩", {"vacuous_statement"}),
+            (": ∃ out, annealOutcome fooProg = out := ⟨_, rfl⟩", {"vacuous_statement"}),
+            (": ∃ (out : Value), out = annealOutcome fooProg := ⟨_, rfl⟩", {"vacuous_statement"}),
+            # Nested wildcard holes and tactic-synthesized binder types.
+            ("(_ : CapturedMir) : id _ := trivial", {"wildcard_statement"}),
+            (": annealOutcome fooProg = _ := rfl", {"wildcard_statement"}),
+            (f"(h : _) : {stmt} := h", {"wildcard_statement"}),
+            (f"(h : by exact False) : {stmt} := h.elim", {"self_typed_statement"}),
+            (f"(h : type_of% fooLemma) : {stmt} := h", {"self_typed_statement"}),
+            # `where` helpers with attributes/modifiers and `in`-scoped tactic commands.
+            (
+                f": {stmt} := aux\nwhere\n  @[simp] aux : {stmt} := sorry\n",
+                {"sorry_or_admit"},
+            ),
+            (
+                f": {stmt} := aux\nwhere\n  private aux : {stmt} := sorry\n",
+                {"sorry_or_admit"},
+            ),
+            (
+                f": {stmt} := aux\nwhere\n  noncomputable aux : {stmt} := sorry\n",
+                {"sorry_or_admit"},
+            ),
+            (
+                f"(h : CapturedMir) : {stmt} := by\n  omit h in\n  sorry\n",
+                {"sorry_or_admit"},
+            ),
+            (
+                f": {stmt} := by\n  attribute [local simp] fooLemma in\n  sorry\n",
+                {"sorry_or_admit"},
+            ),
+        ]
+        for tail, expected in bypass_theorems:
+            with self.subTest(theorem_tail=tail), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._write_flip_tree(root, {div_id: (None, tail, stmt)})
+                rec = self._flip_status(root, div_id)
+                self.assertEqual(rec["status"], "resolution_invalid")
+                self.assertEqual(set(rec["resolution_problems"]), expected)
+
+        # Positive controls: auto-param tactic defaults, `match` wildcard arms, dependent
+        # proof-term arguments `(by ...)`, non-trivial existentials, and `⦃...⦄` binders pass.
+        valid_controls = [
+            f"⦃body : CapturedMir⦄ (_hlive : body ≠ deadBody := by rintro ⟨⟩) : "
+            f"annealOutcome body = miriOutcome body := rfl",
+            f"(k : TyKind) (hk : sizeOf k = match k with | .bool => 1 | _ => 4) : {stmt} := rfl",
+            f"(idx : Nat) (hlt : idx < 4) : getElem fooArr idx (by exact hlt) = miriElem idx := rfl",
+            ": ∃ s', stepMirFn fooProg s = .step s' ∧ mirStateRel s' m' := ⟨s, rfl, hrel⟩",
+        ]
+        for tail in valid_controls:
+            with self.subTest(valid_tail=tail), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._write_flip_tree(root, {div_id: (None, tail, stmt)})
+                rec = self._flip_status(root, div_id)
+                self.assertEqual((rec["status"], rec["resolution_problems"]), ("resolved", []))
+
+        # `mutual ... end` sibling `sorry` invalidates a resolution theorem in the same block,
+        # while a hole-free `mutual` block resolves.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_flip_tree(root, {div_id: (None, None, stmt)})
+            target = root / lm23
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                f"mutual\n"
+                f"  theorem {sym} : {stmt} := mutualHelper\n"
+                f"  theorem mutualHelper : {stmt} := sorry\n"
+                f"end\n",
+                encoding="utf-8",
+            )
+            rec = self._flip_status(root, div_id)
+            self.assertEqual(rec["status"], "resolution_invalid")
+            self.assertEqual(rec["resolution_problems"], ["sorry_or_admit"])
+            target.write_text(
+                f"mutual\n"
+                f"  theorem {sym} : {stmt} := mutualHelper\n"
+                f"  theorem mutualHelper : {stmt} := rfl\n"
+                f"end\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(self._flip_status(root, div_id)["status"], "resolved")
+
+        # 2. Statement-pin RHS operators (`|>`, `▸`, `<|`, `$`), binder holes (`(h : _)`),
+        #    binder self-references, `⦃h : False⦄` strict-implicit binders, and `_root_.True`
+        #    are all rejected; a legitimate `⦃...⦄` statement pin is accepted.
+        bypass_pins: list[tuple[str, list[str]]] = [
+            (f"example : {stmt} := {{sym}} |> ignoreFirst realProof", []),
+            (f"example : {stmt} := {{sym}} ▸ realProof", []),
+            (f"example : {stmt} := {{sym}} <| argA", []),
+            (f"example : {stmt} := {{sym}} $ argA", []),
+            ("example : «True» := {sym}", []),
+            ("example : _root_.True := {sym}", ["pin_closed_trivial_statement", "pin_vacuous_statement"]),
+            (f"example (h : _) : {stmt} := {{sym}} h", ["self_typed_or_hole_pin"]),
+            (f"example [_] : {stmt} := {{sym}}", ["self_typed_or_hole_pin"]),
+            (f"example (h : type_of% {{sym}}) : {stmt} := {{sym}} h", ["self_typed_or_hole_pin"]),
+            (f"example (h : by exact False) : {stmt} := {{sym}} h", ["self_typed_or_hole_pin"]),
+            (f"example ⦃h : False⦄ : {stmt} := {{sym}} h", ["pin_vacuous_statement"]),
+            (f"example (h : {stmt}) : {stmt} := {{sym}} h", ["pin_vacuous_statement"]),
+        ]
+        for pin_text, expected_reasons in bypass_pins:
+            with self.subTest(pin=pin_text), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._write_flip_tree(root, {pin_div: (None, f": {stmt} := rfl", None)})
+                audit_file = root / suite.AUTHORITY_AUDIT_FILES["MiniRustSpec"]
+                with audit_file.open("a", encoding="utf-8") as fh:
+                    fh.write(pin_text.replace("{sym}", pin_sym) + "\n")
+                rec = self._flip_status(root, pin_div)
+                self.assertEqual(rec["status"], "resolution_unpinned")
+                self.assertEqual(rec["resolution_pin_problems"], expected_reasons)
+                with audit_file.open("a", encoding="utf-8") as fh:
+                    fh.write(
+                        f"example ⦃body : CapturedMir⦄ : annealOutcome body = miriOutcome body :=\n"
+                        f"  @{pin_sym}\n"
+                    )
+                self.assertEqual(self._flip_status(root, pin_div)["status"], "resolved")
+
+        # 3. Baseline-to-current transition audit catches cosmetically rewritten witness
+        #    statements (`polarity_not_flipped`), cosmetically rewritten pre-existing
+        #    resolutions (`resolution_predates_flip`), non-`open` incomplete flips,
+        #    `native_decide` / `implemented_by` / `«sorryAx»` holes, witness-file holes,
+        #    and `resolved -> resolved` statement rewrites backed by a new proof hole.
+        d6 = "DIV-LM-D6-OFFSET-DISABLED-TAG"
+        sim31 = "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM3_1.lean"
+        with tempfile.TemporaryDirectory() as tmp:
+            base_root, cur_root = Path(tmp) / "base", Path(tmp) / "cur"
+            self._write_flip_tree(
+                base_root,
+                {
+                    # Witness uses binder `(s : MachineState)` and `≠`.
+                    div_id: ("(s : MachineState) : annealStep s ≠ miriStep s := by decide", None, None),
+                    # Pre-existing simulation uses `(s : MachineState)`.
+                    "DIV-MR-TB-UNSAFECELL-PROTECTED-IM": (
+                        f": {SYNTH_DIVERGENCE_STMT} := rfl",
+                        "(s : MachineState) : annealOutcome s = miriOutcome s := rfl",
+                        "∀ s : MachineState, annealOutcome s = miriOutcome s",
+                    ),
+                    # Baseline is `resolution_missing` (neither witness nor resolution).
+                    "DIV-LM-RAW-OVERWRITE-CHAR-COPY": (None, None, None),
+                    # Proper flip in `SimLM3_1` whose witness file `WitLM3_1` gains a hole.
+                    d6: (f": {SYNTH_DIVERGENCE_STMT} := rfl", None, None),
+                },
+            )
+            self._write_flip_tree(
+                cur_root,
+                {
+                    # Cosmetically alpha-renamed + `∀`-wrapped + `True ∧`-padded witness!
+                    div_id: (
+                        None,
+                        ": ∀ {st : MachineState}, True ∧ (id (annealStep st ≠ miriStep st)) := by decide",
+                        "∀ {st : MachineState}, annealStep st ≠ miriStep st",
+                    ),
+                    # Cosmetically `∀`-wrapped pre-existing simulation!
+                    "DIV-MR-TB-UNSAFECELL-PROTECTED-IM": (
+                        None,
+                        ": ∀ (st : MachineState), (annealOutcome st = miriOutcome st) := rfl",
+                        "∀ (st : MachineState), annealOutcome st = miriOutcome st",
+                    ),
+                    # `resolution_missing -> resolution_unpinned` (non-`open` incomplete flip).
+                    "DIV-LM-RAW-OVERWRITE-CHAR-COPY": (None, f": {stmt} := rfl", None),
+                    # Proper flip on `SimLM3_1`, but `WitLM3_1` gains `«sorryAx»` and
+                    # an already-resolved entry (`DIV-MR-CALL-TARGET-LOCAL`) rewrites its
+                    # statement with a new `axiom` in its module.
+                    d6: (None, f": {stmt} := rfl", stmt),
+                    pin_div: (
+                        None,
+                        ": annealOutcome barProg = miriOutcome barProg := cheatAx",
+                        "annealOutcome barProg = miriOutcome barProg",
+                    ),
+                },
+            )
+            with (cur_root / sim31).open("a", encoding="utf-8") as fh:
+                fh.write("def hiddenHole : False := «sorryAx» False false\n")
+            mr_wit = cur_root / "minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean"
+            with mr_wit.open("a", encoding="utf-8") as fh:
+                fh.write("axiom cheatAx : annealOutcome barProg = miriOutcome barProg\n")
+            audit = suite.audit_flip_direction_transitions(base_root, cur_root)
+            self.assertFalse(audit["passed"])
+            self.assertEqual(
+                sorted((v["id"], v["reason"]) for v in audit["violations"]),
+                sorted(
+                    [
+                        (div_id, "polarity_not_flipped"),
+                        ("DIV-MR-TB-UNSAFECELL-PROTECTED-IM", "resolution_predates_flip"),
+                        ("DIV-LM-RAW-OVERWRITE-CHAR-COPY", "incomplete_flip"),
+                        (d6, "proof_hole_introduced"),
+                        (pin_div, "proof_hole_introduced"),
+                    ]
+                ),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

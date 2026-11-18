@@ -207,6 +207,31 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         "coverage_ratchet.json must record non-zero cumulative_distinct_obs_paths:\n{ratchet_json}"
     );
 
+    // 1b. Standalone `--self-check-mutants` gate through `run_campaign_driver` kills
+    // all 9/9 seeded semantic mutants (including `subplace_multi_elem_copy_truncation`
+    // under `value_mismatch`).
+    let state_dir_mutants = dir.join("state_dir_mutants");
+    let out_mutants = run_campaign_driver(
+        &[],
+        &[],
+        &[],
+        &["--self-check-mutants"],
+        &state_dir_mutants,
+    );
+    let stdout_mutants = String::from_utf8_lossy(&out_mutants.stdout);
+    let stderr_mutants = String::from_utf8_lossy(&out_mutants.stderr);
+    assert_eq!(
+        out_mutants.status.code(),
+        Some(0),
+        "--self-check-mutants must exit 0:\nstdout:\n{stdout_mutants}\nstderr:\n{stderr_mutants}"
+    );
+    assert!(
+        stdout_mutants.contains("(`9/9` killed)")
+            && stdout_mutants.contains("`subplace_multi_elem_copy_truncation`")
+            && stdout_mutants.contains("`value_mismatch`=1"),
+        "--self-check-mutants report must confirm 9/9 mutants killed including value_mismatch:\n{stdout_mutants}"
+    );
+
     // 2. Live kernel-confirmed Miri vs. Anneal divergence bundle + `--reproduce` +
     // unquarantined / partial-quarantine / full-quarantine verification:
     // Evaluate a batch with 3 corpus candidates, `neg_ctrl_char_surrogate_via_ptr__b0_c3`

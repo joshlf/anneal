@@ -4310,6 +4310,8 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
             "__null_p": "RawPtrOffsetMutator",
             "__unaligned_pair": "RawPtrOffsetMutator",
             "__u8_base": "RawPtrOffsetMutator",
+            "__raw_pad_byte": "RawPtrOffsetMutator",
+            "__cp_src": "RawPtrOffsetMutator",
             "__panic_arr": "BitValidityTransmuteMutator",
             "__panic_idx": "BitValidityTransmuteMutator",
             "__ovf_a": "ArithmeticCastMutator",

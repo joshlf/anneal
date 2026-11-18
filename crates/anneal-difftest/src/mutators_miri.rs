@@ -7060,6 +7060,12 @@ pub fn unsuffixed_off() -> u32 {
                     cand.fn_name,
                     cand.source
                 );
+                assert!(
+                    crate::miri_eval::compile_rust_snippet("raw_pad_batch_cand", &cand.source),
+                    "candidate `{}` failed rustc typecheck:\n{}",
+                    cand.fn_name,
+                    cand.source
+                );
                 let (base, steps) = reconstruct_miri_mutation_steps(&cand, &seeds)
                     .expect("reconstruct the padding-read candidate's passes");
                 assert!(
@@ -7072,7 +7078,7 @@ pub fn unsuffixed_off() -> u32 {
                     .find(|st| {
                         st.mutator_name == "RawPtrOffsetMutator" && st.mode == MutationMode::Ub
                     })
-                    .expect("the padding read comes from a `RawPtrOffsetMutator::Ub` pass");
+                    .expect("the padding read comes from a `RawPtrOffsetMutator` `Ub` pass");
                 let alone = replay_miri_mutation_steps(&cand, &base, std::slice::from_ref(ub_step));
                 assert!(
                     alone.fn_source.contains("let __raw_pad_base: *const u8")
@@ -7082,6 +7088,12 @@ pub fn unsuffixed_off() -> u32 {
                     "replaying the `Ub` pass alone lost the padding read:\n{}",
                     alone.fn_source
                 );
+                assert!(
+                    crate::miri_eval::compile_rust_snippet("raw_pad_alone_replay", &alone.source),
+                    "single-step padding-read replay `{}` failed rustc typecheck:\n{}",
+                    alone.fn_name,
+                    alone.source
+                );
                 replayed += 1;
                 if replayed == 3 {
                     break 'search;
@@ -7089,6 +7101,40 @@ pub fn unsuffixed_off() -> u32 {
             }
         }
         assert_eq!(replayed, 3, "too few generated padding-read candidates");
+
+        // 3. Multi-pass batches seeded from both Category 10 corpus seeds (`u32`
+        //    whole-array copy and `u8` padding-byte read) compile cleanly under `rustc`
+        //    and replay byte-for-byte.
+        let corpus_seeds = load_miri_diff_corpus_seeds();
+        let cat10_sources: Vec<&str> = [
+            "pass_copy_nonoverlapping_multi_elem_array_pair",
+            "ub_raw_ptr_read_uninit_struct_padding_kani5183",
+        ]
+        .into_iter()
+        .map(|name| {
+            corpus_seeds
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing Category 10 corpus seed `{name}`"))
+                .fn_source
+                .as_str()
+        })
+        .collect();
+        for cand in generate_miri_batch(&cat10_sources, 8, 0xCA71_0010) {
+            assert!(
+                crate::miri_eval::compile_rust_snippet("cat10_mutated_cand", &cand.source),
+                "Category 10 mutated candidate `{}` failed rustc typecheck:\n{}",
+                cand.fn_name,
+                cand.source
+            );
+            let (base, steps) = reconstruct_miri_mutation_steps(&cand, &cat10_sources)
+                .expect("reconstruct Category 10 candidate passes");
+            assert!(
+                miri_candidate_replay_is_faithful(&cand, &base, &steps),
+                "replay mismatch on Category 10 candidate `{}`",
+                cand.fn_name
+            );
+        }
     }
 
     #[test]
