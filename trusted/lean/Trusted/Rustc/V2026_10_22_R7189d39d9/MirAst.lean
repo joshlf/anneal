@@ -19,10 +19,12 @@ namespace Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst
 
 ## Human-Comprehension Priority
 
-`Trusted.MirAst` sits in the direct transitive dependency cone of the top-level
-correspondence theorem statements (`CorrespondenceClaim`,
-`FaultEquivalenceClaim`, and `MiriMoveDeinitWiringClaim` in
-`Trusted.Correspondence`). Human comprehension is therefore the governing design
+This module sits in the direct transitive dependency cone of the
+`V2026_10_22_R7189d39d9` canonical verification roots
+(`Trusted.MirSemantics.V2026_10_22_R7189d39d9.{CrateTheorem,UnitTheorem}`),
+which map it into the compiler-independent `Trusted.MirModel` (the syntax of the
+top-level correspondence statements in `Trusted.Correspondence`) via
+`Trusted.MirSemantics.interpretV2026_10_22_R7189d39d9`. Human comprehension is therefore the governing design
 priority for every declaration in this file:
 
 1. **Direct, self-evident representations:** Every AST type and constructor is
@@ -58,7 +60,7 @@ Mid-level Intermediate Representation (`Runtime(PostCleanup)` MIR) extracted by
 > `8144389c895da997dbdecaa635e41d6a50be6ffd`)
 
 Unlike `rustc_middle::mir` and `lean-miri` (`Miri.MIR.Syntax`), which index a
-side-table of interned types via `TyId`, `Trusted.MirAst` carries structural
+side-table of interned types via `TyId`, `Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst` carries structural
 `MirTy` descriptors directly by value on `Body.locals`, `ConstOperand`, and
 `ProjectionElem.field`. This eliminates out-of-bounds `TyId` lookup states
 inside $M_{\text{anneal}}$ and allows `Anneal.MirWp` to evaluate operand and
@@ -227,7 +229,7 @@ structure EnumTy where
   discriminants : List Nat
 
 /-- Structural MIR type descriptors carried directly by value in
-`Trusted.MirAst`.
+`Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst`.
 
 Corresponds to monomorphized `rustc_type_ir::TyKind` in
 `compiler/rustc_type_ir/src/ty_kind.rs` (`rust-lang/rust`
@@ -535,8 +537,8 @@ inductive Operand where
 
 Constructor correspondence:
 - `.use op` corresponds to `Rvalue::Use(op, WithRetag::No)` (assignments with
-  `WithRetag::Yes` in `8144389c895da997dbdecaa635e41d6a50be6ffd`, or
-  `StatementKind::Retag` in `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`, lower to
+  `WithRetag::Yes` in `8144389c895da997dbdecaa635e41d6a50be6ffd` and in
+  `7189d39d9ce936881b8132c6addeaf3e295cd455`, lower to
   `.unsupported` until stacked/tree-borrows retagging is modeled).
 - `.binaryOp op lhs rhs` corresponds to `Rvalue::BinaryOp(op, (lhs, rhs))`.
 - `.unaryOp op opnd` corresponds to `Rvalue::UnaryOp(op, opnd)`.
@@ -550,7 +552,7 @@ Constructor correspondence:
   > variant index; use [`discriminant_for_variant`] to convert."
 - `.ref mutability place` corresponds to `Rvalue::Ref(_, borrowKind, place)`.
 - `.addressOf mutability place` corresponds to `Rvalue::RawPtr(kind, place)`
-  (`Rvalue::AddressOf` in `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`).
+  (`compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust` `7189d39d9ce936881b8132c6addeaf3e295cd455`).
 - `.aggregateTuple fields` corresponds to
   `Rvalue::Aggregate(AggregateKind::Tuple, fields)`.
 - `.unsupported` represents all other `Rvalue` variants (`Repeat`,
@@ -593,8 +595,8 @@ Constructor correspondence:
 - `.nop` corresponds to `StatementKind::Nop`.
 - `.unsupported` represents all other `StatementKind` variants (`FakeRead`,
   `SetDiscriminant`, `PlaceMention`, `AscribeUserType`, `Coverage`, `Intrinsic`,
-  `ConstEvalCounter`, `BackwardIncompatibleDropHint`, and `Retag` in
-  `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`). -/
+  `ConstEvalCounter`, and `BackwardIncompatibleDropHint` in
+  `7189d39d9ce936881b8132c6addeaf3e295cd455`). -/
 inductive StatementKind where
   | assign (dst : Place) (rvalue : Rvalue)
   | storageLive (localId : LocalId)

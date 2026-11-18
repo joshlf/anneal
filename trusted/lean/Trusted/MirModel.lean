@@ -535,8 +535,8 @@ inductive Operand where
 
 Constructor correspondence:
 - `.use op` corresponds to `Rvalue::Use(op, WithRetag::No)` (assignments with
-  `WithRetag::Yes` in `8144389c895da997dbdecaa635e41d6a50be6ffd`, or
-  `StatementKind::Retag` in `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`, lower to
+  `WithRetag::Yes` in `8144389c895da997dbdecaa635e41d6a50be6ffd` and in
+  `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`, lower to
   `.unsupported` until stacked/tree-borrows retagging is modeled).
 - `.binaryOp op lhs rhs` corresponds to `Rvalue::BinaryOp(op, (lhs, rhs))`.
 - `.unaryOp op opnd` corresponds to `Rvalue::UnaryOp(op, opnd)`.
@@ -550,7 +550,7 @@ Constructor correspondence:
   > variant index; use [`discriminant_for_variant`] to convert."
 - `.ref mutability place` corresponds to `Rvalue::Ref(_, borrowKind, place)`.
 - `.addressOf mutability place` corresponds to `Rvalue::RawPtr(kind, place)`
-  (`Rvalue::AddressOf` in `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`).
+  (`compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust` `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`).
 - `.aggregateTuple fields` corresponds to
   `Rvalue::Aggregate(AggregateKind::Tuple, fields)`.
 - `.unsupported` represents all other `Rvalue` variants (`Repeat`,
@@ -593,7 +593,7 @@ Constructor correspondence:
 - `.nop` corresponds to `StatementKind::Nop`.
 - `.unsupported` represents all other `StatementKind` variants (`FakeRead`,
   `SetDiscriminant`, `PlaceMention`, `AscribeUserType`, `Coverage`, `Intrinsic`,
-  `ConstEvalCounter`, `BackwardIncompatibleDropHint`, and `Retag` in
+  `ConstEvalCounter`, and `BackwardIncompatibleDropHint` in
   `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`). -/
 inductive StatementKind where
   | assign (dst : Place) (rvalue : Rvalue)

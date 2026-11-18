@@ -99,14 +99,6 @@ fn run(raw_args: Vec<OsString>) -> Result<u8, (u8, String)> {
     }
     if let Some(cache_dir) = cli.miri_cache_dir {
         checker.set_miri_cache_dir(Some(cache_dir));
-    } else if checker.miri_cache_dir.is_none() {
-        let default_cache = env::temp_dir().join("anneal-miri-cache");
-        if default_cache
-            .symlink_metadata()
-            .is_ok_and(|m| m.is_dir())
-        {
-            checker.set_miri_cache_dir(Some(default_cache));
-        }
     }
 
     match checker.run() {

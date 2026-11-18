@@ -371,7 +371,7 @@ impl ModuleArtifacts {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct ImportEdge {
-    /// Imported module name (e.g. `"Init.Core"` or `"Trusted.MirAst"`).
+    /// Imported module name (e.g. `"Init.Core"` or `"Trusted.MirModel"`).
     pub module: String,
     /// Whether `import all` was used (always `false` in admitted modules).
     pub import_all: bool,
@@ -1755,7 +1755,7 @@ impl Checker {
         self.miri_cache_dir = cache_dir;
     }
 
-    /// Configure whether Pass 1 (`"audit"`) requires `Trusted.MirAst`,
+    /// Configure whether Pass 1 (`"audit"`) requires `Trusted.MirModel`,
     /// `Trusted.MirSemantics`, and `Anneal.MirWp` to be present (defaults to
     /// `true`; only disabled in synthetic single-file unit test fixtures).
     pub fn set_require_mir_wp(&mut self, require: bool) {

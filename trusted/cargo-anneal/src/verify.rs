@@ -662,11 +662,14 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // Capture schema 2 binds unsafe caller requirements to source identities.
     // An old program without that required Body field belongs to another model
     // ABI; reject it before compiling proofs. Request schema 1 is independent.
+    // The top-level and compiler-scoped dialect fields must agree, and the
+    // dialect must be the one pinned to the full compiler commit; a capture
+    // cannot select another dialect's syntax or canonical root.
+    let top_dialect = manifest["mir_dialect"].as_str();
+    let compiler_dialect = manifest["compiler"]["mir_dialect"].as_str();
     let supported_dialect = match (
         manifest["compiler"]["commit"].as_str(),
-        manifest["mir_dialect"]
-            .as_str()
-            .or_else(|| manifest["compiler"]["mir_dialect"].as_str()),
+        top_dialect.filter(|_| top_dialect == compiler_dialect),
     ) {
         (
             Some("7189d39d9ce936881b8132c6addeaf3e295cd455"),

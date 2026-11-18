@@ -388,7 +388,7 @@ fn rvalue<'tcx>(
 ) -> Result<ir::Rvalue> {
     Ok(match value {
         // Empty tuple aggregates (`()`) lower via `ir::Rvalue::Unit` to the
-        // unit `ConstLit.zeroSized` use rvalue in `Trusted.MirAst`, which has
+        // unit `ConstLit.zeroSized` use rvalue in `Trusted.Rustc.<Dialect>.MirAst`, which has
         // identical operational semantics in `Trusted.MirSemantics.evalRvalue`
         // (evaluates to `.unit` with unchanged local storage, and faults with
         // `.unsupported` on any non-unit destination). Non-empty tuple

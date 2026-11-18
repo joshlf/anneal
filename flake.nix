@@ -18,6 +18,10 @@
       # Fuchsia's live in-tree rustc pin (`rust-lang/rust` commit
       # `7189d39d9ce936881b8132c6addeaf3e295cd455`, commit-date 2026-10-22,
       # distributed in `nightly-2026-10-23`).
+      # NOTE: the per-platform `rustSha256` fixed-output hashes below were not
+      # refreshed for this date (static.rust-lang.org is unreachable from Team
+      # Capsules); `nix build`/`nix flake check` fails closed on the mismatch and
+      # reports the expected SRI hash. Refresh them on a Cloudtop before use.
       rustDate = "2026-10-23";
       leanVersion =
         nixpkgs.lib.removePrefix "leanprover/lean4:v"
