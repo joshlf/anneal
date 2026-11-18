@@ -8,8 +8,7 @@
 # This file may not be copied, modified, or distributed except according to
 # those terms.
 
-"""Hardware-matched resource wrapper for `lake`, `lean`, and `cargo` commands,
-plus pre-export fast-forward bundle verification (`--verify-bundle-ff`).
+"""Hardware-matched resource wrapper for `lake`, `lean`, and `cargo` commands.
 
 Probes the host's logical CPU count, physical RAM (`MemTotal` and
 `MemAvailable`), and cgroup v2 non-reclaimable working set (`anon + shmem` vs
@@ -34,9 +33,6 @@ Why this wrapper exists:
   cgroup headroom via `memory.max - (anon + shmem)` prevents `.olean` file cache
   from falsely throttling concurrent builds while still throttling when genuine
   anonymous working-set pressure rises.
-- Pre-export bundle verification (`--verify-bundle-ff` / `--check-unstable-ff`)
-  guards shared integration refs (`refs/heads/unstable`) in remote Git bundles
-  against accidental non-fast-forward rollbacks.
 """
 
 from __future__ import annotations
@@ -47,20 +43,54 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import posixpath
+import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 sys.dont_write_bytecode = True
 
 MIB = 1024 * 1024
-REMOTE_FUSE_PREFIXES: tuple[str, ...] = ("/mnt/fuse/rw/", "/mnt/fuse/ro/")
-REMOTE_URI_PREFIX = "/remote/"
+
+_LAKE_VALUE_OPTS: frozenset[str] = frozenset(
+    {"-d", "--dir", "-f", "--file", "-K", "--key", "-p", "--packages"}
+)
+_LAKE_VALUE_EQ_PREFIXES: tuple[str, ...] = (
+    "-d=",
+    "--dir=",
+    "-f=",
+    "--file=",
+    "-K=",
+    "--key=",
+    "-p=",
+    "--packages=",
+)
+_LAKE_FLAG_OPTS: frozenset[str] = frozenset(
+    {
+        "-q",
+        "--quiet",
+        "-v",
+        "--verbose",
+        "-R",
+        "--reconfigure",
+        "-U",
+        "--update",
+        "--keep-toolchain",
+        "--wfail",
+        "--old",
+        "--offline",
+        "--no-build",
+    }
+)
+
+
+def _clamp(val: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, val))
 
 
 def _env_int(name: str, default: int) -> int:
@@ -71,6 +101,304 @@ def _env_int(name: str, default: int) -> int:
         return int(raw.strip())
     except ValueError:
         return default
+
+
+def _env_optional_pos_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        val = int(raw.strip())
+        return val if val >= 1 else None
+    except ValueError:
+        return None
+
+
+def _has_user_systemd_sock(p: Path) -> bool:
+    """True if systemd --user (systemd 255+/260 private/varlink or D-Bus) socket exists."""
+    try:
+        return any(
+            (p / rel).is_socket()
+            for rel in ("systemd/private", "systemd/io.systemd.Manager", "bus")
+        )
+    except OSError:
+        return False
+
+
+def resolve_runtime_base() -> tuple[Path, bool]:
+    """Returns (runtime_dir, user_systemd_sock_alive). Always prefers UID-owned /run/user/<uid>."""
+    uid = os.getuid()
+    run_user = Path(f"/run/user/{uid}")
+    if run_user.is_dir() and os.access(run_user, os.W_OK | os.X_OK):
+        try:
+            if run_user.stat().st_uid == uid:
+                return run_user, _has_user_systemd_sock(run_user)
+        except OSError:
+            pass
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if xdg:
+        p = Path(xdg)
+        if p.is_dir() and os.access(p, os.W_OK | os.X_OK):
+            return p, _has_user_systemd_sock(p)
+    return Path("/tmp"), False
+
+
+def _systemd_env(
+    runtime_base: Path,
+    user_systemd_sock_alive: bool,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    env = dict(base_env if base_env is not None else os.environ)
+    if user_systemd_sock_alive:
+        env["XDG_RUNTIME_DIR"] = str(runtime_base)
+    return env
+
+
+def _find_systemctl() -> str | None:
+    found = shutil.which("systemctl")
+    if found:
+        return found
+    return "/usr/bin/systemctl" if Path("/usr/bin/systemctl").is_file() else None
+
+
+def _find_systemd_run() -> str | None:
+    found = shutil.which("systemd-run")
+    if found:
+        return found
+    return "/usr/bin/systemd-run" if Path("/usr/bin/systemd-run").is_file() else None
+
+
+def check_user_systemd_active(
+    runtime_base: Path | None = None,
+    user_systemd_sock_alive: bool | None = None,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    uid: int | None = None,
+) -> bool:
+    """Zero-scope-spam read-only check that `systemd --user` is live with memory delegation."""
+    if runtime_base is None or user_systemd_sock_alive is None:
+        runtime_base, user_systemd_sock_alive = resolve_runtime_base()
+    if not user_systemd_sock_alive:
+        return False
+
+    eff_uid = os.getuid() if uid is None else uid
+    user_cg = (
+        cgroup_root / "user.slice" / f"user-{eff_uid}.slice" / f"user@{eff_uid}.service"
+    )
+    try:
+        if not (user_cg / "cgroup.controllers").is_file():
+            return False
+        subtree_path = user_cg / "cgroup.subtree_control"
+        if not subtree_path.is_file():
+            return False
+        controllers = subtree_path.read_text(encoding="utf-8", errors="replace").split()
+        if "memory" not in controllers:
+            return False
+    except OSError:
+        return False
+
+    systemctl_bin = _find_systemctl()
+    if not systemctl_bin:
+        return False
+    try:
+        res = subprocess.run(
+            [systemctl_bin, "--user", "show", "-p", "Version", "--value"],
+            env=_systemd_env(runtime_base, True),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2.0,
+        )
+        return res.returncode == 0 and bool(res.stdout.strip())
+    except Exception:
+        return False
+
+
+def read_concurrency_config_file(config_path: Path | None = None) -> int | None:
+    """Reads optional positive integer concurrency from `$XDG_CONFIG_HOME/anneal/concurrency`."""
+    if config_path is None:
+        xdg_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+        base = Path(xdg_cfg) if xdg_cfg else (Path.home() / ".config")
+        config_path = base / "anneal" / "concurrency"
+    try:
+        if not config_path.is_file():
+            return None
+        val = int(config_path.read_text(encoding="utf-8", errors="replace").strip())
+        return val if val >= 1 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _m_safety_host(mem_total_mb: int) -> int:
+    return _clamp((8 * mem_total_mb) // 100, 1024, 8192)
+
+
+def _m_safety_cg(c_mb: int) -> int:
+    return _clamp(c_mb // 10, 256, 8192)
+
+
+def _r_cg(c_mb: int) -> int:
+    return c_mb - _m_safety_cg(c_mb)
+
+
+def _m_cp_floor(c_mb: int, is_shared_user_slice: bool) -> int:
+    if not is_shared_user_slice:
+        return 0
+    r = _r_cg(c_mb)
+    return min(10240, max(0, (9 * (r - 7168)) // 10))
+
+
+def compute_cgroup_working_set_bytes(cg: Path) -> int:
+    """Computes W(cg) = anon + shmem + kernel + min(file, active_file + file_dirty + file_writeback)."""
+    try:
+        if not cg.is_dir():
+            return 0
+    except OSError:
+        return 0
+    stat = parse_memory_stat(cg / "memory.stat")
+    if stat and any(k in stat for k in ("anon", "shmem", "kernel", "file", "active_file")):
+        anon = stat.get("anon", 0)
+        shmem = stat.get("shmem", 0)
+        kernel = stat.get("kernel", 0)
+        file_bytes = stat.get(
+            "file", stat.get("active_file", 0) + stat.get("inactive_file", 0)
+        )
+        active_dirty_wb = (
+            stat.get("active_file", 0)
+            + stat.get("file_dirty", 0)
+            + stat.get("file_writeback", 0)
+        )
+        return max(0, anon + shmem + kernel + min(file_bytes, active_dirty_wb))
+    cur = _read_cgroup_int(cg / "memory.current")
+    if cur is not None:
+        if "inactive_file" in stat:
+            return max(0, cur - stat["inactive_file"])
+        return max(0, cur)
+    return 0
+
+
+def read_cgroup_working_set_mib(cg: Path) -> int:
+    return compute_cgroup_working_set_bytes(cg) // MIB
+
+
+def compute_cgroup_nonrecl_bytes(cg: Path) -> int:
+    """Computes W_nonrecl(cg) = anon + shmem + slab_unreclaimable (fallback: anon+shmem+kernel)."""
+    try:
+        if not cg.is_dir():
+            return 0
+    except OSError:
+        return 0
+    stat = parse_memory_stat(cg / "memory.stat")
+    if not stat:
+        return 0
+    if "slab_unreclaimable" in stat:
+        return max(
+            0,
+            stat.get("anon", 0) + stat.get("shmem", 0) + stat["slab_unreclaimable"],
+        )
+    if any(k in stat for k in ("anon", "shmem", "kernel")):
+        return max(
+            0, stat.get("anon", 0) + stat.get("shmem", 0) + stat.get("kernel", 0)
+        )
+    return 0
+
+
+def read_cgroup_nonrecl_mib(cg: Path) -> int:
+    return compute_cgroup_nonrecl_bytes(cg) // MIB
+
+
+def read_cgroup_ceiling_mib(cg: Path) -> int | None:
+    """Returns min(finite(memory.high), finite(memory.max)) in MiB, or None if unbounded."""
+    hi = _read_cgroup_int(cg / "memory.high")
+    mx = _read_cgroup_int(cg / "memory.max")
+    vals = [v for v in (hi, mx) if v is not None]
+    if not vals:
+        return None
+    return min(vals) // MIB
+
+
+def read_events_local_high(cg: Path) -> int:
+    """Reads `high` counter from `cg/memory.events.local` (returns 0 on missing/error)."""
+    p = cg / "memory.events.local"
+    try:
+        if not p.is_file():
+            return 0
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.strip().split()
+            if len(parts) == 2 and parts[0] == "high":
+                return max(0, int(parts[1]))
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _read_memory_events_oom_kill(cg: Path) -> int:
+    """Best-effort read of `oom_kill` from `cg/memory.events`."""
+    p = cg / "memory.events"
+    try:
+        if not p.is_file():
+            return 0
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.strip().split()
+            if len(parts) == 2 and parts[0] == "oom_kill":
+                return max(0, int(parts[1]))
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def read_psi_full_avg10(cg: Path) -> float:
+    """Reads `full avg10=<val>` from `cg/memory.pressure` (returns 0.0 on missing/error)."""
+    p = cg / "memory.pressure"
+    try:
+        if not p.is_file():
+            return 0.0
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line.startswith("full "):
+                continue
+            for tok in line.split()[1:]:
+                if tok.startswith("avg10="):
+                    return float(tok.split("=", 1)[1])
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
+def count_active_build_slots(
+    runtime_base: Path, uid: int | None = None
+) -> int:
+    """Counts currently held `slot-*.lock` files in `runtime_base/anneal-build-slots-<uid>`."""
+    eff_uid = os.getuid() if uid is None else uid
+    slot_dir = runtime_base / f"anneal-build-slots-{eff_uid}"
+    try:
+        if not slot_dir.is_dir():
+            return 0
+        lock_files = sorted(slot_dir.glob("slot-*.lock"))
+    except OSError:
+        return 0
+    active = 0
+    for lf in lock_files:
+        fd: int | None = None
+        try:
+            fd = os.open(str(lf), os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            except BlockingIOError:
+                active += 1
+        except OSError:
+            continue
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    return active
 
 
 def parse_proc_cgroup_v2(
@@ -360,13 +688,11 @@ def _probe_cgroup_v2_memory_impl(
 probe_cgroup_v2 = probe_cgroup_v2_memory
 
 
-def probe_host_hardware(
+def _read_raw_meminfo_and_cpus(
     meminfo_path: Path = Path("/proc/meminfo"),
-    cgroup_root: Path = Path("/sys/fs/cgroup"),
-    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
-) -> dict[str, Any]:
-    """Returns host logical CPU count, physical memory in MiB, and cgroup v2 stats."""
-    cpu_cores = os.cpu_count() or 4
+) -> tuple[int, int, int]:
+    """Returns raw `(cpu_cores, mem_total_mb, mem_avail_mb)` without cgroup clamping."""
+    cpu_cores = max(1, os.cpu_count() or 4)
     mem_total_mb = 16384
     mem_avail_mb = 12288
 
@@ -384,7 +710,7 @@ def probe_host_hardware(
                     kv[key] = int(val_parts[0]) // 1024
             if "MemTotal" in kv and kv["MemTotal"] > 0:
                 mem_total_mb = kv["MemTotal"]
-            if "MemAvailable" in kv and kv["MemAvailable"] > 0:
+            if "MemAvailable" in kv and kv["MemAvailable"] >= 0:
                 mem_avail_mb = kv["MemAvailable"]
             elif "MemFree" in kv:
                 mem_avail_mb = kv["MemFree"] + kv.get("Cached", 0)
@@ -400,29 +726,577 @@ def probe_host_hardware(
                 timeout=2.0,
             )
             if res.returncode == 0 and res.stdout.strip().isdigit():
-                mem_total_mb = int(res.stdout.strip()) // MIB
-                mem_avail_mb = int(mem_total_mb * 0.75)
+                mem_total_mb = max(1, int(res.stdout.strip()) // MIB)
+                mem_avail_mb = (75 * mem_total_mb) // 100
         except Exception:
             pass
 
+    mem_total_mb = max(1, mem_total_mb)
+    mem_avail_mb = max(0, min(mem_total_mb, mem_avail_mb))
+    return cpu_cores, mem_total_mb, mem_avail_mb
+
+
+def probe_host_hardware(
+    meminfo_path: Path = Path("/proc/meminfo"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+) -> dict[str, Any]:
+    """Returns raw host logical CPU count, physical memory in MiB, and cgroup v2 stats."""
+    cpu_cores, mem_total_mb, mem_avail_mb = _read_raw_meminfo_and_cpus(meminfo_path)
     cg = probe_cgroup_v2_memory(
         cgroup_root=cgroup_root, proc_cgroup_path=proc_cgroup_path
     )
-    cg_max_mib = cg.get("cgroup_memory_max_mib")
-    if isinstance(cg_max_mib, int) and cg_max_mib > 0:
-        mem_total_mb = max(1024, min(mem_total_mb, cg_max_mib))
-
-    mem_avail_mb = max(512, min(mem_total_mb, mem_avail_mb))
-    cg_avail_mib = cg.get("cgroup_avail_mib")
-    if isinstance(cg_avail_mib, int) and cg_avail_mib >= 0:
-        mem_avail_mb = max(512, min(mem_total_mb, mem_avail_mb, cg_avail_mib))
-
     return {
-        "cpu_cores": max(1, cpu_cores),
-        "mem_total_mb": max(1024, mem_total_mb),
-        "mem_avail_mb": max(512, min(mem_total_mb, mem_avail_mb)),
+        "cpu_cores": cpu_cores,
+        "mem_total_mb": mem_total_mb,
+        "mem_avail_mb": mem_avail_mb,
         **cg,
     }
+
+
+def _resolve_target_cgroup_ancestors(
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+    user_systemd_active: bool = False,
+    uid: int | None = None,
+) -> tuple[Path | None, list[dict[str, Any]], bool, bool, int, int, int, str | None]:
+    """Resolves `T_cg` and ancestor chain for `WorkloadMemoryEnvelope`.
+
+    Returns `(t_cg, ancestors, eff_user_systemd_active, t_cg_is_user_service,
+              w_cg_mb, w_cg_nonrecl_mb, l_ws_mb, w_cg_path_str)`.
+    """
+    eff_uid = os.getuid() if uid is None else uid
+    try:
+        if not cgroup_root.is_dir():
+            return None, [], False, False, 0, 0, 0, None
+        root_res = cgroup_root.resolve()
+    except OSError:
+        return None, [], False, False, 0, 0, 0, None
+
+    t_cg: Path | None = None
+    eff_systemd_active = False
+    t_cg_is_user_service = False
+
+    user_cg = (
+        cgroup_root / "user.slice" / f"user-{eff_uid}.slice" / f"user@{eff_uid}.service"
+    )
+    if user_systemd_active:
+        try:
+            if user_cg.is_dir():
+                t_cg = user_cg.resolve()
+                eff_systemd_active = True
+                t_cg_is_user_service = True
+        except OSError:
+            t_cg = None
+
+    if t_cg is None:
+        rel_path: str | None = None
+        try:
+            proc_exists = proc_cgroup_path.is_file()
+        except OSError:
+            proc_exists = False
+        if proc_exists:
+            rel_path = parse_proc_cgroup_v2(proc_cgroup_path)
+        elif (
+            proc_cgroup_path == Path("/proc/self/cgroup")
+            and cgroup_root != Path("/sys/fs/cgroup")
+            and _has_cgroup_memory_files(cgroup_root)
+        ):
+            rel_path = "/"
+
+        if rel_path is not None:
+            rel_clean = rel_path.lstrip("/")
+            rel_parts = [p for p in Path(rel_clean).parts if p not in ("", ".")]
+            if ".." not in rel_parts:
+                cand = cgroup_root.joinpath(*rel_parts) if rel_parts else cgroup_root
+                try:
+                    cand_ok = cand.is_dir() and (
+                        _has_cgroup_memory_files(cand)
+                        or (cand / "cgroup.controllers").is_file()
+                        or (cand / "cgroup.procs").is_file()
+                    )
+                except OSError:
+                    cand_ok = False
+                if cand_ok:
+                    leaf = cand
+                elif rel_parts and _has_cgroup_memory_files(cgroup_root):
+                    leaf = cgroup_root
+                else:
+                    leaf = None
+                if leaf is not None:
+                    try:
+                        leaf_res = leaf.resolve()
+                        if leaf_res == root_res or root_res in leaf_res.parents:
+                            t_cg = leaf_res
+                    except OSError:
+                        t_cg = None
+
+    if t_cg is None:
+        return None, [], False, False, 0, 0, 0, None
+
+    levels: list[Path] = []
+    curr = t_cg
+    while True:
+        levels.append(curr)
+        if curr == root_res or curr.parent == curr:
+            break
+        curr = curr.parent
+
+    shared_names = ("user.slice", f"user-{eff_uid}.slice", f"user@{eff_uid}.service")
+    ancestors: list[dict[str, Any]] = []
+    for lvl in levels:
+        ancestors.append(
+            {
+                "path": str(lvl),
+                "name": lvl.name,
+                "c_high_mb": read_cgroup_ceiling_mib(lvl),
+                "w_mb": read_cgroup_working_set_mib(lvl),
+                "is_shared_user_slice": eff_systemd_active and (lvl.name in shared_names),
+            }
+        )
+
+    w_cg = t_cg / "anneal.slice" / "anneal-workloads.slice"
+    w_cg_path_str = str(w_cg)
+    w_cg_mb = 0
+    w_cg_nonrecl_mb = 0
+    l_ws_mb = 0
+    try:
+        if w_cg.is_dir():
+            w_cg_mb = read_cgroup_working_set_mib(w_cg)
+            w_cg_nonrecl_mb = read_cgroup_nonrecl_mib(w_cg)
+            l_bytes = 0
+            for scope_dir in w_cg.glob("anneal-lsp-daemon-*.scope"):
+                if scope_dir.is_dir():
+                    l_bytes += compute_cgroup_working_set_bytes(scope_dir)
+            l_ws_mb = l_bytes // MIB
+    except OSError:
+        pass
+
+    return (
+        t_cg,
+        ancestors,
+        eff_systemd_active,
+        t_cg_is_user_service,
+        w_cg_mb,
+        w_cg_nonrecl_mb,
+        l_ws_mb,
+        w_cg_path_str,
+    )
+
+
+def resolve_effective_concurrency(
+    *,
+    is_cg_capped: bool,
+    s_heavy_safe: int,
+    w_file: int | None,
+    cli_concurrency: int | None,
+    env_concurrency: int | None,
+    exclusive: bool = False,
+    is_probe: bool = False,
+) -> tuple[int, int]:
+    """Resolves `(w_eff, build_slots)` with heterogeneous-safe host-bounded precedence."""
+    s_safe = max(1, int(s_heavy_safe))
+    if cli_concurrency is not None:
+        w_req = max(1, int(cli_concurrency))
+    elif env_concurrency is not None:
+        w_req = max(1, int(env_concurrency))
+    else:
+        w_req = max(1, int(w_file)) if w_file is not None else 1
+
+    if is_probe and cli_concurrency is not None:
+        w_eff = min(w_req, s_safe) if is_cg_capped else w_req
+        if w_file is not None:
+            w_host = min(max(1, int(w_file)), s_safe) if is_cg_capped else max(1, int(w_file))
+            build_slots = w_host
+        else:
+            build_slots = w_eff
+        return w_eff, build_slots
+
+    if w_file is not None:
+        w_host = min(max(1, int(w_file)), s_safe) if is_cg_capped else max(1, int(w_file))
+        build_slots = w_host
+        if exclusive:
+            w_eff = 1
+        else:
+            w_eff = min(max(w_req, w_host), s_safe) if is_cg_capped else max(w_req, w_host)
+        return w_eff, build_slots
+
+    w_unconf = min(w_req, s_safe) if is_cg_capped else w_req
+    build_slots = w_unconf
+    w_eff = 1 if exclusive else w_unconf
+    return w_eff, build_slots
+
+
+def compute_workload_memory_envelope(
+    *,
+    cpu_cores: int,
+    mem_total_mb: int,
+    mem_avail_mb: int,
+    ancestors: list[dict[str, Any]] | None = None,
+    w_cg_mb: int = 0,
+    w_cg_nonrecl_mb: int = 0,
+    l_ws_mb: int = 0,
+    user_systemd_active: bool = False,
+    lsp_pinned: bool = False,
+    w_file: int | None = None,
+    cli_concurrency: int | None = None,
+    env_concurrency: int | None = None,
+    exclusive: bool = False,
+    is_probe: bool = False,
+    mode: str = "build",
+    override_mem_mb: int | None = None,
+    override_timeout_sec: int | None = None,
+    unsafe_ignore_cgroup: bool = False,
+    runtime_base: str = "/tmp",
+    w_cg_path: str | None = None,
+    t_cg_path: str | None = None,
+    t_cg_is_user_service: bool = False,
+    active_build_slots: int = 0,
+) -> dict[str, Any]:
+    """Pure 1-MiB-monotonic two-regime `WorkloadMemoryEnvelope` computation."""
+    eff_cores = max(1, int(cpu_cores))
+    eff_total = max(1, int(mem_total_mb))
+    eff_avail = max(0, min(eff_total, int(mem_avail_mb)))
+    eff_w_cg = max(0, int(w_cg_mb))
+    eff_w_cg_nonrecl = max(0, int(w_cg_nonrecl_mb))
+    eff_l_ws = max(0, int(l_ws_mb))
+    anc_list = list(ancestors or [])
+
+    capped_ancestors: list[dict[str, Any]] = []
+    a_lim: dict[str, Any] | None = None
+    min_c_high = eff_total
+    for anc in anc_list:
+        c_a = anc.get("c_high_mb")
+        if isinstance(c_a, int) and c_a < eff_total:
+            capped_ancestors.append(anc)
+            # On exact ties walking leaf->root, prefer the broader/outer ancestor.
+            if c_a <= min_c_high:
+                min_c_high = c_a
+                a_lim = anc
+
+    is_cg_capped = bool(capped_ancestors and a_lim is not None)
+    c_high_mb = min_c_high if is_cg_capped else eff_total
+    a_lim_path = str(a_lim["path"]) if (is_cg_capped and a_lim is not None) else None
+
+    m_safety_host = _m_safety_host(eff_total)
+    w_host_live = eff_avail + eff_w_cg_nonrecl - m_safety_host
+    uncapped_slice_max = (3 * eff_total) // 4
+
+    if is_cg_capped:
+        static_caps: list[int] = []
+        cg_live_vals: list[int] = []
+        for anc in capped_ancestors:
+            c_a = int(anc["c_high_mb"])
+            is_shared = bool(anc.get("is_shared_user_slice", False))
+            r_a = _r_cg(c_a)
+            m_cp_a = _m_cp_floor(c_a, is_shared)
+            static_caps.append(max(0, r_a - m_cp_a))
+            b_non_wl_a = max(0, int(anc.get("w_mb", 0)) - eff_w_cg)
+            cg_live_vals.append(r_a - max(m_cp_a, b_non_wl_a))
+        w_slice_max_mb = min(uncapped_slice_max, min(static_caps))
+        w_slice_high_mb = (94 * w_slice_max_mb) // 100
+        w_cg_live_mb: int | None = min(cg_live_vals)
+        w_live_mb = max(0, min(w_slice_max_mb, w_cg_live_mb, w_host_live))
+        m_safety_mb = _m_safety_cg(c_high_mb)
+    else:
+        w_slice_max_mb = uncapped_slice_max
+        w_slice_high_mb = (94 * w_slice_max_mb) // 100
+        w_cg_live_mb = None
+        w_live_mb = max(0, min(w_slice_max_mb, w_host_live))
+        m_safety_mb = m_safety_host
+
+    w_non_lsp_mb = max(0, eff_w_cg - eff_l_ws)
+    usable_mem_mb = max(
+        0, w_live_mb - (eff_w_cg if lsp_pinned else w_non_lsp_mb)
+    )
+    usable_workload_mem_gb = usable_mem_mb // 1024
+
+    s_heavy_safe = min(
+        max(1, eff_cores // 8),
+        max(1, w_slice_max_mb // 12288),
+    )
+
+    w_eff, build_slots = resolve_effective_concurrency(
+        is_cg_capped=is_cg_capped,
+        s_heavy_safe=s_heavy_safe,
+        w_file=w_file,
+        cli_concurrency=cli_concurrency,
+        env_concurrency=env_concurrency,
+        exclusive=exclusive,
+        is_probe=is_probe,
+    )
+
+    b_evict_pool = max(0, w_live_mb - (eff_l_ws if lsp_pinned else 0))
+    b_evict_free = max(0, w_live_mb - (eff_w_cg if lsp_pinned else w_non_lsp_mb))
+    b_max_evict_mb = min(
+        ((90 * b_evict_pool) // 100) // w_eff,
+        (90 * b_evict_free) // 100,
+    )
+    single_build_budget_gb = round(b_max_evict_mb / 1024.0, 2)
+
+    l_max_mb = min(
+        w_slice_high_mb,
+        _clamp((55 * w_slice_max_mb) // 100, 2048, 32768),
+    )
+    max_lean_workers = (
+        1
+        if w_slice_max_mb < 16384
+        else min(4, max(2, w_slice_max_mb // 12288))
+    )
+    max_rust_workers = 1 if w_slice_max_mb < 24576 else 2
+    idle_ttl_seconds = 300 if w_slice_max_mb < 16384 else 900
+
+    b_avail_pool = max(0, w_live_mb - eff_l_ws)
+    b_avail_free = max(0, w_live_mb - eff_w_cg)
+    term1 = ((90 * b_avail_pool) // 100) // w_eff
+    term2 = (90 * b_avail_free) // 100
+    if mode == "file":
+        file_ceiling = min((50 * w_slice_max_mb) // 100, 16384)
+        computed_b_max_mb = min(term1, term2, file_ceiling)
+        default_timeout = 180
+    else:
+        computed_b_max_mb = min(term1, term2)
+        default_timeout = 900
+
+    if override_mem_mb is not None and override_mem_mb > 0:
+        if is_cg_capped and not unsafe_ignore_cgroup:
+            b_max_mb = min(int(override_mem_mb), w_slice_max_mb)
+        else:
+            b_max_mb = int(override_mem_mb)
+    else:
+        b_max_mb = computed_b_max_mb
+
+    lean_m_mb = (75 * b_max_mb) // 100
+    timeout_sec = (
+        int(override_timeout_sec)
+        if (override_timeout_sec is not None and override_timeout_sec > 0)
+        else default_timeout
+    )
+
+    if is_cg_capped and c_high_mb <= 32768:
+        threads = min(max(1, eff_cores // w_eff), max(2, b_max_mb // 1800))
+    else:
+        threads = max(1, eff_cores // w_eff)
+
+    skip_evict = (
+        w_slice_max_mb >= 16384
+        and (w_live_mb - eff_w_cg) >= min(14336, (75 * w_live_mb) // 100)
+    )
+
+    return {
+        # Canonical lowercase snake_case contract keys
+        "mem_total_mb": eff_total,
+        "mem_avail_mb": eff_avail,
+        "user_systemd_active": bool(user_systemd_active),
+        "is_cg_capped": is_cg_capped,
+        "w_eff": w_eff,
+        "runtime_base": str(runtime_base),
+        "w_cg_path": w_cg_path,
+        "a_lim_path": a_lim_path,
+        "c_high_mb": c_high_mb,
+        "m_safety_mb": m_safety_mb,
+        "w_slice_max_mb": w_slice_max_mb,
+        "w_slice_high_mb": w_slice_high_mb,
+        "usable_workload_mem_gb": usable_workload_mem_gb,
+        "single_build_budget_gb": single_build_budget_gb,
+        "s_heavy_safe": s_heavy_safe,
+        "l_max_mb": l_max_mb,
+        "max_lean_workers": max_lean_workers,
+        "max_rust_workers": max_rust_workers,
+        "idle_ttl_seconds": idle_ttl_seconds,
+        "active_build_slots": max(0, int(active_build_slots)),
+        # Execution & backward-compatible fields
+        "mode": mode,
+        "concurrency": w_eff,
+        "cpu_cores": eff_cores,
+        "threads": threads,
+        "memory_max_mb": b_max_mb,
+        "lean_m_mb": lean_m_mb,
+        "timeout_sec": timeout_sec,
+        "build_slots": build_slots,
+        "systemd_user_scope": bool(user_systemd_active),
+        "w_live_mb": w_live_mb,
+        "w_cg_live_mb": w_cg_live_mb,
+        "w_host_live_mb": w_host_live,
+        "w_cg_mb": eff_w_cg,
+        "w_cg_nonrecl_mb": eff_w_cg_nonrecl,
+        "w_non_lsp_mb": w_non_lsp_mb,
+        "l_ws_mb": eff_l_ws,
+        "b_max_evict_mb": b_max_evict_mb,
+        "skip_evict": skip_evict,
+        "t_cg_path": t_cg_path,
+        "t_cg_is_user_service": bool(t_cg_is_user_service),
+        "capped_ancestors": [
+            {"path": str(a["path"]), "c_high_mb": int(a["c_high_mb"])}
+            for a in capped_ancestors
+        ],
+    }
+
+
+def probe_host_envelope(
+    *,
+    meminfo_path: Path = Path("/proc/meminfo"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+    cpu_cores: int | None = None,
+    mem_total_mb: int | None = None,
+    mem_avail_mb: int | None = None,
+    user_systemd_active: bool | None = None,
+    runtime_base: Path | None = None,
+    user_systemd_sock_alive: bool | None = None,
+    uid: int | None = None,
+    concurrency_file_path: Path | None = None,
+    w_file: int | None = None,
+    cli_concurrency: int | None = None,
+    env_concurrency: int | None = None,
+    exclusive: bool = False,
+    is_probe: bool = False,
+    mode: str = "build",
+    override_mem_mb: int | None = None,
+    override_timeout_sec: int | None = None,
+    unsafe_ignore_cgroup: bool = False,
+    lsp_pinned: bool | None = None,
+) -> dict[str, Any]:
+    """Probes live host hardware, cgroup v2 ancestry, and `WorkloadMemoryEnvelope`."""
+    eff_uid = os.getuid() if uid is None else uid
+    if runtime_base is None or user_systemd_sock_alive is None:
+        rb, sock_alive = resolve_runtime_base()
+        if runtime_base is None:
+            runtime_base = rb
+        if user_systemd_sock_alive is None:
+            user_systemd_sock_alive = sock_alive
+
+    raw_cores, raw_total, raw_avail = _read_raw_meminfo_and_cpus(meminfo_path)
+    eff_cores = raw_cores if cpu_cores is None else max(1, int(cpu_cores))
+    eff_total = raw_total if mem_total_mb is None else max(1, int(mem_total_mb))
+    eff_avail = raw_avail if mem_avail_mb is None else max(0, min(eff_total, int(mem_avail_mb)))
+
+    has_cg_override = (
+        cgroup_root != Path("/sys/fs/cgroup")
+        or proc_cgroup_path != Path("/proc/self/cgroup")
+    )
+    if user_systemd_active is None:
+        if has_cg_override:
+            eff_systemd_req = False
+        else:
+            eff_systemd_req = check_user_systemd_active(
+                runtime_base=runtime_base,
+                user_systemd_sock_alive=user_systemd_sock_alive,
+                cgroup_root=cgroup_root,
+                uid=eff_uid,
+            )
+    else:
+        eff_systemd_req = bool(user_systemd_active)
+
+    (
+        t_cg,
+        ancestors,
+        eff_systemd_active,
+        t_cg_is_user_service,
+        w_cg_mb,
+        w_cg_nonrecl_mb,
+        l_ws_mb,
+        w_cg_path_str,
+    ) = _resolve_target_cgroup_ancestors(
+        cgroup_root=cgroup_root,
+        proc_cgroup_path=proc_cgroup_path,
+        user_systemd_active=eff_systemd_req,
+        uid=eff_uid,
+    )
+
+    eff_w_file = (
+        w_file
+        if w_file is not None
+        else read_concurrency_config_file(concurrency_file_path)
+    )
+    eff_env_conc = (
+        env_concurrency
+        if env_concurrency is not None
+        else _env_optional_pos_int("ANNEAL_WORKTREE_CONCURRENCY")
+    )
+    eff_lsp_pinned = (
+        lsp_pinned
+        if lsp_pinned is not None
+        else (os.environ.get("ANNEAL_LSP_NO_EVICT") == "1")
+    )
+    active_slots = count_active_build_slots(runtime_base, uid=eff_uid)
+
+    env_dict = compute_workload_memory_envelope(
+        cpu_cores=eff_cores,
+        mem_total_mb=eff_total,
+        mem_avail_mb=eff_avail,
+        ancestors=ancestors,
+        w_cg_mb=w_cg_mb,
+        w_cg_nonrecl_mb=w_cg_nonrecl_mb,
+        l_ws_mb=l_ws_mb,
+        user_systemd_active=eff_systemd_active,
+        lsp_pinned=eff_lsp_pinned,
+        w_file=eff_w_file,
+        cli_concurrency=cli_concurrency,
+        env_concurrency=eff_env_conc,
+        exclusive=exclusive,
+        is_probe=is_probe,
+        mode=mode,
+        override_mem_mb=override_mem_mb,
+        override_timeout_sec=override_timeout_sec,
+        unsafe_ignore_cgroup=unsafe_ignore_cgroup,
+        runtime_base=str(runtime_base),
+        w_cg_path=w_cg_path_str,
+        t_cg_path=str(t_cg) if t_cg is not None else None,
+        t_cg_is_user_service=t_cg_is_user_service,
+        active_build_slots=active_slots,
+    )
+    # Include legacy cgroup_v2 telemetry keys for compatibility.
+    cg = probe_cgroup_v2_memory(
+        cgroup_root=cgroup_root, proc_cgroup_path=proc_cgroup_path
+    )
+    for k, v in cg.items():
+        env_dict.setdefault(k, v)
+    return env_dict
+
+
+def _lake_subcommand_index(cmd: list[str]) -> int | None:
+    """Returns index of the Lake subcommand in `cmd`, scanning past global options."""
+    if not cmd or Path(cmd[0]).name != "lake":
+        return None
+    i = 1
+    n = len(cmd)
+    while i < n:
+        arg = cmd[i]
+        if arg == "--":
+            return None
+        if arg.startswith("+") and len(arg) > 1:
+            i += 1
+            continue
+        if arg in _LAKE_VALUE_OPTS:
+            i += 2
+            continue
+        if arg.startswith(_LAKE_VALUE_EQ_PREFIXES):
+            i += 1
+            continue
+        if len(arg) > 2 and arg[:2] in ("-d", "-f", "-K", "-p"):
+            i += 1
+            continue
+        if arg in _LAKE_FLAG_OPTS:
+            i += 1
+            continue
+        if arg.startswith("-"):
+            return None
+        return i
+    return None
+
+
+def _lake_env_lean_index(cmd: list[str]) -> int | None:
+    """Returns index of `lean` in `lake [global-opts] env [--] <*/lean> ...`, or None."""
+    sub_idx = _lake_subcommand_index(cmd)
+    if sub_idx is None or cmd[sub_idx] != "env":
+        return None
+    j = sub_idx + 1
+    if j < len(cmd) and cmd[j] == "--":
+        j += 1
+    if j < len(cmd) and Path(cmd[j]).name == "lean":
+        return j
+    return None
 
 
 def detect_mode(cmd: list[str], requested_mode: str) -> str:
@@ -433,15 +1307,10 @@ def detect_mode(cmd: list[str], requested_mode: str) -> str:
         return "build"
 
     exe = Path(cmd[0]).name
-    if exe == "lean" and "--run" not in cmd:
+    if exe == "lean" and "--run" not in cmd[1:]:
         return "file"
-    if (
-        exe == "lake"
-        and len(cmd) >= 3
-        and cmd[1] == "env"
-        and Path(cmd[2]).name == "lean"
-        and "--run" not in cmd
-    ):
+    lean_idx = _lake_env_lean_index(cmd)
+    if lean_idx is not None and "--run" not in cmd[lean_idx + 1 :]:
         return "file"
     return "build"
 
@@ -449,115 +1318,100 @@ def detect_mode(cmd: list[str], requested_mode: str) -> str:
 def compute_limits(
     hw: dict[str, Any],
     mode: str,
-    concurrency: int,
+    concurrency: int | None = None,
     override_mem_mb: int | None = None,
     override_timeout_sec: int | None = None,
+    unsafe_ignore_cgroup: bool = False,
 ) -> dict[str, Any]:
-    """Computes hardware-matched thread, RAM, and wall-clock limits."""
-    w = max(1, concurrency)
-    cpu_cores = max(1, int(hw["cpu_cores"]))
-    mem_total_mb = max(1024, int(hw["mem_total_mb"]))
-    mem_avail_mb = max(512, int(hw["mem_avail_mb"]))
+    """Compatibility wrapper computing limits from a hardware/envelope dict."""
+    if "w_slice_max_mb" in hw and "single_build_budget_gb" in hw:
+        # Already a full WorkloadMemoryEnvelope; recompute if mode/concurrency/overrides differ.
+        ancestors: list[dict[str, Any]] = []
+        if hw.get("is_cg_capped") and hw.get("a_lim_path"):
+            ancestors = [
+                {
+                    "path": hw["a_lim_path"],
+                    "name": Path(hw["a_lim_path"]).name,
+                    "c_high_mb": hw["c_high_mb"],
+                    "w_mb": hw.get("w_cg_mb", 0),
+                    "is_shared_user_slice": bool(hw.get("user_systemd_active", False)),
+                }
+            ]
+        return compute_workload_memory_envelope(
+            cpu_cores=int(hw["cpu_cores"]),
+            mem_total_mb=int(hw["mem_total_mb"]),
+            mem_avail_mb=int(hw["mem_avail_mb"]),
+            ancestors=ancestors,
+            w_cg_mb=int(hw.get("w_cg_mb", 0)),
+            w_cg_nonrecl_mb=int(hw.get("w_cg_nonrecl_mb", 0)),
+            l_ws_mb=int(hw.get("l_ws_mb", 0)),
+            user_systemd_active=bool(hw.get("user_systemd_active", False)),
+            cli_concurrency=concurrency,
+            mode=mode,
+            override_mem_mb=override_mem_mb,
+            override_timeout_sec=override_timeout_sec,
+            unsafe_ignore_cgroup=unsafe_ignore_cgroup,
+            runtime_base=str(hw.get("runtime_base") or "/tmp"),
+            w_cg_path=hw.get("w_cg_path"),
+            t_cg_path=hw.get("t_cg_path"),
+            t_cg_is_user_service=bool(hw.get("t_cg_is_user_service", False)),
+            active_build_slots=int(hw.get("active_build_slots", 0)),
+        )
 
     cg_max_mib = hw.get("cgroup_memory_max_mib")
-    if isinstance(cg_max_mib, int) and cg_max_mib > 0:
-        mem_total_mb = max(1024, min(mem_total_mb, cg_max_mib))
-
-    mem_avail_mb = max(512, min(mem_total_mb, mem_avail_mb))
-    cg_avail_mib = hw.get("cgroup_avail_mib")
-    if isinstance(cg_avail_mib, int) and cg_avail_mib >= 0:
-        mem_avail_mb = max(512, min(mem_total_mb, mem_avail_mb, cg_avail_mib))
-
-    threads = max(1, cpu_cores // w)
-
-    # Reserve at least 30% of total RAM for the OS, editors, and warm LSP
-    # servers, and never allocate more than 80% of currently available RAM.
-    per_worker_total_share = int((mem_total_mb * 0.70) // w)
-    avail_share = int(mem_avail_mb * 0.80)
-
-    if mode == "file":
-        # A single `.lean` module check should never consume more than 15% of
-        # total RAM or 16 GiB; exceeding that indicates an exponential kernel
-        # `whnf` or `dsimp` blowup.
-        file_ceiling = min(int(mem_total_mb * 0.15), 16384)
-        computed_mem_mb = max(
-            1024, min(per_worker_total_share, avail_share, file_ceiling)
+    ancestors = []
+    if isinstance(cg_max_mib, int) and cg_max_mib > 0 and cg_max_mib < int(hw["mem_total_mb"]):
+        w_used = hw.get("cgroup_anon_shmem_mib")
+        if w_used is None:
+            w_used = hw.get("cgroup_current_mib") or 0
+        ancestors.append(
+            {
+                "path": str(hw.get("cgroup_path") or "/"),
+                "name": Path(str(hw.get("cgroup_path") or "/")).name or "root",
+                "c_high_mb": cg_max_mib,
+                "w_mb": int(w_used),
+                "is_shared_user_slice": False,
+            }
         )
-        default_timeout = 180
-    else:
-        computed_mem_mb = max(2048, min(per_worker_total_share, avail_share))
-        default_timeout = 900
-
-    memory_max_mb = (
-        override_mem_mb
-        if (override_mem_mb and override_mem_mb > 0)
-        else computed_mem_mb
+    res = compute_workload_memory_envelope(
+        cpu_cores=int(hw["cpu_cores"]),
+        mem_total_mb=int(hw["mem_total_mb"]),
+        mem_avail_mb=int(hw["mem_avail_mb"]),
+        ancestors=ancestors,
+        cli_concurrency=concurrency if concurrency is not None else 1,
+        mode=mode,
+        override_mem_mb=override_mem_mb,
+        override_timeout_sec=override_timeout_sec,
+        unsafe_ignore_cgroup=unsafe_ignore_cgroup,
     )
-    lean_m_mb = max(512, int(memory_max_mb * 0.75))
-    timeout_sec = (
-        override_timeout_sec
-        if (override_timeout_sec and override_timeout_sec > 0)
-        else default_timeout
-    )
-
-    # Number of concurrent heavy `lake build` / `cargo` slots the host can
-    # safely sustain (~24 GiB physical RAM per concurrent full build, min 1).
-    build_slots = max(1, mem_total_mb // 24576)
-
-    return {
-        "mode": mode,
-        "concurrency": w,
-        "cpu_cores": cpu_cores,
-        "mem_total_mb": mem_total_mb,
-        "mem_avail_mb": mem_avail_mb,
-        "threads": threads,
-        "memory_max_mb": memory_max_mb,
-        "lean_m_mb": lean_m_mb,
-        "timeout_sec": timeout_sec,
-        "build_slots": build_slots,
-        "cgroup_v2": bool(hw.get("cgroup_v2", False)),
-        "cgroup_path": hw.get("cgroup_path"),
-        "cgroup_anon_mib": hw.get("cgroup_anon_mib"),
-        "cgroup_shmem_mib": hw.get("cgroup_shmem_mib"),
-        "cgroup_anon_shmem_mib": hw.get("cgroup_anon_shmem_mib"),
-        "cgroup_file_cache_mib": hw.get("cgroup_file_cache_mib"),
-        "cgroup_current_mib": hw.get("cgroup_current_mib"),
-        "cgroup_memory_max_mib": cg_max_mib if isinstance(cg_max_mib, int) else None,
-        "cgroup_avail_mib": cg_avail_mib if isinstance(cg_avail_mib, int) else None,
-    }
+    for k in (
+        "cgroup_v2",
+        "cgroup_path",
+        "cgroup_anon_mib",
+        "cgroup_shmem_mib",
+        "cgroup_anon_shmem_mib",
+        "cgroup_file_cache_mib",
+        "cgroup_current_mib",
+        "cgroup_memory_max_mib",
+        "cgroup_avail_mib",
+    ):
+        res[k] = hw.get(k)
+    return res
 
 
 def format_cgroup_probe_line(limits: dict[str, Any]) -> str:
     """Formats the human-readable `Cgroup v2 Memory` line for `--probe`."""
-    if not limits.get("cgroup_v2"):
+    if not limits.get("cgroup_v2") and not limits.get("is_cg_capped"):
         return "  Cgroup v2 Memory   : unavailable (using /proc/meminfo)"
-    anon_shmem = limits.get("cgroup_anon_shmem_mib")
-    anon = limits.get("cgroup_anon_mib")
-    shmem = limits.get("cgroup_shmem_mib")
-    file_cache = limits.get("cgroup_file_cache_mib")
-    current = limits.get("cgroup_current_mib")
-    cg_max = limits.get("cgroup_memory_max_mib")
-    cg_avail = limits.get("cgroup_avail_mib")
-
-    ws_str = (
-        f"{anon_shmem} MiB (anon={anon} MiB, shmem={shmem} MiB)"
-        if anon_shmem is not None
-        else "n/a"
-    )
-    file_str = f"{file_cache} MiB" if file_cache is not None else "n/a"
-    cur_str = f"{current} MiB" if current is not None else "n/a"
-    if cg_max is not None:
-        max_str = (
-            f"{cg_max} MiB (avail={cg_avail} MiB)"
-            if cg_avail is not None
-            else f"{cg_max} MiB"
-        )
-    else:
-        max_str = "unbounded"
-
+    regime = "capped" if limits.get("is_cg_capped") else "uncapped"
+    c_high = limits.get("c_high_mb")
+    w_smax = limits.get("w_slice_max_mb")
+    w_shigh = limits.get("w_slice_high_mb")
+    w_live = limits.get("w_live_mb")
+    a_lim = limits.get("a_lim_path") or "none"
     return (
-        f"  Cgroup v2 Memory   : anon+shmem={ws_str}, "
-        f"file={file_str}, current={cur_str}, memory.max={max_str}"
+        f"  Cgroup v2 Envelope : regime={regime}, C_high={c_high} MiB ({a_lim}), "
+        f"W_slice_max={w_smax} MiB, W_slice_high={w_shigh} MiB, W_live={w_live} MiB"
     )
 
 
@@ -565,14 +1419,7 @@ def format_cgroup_diagnostic_snapshot(
     cg: dict[str, Any] | None = None,
     pid: int | None = None,
 ) -> str:
-    """Formats a post-mortem cgroup v2 memory snapshot for timeout/OOM stderr diagnostics.
-
-    When `pid` is provided (e.g. a timed-out child before `SIGKILL`), probes
-    `/proc/<pid>/cgroup` first so transient `systemd-run --user --scope` stats
-    are captured while the scope is still alive, falling back to `/proc/self/cgroup`.
-    Never raises, so a telemetry failure can never turn a structured `124` /
-    `137` diagnostic into a Python traceback with exit code `1`.
-    """
+    """Formats a post-mortem cgroup v2 memory snapshot for timeout/OOM stderr diagnostics."""
     try:
         info = cg
         if info is None and pid is not None and pid > 0:
@@ -602,49 +1449,180 @@ def format_cgroup_diagnostic_snapshot(
 
 
 def systemd_user_scope_available() -> bool:
-    """Returns True if `systemd-run --user --scope` can create cgroup scopes."""
-    if shutil.which("systemd-run") is None:
-        return False
-    try:
-        res = subprocess.run(
-            [
-                "systemd-run",
-                "--user",
-                "--scope",
-                "--quiet",
-                "-p",
-                "MemoryMax=512M",
-                "true",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=3.0,
+    """Zero-scope-spam check returning True if `systemd --user` with memory delegation is live."""
+    return check_user_systemd_active()
+
+
+def _workloads_slice_unit_path() -> Path:
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg_cfg) if xdg_cfg else (Path.home() / ".config")
+    return base / "systemd" / "user" / "anneal-workloads.slice"
+
+
+def render_workloads_slice_unit(w_slice_high_mb: int, w_slice_max_mb: int) -> str:
+    """Renders the static `anneal-workloads.slice` systemd user unit."""
+    return (
+        "[Unit]\n"
+        "Description=Anneal Bounded Compute & Warm LSP Workloads Slice\n"
+        "\n"
+        "[Slice]\n"
+        "MemoryAccounting=yes\n"
+        f"MemoryHigh={int(w_slice_high_mb)}M\n"
+        f"MemoryMax={int(w_slice_max_mb)}M\n"
+        "MemorySwapMax=0\n"
+        "ManagedOOMMemoryPressure=kill\n"
+        "ManagedOOMMemoryPressureLimit=40%\n"
+    )
+
+
+def ensure_workloads_slice(
+    env_info: dict[str, Any],
+    *,
+    unit_path: Path | None = None,
+    reload_systemd: bool = True,
+) -> tuple[bool, bool, str]:
+    """Single-writer `anneal-workloads.slice` reconciler.
+
+    Gated STRICTLY on `user_systemd_active is True` AND `T_cg == user@<uid>.service`.
+    Content-diffs before writing and running `systemctl --user daemon-reload`.
+    Returns `(ok, changed, message)`.
+    """
+    if not env_info.get("user_systemd_active") or not env_info.get("t_cg_is_user_service"):
+        return (
+            False,
+            False,
+            "Refusing to write anneal-workloads.slice: user_systemd_active is False "
+            "or target execution cgroup is not user@<uid>.service.",
         )
-        return res.returncode == 0
-    except Exception:
-        return False
+
+    target = unit_path if unit_path is not None else _workloads_slice_unit_path()
+    rendered = render_workloads_slice_unit(
+        int(env_info["w_slice_high_mb"]), int(env_info["w_slice_max_mb"])
+    )
+    try:
+        if target.is_file():
+            existing = target.read_text(encoding="utf-8", errors="replace")
+            if existing == rendered:
+                return (True, False, f"{target} is already up to date.")
+    except OSError:
+        pass
+
+    tmp_path: str | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".anneal-workloads.slice.", dir=str(target.parent)
+        )
+        try:
+            os.write(fd, rendered.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, str(target))
+        tmp_path = None
+    except OSError as exc:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return (False, False, f"Failed writing {target}: {exc}")
+
+    if reload_systemd:
+        systemctl_bin = _find_systemctl()
+        if not systemctl_bin:
+            return (False, True, f"Wrote {target} but `systemctl` binary is missing.")
+        runtime_base = Path(str(env_info.get("runtime_base") or "/tmp"))
+        try:
+            res = subprocess.run(
+                [systemctl_bin, "--user", "daemon-reload"],
+                env=_systemd_env(runtime_base, True),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5.0,
+            )
+            if res.returncode != 0:
+                detail = res.stderr.strip() or res.stdout.strip() or f"exit {res.returncode}"
+                return (False, True, f"Wrote {target} but daemon-reload failed: {detail}")
+        except Exception as exc:
+            return (False, True, f"Wrote {target} but daemon-reload errored: {exc}")
+
+    return (True, True, f"Updated {target} and reloaded user systemd.")
 
 
 @contextmanager
 def acquire_build_slot(
-    max_slots: int, timeout_sec: int, enabled: bool
-) -> Iterator[int | None]:
-    """Acquires one of `max_slots` host build locks to prevent RAM stampedes."""
+    max_slots: int,
+    timeout_sec: float,
+    enabled: bool,
+    *,
+    exclusive: bool = False,
+    runtime_base: Path | None = None,
+    poll_interval: float = 0.5,
+) -> Iterator[int | list[int] | None]:
+    """Fail-closed host build lock acquisition (normal 1-of-N or ascending `--exclusive` 1..N)."""
     if not enabled or max_slots <= 0:
         yield None
         return
 
-    runtime_base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
-    slot_dir = Path(runtime_base) / f"anneal-build-slots-{os.getuid()}"
-    try:
-        slot_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        yield None
+    base = runtime_base if runtime_base is not None else resolve_runtime_base()[0]
+    slot_dir = Path(base) / f"anneal-build-slots-{os.getuid()}"
+    slot_dir.mkdir(parents=True, exist_ok=True)
+
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    warned = False
+
+    if exclusive:
+        acquired: list[tuple[int, int]] = []
+        try:
+            for slot_idx in range(1, max_slots + 1):
+                lock_path = slot_dir / f"slot-{slot_idx}.lock"
+                while True:
+                    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        try:
+                            os.ftruncate(fd, 0)
+                            os.write(
+                                fd,
+                                f"pid={os.getpid()} ts={int(time.time())} exclusive=1\n".encode(
+                                    "utf-8"
+                                ),
+                            )
+                        except OSError:
+                            pass
+                        acquired.append((slot_idx, fd))
+                        break
+                    except BlockingIOError:
+                        os.close(fd)
+                        rem = deadline - time.monotonic()
+                        if rem <= 0:
+                            raise TimeoutError(
+                                f"BUILD_SLOT_TIMEOUT: Timed out after {timeout_sec}s "
+                                f"waiting for exclusive slot {slot_idx}/{max_slots} in {slot_dir}"
+                            )
+                        if not warned:
+                            sys.stderr.write(
+                                f"[anneal-lean-run] Waiting for exclusive access to all "
+                                f"{max_slots} host build slot(s) (blocked on slot {slot_idx})...\n"
+                            )
+                            warned = True
+                        time.sleep(min(poll_interval, max(0.01, rem)))
+            yield [idx for idx, _ in acquired]
+        finally:
+            for _, fd in reversed(acquired):
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         return
 
-    deadline = time.monotonic() + max(30, timeout_sec)
-    warned = False
     while True:
         for slot_idx in range(1, max_slots + 1):
             lock_path = slot_dir / f"slot-{slot_idx}.lock"
@@ -658,9 +1636,7 @@ def acquire_build_slot(
                     os.ftruncate(fd, 0)
                     os.write(
                         fd,
-                        f"pid={os.getpid()} ts={int(time.time())}\n".encode(
-                            "utf-8"
-                        ),
+                        f"pid={os.getpid()} ts={int(time.time())}\n".encode("utf-8"),
                     )
                 except OSError:
                     pass
@@ -677,35 +1653,45 @@ def acquire_build_slot(
                 os.close(fd)
                 continue
 
-        if time.monotonic() >= deadline:
-            yield None
-            return
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError(
+                f"BUILD_SLOT_TIMEOUT: Timed out after {timeout_sec}s waiting for "
+                f"1 of {max_slots} host build slot(s) in {slot_dir}"
+            )
         if not warned:
             sys.stderr.write(
                 f"[anneal-lean-run] All {max_slots} host build slot(s) busy; "
                 "queuing to prevent RAM/swap exhaustion...\n"
             )
             warned = True
-        time.sleep(1.0)
+        time.sleep(min(poll_interval, max(0.01, rem)))
+
+
+def _has_lean_m_arg(args: list[str]) -> bool:
+    for a in args:
+        if a == "--":
+            break
+        if a == "-M" or a.startswith("-M") or a == "--memory" or a.startswith("--memory="):
+            return True
+    return False
 
 
 def inject_lean_m_flag(cmd: list[str], lean_m_mb: int) -> list[str]:
-    """Injects `-M <lean_m_mb>` into direct `lean` calls when absent."""
-    if "-M" in cmd or any(a.startswith("-M") for a in cmd):
+    """Injects `-M <lean_m_mb>` into direct `lean` or `lake [opts] env [--] lean` calls."""
+    if not cmd or lean_m_mb <= 0:
         return list(cmd)
-    if not cmd:
-        return []
     exe = Path(cmd[0]).name
-    if exe == "lean" and "--run" not in cmd:
+    if exe == "lean":
+        if "--run" in cmd[1:] or _has_lean_m_arg(cmd[1:]):
+            return list(cmd)
         return [cmd[0], "-M", str(lean_m_mb), *cmd[1:]]
-    if (
-        exe == "lake"
-        and len(cmd) >= 3
-        and cmd[1] == "env"
-        and Path(cmd[2]).name == "lean"
-        and "--run" not in cmd
-    ):
-        return [cmd[0], cmd[1], cmd[2], "-M", str(lean_m_mb), *cmd[3:]]
+    lean_idx = _lake_env_lean_index(cmd)
+    if lean_idx is not None:
+        lean_args = cmd[lean_idx + 1 :]
+        if "--run" in lean_args or _has_lean_m_arg(lean_args):
+            return list(cmd)
+        return [*cmd[: lean_idx + 1], "-M", str(lean_m_mb), *lean_args]
     return list(cmd)
 
 
@@ -736,53 +1722,642 @@ def terminate_process_group(pgid: int, grace_sec: float = 2.0) -> None:
         pass
 
 
-def run_bounded_command(
-    cmd: list[str], limits: dict[str, Any], use_slot_lock: bool
-) -> int:
-    """Executes `cmd` inside the computed memory, swap, thread, and time bounds."""
-    threads = int(limits["threads"])
-    memory_max_mb = int(limits["memory_max_mb"])
-    lean_m_mb = int(limits["lean_m_mb"])
-    timeout_sec = int(limits["timeout_sec"])
-    build_slots = int(limits["build_slots"])
-    mode = str(limits["mode"])
+def _kill_systemd_scope(
+    unit_name: str | None,
+    proc: subprocess.Popen[Any],
+    runtime_base: Path,
+    user_systemd_sock_alive: bool,
+    grace_sec: float = 2.0,
+) -> None:
+    """Kills a transient systemd scope (including detached grandchildren) + pgid fallback."""
+    systemctl_bin = _find_systemctl() if (unit_name and user_systemd_sock_alive) else None
+    env = _systemd_env(runtime_base, user_systemd_sock_alive)
 
-    effective_cmd = inject_lean_m_flag(cmd, lean_m_mb)
-    has_systemd_scope = systemd_user_scope_available()
-    if has_systemd_scope:
-        # Set `RuntimeMaxSec` slightly above `timeout_sec` so Python's `wait`
-        # reports a structured timeout diagnostic under normal operation, while
-        # `systemd` still reaps the transient scope if this wrapper receives an
-        # uncatchable `SIGKILL`.
+    if systemctl_bin and unit_name:
+        try:
+            subprocess.run(
+                [systemctl_bin, "--user", "kill", "-s", "SIGTERM", unit_name],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                timeout=2.0,
+            )
+        except Exception:
+            pass
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    deadline = time.monotonic() + grace_sec
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    if systemctl_bin and unit_name:
+        try:
+            subprocess.run(
+                [systemctl_bin, "--user", "kill", "-s", "SIGKILL", unit_name],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                timeout=2.0,
+            )
+        except Exception:
+            pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=5.0)
+    except Exception:
+        pass
+
+
+def _send_lsp_restart_all(sock_path: Path, timeout_sec: float = 5.0) -> bool:
+    """Sends `lean_restart_workspace({"root": "all"})` over a raw Unix socket if alive."""
+    try:
+        if not sock_path.is_socket():
+            return False
+    except OSError:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout_sec)
+            s.connect(str(sock_path))
+            payload = (
+                json.dumps({"action": "lean_restart_workspace", "args": {"root": "all"}})
+                + "\n"
+            )
+            s.sendall(payload.encode("utf-8"))
+            buf = bytearray()
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if b"\n" in chunk:
+                    break
+        if not buf:
+            return False
+        resp = json.loads(bytes(buf).split(b"\n", 1)[0].decode("utf-8", errors="replace"))
+        return bool(resp.get("ok"))
+    except Exception:
+        return False
+
+
+def _evict_lsp_workers(
+    env_info: dict[str, Any],
+    *,
+    timeout_sec: float = 5.0,
+    sock_path: Path | None = None,
+) -> bool:
+    """Evicts warm LSP workers via raw Unix RPC, falling back to `SIGKILL` + cgroup poll."""
+    if os.environ.get("ANNEAL_LSP_NO_EVICT") == "1":
+        return False
+    eff_sock = (
+        sock_path
+        if sock_path is not None
+        else Path(os.environ.get("ANNEAL_LSP_SOCKET", "/tmp/anneal-lean-lsp.sock"))
+    )
+    try:
+        if not eff_sock.is_socket():
+            return False
+    except OSError:
+        return False
+
+    if _send_lsp_restart_all(eff_sock, timeout_sec=timeout_sec):
+        return True
+
+    if env_info.get("user_systemd_active"):
+        systemctl_bin = _find_systemctl()
+        runtime_base = Path(str(env_info.get("runtime_base") or "/tmp"))
+        if systemctl_bin:
+            try:
+                subprocess.run(
+                    [
+                        systemctl_bin,
+                        "--user",
+                        "kill",
+                        "-s",
+                        "SIGKILL",
+                        "anneal-lsp-daemon-*.scope",
+                    ],
+                    env=_systemd_env(runtime_base, True),
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    check=False,
+                    timeout=3.0,
+                )
+            except Exception:
+                pass
+        w_cg_raw = env_info.get("w_cg_path")
+        w_cg = Path(w_cg_raw) if w_cg_raw else None
+        poll_deadline = time.monotonic() + 1.0
+        while time.monotonic() < poll_deadline:
+            if w_cg is None or not w_cg.is_dir():
+                break
+            scopes = [p for p in w_cg.glob("anneal-lsp-daemon-*.scope") if p.is_dir()]
+            if not scopes:
+                break
+            l_bytes = sum(compute_cgroup_working_set_bytes(p) for p in scopes)
+            if (l_bytes // MIB) < 128:
+                break
+            time.sleep(0.1)
+        return True
+    return False
+
+
+def _canonical_git_root(cwd: str | Path | None = None) -> str:
+    work_dir = Path(cwd) if cwd is not None else Path.cwd()
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(work_dir),
+            env=_git_env(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2.0,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return os.path.realpath(res.stdout.strip())
+    except Exception:
+        pass
+    return os.path.realpath(str(work_dir))
+
+
+def stamp_last_oom(
+    runtime_base: Path,
+    mode: str,
+    reason: str,
+    budget_gb: float,
+    *,
+    cwd: str | Path | None = None,
+    now: float | None = None,
+    uid: int | None = None,
+) -> Path:
+    """`flock`-guarded update of `runtime_base/anneal-last-oom-<uid>.json` (pruning `>15m`)."""
+    eff_uid = os.getuid() if uid is None else uid
+    eff_now = time.time() if now is None else float(now)
+    oom_path = Path(runtime_base) / f"anneal-last-oom-{eff_uid}.json"
+    lock_path = Path(runtime_base) / f"anneal-last-oom-{eff_uid}.lock"
+    canonical_root = _canonical_git_root(cwd)
+
+    try:
+        oom_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+", encoding="utf-8") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                data: dict[str, Any] = {"entries": {}}
+                if oom_path.is_file():
+                    try:
+                        loaded = json.loads(
+                            oom_path.read_text(encoding="utf-8", errors="replace")
+                        )
+                        if isinstance(loaded, dict) and isinstance(
+                            loaded.get("entries"), dict
+                        ):
+                            data = loaded
+                    except Exception:
+                        data = {"entries": {}}
+
+                entries: dict[str, dict[str, Any]] = {}
+                for root_key, modes_map in data.get("entries", {}).items():
+                    if not isinstance(modes_map, dict):
+                        continue
+                    kept: dict[str, Any] = {}
+                    for m_key, m_val in modes_map.items():
+                        if not isinstance(m_val, dict):
+                            continue
+                        ts_val = m_val.get("ts")
+                        try:
+                            if eff_now - float(ts_val) <= 900.0:
+                                kept[m_key] = m_val
+                        except (TypeError, ValueError):
+                            continue
+                    if kept:
+                        entries[root_key] = kept
+
+                entries.setdefault(canonical_root, {})[mode] = {
+                    "reason": reason,
+                    "budget_gb": round(float(budget_gb), 2),
+                    "ts": eff_now,
+                }
+                payload = json.dumps({"entries": entries}, indent=2) + "\n"
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=".anneal-last-oom.", dir=str(oom_path.parent)
+                )
+                try:
+                    os.write(fd, payload.encode("utf-8"))
+                finally:
+                    os.close(fd)
+                os.chmod(tmp_name, 0o600)
+                os.replace(tmp_name, str(oom_path))
+            finally:
+                try:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return oom_path
+
+
+def _try_oom_offload(
+    cmd: list[str], mode: str, local_budget_gb: float
+) -> tuple[int, float | None] | None:
+    """Optional Phase-2 `ANNEAL_OOM_OFFLOAD_CMD` hook; returns `(rc, remote_budget_gb)` or None."""
+    raw_cmd = os.environ.get("ANNEAL_OOM_OFFLOAD_CMD", "").strip()
+    if not raw_cmd:
+        return None
+    try:
+        offload_argv = [*shlex.split(raw_cmd), "--", *cmd]
+    except ValueError:
+        return None
+    with tempfile.TemporaryDirectory(prefix="anneal-oom-offload-") as tmpdir:
+        budget_file = Path(tmpdir) / "remote_budget.json"
+        env = os.environ.copy()
+        env["ANNEAL_OOM_LOCAL_BUDGET_GB"] = f"{local_budget_gb:.2f}"
+        env["ANNEAL_OOM_MODE"] = mode
+        env["ANNEAL_OOM_REMOTE_BUDGET_FILE"] = str(budget_file)
+        try:
+            res = subprocess.run(offload_argv, env=env, check=False)
+        except OSError:
+            return (137, None)
+        remote_budget: float | None = None
+        if budget_file.is_file():
+            try:
+                raw_txt = budget_file.read_text(encoding="utf-8", errors="replace").strip()
+                if raw_txt.startswith("{"):
+                    obj = json.loads(raw_txt)
+                    val = obj.get("remote_budget_gb", obj.get("budget_gb"))
+                    if val is not None:
+                        remote_budget = float(val)
+                elif raw_txt:
+                    remote_budget = float(raw_txt)
+            except Exception:
+                remote_budget = None
+        return (res.returncode, remote_budget)
+
+
+class BuildWatchdog:
+    """Two-tier 2.0s mid-build watchdog (Tier 1 LSP shed + Tier 2 multi-ancestor abort)."""
+
+    def __init__(
+        self,
+        *,
+        is_cg_capped: bool,
+        w_cg_path: Path | None,
+        w_slice_high_mb: int,
+        a_lim_path: Path | None,
+        c_high_mb: int,
+        capped_ancestors: list[tuple[Path, int]],
+        lsp_shed_fn: Callable[[], bool] | None = None,
+        read_w_fn: Callable[[Path], int] = read_cgroup_working_set_mib,
+        read_local_high_fn: Callable[[Path], int] = read_events_local_high,
+        read_psi_fn: Callable[[Path], float] = read_psi_full_avg10,
+        lsp_no_evict: bool | None = None,
+    ) -> None:
+        self.is_cg_capped = is_cg_capped
+        self.w_cg_path = w_cg_path
+        self.w_slice_high_mb = max(0, int(w_slice_high_mb))
+        self.a_lim_path = a_lim_path
+        self.c_high_mb = int(c_high_mb)
+        self.capped_ancestors = list(capped_ancestors)
+        self._lsp_shed_fn = lsp_shed_fn
+        self._read_w = read_w_fn
+        self._read_local_high = read_local_high_fn
+        self._read_psi = read_psi_fn
+        self._lsp_no_evict = lsp_no_evict
+        self.last_proactive_shed_ts: float = -1e9
+        self.breach_ticks: int = 0
+        self.prev_local_high: dict[Path, int] = {
+            a_path: self._read_local_high(a_path)
+            for a_path, _ in self.capped_ancestors
+        }
+
+    def _can_shed(self, now: float) -> bool:
+        no_evict = (
+            self._lsp_no_evict
+            if self._lsp_no_evict is not None
+            else (os.environ.get("ANNEAL_LSP_NO_EVICT") == "1")
+        )
+        return (not no_evict) and ((now - self.last_proactive_shed_ts) >= 10.0)
+
+    def _fire_shed(self, now: float) -> bool:
+        if not self._can_shed(now):
+            return False
+        if self._lsp_shed_fn is not None:
+            fired = bool(self._lsp_shed_fn())
+        else:
+            sock_p = Path(
+                os.environ.get("ANNEAL_LSP_SOCKET", "/tmp/anneal-lean-lsp.sock")
+            )
+            fired = _send_lsp_restart_all(sock_p, timeout_sec=0.5)
+        if fired:
+            self.last_proactive_shed_ts = now
+        return fired
+
+    def tick(self, now: float) -> dict[str, Any]:
+        """Executes one 2.0s watchdog evaluation tick."""
+        tier1_triggered = False
+        shed_fired = False
+
+        # Tier 1: proactive LSP shedding on ALL systemd hosts (never kills build).
+        tier1_slice = False
+        if self.w_cg_path is not None and self.w_slice_high_mb > 0:
+            w_cg_cur = self._read_w(self.w_cg_path)
+            slice_thresh = self.w_slice_high_mb - min(1024, self.w_slice_high_mb // 4)
+            tier1_slice = w_cg_cur >= slice_thresh
+
+        tier1_alim = False
+        if self.is_cg_capped and self.a_lim_path is not None:
+            w_alim_cur = self._read_w(self.a_lim_path)
+            tier1_alim = w_alim_cur >= (self.c_high_mb - _m_safety_cg(self.c_high_mb))
+
+        if tier1_slice or tier1_alim:
+            tier1_triggered = True
+            shed_fired = self._fire_shed(now)
+
+        # Tier 2: multi-ancestor build abort strictly on cgroup-capped hosts.
+        if not self.is_cg_capped:
+            return {
+                "action": "ok",
+                "tier1_triggered": tier1_triggered,
+                "shed_fired": shed_fired,
+                "breach_ticks": 0,
+            }
+
+        any_breached = False
+        for a_path, c_high_a in self.capped_ancestors:
+            cur_local_high = self._read_local_high(a_path)
+            delta_local_high = cur_local_high - self.prev_local_high.get(a_path, 0)
+            # Immediately advance prev_local_high on EVERY tick.
+            self.prev_local_high[a_path] = cur_local_high
+
+            w_a = self._read_w(a_path)
+            psi_full = self._read_psi(a_path)
+            thresh_a = c_high_a - min(1024, _m_safety_cg(c_high_a))
+            if (w_a >= thresh_a) or (delta_local_high > 0 and psi_full >= 20.0):
+                any_breached = True
+
+        if any_breached:
+            self.breach_ticks += 1
+            if self.breach_ticks == 1:
+                if self._fire_shed(now):
+                    shed_fired = True
+            if self.breach_ticks >= 3:
+                return {
+                    "action": "abort_pressure",
+                    "tier1_triggered": tier1_triggered,
+                    "shed_fired": shed_fired,
+                    "breach_ticks": self.breach_ticks,
+                }
+        else:
+            self.breach_ticks = 0
+
+        return {
+            "action": "ok",
+            "tier1_triggered": tier1_triggered,
+            "shed_fired": shed_fired,
+            "breach_ticks": self.breach_ticks,
+        }
+
+
+def _build_child_env(
+    threads: int,
+    lean_m_mb: int,
+    is_cg_capped: bool,
+    runtime_base: Path,
+    user_systemd_sock_alive: bool,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    env = _systemd_env(runtime_base, user_systemd_sock_alive, base_env)
+    env["ANNEAL_LEAN_RUN_IN_SCOPE"] = "1"
+    env["ANNEAL_LEAN_RUN_ACTIVE"] = "1"
+    env["ANNEAL_LEAN_RUN_LEAN_M_MB"] = str(lean_m_mb)
+    for var in ("LEAN_NUM_THREADS", "CARGO_BUILD_JOBS", "RAYON_NUM_THREADS"):
+        raw = env.get(var, "").strip()
+        existing = 0
+        if raw:
+            try:
+                existing = int(raw)
+            except ValueError:
+                existing = 0
+        if existing > 0:
+            env[var] = str(min(existing, threads) if is_cg_capped else existing)
+        else:
+            env[var] = str(threads)
+    return env
+
+
+def _build_scope_launch_cmd(
+    effective_cmd: list[str],
+    *,
+    b_max_mb: int,
+    threads: int,
+    timeout_sec: int,
+    user_systemd_active: bool,
+    unit_name: str,
+) -> tuple[list[str], bool]:
+    """Builds the bounded command (systemd leaf scope + oom_score_adj=700 wrapper)."""
+    wrapped_cmd = [
+        "/bin/sh",
+        "-c",
+        'printf 700 > /proc/self/oom_score_adj 2>/dev/null; exec "$@"',
+        "_",
+        *effective_cmd,
+    ]
+    systemd_run_bin = _find_systemd_run() if user_systemd_active else None
+    if user_systemd_active and systemd_run_bin:
         full_cmd = [
-            "systemd-run",
+            systemd_run_bin,
             "--user",
             "--scope",
+            "--collect",
             "--quiet",
+            "--slice=anneal-workloads.slice",
+            f"--unit={unit_name}",
             "-p",
-            f"MemoryMax={memory_max_mb}M",
+            f"MemoryMax={b_max_mb}M",
             "-p",
             "MemorySwapMax=0",
+            "-p",
+            "OOMPolicy=kill",
             "-p",
             f"CPUQuota={threads * 100}%",
             "-p",
             f"RuntimeMaxSec={timeout_sec + 5}s",
             "--",
-            *effective_cmd,
+            *wrapped_cmd,
         ]
+        return full_cmd, True
+    return wrapped_cmd, False
+
+
+def _exec_passthrough(cmd: list[str]) -> int:
+    """Re-entrancy pass-through when already inside an enclosing `anneal-lean-run` scope."""
+    lean_m_mb = _env_int("ANNEAL_LEAN_RUN_LEAN_M_MB", 0)
+    effective_cmd = inject_lean_m_flag(cmd, lean_m_mb) if lean_m_mb > 0 else list(cmd)
+    os.environ["ANNEAL_LEAN_RUN_ACTIVE"] = "1"
+    os.environ["ANNEAL_LEAN_RUN_IN_SCOPE"] = "1"
+    try:
+        os.execvp(effective_cmd[0], effective_cmd)
+    except FileNotFoundError:
+        sys.stderr.write(
+            f"[anneal-lean-run] ERROR: Command not found: {effective_cmd[0]}\n"
+        )
+        return 127
+    except OSError as exc:
+        sys.stderr.write(
+            f"[anneal-lean-run] ERROR: Failed to exec {effective_cmd[0]}: {exc}\n"
+        )
+        return 126
+
+
+def _should_retry_oom(
+    *,
+    rc: int,
+    oom_event_detected: bool,
+    watchdog_aborted: bool,
+    timed_out: bool,
+    mode: str,
+    no_oom_retry: bool,
+    skip_evict_at_launch: bool,
+    b_max_at_launch: int,
+    b_max_evict_at_launch: int,
+    rem_timeout: int,
+    lsp_no_evict: bool,
+) -> bool:
+    """Exact guard for single on-OOM LSP evict-and-retry."""
+    if watchdog_aborted or timed_out:
+        return False
+    if not (rc in (137, -9) or oom_event_detected):
+        return False
+    if mode != "build" or no_oom_retry or lsp_no_evict:
+        return False
+    if not skip_evict_at_launch:
+        return False
+    if b_max_evict_at_launch < b_max_at_launch + 256:
+        return False
+    if rem_timeout < 120:
+        return False
+    return True
+
+
+def run_bounded_command(
+    cmd: list[str],
+    limits: dict[str, Any],
+    use_slot_lock: bool,
+    *,
+    exclusive: bool = False,
+    no_oom_retry: bool = False,
+    cli_concurrency: int | None = None,
+    override_mem_mb: int | None = None,
+    override_timeout_sec: int | None = None,
+    unsafe_ignore_cgroup: bool = False,
+    probe_fn: Callable[..., dict[str, Any]] | None = None,
+    evict_fn: Callable[[dict[str, Any]], bool] | None = None,
+    slot_timeout_override: float | None = None,
+) -> int:
+    """Executes `cmd` inside `anneal-workloads.slice`, slot locks, and 2-tier watchdog."""
+    mode = str(limits["mode"])
+    build_slots = int(limits["build_slots"])
+    is_cg_capped = bool(limits.get("is_cg_capped", False))
+    w_slice_max_mb = int(limits.get("w_slice_max_mb", 0))
+    runtime_base = Path(str(limits.get("runtime_base") or "/tmp"))
+    default_rb, default_sock_alive = resolve_runtime_base()
+    user_systemd_sock_alive = (
+        default_sock_alive
+        if str(runtime_base) == str(default_rb)
+        else _has_user_systemd_sock(runtime_base)
+    )
+
+    # Auto-ensure `anneal-workloads.slice` on first build/file run when absent or stale.
+    if limits.get("user_systemd_active") and limits.get("t_cg_is_user_service"):
+        ensure_workloads_slice(limits)
+
+    if exclusive:
+        need_slot = True
+        slot_timeout = 1200 if mode == "build" else 180
+    elif not use_slot_lock:
+        need_slot = False
+        slot_timeout = 1200 if mode == "build" else 180
+    elif mode == "build":
+        need_slot = True
+        slot_timeout = 1200
+    elif mode == "file" and is_cg_capped and w_slice_max_mb < 16384:
+        need_slot = True
+        slot_timeout = 180
     else:
-        full_cmd = effective_cmd
+        need_slot = False
+        slot_timeout = 180
 
-    env = os.environ.copy()
-    env.setdefault("LEAN_NUM_THREADS", str(threads))
-    env.setdefault("CARGO_BUILD_JOBS", str(threads))
-    env.setdefault("RAYON_NUM_THREADS", str(threads))
+    def _reprobe() -> dict[str, Any]:
+        eff_probe = probe_fn if probe_fn is not None else probe_host_envelope
+        return eff_probe(
+            cli_concurrency=cli_concurrency,
+            exclusive=exclusive,
+            mode=mode,
+            override_mem_mb=override_mem_mb,
+            override_timeout_sec=override_timeout_sec,
+            unsafe_ignore_cgroup=unsafe_ignore_cgroup,
+        )
 
-    need_slot = use_slot_lock and (mode == "build")
-    with acquire_build_slot(build_slots, timeout_sec, enabled=need_slot):
-        # `start_new_session=True` isolates descendants into process group
-        # `proc.pid` for atomic group cleanup, which also detaches them from
-        # signals sent to this wrapper's group unless forwarded explicitly.
+    def _run_single_attempt(
+        att_limits: dict[str, Any], att_timeout: int
+    ) -> tuple[int, bool, bool, bool, float | None]:
+        att_threads = int(att_limits["threads"])
+        att_b_max = int(att_limits["memory_max_mb"])
+        att_lean_m = int(att_limits["lean_m_mb"])
+        att_user_systemd = bool(att_limits.get("user_systemd_active", False))
+        att_capped = bool(att_limits.get("is_cg_capped", False))
+        att_rt_base = Path(str(att_limits.get("runtime_base") or runtime_base))
+        att_sock_alive = att_user_systemd or _has_user_systemd_sock(att_rt_base)
+
+        effective_cmd = inject_lean_m_flag(cmd, att_lean_m)
+        unit_name = f"anneal-run-{os.getpid()}-{time.monotonic_ns()}.scope"
+        full_cmd, in_scope = _build_scope_launch_cmd(
+            effective_cmd,
+            b_max_mb=att_b_max,
+            threads=att_threads,
+            timeout_sec=att_timeout,
+            user_systemd_active=att_user_systemd,
+            unit_name=unit_name,
+        )
+        env = _build_child_env(
+            threads=att_threads,
+            lean_m_mb=att_lean_m,
+            is_cg_capped=att_capped,
+            runtime_base=att_rt_base,
+            user_systemd_sock_alive=att_sock_alive,
+        )
+
+        w_cg_raw = att_limits.get("w_cg_path")
+        w_cg_p = Path(w_cg_raw) if w_cg_raw else None
+        a_lim_raw = att_limits.get("a_lim_path")
+        a_lim_p = Path(a_lim_raw) if a_lim_raw else None
+        cap_ancs = [
+            (Path(str(a["path"])), int(a["c_high_mb"]))
+            for a in (att_limits.get("capped_ancestors") or [])
+        ]
+        watchdog: BuildWatchdog | None = None
+        if att_user_systemd and in_scope:
+            watchdog = BuildWatchdog(
+                is_cg_capped=att_capped,
+                w_cg_path=w_cg_p,
+                w_slice_high_mb=int(att_limits.get("w_slice_high_mb", 0)),
+                a_lim_path=a_lim_p,
+                c_high_mb=int(att_limits.get("c_high_mb", 0)),
+                capped_ancestors=cap_ancs,
+            )
+
         proc = subprocess.Popen(
             full_cmd,
             env=env,
@@ -796,108 +2371,235 @@ def run_bounded_command(
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             prev_handlers[sig] = signal.getsignal(sig)
             signal.signal(sig, _handle_signal)
+
+        att_rc = 0
+        att_timed_out = False
+        att_wd_aborted = False
+        att_pressure_budget: float | None = None
+        att_oom_evt = False
+        deadline = time.monotonic() + att_timeout
         try:
-            rc = proc.wait(timeout=timeout_sec)
+            while True:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    att_timed_out = True
+                    cg_snap = format_cgroup_diagnostic_snapshot(pid=proc.pid)
+                    _kill_systemd_scope(
+                        unit_name if in_scope else None,
+                        proc,
+                        att_rt_base,
+                        att_sock_alive,
+                    )
+                    sys.stderr.write(
+                        f"\n[anneal-lean-run] ERROR: Command timed out after "
+                        f"{att_timeout}s (mode={mode}, MemoryMax={att_b_max}M, "
+                        f"threads={att_threads}).\n"
+                        f"{cg_snap}"
+                        "  Remediation: Inspect proof goals interactively with "
+                        "`lean_goal` / wildcard `change ... _` "
+                        "(`skills/anneal-lsp/SKILL.md`) and apply the kernel "
+                        "proof-scaling patterns in `skills/anneal-prove/SKILL.md` "
+                        "(`BlockCtx`, `Hold`, `bitwiseAndBitsFast`).\n"
+                    )
+                    att_rc = 124
+                    break
+                step = min(2.0, rem) if watchdog is not None else rem
+                try:
+                    att_rc = proc.wait(timeout=step)
+                    break
+                except subprocess.TimeoutExpired:
+                    if watchdog is not None:
+                        wd_res = watchdog.tick(time.monotonic())
+                        if wd_res.get("action") == "abort_pressure":
+                            att_wd_aborted = True
+                            # Measure live budget BEFORE killing the scope.
+                            try:
+                                fresh = _reprobe()
+                                w_self = (
+                                    read_cgroup_working_set_mib(w_cg_p / unit_name)
+                                    if w_cg_p is not None
+                                    else 0
+                                )
+                                w_sibs = max(
+                                    0, int(fresh.get("w_non_lsp_mb", 0)) - w_self
+                                )
+                                live_avail = max(
+                                    0, int(fresh.get("w_live_mb", 0)) - w_sibs
+                                )
+                                att_pressure_budget = round(
+                                    min(att_b_max, live_avail) / 1024.0, 2
+                                )
+                            except Exception:
+                                att_pressure_budget = round(att_b_max / 1024.0, 2)
+                            _kill_systemd_scope(
+                                unit_name if in_scope else None,
+                                proc,
+                                att_rt_base,
+                                att_sock_alive,
+                            )
+                            stamp_last_oom(
+                                att_rt_base,
+                                mode,
+                                "pressure",
+                                att_pressure_budget,
+                            )
+                            sys.stderr.write(
+                                f"\n[anneal-lean-run] ERROR: USER_SLICE_PRESSURE_ABORT: "
+                                f"Aborted build after 3 consecutive ancestor pressure ticks "
+                                f"(mode={mode}, budget_gb={att_pressure_budget:.2f}).\n"
+                            )
+                            att_rc = 137
+                            break
         except _ForwardSignal as caught:
-            terminate_process_group(proc.pid)
-            proc.wait()
-            return 128 + caught.signum
-        except subprocess.TimeoutExpired:
-            cg_snap = format_cgroup_diagnostic_snapshot(pid=proc.pid)
-            terminate_process_group(proc.pid)
-            proc.wait()
-            sys.stderr.write(
-                f"\n[anneal-lean-run] ERROR: Command timed out after "
-                f"{timeout_sec}s (mode={mode}, MemoryMax={memory_max_mb}M, "
-                f"threads={threads}).\n"
-                f"{cg_snap}"
-                "  Remediation: Inspect proof goals interactively with "
-                "`lean_goal` / wildcard `change ... _` "
-                "(`skills/anneal-lsp/SKILL.md`) and apply the kernel "
-                "proof-scaling patterns in `skills/anneal-prove/SKILL.md` "
-                "(`BlockCtx`, `Hold` barrier, `bitwiseAndBitsFast`).\n"
+            _kill_systemd_scope(
+                unit_name if in_scope else None, proc, att_rt_base, att_sock_alive
             )
-            return 124
+            return (128 + caught.signum, False, False, False, None)
         finally:
             for sig, handler in prev_handlers.items():
                 signal.signal(sig, handler)  # type: ignore[arg-type]
             if proc.poll() is None:
-                terminate_process_group(proc.pid)
+                _kill_systemd_scope(
+                    unit_name if in_scope else None, proc, att_rt_base, att_sock_alive
+                )
 
-    if rc in (137, -9):
-        cg_snap = format_cgroup_diagnostic_snapshot()
-        sys.stderr.write(
-            f"\n[anneal-lean-run] ERROR: Command was terminated by the OS "
-            f"memory guard (exit 137, MemoryMax={memory_max_mb}M, "
-            f"MemorySwapMax=0, mode={mode}).\n"
-            f"{cg_snap}"
-            "  Why: The process exceeded its hardware-matched physical RAM "
-            "ceiling and was killed before it could thrash host swap.\n"
-            "  Remediation: Avoid unfolding multi-block "
-            "`Mir.<Crate>.<Item>.body` or `wpMirExecSym` inside `dsimp`; "
-            "use `BlockCtx`, `Hold`, and top-down wildcard `change` "
-            "(`skills/anneal-prove/SKILL.md` Section 5).\n"
-        )
-        return 137
+        if (
+            not att_wd_aborted
+            and not att_timed_out
+            and in_scope
+            and w_cg_p is not None
+        ):
+            att_oom_evt = _read_memory_events_oom_kill(w_cg_p / unit_name) > 0
 
-    return rc
+        return (att_rc, att_timed_out, att_wd_aborted, att_oom_evt, att_pressure_budget)
 
-
-def is_remote_path(bundle_path: str | Path) -> bool:
-    """Returns True if `bundle_path` is an `/remote/` URI or `/mnt/fuse/r{w,o}/` path."""
-    s = str(bundle_path).strip()
-    if not s.startswith("/"):
-        return False
-    norm = posixpath.normpath(s)
-    if norm.startswith("//"):
-        norm = "/" + norm.lstrip("/")
-    return (
-        norm == "/remote"
-        or norm.startswith(REMOTE_URI_PREFIX)
-        or any(
-            norm == p.rstrip("/") or norm.startswith(p)
-            for p in REMOTE_FUSE_PREFIXES
-        )
+    eff_slot_timeout = (
+        float(slot_timeout_override)
+        if slot_timeout_override is not None
+        else float(slot_timeout)
     )
 
+    try:
+        with acquire_build_slot(
+            build_slots,
+            eff_slot_timeout,
+            enabled=need_slot,
+            exclusive=exclusive,
+            runtime_base=runtime_base,
+        ):
+            slot_t0 = time.monotonic()
 
-def to_remote_uri(bundle_path: str | Path) -> str:
-    """Translates `/mnt/fuse/r{w,o}/...` FUSE paths to normalized `/remote/...` URIs."""
-    s = str(bundle_path).strip()
-    if not s:
-        return s
-    if is_remote_path(s):
-        norm = posixpath.normpath(s)
-        if norm.startswith("//"):
-            norm = "/" + norm.lstrip("/")
-        for prefix in REMOTE_FUSE_PREFIXES:
-            base = prefix.rstrip("/")
-            if norm == base:
-                return "/remote"
-            if norm.startswith(prefix):
-                return posixpath.normpath(REMOTE_URI_PREFIX + norm[len(prefix) :])
-        return norm
-    return s
+            # Re-probe strictly INSIDE the held build slot so queued builds see fresh headroom.
+            cur_limits = _reprobe()
+            skip_evict_at_launch = bool(cur_limits.get("skip_evict", False))
+
+            if mode == "build" and not skip_evict_at_launch:
+                evicted = (
+                    evict_fn(cur_limits)
+                    if evict_fn is not None
+                    else _evict_lsp_workers(cur_limits)
+                )
+                if evicted:
+                    cur_limits = _reprobe()
+
+            b_max_1 = int(cur_limits["memory_max_mb"])
+            b_max_evict_at_launch = int(cur_limits["b_max_evict_mb"])
+            cur_rt_base = Path(str(cur_limits.get("runtime_base") or runtime_base))
+            timeout_1 = int(cur_limits["timeout_sec"])
+
+            # Fail-fast admission gate (NO unsafe upward clamp).
+            min_required = 2048 if mode == "build" else 1024
+            if override_mem_mb is None and b_max_1 < min_required:
+                budget_gb = round(b_max_1 / 1024.0, 2)
+                stamp_last_oom(cur_rt_base, mode, "headroom", budget_gb)
+                sys.stderr.write(
+                    f"[anneal-lean-run] ERROR: INSUFFICIENT_CGROUP_HEADROOM: "
+                    f"Computed B_max={b_max_1}M < {min_required}M for mode={mode} "
+                    f"(budget_gb={budget_gb:.2f}). Refusing to launch.\n"
+                )
+                return 137
+
+            rc, timed_out, watchdog_aborted, oom_evt, _ = _run_single_attempt(
+                cur_limits, timeout_1
+            )
+            final_b_max = b_max_1
+
+            # Single on-OOM evict-and-retry (gated on not watchdog_aborted and not timed_out).
+            rem_timeout = int(1200 - (time.monotonic() - slot_t0))
+            lsp_no_evict = os.environ.get("ANNEAL_LSP_NO_EVICT") == "1"
+            if _should_retry_oom(
+                rc=rc,
+                oom_event_detected=oom_evt,
+                watchdog_aborted=watchdog_aborted,
+                timed_out=timed_out,
+                mode=mode,
+                no_oom_retry=no_oom_retry,
+                skip_evict_at_launch=skip_evict_at_launch,
+                b_max_at_launch=b_max_1,
+                b_max_evict_at_launch=b_max_evict_at_launch,
+                rem_timeout=rem_timeout,
+                lsp_no_evict=lsp_no_evict,
+            ):
+                if evict_fn is not None:
+                    evict_fn(cur_limits)
+                else:
+                    _evict_lsp_workers(cur_limits)
+                retry_limits = _reprobe()
+                b_max_retry = int(retry_limits["memory_max_mb"])
+                if b_max_retry >= b_max_1 + 256:
+                    retry_timeout = min(900, max(120, int(1200 - (time.monotonic() - slot_t0))))
+                    sys.stderr.write(
+                        f"[anneal-lean-run] INFO: Attempt 1 OOMed at {b_max_1}M; "
+                        f"evicted LSP workers and retrying once at {b_max_retry}M "
+                        f"(timeout={retry_timeout}s).\n"
+                    )
+                    final_b_max = b_max_retry
+                    rc, timed_out, watchdog_aborted, oom_evt, _ = _run_single_attempt(
+                        retry_limits, retry_timeout
+                    )
+
+            if watchdog_aborted:
+                return 137
+            if timed_out:
+                return 124
+            if rc in (137, -9) or oom_evt:
+                local_budget_gb = round(final_b_max / 1024.0, 2)
+                offload_res = _try_oom_offload(cmd, mode, local_budget_gb)
+                if offload_res is not None:
+                    off_rc, remote_gb = offload_res
+                    if off_rc == 0:
+                        return 0
+                    if off_rc == 137 and remote_gb is not None:
+                        stamp_gb = round(max(local_budget_gb, remote_gb), 2)
+                    else:
+                        stamp_gb = local_budget_gb
+                else:
+                    stamp_gb = local_budget_gb
+
+                stamp_last_oom(cur_rt_base, mode, "oom", stamp_gb)
+                cg_snap = format_cgroup_diagnostic_snapshot()
+                sys.stderr.write(
+                    f"\n[anneal-lean-run] ERROR: Command was terminated by the OS "
+                    f"memory guard (exit 137, MemoryMax={final_b_max}M, "
+                    f"MemorySwapMax=0, mode={mode}, budget_gb={stamp_gb:.2f}).\n"
+                    f"{cg_snap}"
+                    "  Why: The process exceeded its hardware-matched physical RAM "
+                    "ceiling and was killed before it could thrash host swap.\n"
+                    "  Remediation: Avoid unfolding multi-block "
+                    "`Mir.<Crate>.<Item>.body` or `wpMirExecSym` inside `dsimp`; "
+                    "use `BlockCtx`, `Hold`, and top-down wildcard `change` "
+                    "(`skills/anneal-prove/SKILL.md` Section 5).\n"
+                )
+                return 137
+
+            return rc
+    except (TimeoutError, OSError) as exc:
+        sys.stderr.write(f"[anneal-lean-run] ERROR: {exc}\n")
+        return 124
 
 
-def normalize_git_ref(ref: str) -> str:
-    """Normalizes a branch shorthand (e.g. `unstable`) to `refs/heads/<branch>`."""
-    r = ref.strip()
-    if not r:
-        return "refs/heads/unstable"
-    if r == "HEAD" or r.startswith("refs/"):
-        return r
-    if r.startswith(("heads/", "tags/", "remotes/")):
-        return f"refs/{r}"
-    return f"refs/heads/{r}"
-
-
-# Repository-location variables that Git exports to hooks and aliases (see
-# `git rev-parse --local-env-vars` and githooks(5)). They are scrubbed from
-# every `git` subprocess so that `--repo-dir` stays authoritative even when this
-# guard runs inside a `pre-push` hook or `git bundle-push` alias, where an inherited
-# `GIT_DIR` / `GIT_INDEX_FILE` would otherwise silently redirect the ancestry
-# check, dirty-worktree check, and ref update to a different repository/index.
+# Repository-location variables that Git exports to hooks and aliases.
+# Scrubbed from git subprocesses so `git rev-parse --show-toplevel` uses cwd.
 _GIT_LOCAL_ENV_VARS: tuple[str, ...] = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
@@ -922,970 +2624,14 @@ def _git_env() -> dict[str, str]:
     return env
 
 
-def _run_git(
-    args: list[str], cwd: Path | None = None
-) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=str(cwd) if cwd is not None else None,
-            env=_git_env(),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-    except OSError as exc:
-        # Missing `git` binary or vanished `cwd`: report a failed command so
-        # every caller fails closed instead of crashing with a traceback.
-        return subprocess.CompletedProcess(
-            ["git", *args], 127, "", f"failed to execute git: {exc}"
-        )
-
-
-REMOTE_SYNC_CP_TIMEOUT_SEC = 300.0
-REMOTE_SYNC_STAT_TIMEOUT_SEC = 60.0
-
-# Any of these in `remote-sync` output vetoes a "not found" classification.
-_REMOTE_FATAL_ERROR_MARKERS: tuple[str, ...] = (
-    "permission_denied",
-    "permission denied",
-    "deadline_exceeded",
-    "deadline exceeded",
-    "unauthenticated",
-    "unavailable",
-    "resource_exhausted",
-    "internal error",
-    "open failed for",
-)
-
-
-def _is_remote_not_found(output: str, remote_uri: str) -> bool:
-    """Returns True only for an remote server-side NOT_FOUND that names `remote_uri`.
-
-    Real `remote-sync` failures look like:
-      remote missing: `generic::not_found: /remote/<p>: File not found: /<p>
-                       [storage_remote.pb.Error] { code: NO_SUCH_FILE_OR_DIRECTORY }`
-      local failure : `generic::not_found: open failed for /tmp/<staged>:
-                       No such file or directory`
-    Generic "not found" / ENOENT text (e.g. a vanished local staging directory,
-    a missing credential file) must never be mistaken for a missing remote
-    bundle, because `no_remote_bundle` is a fail-open (`ok = True`) verdict.
-    """
-    lower = output.lower()
-    uri = remote_uri.strip().rstrip("/").lower()
-    if not uri.startswith("/remote/") or len(uri) <= len("/remote/"):
-        return False
-    # `remote-sync` echoes the URI (and its `/remote`-relative form) back in its
-    # messages; drop those echoes before looking for veto markers or protocol
-    # tokens so that a path merely *named* e.g. `.../unavailable/...` or
-    # `.../storage_remote/no_such_file_or_directory/...` cannot misclassify errors.
-    rel = uri[len("/remote") :]
-    scrubbed = lower.replace(uri, " ").replace(rel, " ")
-    if any(marker in scrubbed for marker in _REMOTE_FATAL_ERROR_MARKERS):
-        return False
-    if f"not_found: {uri}:" in lower:
-        return True
-    return (
-        "storage_remote" in scrubbed
-        and "no_such_file_or_directory" in scrubbed
-        and uri in lower
-    )
-
-
-def _remote_stat_exists(
-    remote_sync_bin: str, remote_uri: str
-) -> tuple[bool | None, str]:
-    """Independently probes `remote_uri` via `remote-sync stat` (no local writes).
-
-    Returns `(True, ...)` if the remote file exists, `(False, ...)` only for a
-    confirmed remote NOT_FOUND naming `remote_uri`, and `(None, detail)` otherwise.
-    """
-    try:
-        res = subprocess.run(
-            [
-                remote_sync_bin,
-                "--force_client_creation_at_head",
-                "stat",
-                remote_uri,
-            ],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            timeout=REMOTE_SYNC_STAT_TIMEOUT_SEC,
-        )
-    except Exception as exc:  # noqa: BLE001 - fail closed on any error
-        return (None, f"remote-sync stat could not run: {exc}")
-    if res.returncode == 0:
-        return (True, "remote-sync stat reports the remote bundle exists")
-    combined = f"{res.stderr}\n{res.stdout}"
-    if _is_remote_not_found(combined, remote_uri):
-        return (False, "remote-sync stat confirms the remote bundle does not exist")
-    detail = res.stderr.strip() or res.stdout.strip() or f"exit code {res.returncode}"
-    return (None, f"remote-sync stat failed: {detail}")
-
-
-def _remote_source_for(raw_str: str) -> str | None:
-    """Returns the remote path to stage via `remote-sync`, or None for plain local files.
-
-    Besides literal `/remote/` URIs and `/mnt/fuse/r{w,o}/` paths, this also
-    catches local symlinks (e.g. `~/remote -> /mnt/fuse/rw/users/...` or
-    `~/bundle.bundle -> /remote/teams/...`) whose target lives on remote or the
-    `remotefsd` FUSE mount, so their contents are never read through FUSE's stale
-    cached `st_size`.
-    """
-    if is_remote_path(raw_str):
-        return raw_str
-    try:
-        cur = Path(raw_str)
-        for _ in range(40):
-            cur_str = str(cur)
-            if is_remote_path(cur_str):
-                return cur_str
-            if not cur.is_symlink():
-                break
-            target = os.readlink(cur)
-            if is_remote_path(target):
-                return target
-            cur = Path(
-                os.path.normpath(os.path.join(os.path.dirname(cur_str), target))
-            )
-        real = os.path.realpath(raw_str)
-    except (OSError, ValueError):
-        return None
-    return real if is_remote_path(real) else None
-
-
-@contextmanager
-def stage_bundle_for_verification(
-    bundle_path: str | Path,
-    remote_sync_bin: str | None = None,
-) -> Iterator[tuple[str, Path | None, str | None]]:
-    """Safely stages a local or remote bundle for inspection, cleaning up temporary files.
-
-    Yields exactly once: `("staged", path, None)`, `("no_remote_bundle", None,
-    None)`, or `("bundle_error", None, detail)`.
-    """
-    raw_str = str(bundle_path).strip()
-    if not raw_str:
-        yield ("bundle_error", None, "Empty bundle path")
-        return
-
-    remote_source = _remote_source_for(raw_str)
-    if remote_source is not None:
-        remote_uri = to_remote_uri(remote_source)
-        eff_remote_sync = remote_sync_bin
-        if eff_remote_sync is None:
-            eff_remote_sync = (
-                "/usr/bin/remote-sync"
-                if Path("/usr/bin/remote-sync").is_file()
-                else shutil.which("remote-sync")
-            )
-        if not eff_remote_sync:
-            yield (
-                "bundle_error",
-                None,
-                f"remote-sync is required to stage remote bundle {remote_uri} safely without FUSE",
-            )
-            return
-
-        try:
-            tmpdir = Path(tempfile.mkdtemp(prefix="anneal-bundle-ff-"))
-        except OSError as exc:
-            yield (
-                "bundle_error",
-                None,
-                f"Cannot create a local staging directory for {remote_uri}: {exc}",
-            )
-            return
-        try:
-            staged_file = tmpdir / "remote.bundle"
-            status: str = "bundle_error"
-            staged: Path | None = None
-            detail_msg: str | None = None
-            try:
-                res = subprocess.run(
-                    [
-                        eff_remote_sync,
-                        "--force_client_creation_at_head",
-                        "cp",
-                        "-f",
-                        remote_uri,
-                        str(staged_file),
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                    timeout=REMOTE_SYNC_CP_TIMEOUT_SEC,
-                )
-            except Exception as exc:  # noqa: BLE001 - fail closed on any error
-                res = None
-                detail_msg = f"Failed executing remote-sync for {remote_uri}: {exc}"
-
-            if res is not None and res.returncode != 0:
-                combined = f"{res.stderr}\n{res.stdout}"
-                cp_detail = (
-                    res.stderr.strip()
-                    or res.stdout.strip()
-                    or f"exit code {res.returncode}"
-                )
-                if _is_remote_not_found(combined, remote_uri):
-                    # Double-check with an independent `remote-sync stat` before
-                    # emitting the fail-open `no_remote_bundle` verdict.
-                    exists, stat_detail = _remote_stat_exists(eff_remote_sync, remote_uri)
-                    if exists is False:
-                        status = "no_remote_bundle"
-                    else:
-                        detail_msg = (
-                            f"remote-sync cp reported {remote_uri} as missing but the "
-                            f"existence re-check disagreed ({stat_detail}); "
-                            f"cp error: {cp_detail}"
-                        )
-                else:
-                    detail_msg = f"remote-sync cp failed for {remote_uri}: {cp_detail}"
-            elif res is not None:
-                try:
-                    size = (
-                        staged_file.stat().st_size if staged_file.is_file() else 0
-                    )
-                except OSError as exc:
-                    size = 0
-                    detail_msg = f"Cannot stat staged bundle from {remote_uri}: {exc}"
-                if size > 0:
-                    status, staged = "staged", staged_file
-                elif detail_msg is None:
-                    detail_msg = f"Staged bundle from {remote_uri} is missing or empty"
-
-            yield (status, staged, None if status != "bundle_error" else detail_msg)
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        return
-
-    local_p = Path(raw_str)
-    local_status: str
-    local_staged: Path | None = None
-    local_detail: str | None = None
-    try:
-        if local_p.is_symlink() and not local_p.exists():
-            local_status = "bundle_error"
-            local_detail = f"Bundle path {raw_str} is a broken symlink"
-        elif not local_p.exists():
-            local_status = "no_remote_bundle"
-        elif not local_p.is_file():
-            local_status = "bundle_error"
-            local_detail = f"Bundle path {raw_str} is not a regular file"
-        elif local_p.stat().st_size == 0:
-            local_status = "bundle_error"
-            local_detail = f"Bundle file {raw_str} is empty (0 bytes)"
-        else:
-            local_status = "staged"
-            local_staged = local_p.resolve()
-    except OSError as exc:
-        local_status = "bundle_error"
-        local_staged = None
-        local_detail = f"Cannot access bundle {raw_str}: {exc}"
-    # Yield outside the `try` so exceptions raised by the caller's `with` body
-    # propagate instead of being swallowed into a second `yield`.
-    yield (local_status, local_staged, local_detail)
-
-
-def parse_bundle_heads(
-    bundle_file: Path,
-    cwd: Path | None = None,
-) -> tuple[bool, dict[str, str], str | None]:
-    """Runs `git bundle list-heads` on `bundle_file` and returns `(ok, ref_map, error)`.
-
-    `cwd` should be the local repository being verified, so that bundles
-    without an explicit `@object-format` capability are parsed with that
-    repository's hash algorithm rather than whatever repository happens to
-    contain the caller's working directory.
-    """
-    try:
-        bundle_arg = str(Path(bundle_file).resolve())
-    except OSError:
-        bundle_arg = str(bundle_file)
-    res = _run_git(["bundle", "list-heads", "--", bundle_arg], cwd=cwd)
-    if res.returncode != 0:
-        detail = (
-            res.stderr.strip()
-            or res.stdout.strip()
-            or f"git bundle list-heads exited with {res.returncode}"
-        )
-        return (False, {}, detail)
-
-    heads: dict[str, str] = {}
-    for raw_line in res.stdout.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        parts = line.split()
-        if len(parts) != 2:
-            return (
-                False,
-                {},
-                f"Malformed line in git bundle list-heads output: {line!r}",
-            )
-        sha, ref_name = parts[0].lower(), parts[1]
-        # 40 hex digits for SHA-1 repositories, 64 for SHA-256 repositories.
-        if len(sha) not in (40, 64) or any(
-            c not in "0123456789abcdef" for c in sha
-        ):
-            return (
-                False,
-                {},
-                f"Invalid commit SHA in git bundle list-heads output: {sha!r}",
-            )
-        # `git bundle list-heads` happily prints a header that names the same
-        # ref twice with different tips (`git bundle create` never writes one).
-        # Which tip a later `git fetch` / `git bundle-pull` honors is ambiguous,
-        # so treat such a bundle as corrupt instead of silently keeping one.
-        prior = heads.get(ref_name)
-        if prior is not None and prior != sha:
-            return (
-                False,
-                {},
-                f"Bundle header lists conflicting tips for {ref_name}: "
-                f"{prior} vs {sha}",
-            )
-        heads[ref_name] = sha
-
-    if not heads:
-        return (False, {}, "Bundle lists zero heads")
-    return (True, heads, None)
-
-
-def _resolve_commit(repo_path: Path, rev: str) -> str | None:
-    if not rev or rev.startswith("-"):
-        return None
-    res = _run_git(
-        ["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], cwd=repo_path
-    )
-    out = res.stdout.strip().lower()
-    return out if (res.returncode == 0 and out) else None
-
-
-def _worktree_git_dir(wt_path: Path) -> Path | None:
-    """Resolves the per-worktree git directory for `wt_path`."""
-    try:
-        dot_git = wt_path / ".git"
-        if dot_git.is_dir():
-            return dot_git.resolve()
-        if dot_git.is_file():
-            raw = dot_git.read_text(encoding="utf-8", errors="replace").strip()
-            if raw.startswith("gitdir:"):
-                gd_str = raw[len("gitdir:") :].strip()
-                gd_path = Path(gd_str)
-                if not gd_path.is_absolute():
-                    gd_path = wt_path / gd_path
-                return gd_path.resolve()
-    except OSError:
-        pass
-    res = _run_git(["rev-parse", "--git-dir"], cwd=wt_path)
-    if res.returncode != 0 or not res.stdout.strip():
-        return None
-    gd_path = Path(res.stdout.strip())
-    if not gd_path.is_absolute():
-        gd_path = wt_path / gd_path
-    try:
-        return gd_path.resolve()
-    except OSError:
-        return gd_path
-
-
-def _worktree_detached_target_refs(git_dir: Path) -> set[str]:
-    """Returns normalized branch refs being rebased/bisected/update-reffed in `git_dir`."""
-    refs: set[str] = set()
-    for rel in ("rebase-merge/head-name", "rebase-apply/head-name", "BISECT_START"):
-        p = git_dir / rel
-        try:
-            if p.is_file():
-                val = p.read_text(encoding="utf-8", errors="replace").strip()
-                if val:
-                    refs.add(normalize_git_ref(val))
-        except OSError:
-            continue
-    update_refs_file = git_dir / "rebase-merge" / "update-refs"
-    try:
-        if update_refs_file.is_file():
-            for raw_line in (
-                update_refs_file.read_text(encoding="utf-8", errors="replace")
-                .splitlines()
-            ):
-                line = raw_line.strip()
-                if line.startswith("refs/"):
-                    refs.add(normalize_git_ref(line))
-    except OSError:
-        pass
-    for todo_name in ("git-rebase-todo", "done"):
-        todo_file = git_dir / "rebase-merge" / todo_name
-        try:
-            if todo_file.is_file():
-                for raw_line in (
-                    todo_file.read_text(encoding="utf-8", errors="replace")
-                    .splitlines()
-                ):
-                    parts = raw_line.strip().split()
-                    if len(parts) >= 2 and parts[0] in ("update-ref", "u"):
-                        refs.add(normalize_git_ref(parts[1]))
-        except OSError:
-            continue
-    return refs
-
-
-def _worktree_in_progress_operation(git_dir: Path) -> str | None:
-    """Returns the name of any in-progress git sequencer/merge operation in `git_dir`."""
-    for marker in (
-        "MERGE_HEAD",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-        "BISECT_LOG",
-        "BISECT_START",
-        "rebase-merge",
-        "rebase-apply",
-    ):
-        try:
-            if (git_dir / marker).exists():
-                return marker
-        except OSError:
-            continue
-    return None
-
-
-def _sync_local_ref_to_remote(
-    repo_path: Path,
-    normalized_ref: str,
-    old_tip: str | None,
-    new_tip: str,
-) -> tuple[bool, str | None]:
-    """Safely advances `normalized_ref` to `new_tip`, checking all linked worktrees.
-
-    Only local branches (`refs/heads/*`) are ever moved: `git update-ref HEAD`
-    would silently move whichever branch is checked out underneath its index
-    and working tree, and tags/remote-tracking refs are not ours to rewrite.
-    Non-checked-out branches are moved with an atomic compare-and-swap
-    (`git update-ref <ref> <new> <old>`, or `<new> ""` to require that a
-    missing ref is still absent), and the final ref value is re-verified.
-    """
-    if not normalized_ref.startswith("refs/heads/"):
-        return (
-            False,
-            "`--sync-if-behind` only fast-forwards local branches "
-            f"(refs/heads/*); refusing to move {normalized_ref}",
-        )
-
-    top_res = _run_git(["rev-parse", "--show-toplevel"], cwd=repo_path)
-    current_toplevel = (
-        Path(top_res.stdout.strip()).resolve()
-        if (top_res.returncode == 0 and top_res.stdout.strip())
-        else None
-    )
-
-    wt_res = _run_git(["worktree", "list", "--porcelain"], cwd=repo_path)
-    if wt_res.returncode != 0:
-        return (
-            False,
-            wt_res.stderr.strip() or "Failed to inspect git worktree list",
-        )
-
-    stanzas: list[dict[str, str]] = []
-    cur_stanza: dict[str, str] = {}
-    for raw_line in wt_res.stdout.splitlines():
-        line = raw_line.strip()
-        if not line:
-            if cur_stanza:
-                stanzas.append(cur_stanza)
-                cur_stanza = {}
-            continue
-        if line.startswith("worktree "):
-            if cur_stanza:
-                stanzas.append(cur_stanza)
-            cur_stanza = {"worktree": line[len("worktree ") :].strip()}
-        elif line.startswith("branch "):
-            cur_stanza["branch"] = line[len("branch ") :].strip()
-    if cur_stanza:
-        stanzas.append(cur_stanza)
-
-    reflog_msg = (
-        f"anneal-lean-run --sync-if-behind: fast-forward {normalized_ref} "
-        f"{old_tip or '(new)'} -> {new_tip}"
-    )
-    synced_via_checkout = False
-    for entry in stanzas:
-        wt_str = entry.get("worktree", "")
-        if not wt_str:
-            continue
-        try:
-            wt_path = Path(wt_str).resolve()
-        except OSError:
-            return (False, f"Cannot resolve worktree path {wt_str}")
-
-        wt_git_dir = _worktree_git_dir(wt_path)
-        if (
-            wt_git_dir is not None
-            and normalized_ref in _worktree_detached_target_refs(wt_git_dir)
-        ):
-            return (
-                False,
-                f"{normalized_ref} has an active rebase or bisect in worktree {wt_path}",
-            )
-
-        if entry.get("branch") != normalized_ref:
-            continue
-
-        if current_toplevel is None or wt_path != current_toplevel:
-            return (
-                False,
-                f"{normalized_ref} is checked out in linked worktree {wt_path}",
-            )
-
-        if wt_git_dir is not None:
-            op_marker = _worktree_in_progress_operation(wt_git_dir)
-            if op_marker is not None:
-                return (
-                    False,
-                    f"{normalized_ref} has an in-progress git operation ({op_marker}) in worktree {current_toplevel}",
-                )
-
-        st_res = _run_git(["status", "--porcelain"], cwd=current_toplevel)
-        if st_res.returncode != 0 or st_res.stdout.strip():
-            return (
-                False,
-                f"{normalized_ref} is checked out in dirty worktree {current_toplevel}",
-            )
-
-        if old_tip is not None:
-            ff_res = _run_git(
-                ["merge", "--ff-only", "--", new_tip], cwd=current_toplevel
-            )
-        else:
-            # `<ref>` is the unborn branch of a clean worktree.
-            ff_res = _run_git(
-                ["reset", "--hard", new_tip], cwd=current_toplevel
-            )
-        if ff_res.returncode != 0:
-            return (
-                False,
-                ff_res.stderr.strip() or "git merge --ff-only failed",
-            )
-        synced_via_checkout = True
-        break
-
-    if not synced_via_checkout:
-        up_res = _run_git(
-            [
-                "update-ref",
-                "-m",
-                reflog_msg,
-                "--",
-                normalized_ref,
-                new_tip,
-                old_tip if old_tip is not None else "",
-            ],
-            cwd=repo_path,
-        )
-        if up_res.returncode != 0:
-            return (False, up_res.stderr.strip() or "git update-ref failed")
-
-    actual = _resolve_commit(repo_path, normalized_ref)
-    if actual != new_tip.lower():
-        return (
-            False,
-            f"post-sync verification failed: {normalized_ref} is at "
-            f"{actual or '<missing>'}, expected {new_tip}",
-        )
-    return (True, None)
-
-
-def verify_bundle_ff(
-    bundle_path: str | Path,
-    ref: str = "refs/heads/unstable",
-    repo_dir: str | Path = ".",
-    local_rev: str | None = None,
-    sync_if_behind: bool = False,
-    remote_sync_bin: str | None = None,
-) -> dict[str, Any]:
-    """Verifies that local `ref` (or `local_rev`) is a fast-forward descendant of `bundle_path`."""
-    bundle_str = str(bundle_path)
-    normalized_ref = normalize_git_ref(ref)
-    repo_path = Path(repo_dir)
-    local_rev_clean = local_rev.strip() if local_rev is not None else ""
-    local_rev_is_override = bool(
-        local_rev_clean and normalize_git_ref(local_rev_clean) != normalized_ref
-    )
-    # When `--local-rev` merely spells `--ref` (e.g. `unstable`), resolve the
-    # fully-qualified ref: git's DWIM order (`refs/tags/<x>` before
-    # `refs/heads/<x>`) would otherwise let a same-named tag shadow the branch
-    # that `git bundle create ... --branches` actually exports.
-    target_local_rev = local_rev_clean if local_rev_is_override else normalized_ref
-    # Name the revision actually compared in human-readable messages.
-    local_label = (
-        f"{target_local_rev} [--local-rev for {normalized_ref}]"
-        if local_rev_is_override
-        else normalized_ref
-    )
-
-    def _verdict(
-        ok: bool,
-        status: str,
-        remote_tip: str | None,
-        local_tip: str | None,
-        synced: bool,
-        message: str,
-    ) -> dict[str, Any]:
-        return {
-            "ok": ok,
-            "status": status,
-            "bundle_path": bundle_str,
-            "ref": normalized_ref,
-            "remote_tip": remote_tip,
-            "local_tip": local_tip,
-            "synced": synced,
-            "message": message,
-        }
-
-    is_git_repo = False
-    local_tip: str | None = None
-    try:
-        if repo_path.is_dir():
-            git_chk = _run_git(["rev-parse", "--git-dir"], cwd=repo_path)
-            if git_chk.returncode == 0:
-                is_git_repo = True
-                local_tip = _resolve_commit(repo_path, target_local_rev)
-    except OSError:
-        is_git_repo = False
-        local_tip = None
-
-    with stage_bundle_for_verification(
-        bundle_path, remote_sync_bin=remote_sync_bin
-    ) as (stage_status, staged_path, stage_err):
-        if stage_status == "no_remote_bundle":
-            return _verdict(
-                ok=True,
-                status="no_remote_bundle",
-                remote_tip=None,
-                local_tip=local_tip,
-                synced=False,
-                message=(
-                    f"Remote bundle {bundle_str} does not exist yet; "
-                    "first-time bundle export is allowed."
-                ),
-            )
-
-        if stage_status != "staged" or staged_path is None:
-            return _verdict(
-                ok=False,
-                status="bundle_error",
-                remote_tip=None,
-                local_tip=local_tip,
-                synced=False,
-                message=(
-                    f"Failed to stage or read remote bundle {bundle_str}: "
-                    f"{stage_err or 'unknown error'} (failing closed)."
-                ),
-            )
-
-        ok_heads, heads, heads_err = parse_bundle_heads(
-            staged_path, cwd=repo_path if is_git_repo else None
-        )
-        if not ok_heads:
-            return _verdict(
-                ok=False,
-                status="bundle_error",
-                remote_tip=None,
-                local_tip=local_tip,
-                synced=False,
-                message=(
-                    f"Corrupt or unreadable remote bundle {bundle_str}: "
-                    f"{heads_err or 'git bundle list-heads failed'} (failing closed)."
-                ),
-            )
-
-        remote_tip = heads.get(normalized_ref)
-        if remote_tip is None:
-            return _verdict(
-                ok=True,
-                status="no_remote_ref",
-                remote_tip=None,
-                local_tip=local_tip,
-                synced=False,
-                message=(
-                    f"Ref {normalized_ref} is not present in remote bundle "
-                    f"{bundle_str}; export is allowed."
-                ),
-            )
-
-        if not is_git_repo or local_tip is None:
-            if not is_git_repo or not sync_if_behind or local_rev_is_override:
-                reason = (
-                    f"Directory {repo_path} is not a valid Git repository"
-                    if not is_git_repo
-                    else f"Local ref/revision {target_local_rev} does not exist in {repo_path}"
-                )
-                return _verdict(
-                    ok=False,
-                    status="missing_local_ref",
-                    remote_tip=remote_tip,
-                    local_tip=None,
-                    synced=False,
-                    message=(
-                        f"{reason} while remote bundle {bundle_str} has "
-                        f"{normalized_ref} at {remote_tip}. Remediation: run "
-                        "`git bundle-pull` or pass `--sync-if-behind` before exporting."
-                    ),
-                )
-
-            fetch_res = _run_git(
-                ["fetch", "--no-tags", "--quiet", "--", str(staged_path), normalized_ref],
-                cwd=repo_path,
-            )
-            has_obj = (
-                _run_git(
-                    ["cat-file", "-e", f"{remote_tip}^{{commit}}"],
-                    cwd=repo_path,
-                ).returncode
-                == 0
-            )
-            if fetch_res.returncode != 0 or not has_obj:
-                detail = (
-                    fetch_res.stderr.strip()
-                    or "failed to fetch remote_tip commit from bundle"
-                )
-                return _verdict(
-                    ok=False,
-                    status="bundle_error",
-                    remote_tip=remote_tip,
-                    local_tip=None,
-                    synced=False,
-                    message=(
-                        f"Failed fetching {normalized_ref} ({remote_tip}) from "
-                        f"bundle {bundle_str}: {detail} (failing closed)."
-                    ),
-                )
-
-            sync_ok, sync_err = _sync_local_ref_to_remote(
-                repo_path, normalized_ref, None, remote_tip
-            )
-            if not sync_ok:
-                return _verdict(
-                    ok=False,
-                    status="missing_local_ref",
-                    remote_tip=remote_tip,
-                    local_tip=None,
-                    synced=False,
-                    message=(
-                        f"Local {normalized_ref} is missing and `--sync-if-behind` "
-                        f"could not create it at {remote_tip}: {sync_err}."
-                    ),
-                )
-            return _verdict(
-                ok=True,
-                status="synced_missing_local_ref",
-                remote_tip=remote_tip,
-                local_tip=remote_tip,
-                synced=True,
-                message=(
-                    f"Fetched and created missing local {normalized_ref} at "
-                    f"{remote_tip} from {bundle_str}."
-                ),
-            )
-
-        if local_tip == remote_tip:
-            return _verdict(
-                ok=True,
-                status="up_to_date",
-                remote_tip=remote_tip,
-                local_tip=local_tip,
-                synced=False,
-                message=(
-                    f"Local {local_label} ({local_tip}) matches remote "
-                    f"bundle {bundle_str} ({remote_tip})."
-                ),
-            )
-
-        has_remote_obj = (
-            _run_git(
-                ["cat-file", "-e", f"{remote_tip}^{{commit}}"], cwd=repo_path
-            ).returncode
-            == 0
-        )
-        if has_remote_obj:
-            is_ff = (
-                _run_git(
-                    ["merge-base", "--is-ancestor", remote_tip, local_tip],
-                    cwd=repo_path,
-                ).returncode
-                == 0
-            )
-            if is_ff:
-                return _verdict(
-                    ok=True,
-                    status="fast_forward",
-                    remote_tip=remote_tip,
-                    local_tip=local_tip,
-                    synced=False,
-                    message=(
-                        f"Local {local_label} ({local_tip}) is a fast-forward "
-                        f"descendant of remote bundle {bundle_str} ({remote_tip})."
-                    ),
-                )
-        else:
-            if not sync_if_behind:
-                return _verdict(
-                    ok=False,
-                    status="unfetched_remote_tip",
-                    remote_tip=remote_tip,
-                    local_tip=local_tip,
-                    synced=False,
-                    message=(
-                        f"Remote bundle {bundle_str} has {normalized_ref} at "
-                        f"{remote_tip}, which is not present in local repository "
-                        f"{repo_path} (local tip: {local_tip}). Remediation: run "
-                        "`git bundle-pull` or pass `--sync-if-behind` before exporting."
-                    ),
-                )
-
-            fetch_res = _run_git(
-                ["fetch", "--no-tags", "--quiet", "--", str(staged_path), normalized_ref],
-                cwd=repo_path,
-            )
-            has_remote_obj = (
-                _run_git(
-                    ["cat-file", "-e", f"{remote_tip}^{{commit}}"],
-                    cwd=repo_path,
-                ).returncode
-                == 0
-            )
-            if fetch_res.returncode != 0 or not has_remote_obj:
-                detail = (
-                    fetch_res.stderr.strip()
-                    or "failed to fetch remote_tip commit from bundle"
-                )
-                return _verdict(
-                    ok=False,
-                    status="bundle_error",
-                    remote_tip=remote_tip,
-                    local_tip=local_tip,
-                    synced=False,
-                    message=(
-                        f"Failed fetching {normalized_ref} ({remote_tip}) from "
-                        f"bundle {bundle_str}: {detail} (failing closed)."
-                    ),
-                )
-
-            if (
-                _run_git(
-                    ["merge-base", "--is-ancestor", remote_tip, local_tip],
-                    cwd=repo_path,
-                ).returncode
-                == 0
-            ):
-                return _verdict(
-                    ok=True,
-                    status="fast_forward",
-                    remote_tip=remote_tip,
-                    local_tip=local_tip,
-                    synced=False,
-                    message=(
-                        f"Local {local_label} ({local_tip}) is a fast-forward "
-                        f"descendant of remote bundle {bundle_str} ({remote_tip})."
-                    ),
-                )
-
-        is_behind = (
-            _run_git(
-                ["merge-base", "--is-ancestor", local_tip, remote_tip],
-                cwd=repo_path,
-            ).returncode
-            == 0
-        )
-        if not is_behind:
-            return _verdict(
-                ok=False,
-                status="diverged",
-                remote_tip=remote_tip,
-                local_tip=local_tip,
-                synced=False,
-                message=(
-                    f"Local {local_label} ({local_tip}) has diverged from "
-                    f"remote bundle {bundle_str} tip ({remote_tip}); neither is "
-                    "an ancestor of the other. Remediation: run `git bundle-pull` "
-                    f"and rebase or merge {normalized_ref} before exporting."
-                ),
-            )
-
-        cnt_res = _run_git(
-            ["rev-list", "--count", f"{local_tip}..{remote_tip}"],
-            cwd=repo_path,
-        )
-        behind_count = (
-            int(cnt_res.stdout.strip())
-            if (cnt_res.returncode == 0 and cnt_res.stdout.strip().isdigit())
-            else 1
-        )
-
-        if not sync_if_behind or local_rev_is_override:
-            return _verdict(
-                ok=False,
-                status="stale_behind",
-                remote_tip=remote_tip,
-                local_tip=local_tip,
-                synced=False,
-                message=(
-                    f"Local {local_label} ({local_tip}) is stale "
-                    f"({behind_count} commit(s) behind remote bundle {bundle_str} "
-                    f"tip {remote_tip}). Remediation: run `git bundle-pull` or "
-                    "pass `--sync-if-behind` to fast-forward before exporting."
-                ),
-            )
-
-        sync_ok, sync_err = _sync_local_ref_to_remote(
-            repo_path, normalized_ref, local_tip, remote_tip
-        )
-        if not sync_ok:
-            return _verdict(
-                ok=False,
-                status="stale_behind",
-                remote_tip=remote_tip,
-                local_tip=local_tip,
-                synced=False,
-                message=(
-                    f"Local {local_label} ({local_tip}) is stale "
-                    f"({behind_count} commit(s) behind remote bundle {bundle_str} "
-                    f"tip {remote_tip}), and `--sync-if-behind` refused to "
-                    f"update: {sync_err}. Remediation: clean the worktree or "
-                    "run `git bundle-pull` before exporting."
-                ),
-            )
-
-        return _verdict(
-            ok=True,
-            status="synced_fast_forward",
-            remote_tip=remote_tip,
-            local_tip=remote_tip,
-            synced=True,
-            message=(
-                f"Fast-forwarded local {normalized_ref} from {local_tip} to "
-                f"remote bundle {bundle_str} tip {remote_tip} "
-                f"({behind_count} commit(s))."
-            ),
-        )
-
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Run `lake`, `lean`, or `cargo` commands with hardware-matched "
             "CPU thread, physical RAM (`MemoryMax`), zero-swap "
-            "(`MemorySwapMax=0`), and wall-clock timeout limits, or verify "
-            "fast-forward bundle ancestry (`--verify-bundle-ff`)."
+            "(`MemorySwapMax=0`), and wall-clock timeout limits inside "
+            "`anneal-workloads.slice`."
         )
     )
     p.add_argument(
@@ -1894,16 +2640,23 @@ def build_parser() -> argparse.ArgumentParser:
         dest="probe",
         action="store_true",
         help=(
-            "Print detected host hardware, cgroup v2 working-set stats, and "
+            "Print detected host hardware, cgroup v2 workload envelope, and "
             "computed resource limits without running a command."
+        ),
+    )
+    p.add_argument(
+        "--ensure-slice",
+        action="store_true",
+        help=(
+            "Idempotently create/update `~/.config/systemd/user/anneal-workloads.slice` "
+            "when `systemd --user` is active under `user@<uid>.service`."
         ),
     )
     p.add_argument(
         "--json",
         action="store_true",
         help=(
-            "Format `--probe` / `--print-limits` or `--verify-bundle-ff` "
-            "output as JSON."
+            "Format `--probe` / `--print-limits` or `--ensure-slice` output as JSON."
         ),
     )
     p.add_argument(
@@ -1919,10 +2672,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--concurrency",
         "-W",
         type=int,
-        default=_env_int("ANNEAL_WORKTREE_CONCURRENCY", 1),
+        default=None,
         help=(
             "Number of concurrent active build worktrees sharing this host "
-            "(default: $ANNEAL_WORKTREE_CONCURRENCY or 1)."
+            "(default: $ANNEAL_WORKTREE_CONCURRENCY, `$XDG_CONFIG_HOME/anneal/concurrency`, or 1)."
+        ),
+    )
+    p.add_argument(
+        "--exclusive",
+        action="store_true",
+        help=(
+            "Acquire all `1..build_slots` host build locks in ascending order "
+            "and execute with `w_eff = 1` (forces locking even in `file` mode)."
         ),
     )
     p.add_argument(
@@ -1930,6 +2691,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=_env_int("ANNEAL_LEAN_MEMORY_MAX_MB", 0) or None,
         help="Override the computed hard physical RAM ceiling in MiB.",
+    )
+    p.add_argument(
+        "--unsafe-ignore-cgroup",
+        action="store_true",
+        help="Allow explicit `--memory-max-mb` to exceed `W_slice_max` on cgroup-capped hosts.",
     )
     p.add_argument(
         "--timeout",
@@ -1943,48 +2709,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-slot-lock",
         action="store_true",
-        help="Disable the host-wide concurrent build slot lock for `build` mode.",
+        help="Disable the host-wide concurrent build slot lock (ignored with `--exclusive`).",
     )
     p.add_argument(
-        "--verify-bundle-ff",
-        "--check-unstable-ff",
-        dest="verify_bundle_ff",
-        metavar="BUNDLE_PATH",
-        default=None,
-        help=(
-            "Verify that local `--ref` (default: refs/heads/unstable) is a "
-            "fast-forward descendant of `--ref` in BUNDLE_PATH before exporting."
-        ),
-    )
-    p.add_argument(
-        "--ref",
-        default="refs/heads/unstable",
-        help=(
-            "Git ref to check with `--verify-bundle-ff` "
-            "(default: refs/heads/unstable)."
-        ),
-    )
-    p.add_argument(
-        "--repo-dir",
-        default=".",
-        help="Local Git repository directory for `--verify-bundle-ff` (default: .).",
-    )
-    p.add_argument(
-        "--local-rev",
-        default=None,
-        help=(
-            "Optional local commit/ref override for `--verify-bundle-ff` "
-            "(default: same as `--ref`)."
-        ),
-    )
-    p.add_argument(
-        "--sync-if-behind",
+        "--nested-ok",
         action="store_true",
-        help=(
-            "When `--verify-bundle-ff` detects that local `--ref` is missing "
-            "or strictly behind the remote bundle tip, safely fetch and "
-            "fast-forward local `--ref`."
-        ),
+        help="Disable `ANNEAL_LEAN_RUN_IN_SCOPE=1` re-entrancy pass-through.",
+    )
+    p.add_argument(
+        "--no-oom-retry",
+        action="store_true",
+        help="Disable single on-OOM LSP eviction and retry in `build` mode.",
     )
     p.add_argument(
         "cmd",
@@ -2005,70 +2740,98 @@ def main(argv: list[str] | None = None) -> int:
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
 
-    if args.verify_bundle_ff is not None:
-        if args.probe or cmd:
-            sys.stderr.write(
-                "[anneal-lean-run] ERROR: `--verify-bundle-ff` cannot be "
-                "combined with `--probe` or a command execution.\n"
-            )
-            return 2
-        verdict = verify_bundle_ff(
-            bundle_path=args.verify_bundle_ff,
-            ref=args.ref,
-            repo_dir=args.repo_dir,
-            local_rev=args.local_rev,
-            sync_if_behind=args.sync_if_behind,
+    if args.ensure_slice:
+        env_info = probe_host_envelope(
+            cli_concurrency=args.concurrency,
+            exclusive=args.exclusive,
+            is_probe=True,
+            mode="build",
         )
-        if not verdict["ok"]:
-            sys.stderr.write(f"[anneal-lean-run] ERROR: {verdict['message']}\n")
+        ok, changed, msg = ensure_workloads_slice(env_info)
+        if not ok:
+            sys.stderr.write(f"[anneal-lean-run] ERROR: {msg}\n")
         if args.json:
-            print(json.dumps(verdict, indent=2))
-        elif verdict["ok"]:
             print(
-                f"[anneal-lean-run] OK ({verdict['status']}): "
-                f"{verdict['message']}"
+                json.dumps(
+                    {
+                        "ok": ok,
+                        "changed": changed,
+                        "message": msg,
+                        "w_slice_max_mb": env_info["w_slice_max_mb"],
+                        "w_slice_high_mb": env_info["w_slice_high_mb"],
+                        "user_systemd_active": env_info["user_systemd_active"],
+                    },
+                    indent=2,
+                )
             )
-        return 0 if verdict["ok"] else 1
+        elif ok:
+            print(f"[anneal-lean-run] {msg}")
+        return 0 if ok else 1
 
-    hw = probe_host_hardware()
-    eff_mode = detect_mode(cmd, args.mode)
-    limits = compute_limits(
-        hw=hw,
-        mode=eff_mode,
-        concurrency=args.concurrency,
-        override_mem_mb=args.memory_max_mb,
-        override_timeout_sec=args.timeout,
-    )
-
-    if args.probe or not cmd:
-        if not args.probe and not cmd:
-            parser.print_help(sys.stderr)
-            return 2
-        limits["systemd_user_scope"] = systemd_user_scope_available()
+    if args.probe:
+        eff_mode = detect_mode(cmd, args.mode)
+        limits = probe_host_envelope(
+            cli_concurrency=args.concurrency,
+            exclusive=args.exclusive,
+            is_probe=True,
+            mode=eff_mode,
+            override_mem_mb=args.memory_max_mb,
+            override_timeout_sec=args.timeout,
+            unsafe_ignore_cgroup=args.unsafe_ignore_cgroup,
+        )
         if args.json:
             print(json.dumps(limits, indent=2))
         else:
             print(
                 f"=== Anneal Hardware-Matched Resource Limits "
-                f"(mode={limits['mode']}, W={limits['concurrency']}) ===\n"
+                f"(mode={limits['mode']}, W={limits['w_eff']}) ===\n"
                 f"  Host CPUs          : {limits['cpu_cores']} logical cores\n"
                 f"  Host Physical RAM  : {limits['mem_total_mb']} MiB total, "
                 f"{limits['mem_avail_mb']} MiB available\n"
                 f"{format_cgroup_probe_line(limits)}\n"
+                f"  Usable / Budget    : usable={limits['usable_workload_mem_gb']} GiB, "
+                f"single_build_budget={limits['single_build_budget_gb']:.2f} GiB\n"
                 f"  Thread Budget (-j) : {limits['threads']} threads "
                 f"(LEAN_NUM_THREADS={limits['threads']})\n"
                 f"  Hard RAM Cap       : {limits['memory_max_mb']} MiB "
                 f"(MemorySwapMax=0, lean -M {limits['lean_m_mb']})\n"
+                f"  LSP Pool Limits    : L_max={limits['l_max_mb']} MiB, "
+                f"lean={limits['max_lean_workers']}, rust={limits['max_rust_workers']}, "
+                f"ttl={limits['idle_ttl_seconds']}s\n"
                 f"  Wall-Clock Timeout : {limits['timeout_sec']}s\n"
-                f"  Host Build Slots   : {limits['build_slots']} concurrent build(s)\n"
-                f"  Systemd User Scope : {limits['systemd_user_scope']}"
+                f"  Host Build Slots   : {limits['build_slots']} (s_heavy_safe={limits['s_heavy_safe']}, active={limits['active_build_slots']})\n"
+                f"  Systemd User Scope : {limits['user_systemd_active']} (runtime_base={limits['runtime_base']})"
             )
         return 0
 
+    if not cmd:
+        parser.print_help(sys.stderr)
+        return 2
+
+    # Decoupled re-entrancy pass-through gated STRICTLY on ANNEAL_LEAN_RUN_IN_SCOPE == "1".
+    if os.environ.get("ANNEAL_LEAN_RUN_IN_SCOPE") == "1" and not args.nested_ok:
+        return _exec_passthrough(cmd)
+
+    eff_mode = detect_mode(cmd, args.mode)
+    limits = probe_host_envelope(
+        cli_concurrency=args.concurrency,
+        exclusive=args.exclusive,
+        is_probe=False,
+        mode=eff_mode,
+        override_mem_mb=args.memory_max_mb,
+        override_timeout_sec=args.timeout,
+        unsafe_ignore_cgroup=args.unsafe_ignore_cgroup,
+    )
     return run_bounded_command(
         cmd=cmd,
         limits=limits,
         use_slot_lock=not args.no_slot_lock,
+        exclusive=args.exclusive,
+        no_oom_retry=args.no_oom_retry,
+        cli_concurrency=args.concurrency,
+        override_mem_mb=args.memory_max_mb,
+        override_timeout_sec=args.timeout,
+        unsafe_ignore_cgroup=args.unsafe_ignore_cgroup,
     )
 
 
