@@ -3524,6 +3524,78 @@ theorem w_wideSlice_index_oob_and_dangling_deref_ub_agrees :
     rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl),
     rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl)⟩
 
+/-- Shared slice reference type `&[u32]`. -/
+def sharedRefSliceU32Ty : Ty :=
+  { kind := .ref .not (.slice (.uint .u32)), layoutIdx := 0 }
+
+/-- Single-statement reborrow body `_0 = rv` over the 4-local wide-slice frame (`_1 : [u32; 4]`,
+`_2 : *mut [u32]`, `_3 : usize`) with destination `_0 : dstTy`. Only the reborrow statement is
+stepped (the `Return` is never executed), so the `usize` ABI is irrelevant. -/
+def wideSliceReborrowBody (dstTy : Ty) (rv : Rvalue) : CapturedMir :=
+  { defPath := "wide_slice_reborrow"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 0
+    localDecls :=
+      [ { mutability := .mut, ty := dstTy, debugName := none }
+      , { mutability := .mut, ty := arrU32_4Ty, debugName := none }
+      , { mutability := .mut, ty := rawMutSliceU32Ty, debugName := none }
+      , { mutability := .not, ty := usizeTy, debugName := none } ]
+    basicBlocks :=
+      [ { statements := [ ⟨.assign ⟨0, []⟩ rv, "s0"⟩ ]
+          terminator := ⟨.return_, "t0"⟩
+          isCleanup := false } ]
+    fnAbi := fnAbiUsize
+    layouts := emptyLayoutTable
+    allocations := [] }
+
+/-- Concrete Witness 7 (`slice::from_raw_parts` reborrows of `*_2`, `_2 : *mut [u32]`,
+`len = 3`, borrow-backed by `[10, 20, 30, 40]`), real-step on BOTH interpreters with values pinned:
+1. `_0 = &raw const (*_2)` (`ptr::slice_from_raw_parts` / `addr_of!(*p)`): Anneal and vendored
+   `Miri` both return the ORIGINAL wide pointer (same allocation, offset, tag, and length `3`),
+   with no new Anneal borrow, and the results stay related by `WideSliceImmediateRel`.
+2. `_0 = &(*_2)` (`slice::from_raw_parts(data, len)` = `&*ptr::slice_from_raw_parts(data, len)`):
+   both return a wide reference to the same data with metadata `3`, but the provenance discipline
+   DIVERGES (`DIV-LM-SHARED-REBORROW-FRESH-TAG`): Anneal's Stacked-Borrows-style tracker mints a
+   fresh borrow (tag / alloc id `2`, `borrows.length = 2`, `nextTag = 3`), whereas vendored `Miri`
+   keeps the parent tag (`BorTag.one`) because retagging is a separate `Retag` statement there.
+   A state relation across such a reborrow must therefore extend `allocMap` with an entry for the
+   fresh Anneal tag that maps to the parent `Miri` provenance. -/
+theorem w_wideSlice_reborrow_raw_and_shared_agrees :
+    let bRaw := wideSliceReborrowBody rawSliceU32Ty (.rawPtr .not ⟨2, [.deref]⟩)
+    let bRef := wideSliceReborrowBody sharedRefSliceU32Ty (.ref .shared ⟨2, [.deref]⟩)
+    let wideVal : Value := .aggregate 0 [.ptr sampleAnnealPtr 8, .scalar ⟨3, 8⟩]
+    let wideImm : Miri.Interpreter.Immediate AnnealProv :=
+      .scalarPair sampleMiriPtrSc (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 3))
+    ∃ (sRaw sRef : MachineState) (mRaw mRef : AnnealStepState),
+      stepMirFn bRaw (wideSlice4LocalInitAnneal sampleAnnealPtr 3 1 sampleAnnealArrMemory) =
+        .step sRaw ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bRaw.localDecls bRaw.layouts) ()
+        (wideSlice4LocalInitMiri bRaw rawSliceU32Ty sampleMiriPtr 3 1 sampleArrU32Machine) =
+        (mRaw, .ok true) ∧
+      get? sRaw.frame.locals 0 = some (.init wideVal) ∧
+      sRaw.memory.borrows.length = 1 ∧
+      miriTopLocal? mRaw 0 = some (.live (.immediate wideImm)) ∧
+      stepMirFn bRef (wideSlice4LocalInitAnneal sampleAnnealPtr 3 1 sampleAnnealArrMemory) =
+        .step sRef ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bRef.localDecls bRef.layouts) ()
+        (wideSlice4LocalInitMiri bRef sharedRefSliceU32Ty sampleMiriPtr 3 1 sampleArrU32Machine) =
+        (mRef, .ok true) ∧
+      get? sRef.frame.locals 0 =
+        some (.init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8, .scalar ⟨3, 8⟩])) ∧
+      sRef.memory.borrows.length = 2 ∧
+      sRef.memory.nextTag = 3 ∧
+      miriTopLocal? mRef 0 = some (.live (.immediate wideImm)) ∧
+      WideSliceImmediateRel [sampleAllocMapEntry] wideVal wideImm :=
+  ⟨_, _, _, _,
+    rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), rfl, rfl, (by with_unfolding_all rfl),
+    rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), rfl, rfl, rfl,
+    (by with_unfolding_all rfl),
+    .provenance
+      (PtrRel.of_stackAllocPlace (.head _) (by decide))
+      ⟨Or.inr (Or.inr (Or.inr (Or.inl rfl))), by decide, rfl, rfl⟩
+      rfl⟩
+
 end WideSliceWitnesses
 
 end LeanMiriSpec.Correspondence

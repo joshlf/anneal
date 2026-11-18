@@ -1528,6 +1528,9 @@ open LeanMiriSpec.Correspondence in
   WideSliceWitnesses.w_wideSlice_index_write_returns
   WideSliceWitnesses.w_wideSlice_len_index_read_write_returns
   WideSliceWitnesses.w_wideSlice_index_oob_and_dangling_deref_ub_agrees
+  WideSliceWitnesses.sharedRefSliceU32Ty
+  WideSliceWitnesses.wideSliceReborrowBody
+  WideSliceWitnesses.w_wideSlice_reborrow_raw_and_shared_agrees
 
 
 /-- Exhaustively verify that every declaration across every imported
@@ -26439,6 +26442,35 @@ example :
         (wideSlice4LocalInitMiri bRead u32Ty pastEndMiriPtr 3 0 sampleArrU32Machine) =
         (mPastEnd, .error (.undefinedBehavior "pointer dereference check failed")) :=
   w_wideSlice_index_oob_and_dangling_deref_ub_agrees
+
+open WideSliceWitnesses in
+example :
+    let bRaw := wideSliceReborrowBody rawSliceU32Ty (.rawPtr .not ⟨2, [.deref]⟩)
+    let bRef := wideSliceReborrowBody sharedRefSliceU32Ty (.ref .shared ⟨2, [.deref]⟩)
+    let wideVal : Value := .aggregate 0 [.ptr sampleAnnealPtr 8, .scalar ⟨3, 8⟩]
+    let wideImm : Miri.Interpreter.Immediate AnnealProv :=
+      .scalarPair sampleMiriPtrSc (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 3))
+    ∃ (sRaw sRef : MachineState) (mRaw mRef : AnnealStepState),
+      stepMirFn bRaw (wideSlice4LocalInitAnneal sampleAnnealPtr 3 1 sampleAnnealArrMemory) =
+        .step sRaw ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bRaw.localDecls bRaw.layouts) ()
+        (wideSlice4LocalInitMiri bRaw rawSliceU32Ty sampleMiriPtr 3 1 sampleArrU32Machine) =
+        (mRaw, .ok true) ∧
+      get? sRaw.frame.locals 0 = some (.init wideVal) ∧
+      sRaw.memory.borrows.length = 1 ∧
+      miriTopLocal? mRaw 0 = some (.live (.immediate wideImm)) ∧
+      stepMirFn bRef (wideSlice4LocalInitAnneal sampleAnnealPtr 3 1 sampleAnnealArrMemory) =
+        .step sRef ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bRef.localDecls bRef.layouts) ()
+        (wideSlice4LocalInitMiri bRef sharedRefSliceU32Ty sampleMiriPtr 3 1 sampleArrU32Machine) =
+        (mRef, .ok true) ∧
+      get? sRef.frame.locals 0 =
+        some (.init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8, .scalar ⟨3, 8⟩])) ∧
+      sRef.memory.borrows.length = 2 ∧
+      sRef.memory.nextTag = 3 ∧
+      miriTopLocal? mRef 0 = some (.live (.immediate wideImm)) ∧
+      WideSliceImmediateRel [sampleAllocMapEntry] wideVal wideImm :=
+  w_wideSlice_reborrow_raw_and_shared_agrees
 
 end StatementPins
 
