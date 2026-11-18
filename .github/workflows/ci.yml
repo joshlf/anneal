@@ -110,17 +110,25 @@ jobs:
           set -euo pipefail
           exec > >(tee "$ANNEAL_BUILD_DIAGNOSTICS/startup.log") 2>&1
           sha256sum --check --strict trusted/root-manifest.sha256
-          for p in .cargo rust-toolchain rust-toolchain.toml; do
-            test ! -e "$p" && test ! -L "$p"
+          for p in .cargo rust-toolchain rust-toolchain.toml target; do
+            if [ -e "$p" ] || [ -L "$p" ]; then
+              echo "Forbidden repository root file or directory exists: $p" >&2
+              exit 1
+            fi
           done
           printf 'source_revision=%s\n' "$(git rev-parse HEAD)"
 
+      # Store the Nix binary cache outside `${{ github.workspace }}` and skip
+      # it on `merge_group` and `workflow_dispatch` runs so PRs cannot supply
+      # pre-committed cache entries in the checkout and both the merge queue
+      # and manual workflow-dispatch runs always build cold from source.
       - name: Restore Nix binary cache
         id: restore_nix_cache
+        if: github.event_name != 'merge_group' && github.event_name != 'workflow_dispatch'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: target/nix-cache
-          key: anneal-nix-cache-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock', 'trusted/lean/**', 'trusted/audit/**', 'trusted/rustc-capture/**', 'theory/**') }}
+          path: ${{ runner.temp }}/anneal-nix-cache
+          key: anneal-nix-cache-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock', 'trusted/lean/**', 'trusted/audit/**', 'trusted/rustc-capture/**', 'trusted/cargo-anneal/**', 'trusted/correspondence/**', 'correspondence/**', 'vendor/lean-miri/UPSTREAM_PIN.json', 'theory/**') }}
           restore-keys: |
             anneal-nix-cache-v1-${{ runner.os }}-${{ runner.arch }}-
 
@@ -135,8 +143,8 @@ jobs:
           exec > >(tee "$ANNEAL_BUILD_DIAGNOSTICS/nix-build.log") 2>&1
           mkdir -p target
           nix_args=()
-          if [ -f target/nix-cache/nix-cache-info ]; then
-            nix_args+=(--extra-substituters "file://$PWD/target/nix-cache/?trusted=1")
+          if [ -f "$RUNNER_TEMP/anneal-nix-cache/nix-cache-info" ]; then
+            nix_args+=(--extra-substituters "file://$RUNNER_TEMP/anneal-nix-cache/?trusted=1")
           fi
 
           nix build --max-jobs 1 --cores 2 "${nix_args[@]}" \
@@ -146,20 +154,20 @@ jobs:
 
       - name: Populate Nix binary cache
         id: populate_nix_cache
-        if: steps.restore_nix_cache.outputs.cache-hit != 'true'
+        if: github.event_name != 'merge_group' && github.event_name != 'workflow_dispatch' && steps.restore_nix_cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           exec > >(tee "$ANNEAL_BUILD_DIAGNOSTICS/nix-copy.log") 2>&1
-          mkdir -p target/nix-cache
+          mkdir -p "$RUNNER_TEMP/anneal-nix-cache"
           nix copy .#omnibus-archive \
-            --to "file://$PWD/target/nix-cache/?compression=zstd&compression-level=1&trusted=1"
+            --to "file://$RUNNER_TEMP/anneal-nix-cache/?compression=zstd&compression-level=1&trusted=1"
 
       - name: Save Nix binary cache
         id: save_nix_cache
-        if: steps.restore_nix_cache.outputs.cache-hit != 'true'
+        if: github.event_name != 'merge_group' && github.event_name != 'workflow_dispatch' && steps.restore_nix_cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: target/nix-cache
+          path: ${{ runner.temp }}/anneal-nix-cache
           key: ${{ steps.restore_nix_cache.outputs.cache-primary-key }}
 
       - name: Upload exocrate toolchain archive
@@ -243,8 +251,11 @@ jobs:
           set -euo pipefail
           exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/startup.log") 2>&1
           sha256sum --check --strict trusted/root-manifest.sha256
-          for p in .cargo rust-toolchain rust-toolchain.toml; do
-            test ! -e "$p" && test ! -L "$p"
+          for p in .cargo rust-toolchain rust-toolchain.toml target; do
+            if [ -e "$p" ] || [ -L "$p" ]; then
+              echo "Forbidden repository root file or directory exists: $p" >&2
+              exit 1
+            fi
           done
           revision="$(git rev-parse HEAD)"
           printf 'ANNEAL_TEST_SOURCE_REVISION=%s\n' "$revision" >> "$GITHUB_ENV"
@@ -329,12 +340,15 @@ jobs:
           if len(roots) != 1 or roots[0].is_symlink():
               raise SystemExit("setup must produce exactly one fresh installation")
           root = roots[0].resolve()
-          for relative in ("rust/bin/rustc", "rust/bin/rustdoc", "lean/bin/lean", "bin/anneal-rustc-capture"):
+          for relative in ("rust/bin/rustc", "rust/bin/rustdoc", "lean/bin/lean", "bin/anneal-rustc-capture", "share/anneal/correspondence-provenance.json"):
               if not (root / relative).is_file():
                   raise SystemExit(f"installed tool is missing: {root / relative}")
           print(f"XDG_CACHE_HOME={os.environ['XDG_CACHE_HOME']}")
           print(f"ANNEAL_TEST_INSTALL_ROOT={root}")
           print(f"ANNEAL_TEST_RUST_SYSROOT={root / 'rust'}")
+          print(f"ANNEAL_LEAN={root / 'lean/bin/lean'}")
+          print(f"ANNEAL_CAPTURE={root / 'bin/anneal-rustc-capture'}")
+          print(f"ANNEAL_SYSROOT={root / 'rust'}")
           print(f"RUSTC={root / 'rust/bin/rustc'}")
           print(f"RUSTDOC={root / 'rust/bin/rustdoc'}")
           print(f"LD_LIBRARY_PATH={root / 'rust/lib'}")
@@ -407,7 +421,26 @@ jobs:
         run: |
           set -euo pipefail
           exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/workspace.log") 2>&1
+          cargo run --locked -p cargo-anneal --example regenerate_bundle -- \
+            --root . --check
           cargo test --workspace --locked
+
+      - name: Verify production Starnix fixture and mutations
+        id: starnix
+        env:
+          ACTIONS_CACHE_URL: ''
+          ACTIONS_RESULTS_URL: ''
+          ACTIONS_RUNTIME_TOKEN: ''
+          ACTIONS_RUNTIME_URL: ''
+        run: |
+          set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/starnix-e2e.log") 2>&1
+          python3 ci/verify_starnix_e2e.py \
+            --cli "$ANNEAL_TEST_CARGO_ANNEAL" \
+            --capture "$ANNEAL_CAPTURE" \
+            --sysroot "$ANNEAL_SYSROOT" \
+            --lean "$ANNEAL_LEAN" \
+            --artifacts-dir "$ANNEAL_TEST_DIAGNOSTICS/starnix-evidence"
 
       - name: Check crate packaging
         id: package
@@ -462,7 +495,9 @@ jobs:
       - name: Verify clean working tree
         id: clean_tree
         run: |
-          test -z "$(git status --porcelain --untracked-files=all)"
+          set -euo pipefail
+          status="$(git status --porcelain --untracked-files=all)"
+          test -z "$status"
 
       - name: Record test step results
         if: ${{ always() }}

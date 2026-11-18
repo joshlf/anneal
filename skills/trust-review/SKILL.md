@@ -121,9 +121,9 @@ intentional or accidental enforcement bypasses:
      upstream commit and tree pin (`LOCKED_MIRI_COMMIT`,
      `vendor_tree.manifest_sha256`), the closed `LOCKED_PATCHED_MIRI_FILES`
      allowlist, the `LOCKED_UPSTREAM_PIN_SHA256` digest lock in
-     [`trusted/audit/src/lib.rs`](../../trusted/audit/src/lib.rs), and human
-     audit of any compile-time code (`run_cmd`, `initialize`, custom tactic
-     `elab`s) in vendored or patched modules.
+     [`trusted/audit/src/miri_pin.rs`](../../trusted/audit/src/miri_pin.rs),
+     and human audit of any compile-time code (`run_cmd`, `initialize`, custom
+     tactic `elab`s) in vendored or patched modules.
    - Watch for path-normalization tricks, case-collision filenames, or Unicode
      homoglyphs and bidirectional/invisible control characters in module or
      identifier names.
@@ -174,9 +174,10 @@ affected components against these requirements:
   comments and both quote and cite the applicable Rust Reference section
   (`rust-lang/reference`) or compiler source (`rust-lang/rust`) at a pinned
   commit hash.
-- **Statement-Origin Separation:** Verify that `Trusted.CrateTheorem` and
-  `VerificationResult` theorem statements (`ConstantInfo.type`) reference only
-  `Init.*` and `Trusted.*` constants, never `theory/` (`Anneal.*`).
+- **Statement-Origin Separation:** Verify that the obligation definitions
+  `Trusted.MirSemantics.CrateTheorem` and `UnitTheorem`, like every other
+  `trusted/lean/` constant, reference only `Init.*` and `Trusted.*` constants,
+  never `theory/` or `correspondence/` constants (`Anneal.*`).
 - **Module trust-tier discipline (`-- anneal-trust-tier:`):** Every `Trusted.*`
   module must carry an accurate `-- anneal-trust-tier: vetted` or
   `-- anneal-trust-tier: candidate:<feature>` directive. Ensure that new or
@@ -193,22 +194,44 @@ affected components against these requirements:
 - **Fail-closed translation and late-error guards:** Unsupported MIR statements,
   terminators, types, intrinsics, or attributes must produce hard errors rather
   than fallback defaults or skipped obligations, and capture must abort whenever
-  `tcx.dcx().has_errors()` indicates compiler diagnostics.
-- **Emitted `Mir.lean` and `Proof.lean` integrity:** Generated Lean files must
-  remain pure and deterministic, and must never allow crate names, identifiers,
-  or annotation strings to inject raw Lean commands or alter the
-  `Proof.verify_crate : Trusted.CrateTheorem Mir.crate` theorem statement.
+  `tcx.dcx().has_errors()` indicates compiler diagnostics. Capture must also
+  refuse items whose captured body is not what calls execute, such as
+  `#[rustc_intrinsic]` definitions (rustc lowers their calls without running
+  the fallback body).
+- **Emitted Lean integrity:** Generated Lean files (`Captured.lean`, and the
+  runner-generated `Expected.lean` in `cargo-anneal verify`) must remain pure
+  and deterministic, and must never allow crate names, identifiers, or
+  annotation strings to inject raw Lean commands or alter the canonical
+  `Expected.claim` statement. Nominal identities that specifications can name
+  (such as `EnumTy.id`) must not depend on unrelated items in the crate.
 - **Mandatory pinned `rustc` citations:** Code extracting `rustc` internal types
   (`TyCtxt`, `Body`, layouts, regions, ABI facts) must explain the
   correspondence and both quote and cite `rust-lang/rust` at a pinned commit
   hash.
 
-### 3. Boundary auditor and lock manifests (`trusted/audit/`, lock files)
+### 3. Auditor, target inspector, and locks (`trusted/audit/`, lock files)
 
-- **No silent weakening of `anneal-audit`:** Scrutinize any modification to
-  [`trusted/audit/src/lib.rs`](../../trusted/audit/src/lib.rs) or
-  [`TrustedBoundary.lean`](../../trusted/audit/TrustedBoundary.lean). Flag any
-  change that:
+- **No silent weakening of `anneal-audit` or target acceptance:** Scrutinize
+  any modification to:
+  - the repository auditor in [`trusted/audit/src/`](../../trusted/audit/src):
+    `cargo_boundary.rs` (Cargo containment, `.cargo`/`rust-toolchain*`
+    rejection, and `bundled_resources.rs` parity), `miri_pin.rs`
+    (`vendor/lean-miri/` pin and sysroot manifest), and `repo_audit.rs` (Pass
+    1 and Pass 2 orchestration); `lib.rs` only re-exports them;
+  - the enforcement substrate that `anneal-audit` shares with
+    `cargo-anneal verify` in
+    [`trusted/cargo-anneal/src/`](../../trusted/cargo-anneal/src):
+    `toolchain.rs` (lock record types and the `LOCKED_*` toolchain
+    constants), `stage.rs` (environment allowlist, Lean and lock admission,
+    compile flags, inspector invocation, and result acceptance), `bundle.rs`
+    (embedded bundle inventory and rendering), `target.rs` (target roles,
+    module names, and `library-lock.json` digest admission), and `verify.rs`
+    (capture invocation, reserved module names, and the `result.json`
+    receipt); and
+  - [`TrustedBoundary.lean`](../../trusted/audit/TrustedBoundary.lean),
+    including its `"headers"` and `"target-audit"` modes.
+
+  Flag any change that:
   - expands `allowedCommandKinds`, `allowedDeclarationKinds`,
     `allowedAttributeNames`, `allowedTrustedSyntaxKinds`,
     `allowedTheoryTacticKinds`, or the foundation axiom allowlist without a
@@ -218,40 +241,72 @@ affected components against these requirements:
     regular-file checks (`scan_lean_tree`), or environment variable stripping;
   - weakens synchronous compilation flags (`-DElab.async=false`,
     `-Ddebug.skipKernelTC=false`), `.olean` loading (`trustLevel := 0`,
-    `plugins := #[]`, `loadExts := false` in `"audit"` and
-    `"correspondence-audit"`), `checkDeclarationEdges`, or fresh kernel replay
-    (`base.toKernelEnv.replay`). Note that `"correspondence-preflight"`
+    `plugins := #[]`, and `loadExts := false` without
+    `enableInitializersExecution` in `"audit"`, `"correspondence-audit"`, and
+    every `"target-audit"` import), `checkDeclarationEdges`, or fresh kernel
+    replay (`base.toKernelEnv.replay`). Note that `"correspondence-preflight"`
     intentionally imports with `loadExts := true`, `level := .private`, and
     `enableInitializersExecution`, which executes pinned vendored `[init]`
     initializers (able to register user-defined environment extensions),
     evaluates pinned vendored tactic `elab`s, and deserializes compiled Pass 1
     `theory/` extension data inside the inspector process; flag any weakening
     of Pass 1's closed `theory/` attribute allowlist or vendored compile-time
-    code review controls.
-- **Negative regression tests:** Any change to `anneal-audit` admission rules,
-  syntax filters, or tier checks must include negative tests in
-  [`boundary_audit.rs`](../../trusted/audit/tests/boundary_audit.rs) verifying
-  that prohibited inputs are rejected with policy exit code `1` (or non-zero
-  exit code `2` for standalone kernel-replay rejections).
+    code review controls;
+  - relaxes `"target-audit"` acceptance: the canonical claim built from
+    role-authenticated kernel names, the kind, universe, `Prop`, and
+    canonical-input role gates, the fixed three-axiom policy, `TargetRole`
+    import and declaration-edge checks, `@[implemented_by]`, `@[extern]`, and
+    `@[csimp]` metadata rejection, or replay of every reached library and
+    source declaration onto `foundation-lock.json`; or
+  - relaxes target staging admission: reserved module names (`Trusted`,
+    `Trusted.*`, `Anneal`, `Anneal.*`, `Captured`, and `Expected`),
+    module-name overlap with foundation or `library-lock.json` modules, or
+    `library-lock.json` catalog and digest checks.
+- **Negative regression tests:** Any change to admission rules, syntax filters,
+  tier checks, or target acceptance must include negative tests verifying that
+  prohibited inputs fail closed (policy exit code `1` for `anneal-audit` and
+  `TrustedBoundary.lean`, or non-zero exit code `2` for standalone
+  kernel-replay rejections):
+  [`boundary_audit.rs`](../../trusted/audit/tests/boundary_audit.rs) and the
+  `trusted/audit/src/` unit tests for repository audits,
+  [`target_audit.rs`](../../trusted/audit/tests/target_audit.rs) for
+  `"target-audit"`, `trusted/cargo-anneal/src/` unit tests or
+  [`mvp_e2e.rs`](../../trusted/cargo-anneal/tests/mvp_e2e.rs) for target
+  staging and receipts, and
+  [`typed_capture.rs`](../../trusted/rustc-capture/tests/typed_capture.rs) for
+  capture refusals.
 - **Cryptographic lock synchronization:** When `Cargo.toml`, `Cargo.lock`,
   `flake.nix`, `flake.lock`, the Lean binary, sysroot `.olean` files, or
   `vendor/lean-miri/` change, verify that
   [`trusted/root-manifest.sha256`](../../trusted/root-manifest.sha256),
   [`foundation-lock.json`](../../trusted/lean/foundation-lock.json)
   (`trusted/lean/foundation-lock.json`),
+  [`library-lock.json`](../../trusted/audit/library-lock.json)
+  (`trusted/audit/library-lock.json`, whose `toolchain` and module digests
+  must match the pinned Lean sysroot),
   [`UPSTREAM_PIN.json`](../../vendor/lean-miri/UPSTREAM_PIN.json), and the
   corresponding `LOCKED_*` constants in
-  [`trusted/audit/src/lib.rs`](../../trusted/audit/src/lib.rs)
+  [`trusted/cargo-anneal/src/toolchain.rs`][toolchain-rs]
+  and [`trusted/audit/src/miri_pin.rs`](../../trusted/audit/src/miri_pin.rs)
   (`LOCKED_SYSROOT_FOUNDATION_MANIFEST_SHA256`, `LOCKED_UPSTREAM_PIN_SHA256`,
   `LOCKED_MIRI_COMMIT`, `LOCKED_PATCHED_MIRI_FILES`) are updated in lockstep
   and that the underlying dependency, toolchain, or vendored change is audited.
+  Whenever a file in `BUNDLE_SOURCES` or `PROVENANCE_SOURCES`
+  (`trusted/cargo-anneal/src/bundle.rs`) changes, including
+  `TrustedBoundary.lean`, either lock file, `UPSTREAM_PIN.json`, and the
+  correspondence sources, verify that
+  [`bundled_resources.rs`](../../trusted/cargo-anneal/src/bundled_resources.rs)
+  was regenerated with
+  `cargo run --locked -p cargo-anneal --example regenerate_bundle -- --root .`.
 
 ### 4. CLI orchestrator and dependencies (`trusted/cargo-anneal/`, `Cargo.*`)
 
 - **Orchestration integrity:** Verify that `cargo-anneal` does not allow ambient
-  environment variables, target-crate configuration files, or CLI flags to skip
-  Lean kernel checking, substitute an unverified toolchain archive, or suppress
-  verification errors.
+  environment variables, target-crate configuration files, working-directory
+  files (such as a relative capture-tool path), or CLI flags to skip Lean
+  kernel checking, substitute an unverified toolchain archive or capture
+  adapter, or suppress verification errors, and that `result.json` receipts
+  never claim more authentication than the runner performed.
 - **Dependency discipline:** Check any added or updated crate in `Cargo.toml`
   and `Cargo.lock` against [`AGENTS.md`](../../AGENTS.md): prefer standard,
   well-audited crates over hand-rolled plumbing, keep transitive dependency
@@ -294,3 +349,5 @@ When reporting a finding:
    parser production can be reached or how an external tool handles a path),
    state the hypothesis and what check or test would resolve it rather than
    asserting an unverified failure as fact.
+
+[toolchain-rs]: ../../trusted/cargo-anneal/src/toolchain.rs
