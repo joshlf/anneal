@@ -1288,4 +1288,47 @@ fn rustc_that_is_not_the_linked_build_is_refused_before_compilation() {
         assert!(stdout(&output).contains(diagnostic), "{output:?}");
         assert!(!fixture.output.exists(), "{output:?}");
     }
+
+    // A non-UTF-8 --sysroot (spelling or canonical target) is also refused as
+    // `tool_failed` before output reservation or `rustc_driver`'s ICE-hook
+    // argv check, even when `--rustc` itself is valid UTF-8.
+    let non_utf8_sysroot = tools
+        .path()
+        .join(std::ffi::OsString::from_vec(vec![b's', b'y', 0xff]));
+    std::fs::create_dir(&non_utf8_sysroot).unwrap();
+    let utf8_to_non_utf8_sysroot = tools.path().join("utf8-sysroot-link");
+    std::os::unix::fs::symlink(&non_utf8_sysroot, &utf8_to_non_utf8_sysroot).unwrap();
+    let non_utf8_to_utf8_sysroot = tools
+        .path()
+        .join(std::ffi::OsString::from_vec(vec![b's', b'l', 0xff]));
+    std::os::unix::fs::symlink(sysroot(), &non_utf8_to_utf8_sysroot).unwrap();
+    for (bad_sysroot, with_rustc, diagnostic) in [
+        (&non_utf8_to_utf8_sysroot, false, "--sysroot path must be UTF-8"),
+        (&non_utf8_to_utf8_sysroot, true, "--sysroot path must be UTF-8"),
+        (&utf8_to_non_utf8_sysroot, true, "sysroot path must be UTF-8"),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_anneal-rustc-capture"));
+        command
+            .current_dir(fixture.directory.path())
+            .arg("capture")
+            .arg("--crate-root")
+            .arg(&fixture.source)
+            .arg("--crate-name=session")
+            .arg("--target=x86_64-unknown-linux-gnu")
+            .arg("--out-dir")
+            .arg(&fixture.output)
+            .arg("--sysroot")
+            .arg(bad_sysroot)
+            .arg("--source-file")
+            .arg(&fixture.source)
+            .arg("--select=selected");
+        if with_rustc {
+            command.arg("--rustc").arg(&valid);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(status(&output)["status"], "tool_failed", "{output:?}");
+        assert!(stdout(&output).contains(diagnostic), "{output:?}");
+        assert!(!fixture.output.exists(), "{output:?}");
+    }
 }

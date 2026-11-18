@@ -154,6 +154,10 @@ def run(arguments, work):
             raise RuntimeError(
                 f"receipt rustc_binary_sha256 {baseline.get('rustc_binary_sha256')} "
                 f"!= {expected_rustc_sha}")
+    elif baseline.get("rustc_binary_sha256") is not None:
+        raise RuntimeError(
+            "receipt unexpectedly populated rustc_binary_sha256 without --rustc-version: "
+            f"{baseline.get('rustc_binary_sha256')}")
     # Positively exercise the same candidate producer used for mutations.
     # Exact byte equality reuses the baseline's successful kernel check and
     # prevents an invalid-Lean producer from satisfying only negative cases.
@@ -238,10 +242,10 @@ def main():
         "--lean", type=Path,
         default=os.environ.get("ANNEAL_LEAN") or os.environ.get("ANNEAL_MVP_LEAN"))
     parser.add_argument(
-        "--rustc", type=Path, default=os.environ.get("ANNEAL_RUSTC"),
+        "--rustc", type=Path, default=os.environ.get("ANNEAL_RUSTC") or None,
         help="Compiler checked against --rustc-version (default: SYSROOT/bin/rustc)")
     parser.add_argument(
-        "--rustc-version", default=os.environ.get("ANNEAL_RUSTC_VERSION"),
+        "--rustc-version", default=os.environ.get("ANNEAL_RUSTC_VERSION") or None,
         help="Declared compiler: a MIR dialect such as V2026_10_22_R7189d39d9 "
              "or the full commit")
     parser.add_argument("--source-dir", type=Path,

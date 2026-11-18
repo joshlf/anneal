@@ -460,6 +460,11 @@ fn collect(
         ));
     }
     let sysroot = tcx.sess.opts.sysroot.path().to_path_buf();
+    if sysroot.to_str().is_none() {
+        return Err(Failure::tool(format!(
+            "sysroot path must be UTF-8: {sysroot:?}"
+        )));
+    }
     let rustc = args
         .rustc
         .clone()

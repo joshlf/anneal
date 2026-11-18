@@ -2697,6 +2697,9 @@ fn rejects_tampered_capture_compiler_fields() {
     let canonical_rustc = fs::canonicalize(&rustc).unwrap();
     let canonical_rustc = canonical_rustc.to_str().unwrap();
     let escaped_rustc = canonical_rustc.replace('/', "\\/");
+    let canonical_sysroot = fs::canonicalize(&tools.sysroot).unwrap();
+    let canonical_sysroot = canonical_sysroot.to_str().unwrap();
+    let escaped_sysroot = canonical_sysroot.replace('/', "\\/");
     let cases = [
         // Only the top-level field: the two dialect fields disagree.
         (
@@ -2751,6 +2754,14 @@ fn rejects_tampered_capture_compiler_fields() {
             dialect,
             format!("capture reports compiler {dialect} with rustc \"/other/rustc\""),
         ),
+        // Even with the dialect and `compiler.rustc` intact, `compiler.sysroot`
+        // must match the canonical sysroot selected for capture.
+        (
+            format!("-e 's/\"sysroot\": \"{escaped_sysroot}\"/\"sysroot\": \"\\/other\\/sysroot\"/'"),
+            true,
+            dialect,
+            "capture reports sysroot \"/other/sysroot\"".to_owned(),
+        ),
     ];
     for (index, (expressions, declare, expected_dialect, diagnostic)) in
         cases.into_iter().enumerate()
@@ -2788,11 +2799,16 @@ fn rejects_tampered_capture_compiler_fields() {
             manifest["mir_dialect"], expected_dialect,
             "case {index}: {manifest}"
         );
-        assert_ne!(
-            manifest["compiler"]["rustc"].as_str(),
-            (expected_dialect == dialect).then_some(canonical_rustc),
-            "case {index}: {manifest}"
-        );
+        if expected_dialect == dialect {
+            assert_ne!(
+                (
+                    manifest["compiler"]["rustc"].as_str(),
+                    manifest["compiler"]["sysroot"].as_str(),
+                ),
+                (Some(canonical_rustc), Some(canonical_sysroot)),
+                "case {index}: {manifest}"
+            );
+        }
         assert!(
             !sandbox
                 .artifacts_dir

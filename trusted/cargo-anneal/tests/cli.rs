@@ -766,29 +766,78 @@ fn declared_compiler_must_be_supported_and_reported_by_rustc() {
         assert!(!reached.exists(), "capture ran after {receipt}");
     }
 
-    // A non-UTF-8 --sysroot is rejected at phase "sysroot" before capture.
+    // Non-UTF-8 --sysroot and --capture paths (both caller spelling and
+    // canonical target) fail closed before invoking the capture driver.
     let non_utf8_sysroot = tools.join(std::ffi::OsString::from_vec(vec![b's', b'y', 0xff]));
     std::fs::create_dir(&non_utf8_sysroot).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_cargo-anneal"))
-        .current_dir(project.path())
-        .env("XDG_CACHE_HOME", project.path().join("empty-cache"))
-        .arg("verify")
-        .arg("--request")
-        .arg(&request)
-        .arg("--capture")
-        .arg(&capture)
-        .arg("--rustc")
-        .arg(&fuchsia)
-        .args(["--rustc-version", "V2026_10_22_R7189d39d9"])
-        .arg("--sysroot")
-        .arg(&non_utf8_sysroot)
-        .output()
-        .unwrap();
-    assert_result(&output, 2, "--sysroot path must be UTF-8", "");
-    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(receipt["status"], "tool_failed", "{receipt}");
-    assert_eq!(receipt["phase"], "sysroot", "{receipt}");
-    assert!(!reached.exists(), "capture ran after {receipt}");
+    let non_utf8_link_to_utf8_sysroot =
+        tools.join(std::ffi::OsString::from_vec(vec![b's', b'l', 0xff]));
+    std::os::unix::fs::symlink(&tools, &non_utf8_link_to_utf8_sysroot).unwrap();
+    let utf8_link_to_non_utf8_sysroot = tools.join("sysroot-link-to-non-utf8");
+    std::os::unix::fs::symlink(&non_utf8_sysroot, &utf8_link_to_non_utf8_sysroot).unwrap();
+    for (bad_sysroot, diagnostic) in [
+        (&non_utf8_sysroot, "--sysroot path must be UTF-8"),
+        (
+            &non_utf8_link_to_utf8_sysroot,
+            "--sysroot path must be UTF-8",
+        ),
+        (
+            &utf8_link_to_non_utf8_sysroot,
+            "--sysroot target path must be UTF-8",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-anneal"))
+            .current_dir(project.path())
+            .env("XDG_CACHE_HOME", project.path().join("empty-cache"))
+            .arg("verify")
+            .arg("--request")
+            .arg(&request)
+            .arg("--capture")
+            .arg(&capture)
+            .arg("--rustc")
+            .arg(&fuchsia)
+            .args(["--rustc-version", "V2026_10_22_R7189d39d9"])
+            .arg("--sysroot")
+            .arg(bad_sysroot)
+            .output()
+            .unwrap();
+        assert_result(&output, 2, diagnostic, "");
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["status"], "tool_failed", "{receipt}");
+        assert_eq!(receipt["phase"], "sysroot", "{receipt}");
+        assert!(!reached.exists(), "capture ran after {receipt}");
+    }
+
+    let non_utf8_capture = tools.join(std::ffi::OsString::from_vec(vec![b'c', b'a', 0xff]));
+    std::fs::copy(&capture, &non_utf8_capture).unwrap();
+    let utf8_link_to_non_utf8_capture = tools.join("capture-link-to-non-utf8");
+    std::os::unix::fs::symlink(&non_utf8_capture, &utf8_link_to_non_utf8_capture).unwrap();
+    for (bad_capture, diagnostic) in [
+        (&non_utf8_capture, "--capture path must be UTF-8"),
+        (
+            &utf8_link_to_non_utf8_capture,
+            "capture executable path must be UTF-8",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-anneal"))
+            .current_dir(project.path())
+            .env("XDG_CACHE_HOME", project.path().join("empty-cache"))
+            .arg("verify")
+            .arg("--request")
+            .arg(&request)
+            .arg("--capture")
+            .arg(bad_capture)
+            .arg("--rustc")
+            .arg(&fuchsia)
+            .args(["--rustc-version", "V2026_10_22_R7189d39d9"])
+            .output()
+            .unwrap();
+        assert_result(&output, 2, diagnostic, "");
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["status"], "tool_failed", "{receipt}");
+        assert_eq!(receipt["phase"], "capture-tool", "{receipt}");
+        assert!(!reached.exists(), "capture ran after {receipt}");
+    }
 }
 
 /// A Fuchsia-style compiler that reports the declared build passes boundary 1

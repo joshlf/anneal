@@ -435,31 +435,42 @@ fn require_dialect_syntax(bundle: &[(&str, &str)], mir_dialect: &str) -> Result<
     Ok(())
 }
 
-/// Require `Captured.lean` to import exactly the authenticated dialect's
-/// syntax module (boundary 2).
+/// Require `Captured.lean` to carry the exact fixed header for the
+/// authenticated dialect's syntax module (boundary 2).
 ///
-/// Capture renders a fixed header: `prelude`, then one `import` of
-/// `Trusted.Rustc.<dialect>.MirAst`. Dialect modules may re-export one
-/// another's definitions, so Lean's type checker would accept a subject
-/// rendered for one dialect against another dialect's canonical root. This
-/// comparison keeps the rendered syntax and the root's dialect the same.
+/// Capture renders a fixed header: leading `--` copyright comments and blank
+/// lines, `prelude`, one `import` of `Trusted.Rustc.<dialect>.MirAst`, and
+/// `namespace Captured` (where Lean's module header parser terminates). Dialect
+/// modules may re-export one another's definitions, and a line filter looking
+/// only for a leading `import` token would miss `public`/`private`/`meta`
+/// imports or inline `/- ... -/` block comments, so every header line before
+/// `namespace Captured` must match this skeleton.
 fn require_captured_syntax(captured: &str, mir_dialect: &str) -> Result<()> {
     let expected = format!("import Trusted.Rustc.{mir_dialect}.MirAst");
+    let mut lines = captured
+        .lines()
+        .skip_while(|line| line.is_empty() || line.starts_with("--"));
+    let prelude = lines.next();
+    let import = lines.next();
+    let after_import = lines.find(|line| !line.is_empty());
+    if prelude == Some("prelude")
+        && import == Some(expected.as_str())
+        && after_import == Some("namespace Captured")
+    {
+        return Ok(());
+    }
     let imports: Vec<&str> = captured
         .lines()
         .filter(|line| line.split_whitespace().next() == Some("import"))
         .collect();
-    if imports == [expected.as_str()] {
-        Ok(())
-    } else {
-        Err(error(
-            "tool_failed",
-            "capture",
-            format!(
-                "Captured.lean imports {imports:?}, but the capture's compiler has MIR dialect {mir_dialect}"
-            ),
-        ))
-    }
+    Err(error(
+        "tool_failed",
+        "capture",
+        format!(
+            "Captured.lean lacks the exact {mir_dialect} header (imports {imports:?}), \
+             but the capture's compiler has MIR dialect {mir_dialect}"
+        ),
+    ))
 }
 
 /// Detect whether a Lean source file's module header `import` declarations
@@ -939,6 +950,15 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // sysroot stay paired. Development tools remain explicit operator choices;
     // a sibling is the fallback only when no installed bundle is resolved.
     let installed = crate::setup::installed();
+    if let Some(given_capture) = &args.capture
+        && given_capture.to_str().is_none()
+    {
+        return Err(error(
+            "tool_failed",
+            "capture-tool",
+            "--capture path must be UTF-8",
+        ));
+    }
     let capture = args
         .capture
         .clone()
@@ -953,6 +973,13 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
                 .with_file_name("anneal-rustc-capture")
         });
     let capture = fs::canonicalize(capture).map_err(|e| io("capture-tool", e))?;
+    if capture.to_str().is_none() {
+        return Err(error(
+            "tool_failed",
+            "capture-tool",
+            "capture executable path must be UTF-8",
+        ));
+    }
     let capture_binary_sha256 = regular_tool_digest(&capture, "capture-tool")?;
     // Boundary 1, before capture: a compiler declaration must hold for the
     // `--rustc` executable itself, and the bundled model must already support
@@ -988,6 +1015,15 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         ])
         .arg(&capture_dir)
         .current_dir(&rust_stage);
+    if let Some(given_sysroot) = &args.sysroot
+        && given_sysroot.to_str().is_none()
+    {
+        return Err(error(
+            "tool_failed",
+            "sysroot",
+            "--sysroot path must be UTF-8",
+        ));
+    }
     // An explicit sysroot wins. A declared compiler otherwise brings its own
     // distribution's libraries, which an installed bundle need not match.
     let selected_sysroot = match (&args.sysroot, &declared) {
@@ -995,20 +1031,24 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         (None, Some(declared)) => Some(distribution_sysroot(&declared.given, &declared.rustc)?),
         (None, None) => installed.as_ref().map(|root| root.join("rust")),
     };
-    if let Some(sysroot) = &selected_sysroot {
+    let selected_sysroot_utf8 = if let Some(sysroot) = &selected_sysroot {
         let sysroot = fs::canonicalize(sysroot).map_err(|e| io("sysroot", e))?;
-        if sysroot.to_str().is_none() {
-            return Err(error(
-                "tool_failed",
-                "sysroot",
-                "--sysroot path must be UTF-8",
-            ));
-        }
+        let Some(sysroot_utf8) = sysroot.to_str().map(str::to_owned) else {
+            let detail = if args.sysroot.is_some() {
+                "--sysroot target path must be UTF-8"
+            } else {
+                "sysroot path must be UTF-8"
+            };
+            return Err(error("tool_failed", "sysroot", detail));
+        };
         // The library search path belongs to the explicitly selected compiler
         // installation, never to a target crate's ambient environment.
         command.env("LD_LIBRARY_PATH", sysroot.join("lib"));
         command.arg("--sysroot").arg(sysroot);
-    }
+        Some(sysroot_utf8)
+    } else {
+        None
+    };
     if let Some(declared) = &declared {
         command.arg("--rustc").arg(&declared.rustc);
     }
@@ -1073,8 +1113,8 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         ));
     };
     let mir_dialect = compiler.mir_dialect;
-    // Boundary 1, after capture: the capture must report the declared compiler
-    // and the very executable checked before capture.
+    // Boundary 1, after capture: the capture must report the declared compiler,
+    // the exact executable checked before capture, and any selected sysroot.
     if let Some(declared) = &declared
         && (compiler != declared.expected
             || manifest["compiler"]["rustc"].as_str() != Some(declared.rustc_utf8.as_str()))
@@ -1088,6 +1128,18 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
                 manifest["compiler"]["rustc"],
                 declared.expected.mir_dialect,
                 declared.rustc_utf8
+            ),
+        ));
+    }
+    if let Some(expected_sysroot) = &selected_sysroot_utf8
+        && manifest["compiler"]["sysroot"].as_str() != Some(expected_sysroot.as_str())
+    {
+        return Err(error(
+            "tool_failed",
+            "capture",
+            format!(
+                "capture reports sysroot {}, but verification selected {expected_sysroot}",
+                manifest["compiler"]["sysroot"],
             ),
         ));
     }
@@ -1894,6 +1946,28 @@ mod tests {
                     "import Trusted.Rustc.V2026_05_31_R14210df0e.MirAst\n  \
                      import Trusted.MirSemantics\n",
                 ),
+                "V2026_05_31_R14210df0e",
+            ),
+            (
+                subject(
+                    "import Trusted.Rustc.V2026_05_31_R14210df0e.MirAst\n\
+                     public import Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\n",
+                ),
+                "V2026_05_31_R14210df0e",
+            ),
+            (
+                subject(
+                    "/- comment -/ import Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\n\
+                     import Trusted.Rustc.V2026_05_31_R14210df0e.MirAst\n",
+                ),
+                "V2026_05_31_R14210df0e",
+            ),
+            (
+                accepted.replacen("prelude\n", "", 1),
+                "V2026_05_31_R14210df0e",
+            ),
+            (
+                accepted.replacen("namespace Captured\n", "namespace Other\n", 1),
                 "V2026_05_31_R14210df0e",
             ),
         ] {

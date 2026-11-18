@@ -251,7 +251,17 @@ fn run(mut args: Args) -> Result<serde_json::Value, Failure> {
     args.cfg.sort();
     args.cfg.dedup();
     if let Some(sysroot) = &mut args.sysroot {
+        if sysroot.to_str().is_none() {
+            return Err(Failure::tool(format!(
+                "--sysroot path must be UTF-8: {sysroot:?}"
+            )));
+        }
         *sysroot = sysroot.canonicalize().map_err(Failure::io)?;
+        if sysroot.to_str().is_none() {
+            return Err(Failure::tool(format!(
+                "sysroot path must be UTF-8: {sysroot:?}"
+            )));
+        }
     }
     if let Some(rustc) = &mut args.rustc {
         if rustc.to_str().is_none() {
