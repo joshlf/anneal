@@ -41,15 +41,15 @@ For related architectural details, see:
 
 ## 1. The `trusted/` boundary and how verification stays sound
 
-Anneal divides its core repository into two zones with strictly separated roles
-(augmented incrementally in repository CI by pinned `vendor/lean-miri/` and
-untrusted `correspondence/` for the MIR correspondence audit; see
-[`docs/architecture.md`](architecture.md)):
+Anneal divides its repository into three zones with strictly separated roles
+(augmented incrementally by untrusted `correspondence/` once the correspondence
+proofs land; see [`docs/architecture.md`](architecture.md)):
 
 | Zone | Directory | Role | Trust status |
 | :--- | :--- | :--- | :--- |
 | **Trusted foundation** | [`trusted/`](../trusted) | Extracts MIR and emits pure proof scripts (`trusted/rustc-capture/`), defines captured MIR syntax and verification operational semantics (`trusted/lean/`), orchestrates CLI invocation (`trusted/cargo-anneal/`), and audits the Anneal repository in CI (`trusted/audit/`). | **In the TCB.** Audited by humans (alongside external files pinned by hash manifests inside `trusted/`). |
-| **Proof theory** | `theory/` | Defines the normalized `StableAst`, proves lowering passes (`Abstracts`), and provides WP calculi, separation logic, and proof tactics invoked by generated proof scripts. | **Outside the TCB.** Treated as potentially adversarial; audited mechanically in Anneal's CI and checked by the Lean 4 kernel. |
+| **Proof theory** | `theory/` | Defines the normalized `StableAst`, proves lowering passes (`Abstracts`), and provides WP calculi, separation logic, and proof tactics (`theory/`). | **Outside the TCB.** Treated as potentially adversarial; audited mechanically in Anneal's CI and checked by the Lean 4 kernel. |
+| **Vendored reference model** | `vendor/lean-miri/` | Pinned snapshot of `proofs-rs/lean-miri` used by Anneal's MIR correspondence architecture ([`docs/mir-correspondence-design.md`](mir-correspondence-design.md)). Never shipped in the user toolchain archive. | **In the correspondence TCB.** Pinned byte-for-byte in `vendor/lean-miri/UPSTREAM_PIN.json` (locked by SHA-256 in `trusted/audit/`); only the 160-module `Miri.Interpreter.ExecutionMachine` slice (excluding `Miri.Input.NativeMathHost`) is compiled (or restored from a digest-gated cache) and verified by `.olean` SHA-256, every non-`isPartial` declaration in the 160 compiled vendored modules is replayed from scratch through the standalone Lean kernel onto the authenticated sysroot base on every run, and every reachable constant in its execution cone is checked against `unsafe`, `partial`, `.vendorMiri` `opaque`, and unapproved axioms. |
 
 ### How CI auditing and user-machine verification fit together
 
@@ -103,8 +103,12 @@ flowchart TD
    - Therefore, **Anneal's CI runs `anneal-audit` (`trusted/audit/`)** on the
      Anneal repository before any commit can merge or be packaged into the
      toolchain archive. `anneal-audit` does **not** run on a user's machine; its
-     job is to verify in CI that nothing outside `trusted/` in the Anneal
-     repository is effectful or axiom-bearing.
+     job is to verify in CI that all first-party code outside `trusted/`
+     (`theory/`) is pure, effect-free, and axiom-free (and that no Rust crate
+     resides outside `trusted/`). Vendored reference-model sources under
+     `vendor/lean-miri/` are never packaged into the user toolchain archive and
+     are admitted by content-addressed SHA-256 pin under Phase 3 rather than
+     Phase 1 syntactic preflight.
 
 ### Statement-Origin Separation (`ConstantInfo.type` vs. `ConstantInfo.value?`)
 
@@ -174,9 +178,15 @@ locked `Init.*` foundation and other `vetted` modules, never a
 [`trusted/audit/`](../trusted/audit) implements the CI gatekeeper
 (`anneal-audit` and
 [`TrustedBoundary.lean`](../trusted/audit/TrustedBoundary.lean)) that audits
-the Anneal repository. It classifies every module into a single `ModuleRole`
-(`.foundation`, `.trusted .vetted`, `.trusted (.candidate f)`, or `.theory`)
-and enforces five invariants across two phases over an isolated staging
+the Anneal repository. It classifies every module into a closed role partition—
+the four-role `ModuleRole` (`.foundation`, `.trusted .vetted`,
+`.trusted (.candidate f)`, `.theory`) in Phase 2, and the five-role
+`CorrModuleRole` (`.foundation`, `.sysrootFoundation`, `.vendorMiri`,
+`.trusted <tier>`, `.theory`) in Phase 3—and enforces its invariants across
+three internal phases within an audit run (Phase 1 syntactic preflight, Phase 2
+core kernel replay, and Phase 3 vendored `lean-miri` closure verification—run
+unconditionally by `Checker::run` whenever `vendor/lean-miri/` is present until
+the Pass 2 `--require-correspondence` split lands) over an isolated staging
 directory.
 
 ### Cargo workspace containment
@@ -213,11 +223,13 @@ traversal (`inspectSyntax` and `inspectNodeKind`) against a closed, role-aware
   closed allowlist of pure proof tactics (`allowedTheoryTacticKinds`) while
   rejecting trust-tier directives and any unallowlisted syntax node, command,
   modifier, attribute, or tactic configuration (excluding `unsafe`, `partial`,
-  `noncomputable`, `meta`, `axiom`, `macro`, `syntax`, `elab`, `sorry`,
+  `noncomputable section`, `meta`, `axiom`, `macro`, `syntax`, `elab`, `sorry`,
   `native_decide`, `decide!`, `bv_decide`, `rfl'`, `grind`, tactic `configItem`
   flags such as `+native` and `+kernel`, `by_elab`, `run_tac`, `#eval`,
   `include_str`, `set_option`, `@[implemented_by]`, `@[extern]`, `@[csimp]`,
-  and `initialize` hooks).
+  and `initialize` hooks; `noncomputable` declaration modifiers are admitted
+  mechanically by `allowedCommandSyntaxKinds`, while repository policy keeps
+  `theory/` free of `noncomputable` definitions).
 
 ### Phase 2: Standalone kernel replay and DAG audit (`--mode audit`)
 
@@ -252,6 +264,100 @@ full kernel-level audit:
    constant (`Trusted.*` and `theory/`) through the standalone Lean 4 kernel
    typechecker from scratch.
 
+### Phase 3: Vendored `lean-miri` verification (`--mode correspondence-audit`)
+
+Whenever `vendor/lean-miri/` is present, `anneal-audit` verifies the vendored
+reference model before succeeding:
+
+1. **Pin and sysroot authentication (`verify_upstream_pin`,
+   `ensure_sysroot_foundation`):** `trusted/audit` hashes
+   `vendor/lean-miri/UPSTREAM_PIN.json` against `LOCKED_UPSTREAM_PIN_SHA256`,
+   verifies its `commit` against `LOCKED_MIRI_COMMIT`, `build_lean_toolchain`
+   against Anneal's locked `leanprover/lean4:v4.34.1`, and `patched_files`
+   against `LOCKED_PATCHED_MIRI_FILES`. It verifies all 616 vendored files
+   (608 `.lean` files in `vendor_tree`, including `Miri.Input.NativeMathHost`,
+   plus 8 auxiliary files in `vendor_aux_files`) and `UPSTREAM_PIN.json` itself
+   against their SHA-256 digests (rejecting symlinks, missing or unlisted files,
+   and pre-existing `.olean`/`.ir` artifacts); `Miri.Input.NativeMathHost` is
+   excluded only from the 160-module compiled `execution_machine_closure`.
+   Before any vendor module is compiled, `anneal-audit` also authenticates the
+   pinned Lean toolchain's `Init`/`Std`/`Lean` `.olean` companions against
+   `LOCKED_SYSROOT_FOUNDATION_MANIFEST_SHA256`. Note that upstream
+   `proofs-rs/lean-miri` targets `leanprover/lean4:v4.35.0`
+   (`upstream_lean_toolchain`), whereas Anneal compiles and pins `.olean`
+   digests under its locked `leanprover/lean4:v4.34.1` (`build_lean_toolchain`):
+   upstream's `v4.35.0` test results therefore do not automatically carry over
+   to Anneal's `v4.34.1` build, and correspondence proofs must validate
+   reference-model behavior under the `v4.34.1` toolchain.
+2. **Digest-gated cache restore or synchronous compilation:** Every closure
+   source file is staged and re-hashed against its pinned SHA-256 digest before
+   use. For each of the 160 modules in `execution_machine_closure`,
+   `anneal-audit` either restores `.olean` companions from `--miri-cache-dir`
+   (or `ANNEAL_MIRI_CACHE_DIR`) after verifying their SHA-256 digests against
+   `UPSTREAM_PIN.json` (and rejecting symlinks) or compiles the staged source
+   synchronously with `-t0 -DElab.async=false -Ddebug.skipKernelTC=false`.
+   `--miri-cache-dir` (and `ANNEAL_MIRI_CACHE_DIR`) **must reside outside the
+   repository checkout**; `anneal-audit` rejects any path inside the checkout
+   (lexically or after resolving symlinks) as a policy error so a PR cannot
+   commit pre-built `.olean` files to satisfy cache hits. Every staged `.olean`,
+   `.olean.server`, and `.olean.private` artifact is hashed against the pin
+   *before* being written back to the cache (write-after-verify), so a corrupt
+   or poisoned cache entry can never bypass the pin or contaminate future runs.
+   A digest-matching cache hit skips only re-elaborating the pinned `.lean`
+   source; it does **not** skip kernel typechecking, because step 3 below
+   unconditionally runs full standalone kernel replay over all 160 vendored
+   closure modules on every run (cold build and warm cache hit alike). In CI,
+   the cache lives in `${{ runner.temp }}/anneal-miri-olean-cache` keyed on
+   `trusted/lean/lean-toolchain` and `vendor/lean-miri/UPSTREAM_PIN.json` (so
+   pin or toolchain updates automatically miss and compile cold), and
+   merge-queue (`merge_group`) and manual `workflow_dispatch` runs skip the
+   cache action and omit `--miri-cache-dir` so every landed or manually
+   dispatched revision performs a cold, from-source build as well as standalone
+   kernel replay.
+3. **Standalone vendor kernel replay and dependency-cone audit
+   (`auditCorrespondence`):** Unlike `trusted/lean/` and `theory/`, vendored
+   `Miri.*` sources are **not** passed through Phase 1 syntactic preflight:
+   upstream `Miri.Input.*` and proof helpers contain compile-time metaprograms
+   (`run_cmd`, `initialize`), custom tactic `elab`s, and 24 `partial def`s that
+   execute during cold Phase 3 builds in the staging directory. The SHA-256
+   `UPSTREAM_PIN.json` pin and `patched_files` allowlist in `trusted/audit/`
+   authenticate the exact source bytes, while human review of the pinned
+   vendored and patched compile-time code is the security control against
+   compile-time side effects (consistent with
+   [`THREAT_MODEL.md`](../THREAT_MODEL.md) Section 2.1).
+   To eliminate both any `.olean` cache-hit kernel trust assumption and any
+   scoped `set_option debug.skipKernelTC true` bypass inside a vendored or
+   patched `.lean` file (which overrides CLI `-Ddebug.skipKernelTC=false`
+   during elaboration), `TrustedBoundary.lean` loads the verified `.olean`
+   closure with `trustLevel := 0`, `plugins := #[]`, and `loadExts := false`,
+   verifies module classification (`classifyCorrModules`), enforces inventory
+   and origin integrity across `.vendorMiri`, `.trusted`, and `.theory`
+   declarations, rejects any `.vendorMiri` or `.sysrootFoundation` declaration
+   in the reserved `Trusted` or `Anneal` namespaces, and rejects any `axiom`
+   (including stripped-body declarations), `unsafe` declaration, quotient
+   primitive, direct `sorryAx` reference, or direct compiler-reflection
+   primitive (`Lean.ofReduceBool`, `Lean.ofReduceNat`, `Lean.trustCompiler`,
+   `Lean.reduceBool`, `Lean.reduceNat`) across all 160 `.vendorMiri` modules
+   (`verifyAndCollectCorrLocals`). After enforcing trust-tier separation
+   (`checkCorrTierReferences`), it resets the Lean search path strictly to the
+   authenticated sysroot, constructs a clean `baseEnv` containing only the
+   authenticated `.foundation` and `.sysrootFoundation` modules (`trustLevel :=
+   0`, `plugins := #[]`, `loadExts := false`), and replays every non-`isPartial`
+   declaration in the 160 compiled vendored modules (38,603 declarations,
+   including all 27 `.opaqueInfo` declarations) from scratch through the
+   standalone Lean kernel (`baseEnv.toKernelEnv.replay vendorReplayLocals`) on
+   every run—cold build and warm cache hit alike. The 75 compiler-generated
+   `isPartial` (`*._unsafe_rec`) runtime codegen helpers are omitted from the
+   replay map (matching `Kernel.Environment.replay`), so any reference to them
+   from a replayed declaration fails replay with `unknown constant`. Finally,
+   `verifyMiriExecutionMachineCone` (`closureCorr`) traverses from its 21 cone
+   roots to reject any reachable `unsafe` or `isPartial` constant, any
+   reachable `.vendorMiri` `.opaqueInfo` constant (which rejects vendored
+   `Miri.*` `partial def`s, as Lean elaborates `partial def` into an `opaque`
+   constant), and any unapproved axiom (while permitting `opaque`
+   constants—including toolchain `partial def`s—from the pinned toolchain's
+   `.foundation` and `.sysrootFoundation` modules).
+
 ### Including external files in the `trusted/` boundary via hashes
 
 The invariant of [`trusted/`](../trusted) is that an auditor only needs to
@@ -265,11 +371,12 @@ effective TCB cannot practically reside inside the `trusted/` subdirectory:
   `Cargo.lock`, `flake.nix`, and `flake.lock`) to sit at the repository root;
   moving them into `trusted/` would require symlinks or custom wrapper flags
   for every Cargo and Nix command.
-- Pre-built upstream toolchain artifacts (the `lean` binary and its `Init.*`
-  standard prelude) live outside the repository altogether.
+- Pre-built upstream toolchain artifacts (the `lean` binary and its
+  `Init`/`Std`/`Lean` sysroot `.olean` artifacts) live outside the repository
+  altogether.
 
 To include these files in `trusted/`'s effective TCB without relocating them,
-`trusted/` stores their SHA-256 digests in two checked-in lock files:
+`trusted/` stores their SHA-256 digests in checked-in lock manifests:
 
 - **[`trusted/root-manifest.sha256`](../trusted/root-manifest.sha256):** Pins
   the SHA-256 digests of the repository's root build files (`Cargo.toml`,
@@ -279,6 +386,22 @@ To include these files in `trusted/`'s effective TCB without relocating them,
   (`trusted/lean/foundation-lock.json`): Pins the SHA-256 digests of the `lean`
   executable and all `Init.*` prelude source and `.olean` companion files,
   verified by both the Nix toolchain build (`flake.nix`) and `anneal-audit`.
+- **`LOCKED_SYSROOT_FOUNDATION_MANIFEST_SHA256`** (in
+  [`trusted/audit/src/lib.rs`](../trusted/audit/src/lib.rs)): Pins the SHA-256
+  manifest digest over all `Init`/`Std`/`Lean` `.olean`, `.olean.server`, and
+  `.olean.private` sysroot companions loaded during Phase 3 correspondence
+  auditing, and must be updated alongside `foundation-lock.json` and
+  `UPSTREAM_PIN.json` (plus `LOCKED_UPSTREAM_PIN_SHA256`) on any Lean toolchain
+  bump.
+- **[`UPSTREAM_PIN.json`](../vendor/lean-miri/UPSTREAM_PIN.json)**
+  (`vendor/lean-miri/UPSTREAM_PIN.json`):
+  Pins the upstream commit and SHA-256 digest of every file in
+  `vendor/lean-miri/` (together with any consumer-side patch records and the
+  160-module `Miri.Interpreter.ExecutionMachine` slice), verified against
+  `LOCKED_UPSTREAM_PIN_SHA256` inside `trusted/audit/src/lib.rs`. The initial
+  vendor commit imports upstream `lean-miri` unmodified (`patched_files: []`)
+  so any subsequent consumer-side patches are reviewed as explicit diffs in
+  `patched_files` and `LOCKED_PATCHED_MIRI_FILES`.
 
 Because CI and `anneal-audit` reject any mismatch against these files, changing
 a root manifest or toolchain artifact requires a corresponding diff inside
