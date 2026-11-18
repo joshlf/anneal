@@ -40,14 +40,16 @@ the repository's `trusted/` and `theory/` boundary:
    `Runtime(PostCleanup)` MIR and inline Rust specification attributes 1-to-1
    into Lean data definitions (`Mir.lean`) and a pure proof script
    (`Proof.lean`), with zero semantic normalization in Rust.
-2. **Stage 2 — Shared Captured MIR, Verification Semantics & Reference Anchor
-   (`trusted/lean/`, `trusted/correspondence/`, `vendor/`):** A single,
-   auditable Lean AST represents the captured MIR (`Trusted/Rust/Ast/` /
-   `Trusted/MirAst.lean`), and Anneal's verification operational semantics
-   ($M_{\text{anneal}}$ in `Trusted/Rust/Semantics/` /
-   `Trusted/MirSemantics.lean`) states the top-level crate obligation
-   (`Trusted.CrateTheorem`) and weakest-precondition soundness claims without
-   pulling the reference interpreter into per-crate `cargo anneal verify` runs.
+2. **Stage 2 — Versioned Captured MIR, Unversioned Ground Semantics & Reference Anchor
+   (`trusted/lean/`, `trusted/correspondence/`, `vendor/`):** Versioned Lean AST
+   modules represent captured `rustc` MIR per compiler dialect
+   (`Trusted/Rustc/<Dialect>/MirAst.lean`), mapped by total tactic-free
+   interpreters into the compiler-independent ground MIR syntax
+   (`Trusted/MirModel.lean`), and Anneal's verification operational semantics
+   ($M_{\text{anneal}}$ in `Trusted/MirSemantics.lean`) states the top-level
+   crate and proof-unit obligations (`Trusted.MirSemantics.<Dialect>.{CrateTheorem,UnitTheorem}`)
+   and weakest-precondition soundness claims without pulling the reference
+   interpreter into per-crate `cargo anneal verify` runs.
    To keep $M_{\text{anneal}}$'s evolving step rules (`initState` and
    `evalStep`) outside the human-audited semantic surface, an offline
    correspondence audit pass (`anneal-audit --require-correspondence`) anchors
@@ -156,14 +158,16 @@ arm directly against the cited `rustc` data definition.
 ### Stage 2: Shared captured MIR and reference semantics (`trusted/`)
 
 The Lean files emitted by Stage 1 instantiate data structures defined in
-`trusted/lean/` (`Trusted/Rust/Ast/` / `Trusted/MirAst.lean` and
-`Trusted/Rust/Semantics/` / `Trusted/MirSemantics.lean`), anchored offline by
+`trusted/lean/` (`Trusted/Rustc/<Dialect>/MirAst.lean`, `Trusted/MirModel.lean`,
+and `Trusted/MirSemantics.lean`), anchored offline by
 `trusted/correspondence/` and `vendor/lean-miri/` under `anneal-audit
 --require-correspondence`:
 
-- **Captured MIR AST (`Trusted/Rust/Ast/` / `Trusted/MirAst.lean`):** Defines
-  the Lean inductive types for captured MIR programs (`Trusted.Crate`), types,
-  places, rvalues, statements, terminators, and layout environments.
+- **Captured MIR AST & Ground Model (`Trusted/Rustc/<Dialect>/MirAst.lean` and `Trusted/MirModel.lean`):**
+  `Trusted/Rustc/<Dialect>/MirAst.lean` defines the compiler-versioned Lean
+  inductive types for captured MIR programs, which `Trusted/MirSemantics.lean`
+  interprets into the compiler-independent ground model `Trusted/MirModel.lean`
+  (types, places, rvalues, statements, terminators, and layout metadata).
 - **Verification operational semantics ($M_{\text{anneal}}$ in
   `Trusted/Rust/Semantics/` / `Trusted/MirSemantics.lean`):** Defines the
   outer theorem-stating boundary (`Query`, `TerminalOut`, `WellFormed`,
@@ -431,12 +435,13 @@ cheapest possible layer:
    Stage 3 lowering):** Sometimes a new `rustc` version introduces a new
    `Rvalue` or `StatementKind` variant, or changes how a surface Rust construct
    desugars into MIR. When that happens:
-   - `Trusted/Rust/Ast/` (`Trusted/MirAst.lean`) receives an additive
-     constructor for the new MIR construct (preserving all existing constructors
-     for older captures), $\tau_{\text{prog}}$ and $M_{\text{ref}}$'s staged
-     support gate (`trusted/correspondence/` and `vendor/lean-miri/`) map and
-     admit the construct, and $M_{\text{anneal}}$ (`Trusted/Rust/Semantics/` /
-     `Trusted/MirSemantics.lean`) receives the corresponding step rule.
+   - A new `Trusted/Rustc/<Dialect>/MirAst.lean` captures the compiler's MIR
+     syntax, `Trusted/MirModel.lean` receives an additive ground constructor if
+     needed (preserving all existing constructors for older captures),
+     $\tau_{\text{prog}}$ and $M_{\text{ref}}$'s staged support gate
+     (`trusted/correspondence/` and `vendor/lean-miri/`) map and admit the
+     construct, and $M_{\text{anneal}}$ (`Trusted/MirSemantics.lean`) receives
+     the corresponding interpreter arm and step rule.
    - `correspondence/` extends `CorrespondenceTheorem` to cover the new
      construct against $M_{\text{ref}}$, while `Theory/Rust/Passes/` and
      `Theory/Rust/Wp/` (`theory/`) translate the new `Trusted/Rust/Ast/`

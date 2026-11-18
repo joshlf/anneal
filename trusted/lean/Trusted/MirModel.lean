@@ -38,7 +38,8 @@ priority for every declaration in this file:
    `rustc` commit `8144389c895da997dbdecaa635e41d6a50be6ffd` (and, where
    relevant, `rust-lang/reference` commit
    `38da84aa1f1b4fda6d0bc3d8fbdfeb7d8fb5f18e` and `anneal-rustc-capture`'s
-   pinned `rustc` commit `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`).
+   supported `Trusted.Rustc.<Dialect>.MirAst` dialects, led by Fuchsia's pinned
+   `rustc` commit `7189d39d9ce936881b8132c6addeaf3e295cd455`).
 
 ## Correspondence with `rustc_middle::mir`
 
@@ -536,8 +537,9 @@ inductive Operand where
 Constructor correspondence:
 - `.use op` corresponds to `Rvalue::Use(op, WithRetag::No)` (assignments with
   `WithRetag::Yes` in `8144389c895da997dbdecaa635e41d6a50be6ffd` and in
-  `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`, lower to
-  `.unsupported` until stacked/tree-borrows retagging is modeled).
+  `7189d39d9ce936881b8132c6addeaf3e295cd455` lower to
+  `.unsupported` when not provably a reference-free scalar/enum no-op until
+  stacked/tree-borrows retagging is modeled).
 - `.binaryOp op lhs rhs` corresponds to `Rvalue::BinaryOp(op, (lhs, rhs))`.
 - `.unaryOp op opnd` corresponds to `Rvalue::UnaryOp(op, opnd)`.
 - `.discriminant place` corresponds to `Rvalue::Discriminant(place)`
@@ -550,7 +552,8 @@ Constructor correspondence:
   > variant index; use [`discriminant_for_variant`] to convert."
 - `.ref mutability place` corresponds to `Rvalue::Ref(_, borrowKind, place)`.
 - `.addressOf mutability place` corresponds to `Rvalue::RawPtr(kind, place)`
-  (`compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust` `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`).
+  (`compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
+  `8144389c895da997dbdecaa635e41d6a50be6ffd`).
 - `.aggregateTuple fields` corresponds to
   `Rvalue::Aggregate(AggregateKind::Tuple, fields)`.
 - `.unsupported` represents all other `Rvalue` variants (`Repeat`,
@@ -594,7 +597,7 @@ Constructor correspondence:
 - `.unsupported` represents all other `StatementKind` variants (`FakeRead`,
   `SetDiscriminant`, `PlaceMention`, `AscribeUserType`, `Coverage`, `Intrinsic`,
   `ConstEvalCounter`, and `BackwardIncompatibleDropHint` in
-  `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`). -/
+  `8144389c895da997dbdecaa635e41d6a50be6ffd`). -/
 inductive StatementKind where
   | assign (dst : Place) (rvalue : Rvalue)
   | storageLive (localId : LocalId)
@@ -825,8 +828,10 @@ the MIR semantic profile version `mirProfileVersion`, and the capture scope
 
 2. **MIR semantic profile version (`mirProfileVersion`):**
    `mirProfileVersion` pins the contract version of the post-cleanup runtime MIR
-   semantic profile shared between `anneal-rustc-capture` (`rust-lang/rust`
-   `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`), `Trusted.MirSemantics`, and
+   semantic profile shared between `anneal-rustc-capture`
+   (`Trusted.Rustc.<Dialect>.MirAst` dialects interpreted via
+   `Trusted.MirSemantics.interpret<Dialect>`, led by `rust-lang/rust`
+   `7189d39d9ce936881b8132c6addeaf3e295cd455`), `Trusted.MirSemantics`, and
    `Trusted.Correspondence` (`vendor/lean-miri` upstream `rustc` reference
    `8144389c895da997dbdecaa635e41d6a50be6ffd`). Both `initState` and
    `initRefState` fail closed with `FaultKind.unsupported` (`.blocked`) whenever

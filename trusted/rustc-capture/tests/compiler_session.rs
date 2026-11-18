@@ -414,6 +414,12 @@ fn help_and_version_do_not_claim_callback_execution() {
     }
 }
 
+const PINNED_RUSTC_VERSIONS: &[&str] = &[
+    "rustc 1.101.0-nightly (7189d39d9 2026-10-22)",
+    "rustc 1.98.0-nightly (14210df0e 2026-05-31)",
+    "rustc 1.98.0-nightly (f8a08b688 2026-05-30)",
+];
+
 #[test]
 fn explicit_separator_routes_information_requests_to_rustc() {
     let help = Command::new(env!("CARGO_BIN_EXE_anneal-rustc-capture"))
@@ -432,10 +438,7 @@ fn explicit_separator_routes_information_requests_to_rustc() {
     assert_eq!(version.status.code(), Some(1), "{version:?}");
     let version_out = stdout(&version);
     assert!(
-        version_out.starts_with("rustc ")
-            && (version_out.contains("(7189d39d9 2026-10-22)")
-                || version_out.contains("(14210df0e 2026-05-31)")
-                || version_out.contains("(f8a08b688 2026-05-30)")),
+        PINNED_RUSTC_VERSIONS.contains(&version_out.trim()),
         "unexpected compiler version output: {version:?}"
     );
     assert!(!version_out.contains(CALLBACK), "{version:?}");
@@ -460,10 +463,7 @@ fn compiler_artifacts_on_stdout_match_rustc_bytes() {
     assert!(version.status.success(), "{version:?}");
     let version_trimmed = stdout(&version).trim().to_owned();
     assert!(
-        version_trimmed.starts_with("rustc ")
-            && (version_trimmed.ends_with("(7189d39d9 2026-10-22)")
-                || version_trimmed.ends_with("(14210df0e 2026-05-31)")
-                || version_trimmed.ends_with("(f8a08b688 2026-05-30)")),
+        PINNED_RUSTC_VERSIONS.contains(&version_trimmed.as_str()),
         "unexpected pinned compiler version: {version_trimmed}"
     );
     for emission in ["--emit=asm=-", "--emit=llvm-ir=-", "--emit=obj=-"] {

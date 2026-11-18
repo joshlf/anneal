@@ -183,6 +183,133 @@ fn identifier(value: &str) -> bool {
     !value.is_empty() && value.split('.').all(cargo_anneal::is_lean_ident)
 }
 
+/// Authenticate the captured MIR dialect against the schema version and the
+/// full compiler commit hash, requiring `manifest["mir_dialect"]` and
+/// `manifest["compiler"]["mir_dialect"]` to agree byte-for-byte.
+fn authenticated_mir_dialect(manifest: &Value) -> Option<&str> {
+    if manifest["schema_version"] != 2 {
+        return None;
+    }
+    let top_dialect = manifest["mir_dialect"].as_str()?;
+    let compiler_dialect = manifest["compiler"]["mir_dialect"].as_str()?;
+    if top_dialect != compiler_dialect {
+        return None;
+    }
+    match (manifest["compiler"]["commit"].as_str(), top_dialect) {
+        (
+            Some("7189d39d9ce936881b8132c6addeaf3e295cd455"),
+            d @ "V2026_10_22_R7189d39d9",
+        )
+        | (
+            Some("14210df0e27ccd7d9e6a05b8085cbd438e4bbc65"),
+            d @ "V2026_05_31_R14210df0e",
+        )
+        | (
+            Some("f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1"),
+            d @ "V2026_05_30_Rf8a08b688",
+        ) => Some(d),
+        _ => None,
+    }
+}
+
+/// Detect whether a Lean source file's module header `import` declarations
+/// reference `Anneal.PureLift` or any `Anneal.PureLift.*` submodule, ignoring
+/// occurrences inside `--` line comments, nested `/- ... -/` block comments,
+/// and any tokens after the Lean 4 module header ends.
+fn source_imports_pure_lift(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let raw = text.as_bytes();
+    let mut stripped = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut block_depth = 0usize;
+    while i < raw.len() {
+        if block_depth > 0 {
+            if i + 1 < raw.len() && raw[i] == b'/' && raw[i + 1] == b'-' {
+                block_depth += 1;
+                i += 2;
+            } else if i + 1 < raw.len() && raw[i] == b'-' && raw[i + 1] == b'/' {
+                block_depth -= 1;
+                if block_depth == 0 {
+                    stripped.push(' ');
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if i + 1 < raw.len() && raw[i] == b'/' && raw[i + 1] == b'-' {
+            block_depth = 1;
+            i += 2;
+        } else if i + 1 < raw.len() && raw[i] == b'-' && raw[i + 1] == b'-' {
+            i += 2;
+            while i < raw.len() && raw[i] != b'\n' {
+                i += 1;
+            }
+            stripped.push('\n');
+        } else if i + 2 < raw.len()
+            && raw[i] == b'\''
+            && raw[i + 1] == b'"'
+            && raw[i + 2] == b'\''
+        {
+            stripped.push(' ');
+            i += 3;
+        } else if i + 3 < raw.len()
+            && raw[i] == b'\''
+            && raw[i + 1] == b'\\'
+            && raw[i + 2] == b'"'
+            && raw[i + 3] == b'\''
+        {
+            stripped.push(' ');
+            i += 4;
+        } else if raw[i] == b'"' {
+            stripped.push(' ');
+            i += 1;
+            while i < raw.len() && raw[i] != b'"' {
+                if raw[i] == b'\\' && i + 1 < raw.len() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if i < raw.len() {
+                i += 1;
+            }
+        } else {
+            let ch = text[i..].chars().next().expect("valid UTF-8 char boundary");
+            stripped.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    let mut tokens = stripped.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        match tok {
+            "module" | "prelude" | "public" | "private" | "meta" => continue,
+            "import" => {
+                if tokens.peek() == Some(&"all") {
+                    tokens.next();
+                }
+                let Some(module) = tokens.next() else {
+                    break;
+                };
+                let normalized: String = module
+                    .chars()
+                    .filter(|&c| c != '«' && c != '»')
+                    .collect();
+                if normalized == "Anneal.PureLift"
+                    || normalized.starts_with("Anneal.PureLift.")
+                {
+                    return true;
+                }
+            }
+            // In Lean 4 (`Lean.Parser.Module.header`), `import` clauses cannot
+            // appear after the first non-header command token.
+            _ => break,
+        }
+    }
+    false
+}
+
 fn module_of(name: &str) -> Result<String> {
     if !identifier(name) || !name.contains('.') {
         return Err(error(
@@ -665,27 +792,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // The top-level and compiler-scoped dialect fields must agree, and the
     // dialect must be the one pinned to the full compiler commit; a capture
     // cannot select another dialect's syntax or canonical root.
-    let top_dialect = manifest["mir_dialect"].as_str();
-    let compiler_dialect = manifest["compiler"]["mir_dialect"].as_str();
-    let supported_dialect = match (
-        manifest["compiler"]["commit"].as_str(),
-        top_dialect.filter(|_| top_dialect == compiler_dialect),
-    ) {
-        (
-            Some("7189d39d9ce936881b8132c6addeaf3e295cd455"),
-            Some(d @ "V2026_10_22_R7189d39d9"),
-        )
-        | (
-            Some("14210df0e27ccd7d9e6a05b8085cbd438e4bbc65"),
-            Some(d @ "V2026_05_31_R14210df0e"),
-        )
-        | (
-            Some("f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1"),
-            Some(d @ "V2026_05_30_Rf8a08b688"),
-        ) => Some(d),
-        _ => None,
-    };
-    let Some(mir_dialect) = supported_dialect.filter(|_| manifest["schema_version"] == 2) else {
+    let Some(mir_dialect) = authenticated_mir_dialect(&manifest) else {
         return Err(error(
             "tool_failed",
             "capture",
@@ -813,9 +920,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         }
         let original = declared_file(&proof_root, &input.path)?;
         let bytes = fs::read(&original).map_err(|e| io("proof", e))?;
-        if std::str::from_utf8(&bytes)
-            .is_ok_and(|text| text.contains("Anneal.PureLift"))
-        {
+        if source_imports_pure_lift(&bytes) {
             uses_pure_lift = true;
         }
         let sha256 = digest(&bytes);
@@ -1285,5 +1390,101 @@ mod tests {
         fs::write(target.path().join("keep"), b"valuable").unwrap();
         assert!(retain(source.path(), target.path()).is_err());
         assert_eq!(fs::read(target.path().join("keep")).unwrap(), b"valuable");
+    }
+
+    #[test]
+    fn mir_dialect_authentication_requires_matching_schema_commit_and_dialect_fields() {
+        for (commit, dialect) in [
+            (
+                "7189d39d9ce936881b8132c6addeaf3e295cd455",
+                "V2026_10_22_R7189d39d9",
+            ),
+            (
+                "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65",
+                "V2026_05_31_R14210df0e",
+            ),
+            (
+                "f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1",
+                "V2026_05_30_Rf8a08b688",
+            ),
+        ] {
+            let valid = json!({
+                "schema_version": 2,
+                "mir_dialect": dialect,
+                "compiler": { "commit": commit, "mir_dialect": dialect },
+            });
+            assert_eq!(authenticated_mir_dialect(&valid), Some(dialect));
+        }
+
+        // Disagreement between top-level and compiler-scoped mir_dialect must reject.
+        let disagreeing_fields = json!({
+            "schema_version": 2,
+            "mir_dialect": "V2026_10_22_R7189d39d9",
+            "compiler": {
+                "commit": "7189d39d9ce936881b8132c6addeaf3e295cd455",
+                "mir_dialect": "V2026_05_31_R14210df0e",
+            },
+        });
+        assert_eq!(authenticated_mir_dialect(&disagreeing_fields), None);
+
+        // Missing compiler.mir_dialect must reject (no fallback to top-level mir_dialect).
+        let missing_compiler_dialect = json!({
+            "schema_version": 2,
+            "mir_dialect": "V2026_10_22_R7189d39d9",
+            "compiler": { "commit": "7189d39d9ce936881b8132c6addeaf3e295cd455" },
+        });
+        assert_eq!(authenticated_mir_dialect(&missing_compiler_dialect), None);
+
+        // Cross-pinning commit and dialect from different supported toolchains must reject.
+        let cross_pinned = json!({
+            "schema_version": 2,
+            "mir_dialect": "V2026_10_22_R7189d39d9",
+            "compiler": {
+                "commit": "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65",
+                "mir_dialect": "V2026_10_22_R7189d39d9",
+            },
+        });
+        assert_eq!(authenticated_mir_dialect(&cross_pinned), None);
+
+        // Wrong schema version must reject.
+        let wrong_schema = json!({
+            "schema_version": 1,
+            "mir_dialect": "V2026_10_22_R7189d39d9",
+            "compiler": {
+                "commit": "7189d39d9ce936881b8132c6addeaf3e295cd455",
+                "mir_dialect": "V2026_10_22_R7189d39d9",
+            },
+        });
+        assert_eq!(authenticated_mir_dialect(&wrong_schema), None);
+    }
+
+    #[test]
+    fn pure_lift_import_scanner_detects_imports_and_ignores_comments_and_strings() {
+        for imported in [
+            "prelude\nimport Anneal.PureLift\n",
+            "prelude\nimport Expected\nimport Anneal.PureLift.MirBridge\n",
+            "prelude\npublic meta import all Anneal.PureLift.Lens\n",
+            "/- doc -/\nprelude\nimport /- inline -/ Anneal.PureLift\n",
+            "prelude\nimport «Anneal».«PureLift»\n",
+        ] {
+            assert!(
+                source_imports_pure_lift(imported.as_bytes()),
+                "failed to detect PureLift import in {imported:?}"
+            );
+        }
+        for not_imported in [
+            "prelude\n-- import Anneal.PureLift\nimport Anneal.MirWp\n",
+            "/-! Mentions import Anneal.PureLift in doc -/\nprelude\nimport Anneal.MirWp\n",
+            "/- outer /- nested -/ import Anneal.PureLift -/\nprelude\nimport Expected\n",
+            "prelude\nimport Expected\ndef s : String := \"import Anneal.PureLift\"\n",
+            "prelude\nimport Expected\ndef q : Char := '\"'\ndef s : String := \"import Anneal.PureLift\"\n",
+            "prelude\nimport Expected\nopen Anneal\n-- post-header tokens cannot introduce imports\ndef fake : Nat := 0\n",
+            "prelude\nimport Anneal.PureLiftOther\n",
+        ] {
+            assert!(
+                !source_imports_pure_lift(not_imported.as_bytes()),
+                "falsely detected PureLift import in {not_imported:?}"
+            );
+        }
     }
 }

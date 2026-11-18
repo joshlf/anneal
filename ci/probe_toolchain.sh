@@ -47,7 +47,7 @@ run_tool() {
 }
 
 cd "$probe"
-expected_rust='1.98.0-nightly (f8a08b688 2026-05-30)'
+expected_rust='1.101.0-nightly (7189d39d9 2026-10-22)'
 run_tool rustc-version env -i "$install_root/rust/bin/rustc" --version
 grep -Fxq "rustc $expected_rust" rustc-version.stdout
 run_tool rustdoc-version env -i "$install_root/rust/bin/rustdoc" --version

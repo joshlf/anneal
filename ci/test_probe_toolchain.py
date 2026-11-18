@@ -18,7 +18,7 @@ import unittest
 PROBE = Path(__file__).resolve().with_name("probe_toolchain.sh")
 RAW_STDOUT = b"tool stdout\xff\n"
 RAW_STDERR = b"tool stderr\xfe\n"
-VERSION = b"rustc 1.98.0-nightly (f8a08b688 2026-05-30)\n"
+VERSION = b"rustc 1.101.0-nightly (7189d39d9 2026-10-22)\n"
 
 
 @unittest.skipUnless(os.name == "posix", "requires POSIX shell tools and pipes")

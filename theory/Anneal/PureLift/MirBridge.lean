@@ -30,8 +30,8 @@ open Trusted.MirModel Trusted.MirSemantics
 # Bridge Between `PureLift` and `Trusted` MIR Semantics (`MirBridge.lean`)
 
 Connects the language- and MIR-agnostic `Anneal.PureLift` functional lifting
-transformation to the authoritative post-cleanup runtime MIR syntax
-(`Trusted/MirAst.lean`), small-step operational semantics
+transformation to the authoritative post-cleanup runtime MIR ground syntax
+(`Trusted/MirModel.lean`), small-step operational semantics
 (`Trusted/MirSemantics.lean`), fuel-bounded weakest precondition
 (`Anneal/MirWp.lean`), and the `lean-miri` reference correspondence bridge
 (`Trusted/Correspondence.lean`):

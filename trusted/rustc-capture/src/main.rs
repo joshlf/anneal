@@ -10,7 +10,7 @@
 //! Typed capture does not verify a crate; the host must check the generated
 //! subject against its authored specifications and exact root.
 
-#![feature(normalize_lexically, rustc_private)]
+#![feature(cfg_version, normalize_lexically, rustc_private)]
 
 extern crate rustc_abi;
 extern crate rustc_data_structures;

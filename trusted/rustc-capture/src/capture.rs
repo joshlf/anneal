@@ -252,20 +252,23 @@ fn callable(kind: DefKind) -> bool {
 // inventory rather than demanding a body query from every definition.
 // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_hir/src/def.rs#L99-L205
 //
-// Keep this match exhaustive: a compiler upgrade must classify each new kind.
+// Keep this match exhaustive across all supported pinned compilers (`1.98` and
+// `1.101`): a compiler upgrade must classify each new kind explicitly.
 fn required(kind: DefKind, has_body: bool) -> bool {
     match kind {
         DefKind::Fn
         | DefKind::AssocFn
         | DefKind::Static { .. }
-        | DefKind::Const { .. }
-        | DefKind::AssocConst { .. }
         | DefKind::Struct
         | DefKind::Enum
         | DefKind::Union
         | DefKind::Trait
         | DefKind::Impl { .. }
         | DefKind::GlobalAsm => true,
+        #[cfg(not(version("1.101")))]
+        DefKind::Const { .. } | DefKind::AssocConst { .. } => true,
+        #[cfg(version("1.101"))]
+        DefKind::Const | DefKind::AssocConst | DefKind::TestBinderConstraints => true,
         DefKind::Mod
         | DefKind::Variant
         | DefKind::TyAlias
@@ -280,12 +283,13 @@ fn required(kind: DefKind, has_body: bool) -> bool {
         | DefKind::Use
         | DefKind::ForeignMod
         | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::OpaqueTy
         | DefKind::Field
         | DefKind::LifetimeParam
         | DefKind::Closure
         | DefKind::SyntheticCoroutineBody => has_body,
+        #[cfg(not(version("1.101")))]
+        DefKind::InlineConst => has_body,
     }
 }
 

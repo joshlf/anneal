@@ -647,6 +647,25 @@ fn verifies_real_source_and_rejects_boundary_mutations() {
     fixture
         .run(&tools, "safe-divergence", &fixture.request)
         .expect(0, "crate_verified", None);
+
+    // Exercise bundled `Anneal.PureLift` compilation and kernel replay under
+    // `targetAudit` when an authored proof imports `Anneal.PureLift`.
+    fixture.write("rust/lib.rs", SOURCE);
+    fixture.write("lean/Spec.lean", SPEC);
+    let pure_lift_proof = PROOF
+        .replace(
+            "import Anneal.MirWp",
+            "import Anneal.MirWp\nimport Anneal.PureLift",
+        )
+        .replace(
+            "theorem verify : Expected.claim := by\n",
+            "theorem verify : Expected.claim :=\n  let _ : Anneal.PureLift.mirListGet? program.bodies 0 = some body := rfl\n  by\n",
+        );
+    fixture.write("lean/Proof.lean", pure_lift_proof);
+    let pure_lift_receipt = fixture.run(&tools, "bundled-pure-lift", &fixture.request);
+    pure_lift_receipt.expect(0, "crate_verified", None);
+    assert_eq!(pure_lift_receipt.value["audit"]["exactType"], true);
+    assert_eq!(pure_lift_receipt.value["audit"]["replay"], true);
 }
 
 #[test]

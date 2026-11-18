@@ -36,11 +36,10 @@ priority for every declaration in this file:
    constructor, and every comment documents both the modeled variants and the
    exact upstream `rustc_middle::mir` variants that lower to `.unsupported`.
 3. **Pinned upstream citations:** Every declaration quotes and cites the
-   corresponding `rust-lang/rust` definition at `vendor/lean-miri`'s upstream
-   `rustc` commit `8144389c895da997dbdecaa635e41d6a50be6ffd` (and, where
-   relevant, `rust-lang/reference` commit
-   `38da84aa1f1b4fda6d0bc3d8fbdfeb7d8fb5f18e` and `anneal-rustc-capture`'s
-   pinned Fuchsia `rustc` commit `7189d39d9ce936881b8132c6addeaf3e295cd455` (`commit-date: 2026-10-22`, distributed in `nightly-2026-10-23`)).
+   corresponding `rust-lang/rust` definition at Fuchsia's pinned `rustc` commit
+   `7189d39d9ce936881b8132c6addeaf3e295cd455` (`commit-date: 2026-10-22`,
+   distributed in `nightly-2026-10-23`; and, where relevant,
+   `rust-lang/reference` commit `38da84aa1f1b4fda6d0bc3d8fbdfeb7d8fb5f18e`).
 
 ## Correspondence with `rustc_middle::mir`
 
@@ -49,7 +48,7 @@ Mid-level Intermediate Representation (`Runtime(PostCleanup)` MIR) extracted by
 `anneal-rustc-capture`, corresponding to
 `compiler/rustc_middle/src/mir/syntax.rs` and
 `compiler/rustc_middle/src/mir/mod.rs` in `rust-lang/rust` at commit
-`8144389c895da997dbdecaa635e41d6a50be6ffd`:
+`7189d39d9ce936881b8132c6addeaf3e295cd455`:
 
 > "Body: The lowered representation of a single function."
 >
@@ -57,7 +56,7 @@ Mid-level Intermediate Representation (`Runtime(PostCleanup)` MIR) extracted by
 > locals for the function arguments, followed by any user-declared
 > variables and temporaries."
 > (`compiler/rustc_middle/src/mir/mod.rs`, `rust-lang/rust`
-> `8144389c895da997dbdecaa635e41d6a50be6ffd`)
+> `7189d39d9ce936881b8132c6addeaf3e295cd455`)
 
 Unlike `rustc_middle::mir` and `lean-miri` (`Miri.MIR.Syntax`), which index a
 side-table of interned types via `TyId`, `Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst` carries structural
@@ -67,16 +66,17 @@ inside $M_{\text{anneal}}$ and allows `Anneal.MirWp` to evaluate operand and
 local types structurally without threading a global type table.
 -/
 
-/-- Function definition identifier (`rustc_hir::def_id::DefId` index in the
-captured program unit; `compiler/rustc_hir/src/def_id.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+/-- Function definition identifier (`rustc_span::def_id::DefId`, re-exported as
+`rustc_hir::def_id::DefId`, index in the captured program unit;
+`compiler/rustc_span/src/def_id.rs`, `rust-lang/rust`
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub struct DefId { pub index: DefIndex, pub krate: CrateNum }" -/
 abbrev DefId := Nat
 
 /-- Local variable slot index (`rustc_middle::mir::Local` in
 `compiler/rustc_middle/src/mir/mod.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "rustc_index::newtype_index! { pub struct Local { const RETURN_PLACE = 0; } }"
 -/
@@ -84,7 +84,7 @@ abbrev LocalId := Nat
 
 /-- Basic-block index (`rustc_middle::mir::BasicBlock` in
 `compiler/rustc_middle/src/mir/mod.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "rustc_index::newtype_index! { pub struct BasicBlock { const START_BLOCK = 0;
 > } }" -/
@@ -92,14 +92,14 @@ abbrev BasicBlockId := Nat
 
 /-- Aggregate field index (`rustc_abi::FieldIdx` in
 `compiler/rustc_abi/src/lib.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "rustc_index::newtype_index! { pub struct FieldIdx {} }" -/
 abbrev FieldIdx := Nat
 
 /-- Memory allocation identifier (`rustc_middle::mir::interpret::AllocId` in
 `compiler/rustc_middle/src/mir/interpret/mod.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub struct AllocId(pub NonZero<u64>);" -/
 abbrev AllocId := Nat
@@ -107,16 +107,16 @@ abbrev AllocId := Nat
 /-- Integer and pointer-sized scalar widths (`i8`/`u8` through `i128`/`u128`
 and target-pointer-sized `isize`/`usize`).
 
-Corresponds to `rustc_type_ir::IntTy` and `rustc_type_ir::UintTy` in
-`compiler/rustc_type_ir/src/ty_kind.rs` (`rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`) and the Rust Reference
+Corresponds to `rustc_ast_ir::IntTy` and `rustc_ast_ir::UintTy` (re-exported by
+`rustc_type_ir`) in `compiler/rustc_ast_ir/src/lib.rs` (`rust-lang/rust`
+`7189d39d9ce936881b8132c6addeaf3e295cd455`) and the Rust Reference
 (`src/types/numeric.md`, `rust-lang/reference`
 `38da84aa1f1b4fda6d0bc3d8fbdfeb7d8fb5f18e`):
 
 > "pub enum IntTy { Isize, I8, I16, I32, I64, I128 }"
 > "pub enum UintTy { Usize, U8, U16, U32, U64, U128 }"
-> (`compiler/rustc_type_ir/src/ty_kind.rs`, `rust-lang/rust`
-> `8144389c895da997dbdecaa635e41d6a50be6ffd`)
+> (`compiler/rustc_ast_ir/src/lib.rs`, `rust-lang/rust`
+> `7189d39d9ce936881b8132c6addeaf3e295cd455`)
 >
 > "The signed two's complement integer types are `i8`, `i16`, `i32`,
 > `i64`, `i128`, and `isize`. The unsigned integer types are `u8`,
@@ -130,7 +130,7 @@ namespace IntWidth
 
 /-- Size in bytes on 64-bit targets (`usize`/`isize` = 8 bytes), matching
 `rustc_abi::Integer::size` (`compiler/rustc_abi/src/lib.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "I8 => Size::from_bytes(1), I16 => Size::from_bytes(2),
 > I32 => Size::from_bytes(4), I64 => Size::from_bytes(8),
@@ -152,7 +152,7 @@ end IntWidth
 
 /-- Reference and raw-pointer mutability (`rustc_ast_ir::Mutability` in
 `compiler/rustc_ast_ir/src/lib.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum Mutability { Not, Mut }"
 
@@ -164,7 +164,7 @@ inductive Mutability where
 
 /-- In-memory tag representation of a fieldless Rust enum, corresponding to
 `rustc_abi::Variants` (`compiler/rustc_abi/src/lib.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum Variants<FieldIdx: Idx, VariantIdx: Idx> {
 >     Empty,
@@ -199,7 +199,7 @@ its declaration-indexed discriminant bit-pattern table `discriminants`.
 
 Corresponds to `rustc_middle::ty::util::Discr` and `Ty::discriminant_ty`
 (`compiler/rustc_middle/src/ty/util.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`) and the Rust Reference
+`7189d39d9ce936881b8132c6addeaf3e295cd455`) and the Rust Reference
 (`src/items/enumerations.md`, `rust-lang/reference`
 `38da84aa1f1b4fda6d0bc3d8fbdfeb7d8fb5f18e`):
 
@@ -209,7 +209,7 @@ Corresponds to `rustc_middle::ty::util::Discr` and `Ty::discriminant_ty`
 >     pub ty: Ty<'tcx>,
 > }"
 > (`compiler/rustc_middle/src/ty/util.rs`, `rust-lang/rust`
-> `8144389c895da997dbdecaa635e41d6a50be6ffd`)
+> `7189d39d9ce936881b8132c6addeaf3e295cd455`)
 >
 > "Under the default representation, the specified discriminant is interpreted
 > as an `isize` value."
@@ -233,15 +233,17 @@ structure EnumTy where
 
 Corresponds to monomorphized `rustc_type_ir::TyKind` in
 `compiler/rustc_type_ir/src/ty_kind.rs` (`rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum TyKind<I: Interner> { Bool, Char, Int(IntTy), Uint(UintTy),
 > Float(FloatTy), Adt(I::AdtDef, I::GenericArgs), Foreign(I::DefId),
-> Str, Array(I::Ty, I::Const), Pat(I::Ty, I::Pat), Slice(I::Ty),
-> RawPtr(I::Ty, Mutability), Ref(I::Region, I::Ty, Mutability),
-> FnDef(I::DefId, I::GenericArgs), FnPtr(Binder<I, FnSigTys<I>>, FnHeader<I>),
-> Dynamic(...), Closure(...), CoroutineClosure(...), Coroutine(...),
-> CoroutineWitness(...), Never, Tuple(I::Tys), ... }"
+> Str, Array(I::Ty, Const<I>), Pat(I::Ty, I::Pat), Slice(I::Ty),
+> RawPtr(I::Ty, Mutability), Ref(Region<I>, I::Ty, Mutability),
+> FnDef(I::FunctionId, ty::Binder<I, I::GenericArgs>),
+> FnPtr(Binder<I, FnSigTys<I>>, FnHeader<I>),
+> Dynamic(I::BoundExistentialPredicates, Region<I>), Closure(...),
+> CoroutineClosure(...), Coroutine(...), CoroutineWitness(...), Never,
+> Tuple(I::Tys), ... }"
 
 Constructor correspondence:
 - `.bool` corresponds to `TyKind::Bool`.
@@ -352,7 +354,7 @@ end
 
 /-- MIR binary operators (`rustc_middle::mir::BinOp` in
 `compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum BinOp {
 >     Add, AddUnchecked, AddWithOverflow,
@@ -384,7 +386,7 @@ namespace BinOp
 /-- Whether `op` is a bit-shift operator (`.shl`, `.shlUnchecked`, `.shr`, or
 `.shrUnchecked`), whose RHS integer width and signedness may differ from its
 LHS in MIR (`compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "Left and right shift operations accept signed or unsigned integers not
 > necessarily of the same type and return a value of the same type as their
@@ -395,7 +397,7 @@ noncomputable def isShift : BinOp → Bool
 
 /-- Whether `op` is an unchecked arithmetic or shift operator that faults with
 `FaultKind.undefined` on overflow (`compiler/rustc_middle/src/mir/syntax.rs`,
-`rust-lang/rust` `8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`rust-lang/rust` `7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "Like `Add`, but with UB on overflow. (Integers only.)"
 > "Like `Shl`, but is UB if the RHS >= LHS::BITS or RHS < 0" -/
@@ -408,7 +410,7 @@ end BinOp
 
 /-- MIR unary operators (`rustc_middle::mir::UnOp` in
 `compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum UnOp { Not, Neg, PtrMetadata }"
 
@@ -421,7 +423,7 @@ inductive UnOp where
 
 Corresponds to `rustc_middle::mir::ProjectionElem` in
 `compiler/rustc_middle/src/mir/syntax.rs` (`rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum ProjectionElem<V, T> {
 >     Deref,
@@ -448,7 +450,7 @@ inductive ProjectionElem where
 
 /-- A MIR place (`rustc_middle::mir::Place` in
 `compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub struct Place<'tcx> {
 >     pub local: Local,
@@ -463,7 +465,7 @@ structure Place where
 
 /-- Constant literal payload inside `ConstOperand`, corresponding to evaluated
 `rustc_middle::mir::ConstValue` (`compiler/rustc_middle/src/mir/consts.rs`,
-`rust-lang/rust` `8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`rust-lang/rust` `7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum ConstValue { Scalar(Scalar), ZeroSized, Slice { ... },
 > Indirect { ... } }"
@@ -480,7 +482,7 @@ inductive ConstLit where
 /-- Typed constant operand carrying `ty : MirTy` and `lit : ConstLit` directly
 by value, corresponding to `rustc_middle::mir::ConstOperand` in
 `compiler/rustc_middle/src/mir/syntax.rs` (`rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub struct ConstOperand<'tcx> {
 >     pub span: Span,
@@ -495,7 +497,7 @@ structure ConstOperand where
 
 Corresponds to `rustc_middle::mir::Operand` in
 `compiler/rustc_middle/src/mir/syntax.rs` (`rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum Operand<'tcx> {
 >     Copy(Place<'tcx>),
@@ -517,7 +519,7 @@ inductive Operand where
 
 /-- A MIR right-hand-side expression (`rustc_middle::mir::Rvalue` in
 `compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum Rvalue<'tcx> {
 >     Use(Operand<'tcx>, WithRetag),
@@ -537,14 +539,14 @@ inductive Operand where
 
 Constructor correspondence:
 - `.use op` corresponds to `Rvalue::Use(op, WithRetag::No)` (assignments with
-  `WithRetag::Yes` in `8144389c895da997dbdecaa635e41d6a50be6ffd` and in
-  `7189d39d9ce936881b8132c6addeaf3e295cd455`, lower to
-  `.unsupported` until stacked/tree-borrows retagging is modeled).
+  `WithRetag::Yes` in `7189d39d9ce936881b8132c6addeaf3e295cd455` lower to
+  `.unsupported` when not provably a reference-free scalar/enum no-op until
+  stacked/tree-borrows retagging is modeled).
 - `.binaryOp op lhs rhs` corresponds to `Rvalue::BinaryOp(op, (lhs, rhs))`.
 - `.unaryOp op opnd` corresponds to `Rvalue::UnaryOp(op, opnd)`.
 - `.discriminant place` corresponds to `Rvalue::Discriminant(place)`
   (`compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
-  `8144389c895da997dbdecaa635e41d6a50be6ffd`):
+  `7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
   > "Computes the discriminant of the place, returning it as an integer of type
   > [`discriminant_ty`]. Returns zero for types without discriminant."
@@ -571,7 +573,7 @@ inductive Rvalue where
 
 /-- A MIR statement inside a basic block (`rustc_middle::mir::StatementKind` in
 `compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum StatementKind<'tcx> {
 >     Assign(Box<(Place<'tcx>, Rvalue<'tcx>)>),
@@ -607,7 +609,7 @@ inductive StatementKind where
 /-- Branch table for `TerminatorKind.switchInt`
 (`rustc_middle::mir::SwitchTargets` in
 `compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub struct SwitchTargets {
 >     pub(super) values: SmallVec<[Pu128; 1]>,
@@ -625,7 +627,7 @@ structure SwitchTargets where
 /-- Unwind continuation action on panicking terminators
 (`rustc_middle::mir::UnwindAction` in
 `compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum UnwindAction {
 >     Continue,
@@ -641,7 +643,7 @@ inductive UnwindAction where
 
 /-- Built-in MIR `Assert` condition kind (`rustc_middle::mir::AssertKind` in
 `compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum AssertKind<O> {
 >     BoundsCheck { len: O, index: O },
@@ -669,7 +671,7 @@ inductive AssertKind where
 
 /-- A MIR basic-block terminator (`rustc_middle::mir::TerminatorKind` in
 `compiler/rustc_middle/src/mir/syntax.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub enum TerminatorKind<'tcx> {
 >     Goto { target: BasicBlock, loop_hint_attrs: ThinVec<UnrollAttr> },
@@ -724,7 +726,7 @@ inductive TerminatorKind where
 
 /-- A MIR basic block (`rustc_middle::mir::BasicBlockData` in
 `compiler/rustc_middle/src/mir/mod.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub struct BasicBlockData<'tcx> {
 >     pub statements: Vec<Statement<'tcx>>,
@@ -742,7 +744,7 @@ structure BasicBlock where
 
 /-- A MIR function body (`rustc_middle::mir::Body` in
 `compiler/rustc_middle/src/mir/mod.rs`, `rust-lang/rust`
-`8144389c895da997dbdecaa635e41d6a50be6ffd`):
+`7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
 > "pub struct Body<'tcx> {
 >     pub basic_blocks: BasicBlocks<'tcx>,
@@ -765,7 +767,7 @@ Local slot layout (`compiler/rustc_middle/src/mir/mod.rs`):
 - Locals `> argumentCount` are temporaries and user-declared locals.
 - `isUnsafe` records whether the function signature has
   `rustc_hir::Safety::Unsafe` (`compiler/rustc_hir/src/hir.rs`, `rust-lang/rust`
-  `8144389c895da997dbdecaa635e41d6a50be6ffd`):
+  `7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
   > "pub enum Safety { #[default] Unsafe, Safe }"
 
@@ -812,7 +814,7 @@ the MIR semantic profile version `mirProfileVersion`, and the capture scope
    lowered the program. `rustc` sizes `isize` and `usize` by the target data
    layout's pointer width (`compiler/rustc_middle/src/ty/layout.rs` and
    `compiler/rustc_abi/src/lib.rs`, `rust-lang/rust`
-   `8144389c895da997dbdecaa635e41d6a50be6ffd`):
+   `7189d39d9ce936881b8132c6addeaf3e295cd455`):
 
    > "ty::IntTy::Isize => cx.data_layout().ptr_sized_integer(),"
    > (`IntegerExt::from_int_ty`)

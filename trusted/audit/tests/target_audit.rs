@@ -884,3 +884,125 @@ fn kernel_result_channels_preserve_success_mismatch_and_operational_error() {
         )
         .unwrap();
 }
+
+/// Dialect-qualified canonical roots (`Trusted.MirSemantics.<Dialect>.UnitTheorem`)
+/// must resolve `<Dialect>.Crate.mk` in the same namespace with `Model` authority
+/// and reject cross-dialect or non-Model `Crate.mk` substitutions.
+#[test]
+fn accepts_dialect_qualified_canonical_root_and_rejects_cross_dialect_crate_mismatch() {
+    let mut f = Fixture::new(PROOF);
+    f.request.canonical_root =
+        "Trusted.MirSemantics.V2026_10_22_R7189d39d9.UnitTheorem".into();
+    f.set(
+        "Model",
+        TargetRole::Model,
+        concat!(
+            "prelude\nimport Init.Data.BitVec.Basic\n",
+            "namespace Trusted.MirSemantics\n",
+            "structure Crate where\n  program : BitVec 8\n  specs : BitVec 8 → Prop\n",
+            "def UnitTheorem (c : Crate) : Prop := c.program.toNat = 7 ∧ c.specs c.program\n",
+            "namespace V2026_10_22_R7189d39d9\n",
+            "structure CapturedProg where\n  raw : BitVec 8\n",
+            "def interpret (p : CapturedProg) : BitVec 8 := p.raw + BitVec.ofNat 8 1\n",
+            "structure Crate where\n  program : CapturedProg\n  specs : BitVec 8 → Prop\n",
+            "def UnitTheorem (c : Crate) : Prop := Trusted.MirSemantics.UnitTheorem ⟨interpret c.program, c.specs⟩\n",
+            "end V2026_10_22_R7189d39d9\n",
+            "namespace V2026_05_30_Rf8a08b688\n",
+            "structure CapturedProg where\n  raw : BitVec 8\n",
+            "structure Crate where\n  program : CapturedProg\n  specs : BitVec 8 → Prop\n",
+            "def UnitTheorem (c : Crate) : Prop := Trusted.MirSemantics.UnitTheorem ⟨c.program.raw, c.specs⟩\n",
+            "end V2026_05_30_Rf8a08b688\n",
+            "end Trusted.MirSemantics\n",
+        ),
+    );
+    f.set(
+        "Captured",
+        TargetRole::Capture,
+        concat!(
+            "prelude\nimport Model\n",
+            "def Captured.program : Trusted.MirSemantics.V2026_10_22_R7189d39d9.CapturedProg := ⟨BitVec.ofNat 8 6⟩\n",
+        ),
+    );
+    f.set(
+        "Expected",
+        TargetRole::Expected,
+        concat!(
+            "prelude\nimport Captured\nimport Spec\n",
+            "def Expected.claim : Prop := Trusted.MirSemantics.V2026_10_22_R7189d39d9.UnitTheorem (Trusted.MirSemantics.V2026_10_22_R7189d39d9.Crate.mk Captured.program Spec.specs)\n",
+        ),
+    );
+    let report = f.run().unwrap();
+    assert_eq!(report["exactType"], true);
+    assert_eq!(report["replay"], true);
+
+    // Cross-dialect canonical_root against `V2026_10_22_R7189d39d9` Captured.program
+    // must fail kernel type-checking on `<OtherDialect>.Crate.mk`.
+    f.request.canonical_root =
+        "Trusted.MirSemantics.V2026_05_30_Rf8a08b688.UnitTheorem".into();
+    let cross_err = f.run().unwrap_err();
+    assert!(
+        cross_err.message.contains("canonical root type check")
+            || cross_err.message.contains("Type mismatch"),
+        "{cross_err}"
+    );
+    f.request.canonical_root =
+        "Trusted.MirSemantics.V2026_10_22_R7189d39d9.UnitTheorem".into();
+
+    // Bypassing the canonical `<Dialect>.Crate.mk` spec binding in `Expected.claim`
+    // must fail the kernel Expected body comparison even when `Proof` proves it.
+    f.set(
+        "Expected",
+        TargetRole::Expected,
+        concat!(
+            "prelude\nimport Captured\nimport Spec\n",
+            "def Expected.claim : Prop := Trusted.MirSemantics.V2026_10_22_R7189d39d9.UnitTheorem (Trusted.MirSemantics.V2026_10_22_R7189d39d9.Crate.mk Captured.program (fun _ => True))\n",
+        ),
+    );
+    f.set(
+        "Proof",
+        TargetRole::Proof,
+        "prelude\nimport Expected\ntheorem Proof.verify : Expected.claim := ⟨rfl, True.intro⟩\n",
+    );
+    f.reject("compiled Expected body differs from the canonical root");
+    f.set("Proof", TargetRole::Proof, PROOF);
+
+    // Defining `<Dialect>.Crate` in a non-Model module (e.g., Specification)
+    // must fail the `TargetRole.model` provenance check on `crateCtor`.
+    f.set(
+        "Model",
+        TargetRole::Model,
+        concat!(
+            "prelude\nimport Init.Data.BitVec.Basic\n",
+            "namespace Trusted.MirSemantics\n",
+            "structure Crate where\n  program : BitVec 8\n  specs : BitVec 8 → Prop\n",
+            "def UnitTheorem (c : Crate) : Prop := c.program.toNat = 7 ∧ c.specs c.program\n",
+            "end Trusted.MirSemantics\n",
+        ),
+    );
+    f.set(
+        "Captured",
+        TargetRole::Capture,
+        "prelude\nimport Model\ndef Captured.program : BitVec 8 := BitVec.ofNat 8 7\n",
+    );
+    f.set(
+        "Spec",
+        TargetRole::Specification,
+        concat!(
+            "prelude\nimport Model\n",
+            "def Spec.specs (p : BitVec 8) : Prop := BitVec.and p p = p\n",
+            "namespace Trusted.MirSemantics.V2026_10_22_R7189d39d9\n",
+            "structure Crate where\n  program : BitVec 8\n  specs : BitVec 8 → Prop\n",
+            "def UnitTheorem (c : Crate) : Prop := Trusted.MirSemantics.UnitTheorem ⟨c.program, c.specs⟩\n",
+            "end Trusted.MirSemantics.V2026_10_22_R7189d39d9\n",
+        ),
+    );
+    f.set(
+        "Expected",
+        TargetRole::Expected,
+        concat!(
+            "prelude\nimport Captured\nimport Spec\n",
+            "def Expected.claim : Prop := Trusted.MirSemantics.V2026_10_22_R7189d39d9.UnitTheorem (Trusted.MirSemantics.V2026_10_22_R7189d39d9.Crate.mk Captured.program Spec.specs)\n",
+        ),
+    );
+    f.reject("incorrect canonical input origin");
+}

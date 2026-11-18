@@ -14,7 +14,9 @@ first production example verifies Starnix's endianness conversion in the
 original multi-file `ebpf_core` compilation.
 
 The commands below target x86_64 Linux. Capture pins Rust nightly
-`2026-05-31`, commit `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`, and
+`2026-10-23`, commit `7189d39d9ce936881b8132c6addeaf3e295cd455` (`V2026_10_22_R7189d39d9`;
+also admitting `nightly-2026-06-01` / `V2026_05_31_R14210df0e` and
+`nightly-2026-05-31` / `V2026_05_30_Rf8a08b688` for local development), and
 `Runtime(PostCleanup)` MIR. Proof checking pins Lean 4.34.1 and authenticates
 its foundation and checked library artifacts against the repository locks.
 
@@ -66,10 +68,10 @@ For compiler-adapter development with existing `rustup` and `elan`
 installations, the equivalent explicit tool setup is:
 
 ```sh
-rustup toolchain install nightly-2026-05-31 --profile minimal \
+rustup toolchain install nightly-2026-10-23 --profile minimal \
   --component rustc-dev --component llvm-tools
 elan toolchain install leanprover/lean4:v4.34.1
-anneal_sysroot="$(rustup run nightly-2026-05-31 rustc --print sysroot)"
+anneal_sysroot="$(rustup run nightly-2026-10-23 rustc --print sysroot)"
 anneal_lean_prefix="$(elan run leanprover/lean4:v4.34.1 lean --print-prefix)"
 export RUSTC="$anneal_sysroot/bin/rustc"
 export RUSTFLAGS="-Lnative=$anneal_sysroot/lib -Clink-arg=-Wl,-rpath,$anneal_sysroot/lib"

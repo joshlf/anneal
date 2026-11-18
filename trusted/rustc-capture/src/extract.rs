@@ -458,7 +458,9 @@ fn statement<'tcx>(
 /// https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_middle/src/mir/syntax.rs#L692-L740
 fn terminator<'tcx>(tcx: TyCtxt<'tcx>, term: &mir::TerminatorKind<'tcx>) -> Result<ir::Terminator> {
     Ok(match term {
-        mir::TerminatorKind::Goto { target } => ir::Terminator::Goto {
+        // In 1.101 (`7189d39d9`), `Goto` also carries `loop_hint_attrs`, which
+        // are non-operational unroll optimization hints.
+        mir::TerminatorKind::Goto { target, .. } => ir::Terminator::Goto {
             block: target.as_u32(),
         },
         mir::TerminatorKind::SwitchInt { discr, targets } => ir::Terminator::SwitchInt {

@@ -23,7 +23,7 @@ This document specifies the architecture that implements that strategy:
    moving a MIR place deinitializes the source location at runtime, matching
    post-cleanup runtime MIR semantics.
 2. **Anneal MIR syntax and semantics ($M_{\text{anneal}}$):**
-   `Trusted.MirAst` represents MIR programs with structural types (`MirTy`)
+   `Trusted.MirModel` represents MIR programs with structural types (`MirTy`)
    carried directly by value, and `Trusted.MirSemantics` defines a small-step
    operational semantics that shares its boundary input and output value types
    (`Query`, `Out`, `TerminalOut`) directly with the reference adapter.
@@ -54,9 +54,11 @@ trusted/lean/                   Core TCB (Pass 1; shipped in omnibus-archive)
   Trusted.lean                  Umbrella module
                                 (-- anneal-trust-tier: vetted)
   Trusted/
-    MirAst.lean                 Anneal MIR syntax
+    MirModel.lean               Compiler-independent ground MIR syntax
                                 (-- anneal-trust-tier: candidate:mir_ast)
-    MirSemantics.lean           Anneal small-step semantics
+    Rustc/<Dialect>/MirAst.lean Versioned captured rustc MIR syntax
+                                (-- anneal-trust-tier: candidate:mir_ast)
+    MirSemantics.lean           Anneal small-step semantics & dialect interpreters
                                 (-- anneal-trust-tier: candidate:mir_semantics)
 
 theory/                         Core untrusted theory (Pass 1; shipped in
@@ -139,13 +141,16 @@ Placing `Trusted.Correspondence` and `Anneal.MirCorrespondenceProof` in
 `trusted/correspondence/` and `correspondence/` preserves both invariants:
 
 1. **Pass 1 (`Checker::run` on `trusted/lean/` and `theory/`):** Audits
-   `Trusted.MirAst`, `Trusted.MirSemantics`, and `Anneal.MirWp` against the
+   `Trusted.MirModel`, `Trusted.Rustc.<Dialect>.MirAst`, `Trusted.MirSemantics`,
+   and `Anneal.MirWp` against the
    unmodified 51-module `trusted/lean/foundation-lock.json` and unmodified
    `allowedTrustedSyntaxKinds` / `allowedTheorySyntaxKinds` allowlists in
-   `TrustedBoundary.lean`. Whenever `Anneal.PureLift`, `Trusted.MirAst`,
+   `TrustedBoundary.lean`. Whenever `Anneal.PureLift`, `Trusted.MirModel`,
+   `Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst`,
    `Trusted.MirSemantics`, or `Anneal.MirWp` is present (or `require_mir_wp` is
    enabled), `TrustedBoundary.lean` (`verifyMirWpCoreTheorems`) requires
-   `Trusted.MirAst` and `Trusted.MirSemantics` in `trusted/` and `Anneal.MirWp`
+   `Trusted.MirModel`, `Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst`, and
+   `Trusted.MirSemantics` in `trusted/` and `Anneal.MirWp`
    in `theory/`, and verifies that `wellFormed_and_spec_of_wp`,
    `reaches_fault_and_exclusive_of_wpFault`, and all 19 Pass 1 canary theorems
    in `Anneal.MirWp` prove the exact trusted `*Claim` propositions (referencing
@@ -210,18 +215,19 @@ Every `Trusted.*` and `Anneal.*` module satisfies `TrustedBoundary.lean` with
 zero changes to `trusted/lean/foundation-lock.json` or the syntax/tactic
 allowlists:
 
-- **Trust-tier headers (`-- anneal-trust-tier:`):** `Trusted/MirAst.lean`
-  carries `-- anneal-trust-tier: candidate:mir_ast`; `Trusted/MirSemantics.lean`
-  and `Trusted/Correspondence.lean` carry `-- anneal-trust-tier:
-  candidate:mir_semantics`; and `Trusted.lean` carries `-- anneal-trust-tier:
-  vetted`. Because `Trusted.lean` is a pure umbrella module that declares zero
-  constants, `checkTierReferences` (which inspects constant-level
-  `declarationEdges`) permits `Trusted.lean` to import `Trusted.MirAst` and
-  `Trusted.MirSemantics` while forbidding any `vetted` module from referencing
-  `candidate:*` constants.
+- **Trust-tier headers (`-- anneal-trust-tier:`):** `Trusted/MirModel.lean` and
+  `Trusted/Rustc/*/MirAst.lean` carry `-- anneal-trust-tier: candidate:mir_ast`;
+  `Trusted/MirSemantics.lean` and `Trusted/Correspondence.lean` carry
+  `-- anneal-trust-tier: candidate:mir_semantics`; and `Trusted.lean` carries
+  `-- anneal-trust-tier: vetted`. Because `Trusted.lean` is a pure umbrella
+  module that declares zero constants, `checkTierReferences` (which inspects
+  constant-level `declarationEdges`) permits `Trusted.lean` to import
+  `Trusted.MirModel`, `Trusted.Rustc.*.MirAst`, and `Trusted.MirSemantics` while
+  forbidding any `vetted` module from referencing `candidate:*` constants.
 - **Tactic-free, `deriving`-free `Trusted.*` definitions:**
-  `Trusted/MirAst.lean`, `Trusted/MirSemantics.lean`, and
-  `Trusted/Correspondence.lean` start with `prelude`, import locked modules
+  `Trusted/MirModel.lean`, `Trusted/Rustc/*/MirAst.lean`,
+  `Trusted/MirSemantics.lean`, and `Trusted/Correspondence.lean` start with
+  `prelude`, import locked modules
   from `foundation-lock.json` (`Init.NotationExtra`,
   `Init.Data.BitVec.BasicAux`, `Init.Data.Int.Basic`,
   `Init.Data.Nat.Div.Basic`, `Init.Data.Nat.Bitwise.Basic`, and
@@ -257,7 +263,7 @@ constants are defined.
 **Human comprehension of the correspondence theorem statements
 (`CorrespondenceClaim`, `FaultEquivalenceClaim`, and
 `MiriMoveDeinitWiringClaim`) and every definition in their transitive dependency
-cone is therefore the highest design priority in `Trusted.MirAst`,
+cone is therefore the highest design priority in `Trusted.MirModel`,
 `Trusted.MirSemantics`, and `Trusted.Correspondence`.** It must be immediately
 clear to a human reviewer that each theorem statement means in mathematical
 terms what they intend it to mean in intuitive terms. Clever encodings, indirect
@@ -273,7 +279,7 @@ together with every later change to those definitions:
 
 | Component | Theorem-controlling definitions |
 | :--- | :--- |
-| `Trusted.MirAst` | `Program` (`pointerWidthBits`, `mirProfileVersion`) and AST types |
+| `Trusted.MirModel` | `Program` (`pointerWidthBits`, `mirProfileVersion`) and AST types |
 | `Trusted.MirSemantics` | `Val`, `Query`, `Out`, `TerminalOut`, `StepResult` |
 | | `Reaches`, `ReachesResult` |
 | | `WellFormed`, `Behavior`, `Diverges`, `SatisfiesPost` |
@@ -281,7 +287,7 @@ together with every later change to those definitions:
 | `Trusted.Correspondence` | Codec, reference machine, top-level claims, and `CanaryD*Claim` |
 | `vendor/lean-miri/` | Pinned `ExecutionMachine` slice and 10-file patch |
 
-- **`Trusted.MirAst` and `Trusted.MirSemantics` (`trusted/lean/`):** These
+- **`Trusted.MirModel` and `Trusted.MirSemantics` (`trusted/lean/`):** These
   modules define the programs, inputs, and observable outcomes that the claims
   quantify over, the trace predicates (built from `Step` and `ValidChoice`)
   that turn `initState` and `evalStep` into the claims' hypotheses and
@@ -329,9 +335,12 @@ Anneal uses `lean-miri` (pinned at upstream `proofs-rs/lean-miri` commit
 `8144389c895da997dbdecaa635e41d6a50be6ffd` and compiles cleanly on
 `leanprover/lean4:v4.34.1`) as $M_{\text{ref}}$. Because `anneal-rustc-capture`
 extracts Stage 2 `Runtime(PostCleanup)` MIR from Anneal's pinned `rustc`
-toolchain (`f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`), the correspondence TCB
-audits that every enabled Stage 2 MIR construct in `Trusted.MirAst` has
-identical post-cleanup operational rules across both `rustc` revisions, and
+toolchain (`7189d39d9ce936881b8132c6addeaf3e295cd455` / `V2026_10_22_R7189d39d9`,
+along with supported local dialects `V2026_05_31_R14210df0e` and
+`V2026_05_30_Rf8a08b688`) and interprets it into `Trusted.MirModel`, the
+correspondence TCB audits that every enabled Stage 2 MIR construct in
+`Trusted.MirModel` has identical post-cleanup operational rules across the
+pinned `rustc` revisions, and
 stamps captured programs with an explicit semantic profile version
 (`mirProfileVersion : Nat := 1`; Section 3.1) that both `initState` and
 `initRefState` verify fail-closed. `lean-miri` is a mechanized Lean 4
@@ -561,11 +570,11 @@ In `lean-miri`, `OperandMachine.evalOperand` evaluates a `Place` via
 
 ---
 
-## 3. MIR Representation (`Trusted.MirAst`) and Canonical Type Codec
+## 3. MIR Representation (`Trusted.MirModel`) and Canonical Type Codec
 
-### 3.1 Structural Types by Value in `Trusted.MirAst`
+### 3.1 Structural Types by Value in `Trusted.MirModel`
 
-In `Trusted.MirAst`, MIR types (`MirTy`) are structural inductive values carried
+In `Trusted.MirModel`, MIR types (`MirTy`) are structural inductive values carried
 directly inside AST nodes (`Body.locals : List MirTy`, `ConstOperand.ty :
 MirTy`, and `ProjectionElem.field : FieldIdx → MirTy → ProjectionElem`):
 
@@ -587,10 +596,10 @@ inductive MirTy where
 ```
 
 Carrying `MirTy` by value eliminates out-of-bounds type-table indices (`TyId`)
-and duplicate-index aliasing from `Trusted.MirAst` and `Trusted.MirSemantics`:
+and duplicate-index aliasing from `Trusted.MirModel` and `Trusted.MirSemantics`:
 two types in $M_{\text{anneal}}$ are equal if and only if they are structurally
 equal (`t₁ = t₂`). To satisfy `TrustedBoundary.lean`'s `deriving`-free
-syntax allowlist in `trusted/`, `Trusted.MirAst` defines structural equality
+syntax allowlist in `trusted/`, `Trusted.MirModel` defines structural equality
 via pure pattern-matching functions (`IntWidth.beq`, `Mutability.beq`,
 `MirTy.beq`).
 
@@ -601,7 +610,7 @@ Stage 2 `Runtime(PostCleanup)` MIR, it fails closed with a hard capture error
 and never rewrites unsupported MIR into generic `.unsupported` nodes. The
 `.unsupported` constructors (`MirTy.unsupported`, `StatementKind.unsupported`,
 `Rvalue.unsupported`, and `TerminatorKind.unsupported`) exist solely in
-`Trusted.MirAst` as explicit AST sentinels for testing and verifying fail-closed
+`Trusted.MirModel` as explicit AST sentinels for testing and verifying fail-closed
 `.unsupported` / `.blocked` fault handling in `CorrespondenceClaim`,
 `FaultEquivalenceClaim`, and negative canaries (`CanaryD5`).
 
@@ -632,7 +641,8 @@ manifest rather than rely on the defaults:
   a 32-bit target.
 - **Semantic revision and profile gating (`mirProfileVersion = 1`):** Because
   `anneal-rustc-capture` runs on Anneal's pinned `rustc` toolchain
-  (`f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`) while `vendor/lean-miri/` tracks
+  (`7189d39d9ce936881b8132c6addeaf3e295cd455`, plus supported local dialects)
+  while `vendor/lean-miri/` tracks
   upstream `miri`/`rustc` (`8144389c895da997dbdecaa635e41d6a50be6ffd`), the
   correspondence TCB audit verifies that every enabled Stage 2
   `Runtime(PostCleanup)` MIR construct has identical operational rules across
@@ -1661,10 +1671,10 @@ Mechanizing this approach revealed four structural flaws:
 
 ### A.2 Type Representation and Codec Alternatives
 
-#### Nominal `TyId` Indirection Inside `Trusted.MirAst`
+#### Nominal `TyId` Indirection Inside `Trusted.MirModel`
 
 We considered mirroring `lean-miri`'s `TyId := Nat` index table inside
-`Trusted.MirAst` (`Program.types : List MirTy`). We rejected this because a
+`Trusted.MirModel` (`Program.types : List MirTy`). We rejected this because a
 nominal `TyId` table inside $M_{\text{anneal}}$ introduces two classes of
 representation artifacts:
 
@@ -1677,7 +1687,7 @@ representation artifacts:
    (`0 ≠ 1`), whereas structural type checks compare `MirTy` values
    (`u32 = u32`), breaking correspondence unless every `Program` carries an
    extra canonical-table well-formedness side condition. Carrying `MirTy` by
-   value in `Trusted.MirAst` and deduplicating during `encodeProg` eliminates
+   value in `Trusted.MirModel` and deduplicating during `encodeProg` eliminates
    both issues by construction.
 
 #### Unseeded Type Collection (`initTypeTable := []`)

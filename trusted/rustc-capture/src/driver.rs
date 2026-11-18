@@ -155,16 +155,20 @@ pub(super) fn run(args: Vec<OsString>) -> ExitCode {
         // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_interface/src/interface.rs#L491-L509
         rustc_driver::run_compiler(&compiler_args, &mut callbacks);
 
-        // early_note uses rustc's diagnostic emitter, whose destinations are
-        // stderr for both human and JSON formats. Keep stdout exclusively for
-        // requested compiler output, which may include binary artifacts.
-        // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_session/src/session.rs#L1432-L1434
-        // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_session/src/session.rs#L1462-L1478
+        // Emit a standalone `note:` through rustc's diagnostic emitter, whose
+        // destinations are stderr for both human and JSON formats. Keep stdout
+        // exclusively for requested compiler output, which may include binary
+        // artifacts. `EarlyDiagCtxt::early_note` was removed in 1.101
+        // (`7189d39d9`), while `Diag::dcx` + `Diag::cancel` +
+        // `DiagCtxtHandle::note` work identically across 1.98 and 1.101.
         let early_dcx = EarlyDiagCtxt::new(callbacks.error_format);
         if !callbacks.analysis_reached {
             early_dcx.early_fatal("compiler returned without reaching a clean analysis callback");
         }
-        early_dcx.early_note(
+        let probe = early_dcx.early_struct_warn("");
+        let dcx = probe.dcx;
+        probe.cancel();
+        dcx.note(
             "anneal-rustc-capture: compiler analysis callback reached; verification not performed",
         );
     })
