@@ -6174,6 +6174,13 @@ open MiniRustSpec.Correspondence.WideSliceDst
   minirust_interp_metadata_unops_unsupported
   div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total
   wideSliceParentWrite_aliasingDivergence_and_metadata_three_way
+  WideSliceThinPtrRel.of_ctxWithBorrows
+  WideSliceThinPtrRel.inBounds_addr
+  WideSliceValRel.checkPtr_rawSlice_ok
+  ptrMetadata_wideSliceValRel_lockstep
+  ptrToPtr_wideSliceValRel_and_to_from_raw_parts_roundtrip
+  translatePlace_and_translateRvalue_wideSlice_boundary
+  wideSliceWitnesses_translateStatement_correspondence
 
 namespace WideSliceDstStatementPins
 
@@ -6296,6 +6303,76 @@ example :
              stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
       tbRetU32 4 :=
   wideSliceParentWrite_aliasingDivergence_and_metadata_three_way
+
+example
+    {ctx : Ctx} {locals locals' : List LocalSlot} {op : Operand}
+    {mem : MirSemantics.Memory} {localDecls : List MirAst.LocalDecl}
+    {v : MirSemantics.Value} {mrVal : Val} {mrValTB : Gen.Value TBM}
+    (hNonWide : isNonWidePtrAggregateTy (operandTy localDecls emptyLayoutTable op) = false)
+    (hOp : evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok v locals')
+    (hrel : WideSliceValRel ctx v mrVal mrValTB) :
+    ∃ (len : Nat) (widePtr : Pointer Prov),
+      len < scalarModulus 8 ∧
+      mrVal = .Ptr widePtr ∧
+      evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls emptyLayoutTable =
+        .ok (.scalar ⟨len, 8⟩) locals' mem ∧
+      PointerMetaKind.encode_as_value .ElementCount widePtr.metadata =
+        .ok (.Int (Int.ofNat len)) :=
+  ptrMetadata_wideSliceValRel_lockstep hNonWide hOp hrel
+
+example
+    {ctx : Ctx} (locals locals₁ locals₂ : List LocalSlot)
+    (wideOp dataOp metaOp : Operand) (thinTargetTy wideTargetTy pointeeTy : Ty)
+    (mutability : MirAst.Mutability) (mem : MirSemantics.Memory) (localDecls : List MirAst.LocalDecl)
+    (p : ProvenancePtr) (len : Nat) (thin : Ptr)
+    (thinTB : ThinPointer TreeBorrowsProvenance) (ptrTy : PtrType)
+    (hptr : WideSliceThinPtrRel ctx p thin thinTB)
+    (hlen : len < scalarModulus 8)
+    (hThin : isThinRawPtrTy thinTargetTy = true)
+    (hNotThin : isThinRawPtrTy wideTargetTy = false)
+    (hWide : wideRawPtrIsDyn? wideTargetTy = some false)
+    (hWideAgg : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hWideOp : evalOperand locals wideOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals₁)
+    (hData : evalOperand locals₁ dataOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (.ptr p 8) locals₁)
+    (hMeta : evalOperand locals₁ metaOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (.scalar ⟨len, 8⟩) locals₂) :
+    WideSliceValRel ctx
+      (annealWidePtrVal p len 8)
+      (mrWidePtrVal thin (Int.ofNat len))
+      (mrWidePtrValM thinTB (Int.ofNat len)) ∧
+    ((lookupBorrow mem.borrows p.tag = none →
+        evalRvalue locals (.cast .ptrToPtr wideOp thinTargetTy) mem localDecls emptyLayoutTable =
+          .ok (.ptr p 8) locals₁ mem ∧
+        WideSliceThinPtrRel ctx p thin thinTB) ∧
+     evalUnOp .GetThinPointer (mrWidePtrVal thin (Int.ofNat len), .Ptr ptrTy) =
+       .ok (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None)) ∧
+     evalUnOpM (M := TBM) .GetThinPointer (mrWidePtrValM thinTB (Int.ofNat len), .Ptr ptrTy) =
+       .ok (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None))) ∧
+    evalRvalue locals (.cast .ptrToPtr wideOp wideTargetTy) mem localDecls emptyLayoutTable =
+      .ok (annealWidePtrVal p len 8) locals₁ mem ∧
+    evalRvalue locals (.unaryOp .ptrMetadata wideOp) mem localDecls emptyLayoutTable =
+      .ok (.scalar ⟨len, 8⟩) locals₁ mem ∧
+    evalRvalue locals₁ (.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]) mem localDecls
+        emptyLayoutTable =
+      .ok (annealWidePtrVal p len 8) locals₂ mem :=
+  ptrToPtr_wideSliceValRel_and_to_from_raw_parts_roundtrip
+    locals locals₁ locals₂ wideOp dataOp metaOp thinTargetTy wideTargetTy pointeeTy mutability
+    mem localDecls p len thin thinTB ptrTy hptr hlen hThin hNotThin hWide hWideAgg
+    hWideOp hData hMeta
+
+example :
+    let decls := wideRawPartsMir.localDecls
+    translatePlace decls { local_ := 8, projection := [.deref, .index 9] } = none ∧
+    translateRvalue emptyLayoutTable decls (some rawMutSliceU32Ty)
+      (.aggregate (.rawPtr sliceU32PointeeTy .mut) [.copy (local_ 3), WideSliceDst.constUsize 4]) = none ∧
+    translateRvalue emptyLayoutTable decls (some usizeMirTy)
+      (.unaryOp .ptrMetadata (.copy (local_ 5))) = none ∧
+    translateRvalue emptyLayoutTable decls (some usizeMirTy)
+      (.len (derefPlace 4)) = none :=
+  translatePlace_and_translateRvalue_wideSlice_boundary
 
 end WideSliceDstStatementPins
 

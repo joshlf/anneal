@@ -1456,6 +1456,7 @@ open LeanMiriSpec.Correspondence in
   annealCallHooksWideSlice
   translateWideSliceCallTerminator
   annealRvalueHooksWideSlice
+  isWideSliceBasePlace
   isWideSliceMirOperand
   isWideSliceAssign
   isWideSliceCallTerminator
@@ -1478,6 +1479,9 @@ open LeanMiriSpec.Correspondence in
   placeDynamic_length_wideSlice_simulation
   placeDynamic_index_wideSlice_oob_ub_simulation
   placeDynamic_subslice_wideSlice_oob_ub_simulation
+  evalRvalue_len_wideSlice_two_sided_simulation
+  evalPlace_index_wideSlice_oob_ub_two_sided_simulation
+  evalPlace_subslice_wideSlice_oob_ub_two_sided_simulation
   evalSliceSizeOfVal_iff_dynamicLayout_sizeAndAlignFromMeta
   evalSliceSizeOfVal_zst_always_ok
   evalSliceSizeOfVal_zst_simulation
@@ -1485,6 +1489,7 @@ open LeanMiriSpec.Correspondence in
   evalCallTerminator_wideSlice_one
   WideSliceWitnesses.miriTopLocal?
   WideSliceWitnesses.miriUsizeLocal
+  WideSliceWitnesses.miriU32Local
   WideSliceWitnesses.wideSlicePipelineBody
   WideSliceWitnesses.wideSlicePipelineMiriBody
   WideSliceWitnesses.wideSlicePipelineInitAnneal
@@ -1505,6 +1510,24 @@ open LeanMiriSpec.Correspondence in
   WideSliceWitnesses.w_wideSlice_isizeMax_boundary_agrees
   WideSliceWitnesses.w_wideSlice_isizeMax_exact_boundary_values_agree
   WideSliceWitnesses.div_stage1_scalarAddr_wideSlice_sizeOfVal_alignOfVal
+  WideSliceWitnesses.arrU32_4Ty
+  WideSliceWitnesses.rawMutSliceU32Ty
+  WideSliceWitnesses.u32Layout
+  WideSliceWitnesses.fnAbiU32
+  WideSliceWitnesses.sampleArrU32Alloc
+  WideSliceWitnesses.sampleArrU32Machine
+  WideSliceWitnesses.sampleAnnealArrVal
+  WideSliceWitnesses.sampleAnnealArrMemory
+  WideSliceWitnesses.wideSliceSingleLenBody
+  WideSliceWitnesses.wideSliceSingleIndexReadBody
+  WideSliceWitnesses.wideSliceSingleIndexWriteBody
+  WideSliceWitnesses.wideSliceSingleMetadataBody
+  WideSliceWitnesses.wideSlice4LocalInitAnneal
+  WideSliceWitnesses.wideSlice4LocalInitMiri
+  WideSliceWitnesses.w_wideSlice_len_and_index_read_returns
+  WideSliceWitnesses.w_wideSlice_index_write_returns
+  WideSliceWitnesses.w_wideSlice_len_index_read_write_returns
+  WideSliceWitnesses.w_wideSlice_index_oob_and_dangling_deref_ub_agrees
 
 
 /-- Exhaustively verify that every declaration across every imported
@@ -26246,6 +26269,176 @@ example :
         some ⟨.live (.immediate (.scalar (.fromScalarInt maddr4))),
               some (translateTyWideSlice usizeTy)⟩ :=
   div_stage1_scalarAddr_wideSlice_sizeOfVal_alignOfVal
+
+example
+    {allocMap : List AllocMapEntry}
+    {locals locals' : List LocalSlot} {mem : Memory}
+    {localDecls : List MirAst.LocalDecl} {layouts : Layout.LayoutTable}
+    {sIdx : Local} {elemKind : RigidTy} {lIdx : LayoutIdx}
+    {p : ProvenancePtr} {lenSc : MirAst.ScalarInt}
+    {mptr : Miri.Memory.Pointer AnnealProv} {mlen : Miri.Memory.ScalarInt}
+    {sliceLay : Miri.Interpreter.LocalLayout}
+    (hptrBytes : layoutPointerBytes layouts = 8)
+    (hplaceTy :
+      placeTy localDecls layouts ⟨sIdx, [.deref]⟩ =
+        some { kind := .slice elemKind, layoutIdx := lIdx })
+    (hread :
+      evalPlaceRead locals ⟨sIdx, []⟩ mem.borrows mem.globals layouts
+        mem.callerLocals localDecls mem.callStack =
+        .ok (.aggregate 0 [.ptr p 8, .scalar lenSc]) locals')
+    (hborrowNone : lookupBorrow mem.borrows p.tag = none)
+    (hglobalNone : lookupGlobalAlloc mem.globals p.allocId = none)
+    (hallocNeZero : Nat.beq p.allocId 0 = false)
+    (hptr : PtrRel allocMap p mptr)
+    (hlen : ScalarRel lenSc mlen)
+    (hlen_sz : lenSc.sizeBytes = 8)
+    (hunsized : sliceLay.layout.isSized = false)
+    (hsliceOrStr : sliceLay.ty == strPointeeTyId || (2100 ≤ sliceLay.ty && sliceLay.ty < 2200))
+    (st : AnnealStepState) :
+    let mptrOpt : Miri.Memory.Pointer (Option AnnealProv) := ⟨mptr.offset, some mptr.provenance⟩
+    let metaImm : Miri.Interpreter.Immediate AnnealProv :=
+      .scalarPair
+        (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr)
+        (.fromScalarInt mlen)
+    evalRvalue locals (.len ⟨sIdx, [.deref]⟩) mem localDecls layouts =
+      .ok (.scalar lenSc) locals' mem ∧
+    Miri.Interpreter.PlaceDynamic.length
+      (annealPlaceProjectionHooksWideSlice localDecls layouts) ()
+      ⟨.memory ⟨mptrOpt, .metadata (.fromScalarInt mlen), none⟩, sliceLay⟩ st =
+      .ok (UInt64.ofNat lenSc.bits) st ∧
+    Miri.Interpreter.ScalarOps.unary
+      (annealScalarOpsHooksWideSlice localDecls layouts) ()
+      .PtrMetadata ⟨metaImm, ⟨arraySliceMetaTyId, widePointerLayoutData false⟩⟩ st =
+      .ok ⟨.scalar (.fromScalarInt mlen),
+           translateTy { kind := .uint .usize, layoutIdx := 0 }⟩ st ∧
+    WideSliceImmediateRel allocMap (.aggregate 0 [.ptr p 8, .scalar lenSc]) metaImm ∧
+    ScalarRel lenSc mlen :=
+  evalRvalue_len_wideSlice_two_sided_simulation
+    hptrBytes hplaceTy hread hborrowNone hglobalNone hallocNeZero
+    hptr hlen hlen_sz hunsized hsliceOrStr st
+
+example
+    {localDecls : List MirAst.LocalDecl} {layouts : Layout.LayoutTable}
+    {locals : List LocalSlot} {elems : List Value}
+    {idxLocal : Local} {idxSc lenSc : MirAst.ScalarInt}
+    {ptr : Miri.Memory.Pointer (Option AnnealProv)}
+    {mlen : Miri.Memory.ScalarInt}
+    {elemLay : Miri.ABI.LayoutData} {elemId : Miri.MIR.TyId}
+    (hidx_slot : get? locals idxLocal = some (.init (.scalar idxSc)))
+    (hget_none : get? elems idxSc.bits = none)
+    (hlen : ScalarRel lenSc mlen)
+    (hlen_sz : lenSc.sizeBytes = 8)
+    (helemId : elemId < 100)
+    (hoob : UInt64.ofNat lenSc.bits ≤ UInt64.ofNat idxSc.bits)
+    (st : AnnealStepState) :
+    readProjectedValue locals (.aggregate 0 elems) [.index idxLocal] = .ub ∧
+    (∀ v, writeProjectedValue locals (.aggregate 0 elems) [.index idxLocal] v = .ub) ∧
+    ∃ msg,
+      Miri.Interpreter.PlaceDynamic.index
+        (annealPlaceProjectionHooksWideSlice localDecls layouts) ()
+        ⟨.memory ⟨ptr, .metadata (.fromScalarInt mlen), none⟩,
+         ⟨slicePointeeTyId elemId, unsizedSliceLayoutData elemLay⟩⟩
+        (UInt64.ofNat idxSc.bits) st =
+        .error (.undefinedBehavior msg) st :=
+  evalPlace_index_wideSlice_oob_ub_two_sided_simulation
+    hidx_slot hget_none hlen hlen_sz helemId hoob st
+
+example
+    {localDecls : List MirAst.LocalDecl} {layouts : Layout.LayoutTable}
+    {locals : List LocalSlot} {elems : List Value}
+    {ptr : Miri.Memory.Pointer (Option AnnealProv)}
+    {lenSc : MirAst.ScalarInt} {mlen : Miri.Memory.ScalarInt}
+    {elemLay : Miri.ABI.LayoutData} {elemId : Miri.MIR.TyId}
+    {fromIndex to : UInt64}
+    (hextract_none : extractSubslice elems fromIndex.toNat to.toNat true = none)
+    (hlen : ScalarRel lenSc mlen)
+    (hlen_sz : lenSc.sizeBytes = 8)
+    (helemId : elemId < 100)
+    (hoob : (UInt64.ofNat lenSc.bits).toNat < fromIndex.toNat + to.toNat)
+    (st : AnnealStepState) :
+    readProjectedValue locals (.aggregate 0 elems)
+      [.subslice fromIndex.toNat to.toNat true] = .ub ∧
+    Miri.Interpreter.PlaceDynamic.subslice
+      (annealPlaceProjectionHooksWideSlice localDecls layouts) ()
+      ⟨.memory ⟨ptr, .metadata (.fromScalarInt mlen), none⟩,
+       ⟨slicePointeeTyId elemId, unsizedSliceLayoutData elemLay⟩⟩ fromIndex to true st =
+      .error (.undefinedBehavior "subslice bounds") st :=
+  evalPlace_subslice_wideSlice_oob_ub_two_sided_simulation
+    hextract_none hlen hlen_sz helemId hoob st
+
+open WideSliceWitnesses in
+example :
+    let bLen := wideSliceSingleLenBody
+    let bRead := wideSliceSingleIndexReadBody
+    let bWrite := wideSliceSingleIndexWriteBody
+    let hLen := annealStepHooksWideSlice bLen.localDecls bLen.layouts
+    let hRead := annealStepHooksWideSlice bRead.localDecls bRead.layouts
+    let hWrite := annealStepHooksWideSlice bWrite.localDecls bWrite.layouts
+    ∃ (sLen sRead sWrite : MachineState) (mLen mRead mWrite : AnnealStepState),
+      stepMirFn bLen (wideSlice4LocalInitAnneal sampleAnnealPtr 3 1 sampleAnnealArrMemory) =
+        .step sLen ∧
+      Miri.Interpreter.Step.step hLen ()
+        (wideSlice4LocalInitMiri bLen usizeTy sampleMiriPtr 3 1 sampleArrU32Machine) =
+        (mLen, .ok true) ∧
+      get? sLen.frame.locals 0 = some (.init (.scalar ⟨3, 8⟩)) ∧
+      miriTopLocal? mLen 0 = miriUsizeLocal 3 ∧
+      stepMirFn bRead (wideSlice4LocalInitAnneal sampleAnnealPtr 3 1 sampleAnnealArrMemory) =
+        .step sRead ∧
+      Miri.Interpreter.Step.step hRead ()
+        (wideSlice4LocalInitMiri bRead u32Ty sampleMiriPtr 3 1 sampleArrU32Machine) =
+        (mRead, .ok true) ∧
+      get? sRead.frame.locals 0 = some (.init (.scalar ⟨20, 4⟩)) ∧
+      miriTopLocal? mRead 0 = miriU32Local 20 ∧
+      stepMirFn bWrite (wideSlice4LocalInitAnneal sampleAnnealPtr 3 1 sampleAnnealArrMemory) =
+        .step sWrite ∧
+      Miri.Interpreter.Step.step hWrite ()
+        (wideSlice4LocalInitMiri bWrite u32Ty sampleMiriPtr 3 1 sampleArrU32Machine) =
+        (mWrite, .ok true) ∧
+      get? sWrite.frame.locals 1 =
+        some (.init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨40, 4⟩])) :=
+  w_wideSlice_len_index_read_write_returns
+
+open WideSliceWitnesses in
+example :
+    let bRead := wideSliceSingleIndexReadBody
+    let bWrite := wideSliceSingleIndexWriteBody
+    let bMeta := wideSliceSingleMetadataBody
+    let hRead := annealStepHooksWideSlice bRead.localDecls bRead.layouts
+    let hWrite := annealStepHooksWideSlice bWrite.localDecls bWrite.layouts
+    let hMeta := annealStepHooksWideSlice bMeta.localDecls bMeta.layouts
+    let pastEndAnnealPtr : ProvenancePtr := { allocId := 1, offsetBytes := 16 }
+    let pastEndMiriPtr : Miri.Memory.Pointer AnnealProv :=
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr sampleAllocId + 16),
+       .concrete sampleAllocId Miri.Memory.BorTag.one⟩
+    ∃ (sMeta : MachineState) (mOobR mOobW mMeta mDead mPastEnd : AnnealStepState),
+      stepMirFn bRead (wideSlice4LocalInitAnneal sampleAnnealPtr 3 3 sampleAnnealArrMemory) =
+        .fail .ub ∧
+      Miri.Interpreter.Step.step hRead ()
+        (wideSlice4LocalInitMiri bRead u32Ty sampleMiriPtr 3 3 sampleArrU32Machine) =
+        (mOobR, .error (.undefinedBehavior "place index 3 out of bounds for 3")) ∧
+      stepMirFn bWrite (wideSlice4LocalInitAnneal sampleAnnealPtr 3 3 sampleAnnealArrMemory) =
+        .fail .ub ∧
+      Miri.Interpreter.Step.step hWrite ()
+        (wideSlice4LocalInitMiri bWrite u32Ty sampleMiriPtr 3 3 sampleArrU32Machine) =
+        (mOobW, .error (.undefinedBehavior "place index 3 out of bounds for 3")) ∧
+      stepMirFn bMeta (wideSlice4LocalInitAnneal sampleAnnealPtr 3 0 emptyMemory) =
+        .step sMeta ∧
+      Miri.Interpreter.Step.step hMeta ()
+        (wideSlice4LocalInitMiri bMeta usizeTy sampleMiriPtr 3 0 AnnealMachine.empty) =
+        (mMeta, .ok true) ∧
+      get? sMeta.frame.locals 0 = some (.init (.scalar ⟨3, 8⟩)) ∧
+      miriTopLocal? mMeta 0 = miriUsizeLocal 3 ∧
+      stepMirFn bRead (wideSlice4LocalInitAnneal sampleAnnealPtr 3 0 emptyMemory) =
+        .fail .ub ∧
+      Miri.Interpreter.Step.step hRead ()
+        (wideSlice4LocalInitMiri bRead u32Ty sampleMiriPtr 3 0 AnnealMachine.empty) =
+        (mDead, .error (.undefinedBehavior "pointer dereference check failed")) ∧
+      stepMirFn bRead (wideSlice4LocalInitAnneal pastEndAnnealPtr 3 0 sampleAnnealArrMemory) =
+        .fail .ub ∧
+      Miri.Interpreter.Step.step hRead ()
+        (wideSlice4LocalInitMiri bRead u32Ty pastEndMiriPtr 3 0 sampleArrU32Machine) =
+        (mPastEnd, .error (.undefinedBehavior "pointer dereference check failed")) :=
+  w_wideSlice_index_oob_and_dangling_deref_ub_agrees
 
 end StatementPins
 

@@ -1807,4 +1807,300 @@ theorem wideSliceParentWrite_aliasingDivergence_and_metadata_three_way :
     runA_noUB wideSliceMetadataAfterParentWriteMir 30 _ _ _ rfl,
     by decide +kernel, by decide +kernel⟩
 
+/-! ## 7. Relational Pointer Correspondence (`WideSliceThinPtrRel`, `WideSliceValRel`) & `translateStatement` Grounding
+
+Addresses two structural correspondence properties across Anneal and MiniRust:
+1. **`WideSliceThinPtrRel` and `WideSliceValRel`**: ties MiniRust's `BasicMemory` thin pointer
+   `thin` and `TreeBorrowsMemory` thin pointer `thinTB` directly to Anneal's `p : ProvenancePtr`
+   via `ctx.ptrTargets` (`ctxWithBorrows body ctx mem.borrows`), proving that `UnOp.ptrMetadata`,
+   `CastKind.ptrToPtr` (wide-to-thin and wide-to-wide), `AggregateKind.rawPtr`, `checkPtr`, and
+   the `to_raw_parts` $\rightarrow$ `from_raw_parts` round-trip preserve the relational invariant
+   between `p`, `thin`, and `thinTB`.
+2. **`Translate.translateStatement` / `translateRvalue` / `translatePlace` Grounding**: proves that
+   every standard statement of the witness bodies (`wideRawPartsMir`, `wideSliceIdxReadWriteMir`,
+   `wideSliceIdxOobMir`, `wideSliceDisabledDerefUbMir`, `wideSliceMetadataAfterParentWriteMir`)
+   is produced directly by `Translate.translateStatement` (`translateRvalue` / `translatePlace`),
+   and characterizes the exact 4 wide-slice constructs (`(*s)[i]`, `AggregateKind.rawPtr`,
+   `UnOp.ptrMetadata`, `Rvalue.len (*s)`) on which `Translate.lean` returns `none` and which the
+   witness functions lower via `PlaceExpr.Index (PlaceExpr.Deref ... (.Slice _))` and
+   `PtrType.as_wide_pair` (`mrWidePairTupleTy`). -/
+
+/-- Relation tying an Anneal `ProvenancePtr` `p` to its MiniRust `BasicMemory` thin pointer
+`thin` and `TreeBorrowsMemory` thin pointer `thinTB` under `ctx`:
+- `ctx.ptrTargets p.allocId = some (baseAddr, prov)` maps `p.allocId` to its MiniRust target base
+  address `baseAddr` and provenance `prov`,
+- `thin.addr = thinTB.addr = baseAddr + p.offsetBytes < scalarModulus 8` (`2^64`),
+- `thin.provenance = prov`, and
+- `thinTB.provenance` pairs the same MiniRust `AllocId` with Tree Borrows path `[(p.tag : Int)]`. -/
+def WideSliceThinPtrRel (ctx : Ctx) (p : ProvenancePtr) (thin : Ptr)
+    (thinTB : ThinPointer TreeBorrowsProvenance) : Prop :=
+  ∃ (baseAddr : Nat) (prov : Option Prov),
+    ctx.ptrTargets p.allocId = some (baseAddr, prov) ∧
+    baseAddr + p.offsetBytes < scalarModulus 8 ∧
+    thin = { addr := ((baseAddr + p.offsetBytes : Nat) : Int), provenance := prov } ∧
+    thinTB =
+      { addr := ((baseAddr + p.offsetBytes : Nat) : Int)
+        provenance := prov.map (fun (aid, _) => (aid, [(p.tag : Int)])) }
+
+/-- Constructing `WideSliceThinPtrRel` from an active/frozen stack borrow `e` in `mem.borrows`
+under `ctxWithBorrows body ctx borrows`: `p.allocId` resolves through `lookupBorrow borrows p.tag`
+and `ptrTargetSpec` to `baseAddr = (ctx.addrs.getD e.targetLocal 0 + relOff).toNat` and
+`prov = some (⟨ctx.base.length + e.targetLocal⟩, ())`. -/
+theorem WideSliceThinPtrRel.of_ctxWithBorrows
+    (body : CapturedMir) (ctx : Ctx) (borrows : List BorrowEntry)
+    (p : ProvenancePtr) (e : BorrowEntry) (it : Gen.IntType) (relOff : Nat)
+    (hlookup : lookupBorrow borrows p.tag = some e)
+    (htspec : ptrTargetSpec body.layouts body.localDecls ⟨e.targetLocal, e.targetProjection⟩ =
+      some (it, relOff))
+    (haddr : (ctx.addrs.getD e.targetLocal 0 + (relOff : Int)).toNat + p.offsetBytes <
+      scalarModulus 8) :
+    let baseAddr := (ctx.addrs.getD e.targetLocal 0 + (relOff : Int)).toNat
+    let aid : Gen.AllocId := ⟨((ctx.base.length + e.targetLocal : Nat) : Int)⟩
+    WideSliceThinPtrRel (ctxWithBorrows body ctx borrows) p
+      { addr := ((baseAddr + p.offsetBytes : Nat) : Int), provenance := some (aid, ()) }
+      { addr := ((baseAddr + p.offsetBytes : Nat) : Int)
+        provenance := some (aid, [(p.tag : Int)]) } := by
+  refine ⟨(ctx.addrs.getD e.targetLocal 0 + (relOff : Int)).toNat,
+    some (⟨((ctx.base.length + e.targetLocal : Nat) : Int)⟩, ()), ?_, haddr, rfl, rfl⟩
+  simp [ctxWithBorrows, borrowTargets, ProvenancePtr.tag] at hlookup ⊢
+  simp [hlookup, htspec]
+
+/-- Every `WideSliceThinPtrRel`-related MiniRust `thin` pointer has an in-bounds unsigned 64-bit
+address (`inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true`). -/
+theorem WideSliceThinPtrRel.inBounds_addr {ctx : Ctx} {p : ProvenancePtr}
+    {thin : Ptr} {thinTB : ThinPointer TreeBorrowsProvenance}
+    (hrel : WideSliceThinPtrRel ctx p thin thinTB) :
+    inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true := by
+  rcases hrel with ⟨baseAddr, prov, _, hlt, rfl, _⟩
+  have hMod : (2 : Int) ^ (8 * x86_64.PTR_SIZE.bytes) = ((scalarModulus 8 : Nat) : Int) := by
+    decide
+  unfold inBounds Size.bits
+  rw [hMod]
+  have h1 : decide ((0 : Int) ≤ ((baseAddr + p.offsetBytes : Nat) : Int)) = true :=
+    decide_eq_true (Int.natCast_nonneg _)
+  have h2 : decide (((baseAddr + p.offsetBytes : Nat) : Int) < ((scalarModulus 8 : Nat) : Int)) =
+      true :=
+    decide_eq_true (by omega)
+  rw [h1, h2, Bool.true_and]
+
+/-- Value-level correspondence between Anneal wide-slice `Value`s and MiniRust `BasicMemory`
+(`Val`) / `TreeBorrowsMemory` (`Gen.Value TBM`) wide pointer values under `ctx`:
+- `provenance`: relates `annealWidePtrVal p len 8` to `mrWidePtrVal thin (Int.ofNat len)` and
+  `mrWidePtrValM thinTB (Int.ofNat len)` when `WideSliceThinPtrRel ctx p thin thinTB` and
+  `len < scalarModulus 8`.
+- `scalarAddr`: relates provenance-free `annealWideScalarPtrVal addr len 8` to
+  `mrWidePtrVal { addr := (addr : Int), provenance := none } (Int.ofNat len)` and
+  `mrWidePtrValM { addr := (addr : Int), provenance := none } (Int.ofNat len)` when
+  `addr < scalarModulus 8` and `len < scalarModulus 8`. -/
+inductive WideSliceValRel (ctx : Ctx) : MirSemantics.Value → Val → Gen.Value TBM → Prop where
+  | provenance {p : ProvenancePtr} {len : Nat} {thin : Ptr}
+      {thinTB : ThinPointer TreeBorrowsProvenance}
+      (hptr : WideSliceThinPtrRel ctx p thin thinTB)
+      (hlen : len < scalarModulus 8) :
+      WideSliceValRel ctx
+        (annealWidePtrVal p len 8)
+        (mrWidePtrVal thin (Int.ofNat len))
+        (mrWidePtrValM thinTB (Int.ofNat len))
+  | scalarAddr {addr len : Nat}
+      (haddr : addr < scalarModulus 8)
+      (hlen : len < scalarModulus 8) :
+      WideSliceValRel ctx
+        (annealWideScalarPtrVal addr len 8)
+        (mrWidePtrVal { addr := (addr : Int), provenance := none } (Int.ofNat len))
+        (mrWidePtrValM { addr := (addr : Int), provenance := none } (Int.ofNat len))
+
+/-- Every `WideSliceValRel`-related MiniRust wide pointer passes `checkPtr ... (.Raw .ElementCount)`. -/
+theorem WideSliceValRel.checkPtr_rawSlice_ok {ctx : Ctx}
+    {v : MirSemantics.Value} {mrVal : Val} {mrValTB : Gen.Value TBM}
+    (hrel : WideSliceValRel ctx v mrVal mrValTB) (m : Option Mach) :
+    ∃ widePtr,
+      mrVal = .Ptr widePtr ∧
+      checkPtr widePtr (.Raw .ElementCount) m = .ok () := by
+  cases hrel with
+  | provenance hptr hlen =>
+      exact ⟨_, rfl, MiniRustSpec.Correspondence.WideSliceDst.checkPtr_rawSlice_ok
+        _ _ m hptr.inBounds_addr hlen⟩
+  | @scalarAddr addr len haddr hlen =>
+      have hin : inBounds (addr : Int) .Unsigned x86_64.PTR_SIZE = true := by
+        have hMod : (2 : Int) ^ (8 * x86_64.PTR_SIZE.bytes) = ((scalarModulus 8 : Nat) : Int) := by
+          decide
+        unfold inBounds Size.bits
+        rw [hMod]
+        have h1 : decide ((0 : Int) ≤ (addr : Int)) = true :=
+          decide_eq_true (Int.natCast_nonneg _)
+        have h2 : decide ((addr : Int) < ((scalarModulus 8 : Nat) : Int)) = true :=
+          decide_eq_true (by omega)
+        rw [h1, h2, Bool.true_and]
+      exact ⟨_, rfl, MiniRustSpec.Correspondence.WideSliceDst.checkPtr_rawSlice_ok
+        { addr := (addr : Int), provenance := none } len m hin hlen⟩
+
+/-- **Relational `UnOp.ptrMetadata` lockstep (`ptrMetadata_wideSliceValRel_lockstep`)**:
+For any `WideSliceValRel ctx v mrVal mrValTB` (covering both provenance-carrying and
+provenance-free wide pointers), Anneal's `evalRvalue locals (.unaryOp .ptrMetadata op)` and
+MiniRust's `PointerMetaKind.encode_as_value .ElementCount` extract the exact same `len < 2^64`. -/
+theorem ptrMetadata_wideSliceValRel_lockstep
+    {ctx : Ctx} {locals locals' : List LocalSlot} {op : Operand}
+    {mem : MirSemantics.Memory} {localDecls : List LocalDecl}
+    {v : MirSemantics.Value} {mrVal : Val} {mrValTB : Gen.Value TBM}
+    (hNonWide : isNonWidePtrAggregateTy (operandTy localDecls emptyLayoutTable op) = false)
+    (hOp : evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok v locals')
+    (hrel : WideSliceValRel ctx v mrVal mrValTB) :
+    ∃ (len : Nat) (widePtr : Pointer Prov),
+      len < scalarModulus 8 ∧
+      mrVal = .Ptr widePtr ∧
+      evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls emptyLayoutTable =
+        .ok (.scalar ⟨len, 8⟩) locals' mem ∧
+      PointerMetaKind.encode_as_value .ElementCount widePtr.metadata =
+        .ok (.Int (Int.ofNat len)) := by
+  cases hrel with
+  | @provenance p len thin thinTB hptr hlen =>
+      refine ⟨len, _, hlen, rfl, ?_, rfl⟩
+      show evalUnaryPtrMetadata locals op mem localDecls emptyLayoutTable = _
+      unfold evalUnaryPtrMetadata
+      simp only [hOp, annealWidePtrVal, layoutPointerBytes, emptyLayoutTable, Nat.beq_refl,
+        Bool.and_self]
+  | @scalarAddr addr len haddr hlen =>
+      have hWrap : wrapScalarBits len (scalarModulus 8) = len := by
+        unfold wrapScalarBits
+        rw [nat_ble_eq_false_of_lt hlen]
+      refine ⟨len, _, hlen, rfl, ?_, rfl⟩
+      show evalUnaryPtrMetadata locals op mem localDecls emptyLayoutTable = _
+      unfold evalUnaryPtrMetadata
+      simp only [hOp, annealWideScalarPtrVal, hNonWide, layoutPointerBytes, emptyLayoutTable,
+        Nat.beq_refl, Bool.and_self, hWrap]
+
+/-- **Relational `to_raw_parts` $\leftrightarrow$ `from_raw_parts` lockstep
+(`ptrToPtr_wideSliceValRel_and_to_from_raw_parts_roundtrip`)**:
+Given `WideSliceThinPtrRel ctx p thin thinTB` and `len < scalarModulus 8`:
+1. `AggregateKind.rawPtr` from `(.ptr p 8, .scalar ⟨len, 8⟩)` produces a triple satisfying
+   `WideSliceValRel ctx (annealWidePtrVal p len 8) (mrWidePtrVal thin (Int.ofNat len))
+   (mrWidePtrValM thinTB (Int.ofNat len))`;
+2. Wide-to-wide `CastKind.ptrToPtr` preserves `WideSliceValRel ctx`;
+3. Wide-to-thin `CastKind.ptrToPtr` (in Anneal) and `evalUnOp .GetThinPointer` /
+   `evalUnOpM .GetThinPointer` (in `Mach` / `MachTB`) produce `.ptr p 8`,
+   `ThinPointer.widen thin none`, and `ThinPointer.widen thinTB none` preserving
+   `WideSliceThinPtrRel ctx p thin thinTB`;
+4. Decomposing via `to_raw_parts` and reassembling via `AggregateKind.rawPtr` recovers the
+   original `WideSliceValRel`-related wide pointer triple across Anneal, `Mach`, and `MachTB`! -/
+theorem ptrToPtr_wideSliceValRel_and_to_from_raw_parts_roundtrip
+    {ctx : Ctx} (locals locals₁ locals₂ : List LocalSlot)
+    (wideOp dataOp metaOp : Operand) (thinTargetTy wideTargetTy pointeeTy : Ty)
+    (mutability : MirAst.Mutability) (mem : MirSemantics.Memory) (localDecls : List LocalDecl)
+    (p : ProvenancePtr) (len : Nat) (thin : Ptr)
+    (thinTB : ThinPointer TreeBorrowsProvenance) (ptrTy : PtrType)
+    (hptr : WideSliceThinPtrRel ctx p thin thinTB)
+    (hlen : len < scalarModulus 8)
+    (hThin : isThinRawPtrTy thinTargetTy = true)
+    (hNotThin : isThinRawPtrTy wideTargetTy = false)
+    (hWide : wideRawPtrIsDyn? wideTargetTy = some false)
+    (hWideAgg : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hWideOp : evalOperand locals wideOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals₁)
+    (hData : evalOperand locals₁ dataOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (.ptr p 8) locals₁)
+    (hMeta : evalOperand locals₁ metaOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (.scalar ⟨len, 8⟩) locals₂) :
+    WideSliceValRel ctx
+      (annealWidePtrVal p len 8)
+      (mrWidePtrVal thin (Int.ofNat len))
+      (mrWidePtrValM thinTB (Int.ofNat len)) ∧
+    ((lookupBorrow mem.borrows p.tag = none →
+        evalRvalue locals (.cast .ptrToPtr wideOp thinTargetTy) mem localDecls emptyLayoutTable =
+          .ok (.ptr p 8) locals₁ mem ∧
+        WideSliceThinPtrRel ctx p thin thinTB) ∧
+     evalUnOp .GetThinPointer (mrWidePtrVal thin (Int.ofNat len), .Ptr ptrTy) =
+       .ok (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None)) ∧
+     evalUnOpM (M := TBM) .GetThinPointer (mrWidePtrValM thinTB (Int.ofNat len), .Ptr ptrTy) =
+       .ok (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None))) ∧
+    evalRvalue locals (.cast .ptrToPtr wideOp wideTargetTy) mem localDecls emptyLayoutTable =
+      .ok (annealWidePtrVal p len 8) locals₁ mem ∧
+    evalRvalue locals (.unaryOp .ptrMetadata wideOp) mem localDecls emptyLayoutTable =
+      .ok (.scalar ⟨len, 8⟩) locals₁ mem ∧
+    evalRvalue locals₁ (.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]) mem localDecls
+        emptyLayoutTable =
+      .ok (annealWidePtrVal p len 8) locals₂ mem := by
+  have hcast := ptrToPtr_wide_to_thin_and_wide_to_wide_lockstep
+    locals locals₁ wideOp thinTargetTy wideTargetTy mem localDecls p len thin thinTB ptrTy
+    hThin hNotThin hWide hWideOp
+  have hagg := aggregate_rawPtr_and_to_raw_parts_roundtrip_lockstep
+    locals₁ locals₁ locals₂ pointeeTy mutability dataOp metaOp mem localDecls p len thin thinTB
+    hWideAgg hData hMeta
+  refine ⟨.provenance hptr hlen, ⟨fun hnb => ⟨hcast.1.1 hnb, hptr⟩, rfl, rfl⟩,
+    hcast.2, ?_, hagg.1⟩
+  show evalUnaryPtrMetadata locals wideOp mem localDecls emptyLayoutTable = _
+  unfold evalUnaryPtrMetadata
+  simp only [hWideOp, annealWidePtrVal, layoutPointerBytes, emptyLayoutTable, Nat.beq_refl,
+    Bool.and_self]
+
+/-- **Boundary theorem (`translatePlace_and_translateRvalue_wideSlice_boundary`)**:
+`Translate.translatePlace` and `Translate.translateRvalue` return `none` on the 4 wide-slice
+constructs outside the thin-pointer fragment:
+1. Dereference-index `(*_s)[_i]` (`⟨s, [.deref, .index i]⟩`) on a wide slice pointer local `_s`,
+2. `Rvalue.aggregate (.rawPtr pointeeTy mutbl) [dataOp, metaOp]`,
+3. `Rvalue.unaryOp .ptrMetadata op`, and
+4. `Rvalue.len (*_s)` (`⟨s, [.deref]⟩`). -/
+theorem translatePlace_and_translateRvalue_wideSlice_boundary :
+    let decls := wideRawPartsMir.localDecls
+    translatePlace decls { local_ := 8, projection := [.deref, .index 9] } = none ∧
+    translateRvalue emptyLayoutTable decls (some rawMutSliceU32Ty)
+      (.aggregate (.rawPtr sliceU32PointeeTy .mut) [.copy (local_ 3), constUsize 4]) = none ∧
+    translateRvalue emptyLayoutTable decls (some usizeMirTy)
+      (.unaryOp .ptrMetadata (.copy (local_ 5))) = none ∧
+    translateRvalue emptyLayoutTable decls (some usizeMirTy)
+      (.len (derefPlace 4)) = none :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- **`Translate.translateStatement` grounding for the wide-slice witness bodies
+(`wideSliceWitnesses_translateStatement_correspondence`)**:
+Every non-wide-lowering statement of `wideRawPartsMir` and `wideSliceIdxReadWriteMir` — including
+array aggregate initialization, wide-to-wide `CastKind.ptrToPtr` (`_4 as *const [u32]` $\mapsto$
+`.Load (.Local (localName 4))`), wide-to-thin `CastKind.ptrToPtr` (`_5 as *const ()` $\mapsto$
+`.UnOp .GetThinPointer (.Load (.Local (localName 5)))`), `usize` index initialization, `IntToInt`
+casts, and `BinOp.Add` — is produced directly by `Translate.translateStatement`! -/
+theorem wideSliceWitnesses_translateStatement_correspondence :
+    let d1 := wideRawPartsMir.localDecls
+    let d2 := wideSliceIdxReadWriteMir.localDecls
+    -- (1) Array aggregate initialization `[local_ 1, 20, 30, 40]`
+    translateStatement d1
+      (mkStmt (.assign (local_ 2)
+        (.aggregate (.array u32Ty) [.copy (local_ 1), constU32 20, constU32 30, constU32 40])))
+      emptyLayoutTable =
+      some (.Assign (.Local (localName 2))
+        (.Tuple [.Load (.Local (localName 1)), .Constant (.Int 20) (.Int u32),
+                 .Constant (.Int 30) (.Int u32), .Constant (.Int 40) (.Int u32)]
+          (.Array (.Int u32) 4))) ∧
+    -- (2) Wide-to-wide `CastKind.ptrToPtr` (`*mut [u32] as *const [u32]`)
+    translateStatement d1
+      (mkStmt (.assign (local_ 5) (.cast .ptrToPtr (.copy (local_ 4)) rawConstSliceU32Ty)))
+      emptyLayoutTable =
+      some (.Assign (.Local (localName 5)) (.Load (.Local (localName 4)))) ∧
+    -- (3) Wide-to-thin `CastKind.ptrToPtr` (`*const [u32] as *const ()`)
+    translateStatement d1
+      (mkStmt (.assign (local_ 6) (.cast .ptrToPtr (.copy (local_ 5)) rawConstUnitTy)))
+      emptyLayoutTable =
+      some (.Assign (.Local (localName 6)) (.UnOp .GetThinPointer (.Load (.Local (localName 5))))) ∧
+    -- (4) Index constant, `IntToInt` cast, and `BinOp.Add` in `wideRawPartsMir`
+    translateStatement d1 (mkStmt (.assign (local_ 9) (.use (constUsize 0)))) emptyLayoutTable =
+      some (.Assign (.Local (localName 9)) (.Constant (.Int 0) (.Int IntType.usize_ty))) ∧
+    translateStatement d1
+      (mkStmt (.assign (local_ 11) (.cast .intToInt (.copy (local_ 7)) u32Ty))) emptyLayoutTable =
+      some (.Assign (.Local (localName 11))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 7))))) ∧
+    translateStatement d1
+      (mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 10)) (.copy (local_ 11)))))
+      emptyLayoutTable =
+      some (.Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 10))) (.Load (.Local (localName 11))))) ∧
+    -- (5) Array init, index constants, `IntToInt` cast, and `BinOp.Add` in `wideSliceIdxReadWriteMir`
+    translateStatement d2 (mkStmt (.assign (local_ 5) (.use (constUsize 2)))) emptyLayoutTable =
+      some (.Assign (.Local (localName 5)) (.Constant (.Int 2) (.Int IntType.usize_ty))) ∧
+    translateStatement d2 (mkStmt (.assign (local_ 6) (.use (constUsize 1)))) emptyLayoutTable =
+      some (.Assign (.Local (localName 6)) (.Constant (.Int 1) (.Int IntType.usize_ty))) ∧
+    translateStatement d2
+      (mkStmt (.assign (local_ 10) (.cast .intToInt (.copy (local_ 9)) u32Ty))) emptyLayoutTable =
+      some (.Assign (.Local (localName 10))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 9))))) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end MiniRustSpec.Correspondence.WideSliceDst
