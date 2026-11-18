@@ -689,7 +689,13 @@ def writeReturnDestination
     | false =>
       let rootOpt : Option Value :=
         match get? callerLocals dst.local_ with
-        | .some (.init rootVal) => .some (ensureNestedFieldShells rootVal (proj :: rest))
+        | .some (.init rootVal) =>
+          ensureNestedFieldShells
+            rootVal
+            (proj :: rest)
+            localDecls
+            layouts
+            (placeTy localDecls layouts { local_ := dst.local_, projection := .nil })
         | .some .uninit => uninitFieldWriteShell? localDecls layouts dst.local_ proj rest
         | _ => .none
       match rootOpt with
@@ -3955,6 +3961,7 @@ def evalTerminator
       match currentBody with
       | .some b => b.layouts
       | .none => emptyLayoutTable
+    let depth := length s.memory.callStack
     match get? s.frame.locals place.local_ with
     | .none => MirStepNode.fail .ub
     | .some .dead => MirStepNode.fail .ub
@@ -3963,12 +3970,45 @@ def evalTerminator
       | .nil =>
         match set? s.frame.locals place.local_ .uninit with
         | .some locals' =>
-          MirStepNode.step {
-            s with
-            frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
-          }
+          match s.memory.activeProtectors with
+          | .nil =>
+            let borrows' :=
+              invalidateConflictingBorrows s.memory.borrows place.local_ .none depth
+            MirStepNode.step {
+              s with
+              frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
+              memory := { s.memory with borrows := borrows' }
+            }
+          | protHead :: protTail =>
+            match
+              hasProtectedWriteConflict
+                s.memory.borrows
+                (protHead :: protTail)
+                place.local_
+                .none
+                .nil
+                0
+                0
+                depth
+            with
+            | true => MirStepNode.fail .ub
+            | false =>
+              let borrows' :=
+                invalidateConflictingBorrows s.memory.borrows place.local_ .none depth
+              MirStepNode.step {
+                s with
+                frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
+                memory := { s.memory with borrows := borrows' }
+              }
         | .none => MirStepNode.fail .ub
       | proj :: rest =>
+        let resolvedLocalProj :=
+          resolveBorrowWriteLocalProj
+            bodyLocalDecls
+            bodyLayouts
+            s.frame.locals
+            place.local_
+            (proj :: rest)
         match slot with
         | .init rootVal =>
           match
@@ -3983,20 +4023,107 @@ def evalTerminator
           | .ok rootVal' =>
             match set? s.frame.locals place.local_ (.init rootVal') with
             | .some locals' =>
-              MirStepNode.step {
-                s with
-                frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
-              }
+              match s.memory.activeProtectors with
+              | .nil =>
+                let borrows' :=
+                  invalidateConflictingBorrowsAtProj
+                    s.memory.borrows
+                    place.local_
+                    .none
+                    resolvedLocalProj
+                    0
+                    0
+                    depth
+                MirStepNode.step {
+                  s with
+                  frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
+                  memory := { s.memory with borrows := borrows' }
+                }
+              | protHead :: protTail =>
+                match
+                  hasProtectedWriteConflict
+                    s.memory.borrows
+                    (protHead :: protTail)
+                    place.local_
+                    .none
+                    resolvedLocalProj
+                    0
+                    0
+                    depth
+                with
+                | true => MirStepNode.fail .ub
+                | false =>
+                  let borrows' :=
+                    invalidateConflictingBorrowsAtProj
+                      s.memory.borrows
+                      place.local_
+                      .none
+                      resolvedLocalProj
+                      0
+                      0
+                      depth
+                  MirStepNode.step {
+                    s with
+                    frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
+                    memory := { s.memory with borrows := borrows' }
+                  }
             | .none => MirStepNode.fail .ub
           | .ub => MirStepNode.fail .ub
           | .unsupported => MirStepNode.unsupported
         | .uninit =>
-          match deinitTailOk s.frame.locals (proj :: rest) with
+          match
+            deinitTailOk
+              s.frame.locals
+              bodyLocalDecls
+              bodyLayouts
+              (placeTy bodyLocalDecls bodyLayouts { local_ := place.local_, projection := .nil })
+              (proj :: rest)
+          with
           | true =>
-            MirStepNode.step {
-              s with
-              frame := { s.frame with blockIdx := target, stmtIdx := 0 }
-            }
+            match s.memory.activeProtectors with
+            | .nil =>
+              let borrows' :=
+                invalidateConflictingBorrowsAtProj
+                  s.memory.borrows
+                  place.local_
+                  .none
+                  resolvedLocalProj
+                  0
+                  0
+                  depth
+              MirStepNode.step {
+                s with
+                frame := { s.frame with blockIdx := target, stmtIdx := 0 }
+                memory := { s.memory with borrows := borrows' }
+              }
+            | protHead :: protTail =>
+              match
+                hasProtectedWriteConflict
+                  s.memory.borrows
+                  (protHead :: protTail)
+                  place.local_
+                  .none
+                  resolvedLocalProj
+                  0
+                  0
+                  depth
+              with
+              | true => MirStepNode.fail .ub
+              | false =>
+                let borrows' :=
+                  invalidateConflictingBorrowsAtProj
+                    s.memory.borrows
+                    place.local_
+                    .none
+                    resolvedLocalProj
+                    0
+                    0
+                    depth
+                MirStepNode.step {
+                  s with
+                  frame := { s.frame with blockIdx := target, stmtIdx := 0 }
+                  memory := { s.memory with borrows := borrows' }
+                }
           | false =>
             match projectionHasDeref (proj :: rest) with
             | true => MirStepNode.unsupported

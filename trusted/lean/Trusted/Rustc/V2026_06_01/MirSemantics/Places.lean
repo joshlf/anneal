@@ -2606,211 +2606,6 @@ def projListHasDeref : List ProjectionElem → Bool
   | _ :: rest => projListHasDeref rest
 
 /--
-Validate a projection suffix `proj` below an already-uninitialized value or
-local slot during `StatementKind.deinit` or `TerminatorKind.drop`:
-- `.nil`, `.field`, `.downcast` immediately followed by `.field`, `.opaqueCast`,
-  and `.unwrapUnsafeBinder` are well-formed when their tail is;
-- `.index i` requires local `i` to hold an initialized scalar index (`get? locals i`);
-- `.constantIndex offset minLen fromEnd` requires static bounds against `minLen`;
-- `.subslice fromIdx toIdx fromEnd` requires `fromEnd = true` or `fromIdx ≤ toIdx`;
-- `.deref` or a `.downcast` not followed by `.field` is rejected (`false`).
-
-Modeling note (`agent_docs/trusted-rust.md`): `StatementKind.deinit` in `MirAst`
-and post-drop-elaboration `TerminatorKind.drop` write uninitialized state to a
-projected MIR place without reading the old leaf value, while still validating
-place projections (such as `Index` scalar operands and active enum variants).
-Whereas `rustc` `14210df0e` removed `StatementKind::Deinit` from `mir/syntax.rs`,
-`MirAst` retains `StatementKind.deinit` alongside `TerminatorKind.drop`
-(`syntax.rs#L742-L788`) and `Operand.move` (`syntax.rs#L1316-L1327`).
-
-Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
-
-> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
->
-> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
-
-Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
-
-> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
->   place and create a place referring to one of the fields of the type."
--/
-@[reducible]
-def deinitTailOk (locals : List LocalSlot) : List ProjectionElem → Bool
-  | .nil => true
-  | .field _ _ :: rest => deinitTailOk locals rest
-  | .downcast _ _ :: .field _ _ :: rest => deinitTailOk locals rest
-  | .index i :: rest =>
-    match get? locals i with
-    | .some (.init (.scalar _)) => deinitTailOk locals rest
-    | _ => false
-  | .constantIndex offset minLen fromEnd :: rest =>
-    let ok :=
-      match fromEnd with
-      | true => Bool.and (Nat.ble 1 offset) (Nat.ble offset minLen)
-      | false => Nat.blt offset minLen
-    Bool.and ok (deinitTailOk locals rest)
-  | .subslice fromIdx toIdx fromEnd :: rest =>
-    Bool.and (Bool.or fromEnd (Nat.ble fromIdx toIdx)) (deinitTailOk locals rest)
-  | .opaqueCast _ :: rest => deinitTailOk locals rest
-  | .unwrapUnsafeBinder _ :: rest => deinitTailOk locals rest
-  | _ :: _ => false
-
-/--
-Deinitialize the sub-value at projection chain `proj` inside `val`, replacing
-the target sub-place with `Value.uninit`:
-- At `.nil`, returns `.ok .uninit`.
-- Below an already-`.uninit` sub-value, validates the remaining projection tail
-  via `deinitTailOk locals`, returning `.ok .uninit` when valid, `.unsupported`
-  if the tail contains `.deref`, and `.ub` otherwise.
-- On `.aggregate 0 fields` with `.field idx _ :: rest`, or `.aggregate actualVariant fields`
-  with `.downcast _ variantIdx :: .field idx _ :: rest` when `actualVariant == variantIdx`,
-  recurses into `fields[idx]` and updates that slot in place.
-- On `.aggregate 0 fields` with `.index`, `.constantIndex`, or `.subslice`,
-  validates index/subslice bounds and deinitializes the selected element(s).
-
-Modeling note (`agent_docs/trusted-rust.md`): `StatementKind.deinit` in `MirAst`
-and post-drop-elaboration `TerminatorKind.drop` write uninitialized state to a
-projected MIR place without reading the old leaf value, while still validating
-place projections (such as `Index` scalar operands and active enum variants).
-Whereas `rustc` `14210df0e` removed `StatementKind::Deinit` from `mir/syntax.rs`,
-`MirAst` retains `StatementKind.deinit` alongside `TerminatorKind.drop`
-(`syntax.rs#L742-L788`) and `Operand.move` (`syntax.rs#L1316-L1327`).
-
-Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
-
-> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
->
-> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
-
-Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
-
-> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
->   place and create a place referring to one of the fields of the type."
--/
-def deinitProjectedValue
-    (locals : List LocalSlot) :
-    Value → List ProjectionElem → ProjWriteResult
-  | _, .nil => .ok .uninit
-  | .uninit, proj :: rest =>
-    match deinitTailOk locals (proj :: rest) with
-    | true => .ok .uninit
-    | false =>
-      match projListHasDeref (proj :: rest) with
-      | true => .unsupported
-      | false => .ub
-  | .aggregate .zero fields, .field idx _ :: rest =>
-    match get? fields idx with
-    | .some oldFieldVal =>
-      match deinitProjectedValue locals oldFieldVal rest with
-      | .ok updatedFieldVal =>
-        match set? fields idx updatedFieldVal with
-        | .some fields' => .ok (.aggregate 0 fields')
-        | .none => .ub
-      | .ub => .ub
-      | .unsupported => .unsupported
-    | .none => .ub
-  | .scalar sc, .field .zero _ :: rest =>
-    deinitProjectedValue locals (.scalar sc) rest
-  | .ptr p sz, .field .zero _ :: rest =>
-    deinitProjectedValue locals (.ptr p sz) rest
-  | .unit, .field .zero _ :: rest =>
-    deinitProjectedValue locals .unit rest
-  | _, .field _ _ :: _ => .ub
-  | .aggregate actualVariant fields,
-    .downcast _ variantIdx :: .field idx _ :: rest =>
-    match Nat.beq actualVariant variantIdx with
-    | true =>
-      match get? fields idx with
-      | .some oldFieldVal =>
-        match deinitProjectedValue locals oldFieldVal rest with
-        | .ok updatedFieldVal =>
-          match set? fields idx updatedFieldVal with
-          | .some fields' => .ok (.aggregate actualVariant fields')
-          | .none => .ub
-        | .ub => .ub
-        | .unsupported => .unsupported
-      | .none => .ub
-    | false => .ub
-  | _, .downcast _ _ :: rest =>
-    match projListHasDeref rest with
-    | true => .unsupported
-    | false => .ub
-  | .aggregate 0 fields, .index idxLocal :: rest =>
-    match get? locals idxLocal with
-    | .some (.init (.scalar sc)) =>
-      match get? fields sc.bits with
-      | .some oldElemVal =>
-        match deinitProjectedValue locals oldElemVal rest with
-        | .ok updatedElemVal =>
-          match set? fields sc.bits updatedElemVal with
-          | .some fields' => .ok (.aggregate 0 fields')
-          | .none => .ub
-        | .ub => .ub
-        | .unsupported => .unsupported
-      | .none => .ub
-    | _ => .ub
-  | _, .index _ :: rest =>
-    match projListHasDeref rest with
-    | true => .unsupported
-    | false => .ub
-  | .aggregate 0 fields,
-    .constantIndex offset minLen fromEnd :: rest =>
-    let len := length fields
-    let fromEndOk :=
-      match fromEnd with
-      | false => true
-      | true => Bool.and (Nat.ble 1 offset) (Nat.ble offset len)
-    match Bool.and (Nat.ble minLen len) fromEndOk with
-    | true =>
-      let idx :=
-        match fromEnd with
-        | true => Nat.sub len offset
-        | false => offset
-      match get? fields idx with
-      | .some oldElemVal =>
-        match deinitProjectedValue locals oldElemVal rest with
-        | .ok updatedElemVal =>
-          match set? fields idx updatedElemVal with
-          | .some fields' => .ok (.aggregate 0 fields')
-          | .none => .ub
-        | .ub => .ub
-        | .unsupported => .unsupported
-      | .none => .ub
-    | false => .ub
-  | _, .constantIndex _ _ _ :: rest =>
-    match projListHasDeref rest with
-    | true => .unsupported
-    | false => .ub
-  | .aggregate 0 fields,
-    .subslice fromIdx toIdx fromEnd :: rest =>
-    match extractSubslice fields fromIdx toIdx fromEnd with
-    | .some subElems =>
-      match deinitProjectedValue locals (.aggregate 0 subElems) rest with
-      | .ok (.aggregate 0 updatedSubElems) =>
-        match replaceSubslice fields fromIdx toIdx fromEnd updatedSubElems with
-        | .some fields' => .ok (.aggregate 0 fields')
-        | .none => .ub
-      | .ok _ => .ub
-      | .ub => .ub
-      | .unsupported => .unsupported
-    | .none => .ub
-  | _, .subslice _ _ _ :: rest =>
-    match projListHasDeref rest with
-    | true => .unsupported
-    | false => .ub
-  | val, .opaqueCast _ :: rest =>
-    deinitProjectedValue locals val rest
-  | val, .unwrapUnsafeBinder _ :: rest =>
-    deinitProjectedValue locals val rest
-  | _, _ :: _ => .unsupported
-
-/--
 Extract the element `RigidTy` of a slice or string constant type for
 `ConstValue.slice` decoding.
 -/
@@ -9524,12 +9319,653 @@ def writeProjectedForLocal
 abbrev writeProjectedValueForLocal := writeProjectedForLocal
 
 /--
+Resolve the child `Ty` reached by a `.field fieldIdx fieldTy` step from an
+already-resolved container type `rBase`, consulting `rBase`'s single-variant
+`TypeLayout.fieldLayouts` entry when `fieldTy.layoutIdx` is unresolved and
+otherwise delegating to `resolveTyWithLocalDecls`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
+
+> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
+>   place and create a place referring to one of the fields of the type."
+-/
+@[reducible]
+def resolveFieldStepTy
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (rBase : Ty)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty) :
+    Ty :=
+  match isUnresolvedLayoutIdx layouts fieldTy.layoutIdx with
+  | false => fieldTy
+  | true =>
+    match LayoutTable.lookup layouts rBase.layoutIdx with
+    | .some l =>
+      match l.variants with
+      | .single _ =>
+        match get? l.fieldLayouts fieldIdx with
+        | .some flIdx => { fieldTy with layoutIdx := flIdx }
+        | .none => resolveTyWithLocalDecls localDecls layouts fieldTy
+      | _ => resolveTyWithLocalDecls localDecls layouts fieldTy
+    | .none => resolveTyWithLocalDecls localDecls layouts fieldTy
+
+/--
+Resolve the element `Ty` reached by an `.index` or `.constantIndex` step from an
+already-resolved array container type `rBase` with element kind `elemKind`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
+
+> "- [`Index`](ProjectionElem::Index): `Index` projections take their parent
+>   place of array or slice type and select an element at an index given by a
+>   `Local`."
+-/
+@[reducible]
+def resolveArrayStepTy
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (rBase : Ty)
+    (elemKind : RigidTy) :
+    Ty :=
+  match LayoutTable.lookup layouts rBase.layoutIdx with
+  | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } =>
+    { kind := elemKind, layoutIdx := flIdx }
+  | _ =>
+    resolveTyWithLocalDecls
+      localDecls
+      layouts
+      { kind := elemKind, layoutIdx := synthKindLayoutIdx layouts elemKind }
+
+/--
+Compute the declared field count of a non-union single-variant aggregate type
+`ty` (`RigidTy.tuple`, single-variant struct `RigidTy.adt`, or `RigidTy.closure`):
+- For `RigidTy.tuple tys`, returns `.some (length tys)`.
+- For `RigidTy.adt` or `RigidTy.closure`, resolves `ty` via
+  `resolveTyWithLocalDecls` and looks up its `TypeLayout` in `layouts`: when
+  inhabited with `variants = .single 0` and `fields = .arbitrary offsets _`,
+  returns `.some (length offsets)` (or `.some 1` for a resolved non-zero-index
+  single-field `FieldsShape.primitive` transparent wrapper struct); otherwise
+  returns `.none` (failing closed when arity is unknown or `ty` is a union,
+  multi-variant enum, or uninhabited type).
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1643-L1679>
+
+> "/// Offsets for the first byte of each field,
+> /// ordered to match the source definition order.
+> /// This vector always goes in increasing order of `FieldIdx`
+> /// (i.e. `0..fields.len()`)"
+-/
+@[reducible]
+def nonUnionAggregateArity?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty) :
+    Option Nat :=
+  let rTy := resolveTyWithLocalDecls localDecls layouts ty
+  match rTy.kind with
+  | .tuple tys => .some (length tys)
+  | .adt _ _ =>
+    match LayoutTable.lookup layouts rTy.layoutIdx with
+    | .some l =>
+      match l.isUninhabited, l.variants, l.fields with
+      | false, .single 0, .arbitrary offsets _ => .some (length offsets)
+      | false, .single 0, .primitive =>
+        match Nat.beq rTy.layoutIdx 0 with
+        | false => .some 1
+        | true => .none
+      | _, _, _ => .none
+    | .none => .none
+  | .closure _ captureTys => .some (length captureTys)
+  | _ => .none
+
+/--
+Construct the initial aggregate shell for a `.field fieldIdx _` write into an
+uninitialized container of type `ty`:
+- When `ty` resolves to a union (`isUnionLayout layouts rTy = true`) with
+  `FieldsShape.union count` and `fieldIdx < count`, returns `.some (.aggregate 0 .nil)`
+  so union field writes preserve raw-byte overlay semantics.
+- When `ty` resolves to a non-union tuple or single-variant struct with known
+  arity `arity` (`nonUnionAggregateArity?`) and `fieldIdx < arity`, returns
+  `.some (.aggregate 0 (replicateValue arity .uninit))` with every field slot
+  `0 .. arity - 1` initialized to `Value.uninit`, ensuring whole-aggregate and
+  unwritten higher- or lower-index sibling reads fault with `.ub`.
+- Otherwise (out-of-bounds `fieldIdx`, non-aggregate `ty`, or non-union `.adt`
+  with unknown arity), returns `.none` (fail-closed).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+>
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
+-/
+@[reducible]
+def uninitContainerFieldShell?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty)
+    (fieldIdx : FieldIdx) :
+    Option Value :=
+  let rTy := resolveTyWithLocalDecls localDecls layouts ty
+  match isUnionLayout layouts rTy with
+  | true =>
+    match LayoutTable.lookup layouts rTy.layoutIdx with
+    | .some { fields := .union count, .. } =>
+      match Nat.blt fieldIdx count with
+      | true => .some (.aggregate 0 .nil)
+      | false => .none
+    | _ => .none
+  | false =>
+    match nonUnionAggregateArity? localDecls layouts rTy with
+    | .some arity =>
+      match Nat.blt fieldIdx arity with
+      | true => .some (.aggregate 0 (replicateValue arity .uninit))
+      | false => .none
+    | .none => .none
+
+/--
+Compute the declared payload field count for variant `variantIdx` of an ADT
+type `ty` from `layouts`:
+- For `VariantsShape.multiple _ _ variantShapes`, looks up `variantShapes[variantIdx]`
+  and returns `length offsets` for `FieldsShape.arbitrary offsets _` (or `0` for
+  `FieldsShape.primitive`).
+- For `VariantsShape.single expectedIdx` with `variantIdx == expectedIdx` and
+  `FieldsShape.arbitrary offsets _`, returns `length offsets`.
+- Returns `.none` when `ty` is uninhabited, `variantIdx` is out of range, or no
+  captured `TypeLayout` is available.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1937-L1959>
+
+> "Multiple {
+>     tag: Scalar,
+>     tag_encoding: TagEncoding<VariantIdx>,
+>     tag_field: FieldIdx,
+>     variants: IndexVec<VariantIdx, VariantLayout<FieldIdx>>,
+> },"
+-/
+@[reducible]
+def enumVariantPayloadArity?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty)
+    (variantIdx : VariantIdx) :
+    Option Nat :=
+  let rTy := resolveTyWithLocalDecls localDecls layouts ty
+  match rTy.kind with
+  | .adt _ _ =>
+    match LayoutTable.lookup layouts rTy.layoutIdx with
+    | .some l =>
+      match l.isUninhabited, l.variants with
+      | false, .multiple _ _ variantShapes =>
+        match get? variantShapes variantIdx with
+        | .some (.arbitrary offsets _) => .some (length offsets)
+        | .some .primitive => .some 0
+        | _ => .none
+      | false, .single expectedIdx =>
+        match Nat.beq variantIdx expectedIdx, l.fields with
+        | true, .arbitrary offsets _ => .some (length offsets)
+        | _, _ => .none
+      | _, _ => .none
+    | .none => .none
+  | _ => .none
+
+/--
+Pad an enum payload field list `fields` with trailing `Value.uninit` elements up
+to `arity` (`fields ++ replicateValue (arity - length fields) .uninit`), leaving
+`fields` unchanged when `arity ≤ length fields`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L357-L363>
+
+> "/// Write the discriminant for a variant to the enum Place.
+> ///
+> /// This is permitted for both coroutines and ADTs. This does not necessarily
+> /// write to the entire place; instead, it writes to the minimum set of bytes
+> /// as required by the layout for the type.
+> SetDiscriminant { place: Box<Place<'tcx>>, variant_index: VariantIdx },"
+-/
+@[reducible]
+def padFieldsToArity (fields : List Value) (arity : Nat) : List Value :=
+  let curLen := length fields
+  match Nat.blt curLen arity with
+  | true => appendValueList fields (replicateValue (Nat.sub arity curLen) .uninit)
+  | false => fields
+
+/--
+Validate a projection suffix `proj` below an already-uninitialized value or
+local slot of static type `curTyOpt` during `StatementKind.deinit` or
+`TerminatorKind.drop`:
+- `.nil` is always valid (`true`).
+- `.field idx fieldTy :: rest` requires `curTyOpt = .some curTy` whose container
+  type admits in-bounds field `idx` (`uninitContainerFieldShell?`), advancing to
+  `resolveFieldStepTy`.
+- `.downcast _ variantIdx :: .field idx fieldTy :: rest` requires `curTyOpt` to
+  be an ADT whose `variantIdx` has known payload arity `> idx`
+  (`enumVariantPayloadArity?`).
+- `.index i :: rest` requires `locals[i]` to hold an initialized scalar `sc` AND
+  `curTyOpt` to resolve to `RigidTy.array elemKind arrayLen` with
+  `sc.bits < arrayLen` (matching Miri's `project_index` bounds check; fails
+  closed when `curTyOpt` is `.none` or out of bounds).
+- `.constantIndex` and `.subslice` validate bounds against `RigidTy.array _ arrayLen`.
+- `.opaqueCast` and `.unwrapUnsafeBinder` require a known `curTyOpt` and advance
+  to their target `Ty`.
+- `.deref`, unfollowed `.downcast`, unknown `curTyOpt`, or out-of-bounds indices
+  return `false`.
+
+Modeling note (`agent_docs/trusted-rust.md`): `StatementKind.deinit` in `MirAst`
+and post-drop-elaboration `TerminatorKind.drop` write uninitialized state to a
+projected MIR place without reading the old leaf value, while still validating
+place projections (including `Index` bounds against static array lengths and
+field/variant indices). Whereas `rustc` `14210df0e` removed `StatementKind::Deinit`
+from `mir/syntax.rs`, `MirAst` retains `StatementKind.deinit` alongside
+`TerminatorKind.drop` (`syntax.rs#L742-L788`) and `Operand.move`
+(`syntax.rs#L1316-L1327`).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
+
+> "- [`Index`](ProjectionElem::Index): `Index` projections take their parent
+>   place of array or slice type and select an element at an index given by a
+>   `Local`."
+-/
+@[reducible]
+def deinitTailOk
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (curTyOpt : Option Ty := .none) :
+    List ProjectionElem → Bool
+  | .nil => true
+  | .opaqueCast castTy :: rest =>
+    match curTyOpt with
+    | .some _ =>
+      deinitTailOk
+        locals
+        localDecls
+        layouts
+        (.some (resolveTyWithLocalDecls localDecls layouts castTy))
+        rest
+    | .none => false
+  | .unwrapUnsafeBinder innerTy :: rest =>
+    match curTyOpt with
+    | .some _ =>
+      deinitTailOk
+        locals
+        localDecls
+        layouts
+        (.some (resolveTyWithLocalDecls localDecls layouts innerTy))
+        rest
+    | .none => false
+  | .field idx fieldTy :: rest =>
+    match curTyOpt with
+    | .none => false
+    | .some curTy =>
+      let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+      match uninitContainerFieldShell? localDecls layouts rTy idx with
+      | .some _ =>
+        deinitTailOk
+          locals
+          localDecls
+          layouts
+          (.some (resolveFieldStepTy localDecls layouts rTy idx fieldTy))
+          rest
+      | .none => false
+  | .downcast _ variantIdx :: .field idx fieldTy :: rest =>
+    match curTyOpt with
+    | .none => false
+    | .some curTy =>
+      let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+      match enumVariantPayloadArity? localDecls layouts rTy variantIdx with
+      | .some arity =>
+        match Nat.blt idx arity with
+        | true =>
+          deinitTailOk
+            locals
+            localDecls
+            layouts
+            (.some (resolveTyWithLocalDecls localDecls layouts fieldTy))
+            rest
+        | false => false
+      | .none => false
+  | .index i :: rest =>
+    match get? locals i, curTyOpt with
+    | .some (.init (.scalar sc)), .some curTy =>
+      let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+      match rTy.kind with
+      | .array elemKind arrayLen =>
+        match Nat.blt sc.bits arrayLen with
+        | true =>
+          deinitTailOk
+            locals
+            localDecls
+            layouts
+            (.some (resolveArrayStepTy localDecls layouts rTy elemKind))
+            rest
+        | false => false
+      | _ => false
+    | _, _ => false
+  | .constantIndex offset minLen fromEnd :: rest =>
+    match curTyOpt with
+    | .some curTy =>
+      let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+      match rTy.kind with
+      | .array elemKind arrayLen =>
+        let minOk := Nat.ble minLen arrayLen
+        let idxOk :=
+          match fromEnd with
+          | true => Bool.and (Nat.ble 1 offset) (Nat.ble offset minLen)
+          | false => Nat.blt offset minLen
+        match Bool.and minOk idxOk with
+        | true =>
+          deinitTailOk
+            locals
+            localDecls
+            layouts
+            (.some (resolveArrayStepTy localDecls layouts rTy elemKind))
+            rest
+        | false => false
+      | _ => false
+    | .none => false
+  | .subslice fromIdx toIdx fromEnd :: rest =>
+    match curTyOpt with
+    | .some curTy =>
+      let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+      match rTy.kind with
+      | .array elemKind arrayLen =>
+        match fromEnd with
+        | false =>
+          match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx arrayLen) with
+          | true =>
+            deinitTailOk
+              locals
+              localDecls
+              layouts
+              (.some { kind := .array elemKind (Nat.sub toIdx fromIdx), layoutIdx := 0 })
+              rest
+          | false => false
+        | true =>
+          match Nat.ble (Nat.add fromIdx toIdx) arrayLen with
+          | true =>
+            deinitTailOk
+              locals
+              localDecls
+              layouts
+              (.some { kind := .array elemKind (Nat.sub arrayLen (Nat.add fromIdx toIdx)), layoutIdx := 0 })
+              rest
+          | false => false
+      | _ => false
+    | .none => false
+  | _ :: _ => false
+
+/--
+Deinitialize the sub-value at projection chain `proj` inside `val`, replacing
+the target sub-place with `Value.uninit`:
+- At `.nil`, returns `.ok .uninit`.
+- Below an already-`.uninit` sub-value, validates the remaining projection tail
+  via `deinitTailOk locals localDecls layouts curTyOpt`, returning `.ok .uninit`
+  when valid, `.unsupported` if the tail contains `.deref`, and `.ub` otherwise.
+- On `.aggregate 0 fields` with `.field idx _ :: rest`, or `.aggregate actualVariant fields`
+  with `.downcast _ variantIdx :: .field idx _ :: rest` when `actualVariant == variantIdx`,
+  recurses into `fields[idx]` and updates that slot in place.
+- On `.aggregate 0 fields` with `.index`, `.constantIndex`, or `.subslice`,
+  validates index/subslice bounds and deinitializes the selected element(s).
+
+Modeling note (`agent_docs/trusted-rust.md`): `StatementKind.deinit` in `MirAst`
+and post-drop-elaboration `TerminatorKind.drop` write uninitialized state to a
+projected MIR place without reading the old leaf value, while still validating
+place projections (such as `Index` scalar operands and active enum variants).
+Whereas `rustc` `14210df0e` removed `StatementKind::Deinit` from `mir/syntax.rs`,
+`MirAst` retains `StatementKind.deinit` alongside `TerminatorKind.drop`
+(`syntax.rs#L742-L788`) and `Operand.move` (`syntax.rs#L1316-L1327`).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+>
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
+
+> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
+>   place and create a place referring to one of the fields of the type."
+-/
+def deinitProjectedValue
+    (locals : List LocalSlot)
+    (val : Value)
+    (proj : List ProjectionElem)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (curTyOpt : Option Ty := .none) :
+    ProjWriteResult :=
+  match val, proj with
+  | _, .nil => .ok .uninit
+  | .uninit, pHead :: rest =>
+    match deinitTailOk locals localDecls layouts curTyOpt (pHead :: rest) with
+    | true => .ok .uninit
+    | false =>
+      match projListHasDeref (pHead :: rest) with
+      | true => .unsupported
+      | false => .ub
+  | .aggregate .zero fields, .field idx fieldTy :: rest =>
+    let nextTyOpt :=
+      match curTyOpt with
+      | .some curTy =>
+        .some
+          (resolveFieldStepTy
+            localDecls
+            layouts
+            (resolveTyWithLocalDecls localDecls layouts curTy)
+            idx
+            fieldTy)
+      | .none => .none
+    match get? fields idx with
+    | .some oldFieldVal =>
+      match deinitProjectedValue locals oldFieldVal rest localDecls layouts nextTyOpt with
+      | .ok updatedFieldVal =>
+        match set? fields idx updatedFieldVal with
+        | .some fields' => .ok (.aggregate 0 fields')
+        | .none => .ub
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .none =>
+      match projListHasDeref rest with
+      | true => .unsupported
+      | false => .ub
+  | .scalar sc, .field .zero fieldTy :: rest =>
+    let nextTyOpt :=
+      match curTyOpt with
+      | .some _ => .some (resolveTyWithLocalDecls localDecls layouts fieldTy)
+      | .none => .none
+    deinitProjectedValue locals (.scalar sc) rest localDecls layouts nextTyOpt
+  | .ptr p sz, .field .zero fieldTy :: rest =>
+    let nextTyOpt :=
+      match curTyOpt with
+      | .some _ => .some (resolveTyWithLocalDecls localDecls layouts fieldTy)
+      | .none => .none
+    deinitProjectedValue locals (.ptr p sz) rest localDecls layouts nextTyOpt
+  | .unit, .field .zero fieldTy :: rest =>
+    let nextTyOpt :=
+      match curTyOpt with
+      | .some _ => .some (resolveTyWithLocalDecls localDecls layouts fieldTy)
+      | .none => .none
+    deinitProjectedValue locals .unit rest localDecls layouts nextTyOpt
+  | _, .field _ _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | .aggregate actualVariant fields,
+    .downcast _ variantIdx :: .field idx fieldTy :: rest =>
+    let nextTyOpt :=
+      match curTyOpt with
+      | .some _ => .some (resolveTyWithLocalDecls localDecls layouts fieldTy)
+      | .none => .none
+    match Nat.beq actualVariant variantIdx with
+    | true =>
+      match get? fields idx with
+      | .some oldFieldVal =>
+        match deinitProjectedValue locals oldFieldVal rest localDecls layouts nextTyOpt with
+        | .ok updatedFieldVal =>
+          match set? fields idx updatedFieldVal with
+          | .some fields' => .ok (.aggregate actualVariant fields')
+          | .none => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .none =>
+        match projListHasDeref rest with
+        | true => .unsupported
+        | false => .ub
+    | false =>
+      match projListHasDeref rest with
+      | true => .unsupported
+      | false => .ub
+  | _, .downcast _ _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | .aggregate 0 fields, .index idxLocal :: rest =>
+    let nextTyOpt :=
+      match curTyOpt with
+      | .some curTy =>
+        let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+        match rTy.kind with
+        | .array elemKind _ => .some (resolveArrayStepTy localDecls layouts rTy elemKind)
+        | _ => .none
+      | .none => .none
+    match get? locals idxLocal with
+    | .some (.init (.scalar sc)) =>
+      match get? fields sc.bits with
+      | .some oldElemVal =>
+        match deinitProjectedValue locals oldElemVal rest localDecls layouts nextTyOpt with
+        | .ok updatedElemVal =>
+          match set? fields sc.bits updatedElemVal with
+          | .some fields' => .ok (.aggregate 0 fields')
+          | .none => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .none =>
+        match projListHasDeref rest with
+        | true => .unsupported
+        | false => .ub
+    | _ =>
+      match projListHasDeref rest with
+      | true => .unsupported
+      | false => .ub
+  | _, .index _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | .aggregate 0 fields,
+    .constantIndex offset minLen fromEnd :: rest =>
+    let nextTyOpt :=
+      match curTyOpt with
+      | .some curTy =>
+        let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+        match rTy.kind with
+        | .array elemKind _ => .some (resolveArrayStepTy localDecls layouts rTy elemKind)
+        | _ => .none
+      | .none => .none
+    let len := length fields
+    let fromEndOk :=
+      match fromEnd with
+      | false => true
+      | true => Bool.and (Nat.ble 1 offset) (Nat.ble offset len)
+    match Bool.and (Nat.ble minLen len) fromEndOk with
+    | true =>
+      let idx :=
+        match fromEnd with
+        | true => Nat.sub len offset
+        | false => offset
+      match get? fields idx with
+      | .some oldElemVal =>
+        match deinitProjectedValue locals oldElemVal rest localDecls layouts nextTyOpt with
+        | .ok updatedElemVal =>
+          match set? fields idx updatedElemVal with
+          | .some fields' => .ok (.aggregate 0 fields')
+          | .none => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .none =>
+        match projListHasDeref rest with
+        | true => .unsupported
+        | false => .ub
+    | false =>
+      match projListHasDeref rest with
+      | true => .unsupported
+      | false => .ub
+  | _, .constantIndex _ _ _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | .aggregate 0 fields,
+    .subslice fromIdx toIdx fromEnd :: rest =>
+    let nextTyOpt :=
+      match curTyOpt with
+      | .some curTy =>
+        let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+        match rTy.kind, fromEnd with
+        | .array elemKind _, false =>
+          .some { kind := .array elemKind (Nat.sub toIdx fromIdx), layoutIdx := 0 }
+        | .array elemKind arrayLen, true =>
+          .some { kind := .array elemKind (Nat.sub arrayLen (Nat.add fromIdx toIdx)), layoutIdx := 0 }
+        | _, _ => .none
+      | .none => .none
+    match extractSubslice fields fromIdx toIdx fromEnd with
+    | .some subElems =>
+      match deinitProjectedValue locals (.aggregate 0 subElems) rest localDecls layouts nextTyOpt with
+      | .ok (.aggregate 0 updatedSubElems) =>
+        match replaceSubslice fields fromIdx toIdx fromEnd updatedSubElems with
+        | .some fields' => .ok (.aggregate 0 fields')
+        | .none => .ub
+      | .ok _ => .ub
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .none =>
+      match projListHasDeref rest with
+      | true => .unsupported
+      | false => .ub
+  | _, .subslice _ _ _ :: rest =>
+    match projListHasDeref rest with
+    | true => .unsupported
+    | false => .ub
+  | val, .opaqueCast castTy :: rest =>
+    let nextTyOpt :=
+      match curTyOpt with
+      | .some _ => .some (resolveTyWithLocalDecls localDecls layouts castTy)
+      | .none => .none
+    deinitProjectedValue locals val rest localDecls layouts nextTyOpt
+  | val, .unwrapUnsafeBinder innerTy :: rest =>
+    let nextTyOpt :=
+      match curTyOpt with
+      | .some _ => .some (resolveTyWithLocalDecls localDecls layouts innerTy)
+      | .none => .none
+    deinitProjectedValue locals val rest localDecls layouts nextTyOpt
+  | _, _ :: _ => .unsupported
+
+/--
 Deinitialize `proj` on `rootVal` at `loc`:
-- When `placeTouchesUnion localDecls layouts ⟨loc, proj⟩` is `false`, delegates
-  to `deinitProjectedValue locals rootVal proj`.
-- When `placeTouchesUnion localDecls layouts ⟨loc, proj⟩` is `true`, fails
-  closed with `.unsupported` (`UnsupportedPlaceProjection` on union fields,
+- When `projListHasDeref proj` or `placeTouchesUnion localDecls layouts ⟨loc, proj⟩`
+  is `true`, fails closed with `.unsupported` (`UnsupportedPlaceProjection`,
   matching `Anneal.Mir.AdtAndControl.evalDeinitPlaceTyped`).
+- Otherwise delegates to `deinitProjectedValue` with `loc`'s declared root type
+  (`placeTy localDecls layouts { local_ := loc, projection := .nil }`).
 
 Modeling note (`agent_docs/trusted-rust.md`): `StatementKind.deinit` in `MirAst`
 and post-drop-elaboration `TerminatorKind.drop` write uninitialized state to a
@@ -9562,9 +9998,19 @@ def deinitProjectedForLocal
     (rootVal : Value)
     (proj : List ProjectionElem) :
     ProjWriteResult :=
-  match placeTouchesUnion localDecls layouts { local_ := loc, projection := proj } with
-  | false => deinitProjectedValue locals rootVal proj
+  match projListHasDeref proj with
   | true => .unsupported
+  | false =>
+    match placeTouchesUnion localDecls layouts { local_ := loc, projection := proj } with
+    | false =>
+      deinitProjectedValue
+        locals
+        rootVal
+        proj
+        localDecls
+        layouts
+        (placeTy localDecls layouts { local_ := loc, projection := .nil })
+    | true => .unsupported
 
 
 /--
@@ -17042,11 +17488,65 @@ def evalScalarSliceFatPtrDerefRaw
       | _ => .ub
 
 /--
-Compute the MIR `Rvalue.discriminant` scalar for `val` read from `place`.
+Return `true` when every `Size` in `offsets` starts at or after byte offset
+`tagSz` (`tagSz ≤ off.bytes`).
+-/
+@[reducible]
+def allOffsetsAtLeast (tagSz : Nat) : List Size → Bool
+  | .nil => true
+  | off :: rest => Bool.and (Nat.ble tagSz off.bytes) (allOffsetsAtLeast tagSz rest)
 
-- For `core::cmp::Ordering` (`#[repr(i8)] enum Ordering { Less = -1, Equal = 0, Greater = 1 }`),
-  maps both `Value.scalar sc` (produced by `BinOp.cmp` and `three_way_compare`,
-  where `Less = ⟨255, 1⟩`, `Equal = ⟨0, 1⟩`, `Greater = ⟨1, 1⟩`) and zero-field
+/--
+Return `true` when every `FieldsShape.arbitrary` variant in `variantShapes`
+places all of its payload fields at byte offsets `≥ tagSz` (disjoint from a
+direct discriminant tag occupying `[0, tagSz)`).
+-/
+@[reducible]
+def allVariantFieldsAfterTag (tagSz : Nat) : List FieldsShape → Bool
+  | .nil => true
+  | .arbitrary offsets _ :: rest =>
+    Bool.and (allOffsetsAtLeast tagSz offsets) (allVariantFieldsAfterTag tagSz rest)
+  | _ :: rest => allVariantFieldsAfterTag tagSz rest
+
+/--
+`true` when `l` is an inhabited multi-variant enum layout (`VariantsShape.multiple`)
+whose discriminant tag occupies `[0, tagSz)` (`1 ≤ tagSz`) disjoint from every
+variant's payload fields (`TagEncoding::Direct`). Niche-encoded enums
+(`TagEncoding::Niche`, such as `Option<&T>` or `Option<bool>`) place their
+untagged variant starting at byte offset `0 < tagSz` so the discriminant tag
+shares storage with the payload, returning `false`.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1937-L1959>
+
+> "Multiple {
+>     tag: Scalar,
+>     tag_encoding: TagEncoding<VariantIdx>,
+>     tag_field: FieldIdx,
+>     variants: IndexVec<VariantIdx, VariantLayout<FieldIdx>>,
+> },"
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+-/
+@[reducible]
+def enumLayoutHasDisjointDirectTag (l : TypeLayout) : Bool :=
+  match l.isUninhabited, l.variants with
+  | false, .multiple tagLayout _ (vHead :: vTail) =>
+    match scalarLayoutByteWidth tagLayout with
+    | .some tagSz =>
+      Bool.and (Nat.ble 1 tagSz) (allVariantFieldsAfterTag tagSz (vHead :: vTail))
+    | .none => false
+  | _, _ => false
+
+/--
+Evaluate `Rvalue.discriminant place` on an already-loaded runtime value `val`
+using type and layout metadata (`localDecls`, `layouts`) for `place`:
+- For `core::cmp::Ordering` (`#[repr(i8)]` `Less = -1`, `Equal = 0`, `Greater = 1`),
+  maps both `Value.scalar sc` (`sc.bits ∈ {255, 0, 1}`, `sizeBytes == 1`) and
   `Value.aggregate variantIdx []` (`0 ↦ ⟨255, 1⟩`, `1 ↦ ⟨0, 1⟩`, `2 ↦ ⟨1, 1⟩`)
   to the signed 1-byte `Ordering` discriminant scalar, faulting with `.ub` on
   out-of-range scalar bit patterns or widths.
@@ -17055,12 +17555,24 @@ Compute the MIR `Rvalue.discriminant` scalar for `val` read from `place`.
   when present and preserves `Value.scalar sc`.
 - For uninhabited types (`.never`, `isUninhabited = true`, or `VariantsShape.empty`),
   returns `.ub`.
-- For `Value.aggregate variantIdx _`, validates `variantIdx` against
+- For `Value.aggregate variantIdx fields`, validates `variantIdx` against
   `VariantsShape.single` / `VariantsShape.multiple` when layout metadata is
-  available and returns `Value.scalar ⟨variantIdx, 8⟩`.
+  available; when `fields` contains any `Value.uninit` (`valueListContainsUninit`),
+  requires a captured direct-tagged enum layout (`enumLayoutHasDisjointDirectTag`)
+  so reading the discriminant of a niche-encoded enum (such as `Option<&T>` or
+  `Option<bool>`) with an uninitialized payload faults with `.ub`.
 - For single-variant ADTs (`VariantsShape.single`) and non-ADT types (`Value.unit`,
   `Value.scalar`, `Value.ptr`), returns `Value.scalar ⟨0, 8⟩` per `rustc_middle`
   (`Rvalue::Discriminant` "returns `0` if the type does not have a discriminant").
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1189-L1196>
+
+> "/// Reads the discriminant of an ADT; returns `0` if the type does not have a discriminant.
+> ///
+> /// Undefined behavior if the value is not initialized (or has an invalid discriminant
+> /// for its type)."
 -/
 def evalPlaceDiscriminant
     (val : Value)
@@ -17072,54 +17584,76 @@ def evalPlaceDiscriminant
     RvalueEvalResult :=
   match val with
   | .aggregate variantIdx fields =>
-    match placeTyResolved localDecls layouts place with
-    | .some pTy =>
-      match pTy.kind with
-      | .never => .ub
-      | .adt defPath _ =>
-        let evalOrderingOrVariant : RvalueEvalResult :=
-          match Bool.and (stringEq defPath "core::cmp::Ordering") (Nat.beq (length fields) 0) with
-          | true =>
-            match variantIdx with
-            | 0 => .ok (.scalar ⟨255, 1⟩) locals' mem
-            | 1 => .ok (.scalar ⟨0, 1⟩) locals' mem
-            | 2 => .ok (.scalar ⟨1, 1⟩) locals' mem
-            | _ => .ub
-          | false => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
-        match LayoutTable.lookup layouts pTy.layoutIdx with
-        | .some { isUninhabited := true, .. } => .ub
-        | .some { variants := .empty, .. } => .ub
-        | .some { variants := .single expectedIdx, .. } =>
-          match Nat.beq variantIdx expectedIdx with
+    match valueListContainsUninit fields with
+    | true =>
+      match placeTyResolved localDecls layouts place with
+      | .some pTy =>
+        match pTy.kind with
+        | .adt defPath _ =>
+          match LayoutTable.lookup layouts pTy.layoutIdx with
+          | .some l =>
+            match enumLayoutHasDisjointDirectTag l, l.variants with
+            | true, .multiple _ _ variants =>
+              let varBoundsOk :=
+                match variants with
+                | .nil => false
+                | _ :: _ => Nat.ble (.succ variantIdx) (length variants)
+              match varBoundsOk, stringEq defPath "core::cmp::Ordering" with
+              | true, false => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
+              | _, _ => .ub
+            | _, _ => .ub
+          | .none => .ub
+        | _ => .ub
+      | .none => .ub
+    | false =>
+      match placeTyResolved localDecls layouts place with
+      | .some pTy =>
+        match pTy.kind with
+        | .never => .ub
+        | .adt defPath _ =>
+          let evalOrderingOrVariant : RvalueEvalResult :=
+            match Bool.and (stringEq defPath "core::cmp::Ordering") (Nat.beq (length fields) 0) with
+            | true =>
+              match variantIdx with
+              | 0 => .ok (.scalar ⟨255, 1⟩) locals' mem
+              | 1 => .ok (.scalar ⟨0, 1⟩) locals' mem
+              | 2 => .ok (.scalar ⟨1, 1⟩) locals' mem
+              | _ => .ub
+            | false => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
+          match LayoutTable.lookup layouts pTy.layoutIdx with
+          | .some { isUninhabited := true, .. } => .ub
+          | .some { variants := .empty, .. } => .ub
+          | .some { variants := .single expectedIdx, .. } =>
+            match Nat.beq variantIdx expectedIdx with
+            | true => .ok (.scalar ⟨0, 8⟩) locals' mem
+            | false => .ub
+          | .some { variants := .multiple _ _ variants, .. } =>
+            let varBoundsOk :=
+              match variants with
+              | .nil => true
+              | _ :: _ => Nat.ble (.succ variantIdx) (length variants)
+            match varBoundsOk with
+            | true => evalOrderingOrVariant
+            | false => .ub
+          | .none => evalOrderingOrVariant
+        | .tuple _ =>
+          match Nat.beq variantIdx 0 with
           | true => .ok (.scalar ⟨0, 8⟩) locals' mem
           | false => .ub
-        | .some { variants := .multiple _ _ variants, .. } =>
-          let varBoundsOk :=
-            match variants with
-            | .nil => true
-            | _ :: _ => Nat.ble (.succ variantIdx) (length variants)
-          match varBoundsOk with
-          | true => evalOrderingOrVariant
+        | .array _ _ =>
+          match Nat.beq variantIdx 0 with
+          | true => .ok (.scalar ⟨0, 8⟩) locals' mem
           | false => .ub
-        | .none => evalOrderingOrVariant
-      | .tuple _ =>
-        match Nat.beq variantIdx 0 with
-        | true => .ok (.scalar ⟨0, 8⟩) locals' mem
-        | false => .ub
-      | .array _ _ =>
-        match Nat.beq variantIdx 0 with
-        | true => .ok (.scalar ⟨0, 8⟩) locals' mem
-        | false => .ub
-      | .slice _ =>
-        match Nat.beq variantIdx 0 with
-        | true => .ok (.scalar ⟨0, 8⟩) locals' mem
-        | false => .ub
-      | .str =>
-        match Nat.beq variantIdx 0 with
-        | true => .ok (.scalar ⟨0, 8⟩) locals' mem
-        | false => .ub
-      | _ => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
-    | .none => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
+        | .slice _ =>
+          match Nat.beq variantIdx 0 with
+          | true => .ok (.scalar ⟨0, 8⟩) locals' mem
+          | false => .ub
+        | .str =>
+          match Nat.beq variantIdx 0 with
+          | true => .ok (.scalar ⟨0, 8⟩) locals' mem
+          | false => .ub
+        | _ => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
+      | .none => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
   | .scalar sc =>
     match placeTyResolved localDecls layouts place with
     | .some pTy =>

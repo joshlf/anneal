@@ -73,7 +73,10 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   dropValues takeValues extractSubslice readProjectedValue readContainerProjectedValue
   appendValueList replaceSubslice
   setOrExtendFields writeProjectedValue
-  projListHasDeref deinitTailOk deinitProjectedValue deinitProjectedForLocal
+  projListHasDeref resolveFieldStepTy resolveArrayStepTy
+  nonUnionAggregateArity? uninitContainerFieldShell? enumVariantPayloadArity?
+  padFieldsToArity deinitTailOk deinitProjectedValue deinitProjectedForLocal
+  allOffsetsAtLeast allVariantFieldsAfterTag enumLayoutHasDisjointDirectTag
   sliceConstElemKind isScalarCompatibleProj uintRigidTyOfStride
   inferValueByteSizeAux inferElemListByteStride exactByteDivAux byteOffsetToElemIdx?
   splitLastConstantIndex? readSliceBackingAggregate? splitLastSubslice? endsWithSubslice needsThinPtrElemResolution
@@ -107,7 +110,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping
   preventsDeallocation copyEntriesTargetActiveFrame
   borrowsAfterCopySingleDirect evalForeignFrameCopySingleDirect
-  setDiscriminantUninitDeclOk
+  setDiscriminantUninitDeclOk setDiscriminantUninitPayload?
+  padSetDiscriminantInitFields?
   evalSetDiscriminantLocal derefTargetsSuspendedFrame FrameWriteResult
   foreignFrameDerefWrite evalForeignFrameDerefWrite
   evalSetDiscriminantDerefWrite
