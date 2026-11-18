@@ -68,7 +68,9 @@ Headline results:
   `evalFloatToIntSaturating_zeroBits` (`±0.0 ↦ 0`),
   `evalFloatToIntSaturating_of_ge_maxValue` / `evalFloatToIntSaturating_of_le_minValue`
   (finite truncation saturation), `evalFloatToIntSaturating_of_in_range` (exact in-range
-  truncation), and `evalFloatToFloatRoundTiesToEven_{zeroBits,infBits}`.
+  truncation), `evalFloatToIntSaturating_finite_eq` (complete finite-case trichotomy),
+  `evalIntToFloatRoundTiesToEven_zero` (`0 : iN/uN ↦ +0.0`), and
+  `evalFloatToFloatRoundTiesToEven_{zeroBits,infBits}`.
 
 Every theorem is kernel-checked and depends only on `propext` / `Quot.sound` (no
 `Classical.choice`); see the `#guard_msgs in #print axioms` block at the end of
@@ -3387,6 +3389,48 @@ theorem evalFloatToFloatRoundTiesToEven_infBits (src dst : IeeeFormat) (neg : Bo
     evalFloatToFloatRoundTiesToEven src dst (infBits src neg) = infBits dst neg := by
   simp only [evalFloatToFloatRoundTiesToEven, decodeBits_infBits]
 
+/-- **Complete finite-case trichotomy for `evalFloatToIntSaturating`**: on any finite
+`decodeBits src bits = .finite neg n d`, `evalFloatToIntSaturating` yields `MIN` when
+`truncRatio neg n d ≤ minValue`, `MAX` when `maxValue ≤ truncRatio neg n d`, and the exact
+two's-complement encoding `encodeTwosComplement` strictly in between. -/
+theorem evalFloatToIntSaturating_finite_eq (src : IeeeFormat) (bits : Nat) (neg : Bool)
+    (n d : Nat) (t : FloatIntTarget) (pw : FloatPtrWidth)
+    (hdec : decodeBits src bits = .finite neg n d) :
+    (evalFloatToIntSaturating src bits t pw).bits =
+      if truncRatio neg n d ≤ t.minValue pw then
+        if t.isSigned then 2 ^ (t.bitWidth pw - 1) else 0
+      else if t.maxValue pw ≤ truncRatio neg n d then
+        if t.isSigned then 2 ^ (t.bitWidth pw - 1) - 1 else 2 ^ t.bitWidth pw - 1
+      else
+        encodeTwosComplement (t.bitWidth pw) (truncRatio neg n d) := by
+  by_cases hlo : truncRatio neg n d ≤ t.minValue pw
+  · simp only [hlo, ↓reduceIte]
+    exact evalFloatToIntSaturating_of_le_minValue src bits neg n d t pw hdec hlo
+  · simp only [hlo, ↓reduceIte]
+    by_cases hhi : t.maxValue pw ≤ truncRatio neg n d
+    · simp only [hhi, ↓reduceIte]
+      exact evalFloatToIntSaturating_of_ge_maxValue src bits neg n d t pw hdec hhi
+    · simp only [hhi, ↓reduceIte]
+      exact evalFloatToIntSaturating_of_in_range src bits neg n d t pw hdec
+        (by omega) (by omega)
+
+/-- **Zero integer to `+0.0` in `intToFloat`**: for every signedness `signed`, bit-width `w`, and
+destination format `dst`, `0` maps to positive zero `zeroBits dst false` (`0`). -/
+theorem evalIntToFloatRoundTiesToEven_zero (signed : Bool) (w : Nat) (dst : IeeeFormat) :
+    evalIntToFloatRoundTiesToEven signed w 0 dst = zeroBits dst false := by
+  have hiv : intValueOfBits signed w 0 = 0 := by
+    unfold intValueOfBits
+    dsimp only
+    rw [if_neg']
+    · simp only [Nat.zero_mod, Int.natCast_zero]
+    · rintro ⟨_, hle⟩
+      have hp : 1 ≤ 2 ^ (w - 1) := Nat.one_le_two_pow
+      rw [Nat.zero_mod] at hle
+      omega
+  unfold evalIntToFloatRoundTiesToEven roundRatioTiesToEven
+  rw [hiv]
+  rfl
+
 end MiriBridge
 
 /-! ## §5. Axiom guards
@@ -3956,6 +4000,18 @@ info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_of_in_range' depends on
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms evalFloatToIntSaturating_of_in_range
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_finite_eq' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_finite_eq
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalIntToFloatRoundTiesToEven_zero' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalIntToFloatRoundTiesToEven_zero
 
 end AxiomGuards
 
