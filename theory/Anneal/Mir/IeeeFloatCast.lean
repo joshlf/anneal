@@ -67,7 +67,8 @@ Headline results:
   `encodeTwosComplement_maxValue` / `encodeTwosComplement_minValue`),
   `evalFloatToIntSaturating_zeroBits` (`±0.0 ↦ 0`),
   `evalFloatToIntSaturating_of_ge_maxValue` / `evalFloatToIntSaturating_of_le_minValue`
-  (finite truncation saturation), and `evalFloatToFloatRoundTiesToEven_{zeroBits,infBits}`.
+  (finite truncation saturation), `evalFloatToIntSaturating_of_in_range` (exact in-range
+  truncation), and `evalFloatToFloatRoundTiesToEven_{zeroBits,infBits}`.
 
 Every theorem is kernel-checked and depends only on `propext` / `Quot.sound` (no
 `Classical.choice`); see the `#guard_msgs in #print axioms` block at the end of
@@ -3358,6 +3359,22 @@ theorem evalFloatToIntSaturating_of_le_minValue (src : IeeeFormat) (bits : Nat) 
   simp only [evalFloatToIntSaturating, hdec, floatToIntValue, hclamp]
   exact encodeTwosComplement_minValue t pw
 
+/-- **Finite in-range truncation (no saturation)**: when `bits` decodes to a finite rational
+whose truncation toward zero lies in `[minValue, maxValue]`, `evalFloatToIntSaturating` is exactly
+the two's-complement encoding of the truncated value (complementing the saturating cases
+`evalFloatToIntSaturating_of_ge_maxValue` / `evalFloatToIntSaturating_of_le_minValue`). -/
+theorem evalFloatToIntSaturating_of_in_range (src : IeeeFormat) (bits : Nat) (neg : Bool)
+    (n d : Nat) (t : FloatIntTarget) (pw : FloatPtrWidth)
+    (hdec : decodeBits src bits = .finite neg n d)
+    (hlo : t.minValue pw ≤ truncRatio neg n d) (hhi : truncRatio neg n d ≤ t.maxValue pw) :
+    (evalFloatToIntSaturating src bits t pw).bits =
+      encodeTwosComplement (t.bitWidth pw) (truncRatio neg n d) := by
+  have hclamp : clampInt (t.minValue pw) (t.maxValue pw) (truncRatio neg n d) =
+      truncRatio neg n d := by
+    unfold clampInt
+    rw [Int.min_eq_right hhi, Int.max_eq_right hlo]
+  simp only [evalFloatToIntSaturating, hdec, floatToIntValue, hclamp]
+
 /-- **Signed zero preservation in `floatToFloat`**: `zeroBits src neg` maps to `zeroBits dst neg`
 (preserving `-0.0` vs `+0.0`, in contrast to `evalFloatToIntSaturating_zeroBits`). -/
 theorem evalFloatToFloatRoundTiesToEven_zeroBits (src dst : IeeeFormat) (neg : Bool) :
@@ -3933,6 +3950,12 @@ info: 'Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_infBits' depends
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms evalFloatToFloatRoundTiesToEven_infBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_of_in_range' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_of_in_range
 
 end AxiomGuards
 
