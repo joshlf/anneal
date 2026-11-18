@@ -117,6 +117,19 @@ pub(super) fn install_ice_hook() {
     rustc_driver::install_ice_hook("https://github.com/joshlf/anneal/issues/new", |_| ());
 }
 
+/// Invoke the driver entrypoint across supported pinned compilers: `rustc` 1.101
+/// (`7189d39d9`) renamed `rustc_driver::run_compiler` to
+/// `rustc_driver::compiler_entrypoint` while preserving argv[0] stripping,
+/// response-file (`@file`) expansion, and final `abort_if_errors()` semantics.
+/// https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_driver_impl/src/lib.rs#L171-L260
+/// https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/lib.rs#L171-L187
+pub(super) fn run_compiler(args: &[String], callbacks: &mut (dyn Callbacks + Send)) {
+    #[cfg(version("1.101"))]
+    rustc_driver::compiler_entrypoint(args, callbacks);
+    #[cfg(not(version("1.101")))]
+    rustc_driver::run_compiler(args, callbacks);
+}
+
 /// Run one compiler session and require a clean analysis callback.
 ///
 /// Diagnostics, including callback evidence, use rustc's selected stderr format.
@@ -147,13 +160,13 @@ pub(super) fn run(args: Vec<OsString>) -> ExitCode {
             analysis_reached: false,
         };
 
-        // run_compiler discards argv[0] before expanding response files and
-        // parsing compiler options. Supply that slot without parsing flags.
+        // The driver entrypoint discards argv[0] before expanding response files
+        // and parsing compiler options. Supply that slot without parsing flags.
         // Its normal return includes the final abort_if_errors check, so even
         // errors after analysis prohibit callback evidence.
-        // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/lib.rs#L171-L187
+        // https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_driver_impl/src/lib.rs#L171-L260
         // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_interface/src/interface.rs#L491-L509
-        rustc_driver::run_compiler(&compiler_args, &mut callbacks);
+        run_compiler(&compiler_args, &mut callbacks);
 
         // Emit a standalone `note:` through rustc's diagnostic emitter, whose
         // destinations are stderr for both human and JSON formats. Keep stdout

@@ -741,7 +741,7 @@ pub fn run(args: &Args) -> Result<ir::Manifest, Failure> {
     };
     let compiler_result = rustc_driver::catch_fatal_errors(|| {
         crate::driver::install_ice_hook();
-        rustc_driver::run_compiler(&compiler_args, &mut callbacks);
+        crate::driver::run_compiler(&compiler_args, &mut callbacks);
     });
     let reads = reads
         .lock()
