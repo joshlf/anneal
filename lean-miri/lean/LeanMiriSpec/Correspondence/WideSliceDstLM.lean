@@ -4479,6 +4479,36 @@ theorem w_wideSlice_subslice_and_str_reborrow_agrees :
     rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl),
     rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl)⟩
 
+set_option maxHeartbeats 400000 in
+/-- Concrete Witness 9 (**`ProjectionElem.ConstantIndex` on a dereferenced wide slice**, the MIR
+for slice patterns such as `let [.., last] = *s`), real-step on BOTH interpreters with values
+pinned, over a `len = 3` window of the 4-element `[10, 20, 30, 40]` backing (so a `fromEnd` index
+computed from the backing length instead of the slice metadata would read `40` and be caught):
+1. `(*_2)[ConstantIndex 1 1 fromEnd]` reads element `len - 1 = 2` (`30`) in both;
+2. `(*_2)[ConstantIndex 0 4]` (`min_length = 4 > len = 3`) faults `.fail .ub` in `stepMirFn` and
+   `"constant index minimum length"` UB in `Miri.Interpreter.Step.step`.
+(Forward `ConstantIndex 1 2` → `20` and `ConstantIndex 3 3 fromEnd` → `10` were also checked to
+agree by evaluation; they are omitted here to keep kernel memory under the cgroup limit.) -/
+theorem w_wideSlice_constantIndex_fromEnd_and_minLength_agrees :
+    let bEnd := wideSliceReborrowBody u32Ty (.use (.copy ⟨2, [.deref, .constantIndex 1 1 true]⟩))
+    let bMin := wideSliceReborrowBody u32Ty (.use (.copy ⟨2, [.deref, .constantIndex 0 4 false]⟩))
+    ∃ (sEnd : MachineState) (mEnd mMin : AnnealStepState),
+      stepMirFn bEnd (wideSlice4LocalInitAnneal sampleAnnealPtr 3 1 sampleAnnealArrMemory) =
+        .step sEnd ∧
+      get? sEnd.frame.locals 0 = some (.init (.scalar ⟨30, 4⟩)) ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bEnd.localDecls bEnd.layouts) ()
+        (wideSlice4LocalInitMiri bEnd u32Ty sampleMiriPtr 3 1 sampleArrU32Machine) =
+        (mEnd, .ok true) ∧
+      miriTopLocal? mEnd 0 = miriU32Local 30 ∧
+      stepMirFn bMin (wideSlice4LocalInitAnneal sampleAnnealPtr 3 1 sampleAnnealArrMemory) =
+        .fail .ub ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bMin.localDecls bMin.layouts) ()
+        (wideSlice4LocalInitMiri bMin u32Ty sampleMiriPtr 3 1 sampleArrU32Machine) =
+        (mMin, .error (.undefinedBehavior "constant index minimum length")) :=
+  ⟨_, _, _,
+    rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl),
+    rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl)⟩
+
 end WideSliceWitnesses
 
 end LeanMiriSpec.Correspondence

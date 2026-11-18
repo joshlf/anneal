@@ -1532,6 +1532,7 @@ open LeanMiriSpec.Correspondence in
   WideSliceWitnesses.wideSliceReborrowBody
   WideSliceWitnesses.w_wideSlice_reborrow_raw_and_shared_agrees
   WideSliceWitnesses.w_wideSlice_safe_reborrow_zeroSized_dangling_ok_agrees
+  WideSliceWitnesses.w_wideSlice_constantIndex_fromEnd_and_minLength_agrees
   isWideSafeRefTyId
   annealValidateSafeWideSliceRef
   wideSlice_dropValues_eq_drop
@@ -26885,6 +26886,25 @@ example :
         (wideSliceTypedInitMiri bStr arrU8_16Ty rawStrTy sharedRefStrTy strImm20 0 sampleArrU32Machine) =
         (mStrOob, .error (.undefinedBehavior "pointer dereference check failed")) :=
   w_wideSlice_subslice_and_str_reborrow_agrees
+
+open WideSliceWitnesses in
+example :
+    let bEnd := wideSliceReborrowBody u32Ty (.use (.copy ⟨2, [.deref, .constantIndex 1 1 true]⟩))
+    let bMin := wideSliceReborrowBody u32Ty (.use (.copy ⟨2, [.deref, .constantIndex 0 4 false]⟩))
+    ∃ (sEnd : MachineState) (mEnd mMin : AnnealStepState),
+      stepMirFn bEnd (wideSlice4LocalInitAnneal sampleAnnealPtr 3 1 sampleAnnealArrMemory) =
+        .step sEnd ∧
+      get? sEnd.frame.locals 0 = some (.init (.scalar ⟨30, 4⟩)) ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bEnd.localDecls bEnd.layouts) ()
+        (wideSlice4LocalInitMiri bEnd u32Ty sampleMiriPtr 3 1 sampleArrU32Machine) =
+        (mEnd, .ok true) ∧
+      miriTopLocal? mEnd 0 = miriU32Local 30 ∧
+      stepMirFn bMin (wideSlice4LocalInitAnneal sampleAnnealPtr 3 1 sampleAnnealArrMemory) =
+        .fail .ub ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bMin.localDecls bMin.layouts) ()
+        (wideSlice4LocalInitMiri bMin u32Ty sampleMiriPtr 3 1 sampleArrU32Machine) =
+        (mMin, .error (.undefinedBehavior "constant index minimum length")) :=
+  w_wideSlice_constantIndex_fromEnd_and_minLength_agrees
 
 end StatementPins
 
