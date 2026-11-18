@@ -62,7 +62,10 @@ Headline results:
   round-trip bridges (`encodeTwosComplement_eq_toNat_ofInt`,
   `bitVec_ofNat_encodeTwosComplement`, `encodeTwosComplement_bitVec_toInt`,
   `intValueOfBits_signed_bounds`, `bitVec128_ofInt_intValueOfBits_toInt`,
-  `bitVec128_ofNat_intValueOfBits_toNat`, `evalFloatToIntSaturating_bitVec_eq`).
+  `bitVec128_ofNat_intValueOfBits_toNat`, `evalFloatToIntSaturating_bitVec_eq`), and the
+  saturation endpoints `evalFloatToIntSaturating_infBits` (`+∞ ↦ MAX`, `-∞ ↦ MIN`, via
+  `encodeTwosComplement_maxValue` / `encodeTwosComplement_minValue`) and
+  `evalFloatToIntSaturating_zeroBits` (`±0.0 ↦ 0`).
 
 Every theorem is kernel-checked and depends only on `propext` / `Quot.sound` (no
 `Classical.choice`); see the `#guard_msgs in #print axioms` block at the end of
@@ -2858,6 +2861,7 @@ theorem ratioExponent_eq_iff_powScale_bounds (n d : Nat) (e : Int) (hn : 0 < n) 
   · rintro ⟨hlo, hhi⟩
     exact ratioExponent_eq_of_powScale_bounds n d e hn hd hlo hhi
 
+/-- Adding `b < 2 ^ k` to a multiple of `2 ^ k` is a bitwise `or` (no carries). -/
 theorem mul_two_pow_add_eq_lor (a b k : Nat) (hb : b < 2 ^ k) :
     a * 2 ^ k + b = Nat.lor (a * 2 ^ k) b := by
   apply Nat.eq_of_testBit_eq
@@ -3252,6 +3256,64 @@ theorem f64ToF32_setWidth128 (x : F64Bits) :
       BitVec.ofNat 128 (evalFloatToFloatRoundTiesToEven .binary64 .binary32 x.toNat) :=
   bitVec_zeroExtend128_of_lt_width .binary32 _
     (evalFloatToFloatRoundTiesToEven_lt .binary64 .binary32 x.toNat)
+
+/-! ### Saturation endpoints of `evalFloatToIntSaturating` (`±∞`, `±0.0`, `MIN` / `MAX`) -/
+
+/-- `floatToIntValue` saturates `+∞` to `hi` and `-∞` to `lo`. -/
+theorem floatToIntValue_inf (neg : Bool) (lo hi : Int) :
+    floatToIntValue (.inf neg) lo hi = if neg then lo else hi := rfl
+
+/-- `floatToIntValue` sends both zeros (in particular `-0.0`) to `0`. -/
+theorem floatToIntValue_zero (neg : Bool) (lo hi : Int) :
+    floatToIntValue (.zero neg) lo hi = 0 := rfl
+
+/-- Two's-complement encoding of the target minimum: `2 ^ (w - 1)` for signed targets and `0`
+for unsigned targets (`w = t.bitWidth pw`). -/
+theorem encodeTwosComplement_minValue (t : FloatIntTarget) (pw : FloatPtrWidth) :
+    encodeTwosComplement (t.bitWidth pw) (t.minValue pw) =
+      if t.isSigned then 2 ^ (t.bitWidth pw - 1) else 0 := by
+  unfold FloatIntTarget.minValue
+  have hw := FloatIntTarget.bitWidth_cases t pw
+  generalize t.bitWidth pw = w at hw ⊢
+  cases t.isSigned <;> rcases hw with rfl | rfl | rfl | rfl | rfl <;> decide
+
+/-- Two's-complement encoding of the target maximum: `2 ^ (w - 1) - 1` for signed targets and
+`2 ^ w - 1` for unsigned targets (`w = t.bitWidth pw`). -/
+theorem encodeTwosComplement_maxValue (t : FloatIntTarget) (pw : FloatPtrWidth) :
+    encodeTwosComplement (t.bitWidth pw) (t.maxValue pw) =
+      if t.isSigned then 2 ^ (t.bitWidth pw - 1) - 1 else 2 ^ t.bitWidth pw - 1 := by
+  unfold FloatIntTarget.maxValue
+  have hw := FloatIntTarget.bitWidth_cases t pw
+  generalize t.bitWidth pw = w at hw ⊢
+  cases t.isSigned <;> rcases hw with rfl | rfl | rfl | rfl | rfl <;> decide
+
+/-- **`+∞ ↦ MAX`, `-∞ ↦ MIN`**: `evalFloatToIntSaturating` on `infBits src neg` is the
+two's-complement encoding of the target's `minValue` (`-∞`) or `maxValue` (`+∞`), i.e.
+`2 ^ (w - 1)` / `0` for `-∞` and `2 ^ (w - 1) - 1` / `2 ^ w - 1` for `+∞` (signed / unsigned),
+across all twelve integer targets (including `isize` / `usize` at either pointer width). -/
+theorem evalFloatToIntSaturating_infBits (src : IeeeFormat) (neg : Bool) (t : FloatIntTarget)
+    (pw : FloatPtrWidth) :
+    (evalFloatToIntSaturating src (infBits src neg) t pw).bits =
+      if neg then (if t.isSigned then 2 ^ (t.bitWidth pw - 1) else 0)
+      else (if t.isSigned then 2 ^ (t.bitWidth pw - 1) - 1 else 2 ^ t.bitWidth pw - 1) := by
+  simp only [evalFloatToIntSaturating, decodeBits_infBits, floatToIntValue]
+  cases neg
+  · simp only [Bool.false_eq_true, ↓reduceIte]; exact encodeTwosComplement_maxValue t pw
+  · simp only [↓reduceIte]; exact encodeTwosComplement_minValue t pw
+
+/-- **`±0.0 ↦ 0`**: `evalFloatToIntSaturating` maps both zero encodings (`zeroBits src neg`, in
+particular `-0.0`) to the all-zero target pattern, dropping the sign. -/
+theorem evalFloatToIntSaturating_zeroBits (src : IeeeFormat) (neg : Bool) (t : FloatIntTarget)
+    (pw : FloatPtrWidth) :
+    (evalFloatToIntSaturating src (zeroBits src neg) t pw).bits = 0 := by
+  simp only [evalFloatToIntSaturating, decodeBits_zeroBits, floatToIntValue, encodeTwosComplement,
+    Int.zero_emod]
+  rfl
+
+/-- The target width of `evalFloatToIntSaturating` is `t.bitWidth pw / 8` bytes. -/
+theorem evalFloatToIntSaturating_sizeBytes (src : IeeeFormat) (bits : Nat) (t : FloatIntTarget)
+    (pw : FloatPtrWidth) :
+    (evalFloatToIntSaturating src bits t pw).sizeBytes = t.bitWidth pw / 8 := rfl
 
 end MiriBridge
 
@@ -3744,6 +3806,54 @@ info: 'Anneal.Mir.IeeeFloatCast.f64ToF32_setWidth128' depends on axioms: [propex
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms f64ToF32_setWidth128
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.mul_two_pow_add_eq_lor' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms mul_two_pow_add_eq_lor
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.floatToIntValue_inf' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms floatToIntValue_inf
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.floatToIntValue_zero' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms floatToIntValue_zero
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeTwosComplement_minValue' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms encodeTwosComplement_minValue
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeTwosComplement_maxValue' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms encodeTwosComplement_maxValue
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_infBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_infBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_zeroBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_zeroBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_sizeBytes' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_sizeBytes
 
 end AxiomGuards
 
