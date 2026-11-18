@@ -2790,20 +2790,20 @@ def _extract_edit_args_list(payload: dict[str, Any] | None) -> list[dict[str, An
     return candidates
 
 
-_JETSKI_REPL_RESULT_RE = re.compile(
+_REPL_RESULT_RE = re.compile(
     r"\bMade\s+(\d{1,9})\s+replacements?\b"
     r"(?:[^\n]*?\bstarting at line\s+(\d{1,9})\b)?"
 )
 
 
-def _jetski_result_hint(payload: dict[str, Any] | None) -> tuple[int | None, int | None]:
-    """Parse `(count, start_line)` from Jetski's `edit_file` result string if present."""
+def _replacement_result_hint(payload: dict[str, Any] | None) -> tuple[int | None, int | None]:
+    """Parse `(count, start_line)` from a structured `edit_file` result string if present."""
     if not isinstance(payload, dict):
         return None, None
     res = payload.get("result")
     if not isinstance(res, str) or "Made " not in res:
         return None, None
-    m = _JETSKI_REPL_RESULT_RE.search(res)
+    m = _REPL_RESULT_RE.search(res)
     if m is None:
         return None, None
     cnt = int(m.group(1))
@@ -2835,7 +2835,7 @@ def reconstruct_before_text_from_payload(
     not contain reversible diff pairs (e.g. `write_file` / `Write`) or when `Replacement`
     occurs multiple times and cannot be unambiguously inverted without a cache.
     """
-    repl_cnt, repl_line = _jetski_result_hint(payload)
+    repl_cnt, repl_line = _replacement_result_hint(payload)
     for args in _extract_edit_args_list(payload):
         edits = args.get("edits")
         if isinstance(edits, list) and edits:
@@ -2897,7 +2897,7 @@ def _invert_ambiguous_without_cache(
     """Best-effort pre-edit text for rule-count baseline when no cache exists and
     `Replacement` / `new_string` occurs multiple times (or mixes a deletion step
     with an insertion step inside `MultiEdit`)."""
-    repl_cnt, repl_line = _jetski_result_hint(payload)
+    repl_cnt, repl_line = _replacement_result_hint(payload)
     for args in _extract_edit_args_list(payload):
         edits = args.get("edits")
         if isinstance(edits, list) and edits:
@@ -2983,7 +2983,7 @@ def _is_pure_deletion(payload: dict[str, Any] | None) -> bool:
 
 
 def _write_file_args(payload: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Return the Jetski `write_file` argument dict (`Content` plus optional
+    """Return the structured `write_file` argument dict (`Content` plus optional
     `Overwrite` / `Append` flags) carried by `payload`, if any."""
     for args in _extract_edit_args_list(payload):
         if isinstance(args.get("Content"), str) and "Target" not in args:
@@ -2995,7 +2995,7 @@ def _line_spans_of_insertions(
     after_text: str, inserted: list[str], payload: dict[str, Any] | None = None
 ) -> list[tuple[int, int]]:
     """1-based inclusive line ranges covered by inserted strings in `after_text`."""
-    repl_cnt, repl_line = _jetski_result_hint(payload)
+    repl_cnt, repl_line = _replacement_result_hint(payload)
     if repl_cnt == 1 and repl_line is not None and len(inserted) == 1:
         ins = inserted[0]
         last = repl_line + ins.count("\n", 0, max(len(ins) - 1, 0))
@@ -3107,7 +3107,7 @@ def evaluate_post_edit_proof_health(
 
     The pre-edit text comes, in order of preference, from an explicit
     `before_text`, from Claude Code's `tool_response.originalFile`, from inverting
-    the edit payload in memory (using Jetski's `Made <K> replacement(s) ... starting
+    the edit payload in memory (using `Made <K> replacement(s) ... starting
     at line <L>` result and Claude's `replace_all` to resolve repeated occurrences),
     or from the edit shape itself (a `write_file` that creates a new file starts from
     an empty file; a `write_file` with `Append` starts from the text before the
@@ -3393,7 +3393,7 @@ def _extract_duration_ms(obj: dict[str, Any]) -> float | None:
     return None
 
 
-def _is_jetski_tool_result_step(item: dict[str, Any]) -> bool:
+def _is_structured_tool_result_step(item: dict[str, Any]) -> bool:
     if item.get("source") == "SYSTEM":
         return False
     stype = item.get("type")
@@ -3510,7 +3510,7 @@ def compute_unbatched_tool_latencies(
     - explicit latency events `{tool, duration_ms | latency_ms | started_at/completed_at,
       batch_id | step_index | turn_id, batch_size?}`;
     - step objects whose `tool_calls` entries carry their own timings;
-    - Jetski `transcript.jsonl` steps, where a `PLANNER_RESPONSE` step lists its
+    - structured `transcript.jsonl` steps, where a `PLANNER_RESPONSE` step lists its
       `tool_calls` (one batch) and the following result steps report, in order,
       `Created At: ... / Completed At: ...` timestamps for each call. A result step
       without `Completed At` (a call backgrounded while still `RUNNING`, or an error)
@@ -3577,10 +3577,10 @@ def compute_unbatched_tool_latencies(
 
         tname = _tool_name(item)
         if tname is None:
-            # Jetski result step: pop the matching pending call in lockstep even when
+            # Tool result step: pop the matching pending call in lockstep even when
             # it has no `Completed At` (a backgrounded `RUNNING` call or an error), so
             # later siblings of the batch are never shifted onto the wrong tool name.
-            if pending and _is_jetski_tool_result_step(item):
+            if pending and _is_structured_tool_result_step(item):
                 ptool, pbatch, psize = pending.pop(0)
                 dur = _extract_duration_ms(item)
                 if dur is not None:

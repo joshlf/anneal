@@ -85,7 +85,7 @@ const MUTATOR_NAMES: &[&str] = &[
 ];
 
 /// The only keys the runner writes to the ledger. It also preserves keys that
-/// are already present and not obsolete, such as labels added by the capsule
+/// are already present and not obsolete, such as labels added by an external
 /// launcher.
 const LEDGER_KEYS: &[&str] = &[
     "last_oracle_comparison",
@@ -211,18 +211,6 @@ fn write_executable(path: &Path, contents: &str) {
         .permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     fs::set_permissions(path, perms).expect("chmod executable");
-}
-
-/// Writes a `remote-sync` stand-in that appends its arguments to `log` and exits
-/// with `status`.
-fn write_remote_sync_stub(path: &Path, log: &Path, status: i32) {
-    write_executable(
-        path,
-        &format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\nexit {status}\n",
-            log.display()
-        ),
-    );
 }
 
 /// Parses a JSON object file with Python's `json` module and returns its
@@ -641,10 +629,8 @@ fn assert_junit_xml_structure(
 }
 
 /// Runs the campaign runner in-process so that a test can replace module
-/// globals. `REMOTE_SYNC_BIN` always points at the stub given by the caller, so no
-/// test can reach real remote. `harness_summary=<json>` makes every harness
-/// return that summary instead of running. The remaining arguments are passed
-/// to the runner.
+/// globals. `harness_summary=<json>` makes every harness return that summary
+/// instead of running. The remaining arguments are passed to the runner.
 const RUNNER_DRIVER: &str = r#"
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("runner", sys.argv[1])
@@ -652,8 +638,7 @@ runner = importlib.util.module_from_spec(spec)
 # `dataclass` resolves annotations through `sys.modules[cls.__module__]`.
 sys.modules["runner"] = runner
 spec.loader.exec_module(runner)
-runner.REMOTE_SYNC_BIN = sys.argv[2]
-args = sys.argv[3:]
+args = sys.argv[2:]
 while args and "=" in args[0] and not args[0].startswith("--"):
     key, value = args.pop(0).split("=", 1)
     if key == "harness_summary":
@@ -666,7 +651,6 @@ sys.exit(runner.main())
 "#;
 
 fn run_campaign_driver(
-    remote_sync_stub: &Path,
     env_vars: &[(&str, &Path)],
     overrides: &[String],
     runner_args: &[&str],
@@ -677,7 +661,6 @@ fn run_campaign_driver(
     cmd.arg("-c")
         .arg(RUNNER_DRIVER)
         .arg(root.join("scripts/run_diff_test_campaign.py"))
-        .arg(remote_sync_stub)
         .args(overrides)
         .args(runner_args)
         .arg("--state-dir")
@@ -1270,13 +1253,10 @@ fn campaign_runner_reports_not_evaluated_and_fails() {
     let state_dir = dir.join("state-dir");
     let junit = dir.join("diff_test_report.xml");
     let junit_arg = junit.to_string_lossy().into_owned();
-    let remote_sync_log = dir.join("remote-sync.log");
-    let remote_sync = dir.join("remote_sync_must_not_run.sh");
-    write_remote_sync_stub(&remote_sync, &remote_sync_log, 1);
 
     fs::create_dir_all(state_dir.join("state")).expect("create state dir");
     // A ledger written by an earlier runner version, with distinct starting
-    // counts, obsolete evaluation keys, and a capsule-launcher label.
+    // counts, obsolete evaluation keys, and a custom launcher label.
     fs::write(
         state_dir.join("state/campaign_ledger.json"),
         r#"{"next_miri_seed": "0x11", "next_itree_seed": "0x22", "total_campaigns_run": 4,
@@ -1287,15 +1267,12 @@ fn campaign_runner_reports_not_evaluated_and_fails() {
     .expect("write ledger");
 
     let out = run_campaign_driver(
-        &remote_sync,
         &[],
         &[],
         &[
             "--profile",
             "smoke",
             "--compile-only",
-            "--remote-uri",
-            "",
             "--junit-xml",
             &junit_arg,
         ],
@@ -1308,10 +1285,6 @@ fn campaign_runner_reports_not_evaluated_and_fails() {
         "a campaign without oracle comparison must exit with status 3:\n\
          stdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !remote_sync_log.exists(),
-        "the runner invoked remote-sync without an remote URI"
     );
 
     let report = assert_state_dir_reports_and_files(&state_dir, "smoke");
@@ -1408,15 +1381,12 @@ fi
         std::env::var("PATH").unwrap_or_default()
     ));
     let out2 = run_campaign_driver(
-        &remote_sync,
         &[("PATH", &path_env)],
         &[],
         &[
             "--profile",
             "smoke",
             "--compile-only",
-            "--remote-uri",
-            "",
             "--junit-xml",
             &junit_arg,
         ],
@@ -1463,79 +1433,10 @@ fi
 }
 
 #[test]
-fn campaign_runner_syncs_remote_only_when_asked() {
-    let dir = unique_temp_dir("remote_sync");
-    let log = dir.join("remote-sync.log");
-    let stub = dir.join("remote_sync_stub.sh");
-    write_remote_sync_stub(&stub, &log, 0);
-
-    // Without `--remote-uri`, a run must not touch remote at all.
-    let out = run_campaign_driver(
-        &stub,
-        &[],
-        &[],
-        &["--profile", "smoke", "--compile-only"],
-        &dir.join("default"),
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !log.exists(),
-        "a run without --remote-uri invoked remote-sync:\n{}",
-        fs::read_to_string(&log).unwrap_or_default()
-    );
-
-    // Positive control: with `--remote-uri`, the stub must be invoked for the
-    // files this run wrote, but not for a stale report left in the state
-    // directory by an earlier run.
-    let explicit = dir.join("explicit");
-    fs::create_dir_all(explicit.join("reports")).expect("create reports dir");
-    fs::write(
-        explicit.join("reports/2026-01-01_quick_campaign_report.md"),
-        "stale\n",
-    )
-    .expect("write stale report");
-    let base = "/remote/teams/example/differential-testing";
-    let out = run_campaign_driver(
-        &stub,
-        &[],
-        &[],
-        &["--profile", "smoke", "--compile-only", "--remote-uri", base],
-        &explicit,
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let calls = fs::read_to_string(&log).expect("remote-sync stub must have been invoked");
-    assert!(
-        calls.contains(&format!("{base}/state/campaign_ledger.json")),
-        "{calls}"
-    );
-    assert!(
-        calls.contains(&format!("{base}/reports/LATEST_REPORT.md")),
-        "{calls}"
-    );
-    assert!(
-        !calls.contains("2026-01-01_quick_campaign_report.md"),
-        "a stale report was uploaded:\n{calls}"
-    );
-}
-
-#[test]
 fn campaign_runner_rejects_oracle_claims_it_cannot_present() {
     let dir = unique_temp_dir("oracle_claim");
     let junit = dir.join("diff_test_report.xml");
     let junit_arg = junit.to_string_lossy().into_owned();
-    let remote_sync_log = dir.join("remote-sync.log");
-    let remote_sync = dir.join("remote_sync_must_not_run.sh");
-    write_remote_sync_stub(&remote_sync, &remote_sync_log, 1);
     let ledger =
         r#"{"next_miri_seed": "0x11", "next_itree_seed": "0x22", "total_campaigns_run": 4}"#;
 
@@ -1585,14 +1486,11 @@ fn campaign_runner_rejects_oracle_claims_it_cannot_present() {
         fs::create_dir_all(state_dir.join("state")).expect("create state dir");
         fs::write(state_dir.join("state/campaign_ledger.json"), ledger).expect("write ledger");
         let out = run_campaign_driver(
-            &remote_sync,
             &[],
             &[format!("harness_summary={summary}")],
             &[
                 "--profile",
                 "smoke",
-                "--remote-uri",
-                "",
                 "--junit-xml",
                 &junit_arg,
             ],
@@ -1625,14 +1523,11 @@ fn campaign_runner_rejects_oracle_claims_it_cannot_present() {
         fs::create_dir_all(state_dir.join("state")).expect("create state dir");
         fs::write(state_dir.join("state/campaign_ledger.json"), ledger).expect("write ledger");
         let out = run_campaign_driver(
-            &remote_sync,
             &[("PATH", &path_env)],
             &[],
             &[
                 "--profile",
                 "smoke",
-                "--remote-uri",
-                "",
                 "--junit-xml",
                 &junit_arg,
             ],
@@ -1646,9 +1541,4 @@ fn campaign_runner_rejects_oracle_claims_it_cannot_present() {
         );
         assert_failed_run(&state_dir, "n/a", "n/a");
     }
-
-    assert!(
-        !remote_sync_log.exists(),
-        "the runner invoked remote-sync without an remote URI"
-    );
 }

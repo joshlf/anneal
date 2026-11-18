@@ -12,7 +12,6 @@
 //! Miri `PATH` discovery, and red-flag vacuity checks.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,31 +36,13 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-fn write_executable(path: &Path, script: &str) {
-    fs::write(path, script).expect("write script");
-    let mut perms = fs::metadata(path).expect("stat script").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms).expect("chmod script");
-}
-
-fn write_remote_sync_stub(stub: &Path, log: &Path, exit_code: i32) {
-    write_executable(
-        stub,
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit {exit_code}\n",
-            log.display()
-        ),
-    );
-}
-
 const RUNNER_DRIVER: &str = r#"
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("runner", sys.argv[1])
 runner = importlib.util.module_from_spec(spec)
 sys.modules["runner"] = runner
 spec.loader.exec_module(runner)
-runner.REMOTE_SYNC_BIN = sys.argv[2]
-args = sys.argv[3:]
+args = sys.argv[2:]
 miri_override = None
 itree_override = None
 while args and "=" in args[0] and not args[0].startswith("--"):
@@ -86,7 +67,6 @@ sys.exit(runner.main())
 "#;
 
 fn run_campaign_driver(
-    remote_sync_stub: &Path,
     env_vars: &[(&str, &Path)],
     removed_env_vars: &[&str],
     overrides: &[String],
@@ -98,7 +78,6 @@ fn run_campaign_driver(
     cmd.arg("-c")
         .arg(RUNNER_DRIVER)
         .arg(root.join("scripts/run_diff_test_campaign.py"))
-        .arg(remote_sync_stub)
         .args(overrides)
         .args(runner_args)
         .arg("--state-dir")
@@ -120,9 +99,6 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     let state_dir = dir.join("state_dir");
     let junit = dir.join("diff_test_report.xml");
     let junit_arg = junit.to_string_lossy().into_owned();
-    let remote_sync_log = dir.join("remote-sync.log");
-    let remote_sync = dir.join("remote_sync_stub.sh");
-    write_remote_sync_stub(&remote_sync, &remote_sync_log, 0);
 
     // 1. Live smoke run with default seed `0x5eed0001` and no quarantine file:
     // must run real Miri + Anneal and real ITree + Lean `TraceCheck`, separate
@@ -130,15 +106,12 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     // and exit 0 (`PASS (0 divergences)`) now that all 4 previously open corpus
     // bugs (`DIFF-AB`, `DIFF-C`, `DIFF-D`, `DIFF-E`) are fixed in `MirSemantics`.
     let out1 = run_campaign_driver(
-        &remote_sync,
         &[],
         &[],
         &[],
         &[
             "--profile",
             "smoke",
-            "--remote-uri",
-            "",
             "--junit-xml",
             &junit_arg,
         ],
@@ -150,10 +123,6 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         out1.status.code(),
         Some(0),
         "live smoke campaign on 0x5eed0001 must exit 0:\nstdout:\n{stdout1}\nstderr:\n{stderr1}"
-    );
-    assert!(
-        !remote_sync_log.exists(),
-        "campaign without --remote-uri must not invoke remote-sync"
     );
 
     let report1 =
@@ -281,7 +250,6 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c3() -> u32 {
 
     let state_dir_div = dir.join("state_dir_div");
     let out_div = run_campaign_driver(
-        &remote_sync,
         &[],
         &[],
         &[format!("miri_summary={live_div_payload}")],
@@ -289,8 +257,6 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c3() -> u32 {
             "--profile",
             "smoke",
             "--miri-only",
-            "--remote-uri",
-            "",
             "--junit-xml",
             &junit_arg,
         ],
@@ -414,7 +380,6 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c3() -> u32 {
     .expect("write partial quarantine");
     let state_dir_partial = dir.join("state_dir_partial");
     let out_partial = run_campaign_driver(
-        &remote_sync,
         &[],
         &[],
         &[format!("miri_summary={live_div_payload}")],
@@ -458,7 +423,6 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c3() -> u32 {
     .expect("write full quarantine");
     let state_dir_clean = dir.join("state_dir_clean");
     let out_clean = run_campaign_driver(
-        &remote_sync,
         &[],
         &[],
         &[format!("miri_summary={live_div_payload}")],
@@ -506,9 +470,6 @@ fn campaign_orchestrator_fails_when_miri_removed_from_path() {
     let state_dir = dir.join("state_dir");
     let junit = dir.join("diff_test_report.xml");
     let junit_arg = junit.to_string_lossy().into_owned();
-    let remote_sync_log = dir.join("remote-sync.log");
-    let remote_sync = dir.join("remote_sync_stub.sh");
-    write_remote_sync_stub(&remote_sync, &remote_sync_log, 1);
 
     fs::create_dir_all(state_dir.join("state")).expect("create state dir");
     let initial_ledger =
@@ -539,7 +500,6 @@ fn campaign_orchestrator_fails_when_miri_removed_from_path() {
     }
 
     let out = run_campaign_driver(
-        &remote_sync,
         &[("PATH", &no_miri_bin)],
         &["ANNEAL_MIRI_BIN"],
         &[],
@@ -547,8 +507,6 @@ fn campaign_orchestrator_fails_when_miri_removed_from_path() {
             "--profile",
             "smoke",
             "--miri-only",
-            "--remote-uri",
-            "",
             "--junit-xml",
             &junit_arg,
         ],
@@ -584,9 +542,6 @@ fn campaign_orchestrator_fails_when_miri_removed_from_path() {
 #[test]
 fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     let dir = unique_temp_dir("red_flags");
-    let remote_sync_log = dir.join("remote-sync.log");
-    let remote_sync = dir.join("remote_sync_stub.sh");
-    write_remote_sync_stub(&remote_sync, &remote_sync_log, 1);
 
     let initial_ledger = r#"{
   "last_miri_seed": "0x00000011",
@@ -810,7 +765,6 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
             .expect("write ledger");
 
         let out = run_campaign_driver(
-            &remote_sync,
             &[],
             &[],
             &[format!("miri_summary={payload}")],
@@ -818,8 +772,6 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
                 "--profile",
                 "smoke",
                 "--miri-only",
-                "--remote-uri",
-                "",
                 "--junit-xml",
                 &junit_arg,
             ],
@@ -968,7 +920,6 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     .expect("write collision quarantine");
     let collision_state = dir.join("collision_state");
     let out_coll = run_campaign_driver(
-        &remote_sync,
         &[],
         &[],
         &[format!("miri_summary={collision_payload}")],
@@ -978,8 +929,6 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
             "--miri-only",
             "--quarantine-file",
             &collision_quarantine.to_string_lossy(),
-            "--remote-uri",
-            "",
         ],
         &collision_state,
     );
@@ -1066,14 +1015,13 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     }"#;
     let itree_rf_dir = dir.join("itree_red_flag");
     let out_itree_rf = run_campaign_driver(
-        &remote_sync,
         &[],
         &[],
         &[
             format!("miri_summary={clean_miri_payload}"),
             format!("itree_summary={bad_itree_payload}"),
         ],
-        &["--profile", "smoke", "--remote-uri", ""],
+        &["--profile", "smoke"],
         &itree_rf_dir,
     );
     let stdout_itree_rf = String::from_utf8_lossy(&out_itree_rf.stdout);
@@ -1144,14 +1092,13 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
 
     let itree_div_dir = dir.join("itree_div_unquarantined");
     let out_itree_div = run_campaign_driver(
-        &remote_sync,
         &[],
         &[],
         &[
             format!("miri_summary={clean_miri_payload}"),
             format!("itree_summary={div_itree_payload}"),
         ],
-        &["--profile", "smoke", "--remote-uri", ""],
+        &["--profile", "smoke"],
         &itree_div_dir,
     );
     let stdout_itree_div = String::from_utf8_lossy(&out_itree_div.stdout);
@@ -1175,7 +1122,6 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     .expect("write itree quarantine");
     let itree_quar_dir = dir.join("itree_div_quarantined");
     let out_itree_quar = run_campaign_driver(
-        &remote_sync,
         &[],
         &[],
         &[
@@ -1187,8 +1133,6 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
             "smoke",
             "--quarantine-file",
             &itree_quarantine.to_string_lossy(),
-            "--remote-uri",
-            "",
         ],
         &itree_quar_dir,
     );

@@ -7,15 +7,10 @@
 # This file may not be copied, modified, or distributed except according to
 # those terms.
 
-# Option B (CI Batch Instances) entrypoint for continuous Anneal differential
-# testing campaigns.
+# Entrypoint for continuous Anneal differential testing campaigns.
 #
-# Switching from Option A (Shared Agent Host +
-# `/remote/teams/anneal-agent/differential-testing/`) to Option B (CI Batch timed
-# batch jobs on CI runner) requires no changes to the differential testing
-# harnesses or campaign runner (`scripts/run_diff_test_campaign.py`):
-# point the CI Batch `.cfg` build_file at `anneal/ci/ci_diff_test.sh` and
-# set `ANNEAL_DIFF_TEST_GCS_BUCKET` if using GCS state sync.
+# To run timed batch jobs on CI, point your CI job at `anneal/ci/ci_diff_test.sh`
+# and set `ANNEAL_DIFF_TEST_GCS_BUCKET` if using GCS state sync.
 #
 # The campaign runner runs live Miri + Anneal oracle comparisons for
 # `miri-difftest` (exiting 4 on unquarantined divergences, 2 on harness or
@@ -48,7 +43,6 @@ status=0
 python3 "${REPO_ROOT}/scripts/run_diff_test_campaign.py" \
   --profile "${PROFILE}" \
   --state-dir "${STATE_DIR}" \
-  --remote-uri "" \
   --junit-xml "${JUNIT_XML}" \
   | tee "${REPORT_MD}" || status=$?
 

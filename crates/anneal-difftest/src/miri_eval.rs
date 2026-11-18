@@ -10302,7 +10302,7 @@ pub fn cand_shadow() -> u32 {
     fn miri_lean_jobs_and_cgroup_memory_limits_handle_thresholds_overrides_and_stat() {
         const GIB_KIB: u64 = 1024 * 1024;
 
-        // 32–36 GiB capsules clamp to 1 worker regardless of available memory.
+        // 32–36 GiB hosts clamp to 1 worker regardless of available memory.
         assert_eq!(
             miri_lean_jobs_for_memory(Some(32 * GIB_KIB), Some(30 * GIB_KIB)),
             1

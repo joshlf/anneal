@@ -1024,14 +1024,13 @@ def compute_stage_b_empirical_corpora(
 
     zc_root = zerocopy_dir
     if zc_root is None:
-        for candidate in (
-            repo_root.parent / "zerocopy",
-            Path.home() / "Projects/markdittmer/zerocopy",
-            Path("/usr/local/google/Projects/open/zerocopy"),
-        ):
+        env_zc = os.environ.get("ANNEAL_ZEROCOPY_DIR", "").strip()
+        if env_zc:
+            zc_root = Path(env_zc).expanduser()
+        else:
+            candidate = repo_root.parent / "zerocopy"
             if candidate.exists():
                 zc_root = candidate
-                break
 
     all_rs = list(examples_rs) + list(difftest_rs)
     if zc_root is not None and zc_root.exists():
@@ -1972,11 +1971,6 @@ _LEAN_RUN_VALUE_OPTS: frozenset[str] = frozenset(
         "--mode",
         "--memory-max-mb",
         "--timeout",
-        "--verify-bundle-ff",
-        "--check-unstable-ff",
-        "--ref",
-        "--repo-dir",
-        "--local-rev",
     )
 )
 _LEAN_RUN_BOOL_OPTS: frozenset[str] = frozenset(
@@ -1985,7 +1979,11 @@ _LEAN_RUN_BOOL_OPTS: frozenset[str] = frozenset(
         "--print-limits",
         "--json",
         "--no-slot-lock",
-        "--sync-if-behind",
+        "--nested-ok",
+        "--exclusive",
+        "--no-oom-retry",
+        "--unsafe-ignore-cgroup",
+        "--ensure-slice",
         "-h",
         "--help",
     )
@@ -2423,8 +2421,18 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
     the two can never drift apart (`_outer_timeout_sec` adds the wrapper's slot
     queueing and a grace margin on top).
     """
-    lean_run = str(repo_root / "scripts/anneal-lean-run")
-    has_lean_run = Path(lean_run).is_file() and os.access(lean_run, os.X_OK)
+    env_lean_run = os.environ.get("ANNEAL_LEAN_RUN", "").strip()
+    local_lean_run = repo_root / "scripts/anneal-lean-run"
+    if env_lean_run and Path(env_lean_run).is_file() and os.access(env_lean_run, os.X_OK):
+        lean_run = env_lean_run
+        has_lean_run = True
+    elif local_lean_run.is_file() and os.access(local_lean_run, os.X_OK):
+        lean_run = str(local_lean_run)
+        has_lean_run = True
+    else:
+        path_lean_run = shutil.which("anneal-lean-run")
+        lean_run = path_lean_run or str(local_lean_run)
+        has_lean_run = path_lean_run is not None
     steps: list[tuple[str, str, list[str], int]] = []
 
     def add(name: str, category: str, cmd: list[str], timeout_sec: int, wrap: str | None = None) -> None:
@@ -2451,7 +2459,7 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
     add("ci_check_non_stable_version", "cat7_python_and_ci_tests", ["bash", "./ci/check_non_stable_version.sh"], 30)
 
     if profile in ("quick", "nightly"):
-        # Cold `Trusted Anneal MiniRust` builds measure ~210 s on an 8-core capsule.
+        # Cold `Trusted Anneal MiniRust` builds measure ~210 s on an 8-core host.
         add(
             "lake_build_core_theory",
             "cat1_trusted_boundary",
@@ -2555,7 +2563,7 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             wrap="build",
         )
         # Cold `+Anneal.BitValidity +Anneal.ByteCodec +Anneal.Mir.Cast` after the core
-        # build measures ~96 s on an 8-core capsule; rebuilding `Anneal.Mir.AdtAndControl`
+        # build measures ~96 s on an 8-core host; rebuilding `Anneal.Mir.AdtAndControl`
         # (28.8k lines, also imported by `MiniRustSpec` via `DeinitBridge`, so
         # `lake_build_minirust_spec` reuses it) adds ~200 s. The `Correspondence.V2026_06_01`
         # L3/L5 and `MiniRustSpec.Correspondence.Translate` imports of

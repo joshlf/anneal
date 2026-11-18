@@ -3934,11 +3934,11 @@ mod tests {
             std::process::id()
         ));
         let slice = cg_root.join("user.slice");
-        let service = slice.join("rshelld.service");
+        let service = slice.join("runner.service");
         let leaf = service.join("server");
         fs::create_dir_all(&leaf).expect("create cgroup test hierarchy");
 
-        // Mirrors a systemd capsule: `user.slice` throttles at `memory.high`
+        // Mirrors a systemd service cgroup: `user.slice` throttles at `memory.high`
         // (19 GiB) below its `memory.max` (20 GiB); the service and leaf are
         // unbounded (`"max"` for both files).
         fs::write(slice.join("memory.max"), format!("{}\n", 20 * GIB)).unwrap();
@@ -3952,7 +3952,7 @@ mod tests {
             fs::write(dir.join("memory.max"), "max\n").unwrap();
             fs::write(dir.join("memory.high"), "max\n").unwrap();
         }
-        let proc_self_cgroup = "0::/user.slice/rshelld.service/server\n";
+        let proc_self_cgroup = "0::/user.slice/runner.service/server\n";
 
         // `memory.high` (19 GiB) is the binding bound; headroom = 19 - (3 + 1) = 15 GiB
         // (reclaimable `file` cache is not subtracted).
