@@ -134,6 +134,14 @@ theorem mirTy_eq_u64_of_beq {ty : MirTy}
     unfold MirTy.beq at h
     cases h
 
+/-- Universe-polymorphic four-way case split on `Fin 4` so `InitialCache` can
+synthesize both the returned `Val` and its `Executes` certificate in `Type`. -/
+def fin4_elim {motive : Fin 4 → Sort u}
+    (h0 : motive 0) (h1 : motive 1) (h2 : motive 2) (h3 : motive 3) :
+    ∀ w, motive w :=
+  Fin.cases h0
+    (Fin.cases h1 (Fin.cases h2 (Fin.cases h3 (fun i => Fin.elim0 i))))
+
 /-- A `u64` assignment whose computed value `v` equals `u64Val w`. Callers
 supply `h_val` from the `u64*Val_eq` lemmas above, so the stored slot holds the
 `BitVec 64` expression `w` instead of the semantics' 128-bit encoding. -/
@@ -152,6 +160,24 @@ theorem evalStatement_assignU64 {body : Body} {b i : Nat}
       .step (mkState b (i + 1) L₂) :=
   evalStatement_assign h_stmt h_proj h_ty h_rv h_val (checkVal_u64Val w)
     h_live h_set
+
+/-- Run a projection-free `u64` local assignment `.assign ⟨dstId, []⟩ rv` in
+`BlockExec` whose computed value `v` equals `u64Val w`, storing `u64Val w` over
+the pre-normalized `locals` table. -/
+theorem blockExec_assignU64 {body : Body} {blocks : List BasicBlock}
+    {locals : List MirTy} {bb : BasicBlock} {b i dstId : Nat}
+    {rv : Rvalue} {rest : List StatementKind} {L L₁ L₂ : List LocalSlot}
+    {v : Val} {w : Word} {o : Option Val} {out : Val}
+    (h_ty : Trusted.MirSemantics.getElem? locals dstId =
+      some (.int .i64 false))
+    (h_rv : evalRvalue locals L (.int .i64 false) rv = .ok (v, L₁))
+    (h_val : v = u64Val w)
+    (h_live : Trusted.MirSemantics.getElem? L₁ dstId = some (.live o))
+    (h_set : setElem? L₁ dstId (.live (some (u64Val w))) = some L₂)
+    (h_rest : BlockExec body blocks locals bb b (i + 1) rest L₂ out) :
+    BlockExec body blocks locals bb b i
+      (.assign ⟨dstId, []⟩ rv :: rest) L out :=
+  blockExec_assign_local h_ty h_rv h_val (checkVal_u64Val w) h_live h_set h_rest
 
 theorem natListBeq_eq {xs ys : List Nat} (h : natListBeq xs ys = true) :
     xs = ys := by

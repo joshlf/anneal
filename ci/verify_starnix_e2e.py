@@ -149,6 +149,11 @@ def run(arguments, work):
         arguments, execution_request(project / "request.json"),
         work / "baseline-checked-execution", work / "baseline-execution",
         "selected_unit_verified")
+    baseline_captured = (
+        work / "baseline-artifacts/capture/Captured.lean").read_bytes()
+    if (work / "baseline-checked-execution/capture/Captured.lean"
+            ).read_bytes() != baseline_captured:
+        raise RuntimeError("baseline execution check used a different capture")
     check_fixed_sources(project, "baseline")
     results = {"baseline": {"status": baseline["status"],
                              "execution_status": baseline_execution["status"],
@@ -172,12 +177,24 @@ def run(arguments, work):
             arguments, execution_request(candidate / "request.json"),
             work / f"{kind}-checked-execution", work / f"{kind}-execution",
             "selected_unit_verified")
+        mutated_captured = (
+            work / f"{kind}-checked-execution/capture/Captured.lean"
+        ).read_bytes()
+        if mutated_captured == baseline_captured:
+            raise RuntimeError(f"mutation {kind} did not alter captured MIR")
         rejected = verification(arguments, candidate / "request.json",
                                 work / f"{kind}-fixed-claims",
                                 work / f"{kind}-fixed", "proof_failed")
         check_fixed_sources(candidate, kind)
+        rejected_captured = (
+            work / f"{kind}-fixed-claims/capture/Captured.lean"
+        ).read_bytes()
+        if rejected_captured != mutated_captured:
+            raise RuntimeError(f"rejected capture differs from checked execution for {kind}")
         if rejected.get("phase") != "audit":
             raise RuntimeError(f"fixed property did not reach proof checking for {kind}")
+        if "timeout" in rejected.get("detail", "").lower():
+            raise RuntimeError(f"proof timeout must not count as rejection for {kind}")
         results[kind] = {"status": rejected["status"],
                          "phase": rejected["phase"],
                          "execution_status": checked_execution["status"],

@@ -18,51 +18,17 @@ open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp Endianness
 /-!
 A negative test may credit rejection of the fixed byte-reversal property only
 after the same captured body is shown to return on every valid entry. This
-proof states no expected return value, so CI reuses it unchanged on each
-mutated capture: the symbolic execution below binds the output to whatever the
-captured body actually returns. It runs the same rules in the same order as
-`ProductionClaims.sourceExecutes`, which explains that order.
+proof reuses `InitialCache.sourceExec`, which states no expected return value
+and binds the output to whatever the captured body actually returns.
 -/
 
 theorem completed :
     ∀ flag : Bool, ∀ width : Fin 4, ∀ value : Word,
       Safe sourceBody (endianArgs flag width.val value) ∧
-      ∃ output, Returns sourceBody (endianArgs flag width.val value) output := by
-  intro flag width value
-  suffices h : ∃ output,
-      Executes sourceBody (initial sourceBody (endianArgs flag width.val value))
-        output by
-    let ⟨output, h_exec⟩ := h
-    exact ⟨executes_safe h_exec, output, executes_returns h_exec⟩
-  revert width value
-  cases flag <;> apply fin4_cases <;> intro value <;> apply Exists.intro <;>
-  · unfold initial
-    repeat (first
-      | (apply executes_of_blockExec; eq_refl)
-      | (apply blockExec_storageLive; eq_refl; eq_refl)
-      | (apply blockExec_storageDead; eq_refl; eq_refl)
-      | (apply blockExec_cons
-         apply evalStatement_assignU64 (rv := .binaryOp .bitAnd _ _)
-         eq_refl; eq_refl; eq_refl; eq_refl; apply u64BitAndVal_eq
-         eq_refl; eq_refl)
-      | (apply blockExec_cons
-         apply evalStatement_assignU64 (rv := .binaryOp .bitOr _ _)
-         eq_refl; eq_refl; eq_refl; eq_refl; apply u64BitOrVal_eq
-         eq_refl; eq_refl)
-      | (apply blockExec_cons
-         apply evalStatement_assignU64 (rv := .binaryOp .shl _ _)
-         eq_refl; eq_refl; eq_refl; eq_refl; apply u64ShlVal_eq
-         eq_refl; eq_refl)
-      | (apply blockExec_cons
-         apply evalStatement_assignU64 (rv := .binaryOp .shr _ _)
-         eq_refl; eq_refl; eq_refl; eq_refl; apply u64ShrVal_eq
-         eq_refl; eq_refl)
-      | (apply blockExec_cons
-         apply evalStatement_assignU64 (rv := .use _)
-         eq_refl; eq_refl; eq_refl; eq_refl; eq_refl; eq_refl; eq_refl)
-      | (apply blockExec_cons; eq_refl)
-      | (apply blockExec_nil_step; eq_refl; eq_refl)
-      | (apply blockExec_nil_ret; eq_refl; eq_refl))
+      ∃ output, Returns sourceBody (endianArgs flag width.val value) output :=
+  fun flag width value =>
+    let ⟨output, h_exec⟩ := sourceExec flag width value
+    ⟨executes_safe h_exec, output, executes_returns h_exec⟩
 
 theorem verify : Expected.claim := by
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩

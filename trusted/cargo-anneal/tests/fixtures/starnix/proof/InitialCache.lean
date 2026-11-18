@@ -25,4 +25,41 @@ noncomputable abbrev dataWidthVal (width : Nat) : Val :=
 noncomputable abbrev endianArgs (toBe : Bool) (width : Nat) (value : Word) : List Val :=
   bodyEndianArgs sourceBody toBe width value
 
+/-- Execute `sourceBody` symbolically along each `(toBe, width)` path and
+bundle the resulting `Val` with its `Executes` certificate. Keeping this
+execution witness free of the byte-reversal specification lets both
+`ProductionClaims` (which equates `(sourceExec ...).1` with `sourceOutput`) and
+`ExecutionProof` (which proves safe termination on mutated captures without
+prescribing return values) share one symbolic-execution proof with zero
+duplicated tactics. -/
+noncomputable def sourceExec (toBe : Bool) (width : Fin 4) (value : Word) :
+    { output : Val //
+      Executes sourceBody
+        (initial sourceBody (endianArgs toBe width.val value)) output } := by
+  revert width value
+  cases toBe <;> apply fin4_elim <;> intro value <;> apply Subtype.mk <;>
+  · unfold initial
+    apply executes_of_blockExec
+    eq_refl; eq_refl; eq_refl; eq_refl
+    repeat (first
+      | (apply blockExec_nop)
+      | (apply blockExec_storageLive; eq_refl; eq_refl; eq_refl)
+      | (apply blockExec_storageDead; eq_refl; eq_refl)
+      | (apply blockExec_assignU64 (rv := .binaryOp .bitAnd _ _)
+         eq_refl; eq_refl; apply u64BitAndVal_eq; eq_refl; eq_refl)
+      | (apply blockExec_assignU64 (rv := .binaryOp .bitOr _ _)
+         eq_refl; eq_refl; apply u64BitOrVal_eq; eq_refl; eq_refl)
+      | (apply blockExec_assignU64 (rv := .binaryOp .shl _ _)
+         eq_refl; eq_refl; apply u64ShlVal_eq; eq_refl; eq_refl)
+      | (apply blockExec_assignU64 (rv := .binaryOp .shr _ _)
+         eq_refl; eq_refl; apply u64ShrVal_eq; eq_refl; eq_refl)
+      | (apply blockExec_assignU64 (rv := .use (.copy _))
+         eq_refl; eq_refl; eq_refl; eq_refl; eq_refl)
+      | (apply blockExec_assignU64 (rv := .use (.move _))
+         eq_refl; eq_refl; eq_refl; eq_refl; eq_refl)
+      | (apply blockExec_cons; eq_refl)
+      | (apply blockExec_nil_goto; eq_refl; eq_refl; eq_refl)
+      | (apply blockExec_nil_step; eq_refl; eq_refl; eq_refl)
+      | (apply blockExec_nil_ret; eq_refl))
+
 end ProductionReduction
