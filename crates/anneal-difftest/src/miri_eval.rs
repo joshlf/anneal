@@ -107,7 +107,7 @@ pub const WITNESS_POLARITY_NAMES: [&str; 4] = [
 ///   (`ub_location_mismatch`, `panic_site_mismatch`). The class is not
 ///   directional, but it is not benign either: a `wrong_value` means Anneal
 ///   computed a result the program does not produce (for example, through the
-///   Category 9 frame-relative pointer gap in `tests/miri-diff/README.md`), so
+///   Category 9 skipped `Drop` side effect in `tests/miri-diff/README.md`), so
 ///   any value-level claim resting on it is unsound and needs triage.
 /// - [`WitnessPolarity::HarnessOrExtractionError`]
 ///   (`"harness_or_extraction_error"`): no semantic comparison was possible: a
@@ -1576,6 +1576,19 @@ pub fn resolve_rustc_bin() -> String {
 /// another's output before `rustc` wrote it.
 static SNIPPET_COMPILE_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+fn build_snippet_rustc_command(rustc_bin: &str, out_path: &Path) -> Command {
+    let mut cmd = Command::new(rustc_bin);
+    cmd.env_remove("ANNEAL_CAPTURE_DIR")
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+        .args(["--edition=2024", "--crate-type=lib", "-A", "warnings", "-o"])
+        .arg(out_path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 /// Runs `rustc --edition=2024 --crate-type=lib` on an in-memory Rust source
 /// string and reports whether it compiled.
 pub fn compile_rust_snippet(label: &str, source: &str) -> bool {
@@ -1589,14 +1602,7 @@ pub fn compile_rust_snippet(label: &str, source: &str) -> bool {
     let _ = fs::create_dir_all(&tmp_dir);
     let out_path = tmp_dir.join("libmiri_check.rlib");
 
-    let child_res = Command::new(&rustc_bin)
-        .args(["--edition=2024", "--crate-type=lib", "-A", "warnings", "-o"])
-        .arg(&out_path)
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+    let child_res = build_snippet_rustc_command(&rustc_bin, &out_path).spawn();
 
     let Ok(mut child) = child_res else {
         let _ = fs::remove_dir_all(&tmp_dir);
@@ -2622,13 +2628,16 @@ fn staged_helper_fns_reachable_from_candidates(
     staged_fns_and_aux_reachable_from_candidates(lib_rs, items).0
 }
 
+static STAGING_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+
 fn create_staging_dir(label: &str) -> Result<PathBuf, String> {
+    let seq = STAGING_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let dir = env::temp_dir().join(format!(
-        "anneal_miri_eval_{label}_{}_{stamp}",
+        "anneal_miri_eval_{label}_{}_{seq}_{stamp}",
         std::process::id()
     ));
     fs::create_dir_all(dir.join("src"))
@@ -3090,6 +3099,36 @@ fn resolve_cargo_bin() -> PathBuf {
     PathBuf::from("cargo")
 }
 
+fn build_ensure_rustc_wrapper_command(cargo_bin: &Path, root: &Path) -> Command {
+    let mut cmd = Command::new(cargo_bin);
+    cmd.args(["build", "-p", "anneal-rustc-capture", "--locked"])
+        .current_dir(root)
+        .env_remove("ANNEAL_CAPTURE_DIR")
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    cmd
+}
+
+fn build_batch_capture_command(
+    cargo_bin: &Path,
+    corpus_root: &Path,
+    wrapper: &Path,
+    units_dir: &Path,
+    rustflags: &str,
+) -> Command {
+    let mut cmd = Command::new(cargo_bin);
+    cmd.current_dir(corpus_root)
+        .arg("check")
+        .arg("--lib")
+        .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+        .env_remove("RUSTC_WRAPPER")
+        .env("ANNEAL_CAPTURE_DIR", units_dir)
+        .env("RUSTFLAGS", rustflags)
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV);
+    cmd
+}
+
 fn ensure_rustc_wrapper(
     driver_cfg: &CaptureDriverConfig,
     anneal_repo_root: Option<&Path>,
@@ -3115,9 +3154,7 @@ fn ensure_rustc_wrapper(
             return Ok(built);
         }
         let cargo_bin = resolve_cargo_bin();
-        let output = Command::new(&cargo_bin)
-            .args(["build", "-p", "anneal-rustc-capture", "--locked"])
-            .current_dir(root)
+        let output = build_ensure_rustc_wrapper_command(&cargo_bin, root)
             .output()
             .map_err(|e| format!("failed to invoke cargo build for anneal-rustc-capture: {e}"))?;
         if output.status.success() && built.is_file() {
@@ -4792,16 +4829,10 @@ fn run_linked_difftest_oracle_pipeline(
         config.capture_rustflags.join(" ")
     };
     let cargo_bin = resolve_cargo_bin();
-    let capture_out = Command::new(&cargo_bin)
-        .current_dir(&corpus_root)
-        .arg("check")
-        .arg("--lib")
-        .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
-        .env("ANNEAL_CAPTURE_DIR", &units_dir)
-        .env("RUSTFLAGS", rustflags)
-        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
-        .output()
-        .map_err(|err| format!("failed to execute cargo check on corpus: {err}"))?;
+    let capture_out =
+        build_batch_capture_command(&cargo_bin, &corpus_root, &wrapper, &units_dir, &rustflags)
+            .output()
+            .map_err(|err| format!("failed to execute cargo check on corpus: {err}"))?;
     if !capture_out.status.success() {
         let stderr = String::from_utf8_lossy(&capture_out.stderr);
         return Err(format!(
@@ -8510,7 +8541,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         );
     }
 
-    /// Probes for the 8-family semantic-mutant self-check, keyed by probe id (a
+    /// Probes for the 9-family semantic-mutant self-check, keyed by probe id (a
     /// mutant id, or the `probe["id"]` of a variant that needs its own program).
     /// Each exercises one check of Anneal's semantics on which the live engine
     /// agrees with Miri, so a mutant of the semantics that omits or perturbs that
@@ -8519,12 +8550,16 @@ pub fn parameterized_after(x: u32) -> u32 { x }
     /// the inline `exact_div` remainder and signed-overflow guards, the
     /// `ctlz_nonzero` zero guard, and an `FnEntry`-protected call whose callee
     /// writes the protected place through a raw alias) are killed by a mutant that
-    /// returns normally (`missed_ub` / `panic_vs_return`), and the probes on which
+    /// returns normally (`missed_ub` / `panic_vs_return`), the probes on which
     /// Miri returns normally (`Operand::Move` of a non-`Copy` wrapper under a
     /// `Reserved` child reborrow, and a caller write after an `FnEntry`-protected
     /// call returns) are killed by a mutant that faults spuriously
-    /// (`false_positive_ub`). `scripts/run_diff_test_campaign.py` embeds
-    /// byte-identical sources in `SEEDED_SEMANTIC_MUTANTS` (checked by
+    /// (`false_positive_ub`), and the multi-element `copy_nonoverlapping` probe
+    /// (both `u32` elements of a `[u32; 2]` copied through whole-array pointer
+    /// casts, returning `22 ^ 99 = 117`) is killed by a mutant that copies only
+    /// the first element and returns `22` (`wrong_value`).
+    /// `scripts/run_diff_test_campaign.py` embeds byte-identical sources in
+    /// `SEEDED_SEMANTIC_MUTANTS` (checked by
     /// `scripts/test_run_diff_test_campaign.py`).
     ///
     /// `provenance_frag` overwrites all 8 bytes of the stored pointer `p` with the
@@ -8535,7 +8570,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
     /// address and that this address reads `x`'s value `7` once it has provenance,
     /// so a mutant that accepts the provenance-free pointer returns `7`
     /// (`missed_ub`) instead of trapping.
-    const SEMANTIC_MUTANT_PROBES: [(&str, &str); 11] = [
+    const SEMANTIC_MUTANT_PROBES: [(&str, &str); 12] = [
         (
             "bool_valid_range",
             r#"pub fn probe_bool_valid_range() -> u32 {
@@ -8660,6 +8695,18 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
 }
 "#,
         ),
+        (
+            "subplace_multi_elem_copy_truncation",
+            r#"pub fn probe_subplace_multi_elem_copy_truncation() -> u32 {
+    let src: [u32; 2] = [22u32, 99u32];
+    let mut dst: [u32; 2] = [0u32, 0u32];
+    unsafe {
+        copy_nonoverlapping((&raw const src) as *const u32, (&raw mut dst) as *mut u32, 2usize);
+    }
+    dst[0] ^ dst[1]
+}
+"#,
+        ),
     ];
 
     /// Semantic-mutant probes that call a crate helper (`helper_reborrow_mid` from
@@ -8679,7 +8726,7 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
     /// `scripts/run_diff_test_campaign.py` replays as the unmutated baseline
     /// (checked identical by `scripts/test_run_diff_test_campaign.py`), so the
     /// simulated self-check baselines are the real engine's outcomes.
-    const SEMANTIC_MUTANT_PROBE_OUTCOMES: [(&str, &str, &str, &str); 11] = [
+    const SEMANTIC_MUTANT_PROBE_OUTCOMES: [(&str, &str, &str, &str); 12] = [
         (
             "bool_valid_range",
             "ub@src/lib.rs:5:5",
@@ -8746,6 +8793,12 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
             "ub@src/lib.rs:11:9: 11:22",
             "MirDiffTag.ub",
         ),
+        (
+            "subplace_multi_elem_copy_truncation",
+            "pass:scalar:117:4",
+            "pass:scalar:117:4",
+            "(MirDiffTag.normalScalar 117 4)",
+        ),
     ];
 
     /// Controls and known gaps for the probes on which Miri returns normally or
@@ -8763,7 +8816,21 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
     ///    `probe_protector_conflict` is the `FnEntry` protector violation. The live
     ///    engine reports UB at the write either way (its sibling-root retag freeze
     ///    of `raw`, `tests/miri-diff/README.md`), a known `false_positive_ub`.
-    const SEMANTIC_MUTANT_CONTROL_PROBES: [(&str, &str); 2] = [
+    /// 3. `probe_gap_subplace_multi_elem_copy` is `subplace_multi_elem_copy_truncation`
+    ///    with the copy between the *element* sub-places
+    ///    `copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize)` instead
+    ///    of whole-array pointer casts. Miri copies both elements and returns
+    ///    `22 ^ 99 = 117`, but the live engine copies only the first element
+    ///    through the `.constantIndex` sub-place pointer and returns `22`
+    ///    (`wrong_value`), so a "copy only the first element" mutant would be
+    ///    equivalent to the current engine on that form and could never be killed:
+    ///    the probe uses the whole-array casts, and this known gap stays pinned
+    ///    (kernel-confirmed) until `Trusted.Rustc.V2026_06_01.MirSemantics.Statements`
+    ///    copies every element of a sub-place `copy_nonoverlapping`.
+    /// 4. `probe_gap_subplace_multi_elem_copy_88_66` repeats gap 3 with `[88, 66]`:
+    ///    Miri returns `88 ^ 66 = 26` and the live engine `88`, so the engine's value
+    ///    is the first source element rather than a constant.
+    const SEMANTIC_MUTANT_CONTROL_PROBES: [(&str, &str); 4] = [
         (
             "probe_gap_move_subplace_reborrow_write",
             r#"pub fn probe_gap_move_subplace_reborrow_write() -> u32 {
@@ -8786,6 +8853,30 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
         *raw = 8u32;
     }
     3u32 + unsafe { *raw }
+}
+"#,
+        ),
+        (
+            "probe_gap_subplace_multi_elem_copy",
+            r#"pub fn probe_gap_subplace_multi_elem_copy() -> u32 {
+    let src: [u32; 2] = [22u32, 99u32];
+    let mut dst: [u32; 2] = [0u32, 0u32];
+    unsafe {
+        copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize);
+    }
+    dst[0] ^ dst[1]
+}
+"#,
+        ),
+        (
+            "probe_gap_subplace_multi_elem_copy_88_66",
+            r#"pub fn probe_gap_subplace_multi_elem_copy_88_66() -> u32 {
+    let src: [u32; 2] = [88u32, 66u32];
+    let mut dst: [u32; 2] = [0u32, 0u32];
+    unsafe {
+        copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize);
+    }
+    dst[0] ^ dst[1]
 }
 "#,
         ),
@@ -9010,15 +9101,18 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
     /// the protector conflict). `probe_provenance_frag` must fail in Miri for lack
     /// of provenance, and both `PROVENANCE_FRAG_CONTROL_PROBES` must agree on their
     /// return values (the rewritten pointer holds `x`'s address, which reads `7`
-    /// with provenance). The three provenance gap probes and the two
+    /// with provenance). The three provenance gap probes and the four
     /// `SEMANTIC_MUTANT_CONTROL_PROBES` are kernel-confirmed engine gaps, pinned
     /// exactly as measured: the overwritten-byte and mixed-fragment probes are
     /// `missed_ub` (the engine returns `7` and `9`), the `u8` round trip is a
     /// `ub_location_mismatch` (the engine flags the `u8` load of a pointer byte,
-    /// Miri the later dereference), and the sub-place move and unprotected alias
+    /// Miri the later dereference), the sub-place move and unprotected alias
     /// write are `false_positive_ub` at the child / raw write on which Miri returns
-    /// `42` / `11`. When the engine changes on any probe, this test fails and the
-    /// pin must be updated (a ratchet, like a `known_anneal_bug` entry).
+    /// `42` / `11`, and the element sub-place multi-element copies are
+    /// `wrong_value` (`value_mismatch`: the engine returns the first source element
+    /// `22` / `88` where Miri returns `117` / `26`). When the engine changes on any
+    /// probe, this test fails and the pin must be updated (a ratchet, like a
+    /// `known_anneal_bug` entry).
     #[test]
     fn semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned() {
         let gap_probes = KNOWN_PROVENANCE_GAP_PROBES;
@@ -9200,6 +9294,46 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
                 "known engine gap `{name}` changed (fixed?): verdict={:?} miri={:?} anneal={:?} \
                  kernel_confirmed={}; update the pin and the probe notes in \
                  SEEDED_SEMANTIC_MUTANTS",
+                item.verdict,
+                item.miri,
+                item.anneal,
+                item.kernel_confirmed
+            );
+        }
+
+        // The element sub-place `copy_nonoverlapping` gap (`wrong_value`): Miri copies
+        // both elements, while the live engine copies only the first one, so its
+        // value is `src[0]` (`22`, `88`) where Miri returns `src[0] ^ src[1]`.
+        for (name, miri_bits, anneal_bits) in [
+            ("probe_gap_subplace_multi_elem_copy", 117u128, 22u128),
+            ("probe_gap_subplace_multi_elem_copy_88_66", 26u128, 88u128),
+        ] {
+            let item = &linked[name];
+            let ComparisonVerdict::Diverge(kind) = &item.verdict else {
+                panic!(
+                    "known engine gap `{name}` no longer diverges (fixed?): verdict={:?} \
+                     miri={:?} anneal={:?}; update the pin, the `RawPtrOffsetMutator` \
+                     copy template, and the probe notes in SEEDED_SEMANTIC_MUTANTS",
+                    item.verdict, item.miri, item.anneal
+                );
+            };
+            assert!(
+                matches!(kind, DivergenceKind::WrongValue { .. })
+                    && classify_divergence_kind_polarity(kind) == WitnessPolarity::ValueMismatch
+                    && item.miri
+                        == MiriOutcome::PassScalar {
+                            bits: miri_bits,
+                            size_bytes: 4,
+                        }
+                    && item.anneal
+                        == AnnealOutcome::PassScalar {
+                            bits: anneal_bits,
+                            size_bytes: 4,
+                        }
+                    && item.kernel_confirmed,
+                "known engine gap `{name}` changed (fixed?): verdict={:?} miri={:?} anneal={:?} \
+                 kernel_confirmed={}; update the pin, the `RawPtrOffsetMutator` copy template, \
+                 and the probe notes in SEEDED_SEMANTIC_MUTANTS",
                 item.verdict,
                 item.miri,
                 item.anneal,
@@ -11850,6 +11984,115 @@ pub fn cand_shadow() -> u32 {
         assert!(
             !extracted.contains("Mir.X.helper_wrong.body"),
             "panic comment in group 0 must not hijack cand_real's namespace: {extracted}"
+        );
+    }
+
+    #[test]
+    fn snippet_rustc_and_staging_dir_isolate_capture_env_and_paths() {
+        use std::ffi::OsStr;
+
+        let cmd = build_snippet_rustc_command("rustc", Path::new("/tmp/libmiri_check.rlib"));
+        let envs: BTreeMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+        for removed in ["ANNEAL_CAPTURE_DIR", ANNEAL_CAPTURE_FILTER_ENV] {
+            assert_eq!(
+                envs.get(OsStr::new(removed)),
+                Some(&None),
+                "build_snippet_rustc_command must remove {removed}"
+            );
+        }
+
+        let wrapper_cmd =
+            build_ensure_rustc_wrapper_command(Path::new("cargo"), Path::new("/tmp/anneal"));
+        let wrapper_envs: BTreeMap<&OsStr, Option<&OsStr>> = wrapper_cmd.get_envs().collect();
+        for removed in [
+            "ANNEAL_CAPTURE_DIR",
+            ANNEAL_CAPTURE_FILTER_ENV,
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            assert_eq!(
+                wrapper_envs.get(OsStr::new(removed)),
+                Some(&None),
+                "build_ensure_rustc_wrapper_command must remove {removed}"
+            );
+        }
+
+        let capture_cmd = build_batch_capture_command(
+            Path::new("cargo"),
+            Path::new("/tmp/corpus"),
+            Path::new("/opt/bin/anneal-rustc-capture"),
+            Path::new("/tmp/corpus/units"),
+            "-Zmir-opt-level=0",
+        );
+        let capture_envs: BTreeMap<&OsStr, Option<&OsStr>> = capture_cmd.get_envs().collect();
+        for removed in ["RUSTC_WRAPPER", ANNEAL_CAPTURE_FILTER_ENV] {
+            assert_eq!(
+                capture_envs.get(OsStr::new(removed)),
+                Some(&None),
+                "build_batch_capture_command must remove {removed}"
+            );
+        }
+        for (key, value) in [
+            ("RUSTC_WORKSPACE_WRAPPER", "/opt/bin/anneal-rustc-capture"),
+            ("ANNEAL_CAPTURE_DIR", "/tmp/corpus/units"),
+            ("RUSTFLAGS", "-Zmir-opt-level=0"),
+        ] {
+            assert_eq!(
+                capture_envs.get(OsStr::new(key)),
+                Some(&Some(OsStr::new(value))),
+                "build_batch_capture_command must set {key}"
+            );
+        }
+
+        let d1 = create_staging_dir("unit").expect("staging dir 1");
+        let d2 = create_staging_dir("unit").expect("staging dir 2");
+        assert_ne!(d1, d2, "concurrent staging dirs must be distinct");
+        let _ = fs::remove_dir_all(&d1);
+        let _ = fs::remove_dir_all(&d2);
+    }
+
+    /// Each `anneal-difftest` test binary runs its tests in parallel threads of
+    /// one process, and the oracles read the process environment (`HOME`,
+    /// `PATH`, `CARGO`, `RUSTC`, `ANNEAL_*`) and working directory, so a test
+    /// that mutates either races every other test. Tests vary the environment
+    /// of child processes with `Command::env`, `Command::env_remove`, and
+    /// `Command::current_dir` instead (as the `--reproduce` run with an ambient
+    /// `ANNEAL_CAPTURE_DIR` in `tests/miri_difftest_oracle.rs` does). This
+    /// mirrors `cargo_anneal_sources_never_mutate_the_process_environment`.
+    #[test]
+    fn anneal_difftest_sources_never_mutate_the_process_environment() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let forbidden = [
+            concat!("set", "_var("),
+            concat!("remove", "_var("),
+            concat!("set_current", "_dir("),
+        ];
+        let mut stack = vec![manifest_dir.join("src"), manifest_dir.join("tests")];
+        let mut offenders = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).expect("read source dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = fs::read_to_string(&path).expect("read source");
+                    for (lineno, line) in text.lines().enumerate() {
+                        if forbidden.iter().any(|needle| line.contains(needle)) {
+                            offenders.push(format!(
+                                "{}:{}: {}",
+                                path.display(),
+                                lineno + 1,
+                                line.trim()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "process-environment mutation in anneal-difftest sources:\n{}",
+            offenders.join("\n")
         );
     }
 }

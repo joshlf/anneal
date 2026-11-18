@@ -207,11 +207,52 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         "coverage_ratchet.json must record non-zero cumulative_distinct_obs_paths:\n{ratchet_json}"
     );
 
+    // 1b. Standalone `--self-check-mutants` gate through `run_campaign_driver` kills
+    // all 9/9 seeded semantic mutants (including `subplace_multi_elem_copy_truncation`
+    // under `value_mismatch`).
+    let state_dir_mutants = dir.join("state_dir_mutants");
+    let out_mutants = run_campaign_driver(
+        &[],
+        &[],
+        &[],
+        &["--self-check-mutants"],
+        &state_dir_mutants,
+    );
+    let stdout_mutants = String::from_utf8_lossy(&out_mutants.stdout);
+    let stderr_mutants = String::from_utf8_lossy(&out_mutants.stderr);
+    assert_eq!(
+        out_mutants.status.code(),
+        Some(0),
+        "--self-check-mutants must exit 0:\nstdout:\n{stdout_mutants}\nstderr:\n{stderr_mutants}"
+    );
+    assert!(
+        stdout_mutants.contains("(`9/9` killed)")
+            && stdout_mutants.contains("`subplace_multi_elem_copy_truncation`")
+            && stdout_mutants.contains("`value_mismatch`=1"),
+        "--self-check-mutants report must confirm 9/9 mutants killed including value_mismatch:\n{stdout_mutants}"
+    );
+
     // 2. Live kernel-confirmed Miri vs. Anneal divergence bundle + `--reproduce` +
     // unquarantined / partial-quarantine / full-quarantine verification:
-    // Evaluate a batch with 3 corpus candidates plus a negative-control
-    // candidate (`char` surrogate written through `*mut u32`) through live
-    // `evaluate_miri_batches` to produce a real `repro.rs` bundle on disk.
+    // Evaluate a batch with 3 corpus candidates, `neg_ctrl_char_surrogate_via_ptr__b0_c3`
+    // (a positive regression check: since `DIV-LM-RAW-OVERWRITE-CHAR-COPY` was fixed
+    // in `86255c4698`, Miri and Anneal agree that reading a surrogate `char` written
+    // through `*mut u32` is UB), and the oracle-separated negative control
+    // `neg_ctrl_synthetic_missed_ub__b0_c4` through live `evaluate_miri_batches` to
+    // produce a real `repro.rs` bundle on disk.
+    //
+    // The negative control's divergence must not depend on any `trusted/` semantic
+    // gap (a fixed gap, such as the surrogate `char` copy above, turns a divergence
+    // into an agreement, and an unmodeled construct such as `Drop` glue turns it into
+    // `not_compared`). It branches on `option_env!("ANNEAL_CAPTURE_DIR")`, which is
+    // set for every `anneal-rustc-capture` compilation (the capture wrapper records
+    // nothing without it) and never for the plain `rustc` compilation of the Miri
+    // `.rlib`; `run_miri_oracle` removes any ambient value, so the split does
+    // not depend on this test's environment. Anneal therefore evaluates the
+    // defined branch (`normalScalar 2 4`, kernel-confirmed by `rfl`), while
+    // Miri evaluates an invalid `bool` read, which is UB. `cfg(miri)` cannot
+    // split the oracles: the corpus `.rlib` is compiled by plain `rustc`
+    // without `--cfg miri`, so Miri executes `cfg(not(miri))` code.
     let root = repo_root();
     let mut div_batch =
         anneal_difftest::mutators_miri::generate_miri_corpus_batch(3, 0x5eed_0001, 0);
@@ -236,17 +277,94 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c3() -> u32 {
         fn_source: neg_fn.to_string(),
         source: anneal_difftest::mutators_miri::build_standalone_candidate_source(neg_fn),
     });
+    let neg_synthetic_fn = r#"pub fn neg_ctrl_synthetic_missed_ub__b0_c4() -> u32 {
+    const ANNEAL_CAPTURE: bool = option_env!("ANNEAL_CAPTURE_DIR").is_some();
+    if ANNEAL_CAPTURE {
+        2u32
+    } else {
+        let raw: u8 = 2u8;
+        let b: bool = unsafe { *(&raw const raw as *const bool) };
+        b as u32
+    }
+}
+"#;
+    div_batch.push(anneal_difftest::mutators_miri::GeneratedMiriCandidate {
+        id: 4,
+        seed_index: 0,
+        seed_name: "ub_transmute_invalid_bool_through_ptr".to_string(),
+        fn_name: "neg_ctrl_synthetic_missed_ub__b0_c4".to_string(),
+        seed_u64: 0xDEAD_C0DE,
+        applied_mutators: vec!["BitValidityTransmuteMutator".to_string()],
+        tracked_locals: Vec::new(),
+        fn_source: neg_synthetic_fn.to_string(),
+        source: anneal_difftest::mutators_miri::build_standalone_candidate_source(neg_synthetic_fn),
+    });
     let live_findings_dir = dir.join("live_findings");
     let live_div_eval = anneal_difftest::miri_eval::evaluate_miri_batches(
         "seeded",
         0x5eed_0001,
         &[div_batch],
-        4,
+        5,
         Some(&live_findings_dir),
         Some(&root),
     )
     .expect("evaluate live divergence batch");
+    let char_surrogate_rep = live_div_eval
+        .item_reports
+        .iter()
+        .find(|r| r.name == "neg_ctrl_char_surrogate_via_ptr__b0_c3")
+        .expect("item report for neg_ctrl_char_surrogate_via_ptr__b0_c3");
+    assert!(
+        matches!(char_surrogate_rep.verdict, cargo_anneal::ComparisonVerdict::Agree)
+            && matches!(char_surrogate_rep.miri, cargo_anneal::MiriOutcome::Ub { .. })
+            && matches!(char_surrogate_rep.anneal, cargo_anneal::AnnealOutcome::Ub { .. }),
+        "neg_ctrl_char_surrogate_via_ptr__b0_c3 must be UB in both Miri and Anneal \
+         (DIV-LM-RAW-OVERWRITE-CHAR-COPY): {char_surrogate_rep:?}"
+    );
+    let synthetic_div_rep = live_div_eval
+        .item_reports
+        .iter()
+        .find(|r| r.name == "neg_ctrl_synthetic_missed_ub__b0_c4")
+        .expect("item report for neg_ctrl_synthetic_missed_ub__b0_c4");
+    assert!(
+        matches!(
+            synthetic_div_rep.verdict,
+            cargo_anneal::ComparisonVerdict::Diverge(cargo_anneal::DivergenceKind::MissedUb { .. })
+        ) && matches!(synthetic_div_rep.miri, cargo_anneal::MiriOutcome::Ub { .. })
+            && matches!(
+                synthetic_div_rep.anneal,
+                cargo_anneal::AnnealOutcome::PassScalar {
+                    bits: 2,
+                    size_bytes: 4
+                }
+            )
+            && synthetic_div_rep.kernel_confirmed,
+        "neg_ctrl_synthetic_missed_ub__b0_c4 must split the oracles into Miri UB vs. \
+         kernel-confirmed Anneal `normalScalar 2 4` (missed_ub): {synthetic_div_rep:?}"
+    );
     let live_div_payload = anneal_difftest::miri_eval::render_eval_report_json(&live_div_eval);
+    let item_outcome_row = |name: &str| -> String {
+        let key = format!("\"{name}\": {{\"verdict\": ");
+        live_div_payload
+            .lines()
+            .find(|line| line.trim_start().starts_with(&key))
+            .unwrap_or_else(|| panic!("no item_outcomes row for {name}:\n{live_div_payload}"))
+            .to_string()
+    };
+    let char_surrogate_row = item_outcome_row("neg_ctrl_char_surrogate_via_ptr__b0_c3");
+    assert!(
+        char_surrogate_row.contains("\"verdict\": \"agree\"")
+            && char_surrogate_row.contains("\"anneal_lean_tag\": \"MirDiffTag.ub\""),
+        "rendered eval report JSON must record UB agreement for \
+         neg_ctrl_char_surrogate_via_ptr__b0_c3: {char_surrogate_row}"
+    );
+    let synthetic_row = item_outcome_row("neg_ctrl_synthetic_missed_ub__b0_c4");
+    assert!(
+        synthetic_row.contains("\"verdict\": \"diverge\"")
+            && synthetic_row.contains("\"anneal_lean_tag\": \"(MirDiffTag.normalScalar 2 4)\""),
+        "rendered eval report JSON must record the missed_ub divergence of \
+         neg_ctrl_synthetic_missed_ub__b0_c4: {synthetic_row}"
+    );
 
     let state_dir_div = dir.join("state_dir_div");
     let out_div = run_campaign_driver(

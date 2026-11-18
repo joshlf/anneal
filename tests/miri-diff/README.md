@@ -69,11 +69,11 @@ uninterpreted external call.
 
 ## Corpus Coverage
 
-The corpus holds 108 tests: 50 `pass`, 12 `panic` (11 certified via
+The corpus holds 110 tests: 51 `pass`, 12 `panic` (11 certified via
 `verifySafePanicMirPointBounded` and `panic_explicit_macro` via
-`verifyModularSafePanicMirBounded`), and 46 `ub`, grouped into nine categories
+`verifyModularSafePanicMirBounded`), and 47 `ub`, grouped into ten categories
 that `// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
-Anneal agrees with Miri on all 108 tests: `manifest.toml` records no open
+Anneal agrees with Miri on all 110 tests: `manifest.toml` records no open
 `known_anneal_bug` entry.
 Category 8 adds 12 tests covering layout-sensitive types and raw-pointer retags
 (`pass_option_some_niche_and_single_c_mut` exercises both niche encoding and
@@ -132,34 +132,24 @@ of a `Drop` impl. The call-chain tests therefore check reference passing,
 reborrow return, frame cleanup, and unwinding into cleanup landing pads, but
 not Anneal's `FnEntry` protector enforcement or `Drop::drop` calls.
 
-**Frame-relative pointer resolution.** A borrow entry's `targetLocal` is a
-local index into the *running* frame (`get? locals entry.targetLocal`, falling
-back to `memory.callerLocals`, which `pushCalleeFrame` never populates). Inside
-a callee, a reference or raw pointer to the caller's local `_k` therefore
-resolves to the callee's own local `_k`:
+**Frame-relative pointer resolution (fixed).** Before `DIV-MR-CALL-TARGET-LOCAL`
+and `DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL` were repaired (`86255c4698`), a
+borrow entry's `targetLocal` resolved against the *running* frame, so inside a
+callee a pointer to the caller's local `_k` reached the callee's own local
+`_k`. A borrow entry now also records the depth of the frame that owns
+`targetLocal`, and the former witnesses are pinned as exact agreements: a callee
+read through a raw pointer to `x` (`10`), a callee write through it (`11`), a
+callee write through a pointer argument that shares `x`'s local index (`9`), and
+a callee dereference of a reference argument (`fn f(r: &u32, bonus: u32) -> u32
+{ *r + bonus }` called as `f(&x, 1)`, `11`).
 
-- Silent wrong values (`wrong_value`, `value_mismatch`): when the caller's `x`
-  and a `u32` parameter `pad2` of the callee are both local `_3`, a callee read
-  through a raw pointer to `x` returns `pad2` (Anneal `200`, Miri `10`), and a
-  callee write through it lands in `pad2` and leaves `x` unchanged (Anneal `13`,
-  Miri `11`). When the caller's `x` and the callee's pointer argument `alias`
-  are both local `_1`, the callee's write through `alias` overwrites `alias`
-  itself and is lost the same way (Anneal `13`, Miri `9`).
-- False UB (`false_positive_ub`): a callee dereferencing a reference argument
-  (`fn f(r: &u32, bonus: u32) -> u32 { *r + bonus }` called as `f(&x, 1)`, with
-  `x` and `r` both local `_1`) reads its own 8-byte `r` as a `u32` and faults.
-- Missed UB (`missed_ub`, `unsound_missed_fault`): Miri reports a
-  `RetagKind::FnEntry` protector violation when a callee writes through `raw`
-  while `&*raw` (or `&mut *raw`) is one of its arguments. In Anneal the write
-  lands in the callee's local with `x`'s index (the pin pads the callee so that
-  local is a `u32`), never reaching `x` or its borrow tree; the MIR capture
-  also emits no `Retag(FnEntry)`, so no protector would exist anyway. When the
-  colliding local is instead an 8-byte reference whose `ScalarLayout` has
-  `validRange.end_ = u64::MAX`, the 4-byte write sends the Lean kernel's
-  `by rfl` confirmation into byte-level re-decoding, which exhausts memory.
-  Passing `&x` or `&mut x` directly agrees with Miri (both report UB at the
-  write), but only because creating `&x` freezes `raw` (see the next
-  paragraph), not because of a protector.
+One related gap remains (`missed_ub`, `unsound_missed_fault`): Miri reports a
+`RetagKind::FnEntry` protector violation when a callee writes through `raw`
+while `&*raw` (or `&mut *raw`) is one of its arguments. Anneal's write now
+reaches `x` (Anneal `11`), but the MIR capture emits no `Retag(FnEntry)`, so no
+protector exists to forbid it. Passing `&x` or `&mut x` directly agrees with
+Miri (both report UB at the write), but only because creating `&x` freezes
+`raw` (see the next paragraph), not because of a protector.
 
 **Raw-pointer sibling roots (no call needed).** `evalRvalueRawPtr` mints a
 separate root `BorrowEntry` (`perm = .active`) for `raw = &raw mut x`, while
@@ -173,7 +163,7 @@ tag and the write only disables `&x`:
   UB at the write.
 - In a callee: the caller holds `let _r = &x;` and passes `raw`, and the callee
   writes through it. Without `_r`, `raw` stays `.active` and the callee's write
-  is silently lost instead (the frame-relative item above).
+  reaches `x`, agreeing with Miri (the frame-relative item above).
 - After a call: `&x` is a call argument and the caller writes through `raw`
   once the callee has returned. This also reproduces with a callee whose only
   locals are `_0` and `_r`, so it does not depend on local-index collisions.
@@ -207,6 +197,27 @@ Category 9's `UnwindCleanupGuard` has an empty `drop`:
   `semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned` in
   [`miri_eval.rs`](../../crates/anneal-difftest/src/miri_eval.rs) pins the
   sub-place form (`probe_gap_move_subplace_reborrow_write`).
+
+Category 10 adds 2 tests:
+
+| Theme | Tests |
+| :--- | :--- |
+| Multi-element `copy_nonoverlapping` through whole-array pointer casts | `pass_copy_nonoverlapping_multi_elem_array_pair` (`[22, 99]` copied as 2 `u32` elements through `(&raw const src) as *const u32`, returning `22 ^ 99 = 117`) |
+| Raw-pointer reads of uninitialized struct padding (`model-checking/kani#5183`) | `ub_raw_ptr_read_uninit_struct_padding_kani5183` (byte offset `1` of `PaddedU8U32` read as `u8` through `(&raw const s) as *const u8` and `offset(base, 1isize)`) |
+
+Category 10 leaves out one construct on which Anneal currently disagrees with
+Miri: a multi-element `copy_nonoverlapping` between *element* sub-places,
+`copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize)`. Anneal
+copies only the first element through the `.constantIndex` sub-place pointer
+(`wrong_value`, `value_mismatch`; Anneal returns `22` where Miri returns `117`
+for `[22, 99]`), whereas the whole-array casts of
+`pass_copy_nonoverlapping_multi_elem_array_pair` copy both elements and agree.
+`semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned` pins
+the element sub-place form (`probe_gap_subplace_multi_elem_copy`,
+kernel-confirmed) as a ratchet that fails once the gap is fixed, and the
+`subplace_multi_elem_copy_truncation` semantic mutant of
+`--self-check-mutants` replays a semantics that truncates the agreeing
+whole-array copy to one element (killed as `wrong_value`).
 
 `miri-difftest` confirms each divergence in the Lean kernel with
 `lean -M 4096`. When the batched confirmation fails, every divergence is
@@ -244,7 +255,7 @@ rejects, or an elaboration error) still aborts the run.
 
 ### Summary of Open Anneal Bugs Exposed by the Suite
 
-The suite currently exposes no open Anneal bug: all 108 tests agree with Miri.
+The suite currently exposes no open Anneal bug: all 110 tests agree with Miri.
 
 ## Running the Suite
 
