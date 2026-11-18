@@ -6185,6 +6185,8 @@ open MiniRustSpec.Correspondence.WideSliceDst
   WideSliceDst.takeValues_eq_take
   evalRvalue_len_and_frozen_mut_reborrow_wide_slice_lockstep
   evalPlaceRead_index_wide_slice_borrowBacked_lockstep
+  checkPtr_sliceRef_null_vs_dangling_zero_bytes_lockstep
+  writeProjectedValue_and_subslice_reborrow_wide_slice_lockstep
 
 namespace WideSliceDstStatementPins
 
@@ -6452,6 +6454,81 @@ example
     locals mem localDecls sIdx idxLocal elemKind lIdx p len idx szIdx entry rootVal
     containerProj baseIdx rawElemOffset elems hPointeeTy hSlSlot hAlignDeref hBorrow hPerm
     hSlot hAlignTarget hBacking hOff hInBacking hIdxSlot
+
+example
+    (thin : Ptr) (prov : Option Prov) (mutbl : MirAst.Mutability)
+    (elemSz elemAlign len : Nat) (freeze : Bool) (m : Option Mach)
+    (localsNullProv localsNullSc : List LocalSlot)
+    (localDecls : List MirAst.LocalDecl) (sIdx : Local)
+    (hLen : len < scalarModulus 8)
+    (hNullProvSlot :
+      Trusted.Sequence.get? localsNullProv sIdx =
+        some (.init (annealWidePtrVal { allocId := 0, offsetBytes := 0 } 0 8)))
+    (hNullScSlot :
+      Trusted.Sequence.get? localsNullSc sIdx =
+        some (.init (annealWideScalarPtrVal 0 0 8))) :
+    (x86_64.valid_size ⟨len * elemSz⟩ = true →
+      checkPtr (ThinPointer.widen { addr := 0, provenance := prov } (some (.ElementCount (Int.ofNat len))))
+        (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) m =
+        .error (.ub "Value::Ptr: null safe pointer")) ∧
+    evalRvalue localsNullProv (.ref .shared ⟨sIdx, [.deref]⟩) emptyMemory localDecls emptyLayoutTable = .ub ∧
+    evalRvalue localsNullSc (.ref .shared ⟨sIdx, [.deref]⟩) emptyMemory localDecls emptyLayoutTable = .ub ∧
+    (inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true →
+      (thin.addr != 0) = true →
+      Align.is_aligned ⟨elemAlign⟩ thin.addr = true →
+      checkPtr (ThinPointer.widen thin (some (.ElementCount 0)))
+        (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) m = .ok () ∧
+      checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len))))
+        (sliceRefPtrType mutbl ⟨0⟩ ⟨elemAlign⟩ freeze) m = .ok ()) :=
+  checkPtr_sliceRef_null_vs_dangling_zero_bytes_lockstep
+    thin prov mutbl elemSz elemAlign len freeze m localsNullProv localsNullSc
+    localDecls sIdx hLen hNullProvSlot hNullScSlot
+
+example
+    (locals : List LocalSlot) (mem : MirSemantics.Memory)
+    (localDecls : List MirAst.LocalDecl) (idxLocal : Local)
+    (p : ProvenancePtr) (len idx szIdx fromIdx toIdx : Nat)
+    (perm : TreeBorrowPerm) (isMut : Bool) (elemKind : RigidTy)
+    (entry : BorrowEntry) (rootVal newVal : MirSemantics.Value)
+    (containerProj : List ProjectionElem) (baseIdx rawElemOffset : Nat)
+    (elems : List MirSemantics.Value)
+    (hIdxSlot : Trusted.Sequence.get? locals idxLocal = some (.init (.scalar ⟨idx, szIdx⟩)))
+    (hBorrow : lookupBorrow mem.borrows p.tag = some entry)
+    (hPerm : perm ≠ .disabled)
+    (hParentPerm : entry.perm = .active)
+    (hSlot : activeFrameSlot? locals mem.callStack entry.targetFrameDepth entry.targetLocal =
+      some (.init rootVal))
+    (hBacking : readSliceBackingAggregate? locals rootVal entry.targetProjection len
+      (tyByteSize .nil emptyLayoutTable { kind := elemKind, layoutIdx := 0 }) =
+      some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? p.offsetBytes (inferElemListByteStride elems) = some rawElemOffset)
+    (hInBacking : rawElemOffset + baseIdx + len ≤ elems.length) :
+    let window := takeValues len (dropValues (Nat.add rawElemOffset baseIdx) elems)
+    let slicePointeeTy : Ty := { kind := .slice elemKind, layoutIdx := 0 }
+    (len ≤ idx →
+      writeProjectedValue locals (.aggregate 0 window) [.index idxLocal] newVal = .ub ∧
+      decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = true) ∧
+    (∀ oldElem updatedWindow,
+      idx < len →
+      Trusted.Sequence.get? window idx = some oldElem →
+      Trusted.Sequence.set? window idx newVal = some updatedWindow →
+      writeProjectedValue locals (.aggregate 0 window) [.index idxLocal] newVal =
+        .ok (.aggregate 0 updatedWindow) ∧
+      decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = false) ∧
+    (len < fromIdx + toIdx →
+      evalSliceFatPtrDerefBorrow locals mem p 8 ⟨len, 8⟩ [.subslice fromIdx toIdx true]
+        perm isMut (some slicePointeeTy) emptyLayoutTable true localDecls none false = .ub) ∧
+    (fromIdx + toIdx ≤ len →
+      ∃ mem',
+        evalSliceFatPtrDerefBorrow locals mem p 8 ⟨len, 8⟩ [.subslice fromIdx toIdx true]
+          perm isMut (some slicePointeeTy) emptyLayoutTable true localDecls none false =
+          .ok (annealWidePtrVal { allocId := mem.nextTag, offsetBytes := 0 }
+                (len - toIdx - fromIdx) 8) locals mem' ∧
+        mem'.nextTag = mem.nextTag + 1) :=
+  writeProjectedValue_and_subslice_reborrow_wide_slice_lockstep
+    locals mem localDecls idxLocal p len idx szIdx fromIdx toIdx perm isMut elemKind
+    entry rootVal newVal containerProj baseIdx rawElemOffset elems hIdxSlot hBorrow hPerm
+    hParentPerm hSlot hBacking hOff hInBacking
 
 end WideSliceDstStatementPins
 

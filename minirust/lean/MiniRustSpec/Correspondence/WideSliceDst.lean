@@ -932,6 +932,280 @@ theorem evalPlaceRead_index_wide_slice_borrowBacked_lockstep
           hBacking, hSzOpt, hOff, hRemBle, readProjectedValue, hIdxSlot, hGetSome, hValid,
           Nat.beq_refl, Bool.and_self]
 
+/-- **Symbolic null rejection vs. zero-byte (`len = 0` & ZST `elemSz = 0`) dangling acceptance on
+safe wide slice references (`&[T]` / `&mut [T]`)**:
+1. **Null wide safe reference (`addr = 0`)**: For ANY `len < scalarModulus 8` with
+   `x86_64.valid_size ⟨len * elemSz⟩ = true` (including `len = 0` and ZST `elemSz = 0`!) and any
+   `m : Option Mach`, MiniRust's `checkPtr` on `sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze`
+   rejects `{ addr := 0, provenance := prov }` with `.error (.ub "Value::Ptr: null safe pointer")`;
+   and in Anneal, `evalRvalue locals (.ref .shared ⟨sIdx, [.deref]⟩) emptyMemory localDecls
+   emptyLayoutTable = .ub` both when `sIdx` holds the null `ProvenancePtr`
+   `annealWidePtrVal { allocId := 0, offsetBytes := 0 } 0 8` (`Places.lean:16260-16262`) and when
+   `sIdx` holds the provenance-free null `annealWideScalarPtrVal 0 0 8`.
+2. **Non-null aligned zero-byte wide safe reference (`len = 0` or ZST `elemSz = 0`)**: For ANY
+   `m : Option Mach` (`none` or `some mach`, exercising `CM.dereferenceable mach.mem thin ⟨0⟩ = .ok ()`),
+   any in-bounds non-null aligned `thin` (including `thin.provenance = none`, i.e. `NonNull::dangling()`)
+   passes `checkPtr` both at `len = 0` (arbitrary `elemSz`) and at ZST `elemSz = 0` (arbitrary
+   `len < scalarModulus 8`). -/
+theorem checkPtr_sliceRef_null_vs_dangling_zero_bytes_lockstep
+    (thin : Ptr) (prov : Option Prov) (mutbl : MirAst.Mutability)
+    (elemSz elemAlign len : Nat) (freeze : Bool) (m : Option Mach)
+    (localsNullProv localsNullSc : List LocalSlot)
+    (localDecls : List LocalDecl) (sIdx : Local)
+    (hLen : len < scalarModulus 8)
+    (hNullProvSlot :
+      get? localsNullProv sIdx = some (.init (annealWidePtrVal { allocId := 0, offsetBytes := 0 } 0 8)))
+    (hNullScSlot :
+      get? localsNullSc sIdx = some (.init (annealWideScalarPtrVal 0 0 8))) :
+    -- (1a) MiniRust `checkPtr` rejects `addr = 0` on `&[T]` / `&mut [T]` whenever `valid_size` holds
+    (x86_64.valid_size ⟨len * elemSz⟩ = true →
+      checkPtr (ThinPointer.widen { addr := 0, provenance := prov } (some (.ElementCount (Int.ofNat len))))
+        (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) m =
+        .error (.ub "Value::Ptr: null safe pointer")) ∧
+    -- (1b) Anneal `evalRvalue (.ref .shared (*s))` rejects both null wide representations at `len = 0`
+    evalRvalue localsNullProv (.ref .shared ⟨sIdx, [.deref]⟩) emptyMemory localDecls emptyLayoutTable = .ub ∧
+    evalRvalue localsNullSc (.ref .shared ⟨sIdx, [.deref]⟩) emptyMemory localDecls emptyLayoutTable = .ub ∧
+    -- (2) Non-null aligned zero-byte (`len = 0` or ZST `elemSz = 0`) passes `checkPtr` for any `m : Option Mach`
+    (inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true →
+      (thin.addr != 0) = true →
+      Align.is_aligned ⟨elemAlign⟩ thin.addr = true →
+      checkPtr (ThinPointer.widen thin (some (.ElementCount 0)))
+        (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) m = .ok () ∧
+      checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len))))
+        (sliceRefPtrType mutbl ⟨0⟩ ⟨elemAlign⟩ freeze) m = .ok ()) := by
+  have hMetaLen :
+      checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount = Except.ok () :=
+    (checkPtrMetadata_elementCount_iff_anneal_usize len).1.mpr hLen
+  have hMeta0 :
+      checkPtrMetadata (some (.ElementCount 0)) .ElementCount = Except.ok () :=
+    (checkPtrMetadata_elementCount_iff_anneal_usize 0).1.mpr (by decide)
+  have hex_ok : ∀ {α β : Type} (x : α) (f : α → Except Stop β),
+      (Bind.bind (Except.ok x) f) = f x := fun _ _ => rfl
+  have hex_err : ∀ {α β : Type} (e : Stop) (f : α → Except Stop β),
+      (Bind.bind (Except.error e) f) = Except.error e := fun _ _ => rfl
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro hValidSz
+    have hZeroInB :
+        ensureElseUb (inBounds (0 : Int) .Unsigned x86_64.PTR_SIZE)
+          "Value::Ptr: pointer out-of-bounds" = Except.ok () := by
+      have h0 : inBounds (0 : Int) .Unsigned x86_64.PTR_SIZE = true := by decide
+      unfold ensureElseUb; rw [h0]; rfl
+    have hProdNonneg : (0 : Int) ≤ Int.ofNat len * (elemSz : Int) :=
+      Int.mul_nonneg (Int.natCast_nonneg len) (Int.natCast_nonneg elemSz)
+    have hToNat : (Int.ofNat len * (elemSz : Int)).toNat = len * elemSz := rfl
+    have hComp : ∀ (lookup : Ptr → Interp VTable),
+        LayoutStrategy.compute_size_and_align lookup (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+            (some (.ElementCount (Int.ofNat len))) =
+          Except.ok (⟨len * elemSz⟩, ⟨elemAlign⟩) := by
+      intro lookup
+      unfold LayoutStrategy.compute_size_and_align
+      dsimp only
+      rw [ite_eq_left_iff.mpr (fun h => absurd hProdNonneg h), hToNat]
+      rfl
+    have hSzOk :
+        ensureElseUb (inBounds ((len * elemSz : Nat) : Int) .Signed x86_64.PTR_SIZE)
+          "Value::Ptr: total size exeeds isize::MAX" = Except.ok () := by
+      have hInB : inBounds ((len * elemSz : Nat) : Int) .Signed x86_64.PTR_SIZE = true := hValidSz
+      unfold ensureElseUb; rw [hInB]; rfl
+    have hNullErr :
+        ensureElseUb (((0 : Int) != 0)) "Value::Ptr: null safe pointer" =
+          Except.error (.ub "Value::Ptr: null safe pointer") := rfl
+    unfold checkPtr sliceRefPtrType ThinPointer.widen PtrType.meta_kind
+      LayoutStrategy.meta_kind PtrType.safe_pointee
+    dsimp only
+    rw [hZeroInB, hex_ok, hMetaLen, hex_ok, hComp, hex_ok]
+    dsimp only
+    rw [hSzOk, hex_ok, hNullErr, hex_err]
+  · have hPtr8 : layoutPointerBytes emptyLayoutTable = 8 := rfl
+    unfold annealWidePtrVal at hNullProvSlot
+    unfold evalRvalue evalRvalueRefDeref
+    dsimp (config := { zeta := true }) only
+    rw [hNullProvSlot]
+    simp only []
+    generalize Bool.and _ _ = g
+    cases g
+    · rfl
+    · simp only [evalSliceFatPtrDerefBorrow, emptyMemory, lookupBorrow, lookupGlobalAlloc,
+        hPtr8, Nat.beq_refl, Bool.and_self, Bool.not_true, Bool.and_false, Bool.false_and,
+        stripTransparentProjections, resolveBorrowProjectionElems, normalizeSubsliceProjections]
+  · unfold annealWideScalarPtrVal at hNullScSlot
+    unfold evalRvalue evalRvalueRefDeref
+    dsimp (config := { zeta := true }) only
+    rw [hNullScSlot]
+    rfl
+  · intro hAddr hNonNull hAligned
+    have hAddrOk :
+        ensureElseUb (inBounds thin.addr .Unsigned x86_64.PTR_SIZE)
+          "Value::Ptr: pointer out-of-bounds" = Except.ok () := by
+      unfold ensureElseUb; rw [hAddr]; rfl
+    have hSize0Ok :
+        ensureElseUb (inBounds ((0 : Nat) : Int) .Signed x86_64.PTR_SIZE)
+          "Value::Ptr: total size exeeds isize::MAX" = Except.ok () := by
+      have hInB : inBounds ((0 : Nat) : Int) .Signed x86_64.PTR_SIZE = true := by decide
+      unfold ensureElseUb; rw [hInB]; rfl
+    have hNonNullOk :
+        ensureElseUb (thin.addr != 0) "Value::Ptr: null safe pointer" = Except.ok () := by
+      unfold ensureElseUb; rw [hNonNull]; rfl
+    have hAlignOk :
+        ensureElseUb (Align.is_aligned ⟨elemAlign⟩ thin.addr)
+          "Value::Ptr: unaligned safe pointer" = Except.ok () := by
+      unfold ensureElseUb; rw [hAligned]; rfl
+    have hComp0 : ∀ (lookup : Ptr → Interp VTable),
+        LayoutStrategy.compute_size_and_align lookup (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+            (some (.ElementCount 0)) =
+          Except.ok (⟨0⟩, ⟨elemAlign⟩) := by
+      intro lookup
+      unfold LayoutStrategy.compute_size_and_align
+      simp [Pure.pure, Except.pure]
+    have hCompZst : ∀ (lookup : Ptr → Interp VTable),
+        LayoutStrategy.compute_size_and_align lookup (.Slice ⟨0⟩ ⟨elemAlign⟩)
+            (some (.ElementCount (Int.ofNat len))) =
+          Except.ok (⟨0⟩, ⟨elemAlign⟩) := by
+      intro lookup
+      unfold LayoutStrategy.compute_size_and_align
+      simp [Pure.pure, Except.pure]
+    constructor
+    · unfold checkPtr sliceRefPtrType ThinPointer.widen PtrType.meta_kind
+        LayoutStrategy.meta_kind PtrType.safe_pointee
+      dsimp only
+      rw [hAddrOk, hex_ok, hMeta0, hex_ok, hComp0, hex_ok]
+      dsimp only
+      rw [hSize0Ok, hex_ok, hNonNullOk, hex_ok, hAlignOk, hex_ok]
+      cases m <;> rfl
+    · unfold checkPtr sliceRefPtrType ThinPointer.widen PtrType.meta_kind
+        LayoutStrategy.meta_kind PtrType.safe_pointee
+      dsimp only
+      rw [hAddrOk, hex_ok, hMetaLen, hex_ok, hCompZst, hex_ok]
+      dsimp only
+      rw [hSize0Ok, hex_ok, hNonNullOk, hex_ok, hAlignOk, hex_ok]
+      cases m <;> rfl
+
+/-- **Symbolic wide-slice element `writeProjectedValue` and `fromEnd` subslice reborrow lockstep**:
+1. **Element write (`(*s)[idx] = newVal` on sliced window `takeValues len (dropValues ... elems)`)**:
+   * Out-of-bounds (`len ≤ idx`): `writeProjectedValue` faults `.ub` AND MiniRust's slice index
+     bounds guard triggers (`decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = true`).
+   * In-bounds (`idx < len`): `writeProjectedValue` updates index `idx` within the `len`-element
+     slice window (`set?`) AND MiniRust's slice index bounds guard passes (`= false`).
+2. **Borrow-backed `fromEnd` subslice reborrow (`&(*s)[fromIdx..toIdx]` with `fromEnd = true`)**:
+   * Out-of-bounds (`len < fromIdx + toIdx`): `evalSliceFatPtrDerefBorrow` faults `.ub`.
+   * In-bounds (`fromIdx + toIdx ≤ len`): `evalSliceFatPtrDerefBorrow` mints fresh tag
+     `mem.nextTag` with subslice length `len - toIdx - fromIdx`. -/
+theorem writeProjectedValue_and_subslice_reborrow_wide_slice_lockstep
+    (locals : List LocalSlot) (mem : MirSemantics.Memory)
+    (localDecls : List LocalDecl) (idxLocal : Local)
+    (p : ProvenancePtr) (len idx szIdx fromIdx toIdx : Nat)
+    (perm : TreeBorrowPerm) (isMut : Bool) (elemKind : RigidTy)
+    (entry : BorrowEntry) (rootVal newVal : MirSemantics.Value)
+    (containerProj : List ProjectionElem) (baseIdx rawElemOffset : Nat)
+    (elems : List MirSemantics.Value)
+    (hIdxSlot : get? locals idxLocal = some (.init (.scalar ⟨idx, szIdx⟩)))
+    (hBorrow : lookupBorrow mem.borrows p.tag = some entry)
+    (hPerm : perm ≠ .disabled)
+    (hParentPerm : entry.perm = .active)
+    (hSlot : activeFrameSlot? locals mem.callStack entry.targetFrameDepth entry.targetLocal =
+      some (.init rootVal))
+    (hBacking : readSliceBackingAggregate? locals rootVal entry.targetProjection len
+      (tyByteSize .nil emptyLayoutTable { kind := elemKind, layoutIdx := 0 }) =
+      some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? p.offsetBytes (inferElemListByteStride elems) = some rawElemOffset)
+    (hInBacking : rawElemOffset + baseIdx + len ≤ elems.length) :
+    let window := takeValues len (dropValues (Nat.add rawElemOffset baseIdx) elems)
+    let slicePointeeTy : Ty := { kind := .slice elemKind, layoutIdx := 0 }
+    -- (1a) OOB index write (`len ≤ idx`) faults `.ub`
+    (len ≤ idx →
+      writeProjectedValue locals (.aggregate 0 window) [.index idxLocal] newVal = .ub ∧
+      decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = true) ∧
+    -- (1b) In-bounds index write (`idx < len`) updates `window` via `set?`
+    (∀ oldElem updatedWindow,
+      idx < len →
+      get? window idx = some oldElem →
+      set? window idx newVal = some updatedWindow →
+      writeProjectedValue locals (.aggregate 0 window) [.index idxLocal] newVal =
+        .ok (.aggregate 0 updatedWindow) ∧
+      decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = false) ∧
+    -- (2a) OOB `fromEnd = true` subslice reborrow (`len < fromIdx + toIdx`) faults `.ub`
+    (len < fromIdx + toIdx →
+      evalSliceFatPtrDerefBorrow locals mem p 8 ⟨len, 8⟩ [.subslice fromIdx toIdx true]
+        perm isMut (some slicePointeeTy) emptyLayoutTable true localDecls none false = .ub) ∧
+    -- (2b) In-bounds `fromEnd = true` subslice reborrow (`fromIdx + toIdx ≤ len`) mints `len - toIdx - fromIdx`
+    (fromIdx + toIdx ≤ len →
+      ∃ mem',
+        evalSliceFatPtrDerefBorrow locals mem p 8 ⟨len, 8⟩ [.subslice fromIdx toIdx true]
+          perm isMut (some slicePointeeTy) emptyLayoutTable true localDecls none false =
+          .ok (annealWidePtrVal { allocId := mem.nextTag, offsetBytes := 0 }
+                (len - toIdx - fromIdx) 8) locals mem' ∧
+        mem'.nextTag = mem.nextTag + 1) := by
+  intro window slicePointeeTy
+  have hInBle : Nat.ble (Nat.add (Nat.add rawElemOffset baseIdx) len) elems.length = true := by
+    change Nat.ble (rawElemOffset + baseIdx + len) elems.length = true
+    rw [Nat.ble_eq]
+    exact hInBacking
+  have hLenSeq : length elems = elems.length := rfl
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro hOob
+    have hGetNone : get? window idx = none := by
+      change (takeValues len (dropValues (rawElemOffset + baseIdx) elems))[idx]? = none
+      rw [takeValues_eq_take, dropValues_eq_drop]
+      exact List.getElem?_eq_none (by rw [List.length_take, List.length_drop]; omega)
+    refine ⟨?_, decide_eq_true (Or.inr (Int.ofNat_le.mpr hOob))⟩
+    simp only [writeProjectedValue, hIdxSlot, hGetNone]
+  · intro oldElem updatedWindow hLt hGetSome hSetSome
+    have hMrOk : decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = false :=
+      decide_eq_false (fun h =>
+        h.elim
+          (fun hneg => absurd hneg (Int.not_lt.mpr (Int.natCast_nonneg idx)))
+          (fun hge => Nat.not_lt.mpr (Int.ofNat_le.mp hge) hLt))
+    refine ⟨?_, hMrOk⟩
+    simp only [writeProjectedValue, hIdxSlot, hGetSome, hSetSome]
+  · intro hSubOob
+    have hPtr8 : layoutPointerBytes emptyLayoutTable = 8 := rfl
+    have hLookup0 : LayoutTable.lookup emptyLayoutTable 0 = none := rfl
+    have hUnres0 : unresolvedLayoutIdx emptyLayoutTable = 0 := rfl
+    have hToOrFrom :
+        Nat.ble toIdx len = false ∨
+        (Nat.ble toIdx len = true ∧ Nat.ble fromIdx (Nat.sub len toIdx) = false) := by
+      by_cases hTo : toIdx ≤ len
+      · right
+        refine ⟨Nat.ble_eq.mpr hTo, ?_⟩
+        change Nat.ble fromIdx (len - toIdx) = false
+        rw [Bool.eq_false_iff, Ne, Nat.ble_eq]
+        omega
+      · left
+        rw [Bool.eq_false_iff, Ne, Nat.ble_eq]
+        exact hTo
+    unfold evalSliceFatPtrDerefBorrow
+    dsimp (config := { zeta := true }) only [slicePointeeTy]
+    cases isMut <;>
+      (rcases hToOrFrom with hToF | ⟨hToT, hFromF⟩
+       · simp only [hPtr8, hLenSeq, hLookup0, hUnres0, Nat.beq_refl, Bool.and_self,
+           stripTransparentProjections, resolveBorrowProjectionElems,
+           normalizeSubsliceProjections, normalizeSubsliceProjectionsAux,
+           hBorrow, hParentPerm, hSlot, hBacking, hOff, hInBle, hToF]
+       · simp only [hPtr8, hLenSeq, hLookup0, hUnres0, Nat.beq_refl, Bool.and_self,
+           stripTransparentProjections, resolveBorrowProjectionElems,
+           normalizeSubsliceProjections, normalizeSubsliceProjectionsAux,
+           hBorrow, hParentPerm, hSlot, hBacking, hOff, hInBle, hToT, hFromF])
+  · intro hSubIn
+    have hPtr8 : layoutPointerBytes emptyLayoutTable = 8 := rfl
+    have hLookup0 : LayoutTable.lookup emptyLayoutTable 0 = none := rfl
+    have hUnres0 : unresolvedLayoutIdx emptyLayoutTable = 0 := rfl
+    have hToBle : Nat.ble toIdx len = true := Nat.ble_eq.mpr (by omega)
+    have hFromBle : Nat.ble fromIdx (Nat.sub len toIdx) = true := by
+      change Nat.ble fromIdx (len - toIdx) = true
+      rw [Nat.ble_eq]
+      omega
+    have hSubEq : Nat.sub (Nat.sub len toIdx) fromIdx = len - toIdx - fromIdx := rfl
+    let _ := hPerm
+    unfold evalSliceFatPtrDerefBorrow
+    dsimp (config := { zeta := true }) only [slicePointeeTy]
+    cases isMut <;>
+    · simp only [hPtr8, hLenSeq, hLookup0, hUnres0, Nat.beq_refl, Bool.and_self,
+        stripTransparentProjections, resolveBorrowProjectionElems,
+        normalizeSubsliceProjections, normalizeSubsliceProjectionsAux,
+        hBorrow, hParentPerm, hSlot, hBacking, hOff, hInBle, hToBle, hFromBle, hSubEq,
+        annealWidePtrVal]
+      exact ⟨_, rfl, rfl⟩
+
 /-! ## 5. Concrete Multi-Way Execution Witnesses & Negative/Divergence Canaries -/
 
 /-- `u32` array `[u32; 4]` MIR type and declaration. -/
