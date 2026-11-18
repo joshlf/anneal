@@ -17,10 +17,11 @@ Use this skill whenever reviewing code, commits, branches, or pull requests in
 Anneal's correctness promise in [`PRINCIPLES.md`](../../PRINCIPLES.md) depends
 on a strict boundary documented in
 [`docs/trust-model.md`](../../docs/trust-model.md): first-party trusted code
-lives in [`trusted/`](../../trusted) (together with root manifests pinned by
-hashes in `trusted/`), and all code in `theory/` is untrusted and verified in
+lives in [`trusted/`](../../trusted) (together with root manifests and the
+vendored `vendor/lean-miri/` reference model pinned by hashes in `trusted/`),
+and all code in `theory/` and `correspondence/` is untrusted and verified in
 repository CI by [`trusted/audit/`](../../trusted/audit) (`anneal-audit`) to be
-pure, effect-free, and axiom-free.
+pure, effect-free, and within the locked foundation axiom allowlist.
 
 Combine this skill with:
 
@@ -91,10 +92,10 @@ or permission to merge.
 
 ## Pass 1: Audit changes outside `trusted/`, `ci/`, and `.github/` for bypasses
 
-Code outside `trusted/`, `ci/`, and `.github/` (such as `theory/`, tests,
-workspace configurations, or new directories) is untrusted. Although
-`anneal-audit` and CI scripts are designed to enforce purity mechanically,
-parts of the target architecture in
+Code outside `trusted/`, `ci/`, and `.github/` (such as `theory/`,
+`correspondence/`, tests, workspace configurations, or new directories) is
+untrusted. Although `anneal-audit` and CI scripts are designed to enforce purity
+mechanically, parts of the target architecture in
 [`docs/trust-model.md`](../../docs/trust-model.md) are still evolving and any
 static checker can have blind spots. Check every change outside the TCB for
 intentional or accidental enforcement bypasses:
@@ -111,9 +112,10 @@ intentional or accidental enforcement bypasses:
 2. **Filesystem, module-discovery, and artifact evasion:**
    - Check that no `.lean` files are placed in directories or naming layouts
      outside the trees verified by `anneal-audit` (`trusted/lean/`, `theory/`,
-     and the SHA-256-pinned `vendor/lean-miri/` reference model), and that no
-     symlinks, hardlinks, git submodules, or pre-compiled `.olean`, `.ilean`,
-     or `.ir` artifacts are introduced into the source tree.
+     `trusted/correspondence/`, `correspondence/`, and the SHA-256-pinned
+     `vendor/lean-miri/` reference model), and that no symlinks, hardlinks, git
+     submodules, or pre-compiled `.olean`, `.ilean`, or `.ir` artifacts are
+     introduced into the source tree.
    - For any change touching `vendor/lean-miri/` (which bypasses Phase 1
      syntactic preflight and belongs to the correspondence TCB), verify the
      upstream commit and tree pin (`LOCKED_MIRI_COMMIT`,
@@ -125,22 +127,29 @@ intentional or accidental enforcement bypasses:
    - Watch for path-normalization tricks, case-collision filenames, or Unicode
      homoglyphs and bidirectional/invisible control characters in module or
      identifier names.
-3. **Lean syntax, elaborator, or attribute blind spots in `theory/`:**
-   - Verify that `.lean` files in `theory/` use only pure declarations and
-     tactics (and that `trusted/lean/` remains tactic-free). Flag any construct
-     that attempts to run metaprograms, read files or environment variables, or
+3. **Lean syntax, elaborator, or attribute blind spots in `theory/` and
+   `correspondence/`:**
+   - Verify that `.lean` files in `theory/` and `correspondence/` use only pure
+     declarations and tactics (and that `trusted/lean/` and
+     `trusted/correspondence/` remain tactic-free). Flag any construct that
+     attempts to run metaprograms, read files or environment variables, or
      alter elaboration or compiler behavior—even if
      [`TrustedBoundary.lean`](../../trusted/audit/TrustedBoundary.lean)'s
      syntactic preflight (`allowedTrustedSyntaxKinds`,
      `allowedTheoryTacticKinds`, and `inspectNodeKind`) failed to reject that
      specific syntax shape.
-   - Confirm that code outside `trusted/lean/` never declares constants in the
-     `Trusted` root namespace, never includes `-- anneal-trust-tier:`
-     directives, and never introduces `axiom`, `sorry`, `unsafe`, `partial`,
-     `noncomputable`, `opaque`, `native_decide`, `decide!`, `bv_decide`,
-     `rfl'`, `grind`, tactic `configItem` flags (`+native`, `+kernel`),
-     `by_elab`, `#eval`, `set_option`, `initialize`, `@[implemented_by]`,
-     `@[extern]`, or `@[csimp]`.
+   - Confirm that code outside `trusted/lean/` and `trusted/correspondence/`
+     never declares constants in the `Trusted` root namespace, never includes
+     `-- anneal-trust-tier:` directives, and never introduces `axiom`, `sorry`,
+     `unsafe`, `partial`, `noncomputable section`, `opaque`, `native_decide`,
+     `decide!`, `bv_decide`, `rfl'`, `grind`, tactic `configItem` flags
+     (`+native`, `+kernel`), `by_elab`, `#eval`, `set_option`, `initialize`,
+     `@[implemented_by]`, `@[extern]`, or `@[csimp]`. (`noncomputable`
+     declaration modifiers are admitted mechanically across all roles and both
+     passes by `allowedCommandSyntaxKinds`, while `noncomputable section` is
+     forbidden mechanically and repository policy keeps `theory/` free of
+     `noncomputable` definitions; unlike `theory/`, `correspondence/` modules
+     may use `noncomputable def`.)
 4. **Vacuous or misleading specifications at the `trusted/`–`theory/` seam:**
    - Check that lowering passes (`Abstracts`), weakest-precondition rules, and
      specification helpers in `theory/` do not discharge obligations via
@@ -209,12 +218,21 @@ affected components against these requirements:
     regular-file checks (`scan_lean_tree`), or environment variable stripping;
   - weakens synchronous compilation flags (`-DElab.async=false`,
     `-Ddebug.skipKernelTC=false`), `.olean` loading (`trustLevel := 0`,
-    `plugins := #[]`, `loadExts := false`), `checkTierReferences`, or fresh
-    kernel replay (`base.toKernelEnv.replay`).
+    `plugins := #[]`, `loadExts := false` in `"audit"` and
+    `"correspondence-audit"`), `checkDeclarationEdges`, or fresh kernel replay
+    (`base.toKernelEnv.replay`). Note that `"correspondence-preflight"`
+    intentionally imports with `loadExts := true`, `level := .private`, and
+    `enableInitializersExecution`, which executes pinned vendored `[init]`
+    initializers (able to register user-defined environment extensions),
+    evaluates pinned vendored tactic `elab`s, and deserializes compiled Pass 1
+    `theory/` extension data inside the inspector process; flag any weakening
+    of Pass 1's closed `theory/` attribute allowlist or vendored compile-time
+    code review controls.
 - **Negative regression tests:** Any change to `anneal-audit` admission rules,
   syntax filters, or tier checks must include negative tests in
   [`boundary_audit.rs`](../../trusted/audit/tests/boundary_audit.rs) verifying
-  that prohibited inputs are rejected with policy exit code `1`.
+  that prohibited inputs are rejected with policy exit code `1` (or non-zero
+  exit code `2` for standalone kernel-replay rejections).
 - **Cryptographic lock synchronization:** When `Cargo.toml`, `Cargo.lock`,
   `flake.nix`, `flake.lock`, the Lean binary, sysroot `.olean` files, or
   `vendor/lean-miri/` change, verify that

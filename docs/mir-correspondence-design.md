@@ -445,13 +445,11 @@ allowlists:
   import a `candidate:*` module, exercised positively by
   `enforces_module_level_trust_tiers_and_namespace_hygiene` in
   `trusted/audit/tests/boundary_audit.rs` and admitted during module preflight
-  in `trusted/audit/src/`—currently `preflight_repo_modules`, later
-  `preflight_and_order_modules`, and also enforced on compiled `.olean` headers
-  by `RepoOrigin.importViolation?`), and enforces tier isolation at the
-  **declaration-edge level** (`checkTierReferences`, later generalized to
-  `checkDeclarationEdges` with `RepoOrigin.edgeViolation?` and
-  `CorrOrigin.edgeViolation?`, forbids any `vetted` *declaration* from
-  referencing a `candidate:*` declaration).
+  in `trusted/audit/src/` via `preflight_and_order_modules` and also enforced
+  on compiled `.olean` headers by `RepoOrigin.importViolation?`), and enforces
+  tier isolation at the **declaration-edge level** (`checkDeclarationEdges`
+  with `RepoOrigin.edgeViolation?` and `CorrOrigin.edgeViolation?` forbids any
+  `vetted` *declaration* from referencing a `candidate:*` declaration).
 - **Tactic-free, `deriving`-free `Trusted.*` definitions:**
   `Trusted/MirAst.lean`, `Trusted/MirSemantics.lean`, and
   `Trusted/Correspondence.lean` start with `prelude`, import locked modules
@@ -464,9 +462,9 @@ allowlists:
   emitting partial `._unsafe_rec` compiler helpers. Beyond locked modules and
   the `Trusted.*` modules they build on, only `Trusted/Correspondence.lean`
   imports anything else: `Miri.Interpreter.ExecutionMachine` and its
-  sub-modules (`LocalAccess`, `Place`, `Rvalue`, `Discriminant`, `Step`,
-  `ControlFlow`) from `vendor/lean-miri/`, which places the vendored tree
-  inside the correspondence TCB (Section 1.3).
+  sub-modules (`LocalAccess`, `Place`, `Rvalue`, `Step`, `ControlFlow`) from
+  `vendor/lean-miri/`, which places the vendored tree inside the correspondence
+  TCB (Section 1.3).
 - **Allowlisted tactics in `theory/` and `correspondence/`:**
   `Anneal/MirWp.lean`, `Anneal/MirCorrespondenceBase.lean`, and
   `Anneal/MirCorrespondenceProof.lean` use only the tactics that
