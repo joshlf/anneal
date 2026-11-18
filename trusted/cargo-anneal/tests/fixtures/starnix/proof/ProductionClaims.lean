@@ -27,45 +27,23 @@ def sourceOutput (toBe : Bool) (width : Nat) (value : Word) : Word :=
   | true, 2 => swap32 value
   | true, _ => swap64 value
 
-/-- Every flag and width runs the captured body to `sourceOutput`. Each path is
-executed block by block with `Anneal.MirWp`'s `BlockExec` rules. Symbolic `u64`
-assignments store their `BitVec 64` value through `evalStatement_assignU64`;
-every other step closes by `eq_refl`, which also checks the returned value
-against `sourceOutput`. The assignment rules come before the plain
-`blockExec_cons` step: on a symbolic value, `eq_refl` reaches the `checkVal`
-test, which never reduces, and fails only after a long search. -/
+/-- The synthesized return value of `InitialCache.sourceExec` on each byte-order
+flag and width index matches `sourceOutput`. -/
+theorem sourceExec_val (toBe : Bool) (width : Fin 4) (value : Word) :
+    (sourceExec toBe width value).1 =
+      u64Val (sourceOutput toBe width.val value) := by
+  revert width value
+  cases toBe <;> apply fin4_cases <;> intro value <;> eq_refl
+
+/-- Every flag and width runs the captured body to `sourceOutput`, combining the
+spec-independent symbolic execution in `InitialCache.sourceExec` with the
+endpoint check `sourceExec_val`. -/
 theorem sourceExecutes (toBe : Bool) (width : Fin 4) (value : Word) :
     Executes sourceBody (initial sourceBody (endianArgs toBe width.val value))
       (u64Val (sourceOutput toBe width.val value)) := by
-  revert width value
-  cases toBe <;> apply fin4_cases <;> intro value <;>
-  · unfold initial
-    repeat (first
-      | (apply executes_of_blockExec; eq_refl)
-      | (apply blockExec_storageLive; eq_refl; eq_refl)
-      | (apply blockExec_storageDead; eq_refl; eq_refl)
-      | (apply blockExec_cons
-         apply evalStatement_assignU64 (rv := .binaryOp .bitAnd _ _)
-         eq_refl; eq_refl; eq_refl; eq_refl; apply u64BitAndVal_eq
-         eq_refl; eq_refl)
-      | (apply blockExec_cons
-         apply evalStatement_assignU64 (rv := .binaryOp .bitOr _ _)
-         eq_refl; eq_refl; eq_refl; eq_refl; apply u64BitOrVal_eq
-         eq_refl; eq_refl)
-      | (apply blockExec_cons
-         apply evalStatement_assignU64 (rv := .binaryOp .shl _ _)
-         eq_refl; eq_refl; eq_refl; eq_refl; apply u64ShlVal_eq
-         eq_refl; eq_refl)
-      | (apply blockExec_cons
-         apply evalStatement_assignU64 (rv := .binaryOp .shr _ _)
-         eq_refl; eq_refl; eq_refl; eq_refl; apply u64ShrVal_eq
-         eq_refl; eq_refl)
-      | (apply blockExec_cons
-         apply evalStatement_assignU64 (rv := .use _)
-         eq_refl; eq_refl; eq_refl; eq_refl; eq_refl; eq_refl; eq_refl)
-      | (apply blockExec_cons; eq_refl)
-      | (apply blockExec_nil_step; eq_refl; eq_refl)
-      | (apply blockExec_nil_ret; eq_refl; eq_refl))
+  have h_exec := (sourceExec toBe width value).2
+  rw [sourceExec_val toBe width value] at h_exec
+  exact h_exec
 
 theorem sourceReturns (toBe : Bool) (width : Fin 4) (value : Word) :
     Returns sourceBody (endianArgs toBe width.val value)

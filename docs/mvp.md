@@ -334,19 +334,23 @@ A path whose arguments include a universally quantified value cannot be proved
 by evaluating `run` or `step` from the entry state: each step leaves its
 successor's locals as an unreduced update of the previous state, and the
 dynamic type test of an assignment does not reduce on a symbolic scalar.
-`BlockExec` certificates cut such a path at basic-block boundaries. Each rule
-consumes one statement of the current block and states its successor as
-`mkState b i L'`, where closing the `setElem?` premise by `rfl` reduces `L'` to
-a literal list of slots. `evalStatement_assign` turns the type test and the
-stored value into premises that value-level lemmas discharge.
+`Anneal.MirWp` provides two composition routes for such paths:
 
-The endianness proof runs every path through these rules with one tactic
-script and no generated witnesses. The Rust spin fixture uses safety transport
-before its loop invariant and proves no return separately. These consumers
-exercise the existing acceptance path; no speed or memory improvement is
-established. Safety transport and the execution-to-safety bridge rely on the
-deterministic source step. An extension to nondeterministic execution needs a
-bridge covering every relevant path.
+- `wpSteps` (`wpStepsOutcome`) with `wpOutcomeState_trans` and `wpState_cut`,
+  which cut a weakest-precondition obligation across an explicit concrete-spine
+  intermediate state `s_mid` over arbitrary `ValidChoice` branching; and
+- `BlockExec` certificates (`executes_of_blockExec`), which normalize the
+  body's basic-block and local-type spines once at entry, consume one statement
+  of the current block at a time with `L'` reduced to a literal list of slots
+  via `setElem?`, and discharge symbolic assignments via
+  `blockExec_assign_local` / `evalStatement_assign`.
+
+The endianness proof runs every path once through `BlockExec` in
+`InitialCache.sourceExec` — synthesizing both the returned value and its
+`Executes` certificate with one shared tactic script and no generated
+witnesses — so `ExecutionProof` and `ProductionClaims` reuse the same symbolic
+execution without duplicating tactics. The Rust spin fixture uses safety
+transport before its loop invariant and proves no return separately.
 
 ## Supported fragment and results
 
