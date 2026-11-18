@@ -21,12 +21,12 @@ import Miri.Interpreter.Rvalue
 import Miri.Interpreter.Discriminant
 import Miri.Interpreter.Step
 import Miri.Interpreter.ControlFlow
-import Trusted.MirAst
+import Trusted.MirModel
 import Trusted.MirSemantics
 
 namespace Trusted.Correspondence
 
-open Trusted.MirAst Trusted.MirSemantics
+open Trusted.MirModel Trusted.MirSemantics
 
 /-!
 # MIR Correspondence Specification (`Trusted.Correspondence`)
@@ -41,7 +41,7 @@ file is the human-audited specification bridge between `Trusted.MirSemantics`
 ($M_{\text{anneal}}$) and `vendor/lean-miri/` ($M_{\text{ref}}$), **human
 comprehension takes priority over every other concern** across
 `CorrespondenceClaim` and all of its transitive dependencies
-(`Trusted.Correspondence`, `Trusted.MirSemantics`, and `Trusted.MirAst`). Every
+(`Trusted.Correspondence`, `Trusted.MirSemantics`, and `Trusted.MirModel`). Every
 definition in this module is written to be maximally direct, self-evident to a
 human auditor, and accompanied by explicit boundary documentation so any gap or
 scoping restriction is immediately visible rather than subtle.
@@ -989,13 +989,13 @@ noncomputable def refDiscriminantHooksForEnum (S : Type) (enumTyId : Nat)
   scalarMayBeNull := fun _ _ s => .ok true s
 }
 
-/-- Map `Trusted.MirAst.UnOp` to `Miri.MIR.UnOp`. -/
+/-- Map `Trusted.MirModel.UnOp` to `Miri.MIR.UnOp`. -/
 noncomputable def toMiriUnOp : UnOp → Miri.MIR.UnOp
   | .not => .Not
   | .neg => .Neg
   | .ptrMetadata => .PtrMetadata
 
-/-- Map `Trusted.MirAst.BinOp` to `Miri.MIR.BinOp`. -/
+/-- Map `Trusted.MirModel.BinOp` to `Miri.MIR.BinOp`. -/
 noncomputable def toMiriBinOp : BinOp → Miri.MIR.BinOp
   | .add => .Add
   | .addUnchecked => .AddUnchecked

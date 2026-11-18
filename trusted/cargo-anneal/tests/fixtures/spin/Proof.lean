@@ -13,9 +13,12 @@ import Anneal.MirWp
 
 namespace Proof
 
-open Trusted.MirAst Trusted.MirSemantics Anneal.MirWp
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp
 
-def body : Body := Captured.program.bodies[0]
+noncomputable def program : Program :=
+  interpretV2026_10_22_R7189d39d9 Captured.program
+
+noncomputable def body : Body := program.bodies[0]
 
 def s0 : State := mkState 0 0 [.live none, .dead, .live (some .unit)]
 def s1 : State := mkState 0 1 [.live none, .live none, .live (some .unit)]
@@ -95,7 +98,7 @@ theorem noDoneStep (state : State) (inv : invariant state) (out : TerminalOut) :
         | inl same => subst state; simp [step3]
         | inr same => subst state; simp [step4]
 
-theorem verify : CrateTheorem ⟨Captured.program, Spec.specs⟩ := by
+theorem verify : CrateTheorem ⟨program, Spec.specs⟩ := by
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩
   · intro id selected found
     cases id with

@@ -662,15 +662,33 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // Capture schema 2 binds unsafe caller requirements to source identities.
     // An old program without that required Body field belongs to another model
     // ABI; reject it before compiling proofs. Request schema 1 is independent.
-    if manifest["schema_version"] != 2
-        || manifest["compiler"]["commit"] != "f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1"
-    {
+    let supported_dialect = match (
+        manifest["compiler"]["commit"].as_str(),
+        manifest["mir_dialect"]
+            .as_str()
+            .or_else(|| manifest["compiler"]["mir_dialect"].as_str()),
+    ) {
+        (
+            Some("7189d39d9ce936881b8132c6addeaf3e295cd455"),
+            Some(d @ "V2026_10_22_R7189d39d9"),
+        )
+        | (
+            Some("14210df0e27ccd7d9e6a05b8085cbd438e4bbc65"),
+            Some(d @ "V2026_05_31_R14210df0e"),
+        )
+        | (
+            Some("f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1"),
+            Some(d @ "V2026_05_30_Rf8a08b688"),
+        ) => Some(d),
+        _ => None,
+    };
+    let Some(mir_dialect) = supported_dialect.filter(|_| manifest["schema_version"] == 2) else {
         return Err(error(
             "tool_failed",
             "capture",
             "unexpected capture schema or compiler",
         ));
-    }
+    };
     // Authenticate configuration and scope before compiling any authored
     // Lean. A valid theorem about another target or a narrower selection
     // cannot satisfy this request.
@@ -726,6 +744,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
 
     let bundle = work.join("anneal");
     let mut modules = Vec::new();
+    let mut bundled_theory_modules = Vec::new();
     let mut model_identity = Vec::new();
     // Installed theory remains proof code even though it ships with the
     // model. Only primitive trusted modules may determine the canonical
@@ -745,7 +764,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
                 role: TargetRole::Model,
             });
         } else if relative.ends_with(".lean") && relative.starts_with("theory/") {
-            modules.push(TargetModule {
+            bundled_theory_modules.push(TargetModule {
                 module: relative
                     .trim_start_matches("theory/")
                     .trim_end_matches(".lean")
@@ -769,8 +788,13 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // runner-owned names before writing anything so authored files cannot
     // shadow the model, captured subject, or generated expectation.
     let proof_root = root(&base, &request.proof.source_root)?;
-    let mut module_names: BTreeSet<_> = modules.iter().map(|m| m.module.clone()).collect();
+    let mut module_names: BTreeSet<_> = modules
+        .iter()
+        .chain(bundled_theory_modules.iter())
+        .map(|m| m.module.clone())
+        .collect();
     let mut spec_identity = Vec::new();
+    let mut uses_pure_lift = false;
     for input in &request.proof.sources {
         if !identifier(&input.module)
             || ["Expected", "Captured", "Trusted", "Anneal"].contains(&input.module.as_str())
@@ -786,6 +810,11 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         }
         let original = declared_file(&proof_root, &input.path)?;
         let bytes = fs::read(&original).map_err(|e| io("proof", e))?;
+        if std::str::from_utf8(&bytes)
+            .is_ok_and(|text| text.contains("Anneal.PureLift"))
+        {
+            uses_pure_lift = true;
+        }
         let sha256 = digest(&bytes);
         originals.push((original, sha256.clone()));
         let source = work
@@ -806,6 +835,15 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             expected_sha256: sha256,
             role,
         });
+    }
+    for theory_mod in bundled_theory_modules {
+        if theory_mod.module == "Anneal.MirWp"
+            || (uses_pure_lift
+                && (theory_mod.module == "Anneal.PureLift"
+                    || theory_mod.module.starts_with("Anneal.PureLift.")))
+        {
+            modules.push(theory_mod);
+        }
     }
     if !modules
         .iter()
@@ -832,7 +870,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // authored proof package never supplies an expected proposition or model.
     let header = "-- Copyright 2026 The Fuchsia Authors\n--\n-- Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0\n-- <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT\n-- license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.\n-- This file may not be copied, modified, or distributed except according to\n-- those terms.\n\n";
     let expected = format!(
-        "{header}prelude\nimport Trusted.MirSemantics\nimport Captured\nimport {spec_module}\n\nnamespace Expected\ndef claim : Prop := _root_.Trusted.MirSemantics.{root_name} (_root_.Trusted.MirSemantics.Crate.mk _root_.Captured.program _root_.{})\nend Expected\n",
+        "{header}prelude\nimport Trusted.MirSemantics\nimport Captured\nimport {spec_module}\n\nnamespace Expected\ndef claim : Prop := _root_.Trusted.MirSemantics.{mir_dialect}.{root_name} (_root_.Trusted.MirSemantics.{mir_dialect}.Crate.mk _root_.Captured.program _root_.{})\nend Expected\n",
         request.proof.specification
     );
     let expected_path = work.join("generated/Expected.lean");
@@ -849,7 +887,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         theorem_name: request.proof.theorem.clone(),
         expected_module: "Expected".to_owned(),
         expected_declaration: "Expected.claim".to_owned(),
-        canonical_root: format!("Trusted.MirSemantics.{root_name}"),
+        canonical_root: format!("Trusted.MirSemantics.{mir_dialect}.{root_name}"),
         subject_declaration: "Captured.program".to_owned(),
         specification_declaration: request.proof.specification.clone(),
         bindings: TargetBindings {

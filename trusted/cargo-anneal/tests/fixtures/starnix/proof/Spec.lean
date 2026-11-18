@@ -12,7 +12,7 @@ import Endianness
 
 namespace Spec
 
-open Trusted.MirAst Trusted.MirSemantics Endianness
+open Trusted.MirModel Trusted.MirSemantics Endianness
 
 /-- Call `program` at entry body `0` on `args` and reach normal return `ret`
 with empty caller memory. -/

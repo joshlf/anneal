@@ -19,7 +19,7 @@ import Anneal.MirWp
 
 namespace Anneal.MirCorrespondenceBase
 
-open Trusted Trusted.MirAst Trusted.MirSemantics Trusted.Correspondence
+open Trusted Trusted.MirModel Trusted.MirSemantics Trusted.Correspondence
 
 /-!
 # MIR Correspondence Codec and Bridge Lemmas (`Anneal.MirCorrespondenceBase`)

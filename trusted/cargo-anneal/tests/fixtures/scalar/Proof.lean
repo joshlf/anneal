@@ -12,9 +12,12 @@ import Anneal.MirWp
 
 namespace Proof
 
-open Trusted.MirAst Trusted.MirSemantics Anneal.MirWp
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp
 
-def body : Body := Captured.program.bodies[0]
+noncomputable def program : Program :=
+  interpretV2026_10_22_R7189d39d9 Captured.program
+
+noncomputable def body : Body := program.bodies[0]
 
 -- The execution certificate uses the captured body. Changing the Rust result
 -- invalidates this equation and the stated property.

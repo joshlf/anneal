@@ -121,18 +121,20 @@ impl Failure {
 /// `rustc_version_str` reports the "version string for `rustc` itself".
 /// https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_interface/src/util.rs#L688-L691
 fn check_compiler(sysroot: &Path) -> Result<(), Failure> {
-    if rustc_interface::util::rustc_version_str() != Some(ir::COMPILER_VERSION) {
+    let Some((pin, _)) =
+        rustc_interface::util::rustc_version_str().and_then(ir::active_pinned_compiler)
+    else {
         return Err(Failure::tool(
             "capture was linked against an unexpected rustc revision",
         ));
-    }
+    };
     let output = Command::new(sysroot.join("bin/rustc"))
         .args(["--version", "--verbose"])
         .output()
         .map_err(Failure::io)?;
     let text =
         String::from_utf8(output.stdout).map_err(|error| Failure::tool(error.to_string()))?;
-    let expected = format!("commit-hash: {}", ir::COMPILER_COMMIT);
+    let expected = format!("commit-hash: {}", pin.commit);
     if !output.status.success() || !text.lines().any(|line| line == expected) {
         return Err(Failure::tool(
             "sysroot rustc does not match the pinned full compiler commit",
@@ -174,7 +176,7 @@ fn run(mut args: Args) -> Result<serde_json::Value, Failure> {
     let manifest = capture::run(&args)?;
     let json =
         serde_json::to_vec_pretty(&manifest).map_err(|error| Failure::tool(error.to_string()))?;
-    let lean = lean::render(&manifest.program);
+    let lean = lean::render(manifest.mir_dialect, &manifest.program);
     let destination = publication
         .publish(&json, lean.as_bytes())
         .map_err(Failure::io)?;

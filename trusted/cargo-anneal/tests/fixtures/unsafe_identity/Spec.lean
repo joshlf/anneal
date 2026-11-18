@@ -11,7 +11,7 @@ import Trusted.MirSemantics
 
 namespace Spec
 
-open Trusted.MirAst Trusted.MirSemantics
+open Trusted.MirModel Trusted.MirSemantics
 
 /--
 The reviewed caller requirements are: `locked` may never be called, while

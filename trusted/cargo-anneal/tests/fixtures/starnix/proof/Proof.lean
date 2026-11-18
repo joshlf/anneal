@@ -12,7 +12,7 @@ import ProductionClaims
 
 namespace Proof
 
-open Trusted.MirAst Trusted.MirSemantics Endianness ProductionReduction ProductionClaims
+open Trusted.MirModel Trusted.MirSemantics Endianness ProductionReduction ProductionClaims
 
 theorem verify : Expected.claim := by
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩

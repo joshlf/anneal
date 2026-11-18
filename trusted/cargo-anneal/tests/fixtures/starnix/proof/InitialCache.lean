@@ -12,14 +12,17 @@ import SourceInputs
 
 namespace ProductionReduction
 
-open Trusted.MirAst Trusted.MirSemantics Anneal.MirWp Endianness
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp Endianness
 
-abbrev sourceBody : Body := Captured.program.bodies[0]'(by decide)
+noncomputable abbrev sourceProgram : Program :=
+  interpretV2026_10_22_R7189d39d9 Captured.program
 
-abbrev dataWidthVal (width : Nat) : Val :=
+noncomputable abbrev sourceBody : Body := sourceProgram.bodies[0]'(by decide)
+
+noncomputable abbrev dataWidthVal (width : Nat) : Val :=
   bodyDataWidthVal sourceBody width
 
-abbrev endianArgs (toBe : Bool) (width : Nat) (value : Word) : List Val :=
+noncomputable abbrev endianArgs (toBe : Bool) (width : Nat) (value : Word) : List Val :=
   bodyEndianArgs sourceBody toBe width value
 
 end ProductionReduction

@@ -203,18 +203,33 @@ def run(arguments, work):
 
 
 def main():
+    import os
+    repo_root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ["cli", "capture", "sysroot", "lean"]:
-        parser.add_argument(f"--{name}", type=Path, required=True)
+    parser.add_argument(
+        "--cli", type=Path,
+        default=os.environ.get("ANNEAL_CLI") or os.environ.get("ANNEAL_MVP_CLI") or (repo_root / "target/debug/cargo-anneal"))
+    parser.add_argument(
+        "--capture", type=Path,
+        default=os.environ.get("ANNEAL_CAPTURE") or os.environ.get("ANNEAL_MVP_CAPTURE") or (repo_root / "target/debug/anneal-rustc-capture"))
+    parser.add_argument(
+        "--sysroot", type=Path,
+        default=os.environ.get("ANNEAL_SYSROOT") or os.environ.get("ANNEAL_MVP_SYSROOT") or os.environ.get("ANNEAL_TEST_RUST_SYSROOT"))
+    parser.add_argument(
+        "--lean", type=Path,
+        default=os.environ.get("ANNEAL_LEAN") or os.environ.get("ANNEAL_MVP_LEAN"))
     parser.add_argument("--source-dir", type=Path,
                         help="Existing pinned core/src; otherwise fetch hash-pinned files")
     parser.add_argument("--artifacts-dir", type=Path,
                         help="New directory retaining complete test evidence")
     arguments = parser.parse_args()
+    for name in ["cli", "capture", "sysroot", "lean"]:
+        if getattr(arguments, name) is None:
+            parser.error(f"the following arguments are required: --{name}")
     for name in ["cli", "capture", "sysroot", "lean", "source_dir"]:
         path = getattr(arguments, name)
         if path is not None:
-            setattr(arguments, name, path.resolve(strict=True))
+            setattr(arguments, name, Path(path).resolve(strict=True))
     # Own a fresh private evidence directory so an old successful receipt
     # cannot satisfy this run and exported source/log bytes stay private.
     if arguments.artifacts_dir:

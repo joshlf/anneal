@@ -11,7 +11,7 @@ import Trusted.MirSemantics
 
 namespace ExecutionSpec
 
-open Trusted.MirAst Trusted.MirSemantics
+open Trusted.MirModel Trusted.MirSemantics
 
 /--
 Every valid entry has an actual source return, without prescribing its value.

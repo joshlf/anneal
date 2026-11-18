@@ -416,19 +416,30 @@ fn help_and_version_do_not_claim_callback_execution() {
 
 #[test]
 fn explicit_separator_routes_information_requests_to_rustc() {
-    for (option, compiler_output) in [
-        ("--help", "Usage: rustc"),
-        ("--version", "rustc 1.98.0-nightly (f8a08b688 2026-05-30)"),
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_anneal-rustc-capture"))
-            .args(["--", option])
-            .output()
-            .expect("run compiler information command through separator");
-        assert_eq!(output.status.code(), Some(1), "{output:?}");
-        assert!(stdout(&output).starts_with(compiler_output), "{output:?}");
-        assert!(!stdout(&output).contains(CALLBACK), "{output:?}");
-        assert!(!stderr(&output).contains(CALLBACK), "{output:?}");
-    }
+    let help = Command::new(env!("CARGO_BIN_EXE_anneal-rustc-capture"))
+        .args(["--", "--help"])
+        .output()
+        .expect("run compiler --help through separator");
+    assert_eq!(help.status.code(), Some(1), "{help:?}");
+    assert!(stdout(&help).starts_with("Usage: rustc"), "{help:?}");
+    assert!(!stdout(&help).contains(CALLBACK), "{help:?}");
+    assert!(!stderr(&help).contains(CALLBACK), "{help:?}");
+
+    let version = Command::new(env!("CARGO_BIN_EXE_anneal-rustc-capture"))
+        .args(["--", "--version"])
+        .output()
+        .expect("run compiler --version through separator");
+    assert_eq!(version.status.code(), Some(1), "{version:?}");
+    let version_out = stdout(&version);
+    assert!(
+        version_out.starts_with("rustc ")
+            && (version_out.contains("(7189d39d9 2026-10-22)")
+                || version_out.contains("(14210df0e 2026-05-31)")
+                || version_out.contains("(f8a08b688 2026-05-30)")),
+        "unexpected compiler version output: {version:?}"
+    );
+    assert!(!version_out.contains(CALLBACK), "{version:?}");
+    assert!(!stderr(&version).contains(CALLBACK), "{version:?}");
 }
 
 #[test]
@@ -437,15 +448,23 @@ fn compiler_artifacts_on_stdout_match_rustc_bytes() {
     // Use the build's pinned compiler command. Nix supplies a loader wrapper
     // because upstream rustc's host loader is absent from its build sandbox.
     let rustc = std::env::var_os("RUSTC")
-        .expect("set RUSTC to the pinned Rust compiler or its build wrapper");
+        .or_else(|| {
+            std::env::var_os("ANNEAL_TEST_RUST_SYSROOT")
+                .map(|root| PathBuf::from(root).join("bin/rustc").into_os_string())
+        })
+        .expect("set RUSTC or ANNEAL_TEST_RUST_SYSROOT to the pinned Rust compiler");
     let version = Command::new(&rustc)
         .arg("--version")
         .output()
         .expect("run the pinned build compiler");
     assert!(version.status.success(), "{version:?}");
-    assert_eq!(
-        stdout(&version).trim(),
-        "rustc 1.98.0-nightly (f8a08b688 2026-05-30)"
+    let version_trimmed = stdout(&version).trim().to_owned();
+    assert!(
+        version_trimmed.starts_with("rustc ")
+            && (version_trimmed.ends_with("(7189d39d9 2026-10-22)")
+                || version_trimmed.ends_with("(14210df0e 2026-05-31)")
+                || version_trimmed.ends_with("(f8a08b688 2026-05-30)")),
+        "unexpected pinned compiler version: {version_trimmed}"
     );
     for emission in ["--emit=asm=-", "--emit=llvm-ir=-", "--emit=obj=-"] {
         let expected = session
@@ -534,7 +553,12 @@ fn compiler_panics_use_rustcs_ice_hook() {
         diagnostics.contains("https://github.com/joshlf/anneal/issues/new"),
         "{diagnostics}"
     );
-    assert!(diagnostics.contains("f8a08b688"), "{diagnostics}");
+    assert!(
+        diagnostics.contains("7189d39d9")
+            || diagnostics.contains("14210df0e")
+            || diagnostics.contains("f8a08b688"),
+        "{diagnostics}"
+    );
     assert!(
         diagnostics.contains("query stack during panic"),
         "{diagnostics}"

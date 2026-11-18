@@ -14,11 +14,14 @@ import Init.Data.Int.Basic
 import Init.Data.Nat.Div.Basic
 import Init.Data.Nat.Bitwise.Basic
 import Init.Control.Except
-import Trusted.MirAst
+import Trusted.MirModel
+import Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst
+import Trusted.Rustc.V2026_05_31_R14210df0e.MirAst
+import Trusted.Rustc.V2026_05_30_Rf8a08b688.MirAst
 
 namespace Trusted.MirSemantics
 
-open Trusted.MirAst
+open Trusted.MirModel
 
 /-!
 # Anneal MIR Small-Step Operational Semantics (`Trusted.MirSemantics`)
@@ -719,7 +722,7 @@ noncomputable def initLocalsLoop (body : Body) (args : List Val) :
 /-- Entry initialization (`initState p q`):
 Validates the 64-bit target layout (`p.pointerWidthBits = 64`), the MIR
 semantic profile version (`p.mirProfileVersion = 1`; see
-`Trusted.MirAst.Program`), entry body existence, non-empty basic blocks,
+`Trusted.MirModel.Program`), entry body existence, non-empty basic blocks,
 in-bounds storage annotations, supported local types, empty `callerMem`, and
 well-typed `q.args`. Returns `.error .unsupported` if any static/entry
 precondition fails. -/
@@ -1670,6 +1673,360 @@ noncomputable def CrateTheorem (c : Crate) : Prop :=
 capture (`c.program.scope = .unit`). -/
 noncomputable def UnitTheorem (c : Crate) : Prop :=
   c.program.scope = .unit ∧ ProgramVerified c.program c.specs
+
+/-- Map a captured `V2026_10_22_R7189d39d9` integer width into
+`Trusted.MirModel.IntWidth`. -/
+noncomputable def interpretIntWidth :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.IntWidth →
+    Trusted.MirModel.IntWidth
+  | .i8 => .i8
+  | .i16 => .i16
+  | .i32 => .i32
+  | .i64 => .i64
+  | .i128 => .i128
+  | .isize => .isize
+
+/-- Map a captured `V2026_10_22_R7189d39d9` mutability flag into
+`Trusted.MirModel.Mutability`. -/
+noncomputable def interpretMutability :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Mutability →
+    Trusted.MirModel.Mutability
+  | .shared => .shared
+  | .mut => .mut
+
+/-- Map a captured `V2026_10_22_R7189d39d9` enum tag representation into
+`Trusted.MirModel.EnumTagRepr`. -/
+noncomputable def interpretEnumTagRepr :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.EnumTagRepr →
+    Trusted.MirModel.EnumTagRepr
+  | .zeroSized => .zeroSized
+  | .scalar width signed => .scalar (interpretIntWidth width) signed
+
+/-- Map a captured `V2026_10_22_R7189d39d9` fieldless enum descriptor into
+`Trusted.MirModel.EnumTy`. -/
+noncomputable def interpretEnumTy
+    (ety : Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.EnumTy) :
+    Trusted.MirModel.EnumTy :=
+  { id := ety.id
+    discrWidth := interpretIntWidth ety.discrWidth
+    discrSigned := ety.discrSigned
+    tagRepr := interpretEnumTagRepr ety.tagRepr
+    discriminants := ety.discriminants }
+
+mutual
+  /-- Map a captured `V2026_10_22_R7189d39d9` type descriptor into
+  `Trusted.MirModel.MirTy`. -/
+  noncomputable def interpretMirTy :
+      Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.MirTy →
+      Trusted.MirModel.MirTy
+    | .bool => .bool
+    | .int width signed => .int (interpretIntWidth width) signed
+    | .unit => .unit
+    | .never => .never
+    | .enum ty => .enum (interpretEnumTy ty)
+    | .tuple fields => .tuple (interpretMirTyList fields)
+    | .ref mutability pointee =>
+      .ref (interpretMutability mutability) (interpretMirTy pointee)
+    | .rawPtr mutability pointee =>
+      .rawPtr (interpretMutability mutability) (interpretMirTy pointee)
+    | .unsupported => .unsupported
+
+  /-- Elementwise map of `interpretMirTy` over a list of captured types. -/
+  noncomputable def interpretMirTyList :
+      List Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.MirTy →
+      List Trusted.MirModel.MirTy
+    | [] => []
+    | ty :: tys => interpretMirTy ty :: interpretMirTyList tys
+end
+
+/-- Map a captured `V2026_10_22_R7189d39d9` binary operator into
+`Trusted.MirModel.BinOp`. -/
+noncomputable def interpretBinOp :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.BinOp →
+    Trusted.MirModel.BinOp
+  | .add => .add
+  | .addUnchecked => .addUnchecked
+  | .addWithOverflow => .addWithOverflow
+  | .sub => .sub
+  | .subUnchecked => .subUnchecked
+  | .subWithOverflow => .subWithOverflow
+  | .mul => .mul
+  | .mulUnchecked => .mulUnchecked
+  | .mulWithOverflow => .mulWithOverflow
+  | .div => .div
+  | .rem => .rem
+  | .bitXor => .bitXor
+  | .bitAnd => .bitAnd
+  | .bitOr => .bitOr
+  | .shl => .shl
+  | .shlUnchecked => .shlUnchecked
+  | .shr => .shr
+  | .shrUnchecked => .shrUnchecked
+  | .eq => .eq
+  | .lt => .lt
+  | .le => .le
+  | .ne => .ne
+  | .ge => .ge
+  | .gt => .gt
+  | .offset => .offset
+
+/-- Map a captured `V2026_10_22_R7189d39d9` unary operator into
+`Trusted.MirModel.UnOp`. -/
+noncomputable def interpretUnOp :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.UnOp →
+    Trusted.MirModel.UnOp
+  | .not => .not
+  | .neg => .neg
+  | .ptrMetadata => .ptrMetadata
+
+/-- Map a captured `V2026_10_22_R7189d39d9` place projection element into
+`Trusted.MirModel.ProjectionElem`. -/
+noncomputable def interpretProjectionElem :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.ProjectionElem →
+    Trusted.MirModel.ProjectionElem
+  | .deref => .deref
+  | .field fieldIdx ty => .field fieldIdx (interpretMirTy ty)
+  | .unsupported => .unsupported
+
+/-- Map a captured `V2026_10_22_R7189d39d9` place into
+`Trusted.MirModel.Place`. -/
+noncomputable def interpretPlace
+    (p : Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Place) :
+    Trusted.MirModel.Place :=
+  { localId := p.localId
+    projection := p.projection.map interpretProjectionElem }
+
+/-- Map a captured `V2026_10_22_R7189d39d9` constant literal into
+`Trusted.MirModel.ConstLit`. -/
+noncomputable def interpretConstLit :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.ConstLit →
+    Trusted.MirModel.ConstLit
+  | .scalar bits => .scalar bits
+  | .zeroSized => .zeroSized
+
+/-- Map a captured `V2026_10_22_R7189d39d9` constant operand into
+`Trusted.MirModel.ConstOperand`. -/
+noncomputable def interpretConstOperand
+    (c : Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.ConstOperand) :
+    Trusted.MirModel.ConstOperand :=
+  { ty := interpretMirTy c.ty
+    lit := interpretConstLit c.lit }
+
+/-- Map a captured `V2026_10_22_R7189d39d9` operand into
+`Trusted.MirModel.Operand`. -/
+noncomputable def interpretOperand :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Operand →
+    Trusted.MirModel.Operand
+  | .copy place => .copy (interpretPlace place)
+  | .move place => .move (interpretPlace place)
+  | .constant c => .constant (interpretConstOperand c)
+
+/-- Map a captured `V2026_10_22_R7189d39d9` rvalue into
+`Trusted.MirModel.Rvalue`. -/
+noncomputable def interpretRvalue :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Rvalue →
+    Trusted.MirModel.Rvalue
+  | .use op => .use (interpretOperand op)
+  | .binaryOp op lhs rhs =>
+    .binaryOp (interpretBinOp op) (interpretOperand lhs) (interpretOperand rhs)
+  | .unaryOp op opnd =>
+    .unaryOp (interpretUnOp op) (interpretOperand opnd)
+  | .discriminant place => .discriminant (interpretPlace place)
+  | .ref mutability place =>
+    .ref (interpretMutability mutability) (interpretPlace place)
+  | .addressOf mutability place =>
+    .addressOf (interpretMutability mutability) (interpretPlace place)
+  | .aggregateTuple fields =>
+    .aggregateTuple (fields.map interpretOperand)
+  | .unsupported => .unsupported
+
+/-- Map a captured `V2026_10_22_R7189d39d9` statement into
+`Trusted.MirModel.StatementKind`. -/
+noncomputable def interpretStatementKind :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.StatementKind →
+    Trusted.MirModel.StatementKind
+  | .assign dst rvalue =>
+    .assign (interpretPlace dst) (interpretRvalue rvalue)
+  | .storageLive localId => .storageLive localId
+  | .storageDead localId => .storageDead localId
+  | .nop => .nop
+  | .unsupported => .unsupported
+
+/-- Map a captured `V2026_10_22_R7189d39d9` `SwitchTargets` table into
+`Trusted.MirModel.SwitchTargets`. -/
+noncomputable def interpretSwitchTargets
+    (t : Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.SwitchTargets) :
+    Trusted.MirModel.SwitchTargets :=
+  { branches := t.branches
+    otherwise := t.otherwise }
+
+/-- Map a captured `V2026_10_22_R7189d39d9` unwind continuation action into
+`Trusted.MirModel.UnwindAction`. -/
+noncomputable def interpretUnwindAction :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.UnwindAction →
+    Trusted.MirModel.UnwindAction
+  | .continue_ => .continue_
+  | .unreachable => .unreachable
+  | .terminate => .terminate
+  | .cleanup block => .cleanup block
+
+/-- Map a captured `V2026_10_22_R7189d39d9` `AssertKind` into
+`Trusted.MirModel.AssertKind`. -/
+noncomputable def interpretAssertKind :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.AssertKind →
+    Trusted.MirModel.AssertKind
+  | .overflow op => .overflow (interpretBinOp op)
+  | .overflowNeg => .overflowNeg
+  | .divByZero => .divByZero
+  | .remByZero => .remByZero
+  | .boundsCheck => .boundsCheck
+  | .misalignedPtrDeref => .misalignedPtrDeref
+  | .nullPtrDeref => .nullPtrDeref
+  | .unsupported => .unsupported
+
+/-- Map a captured `V2026_10_22_R7189d39d9` terminator into
+`Trusted.MirModel.TerminatorKind`. -/
+noncomputable def interpretTerminatorKind :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.TerminatorKind →
+    Trusted.MirModel.TerminatorKind
+  | .goto target => .goto target
+  | .switchInt discr targets =>
+    .switchInt (interpretOperand discr) (interpretSwitchTargets targets)
+  | .return_ => .return_
+  | .unreachable => .unreachable
+  | .unwindResume => .unwindResume
+  | .assert cond expected msg target unwind =>
+    .assert (interpretOperand cond) expected (interpretAssertKind msg) target
+      (interpretUnwindAction unwind)
+  | .call callee args dst target unwind =>
+    .call callee (args.map interpretOperand) (interpretPlace dst) target
+      (interpretUnwindAction unwind)
+  | .unsupported => .unsupported
+
+/-- Map a captured `V2026_10_22_R7189d39d9` basic block into
+`Trusted.MirModel.BasicBlock`. -/
+noncomputable def interpretBasicBlock
+    (bb : Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.BasicBlock) :
+    Trusted.MirModel.BasicBlock :=
+  { statements := bb.statements.map interpretStatementKind
+    terminator := interpretTerminatorKind bb.terminator
+    cleanup := bb.cleanup }
+
+/-- Map a captured `V2026_10_22_R7189d39d9` function body into
+`Trusted.MirModel.Body`. -/
+noncomputable def interpretBody
+    (b : Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Body) :
+    Trusted.MirModel.Body :=
+  { argumentCount := b.argumentCount
+    locals := interpretMirTyList b.locals
+    basicBlocks := b.basicBlocks.map interpretBasicBlock
+    isUnsafe := b.isUnsafe
+    identity := b.identity }
+
+/-- Map a captured `V2026_10_22_R7189d39d9` verification scope into
+`Trusted.MirModel.VerificationScope`. -/
+noncomputable def interpretVerificationScope :
+    Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.VerificationScope →
+    Trusted.MirModel.VerificationScope
+  | .unit => .unit
+  | .crate => .crate
+
+/-- Total interpreter from `Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Program`
+(`rust-lang/rust` commit `7189d39d9ce936881b8132c6addeaf3e295cd455`,
+`commit-date: 2026-10-22`, distributed in `nightly-2026-10-23`) into the
+compiler-independent semantic model `Trusted.MirModel.Program`. -/
+noncomputable def interpretV2026_10_22_R7189d39d9
+    (p : Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Program) :
+    Trusted.MirModel.Program :=
+  { bodies := p.bodies.map interpretBody
+    entryDefId := p.entryDefId
+    pointerWidthBits := p.pointerWidthBits
+    mirProfileVersion := p.mirProfileVersion
+    scope := interpretVerificationScope p.scope }
+
+/-- Total interpreter from `Trusted.Rustc.V2026_05_31_R14210df0e.MirAst.Program`
+(`rust-lang/rust` commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`,
+`commit-date: 2026-05-31`, distributed in `nightly-2026-06-01`) into
+`Trusted.MirModel.Program`. -/
+noncomputable abbrev interpretV2026_05_31_R14210df0e :
+    Trusted.Rustc.V2026_05_31_R14210df0e.MirAst.Program →
+    Trusted.MirModel.Program :=
+  interpretV2026_10_22_R7189d39d9
+
+/-- Total interpreter from `Trusted.Rustc.V2026_05_30_Rf8a08b688.MirAst.Program`
+(`rust-lang/rust` commit `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`,
+`commit-date: 2026-05-30`, distributed in `nightly-2026-05-31`) into
+`Trusted.MirModel.Program`. -/
+noncomputable abbrev interpretV2026_05_30_Rf8a08b688 :
+    Trusted.Rustc.V2026_05_30_Rf8a08b688.MirAst.Program →
+    Trusted.MirModel.Program :=
+  interpretV2026_10_22_R7189d39d9
+
+namespace V2026_10_22_R7189d39d9
+
+/-- Captured MIR verification subject for `V2026_10_22_R7189d39d9` pairing
+`program` with its reviewed specification bundle `specs`. -/
+structure Crate where
+  program : Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Program
+  specs : Specs := ⟨fun _ _ => True, fun _ => True⟩
+
+/-- Top-level one-argument whole-crate verification obligation for
+`V2026_10_22_R7189d39d9`. -/
+noncomputable def CrateTheorem (c : Crate) : Prop :=
+  Trusted.MirSemantics.CrateTheorem
+    { program := interpretV2026_10_22_R7189d39d9 c.program, specs := c.specs }
+
+/-- Top-level one-argument proof-unit verification obligation for
+`V2026_10_22_R7189d39d9`. -/
+noncomputable def UnitTheorem (c : Crate) : Prop :=
+  Trusted.MirSemantics.UnitTheorem
+    { program := interpretV2026_10_22_R7189d39d9 c.program, specs := c.specs }
+
+end V2026_10_22_R7189d39d9
+
+namespace V2026_05_31_R14210df0e
+
+/-- Captured MIR verification subject for `V2026_05_31_R14210df0e` pairing
+`program` with its reviewed specification bundle `specs`. -/
+structure Crate where
+  program : Trusted.Rustc.V2026_05_31_R14210df0e.MirAst.Program
+  specs : Specs := ⟨fun _ _ => True, fun _ => True⟩
+
+/-- Top-level one-argument whole-crate verification obligation for
+`V2026_05_31_R14210df0e`. -/
+noncomputable def CrateTheorem (c : Crate) : Prop :=
+  Trusted.MirSemantics.CrateTheorem
+    { program := interpretV2026_05_31_R14210df0e c.program, specs := c.specs }
+
+/-- Top-level one-argument proof-unit verification obligation for
+`V2026_05_31_R14210df0e`. -/
+noncomputable def UnitTheorem (c : Crate) : Prop :=
+  Trusted.MirSemantics.UnitTheorem
+    { program := interpretV2026_05_31_R14210df0e c.program, specs := c.specs }
+
+end V2026_05_31_R14210df0e
+
+namespace V2026_05_30_Rf8a08b688
+
+/-- Captured MIR verification subject for `V2026_05_30_Rf8a08b688` pairing
+`program` with its reviewed specification bundle `specs`. -/
+structure Crate where
+  program : Trusted.Rustc.V2026_05_30_Rf8a08b688.MirAst.Program
+  specs : Specs := ⟨fun _ _ => True, fun _ => True⟩
+
+/-- Top-level one-argument whole-crate verification obligation for
+`V2026_05_30_Rf8a08b688`. -/
+noncomputable def CrateTheorem (c : Crate) : Prop :=
+  Trusted.MirSemantics.CrateTheorem
+    { program := interpretV2026_05_30_Rf8a08b688 c.program, specs := c.specs }
+
+/-- Top-level one-argument proof-unit verification obligation for
+`V2026_05_30_Rf8a08b688`. -/
+noncomputable def UnitTheorem (c : Crate) : Prop :=
+  Trusted.MirSemantics.UnitTheorem
+    { program := interpretV2026_05_30_Rf8a08b688 c.program, specs := c.specs }
+
+end V2026_05_30_Rf8a08b688
 
 /-!
 ## Audited Pass 1 Weakest-Precondition and Non-Vacuity Canary Claims

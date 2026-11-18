@@ -11,7 +11,7 @@ import Trusted.MirSemantics
 
 namespace Spec
 
-open Trusted.MirAst Trusted.MirSemantics
+open Trusted.MirModel Trusted.MirSemantics
 
 noncomputable def returnsZero (program : Program) : Prop :=
   Behavior (entryProgForBody program 0) { args := [] }

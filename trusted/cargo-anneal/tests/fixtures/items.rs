@@ -11,8 +11,8 @@
 
 // === case: fieldless_enum_supported ===
 //@ pass
-//@ mir-contains: "Trusted.MirAst.MirTy.enum"
-//@ mir-contains: "Trusted.MirAst.Rvalue.discriminant"
+//@ mir-contains: "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.MirTy.enum"
+//@ mir-contains: "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Rvalue.discriminant"
 
 pub enum E {
     A,
@@ -105,7 +105,7 @@ pub fn take_empty(x: Empty) -> usize {
 
 // === case: single_variant_enum_supported ===
 //@ pass
-//@ mir-contains: "Trusted.MirAst.EnumTagRepr.zeroSized"
+//@ mir-contains: "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.EnumTagRepr.zeroSized"
 
 pub enum Single {
     Only,

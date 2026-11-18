@@ -12,12 +12,15 @@ import Anneal.MirWp
 
 namespace Proof
 
-open Trusted.MirAst Trusted.MirSemantics Anneal.MirWp
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp
 
 -- Inventory positions retrieve the operational bodies for this fixture. The
 -- canonical safety duty still selects the reviewed predicate by body identity.
-def faulting : Body := Captured.program.bodies[0]
-def returning : Body := Captured.program.bodies[1]
+noncomputable def program : Program :=
+  interpretV2026_10_22_R7189d39d9 Captured.program
+
+noncomputable def faulting : Body := program.bodies[0]
+noncomputable def returning : Body := program.bodies[1]
 
 theorem returning_runs :
     run returning 2 (initial returning []) =

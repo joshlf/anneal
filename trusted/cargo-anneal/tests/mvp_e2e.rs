@@ -73,8 +73,25 @@ impl Tools {
                     .filter(|path| path.join("lib").is_dir())
             })
             .unwrap_or_else(|| {
-                let output = Command::new("rustup")
-                    .args(["run", "nightly-2026-05-31", "rustc", "--print", "sysroot"])
+                for toolchain in [
+                    "nightly-2026-10-23",
+                    "nightly-2026-06-01",
+                    "nightly-2026-05-31",
+                ] {
+                    if let Ok(output) = Command::new("rustup")
+                        .args(["run", toolchain, "rustc", "--print", "sysroot"])
+                        .output()
+                        && output.status.success()
+                    {
+                        return PathBuf::from(
+                            String::from_utf8(output.stdout)
+                                .expect("rustc sysroot must be UTF-8")
+                                .trim(),
+                        );
+                    }
+                }
+                let output = Command::new("rustc")
+                    .args(["--print", "sysroot"])
                     .output()
                     .expect("install the pinned compiler or set ANNEAL_MVP_SYSROOT");
                 assert!(
@@ -417,7 +434,7 @@ fn verifies_real_source_and_rejects_boundary_mutations() {
         .replace(
             "theorem verify : Expected.claim := by",
             "def Spec.specs : Specs := ⟨fun _ _ => False, fun _ => True⟩\n\n\
-             theorem verify : CrateTheorem ⟨Captured.program, Spec.specs⟩ := by",
+             theorem verify : CrateTheorem ⟨program, Spec.specs⟩ := by",
         )
         .replace(
             concat!(

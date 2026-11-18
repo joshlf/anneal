@@ -14,12 +14,12 @@ import Init.Data.Nat.Div.Basic
 import Init.Data.Nat.Bitwise.Basic
 import Init.Control.Except
 import Trusted
-import Trusted.MirAst
+import Trusted.MirModel
 import Trusted.MirSemantics
 
 namespace Anneal.MirWp
 
-open Trusted.MirAst Trusted.MirSemantics
+open Trusted.MirModel Trusted.MirSemantics
 
 /-!
 # Fuel-Bounded Weakest Precondition and Non-Vacuity Canaries (`Anneal.MirWp`)

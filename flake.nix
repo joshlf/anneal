@@ -15,7 +15,10 @@
 
   outputs = { self, nixpkgs, ... }:
     let
-      rustDate = "2026-05-31";
+      # Fuchsia's live in-tree rustc pin (`rust-lang/rust` commit
+      # `7189d39d9ce936881b8132c6addeaf3e295cd455`, commit-date 2026-10-22,
+      # distributed in `nightly-2026-10-23`).
+      rustDate = "2026-10-23";
       leanVersion =
         nixpkgs.lib.removePrefix "leanprover/lean4:v"
           (nixpkgs.lib.strings.trim (builtins.readFile ./trusted/lean/lean-toolchain));

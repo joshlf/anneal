@@ -12,10 +12,10 @@ import Init.NotationExtra
 import Init.Data.BitVec.BasicAux
 import Init.Data.Int.Basic
 
-namespace Trusted.MirAst
+namespace Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst
 
 /-!
-# Anneal MIR Abstract Syntax (`Trusted.MirAst`)
+# Versioned Rustc MIR Abstract Syntax (`Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst`)
 
 ## Human-Comprehension Priority
 
@@ -38,7 +38,7 @@ priority for every declaration in this file:
    `rustc` commit `8144389c895da997dbdecaa635e41d6a50be6ffd` (and, where
    relevant, `rust-lang/reference` commit
    `38da84aa1f1b4fda6d0bc3d8fbdfeb7d8fb5f18e` and `anneal-rustc-capture`'s
-   pinned `rustc` commit `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`).
+   pinned Fuchsia `rustc` commit `7189d39d9ce936881b8132c6addeaf3e295cd455` (`commit-date: 2026-10-22`, distributed in `nightly-2026-10-23`)).
 
 ## Correspondence with `rustc_middle::mir`
 
@@ -826,7 +826,7 @@ the MIR semantic profile version `mirProfileVersion`, and the capture scope
 2. **MIR semantic profile version (`mirProfileVersion`):**
    `mirProfileVersion` pins the contract version of the post-cleanup runtime MIR
    semantic profile shared between `anneal-rustc-capture` (`rust-lang/rust`
-   `f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`), `Trusted.MirSemantics`, and
+   `7189d39d9ce936881b8132c6addeaf3e295cd455`, `commit-date: 2026-10-22`), `Trusted.MirSemantics`, and
    `Trusted.Correspondence` (`vendor/lean-miri` upstream `rustc` reference
    `8144389c895da997dbdecaa635e41d6a50be6ffd`). Both `initState` and
    `initRefState` fail closed with `FaultKind.unsupported` (`.blocked`) whenever
@@ -838,4 +838,4 @@ structure Program where
   mirProfileVersion : Nat := 1
   scope : VerificationScope := .unit
 
-end Trusted.MirAst
+end Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst

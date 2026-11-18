@@ -22,8 +22,6 @@ use rustc_middle::ty::TyCtxt;
 use rustc_session::EarlyDiagCtxt;
 use rustc_session::config::ErrorOutputType;
 
-const COMPILER_VERSION: &str = "1.98.0-nightly (f8a08b688 2026-05-30)";
-
 struct AnalysisCallbacks {
     error_format: ErrorOutputType,
     analysis_reached: bool,
@@ -62,7 +60,10 @@ pub(super) fn configure(config: &mut interface::Config) {
     // compiler. This check catches builds against another nightly.
     // rustc_version_str returns the "version string for `rustc` itself".
     // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_interface/src/util.rs#L688-L691
-    if rustc_interface::util::rustc_version_str() != Some(COMPILER_VERSION) {
+    if rustc_interface::util::rustc_version_str()
+        .and_then(crate::ir::active_pinned_compiler)
+        .is_none()
+    {
         early_dcx.early_fatal("driver was built with an unexpected compiler version");
     }
 

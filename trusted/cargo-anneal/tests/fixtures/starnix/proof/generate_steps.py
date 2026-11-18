@@ -178,7 +178,7 @@ def produce(body, flag, width):
     output_val = locals_[0][1][0]
     source = ''
     for i, (b, p, slots) in enumerate(states):
-        source += f'private def {label}_state{i} (value : Word) : State :=\n  mkState {b} {p} [\n'
+        source += f'private noncomputable def {label}_state{i} (value : Word) : State :=\n  mkState {b} {p} [\n'
         terms = [render_slot(x) for x in slots]
         for j in range(0, len(terms), 5):
             source += '    ' + ', '.join(terms[j:j + 5])
@@ -246,7 +246,7 @@ import InitialCache
 
 namespace ProductionSteps
 
-open Trusted.MirAst Trusted.MirSemantics Anneal.MirWp Endianness ProductionReduction
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp Endianness ProductionReduction
 
 """ + ''.join(parts) + 'end ProductionSteps\n')
     print(f'Wrote {count} candidate state witnesses to {args.output}')

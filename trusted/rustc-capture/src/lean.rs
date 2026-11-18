@@ -12,13 +12,22 @@
 
 use crate::ir::{self, BinOp, Operand, Rvalue, Statement, Terminator, Ty};
 
-const HEADER: &str = "-- Copyright 2026 The Fuchsia Authors\n--\n\
+const COPYRIGHT_HEADER: &str = "-- Copyright 2026 The Fuchsia Authors\n--\n\
 -- Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0\n\
 -- <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT\n\
 -- license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.\n\
 -- This file may not be copied, modified, or distributed except according to\n\
--- those terms.\n\n\
-prelude\nimport Trusted.MirAst\n\nnamespace Captured\n\n";
+-- those terms.\n\n";
+
+fn ast_ns(mir_dialect: &str) -> String {
+    debug_assert!(
+        ir::PINNED_COMPILERS
+            .iter()
+            .any(|pin| pin.mir_dialect == mir_dialect),
+        "unexpected MIR dialect {mir_dialect}"
+    );
+    format!("Trusted.Rustc.{mir_dialect}.MirAst")
+}
 
 fn list<T>(values: &[T], render: impl Fn(&T) -> String) -> String {
     format!(
@@ -41,33 +50,33 @@ fn int_width(bits: u32, is_size: bool) -> &'static str {
     }
 }
 
-fn ty(t: &Ty) -> String {
+fn ty(ast: &str, t: &Ty) -> String {
     match t {
-        Ty::Bool => "Trusted.MirAst.MirTy.bool".into(),
-        Ty::Unit => "Trusted.MirAst.MirTy.unit".into(),
-        Ty::Never => "Trusted.MirAst.MirTy.never".into(),
+        Ty::Bool => format!("{ast}.MirTy.bool"),
+        Ty::Unit => format!("{ast}.MirTy.unit"),
+        Ty::Never => format!("{ast}.MirTy.never"),
         Ty::Int {
             bits,
             signed,
             is_size,
         } => format!(
-            "(Trusted.MirAst.MirTy.int Trusted.MirAst.IntWidth.{} {signed})",
+            "({ast}.MirTy.int {ast}.IntWidth.{} {signed})",
             int_width(*bits, *is_size)
         ),
         Ty::Enum(ety) => {
             let tag_repr = match ety.tag_repr {
-                ir::EnumTagRepr::ZeroSized => "Trusted.MirAst.EnumTagRepr.zeroSized".into(),
+                ir::EnumTagRepr::ZeroSized => format!("{ast}.EnumTagRepr.zeroSized"),
                 ir::EnumTagRepr::Scalar {
                     bits,
                     signed,
                     is_size,
                 } => format!(
-                    "(Trusted.MirAst.EnumTagRepr.scalar Trusted.MirAst.IntWidth.{} {signed})",
+                    "({ast}.EnumTagRepr.scalar {ast}.IntWidth.{} {signed})",
                     int_width(bits, is_size)
                 ),
             };
             format!(
-                "(Trusted.MirAst.MirTy.enum {{ id := {}, discrWidth := Trusted.MirAst.IntWidth.{}, discrSigned := {}, tagRepr := {tag_repr}, discriminants := {} }})",
+                "({ast}.MirTy.enum {{ id := {}, discrWidth := {ast}.IntWidth.{}, discrSigned := {}, tagRepr := {tag_repr}, discriminants := {} }})",
                 ety.id,
                 int_width(ety.discr_bits, ety.discr_is_size),
                 ety.discr_signed,
@@ -77,16 +86,18 @@ fn ty(t: &Ty) -> String {
     }
 }
 
-fn operand(op: &Operand) -> String {
+fn operand(ast: &str, op: &Operand) -> String {
     match op {
         Operand::Copy { local } => {
-            format!("(Trusted.MirAst.Operand.copy (Trusted.MirAst.Place.mk {local} []))")
+            format!("({ast}.Operand.copy ({ast}.Place.mk {local} []))")
         }
         Operand::Move { local } => {
-            format!("(Trusted.MirAst.Operand.move (Trusted.MirAst.Place.mk {local} []))")
+            format!("({ast}.Operand.move ({ast}.Place.mk {local} []))")
         }
         Operand::Constant { ty: Ty::Unit, .. } => {
-            "(Trusted.MirAst.Operand.constant (Trusted.MirAst.ConstOperand.mk Trusted.MirAst.MirTy.unit Trusted.MirAst.ConstLit.zeroSized))".into()
+            format!(
+                "({ast}.Operand.constant ({ast}.ConstOperand.mk {ast}.MirTy.unit {ast}.ConstLit.zeroSized))"
+            )
         }
         Operand::Constant {
             ty:
@@ -96,12 +107,12 @@ fn operand(op: &Operand) -> String {
                 }),
             ..
         } => format!(
-            "(Trusted.MirAst.Operand.constant (Trusted.MirAst.ConstOperand.mk {} Trusted.MirAst.ConstLit.zeroSized))",
-            ty(t)
+            "({ast}.Operand.constant ({ast}.ConstOperand.mk {} {ast}.ConstLit.zeroSized))",
+            ty(ast, t)
         ),
         Operand::Constant { ty: t, bits } => format!(
-            "(Trusted.MirAst.Operand.constant (Trusted.MirAst.ConstOperand.mk {} (Trusted.MirAst.ConstLit.scalar (BitVec.ofNat 128 {bits}))))",
-            ty(t)
+            "({ast}.Operand.constant ({ast}.ConstOperand.mk {} ({ast}.ConstLit.scalar (BitVec.ofNat 128 {bits}))))",
+            ty(ast, t)
         ),
     }
 }
@@ -125,68 +136,70 @@ fn bin_op(op: BinOp) -> &'static str {
     }
 }
 
-fn rvalue(dst_ty: Option<&Ty>, value: &Rvalue) -> String {
+fn rvalue(ast: &str, dst_ty: Option<&Ty>, value: &Rvalue) -> String {
     match value {
         Rvalue::Unit => {
-            "(Trusted.MirAst.Rvalue.use (Trusted.MirAst.Operand.constant (Trusted.MirAst.ConstOperand.mk Trusted.MirAst.MirTy.unit Trusted.MirAst.ConstLit.zeroSized)))".into()
+            format!(
+                "({ast}.Rvalue.use ({ast}.Operand.constant ({ast}.ConstOperand.mk {ast}.MirTy.unit {ast}.ConstLit.zeroSized)))"
+            )
         }
         Rvalue::Use {
             operand: op,
             with_retag,
         } => {
             if *with_retag && !dst_ty.is_some_and(Ty::is_retag_noop) {
-                "Trusted.MirAst.Rvalue.unsupported".into()
+                format!("{ast}.Rvalue.unsupported")
             } else {
-                format!("(Trusted.MirAst.Rvalue.use {})", operand(op))
+                format!("({ast}.Rvalue.use {})", operand(ast, op))
             }
         }
         Rvalue::Binary { op, left, right } => format!(
-            "(Trusted.MirAst.Rvalue.binaryOp Trusted.MirAst.BinOp.{} {} {})",
+            "({ast}.Rvalue.binaryOp {ast}.BinOp.{} {} {})",
             bin_op(*op),
-            operand(left),
-            operand(right)
+            operand(ast, left),
+            operand(ast, right)
         ),
         Rvalue::Discriminant { local } => {
-            format!("(Trusted.MirAst.Rvalue.discriminant (Trusted.MirAst.Place.mk {local} []))")
+            format!("({ast}.Rvalue.discriminant ({ast}.Place.mk {local} []))")
         }
     }
 }
 
-fn statement(local_tys: &[Ty], stmt: &Statement) -> String {
+fn statement(ast: &str, local_tys: &[Ty], stmt: &Statement) -> String {
     match stmt {
         Statement::Assign { local, value } => {
             let dst_ty = local_tys.get(*local as usize);
             format!(
-                "(Trusted.MirAst.StatementKind.assign (Trusted.MirAst.Place.mk {local} []) {})",
-                rvalue(dst_ty, value)
+                "({ast}.StatementKind.assign ({ast}.Place.mk {local} []) {})",
+                rvalue(ast, dst_ty, value)
             )
         }
         Statement::StorageLive { local } => {
-            format!("(Trusted.MirAst.StatementKind.storageLive {local})")
+            format!("({ast}.StatementKind.storageLive {local})")
         }
         Statement::StorageDead { local } => {
-            format!("(Trusted.MirAst.StatementKind.storageDead {local})")
+            format!("({ast}.StatementKind.storageDead {local})")
         }
-        Statement::Nop => "Trusted.MirAst.StatementKind.nop".into(),
+        Statement::Nop => format!("{ast}.StatementKind.nop"),
     }
 }
 
-fn terminator(term: &Terminator) -> String {
+fn terminator(ast: &str, term: &Terminator) -> String {
     match term {
-        Terminator::Goto { block } => format!("(Trusted.MirAst.TerminatorKind.goto {block})"),
+        Terminator::Goto { block } => format!("({ast}.TerminatorKind.goto {block})"),
         Terminator::SwitchInt {
             operand: op,
             targets,
             otherwise,
         } => format!(
-            "(Trusted.MirAst.TerminatorKind.switchInt {} (Trusted.MirAst.SwitchTargets.mk {} {otherwise}))",
-            operand(op),
+            "({ast}.TerminatorKind.switchInt {} ({ast}.SwitchTargets.mk {} {otherwise}))",
+            operand(ast, op),
             list(targets, |(value, block)| format!(
                 "((BitVec.ofNat 128 {value}), {block})"
             ))
         ),
-        Terminator::Ret => "Trusted.MirAst.TerminatorKind.return_".into(),
-        Terminator::Unreachable => "Trusted.MirAst.TerminatorKind.unreachable".into(),
+        Terminator::Ret => format!("{ast}.TerminatorKind.return_"),
+        Terminator::Unreachable => format!("{ast}.TerminatorKind.unreachable"),
     }
 }
 
@@ -207,16 +220,16 @@ fn identity(value: &str) -> String {
     )
 }
 
-fn body(body: &ir::Body) -> String {
+fn body(ast: &str, body: &ir::Body) -> String {
     format!(
-        "({{ argumentCount := {}, isUnsafe := {}, locals := {}, basicBlocks := {}, identity := {} }} : Trusted.MirAst.Body)",
+        "({{ argumentCount := {}, isUnsafe := {}, locals := {}, basicBlocks := {}, identity := {} }} : {ast}.Body)",
         body.arg_count,
         body.is_unsafe,
-        list(&body.local_tys, ty),
+        list(&body.local_tys, |t| ty(ast, t)),
         list(&body.blocks, |block| format!(
-            "({{ statements := {}, terminator := {}, cleanup := false }} : Trusted.MirAst.BasicBlock)",
-            list(&block.statements, |stmt| statement(&body.local_tys, stmt)),
-            terminator(&block.terminator)
+            "({{ statements := {}, terminator := {}, cleanup := false }} : {ast}.BasicBlock)",
+            list(&block.statements, |stmt| statement(ast, &body.local_tys, stmt)),
+            terminator(ast, &block.terminator)
         )),
         identity(&body.identity)
     )
@@ -226,21 +239,22 @@ fn body(body: &ir::Body) -> String {
 /// Capture emits a subject, not a proof or a dynamically chosen theorem. The
 /// verifier separately authenticates this source and checks the authored root;
 /// neither diagnostics nor census text can add commands through this renderer.
-pub fn render(program: &ir::Program) -> String {
+pub fn render(mir_dialect: &str, program: &ir::Program) -> String {
+    let ast = ast_ns(mir_dialect);
     let scope = match program.scope {
         ir::VerificationScope::Unit => "unit",
         ir::VerificationScope::Crate => "crate",
     };
     format!(
-        "{HEADER}def program : Trusted.MirAst.Program :=\n  {{ scope := Trusted.MirAst.VerificationScope.{scope}, bodies := {} }}\n\nend Captured\n",
-        list(&program.bodies, body)
+        "{COPYRIGHT_HEADER}prelude\nimport {ast}\n\nnamespace Captured\n\ndef program : {ast}.Program :=\n  {{ scope := {ast}.VerificationScope.{scope}, bodies := {} }}\n\nend Captured\n",
+        list(&program.bodies, |b| body(&ast, b))
     )
 }
 
 #[cfg(test)]
 mod identity_tests {
-    use super::{identity, rvalue};
-    use crate::ir::{Operand, Rvalue, Ty};
+    use super::{ast_ns, identity, rvalue};
+    use crate::ir::{MIR_DIALECT, Operand, Rvalue, Ty};
 
     #[test]
     fn identity_names_are_only_numeric_character_data() {
@@ -252,14 +266,18 @@ mod identity_tests {
 
     #[test]
     fn retagging_use_without_confirmed_retag_noop_destination_emits_unsupported() {
+        let ast = ast_ns(MIR_DIALECT);
         let rv = Rvalue::Use {
             operand: Operand::Copy { local: 1 },
             with_retag: true,
         };
-        assert_eq!(rvalue(None, &rv), "Trusted.MirAst.Rvalue.unsupported");
         assert_eq!(
-            rvalue(Some(&Ty::Bool), &rv),
-            "(Trusted.MirAst.Rvalue.use (Trusted.MirAst.Operand.copy (Trusted.MirAst.Place.mk 1 [])))"
+            rvalue(&ast, None, &rv),
+            "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Rvalue.unsupported"
+        );
+        assert_eq!(
+            rvalue(&ast, Some(&Ty::Bool), &rv),
+            "(Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Rvalue.use (Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Operand.copy (Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Place.mk 1 [])))"
         );
     }
 }

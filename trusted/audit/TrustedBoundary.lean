@@ -949,9 +949,10 @@ def requireParamClaimProof (env : Environment)
     unless valConsts.contains req do
       fail s!"claim {claimName} body must reference {req}"
 
-/-- Verify that `Trusted.MirAst`, `Trusted.MirSemantics`, and `Anneal.MirWp`
-are present (whenever `requireMirWp` is `true` or any of the three modules is
-loaded) and that the core weakest-precondition adequacy and
+/-- Verify that `Trusted.MirModel`,
+`Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst`, `Trusted.MirSemantics`, and
+`Anneal.MirWp` are present (whenever `requireMirWp` is `true` or any of the
+modules is loaded) and that the core weakest-precondition adequacy and
 fault-characterization theorems and all 19 non-vacuity and parameter-boundary
 canaries in `Anneal.MirWp` prove the exact `*Claim` propositions defined in
 `Trusted.MirSemantics`. -/
@@ -959,14 +960,19 @@ def verifyMirWpCoreTheorems (env : Environment)
     (roles : Std.HashMap Name ModuleRole)
     (locals : Std.HashMap Name ConstantInfo)
     (requireMirWp : Bool) : IO Unit := do
+  let hasMirModel := roles.contains `Trusted.MirModel
+  let hasMirAst := roles.contains `Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst
+  let hasMirSem := roles.contains `Trusted.MirSemantics
+  let hasMirWp := roles.contains `Anneal.MirWp
   if requireMirWp || roles.contains `Anneal.PureLift ||
-      roles.contains `Trusted.MirAst ||
-      roles.contains `Trusted.MirSemantics || roles.contains `Anneal.MirWp then
-    unless roles.contains `Trusted.MirAst do
-      fail "missing required trusted module Trusted.MirAst"
-    unless roles.contains `Trusted.MirSemantics do
+      hasMirModel || hasMirAst || hasMirSem || hasMirWp then
+    unless hasMirModel do
+      fail "missing required trusted module Trusted.MirModel"
+    unless hasMirAst do
+      fail "missing required trusted module Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst"
+    unless hasMirSem do
       fail "missing required trusted module Trusted.MirSemantics"
-    unless roles.contains `Anneal.MirWp do
+    unless hasMirWp do
       fail "missing required theory module Anneal.MirWp"
     let semMod := `Trusted.MirSemantics
     let wpMod := `Anneal.MirWp
@@ -1645,7 +1651,7 @@ def targetAudit (j : Json) (foundation : Array Name) : IO Json := do
     fail "target and Expected must have no universe parameters"
   unless expectedInfo.type == .sort .zero do fail "Expected must have type Prop"
   let canonicalRoot := (← field (α := String) target "canonicalRoot").toName
-  let crateCtor : Name := `Trusted.MirSemantics.Crate.mk
+  let crateCtor : Name := canonicalRoot.getPrefix ++ `Crate.mk
   let subjectName := (← field (α := String) target "subjectDeclaration").toName
   let specName := (← field (α := String) target "specificationDeclaration").toName
   for (n, requiredRole) in [(canonicalRoot, TargetRole.model),

@@ -1412,22 +1412,35 @@ fn rejects_vendor_constants_in_reserved_namespaces() {
     }
 }
 
-/// Verifies non-backsliding enforcement on `Trusted.MirAst`,
-/// `Trusted.MirSemantics`, and `Anneal.MirWp` core theorems and canaries in
-/// Pass 1 (`"audit"`) and required correspondence directories and claims in
-/// Pass 2 (`--require-correspondence`).
+/// Verifies non-backsliding enforcement on `Trusted.MirModel`,
+/// `Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst`, `Trusted.MirSemantics`, and
+/// `Anneal.MirWp` core theorems and canaries in Pass 1 (`"audit"`) and required
+/// correspondence directories and claims in Pass 2 (`--require-correspondence`).
 #[test]
 fn enforces_mir_wp_and_correspondence_non_backsliding() {
     // 1. With default `Checker::new` (`require_mir_wp == true`), deleting both
     // `Trusted/MirSemantics.lean` and `Anneal/MirWp.lean` (even when
-    // `Trusted/MirAst.lean` is present) is rejected fail-closed.
+    // `Trusted/MirModel.lean` and `Trusted/Rustc/V2026_10_22_R7189d39d9/MirAst.lean`
+    // are present) is rejected fail-closed.
     let fix_missing_both = TempFixture::new(Some(
-        "-- anneal-trust-tier: vetted\nprelude\nimport Init.NotationExtra\nimport Trusted.MirAst\n",
+        "-- anneal-trust-tier: vetted\nprelude\nimport Init.NotationExtra\nimport Trusted.MirModel\nimport Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\n",
     ));
-    fs::create_dir_all(fix_missing_both.root.join("trusted/lean/Trusted")).unwrap();
+    fs::create_dir_all(
+        fix_missing_both
+            .root
+            .join("trusted/lean/Trusted/Rustc/V2026_10_22_R7189d39d9"),
+    )
+    .unwrap();
     fs::write(
-        fix_missing_both.root.join("trusted/lean/Trusted/MirAst.lean"),
-        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.MirAst\ndef placeholder : Nat := 0\nend Trusted.MirAst\n",
+        fix_missing_both.root.join("trusted/lean/Trusted/MirModel.lean"),
+        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.MirModel\ndef placeholder : Nat := 0\nend Trusted.MirModel\n",
+    )
+    .unwrap();
+    fs::write(
+        fix_missing_both
+            .root
+            .join("trusted/lean/Trusted/Rustc/V2026_10_22_R7189d39d9/MirAst.lean"),
+        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\ndef placeholder : Nat := 0\nend Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\n",
     )
     .unwrap();
     let mut checker_missing_both = Checker::new(&fix_missing_both.root, None).unwrap();
@@ -1440,20 +1453,33 @@ fn enforces_mir_wp_and_correspondence_non_backsliding() {
         "unexpected error: {err_missing_both}"
     );
 
-    // 2. If `Trusted.MirAst` and `Trusted.MirSemantics` are present without
-    // `Anneal.MirWp`, Pass 1 `"audit"` rejects.
+    // 2. If `Trusted.MirModel`, `Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst`,
+    // and `Trusted.MirSemantics` are present without `Anneal.MirWp`, Pass 1
+    // `"audit"` rejects.
     let mut fix_no_wp = TempFixture::new(Some(
-        "-- anneal-trust-tier: vetted\nprelude\nimport Init.NotationExtra\nimport Trusted.MirAst\nimport Trusted.MirSemantics\n",
+        "-- anneal-trust-tier: vetted\nprelude\nimport Init.NotationExtra\nimport Trusted.MirModel\nimport Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\nimport Trusted.MirSemantics\n",
     ));
-    fs::create_dir_all(fix_no_wp.root.join("trusted/lean/Trusted")).unwrap();
+    fs::create_dir_all(
+        fix_no_wp
+            .root
+            .join("trusted/lean/Trusted/Rustc/V2026_10_22_R7189d39d9"),
+    )
+    .unwrap();
     fs::write(
-        fix_no_wp.root.join("trusted/lean/Trusted/MirAst.lean"),
-        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.MirAst\ndef placeholder : Nat := 0\nend Trusted.MirAst\n",
+        fix_no_wp.root.join("trusted/lean/Trusted/MirModel.lean"),
+        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.MirModel\ndef placeholder : Nat := 0\nend Trusted.MirModel\n",
+    )
+    .unwrap();
+    fs::write(
+        fix_no_wp
+            .root
+            .join("trusted/lean/Trusted/Rustc/V2026_10_22_R7189d39d9/MirAst.lean"),
+        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\ndef placeholder : Nat := 0\nend Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\n",
     )
     .unwrap();
     fs::write(
         fix_no_wp.root.join("trusted/lean/Trusted/MirSemantics.lean"),
-        b"-- anneal-trust-tier: candidate:mir_semantics\nprelude\nimport Init.NotationExtra\nimport Trusted.MirAst\nnamespace Trusted.MirSemantics\ndef placeholder : Nat := 0\nend Trusted.MirSemantics\n",
+        b"-- anneal-trust-tier: candidate:mir_semantics\nprelude\nimport Init.NotationExtra\nimport Trusted.MirModel\nimport Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\nnamespace Trusted.MirSemantics\ndef placeholder : Nat := 0\nend Trusted.MirSemantics\n",
     )
     .unwrap();
     let err_no_wp = fix_no_wp
@@ -1469,17 +1495,27 @@ fn enforces_mir_wp_and_correspondence_non_backsliding() {
     // 3. If `Anneal.MirWp` weakens or omits its required theorems/canaries,
     // Pass 1 `"audit"` rejects.
     let mut fix = TempFixture::new(Some(
-        "-- anneal-trust-tier: vetted\nprelude\nimport Init.NotationExtra\nimport Trusted.MirAst\nimport Trusted.MirSemantics\n",
+        "-- anneal-trust-tier: vetted\nprelude\nimport Init.NotationExtra\nimport Trusted.MirModel\nimport Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\nimport Trusted.MirSemantics\n",
     ));
-    fs::create_dir_all(fix.root.join("trusted/lean/Trusted")).unwrap();
+    fs::create_dir_all(
+        fix.root
+            .join("trusted/lean/Trusted/Rustc/V2026_10_22_R7189d39d9"),
+    )
+    .unwrap();
     fs::write(
-        fix.root.join("trusted/lean/Trusted/MirAst.lean"),
-        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.MirAst\ndef placeholder : Nat := 0\nend Trusted.MirAst\n",
+        fix.root.join("trusted/lean/Trusted/MirModel.lean"),
+        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.MirModel\ndef placeholder : Nat := 0\nend Trusted.MirModel\n",
+    )
+    .unwrap();
+    fs::write(
+        fix.root
+            .join("trusted/lean/Trusted/Rustc/V2026_10_22_R7189d39d9/MirAst.lean"),
+        b"-- anneal-trust-tier: candidate:mir_ast\nprelude\nimport Init.NotationExtra\nnamespace Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\ndef placeholder : Nat := 0\nend Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\n",
     )
     .unwrap();
     fs::write(
         fix.root.join("trusted/lean/Trusted/MirSemantics.lean"),
-        b"-- anneal-trust-tier: candidate:mir_semantics\nprelude\nimport Init.NotationExtra\nimport Trusted.MirAst\nnamespace Trusted.MirSemantics\ndef placeholder : Nat := 0\nend Trusted.MirSemantics\n",
+        b"-- anneal-trust-tier: candidate:mir_semantics\nprelude\nimport Init.NotationExtra\nimport Trusted.MirModel\nimport Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\nnamespace Trusted.MirSemantics\ndef placeholder : Nat := 0\nend Trusted.MirSemantics\n",
     )
     .unwrap();
     fs::create_dir_all(fix.root.join("theory/Anneal")).unwrap();

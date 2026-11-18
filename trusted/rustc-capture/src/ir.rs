@@ -16,8 +16,51 @@ use serde::Serialize;
 // Version 2 adds required source identities to every captured Body. Old capture
 // subjects must be rejected before proof checking against this model ABI.
 pub const SCHEMA_VERSION: u32 = 2;
-pub const COMPILER_COMMIT: &str = "f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1";
-pub const COMPILER_VERSION: &str = "1.98.0-nightly (f8a08b688 2026-05-30)";
+pub const COMPILER_COMMIT: &str = "7189d39d9ce936881b8132c6addeaf3e295cd455";
+pub const MIR_DIALECT: &str = "V2026_10_22_R7189d39d9";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnedCompiler {
+    pub commit: &'static str,
+    pub short_commit_date: &'static str,
+    pub mir_dialect: &'static str,
+}
+
+pub const PINNED_COMPILERS: &[PinnedCompiler] = &[
+    // Fuchsia's live in-tree rustc pin (distributed in nightly-2026-10-23).
+    PinnedCompiler {
+        commit: COMPILER_COMMIT,
+        short_commit_date: "7189d39d9 2026-10-22",
+        mir_dialect: MIR_DIALECT,
+    },
+    // Team Capsule nightly-2026-06-01 toolchain pin.
+    PinnedCompiler {
+        commit: "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65",
+        short_commit_date: "14210df0e 2026-05-31",
+        mir_dialect: "V2026_05_31_R14210df0e",
+    },
+    // Prior nightly-2026-05-31 toolchain pin.
+    PinnedCompiler {
+        commit: "f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1",
+        short_commit_date: "f8a08b688 2026-05-30",
+        mir_dialect: "V2026_05_30_Rf8a08b688",
+    },
+];
+
+impl PinnedCompiler {
+    pub fn matches_version_str(&self, version: &str) -> bool {
+        let suffix = format!(" ({})", self.short_commit_date);
+        version.ends_with(&suffix)
+    }
+}
+
+pub fn active_pinned_compiler(version: &'static str) -> Option<(PinnedCompiler, &'static str)> {
+    let pin = PINNED_COMPILERS
+        .iter()
+        .copied()
+        .find(|pin| pin.matches_version_str(version))?;
+    Some((pin, version))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -182,6 +225,7 @@ pub struct Program {
 pub struct Compiler {
     pub commit: &'static str,
     pub version: &'static str,
+    pub mir_dialect: &'static str,
     pub sysroot: PathBuf,
 }
 
@@ -247,6 +291,7 @@ pub struct Unsupported {
 #[derive(Debug, Serialize)]
 pub struct Manifest {
     pub schema_version: u32,
+    pub mir_dialect: &'static str,
     pub compiler: Compiler,
     pub configuration: Configuration,
     pub scope: Scope,

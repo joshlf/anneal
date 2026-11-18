@@ -8,7 +8,7 @@
 
 // === case: fifty_verified_scalar_fns ===
 //@ pass
-//@ mir-contains: "Trusted.MirAst.VerificationScope.crate"
+//@ mir-contains: "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.VerificationScope.crate"
 
 /// anneal:spec ensures(ret == x)
 pub fn id_00(x: usize) -> usize { x }

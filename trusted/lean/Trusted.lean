@@ -9,11 +9,9 @@
 -- anneal-trust-tier: vetted
 prelude
 import Init.NotationExtra
-
-/-!
-# Anneal Trusted Lean Foundation (`Trusted.lean`)
-
-Root umbrella module for Anneal's trusted Lean 4 computing base (`trusted/lean/`).
-Starts from `prelude` and imports only locked foundation modules from
-`trusted/lean/foundation-lock.json` and `Trusted.*` submodules.
--/
+import Init.Data.BitVec.BasicAux
+import Trusted.MirModel
+import Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst
+import Trusted.Rustc.V2026_05_31_R14210df0e.MirAst
+import Trusted.Rustc.V2026_05_30_Rf8a08b688.MirAst
+import Trusted.MirSemantics

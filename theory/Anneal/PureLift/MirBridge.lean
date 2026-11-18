@@ -11,7 +11,7 @@ import Init.Core
 import Init.Data.List.Basic
 import Init.Data.Nat.Basic
 import Trusted
-import Trusted.MirAst
+import Trusted.MirModel
 import Trusted.MirSemantics
 import Anneal.MirWp
 import Anneal.PureLift.Lens
@@ -24,7 +24,7 @@ import Anneal.PureLift.Adapter
 
 namespace Anneal.PureLift
 
-open Trusted.MirAst Trusted.MirSemantics
+open Trusted.MirModel Trusted.MirSemantics
 
 /-!
 # Bridge Between `PureLift` and `Trusted` MIR Semantics (`MirBridge.lean`)
@@ -61,7 +61,7 @@ transformation to the authoritative post-cleanup runtime MIR syntax
    (`liftStraightLineMir`, `MirStraightLineLiftsTo`,
    `mir_pure_lift_correspondence_transfer`,
    `mir_fault_correspondence_transfer`):** `liftStraightLineMir` translates
-   single-block `Trusted.MirAst.Program` bodies (`StorageLive`, `StorageDead`,
+   single-block `Trusted.MirModel.Program` bodies (`StorageLive`, `StorageDead`,
    `Assign`, `Operand.copy`, `Operand.move`, `ConstOperand`, `UnOp`, `BinOp`,
    `Return`) into `FlowPlan Val` plans that track each MIR local's storage
    liveness and represent active initialization as a `PureLift` mutable borrow.
@@ -1425,7 +1425,7 @@ inductive MirExecutesTo (p : Program) :
       MirStepsDone p (.returned ⟨out.ret, ⟨[]⟩⟩) fuel s0 →
       MirExecutesTo p (.running s0) fuel (.returned out)
 
-/-- `OperationalAdapter` connecting `Trusted.MirAst.Program` and
+/-- `OperationalAdapter` connecting `Trusted.MirModel.Program` and
 `Trusted.MirSemantics.State` to `PureLift`. -/
 def mirOperationalAdapter (p : Program) (q : Query)
     (params : List (ParamInput Val)) :
@@ -2123,7 +2123,7 @@ def mirEvalUnOpVal (op : UnOp) (v : Val) : Option Val :=
 
 /-! ## Algorithmic Straight-Line MIR Lifter (`liftStraightLineMir`)
 
-Translates single-block `Trusted.MirAst.Program` bodies (`bb0` ending in
+Translates single-block `Trusted.MirModel.Program` bodies (`bb0` ending in
 `TerminatorKind.return_`) into `FlowPlan Val` plans that track each MIR local
 `l < L`'s storage liveness (`SlotCapState.hasLive`) and represent active
 initialization (`mirInitCap L l`, mutably borrowing `mirValSlot argCnt l`)
@@ -2445,7 +2445,7 @@ def liftMirStmtList (argCnt numLocals : Nat) (bodyLocals : List MirTy)
     caps
 
 /-- Algorithmically translate a single-block straight-line
-`Trusted.MirAst.Program` (`bb0` terminating with `TerminatorKind.return_`) into
+`Trusted.MirModel.Program` (`bb0` terminating with `TerminatorKind.return_`) into
 `(plan, retExpr)`. -/
 def liftStraightLineMir (p : Program) :
     Option (FlowPlan Val × RvalOp Val) :=
@@ -2592,7 +2592,7 @@ evaluated in `PureLift` alone because `Trusted.MirSemantics` v1 rejects `.ref`
 at entry).
 -/
 
-/-- Authoritative `Trusted.MirAst.Program` for `compute_linear(x: u32, delta:
+/-- Authoritative `Trusted.MirModel.Program` for `compute_linear(x: u32, delta:
 u32) -> u32`. -/
 def progComputeLinearU32 : Program where
   bodies := [{
@@ -2784,7 +2784,7 @@ theorem mir_swap_fields_verified (a b : ScalarVal) :
       (.use (.derefSub 0 [0])) =
     .ok ⟨.scalar b, [.tuple [.scalar b, .scalar a]]⟩ := rfl
 
-/-- 4-block authoritative `Trusted.MirAst.Program` for
+/-- 4-block authoritative `Trusted.MirModel.Program` for
 `select_add(flag: bool, x: u32, y: u32, v: u32) -> u32`. -/
 def progSelectAddU32 : Program where
   bodies := [{
@@ -2939,7 +2939,7 @@ body `bb2`, and exit block `bb3`, paired with `.whileLoop`
 and transferred across `CorrespondenceClaim` to `lean-miri` ($M_{\text{ref}}$).
 -/
 
-/-- 4-block authoritative `Trusted.MirAst.Program` for
+/-- 4-block authoritative `Trusted.MirModel.Program` for
 `loop_accumulate(acc: u32, n: u32) -> u32`. -/
 def progLoopAccumulateU32 : Program where
   bodies := [{
@@ -3091,7 +3091,7 @@ theorem mir_loop_accumulate_verified
      `mirValAlg`.
 -/
 
-/-- Authoritative `Trusted.MirAst.Program` that moves `_1` into `_2`
+/-- Authoritative `Trusted.MirModel.Program` that moves `_1` into `_2`
 (`Operand.move`, deinitializing `_1`) and then attempts to read `_1` again. -/
 def progUseAfterMoveUb : Program where
   bodies := [{
@@ -3109,7 +3109,7 @@ def progUseAfterMoveUb : Program where
     }]
   }]
 
-/-- Named `Trusted.MirAst.Program` that initializes `_1`, retires `_1` with
+/-- Named `Trusted.MirModel.Program` that initializes `_1`, retires `_1` with
 `StorageDead`, and then attempts to read `_1` into `_0`. -/
 def progUseAfterStorageDeadUb : Program where
   bodies := [{

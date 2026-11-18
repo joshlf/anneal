@@ -8,7 +8,7 @@
 
 // === case: annotated_id ===
 //@ pass
-//@ mir-contains: "Trusted.MirAst.MirTy.int Trusted.MirAst.IntWidth.isize false"
+//@ mir-contains: "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.MirTy.int Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.IntWidth.isize false"
 
 /// anneal:spec ensures(ret == x)
 pub fn id(x: usize) -> usize {
@@ -24,7 +24,7 @@ pub fn id(x: usize) -> usize {
 
 // === case: id_move_via_local ===
 //@ pass
-//@ mir-contains: "Trusted.MirAst.StatementKind.storageLive 2"
+//@ mir-contains: "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.StatementKind.storageLive 2"
 
 /// anneal:spec ensures(ret == x)
 pub fn id(x: usize) -> usize {
@@ -43,8 +43,8 @@ pub fn id(x: usize) -> usize {
 
 // === case: u32_wrapping_add_expr ===
 //@ pass
-//@ mir-contains: "Trusted.MirAst.MirTy.int Trusted.MirAst.IntWidth.i32 false"
-//@ mir-contains: "Trusted.MirAst.BinOp.add"
+//@ mir-contains: "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.MirTy.int Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.IntWidth.i32 false"
+//@ mir-contains: "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.BinOp.add"
 
 pub fn add(x: u32, y: u32) -> u32 {
     x + y
@@ -52,7 +52,7 @@ pub fn add(x: u32, y: u32) -> u32 {
 
 // === case: safe_fn_with_requires ===
 //@ pass
-//@ mir-contains: "Trusted.MirAst.TerminatorKind.switchInt"
+//@ mir-contains: "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.TerminatorKind.switchInt"
 
 /// anneal:requires x != 0
 /// anneal:spec ensures(ret == x)
@@ -67,7 +67,7 @@ pub fn clamp_nonzero(x: usize) -> usize {
 // === case: unsafe_fn_with_requires ===
 //@ pass
 //@ mir-contains: "isUnsafe := true"
-//@ mir-contains: "Trusted.MirAst.TerminatorKind.unreachable"
+//@ mir-contains: "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.TerminatorKind.unreachable"
 
 #![no_std]
 #![feature(custom_mir, core_intrinsics)]

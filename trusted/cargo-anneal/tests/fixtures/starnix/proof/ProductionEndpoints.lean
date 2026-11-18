@@ -11,7 +11,7 @@ import ProductionSteps
 
 namespace ProductionSteps
 
-open Trusted.MirAst Trusted.MirSemantics Anneal.MirWp Endianness
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp Endianness
   ProductionReduction
 
 /-!

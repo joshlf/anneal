@@ -11,6 +11,7 @@ import Init.NotationExtra
 import Trusted
 import Anneal.MirWp
 import Anneal.PureLift
+import Anneal.PureLift.Canaries
 
 namespace Anneal
 

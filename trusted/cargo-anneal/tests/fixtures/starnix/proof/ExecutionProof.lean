@@ -12,7 +12,7 @@ import ProductionSteps
 
 namespace ExecutionProof
 
-open Trusted.MirAst Trusted.MirSemantics Anneal.MirWp Endianness
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp Endianness
   ProductionReduction ProductionSteps
 
 /-!
@@ -56,7 +56,7 @@ theorem verify : Expected.claim := by
   · refine ⟨sourceBody, rfl, ?_⟩
     apply validArgs3_elim sourceBody _ rfl rfl
       (fun args => ∃ output,
-        Behavior (entryProgForBody Captured.program 0) { args := args }
+        Behavior (entryProgForBody sourceProgram 0) { args := args }
           (.returned ⟨output, ⟨[]⟩⟩))
     intro flag width value
     let ⟨output, h_ret⟩ := (completed flag width value).2

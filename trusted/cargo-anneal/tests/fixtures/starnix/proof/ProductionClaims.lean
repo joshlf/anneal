@@ -11,16 +11,16 @@ import ProductionEndpoints
 
 namespace ProductionClaims
 
-open Trusted.MirAst Trusted.MirSemantics Anneal.MirWp Endianness
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp Endianness
   ProductionReduction ProductionSteps
 
 theorem wellFormed :
-    BodyStaticAdmitted Captured.program sourceBody = true := rfl
+    BodyStaticAdmitted sourceProgram sourceBody = true := rfl
 
 theorem behavior_of_sourceReturns {flag : Bool} {width : Fin 4} {value : Word}
     {ret : Val}
     (h_ret : Returns sourceBody (endianArgs flag width.val value) ret) :
-    Behavior (entryProgForBody Captured.program 0)
+    Behavior (entryProgForBody sourceProgram 0)
       { args := endianArgs flag width.val value }
       (.returned ⟨ret, ⟨[]⟩⟩) :=
   behavior_of_returns rfl wellFormed
@@ -46,7 +46,7 @@ theorem completed :
       (fun v => ⟨(be64 v).1, _, (be64 v).2⟩)
 
 theorem baseline (safetyPre : List Val → Prop) :
-    BodyVerified Captured.program 0 sourceBody safetyPre := by
+    BodyVerified sourceProgram 0 sourceBody safetyPre := by
   refine bodyVerified_of_safe rfl wellFormed (fun args valid _ => ?_)
   apply validArgs3_elim sourceBody _ rfl rfl (Safe sourceBody) _ args valid
   intro flag width value
@@ -54,7 +54,7 @@ theorem baseline (safetyPre : List Val → Prop) :
 
 theorem bigEndian_exact :
     ∀ width : Fin 4, ∀ value : Word, ∃ output : Word,
-      Behavior (entryProgForBody Captured.program 0)
+      Behavior (entryProgForBody sourceProgram 0)
         { args := endianArgs true width.val value }
         (.returned ⟨u64Val output, ⟨[]⟩⟩) ∧
       ByteReversal (8 * 2 ^ width.val) value output := by
@@ -74,7 +74,7 @@ theorem bigEndian_exact :
 
 theorem littleEndian_exact :
     ∀ width : Fin 4, ∀ value : Word, ∃ output : Word,
-      Behavior (entryProgForBody Captured.program 0)
+      Behavior (entryProgForBody sourceProgram 0)
         { args := endianArgs false width.val value }
         (.returned ⟨u64Val output, ⟨[]⟩⟩) ∧
       output = value &&& BitVec.ofNat 64 (2 ^ (8 * 2 ^ width.val) - 1) := by
@@ -94,10 +94,10 @@ theorem littleEndian_exact :
 
 theorem bigEndian_involutive :
     ∀ width : Fin 4, ∀ value : Word, ∃ first second : Word,
-      Behavior (entryProgForBody Captured.program 0)
+      Behavior (entryProgForBody sourceProgram 0)
         { args := endianArgs true width.val value }
         (.returned ⟨u64Val first, ⟨[]⟩⟩) ∧
-      Behavior (entryProgForBody Captured.program 0)
+      Behavior (entryProgForBody sourceProgram 0)
         { args := endianArgs true width.val first }
         (.returned ⟨u64Val second, ⟨[]⟩⟩) ∧
       second = value &&& BitVec.ofNat 64 (2 ^ (8 * 2 ^ width.val) - 1) := by

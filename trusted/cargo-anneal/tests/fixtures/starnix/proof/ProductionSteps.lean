@@ -11,9 +11,9 @@ import InitialCache
 
 namespace ProductionSteps
 
-open Trusted.MirAst Trusted.MirSemantics Anneal.MirWp Endianness ProductionReduction
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp Endianness ProductionReduction
 
-private def le8_state0 (value : Word) : State :=
+private noncomputable def le8_state0 (value : Word) : State :=
   mkState 0 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -30,7 +30,7 @@ private def le8_state0 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le8_state1 (value : Word) : State :=
+private noncomputable def le8_state1 (value : Word) : State :=
   mkState 0 1 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -47,7 +47,7 @@ private def le8_state1 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le8_state2 (value : Word) : State :=
+private noncomputable def le8_state2 (value : Word) : State :=
   mkState 0 2 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live (some (.bool false)),
     .live none, .dead, .dead, .dead, .dead,
@@ -64,7 +64,7 @@ private def le8_state2 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le8_state3 (value : Word) : State :=
+private noncomputable def le8_state3 (value : Word) : State :=
   mkState 7 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -81,7 +81,7 @@ private def le8_state3 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le8_state4 (value : Word) : State :=
+private noncomputable def le8_state4 (value : Word) : State :=
   mkState 7 1 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -98,7 +98,7 @@ private def le8_state4 (value : Word) : State :=
     .dead, .live (some (isizeVal 0)), .dead, .dead, .dead
   ]
 
-private def le8_state5 (value : Word) : State :=
+private noncomputable def le8_state5 (value : Word) : State :=
   mkState 8 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -115,7 +115,7 @@ private def le8_state5 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le8_state6 (value : Word) : State :=
+private noncomputable def le8_state6 (value : Word) : State :=
   mkState 8 1 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -132,7 +132,7 @@ private def le8_state6 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .live none
   ]
 
-private def le8_state7 (value : Word) : State :=
+private noncomputable def le8_state7 (value : Word) : State :=
   mkState 8 2 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -149,7 +149,7 @@ private def le8_state7 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .live (some (u64Val value))
   ]
 
-private def le8_state8 (value : Word) : State :=
+private noncomputable def le8_state8 (value : Word) : State :=
   mkState 8 3 [
     .live (some (u64Val (value &&& 255))), .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -166,7 +166,7 @@ private def le8_state8 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .live none
   ]
 
-private def le8_state9 (value : Word) : State :=
+private noncomputable def le8_state9 (value : Word) : State :=
   mkState 8 4 [
     .live (some (u64Val (value &&& 255))), .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -183,7 +183,7 @@ private def le8_state9 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le8_state10 (value : Word) : State :=
+private noncomputable def le8_state10 (value : Word) : State :=
   mkState 12 0 [
     .live (some (u64Val (value &&& 255))), .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -200,7 +200,7 @@ private def le8_state10 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le8_state11 (value : Word) : State :=
+private noncomputable def le8_state11 (value : Word) : State :=
   mkState 12 1 [
     .live (some (u64Val (value &&& 255))), .live (some (.bool false)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -271,7 +271,7 @@ theorem le8_actual (value : Word) :
     exact executes_prepend segment (le8_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
-private def le16_state0 (value : Word) : State :=
+private noncomputable def le16_state0 (value : Word) : State :=
   mkState 0 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -288,7 +288,7 @@ private def le16_state0 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le16_state1 (value : Word) : State :=
+private noncomputable def le16_state1 (value : Word) : State :=
   mkState 0 1 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -305,7 +305,7 @@ private def le16_state1 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le16_state2 (value : Word) : State :=
+private noncomputable def le16_state2 (value : Word) : State :=
   mkState 0 2 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live (some (.bool false)),
     .live none, .dead, .dead, .dead, .dead,
@@ -322,7 +322,7 @@ private def le16_state2 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le16_state3 (value : Word) : State :=
+private noncomputable def le16_state3 (value : Word) : State :=
   mkState 7 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -339,7 +339,7 @@ private def le16_state3 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le16_state4 (value : Word) : State :=
+private noncomputable def le16_state4 (value : Word) : State :=
   mkState 7 1 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -356,7 +356,7 @@ private def le16_state4 (value : Word) : State :=
     .dead, .live (some (isizeVal 1)), .dead, .dead, .dead
   ]
 
-private def le16_state5 (value : Word) : State :=
+private noncomputable def le16_state5 (value : Word) : State :=
   mkState 11 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -373,7 +373,7 @@ private def le16_state5 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le16_state6 (value : Word) : State :=
+private noncomputable def le16_state6 (value : Word) : State :=
   mkState 11 1 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -390,7 +390,7 @@ private def le16_state6 (value : Word) : State :=
     .dead, .live none, .live none, .dead, .dead
   ]
 
-private def le16_state7 (value : Word) : State :=
+private noncomputable def le16_state7 (value : Word) : State :=
   mkState 11 2 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -407,7 +407,7 @@ private def le16_state7 (value : Word) : State :=
     .dead, .live none, .live (some (u64Val value)), .dead, .dead
   ]
 
-private def le16_state8 (value : Word) : State :=
+private noncomputable def le16_state8 (value : Word) : State :=
   mkState 11 3 [
     .live (some (u64Val (value &&& 65535))), .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -424,7 +424,7 @@ private def le16_state8 (value : Word) : State :=
     .dead, .live none, .live none, .dead, .dead
   ]
 
-private def le16_state9 (value : Word) : State :=
+private noncomputable def le16_state9 (value : Word) : State :=
   mkState 11 4 [
     .live (some (u64Val (value &&& 65535))), .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -441,7 +441,7 @@ private def le16_state9 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le16_state10 (value : Word) : State :=
+private noncomputable def le16_state10 (value : Word) : State :=
   mkState 12 0 [
     .live (some (u64Val (value &&& 65535))), .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -458,7 +458,7 @@ private def le16_state10 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le16_state11 (value : Word) : State :=
+private noncomputable def le16_state11 (value : Word) : State :=
   mkState 12 1 [
     .live (some (u64Val (value &&& 65535))), .live (some (.bool false)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -529,7 +529,7 @@ theorem le16_actual (value : Word) :
     exact executes_prepend segment (le16_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
-private def le32_state0 (value : Word) : State :=
+private noncomputable def le32_state0 (value : Word) : State :=
   mkState 0 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -546,7 +546,7 @@ private def le32_state0 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le32_state1 (value : Word) : State :=
+private noncomputable def le32_state1 (value : Word) : State :=
   mkState 0 1 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -563,7 +563,7 @@ private def le32_state1 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le32_state2 (value : Word) : State :=
+private noncomputable def le32_state2 (value : Word) : State :=
   mkState 0 2 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live (some (.bool false)),
     .live none, .dead, .dead, .dead, .dead,
@@ -580,7 +580,7 @@ private def le32_state2 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le32_state3 (value : Word) : State :=
+private noncomputable def le32_state3 (value : Word) : State :=
   mkState 7 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -597,7 +597,7 @@ private def le32_state3 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le32_state4 (value : Word) : State :=
+private noncomputable def le32_state4 (value : Word) : State :=
   mkState 7 1 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -614,7 +614,7 @@ private def le32_state4 (value : Word) : State :=
     .dead, .live (some (isizeVal 2)), .dead, .dead, .dead
   ]
 
-private def le32_state5 (value : Word) : State :=
+private noncomputable def le32_state5 (value : Word) : State :=
   mkState 10 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -631,7 +631,7 @@ private def le32_state5 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le32_state6 (value : Word) : State :=
+private noncomputable def le32_state6 (value : Word) : State :=
   mkState 10 1 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -648,7 +648,7 @@ private def le32_state6 (value : Word) : State :=
     .dead, .live none, .dead, .live none, .dead
   ]
 
-private def le32_state7 (value : Word) : State :=
+private noncomputable def le32_state7 (value : Word) : State :=
   mkState 10 2 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -665,7 +665,7 @@ private def le32_state7 (value : Word) : State :=
     .dead, .live none, .dead, .live (some (u64Val value)), .dead
   ]
 
-private def le32_state8 (value : Word) : State :=
+private noncomputable def le32_state8 (value : Word) : State :=
   mkState 10 3 [
     .live (some (u64Val (value &&& 4294967295))), .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -682,7 +682,7 @@ private def le32_state8 (value : Word) : State :=
     .dead, .live none, .dead, .live none, .dead
   ]
 
-private def le32_state9 (value : Word) : State :=
+private noncomputable def le32_state9 (value : Word) : State :=
   mkState 10 4 [
     .live (some (u64Val (value &&& 4294967295))), .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -699,7 +699,7 @@ private def le32_state9 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le32_state10 (value : Word) : State :=
+private noncomputable def le32_state10 (value : Word) : State :=
   mkState 12 0 [
     .live (some (u64Val (value &&& 4294967295))), .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -716,7 +716,7 @@ private def le32_state10 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le32_state11 (value : Word) : State :=
+private noncomputable def le32_state11 (value : Word) : State :=
   mkState 12 1 [
     .live (some (u64Val (value &&& 4294967295))), .live (some (.bool false)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -787,7 +787,7 @@ theorem le32_actual (value : Word) :
     exact executes_prepend segment (le32_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
-private def le64_state0 (value : Word) : State :=
+private noncomputable def le64_state0 (value : Word) : State :=
   mkState 0 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -804,7 +804,7 @@ private def le64_state0 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le64_state1 (value : Word) : State :=
+private noncomputable def le64_state1 (value : Word) : State :=
   mkState 0 1 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -821,7 +821,7 @@ private def le64_state1 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le64_state2 (value : Word) : State :=
+private noncomputable def le64_state2 (value : Word) : State :=
   mkState 0 2 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live (some (.bool false)),
     .live none, .dead, .dead, .dead, .dead,
@@ -838,7 +838,7 @@ private def le64_state2 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le64_state3 (value : Word) : State :=
+private noncomputable def le64_state3 (value : Word) : State :=
   mkState 7 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -855,7 +855,7 @@ private def le64_state3 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le64_state4 (value : Word) : State :=
+private noncomputable def le64_state4 (value : Word) : State :=
   mkState 7 1 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -872,7 +872,7 @@ private def le64_state4 (value : Word) : State :=
     .dead, .live (some (isizeVal 3)), .dead, .dead, .dead
   ]
 
-private def le64_state5 (value : Word) : State :=
+private noncomputable def le64_state5 (value : Word) : State :=
   mkState 9 0 [
     .live none, .live (some (.bool false)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -889,7 +889,7 @@ private def le64_state5 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le64_state6 (value : Word) : State :=
+private noncomputable def le64_state6 (value : Word) : State :=
   mkState 9 1 [
     .live (some (u64Val value)), .live (some (.bool false)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -906,7 +906,7 @@ private def le64_state6 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le64_state7 (value : Word) : State :=
+private noncomputable def le64_state7 (value : Word) : State :=
   mkState 12 0 [
     .live (some (u64Val value)), .live (some (.bool false)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -923,7 +923,7 @@ private def le64_state7 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def le64_state8 (value : Word) : State :=
+private noncomputable def le64_state8 (value : Word) : State :=
   mkState 12 1 [
     .live (some (u64Val value)), .live (some (.bool false)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -982,7 +982,7 @@ theorem le64_actual (value : Word) :
     exact executes_prepend segment (le64_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
-private def be8_state0 (value : Word) : State :=
+private noncomputable def be8_state0 (value : Word) : State :=
   mkState 0 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -999,7 +999,7 @@ private def be8_state0 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be8_state1 (value : Word) : State :=
+private noncomputable def be8_state1 (value : Word) : State :=
   mkState 0 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1016,7 +1016,7 @@ private def be8_state1 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be8_state2 (value : Word) : State :=
+private noncomputable def be8_state2 (value : Word) : State :=
   mkState 0 2 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live (some (.bool true)),
     .live none, .dead, .dead, .dead, .dead,
@@ -1033,7 +1033,7 @@ private def be8_state2 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be8_state3 (value : Word) : State :=
+private noncomputable def be8_state3 (value : Word) : State :=
   mkState 1 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1050,7 +1050,7 @@ private def be8_state3 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be8_state4 (value : Word) : State :=
+private noncomputable def be8_state4 (value : Word) : State :=
   mkState 1 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live (some (isizeVal 0)), .dead, .dead, .dead, .dead,
@@ -1067,7 +1067,7 @@ private def be8_state4 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be8_state5 (value : Word) : State :=
+private noncomputable def be8_state5 (value : Word) : State :=
   mkState 3 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1084,7 +1084,7 @@ private def be8_state5 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be8_state6 (value : Word) : State :=
+private noncomputable def be8_state6 (value : Word) : State :=
   mkState 3 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1101,7 +1101,7 @@ private def be8_state6 (value : Word) : State :=
     .live none, .live none, .dead, .dead, .dead
   ]
 
-private def be8_state7 (value : Word) : State :=
+private noncomputable def be8_state7 (value : Word) : State :=
   mkState 3 2 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1118,7 +1118,7 @@ private def be8_state7 (value : Word) : State :=
     .live (some (u64Val value)), .live none, .dead, .dead, .dead
   ]
 
-private def be8_state8 (value : Word) : State :=
+private noncomputable def be8_state8 (value : Word) : State :=
   mkState 3 3 [
     .live (some (u64Val (value &&& 255))), .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1135,7 +1135,7 @@ private def be8_state8 (value : Word) : State :=
     .live none, .live none, .dead, .dead, .dead
   ]
 
-private def be8_state9 (value : Word) : State :=
+private noncomputable def be8_state9 (value : Word) : State :=
   mkState 3 4 [
     .live (some (u64Val (value &&& 255))), .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1152,7 +1152,7 @@ private def be8_state9 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be8_state10 (value : Word) : State :=
+private noncomputable def be8_state10 (value : Word) : State :=
   mkState 12 0 [
     .live (some (u64Val (value &&& 255))), .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1169,7 +1169,7 @@ private def be8_state10 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be8_state11 (value : Word) : State :=
+private noncomputable def be8_state11 (value : Word) : State :=
   mkState 12 1 [
     .live (some (u64Val (value &&& 255))), .live (some (.bool true)), .live (some (dataWidthVal 0)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -1240,7 +1240,7 @@ theorem be8_actual (value : Word) :
     exact executes_prepend segment (be8_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
-private def be16_state0 (value : Word) : State :=
+private noncomputable def be16_state0 (value : Word) : State :=
   mkState 0 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -1257,7 +1257,7 @@ private def be16_state0 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state1 (value : Word) : State :=
+private noncomputable def be16_state1 (value : Word) : State :=
   mkState 0 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1274,7 +1274,7 @@ private def be16_state1 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state2 (value : Word) : State :=
+private noncomputable def be16_state2 (value : Word) : State :=
   mkState 0 2 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live (some (.bool true)),
     .live none, .dead, .dead, .dead, .dead,
@@ -1291,7 +1291,7 @@ private def be16_state2 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state3 (value : Word) : State :=
+private noncomputable def be16_state3 (value : Word) : State :=
   mkState 1 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1308,7 +1308,7 @@ private def be16_state3 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state4 (value : Word) : State :=
+private noncomputable def be16_state4 (value : Word) : State :=
   mkState 1 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live (some (isizeVal 1)), .dead, .dead, .dead, .dead,
@@ -1325,7 +1325,7 @@ private def be16_state4 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state5 (value : Word) : State :=
+private noncomputable def be16_state5 (value : Word) : State :=
   mkState 6 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1342,7 +1342,7 @@ private def be16_state5 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state6 (value : Word) : State :=
+private noncomputable def be16_state6 (value : Word) : State :=
   mkState 6 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live none, .dead, .dead, .dead,
@@ -1359,7 +1359,7 @@ private def be16_state6 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state7 (value : Word) : State :=
+private noncomputable def be16_state7 (value : Word) : State :=
   mkState 6 2 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live none, .live none, .dead, .dead,
@@ -1376,7 +1376,7 @@ private def be16_state7 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state8 (value : Word) : State :=
+private noncomputable def be16_state8 (value : Word) : State :=
   mkState 6 3 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live none, .live (some (u64Val value)), .dead, .dead,
@@ -1393,7 +1393,7 @@ private def be16_state8 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state9 (value : Word) : State :=
+private noncomputable def be16_state9 (value : Word) : State :=
   mkState 6 4 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .live none, .dead, .dead,
@@ -1410,7 +1410,7 @@ private def be16_state9 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state10 (value : Word) : State :=
+private noncomputable def be16_state10 (value : Word) : State :=
   mkState 6 5 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .dead, .dead,
@@ -1427,7 +1427,7 @@ private def be16_state10 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state11 (value : Word) : State :=
+private noncomputable def be16_state11 (value : Word) : State :=
   mkState 6 6 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live none, .dead,
@@ -1444,7 +1444,7 @@ private def be16_state11 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state12 (value : Word) : State :=
+private noncomputable def be16_state12 (value : Word) : State :=
   mkState 6 7 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live none, .live none,
@@ -1461,7 +1461,7 @@ private def be16_state12 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state13 (value : Word) : State :=
+private noncomputable def be16_state13 (value : Word) : State :=
   mkState 6 8 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live none, .live none,
@@ -1478,7 +1478,7 @@ private def be16_state13 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state14 (value : Word) : State :=
+private noncomputable def be16_state14 (value : Word) : State :=
   mkState 6 9 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live none, .live none,
@@ -1495,7 +1495,7 @@ private def be16_state14 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state15 (value : Word) : State :=
+private noncomputable def be16_state15 (value : Word) : State :=
   mkState 6 10 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live none, .live (some (u64Val ((value &&& 65535) &&& 255))),
@@ -1512,7 +1512,7 @@ private def be16_state15 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state16 (value : Word) : State :=
+private noncomputable def be16_state16 (value : Word) : State :=
   mkState 6 11 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live none, .live (some (u64Val ((value &&& 65535) &&& 255))),
@@ -1529,7 +1529,7 @@ private def be16_state16 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state17 (value : Word) : State :=
+private noncomputable def be16_state17 (value : Word) : State :=
   mkState 6 12 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live (some (u64Val (((value &&& 65535) &&& 255) <<< (8 : Nat)))), .live none,
@@ -1546,7 +1546,7 @@ private def be16_state17 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state18 (value : Word) : State :=
+private noncomputable def be16_state18 (value : Word) : State :=
   mkState 6 13 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live (some (u64Val (((value &&& 65535) &&& 255) <<< (8 : Nat)))), .dead,
@@ -1563,7 +1563,7 @@ private def be16_state18 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state19 (value : Word) : State :=
+private noncomputable def be16_state19 (value : Word) : State :=
   mkState 6 14 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live (some (u64Val (((value &&& 65535) &&& 255) <<< (8 : Nat)))), .dead,
@@ -1580,7 +1580,7 @@ private def be16_state19 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state20 (value : Word) : State :=
+private noncomputable def be16_state20 (value : Word) : State :=
   mkState 6 15 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live (some (u64Val (((value &&& 65535) &&& 255) <<< (8 : Nat)))), .dead,
@@ -1597,7 +1597,7 @@ private def be16_state20 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state21 (value : Word) : State :=
+private noncomputable def be16_state21 (value : Word) : State :=
   mkState 6 16 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live (some (u64Val (((value &&& 65535) &&& 255) <<< (8 : Nat)))), .dead,
@@ -1614,7 +1614,7 @@ private def be16_state21 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state22 (value : Word) : State :=
+private noncomputable def be16_state22 (value : Word) : State :=
   mkState 6 17 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live (some (u64Val (((value &&& 65535) &&& 255) <<< (8 : Nat)))), .dead,
@@ -1631,7 +1631,7 @@ private def be16_state22 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state23 (value : Word) : State :=
+private noncomputable def be16_state23 (value : Word) : State :=
   mkState 6 18 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live (some (u64Val (((value &&& 65535) &&& 255) <<< (8 : Nat)))), .dead,
@@ -1648,7 +1648,7 @@ private def be16_state23 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state24 (value : Word) : State :=
+private noncomputable def be16_state24 (value : Word) : State :=
   mkState 6 19 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live (some (u64Val (((value &&& 65535) &&& 255) <<< (8 : Nat)))), .dead,
@@ -1665,7 +1665,7 @@ private def be16_state24 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state25 (value : Word) : State :=
+private noncomputable def be16_state25 (value : Word) : State :=
   mkState 6 20 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live (some (u64Val (((value &&& 65535) &&& 255) <<< (8 : Nat)))), .dead,
@@ -1682,7 +1682,7 @@ private def be16_state25 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state26 (value : Word) : State :=
+private noncomputable def be16_state26 (value : Word) : State :=
   mkState 6 21 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live (some (u64Val (((value &&& 65535) &&& 255) <<< (8 : Nat)))), .dead,
@@ -1699,7 +1699,7 @@ private def be16_state26 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state27 (value : Word) : State :=
+private noncomputable def be16_state27 (value : Word) : State :=
   mkState 6 22 [
     .live (some (u64Val ((((value &&& 65535) &&& 255) <<< (8 : Nat)) ||| (((value &&& 65535) &&& 65280) >>> (8 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live none, .dead,
@@ -1716,7 +1716,7 @@ private def be16_state27 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state28 (value : Word) : State :=
+private noncomputable def be16_state28 (value : Word) : State :=
   mkState 6 23 [
     .live (some (u64Val ((((value &&& 65535) &&& 255) <<< (8 : Nat)) ||| (((value &&& 65535) &&& 65280) >>> (8 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .live none, .dead,
@@ -1733,7 +1733,7 @@ private def be16_state28 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state29 (value : Word) : State :=
+private noncomputable def be16_state29 (value : Word) : State :=
   mkState 6 24 [
     .live (some (u64Val ((((value &&& 65535) &&& 255) <<< (8 : Nat)) ||| (((value &&& 65535) &&& 65280) >>> (8 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .live (some (u64Val (value &&& 65535))), .dead, .dead, .dead,
@@ -1750,7 +1750,7 @@ private def be16_state29 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state30 (value : Word) : State :=
+private noncomputable def be16_state30 (value : Word) : State :=
   mkState 6 25 [
     .live (some (u64Val ((((value &&& 65535) &&& 255) <<< (8 : Nat)) ||| (((value &&& 65535) &&& 65280) >>> (8 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1767,7 +1767,7 @@ private def be16_state30 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state31 (value : Word) : State :=
+private noncomputable def be16_state31 (value : Word) : State :=
   mkState 12 0 [
     .live (some (u64Val ((((value &&& 65535) &&& 255) <<< (8 : Nat)) ||| (((value &&& 65535) &&& 65280) >>> (8 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1784,7 +1784,7 @@ private def be16_state31 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be16_state32 (value : Word) : State :=
+private noncomputable def be16_state32 (value : Word) : State :=
   mkState 12 1 [
     .live (some (u64Val ((((value &&& 65535) &&& 255) <<< (8 : Nat)) ||| (((value &&& 65535) &&& 65280) >>> (8 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 1)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -1939,7 +1939,7 @@ theorem be16_actual (value : Word) :
     exact executes_prepend segment (be16_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
-private def be32_state0 (value : Word) : State :=
+private noncomputable def be32_state0 (value : Word) : State :=
   mkState 0 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -1956,7 +1956,7 @@ private def be32_state0 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state1 (value : Word) : State :=
+private noncomputable def be32_state1 (value : Word) : State :=
   mkState 0 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -1973,7 +1973,7 @@ private def be32_state1 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state2 (value : Word) : State :=
+private noncomputable def be32_state2 (value : Word) : State :=
   mkState 0 2 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live (some (.bool true)),
     .live none, .dead, .dead, .dead, .dead,
@@ -1990,7 +1990,7 @@ private def be32_state2 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state3 (value : Word) : State :=
+private noncomputable def be32_state3 (value : Word) : State :=
   mkState 1 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2007,7 +2007,7 @@ private def be32_state3 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state4 (value : Word) : State :=
+private noncomputable def be32_state4 (value : Word) : State :=
   mkState 1 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live (some (isizeVal 2)), .dead, .dead, .dead, .dead,
@@ -2024,7 +2024,7 @@ private def be32_state4 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state5 (value : Word) : State :=
+private noncomputable def be32_state5 (value : Word) : State :=
   mkState 5 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2041,7 +2041,7 @@ private def be32_state5 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state6 (value : Word) : State :=
+private noncomputable def be32_state6 (value : Word) : State :=
   mkState 5 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2058,7 +2058,7 @@ private def be32_state6 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state7 (value : Word) : State :=
+private noncomputable def be32_state7 (value : Word) : State :=
   mkState 5 2 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2075,7 +2075,7 @@ private def be32_state7 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state8 (value : Word) : State :=
+private noncomputable def be32_state8 (value : Word) : State :=
   mkState 5 3 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2092,7 +2092,7 @@ private def be32_state8 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state9 (value : Word) : State :=
+private noncomputable def be32_state9 (value : Word) : State :=
   mkState 5 4 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2109,7 +2109,7 @@ private def be32_state9 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state10 (value : Word) : State :=
+private noncomputable def be32_state10 (value : Word) : State :=
   mkState 5 5 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2126,7 +2126,7 @@ private def be32_state10 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state11 (value : Word) : State :=
+private noncomputable def be32_state11 (value : Word) : State :=
   mkState 5 6 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2143,7 +2143,7 @@ private def be32_state11 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state12 (value : Word) : State :=
+private noncomputable def be32_state12 (value : Word) : State :=
   mkState 5 7 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2160,7 +2160,7 @@ private def be32_state12 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state13 (value : Word) : State :=
+private noncomputable def be32_state13 (value : Word) : State :=
   mkState 5 8 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2177,7 +2177,7 @@ private def be32_state13 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state14 (value : Word) : State :=
+private noncomputable def be32_state14 (value : Word) : State :=
   mkState 5 9 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2194,7 +2194,7 @@ private def be32_state14 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state15 (value : Word) : State :=
+private noncomputable def be32_state15 (value : Word) : State :=
   mkState 5 10 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2211,7 +2211,7 @@ private def be32_state15 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state16 (value : Word) : State :=
+private noncomputable def be32_state16 (value : Word) : State :=
   mkState 5 11 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2228,7 +2228,7 @@ private def be32_state16 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state17 (value : Word) : State :=
+private noncomputable def be32_state17 (value : Word) : State :=
   mkState 5 12 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2245,7 +2245,7 @@ private def be32_state17 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state18 (value : Word) : State :=
+private noncomputable def be32_state18 (value : Word) : State :=
   mkState 5 13 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2262,7 +2262,7 @@ private def be32_state18 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state19 (value : Word) : State :=
+private noncomputable def be32_state19 (value : Word) : State :=
   mkState 5 14 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2279,7 +2279,7 @@ private def be32_state19 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state20 (value : Word) : State :=
+private noncomputable def be32_state20 (value : Word) : State :=
   mkState 5 15 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2296,7 +2296,7 @@ private def be32_state20 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state21 (value : Word) : State :=
+private noncomputable def be32_state21 (value : Word) : State :=
   mkState 5 16 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2313,7 +2313,7 @@ private def be32_state21 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state22 (value : Word) : State :=
+private noncomputable def be32_state22 (value : Word) : State :=
   mkState 5 17 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2330,7 +2330,7 @@ private def be32_state22 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state23 (value : Word) : State :=
+private noncomputable def be32_state23 (value : Word) : State :=
   mkState 5 18 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2347,7 +2347,7 @@ private def be32_state23 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state24 (value : Word) : State :=
+private noncomputable def be32_state24 (value : Word) : State :=
   mkState 5 19 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2364,7 +2364,7 @@ private def be32_state24 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state25 (value : Word) : State :=
+private noncomputable def be32_state25 (value : Word) : State :=
   mkState 5 20 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2381,7 +2381,7 @@ private def be32_state25 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state26 (value : Word) : State :=
+private noncomputable def be32_state26 (value : Word) : State :=
   mkState 5 21 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2398,7 +2398,7 @@ private def be32_state26 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state27 (value : Word) : State :=
+private noncomputable def be32_state27 (value : Word) : State :=
   mkState 5 22 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2415,7 +2415,7 @@ private def be32_state27 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state28 (value : Word) : State :=
+private noncomputable def be32_state28 (value : Word) : State :=
   mkState 5 23 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2432,7 +2432,7 @@ private def be32_state28 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state29 (value : Word) : State :=
+private noncomputable def be32_state29 (value : Word) : State :=
   mkState 5 24 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2449,7 +2449,7 @@ private def be32_state29 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state30 (value : Word) : State :=
+private noncomputable def be32_state30 (value : Word) : State :=
   mkState 5 25 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2466,7 +2466,7 @@ private def be32_state30 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state31 (value : Word) : State :=
+private noncomputable def be32_state31 (value : Word) : State :=
   mkState 5 26 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2483,7 +2483,7 @@ private def be32_state31 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state32 (value : Word) : State :=
+private noncomputable def be32_state32 (value : Word) : State :=
   mkState 5 27 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2500,7 +2500,7 @@ private def be32_state32 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state33 (value : Word) : State :=
+private noncomputable def be32_state33 (value : Word) : State :=
   mkState 5 28 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2517,7 +2517,7 @@ private def be32_state33 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state34 (value : Word) : State :=
+private noncomputable def be32_state34 (value : Word) : State :=
   mkState 5 29 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2534,7 +2534,7 @@ private def be32_state34 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state35 (value : Word) : State :=
+private noncomputable def be32_state35 (value : Word) : State :=
   mkState 5 30 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2551,7 +2551,7 @@ private def be32_state35 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state36 (value : Word) : State :=
+private noncomputable def be32_state36 (value : Word) : State :=
   mkState 5 31 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2568,7 +2568,7 @@ private def be32_state36 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state37 (value : Word) : State :=
+private noncomputable def be32_state37 (value : Word) : State :=
   mkState 5 32 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2585,7 +2585,7 @@ private def be32_state37 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state38 (value : Word) : State :=
+private noncomputable def be32_state38 (value : Word) : State :=
   mkState 5 33 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2602,7 +2602,7 @@ private def be32_state38 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state39 (value : Word) : State :=
+private noncomputable def be32_state39 (value : Word) : State :=
   mkState 5 34 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2619,7 +2619,7 @@ private def be32_state39 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state40 (value : Word) : State :=
+private noncomputable def be32_state40 (value : Word) : State :=
   mkState 5 35 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2636,7 +2636,7 @@ private def be32_state40 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state41 (value : Word) : State :=
+private noncomputable def be32_state41 (value : Word) : State :=
   mkState 5 36 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2653,7 +2653,7 @@ private def be32_state41 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state42 (value : Word) : State :=
+private noncomputable def be32_state42 (value : Word) : State :=
   mkState 5 37 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2670,7 +2670,7 @@ private def be32_state42 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state43 (value : Word) : State :=
+private noncomputable def be32_state43 (value : Word) : State :=
   mkState 5 38 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2687,7 +2687,7 @@ private def be32_state43 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state44 (value : Word) : State :=
+private noncomputable def be32_state44 (value : Word) : State :=
   mkState 5 39 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2704,7 +2704,7 @@ private def be32_state44 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state45 (value : Word) : State :=
+private noncomputable def be32_state45 (value : Word) : State :=
   mkState 5 40 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2721,7 +2721,7 @@ private def be32_state45 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state46 (value : Word) : State :=
+private noncomputable def be32_state46 (value : Word) : State :=
   mkState 5 41 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2738,7 +2738,7 @@ private def be32_state46 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state47 (value : Word) : State :=
+private noncomputable def be32_state47 (value : Word) : State :=
   mkState 5 42 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2755,7 +2755,7 @@ private def be32_state47 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state48 (value : Word) : State :=
+private noncomputable def be32_state48 (value : Word) : State :=
   mkState 5 43 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2772,7 +2772,7 @@ private def be32_state48 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state49 (value : Word) : State :=
+private noncomputable def be32_state49 (value : Word) : State :=
   mkState 5 44 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2789,7 +2789,7 @@ private def be32_state49 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state50 (value : Word) : State :=
+private noncomputable def be32_state50 (value : Word) : State :=
   mkState 5 45 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2806,7 +2806,7 @@ private def be32_state50 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state51 (value : Word) : State :=
+private noncomputable def be32_state51 (value : Word) : State :=
   mkState 5 46 [
     .live (some (u64Val ((((((value &&& 4294967295) &&& 255) <<< (24 : Nat)) ||| (((value &&& 4294967295) &&& 65280) <<< (8 : Nat))) ||| (((value &&& 4294967295) &&& 16711680) >>> (8 : Nat))) ||| (((value &&& 4294967295) &&& 4278190080) >>> (24 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2823,7 +2823,7 @@ private def be32_state51 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state52 (value : Word) : State :=
+private noncomputable def be32_state52 (value : Word) : State :=
   mkState 5 47 [
     .live (some (u64Val ((((((value &&& 4294967295) &&& 255) <<< (24 : Nat)) ||| (((value &&& 4294967295) &&& 65280) <<< (8 : Nat))) ||| (((value &&& 4294967295) &&& 16711680) >>> (8 : Nat))) ||| (((value &&& 4294967295) &&& 4278190080) >>> (24 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2840,7 +2840,7 @@ private def be32_state52 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state53 (value : Word) : State :=
+private noncomputable def be32_state53 (value : Word) : State :=
   mkState 5 48 [
     .live (some (u64Val ((((((value &&& 4294967295) &&& 255) <<< (24 : Nat)) ||| (((value &&& 4294967295) &&& 65280) <<< (8 : Nat))) ||| (((value &&& 4294967295) &&& 16711680) >>> (8 : Nat))) ||| (((value &&& 4294967295) &&& 4278190080) >>> (24 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2857,7 +2857,7 @@ private def be32_state53 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state54 (value : Word) : State :=
+private noncomputable def be32_state54 (value : Word) : State :=
   mkState 5 49 [
     .live (some (u64Val ((((((value &&& 4294967295) &&& 255) <<< (24 : Nat)) ||| (((value &&& 4294967295) &&& 65280) <<< (8 : Nat))) ||| (((value &&& 4294967295) &&& 16711680) >>> (8 : Nat))) ||| (((value &&& 4294967295) &&& 4278190080) >>> (24 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2874,7 +2874,7 @@ private def be32_state54 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state55 (value : Word) : State :=
+private noncomputable def be32_state55 (value : Word) : State :=
   mkState 12 0 [
     .live (some (u64Val ((((((value &&& 4294967295) &&& 255) <<< (24 : Nat)) ||| (((value &&& 4294967295) &&& 65280) <<< (8 : Nat))) ||| (((value &&& 4294967295) &&& 16711680) >>> (8 : Nat))) ||| (((value &&& 4294967295) &&& 4278190080) >>> (24 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -2891,7 +2891,7 @@ private def be32_state55 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be32_state56 (value : Word) : State :=
+private noncomputable def be32_state56 (value : Word) : State :=
   mkState 12 1 [
     .live (some (u64Val ((((((value &&& 4294967295) &&& 255) <<< (24 : Nat)) ||| (((value &&& 4294967295) &&& 65280) <<< (8 : Nat))) ||| (((value &&& 4294967295) &&& 16711680) >>> (8 : Nat))) ||| (((value &&& 4294967295) &&& 4278190080) >>> (24 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 2)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -3142,7 +3142,7 @@ theorem be32_actual (value : Word) :
     exact executes_prepend segment (be32_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
-private def be64_state0 (value : Word) : State :=
+private noncomputable def be64_state0 (value : Word) : State :=
   mkState 0 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,
@@ -3159,7 +3159,7 @@ private def be64_state0 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state1 (value : Word) : State :=
+private noncomputable def be64_state1 (value : Word) : State :=
   mkState 0 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3176,7 +3176,7 @@ private def be64_state1 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state2 (value : Word) : State :=
+private noncomputable def be64_state2 (value : Word) : State :=
   mkState 0 2 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live (some (.bool true)),
     .live none, .dead, .dead, .dead, .dead,
@@ -3193,7 +3193,7 @@ private def be64_state2 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state3 (value : Word) : State :=
+private noncomputable def be64_state3 (value : Word) : State :=
   mkState 1 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3210,7 +3210,7 @@ private def be64_state3 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state4 (value : Word) : State :=
+private noncomputable def be64_state4 (value : Word) : State :=
   mkState 1 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live (some (isizeVal 3)), .dead, .dead, .dead, .dead,
@@ -3227,7 +3227,7 @@ private def be64_state4 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state5 (value : Word) : State :=
+private noncomputable def be64_state5 (value : Word) : State :=
   mkState 4 0 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3244,7 +3244,7 @@ private def be64_state5 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state6 (value : Word) : State :=
+private noncomputable def be64_state6 (value : Word) : State :=
   mkState 4 1 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3261,7 +3261,7 @@ private def be64_state6 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state7 (value : Word) : State :=
+private noncomputable def be64_state7 (value : Word) : State :=
   mkState 4 2 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3278,7 +3278,7 @@ private def be64_state7 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state8 (value : Word) : State :=
+private noncomputable def be64_state8 (value : Word) : State :=
   mkState 4 3 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3295,7 +3295,7 @@ private def be64_state8 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state9 (value : Word) : State :=
+private noncomputable def be64_state9 (value : Word) : State :=
   mkState 4 4 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3312,7 +3312,7 @@ private def be64_state9 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state10 (value : Word) : State :=
+private noncomputable def be64_state10 (value : Word) : State :=
   mkState 4 5 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3329,7 +3329,7 @@ private def be64_state10 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state11 (value : Word) : State :=
+private noncomputable def be64_state11 (value : Word) : State :=
   mkState 4 6 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3346,7 +3346,7 @@ private def be64_state11 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state12 (value : Word) : State :=
+private noncomputable def be64_state12 (value : Word) : State :=
   mkState 4 7 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3363,7 +3363,7 @@ private def be64_state12 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state13 (value : Word) : State :=
+private noncomputable def be64_state13 (value : Word) : State :=
   mkState 4 8 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3380,7 +3380,7 @@ private def be64_state13 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state14 (value : Word) : State :=
+private noncomputable def be64_state14 (value : Word) : State :=
   mkState 4 9 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3397,7 +3397,7 @@ private def be64_state14 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state15 (value : Word) : State :=
+private noncomputable def be64_state15 (value : Word) : State :=
   mkState 4 10 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3414,7 +3414,7 @@ private def be64_state15 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state16 (value : Word) : State :=
+private noncomputable def be64_state16 (value : Word) : State :=
   mkState 4 11 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3431,7 +3431,7 @@ private def be64_state16 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state17 (value : Word) : State :=
+private noncomputable def be64_state17 (value : Word) : State :=
   mkState 4 12 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3448,7 +3448,7 @@ private def be64_state17 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state18 (value : Word) : State :=
+private noncomputable def be64_state18 (value : Word) : State :=
   mkState 4 13 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3465,7 +3465,7 @@ private def be64_state18 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state19 (value : Word) : State :=
+private noncomputable def be64_state19 (value : Word) : State :=
   mkState 4 14 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3482,7 +3482,7 @@ private def be64_state19 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state20 (value : Word) : State :=
+private noncomputable def be64_state20 (value : Word) : State :=
   mkState 4 15 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3499,7 +3499,7 @@ private def be64_state20 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state21 (value : Word) : State :=
+private noncomputable def be64_state21 (value : Word) : State :=
   mkState 4 16 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3516,7 +3516,7 @@ private def be64_state21 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state22 (value : Word) : State :=
+private noncomputable def be64_state22 (value : Word) : State :=
   mkState 4 17 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3533,7 +3533,7 @@ private def be64_state22 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state23 (value : Word) : State :=
+private noncomputable def be64_state23 (value : Word) : State :=
   mkState 4 18 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3550,7 +3550,7 @@ private def be64_state23 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state24 (value : Word) : State :=
+private noncomputable def be64_state24 (value : Word) : State :=
   mkState 4 19 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3567,7 +3567,7 @@ private def be64_state24 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state25 (value : Word) : State :=
+private noncomputable def be64_state25 (value : Word) : State :=
   mkState 4 20 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3584,7 +3584,7 @@ private def be64_state25 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state26 (value : Word) : State :=
+private noncomputable def be64_state26 (value : Word) : State :=
   mkState 4 21 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3601,7 +3601,7 @@ private def be64_state26 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state27 (value : Word) : State :=
+private noncomputable def be64_state27 (value : Word) : State :=
   mkState 4 22 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3618,7 +3618,7 @@ private def be64_state27 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state28 (value : Word) : State :=
+private noncomputable def be64_state28 (value : Word) : State :=
   mkState 4 23 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3635,7 +3635,7 @@ private def be64_state28 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state29 (value : Word) : State :=
+private noncomputable def be64_state29 (value : Word) : State :=
   mkState 4 24 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3652,7 +3652,7 @@ private def be64_state29 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state30 (value : Word) : State :=
+private noncomputable def be64_state30 (value : Word) : State :=
   mkState 4 25 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3669,7 +3669,7 @@ private def be64_state30 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state31 (value : Word) : State :=
+private noncomputable def be64_state31 (value : Word) : State :=
   mkState 4 26 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3686,7 +3686,7 @@ private def be64_state31 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state32 (value : Word) : State :=
+private noncomputable def be64_state32 (value : Word) : State :=
   mkState 4 27 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3703,7 +3703,7 @@ private def be64_state32 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state33 (value : Word) : State :=
+private noncomputable def be64_state33 (value : Word) : State :=
   mkState 4 28 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3720,7 +3720,7 @@ private def be64_state33 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state34 (value : Word) : State :=
+private noncomputable def be64_state34 (value : Word) : State :=
   mkState 4 29 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3737,7 +3737,7 @@ private def be64_state34 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state35 (value : Word) : State :=
+private noncomputable def be64_state35 (value : Word) : State :=
   mkState 4 30 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3754,7 +3754,7 @@ private def be64_state35 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state36 (value : Word) : State :=
+private noncomputable def be64_state36 (value : Word) : State :=
   mkState 4 31 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3771,7 +3771,7 @@ private def be64_state36 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state37 (value : Word) : State :=
+private noncomputable def be64_state37 (value : Word) : State :=
   mkState 4 32 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3788,7 +3788,7 @@ private def be64_state37 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state38 (value : Word) : State :=
+private noncomputable def be64_state38 (value : Word) : State :=
   mkState 4 33 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3805,7 +3805,7 @@ private def be64_state38 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state39 (value : Word) : State :=
+private noncomputable def be64_state39 (value : Word) : State :=
   mkState 4 34 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3822,7 +3822,7 @@ private def be64_state39 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state40 (value : Word) : State :=
+private noncomputable def be64_state40 (value : Word) : State :=
   mkState 4 35 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3839,7 +3839,7 @@ private def be64_state40 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state41 (value : Word) : State :=
+private noncomputable def be64_state41 (value : Word) : State :=
   mkState 4 36 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3856,7 +3856,7 @@ private def be64_state41 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state42 (value : Word) : State :=
+private noncomputable def be64_state42 (value : Word) : State :=
   mkState 4 37 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3873,7 +3873,7 @@ private def be64_state42 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state43 (value : Word) : State :=
+private noncomputable def be64_state43 (value : Word) : State :=
   mkState 4 38 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3890,7 +3890,7 @@ private def be64_state43 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state44 (value : Word) : State :=
+private noncomputable def be64_state44 (value : Word) : State :=
   mkState 4 39 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3907,7 +3907,7 @@ private def be64_state44 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state45 (value : Word) : State :=
+private noncomputable def be64_state45 (value : Word) : State :=
   mkState 4 40 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3924,7 +3924,7 @@ private def be64_state45 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state46 (value : Word) : State :=
+private noncomputable def be64_state46 (value : Word) : State :=
   mkState 4 41 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3941,7 +3941,7 @@ private def be64_state46 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state47 (value : Word) : State :=
+private noncomputable def be64_state47 (value : Word) : State :=
   mkState 4 42 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3958,7 +3958,7 @@ private def be64_state47 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state48 (value : Word) : State :=
+private noncomputable def be64_state48 (value : Word) : State :=
   mkState 4 43 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3975,7 +3975,7 @@ private def be64_state48 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state49 (value : Word) : State :=
+private noncomputable def be64_state49 (value : Word) : State :=
   mkState 4 44 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -3992,7 +3992,7 @@ private def be64_state49 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state50 (value : Word) : State :=
+private noncomputable def be64_state50 (value : Word) : State :=
   mkState 4 45 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4009,7 +4009,7 @@ private def be64_state50 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state51 (value : Word) : State :=
+private noncomputable def be64_state51 (value : Word) : State :=
   mkState 4 46 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4026,7 +4026,7 @@ private def be64_state51 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state52 (value : Word) : State :=
+private noncomputable def be64_state52 (value : Word) : State :=
   mkState 4 47 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4043,7 +4043,7 @@ private def be64_state52 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state53 (value : Word) : State :=
+private noncomputable def be64_state53 (value : Word) : State :=
   mkState 4 48 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4060,7 +4060,7 @@ private def be64_state53 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state54 (value : Word) : State :=
+private noncomputable def be64_state54 (value : Word) : State :=
   mkState 4 49 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4077,7 +4077,7 @@ private def be64_state54 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state55 (value : Word) : State :=
+private noncomputable def be64_state55 (value : Word) : State :=
   mkState 4 50 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4094,7 +4094,7 @@ private def be64_state55 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state56 (value : Word) : State :=
+private noncomputable def be64_state56 (value : Word) : State :=
   mkState 4 51 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4111,7 +4111,7 @@ private def be64_state56 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state57 (value : Word) : State :=
+private noncomputable def be64_state57 (value : Word) : State :=
   mkState 4 52 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4128,7 +4128,7 @@ private def be64_state57 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state58 (value : Word) : State :=
+private noncomputable def be64_state58 (value : Word) : State :=
   mkState 4 53 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4145,7 +4145,7 @@ private def be64_state58 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state59 (value : Word) : State :=
+private noncomputable def be64_state59 (value : Word) : State :=
   mkState 4 54 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4162,7 +4162,7 @@ private def be64_state59 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state60 (value : Word) : State :=
+private noncomputable def be64_state60 (value : Word) : State :=
   mkState 4 55 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4179,7 +4179,7 @@ private def be64_state60 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state61 (value : Word) : State :=
+private noncomputable def be64_state61 (value : Word) : State :=
   mkState 4 56 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4196,7 +4196,7 @@ private def be64_state61 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state62 (value : Word) : State :=
+private noncomputable def be64_state62 (value : Word) : State :=
   mkState 4 57 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4213,7 +4213,7 @@ private def be64_state62 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state63 (value : Word) : State :=
+private noncomputable def be64_state63 (value : Word) : State :=
   mkState 4 58 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4230,7 +4230,7 @@ private def be64_state63 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state64 (value : Word) : State :=
+private noncomputable def be64_state64 (value : Word) : State :=
   mkState 4 59 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4247,7 +4247,7 @@ private def be64_state64 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state65 (value : Word) : State :=
+private noncomputable def be64_state65 (value : Word) : State :=
   mkState 4 60 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4264,7 +4264,7 @@ private def be64_state65 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state66 (value : Word) : State :=
+private noncomputable def be64_state66 (value : Word) : State :=
   mkState 4 61 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4281,7 +4281,7 @@ private def be64_state66 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state67 (value : Word) : State :=
+private noncomputable def be64_state67 (value : Word) : State :=
   mkState 4 62 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4298,7 +4298,7 @@ private def be64_state67 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state68 (value : Word) : State :=
+private noncomputable def be64_state68 (value : Word) : State :=
   mkState 4 63 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4315,7 +4315,7 @@ private def be64_state68 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state69 (value : Word) : State :=
+private noncomputable def be64_state69 (value : Word) : State :=
   mkState 4 64 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4332,7 +4332,7 @@ private def be64_state69 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state70 (value : Word) : State :=
+private noncomputable def be64_state70 (value : Word) : State :=
   mkState 4 65 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4349,7 +4349,7 @@ private def be64_state70 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state71 (value : Word) : State :=
+private noncomputable def be64_state71 (value : Word) : State :=
   mkState 4 66 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4366,7 +4366,7 @@ private def be64_state71 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state72 (value : Word) : State :=
+private noncomputable def be64_state72 (value : Word) : State :=
   mkState 4 67 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4383,7 +4383,7 @@ private def be64_state72 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state73 (value : Word) : State :=
+private noncomputable def be64_state73 (value : Word) : State :=
   mkState 4 68 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4400,7 +4400,7 @@ private def be64_state73 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state74 (value : Word) : State :=
+private noncomputable def be64_state74 (value : Word) : State :=
   mkState 4 69 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4417,7 +4417,7 @@ private def be64_state74 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state75 (value : Word) : State :=
+private noncomputable def be64_state75 (value : Word) : State :=
   mkState 4 70 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4434,7 +4434,7 @@ private def be64_state75 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state76 (value : Word) : State :=
+private noncomputable def be64_state76 (value : Word) : State :=
   mkState 4 71 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4451,7 +4451,7 @@ private def be64_state76 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state77 (value : Word) : State :=
+private noncomputable def be64_state77 (value : Word) : State :=
   mkState 4 72 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4468,7 +4468,7 @@ private def be64_state77 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state78 (value : Word) : State :=
+private noncomputable def be64_state78 (value : Word) : State :=
   mkState 4 73 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4485,7 +4485,7 @@ private def be64_state78 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state79 (value : Word) : State :=
+private noncomputable def be64_state79 (value : Word) : State :=
   mkState 4 74 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4502,7 +4502,7 @@ private def be64_state79 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state80 (value : Word) : State :=
+private noncomputable def be64_state80 (value : Word) : State :=
   mkState 4 75 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4519,7 +4519,7 @@ private def be64_state80 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state81 (value : Word) : State :=
+private noncomputable def be64_state81 (value : Word) : State :=
   mkState 4 76 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4536,7 +4536,7 @@ private def be64_state81 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state82 (value : Word) : State :=
+private noncomputable def be64_state82 (value : Word) : State :=
   mkState 4 77 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4553,7 +4553,7 @@ private def be64_state82 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state83 (value : Word) : State :=
+private noncomputable def be64_state83 (value : Word) : State :=
   mkState 4 78 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4570,7 +4570,7 @@ private def be64_state83 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state84 (value : Word) : State :=
+private noncomputable def be64_state84 (value : Word) : State :=
   mkState 4 79 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4587,7 +4587,7 @@ private def be64_state84 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state85 (value : Word) : State :=
+private noncomputable def be64_state85 (value : Word) : State :=
   mkState 4 80 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4604,7 +4604,7 @@ private def be64_state85 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state86 (value : Word) : State :=
+private noncomputable def be64_state86 (value : Word) : State :=
   mkState 4 81 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4621,7 +4621,7 @@ private def be64_state86 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state87 (value : Word) : State :=
+private noncomputable def be64_state87 (value : Word) : State :=
   mkState 4 82 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4638,7 +4638,7 @@ private def be64_state87 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state88 (value : Word) : State :=
+private noncomputable def be64_state88 (value : Word) : State :=
   mkState 4 83 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4655,7 +4655,7 @@ private def be64_state88 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state89 (value : Word) : State :=
+private noncomputable def be64_state89 (value : Word) : State :=
   mkState 4 84 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4672,7 +4672,7 @@ private def be64_state89 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state90 (value : Word) : State :=
+private noncomputable def be64_state90 (value : Word) : State :=
   mkState 4 85 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4689,7 +4689,7 @@ private def be64_state90 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state91 (value : Word) : State :=
+private noncomputable def be64_state91 (value : Word) : State :=
   mkState 4 86 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4706,7 +4706,7 @@ private def be64_state91 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state92 (value : Word) : State :=
+private noncomputable def be64_state92 (value : Word) : State :=
   mkState 4 87 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4723,7 +4723,7 @@ private def be64_state92 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state93 (value : Word) : State :=
+private noncomputable def be64_state93 (value : Word) : State :=
   mkState 4 88 [
     .live none, .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4740,7 +4740,7 @@ private def be64_state93 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state94 (value : Word) : State :=
+private noncomputable def be64_state94 (value : Word) : State :=
   mkState 4 89 [
     .live (some (u64Val (((((((((value &&& 255) <<< (56 : Nat)) ||| ((value &&& 65280) <<< (40 : Nat))) ||| ((value &&& 16711680) <<< (24 : Nat))) ||| ((value &&& 4278190080) <<< (8 : Nat))) ||| ((value &&& 1095216660480) >>> (8 : Nat))) ||| ((value &&& 280375465082880) >>> (24 : Nat))) ||| ((value &&& 71776119061217280) >>> (40 : Nat))) ||| ((value &&& 18374686479671623680) >>> (56 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4757,7 +4757,7 @@ private def be64_state94 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state95 (value : Word) : State :=
+private noncomputable def be64_state95 (value : Word) : State :=
   mkState 4 90 [
     .live (some (u64Val (((((((((value &&& 255) <<< (56 : Nat)) ||| ((value &&& 65280) <<< (40 : Nat))) ||| ((value &&& 16711680) <<< (24 : Nat))) ||| ((value &&& 4278190080) <<< (8 : Nat))) ||| ((value &&& 1095216660480) >>> (8 : Nat))) ||| ((value &&& 280375465082880) >>> (24 : Nat))) ||| ((value &&& 71776119061217280) >>> (40 : Nat))) ||| ((value &&& 18374686479671623680) >>> (56 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4774,7 +4774,7 @@ private def be64_state95 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state96 (value : Word) : State :=
+private noncomputable def be64_state96 (value : Word) : State :=
   mkState 4 91 [
     .live (some (u64Val (((((((((value &&& 255) <<< (56 : Nat)) ||| ((value &&& 65280) <<< (40 : Nat))) ||| ((value &&& 16711680) <<< (24 : Nat))) ||| ((value &&& 4278190080) <<< (8 : Nat))) ||| ((value &&& 1095216660480) >>> (8 : Nat))) ||| ((value &&& 280375465082880) >>> (24 : Nat))) ||| ((value &&& 71776119061217280) >>> (40 : Nat))) ||| ((value &&& 18374686479671623680) >>> (56 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4791,7 +4791,7 @@ private def be64_state96 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state97 (value : Word) : State :=
+private noncomputable def be64_state97 (value : Word) : State :=
   mkState 12 0 [
     .live (some (u64Val (((((((((value &&& 255) <<< (56 : Nat)) ||| ((value &&& 65280) <<< (40 : Nat))) ||| ((value &&& 16711680) <<< (24 : Nat))) ||| ((value &&& 4278190080) <<< (8 : Nat))) ||| ((value &&& 1095216660480) >>> (8 : Nat))) ||| ((value &&& 280375465082880) >>> (24 : Nat))) ||| ((value &&& 71776119061217280) >>> (40 : Nat))) ||| ((value &&& 18374686479671623680) >>> (56 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .live none,
     .live none, .dead, .dead, .dead, .dead,
@@ -4808,7 +4808,7 @@ private def be64_state97 (value : Word) : State :=
     .dead, .live none, .dead, .dead, .dead
   ]
 
-private def be64_state98 (value : Word) : State :=
+private noncomputable def be64_state98 (value : Word) : State :=
   mkState 12 1 [
     .live (some (u64Val (((((((((value &&& 255) <<< (56 : Nat)) ||| ((value &&& 65280) <<< (40 : Nat))) ||| ((value &&& 16711680) <<< (24 : Nat))) ||| ((value &&& 4278190080) <<< (8 : Nat))) ||| ((value &&& 1095216660480) >>> (8 : Nat))) ||| ((value &&& 280375465082880) >>> (24 : Nat))) ||| ((value &&& 71776119061217280) >>> (40 : Nat))) ||| ((value &&& 18374686479671623680) >>> (56 : Nat))))), .live (some (.bool true)), .live (some (dataWidthVal 3)), .live (some (u64Val value)), .dead,
     .live none, .dead, .dead, .dead, .dead,

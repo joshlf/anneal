@@ -20,7 +20,7 @@ import Anneal.MirCorrespondenceBase
 
 namespace Anneal.MirCorrespondenceProof
 
-open Trusted Trusted.MirAst Trusted.MirSemantics Trusted.Correspondence
+open Trusted Trusted.MirModel Trusted.MirSemantics Trusted.Correspondence
 open Anneal.MirCorrespondenceBase
 
 /-!

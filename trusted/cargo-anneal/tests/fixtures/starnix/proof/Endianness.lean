@@ -12,7 +12,7 @@ import Trusted.MirSemantics
 
 namespace Endianness
 
-open Trusted.MirAst Trusted.MirSemantics
+open Trusted.MirModel Trusted.MirSemantics
 
 abbrev Word := BitVec 64
 

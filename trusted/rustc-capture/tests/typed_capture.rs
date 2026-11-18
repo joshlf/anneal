@@ -1028,7 +1028,11 @@ fn retag_flags_are_recorded_on_scalar_use_and_reference_assignments_are_refused(
     assert_eq!(stmt["value"]["kind"], "use", "{stmt}");
     assert_eq!(stmt["value"]["with_retag"], true, "{stmt}");
     let lean = std::fs::read_to_string(scalar_fixture.output.join("Captured.lean")).unwrap();
-    assert!(lean.contains("Trusted.MirAst.Rvalue.use"), "{lean}");
+    let mir_dialect = manifest["mir_dialect"].as_str().expect("mir_dialect");
+    assert!(
+        lean.contains(&format!("Trusted.Rustc.{mir_dialect}.MirAst.Rvalue.use")),
+        "{lean}"
+    );
     assert!(!lean.contains("Rvalue.unsupported"), "{lean}");
 
     let ref_fixture = Capture::new(b"pub fn selected(x: &u64) -> &u64 { x }\n");

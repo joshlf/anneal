@@ -623,12 +623,17 @@ fn collect(
         bodies,
     };
     validate_program(&program)?;
+    let (pin, compiler_version) = rustc_interface::util::rustc_version_str()
+        .and_then(ir::active_pinned_compiler)
+        .ok_or_else(|| Failure::tool("capture was linked against an unexpected rustc revision"))?;
     let roots = args.select.clone();
     Ok(ir::Manifest {
         schema_version: ir::SCHEMA_VERSION,
+        mir_dialect: pin.mir_dialect,
         compiler: ir::Compiler {
-            commit: ir::COMPILER_COMMIT,
-            version: ir::COMPILER_VERSION,
+            commit: pin.commit,
+            version: compiler_version,
+            mir_dialect: pin.mir_dialect,
             sysroot,
         },
         configuration: ir::Configuration {

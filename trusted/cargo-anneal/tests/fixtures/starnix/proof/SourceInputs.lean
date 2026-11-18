@@ -12,7 +12,7 @@ import Inputs
 
 namespace Endianness
 
-open Trusted.MirAst Trusted.MirSemantics Anneal.MirWp
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp
 
 theorem bvZeroExtend_128_toNat (w : Word) :
     (bvZeroExtend 128 w).toNat = w.toNat :=

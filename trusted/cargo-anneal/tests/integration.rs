@@ -7,7 +7,7 @@
 // those terms.
 
 //! Declarative integration test suite and host-boundary security tests for
-//! `cargo-anneal verify` over `Trusted.MirAst`, `Trusted.MirSemantics`, and
+//! `cargo-anneal verify` over `Trusted.MirModel`, `Trusted.MirSemantics`, and
 //! `Anneal.MirWp`.
 //!
 //! Fixture corpus files live under `tests/fixtures/*.rs` (top-level `.rs`
@@ -84,8 +84,25 @@ impl Tools {
             .or_else(|| override_path("ANNEAL_TEST_RUST_SYSROOT"))
             .or_else(|| install_root.as_ref().map(|r| r.join("rust")))
             .unwrap_or_else(|| {
-                let output = Command::new("rustup")
-                    .args(["run", "nightly-2026-05-31", "rustc", "--print", "sysroot"])
+                for toolchain in [
+                    "nightly-2026-10-23",
+                    "nightly-2026-06-01",
+                    "nightly-2026-05-31",
+                ] {
+                    if let Ok(output) = Command::new("rustup")
+                        .args(["run", toolchain, "rustc", "--print", "sysroot"])
+                        .output()
+                        && output.status.success()
+                    {
+                        return PathBuf::from(
+                            String::from_utf8(output.stdout)
+                                .expect("rustc sysroot must be UTF-8")
+                                .trim(),
+                        );
+                    }
+                }
+                let output = Command::new("rustc")
+                    .args(["--print", "sysroot"])
                     .output()
                     .expect("install the pinned compiler or set ANNEAL_SYSROOT");
                 assert!(
@@ -434,6 +451,22 @@ fn first_clean_line(diag: &str) -> String {
         .to_owned()
 }
 
+fn normalize_mir_dialect_needle(needle: &str, mir: &str) -> String {
+    for dialect in [
+        "V2026_10_22_R7189d39d9",
+        "V2026_05_31_R14210df0e",
+        "V2026_05_30_Rf8a08b688",
+    ] {
+        if mir.contains(&format!("import Trusted.Rustc.{dialect}.MirAst")) {
+            return needle.replace(
+                "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.",
+                &format!("Trusted.Rustc.{dialect}.MirAst."),
+            );
+        }
+    }
+    needle.to_owned()
+}
+
 fn check_mir_assertions(case: &FixtureCase, mir_lean: Option<&str>) -> Result<(), String> {
     if case.mir_contains.is_empty() && case.mir_not_contains.is_empty() {
         return Ok(());
@@ -443,14 +476,16 @@ fn check_mir_assertions(case: &FixtureCase, mir_lean: Option<&str>) -> Result<()
             .to_owned());
     };
     for needle in &case.mir_contains {
-        if !mir.contains(needle) {
+        let normalized = normalize_mir_dialect_needle(needle, mir);
+        if !mir.contains(needle) && !mir.contains(&normalized) {
             return Err(format!(
                 "Captured.lean did not contain expected substring {needle:?}\n--- Captured.lean ---\n{mir}"
             ));
         }
     }
     for needle in &case.mir_not_contains {
-        if mir.contains(needle) {
+        let normalized = normalize_mir_dialect_needle(needle, mir);
+        if mir.contains(needle) || mir.contains(&normalized) {
             return Err(format!(
                 "Captured.lean unexpectedly contained forbidden substring {needle:?}\n--- Captured.lean ---\n{mir}"
             ));
@@ -1132,7 +1167,7 @@ fn synthesize_proof_package(source: &str) -> Result<SynthesizedPackage, String> 
 import Trusted.MirSemantics
 
 namespace Spec
-open Trusted.MirAst Trusted.MirSemantics
+open Trusted.MirModel Trusted.MirSemantics
 
 def specs : Specs where
   safety := {safety_expr}
@@ -1159,15 +1194,16 @@ import Expected
 import Anneal.MirWp
 
 namespace Proof
-open Trusted.MirAst Trusted.MirSemantics Anneal.MirWp"#
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp
+noncomputable def program : Program := interpretV2026_10_22_R7189d39d9 Captured.program"#
         ),
     );
 
     if fns.is_empty() {
         push_block(
             &mut proof_lines,
-            r#"theorem all_bodies_safe : ∀ id selected, Trusted.MirSemantics.getElem? Captured.program.bodies id = some selected →
-    BodyVerified Captured.program id selected (Spec.specs.safety selected.identity) := by
+            r#"theorem all_bodies_safe : ∀ id selected, Trusted.MirSemantics.getElem? program.bodies id = some selected →
+    BodyVerified program id selected (Spec.specs.safety selected.identity) := by
   intro id _ found
   cases id <;> cases found
 theorem verify : Expected.claim :=
@@ -1190,7 +1226,7 @@ end Proof"#,
         let start_line = proof_lines.len() + 1;
         let pat = classify_body(f);
         let mut block = String::new();
-        let _ = writeln!(block, "def b{i} : Body := Captured.program.bodies[{i}]");
+        let _ = writeln!(block, "noncomputable def b{i} : Body := program.bodies[{i}]");
 
         match pat {
             BodyPattern::DirectId => {
@@ -1203,8 +1239,8 @@ end Proof"#,
     unfold writePlace; rw [hv]; rfl
   have s1 : step b{i} ⟨[⟨0, 0, 1, [.live (some v), .live (some v)]⟩], ⟨[]⟩⟩ = .done (.returned ⟨v, ⟨[]⟩⟩) := rfl
   exact .next s0 (.ret s1)
-theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected) :
-    BodyVerified Captured.program {i} selected (Spec.specs.safety selected.identity) := by
+theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? program.bodies {i} = some selected) :
+    BodyVerified program {i} selected (Spec.specs.safety selected.identity) := by
   have same : b{i} = selected := Option.some.inj found
   subst selected
   refine bodyVerified_of_safe found rfl (fun args h_valid _ => ?_)
@@ -1215,8 +1251,8 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
                 if f.ensures_eq_param.is_some() {
                     let _ = writeln!(
                         block,
-                        r#"theorem b{i}_ens : ∀ selected, Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected →
-    ∀ v ret, ValidEntryArgs selected [v] → Behavior (entryProgForBody Captured.program {i}) {{ args := [v] }} (.returned ⟨ret, ⟨[]⟩⟩) → ret = v := by
+                        r#"theorem b{i}_ens : ∀ selected, Trusted.MirSemantics.getElem? program.bodies {i} = some selected →
+    ∀ v ret, ValidEntryArgs selected [v] → Behavior (entryProgForBody program {i}) {{ args := [v] }} (.returned ⟨ret, ⟨[]⟩⟩) → ret = v := by
   intro selected found v ret h_valid h_beh
   have h_ret : Returns selected [v] ret := (returns_of_behavior found h_beh).2
   have same : b{i} = selected := Option.some.inj found
@@ -1233,8 +1269,8 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
                     block,
                     r#"theorem b{i}_runs (v : Val) :
     run b{i} 8 (initial b{i} [v]) = some (.scalar ⟨.isize, false, BitVec.ofNat 128 0⟩) := rfl
-theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected) :
-    BodyVerified Captured.program {i} selected (Spec.specs.safety selected.identity) := by
+theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? program.bodies {i} = some selected) :
+    BodyVerified program {i} selected (Spec.specs.safety selected.identity) := by
   have same : b{i} = selected := Option.some.inj found
   subst selected
   refine bodyVerified_of_safe found rfl (fun args h_valid _ => ?_)
@@ -1245,8 +1281,8 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
                 if f.ensures_eq_param.is_some() {
                     let _ = writeln!(
                         block,
-                        r#"theorem b{i}_ens : ∀ selected, Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected →
-    ∀ v ret, ValidEntryArgs selected [v] → Behavior (entryProgForBody Captured.program {i}) {{ args := [v] }} (.returned ⟨ret, ⟨[]⟩⟩) → ret = v := by
+                        r#"theorem b{i}_ens : ∀ selected, Trusted.MirSemantics.getElem? program.bodies {i} = some selected →
+    ∀ v ret, ValidEntryArgs selected [v] → Behavior (entryProgForBody program {i}) {{ args := [v] }} (.returned ⟨ret, ⟨[]⟩⟩) → ret = v := by
   intro selected found v ret _ h_beh
   have h_ret : Returns selected [v] ret := (returns_of_behavior found h_beh).2
   have same : b{i} = selected := Option.some.inj found
@@ -1262,8 +1298,8 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
                     r#"theorem b{i}_exec (v : Val) :
     Executes b{i} (initial b{i} [v]) v := by
   exact .ret rfl
-theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected) :
-    BodyVerified Captured.program {i} selected (Spec.specs.safety selected.identity) := by
+theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? program.bodies {i} = some selected) :
+    BodyVerified program {i} selected (Spec.specs.safety selected.identity) := by
   have same : b{i} = selected := Option.some.inj found
   subst selected
   refine bodyVerified_of_safe found rfl (fun args h_valid _ => ?_)
@@ -1274,8 +1310,8 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
                 if f.ensures_eq_param.is_some() {
                     let _ = writeln!(
                         block,
-                        r#"theorem b{i}_ens : ∀ selected, Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected →
-    ∀ v ret, ValidEntryArgs selected [v] → Behavior (entryProgForBody Captured.program {i}) {{ args := [v] }} (.returned ⟨ret, ⟨[]⟩⟩) → ret = v := by
+                        r#"theorem b{i}_ens : ∀ selected, Trusted.MirSemantics.getElem? program.bodies {i} = some selected →
+    ∀ v ret, ValidEntryArgs selected [v] → Behavior (entryProgForBody program {i}) {{ args := [v] }} (.returned ⟨ret, ⟨[]⟩⟩) → ret = v := by
   intro selected found v ret _ h_beh
   have h_ret : Returns selected [v] ret := (returns_of_behavior found h_beh).2
   have same : b{i} = selected := Option.some.inj found
@@ -1299,8 +1335,8 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
   have s3 : step b{i} ⟨[⟨0, 0, 3, [.live (some v), .live (some v), .live (some v)]⟩], ⟨[]⟩⟩ = .step ⟨[⟨0, 0, 4, [.live (some v), .live (some v), .dead]⟩], ⟨[]⟩⟩ := rfl
   have s4 : step b{i} ⟨[⟨0, 0, 4, [.live (some v), .live (some v), .dead]⟩], ⟨[]⟩⟩ = .done (.returned ⟨v, ⟨[]⟩⟩) := rfl
   exact .next s0 (.next s1 (.next s2 (.next s3 (.ret s4))))
-theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected) :
-    BodyVerified Captured.program {i} selected (Spec.specs.safety selected.identity) := by
+theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? program.bodies {i} = some selected) :
+    BodyVerified program {i} selected (Spec.specs.safety selected.identity) := by
   have same : b{i} = selected := Option.some.inj found
   subst selected
   refine bodyVerified_of_safe found rfl (fun args h_valid _ => ?_)
@@ -1311,8 +1347,8 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
                 if f.ensures_eq_param.is_some() {
                     let _ = writeln!(
                         block,
-                        r#"theorem b{i}_ens : ∀ selected, Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected →
-    ∀ v ret, ValidEntryArgs selected [v] → Behavior (entryProgForBody Captured.program {i}) {{ args := [v] }} (.returned ⟨ret, ⟨[]⟩⟩) → ret = v := by
+                        r#"theorem b{i}_ens : ∀ selected, Trusted.MirSemantics.getElem? program.bodies {i} = some selected →
+    ∀ v ret, ValidEntryArgs selected [v] → Behavior (entryProgForBody program {i}) {{ args := [v] }} (.returned ⟨ret, ⟨[]⟩⟩) → ret = v := by
   intro selected found v ret h_valid h_beh
   have h_ret : Returns selected [v] ret := (returns_of_behavior found h_beh).2
   have same : b{i} = selected := Option.some.inj found
@@ -1361,8 +1397,8 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
   have s7 : step b{i} ⟨[⟨0, 0, 7, [.live (some outVal), .live (some v1), .live (some v2), .dead, .dead]⟩], ⟨[]⟩⟩ =
       .done (.returned ⟨outVal, ⟨[]⟩⟩) := rfl
   exact .next s0 (.next s1 (.next s2 (.next s3 (.next s4 (.next s5 (.next s6 (.ret s7)))))))
-theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected) :
-    BodyVerified Captured.program {i} selected (Spec.specs.safety selected.identity) := by
+theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? program.bodies {i} = some selected) :
+    BodyVerified program {i} selected (Spec.specs.safety selected.identity) := by
   have same : b{i} = selected := Option.some.inj found
   subst selected
   refine bodyVerified_of_safe found rfl (fun args h_valid _ => ?_)
@@ -1425,8 +1461,8 @@ theorem b{i}_exec_nonzero (bits : BitVec 128)
   have s9 : step b{i} ⟨[⟨0, 3, 1, [.live (some v), .live (some v), .dead, .dead]⟩], ⟨[]⟩⟩ =
       .done (.returned ⟨v, ⟨[]⟩⟩) := rfl
   exact .next s0 (.next s1 (.next s2 (.next s3 (.next s4 (.next s5 (.next s6 (.next s7 (.next s8 (.ret s9)))))))))
-theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected) :
-    BodyVerified Captured.program {i} selected (Spec.specs.safety selected.identity) := by
+theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? program.bodies {i} = some selected) :
+    BodyVerified program {i} selected (Spec.specs.safety selected.identity) := by
   have same : b{i} = selected := Option.some.inj found
   subst selected
   refine bodyVerified_of_safe found rfl (fun args h_valid _ => ?_)
@@ -1445,8 +1481,8 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
                 if f.ensures_eq_param.is_some() {
                     let _ = writeln!(
                         block,
-                        r#"theorem b{i}_ens : ∀ selected, Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected →
-    ∀ v ret, ValidEntryArgs selected [v] → v ≠ .scalar ⟨.isize, false, BitVec.ofNat 128 0⟩ → Behavior (entryProgForBody Captured.program {i}) {{ args := [v] }} (.returned ⟨ret, ⟨[]⟩⟩) → ret = v := by
+                        r#"theorem b{i}_ens : ∀ selected, Trusted.MirSemantics.getElem? program.bodies {i} = some selected →
+    ∀ v ret, ValidEntryArgs selected [v] → v ≠ .scalar ⟨.isize, false, BitVec.ofNat 128 0⟩ → Behavior (entryProgForBody program {i}) {{ args := [v] }} (.returned ⟨ret, ⟨[]⟩⟩) → ret = v := by
   intro selected found v ret h_valid h_ne h_beh
   have h_ret : Returns selected [v] ret := (returns_of_behavior found h_beh).2
   have same : b{i} = selected := Option.some.inj found
@@ -1489,8 +1525,8 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
   have s2 : step b{i} ⟨[⟨0, 2, 1, [.live (some v), .live (some v)]⟩], ⟨[]⟩⟩ =
       .done (.returned ⟨v, ⟨[]⟩⟩) := rfl
   exact .next s0 (.next s1 (.ret s2))
-theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected) :
-    BodyVerified Captured.program {i} selected (Spec.specs.safety selected.identity) := by
+theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? program.bodies {i} = some selected) :
+    BodyVerified program {i} selected (Spec.specs.safety selected.identity) := by
   have same : b{i} = selected := Option.some.inj found
   subst selected
   refine bodyVerified_of_safe found rfl (fun args h_valid required => ?_)
@@ -1514,15 +1550,15 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
             BodyPattern::EnumTag => {
                 let _ = writeln!(
                     block,
-                    r#"def b{i}_ety : EnumTy := match b{i}.locals with | _ :: .enum ety :: _ => ety | _ => {{ id := 0, discrWidth := .isize, discrSigned := true, tagRepr := .zeroSized, discriminants := [] }}
+                    r#"noncomputable def b{i}_ety : EnumTy := match b{i}.locals with | _ :: .enum ety :: _ => ety | _ => {{ id := 0, discrWidth := .isize, discrSigned := true, tagRepr := .zeroSized, discriminants := [] }}
 theorem b{i}_runs_0 :
     run b{i} 10 (initial b{i} [.enumVal b{i}_ety 0]) =
       some (.scalar ⟨.isize, false, BitVec.ofNat 128 0⟩) := rfl
 theorem b{i}_runs_1 :
     run b{i} 10 (initial b{i} [.enumVal b{i}_ety 1]) =
       some (.scalar ⟨.isize, false, BitVec.ofNat 128 1⟩) := rfl
-theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Captured.program.bodies {i} = some selected) :
-    BodyVerified Captured.program {i} selected (Spec.specs.safety selected.identity) := by
+theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? program.bodies {i} = some selected) :
+    BodyVerified program {i} selected (Spec.specs.safety selected.identity) := by
   have same : b{i} = selected := Option.some.inj found
   subst selected
   refine bodyVerified_of_safe found rfl (fun args h_valid _ => ?_)
@@ -1542,7 +1578,7 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? Cap
 
     // Dispatch all body indices `0..fns.len()`.
     let mut dispatch = String::from(
-        "theorem all_bodies_safe : ∀ id selected, Trusted.MirSemantics.getElem? Captured.program.bodies id = some selected → BodyVerified Captured.program id selected (Spec.specs.safety selected.identity) := by\n  intro id selected found\n",
+        "theorem all_bodies_safe : ∀ id selected, Trusted.MirSemantics.getElem? program.bodies id = some selected → BodyVerified program id selected (Spec.specs.safety selected.identity) := by\n  intro id selected found\n",
     );
     for i in 0..fns.len() {
         let indent = "  ".repeat(i + 1);
@@ -2047,7 +2083,7 @@ fn ignores_tampered_or_spoofed_files_in_dot_anneal_and_proof_olean() {
     fs::create_dir_all(sandbox.crate_dir.join(".anneal")).unwrap();
     fs::write(
         sandbox.crate_dir.join(".anneal/Captured.lean"),
-        b"prelude\nimport Trusted.MirAst\nnamespace Captured\ndef program : Trusted.MirAst.Program := { bodies := [] }\nend Captured\n",
+        b"prelude\nimport Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\nnamespace Captured\ndef program : Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Program := { bodies := [] }\nend Captured\n",
     )
     .unwrap();
     fs::write(

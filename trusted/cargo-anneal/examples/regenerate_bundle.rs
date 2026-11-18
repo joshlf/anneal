@@ -30,9 +30,21 @@ const SOURCES: &[&str] = &[
     "trusted/lean/foundation-lock.json",
     "trusted/lean/lean-toolchain",
     "trusted/lean/Trusted.lean",
-    "trusted/lean/Trusted/MirAst.lean",
+    "trusted/lean/Trusted/MirModel.lean",
+    "trusted/lean/Trusted/Rustc/V2026_10_22_R7189d39d9/MirAst.lean",
+    "trusted/lean/Trusted/Rustc/V2026_05_31_R14210df0e/MirAst.lean",
+    "trusted/lean/Trusted/Rustc/V2026_05_30_Rf8a08b688/MirAst.lean",
     "trusted/lean/Trusted/MirSemantics.lean",
     "theory/Anneal/MirWp.lean",
+    "theory/Anneal/PureLift.lean",
+    "theory/Anneal/PureLift/Lens.lean",
+    "theory/Anneal/PureLift/PermTree.lean",
+    "theory/Anneal/PureLift/LoanGraph.lean",
+    "theory/Anneal/PureLift/SpatialPin.lean",
+    "theory/Anneal/PureLift/Plan.lean",
+    "theory/Anneal/PureLift/BlockCfg.lean",
+    "theory/Anneal/PureLift/Adapter.lean",
+    "theory/Anneal/PureLift/MirBridge.lean",
 ];
 
 const DESTINATION: &str = "trusted/cargo-anneal/src/bundled_resources.rs";
