@@ -744,6 +744,194 @@ theorem evalRvalue_len_wide_slice_borrow_and_disabled_contrast
     simp only [hOp, annealWidePtrVal, layoutPointerBytes, emptyLayoutTable, Nat.beq_refl,
       Bool.and_self]
 
+theorem dropValues_eq_drop : ∀ (n : Nat) (xs : List MirSemantics.Value), dropValues n xs = xs.drop n
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | k + 1, _ :: xs => dropValues_eq_drop k xs
+
+theorem takeValues_eq_take : ∀ (n : Nat) (xs : List MirSemantics.Value), takeValues n xs = xs.take n
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | k + 1, x :: xs => congrArg (x :: ·) (takeValues_eq_take k xs)
+
+/-- **Symbolic borrow-backed `Rvalue.len (*s)` and `.frozen` mutable-reborrow UB lockstep**:
+1. When `sIdx` holds a borrow-backed wide slice pointer (`lookupBorrow mem.borrows p.tag = some entry`,
+   `entry.perm ≠ .disabled`):
+   * In-bounds (`rawElemOffset + baseIdx + len ≤ elems.length`): Anneal's
+     `evalRvalue locals (.len ⟨sIdx, [.deref]⟩)` returns `.ok (.scalar ⟨len, 8⟩) locals' mem`
+     in lockstep with MiniRust `PointerMetaKind.encode_as_value .ElementCount (some (.ElementCount len)) = .ok (.Int len)`.
+   * Out-of-bounds (`elems.length < rawElemOffset + baseIdx + len`): Anneal's
+     `evalRvalue locals (.len ⟨sIdx, [.deref]⟩)` faults `.ub`.
+2. When `entry.perm = .frozen`, mutable reborrowing `&mut (*s)` (`slice::from_raw_parts_mut`
+   over a frozen parent borrow) faults `.ub` in Anneal (`evalRvalueRefDeref` → `evalSliceFatPtrDerefBorrow`). -/
+theorem evalRvalue_len_and_frozen_mut_reborrow_wide_slice_lockstep
+    (locals locals' : List LocalSlot) (mem : MirSemantics.Memory)
+    (localDecls : List LocalDecl) (sIdx : Local) (elem : RigidTy) (lIdx : LayoutIdx)
+    (entry : BorrowEntry) (rootVal : MirSemantics.Value)
+    (containerProj : List ProjectionElem) (baseIdx rawElemOffset : Nat)
+    (elems : List MirSemantics.Value) (p : ProvenancePtr) (len : Nat)
+    (hTy : placeTy localDecls emptyLayoutTable ⟨sIdx, [.deref]⟩ =
+      some { kind := .slice elem, layoutIdx := lIdx })
+    (hRead : evalPlaceRead locals ⟨sIdx, []⟩ mem.borrows mem.globals emptyLayoutTable
+      mem.callerLocals localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals')
+    (hBorrow : lookupBorrow mem.borrows p.tag = some entry)
+    (hSlot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+      some (.init rootVal))
+    (hBacking : readSliceBackingAggregate? locals' rootVal entry.targetProjection len
+      (tyByteSize localDecls emptyLayoutTable { kind := elem, layoutIdx := unresolvedLayoutIdx emptyLayoutTable }) =
+      some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? p.offsetBytes (inferElemListByteStride elems) = some rawElemOffset) :
+    PointerMetaKind.encode_as_value .ElementCount (some (.ElementCount (Int.ofNat len))) =
+      .ok (.Int (Int.ofNat len)) ∧
+    (entry.perm ≠ .disabled → rawElemOffset + baseIdx + len ≤ elems.length →
+      evalRvalue locals (.len ⟨sIdx, [.deref]⟩) mem localDecls emptyLayoutTable =
+        .ok (.scalar ⟨len, 8⟩) locals' mem) ∧
+    (entry.perm ≠ .disabled → elems.length < rawElemOffset + baseIdx + len →
+      evalRvalue locals (.len ⟨sIdx, [.deref]⟩) mem localDecls emptyLayoutTable = .ub) ∧
+    (entry.perm = .frozen →
+      get? locals sIdx = some (.init (annealWidePtrVal p len 8)) →
+      evalRvalue locals (.ref (.mut false) ⟨sIdx, [.deref]⟩) mem localDecls emptyLayoutTable =
+        .ub) := by
+  refine ⟨rfl, ?_, ?_, ?_⟩
+  · intro hNotDis hIn
+    have hBle : Nat.ble (Nat.add (Nat.add rawElemOffset baseIdx) len) (length elems) = true := by
+      change Nat.ble (rawElemOffset + baseIdx + len) elems.length = true
+      rw [Nat.ble_eq]
+      exact hIn
+    cases hp : entry.perm <;>
+      try exact False.elim (hNotDis hp)
+    all_goals
+      simp only [evalRvalue, evalPlaceLen, splitLastDeref?, annealWidePtrVal,
+        layoutPointerBytes, emptyLayoutTable, hTy, hRead, hBorrow, hp, hSlot, hBacking, hOff,
+        hBle, Nat.beq_refl, Bool.and_self]
+  · intro hNotDis hOob
+    have hBle : Nat.ble (Nat.add (Nat.add rawElemOffset baseIdx) len) (length elems) = false := by
+      change Nat.ble (rawElemOffset + baseIdx + len) elems.length = false
+      rw [Bool.eq_false_iff, Ne, Nat.ble_eq]
+      omega
+    cases hp : entry.perm <;>
+      try exact False.elim (hNotDis hp)
+    all_goals
+      simp only [evalRvalue, evalPlaceLen, splitLastDeref?, annealWidePtrVal,
+        layoutPointerBytes, emptyLayoutTable, hTy, hRead, hBorrow, hp, hSlot, hBacking, hOff,
+        hBle, Nat.beq_refl, Bool.and_self, Bool.false_and, Bool.and_false]
+  · intro hFrozen hSlSlot
+    have hPtr8 : layoutPointerBytes emptyLayoutTable = 8 := rfl
+    unfold annealWidePtrVal at hSlSlot
+    unfold evalRvalue evalRvalueRefDeref
+    dsimp (config := { zeta := true }) only
+    rw [hSlSlot]
+    simp only []
+    generalize Bool.and _ _ = g
+    cases g
+    · rfl
+    · simp only [evalSliceFatPtrDerefBorrow, hPtr8, Nat.beq_refl, Bool.and_self,
+        stripTransparentProjections, resolveBorrowProjectionElems,
+        normalizeSubsliceProjections, hBorrow, hFrozen]
+
+/-- **Symbolic full borrow-backed wide-slice `(*s)[idx]` lockstep against MiniRust slice `Index`**:
+Runs Anneal's real `evalPlaceRead locals ⟨sIdx, [.deref, .index idxLocal]⟩`
+(`evalSliceFatPtrDerefRead` → `takeValues len (dropValues (rawElemOffset + baseIdx) elems)`
+→ `readProjectedValue`) alongside MiniRust's `PlaceExpr.Index` slice bounds guard
+(`MiniRustSpec/Interp.lean:3518`: `if idx < 0 ∨ idx ≥ count then ub "access to out-of-bounds index"`):
+1. **Out-of-bounds (`len ≤ idx`)**: Anneal's `evalPlaceRead` faults `.ub` (proved directly
+   from `len ≤ idx` with NO unlinked `get? = none` assumption, even when
+   `rawElemOffset + baseIdx + idx < elems.length`!) AND MiniRust's slice index guard triggers
+   `decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = true`.
+2. **In-bounds (`idx < len`)**: Anneal's `evalPlaceRead` returns `.ok elemVal locals` where
+   `get? elems (rawElemOffset + baseIdx + idx) = some elemVal` AND MiniRust's slice index guard
+   passes (`decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = false`). -/
+theorem evalPlaceRead_index_wide_slice_borrowBacked_lockstep
+    (locals : List LocalSlot) (mem : MirSemantics.Memory)
+    (localDecls : List LocalDecl) (sIdx idxLocal : Local)
+    (elemKind : RigidTy) (lIdx : LayoutIdx)
+    (p : ProvenancePtr) (len idx szIdx : Nat)
+    (entry : BorrowEntry) (rootVal : MirSemantics.Value)
+    (containerProj : List ProjectionElem) (baseIdx rawElemOffset : Nat)
+    (elems : List MirSemantics.Value)
+    (hPointeeTy : placeTyResolved localDecls emptyLayoutTable ⟨sIdx, [.deref]⟩ =
+      some { kind := .slice elemKind, layoutIdx := lIdx })
+    (hSlSlot : get? locals sIdx = some (.init (annealWidePtrVal p len 8)))
+    (hAlignDeref : checkDerefAlign localDecls emptyLayoutTable
+      (some { kind := .slice elemKind, layoutIdx := lIdx }) p.offsetBytes = true)
+    (hBorrow : lookupBorrow mem.borrows p.tag = some entry)
+    (hPerm : entry.perm ≠ .disabled)
+    (hSlot : activeFrameSlot? locals mem.callStack entry.targetFrameDepth entry.targetLocal =
+      some (.init rootVal))
+    (hAlignTarget : checkTargetPlaceAlign localDecls emptyLayoutTable
+      (some { kind := .slice elemKind, layoutIdx := lIdx })
+      entry p (some rootVal) emptyLayoutTable localDecls = true)
+    (hBacking : readSliceBackingAggregate? locals rootVal entry.targetProjection len
+      (rigidTyKindByteSize elemKind) = some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? p.offsetBytes
+      ((rigidTyKindByteSize elemKind).getD (inferElemListByteStride elems)) = some rawElemOffset)
+    (hInBacking : rawElemOffset + baseIdx + len ≤ elems.length)
+    (hIdxSlot : get? locals idxLocal = some (.init (.scalar ⟨idx, szIdx⟩))) :
+    -- (1) Out-of-bounds (`len ≤ idx`): Anneal `.ub` & MiniRust bounds guard triggers UB
+    (len ≤ idx →
+      evalPlaceRead locals ⟨sIdx, [.deref, .index idxLocal]⟩ mem.borrows mem.globals
+        emptyLayoutTable mem.callerLocals localDecls mem.callStack = .ub ∧
+      decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = true) ∧
+    -- (2) In-bounds (`idx < len`): Anneal `.ok elemVal locals` & MiniRust bounds guard passes
+    (∀ elemVal,
+      idx < len →
+      get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      validateValueForTy? emptyLayoutTable
+        (placeTyResolved localDecls emptyLayoutTable ⟨sIdx, [.deref, .index idxLocal]⟩) elemVal = true →
+      evalPlaceRead locals ⟨sIdx, [.deref, .index idxLocal]⟩ mem.borrows mem.globals
+        emptyLayoutTable mem.callerLocals localDecls mem.callStack = .ok elemVal locals ∧
+      decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = false) := by
+  have hRemBle :
+      Nat.ble len (length (dropValues (Nat.add rawElemOffset baseIdx) elems)) = true := by
+    change Nat.ble len (dropValues (rawElemOffset + baseIdx) elems).length = true
+    rw [dropValues_eq_drop, List.length_drop, Nat.ble_eq]
+    omega
+  constructor
+  · intro hOob
+    have hGetNone :
+        get? (takeValues len (dropValues (Nat.add rawElemOffset baseIdx) elems)) idx = none := by
+      change (takeValues len (dropValues (rawElemOffset + baseIdx) elems))[idx]? = none
+      rw [takeValues_eq_take, dropValues_eq_drop, List.getElem?_eq_none]
+      rw [List.length_take, List.length_drop]
+      omega
+    refine ⟨?_, decide_eq_true (Or.inr (Int.ofNat_le.mpr hOob))⟩
+    have hPtr8 : layoutPointerBytes emptyLayoutTable = 8 := rfl
+    cases hSzOpt : rigidTyKindByteSize elemKind <;>
+      simp only [hSzOpt, Option.getD] at hOff hBacking
+    all_goals
+      cases hp : entry.perm <;>
+        try exact False.elim (hPerm hp)
+      all_goals
+        simp only [evalPlaceRead, evalSliceFatPtrDerefRead, annealWidePtrVal, hPtr8,
+          hSlSlot, hPointeeTy, hAlignDeref, hBorrow, hp, hSlot, hAlignTarget,
+          hBacking, hSzOpt, hOff, hRemBle, readProjectedValue, hIdxSlot, hGetNone,
+          Nat.beq_refl, Bool.and_self]
+  · intro elemVal hLt hGetElem hValid
+    have hGetSome :
+        get? (takeValues len (dropValues (Nat.add rawElemOffset baseIdx) elems)) idx =
+          some elemVal := by
+      change (takeValues len (dropValues (rawElemOffset + baseIdx) elems))[idx]? = some elemVal
+      rw [takeValues_eq_take, dropValues_eq_drop, List.getElem?_take_of_lt hLt,
+        List.getElem?_drop]
+      exact hGetElem
+    have hMrOk : decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = false :=
+      decide_eq_false (fun h =>
+        h.elim
+          (fun hneg => absurd hneg (Int.not_lt.mpr (Int.natCast_nonneg idx)))
+          (fun hge => Nat.not_lt.mpr (Int.ofNat_le.mp hge) hLt))
+    have hPtr8 : layoutPointerBytes emptyLayoutTable = 8 := rfl
+    refine ⟨?_, hMrOk⟩
+    cases hSzOpt : rigidTyKindByteSize elemKind <;>
+      simp only [hSzOpt, Option.getD] at hOff hBacking
+    all_goals
+      cases hp : entry.perm <;>
+        try exact False.elim (hPerm hp)
+      all_goals
+        simp only [evalPlaceRead, evalSliceFatPtrDerefRead, annealWidePtrVal, hPtr8,
+          hSlSlot, hPointeeTy, hAlignDeref, hBorrow, hp, hSlot, hAlignTarget,
+          hBacking, hSzOpt, hOff, hRemBle, readProjectedValue, hIdxSlot, hGetSome, hValid,
+          Nat.beq_refl, Bool.and_self]
+
 /-! ## 5. Concrete Multi-Way Execution Witnesses & Negative/Divergence Canaries -/
 
 /-- `u32` array `[u32; 4]` MIR type and declaration. -/
