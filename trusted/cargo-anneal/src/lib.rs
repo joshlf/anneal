@@ -22,9 +22,9 @@
 //!    (including `build.rs` scripts and proc-macros) is effectful and not
 //!    checked by the Lean kernel, every Cargo workspace member must reside
 //!    under `trusted/` and no member may declare a `path` dependency outside
-//!    `trusted/`. The only build script allowed is the reviewed,
-//!    dependency-free `trusted/rustc-capture/build.rs`, which identifies the
-//!    compiler the capture driver links.
+//!    `trusted/`. The only build script allowed is the reviewed
+//!    `trusted/rustc-capture/build.rs`, which identifies the compiler the
+//!    capture driver links; no member may declare build dependencies.
 //! 2. **Toolchain, source-tree, and foundation-lock admission
 //!    ([`scan_lean_tree`], [`Checker::tool_admission`]):** Source directories
 //!    (`trusted/lean/` and `theory/`) must contain only regular files and zero
