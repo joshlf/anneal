@@ -1531,6 +1531,7 @@ open LeanMiriSpec.Correspondence in
   WideSliceWitnesses.sharedRefSliceU32Ty
   WideSliceWitnesses.wideSliceReborrowBody
   WideSliceWitnesses.w_wideSlice_reborrow_raw_and_shared_agrees
+  WideSliceWitnesses.w_wideSlice_safe_reborrow_zeroSized_dangling_ok_agrees
   isWideSafeRefTyId
   annealValidateSafeWideSliceRef
   wideSlice_dropValues_eq_drop
@@ -26721,6 +26722,29 @@ example :
         (mIdxPartial, .ok true) ∧
       miriTopLocal? mIdxPartial 0 = miriU32Local 20 :=
   div_rawSlice_placeLen_and_partialOobLenIndex
+
+open WideSliceWitnesses in
+example :
+    let bRefSh := wideSliceReborrowBody sharedRefSliceU32Ty (.ref .shared ⟨2, [.deref]⟩)
+    let emptyImm : Miri.Interpreter.Immediate AnnealProv :=
+      .scalarPair sampleMiriPtrSc (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 0))
+    ∃ (sDead sLive : MachineState) (mDead mLive : AnnealStepState),
+      stepMirFn bRefSh (wideSlice4LocalInitAnneal sampleAnnealPtr 0 1 emptyMemory) = .step sDead ∧
+      get? sDead.frame.locals 0 =
+        some (.init (.aggregate 0 [.ptr sampleAnnealPtr 8, .scalar ⟨0, 8⟩])) ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bRefSh.localDecls bRefSh.layouts) ()
+        (wideSlice4LocalInitMiri bRefSh sharedRefSliceU32Ty sampleMiriPtr 0 1 AnnealMachine.empty) =
+        (mDead, .ok true) ∧
+      miriTopLocal? mDead 0 = some (.live (.immediate emptyImm)) ∧
+      stepMirFn bRefSh (wideSlice4LocalInitAnneal sampleAnnealPtr 0 1 sampleAnnealArrMemory) =
+        .step sLive ∧
+      get? sLive.frame.locals 0 =
+        some (.init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8, .scalar ⟨0, 8⟩])) ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bRefSh.localDecls bRefSh.layouts) ()
+        (wideSlice4LocalInitMiri bRefSh sharedRefSliceU32Ty sampleMiriPtr 0 1 sampleArrU32Machine) =
+        (mLive, .ok true) ∧
+      miriTopLocal? mLive 0 = some (.live (.immediate emptyImm)) :=
+  w_wideSlice_safe_reborrow_zeroSized_dangling_ok_agrees
 
 end StatementPins
 

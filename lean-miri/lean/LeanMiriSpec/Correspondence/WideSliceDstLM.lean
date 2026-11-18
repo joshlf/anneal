@@ -4154,6 +4154,39 @@ theorem div_rawSlice_placeLen_and_partialOobLenIndex :
     rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl),
     rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl)⟩
 
+/-- Concrete Witness 7d (**zero-sized safe references are not over-validated**): the
+`annealValidateSafeWideSliceRef` / `Validity.checkSafePointer` hook added for Witness 7c must reject
+only what Rust rejects. A shared reborrow `_0 = &(*_2)` of an EMPTY slice (`len = 0`, total size `0`)
+is valid at any non-null, aligned address — `slice::from_raw_parts(NonNull::dangling().as_ptr(), 0)`:
+1. at a dangling address (`emptyMemory` / `AnnealMachine.empty`, no live allocation, no borrow), BOTH
+   `stepMirFn` and `Miri.Interpreter.Step.step` succeed and return the original pointer with length `0`
+   (Anneal mints no borrow for an untracked pointer);
+2. into the live `[u32; 4]`, BOTH succeed with length `0`; Anneal mints the fresh borrow (alloc/tag `2`)
+   while vendored `Miri` keeps the parent tag (`DIV-LM-SHARED-REBORROW-FRESH-TAG`). -/
+theorem w_wideSlice_safe_reborrow_zeroSized_dangling_ok_agrees :
+    let bRefSh := wideSliceReborrowBody sharedRefSliceU32Ty (.ref .shared ⟨2, [.deref]⟩)
+    let emptyImm : Miri.Interpreter.Immediate AnnealProv :=
+      .scalarPair sampleMiriPtrSc (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 0))
+    ∃ (sDead sLive : MachineState) (mDead mLive : AnnealStepState),
+      stepMirFn bRefSh (wideSlice4LocalInitAnneal sampleAnnealPtr 0 1 emptyMemory) = .step sDead ∧
+      get? sDead.frame.locals 0 =
+        some (.init (.aggregate 0 [.ptr sampleAnnealPtr 8, .scalar ⟨0, 8⟩])) ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bRefSh.localDecls bRefSh.layouts) ()
+        (wideSlice4LocalInitMiri bRefSh sharedRefSliceU32Ty sampleMiriPtr 0 1 AnnealMachine.empty) =
+        (mDead, .ok true) ∧
+      miriTopLocal? mDead 0 = some (.live (.immediate emptyImm)) ∧
+      stepMirFn bRefSh (wideSlice4LocalInitAnneal sampleAnnealPtr 0 1 sampleAnnealArrMemory) =
+        .step sLive ∧
+      get? sLive.frame.locals 0 =
+        some (.init (.aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8, .scalar ⟨0, 8⟩])) ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bRefSh.localDecls bRefSh.layouts) ()
+        (wideSlice4LocalInitMiri bRefSh sharedRefSliceU32Ty sampleMiriPtr 0 1 sampleArrU32Machine) =
+        (mLive, .ok true) ∧
+      miriTopLocal? mLive 0 = some (.live (.immediate emptyImm)) :=
+  ⟨_, _, _, _,
+    rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl),
+    rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl)⟩
+
 end WideSliceWitnesses
 
 end LeanMiriSpec.Correspondence
