@@ -7,8 +7,10 @@ open Trusted.MirSemantics
 open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirSemantics.RvalueEvalResult
 open Trusted.Rustc.V2026_06_01.MirSemantics (decodeTypedValueFromBytes decodePtrBytesNoForge
-  decodeScalarLayoutBytesNoForge abstractBytesUniformProv layoutPointerBytes)
+  decodeScalarLayoutBytesNoForge abstractBytesUniformProv layoutPointerBytes
+  FloatIntTarget IeeeFormat TreeBorrowPerm)
 open Anneal.BitValidity
+open Anneal.Mir
 open Anneal.Mir.Cast
 
 /-!
@@ -196,7 +198,17 @@ theorem step_scalarNicheNewtype_nonZeroU32_accepts_five_and_rejects_zero :
   exact ⟨h5.2.2.2.1.mpr (by decide), h0.2.2.2.2.mpr (by decide)⟩
 
 /-- Concrete instantiation of the `char`-range (`0..=0x10FFFF`) surrogate divergence (`0xD800`). -/
-example :=
+theorem scalarNicheNewtype_charRange_surrogate_divergence :
+    let c := ByteCodec.MirValueCodec.scalarNicheNewtype castStage1Layouts "CharWrapper" 2
+      charRangeNewtypeLayout 4 32 false 0 [0] ⟨0, 0x10FFFF⟩ (by decide) rfl rfl rfl rfl rfl rfl
+      rfl rfl
+    (∃ x, c.codec.decode (encodeLittleEndianBytes 0xD800 4 none) = some x ∧ x.val = 0xD800) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.decodeValueFromBytes defaultCodecFuel castStage1Layouts
+        { kind := .adt "CharWrapper" [], layoutIdx := 2 }
+        (encodeLittleEndianBytes 0xD800 4 none) = some (.aggregate 0 [.scalar ⟨0xD800, 4⟩]) ∧
+    decodeTypedValueFromBytes defaultCodecFuel castStage1Layouts
+        { kind := .adt "CharWrapper" [.char], layoutIdx := 2 }
+        (encodeLittleEndianBytes 0xD800 4 none) = none :=
   trusted_decodeTypedValueFromBytes_scalarNicheNewtype_charRange_surrogate_divergence
     castStage1Layouts "CharWrapper" [.char] 2 charRangeNewtypeLayout 32 false 0 [0]
     rfl rfl rfl rfl rfl rfl rfl rfl
@@ -230,22 +242,77 @@ def floatF64Ty : Ty := { kind := .float .f64, layoutIdx := 0 }
 def floatF128Ty : Ty := { kind := .float .f128, layoutIdx := 0 }
 
 /-- Non-vacuity of the step-level soundness theorems: every hypothesis is discharged by `rfl` on a
-concrete `evalRvalue` environment (64-bit `castStage1Layouts`). -/
-example :=
+concrete `evalRvalue` environment (64-bit `castStage1Layouts`), audited as named theorems under
+`#print axioms` (`0` `Classical.choice`). -/
+theorem evalRvalue_cast_floatToInt_sound_inst :
+    ∃ out : ScalarInt,
+      evalRvalue floatLocals (.cast .floatToInt (.copy ⟨0, []⟩) floatI8Ty) emptyMemory
+          floatLocalDecls castStage1Layouts =
+        .ok (.scalar out) floatLocals emptyMemory ∧
+      out.sizeBytes * 8 =
+        (FloatIntTarget.signed .i8).bitWidth (floatPtrWidthOfLayouts castStage1Layouts) ∧
+      intValueOfBits (FloatIntTarget.signed .i8).isSigned
+          ((FloatIntTarget.signed .i8).bitWidth (floatPtrWidthOfLayouts castStage1Layouts))
+          out.bits =
+        floatToIntValue (decodeBits .binary64 0x400921FB54442D18)
+          ((FloatIntTarget.signed .i8).minValue (floatPtrWidthOfLayouts castStage1Layouts))
+          ((FloatIntTarget.signed .i8).maxValue (floatPtrWidthOfLayouts castStage1Layouts)) ∧
+      (IeeeFloatCast.isNaNBits .binary64 0x400921FB54442D18 = true → out.bits = 0) :=
   evalRvalue_cast_floatToInt_sound (locals := floatLocals) (op := .copy ⟨0, []⟩) (dstTy := floatI8Ty)
     (mem := emptyMemory) (localDecls := floatLocalDecls) (layouts := castStage1Layouts)
     (fmt := .binary64) (tgt := .signed .i8) rfl rfl rfl rfl rfl
 
-example :=
+theorem evalRvalue_cast_floatToFloat_sound_inst :
+    ∃ out : ScalarInt,
+      evalRvalue floatLocals (.cast .floatToFloat (.copy ⟨0, []⟩) floatF32Ty) emptyMemory
+          floatLocalDecls castStage1Layouts =
+        .ok (.scalar out) floatLocals emptyMemory ∧
+      out.sizeBytes = IeeeFormat.binary32.byteWidth ∧
+      (∀ (neg : Bool) (n d : Nat), decodeBits .binary64 0x400921FB54442D18 = .finite neg n d →
+        out.bits = roundRatioTiesToEven .binary32 neg n d) ∧
+      (IeeeFloatCast.isNaNBits .binary64 0x400921FB54442D18 = true →
+        IeeeFloatCast.isNaNBits .binary32 out.bits = true ∧
+          IeeeFloatCast.isQuietNaNBits .binary32 out.bits = true) :=
   evalRvalue_cast_floatToFloat_sound (locals := floatLocals) (op := .copy ⟨0, []⟩)
     (dstTy := floatF32Ty) (mem := emptyMemory) (localDecls := floatLocalDecls)
     (layouts := castStage1Layouts) (src := .binary64) (dst := .binary32) rfl rfl rfl rfl rfl
 
-example :=
+theorem evalRvalue_cast_intToFloat_exact_inst :
+    ∃ out : ScalarInt,
+      evalRvalue floatLocals (.cast .intToFloat (.copy ⟨2, []⟩) floatF64Ty) emptyMemory
+          floatLocalDecls castStage1Layouts =
+        .ok (.scalar out) floatLocals emptyMemory ∧
+      out.sizeBytes = IeeeFormat.binary64.byteWidth ∧
+      IeeeFloatCast.floatKindDenotesInt (decodeBits .binary64 out.bits)
+        (intValueOfBits (FloatIntTarget.signed .i64).isSigned
+          ((FloatIntTarget.signed .i64).bitWidth (floatPtrWidthOfLayouts castStage1Layouts))
+          (scalarModulus 8 - 123)) :=
   evalRvalue_cast_intToFloat_exact (locals := floatLocals) (op := .copy ⟨2, []⟩)
     (dstTy := floatF64Ty) (mem := emptyMemory) (localDecls := floatLocalDecls)
     (layouts := castStage1Layouts) (fmt := .binary64) (src := .signed .i64) rfl rfl rfl rfl rfl
     (by decide +kernel)
+
+theorem evalRvalue_cast_float_unsupported_of_no_format_inst :
+    (evalRvalue floatLocals (.cast .floatToInt (.copy ⟨2, []⟩) floatI8Ty) emptyMemory
+        floatLocalDecls castStage1Layouts = unsupported ∧
+     evalRvalue floatLocals (.cast .floatToFloat (.copy ⟨2, []⟩) floatF32Ty) emptyMemory
+        floatLocalDecls castStage1Layouts = unsupported) ∧
+    (evalRvalue floatLocals (.cast .intToFloat (.copy ⟨2, []⟩) floatF128Ty) emptyMemory
+        floatLocalDecls castStage1Layouts = unsupported ∧
+     evalRvalue floatLocals (.cast .floatToFloat (.copy ⟨0, []⟩) floatF128Ty) emptyMemory
+        floatLocalDecls castStage1Layouts = unsupported) :=
+  ⟨(evalRvalue_cast_float_unsupported_of_no_format (locals := floatLocals) (op := .copy ⟨2, []⟩)
+      (dstTy := floatI8Ty) (mem := emptyMemory) (localDecls := floatLocalDecls)
+      (layouts := castStage1Layouts) rfl rfl).1 rfl |>.imp id (fun _ =>
+      ((evalRvalue_cast_float_unsupported_of_no_format (locals := floatLocals) (op := .copy ⟨2, []⟩)
+        (dstTy := floatF32Ty) (mem := emptyMemory) (localDecls := floatLocalDecls)
+        (layouts := castStage1Layouts) rfl rfl).1 rfl).2),
+   ⟨((evalRvalue_cast_float_unsupported_of_no_format (locals := floatLocals) (op := .copy ⟨2, []⟩)
+      (dstTy := floatF128Ty) (mem := emptyMemory) (localDecls := floatLocalDecls)
+      (layouts := castStage1Layouts) rfl rfl).2 rfl).1,
+    ((evalRvalue_cast_float_unsupported_of_no_format (locals := floatLocals) (op := .copy ⟨0, []⟩)
+      (dstTy := floatF128Ty) (mem := emptyMemory) (localDecls := floatLocalDecls)
+      (layouts := castStage1Layouts) rfl rfl).2 rfl).2⟩⟩
 
 /-- Concrete `evalRvalue` float casts on `castStage1Layouts`: `π as i8 = 3`, `π as f32`
 (round to nearest), `-0.0f32 as u8 = 0`, `-0.0f32 as f64 = -0.0`, `-123i64 as f64`,
@@ -574,14 +641,30 @@ def floatF16Body : CapturedMir :=
   floatBody "cast_stage1::float_f16" [.float .f32]
     [fCast 0 .floatToFloat (fConst (.float .f16) 0x3C00 2) (.float .f32)]
 
+def floatF128SrcBody : CapturedMir :=
+  floatBody "cast_stage1::float_f128_src" [.float .f64]
+    [fCast 0 .floatToFloat (fConst (.float .f128) (0x3FFF * 2 ^ 112) 16) (.float .f64)]
+
+def floatF16DstBody : CapturedMir :=
+  floatBody "cast_stage1::float_f16_dst" [.float .f16]
+    [fCast 0 .floatToFloat (fConst (.float .f32) 0x3F800000 4) (.float .f16)]
+
+def floatF128DstBody : CapturedMir :=
+  floatBody "cast_stage1::float_f128_dst" [.float .f128]
+    [fCast 0 .floatToFloat (fConst (.float .f64) 0x3FF0000000000000 8) (.float .f128)]
+
 def floatBoolBody : CapturedMir :=
   floatBody "cast_stage1::float_bool" [.float .f32]
     [fCast 0 .intToFloat (fConst .bool 1 1) (.float .f32)]
 
+def floatCharBody : CapturedMir :=
+  floatBody "cast_stage1::float_char" [.float .f64]
+    [fCast 0 .intToFloat (fConst .char 0x41 4) (.float .f64)]
+
 set_option maxRecDepth 200000 in
 /-- End-to-end `stepMirFn` negative controls: reading a dead (`StorageDead`), never-live,
-uninitialized, or moved-from source in a float cast faults with `.ub`; an `f16` source and a
-`bool` source fail closed with `.unsupported`. -/
+uninitialized, or moved-from source in a float cast faults with `.ub`; `f16`/`f128` sources and
+targets and `bool`/`char` sources fail closed with `.unsupported`. -/
 theorem stepMirFn_float_ub_and_fail_closed_runs :
     runFloatSteps floatDeadBody 4 (initMachineState floatDeadBody []) = MirStepNode.fail .ub ∧
     runFloatSteps floatNeverLiveBody 1 (initMachineState floatNeverLiveBody []) =
@@ -591,8 +674,48 @@ theorem stepMirFn_float_ub_and_fail_closed_runs :
     runFloatSteps floatMovedBody 5 (initMachineState floatMovedBody []) =
       MirStepNode.fail .ub ∧
     runFloatSteps floatF16Body 1 (initMachineState floatF16Body []) = MirStepNode.unsupported ∧
-    runFloatSteps floatBoolBody 1 (initMachineState floatBoolBody []) = MirStepNode.unsupported :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+    runFloatSteps floatF128SrcBody 1 (initMachineState floatF128SrcBody []) =
+      MirStepNode.unsupported ∧
+    runFloatSteps floatF16DstBody 1 (initMachineState floatF16DstBody []) =
+      MirStepNode.unsupported ∧
+    runFloatSteps floatF128DstBody 1 (initMachineState floatF128DstBody []) =
+      MirStepNode.unsupported ∧
+    runFloatSteps floatBoolBody 1 (initMachineState floatBoolBody []) = MirStepNode.unsupported ∧
+    runFloatSteps floatCharBody 1 (initMachineState floatCharBody []) = MirStepNode.unsupported :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- (W5) Address-taken (`&raw mut _1`) local + float-to-int write (invalidating the raw-pointer
+borrow entry) + int-to-float reads (`copy` & `move` round-trip) + `StorageDead` + `return`. -/
+def promotedRawFloatBody : CapturedMir :=
+  floatBody "cast_stage1::promoted_raw_float"
+    [.float .f64, .int .i64, .rawPtr .mut (.int .i64), .float .f32]
+    [.storageLive 1, .storageLive 2, .storageLive 3,
+     .assign (fPlace 2) (.rawPtr .mut (fPlace 1)),
+     fCast 1 .floatToInt (fConst (.float .f64) 0xC045600000000000 8) (.int .i64),
+     fCast 3 .intToFloat (.copy (fPlace 1)) (.float .f32),
+     fCast 1 .floatToInt (.move (fPlace 3)) (.int .i64),
+     fCast 0 .intToFloat (.copy (fPlace 1)) (.float .f64),
+     .storageDead 3, .storageDead 2, .storageDead 1]
+
+/-- Borrow permissions of a silent-step node's memory. -/
+def stepBorrowPerms? : MirStepNode → Option (List (Nat × TreeBorrowPerm))
+  | .tau (.running s) => some (s.memory.borrows.map fun b => (b.tag, b.perm))
+  | _ => none
+
+set_option maxRecDepth 200000 in
+/-- End-to-end `stepMirFn` run of `promotedRawFloatBody` from program entry: `_2 = &raw mut _1`
+creates an `.active` borrow tag on `_1`; writing `-42.75_f64 as i64 = -42` into `_1` transitions
+that borrow tag to `.disabled`; subsequent `intToFloat` / `floatToInt` casts read and overwrite
+`_1`, `StorageDead` cleans up `_3.._1`, and the function returns `-42.0_f64`. -/
+theorem stepMirFn_promoted_raw_float_cast_run :
+    let s₀ := initMachineState promotedRawFloatBody []
+    stepBorrowPerms? (runFloatSteps promotedRawFloatBody 4 s₀) = some [(1, .active)] ∧
+    stepBorrowPerms? (runFloatSteps promotedRawFloatBody 5 s₀) = some [(1, .disabled)] ∧
+    stepLocals? (runFloatSteps promotedRawFloatBody 8 s₀) =
+      some [.init (.scalar ⟨0xC045000000000000, 8⟩), .init (.scalar ⟨0xFFFFFFFFFFFFFFD6, 8⟩),
+        .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit] ∧
+    retScalar? (runFloatSteps promotedRawFloatBody 12 s₀) = some ⟨0xC045000000000000, 8⟩ :=
+  ⟨rfl, rfl, rfl, rfl⟩
 
 end FloatStepRuns
 
@@ -637,6 +760,41 @@ info: 'Anneal.CastStage1Tests.step_scalarNicheNewtype_nonZeroU32_accepts_five_an
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms step_scalarNicheNewtype_nonZeroU32_accepts_five_and_rejects_zero
+
+/--
+info: 'Anneal.CastStage1Tests.scalarNicheNewtype_charRange_surrogate_divergence' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms scalarNicheNewtype_charRange_surrogate_divergence
+
+/--
+info: 'Anneal.CastStage1Tests.evalRvalue_cast_floatToInt_sound_inst' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalRvalue_cast_floatToInt_sound_inst
+
+/--
+info: 'Anneal.CastStage1Tests.evalRvalue_cast_floatToFloat_sound_inst' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalRvalue_cast_floatToFloat_sound_inst
+
+/--
+info: 'Anneal.CastStage1Tests.evalRvalue_cast_intToFloat_exact_inst' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalRvalue_cast_intToFloat_exact_inst
+
+/--
+info: 'Anneal.CastStage1Tests.evalRvalue_cast_float_unsupported_of_no_format_inst' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalRvalue_cast_float_unsupported_of_no_format_inst
 
 /--
 info: 'Anneal.CastStage1Tests.step_float_casts_concrete' depends on axioms:
@@ -707,6 +865,13 @@ info: 'Anneal.CastStage1Tests.stepMirFn_float_ub_and_fail_closed_runs' depends o
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms stepMirFn_float_ub_and_fail_closed_runs
+
+/--
+info: 'Anneal.CastStage1Tests.stepMirFn_promoted_raw_float_cast_run' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stepMirFn_promoted_raw_float_cast_run
 
 end AxiomGuards
 
