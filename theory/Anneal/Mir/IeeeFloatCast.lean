@@ -62,10 +62,12 @@ Headline results:
   round-trip bridges (`encodeTwosComplement_eq_toNat_ofInt`,
   `bitVec_ofNat_encodeTwosComplement`, `encodeTwosComplement_bitVec_toInt`,
   `intValueOfBits_signed_bounds`, `bitVec128_ofInt_intValueOfBits_toInt`,
-  `bitVec128_ofNat_intValueOfBits_toNat`, `evalFloatToIntSaturating_bitVec_eq`), and the
+  `bitVec128_ofNat_intValueOfBits_toNat`, `evalFloatToIntSaturating_bitVec_eq`), the
   saturation endpoints `evalFloatToIntSaturating_infBits` (`+∞ ↦ MAX`, `-∞ ↦ MIN`, via
-  `encodeTwosComplement_maxValue` / `encodeTwosComplement_minValue`) and
-  `evalFloatToIntSaturating_zeroBits` (`±0.0 ↦ 0`).
+  `encodeTwosComplement_maxValue` / `encodeTwosComplement_minValue`),
+  `evalFloatToIntSaturating_zeroBits` (`±0.0 ↦ 0`),
+  `evalFloatToIntSaturating_of_ge_maxValue` / `evalFloatToIntSaturating_of_le_minValue`
+  (finite truncation saturation), and `evalFloatToFloatRoundTiesToEven_{zeroBits,infBits}`.
 
 Every theorem is kernel-checked and depends only on `propext` / `Quot.sound` (no
 `Classical.choice`); see the `#guard_msgs in #print axioms` block at the end of
@@ -3315,6 +3317,59 @@ theorem evalFloatToIntSaturating_sizeBytes (src : IeeeFormat) (bits : Nat) (t : 
     (pw : FloatPtrWidth) :
     (evalFloatToIntSaturating src bits t pw).sizeBytes = t.bitWidth pw / 8 := rfl
 
+/-- **Finite upper saturation (`truncRatio ≥ maxValue ↦ MAX`)**: when `bits` decodes to a
+finite rational whose truncated integer value meets or exceeds `t.maxValue pw`,
+`evalFloatToIntSaturating` saturates to the target maximum's two's-complement bit pattern. -/
+theorem evalFloatToIntSaturating_of_ge_maxValue (src : IeeeFormat) (bits : Nat) (neg : Bool)
+    (n d : Nat) (t : FloatIntTarget) (pw : FloatPtrWidth)
+    (hdec : decodeBits src bits = .finite neg n d)
+    (hge : t.maxValue pw ≤ truncRatio neg n d) :
+    (evalFloatToIntSaturating src bits t pw).bits =
+      if t.isSigned then 2 ^ (t.bitWidth pw - 1) - 1 else 2 ^ t.bitWidth pw - 1 := by
+  have hp1 : 1 ≤ 2 ^ (t.bitWidth pw - 1) := Nat.one_le_two_pow
+  have hp2 : 1 ≤ 2 ^ t.bitWidth pw := Nat.one_le_two_pow
+  have hle : t.minValue pw ≤ t.maxValue pw := by
+    unfold FloatIntTarget.minValue FloatIntTarget.maxValue
+    cases t.isSigned <;> simp only [Bool.false_eq_true, ↓reduceIte] <;> omega
+  have hclamp : clampInt (t.minValue pw) (t.maxValue pw) (truncRatio neg n d) = t.maxValue pw := by
+    unfold clampInt
+    rw [Int.min_eq_left hge, Int.max_eq_right hle]
+  simp only [evalFloatToIntSaturating, hdec, floatToIntValue, hclamp]
+  exact encodeTwosComplement_maxValue t pw
+
+/-- **Finite lower saturation (`truncRatio ≤ minValue ↦ MIN`)**: when `bits` decodes to a
+finite rational whose truncated integer value is at or below `t.minValue pw` (including all
+negative finite floats on unsigned targets, where `minValue = 0`),
+`evalFloatToIntSaturating` saturates to the target minimum's two's-complement bit pattern. -/
+theorem evalFloatToIntSaturating_of_le_minValue (src : IeeeFormat) (bits : Nat) (neg : Bool)
+    (n d : Nat) (t : FloatIntTarget) (pw : FloatPtrWidth)
+    (hdec : decodeBits src bits = .finite neg n d)
+    (hle_min : truncRatio neg n d ≤ t.minValue pw) :
+    (evalFloatToIntSaturating src bits t pw).bits =
+      if t.isSigned then 2 ^ (t.bitWidth pw - 1) else 0 := by
+  have hp1 : 1 ≤ 2 ^ (t.bitWidth pw - 1) := Nat.one_le_two_pow
+  have hp2 : 1 ≤ 2 ^ t.bitWidth pw := Nat.one_le_two_pow
+  have hle : t.minValue pw ≤ t.maxValue pw := by
+    unfold FloatIntTarget.minValue FloatIntTarget.maxValue
+    cases t.isSigned <;> simp only [Bool.false_eq_true, ↓reduceIte] <;> omega
+  have hclamp : clampInt (t.minValue pw) (t.maxValue pw) (truncRatio neg n d) = t.minValue pw := by
+    unfold clampInt
+    rw [Int.min_eq_right (Int.le_trans hle_min hle), Int.max_eq_left hle_min]
+  simp only [evalFloatToIntSaturating, hdec, floatToIntValue, hclamp]
+  exact encodeTwosComplement_minValue t pw
+
+/-- **Signed zero preservation in `floatToFloat`**: `zeroBits src neg` maps to `zeroBits dst neg`
+(preserving `-0.0` vs `+0.0`, in contrast to `evalFloatToIntSaturating_zeroBits`). -/
+theorem evalFloatToFloatRoundTiesToEven_zeroBits (src dst : IeeeFormat) (neg : Bool) :
+    evalFloatToFloatRoundTiesToEven src dst (zeroBits src neg) = zeroBits dst neg := by
+  simp only [evalFloatToFloatRoundTiesToEven, decodeBits_zeroBits]
+
+/-- **Signed infinity preservation in `floatToFloat`**: `infBits src neg` maps to
+`infBits dst neg`. -/
+theorem evalFloatToFloatRoundTiesToEven_infBits (src dst : IeeeFormat) (neg : Bool) :
+    evalFloatToFloatRoundTiesToEven src dst (infBits src neg) = infBits dst neg := by
+  simp only [evalFloatToFloatRoundTiesToEven, decodeBits_infBits]
+
 end MiriBridge
 
 /-! ## §5. Axiom guards
@@ -3854,6 +3909,30 @@ info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_sizeBytes' does not dep
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms evalFloatToIntSaturating_sizeBytes
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_of_ge_maxValue' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_of_ge_maxValue
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_of_le_minValue' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_of_le_minValue
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_zeroBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToFloatRoundTiesToEven_zeroBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_infBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToFloatRoundTiesToEven_infBits
 
 end AxiomGuards
 
