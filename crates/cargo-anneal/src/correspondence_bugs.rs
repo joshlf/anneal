@@ -270,9 +270,6 @@ pub struct FileIssueOptions {
     pub gap_id: String,
     /// Target GitHub repository (`"<owner>/<repo>"`).
     pub repo: String,
-    /// Optional explicit `--ldap <ldap>` forwarded to the `gh` remote bridge when
-    /// `execute == true`.
-    pub ldap: Option<String>,
     /// When `false` (the mandatory default), NO external process is ever
     /// spawned and `FileIssueOutcome::DryRunPreview` is returned. Only when
     /// explicitly set to `true` (`--execute`) is `gh_bin` invoked.
@@ -288,7 +285,6 @@ impl FileIssueOptions {
         Self {
             gap_id: gap_id.into(),
             repo: repo.into(),
-            ldap: None,
             execute: false,
             gh_bin: PathBuf::from("gh"),
         }
@@ -333,7 +329,6 @@ pub enum CorrespondenceBugsSubcommand {
         gaps_toml: PathBuf,
         gap_id: String,
         repo: String,
-        ldap: Option<String>,
         execute: bool,
         gh_bin: PathBuf,
     },
@@ -1159,11 +1154,6 @@ pub fn file_github_issue(
 
     // Explicit `--execute` path: invoke the configured `gh` binary.
     let mut cmd = Command::new(&options.gh_bin);
-    if let Some(ref ldap) = options.ldap
-        && !ldap.trim().is_empty()
-    {
-        cmd.arg("--ldap").arg(ldap.trim());
-    }
     cmd.arg("issue")
         .arg("create")
         .arg("--repo")
@@ -1311,7 +1301,6 @@ pub fn parse_correspondence_bugs_args(args: &[String]) -> Result<CorrespondenceB
             let mut gaps_toml = default_gaps;
             let mut gap_id: Option<String> = None;
             let mut repo: Option<String> = None;
-            let mut ldap: Option<String> = None;
             let mut execute = false;
             let mut gh_bin = PathBuf::from("gh");
             let mut i = 0;
@@ -1341,14 +1330,6 @@ pub fn parse_correspondence_bugs_args(args: &[String]) -> Result<CorrespondenceB
                     s if s.starts_with("--gaps-toml=") => {
                         gaps_toml = PathBuf::from(&s["--gaps-toml=".len()..]);
                     }
-                    "--ldap" => {
-                        i += 1;
-                        let val = rest.get(i).ok_or("missing value for --ldap")?;
-                        ldap = Some(val.clone());
-                    }
-                    s if s.starts_with("--ldap=") => {
-                        ldap = Some(s["--ldap=".len()..].to_string());
-                    }
                     "--gh-bin" => {
                         i += 1;
                         let val = rest.get(i).ok_or("missing value for --gh-bin")?;
@@ -1374,7 +1355,6 @@ pub fn parse_correspondence_bugs_args(args: &[String]) -> Result<CorrespondenceB
                 gaps_toml,
                 gap_id,
                 repo,
-                ldap,
                 execute,
                 gh_bin,
             })
@@ -1456,7 +1436,6 @@ pub fn run_correspondence_bugs_cli(cmd: &CorrespondenceBugsSubcommand) -> Result
             gaps_toml,
             gap_id,
             repo,
-            ldap,
             execute,
             gh_bin,
         } => {
@@ -1464,7 +1443,6 @@ pub fn run_correspondence_bugs_cli(cmd: &CorrespondenceBugsSubcommand) -> Result
             let opts = FileIssueOptions {
                 gap_id: gap_id.clone(),
                 repo: repo.clone(),
-                ldap: ldap.clone(),
                 execute: *execute,
                 gh_bin: gh_bin.clone(),
             };

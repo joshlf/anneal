@@ -67,7 +67,7 @@ def best_of_ms(fn, runs: int = 15, budget_ms: float = 5.0, rounds: int = 3) -> f
     return best
 
 
-def jetski_edit(path: Path, target: str, replacement: str) -> dict:
+def target_replacement_edit(path: Path, target: str, replacement: str) -> dict:
     return {"toolCall": {"args": {"Path": str(path), "Target": target, "Replacement": replacement}}}
 
 
@@ -709,7 +709,7 @@ class TestFiveStructuralAntiPatterns(unittest.TestCase):
 
 
 class TestDeltaOnlyPostEditCheck(unittest.TestCase):
-    def test_delta_only_jetski_and_claude_payloads(self) -> None:
+    def test_delta_only_target_replacement_and_claude_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             cache_file = tmp_dir / "cache.json"
@@ -720,17 +720,17 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             lean_file.write_text(clean_v1, encoding="utf-8")
             fb1 = proof_health.check_post_edit_proof_health(
                 lean_file,
-                jetski_edit(lean_file, "  trivial\n", "  dsimp only [foo]\n  trivial\n"),
+                target_replacement_edit(lean_file, "  trivial\n", "  dsimp only [foo]\n  trivial\n"),
                 cache_path=cache_file,
             )
             self.assertEqual(fb1, "")
 
-            # 2. Introduce `dsimp [wpMirExecSym]` via Jetski `Target`/`Replacement` -> warning (+1)
+            # 2. Introduce `dsimp [wpMirExecSym]` via `Target`/`Replacement` -> warning (+1)
             bad_v2 = "theorem t : True := by\n  dsimp only [foo, wpMirExecSym]\n  trivial\n"
             lean_file.write_text(bad_v2, encoding="utf-8")
             fb2 = proof_health.check_post_edit_proof_health(
                 lean_file,
-                jetski_edit(lean_file, "  dsimp only [foo]\n", "  dsimp only [foo, wpMirExecSym]\n"),
+                target_replacement_edit(lean_file, "  dsimp only [foo]\n", "  dsimp only [foo, wpMirExecSym]\n"),
                 cache_path=cache_file,
             )
             self.assertIn("[Anneal Proof Health]", fb2)
@@ -789,7 +789,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             lean_file = tmp_dir / "Old.lean"
             text = "theorem t : True := by\n  dsimp [wpMirExecSym]\n  trivial\n"
             lean_file.write_text(text, encoding="utf-8")
-            deletion = jetski_edit(lean_file, "  -- obsolete note\n", "")
+            deletion = target_replacement_edit(lean_file, "  -- obsolete note\n", "")
             self.assertEqual(
                 proof_health.check_post_edit_proof_health(
                     lean_file, deletion, cache_path=tmp_dir / "c1.json"
@@ -818,7 +818,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             lean_file = tmp_dir / "New.lean"
             text = "theorem t : True := by\n  simp [wpMirExecSym]\n  trivial\n"
             lean_file.write_text(text, encoding="utf-8")
-            # Jetski `write_file` without `Overwrite`/`Append` only succeeds on a new file.
+            # `write_file` without `Overwrite`/`Append` only succeeds on a new file.
             created = {"toolCall": {"args": {"Path": str(lean_file), "Content": text}}}
             fb = proof_health.check_post_edit_proof_health(lean_file, created, cache_path=cache_file)
             self.assertIn("`dsimp_forbidden_sym` (+1 at L2)", fb)
@@ -856,7 +856,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             lean_file.write_text(after, encoding="utf-8")
             res = proof_health.evaluate_post_edit_proof_health(
                 lean_file,
-                jetski_edit(lean_file, "theorem t : True := by\n", "theorem t : True := by\n" + body),
+                target_replacement_edit(lean_file, "theorem t : True := by\n", "theorem t : True := by\n" + body),
                 cache_path=tmp_dir / "cache.json",
             )
             self.assertEqual(res["deltas"][R1], 1)
@@ -904,7 +904,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
                 lean_file.write_text(v2, encoding="utf-8")
                 fb = proof_health.check_post_edit_proof_health(
                     lean_file,
-                    jetski_edit(lean_file, "  trivial\n", "  skip\n  trivial\n"),
+                    target_replacement_edit(lean_file, "  trivial\n", "  skip\n  trivial\n"),
                     cache_path=cache_file,
                 )
                 self.assertEqual(fb, "")
@@ -919,7 +919,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
                 calls.clear()
                 fb2 = proof_health.check_post_edit_proof_health(
                     lean_file,
-                    jetski_edit(
+                    target_replacement_edit(
                         lean_file,
                         "\n  dsimp [wpMirExecSym]\n",
                         "\n  dsimp [wpMirExecSym]\n  dsimp [wpMirExecSym]\n",
@@ -1089,7 +1089,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
                 target.write_text(v1 + "-- note\n", encoding="utf-8")
                 fb = proof_health.check_post_edit_proof_health(
                     target,
-                    jetski_edit(target, "by omega\n", "by omega\n-- note\n"),
+                    target_replacement_edit(target, "by omega\n", "by omega\n-- note\n"),
                     cache_path=cache_file,
                 )
                 self.assertEqual(fb, "")
@@ -1198,16 +1198,16 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             self.assertEqual(res_c["deltas"][R1], 1)
             self.assertEqual(len(res_c["new_findings"]), 1)
 
-            # 2. Uncached Jetski `edit_file` carrying `Made 1 replacement ... starting at line 5`:
+            # 2. Uncached `edit_file` carrying `Made 1 replacement ... starting at line 5`:
             # exact line L5 reconstructed and attributed (+1 at L5).
-            jetski_file = tmp_dir / "JetskiAmbig.lean"
-            jetski_file.write_text(after, encoding="utf-8")
-            jetski_payload = {
-                "result": f"Made 1 replacement in {jetski_file} starting at line 5 (+1/-1 lines).",
-                **jetski_edit(jetski_file, "  skip\n", "  dsimp [wpMirExecSym]\n"),
+            target_file = tmp_dir / "AmbigTarget.lean"
+            target_file.write_text(after, encoding="utf-8")
+            target_payload = {
+                "result": f"Made 1 replacement in {target_file} starting at line 5 (+1/-1 lines).",
+                **target_replacement_edit(target_file, "  skip\n", "  dsimp [wpMirExecSym]\n"),
             }
             res_j = proof_health.evaluate_post_edit_proof_health(
-                jetski_file, jetski_payload, cache_path=tmp_dir / "c_jetski.json"
+                target_file, target_payload, cache_path=tmp_dir / "c_target.json"
             )
             self.assertEqual(res_j["deltas"][R1], 1)
             self.assertEqual([f.line for f in res_j["new_findings"]], [5])
@@ -1232,7 +1232,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             # Pre-edit `tgt_v1` now ALREADY conflicted with updated `Sib.lean`, so adding a comment
             # to `Tgt.lean` must NOT reuse the stale 0-count cache entry or claim a false +1!
             fb_sib = proof_health.check_post_edit_proof_health(
-                tgt, jetski_edit(tgt, "sorry\n", "sorry\n-- touch\n"), cache_path=scache
+                tgt, target_replacement_edit(tgt, "sorry\n", "sorry\n-- touch\n"), cache_path=scache
             )
             self.assertEqual(fb_sib, "")
             # Delete `Sib.lean` and verify persisted sibling index prunes it.
@@ -1278,7 +1278,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             # and re-scan `tgt_v1` (delta 1 - 1 = 0 -> ""), never claiming a false +1.
             self.assertEqual(
                 proof_health.check_post_edit_proof_health(
-                    tgt, jetski_edit(tgt, "sorry\n", "sorry\n-- harmless comment\n"), cache_path=cache_file
+                    tgt, target_replacement_edit(tgt, "sorry\n", "sorry\n-- harmless comment\n"), cache_path=cache_file
                 ),
                 "",
             )
@@ -1301,7 +1301,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             tgt.write_text(tgt_d1 + "-- touch\n", encoding="utf-8")
             self.assertEqual(
                 proof_health.check_post_edit_proof_health(
-                    tgt, jetski_edit(tgt, ":= 1\n", ":= 1\n-- touch\n"), cache_path=cache2
+                    tgt, target_replacement_edit(tgt, ":= 1\n", ":= 1\n-- touch\n"), cache_path=cache2
                 ),
                 "",
             )
@@ -1389,7 +1389,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             lean_file.write_text(after, encoding="utf-8")
             payload = {
                 "result": f"Made 2 replacements in {lean_file} starting at line 5 (+2/-2 lines).",
-                **jetski_edit(lean_file, "  skip\n", "  dsimp [wpMirExecSym]\n"),
+                **target_replacement_edit(lean_file, "  skip\n", "  dsimp [wpMirExecSym]\n"),
             }
             res = proof_health.evaluate_post_edit_proof_health(
                 lean_file, payload, cache_path=tmp_dir / "c_multi.json"
@@ -1428,7 +1428,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             finally:
                 proof_health._BODY_COMPARE_BUDGET = old_budget
 
-    def test_oversized_jetski_result_numbers_are_not_hints(self) -> None:
+    def test_oversized_replacement_result_numbers_are_not_hints(self) -> None:
         # A replacement count or start line too long to be real (past Python's
         # 4300-digit `int()` limit) is ignored instead of raising.
         with tempfile.TemporaryDirectory() as tmp:
@@ -1444,7 +1444,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             for idx, result in enumerate(results):
                 payload = {
                     "result": result,
-                    **jetski_edit(lean_file, "  skip\n", "  dsimp [wpMirExecSym]\n"),
+                    **target_replacement_edit(lean_file, "  skip\n", "  dsimp [wpMirExecSym]\n"),
                 }
                 res = proof_health.evaluate_post_edit_proof_health(
                     lean_file, payload, cache_path=tmp_dir / f"c{idx}.json"
@@ -1512,7 +1512,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
                     zfile,
                     {
                         "result": bad_hint,
-                        **jetski_edit(zfile, "  skip\n", "  dsimp [wpMirExecSym]\n"),
+                        **target_replacement_edit(zfile, "  skip\n", "  dsimp [wpMirExecSym]\n"),
                     },
                     cache_path=tmp_dir / f"z_{len(bad_hint)}.json",
                 )
@@ -1692,7 +1692,7 @@ class TestPerformanceAndDogfood(unittest.TestCase):
             "_EQN_ALT_LINE_RE",
             "_MATCH_OR_FUN_RE",
             "_HDR_TOKEN_RE",
-            "_JETSKI_REPL_RESULT_RE",
+            "_REPL_RESULT_RE",
             "_CREATED_COMPLETED_RE",
         ):
             self.assertIsNotNone(getattr(proof_health, attr), f"{attr} must be pre-compiled")
@@ -2100,8 +2100,8 @@ class TestTranscriptLatencyTelemetry(unittest.TestCase):
             self.assertEqual(jstats["batched_with_long_call_count"], 2)
             self.assertAlmostEqual(jstats["unbatched_mean_ms"], 25.0, places=3)
 
-    def test_jetski_transcript_result_steps_are_paired_with_planner_calls(self) -> None:
-        # Real Jetski transcripts: the planner step lists its calls without timings and
+    def test_structured_transcript_result_steps_are_paired_with_planner_calls(self) -> None:
+        # Structured transcripts: the planner step lists its calls without timings and
         # each call's result step follows (in order) with `Created At` / `Completed At`
         # timestamps in its content. System messages in between carry no result.
         def result(ts0: str, ts1: str, idx: int) -> dict:
@@ -2353,7 +2353,7 @@ class TestPostToolUseHookIntegration(unittest.TestCase):
             )
             payload = {
                 "result": "Edited OfflineProof.lean",
-                **jetski_edit(lean_file, "  trivial\n", "  dsimp [wpMirExecSym]\n  trivial\n"),
+                **target_replacement_edit(lean_file, "  trivial\n", "  dsimp [wpMirExecSym]\n  trivial\n"),
             }
             env = self.hook_env(tmp_dir / "hook-cache.json")
 
@@ -2384,10 +2384,10 @@ class TestPostToolUseHookIntegration(unittest.TestCase):
                 "",
                 "{ not json",
                 "[1, 2, 3]",
-                {"error": "tool failed", **jetski_edit(opted_out, "a", "b")},
+                {"error": "tool failed", **target_replacement_edit(opted_out, "a", "b")},
                 {"toolCall": {"args": {"Path": str(tmp_dir / "Missing.lean")}}},
                 {"toolCall": {"args": {"Path": str(text_file)}}},
-                jetski_edit(opted_out, "  trivial\n", "  dsimp [wpMirExecSym]\n"),
+                target_replacement_edit(opted_out, "  trivial\n", "  dsimp [wpMirExecSym]\n"),
             ):
                 self.assertEqual(self.run_hook(payload, env), {}, payload)
 
@@ -3138,7 +3138,7 @@ class TestCliBenchmarkAndLivePrototypeSelfAudit(unittest.TestCase):
         # same way), so a slower or loaded host inflates budget and measurement alike instead
         # of flaking: the flat 5 ms / 1.75 us/line targets apply wherever this file lexes in
         # under 5 / 3 ms, and anywhere a cold waiver pass may cost 3x and a cold full 3-axis
-        # pass 10x the lexing pass (2.1x and 7.3x measured on a 2.2 GHz Xeon capsule, where
+        # pass 10x the lexing pass (2.1x and 7.3x measured on a 2.2 GHz Xeon host, where
         # both flat targets are out of reach even for the unmodified auditor).
         lex_ms = best_of_ms(lambda: audit._scan_lean_comments_and_strings(text), budget_ms=0.0)
         # Cold waiver pass (every module cache cleared before each timed run, what a fresh CLI

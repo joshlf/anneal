@@ -1019,7 +1019,7 @@ where
 }
 
 /// Upper bound (`1 year` in seconds) for `ANNEAL_MIRI_SETUP_TIMEOUT_SECS` and
-/// `ANNEAL_MIRI_SETUP_LOCK_TIMEOUT_SECS`, matching `run_capsule_diff_test.sh`
+/// `ANNEAL_MIRI_SETUP_LOCK_TIMEOUT_SECS`, bounding lock wait duration
 /// and preventing `Instant` / `flock -w` overflow on pathological inputs.
 const MAX_MIRI_SETUP_TIMEOUT_SECS: u64 = 31_536_000;
 

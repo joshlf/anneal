@@ -7,7 +7,7 @@ description: >-
   `lean_local_search`, `anneal_audit_preview`, `anneal_item_bridge`,
   `rust_diagnostics`, `rust_symbols_and_def`), zero-turn hooks, and the Live
   InfoView AuxPane. Use whenever writing, debugging, or auditing Lean 4 proofs
-  or Rust verification obligations in `anneal`, `anneal-private`, or `zerocopy`.
+  or Rust verification obligations in Anneal and downstream workspaces (such as `zerocopy`).
 ---
 
 # Interactive Lean 4 & Rust Verification with `anneal-lean` (`anneal-lsp`)
