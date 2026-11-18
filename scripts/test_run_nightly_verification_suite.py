@@ -2774,6 +2774,105 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     [(div_id, "proof_hole_introduced")],
                 )
 
+    def test_lean_source_stripping_caching_and_import_summary_scans(self) -> None:
+        # 1. The bulk-copying comment/literal stripper keeps the exact character-level
+        #    output: nested and doc block comments, line comments, escaped and raw
+        #    strings, character literals, primes, `r` ending an identifier, string gaps
+        #    (backslash-newline), and unterminated spans.
+        strip_cases = [
+            (
+                "theorem a : x = y := rfl -- trailing sorry\n",
+                "theorem a : x = y := rfl                  \n",
+            ),
+            (
+                "/- outer /- nested sorry -/ still -/ theorem b : P := h\n",
+                "                                     theorem b : P := h\n",
+            ),
+            ("/-- doc\n  sorry -/\ntheorem c : P := h", "       \n          \ntheorem c : P := h"),
+            (
+                'def s := "a\\"b sorry" ++ r#"raw "sorry" #"# ++ r"x"\n',
+                "def s :=              ++                    ++     \n",
+            ),
+            ("def ch := '\"' ++ '\\'' ++ \"q\"\n", "def ch :=     ++      ++    \n"),
+            ('def gap := "line\\\nnext"\nend', "def gap :=            \nend"),
+            ("theorem prime' : x' = y := rfl\n", "theorem prime' : x' = y := rfl\n"),
+            ('def r2 := sorr"y" ++ (r"z")\n', "def r2 := sorr    ++ (    )\n"),
+            ("/- unterminated sorry", " " * 21),
+            ('"unterminated sorry', " " * 19),
+            ("-- only a comment", " " * 17),
+        ]
+        for src, expected in strip_cases:
+            with self.subTest(strip=src):
+                self.assertEqual(suite._strip_lean_comments_and_strings(src), expected)
+
+        # 2. File metadata is cached by content: a same-size rewrite that keeps the
+        #    modification time is never served stale.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "Module.lean"
+            path.write_text("theorem a : x = y := sorry\n", encoding="utf-8")
+            before = path.stat()
+            self.assertEqual(suite._lean_file_hole_token_counts(path)["sorry"], 1)
+            path.write_text("theorem a : x = y := rfl  \n", encoding="utf-8")
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            after = path.stat()
+            self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+            self.assertEqual(suite._lean_file_hole_token_counts(path)["sorry"], 0)
+
+        # 3. An imported module's summary scan exports exactly what a full scan does
+        #    (holey declarations, unnamed holes, and definitions that reduce to a fixed
+        #    proposition), and a scan restricted to `resolution_symbols` analyzes only
+        #    those theorems.
+        modules = [
+            (
+                "def Trivial (p : CapturedMir) : Prop := True\n"
+                "def Closed : Prop := 0 < 1\n"
+                "def Chained (p : CapturedMir) : Prop := Trivial p ∧ Closed\n"
+                "theorem holeyThm : annealOutcome fooProg = 1 := sorry\n"
+                "theorem usesHole : annealOutcome fooProg = 1 := holeyThm\n"
+                "theorem clean : annealOutcome fooProg = 1 := rfl\n"
+                "structure Vacuous (p : CapturedMir) : Prop where\n"
+                "inductive Never : Prop\n"
+            ),
+            (
+                "theorem clean : annealOutcome fooProg = 1 := rfl\n"
+                "@[simp] theorem attrHole : miriOutcome fooProg = 1 := sorry\n"
+                "theorem later : annealOutcome fooProg = 2 := by simp\n"
+            ),
+            (
+                "axiom cheat : annealOutcome fooProg = 1\n"
+                "instance : Fact (annealOutcome fooProg = 1) := ⟨cheat⟩\n"
+                "theorem clean : annealOutcome fooProg = 1 := rfl\n"
+            ),
+        ]
+        for src in modules:
+            with self.subTest(module=src.splitlines()[0]):
+                full = suite._scan_lean_declarations_and_pins(src)
+                summary = suite._scan_lean_declarations_and_pins(src, summary_only=True)
+                for key in ("holey_names", "ambient_hole", "prop_def_inline"):
+                    self.assertEqual(summary[key], full[key], key)
+                self.assertEqual(
+                    (summary["resolutions"], summary["decl_statements"], summary["pins"]), ({}, {}, {})
+                )
+                only_clean = suite._scan_lean_declarations_and_pins(
+                    src, resolution_symbols=frozenset({"clean"})
+                )
+                self.assertEqual(set(only_clean["resolutions"]), {"clean"})
+                self.assertEqual(only_clean["resolutions"]["clean"], full["resolutions"]["clean"])
+        first = suite._scan_lean_declarations_and_pins(modules[0])
+        self.assertEqual(first["holey_names"], {"holeyThm", "usesHole"})
+        self.assertEqual(
+            {name: spec[2] for name, spec in first["prop_def_inline"].items()},
+            {
+                "Trivial": ["True"],
+                "Closed": ["(", "0", "<", "1", ")"],
+                "Chained": ["(", "True", "∧", "(", "0", "<", "1", ")", ")"],
+                "Vacuous": ["True"],
+                "Never": ["False"],
+            },
+        )
+        self.assertTrue(suite._scan_lean_declarations_and_pins(modules[1])["ambient_hole"])
+        self.assertTrue(suite._scan_lean_declarations_and_pins(modules[2])["ambient_hole"])
+
 
 if __name__ == "__main__":
     unittest.main()

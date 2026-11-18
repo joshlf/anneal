@@ -19,7 +19,7 @@ dashboard-ready JSON (`LATEST_DASHBOARD_STATE.json`, `completeness_history.jsonl
 reports.
 
 Profiles (`--profile`):
-  census-only  Fast (<5s) static/ledger completeness & correspondence census plus
+  census-only  Fast (seconds) static/ledger completeness & correspondence census plus
                lightweight offline lints (`correspondence_gaps.toml` / `minirust.lock.toml` /
                `check_semantic_sources.py`). Zero heavy Cargo/Lake builds.
   quick        Runs `census-only` plus a pre-flight `lake build Trusted Anneal MiniRust`,
@@ -1278,89 +1278,105 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
 ]
 
 
+# Top-level starts of a stripped span: a nested block comment, a line comment, a string,
+# a character literal, or a raw string literal (`r"..."`, `r#"..."#`, ...; an `r` that
+# does not end an identifier).
+_LEAN_STRIP_TOP_RE = re.compile(r"""/-|--|"|'|(?<![\w'!?»])r(?=#*")""")
+_LEAN_STRIP_BLOCK_RE = re.compile(r"/-|-/")
+_LEAN_STRIP_STRING_RE = re.compile(r'[\\"]')
+
+
+def _blank_keep_newlines(text: str) -> str:
+    """`text` with every character except `\\n` replaced by a space."""
+    if "\n" not in text:
+        return " " * len(text)
+    return "\n".join(" " * len(part) for part in text.split("\n"))
+
+
 def _strip_lean_comments_and_strings(src: str) -> str:
     """Strip Lean `--` line comments, nested `/- ... -/` block comments, and literals.
 
     Replaces stripped spans with spaces while preserving `\\n` so line-anchored
     declaration matching cannot be spoofed by commented-out theorems, docstrings,
-    or string literals (and handles `'\"'` character literals cleanly).
+    or string literals (and handles `'\"'` character literals cleanly). Copies the
+    unstripped text between stripped spans in bulk.
     """
     out: list[str] = []
     n = len(src)
     i = 0
-    block_depth = 0
     while i < n:
-        ch = src[i]
-        nxt = src[i + 1] if i + 1 < n else ""
-        if block_depth > 0:
-            if ch == "/" and nxt == "-":
-                block_depth += 1
-                out.append("  ")
-                i += 2
-            elif ch == "-" and nxt == "/":
-                block_depth -= 1
-                out.append("  ")
-                i += 2
-            else:
-                out.append("\n" if ch == "\n" else " ")
-                i += 1
-            continue
-        if ch == "/" and nxt == "-":
-            block_depth = 1
+        m = _LEAN_STRIP_TOP_RE.search(src, i)
+        if m is None:
+            out.append(src[i:])
+            break
+        start = m.start()
+        out.append(src[i:start])
+        tok = m.group(0)
+        if tok == "/-":
             out.append("  ")
-            i += 2
-            continue
-        if ch == "-" and nxt == "-":
-            while i < n and src[i] != "\n":
-                out.append(" ")
-                i += 1
-            continue
-        # Lean 4 raw string literals (`r"..."`, `r#"..."#`, `r##"..."##`) do not escape `\"`.
-        if ch == "r" and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] in "_'!?»")):
-            j = i + 1
-            while j < n and src[j] == "#":
-                j += 1
-            if j < n and src[j] == '"':
-                hashes = j - (i + 1)
-                closing = '"' + ("#" * hashes)
-                out.append(" " * (j - i + 1))
-                i = j + 1
-                while i < n:
-                    if src.startswith(closing, i):
-                        out.append(" " * len(closing))
-                        i += len(closing)
-                        break
-                    out.append("\n" if src[i] == "\n" else " ")
-                    i += 1
-                continue
-        if ch == '"':
-            out.append(" ")
-            i += 1
-            while i < n:
-                c = src[i]
-                if c == "\\":
-                    out.append("  " if i + 1 < n and src[i + 1] != "\n" else " ")
-                    i += 2
-                    continue
-                if c == '"':
-                    out.append(" ")
-                    i += 1
+            depth = 1
+            j = start + 2
+            while depth > 0:
+                bm = _LEAN_STRIP_BLOCK_RE.search(src, j)
+                if bm is None:
+                    out.append(_blank_keep_newlines(src[j:]))
+                    j = n
                     break
-                out.append("\n" if c == "\n" else " ")
-                i += 1
-            continue
-        # Handle Lean character literals like `'"'` or `'\''` so `'"'` does not open a string.
-        if ch == "'":
-            if i + 2 < n and src[i + 1] != "\\" and src[i + 2] == "'":
-                out.append("   ")
-                i += 3
-                continue
-            if i + 3 < n and src[i + 1] == "\\" and src[i + 3] == "'":
-                out.append("    ")
-                i += 4
-                continue
-        out.append(ch)
-        i += 1
+                out.append(_blank_keep_newlines(src[j : bm.start()]))
+                out.append("  ")
+                depth += 1 if bm.group(0) == "/-" else -1
+                j = bm.end()
+            i = j
+        elif tok == "--":
+            nl = src.find("\n", start)
+            end = n if nl < 0 else nl
+            out.append(" " * (end - start))
+            i = end
+        elif tok == "r":
+            # Lean 4 raw string literals (`r"..."`, `r#"..."#`, `r##"..."##`) do not
+            # escape `\\"`.
+            j = start + 1
+            while src[j] == "#":
+                j += 1
+            closing = '"' + "#" * (j - start - 1)
+            out.append(" " * (j - start + 1))
+            close_at = src.find(closing, j + 1)
+            if close_at < 0:
+                out.append(_blank_keep_newlines(src[j + 1 :]))
+                i = n
+            else:
+                out.append(_blank_keep_newlines(src[j + 1 : close_at]))
+                out.append(" " * len(closing))
+                i = close_at + len(closing)
+        elif tok == '"':
+            out.append(" ")
+            j = start + 1
+            while j < n:
+                sm = _LEAN_STRIP_STRING_RE.search(src, j)
+                if sm is None:
+                    out.append(_blank_keep_newlines(src[j:]))
+                    j = n
+                    break
+                out.append(_blank_keep_newlines(src[j : sm.start()]))
+                j = sm.start()
+                if src[j] == "\\":
+                    out.append("  " if j + 1 < n and src[j + 1] != "\n" else " ")
+                    j += 2
+                else:
+                    out.append(" ")
+                    j += 1
+                    break
+            i = j
+        # Lean character literals like `'"'` or `'\\''`, so `'"'` does not open a string.
+        elif start + 2 < n and src[start + 1] != "\\" and src[start + 2] == "'":
+            out.append("   ")
+            i = start + 3
+        elif start + 3 < n and src[start + 1] == "\\" and src[start + 3] == "'":
+            out.append("    ")
+            i = start + 4
+        else:
+            out.append("'")
+            i = start + 1
     return "".join(out)
 
 
@@ -2790,7 +2806,7 @@ def _lean_prop_def_body_truth(
     for _ in range(64):
         if allow_prop_tautology and toks and toks[0] == "by":
             rest = _lean_norm_expr_tokens(toks[1:])
-            if rest in (["trivial"], ["decide"] if False else []):
+            if rest == ["trivial"]:
                 return _LEAN_TRUTH_TRUE
             if len(rest) >= 2 and rest[0] in ("exact", "apply"):
                 toks = _lean_peel_let_have_show(rest[1:])
@@ -3313,6 +3329,8 @@ def _scan_lean_declarations_and_pins(
     external_holey_names: set[str] | frozenset[str] | None = None,
     external_ambient_hole: bool = False,
     external_prop_defs: dict[str, _PropDefSpec] | None = None,
+    resolution_symbols: frozenset[str] | None = None,
+    summary_only: bool = False,
 ) -> dict[str, Any]:
     """Tokenize comment/string-stripped Lean 4 source at bracket depth 0.
 
@@ -3321,12 +3339,37 @@ def _scan_lean_declarations_and_pins(
     `mutual ... end`, `section #exit`, `#exit'` non-truncation) and extracts:
       - `witness_symbols`: every declared witness-eligible constant name;
       - `resolutions`: `symbol -> list[(effective_namespace_parts, has_forbidden_modifier,
-        signature_problems)]` for `theorem` / `lemma` declarations;
-      - `decl_statements`: `symbol -> list[(effective_namespace_parts, statement)]`;
+        signature_problems)]` for `theorem` / `lemma` declarations (only of
+        `resolution_symbols`, when given), where `signature_problems`
+        (`_lean_signature_problems`) lists why the declaration states or proves nothing
+        (empty for a meaningful, hole-free theorem). The statement is checked with every
+        section `variable` binder in scope (any of them may be a hypothesis, by
+        `include` or by mention) and with the definitions that reduce to a fixed
+        proposition inlined (`_lean_prop_def_replacement`, `_lean_inline_prop_defs`:
+        this module's and `external_prop_defs`), and `hole_dependency` is added when
+        the declaration mentions a holey declaration (`holey_names`: a `sorry`, an
+        `axiom`, ... of this module or `external_holey_names`), or follows a hole that
+        proofs use unnamed (`ambient_hole`: an attributed holey declaration, a holey
+        `instance` / `macro` / `notation`, `set_option debug.skipKernelTC`, or
+        `external_ambient_hole`), or runs a lemma search such as `exact?` after any
+        holey declaration;
+      - `decl_statements`: `symbol -> list[(effective_namespace_parts, statement)]` for
+        every witness-eligible declaration, `statement` being its signature after the
+        name as space-joined rich tokens (`_lean_stmt_tokens`);
       - `pins`: `symbol -> list[(audit_active_namespace_parts, inline_qualifier_parts,
-        type_tokens, example_sig_tokens, var_sig_tokens, rhs_arg_tokens, ambient_hole)]`;
-      - `holey_names`, `ambient_hole`, `prop_def_inline`: module-outward summaries for
-        cross-file import propagation.
+        type_tokens, example_sig_tokens, var_sig_tokens, rhs_arg_tokens, ambient_hole)]`
+        for valid typed `example ... : <NonTrivialProp> := @?symbol <ident_args>*`
+        statement pins, where `example_sig_tokens` / `var_sig_tokens` are the rich
+        tokens (definitions inlined) of the `example`'s binders and type and of the
+        `variable` binders in scope, `rhs_arg_tokens` the arguments applied to
+        `symbol`, and `ambient_hole` whether an unnamed hole precedes the pin;
+      - `holey_names`, `ambient_hole`, `prop_def_inline`: the module's outward summaries,
+        which a module that imports it receives as `external_*`.
+
+    With `summary_only` (an imported module), only the outward summaries are exact:
+    `resolutions`, `decl_statements`, and `pins` are left empty, and a declaration
+    whose text holds no hole token and names no holey declaration (a superset regex
+    screen) is not tokenized unless it may define a proposition.
     """
     matches = list(_LEAN_TOKEN_RE.finditer(stripped_src))
     tokens = [m.group(0) for m in matches]
@@ -3371,6 +3414,7 @@ def _scan_lean_declarations_and_pins(
         prev = tokens[i - 1] if i > 0 else ""
         if tok in _LEAN_OPEN_BRACKETS:
             if tok == "@[" and depth == 0:
+                # Recorded like a modifier: the declaration it decorates has an attribute.
                 pending_mods.add("@[")
             depth += 1
             i += 1
@@ -3397,6 +3441,8 @@ def _scan_lean_declarations_and_pins(
             continue
 
         if tok == "variable":
+            # `variable` takes bracketed binders only; it scopes the next command when an
+            # `in` follows them, and the enclosing section otherwise.
             j = i + 1
             while j < n and tokens[j] in _LEAN_OPEN_BRACKETS and tokens[j] != "@[":
                 d2 = 0
@@ -3429,6 +3475,7 @@ def _scan_lean_declarations_and_pins(
                 t2 = tokens[j]
                 p2 = tokens[j - 1] if j > 0 else ""
                 if d2 == 0 and p2 != "." and t2 == "@[":
+                    # An attribute starts the next declaration.
                     pending_mods.clear()
                     cmd_next = j
                     break
@@ -3453,8 +3500,10 @@ def _scan_lean_declarations_and_pins(
             if tok == "attribute" and any(
                 _clean_lean_seg(t2) in holey_names for t2 in tokens[i + 1 : j]
             ):
+                # `attribute [simp] cheat` lets later proofs use the holey `cheat` unnamed.
                 ambient_hole = True
             if any(t2 in _LEAN_KERNEL_BYPASS_TOKENS for t2 in tokens[i + 1 : j]):
+                # `set_option debug.skipKernelTC true [in]`: later proofs go unchecked.
                 ambient_hole = True
             if cmd_next is None:
                 break
@@ -3503,6 +3552,7 @@ def _scan_lean_declarations_and_pins(
                 if scope_stack:
                     scope_stack.pop()
                 i += 1
+            # Section variables go out of scope with their section or namespace.
             variables = [(d, v) for d, v in variables if d <= len(scope_stack)]
             continue
 
@@ -3520,8 +3570,22 @@ def _scan_lean_declarations_and_pins(
                 inline_ns = segs[:-1]
                 eff_ns = inline_ns[1:] if (inline_ns and inline_ns[0] == "_root_") else (active_ns + inline_ns)
                 decl_end = _lean_decl_end_offset(tokens, spans, next_i, len(stripped_src))
-                sig_toks, body_toks = _split_lean_decl_text(stripped_src[spans[next_i - 1][1] : decl_end])
-                decl_statements.setdefault(sym, []).append((eff_ns, " ".join(sig_toks)))
+                decl_text = stripped_src[spans[next_i - 1][1] : decl_end]
+                if (
+                    summary_only
+                    and tok not in ("def", "abbrev", "structure", "inductive", "axiom")
+                    and _FAST_HOLE_SCREEN_RE.search(decl_text) is None
+                    and not (
+                        holey_names
+                        and not holey_names.isdisjoint(_FAST_IDENT_EXTRACT_RE.findall(decl_text))
+                    )
+                ):
+                    # No hole token and no holey name: nothing to record for an import.
+                    sig_toks, body_toks = [], []
+                else:
+                    sig_toks, body_toks = _split_lean_decl_text(decl_text)
+                if not summary_only:
+                    decl_statements.setdefault(sym, []).append((eff_ns, " ".join(sig_toks)))
                 direct_hole = tok == "axiom" or any(
                     t in _LEAN_HOLE_PROOF_TOKENS for t in [*sig_toks, *body_toks]
                 )
@@ -3534,6 +3598,7 @@ def _scan_lean_declarations_and_pins(
                     if direct_hole or uses_holey:
                         mutual_hole_ids.add(mid)
                     if mid in mutual_hole_ids:
+                        # A `mutual` block stands or falls together.
                         holey_names.update(mutual_decl_names[mid])
                 if tok in ("def", "abbrev") and body_toks:
                     replacement = _lean_prop_def_replacement(sig_toks, body_toks, prop_def_inline)
@@ -3545,7 +3610,11 @@ def _scan_lean_declarations_and_pins(
                     )
                     if replacement is not None:
                         prop_def_inline[sym] = replacement
-                if tok in _LEAN_RES_DECL_KINDS:
+                if (
+                    tok in _LEAN_RES_DECL_KINDS
+                    and not summary_only
+                    and (resolution_symbols is None or sym in resolution_symbols)
+                ):
                     problems = _lean_signature_problems(
                         _lean_inline_prop_defs(sig_toks, prop_def_inline),
                         body_toks,
@@ -3566,6 +3635,7 @@ def _scan_lean_declarations_and_pins(
                     for mid in active_mut:
                         res_mutual_tags.append((sym, entry_idx, mid))
                 if sym in holey_names and "@[" in mods:
+                    # `@[simp]` / `@[instance]` let later proofs use the hole unnamed.
                     ambient_hole = True
             i = max(next_i, i + 1)
             continue
@@ -3634,7 +3704,12 @@ def _scan_lean_declarations_and_pins(
                 rhs_toks = tokens[assign_idx + 1 : end_ex]
                 rhs_end_offset = spans[end_ex][0] if end_ex < n else len(stripped_src)
                 rhs_raw = stripped_src[spans[assign_idx][1] : rhs_end_offset]
-                if valid_type and rhs_toks and _LEAN_PIN_RHS_RE.fullmatch(rhs_raw) is not None:
+                if (
+                    not summary_only
+                    and valid_type
+                    and rhs_toks
+                    and _LEAN_PIN_RHS_RE.fullmatch(rhs_raw) is not None
+                ):
                     r_idx = 1 if rhs_toks[0] == "@" else 0
                     qsegs, r_next = _read_lean_qname(rhs_toks, r_idx)
                     if qsegs and not qsegs[-1].isdigit():
@@ -3666,6 +3741,7 @@ def _scan_lean_declarations_and_pins(
         if pending_mods:
             pending_mods.clear()
         if tok in _LEAN_OTHER_TOP_CMDS:
+            # A `variable ... in` prefix scopes only the command it precedes.
             pending_in_vars = []
             cmd_end = _lean_decl_end_offset(tokens, spans, i + 1, len(stripped_src))
             cmd_toks = _lean_stmt_tokens(stripped_src[spans[i][1] : cmd_end])
@@ -3901,18 +3977,26 @@ _FAST_PROP_OR_UNINHABITED_TYPE_RE = re.compile(
     r"\b(?:Prop|Type|Sort|False|Empty|PEmpty|Fin)\b"
 )
 _FAST_IDENT_EXTRACT_RE = re.compile(r"[^\W\d][\w'!?]*")
-# Cache keyed by `(resolved_path_str, mtime_ns, size)` ->
-# `(stripped_src, content_sha, header_imports, has_hole_screen_hit, cand_decl_idents, all_idents)`.
+# Content-addressed per-file metadata cache: sha256 of the raw file bytes ->
+# `(stripped_content_sha, stripped_src, header_imports, has_hole_screen_hit,
+# cand_decl_idents, all_idents)`. (Keyed by content, not by path and mtime, so a file
+# rewritten within one timestamp tick is never served stale.)
 _LEAN_FILE_META_CACHE: dict[
-    tuple[str, int, int],
+    bytes,
     tuple[bytes, str, tuple[str, ...], bool, dict[str, frozenset[str]], frozenset[str]],
 ] = {}
 # Content-addressed scan cache shared across calls and materialized baseline trees.
 _LEAN_SCAN_BY_HASH_CACHE: dict[
-    tuple[bytes, frozenset[str], bool, tuple[tuple[str, tuple[int, int, tuple[str, ...]]], ...]],
+    tuple[
+        bytes,
+        frozenset[str],
+        bool,
+        tuple[tuple[str, tuple[int, int, tuple[str, ...]]], ...],
+        frozenset[str] | None,
+        bool,
+    ],
     dict[str, Any],
 ] = {}
-
 
 def _scan_lean_cached(
     content_sha: bytes,
@@ -3921,11 +4005,21 @@ def _scan_lean_cached(
     external_holey_names: set[str] | frozenset[str] = frozenset(),
     external_ambient_hole: bool = False,
     external_prop_defs: dict[str, _PropDefSpec] | None = None,
+    resolution_symbols: frozenset[str] | None = None,
+    summary_only: bool = False,
 ) -> dict[str, Any]:
+    """`_scan_lean_declarations_and_pins`, memoized by content and scan context."""
     holey_frozen = frozenset(external_holey_names)
     defs_dict = external_prop_defs or {}
     defs_sig = tuple(sorted((k, (v[0], v[1], tuple(v[2]))) for k, v in defs_dict.items()))
-    key = (content_sha, holey_frozen, bool(external_ambient_hole), defs_sig)
+    key = (
+        content_sha,
+        holey_frozen,
+        bool(external_ambient_hole),
+        defs_sig,
+        resolution_symbols,
+        summary_only,
+    )
     cached = _LEAN_SCAN_BY_HASH_CACHE.get(key)
     if cached is not None:
         return cached
@@ -3934,6 +4028,8 @@ def _scan_lean_cached(
         external_holey_names=holey_frozen,
         external_ambient_hole=external_ambient_hole,
         external_prop_defs=defs_dict,
+        resolution_symbols=resolution_symbols,
+        summary_only=summary_only,
     )
     if len(_LEAN_SCAN_BY_HASH_CACHE) > 2048:
         _LEAN_SCAN_BY_HASH_CACHE.clear()
@@ -3998,19 +4094,14 @@ def _get_cached_lean_file_meta(
     path: Path,
 ) -> tuple[bytes, str, tuple[str, ...], bool, dict[str, frozenset[str]], frozenset[str]] | None:
     try:
-        st = path.stat()
+        raw_bytes = path.read_bytes()
     except OSError:
         return None
-    if not path.is_file():
-        return None
-    key = (str(path), st.st_mtime_ns, st.st_size)
+    key = hashlib.sha256(raw_bytes).digest()
     cached = _LEAN_FILE_META_CACHE.get(key)
     if cached is not None:
         return cached
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
+    raw = raw_bytes.decode("utf-8", errors="replace")
     stripped = _strip_lean_comments_and_strings(raw)
     content_sha = hashlib.sha256(stripped.encode("utf-8")).digest()
     unesc = _SIMPLE_GUILLEMET_UNESCAPE_RE.sub(r"\1", stripped) if "«" in stripped else stripped
@@ -4093,12 +4184,34 @@ def _relevant_target_idents(stripped_src: str, target_symbols: set[str]) -> set[
 def discover_correspondence_divergences(
     repo_root: Path, *, include_statements: bool = False
 ) -> dict[str, Any]:
-    """Check status of tracked correspondence divergences and `correspondence_gaps.toml`."""
+    """Check status of tracked correspondence divergences and `correspondence_gaps.toml`.
+
+    Each actionable entry is `open` while its witness is declared, and otherwise
+    `resolution_missing` (no resolution theorem in the expected namespace),
+    `resolution_invalid` (the resolution theorem's statement or proof is vacuous or
+    hole-riddled, see `_lean_signature_problems` and `_scan_lean_declarations_and_pins`;
+    the reasons are in `resolution_problems`), `resolution_unpinned` (no non-vacuous
+    statement pin; the rejected pins' reasons are in `resolution_pin_problems`), or
+    `resolved`. Resolution and pin modules are scanned with what their repo-local
+    imports export (`holey_names`, `ambient_hole`, `prop_def_inline`), so a vacuous
+    definition or a hole in an imported helper module counts as well.
+
+    With `include_statements`, every record also carries `witness_statements` and
+    `resolution_statements`: the signatures (space-joined `_lean_stmt_tokens`) of the
+    witness's declarations and of the resolution candidates, which the flip-direction
+    audit (`audit_flip_direction_transitions`) compares across checkouts."""
     actionable_open: list[dict[str, Any]] = []
     actionable_resolved: list[dict[str, Any]] = []
     modeling_choices: list[dict[str, Any]] = []
     plain_scan_cache: dict[Path, tuple[str, dict[str, Any]]] = {}
     import_scan_cache: dict[Path, tuple[str, dict[str, Any]]] = {}
+    # Only the tracked resolution theorems' statements are analyzed (the scans of
+    # imported modules need just their exported summaries).
+    tracked_res_syms = frozenset(
+        str(it["resolution_symbol"])
+        for it in TRACKED_CORRESPONDENCE_DIVERGENCES
+        if it.get("resolution_symbol")
+    )
     tracked_res_syms_by_file: dict[str, set[str]] = {}
     for it in TRACKED_CORRESPONDENCE_DIVERGENCES:
         rs = it.get("resolution_symbol")
@@ -4116,7 +4229,7 @@ def discover_correspondence_divergences(
         if meta is None:
             return None
         content_sha, stripped, _, _, _, _ = meta
-        scanned = _scan_lean_cached(content_sha, stripped)
+        scanned = _scan_lean_cached(content_sha, stripped, resolution_symbols=tracked_res_syms)
         plain_scan_cache[path] = (stripped, scanned)
         return stripped, scanned
 
@@ -4178,6 +4291,7 @@ def discover_correspondence_divergences(
                 external_holey_names=ext_holey,
                 external_ambient_hole=ext_ambient,
                 external_prop_defs=ext_defs,
+                summary_only=True,
             )
             ext_holey.update(dscanned["holey_names"])
             ext_ambient = ext_ambient or dscanned["ambient_hole"]
@@ -4189,6 +4303,7 @@ def discover_correspondence_divergences(
             external_holey_names=ext_holey,
             external_ambient_hole=ext_ambient,
             external_prop_defs=ext_defs,
+            resolution_symbols=tracked_res_syms,
         )
         import_scan_cache[path] = (stripped, scanned)
         return stripped, scanned
@@ -4209,6 +4324,9 @@ def discover_correspondence_divergences(
         resolution_problems: list[str] = []
         resolution_statements: list[str] = []
         rel_r = item.get("resolution_file", item["file"])
+        # Explicit namespace of the resolution theorem (and of its pin, when the pin lives
+        # in the same file) for files outside a `lean/` source root, whose path does not
+        # spell their namespace (`tests/mir/X.lean` declares `namespace Anneal.X`).
         res_ns = item.get("resolution_namespace")
         res_ns_parts = [seg for seg in res_ns.split(".") if seg] if res_ns else None
         if resolution_symbol:
@@ -4620,8 +4738,13 @@ def audit_flip_direction_transitions(baseline_root: Path, current_root: Path) ->
     already held next to the live witness in the baseline (`resolution_predates_flip`:
     it held while the divergence was live, so it cannot show that the divergence is
     gone), or when its witness, resolution, pin, or imported helper module gained a
-    proof hole anywhere (`proof_hole_introduced`). Returns `{"passed", "transitions",
-    "violations", ...}`."""
+    proof hole anywhere (`proof_hole_introduced`: a `sorry` / `admit` / `sorryAx` /
+    `native_decide` / `implemented_by` / `extern` / `debug.skipKernelTC` token, see
+    `_lean_file_hole_token_counts`, or an `axiom`, including when an already-resolved
+    theorem's statement is rewritten). Every transition from a non-`resolved` baseline
+    state into a `resolution_*` state is an `incomplete_flip` (a move back to `open`
+    restores a live witness and flips nothing), and every transition out of `resolved`
+    is a `flip_regressed`. Returns `{"passed", "transitions", "violations", ...}`."""
     base = discover_correspondence_divergences(baseline_root, include_statements=True)
     cur = discover_correspondence_divergences(current_root, include_statements=True)
 
