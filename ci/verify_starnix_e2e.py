@@ -10,8 +10,9 @@
 """Check the production Starnix proof and fresh implementation mutations.
 
 Source hashes bind this test to the original ten-file Fuchsia compilation.
-The witness producer is untrusted: its output must first prove actual source
-executions. A separate check then applies the fixed byte-reversal endpoints.
+Every proof source stays fixed: an execution proof that states no return value
+must first verify against each capture, baseline and mutated alike. A separate
+check then applies the fixed byte-reversal claims.
 """
 
 import argparse
@@ -21,14 +22,13 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.request
 
 
-# Retain raw streams before interpreting a receipt. A compiler crash,
-# timeout, or invalid generator output must not count as proof rejection.
+# Retain raw streams before interpreting a receipt. A compiler crash or
+# timeout must not count as proof rejection.
 def checked_command(command, directory, log_prefix):
     with log_prefix.with_suffix(".stdout").open("wb") as stdout:
         with log_prefix.with_suffix(".stderr").open("wb") as stderr:
@@ -100,12 +100,10 @@ def mutate(path, kind):
 
 
 def execution_request(request_path):
-    """Check the generated witnesses without assuming byte-reversal results."""
+    """Check source executions without assuming byte-reversal results."""
     request = json.loads(request_path.read_text())
     proof = request["proof"]
-    fixed_claim_modules = {
-        "ProductionClaims", "ProductionEndpoints", "Proof", "Spec",
-    }
+    fixed_claim_modules = {"ProductionClaims", "Proof", "Spec"}
     proof["sources"] = [source for source in proof["sources"]
                         if source["module"] not in fixed_claim_modules]
     proof["sources"] += [
@@ -129,25 +127,31 @@ def run(arguments, work):
     shutil.copytree(fixture / "proof", project / "proof")
     shutil.copyfile(fixture / "request.json", project / "request.json")
     fixed_sources = {path.name: path.read_bytes()
-                     for path in (project / "proof").glob("*.lean")
-                     if path.name != "ProductionSteps.lean"}
+                     for path in (project / "proof").glob("*.lean")}
+
+    def check_fixed_sources(directory, label):
+        # The proofs are not regenerated per capture. A change here would let
+        # a mutation be judged by a proof other than the one checked above.
+        current = {path.name: path.read_bytes()
+                   for path in (directory / "proof").glob("*.lean")}
+        if current != fixed_sources:
+            raise RuntimeError(f"fixed proof sources changed for {label}")
+
     start = time.monotonic()
     baseline = verification(arguments, project / "request.json", work / "baseline-artifacts",
                             work / "baseline", "selected_unit_verified")
     if len(baseline["sources"]) != 10 or len(baseline["selected"]) != 1:
         raise RuntimeError("production source/selection inventory changed")
-    # Positively exercise the same candidate producer used for mutations.
-    # Exact byte equality reuses the baseline's successful kernel check and
-    # prevents an invalid-Lean producer from satisfying only negative cases.
-    regenerated = work / "baseline-regenerated.lean"
-    generated = checked_command(
-        [sys.executable, str(project / "proof/generate_steps.py"),
-         str(work / "baseline-artifacts/capture/capture.json"), str(regenerated)],
-        project, work / "baseline-generator")
-    if generated or regenerated.read_bytes() != (project / "proof/ProductionSteps.lean").read_bytes():
-        raise RuntimeError("regenerated baseline differs from its verified witnesses")
+    # Positively exercise the execution proof that each mutation reuses, so
+    # that a proof broken for every capture cannot satisfy only the negative
+    # cases below.
+    baseline_execution = verification(
+        arguments, execution_request(project / "request.json"),
+        work / "baseline-checked-execution", work / "baseline-execution",
+        "selected_unit_verified")
+    check_fixed_sources(project, "baseline")
     results = {"baseline": {"status": baseline["status"],
-                             "regenerated_witnesses_match": True,
+                             "execution_status": baseline_execution["status"],
                              "request_sha256": baseline["request_sha256"],
                              "capture_sha256": baseline["capture_sha256"],
                              "timing_ms": baseline["timing_ms"]}}
@@ -158,42 +162,26 @@ def run(arguments, work):
         candidate = work / kind
         shutil.copytree(project, candidate)
         mutate(candidate / "source/api.rs", kind)
-        stale_artifacts = work / f"{kind}-original-witnesses"
-        verification(arguments, candidate / "request.json", stale_artifacts,
-                     work / f"{kind}-stale", "proof_failed")
-        # Refresh candidates against the changed AST, then positively check
-        # that exact module. Syntax, import, or transition failures must stop
-        # the test before it can credit rejection of the fixed property.
-        generated = checked_command(
-            [sys.executable, str(candidate / "proof/generate_steps.py"),
-             str(stale_artifacts / "capture/capture.json"),
-             str(candidate / "proof/ProductionSteps.lean")],
-            candidate, work / f"{kind}-generator")
-        if generated:
-            raise RuntimeError(f"candidate witness producer failed for {kind}")
-        if any((candidate / "proof" / name).read_bytes() != contents
-               for name, contents in fixed_sources.items()):
-            raise RuntimeError(f"fixed proof sources changed for {kind}")
-        witnesses = candidate / "proof/ProductionSteps.lean"
-        witness_sha256 = hashlib.sha256(witnesses.read_bytes()).hexdigest()
+        check_fixed_sources(candidate, kind)
+        # The unchanged execution proof must accept the mutated capture: it
+        # shows that the mutation still returns on every valid entry, so a
+        # rejection below concerns the fixed property rather than a capture
+        # that no longer runs. Syntax, import, or transition failures stop the
+        # test before it can credit that rejection.
         checked_execution = verification(
             arguments, execution_request(candidate / "request.json"),
             work / f"{kind}-checked-execution", work / f"{kind}-execution",
             "selected_unit_verified")
-        if hashlib.sha256(witnesses.read_bytes()).hexdigest() != witness_sha256:
-            raise RuntimeError(f"checked witnesses changed for {kind}")
         rejected = verification(arguments, candidate / "request.json",
-                                work / f"{kind}-fresh-witnesses",
-                                work / f"{kind}-fresh", "proof_failed")
-        if hashlib.sha256(witnesses.read_bytes()).hexdigest() != witness_sha256:
-            raise RuntimeError(f"checked witnesses changed for {kind}")
+                                work / f"{kind}-fixed-claims",
+                                work / f"{kind}-fixed", "proof_failed")
+        check_fixed_sources(candidate, kind)
         if rejected.get("phase") != "audit":
             raise RuntimeError(f"fixed property did not reach proof checking for {kind}")
         results[kind] = {"status": rejected["status"],
                          "phase": rejected["phase"],
-                         "fresh_witnesses": True,
                          "execution_status": checked_execution["status"],
-                         "witness_sha256": witness_sha256}
+                         "capture_sha256": checked_execution["capture_sha256"]}
     # Completion requires both positive execution checks and rejection of the
     # unchanged fixed property. Earlier logs alone establish neither outcome.
     summary = {"source_revision": pin["revision"], "results": results,

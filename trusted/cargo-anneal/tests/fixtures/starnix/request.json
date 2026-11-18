@@ -47,18 +47,8 @@
         "role": "proof"
       },
       {
-        "module": "ProductionEndpoints",
-        "path": "ProductionEndpoints.lean",
-        "role": "proof"
-      },
-      {
         "module": "ProductionClaims",
         "path": "ProductionClaims.lean",
-        "role": "proof"
-      },
-      {
-        "module": "ProductionSteps",
-        "path": "ProductionSteps.lean",
         "role": "proof"
       },
       {
