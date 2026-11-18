@@ -517,13 +517,13 @@ def mkBody (name : String) (decls : List LocalDecl) (bbs : List BasicBlockData)
 theorem w1_div_returns :
     AgreeReturnsBits (Witness.divBody 7) (annealMiriHooks (Witness.divBody 7))
       (initMachineState (Witness.divBody 7) []) (miriEntryState (Witness.divBody 7)) 1 1 :=
-  agreeReturnsBits_of_obs (N := 6) (M := 6) (by decide) (by decide)
+  agreeReturnsBits_of_obs (N := 6) (M := 6) (by decide +kernel) (by decide +kernel)
 
 /-- Division by zero is undefined behavior in both machines. -/
 theorem w1_div_by_zero_ub :
     AgreeUB (Witness.divBody 0) (annealMiriHooks (Witness.divBody 0))
       (initMachineState (Witness.divBody 0) []) (miriEntryState (Witness.divBody 0)) :=
-  agreeUB_of_obs (N := 6) (M := 6) (by decide) (by decide)
+  agreeUB_of_obs (N := 6) (M := 6) (by decide +kernel) (by decide +kernel)
 
 /-- `divBody d` is in the unconditional closed fragment for every divisor. -/
 theorem w1_div_inFragment (d : Nat) (hd : d < 256) : InSafeScalarFragment (Witness.divBody d) :=
@@ -540,14 +540,14 @@ theorem w1_switch_case :
     AgreeReturnsBits (Witness.lm12SwitchBody 7) (annealMiriHooks (Witness.lm12SwitchBody 7))
       (initMachineState (Witness.lm12SwitchBody 7) []) (miriEntryState (Witness.lm12SwitchBody 7))
       1 20 :=
-  agreeReturnsBits_of_obs (N := 4) (M := 4) (by decide) (by decide)
+  agreeReturnsBits_of_obs (N := 4) (M := 4) (by decide +kernel) (by decide +kernel)
 
 /-- `SwitchInt` falls back to `otherwise` (returning `30`) in both machines. -/
 theorem w1_switch_otherwise :
     AgreeReturnsBits (Witness.lm12SwitchBody 9) (annealMiriHooks (Witness.lm12SwitchBody 9))
       (initMachineState (Witness.lm12SwitchBody 9) []) (miriEntryState (Witness.lm12SwitchBody 9))
       1 30 :=
-  agreeReturnsBits_of_obs (N := 4) (M := 4) (by decide) (by decide)
+  agreeReturnsBits_of_obs (N := 4) (M := 4) (by decide +kernel) (by decide +kernel)
 
 /-- `lm12SwitchBody d` (a `SwitchInt` on `const d_u8` with cases `0`, `7`, and
 `otherwise`) is in the unconditional closed fragment for every `d`. -/
@@ -599,7 +599,7 @@ theorem w1_switch_treeSafe_iff_miriSafe (d : Nat) (hd : d < 256) :
 theorem w1_cast_sign_extend :
     AgreeReturnsBits Witness.lm12CastBody (annealMiriHooks Witness.lm12CastBody)
       (initMachineState Witness.lm12CastBody []) (miriEntryState Witness.lm12CastBody) 2 0xFFFF :=
-  agreeReturnsBits_of_obs (N := 3) (M := 3) (by decide) (by decide)
+  agreeReturnsBits_of_obs (N := 3) (M := 3) (by decide +kernel) (by decide +kernel)
 
 /-- `lm12CastBody` (an `IntToInt` cast) is in the unconditional closed fragment. -/
 theorem w1_cast_inFragment : InSafeScalarFragment Witness.lm12CastBody := by
@@ -644,14 +644,14 @@ def checkedAddBody (rhs : Nat) : CapturedMir :=
 theorem w1_checked_add_no_overflow :
     AgreeReturnsBits (checkedAddBody 35) (annealMiriHooks (checkedAddBody 35))
       (initMachineState (checkedAddBody 35) []) (miriEntryState (checkedAddBody 35)) 2 65535 :=
-  agreeReturnsBits_of_obs (N := 7) (M := 7) (by decide) (by decide)
+  agreeReturnsBits_of_obs (N := 7) (M := 7) (by decide +kernel) (by decide +kernel)
 
 /-- On overflow (`65500 + 36`), the failed assertion with `unwind: unreachable`
 is undefined behavior in both machines. -/
 theorem w1_checked_add_overflow_ub :
     AgreeUB (checkedAddBody 36) (annealMiriHooks (checkedAddBody 36))
       (initMachineState (checkedAddBody 36) []) (miriEntryState (checkedAddBody 36)) :=
-  agreeUB_of_obs (N := 7) (M := 7) (by decide) (by decide)
+  agreeUB_of_obs (N := 7) (M := 7) (by decide +kernel) (by decide +kernel)
 
 /-- A terminating conditional loop (`while i < 3 { i += 1 }`) in the
 unconditional fragment: a `SwitchInt` on the `bool` comparison exits the loop.
@@ -731,7 +731,7 @@ theorem w1_count_loop_returns :
       (miriSystem (annealMiriHooks countLoopBody)).Safe (miriEntryState countLoopBody)) ∧
     (∀ o, (miriSystem (annealMiriHooks countLoopBody)).ReachesOutcome
       (miriEntryState countLoopBody) o → o.isReturn ∨ ∃ e, o = .undefinedBehavior e) :=
-  ⟨agreeReturnsBits_of_obs (N := 24) (M := 24) (by decide) (by decide),
+  ⟨agreeReturnsBits_of_obs (N := 24) (M := 24) (by decide +kernel) (by decide +kernel),
     scalarFragment_treeSafe_iff_miriSafe countLoop_inFragment,
     scalarFragment_outcomes countLoop_inFragment⟩
 
@@ -970,13 +970,13 @@ def assumeBody (b : Bool) : CapturedMir :=
 theorem w6_assume_true :
     AgreeReturnsBits (assumeBody true) (annealMiriHooks (assumeBody true))
       (initMachineState (assumeBody true) []) (miriEntryState (assumeBody true)) 1 7 :=
-  agreeReturnsBits_of_obs (N := 4) (M := 4) (by decide) (by decide)
+  agreeReturnsBits_of_obs (N := 4) (M := 4) (by decide +kernel) (by decide +kernel)
 
 /-- `assume(false)` is undefined behavior in both machines. -/
 theorem w6_assume_false_ub :
     AgreeUB (assumeBody false) (annealMiriHooks (assumeBody false))
       (initMachineState (assumeBody false) []) (miriEntryState (assumeBody false)) :=
-  agreeUB_of_obs (N := 4) (M := 4) (by decide) (by decide)
+  agreeUB_of_obs (N := 4) (M := 4) (by decide +kernel) (by decide +kernel)
 
 /-- `exact_div::<u32>(a, 7)` (`bb0: _0 = exact_div(const a, const 7) -> bb1; bb1: return`). -/
 def exactDivBody (a : Nat) : CapturedMir :=
@@ -2067,7 +2067,7 @@ theorem w3_deref_null_ptr_read_ub :
     AgreeUB nullPtrReadEntryBody (annealMiriHooks nullPtrReadEntryBody)
       (initMachineState nullPtrReadEntryBody [])
       (miriEntryState nullPtrReadEntryBody) :=
-  agreeUB_of_obs (N := 5) (M := 5) (by decide) (by decide +kernel)
+  agreeUB_of_obs (N := 5) (M := 5) (by decide +kernel) (by decide +kernel)
 
 /-- Entry-to-UB MIR body for `ub_deref_null_ptr_write`:
 `StorageLive(_1); _1 = const (0 as *mut u64); (*_1) = const 99_u64; return`. -/
@@ -2095,7 +2095,7 @@ theorem w3_deref_null_ptr_write_ub :
     AgreeUB nullPtrWriteEntryBody (annealMiriHooks nullPtrWriteEntryBody)
       (initMachineState nullPtrWriteEntryBody [])
       (miriEntryState nullPtrWriteEntryBody) :=
-  agreeUB_of_obs (N := 5) (M := 5) (by decide) (by decide +kernel)
+  agreeUB_of_obs (N := 5) (M := 5) (by decide +kernel) (by decide +kernel)
 
 /-- Entry-to-return MIR body for RFC 2582 `&raw const (*ptr::null::<u64>())`
 (`step_rawPtr_deref_null_simulation`):
@@ -2128,7 +2128,7 @@ theorem w3_rawPtr_deref_null_reborrow_returns :
     AgreeReturnsBits nullPtrRawReborrowEntryBody (annealMiriHooks nullPtrRawReborrowEntryBody)
       (initMachineState nullPtrRawReborrowEntryBody [])
       (miriEntryState nullPtrRawReborrowEntryBody) 8 0 :=
-  agreeReturnsBits_of_obs (N := 5) (M := 5) (by decide) (by decide +kernel)
+  agreeReturnsBits_of_obs (N := 5) (M := 5) (by decide +kernel) (by decide +kernel)
 
 /-- Entry-prefixed 4-local MIR body (`bb0: StorageLive(_1.._3); _1 = 42_u64; goto bb1;
 bb1: stmts; term1; bb2: return`). -/
@@ -3656,7 +3656,7 @@ theorem w2_array_index_oob_ub :
       m₁ = r₂ at hsim₂
     cases hsim₂ with
     | ub m₂ msg =>
-      exact agreeUB_of_obs_path (N := 6) (by decide)
+      exact agreeUB_of_obs_path (N := 6) (by decide +kernel)
         ((MiriPath.of_runLoopFuel arrayIndexOob_prefix_miri).trans
           (.step hm₁ (frames_ne_of_eq_singleton htf₁) (.refl _))) hm₂ rfl
 
@@ -3670,7 +3670,7 @@ theorem w2_union_uninit_bytes_ub :
       (Witness.lm24InitAnneal 2) (Witness.lm24InitMiri 2) := by
   obtain ⟨m₁, m₂, m₃, msg, hm₁, _, hm₂, hrel₂, _, herr⟩ := Witness.lm24_copy_larger_field_ub
   obtain ⟨tf₂, htf₂, _⟩ := id hrel₂
-  exact agreeUB_of_obs_path (N := 3) (by decide)
+  exact agreeUB_of_obs_path (N := 3) (by decide +kernel)
     (.step hm₁ (frames_ne_of_step_ok_true hm₂) (.step hm₂ (frames_ne_of_eq_singleton htf₂) (.refl _)))
     herr rfl
 
@@ -4751,7 +4751,7 @@ whole program from their entry states (Anneal with `crate::five` as a callee). -
 theorem w5_call_return :
     AgreeReturnsBits callFiveBody (callHooks callFiveBody [fiveBody])
       (initMachineStateWithCallees callFiveBody [] [fiveBody]) (miriEntryState callFiveBody) 1 5 :=
-  agreeReturnsBits_of_obs (N := 8) (M := 8) (by decide) (by decide +kernel)
+  agreeReturnsBits_of_obs (N := 8) (M := 8) (by decide +kernel) (by decide +kernel)
 
 def protCallerBody : CapturedMir where
   defPath := "lm_4_3_witness::prot_caller"
@@ -5072,7 +5072,7 @@ def callStuckBody : CapturedMir :=
 theorem w5_callee_unreachable_ub :
     AgreeUB callStuckBody (callHooks callStuckBody [stuckBody])
       (initMachineStateWithCallees callStuckBody [] [stuckBody]) (miriEntryState callStuckBody) :=
-  agreeUB_of_obs (N := 4) (M := 4) (by decide) (by decide +kernel)
+  agreeUB_of_obs (N := 4) (M := 4) (by decide +kernel) (by decide +kernel)
 
 /-- Callee `crate::noret`: `bb0: return` with `_0` never written. -/
 def noRetBody : CapturedMir :=
@@ -5091,7 +5091,7 @@ def callNoRetBody : CapturedMir :=
 theorem w5_callee_uninit_return_ub :
     AgreeUB callNoRetBody (callHooks callNoRetBody [noRetBody])
       (initMachineStateWithCallees callNoRetBody [] [noRetBody]) (miriEntryState callNoRetBody) :=
-  agreeUB_of_obs (N := 4) (M := 4) (by decide) (by decide +kernel)
+  agreeUB_of_obs (N := 4) (M := 4) (by decide +kernel) (by decide +kernel)
 
 /-! ### Stage-1 multi-frame stack unwinding and indirect `FnPtr` calls from entry -/
 
@@ -5142,7 +5142,7 @@ theorem w5_unwind_cleanup_returns :
       (callHooks unwindCatchRootBody [unwindMidBody, unwindLeafBody])
       (initMachineStateWithCallees unwindCatchRootBody [] [unwindMidBody, unwindLeafBody])
       (miriEntryState unwindCatchRootBody) 1 77 :=
-  agreeReturnsBits_of_obs (N := 12) (M := 14) (by decide) (by decide +kernel)
+  agreeReturnsBits_of_obs (N := 12) (M := 14) (by decide +kernel) (by decide +kernel)
 
 /-- Root caller whose call to `crate::unwind_mid` carries `UnwindAction::Unreachable`. -/
 def unwindUnreachableRootBody : CapturedMir :=
@@ -5160,7 +5160,7 @@ theorem w5_unwind_unreachable_ub :
       (callHooks unwindUnreachableRootBody [unwindMidBody, unwindLeafBody])
       (initMachineStateWithCallees unwindUnreachableRootBody [] [unwindMidBody, unwindLeafBody])
       (miriEntryState unwindUnreachableRootBody) :=
-  agreeUB_of_obs (N := 8) (M := 10) (by decide) (by decide +kernel)
+  agreeUB_of_obs (N := 8) (M := 10) (by decide +kernel) (by decide +kernel)
 
 /-- Root caller whose call to `crate::unwind_mid` carries `UnwindAction::Continue`,
 so `UnwindResume` unwinds all the way past the root stack frame. -/
@@ -5270,7 +5270,7 @@ theorem w5_indirect_fnPtr_call_returns :
       (callHooks indirectCallFiveBody [fiveBody] [fiveFnPtrEntry])
       (initMachineStateWithCallees indirectCallFiveBody [] [fiveBody])
       (miriEntryState indirectCallFiveBody) 1 5 :=
-  agreeReturnsBits_of_obs (N := 12) (M := 12) (by decide) (by decide +kernel)
+  agreeReturnsBits_of_obs (N := 12) (M := 12) (by decide +kernel) (by decide +kernel)
 
 /-- The static function-pointer table `[fiveFnPtrEntry]` of
 `w5_indirect_fnPtr_call_returns` is the one Stage-1 builds: after

@@ -8,6 +8,7 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import Lean
 import MiniRustSpec.Correspondence.IntrinsicFallback
 import MiniRustSpec.Correspondence.DeinitBridge
 import Trusted.VerificationResult
@@ -103,6 +104,42 @@ open MiniRustSpec.LibSpecr
 open MiniRustSpec.Interp
 open MiniRustSpec.Correspondence.Witness
 
+local elab "kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq? | Lean.Meta.throwTacticEx `kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+private theorem runA_isSome_noUB (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : (runA body fuel s).isSome = true) : MirNoUBTree (mirTree body s) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p => exact runA_noUB body fuel s p.1 p.2 hr
+
+private theorem runA_exists_mem_sound (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (tr : List (Event MirEffect)) (v : Value)
+    (h : (runA body fuel s).map (fun (tr', o) =>
+      match o with
+      | .normal (v', _) => some (tr', v')
+      | _ => none) = some (some (tr, v))) :
+    ∃ mem, ReachesRet (mirTree body s) tr (.normal (v, mem)) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p =>
+    rcases p with ⟨tr', o⟩
+    cases o with
+    | normal vm =>
+      rcases vm with ⟨v', mem⟩
+      rw [hr] at h
+      injection h with h1
+      injection h1 with h2
+      injection h2 with htr hv
+      cases htr; cases hv
+      exact ⟨mem, runA_sound body fuel s _ _ hr⟩
+    | _ => rw [hr] at h; cases h
+
 /-! ## Shared building blocks -/
 
 def bdDecl (ty : Ty) : LocalDecl := { mutability := .mut, ty := ty, debugName := none }
@@ -194,7 +231,7 @@ theorem bdNullaryOp_ubChecks_contractChecks (locals : List LocalSlot) (idx : Lay
 /-- Anneal runs `bdUbChecksBody` to completion, returning `true`. -/
 theorem bdUbChecks_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree bdUbChecksBody []) [] (.normal (.scalar ⟨1, 1⟩, mem)) :=
-  ⟨_, runA_sound bdUbChecksBody 10 _ _ _ rfl⟩
+  runA_exists_mem_sound bdUbChecksBody 10 _ _ _ (by kernel_rfl)
 
 theorem bdNullaryOp_translateRvalue (layouts : Layout.LayoutTable) (decls : List LocalDecl)
     (targetTy : Option Ty) (op : NullOp) (ty : Ty) :
@@ -203,7 +240,7 @@ theorem bdNullaryOp_translateRvalue (layouts : Layout.LayoutTable) (decls : List
 theorem bdUbChecks_rejected :
     statementOk [boolDecl] (mkStmt (.assign (local_ 0) (.nullaryOp .ubChecks boolTy))) = false ∧
       inFragment bdUbChecksBody = false :=
-  ⟨rfl, by decide⟩
+  ⟨rfl, by decide +kernel⟩
 
 /-! ## 2. `StatementKind::Intrinsic(CopyNonOverlapping)` -/
 
@@ -246,13 +283,13 @@ def bdCopyBody (n : Nat) : CapturedMir :=
 theorem bdCopy0_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree (bdCopyBody 0) [.scalar ⟨7, 4⟩]) []
       (.normal (.scalar ⟨0, 4⟩, mem)) :=
-  ⟨_, runA_sound (bdCopyBody 0) 30 _ _ _ rfl⟩
+  runA_exists_mem_sound (bdCopyBody 0) 30 _ _ _ (by kernel_rfl)
 
 /-- `count = 1`: the argument `7` is copied into `_0` and returned. -/
 theorem bdCopy1_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree (bdCopyBody 1) [.scalar ⟨7, 4⟩]) []
       (.normal (.scalar ⟨7, 4⟩, mem)) :=
-  ⟨_, runA_sound (bdCopyBody 1) 30 _ _ _ rfl⟩
+  runA_exists_mem_sound (bdCopyBody 1) 30 _ _ _ (by kernel_rfl)
 
 /-- `count = 2`: the copy covers `2 * size_of::<u32>() = 8` bytes, but `_1`
 and `_0` are 4-byte locals, and the `copy_nonoverlapping` safety contract
@@ -261,11 +298,11 @@ Anneal nevertheless returns `7`, the same result as for `count = 1`. -/
 theorem bdCopy2_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree (bdCopyBody 2) [.scalar ⟨7, 4⟩]) []
       (.normal (.scalar ⟨7, 4⟩, mem)) :=
-  ⟨_, runA_sound (bdCopyBody 2) 30 _ _ _ rfl⟩
+  runA_exists_mem_sound (bdCopyBody 2) 30 _ _ _ (by kernel_rfl)
 
 /-- Anneal certifies the `count = 2` run free of UB. -/
 theorem bdCopy2_noUB : MirNoUBTree (mirCallTree (bdCopyBody 2) [.scalar ⟨7, 4⟩]) :=
-  runA_noUB (bdCopyBody 2) 30 _ _ _ rfl
+  runA_isSome_noUB (bdCopyBody 2) 30 _ (by kernel_rfl)
 
 /-- A `copy_nonoverlapping` with `count = 0` and two non-pointer operands. -/
 def bdCopyZeroScalars : MirAst.Statement :=
@@ -286,7 +323,7 @@ theorem bdCopy_translateStatement (decls : List LocalDecl) (src dst count : Oper
 /-- The fragment also has no type for the raw-pointer locals. -/
 theorem bdCopy_rejected :
     scalarTypeOf bdRawConstU32Ty = none ∧ inFragment (bdCopyBody 1) = false :=
-  ⟨rfl, by decide⟩
+  ⟨rfl, by decide +kernel⟩
 
 /-! ## 3. `BinOp::Offset` and `arith_offset` -/
 
@@ -312,7 +349,7 @@ one-past-the-end byte offset `offsetBytes = 4 = size_of::<u32>()`. -/
 theorem bdOffset1_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree (bdOffsetBody 1) [.scalar ⟨7, 4⟩]) []
       (.normal (.ptr ⟨1, 4⟩ 8, mem)) :=
-  ⟨_, runA_sound (bdOffsetBody 1) 30 _ _ _ rfl⟩
+  runA_exists_mem_sound (bdOffsetBody 1) 30 _ _ _ (by kernel_rfl)
 
 /-- `k = -1` (bits `2^64 - 1`): moving `-4` bytes before the start of `_1`
 faults with UB in Anneal, matching MiniRust's `InBounds::Yes` `ptr_offset`. -/
@@ -320,7 +357,7 @@ theorem bdOffsetNeg1_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree (bdOffsetBody 18446744073709551615) [.scalar ⟨7, 4⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound (bdOffsetBody 18446744073709551615) 30 _ rfl
+  faultsA_sound (bdOffsetBody 18446744073709551615) 30 _ (by kernel_rfl)
 
 theorem bdOffsetNeg1_not_noUB :
     ¬ MirNoUBTree (mirCallTree (bdOffsetBody 18446744073709551615) [.scalar ⟨7, 4⟩]) := by
@@ -337,7 +374,7 @@ theorem bdOffset_rejected :
       (translateRvalue ⟨64, true, []⟩ [bdDecl bdRawConstU32Ty, u32Decl] none
         (.binaryOp .offset (.copy (local_ 0)) (bdConstIsize 1))).isSome = true ∧
       inFragment (bdOffsetBody 1) = false :=
-  ⟨rfl, rfl, by decide⟩
+  ⟨rfl, rfl, by decide +kernel⟩
 
 /-- MIR of `fn arith_offset_caller(p: *const u32, k: isize) -> *const u32`,
 which calls `core::intrinsics::arith_offset::<u32>(p, k)`. Anneal's
@@ -354,7 +391,7 @@ def bdArithOffsetArgs : List Value := [.ptr ⟨1, 0⟩ 8, .scalar ⟨1, 8⟩]
 theorem bdArithOffset_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree bdArithOffsetCaller bdArithOffsetArgs) []
       (.normal (.ptr ⟨1, 4⟩ 8, mem)) :=
-  ⟨_, runA_sound bdArithOffsetCaller 10 _ _ _ rfl⟩
+  runA_exists_mem_sound bdArithOffsetCaller 10 _ _ _ (by kernel_rfl)
 
 /-! ## 4. Intrinsic calls without a body in `callees` -/
 
@@ -458,12 +495,12 @@ theorem bdColdPath_extCall :
 theorem bdCtpop_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree bdCtpopCaller bdCtpopArgs) []
       (.normal (.scalar ⟨4, 4⟩, mem)) :=
-  ⟨_, runA_sound bdCtpopCaller 10 _ _ _ rfl⟩
+  runA_exists_mem_sound bdCtpopCaller 10 _ _ _ (by kernel_rfl)
 
 theorem bdExactDivI32_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree bdExactDivI32Caller bdExactDivArgs) []
       (.normal (.scalar ⟨4294967294, 4⟩, mem)) :=
-  ⟨_, runA_sound bdExactDivI32Caller 10 _ _ _ rfl⟩
+  runA_exists_mem_sound bdExactDivI32Caller 10 _ _ _ (by kernel_rfl)
 
 /-- Anneal: `core::intrinsics::abort` is recognized in `isAbortingPanicDefPath`
 and terminates with `MirStepNode.retOutcome .abort`, matching MiniRust's
@@ -726,8 +763,8 @@ theorem bdCtpop_inline :
       (∃ mem, ReachesRet (mirCallTree bdCtpopI8Caller [.scalar ⟨255, 1⟩]) []
         (.normal (.scalar ⟨8, 4⟩, mem))) ∧
       evalUnOp (.Int .CountOnes) (.Int (-1), .Int IntType.I8) = .ok (.Int 8, .Int u32) :=
-  ⟨⟨_, runA_sound bdCtpopCaller 10 _ _ _ rfl⟩, rfl,
-   ⟨_, runA_sound bdCtpopI8Caller 10 _ _ _ rfl⟩, rfl⟩
+  ⟨runA_exists_mem_sound bdCtpopCaller 10 _ _ _ (by kernel_rfl), rfl,
+   runA_exists_mem_sound bdCtpopI8Caller 10 _ _ _ (by kernel_rfl), rfl⟩
 
 /-- Anneal's inline `evalDirectExactDiv` on `bdExactDivI32Caller` and
 `bdExactDivU32Caller` matches MiniRust's `IntBinOp::DivExact` across exact
@@ -751,11 +788,11 @@ theorem bdExactDiv_inline :
         FaultNow u) ∧
       evalBinOp (.Int .DivExact) (.Int (-2147483648), .Int i32) (.Int (-1), .Int i32) =
         .error (.ub "overflow in division") :=
-  ⟨⟨_, runA_sound bdExactDivI32Caller 10 _ _ _ rfl⟩,
-   faultsA_sound bdExactDivU32Caller 10 _ rfl,
-   faultsA_sound bdExactDivI32Caller 10 _ rfl,
+  ⟨runA_exists_mem_sound bdExactDivI32Caller 10 _ _ _ (by kernel_rfl),
+   faultsA_sound bdExactDivU32Caller 10 _ (by kernel_rfl),
+   faultsA_sound bdExactDivI32Caller 10 _ (by kernel_rfl),
    rfl,
-   faultsA_sound bdExactDivI32Caller 10 _ rfl,
+   faultsA_sound bdExactDivI32Caller 10 _ (by kernel_rfl),
    rfl⟩
 
 /-- Symbolic correspondence between `exactDivHandler it` and MiniRust's
@@ -838,7 +875,7 @@ and `progInFragment` rejects the caller (`bdExtCallers_rejected`). -/
 theorem bdWriteBytes_untracked_not_noUB :
     ¬ MirNoUBTree (mirCallTree bdWriteBytesCaller bdWriteBytesArgs) := by
   obtain ⟨tr, u, hr, hf⟩ :=
-    faultsA_sound bdWriteBytesCaller 1 (initMachineState bdWriteBytesCaller bdWriteBytesArgs) rfl
+    faultsA_sound bdWriteBytesCaller 1 (initMachineState bdWriteBytesCaller bdWriteBytesArgs) (by kernel_rfl)
   exact fun hsafe => hsafe tr u hr hf
 
 /-- `fn ub_checks_call_caller() -> bool`, calling `core::intrinsics::ub_checks`
@@ -853,7 +890,7 @@ assertions in Anneal. -/
 theorem bdUbChecksCall_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree bdUbChecksCallCaller []) []
       (.normal (.scalar ⟨1, 1⟩, mem)) :=
-  ⟨_, runA_sound bdUbChecksCallCaller 10 _ _ _ rfl⟩
+  runA_exists_mem_sound bdUbChecksCallCaller 10 _ _ _ (by kernel_rfl)
 
 /-- Session-parameterized `ExternalCallHandler` for external calls to
 `core::intrinsics::ub_checks`: returns `flag` as a 1-byte scalar (`0` or `1`)
@@ -895,7 +932,7 @@ theorem bdUnreach_anneal_ub :
 
 theorem bdUnreach_anneal_fault :
     ∃ tr u, Reaches (mirCallTree bdUnreachCaller []) tr u ∧ FaultNow u :=
-  faultsA_sound bdUnreachCaller 1 _ rfl
+  faultsA_sound bdUnreachCaller 1 _ (by kernel_rfl)
 
 /-- MiniRust's `Terminator::Unreachable` raises UB in every machine
 (`Interp.evalTerminator`). -/
@@ -904,7 +941,7 @@ theorem bd_minirust_unreachable_ub (m : Mach) :
 
 theorem bdUnreach_rejected :
     progInFragment bdUnreachCaller [] = false ∧ translateProg bdUnreachCaller [] = none :=
-  ⟨by decide, rfl⟩
+  ⟨by decide +kernel, rfl⟩
 
 /-- The fragment does cover MIR's own `TerminatorKind::Unreachable`, which
 translates to MiniRust's `Terminator::Unreachable`. -/
@@ -932,7 +969,7 @@ theorem bdPolymorphicCallee_rejected :
           [u32Decl, u32Decl] (fbAbi [u32Layout] u32Layout))
         [fbBlackBoxCallee] = false ∧
       progInFragment fbBlackBoxCaller [{ fbBlackBoxCallee with typeParamCount := 1 }] = false :=
-  ⟨rfl, rfl, rfl, rfl, by decide, by decide⟩
+  ⟨rfl, rfl, rfl, rfl, by decide +kernel, by decide +kernel⟩
 
 /-- Runtime fail-closed execution for polymorphic callee mismatches in Anneal's
 `stepMirFn`:
@@ -1002,7 +1039,7 @@ theorem bdUnmonoParamAliasBody_failClosed :
       stepMirFn (bdUnmonoCastBody (.alias "T::Item" []))
         (initMachineState (bdUnmonoCastBody (.alias "T::Item" [])) [.scalar ⟨7, 4⟩]) =
         MirStepNode.unsupported :=
-  ⟨by decide, rfl, rfl, by decide, rfl, rfl⟩
+  ⟨by decide +kernel, rfl, rfl, by decide +kernel, rfl, rfl⟩
 
 /-! ## 7. Lowered `LIntrinsicOp` / `LCallTarget` boundary correspondence (`DeinitBridge`) -/
 
@@ -1370,7 +1407,7 @@ theorem evalLIntrinsic_abort_minirust_correspondence
       Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::intrinsics::abort" =
         some .abort ∧
       isAbortingPanicDefPath "core::intrinsics::abort" = true := by
-  refine ⟨rfl, ?_, fun t => ?_, rfl, by decide⟩
+  refine ⟨rfl, ?_, fun t => ?_, rfl, by decide +kernel⟩
   · simp only [Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall]
     cases Anneal.Mir.AdtAndControl.unwindActionOk body inCleanup unwind <;> rfl
   · simp only [Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall]
@@ -1397,7 +1434,7 @@ theorem evalLIntrinsic_unreachable_minirust_correspondence
         some .unreachableUnchecked ∧
       isUnreachableCallTarget "core::hint::unreachable_unchecked" = true ∧
       isUnreachableCallTarget "core::intrinsics::unreachable" = true :=
-  ⟨rfl, rfl, rfl, rfl, by decide, by decide⟩
+  ⟨rfl, rfl, rfl, rfl, by decide +kernel, by decide +kernel⟩
 
 /-- **`ctlz_nonzero` / `cttz_nonzero` against MiniRust's `IntrinsicOp::Assume`
 (`evalLIntrinsic_nonzero_minirust_assume`)**: across every integer width (`GoodSize`) and valid
@@ -1575,7 +1612,7 @@ theorem leValue_lt : ∀ (xs : List UInt8), Interp.leValue xs < 256 ^ xs.length
 
 private theorem uint8_ofNat_mod_256 (u : Nat) : (UInt8.ofNat (u % 256)).toNat = u % 256 := by
   rw [UInt8.toNat_ofNat']
-  exact Nat.mod_eq_of_lt (Nat.mod_lt u (by decide))
+  exact Nat.mod_eq_of_lt (Nat.mod_lt u (by decide +kernel))
 
 /-- `Interp.leBytes (Interp.leValue xs) xs.length = xs` for every byte list `xs`. -/
 theorem leBytes_leValue : ∀ (xs : List UInt8), Interp.leBytes (Interp.leValue xs) xs.length = xs
@@ -2002,8 +2039,8 @@ theorem evalLIntrinsic_saturating_valOf_minirust
     have hp : (2 : Int) ^ (8 * it.size.bytes) = ((2 ^ (8 * it.size.bytes) : Nat) : Int) := by
       push_cast; rfl
     have hHalfLt : 2 ^ (8 * it.size.bytes - 1) < 2 ^ (8 * it.size.bytes) :=
-      Nat.pow_lt_pow_right (by decide) (by omega)
-    have hPowPos : 0 < 2 ^ (8 * it.size.bytes) := Nat.pow_pos (by decide)
+      Nat.pow_lt_pow_right (by decide +kernel) (by omega)
+    have hPowPos : 0 < 2 ^ (8 * it.size.bytes) := Nat.pow_pos (by decide +kernel)
     cases hRep : IntType.can_represent it
         (intCheckedArith (if isSub then .Sub else .Add) (intFromBits x it) (intFromBits y it))
     · simp only [ValidBits, Bool.false_eq_true, ↓reduceIte]
@@ -2022,8 +2059,8 @@ theorem evalLIntrinsic_saturating_valOf_minirust
     rcases it with ⟨s, ⟨sz⟩⟩
     dsimp only [valOf, intTypeMinVal, intTypeMaxVal] at hgood hx hy ⊢
     congr 1
-    have hBitsPos : 0 < 8 * sz := Nat.mul_pos (by decide) hgood.pos
-    have hHalfPos : 0 < 2 ^ (8 * sz - 1) := Nat.pow_pos (by decide)
+    have hBitsPos : 0 < 8 * sz := Nat.mul_pos (by decide +kernel) hgood.pos
+    have hHalfPos : 0 < 2 ^ (8 * sz - 1) := Nat.pow_pos (by decide +kernel)
     have hTwoHalfNat : 2 ^ (8 * sz) = 2 * 2 ^ (8 * sz - 1) := by
       obtain ⟨m, hm⟩ : ∃ m, 8 * sz = m + 1 := ⟨8 * sz - 1, by omega⟩
       rw [hm, Nat.add_sub_cancel, Nat.pow_succ, Nat.mul_comm]
@@ -2225,7 +2262,7 @@ theorem evalLIntrinsic_sizeOfVal_alignOfVal_minirust_layout
     | int i => cases i <;> cases hrk <;> exact ⟨rfl, rfl, rfl⟩
     | _ => simp [intTyBytes] at hrk
   obtain ⟨hMrAlign, hSzRk, hAlRk⟩ := hProps
-  have hHalf8 : signedHalfModulus 8 = 2 ^ 63 := by decide
+  have hHalf8 : signedHalfModulus 8 = 2 ^ 63 := by decide +kernel
   have hSlice : evalSliceSizeOfVal it.size.bytes ⟨len, 8⟩ =
       if len * it.size.bytes < 2 ^ 63 then some ⟨len * it.size.bytes, 8⟩ else none := by
     unfold evalSliceSizeOfVal
@@ -2312,7 +2349,7 @@ theorem evalLIntrinsic_panicUnwind_minirust_correspondence
       some .panicUnwind ∧
     Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::panicking::assert_failed" =
       some .panicUnwind := by
-  refine ⟨rfl, fun _ => ?_, by decide, by decide, by decide⟩
+  refine ⟨rfl, fun _ => ?_, by decide +kernel, by decide +kernel, by decide +kernel⟩
   simp only [Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall]
 
 /-- **Extended negative controls (`minirust_bitops_char_and_layout_negative_controls`)**:
@@ -2398,7 +2435,7 @@ theorem evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout
       (if len < 2 ^ 63 then some (.scalar ⟨1, 8⟩) else none) := by
   have hLenWrap : wrapScalarBits len (scalarModulus 8) = len := by
     rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hlen]
-  have hHalf8 : signedHalfModulus 8 = 2 ^ 63 := by decide
+  have hHalf8 : signedHalfModulus 8 = 2 ^ 63 := by decide +kernel
   have hSlice1 : evalSliceSizeOfVal 1 ⟨len, 8⟩ =
       if len < 2 ^ 63 then some ⟨len, 8⟩ else none := by
     unfold evalSliceSizeOfVal
@@ -2521,7 +2558,7 @@ theorem lintrinsicOp_exhaustive_minirust_classification :
     (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .symbolicBitAndFallback)).length = 5 ∧
     (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .callFormMemory)).length = 2 ∧
     (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .trustedOnlyUnwind)).length = 1 := by
-  refine ⟨rfl, by decide, fun op => ?_, rfl, rfl, rfl, rfl⟩
+  refine ⟨rfl, by decide +kernel, fun op => ?_, rfl, rfl, rfl, rfl⟩
   cases op <;> decide
 
 end AdvEp2B4
