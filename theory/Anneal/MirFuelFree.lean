@@ -852,6 +852,7 @@ theorem checkMirBoolExecBounded_mono
     | succ f₂' =>
       have h_le' : f₁' ≤ f₂' := Nat.le_of_succ_le_succ h_le
       unfold checkMirBoolExecBounded at h ⊢
+      simp only [Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirStatePeriodic_eq] at h ⊢
       revert h
       cases stepMirState body st with
       | ret out =>

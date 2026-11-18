@@ -2538,6 +2538,346 @@ theorem wrapScalarBits_of_ble_false
 
 /-! ## 5. Computable Fast-Path Checkers & Bidirectional `MirBoolPredicateHolds` -/
 
+@[reducible]
+def strictBool : Bool → Option Bool
+  | false => .some false
+  | true => .some true
+
+private theorem strictBool_eq : ∀ (b : Bool), strictBool b = .some b
+  | false => rfl
+  | true => rfl
+
+@[reducible]
+def strictBits : Nat → Nat → Option Nat
+  | .zero, n => .some n
+  | .succ k, n =>
+    match Nat.beq n 0 with
+    | true => .some 0
+    | false =>
+      match strictBits k (n / 2), Nat.beq (n % 2) 0 with
+      | .some q, true => .some (2 * q)
+      | .some q, false => .some (2 * q + 1)
+      | .none, _ => .none
+
+private theorem strictBits_eq : ∀ (k n : Nat), strictBits k n = .some n
+  | .zero, _ => rfl
+  | .succ k, n => by
+    unfold strictBits
+    rw [strictBits_eq k (n / 2)]
+    cases h0 : Nat.beq n 0
+    · cases hm : Nat.beq (n % 2) 0
+      · dsimp only
+        have hm' : n % 2 ≠ 0 := fun hc => by
+          rw [hc] at hm
+          nomatch hm
+        exact congrArg Option.some (by omega)
+      · dsimp only
+        have hm' : n % 2 = 0 := Nat.eq_of_beq_eq_true hm
+        exact congrArg Option.some (by omega)
+    · dsimp only
+      exact congrArg Option.some (Nat.eq_of_beq_eq_true h0).symm
+
+@[reducible]
+def strictOpt {α : Type} : Option α → Option (Option α)
+  | .none => .some .none
+  | .some x => .some (.some x)
+
+private theorem strictOpt_eq {α : Type} : ∀ (o : Option α), strictOpt o = .some o
+  | .none => rfl
+  | .some _ => rfl
+
+@[reducible]
+def strictOptNat : Option Nat → Option (Option Nat)
+  | .none => .some .none
+  | .some n =>
+    match strictBits 32 n with
+    | .some n' => .some (.some n')
+    | .none => .none
+
+private theorem strictOptNat_eq : ∀ (o : Option Nat), strictOptNat o = .some o
+  | .none => rfl
+  | .some n => by
+    unfold strictOptNat
+    dsimp only
+    rw [strictBits_eq 32 n]
+
+@[reducible]
+def strictList {α : Type} : List α → Option (List α)
+  | .nil => .some .nil
+  | x :: xs =>
+    match strictList xs with
+    | .some xs' => .some (x :: xs')
+    | .none => .none
+
+private theorem strictList_eq {α : Type} : ∀ (xs : List α), strictList xs = .some xs
+  | .nil => rfl
+  | _ :: xs => by
+    unfold strictList
+    rw [strictList_eq xs]
+
+@[reducible]
+def strictPerm : TreeBorrowPerm → Option TreeBorrowPerm
+  | .cell => .some .cell
+  | .reservedFrz b =>
+    match strictBool b with
+    | .some b' => .some (.reservedFrz b')
+    | .none => .none
+  | .reservedIM => .some .reservedIM
+  | .unique => .some .unique
+  | .frozen => .some .frozen
+  | .disabled => .some .disabled
+
+private theorem strictPerm_eq : ∀ (p : TreeBorrowPerm), strictPerm p = .some p
+  | .cell => rfl
+  | .reservedFrz b => by
+    unfold strictPerm
+    dsimp only
+    rw [strictBool_eq b]
+  | .reservedIM => rfl
+  | .unique => rfl
+  | .frozen => rfl
+  | .disabled => rfl
+
+@[reducible]
+def strictBorrowEntry (e : BorrowEntry) : Option BorrowEntry :=
+  match strictBits 32 e.tag, strictBits 16 e.targetLocal, strictList e.targetProjection, strictPerm e.perm with
+  | .some tag', .some loc', .some proj', .some perm' =>
+    match strictBits 64 e.rangeOffset, strictBits 64 e.rangeLen, strictOptNat e.protector with
+    | .some roff', .some rlen', .some prot' =>
+      match strictOptNat e.parentTag, strictBits 16 e.targetFrameDepth, strictBool e.allocDead with
+      | .some ptag', .some depth', .some dead' =>
+        .some
+          { tag := tag'
+            targetLocal := loc'
+            targetProjection := proj'
+            perm := perm'
+            rangeOffset := roff'
+            rangeLen := rlen'
+            protector := prot'
+            parentTag := ptag'
+            targetFrameDepth := depth'
+            allocDead := dead' }
+      | _, _, _ => .none
+    | _, _, _ => .none
+  | _, _, _, _ => .none
+
+private theorem strictBorrowEntry_eq (e : BorrowEntry) : strictBorrowEntry e = .some e := by
+  cases e
+  unfold strictBorrowEntry
+  dsimp only
+  rw [strictBits_eq, strictBits_eq, strictList_eq, strictPerm_eq,
+      strictBits_eq, strictBits_eq, strictOptNat_eq, strictOptNat_eq,
+      strictBits_eq, strictBool_eq]
+
+@[reducible]
+def strictBorrows : List BorrowEntry → Option (List BorrowEntry)
+  | .nil => .some .nil
+  | e :: rest =>
+    match strictBorrowEntry e, strictBorrows rest with
+    | .some e', .some rest' => .some (e' :: rest')
+    | _, _ => .none
+
+private theorem strictBorrows_eq : ∀ (bs : List BorrowEntry), strictBorrows bs = .some bs
+  | .nil => rfl
+  | e :: rest => by
+    unfold strictBorrows
+    rw [strictBorrowEntry_eq e, strictBorrows_eq rest]
+
+@[reducible]
+def mapStrictList {α : Type} (f : α → Option α) : List α → Option (List α)
+  | .nil => .some .nil
+  | x :: xs =>
+    match f x, mapStrictList f xs with
+    | .some x', .some xs' => .some (x' :: xs')
+    | _, _ => .none
+
+private theorem mapStrictList_eq {α : Type} (f : α → Option α) (hf : ∀ x, f x = .some x) :
+    ∀ (xs : List α), mapStrictList f xs = .some xs
+  | .nil => rfl
+  | x :: xs => by
+    unfold mapStrictList
+    rw [hf x, mapStrictList_eq f hf xs]
+
+@[reducible]
+def strictValue : Nat → Value → Option Value
+  | .zero, v => .some v
+  | .succ _, .unit => .some .unit
+  | .succ _, .uninit => .some .uninit
+  | .succ _, .scalar sc =>
+    match strictBits 128 sc.bits, strictBits 16 sc.sizeBytes with
+    | .some b', .some sz' => .some (.scalar ⟨b', sz'⟩)
+    | _, _ => .none
+  | .succ _, .ptr p sz =>
+    match strictBits 64 p.allocId, strictBits 64 p.offsetBytes, strictBits 16 sz with
+    | .some a', .some o', .some sz' => .some (.ptr ⟨a', o'⟩ sz')
+    | _, _, _ => .none
+  | .succ d, .aggregate v fs =>
+    match strictBits 16 v, mapStrictList (strictValue d) fs with
+    | .some v', .some fs' => .some (.aggregate v' fs')
+    | _, _ => .none
+
+private theorem strictValue_eq : ∀ (d : Nat) (v : Value), strictValue d v = .some v
+  | .zero, _ => rfl
+  | .succ d, v => by
+    cases v with
+    | unit => rfl
+    | uninit => rfl
+    | scalar sc =>
+      cases sc
+      unfold strictValue
+      dsimp only
+      rw [strictBits_eq, strictBits_eq]
+    | ptr p sz =>
+      cases p
+      unfold strictValue
+      dsimp only
+      rw [strictBits_eq, strictBits_eq, strictBits_eq]
+    | aggregate v fs =>
+      unfold strictValue
+      rw [strictBits_eq, mapStrictList_eq (strictValue d) (strictValue_eq d) fs]
+
+@[reducible]
+def strictSlotsAt (argCount idx : Nat) : List LocalSlot → Option (List LocalSlot)
+  | .nil => .some .nil
+  | .dead :: rest =>
+    match strictSlotsAt argCount (.succ idx) rest with
+    | .some rest' => .some (.dead :: rest')
+    | .none => .none
+  | .uninit :: rest =>
+    match strictSlotsAt argCount (.succ idx) rest with
+    | .some rest' => .some (.uninit :: rest')
+    | .none => .none
+  | .init v :: rest =>
+    match Bool.and (Nat.ble 1 idx) (Nat.ble idx argCount) with
+    | true =>
+      match strictSlotsAt argCount (.succ idx) rest with
+      | .some rest' => .some (.init v :: rest')
+      | .none => .none
+    | false =>
+      match strictValue 16 v, strictSlotsAt argCount (.succ idx) rest with
+      | .some v', .some rest' => .some (.init v' :: rest')
+      | _, _ => .none
+
+private theorem strictSlotsAt_eq (argCount : Nat) :
+    ∀ (idx : Nat) (ls : List LocalSlot), strictSlotsAt argCount idx ls = .some ls
+  | _, .nil => rfl
+  | idx, slot :: rest => by
+    cases slot with
+    | dead =>
+      unfold strictSlotsAt
+      rw [strictSlotsAt_eq argCount (.succ idx) rest]
+    | uninit =>
+      unfold strictSlotsAt
+      rw [strictSlotsAt_eq argCount (.succ idx) rest]
+    | init v =>
+      unfold strictSlotsAt
+      cases Bool.and (Nat.ble 1 idx) (Nat.ble idx argCount) <;> dsimp only
+      · rw [strictValue_eq 16 v, strictSlotsAt_eq argCount (.succ idx) rest]
+      · rw [strictSlotsAt_eq argCount (.succ idx) rest]
+
+@[reducible]
+def strictFrame (argCount : Nat) (f : StackFrame) : Option StackFrame :=
+  match strictBits 16 f.blockIdx, strictBits 16 f.stmtIdx, strictSlotsAt argCount 0 f.locals with
+  | .some blk, .some idx, .some locs =>
+    .some { blockIdx := blk, stmtIdx := idx, locals := locs }
+  | _, _, _ => .none
+
+private theorem strictFrame_eq (argCount : Nat) (f : StackFrame) :
+    strictFrame argCount f = .some f := by
+  cases f
+  unfold strictFrame
+  dsimp only
+  rw [strictBits_eq, strictBits_eq, strictSlotsAt_eq]
+
+@[reducible]
+def strictMemory (m : Memory) : Option Memory :=
+  match strictBits 32 m.nextAllocId, strictList m.globals, strictBorrows m.borrows, strictBits 32 m.nextTag with
+  | .some naid, .some glob, .some bor, .some nt =>
+    match strictList m.callees, strictList m.traitImpls, strictList m.callStack, strictOpt m.activeCallee with
+    | .some cal, .some ti, .some cs, .some ac =>
+      match strictList m.activeProtectors, strictBits 32 m.nextProtector, strictSlotsAt 0 0 m.callerLocals with
+      | .some ap, .some np, .some cl =>
+        match strictList m.fnPtrs, strictList m.exposedAllocIds with
+        | .some fp, .some ea =>
+          .some
+            { nextAllocId := naid, globals := glob, borrows := bor, nextTag := nt,
+              callees := cal, traitImpls := ti, callStack := cs, activeCallee := ac,
+              activeProtectors := ap, nextProtector := np, callerLocals := cl,
+              fnPtrs := fp, exposedAllocIds := ea }
+        | _, _ => .none
+      | _, _, _ => .none
+    | _, _, _, _ => .none
+  | _, _, _, _ => .none
+
+private theorem strictMemory_eq (m : Memory) : strictMemory m = .some m := by
+  cases m
+  unfold strictMemory
+  dsimp only
+  rw [strictBits_eq, strictList_eq, strictBorrows_eq, strictBits_eq,
+      strictList_eq, strictList_eq, strictList_eq, strictOpt_eq,
+      strictList_eq, strictBits_eq, strictSlotsAt_eq, strictList_eq, strictList_eq]
+
+@[reducible]
+def strictMachineState (argCount : Nat) (s : MachineState) : Option MachineState :=
+  match strictFrame argCount s.frame, strictMemory s.memory with
+  | .some f', .some m' => .some { frame := f', memory := m' }
+  | _, _ => .none
+
+private theorem strictMachineState_eq (argCount : Nat) (s : MachineState) :
+    strictMachineState argCount s = .some s := by
+  cases s
+  unfold strictMachineState
+  dsimp only
+  rw [strictFrame_eq, strictMemory_eq]
+
+/--
+Spine-normalizing wrapper around `stepMirState` for closed-term `by rfl`
+checkers.
+-/
+@[reducible]
+def stepMirStateStrict (body : CapturedMir) (st : MirExecState) : MirStepNode :=
+  match st with
+  | .running s =>
+    match
+      strictMachineState
+        (match s.memory.activeCallee with
+         | .some callee => callee.argCount
+         | .none => body.argCount)
+        s
+    with
+    | .some s' => stepMirState body (.running s')
+    | .none => stepMirState body st
+  | _ => stepMirState body st
+
+@[simp]
+theorem stepMirStateStrict_eq (body : CapturedMir) (st : MirExecState) :
+    stepMirStateStrict body st = stepMirState body st := by
+  cases st with
+  | running s =>
+    unfold stepMirStateStrict
+    dsimp only
+    rw [strictMachineState_eq _ s]
+  | halted _ => rfl
+  | faulted _ => rfl
+
+/--
+Periodic spine-normalizing wrapper around `stepMirState`: normalizes concrete
+`MachineState` spines once every 8 steps (`fuel' % 8 == 0`), keeping call-by-name
+kernel reduction linear in straight-line MIR length with minimal stack depth and
+zero overhead on short symbolic companions.
+-/
+@[reducible]
+def stepMirStatePeriodic (fuel' : Nat) (body : CapturedMir) (st : MirExecState) : MirStepNode :=
+  match Nat.beq (fuel' % 8) 0 with
+  | false => stepMirState body st
+  | true => stepMirStateStrict body st
+
+@[simp]
+theorem stepMirStatePeriodic_eq (fuel' : Nat) (body : CapturedMir) (st : MirExecState) :
+    stepMirStatePeriodic fuel' body st = stepMirState body st := by
+  unfold stepMirStatePeriodic
+  cases Nat.beq (fuel' % 8) 0 <;> simp only [stepMirStateStrict_eq]
+
 /--
 Computable bounded boolean checker for `MirBoolPredicateHolds`: returns `true`
 when `specBody` halts normally with `true` (`.scalar ⟨1, 1⟩`) or unwinds safely
@@ -2548,7 +2888,7 @@ def checkMirBoolExecBounded
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret (.normal (.scalar { bits := 1, sizeBytes := 1 }, _)) => true
     | .ret (.normal _) => false
     | .ret .panic => true
@@ -2591,6 +2931,7 @@ private theorem wpCoalBounded_of_checkMirBoolExecBounded
   | zero => nomatch h
   | succ fuel' ih =>
     unfold checkMirBoolExecBounded at h
+    rw [stepMirStatePeriodic_eq] at h
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>
@@ -3044,7 +3385,7 @@ def checkMirRustPinnedSpecWithCallees
     match fuel with
     | 0 => false
     | fuel' + 1 =>
-      match stepMirState subjectBody st with
+      match stepMirStatePeriodic fuel' subjectBody st with
       | .ret (.normal (retVal, _)) =>
         checkMirBoolWithCalleesBounded specFuel ensBody callees (args ++ [retVal])
       | .ret .panic => false
@@ -3098,6 +3439,7 @@ theorem wpMirBounded_of_checkMirRustPinnedSpecWithCallees
   | succ fuel' ih =>
     intro st h
     unfold checkMirRustPinnedSpecWithCallees.loop at h
+    rw [stepMirStatePeriodic_eq] at h
     unfold wpCoalBounded
     cases h_step : stepMirState subjectBody st with
     | ret out =>
@@ -3149,7 +3491,7 @@ def reachesFaultExecBounded
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret _ => false
     | .tau st' => reachesFaultExecBounded fuel' body st'
     | .vis (.inl _) _ => true
@@ -3193,6 +3535,7 @@ theorem reachesFaultExecBounded_not_treeSafe
   | succ fuel' ih =>
     intro h_safe
     unfold reachesFaultExecBounded at h_fault
+    rw [stepMirStatePeriodic_eq] at h_fault
     have h_obs :
         (ITree.cofix (stepMirState body) st).observe =
           (stepMirState body st).map (ITree.cofix (stepMirState body)) :=
@@ -5785,7 +6128,7 @@ def evalMirDiffExecBounded
   match fuel with
   | 0 => .outOfFuel
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret (.normal (retVal, mem)) => .normal retVal mem
     | .ret .panic => .panic
     | .ret .abort => .abort
@@ -5846,7 +6189,7 @@ def probeMirDiffExecBounded
   match fuel with
   | 0 => (.outOfFuel, activeMirSpan body st)
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret (.normal (retVal, mem)) =>
       ((MirDiffVerdict.normal retVal mem).toTagWithBody body, "none")
     | .ret .panic => (.panic, activeMirSpan body st)
@@ -5881,6 +6224,7 @@ theorem probeMirDiffExecBounded_fst_eq_toTagWithBody
   | zero => rfl
   | succ fuel' ih =>
     unfold probeMirDiffExecBounded evalMirDiffExecBounded
+    rw [stepMirStatePeriodic_eq]
     cases h_step : stepMirState body st with
     | ret out =>
       cases out with
@@ -5923,7 +6267,7 @@ def reachesStrictUBExecBounded
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret _ => false
     | .tau st' => reachesStrictUBExecBounded fuel' body st'
     | .vis (.inl (.fail .ub)) _ => true
@@ -5951,6 +6295,7 @@ theorem reachesFaultExecBounded_of_reachesStrictUBExecBounded
   | succ fuel' ih =>
     unfold reachesStrictUBExecBounded at h_ub
     unfold reachesFaultExecBounded
+    rw [stepMirStatePeriodic_eq] at h_ub ⊢
     cases h_step : stepMirState body st with
     | ret _ =>
       simp only [h_step] at h_ub
@@ -6046,7 +6391,7 @@ def reachesPanicExecBounded
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret .panic => true
     | .ret (.normal _) => false
     | .ret .abort => false
@@ -6073,6 +6418,7 @@ theorem reachesPanicExecBounded_reachesRet
   | zero => nomatch h_panic
   | succ fuel' ih =>
     unfold reachesPanicExecBounded at h_panic
+    rw [stepMirStatePeriodic_eq] at h_panic
     have h_obs :
         (ITree.cofix (stepMirState body) st).observe =
           (stepMirState body st).map (ITree.cofix (stepMirState body)) :=
@@ -6158,6 +6504,7 @@ theorem wpCoalBounded_of_reachesPanicExecBounded
   | zero => nomatch h_panic
   | succ fuel' ih =>
     unfold reachesPanicExecBounded at h_panic
+    rw [stepMirStatePeriodic_eq] at h_panic
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>
@@ -6725,28 +7072,6 @@ theorem evalOperand_copy_nil_eq (locals : List LocalSlot) (idx : LocalIdx)
     | uninit => rfl
     | dead => rfl
 
-/-- Step-by-step symbolic discharge of `h_modular` in `verifyModularSafePanicMirBounded`. -/
-macro "prove_modular_safe_panic" : tactic =>
-  `(tactic| (
-    intro answers h_init
-    repeat' (
-      rw [reachesModularSafePanicExecBounded_succ]
-      (conv => lhs; arg 4; whnf)
-      try (
-        simp (config := { decide := false }) only [
-          evalOperands_cons_eq, evalOperand_move_nil_eq, evalOperand_copy_nil_eq]
-        (conv in valueContainsUninit _ => arg 1; whnf)
-        simp (config := { decide := false }) only [h_init]
-        (conv => lhs; arg 4; whnf)
-      )
-      delta reachesModularSafePanicExecStep
-      dsimp only []
-      first
-      | rfl
-      | apply modular_call_branches_true
-      | skip
-    )))
-
 /--
 Certify a Miri `panic` test whose execution passes through uninterpreted
 external calls, with linked `callees`, at `(args, mem)`. It proves both
@@ -6777,7 +7102,24 @@ theorem verifyModularSafePanicMirBounded
         reachesModularSafePanicExecBounded fuel body answers
           (.running (initMachineStateWithMemoryAndCallees body args mem callees)) =
             true := by
-      prove_modular_safe_panic)
+      intro answers h_init
+      repeat' (
+        rw [reachesModularSafePanicExecBounded_succ]
+        (conv => lhs; arg 4; whnf)
+        try (
+          simp (config := { decide := false }) only [
+            evalOperands_cons_eq, evalOperand_move_nil_eq, evalOperand_copy_nil_eq]
+          (conv in valueContainsUninit _ => arg 1; whnf)
+          simp (config := { decide := false }) only [h_init]
+          (conv => lhs; arg 4; whnf)
+        )
+        delta reachesModularSafePanicExecStep
+        dsimp only []
+        first
+        | rfl
+        | apply modular_call_branches_true
+        | skip
+      ))
     (h_panic :
       reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory)
         fuel body (initMachineStateWithMemoryAndCallees body args mem callees) =
@@ -6822,6 +7164,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_normalUnit
   | zero => nomatch h_ok
   | succ fuel' ih =>
     unfold evalMirDiffExecBounded at h_ok
+    rw [stepMirStatePeriodic_eq] at h_ok
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>
@@ -6876,6 +7219,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_normalScalar
   | zero => nomatch h_ok
   | succ fuel' ih =>
     unfold evalMirDiffExecBounded at h_ok
+    rw [stepMirStatePeriodic_eq] at h_ok
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>
@@ -7219,6 +7563,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_toTagWithBody_normalScalar
   | zero => nomatch h_ok
   | succ fuel' ih =>
     unfold evalMirDiffExecBounded at h_ok
+    rw [stepMirStatePeriodic_eq] at h_ok
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>

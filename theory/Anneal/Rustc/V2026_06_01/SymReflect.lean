@@ -7435,7 +7435,7 @@ def checkMirRustPinnedSpecOptWithCallees
     match fuel with
     | 0 => false
     | fuel' + 1 =>
-      match stepMirState subjectBody st with
+      match stepMirStatePeriodic fuel' subjectBody st with
       | .ret (.normal (retVal, _)) =>
         checkOptMirBoolBounded specFuel optEnsBody (args ++ [retVal])
       | .ret .panic => false
@@ -7491,6 +7491,7 @@ theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithCallees
   | succ fuel' ih =>
     intro st h
     unfold checkMirRustPinnedSpecOptWithCallees.loop at h
+    rw [stepMirStatePeriodic_eq] at h
     unfold wpCoalBounded
     cases h_step : stepMirState subjectBody st with
     | ret out =>
@@ -7777,7 +7778,7 @@ def checkMirRustPinnedSpecOptWithSpecCallees
     match fuel with
     | 0 => false
     | fuel' + 1 =>
-      match stepMirState subjectBody st with
+      match stepMirStatePeriodic fuel' subjectBody st with
       | .ret (.normal (retVal, _)) =>
         checkOptMirBoolWithCalleesBounded
           specFuel optEnsBody specCallees (args ++ [retVal])
@@ -7824,6 +7825,7 @@ theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithSpecCallees
   | succ fuel' ih =>
     intro st h
     unfold checkMirRustPinnedSpecOptWithSpecCallees.loop at h
+    rw [stepMirStatePeriodic_eq] at h
     unfold wpCoalBounded
     cases h_step : stepMirState subjectBody st with
     | ret out =>
@@ -8729,7 +8731,7 @@ def checkMirReturnsFalseExecBounded
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret (.normal (.scalar { bits := 0, sizeBytes := 1 }, _)) => true
     | .ret _ => false
     | .tau st' => checkMirReturnsFalseExecBounded fuel' body st'
@@ -8757,6 +8759,7 @@ private theorem not_dwlp_of_checkMirReturnsFalseExecBounded
   | zero => nomatch h_false
   | succ fuel' ih =>
     unfold checkMirReturnsFalseExecBounded at h_false
+    rw [stepMirStatePeriodic_eq] at h_false
     rw [DWLP.unfold_eq, ITree.observe_cofix] at h_dwlp
     cases h_step : stepMirState body st with
     | ret out =>
@@ -11111,7 +11114,7 @@ def checkMirRustModularPinnedSpecLoop
     Nat → MirExecState → Bool
   | 0, _ => false
   | fuel' + 1, st =>
-    match stepMirState subjectBody st with
+    match stepMirStatePeriodic fuel' subjectBody st with
     | .ret out =>
       match out with
       | .normal (retVal, _) =>
@@ -11224,6 +11227,7 @@ theorem wpMirModularBounded_of_checkMirRustModularPinnedSpec
   | succ fuel' ih =>
     intro st h
     unfold checkMirRustModularPinnedSpecLoop at h
+    rw [stepMirStatePeriodic_eq] at h
     unfold wpCoalBounded
     cases h_step : stepMirState subjectBody st with
     | ret out =>

@@ -116,6 +116,21 @@ private theorem readProjectedValue_index
         | .none => .ub
       | _ => .ub := rfl
 
+private theorem valueContainsUninit_scalar (sc : ScalarInt) :
+    valueContainsUninit (.scalar sc) = false := rfl
+
+private theorem valueContainsUninit_aggregate (v : Nat) (fs : List Value) :
+    valueContainsUninit (.aggregate v fs) = valueListContainsUninit fs := rfl
+
+private theorem valueListContainsUninit_nil :
+    valueListContainsUninit .nil = false := rfl
+
+private theorem valueListContainsUninit_cons (v : Value) (vs : List Value) :
+    valueListContainsUninit (v :: vs) =
+      (match valueContainsUninit v with
+       | true => true
+       | false => valueListContainsUninit vs) := rfl
+
 private theorem valueListContainsUninit_map_u32 (elems : List Nat) :
     valueListContainsUninit (elems.map (fun x => Value.scalar ⟨x, 4⟩)) = false := by
   induction elems with
@@ -393,7 +408,9 @@ private theorem fastSliceSum_h_body
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, fastSliceSumMkState, fastSliceSumBody,
           encodeU32Slice, optSlot, stepMirFn, MirStepNode.step, evalStmt,
           advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
-          readProjectedValue_index, valueContainsUninit, evalPlaceWrite, operandIsSigned, operandTy, placeTy,
+          readProjectedValue_index, valueContainsUninit_scalar, valueContainsUninit_aggregate,
+          valueListContainsUninit_nil, valueListContainsUninit_cons,
+          evalPlaceWrite, operandIsSigned, operandTy, placeTy,
           tyIsSigned, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?,
           List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq,
           instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or,
@@ -462,8 +479,20 @@ theorem dwp_fastSliceSumBody_trace
     }
     memory := emptyMemory }
 
+private theorem evalPlaceLen_encodeU32Slice
+    (elems : List Nat) (locals : List LocalSlot)
+    (h1 : get? locals 1 = .some (.init (encodeU32Slice elems))) :
+    evalPlaceLen locals (locPlace 1) emptyMemory safeSliceSumBody.localDecls emptyLayoutTable =
+      .ok (.scalar ⟨(elems.map (fun x => Value.scalar ⟨x, 4⟩)).length, 8⟩) locals emptyMemory := by
+  unfold evalPlaceLen evalPlaceRead locPlace safeSliceSumBody mkMirBody u32ArrayMirTy
+  rw [h1]
+  dsimp only [placeTy, resolveProjectedTy, splitLastDeref?, get?, GetElem?.getElem?,
+    List.get?Internal, encodeU32Slice, readProjectedValue]
+  rw [valueContainsUninit_aggregate, valueListContainsUninit_map_u32]
+  rfl
+
 /--
-`bb2` `Len(_1)` step by `rfl` (sparing `dsimp` the `evalPlaceLen` unfolding); the
+`bb2` `Len(_1)` step by `evalPlaceLen_encodeU32Slice` + `rfl`; the
 slice length is left as `(elems.map _).length` for `List.length_map`.
 -/
 private theorem safeSliceSum_bb2_len_step (elems : List Nat) (n i : Nat)
@@ -477,10 +506,19 @@ private theorem safeSliceSum_bb2_len_step (elems : List Nat) (n i : Nat)
                   (.init (.scalar ⟨(elems.map (fun x => Value.scalar ⟨x, 4⟩)).length, 8⟩)) }
           memory := emptyMemory }) := by
   rcases rest with _ | ⟨_, _, _, _, _⟩ <;>
-    (dsimp only [safeSliceSumMkState, safeSliceSumBody, encodeU32Slice, Option.map, optSlot,
-       stepMirFn, evalStmt, evalRvalue, evalPlaceLen, evalOperand, readProjectedValue,
-       valueContainsUninit, get?, set?, length, emptyMemory, Option.getD, List.get?Internal];
-     rw [valueListContainsUninit_map_u32 elems];
+    (change
+       (match
+          evalPlaceLen
+            (safeSliceSumMkState elems n 2 i (some (.scalar ⟨1, 1⟩)) _).frame.locals
+            (locPlace 1)
+            emptyMemory
+            safeSliceSumBody.localDecls
+            emptyLayoutTable
+        with
+        | .ok val locals₁ mem₁ => _
+        | .ub => _
+        | .unsupported => _) = _
+     rw [evalPlaceLen_encodeU32Slice elems _ rfl]
      rfl)
 
 private theorem safeSliceSum_header_switch_raw
@@ -514,7 +552,9 @@ private theorem safeSliceSum_h_body
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, safeSliceSumMkState, safeSliceSumBody,
           encodeU32Slice, Option.map, optSlot, stepMirFn, MirStepNode.step, evalStmt,
           advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
-          readProjectedValue_index, valueContainsUninit, evalPlaceWrite, operandIsSigned, operandTy, placeTy,
+          readProjectedValue_index, valueContainsUninit_scalar, valueContainsUninit_aggregate,
+          valueListContainsUninit_nil, valueListContainsUninit_cons,
+          evalPlaceWrite, operandIsSigned, operandTy, placeTy,
           tyIsSigned, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?,
           List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq,
           instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or,
