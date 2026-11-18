@@ -3365,7 +3365,7 @@ theorem evalOperand_scalar_simulation
         exact .ub _ _
       · have ha : evalOperand af.locals (.copy ⟨idx, .nil⟩) .nil globals body.layouts .nil body.localDecls =
             .ok v af.locals := by
-          simp [evalOperand, readProjectedValue, hslot]
+          simp [evalOperand, readProjectedValue, hslot, himmRel.valueContainsUninit_eq_false]
         obtain ⟨hread, _⟩ :=
           annealReadImmediate_of_immediateRel himmRel hsz_nz (translateTy decl.ty body.layouts)
             { m with stack := ⟨#[topFrame']⟩ }
@@ -6001,11 +6001,14 @@ theorem ValidFrameLocation.preserved
         cases slot with
         | dead => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
         | uninit => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
-        | init _ =>
+        | init retV =>
           dsimp only
           cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors (length []) (length s.frame.locals) with
           | true => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
-          | false => exact fun hstep => absurd hstep MirStepNode_retNormal_ne_step
+          | false =>
+            cases valueContainsUninit retV with
+            | true => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
+            | false => exact fun hstep => absurd hstep MirStepNode_retNormal_ne_step
     · unfold evalTerminator at hstep
       rw [hunreach] at hstep
       exact absurd hstep MirStepNode_fail_ne_step
@@ -6083,11 +6086,14 @@ theorem NonAddrTakenImmediate.preserved
           cases slot with
           | dead => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
           | uninit => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
-          | init _ =>
+          | init retV =>
             dsimp only
             cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors (length []) (length s.frame.locals) with
             | true => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
-            | false => exact fun ha_eq => absurd ha_eq MirStepNode_retNormal_ne_step
+            | false =>
+              cases valueContainsUninit retV with
+              | true => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
+              | false => exact fun ha_eq => absurd ha_eq MirStepNode_retNormal_ne_step
     · rcases hstate with ⟨topFrame, hframes, _, _, hframe, _, _, _, _, _⟩
       have hm_step := miri_step_at_terminator hframes hframe.body_eq hframe.location_eq hbb hstmt_none
       unfold translateTerminator Miri.Interpreter.ControlFlow.evalTerminator at hm_step

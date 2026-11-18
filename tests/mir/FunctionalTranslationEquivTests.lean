@@ -109,9 +109,18 @@ private theorem readProjectedValue_index
       match get? locals idxLocal with
       | .some (.init (.scalar sc)) =>
         match get? fields sc.bits with
-        | .some elemVal => .ok elemVal
+        | .some elemVal =>
+          match valueContainsUninit elemVal with
+          | false => .ok elemVal
+          | true => .ub
         | .none => .ub
       | _ => .ub := rfl
+
+private theorem valueListContainsUninit_map_u32 (elems : List Nat) :
+    valueListContainsUninit (elems.map (fun x => Value.scalar ⟨x, 4⟩)) = false := by
+  induction elems with
+  | nil => rfl
+  | cons _ tl ih => exact ih
 
 /--
 `runMirTauToBlock` unfolding that keeps the continuation folded until the step
@@ -384,7 +393,7 @@ private theorem fastSliceSum_h_body
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, fastSliceSumMkState, fastSliceSumBody,
           encodeU32Slice, optSlot, stepMirFn, MirStepNode.step, evalStmt,
           advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
-          readProjectedValue_index, evalPlaceWrite, operandIsSigned, operandTy, placeTy,
+          readProjectedValue_index, valueContainsUninit, evalPlaceWrite, operandIsSigned, operandTy, placeTy,
           tyIsSigned, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?,
           List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq,
           instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or,
@@ -467,7 +476,12 @@ private theorem safeSliceSum_bb2_len_step (elems : List Nat) (n i : Nat)
                 (safeSliceSumMkState elems n 2 i (some (.scalar ⟨1, 1⟩)) rest).frame.locals.set 6
                   (.init (.scalar ⟨(elems.map (fun x => Value.scalar ⟨x, 4⟩)).length, 8⟩)) }
           memory := emptyMemory }) := by
-  rcases rest with _ | ⟨_, _, _, _, _⟩ <;> rfl
+  rcases rest with _ | ⟨_, _, _, _, _⟩ <;>
+    (dsimp only [safeSliceSumMkState, safeSliceSumBody, encodeU32Slice, Option.map, optSlot,
+       stepMirFn, evalStmt, evalRvalue, evalPlaceLen, evalOperand, readProjectedValue,
+       valueContainsUninit, get?, set?, length, emptyMemory, Option.getD, List.get?Internal];
+     rw [valueListContainsUninit_map_u32 elems];
+     rfl)
 
 private theorem safeSliceSum_header_switch_raw
     (elems : List Nat) (n i : Nat) (o5 : Option Value)
@@ -500,7 +514,7 @@ private theorem safeSliceSum_h_body
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, safeSliceSumMkState, safeSliceSumBody,
           encodeU32Slice, Option.map, optSlot, stepMirFn, MirStepNode.step, evalStmt,
           advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
-          readProjectedValue_index, evalPlaceWrite, operandIsSigned, operandTy, placeTy,
+          readProjectedValue_index, valueContainsUninit, evalPlaceWrite, operandIsSigned, operandTy, placeTy,
           tyIsSigned, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?,
           List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq,
           instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or,

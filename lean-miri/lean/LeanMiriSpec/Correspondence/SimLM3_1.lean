@@ -5867,6 +5867,8 @@ theorem StateRelLM3_1.validateLoadedValue_wtScalar
         rcases hval with ⟨rfl, _⟩ | ⟨_, rfl, himm_rel⟩
         · simp at hok
         · dsimp only [] at hok
+          rw [himm_rel.valueContainsUninit_eq_false] at hok
+          dsimp only [] at hok
           injection hok with hv_eq _
           subst hv_eq
           rcases decl with ⟨_, ⟨dk, dli⟩, _⟩
@@ -11113,7 +11115,7 @@ theorem step_rawPtr_use_lm3_1_simulation
       have hrv_a : evalRvalue s.frame.locals (.use (.move ⟨srcIdx, .nil⟩)) s.memory
           body.localDecls body.layouts =
           .ok (.scalar sc_s) (s.frame.locals.set srcIdx .uninit) s.memory := by
-        unfold evalRvalue evalOperand; dsimp only []
+        unfold evalRvalue evalOperand readProjectedValue; dsimp only []
         rw [hslot_s, hss_sc, set?_eq_some_set hlt_af_s]
         dsimp only []
         rw [hvalid_raw _ _ (Or.inr rfl)]
@@ -11176,7 +11178,7 @@ theorem step_rawPtr_use_lm3_1_simulation
       have hrv_a : evalRvalue s.frame.locals (.use (.move ⟨srcIdx, .nil⟩)) s.memory
           body.localDecls body.layouts =
           .ok (.ptr ptrVal 8) (s.frame.locals.set srcIdx .uninit) s.memory := by
-        unfold evalRvalue evalOperand; dsimp only []
+        unfold evalRvalue evalOperand readProjectedValue; dsimp only []
         rw [hslot_s, hss_ptr, set?_eq_some_set hlt_af_s]
         dsimp only []
         rw [hvalid_raw _ _ (Or.inr rfl)]
@@ -11324,7 +11326,7 @@ theorem step_cast_ptrToPtr_move_simulation
         dsimp only at hsrc_ty
         subst hsrc_ty
         cases srcPointee <;> simp [isThinRawPtrPointee, arrayPtrOrRefElemLen?] at hsrc_thin ⊢
-      unfold evalRvalue evalCastPtrToPtr evalOperand; dsimp only []
+      unfold evalRvalue evalCastPtrToPtr evalOperand readProjectedValue; dsimp only []
       rw [hslot_s, hss_ptr, set?_eq_some_set hlt_af_s]
       dsimp only []
       rw [hptr8]
@@ -11524,7 +11526,7 @@ theorem step_binOp_offset_move_simulation
         have hlhs_a : evalOperand s.frame.locals (.move ⟨ptrIdx, .nil⟩) s.memory.borrows
             s.memory.globals body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
             .ok (.ptr ptrVal 8) s_mid.frame.locals := by
-          unfold evalOperand; dsimp only []; rw [hsp_full, set?_eq_some_set hlt_af_p]
+          unfold evalOperand readProjectedValue; dsimp only []; rw [hsp_full, set?_eq_some_set hlt_af_p]
         dsimp only []; rw [hlhs_a]; dsimp only []; rw [heq_r]
         cases hr : evalOperand s_mid.frame.locals _ s.memory.borrows s.memory.globals body.layouts
           s.memory.callerLocals with
@@ -12064,7 +12066,7 @@ theorem step_cast_expose_provenance_scalar_simulation
         unfold evalRvalue evalPointerExposeProvenance
         dsimp only []
         rw [hexp_tgt, hexp_src _ (Or.inr rfl)]
-        unfold evalOperand; dsimp only []
+        unfold evalOperand readProjectedValue; dsimp only []
         rw [hslot_s, hss_sc]
         dsimp only []
         rw [set?_eq_some_set hlt_af_s]
@@ -12217,7 +12219,7 @@ private theorem evalRawPtrLocalOperand_lm3_1
         { s with frame := { s.frame with locals := s.frame.locals.set idx .uninit } }
         (deinitFrameLocal tfc idx hlt_c)
         (hslot.trans (congrArg some hs_sc)) hrel_sc hsz8
-        (by unfold evalOperand; dsimp only []; rw [hslot, hs_sc, set?_eq_some_set hlt_af])
+        (by unfold evalOperand readProjectedValue; dsimp only []; rw [hslot, hs_sc, set?_eq_some_set hlt_af])
         ?_ hstate_mid rfl rfl
         (fun _ hj => (hj.cache_layout hlt_m _).deinit_local hlt_c)
         (fun h => absurd (congrFun h ⟨0, .nil⟩) (by nofun)) (fun _ => rfl)
@@ -12242,7 +12244,7 @@ private theorem evalRawPtrLocalOperand_lm3_1
         { s with frame := { s.frame with locals := s.frame.locals.set idx .uninit } }
         (deinitFrameLocal tfc idx hlt_c)
         (hslot.trans (congrArg some hs_ptr)) hptrRel
-        (by unfold evalOperand; dsimp only []; rw [hslot, hs_ptr, set?_eq_some_set hlt_af])
+        (by unfold evalOperand readProjectedValue; dsimp only []; rw [hslot, hs_ptr, set?_eq_some_set hlt_af])
         ?_ hstate_mid rfl rfl
         (fun _ hj => (hj.cache_layout hlt_m _).deinit_local hlt_c)
         (fun h => absurd (congrFun h ⟨0, .nil⟩) (by nofun)) (fun _ => rfl)
@@ -17675,7 +17677,7 @@ theorem step_terminator_goto_return_lm3_1_simulation
         · rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
             hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_uninit hframes hget0)]
           exact StepRelLM3_1.ub _ _
-        · dsimp only []; rw [hhfd]; dsimp only []
+        · dsimp only []; rw [hhfd, himmRel.valueContainsUninit_eq_false]; dsimp only []
           cases himmRel with
           | unit hzero =>
             exact False.elim (hsz0 hzero)
@@ -17849,7 +17851,7 @@ theorem step_unaryOp_ptrMetadata_thin_rawPtr_correspondence
   have hunit_lay : translateTy { kind := .tuple .nil, layoutIdx := 0 } emptyLayoutTable =
       translateTy dstDecl.ty body.layouts := by
     unfold translateTy encodeTyId; rw [hdst_ty]
-  obtain ⟨slot_p, _, _, _, hslot_p, _, _, _⟩ := hfr.lookup_local hdecl_ptr
+  obtain ⟨slot_p, mls_p, _, _, hslot_p, hmls_p, _, hloc_p⟩ := hfr.lookup_local hdecl_ptr
   cases evalRawPtrLocalOperand_lm3_1 hstate_a hopKind hdecl_ptr hptr_ty
       (himm_p.cache_layout hlt_d _) knownU with
   | ub _ _ ha_p _ =>
@@ -17859,7 +17861,19 @@ theorem step_unaryOp_ptrMetadata_thin_rawPtr_correspondence
        cases slot_p with
        | dead => exact hptr_init.1 hslot_p
        | uninit => exact hptr_init.2 hslot_p
-       | init _ => simp [readProjectedValue, set?_eq_some_set
+       | init vp =>
+         have hvp_init : valueContainsUninit vp = false := by
+           have hnot_ind_p := himm_p mls_p hmls_p
+           cases hloc_p with
+           | rawPtr _ _ _ _ _ _ _ _ => rfl
+           | base hb =>
+             cases hb with
+             | indirect _ mp _ _ _ _ => exact absurd rfl (hnot_ind_p mp)
+             | immediate _ _ _ _ hval =>
+               rcases hval with ⟨hun, _⟩ | ⟨_, hv, himm_rel⟩
+               · cases hun
+               · injection hv with hv'; subst hv'; exact himm_rel.valueContainsUninit_eq_false
+         simp [readProjectedValue, hvp_init, set?_eq_some_set
            ((List.getElem?_eq_some_iff.mp (by rw [← get?_eq_getElem?]; exact hslot_p)).1)] at ha_p)
   | scalar sc msc s₁ tf₁ _ hrel_sc hsz8 ha_p hm_p hstate₁ hs₁_eq _ hmono₁ hcopy₁ hmove₁ =>
     have hlive_d₁ : get? s₁.frame.locals dstIdx ≠ some .dead := by
@@ -18404,7 +18418,7 @@ theorem step_rawPtr_cmp_ptr_divergence
         exact hrhs_init
     let knownR := if (translateBinOp bop).rightHomogeneous then
         some (translateTy lhsDecl.ty body.layouts) else none
-    obtain ⟨slot_r₁, _, _, _, hslot_r₁, _, _, _⟩ :=
+    obtain ⟨slot_r₁, mls_r₁, _, _, hslot_r₁, hmls_r₁, _, hloc_r₁⟩ :=
       (hstate₁.frame_rel_singleton rfl).lookup_local hdecl_rhs
     cases evalRawPtrLocalOperand_lm3_1 hstate₁ hopKind₂ hdecl_rhs hrhs_ty
         (hmono₁ rhsIdx (himm_r.cache_layout hlt_d _)) knownR with
@@ -18415,7 +18429,20 @@ theorem step_rawPtr_cmp_ptr_divergence
          cases slot_r₁ with
          | dead => exact hrhs_init₁.1 hslot_r₁
          | uninit => exact hrhs_init₁.2 hslot_r₁
-         | init _ => simp [readProjectedValue, set?_eq_some_set
+         | init vr =>
+           have hvr_init : valueContainsUninit vr = false := by
+             have hnot_ind_r₁ := hmono₁ rhsIdx (himm_r.cache_layout hlt_d _) mls_r₁ hmls_r₁
+             cases hloc_r₁ with
+             | rawPtr _ _ _ _ _ _ _ _ => rfl
+             | base hb =>
+               cases hb with
+               | indirect _ mp _ _ _ _ =>
+                 exact absurd rfl (hnot_ind_r₁ mp)
+               | immediate _ _ _ _ hval =>
+                 rcases hval with ⟨hun, _⟩ | ⟨_, hv, himm_rel⟩
+                 · cases hun
+                 · injection hv with hv'; subst hv'; exact himm_rel.valueContainsUninit_eq_false
+           simp [readProjectedValue, hvr_init, set?_eq_some_set
              ((List.getElem?_eq_some_iff.mp (by rw [← get?_eq_getElem?]; exact hslot_r₁)).1)] at ha_r)
     | scalar sc₂ msc₂ s₂ tf₂ _ hrel₂ hsz₂ ha_r hm_r hstate₂ hs₂_eq _ hmono₂ _ _ =>
       rw [hs₁_mem] at ha_r
@@ -18437,20 +18464,27 @@ theorem step_rawPtr_cmp_ptr_divergence
           have hop₂_d : get? s₂.frame.locals dstIdx = get? s₁.frame.locals dstIdx := by
             rcases hopKind₂ with rfl | rfl
             · unfold evalOperand readProjectedValue at ha_r; dsimp only [] at ha_r
-              rw [hslot_r₁] at ha_r; cases slot_r₁ <;> simp at ha_r
-              rcases ha_r with ⟨_, hlocs_eq⟩; rw [← hlocs_eq]
-            · unfold evalOperand at ha_r; dsimp only [] at ha_r
+              rw [hslot_r₁] at ha_r
+              cases slot_r₁ with
+              | dead | uninit => simp at ha_r
+              | init v =>
+                cases hvc : valueContainsUninit v <;> simp [hvc] at ha_r
+                rw [← ha_r.2]
+            · unfold evalOperand readProjectedValue at ha_r; dsimp only [] at ha_r
               rw [hslot_r₁] at ha_r
               cases slot_r₁ with
               | dead => simp at ha_r
               | uninit => simp at ha_r
               | init v =>
-                dsimp only [] at ha_r
                 obtain ⟨hlt_r₁, _⟩ := List.getElem?_eq_some_iff.mp
                   (by rw [← get?_eq_getElem?]; exact hslot_r₁)
-                rw [set?_eq_some_set hlt_r₁] at ha_r
-                injection ha_r with _ hlocs_eq
-                rw [← hlocs_eq, get?_eq_getElem?, List.getElem?_set_ne hd_ne_r.symm, ← get?_eq_getElem?]
+                dsimp only [] at ha_r
+                cases hvc : valueContainsUninit v <;> rw [hvc] at ha_r
+                · dsimp only [] at ha_r
+                  rw [set?_eq_some_set hlt_r₁] at ha_r
+                  injection ha_r with _ hlocs_eq
+                  rw [← hlocs_eq, get?_eq_getElem?, List.getElem?_set_ne hd_ne_r.symm, ← get?_eq_getElem?]
+                · cases ha_r
           exact hop₂_d.trans hs₁_d
         rw [hd₂_eq_s]; exact hdst_live
       have hfr₂ := hstate₂.frame_rel_singleton rfl
@@ -18553,20 +18587,27 @@ theorem step_rawPtr_cmp_ptr_divergence
         have hop₂_d : get? s₂.frame.locals dstIdx = get? s₁.frame.locals dstIdx := by
           rcases hopKind₂ with rfl | rfl
           · unfold evalOperand readProjectedValue at ha_r; dsimp only [] at ha_r
-            rw [hslot_r₁] at ha_r; cases slot_r₁ <;> simp at ha_r
-            rcases ha_r with ⟨_, hlocs_eq⟩; rw [← hlocs_eq]
-          · unfold evalOperand at ha_r; dsimp only [] at ha_r
+            rw [hslot_r₁] at ha_r
+            cases slot_r₁ with
+            | dead | uninit => simp at ha_r
+            | init v =>
+              cases hvc : valueContainsUninit v <;> simp [hvc] at ha_r
+              rw [← ha_r.2]
+          · unfold evalOperand readProjectedValue at ha_r; dsimp only [] at ha_r
             rw [hslot_r₁] at ha_r
             cases slot_r₁ with
             | dead => simp at ha_r
             | uninit => simp at ha_r
             | init v =>
-              dsimp only [] at ha_r
               obtain ⟨hlt_r₁, _⟩ := List.getElem?_eq_some_iff.mp
                 (by rw [← get?_eq_getElem?]; exact hslot_r₁)
-              rw [set?_eq_some_set hlt_r₁] at ha_r
-              injection ha_r with _ hlocs_eq
-              rw [← hlocs_eq, get?_eq_getElem?, List.getElem?_set_ne hd_ne_r.symm, ← get?_eq_getElem?]
+              dsimp only [] at ha_r
+              cases hvc : valueContainsUninit v <;> rw [hvc] at ha_r
+              · dsimp only [] at ha_r
+                rw [set?_eq_some_set hlt_r₁] at ha_r
+                injection ha_r with _ hlocs_eq
+                rw [← hlocs_eq, get?_eq_getElem?, List.getElem?_set_ne hd_ne_r.symm, ← get?_eq_getElem?]
+              · cases ha_r
         rw [hop₂_d, hs₁_d]; exact hdst_live
       have hfr₂ := hstate₂.frame_rel_singleton rfl
       obtain ⟨slot_d₂, mls_d₂, hlt_af_d₂, hlt_d₂, hslot_d₂, hmls_d₂, _, hloc_d₂⟩ :=
@@ -20670,7 +20711,7 @@ theorem step_cast_ptrToPtr_move_scalar_correspondence
     have hrv : evalRvalue s.frame.locals (.cast .ptrToPtr (.move ⟨srcIdx, .nil⟩) castTy) s.memory
         body.localDecls body.layouts =
         .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) s.memory := by
-      unfold evalRvalue evalCastPtrToPtr evalOperand
+      unfold evalRvalue evalCastPtrToPtr evalOperand readProjectedValue
       dsimp only []
       rw [hslot_s, set?_eq_some_set hlt_af_s]
       dsimp only []
@@ -20814,7 +20855,7 @@ theorem step_cast_ptrToPtr_move_scalar_simulation
     have hrv_a : evalRvalue s.frame.locals (.cast .ptrToPtr (.move ⟨srcIdx, .nil⟩) castTy) s.memory
         body.localDecls body.layouts =
         .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) s.memory := by
-      unfold evalRvalue evalCastPtrToPtr evalOperand; dsimp only []
+      unfold evalRvalue evalCastPtrToPtr evalOperand readProjectedValue; dsimp only []
       rw [hslot_s, set?_eq_some_set hlt_af_s]; dsimp only []
       rw [hsz8, hptr8, nat_beq_self, hdst_thin_ty]; dsimp only []
       rw [hwrap_sc]
@@ -22349,7 +22390,7 @@ theorem evalOperand_scalar_copyOrMove_lm3_1_simulation
               s.memory.globals body.layouts s.memory.callerLocals body.localDecls =
               .ok (.scalar sc) (s.frame.locals.set idx .uninit) := by
             intro bor
-            unfold evalOperand
+            unfold evalOperand readProjectedValue
             dsimp only []
             rw [hslot, set?_eq_some_set hlt_af]
           have hvalid : validateLoadedValue body.layouts body.localDecls (.move ⟨idx, .nil⟩)
@@ -23893,7 +23934,7 @@ theorem step_deref_revived_local_ub_simulation
                 · have ha_m : ∀ bor, evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) bor
                       s.memory.globals body.layouts s.memory.callerLocals body.localDecls =
                       .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) := by
-                    intro bor; unfold evalOperand; dsimp only []; rw [hslot_s, set?_eq_some_set hlt_af_s]
+                    intro bor; unfold evalOperand readProjectedValue; dsimp only []; rw [hslot_s, set?_eq_some_set hlt_af_s]
                   have hv := hvalid_s _ (Or.inr rfl)
                   unfold evalRvalue; rw [hstack]
                   cases s.memory.borrows with
@@ -27036,7 +27077,7 @@ theorem step_raw_overwritten_direct_copy_invalid_bool_simulation
     · have hm_a : evalOperand s.frame.locals (.move ⟨loc, .nil⟩) s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals body.localDecls =
           .ok (.scalar rawSc) (s.frame.locals.set loc .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hloc_slot, set?_eq_some_set hlt_af_l]
+        unfold evalOperand readProjectedValue; dsimp only []; rw [hloc_slot, set?_eq_some_set hlt_af_l]
       rw [hm_a]; dsimp only []; rw [hv_false]
   exact ⟨by rw [ha_ub, hm_ub]; exact .ub _ _, ha_ub, _, hm_ub⟩
 
@@ -27183,7 +27224,7 @@ theorem step_raw_overwritten_direct_copy_invalid_char_simulation
     · have hm_a : evalOperand s.frame.locals (.move ⟨loc, .nil⟩) s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals body.localDecls =
           .ok (.scalar rawSc) (s.frame.locals.set loc .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hloc_slot, set?_eq_some_set hlt_af_l]
+        unfold evalOperand readProjectedValue; dsimp only []; rw [hloc_slot, set?_eq_some_set hlt_af_l]
       rw [hm_a]; dsimp only []; rw [hv_false]
   exact ⟨by rw [ha_ub, hm_ub]; exact .ub _ _, ha_ub, _, hm_ub⟩
 
@@ -27344,7 +27385,7 @@ theorem step_raw_overwritten_direct_copy_char_wrong_size_or_invalid_simulation
       · have hm_a : evalOperand s.frame.locals (.move ⟨loc, .nil⟩) s.memory.borrows s.memory.globals
             body.layouts s.memory.callerLocals body.localDecls =
             .ok (.scalar rawSc) (s.frame.locals.set loc .uninit) := by
-          unfold evalOperand; dsimp only []; rw [hloc_slot, set?_eq_some_set hlt_af_l]
+          unfold evalOperand readProjectedValue; dsimp only []; rw [hloc_slot, set?_eq_some_set hlt_af_l]
         rw [hm_a]; dsimp only []; rw [hv_false]
     exact ⟨by rw [ha_ub, hm_ub]; exact .ub _ _, ha_ub, _, msg, hm_ub⟩
 
@@ -27528,7 +27569,7 @@ theorem step_raw_overwritten_direct_copy_valid_char_simulation
     · have hm_a : evalOperand s.frame.locals (.move ⟨loc, .nil⟩) s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals body.localDecls =
           .ok (.scalar rawSc) (s.frame.locals.set loc .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hloc_slot, set?_eq_some_set hlt_af_l]
+        unfold evalOperand readProjectedValue; dsimp only []; rw [hloc_slot, set?_eq_some_set hlt_af_l]
       unfold evalRvalue; rw [hstack]; dsimp only []; rw [hm_a]; dsimp only []; rw [hv_true]
   have hlt_af_d' : dstIdx < (offsetAfterLhsLocals opKind s.frame.locals loc).length := by
     rcases hopKind with rfl | rfl <;> simp [offsetAfterLhsLocals, hlt_af_d]
@@ -28839,7 +28880,7 @@ private theorem evalLhsRawPtr_lm3_1_d6
         (by rw [hs_ptr]; simp) himm_c hlt_c
       refine ⟨ptrVal, mptr, deinitFrameLocal tfc ptrIdx hlt_c,
         hslot.trans (congrArg some hs_ptr), hptrRel,
-        by unfold evalOperand; dsimp only []; rw [hslot, hs_ptr, set?_eq_some_set hlt_af], ?_,
+        by unfold evalOperand readProjectedValue; dsimp only []; rw [hslot, hs_ptr, set?_eq_some_set hlt_af], ?_,
         hstate_mid, rfl, fun _ hj => (hj.cache_layout hlt_m _).deinit_local hlt_c⟩
       dsimp only [translateOperand, translatePlace, List.map, List.toArray]
       rw [EStateM.bind_eq_ok (annealEvalOperand_move_live (m := { m with stack := ⟨#[tf]⟩ })
@@ -28932,7 +28973,7 @@ private theorem evalOperand_copyOrMove_with_imm_d6
           refine ⟨sc, msc,
             { s with frame := { s.frame with locals := s.frame.locals.set idx .uninit } },
             deinitFrameLocal tfc idx hlt_c,
-            by unfold evalOperand; dsimp only []; rw [hslot, set?_eq_some_set hlt_af],
+            by unfold evalOperand readProjectedValue; dsimp only []; rw [hslot, set?_eq_some_set hlt_af],
             ?_, rfl,
             fun e he => by
               rw [get?_eq_getElem?, List.getElem?_set_ne (hnot_in_map e he).symm,
@@ -29036,7 +29077,7 @@ private theorem step_binOp_offset_gen_simulation
       dsimp only [lhsOp]
       rcases hopKind with rfl | rfl
       · simp [evalOperand, readProjectedValue, hptr_slot]
-      · simp [evalOperand, hptr_slot, set?_eq_some_set hlt_p]
+      · simp [evalOperand, readProjectedValue, hptr_slot, set?_eq_some_set hlt_p]
     exact absurd ha_ub ha_ok
   · rw [hptr_slot] at hbad; cases hbad
   · rw [hptr_slot] at hptr_slot'
@@ -30520,7 +30561,7 @@ private theorem step_binOp_offset_usize_wrap_any_divergence
       dsimp only [lhsOp]
       rcases hopKind with rfl | rfl
       · simp [evalOperand, readProjectedValue, hptr_slot]
-      · simp [evalOperand, hptr_slot, set?_eq_some_set hlt_p]
+      · simp [evalOperand, readProjectedValue, hptr_slot, set?_eq_some_set hlt_p]
     exact absurd ha_ub ha_ok
   · rw [hptr_slot] at hbad; cases hbad
   · rw [hptr_slot] at hptr_slot'
@@ -31211,7 +31252,7 @@ theorem step_binOp_offset_usize_wrap_disabled_ub_simulation
       dsimp only [lhsOp]
       rcases hopKind with rfl | rfl
       · simp [evalOperand, readProjectedValue, hptr_slot]
-      · simp [evalOperand, hptr_slot, set?_eq_some_set hlt_p]
+      · simp [evalOperand, readProjectedValue, hptr_slot, set?_eq_some_set hlt_p]
     exact absurd ha_ub ha_ok
   · rw [hptr_slot] at hbad; cases hbad
   · rw [hptr_slot] at hptr_slot'
@@ -31380,7 +31421,7 @@ theorem step_binOp_offset_d6_partition
       obtain ⟨_, _, hlt_p, _⟩ := hfr.lookup_local hdecl_ptr
       rcases hopKind with rfl | rfl
       · simp [evalOperand, readProjectedValue, hptr_slot] at ha_ub
-      · simp [evalOperand, hptr_slot, set?_eq_some_set hlt_p] at ha_ub
+      · simp [evalOperand, readProjectedValue, hptr_slot, set?_eq_some_set hlt_p] at ha_ub
     · rw [hptr_slot] at hbad; cases hbad
     · have hop_rhs₁ : WellTypedScalarCopyOrMoveOperand body tf₁ rhsOp rhsTy :=
         (hop_rhs tf hframes).mono_immediate (fun j hj => hmono₁ j (hj.cache_layout hlt_d _))

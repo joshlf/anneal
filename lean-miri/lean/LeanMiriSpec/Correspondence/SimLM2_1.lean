@@ -1377,7 +1377,7 @@ theorem evalProjection_index_simulation
     obtain ⟨sc_e, msc_e, hval_eq, himm_e, hread_e⟩ :=
       annealReadImmediate_of_projected_array_elem hwf hnodup hmp hget_seq
     refine ⟨elemVal, sc_e, msc_e, hget_seq, hval_eq, ?_, ?_, himm_e, hread_e⟩
-    · simp [readProjectedValue, hidx_slot, hget_seq]
+    · simp [readProjectedValue, hidx_slot, hget_seq, hval_eq]
     · have hcx_local : cx.localIndex idxLocal = .ok (UInt64.ofNat idxSc.bits) := hlocalIdx
       simp only [annealProjectList, Miri.Interpreter.project, hcx_local, bind, Except.bind]
       dsimp only [cx, base]
@@ -1519,8 +1519,8 @@ theorem evalProjection_constantIndex_simulation
         hget_seq
       cases fromEnd <;>
         (simp only [Bool.false_eq_true, ↓reduceIte] at hget_idx;
-         simp (config := { zetaDelta := true }) only [readProjectedValue, hlen_seq, hble,
-           Nat.sub_eq, hget_idx])
+         simp (config := { zetaDelta := true }) only [readProjectedValue, valueContainsUninit, hlen_seq, hble,
+           Nat.sub_eq, hget_idx, hval_eq])
     · simp only [annealProjectList, Miri.Interpreter.project, hnot_ovf, ↓reduceIte,
         Miri.Interpreter.projectConstantIndex, hlen_miri, bind, Except.bind, hnot_lt_min]
       cases fromEnd with
@@ -2366,9 +2366,29 @@ theorem evalRvalue_len_array_simulation
         dsimp only [resolveProjectedTy]
         rw [ht]
         dsimp only
+        have helems_no_uninit : valueListContainsUninit elems = false := by
+          rcases id hmp with ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, harr_c⟩
+          obtain ⟨_, _, _, hslice⟩ := harr_c _ _ elems hwf.arr_kind rfl
+          have hall : ∀ k elemVal, get? elems k = some elemVal → ∃ sc, elemVal = .scalar sc := by
+            intro k ev hget_k
+            obtain ⟨sc, _, hev, _⟩ := hslice.elem_rel k ev hget_k
+            exact ⟨sc, hev⟩
+          have aux : ∀ (es : List Value),
+              (∀ k ev, get? es k = some ev → ∃ sc, ev = .scalar sc) →
+              valueListContainsUninit es = false := by
+            intro es
+            induction es with
+            | nil => intro _; rfl
+            | cons hd tl ih =>
+              intro hall_es
+              obtain ⟨sc, h0⟩ := hall_es 0 hd rfl
+              subst h0
+              simp [valueListContainsUninit, valueContainsUninit]
+              exact ih (fun k ev hk => hall_es (k + 1) ev hk)
+          exact aux elems hall
         rw [hwf.ptr_bytes, hbor, hcaller]
-        simp [evalPlaceRead, hinit_elems, hdecl_arr, resolveProjectedTy, ht, validateValueForTy?,
-          hlen_elems]
+        simp [evalPlaceRead, readProjectedValue, valueContainsUninit, helems_no_uninit,
+          hinit_elems, hdecl_arr, resolveProjectedTy, ht, validateValueForTy?, hlen_elems]
       rw [hlen_rval]
       dsimp only
       rw [hprot, hbor]
@@ -2939,8 +2959,7 @@ theorem WellTypedScalarOperand.evalOperand_locals_eq
       cases slot with
       | dead | uninit => simp [hget] at heval
       | init val =>
-        simp [hget, readProjectedValue] at heval
-        exact heval.2.symm
+        cases hvc : valueContainsUninit val <;> simp_all [readProjectedValue]
 
 /-- Evaluating a `WellTypedScalarOperand` of element type `{ kind := elemKind, layoutIdx := 0 }`
 preserves `tf.locals[arrIdx]?` (since `arrIdx` has array type `[elemKind; count]`). -/
@@ -3149,7 +3168,7 @@ theorem evalLM2_1ScalarOperand_preserves_array_local
           (translateTy srcDecl.ty body.layouts) { m with stack := ⟨#[tf']⟩ }
         have ha_ok : evalOperand af.locals (.move ⟨srcIdx, .nil⟩) .nil globals body.layouts .nil =
             .ok (.scalar sc) (af.locals.set srcIdx .uninit) := by
-          simp [evalOperand, hslot, set?_eq_some_set hlt_af]
+          simp [evalOperand, readProjectedValue, hslot, set?_eq_some_set hlt_af]
         have hm_ok : (annealEvalOperand body.localDecls body.layouts
             (translateOperand (.move ⟨srcIdx, .nil⟩)) known >>= annealReadImmediate) m =
             .ok ⟨.scalar (.fromScalarInt msc), translateTy elemTy body.layouts⟩
@@ -5005,7 +5024,7 @@ theorem evalLM2_1ScalarOperand_with_indirect_dst
             machine := mach' }
         have ha : evalOperand af.locals (.move ⟨idx, .nil⟩) .nil globals body.layouts .nil =
             .ok (.scalar sc) (af.locals.set idx .uninit) := by
-          simp [evalOperand, hslot, set?_eq_some_set hlt_af]
+          simp [evalOperand, readProjectedValue, hslot, set?_eq_some_set hlt_af]
         have hget_dst : get? (af.locals.set idx .uninit) dstIdx = get? af.locals dstIdx := by
           simp only [get?_eq_getElem?, List.getElem?_set, hne, ↓reduceIte]
         have hnew : LocalRel mach decl body.layouts .uninit
@@ -5134,7 +5153,7 @@ theorem evalLM2_1ScalarOperand_for_agg_inplace
           (translateTy decl.ty body.layouts) { stack := ⟨#[tf']⟩, machine := mach' }
         have ha : evalOperand af.locals (.move ⟨idx, .nil⟩) .nil globals body.layouts .nil =
             .ok (.scalar sc) (af.locals.set idx .uninit) := by
-          simp [evalOperand, hslot, set?_eq_some_set hlt_af]
+          simp [evalOperand, readProjectedValue, hslot, set?_eq_some_set hlt_af]
         have hget_dst : get? (af.locals.set idx .uninit) dstIdx = get? af.locals dstIdx := by
           simp only [get?_eq_getElem?, List.getElem?_set, hne, ↓reduceIte]
         have hdst_pres : tf'.locals[dstIdx]? = tf.locals[dstIdx]? := by
@@ -9141,7 +9160,7 @@ theorem step_lm1_4_preserves_nodup_and_immediate
             have heop : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) .nil s.memory.globals
                 body.layouts .nil body.localDecls s.memory.callStack =
                 .ok v (s.frame.locals.set srcIdx .uninit) := by
-              simp [evalOperand, hslot_src, set?_eq_some_set hlt_af_src]
+              simp [evalOperand, readProjectedValue, himmRel.valueContainsUninit_eq_false, hslot_src, set?_eq_some_set hlt_af_src]
             unfold evalRvalue
             dsimp only
             rw [hbor, hcaller, heop]

@@ -1315,6 +1315,7 @@ inductive LocalRelLM2_3
       env decl.ty = some (tagBytes, variants) →
       (∀ l ∈ cachedLayout, l = translateTy decl.ty layouts) →
       EnumMemRel mach decl.ty layouts tagBytes variants v_act fieldVals mp →
+      valueListContainsUninit fieldVals = false →
       LocalRelLM2_3 env mach decl layouts (.init (.aggregate v_act fieldVals))
         ⟨.live (.indirect mp), cachedLayout⟩
 
@@ -1330,7 +1331,7 @@ theorem cachedLayout_eq {env : EnumTypeEnv} {mach : AnnealMachine}
   | enumDead _ _ _ _ _ hc => exact hc
   | enumUninitImm _ _ _ _ _ hc => exact hc
   | enumUninitInd _ _ _ _ _ hc _ => exact hc
-  | enumInd _ _ _ _ _ _ _ hc _ => exact hc
+  | enumInd _ _ _ _ _ _ _ hc _ _ => exact hc
 
 theorem layout_eq {env : EnumTypeEnv} {mach : AnnealMachine}
     {decl : LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
@@ -1358,7 +1359,7 @@ theorem cache_layout {env : EnumTypeEnv} {mach : AnnealMachine}
   | enumDead tb vs _ henv hv _ => exact .enumDead tb vs _ henv hv hc
   | enumUninitImm tb vs _ henv hv _ => exact .enumUninitImm tb vs _ henv hv hc
   | enumUninitInd tb vs mp _ henv _ hmp => exact .enumUninitInd tb vs mp _ henv hc hmp
-  | enumInd tb vs va fv mp _ henv _ hmp => exact .enumInd tb vs va fv mp _ henv hc hmp
+  | enumInd tb vs va fv mp _ henv _ hmp hno => exact .enumInd tb vs va fv mp _ henv hc hmp hno
 
 theorem allocLive {env : EnumTypeEnv} {mach : AnnealMachine}
     {decl : LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
@@ -1374,7 +1375,7 @@ theorem allocLive {env : EnumTypeEnv} {mach : AnnealMachine}
     injection hv with hv; injection hv with hv; subst hv
     rcases hmp with ⟨allocId, _, _, _, _, hprov, _, _, hlive, _, _, _, _, _, _, _, _, _⟩
     exact ⟨allocId, by rw [hprov]; rfl, hlive.any_true⟩
-  | enumInd _ _ _ _ mp _ _ _ hmp =>
+  | enumInd _ _ _ _ mp _ _ _ hmp _ =>
     intro mp' hv
     injection hv with hv; injection hv with hv; subst hv
     rcases hmp with ⟨allocId, _, _, _, _, _, _, _, hprov, _, _, hlive, _, _, _, _, _, _, _, _, _, _, _, _, _, _⟩
@@ -1396,8 +1397,8 @@ theorem of_stackAlloc_other {env : EnumTypeEnv} {mach : AnnealMachine}
   | enumUninitImm tb vs c henv hv hc => exact .enumUninitImm tb vs c henv hv hc
   | enumUninitInd tb vs mp c henv hc hmp =>
     exact .enumUninitInd tb vs mp c henv hc (hmp.of_stackAlloc_other hres)
-  | enumInd tb vs va fv mp c henv hc hmp =>
-    exact .enumInd tb vs va fv mp c henv hc (hmp.of_stackAlloc_other hres)
+  | enumInd tb vs va fv mp c henv hc hmp hno =>
+    exact .enumInd tb vs va fv mp c henv hc (hmp.of_stackAlloc_other hres) hno
 
 theorem of_updateAlloc_ne {env : EnumTypeEnv} {mach : AnnealMachine}
     {u : Nat} {updId : Miri.Memory.AllocId} {oldLa : AnnealLocalAlloc}
@@ -1452,9 +1453,9 @@ theorem of_updateAlloc_ne {env : EnumTypeEnv} {mach : AnnealMachine}
   | enumUninitInd tb vs mp c henv hc hmp =>
     exact .enumUninitInd tb vs mp c henv hc
       (hmp.of_updateAlloc_ne hu_lt hu_eq (hdisj mp rfl))
-  | enumInd tb vs va fv mp c henv hc hmp =>
+  | enumInd tb vs va fv mp c henv hc hmp hno =>
     exact .enumInd tb vs va fv mp c henv hc
-      (hmp.of_updateAlloc_ne hu_lt hu_eq (hdisj mp rfl))
+      (hmp.of_updateAlloc_ne hu_lt hu_eq (hdisj mp rfl)) hno
 
 theorem of_dealloc {env : EnumTypeEnv} {mach : AnnealMachine}
     {v : Miri.Interpreter.LocalValue AnnealProv}
@@ -1474,9 +1475,9 @@ theorem of_dealloc {env : EnumTypeEnv} {mach : AnnealMachine}
   | enumUninitInd tb vs mp c henv hc hmp =>
     exact .enumUninitInd tb vs mp c henv hc
       (hmp.of_dealloc fun mp0 hv0 => hdisj mp0 mp hv0 rfl)
-  | enumInd tb vs va fv mp c henv hc hmp =>
+  | enumInd tb vs va fv mp c henv hc hmp hno =>
     exact .enumInd tb vs va fv mp c henv hc
-      (hmp.of_dealloc fun mp0 hv0 => hdisj mp0 mp hv0 rfl)
+      (hmp.of_dealloc fun mp0 hv0 => hdisj mp0 mp hv0 rfl) hno
 
 end LocalRelLM2_3
 

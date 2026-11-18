@@ -1566,7 +1566,7 @@ theorem LocalRelLM2_3.to_localRel_of_none {env : EnumTypeEnv}
   | enumDead _ _ _ hs _ _ => rw [hnone] at hs; cases hs
   | enumUninitImm _ _ _ hs _ _ => rw [hnone] at hs; cases hs
   | enumUninitInd _ _ _ _ hs _ _ => rw [hnone] at hs; cases hs
-  | enumInd _ _ _ _ _ _ hs _ _ => rw [hnone] at hs; cases hs
+  | enumInd _ _ _ _ _ _ hs _ _ _ => rw [hnone] at hs; cases hs
 
 /-- `EnumLocalByteUninit` is invariant under changing a frame's program
 counter. -/
@@ -2557,7 +2557,7 @@ theorem evalProjection_downcast_field_simulation
         rw [EStateM.bind_eq_ok hdown_ok]; dsimp [annealReadImmediateLM2_2]; exact hread_err)]
     rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb hstmt hm_err]
     exact ⟨.ub _ _, (fun _ _ _ hu => huninit_m₁ _ _ hu), (fun _ hj => himm_m₁ _ hj)⟩
-  | enumInd tb' vs' v_act fieldVals mp c_s henv' _ hmem_i =>
+  | enumInd tb' vs' v_act fieldVals mp c_s henv' _ hmem_i _ =>
     have hop_s1 := frame_getLocalOperand_live tf₁ hget_s1
     rw [henv_src] at henv'; injection henv' with heq_p; rcases heq_p with ⟨rfl, rfl⟩
     rcases hmem_i with ⟨allocId, borTag, baseAddr, localAlloc, words, _,
@@ -2987,7 +2987,7 @@ theorem evalProjection_downcast_field_initialized_divergence
     rw [hslot_src] at hslot_s; cases hslot_s
   | enumUninitInd _ _ _ _ _ _ _ =>
     rw [hslot_src] at hslot_s; cases hslot_s
-  | enumInd tb' vs' v_act' fieldVals' mp c_s henv' _ hmem_i =>
+  | enumInd tb' vs' v_act' fieldVals' mp c_s henv' _ hmem_i _ =>
     rw [hslot_src] at hslot_s
     injection hslot_s with hs_eq
     injection hs_eq with hs_agg
@@ -3325,7 +3325,7 @@ theorem evalRvalue_discriminant_simulation
       rw [EStateM.bind_eq_error hrd_err]
     rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb hstmt hm_err]
     exact ⟨.ub _ _, (fun _ _ _ hu => huninit_m₁ _ _ hu), (fun _ hj => himm_m₁ _ hj)⟩
-  | enumInd tb' vs' v_act fieldVals mp c_s henv' _ hmem_i =>
+  | enumInd tb' vs' v_act fieldVals mp c_s henv' _ hmem_i _ =>
     rw [henv_src] at henv'; injection henv' with heq_p; rcases heq_p with ⟨rfl, rfl⟩
     have hv_act_lt : v_act < variants.length := by
       rcases hmem_i with ⟨_, _, _, _, _, _, _, hv_lt, _⟩; exact hv_lt
@@ -3513,7 +3513,7 @@ theorem step_setDiscriminant_simulation
     exact absurd hslot_d hnot_uninit
   | enumUninitInd _ _ _ _ _ _ _ =>
     exact absurd hslot_d hnot_uninit
-  | enumInd tb' vs' v_act fieldVals mp c_d henv' _ hmem_i =>
+  | enumInd tb' vs' v_act fieldVals mp c_d henv' _ hmem_i hno_uninit =>
     rw [henv_dst] at henv'; injection henv' with heq_p; rcases heq_p with ⟨rfl, rfl⟩
     rcases hmem_i with ⟨allocId, borTag, baseAddr, localAlloc, words, _,
       _, hv_act_lt, hprov, hmis, hmeta, hlive, hbase, hptr, hovf, hmut, halign,
@@ -3687,7 +3687,7 @@ theorem step_setDiscriminant_simulation
           LocalRelLM2_3 env mach' dstDecl body.layouts
             (.init (.aggregate variantIdx fieldVals)) (tf₀.locals[dstIdx]'hlt_d0) := by
         rw [hind₀]
-        exact .enumInd tagBytes variants variantIdx fieldVals mp _ henv_dst hc_some hmem_new
+        exact .enumInd tagBytes variants variantIdx fieldVals mp _ henv_dst hc_some hmem_new hno_uninit
       have hfr_mach' :
           FrameRelLM2_3 body env mach'
             { s.frame with locals := s.frame.locals.set dstIdx (.init (.aggregate variantIdx fieldVals)) }
@@ -4195,7 +4195,7 @@ private theorem finish_setDiscriminant_uninit_from_indirect
     .enumInd tagBytes variants variantIdx .nil mp
       (some (translateTy dstDecl.ty body.layouts)) henv_dst
       (fun _ hl => (Option.some.inj (Option.mem_def.mp hl)).symm)
-      henum_final
+      henum_final rfl
   have hmf_dst_down :
       tf_down.locals[dstIdx]? =
         some ⟨.live (.indirect mp), some (translateTy dstDecl.ty body.layouts)⟩ := by
@@ -4665,7 +4665,9 @@ private theorem evalOperands_enumScalarOps_shape
         | dead | uninit =>
           exact Or.inl (by simp [evalOperand, hget, hsl])
         | init val =>
-          exact Or.inr ⟨val, by simp [evalOperand, hget, hsl, readProjectedValue]⟩
+          cases hv_init : valueContainsUninit val with
+          | true => exact Or.inl (by simp [evalOperand, hget, hsl, readProjectedValue, hv_init])
+          | false => exact Or.inr ⟨val, by simp [evalOperand, hget, hsl, readProjectedValue, hv_init]⟩
     have hrest := evalOperands_enumScalarOps_shape locals globals hlocals_len rest (fun k hk =>
       hops (k + 1) (Nat.succ_lt_succ hk))
     rcases hfirst with hub0 | ⟨v0, hok0⟩
@@ -5573,13 +5575,33 @@ private theorem finish_aggregate_enum_from_indirect
           hbits_i, hinit'_i, hread'_i⟩
     have hfr_final_ex : FrameRelLM2_3Except body env dstIdx m_final.machine s.frame tf_end :=
       hfr_end.of_updateAlloc_excl hdisj_end hdst_end hprov hu_lt hu_eq
+    have hvals_no_uninit : valueListContainsUninit vals = false := by
+      have hlen_eq : vals.length = (variants[variantIdx]'hv).length := hpart_end.done_len
+      have hall : ∀ j (hj : j < vals.length), ∃ sc, get? vals j = some (.scalar sc) := by
+        intro j hj
+        obtain ⟨sc, _, hget_j, _⟩ := hpart_end.fields_rel j (by omega)
+        exact ⟨sc, hget_j⟩
+      have aux : ∀ (vs : List Value),
+          (∀ j (hj : j < vs.length), ∃ sc, get? vs j = some (.scalar sc)) →
+          valueListContainsUninit vs = false := by
+        intro vs
+        induction vs with
+        | nil => intro _; rfl
+        | cons v0 tl ih =>
+          intro hall_vs
+          obtain ⟨sc, h0⟩ := hall_vs 0 (Nat.zero_lt_succ _)
+          unfold get? at h0; simp only [List.getElem?_cons_zero, Option.some.injEq] at h0
+          subst h0
+          simp [valueListContainsUninit]
+          exact ih (fun j hj => hall_vs (j + 1) (Nat.succ_lt_succ hj))
+      exact aux vals hall
     have hloc_dst_final : LocalRelLM2_3 env m_final.machine dstDecl body.layouts
         (.init (.aggregate variantIdx vals))
         ⟨.live (.indirect mp), some (translateTy dstDecl.ty body.layouts)⟩ :=
       .enumInd tagBytes variants variantIdx vals mp
         (some (translateTy dstDecl.ty body.layouts)) henv_dst
         (fun _ hl => (Option.some.inj (Option.mem_def.mp hl)).symm)
-        henum_final
+        henum_final hvals_no_uninit
     have hmf_dst_end : tf_end.locals[dstIdx]? =
         some ⟨.live (.indirect mp), some (translateTy dstDecl.ty body.layouts)⟩ := by
       rw [Array.getElem?_eq_getElem hlt_end, hdst_end]
@@ -6030,7 +6052,7 @@ theorem evalRvalue_aggregate_enum_simulation
         (fun _ _ _ hu => EnumLocalByteUninit.of_cache_layout hframes hu)
         (fun j _ hj₀ => (hj₀ tf₀ hframes).cache_layout hlt_d0 _)
     exact ⟨hstep_rel, fun hno => ⟨fun _ => (hpost hno).1 rfl, (hpost hno).2⟩⟩
-  | enumInd _ _ v_old fv_old mp cd _ _ hmp =>
+  | enumInd _ _ v_old fv_old mp cd _ _ hmp _ =>
     rcases hmp with ⟨allocId, borTag, baseAddr, localAlloc, words_old, _,
       _, _, hprov, hmis, hmeta, hlive, hbase, hptr, hovf, hmut, halign,
       hbs, hlen, hpmap, hmask_old, _, _, _, _, _⟩
@@ -6373,7 +6395,7 @@ private theorem LocalRelLM2_3.valid_of_some
   | enumUninitInd _ _ _ _ henv' _ hmp =>
     rw [henv] at henv'; injection henv' with hp; rcases hp with ⟨rfl, rfl⟩
     cases hmp; assumption
-  | enumInd _ _ _ _ _ _ henv' _ hmp =>
+  | enumInd _ _ _ _ _ _ henv' _ hmp _ =>
     rw [henv] at henv'; injection henv' with hp; rcases hp with ⟨rfl, rfl⟩
     cases hmp; assumption
 
@@ -6896,7 +6918,7 @@ theorem step_enum_copy_move_simulation
     rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq
       hframe.location_eq hbb hstmt hm_ub]
     exact ⟨.ub _ _, fun hno => False.elim (hno _ rfl)⟩
-  | enumInd tb_s vs_s v_act fieldVals srcMp c_s henv_s _ hemr_s =>
+  | enumInd tb_s vs_s v_act fieldVals srcMp c_s henv_s _ hemr_s hno_uninit =>
     have hc_s : ∀ l, c_s = some l → l = translateTy srcDecl.ty body.layouts :=
       fun l hl => hcache_s l (by rw [hmls_s_eq]; exact hl)
     rw [henv_src] at henv_s
@@ -6960,7 +6982,7 @@ theorem step_enum_copy_move_simulation
         refine ⟨s.frame.locals, tf₁,
           by change evalOperand s.frame.locals (.copy ⟨srcIdx, .nil⟩) .nil
                s.memory.globals body.layouts .nil = _
-             simp [evalOperand, readProjectedValue, hslot_s, rootVal],
+             simp [evalOperand, readProjectedValue, valueContainsUninit, hno_uninit, hslot_s, rootVal],
           hm_c, hfr₀.cache_local_layout hsrc_decl hlt_s0,
           MemoryAllocDisjoint_cacheFrameLocalLayout hdisj₀ hlt_s0 _,
           rfl, rfl, rfl,
@@ -7008,7 +7030,7 @@ theorem step_enum_copy_move_simulation
         refine ⟨s.frame.locals.set srcIdx .uninit, tf₁,
           by change evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) .nil
                s.memory.globals body.layouts .nil = _
-             unfold evalOperand; dsimp only; rw [hslot_s]; dsimp only
+             unfold evalOperand; dsimp only; rw [hslot_s]; dsimp only [readProjectedValue, valueContainsUninit]; rw [hno_uninit]; dsimp only
              rw [set?_eq_some_set hlt_src_af .uninit],
           hm_m, hfr₁_mv,
           MemoryAllocDisjoint_deinitFrameLocal_lm2_3
@@ -7127,7 +7149,7 @@ theorem step_enum_copy_move_simulation
           hptr_d, by simpa only [hlay_dst] using hovf_d, hmut_d,
           by simpa only [hlay_dst] using hbs_d,
           by simpa only [hlay_dst] using halign_d⟩)
-      | enumInd _ _ _ _ destMp _ _ _ hemr_d =>
+      | enumInd _ _ _ _ destMp _ _ _ hemr_d _ =>
         rcases hemr_d with ⟨destId, tag_d, destBase, destLocal, _, _, _, _,
           hprov_d, hmis_d, hmeta_d, hlive_d, hbase_d, hptr_d, hovf_d, hmut_d,
           halign_d, hbs_d, _, _, _, _, _, _, _, _⟩
@@ -7218,7 +7240,7 @@ theorem step_enum_copy_move_simulation
             (fun _ hl => by
               rw [hlay_dst]
               exact (Option.some.inj (Option.mem_def.mp hl)).symm)
-            hemr_new)
+            hemr_new hno_uninit)
       dsimp only [mRes]
       rw [ha_ok_of (by rw [hslot_uninit]; nofun),
         miri_step_at_statement_ok _ hframes hframe.body_eq hframe.location_eq
@@ -7357,7 +7379,7 @@ theorem step_enum_copy_move_simulation
             (fun _ hl => by
               rw [hlay_dst]
               exact (Option.some.inj (Option.mem_def.mp hl)).symm)
-            hemr_new)
+            hemr_new hno_uninit)
       dsimp only [mRes]
       rw [ha_ok_of hnot_dead,
         miri_step_at_statement_ok _ hframes hframe.body_eq hframe.location_eq
@@ -7639,6 +7661,25 @@ private theorem set?_eq_setOrExtendFields_of_lt :
       simp [hlt', setOrExtendFields] at ih ⊢
       exact ih
 
+private theorem valueListContainsUninit_setOrExtendFields_scalar :
+    ∀ (vs : List Value) (idx : Nat) (sc : MirAst.ScalarInt),
+      idx ≤ vs.length →
+      valueListContainsUninit vs = false →
+      valueListContainsUninit (setOrExtendFields vs idx (.scalar sc)) = false
+  | [], 0, _, _, _ => rfl
+  | [], _ + 1, _, hle, _ => by cases hle
+  | hd :: tl, 0, _, _, hno => by
+    dsimp only [setOrExtendFields, valueListContainsUninit, valueContainsUninit] at hno ⊢
+    cases hvc : valueContainsUninit hd <;> rw [hvc] at hno
+    · exact hno
+    · cases hno
+  | hd :: tl, idx + 1, sc, hle, hno => by
+    dsimp only [setOrExtendFields, valueListContainsUninit] at hno ⊢
+    cases hvc : valueContainsUninit hd <;> rw [hvc] at hno
+    · exact valueListContainsUninit_setOrExtendFields_scalar tl idx sc
+        (Nat.le_of_succ_le_succ hle) hno
+    · cases hno
+
 private theorem writeProjectedValue_downcast_field_active_eq
     (locals : List LocalSlot) (v_act : Nat) (fieldVals : List Value)
     (vName : Option String) (fieldIdx : Nat) (fieldTy : Ty) (val : Value)
@@ -7870,7 +7911,7 @@ theorem step_downcast_field_write_simulation
         exact (List.getElem?_eq_some_iff.mp hslot_d0).1
       cases hloc_d0 with
       | base _ _ hn _ => rw [henv_dst] at hn; cases hn
-      | enumInd tb_d vs_d v_act fv_d mp c_d henv_d _ hemr =>
+      | enumInd tb_d vs_d v_act fv_d mp c_d henv_d _ hemr hno_uninit =>
         rw [henv_dst] at henv_d
         injection henv_d with hp_d; rcases hp_d with ⟨rfl, rfl⟩
         rcases hemr with
@@ -8124,7 +8165,7 @@ theorem step_downcast_field_write_simulation
             (.enumInd tagBytes variants variantIdx newFields mp
               (some (translateTy dstDecl.ty body.layouts)) henv_dst
               (fun _ hl => (Option.some.inj (Option.mem_def.mp hl)).symm)
-              hemr_new)
+              hemr_new (valueListContainsUninit_setOrExtendFields_scalar _ _ _ hfle hno_uninit))
         dsimp only [mRes]
         rw [ha_ok,
           miri_step_at_statement_ok _ hframes hframe.body_eq hframe.location_eq
@@ -8367,7 +8408,7 @@ theorem step_downcast_field_write_inactive_divergence
       exact Option.some.inj hg
     cases hloc_d0 with
     | base _ _ hn _ => rw [henv_dst] at hn; cases hn
-    | enumInd tb_d vs_d _ _ mp _ henv_d _ hemr =>
+    | enumInd tb_d vs_d _ _ mp _ henv_d _ hemr _ =>
       rw [henv_dst] at henv_d
       injection henv_d with hp_d; rcases hp_d with ⟨rfl, rfl⟩
       rcases hemr with
@@ -8839,7 +8880,7 @@ theorem step_enum_self_move_simulation
     rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq
       hframe.location_eq hbb hstmt hm_ub]
     exact ⟨.ub _ _, fun hno => False.elim (hno _ rfl)⟩
-  | enumInd tb_s vs_s v_act fieldVals srcMp c_s henv_s _ hemr_s =>
+  | enumInd tb_s vs_s v_act fieldVals srcMp c_s henv_s _ hemr_s hno_uninit =>
     rw [henv_idx] at henv_s
     injection henv_s with hp_s; rcases hp_s with ⟨rfl, rfl⟩
     have hemr_copy := hemr_s
@@ -8934,7 +8975,7 @@ theorem step_enum_self_move_simulation
       have hev_op :
           evalOperand s.frame.locals (.move ⟨idx, .nil⟩) .nil s.memory.globals
             body.layouts .nil body.localDecls = .ok rootVal locals₁ := by
-        unfold evalOperand; dsimp only; rw [hslot0]; dsimp only
+        unfold evalOperand; dsimp only; rw [hslot0]; dsimp only [readProjectedValue, valueContainsUninit]; rw [hno_uninit]; dsimp only
         rw [set?_eq_some_set hlt_af0 .uninit]
       rw [hev_op]; dsimp only
       rw [hvalid.validateLoadedValue_unproj hdecl (Or.inr rfl)]; dsimp only
@@ -8957,7 +8998,7 @@ theorem step_enum_self_move_simulation
         (.enumInd tagBytes variants v_act fieldVals (stackAllocPlace newId)
           (some wholeLay) henv_idx
           (fun _ hl => (Option.some.inj (Option.mem_def.mp hl)).symm)
-          hemr_new)
+          hemr_new hno_uninit)
     dsimp only [mRes]
     rw [ha_ok,
       miri_step_at_statement_ok _ hframes hframe.body_eq hframe.location_eq
@@ -10401,7 +10442,7 @@ theorem step_enum_self_copy_dead_or_uninit_simulation
     rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq
       hframe.location_eq hbb hstmt hm_ub]
     exact ⟨.ub _ _, fun hno => False.elim (hno _ rfl)⟩
-  | enumInd _ _ v_act fieldVals _ _ _ _ _ =>
+  | enumInd _ _ v_act fieldVals _ _ _ _ _ _ =>
     exact False.elim (hnot_init (.aggregate v_act fieldVals) hslot0)
 
 /-- Whole-enum self-copy overlapping-range divergence
@@ -10456,6 +10497,10 @@ theorem step_enum_self_copy_overlap_divergence
     exact (List.getElem?_eq_some_iff.mp hslot0).1
   rw [hslot] at hslot0
   injection hslot0 with hsl; subst hsl
+  have hroot_init : valueContainsUninit rootVal = false := by
+    cases hloc0 with
+    | base _ _ hnone _ => rw [henv_idx] at hnone; cases hnone
+    | enumInd _ _ _ _ _ _ _ _ _ hno => simp [valueContainsUninit, hno]
   have ha_ok :
       evalStmt s stmt body.localDecls body.layouts =
       MirStepNode.step
@@ -10465,7 +10510,7 @@ theorem step_enum_self_copy_overlap_divergence
     have hev :
         evalOperand s.frame.locals (.copy ⟨idx, .nil⟩) .nil s.memory.globals
           body.layouts .nil body.localDecls = .ok rootVal s.frame.locals := by
-      simp [evalOperand, readProjectedValue, hslot]
+      simp [evalOperand, readProjectedValue, hroot_init, hslot]
     rw [hev]; dsimp only
     rw [hvalid.validateLoadedValue_unproj hdecl (Or.inl rfl)]; dsimp only
     simp only [hprot, hbor, invalidateConflictingBorrows, hslot]
@@ -10522,7 +10567,7 @@ theorem step_enum_self_copy_overlap_divergence
     simp only [huses_mem, ↓reduceIte]
   cases hloc0 with
   | base _ _ hnone _ => rw [henv_idx] at hnone; cases hnone
-  | enumInd tb_s vs_s v_act fieldVals mp c_s henv_s _ hemr =>
+  | enumInd tb_s vs_s v_act fieldVals mp c_s henv_s _ hemr _ =>
     rw [henv_idx] at henv_s
     injection henv_s with hp_s; rcases hp_s with ⟨rfl, rfl⟩
     have hemr_copy := hemr
@@ -10864,7 +10909,7 @@ theorem step_enum_copy_move_uninitInd_divergence
           exact ⟨_, miri_step_at_statement_ok _ hframes hframe.body_eq
             hframe.location_eq hbb hstmt hm_ok rfl
             (hloc_end.trans hframe.location_eq)⟩
-        | enumInd _ _ _ _ destMp _ _ _ hemr_d =>
+        | enumInd _ _ _ _ destMp _ _ _ hemr_d _ =>
           rcases hemr_d with ⟨destId, tag_d, destBase, destLocal, _, _, _, _,
             hprov_d, _, _, hlive_d, hbase_d, hptr_d, _, hmut_d, _, hbs_d,
             _, _, _, _, _, _, _, _⟩
@@ -10982,7 +11027,7 @@ theorem step_enum_copy_move_uninitInd_divergence
           exact ⟨_, miri_step_at_statement_ok _ hframes hframe.body_eq
             hframe.location_eq hbb hstmt hm_ok rfl
             (hloc_end.trans hframe.location_eq)⟩
-        | enumInd _ _ _ _ destMp _ _ _ hemr_d =>
+        | enumInd _ _ _ _ destMp _ _ _ hemr_d _ =>
           rcases hemr_d with ⟨destId, tag_d, destBase, destLocal, _, _, _, _,
             hprov_d, _, _, hlive_d, hbase_d, hptr_d, _, hmut_d, _, hbs_d,
             _, _, _, _, _, _, _, _⟩
@@ -11142,7 +11187,10 @@ theorem step_return_enum_lm2_3_simulation
     exact False.elim
       (huninit_imm0 hslot0 topFrame hframes ⟨.live (.indirect mp0), c0⟩
         hmls0 mp0 rfl)
-  | enumInd tb0 vs0 v_act fieldVals mp0 _ henv_0 _ hemr =>
+  | enumInd tb0 vs0 v_act fieldVals mp0 _ henv_0 _ hemr hno_uninit =>
+    dsimp only [valueContainsUninit]
+    rw [hno_uninit]
+    dsimp only
     rw [hmem_ret]
     rw [henv0] at henv_0
     injection henv_0 with hp0; rcases hp0 with ⟨rfl, rfl⟩

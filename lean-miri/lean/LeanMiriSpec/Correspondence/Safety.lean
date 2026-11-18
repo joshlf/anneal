@@ -4099,7 +4099,7 @@ theorem step_assign_move_preserves_immediate
           have hop_ok : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) .nil
               s.memory.globals body.layouts .nil body.localDecls =
               .ok v (s.frame.locals.set srcIdx .uninit) := by
-            simp [evalOperand, hslot_src, set?_eq_some_set hlt_af_src]
+            simp [evalOperand, readProjectedValue, himmRel.valueContainsUninit_eq_false, hslot_src, set?_eq_some_set hlt_af_src]
           rw [hop_ok]
           dsimp only
           rw [hval_ok]
@@ -4441,7 +4441,11 @@ theorem ValidFrameLocation.preservedExt
         cases slot with
         | dead => exact fun hstep => absurd hstep fail_ne_emitStep
         | uninit => exact fun hstep => absurd hstep fail_ne_emitStep
-        | init _ => exact fun hstep => absurd hstep retNormal_ne_emitStep
+        | init retV =>
+          dsimp only []
+          cases valueContainsUninit retV with
+          | true => exact fun hstep => absurd hstep fail_ne_emitStep
+          | false => exact fun hstep => absurd hstep retNormal_ne_emitStep
     | unreachable hunreach =>
       unfold evalTerminator at hstep
       rw [hunreach] at hstep
@@ -4538,7 +4542,11 @@ theorem NonAddrTakenImmediate.preservedExt
           cases slot with
           | dead => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
           | uninit => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
-          | init _ => exact fun ha_eq => absurd ha_eq MirStepNode_retNormal_ne_step
+          | init retV =>
+            dsimp only []
+            cases valueContainsUninit retV with
+            | true => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
+            | false => exact fun ha_eq => absurd ha_eq MirStepNode_retNormal_ne_step
     | unreachable hunreach =>
       rcases hstate with ⟨topFrame, hframes, _, _, hframe, _, _, _, _, _⟩
       have hm_step := miri_step_at_terminator hframes hframe.body_eq hframe.location_eq hbb
@@ -5278,6 +5286,37 @@ inductive StepRelUnionReturnLM2_4
       StepRelUnionReturnLM2_4 body m
         (MirStepNode.fail .ub) (m', .error (.undefinedBehavior msg))
 
+private theorem valueListContainsUninit_encodeRawAbstractByteVals :
+    ∀ bs : List AbstractByte, valueListContainsUninit (encodeRawAbstractByteVals bs) = false
+  | [] => rfl
+  | .uninit :: rest => valueListContainsUninit_encodeRawAbstractByteVals rest
+  | .init _ none :: rest => valueListContainsUninit_encodeRawAbstractByteVals rest
+  | .init _ (some _) :: rest => valueListContainsUninit_encodeRawAbstractByteVals rest
+
+private theorem valueListContainsUninit_append :
+    ∀ (xs ys : List Value),
+      valueListContainsUninit xs = false →
+      valueListContainsUninit ys = false →
+      valueListContainsUninit (xs ++ ys) = false
+  | [], _, _, hy => hy
+  | x :: xs, ys, hx, hy => by
+    dsimp only [List.cons_append, valueListContainsUninit] at hx ⊢
+    cases hvc : valueContainsUninit x <;> rw [hvc] at hx
+    · exact valueListContainsUninit_append xs ys hx hy
+    · cases hx
+
+private theorem valueContainsUninit_unionOverlay_eq_false
+    (n j : Nat) (sc_low : MirAst.ScalarInt) (mergedBytes : List AbstractByte) :
+    valueContainsUninit (.aggregate 0
+      (unionSlotFields n j (.scalar sc_low) ++
+        [.aggregate 0 (encodeRawAbstractByteVals mergedBytes)])) = false := by
+  have h1 : valueListContainsUninit (unionSlotFields n j (.scalar sc_low)) = false :=
+    valueContainsUninit_unionSlotFields_scalar n j sc_low
+  dsimp only [valueContainsUninit]
+  refine valueListContainsUninit_append _ _ h1 ?_
+  dsimp only [valueListContainsUninit, valueContainsUninit]
+  rw [valueListContainsUninit_encodeRawAbstractByteVals]
+
 /-- **`LM-2.4` union and immediate root return** (`StateRelLM2_4`,
 `annealStepHooksLM2_4`): root-frame `Return` steps both machines in lockstep
 (`StepRelUnionReturnLM2_4`) when `_0` is a union (`UnionLocalRel.union` or
@@ -5297,7 +5336,10 @@ theorem step_terminator_return_union_lm2_4_simulation
     (hdecl0 : get? body.localDecls 0 = some decl0)
     (hsz0 : (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
     (hnot_uninit_ind :
-      ¬ (get? s.frame.locals 0 = some .uninit ∧
+      ¬ ((get? s.frame.locals 0 = some .uninit ∨
+            ∃ retVal,
+              get? s.frame.locals 0 = some (.init retVal) ∧
+              valueContainsUninit retVal = true) ∧
           ∃ topFrame mp0 c0,
             m.stack.frames = #[topFrame] ∧
             topFrame.locals[0]? = some ⟨.live (.indirect mp0), c0⟩)) :
@@ -5364,20 +5406,25 @@ theorem step_terminator_return_union_lm2_4_simulation
       cases slot0 with
       | dead => exact False.elim (hne_dead rfl)
       | uninit =>
-        exact False.elim (hnot_uninit_ind ⟨hslot0, topFrame, mp0, c0, hframes, hmls0⟩)
+        exact False.elim (hnot_uninit_ind ⟨Or.inl hslot0, topFrame, mp0, c0, hframes, hmls0⟩)
       | init retVal =>
-        rw [hconf0]; dsimp only []; rw [hdis0]
-        have hop0 := annealControlHooks_returnOperand_indirect hframes hget0
-        rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
-          hframe.location_eq hbb hcleanup hretCont hop0
-          (annealControlHooks_popFrame_singleton hframes)
-          (annealControlHooks_copyReturn_empty _ hretPlace)
-          (annealControlHooks_cleanupFrame_eq false topFrame _)]
-        exact .retRootUnion decl0 retVal mp0 s.memory _ hdecl0 hop0
-          (.base _ _ (.indirect (.init retVal) mp0 none (fun _ h => nomatch h)
-            (fun h => nomatch h) hmem)) rfl
+        cases hvc : valueContainsUninit retVal
+        · rw [hconf0]; dsimp only []; rw [hdis0]
+          rw [hvc]; dsimp only []
+          have hop0 := annealControlHooks_returnOperand_indirect hframes hget0
+          rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+            hframe.location_eq hbb hcleanup hretCont hop0
+            (annealControlHooks_popFrame_singleton hframes)
+            (annealControlHooks_copyReturn_empty _ hretPlace)
+            (annealControlHooks_cleanupFrame_eq false topFrame _)]
+          exact .retRootUnion decl0 retVal mp0 s.memory _ hdecl0 hop0
+            (.base _ _ (.indirect (.init retVal) mp0 none (fun _ h => nomatch h)
+              (fun h => nomatch h) hmem)) rfl
+        · exact False.elim (hnot_uninit_ind
+            ⟨Or.inr ⟨retVal, hslot0, hvc⟩, topFrame, mp0, c0, hframes, hmls0⟩)
   | union S n f f0Ty sc mp0 _ _ hwt hfields hf hmem =>
     rw [hconf0]; dsimp only []; rw [hdis0]
+    rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only []
     have hop0 := annealControlHooks_returnOperand_indirect hframes hget0
     rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
       hframe.location_eq hbb hcleanup hretCont hop0
@@ -5388,6 +5435,7 @@ theorem step_terminator_return_union_lm2_4_simulation
       (.union S n f f0Ty sc mp0 none (fun _ h => nomatch h) hwt hfields hf hmem) rfl
   | unionOverlay S n j f0Ty sc sc_low mergedBytes mp0 _ _ hwt hfields hspec hmem =>
     rw [hconf0]; dsimp only []; rw [hdis0]
+    rw [valueContainsUninit_unionOverlay_eq_false n j sc_low mergedBytes]; dsimp only []
     have hop0 := annealControlHooks_returnOperand_indirect hframes hget0
     rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
       hframe.location_eq hbb hcleanup hretCont hop0
@@ -5414,7 +5462,10 @@ theorem step_terminator_return_wellTypedUnion_lm2_4_simulation
     (hdecl0 : get? body.localDecls 0 = some decl0)
     (hwt0 : WellTypedUnionTy body.layouts decl0.ty S)
     (hnot_uninit_ind :
-      ¬ (get? s.frame.locals 0 = some .uninit ∧
+      ¬ ((get? s.frame.locals 0 = some .uninit ∨
+            ∃ retVal,
+              get? s.frame.locals 0 = some (.init retVal) ∧
+              valueContainsUninit retVal = true) ∧
           ∃ topFrame mp0 c0,
             m.stack.frames = #[topFrame] ∧
             topFrame.locals[0]? = some ⟨.live (.indirect mp0), c0⟩)) :

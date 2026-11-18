@@ -292,8 +292,7 @@ theorem WellTypedScalarOperand.prestate_of_evalOperand_ok {body : CapturedMir}
       | uninit => simp [evalOperand, hslot] at heval
       | init v =>
         simp only [evalOperand, readProjectedValue, hslot] at heval
-        injection heval with hv _
-        subst hv
+        cases hvc : valueContainsUninit v <;> rw [hvc] at heval <;> cases heval
         rfl
 
 /-- Copy-operand evaluation without `annealReadImmediate` on an immediate

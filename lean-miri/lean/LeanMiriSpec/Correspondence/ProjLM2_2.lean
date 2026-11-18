@@ -1140,11 +1140,17 @@ theorem ZeroScalarWrappedVal.writeProjectedValue_eq
   induction h with
   | bare =>
     exact ⟨.scalar sc', .bare, fun _ => rfl, fun _ => rfl, fun _ => rfl⟩
-  | wrap_cons fty rest subVal _ ih =>
+  | wrap_cons fty rest subVal hsub ih =>
     obtain ⟨subVal', hsub', hw_sub, _, _⟩ := ih
     refine ⟨.aggregate 0 [subVal'], .wrap_cons fty rest subVal' hsub', ?_, ?_, ?_⟩
     · intro locals
-      simp [writeProjectedValue, get?, set?, hw_sub locals]
+      cases rest with
+      | nil => cases hsub'; rfl
+      | cons r0 rs =>
+        cases hsub with
+        | wrap_cons _ _ _ _ =>
+          conv => lhs; unfold writeProjectedValue; simp only [get?, List.getElem?_cons_zero]
+          rw [hw_sub locals]; rfl
     · intro hnil; cases hnil
     · intro hsc; cases hsc
 
@@ -1602,6 +1608,42 @@ theorem ZeroScalarWrappedVal.noZeroByteLeaves {sc : MirAst.ScalarInt} {v : Value
   | bare => exact hpos
   | wrap_cons _ _ _ _ ih => exact ⟨ih, True.intro⟩
 
+mutual
+  theorem NoZeroByteLeaves.valueContainsUninit_eq_false :
+      ∀ {v : Value}, NoZeroByteLeaves v → valueContainsUninit v = false
+    | .scalar _, _ => rfl
+    | .aggregate 0 (hd :: tl), ⟨hhd, htl⟩ => by
+      simp [valueContainsUninit, valueListContainsUninit,
+        hhd.valueContainsUninit_eq_false, htl.valueListContainsUninit_eq_false]
+
+  theorem NoZeroByteLeavesList.valueListContainsUninit_eq_false :
+      ∀ {vs : List Value}, NoZeroByteLeavesList vs → valueListContainsUninit vs = false
+    | [], _ => rfl
+    | _ :: _, ⟨hhd, htl⟩ => by
+      simp [valueListContainsUninit,
+        hhd.valueContainsUninit_eq_false, htl.valueListContainsUninit_eq_false]
+end
+
+theorem ZeroScalarWrappedVal.valueContainsUninit_eq_false {sc : MirAst.ScalarInt} {v : Value}
+    {projs : List ProjectionElem} (h : ZeroScalarWrappedVal sc v projs) :
+    valueContainsUninit v = false := by
+  induction h with
+  | bare => rfl
+  | wrap_cons _ _ _ _ ih => simp [valueContainsUninit, valueListContainsUninit, ih]
+
+private theorem setOrExtendFields_eq_set_of_lt :
+    ∀ (vs : List Value) (idx : Nat) (v : Value),
+      idx < vs.length → setOrExtendFields vs idx v = vs.set idx v
+  | [], _, _, hlt => by cases hlt
+  | _ :: _, 0, _, _ => rfl
+  | hd :: tl, idx + 1, v, hlt =>
+    congrArg (hd :: ·) (setOrExtendFields_eq_set_of_lt tl idx v (Nat.lt_of_succ_lt_succ hlt))
+
+private theorem eq_of_ok_eq_readProjectedValue_nil {u v : Value}
+    (h : .ok u = readProjectedValue [] v []) : v = u := by
+  dsimp [readProjectedValue] at h
+  cases hvc : valueContainsUninit v <;> rw [hvc] at h <;> cases h <;> rfl
+
 theorem valueLeafBytesList_set_eq {vs : List Value} {idx : Nat} {oldV newV : Value}
     (hget : get? vs idx = some oldV)
     (heq : valueLeafBytes newV = valueLeafBytes oldV) :
@@ -1695,42 +1737,47 @@ theorem ValidAggregateFieldPath.writeProjectedValue_agg_length_eq
   | single fields idx fty oldVal hget =>
     intro sf sf' h1 h2
     injection h1 with _ hsf; subst hsf
-    dsimp [writeProjectedValue] at hw
-    rw [hget] at hw; dsimp only at hw
     have hlt : idx < fields.length := by
       rw [get?_eq_getElem?] at hget
       exact (List.getElem?_eq_some_iff.mp hget).1
     have hset : set? fields idx newVal = some (fields.set idx newVal) := by
       simp [set?, hlt]
-    rw [hset] at hw
+    dsimp [writeProjectedValue] at hw
+    rw [hget] at hw; dsimp only at hw; rw [hset] at hw
     injection hw with hr; subst hr
     injection h2 with _ hsf'; subst hsf'
     exact List.length_set
-  | cons fields idx fty rest subVal hget _ _ =>
+  | cons fields idx fty rest subVal hget _ hsub =>
     intro sf sf' h1 h2
     injection h1 with _ hsf; subst hsf
-    dsimp [writeProjectedValue] at hw
-    rw [hget] at hw; dsimp only at hw
-    cases hw_s : writeProjectedValue [] subVal rest newVal with
-    | ub | unsupported => rw [hw_s] at hw; cases hw
-    | ok subVal' =>
-      rw [hw_s] at hw; dsimp only at hw
-      have hlt : idx < fields.length := by
-        rw [get?_eq_getElem?] at hget
-        exact (List.getElem?_eq_some_iff.mp hget).1
-      have hset : set? fields idx subVal' = some (fields.set idx subVal') := by
-        simp [set?, hlt]
-      rw [hset] at hw
-      injection hw with hr; subst hr
-      injection h2 with _ hsf'; subst hsf'
-      exact List.length_set
+    obtain ⟨hd_s, tl_s, hagg_s⟩ := hsub.nonempty_agg
+    have hlt : idx < fields.length := by
+      rw [get?_eq_getElem?] at hget
+      exact (List.getElem?_eq_some_iff.mp hget).1
+    cases rest with
+    | nil => cases hsub
+    | cons r0 rs =>
+      dsimp [writeProjectedValue] at hw
+      rw [hget, hagg_s] at hw; dsimp only at hw
+      rw [← hagg_s] at hw
+      cases hw_s : writeProjectedValue [] subVal (r0 :: rs) newVal with
+      | ub | unsupported => rw [hw_s] at hw; cases hw
+      | ok subVal' =>
+        rw [hw_s] at hw; dsimp only at hw
+        have hset : set? fields idx subVal' = some (fields.set idx subVal') := by
+          simp [set?, hlt]
+        rw [hset] at hw
+        injection hw with hr; subst hr
+        injection h2 with _ hsf'; subst hsf'
+        exact List.length_set
 
 theorem ValidAggregateFieldPath.writeProjectedValue_spec
     {layouts : LayoutTable} {rootVal : Value} {projs : List ProjectionElem}
     (h : ValidAggregateFieldPath layouts rootVal projs)
-    (newVal : Value) :
+    (newVal : Value)
+    (hnew_init : valueContainsUninit newVal = false := by rfl) :
     ∃ oldVal rootVal',
-      readProjectedValue [] rootVal projs = .ok oldVal ∧
+      readProjectedValue [] rootVal projs = readProjectedValue [] oldVal [] ∧
       (∀ locals, writeProjectedValue locals rootVal projs newVal = .ok rootVal') ∧
       ValidAggregateFieldPath layouts rootVal' projs ∧
       (valueLeafBytes newVal = valueLeafBytes oldVal →
@@ -1761,14 +1808,11 @@ theorem ValidAggregateFieldPath.writeProjectedValue_spec
     · simp [readProjectedValue, hget]
     · intro locals
       dsimp [writeProjectedValue]
-      rw [hget]
-      dsimp only
-      rw [hset]
+      rw [hget]; dsimp only; rw [hset]
     · intro hbytes
       simp [valueLeafBytes, valueLeafBytesList_set_eq hget hbytes]
     · intro locals
-      dsimp [readProjectedValue]
-      rw [hget_new]
+      simp [readProjectedValue, hget_new, hnew_init]
     · intro rest
       refine ⟨?_, ?_⟩
       · dsimp [List.append, readProjectedValue]
@@ -1833,12 +1877,16 @@ theorem ValidAggregateFieldPath.writeProjectedValue_spec
       rw [hget]
       exact hread_old
     · intro locals
-      dsimp [writeProjectedValue]
-      rw [hget]
-      dsimp only
-      rw [hw_sub locals]
-      dsimp only
-      rw [hset]
+      obtain ⟨hd_s, tl_s, hagg_s⟩ := hsub.nonempty_agg
+      cases rest with
+      | nil => cases hsub
+      | cons r0 rs =>
+        dsimp [writeProjectedValue]
+        rw [hget, hagg_s]
+        dsimp only
+        rw [← hagg_s, hw_sub locals]
+        dsimp only
+        rw [hset]
     · intro hbytes
       simp [valueLeafBytes, valueLeafBytesList_set_eq hget (hbytes_sub hbytes)]
     · intro locals
@@ -1908,15 +1956,24 @@ theorem ValidAggregateFieldPath.writeProjectedValue_spec
               exact hsub2_len (hd :: tl) hagg
             exact .cons _ _ _ _ _ hget_new hsub2'_len (hpath_q hsub2)
 
+private def getFieldChain : Value → List ProjectionElem → Option Value
+  | v, [] => some v
+  | .aggregate 0 fields, .field idx _ :: rest =>
+    match get? fields idx with
+    | some sub => getFieldChain sub rest
+    | none => none
+  | _, _ => none
+
 theorem ValidAggregateFieldPath.prefix_of_append {layouts : LayoutTable} :
     ∀ {projs rest : List ProjectionElem} {rootVal : Value},
       projs ≠ [] →
       rest ≠ [] →
       ValidAggregateFieldPath layouts rootVal (projs ++ rest) →
       ∃ subVal subIdx subTy,
+        getFieldChain rootVal projs = some subVal ∧
         projs.getLast? = some (.field subIdx subTy) ∧
         ValidAggregateFieldPath layouts rootVal projs ∧
-        readProjectedValue [] rootVal projs = .ok subVal ∧
+        readProjectedValue [] rootVal projs = readProjectedValue [] subVal [] ∧
         (∀ sf, subVal = .aggregate 0 sf →
           (∀ a b bOff,
             (translateTy subTy layouts).layout.backendRepr =
@@ -1930,17 +1987,18 @@ theorem ValidAggregateFieldPath.prefix_of_append {layouts : LayoutTable} :
     dsimp [List.append] at h
     cases h with
     | cons fields idx fty _ subVal hget hsub_len hsub =>
-      refine ⟨subVal, idx, fty, rfl, .single fields idx fty subVal hget, ?_, hsub_len, hsub, ?_⟩
+      refine ⟨subVal, idx, fty, by simp [getFieldChain, hget], rfl,
+        .single fields idx fty subVal hget, ?_, hsub_len, hsub, ?_⟩
       · simp [readProjectedValue, hget]
       · simp [readProjectedValue, hget]
   | _ :: p1 :: ps, q :: qs, _, _, hrest_ne, h => by
     dsimp [List.append] at h
     cases h with
     | cons fields idx fty _ subVal0 hget0 hsub0_len hsub0 =>
-      obtain ⟨subVal, subIdx, subTy, hlast, hp_pre, hr_pre, hsub_len, hp_rest, hr_rest⟩ :=
+      obtain ⟨subVal, subIdx, subTy, hchain, hlast, hp_pre, hr_pre, hsub_len, hp_rest, hr_rest⟩ :=
         ValidAggregateFieldPath.prefix_of_append
           (projs := p1 :: ps) (rest := q :: qs) (by nofun) hrest_ne hsub0
-      refine ⟨subVal, subIdx, subTy, hlast,
+      refine ⟨subVal, subIdx, subTy, by simp [getFieldChain, hget0, hchain], hlast,
         .cons fields idx fty (p1 :: ps) subVal0 hget0 hsub0_len hp_pre,
         ?_, hsub_len, hp_rest, ?_⟩
       · dsimp [readProjectedValue]; rw [hget0]; exact hr_pre
@@ -1962,16 +2020,16 @@ theorem ValidAggregateFieldPath.read_substruct_scalarPair
     ValidAggregateFieldPath layouts rootVal projs ∧
     (∀ locals, readProjectedValue locals rootVal projs =
       .ok (.aggregate 0 [.scalar sc₀, .scalar sc₁])) := by
-  obtain ⟨subVal0, subIdx', subTy', hlast', hvpath_p, hr_p0, hsub_len, hp_sub0, hr_eq0⟩ :=
+  obtain ⟨subVal0, subIdx', subTy', hch0, hlast', hvpath_p, hr_p0, hsub_len, hp_sub0, hr_eq0⟩ :=
     ValidAggregateFieldPath.prefix_of_append hprojs_ne (by nofun) hp0
-  obtain ⟨subVal1, _, _, _, _, hr_p1, _, hp_sub1, hr_eq1⟩ :=
+  obtain ⟨subVal1, _, _, hch1, _, _, _, _, hp_sub1, hr_eq1⟩ :=
     ValidAggregateFieldPath.prefix_of_append hprojs_ne (by nofun) hp1
   rw [hlast] at hlast'
   injection hlast' with hfeq
   injection hfeq with _ hty_eq
   subst hty_eq
-  rw [hr_p0] at hr_p1
-  injection hr_p1 with hsub_eq; subst hsub_eq
+  rw [hch0] at hch1
+  injection hch1 with hsub_eq; subst hsub_eq
   rw [hr0] at hr_eq0
   rw [hr1] at hr_eq1
   cases hp_sub0 with
@@ -1988,13 +2046,13 @@ theorem ValidAggregateFieldPath.read_substruct_scalarPair
       | nil => rw [get?_eq_getElem?] at hget0; cases hget0
       | cons u0 tl0 =>
         rw [get?_eq_getElem?, List.getElem?_cons_zero, Option.some.injEq] at hget0; subst hget0
-        injection hr_eq0.symm with hu0; subst hu0
+        have hu0 := (eq_of_ok_eq_readProjectedValue_nil hr_eq0).symm; subst hu0
         cases tl0 with
         | nil => rw [get?_eq_getElem?] at hget1; cases hget1
         | cons u1 tl1 =>
           rw [get?_eq_getElem?, List.getElem?_cons_succ, List.getElem?_cons_zero,
             Option.some.injEq] at hget1; subst hget1
-          injection hr_eq1.symm with hu1; subst hu1
+          have hu1 := (eq_of_ok_eq_readProjectedValue_nil hr_eq1).symm; subst hu1
           cases tl1 with
           | cons _ _ => simp at hlen_le
           | nil =>
@@ -2012,7 +2070,7 @@ theorem ValidAggregateFieldPath.read_substruct_scalarWrap
     ValidAggregateFieldPath layouts rootVal projs ∧
     (∀ locals, readProjectedValue locals rootVal projs =
       .ok (.aggregate 0 [.scalar sc₀])) := by
-  obtain ⟨subVal0, subIdx', subTy', hlast', hvpath_p, hr_p0, hsub_len, hp_sub0, hr_eq0⟩ :=
+  obtain ⟨subVal0, subIdx', subTy', _, hlast', hvpath_p, hr_p0, hsub_len, hp_sub0, hr_eq0⟩ :=
     ValidAggregateFieldPath.prefix_of_append hprojs_ne (by nofun) hp0
   rw [hlast] at hlast'
   injection hlast' with hfeq
@@ -2029,7 +2087,7 @@ theorem ValidAggregateFieldPath.read_substruct_scalarWrap
     | nil => rw [get?_eq_getElem?] at hget0; cases hget0
     | cons u0 tl0 =>
       rw [get?_eq_getElem?, List.getElem?_cons_zero, Option.some.injEq] at hget0; subst hget0
-      injection hr_eq0.symm with hu0; subst hu0
+      have hu0 := (eq_of_ok_eq_readProjectedValue_nil hr_eq0).symm; subst hu0
       cases tl0 with
       | cons _ _ => simp at hlen_eq
       | nil =>
@@ -2366,6 +2424,15 @@ inductive StructMemPlaceRel
       StructMemPlaceRel mach ty layouts fields paths rootVal mp
 
 namespace StructMemPlaceRel
+
+theorem valueContainsUninit_eq_false
+    {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {rootVal : Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (h : StructMemPlaceRel mach ty layouts fields paths rootVal mp) :
+    valueContainsUninit rootVal = false := by
+  rcases h with ⟨_, _, _, _, _, _, _, ⟨_, hnz⟩, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _⟩
+  exact hnz.valueContainsUninit_eq_false
 
 /-- An **unpadded** `StructMemPlaceRel` (every byte of the aggregate lies in a
 leaf field: `size ≤ structSumFieldBytes fields`) has its whole byte range
@@ -2806,6 +2873,18 @@ theorem size_lt_4gib {ty : Ty} {layouts : LayoutTable}
   | scalarPair _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ hsz4g
       _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ =>
     exact hsz4g
+
+theorem valueContainsUninit_eq_false {ty : Ty} {layouts : LayoutTable}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {v : Value} {imm : Miri.Interpreter.Immediate AnnealProv}
+    (h : ImmediateStructRel ty layouts fields paths v imm) :
+    valueContainsUninit v = false := by
+  cases h with
+  | scalarWrapper _ _ _ _ _ _ _ _ _ _ _ _ _ hw _ _ _ _ =>
+    exact hw.valueContainsUninit_eq_false
+  | scalarPair _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ hw₀ hw₁ _ _ _ _ _ _ _ _ =>
+    simp [valueContainsUninit, valueListContainsUninit,
+      hw₀.valueContainsUninit_eq_false, hw₁.valueContainsUninit_eq_false]
 
 theorem toImmediateRel_of_flat {ty : Ty} {layouts : LayoutTable}
     {f₀ f₁ : StructFieldDesc} {mid₀ mid₁ : Ty}
@@ -4765,17 +4844,22 @@ theorem ValidAggregateFieldPath.noZeroByteLeaves_write
           cases tl with
           | nil => rw [get?_eq_getElem?] at hget; cases hget
           | cons x xs => exact ih_l n hget htl
-    dsimp [writeProjectedValue] at hw
-    rw [hget] at hw; dsimp only at hw
-    cases hw_s : writeProjectedValue [] subVal rest newVal with
-    | ub | unsupported => rw [hw_s] at hw; cases hw
-    | ok subVal' =>
-      rw [hw_s] at hw; dsimp only at hw
-      have hset : set? fields idx subVal' = some (fields.set idx subVal') := by
-        simp [set?, hlt]
-      rw [hset] at hw
-      injection hw with hr; subst hr
-      exact NoZeroByteLeaves.of_set_nonempty hget hroot (ih hw_s hsub_nz)
+    obtain ⟨hd_s, tl_s, hagg_s⟩ := hsub.nonempty_agg
+    cases rest with
+    | nil => cases hsub
+    | cons r0 rs =>
+      dsimp [writeProjectedValue] at hw
+      rw [hget, hagg_s] at hw; dsimp only at hw
+      rw [← hagg_s] at hw
+      cases hw_s : writeProjectedValue [] subVal (r0 :: rs) newVal with
+      | ub | unsupported => rw [hw_s] at hw; cases hw
+      | ok subVal' =>
+        rw [hw_s] at hw; dsimp only at hw
+        have hset : set? fields idx subVal' = some (fields.set idx subVal') := by
+          simp [set?, hlt]
+        rw [hset] at hw
+        injection hw with hr; subst hr
+        exact NoZeroByteLeaves.of_set_nonempty hget hroot (ih hw_s hsub_nz)
 
 theorem StructMemPlaceRel.write_leaf_field
     {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
@@ -4817,8 +4901,8 @@ theorem StructMemPlaceRel.write_leaf_field
   dsimp at hp_ne_k hfl_k hprim_k hvpath_k hrpv_old hsz_old
   obtain ⟨oldVal, rootVal', hrpv_spec, hw_spec, hvpath_k', hbytes_eq, hrpv_new, _, hdisj_spec⟩ :=
     hvpath_k.writeProjectedValue_spec (.scalar sc')
-  rw [hrpv_old] at hrpv_spec
-  injection hrpv_spec with hold_eq; subst hold_eq
+  have hold_eq := (eq_of_ok_eq_readProjectedValue_nil (hrpv_old.symm.trans hrpv_spec)).symm
+  subst hold_eq
   have hsc_bytes : sc'.sizeBytes = sc_old.sizeBytes := by
     have heq_ts : translateSizeBytes sc'.sizeBytes = translateSizeBytes sc_old.sizeBytes :=
       hsz'.symm.trans hsz_old
@@ -5531,8 +5615,8 @@ theorem StructMemPlaceRel.write_substruct_scalarPair
   let newSubVal : Value := .aggregate 0 [.scalar sc₀', .scalar sc₁']
   obtain ⟨oldSubVal, rootVal', hrpv_spec, hw_spec, hvpath_sub', hbytes_eq, _, happend_spec, hdisj_spec⟩ :=
     hvpath_sub.writeProjectedValue_spec newSubVal
-  rw [hrpv_sub []] at hrpv_spec
-  injection hrpv_spec with hold_eq; subst hold_eq
+  have hold_eq := (eq_of_ok_eq_readProjectedValue_nil ((hrpv_sub []).symm.trans hrpv_spec)).symm
+  subst hold_eq
   have hsc0_bytes : sc₀'.sizeBytes = sc₀_old.sizeBytes := by
     have heq_ts : translateSizeBytes sc₀'.sizeBytes = translateSizeBytes sc₀_old.sizeBytes :=
       hsz₀'.symm.trans hsz₀_old
@@ -6605,8 +6689,8 @@ theorem StructMemPlaceRel.write_substruct_scalarWrap
   let newSubVal : Value := .aggregate 0 [.scalar sc₀']
   obtain ⟨oldSubVal, rootVal', hrpv_spec, hw_spec, hvpath_sub', hbytes_eq, _, happend_spec, hdisj_spec⟩ :=
     hvpath_sub.writeProjectedValue_spec newSubVal
-  rw [hrpv_sub []] at hrpv_spec
-  injection hrpv_spec with hold_eq; subst hold_eq
+  have hold_eq := (eq_of_ok_eq_readProjectedValue_nil ((hrpv_sub []).symm.trans hrpv_spec)).symm
+  subst hold_eq
   have hsc0_bytes : sc₀'.sizeBytes = sc₀_old.sizeBytes := by
     have heq_ts : translateSizeBytes sc₀'.sizeBytes = translateSizeBytes sc₀_old.sizeBytes :=
       hsz₀'.symm.trans hsz₀_old

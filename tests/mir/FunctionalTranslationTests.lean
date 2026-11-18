@@ -798,16 +798,36 @@ private theorem advanceCursorMut_bb0_switch
             (Nat.ble (c.pos + delta) c.len).toNat,
             advanceCursorMutPreSwitchState c delta 1,
             advanceCursorMutPreSwitchState c delta 2) := by
-  have h_raw :
+  let s5 : MachineState :=
+    { frame := {
+        blockIdx := 0
+        stmtIdx := 5
+        locals :=
+          [.uninit,
+           .init (frameCursorCodec.encode c),
+           .init (.scalar ⟨delta, 4⟩),
+           .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
+           .uninit,
+           .uninit,
+           .uninit] }
+      memory :=
+        { emptyMemory with
+          borrows :=
+            [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .reservedFrz false }]
+          nextTag := 2 } }
+  have h_pre5 :
       runMirToBinarySwitch 8 advanceCursorMutMirBody
         (initMachineStateWithMemory advanceCursorMutMirBody
           [frameCursorCodec.encode c, .scalar ⟨delta, 4⟩] emptyMemory) =
+        runMirToBinarySwitch 3 advanceCursorMutMirBody s5 := rfl
+  have h_raw :
+      runMirToBinarySwitch 3 advanceCursorMutMirBody s5 =
         let sumVal := wrapScalarBits (c.pos.add delta) (scalarModulus 4)
         let cmpSc := boolToScalar (Nat.ble sumVal c.len)
         some (!cmpSc.bits.beq 0, cmpSc.bits,
               advanceCursorMutPreSwitchRawState c delta sumVal cmpSc 1,
               advanceCursorMutPreSwitchRawState c delta sumVal cmpSc 2) := rfl
-  rw [h_raw]
+  rw [h_pre5, h_raw]
   dsimp only []
   rw [wrapU32_add h_add_lt, boolToScalar_eq]
   rfl

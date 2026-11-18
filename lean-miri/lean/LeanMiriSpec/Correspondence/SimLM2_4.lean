@@ -4397,7 +4397,8 @@ theorem union_whole_copy_initMask_preservation_simulation
       body.layouts =
       .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) s.frame.locals s.memory := by
     unfold evalRvalue; dsimp only; rw [hbor, hcaller]
-    simp only [evalOperand, hu_slot, readProjectedValue, hvld]
+    simp only [evalOperand, hu_slot, readProjectedValue]
+    rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only; rw [hvld]
   let locals₂ := s.frame.locals.set w (.init (.aggregate 0 (unionSlotFields n f (.scalar sc))))
   have ha_ok : evalStmt s ⟨.assign ⟨w, .nil⟩ (.use (.copy ⟨u, .nil⟩)), span⟩
       body.localDecls body.layouts = MirStepNode.step (advanceStmt s locals₂ s.memory) := by
@@ -4728,7 +4729,8 @@ theorem union_whole_move_initMask_preservation_simulation
       body.layouts =
       .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) locals₁ s.memory := by
     unfold evalRvalue; dsimp only; rw [hbor, hcaller]
-    simp only [evalOperand, hu_slot, set?_eq_some_set hlt_af_u, hvld, locals₁]
+    simp only [evalOperand, readProjectedValue, hu_slot, set?_eq_some_set hlt_af_u, locals₁]
+    rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only; rw [hvld]
   have hw_uninit₁ : get? locals₁ w = some .uninit := by
     dsimp only [locals₁]
     rw [get?_eq_getElem?, List.getElem?_set_ne (Ne.symm hwu), ← get?_eq_getElem?]
@@ -5308,6 +5310,34 @@ theorem elemSize_mul_ok {layouts : LayoutTable} {arrTy : Ty} {elemKind : RigidTy
   rw [hcond]
   rfl
 
+private theorem ArraySliceRel.valueContainsUninit_aggregate_eq_false
+    {elemKind : RigidTy} {c : Nat} {layouts : LayoutTable} {xs : List Value}
+    {relOff : Miri.ABI.Size}
+    {alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)}
+    (h : ArraySliceRel elemKind c layouts xs relOff alloc) (v : VariantIdx) :
+    valueContainsUninit (.aggregate v xs) = false := by
+  dsimp only [valueContainsUninit]
+  have hall : ∀ k (hk : k < xs.length), ∃ sc, get? xs k = some (.scalar sc) := by
+    intro k hk
+    have hget : get? xs k = some (xs[k]'hk) := by
+      unfold get?; exact List.getElem?_eq_getElem hk
+    obtain ⟨sc, _, hsc, _⟩ := h.elem_rel k (xs[k]'hk) hget
+    exact ⟨sc, hsc ▸ hget⟩
+  have aux : ∀ (vs : List Value),
+      (∀ k (hk : k < vs.length), ∃ sc, get? vs k = some (.scalar sc)) →
+      valueListContainsUninit vs = false := by
+    intro vs
+    induction vs with
+    | nil => intro _; rfl
+    | cons hd tl ih =>
+      intro hvs
+      obtain ⟨sc, h0⟩ := hvs 0 (Nat.zero_lt_succ _)
+      unfold get? at h0; simp only [List.getElem?_cons_zero, Option.some.injEq] at h0
+      subst h0
+      dsimp only [valueListContainsUninit, valueContainsUninit]
+      exact ih (fun k hk => hvs (k + 1) (Nat.succ_lt_succ hk))
+  exact aux xs hall
+
 /-- **`evalProjection_subslice_simulation`** (`LM-2.4`): the `Subslice`
 projection `a[fromIdx..toIdx]` (or `a[fromIdx..len - toIdx]` when `fromEnd`) of
 a memory-backed array `a` of `count` primitive scalars related by `MemPlaceRel`,
@@ -5440,7 +5470,10 @@ theorem evalProjection_subslice_simulation
     refine ⟨?_, ?_, allocId, tag, baseAddr, relOffset, localAlloc, hprov, hlive, hbase, hptr,
       hslice.subslice hcnt_le⟩
     · simp only [readProjectedValue, extractSubslice_inBounds hlen_elems hin]
-      rfl
+      change (match valueContainsUninit (.aggregate 0 sub) with
+        | false => ProjReadResult.ok (.aggregate 0 sub)
+        | true => .ub) = _
+      rw [(hslice.subslice hcnt_le).valueContainsUninit_aggregate_eq_false 0]
     · simp only [annealProjectList, Miri.Interpreter.project, hnot_ge64]
       change (do
         let next ← Miri.Interpreter.projectSubslice cx base (UInt64.ofNat fromIdx)
@@ -10280,7 +10313,8 @@ theorem step_union_whole_copy_or_move_overwrite_simulation
             .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) s.frame.locals s.memory := by
           unfold evalRvalue; dsimp only; rw [hbor, hcaller]
           simp only [unionWholeOperand, ↓reduceIte, Bool.false_eq_true, evalOperand,
-            hu_slot, readProjectedValue, hvld]
+            hu_slot, readProjectedValue]
+          rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only; rw [hvld]
         unfold evalStmt; dsimp only; rw [hrv]; simp [hw_dead]
       · simp only [↓reduceIte] at hvld
         have hrv : evalRvalue s.frame.locals (.use (unionWholeOperand true u)) s.memory
@@ -10288,8 +10322,9 @@ theorem step_union_whole_copy_or_move_overwrite_simulation
             .ok (.aggregate 0 (unionSlotFields n f (.scalar sc)))
               (s.frame.locals.set u .uninit) s.memory := by
           unfold evalRvalue; dsimp only; rw [hbor, hcaller]
-          simp only [unionWholeOperand, ↓reduceIte, evalOperand, hu_slot,
-            set?_eq_some_set hlt_af_u, hvld]
+          simp only [unionWholeOperand, ↓reduceIte, evalOperand, readProjectedValue, hu_slot,
+            set?_eq_some_set hlt_af_u]
+          rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only; rw [hvld]
         have hw1 : get? (s.frame.locals.set u .uninit) w = some .dead := by
           rw [get?_eq_getElem?, List.getElem?_set_ne (Ne.symm hwu), ← get?_eq_getElem?]
           exact hw_dead
@@ -10417,7 +10452,10 @@ theorem step_union_whole_copy_or_move_overwrite_simulation
         cases isMove <;>
           (simp only [↓reduceIte, Bool.false_eq_true] at hvld;
            simp only [unionWholeOperand, ↓reduceIte, Bool.false_eq_true, evalOperand,
-             readProjectedValue, hu_slot, set?_eq_some_set hlt_af_u, locals₁, hvld])
+             readProjectedValue, hu_slot, set?_eq_some_set hlt_af_u, locals₁];
+           rw [valueContainsUninit_unionSlotFields_scalar n f sc];
+           dsimp only;
+           rw [hvld])
       unfold evalStmt; dsimp only; rw [hrv]; simp only []
       rw [hprot, hbor]; dsimp only [invalidateConflictingBorrows]; rw [hmem_same]
       simp [hw_slot₁, set?_eq_some_set hlt_af_w₁, locals₂]
@@ -10562,7 +10600,8 @@ theorem step_union_self_copy_overlap_divergence
         body.localDecls body.layouts =
         .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) s.frame.locals s.memory := by
       unfold evalRvalue; dsimp only; rw [hbor, hcaller]
-      simp only [evalOperand, readProjectedValue, hu_slot, hvld]
+      simp only [evalOperand, readProjectedValue, hu_slot]
+      rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only; rw [hvld]
     unfold evalStmt; dsimp only; rw [hrv]; simp only []
     rw [hprot, hbor]; dsimp only [invalidateConflictingBorrows]; rw [hmem_same]
     simp [hu_slot, set?_eq_some_set hlt_af_u]
@@ -12399,7 +12438,10 @@ theorem evalProjection_nested_subslice_simulation
       simp only [readProjectedValue, extractSubslice_inBounds (elems := elems)
         (by cases harr elemKind count elems hwf.arr_kind rfl with | intro _ h => exact h.2.2.elems_len) hin1,
         extractSubslice_inBounds hlen_sub1' hin2']
-      rfl
+      change (match valueContainsUninit (.aggregate 0 sub2) with
+        | false => ProjReadResult.ok (.aggregate 0 sub2)
+        | true => .ub) = _
+      rw [hslice2_raw.valueContainsUninit_aggregate_eq_false 0]
     · unfold annealProjectList; dsimp only; rw [hproj1]; dsimp only [bind, Except.bind]
       simp only [annealProjectList, bind, Except.bind, Miri.Interpreter.project, hnot_ge64]
       change (do

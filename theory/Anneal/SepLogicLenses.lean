@@ -2927,10 +2927,10 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
         simp [ProvenancePtr.tag, hLookB, hPerm, hP]
         rw [hEnvNone, hT, hCaller]
         cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
-        | none => simp [hFT, hInit]
+        | none => simp [hInit]
         | some ft =>
           cases ft with
-          | callerReferent _ => simp [hFT, hInit]
+          | callerReferent _ => simp [hInit]
           | savedFrame _ _ => nomatch hFT
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove
@@ -2964,10 +2964,10 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
         simp [ProvenancePtr.tag, hLookB, hPerm, hP]
         rw [hEnvNone, hT, hCaller]
         cases hFT : foreignFrameTarget? [] m.callerLocals entry.targetFrameDepth rp.allocId with
-        | none => simp [hFT, hInit]
+        | none => simp [hInit]
         | some ft =>
           cases ft with
-          | callerReferent _ => simp [hFT, hInit]
+          | callerReferent _ => simp [hInit]
           | savedFrame _ _ => nomatch hFT
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove

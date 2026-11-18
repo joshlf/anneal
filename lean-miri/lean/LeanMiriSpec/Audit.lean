@@ -25165,7 +25165,10 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hdecl0 : get? body.localDecls 0 = some decl0)
     (hsz0 : (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
     (hnot_uninit_ind :
-      ¬ (get? s.frame.locals 0 = some .uninit ∧
+      ¬ ((get? s.frame.locals 0 = some .uninit ∨
+            ∃ retVal,
+              get? s.frame.locals 0 = some (.init retVal) ∧
+              valueContainsUninit retVal = true) ∧
           ∃ topFrame mp0 c0,
             m.stack.frames = #[topFrame] ∧
             topFrame.locals[0]? = some ⟨.live (.indirect mp0), c0⟩)) :
@@ -25295,7 +25298,10 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {decl0 : MirAst.LocalDecl} {S : Nat} (hdecl0 : get? body.localDecls 0 = some decl0)
     (hwt0 : WellTypedUnionTy body.layouts decl0.ty S)
     (hnot_uninit_ind :
-      ¬ (get? s.frame.locals 0 = some .uninit ∧
+      ¬ ((get? s.frame.locals 0 = some .uninit ∨
+            ∃ retVal,
+              get? s.frame.locals 0 = some (.init retVal) ∧
+              valueContainsUninit retVal = true) ∧
           ∃ topFrame mp0 c0,
             m.stack.frames = #[topFrame] ∧
             topFrame.locals[0]? = some ⟨.live (.indirect mp0), c0⟩)) :

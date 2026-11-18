@@ -821,7 +821,7 @@ theorem evalOperand_move_simulation
             have hop_ok : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) .nil
                 s.memory.globals body.layouts .nil body.localDecls =
                 .ok v (s.frame.locals.set srcIdx .uninit) := by
-              simp [evalOperand, hslot_src, set?_eq_some_set hlt_af_src]
+              simp [evalOperand, readProjectedValue, himmRel.valueContainsUninit_eq_false, hslot_src, set?_eq_some_set hlt_af_src]
             rw [hop_ok]
             dsimp only
             rw [hval_ok]

@@ -824,12 +824,10 @@ theorem step_terminator_drop_projected_init_no_glue_divergence
           .ok ⟨.live (.immediate (.scalarPair (.fromScalarInt msc₁) (.fromScalarInt msc₂))), lay⟩ := by
         unfold Miri.Interpreter.Frame.getLocal
         simp [hlt_mf, hmls_p, pure, Except.pure]
-      have hset : set? s.frame.locals localId (.init deinitPair) =
-          some (s.frame.locals.set localId (.init deinitPair)) :=
-        set?_eq_some_set hlt_af
       refine ⟨?_, ?_⟩
-      · refine ⟨{ s with frame := { blockIdx := target, stmtIdx := 0,
-          locals := s.frame.locals.set localId (.init deinitPair) } }, ?_, rfl, ?_, ?_⟩
+      · refine ⟨{ s with
+          frame := { blockIdx := target, stmtIdx := 0,
+                     locals := s.frame.locals.set localId (.init deinitPair) } }, ?_, rfl, ?_, ?_⟩
         · rw [stepMirFn_activeMirBody_eq rootBody s hphase]
           have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
           simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
@@ -840,8 +838,7 @@ theorem step_terminator_drop_projected_init_no_glue_divergence
           dsimp only
           rw [hNoUnion]
           rcases hfield with rfl | rfl <;>
-          · dsimp only [deinitPair, ↓reduceIte, deinitProjectedValue, get?, set?]
-            rw [hset]
+            simp [deinitPair, deinitProjectedValue, get?, set?, hlt_af]
         · rw [get?_eq_getElem?, List.getElem?_set_self hlt_af]
         · rcases hfield with rfl | rfl <;> rfl
       · have hpush_go :
@@ -4590,7 +4587,7 @@ theorem evalCallArgOperand_simulation
           exact .ub _ _
         · have ha : evalOperand callerAf.locals (.copy ⟨idx, .nil⟩) borrows globals
               callerBody.layouts callerLocals = .ok v callerAf.locals := by
-            simp [evalOperand, readProjectedValue, hslot]
+            simp [evalOperand, readProjectedValue, hslot, himmRel.valueContainsUninit_eq_false]
           obtain ⟨hread, _⟩ :=
             annealReadImmediate_of_immediateRel himmRel hsz_nz (translateTy decl.ty callerBody.layouts)
               { m with stack := ⟨⟨restMfs.reverse ++ [callerMf']⟩⟩ }
@@ -4661,7 +4658,7 @@ theorem evalCallArgOperand_simulation
         exact .ub _ _
       · have ha : evalOperand callerAf.locals (.move ⟨idx, .nil⟩) borrows globals
             callerBody.layouts callerLocals = .ok v (callerAf.locals.set idx .uninit) := by
-          simp [evalOperand, hslot, set?_eq_some_set hlt_af]
+          simp [evalOperand, readProjectedValue, himmRel.valueContainsUninit_eq_false, hslot, set?_eq_some_set hlt_af]
         obtain ⟨hread, _⟩ :=
           annealReadImmediate_of_immediateRel himmRel hsz_nz (translateTy srcDecl.ty callerBody.layouts)
             { m with stack := ⟨⟨restMfs.reverse ++ [callerMf']⟩⟩ }
@@ -8515,7 +8512,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
       evalOperand s.frame.locals (.move ⟨fnIdx, .nil⟩) s.memory.borrows s.memory.globals
         (activeMirBody rootBody s).layouts s.memory.callerLocals =
       .ok (.ptr ptrVal 8) (s.frame.locals.set fnIdx .uninit) := by
-    unfold evalOperand
+    unfold evalOperand readProjectedValue
     dsimp only []
     rw [hpre.fn_slot]
     dsimp only []
@@ -9005,7 +9002,7 @@ theorem step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence
         evalOperand s.frame.locals (.move ⟨fnIdx, .nil⟩) s.memory.borrows s.memory.globals
           (activeMirBody rootBody s).layouts s.memory.callerLocals =
         .ok (.ptr ptrVal 8) (s.frame.locals.set fnIdx .uninit) := by
-      unfold evalOperand; dsimp only []; rw [hpre.fn_slot]; dsimp only []
+      unfold evalOperand readProjectedValue; dsimp only []; rw [hpre.fn_slot]; dsimp only []
       rw [set?_eq_some_set hpre.fn_lt_af .uninit]
     rw [evalOperand_move_nil_any, hmove_a]
     dsimp only []
@@ -9237,7 +9234,7 @@ theorem step_terminator_call_indirect_layoutCompat_fnPtr_divergence
         evalOperand s.frame.locals (.move ⟨fnIdx, .nil⟩) s.memory.borrows s.memory.globals
           (activeMirBody rootBody s).layouts s.memory.callerLocals =
         .ok (.ptr ptrVal 8) (s.frame.locals.set fnIdx .uninit) := by
-      unfold evalOperand; dsimp only []; rw [hpre.fn_slot]; dsimp only []
+      unfold evalOperand readProjectedValue; dsimp only []; rw [hpre.fn_slot]; dsimp only []
       rw [set?_eq_some_set hpre.fn_lt_af .uninit]
     rw [evalOperand_move_nil_any, hmove_a]
     dsimp only []

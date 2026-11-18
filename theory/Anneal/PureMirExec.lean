@@ -16416,7 +16416,94 @@ inductive PureRustIntrinsicKind : Type
   | threeWayCompare
   | ubChecks
   | constEvalSelect
-  deriving DecidableEq, Repr
+  deriving Repr
+
+@[reducible]
+def PureRustIntrinsicKind.toIdx : PureRustIntrinsicKind → Nat
+  | .ctlz => 0
+  | .ctlzNonzero => 1
+  | .cttz => 2
+  | .cttzNonzero => 3
+  | .ctpop => 4
+  | .bswap => 5
+  | .bitreverse => 6
+  | .wrappingAdd => 7
+  | .wrappingSub => 8
+  | .wrappingMul => 9
+  | .saturatingAdd => 10
+  | .saturatingSub => 11
+  | .uncheckedAdd => 12
+  | .uncheckedSub => 13
+  | .uncheckedMul => 14
+  | .uncheckedDiv => 15
+  | .uncheckedRem => 16
+  | .uncheckedShl => 17
+  | .uncheckedShr => 18
+  | .exactDiv => 19
+  | .threeWayCompare => 20
+  | .ubChecks => 21
+  | .constEvalSelect => 22
+
+@[reducible]
+def PureRustIntrinsicKind.ofIdx : Nat → PureRustIntrinsicKind
+  | 0 => .ctlz
+  | 1 => .ctlzNonzero
+  | 2 => .cttz
+  | 3 => .cttzNonzero
+  | 4 => .ctpop
+  | 5 => .bswap
+  | 6 => .bitreverse
+  | 7 => .wrappingAdd
+  | 8 => .wrappingSub
+  | 9 => .wrappingMul
+  | 10 => .saturatingAdd
+  | 11 => .saturatingSub
+  | 12 => .uncheckedAdd
+  | 13 => .uncheckedSub
+  | 14 => .uncheckedMul
+  | 15 => .uncheckedDiv
+  | 16 => .uncheckedRem
+  | 17 => .uncheckedShl
+  | 18 => .uncheckedShr
+  | 19 => .exactDiv
+  | 20 => .threeWayCompare
+  | 21 => .ubChecks
+  | 22 => .constEvalSelect
+  | _ => .ctlz
+
+theorem PureRustIntrinsicKind.ofIdx_toIdx :
+    ∀ k : PureRustIntrinsicKind, ofIdx k.toIdx = k
+  | .ctlz => rfl
+  | .ctlzNonzero => rfl
+  | .cttz => rfl
+  | .cttzNonzero => rfl
+  | .ctpop => rfl
+  | .bswap => rfl
+  | .bitreverse => rfl
+  | .wrappingAdd => rfl
+  | .wrappingSub => rfl
+  | .wrappingMul => rfl
+  | .saturatingAdd => rfl
+  | .saturatingSub => rfl
+  | .uncheckedAdd => rfl
+  | .uncheckedSub => rfl
+  | .uncheckedMul => rfl
+  | .uncheckedDiv => rfl
+  | .uncheckedRem => rfl
+  | .uncheckedShl => rfl
+  | .uncheckedShr => rfl
+  | .exactDiv => rfl
+  | .threeWayCompare => rfl
+  | .ubChecks => rfl
+  | .constEvalSelect => rfl
+
+@[reducible]
+instance : DecidableEq PureRustIntrinsicKind := fun a b =>
+  match decEq a.toIdx b.toIdx with
+  | isTrue h =>
+    isTrue (by rw [← PureRustIntrinsicKind.ofIdx_toIdx a, ← PureRustIntrinsicKind.ofIdx_toIdx b, h])
+  | isFalse h =>
+    isFalse (fun hab => h (congrArg PureRustIntrinsicKind.toIdx hab))
 
 def stripCharPrefix : List Char → List Char → Option (List Char)
   | [], s => some s
