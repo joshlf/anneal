@@ -5521,7 +5521,7 @@ mod tests {
 
     #[test]
     fn lean_jobs_follow_memory_thresholds() {
-        // 32 GiB capsule: always 1 worker, even with > 24 GiB available.
+        // 32 GiB host: always 1 worker, even with > 24 GiB available.
         assert_eq!(
             itree_lean_jobs_for_memory(Some(32 * GIB_KIB), Some(30 * GIB_KIB)),
             1

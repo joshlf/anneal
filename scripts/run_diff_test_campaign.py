@@ -62,9 +62,6 @@ from typing import Any
 import xml.etree.ElementTree as ET
 
 
-REMOTE_SYNC_BIN = "/usr/bin/remote-sync"
-REMOTE_SYNC_FLAG = "--force_client_creation_at_head"
-
 EXIT_SUCCESS = 0
 EXIT_INTERNAL_ERROR = 1
 EXIT_HARNESS_FAILED = 2
@@ -74,16 +71,6 @@ EXIT_DIVERGENCE_DETECTED = 4
 DEFAULT_MIN_ORACLE_ELAPSED_MS = 50.0
 DEFAULT_MAX_ORACLE_ERRORS = 0
 _MAX_SAFE_NONNEG_INT = (1 << 63) - 1
-
-_NON_ABSENT_RPC_STATUS_RE = re.compile(
-    r"(?:^|[\s(\[=])(?:"
-    r"cancelled|canceled|unknown|invalid_argument|deadline_exceeded|"
-    r"already_exists|permission_denied|resource_exhausted|failed_precondition|"
-    r"aborted|out_of_range|unimplemented|internal|unavailable|data_loss|"
-    r"unauthenticated"
-    r")(?:\s*:|[\])]|\s+desc\b|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
 
 
 def _reject_json_constant(token: str) -> Any:
@@ -252,9 +239,9 @@ HARNESS_INT_KEYS = (
 # Ledger keys that earlier compile-only versions of this runner dropped when
 # running without an oracle. Live-oracle history (`fingerprint_history`,
 # `resolved_history`, `quarantined_fingerprints`, `last_*_signature`,
-# `per_suite_runs`, `schema_version`, ...) is deliberately NOT listed: the
-# capsule launcher uploads `state/` after every run, so stripping it on a
-# pass-through `--compile-only` run would erase the shared remote ledger's aging
+# `per_suite_runs`, `schema_version`, ...) is deliberately NOT listed: external
+# runners preserve and upload `state/` across runs, so stripping it on a
+# pass-through `--compile-only` run would erase the shared ledger's aging
 # history and seed-sensitivity baselines.
 OBSOLETE_LEDGER_KEYS = (
     "total_miri_candidates_evaluated",
@@ -341,144 +328,6 @@ def utc_now_iso() -> str:
 
 def utc_date_prefix() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-
-
-def has_remote_sync() -> bool:
-    return os.path.isfile(REMOTE_SYNC_BIN) and os.access(REMOTE_SYNC_BIN, os.X_OK)
-
-
-def run_remote_sync(args: list[str]) -> subprocess.CompletedProcess[str]:
-    cmd = [REMOTE_SYNC_BIN, REMOTE_SYNC_FLAG, *args]
-    return subprocess.run(cmd, text=True, capture_output=True, check=False)
-
-
-def check_remote_uri(remote_uri: str) -> None:
-    if not remote_uri:
-        return
-    norm = os.path.normpath(remote_uri)
-    if (
-        remote_uri.startswith("/mnt/fuse/rw/")
-        or norm == "/mnt/fuse/rw"
-        or norm.startswith("/mnt/fuse/rw/")
-    ):
-        raise ValueError(
-            f"Refusing FUSE path `{remote_uri}`; always use `/remote/...` URIs with "
-            f"`{REMOTE_SYNC_BIN} {REMOTE_SYNC_FLAG}`."
-        )
-    if not remote_uri.startswith("/remote/"):
-        try:
-            real = os.path.realpath(remote_uri)
-        except OSError:
-            real = norm
-        if real == "/mnt/fuse/rw" or real.startswith("/mnt/fuse/rw/"):
-            raise ValueError(
-                f"Refusing FUSE path `{remote_uri}` (resolves to `{real}`); always use "
-                f"`/remote/...` URIs with `{REMOTE_SYNC_BIN} {REMOTE_SYNC_FLAG}`."
-            )
-
-
-def _is_absent_remote_error(err_text: str) -> bool:
-    lower = err_text.lower()
-    if _NON_ABSENT_RPC_STATUS_RE.search(lower):
-        return False
-    if (
-        "permission denied" in lower
-        or "access denied" in lower
-        or "deadline exceeded" in lower
-    ):
-        return False
-    return any(
-        tok in lower
-        for tok in ("not_found", "no files matched", "no such file")
-    )
-
-
-def sync_state_from_remote(
-    remote_uri: str, state_dir: Path, include_ratchet: bool = True
-) -> bool:
-    """Pulls the ledger (and coverage ratchet in live mode) from `/remote/` via `remote-sync` RPC.
-
-    Each file is staged into a sibling temporary path and atomically moved into
-    place only on success so transient remote read errors never clobber valid
-    pre-existing files in a reused `--state-dir`.
-
-    Returns `False` if any remote state file failed to read with a non-absent
-    error so callers can avoid overwriting `/remote/.../state/` at upload time.
-    """
-    if not remote_uri or not has_remote_sync():
-        return True
-    check_remote_uri(remote_uri)
-    state_subdir = state_dir / "state"
-    state_subdir.mkdir(parents=True, exist_ok=True)
-    names = ["campaign_ledger.json"]
-    if include_ratchet:
-        names.append("coverage_ratchet.json")
-    base = remote_uri.rstrip("/")
-    pid = os.getpid()
-    all_reads_ok = True
-    for name in names:
-        dst = state_subdir / name
-        tmp_dst = state_subdir / f".sync_tmp_{pid}_{name}"
-        tmp_dst.unlink(missing_ok=True)
-        remote_src = f"{base}/state/{name}"
-        res = run_remote_sync(["cp", "-f", remote_src, str(tmp_dst)])
-        if res.returncode != 0:
-            tmp_dst.unlink(missing_ok=True)
-            err_detail = (res.stderr or res.stdout or "").strip()
-            if not err_detail or not _is_absent_remote_error(err_detail):
-                all_reads_ok = False
-                suffix = f": {err_detail}" if err_detail else ""
-                sys.stderr.write(
-                    f"warning: failed to fetch `{remote_src}` (exit {res.returncode}){suffix}; "
-                    f"preserving local {dst}\n"
-                )
-        elif tmp_dst.is_file():
-            os.replace(tmp_dst, dst)
-    return all_reads_ok
-
-
-def _filter_written_for_remote(
-    state_dir: Path, remote_uri: str, written: list[Path], remote_state_ok: bool
-) -> list[Path]:
-    if remote_state_ok or not remote_uri or not has_remote_sync():
-        return written
-    filtered: list[Path] = []
-    for p in written:
-        try:
-            in_state = p.relative_to(state_dir).parts[:1] == ("state",)
-        except ValueError:
-            in_state = False
-        if not in_state:
-            filtered.append(p)
-    if len(filtered) != len(written):
-        sys.stderr.write(
-            "warning: could not read shared remote state; skipping upload of state/\n"
-        )
-    return filtered
-
-
-def sync_state_to_remote(state_dir: Path, remote_uri: str, written: list[Path]) -> None:
-    """Uploads the files this run wrote under `state_dir` to `/remote/`.
-
-    Only `written` is uploaded, so stale files in a reused state directory are
-    never republished.
-    """
-    if not remote_uri or not has_remote_sync():
-        return
-    check_remote_uri(remote_uri)
-    base = remote_uri.rstrip("/")
-    created_dirs: set[str] = set()
-    for subdir in ["state", "reports"]:
-        remote_dir = f"{base}/{subdir}"
-        run_remote_sync(["mkdir", "-p", remote_dir])
-        created_dirs.add(remote_dir)
-    for local_file in written:
-        rel = local_file.relative_to(state_dir)
-        remote_parent = f"{base}/{rel.parent}"
-        if remote_parent not in created_dirs:
-            run_remote_sync(["mkdir", "-p", remote_parent])
-            created_dirs.add(remote_parent)
-        run_remote_sync(["cp", "-f", str(local_file), f"{base}/{rel}"])
 
 
 def load_ledger(ledger_path: Path) -> dict[str, Any]:
@@ -6064,7 +5913,6 @@ def is_standalone_gate_invocation(args: argparse.Namespace) -> bool:
         and not args.miri_identity
         and not args.miri_only
         and not args.compile_only
-        and not args.remote_uri.strip()
         and args.junit_xml is None
     )
 
@@ -7057,15 +6905,14 @@ def recover_baseline_coverage_ratchet(baseline_uri: str, ratchet_path: Path) -> 
       ratchet already exists at `ratchet_path`;
     - `BASELINE_RECOVERY_RECOVERED`: `baseline_uri` was parsed and written/merged into
       `ratchet_path`;
-    - `BASELINE_RECOVERY_ABSENT`: `baseline_uri` points to a genuinely non-existent
-      remote/local file (`not_found` / missing path);
-    - `BASELINE_RECOVERY_FAILED`: `baseline_uri` was configured and either failed with
-      a non-absent remote/I/O error or contained malformed/non-object JSON.
+    - `BASELINE_RECOVERY_ABSENT`: `baseline_uri` points to a non-existent
+      local file;
+    - `BASELINE_RECOVERY_FAILED`: `baseline_uri` was configured and either failed
+      with an I/O error or contained malformed/non-object JSON.
     """
     clean_uri = baseline_uri.strip()
     if not clean_uri:
         return BASELINE_RECOVERY_SKIPPED
-    check_remote_uri(clean_uri)
 
     incomplete_overlay: dict[str, Any] | None = None
     try:
@@ -7135,65 +6982,6 @@ def recover_baseline_coverage_ratchet(baseline_uri: str, ratchet_path: Path) -> 
             f"warning: cannot create parent directory for {ratchet_path}: {e}\n"
         )
         return BASELINE_RECOVERY_FAILED
-
-    if clean_uri.startswith("/remote/"):
-        if not has_remote_sync():
-            sys.stderr.write(
-                f"warning: cannot recover baseline coverage ratchet from `{clean_uri}`: "
-                f"`{REMOTE_SYNC_BIN}` is not available\n"
-            )
-            return BASELINE_RECOVERY_FAILED
-        fetch_dst = ratchet_path.parent / f".baseline_tmp_{os.getpid()}_coverage_ratchet.json"
-        fetch_dst.unlink(missing_ok=True)
-        res = run_remote_sync(["cp", "-f", clean_uri, str(fetch_dst)])
-        if res.returncode != 0:
-            fetch_dst.unlink(missing_ok=True)
-            err_detail = (res.stderr or res.stdout or "").strip()
-            suffix = f": {err_detail}" if err_detail else ""
-            sys.stderr.write(
-                f"warning: failed to fetch baseline coverage ratchet from `{clean_uri}` "
-                f"(exit {res.returncode}){suffix}\n"
-            )
-            if err_detail and _is_absent_remote_error(err_detail):
-                return BASELINE_RECOVERY_ABSENT
-            return BASELINE_RECOVERY_FAILED
-        if not fetch_dst.is_file():
-            sys.stderr.write(
-                f"warning: remote sync from `{clean_uri}` exited 0 without creating "
-                f"{fetch_dst}\n"
-            )
-            return BASELINE_RECOVERY_FAILED
-        try:
-            parsed = _strict_json_loads(fetch_dst.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError) as e:
-            fetch_dst.unlink(missing_ok=True)
-            sys.stderr.write(
-                f"warning: baseline coverage ratchet fetched from `{clean_uri}` is "
-                f"malformed or unreadable: {e}\n"
-            )
-            return BASELINE_RECOVERY_FAILED
-        fetch_dst.unlink(missing_ok=True)
-        if not isinstance(parsed, dict):
-            sys.stderr.write(
-                f"warning: baseline coverage ratchet fetched from `{clean_uri}` is not "
-                f"a JSON object (got {type(parsed).__name__})\n"
-            )
-            return BASELINE_RECOVERY_FAILED
-        merged = _merge_ratchet_snapshots(parsed, incomplete_overlay or {})
-        try:
-            _atomic_write_text(
-                ratchet_path, json.dumps(merged, indent=2, sort_keys=True) + "\n"
-            )
-        except OSError as e:
-            sys.stderr.write(
-                f"warning: failed to write recovered baseline coverage ratchet to "
-                f"{ratchet_path}: {e}\n"
-            )
-            return BASELINE_RECOVERY_FAILED
-        sys.stderr.write(
-            f"info: populated missing {ratchet_path} from baseline `{clean_uri}`\n"
-        )
-        return BASELINE_RECOVERY_RECOVERED
 
     src_path = Path(clean_uri)
     try:
@@ -7331,7 +7119,7 @@ def update_coverage_ratchet(
 
     Returns `(ratchet_path, baseline_missing)`, where `baseline_missing` means the
     updated `observed_paths` union still holds fewer paths than the recorded
-    cumulative or per-suite floor (e.g. the capsule launcher copied only
+    cumulative or per-suite floor (e.g. an external launcher copied only
     `campaign_ledger.json` into a fresh state directory), so this run's union
     could not extend the history. The flag is also persisted in the ratchet until
     `observed_paths` catches up with the floor so consumers never mistake a
@@ -7943,17 +7731,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Local directory for the ledger, findings, and reports (default: a temporary directory).",
     )
     parser.add_argument(
-        "--remote-uri",
-        type=str,
-        default="",
-        help="remote directory to synchronize the ledger and reports with (default: no remote sync).",
-    )
-    parser.add_argument(
         "--baseline-ratchet-uri",
         type=str,
         default=os.environ.get("ANNEAL_BASELINE_RATCHET_URI", "").strip(),
         help=(
-            "Optional fallback `/remote/...` URI or local JSON file path used to "
+            "Optional fallback local JSON file path used to "
             "populate a missing `state/coverage_ratchet.json` before union-merging "
             "(default: `ANNEAL_BASELINE_RATCHET_URI`)."
         ),
@@ -8048,11 +7830,8 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = Path(__file__).resolve().parent.parent
     start_time = time.monotonic()
 
-    remote_uri = args.remote_uri.strip()
     baseline_ratchet_uri = args.baseline_ratchet_uri.strip()
     try:
-        check_remote_uri(remote_uri)
-        check_remote_uri(baseline_ratchet_uri)
         cli_miri_seed = parse_seed_int(args.miri_seed) if args.miri_seed is not None else None
         cli_itree_seed = parse_seed_int(args.itree_seed) if args.itree_seed is not None else None
         try:
@@ -8108,9 +7887,6 @@ def main(argv: list[str] | None = None) -> int:
             print(report_md)
             return EXIT_SUCCESS if gate_ok else EXIT_HARNESS_FAILED
 
-        remote_state_ok = sync_state_from_remote(
-            remote_uri, state_dir, include_ratchet=not args.compile_only
-        )
         (state_dir / "state").mkdir(parents=True, exist_ok=True)
         (state_dir / "reports").mkdir(parents=True, exist_ok=True)
 
@@ -8336,13 +8112,6 @@ def main(argv: list[str] | None = None) -> int:
                     extra_cases=gate_junit_cases(mutant_report, ratchet_report),
                 )
 
-            sync_state_to_remote(
-                state_dir,
-                remote_uri,
-                _filter_written_for_remote(
-                    state_dir, remote_uri, written, remote_state_ok
-                ),
-            )
             print(report_md)
             if harness_failed or not gates_passed(mutant_report, ratchet_report):
                 return EXIT_HARNESS_FAILED
@@ -8440,7 +8209,6 @@ def main(argv: list[str] | None = None) -> int:
                     elapsed_sec,
                     extra_cases=gate_junit_cases(mutant_report, ratchet_report),
                 )
-            sync_state_to_remote(state_dir, remote_uri, written)
             print(report_md)
             return EXIT_HARNESS_FAILED
 
@@ -8860,13 +8628,6 @@ def main(argv: list[str] | None = None) -> int:
                 extra_cases=gate_junit_cases(mutant_report, ratchet_report),
             )
 
-        sync_state_to_remote(
-            state_dir,
-            remote_uri,
-            _filter_written_for_remote(
-                state_dir, remote_uri, written, remote_state_ok
-            ),
-        )
         print(report_md)
 
         if harness_or_red_flag_failed:

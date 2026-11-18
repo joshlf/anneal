@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Warm Lean 4 (`lake serve`) + Rust semantic daemon for Anneal in Antigravity.
+"""Warm Lean 4 (`lake serve`) + Rust semantic daemon for Anneal editor plugins.
 
 Listens on a local mode-0600 Unix domain socket (`/tmp/anneal-lean-lsp.sock`) so:
-1. The Antigravity `stdio` MCP server (`anneal_lsp_mcp.py`),
+1. The `stdio` MCP server (`anneal_lsp_mcp.py`),
 2. Synchronous `<100ms` `PostToolUse` hooks (`hooks/post_tool_use.py`), and
-3. The Antigravity Web AuxPane Live InfoView UI sidecar (`sidecars/infoview/main.mjs`)
+3. The Web AuxPane Live InfoView UI sidecar (`sidecars/infoview/main.mjs`)
 all share one warm LRU pool of `lake serve` (and optional `rust-analyzer`) workers
-across `~/Projects/<ldap>/{anneal,anneal-private,zerocopy}`.
+across Anneal Lean and Rust workspaces.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ DEFAULT_SOCKET_PATH = os.environ.get("ANNEAL_LSP_SOCKET", "/tmp/anneal-lean-lsp.
 LOCK_PATH = DEFAULT_SOCKET_PATH + ".lock"
 MAX_WORKERS = int(os.environ.get("ANNEAL_LSP_MAX_WORKERS", "4"))
 IDLE_TTL_SECONDS = int(os.environ.get("ANNEAL_LSP_IDLE_TTL_SECONDS", "900"))
-MAX_INLINE_BYTES = 3800  # Keep MCP tool responses <4,000 bytes so Antigravity never spills to temp files.
+MAX_INLINE_BYTES = 3800  # Keep MCP tool responses <4,000 bytes so clients never spill to temp files.
 
 HOME_DIR = Path.home()
 DEFAULT_ENV_PATH = (
@@ -42,6 +42,433 @@ DEFAULT_ENV_PATH = (
     f"{HOME_DIR / '.elan/bin'}:{HOME_DIR / '.cargo/bin'}:"
     f"{HOME_DIR / '.local/bin'}:{os.environ.get('PATH', '/usr/bin:/bin')}"
 )
+
+MIB = 1024 * 1024
+LIGHT_WORKTREE_MARKER = "/.agent-worktrees/light-slot-"
+_CONTROL_ACTIONS: frozenset[str] = frozenset(
+    {"ping", "shutdown", "ui_state", "lean_restart_workspace"}
+)
+_LIGHT_SKIP_PATH_KEYS: tuple[str, ...] = (
+    "file",
+    "path",
+    "file_path",
+    "target_file",
+    "uri",
+    "Path",
+    "TargetFile",
+    "workspace",
+    "crate_root",
+    "root",
+    "scope",
+)
+_SCRUB_ENV_BASE: tuple[str, ...] = (
+    "ANTIGRAVITY_LS_ADDRESS",
+    "ANTIGRAVITY_CSRF_TOKEN",
+    "ANNEAL_LEAN_RUN_IN_SCOPE",
+    "ANNEAL_LEAN_RUN_ACTIVE",
+    "ANNEAL_LEAN_RUN_LEAN_M_MB",
+)
+
+
+class _LspDeferredError(Exception):
+    """Typed deferral error caught in `Handler.handle` to emit a structured skip envelope."""
+
+    def __init__(self, code: str, msg: str) -> None:
+        super().__init__(msg)
+        self.code = code
+        self.msg = msg
+
+
+def _has_user_systemd_sock(p: Path) -> bool:
+    """True if systemd --user (systemd 255+/260 private/varlink or D-Bus) socket exists."""
+    try:
+        return any(
+            (p / rel).is_socket()
+            for rel in ("systemd/private", "systemd/io.systemd.Manager", "bus")
+        )
+    except OSError:
+        return False
+
+
+def resolve_runtime_base() -> tuple[Path, bool]:
+    """Returns (runtime_dir, user_systemd_sock_alive). Always prefers UID-owned /run/user/<uid>."""
+    uid = os.getuid()
+    run_user = Path(f"/run/user/{uid}")
+    if run_user.is_dir() and os.access(run_user, os.W_OK | os.X_OK):
+        try:
+            if run_user.stat().st_uid == uid:
+                return run_user, _has_user_systemd_sock(run_user)
+        except OSError:
+            pass
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if xdg:
+        p = Path(xdg)
+        if p.is_dir() and os.access(p, os.W_OK | os.X_OK):
+            return p, _has_user_systemd_sock(p)
+    return Path("/tmp"), False
+
+
+def _wrap_oom_score_adj(cmd: list[str], score: int = 900) -> list[str]:
+    """Thread-safe oom_score_adj wrapper avoiding CPython preexec_fn deadlocks and choom."""
+    return [
+        "/bin/sh",
+        "-c",
+        f'printf {int(score)} > /proc/self/oom_score_adj 2>/dev/null; exec "$@"',
+        "_",
+        *cmd,
+    ]
+
+
+def _read_self_cgroup_text() -> str:
+    try:
+        return Path("/proc/self/cgroup").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _detect_self_slice(cgroup_text: str | None = None) -> str | None:
+    """Returns `'anneal-workloads.slice'` if inside our daemon scope, else current slice or None."""
+    txt = _read_self_cgroup_text() if cgroup_text is None else cgroup_text
+    if "anneal-workloads.slice/anneal-lsp-daemon-" in txt:
+        return "anneal-workloads.slice"
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line.startswith("0::"):
+            continue
+        rel = line.split("::", 1)[1].strip()
+        slices = [p for p in rel.split("/") if p.endswith(".slice")]
+        if slices:
+            return slices[-1]
+    return None
+
+
+def _read_cgroup_working_set_mib(cg: Path) -> int:
+    """Fast `0.1 ms` sysfs read of `W(cg)` in MiB for spawn-gate headroom checks."""
+    try:
+        if not cg.is_dir():
+            return 0
+    except OSError:
+        return 0
+    stat: dict[str, int] = {}
+    stat_path = cg / "memory.stat"
+    try:
+        if stat_path.is_file():
+            for line in stat_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    try:
+                        val = int(parts[1])
+                        if val >= 0:
+                            stat[parts[0]] = val
+                    except ValueError:
+                        continue
+    except OSError:
+        stat = {}
+
+    if stat and any(k in stat for k in ("anon", "shmem", "kernel", "file", "active_file")):
+        anon = stat.get("anon", 0)
+        shmem = stat.get("shmem", 0)
+        kernel = stat.get("kernel", 0)
+        file_b = stat.get("file", stat.get("active_file", 0) + stat.get("inactive_file", 0))
+        act_b = stat.get("active_file", 0) + stat.get("file_dirty", 0) + stat.get("file_writeback", 0)
+        return max(0, anon + shmem + kernel + min(file_b, act_b)) // MIB
+
+    cur_path = cg / "memory.current"
+    try:
+        if cur_path.is_file():
+            raw = cur_path.read_text(encoding="utf-8", errors="replace").strip()
+            if raw and raw != "max":
+                cur = int(raw.split()[0])
+                if "inactive_file" in stat:
+                    return max(0, cur - stat["inactive_file"]) // MIB
+                return max(0, cur) // MIB
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _has_active_build_slot_lock(runtime_base: Path, uid: int | None = None) -> bool:
+    """`0.1 ms` non-blocking `flock` probe for any active build slot lock."""
+    eff_uid = os.getuid() if uid is None else uid
+    slot_dir = Path(runtime_base) / f"anneal-build-slots-{eff_uid}"
+    try:
+        if not slot_dir.is_dir():
+            return False
+        locks = sorted(slot_dir.glob("slot-*.lock"))
+    except OSError:
+        return False
+    for lf in locks:
+        fd: int | None = None
+        try:
+            fd = os.open(str(lf), os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            except BlockingIOError:
+                return True
+        except OSError:
+            continue
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    return False
+
+
+def _parse_mem_mb(raw: str | None) -> int | None:
+    if not raw or not raw.strip():
+        return None
+    s = raw.strip().upper()
+    try:
+        if s.endswith("G") or s.endswith("GB"):
+            num = s.rstrip("GB")
+            val = int(float(num) * 1024)
+            return val if val > 0 else None
+        if s.endswith("M") or s.endswith("MB"):
+            num = s.rstrip("MB")
+            val = int(float(num))
+            return val if val > 0 else None
+        val = int(float(s))
+        return val if val > 0 else None
+    except ValueError:
+        return None
+
+
+def _find_anneal_lean_run() -> str | None:
+    return shutil.which("anneal-lean-run", path=DEFAULT_ENV_PATH)
+
+
+def _probe_lean_run_envelope(
+    runtime_base: Path | None = None,
+    user_systemd_sock_alive: bool | None = None,
+) -> dict[str, Any]:
+    """Queries `anneal-lean-run --probe --json` once at startup (safe minimal fallback if absent)."""
+    if runtime_base is None or user_systemd_sock_alive is None:
+        rb, sock_alive = resolve_runtime_base()
+        if runtime_base is None:
+            runtime_base = rb
+        if user_systemd_sock_alive is None:
+            user_systemd_sock_alive = sock_alive
+
+    fallback: dict[str, Any] = {
+        "user_systemd_active": False,
+        "is_cg_capped": False,
+        "runtime_base": str(runtime_base),
+        "w_cg_path": None,
+        "a_lim_path": None,
+        "w_slice_max_mb": 8192,
+        "w_slice_high_mb": 7700,
+        "c_high_mb": 0,
+        "m_safety_mb": 1024,
+        "l_max_mb": 4096,
+        "max_lean_workers": 1,
+        "max_rust_workers": 1,
+        "idle_ttl_seconds": 300,
+    }
+
+    data = dict(fallback)
+    lean_run_bin = _find_anneal_lean_run()
+    if lean_run_bin:
+        env = os.environ.copy()
+        if user_systemd_sock_alive:
+            env["XDG_RUNTIME_DIR"] = str(runtime_base)
+        try:
+            res = subprocess.run(
+                [lean_run_bin, "--probe", "--json"],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5.0,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                parsed = json.loads(res.stdout)
+                if isinstance(parsed, dict):
+                    for key in fallback:
+                        if key in parsed and parsed[key] is not None:
+                            data[key] = parsed[key]
+                    if "w_cg_path" in parsed:
+                        data["w_cg_path"] = parsed["w_cg_path"]
+                    if "a_lim_path" in parsed:
+                        data["a_lim_path"] = parsed["a_lim_path"]
+        except Exception:
+            pass
+
+    # Apply optional env overrides, clamping memory override to <= w_slice_max_mb on capped hosts.
+    is_capped = bool(data.get("is_cg_capped", False))
+    w_slice_max = max(1, int(data.get("w_slice_max_mb", 8192)))
+    mem_override = _parse_mem_mb(os.environ.get("ANNEAL_LSP_MEMORY_MAX_MB")) or _parse_mem_mb(
+        os.environ.get("ANNEAL_LSP_MEMORY_MAX")
+    )
+    if mem_override is not None:
+        data["l_max_mb"] = min(mem_override, w_slice_max) if is_capped else mem_override
+
+    max_w_raw = os.environ.get("ANNEAL_LSP_MAX_WORKERS", "").strip()
+    if max_w_raw:
+        try:
+            val = int(max_w_raw)
+            if val >= 1:
+                data["max_lean_workers"] = val
+        except ValueError:
+            pass
+
+    max_rw_raw = os.environ.get("ANNEAL_LSP_MAX_RUST_WORKERS", "").strip()
+    if max_rw_raw:
+        try:
+            val = int(max_rw_raw)
+            if val >= 1:
+                data["max_rust_workers"] = val
+        except ValueError:
+            pass
+
+    ttl_raw = os.environ.get("ANNEAL_LSP_IDLE_TTL_SECONDS", "").strip()
+    if ttl_raw:
+        try:
+            val = int(ttl_raw)
+            if val >= 1:
+                data["idle_ttl_seconds"] = val
+        except ValueError:
+            pass
+
+    return data
+
+
+def _check_user_systemd_active_lightweight(
+    runtime_base: Path | None = None,
+    user_systemd_sock_alive: bool | None = None,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> bool:
+    """Zero-scope-spam check used strictly on the `"slice"`-mismatch branch in `ensure_daemon_running`."""
+    if runtime_base is None or user_systemd_sock_alive is None:
+        runtime_base, user_systemd_sock_alive = resolve_runtime_base()
+    if not user_systemd_sock_alive:
+        return False
+    uid = os.getuid()
+    user_cg = cgroup_root / "user.slice" / f"user-{uid}.slice" / f"user@{uid}.service"
+    try:
+        if not (user_cg / "cgroup.controllers").is_file():
+            return False
+        subtree = (user_cg / "cgroup.subtree_control").read_text(encoding="utf-8", errors="replace").split()
+        if "memory" not in subtree:
+            return False
+    except OSError:
+        return False
+    systemctl_bin = shutil.which("systemctl", path=DEFAULT_ENV_PATH) or (
+        "/usr/bin/systemctl" if Path("/usr/bin/systemctl").is_file() else None
+    )
+    if not systemctl_bin:
+        return False
+    env = os.environ.copy()
+    env["XDG_RUNTIME_DIR"] = str(runtime_base)
+    try:
+        res = subprocess.run(
+            [systemctl_bin, "--user", "show", "-p", "Version", "--value"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2.0,
+        )
+        return res.returncode == 0 and bool(res.stdout.strip())
+    except Exception:
+        return False
+
+
+def _check_client_light_skip(action: str, args: dict[str, Any]) -> dict[str, Any] | None:
+    """Client-side fast skip in `daemon_rpc()` BEFORE `ensure_daemon_running()`."""
+    if action in _CONTROL_ACTIONS:
+        return None
+    matched = os.environ.get("ANNEAL_WORKLOAD_LIGHT") == "1"
+    if not matched:
+        try:
+            if LIGHT_WORKTREE_MARKER in os.getcwd():
+                matched = True
+        except OSError:
+            pass
+    if not matched and isinstance(args, dict):
+        for key in _LIGHT_SKIP_PATH_KEYS:
+            val = args.get(key)
+            if isinstance(val, str) and val:
+                if LIGHT_WORKTREE_MARKER in val or LIGHT_WORKTREE_MARKER in uri_to_path(val):
+                    matched = True
+                    break
+    if not matched:
+        return None
+    msg = (
+        "[Anneal Lean 4 LSP] Skipped LSP request in light-workload worktree "
+        "(LSP_SKIPPED_LIGHT_WORKTREE)."
+    )
+    return {
+        "ok": True,
+        "skipped": True,
+        "result": {
+            "skipped": True,
+            "code": "LSP_SKIPPED_LIGHT_WORKTREE",
+            "text": msg,
+            "feedback": msg,
+        },
+    }
+
+
+def _terminate_procs_parallel(
+    workers: list[Any], check_procs: list[subprocess.Popen[Any]]
+) -> None:
+    """Parallel `SIGTERM` (`os.killpg`) -> `1.0s` total wait -> `SIGKILL` -> `wait(0.5)`."""
+    procs: list[subprocess.Popen[Any]] = []
+    for w in workers:
+        try:
+            lsp = getattr(w, "lsp", None)
+            if lsp is not None:
+                with lsp._cond:
+                    lsp._closed = True
+                    lsp._cond.notify_all()
+                procs.append(lsp.proc)
+        except Exception:
+            pass
+    for p in check_procs:
+        if p is not None:
+            procs.append(p)
+    if not procs:
+        return
+
+    for p in procs:
+        if p.poll() is not None:
+            continue
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if all(p.poll() is not None for p in procs):
+            return
+        time.sleep(0.05)
+
+    survivors = [p for p in procs if p.poll() is None]
+    for p in survivors:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    for p in survivors:
+        try:
+            p.wait(timeout=0.5)
+        except Exception:
+            pass
 
 
 def compute_script_sha256() -> str:
@@ -425,11 +852,8 @@ class LeanWorkspaceWorker:
         env = self._build_env()
 
         bwrap_bin = "/usr/bin/bwrap" if Path("/usr/bin/bwrap").is_file() else None
-        choom_bin = "/usr/bin/choom" if Path("/usr/bin/choom").is_file() else None
 
         inner_cmd = [lake_bin, "serve", "--"]
-        if choom_bin:
-            inner_cmd = [choom_bin, "-n", "800", "--", *inner_cmd]
 
         if bwrap_bin and os.environ.get("ANNEAL_LSP_DISABLE_BWRAP") != "1":
             # Mount `/` read-only and `--unshare-net` so `#eval` metaprograms can never
@@ -455,14 +879,18 @@ class LeanWorkspaceWorker:
                 *inner_cmd,
             ])
             try:
-                client = self._init_client(bwrap_cmd, env, pid_namespaced=True)
+                client = self._init_client(
+                    _wrap_oom_score_adj(bwrap_cmd, 900), env, pid_namespaced=True
+                )
                 self.sandboxed = True
                 return client
             except Exception:
                 pass
 
         self.sandboxed = False
-        return self._init_client(inner_cmd, env, pid_namespaced=False)
+        return self._init_client(
+            _wrap_oom_score_adj(inner_cmd, 900), env, pid_namespaced=False
+        )
 
     def _init_client(self, cmd: list[str], env: dict[str, str], pid_namespaced: bool = False) -> JsonRpcLspProcess:
         client = JsonRpcLspProcess(cmd=cmd, cwd=self.lake_root, env=env)
@@ -641,7 +1069,7 @@ class RustAnalyzerWorker:
 
         env = os.environ.copy()
         env["PATH"] = f"{DEFAULT_ENV_PATH}:{env.get('PATH', '')}"
-        self.lsp = JsonRpcLspProcess([ra_bin], cwd=cargo_root, env=env)
+        self.lsp = JsonRpcLspProcess(_wrap_oom_score_adj([ra_bin], 900), cwd=cargo_root, env=env)
         self.lsp.on_notification = self._on_notification
         root_uri = cargo_root.as_uri()
         self.lsp.request(
@@ -771,12 +1199,31 @@ def strip_line_comment(raw_line: str) -> str:
 class AnnealLspCoordinator:
     """Coordinates Lean 4 + Rust workers, Anneal checks, and Live InfoView state."""
 
-    def __init__(self) -> None:
+    def __init__(self, envelope: dict[str, Any] | None = None, *, start_reaper: bool = True) -> None:
         self.started_at = time.time()
         self._pool_lock = threading.Lock()
+        self._init_locks: dict[tuple[str, str], threading.Lock] = {}
+        self._evict_generation: int = 0
+        self._root_evict_gen: dict[tuple[str, str], int] = {}
+        self._active_checks: set[subprocess.Popen[Any]] = set()
         self.lean_workers: collections.OrderedDict[str, LeanWorkspaceWorker] = collections.OrderedDict()
         self.rust_workers: collections.OrderedDict[str, RustAnalyzerWorker] = collections.OrderedDict()
         self.ra_bin = find_working_rust_analyzer()
+
+        env_info = envelope if envelope is not None else _probe_lean_run_envelope()
+        self.runtime_base = Path(str(env_info.get("runtime_base") or resolve_runtime_base()[0]))
+        self.w_cg_path: str | None = env_info.get("w_cg_path")
+        self.a_lim_path: str | None = env_info.get("a_lim_path")
+        self.w_slice_max_mb: int = int(env_info.get("w_slice_max_mb", 8192))
+        self.w_slice_high_mb: int = int(env_info.get("w_slice_high_mb", 7700))
+        self.c_high_mb: int = int(env_info.get("c_high_mb", 0))
+        self.m_safety_mb: int = int(env_info.get("m_safety_mb", 1024))
+        self.is_cg_capped: bool = bool(env_info.get("is_cg_capped", False))
+        self.l_max_mb: int = int(env_info.get("l_max_mb", 4096))
+        self.max_lean_workers: int = max(1, int(env_info.get("max_lean_workers", 1)))
+        self.max_rust_workers: int = max(1, int(env_info.get("max_rust_workers", 1)))
+        self.idle_ttl_seconds: int = max(1, int(env_info.get("idle_ttl_seconds", 300)))
+        self.self_slice: str | None = _detect_self_slice()
 
         self._ui_lock = threading.Lock()
         self.infoview_state: dict[str, Any] = {
@@ -793,8 +1240,11 @@ class AnnealLspCoordinator:
             "recent_events": [],
         }
 
-        self._reaper = threading.Thread(target=self._reap_loop, daemon=True)
-        self._reaper.start()
+        if start_reaper:
+            self._reaper = threading.Thread(target=self._reap_loop, daemon=True)
+            self._reaper.start()
+        else:
+            self._reaper = None
 
     def _reap_loop(self) -> None:
         while True:
@@ -804,17 +1254,43 @@ class AnnealLspCoordinator:
             with self._pool_lock:
                 for key in list(self.lean_workers.keys()):
                     w = self.lean_workers[key]
-                    if not w.lsp.is_alive() or (now - w.last_used) > IDLE_TTL_SECONDS:
+                    if not w.lsp.is_alive() or (now - w.last_used) > self.idle_ttl_seconds:
                         to_close.append(self.lean_workers.pop(key))
                 for key in list(self.rust_workers.keys()):
                     rw = self.rust_workers[key]
-                    if not rw.lsp.is_alive() or (now - rw.last_used) > IDLE_TTL_SECONDS:
+                    if not rw.lsp.is_alive() or (now - rw.last_used) > self.idle_ttl_seconds:
                         to_close.append(self.rust_workers.pop(key))
-            for w in to_close:
-                try:
-                    w.close()
-                except Exception:
-                    pass
+            if to_close:
+                _terminate_procs_parallel(to_close, [])
+
+    def _check_worker_spawn_allowed(self, root_path: str | Path) -> None:
+        """Shared server-side gate for cold worker spawns and `cargo check --offline` fallback."""
+        if LIGHT_WORKTREE_MARKER in str(root_path):
+            raise _LspDeferredError(
+                "LSP_SKIPPED_LIGHT_WORKTREE",
+                f"[Anneal Lean 4 LSP] Skipped LSP worker spawn for light worktree `{root_path}` "
+                "(LSP_SKIPPED_LIGHT_WORKTREE).",
+            )
+        if not _has_active_build_slot_lock(self.runtime_base):
+            return
+        if self.w_slice_max_mb < 16384:
+            raise _LspDeferredError(
+                "LSP_DEFERRED_BUILD_ACTIVE",
+                "[Anneal Lean 4 LSP] Deferred cold LSP worker spawn while an active build holds "
+                "a host build slot on a tight-RAM envelope (LSP_DEFERRED_BUILD_ACTIVE).",
+            )
+        w_cg_mb = _read_cgroup_working_set_mib(Path(self.w_cg_path)) if self.w_cg_path else 0
+        slice_tight = (self.w_slice_high_mb - w_cg_mb) < 4096
+        alim_tight = False
+        if self.is_cg_capped and self.a_lim_path:
+            w_alim_mb = _read_cgroup_working_set_mib(Path(self.a_lim_path))
+            alim_tight = (self.c_high_mb - self.m_safety_mb - w_alim_mb) < 4096
+        if slice_tight or alim_tight:
+            raise _LspDeferredError(
+                "LSP_DEFERRED_BUILD_ACTIVE",
+                "[Anneal Lean 4 LSP] Deferred cold LSP worker spawn due to low remaining "
+                "cgroup headroom during an active build (LSP_DEFERRED_BUILD_ACTIVE).",
+            )
 
     def get_lean_worker(self, file_or_dir: str) -> LeanWorkspaceWorker:
         lake_root = resolve_lake_root(file_or_dir)
@@ -823,30 +1299,71 @@ class AnnealLspCoordinator:
                 f"Could not locate an enclosing `lakefile.toml` or `lakefile.lean` for `{file_or_dir}`. "
                 "For a new Anneal crate, run `cargo anneal agent-context` or `cargo anneal lock-specs` first to generate `.anneal/lakefile.toml`."
             )
-        key = str(lake_root.resolve())
-        evicted: list[LeanWorkspaceWorker] = []
+        resolved_root = lake_root.resolve()
+        key = str(resolved_root)
+        stale: list[Any] = []
         with self._pool_lock:
             existing = self.lean_workers.get(key)
             if existing is not None:
                 if existing.needs_restart():
-                    evicted.append(self.lean_workers.pop(key))
-                    existing = None
+                    stale.append(self.lean_workers.pop(key))
                 else:
                     self.lean_workers.move_to_end(key)
                     existing.last_used = time.time()
-            if existing is None:
-                while len(self.lean_workers) >= MAX_WORKERS:
-                    _, oldest = self.lean_workers.popitem(last=False)
-                    evicted.append(oldest)
-                worker = LeanWorkspaceWorker(lake_root.resolve())
-                self.lean_workers[key] = worker
-                existing = worker
-        for old in evicted:
-            try:
-                old.close()
-            except Exception:
-                pass
-        return existing
+                    return existing
+            init_lock = self._init_locks.setdefault(("lean", key), threading.Lock())
+
+        if stale:
+            _terminate_procs_parallel(stale, [])
+
+        with init_lock:
+            stale2: list[Any] = []
+            with self._pool_lock:
+                existing = self.lean_workers.get(key)
+                if existing is not None:
+                    if existing.needs_restart():
+                        stale2.append(self.lean_workers.pop(key))
+                    else:
+                        self.lean_workers.move_to_end(key)
+                        existing.last_used = time.time()
+                        return existing
+                gen_before = self._evict_generation
+                root_gen_before = self._root_evict_gen.get(("lean", key), 0)
+
+            if stale2:
+                _terminate_procs_parallel(stale2, [])
+
+            # Check light/build gate outside _pool_lock before spawning cold worker.
+            if LIGHT_WORKTREE_MARKER in str(file_or_dir):
+                self._check_worker_spawn_allowed(file_or_dir)
+            self._check_worker_spawn_allowed(resolved_root)
+
+            # Spawn and run slow LSP `initialize` handshake with `_pool_lock` RELEASED!
+            worker = LeanWorkspaceWorker(resolved_root)
+
+            evicted: list[Any] = []
+            evicted_during_init = False
+            with self._pool_lock:
+                if (
+                    self._evict_generation != gen_before
+                    or self._root_evict_gen.get(("lean", key), 0) != root_gen_before
+                ):
+                    evicted_during_init = True
+                else:
+                    while len(self.lean_workers) >= self.max_lean_workers:
+                        _, oldest = self.lean_workers.popitem(last=False)
+                        evicted.append(oldest)
+                    self.lean_workers[key] = worker
+
+            if evicted_during_init:
+                _terminate_procs_parallel([worker], [])
+                raise _LspDeferredError(
+                    "LSP_DEFERRED_BUILD_ACTIVE",
+                    "[Anneal Lean 4 LSP] Worker evicted while initializing (LSP_DEFERRED_BUILD_ACTIVE).",
+                )
+            if evicted:
+                _terminate_procs_parallel(evicted, [])
+            return worker
 
     def get_rust_worker(self, file_or_dir: str) -> RustAnalyzerWorker | None:
         if not self.ra_bin:
@@ -856,21 +1373,66 @@ class AnnealLspCoordinator:
         cargo_root = resolve_cargo_root(file_or_dir)
         if cargo_root is None:
             return None
-        key = str(cargo_root.resolve())
+        resolved_root = cargo_root.resolve()
+        key = str(resolved_root)
+        stale: list[Any] = []
         with self._pool_lock:
             existing = self.rust_workers.get(key)
-            if existing is not None and existing.lsp.is_alive():
-                self.rust_workers.move_to_end(key)
-                existing.last_used = time.time()
-                return existing
             if existing is not None:
-                self.rust_workers.pop(key, None)
-                try:
-                    existing.close()
-                except Exception:
-                    pass
-            worker = RustAnalyzerWorker(cargo_root.resolve(), self.ra_bin)
-            self.rust_workers[key] = worker
+                if existing.lsp.is_alive():
+                    self.rust_workers.move_to_end(key)
+                    existing.last_used = time.time()
+                    return existing
+                stale.append(self.rust_workers.pop(key))
+            init_lock = self._init_locks.setdefault(("rust", key), threading.Lock())
+
+        if stale:
+            _terminate_procs_parallel(stale, [])
+
+        with init_lock:
+            stale2: list[Any] = []
+            with self._pool_lock:
+                existing = self.rust_workers.get(key)
+                if existing is not None:
+                    if existing.lsp.is_alive():
+                        self.rust_workers.move_to_end(key)
+                        existing.last_used = time.time()
+                        return existing
+                    stale2.append(self.rust_workers.pop(key))
+                gen_before = self._evict_generation
+                root_gen_before = self._root_evict_gen.get(("rust", key), 0)
+
+            if stale2:
+                _terminate_procs_parallel(stale2, [])
+
+            if LIGHT_WORKTREE_MARKER in str(file_or_dir):
+                self._check_worker_spawn_allowed(file_or_dir)
+            self._check_worker_spawn_allowed(resolved_root)
+
+            worker = RustAnalyzerWorker(resolved_root, self.ra_bin)
+
+            evicted: list[Any] = []
+            evicted_during_init = False
+            with self._pool_lock:
+                if (
+                    self._evict_generation != gen_before
+                    or self._root_evict_gen.get(("rust", key), 0) != root_gen_before
+                ):
+                    evicted_during_init = True
+                else:
+                    while len(self.rust_workers) >= self.max_rust_workers:
+                        _, oldest = self.rust_workers.popitem(last=False)
+                        evicted.append(oldest)
+                    self.rust_workers[key] = worker
+
+            if evicted_during_init:
+                _terminate_procs_parallel([worker], [])
+                raise _LspDeferredError(
+                    "LSP_DEFERRED_BUILD_ACTIVE",
+                    "[Anneal Lean 4 LSP] Rust worker evicted while initializing (LSP_DEFERRED_BUILD_ACTIVE).",
+                )
+            if evicted:
+                _terminate_procs_parallel(evicted, [])
             return worker
 
     def _record_infoview(
@@ -1588,24 +2150,53 @@ class AnnealLspCoordinator:
                 lines.append(f"[{cd['severity'].upper()}] L{cd['line']}:{cd['column']}: {cd['message']}")
             return {"text": middle_clip("\n".join(lines)), "engine": "rust-analyzer"}
 
-        # Offline fallback: `cargo check --offline --message-format=json`
+        # Gate BEFORE `cargo check --offline` fallback (AFTER warm `ra_worker` fast path).
+        if LIGHT_WORKTREE_MARKER in str(target):
+            self._check_worker_spawn_allowed(target)
+        self._check_worker_spawn_allowed(cargo_root)
+
+        # Offline fallback: bounded, tracked, evictable `cargo check --offline --message-format=json`
         t0 = time.monotonic()
         env = os.environ.copy()
         env["PATH"] = f"{DEFAULT_ENV_PATH}:{env.get('PATH', '')}"
+        cpu_cores = max(1, os.cpu_count() or 4)
+        max_jobs = 2 if self.w_slice_max_mb < 16384 else max(1, min(4, cpu_cores // 2))
+        env["CARGO_BUILD_JOBS"] = str(max_jobs)
         cargo_bin = shutil.which("cargo", path=DEFAULT_ENV_PATH) or str(HOME_DIR / ".cargo/bin/cargo")
-        res = subprocess.run(
-            [cargo_bin, "check", "--offline", "--message-format=json"],
+        check_cmd = _wrap_oom_score_adj(
+            [cargo_bin, "check", "--offline", "--message-format=json"], 900
+        )
+        proc = subprocess.Popen(
+            check_cmd,
             cwd=str(cargo_root),
             env=env,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=90.0,
+            start_new_session=True,
         )
+        with self._pool_lock:
+            self._active_checks.add(proc)
+        try:
+            try:
+                stdout_str, stderr_str = proc.communicate(timeout=90.0)
+            except subprocess.TimeoutExpired:
+                _terminate_procs_parallel([], [proc])
+                try:
+                    proc.communicate(timeout=1.0)
+                except Exception:
+                    pass
+                raise TimeoutError("`cargo check --offline` timed out after 90.0s")
+        finally:
+            with self._pool_lock:
+                self._active_checks.discard(proc)
+        returncode = proc.returncode if proc.returncode is not None else -1
         elapsed_ms = round((time.monotonic() - t0) * 1000.0, 1)
         msgs: list[str] = []
         err_n = 0
         warn_n = 0
-        for raw in res.stdout.splitlines():
+        for raw in stdout_str.splitlines():
             if not raw.startswith("{"):
                 continue
             try:
@@ -1627,11 +2218,11 @@ class AnnealLspCoordinator:
 
         header = (
             f"Rust Workspace Check (`cargo check --offline`, {elapsed_ms} ms) in {cargo_root}:\n"
-            f"Summary: {err_n} error(s), {warn_n} warning(s) (exit {res.returncode})"
+            f"Summary: {err_n} error(s), {warn_n} warning(s) (exit {returncode})"
         )
         body = "\n".join(msgs[:25]) if msgs else "✓ Clean (`0` compiler errors)."
-        if res.returncode != 0 and not msgs and res.stderr.strip():
-            body = res.stderr.strip()
+        if returncode != 0 and not msgs and stderr_str.strip():
+            body = stderr_str.strip()
         return {"text": middle_clip(header + "\n" + body), "engine": "cargo-check-json", "errors": err_n, "warnings": warn_n}
 
     # ---------------- Tool 12: rust_symbols_and_def ----------------
@@ -1642,7 +2233,12 @@ class AnnealLspCoordinator:
         line_arg = args.get("line") or args.get("line_number")
 
         target_path = normalize_file_arg(args) if raw_target else str(HOME_DIR / "Projects")
-        ra_worker = self.get_rust_worker(target_path) if Path(target_path).exists() else None
+        ra_worker = None
+        if Path(target_path).exists():
+            try:
+                ra_worker = self.get_rust_worker(target_path)
+            except _LspDeferredError:
+                ra_worker = None
 
         # 1. If rust-analyzer is live and a specific file + line is given, use LSP hover + definition!
         if ra_worker is not None and Path(target_path).is_file() and line_arg is not None:
@@ -1765,14 +2361,21 @@ class AnnealLspCoordinator:
             workers = [w.status_dict() for w in self.lean_workers.values()] + [
                 rw.status_dict() for rw in self.rust_workers.values()
             ]
+            active_checks_n = len(self._active_checks)
         with self._ui_lock:
             iv = dict(self.infoview_state)
         return {
             "daemon_pid": os.getpid(),
             "script_sha256": SCRIPT_SHA256,
+            "slice": self.self_slice,
             "uptime_s": round(time.time() - self.started_at, 1),
             "rust_analyzer_available": self.ra_bin is not None,
             "rust_analyzer_bin": self.ra_bin,
+            "max_lean_workers": self.max_lean_workers,
+            "max_rust_workers": self.max_rust_workers,
+            "l_max_mb": self.l_max_mb,
+            "idle_ttl_seconds": self.idle_ttl_seconds,
+            "active_checks": active_checks_n,
             "workers": workers,
             "infoview": iv,
         }
@@ -1780,41 +2383,47 @@ class AnnealLspCoordinator:
     def restart_worker(self, args: dict[str, Any]) -> dict[str, Any]:
         target = args.get("root") or args.get("file") or args.get("path")
         closed_roots: list[str] = []
-        to_close: list[Any] = []
+        to_close_workers: list[Any] = []
+        to_close_checks: list[subprocess.Popen[Any]] = []
         with self._pool_lock:
             if not target or target == "all":
-                for k, w in list(self.lean_workers.items()):
+                self._evict_generation += 1
+                for k in list(self.lean_workers.keys()):
                     closed_roots.append(k)
-                    to_close.append(self.lean_workers.pop(k))
-                for k, rw in list(self.rust_workers.items()):
+                    to_close_workers.append(self.lean_workers.pop(k))
+                for k in list(self.rust_workers.keys()):
                     closed_roots.append(k)
-                    to_close.append(self.rust_workers.pop(k))
+                    to_close_workers.append(self.rust_workers.pop(k))
+                if self._active_checks:
+                    to_close_checks.extend(self._active_checks)
+                    self._active_checks.clear()
             else:
                 lr = resolve_lake_root(str(target))
                 key = str(lr.resolve()) if lr else str(Path(str(target)).resolve())
+                self._root_evict_gen[("lean", key)] = self._root_evict_gen.get(("lean", key), 0) + 1
+                self._root_evict_gen[("rust", key)] = self._root_evict_gen.get(("rust", key), 0) + 1
                 if key in self.lean_workers:
                     closed_roots.append(key)
-                    to_close.append(self.lean_workers.pop(key))
+                    to_close_workers.append(self.lean_workers.pop(key))
                 if key in self.rust_workers:
                     closed_roots.append(key)
-                    to_close.append(self.rust_workers.pop(key))
-        for w in to_close:
-            try:
-                w.close()
-            except Exception:
-                pass
-        return {"text": f"Restarted {len(closed_roots)} LSP worker(s): {closed_roots or '(none active)'}", "restarted": closed_roots}
+                    to_close_workers.append(self.rust_workers.pop(key))
+        _terminate_procs_parallel(to_close_workers, to_close_checks)
+        return {
+            "text": f"Restarted {len(closed_roots)} LSP worker(s): {closed_roots or '(none active)'}",
+            "restarted": closed_roots,
+            "killed_checks": len(to_close_checks),
+        }
 
     def shutdown_all(self) -> None:
         with self._pool_lock:
+            self._evict_generation += 1
             all_w = list(self.lean_workers.values()) + list(self.rust_workers.values())
+            all_checks = list(self._active_checks)
             self.lean_workers.clear()
             self.rust_workers.clear()
-        for w in all_w:
-            try:
-                w.close()
-            except Exception:
-                pass
+            self._active_checks.clear()
+        _terminate_procs_parallel(all_w, all_checks)
 
 
 def cd_line0(diag: dict[str, Any]) -> int:
@@ -1877,8 +2486,116 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
     daemon_threads = True
 
 
+def _workloads_slice_unit_path() -> Path:
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg_cfg) if xdg_cfg else (HOME_DIR / ".config")
+    return base / "systemd" / "user" / "anneal-workloads.slice"
+
+
+def _maybe_self_slice_reexec(
+    env_info: dict[str, Any],
+    runtime_base: Path,
+    user_systemd_sock_alive: bool,
+    *,
+    cgroup_text: str | None = None,
+    exec_fn: Any = os.execvpe,
+    slice_unit_path: Path | None = None,
+    ensure_slice_fn: Any = None,
+) -> bool:
+    """Single `systemd-run` self-slicing launcher inside `serve_daemon()`.
+
+    Traps fresh starts, legacy `app.slice` respawns, and nested `anneal-run-*.scope` spawns.
+    Refuses unscoped `app.slice` fallback when `is_cg_capped and user_systemd_sock_alive`.
+    """
+    user_systemd_active = bool(env_info.get("user_systemd_active", False))
+    is_cg_capped = bool(env_info.get("is_cg_capped", False))
+    l_max_mb = max(256, int(env_info.get("l_max_mb", 4096)))
+
+    cg_txt = _read_self_cgroup_text() if cgroup_text is None else cgroup_text
+    if not user_systemd_active or "anneal-workloads.slice/anneal-lsp-daemon-" in cg_txt:
+        return False
+
+    unit_path = slice_unit_path if slice_unit_path is not None else _workloads_slice_unit_path()
+    slice_ok = unit_path.is_file()
+    if not slice_ok:
+        if ensure_slice_fn is not None:
+            slice_ok = bool(ensure_slice_fn())
+        else:
+            lean_run_bin = _find_anneal_lean_run()
+            if lean_run_bin:
+                ens_env = os.environ.copy()
+                if user_systemd_sock_alive:
+                    ens_env["XDG_RUNTIME_DIR"] = str(runtime_base)
+                try:
+                    res = subprocess.run(
+                        [lean_run_bin, "--ensure-slice"],
+                        env=ens_env,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=10.0,
+                    )
+                    slice_ok = res.returncode == 0 and unit_path.is_file()
+                except Exception:
+                    slice_ok = False
+
+    if os.environ.get("ANNEAL_LSP_SELF_SLICED") == "1" or not slice_ok:
+        if is_cg_capped and user_systemd_sock_alive:
+            sys.stderr.write(
+                "[anneal-lsp-daemon] ERROR: Refusing unscoped `app.slice` fallback on "
+                "cgroup-capped host (`anneal-workloads.slice` unavailable or self-slice re-exec failed).\n"
+            )
+            raise SystemExit(1)
+        return False
+
+    exec_env = os.environ.copy()
+    exec_env["XDG_RUNTIME_DIR"] = str(runtime_base)
+    exec_env["ANNEAL_LSP_SELF_SLICED"] = "1"
+    systemd_run_bin = shutil.which("systemd-run", path=DEFAULT_ENV_PATH) or "/usr/bin/systemd-run"
+    unit_name = f"anneal-lsp-daemon-{os.getpid()}-{time.monotonic_ns()}"
+    reexec_argv = [
+        systemd_run_bin,
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--slice=anneal-workloads.slice",
+        f"--unit={unit_name}",
+        "-p",
+        f"MemoryMax={l_max_mb}M",
+        "-p",
+        "MemorySwapMax=0",
+        "-p",
+        "OOMPolicy=continue",
+        "--",
+        sys.executable,
+        os.path.abspath(__file__),
+        *sys.argv[1:],
+    ]
+    try:
+        exec_fn(systemd_run_bin, reexec_argv, exec_env)
+        return True
+    except OSError as exc:
+        if is_cg_capped and user_systemd_sock_alive:
+            sys.stderr.write(
+                f"[anneal-lsp-daemon] ERROR: Failed systemd-run self-slice re-exec ({exc}); "
+                "refusing unscoped `app.slice` fallback on cgroup-capped host.\n"
+            )
+            raise SystemExit(1)
+        return False
+
+
 def serve_daemon(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
-    coordinator = AnnealLspCoordinator()
+    # Unconditionally scrub leaked agent/wrapper env vars on ALL hosts (systemd & non-systemd).
+    for key in _SCRUB_ENV_BASE:
+        os.environ.pop(key, None)
+
+    runtime_base, user_systemd_sock_alive = resolve_runtime_base()
+    env_info = _probe_lean_run_envelope(runtime_base, user_systemd_sock_alive)
+    _maybe_self_slice_reexec(env_info, runtime_base, user_systemd_sock_alive)
+
+    coordinator = AnnealLspCoordinator(envelope=env_info)
     try:
         os.unlink(sock_path)
     except FileNotFoundError:
@@ -1913,7 +2630,12 @@ def serve_daemon(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
                 action = req.get("action")
                 args = req.get("args") or {}
                 if action == "ping":
-                    resp = {"ok": True, "pid": os.getpid(), "script_sha256": SCRIPT_SHA256}
+                    resp = {
+                        "ok": True,
+                        "pid": os.getpid(),
+                        "script_sha256": SCRIPT_SHA256,
+                        "slice": coordinator.self_slice,
+                    }
                 elif action == "ui_state":
                     resp = {"ok": True, "result": coordinator.get_ui_state()}
                 elif action == "shutdown":
@@ -1926,6 +2648,17 @@ def serve_daemon(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
                     resp = {"ok": True, "result": dispatch[action](args)}
                 else:
                     resp = {"ok": False, "error": f"Unknown daemon action: {action}"}
+            except _LspDeferredError as exc:
+                resp = {
+                    "ok": True,
+                    "skipped": True,
+                    "result": {
+                        "skipped": True,
+                        "code": exc.code,
+                        "text": exc.msg,
+                        "feedback": exc.msg,
+                    },
+                }
             except Exception as exc:
                 resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             try:
@@ -1946,6 +2679,7 @@ def serve_daemon(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
     try:
         srv.serve_forever()
     finally:
+        srv.server_close()
         coordinator.shutdown_all()
         try:
             os.unlink(sock_path)
@@ -1953,9 +2687,21 @@ def serve_daemon(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
             pass
 
 
-def daemon_rpc(action: str, args: dict[str, Any] | None = None, timeout_s: float = 120.0, sock_path: str = DEFAULT_SOCKET_PATH) -> dict[str, Any]:
-    ensure_daemon_running(sock_path=sock_path)
-    return _raw_unix_call(action, args or {}, timeout_s=timeout_s, sock_path=sock_path)
+def daemon_rpc(
+    action: str,
+    args: dict[str, Any] | None = None,
+    timeout_s: float = 120.0,
+    sock_path: str = DEFAULT_SOCKET_PATH,
+    *,
+    no_start: bool = False,
+) -> dict[str, Any]:
+    req_args = args or {}
+    skip_resp = _check_client_light_skip(action, req_args)
+    if skip_resp is not None:
+        return skip_resp
+    if not no_start:
+        ensure_daemon_running(sock_path=sock_path)
+    return _raw_unix_call(action, req_args, timeout_s=timeout_s, sock_path=sock_path)
 
 
 def _raw_unix_call(action: str, args: dict[str, Any], timeout_s: float, sock_path: str) -> dict[str, Any]:
@@ -1976,23 +2722,41 @@ def _raw_unix_call(action: str, args: dict[str, Any], timeout_s: float, sock_pat
     return json.loads(line.decode("utf-8", errors="replace"))
 
 
+def _ping_matches_expected(
+    ping: dict[str, Any] | None,
+    disk_sha: str,
+    *,
+    systemd_active_fn: Any = _check_user_systemd_active_lightweight,
+) -> bool:
+    """Checks `ping` SHA + slice, evaluating `user_systemd_active` strictly on slice mismatch."""
+    if not isinstance(ping, dict) or not ping.get("ok"):
+        return False
+    if ping.get("script_sha256") != disk_sha:
+        return False
+    if ping.get("slice") == "anneal-workloads.slice":
+        return True
+    # Only on slice mismatch do we check whether user systemd is active (preserving <1ms happy path).
+    return not bool(systemd_active_fn())
+
+
 def ensure_daemon_running(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
     disk_sha = compute_script_sha256()
     try:
         ping = _raw_unix_call("ping", {}, timeout_s=2.0, sock_path=sock_path)
-        if ping.get("ok") and ping.get("script_sha256") == disk_sha:
+        if _ping_matches_expected(ping, disk_sha):
             return
     except Exception:
         ping = None
 
-    os.makedirs(os.path.dirname(LOCK_PATH) or "/tmp", exist_ok=True)
-    with open(LOCK_PATH, "w", encoding="utf-8") as lf:
+    lock_path = sock_path + ".lock"
+    os.makedirs(os.path.dirname(lock_path) or "/tmp", exist_ok=True)
+    with open(lock_path, "w", encoding="utf-8") as lf:
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         disk_sha = compute_script_sha256()
         try:
             ping2 = _raw_unix_call("ping", {}, timeout_s=2.0, sock_path=sock_path)
             if ping2.get("ok"):
-                if ping2.get("script_sha256") == disk_sha:
+                if _ping_matches_expected(ping2, disk_sha):
                     return
                 try:
                     _raw_unix_call("shutdown", {}, timeout_s=2.0, sock_path=sock_path)
@@ -2002,34 +2766,35 @@ def ensure_daemon_running(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
         except Exception:
             pass
 
-        mem_max = os.environ.get("ANNEAL_LSP_MEMORY_MAX", "48G")
+        # Single `systemd-run` launcher lives strictly inside `serve_daemon()`.
+        spawn_env = os.environ.copy()
+        for key in (*_SCRUB_ENV_BASE, "ANNEAL_LSP_SELF_SLICED"):
+            spawn_env.pop(key, None)
+        runtime_base, user_systemd_sock_alive = resolve_runtime_base()
+        if user_systemd_sock_alive:
+            spawn_env["XDG_RUNTIME_DIR"] = str(runtime_base)
+
         daemon_cmd = [sys.executable, os.path.abspath(__file__), "--serve", "--socket", sock_path]
-        systemd_run = "/usr/bin/systemd-run" if Path("/usr/bin/systemd-run").is_file() else None
-        spawned = False
-        if systemd_run:
-            scoped_cmd = [
-                systemd_run,
-                "--user",
-                "--scope",
-                "--quiet",
-                "-p", f"MemoryMax={mem_max}",
-                "-p", "MemorySwapMax=0",
-                "-p", "OOMPolicy=continue",
-                "--",
-                *daemon_cmd,
-            ]
-            try:
-                log_f = open("/tmp/anneal-lean-lsp-daemon.log", "ab")
-                subprocess.Popen(scoped_cmd, stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f, start_new_session=True)
-                spawned = True
-            except Exception:
-                spawned = False
-        if not spawned:
-            log_f = open("/tmp/anneal-lean-lsp-daemon.log", "ab")
-            subprocess.Popen(daemon_cmd, stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f, start_new_session=True)
+        log_f = open("/tmp/anneal-lean-lsp-daemon.log", "ab")
+        try:
+            proc = subprocess.Popen(
+                daemon_cmd,
+                env=spawn_env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=log_f,
+                start_new_session=True,
+            )
+        finally:
+            log_f.close()
 
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
+            rc = proc.poll()
+            if rc is not None and rc != 0:
+                raise RuntimeError(
+                    f"`anneal_lsp_daemon.py` exited early with code {rc} while starting on {sock_path}"
+                )
             try:
                 p = _raw_unix_call("ping", {}, timeout_s=0.5, sock_path=sock_path)
                 if p.get("ok"):
@@ -2047,11 +2812,35 @@ if __name__ == "__main__":
     ap.add_argument("--socket", default=DEFAULT_SOCKET_PATH, help="Unix domain socket path")
     ap.add_argument("--call", help="Invoke a single daemon action and print JSON")
     ap.add_argument("--args", default="{}", help="JSON arguments for --call")
+    ap.add_argument(
+        "--no-start",
+        action="store_true",
+        help="Do not auto-start the daemon if it is not already running",
+    )
     ns = ap.parse_args()
     if ns.serve:
         serve_daemon(sock_path=ns.socket)
     elif ns.call:
-        print(json.dumps(daemon_rpc(ns.call, json.loads(ns.args), sock_path=ns.socket), indent=2))
+        try:
+            print(
+                json.dumps(
+                    daemon_rpc(
+                        ns.call,
+                        json.loads(ns.args),
+                        sock_path=ns.socket,
+                        no_start=ns.no_start,
+                    ),
+                    indent=2,
+                )
+            )
+        except OSError as exc:
+            print(json.dumps({"ok": False, "error": f"Daemon unavailable: {exc}"}, indent=2))
+            sys.exit(1)
     else:
-        ensure_daemon_running(sock_path=ns.socket)
-        print(json.dumps(_raw_unix_call("ping", {}, timeout_s=2.0, sock_path=ns.socket)))
+        if not ns.no_start:
+            ensure_daemon_running(sock_path=ns.socket)
+        try:
+            print(json.dumps(_raw_unix_call("ping", {}, timeout_s=2.0, sock_path=ns.socket)))
+        except OSError as exc:
+            print(json.dumps({"ok": False, "error": f"Daemon unavailable: {exc}"}))
+            sys.exit(1)
