@@ -2470,6 +2470,310 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     self.assertEqual((dest / rel).read_bytes(), (repo / rel).read_bytes(), rel)
             self.assertTrue(suite.audit_flip_direction_transitions(dest, repo)["passed"])
 
+    def test_flip_direction_guard_operators_scopes_defs_pins_and_cross_file_imports(self) -> None:
+        div_id = "DIV-LM-ENUM-SET-DISCR-UNINIT"
+        sym = "step_setDiscriminant_uninit_simulation"
+        lm23 = "lean-miri/lean/LeanMiriSpec/Correspondence/SimLM2_3.lean"
+        pin_div = "DIV-MR-CALL-TARGET-LOCAL"
+        pin_sym = "callerRefMutSilentWrongLocal_simulation"
+        stmt = SYNTH_STMT
+
+        def status_of_tail(tail: str) -> tuple[object, object]:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._write_flip_tree(root, {div_id: (None, tail, stmt)})
+                rec = self._flip_status(root, div_id)
+                return rec["status"], rec["resolution_problems"]
+
+        def status_of_module(text: str, extra_files: dict[str, str] | None = None) -> tuple[object, object]:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._write_flip_tree(root, {div_id: (None, None, stmt)})
+                for rel, content in (extra_files or {}).items():
+                    p = root / rel
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content, encoding="utf-8")
+                (root / lm23).parent.mkdir(parents=True, exist_ok=True)
+                (root / lm23).write_text(text, encoding="utf-8")
+                rec = self._flip_status(root, div_id)
+                return rec["status"], rec["resolution_problems"]
+
+        # 1. Arithmetic, comparison, list, and let-bound expressions that are genuinely
+        #    distinct on both sides must resolve cleanly, and flipping `<` to `≥` across
+        #    checkouts must not be misclassified as `polarity_not_flipped`.
+        for valid_tail in (
+            ": annealOutcome fooProg + delta = annealOutcome fooProg - delta := h",
+            ": annealOutcome fooProg < miriOutcome fooProg → annealOutcome fooProg > miriOutcome fooProg := h",
+            ": [annealOutcome fooProg] ++ xs = miriOutcome fooProg :: xs := h",
+            ": let s := annealOutcome fooProg; s = miriOutcome fooProg := rfl",
+        ):
+            with self.subTest(valid_operator_tail=valid_tail):
+                self.assertEqual(status_of_tail(valid_tail), ("resolved", []))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_root, cur_root = Path(tmp) / "base", Path(tmp) / "cur"
+            self._write_flip_tree(
+                base_root,
+                {div_id: (": annealOutcome fooProg < miriOutcome fooProg := by decide", None, None)},
+            )
+            self._write_flip_tree(
+                cur_root,
+                {
+                    div_id: (
+                        None,
+                        ": annealOutcome fooProg >= miriOutcome fooProg := by decide",
+                        "annealOutcome fooProg ≥ miriOutcome fooProg",
+                    )
+                },
+            )
+            audit_op = suite.audit_flip_direction_transitions(base_root, cur_root)
+            self.assertTrue(audit_op["passed"], audit_op["violations"])
+
+        # 2. Closed-trivial bypasses (unused section `variable`, unused theorem/forall/arrow
+        #    binders, pure `Nat` arithmetic, quoted name literals, dead `let`, and vacuous
+        #    domain padding conjoined/disjoined with `0 < 1`) and scope-token vacuity (`let`,
+        #    `have`, `show`, `if`, `match`) are rejected.
+        closed_only = ("resolution_invalid", ["closed_trivial_statement"])
+        vacuous = ("resolution_invalid", ["vacuous_statement"])
+        closed_vacuous = ("resolution_invalid", ["closed_trivial_statement", "vacuous_statement"])
+        hole_dep = ("resolution_invalid", ["hole_dependency"])
+        resolved = ("resolved", [])
+
+        tail_cases: list[tuple[str, tuple[object, object]]] = [
+            ("(p : CapturedMir) : 0 < 1 := by decide", closed_only),
+            (": ∀ (p : CapturedMir), 0 < 1 := fun _ => by decide", closed_only),
+            (": CapturedMir → 0 < 1 := fun _ => by decide", closed_only),
+            ("(n : Nat) : n + 0 = n := by omega", closed_only),
+            (": (`foo ≠ `bar) := by decide", closed_only),
+            (": let _ := fooProg; 0 < 1 := by decide", closed_only),
+            (": (0 < 1) ∧ (annealOutcome fooProg = annealOutcome fooProg) := ⟨by decide, rfl⟩", closed_only),
+            (
+                ": ((annealOutcome fooProg = miriOutcome fooProg) ∧ False) ∨ (0 < 1) := Or.inr (by decide)",
+                closed_only,
+            ),
+            (": let _ := fooProg; True := trivial", vacuous),
+            (": let a := annealOutcome fooProg; a = annealOutcome fooProg := rfl", vacuous),
+            (": have _ := fooProg; True := trivial", vacuous),
+            (": show Prop from (annealOutcome fooProg = annealOutcome fooProg) := rfl", vacuous),
+            (": if stepOk fooProg then True else True := by split <;> trivial", vacuous),
+            (": if stepOk fooProg then stepOk fooProg else ¬ stepOk fooProg := by split <;> assumption", vacuous),
+            (": match fooProg with | _ => annealOutcome fooProg = annealOutcome fooProg := rfl", vacuous),
+        ]
+        for tail, expected in tail_cases:
+            with self.subTest(tail_case=tail):
+                self.assertEqual(status_of_tail(tail), expected)
+
+        # 3. Module-level `variable` closed-trivial bypass, definitional vacuity (`by exact`,
+        #    `by trivial`, tautology under binder hyps, untyped closed `def`, `: ∀ _, Prop`,
+        #    empty `structure ... : Prop`, 0-constructor `inductive`, 0-arg `Or A P`,
+        #    `(Simulates) fooProg`, `fooProg |> Simulates`, multi-arm `∀` match), and
+        #    metaprogram `mkConst ``sorryAx` holes.
+        thm = f"theorem {sym}"
+        sim_def = "def Simulates (p : CapturedMir) : Prop"
+        mod_cases: list[tuple[str, str, tuple[object, object]]] = [
+            ("unused_section_variable_closed", f"variable {{body : CapturedMir}}\n{thm} : 0 < 1 := by decide\n", closed_only),
+            ("def_by_exact_true", f"{sim_def} := by exact True\n{thm} : Simulates fooProg := trivial\n", closed_vacuous),
+            ("def_by_trivial", f"{sim_def} := by trivial\n{thm} : Simulates fooProg := trivial\n", closed_vacuous),
+            (
+                "def_self_implication",
+                f"{sim_def} := stepOk p → stepOk p\n{thm} : Simulates fooProg := id\n",
+                closed_vacuous,
+            ),
+            (
+                "def_untyped_closed_param",
+                f"def Simulates (p : CapturedMir) := 0 < 1\n{thm} : Simulates fooProg := by decide\n",
+                closed_only,
+            ),
+            (
+                "def_forall_prop_closed",
+                f"def Simulates : ∀ (_ : CapturedMir), Prop := fun _ => 0 < 1\n{thm} : Simulates fooProg := by decide\n",
+                closed_only,
+            ),
+            (
+                "empty_prop_structure",
+                f"structure Simulates (p : CapturedMir) : Prop where\n{thm} : Simulates fooProg := ⟨⟩\n",
+                closed_vacuous,
+            ),
+            (
+                "empty_prop_inductive",
+                f"inductive Broken (p : CapturedMir) : Prop\n{thm} (h : Broken fooProg) : {stmt} := nomatch h\n",
+                vacuous,
+            ),
+            (
+                "zero_arg_def_in_prefix_or",
+                f"def A : Prop := True\n{thm} : Or A ({stmt}) := Or.inl trivial\n",
+                vacuous,
+            ),
+            (
+                "parenthesized_def_head",
+                f"{sim_def} := True\n{thm} : (Simulates) fooProg := trivial\n",
+                closed_vacuous,
+            ),
+            (
+                "piped_def_application",
+                f"{sim_def} := True\n{thm} : fooProg |> Simulates := trivial\n",
+                closed_vacuous,
+            ),
+            (
+                "match_arm_forall_all_vacuous",
+                f"def Simulates : CapturedMir → Prop\n  | .a => ∀ x, True\n  | .b => True\n{thm} : Simulates fooProg := trivial\n",
+                closed_vacuous,
+            ),
+            (
+                "match_arm_forall_second_arm_meaningful",
+                f"def Simulates : CapturedMir → Prop\n  | .a => ∀ x, True\n  | .b => {stmt}\n{thm} : Simulates fooProg := rfl\n",
+                resolved,
+            ),
+            (
+                "elab_mkconst_quoted_sorryax",
+                f'elab "cheat" : term => return mkConst ``sorryAx\n{thm} : {stmt} := cheat\n',
+                hole_dep,
+            ),
+        ]
+        for label, text, expected in mod_cases:
+            with self.subTest(mod_case=label):
+                self.assertEqual(status_of_module(text), expected)
+
+        # 4. Statement-pin RHS specialization, `sorry` argument, and ambient-hole checks.
+        pin_cases: list[tuple[str, list[str]]] = [
+            (f"example : {stmt} := {pin_sym} sorry\n", ["pin_sorry_or_admit"]),
+            (f"example : {stmt} := {pin_sym} emptyProg\n", ["pin_instantiates_or_duplicates_arg"]),
+            (
+                f"example (x : CapturedMir) : annealOutcome x = miriOutcome x := {pin_sym} x x\n",
+                ["pin_instantiates_or_duplicates_arg"],
+            ),
+            (
+                f"set_option debug.skipKernelTC true\nexample : {stmt} := {pin_sym}\n",
+                ["pin_hole_dependency"],
+            ),
+        ]
+        for pin_src, expected_pin_reasons in pin_cases:
+            with self.subTest(pin_src=pin_src), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._write_flip_tree(root, {pin_div: (None, f": {stmt} := rfl", None)})
+                audit_file = root / suite.AUTHORITY_AUDIT_FILES["MiniRustSpec"]
+                with audit_file.open("a", encoding="utf-8") as fh:
+                    fh.write(pin_src)
+                rec = self._flip_status(root, pin_div)
+                self.assertEqual(
+                    (rec["status"], rec["resolution_pin_problems"]),
+                    ("resolution_unpinned", expected_pin_reasons),
+                )
+
+        # 5. Cross-file imported definitions and holes (1-hop and 2-hop chains, imported pin
+        #    definitions, and `materialize_flip_baseline_tree` + `audit_flip_direction_transitions`
+        #    catching a hole added inside an imported helper module).
+        helper_a = "lean-miri/lean/LeanMiriSpec/Correspondence/CheatA.lean"
+        helper_b = "lean-miri/lean/LeanMiriSpec/Correspondence/CheatB.lean"
+        self.assertEqual(
+            status_of_module(
+                f"import LeanMiriSpec.Correspondence.CheatB\n{thm} : Simulates fooProg := trivial\n",
+                {
+                    helper_a: "def BaseTrue : Prop := True\n",
+                    helper_b: f"import LeanMiriSpec.Correspondence.CheatA\n{sim_def} := BaseTrue\n",
+                },
+            ),
+            closed_vacuous,
+        )
+        self.assertEqual(
+            status_of_module(
+                f"import LeanMiriSpec.Correspondence.CheatB\n{thm} : {stmt} := wrapHole\n",
+                {
+                    helper_a: f"axiom rawAx : {stmt}\n",
+                    helper_b: f"import LeanMiriSpec.Correspondence.CheatA\ntheorem wrapHole : {stmt} := rawAx\n",
+                },
+            ),
+            hole_dep,
+        )
+        self.assertEqual(
+            status_of_module(
+                f"import LeanMiriSpec.Correspondence.CheatA\n{thm} : {stmt} := by simp\n",
+                {helper_a: f"@[simp] theorem cheatSimp : {stmt} := sorry\n"},
+            ),
+            hole_dep,
+        )
+
+        # Pin importing a vacuous definition from another module is rejected as unpinned.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_flip_tree(root, {pin_div: (None, f": {stmt} := rfl", None)})
+            pin_helper = root / "minirust/lean/MiniRustSpec/PinCheat.lean"
+            pin_helper.parent.mkdir(parents=True, exist_ok=True)
+            pin_helper.write_text("def Locked : Prop := True\n", encoding="utf-8")
+            audit_file = root / suite.AUTHORITY_AUDIT_FILES["MiniRustSpec"]
+            existing_audit = audit_file.read_text(encoding="utf-8")
+            audit_file.write_text(
+                f"import MiniRustSpec.PinCheat\n{existing_audit}\nexample : Locked := {pin_sym}\n",
+                encoding="utf-8",
+            )
+            rec = self._flip_status(root, pin_div)
+            self.assertEqual(
+                (rec["status"], rec["resolution_pin_problems"]),
+                ("resolution_unpinned", ["pin_closed_trivial_statement", "pin_vacuous_statement"]),
+            )
+
+        # Git revision materialization + transition audit catches a proof hole added to an
+        # imported helper module during a flip.
+        git = shutil.which("git")
+        if git is not None:
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp) / "repo"
+                repo.mkdir(parents=True)
+
+                def run_git(*args: str) -> None:
+                    subprocess.run(
+                        [
+                            git,
+                            "-c",
+                            "user.name=Flip Audit Test",
+                            "-c",
+                            "user.email=flip-audit@example.com",
+                            "-c",
+                            "commit.gpgsign=false",
+                            *args,
+                        ],
+                        cwd=repo,
+                        check=True,
+                        capture_output=True,
+                    )
+
+                run_git("init", "-q")
+                self._write_flip_tree(
+                    repo, {div_id: (f": {SYNTH_DIVERGENCE_STMT} := rfl", None, None)}
+                )
+                (repo / helper_a).parent.mkdir(parents=True, exist_ok=True)
+                (repo / helper_a).write_text("def benignHelper : Nat := 1\n", encoding="utf-8")
+                run_git("add", "-A")
+                run_git("commit", "-q", "-m", "baseline")
+
+                # Flip `div_id` (`open -> resolved`) while smuggling an unused `axiom` into
+                # imported `CheatA.lean` so `c["status"]` is `"resolved"` and `check_added_holes`
+                # across the import closure catches it.
+                for sub in ("lean-miri", "minirust", "tests"):
+                    if (repo / sub).exists():
+                        shutil.rmtree(repo / sub)
+                self._write_flip_tree(repo, {div_id: (None, f": {stmt} := rfl", stmt)})
+                sim_text = (repo / lm23).read_text(encoding="utf-8")
+                (repo / lm23).write_text(
+                    f"import LeanMiriSpec.Correspondence.CheatA\n{sim_text}",
+                    encoding="utf-8",
+                )
+                (repo / helper_a).parent.mkdir(parents=True, exist_ok=True)
+                (repo / helper_a).write_text(
+                    "def benignHelper : Nat := 1\naxiom smuggledHole : False\n",
+                    encoding="utf-8",
+                )
+
+                base_dest = Path(tmp) / "base_dest"
+                suite.materialize_flip_baseline_tree(repo, "HEAD", base_dest)
+                self.assertTrue((base_dest / helper_a).is_file())
+                audit_imp = suite.audit_flip_direction_transitions(base_dest, repo)
+                self.assertFalse(audit_imp["passed"])
+                self.assertEqual(
+                    [(v["id"], v["reason"]) for v in audit_imp["violations"]],
+                    [(div_id, "proof_hole_introduced")],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
