@@ -918,12 +918,12 @@ theorem mir_evalTerminator_return_root_and_caller
     simp only [evalTerminator, hRet]
     cases hConf : hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
         (length s.memory.callStack) (length s.frame.locals) with
-    | true => simp [hConf]
+    | true => simp
     | false =>
       cases hStack : s.memory.callStack with
-      | nil => simp [hConf, hStack, hUninitVal]
+      | nil => simp [hUninitVal]
       | cons caller restStack =>
-        cases hDiv : caller.isDiverging <;> simp [hConf, hStack, hDiv, hUninitVal]
+        cases hDiv : caller.isDiverging <;> simp [hDiv, hUninitVal]
   · intro hUninit
     simp [evalTerminator, hUninit]
   · intro hDead

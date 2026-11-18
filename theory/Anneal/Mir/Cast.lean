@@ -8608,6 +8608,61 @@ def unionRawOverlayValue (count : Nat) (bytes : List AbstractByte) : Value :=
   .aggregate 0
     (appendValueList (replicateValue count .unit) [.aggregate 0 (encodeRawAbstractByteVals bytes)])
 
+private theorem valueListContainsUninit_encodeRawAbstractByteVals :
+    ∀ (bs : List AbstractByte), valueListContainsUninit (encodeRawAbstractByteVals bs) = false
+  | .nil => rfl
+  | .uninit :: rest => by
+    simp [encodeRawAbstractByteVals, valueListContainsUninit, valueContainsUninit,
+      valueListContainsUninit_encodeRawAbstractByteVals rest]
+  | .init _ .none :: rest => by
+    simp [encodeRawAbstractByteVals, valueListContainsUninit, valueContainsUninit,
+      valueListContainsUninit_encodeRawAbstractByteVals rest]
+  | .init _ (.some (_, _)) :: rest => by
+    simp [encodeRawAbstractByteVals, valueListContainsUninit, valueContainsUninit,
+      valueListContainsUninit_encodeRawAbstractByteVals rest]
+
+private theorem valueListContainsUninit_append_units_overlay
+    (bs : List AbstractByte) :
+    ∀ (count : Nat),
+      valueListContainsUninit
+        (appendValueList (replicateValue count .unit)
+          [.aggregate 0 (encodeRawAbstractByteVals bs)]) = false
+  | 0 => by
+    simp [replicateValue, appendValueList, valueListContainsUninit, valueContainsUninit,
+      valueListContainsUninit_encodeRawAbstractByteVals bs]
+  | k + 1 => by
+    simp [replicateValue, appendValueList, valueListContainsUninit, valueContainsUninit,
+      valueListContainsUninit_append_units_overlay bs k]
+
+private theorem readProjectedValue_unionRawOverlayValue_nil
+    (locals : List LocalSlot) (count : Nat) (bs : List AbstractByte) :
+    readProjectedValue locals (unionRawOverlayValue count bs) [] =
+      .ok (unionRawOverlayValue count bs) := by
+  simp [readProjectedValue, unionRawOverlayValue, valueContainsUninit,
+    valueListContainsUninit_append_units_overlay bs count]
+
+private theorem readProjectedValueUnionAware_of_decodePtrBytesNoForge_thin
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (isRef : Bool) (pt : RigidTy) (ptrBytes : Nat) (bs : List AbstractByte)
+    (fv : Value) (ty : Ty)
+    (h_thin : isThinPointee pt = true)
+    (h_dec : decodePtrBytesNoForge isRef pt ptrBytes bs = some fv) :
+    readProjectedValueUnionAware locals localDecls layouts fv ty [] = .ok fv := by
+  cases pt <;> try (simp [isThinPointee] at h_thin; done)
+  all_goals
+    dsimp only [decodePtrBytesNoForge] at h_dec
+    cases hLen : Nat.beq (Trusted.Sequence.length bs) ptrBytes <;> rw [hLen] at h_dec
+    · cases h_dec
+    · cases hSc : decodeScalarBytes bs false with
+      | none => rw [hSc] at h_dec; cases h_dec
+      | some p =>
+        rw [hSc] at h_dec
+        rcases p with ⟨sv, prov⟩
+        cases hU : abstractBytesUniformProv bs <;> rw [hU] at h_dec <;>
+          cases prov <;> cases isRef <;> dsimp only at h_dec
+        all_goals (try cases h_dec)
+        all_goals rfl
+
 /-- `splitUnionTypedAndOverlay` separates the empty typed slots of `unionRawOverlayValue` from its
 raw-byte overlay. -/
 theorem trusted_splitUnionTypedAndOverlay_units_overlay (rawVals : List Value) :
@@ -8883,7 +8938,8 @@ theorem trusted_evalByteCast_union_rawOverlay_no_forge_agreement
     unfold evalOperand
     dsimp only [op]
     rw [hGet]
-    rfl
+    dsimp only
+    rw [readProjectedValue_unionRawOverlayValue_nil]
   have hTy : operandTy localDecls layouts op = some uTy := by
     unfold operandTy placeTy
     dsimp only [op]
@@ -8959,6 +9015,8 @@ theorem trusted_evalByteCast_move_union_rawOverlay_no_forge_agreement
     rw [hGet]
     dsimp only
     rw [hSet]
+    dsimp only
+    rw [readProjectedValue_unionRawOverlayValue_nil]
   have hTy : operandTy localDecls layouts op = some uTy := by
     unfold operandTy placeTy
     dsimp only [op]
@@ -9180,8 +9238,13 @@ theorem trusted_readProjectedForLocal_union_rawOverlay_thin_ptr
     rw [hSlice] <;>
     dsimp only <;>
     rw [hDecLi] <;>
-    cases decodePtrBytesNoForge _ pt (layoutPointerBytes layouts)
-      (cbs.map CastByte.toTrustedAbstractByte) <;> rfl
+    (cases hDec : decodePtrBytesNoForge _ pt (layoutPointerBytes layouts)
+        (cbs.map CastByte.toTrustedAbstractByte) with
+      | none => rfl
+      | some fv =>
+        dsimp only
+        exact readProjectedValueUnionAware_of_decodePtrBytesNoForge_thin locals localDecls layouts
+          _ pt (layoutPointerBytes layouts) _ fv _ h_thin hDec)
 
 /-- **Union-pun field-read no-forge agreement (`_u.ptr_field`).** In Rust MIR, reading a union field
 is lowered as a `.field idx fieldTy` projection rather than `CastKind.transmute`. When local
@@ -9354,7 +9417,7 @@ theorem trusted_union_rawOverlay_intact_ptr_roundtrip
   let uTy : Ty := { kind := .adt defPath args, layoutIdx := uIdx }
   have hOp : evalOperand locals (.copy ⟨loc, .nil⟩) mem.borrows mem.globals layouts
       mem.callerLocals localDecls mem.callStack = .ok (unionRawOverlayValue count tBytes) locals := by
-    unfold evalOperand; dsimp only; rw [hGet]; rfl
+    unfold evalOperand; dsimp only; rw [hGet]; dsimp only; rw [readProjectedValue_unionRawOverlayValue_nil]
   have hTy : operandTy localDecls layouts (.copy ⟨loc, .nil⟩) = some uTy := by
     unfold operandTy placeTy; dsimp only; rw [hDecl]
     show resolveProjectedTy layouts decl.ty [] = some uTy
