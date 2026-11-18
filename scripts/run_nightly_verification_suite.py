@@ -1368,11 +1368,14 @@ _LEAN_TOKEN_RE = re.compile(
     @\[
     | :=
     | [(\[{⟨⦃)\]}⟩⦄:@.;,]
+    | ``?(?:«[^»\n]*»|[^\W\d][\w'!?]*)(?:\.(?:«[^»\n]*»|[^\W\d][\w'!?]*))*
     | «[^»\n]+»
     | [\#?]?[A-Za-z_0-9][A-Za-z_0-9'!?]*
     """,
     re.VERBOSE,
 )
+# (A quoted name literal such as `` `theorem `` or ``` ``Foo.def ``` is one token, never a
+# command keyword that could cut a declaration body short.)
 
 _LEAN_OPEN_BRACKETS = {"@[", "(", "[", "{", "⟨", "⦃"}
 _LEAN_CLOSE_BRACKETS = {")", "]", "}", "⟩", "⦄"}
@@ -1498,12 +1501,28 @@ _LEAN_STMT_FORALLS = frozenset({"∀", "Π", "∏"})
 _LEAN_STMT_SCOPE_TOKENS = frozenset(
     {"∀", "Π", "∏", "∃", "fun", "λ", "let", "have", "show", "match", "if", "do"}
 )
+# Options and environment hooks that add a declaration without kernel type checking
+# (`set_option debug.skipKernelTC true`), so a metaprogram can admit an ill-typed proof.
+# They are holes even as the field of a `.`-qualified name.
+_LEAN_KERNEL_BYPASS_TOKENS = frozenset({"skipKernelTC", "addDeclWithoutChecking"})
 # Proof terms, tactics, and compiler-reduction hooks that close a goal without a
 # kernel-checked standard-axiom proof.
 _LEAN_HOLE_PROOF_TOKENS = frozenset(
-    {"sorry", "admit", "sorryAx", "native_decide", "ofReduceBool", "ofReduceNat", "mkSorry"}
+    {
+        "sorry",
+        "admit",
+        "sorryAx",
+        "native_decide",
+        "ofReduceBool",
+        "ofReduceNat",
+        "mkSorry",
+        *_LEAN_KERNEL_BYPASS_TOKENS,
+    }
 )
 _LEAN_FILE_HOLE_TOKENS = frozenset({*_LEAN_HOLE_PROOF_TOKENS, "axiom", "implemented_by", "extern"})
+# Tactics that search the environment for a closing lemma: a proof that runs one may use
+# an earlier holey declaration of its module without naming it.
+_LEAN_SEARCH_TACTICS = frozenset({"exact?", "apply?", "rw?", "library_search", "rw_search"})
 # Identifiers that name no domain definition a correspondence statement could be about.
 _LEAN_STMT_LOGICAL_IDENTS = frozenset(
     {
@@ -1592,9 +1611,20 @@ def _collapse_lean_root_prefix(tokens: list[str]) -> list[str]:
     return out
 
 
+_LEAN_NAME_SEG_PAT = r"(?:«[^»\n]*»|[^\W\d][\w'!?]*)"
+# A quoted name literal (`` `foo.bar `` or ``` ``foo ```) names a declaration without
+# using it (`` a == ``sorryAx `` in an axiom audit is not a `sorry`), unlike a syntax
+# quotation `` `(tactic| sorry) ``, which expands to its contents.
+_LEAN_NAME_LITERAL_RE = re.compile(rf"``?({_LEAN_NAME_SEG_PAT}(?:\.{_LEAN_NAME_SEG_PAT})*)")
+
+
 def _lean_stmt_tokens(text: str) -> list[str]:
     """Tokens of a comment/string-stripped Lean statement (operators included, simple
-    guillemets unescaped, and `_root_.` prefixes collapsed)."""
+    guillemets unescaped, `_root_.` prefixes collapsed, and quoted name literals kept as
+    opaque `` «`name» `` tokens)."""
+    text = _LEAN_NAME_LITERAL_RE.sub(
+        lambda m: "«`" + m.group(1).replace("«", "").replace("»", "") + "»", text
+    )
     raw = [_unescape_lean_guillemet_ident(tok) for tok in _LEAN_STMT_TOKEN_RE.findall(text)]
     return _collapse_lean_root_prefix(raw)
 
@@ -1825,8 +1855,21 @@ def _lean_top_app_args(tokens: list[str]) -> tuple[str, list[list[str]]] | None:
 
 
 def _lean_eq_sides(tokens: list[str]) -> tuple[str, list[str], list[str]] | None:
-    """Extract `("=", lhs, rhs)` or `("≠", lhs, rhs)` from infix `=`/`≠` or prefix `Eq`/`Ne`."""
+    """Extract `("=", lhs, rhs)` or `("≠", lhs, rhs)` from infix `=`/`≠` or prefix `Eq`/`Ne`.
+
+    `=` and `≠` bind tighter than `∧`, `∨`, `→`, and `↔`, and `¬a = b` is `¬(a = b)`, so
+    `v = e ∧ Q`, `a = b → c`, and `¬a = b` are not equations (`None`)."""
     toks = _lean_norm_expr_tokens(tokens)
+    if not toks or toks[0] in _LEAN_STMT_NOTS or toks[0] in _LEAN_STMT_SCOPE_TOKENS:
+        return None
+    if (
+        _lean_stmt_first_top(
+            toks,
+            _LEAN_STMT_IFFS | _LEAN_STMT_ARROWS | _LEAN_STMT_ORS | _LEAN_STMT_ANDS | {","},
+        )
+        is not None
+    ):
+        return None
     for rel in ("=", "≠"):
         parts = _lean_stmt_split_top(toks, {rel})
         if len(parts) == 2 and parts[0] and parts[1]:
@@ -1838,6 +1881,13 @@ def _lean_eq_sides(tokens: list[str]) -> tuple[str, list[str], list[str]] | None
             return "=", _lean_norm_expr_tokens(args[-2]), _lean_norm_expr_tokens(args[-1])
         if (head == "Ne" and len(args) == 2) or (head == "@Ne" and len(args) == 3):
             return "≠", _lean_norm_expr_tokens(args[-2]), _lean_norm_expr_tokens(args[-1])
+    return None
+
+
+def _lean_decimal_literal(tokens: list[str]) -> int | None:
+    """The value of a single ASCII decimal numeral token (`42`, `042`), else `None`."""
+    if len(tokens) == 1 and tokens[0].isascii() and tokens[0].isdigit():
+        return int(tokens[0])
     return None
 
 
@@ -1958,9 +2008,12 @@ def _lean_prop_truth(tokens: list[str], depth: int = 0) -> str | None:
     eq_sides = _lean_eq_sides(toks)
     if eq_sides is not None:
         rel, lhs_e, rhs_e = eq_sides
-        if lhs_e == rhs_e:
+        lhs_lit, rhs_lit = _lean_decimal_literal(lhs_e), _lean_decimal_literal(rhs_e)
+        if lhs_e == rhs_e or (lhs_lit is not None and lhs_lit == rhs_lit):
             return _LEAN_TRUTH_TRUE if rel == "=" else _LEAN_TRUTH_FALSE
-        both_int_lits = len(lhs_e) == 1 and len(rhs_e) == 1 and lhs_e[0].isdigit() and rhs_e[0].isdigit()
+        # Distinct bare literals differ (bare numerals default to `Nat`; `@Eq T a b`
+        # may fix a type, such as `Fin 2`, in which they wrap around).
+        both_int_lits = lhs_lit is not None and rhs_lit is not None and toks[0] != "@"
         both_bool_lits = (
             len(lhs_e) == 1
             and len(rhs_e) == 1
@@ -2012,7 +2065,10 @@ def _lean_stmt_tautological_under_hyps(
     tokens: list[str], hyp_cores: set[tuple[bool, tuple[str, ...]]], depth: int = 0
 ) -> bool:
     """True when `tokens` is trivially proved from `hyp_cores` (e.g. `(h : P) : P`,
-    `P → P`, `P ∧ Q → P`, `(h : P) : P ∨ Q`, or contradictory hypotheses `P` and `¬P`)."""
+    `P → P`, `P ∧ Q → P`, `(h : P) : P ∨ Q`, or contradictory hypotheses `P` and `¬P`).
+
+    A `∀` or Pi binder shadows the outer hypotheses that mention the names it binds:
+    `(h : P x) : ∀ x, P x` does not follow from `h`."""
     if depth > 64:
         return False
     toks = _lean_norm_expr_tokens(tokens)
@@ -2025,13 +2081,16 @@ def _lean_stmt_tautological_under_hyps(
     if toks[0] == "∀" or toks[0] in _LEAN_STMT_FORALLS:
         comma = _lean_stmt_first_top(toks, {","}, start=1)
         if comma is not None:
-            sub = set(hyp_cores)
-            if _lean_collect_hyp_cores(_lean_quantifier_binder_types(toks[1:comma]), sub, depth + 1):
+            binders = toks[1:comma]
+            bound = set(_lean_quantifier_binder_names(binders))
+            sub = {core for core in hyp_cores if not bound.intersection(core[1])}
+            if _lean_collect_hyp_cores(_lean_quantifier_binder_types(binders), sub, depth + 1):
                 return True
             return _lean_stmt_tautological_under_hyps(toks[comma + 1 :], sub, depth + 1)
     arrows = _lean_stmt_split_top(toks, _LEAN_STMT_ARROWS)
     if len(arrows) > 1:
-        sub = set(hyp_cores)
+        bound = {name for p in arrows[:-1] for name in _lean_binder_group_names(p)}
+        sub = {core for core in hyp_cores if not bound.intersection(core[1])}
         ant_types = [_lean_antecedent_type(p) for p in arrows[:-1]]
         if _lean_collect_hyp_cores(ant_types, sub, depth + 1):
             return True
@@ -2119,6 +2178,138 @@ def _is_lean_stmt_ident(tok: str) -> bool:
     return bool(tok) and (tok[0].isalpha() or (tok[0] == "_" and len(tok) > 1))
 
 
+# Tokens that end the explicit arguments of an application at bracket depth 0.
+_LEAN_APP_ARG_STOPS = frozenset(
+    _LEAN_STMT_ARROWS
+    | _LEAN_STMT_IFFS
+    | _LEAN_STMT_ANDS
+    | _LEAN_STMT_ORS
+    | _LEAN_STMT_SCOPE_TOKENS
+    | {"=", "≠", ",", ":", ":=", "|", "=>", "↦", ";", "then", "else", "with", "from"}
+)
+# Tokens after which a (sub)expression, and so an application head, starts.
+_LEAN_EXPR_START_AFTER = frozenset(
+    _LEAN_STMT_OPEN
+    | _LEAN_STMT_ARROWS
+    | _LEAN_STMT_IFFS
+    | _LEAN_STMT_ANDS
+    | _LEAN_STMT_ORS
+    | _LEAN_STMT_NOTS
+    | {"=", "≠", ",", ":", ":=", "|", "=>", "↦", ";", "then", "else", "show", "from"}
+)
+
+
+def _lean_inline_prop_defs(tokens: list[str], defs: dict[str, list[str]]) -> list[str]:
+    """Replace every application `@?Ns.Def arg*` that starts a (sub)expression of
+    `tokens`, where `Def` is a definition of the same file whose applications reduce to
+    a fixed proposition (`defs`: name -> replacement tokens, see
+    `_lean_prop_def_replacement`), by that proposition, so a statement cannot hide its
+    vacuity behind a definition: with `def Simulates (p : Prog) : Prop := True`,
+    `(p : Prog) : Simulates p ∧ Q p` reads `(p : Prog) : True ∧ Q p`. Binders that
+    shadow `Def` do not stop the replacement (fail closed)."""
+    if not defs:
+        return tokens
+    out: list[str] = []
+    n = len(tokens)
+    i = 0
+    while i < n:
+        tok = tokens[i]
+        if i == 0 or tokens[i - 1] in _LEAN_EXPR_START_AFTER:
+            j = i + 1 if tok == "@" else i
+            if j < n and _is_lean_stmt_ident(tokens[j]):
+                last = tokens[j]
+                k = j + 1
+                while k + 1 < n and tokens[k] == "." and _is_lean_stmt_ident(tokens[k + 1]):
+                    last = tokens[k + 1]
+                    k += 2
+                if last in defs and not (k < n and tokens[k] == "."):
+                    while k < n and tokens[k] not in _LEAN_STMT_CLOSE and tokens[k] not in _LEAN_APP_ARG_STOPS:
+                        k = _lean_stmt_matching_close(tokens, k) + 1 if tokens[k] in _LEAN_STMT_OPEN else k + 1
+                    out.extend(defs[last])
+                    i = min(k, n)
+                    continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+def _lean_prop_def_body_truth(body_tokens: list[str], defs: dict[str, list[str]]) -> str | None:
+    """Truth (`_lean_prop_truth`, after inlining the earlier `defs`) of a definition body
+    that is trivially true / false for every argument: directly (`:= True`, `:= p = p`),
+    under `fun x =>` binders, or in every alternative of an equation-compiler / `match` /
+    `fun` alternative list (`| _ => True`)."""
+    toks = _lean_norm_expr_tokens(_lean_inline_prop_defs(body_tokens, defs))
+    for _ in range(64):
+        if toks and toks[0] == "match":
+            with_idx = _lean_stmt_first_top(toks, {"with"}, start=1)
+            if with_idx is None:
+                return None
+            toks = toks[with_idx + 1 :]
+        elif len(toks) > 1 and toks[0] == "fun" and toks[1] == "|":
+            toks = toks[1:]
+        elif toks and toks[0] == "fun":
+            arrow = _lean_stmt_first_top(toks, {"=>", "↦"}, start=1)
+            if arrow is None:
+                return None
+            toks = _lean_norm_expr_tokens(toks[arrow + 1 :])
+            continue
+        if toks and toks[0] == "|":
+            alts = _lean_stmt_split_top(toks, {"|"})
+            truths: set[str | None] = set()
+            for alt in alts[1:]:
+                arrow = _lean_stmt_first_top(alt, {"=>", "↦"})
+                if arrow is None:
+                    return None
+                rhs = alt[arrow + 1 :]
+                if rhs and rhs[0] in ("fun", "match"):
+                    truths.add(_lean_prop_def_body_truth(rhs, {}))
+                else:
+                    truths.add(_lean_prop_truth(rhs))
+            if alts[0] or len(truths) != 1:
+                return None
+            return truths.pop()
+        return _lean_prop_truth(toks)
+    return None
+
+
+def _lean_prop_def_replacement(
+    sig_tokens: list[str], body_tokens: list[str], defs: dict[str, list[str]]
+) -> list[str] | None:
+    """The proposition that every application of the definition `<sig> := <body>`
+    reduces to, as tokens for `_lean_inline_prop_defs`: `True` / `False` when the body
+    is trivially true / false for every argument (`_lean_prop_def_body_truth`), or the
+    parenthesized body of a `Prop`-valued definition (`: Prop`, `: A → Prop`) whose body
+    ignores its parameters (`def Simulates (p : Prog) : Prop := 0 < 1` makes
+    `Simulates fooProg` the closed `(0 < 1)`); else `None`."""
+    truth = _lean_prop_def_body_truth(body_tokens, defs)
+    if truth is not None:
+        return ["True" if truth == _LEAN_TRUTH_TRUE else "False"]
+    colon = _lean_stmt_first_top(sig_tokens, {":"})
+    if colon is None:
+        return None
+    result = _lean_norm_expr_tokens(sig_tokens[colon + 1 :])
+    if not result or result[-1] != "Prop" or (len(result) > 1 and result[-2] != "→"):
+        return None
+    params = set(_lean_binder_group_names(sig_tokens[:colon]))
+    body = _lean_norm_expr_tokens(_lean_inline_prop_defs(body_tokens, defs))
+    for _ in range(64):
+        if not body or body[0] != "fun":
+            break
+        arrow = _lean_stmt_first_top(body, {"=>", "↦"}, start=1)
+        if arrow is None:
+            return None
+        params.update(t for t in body[1:arrow] if _is_lean_stmt_ident(t))
+        body = _lean_norm_expr_tokens(body[arrow + 1 :])
+    if (
+        not body
+        or body[0] in ("|", "match", "by", "fun")
+        or "where" in body
+        or any(t in params for t in body if _is_lean_stmt_ident(t))
+    ):
+        return None
+    return ["(", *body, ")"]
+
+
 def _lean_signature_problems(sig_tokens: list[str], body_tokens: list[str] | None = None) -> list[str]:
     """Reasons why a declaration signature (`<binders> : <statement>`, as rich tokens
     after the declared name) and its proof body do not state and prove anything:
@@ -2198,7 +2389,8 @@ def _split_lean_decl_text(text: str) -> tuple[list[str], list[str]]:
 # declaration when followed by one of these (inside `where`, `@[simp] aux := sorry` and
 # `private aux := sorry` bind local helpers without a declaration keyword). Commands in
 # `_LEAN_IN_PREFIX_CMDS` (`open`, `set_option`, `omit`, `attribute`, ...) end the body
-# only when no `in` follows before the next boundary.
+# unless an `in` follows that scopes a tactic (`set_option ... in simp`) rather than the
+# next top-level declaration (`set_option ... in theorem ...`).
 _LEAN_UNCOND_DECL_BOUNDARIES = frozenset(
     _LEAN_WITNESS_DECL_KINDS
     | _LEAN_OTHER_TOP_CMDS
@@ -2234,7 +2426,9 @@ def _lean_decl_end_offset(tokens: list[str], spans: list[tuple[int, int]], start
                 d2 = max(0, d2 - 1)
             elif d2 == 0 and tokens[k - 1] != ".":
                 if t2 == "in":
-                    return False
+                    # `set_option ... in theorem ...` prefixes the next top-level
+                    # declaration; `set_option ... in simp` scopes a tactic.
+                    return is_modifier_prefix_of_top_decl(k + 1)
                 if is_uncond_boundary(k) or t2 in _LEAN_IN_SCOPED_CMDS or t2 in _LEAN_DECL_MODIFIERS or t2 == "@[":
                     return True
         return True
@@ -2333,14 +2527,25 @@ def _scan_lean_declarations_and_pins(stripped_src: str) -> dict[str, Any]:
       - `resolutions`: `symbol -> list[(effective_namespace_parts, has_forbidden_modifier,
         signature_problems)]` for `theorem` / `lemma` declarations, where
         `signature_problems` (`_lean_signature_problems`) lists why the declaration
-        states or proves nothing (empty for a meaningful, hole-free theorem);
+        states or proves nothing (empty for a meaningful, hole-free theorem). The
+        statement is checked with every section `variable` binder in scope (any of them
+        may be a hypothesis, by `include` or by mention) and with this file's
+        definitions that reduce to a fixed proposition inlined
+        (`_lean_prop_def_replacement`: `def Simulates (p : Prog) : Prop := True`), and
+        `hole_dependency` is added when the declaration mentions an earlier declaration
+        of this file whose proof or definition has a hole (`sorry`, an `axiom`, ...), or
+        when an earlier hole of this file is usable without being named (an attributed
+        holey declaration, a holey `instance` / `macro` / `notation`, or a lemma search
+        such as `exact?` in the proof);
       - `decl_statements`: `symbol -> list[(effective_namespace_parts, statement)]` for
         every witness-eligible declaration, `statement` being its signature after the
         name as space-joined rich tokens (`_lean_stmt_tokens`);
       - `pins`: `symbol -> list[(audit_active_namespace_parts, inline_qualifier_parts,
         type_tokens, signature_tokens)]` for valid typed
         `example ... : <NonTrivialProp> := @?symbol <ident_args>*` statement pins, where
-        `signature_tokens` are the rich tokens of the `example`'s binders and type.
+        `signature_tokens` are the rich tokens of the in-scope `variable` binders and of
+        the `example`'s binders and type (with this file's definitions inlined the same
+        way).
     """
     matches = list(_LEAN_TOKEN_RE.finditer(stripped_src))
     tokens = [m.group(0) for m in matches]
@@ -2350,18 +2555,45 @@ def _scan_lean_declarations_and_pins(stripped_src: str) -> dict[str, Any]:
     scope_stack: list[tuple[str, list[str]]] = []
     mutual_seq = 0
     mutual_hole_ids: set[str] = set()
+    mutual_decl_names: dict[str, list[str]] = {}
     res_mutual_tags: list[tuple[str, int, str]] = []
     pending_mods: set[str] = set()
     witness_symbols: set[str] = set()
     resolutions: dict[str, list[tuple[list[str], bool, tuple[str, ...]]]] = {}
     decl_statements: dict[str, list[tuple[list[str], str]]] = {}
     pins: dict[str, list[tuple[list[str], list[str], tuple[str, ...], tuple[str, ...]]]] = {}
+    # Section `variable` binders as `(scope depth, rich binder tokens)`, plus the binders
+    # of a `variable ... in` prefix that scope only the next declaration. A theorem (or
+    # pin) may take any of them as hypotheses (`include h`, or a mention in its header),
+    # so its statement is checked with all of them (fail closed).
+    variables: list[tuple[int, list[str]]] = []
+    pending_in_vars: list[str] = []
+    # Names of this file's declarations whose proof or definition has a hole (a `sorry` /
+    # `admit` token, an `axiom`, or a use of another such declaration).
+    holey_names: set[str] = set()
+    # Set once this file has a hole that later proofs can use without naming it: a holey
+    # declaration registered by an attribute (`@[simp]`, `@[instance]`, or a later
+    # `attribute [simp] name`), or an `instance` / `macro` / `elab` / `notation` / ...
+    # command with a hole (`instance : Fact P := ⟨sorry⟩`, `macro "cheat" : term =>
+    # `(sorry)`). Every later resolution theorem then has a `hole_dependency` (as has one
+    # whose proof runs a lemma search such as `exact?` after any holey declaration).
+    ambient_hole = False
+    # This file's definitions whose applications reduce to a fixed proposition
+    # (`def Simulates (p : Prog) : Prop := True`), inlined into the statements that use
+    # them (`_lean_prop_def_replacement`, `_lean_inline_prop_defs`).
+    prop_def_inline: dict[str, list[str]] = {}
+
+    def active_var_tokens() -> list[str]:
+        return [tok for _, var_toks in variables for tok in var_toks] + pending_in_vars
 
     i = 0
     while i < n:
         tok = tokens[i]
         prev = tokens[i - 1] if i > 0 else ""
         if tok in _LEAN_OPEN_BRACKETS:
+            if tok == "@[" and depth == 0:
+                # Recorded like a modifier: the declaration it decorates has an attribute.
+                pending_mods.add("@[")
             depth += 1
             i += 1
             continue
@@ -2386,12 +2618,45 @@ def _scan_lean_declarations_and_pins(stripped_src: str) -> dict[str, Any]:
             i += 1
             continue
 
+        if tok == "variable":
+            # `variable` takes bracketed binders only; it scopes the next command when an
+            # `in` follows them, and the enclosing section otherwise.
+            j = i + 1
+            while j < n and tokens[j] in _LEAN_OPEN_BRACKETS and tokens[j] != "@[":
+                d2 = 0
+                while j < n:
+                    if tokens[j] in _LEAN_OPEN_BRACKETS:
+                        d2 += 1
+                    elif tokens[j] in _LEAN_CLOSE_BRACKETS:
+                        d2 -= 1
+                        if d2 == 0:
+                            break
+                    j += 1
+                j += 1
+            var_toks = _lean_stmt_tokens(
+                stripped_src[spans[i][1] : spans[j][0] if j < n else len(stripped_src)]
+            )
+            if j < n and tokens[j] == "in":
+                pending_in_vars.extend(var_toks)
+                i = j + 1
+            else:
+                variables.append((len(scope_stack), var_toks))
+                pending_mods.clear()
+                i = j
+            continue
+
         if tok in _LEAN_IN_PREFIX_CMDS:
             j = i + 1
             d2 = 0
+            cmd_next: int | None = None
             while j < n:
                 t2 = tokens[j]
                 p2 = tokens[j - 1] if j > 0 else ""
+                if d2 == 0 and p2 != "." and t2 == "@[":
+                    # An attribute starts the next declaration.
+                    pending_mods.clear()
+                    cmd_next = j
+                    break
                 if t2 in _LEAN_OPEN_BRACKETS:
                     d2 += 1
                 elif t2 in _LEAN_CLOSE_BRACKETS:
@@ -2399,20 +2664,28 @@ def _scan_lean_declarations_and_pins(stripped_src: str) -> dict[str, Any]:
                         d2 -= 1
                 elif d2 == 0 and p2 != ".":
                     if t2 == "in":
-                        i = j + 1
+                        cmd_next = j + 1
                         break
                     if (
                         t2 == "#exit"
                         or t2 in (_LEAN_WITNESS_DECL_KINDS | _LEAN_SCOPE_KEYWORDS | {"example"})
                         or t2 in _LEAN_DECL_MODIFIERS
-                        or t2 == "@["
                     ):
                         pending_mods.clear()
-                        i = j
+                        cmd_next = j
                         break
                 j += 1
-            else:
+            if tok == "attribute" and any(
+                _clean_lean_seg(t2) in holey_names for t2 in tokens[i + 1 : j]
+            ):
+                # `attribute [simp] cheat` lets later proofs use the holey `cheat` unnamed.
+                ambient_hole = True
+            if any(t2 in _LEAN_KERNEL_BYPASS_TOKENS for t2 in tokens[i + 1 : j]):
+                # `set_option debug.skipKernelTC true [in]`: later proofs go unchecked.
+                ambient_hole = True
+            if cmd_next is None:
                 break
+            i = cmd_next
             continue
 
         if tok == "namespace":
@@ -2457,11 +2730,15 @@ def _scan_lean_declarations_and_pins(stripped_src: str) -> dict[str, Any]:
                 if scope_stack:
                     scope_stack.pop()
                 i += 1
+            # Section variables go out of scope with their section or namespace.
+            variables = [(d, v) for d, v in variables if d <= len(scope_stack)]
             continue
 
         if tok in _LEAN_WITNESS_DECL_KINDS:
             mods = set(pending_mods)
             pending_mods.clear()
+            var_toks = active_var_tokens()
+            pending_in_vars = []
             segs, next_i = _read_lean_qname(tokens, i + 1)
             if segs and not segs[-1].isdigit():
                 sym = segs[-1]
@@ -2473,29 +2750,53 @@ def _scan_lean_declarations_and_pins(stripped_src: str) -> dict[str, Any]:
                 decl_end = _lean_decl_end_offset(tokens, spans, next_i, len(stripped_src))
                 sig_toks, body_toks = _split_lean_decl_text(stripped_src[spans[next_i - 1][1] : decl_end])
                 decl_statements.setdefault(sym, []).append((eff_ns, " ".join(sig_toks)))
-                if active_mut and (
-                    tok == "axiom"
-                    or any(t in _LEAN_HOLE_PROOF_TOKENS for t in [*sig_toks, *body_toks])
-                ):
-                    mutual_hole_ids.update(active_mut)
+                direct_hole = tok == "axiom" or any(
+                    t in _LEAN_HOLE_PROOF_TOKENS for t in [*sig_toks, *body_toks]
+                )
+                used_names = {t for t in [*sig_toks, *body_toks] if _is_lean_stmt_ident(t)} - {sym}
+                uses_holey = bool(used_names & holey_names)
+                if direct_hole or uses_holey:
+                    holey_names.add(sym)
+                for mid in active_mut:
+                    mutual_decl_names.setdefault(mid, []).append(sym)
+                    if direct_hole or uses_holey:
+                        mutual_hole_ids.add(mid)
+                    if mid in mutual_hole_ids:
+                        # A `mutual` block stands or falls together.
+                        holey_names.update(mutual_decl_names[mid])
+                if tok in ("def", "abbrev") and body_toks:
+                    replacement = _lean_prop_def_replacement(sig_toks, body_toks, prop_def_inline)
+                    if replacement is not None:
+                        prop_def_inline[sym] = replacement
                 if tok in _LEAN_RES_DECL_KINDS:
+                    problems = _lean_signature_problems(
+                        [*var_toks, *_lean_inline_prop_defs(sig_toks, prop_def_inline)], body_toks
+                    )
+                    searches = any(t in _LEAN_SEARCH_TACTICS for t in body_toks)
+                    if uses_holey or ambient_hole or (searches and holey_names - {sym}):
+                        problems.append("hole_dependency")
                     entry_list = resolutions.setdefault(sym, [])
                     entry_idx = len(entry_list)
                     entry_list.append(
                         (
                             eff_ns,
                             bool(mods & _LEAN_FORBIDDEN_RES_MODS),
-                            tuple(_lean_signature_problems(sig_toks, body_toks)),
+                            tuple(problems),
                         )
                     )
                     for mid in active_mut:
                         res_mutual_tags.append((sym, entry_idx, mid))
+                if sym in holey_names and "@[" in mods:
+                    # `@[simp]` / `@[instance]` let later proofs use the hole unnamed.
+                    ambient_hole = True
             i = max(next_i, i + 1)
             continue
 
         if tok == "example":
             mods = set(pending_mods)
             pending_mods.clear()
+            var_toks = active_var_tokens()
+            pending_in_vars = []
             j = i + 1
             d2 = 0
             colon_idx: int | None = None
@@ -2565,9 +2866,13 @@ def _scan_lean_declarations_and_pins(stripped_src: str) -> dict[str, Any]:
                             for rt in rem
                         ):
                             active_ns = [s for kind, sp in scope_stack if kind == "ns" for s in sp]
-                            sig_rich = _lean_stmt_tokens(
-                                stripped_src[spans[i][1] : spans[assign_idx][0]]
-                            )
+                            sig_rich = [
+                                *var_toks,
+                                *_lean_inline_prop_defs(
+                                    _lean_stmt_tokens(stripped_src[spans[i][1] : spans[assign_idx][0]]),
+                                    prop_def_inline,
+                                ),
+                            ]
                             pins.setdefault(qsegs[-1], []).append(
                                 (active_ns, qsegs[:-1], tuple(type_toks), tuple(sig_rich))
                             )
@@ -2576,6 +2881,15 @@ def _scan_lean_declarations_and_pins(stripped_src: str) -> dict[str, Any]:
 
         if pending_mods:
             pending_mods.clear()
+        if tok in _LEAN_OTHER_TOP_CMDS:
+            # A `variable ... in` prefix scopes only the command it precedes.
+            pending_in_vars = []
+            cmd_end = _lean_decl_end_offset(tokens, spans, i + 1, len(stripped_src))
+            if any(
+                t2 in _LEAN_HOLE_PROOF_TOKENS or t2 in holey_names
+                for t2 in _lean_stmt_tokens(stripped_src[spans[i][1] : cmd_end])
+            ):
+                ambient_hole = True
         i += 1
 
     for sym, entry_idx, mid in res_mutual_tags:
@@ -2969,8 +3283,11 @@ def materialize_flip_baseline_tree(repo_root: Path, ref: str, dest: Path) -> Pat
         raise ValueError(f"unknown flip-direction baseline revision {ref!r}")
     commit = probe.stdout.strip()
     for rel in flip_direction_tracked_files():
+        # `<commit>:./<path>` resolves `<path>` against `repo_root`, even when `repo_root`
+        # is a subdirectory of the git work tree (`<commit>:<path>` would resolve it
+        # against the work tree's top level).
         shown = subprocess.run(
-            ["git", "-C", str(repo_root), "show", f"{commit}:{rel}"],
+            ["git", "-C", str(repo_root), "show", f"{commit}:./{rel}"],
             capture_output=True,
             check=False,
         )
@@ -3101,7 +3418,11 @@ def _lean_file_hole_token_counts(path: Path) -> dict[str, int]:
     """Counts of the proof-hole and unsound-escape tokens of a Lean file (comments and
     strings stripped, guillemets unescaped): `sorry`, `admit`, `sorryAx`, `axiom`,
     `native_decide`, `ofReduceBool`, `ofReduceNat`, `mkSorry`, `implemented_by`, and
-    `extern` (not after a `.`)."""
+    `extern` (not after a `.`), the kernel-check bypasses `skipKernelTC` and
+    `addDeclWithoutChecking` (also after a `.`), and each of them as the last component
+    of a quoted name literal (``` ``sorryAx ```, `` `Lean.Meta.mkSorry ``), with which
+    metaprogramming code (`mkConst ``sorryAx`) builds a hole term without spelling the
+    token."""
     counts = {tok: 0 for tok in sorted(_LEAN_FILE_HOLE_TOKENS)}
     if not path.is_file():
         return counts
@@ -3109,7 +3430,11 @@ def _lean_file_hole_token_counts(path: Path) -> dict[str, int]:
         _strip_lean_comments_and_strings(path.read_text(encoding="utf-8", errors="replace"))
     )
     for idx, tok in enumerate(toks):
-        if tok in counts and (idx == 0 or toks[idx - 1] != "."):
+        if tok.startswith("«`"):
+            last = tok[2:-1].rsplit(".", 1)[-1]
+            if last in counts:
+                counts[last] += 1
+        elif tok in counts and (idx == 0 or toks[idx - 1] != "." or tok in _LEAN_KERNEL_BYPASS_TOKENS):
             counts[tok] += 1
     return counts
 
@@ -3129,11 +3454,12 @@ def audit_flip_direction_transitions(baseline_root: Path, current_root: Path) ->
     it held while the divergence was live, so it cannot show that the divergence is
     gone), or when its witness, resolution, or pin file gained a proof hole anywhere
     (`proof_hole_introduced`: a `sorry` / `admit` / `sorryAx` / `native_decide` /
-    `implemented_by` / `extern` token or an `axiom`, including when an already-resolved
-    theorem's statement is rewritten). Every non-`resolved` transition out of a
-    non-`resolved` baseline state is an `incomplete_flip`, and every transition out of
-    `resolved` is a `flip_regressed`. Returns `{"passed", "transitions",
-    "violations", ...}`."""
+    `implemented_by` / `extern` / `debug.skipKernelTC` token (see
+    `_lean_file_hole_token_counts`) or an `axiom`, including when an already-resolved
+    theorem's statement is rewritten). Every transition from a non-`resolved` baseline
+    state into a `resolution_*` state is an `incomplete_flip` (a move back to `open`
+    restores a live witness and flips nothing), and every transition out of `resolved`
+    is a `flip_regressed`. Returns `{"passed", "transitions", "violations", ...}`."""
     base = discover_correspondence_divergences(baseline_root, include_statements=True)
     cur = discover_correspondence_divergences(current_root, include_statements=True)
 
@@ -3227,7 +3553,10 @@ def audit_flip_direction_transitions(baseline_root: Path, current_root: Path) ->
                 "flip_regressed",
                 f"resolved in the baseline, `{c['status']}` now",
             )
-        else:
+        elif c["status"] != "open":
+            # An incomplete flip: out of `open`, or between the `resolution_*` states.
+            # (A move back to `open` restores a live witness: the divergence is tracked
+            # as open again, which is no flip at all.)
             detail = f"the witness flipped from `{b['status']}` to `{c['status']}`"
             if c["resolution_problems"]:
                 detail += f": {c['resolution_problems']}"
