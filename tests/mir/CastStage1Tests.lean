@@ -128,6 +128,10 @@ theorem scalarLayoutNoForge_nonNullPtr_range_enforced :
 
 /-! ## Section 8.6: Function Pointers (`RigidTy.fnPtr`) vs Raw Pointers -/
 
+/-- Intact / provenance-free `fnPtr` decoding through the Stage-1 bridges, and the byte-overwrite
+no-forge agreement on a concrete pointer (decided by kernel evaluation: the general
+`trusted_vs_anneal_overwrite_provenance_no_forge_agreement_fnPtr` depends on
+`Classical.choice`, which this file excludes). -/
 theorem fnPtr_intact_vs_provFree_and_overwrite :
     decodeTypedValueFromBytes defaultCodecFuel castStage1Layouts sampleFnPtrTy
         (encodeLittleEndianBytes 16 8 (some (7, 7))) = some (.ptr samplePtr 8) ∧
@@ -142,9 +146,7 @@ theorem fnPtr_intact_vs_provFree_and_overwrite :
       .safe .rust 0 samplePtr rfl (by decide),
    trusted_decodeTypedValueFromBytes_fnPtr_provFree 15 castStage1Layouts [.uint .u32] (.uint .u32)
       .safe .rust 0 42 rfl (by decide),
-   trusted_vs_anneal_overwrite_provenance_no_forge_agreement_fnPtr 15 castStage1Layouts [.uint .u32]
-      (.uint .u32) .safe .rust 0 16 (some 7) 3 { data := 0xAA, prov := none } rfl (by decide)
-      (Or.inl rfl)⟩
+   ⟨rfl, rfl⟩⟩
 
 theorem step_u64_to_fnPtr_ub_vs_rawPtr_strips_and_ptr_to_fnPtr_preserves :
     (evalByteCast castLocals (.copy ⟨0, []⟩) sampleFnPtrTy emptyMemory castLocalDecls
@@ -352,5 +354,360 @@ theorem fcast_int_to_float_limits_and_ties :
     fcast .intToFloat (.uint .u64) (.float .f64) (2 ^ 53 + 1) 8 =
       some (.scalar ⟨0x4340000000000000, 8⟩) := by
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+
+/-! ## Section 10.1: End-to-end multi-statement `stepMirFn` float-cast runs
+
+Each body below runs **from program entry** (`initMachineState body []`: `_0` uninitialized,
+every other local dead) through `StorageLive`, float casts (`.constant` / `.copy` / `.move`),
+`StorageDead`, and its root `return` under Anneal's trusted small-step function `stepMirFn`
+(64-bit `castStage1Layouts`), kernel-evaluated by `rfl`. -/
+
+section FloatStepRuns
+
+open Trusted.Rustc.V2026_06_01.MirSemantics (MirStepNode MachineState stepMirFn initMachineState)
+
+/-- Run `stepMirFn` for at most `fuel` silent steps, stopping at the first non-step node. -/
+def runFloatSteps (body : CapturedMir) : Nat → MachineState → MirStepNode
+  | 0, s => MirStepNode.step s
+  | n + 1, s =>
+    match stepMirFn body s with
+    | .tau (.running s') => runFloatSteps body n s'
+    | r => r
+
+/-- Frame locals of a silent-step node. -/
+def stepLocals? : MirStepNode → Option (List LocalSlot)
+  | .tau (.running s) => some s.frame.locals
+  | _ => none
+
+/-- Scalar returned by a normal root-return node. -/
+def retScalar? : MirStepNode → Option ScalarInt
+  | .ret (.normal (.scalar sc, _)) => some sc
+  | _ => none
+
+/-- `as`-cast test statement. -/
+def fStmt (k : StatementKind) : Statement := { kind := k, span := "cast-stage1-float" }
+/-- Unprojected local place. -/
+def fPlace (i : Nat) : Place := { local_ := i, projection := [] }
+/-- Type of kind `k`. -/
+def fTy (k : RigidTy) : Ty := { kind := k, layoutIdx := 0 }
+/-- Scalar constant `⟨bits, sz⟩ : k`. -/
+def fConst (k : RigidTy) (bits sz : Nat) : Operand :=
+  .constant { ty := fTy k, val := .scalar (.int ⟨bits, sz⟩) }
+/-- `_dst = op as k` with cast kind `ck`. -/
+def fCast (dst : Nat) (ck : CastKind) (op : Operand) (k : RigidTy) : StatementKind :=
+  .assign (fPlace dst) (.cast ck op (fTy k))
+
+/-- Single-block `Runtime(PostCleanup)` body `bb0: stmts; return` over `castStage1Layouts`. -/
+def floatBody (name : String) (decls : List RigidTy) (stmts : List StatementKind) :
+    CapturedMir where
+  defPath := name
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := decls.map fun k => { mutability := .mut, ty := fTy k, debugName := none }
+  basicBlocks := [
+    { statements := stmts.map fStmt
+      terminator := { kind := .return_, span := "cast-stage1-float" }
+      isCleanup := false }]
+  fnAbi :=
+    { args := []
+      ret := { layout := unitPlaceholderLayout, mode := .direct }
+      conv := .rust
+      canUnwind := false }
+  layouts := castStage1Layouts
+  allocations := []
+
+/-- (W1/W3/W4) `StorageLive(_1.._5)`; `_1 = const 1.5·2⁻¹⁴⁹_f64 as f32` (tie ↦ `0x2`);
+`_2 = copy _1 as f64` (exact `2⁻¹⁴⁸`); `_3 = const +∞_f32 as i8`; `_4 = const +∞_f32 as u128`;
+`_5 = move _4 as f32` (`u128::MAX ↦ +∞`); `_0 = move _2 as f32` (exact round trip);
+`StorageDead(_5.._1)`; `return`. -/
+def floatPipelineBody : CapturedMir :=
+  floatBody "cast_stage1::float_pipeline"
+    [.float .f32, .float .f32, .float .f64, .int .i8, .uint .u128, .float .f32]
+    [.storageLive 1, .storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+     fCast 1 .floatToFloat (fConst (.float .f64) 0x36A8000000000000 8) (.float .f32),
+     fCast 2 .floatToFloat (.copy (fPlace 1)) (.float .f64),
+     fCast 3 .floatToInt (fConst (.float .f32) 0x7F800000 4) (.int .i8),
+     fCast 4 .floatToInt (fConst (.float .f32) 0x7F800000 4) (.uint .u128),
+     fCast 5 .intToFloat (.move (fPlace 4)) (.float .f32),
+     fCast 0 .floatToFloat (.move (fPlace 2)) (.float .f32),
+     .storageDead 5, .storageDead 4, .storageDead 3, .storageDead 2, .storageDead 1]
+
+set_option maxRecDepth 200000 in
+/-- End-to-end `stepMirFn` run of `floatPipelineBody` from program entry: after the prologue
+and the six casts every local holds the IEEE-754 result (moved-from `_2`, `_4` are
+`.uninit`), after the epilogue only `_0` is live, and the function returns `0x0000_0002_f32`. -/
+theorem stepMirFn_float_pipeline_run :
+    let s₀ := initMachineState floatPipelineBody []
+    s₀.frame.locals = [.uninit, .dead, .dead, .dead, .dead, .dead] ∧
+    stepLocals? (runFloatSteps floatPipelineBody 11 s₀) =
+      some [.init (.scalar ⟨0x2, 4⟩), .init (.scalar ⟨0x2, 4⟩), .uninit,
+        .init (.scalar ⟨0x7F, 1⟩), .uninit, .init (.scalar ⟨0x7F800000, 4⟩)] ∧
+    stepLocals? (runFloatSteps floatPipelineBody 16 s₀) =
+      some [.init (.scalar ⟨0x2, 4⟩), .dead, .dead, .dead, .dead, .dead] ∧
+    retScalar? (runFloatSteps floatPipelineBody 17 s₀) = some ⟨0x2, 4⟩ :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- (W3) `StorageLive(_1.._13)`, then the twelve saturating float-to-int casts of
+`LeanMiriSpec.WitFloatCastLM.wfcW3Body` into `_0 : i8 .. _11 : usize` (sources `_12 : f32`,
+`_13 : f64`), then `return`. -/
+def floatToIntAllTargetsBody : CapturedMir :=
+  floatBody "cast_stage1::float_to_int_all_targets"
+    [.int .i8, .int .i16, .int .i32, .int .i64, .int .i128, .int .isize, .uint .u8, .uint .u16,
+     .uint .u32, .uint .u64, .uint .u128, .uint .usize, .float .f32, .float .f64]
+    ((List.range 13).map (fun i => .storageLive (i + 1)) ++
+    [fCast 13 .floatToFloat (fConst (.float .f32) 0xBFC00000 4) (.float .f64),
+     fCast 12 .floatToFloat (fConst (.float .f64) 0x44B52D02C7E14AF6 8) (.float .f32),
+     fCast 0 .floatToInt (fConst (.float .f32) 0x7F800000 4) (.int .i8),
+     fCast 1 .floatToInt (fConst (.float .f64) 0xFFF0000000000000 8) (.int .i16),
+     fCast 2 .floatToInt (fConst (.float .f64) 0x41E65A0BC0000000 8) (.int .i32),
+     fCast 3 .floatToInt (fConst (.float .f64) 0xC007333333333333 8) (.int .i64),
+     fCast 4 .floatToInt (fConst (.float .f64) 0x7FF8000000000000 8) (.int .i128),
+     fCast 5 .floatToInt (fConst (.float .f32) 0x80000000 4) (.int .isize),
+     fCast 6 .floatToInt (.copy (fPlace 13)) (.uint .u8),
+     fCast 7 .floatToInt (fConst (.float .f32) 0x477FFF80 4) (.uint .u16),
+     fCast 8 .floatToInt (fConst (.float .f64) 0x41F0000000000000 8) (.uint .u32),
+     fCast 9 .floatToInt (fConst (.float .f32) 0x5F800000 4) (.uint .u64),
+     fCast 10 .floatToInt (fConst (.float .f32) 0x7F7FFFFF 4) (.uint .u128),
+     fCast 11 .floatToInt (.move (fPlace 12)) (.uint .usize)])
+
+set_option maxRecDepth 200000 in
+/-- End-to-end `stepMirFn` run hitting all twelve integer targets: `+∞ as i8 = 127`,
+`-∞ as i16 = i16::MIN`, `3e9 as i32 = i32::MAX`, `-2.9 as i64 = -2`, `NaN as i128 = 0`,
+`-0.0 as isize = 0`, `-1.5 as u8 = 0`, `65535.5 as u16 = u16::MAX`, `2³² as u32 = u32::MAX`,
+`2⁶⁴ as u64 = u64::MAX`, `f32::MAX as u128` exact, `1e23 as usize = usize::MAX`. -/
+theorem stepMirFn_float_to_int_all_targets_run :
+    let s₀ := initMachineState floatToIntAllTargetsBody []
+    stepLocals? (runFloatSteps floatToIntAllTargetsBody 27 s₀) =
+      some [.init (.scalar ⟨0x7F, 1⟩), .init (.scalar ⟨0x8000, 2⟩),
+        .init (.scalar ⟨0x7FFFFFFF, 4⟩), .init (.scalar ⟨0xFFFFFFFFFFFFFFFE, 8⟩),
+        .init (.scalar ⟨0, 16⟩), .init (.scalar ⟨0, 8⟩), .init (.scalar ⟨0, 1⟩),
+        .init (.scalar ⟨0xFFFF, 2⟩), .init (.scalar ⟨0xFFFFFFFF, 4⟩),
+        .init (.scalar ⟨0xFFFFFFFFFFFFFFFF, 8⟩),
+        .init (.scalar ⟨0xFFFFFF00000000000000000000000000, 16⟩),
+        .init (.scalar ⟨0xFFFFFFFFFFFFFFFF, 8⟩), .uninit,
+        .init (.scalar ⟨0xBFF8000000000000, 8⟩)] ∧
+    retScalar? (runFloatSteps floatToIntAllTargetsBody 28 s₀) = some ⟨0x7F, 1⟩ :=
+  ⟨rfl, rfl⟩
+
+/-- (W4) `StorageLive(_1.._8)`, then the integer-to-float casts of
+`LeanMiriSpec.WitFloatCastLM.wfcW4Body`, then `return`. -/
+def intToFloatTiesBody : CapturedMir :=
+  floatBody "cast_stage1::int_to_float_ties"
+    [.float .f32, .float .f32, .float .f64, .float .f32, .float .f32, .float .f32, .float .f64,
+     .float .f64, .uint .u128]
+    ((List.range 8).map (fun i => .storageLive (i + 1)) ++
+    [fCast 8 .floatToInt (fConst (.float .f32) 0x7F800000 4) (.uint .u128),
+     fCast 1 .intToFloat (.copy (fPlace 8)) (.float .f32),
+     fCast 2 .intToFloat (.move (fPlace 8)) (.float .f64),
+     fCast 3 .intToFloat (fConst (.int .i128) (2 ^ 127) 16) (.float .f32),
+     fCast 4 .intToFloat (fConst (.int .i32) (2 ^ 24 + 1) 4) (.float .f32),
+     fCast 5 .intToFloat (fConst (.int .i32) (2 ^ 24 + 3) 4) (.float .f32),
+     fCast 6 .intToFloat (fConst (.uint .u64) (2 ^ 53 + 1) 8) (.float .f64),
+     fCast 7 .intToFloat (fConst (.uint .u64) (2 ^ 53 + 3) 8) (.float .f64),
+     fCast 0 .intToFloat (fConst (.int .i8) 0x80 1) (.float .f32)])
+
+set_option maxRecDepth 200000 in
+/-- End-to-end `stepMirFn` run of the integer-to-float limits: `u128::MAX as f32 = +∞`,
+`u128::MAX as f64 = 2¹²⁸`, `i128::MIN as f32 = -2¹²⁷`, ties `2²⁴ + 1 ↦ 2²⁴`,
+`2²⁴ + 3 ↦ 2²⁴ + 4`, `2⁵³ + 1 ↦ 2⁵³`, `2⁵³ + 3 ↦ 2⁵³ + 4`, and `i8::MIN as f32 = -128.0`. -/
+theorem stepMirFn_int_to_float_ties_run :
+    let s₀ := initMachineState intToFloatTiesBody []
+    stepLocals? (runFloatSteps intToFloatTiesBody 17 s₀) =
+      some [.init (.scalar ⟨0xC3000000, 4⟩), .init (.scalar ⟨0x7F800000, 4⟩),
+        .init (.scalar ⟨0x47F0000000000000, 8⟩), .init (.scalar ⟨0xFF000000, 4⟩),
+        .init (.scalar ⟨0x4B800000, 4⟩), .init (.scalar ⟨0x4B800002, 4⟩),
+        .init (.scalar ⟨0x4340000000000000, 8⟩), .init (.scalar ⟨0x4340000000000002, 8⟩),
+        .uninit] ∧
+    retScalar? (runFloatSteps intToFloatTiesBody 18 s₀) = some ⟨0xC3000000, 4⟩ :=
+  ⟨rfl, rfl⟩
+
+/-- (W2) `StorageLive(_1.._4)`; `_1 = const 0x7F80_0001_f32 as f64`;
+`_2 = const 0x7FF0_0000_0000_0001_f64 as f32`; `_3 = const 0x7FF0_0000_2000_0001_f64 as f32`;
+`_4 = copy _1 as f32`; `_0 = move _4 as f64`; `return`. -/
+def floatNaNBody : CapturedMir :=
+  floatBody "cast_stage1::float_nan"
+    [.float .f64, .float .f64, .float .f32, .float .f32, .float .f32]
+    [.storageLive 1, .storageLive 2, .storageLive 3, .storageLive 4,
+     fCast 1 .floatToFloat (fConst (.float .f32) 0x7F800001 4) (.float .f64),
+     fCast 2 .floatToFloat (fConst (.float .f64) 0x7FF0000000000001 8) (.float .f32),
+     fCast 3 .floatToFloat (fConst (.float .f64) 0x7FF0000020000001 8) (.float .f32),
+     fCast 4 .floatToFloat (.copy (fPlace 1)) (.float .f32),
+     fCast 0 .floatToFloat (.move (fPlace 4)) (.float .f64)]
+
+set_option maxRecDepth 200000 in
+/-- End-to-end `stepMirFn` NaN run: signaling NaNs are quieted with their payload kept
+(`0x7F80_0001 ↦ 0x7FF8_0000_2000_0000`, `0x7FF0_0000_2000_0001 ↦ 0x7FC0_0001`) or truncated
+(`0x7FF0_0000_0000_0001 ↦ 0x7FC0_0000`), and the payload NaN round-trips `f64 → f32 → f64`. -/
+theorem stepMirFn_float_nan_run :
+    let s₀ := initMachineState floatNaNBody []
+    stepLocals? (runFloatSteps floatNaNBody 9 s₀) =
+      some [.init (.scalar ⟨0x7FF8000020000000, 8⟩), .init (.scalar ⟨0x7FF8000020000000, 8⟩),
+        .init (.scalar ⟨0x7FC00000, 4⟩), .init (.scalar ⟨0x7FC00001, 4⟩), .uninit] ∧
+    retScalar? (runFloatSteps floatNaNBody 10 s₀) = some ⟨0x7FF8000020000000, 8⟩ :=
+  ⟨rfl, rfl⟩
+
+/-- (W5) Dead (`StorageDead`), never-live, uninitialized, and moved-from float-cast sources are
+UB, and `f16` sources / `bool` sources fail closed, all from program entry. -/
+def floatDeadBody : CapturedMir :=
+  floatBody "cast_stage1::float_dead" [.float .f32, .float .f64]
+    [.storageLive 1, fCast 1 .intToFloat (fConst (.int .i32) 3 4) (.float .f64), .storageDead 1,
+     fCast 0 .floatToFloat (.copy (fPlace 1)) (.float .f32)]
+
+def floatNeverLiveBody : CapturedMir :=
+  floatBody "cast_stage1::float_never_live" [.float .f32, .float .f64]
+    [fCast 0 .floatToFloat (.move (fPlace 1)) (.float .f32)]
+
+def floatUninitBody : CapturedMir :=
+  floatBody "cast_stage1::float_uninit" [.uint .u32, .float .f64]
+    [.storageLive 1, fCast 0 .floatToInt (.copy (fPlace 1)) (.uint .u32)]
+
+def floatMovedBody : CapturedMir :=
+  floatBody "cast_stage1::float_moved" [.int .i32, .float .f64, .float .f32]
+    [.storageLive 1, .storageLive 2,
+     fCast 2 .floatToFloat (fConst (.float .f64) 0x4004000000000000 8) (.float .f32),
+     fCast 1 .floatToFloat (.move (fPlace 2)) (.float .f64),
+     fCast 0 .floatToInt (.move (fPlace 2)) (.int .i32)]
+
+def floatF16Body : CapturedMir :=
+  floatBody "cast_stage1::float_f16" [.float .f32]
+    [fCast 0 .floatToFloat (fConst (.float .f16) 0x3C00 2) (.float .f32)]
+
+def floatBoolBody : CapturedMir :=
+  floatBody "cast_stage1::float_bool" [.float .f32]
+    [fCast 0 .intToFloat (fConst .bool 1 1) (.float .f32)]
+
+set_option maxRecDepth 200000 in
+/-- End-to-end `stepMirFn` negative controls: reading a dead (`StorageDead`), never-live,
+uninitialized, or moved-from source in a float cast faults with `.ub`; an `f16` source and a
+`bool` source fail closed with `.unsupported`. -/
+theorem stepMirFn_float_ub_and_fail_closed_runs :
+    runFloatSteps floatDeadBody 4 (initMachineState floatDeadBody []) = MirStepNode.fail .ub ∧
+    runFloatSteps floatNeverLiveBody 1 (initMachineState floatNeverLiveBody []) =
+      MirStepNode.fail .ub ∧
+    runFloatSteps floatUninitBody 2 (initMachineState floatUninitBody []) =
+      MirStepNode.fail .ub ∧
+    runFloatSteps floatMovedBody 5 (initMachineState floatMovedBody []) =
+      MirStepNode.fail .ub ∧
+    runFloatSteps floatF16Body 1 (initMachineState floatF16Body []) = MirStepNode.unsupported ∧
+    runFloatSteps floatBoolBody 1 (initMachineState floatBoolBody []) = MirStepNode.unsupported :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+end FloatStepRuns
+
+/-! ## Axiom guards
+
+Every theorem of this file depends on at most `propext` and `Quot.sound`: **no**
+`Classical.choice`, `sorryAx`, or `Lean.ofReduceBool` (`#guard_msgs` fails the check otherwise). -/
+
+section AxiomGuards
+
+/--
+info: 'Anneal.CastStage1Tests.ptrBytesNoForge_ref_intact_and_provFree' depends on axioms:
+  [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms ptrBytesNoForge_ref_intact_and_provFree
+
+/--
+info: 'Anneal.CastStage1Tests.scalarLayoutNoForge_nonNullPtr_range_enforced' depends on axioms:
+  [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms scalarLayoutNoForge_nonNullPtr_range_enforced
+
+/--
+info: 'Anneal.CastStage1Tests.fnPtr_intact_vs_provFree_and_overwrite' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms fnPtr_intact_vs_provFree_and_overwrite
+
+/--
+info: 'Anneal.CastStage1Tests.step_u64_to_fnPtr_ub_vs_rawPtr_strips_and_ptr_to_fnPtr_preserves' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms step_u64_to_fnPtr_ub_vs_rawPtr_strips_and_ptr_to_fnPtr_preserves
+
+/--
+info: 'Anneal.CastStage1Tests.step_scalarNicheNewtype_nonZeroU32_accepts_five_and_rejects_zero' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms step_scalarNicheNewtype_nonZeroU32_accepts_five_and_rejects_zero
+
+/--
+info: 'Anneal.CastStage1Tests.step_float_casts_concrete' depends on axioms:
+  [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms step_float_casts_concrete
+
+/--
+info: 'Anneal.CastStage1Tests.fcast_f64_to_f32_ties_subnormal_and_overflow' depends on axioms:
+  [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms fcast_f64_to_f32_ties_subnormal_and_overflow
+
+/--
+info: 'Anneal.CastStage1Tests.fcast_nan_quieting_and_exact_widening' depends on axioms:
+  [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms fcast_nan_quieting_and_exact_widening
+
+/--
+info: 'Anneal.CastStage1Tests.fcast_float_to_int_saturation_extremes' depends on axioms:
+  [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms fcast_float_to_int_saturation_extremes
+
+/--
+info: 'Anneal.CastStage1Tests.fcast_int_to_float_limits_and_ties' depends on axioms:
+  [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms fcast_int_to_float_limits_and_ties
+
+/--
+info: 'Anneal.CastStage1Tests.stepMirFn_float_pipeline_run' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stepMirFn_float_pipeline_run
+
+/--
+info: 'Anneal.CastStage1Tests.stepMirFn_float_to_int_all_targets_run' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stepMirFn_float_to_int_all_targets_run
+
+/--
+info: 'Anneal.CastStage1Tests.stepMirFn_int_to_float_ties_run' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stepMirFn_int_to_float_ties_run
+
+/--
+info: 'Anneal.CastStage1Tests.stepMirFn_float_nan_run' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stepMirFn_float_nan_run
+
+/--
+info: 'Anneal.CastStage1Tests.stepMirFn_float_ub_and_fail_closed_runs' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stepMirFn_float_ub_and_fail_closed_runs
+
+end AxiomGuards
 
 end Anneal.CastStage1Tests
