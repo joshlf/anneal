@@ -27,11 +27,14 @@ noncomputable abbrev endianArgs (toBe : Bool) (width : Nat) (value : Word) : Lis
 
 /-- Execute `sourceBody` symbolically along each `(toBe, width)` path and
 bundle the resulting `Val` with its `Executes` certificate. Keeping this
-execution witness free of the byte-reversal specification lets both
-`ProductionClaims` (which equates `(sourceExec ...).1` with `sourceOutput`) and
-`ExecutionProof` (which proves safe termination on mutated captures without
-prescribing return values) share one symbolic-execution proof with zero
-duplicated tactics. -/
+witness free of the byte-reversal specification lets `ProductionClaims` (which
+equates `(sourceExec ...).1` with `sourceOutput`) and `ExecutionProof` (which
+proves safe termination on mutated captures without prescribing return values)
+reuse the same symbolic execution.
+
+The `blockExec_assignU64` rules must precede the plain `blockExec_cons` step:
+on a symbolic `u64` value, `eq_refl` reaches `checkVal`, which never reduces
+and fails only after an expensive definitional-equality search. -/
 noncomputable def sourceExec (toBe : Bool) (width : Fin 4) (value : Word) :
     { output : Val //
       Executes sourceBody
