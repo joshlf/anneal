@@ -705,6 +705,18 @@ fn declared_compiler_must_be_supported_and_reported_by_rustc() {
             "tool_failed",
             "cannot resolve --rustc",
         ),
+        (
+            tools.clone(),
+            "V2026_10_22_R7189d39d9",
+            "tool_failed",
+            "expected a regular file",
+        ),
+        (
+            std::path::PathBuf::from("/dev/null"),
+            "V2026_10_22_R7189d39d9",
+            "tool_failed",
+            "expected a regular file",
+        ),
         // A wrapper outside a distribution needs an explicit --sysroot.
         (
             fuchsia.clone(),
@@ -767,10 +779,36 @@ fn declared_fuchsia_compiler_reaches_capture_with_its_distribution() {
     );
     let explicit = root.join("explicit-sysroot");
     std::fs::create_dir(&explicit).unwrap();
-    for (id, sysroot) in [
-        ("V2026_10_22_R7189d39d9", None),
-        (COMMIT_7189, None),
-        ("V2026_10_22_R7189d39d9", Some(&explicit)),
+    let store = root.join("store");
+    std::fs::create_dir(&store).unwrap();
+    let store_rustc = store.join("fuchsia-rustc-blob");
+    fake_rustc(
+        &store_rustc,
+        &verbose_version(FUCHSIA_7189, COMMIT_7189, "2026-10-22"),
+        0,
+    );
+    let joined_dist = root.join("fuchsia-symlink-dist");
+    std::fs::create_dir_all(joined_dist.join("bin")).unwrap();
+    std::fs::create_dir_all(joined_dist.join("lib/rustlib")).unwrap();
+    let joined_rustc = joined_dist.join("bin/rustc");
+    std::os::unix::fs::symlink(&store_rustc, &joined_rustc).unwrap();
+    for (given_rustc, canon_rustc, expected_dist, id, sysroot) in [
+        (&alias, &rustc, &distribution, "V2026_10_22_R7189d39d9", None),
+        (&alias, &rustc, &distribution, COMMIT_7189, None),
+        (
+            &alias,
+            &rustc,
+            &distribution,
+            "V2026_10_22_R7189d39d9",
+            Some(&explicit),
+        ),
+        (
+            &joined_rustc,
+            &store_rustc,
+            &joined_dist,
+            "V2026_10_22_R7189d39d9",
+            None,
+        ),
     ] {
         let _ = std::fs::remove_file(&recorded);
         let mut child = Command::new(env!("CARGO_BIN_EXE_cargo-anneal"));
@@ -783,7 +821,7 @@ fn declared_fuchsia_compiler_reaches_capture_with_its_distribution() {
             .arg("--capture")
             .arg(&capture)
             .arg("--rustc")
-            .arg(&alias)
+            .arg(given_rustc)
             .args(["--rustc-version", id]);
         if let Some(sysroot) = sysroot {
             child.arg("--sysroot").arg(sysroot);
@@ -801,10 +839,14 @@ fn declared_fuchsia_compiler_reaches_capture_with_its_distribution() {
             let index = arguments.iter().position(|arg| *arg == flag).unwrap();
             arguments[index + 1]
         };
-        assert_eq!(value("--rustc"), rustc.to_str().unwrap(), "{arguments:?}");
+        assert_eq!(
+            value("--rustc"),
+            canon_rustc.to_str().unwrap(),
+            "{arguments:?}"
+        );
         assert_eq!(
             value("--sysroot"),
-            sysroot.unwrap_or(&distribution).to_str().unwrap(),
+            sysroot.unwrap_or(expected_dist).to_str().unwrap(),
             "{arguments:?}"
         );
     }

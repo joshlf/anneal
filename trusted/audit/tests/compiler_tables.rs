@@ -73,7 +73,11 @@ fn compiler_tables_agree_and_every_dialect_has_its_lean_model_and_gates() {
     let semantics = read("trusted/lean/Trusted/MirSemantics.lean");
     let bundle = read("trusted/cargo-anneal/examples/regenerate_bundle.rs");
     let guard = read("trusted/rustc-capture/src/main.rs");
+    let driver_entry = read("trusted/rustc-capture/src/driver.rs");
+    let capture_census = read("trusted/rustc-capture/src/capture.rs");
     let emission = read("trusted/rustc-capture/src/lean.rs");
+    let integration = read("trusted/cargo-anneal/tests/integration.rs");
+    let typed_capture = read("trusted/rustc-capture/tests/typed_capture.rs");
     for (dialect, commit, date) in &driver {
         assert_eq!(
             *dialect,
@@ -90,18 +94,38 @@ fn compiler_tables_agree_and_every_dialect_has_its_lean_model_and_gates() {
                 && semantics.contains(&format!("\nnamespace {dialect}\n")),
             "Trusted.MirSemantics lacks the {dialect} roots"
         );
-        // The driver's central dialect guard and its syntax-module selection
-        // must both classify the dialect; a build for an unlisted dialect
-        // stops at the guard.
-        assert!(
-            guard.contains(&format!("    anneal_mir_dialect = \"{dialect}\",\n")),
-            "rustc-capture's dialect guard omits {dialect}"
-        );
+        // Every dialect-classified module in `rustc-capture` and the test
+        // tables must cover the dialect; an unlisted dialect stops the build.
+        for (label, source) in [
+            ("rustc-capture main.rs", &guard),
+            ("rustc-capture driver.rs", &driver_entry),
+            ("rustc-capture capture.rs", &capture_census),
+        ] {
+            assert!(
+                source.contains(&format!("anneal_mir_dialect = \"{dialect}\"")),
+                "{label} omits anneal_mir_dialect = \"{dialect}\""
+            );
+        }
         assert!(
             emission.contains(&format!(
                 "#[cfg(anneal_mir_dialect = \"{dialect}\")]\nconst MIR_AST: &str = \"Trusted.Rustc.{dialect}.MirAst\";\n"
             )),
             "rustc-capture does not select Trusted.Rustc.{dialect}.MirAst"
         );
+        for (label, test_source) in [
+            ("cargo-anneal tests/integration.rs", &integration),
+            ("rustc-capture tests/typed_capture.rs", &typed_capture),
+        ] {
+            let tuple = format!(
+                "(\n            \"{dialect}\",\n            \"{commit}\",\n            \"{date}\",\n        )"
+            );
+            let outer_tuple = format!(
+                "(\n        \"{dialect}\",\n        \"{commit}\",\n        \"{date}\",\n    )"
+            );
+            assert!(
+                test_source.contains(&tuple) || test_source.contains(&outer_tuple),
+                "{label} omits ({dialect}, {commit}, {date})"
+            );
+        }
     }
 }

@@ -988,6 +988,16 @@ fn admits_only_the_reviewed_capture_build_script() {
     reject("disallowed build script trusted/cargo-anneal/build.rs");
     fs::remove_file(&other).unwrap();
 
+    for case_variant in [
+        "trusted/cargo-anneal/Build.rs",
+        "trusted/rustc-capture/Build.rs",
+    ] {
+        let variant = fix.root.join(case_variant);
+        fs::write(&variant, b"fn main() {}\n").unwrap();
+        reject(&format!("disallowed build script {case_variant}"));
+        fs::remove_file(&variant).unwrap();
+    }
+
     let moved = fix.root.join("moved-build.rs");
     fs::rename(&script, &moved).unwrap();
     symlink(&moved, &script).unwrap();
@@ -1003,7 +1013,7 @@ fn admits_only_the_reviewed_capture_build_script() {
         "[target.'cfg(unix)'.build-dependencies]",
     ] {
         fs::write(&manifest_path, format!("{manifest}\n{table}\ncc = \"1\"\n")).unwrap();
-        reject("for the build script of trusted/rustc-capture");
+        reject("in trusted/rustc-capture/Cargo.toml");
     }
     fs::write(
         &manifest_path,
@@ -1012,6 +1022,16 @@ fn admits_only_the_reviewed_capture_build_script() {
     .unwrap();
     reject("disallowed package.build");
     fs::write(&manifest_path, &manifest).unwrap();
+
+    let cli_manifest_path = fix.root.join("trusted/cargo-anneal/Cargo.toml");
+    let cli_manifest = fs::read_to_string(&cli_manifest_path).unwrap();
+    fs::write(
+        &cli_manifest_path,
+        format!("{cli_manifest}\n[build-dependencies]\ncc = \"1\"\n"),
+    )
+    .unwrap();
+    reject("in trusted/cargo-anneal/Cargo.toml");
+    fs::write(&cli_manifest_path, &cli_manifest).unwrap();
     check_cargo_boundary(&fix.root).unwrap();
 }
 

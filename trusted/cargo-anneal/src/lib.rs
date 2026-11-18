@@ -1107,34 +1107,17 @@ fn verify_cargo_lock(checkout: &Path, member_pkg_names: &BTreeSet<String>) -> Re
 /// but the standard library and the reviewed driver sources it includes.
 const BUILD_SCRIPT_MEMBER: &str = "trusted/rustc-capture";
 
-/// Reject build scripts, which run arbitrary code during every Cargo build,
-/// except the single reviewed script of [`BUILD_SCRIPT_MEMBER`].
+/// Reject build scripts and build dependencies across workspace members,
+/// admitting only the single reviewed script of [`BUILD_SCRIPT_MEMBER`].
 /// `package.build` is rejected separately, so Cargo can only discover a script
-/// at the default `build.rs` path checked here.
+/// at the default `build.rs` path (including case variants on case-insensitive
+/// filesystems) checked here.
 fn check_build_script(
     checkout: &Path,
     member: &str,
     manifest: &MemberCargoManifest,
 ) -> Result<(), Failure> {
     let phase = "cargo-boundary";
-    let script = checkout.join(member).join("build.rs");
-    let Ok(metadata) = fs::symlink_metadata(&script) else {
-        return Ok(());
-    };
-    if member != BUILD_SCRIPT_MEMBER {
-        return Err(Failure::new(
-            1,
-            phase,
-            format!("disallowed build script {member}/build.rs"),
-        ));
-    }
-    if !metadata.file_type().is_file() {
-        return Err(Failure::new(
-            1,
-            phase,
-            format!("build script {member}/build.rs must be a regular file"),
-        ));
-    }
     if let Some((section, _)) = manifest
         .all_dep_tables()
         .into_iter()
@@ -1147,7 +1130,46 @@ fn check_build_script(
         return Err(Failure::new(
             1,
             phase,
-            format!("disallowed [{section}] for the build script of {member}"),
+            format!("disallowed [{section}] in {member}/Cargo.toml"),
+        ));
+    }
+    let member_dir = checkout.join(member);
+    let entries = fs::read_dir(&member_dir).map_err(|e| {
+        Failure::new(
+            2,
+            phase,
+            format!("cannot inspect {}: {e}", member_dir.display()),
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            Failure::new(
+                2,
+                phase,
+                format!("cannot inspect {}: {e}", member_dir.display()),
+            )
+        })?;
+        let raw_name = entry.file_name();
+        let name = raw_name.to_string_lossy();
+        if !name.eq_ignore_ascii_case("build.rs") {
+            continue;
+        }
+        if member != BUILD_SCRIPT_MEMBER || name != "build.rs" {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!("disallowed build script {member}/{name}"),
+            ));
+        }
+    }
+    let script = member_dir.join("build.rs");
+    if let Ok(metadata) = fs::symlink_metadata(&script)
+        && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
+    {
+        return Err(Failure::new(
+            1,
+            phase,
+            format!("build script {member}/build.rs must be a regular file"),
         ));
     }
     Ok(())

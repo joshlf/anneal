@@ -2684,10 +2684,15 @@ fn rejects_tampered_capture_compiler_fields() {
         format!("-e 's/\"{field}\": \"{from}\"/\"{field}\": \"{to}\"/g'")
     };
     let all_dialects = replace("mir_dialect", dialect, other);
-    let consistent = format!(
+    let without_version = format!(
         "{all_dialects} {} {}",
         replace("commit", commit, other_commit),
         replace("commit_date", date, other_date)
+    );
+    let consistent = format!(
+        "{without_version} -e 's/{}/{}/g'",
+        &commit[..9],
+        &other_commit[..9]
     );
     let cases = [
         // Only the top-level field: the two dialect fields disagree.
@@ -2699,6 +2704,13 @@ fn rejects_tampered_capture_compiler_fields() {
         // Both dialect fields: they no longer match the commit.
         (
             all_dialects.clone(),
+            false,
+            "unexpected capture schema or compiler".to_owned(),
+        ),
+        // Commit, date, and dialects name another supported compiler, but
+        // `compiler.version` still reports the linked compiler's short commit.
+        (
+            without_version,
             false,
             "unexpected capture schema or compiler".to_owned(),
         ),

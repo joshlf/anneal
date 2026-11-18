@@ -38,12 +38,14 @@ def checked_command(command, directory, log_prefix):
 
 
 def verification(arguments, request, artifacts, log_prefix, expected):
-    # Declare the compiler explicitly: the CLI checks `--rustc` against
+    # When `--rustc-version` is declared, the CLI checks `--rustc` against
     # `--rustc-version` before capture and the capture's compiler after it.
     command = [str(arguments.cli), "verify", "--request", str(request),
                "--capture", str(arguments.capture), "--sysroot", str(arguments.sysroot),
-               "--rustc", str(arguments.rustc), "--rustc-version", arguments.rustc_version,
                "--lean", str(arguments.lean), "--artifacts", str(artifacts)]
+    if arguments.rustc_version is not None:
+        command.extend(["--rustc", str(arguments.rustc),
+                        "--rustc-version", arguments.rustc_version])
     code = checked_command(command, request.parent, log_prefix)
     output = json.loads(log_prefix.with_suffix(".stdout").read_text())
     if output.get("status") != expected or code != (0 if expected.endswith("verified") else 1):
@@ -139,11 +141,19 @@ def run(arguments, work):
                             work / "baseline", "selected_unit_verified")
     if len(baseline["sources"]) != 10 or len(baseline["selected"]) != 1:
         raise RuntimeError("production source/selection inventory changed")
-    # The receipt must report the declared compiler, not merely any supported
-    # one; `--rustc-version` accepts a dialect name or the full commit.
+    # When `--rustc-version` is declared, the receipt must report that exact
+    # compiler and the SHA-256 digest of the probed `--rustc` binary.
     compiler = baseline["compiler"]
-    if arguments.rustc_version not in (compiler["mir_dialect"], compiler["commit"]):
-        raise RuntimeError(f"receipt compiler differs from --rustc-version: {compiler}")
+    if not compiler.get("mir_dialect"):
+        raise RuntimeError(f"receipt missing compiler mir_dialect: {compiler}")
+    if arguments.rustc_version is not None:
+        if arguments.rustc_version not in (compiler["mir_dialect"], compiler["commit"]):
+            raise RuntimeError(f"receipt compiler differs from --rustc-version: {compiler}")
+        expected_rustc_sha = hashlib.sha256(arguments.rustc.read_bytes()).hexdigest()
+        if baseline.get("rustc_binary_sha256") != expected_rustc_sha:
+            raise RuntimeError(
+                f"receipt rustc_binary_sha256 {baseline.get('rustc_binary_sha256')} "
+                f"!= {expected_rustc_sha}")
     # Positively exercise the same candidate producer used for mutations.
     # Exact byte equality reuses the baseline's successful kernel check and
     # prevents an invalid-Lean producer from satisfying only negative cases.
@@ -239,11 +249,13 @@ def main():
     parser.add_argument("--artifacts-dir", type=Path,
                         help="New directory retaining complete test evidence")
     arguments = parser.parse_args()
-    for name in ["cli", "capture", "sysroot", "lean", "rustc_version"]:
+    for name in ["cli", "capture", "sysroot", "lean"]:
         if getattr(arguments, name) is None:
             option = name.replace("_", "-")
             parser.error(f"the following arguments are required: --{option}")
-    if arguments.rustc is None:
+    if arguments.rustc is not None and arguments.rustc_version is None:
+        parser.error("the following arguments are required: --rustc-version (required with --rustc)")
+    if arguments.rustc_version is not None and arguments.rustc is None:
         arguments.rustc = Path(arguments.sysroot) / "bin/rustc"
     for name in ["cli", "capture", "sysroot", "lean", "rustc", "source_dir"]:
         path = getattr(arguments, name)

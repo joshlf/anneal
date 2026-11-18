@@ -183,8 +183,15 @@ fn check_compiler(rustc: &Path) -> Result<(), Failure> {
             ))
         })?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        };
         return Err(Failure::tool(format!(
-            "{} --version --verbose failed with {}",
+            "{} --version --verbose failed with {}{detail}",
             rustc.display(),
             output.status
         )));
@@ -249,15 +256,21 @@ fn run(mut args: Args) -> Result<serde_json::Value, Failure> {
             ))
         })?;
     }
-    // Check a compiler named by the arguments before reserving output or
-    // starting rustc. `collect` checks again against the session's effective
-    // sysroot, which also covers the packaged default.
+    // Check the linked libraries and any compiler named by the arguments
+    // before reserving output or starting rustc. `collect` checks again
+    // against the session's effective sysroot, which also covers the packaged
+    // default's `bin/rustc`.
     if let Some(rustc) = args.rustc.clone().or_else(|| {
         args.sysroot
             .as_ref()
             .map(|sysroot| sysroot.join("bin/rustc"))
     }) {
         check_compiler(&rustc)?;
+    } else if linked_compiler_version().is_none() {
+        return Err(Failure::tool(format!(
+            "capture was linked against compiler libraries that do not report commit {}",
+            &ir::LINKED_COMPILER.commit[..9]
+        )));
     }
     // Keep compiler side effects outside the public artifact pair. The
     // publication owner cleans up staging on every error and unwind; only its

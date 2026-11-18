@@ -391,9 +391,9 @@ python3 ci/verify_starnix_e2e.py \
   --artifacts-dir "$PWD/target/starnix-evidence"
 ```
 
-Every verification in the helper declares its compiler: `--rustc` defaults to
-`bin/rustc` in the sysroot, and `--rustc-version` names the compiler that the
-bundle's capture driver links.
+When `--rustc-version` is given, every verification in the helper declares its
+compiler: `--rustc` defaults to `bin/rustc` in the sysroot, and
+`--rustc-version` names the compiler that the bundle's capture driver links.
 
 The helper fetches the original ten-file Fuchsia source set at the revision and
 hashes in

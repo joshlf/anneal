@@ -131,6 +131,14 @@ pub(super) fn run_compiler(args: &[String], callbacks: &mut (dyn Callbacks + Sen
         anneal_mir_dialect = "V2026_05_30_Rf8a08b688"
     ))]
     rustc_driver::run_compiler(args, callbacks);
+    #[cfg(not(any(
+        anneal_mir_dialect = "V2026_10_22_R7189d39d9",
+        anneal_mir_dialect = "V2026_05_31_R14210df0e",
+        anneal_mir_dialect = "V2026_05_30_Rf8a08b688",
+    )))]
+    compile_error!(
+        "build.rs selected no MIR dialect classified by driver::run_compiler"
+    );
 }
 
 /// Run one compiler session and require a clean analysis callback.

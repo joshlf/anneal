@@ -52,6 +52,7 @@ fn main() -> ExitCode {
     // https://github.com/rust-lang/cargo/blob/fbb61be30e5f9ac3a6ad58e56a5c0f5db2d2b3ef/src/doc/src/reference/build-scripts.md?plain=1#L404-L421
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=src/compilers.rs");
+    println!("cargo::rerun-if-env-changed=RUSTC");
     match identify() {
         Ok(compiler) => {
             emit(compiler);
@@ -93,11 +94,17 @@ fn identify() -> Result<&'static SupportedCompiler, String> {
             )
         })?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        };
         return Err(format!(
-            "{} --version --verbose failed with {}: {}",
+            "{} --version --verbose failed with {}{detail}",
             rustc.display(),
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     let text = String::from_utf8(output.stdout).map_err(|_| {
