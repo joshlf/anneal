@@ -203,8 +203,10 @@ theorem wpState_cut {p : Program} {post : TerminalOut → Prop}
   subst h_eq
   exact h_cont
 
-/-- Advance `wpSteps` across one step `evalStep p 0 s = .step s'`, normalizing
-the successor state to `s'`. -/
+/-- Advance `wpSteps` across one deterministic (`Choice = 0`) step
+`evalStep p 0 s = .step s'`. Relies on `ValidChoice p s c` forcing `c = 0`;
+writing `s'` in reduced form and closing `h_step` by `rfl` avoids carrying
+nested state updates into `h_rest`. -/
 theorem wpSteps_step {p : Program} {steps : Nat} {s s' : State}
     {onMid : State → Prop} {post : TerminalOut → Prop}
     (h_step : evalStep p 0 s = .step s')
@@ -215,8 +217,10 @@ theorem wpSteps_step {p : Program} {steps : Nat} {s s' : State}
   rw [h_step]
   exact h_rest
 
-/-- Advance `wpState` across one step `evalStep p 0 s = .step s'`, normalizing
-the successor state to `s'`. -/
+/-- Advance `wpState` across one deterministic (`Choice = 0`) step
+`evalStep p 0 s = .step s'`. Relies on `ValidChoice p s c` forcing `c = 0`;
+writing `s'` in reduced form and closing `h_step` by `rfl` avoids carrying
+nested state updates into `h_rest`. -/
 theorem wpState_step {p : Program} {fuel : Nat} {s s' : State}
     {post : TerminalOut → Prop}
     (h_step : evalStep p 0 s = .step s')
@@ -227,8 +231,9 @@ theorem wpState_step {p : Program} {fuel : Nat} {s s' : State}
   rw [h_step]
   exact h_rest
 
-/-- Discharge `wpState` at a terminal step `evalStep p 0 s = .done out`
-satisfying `post out`. -/
+/-- Discharge `wpState` at a deterministic (`Choice = 0`) terminal step
+`evalStep p 0 s = .done out` satisfying `post out`; relies on `ValidChoice`
+forcing `c = 0`. -/
 theorem wpState_done {p : Program} {fuel : Nat} {s : State}
     {out : TerminalOut} {post : TerminalOut → Prop}
     (h_done : evalStep p 0 s = .done out)
@@ -444,47 +449,6 @@ theorem canary_positive_empty_unit_fn : CanaryPositiveEmptyUnitFnClaim := by
   apply positiveCanary_of_wp (fuel := 1)
   refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
   rfl
-
-/-- Control-flow and statement canary (`nop`, `storageLive`, `storageDead`,
-`goto`, and both matched and `otherwise` arms of `switchInt`), also exercising
-`wpOutcomeState_mono`, `wpStepsOutcome_mono`, and `wpState_cut` across the
-`bb0 -> bb1` block boundary. -/
-theorem canary_positive_stmts_and_cf_anneal :
-    CanaryPositiveStmtsAndCfAnnealClaim := by
-  constructor
-  · apply positiveCanary_of_wp (fuel := 12)
-    refine wpOutcomeState_mono (fuel₁ := 6 + 4) ?_
-      (fun _ h => h) (fun _ h => h) (by decide)
-    refine wpState_cut (steps := 6) (fuel := 4)
-      (s_mid := ⟨[⟨0, 1, 0,
-        [.live none, .live (some (u32Val 10)), .live (some (u32Val 10))]⟩],
-        ⟨[]⟩⟩) ?_ ?_
-    · refine wpStepsOutcome_mono ?_
-        (fun _ h => h) (fun _ h => h) (fun _ h => h)
-      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-      rfl
-    · refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-      rfl
-  · apply positiveCanary_of_wp (fuel := 10)
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    rfl
 
 /-- Unary-operator canary (`UnOp.not` on `bool` and `u8`, `UnOp.neg` on signed
 `i8` including wrapping `-INT_MIN == INT_MIN`). -/
@@ -1487,7 +1451,7 @@ reduction. `h_val` lets a caller replace the value that `evalRvalue` computes
 by an equal normal form, and `h_check` is the dynamic type test of
 `writePlace`; neither reduces by `rfl` when the value mentions a free
 variable. -/
-theorem evalStatement_assign {body : Body} {b i : Nat}
+theorem evalStatement_assign {body : Body} {defId : DefId} {b i : Nat}
     {L L₁ L₂ : List LocalSlot} {stmt : StatementKind} {dst : Place}
     {rv : Rvalue} {ty : MirTy} {v v' : Val} {o : Option Val}
     (h_stmt : stmt = .assign dst rv)
@@ -1498,8 +1462,8 @@ theorem evalStatement_assign {body : Body} {b i : Nat}
     (h_check : checkVal v' ty = true)
     (h_live : Trusted.MirSemantics.getElem? L₁ dst.localId = some (.live o))
     (h_set : setElem? L₁ dst.localId (.live (some v')) = some L₂) :
-    evalStatement body ⟨0, b, i, L⟩ ⟨[]⟩ stmt =
-      .step (mkState b (i + 1) L₂) := by
+    evalStatement body ⟨defId, b, i, L⟩ ⟨[]⟩ stmt =
+      .step (mkState b (i + 1) L₂ defId) := by
   subst h_stmt h_val
   dsimp only [evalStatement]
   rw [h_proj, h_ty]
@@ -1550,13 +1514,9 @@ theorem bvExtractLsb_bvZeroExtend_self {k : Nat}
 
 theorem truncateBits_idem (w : IntWidth) (x : BitVec 128) :
     truncateBits w (truncateBits w x) = truncateBits w x := by
-  cases w
-  · change bvZeroExtend 128 (BitVec.ofNat 8 (bvZeroExtend 128 (bvExtractLsb 7 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
-  · change bvZeroExtend 128 (BitVec.ofNat 16 (bvZeroExtend 128 (bvExtractLsb 15 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
-  · change bvZeroExtend 128 (BitVec.ofNat 32 (bvZeroExtend 128 (bvExtractLsb 31 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
-  · change bvZeroExtend 128 (BitVec.ofNat 64 (bvZeroExtend 128 (bvExtractLsb 63 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
-  · change bvZeroExtend 128 (BitVec.ofNat 128 (bvZeroExtend 128 (bvExtractLsb 127 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
-  · change bvZeroExtend 128 (BitVec.ofNat 64 (bvZeroExtend 128 (bvExtractLsb 63 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
+  cases w <;>
+    exact congrArg (bvZeroExtend 128)
+      (bvExtractLsb_bvZeroExtend_self (by decide) _)
 
 theorem mirTy_beq_int_self (w : IntWidth) (s : Bool) :
     MirTy.beq (.int w s) (.int w s) = true := by
@@ -1564,12 +1524,15 @@ theorem mirTy_beq_int_self (w : IntWidth) (s : Bool) :
 
 theorem checkVal_int_truncateBits (w : IntWidth) (s : Bool) (x : BitVec 128) :
     checkVal (.scalar ⟨w, s, truncateBits w x⟩) (.int w s) = true := by
-  have h_eq : (truncateBits w (truncateBits w x) == truncateBits w x) = true := by
-    rw [truncateBits_idem w x]; exact beq_self_eq_true (truncateBits w x)
+  have h_eq :
+      (truncateBits w (truncateBits w x) == truncateBits w x) = true := by
+    rw [truncateBits_idem w x]
+    exact beq_self_eq_true (truncateBits w x)
   change (match if (truncateBits w (truncateBits w x) == truncateBits w x)
       then some (.int w s) else none with
     | some vTy => MirTy.beq vTy (.int w s) | none => false) = true
-  rw [h_eq]; exact mirTy_beq_int_self w s
+  rw [h_eq]
+  exact mirTy_beq_int_self w s
 
 theorem truncateBits_i64_idem (x : BitVec 128) :
     truncateBits .i64 (truncateBits .i64 x) = truncateBits .i64 x :=
@@ -1586,7 +1549,8 @@ theorem checkVal_u64_truncateBits (x : BitVec 128) :
 `blockExec_nil_ret`) bridged through `wpState_of_executes` into
 `positiveCanary_of_wp`. -/
 theorem canary_blockExec_wpState_of_executes :
-    PositiveCanaryClaim progStmtsAndCf { args := [u32Val 99] } (u32Val 200) := by
+    PositiveCanaryClaim progStmtsAndCf { args := [u32Val 99] }
+      (u32Val 200) := by
   let body : Body :=
     match progStmtsAndCf.bodies with
     | b :: _ => b
@@ -2094,50 +2058,50 @@ theorem not_behavior_of_no_done {p : Program} {defId : DefId} {body : Body}
       subst h_out
       exact h_no_done s h_reach h_st
 
-/-- Symbolic single-branch step rule for `evalSwitchBranches` when `discrBits`
-is already in canonical truncated form (`truncateBits w discrBits =
-discrBits`). -/
+/-- Single-branch step rule for `evalSwitchBranches` when both `discrBits` and
+`caseBits` are already in canonical truncated form at width `w`. -/
 theorem evalSwitchBranches_cons {w : IntWidth} {discrBits caseBits : BitVec 128}
     {otherwise target : BasicBlockId} {rest : List (BitVec 128 × BasicBlockId)}
-    {caseCanon : BitVec 128}
     (h_discr : truncateBits w discrBits = discrBits)
-    (h_case : (truncateBits w caseBits != caseBits) = false)
-    (h_canon : truncateBits w caseBits = caseCanon) :
+    (h_case : truncateBits w caseBits = caseBits) :
     evalSwitchBranches w discrBits otherwise ((caseBits, target) :: rest) =
-      if (discrBits == caseCanon) then .ok target
+      if (discrBits == caseBits) then .ok target
       else evalSwitchBranches w discrBits otherwise rest := by
+  have h_bne : (caseBits != caseBits) = false := by
+    change (!(caseBits == caseBits)) = false
+    rw [beq_self_eq_true caseBits]; rfl
   dsimp only [evalSwitchBranches]
-  rw [h_case, h_discr, h_canon]
-  rfl
+  rw [h_case, h_bne, h_discr]; rfl
 
 /-- Symbolic `evalStep` rule for a `TerminatorKind.switchInt` on a scalar
 discriminant `Val.scalar ⟨w, s, discrBits⟩`: evaluates `evalPrimitiveOperand`,
 dispatches `evalSwitchBranches`, and avoids unfolding `BitVec 128` comparisons
 over symbolic `discrBits`. -/
-theorem evalStep_switchInt_scalar {p : Program} {c : Choice} {b i : Nat}
-    {L L₁ : List LocalSlot} {body : Body} {bb : BasicBlock}
+theorem evalStep_switchInt_scalar {p : Program} {c : Choice} {defId : DefId}
+    {b i : Nat} {L L₁ : List LocalSlot} {body : Body} {bb : BasicBlock}
     {discr : Operand} {targets : SwitchTargets}
     {w : IntWidth} {s : Bool} {discrBits : BitVec 128}
-    (h_body : Trusted.MirSemantics.getElem? p.bodies 0 = some body)
+    (h_body : Trusted.MirSemantics.getElem? p.bodies defId = some body)
     (h_bb : Trusted.MirSemantics.getElem? body.basicBlocks b = some bb)
     (h_none : Trusted.MirSemantics.getElem? bb.statements i = none)
     (h_end : Nat.beq i bb.statements.length = true)
     (h_term : bb.terminator = .switchInt discr targets)
     (h_op : evalPrimitiveOperand body.locals L discr =
       .ok (.scalar ⟨w, s, discrBits⟩, L₁)) :
-    evalStep p c (mkState b i L) =
-      match evalSwitchBranches w discrBits targets.otherwise targets.branches with
+    evalStep p c (mkState b i L defId) =
+      match evalSwitchBranches w discrBits targets.otherwise
+          targets.branches with
       | .error k => .fault k
-      | .ok target => .step (mkState target 0 L₁) := by
+      | .ok target => .step (mkState target 0 L₁ defId) := by
   dsimp only [evalStep, mkState]; rw [h_body]; dsimp only; rw [h_bb]; dsimp only
   rw [h_none]; dsimp only; rw [h_end]; dsimp only [evalTerminator, jumpToBlock]
   rw [h_term]; dsimp only; rw [h_op]; rfl
 
-/-- Symbolic multi-block canary exercising `wpState_cut`, `wpSteps_step`,
-`wpState_step`, and `wpState_done` across `bb0 -> bb1` on `progStmtsAndCf` over
-a universally quantified `u32` input (`checkVal_int_truncateBits`,
-`evalStatement_assign`, `evalStep_switchInt_scalar`, and
-`evalSwitchBranches_cons`). -/
+/-- Symbolic multi-block canary exercising `wpOutcomeState_mono`,
+`wpStepsOutcome_mono`, `wpState_cut`, `wpSteps_step`, `wpState_step`, and
+`wpState_done` across `bb0 -> bb1` on `progStmtsAndCf` over a universally
+quantified `u32` input (`checkVal_int_truncateBits`, `evalStatement_assign`,
+`evalStep_switchInt_scalar`, and `evalSwitchBranches_cons`). -/
 theorem canary_symbolic_stmts_and_cf_wpState_cut (x : BitVec 128) :
     let v : Val := .scalar ⟨.i32, false, truncateBits .i32 x⟩
     let expected : Val :=
@@ -2146,50 +2110,74 @@ theorem canary_symbolic_stmts_and_cf_wpState_cut (x : BitVec 128) :
     PositiveCanaryClaim progStmtsAndCf { args := [v] } expected := by
   dsimp only
   let v : Val := .scalar ⟨.i32, false, truncateBits .i32 x⟩
-  let body : Body := match progStmtsAndCf.bodies with
-    | b :: _ => b | [] => { argumentCount := 0, locals := [], basicBlocks := [] }
+  let s_dead : List LocalSlot := [.live none, .live (some v), .dead]
+  let s_uninit : List LocalSlot := [.live none, .live (some v), .live none]
+  let s_both : List LocalSlot := [.live none, .live (some v), .live (some v)]
+  let s_mid : State := mkState 1 0 s_both
+  let body : Body :=
+    match progStmtsAndCf.bodies with
+    | b :: _ => b
+    | [] => { argumentCount := 0, locals := [], basicBlocks := [] }
   have h_chk : checkVal v u32Ty = true := checkVal_int_truncateBits .i32 false x
   have h_init : initState progStmtsAndCf { args := [v] } =
-      .ok (mkState 0 0 [.live none, .live (some v), .dead]) := by
-    change (if !(checkVal v u32Ty && true) then Except.error FaultKind.unsupported
-      else Except.ok (mkState 0 0 [.live none, .live (some v), .dead])) =
-      Except.ok (mkState 0 0 [.live none, .live (some v), .dead])
+      .ok (mkState 0 0 s_dead) := by
+    change (if !(checkVal v u32Ty && true)
+      then Except.error FaultKind.unsupported
+      else Except.ok (mkState 0 0 s_dead)) = Except.ok (mkState 0 0 s_dead)
     rw [h_chk]; rfl
-  apply positiveCanary_of_wp (fuel := 6 + 4); unfold wpProg; rw [h_init]
-  refine wpState_cut (steps := 6) (fuel := 4)
-    (s_mid := mkState 1 0 [.live none, .live (some v), .live (some v)]) ?_ ?_
-  · apply wpSteps_step (s' := mkState 0 1 [.live none, .live (some v), .dead]) rfl
-    apply wpSteps_step (s' := mkState 0 2 [.live none, .live (some v), .live none]) rfl
-    apply wpSteps_step (s' := mkState 0 3 [.live none, .live (some v), .dead]) rfl
-    apply wpSteps_step (s' := mkState 0 4 [.live none, .live (some v), .live none]) rfl
-    refine wpSteps_step
-      (s' := mkState 0 5 [.live none, .live (some v), .live (some v)]) ?_ ?_
-    · change evalStatement body ⟨0, 0, 4, [.live none, .live (some v), .live none]⟩
-          ⟨[]⟩ (.assign ⟨2, []⟩ (.use (.copy ⟨1, []⟩))) = _
+  apply positiveCanary_of_wp (fuel := 12)
+  unfold wpProg; rw [h_init]
+  refine wpOutcomeState_mono (fuel₁ := 6 + 4) ?_
+    (fun _ h => h) (fun _ h => h) (by decide)
+  refine wpState_cut (steps := 6) (fuel := 4) (s_mid := s_mid) ?_ ?_
+  · refine wpStepsOutcome_mono
+      (onMid₁ := fun s' => s' = s_mid ∧ s'.callerMem = ⟨[]⟩) ?_
+      (fun _ h => h.1) (fun _ h => h) (fun _ h => h)
+    apply wpSteps_step (s' := mkState 0 1 s_dead) rfl
+    apply wpSteps_step (s' := mkState 0 2 s_uninit) rfl
+    apply wpSteps_step (s' := mkState 0 3 s_dead) rfl
+    apply wpSteps_step (s' := mkState 0 4 s_uninit) rfl
+    refine wpSteps_step (s' := mkState 0 5 s_both) ?_ ?_
+    · change evalStatement body ⟨0, 0, 4, s_uninit⟩ ⟨[]⟩
+          (.assign ⟨2, []⟩ (.use (.copy ⟨1, []⟩))) = _
       apply evalStatement_assign; rfl; rfl; rfl; rfl; rfl; exact h_chk; rfl; rfl
-    · apply wpSteps_step
-        (s' := mkState 1 0 [.live none, .live (some v), .live (some v)]) rfl; rfl
-  · have h_sw : evalStep progStmtsAndCf 0
-        (mkState 1 0 [.live none, .live (some v), .live (some v)]) =
+    · apply wpSteps_step (s' := s_mid) rfl
+      exact ⟨rfl, rfl⟩
+  · have h_sw : evalStep progStmtsAndCf 0 s_mid =
         match evalSwitchBranches .i32 (truncateBits .i32 x) 3
             [(BitVec.ofNat 128 10, 2)] with
         | .error k => .fault k
-        | .ok target =>
-          .step (mkState target 0 [.live none, .live (some v), .live none]) := by
-      apply evalStep_switchInt_scalar (targets := ⟨[(BitVec.ofNat 128 10, 2)], 3⟩)
+        | .ok target => .step (mkState target 0 s_uninit) := by
+      apply evalStep_switchInt_scalar
+        (targets := ⟨[(BitVec.ofNat 128 10, 2)], 3⟩)
       rfl; rfl; rfl; rfl; rfl; rfl
-    rw [evalSwitchBranches_cons (caseBits := BitVec.ofNat 128 10)
-      (caseCanon := BitVec.ofNat 128 10) (truncateBits_idem .i32 x) rfl rfl] at h_sw
+    rw [evalSwitchBranches_cons (truncateBits_idem .i32 x) rfl] at h_sw
     revert h_sw; cases (truncateBits .i32 x == BitVec.ofNat 128 10)
     · intro h_sw
-      apply wpState_step (s' := mkState 3 0 [.live none, .live (some v), .live none]) h_sw
-      apply wpState_step (s' := mkState 3 1 [.live (some (u32Val 200)), .live (some v), .live none]) rfl
-      apply wpState_step (s' := mkState 3 2 [.live (some (u32Val 200)), .live (some v), .dead]) rfl
+      let r200 : Option Val := some (u32Val 200)
+      apply wpState_step (s' := mkState 3 0 s_uninit) h_sw
+      apply wpState_step
+        (s' := mkState 3 1 [.live r200, .live (some v), .live none]) rfl
+      apply wpState_step
+        (s' := mkState 3 2 [.live r200, .live (some v), .dead]) rfl
       exact wpState_done (out := .returned ⟨u32Val 200, ⟨[]⟩⟩) rfl rfl
     · intro h_sw
-      apply wpState_step (s' := mkState 2 0 [.live none, .live (some v), .live none]) h_sw
-      apply wpState_step (s' := mkState 2 1 [.live (some (u32Val 100)), .live (some v), .live none]) rfl
-      apply wpState_step (s' := mkState 2 2 [.live (some (u32Val 100)), .live (some v), .dead]) rfl
+      let r100 : Option Val := some (u32Val 100)
+      apply wpState_step (s' := mkState 2 0 s_uninit) h_sw
+      apply wpState_step
+        (s' := mkState 2 1 [.live r100, .live (some v), .live none]) rfl
+      apply wpState_step
+        (s' := mkState 2 2 [.live r100, .live (some v), .dead]) rfl
       exact wpState_done (out := .returned ⟨u32Val 100, ⟨[]⟩⟩) rfl rfl
+
+/-- Control-flow and statement canary (`nop`, `storageLive`, `storageDead`,
+`goto`, and both matched and `otherwise` arms of `switchInt`), discharging its
+matched arm by instantiating `canary_symbolic_stmts_and_cf_wpState_cut` and its
+`otherwise` arm via `canary_blockExec_wpState_of_executes` so both combinator
+routes stay in the `TrustedBoundary`-checked Pass 1 dependency cone. -/
+theorem canary_positive_stmts_and_cf_anneal :
+    CanaryPositiveStmtsAndCfAnnealClaim :=
+  ⟨canary_symbolic_stmts_and_cf_wpState_cut (BitVec.ofNat 128 10),
+    canary_blockExec_wpState_of_executes⟩
 
 end Anneal.MirWp

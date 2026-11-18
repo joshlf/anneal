@@ -34,7 +34,8 @@ theorem truncateBits_i64_bvZeroExtend (w : Word) :
 
 theorem checkVal_u64Val (w : Word) :
     checkVal (u64Val w) (.int .i64 false) = true := by
-  change checkVal (.scalar ⟨.i64, false, bvZeroExtend 128 w⟩) (.int .i64 false) = true
+  change checkVal (.scalar ⟨.i64, false, bvZeroExtend 128 w⟩)
+    (.int .i64 false) = true
   rw [← truncateBits_i64_bvZeroExtend w]
   exact checkVal_u64_truncateBits (bvZeroExtend 128 w)
 
@@ -304,12 +305,15 @@ theorem enumTy_beq_self (e : EnumTy) : EnumTy.beq e e = true := by
   cases e with | mk id dw ds tr discs =>
     have hw : IntWidth.beq dw dw = true := by cases dw <;> rfl
     have htr : EnumTagRepr.beq tr tr = true := by
-      cases tr with | zeroSized => rfl | scalar w s => cases w <;> cases s <;> rfl
+      cases tr with
+      | zeroSized => rfl
+      | scalar w s => cases w <;> cases s <;> rfl
     have hdl : natListBeq discs discs = true := by
       induction discs with
       | nil => rfl
       | cons x xs ih =>
-        change (Nat.beq x x && natListBeq xs xs) = true; rw [Nat.beq_refl, ih]; rfl
+        change (Nat.beq x x && natListBeq xs xs) = true
+        rw [Nat.beq_refl, ih]; rfl
     unfold EnumTy.beq; dsimp only
     rw [Nat.beq_refl, hw, beq_self_eq_true, htr, hdl]; rfl
 

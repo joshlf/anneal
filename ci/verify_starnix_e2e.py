@@ -220,7 +220,8 @@ def run(arguments, work):
             work / f"{kind}-fixed-claims/capture/Captured.lean"
         ).read_bytes()
         if rejected_captured != mutated_captured:
-            raise RuntimeError(f"rejected capture differs from checked execution for {kind}")
+            raise RuntimeError(
+                f"rejected capture differs from checked execution for {kind}")
         # verification() requires exit 1 and "proof_failed". cargo-anneal
         # reports Lean resource limits (runtime.* diagnostics, such as
         # maxHeartbeats) and kernel diagnostics as operational failures with

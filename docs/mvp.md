@@ -336,11 +336,13 @@ successor's locals as an unreduced update of the previous state, and the
 dynamic type test of an assignment does not reduce on a symbolic scalar.
 `Anneal.MirWp` provides two ways to split such a path:
 
-- `wpState_cut` cuts a `wpState` obligation at an explicitly named intermediate
-  state `s_mid` (stepped with `wpSteps_step`, `wpState_step`, and
-  `wpState_done`). Its prefix obligation, `wpSteps`, covers every valid choice,
-  so it also applies to nondeterministic steps. Naming `s_mid` with a literal
-  list of slots lets the continuation start from a reduced state.
+- `wpOutcomeState_trans` and `wpState_cut` cut a weakest-precondition
+  obligation across an intermediate predicate `onMid` or an explicitly named
+  state `s_mid` over all valid choices (`wpStepsOutcome` / `wpSteps`;
+  `wpState_cut` applies when every valid path reaches that single `s_mid` or
+  returns earlier). Naming `s_mid` with a literal list of slots lets the
+  continuation start from a reduced state; `wpSteps_step`, `wpState_step` and
+  `wpState_done` discharge deterministic (`Choice = 0`) steps along each arm.
 - `BlockExec` certificates follow one deterministic execution. Entry through
   `executes_of_blockExec` reduces the body's block and local-type lists once.
   Each rule then consumes one statement of the current block and states its
@@ -354,12 +356,13 @@ path with one tactic script and no generated witnesses, producing the returned
 value together with its `Executes` certificate. `ExecutionProof` uses the
 certificate alone; `ProductionClaims` also checks the value against
 `sourceOutput`. `Anneal.MirWp` exercises `wpState_cut`, `wpOutcomeState_mono`,
-`wpStepsOutcome_mono`, and `wpState_of_executes` directly on multi-block
-concrete and symbolic `u32` control-flow canaries
-(`canary_positive_stmts_and_cf_anneal`, `canary_blockExec_wpState_of_executes`,
-and `canary_symbolic_stmts_and_cf_wpState_cut`). The Rust spin fixture uses
-safety transport before its loop invariant and proves no return separately.
-Safety transport, the execution-to-safety bridge and `wpState_of_executes` rely
+`wpStepsOutcome_mono` and `wpState_of_executes` directly inside the
+`canary_positive_stmts_and_cf_anneal` dependency cone
+(`canary_symbolic_stmts_and_cf_wpState_cut` and
+`canary_blockExec_wpState_of_executes`). The Rust spin fixture uses safety
+transport before its loop invariant and proves no return separately. Safety
+transport, the execution-to-safety bridge, `wpState_of_executes` and the
+`Choice = 0` step helpers (`wpSteps_step`, `wpState_step`, `wpState_done`) rely
 on the deterministic source step. An extension to nondeterministic execution
 needs a bridge covering every relevant path.
 
@@ -450,14 +453,15 @@ With `to_be = false`, a safe normal return exists and equals the masked input.
 Baseline safety also covers all valid function inputs independently of these
 additional properties.
 
-The helper first verifies an execution proof that states no return value: every
-valid entry of the baseline capture returns safely. It then changes the
-implementation to return zero and to preserve the masked input. For each
-mutation, the same unchanged execution proof must verify against the changed
-capture before the helper credits rejection of the unchanged fixed claims, so
-a syntax or transition failure cannot satisfy this negative test. Every proof
-source stays byte-identical across the three captures. Logs, receipts and
-`summary.json` remain in the new evidence directory.
+After verifying the baseline request, the helper verifies an execution proof
+that states no return value: every valid entry of the baseline capture returns
+safely. It then changes the implementation to return zero and to preserve the
+masked input. For each mutation, the same unchanged execution proof must verify
+against the changed capture before the helper credits rejection of the
+unchanged fixed claims, so a syntax or transition failure cannot satisfy this
+negative test. Every proof source stays byte-identical across the three
+captures. Logs, receipts and `summary.json` remain in the new evidence
+directory.
 
 For the workspace tests, first install the omnibus archive as above, then build
 the workspace capture driver with its pinned compiler. Explicit tool paths make
