@@ -17,8 +17,11 @@ The commands below target x86_64 Linux. Capture pins Rust nightly
 `2026-10-23`, commit `7189d39d9ce936881b8132c6addeaf3e295cd455` (`V2026_10_22_R7189d39d9`;
 also admitting `nightly-2026-06-01` / `V2026_05_31_R14210df0e` and
 `nightly-2026-05-31` / `V2026_05_30_Rf8a08b688` for local development), and
-`Runtime(PostCleanup)` MIR. Proof checking pins Lean 4.34.1 and authenticates
-its foundation and checked library artifacts against the repository locks.
+`Runtime(PostCleanup)` MIR. The capture driver's build script identifies the
+compiler it is built with against this closed set and selects that compiler's
+MIR dialect; building it with any other compiler fails. Proof checking pins
+Lean 4.34.1 and authenticates its foundation and checked library artifacts
+against the repository locks.
 
 Archive variants select the host executables used to run Anneal. Verification
 admits only `x86_64-unknown-linux-gnu`; the Cargo shortcut uses that same fixed
@@ -89,6 +92,29 @@ target/debug/cargo-anneal verify --request /path/to/request.json \
 The native-library search path and rpath must reference the same compiler
 distribution used to build the capture driver. Building it with an unrelated
 Rust compiler cannot use the pinned `rustc_private` metadata.
+
+To declare the compiler as well, add `--rustc` and `--rustc-version`, which
+must be passed together:
+
+```sh
+target/debug/cargo-anneal verify --request /path/to/request.json \
+  --capture "$PWD/target/debug/anneal-rustc-capture" \
+  --rustc "$anneal_sysroot/bin/rustc" --rustc-version V2026_10_22_R7189d39d9 \
+  --lean "$anneal_lean_prefix/bin/lean"
+```
+
+`--rustc-version` names a supported compiler by its MIR dialect or by its full
+40-hex commit. Before capture, `verify` runs the `--rustc` executable with
+`--version --verbose` in a cleared environment and requires the declared
+compiler's `commit-hash` and `commit-date`. Only those two lines identify a
+compiler, so a distribution's custom version line (such as Fuchsia's
+`rustc 1.101.0-dev (git_revisions:...)`) is accepted. `verify` then passes the
+executable to capture, which checks it against the compiler the driver links,
+and finally requires `capture.json` to record that same compiler. Without
+`--sysroot`, the sysroot is the distribution containing `--rustc`
+(`<sysroot>/bin/rustc`). Any mismatch fails with a JSON receipt and a nonzero
+exit status. These checks bind the run to one compiler; they do not replace
+authenticating that compiler's distribution.
 
 ## Describe the compilation and proof
 
@@ -360,9 +386,14 @@ python3 ci/verify_starnix_e2e.py \
   --cli "$PWD/target/local-install/bin/cargo-anneal" \
   --capture "$anneal_bundle/bin/anneal-rustc-capture" \
   --sysroot "$anneal_bundle/rust" \
+  --rustc-version V2026_10_22_R7189d39d9 \
   --lean "$anneal_bundle/lean/bin/lean" \
   --artifacts-dir "$PWD/target/starnix-evidence"
 ```
+
+Every verification in the helper declares its compiler: `--rustc` defaults to
+`bin/rustc` in the sysroot, and `--rustc-version` names the compiler that the
+bundle's capture driver links.
 
 The helper fetches the original ten-file Fuchsia source set at the revision and
 hashes in

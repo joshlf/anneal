@@ -13,59 +13,23 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use crate::compilers::SupportedCompiler;
+
 // Version 2 adds required source identities to every captured Body. Old capture
 // subjects must be rejected before proof checking against this model ABI.
 pub const SCHEMA_VERSION: u32 = 2;
-pub const COMPILER_COMMIT: &str = "7189d39d9ce936881b8132c6addeaf3e295cd455";
-pub const MIR_DIALECT: &str = "V2026_10_22_R7189d39d9";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PinnedCompiler {
-    /// Full 40-hex `commit-hash` reported by `rustc --version --verbose`.
-    pub commit: &'static str,
-    /// Exact `rustc_interface::util::rustc_version_str()` of this compiler.
-    /// The linked compiler must match this string byte-for-byte; matching only
-    /// the abbreviated hash/date suffix would weaken the pre-versioning check.
-    pub version: &'static str,
-    /// Composite `VYYYY_MM_DD_R<9hex>` identifier naming the
-    /// `Trusted.Rustc.<Dialect>.MirAst` module that captured MIR is rendered in.
-    pub mir_dialect: &'static str,
-}
-
-pub const PINNED_COMPILERS: &[PinnedCompiler] = &[
-    // Fuchsia's live in-tree rustc pin (distributed in nightly-2026-10-23).
-    PinnedCompiler {
-        commit: COMPILER_COMMIT,
-        version: "1.101.0-nightly (7189d39d9 2026-10-22)",
-        mir_dialect: MIR_DIALECT,
-    },
-    // Team Capsule nightly-2026-06-01 toolchain pin.
-    PinnedCompiler {
-        commit: "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65",
-        version: "1.98.0-nightly (14210df0e 2026-05-31)",
-        mir_dialect: "V2026_05_31_R14210df0e",
-    },
-    // Prior pin (#267), distributed in nightly-2026-05-31.
-    PinnedCompiler {
-        commit: "f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1",
-        version: "1.98.0-nightly (f8a08b688 2026-05-30)",
-        mir_dialect: "V2026_05_30_Rf8a08b688",
-    },
-];
-
-impl PinnedCompiler {
-    pub fn matches_version_str(&self, version: &str) -> bool {
-        version == self.version
-    }
-}
-
-pub fn active_pinned_compiler(version: &'static str) -> Option<(PinnedCompiler, &'static str)> {
-    let pin = PINNED_COMPILERS
-        .iter()
-        .copied()
-        .find(|pin| pin.matches_version_str(version))?;
-    Some((pin, version))
-}
+/// The compiler whose `rustc_private` libraries this driver links.
+///
+/// `build.rs` identifies `$RUSTC` against the closed table in `compilers.rs`
+/// and exports its fields; a build with any other compiler stops there. The
+/// driver therefore needs no run-time table search: every check compares
+/// against this one compile-time identity.
+pub const LINKED_COMPILER: SupportedCompiler = SupportedCompiler {
+    mir_dialect: env!("ANNEAL_LINKED_MIR_DIALECT"),
+    commit: env!("ANNEAL_LINKED_RUSTC_COMMIT"),
+    commit_date: env!("ANNEAL_LINKED_RUSTC_DATE"),
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -226,11 +190,18 @@ pub struct Program {
     pub bodies: Vec<Body>,
 }
 
+/// The compiler that produced the capture and the executable checked against
+/// it. `commit`, `commit_date`, and `mir_dialect` are [`LINKED_COMPILER`];
+/// `version` is the linked libraries' own `rustc_version_str()`, which may be
+/// a distribution's custom version text.
 #[derive(Debug, Serialize)]
 pub struct Compiler {
     pub commit: &'static str,
+    pub commit_date: &'static str,
     pub version: &'static str,
     pub mir_dialect: &'static str,
+    /// The `rustc` whose `--version --verbose` matched the linked compiler.
+    pub rustc: PathBuf,
     pub sysroot: PathBuf,
 }
 

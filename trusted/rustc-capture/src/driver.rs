@@ -57,14 +57,14 @@ pub(super) fn configure(config: &mut interface::Config) {
     let early_dcx = EarlyDiagCtxt::new(config.opts.error_format);
 
     // The distribution hashes in flake.nix authenticate the complete
-    // compiler. This check catches builds against another nightly.
-    // rustc_version_str returns the "version string for `rustc` itself".
-    // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_interface/src/util.rs#L688-L691
-    if rustc_interface::util::rustc_version_str()
-        .and_then(crate::ir::active_pinned_compiler)
-        .is_none()
-    {
-        early_dcx.early_fatal("driver was built with an unexpected compiler version");
+    // compiler. This check catches a driver built or run against another
+    // compiler's libraries; `crate::linked_compiler_version` explains it.
+    if crate::linked_compiler_version().is_none() {
+        early_dcx.early_fatal(format!(
+            "driver was built for {} but runs with compiler libraries that do not report commit {}",
+            crate::ir::LINKED_COMPILER.mir_dialect,
+            &crate::ir::LINKED_COMPILER.commit[..9]
+        ));
     }
 
     // Let rustc parse --sysroot, including options in response files.
@@ -117,16 +117,19 @@ pub(super) fn install_ice_hook() {
     rustc_driver::install_ice_hook("https://github.com/joshlf/anneal/issues/new", |_| ());
 }
 
-/// Invoke the driver entrypoint across supported pinned compilers: `rustc` 1.101
-/// (`7189d39d9`) renamed `rustc_driver::run_compiler` to
+/// Invoke the driver entrypoint of the linked compiler: `rustc` 1.101
+/// (`V2026_10_22_R7189d39d9`) renamed `rustc_driver::run_compiler` to
 /// `rustc_driver::compiler_entrypoint` while preserving argv[0] stripping,
 /// response-file (`@file`) expansion, and final `abort_if_errors()` semantics.
 /// https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_driver_impl/src/lib.rs#L171-L260
 /// https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/lib.rs#L171-L187
 pub(super) fn run_compiler(args: &[String], callbacks: &mut (dyn Callbacks + Send)) {
-    #[cfg(version("1.101"))]
+    #[cfg(anneal_mir_dialect = "V2026_10_22_R7189d39d9")]
     rustc_driver::compiler_entrypoint(args, callbacks);
-    #[cfg(not(version("1.101")))]
+    #[cfg(any(
+        anneal_mir_dialect = "V2026_05_31_R14210df0e",
+        anneal_mir_dialect = "V2026_05_30_Rf8a08b688"
+    ))]
     rustc_driver::run_compiler(args, callbacks);
 }
 

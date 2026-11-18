@@ -19,15 +19,19 @@ const COPYRIGHT_HEADER: &str = "-- Copyright 2026 The Fuchsia Authors\n--\n\
 -- This file may not be copied, modified, or distributed except according to\n\
 -- those terms.\n\n";
 
-fn ast_ns(mir_dialect: &str) -> String {
-    debug_assert!(
-        ir::PINNED_COMPILERS
-            .iter()
-            .any(|pin| pin.mir_dialect == mir_dialect),
-        "unexpected MIR dialect {mir_dialect}"
-    );
-    format!("Trusted.Rustc.{mir_dialect}.MirAst")
-}
+/// The Lean syntax module for the linked compiler's MIR dialect.
+///
+/// Each dialect has its own reviewed `Trusted.Rustc.<Dialect>.MirAst`, so the
+/// constructors below must exist in the module named here. Selecting the name
+/// by `anneal_mir_dialect` ties it to the compiler `build.rs` identified; a
+/// dialect without an entry stops the build instead of borrowing another
+/// dialect's syntax.
+#[cfg(anneal_mir_dialect = "V2026_10_22_R7189d39d9")]
+const MIR_AST: &str = "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst";
+#[cfg(anneal_mir_dialect = "V2026_05_31_R14210df0e")]
+const MIR_AST: &str = "Trusted.Rustc.V2026_05_31_R14210df0e.MirAst";
+#[cfg(anneal_mir_dialect = "V2026_05_30_Rf8a08b688")]
+const MIR_AST: &str = "Trusted.Rustc.V2026_05_30_Rf8a08b688.MirAst";
 
 fn list<T>(values: &[T], render: impl Fn(&T) -> String) -> String {
     format!(
@@ -239,22 +243,30 @@ fn body(ast: &str, body: &ir::Body) -> String {
 /// Capture emits a subject, not a proof or a dynamically chosen theorem. The
 /// verifier separately authenticates this source and checks the authored root;
 /// neither diagnostics nor census text can add commands through this renderer.
-pub fn render(mir_dialect: &str, program: &ir::Program) -> String {
-    let ast = ast_ns(mir_dialect);
+pub fn render(program: &ir::Program) -> String {
+    let ast = MIR_AST;
     let scope = match program.scope {
         ir::VerificationScope::Unit => "unit",
         ir::VerificationScope::Crate => "crate",
     };
     format!(
         "{COPYRIGHT_HEADER}prelude\nimport {ast}\n\nnamespace Captured\n\ndef program : {ast}.Program :=\n  {{ scope := {ast}.VerificationScope.{scope}, bodies := {} }}\n\nend Captured\n",
-        list(&program.bodies, |b| body(&ast, b))
+        list(&program.bodies, |b| body(ast, b))
     )
 }
 
 #[cfg(test)]
 mod identity_tests {
-    use super::{ast_ns, identity, rvalue};
-    use crate::ir::{MIR_DIALECT, Operand, Rvalue, Ty};
+    use super::{MIR_AST, identity, rvalue};
+    use crate::ir::{LINKED_COMPILER, Operand, Rvalue, Ty};
+
+    #[test]
+    fn emission_uses_the_linked_dialect_syntax_module() {
+        assert_eq!(
+            MIR_AST,
+            format!("Trusted.Rustc.{}.MirAst", LINKED_COMPILER.mir_dialect)
+        );
+    }
 
     #[test]
     fn identity_names_are_only_numeric_character_data() {
@@ -266,18 +278,17 @@ mod identity_tests {
 
     #[test]
     fn retagging_use_without_confirmed_retag_noop_destination_emits_unsupported() {
-        let ast = ast_ns(MIR_DIALECT);
         let rv = Rvalue::Use {
             operand: Operand::Copy { local: 1 },
             with_retag: true,
         };
         assert_eq!(
-            rvalue(&ast, None, &rv),
-            "Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Rvalue.unsupported"
+            rvalue(MIR_AST, None, &rv),
+            format!("{MIR_AST}.Rvalue.unsupported")
         );
         assert_eq!(
-            rvalue(&ast, Some(&Ty::Bool), &rv),
-            "(Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Rvalue.use (Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Operand.copy (Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst.Place.mk 1 [])))"
+            rvalue(MIR_AST, Some(&Ty::Bool), &rv),
+            format!("({MIR_AST}.Rvalue.use ({MIR_AST}.Operand.copy ({MIR_AST}.Place.mk 1 [])))")
         );
     }
 }

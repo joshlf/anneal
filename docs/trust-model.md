@@ -184,7 +184,10 @@ manifests against [`root-manifest.sha256`](../trusted/root-manifest.sha256)
 (`trusted/root-manifest.sha256`) and checks that every Cargo workspace member
 and `path` dependency resides under `trusted/`. Because Rust code (including
 `build.rs` scripts and proc-macros) is effectful and not checked by the Lean
-kernel, no Rust crate is permitted outside `trusted/`.
+kernel, no Rust crate is permitted outside `trusted/`. Inside `trusted/`, the
+only build script admitted is `trusted/rustc-capture/build.rs`: a regular file
+at Cargo's default path with no build dependencies, which identifies the
+compiler whose `rustc_private` libraries the capture driver links.
 
 ### Phase 1: Syntactic source preflight (`--mode preflight`)
 

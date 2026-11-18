@@ -2408,3 +2408,351 @@ pub fn id(x: usize) -> usize {
         synth.spec_lean
     );
 }
+
+// ---------------------------------------------------------------------------
+// Declared compiler boundaries (`--rustc` / `--rustc-version`)
+// ---------------------------------------------------------------------------
+
+/// Supported compilers as `(dialect, commit, commit-date)`, mirrored from
+/// `src/compilers.rs` to choose test inputs.
+const SUPPORTED_COMPILERS: &[(&str, &str, &str)] = &[
+    (
+        "V2026_10_22_R7189d39d9",
+        "7189d39d9ce936881b8132c6addeaf3e295cd455",
+        "2026-10-22",
+    ),
+    (
+        "V2026_05_31_R14210df0e",
+        "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65",
+        "2026-05-31",
+    ),
+    (
+        "V2026_05_30_Rf8a08b688",
+        "f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1",
+        "2026-05-30",
+    ),
+];
+
+const DECLARED_SRC: &str =
+    "/// anneal:spec ensures(ret == x)\npub fn id(x: usize) -> usize { x }\n";
+
+/// Return the sysroot's `bin/rustc` and its supported entry, read from the
+/// compiler's own `--version --verbose` report.
+fn sysroot_compiler(tools: &Tools) -> (PathBuf, (&'static str, &'static str, &'static str)) {
+    let rustc = tools.sysroot.join("bin/rustc");
+    let output = Command::new(&rustc)
+        .args(["--version", "--verbose"])
+        .output()
+        .expect("run the sysroot compiler");
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap_or_else(|| panic!("missing {name} in {text}"))
+            .to_owned()
+    };
+    let (commit, date) = (field("commit-hash: "), field("commit-date: "));
+    let entry = SUPPORTED_COMPILERS
+        .iter()
+        .copied()
+        .find(|(_, supported, supported_date)| *supported == commit && *supported_date == date)
+        .unwrap_or_else(|| panic!("the test sysroot compiler is unsupported: {text}"));
+    (rustc, entry)
+}
+
+fn another_compiler(dialect: &str) -> (&'static str, &'static str, &'static str) {
+    SUPPORTED_COMPILERS
+        .iter()
+        .copied()
+        .find(|(other, ..)| *other != dialect)
+        .unwrap()
+}
+
+/// A crate sandbox with its synthesized proof package already written.
+fn declared_sandbox(prefix: &str) -> SandboxCrate {
+    let sandbox = SandboxCrate::new(prefix, DECLARED_SRC);
+    let synth = synthesize_proof_package(DECLARED_SRC).unwrap();
+    fs::write(sandbox.proof_dir.join("Spec.lean"), &synth.spec_lean).unwrap();
+    fs::write(sandbox.proof_dir.join("Proof.lean"), &synth.proof_lean).unwrap();
+    sandbox
+}
+
+/// Run `verify` for `sandbox` with `capture` and optional compiler options.
+fn run_declared(
+    tools: &Tools,
+    sandbox: &SandboxCrate,
+    capture: &Path,
+    declared: Option<(&Path, &str)>,
+    sysroot: bool,
+) -> (Option<i32>, Value) {
+    let mut command = Command::new(&tools.cli);
+    command
+        .arg("verify")
+        .arg("--capture")
+        .arg(capture)
+        .arg("--lean")
+        .arg(&tools.lean)
+        .arg("--manifest-path")
+        .arg(sandbox.crate_dir.join("Cargo.toml"))
+        .arg("--proof-dir")
+        .arg(&sandbox.proof_dir)
+        .arg("--artifacts")
+        .arg(&sandbox.artifacts_dir);
+    if sysroot {
+        command.arg("--sysroot").arg(&tools.sysroot);
+    }
+    if let Some((rustc, id)) = declared {
+        command
+            .arg("--rustc")
+            .arg(rustc)
+            .args(["--rustc-version", id]);
+    }
+    let output = command.output().expect("run cargo-anneal verify");
+    let receipt = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "invalid receipt ({error}):\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output.status.code(), receipt)
+}
+
+/// Create an executable from a short-lived child process. A child that
+/// another test thread forks while this process holds the file open for
+/// writing keeps that descriptor until its own `exec`, and executing the file
+/// meanwhile fails with ETXTBSY ("Text file busy").
+fn executable_script(path: &Path, script: &str) {
+    use std::io::Write as _;
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "cat > \"$1\" && chmod 755 \"$1\"",
+            "install-executable",
+        ])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("start executable installer");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "install {}",
+        path.display()
+    );
+}
+
+/// The positive end-to-end path: both `--rustc-version` spellings, with the
+/// sysroot inferred from `--rustc` and given explicitly, verify the crate and
+/// bind the receipt, capture, and canonical root to the declared dialect.
+#[test]
+fn verifies_with_declared_rustc_and_rustc_version() {
+    use sha2::{Digest, Sha256};
+
+    let tools = Tools::discover();
+    let (rustc, (dialect, commit, date)) = sysroot_compiler(&tools);
+    let canonical = fs::canonicalize(&rustc).unwrap();
+    for (id, sysroot) in [(dialect, false), (commit, true)] {
+        let sandbox = declared_sandbox("declared-rustc");
+        let (code, receipt) = run_declared(
+            &tools,
+            &sandbox,
+            &tools.capture,
+            Some((&rustc, id)),
+            sysroot,
+        );
+        assert_eq!(code, Some(0), "{receipt}");
+        assert_eq!(receipt["status"], "crate_verified", "{receipt}");
+        assert_eq!(receipt["audit"]["exactType"], true, "{receipt}");
+        assert_eq!(receipt["audit"]["replay"], true, "{receipt}");
+        let compiler = &receipt["compiler"];
+        assert_eq!(compiler["mir_dialect"], dialect, "{receipt}");
+        assert_eq!(compiler["commit"], commit, "{receipt}");
+        assert_eq!(compiler["commit_date"], date, "{receipt}");
+        assert_eq!(compiler["rustc"], canonical.to_str().unwrap(), "{receipt}");
+        assert_eq!(
+            receipt["rustc_binary_sha256"],
+            format!("{:x}", Sha256::digest(fs::read(&canonical).unwrap())),
+            "{receipt}"
+        );
+        let captured =
+            fs::read_to_string(sandbox.artifacts_dir.join("capture/Captured.lean")).unwrap();
+        assert!(
+            captured.contains(&format!("import Trusted.Rustc.{dialect}.MirAst\n")),
+            "{captured}"
+        );
+        let request: Value = serde_json::from_slice(
+            &fs::read(sandbox.artifacts_dir.join("audit-request.json")).unwrap(),
+        )
+        .unwrap();
+        // `TargetAuditRequest` serializes its fields in camelCase.
+        assert_eq!(
+            request["canonicalRoot"],
+            format!("Trusted.MirSemantics.{dialect}.CrateTheorem"),
+            "{request}"
+        );
+        let expected =
+            fs::read_to_string(sandbox.artifacts_dir.join("generated/Expected.lean")).unwrap();
+        assert!(
+            expected.contains(&format!("Trusted.MirSemantics.{dialect}.CrateTheorem (")),
+            "{expected}"
+        );
+    }
+}
+
+/// Boundary 1 before capture: the real sysroot compiler declared as another
+/// supported compiler is refused without running capture.
+#[test]
+fn rejects_rustc_that_differs_from_rustc_version() {
+    let tools = Tools::discover();
+    let (rustc, (dialect, ..)) = sysroot_compiler(&tools);
+    let (other, ..) = another_compiler(dialect);
+    let sandbox = declared_sandbox("declared-mismatch");
+    let (code, receipt) = run_declared(
+        &tools,
+        &sandbox,
+        &tools.capture,
+        Some((&rustc, other)),
+        true,
+    );
+    assert_eq!(code, Some(2), "{receipt}");
+    assert_eq!(receipt["status"], "tool_failed", "{receipt}");
+    assert_eq!(receipt["phase"], "compiler", "{receipt}");
+    let detail = receipt["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(&format!("but --rustc-version {other} is {other}")),
+        "{receipt}"
+    );
+    assert!(!sandbox.artifacts_dir.join("capture").exists(), "{receipt}");
+}
+
+/// Boundary 1 between `--rustc` and the capture driver: a compiler that
+/// matches its declaration but not the driver's linked libraries is refused
+/// by the driver.
+#[test]
+fn capture_driver_refuses_declared_rustc_of_another_compiler() {
+    let tools = Tools::discover();
+    let (_, (dialect, ..)) = sysroot_compiler(&tools);
+    let (other, other_commit, other_date) = another_compiler(dialect);
+    let fakes = tempfile::tempdir().unwrap();
+    let rustc = fakes.path().join("rustc");
+    executable_script(
+        &rustc,
+        &format!(
+            "#!/bin/sh\nif [ \"$#\" -eq 2 ] && [ \"$1\" = --version ] && [ \"$2\" = --verbose ]; then\n\
+             printf '%s\\n' 'rustc 1.0.0-dev (git_revisions:{other_commit})' 'binary: rustc' \
+             'commit-hash: {other_commit}' 'commit-date: {other_date}'\nexit 0\nfi\nexit 97\n"
+        ),
+    );
+    let sandbox = declared_sandbox("declared-driver-mismatch");
+    let (code, receipt) = run_declared(
+        &tools,
+        &sandbox,
+        &tools.capture,
+        Some((&rustc, other)),
+        true,
+    );
+    assert_eq!(code, Some(2), "{receipt}");
+    assert_eq!(receipt["status"], "tool_failed", "{receipt}");
+    assert_eq!(receipt["phase"], "capture", "{receipt}");
+    let detail = receipt["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(&format!("is {other} (commit-hash {other_commit}"))
+            && detail.contains(&format!("but this capture driver links {dialect}")),
+        "{receipt}"
+    );
+    assert!(
+        !sandbox.artifacts_dir.join("capture/capture.json").exists(),
+        "{receipt}"
+    );
+}
+
+/// Tampered capture compiler fields fail closed at the manifest check, the
+/// rendered-syntax check, or the declared-compiler check, all before Lean.
+#[test]
+fn rejects_tampered_capture_compiler_fields() {
+    let tools = Tools::discover();
+    let (rustc, (dialect, commit, date)) = sysroot_compiler(&tools);
+    let (other, other_commit, other_date) = another_compiler(dialect);
+    let replace = |field: &str, from: &str, to: &str| {
+        format!("-e 's/\"{field}\": \"{from}\"/\"{field}\": \"{to}\"/g'")
+    };
+    let all_dialects = replace("mir_dialect", dialect, other);
+    let consistent = format!(
+        "{all_dialects} {} {}",
+        replace("commit", commit, other_commit),
+        replace("commit_date", date, other_date)
+    );
+    let cases = [
+        // Only the top-level field: the two dialect fields disagree.
+        (
+            format!("-e '0,/\"mir_dialect\": \"{dialect}\"/s//\"mir_dialect\": \"{other}\"/'"),
+            false,
+            "unexpected capture schema or compiler".to_owned(),
+        ),
+        // Both dialect fields: they no longer match the commit.
+        (
+            all_dialects.clone(),
+            false,
+            "unexpected capture schema or compiler".to_owned(),
+        ),
+        // Every compiler field names another supported compiler, but the
+        // rendered subject still imports the real dialect's syntax.
+        (
+            consistent.clone(),
+            false,
+            format!("but the capture's compiler has MIR dialect {other}"),
+        ),
+        // With a declaration, the recorded compiler must be the declared one.
+        (
+            consistent,
+            true,
+            format!("capture reports compiler {other}"),
+        ),
+    ];
+    for (index, (expressions, declare, diagnostic)) in cases.into_iter().enumerate() {
+        let wrappers = tempfile::tempdir().unwrap();
+        let wrapper = wrappers.path().join("tampering-capture");
+        executable_script(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nout=\nprevious=\nfor argument in \"$@\"; do\n\
+                 if [ \"$previous\" = --out-dir ]; then out=\"$argument\"; fi\n\
+                 previous=\"$argument\"\ndone\n\
+                 receipt=$('{}' \"$@\")\nstatus=$?\n\
+                 if [ \"$status\" -eq 0 ]; then sed -i {expressions} \"$out/capture.json\" || exit 70; fi\n\
+                 printf '%s\\n' \"$receipt\"\nexit \"$status\"\n",
+                tools.capture.display()
+            ),
+        );
+        let sandbox = declared_sandbox(&format!("tampered-{index}"));
+        let declared = declare.then_some((rustc.as_path(), dialect));
+        let (code, receipt) = run_declared(&tools, &sandbox, &wrapper, declared, true);
+        assert_eq!(code, Some(2), "case {index}: {receipt}");
+        assert_eq!(receipt["status"], "tool_failed", "case {index}: {receipt}");
+        assert_eq!(receipt["phase"], "capture", "case {index}: {receipt}");
+        assert!(
+            receipt["detail"].as_str().unwrap().contains(&diagnostic),
+            "case {index}: {receipt}"
+        );
+        // The tampering really happened: the retained manifest names `other`.
+        let manifest: Value = serde_json::from_slice(
+            &fs::read(sandbox.artifacts_dir.join("capture/capture.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["mir_dialect"], other, "case {index}: {manifest}");
+        assert!(
+            !sandbox
+                .artifacts_dir
+                .join("generated/Expected.lean")
+                .exists(),
+            "case {index}: Lean staging began"
+        );
+    }
+}

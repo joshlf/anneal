@@ -957,6 +957,64 @@ fn rejects_cargo_workspace_members_and_path_deps_outside_trusted() {
     );
 }
 
+/// Verifies the single build-script exemption: `trusted/rustc-capture/build.rs`
+/// passes only as a regular file at Cargo's default path with no build
+/// dependencies, and every other member's build script is still rejected.
+#[test]
+fn admits_only_the_reviewed_capture_build_script() {
+    let checkout = repo_root();
+    let fix = TempFixture::new(None);
+    fs::copy(checkout.join("Cargo.toml"), fix.root.join("Cargo.toml")).unwrap();
+    fs::copy(
+        checkout.join("trusted/audit/Cargo.toml"),
+        fix.root.join("trusted/audit/Cargo.toml"),
+    )
+    .unwrap();
+    for member in ["trusted/rustc-capture", "trusted/cargo-anneal"] {
+        copy_dir_all(&checkout.join(member), &fix.root.join(member)).unwrap();
+    }
+    let script = fix.root.join("trusted/rustc-capture/build.rs");
+    assert!(script.is_file());
+    check_cargo_boundary(&fix.root).unwrap();
+    let reject = |expected: &str| {
+        let err = check_cargo_boundary(&fix.root).unwrap_err();
+        assert_eq!(err.code, 1, "{err}");
+        assert_eq!(err.phase, "cargo-boundary", "{err}");
+        assert!(err.message.contains(expected), "unexpected error: {err}");
+    };
+
+    let other = fix.root.join("trusted/cargo-anneal/build.rs");
+    fs::write(&other, b"fn main() {}\n").unwrap();
+    reject("disallowed build script trusted/cargo-anneal/build.rs");
+    fs::remove_file(&other).unwrap();
+
+    let moved = fix.root.join("moved-build.rs");
+    fs::rename(&script, &moved).unwrap();
+    symlink(&moved, &script).unwrap();
+    reject("build script trusted/rustc-capture/build.rs must be a regular file");
+    fs::remove_file(&script).unwrap();
+    fs::rename(&moved, &script).unwrap();
+
+    let manifest_path = fix.root.join("trusted/rustc-capture/Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    for table in [
+        "[build-dependencies]",
+        "[build_dependencies]",
+        "[target.'cfg(unix)'.build-dependencies]",
+    ] {
+        fs::write(&manifest_path, format!("{manifest}\n{table}\ncc = \"1\"\n")).unwrap();
+        reject("for the build script of trusted/rustc-capture");
+    }
+    fs::write(
+        &manifest_path,
+        manifest.replacen("[package]\n", "[package]\nbuild = \"build.rs\"\n", 1),
+    )
+    .unwrap();
+    reject("disallowed package.build");
+    fs::write(&manifest_path, &manifest).unwrap();
+    check_cargo_boundary(&fix.root).unwrap();
+}
+
 /// Verifies module-level trust-tier non-contamination and `Trusted` namespace
 /// hygiene:
 /// - A `vetted` module referencing a `candidate:<feature>` constant is rejected

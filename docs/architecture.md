@@ -39,7 +39,11 @@ the repository's `trusted/` and `theory/` boundary:
    version-specific `rustc_driver` wrapper transcribes `rustc`'s
    `Runtime(PostCleanup)` MIR and inline Rust specification attributes 1-to-1
    into Lean data definitions (`Mir.lean`) and a pure proof script
-   (`Proof.lean`), with zero semantic normalization in Rust.
+   (`Proof.lean`), with zero semantic normalization in Rust. Its build script
+   identifies the compiler it links against a closed table of supported
+   compilers and selects that compiler's MIR dialect at build time;
+   `cargo anneal verify --rustc <PATH> --rustc-version <ID>` checks the
+   declared compiler before capture and the captured compiler after it.
 2. **Stage 2 — Versioned Captured MIR, Unversioned Ground Semantics & Reference Anchor
    (`trusted/lean/`, `trusted/correspondence/`, `vendor/`):** Versioned Lean AST
    modules represent captured `rustc` MIR per compiler dialect
@@ -427,10 +431,14 @@ cheapest possible layer:
 1. **Internal `rustc` API refactoring (absorbed in Stage 1):** Most changes
    between `rustc 1.X` and `rustc 1.Y` are internal compiler refactorings (such
    as renaming a `TyCtxt` query or restructuring an internal arena) that do not
-   change the meaning or shape of emitted MIR. These changes are isolated inside
-   a new `trusted/rustc-capture/crates/rustc-capture-v1_Y/` crate, which still
-   emits the exact same Stage 2 `Trusted/Rust/Ast/` structures. Neither
-   `trusted/lean/` nor `theory/` changes at all.
+   change the meaning or shape of emitted MIR. These changes stay inside
+   `trusted/rustc-capture/`: its `build.rs` sets
+   `cfg(anneal_mir_dialect = "<Dialect>")` for the compiler it is built with,
+   and the few `rustc_private` call sites that differ between supported
+   compilers are gated on that cfg. Each gate names the dialects it covers, so
+   adding a compiler to the table stops the build until every gate is
+   reviewed. Neither `trusted/lean/` nor `theory/` changes for such an API
+   refactoring.
 2. **New MIR syntactic forms or desugarings (absorbed in Stage 2 $\rightarrow$
    Stage 3 lowering):** Sometimes a new `rustc` version introduces a new
    `Rvalue` or `StatementKind` variant, or changes how a surface Rust construct

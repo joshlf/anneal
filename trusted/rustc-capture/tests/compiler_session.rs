@@ -414,11 +414,15 @@ fn help_and_version_do_not_claim_callback_execution() {
     }
 }
 
-const PINNED_RUSTC_VERSIONS: &[&str] = &[
-    "rustc 1.101.0-nightly (7189d39d9 2026-10-22)",
-    "rustc 1.98.0-nightly (14210df0e 2026-05-31)",
-    "rustc 1.98.0-nightly (f8a08b688 2026-05-30)",
-];
+/// The compiler commit that `build.rs` selected for this driver.
+const LINKED_COMMIT: &str = env!("ANNEAL_LINKED_RUSTC_COMMIT");
+
+/// Whether a `--version` line names the linked compiler. The line is
+/// `rustc <CFG_VERSION>`; upstream builds print the nine-digit commit as
+/// `(<commit> <date>)` and Fuchsia's builds inside `(git_revisions:...)`.
+fn names_linked_compiler(line: &str) -> bool {
+    line.starts_with("rustc ") && line.contains(&LINKED_COMMIT[..9])
+}
 
 #[test]
 fn explicit_separator_routes_information_requests_to_rustc() {
@@ -438,7 +442,7 @@ fn explicit_separator_routes_information_requests_to_rustc() {
     assert_eq!(version.status.code(), Some(1), "{version:?}");
     let version_out = stdout(&version);
     assert!(
-        PINNED_RUSTC_VERSIONS.contains(&version_out.trim()),
+        names_linked_compiler(version_out.trim()),
         "unexpected compiler version output: {version:?}"
     );
     assert!(!version_out.contains(CALLBACK), "{version:?}");
@@ -463,7 +467,7 @@ fn compiler_artifacts_on_stdout_match_rustc_bytes() {
     assert!(version.status.success(), "{version:?}");
     let version_trimmed = stdout(&version).trim().to_owned();
     assert!(
-        PINNED_RUSTC_VERSIONS.contains(&version_trimmed.as_str()),
+        names_linked_compiler(&version_trimmed),
         "unexpected pinned compiler version: {version_trimmed}"
     );
     for emission in ["--emit=asm=-", "--emit=llvm-ir=-", "--emit=obj=-"] {
@@ -553,12 +557,7 @@ fn compiler_panics_use_rustcs_ice_hook() {
         diagnostics.contains("https://github.com/joshlf/anneal/issues/new"),
         "{diagnostics}"
     );
-    assert!(
-        diagnostics.contains("7189d39d9")
-            || diagnostics.contains("14210df0e")
-            || diagnostics.contains("f8a08b688"),
-        "{diagnostics}"
-    );
+    assert!(diagnostics.contains(&LINKED_COMMIT[..9]), "{diagnostics}");
     assert!(
         diagnostics.contains("query stack during panic"),
         "{diagnostics}"

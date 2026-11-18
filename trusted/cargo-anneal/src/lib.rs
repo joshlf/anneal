@@ -22,7 +22,9 @@
 //!    (including `build.rs` scripts and proc-macros) is effectful and not
 //!    checked by the Lean kernel, every Cargo workspace member must reside
 //!    under `trusted/` and no member may declare a `path` dependency outside
-//!    `trusted/`.
+//!    `trusted/`. The only build script allowed is the reviewed,
+//!    dependency-free `trusted/rustc-capture/build.rs`, which identifies the
+//!    compiler the capture driver links.
 //! 2. **Toolchain, source-tree, and foundation-lock admission
 //!    ([`scan_lean_tree`], [`Checker::tool_admission`]):** Source directories
 //!    (`trusted/lean/` and `theory/`) must contain only regular files and zero
@@ -1095,6 +1097,62 @@ fn verify_cargo_lock(checkout: &Path, member_pkg_names: &BTreeSet<String>) -> Re
     Ok(())
 }
 
+/// The only workspace member allowed a build script.
+///
+/// `trusted/rustc-capture/build.rs` identifies the compiler whose
+/// `rustc_private` libraries the driver links and stops the build for any
+/// compiler outside its closed table. It is reviewed `trusted/` code like the
+/// rest of the driver. The exemption admits only Cargo's default script path
+/// as a regular file with no build dependencies, so the script runs nothing
+/// but the standard library and the reviewed driver sources it includes.
+const BUILD_SCRIPT_MEMBER: &str = "trusted/rustc-capture";
+
+/// Reject build scripts, which run arbitrary code during every Cargo build,
+/// except the single reviewed script of [`BUILD_SCRIPT_MEMBER`].
+/// `package.build` is rejected separately, so Cargo can only discover a script
+/// at the default `build.rs` path checked here.
+fn check_build_script(
+    checkout: &Path,
+    member: &str,
+    manifest: &MemberCargoManifest,
+) -> Result<(), Failure> {
+    let phase = "cargo-boundary";
+    let script = checkout.join(member).join("build.rs");
+    let Ok(metadata) = fs::symlink_metadata(&script) else {
+        return Ok(());
+    };
+    if member != BUILD_SCRIPT_MEMBER {
+        return Err(Failure::new(
+            1,
+            phase,
+            format!("disallowed build script {member}/build.rs"),
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(Failure::new(
+            1,
+            phase,
+            format!("build script {member}/build.rs must be a regular file"),
+        ));
+    }
+    if let Some((section, _)) = manifest
+        .all_dep_tables()
+        .into_iter()
+        .find(|(section, table)| {
+            table.is_some()
+                && (section.ends_with("build-dependencies")
+                    || section.ends_with("build_dependencies"))
+        })
+    {
+        return Err(Failure::new(
+            1,
+            phase,
+            format!("disallowed [{section}] for the build script of {member}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Verify Cargo workspace DAG containment, root Cargo/toolchain hygiene,
 /// `Cargo.lock` dependency provenance, and `trusted/root-manifest.sha256` (when
 /// present): all workspace crates must reside under `trusted/`, and no
@@ -1188,13 +1246,7 @@ pub fn check_cargo_boundary(checkout: &Path) -> Result<(), Failure> {
                 format!("disallowed package.build or package.workspace in {member}/Cargo.toml"),
             ));
         }
-        if fs::symlink_metadata(checkout.join(member).join("build.rs")).is_ok() {
-            return Err(Failure::new(
-                1,
-                phase,
-                format!("disallowed build script {member}/build.rs"),
-            ));
-        }
+        check_build_script(checkout, member, &manifest)?;
 
         for (section, target) in manifest.all_targets() {
             validate_member_target(member, section, target)?;

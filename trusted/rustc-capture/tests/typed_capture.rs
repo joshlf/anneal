@@ -8,7 +8,7 @@
 
 //! Check explicit typed capture and its separation from raw compiler arguments.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::Value;
@@ -1040,4 +1040,238 @@ fn retag_flags_are_recorded_on_scalar_use_and_reference_assignments_are_refused(
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(status(&output)["status"], "unsupported", "{output:?}");
     ref_fixture.assert_no_capture_artifacts();
+}
+
+// The identity `build.rs` selected for this driver. Fake compilers below
+// report it, or deliberately report something else.
+const LINKED_COMMIT: &str = env!("ANNEAL_LINKED_RUSTC_COMMIT");
+const LINKED_DATE: &str = env!("ANNEAL_LINKED_RUSTC_DATE");
+const LINKED_DIALECT: &str = env!("ANNEAL_LINKED_MIR_DIALECT");
+
+fn verbose_version(version: &str, commit: &str, date: &str) -> String {
+    format!(
+        "rustc {version}\nbinary: rustc\ncommit-hash: {commit}\ncommit-date: {date}\n\
+         host: x86_64-unknown-linux-gnu\nrelease: 1.0.0-dev\nLLVM version: 22.1.6\n"
+    )
+}
+
+/// Write a stand-in compiler that answers exactly `--version --verbose` with
+/// `report` and `status`, and refuses any compilation request. It uses only
+/// shell builtins: capture probes compilers with `PATH=/usr/bin:/bin`, which a
+/// build sandbox may leave empty.
+///
+/// A short-lived child writes the file. A child that another test thread
+/// forks while this process holds the file open for writing keeps that
+/// descriptor until its own `exec`, and executing the file meanwhile fails
+/// with ETXTBSY ("Text file busy").
+#[cfg(unix)]
+fn fake_rustc(directory: &Path, name: &str, report: &str, status: i32) -> PathBuf {
+    use std::io::Write as _;
+
+    assert!(!report.contains('\''), "{report}");
+    let path = directory.join(name);
+    let script = format!(
+        "#!/bin/sh\nif [ \"$#\" -eq 2 ] && [ \"$1\" = --version ] && [ \"$2\" = --verbose ]; then\n\
+         printf '%s' '{report}'\nexit {status}\nfi\nexit 97\n"
+    );
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "cat > \"$1\" && chmod 755 \"$1\"",
+            "install-executable",
+        ])
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("start executable installer");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "install {}",
+        path.display()
+    );
+    path
+}
+
+#[test]
+fn rustc_identity_is_recorded_for_explicit_and_default_compilers() {
+    let rustc = PathBuf::from(sysroot()).join("bin/rustc");
+    for explicit in [true, false] {
+        let fixture = Capture::new(b"pub fn selected(value: u64) -> u64 { value }\n");
+        let mut command = fixture.selected_command();
+        if explicit {
+            command.arg("--rustc").arg(&rustc);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let manifest = fixture.manifest();
+        let compiler = &manifest["compiler"];
+        assert_eq!(manifest["mir_dialect"], LINKED_DIALECT, "{manifest}");
+        assert_eq!(compiler["mir_dialect"], LINKED_DIALECT, "{manifest}");
+        assert_eq!(compiler["commit"], LINKED_COMMIT, "{manifest}");
+        assert_eq!(compiler["commit_date"], LINKED_DATE, "{manifest}");
+        assert!(
+            compiler["version"]
+                .as_str()
+                .unwrap()
+                .contains(&LINKED_COMMIT[..9]),
+            "{manifest}"
+        );
+        // An explicit compiler is recorded at its canonical path. Without
+        // one, the probe uses bin/rustc of the canonical session sysroot.
+        let expected = if explicit {
+            rustc.canonicalize().unwrap()
+        } else {
+            PathBuf::from(sysroot())
+                .canonicalize()
+                .unwrap()
+                .join("bin/rustc")
+        };
+        assert_eq!(compiler["rustc"], expected.to_str().unwrap(), "{manifest}");
+        let lean = std::fs::read_to_string(fixture.output.join("Captured.lean")).unwrap();
+        assert!(
+            lean.contains(&format!("import Trusted.Rustc.{LINKED_DIALECT}.MirAst\n")),
+            "{lean}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fuchsia_style_rustc_reporting_the_linked_build_is_accepted() {
+    // Fuchsia's compilers put their revisions in the version line's
+    // description; only the commit-hash and commit-date lines identify them.
+    let fixture = Capture::new(b"pub fn selected(value: u64) -> u64 { value }\n");
+    let tools = tempfile::tempdir().unwrap();
+    let report = verbose_version(
+        &format!("1.101.0-dev (git_revisions:{LINKED_COMMIT},llvm:0123456789abcdef)"),
+        LINKED_COMMIT,
+        LINKED_DATE,
+    );
+    let rustc = fake_rustc(tools.path(), "fuchsia-rustc", &report, 0);
+    let output = fixture
+        .selected_command()
+        .arg("--rustc")
+        .arg(&rustc)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let manifest = fixture.manifest();
+    assert_eq!(manifest["compiler"]["commit"], LINKED_COMMIT, "{manifest}");
+    assert_eq!(
+        manifest["compiler"]["rustc"],
+        rustc.canonicalize().unwrap().to_str().unwrap(),
+        "{manifest}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rustc_that_is_not_the_linked_build_is_refused_before_compilation() {
+    const SUPPORTED: &[(&str, &str, &str)] = &[
+        (
+            "V2026_10_22_R7189d39d9",
+            "7189d39d9ce936881b8132c6addeaf3e295cd455",
+            "2026-10-22",
+        ),
+        (
+            "V2026_05_31_R14210df0e",
+            "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65",
+            "2026-05-31",
+        ),
+        (
+            "V2026_05_30_Rf8a08b688",
+            "f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1",
+            "2026-05-30",
+        ),
+    ];
+    let mut cases: Vec<(String, String)> = SUPPORTED
+        .iter()
+        .filter(|(dialect, ..)| *dialect != LINKED_DIALECT)
+        .map(|(dialect, commit, date)| {
+            (
+                verbose_version("1.0.0", commit, date),
+                format!("is {dialect} (commit-hash {commit}"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        cases.len(),
+        SUPPORTED.len() - 1,
+        "linked dialect is supported"
+    );
+    let unknown = "0123456789abcdef0123456789abcdef01234567";
+    cases.extend([
+        // A different build of the linked commit is not the linked build.
+        (
+            verbose_version("1.0.0", LINKED_COMMIT, "1999-12-31"),
+            "commit-date 1999-12-31".to_owned(),
+        ),
+        (
+            verbose_version("1.0.0", unknown, LINKED_DATE),
+            format!(
+                "is unsupported V{}_R012345678",
+                LINKED_DATE.replace('-', "_")
+            ),
+        ),
+        // An injected version line cannot add a matching commit-hash.
+        (
+            verbose_version(
+                &format!("1.0.0\ncommit-hash: {LINKED_COMMIT}"),
+                unknown,
+                LINKED_DATE,
+            ),
+            "repeats commit-hash".to_owned(),
+        ),
+        (
+            verbose_version("1.0.0", "unknown", "unknown"),
+            "full lowercase hexadecimal commit".to_owned(),
+        ),
+    ]);
+    for (index, (report, diagnostic)) in cases.iter().enumerate() {
+        let fixture = Capture::new(b"pub fn selected() {}\n");
+        let tools = tempfile::tempdir().unwrap();
+        let rustc = fake_rustc(tools.path(), &format!("rustc-{index}"), report, 0);
+        let output = fixture
+            .selected_command()
+            .arg("--rustc")
+            .arg(&rustc)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let failure = status(&output);
+        assert_eq!(failure["status"], "tool_failed", "{failure}");
+        assert!(
+            failure.to_string().contains(diagnostic.as_str()),
+            "{failure}"
+        );
+        // The early check precedes output reservation and compilation.
+        assert!(!fixture.output.exists(), "{output:?}");
+    }
+
+    // A failing or missing compiler is refused the same way.
+    let fixture = Capture::new(b"pub fn selected() {}\n");
+    let tools = tempfile::tempdir().unwrap();
+    let report = verbose_version("1.0.0", LINKED_COMMIT, LINKED_DATE);
+    let failing = fake_rustc(tools.path(), "failing-rustc", &report, 3);
+    for (rustc, diagnostic) in [
+        (failing, "--version --verbose failed"),
+        (tools.path().join("missing-rustc"), "cannot resolve --rustc"),
+    ] {
+        let output = fixture
+            .selected_command()
+            .arg("--rustc")
+            .arg(&rustc)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(status(&output)["status"], "tool_failed", "{output:?}");
+        assert!(stdout(&output).contains(diagnostic), "{output:?}");
+        assert!(!fixture.output.exists(), "{output:?}");
+    }
 }

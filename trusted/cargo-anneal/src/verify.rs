@@ -12,6 +12,7 @@
 //! the source model, captured subject or expected proposition. Those inputs are
 //! staged independently and passed to the compiled-environment auditor.
 
+use crate::compilers;
 use cargo_anneal::{Checker, TargetAuditRequest, TargetBindings, TargetModule, TargetRole};
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,15 @@ pub struct VerifyArgs {
     /// Pinned compiler sysroot, for a separately installed capture driver.
     #[arg(long)]
     sysroot: Option<PathBuf>,
+    /// Compiler executable that must report `--rustc-version`; the capture
+    /// driver checks it against its linked compiler too. Without `--sysroot`,
+    /// the distribution containing it supplies the sysroot.
+    #[arg(long, value_name = "PATH", requires = "rustc_version")]
+    rustc: Option<PathBuf>,
+    /// Expected compiler of `--rustc` and the capture: a MIR dialect such as
+    /// V2026_10_22_R7189d39d9, or the full 40-hex commit.
+    #[arg(long, value_name = "ID", requires = "rustc")]
+    rustc_version: Option<String>,
     /// New UTF-8 directory path for retained capture, sources and audit
     /// evidence.
     #[arg(long)]
@@ -183,32 +193,190 @@ fn identifier(value: &str) -> bool {
     !value.is_empty() && value.split('.').all(cargo_anneal::is_lean_ident)
 }
 
-/// Authenticate the captured MIR dialect against the schema version and the
-/// full compiler commit hash, requiring `manifest["mir_dialect"]` and
-/// `manifest["compiler"]["mir_dialect"]` to agree byte-for-byte.
-fn authenticated_mir_dialect(manifest: &Value) -> Option<&str> {
+/// Authenticate the capture's compiler against the schema version and the
+/// closed compiler table: the full commit selects the entry, and the commit
+/// date and both dialect fields must name that same entry. The dialect selects
+/// the subject's syntax module and the canonical root, so a capture cannot
+/// pair one compiler with another dialect's theorem.
+fn authenticated_compiler(manifest: &Value) -> Option<&'static compilers::SupportedCompiler> {
     if manifest["schema_version"] != 2 {
         return None;
     }
-    let top_dialect = manifest["mir_dialect"].as_str()?;
-    let compiler_dialect = manifest["compiler"]["mir_dialect"].as_str()?;
-    if top_dialect != compiler_dialect {
-        return None;
+    let compiler = compilers::by_commit(manifest["compiler"]["commit"].as_str()?)?;
+    (manifest["compiler"]["commit_date"] == compiler.commit_date
+        && manifest["compiler"]["mir_dialect"] == compiler.mir_dialect
+        && manifest["mir_dialect"] == compiler.mir_dialect)
+        .then_some(compiler)
+}
+
+/// A compiler declared by `--rustc-version` and confirmed from `--rustc`.
+struct DeclaredCompiler {
+    /// Canonical `--rustc`, passed unchanged to the capture driver.
+    rustc: PathBuf,
+    expected: &'static compilers::SupportedCompiler,
+    /// Digest of the probed executable, rechecked when accepting the result.
+    sha256: String,
+}
+
+/// Check the operator's compiler declaration before capture (boundary 1).
+///
+/// `--rustc-version` must name a supported compiler, and `--rustc` must
+/// report exactly its commit and commit date. The capture driver then checks
+/// the same executable against its linked compiler, and `run` checks the
+/// compiler recorded in `capture.json` against this declaration. The probe
+/// runs with a cleared environment, like capture, so ambient variables such
+/// as `RUSTC_OVERRIDE_VERSION_STRING` cannot change the report.
+fn declared_compiler(rustc: &Path, id: &str) -> Result<DeclaredCompiler> {
+    let expected = compilers::resolve(id).ok_or_else(|| {
+        error(
+            "unsupported",
+            "compiler",
+            format!(
+                "unsupported --rustc-version {id:?}; use one of: {}",
+                compilers::supported_list()
+            ),
+        )
+    })?;
+    let rustc = fs::canonicalize(rustc).map_err(|e| {
+        error(
+            "tool_failed",
+            "compiler",
+            format!("cannot resolve --rustc {}: {e}", rustc.display()),
+        )
+    })?;
+    let sha256 = digest(&fs::read(&rustc).map_err(|e| io("compiler", e))?);
+    let output = Command::new(&rustc)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .args(["--version", "--verbose"])
+        .output()
+        .map_err(|e| io("compiler", e))?;
+    if !output.status.success() {
+        return Err(error(
+            "tool_failed",
+            "compiler",
+            format!(
+                "{} --version --verbose failed with {}: {}",
+                rustc.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
     }
-    match (manifest["compiler"]["commit"].as_str(), top_dialect) {
-        (
-            Some("7189d39d9ce936881b8132c6addeaf3e295cd455"),
-            d @ "V2026_10_22_R7189d39d9",
+    let text = String::from_utf8(output.stdout).map_err(|_| {
+        error(
+            "tool_failed",
+            "compiler",
+            format!(
+                "{} --version --verbose printed non-UTF-8 text",
+                rustc.display()
+            ),
         )
-        | (
-            Some("14210df0e27ccd7d9e6a05b8085cbd438e4bbc65"),
-            d @ "V2026_05_31_R14210df0e",
+    })?;
+    let identity = compilers::CompilerIdentity::parse(&text).map_err(|e| {
+        error(
+            "tool_failed",
+            "compiler",
+            format!("{}: {e}", rustc.display()),
         )
-        | (
-            Some("f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1"),
-            d @ "V2026_05_30_Rf8a08b688",
-        ) => Some(d),
-        _ => None,
+    })?;
+    if !identity.is(expected) {
+        return Err(error(
+            "tool_failed",
+            "compiler",
+            format!(
+                "--rustc {} reports commit-hash {} and commit-date {}, but --rustc-version {id} is {} (commit-hash {}, commit-date {})",
+                rustc.display(),
+                identity.commit,
+                identity.commit_date,
+                expected.mir_dialect,
+                expected.commit,
+                expected.commit_date
+            ),
+        ));
+    }
+    Ok(DeclaredCompiler {
+        rustc,
+        expected,
+        sha256,
+    })
+}
+
+/// Return the root of the Rust distribution containing `rustc`.
+///
+/// A distribution keeps its compiler at `<root>/bin/rustc` and its libraries
+/// under `<root>/lib/rustlib`. Inferring that root keeps the declared compiler
+/// and the libraries capture compiles against in one distribution. A compiler
+/// outside that layout, such as a wrapper script, needs an explicit
+/// `--sysroot`. `rustc` must already be canonical.
+fn distribution_sysroot(rustc: &Path) -> Result<PathBuf> {
+    rustc
+        .parent()
+        .filter(|bin| bin.file_name() == Some("bin".as_ref()))
+        .and_then(Path::parent)
+        .filter(|root| {
+            root.join("lib/rustlib").is_dir()
+                && fs::canonicalize(root.join("bin/rustc")).is_ok_and(|path| path == rustc)
+        })
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            error(
+                "tool_failed",
+                "compiler",
+                format!(
+                    "--rustc {} is not bin/rustc of a Rust distribution; pass --sysroot",
+                    rustc.display()
+                ),
+            )
+        })
+}
+
+/// Require the bundled model to contain the authenticated dialect's syntax
+/// module (boundary 2).
+///
+/// `Captured.lean` imports `Trusted.Rustc.<dialect>.MirAst`, and
+/// `Expected.lean` states `Trusted.MirSemantics.<dialect>.*Theorem` over it.
+/// Without the module, this CLI cannot check that dialect at all; refuse it
+/// before staging any Lean source rather than fail inside proof checking.
+fn require_dialect_syntax(bundle: &[(&str, &str)], mir_dialect: &str) -> Result<()> {
+    let syntax = format!("trusted/lean/Trusted/Rustc/{mir_dialect}/MirAst.lean");
+    if bundle.iter().any(|(relative, _)| *relative == syntax) {
+        Ok(())
+    } else {
+        Err(error(
+            "tool_failed",
+            "model",
+            format!(
+                "the bundled model lacks {syntax}; MIR dialect {mir_dialect} cannot be checked"
+            ),
+        ))
+    }
+}
+
+/// Require `Captured.lean` to import exactly the authenticated dialect's
+/// syntax module (boundary 2).
+///
+/// Capture renders a fixed header: `prelude`, then one `import` of
+/// `Trusted.Rustc.<dialect>.MirAst`. Dialect modules may re-export one
+/// another's definitions, so Lean's type checker would accept a subject
+/// rendered for one dialect against another dialect's canonical root. This
+/// comparison keeps the rendered syntax and the root's dialect the same.
+fn require_captured_syntax(captured: &str, mir_dialect: &str) -> Result<()> {
+    let expected = format!("import Trusted.Rustc.{mir_dialect}.MirAst");
+    let imports: Vec<&str> = captured
+        .lines()
+        .filter(|line| line.split_whitespace().next() == Some("import"))
+        .collect();
+    if imports == [expected.as_str()] {
+        Ok(())
+    } else {
+        Err(error(
+            "tool_failed",
+            "capture",
+            format!(
+                "Captured.lean imports {imports:?}, but the capture's compiler has MIR dialect {mir_dialect}"
+            ),
+        ))
     }
 }
 
@@ -704,6 +872,12 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         });
     let capture = fs::canonicalize(capture).map_err(|e| io("capture-tool", e))?;
     let capture_binary_sha256 = digest(&fs::read(&capture).map_err(|e| io("capture-tool", e))?);
+    // Boundary 1, before capture: a compiler declaration must hold for the
+    // `--rustc` executable itself. clap accepts the two options only together.
+    let declared = match (&args.rustc, &args.rustc_version) {
+        (Some(rustc), Some(id)) => Some(declared_compiler(rustc, id)?),
+        _ => None,
+    };
     let capture_dir = work.join("capture");
     // Capture reserves and publishes a new output directory itself; precreating
     // it here would violate its create-only publication contract.
@@ -727,16 +901,22 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         ])
         .arg(&capture_dir)
         .current_dir(&rust_stage);
-    let selected_sysroot = args
-        .sysroot
-        .clone()
-        .or_else(|| installed.as_ref().map(|root| root.join("rust")));
+    // An explicit sysroot wins. A declared compiler otherwise brings its own
+    // distribution's libraries, which an installed bundle need not match.
+    let selected_sysroot = match (&args.sysroot, &declared) {
+        (Some(sysroot), _) => Some(sysroot.clone()),
+        (None, Some(declared)) => Some(distribution_sysroot(&declared.rustc)?),
+        (None, None) => installed.as_ref().map(|root| root.join("rust")),
+    };
     if let Some(sysroot) = &selected_sysroot {
         let sysroot = fs::canonicalize(sysroot).map_err(|e| io("sysroot", e))?;
         // The library search path belongs to the explicitly selected compiler
         // installation, never to a target crate's ambient environment.
         command.env("LD_LIBRARY_PATH", sysroot.join("lib"));
         command.arg("--sysroot").arg(sysroot);
+    }
+    if let Some(declared) = &declared {
+        command.arg("--rustc").arg(&declared.rustc);
     }
     match &request.scope {
         Scope::Crate => {
@@ -789,16 +969,40 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // Capture schema 2 binds unsafe caller requirements to source identities.
     // An old program without that required Body field belongs to another model
     // ABI; reject it before compiling proofs. Request schema 1 is independent.
-    // The top-level and compiler-scoped dialect fields must agree, and the
-    // dialect must be the one pinned to the full compiler commit; a capture
-    // cannot select another dialect's syntax or canonical root.
-    let Some(mir_dialect) = authenticated_mir_dialect(&manifest) else {
+    // The commit, commit date, and both dialect fields must name one supported
+    // compiler; a capture cannot select another dialect's syntax or root.
+    let Some(compiler) = authenticated_compiler(&manifest) else {
         return Err(error(
             "tool_failed",
             "capture",
             "unexpected capture schema or compiler",
         ));
     };
+    let mir_dialect = compiler.mir_dialect;
+    // Boundary 1, after capture: the capture must report the declared compiler
+    // and the very executable checked before capture.
+    if let Some(declared) = &declared
+        && (compiler != declared.expected
+            || manifest["compiler"]["rustc"].as_str() != declared.rustc.to_str())
+    {
+        return Err(error(
+            "tool_failed",
+            "capture",
+            format!(
+                "capture reports compiler {} with rustc {}, but --rustc-version declares {} and --rustc is {}",
+                compiler.mir_dialect,
+                manifest["compiler"]["rustc"],
+                declared.expected.mir_dialect,
+                declared.rustc.display()
+            ),
+        ));
+    }
+    // Boundary 2: the rendered subject must use the same dialect's syntax.
+    let captured_lean = capture_dir.join("Captured.lean");
+    let captured_bytes = fs::read(&captured_lean).map_err(|e| io("capture", e))?;
+    let captured_text =
+        std::str::from_utf8(&captured_bytes).map_err(|e| error("tool_failed", "capture", e))?;
+    require_captured_syntax(captured_text, mir_dialect)?;
     // Authenticate configuration and scope before compiling any authored
     // Lean. A valid theorem about another target or a narrower selection
     // cannot satisfy this request.
@@ -852,6 +1056,9 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     }
     let capture_sha256 = digest(&capture_bytes);
 
+    // Boundary 2: refuse a dialect this CLI's model cannot express before
+    // staging any Lean source.
+    require_dialect_syntax(BUNDLE, mir_dialect)?;
     let bundle = work.join("anneal");
     let mut modules = Vec::new();
     let mut bundled_theory_modules = Vec::new();
@@ -886,10 +1093,10 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         }
     }
     let model_manifest_sha256 = digest(&encoded(&model_identity)?);
-    let captured_lean = capture_dir.join("Captured.lean");
+    // Stage exactly the bytes whose syntax module was checked above.
     modules.push(TargetModule {
         module: "Captured".to_owned(),
-        expected_sha256: digest(&fs::read(&captured_lean).map_err(|e| io("capture", e))?),
+        expected_sha256: digest(&captured_bytes),
         source: captured_lean,
         role: TargetRole::Capture,
     });
@@ -1042,6 +1249,15 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             "capture executable changed during verification",
         ));
     }
+    if let Some(declared) = &declared
+        && digest(&fs::read(&declared.rustc).map_err(|e| io("binding", e))?) != declared.sha256
+    {
+        return Err(error(
+            "tool_failed",
+            "binding",
+            "declared compiler executable changed during verification",
+        ));
+    }
     let status = match request.scope {
         Scope::Crate => "crate_verified",
         Scope::SelectedUnit { .. } => "selected_unit_verified",
@@ -1053,6 +1269,8 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         "schema_version": 1, "status": status, "experimental": true,
         "request_sha256": request_sha256, "capture_sha256": capture_sha256,
         "capture_binary_sha256": capture_binary_sha256,
+        "compiler": manifest["compiler"],
+        "rustc_binary_sha256": declared.as_ref().map(|declared| &declared.sha256),
         "model_manifest_sha256": model_manifest_sha256,
         "specification_manifest_sha256": specification_manifest_sha256,
         "scope": request.scope, "selected": manifest["selected"],
@@ -1393,69 +1611,163 @@ mod tests {
     }
 
     #[test]
-    fn mir_dialect_authentication_requires_matching_schema_commit_and_dialect_fields() {
-        for (commit, dialect) in [
+    fn compiler_authentication_requires_one_entry_for_commit_date_and_dialects() {
+        let fields = |commit: &str, date: &str, top: &str, scoped: &str| {
+            json!({
+                "schema_version": 2,
+                "mir_dialect": top,
+                "compiler": { "commit": commit, "commit_date": date, "mir_dialect": scoped },
+            })
+        };
+        for compiler in compilers::SUPPORTED_COMPILERS {
+            let (commit, date, dialect) =
+                (compiler.commit, compiler.commit_date, compiler.mir_dialect);
+            let valid = fields(commit, date, dialect, dialect);
+            assert_eq!(authenticated_compiler(&valid), Some(compiler));
+
+            let mut wrong_schema = valid.clone();
+            wrong_schema["schema_version"] = json!(1);
+            let mut missing_date = valid.clone();
+            missing_date["compiler"]
+                .as_object_mut()
+                .unwrap()
+                .remove("commit_date");
+            for invalid in [
+                wrong_schema,
+                missing_date,
+                fields(commit, "2026-01-01", dialect, dialect),
+                fields(&commit.to_uppercase(), date, dialect, dialect),
+                fields(&commit[..9], date, dialect, dialect),
+            ] {
+                assert_eq!(authenticated_compiler(&invalid), None, "{invalid}");
+            }
+            for other in compilers::SUPPORTED_COMPILERS {
+                if other == compiler {
+                    continue;
+                }
+                // Either dialect field, or both, naming another compiler's
+                // dialect must reject; so must another compiler's date.
+                for invalid in [
+                    fields(commit, date, other.mir_dialect, dialect),
+                    fields(commit, date, dialect, other.mir_dialect),
+                    fields(commit, date, other.mir_dialect, other.mir_dialect),
+                    fields(commit, other.commit_date, dialect, dialect),
+                ] {
+                    assert_eq!(authenticated_compiler(&invalid), None, "{invalid}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_supported_dialect_has_bundled_syntax_and_canonical_roots() {
+        let semantics = BUNDLE
+            .iter()
+            .find(|(relative, _)| *relative == "trusted/lean/Trusted/MirSemantics.lean")
+            .map(|(_, text)| *text)
+            .expect("bundled MirSemantics");
+        for compiler in compilers::SUPPORTED_COMPILERS {
+            let dialect = compiler.mir_dialect;
+            assert!(require_dialect_syntax(BUNDLE, dialect).is_ok(), "{dialect}");
+            // Expected.lean names these roots inside the dialect namespace.
+            let namespace = format!("\nnamespace {dialect}\n");
+            let start = semantics.find(&namespace).expect(&namespace);
+            let end = semantics[start..]
+                .find(&format!("\nend {dialect}\n"))
+                .expect("end of dialect namespace");
+            let body = &semantics[start..start + end];
+            for root in [
+                "structure Crate where",
+                "def CrateTheorem (c : Crate)",
+                "def UnitTheorem (c : Crate)",
+            ] {
+                assert!(body.contains(root), "{dialect} lacks {root}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dialect_without_bundled_syntax_is_refused() {
+        for compiler in compilers::SUPPORTED_COMPILERS {
+            let dialect = compiler.mir_dialect;
+            let syntax = format!("trusted/lean/Trusted/Rustc/{dialect}/MirAst.lean");
+            let without: Vec<_> = BUNDLE
+                .iter()
+                .copied()
+                .filter(|(relative, _)| *relative != syntax)
+                .collect();
+            assert_eq!(without.len() + 1, BUNDLE.len());
+            let failure = require_dialect_syntax(&without, dialect).unwrap_err();
+            assert_eq!((failure.status, failure.phase), ("tool_failed", "model"));
+            assert!(failure.detail.contains(&syntax), "{}", failure.detail);
+        }
+    }
+
+    #[test]
+    fn captured_subject_must_import_exactly_the_authenticated_syntax() {
+        let header = "-- Copyright 2026 The Fuchsia Authors\n--\n-- those terms.\n\n";
+        let subject = |imports: &str| {
+            format!(
+                "{header}prelude\n{imports}\nnamespace Captured\n\ndef program : X := y\n\nend Captured\n"
+            )
+        };
+        let accepted = subject("import Trusted.Rustc.V2026_05_31_R14210df0e.MirAst\n");
+        assert!(require_captured_syntax(&accepted, "V2026_05_31_R14210df0e").is_ok());
+        for (text, dialect) in [
+            (accepted.clone(), "V2026_10_22_R7189d39d9"),
+            (subject(""), "V2026_05_31_R14210df0e"),
             (
-                "7189d39d9ce936881b8132c6addeaf3e295cd455",
-                "V2026_10_22_R7189d39d9",
-            ),
-            (
-                "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65",
+                subject(
+                    "import Trusted.Rustc.V2026_05_31_R14210df0e.MirAst\n\
+                     import Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst\n",
+                ),
                 "V2026_05_31_R14210df0e",
             ),
             (
-                "f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1",
-                "V2026_05_30_Rf8a08b688",
+                subject(
+                    "import Trusted.Rustc.V2026_05_31_R14210df0e.MirAst\n  \
+                     import Trusted.MirSemantics\n",
+                ),
+                "V2026_05_31_R14210df0e",
             ),
         ] {
-            let valid = json!({
-                "schema_version": 2,
-                "mir_dialect": dialect,
-                "compiler": { "commit": commit, "mir_dialect": dialect },
-            });
-            assert_eq!(authenticated_mir_dialect(&valid), Some(dialect));
+            let failure = require_captured_syntax(&text, dialect).unwrap_err();
+            assert_eq!((failure.status, failure.phase), ("tool_failed", "capture"));
         }
+    }
 
-        // Disagreement between top-level and compiler-scoped mir_dialect must reject.
-        let disagreeing_fields = json!({
-            "schema_version": 2,
-            "mir_dialect": "V2026_10_22_R7189d39d9",
-            "compiler": {
-                "commit": "7189d39d9ce936881b8132c6addeaf3e295cd455",
-                "mir_dialect": "V2026_05_31_R14210df0e",
-            },
-        });
-        assert_eq!(authenticated_mir_dialect(&disagreeing_fields), None);
+    #[cfg(unix)]
+    #[test]
+    fn declared_compilers_bring_their_own_distribution_sysroot() {
+        let root = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(root.path()).unwrap();
+        let distribution = root.join("toolchain");
+        fs::create_dir_all(distribution.join("bin")).unwrap();
+        fs::create_dir_all(distribution.join("lib/rustlib")).unwrap();
+        let rustc = distribution.join("bin/rustc");
+        fs::write(&rustc, b"").unwrap();
+        assert_eq!(
+            distribution_sysroot(&rustc).ok(),
+            Some(distribution.clone())
+        );
 
-        // Missing compiler.mir_dialect must reject (no fallback to top-level mir_dialect).
-        let missing_compiler_dialect = json!({
-            "schema_version": 2,
-            "mir_dialect": "V2026_10_22_R7189d39d9",
-            "compiler": { "commit": "7189d39d9ce936881b8132c6addeaf3e295cd455" },
-        });
-        assert_eq!(authenticated_mir_dialect(&missing_compiler_dialect), None);
-
-        // Cross-pinning commit and dialect from different supported toolchains must reject.
-        let cross_pinned = json!({
-            "schema_version": 2,
-            "mir_dialect": "V2026_10_22_R7189d39d9",
-            "compiler": {
-                "commit": "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65",
-                "mir_dialect": "V2026_10_22_R7189d39d9",
-            },
-        });
-        assert_eq!(authenticated_mir_dialect(&cross_pinned), None);
-
-        // Wrong schema version must reject.
-        let wrong_schema = json!({
-            "schema_version": 1,
-            "mir_dialect": "V2026_10_22_R7189d39d9",
-            "compiler": {
-                "commit": "7189d39d9ce936881b8132c6addeaf3e295cd455",
-                "mir_dialect": "V2026_10_22_R7189d39d9",
-            },
-        });
-        assert_eq!(authenticated_mir_dialect(&wrong_schema), None);
+        // A wrapper elsewhere, or one beside the compiler under another name,
+        // does not identify a distribution.
+        let wrapper = distribution.join("bin/rustc-wrapper");
+        fs::write(&wrapper, b"").unwrap();
+        let outside = root.join("rustc");
+        fs::write(&outside, b"").unwrap();
+        for rustc in [wrapper, outside] {
+            let failure = distribution_sysroot(&rustc).unwrap_err();
+            assert_eq!((failure.status, failure.phase), ("tool_failed", "compiler"));
+            assert!(
+                failure.detail.contains("pass --sysroot"),
+                "{}",
+                failure.detail
+            );
+        }
+        fs::remove_dir(distribution.join("lib/rustlib")).unwrap();
+        assert!(distribution_sysroot(&distribution.join("bin/rustc")).is_err());
     }
 
     #[test]

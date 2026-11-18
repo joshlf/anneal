@@ -8,6 +8,7 @@
 
 //! CLI entrypoint for `cargo-anneal`.
 
+mod compilers;
 mod setup;
 mod verify;
 
@@ -41,12 +42,14 @@ enum Command {
         local_archive: Option<PathBuf>,
     },
     /// Capture a configured compilation and check its authored source proof.
-    Verify(verify::VerifyArgs),
+    // Boxed so the parsed command stays small beside `Setup`
+    // (`clippy::large_enum_variant`).
+    Verify(Box<verify::VerifyArgs>),
 }
 
 enum Action {
     Print(String),
-    Verify(verify::VerifyArgs),
+    Verify(Box<verify::VerifyArgs>),
 }
 
 #[derive(Debug)]
@@ -106,7 +109,7 @@ fn main() -> ExitCode {
             print!("{output}");
             ExitCode::SUCCESS
         }
-        Ok(Action::Verify(args)) => verify::main(args),
+        Ok(Action::Verify(args)) => verify::main(*args),
         Err(Failure::Arguments(error)) => {
             eprint!("{error}");
             ExitCode::from(2)

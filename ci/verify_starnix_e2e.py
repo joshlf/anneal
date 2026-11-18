@@ -38,8 +38,11 @@ def checked_command(command, directory, log_prefix):
 
 
 def verification(arguments, request, artifacts, log_prefix, expected):
+    # Declare the compiler explicitly: the CLI checks `--rustc` against
+    # `--rustc-version` before capture and the capture's compiler after it.
     command = [str(arguments.cli), "verify", "--request", str(request),
                "--capture", str(arguments.capture), "--sysroot", str(arguments.sysroot),
+               "--rustc", str(arguments.rustc), "--rustc-version", arguments.rustc_version,
                "--lean", str(arguments.lean), "--artifacts", str(artifacts)]
     code = checked_command(command, request.parent, log_prefix)
     output = json.loads(log_prefix.with_suffix(".stdout").read_text())
@@ -136,6 +139,11 @@ def run(arguments, work):
                             work / "baseline", "selected_unit_verified")
     if len(baseline["sources"]) != 10 or len(baseline["selected"]) != 1:
         raise RuntimeError("production source/selection inventory changed")
+    # The receipt must report the declared compiler, not merely any supported
+    # one; `--rustc-version` accepts a dialect name or the full commit.
+    compiler = baseline["compiler"]
+    if arguments.rustc_version not in (compiler["mir_dialect"], compiler["commit"]):
+        raise RuntimeError(f"receipt compiler differs from --rustc-version: {compiler}")
     # Positively exercise the same candidate producer used for mutations.
     # Exact byte equality reuses the baseline's successful kernel check and
     # prevents an invalid-Lean producer from satisfying only negative cases.
@@ -150,6 +158,7 @@ def run(arguments, work):
                              "regenerated_witnesses_match": True,
                              "request_sha256": baseline["request_sha256"],
                              "capture_sha256": baseline["capture_sha256"],
+                             "mir_dialect": compiler["mir_dialect"],
                              "timing_ms": baseline["timing_ms"]}}
     # Zero challenges a nontrivial output; masked identity challenges byte
     # reversal while preserving the requested width. Reusing the complete
@@ -218,15 +227,25 @@ def main():
     parser.add_argument(
         "--lean", type=Path,
         default=os.environ.get("ANNEAL_LEAN") or os.environ.get("ANNEAL_MVP_LEAN"))
+    parser.add_argument(
+        "--rustc", type=Path, default=os.environ.get("ANNEAL_RUSTC"),
+        help="Compiler checked against --rustc-version (default: SYSROOT/bin/rustc)")
+    parser.add_argument(
+        "--rustc-version", default=os.environ.get("ANNEAL_RUSTC_VERSION"),
+        help="Declared compiler: a MIR dialect such as V2026_10_22_R7189d39d9 "
+             "or the full commit")
     parser.add_argument("--source-dir", type=Path,
                         help="Existing pinned core/src; otherwise fetch hash-pinned files")
     parser.add_argument("--artifacts-dir", type=Path,
                         help="New directory retaining complete test evidence")
     arguments = parser.parse_args()
-    for name in ["cli", "capture", "sysroot", "lean"]:
+    for name in ["cli", "capture", "sysroot", "lean", "rustc_version"]:
         if getattr(arguments, name) is None:
-            parser.error(f"the following arguments are required: --{name}")
-    for name in ["cli", "capture", "sysroot", "lean", "source_dir"]:
+            option = name.replace("_", "-")
+            parser.error(f"the following arguments are required: --{option}")
+    if arguments.rustc is None:
+        arguments.rustc = Path(arguments.sysroot) / "bin/rustc"
+    for name in ["cli", "capture", "sysroot", "lean", "rustc", "source_dir"]:
         path = getattr(arguments, name)
         if path is not None:
             setattr(arguments, name, Path(path).resolve(strict=True))

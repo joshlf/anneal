@@ -414,6 +414,8 @@ jobs:
             --cli "$ANNEAL_TEST_CARGO_ANNEAL" \
             --capture "$ANNEAL_CAPTURE" \
             --sysroot "$ANNEAL_SYSROOT" \
+            --rustc "$ANNEAL_SYSROOT/bin/rustc" \
+            --rustc-version V2026_10_22_R7189d39d9 \
             --lean "$ANNEAL_LEAN" \
             --artifacts-dir "$ANNEAL_TEST_DIAGNOSTICS/starnix-evidence"
 

@@ -10,7 +10,7 @@
 //! Typed capture does not verify a crate; the host must check the generated
 //! subject against its authored specifications and exact root.
 
-#![feature(cfg_version, normalize_lexically, rustc_private)]
+#![feature(normalize_lexically, rustc_private)]
 
 extern crate rustc_abi;
 extern crate rustc_data_structures;
@@ -22,11 +22,26 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 mod capture;
+mod compilers;
 mod driver;
 mod extract;
 mod ir;
 mod lean;
 mod publication;
+
+// `build.rs` selects exactly one dialect from `compilers::SUPPORTED_COMPILERS`.
+// Code that differs between `rustc_private` revisions or Lean syntax modules
+// is gated on `anneal_mir_dialect` and names every dialect it covers. This
+// guard lists the dialects those gates classify; a new table entry stops the
+// build here until each gate has been reviewed for it.
+#[cfg(not(any(
+    anneal_mir_dialect = "V2026_10_22_R7189d39d9",
+    anneal_mir_dialect = "V2026_05_31_R14210df0e",
+    anneal_mir_dialect = "V2026_05_30_Rf8a08b688",
+)))]
+compile_error!(
+    "build.rs selected no MIR dialect classified by this crate's anneal_mir_dialect gates"
+);
 
 use std::env;
 use std::ffi::OsString;
@@ -64,6 +79,10 @@ pub struct Args {
     /// Override the sysroot resolved from the pinned compiler distribution.
     #[arg(long)]
     sysroot: Option<PathBuf>,
+    /// Compiler executable that must report the linked compiler's commit and
+    /// date; defaults to `bin/rustc` in the session's sysroot.
+    #[arg(long)]
+    rustc: Option<PathBuf>,
     /// Declare an allowed compiler input; repeat for every staged source file.
     /// An explicit allowlist prevents omitted declarations from authorizing
     /// ambient module or include-file reads.
@@ -115,30 +134,85 @@ impl Failure {
     }
 }
 
-/// Check both the linked compiler libraries and the binary in their sysroot.
-/// The full source commit comes from `rustc --version --verbose`; checking it
-/// does not replace authentication of the distribution by the calling host.
-/// `rustc_version_str` reports the "version string for `rustc` itself".
-/// https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_interface/src/util.rs#L688-L691
-fn check_compiler(sysroot: &Path) -> Result<(), Failure> {
-    let Some((pin, _)) =
-        rustc_interface::util::rustc_version_str().and_then(ir::active_pinned_compiler)
-    else {
-        return Err(Failure::tool(
-            "capture was linked against an unexpected rustc revision",
-        ));
-    };
-    let output = Command::new(sysroot.join("bin/rustc"))
+/// Return the linked compiler libraries' version string if it names the commit
+/// that `build.rs` selected.
+///
+/// `rustc_version_str` returns the `CFG_VERSION` compiled into the linked
+/// `rustc_interface`, the "version string for `rustc` itself". Upstream builds
+/// print the nine-digit short commit there, and Fuchsia's builds print the
+/// commit inside their `git_revisions:` description, so the prefix check
+/// accepts both. A driver built or run against another compiler's libraries
+/// reports another commit. This is a consistency check; authenticating the
+/// distribution remains the calling host's responsibility.
+/// https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_interface/src/util.rs#L716-L724
+/// https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_interface/src/util.rs#L683-L691
+pub(crate) fn linked_compiler_version() -> Option<&'static str> {
+    rustc_interface::util::rustc_version_str()
+        .filter(|version| version.contains(&ir::LINKED_COMPILER.commit[..9]))
+}
+
+/// Check that `rustc` is the compiler whose libraries this driver links.
+///
+/// Two observations must agree with the identity that `build.rs` selected:
+/// the linked libraries' version string ([`linked_compiler_version`]), and the
+/// full `commit-hash` and `commit-date` that `rustc --version --verbose`
+/// reports. The second comparison uses the full commit, not its prefix.
+///
+/// `rustc` is the explicit `--rustc` or, without one, `<sysroot>/bin/rustc`:
+/// a distribution may keep its compiler executable outside the sysroot it
+/// compiles against. The probe runs with a cleared environment, so variables
+/// such as `RUSTC_OVERRIDE_VERSION_STRING` cannot change its report. Neither
+/// check replaces authentication of the distribution by the calling host.
+fn check_compiler(rustc: &Path) -> Result<(), Failure> {
+    let linked = &ir::LINKED_COMPILER;
+    if linked_compiler_version().is_none() {
+        return Err(Failure::tool(format!(
+            "capture was linked against compiler libraries that do not report commit {}",
+            &linked.commit[..9]
+        )));
+    }
+    let output = Command::new(rustc)
         .args(["--version", "--verbose"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
         .output()
-        .map_err(Failure::io)?;
-    let text =
-        String::from_utf8(output.stdout).map_err(|error| Failure::tool(error.to_string()))?;
-    let expected = format!("commit-hash: {}", pin.commit);
-    if !output.status.success() || !text.lines().any(|line| line == expected) {
-        return Err(Failure::tool(
-            "sysroot rustc does not match the pinned full compiler commit",
-        ));
+        .map_err(|error| {
+            Failure::tool(format!(
+                "cannot run {} --version --verbose: {error}",
+                rustc.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(Failure::tool(format!(
+            "{} --version --verbose failed with {}",
+            rustc.display(),
+            output.status
+        )));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|_| {
+        Failure::tool(format!(
+            "{} --version --verbose printed non-UTF-8 text",
+            rustc.display()
+        ))
+    })?;
+    let identity = compilers::CompilerIdentity::parse(&text)
+        .map_err(|error| Failure::tool(format!("{}: {error}", rustc.display())))?;
+    if identity.commit != linked.commit || identity.commit_date != linked.commit_date {
+        // Name the probed dialect when it is another supported compiler. Any
+        // other identity cannot run these libraries either.
+        let probed = identity.supported().map_or_else(
+            |_| format!("unsupported {}", compilers::mir_dialect_name(&identity)),
+            |compiler| compiler.mir_dialect.to_owned(),
+        );
+        return Err(Failure::tool(format!(
+            "{} is {probed} (commit-hash {}, commit-date {}), but this capture driver links {} (commit-hash {}, commit-date {})",
+            rustc.display(),
+            identity.commit,
+            identity.commit_date,
+            linked.mir_dialect,
+            linked.commit,
+            linked.commit_date
+        )));
     }
     Ok(())
 }
@@ -166,7 +240,24 @@ fn run(mut args: Args) -> Result<serde_json::Value, Failure> {
     args.cfg.dedup();
     if let Some(sysroot) = &mut args.sysroot {
         *sysroot = sysroot.canonicalize().map_err(Failure::io)?;
-        check_compiler(sysroot)?;
+    }
+    if let Some(rustc) = &mut args.rustc {
+        *rustc = rustc.canonicalize().map_err(|error| {
+            Failure::tool(format!(
+                "cannot resolve --rustc {}: {error}",
+                rustc.display()
+            ))
+        })?;
+    }
+    // Check a compiler named by the arguments before reserving output or
+    // starting rustc. `collect` checks again against the session's effective
+    // sysroot, which also covers the packaged default.
+    if let Some(rustc) = args.rustc.clone().or_else(|| {
+        args.sysroot
+            .as_ref()
+            .map(|sysroot| sysroot.join("bin/rustc"))
+    }) {
+        check_compiler(&rustc)?;
     }
     // Keep compiler side effects outside the public artifact pair. The
     // publication owner cleans up staging on every error and unwind; only its
@@ -176,7 +267,7 @@ fn run(mut args: Args) -> Result<serde_json::Value, Failure> {
     let manifest = capture::run(&args)?;
     let json =
         serde_json::to_vec_pretty(&manifest).map_err(|error| Failure::tool(error.to_string()))?;
-    let lean = lean::render(manifest.mir_dialect, &manifest.program);
+    let lean = lean::render(&manifest.program);
     let destination = publication
         .publish(&json, lean.as_bytes())
         .map_err(Failure::io)?;
@@ -266,4 +357,13 @@ fn main() -> ExitCode {
         args.remove(0);
     }
     driver::run(args)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn linked_libraries_report_the_commit_selected_by_the_build_script() {
+        let version = super::linked_compiler_version().expect("linked compiler version");
+        assert!(version.contains(&super::ir::LINKED_COMPILER.commit[..9]));
+    }
 }

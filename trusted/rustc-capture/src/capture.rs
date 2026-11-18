@@ -252,8 +252,10 @@ fn callable(kind: DefKind) -> bool {
 // inventory rather than demanding a body query from every definition.
 // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_hir/src/def.rs#L99-L205
 //
-// Keep this match exhaustive across all supported pinned compilers (`1.98` and
-// `1.101`): a compiler upgrade must classify each new kind explicitly.
+// Keep this match exhaustive for every supported dialect: `1.98`
+// (`V2026_05_31_R14210df0e`, `V2026_05_30_Rf8a08b688`) and `1.101`
+// (`V2026_10_22_R7189d39d9`). A compiler upgrade must classify each new kind
+// explicitly.
 fn required(kind: DefKind, has_body: bool) -> bool {
     match kind {
         DefKind::Fn
@@ -265,9 +267,12 @@ fn required(kind: DefKind, has_body: bool) -> bool {
         | DefKind::Trait
         | DefKind::Impl { .. }
         | DefKind::GlobalAsm => true,
-        #[cfg(not(version("1.101")))]
+        #[cfg(any(
+            anneal_mir_dialect = "V2026_05_31_R14210df0e",
+            anneal_mir_dialect = "V2026_05_30_Rf8a08b688"
+        ))]
         DefKind::Const { .. } | DefKind::AssocConst { .. } => true,
-        #[cfg(version("1.101"))]
+        #[cfg(anneal_mir_dialect = "V2026_10_22_R7189d39d9")]
         DefKind::Const | DefKind::AssocConst | DefKind::TestBinderConstraints => true,
         DefKind::Mod
         | DefKind::Variant
@@ -288,7 +293,10 @@ fn required(kind: DefKind, has_body: bool) -> bool {
         | DefKind::LifetimeParam
         | DefKind::Closure
         | DefKind::SyntheticCoroutineBody => has_body,
-        #[cfg(not(version("1.101")))]
+        #[cfg(any(
+            anneal_mir_dialect = "V2026_05_31_R14210df0e",
+            anneal_mir_dialect = "V2026_05_30_Rf8a08b688"
+        ))]
         DefKind::InlineConst => has_body,
     }
 }
@@ -452,7 +460,11 @@ fn collect(
         ));
     }
     let sysroot = tcx.sess.opts.sysroot.path().to_path_buf();
-    crate::check_compiler(&sysroot)?;
+    let rustc = args
+        .rustc
+        .clone()
+        .unwrap_or_else(|| sysroot.join("bin/rustc"));
+    crate::check_compiler(&rustc)?;
 
     // `iter_local_def_id` finishes analysis and visits all definitions,
     // including definitions created during enumeration: "Recompute the number of
@@ -627,17 +639,19 @@ fn collect(
         bodies,
     };
     validate_program(&program)?;
-    let (pin, compiler_version) = rustc_interface::util::rustc_version_str()
-        .and_then(ir::active_pinned_compiler)
+    let compiler_version = crate::linked_compiler_version()
         .ok_or_else(|| Failure::tool("capture was linked against an unexpected rustc revision"))?;
+    let linked = &ir::LINKED_COMPILER;
     let roots = args.select.clone();
     Ok(ir::Manifest {
         schema_version: ir::SCHEMA_VERSION,
-        mir_dialect: pin.mir_dialect,
+        mir_dialect: linked.mir_dialect,
         compiler: ir::Compiler {
-            commit: pin.commit,
+            commit: linked.commit,
+            commit_date: linked.commit_date,
             version: compiler_version,
-            mir_dialect: pin.mir_dialect,
+            mir_dialect: linked.mir_dialect,
+            rustc,
             sysroot,
         },
         configuration: ir::Configuration {
