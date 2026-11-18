@@ -1206,6 +1206,119 @@ theorem writeProjectedValue_and_subslice_reborrow_wide_slice_lockstep
         annealWidePtrVal]
       exact ⟨_, rfl, rfl⟩
 
+/-- **Symbolic `ProjectionElem.constantIndex` on wide-slice windows vs. MiniRust `projOk` & slice
+bounds (`readProjectedValue_constantIndex_wide_slice_lockstep_and_saturation`)**:
+1. **`minLen` failure (`len < minLen`)**: `readProjectedValue` on the `len`-element slice window
+   faults `.ub`, AND MiniRust's `projOk decls len (.constantIndex offset minLen fromEnd) = false`.
+2. **Well-formed MIR slice-pattern `ConstantIndex` (`minLen ≤ len`,
+   `(fromEnd = false ∧ offset < minLen) ∨ (fromEnd = true ∧ 1 ≤ offset ∧ offset ≤ minLen)`)**:
+   `readProjectedValue` reads element `idx = if fromEnd then len - offset else offset` from the
+   backing window (`get? elems (rawElemOffset + baseIdx + idx)`), AND MiniRust's slice index
+   bounds guard passes (`decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = false`).
+3. **`DIV-MR-CONSTANT-INDEX-NAT-SUB-SATURATION`** (`fromEnd = true`, `minLen ≤ len`, `0 < len`,
+   `len < offset`): MiniRust's `projOk decls len (.constantIndex offset minLen true) = false`
+   (matching rustc / Miri's rejection of `offset > minLen`), whereas Anneal's `readProjectedValue`
+   (`Places.lean:2398`) computes `Nat.sub len offset = 0` via saturating `Nat` subtraction and
+   silently returns element `0` (`elem0`)! -/
+theorem readProjectedValue_constantIndex_wide_slice_lockstep_and_saturation
+    (locals : List LocalSlot) (decls : List LocalDecl)
+    (len offset minLen baseIdx rawElemOffset : Nat) (fromEnd : Bool)
+    (elems : List MirSemantics.Value)
+    (hInBacking : rawElemOffset + baseIdx + len ≤ elems.length) :
+    let window := takeValues len (dropValues (Nat.add rawElemOffset baseIdx) elems)
+    let idx := if fromEnd then len - offset else offset
+    -- (1) `minLen` failure (`len < minLen`)
+    (len < minLen →
+      readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] = .ub ∧
+      projOk decls len (.constantIndex offset minLen fromEnd) = false) ∧
+    -- (2) Well-formed MIR `ConstantIndex` lockstep
+    (∀ elemVal,
+      minLen ≤ len →
+      ((fromEnd = false ∧ offset < minLen) ∨ (fromEnd = true ∧ 1 ≤ offset ∧ offset ≤ minLen)) →
+      get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] =
+        .ok elemVal ∧
+      decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = false) ∧
+    -- (3) `DIV-MR-CONSTANT-INDEX-NAT-SUB-SATURATION` (`minLen ≤ len < offset`, `0 < len`)
+    (∀ elem0,
+      0 < len →
+      minLen ≤ len →
+      len < offset →
+      get? elems (rawElemOffset + baseIdx) = some elem0 →
+      projOk decls len (.constantIndex offset minLen true) = false ∧
+      readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen true] =
+        .ok elem0) := by
+  intro window idx
+  have hRpv : ∀ (fs : List MirSemantics.Value) (o m : Nat) (fe : Bool),
+      readProjectedValue locals (.aggregate 0 fs) [.constantIndex o m fe] =
+        match Nat.ble m (length fs) with
+        | true =>
+          match get? fs (if fe then Nat.sub (length fs) o else o) with
+          | some elemVal => .ok elemVal
+          | none => .ub
+        | false => .ub := by
+    intro fs o m fe
+    cases fe <;> rfl
+  have hWinLen : length window = len := by
+    change (takeValues len (dropValues (rawElemOffset + baseIdx) elems)).length = len
+    rw [takeValues_eq_take, dropValues_eq_drop, List.length_take, List.length_drop]
+    omega
+  refine ⟨?_, ?_, ?_⟩
+  · intro hLtMin
+    have hBleF : Nat.ble minLen (length window) = false := by
+      rw [hWinLen, Bool.eq_false_iff, Ne, Nat.ble_eq]
+      omega
+    have hDecF : decide (minLen ≤ len) = false := decide_eq_false (by omega)
+    refine ⟨?_, ?_⟩
+    · rw [hRpv, hBleF]
+    · unfold projOk
+      simp only [hDecF, Bool.false_and]
+  · intro elemVal hMinLe hWf hGetElem
+    have hBleT : Nat.ble minLen (length window) = true := by
+      rw [hWinLen, Nat.ble_eq]
+      exact hMinLe
+    have hIdxLt : idx < len := by
+      rcases hWf with ⟨hfe, hoff⟩ | ⟨hfe, h1, hoff⟩ <;> simp only [idx, hfe, ↓reduceIte, Bool.false_eq_true] <;> omega
+    have hMrOk : decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = false :=
+      decide_eq_false (fun h =>
+        h.elim
+          (fun hneg => absurd hneg (Int.not_lt.mpr (Int.natCast_nonneg idx)))
+          (fun hge => Nat.not_lt.mpr (Int.ofNat_le.mp hge) hIdxLt))
+    have hWinGet : get? window idx = some elemVal := by
+      change (takeValues len (dropValues (rawElemOffset + baseIdx) elems))[idx]? = some elemVal
+      rw [takeValues_eq_take, dropValues_eq_drop, List.getElem?_take_of_lt hIdxLt,
+        List.getElem?_drop]
+      exact hGetElem
+    refine ⟨?_, hMrOk⟩
+    rcases hWf with ⟨rfl, _⟩ | ⟨rfl, _, _⟩
+    · simp only [idx, Bool.false_eq_true, ↓reduceIte] at hWinGet
+      rw [hRpv, hBleT]
+      simp only [Bool.false_eq_true, ↓reduceIte, hWinGet]
+    · simp only [idx, ↓reduceIte] at hWinGet
+      have hSubEq : Nat.sub (length window) offset = len - offset := by rw [hWinLen]; rfl
+      rw [hRpv, hBleT]
+      simp only [↓reduceIte, hSubEq, hWinGet]
+  · intro elem0 hPos hMinLe hGt hGet0
+    have hBleT : Nat.ble minLen (length window) = true := by
+      rw [hWinLen, Nat.ble_eq]
+      exact hMinLe
+    have hSub0 : Nat.sub (length window) offset = 0 := by
+      rw [hWinLen]
+      change len - offset = 0
+      omega
+    have hWinGet0 : get? window 0 = some elem0 := by
+      change (takeValues len (dropValues (rawElemOffset + baseIdx) elems))[0]? = some elem0
+      rw [takeValues_eq_take, dropValues_eq_drop, List.getElem?_take_of_lt hPos,
+        List.getElem?_drop, Nat.add_zero]
+      exact hGet0
+    have hDecRangeF : decide (1 ≤ offset ∧ offset ≤ len) = false :=
+      decide_eq_false (by omega)
+    refine ⟨?_, ?_⟩
+    · unfold projOk
+      simp only [↓reduceIte, hDecRangeF, Bool.and_false]
+    · rw [hRpv, hBleT]
+      simp only [↓reduceIte, hSub0, hWinGet0]
+
 /-! ## 5. Concrete Multi-Way Execution Witnesses & Negative/Divergence Canaries -/
 
 /-- `u32` array `[u32; 4]` MIR type and declaration. -/

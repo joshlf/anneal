@@ -2577,6 +2577,170 @@ theorem evalPlaceRead_index_wideSlice_borrowBacked_two_sided_simulation
         EStateM.bind, Pure.pure, EStateM.pure, annealPlaceProjectionHooksWideSlice, get, getThe,
         MonadStateOf.get, EStateM.get, hproj_off]
 
+private theorem wideSlice_u64_sub_eq {a b : Nat} (ha : a < 2 ^ 64) (hb : b ≤ a) :
+    UInt64.ofNat a - UInt64.ofNat b = UInt64.ofNat (a - b) := by
+  have hb64 : b < 2 ^ 64 := Nat.lt_of_le_of_lt hb ha
+  apply UInt64.eq_of_toBitVec_eq
+  apply BitVec.eq_of_toNat_eq
+  simp [UInt64.toBitVec_sub, BitVec.toNat_sub,
+    Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hb64,
+    Nat.mod_eq_of_lt (Nat.lt_of_le_of_lt (Nat.sub_le a b) ha)]
+  omega
+
+/-- **Two-sided symbolic `ConstantIndex` simulation on dereferenced wide slices**:
+Relates Anneal's `readProjectedValue` over the `lenSc.bits`-element wide-slice window
+`takeValues lenSc.bits (dropValues (rawElemOffset + baseIdx) elems)` to vendored
+`Miri.Interpreter.PlaceDynamic.constantIndex` (`PlaceDynamic.lean:105-115`):
+1. **`min_length` failure (`lenSc.bits < minLen`)**: BOTH fault with UB
+   (`.ub` in Anneal and `.error (.undefinedBehavior "constant index minimum length") st`
+   in `PlaceDynamic.constantIndex`).
+2. **Well-formed MIR slice-pattern `ConstantIndex` (`minLen ≤ lenSc.bits` and
+   `(fromEnd = false ∧ offset < minLen) ∨ (fromEnd = true ∧ 1 ≤ offset ∧ offset ≤ minLen)`)**:
+   BOTH resolve the exact same element index `idx = if fromEnd then lenSc.bits - offset else offset`
+   (`idx < lenSc.bits`): Anneal reads `elems[rawElemOffset + baseIdx + idx]?`, and vendored
+   `Miri.Interpreter.PlaceDynamic.constantIndex` delegates directly to
+   `PlaceDynamic.index ... (UInt64.ofNat idx) st`. -/
+theorem placeDynamic_constantIndex_wideSlice_two_sided_simulation
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {locals : List LocalSlot}
+    {lenSc : MirAst.ScalarInt} {mlen : Miri.Memory.ScalarInt}
+    {offset minLen baseIdx rawElemOffset : Nat} {fromEnd : Bool}
+    {elems : List Value}
+    {ptr : Miri.Memory.Pointer (Option AnnealProv)}
+    {elemLay : Miri.ABI.LayoutData} {elemId : Miri.MIR.TyId}
+    (hin_backing : rawElemOffset + baseIdx + lenSc.bits ≤ elems.length)
+    (hlen : ScalarRel lenSc mlen)
+    (hlen_sz : lenSc.sizeBytes = 8)
+    (helemId : elemId < 100)
+    (hoff_u64 : offset < 2 ^ 64)
+    (hmin_u64 : minLen < 2 ^ 64)
+    (st : AnnealStepState) :
+    let window := takeValues lenSc.bits (dropValues (Nat.add rawElemOffset baseIdx) elems)
+    let slicePlace : Miri.Interpreter.RuntimePlace AnnealProv :=
+      ⟨.memory ⟨ptr, .metadata (.fromScalarInt mlen), none⟩,
+       ⟨slicePointeeTyId elemId, unsizedSliceLayoutData elemLay⟩⟩
+    let idx := if fromEnd then lenSc.bits - offset else offset
+    -- (1) `min_length` failure (`lenSc.bits < minLen`): `.ub` in both
+    (lenSc.bits < minLen →
+      readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] = .ub ∧
+      Miri.Interpreter.PlaceDynamic.constantIndex
+        (annealPlaceProjectionHooksWideSlice localDecls layouts) ()
+        slicePlace (UInt64.ofNat offset) (UInt64.ofNat minLen) fromEnd st =
+        .error (.undefinedBehavior "constant index minimum length") st) ∧
+    -- (2) Well-formed MIR `ConstantIndex`: both resolve to `idx`
+    (∀ elemVal,
+      minLen ≤ lenSc.bits →
+      ((fromEnd = false ∧ offset < minLen) ∨ (fromEnd = true ∧ 1 ≤ offset ∧ offset ≤ minLen)) →
+      get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] =
+        .ok elemVal ∧
+      Miri.Interpreter.PlaceDynamic.constantIndex
+        (annealPlaceProjectionHooksWideSlice localDecls layouts) ()
+        slicePlace (UInt64.ofNat offset) (UInt64.ofNat minLen) fromEnd st =
+        Miri.Interpreter.PlaceDynamic.index
+          (annealPlaceProjectionHooksWideSlice localDecls layouts) ()
+          slicePlace (UInt64.ofNat idx) st) := by
+  intro window slicePlace idx
+  have hlen_lt : lenSc.bits < 2 ^ 64 := by
+    have hlt := hlen.canonical
+    rw [hlen_sz] at hlt
+    exact hlt
+  have hu_len : (UInt64.ofNat lenSc.bits).toNat = lenSc.bits := Nat.mod_eq_of_lt hlen_lt
+  have hu_off : (UInt64.ofNat offset).toNat = offset := Nat.mod_eq_of_lt hoff_u64
+  have hu_min : (UInt64.ofNat minLen).toNat = minLen := Nat.mod_eq_of_lt hmin_u64
+  have hsliceOrStr :
+      (slicePointeeTyId elemId == strPointeeTyId ||
+        (2100 ≤ slicePointeeTyId elemId && slicePointeeTyId elemId < 2200)) = true := by
+    unfold slicePointeeTyId strPointeeTyId
+    rw [Bool.or_eq_true]
+    right
+    rw [Bool.and_eq_true, decide_eq_true_eq, decide_eq_true_eq]
+    exact ⟨Nat.le_add_right 2100 elemId, Nat.add_lt_add_left helemId 2100⟩
+  have hlen_eval :=
+    placeDynamic_length_wideSlice_simulation
+      (localDecls := localDecls) (layouts := layouts) (ptr := ptr)
+      (sliceLay := ⟨slicePointeeTyId elemId, unsizedSliceLayoutData elemLay⟩)
+      hlen hlen_sz rfl hsliceOrStr st
+  have hWinLen : length window = lenSc.bits := by
+    change (takeValues lenSc.bits (dropValues (rawElemOffset + baseIdx) elems)).length = lenSc.bits
+    rw [wideSlice_takeValues_eq_take, wideSlice_dropValues_eq_drop, List.length_take, List.length_drop]
+    omega
+  have hRpv : ∀ (fs : List Value) (o m : Nat) (fe : Bool),
+      readProjectedValue locals (.aggregate 0 fs) [.constantIndex o m fe] =
+        match Nat.ble m (length fs) with
+        | true =>
+          match get? fs (if fe then Nat.sub (length fs) o else o) with
+          | some elemVal => .ok elemVal
+          | none => .ub
+        | false => .ub := by
+    intro fs o m fe
+    cases fe <;> rfl
+  constructor
+  · intro hLtMin
+    have hBleF : Nat.ble minLen (length window) = false := by
+      rw [hWinLen, Bool.eq_false_iff, Ne, Nat.ble_eq]
+      omega
+    have hU64Lt : UInt64.ofNat lenSc.bits < UInt64.ofNat minLen := by
+      rw [UInt64.lt_iff_toNat_lt, hu_len, hu_min]
+      exact hLtMin
+    refine ⟨?_, ?_⟩
+    · rw [hRpv, hBleF]
+    · unfold Miri.Interpreter.PlaceDynamic.constantIndex
+      rw [EStateM.bind_eq_ok hlen_eval]
+      simp only [hU64Lt, ↓reduceIte]
+      rfl
+  · intro elemVal hMinLe hWf hGetElem
+    have hBleT : Nat.ble minLen (length window) = true := by
+      rw [hWinLen, Nat.ble_eq]
+      exact hMinLe
+    have hIdxLt : idx < lenSc.bits := by
+      rcases hWf with ⟨hfe, hoff⟩ | ⟨hfe, h1, hoff⟩ <;>
+        simp only [idx, hfe, ↓reduceIte, Bool.false_eq_true] <;> omega
+    have hWinGet : get? window idx = some elemVal := by
+      change (takeValues lenSc.bits (dropValues (rawElemOffset + baseIdx) elems))[idx]? =
+        some elemVal
+      rw [wideSlice_takeValues_eq_take, wideSlice_dropValues_eq_drop,
+        List.getElem?_take_of_lt hIdxLt, List.getElem?_drop]
+      exact hGetElem
+    have hNotLtMin : ¬ (UInt64.ofNat lenSc.bits < UInt64.ofNat minLen) := by
+      rw [UInt64.lt_iff_toNat_lt, hu_len, hu_min]
+      omega
+    refine ⟨?_, ?_⟩
+    · rcases hWf with ⟨rfl, _⟩ | ⟨rfl, _, _⟩
+      · simp only [idx, Bool.false_eq_true, ↓reduceIte] at hWinGet
+        rw [hRpv, hBleT]
+        simp only [Bool.false_eq_true, ↓reduceIte, hWinGet]
+      · simp only [idx, ↓reduceIte] at hWinGet
+        have hSubEq : Nat.sub (length window) offset = lenSc.bits - offset := by
+          rw [hWinLen]; rfl
+        rw [hRpv, hBleT]
+        simp only [↓reduceIte, hSubEq, hWinGet]
+    · unfold Miri.Interpreter.PlaceDynamic.constantIndex
+      rw [EStateM.bind_eq_ok hlen_eval]
+      simp only [hNotLtMin, ↓reduceIte]
+      rcases hWf with ⟨rfl, hoff_lt⟩ | ⟨rfl, h1, hoff_le⟩
+      · have hNotGe : ¬ (UInt64.ofNat offset ≥ UInt64.ofNat minLen) := by
+          rw [GE.ge, UInt64.le_iff_toNat_le, hu_min, hu_off]
+          omega
+        simp only [Bool.false_eq_true, ↓reduceIte, hNotGe, idx, Bind.bind, EStateM.bind,
+          Pure.pure, EStateM.pure]
+      · have hNe0 : (UInt64.ofNat offset == 0) = false := by
+          rw [beq_eq_false_iff_ne]
+          intro heq
+          have h0 : (UInt64.ofNat offset).toNat = (0 : UInt64).toNat := congrArg UInt64.toNat heq
+          rw [hu_off] at h0
+          change offset = 0 at h0
+          omega
+        have hNotGt : ¬ (UInt64.ofNat offset > UInt64.ofNat minLen) := by
+          change ¬ (UInt64.ofNat minLen < UInt64.ofNat offset)
+          rw [UInt64.lt_iff_toNat_lt, hu_min, hu_off]
+          omega
+        have hSubU64 :
+            UInt64.ofNat lenSc.bits - UInt64.ofNat offset = UInt64.ofNat (lenSc.bits - offset) :=
+          wideSlice_u64_sub_eq hlen_lt (Nat.le_trans hoff_le hMinLe)
+        simp only [↓reduceIte, hNe0, decide_eq_false hNotGt, Bool.or_self, Bool.false_eq_true,
+          idx, hSubU64, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure]
+
 /-! ### 2.5 `size_of_val` & `align_of_val` vs. `DynamicLayout.sizeAndAlignFromMeta` & `Intrinsics.eval` -/
 
 /-- Exact symbolic equivalence between Anneal's `evalSliceSizeOfVal` and vendored
@@ -4507,6 +4671,84 @@ theorem w_wideSlice_constantIndex_fromEnd_and_minLength_agrees :
         (mMin, .error (.undefinedBehavior "constant index minimum length")) :=
   ⟨_, _, _,
     rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl),
+    rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl)⟩
+
+/-- Shared thin `&u32` reference type. -/
+def sharedRefU32Ty : Ty :=
+  { kind := .ref .not (.uint .u32), layoutIdx := 0 }
+
+set_option maxHeartbeats 600000 in
+/-- Concrete Witness 9b (**Forward & first-from-end `ConstantIndex` reads on dereferenced wide slices**):
+Kernel-checks both cases left as unproved docstring comments in Witness 9 (`2613d77c`) on `len = 3`
+over `[10, 20, 30, 40]` (kept well within cgroup RAM by `Elab.async false`):
+1. Forward `(*_2)[ConstantIndex 1 2 false]` reads `20_u32` in both `stepMirFn` and `Step.step`.
+2. First-from-end `(*_2)[ConstantIndex 3 3 true]` reads `len - 3 = 0` (`10_u32`) in both. -/
+theorem w_wideSlice_constantIndex_forward_and_firstFromEnd_agrees :
+    let bFwd := wideSliceReborrowBody u32Ty (.use (.copy ⟨2, [.deref, .constantIndex 1 2 false]⟩))
+    let bFirstEnd := wideSliceReborrowBody u32Ty (.use (.copy ⟨2, [.deref, .constantIndex 3 3 true]⟩))
+    ∃ (sFwd sFirstEnd : MachineState) (mFwd mFirstEnd : AnnealStepState),
+      stepMirFn bFwd (wideSlice4LocalInitAnneal sampleAnnealPtr 3 0 sampleAnnealArrMemory) =
+        .step sFwd ∧
+      get? sFwd.frame.locals 0 = some (.init (.scalar ⟨20, 4⟩)) ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bFwd.localDecls bFwd.layouts) ()
+        (wideSlice4LocalInitMiri bFwd u32Ty sampleMiriPtr 3 0 sampleArrU32Machine) =
+        (mFwd, .ok true) ∧
+      miriTopLocal? mFwd 0 = miriU32Local 20 ∧
+      stepMirFn bFirstEnd (wideSlice4LocalInitAnneal sampleAnnealPtr 3 0 sampleAnnealArrMemory) =
+        .step sFirstEnd ∧
+      get? sFirstEnd.frame.locals 0 = some (.init (.scalar ⟨10, 4⟩)) ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bFirstEnd.localDecls bFirstEnd.layouts) ()
+        (wideSlice4LocalInitMiri bFirstEnd u32Ty sampleMiriPtr 3 0 sampleArrU32Machine) =
+        (mFirstEnd, .ok true) ∧
+      miriTopLocal? mFirstEnd 0 = miriU32Local 10 :=
+  ⟨_, _, _, _,
+    rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl),
+    rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl)⟩
+
+set_option maxHeartbeats 600000 in
+/-- Concrete Witness 9c (**Thin element-ref `ConstantIndex` reborrow & `DIV-LM-CONSTANT-INDEX-NAT-SUB-SATURATION`**):
+1. **Thin element-reference reborrow `_0 = &(*_2)[ConstantIndex 1 1 true]` (`_0 : &u32`)**:
+   BOTH `stepMirFn` (`evalSliceFatPtrDerefBorrow` line `16059`, fresh tag `2`) and
+   `Miri.Interpreter.Step.step` (`PlaceDynamic.constantIndex` → byte offset `+ 8`) succeed in lockstep.
+2. **`DIV-LM-CONSTANT-INDEX-NAT-SUB-SATURATION`** (`copy (*_2)[ConstantIndex 4 1 true]` where
+   `offset = 4 > len = 3 ≥ minLen = 1`): Anneal's `readProjectedValue` (`Places.lean:2398`)
+   evaluates `Nat.sub 3 4 = 0` via saturating `Nat` subtraction and silently succeeds with `10_u32`,
+   whereas vendored `Miri.Interpreter.Step.step` (`PlaceDynamic.lean:110`) rejects with
+   `.error (.invalidProgram "invalid from-end constant index")`! (Contrast with reborrow
+   `&(*_2)[ConstantIndex 4 1 true]`, where `evalSliceFatPtrDerefBorrow` at `Places.lean:16065`
+   checks `offset ≤ len` and faults `.fail .ub`.) -/
+theorem w_wideSlice_constantIndex_reborrow_and_malformed_divergence :
+    let bRefElem := wideSliceReborrowBody sharedRefU32Ty (.ref .shared ⟨2, [.deref, .constantIndex 1 1 true]⟩)
+    let bMalRead := wideSliceReborrowBody u32Ty (.use (.copy ⟨2, [.deref, .constantIndex 4 1 true]⟩))
+    let bMalRef := wideSliceReborrowBody sharedRefU32Ty (.ref .shared ⟨2, [.deref, .constantIndex 4 1 true]⟩)
+    let elem2MiriPtr : Miri.Memory.Pointer AnnealProv :=
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr sampleAllocId + 8),
+       .concrete sampleAllocId Miri.Memory.BorTag.one⟩
+    let elem2MiriPtrSc : Miri.Memory.Scalar AnnealProv :=
+      Miri.Memory.Scalar.fromPointer annealTargetDataLayout elem2MiriPtr
+    ∃ (sRefElem sMalRead : MachineState) (mRefElem mMalRead mMalRef : AnnealStepState),
+      stepMirFn bRefElem (wideSlice4LocalInitAnneal sampleAnnealPtr 3 0 sampleAnnealArrMemory) =
+        .step sRefElem ∧
+      get? sRefElem.frame.locals 0 =
+        some (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)) ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bRefElem.localDecls bRefElem.layouts) ()
+        (wideSlice4LocalInitMiri bRefElem sharedRefU32Ty sampleMiriPtr 3 0 sampleArrU32Machine) =
+        (mRefElem, .ok true) ∧
+      miriTopLocal? mRefElem 0 = some (.live (.immediate (.scalar elem2MiriPtrSc))) ∧
+      stepMirFn bMalRead (wideSlice4LocalInitAnneal sampleAnnealPtr 3 0 sampleAnnealArrMemory) =
+        .step sMalRead ∧
+      get? sMalRead.frame.locals 0 = some (.init (.scalar ⟨10, 4⟩)) ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bMalRead.localDecls bMalRead.layouts) ()
+        (wideSlice4LocalInitMiri bMalRead u32Ty sampleMiriPtr 3 0 sampleArrU32Machine) =
+        (mMalRead, .error (.invalidProgram "invalid from-end constant index")) ∧
+      stepMirFn bMalRef (wideSlice4LocalInitAnneal sampleAnnealPtr 3 0 sampleAnnealArrMemory) =
+        .fail .ub ∧
+      Miri.Interpreter.Step.step (annealStepHooksWideSlice bMalRef.localDecls bMalRef.layouts) ()
+        (wideSlice4LocalInitMiri bMalRef sharedRefU32Ty sampleMiriPtr 3 0 sampleArrU32Machine) =
+        (mMalRef, .error (.invalidProgram "invalid from-end constant index")) :=
+  ⟨_, _, _, _, _,
+    rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl),
+    rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl),
     rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl)⟩
 
 end WideSliceWitnesses

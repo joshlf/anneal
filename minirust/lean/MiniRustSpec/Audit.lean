@@ -6187,6 +6187,7 @@ open MiniRustSpec.Correspondence.WideSliceDst
   evalPlaceRead_index_wide_slice_borrowBacked_lockstep
   checkPtr_sliceRef_null_vs_dangling_zero_bytes_lockstep
   writeProjectedValue_and_subslice_reborrow_wide_slice_lockstep
+  readProjectedValue_constantIndex_wide_slice_lockstep_and_saturation
 
 namespace WideSliceDstStatementPins
 
@@ -6529,6 +6530,34 @@ example
     locals mem localDecls idxLocal p len idx szIdx fromIdx toIdx perm isMut elemKind
     entry rootVal newVal containerProj baseIdx rawElemOffset elems hIdxSlot hBorrow hPerm
     hParentPerm hSlot hBacking hOff hInBacking
+
+example
+    (locals : List LocalSlot) (decls : List MirAst.LocalDecl)
+    (len offset minLen baseIdx rawElemOffset : Nat) (fromEnd : Bool)
+    (elems : List MirSemantics.Value)
+    (hInBacking : rawElemOffset + baseIdx + len ≤ elems.length) :
+    let window := takeValues len (dropValues (Nat.add rawElemOffset baseIdx) elems)
+    let idx := if fromEnd then len - offset else offset
+    (len < minLen →
+      readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] = .ub ∧
+      projOk decls len (.constantIndex offset minLen fromEnd) = false) ∧
+    (∀ elemVal,
+      minLen ≤ len →
+      ((fromEnd = false ∧ offset < minLen) ∨ (fromEnd = true ∧ 1 ≤ offset ∧ offset ≤ minLen)) →
+      Trusted.Sequence.get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] =
+        .ok elemVal ∧
+      decide ((Int.ofNat idx) < 0 ∨ (Int.ofNat len) ≤ (Int.ofNat idx)) = false) ∧
+    (∀ elem0,
+      0 < len →
+      minLen ≤ len →
+      len < offset →
+      Trusted.Sequence.get? elems (rawElemOffset + baseIdx) = some elem0 →
+      projOk decls len (.constantIndex offset minLen true) = false ∧
+      readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen true] =
+        .ok elem0) :=
+  readProjectedValue_constantIndex_wide_slice_lockstep_and_saturation
+    locals decls len offset minLen baseIdx rawElemOffset fromEnd elems hInBacking
 
 end WideSliceDstStatementPins
 
