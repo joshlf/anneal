@@ -3148,6 +3148,10 @@ fn reconcile_subject_by_suffix(
     let mut visited_proof = std::collections::BTreeSet::new();
     let mut visited_assump = std::collections::BTreeSet::new();
     let mut visited_sib_specs = std::collections::BTreeSet::new();
+    let mut sibling_local_defs: std::collections::BTreeMap<
+        String,
+        (Vec<String>, Vec<fault_census::LeanToken>),
+    > = std::collections::BTreeMap::new();
 
     while !proof_queue.is_empty() || !assump_queue.is_empty() || !specs_queue.is_empty() {
         while let Some(proof_suf) = proof_queue.pop_front() {
@@ -3277,16 +3281,53 @@ fn reconcile_subject_by_suffix(
                     );
                 }
             };
-            let next_specs = match fault_census::validate_sibling_specs_no_subject_override(
-                &sib_text,
-                &sib_suf,
-                &subject_meta.body.def_path,
-            ) {
-                Ok(ns) => ns,
+            let sib_links = match fault_census::scan_specs_module(&sib_text, &sib_suf) {
+                Ok(sl) => {
+                    if sl
+                        .declared_spec_def_ids
+                        .iter()
+                        .any(|did| did == &subject_meta.body.def_path)
+                    {
+                        return fail_with_cert(
+                            cert_info,
+                            format!(
+                                "imported sibling `Specs.{sib_suf}` declares an `*ItemSpec` override for subject `{}`",
+                                subject_meta.body.def_path
+                            ),
+                        );
+                    }
+                    sl
+                }
                 Err(err) => return fail_with_cert(cert_info, err),
             };
-            for next_s in next_specs {
+            for (k_d, v_d) in sib_links.local_defs {
+                sibling_local_defs.entry(k_d).or_insert(v_d);
+            }
+            for next_s in sib_links.imported_specs_suffixes {
                 specs_queue.push_back(next_s);
+            }
+        }
+    }
+
+    if let Some(ref sl) = specs_links_opt
+        && !sibling_local_defs.is_empty()
+    {
+        let mut combined_defs = sibling_local_defs;
+        for (k_d, v_d) in &sl.local_defs {
+            combined_defs.insert(k_d.clone(), v_d.clone());
+        }
+        for pre_expr in &sl.pre_exprs {
+            if fault_census::is_trivially_false_spec_pre(
+                pre_expr,
+                &combined_defs,
+                &std::collections::BTreeSet::new(),
+            ) {
+                return fail_with_cert(
+                    cert_info,
+                    format!(
+                        "vacuous `False` precondition in `Specs.{suffix}` (via imported sibling `Specs` helper)"
+                    ),
+                );
             }
         }
     }

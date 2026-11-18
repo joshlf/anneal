@@ -1890,7 +1890,7 @@ impl fmt::Display for CensusScanError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum LeanToken {
+pub enum LeanToken {
     LParen,
     RParen,
     LBrace,
@@ -5156,6 +5156,32 @@ pub fn scan_obligations_callee_links(
                 .any(|t| matches!(t, LeanToken::Ident(n) if n == "legacySpec"));
             if is_legacy_spec {
                 links.has_legacy_spec_override = true;
+                let body_tokens = cmd_slice.get(header_end + 1..).unwrap_or(&[]);
+                let legacy_ok = is_item_spec_ty
+                    && matches!(cmd_slice.get(header_end), Some(LeanToken::Ident(w)) if w == "where")
+                    && matches!(
+                        body_tokens,
+                        [
+                            LeanToken::Ident(pre_kw),
+                            LeanToken::ColonEq,
+                            LeanToken::Ident(pre_ref),
+                            LeanToken::Ident(post_kw),
+                            LeanToken::ColonEq,
+                            LeanToken::Ident(post_ref),
+                        ] if pre_kw == "pre"
+                            && post_kw == "post"
+                            && pre_ref.starts_with("Specs.")
+                            && pre_ref.ends_with(".pre")
+                            && post_ref.starts_with("Specs.")
+                            && post_ref.ends_with(".post")
+                            && pre_ref.strip_suffix(".pre") == post_ref.strip_suffix(".post")
+                    );
+                if !legacy_ok {
+                    links.contract_integrity_errors.push(
+                        "malformed or tampered `legacySpec` instance in Obligations module"
+                            .to_string(),
+                    );
+                }
             }
             if let Some((cls, ref opt_did)) = spec_cls_opt {
                 const ALLOWED_OB_SPEC_INSTANCES: &[&str] = &[
@@ -7800,6 +7826,51 @@ pub fn validate_verify_module_certificate(
     inspect_verify_module_certificate(verify_text, subject_suffix).map(|_| ())
 }
 
+const ALLOWED_INIT_OPEN_NAMESPACES: &[&str] = &[
+    "Classical",
+    "Nat",
+    "Int",
+    "List",
+    "BitVec",
+    "Fin",
+    "Option",
+    "Bool",
+    "String",
+    "Array",
+    "ByteArray",
+    "Subtype",
+    "Prod",
+    "PProd",
+    "MProd",
+    "Sum",
+    "PSum",
+    "Sigma",
+    "PSigma",
+    "Char",
+    "UInt8",
+    "UInt16",
+    "UInt32",
+    "UInt64",
+    "USize",
+    "Int8",
+    "Int16",
+    "Int32",
+    "Int64",
+    "ISize",
+    "Float",
+    "Function",
+    "Decidable",
+    "Empty",
+    "PEmpty",
+    "Unit",
+    "PUnit",
+    "ULift",
+    "PLift",
+    "Id",
+    "Except",
+    "Order",
+];
+
 fn check_specs_or_aux_open_command(
     tokens: &[LeanToken],
     start_idx: usize,
@@ -7831,26 +7902,75 @@ fn check_specs_or_aux_open_command(
     };
     let mut k = start_idx + 1;
     let mut count = 0usize;
+    let mut in_hiding = false;
     while k < tokens.len() {
         if is_lean_command_start(&tokens[k]) {
             break;
         }
+        if tokens[k] == LeanToken::LParen {
+            let mut d = 1isize;
+            let mut j = k + 1;
+            while j < tokens.len() && d > 0 {
+                match &tokens[j] {
+                    LeanToken::LParen => d += 1,
+                    LeanToken::RParen => d -= 1,
+                    LeanToken::Comma => {}
+                    LeanToken::Ident(s_j) => {
+                        if matches!(s_j.as_str(), "renaming" | "scoped" | "->" | "→")
+                            || SPECS_RESERVED_DECL_NAMES.contains(&s_j.as_str())
+                        {
+                            return Err(format!(
+                                "disallowed identifier `{s_j}` inside selective `open` in {label}"
+                            ));
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "unsupported token `{other:?}` inside selective `open` in {label}"
+                        ));
+                    }
+                }
+                j += 1;
+            }
+            if d != 0 {
+                return Err(format!("unclosed `(` in `open` command of {label}"));
+            }
+            k = j;
+            continue;
+        }
         let LeanToken::Ident(ns_name) = &tokens[k] else {
             return Err(format!(
-                "unsupported `open` syntax `{:?}` in {label} (selective/renaming `open` is forbidden)",
+                "unsupported `open` syntax `{:?}` in {label}",
                 tokens[k]
             ));
         };
-        if matches!(ns_name.as_str(), "renaming" | "hiding" | "in" | "scoped") {
+        if matches!(ns_name.as_str(), "renaming" | "scoped") {
             return Err(format!("`open ... {ns_name}` is not supported in {label}"));
         }
-        let ok = allowed_roots.iter().any(|r| {
-            if r.ends_with('.') {
-                ns_name.starts_with(r)
-            } else {
-                ns_name == r || ns_name.starts_with(&format!("{r}."))
+        if ns_name == "in" {
+            break;
+        }
+        if ns_name == "hiding" {
+            if count == 0 {
+                return Err(format!("`open hiding` without namespace in {label}"));
             }
-        });
+            in_hiding = true;
+            k += 1;
+            continue;
+        }
+        if in_hiding {
+            k += 1;
+            continue;
+        }
+        let root_seg = ns_name.split_once('.').map_or(ns_name.as_str(), |(r, _)| r);
+        let ok = ALLOWED_INIT_OPEN_NAMESPACES.contains(&root_seg)
+            || allowed_roots.iter().any(|r| {
+                if r.ends_with('.') {
+                    ns_name.starts_with(r)
+                } else {
+                    ns_name == r || ns_name.starts_with(&format!("{r}."))
+                }
+            });
         if !ok {
             return Err(format!("disallowed `open {ns_name}` in {label}"));
         }
@@ -8293,7 +8413,86 @@ fn extract_def_binders_and_is_prop(sig_tokens: &[LeanToken]) -> (Vec<String>, bo
     (params, is_prop)
 }
 
-fn is_trivially_false_spec_pre(
+const SPEC_INHABITED_FORALL_TYPES: &[&str] = &[
+    "Nat",
+    "Int",
+    "Bool",
+    "Unit",
+    "String",
+    "USize",
+    "ISize",
+    "UInt8",
+    "UInt16",
+    "UInt32",
+    "UInt64",
+    "Int8",
+    "Int16",
+    "Int32",
+    "Int64",
+    "Value",
+    "Memory",
+];
+
+fn forall_binders_have_inhabited_types(binder_tokens: &[LeanToken]) -> bool {
+    if binder_tokens.is_empty() {
+        return false;
+    }
+    let check_single_group = |group: &[LeanToken]| -> bool {
+        let Some(colon_pos) = group.iter().position(|t| *t == LeanToken::Colon) else {
+            return false;
+        };
+        if colon_pos == 0 || colon_pos + 2 != group.len() {
+            return false;
+        }
+        let Some(LeanToken::Ident(ty)) = group.get(colon_pos + 1) else {
+            return false;
+        };
+        if !SPEC_INHABITED_FORALL_TYPES.contains(&ty.as_str()) {
+            return false;
+        }
+        group[..colon_pos]
+            .iter()
+            .all(|t| matches!(t, LeanToken::Ident(v) if is_valid_lean_binder_ident(v)))
+    };
+
+    if binder_tokens.first() != Some(&LeanToken::LParen) {
+        return check_single_group(binder_tokens);
+    }
+    let mut k = 0usize;
+    let n = binder_tokens.len();
+    let mut groups = 0usize;
+    while k < n {
+        if binder_tokens[k] != LeanToken::LParen {
+            return false;
+        }
+        let mut d = 1isize;
+        let mut j = k + 1;
+        while j < n && d > 0 {
+            match binder_tokens[j] {
+                LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => d += 1,
+                LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => d -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        if d != 0 || binder_tokens[j - 1] != LeanToken::RParen {
+            return false;
+        }
+        if !check_single_group(&binder_tokens[k + 1..j - 1]) {
+            return false;
+        }
+        groups += 1;
+        k = j;
+    }
+    groups > 0
+}
+
+/// `[adv ep2-A3]` / `[adv ep2-A4]` Detect a syntactically vacuous `False` precondition
+/// (`False`, `fun ... => False`, `∃ ..., False`, `∀ x : Nat, False`, `let ...; False`,
+/// `match ... with | ... => False`, `¬ True`, `Not True`, `0 = 1`, `true = false`, `x ≠ x`,
+/// `True → False`, `True ↔ False`, `False ∨ False`, `And False _`, `And _ False`,
+/// `False ∧ _`, `_ ∧ False`, or a `def`/`abbrev` in `Specs` unfolding to one of these).
+pub fn is_trivially_false_spec_pre(
     tokens_slice: &[LeanToken],
     local_defs: &BTreeMap<String, (Vec<String>, Vec<LeanToken>)>,
     seen: &BTreeSet<String>,
@@ -8317,6 +8516,148 @@ fn is_trivially_false_spec_pre(
             }
         }
         return false;
+    }
+    if matches!(s.first(), Some(LeanToken::Ident(ek)) if ek == "∃" || ek == "exists") {
+        let mut depth = 0isize;
+        for (i, t) in s.iter().enumerate() {
+            match t {
+                LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+                LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                    depth = (depth - 1).max(0);
+                }
+                LeanToken::Comma if depth == 0 => {
+                    return is_trivially_false_spec_pre(&s[i + 1..], local_defs, seen);
+                }
+                _ => {}
+            }
+        }
+        return false;
+    }
+    if matches!(s.first(), Some(LeanToken::Ident(ak)) if ak == "∀" || ak == "forall") {
+        let mut depth = 0isize;
+        for (i, t) in s.iter().enumerate() {
+            match t {
+                LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+                LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                    depth = (depth - 1).max(0);
+                }
+                LeanToken::Comma if depth == 0 => {
+                    if forall_binders_have_inhabited_types(&s[1..i]) {
+                        return is_trivially_false_spec_pre(&s[i + 1..], local_defs, seen);
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        return false;
+    }
+    if matches!(s.first(), Some(LeanToken::Ident(lk)) if lk == "let" || lk == "have") {
+        let mut depth = 0isize;
+        let mut eq_i: Option<usize> = None;
+        let mut sep_i: Option<usize> = None;
+        for (i, t) in s.iter().enumerate().skip(1) {
+            match t {
+                LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+                LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                    depth = (depth - 1).max(0);
+                }
+                _ if depth == 0 => {
+                    if eq_i.is_none() && *t == LeanToken::ColonEq {
+                        eq_i = Some(i);
+                    } else if eq_i.is_some()
+                        && (*t == LeanToken::Semicolon
+                            || matches!(t, LeanToken::Ident(v) if v == "in"))
+                    {
+                        sep_i = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let (Some(eq), Some(sep)) = (eq_i, sep_i)
+            && sep + 1 < s.len()
+        {
+            let mut next_defs = local_defs.clone();
+            if let Some(LeanToken::Ident(let_name)) = s.get(1)
+                && (eq == 2 || (eq > 2 && s.get(2) == Some(&LeanToken::Colon)))
+            {
+                next_defs.insert(let_name.clone(), (Vec::new(), s[eq + 1..sep].to_vec()));
+            }
+            return is_trivially_false_spec_pre(&s[sep + 1..], &next_defs, seen);
+        }
+        return false;
+    }
+    if matches!(s.first(), Some(LeanToken::Ident(mk)) if mk == "match") {
+        let mut depth = 0isize;
+        let mut with_i: Option<usize> = None;
+        for (i, t) in s.iter().enumerate().skip(1) {
+            match t {
+                LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+                LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                    depth = (depth - 1).max(0);
+                }
+                LeanToken::Ident(v) if depth == 0 && v == "with" => {
+                    with_i = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(wi) = with_i else {
+            return false;
+        };
+        if wi + 1 >= s.len() {
+            return false;
+        }
+        let arms_slice = &s[wi + 1..];
+        let mut bar_indices = Vec::new();
+        let mut depth = 0isize;
+        for (i, t) in arms_slice.iter().enumerate() {
+            match t {
+                LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+                LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                    depth = (depth - 1).max(0);
+                }
+                LeanToken::Ident(v) if depth == 0 && v == "|" => {
+                    bar_indices.push(i);
+                }
+                _ => {}
+            }
+        }
+        if bar_indices.first() != Some(&0) {
+            return false;
+        }
+        for (a_idx, &b_start) in bar_indices.iter().enumerate() {
+            let b_end = bar_indices
+                .get(a_idx + 1)
+                .copied()
+                .unwrap_or(arms_slice.len());
+            let arm = &arms_slice[b_start + 1..b_end];
+            let mut arr_i: Option<usize> = None;
+            let mut depth = 0isize;
+            for (i, t) in arm.iter().enumerate() {
+                match t {
+                    LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+                    LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                        depth = (depth - 1).max(0);
+                    }
+                    LeanToken::Ident(v) if depth == 0 && (v == "=>" || v == "↦") => {
+                        arr_i = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let Some(ai) = arr_i else {
+                return false;
+            };
+            if !is_trivially_false_spec_pre(&arm[ai + 1..], local_defs, seen) {
+                return false;
+            }
+        }
+        return true;
     }
     if let [LeanToken::Ident(ident0)] = s {
         if matches!(ident0.as_str(), "False" | "_root_.False" | "Prop.False") {
@@ -8381,7 +8722,7 @@ fn is_trivially_false_spec_pre(
         }
     }
     let mut depth = 0isize;
-    let mut has_binder = false;
+    let mut first_binder_pos: Option<usize> = None;
     let mut iff_positions = Vec::new();
     let mut imp_positions = Vec::new();
     let mut disj_positions = Vec::new();
@@ -8398,28 +8739,29 @@ fn is_trivially_false_spec_pre(
             LeanToken::Ident(v) if depth == 0 => {
                 let vs = v.as_str();
                 if SPEC_PRE_BINDERS_ONLY.contains(&vs) {
-                    has_binder = true;
-                } else if matches!(vs, "↔" | "<->") {
-                    iff_positions.push(idx);
-                } else if matches!(vs, "→" | "->") {
-                    imp_positions.push(idx);
-                } else if matches!(vs, "∨" | "\\/") {
-                    disj_positions.push(idx);
-                } else if matches!(vs, "∧" | "/\\") {
-                    conj_positions.push(idx);
-                } else if matches!(vs, "=" | "==") {
-                    eq_positions.push(idx);
-                } else if matches!(vs, "≠" | "!=") {
-                    ne_positions.push(idx);
-                } else if matches!(vs, "<" | "≤" | "<=" | ">" | "≥" | ">=") {
-                    other_infix = true;
+                    if first_binder_pos.is_none() {
+                        first_binder_pos = Some(idx);
+                    }
+                } else if first_binder_pos.is_none() {
+                    if matches!(vs, "↔" | "<->") {
+                        iff_positions.push(idx);
+                    } else if matches!(vs, "→" | "->") {
+                        imp_positions.push(idx);
+                    } else if matches!(vs, "∨" | "\\/") {
+                        disj_positions.push(idx);
+                    } else if matches!(vs, "∧" | "/\\") {
+                        conj_positions.push(idx);
+                    } else if matches!(vs, "=" | "==") {
+                        eq_positions.push(idx);
+                    } else if matches!(vs, "≠" | "!=") {
+                        ne_positions.push(idx);
+                    } else if matches!(vs, "<" | "≤" | "<=" | ">" | "≥" | ">=") {
+                        other_infix = true;
+                    }
                 }
             }
             _ => {}
         }
-    }
-    if has_binder {
-        return false;
     }
     if iff_positions.len() == 1 && imp_positions.is_empty() {
         let idx = iff_positions[0];
@@ -8447,6 +8789,9 @@ fn is_trivially_false_spec_pre(
     if let Some(&idx) = conj_positions.first() {
         return is_trivially_false_spec_pre(&s[..idx], local_defs, seen)
             || is_trivially_false_spec_pre(&s[idx + 1..], local_defs, seen);
+    }
+    if first_binder_pos.is_some() {
+        return false;
     }
     if eq_positions.len() == 1 && ne_positions.is_empty() && !other_infix {
         let idx = eq_positions[0];
@@ -8500,6 +8845,26 @@ fn is_trivially_false_spec_pre(
     false
 }
 
+const SPEC_FIELD_HEADER_FORBIDDEN_KW: &[&str] = &[
+    "with",
+    "where",
+    "fun",
+    "λ",
+    "let",
+    "have",
+    "mut",
+    "match",
+    "if",
+    "then",
+    "else",
+    "do",
+    "by",
+    "in",
+    "|",
+    "=>",
+    "↦",
+];
+
 fn split_structure_instance_fields(
     body: &[LeanToken],
 ) -> Option<Vec<(String, Vec<LeanToken>, Vec<LeanToken>)>> {
@@ -8531,7 +8896,7 @@ fn split_structure_instance_fields(
     if depth != 0 {
         return None;
     }
-    let header_colon_eq = |k: usize| -> Option<usize> {
+    let header_info = |k: usize| -> Option<(usize, usize)> {
         let LeanToken::Ident(fname) = &body[k] else {
             return None;
         };
@@ -8550,6 +8915,7 @@ fn split_structure_instance_fields(
             if let LeanToken::Ident(b) = &body[m]
                 && is_valid_lean_binder_ident(b)
                 && !SPEC_STRUCTURE_FIELD_NAMES.contains(&b.as_str())
+                && !SPEC_FIELD_HEADER_FORBIDDEN_KW.contains(&b.as_str())
             {
                 m += 1;
                 continue;
@@ -8576,8 +8942,33 @@ fn split_structure_instance_fields(
             }
             break;
         }
+        let binders_end = m;
+        if m < n && body[m] == LeanToken::Colon && depth_at[m] == 0 {
+            let t_start = m + 1;
+            m = t_start;
+            while m < n && !(body[m] == LeanToken::ColonEq && depth_at[m] == 0) {
+                if depth_at[m] == 0 {
+                    if matches!(
+                        body[m],
+                        LeanToken::Comma | LeanToken::Semicolon | LeanToken::Colon
+                    ) {
+                        return None;
+                    }
+                    if let LeanToken::Ident(v) = &body[m]
+                        && (SPEC_FIELD_HEADER_FORBIDDEN_KW.contains(&v.as_str())
+                            || SPEC_STRUCTURE_FIELD_NAMES.contains(&v.as_str()))
+                    {
+                        return None;
+                    }
+                }
+                m += 1;
+            }
+            if m == t_start {
+                return None;
+            }
+        }
         if m < n && body[m] == LeanToken::ColonEq && depth_at[m] == 0 {
-            Some(m)
+            Some((binders_end, m))
         } else {
             None
         }
@@ -8591,7 +8982,7 @@ fn split_structure_instance_fields(
             k += 1;
             continue;
         }
-        let eq = header_colon_eq(k)?;
+        let (binders_end, eq) = header_info(k)?;
         let mut r = eq + 1;
         while r < n {
             // `[adv ep2-B4]`: a depth-0 `,` / `;` separates fields only when a field header (or
@@ -8599,8 +8990,8 @@ fn split_structure_instance_fields(
             // (`fun args mem => ∀ x, P x`, `∃ n, ...`, `let x := e; ...`).
             if depth_at[r] == 0
                 && ((matches!(body[r], LeanToken::Comma | LeanToken::Semicolon)
-                    && (r + 1 == n || header_colon_eq(r + 1).is_some()))
-                    || header_colon_eq(r).is_some())
+                    && (r + 1 == n || header_info(r + 1).is_some()))
+                    || header_info(r).is_some())
             {
                 break;
             }
@@ -8615,7 +9006,7 @@ fn split_structure_instance_fields(
         }
         fields.push((
             fname.clone(),
-            body[k + 1..eq].to_vec(),
+            body[k + 1..binders_end].to_vec(),
             rhs_slice.to_vec(),
         ));
         k = r;
@@ -8623,8 +9014,8 @@ fn split_structure_instance_fields(
     (!fields.is_empty()).then_some(fields)
 }
 
-/// `[adv ep1-A3]` / `[adv ep1-B4]` Callee and reference-MIR links declared in an authored
-/// `anneal/proofs/Specs/<Item>.lean` module.
+/// `[adv ep1-A3]` / `[adv ep1-B4]` / `[adv ep2-A4]` Callee, reference-MIR, and local
+/// definition links declared in an authored `anneal/proofs/Specs/<Item>.lean` module.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpecsModuleLinks {
     /// Distinct `defId` string literals bound on `*ItemSpec "<defId>"` instances in
@@ -8661,6 +9052,10 @@ pub struct SpecsModuleLinks {
     /// `<Ref>` module suffix bound as `specBody := Mir.<Ref>.body` (or via
     /// `refineEquivSpec Mir.<Ref>.body`) on `StatefulEquivItemSpec`.
     pub equiv_spec_body_suffix: Option<String>,
+    /// Local `def`/`abbrev` bindings `(param_names, rhs_tokens)` for cross-module vacuity checks.
+    pub local_defs: BTreeMap<String, (Vec<String>, Vec<LeanToken>)>,
+    /// Precondition token slices (`pre` and `refine*Spec` `extraPre`/`safetyDomain`) for cross-module vacuity checks.
+    pub pre_exprs: Vec<Vec<LeanToken>>,
 }
 
 /// `[adv ep1-A3]` / `[adv ep1-B4]` / `[adv ep2-A3]` Scan an authored
@@ -8835,11 +9230,29 @@ pub fn scan_specs_module(
                     }
                     if kw == "def" || kw == "abbrev" {
                         let mut sig_end = None;
+                        let mut used_where_def = false;
                         let mut s_depth = 0isize;
                         for (s_pos, t) in cmd_slice.iter().enumerate().skip(2) {
-                            if s_depth == 0 && *t == LeanToken::ColonEq {
-                                sig_end = Some(s_pos);
-                                break;
+                            if s_depth == 0 {
+                                if *t == LeanToken::ColonEq {
+                                    sig_end = Some(s_pos);
+                                    break;
+                                }
+                                if matches!(t, LeanToken::Ident(v) if v == "where") {
+                                    sig_end = Some(s_pos);
+                                    used_where_def = true;
+                                    break;
+                                }
+                                if matches!(
+                                    t,
+                                    LeanToken::Ident(v)
+                                        if matches!(
+                                            v.as_str(),
+                                            "|" | "=>" | "↦" | "let" | "have" | "match" | "by" | "do"
+                                        )
+                                ) {
+                                    break;
+                                }
                             }
                             match t {
                                 LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => {
@@ -8858,17 +9271,53 @@ pub fn scan_specs_module(
                         };
                         let sig_tokens = &cmd_slice[2..colon_eq_pos];
                         let rhs_tokens = cmd_slice[colon_eq_pos + 1..].to_vec();
-                        // `[adv ep2-B4]`: a `False`-valued `Prop` helper is only vacuous when a
-                        // precondition uses it; every `pre` / `refine*Spec` precondition resolves
-                        // local helpers through `local_defs`, so unused or postcondition-only
-                        // helpers are not rejected.
-                        let (param_names, _is_prop) = extract_def_binders_and_is_prop(sig_tokens);
+                        // `[adv ep2-B4]` / `[adv ep2-A4]`: a `False`-valued `Prop` helper is only
+                        // vacuous when a precondition uses it, EXCEPT `def pre` itself which is
+                        // the canonical legacy precondition bound by `instance legacySpec`.
+                        let (param_names, is_prop) = extract_def_binders_and_is_prop(sig_tokens);
+                        if used_where_def
+                            && (is_prop
+                                || matches!(
+                                    decl_name.as_str(),
+                                    "pre" | "post" | "envAssumed" | "strictSafetyPre"
+                                ))
+                        {
+                            return Err(format!(
+                                "`{kw} {decl_name}` in Specs.{subject_suffix} must use `:=` instead of `where`"
+                            ));
+                        }
+                        if is_prop
+                            && decl_name == "pre"
+                            && is_trivially_false_spec_pre(
+                                &rhs_tokens,
+                                &local_defs,
+                                &BTreeSet::new(),
+                            )
+                        {
+                            return Err(format!(
+                                "vacuous `False` precondition `{kw} pre` in Specs.{subject_suffix}"
+                            ));
+                        }
+                        if is_prop && decl_name == "pre" {
+                            out.pre_exprs.push(rhs_tokens.clone());
+                        }
+                        let subject_leaf = subject_suffix
+                            .rsplit_once('.')
+                            .map_or(subject_suffix, |(_, l)| l);
                         local_defs.insert(
                             decl_name.clone(),
                             (param_names.clone(), rhs_tokens.clone()),
                         );
                         local_defs.insert(
                             format!("{expected_ns}.{decl_name}"),
+                            (param_names.clone(), rhs_tokens.clone()),
+                        );
+                        local_defs.insert(
+                            format!("{subject_suffix}.{decl_name}"),
+                            (param_names.clone(), rhs_tokens.clone()),
+                        );
+                        local_defs.insert(
+                            format!("{subject_leaf}.{decl_name}"),
                             (param_names, rhs_tokens.clone()),
                         );
                         if decl_name == "envAssumed" {
@@ -9063,6 +9512,7 @@ pub fn scan_specs_module(
                                     ));
                                 };
                                 for &pi in pre_idxs {
+                                    out.pre_exprs.push(args_n[pi].to_vec());
                                     if is_trivially_false_spec_pre(
                                         args_n[pi],
                                         &local_defs,
@@ -9137,6 +9587,7 @@ pub fn scan_specs_module(
                             synth.extend_from_slice(f_rhs);
                             synth
                         };
+                        out.pre_exprs.push(pre_expr.clone());
                         if is_trivially_false_spec_pre(&pre_expr, &local_defs, &BTreeSet::new()) {
                             return Err(format!(
                                 "vacuous `False` precondition in `{cls0}` instance of Specs.{subject_suffix}"
@@ -9240,6 +9691,7 @@ pub fn scan_specs_module(
             "Specs.{subject_suffix} binds `specBody` to `Mir.{ref_suf}.body` without `import Mir.{ref_suf}`"
         ));
     }
+    out.local_defs = local_defs;
     Ok(out)
 }
 
@@ -14732,6 +15184,12 @@ end Mir.Probe.item",
         for b4_bad in [
             b4_base.replace("PRE", "unreachable"),
             b4_base.replace("PRE", "pre args ∧ unreachable"),
+            b4_base.replace("PRE", "False ∧ ∃ n : Nat, args.length = n"),
+            b4_base.replace("PRE", "∃ n : Nat, args.length = n ∧ False"),
+            b4_base.replace("PRE", "∀ x : Nat, 0 = 1"),
+            b4_base.replace("PRE", "let k := args.length; False"),
+            b4_base.replace("PRE", "let p := False; p"),
+            b4_base.replace("PRE", "match args with | [] => False | _ => 0 = 1"),
             b4_base
                 .replace("post := post, }", "post := post, pre := fun _ => False }")
                 .replace("{ pre := fun a => ∀ x : Nat, x = x ∧ pre a, ", "{ ")
@@ -14739,12 +15197,28 @@ end Mir.Probe.item",
             b4_base
                 .replace("{ pre := fun a", "{ Obligations.Demo.caller.defaultSpec with pre := fun a")
                 .replace("PRE", "pre args"),
+            "import Trusted\nnamespace Specs.Demo.caller\ndef pre : List Value → Prop\n  | _ => let x := 0; False\nend Specs.Demo.caller\n".to_string(),
+            "import Trusted\nnamespace Specs.Demo.caller\ndef pre (args : List Value) : Prop := False\ndef post (args : List Value) (ret : Value) : Prop := True\nend Specs.Demo.caller\n".to_string(),
         ] {
             assert!(
                 scan_specs_module(&b4_bad, "Demo.caller").is_err(),
                 "expected vacuous or struct-update `Specs` to fail closed:\n{b4_bad}"
             );
         }
+        assert!(
+            scan_specs_module(
+                "import Trusted\nnamespace Specs.Demo.caller\n\
+                 open Classical\nopen Nat (add_comm)\nopen List hiding nil\nopen Int in\n\
+                 def pre (args : List Value) : Prop := args.length = 1\n\
+                 instance : StatefulItemSpec \"demo::caller\" where\n  \
+                   pre (args : List Value) (mem : Memory) : Prop := pre args ∧ mem = emptyMemory\n  \
+                   post : List Value → Memory → Value → Memory → Prop := fun _ _ _ _ => True\n\
+                 end Specs.Demo.caller\n",
+                "Demo.caller",
+            )
+            .is_ok(),
+            "expected field type ascriptions and standard Init opens to succeed"
+        );
 
         // `[adv ep2-A3]`: `UbExceptionItemSpec` with `strictSafetyPre := fun _ _ => False`
         // (and non-vacuous `pre`) is valid, while `pre := fun _ _ => False` fails closed.

@@ -12659,16 +12659,88 @@ def _extract_def_binders_and_is_prop(
     return params, is_prop
 
 
+_SPEC_INHABITED_FORALL_TYPES: frozenset[str] = frozenset((
+    "Nat",
+    "Int",
+    "Bool",
+    "Unit",
+    "String",
+    "USize",
+    "ISize",
+    "UInt8",
+    "UInt16",
+    "UInt32",
+    "UInt64",
+    "Int8",
+    "Int16",
+    "Int32",
+    "Int64",
+    "Value",
+    "Memory",
+))
+
+
+def _forall_binders_have_inhabited_types(
+    binder_tokens: list[tuple[str, Any]],
+) -> bool:
+    """`[adv ep2-A4]` Return True iff every binder group in `∀ <binders>, <body>` has an
+    explicit `: <InhabitedType>` annotation from `_SPEC_INHABITED_FORALL_TYPES`."""
+    if not binder_tokens:
+        return False
+    binder_re = re.compile(r"[A-Za-z_][A-Za-z0-9_'!?]*")
+
+    def check_single_group(group: list[tuple[str, Any]]) -> bool:
+        colon_pos = next(
+            (i for i, (tk, _) in enumerate(group) if tk == "Colon"),
+            None,
+        )
+        if colon_pos is None or colon_pos == 0 or colon_pos + 2 != len(group):
+            return False
+        if group[colon_pos + 1][0] != "Ident" or (
+            str(group[colon_pos + 1][1]) not in _SPEC_INHABITED_FORALL_TYPES
+        ):
+            return False
+        return all(
+            tk == "Ident" and binder_re.fullmatch(str(v)) is not None
+            for tk, v in group[:colon_pos]
+        )
+
+    if binder_tokens[0][0] != "LParen":
+        return check_single_group(binder_tokens)
+    k = 0
+    n = len(binder_tokens)
+    groups = 0
+    while k < n:
+        if binder_tokens[k][0] != "LParen":
+            return False
+        d = 1
+        j = k + 1
+        while j < n and d > 0:
+            if binder_tokens[j][0] in ("LParen", "LBrace", "LBracket"):
+                d += 1
+            elif binder_tokens[j][0] in ("RParen", "RBrace", "RBracket"):
+                d -= 1
+            j += 1
+        if d != 0 or binder_tokens[j - 1][0] != "RParen":
+            return False
+        if not check_single_group(binder_tokens[k + 1 : j - 1]):
+            return False
+        groups += 1
+        k = j
+    return groups > 0
+
+
 def _is_trivially_false_spec_pre(
     tokens_slice: list[tuple[str, Any]],
     local_defs: dict[str, tuple[list[str], list[tuple[str, Any]]]] | None = None,
     _seen: frozenset[str] = frozenset(),
 ) -> bool:
-    """`[adv ep2-A2]` / `[adv ep2-B3]` / `[adv ep2-A3]` Detect a syntactically vacuous
-    `False` precondition (`False`, `fun ... => False`, `¬ True`, `Not True`, `0 = 1`,
+    """`[adv ep2-A2]` / `[adv ep2-B3]` / `[adv ep2-A3]` / `[adv ep2-A4]` Detect a syntactically
+    vacuous `False` precondition (`False`, `fun ... => False`, `∃ ..., False`, `∀ x : Nat, False`,
+    `let ...; False`, `match ... with | ... => False`, `¬ True`, `Not True`, `0 = 1`,
     `true = false`, `x ≠ x`, `True → False`, `True ↔ False`, `False ∨ False`,
-    `And False _`, `And _ False`, `False ∧ _`, `_ ∧ False`, or a local `def`/`abbrev`
-    in `Specs/<Item>.lean` unfolding to one of these) in `Specs/<Item>.lean`.
+    `And False _`, `And _ False`, `False ∧ _`, `_ ∧ False`, or a `def`/`abbrev`
+    in `Specs` unfolding to one of these).
     """
     s = _strip_enclosing_parens_tokens(tokens_slice)
     if not s:
@@ -12683,6 +12755,94 @@ def _is_trivially_false_spec_pre(
             elif depth == 0 and tk == "Ident" and v in ("=>", "↦"):
                 return _is_trivially_false_spec_pre(s[i + 1 :], local_defs, _seen)
         return False
+    if s[0] in (("Ident", "∃"), ("Ident", "exists")):
+        depth = 0
+        for i, (tk, _v) in enumerate(s):
+            if tk in ("LParen", "LBrace", "LBracket"):
+                depth += 1
+            elif tk in ("RParen", "RBrace", "RBracket"):
+                depth = max(0, depth - 1)
+            elif depth == 0 and tk == "Comma":
+                return _is_trivially_false_spec_pre(s[i + 1 :], local_defs, _seen)
+        return False
+    if s[0] in (("Ident", "∀"), ("Ident", "forall")):
+        depth = 0
+        for i, (tk, _v) in enumerate(s):
+            if tk in ("LParen", "LBrace", "LBracket"):
+                depth += 1
+            elif tk in ("RParen", "RBrace", "RBracket"):
+                depth = max(0, depth - 1)
+            elif depth == 0 and tk == "Comma":
+                if _forall_binders_have_inhabited_types(s[1:i]):
+                    return _is_trivially_false_spec_pre(s[i + 1 :], local_defs, _seen)
+                return False
+        return False
+    if s[0] in (("Ident", "let"), ("Ident", "have")):
+        depth = 0
+        eq_i: int | None = None
+        sep_i: int | None = None
+        for i in range(1, len(s)):
+            tk, v = s[i]
+            if tk in ("LParen", "LBrace", "LBracket"):
+                depth += 1
+            elif tk in ("RParen", "RBrace", "RBracket"):
+                depth = max(0, depth - 1)
+            elif depth == 0:
+                if eq_i is None and tk == "ColonEq":
+                    eq_i = i
+                elif eq_i is not None and (tk == "Semicolon" or (tk, v) == ("Ident", "in")):
+                    sep_i = i
+                    break
+        if eq_i is not None and sep_i is not None and sep_i + 1 < len(s):
+            next_defs = dict(local_defs) if local_defs is not None else {}
+            if s[1][0] == "Ident" and (eq_i == 2 or (eq_i > 2 and s[2][0] == "Colon")):
+                next_defs[str(s[1][1])] = ([], s[eq_i + 1 : sep_i])
+            return _is_trivially_false_spec_pre(s[sep_i + 1 :], next_defs, _seen)
+        return False
+    if s[0] == ("Ident", "match"):
+        depth = 0
+        with_i: int | None = None
+        for i in range(1, len(s)):
+            tk, v = s[i]
+            if tk in ("LParen", "LBrace", "LBracket"):
+                depth += 1
+            elif tk in ("RParen", "RBrace", "RBracket"):
+                depth = max(0, depth - 1)
+            elif depth == 0 and (tk, v) == ("Ident", "with"):
+                with_i = i
+                break
+        if with_i is None or with_i + 1 >= len(s):
+            return False
+        arms_slice = s[with_i + 1 :]
+        bar_indices: list[int] = []
+        depth = 0
+        for i, (tk, v) in enumerate(arms_slice):
+            if tk in ("LParen", "LBrace", "LBracket"):
+                depth += 1
+            elif tk in ("RParen", "RBrace", "RBracket"):
+                depth = max(0, depth - 1)
+            elif depth == 0 and (tk, v) == ("Ident", "|"):
+                bar_indices.append(i)
+        if not bar_indices or bar_indices[0] != 0:
+            return False
+        for a_idx, b_start in enumerate(bar_indices):
+            b_end = bar_indices[a_idx + 1] if a_idx + 1 < len(bar_indices) else len(arms_slice)
+            arm = arms_slice[b_start + 1 : b_end]
+            arr_i: int | None = None
+            depth = 0
+            for i, (tk, v) in enumerate(arm):
+                if tk in ("LParen", "LBrace", "LBracket"):
+                    depth += 1
+                elif tk in ("RParen", "RBrace", "RBracket"):
+                    depth = max(0, depth - 1)
+                elif depth == 0 and tk == "Ident" and v in ("=>", "↦"):
+                    arr_i = i
+                    break
+            if arr_i is None or not _is_trivially_false_spec_pre(
+                arm[arr_i + 1 :], local_defs, _seen
+            ):
+                return False
+        return True
     if len(s) == 1 and s[0][0] == "Ident":
         ident0 = str(s[0][1])
         if ident0 in ("False", "_root_.False", "Prop.False"):
@@ -12738,7 +12898,7 @@ def _is_trivially_false_spec_pre(
             if l_ne and l_ne == r_ne:
                 return True
     depth = 0
-    has_binder = False
+    first_binder_pos: int | None = None
     iff_positions: list[int] = []
     imp_positions: list[int] = []
     disj_positions: list[int] = []
@@ -12754,23 +12914,23 @@ def _is_trivially_false_spec_pre(
         elif tk == "Ident" and depth == 0:
             v_str = str(val)
             if v_str in _SPEC_PRE_BINDERS_ONLY:
-                has_binder = True
-            elif v_str in ("↔", "<->"):
-                iff_positions.append(idx)
-            elif v_str in ("→", "->"):
-                imp_positions.append(idx)
-            elif v_str in ("∨", "\\/"):
-                disj_positions.append(idx)
-            elif v_str in ("∧", "/\\"):
-                conj_positions.append(idx)
-            elif v_str in ("=", "=="):
-                eq_positions.append(idx)
-            elif v_str in ("≠", "!="):
-                ne_positions.append(idx)
-            elif v_str in ("<", "≤", "<=", ">", "≥", ">="):
-                other_infix = True
-    if has_binder:
-        return False
+                if first_binder_pos is None:
+                    first_binder_pos = idx
+            elif first_binder_pos is None:
+                if v_str in ("↔", "<->"):
+                    iff_positions.append(idx)
+                elif v_str in ("→", "->"):
+                    imp_positions.append(idx)
+                elif v_str in ("∨", "\\/"):
+                    disj_positions.append(idx)
+                elif v_str in ("∧", "/\\"):
+                    conj_positions.append(idx)
+                elif v_str in ("=", "=="):
+                    eq_positions.append(idx)
+                elif v_str in ("≠", "!="):
+                    ne_positions.append(idx)
+                elif v_str in ("<", "≤", "<=", ">", "≥", ">="):
+                    other_infix = True
     if len(iff_positions) == 1 and not imp_positions:
         idx = iff_positions[0]
         lhs_i, rhs_i = s[:idx], s[idx + 1 :]
@@ -12800,6 +12960,8 @@ def _is_trivially_false_spec_pre(
         return _is_trivially_false_spec_pre(
             s[:idx], local_defs, _seen
         ) or _is_trivially_false_spec_pre(s[idx + 1 :], local_defs, _seen)
+    if first_binder_pos is not None:
+        return False
     if len(eq_positions) == 1 and not ne_positions and not other_infix:
         idx = eq_positions[0]
         return _are_contradictory_eq_sides(s[:idx], s[idx + 1 :])
@@ -12915,11 +13077,33 @@ _SPECS_RESERVED_DECL_NAMES: frozenset[str] = (
 )
 
 
+_SPEC_FIELD_HEADER_FORBIDDEN_KW: frozenset[str] = frozenset((
+    "with",
+    "where",
+    "fun",
+    "λ",
+    "let",
+    "have",
+    "mut",
+    "match",
+    "if",
+    "then",
+    "else",
+    "do",
+    "by",
+    "in",
+    "|",
+    "=>",
+    "↦",
+))
+
+
 def _split_structure_instance_fields(
     body: list[tuple[str, Any]],
 ) -> list[tuple[str, list[tuple[str, Any]], list[tuple[str, Any]]]] | None:
-    """`[adv ep2-B3]` / `[adv ep2-A3]` Split a `where` / `{ ... }` `*ItemSpec` instance body
-    into `(field, binder_tokens, rhs)` triples, failing closed (`None`) if any token is
+    """`[adv ep2-B3]` / `[adv ep2-A3]` / `[adv ep2-B4]` / `[adv ep2-A4]` Split a `where` /
+    `{ ... }` `*ItemSpec` instance body into `(field, binder_tokens, rhs)` triples, supporting
+    optional `: <Type>` field type ascriptions and failing closed (`None`) if any token is
     unconsumed, if `with` struct-update or nested `where` syntax appears at depth 0, or if
     duplicate/empty fields appear.
     """
@@ -12945,7 +13129,7 @@ def _split_structure_instance_fields(
     if depth != 0:
         return None
 
-    def header_colon_eq(k: int) -> int | None:
+    def header_info(k: int) -> tuple[int, int] | None:
         if (
             depth_at[k] != 0
             or body[k][0] != "Ident"
@@ -12959,6 +13143,7 @@ def _split_structure_instance_fields(
                 body[m][0] == "Ident"
                 and binder_re.fullmatch(str(body[m][1]))
                 and str(body[m][1]) not in _SPEC_STRUCTURE_FIELD_NAMES
+                and str(body[m][1]) not in _SPEC_FIELD_HEADER_FORBIDDEN_KW
             ):
                 m += 1
                 continue
@@ -12971,8 +13156,24 @@ def _split_structure_instance_fields(
                 m = close
                 continue
             break
+        binders_end = m
+        if m < n and body[m][0] == "Colon" and depth_at[m] == 0:
+            t_start = m + 1
+            m = t_start
+            while m < n and not (body[m][0] == "ColonEq" and depth_at[m] == 0):
+                if depth_at[m] == 0:
+                    if body[m][0] in ("Comma", "Semicolon", "Colon"):
+                        return None
+                    if body[m][0] == "Ident" and (
+                        str(body[m][1]) in _SPEC_FIELD_HEADER_FORBIDDEN_KW
+                        or str(body[m][1]) in _SPEC_STRUCTURE_FIELD_NAMES
+                    ):
+                        return None
+                m += 1
+            if m == t_start:
+                return None
         if m < n and body[m][0] == "ColonEq" and depth_at[m] == 0:
-            return m
+            return (binders_end, m)
         return None
 
     fields: list[tuple[str, list[tuple[str, Any]], list[tuple[str, Any]]]] = []
@@ -12982,9 +13183,10 @@ def _split_structure_instance_fields(
         if body[k][0] in ("Comma", "Semicolon") and depth_at[k] == 0:
             k += 1
             continue
-        eq = header_colon_eq(k)
-        if eq is None:
+        hdr = header_info(k)
+        if hdr is None:
             return None
+        binders_end, eq = hdr
         r = eq + 1
         while r < n:
             # `[adv ep2-B4]`: a depth-0 `,` / `;` separates fields only when a field header (or
@@ -12993,9 +13195,9 @@ def _split_structure_instance_fields(
             if depth_at[r] == 0 and (
                 (
                     body[r][0] in ("Comma", "Semicolon")
-                    and (r + 1 == n or header_colon_eq(r + 1) is not None)
+                    and (r + 1 == n or header_info(r + 1) is not None)
                 )
-                or header_colon_eq(r) is not None
+                or header_info(r) is not None
             ):
                 break
             r += 1
@@ -13004,18 +13206,64 @@ def _split_structure_instance_fields(
         if fname in seen_names or not rhs_slice:
             return None
         seen_names.add(fname)
-        fields.append((fname, body[k + 1 : eq], rhs_slice))
+        fields.append((fname, body[k + 1 : binders_end], rhs_slice))
         k = r
     return fields if fields else None
+
+
+_ALLOWED_INIT_OPEN_NAMESPACES: frozenset[str] = frozenset((
+    "Classical",
+    "Nat",
+    "Int",
+    "List",
+    "BitVec",
+    "Fin",
+    "Option",
+    "Bool",
+    "String",
+    "Array",
+    "ByteArray",
+    "Subtype",
+    "Prod",
+    "PProd",
+    "MProd",
+    "Sum",
+    "PSum",
+    "Sigma",
+    "PSigma",
+    "Char",
+    "UInt8",
+    "UInt16",
+    "UInt32",
+    "UInt64",
+    "USize",
+    "Int8",
+    "Int16",
+    "Int32",
+    "Int64",
+    "ISize",
+    "Float",
+    "Function",
+    "Decidable",
+    "Empty",
+    "PEmpty",
+    "Unit",
+    "PUnit",
+    "ULift",
+    "PLift",
+    "Id",
+    "Except",
+    "Order",
+))
 
 
 def _check_specs_or_aux_open_command(
     tokens: list[tuple[str, Any]], start_idx: int, label: str, *, is_aux: bool
 ) -> None:
-    """`[adv ep2-A3]` Validate `open` commands in `Specs`, `Proof`, and `Assumptions`:
-    forbid `open ... renaming`, `open ... hiding`, `open ... in`, `open scoped`, or
-    parenthesized/bracketed identifier lists, and restrict opened namespaces to
-    trusted/workspace module hierarchies."""
+    """`[adv ep2-A3]` / `[adv ep2-A4]` Validate `open` commands in `Specs`, `Proof`, and
+    `Assumptions`: forbid `open ... renaming` and `open ... scoped` (and selective `open`
+    of reserved spec/certificate identifiers), while allowing standard `Init` / workspace
+    namespaces, `open ... hiding`, `open ... in`, and selective `open Ns (a b)`."""
     n = len(tokens)
     k = start_idx + 1
     count = 0
@@ -13024,21 +13272,65 @@ def _check_specs_or_aux_open_command(
         if is_aux
         else ("Trusted", "Anneal", "Std", "Init", "Obligations.", "Specs.", "Mir.")
     )
+    in_hiding = False
     while k < n:
         if _fc_is_lean_command_start(tokens[k]):
             break
+        if tokens[k][0] == "LParen":
+            # Selective `open Ns (id1 id2 ...)`: forbid `renaming`/`scoped` or reserved spec names
+            d = 1
+            j = k + 1
+            while j < n and d > 0:
+                tk_j, v_j = tokens[j]
+                if tk_j == "LParen":
+                    d += 1
+                elif tk_j == "RParen":
+                    d -= 1
+                elif tk_j == "Comma":
+                    pass
+                elif tk_j == "Ident":
+                    s_j = str(v_j)
+                    if s_j in ("renaming", "scoped", "->", "→") or s_j in _SPECS_RESERVED_DECL_NAMES:
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"disallowed identifier `{s_j}` inside selective `open` in {label}",
+                        )
+                else:
+                    raise Failure(
+                        1,
+                        FAULT_COVERAGE_PHASE,
+                        f"unsupported token `{tokens[j]!r}` inside selective `open` in {label}",
+                    )
+                j += 1
+            if d != 0:
+                raise Failure(1, FAULT_COVERAGE_PHASE, f"unclosed `(` in `open` command of {label}")
+            k = j
+            continue
         if tokens[k][0] != "Ident":
             raise Failure(
                 1,
                 FAULT_COVERAGE_PHASE,
-                f"unsupported `open` syntax `{tokens[k]!r}` in {label} (selective/renaming `open` is forbidden)",
+                f"unsupported `open` syntax `{tokens[k]!r}` in {label}",
             )
         ns_name = str(tokens[k][1])
-        if ns_name in ("renaming", "hiding", "in", "scoped"):
+        if ns_name in ("renaming", "scoped"):
             raise Failure(
                 1, FAULT_COVERAGE_PHASE, f"`open ... {ns_name}` is not supported in {label}"
             )
-        if not any(
+        if ns_name == "in":
+            break
+        if ns_name == "hiding":
+            if count == 0:
+                raise Failure(1, FAULT_COVERAGE_PHASE, f"`open hiding` without namespace in {label}")
+            in_hiding = True
+            k += 1
+            continue
+        if in_hiding:
+            k += 1
+            continue
+        root_seg = ns_name.split(".", 1)[0]
+        if root_seg not in _ALLOWED_INIT_OPEN_NAMESPACES and not any(
             ns_name == r or ns_name.startswith(r if r.endswith(".") else r + ".")
             for r in allowed_roots
         ):
@@ -13066,6 +13358,7 @@ def _scan_specs_module(
     ns_closes = 0
     local_env_assumed_def: list[tuple[str, Any]] | None = None
     local_defs: dict[str, tuple[list[str], list[tuple[str, Any]]]] = {}
+    pre_exprs: list[list[tuple[str, Any]]] = []
     declared_spec_def_ids: list[str] = []
     declared_spec_classes: list[str] = []
     has_modular_spec_instance = False
@@ -13215,12 +13508,29 @@ def _scan_specs_module(
                     )
                 if val in ("def", "abbrev"):
                     colon_eq_pos: int | None = None
+                    used_where_def = False
                     s_depth = 0
                     for s_pos in range(2, len(cmd_slice)):
-                        t_s = cmd_slice[s_pos][0]
-                        if s_depth == 0 and t_s == "ColonEq":
-                            colon_eq_pos = s_pos
-                            break
+                        t_s, v_s = cmd_slice[s_pos]
+                        if s_depth == 0:
+                            if t_s == "ColonEq":
+                                colon_eq_pos = s_pos
+                                break
+                            if (t_s, v_s) == ("Ident", "where"):
+                                colon_eq_pos = s_pos
+                                used_where_def = True
+                                break
+                            if t_s == "Ident" and str(v_s) in (
+                                "|",
+                                "=>",
+                                "↦",
+                                "let",
+                                "have",
+                                "match",
+                                "by",
+                                "do",
+                            ):
+                                break
                         if t_s in ("LParen", "LBrace", "LBracket"):
                             s_depth += 1
                         elif t_s in ("RParen", "RBrace", "RBracket"):
@@ -13233,13 +13543,37 @@ def _scan_specs_module(
                         )
                     sig_tokens = cmd_slice[2:colon_eq_pos]
                     rhs_tokens = list(cmd_slice[colon_eq_pos + 1 :])
-                    param_names, _is_prop = _extract_def_binders_and_is_prop(sig_tokens)
-                    # `[adv ep2-B4]`: a `False`-valued `Prop` helper is only vacuous when a
-                    # precondition uses it; every `pre` / `refine*Spec` precondition resolves
-                    # local helpers through `local_defs`, so an unused helper or one used only
-                    # in a postcondition (`post := fun _ _ => ¬ unreachable`) is not rejected.
+                    param_names, is_prop = _extract_def_binders_and_is_prop(sig_tokens)
+                    if used_where_def and (
+                        is_prop
+                        or decl_name in ("pre", "post", "envAssumed", "strictSafetyPre")
+                    ):
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"`{val} {decl_name}` in {label} must use `:=` instead of `where`",
+                        )
+                    # `[adv ep2-B4]` / `[adv ep2-A4]`: a `False`-valued `Prop` helper (such as
+                    # `def unreachable : Prop := False` used in `post := fun _ _ => ¬ unreachable`)
+                    # is only vacuous when a precondition uses it, EXCEPT `def pre` itself which
+                    # is the canonical legacy precondition bound by `instance legacySpec`.
+                    if (
+                        is_prop
+                        and decl_name == "pre"
+                        and _is_trivially_false_spec_pre(rhs_tokens, local_defs)
+                    ):
+                        raise Failure(
+                            1,
+                            FAULT_COVERAGE_PHASE,
+                            f"vacuous `False` precondition `{val} pre` in {label}",
+                        )
+                    if is_prop and decl_name == "pre":
+                        pre_exprs.append(rhs_tokens)
+                    subject_leaf = subject_suffix.rsplit(".", 1)[-1]
                     local_defs[decl_name] = (param_names, rhs_tokens)
                     local_defs[f"{expected_ns}.{decl_name}"] = (param_names, rhs_tokens)
+                    local_defs[f"{subject_suffix}.{decl_name}"] = (param_names, rhs_tokens)
+                    local_defs[f"{subject_leaf}.{decl_name}"] = (param_names, rhs_tokens)
                     if decl_name == "envAssumed":
                         if local_env_assumed_def is not None:
                             raise Failure(
@@ -13389,6 +13723,7 @@ def _scan_specs_module(
                             )
                         )
                         for p_i in pre_indices:
+                            pre_exprs.append(list(r_args[p_i]))
                             if _is_trivially_false_spec_pre(r_args[p_i], local_defs):
                                 raise Failure(
                                     1,
@@ -13452,6 +13787,7 @@ def _scan_specs_module(
                         if f_binders
                         else f_rhs
                     )
+                    pre_exprs.append(list(pre_expr))
                     if _is_trivially_false_spec_pre(pre_expr, local_defs):
                         raise Failure(
                             1,
@@ -13582,6 +13918,8 @@ def _scan_specs_module(
         "referenced_subject_external_contract_idents": referenced_subject_external_contract_idents,
         "has_equiv_spec_instance": has_equiv_spec_instance,
         "equiv_spec_body_suffix": equiv_spec_body_suffix,
+        "local_defs": local_defs,
+        "pre_exprs": pre_exprs,
     }
 
 
@@ -14166,7 +14504,8 @@ def _audit_single_item_receipt(
     specs_scan: dict[str, Any] | None = None
     specs_queue: list[str] = []
     cone_mir_suffixes: list[str] = list(surface["imported_mir_suffixes"])
-    if surface["imports_specs"]:
+    specs_in_cone = surface["imports_specs"] or ob_scan["has_legacy_spec_override"]
+    if specs_in_cone:
         if specs_root is None:
             raise Failure(
                 1,
@@ -14183,6 +14522,12 @@ def _audit_single_item_receipt(
                     FAULT_COVERAGE_PHASE,
                     f"Specs.{suffix} ({specs_path}) declares an `*ItemSpec` instance for `{did}` instead of subject `{subject_body['def_path']}`",
                 )
+        if ob_scan["has_legacy_spec_override"] and "pre" not in specs_scan["local_defs"]:
+            raise Failure(
+                1,
+                FAULT_COVERAGE_PHASE,
+                f"`Obligations.{suffix}` declares `legacySpec`, but `Specs.{suffix}` does not define `pre`",
+            )
         specs_queue.extend(specs_scan["imported_specs_suffixes"])
         cone_mir_suffixes.extend(specs_scan["imported_mir_suffixes"])
     elif specs_root is not None:
@@ -14197,6 +14542,7 @@ def _audit_single_item_receipt(
                         FAULT_COVERAGE_PHASE,
                         f"Specs.{suffix} ({specs_path}) declares an `*ItemSpec` instance for `{did}` instead of subject `{subject_body['def_path']}`",
                     )
+            specs_queue.extend(specs_scan["imported_specs_suffixes"])
             cone_mir_suffixes.extend(specs_scan["imported_mir_suffixes"])
 
     # Walk transitive `Proof.*` / `Assumptions.*` / sibling `Specs.*` import cone.
@@ -14205,6 +14551,7 @@ def _audit_single_item_receipt(
     visited_proof: set[str] = set()
     visited_assump: set[str] = set()
     visited_sib_specs: set[str] = set()
+    sibling_local_defs: dict[str, tuple[list[str], list[tuple[str, Any]]]] = {}
     while proof_queue or assump_queue or specs_queue:
         while proof_queue:
             psuf = proof_queue.pop(0)
@@ -14220,7 +14567,7 @@ def _audit_single_item_receipt(
             ppath = proofs_root / "Proof" / f"{psuf.replace('.', '/')}.lean"
             ptext = _read_regular_text(ppath, f"Proof.{psuf}")
             aux = _validate_auxiliary_module_no_spec_override(
-                ptext, f"Proof.{psuf}", suffix, surface["imports_specs"]
+                ptext, f"Proof.{psuf}", suffix, specs_in_cone
             )
             specs_queue.extend(aux["imported_sibling_specs"])
             proof_queue.extend(aux["imported_proof_suffixes"])
@@ -14250,7 +14597,7 @@ def _audit_single_item_receipt(
             for cpath in cand_paths:
                 atext = _read_regular_text(cpath, f"Assumptions.{asuf}")
                 aux = _validate_auxiliary_module_no_spec_override(
-                    atext, f"Assumptions.{asuf}", suffix, surface["imports_specs"]
+                    atext, f"Assumptions.{asuf}", suffix, specs_in_cone
                 )
                 specs_queue.extend(aux["imported_sibling_specs"])
                 proof_queue.extend(aux["imported_proof_suffixes"])
@@ -14259,7 +14606,7 @@ def _audit_single_item_receipt(
         while specs_queue:
             sib_suf = specs_queue.pop(0)
             if sib_suf == suffix:
-                if not surface["imports_specs"]:
+                if not specs_in_cone:
                     raise Failure(
                         1,
                         FAULT_COVERAGE_PHASE,
@@ -14284,8 +14631,20 @@ def _audit_single_item_receipt(
                     FAULT_COVERAGE_PHASE,
                     f"imported sibling `Specs.{sib_suf}` declares an `*ItemSpec` override for subject `{subject_body['def_path']}`",
                 )
+            for k_d, v_d in sib_scan["local_defs"].items():
+                sibling_local_defs.setdefault(k_d, v_d)
             specs_queue.extend(sib_scan["imported_specs_suffixes"])
             cone_mir_suffixes.extend(sib_scan["imported_mir_suffixes"])
+
+    if specs_scan is not None and sibling_local_defs:
+        combined_defs = {**sibling_local_defs, **specs_scan["local_defs"]}
+        for pre_expr in specs_scan["pre_exprs"]:
+            if _is_trivially_false_spec_pre(pre_expr, combined_defs):
+                raise Failure(
+                    1,
+                    FAULT_COVERAGE_PHASE,
+                    f"vacuous `False` precondition in `Specs.{suffix}` (via imported sibling `Specs` helper)",
+                )
 
     seen_cone_mir: set[str] = set()
     for cone_mir_suf in cone_mir_suffixes:

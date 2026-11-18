@@ -1857,6 +1857,59 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         expect_failure(lambda: runner._scan_specs_module(
             b4_base.replace("{ pre := fun a", "{ Obligations.Demo.item_1.defaultSpec with pre := fun a").replace(
                 "PRE", "pre args"), "Demo.item_1", "Specs.Demo.item_1"), 1, "fault-coverage", "`with` struct updates")
+        # `[adv ep2-A4]`: Field type ascriptions (`pre (a : List Value) : Prop := ...`),
+        # standard `Init` / `open ... in` / selective `open` in `Specs`/`Proof`, and
+        # quantifier / `let` / `match` / pattern-def / cross-module vacuity checks.
+        runner._scan_specs_module(
+            "import Trusted\nnamespace Specs.Demo.item_1\n"
+            "open Classical\nopen Nat (add_comm)\nopen List hiding nil\n"
+            "open Int in\ndef pre (args : List Value) : Prop := args.length = 1\n"
+            "instance : StatefulItemSpec \"demo::item_1\" where\n"
+            "  pre (args : List Value) (mem : Memory) : Prop := pre args ∧ mem = emptyMemory\n"
+            "  post : List Value → Memory → Value → Memory → Prop := fun _ _ _ _ => True\n"
+            "end Specs.Demo.item_1\n",
+            "Demo.item_1",
+            "Specs.Demo.item_1",
+        )
+        for a4_bad_pre in (
+            "False ∧ ∃ n : Nat, args.length = n",
+            "∃ n : Nat, args.length = n ∧ False",
+            "∀ x : Nat, 0 = 1",
+            "let k := args.length; False",
+            "let p := False; p",
+            "match args with | [] => False | _ => 0 = 1",
+        ):
+            expect_failure(
+                lambda: runner._scan_specs_module(b4_base.replace("PRE", a4_bad_pre), "Demo.item_1", "Specs.Demo.item_1"),
+                1,
+                "fault-coverage",
+                "vacuous `False` precondition",
+            )
+        expect_failure(
+            lambda: runner._scan_specs_module(
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "def pre : List Value → Prop\n  | _ => let x := 0; False\n"
+                "end Specs.Demo.item_1\n",
+                "Demo.item_1",
+                "Specs.Demo.item_1",
+            ),
+            1,
+            "fault-coverage",
+            "lacks `:=`",
+        )
+        expect_failure(
+            lambda: runner._scan_specs_module(
+                "import Trusted\nnamespace Specs.Demo.item_1\n"
+                "def pre (args : List Value) : Prop := False\n"
+                "def post (args : List Value) (ret : Value) : Prop := True\n"
+                "end Specs.Demo.item_1\n",
+                "Demo.item_1",
+                "Specs.Demo.item_1",
+            ),
+            1,
+            "fault-coverage",
+            "vacuous `False` precondition",
+        )
 
         shutil.rmtree(ws_dir)
         done("fault-site census, 12-class PropertyRegistry, source pins, 4+2 false-proof mutation probes, and --audit-fault-coverage")
