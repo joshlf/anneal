@@ -32,8 +32,9 @@ WpFaultSoundnessClaim wpFaultProg`), and discharges the Pass 1
 $M_{\text{anneal}}$ non-vacuity and parameter-boundary canary claims covering
 all three outcome poles, every supported Day 1 statement, rvalue, terminator,
 unary and binary operator, and all six integer widths in signed and unsigned
-modes. It also provides fuel-bounded segment cut combinators (`wpStepsOutcome`,
-`wpSteps`, `wpOutcomeState_mono`, `wpOutcomeState_trans`, `wpState_cut`),
+modes. It also provides fuel-bounded segment cut and step combinators
+(`wpStepsOutcome`, `wpSteps`, `wpSteps_step`, `wpState_step`, `wpState_done`,
+`wpOutcomeState_mono`, `wpOutcomeState_trans`, `wpState_cut`),
 single-body execution certificates (`run`, `Executes`, `SafeFrom`,
 `wpState_of_executes`), and block-modular `BlockExec` rules for executions whose
 arguments contain universally quantified values.
@@ -201,6 +202,42 @@ theorem wpState_cut {p : Program} {post : TerminalOut → Prop}
   refine wpOutcomeState_trans h_seg (fun s' h_eq => ?_)
   subst h_eq
   exact h_cont
+
+/-- Advance `wpSteps` across one step `evalStep p 0 s = .step s'`, normalizing
+the successor state to `s'`. -/
+theorem wpSteps_step {p : Program} {steps : Nat} {s s' : State}
+    {onMid : State → Prop} {post : TerminalOut → Prop}
+    (h_step : evalStep p 0 s = .step s')
+    (h_rest : wpSteps p steps s' onMid post) :
+    wpSteps p (steps + 1) s onMid post := by
+  refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩
+  subst hc
+  rw [h_step]
+  exact h_rest
+
+/-- Advance `wpState` across one step `evalStep p 0 s = .step s'`, normalizing
+the successor state to `s'`. -/
+theorem wpState_step {p : Program} {fuel : Nat} {s s' : State}
+    {post : TerminalOut → Prop}
+    (h_step : evalStep p 0 s = .step s')
+    (h_rest : wpState p fuel s' post) :
+    wpState p (fuel + 1) s post := by
+  refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩
+  subst hc
+  rw [h_step]
+  exact h_rest
+
+/-- Discharge `wpState` at a terminal step `evalStep p 0 s = .done out`
+satisfying `post out`. -/
+theorem wpState_done {p : Program} {fuel : Nat} {s : State}
+    {out : TerminalOut} {post : TerminalOut → Prop}
+    (h_done : evalStep p 0 s = .done out)
+    (h_post : post out) :
+    wpState p (fuel + 1) s post := by
+  refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩
+  subst hc
+  rw [h_done]
+  exact h_post
 
 /-- Any state `s₂` reachable from `s₁` preserves `wpOutcomeState` at some
 remaining fuel `fuel'`. -/
@@ -409,22 +446,33 @@ theorem canary_positive_empty_unit_fn : CanaryPositiveEmptyUnitFnClaim := by
   rfl
 
 /-- Control-flow and statement canary (`nop`, `storageLive`, `storageDead`,
-`goto`, and both matched and `otherwise` arms of `switchInt`). -/
+`goto`, and both matched and `otherwise` arms of `switchInt`), also exercising
+`wpOutcomeState_mono`, `wpStepsOutcome_mono`, and `wpState_cut` across the
+`bb0 -> bb1` block boundary. -/
 theorem canary_positive_stmts_and_cf_anneal :
     CanaryPositiveStmtsAndCfAnnealClaim := by
   constructor
-  · apply positiveCanary_of_wp (fuel := 10)
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
-    rfl
+  · apply positiveCanary_of_wp (fuel := 12)
+    refine wpOutcomeState_mono (fuel₁ := 6 + 4) ?_
+      (fun _ h => h) (fun _ h => h) (by decide)
+    refine wpState_cut (steps := 6) (fuel := 4)
+      (s_mid := ⟨[⟨0, 1, 0,
+        [.live none, .live (some (u32Val 10)), .live (some (u32Val 10))]⟩],
+        ⟨[]⟩⟩) ?_ ?_
+    · refine wpStepsOutcome_mono ?_
+        (fun _ h => h) (fun _ h => h) (fun _ h => h)
+      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
+      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
+      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
+      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
+      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
+      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
+      rfl
+    · refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
+      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
+      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
+      refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
+      rfl
   · apply positiveCanary_of_wp (fuel := 10)
     refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
     refine ⟨⟨0, rfl⟩, fun c hc => ?_⟩; subst hc
@@ -1149,18 +1197,10 @@ theorem wpState_of_executes {body : Body} {start : State} {value : Val}
     ∃ fuel, wpState (bodyProg body) fuel start
       (fun out => out = .returned ⟨value, ⟨[]⟩⟩) := by
   induction h_exec with
-  | @ret s₀ val h_done =>
-    refine ⟨1, ⟨0, rfl⟩, fun c hc => ?_⟩
-    subst hc
-    unfold step at h_done
-    rw [h_done]
-  | @next s₀ s₁ val h_step _ ih =>
+  | @ret _ _ h_done => exact ⟨1, wpState_done h_done rfl⟩
+  | @next _ _ _ h_step _ ih =>
     let ⟨fuel, h_wp⟩ := ih
-    refine ⟨fuel + 1, ⟨0, rfl⟩, fun c hc => ?_⟩
-    subst hc
-    unfold step at h_step
-    rw [h_step]
-    exact h_wp
+    exact ⟨fuel + 1, wpState_step h_step h_wp⟩
 
 /-- Reconstruct a list spine from its constructors so closing
 `forceList? xs = some ys` by `rfl` normalizes `xs` to a flat `::` list. -/
@@ -1497,32 +1537,78 @@ theorem bitVec_eq_of_toNat_eq {n : Nat} {a b : BitVec n}
     | ofFin fb =>
       exact congrArg BitVec.ofFin (Fin.eq_of_val_eq h)
 
-theorem truncateBits_i64_idem (x : BitVec 128) :
-    truncateBits .i64 (truncateBits .i64 x) = truncateBits .i64 x := by
-  let b : BitVec 64 := bvExtractLsb 63 0 x
+theorem bvExtractLsb_bvZeroExtend_self {k : Nat}
+    (h_le : Nat.pow 2 k ≤ Nat.pow 2 128)
+    (b : BitVec k) :
+    BitVec.ofNat k (bvZeroExtend 128 b).toNat = b := by
+  apply bitVec_eq_of_toNat_eq
   have hb : (bvZeroExtend 128 b).toNat = b.toNat :=
-    Nat.mod_eq_of_lt (Nat.lt_of_lt_of_le b.isLt (by decide))
-  have hb64 : BitVec.ofNat 64 (bvZeroExtend 128 b).toNat = b := by
-    apply bitVec_eq_of_toNat_eq
-    change Nat.mod (bvZeroExtend 128 b).toNat (Nat.pow 2 64) = b.toNat
-    rw [hb]
-    exact Nat.mod_eq_of_lt b.isLt
-  change bvZeroExtend 128 (BitVec.ofNat 64 (bvZeroExtend 128 b).toNat) =
-    bvZeroExtend 128 b
-  rw [hb64]
+    Nat.mod_eq_of_lt (Nat.lt_of_lt_of_le b.isLt h_le)
+  change Nat.mod (bvZeroExtend 128 b).toNat (Nat.pow 2 k) = b.toNat
+  rw [hb]
+  exact Nat.mod_eq_of_lt b.isLt
+
+theorem truncateBits_idem (w : IntWidth) (x : BitVec 128) :
+    truncateBits w (truncateBits w x) = truncateBits w x := by
+  cases w
+  · change bvZeroExtend 128 (BitVec.ofNat 8 (bvZeroExtend 128 (bvExtractLsb 7 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
+  · change bvZeroExtend 128 (BitVec.ofNat 16 (bvZeroExtend 128 (bvExtractLsb 15 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
+  · change bvZeroExtend 128 (BitVec.ofNat 32 (bvZeroExtend 128 (bvExtractLsb 31 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
+  · change bvZeroExtend 128 (BitVec.ofNat 64 (bvZeroExtend 128 (bvExtractLsb 63 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
+  · change bvZeroExtend 128 (BitVec.ofNat 128 (bvZeroExtend 128 (bvExtractLsb 127 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
+  · change bvZeroExtend 128 (BitVec.ofNat 64 (bvZeroExtend 128 (bvExtractLsb 63 0 x)).toNat) = _; rw [bvExtractLsb_bvZeroExtend_self (by decide)]; rfl
+
+theorem mirTy_beq_int_self (w : IntWidth) (s : Bool) :
+    MirTy.beq (.int w s) (.int w s) = true := by
+  cases w <;> cases s <;> rfl
+
+theorem checkVal_int_truncateBits (w : IntWidth) (s : Bool) (x : BitVec 128) :
+    checkVal (.scalar ⟨w, s, truncateBits w x⟩) (.int w s) = true := by
+  have h_eq : (truncateBits w (truncateBits w x) == truncateBits w x) = true := by
+    rw [truncateBits_idem w x]; exact beq_self_eq_true (truncateBits w x)
+  change (match if (truncateBits w (truncateBits w x) == truncateBits w x)
+      then some (.int w s) else none with
+    | some vTy => MirTy.beq vTy (.int w s) | none => false) = true
+  rw [h_eq]; exact mirTy_beq_int_self w s
+
+theorem truncateBits_i64_idem (x : BitVec 128) :
+    truncateBits .i64 (truncateBits .i64 x) = truncateBits .i64 x :=
+  truncateBits_idem .i64 x
 
 theorem checkVal_u64_truncateBits (x : BitVec 128) :
     checkVal (.scalar ⟨.i64, false, truncateBits .i64 x⟩) (.int .i64 false) =
-      true := by
-  unfold checkVal Val.ty? ScalarVal.wf
-  dsimp only
-  have h_eq :
-      (truncateBits .i64 (truncateBits .i64 x) == truncateBits .i64 x) =
-      true := by
-    rw [truncateBits_i64_idem]
-    exact beq_self_eq_true (truncateBits .i64 x)
-  rw [h_eq]
-  rfl
+      true :=
+  checkVal_int_truncateBits .i64 false x
+
+/-- Non-vacuity canary exercising `BlockExec` (`executes_of_blockExec`,
+`blockExec_nop`, `blockExec_storageLive`, `blockExec_storageDead`,
+`blockExec_cons`, `blockExec_nil_goto`, `blockExec_nil_step`,
+`blockExec_nil_ret`) bridged through `wpState_of_executes` into
+`positiveCanary_of_wp`. -/
+theorem canary_blockExec_wpState_of_executes :
+    PositiveCanaryClaim progStmtsAndCf { args := [u32Val 99] } (u32Val 200) := by
+  let body : Body :=
+    match progStmtsAndCf.bodies with
+    | b :: _ => b
+    | [] => { argumentCount := 0, locals := [], basicBlocks := [] }
+  have h_exec :
+      Executes body
+        (mkState 0 0 [.live none, .live (some (u32Val 99)), .dead])
+        (u32Val 200) := by
+    apply executes_of_blockExec; rfl; rfl; rfl; rfl
+    apply blockExec_nop
+    apply blockExec_storageLive; rfl; rfl; rfl
+    apply blockExec_storageDead; rfl; rfl
+    apply blockExec_storageLive; rfl; rfl; rfl
+    apply blockExec_cons; rfl
+    apply blockExec_nil_goto; rfl; rfl; rfl
+    apply blockExec_nil_step; rfl; rfl; rfl
+    apply blockExec_cons; rfl
+    apply blockExec_storageDead; rfl; rfl
+    apply blockExec_nil_ret; rfl
+  let ⟨fuel, h_wp⟩ := wpState_of_executes h_exec
+  apply positiveCanary_of_wp (fuel := fuel)
+  exact h_wp
 
 noncomputable def retagDefId (d : DefId) (s : State) : State :=
   match s.frames with
@@ -2007,5 +2093,103 @@ theorem not_behavior_of_no_done {p : Program} {defId : DefId} {body : Body}
       injection h_eval with h_out
       subst h_out
       exact h_no_done s h_reach h_st
+
+/-- Symbolic single-branch step rule for `evalSwitchBranches` when `discrBits`
+is already in canonical truncated form (`truncateBits w discrBits =
+discrBits`). -/
+theorem evalSwitchBranches_cons {w : IntWidth} {discrBits caseBits : BitVec 128}
+    {otherwise target : BasicBlockId} {rest : List (BitVec 128 × BasicBlockId)}
+    {caseCanon : BitVec 128}
+    (h_discr : truncateBits w discrBits = discrBits)
+    (h_case : (truncateBits w caseBits != caseBits) = false)
+    (h_canon : truncateBits w caseBits = caseCanon) :
+    evalSwitchBranches w discrBits otherwise ((caseBits, target) :: rest) =
+      if (discrBits == caseCanon) then .ok target
+      else evalSwitchBranches w discrBits otherwise rest := by
+  dsimp only [evalSwitchBranches]
+  rw [h_case, h_discr, h_canon]
+  rfl
+
+/-- Symbolic `evalStep` rule for a `TerminatorKind.switchInt` on a scalar
+discriminant `Val.scalar ⟨w, s, discrBits⟩`: evaluates `evalPrimitiveOperand`,
+dispatches `evalSwitchBranches`, and avoids unfolding `BitVec 128` comparisons
+over symbolic `discrBits`. -/
+theorem evalStep_switchInt_scalar {p : Program} {c : Choice} {b i : Nat}
+    {L L₁ : List LocalSlot} {body : Body} {bb : BasicBlock}
+    {discr : Operand} {targets : SwitchTargets}
+    {w : IntWidth} {s : Bool} {discrBits : BitVec 128}
+    (h_body : Trusted.MirSemantics.getElem? p.bodies 0 = some body)
+    (h_bb : Trusted.MirSemantics.getElem? body.basicBlocks b = some bb)
+    (h_none : Trusted.MirSemantics.getElem? bb.statements i = none)
+    (h_end : Nat.beq i bb.statements.length = true)
+    (h_term : bb.terminator = .switchInt discr targets)
+    (h_op : evalPrimitiveOperand body.locals L discr =
+      .ok (.scalar ⟨w, s, discrBits⟩, L₁)) :
+    evalStep p c (mkState b i L) =
+      match evalSwitchBranches w discrBits targets.otherwise targets.branches with
+      | .error k => .fault k
+      | .ok target => .step (mkState target 0 L₁) := by
+  dsimp only [evalStep, mkState]; rw [h_body]; dsimp only; rw [h_bb]; dsimp only
+  rw [h_none]; dsimp only; rw [h_end]; dsimp only [evalTerminator, jumpToBlock]
+  rw [h_term]; dsimp only; rw [h_op]; rfl
+
+/-- Symbolic multi-block canary exercising `wpState_cut`, `wpSteps_step`,
+`wpState_step`, and `wpState_done` across `bb0 -> bb1` on `progStmtsAndCf` over
+a universally quantified `u32` input (`checkVal_int_truncateBits`,
+`evalStatement_assign`, `evalStep_switchInt_scalar`, and
+`evalSwitchBranches_cons`). -/
+theorem canary_symbolic_stmts_and_cf_wpState_cut (x : BitVec 128) :
+    let v : Val := .scalar ⟨.i32, false, truncateBits .i32 x⟩
+    let expected : Val :=
+      if (truncateBits .i32 x == BitVec.ofNat 128 10)
+      then u32Val 100 else u32Val 200
+    PositiveCanaryClaim progStmtsAndCf { args := [v] } expected := by
+  dsimp only
+  let v : Val := .scalar ⟨.i32, false, truncateBits .i32 x⟩
+  let body : Body := match progStmtsAndCf.bodies with
+    | b :: _ => b | [] => { argumentCount := 0, locals := [], basicBlocks := [] }
+  have h_chk : checkVal v u32Ty = true := checkVal_int_truncateBits .i32 false x
+  have h_init : initState progStmtsAndCf { args := [v] } =
+      .ok (mkState 0 0 [.live none, .live (some v), .dead]) := by
+    change (if !(checkVal v u32Ty && true) then Except.error FaultKind.unsupported
+      else Except.ok (mkState 0 0 [.live none, .live (some v), .dead])) =
+      Except.ok (mkState 0 0 [.live none, .live (some v), .dead])
+    rw [h_chk]; rfl
+  apply positiveCanary_of_wp (fuel := 6 + 4); unfold wpProg; rw [h_init]
+  refine wpState_cut (steps := 6) (fuel := 4)
+    (s_mid := mkState 1 0 [.live none, .live (some v), .live (some v)]) ?_ ?_
+  · apply wpSteps_step (s' := mkState 0 1 [.live none, .live (some v), .dead]) rfl
+    apply wpSteps_step (s' := mkState 0 2 [.live none, .live (some v), .live none]) rfl
+    apply wpSteps_step (s' := mkState 0 3 [.live none, .live (some v), .dead]) rfl
+    apply wpSteps_step (s' := mkState 0 4 [.live none, .live (some v), .live none]) rfl
+    refine wpSteps_step
+      (s' := mkState 0 5 [.live none, .live (some v), .live (some v)]) ?_ ?_
+    · change evalStatement body ⟨0, 0, 4, [.live none, .live (some v), .live none]⟩
+          ⟨[]⟩ (.assign ⟨2, []⟩ (.use (.copy ⟨1, []⟩))) = _
+      apply evalStatement_assign; rfl; rfl; rfl; rfl; rfl; exact h_chk; rfl; rfl
+    · apply wpSteps_step
+        (s' := mkState 1 0 [.live none, .live (some v), .live (some v)]) rfl; rfl
+  · have h_sw : evalStep progStmtsAndCf 0
+        (mkState 1 0 [.live none, .live (some v), .live (some v)]) =
+        match evalSwitchBranches .i32 (truncateBits .i32 x) 3
+            [(BitVec.ofNat 128 10, 2)] with
+        | .error k => .fault k
+        | .ok target =>
+          .step (mkState target 0 [.live none, .live (some v), .live none]) := by
+      apply evalStep_switchInt_scalar (targets := ⟨[(BitVec.ofNat 128 10, 2)], 3⟩)
+      rfl; rfl; rfl; rfl; rfl; rfl
+    rw [evalSwitchBranches_cons (caseBits := BitVec.ofNat 128 10)
+      (caseCanon := BitVec.ofNat 128 10) (truncateBits_idem .i32 x) rfl rfl] at h_sw
+    revert h_sw; cases (truncateBits .i32 x == BitVec.ofNat 128 10)
+    · intro h_sw
+      apply wpState_step (s' := mkState 3 0 [.live none, .live (some v), .live none]) h_sw
+      apply wpState_step (s' := mkState 3 1 [.live (some (u32Val 200)), .live (some v), .live none]) rfl
+      apply wpState_step (s' := mkState 3 2 [.live (some (u32Val 200)), .live (some v), .dead]) rfl
+      exact wpState_done (out := .returned ⟨u32Val 200, ⟨[]⟩⟩) rfl rfl
+    · intro h_sw
+      apply wpState_step (s' := mkState 2 0 [.live none, .live (some v), .live none]) h_sw
+      apply wpState_step (s' := mkState 2 1 [.live (some (u32Val 100)), .live (some v), .live none]) rfl
+      apply wpState_step (s' := mkState 2 2 [.live (some (u32Val 100)), .live (some v), .dead]) rfl
+      exact wpState_done (out := .returned ⟨u32Val 100, ⟨[]⟩⟩) rfl rfl
 
 end Anneal.MirWp
