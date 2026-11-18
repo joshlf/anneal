@@ -69,7 +69,8 @@ Headline results:
   `evalFloatToIntSaturating_of_ge_maxValue` / `evalFloatToIntSaturating_of_le_minValue`
   (finite truncation saturation), `evalFloatToIntSaturating_of_in_range` (exact in-range
   truncation), `evalFloatToIntSaturating_finite_eq` (complete finite-case trichotomy),
-  `evalIntToFloatRoundTiesToEven_zero` (`0 : iN/uN ↦ +0.0`), and
+  `evalIntToFloatRoundTiesToEven_zero` (`0 : iN/uN ↦ +0.0`),
+  `intValueOfBits_{unsigned_eq_mod,signed_min,signed_neg_one}`, and
   `evalFloatToFloatRoundTiesToEven_{zeroBits,infBits}`.
 
 Every theorem is kernel-checked and depends only on `propext` / `Quot.sound` (no
@@ -3431,6 +3432,42 @@ theorem evalIntToFloatRoundTiesToEven_zero (signed : Bool) (w : Nat) (dst : Ieee
   rw [hiv]
   rfl
 
+/-- Unsigned `intValueOfBits` is the canonical residue modulo `2 ^ w`. -/
+theorem intValueOfBits_unsigned_eq_mod (w bits : Nat) :
+    intValueOfBits false w bits = ((bits % 2 ^ w : Nat) : Int) := by
+  unfold intValueOfBits
+  dsimp only
+  rw [if_neg' (fun ⟨h, _⟩ => Bool.noConfusion h)]
+
+/-- Signed `intValueOfBits` at the sign bit `2 ^ (w - 1)` (`0 < w`) is `-2 ^ (w - 1)` (`iN::MIN`). -/
+theorem intValueOfBits_signed_min (w : Nat) (hw : 0 < w) :
+    intValueOfBits true w (2 ^ (w - 1)) = -((2 ^ (w - 1) : Nat) : Int) := by
+  have hlt : 2 ^ (w - 1) < 2 ^ w := two_pow_lt_two_pow (by omega)
+  have hpow : 2 ^ w = 2 * 2 ^ (w - 1) := by
+    have h1 : w = (w - 1) + 1 := by omega
+    conv => lhs; rw [h1]
+    rw [Nat.pow_succ, Nat.mul_comm]
+  unfold intValueOfBits
+  dsimp only
+  rw [if_pos' ⟨rfl, by rw [Nat.mod_eq_of_lt hlt]; exact Nat.le_refl _⟩]
+  rw [Nat.mod_eq_of_lt hlt, hpow]
+  omega
+
+/-- Signed `intValueOfBits` at all-ones `2 ^ w - 1` (`0 < w`) is `-1`. -/
+theorem intValueOfBits_signed_neg_one (w : Nat) (hw : 0 < w) :
+    intValueOfBits true w (2 ^ w - 1) = -1 := by
+  have hp1 : 1 ≤ 2 ^ (w - 1) := Nat.one_le_two_pow
+  have hpow : 2 ^ w = 2 * 2 ^ (w - 1) := by
+    have h1 : w = (w - 1) + 1 := by omega
+    conv => lhs; rw [h1]
+    rw [Nat.pow_succ, Nat.mul_comm]
+  have hlt : 2 ^ w - 1 < 2 ^ w := by omega
+  unfold intValueOfBits
+  dsimp only
+  rw [if_pos' ⟨rfl, by rw [Nat.mod_eq_of_lt hlt]; omega⟩]
+  rw [Nat.mod_eq_of_lt hlt]
+  omega
+
 end MiriBridge
 
 /-! ## §5. Axiom guards
@@ -4012,6 +4049,24 @@ info: 'Anneal.Mir.IeeeFloatCast.evalIntToFloatRoundTiesToEven_zero' depends on a
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms evalIntToFloatRoundTiesToEven_zero
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_unsigned_eq_mod' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms intValueOfBits_unsigned_eq_mod
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_signed_min' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms intValueOfBits_signed_min
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_signed_neg_one' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms intValueOfBits_signed_neg_one
 
 end AxiomGuards
 
