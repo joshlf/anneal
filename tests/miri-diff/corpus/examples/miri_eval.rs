@@ -240,6 +240,15 @@ fn main() {
             print_u32(ub_copy_nonoverlapping_partial_overlap_array())
         }
 
+        // Category 10: Multi-element `copy_nonoverlapping` through whole-array pointer
+        // casts and raw-pointer reads of uninitialized struct padding
+        "pass_copy_nonoverlapping_multi_elem_array_pair" => {
+            print_u32(pass_copy_nonoverlapping_multi_elem_array_pair())
+        }
+        "ub_raw_ptr_read_uninit_struct_padding_kani5183" => {
+            print_u8(ub_raw_ptr_read_uninit_struct_padding_kani5183())
+        }
+
         other => {
             eprintln!("unknown test: {other}");
             std::process::exit(2);

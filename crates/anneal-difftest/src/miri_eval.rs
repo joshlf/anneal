@@ -8541,7 +8541,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         );
     }
 
-    /// Probes for the 8-family semantic-mutant self-check, keyed by probe id (a
+    /// Probes for the 9-family semantic-mutant self-check, keyed by probe id (a
     /// mutant id, or the `probe["id"]` of a variant that needs its own program).
     /// Each exercises one check of Anneal's semantics on which the live engine
     /// agrees with Miri, so a mutant of the semantics that omits or perturbs that
@@ -8550,12 +8550,16 @@ pub fn parameterized_after(x: u32) -> u32 { x }
     /// the inline `exact_div` remainder and signed-overflow guards, the
     /// `ctlz_nonzero` zero guard, and an `FnEntry`-protected call whose callee
     /// writes the protected place through a raw alias) are killed by a mutant that
-    /// returns normally (`missed_ub` / `panic_vs_return`), and the probes on which
+    /// returns normally (`missed_ub` / `panic_vs_return`), the probes on which
     /// Miri returns normally (`Operand::Move` of a non-`Copy` wrapper under a
     /// `Reserved` child reborrow, and a caller write after an `FnEntry`-protected
     /// call returns) are killed by a mutant that faults spuriously
-    /// (`false_positive_ub`). `scripts/run_diff_test_campaign.py` embeds
-    /// byte-identical sources in `SEEDED_SEMANTIC_MUTANTS` (checked by
+    /// (`false_positive_ub`), and the multi-element `copy_nonoverlapping` probe
+    /// (both `u32` elements of a `[u32; 2]` copied through whole-array pointer
+    /// casts, returning `22 ^ 99 = 117`) is killed by a mutant that copies only
+    /// the first element and returns `22` (`wrong_value`).
+    /// `scripts/run_diff_test_campaign.py` embeds byte-identical sources in
+    /// `SEEDED_SEMANTIC_MUTANTS` (checked by
     /// `scripts/test_run_diff_test_campaign.py`).
     ///
     /// `provenance_frag` overwrites all 8 bytes of the stored pointer `p` with the
@@ -8566,7 +8570,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
     /// address and that this address reads `x`'s value `7` once it has provenance,
     /// so a mutant that accepts the provenance-free pointer returns `7`
     /// (`missed_ub`) instead of trapping.
-    const SEMANTIC_MUTANT_PROBES: [(&str, &str); 11] = [
+    const SEMANTIC_MUTANT_PROBES: [(&str, &str); 12] = [
         (
             "bool_valid_range",
             r#"pub fn probe_bool_valid_range() -> u32 {
@@ -8691,6 +8695,18 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
 }
 "#,
         ),
+        (
+            "subplace_multi_elem_copy_truncation",
+            r#"pub fn probe_subplace_multi_elem_copy_truncation() -> u32 {
+    let src: [u32; 2] = [22u32, 99u32];
+    let mut dst: [u32; 2] = [0u32, 0u32];
+    unsafe {
+        copy_nonoverlapping((&raw const src) as *const u32, (&raw mut dst) as *mut u32, 2usize);
+    }
+    dst[0] ^ dst[1]
+}
+"#,
+        ),
     ];
 
     /// Semantic-mutant probes that call a crate helper (`helper_reborrow_mid` from
@@ -8710,7 +8726,7 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
     /// `scripts/run_diff_test_campaign.py` replays as the unmutated baseline
     /// (checked identical by `scripts/test_run_diff_test_campaign.py`), so the
     /// simulated self-check baselines are the real engine's outcomes.
-    const SEMANTIC_MUTANT_PROBE_OUTCOMES: [(&str, &str, &str, &str); 11] = [
+    const SEMANTIC_MUTANT_PROBE_OUTCOMES: [(&str, &str, &str, &str); 12] = [
         (
             "bool_valid_range",
             "ub@src/lib.rs:5:5",
@@ -8777,6 +8793,12 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
             "ub@src/lib.rs:11:9: 11:22",
             "MirDiffTag.ub",
         ),
+        (
+            "subplace_multi_elem_copy_truncation",
+            "pass:scalar:117:4",
+            "pass:scalar:117:4",
+            "(MirDiffTag.normalScalar 117 4)",
+        ),
     ];
 
     /// Controls and known gaps for the probes on which Miri returns normally or
@@ -8794,7 +8816,21 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
     ///    `probe_protector_conflict` is the `FnEntry` protector violation. The live
     ///    engine reports UB at the write either way (its sibling-root retag freeze
     ///    of `raw`, `tests/miri-diff/README.md`), a known `false_positive_ub`.
-    const SEMANTIC_MUTANT_CONTROL_PROBES: [(&str, &str); 2] = [
+    /// 3. `probe_gap_subplace_multi_elem_copy` is `subplace_multi_elem_copy_truncation`
+    ///    with the copy between the *element* sub-places
+    ///    `copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize)` instead
+    ///    of whole-array pointer casts. Miri copies both elements and returns
+    ///    `22 ^ 99 = 117`, but the live engine copies only the first element
+    ///    through the `.constantIndex` sub-place pointer and returns `22`
+    ///    (`wrong_value`), so a "copy only the first element" mutant would be
+    ///    equivalent to the current engine on that form and could never be killed:
+    ///    the probe uses the whole-array casts, and this known gap stays pinned
+    ///    (kernel-confirmed) until `Trusted.Rustc.V2026_06_01.MirSemantics.Statements`
+    ///    copies every element of a sub-place `copy_nonoverlapping`.
+    /// 4. `probe_gap_subplace_multi_elem_copy_88_66` repeats gap 3 with `[88, 66]`:
+    ///    Miri returns `88 ^ 66 = 26` and the live engine `88`, so the engine's value
+    ///    is the first source element rather than a constant.
+    const SEMANTIC_MUTANT_CONTROL_PROBES: [(&str, &str); 4] = [
         (
             "probe_gap_move_subplace_reborrow_write",
             r#"pub fn probe_gap_move_subplace_reborrow_write() -> u32 {
@@ -8817,6 +8853,30 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
         *raw = 8u32;
     }
     3u32 + unsafe { *raw }
+}
+"#,
+        ),
+        (
+            "probe_gap_subplace_multi_elem_copy",
+            r#"pub fn probe_gap_subplace_multi_elem_copy() -> u32 {
+    let src: [u32; 2] = [22u32, 99u32];
+    let mut dst: [u32; 2] = [0u32, 0u32];
+    unsafe {
+        copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize);
+    }
+    dst[0] ^ dst[1]
+}
+"#,
+        ),
+        (
+            "probe_gap_subplace_multi_elem_copy_88_66",
+            r#"pub fn probe_gap_subplace_multi_elem_copy_88_66() -> u32 {
+    let src: [u32; 2] = [88u32, 66u32];
+    let mut dst: [u32; 2] = [0u32, 0u32];
+    unsafe {
+        copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize);
+    }
+    dst[0] ^ dst[1]
 }
 "#,
         ),
@@ -9041,15 +9101,18 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
     /// the protector conflict). `probe_provenance_frag` must fail in Miri for lack
     /// of provenance, and both `PROVENANCE_FRAG_CONTROL_PROBES` must agree on their
     /// return values (the rewritten pointer holds `x`'s address, which reads `7`
-    /// with provenance). The three provenance gap probes and the two
+    /// with provenance). The three provenance gap probes and the four
     /// `SEMANTIC_MUTANT_CONTROL_PROBES` are kernel-confirmed engine gaps, pinned
     /// exactly as measured: the overwritten-byte and mixed-fragment probes are
     /// `missed_ub` (the engine returns `7` and `9`), the `u8` round trip is a
     /// `ub_location_mismatch` (the engine flags the `u8` load of a pointer byte,
-    /// Miri the later dereference), and the sub-place move and unprotected alias
+    /// Miri the later dereference), the sub-place move and unprotected alias
     /// write are `false_positive_ub` at the child / raw write on which Miri returns
-    /// `42` / `11`. When the engine changes on any probe, this test fails and the
-    /// pin must be updated (a ratchet, like a `known_anneal_bug` entry).
+    /// `42` / `11`, and the element sub-place multi-element copies are
+    /// `wrong_value` (`value_mismatch`: the engine returns the first source element
+    /// `22` / `88` where Miri returns `117` / `26`). When the engine changes on any
+    /// probe, this test fails and the pin must be updated (a ratchet, like a
+    /// `known_anneal_bug` entry).
     #[test]
     fn semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned() {
         let gap_probes = KNOWN_PROVENANCE_GAP_PROBES;
@@ -9231,6 +9294,46 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
                 "known engine gap `{name}` changed (fixed?): verdict={:?} miri={:?} anneal={:?} \
                  kernel_confirmed={}; update the pin and the probe notes in \
                  SEEDED_SEMANTIC_MUTANTS",
+                item.verdict,
+                item.miri,
+                item.anneal,
+                item.kernel_confirmed
+            );
+        }
+
+        // The element sub-place `copy_nonoverlapping` gap (`wrong_value`): Miri copies
+        // both elements, while the live engine copies only the first one, so its
+        // value is `src[0]` (`22`, `88`) where Miri returns `src[0] ^ src[1]`.
+        for (name, miri_bits, anneal_bits) in [
+            ("probe_gap_subplace_multi_elem_copy", 117u128, 22u128),
+            ("probe_gap_subplace_multi_elem_copy_88_66", 26u128, 88u128),
+        ] {
+            let item = &linked[name];
+            let ComparisonVerdict::Diverge(kind) = &item.verdict else {
+                panic!(
+                    "known engine gap `{name}` no longer diverges (fixed?): verdict={:?} \
+                     miri={:?} anneal={:?}; update the pin, the `RawPtrOffsetMutator` \
+                     copy template, and the probe notes in SEEDED_SEMANTIC_MUTANTS",
+                    item.verdict, item.miri, item.anneal
+                );
+            };
+            assert!(
+                matches!(kind, DivergenceKind::WrongValue { .. })
+                    && classify_divergence_kind_polarity(kind) == WitnessPolarity::ValueMismatch
+                    && item.miri
+                        == MiriOutcome::PassScalar {
+                            bits: miri_bits,
+                            size_bytes: 4,
+                        }
+                    && item.anneal
+                        == AnnealOutcome::PassScalar {
+                            bits: anneal_bits,
+                            size_bytes: 4,
+                        }
+                    && item.kernel_confirmed,
+                "known engine gap `{name}` changed (fixed?): verdict={:?} miri={:?} anneal={:?} \
+                 kernel_confirmed={}; update the pin, the `RawPtrOffsetMutator` copy template, \
+                 and the probe notes in SEEDED_SEMANTIC_MUTANTS",
                 item.verdict,
                 item.miri,
                 item.anneal,

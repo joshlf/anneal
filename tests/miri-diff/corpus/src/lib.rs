@@ -1251,3 +1251,36 @@ pub fn ub_copy_nonoverlapping_partial_overlap_array() -> u32 {
     }
     arr[2]
 }
+
+// ============================================================================
+// Category 10: Multi-Element `copy_nonoverlapping` Through Whole-Array Pointer
+// Casts and Raw-Pointer Reads of Uninitialized Struct Padding
+// ============================================================================
+
+/// `copy_nonoverlapping` of both elements of a `[u32; 2]` through whole-array
+/// pointer casts (`(&raw const src) as *const u32`): a semantics that copies
+/// only the first element returns `22` instead of `22 ^ 99 = 117`.
+pub fn pass_copy_nonoverlapping_multi_elem_array_pair() -> u32 {
+    let src: [u32; 2] = [22u32, 99u32];
+    let mut dst: [u32; 2] = [0u32, 0u32];
+    unsafe {
+        copy_nonoverlapping(
+            (&raw const src) as *const u32,
+            (&raw mut dst) as *mut u32,
+            2usize,
+        );
+    }
+    dst[0] ^ dst[1]
+}
+
+/// Raw-pointer read of the first inter-field padding byte (byte offset `1`) of
+/// `PaddedU8U32` through `(&raw const s) as *const u8` (`model-checking/kani#5183`):
+/// padding bytes are uninitialized, so reading one as `u8` is UB.
+pub fn ub_raw_ptr_read_uninit_struct_padding_kani5183() -> u8 {
+    let s = PaddedU8U32 {
+        tag: 1u8,
+        word: 0x1122_3344u32,
+    };
+    let base: *const u8 = (&raw const s) as *const u8;
+    unsafe { *offset(base, 1isize) }
+}

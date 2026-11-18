@@ -2604,6 +2604,7 @@ SEMANTIC_MUTANT_PROBE_IDS = [
     "ctlz_nonzero_zero",
     "protector_release_order",
     "protector_conflict",
+    "subplace_multi_elem_copy_truncation",
 ]
 
 SEEDED_MUTANT_IDS = [
@@ -2615,17 +2616,18 @@ SEEDED_MUTANT_IDS = [
     "move_triggers_tb_write",
     "exact_div_rem_omitted",
     "protector_release_order",
+    "subplace_multi_elem_copy_truncation",
 ]
 
 
 class SemanticMutantSelfCheckTest(unittest.TestCase):
-    def test_default_8_mutants_all_killed(self) -> None:
+    def test_default_9_mutants_all_killed(self) -> None:
         mutant_ids = [m["id"] for m in campaign.SEEDED_SEMANTIC_MUTANTS]
         self.assertEqual(mutant_ids, SEEDED_MUTANT_IDS)
         res = campaign.run_semantic_mutant_self_check()
         self.assertTrue(res["passed"], res)
-        self.assertEqual(res["total_mutants"], 8)
-        self.assertEqual(res["killed_count"], 8)
+        self.assertEqual(res["total_mutants"], 9)
+        self.assertEqual(res["killed_count"], 9)
         self.assertEqual(res["killed_mutants"], SEEDED_MUTANT_IDS)
         self.assertEqual(res["survived_mutants"], [])
         self.assertEqual(res["exit_code"], campaign.EXIT_SUCCESS)
@@ -2634,7 +2636,7 @@ class SemanticMutantSelfCheckTest(unittest.TestCase):
             {
                 "unsound_missed_fault": 9,
                 "sound_conservative_abstraction": 2,
-                "value_mismatch": 0,
+                "value_mismatch": 1,
                 "harness_or_extraction_error": 2,
             },
         )
@@ -2650,7 +2652,7 @@ class SemanticMutantSelfCheckTest(unittest.TestCase):
 
         res = campaign.run_semantic_mutant_self_check(evaluator=surviving_wide_shift_eval)
         self.assertFalse(res["passed"])
-        self.assertEqual(res["killed_count"], 7)
+        self.assertEqual(res["killed_count"], 8)
         self.assertEqual(res["survived_mutants"], ["wide_shift"])
         self.assertEqual(res["exit_code"], campaign.EXIT_HARNESS_FAILED)
 
@@ -2804,8 +2806,8 @@ class CliGateIntegrationTest(unittest.TestCase):
             summary = _read_summary(state_dir)
             self.assertEqual(summary["mode"], "standalone_gate")
             self.assertTrue(summary["semantic_mutant_self_check"]["passed"])
-            self.assertEqual(summary["semantic_mutant_self_check"]["killed_count"], 8)
-            self.assertEqual(summary["semantic_mutant_self_check"]["total_mutants"], 8)
+            self.assertEqual(summary["semantic_mutant_self_check"]["killed_count"], 9)
+            self.assertEqual(summary["semantic_mutant_self_check"]["total_mutants"], 9)
             self.assertIsNone(summary["witness_polarity_counts"])
             self.assertIsNone(summary["stale_ratchet_audit"])
 
@@ -3112,10 +3114,18 @@ class SemanticMutantDifferentialTest(unittest.TestCase):
                     campaign.classify_oracle_outcome_tags(miri_tag, anneal_tag), ("agree", "")
                 )
                 self.assertIsNone(campaign.classify_witness_polarity_from_tags(miri_tag, anneal_tag))
-        # Probes on which Miri returns normally (killed by spurious faults) are
-        # exactly the `false_positive_ub` probes; every other probe faults in Miri.
+        # Probes on which Miri returns normally are exactly the probes whose mutants
+        # fault spuriously (`false_positive_ub`) or return a different value
+        # (`wrong_value`); every other probe faults in Miri.
         pass_probes = [pid for pid, miri_tag, _, _ in py if miri_tag.startswith("pass:")]
-        self.assertEqual(pass_probes, ["move_triggers_tb_write", "protector_release_order"])
+        self.assertEqual(
+            pass_probes,
+            [
+                "move_triggers_tb_write",
+                "protector_release_order",
+                "subplace_multi_elem_copy_truncation",
+            ],
+        )
 
     def test_provenance_frag_probe_strips_provenance_at_a_live_address(self) -> None:
         frag = next(m for m in campaign.SEEDED_SEMANTIC_MUTANTS if m["id"] == "provenance_frag")
@@ -3174,6 +3184,69 @@ class SemanticMutantDifferentialTest(unittest.TestCase):
         self.assertEqual(res["survived_mutants"], ["provenance_frag"])
         frag = next(r for r in res["results"] if r["id"] == "provenance_frag")
         self.assertEqual(frag["kill_class"], "evaluator_error")
+
+    def test_copy_truncation_probe_and_its_pinned_subplace_gap_twins(self) -> None:
+        # The probe copies `[22, 99]` through whole-array pointer casts, on which the
+        # live engine agrees with Miri (`117`); the mutant keeps only the first
+        # element (`22`). The Rust test pins the element sub-place twins of the probe
+        # (identical but for the copy statement, and the source pair) as live
+        # `wrong_value` gaps on which the engine already returns the first element.
+        mutant = next(
+            m
+            for m in campaign.SEEDED_SEMANTIC_MUTANTS
+            if m["id"] == "subplace_multi_elem_copy_truncation"
+        )
+        probe = str(mutant["probe_rust_source"])
+        whole = (
+            "copy_nonoverlapping((&raw const src) as *const u32, "
+            "(&raw mut dst) as *mut u32, 2usize);"
+        )
+        elem = "copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize);"
+        self.assertEqual(probe.count(whole), 1, probe)
+        self.assertNotIn("src[0], ", probe)
+        self.assertIn("let src: [u32; 2] = [22u32, 99u32];", probe)
+        self.assertEqual(
+            (mutant["reference_miri_outcome"], mutant["baseline_anneal_outcome"]),
+            (f"pass:scalar:{22 ^ 99}:4", f"pass:scalar:{22 ^ 99}:4"),
+        )
+        self.assertEqual(
+            [(v["anneal_outcome"], v["expected_kill_class"]) for v in mutant["mutant_variants"]],
+            [("pass:scalar:22:4", "wrong_value")],
+        )
+        controls = dict(
+            re.findall(
+                r'\(\s*"(\w+)",\s*r#"(.*?)"#,\s*\)',
+                _rust_const_body("SEMANTIC_MUTANT_CONTROL_PROBES"),
+                re.S,
+            )
+        )
+        self.assertEqual(
+            list(controls),
+            [
+                "probe_gap_move_subplace_reborrow_write",
+                "probe_ctrl_protector_unprotected_alias_write",
+                "probe_gap_subplace_multi_elem_copy",
+                "probe_gap_subplace_multi_elem_copy_88_66",
+            ],
+        )
+        gap = probe.replace(
+            "probe_subplace_multi_elem_copy_truncation", "probe_gap_subplace_multi_elem_copy"
+        ).replace(whole, elem)
+        self.assertEqual(controls["probe_gap_subplace_multi_elem_copy"], gap)
+        self.assertEqual(
+            controls["probe_gap_subplace_multi_elem_copy_88_66"],
+            gap.replace(
+                "probe_gap_subplace_multi_elem_copy", "probe_gap_subplace_multi_elem_copy_88_66"
+            ).replace("[22u32, 99u32]", "[88u32, 66u32]"),
+        )
+        # The live pins: Miri `src[0] ^ src[1]`, the engine `src[0]`.
+        miri_eval_src = MIRI_EVAL_RS.read_text(encoding="utf-8")
+        for name, miri_bits, anneal_bits in (
+            ("probe_gap_subplace_multi_elem_copy", 22 ^ 99, 22),
+            ("probe_gap_subplace_multi_elem_copy_88_66", 88 ^ 66, 88),
+        ):
+            with self.subTest(gap=name):
+                self.assertIn(f'("{name}", {miri_bits}u128, {anneal_bits}u128),', miri_eval_src)
 
     def test_simulation_and_normalization_crashes_count_as_survival(self) -> None:
         base = dict(campaign.SEEDED_SEMANTIC_MUTANTS[0])
@@ -4339,7 +4412,7 @@ class GateProfileAndModeTest(unittest.TestCase):
                 summary["gates"],
                 {"passed": True, "self_check_mutants": True, "check_stale_ratchet": True},
             )
-            self.assertEqual(summary["semantic_mutant_self_check"]["killed_count"], 8)
+            self.assertEqual(summary["semantic_mutant_self_check"]["killed_count"], 9)
             self.assertTrue(summary["stale_ratchet_audit"]["passed"])
             self.assertEqual(
                 summary["stale_ratchet_audit"]["checked_known_bug_count"],
@@ -5602,7 +5675,7 @@ class PassA2AdversarialRegressionTest(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # Episode 2: `WitnessPolarity` classifier parity, fail-closed polarity accounting,
-# the 8/8 semantic-mutant gate, probe sources, and polarity reporting.
+# the 9/9 semantic-mutant gate, probe sources, and polarity reporting.
 # ---------------------------------------------------------------------------
 
 MUTATORS_MIRI_RS = REPO_ROOT / "crates" / "anneal-difftest" / "src" / "mutators_miri.rs"
@@ -6094,7 +6167,7 @@ class WitnessPolarityAccountingTest(unittest.TestCase):
 
 
 class SemanticMutantPolarityGateTest(unittest.TestCase):
-    """The 8/8 semantic-mutant gate kills every variant with its expected class and
+    """The 9/9 semantic-mutant gate kills every variant with its expected class and
     witness polarity, and treats any other class or polarity as a survivor."""
 
     EXPECTED_VARIANTS = {
@@ -6127,6 +6200,15 @@ class SemanticMutantPolarityGateTest(unittest.TestCase):
             ),
             ("protector_conflict_omitted", "protector_conflict", 4, "missed_ub", UNSOUND),
         ],
+        "subplace_multi_elem_copy_truncation": [
+            (
+                "copy_truncated_to_first_element",
+                "subplace_multi_elem_copy_truncation",
+                4,
+                "wrong_value",
+                VALUE,
+            ),
+        ],
     }
 
     def test_every_variant_is_killed_with_its_class_and_polarity(self) -> None:
@@ -6134,6 +6216,7 @@ class SemanticMutantPolarityGateTest(unittest.TestCase):
         self.assertTrue(res["passed"], res)
         by_id = {r["id"]: r for r in res["results"]}
         self.assertEqual(list(by_id), SEEDED_MUTANT_IDS)
+        self.assertEqual(list(self.EXPECTED_VARIANTS), SEEDED_MUTANT_IDS)
         for mutant_id, expected in self.EXPECTED_VARIANTS.items():
             with self.subTest(mutant=mutant_id):
                 r = by_id[mutant_id]
@@ -6202,11 +6285,9 @@ class SemanticMutantPolarityGateTest(unittest.TestCase):
                 missing = {k: v for k, v in mutant.items() if k != "expected_witness_polarities"}
                 res = campaign.run_semantic_mutant_self_check(mutants=[missing])
                 self.assertFalse(res["passed"])
-                partial = dict(
-                    mutant,
-                    expected_witness_polarities=tuple(mutant["expected_witness_polarities"])[:-1]
-                    or ("value_mismatch",),
-                )
+                declared = tuple(mutant["expected_witness_polarities"])
+                undeclared = next(p for p in ALL_POLARITIES if p not in declared)
+                partial = dict(mutant, expected_witness_polarities=declared[:-1] or (undeclared,))
                 self.assertFalse(campaign.run_semantic_mutant_self_check(mutants=[partial])["passed"])
         # A mutant whose variants never produce one of its declared polarities is
         # not fully killed.
@@ -6218,11 +6299,13 @@ class SemanticMutantPolarityGateTest(unittest.TestCase):
 
     def test_pipeline_that_mislabels_polarity_lets_every_divergence_variant_survive(self) -> None:
         real_dedup = campaign.deduplicate_and_quarantine_findings
+        # Every finding is relabeled with a polarity other than its own.
+        mislabel = {UNSOUND: VALUE, CONSERVATIVE: VALUE, VALUE: UNSOUND, HARNESS: VALUE}
 
         def wrong_polarity(findings, known, rules):  # type: ignore[no-untyped-def]
             all_dedup, unq, quar = real_dedup(findings, known, rules)
             for d in all_dedup:
-                d.witness_polarity = VALUE
+                d.witness_polarity = mislabel.get(d.witness_polarity, VALUE)
             return all_dedup, unq, quar
 
         with mock.patch.object(campaign, "deduplicate_and_quarantine_findings", wrong_polarity):
@@ -6231,13 +6314,18 @@ class SemanticMutantPolarityGateTest(unittest.TestCase):
         self.assertEqual(res["survived_mutants"], SEEDED_MUTANT_IDS)
         wide = next(r for r in res["results"] if r["id"] == "wide_shift")
         self.assertEqual(wide["survived_variants"], ["guard_masks_exponent_silently"])
+        copy_trunc = next(
+            r for r in res["results"] if r["id"] == "subplace_multi_elem_copy_truncation"
+        )
+        self.assertEqual(copy_trunc["survived_variants"], ["copy_truncated_to_first_element"])
 
     def test_classifier_that_flips_polarity_is_caught(self) -> None:
         real = campaign.classify_witness_polarity_from_tags
+        flips = {UNSOUND: CONSERVATIVE, VALUE: UNSOUND}
 
         def flipped(miri_tag, anneal_tag, slug=None):  # type: ignore[no-untyped-def]
             pol = real(miri_tag, anneal_tag, slug)
-            return CONSERVATIVE if pol == UNSOUND else pol
+            return flips.get(pol, pol)
 
         with mock.patch.object(campaign, "classify_witness_polarity_from_tags", flipped):
             res = campaign.run_semantic_mutant_self_check()
@@ -6300,9 +6388,31 @@ class SemanticMutantPolarityGateTest(unittest.TestCase):
         self.assertTrue(implied["passed"], implied)
         self.assertTrue(all(r["witness_polarity"] for r in implied["results"]))
         # ...an explicit contradicting or undeclared polarity is a survivor...
-        wrong = campaign.run_semantic_mutant_self_check(evaluator=explicit(VALUE))
+        def undeclared(mutant):  # type: ignore[no-untyped-def]
+            return next(p for p in ALL_POLARITIES if p not in mutant["expected_witness_polarities"])
+
+        wrong = campaign.run_semantic_mutant_self_check(
+            evaluator=lambda m: {
+                "killed": True,
+                "kill_class": m["mutant_variants"][-1]["expected_kill_class"],
+                "witness_polarity": undeclared(m),
+            }
+        )
         self.assertEqual(wrong["killed_count"], 0)
-        self.assertTrue(all(r["unexpected_witness_polarity"] == VALUE for r in wrong["results"]))
+        by_id = {m["id"]: m for m in campaign.SEEDED_SEMANTIC_MUTANTS}
+        self.assertTrue(
+            all(r["unexpected_witness_polarity"] == undeclared(by_id[r["id"]]) for r in wrong["results"])
+        )
+        # (An explicit `value_mismatch` kills exactly the mutant that declares it.)
+        value_only = campaign.run_semantic_mutant_self_check(evaluator=explicit(VALUE))
+        self.assertEqual(value_only["killed_mutants"], ["subplace_multi_elem_copy_truncation"])
+        self.assertTrue(
+            all(
+                r["unexpected_witness_polarity"] == VALUE
+                for r in value_only["results"]
+                if r["id"] != "subplace_multi_elem_copy_truncation"
+            )
+        )
         # ...an invalid one is an evaluator error...
         bogus = campaign.run_semantic_mutant_self_check(evaluator=explicit("unsound"))
         self.assertTrue(all(r["kill_class"] == "evaluator_error" for r in bogus["results"]))
@@ -6411,6 +6521,32 @@ class SemanticMutantProbeSourceTest(unittest.TestCase):
         self.assertRegex(body, rf"\n\s*{moved} = move {x};")
         self.assertNotRegex(body, rf"{moved} = copy {x};")
         self.assertRegex(body, rf"{root} = &raw mut {x};")
+
+    def test_copy_probe_copies_two_elements_through_whole_array_pointer_casts(self) -> None:
+        # The probe's inline `copy_nonoverlapping` statement copies `count = 2`
+        # elements between whole-array pointer casts (`&raw const src` /
+        # `&raw mut dst`, `PtrToPtr`), never between element sub-places
+        # (`&raw const src[_]`, the known engine gap).
+        body = _mir_fn_body(
+            self._mir("subplace_multi_elem_copy_truncation"),
+            "probe_subplace_multi_elem_copy_truncation",
+        )
+        src = re.search(r"debug src => (_\d+);", body).group(1)  # type: ignore[union-attr]
+        dst = re.search(r"debug dst => (_\d+);", body).group(1)  # type: ignore[union-attr]
+        stmt = re.search(
+            r"copy_nonoverlapping\(dst = move (_\d+), src = move (_\d+), count = const 2_usize\);",
+            body,
+        )
+        self.assertIsNotNone(stmt, body)
+        dst_ptr, src_ptr = stmt.group(1), stmt.group(2)  # type: ignore[union-attr]
+        src_raw = re.search(rf"\n\s*{src_ptr} = move (_\d+) as \*const u32 \(PtrToPtr\);", body)
+        dst_raw = re.search(rf"\n\s*{dst_ptr} = move (_\d+) as \*mut u32 \(PtrToPtr\);", body)
+        self.assertIsNotNone(src_raw, body)
+        self.assertIsNotNone(dst_raw, body)
+        self.assertRegex(body, rf"\n\s*{src_raw.group(1)} = &raw const {src};")  # type: ignore[union-attr]
+        self.assertRegex(body, rf"\n\s*{dst_raw.group(1)} = &raw mut {dst};")  # type: ignore[union-attr]
+        self.assertNotRegex(body, r"&raw (const|mut) _\d+\[")
+        self.assertEqual(body.count("copy_nonoverlapping("), 1, body)
 
     def test_intrinsic_probes_call_the_guarded_intrinsics(self) -> None:
         for probe_id, call in (
@@ -6612,17 +6748,23 @@ class WitnessPolarityReportingTest(unittest.TestCase):
             self.assertIn("Status: NOT EVALUATED", co_report)
             self.assertNotIn("olarity", co_report)
 
-    def test_gate_section_renders_8_of_8_and_variant_polarities(self) -> None:
+    def test_gate_section_renders_9_of_9_and_variant_polarities(self) -> None:
         report = campaign.render_gate_report_sections(campaign.run_semantic_mutant_self_check(), None)
-        self.assertIn("(`8/8` killed)", report)
+        self.assertIn("(`9/9` killed)", report)
         self.assertIn(
             "- **Killed-variant witness polarities**: `unsound_missed_fault`=9, "
-            "`sound_conservative_abstraction`=2, `value_mismatch`=0, "
+            "`sound_conservative_abstraction`=2, `value_mismatch`=1, "
             "`harness_or_extraction_error`=2",
             report,
         )
         self.assertIn("protector_conflict_omitted: 4, missed_ub, unsound_missed_fault", report)
         self.assertIn("release_after_frame_cleanup: 4, false_positive_ub, sound_conservative_abstraction", report)
+        self.assertIn("copy_truncated_to_first_element: 4, wrong_value, value_mismatch", report)
+        self.assertIn(
+            "| `subplace_multi_elem_copy_truncation` | `True` | `wrong_value` | "
+            "`value_mismatch` | `agree` (exit `0`) |",
+            report,
+        )
         self.assertIn(
             "| `exact_div_rem_omitted` | `True` | `missed_ub` | `unsound_missed_fault` | "
             "`agree` (exit `0`; 3 probes) |",
@@ -6710,7 +6852,7 @@ class PassEp2B1AdversarialRegressionTest(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn("Status: HARNESS FAILED", broken_report)
-            self.assertIn("(`8/8` killed)", broken_report)
+            self.assertIn("(`9/9` killed)", broken_report)
 
     def test_finding_tag_bypass_and_same_polarity_class_spoofing_without_item_outcomes_rejected(
         self,
@@ -6880,7 +7022,7 @@ class PassEp2B1AdversarialRegressionTest(unittest.TestCase):
 
         gate_res = campaign.run_semantic_mutant_self_check(evaluator=fake_eval_bad_variant)
         self.assertFalse(gate_res["passed"])
-        self.assertEqual(len(gate_res["survived_mutants"]), 8)
+        self.assertEqual(len(gate_res["survived_mutants"]), 9)
 
         # 3. A custom mutant with a bogus `expected_kill_classes` entry that maps to
         # `None` polarity cannot pass with `witness_polarity: None`.
@@ -7057,7 +7199,7 @@ class PassEp2A1AdversarialRegressionTest(unittest.TestCase):
         )
         gate = campaign.run_semantic_mutant_self_check(evaluator=_variant_reporting_evaluator())
         self.assertTrue(gate["passed"], gate["results"])
-        self.assertEqual(gate["killed_count"], 8)
+        self.assertEqual(gate["killed_count"], 9)
         self.assertEqual(
             gate["witness_polarity_counts"],
             campaign.run_semantic_mutant_self_check()["witness_polarity_counts"],

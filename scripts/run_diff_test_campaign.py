@@ -3898,6 +3898,7 @@ RAW_PTR_OFFSET_MUTATOR_TOKENS = (
     "__null_p",
     "__unaligned_",
     "__u8_base",
+    "__raw_pad_",
     "__wb_src",
     "__cp_src",
     "__cp_dst",
@@ -4585,7 +4586,8 @@ def campaign_exit_for_miri_summary(summary: dict[str, Any]) -> tuple[int, str, s
 # omitted" mutant would be equivalent to the current engine there and could never be
 # killed; the same Rust test pins them as known engine gaps instead (as it pins the
 # sub-place `&raw mut x.0` form of `move_triggers_tb_write`, a live
-# `false_positive_ub`).
+# `false_positive_ub`, and the element sub-place form of
+# `subplace_multi_elem_copy_truncation`, a live `wrong_value`).
 #
 # A variant that needs a different program than its mutant's probe carries its own
 # `probe` (`id`, `probe_rust_source`, `reference_miri_outcome`,
@@ -4991,6 +4993,50 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
             "        *raw = *r0 + delta;\n"
             "        *raw\n"
             "    }\n"
+            "}\n"
+        ),
+    },
+    {
+        # `copy_nonoverlapping` copies both `u32` elements of `[22, 99]` through
+        # whole-array pointer casts (`(&raw const src) as *const u32`), so Miri and the
+        # live engine both return `22 ^ 99 = 117`. A semantics that copies only the
+        # first element of a multi-element copy leaves `dst[1] == 0` and returns `22`.
+        # The live engine still truncates the element sub-place form
+        # `copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize)` that way
+        # (`wrong_value`, kernel-confirmed), so that form cannot be a probe: the same
+        # Rust test pins it as a known engine gap (`probe_gap_subplace_multi_elem_copy`).
+        "id": "subplace_multi_elem_copy_truncation",
+        "name": "subplace_multi_elem_copy_truncation",
+        "bug_class": "copy_nonoverlapping_multi_element_truncation",
+        "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Statements",
+        "description": (
+            "Truncate a multi-element `copy_nonoverlapping` (`count = 2` over `[u32; 2]`) "
+            "to its first element, so the copied pair `[22, 99]` reads back as `[22, 0]`"
+        ),
+        "expected_kill_classes": ("wrong_value",),
+        "expected_witness_polarities": (WITNESS_POLARITY_VALUE_MISMATCH,),
+        "reference_miri_outcome": "pass:scalar:117:4",
+        "baseline_anneal_outcome": "pass:scalar:117:4",
+        "baseline_anneal_lean_tag": "(MirDiffTag.normalScalar 117 4)",
+        "mutant_variants": (
+            {
+                # Only `dst[0] = 22` is written: `22 ^ 0`.
+                "label": "copy_truncated_to_first_element",
+                "anneal_outcome": "pass:scalar:22:4",
+                "anneal_lean_tag": "(MirDiffTag.normalScalar 22 4)",
+                "expected_kill_class": "wrong_value",
+                "expected_witness_polarity": WITNESS_POLARITY_VALUE_MISMATCH,
+            },
+        ),
+        "probe_rust_source": (
+            "pub fn probe_subplace_multi_elem_copy_truncation() -> u32 {\n"
+            "    let src: [u32; 2] = [22u32, 99u32];\n"
+            "    let mut dst: [u32; 2] = [0u32, 0u32];\n"
+            "    unsafe {\n"
+            "        copy_nonoverlapping((&raw const src) as *const u32, "
+            "(&raw mut dst) as *mut u32, 2usize);\n"
+            "    }\n"
+            "    dst[0] ^ dst[1]\n"
             "}\n"
         ),
     },
@@ -5625,11 +5671,12 @@ def run_semantic_mutant_self_check(
     evaluator: Any = None,
     mutants: tuple[dict[str, Any], ...] | list[dict[str, Any]] = SEEDED_SEMANTIC_MUTANTS,
 ) -> dict[str, Any]:
-    """Runs the seeded semantic mutant probes (by default the 8 families
+    """Runs the seeded semantic mutant probes (by default the 9 families
     `bool_valid_range`, `storage_dead_tag`, `provenance_frag`, `div_by_zero`,
-    `wide_shift`, `move_triggers_tb_write`, `exact_div_rem_omitted`, and
-    `protector_release_order`) through the campaign oracle verdict pipeline and fails
-    closed (`EXIT_HARNESS_FAILED`) unless every mutant is killed.
+    `wide_shift`, `move_triggers_tb_write`, `exact_div_rem_omitted`,
+    `protector_release_order`, and `subplace_multi_elem_copy_truncation`) through the
+    campaign oracle verdict pipeline and fails closed (`EXIT_HARNESS_FAILED`) unless
+    every mutant is killed.
 
     Without `evaluator`, each mutant is checked differentially by
     `_simulate_mutant_through_campaign_pipeline` (unmutated semantics must pass on

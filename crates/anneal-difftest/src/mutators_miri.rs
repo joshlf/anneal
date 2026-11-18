@@ -322,7 +322,7 @@ impl DetRng {
     }
 }
 
-/// Extract the 108 closed zero-argument test functions from
+/// Extract the 110 closed zero-argument test functions from
 /// `tests/miri-diff/corpus/src/lib.rs` (excluding `helper_add_ten` and model
 /// helpers).
 pub fn load_miri_diff_corpus_seeds() -> Vec<MiriCorpusSeed> {
@@ -2184,7 +2184,9 @@ impl MiriAstMutator for PlaceProjectionWrapper {
 /// 3. Perturbs `core::intrinsics::offset` arguments in place and synthesizes
 ///    raw pointer address-of and `offset` dereferences across in-bounds
 ///    (`0isize`, `1isize`), out-of-bounds (`2isize`, `-1isize`), null, and
-///    unaligned addresses.
+///    unaligned addresses, and `u8` reads of the uninitialized padding byte at
+///    offset 1 of a `PaddedU8U32` through `(&raw const s) as *const u8`
+///    (`model-checking/kani#5183`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RawPtrOffsetMutator;
 
@@ -2319,12 +2321,17 @@ impl MiriAstMutator for RawPtrOffsetMutator {
                             let #probe_ident: u32 = (__wb_dst & 0xFFu32) ^ __wb_src.b;
                         }
                     }
+                    // Copy both elements through whole-array pointer casts. A
+                    // multi-element copy between *element* sub-places
+                    // (`&raw const __cp_src[0]`) is a known engine gap (Anneal
+                    // copies only the first element, `wrong_value`), pinned by
+                    // `probe_gap_subplace_multi_elem_copy` in `miri_eval.rs`.
                     _ => syn::parse_quote! {
                         let __cp_src: [u32; 2] = [#c_a, #c_b];
                         let mut __cp_dst: [u32; 2] = [0u32, 0u32];
                         unsafe {
-                            let __src_p: *const u32 = &raw const __cp_src[0];
-                            let __dst_p: *mut u32 = &raw mut __cp_dst[0];
+                            let __src_p: *const u32 = (&raw const __cp_src) as *const u32;
+                            let __dst_p: *mut u32 = (&raw mut __cp_dst) as *mut u32;
                             copy_nonoverlapping(__src_p, __dst_p, 2usize);
                         }
                         let #probe_ident: u32 = __cp_dst[0] ^ __cp_dst[1];
@@ -2368,7 +2375,17 @@ impl MiriAstMutator for RawPtrOffsetMutator {
                     }
                 }
                 MutationMode::Ub => {
-                    let variant = rng.gen_range(5);
+                    // One draw picks the template family: its remainder modulo 5
+                    // is exactly the `gen_range(5)` draw, and its quotient splits
+                    // family 3 (a `*const u8` stepped by `offset(.., 1isize)`)
+                    // between an unaligned `u32` read and a `u8` read of the
+                    // uninitialized padding byte at offset 1 of a `PaddedU8U32`
+                    // (`model-checking/kani#5183`), so the split consumes no
+                    // extra draw and every other family keeps its draws.
+                    let draw = rng.next_u64() as usize;
+                    let variant = draw % 5;
+                    let padding_read = (draw / 5) % 2 == 1;
+                    let pad_tag: u8 = u8::try_from(c_a).unwrap_or(u8::MAX);
                     match variant {
                         0 => syn::parse_quote! {
                             let __null_p: *const u32 = 0usize as *const u32;
@@ -2385,6 +2402,13 @@ impl MiriAstMutator for RawPtrOffsetMutator {
                             let __neg_base: *const u32 = &raw const __neg_pair.a;
                             let __neg_step: isize = -1isize;
                             let #probe_ident: u32 = unsafe { *offset(__neg_base, __neg_step) };
+                        },
+                        3 if padding_read => syn::parse_quote! {
+                            let __raw_pad_s: PaddedU8U32 = PaddedU8U32 { tag: #pad_tag, word: #c_b };
+                            let __raw_pad_base: *const u8 = (&raw const __raw_pad_s) as *const u8;
+                            let __raw_pad_step: isize = 1isize;
+                            let __raw_pad_byte: u8 = unsafe { *offset(__raw_pad_base, __raw_pad_step) };
+                            let #probe_ident: u32 = __raw_pad_byte as u32;
                         },
                         3 => syn::parse_quote! {
                             let __unaligned_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
@@ -4899,12 +4923,12 @@ mod tests {
     }
 
     #[test]
-    fn corpus_seeds_load_all_108_zero_arg_functions_and_do_not_blocklist_known_bugs() {
+    fn corpus_seeds_load_all_110_zero_arg_functions_and_do_not_blocklist_known_bugs() {
         let seeds = load_miri_diff_corpus_seeds();
         assert_eq!(
             seeds.len(),
-            108,
-            "expected 108 zero-arg functions from tests/miri-diff/corpus/src/lib.rs"
+            110,
+            "expected 110 zero-arg functions from tests/miri-diff/corpus/src/lib.rs"
         );
         assert!(seeds.iter().any(|s| s.name == "pass_integer_arith_basic"));
         assert!(
@@ -4946,6 +4970,8 @@ mod tests {
             "pass_fn_entry_returns_reborrowed_child",
             "panic_multi_callee_unwind_cleanup_guard",
             "ub_frozen_reborrow_write_in_callee_frame",
+            "pass_copy_nonoverlapping_multi_elem_array_pair",
+            "ub_raw_ptr_read_uninit_struct_padding_kani5183",
         ] {
             assert!(seeds.iter().any(|s| s.name == name), "missing seed {name}");
         }
@@ -6502,6 +6528,7 @@ pub fn usize_off() -> u32 {
                     || out.contains("let __oob_step: isize = 2isize;")
                     || out.contains("let __neg_step: isize = -1isize;")
                     || out.contains("let __unaligned_step: isize = 1isize;")
+                    || out.contains("let __raw_pad_step: isize = 1isize;")
                     || out.contains("let __ovl_step: isize = 1isize;"),
                 "follow-up `RawPtrOffsetMutator::Pass` erased Pass 0 UB:\n{out}"
             );
@@ -6914,6 +6941,154 @@ pub fn unsuffixed_off() -> u32 {
                 cand.fn_name
             );
         }
+    }
+
+    #[test]
+    fn raw_ptr_offset_ub_padding_read_keeps_family_draws_parses_and_replays() {
+        // 1. `RawPtrOffsetMutator::Ub` picks its template family with the same
+        //    draw as `gen_range(5)` and consumes the same draws for every family,
+        //    so the `PaddedU8U32` padding-byte read changes no other family's PRNG
+        //    schedule: family 3 alone splits between the unaligned `u32` read and
+        //    the padding-byte read.
+        let seed_fn = "pub fn seed() -> u32 { 7u32 }\n";
+        let family_markers: [&[&str]; 5] = [
+            &["let __null_p: *const u32 = 0usize as *const u32;"],
+            &["let __oob_step: isize = 2isize;"],
+            &["let __neg_step: isize = -1isize;"],
+            &[
+                "let __unaligned_step: isize = 1isize;",
+                "let __raw_pad_step: isize = 1isize;",
+            ],
+            &["let __ovl_step: isize = 1isize;"],
+        ];
+        let mut padding_hits = 0usize;
+        let mut unaligned_hits = 0usize;
+        for s in 0..256u64 {
+            let mut f = syn::parse_file(seed_fn).unwrap();
+            let mut rng = DetRng::new(s);
+            let mut locals = Vec::new();
+            RawPtrOffsetMutator.mutate_with_mode(&mut f, &mut rng, MutationMode::Ub, &mut locals);
+            let out = prettyplease::unparse(&f);
+            // The probe tag, the two template constants, then the family draw.
+            let mut expected = DetRng::new(s);
+            let _tag = expected.next_u64();
+            let _c_a = expected.gen_range(4);
+            let _c_b = expected.gen_range(4);
+            let family = expected.gen_range(5);
+            assert_eq!(
+                format!("{rng:?}"),
+                format!("{expected:?}"),
+                "seed {s}: family {family} consumed a different number of draws:\n{out}"
+            );
+            for (idx, markers) in family_markers.iter().enumerate() {
+                assert_eq!(
+                    markers.iter().any(|m| out.contains(m)),
+                    idx == family,
+                    "seed {s}: drew family {family} but family {idx}'s template differs:\n{out}"
+                );
+            }
+            if out.contains("__raw_pad_") {
+                padding_hits += 1;
+                for needle in [
+                    "let __raw_pad_s: PaddedU8U32 = PaddedU8U32 {",
+                    "let __raw_pad_base: *const u8 = (&raw const __raw_pad_s) as *const u8;",
+                    "let __raw_pad_step: isize = 1isize;",
+                    "let __raw_pad_byte: u8 = unsafe { *offset(__raw_pad_base, __raw_pad_step) };",
+                ] {
+                    assert!(out.contains(needle), "seed {s}: missing `{needle}`:\n{out}");
+                }
+                assert!(
+                    !out.contains("__unaligned_"),
+                    "seed {s}: family 3 emitted both reads:\n{out}"
+                );
+                let standalone = build_standalone_candidate_source(&out);
+                assert!(
+                    syn::parse_file(&standalone).is_ok(),
+                    "seed {s}: padding-read candidate failed syn::parse_file:\n{standalone}"
+                );
+            } else if out.contains("__unaligned_pair") {
+                unaligned_hits += 1;
+            }
+        }
+        assert!(
+            padding_hits > 0 && unaligned_hits > 0,
+            "family 3 must emit both reads: padding {padding_hits}, unaligned {unaligned_hits}"
+        );
+        // Other modes never emit the padding read, and the `Pass` multi-element
+        // copy template copies through whole-array pointer casts, never between
+        // element sub-places (the pinned `wrong_value` engine gap).
+        let mut whole_array_copies = 0usize;
+        for s in 0..64u64 {
+            for mode in [
+                MutationMode::Pass,
+                MutationMode::PerturbAst,
+                MutationMode::Panic,
+            ] {
+                let mut f = syn::parse_file(seed_fn).unwrap();
+                let mut rng = DetRng::new(s);
+                let mut locals = Vec::new();
+                RawPtrOffsetMutator.mutate_with_mode(&mut f, &mut rng, mode, &mut locals);
+                let out = prettyplease::unparse(&f);
+                assert!(!out.contains("__raw_pad_"), "{mode:?} emitted the padding read:\n{out}");
+                if out.contains("copy_nonoverlapping(__src_p, __dst_p, 2usize)") {
+                    whole_array_copies += 1;
+                    assert!(
+                        out.contains("let __src_p: *const u32 = (&raw const __cp_src) as *const u32;")
+                            && out.contains("let __dst_p: *mut u32 = (&raw mut __cp_dst) as *mut u32;")
+                            && !out.contains("__cp_src[0]")
+                            && !out.contains("&raw mut __cp_dst["),
+                        "{mode:?} copy template must use whole-array pointer casts:\n{out}"
+                    );
+                }
+            }
+        }
+        assert!(whole_array_copies > 0, "the `Pass` copy template never fired");
+
+        // 2. Generated candidates carrying the padding read replay byte for byte
+        //    from their recorded passes, and replaying the `Ub` pass alone from its
+        //    recorded PRNG state re-emits the same padding read.
+        let seeds = ["pub fn base_seed() -> u32 {\n    let x: u32 = 6u32;\n    x\n}\n"];
+        let mut replayed = 0usize;
+        'search: for seed_u64 in 0..4096u64 {
+            for cand in generate_miri_batch(&seeds, 8, seed_u64) {
+                if !cand.fn_source.contains("__raw_pad_base") {
+                    continue;
+                }
+                assert!(
+                    syn::parse_file(&cand.source).is_ok(),
+                    "candidate `{}` failed syn::parse_file:\n{}",
+                    cand.fn_name,
+                    cand.source
+                );
+                let (base, steps) = reconstruct_miri_mutation_steps(&cand, &seeds)
+                    .expect("reconstruct the padding-read candidate's passes");
+                assert!(
+                    miri_candidate_replay_is_faithful(&cand, &base, &steps),
+                    "replay mismatch on padding-read candidate `{}`",
+                    cand.fn_name
+                );
+                let ub_step = steps
+                    .iter()
+                    .find(|st| {
+                        st.mutator_name == "RawPtrOffsetMutator" && st.mode == MutationMode::Ub
+                    })
+                    .expect("the padding read comes from a `RawPtrOffsetMutator::Ub` pass");
+                let alone = replay_miri_mutation_steps(&cand, &base, std::slice::from_ref(ub_step));
+                assert!(
+                    alone.fn_source.contains("let __raw_pad_base: *const u8")
+                        && alone.fn_source.contains(
+                            "let __raw_pad_byte: u8 = unsafe { *offset(__raw_pad_base, __raw_pad_step) };"
+                        ),
+                    "replaying the `Ub` pass alone lost the padding read:\n{}",
+                    alone.fn_source
+                );
+                replayed += 1;
+                if replayed == 3 {
+                    break 'search;
+                }
+            }
+        }
+        assert_eq!(replayed, 3, "too few generated padding-read candidates");
     }
 
     #[test]

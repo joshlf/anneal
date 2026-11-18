@@ -26,9 +26,9 @@ use anneal_difftest::miri_eval::{
 use anneal_difftest::mutators_miri::{
     ArithmeticCastMutator, BitValidityTransmuteMutator, DetRng, GeneratedMiriCandidate,
     MIRI_CORPUS_CRATE_HEADER, MIRI_CORPUS_MODULE_PREAMBLE, MiriAstMutator, MutationMode,
-    PlaceProjectionWrapper, TreeBorrowsRetagInterleaver, build_standalone_candidate_source,
-    generate_miri_batch, generate_miri_corpus_batch, reconstruct_miri_mutation_steps,
-    replay_miri_mutation_steps,
+    PlaceProjectionWrapper, RawPtrOffsetMutator, TreeBorrowsRetagInterleaver,
+    build_standalone_candidate_source, generate_miri_batch, generate_miri_corpus_batch,
+    reconstruct_miri_mutation_steps, replay_miri_mutation_steps,
 };
 use cargo_anneal::{
     AnnealOutcome, CaptureDriverConfig, ComparisonVerdict, DivergenceKind, MiriOutcome,
@@ -153,11 +153,11 @@ data = json.loads(json_path.read_text())
 assert data["harness"] == "miri-difftest"
 assert data["oracle_comparison"] == "performed"
 assert data["mode"] == "identity"
-assert data["total_candidates"] == 108
-assert data["compiled_candidates"] == 108
+assert data["total_candidates"] == 110
+assert data["compiled_candidates"] == 110
 assert data["compile_failed_candidates"] == 0
-assert data["compared_candidates"] == 108
-assert data["agree_count"] == 108
+assert data["compared_candidates"] == 110
+assert data["agree_count"] == 110
 assert data["diverge_count"] == 0
 assert data["kernel_confirmed_divergences"] == 0
 assert data["not_compared_count"] == 0
@@ -2289,6 +2289,146 @@ pub fn early_ret_ep2_live(b_static: &'static [u8], flag: bool) -> u32 {
         "{repro_report:#?}"
     );
     assert!(repro_report.kernel_confirmed);
+}
+
+/// `RawPtrOffsetMutator`'s `u8` read of the uninitialized padding byte at offset
+/// 1 of a `PaddedU8U32` through `(&raw const s) as *const u8` and
+/// `offset(base, 1isize)` (`model-checking/kani#5183`) compiles, faults in Miri on
+/// the uninitialized byte, and agrees with Anneal's strict UB at the same read;
+/// its `Pass` multi-element `copy_nonoverlapping` template (whole-array pointer
+/// casts) compiles and agrees on the returned value. The template's former
+/// element sub-place form (`&raw const __cp_src[0]`) stays a negative control: a
+/// kernel-confirmed `wrong_value` divergence (Anneal copies only the first
+/// element), so this test fails once `trusted/` fixes it and the restriction can
+/// be lifted.
+#[test]
+fn raw_ptr_offset_padding_read_and_whole_array_copy_templates_agree_with_miri() {
+    let dir = unique_temp_dir("raw_ptr_pad_templates");
+    let root = repo_root();
+    let padding = template_candidate(
+        0,
+        &RawPtrOffsetMutator,
+        MutationMode::Ub,
+        "let __raw_pad_base: *const u8 = (&raw const __raw_pad_s) as *const u8;",
+        &[],
+    );
+    assert!(
+        padding
+            .fn_source
+            .contains("let __raw_pad_byte: u8 = unsafe { *offset(__raw_pad_base, __raw_pad_step) };")
+            && padding.fn_source.contains("let __raw_pad_step: isize = 1isize;")
+            && padding.fn_source.contains("PaddedU8U32 {"),
+        "{}",
+        padding.fn_source
+    );
+    let copy = template_candidate(
+        1,
+        &RawPtrOffsetMutator,
+        MutationMode::Pass,
+        "let __src_p: *const u32 = (&raw const __cp_src) as *const u32;",
+        &[],
+    );
+    assert!(
+        copy.fn_source
+            .contains("copy_nonoverlapping(__src_p, __dst_p, 2usize);"),
+        "{}",
+        copy.fn_source
+    );
+    let neg_name = "neg_ctrl_raw_ptr_elem_subplace_copy__b0_c2";
+    let neg_source = format!(
+        "pub fn {neg_name}() -> u32 {{
+    let __cp_src: [u32; 2] = [22u32, 99u32];
+    let mut __cp_dst: [u32; 2] = [0u32, 0u32];
+    unsafe {{
+        let __src_p: *const u32 = &raw const __cp_src[0];
+        let __dst_p: *mut u32 = &raw mut __cp_dst[0];
+        copy_nonoverlapping(__src_p, __dst_p, 2usize);
+    }}
+    __cp_dst[0] ^ __cp_dst[1]
+}}
+"
+    );
+    let neg = handwritten_candidate(
+        2,
+        "raw_ptr_negative_control",
+        neg_name,
+        "RawPtrOffsetMutator",
+        &neg_source,
+    );
+    let findings_dir = dir.join("findings_raw_ptr_pad");
+    let report = evaluate_miri_batches(
+        "seeded",
+        0xE2_0002,
+        &[vec![padding, copy, neg]],
+        3,
+        Some(&findings_dir),
+        Some(&root),
+    )
+    .expect("evaluate RawPtrOffsetMutator template batch");
+    assert_eq!(report.compiled_candidates, 3, "{report:#?}");
+    assert_eq!(report.compared_candidates, 3, "{report:#?}");
+    let item = |name: &str| {
+        report
+            .item_reports
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing item report for `{name}`"))
+    };
+
+    let pad = item("ep2_template__b0_c0");
+    assert!(
+        matches!(pad.verdict, ComparisonVerdict::Agree)
+            && matches!(&pad.miri, MiriOutcome::Ub { message, .. }
+                if message.contains("uninitialized"))
+            && matches!(pad.anneal, AnnealOutcome::Ub { span: Some(_) }),
+        "the padding read must be UB on the uninitialized byte in Miri and strict UB at \
+         the same read in Anneal: verdict={:?} miri={:?} anneal={:?}",
+        pad.verdict,
+        pad.miri,
+        pad.anneal
+    );
+
+    let cp = item("ep2_template__b0_c1");
+    assert!(
+        matches!(cp.verdict, ComparisonVerdict::Agree)
+            && matches!(cp.miri, MiriOutcome::PassScalar { size_bytes: 4, .. }),
+        "the whole-array copy template must return normally and agree: verdict={:?} \
+         miri={:?} anneal={:?}",
+        cp.verdict,
+        cp.miri,
+        cp.anneal
+    );
+
+    let gap = item(neg_name);
+    assert!(
+        matches!(
+            gap.verdict,
+            ComparisonVerdict::Diverge(DivergenceKind::WrongValue { .. })
+        ) && gap.miri
+            == MiriOutcome::PassScalar {
+                bits: 117,
+                size_bytes: 4,
+            }
+            && gap.anneal
+                == AnnealOutcome::PassScalar {
+                    bits: 22,
+                    size_bytes: 4,
+                }
+            && gap.kernel_confirmed,
+        "the element sub-place copy gap changed (fixed?): verdict={:?} miri={:?} anneal={:?} \
+         kernel_confirmed={}; lift the `RawPtrOffsetMutator` copy-template restriction and \
+         update `probe_gap_subplace_multi_elem_copy` in `miri_eval.rs`",
+        gap.verdict,
+        gap.miri,
+        gap.anneal,
+        gap.kernel_confirmed
+    );
+    assert_eq!(report.agree_count, 2, "{:#?}", report.findings);
+    assert_eq!(report.diverge_count, 1, "{:#?}", report.findings);
+    assert_eq!(
+        report.findings.iter().map(|f| f.divergence_class.as_str()).collect::<Vec<_>>(),
+        vec!["wrong_value"]
+    );
 }
 
 /// Seed whose unmutated program diverges (`missed_ub`) independently of any

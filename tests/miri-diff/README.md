@@ -69,11 +69,11 @@ uninterpreted external call.
 
 ## Corpus Coverage
 
-The corpus holds 108 tests: 50 `pass`, 12 `panic` (11 certified via
+The corpus holds 110 tests: 51 `pass`, 12 `panic` (11 certified via
 `verifySafePanicMirPointBounded` and `panic_explicit_macro` via
-`verifyModularSafePanicMirBounded`), and 46 `ub`, grouped into nine categories
+`verifyModularSafePanicMirBounded`), and 47 `ub`, grouped into ten categories
 that `// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
-Anneal agrees with Miri on all 108 tests: `manifest.toml` records no open
+Anneal agrees with Miri on all 110 tests: `manifest.toml` records no open
 `known_anneal_bug` entry.
 Category 8 adds 12 tests covering layout-sensitive types and raw-pointer retags
 (`pass_option_some_niche_and_single_c_mut` exercises both niche encoding and
@@ -198,6 +198,27 @@ Category 9's `UnwindCleanupGuard` has an empty `drop`:
   [`miri_eval.rs`](../../crates/anneal-difftest/src/miri_eval.rs) pins the
   sub-place form (`probe_gap_move_subplace_reborrow_write`).
 
+Category 10 adds 2 tests:
+
+| Theme | Tests |
+| :--- | :--- |
+| Multi-element `copy_nonoverlapping` through whole-array pointer casts | `pass_copy_nonoverlapping_multi_elem_array_pair` (`[22, 99]` copied as 2 `u32` elements through `(&raw const src) as *const u32`, returning `22 ^ 99 = 117`) |
+| Raw-pointer reads of uninitialized struct padding (`model-checking/kani#5183`) | `ub_raw_ptr_read_uninit_struct_padding_kani5183` (byte offset `1` of `PaddedU8U32` read as `u8` through `(&raw const s) as *const u8` and `offset(base, 1isize)`) |
+
+Category 10 leaves out one construct on which Anneal currently disagrees with
+Miri: a multi-element `copy_nonoverlapping` between *element* sub-places,
+`copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize)`. Anneal
+copies only the first element through the `.constantIndex` sub-place pointer
+(`wrong_value`, `value_mismatch`; Anneal returns `22` where Miri returns `117`
+for `[22, 99]`), whereas the whole-array casts of
+`pass_copy_nonoverlapping_multi_elem_array_pair` copy both elements and agree.
+`semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned` pins
+the element sub-place form (`probe_gap_subplace_multi_elem_copy`,
+kernel-confirmed) as a ratchet that fails once the gap is fixed, and the
+`subplace_multi_elem_copy_truncation` semantic mutant of
+`--self-check-mutants` replays a semantics that truncates the agreeing
+whole-array copy to one element (killed as `wrong_value`).
+
 `miri-difftest` confirms each divergence in the Lean kernel with
 `lean -M 4096`. When the batched confirmation fails, every divergence is
 re-confirmed on its own: an item that exhausts a resource (`-M`, heartbeats,
@@ -234,7 +255,7 @@ rejects, or an elaboration error) still aborts the run.
 
 ### Summary of Open Anneal Bugs Exposed by the Suite
 
-The suite currently exposes no open Anneal bug: all 108 tests agree with Miri.
+The suite currently exposes no open Anneal bug: all 110 tests agree with Miri.
 
 ## Running the Suite
 
