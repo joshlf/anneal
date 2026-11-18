@@ -49,7 +49,7 @@ proofs land; see [`docs/architecture.md`](architecture.md)):
 | :--- | :--- | :--- | :--- |
 | **Trusted foundation** | [`trusted/`](../trusted) | Extracts MIR and emits pure proof scripts (`trusted/rustc-capture/`), defines captured MIR syntax and verification operational semantics (`trusted/lean/`), orchestrates CLI invocation (`trusted/cargo-anneal/`), and audits the Anneal repository in CI (`trusted/audit/`). | **In the TCB.** Audited by humans (alongside external files pinned by hash manifests inside `trusted/`). |
 | **Proof theory** | `theory/` | Defines the normalized `StableAst`, proves lowering passes (`Abstracts`), and provides WP calculi, separation logic, and proof tactics (`theory/`). | **Outside the TCB.** Treated as potentially adversarial; audited mechanically in Anneal's CI and checked by the Lean 4 kernel. |
-| **Vendored reference model** | `vendor/lean-miri/` | Pinned snapshot of `proofs-rs/lean-miri` used by Anneal's MIR correspondence architecture ([`docs/mir-correspondence-design.md`](mir-correspondence-design.md)). Never shipped in the user toolchain archive. | **In the correspondence TCB.** Pinned byte-for-byte in `vendor/lean-miri/UPSTREAM_PIN.json` (locked by SHA-256 in `trusted/audit/`); only the 160-module `Miri.Interpreter.ExecutionMachine` slice (excluding `Miri.Input.NativeMathHost`) is compiled (or restored from a digest-gated cache) and verified by `.olean` SHA-256, every non-`isPartial` declaration in the 160 compiled vendored modules is replayed from scratch through the standalone Lean kernel onto the authenticated sysroot base on every run, and every reachable constant in its execution cone is checked against `unsafe`, `partial`, `.vendorMiri` `opaque`, and unapproved axioms. |
+| **Vendored reference model** | `vendor/lean-miri/` | Pinned snapshot of `proofs-rs/lean-miri` used by Anneal's MIR correspondence architecture ([`docs/mir-correspondence-design.md`](mir-correspondence-design.md)). Never shipped in the user toolchain archive. | **In the correspondence TCB.** Pinned byte-for-byte in `vendor/lean-miri/UPSTREAM_PIN.json` (locked by SHA-256 in `trusted/audit/`), with 10 `Miri/Interpreter/*.lean` files carrying Anneal's human-audited opt-in `deinitMovedPlace` patch pinned in `patched_files` and `LOCKED_PATCHED_MIRI_FILES`; only the 160-module `Miri.Interpreter.ExecutionMachine` slice (excluding `Miri.Input.NativeMathHost`) is compiled (or restored from a digest-gated cache) and verified by `.olean` SHA-256, every non-`isPartial` declaration in the 160 compiled vendored modules is replayed from scratch through the standalone Lean kernel onto the authenticated sysroot base on every run, and every reachable constant in its execution cone is checked against `unsafe`, `partial`, `.vendorMiri` `opaque`, and unapproved axioms. |
 
 ### How CI auditing and user-machine verification fit together
 
@@ -343,7 +343,7 @@ reference model before succeeding:
    authenticated sysroot, constructs a clean `baseEnv` containing only the
    authenticated `.foundation` and `.sysrootFoundation` modules (`trustLevel :=
    0`, `plugins := #[]`, `loadExts := false`), and replays every non-`isPartial`
-   declaration in the 160 compiled vendored modules (38,603 declarations,
+   declaration in the 160 compiled vendored modules (38,718 declarations,
    including all 27 `.opaqueInfo` declarations) from scratch through the
    standalone Lean kernel (`baseEnv.toKernelEnv.replay vendorReplayLocals`) on
    every run—cold build and warm cache hit alike. The 75 compiler-generated
@@ -398,10 +398,11 @@ To include these files in `trusted/`'s effective TCB without relocating them,
   Pins the upstream commit and SHA-256 digest of every file in
   `vendor/lean-miri/` (together with any consumer-side patch records and the
   160-module `Miri.Interpreter.ExecutionMachine` slice), verified against
-  `LOCKED_UPSTREAM_PIN_SHA256` inside `trusted/audit/src/lib.rs`. The initial
-  vendor commit imports upstream `lean-miri` unmodified (`patched_files: []`)
-  so any subsequent consumer-side patches are reviewed as explicit diffs in
-  `patched_files` and `LOCKED_PATCHED_MIRI_FILES`.
+  `LOCKED_UPSTREAM_PIN_SHA256` inside `trusted/audit/src/lib.rs`. After the
+  unmodified initial vendor import, 10 `Miri/Interpreter/*.lean` files carry
+  Anneal's human-audited opt-in `deinitMovedPlace` patch, pinned by explicit
+  `upstream_sha256`/`patched_sha256` records in `patched_files` and the closed
+  `LOCKED_PATCHED_MIRI_FILES` allowlist.
 
 Because CI and `anneal-audit` reject any mismatch against these files, changing
 a root manifest or toolchain artifact requires a corresponding diff inside

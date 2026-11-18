@@ -114,7 +114,7 @@ pub const LOCKED_MIRI_COMMIT: &str = "c92d1d9754c9dd585b6b9d6949ae67e5e4665d6a";
 /// change to `UPSTREAM_PIN.json` requires a corresponding TCB diff inside
 /// `trusted/audit/`.
 pub const LOCKED_UPSTREAM_PIN_SHA256: &str =
-    "c7b58e6934125ff80ad7f11200056046e220d6d50b40148a4078645f94e30f2b";
+    "c25108bbfb9513c27fbf55c5c2821b7754003fe3d5569e4f1b57b27bf2ed7622";
 
 /// Pinned SHA-256 manifest digest of all `<prefix>/lib/lean/{Init,Std,Lean}*`
 /// `.olean`, `.olean.server`, and `.olean.private` artifacts in the pinned Lean
@@ -127,9 +127,20 @@ pub const LOCKED_UPSTREAM_PIN_SHA256: &str =
 pub const LOCKED_SYSROOT_FOUNDATION_MANIFEST_SHA256: &str =
     "2fa0ec692ae74051072ed105a66054843dcb711eb702bb64dc7947b96ea4fcdf";
 
-/// Closed allowlist of `vendor/lean-miri` files permitted to carry a
-/// consumer-side patch in `UPSTREAM_PIN.json`.
-pub const LOCKED_PATCHED_MIRI_FILES: &[&str] = &[];
+/// Exact set of `vendor/lean-miri` files that must each carry one
+/// consumer-side patch record in `UPSTREAM_PIN.json`.
+pub const LOCKED_PATCHED_MIRI_FILES: &[&str] = &[
+    "Miri/Interpreter/Call.lean",
+    "Miri/Interpreter/Cast.lean",
+    "Miri/Interpreter/ExecutionCalls.lean",
+    "Miri/Interpreter/ExecutionCast.lean",
+    "Miri/Interpreter/ExecutionMachine.lean",
+    "Miri/Interpreter/LocalAccess.lean",
+    "Miri/Interpreter/MachineHooks.lean",
+    "Miri/Interpreter/OperandMachine.lean",
+    "Miri/Interpreter/Place.lean",
+    "Miri/Interpreter/PlaceMachine.lean",
+];
 
 // ---------------------------------------------------------------------------
 // Domain types
@@ -3714,7 +3725,7 @@ mod process_tests {
 
         // Positive replayed count with `miriReplay == true` succeeds.
         validate_correspondence_report(
-            &obj(json!({"miriReplay": true, "miriReplayedDeclarations": 38603})),
+            &obj(json!({"miriReplay": true, "miriReplayedDeclarations": 38718})),
             true,
         )
         .unwrap();
@@ -3725,15 +3736,20 @@ mod process_tests {
         let vendor_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/lean-miri");
         let orig_pin_bytes = fs::read(vendor_root.join("UPSTREAM_PIN.json")).unwrap();
 
-        // Unauthorized `patched_files` entry is rejected even if the outer pin
-        // digest check has already passed.
+        // Unauthorized `patched_files` entry, mismatched `patched_sha256`
+        // between `patched_files` and `vendor_tree`, and missing
+        // `patched_sha256` annotation in `vendor_tree` are rejected even if
+        // the outer pin digest check has already passed.
         let mut pin_json: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
-        pin_json["patched_files"] = json!([{
-            "path": "Miri.lean",
-            "upstream_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-            "patched_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-            "rationale": "unauthorized patch"
-        }]);
+        pin_json["patched_files"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "path": "Miri.lean",
+                "upstream_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "patched_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "rationale": "unauthorized patch"
+            }));
         let err_unauth_patch =
             verify_upstream_pin_bytes(&vendor_root, &serde_json::to_vec(&pin_json).unwrap())
                 .unwrap_err();
@@ -3743,6 +3759,44 @@ mod process_tests {
                 .message
                 .contains("unauthorized patched file in UPSTREAM_PIN.json: Miri.lean"),
             "unexpected error: {err_unauth_patch}"
+        );
+
+        let mut pin_mismatch_json: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+        pin_mismatch_json["patched_files"][0]["patched_sha256"] =
+            json!("2222222222222222222222222222222222222222222222222222222222222222");
+        let err_patch_mismatch = verify_upstream_pin_bytes(
+            &vendor_root,
+            &serde_json::to_vec(&pin_mismatch_json).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err_patch_mismatch.code, 1);
+        assert!(
+            err_patch_mismatch
+                .message
+                .contains("patched_sha256 mismatch between patched_files and vendor_tree"),
+            "unexpected error: {err_patch_mismatch}"
+        );
+
+        let mut pin_missing_annot_json: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+        for entry in pin_missing_annot_json["vendor_tree"]["files"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if entry["path"].as_str() == Some("Miri/Interpreter/Call.lean") {
+                entry.as_object_mut().unwrap().remove("patched_sha256");
+            }
+        }
+        let err_missing_annot = verify_upstream_pin_bytes(
+            &vendor_root,
+            &serde_json::to_vec(&pin_missing_annot_json).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err_missing_annot.code, 1);
+        assert!(
+            err_missing_annot.message.contains(
+                "inconsistent patched_sha256 annotation in vendor_tree for Miri/Interpreter/Call.lean"
+            ),
+            "unexpected error: {err_missing_annot}"
         );
 
         // Forbidden `Miri.Input.NativeMathHost` closure entry is rejected.
@@ -3778,6 +3832,137 @@ mod process_tests {
                 "expected 160 execution_machine_closure entries in UPSTREAM_PIN.json, got 0"
             ),
             "unexpected error: {err_empty_closure}"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_patched_files_and_vendor_tree_annotations_in_pin_bytes() {
+        let vendor_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/lean-miri");
+        let orig_pin_bytes = fs::read(vendor_root.join("UPSTREAM_PIN.json")).unwrap();
+
+        // (a) A `patched_sha256` annotation on a non-allowlisted file in
+        // `vendor_tree` is rejected.
+        let mut pin_extra_annot: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+        let mut found_miri = false;
+        for entry in pin_extra_annot["vendor_tree"]["files"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if entry["path"].as_str() == Some("Miri.lean") {
+                entry.as_object_mut().unwrap().insert(
+                    "patched_sha256".to_string(),
+                    json!("3333333333333333333333333333333333333333333333333333333333333333"),
+                );
+                found_miri = true;
+            }
+        }
+        assert!(found_miri, "Miri.lean must appear in vendor_tree.files");
+        let err_extra_annot =
+            verify_upstream_pin_bytes(&vendor_root, &serde_json::to_vec(&pin_extra_annot).unwrap())
+                .unwrap_err();
+        assert_eq!(err_extra_annot.code, 1);
+        assert!(
+            err_extra_annot
+                .message
+                .contains("inconsistent patched_sha256 annotation in vendor_tree for Miri.lean"),
+            "unexpected error: {err_extra_annot}"
+        );
+
+        // (b) A dropped record / count mismatch in `patched_files` is
+        // rejected.
+        let mut pin_dropped: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+        pin_dropped["patched_files"].as_array_mut().unwrap().pop();
+        let err_dropped =
+            verify_upstream_pin_bytes(&vendor_root, &serde_json::to_vec(&pin_dropped).unwrap())
+                .unwrap_err();
+        assert_eq!(err_dropped.code, 1);
+        assert!(
+            err_dropped.message.contains(
+                "patched_files list in UPSTREAM_PIN.json does not match locked allowlist"
+            ),
+            "unexpected error: {err_dropped}"
+        );
+
+        // (c) Duplicate records in `patched_files` are rejected.
+        let mut pin_dup: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+        let first_record = pin_dup["patched_files"][0].clone();
+        let first_path = first_record["path"].as_str().unwrap().to_string();
+        pin_dup["patched_files"]
+            .as_array_mut()
+            .unwrap()
+            .push(first_record);
+        let err_dup =
+            verify_upstream_pin_bytes(&vendor_root, &serde_json::to_vec(&pin_dup).unwrap())
+                .unwrap_err();
+        assert_eq!(err_dup.code, 1);
+        assert!(
+            err_dup
+                .message
+                .contains(&format!("duplicate patched_files record for {first_path}")),
+            "unexpected error: {err_dup}"
+        );
+
+        // (d1) An invalid `patched_files` record with
+        // `upstream_sha256 == patched_sha256` is rejected.
+        let mut pin_same_sha: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+        let same_path = pin_same_sha["patched_files"][0]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let upstream_sha = pin_same_sha["patched_files"][0]["upstream_sha256"].clone();
+        pin_same_sha["patched_files"][0]["patched_sha256"] = upstream_sha;
+        let err_same_sha =
+            verify_upstream_pin_bytes(&vendor_root, &serde_json::to_vec(&pin_same_sha).unwrap())
+                .unwrap_err();
+        assert_eq!(err_same_sha.code, 1);
+        assert!(
+            err_same_sha
+                .message
+                .contains(&format!("invalid patched_files record for {same_path}")),
+            "unexpected error: {err_same_sha}"
+        );
+
+        // (d2) An invalid `patched_files` record with empty/whitespace
+        // `rationale` is rejected.
+        let mut pin_blank_rationale: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+        let blank_path = pin_blank_rationale["patched_files"][0]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        pin_blank_rationale["patched_files"][0]["rationale"] = json!("   \t\n ");
+        let err_blank_rationale = verify_upstream_pin_bytes(
+            &vendor_root,
+            &serde_json::to_vec(&pin_blank_rationale).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err_blank_rationale.code, 1);
+        assert!(
+            err_blank_rationale
+                .message
+                .contains(&format!("invalid patched_files record for {blank_path}")),
+            "unexpected error: {err_blank_rationale}"
+        );
+
+        // (e) A mismatch between `patched_files.upstream_sha256` and
+        // `vendor_tree.files[].sha256` is rejected.
+        let mut pin_upstream_mismatch: Json = serde_json::from_slice(&orig_pin_bytes).unwrap();
+        let mismatch_path = pin_upstream_mismatch["patched_files"][0]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        pin_upstream_mismatch["patched_files"][0]["upstream_sha256"] =
+            json!("4444444444444444444444444444444444444444444444444444444444444444");
+        let err_upstream_mismatch = verify_upstream_pin_bytes(
+            &vendor_root,
+            &serde_json::to_vec(&pin_upstream_mismatch).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err_upstream_mismatch.code, 1);
+        assert!(
+            err_upstream_mismatch.message.contains(&format!(
+                "patched_sha256 mismatch between patched_files and vendor_tree for {mismatch_path}"
+            )),
+            "unexpected error: {err_upstream_mismatch}"
         );
     }
 }

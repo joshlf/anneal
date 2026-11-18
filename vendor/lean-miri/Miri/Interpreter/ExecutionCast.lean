@@ -112,5 +112,14 @@ def hooks [DecidableEq K] (queries : Leaves (State K U) C)
     copyAllowTransmute := fun c source dest => copyRuntimePlace place copy c source dest true
     copyNoValidate := copyRuntimePlaceNoValidate place copy
     projectRead := projectRead
-    projectWrite := PlaceDynamic.field projection }
+    projectWrite := PlaceDynamic.field projection
+    takePendingMoveDeinit := place.takePendingMoveDeinit
+    restorePendingMoveDeinit := fun flag => do
+      if flag then
+        let s ← get
+        set { s with machine := { s.machine with pendingMoveDeinit := true } }
+    deinitSource := fun c source =>
+      match source.op with
+      | .immediate _ => pure ()
+      | .indirect mplace => place.writeMemoryNoValidate c .uninit ⟨mplace, source.layout⟩ }
 end Miri.Interpreter.ExecutionCast
