@@ -2104,6 +2104,68 @@ theorem concretizeSymState_initSymState
   dsimp only [concretizeSymState, initSymState, initMachineState, concretizeSymMemory]
   rw [concretizeSymSlots_initSymSlots args body.localDecls body.argCount h_len]
 
+@[reducible]
+def strictSymSlot : SymSlot → Option SymSlot
+  | .concrete .dead => .some (.concrete .dead)
+  | .concrete .uninit => .some (.concrete .uninit)
+  | .concrete (.init v) =>
+    match strictValue 8 v with
+    | .some v' => .some (.concrete (.init v'))
+    | .none => .none
+  | .symArg idx =>
+    match strictBits 16 idx with
+    | .some idx' => .some (.symArg idx')
+    | .none => .none
+  | .symPair0 v0 idx =>
+    match strictValue 8 v0, strictBits 16 idx with
+    | .some v0', .some idx' => .some (.symPair0 v0' idx')
+    | _, _ => .none
+
+theorem strictSymSlot_eq : ∀ (s : SymSlot), strictSymSlot s = .some s
+  | .concrete .dead => rfl
+  | .concrete .uninit => rfl
+  | .concrete (.init v) => by
+    dsimp only [strictSymSlot]
+    rw [strictValue_eq 8 v]
+  | .symArg idx => by
+    dsimp only [strictSymSlot]
+    rw [strictBits_eq 16 idx]
+  | .symPair0 v0 idx => by
+    dsimp only [strictSymSlot]
+    rw [strictValue_eq 8 v0, strictBits_eq 16 idx]
+
+@[reducible]
+def strictSymState (st : SymState) : SymState :=
+  match strictBits 16 st.blockIdx, strictBits 16 st.stmtIdx, strictBits 16 st.nextTag with
+  | .some bIdx, .some sIdx, .some nTag =>
+    match mapStrictList strictSymSlot st.slots, strictBorrows st.borrows with
+    | .some slots', .some borrows' =>
+      { blockIdx := bIdx
+        stmtIdx := sIdx
+        slots := slots'
+        borrows := borrows'
+        nextTag := nTag }
+    | _, _ => st
+  | _, _, _ => st
+
+@[simp]
+theorem strictSymState_eq (st : SymState) : strictSymState st = st := by
+  cases st
+  unfold strictSymState
+  dsimp only
+  rw [strictBits_eq, strictBits_eq, strictBits_eq,
+      mapStrictList_eq strictSymSlot strictSymSlot_eq,
+      strictBorrows_eq]
+
+@[reducible]
+def strictSymStatePeriodic (_fuel : Nat) (st : SymState) : SymState :=
+  strictSymState st
+
+@[simp]
+theorem strictSymStatePeriodic_eq (fuel : Nat) (st : SymState) :
+    strictSymStatePeriodic fuel st = st :=
+  strictSymState_eq st
+
 /-- Symbolic counterpart of `placeIndexLocalsInit`: every `.index idxLocal`
 projection in `proj` names a concrete initialized scalar slot of `slots`. -/
 def symPlaceIndexLocalsInit (slots : List SymSlot) : List ProjectionElem → Bool
@@ -2924,7 +2986,7 @@ def checkSymReturnsFalse : Nat → CapturedMir → SymState → Bool
   | .zero, _, _ => false
   | .succ fuel, body, st =>
     match symStepConcrete body st with
-    | .some st' => checkSymReturnsFalse fuel body st'
+    | .some st' => checkSymReturnsFalse fuel body (strictSymStatePeriodic fuel st')
     | .none => symIsReturnFalse body st
 
 theorem checkSymReturnsFalse_sound :
@@ -2938,6 +3000,7 @@ theorem checkSymReturnsFalse_sound :
     cases hStep : symStepConcrete body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymReturnsFalse_sound
         fuel body args st' hCheck
         (symStepConcrete_sound fuel body args st st' hStep hHold)
@@ -5418,7 +5481,7 @@ def checkSymReturnsFalseExt : Nat → CapturedMir → SymState → Bool
   | .zero, _, _ => false
   | .succ fuel, body, st =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymReturnsFalseExt fuel body st'
+    | .some st' => checkSymReturnsFalseExt fuel body (strictSymStatePeriodic fuel st')
     | .none => symIsReturnFalse body st
 
 theorem checkSymReturnsFalseExt_sound :
@@ -5432,6 +5495,7 @@ theorem checkSymReturnsFalseExt_sound :
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymReturnsFalseExt_sound
         fuel body args st' hCheck
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -6265,7 +6329,7 @@ def checkSymPinsLoopDirect : Nat → CapturedMir → SymState → List (Nat × S
   | .zero, _, _, _ :: _ => false
   | .succ fuel, body, st, p :: ps =>
     match symStepConcrete body st with
-    | .some st' => checkSymPinsLoopDirect fuel body st' (p :: ps)
+    | .some st' => checkSymPinsLoopDirect fuel body (strictSymStatePeriodic fuel st') (p :: ps)
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
@@ -6293,6 +6357,7 @@ theorem checkSymPinsLoopDirect_sound :
     cases hStep : symStepConcrete body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymPinsLoopDirect_sound
         fuel body args st' (p :: ps) hCheck
         (symStepConcrete_sound fuel body args st st' hStep hHold)
@@ -6569,7 +6634,7 @@ def checkSymPinsLoop : Nat → CapturedMir → SymState → List (Nat × ScalarI
   | .zero, _, _, _ :: _ => false
   | .succ fuel, body, st, p :: ps =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymPinsLoop fuel body st' (p :: ps)
+    | .some st' => checkSymPinsLoop fuel body (strictSymStatePeriodic fuel st') (p :: ps)
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
@@ -6609,6 +6674,7 @@ theorem checkSymPinsLoop_sound :
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymPinsLoop_sound
         fuel body args st' (p :: ps) hCheck
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -6788,12 +6854,12 @@ def collectSymPinsLoop :
   | .zero, _, _ => .nil
   | .succ fuel, body, st =>
     match symStepConcreteExt body st with
-    | .some st' => collectSymPinsLoop fuel body st'
+    | .some st' => collectSymPinsLoop fuel body (strictSymStatePeriodic fuel st')
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
         match checkSymReturnsFalseExt fuel body stFalse with
-        | true => (idx, sc) :: collectSymPinsLoop fuel body stTrue
+        | true => (idx, sc) :: collectSymPinsLoop fuel body (strictSymState stTrue)
         | false => .nil
       | .none =>
         match symExtractDerefSlicePinEq body st with
@@ -6802,11 +6868,11 @@ def collectSymPinsLoop :
           | .zero => .nil
           | .succ fuel' =>
             match checkSymReturnsFalseExt fuel' body stFalse with
-            | true => (idx, sc) :: collectSymPinsLoop fuel' body stTrue
+            | true => (idx, sc) :: collectSymPinsLoop fuel' body (strictSymState stTrue)
             | false => .nil
         | .none =>
           match symStepDerefSymArgAny body st with
-          | .some st' => collectSymPinsLoop fuel body st'
+          | .some st' => collectSymPinsLoop fuel body (strictSymState st')
           | .none => .nil
 
 /-- Look up the `ScalarInt` pinned for argument index `idx` in `pins`. -/
@@ -7219,19 +7285,19 @@ def checkSymPinsExtLoop
   | .zero, _, _, _ :: _ => false
   | .succ fuel, body, st, p :: ps =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymPinsExtLoop expected fuel body st' (p :: ps)
+    | .some st' => checkSymPinsExtLoop expected fuel body (strictSymStatePeriodic fuel st') (p :: ps)
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
-        match checkSymReturnsFalseExt fuel body stFalse with
+        match checkSymReturnsFalseExt fuel body (strictSymStatePeriodic fuel stFalse) with
         | false => false
         | true =>
           match removeScalarPin idx sc (p :: ps) with
-          | .some pins' => checkSymPinsExtLoop expected fuel body stTrue pins'
-          | .none => checkSymPinsExtLoop expected fuel body stTrue (p :: ps)
+          | .some pins' => checkSymPinsExtLoop expected fuel body (strictSymStatePeriodic fuel stTrue) pins'
+          | .none => checkSymPinsExtLoop expected fuel body (strictSymStatePeriodic fuel stTrue) (p :: ps)
       | .none =>
         match symStepDerefSymArgWithExpected body st expected with
-        | .some st' => checkSymPinsExtLoop expected fuel body st' (p :: ps)
+        | .some st' => checkSymPinsExtLoop expected fuel body (strictSymStatePeriodic fuel st') (p :: ps)
         | .none => false
 
 theorem checkSymPinsExtLoop_sound
@@ -7252,6 +7318,7 @@ theorem checkSymPinsExtLoop_sound
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymPinsExtLoop_sound expected
         fuel body args st' (p :: ps) hWidths hCheck
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -7262,6 +7329,7 @@ theorem checkSymPinsExtLoop_sound
         rw [hExt] at hCheck
         rcases tup with ⟨idx, sc, stTrue, stFalse⟩
         dsimp only at hCheck
+        rw [strictSymStatePeriodic_eq] at hCheck
         cases hFalse : checkSymReturnsFalseExt fuel body stFalse with
         | false => rw [hFalse] at hCheck; nomatch hCheck
         | true =>
@@ -7276,11 +7344,13 @@ theorem checkSymPinsExtLoop_sound
           cases hRem : removeScalarPin idx sc (p :: ps) with
           | some pins' =>
             rw [hRem] at hCheck
+            (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
             have hRestHold :=
               checkSymPinsExtLoop_sound expected fuel body args stTrue pins' hWidths hCheck hHoldTrue
             exact allScalarPinsHold_of_removeScalarPin args idx sc hPinIdx (p :: ps) pins' hRem hRestHold
           | none =>
             rw [hRem] at hCheck
+            (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
             exact checkSymPinsExtLoop_sound expected fuel body args stTrue (p :: ps) hWidths hCheck hHoldTrue
       | none =>
         rw [hExt] at hCheck
@@ -7288,6 +7358,7 @@ theorem checkSymPinsExtLoop_sound
         | none => rw [hDeref] at hCheck; nomatch hCheck
         | some st' =>
           rw [hDeref] at hCheck
+          (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
           exact checkSymPinsExtLoop_sound expected
             fuel body args st' (p :: ps) hWidths hCheck
             (symStepDerefSymArgWithExpected_hold_sound fuel body args st st' expected hWidths hDeref hHold)
@@ -7437,7 +7508,7 @@ def checkMirRustPinnedSpecOptWithCallees
     | fuel' + 1 =>
       match stepMirStatePeriodic fuel' subjectBody st with
       | .ret (.normal (retVal, _)) =>
-        checkOptMirBoolBounded specFuel optEnsBody (args ++ [retVal])
+        checkOptMirBoolBounded specFuel optEnsBody (args ++ [strictValueTop retVal])
       | .ret .panic => false
       | .ret .abort => false
       | .tau st' => loop fuel' st'
@@ -7499,6 +7570,7 @@ theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithCallees
       cases out with
       | normal p =>
         rcases p with ⟨rv, m⟩
+        simp only [strictValueTop_eq] at h
         exact ⟨rv, m, rfl,
           optMirBoolPredicateHolds_of_checkBounded
             specFuel optEnsBody (args ++ [rv]) h⟩
@@ -7781,7 +7853,7 @@ def checkMirRustPinnedSpecOptWithSpecCallees
       match stepMirStatePeriodic fuel' subjectBody st with
       | .ret (.normal (retVal, _)) =>
         checkOptMirBoolWithCalleesBounded
-          specFuel optEnsBody specCallees (args ++ [retVal])
+          specFuel optEnsBody specCallees (args ++ [strictValueTop retVal])
       | .ret .panic => false
       | .ret .abort => false
       | .tau st' => loop fuel' st'
@@ -7833,6 +7905,7 @@ theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithSpecCallees
       cases out with
       | normal p =>
         rcases p with ⟨rv, m⟩
+        simp only [strictValueTop_eq] at h
         exact ⟨rv, m, rfl,
           optMirBoolPredicateHoldsWithCallees_of_checkBounded
             specFuel optEnsBody specCallees (args ++ [rv]) h⟩
@@ -8413,7 +8486,7 @@ def extractMirUpperBound1Loop : Nat → CapturedMir → SymState → Option Scal
   | .zero, _, _ => .none
   | .succ fuel, body, st =>
     match symStepConcreteExt body st with
-    | .some st' => extractMirUpperBound1Loop fuel body st'
+    | .some st' => extractMirUpperBound1Loop fuel body (strictSymStatePeriodic fuel st')
     | .none =>
       match symExtractUpperBound1 body st with
       | .some (boundSc, stFalse) =>
@@ -8422,7 +8495,7 @@ def extractMirUpperBound1Loop : Nat → CapturedMir → SymState → Option Scal
         | false => .none
       | .none =>
         match symStepDerefSymArgAny body st with
-        | .some st' => extractMirUpperBound1Loop fuel body st'
+        | .some st' => extractMirUpperBound1Loop fuel body (strictSymState st')
         | .none => .none
 
 /-- Extract the 1-argument unsigned upper bound `boundSc` from `reqBody`. -/
@@ -8435,7 +8508,7 @@ def checkSymUpperBound1LoopDirect :
   | .zero, _, _, _ => false
   | .succ fuel, body, st, boundSc =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymUpperBound1LoopDirect fuel body st' boundSc
+    | .some st' => checkSymUpperBound1LoopDirect fuel body (strictSymStatePeriodic fuel st') boundSc
     | .none =>
       match symExtractUpperBound1 body st with
       | .some (scOut, stFalse) =>
@@ -8463,6 +8536,7 @@ theorem checkSymUpperBound1LoopDirect_sound :
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymUpperBound1LoopDirect_sound
         fuel body args st' boundSc hCheck
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -8505,7 +8579,7 @@ def checkSymUpperBound1Loop :
   | .zero, _, _, _ => false
   | .succ fuel, body, st, boundSc =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymUpperBound1Loop fuel body st' boundSc
+    | .some st' => checkSymUpperBound1Loop fuel body (strictSymStatePeriodic fuel st') boundSc
     | .none =>
       match symExtractUpperBound1 body st with
       | .some (scOut, stFalse) =>
@@ -8513,10 +8587,10 @@ def checkSymUpperBound1Loop :
           (Bool.and
             (Nat.beq scOut.bits boundSc.bits)
             (Nat.beq scOut.sizeBytes boundSc.sizeBytes))
-          (checkSymReturnsFalseExt fuel body stFalse)
+          (checkSymReturnsFalseExt fuel body (strictSymStatePeriodic fuel stFalse))
       | .none =>
         match symStepDerefSymArg body st 0 boundSc.sizeBytes with
-        | .some st' => checkSymUpperBound1Loop fuel body st' boundSc
+        | .some st' => checkSymUpperBound1Loop fuel body (strictSymStatePeriodic fuel st') boundSc
         | .none => false
 
 theorem checkSymUpperBound1Loop_sound :
@@ -8537,6 +8611,7 @@ theorem checkSymUpperBound1Loop_sound :
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymUpperBound1Loop_sound
         fuel body args st' boundSc hCheck hArg0
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -8561,6 +8636,7 @@ theorem checkSymUpperBound1Loop_sound :
             | true =>
               rw [hSzEq] at hCheck
               dsimp only [Bool.and] at hCheck
+              rw [strictSymStatePeriodic_eq] at hCheck
               have hScEq : scOut = boundSc :=
                 scalarInt_eq_of_parts
                   (Nat.eq_of_beq_eq_true hBitsEq)
@@ -8576,6 +8652,7 @@ theorem checkSymUpperBound1Loop_sound :
           nomatch hCheck
         | some st' =>
           rw [hDeref] at hCheck
+          (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
           rcases hArg0 with ⟨b0, hb0⟩
           exact checkSymUpperBound1Loop_sound
             fuel body args st' boundSc hCheck ⟨b0, hb0⟩
@@ -9965,10 +10042,10 @@ def checkSymReturnsTrue : Nat → CapturedMir → SymState → Bool
   | .zero, _, _ => false
   | .succ fuel, body, st =>
     match symStepConcreteInBounds body st with
-    | .some st' => checkSymReturnsTrue fuel body st'
+    | .some st' => checkSymReturnsTrue fuel body (strictSymStatePeriodic fuel st')
     | .none =>
       match symStepConcreteDeref body st with
-      | .some st' => checkSymReturnsTrue fuel body st'
+      | .some st' => checkSymReturnsTrue fuel body (strictSymStatePeriodic fuel st')
       | .none => symIsReturnTrue body st
 
 theorem checkSymReturnsTrue_sound :
@@ -9983,6 +10060,7 @@ theorem checkSymReturnsTrue_sound :
     cases hStep : symStepConcreteInBounds body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact symStepConcreteInBounds_true_sound
         fuel body args st st' hLen hArgsInit hStep
         (checkSymReturnsTrue_sound fuel body args st' hLen hArgsInit hCheck)
@@ -9991,6 +10069,7 @@ theorem checkSymReturnsTrue_sound :
       cases hDeref : symStepConcreteDeref body st with
       | some st' =>
         rw [hDeref] at hCheck
+        (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
         exact symStepConcreteDeref_true_sound
           fuel body args st st' hDeref
           (checkSymReturnsTrue_sound fuel body args st' hLen hArgsInit hCheck)
@@ -10340,10 +10419,10 @@ def checkSymEnsuresUpperBound1Loop :
   | .zero, _, _, _ => false
   | .succ fuel, body, st, boundSc =>
     match symStepConcreteInBounds body st with
-    | .some st' => checkSymEnsuresUpperBound1Loop fuel body st' boundSc
+    | .some st' => checkSymEnsuresUpperBound1Loop fuel body (strictSymStatePeriodic fuel st') boundSc
     | .none =>
       match symStepConcreteDeref body st with
-      | .some st' => checkSymEnsuresUpperBound1Loop fuel body st' boundSc
+      | .some st' => checkSymEnsuresUpperBound1Loop fuel body (strictSymStatePeriodic fuel st') boundSc
       | .none =>
         match symExtractEnsuresUpperBound1 body st with
         | .some (scOut, stTrue) =>
@@ -10351,10 +10430,10 @@ def checkSymEnsuresUpperBound1Loop :
             (Bool.and
               (Nat.beq scOut.bits boundSc.bits)
               (Nat.beq scOut.sizeBytes boundSc.sizeBytes))
-            (checkSymReturnsTrue fuel body stTrue)
+            (checkSymReturnsTrue fuel body (strictSymStatePeriodic fuel stTrue))
         | .none =>
           match symStepDerefSymArg body st 1 boundSc.sizeBytes with
-          | .some st' => checkSymEnsuresUpperBound1Loop fuel body st' boundSc
+          | .some st' => checkSymEnsuresUpperBound1Loop fuel body (strictSymStatePeriodic fuel st') boundSc
           | .none => false
 
 theorem checkSymEnsuresUpperBound1Loop_sound :
@@ -10376,6 +10455,7 @@ theorem checkSymEnsuresUpperBound1Loop_sound :
     cases hStep : symStepConcreteInBounds body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact symStepConcreteInBounds_true_sound
         fuel body args st st' hLen hArgsInit hStep
         (checkSymEnsuresUpperBound1Loop_sound
@@ -10385,6 +10465,7 @@ theorem checkSymEnsuresUpperBound1Loop_sound :
       cases hDeref : symStepConcreteDeref body st with
       | some st' =>
         rw [hDeref] at hCheck
+        (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
         exact symStepConcreteDeref_true_sound
           fuel body args st st' hDeref
           (checkSymEnsuresUpperBound1Loop_sound
@@ -10400,6 +10481,7 @@ theorem checkSymEnsuresUpperBound1Loop_sound :
             nomatch hCheck
           | some st' =>
             rw [hDerefSym] at hCheck
+            (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
             exact symStepDerefSymArg_true_sound
               fuel body args st st' 1 boundSc.sizeBytes r hArg1 hDerefSym
               (checkSymEnsuresUpperBound1Loop_sound
@@ -10422,6 +10504,7 @@ theorem checkSymEnsuresUpperBound1Loop_sound :
               | true =>
                 rw [hSzEq] at hCheck
                 dsimp only [Bool.and] at hCheck
+                rw [strictSymStatePeriodic_eq] at hCheck
                 have hScEq : scOut = boundSc :=
                   scalarInt_eq_of_parts
                     (Nat.eq_of_beq_eq_true hBitsEq)
@@ -10892,11 +10975,11 @@ def checkSymSinglePinExtLoop :
   | .zero, _, _, _, _ => false
   | .succ fuel, body, st, expectedIdx, expectedSc =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymSinglePinExtLoop fuel body st' expectedIdx expectedSc
+    | .some st' => checkSymSinglePinExtLoop fuel body (strictSymStatePeriodic fuel st') expectedIdx expectedSc
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
-        match checkSymReturnsFalseExt fuel body stFalse with
+        match checkSymReturnsFalseExt fuel body (strictSymStatePeriodic fuel stFalse) with
         | false => false
         | true =>
           match Nat.beq idx expectedIdx with
@@ -10904,10 +10987,10 @@ def checkSymSinglePinExtLoop :
             Bool.and
               (Nat.beq sc.bits expectedSc.bits)
               (Nat.beq sc.sizeBytes expectedSc.sizeBytes)
-          | false => checkSymSinglePinExtLoop fuel body stTrue expectedIdx expectedSc
+          | false => checkSymSinglePinExtLoop fuel body (strictSymStatePeriodic fuel stTrue) expectedIdx expectedSc
       | .none =>
         match symStepDerefSymArg body st expectedIdx expectedSc.sizeBytes with
-        | .some st' => checkSymSinglePinExtLoop fuel body st' expectedIdx expectedSc
+        | .some st' => checkSymSinglePinExtLoop fuel body (strictSymStatePeriodic fuel st') expectedIdx expectedSc
         | .none => false
 
 theorem checkSymSinglePinExtLoop_sound :
@@ -10927,6 +11010,7 @@ theorem checkSymSinglePinExtLoop_sound :
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymSinglePinExtLoop_sound
         fuel body args st' expectedIdx expectedSc hCheck hArg
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -10937,6 +11021,7 @@ theorem checkSymSinglePinExtLoop_sound :
         rw [hExt] at hCheck
         rcases tup with ⟨idx, sc, stTrue, stFalse⟩
         dsimp only at hCheck
+        rw [strictSymStatePeriodic_eq] at hCheck
         cases hFalse : checkSymReturnsFalseExt fuel body stFalse with
         | false => rw [hFalse] at hCheck; nomatch hCheck
         | true =>
@@ -10960,6 +11045,7 @@ theorem checkSymSinglePinExtLoop_sound :
             exact hPinIdx
           | false =>
             rw [hIdxEq] at hCheck
+            (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
             exact checkSymSinglePinExtLoop_sound
               fuel body args stTrue expectedIdx expectedSc hCheck hArg hHoldTrue
       | none =>
@@ -10968,6 +11054,7 @@ theorem checkSymSinglePinExtLoop_sound :
         | none => rw [hDeref] at hCheck; nomatch hCheck
         | some st' =>
           rw [hDeref] at hCheck
+          (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
           rcases hArg with ⟨b0, hb0⟩
           exact checkSymSinglePinExtLoop_sound
             fuel body args st' expectedIdx expectedSc hCheck ⟨b0, hb0⟩
@@ -11728,10 +11815,10 @@ def checkSymSliceBoolTrueBounded : Nat → CapturedMir → ScalarInt → SymStat
   | .zero, _, _, _ => false
   | .succ fuel, body, expectedSc, st =>
     match symStepConcreteInBounds body st with
-    | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc st'
+    | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc (strictSymStatePeriodic fuel st')
     | .none =>
       match symStepConcreteDeref body st with
-      | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc st'
+      | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc (strictSymStatePeriodic fuel st')
       | .none =>
         match symStepDerefLoadSlice body st expectedSc with
         | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc st'
@@ -11764,6 +11851,7 @@ theorem checkSymSliceBoolTrueBounded_sound :
     cases hStep1 : symStepConcreteInBounds body st with
     | some st' =>
       rw [hStep1] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact symStepConcreteInBounds_true_sound
         fuel body [v, v] st st' hLen hArgsInit hStep1
         (checkSymSliceBoolTrueBounded_sound fuel body v expectedSc st' hArgCount hSlice hCheck)
@@ -11772,6 +11860,7 @@ theorem checkSymSliceBoolTrueBounded_sound :
       cases hStep2 : symStepConcreteDeref body st with
       | some st' =>
         rw [hStep2] at hCheck
+        (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
         exact symStepConcreteDeref_true_sound
           fuel body [v, v] st st' hStep2
           (checkSymSliceBoolTrueBounded_sound fuel body v expectedSc st' hArgCount hSlice hCheck)
@@ -11814,7 +11903,7 @@ def checkSymReturnsSymArg0 : Nat → CapturedMir → SymState → Bool
   | .zero, _, _ => false
   | .succ fuel, body, st =>
     match symStepConcreteInBounds body st with
-    | .some st' => checkSymReturnsSymArg0 fuel body st'
+    | .some st' => checkSymReturnsSymArg0 fuel body (strictSymStatePeriodic fuel st')
     | .none => symIsReturnSymArg0 body st
 
 theorem wpCoalBounded_of_symIsReturnSymArg0
@@ -11913,6 +12002,7 @@ theorem wpCoalBounded_of_checkSymReturnsSymArg0 :
       exact wpCoalBounded_of_symIsReturnSymArg0 fuel body v st P hCheck hP hVInit
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       have hRec := wpCoalBounded_of_checkSymReturnsSymArg0 fuel body v st' P hArg1 hVInit hCheck hP
       dsimp only [symStepConcreteInBounds] at hStep
       unfold wpCoalBounded stepMirState

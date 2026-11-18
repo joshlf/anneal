@@ -1714,16 +1714,16 @@ theorem polyId_all_typeArgs_verified :
       subst h_args
       have h_non_bc :
           t ≠ .bool → t ≠ .char →
-          ∀ fields vIdx,
-            valueListContainsUninit fields = false →
+          ∀ v : Value,
+            valueContainsUninit v = false →
             wpMirSym 8 (polyIdClaimFor [(t, l)]).body
-              (initMachineStateWithCallees (polyIdClaimFor [(t, l)]).body [.aggregate vIdx fields]
+              (initMachineStateWithCallees (polyIdClaimFor [(t, l)]).body [v]
                 (polyIdClaimFor [(t, l)]).callees)
               (mirNormalPost (fun retVal _ =>
-                (polyIdClaimFor [(t, l)]).post [.aggregate vIdx fields] retVal)) := by
-        intro h_nb h_nc fields vIdx h_f_init
+                (polyIdClaimFor [(t, l)]).post [v] retVal)) := by
+        intro h_nb h_nc v h_v_init
         let body_t := (polyIdClaimFor [(t, l)]).body
-        let s0 := initMachineStateWithCallees body_t [.aggregate vIdx fields] (polyIdClaimFor [(t, l)]).callees
+        let s0 := initMachineStateWithCallees body_t [v] (polyIdClaimFor [(t, l)]).callees
         have h_op :
             evalOperand s0.frame.locals (.move { local_ := 1, projection := [] })
               s0.memory.borrows s0.memory.globals
@@ -1731,17 +1731,16 @@ theorem polyId_all_typeArgs_verified :
               s0.memory.callerLocals
               (s0.memory.activeCallee.getD body_t).localDecls
               s0.memory.callStack =
-            .ok (.aggregate vIdx fields) [.uninit, .uninit] := by
+            .ok v [.uninit, .uninit] := by
           rw [evalOperand_move_nil_eq]
           (conv in peekLocalInitOrUnit _ _ => whnf)
-          (conv in valueContainsUninit _ => whnf)
-          rw [h_f_init]
+          rw [h_v_init]
           rfl
         have h_s1 :
             stepMirFn body_t s0 =
             MirStepNode.step
               { frame := { blockIdx := 0, stmtIdx := 1,
-                           locals := [.init (.aggregate vIdx fields), .uninit] }
+                           locals := [.init v, .uninit] }
                 memory := s0.memory } := by
           cases t <;> first | contradiction | (
             (conv => lhs; whnf)
@@ -1751,16 +1750,16 @@ theorem polyId_all_typeArgs_verified :
         have h_s2 :
             stepMirFn (polyIdClaimFor [(t, l)]).body
               { frame := { blockIdx := 0, stmtIdx := 1,
-                           locals := [.init (.aggregate vIdx fields), .uninit] }
+                           locals := [.init v, .uninit] }
                 memory := (initMachineStateWithCallees (polyIdClaimFor [(t, l)]).body
-                            [.aggregate vIdx fields] (polyIdClaimFor [(t, l)]).callees).memory } =
-            match valueListContainsUninit fields with
+                            [v] (polyIdClaimFor [(t, l)]).callees).memory } =
+            match valueContainsUninit v with
             | true => MirStepNode.fail .ub
             | false =>
-              MirStepNode.retNormal (.aggregate vIdx fields)
+              MirStepNode.retNormal v
                 (initMachineStateWithCallees (polyIdClaimFor [(t, l)]).body
-                  [.aggregate vIdx fields] (polyIdClaimFor [(t, l)]).callees).memory := rfl
-        rw [h_f_init] at h_s2
+                  [v] (polyIdClaimFor [(t, l)]).callees).memory := rfl
+        rw [h_v_init] at h_s2
         unfold wpMirSym wpMirExecSym
         rw [evalSymNodeTree_eq, stepMirExecSymTree_eval]
         dsimp only [stepMirState]
@@ -1806,13 +1805,7 @@ theorem polyId_all_typeArgs_verified :
         rw [h_rv, h_char]
         rfl
       all_goals
-        cases v with
-        | uninit => nomatch h_v_init
-        | unit => rfl
-        | scalar _ => rfl
-        | ptr _ _ => rfl
-        | aggregate vIdx fields =>
-          exact h_non_bc (by intro h; nomatch h) (by intro h; nomatch h) fields vIdx h_v_init
+        exact h_non_bc (by intro h; nomatch h) (by intro h; nomatch h) v h_v_init
 
 /--
 `#[external_spec]` sidecar for `core::slice::from_raw_parts_mut` and a modular

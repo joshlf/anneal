@@ -2550,32 +2550,35 @@ private theorem strictBool_eq : ∀ (b : Bool), strictBool b = .some b
 @[reducible]
 def strictBits : Nat → Nat → Option Nat
   | .zero, n => .some n
-  | .succ k, n =>
-    match Nat.beq n 0 with
-    | true => .some 0
-    | false =>
-      match strictBits k (n / 2), Nat.beq (n % 2) 0 with
-      | .some q, true => .some (2 * q)
-      | .some q, false => .some (2 * q + 1)
-      | .none, _ => .none
+  | .succ _, .zero => .some .zero
+  | .succ _, .succ .zero => .some (.succ .zero)
+  | .succ k, .succ (.succ m) =>
+    let n := .succ (.succ m)
+    match strictBits k (Nat.div n 2), Nat.beq (Nat.mod n 2) 0 with
+    | .some q, true => .some (Nat.mul 2 q)
+    | .some q, false => .some (.succ (Nat.mul 2 q))
+    | .none, _ => .none
 
-private theorem strictBits_eq : ∀ (k n : Nat), strictBits k n = .some n
+theorem strictBits_eq : ∀ (k n : Nat), strictBits k n = .some n
   | .zero, _ => rfl
-  | .succ k, n => by
+  | .succ _, .zero => rfl
+  | .succ _, .succ .zero => rfl
+  | .succ k, .succ (.succ m) => by
     unfold strictBits
-    rw [strictBits_eq k (n / 2)]
-    cases h0 : Nat.beq n 0
-    · cases hm : Nat.beq (n % 2) 0
-      · dsimp only
-        have hm' : n % 2 ≠ 0 := fun hc => by
-          rw [hc] at hm
-          nomatch hm
-        exact congrArg Option.some (by omega)
-      · dsimp only
-        have hm' : n % 2 = 0 := Nat.eq_of_beq_eq_true hm
-        exact congrArg Option.some (by omega)
+    dsimp only
+    rw [strictBits_eq k (Nat.div (.succ (.succ m)) 2)]
+    cases hm : Nat.beq (Nat.mod (.succ (.succ m)) 2) 0
     · dsimp only
-      exact congrArg Option.some (Nat.eq_of_beq_eq_true h0).symm
+      have hm' : (.succ (.succ m)) % 2 ≠ 0 := fun hc => by
+        change Nat.mod (.succ (.succ m)) 2 = 0 at hc
+        rw [hc] at hm
+        nomatch hm
+      change Option.some (2 * ((m + 2) / 2) + 1) = Option.some (m + 2)
+      exact congrArg Option.some (by omega)
+    · dsimp only
+      have hm' : (.succ (.succ m)) % 2 = 0 := Nat.eq_of_beq_eq_true hm
+      change Option.some (2 * ((m + 2) / 2)) = Option.some (m + 2)
+      exact congrArg Option.some (by omega)
 
 @[reducible]
 def strictOpt {α : Type} : Option α → Option (Option α)
@@ -2677,7 +2680,7 @@ def strictBorrows : List BorrowEntry → Option (List BorrowEntry)
     | .some e', .some rest' => .some (e' :: rest')
     | _, _ => .none
 
-private theorem strictBorrows_eq : ∀ (bs : List BorrowEntry), strictBorrows bs = .some bs
+theorem strictBorrows_eq : ∀ (bs : List BorrowEntry), strictBorrows bs = .some bs
   | .nil => rfl
   | e :: rest => by
     unfold strictBorrows
@@ -2691,7 +2694,7 @@ def mapStrictList {α : Type} (f : α → Option α) : List α → Option (List 
     | .some x', .some xs' => .some (x' :: xs')
     | _, _ => .none
 
-private theorem mapStrictList_eq {α : Type} (f : α → Option α) (hf : ∀ x, f x = .some x) :
+theorem mapStrictList_eq {α : Type} (f : α → Option α) (hf : ∀ x, f x = .some x) :
     ∀ (xs : List α), mapStrictList f xs = .some xs
   | .nil => rfl
   | x :: xs => by
@@ -2716,7 +2719,7 @@ def strictValue : Nat → Value → Option Value
     | .some v', .some fs' => .some (.aggregate v' fs')
     | _, _ => .none
 
-private theorem strictValue_eq : ∀ (d : Nat) (v : Value), strictValue d v = .some v
+theorem strictValue_eq : ∀ (d : Nat) (v : Value), strictValue d v = .some v
   | .zero, _ => rfl
   | .succ d, v => by
     cases v with
@@ -2735,6 +2738,17 @@ private theorem strictValue_eq : ∀ (d : Nat) (v : Value), strictValue d v = .s
     | aggregate v fs =>
       unfold strictValue
       rw [strictBits_eq, mapStrictList_eq (strictValue d) (strictValue_eq d) fs]
+
+@[reducible]
+def strictValueTop (v : Value) : Value :=
+  match strictValue 16 v with
+  | .some v' => v'
+  | .none => v
+
+@[simp]
+theorem strictValueTop_eq (v : Value) : strictValueTop v = v := by
+  unfold strictValueTop
+  rw [strictValue_eq 16 v]
 
 @[reducible]
 def strictSlotsAt (argCount idx : Nat) : List LocalSlot → Option (List LocalSlot)
@@ -2862,13 +2876,13 @@ theorem stepMirStateStrict_eq (body : CapturedMir) (st : MirExecState) :
 
 /--
 Periodic spine-normalizing wrapper around `stepMirState`: normalizes concrete
-`MachineState` spines once every 8 steps (`fuel' % 8 == 0`), keeping call-by-name
-kernel reduction linear in straight-line MIR length with minimal stack depth and
-zero overhead on short symbolic companions.
+`MachineState` spines once every 4 steps (`Nat.beq (fuel' % 4) 0`), keeping
+call-by-name kernel reduction linear in MIR length with compact kernel `Expr`
+arenas and zero overhead on short symbolic companions.
 -/
 @[reducible]
 def stepMirStatePeriodic (fuel' : Nat) (body : CapturedMir) (st : MirExecState) : MirStepNode :=
-  match Nat.beq (fuel' % 8) 0 with
+  match Nat.beq (fuel' % 4) 0 with
   | false => stepMirState body st
   | true => stepMirStateStrict body st
 
@@ -2876,7 +2890,7 @@ def stepMirStatePeriodic (fuel' : Nat) (body : CapturedMir) (st : MirExecState) 
 theorem stepMirStatePeriodic_eq (fuel' : Nat) (body : CapturedMir) (st : MirExecState) :
     stepMirStatePeriodic fuel' body st = stepMirState body st := by
   unfold stepMirStatePeriodic
-  cases Nat.beq (fuel' % 8) 0 <;> simp only [stepMirStateStrict_eq]
+  cases Nat.beq (fuel' % 4) 0 <;> simp only [stepMirStateStrict_eq]
 
 /--
 Computable bounded boolean checker for `MirBoolPredicateHolds`: returns `true`
@@ -3387,7 +3401,7 @@ def checkMirRustPinnedSpecWithCallees
     | fuel' + 1 =>
       match stepMirStatePeriodic fuel' subjectBody st with
       | .ret (.normal (retVal, _)) =>
-        checkMirBoolWithCalleesBounded specFuel ensBody callees (args ++ [retVal])
+        checkMirBoolWithCalleesBounded specFuel ensBody callees (args ++ [strictValueTop retVal])
       | .ret .panic => false
       | .ret .abort => false
       | .tau st' => loop fuel' st'
@@ -3447,6 +3461,7 @@ theorem wpMirBounded_of_checkMirRustPinnedSpecWithCallees
       cases out with
       | normal p =>
         rcases p with ⟨rv, m⟩
+        simp only [strictValueTop_eq] at h
         intro retVal mem' h_eq
         injection h_eq with h_pair
         cases h_pair
