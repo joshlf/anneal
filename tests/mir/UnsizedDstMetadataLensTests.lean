@@ -328,9 +328,8 @@ theorem brief_named_slice_metadata_and_roundtrip :
     evalRvalue_aggregate_rawPtr_slice_roundtrip _ 2 (.uint .u32) 0 ptrU32Ty usizeTy .mut mem0
       dstDecls layouts64 wide4 rfl rfl rfl⟩
 
-/-- `AggregateKind.rawPtr` (`from_raw_parts`) on `[u32]`, `str`, and thin `u32`, plus
-`to_raw_parts` round-trip preserving `UnsizedSliceDstAt`, `ActiveTypedSliceBorrow`, and
-`ActiveTypedSliceMutBorrow`, followed by a borrow-backed write! -/
+/-- Backing 4-element `[u32; 4]` local `_0` and borrow-backed wide pointer `_1`
+at tag `77`. -/
 def backingArrLocals : List LocalSlot :=
   [.init (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]),
    .init (WidePtrVal.toValue 8 (WidePtrVal.mk ⟨77, 0⟩ 4))]
@@ -345,6 +344,11 @@ theorem mutLens77 :
   ⟨sliceTypedAt_encodeElems ByteLensCodec.u32LE 77 xs4,
    mutEntry77, rfl, ⟨Nat.le_refl 0, Nat.le_refl 16⟩, TreeBorrowPerm.permitsUniqueWrite_unique⟩
 
+/-- `AggregateKind.rawPtr` (`from_raw_parts`) on `[u32]`, `str`, and thin `u32`,
+plus decomposed `(data, meta)` `.field 0/1` + `rawPtr` round-trip preserving
+`UnsizedSliceDstAt` and followed by a borrow-backed write (with the proof body
+also exercising `of_invalidateConflictingBorrows_ne` on `ActiveTypedSliceBorrow`
+and `ActiveTypedSliceMutBorrow`). -/
 theorem rawPtr_from_raw_parts_and_roundtrip_with_borrow_write :
     evalRvalue (dstLocals 8)
         (.aggregate (.rawPtr sliceU32Ty .not)
@@ -524,8 +528,9 @@ theorem pointee_resolution_typeArgs_and_operand_fallbacks :
    resolveIntrinsicPointeeTy?_of_ref_operand _ _ _ _ [] .not .str 1 rfl rfl⟩
 
 /-- Concrete positive witnesses for `[u32]` (`len = 4 → size = 16, align = 4`),
-`str` (`len = 5 → size = 5, align = 1`), empty `[u32]` (`len = 0 → size = 0, align = 4`),
-ZST `[(); 1000]` (`elemSz = 0 → size = 0, align = 1`), and sized `u32` (`size = 4, align = 4`). -/
+`str` (`len = 5 → size = 5, align = 1`), empty `[u32]` (`len = 0 → size = 0`),
+ZST `[(); 1000]` (`elemSz = 0 → size = 0, align = 1`), and sized `u32`
+(`size = 4, align = 4`). -/
 theorem size_and_align_positive_witnesses :
     let bodyU32 := sizeAlignSliceCallerMir (.uint .u32)
     let bodyZst := sizeAlignSliceCallerMir (.tuple [])
@@ -1090,11 +1095,12 @@ active protector (`activeProtectors = [5]`): steps across
 `Layout::for_value_raw` `(size, align)` tuple assembly (`move` operands), proving
 `MirWpConverges` to `(16usize, 4usize)` *compositionally* (chaining the per-step
 `MirWpConverges` transports of the `*_preserves_spatialPin` lemmas into the final `return`), that
-the spatial pin on `_2 : [u32; 4]`, the loan binding on `_3` (`mirStateRel` at the exit), the
-borrow-backed `UnsizedSliceDstAt` lens of the raw slice pointer into the pinned array, and its
-`ActiveTypedSliceMutBorrow` all remain intact after every step, and that both `bb0` (3-step
-multi-statement + `size_of_val` block) and `bb1` (`align_of_val` block) are `BlockCfg` segments
-re-establishing `mirCfgStateRel` with the non-trivial `pinCfgExtra` invariant. -/
+the spatial pin on `_2 : [u32; 4]`, the loan binding on `_3` (`mirStateRel` at the exit), and the
+borrow-backed `UnsizedSliceDstAt` lens of the raw slice pointer into the pinned array remain
+intact after every step (`ms1..ms5`), with `ActiveTypedSliceMutBorrow` also checked at `ms4` after
+both intrinsic calls, and that both `bb0` (3-step multi-statement + `size_of_val` block) and `bb1`
+(`align_of_val` block) are `BlockCfg` segments re-establishing `mirCfgStateRel` with the
+non-trivial `pinCfgExtra` invariant. -/
 theorem dst_metadata_and_layout_converges_preserving_spatialPin :
     Anneal.MirFuelFree.MirWpConverges pinBody pinMs0
       (fun out =>
@@ -1417,12 +1423,12 @@ theorem ptrMetadata_and_rawPtr_negative_canaries :
    evalRvalue_aggregate_rawPtr_nil_unsupported (dstLocals 8) sliceU32Ty .not
      mem0 dstDecls layouts64⟩
 
-/-- **Metadata-without-deref contrast**:
+/-- **Metadata-without-deref OOB contrast**:
 A wide raw pointer `*const [u32]` with out-of-bounds length `5` (`5 * 4 = 20 > 16` bytes on the
 16-byte global `arrAlloc16`) faults with `.ub` when dereferenced by `Rvalue.len (*_1)`, yet
 `UnOp.ptrMetadata(_1)` and `size_of_val_raw(_1)` (`5 * 4 = 20 < 2^63`) succeed without
 dereferencing memory! -/
-theorem metadata_without_deref_oob_and_disabled_contrast :
+theorem metadata_without_deref_oob_contrast :
     let wideOob5 : WidePtrVal := WidePtrVal.mk p9 5
     let localsOob : List LocalSlot := (dstLocals 8).set 1 (.init (WidePtrVal.toValue 8 wideOob5))
     let bodyU32 := sizeAlignSliceCallerMir (.uint .u32)
@@ -1543,8 +1549,11 @@ remaining fail-closed shapes**:
   metadata for both provenance-carrying `.ptr p9 8` and provenance-free `.scalar ⟨4, 8⟩` data
   pointers, and `UnOp.ptrMetadata` on `.scalar ⟨4, 8⟩` returns `.unit` when typed as `*const u32`
   while faulting `.ub` when typed as `*const [u32]`;
-- the trusted `size_of_val::<[u32]>` and `align_of_val::<[u32]>` fault `.ub` on a provenance-free
-  wide pointer at `stepMirFn` level (they require a provenance-carrying `.ptr _ 8` data pointer);
+- Stage-1 conservative divergence: the trusted `size_of_val::<[u32]>` and
+  `align_of_val::<[u32]>` fault `.ub` on a provenance-free wide pointer at
+  `stepMirFn` level because Stage-1 requires a provenance-carrying `.ptr _ 8`
+  data pointer even when `len = 0` (whereas Rust/Miri/MiniRust allow aligned
+  provenance-free zero-byte layout queries);
 - `from_raw_parts::<[u32]>` with vtable-pointer metadata fails closed with `.ub`;
 - a 32-bit (`ptrSz = 4`) data pointer in a `&str` faults `.ub` for both `size_of_val` and
   `align_of_val` at `stepMirFn` level. -/
@@ -1943,14 +1952,8 @@ def disabledMem : Memory :=
 def disabledLocals : List LocalSlot :=
   [.init pinArrVal, .init (WidePtrVal.toValue 8 wide77), .uninit, .uninit]
 
-/-- **Metadata-without-deref under a disabled tag** (the brief's second contrast case): once the
-borrow `77` behind the raw `*const [u32]` `_1` is disabled, the dereferencing `Rvalue.len (*_1)`
-faults `.ub` (`WidePtrVal.evalRvalue_len_disabled_ub_and_ptrMetadata_ok`), while
-`UnOp.ptrMetadata(_1)` still yields `4` and the live `size_of_val::<[u32]>(_1)` step still writes
-`16`: neither consults the borrow table. Also exercises
-`mirStep_assign_aggregate_rawPtr_wide_scalarAddr_preserves_spatialPin` and
-`mirStep_assign_ptrMetadata_wide_scalarAddr_preserves_spatialPin` on a provenance-free empty
-slice while `_2 : [u32; 4]` is spatially pinned. -/
+/-- MIR body building a provenance-free empty slice via `AggregateKind.rawPtr`
+and extracting its `UnOp.ptrMetadata` while `_2 : [u32; 4]` is spatially pinned. -/
 def danglingPinBody : CapturedMir :=
   { (Anneal.MirLoops.mkMirBody "test::dangling_slice_metadata_with_pinned_array" 1
       [{ mutability := .mut, ty := usizeTy, debugName := some "_0" },
@@ -1972,6 +1975,14 @@ def danglingPinBody : CapturedMir :=
             span := "stmt_dangling_ptr_metadata" }]]) with
     layouts := layouts64 }
 
+/-- **Metadata-without-deref under a disabled tag**: once borrow `77` behind
+raw `*const [u32]` `_1` is `.disabled`, dereferencing `Rvalue.len (*_1)` faults
+`.ub` (`WidePtrVal.evalRvalue_len_disabled_ub_and_ptrMetadata_ok`), while
+`UnOp.ptrMetadata(_1)` still yields `4` and the live `size_of_val::<[u32]>(_1)`
+step still writes `16` (neither consults `mem.borrows`). Also steps
+`danglingPinBody` across `mirStep_assign_aggregate_rawPtr_wide_scalarAddr_preserves_spatialPin`
+and `mirStep_assign_ptrMetadata_wide_scalarAddr_preserves_spatialPin` while
+`_2 : [u32; 4]` remains spatially pinned. -/
 theorem metadata_without_deref_disabled_tag_contrast :
     let bodyU32 := sizeAlignSliceCallerMir (.uint .u32)
     let s0 : MachineState :=
@@ -2076,8 +2087,11 @@ def ptrToPtrPinBody : CapturedMir :=
   and `p as *mut [u32]` while `_2 : [u32; 4]` remains spatially pinned and `_3 : u32` remains bound;
 - `evalRvalue_cast_ptrToPtr_wide_scalarAddr_to_thin` and
   `evalRvalue_cast_ptrToPtr_wide_scalarAddr_to_wide` cast provenance-free wide pointers;
-- `evalRvalue_cast_ptrToPtr_wide_to_thin_disabled_ub` faults `.ub` when casting a `.disabled`
-  borrow-backed wide pointer to a thin pointer (in contrast to `UnOp.ptrMetadata`, which succeeds!);
+- Stage-1 conservative divergence: `evalRvalue_cast_ptrToPtr_wide_to_thin_disabled_ub`
+  faults `.ub` when casting a `.disabled` borrow-backed wide pointer to a thin
+  pointer because Stage-1 eagerly narrows borrow provenance in `deriveStackElemThinPtr`
+  (whereas Rust/Miri/MiniRust pointer-to-pointer casts do not dereference or
+  check borrow liveness, and Stage-1 `UnOp.ptrMetadata` likewise succeeds);
 - `evalRvalue_cast_ptrToPtr_thin_to_wide_ub` and `evalRvalue_cast_ptrToPtr_wide_slice_to_dyn_ub`
   fault `.ub` on thin-to-wide and slice-to-`dyn` `CastKind.ptrToPtr` casts. -/
 theorem ptrToPtr_spatialPin_scalarAddr_and_negative_canaries :
@@ -2182,9 +2196,9 @@ run_cmd do
   let mut auditedThms : Array Name := #[]
   let mut modIdxs : Array ModuleIdx := #[]
   for (modName, anchor, minCount) in
-      [(`Anneal.MirLiftCore, ``Anneal.MirLiftCore.updateBorrowPerm_tag, 35),
-       (`Anneal.SepLogicLenses, ``Anneal.SepLogicLenses.WidePtrVal.dataVal, 25),
-       (`Anneal.PureLift.V2026_06_01Bridge, ``Anneal.PureLift.V2026_06_01Bridge.stdWideSliceVal, 20)] do
+      [(`Anneal.MirLiftCore, ``Anneal.MirLiftCore.updateBorrowPerm_tag, 100),
+       (`Anneal.SepLogicLenses, ``Anneal.SepLogicLenses.WidePtrVal.dataVal, 60),
+       (`Anneal.PureLift.V2026_06_01Bridge, ``Anneal.PureLift.V2026_06_01Bridge.stdWideSliceVal, 40)] do
     let some modIdx := env.getModuleIdx? modName | throwError "module {modName} not imported"
     modIdxs := modIdxs.push modIdx
     let some anchorRange ← findDeclarationRanges? anchor | throwError "no range for {anchor}"
@@ -2260,8 +2274,8 @@ run_cmd do
           work := work.push d
   let unreached := auditedThms.filter (fun n => !reached.contains n)
   unless unreached.isEmpty do
-    throwError "theorems not instantiated by any witness: {unreached.toList}"
+    throwError "theorems not transitively reached by any test declaration: {unreached.toList}"
   logInfo m!"axiom & reachability audit passed: {audited} declarations ({theorems} module theorems, \
-    all constructive and instantiated by witnesses; no Prod.casesOn/Prod.rec in new definitions)"
+    all constructive and transitively reached by test declarations; no Prod.casesOn/Prod.rec)"
 
 end Anneal.UnsizedDstMetadataLensTests

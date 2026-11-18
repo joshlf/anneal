@@ -450,18 +450,25 @@ import LeanMiriSpec.Audit
   `w6_rotate_left_extCall_boundary`) (`LM-4.3`).
 * `LeanMiriSpec.Correspondence.WideSliceDstLM`: wide-slice DST correspondence
   (`*const [T]`, `*mut [T]`, `&[T]`, `&mut [T]`, `*const str`, `*mut str`, `&str`,
-  `&mut str`), conservative hook overlays (`annealDynamicLayoutHooksWideSlice`,
+  `&mut str` over fail-closed exact-layout `encodeSliceElemTyId?` elements),
+  conservative hook overlays (`annealDynamicLayoutHooksWideSlice`,
   `annealPlaceProjectionHooksWideSlice`, `annealScalarOpsHooksWideSlice`,
   `annealCastHooksWideSlice`, `annealAggregateHooksWideSlice`,
   `annealIntrinsicHooksWideSlice`, `annealCallHooksWideSlice`,
   `annealStepHooksWideSlice`), lockstep simulation for `AggregateKind.RawPtr`,
-  `UnaryOp.PtrMetadata`, `CastKind.PtrToPtr` (wide-to-thin and wide-to-wide),
-  `CastKind.PointerCoercion .Unsize` (`&[T; N] -> &[T]`), `PlaceElem.Deref` +
-  `Index`/`ConstantIndex`/`Subslice` (`fromEnd = false`/`true`), `Rvalue.Len (*p)`
-  vs `UnaryOp.PtrMetadata`, `size_of_val` / `align_of_val` intrinsics, whole-step
-  `StepHooks.step`, and kernel-checked `Miri`/Anneal semantic divergence witnesses
-  (Provenance-Free `Index` Bounds-Check before Deref, `Rvalue.Len (*p)` Dead-Alloc
-  and Disabled-Tag vs `PtrMetadata`, and `isize::MAX` Dynamic Layout Cap).
+  `UnaryOp.PtrMetadata` on raw wide pointers (`isWideRawPtrTyId`) and valid safe
+  wide references, `CastKind.PtrToPtr` (wide-to-thin, wide-to-wide, and
+  `to_raw_parts` → `from_raw_parts` round-trip), `PlaceElem.Deref` +
+  `Index`/`ConstantIndex`/`Subslice` (`fromEnd = false`/`true`), `&*p` / `&mut *p`
+  / `&raw const (*p)` / `&raw mut (*p)` reborrows and safe wide-reference validity,
+  `Rvalue.len (*p)`, `core::intrinsics::{size_of_val, align_of_val}` (with exact
+  `isize::MAX = 2^63 - 1` `InvalidMeta(SliceTooBig)` UB boundary), whole-step
+  `Step.step` witnesses, and all 7 kernel-checked `Miri`/Anneal semantic
+  divergences (`DIV-STAGE1-SCALAR-ADDR-WIDE-SLICE-SIZE-ALIGN`,
+  `DIV-LM-PTR-METADATA-INVALID-SAFE-REF`, `DIV-LM-SHARED-REBORROW-FRESH-TAG`,
+  `DIV-LM-PLACE-LEN-BORROW-BOUNDS`, `DIV-LM-RAW-SLICE-PARTIAL-OOB-LEN-INDEX`,
+  `DIV-LM-ZERO-BYTE-DANGLING-REBORROW`, and
+  `DIV-LM-CONSTANT-INDEX-NAT-SUB-SATURATION`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

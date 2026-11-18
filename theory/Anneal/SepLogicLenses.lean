@@ -26591,11 +26591,14 @@ theorem evalRvalue_unaryOp_ptrMetadata_slice (locals locals' : List LocalSlot) (
       .ok (.scalar ⟨wide.2, layoutPointerBytes layouts⟩) locals' mem :=
   evalRvalue_unaryOp_ptrMetadata_wide locals locals' op mem localDecls layouts wide.1 wide.2 hOp
 
-/-- **`evalRvalue_aggregate_rawPtr_slice_roundtrip`** (the brief's named form, stated on
-`WidePtrVal`): decomposing `WidePtrVal.toValue ptrBytes wide` at `loc` via `to_raw_parts`
-(`.field 0` data pointer, `.field 1` length) and reassembling with
-`AggregateKind.rawPtr` on `.slice elemTy` (`ptr::slice_from_raw_parts(_mut)`) is the exact
-identity on the wide pointer, leaving `locals` and `mem` unchanged. -/
+/-- **`evalRvalue_aggregate_rawPtr_slice_roundtrip`** (stated on `WidePtrVal`):
+projecting `.field 0` (data pointer) and `.field 1` (length) from a decomposed
+2-field `(data, meta)` aggregate at `loc` holding `WidePtrVal.toValue ptrBytes wide`
+and reassembling with `AggregateKind.rawPtr` on `.slice elemTy`
+(`ptr::slice_from_raw_parts(_mut)`) is the exact identity on the wide pointer,
+leaving `locals` and `mem` unchanged. Note that rustc lowers
+`<*const [T]>::to_raw_parts` to `CastKind.ptrToPtr` + `UnOp.ptrMetadata` rather
+than MIR `.field` projections on a raw-pointer place. -/
 theorem evalRvalue_aggregate_rawPtr_slice_roundtrip (locals : List LocalSlot) (loc : Local)
     (elemTy : RigidTy) (lIdx : LayoutIdx) (dataTy metaTy : Ty) (mutability : Mutability)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (wide : WidePtrVal)
@@ -26615,8 +26618,11 @@ theorem evalRvalue_aggregate_rawPtr_slice_roundtrip (locals : List LocalSlot) (l
     { kind := .slice elemTy, layoutIdx := lIdx } dataTy metaTy mutability mem localDecls layouts
     wide.1 wide.2 rfl hSlot hNoUnion0 hNoUnion1
 
-/-- Predicate characterizing an unsized slice-like DST `RigidTy` (`.slice elemTy` for element
-byte stride `n`, or `.str` with `n = 1`). -/
+/-- Predicate characterizing an unsized slice-like DST `RigidTy` paired with a
+caller-supplied element byte stride parameter `n`: `.str` pins `n = 1`, while
+`.slice elemTy` leaves `n` unconstrained here so callers pair it with a
+`ByteLensCodec α n` (and with `intrinsicRigidTyByteSize elemTy = some n` at
+layout-intrinsic call sites). -/
 @[reducible]
 def IsUnsizedSliceDstTy (dstTy : RigidTy) (n : Nat) : Prop :=
   (∃ elemTy, dstTy = .slice elemTy) ∨ (dstTy = .str ∧ n = 1)
@@ -26640,16 +26646,19 @@ theorem IsUnsizedSliceDstTy.isUnsizedRawPtrPointee_eq_true {dstTy : RigidTy} {n 
   rcases h with ⟨elemTy, rfl⟩ | ⟨rfl, _⟩ <;> rfl
 
 /--
-**`UnsizedSliceDstBacking`**: the live `Memory` backing of the byte image `bytes` of an unsized
-slice DST at `wide`, for element byte stride `n`:
-- `global`: `bytes` is the live image of `wide.1`'s captured global allocation
-  (`LiveSliceImage mem wide bytes`);
-- `borrow`: a live trusted borrow entry at the pointer's own provenance tag `wide.1.tag` in
-  `mem.borrows` covers the slice window `[wide.1.offsetBytes, wide.1.offsetBytes + wide.2 * n)`
-  with Tree Borrows read permission (the memory half of `ActiveTypedSliceBorrow` /
-  `ActiveTypedSliceMutBorrow` at `wide.1.tag`);
-- `zeroSized`: the window is empty (`wide.2 * n = 0`: `len = 0`, or a ZST element type), which
-  Rust permits for dangling, well-aligned data pointers and which needs no live allocation.
+**`UnsizedSliceDstBacking`**: `Memory`-side backing condition for an unsized
+slice DST at `wide` with caller-supplied element byte stride `n`:
+- `global`: pins `bytes` directly to the live byte image of `wide.1`'s captured
+  global allocation in `mem.globals` (`LiveSliceImage mem wide bytes`);
+- `borrow`: mirrors `ActiveTypedSliceBorrow` / `ActiveTypedSliceMutBorrow` by
+  grounding active borrow tag (`wide.1.tag`), Tree Borrows read permission
+  (`PermitsRead`: `.shared` / `.unique` / `.reserved`), and byte extent
+  (`BorrowRangeCovers` over `[wide.1.offsetBytes, wide.1.offsetBytes + wide.2 * n)`)
+  in `mem.borrows` (while `bytes` carries the caller's `SliceTypedAt` logical
+  witness rather than reading the target frame slot directly);
+- `zeroSized`: the window is empty (`wide.2 * n = 0`: `len = 0`, or a ZST
+  stride `n = 0`), which Rust permits for dangling well-aligned data pointers
+  and which needs no live allocation.
 -/
 inductive UnsizedSliceDstBacking (n : Nat) (mem : Memory) (wide : WidePtrVal) (bytes : ByteMem) :
     Prop where
@@ -26762,12 +26771,16 @@ theorem of_splitAt_pos {mem : Memory} {wide : WidePtrVal} {bytes : ByteMem} {k :
 end UnsizedSliceDstBacking
 
 /--
-**`UnsizedSliceDstAt`**: relational lens over `Memory` (`mem`), runtime wide-pointer `Value`
-(`fatVal`), unsized DST `RigidTy` (`dstTy`: `.slice elemTy` or `.str`), `ByteLensCodec α n`,
-and logical element list `elems : List α`, connecting the wide-pointer representation,
-`PtrMetadataOf`, the typed byte view `SliceTypedAt`, and the live backing of `bytes` in `mem`
-(`UnsizedSliceDstBacking`: a captured global allocation image, a live borrow entry at `wide.1.tag`
-as in `ActiveTypedSliceBorrow` / `ActiveTypedSliceMutBorrow`, or an empty window).
+**`UnsizedSliceDstAt`**: relational lens over `Memory` (`mem`), runtime
+wide-pointer `Value` (`fatVal`), unsized DST `RigidTy` (`dstTy`: `.slice elemTy`
+or `.str`), `ByteLensCodec α n`, and logical element list `elems : List α`.
+Connects the wide-pointer representation, `PtrMetadataOf`, the typed byte view
+`SliceTypedAt c wide elems bytes`, and `UnsizedSliceDstBacking n mem wide bytes`
+(`.global` pins live `bytes` in `mem.globals` via `LiveSliceImage`; `.borrow`
+mirrors `ActiveTypedSliceBorrow` / `ActiveTypedSliceMutBorrow` by grounding
+active borrow tag `wide.1.tag`, read permission, and `BorrowRangeCovers` byte
+extent in `mem.borrows` while `bytes` carries the caller's `SliceTypedAt`
+logical witness; `.zeroSized` covers empty `wide.2 * n = 0` windows).
 -/
 structure UnsizedSliceDstAt {α : Type} {n : Nat} (c : ByteLensCodec α n)
     (ptrBytes : Nat) (dstTy : RigidTy) (mem : Memory) (wide : WidePtrVal)
@@ -26864,9 +26877,11 @@ theorem unique {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     elems₁ = elems₂ :=
   SliceTypedAt.unique h₁.slice_typed h₂.slice_typed
 
-/-- **Backing cases**: the bytes of an `UnsizedSliceDstAt` view are the live image of a captured
-global allocation, or are covered by a live shared borrow lens (`ActiveTypedSliceBorrow`) at the
-pointer's own tag `wide.1.tag`, or the view is an empty (`len = 0` or ZST) window. -/
+/-- **Backing cases**: an `UnsizedSliceDstAt` view either pins `bytes` to a
+captured global allocation in `mem.globals` (`LiveSliceImage`), or pairs its
+`SliceTypedAt` witness with a live shared borrow entry (`ActiveTypedSliceBorrow`:
+active tag `wide.1.tag`, read permission, and `BorrowRangeCovers` extent in
+`mem.borrows`), or has an empty (`wide.2 * n = 0`) byte window. -/
 theorem image_or_activeBorrow_or_zeroSized {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
     (h : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes) :
@@ -27020,8 +27035,11 @@ theorem evalRvalue_ptrMetadata {dstTy : RigidTy} {mem : Memory}
       UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes :=
   ⟨h.meta_of_length.evalRvalue_ptrMetadata hOp, h⟩
 
-/-- **`UnsizedSliceDstAt.evalOperand_field0`**: projecting `.field 0` (`to_raw_parts` data pointer)
-of an `UnsizedSliceDstAt` view at `loc` evaluates to `.ok (.ptr wide.1 ptrBytes) locals`. -/
+/-- **`UnsizedSliceDstAt.evalOperand_field0`**: projecting `.field 0` (data
+pointer of a decomposed 2-field `(data, meta)` aggregate local `loc`) of an
+`UnsizedSliceDstAt` view evaluates to `.ok (.ptr wide.1 ptrBytes) locals`.
+(Rustc lowers `<*const [T]>::to_raw_parts` to `CastKind.ptrToPtr` +
+`UnOp.ptrMetadata` rather than `.field` on a raw-pointer place.) -/
 theorem evalOperand_field0 {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
     (locals : List LocalSlot) (loc : Local) (dataTy : Ty)
@@ -27040,8 +27058,10 @@ theorem evalOperand_field0 {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
   exact evalOperand_copy_widePtr_field0 locals loc dataTy _ _ mem.borrows mem.globals layouts
     mem.callerLocals localDecls mem.callStack hSlot' hNoUnion0
 
-/-- **`UnsizedSliceDstAt.evalOperand_field1`**: projecting `.field 1` (`to_raw_parts` metadata)
-of an `UnsizedSliceDstAt` view at `loc` evaluates to `.ok (.scalar ⟨elems.length, ptrBytes⟩) locals`. -/
+/-- **`UnsizedSliceDstAt.evalOperand_field1`**: projecting `.field 1` (length
+metadata of a decomposed 2-field `(data, meta)` aggregate local `loc`) of an
+`UnsizedSliceDstAt` view evaluates to
+`.ok (.scalar ⟨elems.length, ptrBytes⟩) locals`. -/
 theorem evalOperand_field1 {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
     (locals : List LocalSlot) (loc : Local) (metaTy : Ty)
@@ -27060,10 +27080,11 @@ theorem evalOperand_field1 {ptrBytes : Nat} {dstTy : RigidTy} {mem : Memory}
   exact evalOperand_copy_widePtr_field1 locals loc metaTy _ _ mem.borrows mem.globals layouts
     mem.callerLocals localDecls mem.callStack hSlot' hNoUnion1
 
-/-- **`UnsizedSliceDstAt.evalRvalue_aggregate_rawPtr_roundtrip`**: decomposing `fatVal` at `loc`
-via `.field 0` and `.field 1` (`to_raw_parts`) and reassembling via
-`Rvalue.aggregate (.rawPtr { kind := dstTy, layoutIdx := lIdx } mutability)` returns
-`.ok fatVal locals mem` and preserves `UnsizedSliceDstAt`. -/
+/-- **`UnsizedSliceDstAt.evalRvalue_aggregate_rawPtr_roundtrip`**: projecting
+`.field 0` and `.field 1` from a decomposed 2-field `(data, meta)` aggregate at
+`loc` holding `fatVal` and reassembling via
+`Rvalue.aggregate (.rawPtr { kind := dstTy, layoutIdx := lIdx } mutability)`
+returns `.ok fatVal locals mem` and preserves `UnsizedSliceDstAt`. -/
 theorem evalRvalue_aggregate_rawPtr_roundtrip {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
     (locals : List LocalSlot) (loc : Local) (lIdx : LayoutIdx) (dataTy metaTy : Ty)

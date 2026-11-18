@@ -19315,17 +19315,28 @@ end CallConeNarrowing
 ## Unsized DST Pointer Metadata, `AggregateKind.rawPtr`, and Dynamic Layout Intrinsics
 
 Composable ground-MIR evaluation, `PureMirExec.mirStep`, `wpMirExecSym`, and
-`MirWpConverges` step combinators for:
-1. `Rvalue.unaryOp .ptrMetadata` (wide `[T]` / `str` pointers and thin pointers, plus
-   width-mismatch UB refutations);
-2. `Rvalue.aggregate (.rawPtr pointeeTy mutability)` (`ptr::from_raw_parts(_mut)` /
-   `ptr::slice_from_raw_parts(_mut)`) and `to_raw_parts` (`.field 0` data pointer,
-   `.field 1` metadata scalar) round-trips, plus negative UB / unsupported characterizations;
-3. `TerminatorKind.call` to `core::intrinsics::size_of_val` (`size_of_val_raw`) and
-   `core::intrinsics::align_of_val` (`align_of_val_raw`) on `[T]` (including `ZST` and empty
-   slices), `str`, and sized `T`, with exact `isize` (`signedHalfModulus 8 = 2^63`) overflow,
-   thin-pointer-on-DST, and pointer-width UB characterizations, and `Layout::for_value(_raw)`
-   `(size, align)` tuple assembly.
+`MirWpConverges` step combinators across six subsections:
+1. `Rvalue.unaryOp .ptrMetadata` (wide `[T]` / `str` pointers and thin pointers,
+   plus width-mismatch UB refutations), `Rvalue.aggregate (.rawPtr pointeeTy mut)`
+   (`ptr::from_raw_parts(_mut)` / `ptr::slice_from_raw_parts(_mut)`), and
+   decomposed 2-field `(data, meta)` tuple/aggregate `.field 0` / `.field 1`
+   round-trips (plus negative UB / unsupported characterizations);
+2. `core::intrinsics::size_of_val` (`size_of_val_raw`) and
+   `core::intrinsics::align_of_val` (`align_of_val_raw`) value-level helpers on
+   `[T]` (including `ZST` and empty slices), `str`, and sized `T`, with exact
+   `isize` (`signedHalfModulus 8 = 2^63`) overflow, thin-pointer-on-DST, and
+   pointer-width UB characterizations;
+3. `writeIntrinsicReturn`, `evalTerminator`, `mirStep`, `wpMirBounded`, and
+   `WpConverges` call-terminator lifters plus `Layout::for_value(_raw)`
+   `(size, align)` tuple assembly;
+4. General non-`select` intrinsic-call combinators, `stepMirFn`-level UB fault
+   lifters, and sized `size_of_val` / `align_of_val` lifters;
+5. `MirWpConverges` / `wpMirExecSym` step-transport combinators, provenance-free
+   (integer-address) wide-pointer metadata & `AggregateKind.rawPtr` lifters, and
+   remaining fail-closed characterizations;
+6. `CastKind.ptrToPtr` on wide pointers (`ptr.cast()`, and rustc's actual MIR
+   lowering of `<*const [T]>::to_raw_parts` via `CastKind.ptrToPtr` +
+   `UnOp.ptrMetadata`, since MIR forbids `.field` projections on raw pointers).
 -/
 
 section UnsizedDstMetadataLifters
@@ -19343,7 +19354,9 @@ theorem updateBorrowPerm_tag (entry : BorrowEntry) (targetLocal : Local)
     unfold applyTreeBorrowTransition
     cases treeBorrowNodeAccess .write (treeBorrowWriterRelatedness entry writerTag) entry.perm false <;> rfl
 
-/-- `updateBorrowPerm` leaves `entry` unchanged when `entry.targetLocal ≠ targetLocal`. -/
+/-- `updateBorrowPerm` leaves `entry` unchanged when `entry.targetLocal ≠ targetLocal`
+(constructive `Classical.choice`-free proof kept in `MirLiftCore` for the
+constructive-axiom audit without importing `SepLogic`). -/
 theorem updateBorrowPerm_eq_self_of_ne (entry : BorrowEntry) {targetLocal : Local}
     (writerTag : Option Nat) (targetFrameDepth : Nat) (hNe : entry.targetLocal ≠ targetLocal) :
     updateBorrowPerm entry targetLocal writerTag targetFrameDepth = entry := by
@@ -19354,7 +19367,8 @@ theorem updateBorrowPerm_eq_self_of_ne (entry : BorrowEntry) {targetLocal : Loca
   unfold updateBorrowPerm
   rw [hBeq, Bool.and_false]
 
-/-- `lookupBorrow` commutes with `invalidateConflictingBorrows`. -/
+/-- `lookupBorrow` commutes with `invalidateConflictingBorrows`
+(constructive `MirLiftCore`-local counterpart of `SepLogic`'s lemma). -/
 theorem lookupBorrow_invalidateConflictingBorrows (borrows : List BorrowEntry)
     (targetLocal : Local) (writerTag : Option Nat) (targetFrameDepth tag : Nat) :
     lookupBorrow (invalidateConflictingBorrows borrows targetLocal writerTag targetFrameDepth) tag =
@@ -19479,7 +19493,7 @@ theorem hasProtectedWriteConflict_eq_false_of_forall_ne :
     simp only [hBeq, Bool.and_false, Bool.false_and]
     exact ih
 
-/-! ### 1. `UnOp.ptrMetadata`, `AggregateKind.rawPtr`, and `to_raw_parts` Rvalue Lemmas -/
+/-! ### 1. `UnOp.ptrMetadata`, `AggregateKind.rawPtr`, and Decomposed `(data, meta)` Round-Trips -/
 
 /-- **`evalRvalue_unaryOp_ptrMetadata_wide`**: `Rvalue.unaryOp .ptrMetadata op` on a wide pointer
 `.aggregate 0 [.ptr p ptrBytes, .scalar ⟨len, ptrBytes⟩]` (`ptrBytes = layoutPointerBytes layouts`)
@@ -19686,15 +19700,18 @@ theorem evalRvalue_aggregate_rawPtr_wide_width_mismatch_ub (locals locals₁ loc
   dsimp only [evalOperands]
   rw [hWide, hBad]
 
-/-- Negative: `AggregateKind.rawPtr` with fewer than 2 operands fails closed with `.unsupported`. -/
+/-- Negative: `AggregateKind.rawPtr` with empty operand list `[]` fails closed
+with `.unsupported`. -/
 theorem evalRvalue_aggregate_rawPtr_nil_unsupported (locals : List LocalSlot)
     (pointeeTy : Ty) (mutability : Mutability) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) []) mem localDecls layouts =
       .unsupported := rfl
 
-/-- **`evalOperand_copy_widePtr_field0`**: projecting `.field 0` (`to_raw_parts` data pointer) of a
-2-field wide-pointer aggregate in local `loc` returns `dataVal` with `locals` unchanged. -/
+/-- **`evalOperand_copy_widePtr_field0`**: projecting `.field 0` (data component
+of a decomposed 2-field `(data, meta)` aggregate in local `loc`) returns
+`dataVal` with `locals` unchanged. (Rustc lowers `<*const [T]>::to_raw_parts`
+to `CastKind.ptrToPtr` + `UnOp.ptrMetadata`; see §6.) -/
 theorem evalOperand_copy_widePtr_field0 (locals : List LocalSlot) (loc : Local)
     (fTy : Ty) (dataVal metaVal : Value) (borrows : List BorrowEntry)
     (globals : List CapturedAllocation) (layouts : LayoutTable)
@@ -19710,8 +19727,9 @@ theorem evalOperand_copy_widePtr_field0 (locals : List LocalSlot) (loc : Local)
   rw [hSlot, hNoUnion]
   rfl
 
-/-- **`evalOperand_copy_widePtr_field1`**: projecting `.field 1` (`to_raw_parts` metadata) of a
-2-field wide-pointer aggregate in local `loc` returns `metaVal` with `locals` unchanged. -/
+/-- **`evalOperand_copy_widePtr_field1`**: projecting `.field 1` (metadata
+component of a decomposed 2-field `(data, meta)` aggregate in local `loc`)
+returns `metaVal` with `locals` unchanged. -/
 theorem evalOperand_copy_widePtr_field1 (locals : List LocalSlot) (loc : Local)
     (fTy : Ty) (dataVal metaVal : Value) (borrows : List BorrowEntry)
     (globals : List CapturedAllocation) (layouts : LayoutTable)
@@ -19727,10 +19745,11 @@ theorem evalOperand_copy_widePtr_field1 (locals : List LocalSlot) (loc : Local)
   rw [hSlot, hNoUnion]
   rfl
 
-/-- **`evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip`**: decomposing a wide pointer
-`.aggregate 0 [.ptr p ptrBytes, .scalar ⟨len, ptrBytes⟩]` at `loc` via `.field 0` and `.field 1`
-(`to_raw_parts`) and reassembling via `Rvalue.aggregate (.rawPtr pointeeTy mutability)` is the
-exact identity on the wide pointer value and preserves `locals` and `mem`. -/
+/-- **`evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip`**: projecting
+`.field 0` and `.field 1` from a decomposed 2-field `(data, meta)` aggregate
+`.aggregate 0 [.ptr p ptrBytes, .scalar ⟨len, ptrBytes⟩]` at `loc` and
+reassembling via `Rvalue.aggregate (.rawPtr pointeeTy mutability)` is the exact
+identity on the wide-pointer value and preserves `locals` and `mem`. -/
 theorem evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip (locals : List LocalSlot)
     (loc : Local) (pointeeTy dataTy metaTy : Ty) (mutability : Mutability)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
@@ -20186,6 +20205,9 @@ theorem writeIntrinsicReturn_local (s : MachineState) (locals' updatedLocals : L
   | uninit => dsimp only []; rw [hSet]
   | init _ => dsimp only []; rw [hSet]
 
+-- Constructive (`Classical.choice`-free) copies of call-target and frame-terminator
+-- helpers so all declarations in `UnsizedDstMetadataLifters` pass the constructive
+-- `run_cmd` axiom audit.
 private theorem resolveCallTarget_of_extractCallee_constructive (s : MachineState) (func : Operand)
     (argCount : Nat) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
     (defPath : DefPath) (typeArgs : List RigidTy)
@@ -21518,8 +21540,8 @@ theorem evalRvalue_aggregate_rawPtr_wide_vtableMeta_ub (locals locals₁ locals�
   dsimp only [evalOperands]
   rw [hWide]
 
-/-- **`wrapScalarBits_eq_of_lt`**: when `val < modulus`, `wrapScalarBits val modulus` reduces
-constructively to `val`. -/
+/-- **`wrapScalarBits_eq_of_lt`**: when `val < modulus`, `wrapScalarBits val modulus`
+reduces constructively (`Classical.choice`-free) to `val`. -/
 theorem wrapScalarBits_eq_of_lt {val modulus : Nat} (h : val < modulus) :
     wrapScalarBits val modulus = val := by
   unfold wrapScalarBits
@@ -21565,9 +21587,10 @@ theorem evalRvalue_aggregate_rawPtr_wide_scalarAddr_of_lt (locals locals₁ loca
     dataOp metaOp mem localDecls layouts addr len hWide hData hMeta,
     wrapScalarBits_eq_of_lt hAddr, wrapScalarBits_eq_of_lt hLen]
 
-/-- **`evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip_scalarAddr`**: `to_raw_parts` +
-`AggregateKind.rawPtr` round-trip on a provenance-free (integer-address) wide pointer
-`.aggregate 0 [.scalar ⟨addr, ptrBytes⟩, .scalar ⟨len, ptrBytes⟩]` with
+/-- **`evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip_scalarAddr`**:
+decomposed `.field 0` / `.field 1` `(addr, len)` aggregate projections +
+`AggregateKind.rawPtr` round-trip on a provenance-free (integer-address) wide
+pointer `.aggregate 0 [.scalar ⟨addr, ptrBytes⟩, .scalar ⟨len, ptrBytes⟩]` with
 `addr, len < scalarModulus ptrBytes`. -/
 theorem evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip_scalarAddr (locals : List LocalSlot)
     (loc : Local) (pointeeTy dataTy metaTy : Ty) (mutability : Mutability)

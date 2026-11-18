@@ -18,6 +18,8 @@ import Miri.Interpreter.Cast
 import Miri.Interpreter.Intrinsics
 import Miri.Interpreter.Step
 
+set_option Elab.async false
+
 /-!
 # Wide-Slice DST Correspondence (`LeanMiriSpec.Correspondence.WideSliceDstLM`)
 
@@ -56,8 +58,10 @@ for dynamically sized slice (`[T]`) and string slice (`str`) wide pointers:
    * `ptr::from_raw_parts(_mut)` / `ptr::slice_from_raw_parts(_mut)` (`Rvalue.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]`)
      lockstep simulation against `Miri.Interpreter.writeAggregate` (`Immediate.newPointerWithMeta`),
    * `ptr::metadata` (`Rvalue.unaryOp .ptrMetadata op`) lockstep simulation against
-     `Miri.Interpreter.ScalarOps.unary .PtrMetadata` (including dangling/OOB/disabled
-     pointers without dereferencing memory),
+     `Miri.Interpreter.ScalarOps.unary .PtrMetadata` on raw wide-slice pointers
+     (`isWideRawPtrTyId`: including null, dangling, OOB, or disabled pointers without
+     dereferencing memory) and valid safe wide references, contrasted with
+     `DIV-LM-PTR-METADATA-INVALID-SAFE-REF` on invalid safe wide references,
    * `to_raw_parts` (`Rvalue.cast .ptrToPtr op targetTy` wide-to-thin and wide-to-wide)
      lockstep simulation against `Miri.Interpreter.Cast.ptrToPtr` / `Cast.cast` and the
      `to_raw_parts` → `from_raw_parts` round-trip identity theorem,
@@ -70,12 +74,22 @@ for dynamically sized slice (`[T]`) and string slice (`str`) wide pointers:
      equivalence (`elemSz * len ≥ 2^63`) across `[T]`, `str`, empty (`len = 0`), and
      ZST (`elemSz = 0`) slices.
 
-3. **Part 3 — Concrete Real-Step Witnesses & Stage-1 Divergence Witness**:
+3. **Part 3 — Concrete Real-Step Witnesses & Documented Divergences**:
    * Multi-step execution witnesses of `stepMirFn` and `Miri.Interpreter.Step.step`
      for `[u32]`, `str`, ZST `[()]`, exact `isize::MAX = 2^63 - 1` boundary (`len = 2^61 - 1`
      vs. `len = 2^61` on `[u32]`, `len = 2^63` on `str`), dangling metadata vs. OOB index UB,
-     and the documented Stage-1 `.scalar`-address `size_of_val` / `align_of_val` divergence
-     (`div_stage1_scalarAddr_wideSlice_sizeOfVal_alignOfVal`).
+     safe wide-reference validity (`slice::from_raw_parts(_mut)`), `Subslice`, `ConstantIndex`,
+     and all 7 documented Stage-1 / `LeanMiriSpec` divergences:
+     `DIV-STAGE1-SCALAR-ADDR-WIDE-SLICE-SIZE-ALIGN`
+     (`div_stage1_scalarAddr_wideSlice_sizeOfVal_alignOfVal`),
+     `DIV-LM-PTR-METADATA-INVALID-SAFE-REF` (`div_ptrMetadata_invalidSafeWideRef`),
+     `DIV-LM-SHARED-REBORROW-FRESH-TAG` (`w_wideSlice_reborrow_raw_and_shared_agrees`),
+     `DIV-LM-PLACE-LEN-BORROW-BOUNDS` and `DIV-LM-RAW-SLICE-PARTIAL-OOB-LEN-INDEX`
+     (`div_rawSlice_placeLen_and_partialOobLenIndex`),
+     `DIV-LM-ZERO-BYTE-DANGLING-REBORROW`
+     (`div_zeroByte_dangling_reborrow_mut_zst_scalarAddr`), and
+     `DIV-LM-CONSTANT-INDEX-NAT-SUB-SATURATION`
+     (`w_wideSlice_constantIndex_reborrow_and_malformed_divergence`).
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -160,10 +174,60 @@ def wideRawSlicePtrTyId (elemId : Miri.MIR.TyId) : Miri.MIR.TyId := 3100 + elemI
 /-- Canonical `Miri.MIR.TyId` for `&[T]` / `&mut [T]` (`3200 + elemId`). -/
 def wideRefSlicePtrTyId (elemId : Miri.MIR.TyId) : Miri.MIR.TyId := 3200 + elemId
 
-/-- Encode a slice element `RigidTy` into a scalar/pointer/ZST `TyId < 100`
-(defaulting to `51` for `()`). -/
-def encodeSliceElemTyId (elemKind : RigidTy) : Miri.MIR.TyId :=
-  (encodeScalarRigidTy elemKind).getD 51
+/-- Fail-closed sentinel `Miri.MIR.TyId` for unsized `[T]` or raw `*const/*mut [T]`
+when `T` is outside the exact-layout slice element fragment (`encodeSliceElemTyId? = none`). -/
+def unsupportedWideSliceTyId : Miri.MIR.TyId := 3300
+
+/-- Fail-closed sentinel `Miri.MIR.TyId` for safe `&[T]` / `&mut [T]` when `T` is
+outside the exact-layout slice element fragment (`encodeSliceElemTyId? = none`),
+recognized by `isWideSafeRefTyId` so safe-reference validation rejects it with `.unsupported`. -/
+def unsupportedWideSafeRefTyId : Miri.MIR.TyId := 3301
+
+/-- Whether a pointer/reference pointee `RigidTy` is guaranteed to be `Sized`
+(hence represented by an 8-byte thin pointer rather than a 16-byte wide pointer):
+excludes `.slice`, `.str`, `.dynamic`, `.foreign`, `.adt` (custom DSTs), and
+non-empty `.tuple`s (unsized tuple tails). -/
+def isKnownThinPointee : RigidTy → Bool
+  | .bool | .char | .int _ | .uint _ | .float _
+  | .rawPtr _ _ | .ref _ _ | .fnPtr _ _ _ _
+  | .never | .tuple .nil | .array _ _ | .fnDef _ _ => true
+  | _ => false
+
+/-- Partial fail-closed `TyId` encoder for slice element types `[T]`:
+accepts **only** element types whose ABI layout is exact in both
+`scalarLayoutOfRigidTy` and `layoutOfEncodedTyId` — primitive scalars (`bool`,
+`char`, `int`, `uint`, `float`), unit `.tuple []` (`51`), function pointers
+(`42`), and thin raw/safe pointers (`isKnownThinPointee pointee`). Returns `none`
+on arrays, structs/enums, non-unit tuples, and fat-pointer elements (`&str`,
+`&[U]`, `*const [U]`, `&dyn Trait`) so unsupported slice element types fail
+closed instead of receiving a guessed ZST or 8-byte layout. -/
+def encodeSliceElemTyId? (elemKind : RigidTy) : Option Miri.MIR.TyId :=
+  match elemKind with
+  | .bool => some 1
+  | .char => some 2
+  | .int .i8 => some 10
+  | .int .i16 => some 11
+  | .int .i32 => some 12
+  | .int .i64 => some 13
+  | .int .i128 => some 14
+  | .int .isize => some 15
+  | .uint .u8 => some 20
+  | .uint .u16 => some 21
+  | .uint .u32 => some 22
+  | .uint .u64 => some 23
+  | .uint .u128 => some 24
+  | .uint .usize => some 25
+  | .float .f16 => some 30
+  | .float .f32 => some 31
+  | .float .f64 => some 32
+  | .float .f128 => some 33
+  | .tuple .nil => some 51
+  | .fnPtr _ _ _ _ => some 42
+  | .rawPtr _ pointee =>
+      if isKnownThinPointee pointee then some (encodeRawPtrTyId pointee) else none
+  | .ref _ pointee =>
+      if isKnownThinPointee pointee then some 41 else none
+  | _ => none
 
 /-- Whether `ty` is an unsized `[T]` / `str` pointee or a wide pointer/reference
 to `[T]` / `str`. -/
@@ -174,17 +238,29 @@ def isWideSliceOrPointeeTy (ty : Ty) : Bool :=
   | .ref _ .str | .ref _ (.slice _) => true
   | _ => false
 
-/-- Wide-slice-aware `Miri.MIR.TyId` encoding: assigns injective `2000..3299`
-IDs to `str`, `[T]`, `*const/*mut str`, `&/&mut str`, `*const/*mut [T]`, and
-`&/&mut [T]`, and delegates every other `Ty` unchanged to `encodeTyId`. -/
+/-- Wide-slice-aware `Miri.MIR.TyId` encoding: assigns `2000..3299` IDs to `str`,
+supported `[T]` (`encodeSliceElemTyId?`), `*const/*mut str`, `&/&mut str`,
+`*const/*mut [T]`, and `&/&mut [T]`, maps unsupported slice element types to
+fail-closed sentinels `unsupportedWideSliceTyId` (`3300`) /
+`unsupportedWideSafeRefTyId` (`3301`), and delegates every other `Ty` unchanged
+to `encodeTyId`. -/
 def encodeTyIdWideSlice (ty : Ty) : Miri.MIR.TyId :=
   match ty.kind with
   | .str => strPointeeTyId
-  | .slice elemKind => slicePointeeTyId (encodeSliceElemTyId elemKind)
+  | .slice elemKind =>
+      match encodeSliceElemTyId? elemKind with
+      | some elemId => slicePointeeTyId elemId
+      | none => unsupportedWideSliceTyId
   | .rawPtr _ .str => wideRawStrPtrTyId
   | .ref _ .str => wideRefStrPtrTyId
-  | .rawPtr _ (.slice elemKind) => wideRawSlicePtrTyId (encodeSliceElemTyId elemKind)
-  | .ref _ (.slice elemKind) => wideRefSlicePtrTyId (encodeSliceElemTyId elemKind)
+  | .rawPtr _ (.slice elemKind) =>
+      match encodeSliceElemTyId? elemKind with
+      | some elemId => wideRawSlicePtrTyId elemId
+      | none => unsupportedWideSliceTyId
+  | .ref _ (.slice elemKind) =>
+      match encodeSliceElemTyId? elemKind with
+      | some elemId => wideRefSlicePtrTyId elemId
+      | none => unsupportedWideSafeRefTyId
   | _ => encodeTyId ty
 
 theorem encodeTyIdWideSlice_eq_encodeTyId {ty : Ty}
@@ -207,9 +283,11 @@ theorem encodeTyIdWideSlice_eq_encodeTyId {ty : Ty}
   | _ => rfl
 
 /-- Wide-slice-aware `LocalLayout` translation: assigns `unsizedSliceLayoutData`
-to `str` and `[T]`, `widePointerLayoutData false` to `*const/*mut [T]` and
-`*const/*mut str`, `widePointerLayoutData true` to `&/&mut [T]` and `&/&mut str`,
-and delegates every other `Ty` unchanged to `translateTy`. -/
+to `str` and supported `[T]`, `widePointerLayoutData false` to `*const/*mut [T]`
+and `*const/*mut str`, `widePointerLayoutData true` to `&/&mut [T]` and
+`&/&mut str` (emitting fail-closed `unsupportedWideSliceTyId` /
+`unsupportedWideSafeRefTyId` when `encodeSliceElemTyId? elemKind = none`), and
+delegates every other `Ty` unchanged to `translateTy`. -/
 def translateTyWideSlice (ty : Ty) (layouts : LayoutTable := emptyLayoutTable) :
     Miri.Interpreter.LocalLayout :=
   match ty.kind with
@@ -217,19 +295,23 @@ def translateTyWideSlice (ty : Ty) (layouts : LayoutTable := emptyLayoutTable) :
       let u8Lay := scalarLayoutData 1 false
       { ty := strPointeeTyId, layout := unsizedSliceLayoutData u8Lay }
   | .slice elemKind =>
-      let elemId := encodeSliceElemTyId elemKind
-      let elemLay := (scalarLayoutOfRigidTy elemKind).getD zstLayoutData
-      { ty := slicePointeeTyId elemId, layout := unsizedSliceLayoutData elemLay }
+      match encodeSliceElemTyId? elemKind, scalarLayoutOfRigidTy elemKind with
+      | some elemId, some elemLay =>
+          { ty := slicePointeeTyId elemId, layout := unsizedSliceLayoutData elemLay }
+      | _, _ =>
+          { ty := unsupportedWideSliceTyId, layout := unsizedSliceLayoutData zstLayoutData }
   | .rawPtr _ .str =>
       { ty := wideRawStrPtrTyId, layout := widePointerLayoutData false }
   | .ref _ .str =>
       { ty := wideRefStrPtrTyId, layout := widePointerLayoutData true }
   | .rawPtr _ (.slice elemKind) =>
-      let elemId := encodeSliceElemTyId elemKind
-      { ty := wideRawSlicePtrTyId elemId, layout := widePointerLayoutData false }
+      match encodeSliceElemTyId? elemKind with
+      | some elemId => { ty := wideRawSlicePtrTyId elemId, layout := widePointerLayoutData false }
+      | none => { ty := unsupportedWideSliceTyId, layout := widePointerLayoutData false }
   | .ref _ (.slice elemKind) =>
-      let elemId := encodeSliceElemTyId elemKind
-      { ty := wideRefSlicePtrTyId elemId, layout := widePointerLayoutData true }
+      match encodeSliceElemTyId? elemKind with
+      | some elemId => { ty := wideRefSlicePtrTyId elemId, layout := widePointerLayoutData true }
+      | none => { ty := unsupportedWideSafeRefTyId, layout := widePointerLayoutData true }
   | _ => translateTy ty layouts
 
 theorem translateTyWideSlice_eq_translateTy {ty : Ty} (layouts : LayoutTable)
@@ -270,10 +352,16 @@ def layoutOfEncodedTyIdWideSlice (tyId : Miri.MIR.TyId)
     { ty := tyId, layout := widePointerLayoutData false }
   else if 3200 ≤ tyId && tyId < 3300 then
     { ty := tyId, layout := widePointerLayoutData true }
+  else if tyId == unsupportedWideSliceTyId then
+    { ty := unsupportedWideSliceTyId, layout := widePointerLayoutData false }
+  else if tyId == unsupportedWideSafeRefTyId then
+    { ty := unsupportedWideSafeRefTyId, layout := widePointerLayoutData true }
   else
     layoutOfEncodedTyId tyId layouts
 
-/-- Recover the pointee `Miri.MIR.TyId` from a thin or wide pointer/reference `TyId`. -/
+/-- Recover the pointee `Miri.MIR.TyId` from a thin or wide pointer/reference `TyId`.
+Returns `none` on `unsupportedWideSliceTyId` (`3300`) and `unsupportedWideSafeRefTyId`
+(`3301`) so unsupported slice element types fail closed. -/
 def wideSlicePointeeTyId? (tyId : Miri.MIR.TyId) : Option Miri.MIR.TyId :=
   if tyId == wideRawStrPtrTyId || tyId == wideRefStrPtrTyId then
     some strPointeeTyId
@@ -284,29 +372,54 @@ def wideSlicePointeeTyId? (tyId : Miri.MIR.TyId) : Option Miri.MIR.TyId :=
   else
     rawPtrPointeeEncodedTyId? tyId
 
-/-- Whether `tyId` encodes a wide slice or `str` pointer/reference (`3000..3299`). -/
+/-- Whether `tyId` encodes a raw wide slice or `str` pointer (`*const/*mut str` =
+`3000`, `*const/*mut [T]` = `3100..3199`). -/
+def isWideRawPtrTyId (tyId : Miri.MIR.TyId) : Bool :=
+  tyId == wideRawStrPtrTyId || (3100 ≤ tyId && tyId < 3200)
+
+/-- Whether `tyId` encodes a supported wide slice or `str` pointer/reference (`3000..3299`). -/
 def isWideSlicePtrTyId (tyId : Miri.MIR.TyId) : Bool :=
   tyId == wideRawStrPtrTyId || tyId == wideRefStrPtrTyId ||
     (3100 ≤ tyId && tyId < 3300)
 
+theorem isWideSlicePtrTyId_of_isWideRawPtrTyId {tyId : Miri.MIR.TyId}
+    (h : isWideRawPtrTyId tyId = true) :
+    isWideSlicePtrTyId tyId = true := by
+  unfold isWideRawPtrTyId at h
+  unfold isWideSlicePtrTyId
+  rw [Bool.or_eq_true] at h
+  rcases h with hstr | hslice
+  · rw [hstr]; rfl
+  · rw [Bool.or_eq_true]; right
+    rw [Bool.and_eq_true, decide_eq_true_eq, decide_eq_true_eq] at hslice ⊢
+    exact ⟨hslice.1, Nat.lt_trans hslice.2 (by decide)⟩
+
 /-- Whether `tyId` encodes a safe wide reference (`&str`, `&mut str`, `&[T]`,
-`&mut [T]`, i.e., `3001` or `3200..3299`), as opposed to a raw wide pointer
-(`*const/*mut str` = `3000`, `*const/*mut [T]` = `3100..3199`). -/
+`&mut [T]`, i.e., `3001`, `3200..3299`, or fail-closed `unsupportedWideSafeRefTyId`
+`3301`), as opposed to a raw wide pointer (`3000`, `3100..3199`). -/
 def isWideSafeRefTyId (tyId : Miri.MIR.TyId) : Bool :=
-  tyId == wideRefStrPtrTyId || (3200 ≤ tyId && tyId < 3300)
+  tyId == wideRefStrPtrTyId || (3200 ≤ tyId && tyId < 3300) ||
+    tyId == unsupportedWideSafeRefTyId
 
 /-- Classify an encoded `TyId` into `Miri.Interpreter.ScalarTypeClass`, extending
-`classifyEncodedTyId` with wide-slice pointer/reference `TyId`s (`3000..3299`). -/
+`classifyEncodedTyId` with supported wide-slice pointer/reference `TyId`s (`3000..3299`)
+and failing closed with `.unsupported` on `unsupportedWideSliceTyId` /
+`unsupportedWideSafeRefTyId`. -/
 def classifyEncodedTyIdWideSlice (tyId : Miri.MIR.TyId) :
     Except Miri.Interpreter.StepError Miri.Interpreter.ScalarTypeClass :=
   if isWideSlicePtrTyId tyId then
     .ok .pointer
+  else if tyId == unsupportedWideSliceTyId || tyId == unsupportedWideSafeRefTyId then
+    .error (.unsupported s!"unsupported wide-slice element TyId {tyId} in ScalarOps")
   else
     classifyEncodedTyId tyId
 
 /-- Classify an encoded `TyId` into `Miri.Interpreter.CastTypeInfo`, extending
 `castTypeInfoOfEncodedTyId` with wide raw pointers (`3000`, `3100..3199`), wide
-references (`3001`, `3200..3299`), and unsized slice/str pointees (`2000`, `2100..2199`). -/
+references (`3001`, `3200..3299`), and unsized slice/str pointees (`2000`, `2100..2199`).
+Note: `tyId == 40` is mapped to `.rawPointer strPointeeTyId` so unrefined `encodeTyId`
+wide raw-pointer targets fail closed unless refined by `refineWideSliceRvalue`, and
+`3300`/`3301` fail closed with `.unsupported`. -/
 def castTypeInfoOfEncodedTyIdWideSlice (tyId : Miri.MIR.TyId) :
     Except Miri.Interpreter.StepError Miri.Interpreter.CastTypeInfo :=
   if tyId == wideRawStrPtrTyId then
@@ -321,6 +434,8 @@ def castTypeInfoOfEncodedTyIdWideSlice (tyId : Miri.MIR.TyId) :
     .ok (.slice 20)
   else if 2100 ≤ tyId && tyId < 2200 then
     .ok (.slice (tyId - 2100))
+  else if tyId == unsupportedWideSliceTyId || tyId == unsupportedWideSafeRefTyId then
+    .error (.unsupported s!"unsupported wide-slice element TyId {tyId} in Cast")
   else if tyId == 40 then
     .ok (.rawPointer strPointeeTyId)
   else
@@ -511,7 +626,12 @@ theorem newSlice_provenance {allocMap : List AllocMapEntry}
 end WideSliceImmediateRel
 
 /-- Local-slot relation extended to wide-slice pointer/reference locals
-(`WideSliceImmediateRel`), CONSERVATIVELY extending `LocalRelLM3_1`. -/
+(`WideSliceImmediateRel`), CONSERVATIVELY extending `LocalRelLM3_1`.
+Together with `FrameRelWideSlice`, `StateRelWideSlice`, and `StepRelWideSlice`,
+this provides the whole-frame relational specification vocabulary over
+`WideSliceImmediateRel` (while Part 2 states symbolic Rvalue/projection/intrinsic
+simulation theorems directly over `WideSliceImmediateRel`, `PtrRel`, and `ScalarRel`,
+and Part 3 proves concrete whole-machine `stepMirFn` / `Step.step` witnesses). -/
 inductive LocalRelWideSlice
     (mach : AnnealMachine)
     (allocMap : List AllocMapEntry)
@@ -541,7 +661,13 @@ inductive LocalRelWideSlice
         cached = some (translateTyWideSlice decl.ty layouts)) :
       LocalRelWideSlice mach allocMap decl layouts .uninit ⟨.live (.immediate .uninit), cached⟩
 
-/-- Frame-level correspondence for wide-slice MIR execution (`StateRelWideSlice`). -/
+/-- Frame-level correspondence for wide-slice MIR execution (`StateRelWideSlice`).
+Note: `body_eq` (`mf.body = translateBody cm`) applies directly to statement-only
+and `AnnealIntrinsic` bodies; MIR bodies containing `core::intrinsics::{size_of_val,
+align_of_val}` `Call` terminators refine those call terminators via
+`translateWideSliceCallTerminator` (as in `wideSlicePipelineMiriBody` and
+`singleWideIntrinsicMiriBody`), because base `translateCalleeOperand` encodes
+only `AnnealIntrinsic`. -/
 structure FrameRelWideSlice (cm : CapturedMir) (mach : AnnealMachine)
     (allocMap : List AllocMapEntry) (af : StackFrame)
     (mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) : Prop where
@@ -679,25 +805,23 @@ def annealDerefWideSliceImmediate
             fun e => .invalidProgram (toString e)
         return ⟨ptr, .metadata msc, mismatch⟩
 
-/-- Validate a safe wide reference (`&[T]`, `&mut [T]`, `&str`, `&mut str`)
-in the exact source order of vendored `Miri.Memory.Validity.checkSafePointer`
-(`Validity.lean:1048-1106`, invoked by `Place.writePlaceImmediate` and
-non-skipped safe-reference `deref`):
-1. Unpack `(ptr, .metadata msc)` and check `msc.toTargetUsize 8` via
-   `annealDerefWideSliceImmediate`.
-2. Compute `(totalSize, _)` via vendored
-   `Miri.Interpreter.DynamicLayout.sizeAndAlignOfVal` (raising
-   `.undefinedBehavior "InvalidMeta(SliceTooBig)"` whenever `elemSz * len ≥ 2^63`).
-3. Check dereferenceability of `totalSize` bytes via vendored
-   `Miri.Memory.checkPtrAccess` (`(.dereferenceable "pointer")`), raising
-   `.undefinedBehavior "pointer dereference check failed"` on dangling, dead,
-   or out-of-bounds backing allocations.
-4. Reject null data pointers (`mp.ptr.offset.bytes == 0`) with
-   `.undefinedBehavior "dereferencing a null reference"`.
-5. Reject misaligned data pointers (`mp.misaligned.isSome`) with
-   `.undefinedBehavior "misaligned pointer dereference"`. -/
+/-- Validate a safe wide reference (`&[T]`, `&mut [T]`, `&str`, `&mut str`):
+* When `nullFirst = false` (default, invoked by `writeImmediate` / `copyOp` modeling
+  `Place.writePlaceImmediate`), follows the exact check order of vendored
+  `Miri.Memory.Validity.checkSafePointer` (`Validity.lean:1048-1106`):
+  `annealDerefWideSliceImmediate` → `DynamicLayout.sizeAndAlignOfVal`
+  (`"InvalidMeta(SliceTooBig)"` if `elemSz * len ≥ 2^63`) → `Miri.Memory.checkPtrAccess`
+  (`"pointer dereference check failed"`) → null check (`"dereferencing a null reference"`)
+  → alignment check (`"misaligned pointer dereference"`).
+* When `nullFirst = true` (invoked by non-skipped `deref` and
+  `annealDerefValidityWideSlice` for `ScalarOps.derefValidity`), follows vendored
+  `Miri.Interpreter.PointerPlaceMachine.dereference` (`PointerPlaceMachine.lean:98-105`),
+  checking `mp.ptr.offset.bytes == 0` (`"dereferencing a null reference"`) before
+  `DynamicLayout.sizeAndAlignOfVal` (differing from `checkSafePointer` only on which
+  UB message fires when a safe reference is simultaneously null and `SliceTooBig`). -/
 def annealValidateSafeWideSliceRef (layouts : LayoutTable := emptyLayoutTable)
-    (val : Miri.Interpreter.RvalueImmTy AnnealProv) :
+    (val : Miri.Interpreter.RvalueImmTy AnnealProv)
+    (nullFirst : Bool := false) :
     Miri.Interpreter.RvalueM AnnealStepState Unit := do
   if !isWideSafeRefTyId val.layout.ty then
     return ()
@@ -708,6 +832,8 @@ def annealValidateSafeWideSliceRef (layouts : LayoutTable := emptyLayoutTable)
     match annealDerefWideSliceImmediate val.imm pointeeLay with
     | .ok mp => pure mp
     | .error err => throw err
+  if nullFirst && mp.ptr.offset.bytes == 0 then
+    throw (.undefinedBehavior "dereferencing a null reference")
   let some (totalSize, _) ←
     Miri.Interpreter.DynamicLayout.sizeAndAlignOfVal
       (annealDynamicLayoutHooksWideSlice layouts) () 8 ⟨.indirect mp, pointeeLay⟩
@@ -718,14 +844,16 @@ def annealValidateSafeWideSliceRef (layouts : LayoutTable := emptyLayoutTable)
       (annealLookupAlloc st.machine) with
   | .error _ => throw (.undefinedBehavior "pointer dereference check failed")
   | .ok () =>
-      if mp.ptr.offset.bytes == 0 then
+      if !nullFirst && mp.ptr.offset.bytes == 0 then
         throw (.undefinedBehavior "dereferencing a null reference")
       if mp.misaligned.isSome then
         throw (.undefinedBehavior "misaligned pointer dereference")
       return ()
 
-/-- Resolve the pointee `LocalLayout` (including unsized `[T]` and `str`) of a
-pointer/reference local `localId` from `localDecls` or `wideSlicePointeeTyId?`. -/
+/-- Resolve the pointee `LocalLayout` (including unsized `[T]` for supported
+`encodeSliceElemTyId?` elements and `str`) of a pointer/reference local `localId`
+from `localDecls` or `wideSlicePointeeTyId?`. Unsupported slice element types
+resolve to `none` so dereferencing fails closed. -/
 def lookupWideSlicePointeeLayout (localDecls : List LocalDecl) (layouts : LayoutTable)
     (localId : Miri.MIR.LocalId) (ptrLayout : Miri.Interpreter.LocalLayout) :
     Option Miri.Interpreter.LocalLayout :=
@@ -735,7 +863,9 @@ def lookupWideSlicePointeeLayout (localDecls : List LocalDecl) (layouts : Layout
       | .rawPtr _ .str | .ref _ .str =>
           some (translateTyWideSlice { kind := .str, layoutIdx := 0 } layouts)
       | .rawPtr _ (.slice elemKind) | .ref _ (.slice elemKind) =>
-          some (translateTyWideSlice { kind := .slice elemKind, layoutIdx := 0 } layouts)
+          match encodeSliceElemTyId? elemKind with
+          | some _ => some (translateTyWideSlice { kind := .slice elemKind, layoutIdx := 0 } layouts)
+          | none => none
       | .rawPtr _ pointeeKind | .ref _ pointeeKind =>
           if derefPointeeKindHasExactLayout pointeeKind then
             some (translateTy { kind := pointeeKind, layoutIdx := 0 } layouts)
@@ -771,7 +901,7 @@ def annealPlaceProjectionHooksWideSlice (localDecls : List LocalDecl := .nil)
             | .error e => throw (.stack e)
           let imm ← annealReadImmediate ⟨operand, base.layout⟩
           if !skipValidity && isWideSafeRefTyId base.layout.ty then
-            annealValidateSafeWideSliceRef layouts ⟨imm.imm, base.layout⟩
+            annealValidateSafeWideSliceRef layouts ⟨imm.imm, base.layout⟩ (nullFirst := true)
           let some pointeeLay := lookupWideSlicePointeeLayout localDecls layouts localId base.layout
             | throw (.unsupported "deref of local without pointee layout")
           match annealDerefWideSliceImmediate imm.imm pointeeLay with
@@ -825,24 +955,27 @@ def annealPlaceProjectionHooksWideSlice (localDecls : List LocalDecl := .nil)
     | .ok idx => return idx
     | .error err => throw (annealLiftProjectionError err)
 
-/-- Validate `ScalarOpsHooks.derefValidity` on thin or wide raw/reference
-pointers for `UnOp.PtrMetadata`:
-* Thin pointers (`value.imm = .scalar sc`): checks `sc.toPointer annealTargetDataLayout`
-  without touching memory.
-* Wide slice/str pointers (`value.imm = .scalarPair dataSc metaSc`): checks
-  `dataSc.toPointer annealTargetDataLayout` and `metaSc.toTargetUsize 8` without
-  touching memory, matching Rust's `ptr::metadata` (which never dereferences
-  even dangling, OOB, or disabled pointers). -/
+/-- Validate `ScalarOpsHooks.derefValidity` (modeling vendored
+`PointerPlaceMachine.bindScalarOps` → `dereference`, `PointerPlaceMachine.lean:98-142`):
+* **Raw wide-slice pointers** (`isWideRawPtrTyId`: `3000`, `3100..3199`): checks
+  only that `value.imm.toScalarAndMeta` carries `.metadata _` (never touching
+  memory, nullness, or bounds, even on null/dangling/OOB/disabled raw pointers).
+* **Safe wide references** (`isWideSafeRefTyId`: `3001`, `3200..3299`, `3301`):
+  validates the reference via `annealValidateSafeWideSliceRef ... (nullFirst := true)`
+  (null → `sizeAndAlignOfVal` → `checkPtrAccess` → alignment).
+* **All other `TyId`s**: delegates to `annealDerefValidity`, which checks thin
+  sized raw pointers (`60..79`) without touching memory and fails closed with
+  `.unsupported` on unencoded `40`, `41`, `90` (`arraySliceMetaTyId`), and `3300`. -/
 def annealDerefValidityWideSlice (layouts : LayoutTable := emptyLayoutTable)
     (value : Miri.Interpreter.RvalueImmTy AnnealProv) :
     Miri.Interpreter.RvalueM AnnealStepState Unit :=
-  if isWideSlicePtrTyId value.layout.ty then
+  if isWideRawPtrTyId value.layout.ty then
     match value.imm.toScalarAndMeta with
     | .error err => throw (Miri.Interpreter.ScalarOps.immediateError err)
     | .ok (_, .metadata _) => pure ()
     | .ok (_, .none) => throw (.invalidProgram "wide slice pointer immediate missing metadata")
-  else if value.layout.ty == arraySliceMetaTyId || value.layout.ty == 40 || value.layout.ty == 41 then
-    pure ()
+  else if isWideSafeRefTyId value.layout.ty then
+    annealValidateSafeWideSliceRef layouts value (nullFirst := true)
   else
     annealDerefValidity layouts value
 
@@ -988,7 +1121,7 @@ def annealEvalOperandWideSlice (localDecls : List LocalDecl) (layouts : LayoutTa
               match mp.toRef annealTargetDataLayout with
               | .ok imm =>
                   return ⟨.immediate imm,
-                          { ty := arraySliceMetaTyId,
+                          { ty := wideRawStrPtrTyId,
                             layout := widePointerLayoutData false }⟩
               | .error err => throw (.invalidProgram s!"slice len reference: {repr err}")
           | _ => throw (.invalidProgram "slice len deref did not resolve to memory place")
@@ -1004,9 +1137,9 @@ def annealEvalOperandWideSlice (localDecls : List LocalDecl) (layouts : LayoutTa
   | _ => annealEvalOperand localDecls layouts op known
 
 /-- Wide-slice-aware destination/borrow place evaluation with explicit
-`skipValidityForSimpleDeref` threading (`Rvalue.lean:81` passes `true` for
-`Rvalue.Ref`, whereas `Rvalue.lean:97` passes `false` for `Rvalue.RawPtr` and
-assignment destinations pass `false`):
+`skipValidityForSimpleDeref` threading (`Rvalue.lean:53` passes `true` for
+assignment destinations and `Rvalue.lean:81` passes `true` for `Rvalue.Ref`,
+whereas `Rvalue.lean:97` passes `false` for `Rvalue.RawPtr`):
 1. Resolves unprojected locals with `annealResolveAndCacheLocalLayoutWideSlice`
    so wide-pointer destinations have their 16-byte `widePointerLayoutData` layout.
 2. Evaluates projected places (`*s`, `(*s)[i]`, `(*s)[from..to]`) on a wide-slice
@@ -1142,9 +1275,9 @@ def ofDefId? : Miri.MIR.DefId → Option WideSliceIntrinsic
   | _ => none
 
 def ofDefPath? (p : DefPath) : Option WideSliceIntrinsic :=
-  if stringEq p "core::intrinsics::size_of_val" || stringEq p "std::intrinsics::size_of_val" then
+  if stringEq p "core::intrinsics::size_of_val" then
     some .sizeOfVal
-  else if stringEq p "core::intrinsics::align_of_val" || stringEq p "std::intrinsics::align_of_val" then
+  else if stringEq p "core::intrinsics::align_of_val" then
     some .alignOfVal
   else
     none
@@ -1264,21 +1397,26 @@ def translateWideSliceCallTerminator (localDecls : List LocalDecl)
   match defPath? >>= WideSliceIntrinsic.ofDefPath? with
   | none => none
   | some wk =>
-      let pointeeTy := (resolveWideSliceCallPointeeTy localDecls func args).getD { kind := .str, layoutIdx := 0 }
-      let pointeeTyId := encodeTyIdWideSlice pointeeTy
-      let fnTyId := annealFnItemTyIdBase + wk.defId + 64 * pointeeTyId
-      let calleeOp : Miri.MIR.Operand :=
-        .Constant
-          { span := defaultSpanRef
-            userType := none
-            value := .Val .ZeroSized fnTyId }
-      some (.Call calleeOp
-        (args.map fun a => ({ span := defaultSpanRef, operand := translateOperand a } : Miri.MIR.SpannedOperand)).toArray
-        (translatePlace destination)
-        target
-        (translateUnwindAction unwind)
-        .Normal
-        defaultSpanRef)
+      match resolveWideSliceCallPointeeTy localDecls func args with
+      | none => none
+      | some pointeeTy =>
+          let pointeeTyId := encodeTyIdWideSlice pointeeTy
+          if pointeeTyId == unsupportedWideSliceTyId || pointeeTyId == unsupportedWideSafeRefTyId then
+            none
+          else
+            let fnTyId := annealFnItemTyIdBase + wk.defId + 64 * pointeeTyId
+            let calleeOp : Miri.MIR.Operand :=
+              .Constant
+                { span := defaultSpanRef
+                  userType := none
+                  value := .Val .ZeroSized fnTyId }
+            some (.Call calleeOp
+              (args.map fun a => ({ span := defaultSpanRef, operand := translateOperand a } : Miri.MIR.SpannedOperand)).toArray
+              (translatePlace destination)
+              target
+              (translateUnwindAction unwind)
+              .Normal
+              defaultSpanRef)
 
 /-- `RvalueHooks` instantiated for wide-slice DST operations, wiring vendored
 `Miri.Interpreter.ScalarOps.unary`, `Miri.Interpreter.writeAggregate`,
@@ -1652,11 +1790,16 @@ theorem evalAggregateRawPtr_wideSlice_scalarAddr_simulation
 
 /-! ### 2.2 `ptr::metadata` (`UnOp.ptrMetadata` vs. `Miri.Interpreter.ScalarOps.unary .PtrMetadata`) -/
 
-/-- Symbolic lockstep simulation for `Rvalue.unaryOp .ptrMetadata` on a wide
-slice/str pointer (`WideSliceImmediateRel`), proving that both Anneal's
-`evalUnaryPtrMetadata` and vendored `Miri.Interpreter.ScalarOps.unary .PtrMetadata`
-extract the 8-byte `usize` length metadata without touching memory (even when
-the data pointer is OOB, dangling, or `.disabled`). -/
+/-- Symbolic lockstep simulation for `Rvalue.unaryOp .ptrMetadata` on a **raw**
+wide slice/str pointer (`isWideRawPtrTyId`, related via `WideSliceImmediateRel`),
+proving that both Anneal's `evalUnaryPtrMetadata` and vendored
+`Miri.Interpreter.ScalarOps.unary .PtrMetadata` extract the 8-byte `usize` length
+metadata without touching memory (even when the raw data pointer is null, OOB,
+dangling, or `.disabled`). On safe wide references (`isWideSafeRefTyId`), lockstep
+holds whenever the reference passes `annealValidateSafeWideSliceRef`, whereas an
+invalid safe wide reference faults in vendored `Miri` while returning `len` in
+Stage-1 Anneal (`div_ptrMetadata_invalidSafeWideRef`,
+`DIV-LM-PTR-METADATA-INVALID-SAFE-REF`). -/
 theorem evalUnaryPtrMetadata_wideSlice_simulation
     {allocMap : List AllocMapEntry}
     {locals locals' : List LocalSlot} {mem : Memory}
@@ -1664,7 +1807,7 @@ theorem evalUnaryPtrMetadata_wideSlice_simulation
     {op : Operand} {v : Value} {imm : Miri.Interpreter.Immediate AnnealProv}
     {ptrTyId : Miri.MIR.TyId} {ptrLayoutData : Miri.ABI.LayoutData}
     (hptrBytes : layoutPointerBytes layouts = 8)
-    (hwideTy : isWideSlicePtrTyId ptrTyId = true)
+    (hwideTy : isWideRawPtrTyId ptrTyId = true)
     (hnonWideFalse : isNonWidePtrAggregateTy (operandTy localDecls layouts op) = false)
     (heval :
       evalOperand locals op mem.borrows mem.globals layouts
@@ -1681,9 +1824,10 @@ theorem evalUnaryPtrMetadata_wideSlice_simulation
         .PtrMetadata ⟨imm, ⟨ptrTyId, ptrLayoutData⟩⟩ st =
         .ok ⟨.scalar (.fromScalarInt mlen),
              translateTy { kind := .uint .usize, layoutIdx := 0 }⟩ st := by
+  have hw := isWideSlicePtrTyId_of_isWideRawPtrTyId hwideTy
   have hcls : classifyEncodedTyIdWideSlice ptrTyId = .ok .pointer := by
     unfold classifyEncodedTyIdWideSlice
-    rw [hwideTy]
+    rw [hw]
     rfl
   cases hrel with
   | @provenance p lenSc mptr mlen hptr hlen hlen_sz =>
@@ -1924,7 +2068,7 @@ theorem wideSlice_to_from_raw_parts_roundtrip_two_sided
     (hptr : PtrRel allocMap p mptr)
     (hlen : ScalarRel lenSc mlen)
     (hlen_sz : lenSc.sizeBytes = 8)
-    (hsrcWide : isWideSlicePtrTyId srcTyId = true)
+    (hsrcWide : isWideRawPtrTyId srcTyId = true)
     (hsrc_info : ∃ pt, castTypeInfoOfEncodedTyIdWideSlice srcTyId = .ok (.rawPointer pt))
     (hdst_info : ∃ pt, castTypeInfoOfEncodedTyIdWideSlice dstTyId = .ok (.rawPointer pt))
     (st : AnnealStepState) :
@@ -1955,9 +2099,10 @@ theorem wideSlice_to_from_raw_parts_roundtrip_two_sided
     hborrowNone hevalWide hptr hlen hlen_sz hsrc_info hdst_info st
   have hagg := evalAggregateRawPtr_wideSlice_provenance_simulation hptrBytes hwide hevalParts
     hptr hlen hlen_sz
+  have hsrcWideAny := isWideSlicePtrTyId_of_isWideRawPtrTyId hsrcWide
   have hcls : classifyEncodedTyIdWideSlice srcTyId = .ok .pointer := by
     unfold classifyEncodedTyIdWideSlice
-    rw [hsrcWide]
+    rw [hsrcWideAny]
     rfl
   have hlenEq : (⟨lenSc.bits, 8⟩ : MirAst.ScalarInt) = lenSc := by
     rcases lenSc with ⟨b, sz⟩
@@ -2117,8 +2262,8 @@ with `lenSc.sizeBytes = 8`) to `mptr` and `mlen`:
    evaluates `evalPlaceLen` and returns `.ok (.scalar lenSc) locals' mem`;
 2. Vendored `Miri.Interpreter.PlaceDynamic.length` on the dereferenced slice
    `RuntimePlace AnnealProv` returns `.ok (UInt64.ofNat lenSc.bits) st`, and
-   `Miri.Interpreter.ScalarOps.unary .PtrMetadata` on the resulting
-   `arraySliceMetaTyId` reference returns
+   `Miri.Interpreter.ScalarOps.unary .PtrMetadata` on the resulting synthetic raw
+   `wideRawStrPtrTyId` reference returns
    `.ok ⟨.scalar (.fromScalarInt mlen), translateTy { kind := .uint .usize, layoutIdx := 0 }⟩ st`;
 3. The Anneal and Miri `usize` lengths remain related by `ScalarRel lenSc mlen`. -/
 theorem evalRvalue_len_wideSlice_two_sided_simulation
@@ -2159,7 +2304,7 @@ theorem evalRvalue_len_wideSlice_two_sided_simulation
       .ok (UInt64.ofNat lenSc.bits) st ∧
     Miri.Interpreter.ScalarOps.unary
       (annealScalarOpsHooksWideSlice localDecls layouts) ()
-      .PtrMetadata ⟨metaImm, ⟨arraySliceMetaTyId, widePointerLayoutData false⟩⟩ st =
+      .PtrMetadata ⟨metaImm, ⟨wideRawStrPtrTyId, widePointerLayoutData false⟩⟩ st =
       .ok ⟨.scalar (.fromScalarInt mlen),
            translateTy { kind := .uint .usize, layoutIdx := 0 }⟩ st ∧
     WideSliceImmediateRel allocMap (.aggregate 0 [.ptr p 8, .scalar lenSc]) metaImm ∧
@@ -2173,12 +2318,15 @@ theorem evalRvalue_len_wideSlice_two_sided_simulation
   cases hlen_sz
   simp [evalRvalue, evalPlaceLen, hptrBytes, hplaceTy, hread, hborrowNone, hglobalNone, hallocNeZero]
 
-/-- **Two-sided out-of-bounds wide-slice `Index` UB simulation
+/-- **Projection-step out-of-bounds `Index` UB agreement
 (`evalPlace_index_wideSlice_oob_ub_two_sided_simulation`)**:
-When `idx ≥ len` (`get? elems idxSc.bits = none` and `UInt64.ofNat lenSc.bits ≤ UInt64.ofNat idxSc.bits`),
-BOTH Anneal's `readProjectedValue locals (.aggregate 0 elems) [.index idxLocal]` /
-`writeProjectedValue locals (.aggregate 0 elems) [.index idxLocal] v` AND vendored
-`Miri.Interpreter.PlaceDynamic.index` fault with undefined behavior! -/
+Pairs Anneal's projection-step helpers `readProjectedValue` / `writeProjectedValue`
+(under explicit `get? elems idxSc.bits = none` on an already-sliced `elems` window)
+with vendored `Miri.Interpreter.PlaceDynamic.index` (under `ScalarRel lenSc mlen` and
+`UInt64.ofNat lenSc.bits ≤ UInt64.ofNat idxSc.bits`): both fault with UB. For the
+borrow-backed `evalPlaceRead` theorem that derives `get? = none` from
+`takeValues lenSc.bits` without an independent `hget_none` hypothesis, see
+`evalPlaceRead_index_wideSlice_borrowBacked_two_sided_simulation`. -/
 theorem evalPlace_index_wideSlice_oob_ub_two_sided_simulation
     {localDecls : List LocalDecl} {layouts : LayoutTable}
     {locals : List LocalSlot} {elems : List Value}
@@ -2207,12 +2355,14 @@ theorem evalPlace_index_wideSlice_oob_ub_two_sided_simulation
   · intro v
     simp [writeProjectedValue, hidx_slot, hget_none]
 
-/-- **Two-sided out-of-bounds wide-slice `Subslice` UB simulation
+/-- **Projection-step out-of-bounds `Subslice` UB agreement
 (`evalPlace_subslice_wideSlice_oob_ub_two_sided_simulation`)**:
-When `fromEnd = true` and `fromIndex + to > len` (`extractSubslice elems fromIndex.toNat to.toNat true = none`
-and `(UInt64.ofNat lenSc.bits).toNat < fromIndex.toNat + to.toNat`), BOTH Anneal's
-`readProjectedValue locals (.aggregate 0 elems) [.subslice fromIndex.toNat to.toNat true]`
-AND vendored `Miri.Interpreter.PlaceDynamic.subslice` fault with undefined behavior! -/
+Pairs Anneal's projection-step helper `readProjectedValue` on
+`[.subslice fromIndex.toNat to.toNat true]` (given `extractSubslice = none`)
+with vendored `Miri.Interpreter.PlaceDynamic.subslice` (given `ScalarRel lenSc mlen`
+and `(UInt64.ofNat lenSc.bits).toNat < fromIndex.toNat + to.toNat`): both fault
+with UB (see Concrete Witness 8c `w_wideSlice_subslice_and_str_reborrow_agrees`
+for the end-to-end `stepMirFn` / `Step.step` execution). -/
 theorem evalPlace_subslice_wideSlice_oob_ub_two_sided_simulation
     {localDecls : List LocalDecl} {layouts : LayoutTable}
     {locals : List LocalSlot} {elems : List Value}
@@ -2309,7 +2459,7 @@ theorem evalRvalue_len_wideSlice_borrowBacked_two_sided_simulation
       .ok (UInt64.ofNat lenSc.bits) st ∧
     Miri.Interpreter.ScalarOps.unary
       (annealScalarOpsHooksWideSlice localDecls layouts) ()
-      .PtrMetadata ⟨metaImm, ⟨arraySliceMetaTyId, widePointerLayoutData false⟩⟩ st =
+      .PtrMetadata ⟨metaImm, ⟨wideRawStrPtrTyId, widePointerLayoutData false⟩⟩ st =
       .ok ⟨.scalar (.fromScalarInt mlen),
            translateTy { kind := .uint .usize, layoutIdx := 0 }⟩ st ∧
     WideSliceImmediateRel allocMap (.aggregate 0 [.ptr p 8, .scalar lenSc]) metaImm ∧
@@ -2350,23 +2500,25 @@ theorem evalRvalue_len_wideSlice_borrowBacked_two_sided_simulation
         hborrow, hp, hslot, hbacking, hoff, hble, Nat.beq_refl, Bool.and_self, Bool.false_and,
         Bool.and_false]
 
-/-- **Full two-sided borrow-backed wide-slice `(*s)[idx]` simulation
+/-- **Borrow-backed wide-slice `(*s)[idx]` `evalPlaceRead` & `PlaceDynamic.index` simulation
 (`evalPlaceRead_index_wideSlice_borrowBacked_two_sided_simulation`)**:
-Runs the **real** Anneal `evalPlaceRead locals ⟨sIdx, [.deref, .index idxLocal]⟩`
+Steps the real Anneal `evalPlaceRead locals ⟨sIdx, [.deref, .index idxLocal]⟩`
 (`evalSliceFatPtrDerefRead` → `takeValues lenSc.bits (dropValues (rawElemOffset + baseIdx) elems)`
-→ `readProjectedValue`) in lockstep with vendored `Miri.Interpreter.PlaceDynamic.index`:
+→ `readProjectedValue`) alongside vendored `Miri.Interpreter.PlaceDynamic.index`
+with lengths linked by `ScalarRel lenSc mlen`:
 1. **Slice-length OOB (`lenSc.bits ≤ idxSc.bits`)**:
-   Anneal's `evalPlaceRead locals ⟨sIdx, [.deref, .index idxLocal]⟩` faults with `.ub`
-   (with NO unlinked `hget_none` hypothesis — proved even when
-   `rawElemOffset + baseIdx + idxSc.bits < elems.length` on a subslice of a larger array!),
-   AND vendored `Miri.Interpreter.PlaceDynamic.index` raises
-   `.error (.undefinedBehavior msg) st`.
+   Anneal's `evalPlaceRead` faults `.ub` directly from `takeValues lenSc.bits`
+   (requiring no separate `get? = none` assumption, even when
+   `rawElemOffset + baseIdx + idxSc.bits < elems.length` on a subslice of a larger array),
+   and `Miri.Interpreter.PlaceDynamic.index` raises `.error (.undefinedBehavior msg) st`.
 2. **In-bounds (`idxSc.bits < lenSc.bits`)**:
    When `get? elems (rawElemOffset + baseIdx + idxSc.bits) = some elemVal` and
    `validateValueForTy?` holds, Anneal's `evalPlaceRead` returns `.ok elemVal locals`,
-   AND (given non-overflowing byte offset `elemLay.size.bytes.toNat * idxSc.bits < 2^63`
-   and in-bounds `projectionMemoryOffset`) vendored `Miri.Interpreter.PlaceDynamic.index`
-   returns `.ok ⟨.memory elemMp, layoutOfEncodedTyId elemId layouts⟩ st`. -/
+   and when `projectionMemoryOffset` resolves the byte offset `elemLay.size * idxSc.bits`
+   to `elemMp`, `Miri.Interpreter.PlaceDynamic.index` returns
+   `.ok ⟨.memory elemMp, layoutOfEncodedTyId elemId layouts⟩ st` (with end-to-end
+   memory-decoded value agreement across `stepMirFn` and `Step.step` established in
+   Concrete Witness 5 `w_wideSlice_len_index_read_write_returns`). -/
 theorem evalPlaceRead_index_wideSlice_borrowBacked_two_sided_simulation
     {localDecls : List LocalDecl} {layouts : LayoutTable}
     {locals : List LocalSlot} {mem : Memory}
@@ -3553,10 +3705,11 @@ Documented Stage-1 `.scalar`-address divergence between `Trusted.Rustc.V2026_06_
 (`stepMirFn`) and vendored `Miri` (`Miri.Interpreter.Step.step`) on a
 provenance-free wide slice pointer `ptr::slice_from_raw_parts(without_provenance(4), 0)`
 (`Value.aggregate 0 [.scalar ⟨4, 8⟩, .scalar ⟨0, 8⟩]`):
-1. **Agreement on `UnOp.ptrMetadata` and `CastKind.ptrToPtr`**: Both Anneal
-   `evalRvalue` and vendored `Miri` (`ScalarOps.unary .PtrMetadata` and
-   `Cast.ptrToPtr`) accept the provenance-free wide pointer and return length
-   `0` and thin address `4`.
+1. **Anneal `UnOp.ptrMetadata` and `CastKind.ptrToPtr` on `WideSliceImmediateRel`**:
+   `scVal` and `scImm` satisfy `WideSliceImmediateRel [] scVal scImm`, and Anneal
+   `evalRvalue` accepts the provenance-free wide pointer on both `UnOp.ptrMetadata`
+   (returning length `0`, matching `evalUnaryPtrMetadata_wideSlice_simulation` on
+   `ScalarOps.unary .PtrMetadata`) and `CastKind.ptrToPtr` (returning `.scalar ⟨4, 8⟩`).
 2. **Stage-1 Divergence on `size_of_val` and `align_of_val`**:
    * Stage-1 `evalNonSelectIntrinsicCall` (`Terminators.lean:2543, 2606`)
      pattern-matches on `.aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil)`
@@ -3885,8 +4038,9 @@ set_option maxRecDepth 20000 in
 /-- Concrete Witness 5b: Real-step (`stepMirFn` and `Miri.Interpreter.Step.step`)
 lockstep execution for in-bounds slice indexing write `(*_2)[_3] = const 99_u32`
 over a wide `*mut [u32]` pointer of length `3` into `[10_u32, 20_u32, 30_u32, 40_u32]`:
-`(*_2)[1] = const 99_u32` updates element `1` in both Anneal (`get? sWrite.frame.locals 1`)
-and vendored `Miri` (`Step.step = (mWrite, .ok true)`). -/
+`stepMirFn` updates element `1` of `_1` to `99_u32` (`get? sWrite.frame.locals 1`)
+and vendored `Miri` steps `annealWriteMemoryPlace` at byte offset `4` to
+`(mWrite, .ok true)` (`alloc_writeScalar_at_offset` in the proof). -/
 theorem w_wideSlice_index_write_returns :
     let bWrite := wideSliceSingleIndexWriteBody
     let hWrite := annealStepHooksWideSlice bWrite.localDecls bWrite.layouts
@@ -4051,7 +4205,7 @@ dereferencing:
    * `UnOp.ptrMetadata(copy _2)` succeeds without dereferencing and writes `3`
      in both `stepMirFn` and `Miri.Interpreter.Step.step`,
    * whereas dereferencing `(*_2)[0]` (`0 < 3`) faults with `.fail .ub` in
-     `stepMirFn` and `.error (.undefinedBehavior "out-of-bounds projection offset")`
+     `stepMirFn` and `.error (.undefinedBehavior "pointer dereference check failed")`
      in `Miri.Interpreter.Step.step`.
 3. **Past-end offset (`offsetBytes = 16` on the live 16-byte `[u32; 4]`
    allocation, `len = 3`, `idx = 0`)**:
@@ -4188,7 +4342,7 @@ def mutRefSliceU32Ty : Ty :=
 /-- Concrete Witness 7b (`&raw mut (*_2)` vs. `slice::from_raw_parts_mut` `&mut (*_2)`):
 1. `_0 = &raw mut (*_2)` (`len = 3` in-bounds AND `len = 5` OOB on 16-byte `[u32; 4]`):
    BOTH `stepMirFn` and `Miri.Interpreter.Step.step` succeed without dereferencing memory
-   and return the raw wide pointer (`borrows.length = 1`).
+   and return the raw wide pointer (`wideVal3` / `wideVal5` and `wideImm3` / `wideImm5`).
 2. `_0 = &mut (*_2)` (`slice::from_raw_parts_mut`, `len = 3` in-bounds on `[u32; 4]`):
    BOTH succeed with metadata `3` (Anneal mints fresh `.active` tag `2`, vendored `Miri`
    retains `BorTag.one`). -/
@@ -4571,7 +4725,7 @@ theorem div_zeroByte_dangling_reborrow_mut_zst_scalarAddr :
    rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl)⟩
 
 set_option maxHeartbeats 400000 in
-/-- Concrete Witness 9 (**Real-step `Subslice` (`&(*_2)[from..to]`) & `&str` safe reborrow lockstep**):
+/-- Concrete Witness 8c (**Real-step `Subslice` (`&(*_2)[from..to]`) & `&str` safe reborrow lockstep**):
 Exercises `PlaceDynamic.subslice` (`ProjectionElem.subslice fromIdx toIdx true`) and `&str`
 (`wideRefStrPtrTyId = 3001`) across BOTH `stepMirFn` and `Miri.Interpreter.Step.step`:
 1. **In-bounds `fromEnd = true` subslice reborrow `_0 = &(*_2)[1..1]`** on `len = 3` into live
@@ -4644,15 +4798,15 @@ theorem w_wideSlice_subslice_and_str_reborrow_agrees :
     rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl)⟩
 
 set_option maxHeartbeats 400000 in
-/-- Concrete Witness 9 (**`ProjectionElem.ConstantIndex` on a dereferenced wide slice**, the MIR
+/-- Concrete Witness 9a (**`ProjectionElem.ConstantIndex` on a dereferenced wide slice**, the MIR
 for slice patterns such as `let [.., last] = *s`), real-step on BOTH interpreters with values
 pinned, over a `len = 3` window of the 4-element `[10, 20, 30, 40]` backing (so a `fromEnd` index
 computed from the backing length instead of the slice metadata would read `40` and be caught):
 1. `(*_2)[ConstantIndex 1 1 fromEnd]` reads element `len - 1 = 2` (`30`) in both;
 2. `(*_2)[ConstantIndex 0 4]` (`min_length = 4 > len = 3`) faults `.fail .ub` in `stepMirFn` and
-   `"constant index minimum length"` UB in `Miri.Interpreter.Step.step`.
-(Forward `ConstantIndex 1 2` → `20` and `ConstantIndex 3 3 fromEnd` → `10` were also checked to
-agree by evaluation; they are omitted here to keep kernel memory under the cgroup limit.) -/
+   `"constant index minimum length"` UB in `Miri.Interpreter.Step.step`
+   (see Concrete Witness 9b for forward `ConstantIndex 1 2` → `20` and first-from-end
+   `ConstantIndex 3 3 fromEnd` → `10`). -/
 theorem w_wideSlice_constantIndex_fromEnd_and_minLength_agrees :
     let bEnd := wideSliceReborrowBody u32Ty (.use (.copy ⟨2, [.deref, .constantIndex 1 1 true]⟩))
     let bMin := wideSliceReborrowBody u32Ty (.use (.copy ⟨2, [.deref, .constantIndex 0 4 false]⟩))
@@ -4679,8 +4833,7 @@ def sharedRefU32Ty : Ty :=
 
 set_option maxHeartbeats 600000 in
 /-- Concrete Witness 9b (**Forward & first-from-end `ConstantIndex` reads on dereferenced wide slices**):
-Kernel-checks both cases left as unproved docstring comments in Witness 9 (`2613d77c`) on `len = 3`
-over `[10, 20, 30, 40]` (kept well within cgroup RAM by `Elab.async false`):
+Complements Witness 9a on `len = 3` over `[10, 20, 30, 40]`:
 1. Forward `(*_2)[ConstantIndex 1 2 false]` reads `20_u32` in both `stepMirFn` and `Step.step`.
 2. First-from-end `(*_2)[ConstantIndex 3 3 true]` reads `len - 3 = 0` (`10_u32`) in both. -/
 theorem w_wideSlice_constantIndex_forward_and_firstFromEnd_agrees :
@@ -4750,6 +4903,57 @@ theorem w_wideSlice_constantIndex_reborrow_and_malformed_divergence :
     rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl), (by with_unfolding_all rfl),
     rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl),
     rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl)⟩
+
+/-- Concrete Witness 10 (`DIV-LM-PTR-METADATA-INVALID-SAFE-REF`):
+Documented divergence between Stage-1 `Trusted.Rustc.V2026_06_01` (`stepMirFn` /
+`evalUnaryPtrMetadata`) and vendored `Miri` (`Miri.Interpreter.Step.step` /
+`Miri.Interpreter.ScalarOps.unary .PtrMetadata`) on `UnOp.ptrMetadata(copy _2)`
+when `_2 : &[u32]` (`sharedRefSliceU32Ty`) is an invalid **safe wide reference**:
+* **Real-step null `&[u32]` (`offset = 0`, `len = 3`)**: Stage-1 `stepMirFn`
+  extracts metadata without checking safe-reference validity (stepping to `sNull`
+  with `_0 = 3`), whereas vendored `Miri.Interpreter.Step.step`
+  (`PointerPlaceMachine.dereference` / `annealDerefValidityWideSlice`) faults with
+  `.error (.undefinedBehavior "dereferencing a null reference")`!
+* **Non-null dangling `&[u32]` (`len = 3` over `emptyMemory` / `AnnealMachine.empty`)**:
+  Stage-1 `evalRvalue` returns `.ok (.scalar ⟨3, 8⟩)`, whereas vendored
+  `Miri.Interpreter.ScalarOps.unary .PtrMetadata` faults with
+  `.error (.undefinedBehavior "pointer dereference check failed")`! -/
+theorem div_ptrMetadata_invalidSafeWideRef :
+    let bSafeMeta :=
+      wideSliceTypedReborrowBody arrU32_4Ty sharedRefSliceU32Ty usizeTy
+        (.unaryOp .ptrMetadata (.copy ⟨2, []⟩))
+    let hSafeMeta := annealStepHooksWideSlice bSafeMeta.localDecls bSafeMeta.layouts
+    let danglingVal : Value := .aggregate 0 [.ptr sampleAnnealPtr 8, .scalar ⟨3, 8⟩]
+    let danglingImm : Miri.Interpreter.Immediate AnnealProv :=
+      .scalarPair sampleMiriPtrSc (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 3))
+    let nullVal : Value :=
+      .aggregate 0 [.ptr { allocId := 0, offsetBytes := 0 } 8, .scalar ⟨3, 8⟩]
+    let nullMiriPtr : Miri.Memory.Pointer AnnealProv :=
+      ⟨Miri.ABI.Size.ZERO, .concrete sampleAllocId Miri.Memory.BorTag.one⟩
+    let nullImm : Miri.Interpreter.Immediate AnnealProv :=
+      .scalarPair
+        (Miri.Memory.Scalar.fromPointer annealTargetDataLayout nullMiriPtr)
+        (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 3))
+    let emptyStepState : AnnealStepState := { stack := { frames := #[] }, machine := AnnealMachine.empty }
+    evalRvalue [.uninit, .init sampleAnnealArrVal, .init danglingVal, .init (.scalar ⟨0, 8⟩)]
+      (.unaryOp .ptrMetadata (.copy ⟨2, []⟩)) emptyMemory bSafeMeta.localDecls bSafeMeta.layouts =
+      .ok (.scalar ⟨3, 8⟩)
+        [.uninit, .init sampleAnnealArrVal, .init danglingVal, .init (.scalar ⟨0, 8⟩)]
+        emptyMemory ∧
+    Miri.Interpreter.ScalarOps.unary
+      (annealScalarOpsHooksWideSlice bSafeMeta.localDecls bSafeMeta.layouts) ()
+      .PtrMetadata ⟨danglingImm, translateTyWideSlice sharedRefSliceU32Ty⟩ emptyStepState =
+      .error (.undefinedBehavior "pointer dereference check failed") emptyStepState ∧
+    ∃ (sNull : MachineState) (mNull : AnnealStepState),
+      stepMirFn bSafeMeta
+        (wideSliceTypedInitAnneal sampleAnnealArrVal nullVal 0 emptyMemory) = .step sNull ∧
+      get? sNull.frame.locals 0 = some (.init (.scalar ⟨3, 8⟩)) ∧
+      Miri.Interpreter.Step.step hSafeMeta ()
+        (wideSliceTypedInitMiri bSafeMeta arrU32_4Ty sharedRefSliceU32Ty usizeTy
+          nullImm 0 AnnealMachine.empty) =
+        (mNull, .error (.undefinedBehavior "dereferencing a null reference")) :=
+  ⟨rfl, (by with_unfolding_all rfl), _, _,
+    rfl, rfl, prod_eq_fst_of_snd (by with_unfolding_all rfl)⟩
 
 end WideSliceWitnesses
 

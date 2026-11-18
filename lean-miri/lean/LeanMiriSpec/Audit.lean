@@ -1406,7 +1406,10 @@ open LeanMiriSpec.Correspondence in
   wideRefStrPtrTyId
   wideRawSlicePtrTyId
   wideRefSlicePtrTyId
-  encodeSliceElemTyId
+  unsupportedWideSliceTyId
+  unsupportedWideSafeRefTyId
+  isKnownThinPointee
+  encodeSliceElemTyId?
   isWideSliceOrPointeeTy
   encodeTyIdWideSlice
   encodeTyIdWideSlice_eq_encodeTyId
@@ -1414,7 +1417,9 @@ open LeanMiriSpec.Correspondence in
   translateTyWideSlice_eq_translateTy
   layoutOfEncodedTyIdWideSlice
   wideSlicePointeeTyId?
+  isWideRawPtrTyId
   isWideSlicePtrTyId
+  isWideSlicePtrTyId_of_isWideRawPtrTyId
   classifyEncodedTyIdWideSlice
   castTypeInfoOfEncodedTyIdWideSlice
   tryFromUInt_u64_spec
@@ -1558,6 +1563,7 @@ open LeanMiriSpec.Correspondence in
   WideSliceWitnesses.sharedRefU32Ty
   WideSliceWitnesses.w_wideSlice_constantIndex_forward_and_firstFromEnd_agrees
   WideSliceWitnesses.w_wideSlice_constantIndex_reborrow_and_malformed_divergence
+  WideSliceWitnesses.div_ptrMetadata_invalidSafeWideRef
 
 
 /-- Exhaustively verify that every declaration across every imported
@@ -25773,7 +25779,7 @@ example
     {op : Operand} {v : Value} {imm : Miri.Interpreter.Immediate AnnealProv}
     {ptrTyId : Miri.MIR.TyId} {ptrLayoutData : Miri.ABI.LayoutData}
     (hptrBytes : layoutPointerBytes layouts = 8)
-    (hwideTy : isWideSlicePtrTyId ptrTyId = true)
+    (hwideTy : isWideRawPtrTyId ptrTyId = true)
     (hnonWideFalse : isNonWidePtrAggregateTy (operandTy localDecls layouts op) = false)
     (heval :
       evalOperand locals op mem.borrows mem.globals layouts
@@ -26238,7 +26244,7 @@ example
     (hptr : PtrRel allocMap p mptr)
     (hlen : ScalarRel lenSc mlen)
     (hlen_sz : lenSc.sizeBytes = 8)
-    (hsrcWide : isWideSlicePtrTyId srcTyId = true)
+    (hsrcWide : isWideRawPtrTyId srcTyId = true)
     (hsrc_info : ∃ pt, castTypeInfoOfEncodedTyIdWideSlice srcTyId = .ok (.rawPointer pt))
     (hdst_info : ∃ pt, castTypeInfoOfEncodedTyIdWideSlice dstTyId = .ok (.rawPointer pt))
     (st : AnnealStepState) :
@@ -26338,7 +26344,7 @@ example
       .ok (UInt64.ofNat lenSc.bits) st ∧
     Miri.Interpreter.ScalarOps.unary
       (annealScalarOpsHooksWideSlice localDecls layouts) ()
-      .PtrMetadata ⟨metaImm, ⟨arraySliceMetaTyId, widePointerLayoutData false⟩⟩ st =
+      .PtrMetadata ⟨metaImm, ⟨wideRawStrPtrTyId, widePointerLayoutData false⟩⟩ st =
       .ok ⟨.scalar (.fromScalarInt mlen),
            translateTy { kind := .uint .usize, layoutIdx := 0 }⟩ st ∧
     WideSliceImmediateRel allocMap (.aggregate 0 [.ptr p 8, .scalar lenSc]) metaImm ∧
@@ -26547,7 +26553,7 @@ example
       .ok (UInt64.ofNat lenSc.bits) st ∧
     Miri.Interpreter.ScalarOps.unary
       (annealScalarOpsHooksWideSlice localDecls layouts) ()
-      .PtrMetadata ⟨metaImm, ⟨arraySliceMetaTyId, widePointerLayoutData false⟩⟩ st =
+      .PtrMetadata ⟨metaImm, ⟨wideRawStrPtrTyId, widePointerLayoutData false⟩⟩ st =
       .ok ⟨.scalar (.fromScalarInt mlen),
            translateTy { kind := .uint .usize, layoutIdx := 0 }⟩ st ∧
     WideSliceImmediateRel allocMap (.aggregate 0 [.ptr p 8, .scalar lenSc]) metaImm ∧
@@ -27003,6 +27009,43 @@ example :
         (wideSlice4LocalInitMiri bMalRef sharedRefU32Ty sampleMiriPtr 3 0 sampleArrU32Machine) =
         (mMalRef, .error (.invalidProgram "invalid from-end constant index")) :=
   w_wideSlice_constantIndex_reborrow_and_malformed_divergence
+
+open WideSliceWitnesses in
+example :
+    let bSafeMeta :=
+      wideSliceTypedReborrowBody arrU32_4Ty sharedRefSliceU32Ty usizeTy
+        (.unaryOp .ptrMetadata (.copy ⟨2, []⟩))
+    let hSafeMeta := annealStepHooksWideSlice bSafeMeta.localDecls bSafeMeta.layouts
+    let danglingVal : Value := .aggregate 0 [.ptr sampleAnnealPtr 8, .scalar ⟨3, 8⟩]
+    let danglingImm : Miri.Interpreter.Immediate AnnealProv :=
+      .scalarPair sampleMiriPtrSc (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 3))
+    let nullVal : Value :=
+      .aggregate 0 [.ptr { allocId := 0, offsetBytes := 0 } 8, .scalar ⟨3, 8⟩]
+    let nullMiriPtr : Miri.Memory.Pointer AnnealProv :=
+      ⟨Miri.ABI.Size.ZERO, .concrete sampleAllocId Miri.Memory.BorTag.one⟩
+    let nullImm : Miri.Interpreter.Immediate AnnealProv :=
+      .scalarPair
+        (Miri.Memory.Scalar.fromPointer annealTargetDataLayout nullMiriPtr)
+        (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 3))
+    let emptyStepState : AnnealStepState := { stack := { frames := #[] }, machine := AnnealMachine.empty }
+    evalRvalue [.uninit, .init sampleAnnealArrVal, .init danglingVal, .init (.scalar ⟨0, 8⟩)]
+      (.unaryOp .ptrMetadata (.copy ⟨2, []⟩)) emptyMemory bSafeMeta.localDecls bSafeMeta.layouts =
+      .ok (.scalar ⟨3, 8⟩)
+        [.uninit, .init sampleAnnealArrVal, .init danglingVal, .init (.scalar ⟨0, 8⟩)]
+        emptyMemory ∧
+    Miri.Interpreter.ScalarOps.unary
+      (annealScalarOpsHooksWideSlice bSafeMeta.localDecls bSafeMeta.layouts) ()
+      .PtrMetadata ⟨danglingImm, translateTyWideSlice sharedRefSliceU32Ty⟩ emptyStepState =
+      .error (.undefinedBehavior "pointer dereference check failed") emptyStepState ∧
+    ∃ (sNull : MachineState) (mNull : AnnealStepState),
+      stepMirFn bSafeMeta
+        (wideSliceTypedInitAnneal sampleAnnealArrVal nullVal 0 emptyMemory) = .step sNull ∧
+      get? sNull.frame.locals 0 = some (.init (.scalar ⟨3, 8⟩)) ∧
+      Miri.Interpreter.Step.step hSafeMeta ()
+        (wideSliceTypedInitMiri bSafeMeta arrU32_4Ty sharedRefSliceU32Ty usizeTy
+          nullImm 0 AnnealMachine.empty) =
+        (mNull, .error (.undefinedBehavior "dereferencing a null reference")) :=
+  div_ptrMetadata_invalidSafeWideRef
 
 end StatementPins
 

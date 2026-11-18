@@ -159,9 +159,21 @@ machine state:
    (`freeze_fail_of_window_not_init`) nor be unpinned from a block mirroring its
    window (`unpin_fail_of_window_not_init`); `u8U32Padded_freeze_refused` and
    `u8U32Padded_unpin_blocked` instantiate both for padded `(u8, u32)`.
+9. **Wide-slice DST refinement (`stdWideSliceVal`, `UnsizedSliceDstAt`) and
+   spatial-pin framing (`WideSliceDstBridge`).** `stdWideSliceVal lid len`
+   models a wide `[T]` / `str` pointer symbolically as `.pair (.refVal lid [])
+   (.nat len)`, refined via `StdValRefines.wideSlice` when `wide.1.allocId =
+   tagOf lid` and `wide.1.offsetBytes = 0`. Statement- and call-level step
+   lifters preserve `spatialPinnedBlockHolds`, `spatialBindingsHold`,
+   `mirStateRel`, `mirCfgStateRel`, and `MirWpConverges` without unpinning
+   across `UnOp.ptrMetadata`, `AggregateKind.rawPtr` (`from_raw_parts`),
+   `CastKind.ptrToPtr` (`to_raw_parts` data pointer on global-backed wide
+   pointers, and wide-to-wide casts), and `core::intrinsics::size_of_val` /
+   `align_of_val`.
 
 End-to-end regressions over concrete `CapturedMir` bodies live in
-`tests/mir/PureLiftV2026BridgeTests.lean`.
+`tests/mir/PureLiftV2026BridgeTests.lean` and
+`tests/mir/UnsizedDstMetadataLensTests.lean`.
 -/
 
 namespace Anneal.PureLift.V2026_06_01Bridge
@@ -7094,9 +7106,10 @@ theorem StdValRefines.of_unsizedSliceDstAt {α : Type} {n : Nat} {c : ByteLensCo
   exact StdValRefines.wideSlice tagOf lid ptrBytes wide hAlloc hOff
     (by rw [← hDst.length_eq]; exact hLen)
 
-/-- **`StdValRefines.wideSlice_ptrMetadata_refines`**: evaluating `Rvalue.unaryOp .ptrMetadata`
-on a wide pointer refining `stdWideSliceVal lid wide.2` under `UnsizedSliceDstAt` produces a
-scalar refining `.nat elems.length`. -/
+/-- **`StdValRefines.wideSlice_ptrMetadata_refines`**: evaluating
+`Rvalue.unaryOp .ptrMetadata` on an `UnsizedSliceDstAt` view `fatVal` with
+`elems.length < 256 ^ (layoutPointerBytes layouts)` produces
+`.scalar ⟨elems.length, layoutPointerBytes layouts⟩` refining `.nat elems.length`. -/
 theorem StdValRefines.wideSlice_ptrMetadata_refines {α : Type} {n : Nat} {c : ByteLensCodec α n}
     (tagOf : LoanId → Nat) {dstTy : RigidTy} {mem : Memory}
     {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
@@ -7112,9 +7125,12 @@ theorem StdValRefines.wideSlice_ptrMetadata_refines {α : Type} {n : Nat} {c : B
         (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) :=
   ⟨(hDst.evalRvalue_ptrMetadata locals locals' op localDecls layouts hOp).1, .nat hLen⟩
 
-/-- **`StdValRefines.wideSlice_from_raw_parts_roundtrip`**: decomposing `fatVal` at `loc` via
-`to_raw_parts` (`.field 0` and `.field 1`) and reassembling via `AggregateKind.rawPtr` preserves
-both `StdValRefines tagOf (stdWideSliceVal lid elems.length)` and `UnsizedSliceDstAt`. -/
+/-- **`StdValRefines.wideSlice_from_raw_parts_roundtrip`**: projecting `.field 0`
+and `.field 1` from a decomposed 2-field `(data, meta)` aggregate local `loc`
+holding `fatVal` and reassembling via `AggregateKind.rawPtr` preserves both
+`StdValRefines tagOf (stdWideSliceVal lid elems.length)` and `UnsizedSliceDstAt`.
+(Rustc lowers `<*const [T]>::to_raw_parts` to `CastKind.ptrToPtr` +
+`UnOp.ptrMetadata`; see `mirStep_assign_cast_ptrToPtr_wide_to_thin_preserves_spatialPin`.) -/
 theorem StdValRefines.wideSlice_from_raw_parts_roundtrip {α : Type} {n : Nat}
     {c : ByteLensCodec α n} (tagOf : LoanId → Nat) (lid : LoanId)
     {dstTy : RigidTy} {mem : Memory} {wide : WidePtrVal} {fatVal : Value}
@@ -8362,12 +8378,17 @@ theorem mirStep_assign_ptrMetadata_wide_scalarAddr_preserves_spatialPin
     rfl rfl
   exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
 
-/-- **`mirStep_assign_cast_ptrToPtr_wide_to_thin_preserves_spatialPin`**: executing
-`dstLoc = op as targetTy` (`CastKind.ptrToPtr` from a wide pointer with
-`lookupBorrow ms.memory.borrows p.tag = none` to a thin raw pointer `isThinRawPtrTy targetTy = true`,
-i.e., the data half of rustc's `to_raw_parts` lowering) into a local `dstLoc` disjoint from `l`
-and `bindings` steps `PureMirExec.mirStep`, preserves `spatialPinnedBlockHolds` and
-`spatialBindingsHold` without unpinning, and transports `MirWpConverges`. -/
+/-- **`mirStep_assign_cast_ptrToPtr_wide_to_thin_preserves_spatialPin`**:
+executing `dstLoc = op as targetTy` (`CastKind.ptrToPtr` from a global-backed
+wide pointer with `lookupBorrow ms.memory.borrows p.tag = none` to a thin raw
+pointer `isThinRawPtrTy targetTy = true`, i.e. the data half of rustc's
+`to_raw_parts` lowering) into a local `dstLoc` disjoint from `l` and `bindings`
+steps `PureMirExec.mirStep`, preserves `spatialPinnedBlockHolds` and
+`spatialBindingsHold` without unpinning, and transports `MirWpConverges`.
+(Global-backed and `alreadySubslice = true` borrow-backed `PtrToPtr` preserve
+`mem.borrows`/`nextTag` and `StdValRefines`, whereas whole-place
+`alreadySubslice = false` borrow-backed `PtrToPtr` allocates fresh narrowed tag
+`mem.nextTag` at `offsetBytes = 0`.) -/
 theorem mirStep_assign_cast_ptrToPtr_wide_to_thin_preserves_spatialPin
     (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
     {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
