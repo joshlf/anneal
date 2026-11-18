@@ -314,9 +314,9 @@ need an admitted import path.
 ## Compose source proofs
 
 The checked library in `Anneal.MirWp` supports several proof routes: finite
-evaluation with `run`, explicit `Executes` witnesses, finite `wpSteps` proofs,
-and invariants for prefix safety. The canonical theorem does not require one
-particular route.
+evaluation with `run`, explicit `Executes` witnesses, block-by-block
+`BlockExec` certificates, finite `wpSteps` proofs, and invariants for prefix
+safety. The canonical theorem does not require one particular route.
 
 A finite source segment `Reach body start checkpoint` can precede either a
 returning or a safe continuation. `executes_prepend` combines that segment with
@@ -330,12 +330,23 @@ A loop summary must preserve every storage condition needed by its segment.
 An unread local can still need allocation evidence if the segment writes it:
 assigning to a dead destination faults even when its old value is irrelevant.
 
-The endianness witness generator uses this composition at each path's entry.
-The Rust spin fixture uses safety transport before its loop invariant and
-proves no return separately. These consumers exercise the existing acceptance
-path; no speed or memory improvement is established. Safety transport and the
-execution-to-safety bridge rely on the deterministic source step. An extension
-to nondeterministic execution needs a bridge covering every relevant path.
+A path whose arguments include a universally quantified value cannot be proved
+by evaluating `run` or `step` from the entry state: each step leaves its
+successor's locals as an unreduced update of the previous state, and the
+dynamic type test of an assignment does not reduce on a symbolic scalar.
+`BlockExec` certificates cut such a path at basic-block boundaries. Each rule
+consumes one statement of the current block and states its successor as
+`mkState b i L'`, where closing the `setElem?` premise by `rfl` reduces `L'` to
+a literal list of slots. `evalStatement_assign` turns the type test and the
+stored value into premises that value-level lemmas discharge.
+
+The endianness proof runs every path through these rules with one tactic
+script and no generated witnesses. The Rust spin fixture uses safety transport
+before its loop invariant and proves no return separately. These consumers
+exercise the existing acceptance path; no speed or memory improvement is
+established. Safety transport and the execution-to-safety bridge rely on the
+deterministic source step. An extension to nondeterministic execution needs a
+bridge covering every relevant path.
 
 ## Supported fragment and results
 
@@ -424,14 +435,14 @@ With `to_be = false`, a safe normal return exists and equals the masked input.
 Baseline safety also covers all valid function inputs independently of these
 additional properties.
 
-The helper regenerates baseline witnesses and requires their bytes to match
-those just verified. It then changes the implementation to return zero and to
-preserve the masked input. Both mutations must fail with the original witnesses
-and with fresh witnesses for their changed captures. Before crediting each
-fresh rejection, it separately verifies those exact witnesses against a safe
-completion specification. The fixed endpoint claims remain unchanged, so a
-syntax or transition failure cannot satisfy this negative test. Logs, receipts
-and `summary.json` remain in the new evidence directory.
+The helper first verifies an execution proof that states no return value: every
+valid entry of the baseline capture returns safely. It then changes the
+implementation to return zero and to preserve the masked input. For each
+mutation, the same unchanged execution proof must verify against the changed
+capture before the helper credits rejection of the unchanged fixed claims, so
+a syntax or transition failure cannot satisfy this negative test. Every proof
+source stays byte-identical across the three captures. Logs, receipts and
+`summary.json` remain in the new evidence directory.
 
 For the workspace tests, first install the omnibus archive as above, then build
 the workspace capture driver with its pinned compiler. Explicit tool paths make

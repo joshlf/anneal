@@ -7,12 +7,70 @@
 -- those terms.
 
 prelude
-import ProductionEndpoints
+import InitialCache
 
 namespace ProductionClaims
 
 open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp Endianness
-  ProductionReduction ProductionSteps
+  ProductionReduction
+
+/-- The value that `apply_endianness` returns for each byte-order flag and
+width index, written with the same masks and shifts as the Rust source. -/
+def sourceOutput (toBe : Bool) (width : Nat) (value : Word) : Word :=
+  match toBe, width with
+  | false, 0 => value &&& 255
+  | false, 1 => value &&& 65535
+  | false, 2 => value &&& 4294967295
+  | false, _ => value
+  | true, 0 => swap8 value
+  | true, 1 => swap16 value
+  | true, 2 => swap32 value
+  | true, _ => swap64 value
+
+/-- Every flag and width runs the captured body to `sourceOutput`. Each path is
+executed block by block with `Anneal.MirWp`'s `BlockExec` rules. Symbolic `u64`
+assignments store their `BitVec 64` value through `evalStatement_assignU64`;
+every other step closes by `eq_refl`, which also checks the returned value
+against `sourceOutput`. The assignment rules come before the plain
+`blockExec_cons` step: on a symbolic value, `eq_refl` reaches the `checkVal`
+test, which never reduces, and fails only after a long search. -/
+theorem sourceExecutes (toBe : Bool) (width : Fin 4) (value : Word) :
+    Executes sourceBody (initial sourceBody (endianArgs toBe width.val value))
+      (u64Val (sourceOutput toBe width.val value)) := by
+  revert width value
+  cases toBe <;> apply fin4_cases <;> intro value <;>
+  · unfold initial
+    repeat (first
+      | (apply executes_of_blockExec; eq_refl)
+      | (apply blockExec_storageLive; eq_refl; eq_refl)
+      | (apply blockExec_storageDead; eq_refl; eq_refl)
+      | (apply blockExec_cons
+         apply evalStatement_assignU64 (rv := .binaryOp .bitAnd _ _)
+         eq_refl; eq_refl; eq_refl; eq_refl; apply u64BitAndVal_eq
+         eq_refl; eq_refl)
+      | (apply blockExec_cons
+         apply evalStatement_assignU64 (rv := .binaryOp .bitOr _ _)
+         eq_refl; eq_refl; eq_refl; eq_refl; apply u64BitOrVal_eq
+         eq_refl; eq_refl)
+      | (apply blockExec_cons
+         apply evalStatement_assignU64 (rv := .binaryOp .shl _ _)
+         eq_refl; eq_refl; eq_refl; eq_refl; apply u64ShlVal_eq
+         eq_refl; eq_refl)
+      | (apply blockExec_cons
+         apply evalStatement_assignU64 (rv := .binaryOp .shr _ _)
+         eq_refl; eq_refl; eq_refl; eq_refl; apply u64ShrVal_eq
+         eq_refl; eq_refl)
+      | (apply blockExec_cons
+         apply evalStatement_assignU64 (rv := .use _)
+         eq_refl; eq_refl; eq_refl; eq_refl; eq_refl; eq_refl; eq_refl)
+      | (apply blockExec_cons; eq_refl)
+      | (apply blockExec_nil_step; eq_refl; eq_refl)
+      | (apply blockExec_nil_ret; eq_refl; eq_refl))
+
+theorem sourceReturns (toBe : Bool) (width : Fin 4) (value : Word) :
+    Returns sourceBody (endianArgs toBe width.val value)
+      (u64Val (sourceOutput toBe width.val value)) :=
+  executes_returns (sourceExecutes toBe width value)
 
 theorem wellFormed :
     BodyStaticAdmitted sourceProgram sourceBody = true := rfl
@@ -29,21 +87,10 @@ theorem behavior_of_sourceReturns {flag : Bool} {width : Fin 4} {value : Word}
 theorem completed :
     ∀ flag : Bool, ∀ width : Fin 4, ∀ value : Word,
       Safe sourceBody (endianArgs flag width.val value) ∧
-      ∃ output, Returns sourceBody (endianArgs flag width.val value) output := by
-  intro flag
-  cases flag with
-  | false =>
-    exact fin4_cases
-      (fun v => ⟨(le8 v).1, _, (le8 v).2⟩)
-      (fun v => ⟨(le16 v).1, _, (le16 v).2⟩)
-      (fun v => ⟨(le32 v).1, _, (le32 v).2⟩)
-      (fun v => ⟨(le64 v).1, _, (le64 v).2⟩)
-  | true =>
-    exact fin4_cases
-      (fun v => ⟨(be8 v).1, _, (be8 v).2⟩)
-      (fun v => ⟨(be16 v).1, _, (be16 v).2⟩)
-      (fun v => ⟨(be32 v).1, _, (be32 v).2⟩)
-      (fun v => ⟨(be64 v).1, _, (be64 v).2⟩)
+      ∃ output, Returns sourceBody (endianArgs flag width.val value) output :=
+  fun flag width value =>
+    ⟨executes_safe (sourceExecutes flag width value), _,
+      sourceReturns flag width value⟩
 
 theorem baseline (safetyPre : List Val → Prop) :
     BodyVerified sourceProgram 0 sourceBody safetyPre := by
@@ -60,16 +107,16 @@ theorem bigEndian_exact :
       ByteReversal (8 * 2 ^ width.val) value output := by
   refine fin4_cases ?_ ?_ ?_ ?_
   · intro value
-    exact ⟨_, behavior_of_sourceReturns (width := 0) (be8 value).2,
+    exact ⟨_, behavior_of_sourceReturns (sourceReturns true 0 value),
       swap8_exact value⟩
   · intro value
-    exact ⟨_, behavior_of_sourceReturns (width := 1) (be16 value).2,
+    exact ⟨_, behavior_of_sourceReturns (sourceReturns true 1 value),
       swap16_exact value⟩
   · intro value
-    exact ⟨_, behavior_of_sourceReturns (width := 2) (be32 value).2,
+    exact ⟨_, behavior_of_sourceReturns (sourceReturns true 2 value),
       swap32_exact value⟩
   · intro value
-    exact ⟨_, behavior_of_sourceReturns (width := 3) (be64 value).2,
+    exact ⟨_, behavior_of_sourceReturns (sourceReturns true 3 value),
       swap64_exact value⟩
 
 theorem littleEndian_exact :
@@ -80,13 +127,13 @@ theorem littleEndian_exact :
       output = value &&& BitVec.ofNat 64 (2 ^ (8 * 2 ^ width.val) - 1) := by
   refine fin4_cases ?_ ?_ ?_ ?_
   · intro value
-    exact ⟨_, behavior_of_sourceReturns (width := 0) (le8 value).2, rfl⟩
+    exact ⟨_, behavior_of_sourceReturns (sourceReturns false 0 value), rfl⟩
   · intro value
-    exact ⟨_, behavior_of_sourceReturns (width := 1) (le16 value).2, rfl⟩
+    exact ⟨_, behavior_of_sourceReturns (sourceReturns false 1 value), rfl⟩
   · intro value
-    exact ⟨_, behavior_of_sourceReturns (width := 2) (le32 value).2, rfl⟩
+    exact ⟨_, behavior_of_sourceReturns (sourceReturns false 2 value), rfl⟩
   · intro value
-    refine ⟨_, behavior_of_sourceReturns (width := 3) (le64 value).2, ?_⟩
+    refine ⟨_, behavior_of_sourceReturns (sourceReturns false 3 value), ?_⟩
     have mask : BitVec.ofNat 64 (2 ^ (8 * 2 ^ (3 : Nat)) - 1) =
         BitVec.allOnes 64 := rfl
     change value = value &&& BitVec.ofNat 64 (2 ^ (8 * 2 ^ (3 : Nat)) - 1)
@@ -103,20 +150,20 @@ theorem bigEndian_involutive :
       second = value &&& BitVec.ofNat 64 (2 ^ (8 * 2 ^ width.val) - 1) := by
   refine fin4_cases ?_ ?_ ?_ ?_
   · intro value
-    exact ⟨_, _, behavior_of_sourceReturns (width := 0) (be8 value).2,
-      behavior_of_sourceReturns (width := 0) (be8 (swap8 value)).2,
+    exact ⟨_, _, behavior_of_sourceReturns (sourceReturns true 0 value),
+      behavior_of_sourceReturns (sourceReturns true 0 (swap8 value)),
       swap8_involutive value⟩
   · intro value
-    exact ⟨_, _, behavior_of_sourceReturns (width := 1) (be16 value).2,
-      behavior_of_sourceReturns (width := 1) (be16 (swap16 value)).2,
+    exact ⟨_, _, behavior_of_sourceReturns (sourceReturns true 1 value),
+      behavior_of_sourceReturns (sourceReturns true 1 (swap16 value)),
       swap16_involutive value⟩
   · intro value
-    exact ⟨_, _, behavior_of_sourceReturns (width := 2) (be32 value).2,
-      behavior_of_sourceReturns (width := 2) (be32 (swap32 value)).2,
+    exact ⟨_, _, behavior_of_sourceReturns (sourceReturns true 2 value),
+      behavior_of_sourceReturns (sourceReturns true 2 (swap32 value)),
       swap32_involutive value⟩
   · intro value
-    refine ⟨_, _, behavior_of_sourceReturns (width := 3) (be64 value).2,
-      behavior_of_sourceReturns (width := 3) (be64 (swap64 value)).2, ?_⟩
+    refine ⟨_, _, behavior_of_sourceReturns (sourceReturns true 3 value),
+      behavior_of_sourceReturns (sourceReturns true 3 (swap64 value)), ?_⟩
     have mask : BitVec.ofNat 64 (2 ^ (8 * 2 ^ (3 : Nat)) - 1) =
         BitVec.allOnes 64 := rfl
     change swap64 (swap64 value) =

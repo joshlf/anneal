@@ -123,67 +123,6 @@ theorem u64ShrVal_eq (x : Word) (k : Nat) :
   rw [h]
   rfl
 
-noncomputable def evalAssignVal (body : Body) (s : State) : Option Val :=
-  match s.frames with
-  | [frame] =>
-    match Trusted.MirSemantics.getElem? body.basicBlocks frame.blockIdx with
-    | some bb =>
-      match Trusted.MirSemantics.getElem? bb.statements frame.stmtIdx with
-      | some (.assign dst rvalue) =>
-        match Trusted.MirSemantics.getElem? body.locals dst.localId with
-        | some dstTy =>
-          match evalRvalue body.locals frame.locals dstTy rvalue with
-          | .ok (val, _) => some val
-          | .error _ => none
-        | none => none
-      | _ => none
-    | none => none
-  | _ => none
-
-noncomputable def evalAssignWith (body : Body) (s : State)
-    (overrideVal : Val) : StepResult State TerminalOut :=
-  match s.frames with
-  | [frame] =>
-    match Nat.beq frame.defId 0 with
-    | false => .fault .unsupported
-    | true =>
-      match Trusted.MirSemantics.getElem? body.basicBlocks frame.blockIdx with
-      | none => .fault .unsupported
-      | some bb =>
-        match Trusted.MirSemantics.getElem? bb.statements frame.stmtIdx with
-        | some (.assign dst rvalue) =>
-          match dst.projection.isEmpty with
-          | false => .fault .unsupported
-          | true =>
-            match Trusted.MirSemantics.getElem? body.locals dst.localId with
-            | none => .fault .unsupported
-            | some dstTy =>
-              match MirTy.beq dstTy (.int .i64 false) with
-              | false => .fault .unsupported
-              | true =>
-                match evalRvalue body.locals frame.locals dstTy rvalue with
-                | .error k => .fault k
-                | .ok (_, localsAfterRval) =>
-                  match Trusted.MirSemantics.getElem?
-                      localsAfterRval dst.localId with
-                  | none => .fault .unsupported
-                  | some .dead => .fault .undefined
-                  | some (.live _) =>
-                    match setElem? localsAfterRval dst.localId
-                        (.live (some overrideVal)) with
-                    | some localsAfterWrite =>
-                      .step {
-                        frames := [{
-                          frame with
-                          stmtIdx := frame.stmtIdx + 1
-                          locals := localsAfterWrite
-                        }]
-                        callerMem := s.callerMem
-                      }
-                    | none => .fault .unsupported
-        | _ => .fault .unsupported
-  | _ => .fault .unsupported
-
 theorem mirTy_eq_u64_of_beq {ty : MirTy}
     (h : MirTy.beq ty (.int .i64 false) = true) : ty = .int .i64 false := by
   cases ty with
@@ -195,126 +134,24 @@ theorem mirTy_eq_u64_of_beq {ty : MirTy}
     unfold MirTy.beq at h
     cases h
 
-theorem step_eq_evalAssignWith {body : Body} {s next : State} {val : Val}
-    {w : Word}
-    (h_val : evalAssignVal body s = some val)
-    (h_eq : val = u64Val w)
-    (h_next : evalAssignWith body s (u64Val w) = .step next) :
-    step body s = .step next := by
-  unfold evalAssignVal at h_val
-  unfold evalAssignWith at h_next
-  unfold step bodyProg evalStep
-  cases h_fr : s.frames with
-  | nil => rw [h_fr] at h_next; cases h_next
-  | cons frame rest =>
-    cases rest with
-    | cons _ _ => rw [h_fr] at h_next; cases h_next
-    | nil =>
-      rw [h_fr] at h_val h_next
-      dsimp only at h_val h_next ⊢
-      cases h_def : Nat.beq frame.defId 0 with
-      | false => rw [h_def] at h_next; cases h_next
-      | true =>
-        rw [h_def] at h_next
-        dsimp only at h_next
-        have h_def0 : frame.defId = 0 := Nat.eq_of_beq_eq_true h_def
-        rw [h_def0]
-        rw [show Trusted.MirSemantics.getElem? [body] 0 = some body from rfl]
-        dsimp only
-        cases h_bb :
-            Trusted.MirSemantics.getElem? body.basicBlocks frame.blockIdx with
-        | none => rw [h_bb] at h_next; cases h_next
-        | some bb =>
-          rw [h_bb] at h_val h_next
-          dsimp only at h_val h_next ⊢
-          cases h_st :
-              Trusted.MirSemantics.getElem? bb.statements frame.stmtIdx with
-          | none => rw [h_st] at h_next; cases h_next
-          | some stmt =>
-            rw [h_st] at h_val h_next
-            dsimp only at h_val h_next ⊢
-            cases stmt with
-            | nop | storageLive _ | storageDead _ | unsupported => cases h_next
-            | assign dst rvalue =>
-              dsimp only at h_val h_next
-              unfold evalStatement
-              dsimp only
-              cases h_proj : dst.projection.isEmpty with
-              | false => rw [h_proj] at h_next; cases h_next
-              | true =>
-                rw [h_proj] at h_next
-                simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-                dsimp only at h_next
-                cases h_dst :
-                    Trusted.MirSemantics.getElem? body.locals dst.localId with
-                | none => rw [h_dst] at h_next; cases h_next
-                | some dstTy =>
-                  rw [h_dst] at h_val h_next
-                  dsimp only at h_val h_next ⊢
-                  cases h_ty : MirTy.beq dstTy (.int .i64 false) with
-                  | false => rw [h_ty] at h_next; cases h_next
-                  | true =>
-                    rw [h_ty] at h_next
-                    dsimp only at h_next
-                    have h_ty_eq := mirTy_eq_u64_of_beq h_ty
-                    subst h_ty_eq
-                    cases h_rv : evalRvalue body.locals frame.locals
-                        (.int .i64 false) rvalue with
-                    | error k => rw [h_rv] at h_val; cases h_val
-                    | ok pair =>
-                      rw [h_rv] at h_val h_next
-                      dsimp only at h_val h_next ⊢
-                      injection h_val with h_v
-                      have h_vw : pair.1 = u64Val w := h_v.trans h_eq
-                      rw [h_vw]
-                      unfold writePlace
-                      rw [checkVal_u64Val w]
-                      simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-                      cases h_slot :
-                          Trusted.MirSemantics.getElem? pair.2 dst.localId with
-                      | none => rw [h_slot] at h_next; cases h_next
-                      | some slot =>
-                        rw [h_slot] at h_next
-                        cases slot with
-                        | dead => cases h_next
-                        | live _ =>
-                          dsimp only at h_next ⊢
-                          cases h_set : setElem? pair.2 dst.localId
-                              (.live (some (u64Val w))) with
-                          | none => rw [h_set] at h_next; cases h_next
-                          | some localsAfterWrite =>
-                            rw [h_set] at h_next
-                            exact h_next
-
-theorem step_u64Use {body : Body} {s next : State} (x : Word)
-    (h_val : evalAssignVal body s = some (u64Val x))
-    (h_next : evalAssignWith body s (u64Val x) = .step next) :
-    step body s = .step next :=
-  step_eq_evalAssignWith h_val rfl h_next
-
-theorem step_u64And {body : Body} {s next : State} (x y : Word)
-    (h_val : evalAssignVal body s = some (u64BitAndVal x y))
-    (h_next : evalAssignWith body s (u64Val (x &&& y)) = .step next) :
-    step body s = .step next :=
-  step_eq_evalAssignWith h_val (u64BitAndVal_eq x y) h_next
-
-theorem step_u64Or {body : Body} {s next : State} (x y : Word)
-    (h_val : evalAssignVal body s = some (u64BitOrVal x y))
-    (h_next : evalAssignWith body s (u64Val (x ||| y)) = .step next) :
-    step body s = .step next :=
-  step_eq_evalAssignWith h_val (u64BitOrVal_eq x y) h_next
-
-theorem step_u64Shl {body : Body} {s next : State} (x : Word) (k : Nat)
-    (h_val : evalAssignVal body s = some (u64ShlVal x k))
-    (h_next : evalAssignWith body s (u64Val (x <<< k)) = .step next) :
-    step body s = .step next :=
-  step_eq_evalAssignWith h_val (u64ShlVal_eq x k) h_next
-
-theorem step_u64Shr {body : Body} {s next : State} (x : Word) (k : Nat)
-    (h_val : evalAssignVal body s = some (u64ShrVal x k))
-    (h_next : evalAssignWith body s (u64Val (x >>> k)) = .step next) :
-    step body s = .step next :=
-  step_eq_evalAssignWith h_val (u64ShrVal_eq x k) h_next
+/-- A `u64` assignment whose computed value `v` equals `u64Val w`. Callers
+supply `h_val` from the `u64*Val_eq` lemmas above, so the stored slot holds the
+`BitVec 64` expression `w` instead of the semantics' 128-bit encoding. -/
+theorem evalStatement_assignU64 {body : Body} {b i : Nat}
+    {L L₁ L₂ : List LocalSlot} {stmt : StatementKind} {dst : Place}
+    {rv : Rvalue} {v : Val} {w : Word} {o : Option Val}
+    (h_stmt : stmt = .assign dst rv)
+    (h_proj : dst.projection.isEmpty = true)
+    (h_ty : Trusted.MirSemantics.getElem? body.locals dst.localId =
+      some (.int .i64 false))
+    (h_rv : evalRvalue body.locals L (.int .i64 false) rv = .ok (v, L₁))
+    (h_val : v = u64Val w)
+    (h_live : Trusted.MirSemantics.getElem? L₁ dst.localId = some (.live o))
+    (h_set : setElem? L₁ dst.localId (.live (some (u64Val w))) = some L₂) :
+    evalStatement body ⟨0, b, i, L⟩ ⟨[]⟩ stmt =
+      .step (mkState b (i + 1) L₂) :=
+  evalStatement_assign h_stmt h_proj h_ty h_rv h_val (checkVal_u64Val w)
+    h_live h_set
 
 theorem natListBeq_eq {xs ys : List Nat} (h : natListBeq xs ys = true) :
     xs = ys := by

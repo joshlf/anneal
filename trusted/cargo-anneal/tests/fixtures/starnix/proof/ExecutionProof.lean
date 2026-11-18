@@ -8,37 +8,61 @@
 
 prelude
 import Expected
-import ProductionSteps
+import InitialCache
 
 namespace ExecutionProof
 
 open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp Endianness
-  ProductionReduction ProductionSteps
+  ProductionReduction
 
 /-!
-All generated paths must prove real source executions before a negative test
-can credit rejection of the fixed byte-reversal property. This proof uses the
-same generated witness module as that later check, with no expected endpoints.
+A negative test may credit rejection of the fixed byte-reversal property only
+after the same captured body is shown to return on every valid entry. This
+proof states no expected return value, so CI reuses it unchanged on each
+mutated capture: the symbolic execution below binds the output to whatever the
+captured body actually returns. It runs the same rules in the same order as
+`ProductionClaims.sourceExecutes`, which explains that order.
 -/
 
 theorem completed :
     ∀ flag : Bool, ∀ width : Fin 4, ∀ value : Word,
       Safe sourceBody (endianArgs flag width.val value) ∧
       ∃ output, Returns sourceBody (endianArgs flag width.val value) output := by
-  intro flag
-  cases flag with
-  | false =>
-    exact fin4_cases
-      (fun v => ⟨(le8_actual v).1, _, (le8_actual v).2⟩)
-      (fun v => ⟨(le16_actual v).1, _, (le16_actual v).2⟩)
-      (fun v => ⟨(le32_actual v).1, _, (le32_actual v).2⟩)
-      (fun v => ⟨(le64_actual v).1, _, (le64_actual v).2⟩)
-  | true =>
-    exact fin4_cases
-      (fun v => ⟨(be8_actual v).1, _, (be8_actual v).2⟩)
-      (fun v => ⟨(be16_actual v).1, _, (be16_actual v).2⟩)
-      (fun v => ⟨(be32_actual v).1, _, (be32_actual v).2⟩)
-      (fun v => ⟨(be64_actual v).1, _, (be64_actual v).2⟩)
+  intro flag width value
+  suffices h : ∃ output,
+      Executes sourceBody (initial sourceBody (endianArgs flag width.val value))
+        output by
+    let ⟨output, h_exec⟩ := h
+    exact ⟨executes_safe h_exec, output, executes_returns h_exec⟩
+  revert width value
+  cases flag <;> apply fin4_cases <;> intro value <;> apply Exists.intro <;>
+  · unfold initial
+    repeat (first
+      | (apply executes_of_blockExec; eq_refl)
+      | (apply blockExec_storageLive; eq_refl; eq_refl)
+      | (apply blockExec_storageDead; eq_refl; eq_refl)
+      | (apply blockExec_cons
+         apply evalStatement_assignU64 (rv := .binaryOp .bitAnd _ _)
+         eq_refl; eq_refl; eq_refl; eq_refl; apply u64BitAndVal_eq
+         eq_refl; eq_refl)
+      | (apply blockExec_cons
+         apply evalStatement_assignU64 (rv := .binaryOp .bitOr _ _)
+         eq_refl; eq_refl; eq_refl; eq_refl; apply u64BitOrVal_eq
+         eq_refl; eq_refl)
+      | (apply blockExec_cons
+         apply evalStatement_assignU64 (rv := .binaryOp .shl _ _)
+         eq_refl; eq_refl; eq_refl; eq_refl; apply u64ShlVal_eq
+         eq_refl; eq_refl)
+      | (apply blockExec_cons
+         apply evalStatement_assignU64 (rv := .binaryOp .shr _ _)
+         eq_refl; eq_refl; eq_refl; eq_refl; apply u64ShrVal_eq
+         eq_refl; eq_refl)
+      | (apply blockExec_cons
+         apply evalStatement_assignU64 (rv := .use _)
+         eq_refl; eq_refl; eq_refl; eq_refl; eq_refl; eq_refl; eq_refl)
+      | (apply blockExec_cons; eq_refl)
+      | (apply blockExec_nil_step; eq_refl; eq_refl)
+      | (apply blockExec_nil_ret; eq_refl; eq_refl))
 
 theorem verify : Expected.claim := by
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩

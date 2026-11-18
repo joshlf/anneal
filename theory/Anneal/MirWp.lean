@@ -32,7 +32,9 @@ WpFaultSoundnessClaim wpFaultProg`), and discharges the Pass 1
 $M_{\text{anneal}}$ non-vacuity and parameter-boundary canary claims covering
 all three outcome poles, every supported Day 1 statement, rvalue, terminator,
 unary and binary operator, and all six integer widths in signed and unsigned
-modes.
+modes. It also provides single-body execution certificates (`run`, `Executes`,
+`SafeFrom`) and block-modular `BlockExec` rules for executions whose arguments
+contain universally quantified values.
 -/
 
 /-- Unified structural fuel-bounded weakest precondition over `evalStep`. -/
@@ -993,6 +995,204 @@ theorem safeFrom_selfLoop {body : Body} {start : State}
   rw [loop]
   intro h
   cases h
+
+/-! ## Block-Modular Execution Certificates
+
+An `Executes` certificate can be built one `step` at a time, but if each
+successor state is left as the unreduced result of `step`, its locals are a
+`setElem?` term over the previous state's locals. Each later step then
+re-reduces an ever deeper spine. When the arguments contain a universally
+quantified value, `checkVal` on a symbolic scalar never reduces to `true` at
+all, so such a step cannot close by reduction.
+
+The combinators below cut a path at basic-block boundaries instead.
+`BlockExec` carries the remaining statements of the current block, so stepping
+a statement never looks up the block again. Every rule states its successor
+as `mkState b i L'` with `L'` fixed by one equational premise, such as the
+`setElem?` equation of `blockExec_storageLive`. Closing that premise by `rfl`
+reduces the successor's local-slot spine to a literal list before the next
+statement runs. `evalStatement_assign` turns the dynamic `checkVal` test and
+the choice of the stored value into explicit premises, which a caller
+discharges with value-level lemmas when the value depends on a free
+variable. -/
+
+/-- One `step` of a single-frame `mkState` state: look up block `b`, then run
+statement `i`, or the terminator once `i` reaches the end of the block. -/
+theorem step_mkState (body : Body) (b i : Nat) (L : List LocalSlot) :
+    step body (mkState b i L) =
+      match Trusted.MirSemantics.getElem? body.basicBlocks b with
+      | none => .fault .unsupported
+      | some bb =>
+        match Trusted.MirSemantics.getElem? bb.statements i with
+        | some stmt => evalStatement body ⟨0, b, i, L⟩ ⟨[]⟩ stmt
+        | none =>
+          if Nat.beq i bb.statements.length then
+            evalTerminator body bb ⟨0, b, i, L⟩ ⟨[]⟩
+          else
+            .fault .undefined :=
+  rfl
+
+/-- Execution from statement `i` of basic block `b` (whose definition is `bb`)
+with locals `L` returns `v`, where `stmts` lists the statements of `bb` from
+index `i` on. The two hypotheses tie `bb` and `stmts` to `body`, so a proof can
+consume `stmts` one statement at a time without looking the block up again. -/
+noncomputable def BlockExec (body : Body) (bb : BasicBlock) (b i : Nat)
+    (stmts : List StatementKind) (L : List LocalSlot) (v : Val) : Prop :=
+  Trusted.MirSemantics.getElem? body.basicBlocks b = some bb →
+    bb.statements.drop i = stmts → Executes body (mkState b i L) v
+
+theorem getElem?_of_drop_eq_cons {α : Type} (l : List α) (i : Nat) (x : α)
+    (rest : List α) (h : l.drop i = x :: rest) :
+    Trusted.MirSemantics.getElem? l i = some x := by
+  induction l generalizing i with
+  | nil => cases i <;> cases h
+  | cons y ys ih =>
+    cases i with
+    | zero =>
+      cases h
+      rfl
+    | succ i => exact ih i h
+
+theorem drop_succ_of_drop_eq_cons {α : Type} (l : List α) (i : Nat) (x : α)
+    (rest : List α) (h : l.drop i = x :: rest) : l.drop (i + 1) = rest := by
+  induction l generalizing i with
+  | nil => cases i <;> cases h
+  | cons y ys ih =>
+    cases i with
+    | zero =>
+      cases h
+      rfl
+    | succ i => exact ih i h
+
+theorem getElem?_of_drop_eq_nil {α : Type} (l : List α) (i : Nat)
+    (h : l.drop i = []) : Trusted.MirSemantics.getElem? l i = none := by
+  induction l generalizing i with
+  | nil => rfl
+  | cons y ys ih =>
+    cases i with
+    | zero => cases h
+    | succ i => exact ih i h
+
+/-- Enter basic block `b` at its first statement. -/
+theorem executes_of_blockExec {body : Body} {bb : BasicBlock} {b : Nat}
+    {L : List LocalSlot} {v : Val}
+    (h_bb : Trusted.MirSemantics.getElem? body.basicBlocks b = some bb)
+    (h_exec : BlockExec body bb b 0 bb.statements L v) :
+    Executes body (mkState b 0 L) v :=
+  h_exec h_bb rfl
+
+/-- Run the next statement `s` of the current block. -/
+theorem blockExec_cons {body : Body} {bb : BasicBlock} {b i : Nat}
+    {s : StatementKind} {rest : List StatementKind} {L L' : List LocalSlot}
+    {v : Val}
+    (h_stmt : evalStatement body ⟨0, b, i, L⟩ ⟨[]⟩ s =
+      .step (mkState b (i + 1) L'))
+    (h_rest : BlockExec body bb b (i + 1) rest L' v) :
+    BlockExec body bb b i (s :: rest) L v := by
+  intro h_bb h_drop
+  have h_step : step body (mkState b i L) = .step (mkState b (i + 1) L') := by
+    rw [step_mkState, h_bb]
+    dsimp only
+    rw [getElem?_of_drop_eq_cons bb.statements i s rest h_drop]
+    exact h_stmt
+  exact .next h_step
+    (h_rest h_bb (drop_succ_of_drop_eq_cons bb.statements i s rest h_drop))
+
+/-- Run a `StorageLive k` statement: slot `k` becomes live and uninitialized
+(or inhabited, for zero-sized types; see `liveUninitSlot`). -/
+theorem blockExec_storageLive {body : Body} {bb : BasicBlock} {b i k : Nat}
+    {rest : List StatementKind} {L L' : List LocalSlot} {ty : MirTy}
+    {v : Val}
+    (h_ty : Trusted.MirSemantics.getElem? body.locals k = some ty)
+    (h_set : setElem? L k (liveUninitSlot ty) = some L')
+    (h_rest : BlockExec body bb b (i + 1) rest L' v) :
+    BlockExec body bb b i (.storageLive k :: rest) L v := by
+  refine blockExec_cons ?_ h_rest
+  unfold evalStatement
+  dsimp only
+  rw [h_ty]
+  dsimp only
+  rw [h_set]
+  rfl
+
+/-- Run a `StorageDead k` statement for a local other than the return place. -/
+theorem blockExec_storageDead {body : Body} {bb : BasicBlock} {b i k : Nat}
+    {rest : List StatementKind} {L L' : List LocalSlot} {v : Val}
+    (h_k : Nat.beq k 0 = false)
+    (h_set : setElem? L k .dead = some L')
+    (h_rest : BlockExec body bb b (i + 1) rest L' v) :
+    BlockExec body bb b i (.storageDead k :: rest) L v := by
+  refine blockExec_cons ?_ h_rest
+  unfold evalStatement
+  dsimp only
+  rw [h_k, h_set]
+  rfl
+
+/-- Leave the current block through a terminator that steps to the first
+statement of block `t`. -/
+theorem blockExec_nil_step {body : Body} {bb : BasicBlock} {b i t : Nat}
+    {L L' : List LocalSlot} {v : Val}
+    (h_end : Nat.beq i bb.statements.length = true)
+    (h_term : evalTerminator body bb ⟨0, b, i, L⟩ ⟨[]⟩ =
+      .step (mkState t 0 L'))
+    (h_next : Executes body (mkState t 0 L') v) :
+    BlockExec body bb b i [] L v := by
+  intro h_bb h_drop
+  have h_step : step body (mkState b i L) = .step (mkState t 0 L') := by
+    rw [step_mkState, h_bb]
+    dsimp only
+    rw [getElem?_of_drop_eq_nil bb.statements i h_drop]
+    dsimp only
+    rw [h_end]
+    exact h_term
+  exact .next h_step h_next
+
+/-- Leave the current block through a terminator that returns `v`. -/
+theorem blockExec_nil_ret {body : Body} {bb : BasicBlock} {b i : Nat}
+    {L : List LocalSlot} {v : Val}
+    (h_end : Nat.beq i bb.statements.length = true)
+    (h_term : evalTerminator body bb ⟨0, b, i, L⟩ ⟨[]⟩ =
+      .done (.returned ⟨v, ⟨[]⟩⟩)) :
+    BlockExec body bb b i [] L v := by
+  intro h_bb h_drop
+  have h_step :
+      step body (mkState b i L) = .done (.returned ⟨v, ⟨[]⟩⟩) := by
+    rw [step_mkState, h_bb]
+    dsimp only
+    rw [getElem?_of_drop_eq_nil bb.statements i h_drop]
+    dsimp only
+    rw [h_end]
+    exact h_term
+  exact .ret h_step
+
+/-- An assignment step whose stored value is given by premises rather than by
+reduction. `h_val` lets a caller replace the value that `evalRvalue` computes
+by an equal normal form, and `h_check` is the dynamic type test of
+`writePlace`; neither reduces by `rfl` when the value mentions a free
+variable. -/
+theorem evalStatement_assign {body : Body} {b i : Nat}
+    {L L₁ L₂ : List LocalSlot} {stmt : StatementKind} {dst : Place}
+    {rv : Rvalue} {ty : MirTy} {v v' : Val} {o : Option Val}
+    (h_stmt : stmt = .assign dst rv)
+    (h_proj : dst.projection.isEmpty = true)
+    (h_ty : Trusted.MirSemantics.getElem? body.locals dst.localId = some ty)
+    (h_rv : evalRvalue body.locals L ty rv = .ok (v, L₁))
+    (h_val : v = v')
+    (h_check : checkVal v' ty = true)
+    (h_live : Trusted.MirSemantics.getElem? L₁ dst.localId = some (.live o))
+    (h_set : setElem? L₁ dst.localId (.live (some v')) = some L₂) :
+    evalStatement body ⟨0, b, i, L⟩ ⟨[]⟩ stmt =
+      .step (mkState b (i + 1) L₂) := by
+  subst h_stmt h_val
+  unfold evalStatement
+  dsimp only
+  rw [h_proj, h_ty]
+  dsimp only
+  rw [h_rv]
+  dsimp only
+  unfold writePlace
+  rw [h_check, h_live, h_set]
+  rfl
 
 theorem bitVec_eq_of_toNat_eq {n : Nat} {a b : BitVec n}
     (h : a.toNat = b.toNat) : a = b := by
