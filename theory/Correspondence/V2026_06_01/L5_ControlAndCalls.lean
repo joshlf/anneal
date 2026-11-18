@@ -916,16 +916,14 @@ theorem mir_evalTerminator_return_root_and_caller
     simp only [evalTerminator, hRet, hConflict]
   · intro retVal hRet hUninitVal
     simp only [evalTerminator, hRet]
-    cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+    cases hConf : hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
         (length s.memory.callStack) (length s.frame.locals) with
-    | true => rfl
+    | true => simp [hConf]
     | false =>
-      cases s.memory.callStack with
-      | nil => simp [hUninitVal]
+      cases hStack : s.memory.callStack with
+      | nil => simp [hConf, hStack, hUninitVal]
       | cons caller restStack =>
-        cases caller.isDiverging with
-        | true => rfl
-        | false => simp [hUninitVal]
+        cases hDiv : caller.isDiverging <;> simp [hConf, hStack, hDiv, hUninitVal]
   · intro hUninit
     simp [evalTerminator, hUninit]
   · intro hDead
@@ -2536,9 +2534,10 @@ theorem mir_evalTerminator_ub_checks_intrinsic_corresponds
       evalNonSelectIntrinsicCall, writeIntrinsicReturn,
       writePlaceValue, get?, set?]
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
-      readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
-      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
+    cases hInit : valueContainsUninit argVal <;>
+      simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+        readProjectedValue, hInit, emptyMemory, get?, isDirectExactDivTarget,
+        evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
 
 /--
 **Theorem L5.20 (`mir_evalTerminator_const_eval_select_intrinsic_corresponds`)**:
@@ -2579,7 +2578,9 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
     (hPath0 : calleeBody0.defPath = "core::rt_callee_0")
     (hArgs0 : calleeBody0.argCount = 0)
     (hConv0 : calleeBody0.fnAbi.conv = .rust)
-    (hParams0 : calleeBody0.typeParamCount = 0 := by rfl) :
+    (hParams0 : calleeBody0.typeParamCount = 0 := by rfl)
+    (hv1 : valueContainsUninit v1 = false := by rfl)
+    (hv2 : valueContainsUninit v2 = false := by rfl) :
     let dest : Place := { local_ := 0, projection := .nil }
     let constFnOp : Operand :=
       .constant { ty := { kind := .fnDef "core::ct_callee" .nil, layoutIdx := 0 }, val := .zeroSized }
@@ -2699,7 +2700,8 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl, rfl, rfl⟩
   · unfold evalTerminator mkIntrinsicCallTerm
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
-      readProjectedValue, evalConstValue, emptyMemory, get?, lookupCallee,
+      readProjectedValue, valueContainsUninit, valueListContainsUninit, hv1, hv2,
+      evalConstValue, emptyMemory, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?, checkCalleeTargetCompatible,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
       hKind, hEx, unpackConstEvalSelectArgs?, resolveConstEvalSelectTarget?,
@@ -2743,7 +2745,8 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
       hKind, hEx]
   · unfold evalTerminator mkIntrinsicCallTerm
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
-      readProjectedValue, evalConstValue, get?, lookupCallee,
+      readProjectedValue, valueContainsUninit, valueListContainsUninit, hv1, hv2,
+      evalConstValue, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?, checkCalleeTargetCompatible,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
       hKind, hEx, unpackConstEvalSelectArgs?, resolveConstEvalSelectTarget?,
@@ -4636,6 +4639,62 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
 
 /-! ## DIFF-C: `copy_nonoverlapping` Over Uninitialized and Initialized Union Bytes -/
 
+mutual
+  private def valueBoolEq : Value → Value → Bool
+    | .unit, .unit => true
+    | .scalar a, .scalar b => a.bits == b.bits && a.sizeBytes == b.sizeBytes
+    | .ptr p1 s1, .ptr p2 s2 => p1.allocId == p2.allocId && p1.offsetBytes == p2.offsetBytes && s1 == s2
+    | .aggregate v1 fs1, .aggregate v2 fs2 => v1 == v2 && valueListBoolEq fs1 fs2
+    | .uninit, .uninit => true
+    | _, _ => false
+
+  private def valueListBoolEq : List Value → List Value → Bool
+    | [], [] => true
+    | x :: xs, y :: ys => valueBoolEq x y && valueListBoolEq xs ys
+    | _, _ => false
+end
+
+mutual
+  private theorem valueBoolEq_iff : ∀ (x y : Value), valueBoolEq x y = true ↔ x = y
+    | .unit, .unit => by simp [valueBoolEq]
+    | .scalar ⟨b1, s1⟩, .scalar ⟨b2, s2⟩ => by simp [valueBoolEq]
+    | .ptr ⟨a1, o1⟩ s1, .ptr ⟨a2, o2⟩ s2 => by simp [valueBoolEq]
+    | .aggregate v1 fs1, .aggregate v2 fs2 => by
+      simp [valueBoolEq, valueListBoolEq_iff fs1 fs2]
+    | .uninit, .uninit => by simp [valueBoolEq]
+    | .unit, .scalar _ | .unit, .ptr _ _ | .unit, .aggregate _ _ | .unit, .uninit
+    | .scalar _, .unit | .scalar _, .ptr _ _ | .scalar _, .aggregate _ _ | .scalar _, .uninit
+    | .ptr _ _, .unit | .ptr _ _, .scalar _ | .ptr _ _, .aggregate _ _ | .ptr _ _, .uninit
+    | .aggregate _ _, .unit | .aggregate _ _, .scalar _ | .aggregate _ _, .ptr _ _ | .aggregate _ _, .uninit
+    | .uninit, .unit | .uninit, .scalar _ | .uninit, .ptr _ _ | .uninit, .aggregate _ _ => by
+      simp [valueBoolEq]
+
+  private theorem valueListBoolEq_iff : ∀ (xs ys : List Value), valueListBoolEq xs ys = true ↔ xs = ys
+    | [], [] => by simp [valueListBoolEq]
+    | x :: xs, y :: ys => by simp [valueListBoolEq, valueBoolEq_iff x y, valueListBoolEq_iff xs ys]
+    | [], _ :: _ | _ :: _, [] => by simp [valueListBoolEq]
+end
+
+private def localSlotBoolEq : LocalSlot → LocalSlot → Bool
+  | .dead, .dead => true
+  | .uninit, .uninit => true
+  | .init x, .init y => valueBoolEq x y
+  | _, _ => false
+
+private theorem localSlotBoolEq_iff : ∀ (x y : LocalSlot), localSlotBoolEq x y = true ↔ x = y
+  | .dead, .dead | .uninit, .uninit => by simp [localSlotBoolEq]
+  | .init x, .init y => by simp [localSlotBoolEq, valueBoolEq_iff]
+  | .dead, .uninit | .dead, .init _ | .uninit, .dead | .uninit, .init _
+  | .init _, .dead | .init _, .uninit => by simp [localSlotBoolEq]
+
+local instance : DecidableEq Value := fun x y =>
+  if h : valueBoolEq x y = true then isTrue ((valueBoolEq_iff x y).mp h)
+  else isFalse (fun heq => h ((valueBoolEq_iff x y).mpr heq))
+
+local instance : DecidableEq LocalSlot := fun x y =>
+  if h : localSlotBoolEq x y = true then isTrue ((localSlotBoolEq_iff x y).mp h)
+  else isFalse (fun heq => h ((localSlotBoolEq_iff x y).mpr heq))
+
 section DiffCUnionCopyConfirmation
 
 open Trusted.Effect
@@ -4729,7 +4788,7 @@ theorem confirm_finding_0002_bb0_copy_nonoverlapping_resets_dst :
       (diffCStepN 27 diffCFinding0002Body
         (.running (initMachineState diffCFinding0002Body []))) =
       .some (0, 27, .some (.init (.aggregate 0 [.aggregate 0 []]))) := by
-  rfl
+  decide +kernel
 
 /-- Kernel confirmation (1b): exact reproduction of `finding_0002`
 (`pass_copy_nonoverlapping_uninit_bytes_to_uninit__b2_c8`) — execution steps
@@ -4739,7 +4798,7 @@ theorem confirm_finding_0002_ub_at_bb1_read :
     diffCProbeBounded 64 diffCFinding0002Body
       (.running (initMachineState diffCFinding0002Body [])) =
       .some (.some .ub, "src/lib.rs:1458:10: 1458:22", .none) := by
-  rfl
+  decide +kernel
 
 /-- MIR body where `src` (`_1: Uninit<[u8; 4]>`) is initialized to `[1, 2, 3, 4]`
 and copied via `(&raw const src.value) as *const u8` into uninitialized `dst`
@@ -4860,7 +4919,7 @@ theorem confirm_copy_nonoverlapping_init_union_bytes_to_uninit :
     diffCProbeBounded 32 diffCInitUnionToUninitBody
       (.running (initMachineState diffCInitUnionToUninitBody [])) =
       .some (.none, "none", .some (.scalar ⟨1, 1⟩)) := by
-  exact ⟨rfl, rfl⟩
+  exact ⟨by decide +kernel, by decide +kernel⟩
 
 /-- Kernel confirmation (2b): even when `dst`'s borrow carries a `.subslice 0 4 false`
 projection while `dst` holds uninitialized union state `Value.aggregate 0 [.aggregate 0 []]`,
@@ -5096,7 +5155,7 @@ theorem stmt_div_storage_revive_dangling_read_is_ub :
     diffCProbeBounded 16 stmtDivReviveReadBody
       (.running (initMachineState stmtDivReviveReadBody [])) =
       .some (.some .ub, "stmt5: _0 = copy (*_2)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D2` implicit-deallocation regression: calling `StorageLive(_1)` on an
 already-allocated local `_1` (without an intervening `StorageDead(_1)`)
@@ -5123,7 +5182,7 @@ theorem stmt_div_storage_live_implicit_dealloc_dangling_read_is_ub :
     diffCProbeBounded 16 stmtDivReviveWithoutDeadBody
       (.running (initMachineState stmtDivReviveWithoutDeadBody [])) =
       .some (.some .ub, "_0 = copy (*_2)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D2` read-after-revive regression through a two-phase mutable borrow, whose
 `.reserved` Tree Borrows tag survives the direct write `_1 = 20`:
@@ -5150,7 +5209,7 @@ theorem stmt_div_storage_revive_two_phase_read_is_ub :
     diffCProbeBounded 16 stmtDivReviveTwoPhaseReadBody
       (.running (initMachineState stmtDivReviveTwoPhaseReadBody [])) =
       .some (.some .ub, "_0 = copy *_2", .none) := by
-  rfl
+  decide +kernel
 
 /-- Captured global allocation with identifier `1` holding the `u64` value `42`.
 `anneal-rustc-capture` numbers captured global allocations from `1`, the same
@@ -5190,7 +5249,7 @@ theorem stmt_div_storage_dead_global_alias_read_is_ub :
     diffCProbeBounded 16 stmtDivDeadGlobalAliasReadBody
       (.running (initMachineState stmtDivDeadGlobalAliasReadBody [])) =
       .some (.some .ub, "_0 = copy *_2", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D14a-storage` tag/global aliasing body: reborrow through the dangling
 pointer, then read through the reborrow:
@@ -5220,7 +5279,7 @@ theorem stmt_div_storage_dead_global_alias_reborrow_is_ub :
     diffCProbeBounded 16 stmtDivDeadGlobalAliasReborrowBody
       (.running (initMachineState stmtDivDeadGlobalAliasReborrowBody [])) =
       .some (.some .ub, "_3 = &*_2", .none) := by
-  rfl
+  decide +kernel
 
 /-- Positive control for the aliasing regressions: a pointer to the captured
 global `stmtDivGlobal1` reads its `42` when no stack borrow shares its
@@ -5244,7 +5303,7 @@ theorem stmt_div_global_read_ok :
     diffCProbeBounded 16 stmtDivGlobalReadOkBody
       (.running (initMachineState stmtDivGlobalReadOkBody [])) =
       .some (.none, "none", .some (.scalar ⟨42, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D2` (`wit_lm3_1_anneal_storage_revive_divergence`): write and read through a
 raw pointer after its pointee's storage has ended and restarted:
@@ -5270,7 +5329,7 @@ theorem stmt_div_storage_revive_write_is_ub :
     diffCProbeBounded 16 stmtDivReviveBody
       (.running (initMachineState stmtDivReviveBody [])) =
       .some (.some .ub, "*_2 = 7", .none) := by
-  rfl
+  decide +kernel
 
 /-- Positive control for `D2`: a pointer freshly minted after `StorageLive(_1)`
 revives `_1` still reads and writes the new storage:
@@ -5298,7 +5357,7 @@ theorem stmt_div_storage_revive_fresh_pointer_ok :
     diffCProbeBounded 16 stmtDivReviveFreshBody
       (.running (initMachineState stmtDivReviveFreshBody [])) =
       .some (.none, "none", .some (.scalar ⟨7, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D14a-storage` (`evalRvalue_reborrow_dangling_divergence`): reborrow a shared
 reference through a raw pointer whose pointee was killed by `StorageDead`:
@@ -5325,7 +5384,7 @@ theorem stmt_div_storage_dead_reborrow_is_ub :
     diffCProbeBounded 16 stmtDivDanglingReborrowBody
       (.running (initMachineState stmtDivDanglingReborrowBody [])) =
       .some (.some .ub, "_3 = &*_2", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D9` (`step_placeMention_deref_uninit_divergence`): mention a dereference of
 an uninitialized raw-pointer local:
@@ -5345,7 +5404,7 @@ theorem stmt_div_placeMention_deref_uninit_is_ub :
     diffCProbeBounded 8 stmtDivPlaceMentionDerefUninitBody
       (.running (initMachineState stmtDivPlaceMentionDerefUninitBody [])) =
       .some (.some .ub, "PlaceMention(*_1)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D9` index regression body: mention `_1[_2]` with an uninitialized index:
 ```text
@@ -5369,7 +5428,7 @@ theorem stmt_div_placeMention_index_uninit_is_ub :
     diffCProbeBounded 8 stmtDivPlaceMentionIndexUninitBody
       (.running (initMachineState stmtDivPlaceMentionIndexUninitBody [])) =
       .some (.some .ub, "PlaceMention(_1[_2])", .none) := by
-  rfl
+  decide +kernel
 
 /-- Positive control for `D9`: mentioning an uninitialized local without
 projections (`let _ = x;` on a live local) and mentioning an initialized index
@@ -5396,7 +5455,7 @@ theorem stmt_div_placeMention_defined_ok :
     diffCProbeBounded 16 stmtDivPlaceMentionOkBody
       (.running (initMachineState stmtDivPlaceMentionOkBody [])) =
       .some (.none, "none", .some (.scalar ⟨5, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- Machine state at `StorageDead(_1)` in which `_1` is borrowed by a tag
 carrying function-entry protector `protId`, with active protectors `prots`. -/
@@ -5479,7 +5538,7 @@ theorem stmt_div_storage_dead_retag_is_ub :
     diffCProbeBounded 16 stmtDivDeadGlobalAliasRetagBody
       (.running (initMachineState stmtDivDeadGlobalAliasRetagBody [])) =
       .some (.some .ub, "Retag(_2)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D2` `copy_nonoverlapping` source after `StorageDead` + `StorageLive`
 revival: copying 1 element out of the revived and re-initialized `_1` through
@@ -5515,7 +5574,7 @@ theorem stmt_div_storage_revive_copy_nonoverlapping_is_ub :
     diffCProbeBounded 20 stmtDivReviveCopySrcBody
       (.running (initMachineState stmtDivReviveCopySrcBody [])) =
       .some (.some .ub, "copy_nonoverlapping(src=_2, dst=_3, 1)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D2` `copy_nonoverlapping` destination after `StorageDead` + `StorageLive`
 revival: copying 1 element into the revived `_1` through the raw pointer `_2`
@@ -5551,7 +5610,7 @@ theorem stmt_div_storage_revive_copy_nonoverlapping_dst_is_ub :
     diffCProbeBounded 20 stmtDivReviveCopyDstBody
       (.running (initMachineState stmtDivReviveCopyDstBody [])) =
       .some (.some .ub, "copy_nonoverlapping(src=_3, dst=_2, 1)", .none) := by
-  rfl
+  decide +kernel
 
 /-- Positive control for `D9` + `D2` (`rustc_middle/src/mir/syntax.rs`:
 "`let _ = *ptr;` is fine even if the pointer is dangling"): mentioning `*_2` via
@@ -5577,7 +5636,7 @@ theorem stmt_div_placeMention_deref_dangling_ok :
     diffCProbeBounded 16 stmtDivPlaceMentionDanglingPtrOkBody
       (.running (initMachineState stmtDivPlaceMentionDanglingPtrOkBody [])) =
       .some (.none, "none", .some (.scalar ⟨99, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D2` transitive child-reborrow revival regression: reborrowing a mutable
 reference `_3 = &mut *_2` (`parentTag = .some 1`, `targetLocal = 1`, initialized
@@ -5614,7 +5673,7 @@ theorem stmt_div_storage_revive_child_reborrow_read_is_ub :
     diffCProbeBounded 20 stmtDivReviveChildReborrowReadBody
       (.running (initMachineState stmtDivReviveChildReborrowReadBody [])) =
       .some (.some .ub, "_0 = copy *_3", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D2` pointer-offset (`BinOp.offset`) after `StorageDead` + `StorageLive`
 revival: offsetting the raw pointer `_2 = &raw mut _1` minted before
@@ -5652,7 +5711,7 @@ theorem stmt_div_storage_revive_ptr_offset_is_ub :
     diffCProbeBounded 16 stmtDivRevivePtrOffsetBody
       (.running (initMachineState stmtDivRevivePtrOffsetBody [])) =
       .some (.some .ub, "_3 = Offset(_2, 1)", .none) := by
-  rfl
+  decide +kernel
 
 /-- Two-variant enum `enum E { A(u64), B(u64) }` used by the `SetDiscriminant`
 regression body (`SetDiscriminant` is only well-formed on enums). -/
@@ -5692,7 +5751,7 @@ theorem stmt_div_storage_revive_set_discriminant_is_ub :
     diffCProbeBounded 16 stmtDivReviveSetDiscrBody
       (.running (initMachineState stmtDivReviveSetDiscrBody [])) =
       .some (.some .ub, "SetDiscriminant(*_2, 1)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D9` compound deref-plus-uninitialized-index regression: mentioning
 `(*_2)[_3]` when the root pointer `_2 = &raw const _1` is initialized (so the
@@ -5724,7 +5783,7 @@ theorem stmt_div_placeMention_deref_index_uninit_is_ub :
     diffCProbeBounded 16 stmtDivPlaceMentionDerefIndexUninitBody
       (.running (initMachineState stmtDivPlaceMentionDerefIndexUninitBody [])) =
       .some (.some .ub, "PlaceMention((*_2)[_3])", .none) := by
-  rfl
+  decide +kernel
 
 end StatementDivergenceRegressions
 
@@ -5775,7 +5834,7 @@ theorem stmt_div_assign_uninit_union_field_ok :
     diffCProbeBounded 16 stmtDivUnionFieldInitBody
       (.running (initMachineState stmtDivUnionFieldInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨42, 4⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` struct variant: initialize both fields of an uninitialized struct
 local out of declaration order and read the first one back:
@@ -5799,7 +5858,7 @@ theorem stmt_div_assign_uninit_struct_fields_ok :
     diffCProbeBounded 16 stmtDivStructFieldInitBody
       (.running (initMachineState stmtDivStructFieldInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨5, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` tuple variant: initialize both fields of an uninitialized pair local
 and read the second one back:
@@ -5823,7 +5882,7 @@ theorem stmt_div_assign_uninit_tuple_fields_ok :
     diffCProbeBounded 16 stmtDivPairFieldInitBody
       (.running (initMachineState stmtDivPairFieldInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨4, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `struct Outer { a: S, b: S }` with two nested struct fields. -/
 private def stmtDivOuterStructTy : Ty :=
@@ -5869,7 +5928,7 @@ theorem stmt_div_assign_uninit_nested_struct_rev_ok :
     diffCProbeBounded 16 stmtDivNestedStructRevInitBody
       (.running (initMachineState stmtDivNestedStructRevInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨10, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` nested aggregate regression (forward field order): initialize all
 four leaf fields of an uninitialized `Outer { a: S, b: S }` local in declaration
@@ -5907,7 +5966,7 @@ theorem stmt_div_assign_uninit_nested_struct_fwd_ok :
     diffCProbeBounded 16 stmtDivNestedStructFwdInitBody
       (.running (initMachineState stmtDivNestedStructFwdInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨40, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` union with nested tuple field (`union U { pair: (u32, u32), raw: u64 }`):
 initialize both elements of `_1.pair` on an uninitialized union local and read
@@ -5934,7 +5993,7 @@ theorem stmt_div_assign_uninit_union_nested_pair_ok :
     diffCProbeBounded 16 stmtDivUnionNestedPairInitBody
       (.running (initMachineState stmtDivUnionNestedPairInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨99, 4⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` nested aggregate regression with transparent `.opaqueCast` and
 `.unwrapUnsafeBinder` wrappers: initialize `(_1.b as S).b = 40` on an
@@ -5969,7 +6028,7 @@ theorem stmt_div_assign_uninit_nested_opaque_cast_field_ok :
     diffCProbeBounded 16 stmtDivNestedOpaqueCastInitBody
       (.running (initMachineState stmtDivNestedOpaqueCastInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨20, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `((u64, u64), u64)` nested tuple type. -/
 private def stmtDivNestedTupleTy : Ty :=
@@ -6003,7 +6062,7 @@ theorem stmt_div_assign_uninit_nested_tuple_fields_ok :
     diffCProbeBounded 16 stmtDivNestedTupleInitBody
       (.running (initMachineState stmtDivNestedTupleInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨66, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `&U` shared reference type to `union U`. -/
 private def stmtDivRefUnionTy : Ty :=
@@ -6047,7 +6106,7 @@ theorem stmt_div_assign_uninit_union_field_invalidates_shared_ref_ub :
     diffCProbeBounded 16 stmtDivUninitUnionInvalidatesSharedRefBody
       (.running (initMachineState stmtDivUninitUnionInvalidatesSharedRefBody [])) =
       .some (.some .ub, "_0 = copy (*_2).f0", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` projection-aware borrow preservation on an uninitialized sibling
 field write: taking `_2 = &mut (_1.a)` on an uninitialized
@@ -6087,7 +6146,7 @@ theorem stmt_div_assign_uninit_sibling_union_field_preserves_mut_ref_ok :
     diffCProbeBounded 16 stmtDivUninitSiblingPreservesMutRefBody
       (.running (initMachineState stmtDivUninitSiblingPreservesMutRefBody [])) =
       .some (.none, "none", .some (.scalar ⟨10, 4⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` overlapping-field complement of
 `stmt_div_assign_uninit_sibling_union_field_preserves_mut_ref_ok`: the same body
@@ -6130,7 +6189,7 @@ theorem stmt_div_assign_uninit_overlapping_nested_field_write_disables_mut_ref_u
     diffCProbeBounded 16 stmtDivUninitOverlapDisablesMutRefBody
       (.running (initMachineState stmtDivUninitOverlapDisablesMutRefBody [])) =
       .some (.some .ub, "(*_2) = move _3", .none) := by
-  rfl
+  decide +kernel
 
 /-- Closed `D13b` unwritten-lower-field soundness witness: after an out-of-order
 write that initializes only field `b` of an uninitialized struct local,
@@ -6154,7 +6213,7 @@ theorem stmt_div_known_limitation_unwritten_lower_field_reads_unit :
     diffCProbeBounded 16 stmtDivUnwrittenLowerFieldBody
       (.running (initMachineState stmtDivUnwrittenLowerFieldBody [])) =
       .some (.some .ub, "_0 = copy _1.a", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` array-field scope-boundary witness
 (`evalStmt_assign_uninit_array_field_elem_ub`): writing element `_2` of the
@@ -6185,7 +6244,7 @@ theorem stmt_div_assign_uninit_array_field_elem_is_ub :
     diffCProbeBounded 16 stmtDivUnionArrayFieldElemBody
       (.running (initMachineState stmtDivUnionArrayFieldElemBody [])) =
       .some (.some .ub, "(_1.arr)[_2] = 11", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` scope-boundary witness (`evalStmt_assign_uninit_non_aggregate_ub`):
 writing an array element `_1[_2] = const 10_u64` into an uninitialized array
@@ -6214,7 +6273,7 @@ theorem stmt_div_assign_uninit_array_index_is_ub :
     diffCProbeBounded 16 stmtDivUninitArrayIndexWriteBody
       (.running (initMachineState stmtDivUninitArrayIndexWriteBody [])) =
       .some (.some .ub, "_1[_2] = 10", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` scope-boundary witness (`evalStmt_assign_uninit_non_aggregate_ub`):
 writing an enum variant field `((_1 as Variant#0).0) = const 10_u64` into an
@@ -6239,7 +6298,7 @@ theorem stmt_div_assign_uninit_downcast_is_ub :
     diffCProbeBounded 16 stmtDivUninitDowncastWriteBody
       (.running (initMachineState stmtDivUninitDowncastWriteBody [])) =
       .some (.some .ub, "((_1 as A).0) = 10", .none) := by
-  rfl
+  decide +kernel
 
 /-- **Theorem L5.24 (`mir_uninit_aggregate_field_write_characterizations`)**:
 Consolidates the `Statements.lean` universal characterizations for `D13b`
@@ -6333,7 +6392,7 @@ theorem mir_uninit_aggregate_field_write_characterizations
       get? locals₁ dstLoc = .some (.init (.aggregate variantIdx fields)) →
       ((∃ innerDefPath innerArgs, outerTy.kind = .adt innerDefPath innerArgs) ∨
        (∃ innerFields, outerTy.kind = .tuple innerFields)) →
-      (get? fields fieldIdx = .none ∨ get? fields fieldIdx = .some .unit) →
+      (get? fields fieldIdx = .none ∨ get? fields fieldIdx = .some .unit ∨ get? fields fieldIdx = .some .uninit) →
       set? locals₁ dstLoc
         (.init
           (.aggregate variantIdx

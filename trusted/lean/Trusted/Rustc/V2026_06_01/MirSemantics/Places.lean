@@ -11762,31 +11762,31 @@ def writeStackThinPtrTypedDeref
               fullProj
           with
           | .ub =>
-            match
-              placeTouchesUnion
+            let subTyOpt : Option Ty :=
+              placeTyResolved
                 effTargetDecls
                 targetLayouts
                 { local_ := entry.targetLocal, projection := fullProj }
-            with
-            | false => .ub
-            | true =>
-              let subTyOpt : Option Ty :=
-                placeTyResolved
+            let directInitOk : Bool :=
+              match Nat.beq residualBytes 0, resolvedAccTyOpt, subTyOpt with
+              | true, .some { kind := .never, .. }, _ => false
+              | true, .some accTy, .some subTy =>
+                Bool.and
+                  (Bool.not (endsWithSubslice fullProj))
+                  (rigidTyEq accTy.kind subTy.kind)
+              | true, .none, _ => Bool.not (endsWithSubslice fullProj)
+              | _, _, _ => false
+            match directInitOk with
+            | true => commitAtProj fullProj val
+            | false =>
+              match
+                placeTouchesUnion
                   effTargetDecls
                   targetLayouts
                   { local_ := entry.targetLocal, projection := fullProj }
-              let directUnionInitOk : Bool :=
-                match Nat.beq residualBytes 0, resolvedAccTyOpt, subTyOpt with
-                | true, .some { kind := .never, .. }, _ => false
-                | true, .some accTy, .some subTy =>
-                  Bool.and
-                    (Bool.not (endsWithSubslice fullProj))
-                    (rigidTyEq accTy.kind subTy.kind)
-                | true, .none, _ => Bool.not (endsWithSubslice fullProj)
-                | _, _, _ => false
-              match directUnionInitOk with
-              | true => commitAtProj fullProj val
-              | false => spliceIntoRootViaEntryOffset
+              with
+              | true => spliceIntoRootViaEntryOffset
+              | false => .ub
           | .unsupported => .unsupported
           | .ok oldVal =>
             let subTyOpt : Option Ty :=

@@ -391,7 +391,8 @@ with `ProjReadResult.ok elemVal`.
 -/
 theorem mir_dynamic_index_borrow_after_storage_dead_corresponds
     (elems : List Value) (idxSc : ScalarVal) (elemVal : Value) (mem : Memory)
-    (h_in : get? elems idxSc.bits = some elemVal) :
+    (h_in : get? elems idxSc.bits = some elemVal)
+    (hInit : valueContainsUninit elemVal = false := by rfl) :
     let arrVal := Value.aggregate 0 elems
     let localsAtBorrow : List LocalSlot := [.init arrVal, .init (.scalar idxSc)]
     let expectedEntry : BorrowEntry := {
@@ -410,7 +411,7 @@ theorem mir_dynamic_index_borrow_after_storage_dead_corresponds
   · rfl
   · have h_ble0 : Nat.ble 0 (length elems) = true :=
       Nat.ble_eq.mpr (Nat.zero_le (length elems))
-    simp [readProjectedValue, h_ble0, h_in]
+    simp [readProjectedValue, h_ble0, h_in, hInit]
 
 /-! ## 2. MiniRust `BasicMemory` State Machine (`Generated.Ops`) & Algebraic Bisection -/
 
@@ -697,10 +698,10 @@ theorem mir_rvalue_len_array_and_slice_corresponds
       .ub := by
   refine ⟨rfl, ?_, ?_, rfl⟩
   · simp [evalRvalue, evalPlaceLen, placeTy, resolveProjectedTy,
-      layoutPointerBytes, evalPlaceRead, get?,
+      layoutPointerBytes, evalPlaceRead, readProjectedValue, get?,
       h_no_borrow, h_no_global, h_nonnull]
   · simp [evalRvalue, evalPlaceLen, placeTy, resolveProjectedTy,
-      evalPlaceRead, get?, lookupBorrow]
+      evalPlaceRead, readProjectedValue, get?, lookupBorrow]
 
 /--
 **Theorem L3.19 (`mir_evalConstValue_and_global_deref_read_corresponds`)**:
@@ -930,7 +931,10 @@ Universal characterization of `B1` hardening for `BRIEF-1.4`:
    (`allocId = 0`) while rejecting non-zero offsets on unbacked pointers with `.none`.
 -/
 theorem mir_slice_fat_ptr_write_reborrow_retag_and_edge_cases_corresponds
-    (v0 v1 v2 w1 : Value) (binderTy : Ty) :
+    (v0 v1 v2 w1 : Value) (binderTy : Ty)
+    (hv0 : valueContainsUninit v0 = false := by rfl)
+    (hv1 : valueContainsUninit v1 = false := by rfl)
+    (hv2 : valueContainsUninit v2 = false := by rfl) :
     let alloc2 : CapturedAllocation := {
       allocId := 7
       bytes := [.some 10, .some 20]
@@ -980,7 +984,29 @@ theorem mir_slice_fat_ptr_write_reborrow_retag_and_edge_cases_corresponds
     evalBinOpOffset { allocId := 0, offsetBytes := 4 } 8 ⟨0, 8⟩ 4 (.some 0) =
       .some { allocId := 0, offsetBytes := 4 } ∧
     evalBinOpOffset { allocId := 0, offsetBytes := 4 } 8 ⟨1, 8⟩ 4 (.some 0) = .none := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  have hval : valueContainsUninit (.aggregate 0 [v0, v1, v2]) = false := by
+    simp [valueContainsUninit, valueListContainsUninit, hv0, hv1, hv2]
+  refine ⟨rfl, rfl, rfl, ?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl⟩
+  · (conv => lhs; whnf)
+    simp only [writeSliceFatPtrTargetValue, readSliceBackingAggregate?,
+      normalizeSubsliceProjections, stripTransparentProjections,
+      splitLastConstantIndex?, readProjectedValue, hval]
+    rfl
+  · (conv => lhs; whnf)
+    simp only [writeSliceFatPtrTargetValue, readSliceBackingAggregate?,
+      normalizeSubsliceProjections, stripTransparentProjections,
+      splitLastConstantIndex?, readProjectedValue, hval]
+    rfl
+  · (conv => lhs; whnf)
+    simp only [readSliceBackingAggregate?,
+      normalizeSubsliceProjections, stripTransparentProjections,
+      splitLastConstantIndex?, readProjectedValue, hval]
+    rfl
+  · (conv => lhs; whnf)
+    simp only [readSliceBackingAggregate?,
+      normalizeSubsliceProjections, stripTransparentProjections,
+      splitLastConstantIndex?, readProjectedValue, hval]
+    rfl
 
 /--
 **Theorem L3.23 (`mir_subslice_disjoint_overlap_offset_borrow_and_unsize_mut_corresponds`)**:
@@ -2345,7 +2371,7 @@ theorem mir_diff_ab_captured_findings_reproduction_confirmed :
     probeExecBounded 256 diffAbFinding0001Body
       (.running (initMachineState diffAbFinding0001Body [])) =
       (.ub, "src/lib.rs:773:42: 773:69") := by
-  exact ⟨rfl, rfl, rfl⟩
+  decide +kernel
 
 end DiffAbCrossFieldAndOnePastEnd
 
