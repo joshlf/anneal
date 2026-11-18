@@ -202,22 +202,30 @@ fn regular_tool_digest(path: &Path, phase: &'static str) -> Result<String> {
 
 /// Authenticate the capture's compiler against the schema version and the
 /// closed compiler table: the full commit selects the entry, the commit date
-/// and both dialect fields must name that same entry, and the linked libraries'
-/// `version` text must report that commit's nine-digit prefix. The dialect
-/// selects the subject's syntax module and the canonical root, so a capture
-/// cannot pair one compiler with another dialect's theorem.
+/// and both dialect fields must name that same entry, `rustc` and `sysroot`
+/// must be non-empty UTF-8 strings, and the linked libraries' `version` text
+/// must report that commit's nine-digit prefix. The dialect selects the
+/// subject's syntax module and the canonical root, so a capture cannot pair
+/// one compiler with another dialect's theorem.
 fn authenticated_compiler(manifest: &Value) -> Option<&'static compilers::SupportedCompiler> {
     if manifest["schema_version"] != 2 {
         return None;
     }
     let compiler = compilers::by_commit(manifest["compiler"]["commit"].as_str()?)?;
+    let non_empty = |field: &str| {
+        manifest["compiler"][field]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    };
     (manifest["compiler"]["commit_date"] == compiler.commit_date
         && manifest["compiler"]["mir_dialect"] == compiler.mir_dialect
         && manifest["mir_dialect"] == compiler.mir_dialect
+        && non_empty("rustc")
+        && non_empty("sysroot")
         && manifest["compiler"]["version"]
             .as_str()
             .is_some_and(|version| version.contains(&compiler.commit[..9])))
-        .then_some(compiler)
+    .then_some(compiler)
 }
 
 /// A compiler declared by `--rustc-version` and confirmed from `--rustc`.
@@ -227,6 +235,8 @@ struct DeclaredCompiler {
     given: PathBuf,
     /// Canonical `--rustc`, passed unchanged to the capture driver.
     rustc: PathBuf,
+    /// Validated UTF-8 form of `rustc`, matched against `capture.json`.
+    rustc_utf8: String,
     expected: &'static compilers::SupportedCompiler,
     /// Digest of the probed executable, rechecked when accepting the result.
     sha256: String,
@@ -252,6 +262,13 @@ fn declared_compiler(given: &Path, id: &str) -> Result<DeclaredCompiler> {
             ),
         )
     })?;
+    if given.to_str().is_none() {
+        return Err(error(
+            "tool_failed",
+            "compiler",
+            "--rustc path must be UTF-8",
+        ));
+    }
     let rustc = fs::canonicalize(given).map_err(|e| {
         error(
             "tool_failed",
@@ -259,6 +276,13 @@ fn declared_compiler(given: &Path, id: &str) -> Result<DeclaredCompiler> {
             format!("cannot resolve --rustc {}: {e}", given.display()),
         )
     })?;
+    let Some(rustc_utf8) = rustc.to_str().map(str::to_owned) else {
+        return Err(error(
+            "tool_failed",
+            "compiler",
+            "--rustc target path must be UTF-8",
+        ));
+    };
     let sha256 = regular_tool_digest(&rustc, "compiler")?;
     let output = Command::new(&rustc)
         .env_clear()
@@ -319,6 +343,7 @@ fn declared_compiler(given: &Path, id: &str) -> Result<DeclaredCompiler> {
     Ok(DeclaredCompiler {
         given: given.to_path_buf(),
         rustc,
+        rustc_utf8,
         expected,
         sha256,
     })
@@ -972,6 +997,13 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     };
     if let Some(sysroot) = &selected_sysroot {
         let sysroot = fs::canonicalize(sysroot).map_err(|e| io("sysroot", e))?;
+        if sysroot.to_str().is_none() {
+            return Err(error(
+                "tool_failed",
+                "sysroot",
+                "--sysroot path must be UTF-8",
+            ));
+        }
         // The library search path belongs to the explicitly selected compiler
         // installation, never to a target crate's ambient environment.
         command.env("LD_LIBRARY_PATH", sysroot.join("lib"));
@@ -1045,7 +1077,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // and the very executable checked before capture.
     if let Some(declared) = &declared
         && (compiler != declared.expected
-            || manifest["compiler"]["rustc"].as_str() != declared.rustc.to_str())
+            || manifest["compiler"]["rustc"].as_str() != Some(declared.rustc_utf8.as_str()))
     {
         return Err(error(
             "tool_failed",
@@ -1055,7 +1087,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
                 compiler.mir_dialect,
                 manifest["compiler"]["rustc"],
                 declared.expected.mir_dialect,
-                declared.rustc.display()
+                declared.rustc_utf8
             ),
         ));
     }
@@ -1683,6 +1715,8 @@ mod tests {
                     "commit_date": date,
                     "version": version,
                     "mir_dialect": scoped,
+                    "rustc": "/opt/rust/bin/rustc",
+                    "sysroot": "/opt/rust",
                 },
             })
         };
@@ -1709,10 +1743,31 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .remove("version");
+            let mut missing_rustc = valid.clone();
+            missing_rustc["compiler"]
+                .as_object_mut()
+                .unwrap()
+                .remove("rustc");
+            let mut empty_rustc = valid.clone();
+            empty_rustc["compiler"]["rustc"] = json!("");
+            let mut null_rustc = valid.clone();
+            null_rustc["compiler"]["rustc"] = Value::Null;
+            let mut missing_sysroot = valid.clone();
+            missing_sysroot["compiler"]
+                .as_object_mut()
+                .unwrap()
+                .remove("sysroot");
+            let mut empty_sysroot = valid.clone();
+            empty_sysroot["compiler"]["sysroot"] = json!("");
             for invalid in [
                 wrong_schema,
                 missing_date,
                 missing_version,
+                missing_rustc,
+                empty_rustc,
+                null_rustc,
+                missing_sysroot,
+                empty_sysroot,
                 fields(commit, "2026-01-01", &upstream_ver, dialect, dialect),
                 fields(commit, date, "1.80.0 (000000000 2025-01-01)", dialect, dialect),
                 fields(&commit.to_uppercase(), date, &upstream_ver, dialect, dialect),

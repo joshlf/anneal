@@ -2694,17 +2694,22 @@ fn rejects_tampered_capture_compiler_fields() {
         &commit[..9],
         &other_commit[..9]
     );
+    let canonical_rustc = fs::canonicalize(&rustc).unwrap();
+    let canonical_rustc = canonical_rustc.to_str().unwrap();
+    let escaped_rustc = canonical_rustc.replace('/', "\\/");
     let cases = [
         // Only the top-level field: the two dialect fields disagree.
         (
             format!("-e '0,/\"mir_dialect\": \"{dialect}\"/s//\"mir_dialect\": \"{other}\"/'"),
             false,
+            other,
             "unexpected capture schema or compiler".to_owned(),
         ),
         // Both dialect fields: they no longer match the commit.
         (
             all_dialects.clone(),
             false,
+            other,
             "unexpected capture schema or compiler".to_owned(),
         ),
         // Commit, date, and dialects name another supported compiler, but
@@ -2712,6 +2717,15 @@ fn rejects_tampered_capture_compiler_fields() {
         (
             without_version,
             false,
+            other,
+            "unexpected capture schema or compiler".to_owned(),
+        ),
+        // An emptied `compiler.rustc` fails manifest authentication even
+        // without `--rustc` / `--rustc-version`.
+        (
+            format!("-e 's/\"rustc\": \"{escaped_rustc}\"/\"rustc\": \"\"/'"),
+            false,
+            dialect,
             "unexpected capture schema or compiler".to_owned(),
         ),
         // Every compiler field names another supported compiler, but the
@@ -2719,16 +2733,28 @@ fn rejects_tampered_capture_compiler_fields() {
         (
             consistent.clone(),
             false,
+            other,
             format!("but the capture's compiler has MIR dialect {other}"),
         ),
         // With a declaration, the recorded compiler must be the declared one.
         (
             consistent,
             true,
+            other,
             format!("capture reports compiler {other}"),
         ),
+        // Even with the declared dialect intact, `compiler.rustc` must match
+        // the canonical `--rustc` probed before capture.
+        (
+            format!("-e 's/\"rustc\": \"{escaped_rustc}\"/\"rustc\": \"\\/other\\/rustc\"/'"),
+            true,
+            dialect,
+            format!("capture reports compiler {dialect} with rustc \"/other/rustc\""),
+        ),
     ];
-    for (index, (expressions, declare, diagnostic)) in cases.into_iter().enumerate() {
+    for (index, (expressions, declare, expected_dialect, diagnostic)) in
+        cases.into_iter().enumerate()
+    {
         let wrappers = tempfile::tempdir().unwrap();
         let wrapper = wrappers.path().join("tampering-capture");
         executable_script(
@@ -2753,12 +2779,20 @@ fn rejects_tampered_capture_compiler_fields() {
             receipt["detail"].as_str().unwrap().contains(&diagnostic),
             "case {index}: {receipt}"
         );
-        // The tampering really happened: the retained manifest names `other`.
+        // The tampering really happened on the retained manifest.
         let manifest: Value = serde_json::from_slice(
             &fs::read(sandbox.artifacts_dir.join("capture/capture.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest["mir_dialect"], other, "case {index}: {manifest}");
+        assert_eq!(
+            manifest["mir_dialect"], expected_dialect,
+            "case {index}: {manifest}"
+        );
+        assert_ne!(
+            manifest["compiler"]["rustc"].as_str(),
+            (expected_dialect == dialect).then_some(canonical_rustc),
+            "case {index}: {manifest}"
+        );
         assert!(
             !sandbox
                 .artifacts_dir

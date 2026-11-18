@@ -1254,14 +1254,28 @@ fn rustc_that_is_not_the_linked_build_is_refused_before_compilation() {
         assert!(!fixture.output.exists(), "{output:?}");
     }
 
-    // A failing or missing compiler is refused the same way.
+    // A failing, missing, or non-UTF-8 compiler path is refused the same way.
+    use std::os::unix::ffi::OsStringExt as _;
     let fixture = Capture::new(b"pub fn selected() {}\n");
     let tools = tempfile::tempdir().unwrap();
     let report = verbose_version("1.0.0", LINKED_COMMIT, LINKED_DATE);
+    let valid = fake_rustc(tools.path(), "valid-rustc", &report, 0);
+    let non_utf8_target = tools
+        .path()
+        .join(std::ffi::OsString::from_vec(vec![b'r', b'u', 0xff]));
+    std::fs::copy(&valid, &non_utf8_target).unwrap();
+    let utf8_to_non_utf8 = tools.path().join("utf8-link");
+    std::os::unix::fs::symlink(&non_utf8_target, &utf8_to_non_utf8).unwrap();
+    let non_utf8_to_utf8 = tools
+        .path()
+        .join(std::ffi::OsString::from_vec(vec![b'l', b'n', 0xff]));
+    std::os::unix::fs::symlink(&valid, &non_utf8_to_utf8).unwrap();
     let failing = fake_rustc(tools.path(), "failing-rustc", &report, 3);
     for (rustc, diagnostic) in [
         (failing, "--version --verbose failed"),
         (tools.path().join("missing-rustc"), "cannot resolve --rustc"),
+        (non_utf8_to_utf8, "--rustc path must be UTF-8"),
+        (utf8_to_non_utf8, "compiler path must be UTF-8"),
     ] {
         let output = fixture
             .selected_command()

@@ -1102,9 +1102,11 @@ fn verify_cargo_lock(checkout: &Path, member_pkg_names: &BTreeSet<String>) -> Re
 /// `trusted/rustc-capture/build.rs` identifies the compiler whose
 /// `rustc_private` libraries the driver links and stops the build for any
 /// compiler outside its closed table. It is reviewed `trusted/` code like the
-/// rest of the driver. The exemption admits only Cargo's default script path
-/// as a regular file with no build dependencies, so the script runs nothing
-/// but the standard library and the reviewed driver sources it includes.
+/// rest of the driver. The exemption admits only Cargo's default exact-case
+/// `build.rs` path on this member as a regular file, rejects case variants
+/// everywhere, and forbids build dependencies across all workspace members, so
+/// the script runs nothing beyond the standard library and the reviewed driver
+/// sources it includes.
 const BUILD_SCRIPT_MEMBER: &str = "trusted/rustc-capture";
 
 /// Reject build scripts and build dependencies across workspace members,

@@ -164,6 +164,11 @@ pub(crate) fn linked_compiler_version() -> Option<&'static str> {
 /// such as `RUSTC_OVERRIDE_VERSION_STRING` cannot change its report. Neither
 /// check replaces authentication of the distribution by the calling host.
 fn check_compiler(rustc: &Path) -> Result<(), Failure> {
+    if rustc.to_str().is_none() {
+        return Err(Failure::tool(format!(
+            "compiler path must be UTF-8: {rustc:?}"
+        )));
+    }
     let linked = &ir::LINKED_COMPILER;
     if linked_compiler_version().is_none() {
         return Err(Failure::tool(format!(
@@ -249,6 +254,11 @@ fn run(mut args: Args) -> Result<serde_json::Value, Failure> {
         *sysroot = sysroot.canonicalize().map_err(Failure::io)?;
     }
     if let Some(rustc) = &mut args.rustc {
+        if rustc.to_str().is_none() {
+            return Err(Failure::tool(format!(
+                "--rustc path must be UTF-8: {rustc:?}"
+            )));
+        }
         *rustc = rustc.canonicalize().map_err(|error| {
             Failure::tool(format!(
                 "cannot resolve --rustc {}: {error}",
