@@ -434,7 +434,7 @@ Corresponds to `rustc_middle::mir::ProjectionElem` in
 >     Downcast(Option<Symbol>, VariantIdx),
 >     OpaqueCast(T),
 >     UnwrapUnsafeBinder(T),
->     ReborrowDeref,
+>     PhantomDeref,
 > }"
 
 Constructor correspondence:
@@ -442,7 +442,7 @@ Constructor correspondence:
 - `.field fieldIdx ty` corresponds to `ProjectionElem::Field(fieldIdx, ty)`.
 - `.unsupported` represents all other `ProjectionElem` variants (`Index`,
   `ConstantIndex`, `Subslice`, `Downcast`, `OpaqueCast`, `UnwrapUnsafeBinder`,
-  and `ReborrowDeref`). -/
+  and `PhantomDeref`). -/
 inductive ProjectionElem where
   | deref
   | field (fieldIdx : FieldIdx) (ty : MirTy)

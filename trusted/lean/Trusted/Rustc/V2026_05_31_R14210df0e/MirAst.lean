@@ -23,10 +23,16 @@ Captured post-cleanup runtime MIR syntax (`Runtime(PostCleanup)`) for
 
 For the modeled MIR fragment, the post-cleanup runtime MIR syntax at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65` is identical to `Trusted.Rustc.V2026_10_22_R7189d39d9.MirAst` (`7189d39d9ce936881b8132c6addeaf3e295cd455`,
-`commit-date: 2026-10-22`; upstream `TerminatorKind::Goto` gained
-non-operational `loop_hint_attrs` in `7189d39d9ce936881b8132c6addeaf3e295cd455`,
-which `TerminatorKind.goto` omits across all dialects); every syntax category
-and constructor is therefore re-exported as a kernel-reducible `abbrev`.
+`commit-date: 2026-10-22`). Every upstream
+`compiler/rustc_middle/src/mir/syntax.rs` difference between the two commits
+falls outside the modeled fragment: `TerminatorKind::Goto` gained
+non-operational `loop_hint_attrs` (omitted by `TerminatorKind.goto` in every
+dialect), `TerminatorKind::Drop` lost `async_fut`, and
+`AssertKind::NullReferenceConstructed`, `ProjectionElem::PhantomDeref`, and
+`CastKind::BoxDerefTransmute` were added (drops, casts, projections, and
+unmodeled assert kinds lower to `.unsupported` or are rejected by
+`anneal-rustc-capture`). Every syntax category and constructor is therefore
+re-exported as a kernel-reducible `abbrev`.
 -/
 
 /-- Function definition identifier (`rustc_hir::def_id::DefId` index). -/
