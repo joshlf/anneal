@@ -29,15 +29,12 @@ theorem truncateBits_i64_ofNat (n : Nat) :
   rw [Nat.mod_mod_of_dvd n (by decide : 2 ^ 64 ∣ 2 ^ 128)]
 
 theorem truncateBits_i64_bvZeroExtend (w : Word) :
-    truncateBits .i64 (bvZeroExtend 128 w) = bvZeroExtend 128 w := by
-  change truncateBits .i64 (BitVec.ofNat 128 w.toNat) = bvZeroExtend 128 w
-  rw [truncateBits_i64_ofNat]
-  simp only [BitVec.ofNat_toNat, BitVec.setWidth_eq]
+    truncateBits .i64 (bvZeroExtend 128 w) = bvZeroExtend 128 w :=
+  congrArg (bvZeroExtend 128) (bvExtractLsb_bvZeroExtend_self (by decide) w)
 
 theorem checkVal_u64Val (w : Word) :
     checkVal (u64Val w) (.int .i64 false) = true := by
-  change checkVal (.scalar ⟨.i64, false, bvZeroExtend 128 w⟩)
-    (.int .i64 false) = true
+  change checkVal (.scalar ⟨.i64, false, bvZeroExtend 128 w⟩) (.int .i64 false) = true
   rw [← truncateBits_i64_bvZeroExtend w]
   exact checkVal_u64_truncateBits (bvZeroExtend 128 w)
 
@@ -164,22 +161,15 @@ theorem blockExec_assignU64 {body : Body} {blocks : List BasicBlock}
 theorem natListBeq_eq {xs ys : List Nat} (h : natListBeq xs ys = true) :
     xs = ys := by
   induction xs generalizing ys with
-  | nil =>
-    cases ys with
-    | nil => rfl
-    | cons _ _ => cases h
+  | nil => cases ys <;> first | rfl | cases h
   | cons x xs ih =>
     cases ys with
     | nil => cases h
     | cons y ys =>
       change (Nat.beq x y && natListBeq xs ys) = true at h
-      have h1 : Nat.beq x y = true := by
-        cases h_xy : Nat.beq x y
-        · rw [h_xy] at h; cases h
-        · rfl
-      have h2 : natListBeq xs ys = true := by
-        rw [h1] at h; exact h
-      rw [Nat.eq_of_beq_eq_true h1, ih h2]
+      cases h1 : Nat.beq x y <;> rw [h1] at h
+      · cases h
+      · rw [Nat.eq_of_beq_eq_true h1, ih h]
 
 theorem intWidth_beq_eq {w1 w2 : IntWidth}
     (h : IntWidth.beq w1 w2 = true) : w1 = w2 := by
@@ -187,34 +177,21 @@ theorem intWidth_beq_eq {w1 w2 : IntWidth}
 
 theorem enumTagRepr_beq_eq {r1 r2 : EnumTagRepr}
     (h : EnumTagRepr.beq r1 r2 = true) : r1 = r2 := by
-  cases r1 with
-  | zeroSized =>
-    cases r2 with
-    | zeroSized => rfl
-    | scalar _ _ => cases h
-  | scalar w1 s1 =>
-    cases r2 with
-    | zeroSized => cases h
-    | scalar w2 s2 =>
-      cases w1 <;> cases w2 <;> cases s1 <;> cases s2 <;> first | rfl | cases h
+  cases r1 <;> cases r2 <;> try (first | rfl | cases h)
+  rename_i w1 s1 w2 s2
+  cases w1 <;> cases w2 <;> cases s1 <;> cases s2 <;> first | rfl | cases h
 
 theorem enumTy_beq_eq {e1 e2 : EnumTy}
     (h : EnumTy.beq e1 e2 = true) : e1 = e2 := by
-  cases e1 with
-  | mk id1 dw1 ds1 tr1 discs1 =>
-    cases e2 with
-    | mk id2 dw2 ds2 tr2 discs2 =>
-      unfold EnumTy.beq at h
-      dsimp only at h
-      cases h1 : Nat.beq id1 id2 <;>
-        cases h2 : IntWidth.beq dw1 dw2 <;>
-        cases h3 : (ds1 == ds2) <;>
-        cases h4 : EnumTagRepr.beq tr1 tr2 <;>
-        cases h5 : natListBeq discs1 discs2 <;>
-        rw [h1, h2, h3, h4, h5] at h <;>
-        try cases h
-      rw [Nat.eq_of_beq_eq_true h1, intWidth_beq_eq h2, eq_of_beq h3,
-        enumTagRepr_beq_eq h4, natListBeq_eq h5]
+  cases e1 with | mk id1 dw1 ds1 tr1 discs1 =>
+  cases e2 with | mk id2 dw2 ds2 tr2 discs2 =>
+    unfold EnumTy.beq at h; dsimp only at h
+    cases h1 : Nat.beq id1 id2 <;> cases h2 : IntWidth.beq dw1 dw2 <;>
+      cases h3 : (ds1 == ds2) <;> cases h4 : EnumTagRepr.beq tr1 tr2 <;>
+      cases h5 : natListBeq discs1 discs2 <;>
+      rw [h1, h2, h3, h4, h5] at h <;> try cases h
+    rw [Nat.eq_of_beq_eq_true h1, intWidth_beq_eq h2, eq_of_beq h3,
+      enumTagRepr_beq_eq h4, natListBeq_eq h5]
 
 theorem checkVal_bool_elim {v : Val} (h : checkVal v .bool = true) :
     ∃ b : Bool, v = .bool b := by
@@ -288,91 +265,53 @@ theorem checkVal_u64_elim {v : Val}
 
 theorem bodyDataWidthVal_of_paramTys (body : Body) (ety : EnumTy)
     (paramTys : (body.locals.drop 1).take body.argumentCount =
-      [.bool, .enum ety, .int .i64 false])
-    (w : Nat) :
+      [.bool, .enum ety, .int .i64 false]) (w : Nat) :
     bodyDataWidthVal body w = .enumVal ety w := by
-  cases h_loc : body.locals with
-  | nil => simp [h_loc] at paramTys
-  | cons l0 ls0 =>
-    cases ls0 with
-    | nil => simp [h_loc] at paramTys
-    | cons l1 ls1 =>
-      cases ls1 with
-      | nil =>
-        cases h_ac : body.argumentCount with
-        | zero => simp [h_loc, h_ac] at paramTys
-        | succ k => simp [h_loc, h_ac] at paramTys
-      | cons l2 ls2 =>
-        cases h_ac : body.argumentCount with
-        | zero => simp [h_loc, h_ac] at paramTys
-        | succ k0 =>
-          cases k0 with
-          | zero => simp [h_loc, h_ac] at paramTys
-          | succ k1 =>
-            have h_l2 : l2 = .enum ety := by
-              simp [h_loc, h_ac] at paramTys
-              exact paramTys.2.1
-            subst h_l2
-            simp [bodyDataWidthVal, h_loc]
+  match h_loc : body.locals, h_ac : body.argumentCount with
+  | _ :: _ :: l2 :: _, _ + 2 =>
+    simp [h_loc, h_ac] at paramTys
+    simp [bodyDataWidthVal, h_loc, paramTys.2.1]
+  | [], _ | [_], _ | [_, _], 0 | [_, _], _ + 1
+  | _ :: _ :: _ :: _, 0 | _ :: _ :: _ :: _, 1 =>
+    simp [h_loc, h_ac] at paramTys
 
 /-- Valid source entries have exactly the finite flag and width cases. -/
 theorem validArgs3_elim (body : Body) (ety : EnumTy)
     (paramTys : (body.locals.drop 1).take body.argumentCount =
       [.bool, .enum ety, .int .i64 false])
-    (h_ds : ety.discriminants = [0, 1, 2, 3])
-    (p : List Val → Prop)
+    (h_ds : ety.discriminants = [0, 1, 2, 3]) (p : List Val → Prop)
     (inputs : ∀ flag : Bool, ∀ width : Fin 4, ∀ value : Word,
       p (bodyEndianArgs body flag width.val value)) :
     ∀ args, ValidEntryArgs body args → p args := by
   intro args valid
-  unfold ValidEntryArgs at valid
-  rw [paramTys] at valid
-  cases args with
-  | nil => cases valid
-  | cons a0 rest0 =>
-    cases rest0 with
-    | nil => simp [checkArgsMatch] at valid
-    | cons a1 rest1 =>
-      cases rest1 with
-      | nil => simp [checkArgsMatch] at valid
-      | cons a2 rest2 =>
-        cases rest2 with
-        | cons _ _ => simp [checkArgsMatch] at valid
-        | nil =>
-          simp only [checkArgsMatch, Bool.and_eq_true] at valid
-          let ⟨flag, hf⟩ := checkVal_bool_elim valid.1
-          let ⟨width, hw⟩ := checkVal_dataWidth_elim h_ds valid.2.1
-          let ⟨value, hv⟩ := checkVal_u64_elim valid.2.2.1
-          subst hf hw hv
-          have h_dw := bodyDataWidthVal_of_paramTys body ety paramTys
-            width.val
-          have h_eq :
-              [.bool flag, .enumVal ety width.val, u64Val value] =
-              bodyEndianArgs body flag width.val value := by
-            unfold bodyEndianArgs
-            rw [h_dw]
-          rw [h_eq]
-          exact inputs flag width value
+  unfold ValidEntryArgs at valid; rw [paramTys] at valid
+  match args with
+  | [] | [_] | [_, _] | _ :: _ :: _ :: _ :: _ =>
+    simp [checkArgsMatch] at valid
+  | [a0, a1, a2] =>
+    simp only [checkArgsMatch, Bool.and_eq_true] at valid
+    let ⟨flag, hf⟩ := checkVal_bool_elim valid.1
+    let ⟨width, hw⟩ := checkVal_dataWidth_elim h_ds valid.2.1
+    let ⟨value, hv⟩ := checkVal_u64_elim valid.2.2.1
+    subst hf hw hv
+    have h_eq : [.bool flag, .enumVal ety width.val, u64Val value] =
+        bodyEndianArgs body flag width.val value := by
+      unfold bodyEndianArgs
+      rw [bodyDataWidthVal_of_paramTys body ety paramTys width.val]
+    rw [h_eq]; exact inputs flag width value
 
 theorem enumTy_beq_self (e : EnumTy) : EnumTy.beq e e = true := by
-  cases e with
-  | mk id dw ds tr discs =>
+  cases e with | mk id dw ds tr discs =>
     have hw : IntWidth.beq dw dw = true := by cases dw <;> rfl
     have htr : EnumTagRepr.beq tr tr = true := by
-      cases tr with
-      | zeroSized => rfl
-      | scalar w s => cases w <;> cases s <;> rfl
+      cases tr with | zeroSized => rfl | scalar w s => cases w <;> cases s <;> rfl
     have hdl : natListBeq discs discs = true := by
       induction discs with
       | nil => rfl
       | cons x xs ih =>
-        change (Nat.beq x x && natListBeq xs xs) = true
-        rw [Nat.beq_refl, ih]
-        rfl
-    unfold EnumTy.beq
-    dsimp only
-    rw [Nat.beq_refl, hw, beq_self_eq_true, htr, hdl]
-    rfl
+        change (Nat.beq x x && natListBeq xs xs) = true; rw [Nat.beq_refl, ih]; rfl
+    unfold EnumTy.beq; dsimp only
+    rw [Nat.beq_refl, hw, beq_self_eq_true, htr, hdl]; rfl
 
 theorem validEntryArgs_bodyEndianArgs (body : Body) (ety : EnumTy)
     (paramTys : (body.locals.drop 1).take body.argumentCount =

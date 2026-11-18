@@ -295,7 +295,8 @@ dynamic type test of an assignment does not reduce on a symbolic scalar.
 `Anneal.MirWp` provides two ways to split such a path:
 
 - `wpState_cut` cuts a `wpState` obligation at an explicitly named intermediate
-  state `s_mid`. Its prefix obligation, `wpSteps`, covers every valid choice,
+  state `s_mid` (stepped with `wpSteps_step`, `wpState_step`, and
+  `wpState_done`). Its prefix obligation, `wpSteps`, covers every valid choice,
   so it also applies to nondeterministic steps. Naming `s_mid` with a literal
   list of slots lets the continuation start from a reduced state.
 - `BlockExec` certificates follow one deterministic execution. Entry through
@@ -310,11 +311,15 @@ The endianness proof uses `BlockExec`. `InitialCache.sourceExec` runs every
 path with one tactic script and no generated witnesses, producing the returned
 value together with its `Executes` certificate. `ExecutionProof` uses the
 certificate alone; `ProductionClaims` also checks the value against
-`sourceOutput`. No current consumer uses `wpState_cut`. The Rust spin fixture
-uses safety transport before its loop invariant and proves no return
-separately. Safety transport, the execution-to-safety bridge and
-`wpState_of_executes` rely on the deterministic source step. An extension to
-nondeterministic execution needs a bridge covering every relevant path.
+`sourceOutput`. `Anneal.MirWp` exercises `wpState_cut`, `wpOutcomeState_mono`,
+`wpStepsOutcome_mono`, and `wpState_of_executes` directly on multi-block
+concrete and symbolic `u32` control-flow canaries
+(`canary_positive_stmts_and_cf_anneal`, `canary_blockExec_wpState_of_executes`,
+and `canary_symbolic_stmts_and_cf_wpState_cut`). The Rust spin fixture uses
+safety transport before its loop invariant and proves no return separately.
+Safety transport, the execution-to-safety bridge and `wpState_of_executes` rely
+on the deterministic source step. An extension to nondeterministic execution
+needs a bridge covering every relevant path.
 
 ## Supported fragment and results
 
