@@ -4068,6 +4068,441 @@ info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_signed_neg_one' depends on axioms
 #guard_msgs (whitespace := lax) in
 #print axioms intValueOfBits_signed_neg_one
 
+/-! Axiom guards for the remaining (helper) theorems: together with the guards above,
+all theorems of this file are pinned to `⊆ {propext, Quot.sound}` (no `Classical.choice`). -/
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.if_pos'' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.if_pos'
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.if_neg'' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.if_neg'
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.two_pow_le_two_pow' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.two_pow_le_two_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.two_pow_lt_two_pow' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.two_pow_lt_two_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.lt_of_two_pow_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.lt_of_two_pow_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_mul_lt_mul_right_iff' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_mul_lt_mul_right_iff
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_beq_eq_decide' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_beq_eq_decide
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_div_lt_of_lt_mul' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_div_lt_of_lt_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.unpackBits_encodeBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.unpackBits_encodeBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeBits_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.encodeBits_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_zero_fst' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_zero_fst
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_beq_op_eq_decide' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_beq_op_eq_decide
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.floatToIntValue_mem' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.floatToIntValue_mem
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.twos_roundtrip' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.twos_roundtrip
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.FloatIntTarget.bitWidth_cases' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.FloatIntTarget.bitWidth_cases
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.scalarModulus_div8' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.scalarModulus_div8
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_log2_eq_of_bounds' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_log2_eq_of_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_log2_two_pow' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_log2_two_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.pow_mul_pow' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.pow_mul_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_mul_pow' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.ratioExponent_mul_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_div_pow' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.ratioExponent_div_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_mul' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.ratioExponent_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_mul' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_mul' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_exact' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_exact
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundRatioBits_mul' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundRatioBits_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_snd_pos' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_snd_pos
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_fst_pos' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_fst_pos
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_powScale_neg' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_powScale_neg
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_powScale' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.ratioExponent_powScale
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.IeeeFormat.fb_le_bias' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.IeeeFormat.fb_le_bias
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.IeeeFormat.one_le_fb' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.IeeeFormat.one_le_fb
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_encodeBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.decodeBits_encodeBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeBits_unpackBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.encodeBits_unpackBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.unpackBits_exponent_lt' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.unpackBits_exponent_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.unpackBits_fraction_lt' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.unpackBits_fraction_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.IeeeFormat.two_bias_lt' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.IeeeFormat.two_bias_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.IeeeFormat.max_exp_ne_zero' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.IeeeFormat.max_exp_ne_zero
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_roundRatio_normal' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.decodeBits_roundRatio_normal
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_roundRatio_subnormal' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.decodeBits_roundRatio_subnormal
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_shift_cross' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_shift_cross
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.IeeeFormat.fb_add_bias_lt' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.IeeeFormat.fb_add_bias_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.zeroBits_eq_encodeBits' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.zeroBits_eq_encodeBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f64_encode_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f64_encode_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.convertFloatBits_of_zero' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.convertFloatBits_of_zero
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.convertFloatBits_of_inf' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.convertFloatBits_of_inf
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.convertFloatBits_of_finite' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.convertFloatBits_of_finite
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.isNaNBits_of_nan' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.isNaNBits_of_nan
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f32_rt_inf' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f32_rt_inf
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f32_rt_zero' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f32_rt_zero
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f32_rt_subnormal' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f32_rt_subnormal
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f32_rt_normal' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f32_rt_normal
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f32_roundtrip_core' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f32_roundtrip_core
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.isQuietNaNBits_of_nan' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.isQuietNaNBits_of_nan
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_snd_pos_gen' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_snd_pos_gen
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_diff_cross' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_diff_cross
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_neg_ratioExponent_bounds' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_neg_ratioExponent_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.scale_lo_helper' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.scale_lo_helper
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.scale_hi_helper' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.scale_hi_helper
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.scale_sub_helper' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.scale_sub_helper
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_roundRatio_scaled_bounds' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_roundRatio_scaled_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_bounds' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_le_of_lt_mul' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_le_of_lt_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_ge_of_mul_le' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_ge_of_mul_le
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.int_le_max_right' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.int_le_max_right
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.int_max_eq_right' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.int_max_eq_right
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_zeroBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.decodeBits_zeroBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_infBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.decodeBits_infBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.floatToIntValue_of_denotesInt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.floatToIntValue_of_denotesInt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeTwosComplement_intValueOfBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.encodeTwosComplement_intValueOfBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.clampInt_monotone' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.clampInt_monotone
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.truncRatio_monotone_nonneg' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.truncRatio_monotone_nonneg
+
 end AxiomGuards
 
 end Anneal.Mir.IeeeFloatCast

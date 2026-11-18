@@ -76,7 +76,9 @@ directly to the vendored ones.
    `floatOps_castIntToFloat_eq`, `floatOps_castIntToFloat_bool_char_err` (exercising
    `h.integerKindOf`), and `cast_floatToFloat_eq`, `cast_floatToFloat_any_chooseNaN_spec`,
    `cast_floatToFloat_pure_index_eq`, `cast_floatToInt_eq`, `cast_intToFloat_eq`,
-   `cast_floatCast_uninit`, unified as `floatCast_result_spec_mode`.
+   `cast_floatCast_uninit`, unified as `floatCast_result_spec_mode`; an out-of-range constant
+   selector makes `Cast.cast` throw `.invalidProgram` (`cast_floatToFloat_pure_out_of_range`,
+   via `floatOps_adjustNaN_pure_out_of_range` and `floatBits_nanChoices_quiet_length`).
 7. **Real-step simulation over immediate, promoted (`allocMap`), and indirect locals**
    (`StateRelLM3_1` / `StepRelLM3_1`):
    - Immediate-local simulation: `step_cast_float_{copy,move,constant}_simulation{_mode}`;
@@ -105,10 +107,13 @@ directly to the vendored ones.
      simulations modulo NaN canonicalization
      `step_cast_floatToFloat_{constant,copy,move}_deterministic_simulation` (corollaries of the
      NaN-choice simulations);
-   - Tightness of `FloatCastDetAgrees`:
-     `step_cast_floatToFloat_{copy,move,constant}_deterministic_lockstep_iff`
-     (deterministic lockstep holds **iff** the input is not a NaN or its quieted conversion
-     already is `preferredNaNBits`).
+   - Tightness of the side conditions:
+     `step_cast_floatToFloat_{copy,move,constant}_deterministic_lockstep_iff` (deterministic
+     lockstep holds **iff** the input is not a NaN or its quieted conversion already is
+     `preferredNaNBits`, so `FloatCastDetAgrees` is necessary) and
+     `step_cast_floatToFloat_constant_pure_out_of_range` (an out-of-range selector makes
+     `lean-miri` fail with `.invalidProgram` while Anneal steps, so the selector-validity premise
+     is necessary).
 8. **Boundaries and end-to-end multi-step witnesses**: two-sided `bool` / `char`
    (`evalFloatCast_intToFloat_bool_char_none` vs `cast_intToFloat_{bool,char}_miri_ok`) and
    `f16` / `f128` (`evalFloatCast_f16_f128_none`, `cast_f16_f128_unsupported`,
@@ -126,7 +131,12 @@ directly to the vendored ones.
    memory-backed-local non-vacuity witnesses built from hand-constructed `StateRelLM3_1` states
    with a force-allocated (`LocalRel.indirect`, unpromoted) `f64` local at `AllocId 1`:
    `floatWit_indirect_dst_step` (`_0 = const 7_i32 as f64` written into memory) and
-   `floatWit_indirect_src_step` (`_0 = copy _1 as f32` read from memory holding `2.5_f64`).
+   `floatWit_indirect_src_step` (`_0 = copy _1 as f32` read from memory holding `2.5_f64`); and
+   `floatWit_nanChoice_pure4_out_of_range` (selector `pure 4` on a quiet NaN: `lean-miri` fails,
+   Anneal steps, no `StepRelLM3_1`).
+
+Every public theorem of this file carries a `#guard_msgs (whitespace := lax) in #print axioms`
+guard (standard axioms only: `propext`, `Classical.choice`, `Quot.sound`).
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -1418,6 +1428,58 @@ theorem floatOps_adjustNaN_pure_snan_index {P S C : Type} (h : Miri.Interpreter.
   · rintro (rfl | rfl)
     · exact hsig_enc neg
     · exact hsig_enc (!neg)
+
+/-- **Out-of-range constant selectors make `lean-miri` fail**: in nondeterministic mode, if a
+state-preserving constant selector returns an index `i` at or beyond the length of the candidate
+list that `FloatBits.nanChoices` produces for a NaN input (e.g. `i ≥ 4` on a quiet NaN, whose list
+has 4 entries), `FloatOps.adjustNaN` throws `.invalidProgram "invalid floating NaN choice index"`.
+Hence the selector-validity premises of the NaN-choice theorems (`hchoose`, `i < 4`, `i < 6`)
+cannot be dropped. -/
+theorem floatOps_adjustNaN_pure_out_of_range {P S C : Type}
+    (h : Miri.Interpreter.FloatOpsHooks P S C)
+    (choice : C) (hnd : h.floatNondeterministic = true) (i : Nat)
+    (hsel : ∀ cs st, h.chooseNaN choice cs st = .ok i st)
+    (src dst : IeeeFormat) (bits : Nat) (neg q : Bool) (payload : Nat)
+    (hnan : decodeBits src bits = .nan neg q payload)
+    {cs : List Miri.Interpreter.FloatBits}
+    (hcs : Miri.Interpreter.FloatBits.nanChoices (ieeeFormatToMiri dst)
+      [⟨ieeeFormatToMiri src, BitVec.ofNat 128 bits⟩] true = .ok cs)
+    (hi : cs.length ≤ i) (st : S) :
+    Miri.Interpreter.FloatOps.adjustNaN h choice
+        ⟨ieeeFormatToMiri dst, BitVec.ofNat 128 (evalFloatToFloatRoundTiesToEven src dst bits)⟩
+        [⟨ieeeFormatToMiri src, BitVec.ofNat 128 bits⟩] st =
+      .error (.invalidProgram "invalid floating NaN choice index") st := by
+  have hclt := Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_lt src dst bits
+  have hsn : Anneal.Mir.IeeeFloatCast.isNaNBits src bits = true :=
+    Anneal.Mir.IeeeFloatCast.isNaNBits_of_nan src bits neg q payload hnan
+  have hiff := Anneal.Mir.IeeeFloatCast.isNaNBits_evalFloatToFloatRoundTiesToEven src dst bits
+  rw [hsn] at hiff
+  have hfn : Miri.Interpreter.FloatOps.adjustNaN h choice
+      ⟨ieeeFormatToMiri dst, BitVec.ofNat 128 (evalFloatToFloatRoundTiesToEven src dst bits)⟩
+      [⟨ieeeFormatToMiri src, BitVec.ofNat 128 bits⟩] =
+      (h.chooseNaN choice cs >>= fun index =>
+        match cs[index]? with
+        | some chosen => pure chosen
+        | _ => throw (.invalidProgram "invalid floating NaN choice index")) := by
+    unfold Miri.Interpreter.FloatOps.adjustNaN
+    simp only [floatBits_isNaN_eq dst _ hclt, hiff, hnd, hcs, floatOps_engine_ok, pure_bind,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    rfl
+  rw [congrFun hfn st, EStateM.bind_eq_ok (hsel _ st), List.getElem?_eq_none hi]
+  rfl
+
+/-- On a quiet NaN input the nondeterministic `nanChoices` list has exactly 4 entries
+(`floatBits_nanChoices_nondet_list_eq`), so every constant selector `pure i` with `i ≥ 4` is out
+of range. -/
+theorem floatBits_nanChoices_quiet_length (src dst : IeeeFormat) (bits : Nat)
+    (h : bits < 2 ^ src.width) (neg : Bool) (payload : Nat)
+    (hnan : decodeBits src bits = .nan neg true payload) :
+    ∃ cs, Miri.Interpreter.FloatBits.nanChoices (ieeeFormatToMiri dst)
+        [⟨ieeeFormatToMiri src, BitVec.ofNat 128 bits⟩] true = .ok cs ∧ cs.length = 4 := by
+  have hl := floatBits_nanChoices_nondet_list_eq src dst bits h neg true payload hnan
+  dsimp only at hl
+  refine ⟨_, hl, ?_⟩
+  simp
 
 /-! ## Part 4. Float-cast hook overlay -/
 
@@ -2797,6 +2859,53 @@ theorem cast_floatToFloat_pure_index_eq (layouts : LayoutTable)
       floatLayoutData_size, bne_self_eq_false]
   rw [congrFun hcast_fn st, EStateM.bind_eq_ok hadj]
   simp only [hfrom, Except.mapError, cast_liftResult_ok, pure_bind]
+
+/-- **`Cast.cast .FloatToFloat` fails under an out-of-range constant selector**: on a NaN input
+whose nondeterministic `nanChoices` list has length `≤ i`, `Cast.cast` throws
+`.invalidProgram "invalid floating NaN choice index"` (`floatOps_adjustNaN_pure_out_of_range`). -/
+theorem cast_floatToFloat_pure_out_of_range (layouts : LayoutTable)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (i : Nat) (hsel : ∀ cs st, chooseNaN () cs st = .ok i st)
+    {srcTy targetTy : Ty} {src dst : IeeeFormat}
+    (hsrc : ieeeFormatOfTy? srcTy = some src) (hdst : ieeeFormatOfTy? targetTy = some dst)
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt} (hrel : ScalarRel sc msc)
+    (hsz : sc.sizeBytes = src.byteWidth) {neg q : Bool} {payload : Nat}
+    (hnan : decodeBits src sc.bits = .nan neg q payload)
+    {cs : List Miri.Interpreter.FloatBits}
+    (hcs : Miri.Interpreter.FloatBits.nanChoices (ieeeFormatToMiri dst)
+      [⟨ieeeFormatToMiri src, BitVec.ofNat 128 sc.bits⟩] true = .ok cs)
+    (hi : cs.length ≤ i) (destRef : Miri.Interpreter.RuntimePlaceRef AnnealProv)
+    (st : AnnealStepState) :
+    Miri.Interpreter.Cast.cast (annealCastHooksFloat layouts true chooseNaN) () 16
+        ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy layouts⟩ .FloatToFloat
+        (encodeTyId targetTy) ⟨destRef, translateTy targetTy layouts⟩ st =
+      .error (.invalidProgram "invalid floating NaN choice index") st := by
+  have hbits : sc.bits < 2 ^ src.width := by
+    have := hrel.canonical; rwa [hsz, scalarModulus_byteWidth] at this
+  have hadj := floatOps_adjustNaN_pure_out_of_range (annealFloatOpsHooks true chooseNaN) () rfl i
+    hsel src dst sc.bits neg q payload hnan hcs hi st
+  have hsrcT := translateTy_of_ieeeFormatOfTy? hsrc layouts
+  have hdstT := translateTy_of_ieeeFormatOfTy? hdst layouts
+  have henc : encodeTyId targetTy = floatTyIdOf dst := congrArg (·.ty) hdstT
+  have hcast_fn :
+      Miri.Interpreter.Cast.cast (annealCastHooksFloat layouts true chooseNaN) () 16
+          ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy layouts⟩ .FloatToFloat
+          (encodeTyId targetTy) ⟨destRef, translateTy targetTy layouts⟩ =
+        (Miri.Interpreter.FloatOps.adjustNaN (annealFloatOpsHooks true chooseNaN) ()
+          ⟨ieeeFormatToMiri dst, BitVec.ofNat 128 (evalFloatToFloatRoundTiesToEven src dst sc.bits)⟩
+          [⟨ieeeFormatToMiri src, BitVec.ofNat 128 sc.bits⟩] >>= fun converted =>
+          miriCastLiftResult
+            (Miri.Memory.Scalar.fromUInt converted.bits (ieeeFormatToMiri dst).size |>.mapError
+              Miri.Interpreter.ScalarOps.scalarError) >>= fun scalar =>
+            annealWriteImmediate (.scalar scalar) ⟨destRef, translateTy targetTy layouts⟩) := by
+    rw [hsrcT, hdstT, henc]
+    unfold Miri.Interpreter.Cast.cast
+    simp only [annealCastHooksFloat, annealCastHooks, beq_self_eq_true, ↓reduceIte,
+      castTypeInfoOfEncodedTyIdFloat_floatTyIdOf, pure_bind, Bool.false_eq_true,
+      annealReadImmediate_scalar, floatOps_readBits_annealFloat true chooseNaN src hrel hsz,
+      floatBits_convert_eq src dst sc.bits hbits, Except.mapError, cast_liftResult_ok,
+      floatLayoutData_size, bne_self_eq_false]
+  rw [congrFun hcast_fn st, EStateM.bind_eq_error hadj]
 
 /-! ## Part 7. Unified float-cast signature and results -/
 
@@ -8210,6 +8319,92 @@ theorem step_cast_floatToFloat_move_pure_index_simulation
     refine ⟨?_, hsim⟩
     rw [stepMirFn_eq_of_not_other body s hcal hphase]; simp only [hbb, hstmt]; exact hev
 
+/-- **Tightness of the selector-validity premise at the step level (`_d = const c as T`,
+`floatToFloat`)**: under `floatNondeterministic := true` with a state-preserving constant selector
+whose index lies at or beyond the length of the NaN candidate list (e.g. `pure 4` on a quiet NaN),
+Anneal steps normally while `lean-miri`'s `Step.step` fails with
+`.invalidProgram "invalid floating NaN choice index"`, so no `StepRelLM3_1` relates the two steps:
+the `hchoose` / `i < 4` premises of the NaN-choice simulations are necessary. -/
+theorem step_cast_floatToFloat_constant_pure_out_of_range
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits → Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (i : Nat) (hsel : ∀ cs st, chooseNaN () cs st = .ok i st)
+    {bb : BasicBlockData} {dstIdx : Local} {c : ConstOperand} {castTy : Ty} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.cast .floatToFloat (.constant c) castTy), span⟩)
+    {dstDecl : LocalDecl} (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    {src dst : IeeeFormat} (hsrc : ieeeFormatOfTy? c.ty = some src)
+    (hdst : ieeeFormatOfTy? castTy = some dst) (hdst_ty : dstDecl.ty.kind = castTy.kind)
+    {sc : MirAst.ScalarInt} (hval : c.val = .scalar (.int sc))
+    (hsz : sc.sizeBytes = src.byteWidth) (hcan : sc.bits < scalarModulus sc.sizeBytes)
+    {neg q : Bool} {payload : Nat} (hnan : decodeBits src sc.bits = .nan neg q payload)
+    {cs : List Miri.Interpreter.FloatBits}
+    (hcs : Miri.Interpreter.FloatBits.nanChoices (ieeeFormatToMiri dst)
+      [⟨ieeeFormatToMiri src, BitVec.ofNat 128 sc.bits⟩] true = .ok cs)
+    (hi : cs.length ≤ i)
+    (hlive_dst : get? s.frame.locals dstIdx ≠ some .dead)
+    (himm_dst : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx) :
+    stepMirFn body s =
+        MirStepNode.step (advanceStmt s (s.frame.locals.set dstIdx
+          (.init (.scalar ⟨evalFloatToFloatRoundTiesToEven src dst sc.bits, dst.byteWidth⟩)))
+          s.memory) ∧
+      (∃ m', Miri.Interpreter.Step.step
+          (annealStepHooksFloat body.localDecls body.layouts true chooseNaN) () m =
+        (m', .error (.invalidProgram "invalid floating NaN choice index"))) ∧
+      ¬ StepRelLM3_1 body m allocMap (stepMirFn body s)
+        (Miri.Interpreter.Step.step
+          (annealStepHooksFloat body.localDecls body.layouts true chooseNaN) () m) := by
+  have ha := (step_cast_floatToFloat_constant_deterministic_simulation hstate hphase chooseNaN
+    hbb hstmt hdecl_dst hsrc hdst hdst_ty hval hsz hcan hlive_dst himm_dst).1
+  obtain ⟨tf, hframes, _, _, hfr, _, _, _, _, _, _, _⟩ := id hstate
+  have hsig : FloatCastSig .floatToFloat c.ty castTy := .floatToFloat hsrc hdst
+  have hm_stmt := evalStatement_assign_floatCast_eq body.localDecls body.layouts true
+    chooseNaN ⟨dstIdx, .nil⟩ .floatToFloat rfl (.constant c) castTy span m
+  have hdstT : translateTy dstDecl.ty body.layouts = translateTy castTy body.layouts :=
+    hsig.cast_scalar.translateTy_eq hdst_ty body.layouts
+  obtain ⟨_, mls_d, _, hlt_d, _, _, hmls_d_eq, hloc_d⟩ := hfr.lookup_local hdecl_dst
+  have hcache_d : ∀ l, (tf.locals[dstIdx]'hlt_d).layout = some l →
+      l = translateTy dstDecl.ty body.layouts := by
+    rw [hmls_d_eq]; exact hloc_d.cachedLayout_eq
+  have hdst_eval := annealEvalPlace_unprojected hframes hlt_d hdecl_dst hcache_d
+  let tfa := cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)
+  have hv_bytes : ValidScalarBytes sc.sizeBytes := hsz ▸ validScalarBytes_byteWidth src
+  obtain ⟨msc, htry, hrel⟩ := tryFromUInt_of_valid_canonical hv_bytes hcan
+  have hsrc_ok : annealEvalOperand body.localDecls body.layouts (translateOperand (.constant c))
+      none { m with stack := ⟨#[tfa]⟩ } =
+      .ok ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy c.ty body.layouts⟩
+        { m with stack := ⟨#[tfa]⟩ } := by
+    with_unfolding_all
+      unfold translateOperand translateConstOperand annealEvalOperand evalMirConstImmediate
+      dsimp only
+      rw [hval]
+      simp only [translateConstValue, translateConstScalar, get, getThe, MonadStateOf.get,
+        EStateM.get, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+        stack_currentFrame?_singleton { m with stack := ⟨#[tfa]⟩ }.stack tfa rfl,
+        Option.isNone_some, Bool.false_eq_true, ↓reduceIte, htry,
+        layoutOfEncodedTyId_floatCastScalar hsig.src_scalar body.layouts]
+  have hcast_err := cast_floatToFloat_pure_out_of_range body.layouts chooseNaN i hsel hsrc hdst
+    hrel hsz hnan hcs hi (.local 0 dstIdx none tf.localsIdentity) { m with stack := ⟨#[tfa]⟩ }
+  rw [← hdstT] at hcast_err
+  have hm_err : Miri.Interpreter.Step.evalStatement
+      (annealStepHooksFloat body.localDecls body.layouts true chooseNaN) ()
+      (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.cast .floatToFloat (.constant c) castTy), span⟩) m =
+      ({ m with stack := ⟨#[tfa]⟩ },
+        .error (.invalidProgram "invalid floating NaN choice index")) := by
+    rw [hm_stmt, show translatePlace ⟨dstIdx, .nil⟩ = ⟨dstIdx, #[]⟩ from rfl]
+    unfold Miri.Interpreter.runRvalue
+    rw [EStateM.bind_eq_ok hdst_eval, EStateM.bind_eq_ok hsrc_ok,
+      show translateCastKind .floatToFloat = .FloatToFloat from rfl, hcast_err]
+  have hm_step := miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt
+    hm_err
+  refine ⟨ha, ⟨_, hm_step⟩, fun hrel => ?_⟩
+  rw [ha, hm_step] at hrel
+  cases hrel
+
 /-! ### Part 8d. Tightness of `FloatCastDetAgrees`: deterministic lockstep iff agreement
 
 The `_mode` step theorems need `FloatCastDetAgrees` in deterministic NaN mode. The theorems
@@ -10801,6 +10996,32 @@ theorem floatWit_indirect_src_step :
   obtain ⟨m₁, hm₁, hrel₁⟩ := floatWit_step_of_stepRel hr floatWitIndSrc_anneal_step
   exact ⟨m₁, hm₁, floatWitIndSrc_anneal_step, hrel₁⟩
 
+/-- **Non-vacuity of the selector-validity tightness**: on `_0 = const (0x7FC0_0001_f32) as f64`
+(a quiet `f32` NaN, whose nondeterministic candidate list has 4 entries), the out-of-range
+selector `pure 4` makes `lean-miri`'s `Step.step` fail with `.invalidProgram` while Anneal steps
+normally, so no `StepRelLM3_1` relates them (`step_cast_floatToFloat_constant_pure_out_of_range`). -/
+theorem floatWit_nanChoice_pure4_out_of_range :
+    let b := floatWitDetNaNBody
+    let s₀ := initMachineState b []
+    let m₀ := lm12MiriInit b floatWitF64Ty
+    let hooks := annealStepHooksFloat b.localDecls b.layouts true (fun _ _ => pure 4)
+    (∃ m', Miri.Interpreter.Step.step hooks () m₀ =
+        (m', .error (.invalidProgram "invalid floating NaN choice index"))) ∧
+      ¬ StepRelLM3_1 b m₀ [] (stepMirFn b s₀) (Miri.Interpreter.Step.step hooks () m₀) := by
+  have hrel₀ : StateRelLM3_1 floatWitDetNaNBody (initMachineState floatWitDetNaNBody [])
+      (lm12MiriInit floatWitDetNaNBody floatWitF64Ty) [] :=
+    (lm12_stateRel_init _ floatWitF64Decl rfl rfl rfl rfl rfl rfl rfl).toLM3_1
+  have himm₀ : ∀ tf, (lm12MiriInit floatWitDetNaNBody floatWitF64Ty).stack.frames = #[tf] →
+      IsImmediateFrameLocal tf 0 :=
+    fun tf htf => by rw [lm12_frames_eq htf]; exact lm12Frame_immediate _ _ 0
+  have hnan : decodeBits .binary32 0x7FC00001 = .nan false true 0x400001 := rfl
+  obtain ⟨cs, hcs, hlen⟩ :=
+    floatBits_nanChoices_quiet_length .binary32 .binary64 0x7FC00001 (by decide) false 0x400001 hnan
+  obtain ⟨_, hm, hnot⟩ := step_cast_floatToFloat_constant_pure_out_of_range hrel₀
+    (fun _ h => nomatch h) (fun _ _ => pure 4) 4 (fun _ _ => rfl) rfl rfl rfl rfl rfl rfl rfl rfl
+    (by decide) hnan hcs (by omega) (fun h => nomatch h) himm₀
+  exact ⟨hm, hnot⟩
+
 end NonVacuity
 
 /-! ## Axiom guards
@@ -11643,6 +11864,657 @@ info: 'LeanMiriSpec.Correspondence.step_cast_f16_f128_move_target_boundary' depe
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms step_cast_f16_f128_move_target_boundary
+
+/-! Axiom guards for the remaining public theorems (helpers, `_mode` variants, and witnesses): together
+with the guards above, every public theorem of this file is pinned to the standard axioms. -/
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatOps_engine_ok' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatOps_engine_ok
+
+/--
+info: 'LeanMiriSpec.Correspondence.miri_signedNumerator_eq' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.miri_signedNumerator_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.ieeeFormatToMiri_size' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.ieeeFormatToMiri_size
+
+/--
+info: 'LeanMiriSpec.Correspondence.ieeeFormatToMiri_of_miriFormatToIeee?' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.ieeeFormatToMiri_of_miriFormatToIeee?
+
+/--
+info: 'LeanMiriSpec.Correspondence.width_lt_128' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.width_lt_128
+
+/--
+info: 'LeanMiriSpec.Correspondence.bitVec128_toNat_of_lt_width' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.bitVec128_toNat_of_lt_width
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatBits_decode_eq_miriDecode' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatBits_decode_eq_miriDecode
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatBits_zero_eq' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatBits_zero_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatBits_infinity_eq' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatBits_infinity_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatBits_preferredNaN_eq' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatBits_preferredNaN_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatBits_roundRatio_zeroDenominator' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatBits_roundRatio_zeroDenominator
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatIntTarget_bounds' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatIntTarget_bounds
+
+/--
+info: 'LeanMiriSpec.Correspondence.quietBit_eq_not_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.quietBit_eq_not_lt
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatBits_negate_eq' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatBits_negate_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.flipSignBits_encodeBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.flipSignBits_encodeBits
+
+/--
+info: 'LeanMiriSpec.Correspondence.isNaNBits_encodeBits_maxExp' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.isNaNBits_encodeBits_maxExp
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatBits_negate_encodeBits_nan' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatBits_negate_encodeBits_nan
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatOps_adjustNaN_of_not_nan' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatOps_adjustNaN_of_not_nan
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatToFloatPureIndexBits_lt' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatToFloatPureIndexBits_lt
+
+/--
+info: 'LeanMiriSpec.Correspondence.ieeeFormatOfTy?_kind' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.ieeeFormatOfTy?_kind
+
+/--
+info: 'LeanMiriSpec.Correspondence.translateTy_of_ieeeFormatOfTy?' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.translateTy_of_ieeeFormatOfTy?
+
+/--
+info: 'LeanMiriSpec.Correspondence.castTypeInfoOfEncodedTyIdFloat_floatTyIdOf' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.castTypeInfoOfEncodedTyIdFloat_floatTyIdOf
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatFormatOfEncodedTyId_floatTyIdOf' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatFormatOfEncodedTyId_floatTyIdOf
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatLayoutData_size' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatLayoutData_size
+
+/--
+info: 'LeanMiriSpec.Correspondence.scalarModulus_byteWidth' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.scalarModulus_byteWidth
+
+/--
+info: 'LeanMiriSpec.Correspondence.validScalarBytes_byteWidth' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.validScalarBytes_byteWidth
+
+/--
+info: 'LeanMiriSpec.Correspondence.translateSizeBytes_byteWidth' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.translateSizeBytes_byteWidth
+
+/--
+info: 'LeanMiriSpec.Correspondence.cast_liftResult_ok' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.cast_liftResult_ok
+
+/--
+info: 'LeanMiriSpec.Correspondence.cast_liftResult_error' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.cast_liftResult_error
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatOps_liftResult_ok' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatOps_liftResult_ok
+
+/--
+info: 'LeanMiriSpec.Correspondence.annealReadImmediate_scalar' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.annealReadImmediate_scalar
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatOps_readScalarBits_unfold' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatOps_readScalarBits_unfold
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatOps_readBits_annealFloat' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatOps_readBits_annealFloat
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatOps_adjustNaN_annealFloat_refine' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatOps_adjustNaN_annealFloat_refine
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatIntTargetOfTy?_kind' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatIntTargetOfTy?_kind
+
+/--
+info: 'LeanMiriSpec.Correspondence.translateTy_of_floatIntTargetOfTy?' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.translateTy_of_floatIntTargetOfTy?
+
+/--
+info: 'LeanMiriSpec.Correspondence.castTypeInfoOfEncodedTyIdFloat_floatIntTargetTyId' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.castTypeInfoOfEncodedTyIdFloat_floatIntTargetTyId
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatIntTargetKind_signed' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatIntTargetKind_signed
+
+/--
+info: 'LeanMiriSpec.Correspondence.scalarLayoutData_floatIntTarget_size' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.scalarLayoutData_floatIntTarget_size
+
+/--
+info: 'LeanMiriSpec.Correspondence.scalarLayoutData_floatIntTarget_bitsNat' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.scalarLayoutData_floatIntTarget_bitsNat
+
+/--
+info: 'LeanMiriSpec.Correspondence.translateSizeBytes_floatIntTarget_bitsNat' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.translateSizeBytes_floatIntTarget_bitsNat
+
+/--
+info: 'LeanMiriSpec.Correspondence.scalarLayoutData_floatIntTarget_isSigned' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.scalarLayoutData_floatIntTarget_isSigned
+
+/--
+info: 'LeanMiriSpec.Correspondence.validScalarBytes_floatIntTarget' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.validScalarBytes_floatIntTarget
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatIntTarget_bitWidth_eq' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatIntTarget_bitWidth_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.annealFloatOpsHooks_formatOf' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.annealFloatOpsHooks_formatOf
+
+/--
+info: 'LeanMiriSpec.Correspondence.cast_scalarOf_scalar' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.cast_scalarOf_scalar
+
+/--
+info: 'LeanMiriSpec.Correspondence.decodeBitsInt_true_eq_intValueOfBits' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.decodeBitsInt_true_eq_intValueOfBits
+
+/--
+info: 'LeanMiriSpec.Correspondence.intLike_integer_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.intLike_integer_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatOps_scalarResult_unfold' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatOps_scalarResult_unfold
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatOps_scalarResult_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatOps_scalarResult_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatOps_adjustNaN_annealFloat_deterministic' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatOps_adjustNaN_annealFloat_deterministic
+
+/--
+info: 'LeanMiriSpec.Correspondence.annealCastHooksFloat_typeInfo_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.annealCastHooksFloat_typeInfo_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.intLikeValue_floatHooks_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.intLikeValue_floatHooks_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.castFromIntLike_floatHooks_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.castFromIntLike_floatHooks_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.ptrToPtr_floatHooks_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.ptrToPtr_floatHooks_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.pointerExposeProvenance_floatHooks_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.pointerExposeProvenance_floatHooks_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.FloatCastSig.src_scalar' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.FloatCastSig.src_scalar
+
+/--
+info: 'LeanMiriSpec.Correspondence.FloatCastSig.cast_scalar' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.FloatCastSig.cast_scalar
+
+/--
+info: 'LeanMiriSpec.Correspondence.FloatCastSig.isFloatCastKind' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.FloatCastSig.isFloatCastKind
+
+/--
+info: 'LeanMiriSpec.Correspondence.IsFloatCastScalarTy.translateTy_eq' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.IsFloatCastScalarTy.translateTy_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.IsFloatCastScalarTy.not_bool_char' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.IsFloatCastScalarTy.not_bool_char
+
+/--
+info: 'LeanMiriSpec.Correspondence.IsFloatCastScalarTy.size_ne_zero' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.IsFloatCastScalarTy.size_ne_zero
+
+/--
+info: 'LeanMiriSpec.Correspondence.IsFloatCastScalarTy.not_aggregate' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.IsFloatCastScalarTy.not_aggregate
+
+/--
+info: 'LeanMiriSpec.Correspondence.IsFloatCastScalarTy.not_rawPtr' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.IsFloatCastScalarTy.not_rawPtr
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatPtrWidthOfLayouts_of_ptr8' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatPtrWidthOfLayouts_of_ptr8
+
+/--
+info: 'LeanMiriSpec.Correspondence.sizeBytes_of_float_layout' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.sizeBytes_of_float_layout
+
+/--
+info: 'LeanMiriSpec.Correspondence.sizeBytes_of_int_layout' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.sizeBytes_of_int_layout
+
+/--
+info: 'LeanMiriSpec.Correspondence.estate_throw_bind_float' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.estate_throw_bind_float
+
+/--
+info: 'LeanMiriSpec.Correspondence.annealReadImmediate_uninit_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.annealReadImmediate_uninit_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.cast_floatCast_of_readImmediate_err' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.cast_floatCast_of_readImmediate_err
+
+/--
+info: 'LeanMiriSpec.Correspondence.cast_floatCast_of_readImmediate_scalar' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.cast_floatCast_of_readImmediate_scalar
+
+/--
+info: 'LeanMiriSpec.Correspondence.annealReadImmediate_indirect_floatCastScalar_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.annealReadImmediate_indirect_floatCastScalar_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.IsFloatCastScalarTy.validateScalar_true' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.IsFloatCastScalarTy.validateScalar_true
+
+/--
+info: 'LeanMiriSpec.Correspondence.operandTy_copy_local' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.operandTy_copy_local
+
+/--
+info: 'LeanMiriSpec.Correspondence.operandTy_move_local' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.operandTy_move_local
+
+/--
+info: 'LeanMiriSpec.Correspondence.evalRvalue_floatCast_eq' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.evalRvalue_floatCast_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.layoutOfEncodedTyId_floatCastScalar' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.layoutOfEncodedTyId_floatCastScalar
+
+/--
+info: 'LeanMiriSpec.Correspondence.finish_write_anyLocal_from_mid_hooks' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.finish_write_anyLocal_from_mid_hooks
+
+/--
+info: 'LeanMiriSpec.Correspondence.IsFloatCastScalarTy.of_kind_eq' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.IsFloatCastScalarTy.of_kind_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.finish_write_anyLocal_preserves' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.finish_write_anyLocal_preserves
+
+/--
+info: 'LeanMiriSpec.Correspondence.IsFloatCastScalarTy.align_pow2_le_29' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.IsFloatCastScalarTy.align_pow2_le_29
+
+/--
+info: 'LeanMiriSpec.Correspondence.finish_write_unpromoted_indirect_from_mid_hooks' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.finish_write_unpromoted_indirect_from_mid_hooks
+
+/--
+info: 'LeanMiriSpec.Correspondence.step_cast_float_constant_indirect_dst_simulation_mode' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.step_cast_float_constant_indirect_dst_simulation_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.step_cast_float_copy_indirect_dst_simulation_mode' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.step_cast_float_copy_indirect_dst_simulation_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.step_cast_float_move_indirect_dst_simulation_mode' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.step_cast_float_move_indirect_dst_simulation_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.step_cast_float_constant_indirect_floatDst_simulation_mode' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.step_cast_float_constant_indirect_floatDst_simulation_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.step_cast_float_copy_indirect_floatDst_simulation_mode' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.step_cast_float_copy_indirect_floatDst_simulation_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.step_cast_float_move_indirect_floatDst_simulation_mode' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.step_cast_float_move_indirect_floatDst_simulation_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatCast_dst_localRel' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatCast_dst_localRel
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatToFloat_dst_size' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatToFloat_dst_size
+
+/--
+info: 'LeanMiriSpec.Correspondence.scalar_fromScalarInt_inj' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.scalar_fromScalarInt_inj
+
+/--
+info: 'LeanMiriSpec.Correspondence.detBits_eq_iff_agrees' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.detBits_eq_iff_agrees
+
+/--
+info: 'LeanMiriSpec.Correspondence.scalar_fromBool_toBool' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.scalar_fromBool_toBool
+
+/--
+info: 'LeanMiriSpec.Correspondence.scalar_fromChar_toChar' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.scalar_fromChar_toChar
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWit_stateRel' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatWit_stateRel
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWit_anneal_result' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatWit_anneal_result
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWitPipeline_stateRel_pre' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatWitPipeline_stateRel_pre
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWitPipeline_all_imm_pre' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatWitPipeline_all_imm_pre
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWit_scalarRel7' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatWit_scalarRel7
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWitPromoted_stateRel_pre' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatWitPromoted_stateRel_pre
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWitPromoted_all_imm_pre' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatWitPromoted_all_imm_pre
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWitIndAlloc_shape' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatWitIndAlloc_shape
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWitIndSrcAlloc_shape' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatWitIndSrcAlloc_shape
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatOps_adjustNaN_pure_out_of_range' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatOps_adjustNaN_pure_out_of_range
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatBits_nanChoices_quiet_length' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatBits_nanChoices_quiet_length
+
+/--
+info: 'LeanMiriSpec.Correspondence.cast_floatToFloat_pure_out_of_range' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.cast_floatToFloat_pure_out_of_range
+
+/--
+info: 'LeanMiriSpec.Correspondence.step_cast_floatToFloat_constant_pure_out_of_range' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.step_cast_floatToFloat_constant_pure_out_of_range
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWit_nanChoice_pure4_out_of_range' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms LeanMiriSpec.Correspondence.floatWit_nanChoice_pure4_out_of_range
 
 end AxiomGuards
 
