@@ -58,8 +58,10 @@ directly to the vendored ones.
    `floatOps_adjustNaN_any_chooseNaN` (any valid selector: `nondet = true →` in-bounds index on
    every list of length `≥ 4`, satisfied by every `pure i`, `i < 4`: `chooseNaN_pure_valid`,
    `annealChooseQuietedNaN_valid`), `floatOps_adjustNaN_pure_index` /
-   `floatOps_adjustNaN_pure_index_all` (`floatToFloatPureIndexBits` across all inputs for `i < 4`),
-   and `floatOps_adjustNaN_pure_snan_index` (`i < 6` sNaN candidates `4, 5`).
+   `floatOps_adjustNaN_pure_index_all` (`floatToFloatPureIndexBits` across all inputs for `i < 4`;
+   `floatToFloatPureIndexBits_spec` pins it to the trusted conversion on non-NaN inputs and to
+   the `i`-th entry of `lean-miri`'s own `nanChoices` list on NaN inputs, so it is no independent
+   semantics), and `floatOps_adjustNaN_pure_snan_index` (`i < 6` sNaN candidates `4, 5`).
 5. **Conservative hook overlay** (following `WideSliceDstLM`, leaving `Translate.lean`
    untouched): `castTypeInfoOfEncodedTyIdFloat` (`31 ↦ binary32`, `32 ↦ binary64`,
    `30` / `33` keep failing closed), `annealFloatOpsHooks` (`annealFloatOpsHooks_integerKindOf`),
@@ -114,7 +116,11 @@ directly to the vendored ones.
    `Step.step`/`stepMirFn` witnesses (`floatWit_copy_move_isize_and_ub`,
    `floatWit_promoted_allocMap_pipeline`, `div_floatToFloat_deterministic_payloadNaN_step`), plus
    `div_floatToFloat_deterministic_payloadNaN_exact`, `floatWit_nanChoice_pure1_step`, and
-   `floatWit_nanChoice_pure1_exact` (pinning `0xFFF8_0000_0000_0000` under `pure 1`).
+   `floatWit_nanChoice_pure1_exact` (pinning `0xFFF8_0000_0000_0000` under `pure 1`); and
+   memory-backed-local non-vacuity witnesses built from hand-constructed `StateRelLM3_1` states
+   with a force-allocated (`LocalRel.indirect`, unpromoted) `f64` local at `AllocId 1`:
+   `floatWit_indirect_dst_step` (`_0 = const 7_i32 as f64` written into memory) and
+   `floatWit_indirect_src_step` (`_0 = copy _1 as f32` read from memory holding `2.5_f64`).
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -1187,6 +1193,47 @@ theorem floatToFloatPureIndexBits_lt (src dst : IeeeFormat) (bits i : Nat) :
     · exact Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_lt src dst bits
     · exact Anneal.Mir.IeeeFloatCast.encodeBits_lt dst (!neg) _ _ hE hplt
   · exact Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_lt src dst bits
+
+/-- **`floatToFloatPureIndexBits` is `lean-miri`'s own `i`-th candidate, not an independent
+semantics**: on a NaN input it is exactly the `i`-th entry (`i < 4`) of the list that
+`FloatBits.nanChoices` itself returns, and on a non-NaN input it is the trusted conversion,
+which `FloatOps.adjustNaN` returns unchanged (`floatOps_adjustNaN_of_not_nan`). -/
+theorem floatToFloatPureIndexBits_spec (src dst : IeeeFormat) (bits : Nat)
+    (h : bits < 2 ^ src.width) (i : Nat) (hi : i < 4) :
+    (Anneal.Mir.IeeeFloatCast.isNaNBits src bits = false →
+      floatToFloatPureIndexBits src dst bits i = evalFloatToFloatRoundTiesToEven src dst bits) ∧
+    (Anneal.Mir.IeeeFloatCast.isNaNBits src bits = true →
+      ∃ cs, Miri.Interpreter.FloatBits.nanChoices (ieeeFormatToMiri dst)
+          [⟨ieeeFormatToMiri src, BitVec.ofNat 128 bits⟩] true = .ok cs ∧
+        cs[i]? = some ⟨ieeeFormatToMiri dst,
+          BitVec.ofNat 128 (floatToFloatPureIndexBits src dst bits i)⟩) := by
+  constructor
+  · intro hn
+    unfold floatToFloatPureIndexBits
+    dsimp only
+    unfold Anneal.Mir.IeeeFloatCast.isNaNBits at hn
+    split
+    · rename_i neg q payload hk; rw [hk] at hn; cases hn
+    · rfl
+  · intro hn
+    have hdec : ∃ neg q payload, decodeBits src bits = .nan neg q payload := by
+      unfold Anneal.Mir.IeeeFloatCast.isNaNBits at hn
+      split at hn
+      · rename_i neg q payload hk; exact ⟨neg, q, payload, hk⟩
+      · cases hn
+    obtain ⟨neg, q, payload, hk⟩ := hdec
+    have hl := floatBits_nanChoices_nondet_list_eq src dst bits h neg q payload hk
+    dsimp only at hl
+    refine ⟨_, hl, ?_⟩
+    unfold floatToFloatPureIndexBits
+    dsimp only
+    simp only [hk]
+    obtain _ | _ | _ | _ | i := i
+    · split <;> rfl
+    · split <;> rfl
+    · split <;> rfl
+    · split <;> rfl
+    · omega
 
 /-- **Exact constant-index NaN choice across all inputs (`i < 4`)**: extends
 `floatOps_adjustNaN_pure_index` from NaN-only inputs to **every** `bits < 2 ^ src.width`
@@ -9678,6 +9725,324 @@ theorem floatWit_nanChoice_pure1_exact :
     hrel₀ (fun _ h => nomatch h) (fun _ _ => pure 1) 1 (by decide) (fun _ _ => rfl)
     rfl rfl rfl rfl rfl rfl rfl rfl (by decide) (fun h => nomatch h) himm₀
 
+/-! ### Force-allocated (`LocalRel.indirect`, unpromoted) `f64` destination witness
+
+The `*_indirect_dst_simulation` theorems demand a live stack allocation of
+`StackScalarAllocShape`, a cached base address, and an `.indirect (stackAllocPlace id)`
+destination local outside `allocMap`. The witness below builds such a `StateRelLM3_1` state from
+scratch (`_0 : f64` memory-backed at `AllocId 1`, holding `0.0`) and steps
+`_0 = const 7_i32 as f64` through `step_cast_float_constant_indirect_dst_simulation`, so these
+hypotheses are jointly satisfiable. -/
+
+/-- Initialized all-zero 8-byte stack allocation (`0.0_f64`), built with `Allocation.fromBytes`. -/
+def floatWitIndAlloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
+  (extractExceptOk
+    (Miri.Memory.Allocation.fromBytes (Prov := AnnealProv) #[0, 0, 0, 0, 0, 0, 0, 0]
+      Miri.ABI.Align.ONE .Mut)
+    (by decide)).withExtra none
+
+/-- `lean-miri` machine with `floatWitIndAlloc` live at `AllocId 1` and its stack base address
+`annealStackBaseAddr 1` cached. -/
+def floatWitIndMachine : AnnealMachine :=
+  { memory := { (Miri.Memory.MemoryState.empty : AnnealMemory) with
+      nextAllocId := 2
+      live := #[(floatWitAllocId1, { kind := .stack, allocation := floatWitIndAlloc })] }
+    addresses :=
+      { provenanceMode := .default
+        addressMode := .managed
+        generation := none
+        baseAddr := #[{ allocId := floatWitAllocId1, address := annealStackBaseAddr floatWitAllocId1 }] }
+    borrowTracker := none }
+
+/-- The constant `7_i32`. -/
+def floatWitSevenI32Const : ConstOperand :=
+  { ty := floatWitI32Ty, val := .scalar (.int ⟨7, 4⟩) }
+
+/-- MIR of `_0 = const 7_i32 as f64; return` with `_0 : f64`. -/
+def floatWitIndBody : CapturedMir where
+  defPath := "float_cast_lm_witness::indirect_dst"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [floatWitF64Decl]
+  basicBlocks := [
+    { statements :=
+        [mkStmt (.assign (local_ 0) (.cast .intToFloat (.constant floatWitSevenI32Const)
+          floatWitF64Ty))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := lm12FnAbi floatWitF64Layout
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Anneal's state before the cast: `_0 = 0.0_f64`. -/
+def floatWitIndAnnealPre : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar ⟨0, 8⟩)] }
+    memory := (initMachineState floatWitIndBody []).memory }
+
+/-- Anneal's state after the cast: `_0 = 7.0_f64` (`0x401C_0000_0000_0000`). -/
+def floatWitIndAnnealPost : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 1, locals := [.init (.scalar ⟨0x401C000000000000, 8⟩)] }
+    memory := floatWitIndAnnealPre.memory }
+
+/-- `lean-miri` frame whose return local `_0` is memory-backed at `stackAllocPlace 1`. -/
+def floatWitIndMiriFramePre :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody floatWitIndBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy floatWitF64Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[{ value := .live (.indirect (stackAllocPlace floatWitAllocId1)), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def floatWitIndMiriPre : AnnealStepState :=
+  { stack := ⟨#[floatWitIndMiriFramePre]⟩, machine := floatWitIndMachine }
+
+theorem floatWitIndAlloc_shape :
+    StackScalarAllocShape (translateTy floatWitF64Ty emptyLayoutTable).layout.size
+      floatWitIndAlloc :=
+  ⟨by decide, by decide, by decide, rfl, ⟨true, rfl⟩⟩
+
+theorem floatWitInd_stateRel_pre :
+    StateRelLM3_1 floatWitIndBody floatWitIndAnnealPre floatWitIndMiriPre [] := by
+  refine (StateRel.mk floatWitIndMiriFramePre rfl rfl ⟨translateTy floatWitF64Ty, rfl⟩ ?_
+    rfl rfl rfl rfl rfl ?_).toLM3_1
+  · refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+    intro i decl slot mls hdecl hslot hmls
+    match i with
+    | 0 =>
+      have hd : decl = floatWitF64Decl := by simpa [floatWitIndBody, get?] using hdecl.symm
+      have hs : slot = .init (.scalar ⟨0, 8⟩) := by
+        simpa [floatWitIndAnnealPre, get?] using hslot.symm
+      have hm : mls =
+          { value := .live (.indirect (stackAllocPlace floatWitAllocId1)), layout := none } := by
+        simpa [floatWitIndMiriFramePre] using hmls.symm
+      subst hd hs hm
+      refine .indirect (.init (.scalar ⟨0, 8⟩)) (stackAllocPlace floatWitAllocId1) none
+        (fun _ h => nomatch h) nofun ?_
+      refine MemPlaceRel.mk floatWitAllocId1 Miri.Memory.BorTag.one
+        (annealStackBaseAddr floatWitAllocId1) Miri.ABI.Size.ZERO
+        { kind := .stack, allocation := floatWitIndAlloc }
+        rfl rfl rfl (List.Mem.head _) (by decide) (by decide) (by decide) (by decide)
+        (by decide) (by decide) (fun h _ => nomatch h) (fun _ _ _ => by decide) ?_
+        (fun _ _ _ _ h => nomatch h)
+      intro sc h
+      injection h with hv
+      injection hv with hsc
+      subst hsc
+      exact ⟨by decide, (fun hb => nomatch hb), (fun hc => nomatch hc),
+        extractExceptOk (translateScalarInt ⟨0, 8⟩) (by decide),
+        ⟨Or.inr (Or.inr (Or.inr (Or.inl rfl))), by decide, by decide, by decide⟩,
+        by with_unfolding_all rfl⟩
+    | _ + 1 => simp [floatWitIndBody, get?] at hdecl
+  · intro i j mp_i mp_j lay_i lay_j hij hi hj
+    have hi0 : i = 0 := by
+      match i, hi with
+      | 0, _ => rfl
+      | _ + 1, h => simp [floatWitIndMiriFramePre] at h
+    have hj0 : j = 0 := by
+      match j, hj with
+      | 0, _ => rfl
+      | _ + 1, h => simp [floatWitIndMiriFramePre] at h
+    exact absurd (hi0.trans hj0.symm) hij
+
+set_option maxRecDepth 200000 in
+private theorem floatWitInd_anneal_step :
+    stepMirFn floatWitIndBody floatWitIndAnnealPre = .step floatWitIndAnnealPost := rfl
+
+/-- **Non-vacuity of the indirect-destination step theorems**: in a `StateRelLM3_1` state
+whose `f64` return local `_0` is force-allocated (`LocalRel.indirect`, outside `allocMap`, backed
+by a `StackScalarAllocShape` stack allocation at `AllocId 1` holding `0.0`),
+`step_cast_float_constant_indirect_dst_simulation` applies to `_0 = const 7_i32 as f64`: both
+machines step, Anneal stores `7.0_f64`, `lean-miri` overwrites the stack allocation, and the
+successors are `StateRelLM3_1`-related. -/
+theorem floatWit_indirect_dst_step :
+    ∃ m₁, Miri.Interpreter.Step.step
+        (annealStepHooksFloat floatWitIndBody.localDecls floatWitIndBody.layouts) ()
+        floatWitIndMiriPre = (m₁, .ok true) ∧
+      stepMirFn floatWitIndBody floatWitIndAnnealPre = .step floatWitIndAnnealPost ∧
+      StateRelLM3_1 floatWitIndBody floatWitIndAnnealPost m₁ [] := by
+  have hr := step_cast_float_constant_indirect_dst_simulation floatWitInd_stateRel_pre
+    (fun _ h => nomatch h) rfl rfl rfl (.intToFloat (t := .signed .i32) rfl rfl) rfl rfl
+    (Or.inr (Or.inr (Or.inl rfl))) (by decide) rfl (fun _ h => nomatch h)
+    (allocId := floatWitAllocId1) (localAlloc := { kind := .stack, allocation := floatWitIndAlloc })
+    (by decide) (by decide) rfl floatWitIndAlloc_shape
+    (fun tf htf => ⟨none, by
+      injection htf with h₁; injection h₁ with h₂; subst h₂; rfl⟩)
+  obtain ⟨m₁, hm₁, hrel₁⟩ := floatWit_step_of_stepRel hr floatWitInd_anneal_step
+  exact ⟨m₁, hm₁, floatWitInd_anneal_step, hrel₁⟩
+/-! ### Force-allocated (`LocalRel.indirect`, unpromoted) `f64` source witness -/
+
+/-- Initialized 8-byte stack allocation holding `2.5_f64` (`0x4004_0000_0000_0000`,
+little-endian). -/
+def floatWitIndSrcAlloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
+  (extractExceptOk
+    (Miri.Memory.Allocation.fromBytes (Prov := AnnealProv) #[0, 0, 0, 0, 0, 0, 4, 64]
+      Miri.ABI.Align.ONE .Mut)
+    (by decide)).withExtra none
+
+/-- `lean-miri` machine with `floatWitIndSrcAlloc` live at `AllocId 1` and its stack base address
+cached. -/
+def floatWitIndSrcMachine : AnnealMachine :=
+  { memory := { (Miri.Memory.MemoryState.empty : AnnealMemory) with
+      nextAllocId := 2
+      live := #[(floatWitAllocId1, { kind := .stack, allocation := floatWitIndSrcAlloc })] }
+    addresses :=
+      { provenanceMode := .default
+        addressMode := .managed
+        generation := none
+        baseAddr := #[{ allocId := floatWitAllocId1, address := annealStackBaseAddr floatWitAllocId1 }] }
+    borrowTracker := none }
+
+/-- MIR of `_0 = copy _1 as f32; return` with `_0 : f32` and `_1 : f64`. -/
+def floatWitIndSrcBody : CapturedMir where
+  defPath := "float_cast_lm_witness::indirect_src"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [floatWitF32Decl, floatWitF64Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.cast .floatToFloat (.copy (local_ 1)) floatWitF32Ty))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := lm12FnAbi floatWitF64Layout
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Anneal's state before the cast: `_0` uninitialized, `_1 = 2.5_f64`. -/
+def floatWitIndSrcAnnealPre : MachineState :=
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.scalar ⟨0x4004000000000000, 8⟩)] }
+    memory := (initMachineState floatWitIndSrcBody []).memory }
+
+/-- Anneal's state after the cast: `_0 = 2.5_f32` (`0x4020_0000`). -/
+def floatWitIndSrcAnnealPost : MachineState :=
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := 1
+        locals := [.init (.scalar ⟨0x40200000, 4⟩), .init (.scalar ⟨0x4004000000000000, 8⟩)] }
+    memory := floatWitIndSrcAnnealPre.memory }
+
+/-- `lean-miri` frame with immediate `_0` and `_1` memory-backed at `stackAllocPlace 1`. -/
+def floatWitIndSrcMiriFramePre :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody floatWitIndSrcBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy floatWitF32Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.indirect (stackAllocPlace floatWitAllocId1)), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def floatWitIndSrcMiriPre : AnnealStepState :=
+  { stack := ⟨#[floatWitIndSrcMiriFramePre]⟩, machine := floatWitIndSrcMachine }
+
+theorem floatWitIndSrcAlloc_shape :
+    StackScalarAllocShape (translateTy floatWitF64Ty emptyLayoutTable).layout.size
+      floatWitIndSrcAlloc :=
+  ⟨by decide, by decide, by decide, rfl, ⟨true, rfl⟩⟩
+
+theorem floatWitIndSrc_stateRel_pre :
+    StateRelLM3_1 floatWitIndSrcBody floatWitIndSrcAnnealPre floatWitIndSrcMiriPre [] := by
+  refine (StateRel.mk floatWitIndSrcMiriFramePre rfl rfl ⟨translateTy floatWitF32Ty, rfl⟩ ?_
+    rfl rfl rfl rfl rfl ?_).toLM3_1
+  · refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+    intro i decl slot mls hdecl hslot hmls
+    match i with
+    | 0 =>
+      have hs : slot = .uninit := by simpa [floatWitIndSrcAnnealPre, get?] using hslot.symm
+      have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+        simpa [floatWitIndSrcMiriFramePre] using hmls.symm
+      subst hs hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    | 1 =>
+      have hd : decl = floatWitF64Decl := by simpa [floatWitIndSrcBody, get?] using hdecl.symm
+      have hs : slot = .init (.scalar ⟨0x4004000000000000, 8⟩) := by
+        simpa [floatWitIndSrcAnnealPre, get?] using hslot.symm
+      have hm : mls =
+          { value := .live (.indirect (stackAllocPlace floatWitAllocId1)), layout := none } := by
+        simpa [floatWitIndSrcMiriFramePre] using hmls.symm
+      subst hd hs hm
+      refine .indirect (.init (.scalar ⟨0x4004000000000000, 8⟩)) (stackAllocPlace floatWitAllocId1)
+        none (fun _ h => nomatch h) nofun ?_
+      refine MemPlaceRel.mk floatWitAllocId1 Miri.Memory.BorTag.one
+        (annealStackBaseAddr floatWitAllocId1) Miri.ABI.Size.ZERO
+        { kind := .stack, allocation := floatWitIndSrcAlloc }
+        rfl rfl rfl (List.Mem.head _) (by decide) (by decide) (by decide) (by decide)
+        (by decide) (by decide) (fun h _ => nomatch h) (fun _ _ _ => by decide) ?_
+        (fun _ _ _ _ h => nomatch h)
+      intro sc h
+      injection h with hv
+      injection hv with hsc
+      subst hsc
+      exact ⟨by decide, (fun hb => nomatch hb), (fun hc => nomatch hc),
+        extractExceptOk (translateScalarInt ⟨0x4004000000000000, 8⟩) (by decide),
+        ⟨Or.inr (Or.inr (Or.inr (Or.inl rfl))), by decide, by decide, by decide⟩,
+        by with_unfolding_all rfl⟩
+    | _ + 2 => simp [floatWitIndSrcBody, get?] at hdecl
+  · intro i j mp_i mp_j lay_i lay_j hij hi hj
+    have hi1 : i = 1 := by
+      match i, hi with
+      | 1, _ => rfl
+      | 0, h => simp [floatWitIndSrcMiriFramePre] at h
+      | _ + 2, h => simp [floatWitIndSrcMiriFramePre] at h
+    have hj1 : j = 1 := by
+      match j, hj with
+      | 1, _ => rfl
+      | 0, h => simp [floatWitIndSrcMiriFramePre] at h
+      | _ + 2, h => simp [floatWitIndSrcMiriFramePre] at h
+    exact absurd (hi1.trans hj1.symm) hij
+
+set_option maxRecDepth 200000 in
+private theorem floatWitIndSrc_anneal_step :
+    stepMirFn floatWitIndSrcBody floatWitIndSrcAnnealPre = .step floatWitIndSrcAnnealPost := rfl
+
+/-- **Non-vacuity of the indirect-source step theorems**: in a `StateRelLM3_1` state whose
+`f64` local `_1` is force-allocated (`LocalRel.indirect`, backed by a `StackScalarAllocShape`
+stack allocation at `AllocId 1` holding `2.5_f64`),
+`step_cast_float_copy_indirect_float_simulation` applies to `_0 = copy _1 as f32`: `lean-miri`
+reads the operand from memory, both machines store `2.5_f32` into `_0`, and the successors are
+`StateRelLM3_1`-related. -/
+theorem floatWit_indirect_src_step :
+    ∃ m₁, Miri.Interpreter.Step.step
+        (annealStepHooksFloat floatWitIndSrcBody.localDecls floatWitIndSrcBody.layouts) ()
+        floatWitIndSrcMiriPre = (m₁, .ok true) ∧
+      stepMirFn floatWitIndSrcBody floatWitIndSrcAnnealPre = .step floatWitIndSrcAnnealPost ∧
+      StateRelLM3_1 floatWitIndSrcBody floatWitIndSrcAnnealPost m₁ [] := by
+  have hr := step_cast_float_copy_indirect_float_simulation floatWitIndSrc_stateRel_pre
+    (fun _ h => nomatch h) rfl rfl rfl rfl (.floatToFloat rfl rfl) rfl
+    (allocId := floatWitAllocId1)
+    (localAlloc := { kind := .stack, allocation := floatWitIndSrcAlloc })
+    (by decide) (by decide) rfl
+    (fun la₁ la₂ h₁ h₂ => by
+      have e₁ := List.mem_singleton.mp h₁
+      have e₂ := List.mem_singleton.mp h₂
+      rw [(Prod.mk.inj e₁).2, (Prod.mk.inj e₂).2])
+    floatWitIndSrcAlloc_shape
+    (fun tf htf => ⟨none, by
+      injection htf with h₁; injection h₁ with h₂; subst h₂; rfl⟩)
+    (fun v hv => ⟨⟨0x4004000000000000, 8⟩, by
+      simpa [floatWitIndSrcAnnealPre, get?] using hv.symm⟩)
+    (fun tf htf => Or.inl (by
+      injection htf with h₁; injection h₁ with h₂; subst h₂
+      intro mls hmls mp hmp
+      simp [floatWitIndSrcMiriFramePre] at hmls
+      subst hmls
+      cases hmp))
+  obtain ⟨m₁, hm₁, hrel₁⟩ := floatWit_step_of_stepRel hr floatWitIndSrc_anneal_step
+  exact ⟨m₁, hm₁, floatWitIndSrc_anneal_step, hrel₁⟩
+
 end NonVacuity
 
 /-! ## Axiom guards
@@ -10448,6 +10813,36 @@ info: 'LeanMiriSpec.Correspondence.floatWit_nanChoice_pure1_exact' depends on ax
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms floatWit_nanChoice_pure1_exact
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatToFloatPureIndexBits_spec' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms floatToFloatPureIndexBits_spec
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWitInd_stateRel_pre' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms floatWitInd_stateRel_pre
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWit_indirect_dst_step' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms floatWit_indirect_dst_step
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWitIndSrc_stateRel_pre' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms floatWitIndSrc_stateRel_pre
+
+/--
+info: 'LeanMiriSpec.Correspondence.floatWit_indirect_src_step' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms floatWit_indirect_src_step
 
 end AxiomGuards
 
