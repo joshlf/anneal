@@ -191,10 +191,14 @@ def run(arguments, work):
         ).read_bytes()
         if rejected_captured != mutated_captured:
             raise RuntimeError(f"rejected capture differs from checked execution for {kind}")
+        # verification() requires exit 1 and "proof_failed". cargo-anneal
+        # reports Lean resource limits (runtime.* diagnostics, such as
+        # maxHeartbeats) and kernel diagnostics as operational failures with
+        # exit 2 (see reports_frontend_rejection in
+        # trusted/cargo-anneal/src/lib.rs), so a timeout cannot count as this
+        # rejection.
         if rejected.get("phase") != "audit":
             raise RuntimeError(f"fixed property did not reach proof checking for {kind}")
-        if "timeout" in rejected.get("detail", "").lower():
-            raise RuntimeError(f"proof timeout must not count as rejection for {kind}")
         results[kind] = {"status": rejected["status"],
                          "phase": rejected["phase"],
                          "execution_status": checked_execution["status"],

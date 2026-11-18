@@ -142,28 +142,10 @@ def fin4_elim {motive : Fin 4 → Sort u}
   Fin.cases h0
     (Fin.cases h1 (Fin.cases h2 (Fin.cases h3 (fun i => Fin.elim0 i))))
 
-/-- A `u64` assignment whose computed value `v` equals `u64Val w`. Callers
-supply `h_val` from the `u64*Val_eq` lemmas above, so the stored slot holds the
-`BitVec 64` expression `w` instead of the semantics' 128-bit encoding. -/
-theorem evalStatement_assignU64 {body : Body} {b i : Nat}
-    {L L₁ L₂ : List LocalSlot} {stmt : StatementKind} {dst : Place}
-    {rv : Rvalue} {v : Val} {w : Word} {o : Option Val}
-    (h_stmt : stmt = .assign dst rv)
-    (h_proj : dst.projection.isEmpty = true)
-    (h_ty : Trusted.MirSemantics.getElem? body.locals dst.localId =
-      some (.int .i64 false))
-    (h_rv : evalRvalue body.locals L (.int .i64 false) rv = .ok (v, L₁))
-    (h_val : v = u64Val w)
-    (h_live : Trusted.MirSemantics.getElem? L₁ dst.localId = some (.live o))
-    (h_set : setElem? L₁ dst.localId (.live (some (u64Val w))) = some L₂) :
-    evalStatement body ⟨0, b, i, L⟩ ⟨[]⟩ stmt =
-      .step (mkState b (i + 1) L₂) :=
-  evalStatement_assign h_stmt h_proj h_ty h_rv h_val (checkVal_u64Val w)
-    h_live h_set
-
 /-- Run a projection-free `u64` local assignment `.assign ⟨dstId, []⟩ rv` in
-`BlockExec` whose computed value `v` equals `u64Val w`, storing `u64Val w` over
-the pre-normalized `locals` table. -/
+`BlockExec` whose computed value `v` equals `u64Val w`. Callers supply `h_val`
+from the `u64*Val_eq` lemmas above, so the stored slot holds the `BitVec 64`
+expression `w` instead of the semantics' 128-bit encoding. -/
 theorem blockExec_assignU64 {body : Body} {blocks : List BasicBlock}
     {locals : List MirTy} {bb : BasicBlock} {b i dstId : Nat}
     {rv : Rvalue} {rest : List StatementKind} {L L₁ L₂ : List LocalSlot}

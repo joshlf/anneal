@@ -108,10 +108,11 @@ theorem wpOutcomeState_mono {p : Program}
         rw [h_eval] at h_step
         exact h_fault k h_step
 
-/-- Fuel-bounded segment weakest precondition: within `steps` transitions from
-`s`, every valid choice path either reaches an intermediate state satisfying
-`onMid` or terminates earlier in `.done out` (`onDone out`) or `.fault k`
-(`onFault k`). -/
+/-- Segment weakest precondition: along every valid choice, `s` either reaches
+a state satisfying `onMid` after exactly `steps` transitions or terminates
+earlier with `.done out` satisfying `onDone out` or `.fault k` satisfying
+`onFault k`. Every state before the end of the segment must admit a valid
+choice. -/
 noncomputable def wpStepsOutcome (p : Program) (onMid : State → Prop)
     (onDone : TerminalOut → Prop) (onFault : FaultKind → Prop) :
     Nat → State → Prop
@@ -124,8 +125,8 @@ noncomputable def wpStepsOutcome (p : Program) (onMid : State → Prop)
         | .done out => onDone out
         | .fault k => onFault k
 
-/-- Fault-free segment weakest precondition reaching `onMid` (or returning early
-with `post`) within `steps` transitions. -/
+/-- Fault-free `wpStepsOutcome`: reach `onMid` after exactly `steps`
+transitions, or return earlier with an outcome satisfying `post`. -/
 abbrev wpSteps (p : Program) (steps : Nat) (s : State)
     (onMid : State → Prop)
     (post : TerminalOut → Prop := fun _ => False) : Prop :=
@@ -187,10 +188,11 @@ theorem wpOutcomeState_trans {p : Program} {onMid : State → Prop}
       rw [h_eval] at h_step
       exact h_step
 
-/-- Spine-forcing cut combinator for `wpState`: step `s` for `steps` fault-free
-transitions to an explicit concrete-spine state `s_mid` (whose `List LocalSlot`
-spine is written as a flat literal list), then prove `wpState p fuel s_mid post`
-from `s_mid`. -/
+/-- Cut `wpState` at an explicitly named intermediate state `s_mid`: if every
+valid path from `s` reaches `s_mid` after `steps` fault-free transitions or
+returns earlier with `post`, then `wpState p fuel s_mid post` extends to `s`.
+Writing `s_mid` with a literal list of local slots lets the continuation start
+from a reduced state instead of the nested `setElem?` updates of the prefix. -/
 theorem wpState_cut {p : Program} {post : TerminalOut → Prop}
     {steps fuel : Nat} {s s_mid : State}
     (h_seg : wpSteps p steps s (fun s' => s' = s_mid) post)
@@ -1187,8 +1189,8 @@ theorem forceList?_eq {α : Type} {xs ys : List α}
       rw [ih hr]
 
 /-- Reconstruct a `LocalSlot` from its constructors so closing
-`forceSlot? s = some s'` by `rfl` normalizes `liveUninitSlot ty` thunks to
-`.dead`, `.live none`, or `.live (some v)`. -/
+`forceSlot? s = some s'` by `rfl` reduces an unevaluated slot such as
+`liveUninitSlot ty` to `.dead`, `.live none`, or `.live (some v)`. -/
 noncomputable def forceSlot? : LocalSlot → Option LocalSlot
   | .dead => some .dead
   | .live none => some (.live none)

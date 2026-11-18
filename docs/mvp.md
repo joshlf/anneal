@@ -292,23 +292,29 @@ A path whose arguments include a universally quantified value cannot be proved
 by evaluating `run` or `step` from the entry state: each step leaves its
 successor's locals as an unreduced update of the previous state, and the
 dynamic type test of an assignment does not reduce on a symbolic scalar.
-`Anneal.MirWp` provides two composition routes for such paths:
+`Anneal.MirWp` provides two ways to split such a path:
 
-- `wpSteps` (`wpStepsOutcome`) with `wpOutcomeState_trans` and `wpState_cut`,
-  which cut a weakest-precondition obligation across an explicit concrete-spine
-  intermediate state `s_mid` over arbitrary `ValidChoice` branching; and
-- `BlockExec` certificates (`executes_of_blockExec`), which normalize the
-  body's basic-block and local-type spines once at entry, consume one statement
-  of the current block at a time with `L'` reduced to a literal list of slots
-  via `setElem?`, and discharge symbolic assignments via
-  `blockExec_assign_local` / `evalStatement_assign`.
+- `wpState_cut` cuts a `wpState` obligation at an explicitly named intermediate
+  state `s_mid`. Its prefix obligation, `wpSteps`, covers every valid choice,
+  so it also applies to nondeterministic steps. Naming `s_mid` with a literal
+  list of slots lets the continuation start from a reduced state.
+- `BlockExec` certificates follow one deterministic execution. Entry through
+  `executes_of_blockExec` reduces the body's block and local-type lists once.
+  Each rule then consumes one statement of the current block and states its
+  successor as `mkState b i L'`; closing the `setElem?` premise by reduction
+  turns `L'` into a literal list of slots. `blockExec_assign_local` turns the
+  type test and the stored value into premises that value-level lemmas
+  discharge.
 
-The endianness proof runs every path once through `BlockExec` in
-`InitialCache.sourceExec` — synthesizing both the returned value and its
-`Executes` certificate with one shared tactic script and no generated
-witnesses — so `ExecutionProof` and `ProductionClaims` reuse the same symbolic
-execution without duplicating tactics. The Rust spin fixture uses safety
-transport before its loop invariant and proves no return separately.
+The endianness proof uses `BlockExec`. `InitialCache.sourceExec` runs every
+path with one tactic script and no generated witnesses, producing the returned
+value together with its `Executes` certificate. `ExecutionProof` uses the
+certificate alone; `ProductionClaims` also checks the value against
+`sourceOutput`. No current consumer uses `wpState_cut`. The Rust spin fixture
+uses safety transport before its loop invariant and proves no return
+separately. Safety transport, the execution-to-safety bridge and
+`wpState_of_executes` rely on the deterministic source step. An extension to
+nondeterministic execution needs a bridge covering every relevant path.
 
 ## Supported fragment and results
 
