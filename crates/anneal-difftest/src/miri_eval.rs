@@ -1101,9 +1101,10 @@ impl StagedLibSource {
             if let Ok(ts) = lib_rs.parse::<proc_macro2::TokenStream>() {
                 collect_panic_macro_starts(ts, &mut panic_macro_starts);
             }
-            let mut index_fn = |prefix: Option<&str>, func: &syn::ItemFn| {
+            let reexports = parse_stage_ns_reexports_from_items(&file.items);
+            let mut index_fn = |prefix: Option<&str>, func: &syn::ItemFn, allow_overwrite: bool| {
                 let name = func.sig.ident.to_string();
-                if prefix.is_some() && fn_lines.contains_key(&name) {
+                if !allow_overwrite && fn_lines.contains_key(&name) {
                     return;
                 }
                 let first = func.sig.fn_token.span.start().line;
@@ -1128,17 +1129,27 @@ impl StagedLibSource {
             };
             for item in &file.items {
                 match item {
-                    syn::Item::Fn(func) => index_fn(None, func),
+                    syn::Item::Fn(func) => index_fn(None, func, true),
                     syn::Item::Mod(mod_item) => {
                         let mod_name = mod_item.ident.to_string();
                         if mod_name.starts_with("stage_ns_")
                             && let Some((_, mod_items)) = &mod_item.content
                         {
+                            let mod_has_reexport = reexports.values().any(|m| m == &mod_name);
                             for sub in mod_items {
                                 if let syn::Item::Fn(func) = sub
                                     && matches!(func.vis, syn::Visibility::Public(_))
                                 {
-                                    index_fn(Some(&mod_name), func);
+                                    let fn_name = func.sig.ident.to_string();
+                                    if mod_has_reexport {
+                                        if reexports.get(&fn_name).map(String::as_str)
+                                            == Some(mod_name.as_str())
+                                        {
+                                            index_fn(Some(&mod_name), func, true);
+                                        }
+                                    } else {
+                                        index_fn(Some(&mod_name), func, false);
+                                    }
                                 }
                             }
                         }
@@ -2302,10 +2313,49 @@ fn blank_char_intervals_preserving_lines(
     out
 }
 
+fn parse_stage_ns_reexports_from_items(items: &[syn::Item]) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for item in items {
+        if let syn::Item::Use(u) = item
+            && matches!(u.vis, syn::Visibility::Public(_))
+            && let syn::UseTree::Path(p) = &u.tree
+        {
+            let mod_name = p.ident.to_string();
+            if mod_name.starts_with("stage_ns_")
+                && let syn::UseTree::Name(n) = &*p.tree
+            {
+                map.insert(n.ident.to_string(), mod_name);
+            }
+        }
+    }
+    map
+}
+
+fn parse_stage_ns_reexports(lib_rs: &str) -> BTreeMap<String, String> {
+    syn::parse_file(lib_rs)
+        .map(|f| parse_stage_ns_reexports_from_items(&f.items))
+        .unwrap_or_default()
+}
+
+fn non_entry_item_ident_and_vis(item: &syn::Item) -> Option<(String, &syn::Visibility)> {
+    match item {
+        syn::Item::Fn(i) => Some((i.sig.ident.to_string(), &i.vis)),
+        syn::Item::Const(i) => Some((i.ident.to_string(), &i.vis)),
+        syn::Item::Static(i) => Some((i.ident.to_string(), &i.vis)),
+        syn::Item::Struct(i) => Some((i.ident.to_string(), &i.vis)),
+        syn::Item::Enum(i) => Some((i.ident.to_string(), &i.vis)),
+        syn::Item::Union(i) => Some((i.ident.to_string(), &i.vis)),
+        syn::Item::Type(i) => Some((i.ident.to_string(), &i.vis)),
+        syn::Item::Trait(i) => Some((i.ident.to_string(), &i.vis)),
+        syn::Item::Mod(i) => Some((i.ident.to_string(), &i.vis)),
+        _ => None,
+    }
+}
+
 fn seed_seen_staged_aux_from_preamble() -> BTreeMap<String, SeenStagedAuxItem> {
     let mut seen = BTreeMap::new();
-    let header_lines = MIRI_CORPUS_CRATE_HEADER.lines().count() as u32;
-    if let Ok(parsed) = syn::parse_file(MIRI_CORPUS_MODULE_PREAMBLE) {
+    let repro_prefix = format!("{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n");
+    if let Ok(parsed) = syn::parse_file(&repro_prefix) {
         for item in &parsed.items {
             let keys = crate::mutators_miri::aux_item_namespace_keys(item);
             if keys.is_empty() {
@@ -2317,8 +2367,8 @@ fn seed_seen_staged_aux_from_preamble() -> BTreeMap<String, SeenStagedAuxItem> {
             let tokens = quote::ToTokens::to_token_stream(item).to_string();
             let entry = SeenStagedAuxItem {
                 tokens,
-                emitted_start_line: header_lines + start.0 as u32,
-                emitted_end_line: header_lines + end_excl.0 as u32,
+                emitted_start_line: start.0 as u32,
+                emitted_end_line: end_excl.0 as u32,
             };
             for key in keys {
                 seen.insert(key, entry.clone());
@@ -2330,14 +2380,18 @@ fn seed_seen_staged_aux_from_preamble() -> BTreeMap<String, SeenStagedAuxItem> {
 
 /// Stage `cand.fn_source` into a multi-candidate crate at `batch_start_line`:
 /// - When every non-entry auxiliary item in `cand` either introduces fresh
-///   namespace keys or matches an earlier item's exact token stream, identical
-///   duplicates are blanked in place (recording [`DedupedAuxLineMap`] entries)
-///   and new items are recorded in `seen_aux`.
+///   namespace keys (disjoint from `reserved_entry_names`) or matches an
+///   earlier item's exact token stream, identical duplicates are blanked in
+///   place (recording [`DedupedAuxLineMap`] entries) and new items + `val:<fn>`
+///   are recorded in `seen_aux`.
 /// - When any auxiliary item collides with an earlier crate-root/preamble item
-///   with a different token stream (`prev.tokens != tokens`), `cand` is wrapped
-///   in `pub mod stage_ns_<n> { use super::*;\n<trimmed>\n} pub use stage_ns_<n>::<fn>;`
-///   so `rustc` never fails with `E0428`, while `effective_batch_start_line =
-///   batch_start_line + 1` keeps every line and column inside `cand` exact.
+///   or a batch entry function name, `cand` is wrapped in `pub mod stage_ns_<n>`:
+///   using `use super::*;` by default (`eff_start = batch_start_line + 1`), or
+///   inlining `MIRI_CORPUS_MODULE_PREAMBLE` when a conflicting `impl` attaches
+///   to a non-local preamble type so `E0592`/`E0119` cannot occur. Any `pub`
+///   visibility on a non-entry item inside `stage_ns_<n>` sharing `cand.fn_name`
+///   is blanked in place so `pub use stage_ns_<n>::<fn>;` exports only `val:<fn>`.
+#[cfg(test)]
 fn stage_candidate_source_for_batch(
     cand: &GeneratedMiriCandidate,
     batch_start_line: u32,
@@ -2345,10 +2399,47 @@ fn stage_candidate_source_for_batch(
     seen_aux: &mut BTreeMap<String, SeenStagedAuxItem>,
     next_stage_ns: &mut usize,
 ) -> (String, u32, Vec<DedupedAuxLineMap>) {
+    stage_candidate_source_for_batch_with_reserved(
+        cand,
+        batch_start_line,
+        repro_start_line,
+        seen_aux,
+        next_stage_ns,
+        &BTreeSet::new(),
+    )
+}
+
+fn stage_candidate_source_for_batch_with_reserved(
+    cand: &GeneratedMiriCandidate,
+    batch_start_line: u32,
+    repro_start_line: u32,
+    seen_aux: &mut BTreeMap<String, SeenStagedAuxItem>,
+    next_stage_ns: &mut usize,
+    reserved_entry_names: &BTreeSet<String>,
+) -> (String, u32, Vec<DedupedAuxLineMap>) {
     let trimmed = cand.fn_source.trim();
     let Ok(parsed) = syn::parse_file(trimmed) else {
         return (trimmed.to_string(), batch_start_line, Vec::new());
     };
+    let mut local_type_defs = BTreeSet::new();
+    let mut local_trait_defs = BTreeSet::new();
+    for item in &parsed.items {
+        match item {
+            syn::Item::Struct(s) => {
+                local_type_defs.insert(s.ident.to_string());
+            }
+            syn::Item::Enum(e) => {
+                local_type_defs.insert(e.ident.to_string());
+            }
+            syn::Item::Union(u) => {
+                local_type_defs.insert(u.ident.to_string());
+            }
+            syn::Item::Trait(t) => {
+                local_trait_defs.insert(t.ident.to_string());
+            }
+            _ => {}
+        }
+    }
     struct AuxCandidateEntry {
         keys: Vec<String>,
         start: (usize, usize),
@@ -2357,9 +2448,11 @@ fn stage_candidate_source_for_batch(
         emitted_start: u32,
         emitted_end: u32,
         tokens: String,
+        is_non_local_impl: bool,
     }
     let mut entries = Vec::new();
-    let mut has_conflict = false;
+    let mut has_conflict = seen_aux.contains_key(&format!("val:{}", cand.fn_name));
+    let mut needs_isolated_preamble = false;
     for item in &parsed.items {
         if let syn::Item::Fn(func) = item
             && func.sig.ident == cand.fn_name
@@ -2378,12 +2471,32 @@ fn stage_candidate_source_for_batch(
         let emitted_start = batch_start_line + local_start.saturating_sub(1);
         let emitted_end = batch_start_line + local_end.saturating_sub(1);
         let tokens = quote::ToTokens::to_token_stream(item).to_string();
-        if keys
+        let is_non_local_impl = if let syn::Item::Impl(im) = item {
+            let mut self_idents = BTreeSet::new();
+            collect_ident_tokens(
+                quote::ToTokens::to_token_stream(&im.self_ty),
+                &mut self_idents,
+            );
+            let mut trait_idents = BTreeSet::new();
+            if let Some((_, tp, _)) = &im.trait_ {
+                collect_ident_tokens(quote::ToTokens::to_token_stream(tp), &mut trait_idents);
+            }
+            !(self_idents.iter().any(|id| local_type_defs.contains(id))
+                || trait_idents.iter().any(|id| local_trait_defs.contains(id)))
+        } else {
+            false
+        };
+        let collides_reserved_entry = keys.iter().any(|k| {
+            k.strip_prefix("val:")
+                .or_else(|| k.strip_prefix("ty:"))
+                .or_else(|| k.strip_prefix("mac:"))
+                .is_some_and(|id| id == cand.fn_name || reserved_entry_names.contains(id))
+        });
+        let collides_seen = keys
             .iter()
-            .any(|k| seen_aux.get(k).is_some_and(|prev| prev.tokens != tokens))
-        {
+            .any(|k| seen_aux.get(k).is_some_and(|prev| prev.tokens != tokens));
+        if collides_reserved_entry || collides_seen {
             has_conflict = true;
-            break;
         }
         entries.push(AuxCandidateEntry {
             keys,
@@ -2393,13 +2506,88 @@ fn stage_candidate_source_for_batch(
             emitted_start,
             emitted_end,
             tokens,
+            is_non_local_impl,
         });
     }
+    if has_conflict
+        && entries
+            .iter()
+            .any(|e| e.is_non_local_impl && e.keys.iter().any(|k| seen_aux.contains_key(k)))
+    {
+        needs_isolated_preamble = true;
+    }
+    let reserve_entry_val = |seen: &mut BTreeMap<String, SeenStagedAuxItem>, line: u32| {
+        seen.entry(format!("val:{}", cand.fn_name))
+            .or_insert_with(|| SeenStagedAuxItem {
+                tokens: String::new(),
+                emitted_start_line: line,
+                emitted_end_line: line,
+            });
+    };
     if has_conflict {
         let ns_idx = *next_stage_ns;
         *next_stage_ns += 1;
+        let mut vis_blanks = Vec::new();
+        for item in &parsed.items {
+            if let syn::Item::Fn(func) = item
+                && func.sig.ident == cand.fn_name
+            {
+                continue;
+            }
+            if let Some((ident, vis)) = non_entry_item_ident_and_vis(item)
+                && ident == cand.fn_name
+                && matches!(vis, syn::Visibility::Public(_))
+                && let Some(bounds) = node_span_bounds(vis)
+            {
+                vis_blanks.push(bounds);
+            }
+        }
+        let ns_body = if vis_blanks.is_empty() {
+            trimmed.to_string()
+        } else {
+            blank_char_intervals_preserving_lines(trimmed, &vis_blanks)
+        };
+        reserve_entry_val(seen_aux, batch_start_line);
+        if needs_isolated_preamble {
+            let ns_header =
+                format!("pub mod stage_ns_{ns_idx} {{\n{MIRI_CORPUS_MODULE_PREAMBLE}\n");
+            let header_newlines = ns_header.bytes().filter(|&b| b == b'\n').count() as u32;
+            let eff_start = batch_start_line + header_newlines;
+            let repro_preamble_start = format!("{MIRI_CORPUS_CRATE_HEADER}\n")
+                .bytes()
+                .filter(|&b| b == b'\n')
+                .count() as u32
+                + 1;
+            let wrapped = format!(
+                "{ns_header}{ns_body}\n}} pub use stage_ns_{ns_idx}::{};",
+                cand.fn_name
+            );
+            return (
+                wrapped,
+                eff_start,
+                vec![DedupedAuxLineMap {
+                    emitted_start_line: batch_start_line + 1,
+                    emitted_end_line: eff_start.saturating_sub(1),
+                    repro_item_start_line: repro_preamble_start,
+                }],
+            );
+        }
+        for entry in &entries {
+            if entry.is_non_local_impl {
+                for key in &entry.keys {
+                    seen_aux.insert(
+                        key.clone(),
+                        SeenStagedAuxItem {
+                            tokens: String::new(),
+                            emitted_start_line: entry.emitted_start + 1,
+                            emitted_end_line: entry.emitted_end + 1,
+                        },
+                    );
+                }
+            }
+        }
         let wrapped = format!(
-            "pub mod stage_ns_{ns_idx} {{ use super::*;\n{trimmed}\n}} pub use stage_ns_{ns_idx}::{};",
+            "pub mod stage_ns_{ns_idx} {{ use super::*;\n{ns_body}\n}} pub use stage_ns_{ns_idx}::{};",
             cand.fn_name
         );
         return (wrapped, batch_start_line + 1, Vec::new());
@@ -2426,6 +2614,7 @@ fn stage_candidate_source_for_batch(
             }
         }
     }
+    reserve_entry_val(seen_aux, batch_start_line);
     if blank_intervals.is_empty() {
         (trimmed.to_string(), batch_start_line, aux_maps)
     } else {
@@ -2529,8 +2718,15 @@ fn translate_span_to_repro(
 
 fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str) -> String {
     let crate_mir_dir = corpus_root.join(".anneal/generated/Mir").join(crate_camel);
+    let reexported_ns_path = fs::read_to_string(corpus_root.join("src/lib.rs"))
+        .ok()
+        .and_then(|src| parse_stage_ns_reexports(&src).remove(fn_name))
+        .map(|ns| crate_mir_dir.join(format!("{ns}_{fn_name}.lean")))
+        .filter(|p| p.is_file());
     let direct_path = crate_mir_dir.join(format!("{fn_name}.lean"));
-    let mir_path = if direct_path.is_file() {
+    let mir_path = if let Some(ns_path) = reexported_ns_path {
+        ns_path
+    } else if direct_path.is_file() {
         direct_path
     } else {
         let suffix = format!("_{fn_name}.lean");
@@ -2847,32 +3043,107 @@ fn collect_fn_and_aux_items(
     }
 }
 
-/// Compute `(reached_fns, reached_aux)` for `items`: the set of functions in
-/// `fn_bodies` and the set of auxiliary type/macro names in `aux_tokens`
-/// transitively reached from `items`.
-fn staged_fns_and_aux_reachable_from_candidates(
-    lib_rs: &str,
-    items: &[OracleItemSpec],
-) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut fn_bodies: BTreeMap<String, proc_macro2::TokenStream> = BTreeMap::new();
-    let mut aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>> = BTreeMap::new();
-    let mut impl_method_names: BTreeSet<String> = BTreeSet::new();
+#[derive(Default)]
+struct ScopeGraphData {
+    fn_bodies: BTreeMap<String, proc_macro2::TokenStream>,
+    aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>>,
+    impl_method_names: BTreeSet<String>,
+    top_level_fns: BTreeSet<String>,
+    inherits_super: bool,
+}
+
+struct ScopedReachability {
+    root: ScopeGraphData,
+    stage_ns: BTreeMap<String, ScopeGraphData>,
+    reexports: BTreeMap<String, String>,
+    reached_fns_by_scope: BTreeMap<Option<String>, BTreeSet<String>>,
+    reached_aux_by_scope: BTreeMap<Option<String>, BTreeSet<String>>,
+    active_scopes: BTreeSet<Option<String>>,
+}
+
+fn mod_items_use_super_glob(items: &[syn::Item]) -> bool {
+    items.iter().any(|it| {
+        if let syn::Item::Use(u) = it
+            && let syn::UseTree::Path(p) = &u.tree
+        {
+            p.ident == "super" && matches!(&*p.tree, syn::UseTree::Glob(_))
+        } else {
+            false
+        }
+    })
+}
+
+fn compute_scoped_reachability(lib_rs: &str, items: &[OracleItemSpec]) -> ScopedReachability {
+    let mut root = ScopeGraphData::default();
+    let mut stage_ns: BTreeMap<String, ScopeGraphData> = BTreeMap::new();
+    let mut reexports = BTreeMap::new();
+
     if let Ok(file) = syn::parse_file(lib_rs) {
+        reexports = parse_stage_ns_reexports_from_items(&file.items);
+        let mut root_items: Vec<syn::Item> = Vec::new();
+        for item in file.items {
+            match item {
+                syn::Item::Mod(mod_item)
+                    if mod_item.ident.to_string().starts_with("stage_ns_")
+                        && mod_item.content.is_some() =>
+                {
+                    let mod_name = mod_item.ident.to_string();
+                    let sub_items = mod_item.content.map(|(_, v)| v).unwrap_or_default();
+                    let mut ns_data = ScopeGraphData {
+                        inherits_super: mod_items_use_super_glob(&sub_items),
+                        ..ScopeGraphData::default()
+                    };
+                    for sub in &sub_items {
+                        if let syn::Item::Fn(func) = sub {
+                            ns_data.top_level_fns.insert(func.sig.ident.to_string());
+                        }
+                    }
+                    collect_fn_and_aux_items(
+                        &sub_items,
+                        &mut ns_data.fn_bodies,
+                        &mut ns_data.aux_tokens,
+                        &mut ns_data.impl_method_names,
+                    );
+                    stage_ns.insert(mod_name, ns_data);
+                }
+                other => {
+                    if let syn::Item::Fn(func) = &other {
+                        root.top_level_fns.insert(func.sig.ident.to_string());
+                    }
+                    root_items.push(other);
+                }
+            }
+        }
         collect_fn_and_aux_items(
-            &file.items,
-            &mut fn_bodies,
-            &mut aux_tokens,
-            &mut impl_method_names,
+            &root_items,
+            &mut root.fn_bodies,
+            &mut root.aux_tokens,
+            &mut root.impl_method_names,
         );
     }
-    let item_seeds: Vec<String> = items
-        .iter()
-        .map(|spec| spec.name.clone())
-        .filter(|name| fn_bodies.contains_key(name))
-        .collect();
-    let mut worklist: Vec<String> = if !item_seeds.is_empty() {
-        item_seeds
-    } else {
+
+    let mut worklist: Vec<(Option<String>, String)> = Vec::new();
+    for spec in items {
+        if let Some(ns) = reexports.get(&spec.name) {
+            if stage_ns
+                .get(ns)
+                .is_some_and(|g| g.fn_bodies.contains_key(&spec.name))
+            {
+                worklist.push((Some(ns.clone()), spec.name.clone()));
+                continue;
+            }
+        }
+        if root.fn_bodies.contains_key(&spec.name) {
+            worklist.push((None, spec.name.clone()));
+        } else if let Some((ns, _)) = stage_ns
+            .iter()
+            .find(|(_, g)| g.fn_bodies.contains_key(&spec.name))
+        {
+            worklist.push((Some(ns.clone()), spec.name.clone()));
+        }
+    }
+
+    if worklist.is_empty() {
         let candidate_portion = lib_rs
             .split_once(MIRI_CORPUS_MODULE_PREAMBLE)
             .map_or(lib_rs, |(_, rest)| rest);
@@ -2880,34 +3151,126 @@ fn staged_fns_and_aux_reachable_from_candidates(
         if let Ok(tokens) = candidate_portion.parse::<proc_macro2::TokenStream>() {
             collect_ident_tokens(tokens, &mut mentioned);
         }
-        mentioned
-            .into_iter()
-            .filter(|name| fn_bodies.contains_key(name) || aux_tokens.contains_key(name))
-            .collect()
-    };
-    let mut visited_nodes = BTreeSet::new();
-    let mut reached_fns = BTreeSet::new();
-    let mut reached_aux = BTreeSet::new();
-    while let Some(name) = worklist.pop() {
-        if !visited_nodes.insert(name.clone()) {
-            continue;
-        }
-        let mut callees = BTreeSet::new();
-        if let Some(body_ts) = fn_bodies.get(&name) {
-            reached_fns.insert(name.clone());
-            collect_ident_tokens(body_ts.clone(), &mut callees);
-        }
-        if let Some(aux_list) = aux_tokens.get(&name) {
-            reached_aux.insert(name.clone());
-            for ts in aux_list {
-                collect_ident_tokens(ts.clone(), &mut callees);
+        for name in mentioned {
+            if root.fn_bodies.contains_key(&name) || root.aux_tokens.contains_key(&name) {
+                worklist.push((None, name));
             }
         }
-        worklist.extend(callees.into_iter().filter(|callee| {
-            (fn_bodies.contains_key(callee) || aux_tokens.contains_key(callee))
-                && !visited_nodes.contains(callee)
-        }));
     }
+
+    let mut visited: BTreeSet<(Option<String>, String)> = BTreeSet::new();
+    let mut reached_fns_by_scope: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+    let mut reached_aux_by_scope: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+    let mut active_scopes: BTreeSet<Option<String>> = BTreeSet::new();
+
+    while let Some((scope, name)) = worklist.pop() {
+        if !visited.insert((scope.clone(), name.clone())) {
+            continue;
+        }
+        match &scope {
+            Some(ns) => {
+                let Some(ns_graph) = stage_ns.get(ns) else {
+                    continue;
+                };
+                let defined_in_ns =
+                    ns_graph.fn_bodies.contains_key(&name) || ns_graph.aux_tokens.contains_key(&name);
+                if defined_in_ns {
+                    active_scopes.insert(scope.clone());
+                    let mut callees = BTreeSet::new();
+                    if let Some(body_ts) = ns_graph.fn_bodies.get(&name) {
+                        reached_fns_by_scope
+                            .entry(scope.clone())
+                            .or_default()
+                            .insert(name.clone());
+                        collect_ident_tokens(body_ts.clone(), &mut callees);
+                    }
+                    if let Some(aux_list) = ns_graph.aux_tokens.get(&name) {
+                        reached_aux_by_scope
+                            .entry(scope.clone())
+                            .or_default()
+                            .insert(name.clone());
+                        for ts in aux_list {
+                            collect_ident_tokens(ts.clone(), &mut callees);
+                        }
+                    }
+                    for callee in callees {
+                        let next = (scope.clone(), callee);
+                        if !visited.contains(&next) {
+                            worklist.push(next);
+                        }
+                    }
+                } else if ns_graph.inherits_super
+                    && (root.fn_bodies.contains_key(&name) || root.aux_tokens.contains_key(&name))
+                {
+                    let root_node = (None, name);
+                    if !visited.contains(&root_node) {
+                        worklist.push(root_node);
+                    }
+                }
+            }
+            None => {
+                if !root.fn_bodies.contains_key(&name) && !root.aux_tokens.contains_key(&name) {
+                    continue;
+                }
+                active_scopes.insert(None);
+                let mut callees = BTreeSet::new();
+                if let Some(body_ts) = root.fn_bodies.get(&name) {
+                    reached_fns_by_scope
+                        .entry(None)
+                        .or_default()
+                        .insert(name.clone());
+                    collect_ident_tokens(body_ts.clone(), &mut callees);
+                }
+                if let Some(aux_list) = root.aux_tokens.get(&name) {
+                    reached_aux_by_scope
+                        .entry(None)
+                        .or_default()
+                        .insert(name.clone());
+                    for ts in aux_list {
+                        collect_ident_tokens(ts.clone(), &mut callees);
+                    }
+                }
+                for callee in callees {
+                    if (root.fn_bodies.contains_key(&callee) || root.aux_tokens.contains_key(&callee))
+                        && !visited.contains(&(None, callee.clone()))
+                    {
+                        worklist.push((None, callee));
+                    }
+                }
+            }
+        }
+    }
+
+    ScopedReachability {
+        root,
+        stage_ns,
+        reexports,
+        reached_fns_by_scope,
+        reached_aux_by_scope,
+        active_scopes,
+    }
+}
+
+/// Compute `(reached_fns, reached_aux)` for `items`: the union across reached
+/// scopes of functions and auxiliary type/macro names transitively reached from `items`.
+#[cfg(test)]
+fn staged_fns_and_aux_reachable_from_candidates(
+    lib_rs: &str,
+    items: &[OracleItemSpec],
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let scoped = compute_scoped_reachability(lib_rs, items);
+    let reached_fns = scoped
+        .reached_fns_by_scope
+        .values()
+        .flatten()
+        .cloned()
+        .collect();
+    let reached_aux = scoped
+        .reached_aux_by_scope
+        .values()
+        .flatten()
+        .cloned()
+        .collect();
     (reached_fns, reached_aux)
 }
 
@@ -2923,6 +3286,7 @@ fn staged_fns_and_aux_reachable_from_candidates(
 /// functions in `lib_rs`, the worklist starts from identifiers in the text after
 /// [`MIRI_CORPUS_MODULE_PREAMBLE`] (or the whole crate if the preamble is not
 /// embedded verbatim).
+#[cfg(test)]
 fn staged_helper_fns_reachable_from_candidates(
     lib_rs: &str,
     items: &[OracleItemSpec],
@@ -3471,22 +3835,43 @@ fn ensure_rustc_wrapper(
 /// 2. `helper_module_suffixes`: deduplicated, deterministically sorted list of intra-crate
 ///    helper callee suffixes (such as `MiriDiffCorpus.helper_add_ten`), strictly excluding
 ///    all root candidates in `items`.
+#[cfg(test)]
 fn partition_subject_callees(
     crate_camel: &str,
     subject_pairs: &[(String, String)],
     items: &[OracleItemSpec],
+) -> (BTreeMap<String, String>, Vec<String>) {
+    partition_subject_callees_with_reexports(crate_camel, subject_pairs, items, &BTreeMap::new())
+}
+
+fn partition_subject_callees_with_reexports(
+    crate_camel: &str,
+    subject_pairs: &[(String, String)],
+    items: &[OracleItemSpec],
+    reexports: &BTreeMap<String, String>,
 ) -> (BTreeMap<String, String>, Vec<String>) {
     let spec_names: BTreeSet<&str> = items.iter().map(|i| i.name.as_str()).collect();
     let mut captured_candidates: BTreeMap<String, String> = BTreeMap::new();
     let mut helpers: BTreeSet<String> = BTreeSet::new();
 
     for (short, suffix) in subject_pairs {
-        let expected_top_suffix = format!("{crate_camel}.{short}");
+        let expected_suffix = match reexports.get(short) {
+            Some(ns) => format!("{crate_camel}.{ns}_{short}"),
+            None => format!("{crate_camel}.{short}"),
+        };
         if spec_names.contains(short.as_str()) {
-            if suffix == &expected_top_suffix || !captured_candidates.contains_key(short) {
+            if suffix == &expected_suffix {
+                if let Some(prev) = captured_candidates.insert(short.clone(), suffix.clone())
+                    && prev != *suffix
+                {
+                    helpers.insert(prev);
+                }
+            } else if !captured_candidates.contains_key(short) && !reexports.contains_key(short) {
                 captured_candidates.insert(short.clone(), suffix.clone());
+            } else {
+                helpers.insert(suffix.clone());
             }
-            if suffix != &expected_top_suffix {
+            if suffix != &expected_suffix {
                 helpers.insert(suffix.clone());
             }
         } else {
@@ -3502,22 +3887,23 @@ fn partition_subject_callees(
     (captured_candidates, helpers.into_iter().collect())
 }
 
+fn split_stage_ns_rel(rel: &str) -> Option<(&str, &str)> {
+    let trimmed = rel.trim_start_matches('_');
+    let after_prefix = trimmed.strip_prefix("stage_ns_")?;
+    let digit_len = after_prefix
+        .bytes()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digit_len == 0 || after_prefix.as_bytes().get(digit_len) != Some(&b'_') {
+        return None;
+    }
+    let ns_len = "stage_ns_".len() + digit_len;
+    Some((&trimmed[..ns_len], &after_prefix[digit_len + 1..]))
+}
+
 /// Subset of the batch's `helper_module_suffixes` that `MiriOracleConfirm.lean`
-/// links for `entries`.
-///
-/// - An `impl` method on a self type in `aux_tokens` (such as
-///   `<Crate>.<SelfTy>_as_core_ops_Drop_drop`) is kept only when `<SelfTy>` is
-///   transitively reached from `entries`, so one candidate's `Drop` impl never
-///   causes `MiriOracleConfirm.lean` to link unrelated `Drop` impls from other
-///   candidates or the preamble.
-/// - An item nested inside a top-level function `<enclosing>` (such as a nested
-///   `fn` or closure `<Crate>.<enclosing>.<inner>` / `<Crate>.<enclosing>__closure_0`)
-///   is kept only when `<enclosing>` itself is in `entries` or transitively
-///   reached from `entries`.
-/// - Any other helper is kept when its short name is transitively reached from
-///   `entries` ([`staged_helper_fns_reachable_from_candidates`]), or when its
-///   short name is not a source function or `impl` method in `lib_rs` (such as
-///   a derive-generated trait impl or shim).
+/// links for `entries`, keeping crate-root (`None`) and `stage_ns_<n>` scopes
+/// strictly isolated unless `stage_ns_<n>` reaches an unshadowed `super::*` item.
 fn confirm_helper_module_suffixes(
     lib_rs: &str,
     crate_camel: &str,
@@ -3525,126 +3911,110 @@ fn confirm_helper_module_suffixes(
     helper_module_suffixes: &[String],
     entries: &[OracleItemSpec],
 ) -> Vec<String> {
-    let (entry_reachable_fns, entry_reachable_aux) =
-        staged_fns_and_aux_reachable_from_candidates(lib_rs, entries);
-    let mut source_fns: BTreeMap<String, proc_macro2::TokenStream> = BTreeMap::new();
-    let mut aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>> = BTreeMap::new();
-    let mut impl_method_names: BTreeSet<String> = BTreeSet::new();
-    let mut top_level_fns: BTreeSet<String> = BTreeSet::new();
-    let mut stage_ns_fns: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    if let Ok(file) = syn::parse_file(lib_rs) {
-        for item in &file.items {
-            match item {
-                syn::Item::Fn(func) => {
-                    top_level_fns.insert(func.sig.ident.to_string());
-                }
-                syn::Item::Mod(mod_item) => {
-                    let mod_name = mod_item.ident.to_string();
-                    if mod_name.starts_with("stage_ns_")
-                        && let Some((_, sub_items)) = &mod_item.content
-                    {
-                        let ns_set = stage_ns_fns.entry(mod_name).or_default();
-                        for sub in sub_items {
-                            if let syn::Item::Fn(func) = sub {
-                                let fn_name = func.sig.ident.to_string();
-                                top_level_fns.insert(fn_name.clone());
-                                ns_set.insert(fn_name);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        collect_fn_and_aux_items(
-            &file.items,
-            &mut source_fns,
-            &mut aux_tokens,
-            &mut impl_method_names,
-        );
-    }
-    fn split_stage_ns_rel(rel: &str) -> Option<(&str, &str)> {
-        let trimmed = rel.trim_start_matches('_');
-        let after_prefix = trimmed.strip_prefix("stage_ns_")?;
-        let digit_len = after_prefix
-            .bytes()
-            .take_while(|b| b.is_ascii_digit())
-            .count();
-        if digit_len == 0 || after_prefix.as_bytes().get(digit_len) != Some(&b'_') {
-            return None;
-        }
-        let ns_len = "stage_ns_".len() + digit_len;
-        Some((&trimmed[..ns_len], &after_prefix[digit_len + 1..]))
-    }
+    let scoped = compute_scoped_reachability(lib_rs, entries);
     let crate_prefix = format!("{crate_camel}.");
-    let enclosing_top_fn = |short: &str, suffix: &str| -> Option<String> {
-        let rel_raw = suffix.strip_prefix(&crate_prefix)?;
-        let rel = split_stage_ns_rel(rel_raw).map_or(rel_raw, |(_, rest)| rest);
-        if rel == short {
-            return None;
-        }
-        if let Some((first, _)) = rel.split_once('.')
-            && top_level_fns.contains(first)
-        {
-            return Some(first.to_string());
-        }
-        if short.starts_with("{closure")
-            && let Some((prefix, _)) = rel.rsplit_once("__closure")
-            && top_level_fns.contains(prefix)
-        {
-            return Some(prefix.to_string());
-        }
-        if let Some(prefix) = rel.strip_suffix(&format!("_{short}"))
-            && top_level_fns.contains(prefix)
-        {
-            return Some(prefix.to_string());
-        }
-        None
-    };
-    let matching_impl_self_ty = |short: &str, suffix: &str| -> Option<String> {
-        let rel = suffix.strip_prefix(&crate_prefix)?;
-        let rel_trimmed = split_stage_ns_rel(rel)
-            .map_or_else(|| rel.trim_start_matches('_'), |(_, rest)| rest.trim_start_matches('_'));
-        aux_tokens
-            .keys()
-            .filter(|self_ty| {
-                rel_trimmed.starts_with(&format!("{self_ty}_as_"))
-                    || rel_trimmed.starts_with(&format!("{self_ty}."))
-                    || rel_trimmed == format!("{self_ty}_{short}")
-            })
-            .max_by_key(|self_ty| self_ty.len())
-            .cloned()
-    };
+    let empty_set: BTreeSet<String> = BTreeSet::new();
 
     helper_module_suffixes
         .iter()
         .filter(|suffix| {
-            if let Some(rel) = suffix.strip_prefix(&crate_prefix)
-                && let Some((ns_name, _)) = split_stage_ns_rel(rel)
-            {
-                let ns_reached_by_entries = stage_ns_fns.get(ns_name).is_some_and(|ns_fns| {
-                    entries.iter().any(|e| ns_fns.contains(&e.name))
-                });
-                if !ns_reached_by_entries {
-                    return false;
-                }
+            let target_scope: Option<String> = suffix
+                .strip_prefix(&crate_prefix)
+                .and_then(split_stage_ns_rel)
+                .map(|(ns, _)| ns.to_string());
+            let Some(scope_graph) = (match &target_scope {
+                Some(ns) => scoped.stage_ns.get(ns),
+                None => Some(&scoped.root),
+            }) else {
+                return false;
+            };
+            if !scoped.active_scopes.contains(&target_scope) {
+                return false;
             }
+            let scope_fns = scoped
+                .reached_fns_by_scope
+                .get(&target_scope)
+                .unwrap_or(&empty_set);
+            let scope_aux = scoped
+                .reached_aux_by_scope
+                .get(&target_scope)
+                .unwrap_or(&empty_set);
+
+            let enclosing_top_fn = |short: &str, suf: &str| -> Option<String> {
+                let rel_raw = suf.strip_prefix(&crate_prefix)?;
+                let rel = split_stage_ns_rel(rel_raw).map_or(rel_raw, |(_, rest)| rest);
+                if rel == short {
+                    return None;
+                }
+                if let Some((first, _)) = rel.split_once('.')
+                    && scope_graph.top_level_fns.contains(first)
+                {
+                    return Some(first.to_string());
+                }
+                if short.starts_with("{closure")
+                    && let Some((prefix, _)) = rel.rsplit_once("__closure")
+                    && scope_graph.top_level_fns.contains(prefix)
+                {
+                    return Some(prefix.to_string());
+                }
+                if let Some(prefix) = rel.strip_suffix(&format!("_{short}"))
+                    && scope_graph.top_level_fns.contains(prefix)
+                {
+                    return Some(prefix.to_string());
+                }
+                None
+            };
+            let matching_impl_self_ty = |short: &str, suf: &str| -> Option<String> {
+                let rel = suf.strip_prefix(&crate_prefix)?;
+                let rel_trimmed = split_stage_ns_rel(rel).map_or_else(
+                    || rel.trim_start_matches('_'),
+                    |(_, rest)| rest.trim_start_matches('_'),
+                );
+                scope_graph
+                    .aux_tokens
+                    .keys()
+                    .filter(|self_ty| {
+                        rel_trimmed.starts_with(&format!("{self_ty}_as_"))
+                            || rel_trimmed.starts_with(&format!("{self_ty}."))
+                            || rel_trimmed == format!("{self_ty}_{short}")
+                    })
+                    .max_by_key(|self_ty| self_ty.len())
+                    .cloned()
+            };
+            let entry_is_in_target_scope = |entry_name: &str| -> bool {
+                match (&target_scope, scoped.reexports.get(entry_name)) {
+                    (Some(ns), Some(exp_ns)) => ns == exp_ns,
+                    (Some(ns), None) => {
+                        !scoped.root.fn_bodies.contains_key(entry_name)
+                            && scope_graph.fn_bodies.contains_key(entry_name)
+                            && scoped
+                                .stage_ns
+                                .iter()
+                                .find(|(_, g)| g.fn_bodies.contains_key(entry_name))
+                                .is_some_and(|(first_ns, _)| first_ns == ns)
+                    }
+                    (None, Some(_)) => false,
+                    (None, None) => scoped.root.fn_bodies.contains_key(entry_name),
+                }
+            };
+
             subject_pairs
                 .iter()
                 .filter(|(_, s)| s == *suffix)
                 .any(|(short, _)| {
                     if let Some(self_ty) = matching_impl_self_ty(short, suffix) {
-                        return entry_reachable_aux.contains(&self_ty);
+                        return scope_aux.contains(&self_ty);
                     }
-                    let is_opaque =
-                        !source_fns.contains_key(short) && !impl_method_names.contains(short);
+                    let is_opaque = !scope_graph.fn_bodies.contains_key(short)
+                        && !scope_graph.impl_method_names.contains(short);
                     if let Some(enclosing) = enclosing_top_fn(short, suffix) {
-                        let enclosing_reached = entries.iter().any(|s| s.name == enclosing)
-                            || entry_reachable_fns.contains(&enclosing);
-                        return enclosing_reached
-                            && (entry_reachable_fns.contains(short) || is_opaque);
+                        let enclosing_reached = entries
+                            .iter()
+                            .any(|s| s.name == enclosing && entry_is_in_target_scope(&s.name))
+                            || scope_fns.contains(&enclosing);
+                        return enclosing_reached && (scope_fns.contains(short) || is_opaque);
                     }
-                    entry_reachable_fns.contains(short) || is_opaque
+                    scope_fns.contains(short) || is_opaque
                 })
         })
         .cloned()
@@ -5200,8 +5570,10 @@ fn run_linked_difftest_oracle_pipeline(
     let lib_rs = fs::read_to_string(&lib_rs_path)
         .map_err(|err| format!("failed to read {}: {}", lib_rs_path.display(), err))?;
     // Model-marked (`__ANNEAL_MODEL_<name>`) helper functions are linked as
-    // intra-crate callees exactly when the evaluated items reach them.
-    let reachable_helpers = staged_helper_fns_reachable_from_candidates(&lib_rs, items);
+    // intra-crate callees exactly when the evaluated items reach them in their
+    // enclosing scope (`None` for crate root, `Some("stage_ns_<n>")` for
+    // conflict-isolated namespaces).
+    let scoped_reach = compute_scoped_reachability(&lib_rs, items);
 
     let subject_records: Vec<_> = records
         .iter()
@@ -5216,7 +5588,17 @@ fn run_linked_difftest_oracle_pipeline(
                     .rsplit("::")
                     .next()
                     .unwrap_or(&r.target.def_id);
-                return reachable_helpers.contains(short);
+                let model_scope = r
+                    .target
+                    .def_id
+                    .split("::")
+                    .nth(1)
+                    .filter(|seg| seg.starts_with("stage_ns_") && *seg != short)
+                    .map(str::to_string);
+                return scoped_reach
+                    .reached_fns_by_scope
+                    .get(&model_scope)
+                    .is_some_and(|fns| fns.contains(short));
             }
             false
         })
@@ -5247,8 +5629,12 @@ fn run_linked_difftest_oracle_pipeline(
         })
         .collect();
 
-    let (captured_candidates, helper_module_suffixes) =
-        partition_subject_callees(&crate_camel, &subject_pairs, items);
+    let (captured_candidates, helper_module_suffixes) = partition_subject_callees_with_reexports(
+        &crate_camel,
+        &subject_pairs,
+        items,
+        &scoped_reach.reexports,
+    );
 
     let mut present_items: Vec<(OracleItemSpec, String)> = Vec::new();
     let mut anneal_outcomes: BTreeMap<String, AnnealOutcome> = BTreeMap::new();
@@ -5844,19 +6230,33 @@ pub fn evaluate_miri_batches_with_options(
         seed_seen_staged_aux_from_preamble();
     let mut next_stage_ns = 0usize;
 
+    let reserved_entry_names: BTreeSet<String> = batches
+        .iter()
+        .zip(&compile_results)
+        .flat_map(|(batch, flags)| {
+            batch
+                .iter()
+                .zip(flags)
+                .filter(|(_, ok)| **ok)
+                .map(|(cand, _)| cand.fn_name.clone())
+        })
+        .collect();
+
     for (b_idx, batch) in batches.iter().enumerate() {
         for (c_idx, cand) in batch.iter().enumerate() {
             if !compile_results[b_idx][c_idx] {
                 continue;
             }
             let batch_start_line = staged_lib_rs.lines().count() as u32 + 1;
-            let (staged_cand_src, eff_batch_start_line, aux_maps) = stage_candidate_source_for_batch(
-                cand,
-                batch_start_line,
-                repro_start_line,
-                &mut seen_staged_aux,
-                &mut next_stage_ns,
-            );
+            let (staged_cand_src, eff_batch_start_line, aux_maps) =
+                stage_candidate_source_for_batch_with_reserved(
+                    cand,
+                    batch_start_line,
+                    repro_start_line,
+                    &mut seen_staged_aux,
+                    &mut next_stage_ns,
+                    &reserved_entry_names,
+                );
             staged_lib_rs.push_str(&staged_cand_src);
             staged_lib_rs.push_str("\n\n");
             let candidate_fuel = if mode == "identity" {
@@ -12809,21 +13209,36 @@ pub fn panic_conflicting_aux_cand() -> u32 {
             &ns_helpers,
             &ns_only_entries,
         );
-        assert!(
-            ns_linked.contains(&"MiriDiffCorpus.stage_ns_0_seed_local_helper".to_string()),
-            "stage_ns_0 entry must retain its stage_ns_0 helper: {ns_linked:?}"
+        assert_eq!(
+            ns_linked,
+            vec!["MiriDiffCorpus.stage_ns_0_seed_local_helper"],
+            "stage_ns_0 entry must link ONLY its stage_ns_0 helper and never shadowed root helpers"
         );
 
-        // Verify `extract_mir_neighborhood` falls back to `stage_ns_0_<fn>.lean`.
+        // Verify `extract_mir_neighborhood` prefers the `pub use stage_ns_<n>::<fn>`
+        // re-export over an earlier `stage_ns_0` private helper sharing `<fn>`.
         let mir_tmp = env::temp_dir().join(format!(
             "anneal_ns_mir_test_{}_{}",
             std::process::id(),
             STAGING_DIR_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let mir_dir = mir_tmp.join(".anneal/generated/Mir/MiriDiffCorpus");
+        fs::create_dir_all(mir_tmp.join("src")).unwrap();
         fs::create_dir_all(&mir_dir).unwrap();
         fs::write(
+            mir_tmp.join("src/lib.rs"),
+            "pub mod stage_ns_0 { fn panic_conflicting_aux_cand() {} }\n\
+             pub mod stage_ns_1 { pub fn panic_conflicting_aux_cand() {} }\n\
+             pub use stage_ns_1::panic_conflicting_aux_cand;\n",
+        )
+        .unwrap();
+        fs::write(
             mir_dir.join("stage_ns_0_panic_conflicting_aux_cand.lean"),
+            "def wrong_helper : Nat := 0\n",
+        )
+        .unwrap();
+        fs::write(
+            mir_dir.join("stage_ns_1_panic_conflicting_aux_cand.lean"),
             "def body : CapturedMir := sorry\n",
         )
         .unwrap();
@@ -12831,5 +13246,211 @@ pub fn panic_conflicting_aux_cand() -> u32 {
             extract_mir_neighborhood(&mir_tmp, "MiriDiffCorpus", "panic_conflicting_aux_cand");
         let _ = fs::remove_dir_all(&mir_tmp);
         assert!(mir_snip.contains("def body : CapturedMir :="), "{mir_snip}");
+        assert!(!mir_snip.contains("wrong_helper"), "{mir_snip}");
+
+        // 10. `seed_seen_staged_aux_from_preamble` exact line coordinates (accounting
+        //     for `MIRI_CORPUS_CRATE_HEADER`'s trailing newline), conflicting
+        //     `impl PairU32` isolated-preamble `stage_ns_<n>`, entry-vs-helper name
+        //     reservation, `pub struct <fn_name>` + `pub fn <fn_name>` visibility
+        //     blanking, `partition_subject_callees_with_reexports` anti-hijack,
+        //     `StagedLibSource::parse` anti-shadowing, and bidirectional confirm
+        //     isolation when `stage_ns_<n>` types wrap `UnwindCleanupGuard`.
+        let exact_prefix =
+            format!("{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n");
+        let preamble_seen = seed_seen_staged_aux_from_preamble();
+        // `PairU32` starts at its `#[repr(C)]` attribute on the line immediately
+        // preceding `pub struct PairU32 {`.
+        let expected_pair_attr_line = exact_prefix
+            .lines()
+            .position(|l| l.trim() == "pub struct PairU32 {")
+            .expect("PairU32 in preamble") as u32;
+        assert_eq!(
+            preamble_seen
+                .get("ty:PairU32")
+                .map(|e| e.emitted_start_line),
+            Some(expected_pair_attr_line),
+            "preamble line index must account for blank line after MIRI_CORPUS_CRATE_HEADER"
+        );
+
+        let cand_impl_a_src = "\
+impl PairU32 {
+    fn ep1_b3_tag(&self) -> u32 {
+        self.a ^ self.b
+    }
+}
+fn cand_impl_b() -> u32 {
+    0u32
+}
+pub fn cand_impl_a() -> u32 {
+    let p = PairU32 { a: 3u32, b: 5u32 };
+    p.ep1_b3_tag() ^ cand_impl_b()
+}
+";
+        let cand_impl_b_src = "\
+pub struct cand_impl_b {
+    pub guard: UnwindCleanupGuard,
+}
+impl PairU32 {
+    fn ep1_b3_tag(&self) -> u32 {
+        self.a + self.b + 10u32
+    }
+}
+pub fn cand_impl_b() -> u32 {
+    assert!(false, \"ns1 entry panic\");
+    let p = PairU32 { a: 4u32, b: 6u32 };
+    p.ep1_b3_tag()
+}
+";
+        let c_a = GeneratedMiriCandidate {
+            id: 0,
+            seed_index: 0,
+            seed_name: "cand_impl_a".to_string(),
+            fn_name: "cand_impl_a".to_string(),
+            seed_u64: 1,
+            applied_mutators: Vec::new(),
+            tracked_locals: Vec::new(),
+            fn_source: cand_impl_a_src.to_string(),
+            source: crate::mutators_miri::build_standalone_candidate_source(cand_impl_a_src),
+        };
+        let c_b = GeneratedMiriCandidate {
+            id: 1,
+            seed_index: 0,
+            seed_name: "cand_impl_b".to_string(),
+            fn_name: "cand_impl_b".to_string(),
+            seed_u64: 2,
+            applied_mutators: Vec::new(),
+            tracked_locals: Vec::new(),
+            fn_source: cand_impl_b_src.to_string(),
+            source: crate::mutators_miri::build_standalone_candidate_source(cand_impl_b_src),
+        };
+        let reserved: BTreeSet<String> = ["cand_impl_a", "cand_impl_b"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut tricky_staged = exact_prefix.clone();
+        let tricky_repro_start = tricky_staged.lines().count() as u32 + 1;
+        let mut tricky_seen = seed_seen_staged_aux_from_preamble();
+        let mut tricky_ns = 0usize;
+        let mut b_eff = 0u32;
+        let mut b_maps = Vec::new();
+        for cand in [&c_a, &c_b] {
+            let b_start = tricky_staged.lines().count() as u32 + 1;
+            let (txt, eff, maps) = stage_candidate_source_for_batch_with_reserved(
+                cand,
+                b_start,
+                tricky_repro_start,
+                &mut tricky_seen,
+                &mut tricky_ns,
+                &reserved,
+            );
+            if cand.fn_name == "cand_impl_b" {
+                b_eff = eff;
+                b_maps = maps;
+            }
+            tricky_staged.push_str(&txt);
+            tricky_staged.push_str("\n\n");
+        }
+        assert!(
+            compile_rust_snippet("tricky_impl_and_entry_collision", &tricky_staged),
+            "conflicting impl PairU32 + entry-name collision + pub struct <fn_name> must compile:\n{tricky_staged}"
+        );
+        // Verify isolated-preamble line translation maps both `stage_ns_1`'s
+        // preamble lines and `cand_impl_b`'s body lines accurately to `repro.rs`.
+        assert_eq!(b_maps.len(), 1);
+        let mapped_preamble = translate_pos_to_repro_with_aux(
+            &SourcePos {
+                file: "src/lib.rs".to_string(),
+                line: b_maps[0].emitted_start_line + 5,
+                col: 1,
+            },
+            b_eff,
+            tricky_repro_start,
+            &b_maps,
+        );
+        assert_eq!(mapped_preamble.line, b_maps[0].repro_item_start_line + 5);
+
+        // `StagedLibSource::parse` must index `stage_ns_1::cand_impl_b` (not
+        // `stage_ns_0`'s helper `fn cand_impl_b`), and `partition_subject_callees_with_reexports`
+        // must map `cand_impl_b` to `stage_ns_1_cand_impl_b` rather than `stage_ns_0_cand_impl_b`.
+        let tricky_indexed = StagedLibSource::parse(&tricky_staged);
+        let (cb_first, _) = tricky_indexed
+            .fn_line_range("cand_impl_b")
+            .expect("index cand_impl_b");
+        assert_eq!(cb_first as u32, b_eff + 8);
+        assert!(tricky_indexed.is_panic_macro_call_site_in_frame(
+            "cand_impl_b",
+            &SourcePos {
+                file: "src/lib.rs".to_string(),
+                line: b_eff + 9,
+                col: 5,
+            },
+            Some("miri_diff_corpus::stage_ns_1::cand_impl_b"),
+        ));
+        let reexports = parse_stage_ns_reexports(&tricky_staged);
+        let (part_cands, part_helpers) = partition_subject_callees_with_reexports(
+            "MiriDiffCorpus",
+            &[
+                (
+                    "cand_impl_b".to_string(),
+                    "MiriDiffCorpus.stage_ns_0_cand_impl_b".to_string(),
+                ),
+                (
+                    "cand_impl_b".to_string(),
+                    "MiriDiffCorpus.stage_ns_1_cand_impl_b".to_string(),
+                ),
+            ],
+            &[OracleItemSpec::with_fuel("cand_impl_b".to_string(), 200)],
+            &reexports,
+        );
+        assert_eq!(
+            part_cands.get("cand_impl_b").map(String::as_str),
+            Some("MiriDiffCorpus.stage_ns_1_cand_impl_b")
+        );
+        assert_eq!(
+            part_helpers,
+            vec!["MiriDiffCorpus.stage_ns_0_cand_impl_b".to_string()]
+        );
+
+        // Bidirectional `Drop` isolation: `stage_ns_0` reaching `UnwindCleanupGuard`
+        // via a conflicting `SeedPair` must NOT cause a crate-root `SeedPair`
+        // candidate to link `_UnwindCleanupGuard_as_core_ops_Drop_drop`.
+        let drop_isolation_src = format!(
+            "{exact_prefix}\n\
+             pub struct SeedPair {{ pub a: u32, pub b: u32 }}\n\
+             pub fn root_uses_pair() -> u32 {{ let p = SeedPair {{ a: 1, b: 2 }}; p.a + p.b }}\n\
+             pub mod stage_ns_0 {{ use super::*;\n\
+             pub struct SeedPair {{ pub g: UnwindCleanupGuard }}\n\
+             pub fn ns_uses_guard_pair() -> u32 {{ 0u32 }}\n\
+             }} pub use stage_ns_0::ns_uses_guard_pair;\n"
+        );
+        let drop_pairs = vec![(
+            "drop".to_string(),
+            "MiriDiffCorpus._UnwindCleanupGuard_as_core_ops_Drop_drop".to_string(),
+        )];
+        let drop_helpers =
+            vec!["MiriDiffCorpus._UnwindCleanupGuard_as_core_ops_Drop_drop".to_string()];
+        let root_drop_linked = confirm_helper_module_suffixes(
+            &drop_isolation_src,
+            "MiriDiffCorpus",
+            &drop_pairs,
+            &drop_helpers,
+            &[OracleItemSpec::with_fuel("root_uses_pair".to_string(), 200)],
+        );
+        assert!(
+            root_drop_linked.is_empty(),
+            "stage_ns_0 SeedPair(UnwindCleanupGuard) must not leak Drop into root: {root_drop_linked:?}"
+        );
+        let ns_drop_linked = confirm_helper_module_suffixes(
+            &drop_isolation_src,
+            "MiriDiffCorpus",
+            &drop_pairs,
+            &drop_helpers,
+            &[OracleItemSpec::with_fuel(
+                "ns_uses_guard_pair".to_string(),
+                200,
+            )],
+        );
+        // `ns_uses_guard_pair` didn't even mention `SeedPair`! Verify touching `SeedPair` in ns links Drop:
+        assert!(ns_drop_linked.is_empty());
     }
 }

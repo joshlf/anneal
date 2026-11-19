@@ -4325,22 +4325,75 @@ pub fn pass_c16_conflicting_aux_div() -> u32 {
     conflict_div_cand.applied_mutators.clear();
     multi_batch.push(conflict_div_cand);
 
+    // (d) two candidates implementing conflicting inherent methods on preamble
+    //     `PairU32`, where candidate 4 also defines a private helper matching
+    //     candidate 5's entry name (`pass_c16_preamble_impl_b`), and candidate 5
+    //     defines both `pub struct pass_c16_preamble_impl_b` (`ty:` vs `val:`)
+    //     and a scoped `__ANNEAL_MODEL_*` helper inside isolated-preamble `stage_ns`.
+    let preamble_impl_a_src = "\
+impl PairU32 {
+    fn c16_pair_score(&self) -> u32 {
+        wrapping_add(self.a, self.b)
+    }
+}
+fn pass_c16_preamble_impl_b() -> u32 {
+    1u32
+}
+pub fn pass_c16_preamble_impl_a() -> u32 {
+    let p = PairU32 { a: 20u32, b: 21u32 };
+    wrapping_add(p.c16_pair_score(), pass_c16_preamble_impl_b())
+}
+";
+    let preamble_impl_b_src = "\
+pub struct pass_c16_preamble_impl_b {
+    pub extra: u32,
+}
+impl PairU32 {
+    fn c16_pair_score(&self) -> u32 {
+        wrapping_add(wrapping_add(self.a, self.b), 10u32)
+    }
+}
+pub const __ANNEAL_MODEL_c16_scoped_ns_model: &str = \"c16_scoped_ns_model\";
+pub fn c16_scoped_ns_model(x: u32) -> u32 {
+    wrapping_add(x, 2u32)
+}
+pub fn pass_c16_preamble_impl_b() -> u32 {
+    let local_s = pass_c16_preamble_impl_b { extra: 5u32 };
+    let p = PairU32 { a: 10u32, b: 15u32 };
+    c16_scoped_ns_model(wrapping_add(p.c16_pair_score(), local_s.extra))
+}
+";
+    multi_batch.push(handwritten_candidate(
+        4,
+        "pass_c16_preamble_impl_a",
+        "pass_c16_preamble_impl_a",
+        "identity",
+        preamble_impl_a_src,
+    ));
+    multi_batch.push(handwritten_candidate(
+        5,
+        "pass_c16_preamble_impl_b",
+        "pass_c16_preamble_impl_b",
+        "identity",
+        preamble_impl_b_src,
+    ));
+
     let multi_findings_dir = dir.join("multi_item_findings");
     let multi_report = evaluate_miri_batches_with_options(
         "c16_multi_item_batch",
         0xC16_B201,
         &[multi_batch],
-        4,
+        6,
         &MiriEvalOptions {
             findings_dir: Some(multi_findings_dir),
             anneal_repo_root: Some(root.clone()),
             shrink_seeds: Some(vec![multi_item_seed.to_string()]),
         },
     )
-    .expect("4-candidate unmarked + conflicting multi-item batch must stage without E0428");
-    assert_eq!(multi_report.compiled_candidates, 4);
+    .expect("6-candidate unmarked + conflicting multi-item batch must stage without E0428/E0592");
+    assert_eq!(multi_report.compiled_candidates, 6);
     assert_eq!(multi_report.compile_failed_candidates, 0);
-    assert_eq!(multi_report.compared_candidates, 4);
+    assert_eq!(multi_report.compared_candidates, 6);
     assert_eq!(multi_report.not_compared_count, 0);
     assert_eq!(
         multi_report
@@ -4348,19 +4401,25 @@ pub fn pass_c16_conflicting_aux_div() -> u32 {
             .get("unsound_missed_fault"),
         Some(&0)
     );
-    let agree_ns_rep = multi_report
-        .item_reports
-        .iter()
-        .find(|r| r.name == "pass_c16_conflicting_aux_agree")
-        .expect("conflicting stage_ns_0 agree item report");
-    assert_eq!(agree_ns_rep.verdict, ComparisonVerdict::Agree);
-    assert_eq!(
-        agree_ns_rep.miri,
-        MiriOutcome::PassScalar {
-            bits: 42,
-            size_bytes: 4
-        }
-    );
+    for (expected_name, expected_bits) in [
+        ("pass_c16_conflicting_aux_agree", 42u128),
+        ("pass_c16_preamble_impl_a", 42u128),
+        ("pass_c16_preamble_impl_b", 42u128),
+    ] {
+        let rep = multi_report
+            .item_reports
+            .iter()
+            .find(|r| r.name == expected_name)
+            .unwrap_or_else(|| panic!("missing report for {expected_name}"));
+        assert_eq!(rep.verdict, ComparisonVerdict::Agree, "{rep:?}");
+        assert_eq!(
+            rep.miri,
+            MiriOutcome::PassScalar {
+                bits: expected_bits,
+                size_bytes: 4
+            }
+        );
+    }
 
     if let Some(ns_finding) = multi_report
         .findings
@@ -4381,6 +4440,13 @@ pub fn pass_c16_conflicting_aux_div() -> u32 {
                 .kernel_confirm_theorems
                 .contains("Mir.MiriDiffCorpus.stage_ns_1_c16_unmarked_step.body"),
             "stage_ns_1 confirm module must link stage_ns_1 local helper:\n{}",
+            ns_finding.kernel_confirm_theorems
+        );
+        assert!(
+            !ns_finding
+                .kernel_confirm_theorems
+                .contains("Mir.MiriDiffCorpus.c16_unmarked_step.body"),
+            "stage_ns_1 confirm module must NOT leak shadowed crate-root helper:\n{}",
             ns_finding.kernel_confirm_theorems
         );
         let ns_repro_path = ns_finding

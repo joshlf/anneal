@@ -574,17 +574,55 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
             f"top-level item: {stale_markers}"
         )
 
-    restricted_zero_arg_fns = sorted(
-        m.group(1)
-        for m in re.finditer(
-            _TOP_PREFIX
-            + r"pub\s*\([^)]*\)\s+"
-            + _FN_QUALS
-            + r"fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>\s*)?\(\s*\)",
-            top_lib_no_str,
-        )
-        if m.group(1) != "helper_add_ten" and m.group(1) not in model_names
-    )
+    def _after_optional_generics(src: str, pos: int) -> int:
+        n = len(src)
+        while pos < n and src[pos].isspace():
+            pos += 1
+        if pos >= n or src[pos] != "<":
+            return pos
+        gdepth = pdepth = bdepth = cdepth = 0
+        i = pos
+        while i < n:
+            if src[i : i + 2] == "->":
+                i += 2
+                continue
+            ch = src[i]
+            if ch == "(":
+                pdepth += 1
+            elif ch == ")":
+                pdepth = max(0, pdepth - 1)
+            elif ch == "[":
+                bdepth += 1
+            elif ch == "]":
+                bdepth = max(0, bdepth - 1)
+            elif ch == "{":
+                cdepth += 1
+            elif ch == "}":
+                cdepth = max(0, cdepth - 1)
+            elif ch == "<" and pdepth == 0 and bdepth == 0 and cdepth == 0:
+                gdepth += 1
+            elif ch == ">" and pdepth == 0 and bdepth == 0 and cdepth == 0:
+                gdepth -= 1
+                if gdepth == 0:
+                    i += 1
+                    while i < n and src[i].isspace():
+                        i += 1
+                    return i
+            i += 1
+        return pos
+
+    restricted_zero_arg_fns: list[str] = []
+    for m in re.finditer(
+        _TOP_PREFIX + r"pub\s*\([^)]*\)\s+" + _FN_QUALS + r"fn\s+([A-Za-z0-9_]+)\b",
+        top_lib_no_str,
+    ):
+        name = m.group(1)
+        if name == "helper_add_ten" or name in model_names:
+            continue
+        after_gen = _after_optional_generics(top_lib_no_str, m.end())
+        if re.match(r"\(\s*\)", top_lib_no_str[after_gen:]):
+            restricted_zero_arg_fns.append(name)
+    restricted_zero_arg_fns.sort()
     if restricted_zero_arg_fns:
         raise ValueError(
             "corpus/src/lib.rs declares non-exported `pub(...)` zero-arg functions "

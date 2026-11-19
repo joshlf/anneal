@@ -384,10 +384,11 @@ pub fn nested_inside_fn_body() -> u32 { 0 }
             manifest = SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
             self.assertEqual([t["name"] for t in manifest["tests"]], ["pass_demo"])
 
-        for label, rogue_fn in [
-            ("private-fn", "fn unmarked_private_helper() -> u32 { 0 }\n"),
-            ("parameterized-pub-fn", "pub fn unmarked_callee(x: u32) -> u32 { x }\n"),
-            ("generic-pub-fn", "pub fn unmarked_generic<'a>() -> &'a u32 { &0 }\n"),
+        for label, rogue_fn, expected_err in [
+            ("private-fn", "fn unmarked_private_helper() -> u32 { 0 }\n", "without `__ANNEAL_MODEL_\\*` markers"),
+            ("parameterized-pub-fn", "pub fn unmarked_callee(x: u32) -> u32 { x }\n", "without `__ANNEAL_MODEL_\\*` markers"),
+            ("generic-pub-fn", "pub fn unmarked_generic<'a>() -> &'a u32 { &0 }\n", "without `__ANNEAL_MODEL_\\*` markers"),
+            ("restricted-nested-generic", "pub(crate) fn hidden_fn_ptr<F = fn() -> u32>() -> u32 { 0 }\n", "non-exported `pub\\(\\.\\.\\.\\)` zero-arg functions"),
         ]:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
                 manifest_path, corpus_dir = _write_fixture(
@@ -397,7 +398,7 @@ pub fn nested_inside_fn_body() -> u32 { 0 }
                     eval_rs=char_quote_eval_rs,
                 )
                 with self.assertRaisesRegex(
-                    ValueError, "without `__ANNEAL_MODEL_\\*` markers"
+                    ValueError, expected_err
                 ):
                     SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
 

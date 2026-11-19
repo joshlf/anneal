@@ -898,35 +898,11 @@ pub(crate) fn discover_top_level_zero_arg_pub_fns_in_source_text(source: &str) -
         let ident = &rest[..ident_len];
         let mut after_ident = rest[ident_len..].trim_start();
         if after_ident.starts_with('<') {
-            let mut gdepth = 0usize;
-            let mut close_byte = None;
-            let mut top_params = Vec::new();
-            let mut param_start = 1usize;
-            for (idx, ch) in after_ident.char_indices() {
-                match ch {
-                    '<' => gdepth += 1,
-                    '>' => {
-                        gdepth = gdepth.saturating_sub(1);
-                        if gdepth == 0 {
-                            top_params.push(after_ident[param_start..idx].trim());
-                            close_byte = Some(idx + 1);
-                            break;
-                        }
-                    }
-                    ',' if gdepth == 1 => {
-                        top_params.push(after_ident[param_start..idx].trim());
-                        param_start = idx + 1;
-                    }
-                    _ => {}
-                }
-            }
-            let Some(end_generics) = close_byte else {
+            let Some((end_generics, callable_without_turbofish)) =
+                scan_leading_rust_generics(after_ident)
+            else {
                 continue;
             };
-            let callable_without_turbofish = top_params
-                .iter()
-                .filter(|p| !p.is_empty())
-                .all(|p| p.starts_with('\'') || p.contains('='));
             if !callable_without_turbofish {
                 continue;
             }
@@ -941,6 +917,73 @@ pub(crate) fn discover_top_level_zero_arg_pub_fns_in_source_text(source: &str) -
     out
 }
 
+/// Scan a leading `<...>` generic parameter list in `src` (already comment- and
+/// literal-masked), returning `(closing_byte_offset, callable_without_turbofish)`.
+///
+/// Tracks nested `<...>`, `(...)`, `[...]`, and `{...}` delimiters and skips
+/// `->` return-type arrows so defaulted function-pointer parameters like
+/// `<F = fn() -> u32>` do not close `<...>` early, and requires `=` at top
+/// parameter depth (`gdepth == 1` outside nested `<...>`/`(...)`/`[...]`) so
+/// associated-type bounds like `<T: Iterator<Item = u32>>` are rejected.
+fn scan_leading_rust_generics(src: &str) -> Option<(usize, bool)> {
+    let bytes = src.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+    let mut gdepth = 0usize;
+    let mut pdepth = 0usize;
+    let mut bdepth = 0usize;
+    let mut cdepth = 0usize;
+    let mut i = 0usize;
+    let mut param_start = 1usize;
+    let mut param_has_top_eq = false;
+    let mut all_callable = true;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'-' && bytes.get(i + 1) == Some(&b'>') {
+            i += 2;
+            continue;
+        }
+        match b {
+            b'(' => pdepth += 1,
+            b')' => pdepth = pdepth.saturating_sub(1),
+            b'[' => bdepth += 1,
+            b']' => bdepth = bdepth.saturating_sub(1),
+            b'{' => cdepth += 1,
+            b'}' => cdepth = cdepth.saturating_sub(1),
+            b'<' if pdepth == 0 && bdepth == 0 && cdepth == 0 => {
+                gdepth += 1;
+            }
+            b'>' if pdepth == 0 && bdepth == 0 && cdepth == 0 => {
+                gdepth = gdepth.saturating_sub(1);
+                if gdepth == 0 {
+                    let param = src[param_start..i].trim();
+                    if !param.is_empty() && !param.starts_with('\'') && !param_has_top_eq {
+                        all_callable = false;
+                    }
+                    return Some((i + 1, all_callable));
+                }
+            }
+            b'=' if gdepth == 1 && pdepth == 0 && bdepth == 0 && cdepth == 0 => {
+                if bytes.get(i + 1) != Some(&b'>') && bytes.get(i + 1) != Some(&b'=') {
+                    param_has_top_eq = true;
+                }
+            }
+            b',' if gdepth == 1 && pdepth == 0 && bdepth == 0 && cdepth == 0 => {
+                let param = src[param_start..i].trim();
+                if !param.is_empty() && !param.starts_with('\'') && !param_has_top_eq {
+                    all_callable = false;
+                }
+                param_start = i + 1;
+                param_has_top_eq = false;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Whether `generics` allows calling a function as `f()` without explicit
 /// turbofish type or const arguments (lifetime parameters and defaulted
 /// type/const parameters are permitted).
@@ -952,28 +995,41 @@ pub(crate) fn is_zero_arg_callable_generics(generics: &syn::Generics) -> bool {
     })
 }
 
-/// Index in `file.items` of the candidate target entry `Item::Fn`: prefers the
-/// last `pub fn` not in `local_models` / `helper_add_ten`, falling back to the
-/// last non-model `Item::Fn` when a synthetic seed has no `pub` visibility.
+/// Index in `file.items` of the candidate target entry `Item::Fn`:
+/// 1. Last non-model zero-arg callable `pub fn` (leaving trailing parameterized
+///    or non-defaulted generic `pub fn` helpers intact),
+/// 2. Last non-model callable-generic `pub fn` (for parameterized seeds that
+///    `close_miri_seed` closes into zero-arg candidates),
+/// 3. Last non-model `pub fn`,
+/// 4. Last non-model zero-arg callable `fn`, else last non-model `Item::Fn`.
 fn target_entry_fn_index(
     file: &File,
     local_models: &std::collections::BTreeSet<String>,
 ) -> Option<usize> {
-    file.items
-        .iter()
-        .rposition(|item| match item {
+    let find_last = |pred: &dyn Fn(&ItemFn) -> bool| -> Option<usize> {
+        file.items.iter().rposition(|item| match item {
             Item::Fn(f) => {
-                matches!(f.vis, syn::Visibility::Public(_))
-                    && !is_helper_fn_name_in_set(&f.sig.ident.to_string(), local_models)
+                !is_helper_fn_name_in_set(&f.sig.ident.to_string(), local_models) && pred(f)
             }
             _ => false,
         })
-        .or_else(|| {
-            file.items.iter().rposition(|item| match item {
-                Item::Fn(f) => !is_helper_fn_name_in_set(&f.sig.ident.to_string(), local_models),
-                _ => false,
-            })
+    };
+    find_last(&|f| {
+        matches!(f.vis, syn::Visibility::Public(_))
+            && f.sig.inputs.is_empty()
+            && is_zero_arg_callable_generics(&f.sig.generics)
+    })
+    .or_else(|| {
+        find_last(&|f| {
+            matches!(f.vis, syn::Visibility::Public(_))
+                && is_zero_arg_callable_generics(&f.sig.generics)
         })
+    })
+    .or_else(|| find_last(&|f| matches!(f.vis, syn::Visibility::Public(_))))
+    .or_else(|| {
+        find_last(&|f| f.sig.inputs.is_empty() && is_zero_arg_callable_generics(&f.sig.generics))
+    })
+    .or_else(|| find_last(&|_| true))
 }
 
 /// Whether `name` is a helper/model function given `model_names` rather than a
@@ -5273,14 +5329,11 @@ pub fn collect_non_fault_seed_indices(seeds: &[&str]) -> Vec<usize> {
         .filter_map(|(idx, src)| {
             let parsed = syn::parse_str::<File>(src).ok()?;
             let local_models = model_marked_names_in_file(&parsed);
-            let fn_name = parsed.items.iter().rev().find_map(|it| match it {
-                Item::Fn(f)
-                    if !is_helper_fn_name_in_set(&f.sig.ident.to_string(), &local_models) =>
-                {
-                    Some(f.sig.ident.to_string())
-                }
-                _ => None,
-            })?;
+            let target_idx = target_entry_fn_index(&parsed, &local_models)?;
+            let fn_name = match parsed.items.get(target_idx)? {
+                Item::Fn(f) => f.sig.ident.to_string(),
+                _ => return None,
+            };
             if !fn_name.starts_with("panic_") && !fn_name.starts_with("ub_") {
                 Some(idx)
             } else {
@@ -5586,13 +5639,11 @@ fn finish_miri_candidate(
     mut raw_locals: Vec<(String, String)>,
 ) -> (Vec<(String, String)>, String, String) {
     let local_models = model_marked_names_in_file(parsed);
-    for item in &parsed.items {
-        if let Item::Fn(func) = item
-            && !is_helper_fn_name_in_set(&func.sig.ident.to_string(), &local_models)
-        {
-            for loc in collect_initialized_locals(func) {
-                raw_locals.push((loc.name, loc.ty));
-            }
+    if let Some(target_idx) = target_entry_fn_index(parsed, &local_models)
+        && let Some(Item::Fn(func)) = parsed.items.get(target_idx)
+    {
+        for loc in collect_initialized_locals(func) {
+            raw_locals.push((loc.name, loc.ty));
         }
     }
     let mut tracked_locals = Vec::new();
@@ -8400,7 +8451,9 @@ decl_items!(pub const __ANNEAL_MODEL_real_lt_cand: () = (); pub fn macro_paren_g
 decl_items![pub fn macro_bracket_ghost() -> u32 { 1 }];
 pub fn paren_marked_helper() -> u32 { 7u32 }
 pub fn non_callable_type_generic<T>() -> u32 { 0u32 }
+pub fn non_callable_assoc_bound<T: Iterator<Item = u32>>() -> u32 { 0u32 }
 pub fn callable_defaulted_generic<T = u32>() -> u32 { 1u32 }
+pub fn callable_fn_ptr_default<F = fn() -> u32>() -> u32 { 2u32 }
 pub fn real_lt_cand<'a>() { @@@ }
 ";
         let edge_marked = model_marked_names_in_source_text(edge_fallback_src);
@@ -8412,9 +8465,50 @@ pub fn real_lt_cand<'a>() { @@@ }
             vec![
                 "paren_marked_helper",
                 "callable_defaulted_generic",
+                "callable_fn_ptr_default",
                 "real_lt_cand"
             ]
         );
+
+        // Trailing parameterized `pub fn` helpers and `ub_*`-named private helpers
+        // must not hijack `target_entry_fn_index`, `collect_non_fault_seed_indices`,
+        // or `finish_miri_candidate` `tracked_locals`.
+        let trailing_pub_param_seed = "\
+pub fn pass_with_trailing_pub_helper() -> u32 {
+    let entry_only_local: u32 = 17u32;
+    trailing_pub_param_helper(entry_only_local)
+}
+pub fn trailing_pub_param_helper(helper_only_param: u32) -> u32 {
+    helper_only_param ^ 9u32
+}
+fn ub_named_private_helper() -> u32 { 3u32 }
+";
+        let fault_with_trailing_private_seed = "\
+pub fn ub_seed_with_trailing_private() -> u32 { 0u32 }
+fn pass_named_private_helper() -> u32 { 1u32 }
+";
+        let non_fault = collect_non_fault_seed_indices(&[
+            trailing_pub_param_seed,
+            fault_with_trailing_private_seed,
+        ]);
+        assert_eq!(non_fault, vec![0]);
+        let param_pub_batch = generate_miri_batch(&[trailing_pub_param_seed], 3, 0xC16_B301);
+        for cand in &param_pub_batch {
+            assert_eq!(cand.seed_name, "pass_with_trailing_pub_helper");
+            assert!(
+                !cand
+                    .tracked_locals
+                    .iter()
+                    .any(|(n, _)| n == "helper_only_param"),
+                "helper locals leaked into tracked_locals: {:?}",
+                cand.tracked_locals
+            );
+            assert!(
+                crate::miri_eval::compile_rust_snippet("trailing_pub_param_cand", &cand.source),
+                "candidate with trailing parameterized pub fn failed rustc:\n{}",
+                cand.source
+            );
+        }
 
         // 2. `close_miri_seed` / `seeded_type_expr` must synthesize valid `FreezeAndCell`,
         //    `NonCopyU32`, `UnwindCleanupGuard`, and `UnsafeCell<u32>` arguments and
