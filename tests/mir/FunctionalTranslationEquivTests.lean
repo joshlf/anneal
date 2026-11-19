@@ -1640,11 +1640,12 @@ def tailRun
 
 /--
 Call-handler law on the baseline: on `flag = false` the run is the `bind` of
-the environment's answer with the rest of the run, for every environment.
+the sealed environment answer with the rest of the run, for every environment.
 -/
 theorem tailCaller_run_false (env : MirCallEnv) (x fuel : Nat) :
     runMirWithGap env [] tailCallerBody (fuel + 2) (callerArgs (false, x)) =
-      ((env (extHelperReq x)).mapFault (fun _ => .ub)).bind (fun ans =>
+      (((env (extHelperReq x)).mapFault (fun _ => .ub)).mapGap
+          (·.sealOutOfFuel "test::ext_helper")).bind (fun ans =>
         runMirStepsWithGap env tailCallerBody fuel (resumeExternalTailCall ans)) :=
   (runGapSteps_succ_of_next (mirSiteGapStep env tailCallerBody)
       (s := mirSiteOfExec tailCallerBody (.running (initMachineStateWithCallees tailCallerBody
@@ -1658,7 +1659,8 @@ theorem tailCaller_run_false (env : MirCallEnv) (x fuel : Nat) :
 /-- Call-handler law on the refactored caller: the same request and `bind`. -/
 theorem tailCallerRefactored_run_false (env : MirCallEnv) (x fuel : Nat) :
     runMirWithGap env [] tailCallerRefactoredBody (fuel + 2) (callerArgs (false, x)) =
-      ((env (extHelperReq x)).mapFault (fun _ => .ub)).bind (fun ans =>
+      (((env (extHelperReq x)).mapFault (fun _ => .ub)).mapGap
+          (·.sealOutOfFuel "test::ext_helper")).bind (fun ans =>
         runMirStepsWithGap env tailCallerRefactoredBody fuel
           (resumeExternalTailCall ans)) :=
   (runGapSteps_succ_of_next (mirSiteGapStep env tailCallerRefactoredBody)
@@ -1691,7 +1693,7 @@ theorem tailCaller_run_false_pure
   cases f "test::ext_helper" [.scalar ⟨x, 4⟩] with
   | ok v => rfl
   | fault e => cases e <;> rfl
-  | gap g => rfl
+  | gap g => cases g <;> rfl
 
 theorem tailCallerRefactored_run_false_pure
     (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
@@ -1707,7 +1709,7 @@ theorem tailCallerRefactored_run_false_pure
   cases f "test::ext_helper" [.scalar ⟨x, 4⟩] with
   | ok v => rfl
   | fault e => cases e <;> rfl
-  | gap g => rfl
+  | gap g => cases g <;> rfl
 
 theorem tailCaller_run_true
     (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
@@ -1781,10 +1783,10 @@ theorem tailCallerRefactored_contextEquiv_any_env (env : MirCallEnv)
         (.running (initMachineStateWithCallees tailCallerRefactoredBody
           (callerArgs (false, x)) []))
     let R : MirSiteState → MirSiteState → Prop :=
-      fun a b => (a = s₁₀ ∧ b = s₂₀) ∨ ∃ out, a.exec = .halted out ∧ b.exec = .halted out
+      fun a b => (a = s₁₀ ∧ b = s₂₀) ∨ ∃ out, a = .halted out ∧ b = .halted out
     refine mirGapBehaviors_equiv_of_stutter_with (R := R) (fun _ => rfl) ?_ (Or.inl ⟨rfl, rfl⟩)
     intro a b hR
-    rcases hR with ⟨rfl, rfl⟩ | ⟨out, ha, hb⟩
+    rcases hR with ⟨rfl, rfl⟩ | ⟨out, rfl, rfl⟩
     · let t₁ : MirSiteState :=
         mirSiteOfExec tailCallerBody (.running (tailCallerAtCall tailCallerBody x))
       let t₂ : MirSiteState :=
@@ -1792,43 +1794,35 @@ theorem tailCallerRefactored_contextEquiv_any_env (env : MirCallEnv)
           (.running (tailCallerAtCall tailCallerRefactoredBody x))
       refine ⟨1, 1, t₁, t₂, .step rfl (.refl _), .step rfl (.refl _), ?_⟩
       change StepNodeRelWith (mirGapHandle env) (mirGapHandle env) R (· = ·) (· = ·)
-        t₁.site t₂.site
+        (mirSiteOfState tailCallerBody t₁) (mirSiteOfState tailCallerRefactoredBody t₂)
         (.vis (.inr (.inr (.call (extHelperReq x))))
           (fun ans => mirNextSiteState tailCallerBody t₁ (resumeExternalTailCall ans)))
         (.vis (.inr (.inr (.call (extHelperReq x))))
           (fun ans => mirNextSiteState tailCallerRefactoredBody t₂ (resumeExternalTailCall ans)))
-      refine StepNodeRelWith.vis
-        (fun a₁ a₂ => a₁ = a₂ ∧ env (extHelperReq x) = .ok a₁) ?_ ?_
-      · dsimp only [mirGapHandle]
-        cases he : env (extHelperReq x) with
-        | ok ans => exact ⟨rfl, rfl⟩
-        | fault _ => exact (rfl : ExecFault.ub = ExecFault.ub)
-        | gap g => exact (rfl : g = g)
-      · rintro ans _ ⟨rfl, he⟩
-        cases ans with
-        | returned v mem =>
-          have hcs := hStackRet x v mem he
-          refine Or.inr ⟨.normal (v, mem), ?_, ?_⟩
-          · dsimp only [mirNextSiteState, t₁, mirSiteOfExec, resumeExternalTailCall]
-            rw [hcs]
-          · dsimp only [mirNextSiteState, t₂, mirSiteOfExec, resumeExternalTailCall]
-            rw [hcs]
-        | panicked mem =>
-          have hcs := hStackPanic x mem he
-          refine Or.inr ⟨.panic, ?_, ?_⟩
-          · dsimp only [mirNextSiteState, t₁, mirSiteOfExec, resumeExternalTailCall]
-            rw [hcs]
-            rfl
-          · dsimp only [mirNextSiteState, t₂, mirSiteOfExec, resumeExternalTailCall]
-            rw [hcs]
-            rfl
-        | aborted =>
-          exact Or.inr ⟨.abort, rfl, rfl⟩
-    · refine ⟨0, 0, a, b, .refl _, .refl _, ?_⟩
-      rcases a with ⟨exec₁, site₁⟩
-      rcases b with ⟨exec₂, site₂⟩
-      dsimp only at ha hb
-      subst ha hb
+      refine StepNodeRelWith.vis (· = ·)
+        (GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _) ?_
+      rintro ans _ ho₁ _ rfl
+      have he : env (extHelperReq x) = .ok ans := mirGapHandle_call_eq_ok ho₁
+      cases ans with
+      | returned v mem =>
+        have hcs := hStackRet x v mem he
+        refine Or.inr ⟨.normal (v, mem), ?_, ?_⟩
+        · dsimp only [mirNextSiteState, t₁, mirSiteOfExec, resumeExternalTailCall]
+          rw [hcs]
+        · dsimp only [mirNextSiteState, t₂, mirSiteOfExec, resumeExternalTailCall]
+          rw [hcs]
+      | panicked mem =>
+        have hcs := hStackPanic x mem he
+        refine Or.inr ⟨.panic, ?_, ?_⟩
+        · dsimp only [mirNextSiteState, t₁, mirSiteOfExec, resumeExternalTailCall]
+          rw [hcs]
+          rfl
+        · dsimp only [mirNextSiteState, t₂, mirSiteOfExec, resumeExternalTailCall]
+          rw [hcs]
+          rfl
+      | aborted =>
+        exact Or.inr ⟨.abort, rfl, rfl⟩
+    · refine ⟨0, 0, .halted out, .halted out, .refl _, .refl _, ?_⟩
       change StepNodeRelWith _ _ _ _ _ _ _ (.ret out) (.ret out)
       cases out with
       | normal r => exact StepNodeRelWith.normal rfl
@@ -1927,11 +1921,12 @@ def seqCallerAtCall (body : CapturedMir) (x : Nat) : MachineState :=
 
 /--
 Call-handler law for `seqCallerBody`: the bounded run is literally the monadic
-`bind` of the external helper's outcome with the post-call continuation.
+`bind` of the sealed external helper outcome with the post-call continuation.
 -/
 theorem seqCaller_run_eq_bind (env : MirCallEnv) (x fuel : Nat) :
     runMirWithGap env [] seqCallerBody (fuel + 2) [.scalar ⟨x, 4⟩] =
-      ((env (extHelperReq x)).mapFault (fun _ => .ub)).bind (fun ans =>
+      (((env (extHelperReq x)).mapFault (fun _ => .ub)).mapGap
+          (·.sealOutOfFuel "test::ext_helper")).bind (fun ans =>
         runMirStepsWithGap env seqCallerBody fuel
           (resumeExternalCall (seqCallerAtCall seqCallerBody x)
             (seqCallerAtCall seqCallerBody x).frame.locals
@@ -1951,7 +1946,8 @@ theorem seqCaller_run_eq_bind (env : MirCallEnv) (x fuel : Nat) :
 /-- Call-handler law for `seqCallerRefactoredBody`: same request, different continuation. -/
 theorem seqCallerRefactored_run_eq_bind (env : MirCallEnv) (x fuel : Nat) :
     runMirWithGap env [] seqCallerRefactoredBody (fuel + 2) [.scalar ⟨x, 4⟩] =
-      ((env (extHelperReq x)).mapFault (fun _ => .ub)).bind (fun ans =>
+      (((env (extHelperReq x)).mapFault (fun _ => .ub)).mapGap
+          (·.sealOutOfFuel "test::ext_helper")).bind (fun ans =>
         runMirStepsWithGap env seqCallerRefactoredBody fuel
           (resumeExternalCall (seqCallerAtCall seqCallerRefactoredBody x)
             (seqCallerAtCall seqCallerRefactoredBody x).frame.locals
@@ -2004,7 +2000,7 @@ theorem seqCallerRefactored_gapEqErr_via_bind_congr
       | ub => exact (rfl : ExecFault.ub = ExecFault.ub)
       | panic => exact ⟨rfl, Or.inr (Or.inl rfl)⟩
       | abort => exact ⟨rfl, Or.inr (Or.inr rfl)⟩
-    | gap g => exact (rfl : g.sealOutOfFuel "test::ext_helper" = g.sealOutOfFuel "test::ext_helper")
+    | gap g => exact (rfl : _ = _)
   · rintro a₁ a₂ ⟨rfl, ⟨y, rfl⟩ | rfl | rfl⟩
     · change GapEqErr (· = ·) (· = ·)
         (OutcomeWithGap.ok
@@ -2046,7 +2042,7 @@ theorem seqCallerRefactored_contextEquiv_any_pure
       cases e <;> exact fun h₀ => by cases h₀
     | gap g =>
       intro h₀
-      exact g.sealOutOfFuel_ne_outOfFuel "test::ext_helper" (OutcomeWithGap.gap.inj h₀)
+      exact GapTag.sealOutOfFuel_ne_outOfFuel "test::ext_helper" _ (OutcomeWithGap.gap.inj h₀)
   exact mirGapBehaviors_equiv_of_runs hne
     (seqCallerRefactored_gapEqErr_via_bind_congr f hU32 x)
 
@@ -2509,11 +2505,11 @@ theorem borrowBeforeCall_distinct_memory_contextEquiv
                 (borrowBeforeCallAtCall x).frame.locals
                 (locPlace 2) 1 .continue_
                 (.returned (.scalar ⟨y, 4⟩) (borrowBeforeCallReq x).memory))) ∨
-      (a.exec = .halted .panic ∧ b.exec = .halted .panic) ∨
-      (a.exec = .halted .abort ∧ b.exec = .halted .abort)
+      (a = .halted .panic ∧ b = .halted .panic) ∨
+      (a = .halted .abort ∧ b = .halted .abort)
   refine mirGapBehaviors_equiv_of_stutter_with (R := R) (fun _ => rfl) ?_ (Or.inl ⟨rfl, rfl⟩)
   intro a b hR
-  rcases hR with ⟨rfl, rfl⟩ | ⟨y, rfl, rfl⟩ | ⟨ha, hb⟩ | ⟨ha, hb⟩
+  rcases hR with ⟨rfl, rfl⟩ | ⟨y, rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
   · let t₁ : MirSiteState :=
       mirSiteOfExec seqCallerBody (.running (seqCallerAtCall seqCallerBody x))
     let t₂ : MirSiteState :=
@@ -2524,7 +2520,8 @@ theorem borrowBeforeCall_distinct_memory_contextEquiv
       .step rfl (.step rfl (.step rfl (.refl _)))
     refine ⟨1, 3, t₁, t₂, hr₁, hr₂, ?_⟩
     change StepNodeRelWith (mirGapHandle env) (mirGapHandle env)
-      R (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·) t₁.site t₂.site
+      R (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·)
+      (mirSiteOfState seqCallerBody t₁) (mirSiteOfState borrowBeforeCallBody t₂)
       (.vis (.inr (.inr (.call (extHelperReq x))))
         (fun ans => mirNextSiteState seqCallerBody t₁
           (resumeExternalCall (seqCallerAtCall seqCallerBody x)
@@ -2533,50 +2530,22 @@ theorem borrowBeforeCall_distinct_memory_contextEquiv
         (fun ans => mirNextSiteState borrowBeforeCallBody t₂
           (resumeExternalCall (borrowBeforeCallAtCall x)
             (borrowBeforeCallAtCall x).frame.locals (locPlace 2) 1 .continue_ ans)))
-    have hPureRel := MirCallEnv.ofPure_rel_of_same_target f
-      (req₁ := extHelperReq x) (req₂ := borrowBeforeCallReq x) rfl rfl
-    refine StepNodeRelWith.vis
-      (fun a₁ a₂ =>
-        ((∃ y, a₁ = .returned (.scalar ⟨y, 4⟩) (extHelperReq x).memory ∧
-               a₂ = .returned (.scalar ⟨y, 4⟩) (borrowBeforeCallReq x).memory) ∨
-         (a₁ = .panicked (extHelperReq x).memory ∧
-          a₂ = .panicked (borrowBeforeCallReq x).memory) ∨
-         (a₁ = .aborted ∧ a₂ = .aborted)))
-      ?_ ?_
-    · dsimp only [mirGapHandle, env, MirCallEnv.ofPure, extHelperReq, borrowBeforeCallReq]
-      cases hf : f "test::ext_helper" [.scalar ⟨x, 4⟩] with
-      | ok v =>
-        obtain ⟨y, rfl⟩ := hU32 x v hf
-        exact Or.inl ⟨y, rfl, rfl⟩
-      | fault e =>
-        cases e with
-        | ub => exact (rfl : ExecFault.ub = ExecFault.ub)
-        | panic => exact Or.inr (Or.inl ⟨rfl, rfl⟩)
-        | abort => exact Or.inr (Or.inr ⟨rfl, rfl⟩)
-      | gap g =>
-        have _ := hPureRel
-        exact (rfl : g.sealOutOfFuel "test::ext_helper" = g.sealOutOfFuel "test::ext_helper")
-    · rintro a₁ a₂ (⟨y, rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩)
-      · exact Or.inr (Or.inl ⟨y, rfl, rfl⟩)
-      · exact Or.inr (Or.inr (Or.inl ⟨rfl, rfl⟩))
-      · exact Or.inr (Or.inr (Or.inr ⟨rfl, rfl⟩))
+    refine StepNodeRelWith.vis _
+      (MirCallEnv.mirGapHandle_ofPure_rel_of_same_target f
+        (req₁ := extHelperReq x) (req₂ := borrowBeforeCallReq x) rfl rfl) ?_
+    rintro a₁ a₂ ho₁ _ (⟨v, rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩)
+    · obtain ⟨hf, _⟩ := MirCallEnv.mirGapHandle_ofPure_eq_ok_returned ho₁
+      obtain ⟨y, rfl⟩ := hU32 x v hf
+      exact Or.inr (Or.inl ⟨y, rfl, rfl⟩)
+    · exact Or.inr (Or.inr (Or.inl ⟨rfl, rfl⟩))
+    · exact Or.inr (Or.inr (Or.inr ⟨rfl, rfl⟩))
   · refine ⟨1, 1, _, _, .step rfl (.refl _), .step rfl (.refl _), ?_⟩
     refine StepNodeRelWith.normal ?_
     change Value.scalar ⟨wrapScalarBits (y + y) (scalarModulus 4), 4⟩ =
       Value.scalar ⟨wrapScalarBits (y * 2) (scalarModulus 4), 4⟩
     rw [Nat.mul_two]
-  · refine ⟨0, 0, a, b, .refl _, .refl _, ?_⟩
-    rcases a with ⟨exec₁, site₁⟩
-    rcases b with ⟨exec₂, site₂⟩
-    dsimp only at ha hb
-    subst ha hb
-    exact StepNodeRelWith.panic
-  · refine ⟨0, 0, a, b, .refl _, .refl _, ?_⟩
-    rcases a with ⟨exec₁, site₁⟩
-    rcases b with ⟨exec₂, site₂⟩
-    dsimp only at ha hb
-    subst ha hb
-    exact StepNodeRelWith.abort
+  · exact ⟨0, 0, .halted .panic, .halted .panic, .refl _, .refl _, StepNodeRelWith.panic⟩
+  · exact ⟨0, 0, .halted .abort, .halted .abort, .refl _, .refl _, StepNodeRelWith.abort⟩
 
 /--
 Direct `valSemantics` `ExactPass` and `valLanguage` / `outcomeLanguage` contract
@@ -2639,6 +2608,279 @@ theorem callerRefactored_valExactPass_and_spec_transfer :
     | normal r => cases OutcomeWithGap.ok.inj heq; rfl
     | panic => cases heq
     | abort => cases heq
+
+/-! ### Part 5F: Handler-Boundary Sealing, Inline `return_` Destination Attribution, and Direct Trusted `MirLang` / `mirTree` `ExactPass` -/
+
+/--
+Raw unsealed `MirCallEnv` that returns the outer evaluator's `.gap .outOfFuel`
+sentinel directly, bypassing `MirCallEnv.ofPure` / `MirCallEnv.seal`.
+-/
+def rawOOFEnv : MirCallEnv :=
+  fun _ => .gap .outOfFuel
+
+/--
+Handler-boundary sealing canary: even for a raw unsealed `MirCallEnv` that
+fails `MirCallEnv.IsSealed`, `mirGapHandle` seals `.gap .outOfFuel` into
+`.gap (.budget req.defPath)` unconditionally, so `mirGapBehaviors` never
+collapses to `∅` (`¬ NeverGap`, and `¬ OutcomeSetEquiv` against `spinLoopBody`).
+-/
+theorem seqCaller_rawOOFEnv_sealed_and_not_spinLoop (x : Nat) :
+    ¬ rawOOFEnv.IsSealed ∧
+      runMirWithGap rawOOFEnv [] seqCallerBody 3 [.scalar ⟨x, 4⟩] =
+        .gap (.budget "test::ext_helper") ∧
+      mirGapBehaviors rawOOFEnv [] seqCallerBody [.scalar ⟨x, 4⟩]
+        (.gap (.budget "test::ext_helper")) ∧
+      ¬ NeverGap (mirGapBehaviors rawOOFEnv [] seqCallerBody [.scalar ⟨x, 4⟩]) ∧
+      ¬ OutcomeSetEquiv (GapEqErr (· = ·) (· = ·))
+        (mirGapBehaviors rawOOFEnv [] seqCallerBody [.scalar ⟨x, 4⟩])
+        (mirGapBehaviors MirCallEnv.unresolved [] spinLoopBody []) := by
+  have hUnsealed : ¬ rawOOFEnv.IsSealed := fun h => h (extHelperReq x) rfl
+  have hrun : runMirWithGap rawOOFEnv [] seqCallerBody 3 [.scalar ⟨x, 4⟩] =
+      .gap (.budget "test::ext_helper") := rfl
+  have hmem : mirGapBehaviors rawOOFEnv [] seqCallerBody [.scalar ⟨x, 4⟩]
+      (.gap (.budget "test::ext_helper")) :=
+    (mirGapBehaviors_iff_of_run
+      (ne_outOfFuel_of_eq hrun (fun h₀ => by cases h₀)) _).mpr hrun.symm
+  refine ⟨hUnsealed, hrun, hmem, fun hng => hng hmem, fun heq => ?_⟩
+  obtain ⟨o₂, ⟨hne₂, fuel, hrun₂⟩, _⟩ := heq.forward hmem
+  exact hne₂ (hrun₂.symm.trans (spinLoop_run_outOfFuel fuel))
+
+/-- Modeled-phase inline identity helper: `fn id_helper(x: u32) -> u32 { x }`. -/
+def idHelperBody : CapturedMir :=
+  mkMirBody "test::id_helper" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy]
+    [ { statements := [mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 1))))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/--
+Caller invoking inline `idHelperBody` with an unmodeled destination projection
+`[.field 0 u32MirTy, .deref]`: `idHelperBody` executes cleanly up to
+`TerminatorKind.return_`, where `writeReturnDestination` fails on the caller's
+destination projection.
+-/
+def callerWithBadReturnDest (name : DefPath) : CapturedMir :=
+  mkMirBody name 1
+    [mkDecl .mut u32MirTy, mkDecl .mut u32MirTy]
+    [ { statements := []
+        terminator := mkTerm
+          (.call (fnItemOp "test::id_helper") [.copy (locPlace 1)]
+            { local_ := 1, projection := [.field 0 u32MirTy, .deref] }
+            (some 1) .continue_)
+        isCleanup := false },
+      returnBlock ]
+
+def callerBadDestA : CapturedMir :=
+  callerWithBadReturnDest "test::caller_bad_dest_a"
+
+def callerBadDestB : CapturedMir :=
+  callerWithBadReturnDest "test::caller_bad_dest_b"
+
+def midBadDestHelperBody : CapturedMir :=
+  callerWithBadReturnDest "test::mid_bad_dest_helper"
+
+def returnDestLinkedHelpers : List CapturedMir :=
+  [midBadDestHelperBody, idHelperBody]
+
+def outerBadDestBranchingBody : CapturedMir :=
+  mkMirBody "test::outer_bad_dest_branching" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy]
+    [ flagSwitchBlock,
+      { statements :=
+          [mkStmt (.assign (locPlace 0)
+            (.binaryOp .add (.copy (locPlace 2)) (.copy (locPlace 2))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      helperCallBlock "test::mid_bad_dest_helper",
+      returnBlock ]
+
+def outerBadDestRefactoredBody : CapturedMir :=
+  mkMirBody "test::outer_bad_dest_refactored" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy,
+     mkDecl .mut u32MirTy]
+    [ flagSwitchBlock,
+      { statements :=
+          [mkStmt (.storageLive 3),
+           mkStmt (.assign (locPlace 3)
+             (.binaryOp .mul (.copy (locPlace 2)) (u32ConstOp 2))),
+           mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 3))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      helperCallBlock "test::mid_bad_dest_helper",
+      returnBlock ]
+
+/--
+Inline-callee `TerminatorKind.return_` destination-write attribution canary:
+1. When `callerBadDestA` and `callerBadDestB` call modeled `idHelperBody` with
+   an unmodeled destination projection, `mirRunningFailSite` attributes the gap
+   to `"test::caller_bad_dest_a"` vs `"test::caller_bad_dest_b"` (the frame
+   owning `caller.destination`), NEVER blaming `"test::id_helper"`;
+2. Consequently `callerBadDestA` and `callerBadDestB` are rejected
+   (`¬ ContextEquiv`); and
+3. When two refactored outer callers share `midBadDestHelperBody` (which owns
+   the unmodeled destination in its call to `idHelperBody`), both stamp
+   `"test::mid_bad_dest_helper"` and satisfy `ContextEquiv` across all `(flag, x)`.
+-/
+theorem inlineCallee_returnDest_gap_attribution_and_contextEquiv :
+    runMirWithGap MirCallEnv.unresolved [idHelperBody]
+        callerBadDestA 4 [.scalar ⟨7, 4⟩] =
+        .gap (.unsupported "test::caller_bad_dest_a") ∧
+      runMirWithGap MirCallEnv.unresolved [idHelperBody]
+          callerBadDestB 4 [.scalar ⟨7, 4⟩] =
+        .gap (.unsupported "test::caller_bad_dest_b") ∧
+      ¬ ContextEquiv (· = ·) (· = ·)
+        (fun x : Nat =>
+          mirGapBehaviors MirCallEnv.unresolved [idHelperBody]
+            callerBadDestA [.scalar ⟨x, 4⟩])
+        (fun x : Nat =>
+          mirGapBehaviors MirCallEnv.unresolved [idHelperBody]
+            callerBadDestB [.scalar ⟨x, 4⟩]) ∧
+      runMirWithGap MirCallEnv.unresolved returnDestLinkedHelpers
+          outerBadDestBranchingBody 6 (callerArgs (false, 7)) =
+        .gap (.unsupported "test::mid_bad_dest_helper") ∧
+      ContextEquiv (· = ·) (· = ·)
+        (fun q : Bool × Nat =>
+          mirGapBehaviors MirCallEnv.unresolved returnDestLinkedHelpers
+            outerBadDestBranchingBody (callerArgs q))
+        (fun q : Bool × Nat =>
+          mirGapBehaviors MirCallEnv.unresolved returnDestLinkedHelpers
+            outerBadDestRefactoredBody (callerArgs q)) := by
+  refine ⟨rfl, rfl, ?_, rfl, ?_⟩
+  · intro h
+    have h₁ : runMirWithGap MirCallEnv.unresolved [idHelperBody]
+        callerBadDestA 4 [.scalar ⟨0, 4⟩] =
+        .gap (.unsupported "test::caller_bad_dest_a") := rfl
+    have h₂ : runMirWithGap MirCallEnv.unresolved [idHelperBody]
+        callerBadDestB 4 [.scalar ⟨0, 4⟩] =
+        .gap (.unsupported "test::caller_bad_dest_b") := rfl
+    have hEq := (mirGapBehaviors_equiv_iff_of_runs
+      (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀))
+      (ne_outOfFuel_of_eq h₂ (fun h₀ => by cases h₀))).mp (h 0)
+    rw [h₁, h₂] at hEq
+    exact absurd (GapTag.unsupported.inj hEq) (by decide)
+  · intro ⟨flag, x⟩
+    cases flag with
+    | true =>
+      have h₁ : runMirWithGap MirCallEnv.unresolved returnDestLinkedHelpers
+          outerBadDestBranchingBody 3 (callerArgs (true, x)) =
+          .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩,
+            (initMachineStateWithCallees outerBadDestBranchingBody []
+              returnDestLinkedHelpers).memory) := rfl
+      have h₂ : runMirWithGap MirCallEnv.unresolved returnDestLinkedHelpers
+          outerBadDestRefactoredBody 5 (callerArgs (true, x)) =
+          .ok (.scalar ⟨wrapScalarBits (x * 2) (scalarModulus 4), 4⟩,
+            (initMachineStateWithCallees outerBadDestBranchingBody []
+              returnDestLinkedHelpers).memory) := rfl
+      refine mirGapBehaviors_equiv_of_runs (fuel₂ := 5)
+        (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) ?_
+      rw [h₁, h₂, Nat.mul_two]
+      exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+    | false =>
+      have h₁ : runMirWithGap MirCallEnv.unresolved returnDestLinkedHelpers
+          outerBadDestBranchingBody 6 (callerArgs (false, x)) =
+          .gap (.unsupported "test::mid_bad_dest_helper") := rfl
+      have h₂ : runMirWithGap MirCallEnv.unresolved returnDestLinkedHelpers
+          outerBadDestRefactoredBody 6 (callerArgs (false, x)) =
+          .gap (.unsupported "test::mid_bad_dest_helper") := rfl
+      refine mirGapBehaviors_equiv_of_runs (fuel₂ := 6)
+        (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) ?_
+      rw [h₁, h₂]
+      exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+
+/--
+Direct trusted `MirLang` `ExactPass` and closed-world `MirNoUBTree ↔ Defined`
+canary: `spinLoopBody` and `spinTwoBlockBody` satisfy full-domain
+`ContextEquiv` across every `args : List Value`, inducing an unconditional
+`ExactPass` directly on `mirLangTraceErasedSem` (`MirLang`).
+-/
+theorem spinLoop_mirLang_exactPass :
+    ExactPass mirLangTraceErasedSem mirLangTraceErasedSem id id
+        spinLoopBody spinTwoBlockBody ∧
+      ∀ args : List Value,
+        OutcomeSet.Defined ExecFault.isUB
+            (mirGapBehaviors MirCallEnv.unresolved [] spinLoopBody args) ↔
+          MirNoUBTree (mirCallTree spinLoopBody args) := by
+  have hInitSpin : ∀ args : List Value,
+      initMachineStateWithCallees spinLoopBody args [] =
+        initMachineStateWithCallees spinLoopBody [] [] := by
+    intro args; cases args <;> rfl
+  have hInitTwo : ∀ args : List Value,
+      initMachineStateWithCallees spinTwoBlockBody args [] =
+        initMachineStateWithCallees spinTwoBlockBody [] [] := by
+    intro args; cases args <;> rfl
+  have hClosed : ∀ (args : List Value) (site : DefPath),
+      ¬ mirGapBehaviors MirCallEnv.unresolved [] spinLoopBody args (.gap (.unresolved site)) := by
+    intro args site ⟨hne, fuel, hrun⟩
+    have hrun' : runMirWithGap MirCallEnv.unresolved [] spinLoopBody fuel args = .gap .outOfFuel := by
+      unfold runMirWithGap
+      rw [hInitSpin args]
+      exact spinLoop_run_outOfFuel fuel
+    exact hne (hrun.symm.trans hrun')
+  have hEq : ContextEquiv (· = ·) (· = ·)
+      (mirGapBehaviors MirCallEnv.unresolved [] spinLoopBody)
+      (mirGapBehaviors MirCallEnv.unresolved [] spinTwoBlockBody) := by
+    intro args
+    unfold mirGapBehaviors
+    rw [hInitSpin args, hInitTwo args]
+    let s₁ : MirSiteState :=
+      mirSiteOfExec spinLoopBody (.running (initMachineStateWithCallees spinLoopBody [] []))
+    let init₂ := initMachineStateWithCallees spinTwoBlockBody [] []
+    let s₂₀ : MirSiteState := mirSiteOfExec spinTwoBlockBody (.running init₂)
+    let s₂₁ : MirSiteState :=
+      mirSiteOfExec spinTwoBlockBody
+        (.running { init₂ with frame := { init₂.frame with blockIdx := 1 } })
+    let R : MirSiteState → MirSiteState → Prop :=
+      fun a b => a = s₁ ∧ (b = s₂₀ ∨ b = s₂₁)
+    refine mirGapBehaviors_equiv_of_stutter_with (R := R) (fun _ => rfl) ?_ ⟨rfl, Or.inl rfl⟩
+    rintro a b ⟨rfl, rfl | rfl⟩
+    · exact ⟨0, 0, s₁, s₂₀, .refl _, .refl _, StepNodeRelWith.tau ⟨rfl, Or.inr rfl⟩⟩
+    · exact ⟨0, 0, s₁, s₂₁, .refl _, .refl _, StepNodeRelWith.tau ⟨rfl, Or.inl rfl⟩⟩
+  exact ⟨mirContextEquiv_mirLang_exactPass hEq hClosed,
+    fun args => mirGapBehaviors_defined_iff_mirNoUBTree (hClosed args)⟩
+
+/--
+Direct trusted `mirTree` `ExactPass` canary on gapping callers
+(`callerBranchingBody → callerRefactoredBody`): using
+`mirContextEquivOn_mirTree_exactPass` and `mirContextEquivOn_mirTree_toPartial_eq`,
+the two trusted `mirTree`s form an `ExactPass` across BOTH the supported branch
+(`flag = true`, defined returns) AND the unmodeled branch (`flag = false`, where
+both `mirTree`s fail `MirNoUBTree` via `.unsupported "test::unmodeled_helper"`).
+-/
+theorem callerRefactored_mirTree_exactPass_with_gaps :
+    let pre : List Value → Prop := fun args => ∃ q : Bool × Nat, args = callerArgs q
+    ExactPass
+        (fun b (q : { args : List Value // pre args }) =>
+          mirTreeTraceErasedSem linkedHelpers b q.1)
+        (fun b (q : { args : List Value // pre args }) =>
+          mirTreeTraceErasedSem linkedHelpers b q.1)
+        id id callerBranchingBody callerRefactoredBody ∧
+      ¬ MirNoUBTree (mirTree callerBranchingBody
+          (initMachineStateWithCallees callerBranchingBody (callerArgs (false, 7)) linkedHelpers)) ∧
+      mirTreeTraceErasedSem linkedHelpers callerBranchingBody (callerArgs (false, 7)) =
+        mirTreeTraceErasedSem linkedHelpers callerRefactoredBody (callerArgs (false, 7)) := by
+  dsimp only
+  let pre : List Value → Prop := fun args => ∃ q : Bool × Nat, args = callerArgs q
+  have hEqOn : ContextEquivOn pre (· = ·) (· = ·)
+      (mirGapBehaviors MirCallEnv.unresolved linkedHelpers callerBranchingBody)
+      (mirGapBehaviors MirCallEnv.unresolved linkedHelpers callerRefactoredBody) := by
+    rintro _ ⟨q, rfl⟩
+    exact callerRefactored_contextEquiv q
+  have hClosed : ∀ args, pre args → ∀ site,
+      ¬ mirGapBehaviors MirCallEnv.unresolved linkedHelpers callerBranchingBody args
+          (.gap (.unresolved site)) := by
+    rintro _ ⟨⟨flag, x⟩, rfl⟩ site hm
+    have heq : OutcomeWithGap.gap (GapTag.unresolved site) =
+        callerRun callerBranchingBody 3 (flag, x) :=
+      (mirGapBehaviors_iff_of_run
+        (callerBranching_run_ne_outOfFuel (flag, x)) _).mp hm
+    cases flag with
+    | true => rw [callerBranching_run_true x] at heq; cases heq
+    | false => rw [callerBranching_run_false x] at heq; cases heq
+  exact ⟨mirContextEquivOn_mirTree_exactPass hEqOn hClosed,
+    not_mirNoUBTree_of_run_undefined (callerBranching_run_false 7)
+      (Or.inr (Or.inl ⟨"test::unmodeled_helper", rfl⟩)),
+    mirContextEquivOn_mirTree_toPartial_eq hEqOn ⟨(false, 7), rfl⟩
+      (hClosed _ ⟨(false, 7), rfl⟩)⟩
 
 end GapPreservingCanaries
 
