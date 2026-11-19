@@ -111,14 +111,16 @@ represent: IEEE-754 bit patterns carried by `u32` / `i32` / `[u8; 4]`
    `f64::from_bits(x) as i64`, narrowing `(f64::from_bits(x) as f32).to_bits()`, and
    exact `(x as f64).to_bits()` (the carrier decodes to exactly `x`), and the
    reverse `f16` / `f128` transmute directions complete the carrier matrix.
-9. **`Transmute` & `[u8; 4]` machine carriers, `TreeBorrowsMemory` + `MachTB.wfLive`
-   preservation, and unsigned / rounding float-cast bridges (§15).** Proves `BasicMemory`
-   (`Interp.steps`) and `TreeBorrowsMemory` (`Interp.stepsTB` + `MachTB.wfLive`) executions
-   of `fcCarrierBody` (`u32 → i32`), `fcCarrier64Body` (`u64 → i64`), and
-   `fcU32ToBytes4CarrierBody` (`u32 → [u8; 4]`), lifts all five signed/widening/narrowing
-   pipelines to unified symbolic `BasicMemory` + `TreeBorrowsMemory` bridges, and proves
-   symbolic machine-level bridges for unsigned saturating `f32::from_bits(x) as u32` and
-   non-exact IEEE-754 round-ties-to-even `(x: u64) as f64`.
+9. **`Transmute` & `[u8; 4]`/`[u8; 8]` machine carriers, `TreeBorrowsMemory` + `MachTB.wfLive`
+   preservation, carrier operator/function factorization, and unsigned / narrow / rounding
+   float-cast bridges (§§15–17).** Proves `BasicMemory` (`Interp.steps`) and `TreeBorrowsMemory`
+   (`Interp.stepsTB` + `MachTB.wfLive`) executions of `fcCarrierBody` (`u32 → i32`),
+   `fcCarrier64Body` (`u64 → i64`), `fcU32ToBytes4CarrierBody` (`u32 → [u8; 4]`), and
+   `fcU64ToBytes8CarrierBody` (`u64 → [u8; 8]`), factors the whole `Gen.Function` translations of
+   32-bit and 64-bit `Transmute` vs. `IntToInt` carriers (`fc_carrier_fn_factorization`) alongside
+   polymorphic operator agreement (`fc_mrM_transmute_eq_intToInt`), lifts all five
+   signed/widening/narrowing pipelines to unified symbolic `BM` + `TBM` bridges, and proves
+   symbolic bridges for unsigned `f32 → u32`, narrow `f32 → u8`, and rounding `u64 → f64`.
 
 Every public theorem is guarded by `#print axioms` at the end of the file.
 -/
@@ -4144,6 +4146,156 @@ theorem fc_carrier_translations :
         (.UnOp (.Cast (.IntToInt fcI32It)) (.Load (.Local (localName 1))))) :=
   ⟨rfl, rfl⟩
 
+/-! ## 17. Whole-function 32/64-bit carrier factorization, `[u8; 8]` machine carrier, and narrow
+`f32 → u8` bridge (`[adv shard-b B3]`) -/
+
+/-- Parameterized 32-bit `u32 → i32` MiniRust function over an arbitrary `op : Gen.CastOp`. -/
+def fcCarrierFnWithOp (op : Gen.CastOp) : Gen.Function where
+  locals := ⟨[(localName 0, .Int fcI32It), (localName 1, .Int fcU32It)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[.Assign (.Local (localName 0)) (.UnOp (.Cast op) (.Load (.Local (localName 1))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+/-- Parameterized 64-bit `u64 → i64` MiniRust function over an arbitrary `op : Gen.CastOp`. -/
+def fcCarrier64FnWithOp (op : Gen.CastOp) : Gen.Function where
+  locals := ⟨[(localName 0, .Int fcI64It), (localName 1, .Int fcU64It)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[.Assign (.Local (localName 0)) (.UnOp (.Cast op) (.Load (.Local (localName 1))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+/-- **Whole-function `Gen.Function` factorization of both 32-bit and 64-bit carriers**:
+`translateFn` maps `fcCarrierBody` vs. `fcCarrierCastBody` (`u32 → i32`) and `fcCarrier64Body` vs.
+`fcCarrierCast64Body` (`u64 → i64`) to the exact same `Gen.Function` records (`locals`, `args`,
+`ret`, `calling_convention`, `start`, `implicit_writes`, `bb1`, and `Return` terminator), differing
+solely at the single `CastOp` parameter (`CastOp.Transmute` vs. `CastOp.IntToInt`) where
+`fc_mrM_transmute_eq_intToInt` proves exact equality over every memory model `M`. -/
+theorem fc_carrier_fn_factorization :
+    translateFn fcCarrierBody = some (fcCarrierFnWithOp (.Transmute (.Int fcI32It))) ∧
+    translateFn fcCarrierCastBody = some (fcCarrierFnWithOp (.IntToInt fcI32It)) ∧
+    translateFn fcCarrier64Body = some (fcCarrier64FnWithOp (.Transmute (.Int fcI64It))) ∧
+    translateFn fcCarrierCast64Body = some (fcCarrier64FnWithOp (.IntToInt fcI64It)) :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- `fn u64_to_bytes8(x: u64) -> [u8; 8] { transmute(x) }`: the 8-byte `[u8; 8]` (`f64::to_le_bytes`)
+MiniRust-representable bit carrier. -/
+def fcU64ToBytes8CarrierBody : CapturedMir :=
+  fcBody "float_cast::carrier_u64_bytes8" [fcDecl fcBytes8Ty, fcDecl fcU64Ty]
+    [.assign (local_ 0) (.cast .transmute (.copy (local_ 1)) fcBytes8Ty)]
+
+def fcU64ToBytes8CarrierFn : Gen.Function where
+  locals := ⟨[(localName 0, .Array (.Int fcU8It) 8), (localName 1, .Int fcU64It)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.Transmute (.Array (.Int fcU8It) 8))) (.Load (.Local (localName 1))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem fc_translateFn_u64ToBytes8Carrier :
+    translateFn fcU64ToBytes8CarrierBody = some fcU64ToBytes8CarrierFn := rfl
+
+/-- **Symbolic `BM` + `TBM` `transmuteM` + concrete 8-byte `BM`/`TBM` + `MachTB.wfLive` execution**
+of the `[u8; 8]` byte-array carrier `fcU64ToBytes8CarrierBody` (`u64 → [u8; 8]`, `to_le_bytes`)
+under `fcCtx8`. -/
+theorem fc_u64_to_bytes8_carrier_steps_and_wfLive :
+    (∀ bits < 2 ^ 64,
+      transmuteM (M := BM) (.Int (intFromBits bits fcU64It))
+        (.Int fcU64It) (.Array (.Int fcU8It) 8) = .ok (.Tuple (fcLeByteValsMRM bits 8)) ∧
+      transmuteM (M := TBM) (.Int (intFromBits bits fcU64It))
+        (.Int fcU64It) (.Array (.Int fcU8It) 8) = .ok (.Tuple (fcLeByteValsMRM bits 8))) ∧
+    fcRetAfter8 fcU64ToBytes8CarrierBody [.scalar ⟨0xBFF8000000000000, 8⟩] 3 =
+      some (some { fcRetAlloc8 with data := scalarBytes fcU64It 0xBFF8000000000000 }, [1]) ∧
+    fcRetAfterTB8 fcU64ToBytes8CarrierBody [.scalar ⟨0, 8⟩] 3 = tbRetU64 0 ∧
+    fcRetAfterTB8 fcU64ToBytes8CarrierBody [.scalar ⟨0xBFF8000000000000, 8⟩] 3 =
+      tbRetU64 0xBFF8000000000000 ∧
+    fcRetAfterTB8 fcU64ToBytes8CarrierBody [.scalar ⟨0xFFFFFFFFFFFFFFFF, 8⟩] 3 =
+      tbRetU64 0xFFFFFFFFFFFFFFFF ∧
+    (∃ m0 m',
+      fcStartMachineTB8 fcU64ToBytes8CarrierBody [.scalar ⟨0xBFF8000000000000, 8⟩] = some m0 ∧
+      Interp.stepsTB 3 m0 = .ok m' ∧
+      MachTB.wfLive m') := by
+  refine ⟨fun bits h => ⟨(fc_mrM_transmute_int_bytes8 (M := BM) .Unsigned bits h none).1,
+    (fc_mrM_transmute_int_bytes8 (M := TBM) .Unsigned bits h none).1⟩,
+    by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel, ?_⟩
+  simp only [fcStartMachineTB8, fcStartMachine8, fc_translateFn_u64ToBytes8Carrier, Option.map]
+  exact fc_wfLive_of_stepsTB_isOk
+    (machineWithCtx fcCtx8 fcU64ToBytes8CarrierBody fcU64ToBytes8CarrierFn
+      (initMachineState fcU64ToBytes8CarrierBody [.scalar ⟨0xBFF8000000000000, 8⟩]).frame.locals
+      fcU64ToBytes8CarrierFn.start)
+    3 (by decide +kernel)
+
+theorem fc_goodSize_1 : GoodSize 1 := by unfold GoodSize; omega
+
+/-- MiniRust `i8`. -/
+def fcI8It : Gen.IntType := ⟨.Signed, ⟨1⟩⟩
+
+/-- `fn from_bits_as_u8(x: u32) -> u8 { f32::from_bits(x) as u8 }`: narrow 1-byte saturating
+`FloatToInt` (clamping `< 0` / `-0.0` / `NaN` to `0`, and `> 255` to `255`). -/
+def fcFromBitsAsU8Body : CapturedMir :=
+  fcBody "float_cast::from_bits_as_u8" [fcDecl fcU8Ty, fcDecl fcU32Ty, fcDecl fcF32Ty]
+    [.storageLive 2,
+     .assign (local_ 2) (.cast .transmute (.copy (local_ 1)) fcF32Ty),
+     .assign (local_ 0) (.cast .floatToInt (.copy (local_ 2)) fcU8Ty),
+     .storageDead 2]
+
+theorem fc_run_from_bits_as_u8_raw (bits : Nat) : ∃ mem, runA fcFromBitsAsU8Body 10
+    (initMachineState fcFromBitsAsU8Body [.scalar ⟨bits, 4⟩]) =
+      some ([], .normal (.scalar (evalFloatToIntSaturating .binary32 (fcLeRound 4 bits)
+        (.unsigned .u8) .bits64), mem)) := ⟨_, rfl⟩
+
+/-- **Symbolic narrow 1-byte `f32::from_bits(x) as u8` bridge**: Anneal's multi-step run returns,
+free of UB, the 1-byte saturated carrier `sc` in `[0, 255]`, MiniRust's `Type.encode`/`Type.decode`
+agree with Anneal's 1-byte encoding, `evalCastOpM` agrees between `Transmute(i8)` and `IntToInt(i8)`
+over both `BasicMemory` and `TreeBorrowsMemory`, and narrow saturation clamps `256.0f32 ↦ 255`,
+`-1.0f32 ↦ 0`, and `NaN ↦ 0`. -/
+theorem fc_sym_e2e_from_bits_as_u8 :
+    (∀ bits < 2 ^ 32,
+      let sc := evalFloatToIntSaturating .binary32 bits (.unsigned .u8) .bits64
+      (∃ mem, ReachesRet (mirCallTree fcFromBitsAsU8Body [.scalar ⟨bits, 4⟩]) []
+        (.normal (.scalar sc, mem))) ∧
+      MirNoUBTree (mirCallTree fcFromBitsAsU8Body [.scalar ⟨bits, 4⟩]) ∧
+      Type.decode (.Int fcU8It) ((encodeLittleEndianBytes sc.bits 1 none).map fcByteToMR) =
+        .ok (some (.Int (floatToIntValue (decodeBits .binary32 bits) 0 255))) ∧
+      evalCastOpM (M := BM) (.Transmute (.Int fcI8It))
+          (.Int (intFromBits sc.bits fcU8It), .Int fcU8It) none =
+        evalCastOpM (M := BM) (.IntToInt fcI8It)
+          (.Int (intFromBits sc.bits fcU8It), .Int fcU8It) none ∧
+      evalCastOpM (M := TBM) (.Transmute (.Int fcI8It))
+          (.Int (intFromBits sc.bits fcU8It), .Int fcU8It) none =
+        evalCastOpM (M := TBM) (.IntToInt fcI8It)
+          (.Int (intFromBits sc.bits fcU8It), .Int fcU8It) none) ∧
+    (evalFloatToIntSaturating .binary32 0x43800000 (.unsigned .u8) .bits64).bits = 255 ∧
+    (evalFloatToIntSaturating .binary32 0xBF800000 (.unsigned .u8) .bits64).bits = 0 ∧
+    (evalFloatToIntSaturating .binary32 0x7FC00001 (.unsigned .u8) .bits64).bits = 0 := by
+  refine ⟨fun bits h32 => ?_, by decide +kernel, by decide +kernel, by decide +kernel⟩
+  obtain ⟨mem, hrun⟩ := fc_run_from_bits_as_u8_raw bits
+  rw [fcLeRound_eq4 bits h32] at hrun
+  obtain ⟨_, hlt, _, _, hdec⟩ :=
+    fc_bridge_floatToInt .binary32 bits (.unsigned .u8) 1 rfl fc_goodSize_1
+  obtain ⟨hbm1, hbm2⟩ :=
+    fc_mrM_transmute_eq_intToInt (M := BM) .Unsigned .Signed 1 _ fc_goodSize_1 hlt none
+  obtain ⟨htb1, htb2⟩ :=
+    fc_mrM_transmute_eq_intToInt (M := TBM) .Unsigned .Signed 1 _ fc_goodSize_1 hlt none
+  exact ⟨⟨mem, runA_sound _ _ _ _ _ hrun⟩, runA_noUB _ _ _ _ _ hrun, hdec,
+    hbm1.trans hbm2.symm, htb1.trans htb2.symm⟩
+
 /-! ## Axiom guards
 
 Every public theorem of this module depends at most on `propext`, `Classical.choice`, and
@@ -5557,6 +5709,42 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrier_translations' depends 
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrier_translations
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrier_fn_factorization' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrier_fn_factorization
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_translateFn_u64ToBytes8Carrier' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_translateFn_u64ToBytes8Carrier
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_u64_to_bytes8_carrier_steps_and_wfLive' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_u64_to_bytes8_carrier_steps_and_wfLive
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_goodSize_1' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_goodSize_1
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_from_bits_as_u8_raw' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_from_bits_as_u8_raw
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_from_bits_as_u8' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_from_bits_as_u8
 
 end AxiomGuards
 
