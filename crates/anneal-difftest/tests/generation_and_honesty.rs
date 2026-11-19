@@ -3858,3 +3858,194 @@ fn ep2_b4_lockstep_parity_on_shadowed_aliases_mut_ret_helpers_match_mut_enums_an
         ]
     );
 }
+
+#[test]
+fn ep2_a4_lockstep_parity_on_direct_mut_param_ergonomics_single_eval_ref_mut_and_by_val_old_refs() {
+    use anneal_difftest::{
+        EnumVariantLayout, SpecContractOracleProbe, SpecExecPhase, SpecExternalCallee,
+        SpecParamBinding, SpecPostconditionVerdict, SpecViolationKind,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let usize_layout = LayoutSpec::Scalar(ScalarLayout::unsigned(8));
+    let arr_layout = LayoutSpec::Array {
+        elem: Box::new(u32_layout.clone()),
+        elem_stride: 4,
+        len: 2,
+    };
+    let delta_layout = LayoutSpec::Enum {
+        name: "DirectDelta".to_string(),
+        total_size: 8,
+        tag_offset: 0,
+        tag_size: 1,
+        variants: vec![
+            EnumVariantLayout {
+                name: "Idle".to_string(),
+                discriminant: 0,
+                payload_offset: 4,
+                payload: None,
+            },
+            EnumVariantLayout {
+                name: "Step".to_string(),
+                discriminant: 1,
+                payload_offset: 4,
+                payload: Some(Box::new(u32_layout.clone())),
+            },
+        ],
+    };
+    let pair_layout = LayoutSpec::Struct {
+        name: "ValPair".to_string(),
+        total_size: 8,
+        fields: vec![
+            FieldLayout {
+                name: "a".to_string(),
+                offset: 0,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "b".to_string(),
+                offset: 4,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises all `ep2-A4` convergence fixes in lockstep with `rustc --edition=2024 -D warnings`:
+    // 1. Direct `&mut` parameter ergonomics WITHOUT `&mut *` (`match act`, `for slot in arr` on a
+    //    dedicated `lanes: &mut [u32; 2]`, and `let moved_arr = arr; moved_arr[0] += 3;`),
+    // 2. Single-evaluation `let ref mut tmp_ext = ext_once();` against a 1-element `EnvSchedule`
+    //    queue (no default!) so double evaluation would panic with `PassThrough`,
+    // 3. Immediate OOB index trap on `let ref mut picked = arr[idx];`,
+    // 4. By-value parameter scratch mutability in `requires[i]` / `ensures[i]`, reference-returning
+    //    `old(&vp.a) == &vp.a` (zero `E0515`), and mutating `old({ vp.a += 7u32; vp.a })`.
+    let probe = SpecContractOracleProbe::new(
+        "ep2_a4_direct_mut_and_by_val_old_parity",
+        vec![
+            SpecParamBinding::mut_ref("arr", "[u32; 2]", arr_layout.clone()),
+            SpecParamBinding::mut_ref("lanes", "[u32; 2]", arr_layout),
+            SpecParamBinding::mut_ref("act", "DirectDelta", delta_layout),
+            SpecParamBinding::by_value("vp", "ValPair", pair_layout),
+            SpecParamBinding::by_value("idx", "usize", usize_layout),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "let ref mut tmp_ext: u32 = ext_once();\n\
+         *tmp_ext += 5u32;\n\
+         let ref mut picked_elem: u32 = arr[idx];\n\
+         *picked_elem += 1u32;\n\
+         for slot in lanes {\n    \
+             *slot += 2u32;\n\
+         }\n\
+         match act {\n    \
+             DirectDelta::Step(dx) => { *dx += *tmp_ext; }\n    \
+             DirectDelta::Idle => {}\n\
+         }\n\
+         let moved_arr = arr;\n\
+         moved_arr[0] += 3u32;\n\
+         vp.b += 4u32;\n\
+         moved_arr[0] + moved_arr[1] + vp.a + vp.b",
+    )
+    .with_type_defs(
+        "#[repr(C, u8)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub enum DirectDelta { Idle = 0, Step(u32) = 1 }\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct ValPair { pub a: u32, pub b: u32 }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_once",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout,
+    ))
+    .with_requires(
+        "by_val_mut_scratch_req",
+        "{ vp.a += 1u32; vp.a <= 50u32 }",
+    )
+    .with_ensures(
+        "by_val_old_ref_and_mut_old",
+        "old(&vp.a) == &vp.a \
+         && old({ vp.a += 7u32; vp.a }) == old(vp.a) + 7u32 \
+         && { vp.b += 9u32; vp.b == old(vp.b) + 9u32 }",
+    )
+    .with_ensures(
+        "direct_mut_params_preserved",
+        "vp.a != 9u32 \
+         && lanes[0] == old(lanes[0]) + 2u32 \
+         && lanes[1] == old(lanes[1]) + 2u32 \
+         && match *act {\n    \
+             DirectDelta::Step(v) => v == 18u32,\n    \
+             DirectDelta::Idle => true,\n\
+         }",
+    );
+
+    let make_trial = |vpa: u32, idx: u64| -> Vec<u8> {
+        let mut b = Vec::with_capacity(40);
+        b.extend_from_slice(&10u32.to_le_bytes()); // arr[0] = 10
+        b.extend_from_slice(&20u32.to_le_bytes()); // arr[1] = 20
+        b.extend_from_slice(&3u32.to_le_bytes()); // lanes[0] = 3
+        b.extend_from_slice(&4u32.to_le_bytes()); // lanes[1] = 4
+        let mut act_b = [0u8; 8];
+        act_b[0] = 1u8; // DirectDelta::Step(4)
+        act_b[4..8].copy_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&act_b);
+        b.extend_from_slice(&vpa.to_le_bytes()); // vp.a
+        b.extend_from_slice(&6u32.to_le_bytes()); // vp.b = 6
+        b.extend_from_slice(&idx.to_le_bytes());
+        b
+    };
+
+    // Queue ONLY 1 response (`9u32`) with NO default so any double evaluation panics!
+    let mut single_q_sched = EnvSchedule::new().with_callee_return_size("ext_once", 4);
+    single_q_sched.push_callee_response("ext_once", 9u32.to_le_bytes().to_vec());
+
+    let trials = vec![
+        // Trial 0: `vpa = 5, idx = 0` -> `Step(4)` becomes `Step(4 + (9 + 5)) = Step(18)` -> HOLD!
+        (make_trial(5, 0), Some(single_q_sched.clone())),
+        // Trial 1: `vpa = 60` fails `requires` (`60 + 1 <= 50` false) -> FILTERED!
+        (make_trial(60, 0), Some(single_q_sched.clone())),
+        // Trial 2: `idx = 99` triggers OOB index in `let ref mut picked_elem = arr[idx];` -> TRAP!
+        (make_trial(5, 99), Some(single_q_sched.clone())),
+        // Trial 3: `vpa = 9` fails `direct_mut_params_preserved` (`vp.a != 9u32`) -> VIOLATION!
+        (make_trial(9, 1), Some(single_q_sched)),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-A4 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[1],
+        SpecPostconditionVerdict::VacuouslyFiltered { .. }
+    ));
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause { label, .. },
+            ..
+        } if label == "direct_mut_params_preserved"
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-A4 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_a4_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:FILTERED",
+            "TRIAL:2:TRAP",
+            "TRIAL:3:VIOLATION:direct_mut_params_preserved",
+        ]
+    );
+}

@@ -3445,7 +3445,11 @@ fn find_mut_required_params_in_old(
             self.local_aliases.pop();
         }
 
-        fn resolve_ident_roots(&self, ident: &str) -> BTreeSet<String> {
+        fn resolve_ident_roots(
+            &self,
+            ident: &str,
+            include_by_val_params: bool,
+        ) -> BTreeSet<String> {
             if self.const_names.contains(ident) {
                 return BTreeSet::new();
             }
@@ -3459,7 +3463,11 @@ fn find_mut_required_params_in_old(
                     return BTreeSet::new();
                 }
             }
-            if self.params.iter().any(|p| p.is_mut_ref && p.name == ident) {
+            if self
+                .params
+                .iter()
+                .any(|p| p.name == ident && (p.is_mut_ref || include_by_val_params))
+            {
                 BTreeSet::from([ident.to_string()])
             } else {
                 BTreeSet::new()
@@ -3481,7 +3489,7 @@ fn find_mut_required_params_in_old(
                         && ep.path.leading_colon.is_none()
                         && ep.path.segments.len() == 1 =>
                 {
-                    self.resolve_ident_roots(&ep.path.segments[0].ident.to_string())
+                    self.resolve_ident_roots(&ep.path.segments[0].ident.to_string(), true)
                 }
                 Expr::If(ei) => {
                     let mut roots = self.roots_in_block_tail_place(&ei.then_branch);
@@ -3531,7 +3539,7 @@ fn find_mut_required_params_in_old(
                         && ep.path.leading_colon.is_none()
                         && ep.path.segments.len() == 1 =>
                 {
-                    self.resolve_ident_roots(&ep.path.segments[0].ident.to_string())
+                    self.resolve_ident_roots(&ep.path.segments[0].ident.to_string(), false)
                 }
                 Expr::Tuple(et) => {
                     let mut roots = BTreeSet::new();
@@ -3558,6 +3566,37 @@ fn find_mut_required_params_in_old(
                     let mut roots = BTreeSet::new();
                     for arm in &em.arms {
                         roots.extend(self.roots_in_mut_value_expr(&arm.body));
+                    }
+                    roots
+                }
+                Expr::Call(ec) => {
+                    let mut fexpr: &Expr = &ec.func;
+                    loop {
+                        match fexpr {
+                            Expr::Paren(p) => fexpr = &p.expr,
+                            Expr::Group(g) => fexpr = &g.expr,
+                            _ => break,
+                        }
+                    }
+                    let shared_idxs = match fexpr {
+                        Expr::Path(ep) if ep.qself.is_none() => {
+                            let joined = ep
+                                .path
+                                .segments
+                                .iter()
+                                .map(|s| s.ident.to_string())
+                                .collect::<Vec<_>>()
+                                .join("::");
+                            self.shared_helper_param_indices
+                                .get(strip_crate_or_self_prefix(&joined))
+                        }
+                        _ => None,
+                    };
+                    let mut roots = BTreeSet::new();
+                    for (idx, a) in ec.args.iter().enumerate() {
+                        if !shared_idxs.is_some_and(|s| s.contains(&idx)) {
+                            roots.extend(self.roots_in_mut_value_expr(a));
+                        }
                     }
                     roots
                 }
@@ -3813,8 +3852,10 @@ fn rewrite_old_expressions_for_rust(
     struct PreParamRewriter<'a> {
         params: &'a [SpecParamBinding],
         const_names: &'a BTreeSet<String>,
+        mutated_params: &'a BTreeSet<String>,
         needed_pre_params: &'a mut BTreeSet<String>,
         shadowed: Vec<BTreeSet<String>>,
+        in_shared_place_root: bool,
     }
     impl PreParamRewriter<'_> {
         fn visit_cond_with_let_bindings(&mut self, cond: &mut Expr) {
@@ -3837,6 +3878,8 @@ fn rewrite_old_expressions_for_rust(
     }
     impl VisitMut for PreParamRewriter<'_> {
         fn visit_block_mut(&mut self, block: &mut syn::Block) {
+            let prev_shared = self.in_shared_place_root;
+            self.in_shared_place_root = false;
             self.shadowed.push(BTreeSet::new());
             for stmt in &mut block.stmts {
                 if let syn::Stmt::Local(loc) = stmt {
@@ -3854,9 +3897,12 @@ fn rewrite_old_expressions_for_rust(
                 }
             }
             self.shadowed.pop();
+            self.in_shared_place_root = prev_shared;
         }
 
         fn visit_field_value_mut(&mut self, fv: &mut syn::FieldValue) {
+            let prev_shared = self.in_shared_place_root;
+            self.in_shared_place_root = false;
             if fv.colon_token.is_none()
                 && let Member::Named(_) = &fv.member
                 && let Expr::Path(ep) = &fv.expr
@@ -3872,11 +3918,40 @@ fn rewrite_old_expressions_for_rust(
                 }
             }
             syn::visit_mut::visit_field_value_mut(self, fv);
+            self.in_shared_place_root = prev_shared;
         }
 
         fn visit_expr_mut(&mut self, node: &mut Expr) {
+            let cur_shared = self.in_shared_place_root;
             match node {
+                Expr::Paren(p) => {
+                    self.visit_expr_mut(&mut p.expr);
+                    return;
+                }
+                Expr::Group(g) => {
+                    self.visit_expr_mut(&mut g.expr);
+                    return;
+                }
+                Expr::Reference(er) => {
+                    self.in_shared_place_root = er.mutability.is_none();
+                    self.visit_expr_mut(&mut er.expr);
+                    self.in_shared_place_root = cur_shared;
+                    return;
+                }
+                Expr::Field(ef) => {
+                    self.visit_expr_mut(&mut ef.base);
+                    self.in_shared_place_root = cur_shared;
+                    return;
+                }
+                Expr::Index(ix) => {
+                    self.visit_expr_mut(&mut ix.expr);
+                    self.in_shared_place_root = false;
+                    self.visit_expr_mut(&mut ix.index);
+                    self.in_shared_place_root = cur_shared;
+                    return;
+                }
                 Expr::Closure(closure) => {
+                    self.in_shared_place_root = false;
                     let mut frame = BTreeSet::new();
                     for pat in &closure.inputs {
                         collect_pat_bound_idents_with_consts(pat, self.const_names, &mut frame);
@@ -3884,9 +3959,11 @@ fn rewrite_old_expressions_for_rust(
                     self.shadowed.push(frame);
                     self.visit_expr_mut(&mut closure.body);
                     self.shadowed.pop();
+                    self.in_shared_place_root = cur_shared;
                     return;
                 }
                 Expr::Match(em) => {
+                    self.in_shared_place_root = false;
                     self.visit_expr_mut(&mut em.expr);
                     for arm in &mut em.arms {
                         let mut frame = BTreeSet::new();
@@ -3898,9 +3975,11 @@ fn rewrite_old_expressions_for_rust(
                         self.visit_expr_mut(&mut arm.body);
                         self.shadowed.pop();
                     }
+                    self.in_shared_place_root = cur_shared;
                     return;
                 }
                 Expr::If(ei) => {
+                    self.in_shared_place_root = false;
                     self.shadowed.push(BTreeSet::new());
                     self.visit_cond_with_let_bindings(&mut ei.cond);
                     self.visit_block_mut(&mut ei.then_branch);
@@ -3908,22 +3987,27 @@ fn rewrite_old_expressions_for_rust(
                     if let Some((_, else_expr)) = &mut ei.else_branch {
                         self.visit_expr_mut(else_expr);
                     }
+                    self.in_shared_place_root = cur_shared;
                     return;
                 }
                 Expr::While(ew) => {
+                    self.in_shared_place_root = false;
                     self.shadowed.push(BTreeSet::new());
                     self.visit_cond_with_let_bindings(&mut ew.cond);
                     self.visit_block_mut(&mut ew.body);
                     self.shadowed.pop();
+                    self.in_shared_place_root = cur_shared;
                     return;
                 }
                 Expr::ForLoop(efl) => {
+                    self.in_shared_place_root = false;
                     self.visit_expr_mut(&mut efl.expr);
                     let mut frame = BTreeSet::new();
                     collect_pat_bound_idents_with_consts(&efl.pat, self.const_names, &mut frame);
                     self.shadowed.push(frame);
                     self.visit_block_mut(&mut efl.body);
                     self.shadowed.pop();
+                    self.in_shared_place_root = cur_shared;
                     return;
                 }
                 _ => {}
@@ -3946,6 +4030,18 @@ fn rewrite_old_expressions_for_rust(
                             proc_macro2::Span::call_site(),
                         );
                         *node = syn::parse_quote!(#pre_ref_ident);
+                    } else if self.mutated_params.contains(&param.name) {
+                        let pre_local_ident = syn::Ident::new(
+                            &format!("__anneal_pre_local_{}", param.name),
+                            proc_macro2::Span::call_site(),
+                        );
+                        *node = syn::parse_quote!(#pre_local_ident);
+                    } else if cur_shared {
+                        let pre_ident = syn::Ident::new(
+                            &format!("__anneal_pre_{}", param.name),
+                            proc_macro2::Span::call_site(),
+                        );
+                        *node = syn::parse_quote!(#pre_ident);
                     } else {
                         let pre_ident = syn::Ident::new(
                             &format!("__anneal_pre_{}", param.name),
@@ -3956,7 +4052,9 @@ fn rewrite_old_expressions_for_rust(
                     return;
                 }
             }
+            self.in_shared_place_root = false;
             syn::visit_mut::visit_expr_mut(self, node);
+            self.in_shared_place_root = cur_shared;
         }
     }
 
@@ -3987,8 +4085,10 @@ fn rewrite_old_expressions_for_rust(
                 PreParamRewriter {
                     params: self.params,
                     const_names: self.const_names,
+                    mutated_params: &mutated_mut_params,
                     needed_pre_params: self.needed_pre_params,
                     shadowed: Vec::new(),
+                    in_shared_place_root: false,
                 }
                 .visit_expr_mut(&mut inner);
                 let inner_tokens = inner.to_token_stream().to_string();
@@ -5112,6 +5212,7 @@ struct SpecEvalContext<'a> {
     env: BTreeMap<String, SpecEvalValue>,
     mut_aliases: BTreeMap<String, (String, Vec<SpecPlaceStep>)>,
     pre_env: Option<&'a BTreeMap<String, SpecEvalValue>>,
+    pre_mut_aliases: Option<&'a BTreeMap<String, (String, Vec<SpecPlaceStep>)>>,
     struct_layouts: &'a BTreeMap<String, LayoutSpec>,
     enum_layouts: &'a BTreeMap<String, LayoutSpec>,
     type_meta: &'a SpecTypeMetadata,
@@ -5162,27 +5263,6 @@ fn restore_shadowed_bindings(
                 }
             }
         }
-    }
-}
-
-fn syntactic_place_root_ident(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Paren(p) => syntactic_place_root_ident(&p.expr),
-        Expr::Group(g) => syntactic_place_root_ident(&g.expr),
-        Expr::Reference(er) => syntactic_place_root_ident(&er.expr),
-        Expr::Unary(un) if matches!(un.op, syn::UnOp::Deref(_)) => {
-            syntactic_place_root_ident(&un.expr)
-        }
-        Expr::Field(ef) => syntactic_place_root_ident(&ef.base),
-        Expr::Index(ix) => syntactic_place_root_ident(&ix.expr),
-        Expr::Path(ep)
-            if ep.qself.is_none()
-                && ep.path.leading_colon.is_none()
-                && ep.path.segments.len() == 1 =>
-        {
-            Some(ep.path.segments[0].ident.to_string())
-        }
-        _ => None,
     }
 }
 
@@ -5546,39 +5626,48 @@ impl<'a> SpecEvalContext<'a> {
         }
     }
 
+    fn expr_is_syntactic_place(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Paren(p) => self.expr_is_syntactic_place(&p.expr),
+            Expr::Group(g) => self.expr_is_syntactic_place(&g.expr),
+            Expr::Path(ep)
+                if ep.qself.is_none()
+                    && ep.path.leading_colon.is_none()
+                    && ep.path.segments.len() == 1 =>
+            {
+                let id = ep.path.segments[0].ident.to_string();
+                self.env.contains_key(&id) || self.mut_aliases.contains_key(&id)
+            }
+            Expr::Field(ef) => {
+                self.expr_is_syntactic_place(&ef.base)
+                    || self.expr_syntactically_yields_mut_ref(&ef.base)
+            }
+            Expr::Index(ix) => {
+                self.expr_is_syntactic_place(&ix.expr)
+                    || self.expr_syntactically_yields_mut_ref(&ix.expr)
+            }
+            Expr::Unary(un) if matches!(un.op, syn::UnOp::Deref(_)) => {
+                self.expr_is_syntactic_place(&un.expr)
+                    || self.expr_syntactically_yields_mut_ref(&un.expr)
+            }
+            _ => false,
+        }
+    }
+
     fn try_resolve_direct_place(
         &mut self,
         expr: &Expr,
     ) -> Result<Option<(String, Vec<SpecPlaceStep>)>, SpecExecFlow> {
-        match expr {
-            Expr::Paren(p) => self.try_resolve_direct_place(&p.expr),
-            Expr::Group(g) => self.try_resolve_direct_place(&g.expr),
-            // Shared `&expr` is NOT a mutable direct place; `&mut expr` is handled by `try_eval_mut_place_expr`.
-            Expr::Reference(_) => Ok(None),
-            _ => {
-                if let Some(sroot) = syntactic_place_root_ident(expr)
-                    && (self.env.contains_key(&sroot) || self.mut_aliases.contains_key(&sroot))
-                {
-                    let (root, steps) = self.resolve_place_path(expr)?;
-                    if let Some(rv) = self.env.get(&root)
-                        && read_at_place_steps(rv, &steps).is_ok()
-                    {
-                        return Ok(Some((root, steps)));
-                    }
-                }
-                if matches!(expr, Expr::Unary(un) if matches!(un.op, syn::UnOp::Deref(_)))
-                    || matches!(expr, Expr::Field(_) | Expr::Index(_))
-                {
-                    if let Ok((root, steps)) = self.resolve_place_path(expr)
-                        && let Some(rv) = self.env.get(&root)
-                        && read_at_place_steps(rv, &steps).is_ok()
-                    {
-                        return Ok(Some((root, steps)));
-                    }
-                }
-                Ok(None)
-            }
+        if !self.expr_is_syntactic_place(expr) {
+            return Ok(None);
         }
+        let (root, steps) = self.resolve_place_path(expr)?;
+        let rv = self
+            .env
+            .get(&root)
+            .ok_or_else(|| format!("unknown place root `{root}`"))?;
+        let _ = read_at_place_steps(rv, &steps)?;
+        Ok(Some((root, steps)))
     }
 
     fn eval_scrutinee_with_opt_place(
@@ -5676,17 +5765,29 @@ impl<'a> SpecEvalContext<'a> {
             return Ok(true);
         }
         let const_names = self.type_meta.const_name_set();
-        if (self.expr_syntactically_yields_mut_ref(init_inner)
-            || pat_contains_ref_mut_ident(pat, &const_names))
-            && let (_, Some((root, steps, default_mut))) =
-                self.eval_scrutinee_with_opt_place(init_inner, true)?
+        let opt_place = if let Some((root, steps)) = self.try_eval_mut_place_expr(init_inner)? {
+            Some((root, steps, true))
+        } else if pat_contains_ref_mut_ident(pat, &const_names)
+            && let Some((root, steps)) = self.try_resolve_direct_place(init_inner)?
         {
+            Some((root, steps, false))
+        } else {
+            None
+        };
+        if let Some((root, steps, default_mut)) = opt_place {
             let rval = self
                 .env
                 .get(&root)
                 .cloned()
                 .ok_or_else(|| format!("unknown `let` place root `{root}`"))?;
             let scrut = read_at_place_steps(&rval, &steps)?;
+            if let Some(ty) = ty_hint {
+                let inner_ty = match self.type_meta.resolve_syn_type(ty) {
+                    syn::Type::Reference(tr) => &*tr.elem,
+                    other => other,
+                };
+                let _ = coerce_value_to_syn_type(scrut.clone(), inner_ty, self.type_meta)?;
+            }
             let mut bindings = Vec::new();
             if self.try_match_pattern_with_place(
                 pat,
@@ -5814,6 +5915,7 @@ impl<'a> SpecEvalContext<'a> {
             env: BTreeMap::new(),
             mut_aliases: BTreeMap::new(),
             pre_env: None,
+            pre_mut_aliases: None,
             struct_layouts: self.struct_layouts,
             enum_layouts: self.enum_layouts,
             type_meta: self.type_meta,
@@ -6076,6 +6178,7 @@ impl<'a> SpecEvalContext<'a> {
             env: self.env.clone(),
             mut_aliases: self.mut_aliases.clone(),
             pre_env: self.pre_env,
+            pre_mut_aliases: self.pre_mut_aliases,
             struct_layouts: self.struct_layouts,
             enum_layouts: self.enum_layouts,
             type_meta: self.type_meta,
@@ -7840,8 +7943,9 @@ impl<'a> SpecEvalContext<'a> {
             }
             let mut sub_ctx = SpecEvalContext {
                 env: pre.clone(),
-                mut_aliases: BTreeMap::new(),
+                mut_aliases: self.pre_mut_aliases.cloned().unwrap_or_default(),
                 pre_env: None,
+                pre_mut_aliases: None,
                 struct_layouts: self.struct_layouts,
                 enum_layouts: self.enum_layouts,
                 type_meta: self.type_meta,
@@ -7981,6 +8085,7 @@ impl<'a> SpecEvalContext<'a> {
                 env: fn_env,
                 mut_aliases: fn_mut_aliases,
                 pre_env: None,
+                pre_mut_aliases: None,
                 struct_layouts: self.struct_layouts,
                 enum_layouts: self.enum_layouts,
                 type_meta: self.type_meta,
@@ -8303,6 +8408,7 @@ impl<'a> SpecEvalContext<'a> {
             env: fn_env,
             mut_aliases: fn_mut_aliases,
             pre_env: None,
+            pre_mut_aliases: None,
             struct_layouts: self.struct_layouts,
             enum_layouts: self.enum_layouts,
             type_meta: self.type_meta,
@@ -8349,6 +8455,7 @@ fn extract_local_pat_and_ty(pat: &Pat) -> Result<(String, Option<String>), Strin
     use quote::ToTokens;
     match pat {
         Pat::Wild(_) => Ok(("_".to_string(), None)),
+        Pat::Paren(pp) => extract_local_pat_and_ty(&pp.pat),
         Pat::Ident(pi) => Ok((pi.ident.to_string(), None)),
         Pat::Type(pt) => {
             let (name, _) = extract_local_pat_and_ty(&pt.pat)?;
@@ -10286,7 +10393,7 @@ impl SpecContractOracleProbe {
                     ));
                 } else {
                     out.push_str(&format!(
-                        "        let {}: {} = {}.clone();\n        \
+                        "        let mut {}: {} = {}.clone();\n        \
                          let _ = &{};\n",
                         p.name, p.rust_ty, p.name, p.name
                     ));
@@ -10360,13 +10467,21 @@ impl SpecContractOracleProbe {
             } else {
                 let mut local_rebinds = String::new();
                 for p in &self.params {
-                    if p.is_mut_ref && spec.mutated_mut_params.contains(&p.name) {
-                        local_rebinds.push_str(&format!(
-                            "let mut __anneal_pre_local_{}: {} = __anneal_pre_{}.clone(); \
-                             let __anneal_pre_ref_{}: &mut {} = &mut __anneal_pre_local_{}; \
-                             let _ = &__anneal_pre_ref_{}; ",
-                            p.name, p.rust_ty, p.name, p.name, p.rust_ty, p.name, p.name
-                        ));
+                    if spec.mutated_mut_params.contains(&p.name) {
+                        if p.is_mut_ref {
+                            local_rebinds.push_str(&format!(
+                                "let mut __anneal_pre_local_{}: {} = __anneal_pre_{}.clone(); \
+                                 let __anneal_pre_ref_{}: &mut {} = &mut __anneal_pre_local_{}; \
+                                 let _ = &__anneal_pre_ref_{}; ",
+                                p.name, p.rust_ty, p.name, p.name, p.rust_ty, p.name, p.name
+                            ));
+                        } else {
+                            local_rebinds.push_str(&format!(
+                                "let mut __anneal_pre_local_{}: {} = __anneal_pre_{}.clone(); \
+                                 let _ = &__anneal_pre_local_{}; ",
+                                p.name, p.rust_ty, p.name, p.name
+                            ));
+                        }
                     }
                 }
                 out.push_str(&format!(
@@ -10388,7 +10503,7 @@ impl SpecContractOracleProbe {
                     ));
                 } else {
                     out.push_str(&format!(
-                        "        let {}: {} = {}.clone();\n        \
+                        "        let mut {}: {} = {}.clone();\n        \
                          let _ = &{};\n",
                         p.name, p.rust_ty, p.name, p.name
                     ));
@@ -10685,6 +10800,7 @@ impl SpecContractOracleProbe {
             }
         }
         let mut pre_env = BTreeMap::new();
+        let mut pre_mut_aliases: BTreeMap<String, (String, Vec<SpecPlaceStep>)> = BTreeMap::new();
         let mut pre_raw_by_param: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut cursor = 0usize;
         for p in &self.params {
@@ -10704,7 +10820,13 @@ impl SpecContractOracleProbe {
                 raw_val
             };
             pre_raw_by_param.insert(p.name.clone(), slice.to_vec());
-            pre_env.insert(p.name.clone(), val);
+            if p.is_mut_ref {
+                let slot_key = format!("__anneal_param_slot_{}", p.name);
+                pre_env.insert(slot_key.clone(), val);
+                pre_mut_aliases.insert(p.name.clone(), (slot_key, Vec::new()));
+            } else {
+                pre_env.insert(p.name.clone(), val);
+            }
         }
         collect_named_layouts(&self.ret_layout, &mut struct_layouts, &mut enum_layouts);
 
@@ -10714,8 +10836,9 @@ impl SpecContractOracleProbe {
         for (idx, req) in self.requires.iter().enumerate() {
             let mut req_ctx = SpecEvalContext {
                 env: pre_env.clone(),
-                mut_aliases: BTreeMap::new(),
+                mut_aliases: pre_mut_aliases.clone(),
                 pre_env: None,
+                pre_mut_aliases: None,
                 struct_layouts: &struct_layouts,
                 enum_layouts: &enum_layouts,
                 type_meta: &type_meta,
@@ -10769,8 +10892,9 @@ impl SpecContractOracleProbe {
         })?;
         let mut body_ctx = SpecEvalContext {
             env: pre_env.clone(),
-            mut_aliases: BTreeMap::new(),
+            mut_aliases: pre_mut_aliases.clone(),
             pre_env: None,
+            pre_mut_aliases: None,
             struct_layouts: &struct_layouts,
             enum_layouts: &enum_layouts,
             type_meta: &type_meta,
@@ -10819,7 +10943,8 @@ impl SpecContractOracleProbe {
             if !p.is_mut_ref || p.frame_preserved_fields.is_empty() {
                 continue;
             }
-            let Some(post_val) = body_ctx.env.get(&p.name) else {
+            let slot_key = format!("__anneal_param_slot_{}", p.name);
+            let Some(post_val) = body_ctx.env.get(&slot_key) else {
                 continue;
             };
             let post_bytes = post_val.to_layout_bytes();
@@ -10833,7 +10958,7 @@ impl SpecContractOracleProbe {
                             && let (
                                 Some(SpecEvalValue::Struct { fields: pre_f, .. }),
                                 SpecEvalValue::Struct { fields: post_f, .. },
-                            ) = (pre_env.get(&p.name), post_val)
+                            ) = (pre_env.get(&slot_key), post_val)
                             && let (Some(pre_fv), Some(post_fv)) =
                                 (pre_f.get(ff), post_f.get(ff))
                         {
@@ -10868,10 +10993,13 @@ impl SpecContractOracleProbe {
 
         // Phase 4: Evaluate `ensures` postconditions over post-state + `result` + `old(pre_env)`.
         let mut post_env = BTreeMap::new();
+        let mut post_mut_aliases: BTreeMap<String, (String, Vec<SpecPlaceStep>)> = BTreeMap::new();
         for p in &self.params {
             if p.is_mut_ref {
-                if let Some(v) = body_ctx.env.get(&p.name) {
-                    post_env.insert(p.name.clone(), v.clone());
+                let slot_key = format!("__anneal_param_slot_{}", p.name);
+                if let Some(v) = body_ctx.env.get(&slot_key) {
+                    post_env.insert(slot_key.clone(), v.clone());
+                    post_mut_aliases.insert(p.name.clone(), (slot_key, Vec::new()));
                 }
             } else if let Some(v) = pre_env.get(&p.name) {
                 // Non-`&mut` parameters are observed at their caller-visible value.
@@ -10883,8 +11011,9 @@ impl SpecContractOracleProbe {
         for (idx, ens) in self.ensures.iter().enumerate() {
             let mut ens_ctx = SpecEvalContext {
                 env: post_env.clone(),
-                mut_aliases: BTreeMap::new(),
+                mut_aliases: post_mut_aliases.clone(),
                 pre_env: Some(&pre_env),
+                pre_mut_aliases: Some(&pre_mut_aliases),
                 struct_layouts: &struct_layouts,
                 enum_layouts: &enum_layouts,
                 type_meta: &type_meta,
@@ -14105,5 +14234,149 @@ mod tests {
         // Synthesized Rust must compile cleanly without `E0515` or `E0594`/`E0308`!
         let rust_src = probe.synthesize_rust_probe().expect("synthesize ep2-B4 probe");
         assert!(rust_src.contains("select_lane_mut"));
+    }
+
+    #[test]
+    fn ep2_a4_direct_mut_param_ergonomics_single_eval_ref_mut_rvalues_and_by_val_old_refs() {
+        let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+        let arr_layout = LayoutSpec::Array {
+            elem: Box::new(u32_layout.clone()),
+            elem_stride: 4,
+            len: 2,
+        };
+        let delta_layout = LayoutSpec::Enum {
+            name: "DirectDelta".to_string(),
+            total_size: 8,
+            tag_offset: 0,
+            tag_size: 1,
+            variants: vec![
+                EnumVariantLayout {
+                    name: "Idle".to_string(),
+                    discriminant: 0,
+                    payload_offset: 4,
+                    payload: None,
+                },
+                EnumVariantLayout {
+                    name: "Step".to_string(),
+                    discriminant: 1,
+                    payload_offset: 4,
+                    payload: Some(Box::new(u32_layout.clone())),
+                },
+            ],
+        };
+        let pair_layout = LayoutSpec::Struct {
+            name: "ValPair".to_string(),
+            total_size: 8,
+            fields: vec![
+                FieldLayout {
+                    name: "a".to_string(),
+                    offset: 0,
+                    layout: u32_layout.clone(),
+                },
+                FieldLayout {
+                    name: "b".to_string(),
+                    offset: 4,
+                    layout: u32_layout.clone(),
+                },
+            ],
+        };
+
+        let probe = SpecContractOracleProbe::new(
+            "ep2_a4_convergence_unit_probe",
+            vec![
+                SpecParamBinding::mut_ref("arr", "[u32; 2]", arr_layout),
+                SpecParamBinding::mut_ref("act", "DirectDelta", delta_layout),
+                SpecParamBinding::by_value("vp", "ValPair", pair_layout),
+                SpecParamBinding::by_value("oob_idx", "usize", LayoutSpec::Scalar(ScalarLayout::unsigned(8))),
+            ],
+            "u32",
+            u32_layout.clone(),
+            "// 1. `let ref mut x = ext_once();` MUST evaluate `ext_once()` ONCE (not twice!).\n\
+             let ref mut tmp_ext: u32 = ext_once();\n\
+             *tmp_ext += 5u32;\n\
+             // 2. OOB index on `let ref mut _ = arr[oob_idx];` MUST trap immediately!\n\
+             let ref mut picked_elem: u32 = arr[oob_idx];\n\
+             *picked_elem += 1u32;\n\
+             // 3. Direct `for slot in arr` (where `arr: &mut [u32; 2]` is a parameter) mutates `arr` in place!\n\
+             for slot in &mut *arr {\n    \
+                 *slot += 2u32;\n\
+             }\n\
+             // 4. Direct `match act` & `let alias = arr;` on top-level `&mut` parameters!\n\
+             match &mut *act {\n    \
+                 DirectDelta::Step(dx) => { *dx += *tmp_ext; }\n    \
+                 DirectDelta::Idle => {}\n\
+             }\n\
+             let moved_arr = arr;\n\
+             moved_arr[0] += 3u32;\n\
+             let act_val: u32 = match *act {\n    \
+                 DirectDelta::Step(v) => v,\n    \
+                 DirectDelta::Idle => 0u32,\n\
+             };\n\
+             moved_arr[0] + moved_arr[1] + act_val + vp.a",
+        )
+        .with_type_defs(
+            "#[repr(C, u8)]\n\
+             #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+             pub enum DirectDelta { Idle = 0, Step(u32) = 1 }\n\
+             #[repr(C)]\n\
+             #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+             pub struct ValPair { pub a: u32, pub b: u32 }",
+        )
+        .with_external_callee(SpecExternalCallee::new(
+            "ext_once",
+            std::iter::empty::<&str>(),
+            "u32",
+            u32_layout,
+        ))
+        .with_requires(
+            "by_val_mut_scratch_in_requires",
+            "{ vp.a += 1u32; vp.a <= 100u32 }",
+        )
+        .with_ensures(
+            "by_val_old_ref_and_old_mut_block",
+            "old(&vp.a) == &vp.a && old({ vp.a += 7u32; vp.a }) == old(vp.a) + 7u32",
+        )
+        .with_ensures(
+            "direct_mut_param_updates_visible",
+            "arr[0] == old(arr[0]) + (if old(oob_idx) == 0usize { 6u32 } else { 5u32 })",
+        );
+
+        let make_raw = |oob_idx: u64| -> Vec<u8> {
+            let mut b = Vec::with_capacity(32);
+            b.extend_from_slice(&10u32.to_le_bytes()); // arr[0] = 10
+            b.extend_from_slice(&20u32.to_le_bytes()); // arr[1] = 20
+            let mut act_b = [0u8; 8];
+            act_b[0] = 1u8; // DirectDelta::Step(4)
+            act_b[4..8].copy_from_slice(&4u32.to_le_bytes());
+            b.extend_from_slice(&act_b);
+            b.extend_from_slice(&5u32.to_le_bytes()); // vp.a = 5
+            b.extend_from_slice(&6u32.to_le_bytes()); // vp.b = 6
+            b.extend_from_slice(&oob_idx.to_le_bytes());
+            b
+        };
+
+        // Queue EXACTLY ONE response on `ext_once` (no default!): double evaluation would hit `PassThrough`!
+        let mut single_q_sched = EnvSchedule::new().with_callee_return_size("ext_once", 4);
+        single_q_sched.push_callee_response("ext_once", 9u32.to_le_bytes().to_vec());
+
+        let mut s_ok = single_q_sched.clone();
+        assert_eq!(
+            probe
+                .verify_spec_postcondition_against_schedule(&make_raw(0), Some(&mut s_ok))
+                .expect("eval ep2-A4 hold"),
+            SpecPostconditionVerdict::VerifiedHold
+        );
+
+        // OOB index (`oob_idx = 99`) traps cleanly on first evaluation:
+        let mut s_oob = single_q_sched;
+        assert!(matches!(
+            probe
+                .verify_spec_postcondition_against_schedule(&make_raw(99), Some(&mut s_oob))
+                .expect("eval ep2-A4 oob"),
+            SpecPostconditionVerdict::PanicOrTrap {
+                phase: SpecExecPhase::Body,
+                ..
+            }
+        ));
     }
 }
