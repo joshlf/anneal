@@ -1424,6 +1424,58 @@ fn verifies_with_work_dir_under_nonexistent_and_readonly_tmpdir() {
     shortcut_receipt.expect(0, "crate_verified", None);
     assert!(!nonexistent_tmp.exists());
     assert_eq!(fs::read_dir(&writable_work).unwrap().count(), 0);
+
+    // Exercise a Bazel/RBE/Nix-style symlinked `--lean` executable alongside
+    // `--work-dir`, and confirm non-regular `--lean /dev/null` fails closed as
+    // `tool_failed` (`exit 2`, never `proof_failed`).
+    use sha2::{Digest as _, Sha256};
+    let lean_symlink = fixture.path("cas-prebuilt-lean");
+    std::os::unix::fs::symlink(&tools.lean, &lean_symlink).unwrap();
+    let expected_lean_sha = format!(
+        "{:x}",
+        Sha256::digest(fs::read(fs::canonicalize(&tools.lean).unwrap()).unwrap())
+    );
+    let sym_lean_receipt = fixture.execute(
+        "work-dir-symlinked-lean",
+        Command::new(&tools.cli)
+            .env("TMPDIR", &nonexistent_tmp)
+            .arg("verify")
+            .arg("--request")
+            .arg(&req_path)
+            .arg("--capture")
+            .arg(&tools.capture)
+            .arg("--lean")
+            .arg(&lean_symlink)
+            .arg("--sysroot")
+            .arg(&tools.sysroot)
+            .arg("--work-dir")
+            .arg(&writable_work),
+    );
+    sym_lean_receipt.expect(0, "crate_verified", None);
+    assert_eq!(
+        sym_lean_receipt.value["lean_binary_sha256"],
+        expected_lean_sha
+    );
+
+    fixture
+        .execute(
+            "dev-null-lean-tool-failed",
+            Command::new(&tools.cli)
+                .env("TMPDIR", &nonexistent_tmp)
+                .arg("verify")
+                .arg("--request")
+                .arg(&req_path)
+                .arg("--capture")
+                .arg(&tools.capture)
+                .arg("--lean")
+                .arg("/dev/null")
+                .arg("--sysroot")
+                .arg(&tools.sysroot)
+                .arg("--work-dir")
+                .arg(&writable_work),
+        )
+        .expect(2, "tool_failed", Some("audit"));
+
     fs::set_permissions(&ro_tmp, fs::Permissions::from_mode(0o700)).unwrap();
 }
 

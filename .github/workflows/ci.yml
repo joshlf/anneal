@@ -404,12 +404,24 @@ jobs:
           cargo run --locked -p cargo-anneal --example regenerate_bundle -- \
             --root . --check
           # Guard the Fuchsia/RBE hermetic build mode: `--no-default-features`
-          # must keep `exocrate`, `dirs`, and their network stack out of the
-          # whole normal dependency tree and pass CLI/unit/harness tests.
-          hermetic_tree="$(cargo tree --locked -p cargo-anneal \
-            --no-default-features -e normal)"
-          printf '%s\n' "$hermetic_tree"
-          if printf '%s\n' "$hermetic_tree" | grep -E '\b(exocrate|dirs|ureq|rustls)\b'; then
+          # must keep the exact 8-crate direct allowlist, exclude `exocrate`,
+          # `dirs`, and their network stack across the full `normal,build`
+          # crate graph (ignoring line 1's checkout path), and pass tests.
+          expected_direct="clap serde serde_json sha2 tempfile thiserror toml walkdir"
+          actual_direct="$(cargo tree --locked -p cargo-anneal \
+            --no-default-features -e normal --depth 1 --prefix none \
+            | awk 'NR > 1 { print $1 }' | sort -u | paste -sd ' ' -)"
+          printf 'hermetic direct deps: %s\n' "$actual_direct"
+          if [ "$actual_direct" != "$expected_direct" ]; then
+            echo "error: unexpected direct --no-default-features deps: $actual_direct" >&2
+            exit 1
+          fi
+          hermetic_crates="$(cargo tree --locked -p cargo-anneal \
+            --no-default-features -e normal,build --prefix none \
+            | awk 'NR > 1 { print $1 }' | sort -u)"
+          printf '%s\n' "$hermetic_crates"
+          if printf '%s\n' "$hermetic_crates" \
+            | grep -E '^(exocrate|dirs|dirs-sys|directories|ureq|rustls|webpki-roots)$'; then
             echo "error: forbidden non-hermetic crate in --no-default-features tree" >&2
             exit 1
           fi

@@ -903,6 +903,31 @@ fn declared_compiler_must_be_supported_and_reported_by_rustc() {
         assert_eq!(receipt["phase"], "capture-tool", "{receipt}");
         assert!(!reached.exists(), "capture ran after {receipt}");
     }
+
+    let non_utf8_lean = tools.join(std::ffi::OsString::from_vec(vec![b'l', b'n', 0xff]));
+    let mut bad_lean_cmd = Command::new(env!("CARGO_BIN_EXE_cargo-anneal"));
+    bad_lean_cmd
+        .current_dir(project.path())
+        .env("XDG_CACHE_HOME", project.path().join("empty-cache"))
+        .arg("verify")
+        .arg("--request")
+        .arg(&request)
+        .arg("--capture")
+        .arg(&capture)
+        .arg("--lean")
+        .arg(&non_utf8_lean)
+        .arg("--rustc")
+        .arg(&fuchsia)
+        .args(["--rustc-version", "V2026_10_22_R7189d39d9"]);
+    let bad_lean_out = bad_lean_cmd.output().unwrap();
+    assert_result(&bad_lean_out, 2, "--lean path must be UTF-8", "");
+    let bad_lean_receipt: serde_json::Value = serde_json::from_slice(&bad_lean_out.stdout).unwrap();
+    assert_eq!(
+        bad_lean_receipt["status"], "tool_failed",
+        "{bad_lean_receipt}"
+    );
+    assert_eq!(bad_lean_receipt["phase"], "lean-tool", "{bad_lean_receipt}");
+    assert!(!reached.exists(), "capture ran after {bad_lean_receipt}");
 }
 
 /// A Fuchsia-style compiler that reports the declared build passes boundary 1

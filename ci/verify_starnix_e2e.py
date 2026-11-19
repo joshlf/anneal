@@ -149,7 +149,8 @@ def run(arguments, work):
     if arguments.rustc_version is not None:
         if arguments.rustc_version not in (compiler["mir_dialect"], compiler["commit"]):
             raise RuntimeError(f"receipt compiler differs from --rustc-version: {compiler}")
-        expected_rustc_sha = hashlib.sha256(arguments.rustc.read_bytes()).hexdigest()
+        expected_rustc_sha = hashlib.sha256(
+            arguments.rustc.resolve(strict=True).read_bytes()).hexdigest()
         if baseline.get("rustc_binary_sha256") != expected_rustc_sha:
             raise RuntimeError(
                 f"receipt rustc_binary_sha256 {baseline.get('rustc_binary_sha256')} "
@@ -158,7 +159,8 @@ def run(arguments, work):
         raise RuntimeError(
             "receipt unexpectedly populated rustc_binary_sha256 without --rustc-version: "
             f"{baseline.get('rustc_binary_sha256')}")
-    expected_lean_sha = hashlib.sha256(arguments.lean.read_bytes()).hexdigest()
+    expected_lean_sha = hashlib.sha256(
+        arguments.lean.resolve(strict=True).read_bytes()).hexdigest()
     if baseline.get("lean_binary_sha256") != expected_lean_sha:
         raise RuntimeError(
             f"receipt lean_binary_sha256 {baseline.get('lean_binary_sha256')} "

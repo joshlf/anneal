@@ -1381,6 +1381,15 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             "--capture path must be UTF-8",
         ));
     }
+    if let Some(given_lean) = &args.lean
+        && given_lean.to_str().is_none()
+    {
+        return Err(error(
+            "tool_failed",
+            "lean-tool",
+            "--lean path must be UTF-8",
+        ));
+    }
     #[cfg(feature = "setup")]
     let capture = args
         .capture
@@ -1881,11 +1890,43 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // the exact closed root and enforce origin roles before a receipt can
     // report verification success. Operational failures stay distinct from
     // a successfully executed checker rejecting a proof.
-    let mut checker =
-        Checker::new_in(&bundle, args.lean.as_deref(), &work_tmp).map_err(|e| io("audit", e))?;
+    let resolved_lean = if let Some(given_lean) = &args.lean {
+        if given_lean.as_os_str().is_empty() {
+            return Err(error(
+                "tool_failed",
+                "audit",
+                "--lean path must not be empty",
+            ));
+        }
+        let canon_lean = fs::canonicalize(given_lean).map_err(|e| {
+            error(
+                "tool_failed",
+                "audit",
+                format!("cannot resolve --lean {}: {e}", given_lean.display()),
+            )
+        })?;
+        if canon_lean.to_str().is_none() {
+            return Err(error(
+                "tool_failed",
+                "audit",
+                "--lean target path must be UTF-8",
+            ));
+        }
+        let _ = regular_tool_digest(&canon_lean, "audit")?;
+        Some(canon_lean)
+    } else {
+        None
+    };
+    let mut checker = Checker::new_in(&bundle, resolved_lean.as_deref(), &work_tmp)
+        .map_err(|e| io("audit", e))?;
     let audit = checker.run_target(&audit_request).map_err(|e| {
+        let is_proof_rejection = e.code == 1
+            && !matches!(
+                e.phase.as_str(),
+                "lock" | "toolchain" | "foundation" | "library-lock"
+            );
         error(
-            if e.code == 1 {
+            if is_proof_rejection {
                 "proof_failed"
             } else {
                 "tool_failed"
