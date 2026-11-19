@@ -501,6 +501,59 @@ theorem prod_comp_not_eq_without_tightValidRep :
   have hfalse : false = true := hlhs.1.2 false rfl
   cases hfalse
 
+/-- `CodecLaws.ofEquiv_symm` has tight representation validity. -/
+theorem ofEquiv_symm_tightValidRep (f : α → β) (g : β → α)
+    (left_inv : ∀ a, g (f a) = a) (right_inv : ∀ b, f (g b) = b) :
+    (ofEquiv_symm f g left_inv right_inv).TightValidRep :=
+  ofEquiv_tightValidRep g f right_inv left_inv
+
+/--
+Canonical tightening reflector on `CodecLaws`: keeps `encode` and `decode`
+unchanged while restricting `ValidRep b` to valid representations that decode
+(`c.ValidRep b ∧ ∃ a, c.decode b = some a`). Turns any codec into a
+`TightValidRep` codec so `CodecLaws.prod_comp` applies unconditionally.
+-/
+def tighten (c : CodecLaws α β) : CodecLaws α β where
+  encode := c.encode
+  decode := c.decode
+  ValidRep := fun b => c.ValidRep b ∧ ∃ a, c.decode b = some a
+  decode_encode := c.decode_encode
+  encode_valid := fun a => ⟨c.encode_valid a, a, c.decode_encode a⟩
+  encode_decode_of_valid := fun b a hv hd =>
+    c.encode_decode_of_valid b a hv.1 hd
+
+/-- Every tightened codec satisfies `TightValidRep`. -/
+theorem tighten_tightValidRep (c : CodecLaws α β) : c.tighten.TightValidRep :=
+  fun _ hv => hv.2
+
+/-- `CodecLaws.tighten` is idempotent. -/
+theorem tighten_idem (c : CodecLaws α β) : c.tighten.tighten = c.tighten :=
+  ext (fun _ => rfl) (fun _ => rfl)
+    (fun _ => ⟨fun h => h.1, fun h => ⟨h, h.2⟩⟩)
+
+/-- A codec is fixed by `tighten` if and only if it satisfies
+`TightValidRep`. -/
+theorem tighten_eq_self_iff (c : CodecLaws α β) :
+    c.tighten = c ↔ c.TightValidRep := by
+  constructor
+  · intro heq b hv
+    have hval : c.tighten.ValidRep b = c.ValidRep b :=
+      congrFun (congrArg CodecLaws.ValidRep heq) b
+    exact (hval.symm ▸ hv).2
+  · intro ht
+    exact ext (fun _ => rfl) (fun _ => rfl)
+      (fun b => ⟨fun h => h.1, fun h => ⟨h, ht b h⟩⟩)
+
+/-- Unconditional product-composition interchange after tightening the outer
+codecs. -/
+theorem prod_comp_tighten {γ₁ : Type w₁} {γ₂ : Type w₂}
+    (c₁ : CodecLaws α₁ β₁) (d₁ : CodecLaws β₁ γ₁)
+    (c₂ : CodecLaws α₂ β₂) (d₂ : CodecLaws β₂ γ₂) :
+    (c₁.comp d₁.tighten).prod (c₂.comp d₂.tighten) =
+      (c₁.prod c₂).comp (d₁.tighten.prod d₂.tighten) :=
+  prod_comp c₁ d₁.tighten c₂ d₂.tighten d₁.tighten_tightValidRep
+    d₂.tighten_tightValidRep
+
 end CodecLaws
 
 /--
@@ -3643,6 +3696,20 @@ theorem liftMode_productiveRef {ModeMR' : Type uMM'} {ModeLM' : Type uML'}
   ⟨B.mrRel.liftMode_productiveRef fMR hpMR,
    B.lmRel.liftMode_productiveRef fLM hpLM⟩
 
+/-- `DualCorrespondenceBundle.liftMode` preserves two-sided productivity
+(`ProductiveBoth`). -/
+theorem liftMode_productiveBoth {ModeMR' : Type uMM'} {ModeLM' : Type uML'}
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (fMR : ModeMR' → ModeMR) (gMR : ModeMR → ModeMR')
+    (hMR : ∀ m, fMR (gMR m) = m) (fLM : ModeLM' → ModeLM)
+    (gLM : ModeLM → ModeLM') (hLM : ∀ m, fLM (gLM m) = m)
+    (hpMR : B.mrRel.ProductiveBoth) (hpLM : B.lmRel.ProductiveBoth) :
+    (B.liftMode fMR gMR hMR fLM gLM hLM).mrRel.ProductiveBoth ∧
+      (B.liftMode fMR gMR hMR fLM gLM hLM).lmRel.ProductiveBoth :=
+  ⟨B.mrRel.liftMode_productiveBoth fMR hpMR,
+   B.lmRel.liftMode_productiveBoth fLM hpLM⟩
+
 /-- `DualCorrespondenceBundle.restrictMode` preserves Anneal productivity. -/
 theorem restrictMode_productiveAnneal {ModeMR' : Type uMM'}
     {ModeLM' : Type uML'}
@@ -3686,6 +3753,28 @@ theorem restrictMode_productiveRef {ModeMR' : Type uMM'} {ModeLM' : Type uML'}
   ⟨B.mrRel.liftMode_productiveRef fMR hpMR,
    B.lmRel.liftMode_productiveRef fLM hpLM⟩
 
+/-- `DualCorrespondenceBundle.restrictMode` preserves two-sided productivity
+(`ProductiveBoth`). -/
+theorem restrictMode_productiveBoth {ModeMR' : Type uMM'} {ModeLM' : Type uML'}
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (fMR : ModeMR' → ModeMR) (fLM : ModeLM' → ModeLM)
+    (mMRPos mMRFlt mMRFlip : ModeMR') (hMRPos : fMR mMRPos = B.mrPositive.m)
+    (hMRFlt : fMR mMRFlt = B.mrFault.m) (hMRFlip : fMR mMRFlip = B.mrFlip.m)
+    (mLMPos mLMFlt mLMFlip : ModeLM') (hLMPos : fLM mLMPos = B.lmPositive.m)
+    (hLMFlt : fLM mLMFlt = B.lmFault.m) (hLMFlip : fLM mLMFlip = B.lmFlip.m)
+    (mrMode? : Option (ModeSensitivityWitness (B.mrRel.liftMode fMR)) := none)
+    (lmMode? : Option (ModeSensitivityWitness (B.lmRel.liftMode fLM)) := none)
+    (hpMR : B.mrRel.ProductiveBoth) (hpLM : B.lmRel.ProductiveBoth) :
+    (B.restrictMode fMR fLM mMRPos mMRFlt mMRFlip hMRPos hMRFlt hMRFlip
+        mLMPos mLMFlt mLMFlip hLMPos hLMFlt hLMFlip mrMode?
+        lmMode?).mrRel.ProductiveBoth ∧
+      (B.restrictMode fMR fLM mMRPos mMRFlt mMRFlip hMRPos hMRFlt hMRFlip
+        mLMPos mLMFlt mLMFlip hLMPos hLMFlt hLMFlip mrMode?
+        lmMode?).lmRel.ProductiveBoth :=
+  ⟨B.mrRel.liftMode_productiveBoth fMR hpMR,
+   B.lmRel.liftMode_productiveBoth fLM hpLM⟩
+
 /-- Vertical bundle composition inherits Anneal productivity from the front
 step relations. -/
 theorem comp_productiveAnneal {ModeX : Type uMX} {RetX : Type uRX}
@@ -3719,6 +3808,68 @@ theorem comp_productiveAnneal {ModeX : Type uMX} {RetX : Type uRX}
         hcodecMR hcodecLM toFrontMR toFrontLM ExecFront
         hcoh).lmRel.ProductiveAnneal :=
   ⟨fun m p q hg => hpMR m p q hg.1, fun m p q hg => hpLM m p q hg.1⟩
+
+/-- Vertical bundle composition preserves full two-sided productivity
+(`ProductiveBoth`) directly from front Anneal productivity and back reference
+productivity (without requiring `ReverseTotal`). -/
+theorem comp_productiveBoth {ModeX : Type uMX} {RetX : Type uRX}
+    {UnwX : Type uUX}
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (frontCodec : CodecLaws RetX RetA)
+    {mrFront : ModeParamStepRel ModeMR Prog Query ChoiceMR RetX RetA UnwX UnwA}
+    {lmFront : ModeParamStepRel ModeLM Prog Query ChoiceLM RetX RetA UnwX UnwA}
+    (mrFrontSim : ModeStepSim mrFront) (lmFrontSim : ModeStepSim lmFront)
+    (hmidMR : ∀ m p q c out,
+      mrFront.ExecR m p q c out ↔ B.mrRel.ExecA m p q c out)
+    (hmidLM : ∀ m p q c out,
+      lmFront.ExecR m p q c out ↔ B.lmRel.ExecA m p q c out)
+    (hgateMR : ∀ m p q, B.mrRel.SupportGate m p q → mrFront.SupportGate m p q)
+    (hgateLM : ∀ m p q, B.lmRel.SupportGate m p q → lmFront.SupportGate m p q)
+    (hcodecMR : ∀ x a, mrFront.RetRel x a → a = frontCodec.encode x)
+    (hcodecLM : ∀ x a, lmFront.RetRel x a → a = frontCodec.encode x)
+    (toFrontMR : ModeMR → ModeX) (toFrontLM : ModeLM → ModeX)
+    (ExecFront : ModeX → Prog → Query → ExecOutcome4 RetX UnwX → Prop)
+    (hcoh :
+      (∀ m p q out,
+        (∃ c, mrFront.ExecA m p q c out) ↔ ExecFront (toFrontMR m) p q out) ∧
+      (∀ m p q out,
+        (∃ c, lmFront.ExecA m p q c out) ↔ ExecFront (toFrontLM m) p q out))
+    (hpAMR : mrFront.ProductiveAnneal) (hpALM : lmFront.ProductiveAnneal)
+    (hpRMR : B.mrRel.ProductiveRef) (hpRLM : B.lmRel.ProductiveRef) :
+    (B.comp frontCodec mrFrontSim lmFrontSim hmidMR hmidLM hgateMR hgateLM
+        hcodecMR hcodecLM toFrontMR toFrontLM ExecFront
+        hcoh).mrRel.ProductiveBoth ∧
+      (B.comp frontCodec mrFrontSim lmFrontSim hmidMR hmidLM hgateMR hgateLM
+        hcodecMR hcodecLM toFrontMR toFrontLM ExecFront
+        hcoh).lmRel.ProductiveBoth :=
+  ⟨⟨fun m p q hg => hpAMR m p q hg.1, fun m p q hg => hpRMR m p q hg.2⟩,
+   ⟨fun m p q hg => hpALM m p q hg.1, fun m p q hg => hpRLM m p q hg.2⟩⟩
+
+/-- Transitive bundle composition preserves `ProductiveBoth`. -/
+theorem trans_productiveBoth {ModeX : Type uMX} {RetX : Type uRX}
+    {UnwX : Type uUX}
+    (B₀ : DualCorrespondenceBundle ModeX Prog Query RetX UnwX RetA ModeMR
+      ChoiceMR RetA UnwA ModeLM ChoiceLM RetA UnwA)
+    (B₁ : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (hmidMR : ∀ m p q c out,
+      B₀.mrRel.ExecR m p q c out ↔ B₁.mrRel.ExecA m p q c out)
+    (hmidLM : ∀ m p q c out,
+      B₀.lmRel.ExecR m p q c out ↔ B₁.lmRel.ExecA m p q c out)
+    (hgateMR : ∀ m p q,
+      B₁.mrRel.SupportGate m p q → B₀.mrRel.SupportGate m p q)
+    (hgateLM : ∀ m p q,
+      B₁.lmRel.SupportGate m p q → B₀.lmRel.SupportGate m p q)
+    (hrepMR : ∀ a, B₀.repMR a = a) (hrepLM : ∀ a, B₀.repLM a = a)
+    (hpAMR : B₀.mrRel.ProductiveAnneal) (hpALM : B₀.lmRel.ProductiveAnneal)
+    (hpRMR : B₁.mrRel.ProductiveRef) (hpRLM : B₁.lmRel.ProductiveRef) :
+    (B₀.trans B₁ hmidMR hmidLM hgateMR hgateLM hrepMR
+        hrepLM).mrRel.ProductiveBoth ∧
+      (B₀.trans B₁ hmidMR hmidLM hgateMR hgateLM hrepMR
+        hrepLM).lmRel.ProductiveBoth :=
+  ⟨⟨fun m p q hg => hpAMR m p q hg.1, fun m p q hg => hpRMR m p q hg.2⟩,
+   ⟨fun m p q hg => hpALM m p q hg.1, fun m p q hg => hpRLM m p q hg.2⟩⟩
 
 /--
 Ergonomic constructor from evaluation-equivalence theorems. The Anneal model
@@ -4166,6 +4317,18 @@ theorem fromDetEquiv_productiveBoth (codec : CodecLaws RetA Rep)
     fun m p q _ => ⟨mrPositive.c, evalMR m p q mrPositive.c, rfl⟩⟩,
    ⟨fun m p q _ => ⟨lmPositive.c, evalA (toAnnealLM m) p q, rfl⟩,
     fun m p q _ => ⟨lmPositive.c, evalLM m p q lmPositive.c, rfl⟩⟩⟩
+
+/-- Every bundle built with `fromEquiv` whose authority relations satisfy
+`ReverseTotal` satisfies full two-sided productivity (`ProductiveBoth`),
+ruling out `fromEquiv_admits_stuck_ref`. -/
+theorem fromEquiv_productiveBoth_of_reverseTotal
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (hpMR : B.mrRel.ProductiveAnneal) (hpLM : B.lmRel.ProductiveAnneal)
+    (hrevMR : B.mrRel.ReverseTotal) (hrevLM : B.lmRel.ReverseTotal) :
+    B.mrRel.ProductiveBoth ∧ B.lmRel.ProductiveBoth :=
+  ⟨⟨hpMR, B.mrSim.productiveRef_of_reverseTotal hrevMR hpMR⟩,
+   ⟨hpLM, B.lmSim.productiveRef_of_reverseTotal hrevLM hpLM⟩⟩
 
 /--
 Tightness of `ProductiveBoth` vs `fromEquiv_productiveAnneal`
