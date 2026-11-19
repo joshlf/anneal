@@ -3049,6 +3049,3411 @@ impl MirObsPathSet {
     }
 }
 
+// ============================================================================
+// Episode 2: Verus `#3539`-Style External `#[spec]` Postcondition Oracle
+// Harnesses & Guo et al. (`arXiv:2611.11899`) Write-Chain Walk Coverage Bounds
+// ============================================================================
+
+/// Parameter descriptor for [`SpecContractOracleProbe`], binding a typed Rust
+/// parameter (by value or `&mut T`) to its [`LayoutSpec`] and optional
+/// frame-preserved fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecParamBinding {
+    /// Parameter identifier in the target function and contract expressions.
+    pub name: String,
+    /// Pointee / value Rust type syntax (e.g. `"u32"`, `"[u32; 4]"`, `"CounterPair"`).
+    /// When `is_mut_ref` is `true`, the target function signature receives `&mut <rust_ty>`.
+    pub rust_ty: String,
+    /// Exact layout specification used to validate and decode schedule bytes.
+    pub layout: LayoutSpec,
+    /// Whether this parameter is passed as `&mut <rust_ty>` so post-state
+    /// mutations and `frame_preserved_fields` are checked after execution.
+    pub is_mut_ref: bool,
+    /// Struct field names on an `is_mut_ref` parameter that the contract
+    /// frames as unmodified (`post.<field> == old(pre.<field>)` on occupied
+    /// non-padding bytes).
+    pub frame_preserved_fields: Vec<String>,
+}
+
+impl SpecParamBinding {
+    /// Creates a by-value parameter binding.
+    pub fn by_value(name: impl Into<String>, rust_ty: impl Into<String>, layout: LayoutSpec) -> Self {
+        Self {
+            name: name.into(),
+            rust_ty: rust_ty.into(),
+            layout,
+            is_mut_ref: false,
+            frame_preserved_fields: Vec::new(),
+        }
+    }
+
+    /// Creates a mutable-reference (`&mut T`) parameter binding.
+    pub fn mut_ref(name: impl Into<String>, rust_ty: impl Into<String>, layout: LayoutSpec) -> Self {
+        Self {
+            name: name.into(),
+            rust_ty: rust_ty.into(),
+            layout,
+            is_mut_ref: true,
+            frame_preserved_fields: Vec::new(),
+        }
+    }
+
+    /// Declares struct field names on an `&mut Struct` parameter whose occupied
+    /// bytes must remain identical between pre-state and post-state.
+    pub fn with_frame_preserved_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.frame_preserved_fields = fields.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// A single `requires(...)` or `ensures(...)` Boolean contract clause in a
+/// [`SpecContractOracleProbe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecContractAssertion {
+    /// Human-readable label / diagnostic identifier for this clause.
+    pub label: String,
+    /// Rust Boolean expression evaluated in both [`SpecContractOracleProbe::synthesize_rust_probe`]
+    /// and [`SpecContractOracleProbe::verify_spec_postcondition_against_schedule`].
+    /// `ensures` expressions may reference `result` and `old(<expr>)`.
+    pub rust_expr: String,
+}
+
+impl SpecContractAssertion {
+    /// Constructs a new contract assertion with `label` and Boolean `rust_expr`.
+    pub fn new(label: impl Into<String>, rust_expr: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            rust_expr: rust_expr.into(),
+        }
+    }
+}
+
+/// Execution phase in which a runtime trap, overflow, UB guard, or panic occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecExecPhase {
+    /// Trap occurred while evaluating a `requires(...)` clause.
+    Requires,
+    /// Trap occurred while executing the target callee body or an `EnvSchedule` call.
+    Body,
+    /// Trap occurred while evaluating an `ensures(...)` clause.
+    Ensures,
+}
+
+/// Kind of postcondition or frame violation detected after normal return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecViolationKind {
+    /// An explicit `ensures(...)` Boolean predicate evaluated to `false`.
+    EnsuresClause {
+        clause_index: usize,
+        label: String,
+    },
+    /// A framed field on an `&mut` parameter was mutated (`post != old`).
+    FrameCondition {
+        param: String,
+        field: String,
+    },
+}
+
+/// Concrete outcome of checking a [`SpecContractOracleProbe`] on one scheduled trial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecPostconditionVerdict {
+    /// A `requires(...)` precondition evaluated to `false`; the callee was not
+    /// executed and this trial is vacuously filtered (never counted as a hold).
+    VacuouslyFiltered {
+        failed_requires_index: usize,
+        failed_requires_label: String,
+    },
+    /// `requires` held, the body returned normally, all framed fields were
+    /// preserved, and every `ensures` predicate evaluated to `true`.
+    VerifiedHold,
+    /// The body returned normally, but an `ensures` clause or frame condition
+    /// was violated (unsound spec or buggy implementation mutant killed).
+    PostconditionViolation {
+        kind: SpecViolationKind,
+        detail: String,
+    },
+    /// Checked arithmetic overflow, shift-width UB (`shift >= bit_width`),
+    /// division by zero, out-of-bounds index, assertion failure, or scheduled
+    /// panic occurred while `requires` held (unsound/incomplete spec mutant killed).
+    PanicOrTrap {
+        phase: SpecExecPhase,
+        detail: String,
+    },
+}
+
+impl SpecPostconditionVerdict {
+    /// Whether this trial exposed a postcondition violation, frame violation,
+    /// or unguarded trap/panic (`PostconditionViolation` or `PanicOrTrap`).
+    pub fn is_mutant_killed(&self) -> bool {
+        matches!(
+            self,
+            Self::PostconditionViolation { .. } | Self::PanicOrTrap { .. }
+        )
+    }
+
+    /// Whether this trial genuinely exercised the body and verified all
+    /// postconditions and frame invariants (`VerifiedHold`).
+    pub fn is_verified_hold(&self) -> bool {
+        matches!(self, Self::VerifiedHold)
+    }
+}
+
+/// Aggregated report across a batch of concrete schedule evaluations for a
+/// [`SpecContractOracleProbe`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpecBatchVerificationReport {
+    pub total_trials: usize,
+    pub verified_hold_count: usize,
+    pub vacuously_filtered_count: usize,
+    pub postcondition_violation_count: usize,
+    pub panic_or_trap_count: usize,
+    pub verdicts: Vec<SpecPostconditionVerdict>,
+}
+
+impl SpecBatchVerificationReport {
+    /// Returns `true` iff zero violations/traps occurred AND at least one trial
+    /// satisfied `requires` and reached `VerifiedHold` (preventing vacuous
+    /// `requires(false)` specs from passing certification).
+    pub fn is_sound_and_non_vacuous(&self) -> bool {
+        self.postcondition_violation_count == 0
+            && self.panic_or_trap_count == 0
+            && self.verified_hold_count > 0
+    }
+
+    /// Returns `true` iff at least one trial killed the spec/implementation
+    /// via `PostconditionViolation` or `PanicOrTrap`.
+    pub fn is_mutant_killed(&self) -> bool {
+        self.postcondition_violation_count > 0 || self.panic_or_trap_count > 0
+    }
+}
+
+fn is_valid_rust_ident(s: &str) -> bool {
+    syn::parse_str::<syn::Ident>(s).is_ok()
+}
+
+fn contains_old_call(expr: &Expr) -> bool {
+    struct OldFinder(bool);
+    impl<'ast> Visit<'ast> for OldFinder {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let Expr::Path(ep) = &*node.func
+                && ep.qself.is_none()
+                && ep.path.leading_colon.is_none()
+                && ep.path.segments.len() == 1
+                && ep.path.segments[0].ident == "old"
+            {
+                self.0 = true;
+                return;
+            }
+            visit::visit_expr_call(self, node);
+        }
+    }
+    let mut finder = OldFinder(false);
+    finder.visit_expr(expr);
+    finder.0
+}
+
+fn validate_old_calls_in_ensures(expr: &Expr) -> Result<(), String> {
+    struct OldValidator {
+        in_old: bool,
+        err: Option<String>,
+    }
+    impl<'ast> Visit<'ast> for OldValidator {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if self.err.is_some() {
+                return;
+            }
+            if let Expr::Path(ep) = &*node.func
+                && ep.qself.is_none()
+                && ep.path.leading_colon.is_none()
+                && ep.path.segments.len() == 1
+                && ep.path.segments[0].ident == "old"
+            {
+                if self.in_old {
+                    self.err = Some("nested `old(old(...))` is not permitted".to_string());
+                    return;
+                }
+                if node.args.len() != 1 {
+                    self.err = Some(format!(
+                        "`old(...)` expects exactly 1 argument, got {}",
+                        node.args.len()
+                    ));
+                    return;
+                }
+                self.in_old = true;
+                visit::visit_expr(self, &node.args[0]);
+                self.in_old = false;
+                return;
+            }
+            visit::visit_expr_call(self, node);
+        }
+    }
+    let mut v = OldValidator {
+        in_old: false,
+        err: None,
+    };
+    v.visit_expr(expr);
+    match v.err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn hoist_old_expressions_for_rust(
+    expr: &mut Expr,
+    hoisted: &mut Vec<(String, String)>,
+) {
+    use quote::ToTokens;
+    use syn::visit_mut::VisitMut;
+
+    struct Hoister<'a> {
+        hoisted: &'a mut Vec<(String, String)>,
+    }
+    impl VisitMut for Hoister<'_> {
+        fn visit_expr_mut(&mut self, node: &mut Expr) {
+            if let Expr::Call(call) = node
+                && let Expr::Path(ep) = &*call.func
+                && ep.qself.is_none()
+                && ep.path.leading_colon.is_none()
+                && ep.path.segments.len() == 1
+                && ep.path.segments[0].ident == "old"
+                && call.args.len() == 1
+            {
+                let inner_tokens = call.args[0].to_token_stream().to_string();
+                let var_name = if let Some((existing, _)) =
+                    self.hoisted.iter().find(|(_, src)| src == &inner_tokens)
+                {
+                    existing.clone()
+                } else {
+                    let fresh = format!("__anneal_old_expr_{}", self.hoisted.len());
+                    self.hoisted.push((fresh.clone(), inner_tokens));
+                    fresh
+                };
+                let ident = syn::Ident::new(&var_name, proc_macro2::Span::call_site());
+                *node = syn::parse_quote!(#ident);
+                return;
+            }
+            syn::visit_mut::visit_expr_mut(self, node);
+        }
+    }
+    Hoister { hoisted }.visit_expr_mut(expr);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpecEvalValue {
+    Unit,
+    Bool(bool),
+    Char(char),
+    Int {
+        bits: u128,
+        size_bytes: usize,
+        signed: bool,
+        untyped_lit: bool,
+    },
+    Struct {
+        name: String,
+        layout: LayoutSpec,
+        raw_bytes: Vec<u8>,
+        fields: BTreeMap<String, SpecEvalValue>,
+    },
+    Tuple {
+        layout: LayoutSpec,
+        raw_bytes: Vec<u8>,
+        elems: Vec<SpecEvalValue>,
+    },
+    Array {
+        layout: LayoutSpec,
+        elem_layout: LayoutSpec,
+        elem_stride: usize,
+        raw_bytes: Vec<u8>,
+        elems: Vec<SpecEvalValue>,
+    },
+}
+
+impl SpecEvalValue {
+    fn from_layout_bytes(layout: &LayoutSpec, raw: &[u8]) -> Result<Self, ScheduleError> {
+        layout.validate_bytes(raw)?;
+        Self::decode_validated(layout, raw)
+    }
+
+    fn decode_validated(layout: &LayoutSpec, raw: &[u8]) -> Result<Self, ScheduleError> {
+        match layout {
+            LayoutSpec::Scalar(s) => {
+                if s.size_bytes == 0 {
+                    return Ok(Self::Unit);
+                }
+                let bits = decode_scalar_le_bytes(&raw[..s.size_bytes]);
+                if s.is_bool {
+                    Ok(Self::Bool(bits != 0))
+                } else if s.is_char {
+                    let ch = char::from_u32(bits as u32).ok_or_else(|| {
+                        ScheduleError::InvalidBitPattern {
+                            context: "SpecEvalValue::Char".to_string(),
+                            reason: format!("invalid Unicode scalar {bits:#x}"),
+                        }
+                    })?;
+                    Ok(Self::Char(ch))
+                } else {
+                    Ok(Self::Int {
+                        bits: bits & width_mask(s.bit_width()),
+                        size_bytes: s.size_bytes,
+                        signed: s.signed,
+                        untyped_lit: false,
+                    })
+                }
+            }
+            LayoutSpec::Struct { name, fields, .. } => {
+                let mut map = BTreeMap::new();
+                for f in fields {
+                    let end = f.offset + f.layout.total_size();
+                    let v = Self::decode_validated(&f.layout, &raw[f.offset..end])?;
+                    map.insert(f.name.clone(), v);
+                }
+                Ok(Self::Struct {
+                    name: name.clone(),
+                    layout: layout.clone(),
+                    raw_bytes: raw.to_vec(),
+                    fields: map,
+                })
+            }
+            LayoutSpec::Tuple { elements, .. } => {
+                let mut elems = Vec::with_capacity(elements.len());
+                for (off, el_layout) in elements {
+                    let end = *off + el_layout.total_size();
+                    elems.push(Self::decode_validated(el_layout, &raw[*off..end])?);
+                }
+                Ok(Self::Tuple {
+                    layout: layout.clone(),
+                    raw_bytes: raw.to_vec(),
+                    elems,
+                })
+            }
+            LayoutSpec::Array {
+                elem,
+                elem_stride,
+                len,
+            } => {
+                let mut elems = Vec::with_capacity(*len);
+                let el_sz = elem.total_size();
+                for i in 0..*len {
+                    let start = i * (*elem_stride);
+                    elems.push(Self::decode_validated(elem, &raw[start..start + el_sz])?);
+                }
+                Ok(Self::Array {
+                    layout: layout.clone(),
+                    elem_layout: (**elem).clone(),
+                    elem_stride: *elem_stride,
+                    raw_bytes: raw.to_vec(),
+                    elems,
+                })
+            }
+            LayoutSpec::Enum { .. } => Err(ScheduleError::InvalidBitPattern {
+                context: "SpecEvalValue::Enum".to_string(),
+                reason: "enum decoding in SpecContractOracleProbe requires struct/scalar/array/tuple layouts".to_string(),
+            }),
+        }
+    }
+
+    fn to_layout_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Unit => Vec::new(),
+            Self::Bool(b) => vec![u8::from(*b)],
+            Self::Char(c) => (*c as u32).to_le_bytes().to_vec(),
+            Self::Int {
+                bits, size_bytes, ..
+            } => encode_scalar_le_bytes(*bits, *size_bytes),
+            Self::Struct {
+                layout: LayoutSpec::Struct { fields, .. },
+                raw_bytes,
+                fields: map,
+                ..
+            } => {
+                let mut out = raw_bytes.clone();
+                for f in fields {
+                    if let Some(fv) = map.get(&f.name) {
+                        let fb = fv.to_layout_bytes();
+                        let end = f.offset + fb.len();
+                        if end <= out.len() {
+                            out[f.offset..end].copy_from_slice(&fb);
+                        }
+                    }
+                }
+                out
+            }
+            Self::Tuple {
+                layout: LayoutSpec::Tuple { elements, .. },
+                raw_bytes,
+                elems,
+            } => {
+                let mut out = raw_bytes.clone();
+                for ((off, _), ev) in elements.iter().zip(elems) {
+                    let eb = ev.to_layout_bytes();
+                    let end = *off + eb.len();
+                    if end <= out.len() {
+                        out[*off..end].copy_from_slice(&eb);
+                    }
+                }
+                out
+            }
+            Self::Array {
+                elem_stride,
+                raw_bytes,
+                elems,
+                ..
+            } => {
+                let mut out = raw_bytes.clone();
+                for (i, ev) in elems.iter().enumerate() {
+                    let eb = ev.to_layout_bytes();
+                    let start = i * (*elem_stride);
+                    let end = start + eb.len();
+                    if end <= out.len() {
+                        out[start..end].copy_from_slice(&eb);
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn to_signed_i128(&self) -> Result<i128, String> {
+        let Self::Int {
+            bits,
+            size_bytes,
+            signed,
+            ..
+        } = self
+        else {
+            return Err(format!("expected integer value, got {self:?}"));
+        };
+        let bw = (*size_bytes * 8) as u32;
+        let masked = *bits & width_mask(bw);
+        if *signed {
+            if bw >= 128 {
+                Ok(masked as i128)
+            } else {
+                let sign_bit = 1u128 << (bw - 1);
+                if (masked & sign_bit) != 0 {
+                    let ext = masked | (!width_mask(bw));
+                    Ok(ext as i128)
+                } else {
+                    Ok(masked as i128)
+                }
+            }
+        } else {
+            Ok(masked as i128)
+        }
+    }
+
+    fn rust_literal(&self, rust_ty: &str) -> String {
+        match self {
+            Self::Unit => "()".to_string(),
+            Self::Bool(b) => b.to_string(),
+            Self::Char(c) => format!("{c:?}"),
+            Self::Int {
+                bits,
+                size_bytes,
+                signed,
+                ..
+            } => {
+                let ty = rust_ty.trim();
+                if *signed {
+                    let bw = (*size_bytes * 8) as u32;
+                    let min_v = if bw >= 128 {
+                        i128::MIN
+                    } else {
+                        -(1i128 << (bw - 1))
+                    };
+                    let v = self.to_signed_i128().unwrap_or(0);
+                    if v == min_v {
+                        format!("{ty}::MIN")
+                    } else {
+                        format!("{v}{ty}")
+                    }
+                } else {
+                    let masked = *bits & width_mask((*size_bytes * 8) as u32);
+                    format!("{masked}{ty}")
+                }
+            }
+            Self::Struct {
+                name,
+                layout: LayoutSpec::Struct { fields, .. },
+                fields: map,
+                ..
+            } => {
+                let mut parts = Vec::with_capacity(fields.len());
+                for f in fields {
+                    if let Some(v) = map.get(&f.name) {
+                        let fty = default_rust_ty_for_layout(&f.layout);
+                        parts.push(format!("{}: {}", f.name, v.rust_literal(&fty)));
+                    }
+                }
+                format!("{name} {{ {} }}", parts.join(", "))
+            }
+            Self::Tuple {
+                layout: LayoutSpec::Tuple { elements, .. },
+                elems,
+                ..
+            } => {
+                if elems.is_empty() {
+                    return "()".to_string();
+                }
+                let parts: Vec<String> = elements
+                    .iter()
+                    .zip(elems)
+                    .map(|((_, l), v)| v.rust_literal(&default_rust_ty_for_layout(l)))
+                    .collect();
+                format!("({},)", parts.join(", "))
+            }
+            Self::Array {
+                elem_layout, elems, ..
+            } => {
+                let ety = default_rust_ty_for_layout(elem_layout);
+                let parts: Vec<String> = elems.iter().map(|v| v.rust_literal(&ety)).collect();
+                format!("[{}]", parts.join(", "))
+            }
+            _ => "()".to_string(),
+        }
+    }
+}
+
+fn default_rust_ty_for_layout(layout: &LayoutSpec) -> String {
+    match layout {
+        LayoutSpec::Scalar(s) => {
+            if s.is_bool {
+                "bool".to_string()
+            } else if s.is_char {
+                "char".to_string()
+            } else {
+                match (s.signed, s.size_bytes) {
+                    (false, 1) => "u8".to_string(),
+                    (false, 2) => "u16".to_string(),
+                    (false, 4) => "u32".to_string(),
+                    (false, 8) => "u64".to_string(),
+                    (false, 16) => "u128".to_string(),
+                    (true, 1) => "i8".to_string(),
+                    (true, 2) => "i16".to_string(),
+                    (true, 4) => "i32".to_string(),
+                    (true, 8) => "i64".to_string(),
+                    (true, 16) => "i128".to_string(),
+                    _ => "u32".to_string(),
+                }
+            }
+        }
+        LayoutSpec::Struct { name, .. } => name.clone(),
+        LayoutSpec::Array { elem, len, .. } => {
+            format!("[{}; {}]", default_rust_ty_for_layout(elem), len)
+        }
+        LayoutSpec::Tuple { elements, .. } => {
+            if elements.is_empty() {
+                "()".to_string()
+            } else {
+                let inner: Vec<String> = elements
+                    .iter()
+                    .map(|(_, l)| default_rust_ty_for_layout(l))
+                    .collect();
+                format!("({},)", inner.join(", "))
+            }
+        }
+        LayoutSpec::Enum { name, .. } => name.clone(),
+    }
+}
+
+fn parse_scalar_type_spec(ty_name: &str) -> Option<(usize, bool)> {
+    match ty_name.trim() {
+        "u8" => Some((1, false)),
+        "u16" => Some((2, false)),
+        "u32" => Some((4, false)),
+        "u64" | "usize" => Some((8, false)),
+        "u128" => Some((16, false)),
+        "i8" => Some((1, true)),
+        "i16" => Some((2, true)),
+        "i32" => Some((4, true)),
+        "i64" | "isize" => Some((8, true)),
+        "i128" => Some((16, true)),
+        _ => None,
+    }
+}
+
+fn coerce_untyped_int_pair(
+    lhs: SpecEvalValue,
+    rhs: SpecEvalValue,
+) -> Result<(SpecEvalValue, SpecEvalValue), String> {
+    match (&lhs, &rhs) {
+        (
+            SpecEvalValue::Int {
+                size_bytes: ls,
+                signed: lsig,
+                untyped_lit: false,
+                ..
+            },
+            SpecEvalValue::Int {
+                bits: rb,
+                signed: rsig,
+                untyped_lit: true,
+                ..
+            },
+        ) => {
+            let coerced = coerce_lit_to_int(*rb, *rsig, *ls, *lsig)?;
+            Ok((lhs, coerced))
+        }
+        (
+            SpecEvalValue::Int {
+                bits: lb,
+                signed: lsig,
+                untyped_lit: true,
+                ..
+            },
+            SpecEvalValue::Int {
+                size_bytes: rs,
+                signed: rsig,
+                untyped_lit: false,
+                ..
+            },
+        ) => {
+            let coerced = coerce_lit_to_int(*lb, *lsig, *rs, *rsig)?;
+            Ok((coerced, rhs))
+        }
+        _ => Ok((lhs, rhs)),
+    }
+}
+
+fn coerce_lit_to_int(
+    raw_bits: u128,
+    raw_signed: bool,
+    target_size: usize,
+    target_signed: bool,
+) -> Result<SpecEvalValue, String> {
+    let bw = (target_size * 8) as u32;
+    let mask = width_mask(bw);
+    if target_signed {
+        let sval = if raw_signed {
+            raw_bits as i128
+        } else if raw_bits <= i128::MAX as u128 {
+            raw_bits as i128
+        } else {
+            return Err(format!("integer literal {raw_bits} overflows signed {bw}-bit type"));
+        };
+        let min_v = if bw >= 128 { i128::MIN } else { -(1i128 << (bw - 1)) };
+        let max_v = if bw >= 128 {
+            i128::MAX
+        } else {
+            (1i128 << (bw - 1)) - 1
+        };
+        if sval < min_v || sval > max_v {
+            return Err(format!(
+                "integer literal {sval} out of range for signed {bw}-bit type"
+            ));
+        }
+        Ok(SpecEvalValue::Int {
+            bits: (sval as u128) & mask,
+            size_bytes: target_size,
+            signed: true,
+            untyped_lit: false,
+        })
+    } else {
+        if raw_signed && (raw_bits as i128) < 0 {
+            return Err("negative integer literal coerced to unsigned type".to_string());
+        }
+        if raw_bits > mask {
+            return Err(format!(
+                "integer literal {raw_bits} overflows unsigned {bw}-bit type"
+            ));
+        }
+        Ok(SpecEvalValue::Int {
+            bits: raw_bits & mask,
+            size_bytes: target_size,
+            signed: false,
+            untyped_lit: false,
+        })
+    }
+}
+
+struct SpecEvalContext<'a> {
+    env: BTreeMap<String, SpecEvalValue>,
+    pre_env: Option<&'a BTreeMap<String, SpecEvalValue>>,
+    struct_layouts: &'a BTreeMap<String, LayoutSpec>,
+    external_callees: &'a BTreeMap<String, LayoutSpec>,
+    helper_fns: &'a BTreeMap<String, syn::ItemFn>,
+    schedule: Option<&'a mut EnvSchedule>,
+    call_index: usize,
+    early_return: Option<SpecEvalValue>,
+}
+
+impl<'a> SpecEvalContext<'a> {
+    fn eval_block(&mut self, block: &syn::Block) -> Result<SpecEvalValue, String> {
+        let mut shadowed: Vec<(String, Option<SpecEvalValue>)> = Vec::new();
+        let res = self.eval_block_inner(block, &mut shadowed);
+        for (name, prev) in shadowed.into_iter().rev() {
+            match prev {
+                Some(v) => {
+                    self.env.insert(name, v);
+                }
+                None => {
+                    self.env.remove(&name);
+                }
+            }
+        }
+        res
+    }
+
+    fn eval_block_inner(
+        &mut self,
+        block: &syn::Block,
+        shadowed: &mut Vec<(String, Option<SpecEvalValue>)>,
+    ) -> Result<SpecEvalValue, String> {
+        let mut last = SpecEvalValue::Unit;
+        for stmt in &block.stmts {
+            if let Some(ret) = &self.early_return {
+                return Ok(ret.clone());
+            }
+            match stmt {
+                syn::Stmt::Local(loc) => {
+                    let init_expr = loc
+                        .init
+                        .as_ref()
+                        .ok_or_else(|| "uninitialized local `let` binding in spec probe".to_string())?;
+                    let mut val = self.eval_expr(&init_expr.expr)?;
+                    let (bind_name, ty_ann) = extract_local_pat_and_ty(&loc.pat)?;
+                    if let Some(ty_str) = ty_ann
+                        && let Some((sz, sig)) = parse_scalar_type_spec(&ty_str)
+                        && let SpecEvalValue::Int {
+                            bits,
+                            signed: rsig,
+                            untyped_lit: true,
+                            ..
+                        } = val
+                    {
+                        val = coerce_lit_to_int(bits, rsig, sz, sig)?;
+                    }
+                    if bind_name != "_" {
+                        let prev = self.env.insert(bind_name.clone(), val);
+                        shadowed.push((bind_name, prev));
+                    }
+                    last = SpecEvalValue::Unit;
+                }
+                syn::Stmt::Expr(e, semi) => {
+                    let v = self.eval_expr(e)?;
+                    if let Some(ret) = &self.early_return {
+                        return Ok(ret.clone());
+                    }
+                    last = if semi.is_some() { SpecEvalValue::Unit } else { v };
+                }
+                syn::Stmt::Macro(m) => {
+                    let m_name = m
+                        .mac
+                        .path
+                        .segments
+                        .last()
+                        .map(|s| s.ident.to_string())
+                        .unwrap_or_default();
+                    self.eval_macro(&m_name, &m.mac.tokens)?;
+                    last = SpecEvalValue::Unit;
+                }
+                syn::Stmt::Item(_) => {}
+            }
+        }
+        if let Some(ret) = &self.early_return {
+            return Ok(ret.clone());
+        }
+        Ok(last)
+    }
+
+    fn eval_macro(
+        &mut self,
+        m_name: &str,
+        tokens: &proc_macro2::TokenStream,
+    ) -> Result<SpecEvalValue, String> {
+        match m_name {
+            "panic" | "unreachable" | "todo" | "unimplemented" => {
+                Err(format!("explicit `{m_name}!` panic: {tokens}"))
+            }
+            "assert" | "debug_assert" => {
+                let parser = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated;
+                let args = syn::parse::Parser::parse2(parser, tokens.clone())
+                    .map_err(|e| format!("invalid `{m_name}!` syntax: {e}"))?;
+                let cond = args
+                    .first()
+                    .ok_or_else(|| format!("empty `{m_name}!()` invocation"))?;
+                match self.eval_expr(cond)? {
+                    SpecEvalValue::Bool(true) => Ok(SpecEvalValue::Unit),
+                    SpecEvalValue::Bool(false) => Err(format!("assertion failed: `{tokens}`")),
+                    other => Err(format!("non-boolean `{m_name}!` condition: {other:?}")),
+                }
+            }
+            "assert_eq" | "debug_assert_eq" => {
+                let parser = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated;
+                let args = syn::parse::Parser::parse2(parser, tokens.clone())
+                    .map_err(|e| format!("invalid `{m_name}!` syntax: {e}"))?;
+                if args.len() < 2 {
+                    return Err(format!("`{m_name}!` requires 2 arguments"));
+                }
+                let l = self.eval_expr(&args[0])?;
+                let r = self.eval_expr(&args[1])?;
+                let (l, r) = coerce_untyped_int_pair(l, r)?;
+                if l == r {
+                    Ok(SpecEvalValue::Unit)
+                } else {
+                    Err(format!("`{m_name}!` failed: {l:?} != {r:?}"))
+                }
+            }
+            other => Err(format!("unsupported macro `{other}!` in spec probe")),
+        }
+    }
+
+    fn assign_place(&mut self, lhs: &Expr, rhs: SpecEvalValue) -> Result<(), String> {
+        match lhs {
+            Expr::Paren(p) => self.assign_place(&p.expr, rhs),
+            Expr::Unary(un) if matches!(un.op, syn::UnOp::Deref(_)) => {
+                self.assign_place(&un.expr, rhs)
+            }
+            Expr::Path(ep) if ep.qself.is_none() && ep.path.segments.len() == 1 => {
+                let name = ep.path.segments[0].ident.to_string();
+                let cur = self
+                    .env
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown assignment target `{name}`"))?;
+                let (_, coerced) = coerce_untyped_int_pair(cur, rhs)?;
+                self.env.insert(name, coerced);
+                Ok(())
+            }
+            Expr::Field(ef) => {
+                let Member::Named(field_ident) = &ef.member else {
+                    return Err("unnamed tuple field assignment unsupported".to_string());
+                };
+                let root_name = extract_place_root_ident(&ef.base)
+                    .ok_or_else(|| "unsupported nested field assignment target".to_string())?;
+                let Some(SpecEvalValue::Struct {
+                    name,
+                    layout,
+                    raw_bytes,
+                    mut fields,
+                }) = self.env.get(&root_name).cloned()
+                else {
+                    return Err(format!("`{root_name}` is not a struct variable"));
+                };
+                let fname = field_ident.to_string();
+                let prev = fields
+                    .get(&fname)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown field `{fname}` on `{name}`"))?;
+                let (_, coerced) = coerce_untyped_int_pair(prev, rhs)?;
+                fields.insert(fname, coerced);
+                let updated = SpecEvalValue::Struct {
+                    name,
+                    layout,
+                    raw_bytes,
+                    fields,
+                };
+                let new_raw = updated.to_layout_bytes();
+                if let SpecEvalValue::Struct {
+                    name,
+                    layout,
+                    fields,
+                    ..
+                } = updated
+                {
+                    self.env.insert(
+                        root_name,
+                        SpecEvalValue::Struct {
+                            name,
+                            layout,
+                            raw_bytes: new_raw,
+                            fields,
+                        },
+                    );
+                }
+                Ok(())
+            }
+            Expr::Index(ix) => {
+                let idx_val = self.eval_expr(&ix.index)?;
+                let idx = match idx_val {
+                    SpecEvalValue::Int {
+                        bits, signed: false, ..
+                    } => bits as usize,
+                    _ => return Err("array index must be an unsigned integer".to_string()),
+                };
+                let root_name = extract_place_root_ident(&ix.expr)
+                    .ok_or_else(|| "unsupported array assignment base".to_string())?;
+                let Some(SpecEvalValue::Array {
+                    layout,
+                    elem_layout,
+                    elem_stride,
+                    raw_bytes,
+                    mut elems,
+                }) = self.env.get(&root_name).cloned()
+                else {
+                    return Err(format!("`{root_name}` is not an array variable"));
+                };
+                if idx >= elems.len() {
+                    return Err(format!(
+                        "index out of bounds: the len is {} but the index is {idx}",
+                        elems.len()
+                    ));
+                }
+                let (_, coerced) = coerce_untyped_int_pair(elems[idx].clone(), rhs)?;
+                elems[idx] = coerced;
+                let updated = SpecEvalValue::Array {
+                    layout,
+                    elem_layout,
+                    elem_stride,
+                    raw_bytes,
+                    elems,
+                };
+                let new_raw = updated.to_layout_bytes();
+                if let SpecEvalValue::Array {
+                    layout,
+                    elem_layout,
+                    elem_stride,
+                    elems,
+                    ..
+                } = updated
+                {
+                    self.env.insert(
+                        root_name,
+                        SpecEvalValue::Array {
+                            layout,
+                            elem_layout,
+                            elem_stride,
+                            raw_bytes: new_raw,
+                            elems,
+                        },
+                    );
+                }
+                Ok(())
+            }
+            _ => Err("unsupported assignment left-hand side".to_string()),
+        }
+    }
+
+    fn eval_expr(&mut self, expr: &Expr) -> Result<SpecEvalValue, String> {
+        use quote::ToTokens;
+        match expr {
+            Expr::Paren(p) => self.eval_expr(&p.expr),
+            Expr::Group(g) => self.eval_expr(&g.expr),
+            Expr::Block(b) => self.eval_block(&b.block),
+            Expr::Unsafe(u) => self.eval_block(&u.block),
+            Expr::Return(r) => {
+                let val = match &r.expr {
+                    Some(e) => self.eval_expr(e)?,
+                    None => SpecEvalValue::Unit,
+                };
+                self.early_return = Some(val.clone());
+                Ok(val)
+            }
+            Expr::Tuple(t) if t.elems.is_empty() => Ok(SpecEvalValue::Unit),
+            Expr::Lit(el) => match &el.lit {
+                Lit::Bool(b) => Ok(SpecEvalValue::Bool(b.value)),
+                Lit::Char(c) => Ok(SpecEvalValue::Char(c.value())),
+                Lit::Int(li) => {
+                    let suffix = li.suffix();
+                    if suffix.is_empty() {
+                        let v = li
+                            .base10_parse::<u128>()
+                            .map_err(|e| format!("invalid int literal `{li}`: {e}"))?;
+                        Ok(SpecEvalValue::Int {
+                            bits: v,
+                            size_bytes: 4,
+                            signed: false,
+                            untyped_lit: true,
+                        })
+                    } else if let Some((sz, sig)) = parse_scalar_type_spec(suffix) {
+                        if sig {
+                            let v = li
+                                .base10_parse::<i128>()
+                                .map_err(|e| format!("invalid signed int literal `{li}`: {e}"))?;
+                            coerce_lit_to_int(v as u128, true, sz, true)
+                        } else {
+                            let v = li
+                                .base10_parse::<u128>()
+                                .map_err(|e| format!("invalid unsigned int literal `{li}`: {e}"))?;
+                            coerce_lit_to_int(v, false, sz, false)
+                        }
+                    } else {
+                        Err(format!("unsupported integer literal suffix `{suffix}`"))
+                    }
+                }
+                other => Err(format!(
+                    "unsupported literal `{}`",
+                    other.to_token_stream()
+                )),
+            },
+            Expr::Path(ep) if ep.qself.is_none() => {
+                if ep.path.segments.len() == 1 {
+                    let id = ep.path.segments[0].ident.to_string();
+                    self.env
+                        .get(&id)
+                        .cloned()
+                        .ok_or_else(|| format!("unknown variable `{id}`"))
+                } else if ep.path.segments.len() == 2 {
+                    let ty = ep.path.segments[0].ident.to_string();
+                    let assoc = ep.path.segments[1].ident.to_string();
+                    eval_assoc_int_const(&ty, &assoc)
+                } else {
+                    Err(format!("unsupported path `{}`", ep.to_token_stream()))
+                }
+            }
+            Expr::Reference(r) => self.eval_expr(&r.expr),
+            Expr::Unary(un) => match un.op {
+                syn::UnOp::Deref(_) => self.eval_expr(&un.expr),
+                syn::UnOp::Not(_) => match self.eval_expr(&un.expr)? {
+                    SpecEvalValue::Bool(b) => Ok(SpecEvalValue::Bool(!b)),
+                    SpecEvalValue::Int {
+                        bits,
+                        size_bytes,
+                        signed,
+                        untyped_lit,
+                    } => {
+                        let mask = width_mask((size_bytes * 8) as u32);
+                        Ok(SpecEvalValue::Int {
+                            bits: (!bits) & mask,
+                            size_bytes,
+                            signed,
+                            untyped_lit,
+                        })
+                    }
+                    other => Err(format!("cannot apply `!` to {other:?}")),
+                },
+                syn::UnOp::Neg(_) => {
+                    if let Expr::Lit(ExprLit {
+                        lit: Lit::Int(li), ..
+                    }) = &*un.expr
+                    {
+                        let suffix = li.suffix();
+                        let mag = li
+                            .base10_parse::<u128>()
+                            .map_err(|e| format!("invalid negated literal: {e}"))?;
+                        if suffix.is_empty() {
+                            if mag > (i128::MAX as u128) + 1 {
+                                return Err("negated integer literal overflows i128".to_string());
+                            }
+                            let neg = (-(mag as i128)) as u128;
+                            return Ok(SpecEvalValue::Int {
+                                bits: neg,
+                                size_bytes: 4,
+                                signed: true,
+                                untyped_lit: true,
+                            });
+                        } else if let Some((sz, true)) = parse_scalar_type_spec(suffix) {
+                            let bw = (sz * 8) as u32;
+                            let min_mag = if bw >= 128 {
+                                1u128 << 127
+                            } else {
+                                1u128 << (bw - 1)
+                            };
+                            if mag > min_mag {
+                                return Err(format!("negated literal `-{li}` overflows `{suffix}`"));
+                            }
+                            let neg = 0u128.wrapping_sub(mag) & width_mask(bw);
+                            return Ok(SpecEvalValue::Int {
+                                bits: neg,
+                                size_bytes: sz,
+                                signed: true,
+                                untyped_lit: false,
+                            });
+                        }
+                    }
+                    let inner = self.eval_expr(&un.expr)?;
+                    match inner {
+                        SpecEvalValue::Int {
+                            bits,
+                            size_bytes,
+                            signed,
+                            ..
+                        } => {
+                            if !signed {
+                                if bits == 0 {
+                                    Ok(inner)
+                                } else {
+                                    Err("attempt to negate unsigned non-zero integer with overflow"
+                                        .to_string())
+                                }
+                            } else {
+                                let bw = (size_bytes * 8) as u32;
+                                let sval = inner.to_signed_i128()?;
+                                let min_v =
+                                    if bw >= 128 { i128::MIN } else { -(1i128 << (bw - 1)) };
+                                if sval == min_v {
+                                    Err("attempt to negate with overflow".to_string())
+                                } else {
+                                    Ok(SpecEvalValue::Int {
+                                        bits: ((-sval) as u128) & width_mask(bw),
+                                        size_bytes,
+                                        signed: true,
+                                        untyped_lit: false,
+                                    })
+                                }
+                            }
+                        }
+                        other => Err(format!("cannot negate {other:?}")),
+                    }
+                }
+                _ => Err("unsupported unary operator".to_string()),
+            },
+            Expr::Field(ef) => {
+                let base = self.eval_expr(&ef.base)?;
+                match (&base, &ef.member) {
+                    (SpecEvalValue::Struct { name, fields, .. }, Member::Named(id)) => fields
+                        .get(&id.to_string())
+                        .cloned()
+                        .ok_or_else(|| format!("unknown field `{id}` on struct `{name}`")),
+                    (SpecEvalValue::Tuple { elems, .. }, Member::Unnamed(idx)) => elems
+                        .get(idx.index as usize)
+                        .cloned()
+                        .ok_or_else(|| format!("tuple index {} out of bounds", idx.index)),
+                    _ => Err("invalid field projection".to_string()),
+                }
+            }
+            Expr::Index(ix) => {
+                let base = self.eval_expr(&ix.expr)?;
+                let idx_val = self.eval_expr(&ix.index)?;
+                let idx = match idx_val {
+                    SpecEvalValue::Int {
+                        bits, signed: false, ..
+                    } => bits as usize,
+                    _ => return Err("slice/array index must be unsigned".to_string()),
+                };
+                let SpecEvalValue::Array { elems, .. } = base else {
+                    return Err("indexing requires array value".to_string());
+                };
+                if idx >= elems.len() {
+                    return Err(format!(
+                        "index out of bounds: the len is {} but the index is {idx}",
+                        elems.len()
+                    ));
+                }
+                Ok(elems[idx].clone())
+            }
+            Expr::Struct(es) => {
+                let sname = es
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let layout = self
+                    .struct_layouts
+                    .get(&sname)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown struct layout `{sname}`"))?;
+                let LayoutSpec::Struct {
+                    total_size,
+                    fields: field_specs,
+                    ..
+                } = &layout
+                else {
+                    return Err(format!("`{sname}` layout is not a struct"));
+                };
+                let mut fvals = BTreeMap::new();
+                for fv in &es.fields {
+                    let Member::Named(fid) = &fv.member else {
+                        return Err("unnamed struct literal field".to_string());
+                    };
+                    let mut val = self.eval_expr(&fv.expr)?;
+                    if let Some(fspec) = field_specs.iter().find(|f| f.name == *fid.to_string())
+                        && let LayoutSpec::Scalar(sc) = &fspec.layout
+                        && let SpecEvalValue::Int {
+                            bits,
+                            signed: rsig,
+                            untyped_lit: true,
+                            ..
+                        } = val
+                    {
+                        val = coerce_lit_to_int(bits, rsig, sc.size_bytes, sc.signed)?;
+                    }
+                    fvals.insert(fid.to_string(), val);
+                }
+                let provisional = SpecEvalValue::Struct {
+                    name: sname.clone(),
+                    layout: layout.clone(),
+                    raw_bytes: vec![0u8; *total_size],
+                    fields: fvals.clone(),
+                };
+                let bytes = provisional.to_layout_bytes();
+                Ok(SpecEvalValue::Struct {
+                    name: sname,
+                    layout,
+                    raw_bytes: bytes,
+                    fields: fvals,
+                })
+            }
+            Expr::Assign(ea) => {
+                let rhs = self.eval_expr(&ea.right)?;
+                self.assign_place(&ea.left, rhs)?;
+                Ok(SpecEvalValue::Unit)
+            }
+            Expr::If(ei) => {
+                let cond = self.eval_expr(&ei.cond)?;
+                let SpecEvalValue::Bool(taken) = cond else {
+                    return Err(format!("non-boolean `if` condition: {cond:?}"));
+                };
+                if taken {
+                    self.eval_block(&ei.then_branch)
+                } else if let Some((_, else_expr)) = &ei.else_branch {
+                    self.eval_expr(else_expr)
+                } else {
+                    Ok(SpecEvalValue::Unit)
+                }
+            }
+            Expr::Cast(ec) => {
+                let inner = self.eval_expr(&ec.expr)?;
+                let ty_str = ec.ty.to_token_stream().to_string().replace(' ', "");
+                let Some((target_sz, target_sig)) = parse_scalar_type_spec(&ty_str) else {
+                    return Err(format!("unsupported cast target `{ty_str}`"));
+                };
+                let target_mask = width_mask((target_sz * 8) as u32);
+                let raw_u128 = match inner {
+                    SpecEvalValue::Bool(b) => u128::from(b),
+                    SpecEvalValue::Char(c) => c as u32 as u128,
+                    ref iv @ SpecEvalValue::Int { signed, bits, .. } => {
+                        if signed {
+                            (iv.to_signed_i128()? as u128) & target_mask
+                        } else {
+                            bits & target_mask
+                        }
+                    }
+                    other => return Err(format!("cannot cast {other:?} to `{ty_str}`")),
+                };
+                Ok(SpecEvalValue::Int {
+                    bits: raw_u128 & target_mask,
+                    size_bytes: target_sz,
+                    signed: target_sig,
+                    untyped_lit: false,
+                })
+            }
+            Expr::Binary(eb) => self.eval_binary(eb),
+            Expr::MethodCall(mc) => self.eval_method_call(mc),
+            Expr::Call(ec) => self.eval_call(ec),
+            Expr::Macro(em) => {
+                let m_name = em
+                    .mac
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                self.eval_macro(&m_name, &em.mac.tokens)
+            }
+            other => Err(format!(
+                "unsupported expression `{}` in spec probe",
+                other.to_token_stream()
+            )),
+        }
+    }
+
+    fn eval_binary(&mut self, eb: &ExprBinary) -> Result<SpecEvalValue, String> {
+        // Short-circuit boolean `&&` and `||` identically to Rust!
+        if matches!(eb.op, BinOp::And(_)) {
+            return match self.eval_expr(&eb.left)? {
+                SpecEvalValue::Bool(false) => Ok(SpecEvalValue::Bool(false)),
+                SpecEvalValue::Bool(true) => match self.eval_expr(&eb.right)? {
+                    SpecEvalValue::Bool(b) => Ok(SpecEvalValue::Bool(b)),
+                    other => Err(format!("non-boolean rhs of `&&`: {other:?}")),
+                },
+                other => Err(format!("non-boolean lhs of `&&`: {other:?}")),
+            };
+        }
+        if matches!(eb.op, BinOp::Or(_)) {
+            return match self.eval_expr(&eb.left)? {
+                SpecEvalValue::Bool(true) => Ok(SpecEvalValue::Bool(true)),
+                SpecEvalValue::Bool(false) => match self.eval_expr(&eb.right)? {
+                    SpecEvalValue::Bool(b) => Ok(SpecEvalValue::Bool(b)),
+                    other => Err(format!("non-boolean rhs of `||`: {other:?}")),
+                },
+                other => Err(format!("non-boolean lhs of `||`: {other:?}")),
+            };
+        }
+
+        // Compound assignment operators (`+=`, `-=`, `*=`, `<<=`, `>>=`, `^=`, `|=`, `&=`).
+        let compound_bin = match eb.op {
+            BinOp::AddAssign(_) => Some(BinOp::Add(Default::default())),
+            BinOp::SubAssign(_) => Some(BinOp::Sub(Default::default())),
+            BinOp::MulAssign(_) => Some(BinOp::Mul(Default::default())),
+            BinOp::BitXorAssign(_) => Some(BinOp::BitXor(Default::default())),
+            BinOp::BitAndAssign(_) => Some(BinOp::BitAnd(Default::default())),
+            BinOp::BitOrAssign(_) => Some(BinOp::BitOr(Default::default())),
+            BinOp::ShlAssign(_) => Some(BinOp::Shl(Default::default())),
+            BinOp::ShrAssign(_) => Some(BinOp::Shr(Default::default())),
+            _ => None,
+        };
+        if let Some(op) = compound_bin {
+            let cur_lhs = self.eval_expr(&eb.left)?;
+            let rhs = self.eval_expr(&eb.right)?;
+            let next = eval_pure_binary(&op, cur_lhs, rhs)?;
+            self.assign_place(&eb.left, next)?;
+            return Ok(SpecEvalValue::Unit);
+        }
+
+        let lhs = self.eval_expr(&eb.left)?;
+        let rhs = self.eval_expr(&eb.right)?;
+        eval_pure_binary(&eb.op, lhs, rhs)
+    }
+
+    fn eval_method_call(&mut self, mc: &ExprMethodCall) -> Result<SpecEvalValue, String> {
+        let recv = self.eval_expr(&mc.receiver)?;
+        let m_name = mc.method.to_string();
+        if m_name == "len" && mc.args.is_empty() {
+            if let SpecEvalValue::Array { elems, .. } = recv {
+                return Ok(SpecEvalValue::Int {
+                    bits: elems.len() as u128,
+                    size_bytes: 8,
+                    signed: false,
+                    untyped_lit: false,
+                });
+            }
+        }
+        let mut args = Vec::with_capacity(mc.args.len());
+        for a in &mc.args {
+            args.push(self.eval_expr(a)?);
+        }
+        eval_int_method(&m_name, recv, &args)
+    }
+
+    fn eval_call(&mut self, ec: &syn::ExprCall) -> Result<SpecEvalValue, String> {
+        use quote::ToTokens;
+        let callee_name = match &*ec.func {
+            Expr::Path(ep) if ep.qself.is_none() => ep
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::"),
+            other => {
+                return Err(format!(
+                    "unsupported call target `{}`",
+                    other.to_token_stream()
+                ));
+            }
+        };
+        if callee_name == "old" {
+            let Some(pre) = self.pre_env else {
+                return Err("`old(...)` is only valid inside `ensures` postconditions".to_string());
+            };
+            if ec.args.len() != 1 {
+                return Err("`old(...)` requires exactly 1 argument".to_string());
+            }
+            let mut sub_ctx = SpecEvalContext {
+                env: pre.clone(),
+                pre_env: None,
+                struct_layouts: self.struct_layouts,
+                external_callees: self.external_callees,
+                helper_fns: self.helper_fns,
+                schedule: None,
+                call_index: 0,
+                early_return: None,
+            };
+            return sub_ctx.eval_expr(&ec.args[0]);
+        }
+
+        let mut evaled_args = Vec::with_capacity(ec.args.len());
+        for a in &ec.args {
+            evaled_args.push(self.eval_expr(a)?);
+        }
+
+        // Pure helper function defined inside `type_defs_rust`!
+        if let Some(helper_fn) = self.helper_fns.get(&callee_name) {
+            if helper_fn.sig.inputs.len() != evaled_args.len() {
+                return Err(format!(
+                    "helper `{callee_name}` expects {} argument(s), got {}",
+                    helper_fn.sig.inputs.len(),
+                    evaled_args.len()
+                ));
+            }
+            let mut fn_env = BTreeMap::new();
+            for (fn_arg, arg_val) in helper_fn.sig.inputs.iter().zip(evaled_args) {
+                let syn::FnArg::Typed(pat_ty) = fn_arg else {
+                    return Err(format!("unsupported `self` receiver in helper `{callee_name}`"));
+                };
+                let (pname, _) = extract_local_pat_and_ty(&pat_ty.pat)?;
+                let ty_str = pat_ty.ty.to_token_stream().to_string().replace(' ', "");
+                let coerced = if let Some((sz, sig)) = parse_scalar_type_spec(&ty_str)
+                    && let SpecEvalValue::Int {
+                        bits,
+                        signed: rsig,
+                        untyped_lit: true,
+                        ..
+                    } = arg_val
+                {
+                    coerce_lit_to_int(bits, rsig, sz, sig)?
+                } else {
+                    arg_val
+                };
+                fn_env.insert(pname, coerced);
+            }
+            let mut sub_ctx = SpecEvalContext {
+                env: fn_env,
+                pre_env: None,
+                struct_layouts: self.struct_layouts,
+                external_callees: self.external_callees,
+                helper_fns: self.helper_fns,
+                schedule: self.schedule.as_deref_mut(),
+                call_index: self.call_index,
+                early_return: None,
+            };
+            let mut out_val = sub_ctx.eval_block(&helper_fn.block)?;
+            self.call_index = sub_ctx.call_index;
+            if let syn::ReturnType::Type(_, ret_ty) = &helper_fn.sig.output {
+                let ret_ty_str = ret_ty.to_token_stream().to_string().replace(' ', "");
+                if let Some((sz, sig)) = parse_scalar_type_spec(&ret_ty_str)
+                    && let SpecEvalValue::Int {
+                        bits,
+                        signed: rsig,
+                        untyped_lit: true,
+                        ..
+                    } = out_val
+                {
+                    out_val = coerce_lit_to_int(bits, rsig, sz, sig)?;
+                }
+            }
+            return Ok(out_val);
+        }
+
+        // Built-in unchecked intrinsics mirror Rust / Miri UB traps!
+        let short_callee = callee_name
+            .rsplit("::")
+            .next()
+            .unwrap_or(callee_name.as_str());
+        if matches!(
+            short_callee,
+            "unchecked_shl"
+                | "unchecked_shr"
+                | "unchecked_add"
+                | "unchecked_sub"
+                | "unchecked_mul"
+                | "wrapping_add"
+                | "wrapping_sub"
+                | "wrapping_mul"
+                | "saturating_add"
+                | "saturating_sub"
+        ) && evaled_args.len() == 2
+        {
+            return match short_callee {
+                "unchecked_shl" => {
+                    eval_pure_binary(&BinOp::Shl(Default::default()), evaled_args[0].clone(), evaled_args[1].clone())
+                }
+                "unchecked_shr" => {
+                    eval_pure_binary(&BinOp::Shr(Default::default()), evaled_args[0].clone(), evaled_args[1].clone())
+                }
+                "unchecked_add" => {
+                    eval_pure_binary(&BinOp::Add(Default::default()), evaled_args[0].clone(), evaled_args[1].clone())
+                }
+                "unchecked_sub" => {
+                    eval_pure_binary(&BinOp::Sub(Default::default()), evaled_args[0].clone(), evaled_args[1].clone())
+                }
+                "unchecked_mul" => {
+                    eval_pure_binary(&BinOp::Mul(Default::default()), evaled_args[0].clone(), evaled_args[1].clone())
+                }
+                "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "saturating_add" | "saturating_sub" => {
+                    eval_int_method(short_callee, evaled_args[0].clone(), &[evaled_args[1].clone()])
+                }
+                _ => unreachable!(),
+            };
+        }
+
+        // External boundary call dispatched against `EnvSchedule`!
+        let Some(sched_ref) = self.schedule.as_deref_mut() else {
+            return Err(format!(
+                "call to external function `{callee_name}` without an active EnvSchedule"
+            ));
+        };
+        let idx = self.call_index;
+        self.call_index += 1;
+        let declared_ret_layout = self.external_callees.get(&callee_name);
+        let expected_sz = declared_ret_layout
+            .map(LayoutSpec::total_size)
+            .or_else(|| sched_ref.expected_return_size(&callee_name));
+        match sched_ref.next_action(&callee_name, idx) {
+            crate::instrument::EnvAction::PanicOnCall(p_idx) => {
+                Err(format!("scheduled panic on `{callee_name}` at call {p_idx}"))
+            }
+            crate::instrument::EnvAction::ReturnBytes(bytes) => {
+                let sz = expected_sz.unwrap_or(bytes.len());
+                if bytes.len() != sz {
+                    return Err(format!(
+                        "EnvSchedule payload size mismatch for `{callee_name}`: expected {sz}, got {}",
+                        bytes.len()
+                    ));
+                }
+                if sz == 0 {
+                    Ok(SpecEvalValue::Unit)
+                } else if let Some(ext_layout) = declared_ret_layout {
+                    SpecEvalValue::from_layout_bytes(ext_layout, &bytes)
+                        .map_err(|e| format!("invalid EnvSchedule return bytes for `{callee_name}`: {e}"))
+                } else {
+                    let layout = LayoutSpec::Scalar(ScalarLayout::unsigned(sz));
+                    SpecEvalValue::from_layout_bytes(&layout, &bytes)
+                        .map_err(|e| format!("invalid EnvSchedule return bytes for `{callee_name}`: {e}"))
+                }
+            }
+            crate::instrument::EnvAction::PassThrough => Err(format!(
+                "EnvSchedule returned PassThrough (no scheduled payload) for external call `{callee_name}`"
+            )),
+        }
+    }
+}
+
+fn extract_local_pat_and_ty(pat: &Pat) -> Result<(String, Option<String>), String> {
+    use quote::ToTokens;
+    match pat {
+        Pat::Wild(_) => Ok(("_".to_string(), None)),
+        Pat::Ident(pi) => Ok((pi.ident.to_string(), None)),
+        Pat::Type(pt) => {
+            let (name, _) = extract_local_pat_and_ty(&pt.pat)?;
+            let ty_str = pt.ty.to_token_stream().to_string().replace(' ', "");
+            Ok((name, Some(ty_str)))
+        }
+        other => Err(format!(
+            "unsupported local binding pattern `{}`",
+            other.to_token_stream()
+        )),
+    }
+}
+
+fn extract_place_root_ident(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Paren(p) => extract_place_root_ident(&p.expr),
+        Expr::Unary(un) if matches!(un.op, syn::UnOp::Deref(_)) => {
+            extract_place_root_ident(&un.expr)
+        }
+        Expr::Path(ep) if ep.qself.is_none() && ep.path.segments.len() == 1 => {
+            Some(ep.path.segments[0].ident.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn eval_assoc_int_const(ty: &str, assoc: &str) -> Result<SpecEvalValue, String> {
+    let Some((sz, sig)) = parse_scalar_type_spec(ty) else {
+        return Err(format!("unknown integer type `{ty}` for `{ty}::{assoc}`"));
+    };
+    let bw = (sz * 8) as u32;
+    let mask = width_mask(bw);
+    match (sig, assoc) {
+        (false, "MIN") => Ok(SpecEvalValue::Int {
+            bits: 0,
+            size_bytes: sz,
+            signed: false,
+            untyped_lit: false,
+        }),
+        (false, "MAX") => Ok(SpecEvalValue::Int {
+            bits: mask,
+            size_bytes: sz,
+            signed: false,
+            untyped_lit: false,
+        }),
+        (true, "MIN") => {
+            let min_bits = if bw >= 128 {
+                1u128 << 127
+            } else {
+                1u128 << (bw - 1)
+            };
+            Ok(SpecEvalValue::Int {
+                bits: min_bits,
+                size_bytes: sz,
+                signed: true,
+                untyped_lit: false,
+            })
+        }
+        (true, "MAX") => {
+            let max_bits = if bw >= 128 {
+                (1u128 << 127) - 1
+            } else {
+                (1u128 << (bw - 1)) - 1
+            };
+            Ok(SpecEvalValue::Int {
+                bits: max_bits,
+                size_bytes: sz,
+                signed: true,
+                untyped_lit: false,
+            })
+        }
+        (_, "BITS") => Ok(SpecEvalValue::Int {
+            bits: bw as u128,
+            size_bytes: 4,
+            signed: false,
+            untyped_lit: false,
+        }),
+        _ => Err(format!("unsupported associated constant `{ty}::{assoc}`")),
+    }
+}
+
+fn eval_pure_binary(
+    op: &BinOp,
+    lhs: SpecEvalValue,
+    rhs: SpecEvalValue,
+) -> Result<SpecEvalValue, String> {
+    if matches!(op, BinOp::Shl(_) | BinOp::Shr(_)) {
+        let SpecEvalValue::Int {
+            bits: lb,
+            size_bytes: lsz,
+            signed: lsig,
+            ..
+        } = lhs
+        else {
+            return Err("shift lhs must be an integer".to_string());
+        };
+        let bw = (lsz * 8) as u32;
+        let mask = width_mask(bw);
+        let shift_amt: u32 = match &rhs {
+            SpecEvalValue::Int { signed: true, .. } => {
+                let sv = rhs.to_signed_i128()?;
+                if sv < 0 || (sv as u128) >= (bw as u128) {
+                    return Err(format!(
+                        "attempt to shift with overflow (shift={sv}, bit_width={bw})"
+                    ));
+                }
+                sv as u32
+            }
+            SpecEvalValue::Int {
+                bits: rb,
+                signed: false,
+                ..
+            } => {
+                if *rb >= (bw as u128) {
+                    return Err(format!(
+                        "attempt to shift with overflow (shift={rb}, bit_width={bw})"
+                    ));
+                }
+                *rb as u32
+            }
+            _ => return Err("shift rhs must be an integer".to_string()),
+        };
+        let out_bits = match op {
+            BinOp::Shl(_) => (lb << shift_amt) & mask,
+            BinOp::Shr(_) => {
+                if lsig {
+                    let sv = lhs.to_signed_i128()?;
+                    ((sv >> shift_amt) as u128) & mask
+                } else {
+                    (lb & mask) >> shift_amt
+                }
+            }
+            _ => unreachable!(),
+        };
+        return Ok(SpecEvalValue::Int {
+            bits: out_bits,
+            size_bytes: lsz,
+            signed: lsig,
+            untyped_lit: false,
+        });
+    }
+
+    let (lhs, rhs) = coerce_untyped_int_pair(lhs, rhs)?;
+    if matches!(op, BinOp::Eq(_) | BinOp::Ne(_)) {
+        let eq = match (&lhs, &rhs) {
+            (
+                SpecEvalValue::Int {
+                    bits: a,
+                    size_bytes: sa,
+                    signed: sga,
+                    ..
+                },
+                SpecEvalValue::Int {
+                    bits: b,
+                    size_bytes: sb,
+                    signed: sgb,
+                    ..
+                },
+            ) => sa == sb && sga == sgb && (a & width_mask((*sa * 8) as u32)) == (b & width_mask((*sb * 8) as u32)),
+            _ => lhs == rhs,
+        };
+        return Ok(SpecEvalValue::Bool(if matches!(op, BinOp::Eq(_)) {
+            eq
+        } else {
+            !eq
+        }));
+    }
+
+    let (
+        SpecEvalValue::Int {
+            bits: lb,
+            size_bytes: lsz,
+            signed: lsig,
+            untyped_lit: l_untyped,
+        },
+        SpecEvalValue::Int {
+            bits: rb,
+            size_bytes: rsz,
+            signed: rsig,
+            untyped_lit: r_untyped,
+        },
+    ) = (&lhs, &rhs)
+    else {
+        return Err(format!("invalid binary operands {lhs:?} and {rhs:?}"));
+    };
+    if lsz != rsz || lsig != rsig {
+        return Err(format!(
+            "mismatched integer types in binary op: ({lsz}B, signed={lsig}) vs ({rsz}B, signed={rsig})"
+        ));
+    }
+    let bw = (*lsz * 8) as u32;
+    let mask = width_mask(bw);
+    let both_untyped = *l_untyped && *r_untyped;
+
+    if *lsig {
+        let la = lhs.to_signed_i128()?;
+        let ra = rhs.to_signed_i128()?;
+        let min_v = if bw >= 128 { i128::MIN } else { -(1i128 << (bw - 1)) };
+        let max_v = if bw >= 128 {
+            i128::MAX
+        } else {
+            (1i128 << (bw - 1)) - 1
+        };
+        let check_range = |v: Option<i128>, label: &str| -> Result<SpecEvalValue, String> {
+            let val = v.ok_or_else(|| format!("attempt to {label} with overflow"))?;
+            if val < min_v || val > max_v {
+                return Err(format!("attempt to {label} with overflow"));
+            }
+            Ok(SpecEvalValue::Int {
+                bits: (val as u128) & mask,
+                size_bytes: *lsz,
+                signed: true,
+                untyped_lit: both_untyped,
+            })
+        };
+        match op {
+            BinOp::Add(_) => check_range(la.checked_add(ra), "add"),
+            BinOp::Sub(_) => check_range(la.checked_sub(ra), "subtract"),
+            BinOp::Mul(_) => check_range(la.checked_mul(ra), "multiply"),
+            BinOp::Div(_) => {
+                if ra == 0 {
+                    return Err("attempt to divide by zero".to_string());
+                }
+                if la == min_v && ra == -1 {
+                    return Err("attempt to divide with overflow".to_string());
+                }
+                check_range(la.checked_div(ra), "divide")
+            }
+            BinOp::Rem(_) => {
+                if ra == 0 {
+                    return Err("attempt to calculate the remainder with a divisor of zero".to_string());
+                }
+                if la == min_v && ra == -1 {
+                    return Err("attempt to calculate the remainder with overflow".to_string());
+                }
+                check_range(la.checked_rem(ra), "rem")
+            }
+            BinOp::BitXor(_) => Ok(SpecEvalValue::Int {
+                bits: (lb ^ rb) & mask,
+                size_bytes: *lsz,
+                signed: true,
+                untyped_lit: both_untyped,
+            }),
+            BinOp::BitAnd(_) => Ok(SpecEvalValue::Int {
+                bits: (lb & rb) & mask,
+                size_bytes: *lsz,
+                signed: true,
+                untyped_lit: both_untyped,
+            }),
+            BinOp::BitOr(_) => Ok(SpecEvalValue::Int {
+                bits: (lb | rb) & mask,
+                size_bytes: *lsz,
+                signed: true,
+                untyped_lit: both_untyped,
+            }),
+            BinOp::Lt(_) => Ok(SpecEvalValue::Bool(la < ra)),
+            BinOp::Le(_) => Ok(SpecEvalValue::Bool(la <= ra)),
+            BinOp::Gt(_) => Ok(SpecEvalValue::Bool(la > ra)),
+            BinOp::Ge(_) => Ok(SpecEvalValue::Bool(la >= ra)),
+            _ => Err("unsupported signed binary operator".to_string()),
+        }
+    } else {
+        let la = *lb & mask;
+        let ra = *rb & mask;
+        let check_u = |v: Option<u128>, label: &str| -> Result<SpecEvalValue, String> {
+            let val = v.ok_or_else(|| format!("attempt to {label} with overflow"))?;
+            if val > mask {
+                return Err(format!("attempt to {label} with overflow"));
+            }
+            Ok(SpecEvalValue::Int {
+                bits: val & mask,
+                size_bytes: *lsz,
+                signed: false,
+                untyped_lit: both_untyped,
+            })
+        };
+        match op {
+            BinOp::Add(_) => check_u(la.checked_add(ra), "add"),
+            BinOp::Sub(_) => check_u(la.checked_sub(ra), "subtract"),
+            BinOp::Mul(_) => check_u(la.checked_mul(ra), "multiply"),
+            BinOp::Div(_) => {
+                if ra == 0 {
+                    return Err("attempt to divide by zero".to_string());
+                }
+                Ok(SpecEvalValue::Int {
+                    bits: la / ra,
+                    size_bytes: *lsz,
+                    signed: false,
+                    untyped_lit: both_untyped,
+                })
+            }
+            BinOp::Rem(_) => {
+                if ra == 0 {
+                    return Err("attempt to calculate the remainder with a divisor of zero".to_string());
+                }
+                Ok(SpecEvalValue::Int {
+                    bits: la % ra,
+                    size_bytes: *lsz,
+                    signed: false,
+                    untyped_lit: both_untyped,
+                })
+            }
+            BinOp::BitXor(_) => Ok(SpecEvalValue::Int {
+                bits: (la ^ ra) & mask,
+                size_bytes: *lsz,
+                signed: false,
+                untyped_lit: both_untyped,
+            }),
+            BinOp::BitAnd(_) => Ok(SpecEvalValue::Int {
+                bits: (la & ra) & mask,
+                size_bytes: *lsz,
+                signed: false,
+                untyped_lit: both_untyped,
+            }),
+            BinOp::BitOr(_) => Ok(SpecEvalValue::Int {
+                bits: (la | ra) & mask,
+                size_bytes: *lsz,
+                signed: false,
+                untyped_lit: both_untyped,
+            }),
+            BinOp::Lt(_) => Ok(SpecEvalValue::Bool(la < ra)),
+            BinOp::Le(_) => Ok(SpecEvalValue::Bool(la <= ra)),
+            BinOp::Gt(_) => Ok(SpecEvalValue::Bool(la > ra)),
+            BinOp::Ge(_) => Ok(SpecEvalValue::Bool(la >= ra)),
+            _ => Err("unsupported unsigned binary operator".to_string()),
+        }
+    }
+}
+
+fn eval_int_method(
+    m_name: &str,
+    recv: SpecEvalValue,
+    args: &[SpecEvalValue],
+) -> Result<SpecEvalValue, String> {
+    let SpecEvalValue::Int {
+        bits: lb,
+        size_bytes: lsz,
+        signed: lsig,
+        ..
+    } = recv
+    else {
+        return Err(format!("method `{m_name}` called on non-integer {recv:?}"));
+    };
+    let bw = (lsz * 8) as u32;
+    let mask = width_mask(bw);
+    let la = lb & mask;
+
+    if args.is_empty() {
+        return match m_name {
+            "wrapping_neg" => Ok(SpecEvalValue::Int {
+                bits: 0u128.wrapping_sub(la) & mask,
+                size_bytes: lsz,
+                signed: lsig,
+                untyped_lit: false,
+            }),
+            "count_ones" => Ok(SpecEvalValue::Int {
+                bits: la.count_ones() as u128,
+                size_bytes: 4,
+                signed: false,
+                untyped_lit: false,
+            }),
+            "leading_zeros" => Ok(SpecEvalValue::Int {
+                bits: (la.leading_zeros() - (128 - bw)) as u128,
+                size_bytes: 4,
+                signed: false,
+                untyped_lit: false,
+            }),
+            "trailing_zeros" => Ok(SpecEvalValue::Int {
+                bits: if la == 0 {
+                    bw as u128
+                } else {
+                    la.trailing_zeros() as u128
+                },
+                size_bytes: 4,
+                signed: false,
+                untyped_lit: false,
+            }),
+            _ => Err(format!("unsupported 0-arg integer method `{m_name}`")),
+        };
+    }
+
+    if args.len() == 1 {
+        if matches!(m_name, "wrapping_shl" | "wrapping_shr") {
+            let SpecEvalValue::Int { bits: rb, .. } = args[0] else {
+                return Err(format!("`{m_name}` expects integer shift count"));
+            };
+            let sh = (rb as u32) & (bw - 1);
+            let out_bits = if m_name == "wrapping_shl" {
+                (la << sh) & mask
+            } else if lsig {
+                let sv = recv.to_signed_i128()?;
+                ((sv >> sh) as u128) & mask
+            } else {
+                la >> sh
+            };
+            return Ok(SpecEvalValue::Int {
+                bits: out_bits,
+                size_bytes: lsz,
+                signed: lsig,
+                untyped_lit: false,
+            });
+        }
+
+        let (lhs_c, rhs_c) = coerce_untyped_int_pair(recv, args[0].clone())?;
+        let (
+            SpecEvalValue::Int { bits: l_bits, .. },
+            SpecEvalValue::Int { bits: r_bits, .. },
+        ) = (&lhs_c, &rhs_c)
+        else {
+            return Err(format!("`{m_name}` expects matching integer argument"));
+        };
+        let lu = *l_bits & mask;
+        let ru = *r_bits & mask;
+        return match m_name {
+            "wrapping_add" => Ok(SpecEvalValue::Int {
+                bits: lu.wrapping_add(ru) & mask,
+                size_bytes: lsz,
+                signed: lsig,
+                untyped_lit: false,
+            }),
+            "wrapping_sub" => Ok(SpecEvalValue::Int {
+                bits: lu.wrapping_sub(ru) & mask,
+                size_bytes: lsz,
+                signed: lsig,
+                untyped_lit: false,
+            }),
+            "wrapping_mul" => Ok(SpecEvalValue::Int {
+                bits: lu.wrapping_mul(ru) & mask,
+                size_bytes: lsz,
+                signed: lsig,
+                untyped_lit: false,
+            }),
+            "saturating_add" => {
+                if lsig {
+                    let a = lhs_c.to_signed_i128()?;
+                    let b = rhs_c.to_signed_i128()?;
+                    let min_v = if bw >= 128 { i128::MIN } else { -(1i128 << (bw - 1)) };
+                    let max_v = if bw >= 128 {
+                        i128::MAX
+                    } else {
+                        (1i128 << (bw - 1)) - 1
+                    };
+                    let sat = a.saturating_add(b).clamp(min_v, max_v);
+                    Ok(SpecEvalValue::Int {
+                        bits: (sat as u128) & mask,
+                        size_bytes: lsz,
+                        signed: true,
+                        untyped_lit: false,
+                    })
+                } else {
+                    let sat = lu.saturating_add(ru).min(mask);
+                    Ok(SpecEvalValue::Int {
+                        bits: sat,
+                        size_bytes: lsz,
+                        signed: false,
+                        untyped_lit: false,
+                    })
+                }
+            }
+            "saturating_sub" => {
+                if lsig {
+                    let a = lhs_c.to_signed_i128()?;
+                    let b = rhs_c.to_signed_i128()?;
+                    let min_v = if bw >= 128 { i128::MIN } else { -(1i128 << (bw - 1)) };
+                    let max_v = if bw >= 128 {
+                        i128::MAX
+                    } else {
+                        (1i128 << (bw - 1)) - 1
+                    };
+                    let sat = a.saturating_sub(b).clamp(min_v, max_v);
+                    Ok(SpecEvalValue::Int {
+                        bits: (sat as u128) & mask,
+                        size_bytes: lsz,
+                        signed: true,
+                        untyped_lit: false,
+                    })
+                } else {
+                    Ok(SpecEvalValue::Int {
+                        bits: lu.saturating_sub(ru),
+                        size_bytes: lsz,
+                        signed: false,
+                        untyped_lit: false,
+                    })
+                }
+            }
+            "min" => {
+                let pick = if lsig {
+                    if lhs_c.to_signed_i128()? <= rhs_c.to_signed_i128()? {
+                        lu
+                    } else {
+                        ru
+                    }
+                } else if lu <= ru {
+                    lu
+                } else {
+                    ru
+                };
+                Ok(SpecEvalValue::Int {
+                    bits: pick,
+                    size_bytes: lsz,
+                    signed: lsig,
+                    untyped_lit: false,
+                })
+            }
+            "max" => {
+                let pick = if lsig {
+                    if lhs_c.to_signed_i128()? >= rhs_c.to_signed_i128()? {
+                        lu
+                    } else {
+                        ru
+                    }
+                } else if lu >= ru {
+                    lu
+                } else {
+                    ru
+                };
+                Ok(SpecEvalValue::Int {
+                    bits: pick,
+                    size_bytes: lsz,
+                    signed: lsig,
+                    untyped_lit: false,
+                })
+            }
+            "abs_diff" => {
+                let diff = if lsig {
+                    lhs_c.to_signed_i128()?.abs_diff(rhs_c.to_signed_i128()?)
+                } else {
+                    lu.abs_diff(ru)
+                };
+                Ok(SpecEvalValue::Int {
+                    bits: diff & mask,
+                    size_bytes: lsz,
+                    signed: false,
+                    untyped_lit: false,
+                })
+            }
+            _ => Err(format!("unsupported 1-arg integer method `{m_name}`")),
+        };
+    }
+
+    Err(format!("unsupported integer method `{m_name}`"))
+}
+
+/// Descriptor for an `EnvSchedule`-backed external callee invoked inside a
+/// [`SpecContractOracleProbe`] body so both [`SpecContractOracleProbe::synthesize_rust_probe`]
+/// and [`SpecContractOracleProbe::verify_spec_postcondition_against_schedule`]
+/// enforce identical signatures, return layouts, and scheduled actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecExternalCallee {
+    /// External callee identifier invoked by `callee_body_rust`.
+    pub name: String,
+    /// Rust parameter types of the external callee (e.g. `vec!["u32".into()]`).
+    pub param_tys: Vec<String>,
+    /// Rust return type syntax (e.g. `"u32"`, `"i32"`, `"bool"`).
+    pub ret_rust_ty: String,
+    /// Return value layout used to validate/decode `EnvAction::ReturnBytes`.
+    pub ret_layout: LayoutSpec,
+}
+
+impl SpecExternalCallee {
+    /// Constructs a new [`SpecExternalCallee`] descriptor.
+    pub fn new<I, S>(
+        name: impl Into<String>,
+        param_tys: I,
+        ret_rust_ty: impl Into<String>,
+        ret_layout: LayoutSpec,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            name: name.into(),
+            param_tys: param_tys.into_iter().map(Into::into).collect(),
+            ret_rust_ty: ret_rust_ty.into(),
+            ret_layout,
+        }
+    }
+}
+
+/// Verus `#3539` (`tools/vstd-kani`)-inspired external `#[anneal_spec::spec]`
+/// postcondition oracle harness builder and schedule-backed contract evaluator.
+///
+/// Synthesizes standalone, warning-free (`rustc -D warnings`) safe Rust
+/// contract-checking harnesses (`__anneal_spec_check_<fn_name>`) AND evaluates
+/// the exact same AST contract (`requires`, `old(...)` snapshots, framed `&mut`
+/// fields, and `ensures`) directly against concrete [`LayoutAwareByteBuilder`] /
+/// [`EnvSchedule`] inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecContractOracleProbe {
+    /// Name of the target function under specification test.
+    pub fn_name: String,
+    /// Optional auxiliary Rust `struct` / `type` / `fn` items required by the
+    /// signature or body (e.g. `#[repr(C)] #[derive(Copy, Clone, Debug, PartialEq, Eq)] pub struct CounterPair { ... }`).
+    pub type_defs_rust: String,
+    /// Ordered parameter bindings (by-value and `&mut T`).
+    pub params: Vec<SpecParamBinding>,
+    /// Return type syntax in Rust (`"u32"`, `"bool"`, `"()"`, etc.).
+    pub ret_rust_ty: String,
+    /// Return value layout (`LayoutSpec::Tuple { total_size: 0, elements: vec![] }` for `()`).
+    pub ret_layout: LayoutSpec,
+    /// Optional external environment callees dispatched through [`EnvSchedule`].
+    pub external_callees: Vec<SpecExternalCallee>,
+    /// Ordered `requires(...)` preconditions guarding execution.
+    pub requires: Vec<SpecContractAssertion>,
+    /// Ordered `ensures(...)` postconditions checked on `result` and post-state
+    /// parameters (with `old(<expr>)` denoting pre-state values).
+    pub ensures: Vec<SpecContractAssertion>,
+    /// Rust statements/tail-expression of the target implementation body.
+    pub callee_body_rust: String,
+}
+
+impl SpecContractOracleProbe {
+    /// Creates a new [`SpecContractOracleProbe`] for `fn_name`.
+    pub fn new(
+        fn_name: impl Into<String>,
+        params: Vec<SpecParamBinding>,
+        ret_rust_ty: impl Into<String>,
+        ret_layout: LayoutSpec,
+        callee_body_rust: impl Into<String>,
+    ) -> Self {
+        Self {
+            fn_name: fn_name.into(),
+            type_defs_rust: String::new(),
+            params,
+            ret_rust_ty: ret_rust_ty.into(),
+            ret_layout,
+            external_callees: Vec::new(),
+            requires: Vec::new(),
+            ensures: Vec::new(),
+            callee_body_rust: callee_body_rust.into(),
+        }
+    }
+
+    /// Attaches auxiliary Rust type/helper definitions emitted ahead of the probe.
+    pub fn with_type_defs(mut self, type_defs_rust: impl Into<String>) -> Self {
+        self.type_defs_rust = type_defs_rust.into();
+        self
+    }
+
+    /// Registers an `EnvSchedule`-backed external callee so both
+    /// [`Self::synthesize_rust_probe`] and [`Self::verify_spec_postcondition_against_schedule`]
+    /// dispatch it with matching return type and layout.
+    pub fn with_external_callee(mut self, callee: SpecExternalCallee) -> Self {
+        self.external_callees.push(callee);
+        self
+    }
+
+    /// Appends a `requires(...)` precondition assertion.
+    pub fn with_requires(
+        mut self,
+        label: impl Into<String>,
+        rust_expr: impl Into<String>,
+    ) -> Self {
+        self.requires
+            .push(SpecContractAssertion::new(label, rust_expr));
+        self
+    }
+
+    /// Appends an `ensures(...)` postcondition assertion.
+    pub fn with_ensures(
+        mut self,
+        label: impl Into<String>,
+        rust_expr: impl Into<String>,
+    ) -> Self {
+        self.ensures
+            .push(SpecContractAssertion::new(label, rust_expr));
+        self
+    }
+
+    /// Validates identifier hygiene, parameter uniqueness, frame field existence,
+    /// `requires` / `ensures` expression syntax, `old(...)` placement, and body syntax.
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_valid_rust_ident(&self.fn_name) {
+            return Err(format!(
+                "invalid target function identifier `{}`",
+                self.fn_name
+            ));
+        }
+        if !self.type_defs_rust.trim().is_empty() {
+            syn::parse_file(&self.type_defs_rust)
+                .map_err(|e| format!("invalid `type_defs_rust`: {e}"))?;
+        }
+        let mut seen_params = BTreeSet::new();
+        for p in &self.params {
+            if !is_valid_rust_ident(&p.name) || p.name == "result" {
+                return Err(format!(
+                    "invalid or reserved parameter name `{}` (note: `result` is reserved for postconditions)",
+                    p.name
+                ));
+            }
+            if !seen_params.insert(p.name.clone()) {
+                return Err(format!("duplicate parameter name `{}`", p.name));
+            }
+            syn::parse_str::<syn::Type>(&p.rust_ty)
+                .map_err(|e| format!("invalid parameter type `{}`: {e}", p.rust_ty))?;
+            if !p.frame_preserved_fields.is_empty() {
+                if !p.is_mut_ref {
+                    return Err(format!(
+                        "`frame_preserved_fields` specified on non-`&mut` parameter `{}`",
+                        p.name
+                    ));
+                }
+                let LayoutSpec::Struct { fields, .. } = &p.layout else {
+                    return Err(format!(
+                        "`frame_preserved_fields` requires a `LayoutSpec::Struct` on `{}`",
+                        p.name
+                    ));
+                };
+                for ff in &p.frame_preserved_fields {
+                    if !fields.iter().any(|f| &f.name == ff) {
+                        return Err(format!(
+                            "unknown framed field `{ff}` on parameter `{}`",
+                            p.name
+                        ));
+                    }
+                }
+            }
+        }
+        let mut seen_ext = BTreeSet::new();
+        for ext in &self.external_callees {
+            if !is_valid_rust_ident(&ext.name) || ext.name == self.fn_name || ext.name == "old" {
+                return Err(format!(
+                    "invalid or colliding external callee identifier `{}`",
+                    ext.name
+                ));
+            }
+            if !seen_ext.insert(ext.name.clone()) {
+                return Err(format!("duplicate external callee `{}`", ext.name));
+            }
+            for pty in &ext.param_tys {
+                syn::parse_str::<syn::Type>(pty).map_err(|e| {
+                    format!(
+                        "invalid parameter type `{pty}` on external callee `{}`: {e}",
+                        ext.name
+                    )
+                })?;
+            }
+            syn::parse_str::<syn::Type>(&ext.ret_rust_ty).map_err(|e| {
+                format!(
+                    "invalid return type `{}` on external callee `{}`: {e}",
+                    ext.ret_rust_ty, ext.name
+                )
+            })?;
+        }
+        syn::parse_str::<syn::Type>(&self.ret_rust_ty)
+            .map_err(|e| format!("invalid return type `{}`: {e}", self.ret_rust_ty))?;
+
+        for req in &self.requires {
+            let parsed = syn::parse_str::<Expr>(&req.rust_expr).map_err(|e| {
+                format!(
+                    "invalid `requires` expression `{}` ({}): {e}",
+                    req.rust_expr, req.label
+                )
+            })?;
+            if contains_old_call(&parsed) {
+                return Err(format!(
+                    "`old(...)` is not allowed in `requires` clause `{}`",
+                    req.label
+                ));
+            }
+        }
+        for ens in &self.ensures {
+            let parsed = syn::parse_str::<Expr>(&ens.rust_expr).map_err(|e| {
+                format!(
+                    "invalid `ensures` expression `{}` ({}): {e}",
+                    ens.rust_expr, ens.label
+                )
+            })?;
+            validate_old_calls_in_ensures(&parsed)?;
+        }
+
+        let wrapped_body = format!("{{\n{}\n}}", self.callee_body_rust);
+        syn::parse_str::<syn::Block>(&wrapped_body)
+            .map_err(|e| format!("invalid `callee_body_rust` syntax: {e}"))?;
+        Ok(())
+    }
+
+    /// Combined input [`LayoutSpec::Tuple`] packing all parameters sequentially
+    /// at contiguous offsets so [`LayoutAwareByteBuilder::build_bytes`] can
+    /// materialize complete argument tuples directly.
+    pub fn combined_input_layout(&self) -> LayoutSpec {
+        let mut offset = 0usize;
+        let mut elements = Vec::with_capacity(self.params.len());
+        for p in &self.params {
+            elements.push((offset, p.layout.clone()));
+            offset += p.layout.total_size();
+        }
+        LayoutSpec::Tuple {
+            total_size: offset,
+            elements,
+        }
+    }
+
+    /// Synthesizes a standalone, self-contained, `#![allow(dead_code)]` safe Rust
+    /// library module containing:
+    /// - `SpecProbeOutcome`,
+    /// - any `type_defs_rust`,
+    /// - the target function `pub fn <fn_name>(...) -> <ret_rust_ty>`,
+    /// - non-panicking `pub fn __anneal_spec_check_<fn_name>(...) -> SpecProbeOutcome`, and
+    /// - asserting `pub fn __anneal_spec_assert_<fn_name>(...) -> bool` (which
+    ///   panics on `PostconditionViolation` / `FrameViolation`).
+    ///
+    /// Compiles cleanly with `rustc --edition=2024 --crate-type=lib -D warnings`.
+    pub fn synthesize_rust_probe(&self) -> Result<String, String> {
+        use quote::ToTokens;
+        self.validate()?;
+
+        let mut hoisted_olds: Vec<(String, String)> = Vec::new();
+        let mut rewritten_ensures: Vec<(String, String)> = Vec::with_capacity(self.ensures.len());
+        for ens in &self.ensures {
+            let mut expr = syn::parse_str::<Expr>(&ens.rust_expr)
+                .map_err(|e| format!("invalid ensures `{}`: {e}", ens.rust_expr))?;
+            hoist_old_expressions_for_rust(&mut expr, &mut hoisted_olds);
+            rewritten_ensures.push((ens.label.clone(), expr.to_token_stream().to_string()));
+        }
+
+        let mut sig_params = Vec::with_capacity(self.params.len());
+        let mut check_params = Vec::with_capacity(self.params.len());
+        let mut call_args = Vec::with_capacity(self.params.len());
+        let mut touch_params = Vec::with_capacity(self.params.len());
+        for p in &self.params {
+            if p.is_mut_ref {
+                sig_params.push(format!("{}: &mut {}", p.name, p.rust_ty));
+                check_params.push(format!("{}: &mut {}", p.name, p.rust_ty));
+                call_args.push(format!("&mut *{}", p.name));
+            } else {
+                sig_params.push(format!("{}: {}", p.name, p.rust_ty));
+                check_params.push(format!("{}: {}", p.name, p.rust_ty));
+                call_args.push(p.name.clone());
+            }
+            touch_params.push(format!("let _ = &{};", p.name));
+        }
+
+        let mut out = String::from(
+            "#![allow(dead_code)]\n\n\
+             #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
+             pub enum SpecProbeOutcome {\n    \
+                 VacuouslyFiltered,\n    \
+                 VerifiedHold,\n    \
+                 PostconditionViolation(&'static str),\n    \
+                 FrameViolation(&'static str),\n\
+             }\n\n",
+        );
+
+        if !self.type_defs_rust.trim().is_empty() {
+            out.push_str(self.type_defs_rust.trim());
+            out.push_str("\n\n");
+        }
+
+        if !self.external_callees.is_empty() {
+            for ext in &self.external_callees {
+                let queue_static = format!("__ANNEAL_SCHED_{}", ext.name.to_ascii_uppercase());
+                out.push_str(&format!(
+                    "std::thread_local! {{\n    \
+                         static {queue_static}: std::cell::RefCell<std::collections::VecDeque<Option<{}>>> = \
+                             const {{ std::cell::RefCell::new(std::collections::VecDeque::new()) }};\n\
+                     }}\n\
+                     pub fn __anneal_reset_schedule_{}() {{\n    \
+                         {queue_static}.with(|q| q.borrow_mut().clear());\n\
+                     }}\n\
+                     pub fn __anneal_push_schedule_{}(item: Option<{}>) {{\n    \
+                         {queue_static}.with(|q| q.borrow_mut().push_back(item));\n\
+                     }}\n",
+                    ext.ret_rust_ty, ext.name, ext.name, ext.ret_rust_ty
+                ));
+                let ext_params: Vec<String> = ext
+                    .param_tys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ty)| format!("_arg_{i}: {ty}"))
+                    .collect();
+                out.push_str(&format!(
+                    "pub fn {}({}) -> {} {{\n    \
+                         let next = {queue_static}.with(|q| q.borrow_mut().pop_front());\n    \
+                         match next {{\n        \
+                             Some(Some(val)) => val,\n        \
+                             Some(None) => panic!(\"scheduled panic on `{}`\"),\n        \
+                             None => panic!(\"unscheduled PassThrough call to `{}`\"),\n    \
+                         }}\n\
+                     }}\n\n",
+                    ext.name,
+                    ext_params.join(", "),
+                    ext.ret_rust_ty,
+                    ext.name,
+                    ext.name
+                ));
+            }
+        }
+
+        out.push_str(&format!(
+            "#[allow(unused_variables, unused_mut)]\n\
+             pub fn {}({}) -> {} {{\n{}\n}}\n\n",
+            self.fn_name,
+            sig_params.join(", "),
+            self.ret_rust_ty,
+            self.callee_body_rust.trim()
+        ));
+
+        out.push_str(&format!(
+            "pub fn __anneal_spec_check_{}({}) -> SpecProbeOutcome {{\n",
+            self.fn_name,
+            check_params.join(", ")
+        ));
+        for t in &touch_params {
+            out.push_str("    ");
+            out.push_str(t);
+            out.push('\n');
+        }
+        for (req_idx, req) in self.requires.iter().enumerate() {
+            out.push_str(&format!(
+                "    let __anneal_req_{req_idx}: bool = {};\n    \
+                 if !__anneal_req_{req_idx} {{\n        \
+                     return SpecProbeOutcome::VacuouslyFiltered;\n    \
+                 }}\n",
+                req.rust_expr
+            ));
+        }
+        for (old_var, inner_src) in &hoisted_olds {
+            out.push_str(&format!("    let {old_var} = {inner_src};\n"));
+        }
+        for p in &self.params {
+            if p.is_mut_ref {
+                for ff in &p.frame_preserved_fields {
+                    out.push_str(&format!(
+                        "    let __anneal_frame_old_{}_{ff} = {}.{};\n",
+                        p.name, p.name, ff
+                    ));
+                }
+            }
+        }
+        out.push_str(&format!(
+            "    let result: {} = {}({});\n    let _ = &result;\n",
+            self.ret_rust_ty,
+            self.fn_name,
+            call_args.join(", ")
+        ));
+        for p in &self.params {
+            if p.is_mut_ref {
+                for ff in &p.frame_preserved_fields {
+                    let tag = format!("{}.{ff}", p.name);
+                    out.push_str(&format!(
+                        "    if {}.{} != __anneal_frame_old_{}_{ff} {{\n        \
+                             return SpecProbeOutcome::FrameViolation({tag:?});\n    \
+                         }}\n",
+                        p.name, ff, p.name
+                    ));
+                }
+            }
+        }
+        for (ens_idx, (label, expr_src)) in rewritten_ensures.iter().enumerate() {
+            out.push_str(&format!(
+                "    let __anneal_ens_{ens_idx}: bool = {expr_src};\n    \
+                 if !__anneal_ens_{ens_idx} {{\n        \
+                     return SpecProbeOutcome::PostconditionViolation({label:?});\n    \
+                 }}\n"
+            ));
+        }
+        out.push_str("    SpecProbeOutcome::VerifiedHold\n}\n\n");
+
+        let assert_fwd_args: Vec<String> = self
+            .params
+            .iter()
+            .map(|p| {
+                if p.is_mut_ref {
+                    format!("&mut *{}", p.name)
+                } else {
+                    p.name.clone()
+                }
+            })
+            .collect();
+        out.push_str(&format!(
+            "pub fn __anneal_spec_assert_{}({}) -> bool {{\n    \
+                 match __anneal_spec_check_{}({}) {{\n        \
+                     SpecProbeOutcome::VacuouslyFiltered => false,\n        \
+                     SpecProbeOutcome::VerifiedHold => true,\n        \
+                     SpecProbeOutcome::PostconditionViolation(lbl) => {{\n            \
+                         panic!(\"SpecPostconditionViolation in `{}`: {{lbl}}\");\n        \
+                     }}\n        \
+                     SpecProbeOutcome::FrameViolation(field) => {{\n            \
+                         panic!(\"SpecFrameViolation in `{}`: {{field}}\");\n        \
+                     }}\n    \
+                 }}\n\
+             }}\n",
+            self.fn_name,
+            check_params.join(", "),
+            self.fn_name,
+            assert_fwd_args.join(", "),
+            self.fn_name,
+            self.fn_name,
+        ));
+
+        Ok(out)
+    }
+
+    /// Synthesizes a complete executable Rust binary (`fn main()`) that runs
+    /// `__anneal_spec_check_<fn_name>` across `packed_trials` (catching panics
+    /// via `std::panic::catch_unwind`) and prints one canonical tag line per
+    /// trial (`HOLD`, `FILTERED`, `VIOLATION:<detail>`, `FRAME:<field>`, or `TRAP`),
+    /// enabling end-to-end native `rustc -D warnings` parity tests.
+    pub fn synthesize_rust_executable_harness(
+        &self,
+        packed_trials: &[Vec<u8>],
+    ) -> Result<String, String> {
+        let scheduled: Vec<(Vec<u8>, Option<EnvSchedule>)> = packed_trials
+            .iter()
+            .map(|b| (b.clone(), None))
+            .collect();
+        self.synthesize_rust_executable_harness_with_schedules(&scheduled)
+    }
+
+    /// Synthesizes a complete executable Rust binary (`fn main()`) over
+    /// `(packed_arg_bytes, optional_schedule)` trials, staging each trial's
+    /// declared external callee actions from [`EnvSchedule`] before running
+    /// `__anneal_spec_check_<fn_name>`.
+    pub fn synthesize_rust_executable_harness_with_schedules(
+        &self,
+        trials: &[(Vec<u8>, Option<EnvSchedule>)],
+    ) -> Result<String, String> {
+        let mut src = self.synthesize_rust_probe()?;
+        src.push_str("\nfn main() {\n");
+        for (t_idx, (raw_trial, opt_sched)) in trials.iter().enumerate() {
+            let expected_len: usize = self.params.iter().map(|p| p.layout.total_size()).sum();
+            if raw_trial.len() != expected_len {
+                return Err(format!(
+                    "trial {t_idx} byte length mismatch: expected {expected_len}, got {}",
+                    raw_trial.len()
+                ));
+            }
+            let mut cursor = 0usize;
+            let mut bindings_code = String::new();
+            for ext in &self.external_callees {
+                bindings_code.push_str(&format!(
+                    "        __anneal_reset_schedule_{}();\n",
+                    ext.name
+                ));
+            }
+            if let Some(sched) = opt_sched {
+                for ext in &self.external_callees {
+                    let mut sim = sched.clone();
+                    for call_slot in 0..16usize {
+                        match sim.next_action(&ext.name, call_slot) {
+                            crate::instrument::EnvAction::ReturnBytes(bytes) => {
+                                if bytes.len() == ext.ret_layout.total_size()
+                                    && let Ok(val) =
+                                        SpecEvalValue::from_layout_bytes(&ext.ret_layout, &bytes)
+                                {
+                                    bindings_code.push_str(&format!(
+                                        "        __anneal_push_schedule_{}(Some({}));\n",
+                                        ext.name,
+                                        val.rust_literal(&ext.ret_rust_ty)
+                                    ));
+                                } else {
+                                    bindings_code.push_str(&format!(
+                                        "        __anneal_push_schedule_{}(None);\n",
+                                        ext.name
+                                    ));
+                                }
+                            }
+                            crate::instrument::EnvAction::PanicOnCall(_) => {
+                                bindings_code.push_str(&format!(
+                                    "        __anneal_push_schedule_{}(None);\n",
+                                    ext.name
+                                ));
+                            }
+                            crate::instrument::EnvAction::PassThrough => break,
+                        }
+                    }
+                }
+            }
+            let mut call_args = Vec::with_capacity(self.params.len());
+            for p in &self.params {
+                let sz = p.layout.total_size();
+                let val = SpecEvalValue::from_layout_bytes(&p.layout, &raw_trial[cursor..cursor + sz])
+                    .map_err(|e| format!("trial {t_idx} param `{}` invalid: {e}", p.name))?;
+                cursor += sz;
+                let lit = val.rust_literal(&p.rust_ty);
+                if p.is_mut_ref {
+                    bindings_code.push_str(&format!(
+                        "        let mut __arg_{}: {} = {};\n",
+                        p.name, p.rust_ty, lit
+                    ));
+                    call_args.push(format!("&mut __arg_{}", p.name));
+                } else {
+                    bindings_code.push_str(&format!(
+                        "        let __arg_{}: {} = {};\n",
+                        p.name, p.rust_ty, lit
+                    ));
+                    call_args.push(format!("__arg_{}", p.name));
+                }
+            }
+            src.push_str(&format!(
+                "    let __trial_{t_idx} = std::panic::catch_unwind(|| {{\n\
+                 {bindings_code}\
+                         __anneal_spec_check_{}({})\n    \
+                 }});\n    \
+                 match __trial_{t_idx} {{\n        \
+                     Ok(SpecProbeOutcome::VerifiedHold) => println!(\"TRIAL:{t_idx}:HOLD\"),\n        \
+                     Ok(SpecProbeOutcome::VacuouslyFiltered) => println!(\"TRIAL:{t_idx}:FILTERED\"),\n        \
+                     Ok(SpecProbeOutcome::PostconditionViolation(lbl)) => println!(\"TRIAL:{t_idx}:VIOLATION:{{lbl}}\"),\n        \
+                     Ok(SpecProbeOutcome::FrameViolation(fld)) => println!(\"TRIAL:{t_idx}:FRAME:{{fld}}\"),\n        \
+                     Err(_) => println!(\"TRIAL:{t_idx}:TRAP\"),\n    \
+                 }}\n",
+                self.fn_name,
+                call_args.join(", ")
+            ));
+        }
+        src.push_str("}\n");
+        Ok(src)
+    }
+
+    /// Evaluates this contract against a single packed input byte slice (such as
+    /// one generated by [`LayoutAwareByteBuilder::build_bytes`] on
+    /// [`Self::combined_input_layout`]) and an optional [`EnvSchedule`].
+    ///
+    /// Distinguishes:
+    /// 1. `VacuouslyFiltered` when any `requires` clause evaluates to `false`,
+    /// 2. `PostconditionViolation` when an `ensures` clause or framed `&mut`
+    ///    field invariant fails on normal return,
+    /// 3. `PanicOrTrap` when checked overflow, shift-width UB, OOB indexing,
+    ///    explicit `panic!` / `assert!`, or `EnvAction::PanicOnCall` fires, and
+    /// 4. `VerifiedHold` when `requires`, body execution, frame conditions, and
+    ///    `ensures` all succeed.
+    pub fn verify_spec_postcondition_against_schedule(
+        &self,
+        packed_arg_bytes: &[u8],
+        schedule: Option<&mut EnvSchedule>,
+    ) -> Result<SpecPostconditionVerdict, ScheduleError> {
+        self.validate().map_err(|reason| ScheduleError::InvalidBitPattern {
+            context: self.fn_name.clone(),
+            reason,
+        })?;
+
+        let expected_total: usize = self.params.iter().map(|p| p.layout.total_size()).sum();
+        if packed_arg_bytes.len() != expected_total {
+            return Err(ScheduleError::PayloadSizeMismatch {
+                context: format!("SpecContractOracleProbe({})", self.fn_name),
+                expected: expected_total,
+                actual: packed_arg_bytes.len(),
+            });
+        }
+
+        let mut struct_layouts = BTreeMap::new();
+        let mut external_callees = BTreeMap::new();
+        for ext in &self.external_callees {
+            collect_named_struct_layouts(&ext.ret_layout, &mut struct_layouts);
+            external_callees.insert(ext.name.clone(), ext.ret_layout.clone());
+        }
+        let mut helper_fns = BTreeMap::new();
+        if !self.type_defs_rust.trim().is_empty()
+            && let Ok(parsed_defs) = syn::parse_file(&self.type_defs_rust)
+        {
+            for item in parsed_defs.items {
+                if let syn::Item::Fn(f) = item {
+                    helper_fns.insert(f.sig.ident.to_string(), f);
+                }
+            }
+        }
+        let mut pre_env = BTreeMap::new();
+        let mut pre_raw_by_param: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut cursor = 0usize;
+        for p in &self.params {
+            collect_named_struct_layouts(&p.layout, &mut struct_layouts);
+            let sz = p.layout.total_size();
+            let slice = &packed_arg_bytes[cursor..cursor + sz];
+            cursor += sz;
+            let val = SpecEvalValue::from_layout_bytes(&p.layout, slice)?;
+            pre_raw_by_param.insert(p.name.clone(), slice.to_vec());
+            pre_env.insert(p.name.clone(), val);
+        }
+        collect_named_struct_layouts(&self.ret_layout, &mut struct_layouts);
+
+        // Phase 1: Evaluate `requires` preconditions in order BEFORE executing the body.
+        {
+            let mut req_ctx = SpecEvalContext {
+                env: pre_env.clone(),
+                pre_env: None,
+                struct_layouts: &struct_layouts,
+                external_callees: &external_callees,
+                helper_fns: &helper_fns,
+                schedule: None,
+                call_index: 0,
+                early_return: None,
+            };
+            for (idx, req) in self.requires.iter().enumerate() {
+                let expr = syn::parse_str::<Expr>(&req.rust_expr).map_err(|e| {
+                    ScheduleError::InvalidBitPattern {
+                        context: req.label.clone(),
+                        reason: e.to_string(),
+                    }
+                })?;
+                match req_ctx.eval_expr(&expr) {
+                    Ok(SpecEvalValue::Bool(true)) => {}
+                    Ok(SpecEvalValue::Bool(false)) => {
+                        return Ok(SpecPostconditionVerdict::VacuouslyFiltered {
+                            failed_requires_index: idx,
+                            failed_requires_label: req.label.clone(),
+                        });
+                    }
+                    Ok(other) => {
+                        return Ok(SpecPostconditionVerdict::PanicOrTrap {
+                            phase: SpecExecPhase::Requires,
+                            detail: format!(
+                                "`requires` clause `{}` returned non-bool {other:?}",
+                                req.label
+                            ),
+                        });
+                    }
+                    Err(trap) => {
+                        return Ok(SpecPostconditionVerdict::PanicOrTrap {
+                            phase: SpecExecPhase::Requires,
+                            detail: trap,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Execute callee body against `schedule`.
+        let wrapped_body = format!("{{\n{}\n}}", self.callee_body_rust);
+        let body_block = syn::parse_str::<syn::Block>(&wrapped_body).map_err(|e| {
+            ScheduleError::InvalidBitPattern {
+                context: self.fn_name.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+        let mut body_ctx = SpecEvalContext {
+            env: pre_env.clone(),
+            pre_env: None,
+            struct_layouts: &struct_layouts,
+            external_callees: &external_callees,
+            helper_fns: &helper_fns,
+            schedule,
+            call_index: 0,
+            early_return: None,
+        };
+        let mut result_val = match body_ctx.eval_block(&body_block) {
+            Ok(v) => v,
+            Err(trap) => {
+                return Ok(SpecPostconditionVerdict::PanicOrTrap {
+                    phase: SpecExecPhase::Body,
+                    detail: trap,
+                });
+            }
+        };
+        if let LayoutSpec::Scalar(sc) = &self.ret_layout
+            && let SpecEvalValue::Int {
+                bits,
+                signed: rsig,
+                untyped_lit: true,
+                ..
+            } = result_val
+        {
+            match coerce_lit_to_int(bits, rsig, sc.size_bytes, sc.signed) {
+                Ok(coerced) => result_val = coerced,
+                Err(trap) => {
+                    return Ok(SpecPostconditionVerdict::PanicOrTrap {
+                        phase: SpecExecPhase::Body,
+                        detail: trap,
+                    });
+                }
+            }
+        }
+
+        // Phase 3: Check frame conditions on `&mut` parameters using
+        // `LayoutSpec::mask_padding_as_unknown` so padding bytes never cause
+        // false alarms while every occupied data byte of framed fields is checked!
+        for p in &self.params {
+            if !p.is_mut_ref || p.frame_preserved_fields.is_empty() {
+                continue;
+            }
+            let Some(post_val) = body_ctx.env.get(&p.name) else {
+                continue;
+            };
+            let post_bytes = post_val.to_layout_bytes();
+            let pre_bytes = &pre_raw_by_param[&p.name];
+            if let LayoutSpec::Struct { fields, .. } = &p.layout {
+                for ff in &p.frame_preserved_fields {
+                    if let Some(fspec) = fields.iter().find(|f| &f.name == ff) {
+                        let start = fspec.offset;
+                        let end = start + fspec.layout.total_size();
+                        let pre_masked = fspec
+                            .layout
+                            .mask_padding_as_unknown(&pre_bytes[start..end])?;
+                        let post_masked = fspec
+                            .layout
+                            .mask_padding_as_unknown(&post_bytes[start..end])?;
+                        if pre_masked != post_masked {
+                            return Ok(SpecPostconditionVerdict::PostconditionViolation {
+                                kind: SpecViolationKind::FrameCondition {
+                                    param: p.name.clone(),
+                                    field: ff.clone(),
+                                },
+                                detail: format!(
+                                    "framed field `{}.{ff}` mutated from {:?} to {:?}",
+                                    p.name,
+                                    &pre_bytes[start..end],
+                                    &post_bytes[start..end]
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 4: Evaluate `ensures` postconditions over post-state + `result` + `old(pre_env)`.
+        let mut post_env = BTreeMap::new();
+        for p in &self.params {
+            if p.is_mut_ref {
+                if let Some(v) = body_ctx.env.get(&p.name) {
+                    post_env.insert(p.name.clone(), v.clone());
+                }
+            } else if let Some(v) = pre_env.get(&p.name) {
+                // Non-`&mut` parameters are observed at their caller-visible value.
+                post_env.insert(p.name.clone(), v.clone());
+            }
+        }
+        post_env.insert("result".to_string(), result_val);
+
+        let mut ens_ctx = SpecEvalContext {
+            env: post_env,
+            pre_env: Some(&pre_env),
+            struct_layouts: &struct_layouts,
+            external_callees: &external_callees,
+            helper_fns: &helper_fns,
+            schedule: None,
+            call_index: 0,
+            early_return: None,
+        };
+        for (idx, ens) in self.ensures.iter().enumerate() {
+            let expr = syn::parse_str::<Expr>(&ens.rust_expr).map_err(|e| {
+                ScheduleError::InvalidBitPattern {
+                    context: ens.label.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+            match ens_ctx.eval_expr(&expr) {
+                Ok(SpecEvalValue::Bool(true)) => {}
+                Ok(SpecEvalValue::Bool(false)) => {
+                    return Ok(SpecPostconditionVerdict::PostconditionViolation {
+                        kind: SpecViolationKind::EnsuresClause {
+                            clause_index: idx,
+                            label: ens.label.clone(),
+                        },
+                        detail: format!(
+                            "`ensures` clause `{}` (`{}`) evaluated to false",
+                            ens.label, ens.rust_expr
+                        ),
+                    });
+                }
+                Ok(other) => {
+                    return Ok(SpecPostconditionVerdict::PanicOrTrap {
+                        phase: SpecExecPhase::Ensures,
+                        detail: format!(
+                            "`ensures` clause `{}` returned non-bool {other:?}",
+                            ens.label
+                        ),
+                    });
+                }
+                Err(trap) => {
+                    return Ok(SpecPostconditionVerdict::PanicOrTrap {
+                        phase: SpecExecPhase::Ensures,
+                        detail: trap,
+                    });
+                }
+            }
+        }
+
+        Ok(SpecPostconditionVerdict::VerifiedHold)
+    }
+
+    /// Evaluates `self` across a batch of `(packed_arg_bytes, optional_schedule)`
+    /// trials and aggregates counts into a [`SpecBatchVerificationReport`].
+    pub fn verify_spec_postcondition_batch(
+        &self,
+        trials: &[(Vec<u8>, Option<EnvSchedule>)],
+    ) -> Result<SpecBatchVerificationReport, ScheduleError> {
+        let mut report = SpecBatchVerificationReport {
+            total_trials: trials.len(),
+            ..SpecBatchVerificationReport::default()
+        };
+        for (arg_bytes, opt_sched) in trials {
+            let mut sched_clone = opt_sched.clone();
+            let verdict = self
+                .verify_spec_postcondition_against_schedule(arg_bytes, sched_clone.as_mut())?;
+            match &verdict {
+                SpecPostconditionVerdict::VerifiedHold => report.verified_hold_count += 1,
+                SpecPostconditionVerdict::VacuouslyFiltered { .. } => {
+                    report.vacuously_filtered_count += 1;
+                }
+                SpecPostconditionVerdict::PostconditionViolation { .. } => {
+                    report.postcondition_violation_count += 1;
+                }
+                SpecPostconditionVerdict::PanicOrTrap { .. } => report.panic_or_trap_count += 1,
+            }
+            report.verdicts.push(verdict);
+        }
+        Ok(report)
+    }
+}
+
+fn collect_named_struct_layouts(layout: &LayoutSpec, out: &mut BTreeMap<String, LayoutSpec>) {
+    match layout {
+        LayoutSpec::Struct { name, fields, .. } => {
+            out.insert(name.clone(), layout.clone());
+            for f in fields {
+                collect_named_struct_layouts(&f.layout, out);
+            }
+        }
+        LayoutSpec::Tuple { elements, .. } => {
+            for (_, el) in elements {
+                collect_named_struct_layouts(el, out);
+            }
+        }
+        LayoutSpec::Array { elem, .. } => collect_named_struct_layouts(elem, out),
+        LayoutSpec::Enum { variants, .. } => {
+            for v in variants {
+                if let Some(p) = &v.payload {
+                    collect_named_struct_layouts(p, out);
+                }
+            }
+        }
+        LayoutSpec::Scalar(_) => {}
+    }
+}
+
+/// Convenience free-function entry point delegating to
+/// [`SpecContractOracleProbe::verify_spec_postcondition_against_schedule`].
+pub fn verify_spec_postcondition_against_schedule(
+    probe: &SpecContractOracleProbe,
+    packed_arg_bytes: &[u8],
+    schedule: Option<&mut EnvSchedule>,
+) -> Result<SpecPostconditionVerdict, ScheduleError> {
+    probe.verify_spec_postcondition_against_schedule(packed_arg_bytes, schedule)
+}
+
+/// One write or read-modify-write (RMW) transition observed by [`WriteChainCoverageBound`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteChainStep {
+    /// Mutable variable / place / channel written in this step.
+    pub written_slot: String,
+    /// Source slots read to compute the value written in this step.
+    pub read_slots: Vec<String>,
+    /// Optional external environment callee mediating this step.
+    pub env_callee: Option<String>,
+    /// When `env_callee.is_some()`, whether the scheduled environment call
+    /// delivered a valid payload (`false` indicates a gap/panic breaking the chain).
+    pub env_link_satisfied: bool,
+}
+
+impl WriteChainStep {
+    /// Local write `written_slot := const_or_initial(...)` with zero causal slot dependencies.
+    pub fn local_write(written_slot: impl Into<String>) -> Self {
+        Self {
+            written_slot: written_slot.into(),
+            read_slots: Vec::new(),
+            env_callee: None,
+            env_link_satisfied: true,
+        }
+    }
+
+    /// Causal write / RMW `written_slot := f(read_slots...)`.
+    pub fn dependent_write<I, S>(written_slot: impl Into<String>, read_slots: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            written_slot: written_slot.into(),
+            read_slots: read_slots.into_iter().map(Into::into).collect(),
+            env_callee: None,
+            env_link_satisfied: true,
+        }
+    }
+
+    /// Environment-mediated write / RMW crossing external `callee`.
+    pub fn env_dependent_write<I, S>(
+        written_slot: impl Into<String>,
+        read_slots: I,
+        callee: impl Into<String>,
+        env_link_satisfied: bool,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            written_slot: written_slot.into(),
+            read_slots: read_slots.into_iter().map(Into::into).collect(),
+            env_callee: Some(callee.into()),
+            env_link_satisfied,
+        }
+    }
+}
+
+/// Planned environment-scheduled write/RMW transition evaluated against an
+/// [`EnvSchedule`] via [`WriteChainCoverageBound::observe_env_schedule`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvScheduledWriteStep {
+    /// External callee queried at this schedule step.
+    pub callee: String,
+    /// Target mutable slot updated using `callee`'s response and `read_slots`.
+    pub written_slot: String,
+    /// Previously written slots fed into `callee` or combined with its response.
+    pub read_slots: Vec<String>,
+}
+
+impl EnvScheduledWriteStep {
+    /// Constructs a planned environment-scheduled write/RMW step.
+    pub fn new<I, S>(
+        callee: impl Into<String>,
+        written_slot: impl Into<String>,
+        read_slots: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            callee: callee.into(),
+            written_slot: written_slot.into(),
+            read_slots: read_slots.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Structured diagnostic explaining why [`WriteChainCoverageBound::is_depth_certified`]
+/// is `false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnderExplorationReason {
+    /// `min_walk_length == 0` is invalid (a causal write chain requires $d \ge 1$).
+    InvalidTargetDepth { min_walk_length: usize },
+    /// `num_slots == 0` is invalid (at least $m \ge 1$ mutable slot is required).
+    InvalidSlotCount { num_slots: usize },
+    /// Zero valid writes have been observed so far.
+    NoWritesObserved { required_depth: usize },
+    /// An `EnvSchedule` call panicked, failed payload validation, or lacked a
+    /// scheduled response (`PassThrough`), breaking the cross-boundary RMW chain.
+    BrokenEnvScheduleLink {
+        max_observed_depth: usize,
+        required_depth: usize,
+        broken_links: usize,
+    },
+    /// One or more writes were observed, but every write was an independent
+    /// depth-1 local write (`x = 1; y = 2; z = 3`) with zero write-to-read-to-write
+    /// composition ($k = 1 < d$).
+    OnlyDepthOneLocalWrites {
+        steps_observed: usize,
+        distinct_slots_written: usize,
+        required_depth: usize,
+    },
+    /// Some multi-step RMW/write-read-write progress occurred ($2 \le k < d$),
+    /// but the maximum contiguous causal chain depth $k$ is still below $d$.
+    InsufficientChainDepth {
+        max_observed_depth: usize,
+        required_depth: usize,
+        steps_observed: usize,
+        recommended_walk_steps: usize,
+    },
+}
+
+impl std::fmt::Display for UnderExplorationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTargetDepth { min_walk_length } => write!(
+                f,
+                "invalid target write-chain depth min_walk_length={min_walk_length} (must be >= 1)"
+            ),
+            Self::InvalidSlotCount { num_slots } => write!(
+                f,
+                "invalid mutable slot count num_slots={num_slots} (must be >= 1)"
+            ),
+            Self::NoWritesObserved { required_depth } => write!(
+                f,
+                "0 valid writes observed; causal write-chain depth {required_depth} required"
+            ),
+            Self::BrokenEnvScheduleLink {
+                max_observed_depth,
+                required_depth,
+                broken_links,
+            } => write!(
+                f,
+                "broken EnvSchedule boundary link ({broken_links} gap/panic step(s)): max chain depth {max_observed_depth} < {required_depth}"
+            ),
+            Self::OnlyDepthOneLocalWrites {
+                steps_observed,
+                distinct_slots_written,
+                required_depth,
+            } => write!(
+                f,
+                "only independent depth-1 local writes observed ({steps_observed} step(s) across {distinct_slots_written} slot(s)); required causal RMW depth is {required_depth}"
+            ),
+            Self::InsufficientChainDepth {
+                max_observed_depth,
+                required_depth,
+                steps_observed,
+                recommended_walk_steps,
+            } => write!(
+                f,
+                "max observed causal write-chain depth {max_observed_depth} < {required_depth} after {steps_observed} step(s) (recommended random-walk horizon >= {recommended_walk_steps})"
+            ),
+        }
+    }
+}
+
+/// Bounded write-chain / read-modify-write (RMW) walk coverage tracker modeled
+/// on Guo et al. (*"How Far Must a Test Explore? Certifying Composable
+/// Read-Write Interfaces from Their Own Random Edits"*, arXiv:2611.11899).
+///
+/// Tracks Lamport-style causal write depth per mutable slot (`slot_depth`):
+/// - Unwritten slots have causal depth `0`.
+/// - A write `w := f(r_1, ..., r_k)` updates `slot_depth[w] = 1 + max_i slot_depth[r_i]`
+///   (overwriting `w`'s previous live depth so a constant overwrite `w := c`
+///   resets `slot_depth[w]` to `1` rather than falsely extending an overwritten chain!).
+/// - A broken environment-boundary step (`env_callee.is_some() && !env_link_satisfied`)
+///   clears `slot_depth[w]` (`0`) and increments `broken_env_links` so gapped
+///   schedules cannot bridge causal depth across missing/panicking calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteChainCoverageBound {
+    num_slots: usize,
+    min_walk_length: usize,
+    live_slot_depths: BTreeMap<String, usize>,
+    ever_written_slots: BTreeSet<String>,
+    max_observed_depth: usize,
+    steps_observed: usize,
+    rmw_transitions_observed: usize,
+    broken_env_links: usize,
+}
+
+impl WriteChainCoverageBound {
+    /// Creates a new [`WriteChainCoverageBound`] over `num_slots` ($m$) mutable
+    /// variables/channels requiring causal write-chain depth `min_walk_length` ($d$).
+    pub fn new(num_slots: usize, min_walk_length: usize) -> Self {
+        Self {
+            num_slots,
+            min_walk_length,
+            live_slot_depths: BTreeMap::new(),
+            ever_written_slots: BTreeSet::new(),
+            max_observed_depth: 0,
+            steps_observed: 0,
+            rmw_transitions_observed: 0,
+            broken_env_links: 0,
+        }
+    }
+
+    /// Convenience constructor for single-pool causal depth tracking (`num_slots = 1`).
+    pub fn with_target_depth(min_walk_length: usize) -> Self {
+        Self::new(1, min_walk_length)
+    }
+
+    /// Configured number of mutable slots $m$.
+    #[inline]
+    pub fn num_slots(&self) -> usize {
+        self.num_slots
+    }
+
+    /// Required causal write-chain / RMW depth $d$.
+    #[inline]
+    pub fn min_walk_length(&self) -> usize {
+        self.min_walk_length
+    }
+
+    /// Computes the coupon-collector random-walk step bound
+    /// $\ell(m, d) = \lceil d \cdot m \cdot H_m \rceil$ required in expectation
+    /// for uniform random edits over $m$ mutable slots to witness a causal
+    /// read-modify-write chain of depth $d$ (`0` when $m = 0$ or $d = 0$, and
+    /// exact $d$ when $m = 1$).
+    pub fn compute_random_walk_step_bound(num_slots: usize, min_walk_length: usize) -> usize {
+        if num_slots == 0 || min_walk_length == 0 {
+            return 0;
+        }
+        if num_slots == 1 {
+            return min_walk_length;
+        }
+        // Compute ceil(d * m * sum_{k=1..=m} (1/k)) in exact u128 fixed-point
+        // rational arithmetic when `m <= 34` (lcm fits in u128), falling back
+        // to tight integer-scaled harmonic sum with ceiling rounding.
+        const SCALE: u128 = 1_000_000_000_000;
+        let m_u128 = num_slots as u128;
+        let d_u128 = min_walk_length as u128;
+        let mut harmonic_scaled: u128 = 0;
+        for k in 1..=num_slots {
+            let ku = k as u128;
+            // Ceiling of `SCALE / k` ensures the bound is never under-rounded.
+            harmonic_scaled = harmonic_scaled.saturating_add((SCALE + ku - 1) / ku);
+        }
+        let prod = d_u128
+            .saturating_mul(m_u128)
+            .saturating_mul(harmonic_scaled);
+        let ceil_steps = (prod + SCALE - 1) / SCALE;
+        ceil_steps.min(usize::MAX as u128) as usize
+    }
+
+    /// Minimum random-walk step horizon $\ell(m, d)$ for `(self.num_slots, self.min_walk_length)`.
+    #[inline]
+    pub fn random_walk_step_bound(&self) -> usize {
+        Self::compute_random_walk_step_bound(self.num_slots, self.min_walk_length)
+    }
+
+    /// Maximum contiguous causal write-chain depth observed so far.
+    #[inline]
+    pub fn max_observed_depth(&self) -> usize {
+        self.max_observed_depth
+    }
+
+    /// Current live causal depth of `slot` (`0` if unwritten, overwritten by a
+    /// broken env step, or unknown).
+    #[inline]
+    pub fn current_slot_depth(&self, slot: &str) -> usize {
+        self.live_slot_depths.get(slot).copied().unwrap_or(0)
+    }
+
+    /// Total valid write steps observed.
+    #[inline]
+    pub fn steps_observed(&self) -> usize {
+        self.steps_observed
+    }
+
+    /// Count of distinct mutable slots written at least once.
+    #[inline]
+    pub fn distinct_slots_written(&self) -> usize {
+        self.ever_written_slots.len()
+    }
+
+    /// Count of broken environment-boundary links encountered.
+    #[inline]
+    pub fn broken_env_links(&self) -> usize {
+        self.broken_env_links
+    }
+
+    /// Records a single [`WriteChainStep`], updating live per-slot causal depth
+    /// and returning the newly assigned live causal depth of `step.written_slot`
+    /// (`0` if `written_slot` is empty, configuration is invalid, or `env_link_satisfied` is `false`).
+    pub fn observe_step(&mut self, step: &WriteChainStep) -> usize {
+        if self.num_slots == 0 || self.min_walk_length == 0 || step.written_slot.trim().is_empty() {
+            return 0;
+        }
+        if step.env_callee.is_some() && !step.env_link_satisfied {
+            self.broken_env_links += 1;
+            self.live_slot_depths.remove(&step.written_slot);
+            return 0;
+        }
+
+        let max_dep = step
+            .read_slots
+            .iter()
+            .filter_map(|src| self.live_slot_depths.get(src).copied())
+            .max()
+            .unwrap_or(0);
+        let new_depth = 1usize.saturating_add(max_dep);
+        if max_dep >= 1 {
+            self.rmw_transitions_observed += 1;
+        }
+        self.steps_observed += 1;
+        self.ever_written_slots.insert(step.written_slot.clone());
+        self.live_slot_depths
+            .insert(step.written_slot.clone(), new_depth);
+        if new_depth > self.max_observed_depth {
+            self.max_observed_depth = new_depth;
+        }
+        new_depth
+    }
+
+    /// Observes an ordered sequence of [`WriteChainStep`]s and returns the
+    /// maximum causal chain depth reached across all observations so far.
+    pub fn observe_write_chain(&mut self, steps: &[WriteChainStep]) -> usize {
+        for s in steps {
+            self.observe_step(s);
+        }
+        self.max_observed_depth
+    }
+
+    /// Simulates `planned_steps` against a clone of `schedule`: a step's
+    /// environment link is satisfied iff `schedule.next_action` yields
+    /// [`crate::instrument::EnvAction::ReturnBytes`] with a non-empty payload
+    /// passing `schedule.validate_callee_payload`. Panicking or unscheduled
+    /// (`PassThrough`) calls break the causal chain at `step.written_slot`.
+    pub fn observe_env_schedule(
+        &mut self,
+        schedule: &EnvSchedule,
+        planned_steps: &[EnvScheduledWriteStep],
+    ) -> usize {
+        let mut sim = schedule.clone();
+        for (call_idx, planned) in planned_steps.iter().enumerate() {
+            let link_ok = match sim.next_action(&planned.callee, call_idx) {
+                crate::instrument::EnvAction::ReturnBytes(bytes) => {
+                    !bytes.is_empty() && sim.validate_callee_payload(&planned.callee, &bytes).is_ok()
+                }
+                crate::instrument::EnvAction::PanicOnCall(_)
+                | crate::instrument::EnvAction::PassThrough => false,
+            };
+            self.observe_step(&WriteChainStep {
+                written_slot: planned.written_slot.clone(),
+                read_slots: planned.read_slots.clone(),
+                env_callee: Some(planned.callee.clone()),
+                env_link_satisfied: link_ok,
+            });
+        }
+        self.max_observed_depth
+    }
+
+    /// Returns `true` iff configuration is valid (`num_slots >= 1` and
+    /// `min_walk_length >= 1`) AND an unbroken causal write/RMW chain of length
+    /// `>= self.min_walk_length` has been observed.
+    pub fn is_depth_certified(&self) -> bool {
+        self.num_slots >= 1
+            && self.min_walk_length >= 1
+            && self.max_observed_depth >= self.min_walk_length
+    }
+
+    /// Returns `None` iff [`Self::is_depth_certified`] holds, or a structured
+    /// [`UnderExplorationReason`] pinpointing why depth $d$ is not yet certified.
+    pub fn under_exploration_reason(&self) -> Option<UnderExplorationReason> {
+        if self.min_walk_length == 0 {
+            return Some(UnderExplorationReason::InvalidTargetDepth {
+                min_walk_length: 0,
+            });
+        }
+        if self.num_slots == 0 {
+            return Some(UnderExplorationReason::InvalidSlotCount { num_slots: 0 });
+        }
+        if self.max_observed_depth >= self.min_walk_length {
+            return None;
+        }
+        if self.broken_env_links > 0 {
+            return Some(UnderExplorationReason::BrokenEnvScheduleLink {
+                max_observed_depth: self.max_observed_depth,
+                required_depth: self.min_walk_length,
+                broken_links: self.broken_env_links,
+            });
+        }
+        if self.steps_observed == 0 || self.max_observed_depth == 0 {
+            return Some(UnderExplorationReason::NoWritesObserved {
+                required_depth: self.min_walk_length,
+            });
+        }
+        if self.max_observed_depth == 1 {
+            return Some(UnderExplorationReason::OnlyDepthOneLocalWrites {
+                steps_observed: self.steps_observed,
+                distinct_slots_written: self.ever_written_slots.len(),
+                required_depth: self.min_walk_length,
+            });
+        }
+        Some(UnderExplorationReason::InsufficientChainDepth {
+            max_observed_depth: self.max_observed_depth,
+            required_depth: self.min_walk_length,
+            steps_observed: self.steps_observed,
+            recommended_walk_steps: self.random_walk_step_bound(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3747,5 +7152,336 @@ mod tests {
             flip_branch_guard(&no_fields, &[g_ne, g_ge], &[], 1, &MirInputDictionary::new(), 0)
                 .expect("flip x >= 50_000 under x != 50_000");
         assert!(flipped_ge.flipped_bits > 50_000);
+    }
+
+    #[test]
+    fn spec_contract_oracle_probe_validation_and_verdict_classification() {
+        let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+        let unit_layout = LayoutSpec::Tuple {
+            total_size: 0,
+            elements: Vec::new(),
+        };
+
+        // Invalid identifiers, reserved `result` parameter, `old(...)` in `requires`,
+        // nested `old(old(...))`, and unknown/non-`&mut` framed fields are rejected cleanly.
+        let bad_fn = SpecContractOracleProbe::new(
+            "not-an-ident",
+            vec![SpecParamBinding::by_value("x", "u32", u32_layout.clone())],
+            "u32",
+            u32_layout.clone(),
+            "x",
+        );
+        assert!(bad_fn.validate().is_err());
+
+        let reserved_param = SpecContractOracleProbe::new(
+            "foo",
+            vec![SpecParamBinding::by_value(
+                "result",
+                "u32",
+                u32_layout.clone(),
+            )],
+            "u32",
+            u32_layout.clone(),
+            "0u32",
+        );
+        assert!(reserved_param.validate().is_err());
+
+        let old_in_requires = SpecContractOracleProbe::new(
+            "foo",
+            vec![SpecParamBinding::by_value("x", "u32", u32_layout.clone())],
+            "u32",
+            u32_layout.clone(),
+            "x",
+        )
+        .with_requires("bad_old", "old(x) < 10u32");
+        assert!(old_in_requires.validate().is_err());
+
+        let nested_old = SpecContractOracleProbe::new(
+            "foo",
+            vec![SpecParamBinding::by_value("x", "u32", u32_layout.clone())],
+            "u32",
+            u32_layout.clone(),
+            "x",
+        )
+        .with_ensures("nested", "result == old(old(x))");
+        assert!(nested_old.validate().is_err());
+
+        let non_mut_framed = SpecContractOracleProbe::new(
+            "foo",
+            vec![
+                SpecParamBinding::by_value("x", "u32", u32_layout.clone())
+                    .with_frame_preserved_fields(["f"]),
+            ],
+            "()",
+            unit_layout.clone(),
+            "()",
+        );
+        assert!(non_mut_framed.validate().is_err());
+
+        // Sound padded struct contract with `&mut`, `old(...)`, framed field, and `EnvSchedule`.
+        let padded_pair_layout = LayoutSpec::Struct {
+            name: "PaddedPair".to_string(),
+            total_size: 12,
+            fields: vec![
+                FieldLayout {
+                    name: "tag".to_string(),
+                    offset: 0,
+                    layout: LayoutSpec::Scalar(ScalarLayout::u8()),
+                },
+                FieldLayout {
+                    name: "active".to_string(),
+                    offset: 4,
+                    layout: u32_layout.clone(),
+                },
+                FieldLayout {
+                    name: "framed".to_string(),
+                    offset: 8,
+                    layout: u32_layout.clone(),
+                },
+            ],
+        };
+        let sound_probe = SpecContractOracleProbe::new(
+            "step_active_with_env",
+            vec![
+                SpecParamBinding::mut_ref("pair", "PaddedPair", padded_pair_layout.clone())
+                    .with_frame_preserved_fields(["tag", "framed"]),
+            ],
+            "u32",
+            u32_layout.clone(),
+            "let delta: u32 = ext_delta(pair.active);\n\
+             let bounded: u32 = delta & 7u32;\n\
+             pair.active = pair.active + bounded;\n\
+             pair.active",
+        )
+        .with_type_defs(
+            "#[repr(C)]\n\
+             #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+             pub struct PaddedPair { pub tag: u8, pub active: u32, pub framed: u32 }",
+        )
+        .with_external_callee(SpecExternalCallee::new(
+            "ext_delta",
+            ["u32"],
+            "u32",
+            u32_layout.clone(),
+        ))
+        .with_requires("room_for_delta", "pair.active <= u32::MAX - 7u32")
+        .with_ensures("ge_old", "pair.active >= old(pair.active)")
+        .with_ensures("bounded_step", "result <= old(pair.active) + 7u32");
+
+        let synthesized = sound_probe
+            .synthesize_rust_probe()
+            .expect("synthesize sound probe");
+        assert!(synthesized.contains("pub fn __anneal_spec_check_step_active_with_env"));
+        assert!(synthesized.contains("__anneal_old_expr_0"));
+        assert!(synthesized.contains("__anneal_frame_old_pair_framed"));
+
+        // Non-zero poison padding bytes at offsets `1..4` must NOT trigger a false
+        // frame violation when `tag` and `framed` preserve their occupied bytes.
+        let mut raw_ok = vec![0xAAu8; 12];
+        raw_ok[0] = 5u8;
+        raw_ok[4..8].copy_from_slice(&100u32.to_le_bytes());
+        raw_ok[8..12].copy_from_slice(&777u32.to_le_bytes());
+
+        let dict = MirInputDictionary::new();
+        let sched_gen = EnvScheduleGenerator::new(&dict)
+            .with_horizon_steps(2)
+            .with_panic_injection_pct(0)
+            .with_callee_return_layout("ext_delta", u32_layout.clone());
+        let mut u = Unstructured::new(&[0x05; 64]);
+        let mut sched = sched_gen.generate_schedule(&["ext_delta"], &mut u);
+
+        let verdict_ok =
+            verify_spec_postcondition_against_schedule(&sound_probe, &raw_ok, Some(&mut sched))
+                .expect("evaluate sound probe");
+        assert_eq!(verdict_ok, SpecPostconditionVerdict::VerifiedHold);
+
+        // Precondition violated (`pair.active == u32::MAX`) -> `VacuouslyFiltered`, NOT `PanicOrTrap`.
+        let mut raw_filtered = raw_ok.clone();
+        raw_filtered[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let verdict_filt = sound_probe
+            .verify_spec_postcondition_against_schedule(&raw_filtered, None)
+            .expect("evaluate filtered trial");
+        assert_eq!(
+            verdict_filt,
+            SpecPostconditionVerdict::VacuouslyFiltered {
+                failed_requires_index: 0,
+                failed_requires_label: "room_for_delta".to_string(),
+            }
+        );
+        assert!(!verdict_filt.is_verified_hold());
+        assert!(!verdict_filt.is_mutant_killed());
+
+        // Vacuous `requires(false)` batch report must NOT pass `is_sound_and_non_vacuous()`.
+        let batch_vacuous = sound_probe
+            .verify_spec_postcondition_batch(&[(raw_filtered, None)])
+            .expect("vacuous batch");
+        assert_eq!(batch_vacuous.vacuously_filtered_count, 1);
+        assert_eq!(batch_vacuous.verified_hold_count, 0);
+        assert!(!batch_vacuous.is_sound_and_non_vacuous());
+
+        // Scheduled `PanicOnCall` -> `PanicOrTrap { phase: Body, .. }`.
+        let panic_gen = EnvScheduleGenerator::new(&dict)
+            .with_horizon_steps(1)
+            .with_callee_return_layout("ext_delta", u32_layout.clone());
+        let mut u_panic = Unstructured::new(&[0x11; 32]);
+        let mut panic_sched = EnvSchedule::new();
+        panic_gen.apply_strategy(
+            &mut panic_sched,
+            "ext_delta",
+            &EnvStrategy::PanicOnCall(0),
+            &mut u_panic,
+        );
+        let verdict_panic = sound_probe
+            .verify_spec_postcondition_against_schedule(&raw_ok, Some(&mut panic_sched))
+            .expect("evaluate panic trial");
+        assert!(matches!(
+            verdict_panic,
+            SpecPostconditionVerdict::PanicOrTrap {
+                phase: SpecExecPhase::Body,
+                ..
+            }
+        ));
+        assert!(verdict_panic.is_mutant_killed());
+
+        // Lexical shadowing inside inner blocks must restore outer bindings on exit.
+        let shadow_probe = SpecContractOracleProbe::new(
+            "lexical_shadow",
+            vec![SpecParamBinding::by_value("x", "u32", u32_layout.clone())],
+            "u32",
+            u32_layout,
+            "let mut acc: u32 = x;\n\
+             if x >= 0u32 {\n    \
+                 let acc: u32 = 999u32;\n    \
+                 let _ = acc;\n\
+             }\n\
+             acc",
+        )
+        .with_ensures("unchanged_outer", "result == x");
+        let shadow_verdict = shadow_probe
+            .verify_spec_postcondition_against_schedule(&42u32.to_le_bytes(), None)
+            .expect("shadowing probe");
+        assert_eq!(shadow_verdict, SpecPostconditionVerdict::VerifiedHold);
+    }
+
+    #[test]
+    fn write_chain_coverage_bound_separates_local_writes_overwrites_and_rmw_walks() {
+        // Boundary `d = 0` and `m = 0` configurations fail closed with exact reasons.
+        let zero_d = WriteChainCoverageBound::new(3, 0);
+        assert_eq!(zero_d.random_walk_step_bound(), 0);
+        assert!(!zero_d.is_depth_certified());
+        assert_eq!(
+            zero_d.under_exploration_reason(),
+            Some(UnderExplorationReason::InvalidTargetDepth { min_walk_length: 0 })
+        );
+
+        let zero_m = WriteChainCoverageBound::new(0, 2);
+        assert_eq!(zero_m.random_walk_step_bound(), 0);
+        assert!(!zero_m.is_depth_certified());
+        assert_eq!(
+            zero_m.under_exploration_reason(),
+            Some(UnderExplorationReason::InvalidSlotCount { num_slots: 0 })
+        );
+
+        // Fresh tracker (`m = 3, d = 3`): coupon-collector bound ceil(3 * 3 * (1 + 1/2 + 1/3)) = ceil(16.5) = 17.
+        let mut tracker = WriteChainCoverageBound::new(3, 3);
+        assert_eq!(tracker.random_walk_step_bound(), 17);
+        assert_eq!(WriteChainCoverageBound::compute_random_walk_step_bound(1, 4), 4);
+        assert!(!tracker.is_depth_certified());
+        assert_eq!(
+            tracker.under_exploration_reason(),
+            Some(UnderExplorationReason::NoWritesObserved { required_depth: 3 })
+        );
+
+        // Repeated independent depth-1 local writes (`x = 1; y = 2; z = 3; x = 4`) NEVER
+        // sum to depth 3!
+        tracker.observe_write_chain(&[
+            WriteChainStep::local_write("x"),
+            WriteChainStep::local_write("y"),
+            WriteChainStep::local_write("z"),
+            WriteChainStep::local_write("x"),
+        ]);
+        assert_eq!(tracker.max_observed_depth(), 1);
+        assert!(!tracker.is_depth_certified());
+        assert_eq!(
+            tracker.under_exploration_reason(),
+            Some(UnderExplorationReason::OnlyDepthOneLocalWrites {
+                steps_observed: 4,
+                distinct_slots_written: 3,
+                required_depth: 3,
+            })
+        );
+
+        // Depth 1 (`d = 1`) IS certified by a single local write.
+        let mut d1 = WriteChainCoverageBound::with_target_depth(1);
+        assert_eq!(d1.observe_step(&WriteChainStep::local_write("x")), 1);
+        assert!(d1.is_depth_certified());
+        assert_eq!(d1.under_exploration_reason(), None);
+
+        // Reading `x` into `y` reaches depth 2 (`InsufficientChainDepth` for `d = 3`),
+        // AND overwriting `y` with a constant (`local_write("y")`) resets `y`'s live
+        // depth back to 1 so a subsequent `z := f(y)` gets depth 2, NOT stale depth 3!
+        assert_eq!(
+            tracker.observe_step(&WriteChainStep::dependent_write("y", ["x"])),
+            2
+        );
+        assert!(!tracker.is_depth_certified());
+        assert_eq!(
+            tracker.under_exploration_reason(),
+            Some(UnderExplorationReason::InsufficientChainDepth {
+                max_observed_depth: 2,
+                required_depth: 3,
+                steps_observed: 5,
+                recommended_walk_steps: 17,
+            })
+        );
+        assert_eq!(tracker.observe_step(&WriteChainStep::local_write("y")), 1);
+        assert_eq!(
+            tracker.observe_step(&WriteChainStep::dependent_write("z", ["y"])),
+            2
+        );
+        assert!(!tracker.is_depth_certified());
+
+        // Self-RMW `z = f(z)` advances live depth of `z` from 2 -> 3 and certifies depth 3!
+        assert_eq!(
+            tracker.observe_step(&WriteChainStep::dependent_write("z", ["z"])),
+            3
+        );
+        assert!(tracker.is_depth_certified());
+        assert_eq!(tracker.under_exploration_reason(), None);
+
+        // Broken `EnvSchedule` boundary step (`PassThrough` / `PanicOnCall`) clears the
+        // target slot's live causal depth and surfaces `BrokenEnvScheduleLink`.
+        let dict = MirInputDictionary::new();
+        let panic_gen = EnvScheduleGenerator::new(&dict)
+            .with_horizon_steps(3)
+            .with_callee_return_layout("ext_hop", LayoutSpec::Scalar(ScalarLayout::u32()));
+        let mut u = Unstructured::new(&[0x42; 64]);
+        let mut gapped_sched = EnvSchedule::new();
+        panic_gen.apply_strategy(
+            &mut gapped_sched,
+            "ext_hop",
+            &EnvStrategy::Constant(1u32.to_le_bytes().to_vec()),
+            &mut u,
+        );
+        gapped_sched.set_callee_panic_on_call("ext_hop", 1);
+
+        let planned = vec![
+            EnvScheduledWriteStep::new("ext_hop", "s0", std::iter::empty::<&str>()),
+            EnvScheduledWriteStep::new("ext_hop", "s1", ["s0"]),
+            EnvScheduledWriteStep::new("ext_hop", "s2", ["s1"]),
+        ];
+        let mut env_tracker = WriteChainCoverageBound::new(3, 3);
+        env_tracker.observe_env_schedule(&gapped_sched, &planned);
+        assert!(!env_tracker.is_depth_certified());
+        assert_eq!(env_tracker.current_slot_depth("s1"), 0);
+        assert_eq!(env_tracker.current_slot_depth("s2"), 1);
+        assert!(matches!(
+            env_tracker.under_exploration_reason(),
+            Some(UnderExplorationReason::BrokenEnvScheduleLink {
+                max_observed_depth: 1,
+                required_depth: 3,
+                broken_links: 1,
+            })
+        ));
     }
 }

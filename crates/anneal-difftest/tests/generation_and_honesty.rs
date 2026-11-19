@@ -1542,3 +1542,616 @@ fn campaign_runner_rejects_oracle_claims_it_cannot_present() {
         assert_failed_run(&state_dir, "n/a", "n/a");
     }
 }
+
+fn compile_and_run_spec_harness(label: &str, source: &str) -> Vec<String> {
+    let dir = unique_temp_dir(label);
+    let src_path = dir.join("spec_harness.rs");
+    let bin_path = dir.join("spec_harness_bin");
+    fs::write(&src_path, source).expect("write spec harness source");
+
+    let compile_out = Command::new(resolve_rustc_bin())
+        .args([
+            "--edition=2024",
+            "-C",
+            "debug-assertions=on",
+            "-D",
+            "warnings",
+            "-o",
+        ])
+        .arg(&bin_path)
+        .arg(&src_path)
+        .output()
+        .expect("spawn rustc for executable spec harness");
+    assert!(
+        compile_out.status.success(),
+        "rustc -D warnings failed for `{label}`:\n{}\nsource:\n{source}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+
+    let run_out = Command::new(&bin_path)
+        .output()
+        .expect("execute compiled spec harness");
+    assert!(
+        run_out.status.success(),
+        "compiled spec harness `{label}` exited non-zero:\n{}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    String::from_utf8_lossy(&run_out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+#[test]
+fn external_spec_postcondition_oracle_probe_compiles_strict_and_matches_native_execution() {
+    use anneal_difftest::{
+        SpecContractOracleProbe, SpecExternalCallee, SpecParamBinding, SpecPostconditionVerdict,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let counter_pair_layout = LayoutSpec::Struct {
+        name: "CounterPair".to_string(),
+        total_size: 12,
+        fields: vec![
+            FieldLayout {
+                name: "tag".to_string(),
+                offset: 0,
+                layout: LayoutSpec::Scalar(ScalarLayout::u8()),
+            },
+            FieldLayout {
+                name: "active".to_string(),
+                offset: 4,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "untouched".to_string(),
+                offset: 8,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    let probe = SpecContractOracleProbe::new(
+        "advance_counter_with_bonus",
+        vec![
+            SpecParamBinding::mut_ref("pair", "CounterPair", counter_pair_layout)
+                .with_frame_preserved_fields(["tag", "untouched"]),
+            SpecParamBinding::by_value("step", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "let raw_bonus: u32 = ext_bonus(step);\n\
+         let capped_bonus: u32 = raw_bonus & 7u32;\n\
+         pair.active = pair.active + step + capped_bonus;\n\
+         pair.active",
+    )
+    .with_type_defs(
+        "#[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct CounterPair { pub tag: u8, pub active: u32, pub untouched: u32 }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_bonus",
+        ["u32"],
+        "u32",
+        u32_layout.clone(),
+    ))
+    .with_requires(
+        "bounded_inputs",
+        "step <= 16u32 && pair.active <= u32::MAX - 23u32",
+    )
+    .with_ensures("monotonic", "pair.active >= old(pair.active) + step")
+    .with_ensures(
+        "bounded_growth",
+        "result <= old(pair.active) + step + 7u32 && result == pair.active",
+    );
+
+    // 1. Standalone library module compiles cleanly under `rustc -D warnings` with zero `unsafe`.
+    let lib_src = probe
+        .synthesize_rust_probe()
+        .expect("synthesize standalone probe");
+    assert!(
+        !contains_unsafe_token(&lib_src),
+        "synthesized spec probe must not emit `unsafe`"
+    );
+    compile_module_with_rustc("ep2_sound_spec_lib", &["-D", "warnings"], &lib_src)
+        .expect("standalone spec probe compiles with -D warnings");
+
+    // 2. Non-vacuous certification across 48 dictionary-biased trials (0 panics).
+    let mut dict = MirInputDictionary::new();
+    dict.add_switch_int_literal(0, 32);
+    dict.add_switch_int_literal(8, 32);
+    dict.add_switch_int_literal(16, 32);
+    dict.add_switch_int_literal(u32::MAX as u128, 32);
+    let builder = LayoutAwareByteBuilder::new(&dict)
+        .with_dictionary_bias_pct(65)
+        .with_padding_pattern(PaddingFillPattern::AlternatingA55A);
+    let combined_layout = probe.combined_input_layout();
+    let sched_gen_clean = EnvScheduleGenerator::new(&dict)
+        .with_horizon_steps(2)
+        .with_panic_injection_pct(0)
+        .with_callee_return_layout("ext_bonus", u32_layout.clone());
+
+    let mut clean_trials: Vec<(Vec<u8>, Option<EnvSchedule>)> = Vec::with_capacity(48);
+    // Seed explicit valid + boundary-filtered trials first so both outcomes are guaranteed,
+    // followed by deterministic `Unstructured` fuzz trials with non-zero padding bytes.
+    let mut valid_seed = vec![0x55u8; 16];
+    valid_seed[0] = 3u8;
+    valid_seed[4..8].copy_from_slice(&100u32.to_le_bytes());
+    valid_seed[8..12].copy_from_slice(&999u32.to_le_bytes());
+    valid_seed[12..16].copy_from_slice(&12u32.to_le_bytes());
+    let mut u0 = Unstructured::new(&[0x21; 64]);
+    clean_trials.push((
+        valid_seed.clone(),
+        Some(sched_gen_clean.generate_schedule(&["ext_bonus"], &mut u0)),
+    ));
+
+    let mut filtered_seed = valid_seed.clone();
+    filtered_seed[12..16].copy_from_slice(&50u32.to_le_bytes());
+    let mut u1 = Unstructured::new(&[0x22; 64]);
+    clean_trials.push((
+        filtered_seed,
+        Some(sched_gen_clean.generate_schedule(&["ext_bonus"], &mut u1)),
+    ));
+
+    for seed in 0..46u8 {
+        let entropy: Vec<u8> = (0..96u8)
+            .map(|i| seed.wrapping_mul(37).wrapping_add(i.wrapping_mul(13)))
+            .collect();
+        let mut u = Unstructured::new(&entropy);
+        let arg_bytes = builder.build_bytes(&combined_layout, &mut u);
+        let sched = sched_gen_clean.generate_schedule(&["ext_bonus"], &mut u);
+        clean_trials.push((arg_bytes, Some(sched)));
+    }
+
+    let clean_report = probe
+        .verify_spec_postcondition_batch(&clean_trials)
+        .expect("verify clean batch");
+    assert!(
+        clean_report.is_sound_and_non_vacuous(),
+        "sound spec must pass non-vacuous certification: {clean_report:?}"
+    );
+    assert!(clean_report.vacuously_filtered_count >= 1);
+    assert!(clean_report.verified_hold_count >= 1);
+
+    // Append 4 scheduled-panic trials to verify exact 1-for-1 `HOLD`/`FILTERED`/`TRAP` parity
+    // between `verify_spec_postcondition_against_schedule` and native `rustc -D warnings`.
+    let mut parity_trials = clean_trials;
+    let panic_gen = EnvScheduleGenerator::new(&dict)
+        .with_horizon_steps(1)
+        .with_callee_return_layout("ext_bonus", u32_layout);
+    for seed in 0..4u8 {
+        let buf = [seed.wrapping_add(0x70); 64];
+        let mut u = Unstructured::new(&buf);
+        let mut arg = valid_seed.clone();
+        arg[12..16].copy_from_slice(&(seed as u32).to_le_bytes());
+        let mut p_sched = EnvSchedule::new();
+        panic_gen.apply_strategy(
+            &mut p_sched,
+            "ext_bonus",
+            &EnvStrategy::PanicOnCall(0),
+            &mut u,
+        );
+        parity_trials.push((arg, Some(p_sched)));
+    }
+
+    let parity_report = probe
+        .verify_spec_postcondition_batch(&parity_trials)
+        .expect("verify parity batch");
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&parity_trials)
+        .expect("synthesize executable harness");
+    let native_lines = compile_and_run_spec_harness("ep2_sound_parity", &exe_src);
+    assert_eq!(native_lines.len(), parity_report.verdicts.len());
+    for (idx, (verdict, line)) in parity_report
+        .verdicts
+        .iter()
+        .zip(native_lines.iter())
+        .enumerate()
+    {
+        let expected_line = match verdict {
+            SpecPostconditionVerdict::VerifiedHold => format!("TRIAL:{idx}:HOLD"),
+            SpecPostconditionVerdict::VacuouslyFiltered { .. } => format!("TRIAL:{idx}:FILTERED"),
+            SpecPostconditionVerdict::PanicOrTrap { .. } => format!("TRIAL:{idx}:TRAP"),
+            other => panic!("unexpected verdict at trial {idx}: {other:?}"),
+        };
+        assert_eq!(line, &expected_line, "trial {idx} native vs oracle mismatch");
+    }
+}
+
+#[test]
+fn external_spec_oracle_kills_all_three_verus_unsound_spec_mutants() {
+    use anneal_difftest::{
+        SpecContractOracleProbe, SpecExecPhase, SpecParamBinding, SpecPostconditionVerdict,
+        SpecViolationKind,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let mut dict = MirInputDictionary::new();
+    dict.add_switch_int_literal(0, 32);
+    dict.add_switch_int_literal(1, 32);
+    dict.add_shift_const(32, 32);
+    dict.add_switch_int_literal(64, 32);
+    let builder = LayoutAwareByteBuilder::new(&dict)
+        .with_dictionary_bias_pct(85)
+        .with_padding_pattern(PaddingFillPattern::Fixed(0xFF));
+
+    let mut mutants_killed = 0usize;
+    let mut sound_controls_passed = 0usize;
+
+    // -------------------------------------------------------------------------
+    // Mutant 1 (Verus #2674-style off-by-one postcondition):
+    // `last_index(len)` returns `len - 1` for `len >= 1`, but the unsound spec
+    // asserts `ensures(result == len)` instead of `ensures(result == len - 1u32)`.
+    // -------------------------------------------------------------------------
+    let mutant1 = SpecContractOracleProbe::new(
+        "last_index_off_by_one_mutant",
+        vec![SpecParamBinding::by_value("len", "u32", u32_layout.clone())],
+        "u32",
+        u32_layout.clone(),
+        "len - 1u32",
+    )
+    .with_requires("non_empty", "len >= 1u32")
+    .with_ensures("wrong_upper_bound", "result == len");
+
+    let control1 = SpecContractOracleProbe::new(
+        "last_index_sound_control",
+        vec![SpecParamBinding::by_value("len", "u32", u32_layout.clone())],
+        "u32",
+        u32_layout.clone(),
+        "len - 1u32",
+    )
+    .with_requires("non_empty", "len >= 1u32")
+    .with_ensures("exact_last_index", "result == len - 1u32");
+
+    let mut trials1: Vec<(Vec<u8>, Option<EnvSchedule>)> = vec![
+        (0u32.to_le_bytes().to_vec(), None),
+        (1u32.to_le_bytes().to_vec(), None),
+        (8u32.to_le_bytes().to_vec(), None),
+    ];
+    for s in 0..16u8 {
+        let buf = [s.wrapping_mul(29).wrapping_add(3); 32];
+        let mut u = Unstructured::new(&buf);
+        trials1.push((builder.build_bytes(&mutant1.combined_input_layout(), &mut u), None));
+    }
+    let rep_m1 = mutant1
+        .verify_spec_postcondition_batch(&trials1)
+        .expect("eval mutant 1");
+    assert!(rep_m1.is_mutant_killed());
+    assert!(rep_m1.verdicts.iter().any(|v| matches!(
+        v,
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause { label, .. },
+            ..
+        } if label == "wrong_upper_bound"
+    )));
+    let raw_trials1: Vec<Vec<u8>> = trials1.iter().map(|(b, _)| b.clone()).collect();
+    let lines_m1 = compile_and_run_spec_harness(
+        "ep2_mutant1_verus2674",
+        &mutant1
+            .synthesize_rust_executable_harness(&raw_trials1)
+            .expect("synth mutant 1"),
+    );
+    assert!(
+        lines_m1
+            .iter()
+            .any(|l| l.ends_with(":VIOLATION:wrong_upper_bound")),
+        "native compiled probe must kill Mutant 1: {lines_m1:?}"
+    );
+    mutants_killed += 1;
+    assert!(
+        control1
+            .verify_spec_postcondition_batch(&trials1)
+            .expect("eval control 1")
+            .is_sound_and_non_vacuous()
+    );
+    sound_controls_passed += 1;
+
+    // -------------------------------------------------------------------------
+    // Mutant 2 (Verus #2603-style omitted shift-width / overflow precondition):
+    // `shl_u32(val, shift)` omits `requires(shift < 32u32)` and shifts by an
+    // unbounded `shift: u32`, trapping on `shift >= 32` (`unchecked_shl` / debug `<<`).
+    // -------------------------------------------------------------------------
+    let mutant2 = SpecContractOracleProbe::new(
+        "shl_missing_shift_bound_mutant",
+        vec![
+            SpecParamBinding::by_value("val", "u32", u32_layout.clone()),
+            SpecParamBinding::by_value("shift", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "val << shift",
+    )
+    .with_requires("val_bounded_only", "val <= 1024u32")
+    .with_ensures("non_zero_when_one", "val != 1u32 || result >= 1u32");
+
+    let control2 = SpecContractOracleProbe::new(
+        "shl_sound_control",
+        vec![
+            SpecParamBinding::by_value("val", "u32", u32_layout.clone()),
+            SpecParamBinding::by_value("shift", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "val << shift",
+    )
+    .with_requires("val_and_shift_bounded", "val <= 1024u32 && shift < 20u32")
+    .with_ensures("non_zero_when_one", "val != 1u32 || result >= 1u32");
+
+    let mut trials2: Vec<(Vec<u8>, Option<EnvSchedule>)> = Vec::new();
+    for s in 0..32u8 {
+        let entropy: Vec<u8> = (0..64u8)
+            .map(|i| s.wrapping_mul(41).wrapping_add(i.wrapping_mul(7)))
+            .collect();
+        let mut u = Unstructured::new(&entropy);
+        trials2.push((builder.build_bytes(&mutant2.combined_input_layout(), &mut u), None));
+    }
+    // Ensure a concrete valid witness `(1, 4)` is also included for non-vacuity of `control2`.
+    let mut valid_shl = Vec::with_capacity(8);
+    valid_shl.extend_from_slice(&1u32.to_le_bytes());
+    valid_shl.extend_from_slice(&4u32.to_le_bytes());
+    trials2.push((valid_shl, None));
+
+    let rep_m2 = mutant2
+        .verify_spec_postcondition_batch(&trials2)
+        .expect("eval mutant 2");
+    assert!(rep_m2.is_mutant_killed());
+    assert!(rep_m2.verdicts.iter().any(|v| matches!(
+        v,
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    )));
+    let raw_trials2: Vec<Vec<u8>> = trials2.iter().map(|(b, _)| b.clone()).collect();
+    let lines_m2 = compile_and_run_spec_harness(
+        "ep2_mutant2_verus2603",
+        &mutant2
+            .synthesize_rust_executable_harness(&raw_trials2)
+            .expect("synth mutant 2"),
+    );
+    assert!(
+        lines_m2.iter().any(|l| l.ends_with(":TRAP")),
+        "native compiled probe must trap on Mutant 2 (`shift >= 32`): {lines_m2:?}"
+    );
+    mutants_killed += 1;
+    assert!(
+        control2
+            .verify_spec_postcondition_batch(&trials2)
+            .expect("eval control 2")
+            .is_sound_and_non_vacuous()
+    );
+    sound_controls_passed += 1;
+
+    // -------------------------------------------------------------------------
+    // Mutant 3 (Verus #2606-style `&mut` frame / `old(...)` mutation violation):
+    // `bump_active` promises `untouched` is framed (`post.untouched == old.untouched`)
+    // and `pair.active == old(pair.active) + delta`, but covertly mutates `pair.untouched`.
+    // -------------------------------------------------------------------------
+    let pair_layout = LayoutSpec::Struct {
+        name: "FramedAccount".to_string(),
+        total_size: 12,
+        fields: vec![
+            FieldLayout {
+                name: "flags".to_string(),
+                offset: 0,
+                layout: LayoutSpec::Scalar(ScalarLayout::u8()),
+            },
+            FieldLayout {
+                name: "active".to_string(),
+                offset: 4,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "untouched".to_string(),
+                offset: 8,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+    let account_typedef = "#[repr(C)]\n\
+                           #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+                           pub struct FramedAccount { pub flags: u8, pub active: u32, pub untouched: u32 }";
+
+    let mutant3 = SpecContractOracleProbe::new(
+        "bump_account_frame_mutant",
+        vec![
+            SpecParamBinding::mut_ref("acct", "FramedAccount", pair_layout.clone())
+                .with_frame_preserved_fields(["flags", "untouched"]),
+            SpecParamBinding::by_value("delta", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "acct.active = acct.active + delta;\n\
+         acct.untouched = acct.untouched.wrapping_add(1u32);\n\
+         acct.active",
+    )
+    .with_type_defs(account_typedef)
+    .with_requires(
+        "safe_bump",
+        "acct.active <= 100_000u32 && delta >= 1u32 && delta <= 1000u32",
+    )
+    .with_ensures("exact_bump", "acct.active == old(acct.active) + delta && result == acct.active");
+
+    let control3 = SpecContractOracleProbe::new(
+        "bump_account_sound_control",
+        vec![
+            SpecParamBinding::mut_ref("acct", "FramedAccount", pair_layout)
+                .with_frame_preserved_fields(["flags", "untouched"]),
+            SpecParamBinding::by_value("delta", "u32", u32_layout),
+        ],
+        "u32",
+        LayoutSpec::Scalar(ScalarLayout::u32()),
+        "acct.active = acct.active + delta;\n\
+         acct.active",
+    )
+    .with_type_defs(account_typedef)
+    .with_requires(
+        "safe_bump",
+        "acct.active <= 100_000u32 && delta >= 1u32 && delta <= 1000u32",
+    )
+    .with_ensures("exact_bump", "acct.active == old(acct.active) + delta && result == acct.active");
+
+    let mut valid_acct = vec![0xFFu8; 16];
+    valid_acct[0] = 7u8;
+    valid_acct[4..8].copy_from_slice(&250u32.to_le_bytes());
+    valid_acct[8..12].copy_from_slice(&42u32.to_le_bytes());
+    valid_acct[12..16].copy_from_slice(&15u32.to_le_bytes());
+    let mut trials3: Vec<(Vec<u8>, Option<EnvSchedule>)> = vec![(valid_acct, None)];
+    for s in 0..16u8 {
+        let buf = [s.wrapping_mul(19).wrapping_add(11); 48];
+        let mut u = Unstructured::new(&buf);
+        trials3.push((builder.build_bytes(&mutant3.combined_input_layout(), &mut u), None));
+    }
+
+    let rep_m3 = mutant3
+        .verify_spec_postcondition_batch(&trials3)
+        .expect("eval mutant 3");
+    assert!(rep_m3.is_mutant_killed());
+    assert!(rep_m3.verdicts.iter().any(|v| matches!(
+        v,
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "acct" && field == "untouched"
+    )));
+    let raw_trials3: Vec<Vec<u8>> = trials3.iter().map(|(b, _)| b.clone()).collect();
+    let lines_m3 = compile_and_run_spec_harness(
+        "ep2_mutant3_verus2606",
+        &mutant3
+            .synthesize_rust_executable_harness(&raw_trials3)
+            .expect("synth mutant 3"),
+    );
+    assert!(
+        lines_m3
+            .iter()
+            .any(|l| l.ends_with(":FRAME:acct.untouched")),
+        "native compiled probe must kill Mutant 3 frame violation: {lines_m3:?}"
+    );
+    mutants_killed += 1;
+    assert!(
+        control3
+            .verify_spec_postcondition_batch(&trials3)
+            .expect("eval control 3")
+            .is_sound_and_non_vacuous()
+    );
+    sound_controls_passed += 1;
+
+    assert_eq!(mutants_killed, 3, "all 3/3 Verus-style mutants must be killed");
+    assert_eq!(
+        sound_controls_passed, 3,
+        "all 3/3 sound control contracts must pass without false positives"
+    );
+}
+
+#[test]
+fn write_chain_coverage_bound_separates_depth_one_local_writes_from_scheduled_rmw_walks() {
+    use anneal_difftest::{
+        EnvScheduledWriteStep, UnderExplorationReason, WriteChainCoverageBound, WriteChainStep,
+    };
+
+    let mut dict = MirInputDictionary::new();
+    dict.add_switch_int_literal(1, 32);
+    dict.add_switch_int_literal(7, 32);
+    let builder = LayoutAwareByteBuilder::new(&dict);
+    let triple_u32 = LayoutSpec::Tuple {
+        total_size: 12,
+        elements: vec![
+            (0, LayoutSpec::Scalar(ScalarLayout::u32())),
+            (4, LayoutSpec::Scalar(ScalarLayout::u32())),
+            (8, LayoutSpec::Scalar(ScalarLayout::u32())),
+        ],
+    };
+    let mut u = Unstructured::new(&[0x5A; 128]);
+    let seed_bytes = builder.build_bytes(&triple_u32, &mut u);
+    assert_eq!(seed_bytes.len(), 12);
+
+    // 1. Repeated independent depth-1 writes (`x = c0; y = c1; z = c2; x = c3; y = c4; z = c5`)
+    //    do NOT sum to causal walk length `d = 3`.
+    let mut local_only = WriteChainCoverageBound::new(3, 3);
+    assert_eq!(local_only.min_walk_length(), 3);
+    assert!(local_only.random_walk_step_bound() >= 9);
+    for round in 0..2 {
+        for slot in ["x", "y", "z"] {
+            let _ = (round, &seed_bytes);
+            local_only.observe_step(&WriteChainStep::local_write(slot));
+        }
+    }
+    assert_eq!(local_only.max_observed_depth(), 1);
+    assert!(!local_only.is_depth_certified());
+    assert_eq!(
+        local_only.under_exploration_reason(),
+        Some(UnderExplorationReason::OnlyDepthOneLocalWrites {
+            steps_observed: 6,
+            distinct_slots_written: 3,
+            required_depth: 3,
+        })
+    );
+
+    // 2. Depth-2 chain followed by constant overwrite on `y` resets `y` to depth 1,
+    //    preventing `z := f(y)` from falsely reaching depth 3.
+    let mut overwrite_guard = WriteChainCoverageBound::new(3, 3);
+    overwrite_guard.observe_write_chain(&[
+        WriteChainStep::local_write("x"),
+        WriteChainStep::dependent_write("y", ["x"]),
+        WriteChainStep::local_write("y"),
+        WriteChainStep::dependent_write("z", ["y"]),
+    ]);
+    assert_eq!(overwrite_guard.current_slot_depth("y"), 1);
+    assert_eq!(overwrite_guard.current_slot_depth("z"), 2);
+    assert_eq!(overwrite_guard.max_observed_depth(), 2);
+    assert!(!overwrite_guard.is_depth_certified());
+    assert!(matches!(
+        overwrite_guard.under_exploration_reason(),
+        Some(UnderExplorationReason::InsufficientChainDepth {
+            max_observed_depth: 2,
+            required_depth: 3,
+            steps_observed: 4,
+            ..
+        })
+    ));
+
+    // 3. `EnvSchedule`-driven transitive RMW walk across 3 boundary steps:
+    //    - Gapped/panicking schedule (`PanicAtCall(1)`) fails certification with `BrokenEnvScheduleLink`.
+    //    - Complete non-panicking schedule (`ReturnBytes` of 4-byte `u32`) certifies `min_walk_length = 3`.
+    let planned_walk = vec![
+        EnvScheduledWriteStep::new("ext_rmw_hop", "x", std::iter::empty::<&str>()),
+        EnvScheduledWriteStep::new("ext_rmw_hop", "y", ["x"]),
+        EnvScheduledWriteStep::new("ext_rmw_hop", "z", ["y"]),
+    ];
+
+    let panic_sched_gen = EnvScheduleGenerator::new(&dict)
+        .with_horizon_steps(3)
+        .with_callee_return_layout("ext_rmw_hop", LayoutSpec::Scalar(ScalarLayout::u32()));
+    let mut broken_sched = EnvSchedule::new();
+    panic_sched_gen.apply_strategy(
+        &mut broken_sched,
+        "ext_rmw_hop",
+        &EnvStrategy::Constant(1u32.to_le_bytes().to_vec()),
+        &mut u,
+    );
+    broken_sched.set_callee_panic_on_call("ext_rmw_hop", 1);
+    let mut broken_walk = WriteChainCoverageBound::new(3, 3);
+    broken_walk.observe_env_schedule(&broken_sched, &planned_walk);
+    assert!(!broken_walk.is_depth_certified());
+    assert!(matches!(
+        broken_walk.under_exploration_reason(),
+        Some(UnderExplorationReason::BrokenEnvScheduleLink {
+            required_depth: 3,
+            broken_links: 1,
+            ..
+        })
+    ));
+
+    let valid_sched_gen = EnvScheduleGenerator::new(&dict)
+        .with_horizon_steps(3)
+        .with_panic_injection_pct(0)
+        .with_callee_return_layout("ext_rmw_hop", LayoutSpec::Scalar(ScalarLayout::u32()));
+    let complete_sched = valid_sched_gen.generate_schedule(&["ext_rmw_hop"], &mut u);
+    let mut certified_walk = WriteChainCoverageBound::new(3, 3);
+    let max_d = certified_walk.observe_env_schedule(&complete_sched, &planned_walk);
+    assert_eq!(max_d, 3);
+    assert!(certified_walk.is_depth_certified());
+    assert_eq!(certified_walk.under_exploration_reason(), None);
+}
