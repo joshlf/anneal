@@ -314,10 +314,13 @@ theorem evalRvalue_cast_float_unsupported_of_no_format_inst :
       (dstTy := floatF128Ty) (mem := emptyMemory) (localDecls := floatLocalDecls)
       (layouts := castStage1Layouts) rfl rfl).2 rfl).2⟩⟩
 
-/-- Concrete `evalRvalue` float casts on `castStage1Layouts`: `π as i8 = 3`, `π as f32`
-(round to nearest), `-0.0f32 as u8 = 0`, `-0.0f32 as f64 = -0.0`, `-123i64 as f64`,
-`(2^53 + 3) as f64 = 2^53 + 4` (tie to even), `-1e39f64 as i8 = i8::MIN` and `as f32 = -∞`
-(saturation / overflow), and `-1isize as f32 = -1.0` (64-bit `isize`). -/
+/-- Concrete `evalRvalue` float casts on `castStage1Layouts` (both `.copy` local and `.constant`
+operands, mirroring `LeanMiriSpec.WitFloatCastLM.wfcCast_two_sided_table`): `π as i8 = 3`,
+`π as f32` (round to nearest), `-0.0f32 as u8 = 0`, `-0.0f32 as f64 = -0.0`, `-123i64 as f64`,
+`(2^53 + 3) as f64 = 2^53 + 4` (tie to even), `-1e39f64 as i8 = i8::MIN` and `as f32 = -∞`,
+`-1isize as f32 = -1.0`, subnormal tie `1.5·2⁻¹⁴⁹_f64 as f32 = 0x2`, signaling
+`0x7F80_0001_f32 as f64 = 0x7FF8_0000_2000_0000`, `NaN_f64 as u128 = 0`, `-2.9_f64 as i64 = -2`,
+`u128::MAX as f32 = +∞`, `i128::MIN as f32 = -2¹²⁷`, and `f16` / `f128` fail-closed `unsupported`. -/
 theorem step_float_casts_concrete :
     evalRvalue floatLocals (.cast .floatToInt (.copy ⟨0, []⟩) floatI8Ty) emptyMemory
         floatLocalDecls castStage1Layouts = ok (.scalar ⟨3, 1⟩) floatLocals emptyMemory ∧
@@ -340,9 +343,46 @@ theorem step_float_casts_concrete :
         floatLocalDecls castStage1Layouts = ok (.scalar ⟨0xFF800000, 4⟩) floatLocals emptyMemory ∧
     evalRvalue floatLocals (.cast .intToFloat (.copy ⟨5, []⟩) floatF32Ty) emptyMemory
         floatLocalDecls castStage1Layouts = ok (.scalar ⟨0xBF800000, 4⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals
+        (.cast .floatToFloat
+          (.constant { ty := floatF64Ty, val := .scalar (.int ⟨0x36A8000000000000, 8⟩) })
+          floatF32Ty) emptyMemory floatLocalDecls castStage1Layouts =
+      ok (.scalar ⟨0x2, 4⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals
+        (.cast .floatToFloat
+          (.constant { ty := floatF32Ty, val := .scalar (.int ⟨0x7F800001, 4⟩) })
+          floatF64Ty) emptyMemory floatLocalDecls castStage1Layouts =
+      ok (.scalar ⟨0x7FF8000020000000, 8⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals
+        (.cast .floatToInt
+          (.constant { ty := floatF64Ty, val := .scalar (.int ⟨0x7FF8000000000000, 8⟩) })
+          { kind := .uint .u128, layoutIdx := 0 }) emptyMemory floatLocalDecls castStage1Layouts =
+      ok (.scalar ⟨0, 16⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals
+        (.cast .floatToInt
+          (.constant { ty := floatF64Ty, val := .scalar (.int ⟨0xC007333333333333, 8⟩) })
+          { kind := .int .i64, layoutIdx := 0 }) emptyMemory floatLocalDecls castStage1Layouts =
+      ok (.scalar ⟨0xFFFFFFFFFFFFFFFE, 8⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals
+        (.cast .intToFloat
+          (.constant { ty := { kind := .uint .u128, layoutIdx := 0 },
+                       val := .scalar (.int ⟨2 ^ 128 - 1, 16⟩) })
+          floatF32Ty) emptyMemory floatLocalDecls castStage1Layouts =
+      ok (.scalar ⟨0x7F800000, 4⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals
+        (.cast .intToFloat
+          (.constant { ty := { kind := .int .i128, layoutIdx := 0 },
+                       val := .scalar (.int ⟨2 ^ 127, 16⟩) })
+          floatF32Ty) emptyMemory floatLocalDecls castStage1Layouts =
+      ok (.scalar ⟨0xFF000000, 4⟩) floatLocals emptyMemory ∧
+    evalRvalue floatLocals
+        (.cast .floatToFloat
+          (.constant { ty := { kind := .float .f16, layoutIdx := 0 },
+                       val := .scalar (.int ⟨0x3C00, 2⟩) })
+          floatF32Ty) emptyMemory floatLocalDecls castStage1Layouts = unsupported ∧
     evalRvalue floatLocals (.cast .floatToFloat (.copy ⟨0, []⟩) floatF128Ty) emptyMemory
         floatLocalDecls castStage1Layouts = unsupported :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- `evalFloatCast` at `castStage1Layouts` on a single scalar operand of byte width `sz`. -/
 def fcast (ck : CastKind) (src dst : RigidTy) (bits sz : Nat) : Option Value :=

@@ -77,12 +77,15 @@ bit-for-bit after every step. No shadow evaluator is defined.
   formats), `wfcW4_signed_negative_ties` (signed negative `i32` / `i64` halfway ties and
   `i64::MIN + 1`), and `wfcW4_ties_all_wide_sources` (the `2²⁴ ± …` / `2⁵³ ± …` tie behaviour is
   the same for **every** source type wide enough to hold it).
-* **`Cast.cast` level**: `wfc_cast_two_sided` / `wfcCast_two_sided_table` pin
-  `Miri.Interpreter.Cast.cast` (refinement hooks) to the `ScalarRel`-image of Anneal's
-  `evalFloatCast` for **every** related source scalar, on `.FloatToFloat`, `.FloatToInt`, and
-  `.IntToFloat` instances (subnormal tie, `-0.0`, sNaN quieting, saturation, NaN `↦ 0`, truncation,
-  `u128::MAX ↦ +∞`, ties to even, `i128::MIN`). `wfcLockstep_eq_mode` / `wfcReturns_eq_mode` /
-  `wfcRun_iff_mode` show the refinement-witness predicates are instances of the mode-generic ones.
+* **`Cast.cast` level**: `wfc_cast_two_sided_mode`, `wfc_cast_two_sided`, and
+  `wfcCast_two_sided_table` pin `Miri.Interpreter.Cast.cast` over **any** 64-bit `LayoutTable` to
+  the `ScalarRel`-image of Anneal's `evalFloatCast` for **every** related source scalar across
+  `.FloatToFloat`, `.FloatToInt`, and `.IntToFloat`; `wfcCast_deterministic_and_f16_f128_boundary`
+  adds deterministic-mode (`floatNondeterministic := false`) NaN canonicalization vs. exact
+  agreement (`cast_floatToFloat_deterministic_eq`) **and** mode-generic `f16` / `f128` fail-closed
+  `.unsupported` (`cast_f16_f128_unsupported` + `evalFloatCast_f16_f128_none`).
+  `wfcLockstep_eq_mode` / `wfcReturns_eq_mode` / `wfcRun_iff_mode` show the refinement-witness
+  predicates are instances of the mode-generic ones.
 * **(W5)** `wfcW5_uninit_source_ub`, `wfcW5_moved_from_ub`, `wfcW5_dead_source_ub` (from program
   entry, through `StorageLive` / `StorageDead`) fault with `.ub` in both machines
   (`StepRelLM3_1.ub`); `wfcW5_f16_f128_fail_closed` + `wfcW5_f16_f128_uninit_source_vs_target`
@@ -1273,10 +1276,14 @@ theorem wfcVSB16 : ValidScalarBytes 16 := Or.inr (Or.inr (Or.inr (Or.inr rfl)))
 
 /-! ### Shared types, constants, and body builder -/
 
+/-- `f16`. -/
+def wfcF16Ty : Ty := { kind := .float .f16, layoutIdx := 0 }
 /-- `f32`. -/
 def wfcF32Ty : Ty := { kind := .float .f32, layoutIdx := 0 }
 /-- `f64`. -/
 def wfcF64Ty : Ty := { kind := .float .f64, layoutIdx := 0 }
+/-- `f128`. -/
+def wfcF128Ty : Ty := { kind := .float .f128, layoutIdx := 0 }
 /-- Signed integer type. -/
 def wfcIntTy (it : IntTy) : Ty := { kind := .int it, layoutIdx := 0 }
 /-- Unsigned integer type. -/
@@ -3218,49 +3225,101 @@ theorem wfcW4_ties_all_wide_sources (s : FloatIntTarget) :
         wfc_fromInteger _ _ _ _ (by decide +kernel),
         wfc_fromInteger _ _ _ _ (by decide +kernel)⟩
 
-/-! ## Two-sided `Miri.Interpreter.Cast.cast` witnesses for all three cast kinds -/
+/-! ## Two-sided `Miri.Interpreter.Cast.cast` witnesses across layouts, NaN modes, and `f16`/`f128` -/
 
-/-- **Two-sided `Cast.cast` instance**: if Anneal's `evalFloatCast` maps the source scalar `sc` to
-`⟨V, w⟩`, then for **every** `ScalarRel`-related `lean-miri` source scalar, `lean-miri`'s
-`Cast.cast` under `annealCastHooksFloat emptyLayoutTable` writes exactly a `ScalarRel`-image of
-`⟨V, w⟩` into the destination (`floatCast_result_spec`). -/
-theorem wfc_cast_two_sided {kind : CastKind} {srcTy dstTy : Ty} (hsig : FloatCastSig kind srcTy dstTy)
+/-- `evalFloatCast` depends on `layouts` only through `floatPtrWidthOfLayouts layouts`. -/
+theorem wfc_evalFloatCast_layouts_eq {layouts : LayoutTable}
+    (hpw : floatPtrWidthOfLayouts layouts = .bits64)
+    {kind : CastKind} {srcTy dstTy : Ty} (sc : MirAst.ScalarInt) :
+    evalFloatCast kind (some srcTy) dstTy layouts (.scalar sc) =
+      evalFloatCast kind (some srcTy) dstTy emptyLayoutTable (.scalar sc) := by
+  simp only [evalFloatCast, hpw, show floatPtrWidthOfLayouts emptyLayoutTable = .bits64 from rfl]
+
+/-- `translateTy` on any modeled float- or integer-scalar type is independent of `layouts`. -/
+theorem wfc_translateTy_floatCast_eq {ty : Ty} (h : IsFloatCastScalarTy ty)
+    (layouts : LayoutTable) :
+    translateTy ty layouts = translateTy ty emptyLayoutTable := by
+  rcases h with ⟨f, hf⟩ | ⟨t, ht⟩
+  · rw [translateTy_of_ieeeFormatOfTy? hf layouts,
+        translateTy_of_ieeeFormatOfTy? hf emptyLayoutTable]
+  · rw [translateTy_of_floatIntTargetOfTy? ht layouts,
+        translateTy_of_floatIntTargetOfTy? ht emptyLayoutTable]
+
+/-- **Mode-generic, layout-parametric two-sided `Cast.cast` instance**: over **any** 64-bit
+`LayoutTable` and either NaN mode (`FloatNaNModeOk nondet chooseNaN`), if Anneal's `evalFloatCast`
+maps `sc` to `⟨V, w⟩` (with `FloatCastDetAgrees` when `nondet = false`), then for **every**
+`ScalarRel`-related `lean-miri` source scalar, `Miri.Interpreter.Cast.cast` writes a
+`ScalarRel`-image of `⟨V, w⟩` (`floatCast_result_spec_mode`). -/
+theorem wfc_cast_two_sided_mode (layouts : LayoutTable)
+    (hpw : floatPtrWidthOfLayouts layouts = .bits64 := by rfl)
+    (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (hmode : FloatNaNModeOk nondet chooseNaN)
+    {kind : CastKind} {srcTy dstTy : Ty} (hsig : FloatCastSig kind srcTy dstTy)
+    {sc : MirAst.ScalarInt} {V w : Nat}
+    (hsz : (translateTy srcTy emptyLayoutTable).layout.size = translateSizeBytes sc.sizeBytes)
+    (hagree : nondet = false → FloatCastDetAgrees kind srcTy dstTy sc.bits)
+    (hev : evalFloatCast kind (some srcTy) dstTy emptyLayoutTable (.scalar sc) =
+      some (.scalar ⟨V, w⟩))
+    (destRef : Miri.Interpreter.RuntimePlaceRef AnnealProv) :
+    evalFloatCast kind (some srcTy) dstTy layouts (.scalar sc) = some (.scalar ⟨V, w⟩) ∧
+    ∀ msc, ScalarRel sc msc → ∃ msc', ScalarRel ⟨V, w⟩ msc' ∧
+      Miri.Interpreter.Cast.cast (annealCastHooksFloat layouts nondet chooseNaN) () 16
+          ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy layouts⟩
+          (translateCastKind kind) (encodeTyId dstTy) ⟨destRef, translateTy dstTy layouts⟩ =
+        annealWriteImmediate (.scalar (.fromScalarInt msc'))
+          ⟨destRef, translateTy dstTy layouts⟩ := by
+  have hevL : evalFloatCast kind (some srcTy) dstTy layouts (.scalar sc) =
+      some (.scalar ⟨V, w⟩) :=
+    (wfc_evalFloatCast_layouts_eq hpw sc).trans hev
+  have hszL : (translateTy srcTy layouts).layout.size = translateSizeBytes sc.sizeBytes := by
+    rw [wfc_translateTy_floatCast_eq hsig.src_scalar layouts]; exact hsz
+  refine ⟨hevL, fun msc hrel => ?_⟩
+  obtain ⟨sc', msc', hev', hrel', _, hcast⟩ :=
+    floatCast_result_spec_mode layouts hpw nondet chooseNaN hmode hsig hrel hszL hagree destRef
+  rw [hevL] at hev'
+  cases hev'
+  exact ⟨msc', hrel', hcast⟩
+
+/-- **Layout-parametric two-sided `Cast.cast` instance** under the refinement-witness hooks
+(`nondet = true`, `chooseNaN = annealChooseQuietedNaN`). -/
+theorem wfc_cast_two_sided (layouts : LayoutTable := emptyLayoutTable)
+    (hpw : floatPtrWidthOfLayouts layouts = .bits64 := by rfl)
+    {kind : CastKind} {srcTy dstTy : Ty} (hsig : FloatCastSig kind srcTy dstTy)
     {sc : MirAst.ScalarInt} {V w : Nat}
     (hsz : (translateTy srcTy emptyLayoutTable).layout.size = translateSizeBytes sc.sizeBytes)
     (hev : evalFloatCast kind (some srcTy) dstTy emptyLayoutTable (.scalar sc) =
       some (.scalar ⟨V, w⟩))
     (destRef : Miri.Interpreter.RuntimePlaceRef AnnealProv) :
-    evalFloatCast kind (some srcTy) dstTy emptyLayoutTable (.scalar sc) = some (.scalar ⟨V, w⟩) ∧
+    evalFloatCast kind (some srcTy) dstTy layouts (.scalar sc) = some (.scalar ⟨V, w⟩) ∧
     ∀ msc, ScalarRel sc msc → ∃ msc', ScalarRel ⟨V, w⟩ msc' ∧
-      Miri.Interpreter.Cast.cast (annealCastHooksFloat emptyLayoutTable) () 16
-          ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy emptyLayoutTable⟩
-          (translateCastKind kind) (encodeTyId dstTy) ⟨destRef, translateTy dstTy emptyLayoutTable⟩ =
+      Miri.Interpreter.Cast.cast (annealCastHooksFloat layouts) () 16
+          ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy layouts⟩
+          (translateCastKind kind) (encodeTyId dstTy) ⟨destRef, translateTy dstTy layouts⟩ =
         annealWriteImmediate (.scalar (.fromScalarInt msc'))
-          ⟨destRef, translateTy dstTy emptyLayoutTable⟩ := by
-  refine ⟨hev, fun msc hrel => ?_⟩
-  obtain ⟨sc', msc', hev', hrel', _, hcast⟩ :=
-    floatCast_result_spec emptyLayoutTable rfl hsig hrel hsz destRef
-  rw [hev] at hev'
-  injection hev' with h₁
-  injection h₁ with h₂
-  subst h₂
-  exact ⟨msc', hrel', hcast⟩
+          ⟨destRef, translateTy dstTy layouts⟩ :=
+  wfc_cast_two_sided_mode layouts hpw true annealChooseQuietedNaN (Or.inl ⟨rfl, rfl⟩) hsig hsz
+    (fun h => nomatch h) hev destRef
 
 /-- **Two-sided `Miri.Interpreter.Cast.cast` table for `.FloatToFloat`, `.FloatToInt`, and
-`.IntToFloat`** (refinement-witness hooks): for every `ScalarRel`-related source, `lean-miri`'s
-`Cast.cast` writes the image of Anneal's `evalFloatCast` result: the subnormal tie
-`1.5·2⁻¹⁴⁹_f64 ↦ 0x0000_0002_f32`, `-0.0_f64 ↦ -0.0_f32`, the signaling `0x7F80_0001_f32 ↦
-0x7FF8_0000_2000_0000_f64`, `+∞_f32 ↦ i8::MAX`, `NaN_f64 ↦ 0_u128`, `-2.9_f64 ↦ -2_i64`,
-`u128::MAX ↦ +∞_f32`, `(2⁵³ + 1)_u64 ↦ 2⁵³_f64` (tie to even), and `i128::MIN ↦ -2¹²⁷_f32`. -/
-theorem wfcCast_two_sided_table (destRef : Miri.Interpreter.RuntimePlaceRef AnnealProv) :
+`.IntToFloat` over ANY 64-bit `LayoutTable`** (including both `emptyLayoutTable` and
+`wfcStage1Layouts`): for every `ScalarRel`-related source, `lean-miri`'s `Cast.cast` writes the
+image of Anneal's `evalFloatCast` result: the subnormal tie `1.5·2⁻¹⁴⁹_f64 ↦ 0x0000_0002_f32`,
+`-0.0_f64 ↦ -0.0_f32`, the signaling `0x7F80_0001_f32 ↦ 0x7FF8_0000_2000_0000_f64`,
+`+∞_f32 ↦ i8::MAX`, `NaN_f64 ↦ 0_u128`, `-2.9_f64 ↦ -2_i64`, `u128::MAX ↦ +∞_f32`,
+`(2⁵³ + 1)_u64 ↦ 2⁵³_f64` (tie to even), and `i128::MIN ↦ -2¹²⁷_f32`. -/
+theorem wfcCast_two_sided_table (layouts : LayoutTable)
+    (hpw : floatPtrWidthOfLayouts layouts = .bits64)
+    (destRef : Miri.Interpreter.RuntimePlaceRef AnnealProv) :
     let castOK (kind : CastKind) (srcTy dstTy : Ty) (sc : MirAst.ScalarInt) (V w : Nat) :=
-      evalFloatCast kind (some srcTy) dstTy emptyLayoutTable (.scalar sc) = some (.scalar ⟨V, w⟩) ∧
+      evalFloatCast kind (some srcTy) dstTy layouts (.scalar sc) = some (.scalar ⟨V, w⟩) ∧
       ∀ msc, ScalarRel sc msc → ∃ msc', ScalarRel ⟨V, w⟩ msc' ∧
-        Miri.Interpreter.Cast.cast (annealCastHooksFloat emptyLayoutTable) () 16
-            ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy emptyLayoutTable⟩
-            (translateCastKind kind) (encodeTyId dstTy) ⟨destRef, translateTy dstTy emptyLayoutTable⟩ =
+        Miri.Interpreter.Cast.cast (annealCastHooksFloat layouts) () 16
+            ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy layouts⟩
+            (translateCastKind kind) (encodeTyId dstTy) ⟨destRef, translateTy dstTy layouts⟩ =
           annealWriteImmediate (.scalar (.fromScalarInt msc'))
-            ⟨destRef, translateTy dstTy emptyLayoutTable⟩
+            ⟨destRef, translateTy dstTy layouts⟩
     castOK .floatToFloat wfcF64Ty wfcF32Ty ⟨0x36A8000000000000, 8⟩ 0x2 4 ∧
     castOK .floatToFloat wfcF64Ty wfcF32Ty ⟨0x8000000000000000, 8⟩ 0x80000000 4 ∧
     castOK .floatToFloat wfcF32Ty wfcF64Ty ⟨0x7F800001, 4⟩ 0x7FF8000020000000 8 ∧
@@ -3271,15 +3330,101 @@ theorem wfcCast_two_sided_table (destRef : Miri.Interpreter.RuntimePlaceRef Anne
     castOK .intToFloat (wfcUintTy .u64) wfcF64Ty ⟨2 ^ 53 + 1, 8⟩ 0x4340000000000000 8 ∧
     castOK .intToFloat (wfcIntTy .i128) wfcF32Ty ⟨2 ^ 127, 16⟩ 0xFF000000 4 := by
   intro castOK
-  exact ⟨wfc_cast_two_sided (.floatToFloat rfl rfl) rfl rfl destRef,
-    wfc_cast_two_sided (.floatToFloat rfl rfl) rfl rfl destRef,
-    wfc_cast_two_sided (.floatToFloat rfl rfl) rfl rfl destRef,
-    wfc_cast_two_sided (.floatToInt rfl rfl) rfl rfl destRef,
-    wfc_cast_two_sided (.floatToInt rfl rfl) rfl rfl destRef,
-    wfc_cast_two_sided (.floatToInt rfl rfl) rfl rfl destRef,
-    wfc_cast_two_sided (.intToFloat rfl rfl) rfl rfl destRef,
-    wfc_cast_two_sided (.intToFloat rfl rfl) rfl rfl destRef,
-    wfc_cast_two_sided (.intToFloat rfl rfl) rfl rfl destRef⟩
+  exact ⟨wfc_cast_two_sided layouts hpw (.floatToFloat rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided layouts hpw (.floatToFloat rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided layouts hpw (.floatToFloat rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided layouts hpw (.floatToInt rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided layouts hpw (.floatToInt rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided layouts hpw (.floatToInt rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided layouts hpw (.intToFloat rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided layouts hpw (.intToFloat rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided layouts hpw (.intToFloat rfl rfl) rfl rfl destRef⟩
+
+/-- **Deterministic-mode `Cast.cast` NaN canonicalization vs. exact agreement & mode-generic
+`f16`/`f128` fail-closed `Cast.cast` boundary** over **any** 64-bit `LayoutTable`:
+1. Under `floatNondeterministic := false` (`annealCastHooksFloat layouts false chooseNaN`), payload
+   sNaNs `0x7F80_0001_f32 -> f64` and `0x7FF0_0000_2000_0001_f64 -> f32` write canonical
+   `preferredNaNBits` (`0x7FF8_0000_0000_0000` and `0x7FC0_0000`) whereas Anneal's `evalFloatCast`
+   preserves payload (`0x7FF8_0000_2000_0000` and `0x7FC0_0001`), while truncating sNaN
+   `0x7FF0_0000_0000_0001_f64 -> f32` (`0x7FC0_0000`), finite `1.5·2⁻¹⁴⁹_f64 -> f32`,
+   `+∞_f32 -> i8`, and `u128::MAX -> f32` agree bit-for-bit (`wfc_cast_two_sided_mode`).
+2. Under **any** `nondet : Bool` and `chooseNaN`, `f16` and `f128` sources and targets return `none`
+   in `evalFloatCast` (`evalFloatCast_f16_f128_none`) **and** `.error (.unsupported msg)` in
+   `Miri.Interpreter.Cast.cast` (`cast_f16_f128_unsupported`). -/
+theorem wfcCast_deterministic_and_f16_f128_boundary (layouts : LayoutTable)
+    (hpw : floatPtrWidthOfLayouts layouts = .bits64) (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (srcOp : Miri.Interpreter.Operand AnnealProv)
+    (destRef : Miri.Interpreter.RuntimePlaceRef AnnealProv) (st : AnnealStepState) :
+    let castDetEq (kind : CastKind) (srcTy dstTy : Ty) (sc : MirAst.ScalarInt) (V w : Nat) :=
+      evalFloatCast kind (some srcTy) dstTy layouts (.scalar sc) = some (.scalar ⟨V, w⟩) ∧
+      ∀ msc, ScalarRel sc msc → ∃ msc', ScalarRel ⟨V, w⟩ msc' ∧
+        Miri.Interpreter.Cast.cast (annealCastHooksFloat layouts false chooseNaN) () 16
+            ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy layouts⟩
+            (translateCastKind kind) (encodeTyId dstTy) ⟨destRef, translateTy dstTy layouts⟩ =
+          annealWriteImmediate (.scalar (.fromScalarInt msc'))
+            ⟨destRef, translateTy dstTy layouts⟩
+    (evalFloatCast .floatToFloat (some wfcF32Ty) wfcF64Ty layouts (.scalar ⟨0x7F800001, 4⟩) =
+        some (.scalar ⟨0x7FF8000020000000, 8⟩) ∧
+      ∀ msc, ScalarRel ⟨0x7F800001, 4⟩ msc → ∃ msc', ScalarRel ⟨0x7FF8000000000000, 8⟩ msc' ∧
+        Miri.Interpreter.Cast.cast (annealCastHooksFloat layouts false chooseNaN) () 16
+            ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy wfcF32Ty layouts⟩
+            .FloatToFloat (encodeTyId wfcF64Ty) ⟨destRef, translateTy wfcF64Ty layouts⟩ =
+          annealWriteImmediate (.scalar (.fromScalarInt msc'))
+            ⟨destRef, translateTy wfcF64Ty layouts⟩) ∧
+    (evalFloatCast .floatToFloat (some wfcF64Ty) wfcF32Ty layouts
+          (.scalar ⟨0x7FF0000020000001, 8⟩) = some (.scalar ⟨0x7FC00001, 4⟩) ∧
+      ∀ msc, ScalarRel ⟨0x7FF0000020000001, 8⟩ msc → ∃ msc', ScalarRel ⟨0x7FC00000, 4⟩ msc' ∧
+        Miri.Interpreter.Cast.cast (annealCastHooksFloat layouts false chooseNaN) () 16
+            ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy wfcF64Ty layouts⟩
+            .FloatToFloat (encodeTyId wfcF32Ty) ⟨destRef, translateTy wfcF32Ty layouts⟩ =
+          annealWriteImmediate (.scalar (.fromScalarInt msc'))
+            ⟨destRef, translateTy wfcF32Ty layouts⟩) ∧
+    castDetEq .floatToFloat wfcF64Ty wfcF32Ty ⟨0x7FF0000000000001, 8⟩ 0x7FC00000 4 ∧
+    castDetEq .floatToFloat wfcF64Ty wfcF32Ty ⟨0x36A8000000000000, 8⟩ 0x2 4 ∧
+    castDetEq .floatToInt wfcF32Ty (wfcIntTy .i8) ⟨0x7F800000, 4⟩ 0x7F 1 ∧
+    castDetEq .intToFloat (wfcUintTy .u128) wfcF32Ty ⟨2 ^ 128 - 1, 16⟩ 0x7F800000 4 ∧
+    evalFloatCast .floatToFloat (some wfcF16Ty) wfcF32Ty layouts (.scalar ⟨0x3C00, 2⟩) = none ∧
+    evalFloatCast .floatToFloat (some wfcF32Ty) wfcF128Ty layouts (.scalar ⟨0x3F800000, 4⟩) =
+      none ∧
+    (∃ msg, Miri.Interpreter.Cast.cast (annealCastHooksFloat layouts nondet chooseNaN) () 16
+        ⟨srcOp, translateTy wfcF16Ty layouts⟩ .FloatToFloat (encodeTyId wfcF32Ty)
+        ⟨destRef, translateTy wfcF32Ty layouts⟩ st = .error (.unsupported msg) st) ∧
+    (∀ msc, ScalarRel ⟨0x3F800000, 4⟩ msc →
+      ∃ msg, Miri.Interpreter.Cast.cast (annealCastHooksFloat layouts nondet chooseNaN) () 16
+          ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy wfcF32Ty layouts⟩
+          .FloatToFloat (encodeTyId wfcF128Ty) ⟨destRef, translateTy wfcF128Ty layouts⟩ st =
+        .error (.unsupported msg) st) := by
+  intro castDetEq
+  have hmd : FloatNaNModeOk false chooseNaN := Or.inr rfl
+  have hf16_f128 := cast_f16_f128_unsupported layouts nondet chooseNaN destRef st
+  refine ⟨⟨(wfc_evalFloatCast_layouts_eq hpw _).trans rfl, fun msc hrel => ?_⟩,
+    ⟨(wfc_evalFloatCast_layouts_eq hpw _).trans rfl, fun msc hrel => ?_⟩,
+    wfc_cast_two_sided_mode layouts hpw false chooseNaN hmd (.floatToFloat rfl rfl) rfl
+      (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inr rfl)) rfl destRef,
+    wfc_cast_two_sided_mode layouts hpw false chooseNaN hmd (.floatToFloat rfl rfl) rfl
+      (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inl rfl)) rfl destRef,
+    wfc_cast_two_sided_mode layouts hpw false chooseNaN hmd (.floatToInt rfl rfl) rfl
+      (fun _ _ _ hk _ _ => nomatch hk) rfl destRef,
+    wfc_cast_two_sided_mode layouts hpw false chooseNaN hmd (.intToFloat rfl rfl) rfl
+      (fun _ _ _ hk _ _ => nomatch hk) rfl destRef,
+    (evalFloatCast_f16_f128_none .floatToFloat wfcF32Ty layouts _ (Or.inl rfl)).1,
+    (evalFloatCast_f16_f128_none .floatToFloat wfcF32Ty layouts _ (Or.inr rfl)).2,
+    hf16_f128.1 (kind := .floatToFloat) rfl (Or.inl rfl) srcOp,
+    fun msc hrel => hf16_f128.2 (kind := .floatToFloat) rfl
+      (Or.inr ⟨Or.inl rfl, .binary32, rfl⟩) hrel
+      (by rw [wfc_translateTy_floatCast_eq (Or.inl ⟨.binary32, rfl⟩) layouts]; rfl) (Or.inr rfl)⟩
+  · simpa [show Anneal.Mir.IeeeFloatCast.isNaNBits .binary32 0x7F800001 = true from rfl,
+      show preferredNaNBits .binary64 = 0x7FF8000000000000 from rfl,
+      show IeeeFormat.binary64.byteWidth = 8 from rfl] using
+      cast_floatToFloat_deterministic_eq layouts chooseNaN (srcTy := wfcF32Ty)
+        (targetTy := wfcF64Ty) rfl rfl hrel rfl destRef
+  · simpa [show Anneal.Mir.IeeeFloatCast.isNaNBits .binary64 0x7FF0000020000001 = true from rfl,
+      show preferredNaNBits .binary32 = 0x7FC00000 from rfl,
+      show IeeeFormat.binary32.byteWidth = 4 from rfl] using
+      cast_floatToFloat_deterministic_eq layouts chooseNaN (srcTy := wfcF64Ty)
+        (targetTy := wfcF32Ty) rfl rfl hrel rfl destRef
 
 /-! ## (W5) Negative controls: UB, fail-closed boundaries, and memory-backed locals -/
 
@@ -3556,11 +3701,6 @@ theorem wfcW5_dead_source_ub :
       (.floatToFloat rfl rfl) rfl rfl h6⟩
 
 /-! ### (W5d) `f16` / `f128` fail-closed boundaries -/
-
-/-- `f16`. -/
-def wfcF16Ty : Ty := { kind := .float .f16, layoutIdx := 0 }
-/-- `f128`. -/
-def wfcF128Ty : Ty := { kind := .float .f128, layoutIdx := 0 }
 
 /-- **(W5d) `f16` source body** `bb0: _0 = const 1.0_f16 (0x3C00) as f32; return`. -/
 def wfcW5HBody : CapturedMir :=
@@ -5632,6 +5772,27 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW4_ties_all_wide_sources' dep
 #print axioms wfcW4_ties_all_wide_sources
 
 /--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_evalFloatCast_layouts_eq' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_evalFloatCast_layouts_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_translateTy_floatCast_eq' depends on axioms:
+  [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_translateTy_floatCast_eq
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_cast_two_sided_mode' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_cast_two_sided_mode
+
+/--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_cast_two_sided' depends on axioms:
   [propext, Classical.choice, Quot.sound]
 -/
@@ -5644,6 +5805,13 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcCast_two_sided_table' depends
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcCast_two_sided_table
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcCast_deterministic_and_f16_f128_boundary' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcCast_deterministic_and_f16_f128_boundary
 
 /--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5U_anneal_run' depends on axioms:
