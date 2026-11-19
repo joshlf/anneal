@@ -160,6 +160,9 @@ def interpUbMsg {α : Type} : Interp α → Option String
 /-- Decidable `.abort` check for `Interp α`. -/
 def interpIsAbort {α : Type} : Interp α → Bool
   | .error .abort => true | _ => false
+/-- Decidable `.specPanic` message projection for `Interp α`. -/
+def interpSpecPanicMsg {α : Type} : Interp α → Option String
+  | .error (.specPanic msg) => some msg | _ => none
 theorem eq_error_ub_of_interpUbMsg {α : Type} {r : Interp α} {msg : String} (h : interpUbMsg r = some msg) : r = .error (.ub msg) := by
   cases r with
   | ok _ => simp [interpUbMsg] at h
@@ -168,6 +171,11 @@ theorem eq_error_abort_of_interpIsAbort {α : Type} {r : Interp α} (h : interpI
   cases r with
   | ok _ => simp [interpIsAbort] at h
   | error e => cases e <;> simp [interpIsAbort] at h; rfl
+theorem eq_error_specPanic_of_interpSpecPanic {α : Type} {r : Interp α} {msg : String} (h : interpSpecPanicMsg r = some msg) :
+    r = .error (.specPanic msg) := by
+  cases r with
+  | ok _ => simp [interpSpecPanicMsg] at h
+  | error e => cases e <;> simp [interpSpecPanicMsg] at h; subst h; rfl
 theorem ok_of_map_toOption {α β : Type} {r : Interp α} {f : α → β} {b : β} (h : r.toOption.map f = some b) : ∃ a, r = .ok a ∧ f a = b := by
   cases r with
   | error _ => simp [Except.toOption] at h
@@ -1065,7 +1073,7 @@ across genuine `optionNonZeroU8MirTy` (`optionNonZeroU8Layouts`), `Mach`, and
 performs zero memory writes preserving `[.Init 7 none]` and reads discriminant
 `1`, setting `None` (`0`) writes `[.Init 0 none]` and reads discriminant `0`,
 and out-of-range `2` steps then faults `.ub` on `Rvalue.discriminant` in
-Trusted vs. immediate `SetDiscriminant` failure in MiniRust. -/
+Trusted vs. immediate `SetDiscriminant` `.specPanic` in MiniRust. -/
 theorem c1_niche_optionNonZeroU8_three_way_witness :
     let optMir (tag : Nat) := mkMirBody "ep2::c1_niche_opt" [mkDecl u64MirTy, mkDecl optionNonZeroU8MirTy] 1
       [mkBb [mkSt (.setDiscriminant (locPlace 1) tag), mkSt (.assign (locPlace 0) (.discriminant (locPlace 1)))] .return_] optionNonZeroU8Layouts
@@ -1088,9 +1096,10 @@ theorem c1_niche_optionNonZeroU8_three_way_witness :
        m2.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB)) = (some [.initNoProv 0], some [.initNoProv 0])) ∧
     (match stepMirFn (optMir 2) (initMachineState (optMir 2) [.aggregate 1 [.scalar ⟨7, 1⟩]]) with
      | .tau (.running s1) => stepMirFn (optMir 2) s1 = MirStepNode.fail .ub | _ => False) ∧
-    (Interp.step (optMach 2)).isOk = false ∧ (Interp.stepTB (liftMachToTB (optMach 2))).isOk = false :=
+    Interp.step (optMach 2) = .error (.specPanic "setting an invalid discriminant (2)") ∧
+    Interp.stepTB (liftMachToTB (optMach 2)) = .error (.specPanic "setting an invalid discriminant (2)") :=
   ⟨rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel), rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
-   rfl, by decide +kernel, by decide +kernel⟩
+   rfl, eq_error_specPanic_of_interpSpecPanic (by decide +kernel), eq_error_specPanic_of_interpSpecPanic (by decide +kernel)⟩
 /-- Concrete deref `SetDiscriminant` witness (`(*_2) = variant 1`) across
 Trusted, `Mach`, and `MachTB` (with payload preservation & `MachTB.wfLive`). -/
 def c1DerefMir : MirAst.CapturedMir := mkMirBody "ep2::c1_set_discr_deref" [mkDecl twoVarMirTy, mkDecl twoVarMirTy,
@@ -1125,9 +1134,11 @@ theorem c1_setDiscriminant_uninit_shell_witness :
     (match stepMirFn c1SetDiscrLocalMir s0 with
      | .tau (.running s1) => get? s1.frame.locals 1 = some (.init (.aggregate 1 [])) | _ => False) ∧
     (∃ m1, Interp.step c1UninitMach = .ok m1 ∧ m1.mem.memory.allocations[1]?.map (·.data) = some (.Init 1 none :: List.replicate 7 .Uninit)) ∧
-    Type.decode twoVarEnumMrTy (.Init 1 none :: List.replicate 7 .Uninit) = .ok none ∧ (∃ m1, Interp.stepTB (liftMachToTB c1UninitMach) = .ok m1 ∧ MachTB.wfLive m1 ∧
+    Type.decode twoVarEnumMrTy (.Init 1 none :: List.replicate 7 .Uninit) = .ok none ∧
+    Type.decodeM (M := TBM) twoVarEnumMrTy (.Init 1 none :: List.replicate 7 .Uninit) = .ok none ∧
+    (∃ m1, Interp.stepTB (liftMachToTB c1UninitMach) = .ok m1 ∧ MachTB.wfLive m1 ∧
       m1.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB) =
-        some (TBByteOutcome.initNoProv 1 :: List.replicate 7 TBByteOutcome.uninit)) := ⟨rfl, ok_of_map_toOption (by decide +kernel), rfl, ok_stepTB_wfLive (by decide +kernel)⟩
+        some (TBByteOutcome.initNoProv 1 :: List.replicate 7 TBByteOutcome.uninit)) := ⟨rfl, ok_of_map_toOption (by decide +kernel), rfl, rfl, ok_stepTB_wfLive (by decide +kernel)⟩
 /-- Concrete dead-local UB C1 witness across Trusted, `Mach`, and `MachTB`. -/
 def c1DeadLocalMach : Mach := mkMrMach c1SetDiscrLocalProg [mkStackAlloc 128 (List.replicate 8 .Uninit) 4]
     [mkRootFrame c1SetDiscrLocalMrFn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]]
@@ -2529,6 +2540,39 @@ theorem unsafeFnPointer_ground_truth_and_divergences (locals locals' : List Loca
   · show evalUnsafeFnPointer locals op
       { kind := .fnPtr [.uint .u32] (.uint .u32) .unsafe_ .rustIntrinsic, layoutIdx := 0 } mem decls layouts = .ub
     unfold evalUnsafeFnPointer; simp [hOp, callConvEq]
+/-- **C8.3 Named Divergence Showcase
+(`unsafeFnPointer_trusted_unsupported_divergence`)**: Unrecognized
+`PointerCoercion` tags (including `"UnsafeFnPointer(Unsafe)"`) return
+`.unsupported` in `Trusted.MirSemantics`, and `"UnsafeFnPointer"` strict
+checks reject already-`.unsafe_` sources, `.safe` targets, and `.rustIntrinsic`
+ABIs with `.ub`, whereas MiniRust erases fn-ptr safety/ABI so `Transmute
+thinRawPtrTy` succeeds on both `Mach` and `MachTB`. -/
+theorem unsafeFnPointer_trusted_unsupported_divergence (locals locals' : List LocalSlot) (op : MirAst.Operand) (dstTy : MirAst.Ty)
+    (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (p : ProvenancePtr) (addr : Nat)
+    (hAddr : addr < 2 ^ 64) (provBM : Option Prov) (provTB : Option TreeBorrowsProvenance) (mBM : Option Mach) (mTB : Option MachTB)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals decls mem.callStack = .ok (.ptr p 8) locals') (ck : String) :
+    (isReifyFnPointerCoercion ck = false → stringEq ck "Unsize" = false → stringEq ck "ArrayToPointer" = false →
+      stringEq ck "MutToConstPointer" = false → evalRvalue locals (.cast (.pointerCoercion ck) op dstTy) mem decls layouts = .unsupported) ∧
+    evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer(Unsafe)") op fnPtrUnsafeU32MirTy) mem decls layouts = .unsupported ∧
+    evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op fnPtrSafeU32MirTy) mem decls layouts = .ub ∧
+    (operandTy decls layouts op = some fnPtrUnsafeU32MirTy →
+      evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op fnPtrUnsafeU32MirTy) mem decls layouts = .ub) ∧
+    evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op fnPtrIntrinsicU32MirTy) mem decls layouts = .ub ∧
+    evalCastOp (.Transmute thinRawPtrTy) (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy)
+      mBM = .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) ∧
+    evalCastOpM (M := TBM) (.Transmute thinRawPtrTy) (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy)
+      mTB = .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) := by
+  refine ⟨?_, rfl, ?_, ?_, ?_, evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM, evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB mTB⟩
+  · intro hNR hNU hNA hNM
+    show evalReifyFnPointer locals op dstTy mem decls layouts ck = .unsupported
+    unfold evalReifyFnPointer; simp only [hNR, hNU, hNA, hNM]
+  · show evalUnsafeFnPointer locals op fnPtrSafeU32MirTy mem decls layouts = .ub
+    unfold evalUnsafeFnPointer; simp [hOp, fnPtrSafeU32MirTy]
+  · intro hU
+    show evalUnsafeFnPointer locals op fnPtrUnsafeU32MirTy mem decls layouts = .ub
+    unfold evalUnsafeFnPointer; simp [hOp, hU, fnPtrUnsafeU32MirTy, callConvEq]
+  · show evalUnsafeFnPointer locals op fnPtrIntrinsicU32MirTy mem decls layouts = .ub
+    unfold evalUnsafeFnPointer; simp [hOp, fnPtrIntrinsicU32MirTy, callConvEq]
 /-- **C8 + C6 Universal Composed Function-Pointer Pipeline (`ReifyFnPointer`
 / `ClosureFnPointer` → `UnsafeFnPointer` → `FnPtrToPtr`)**: When a fresh
 `internFnPtr` allocates `(aid, mem')` for a `.safe` `fn(u32) -> u32`, `mem'`
