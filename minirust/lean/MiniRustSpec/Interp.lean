@@ -5538,7 +5538,7 @@ def evalCall (m : Mach) (callee : Function) (callerConv : CallingConvention)
   let (_, m) ← mutateCurStack m (fun stack => pure ((), stack ++ [frame]))
   pure m
 
-/-- The teardown loop of `Terminator::Return`:
+/-- The teardown loop of `Terminator::Return` and `Terminator::ResumeUnwind`:
 > "while let Some(local) = frame.locals.keys().next() {
 >      frame.storage_dead(&mut self.mem, local)?;
 >  }"
@@ -8224,8 +8224,9 @@ def evalSetDiscriminantM {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
       | none => specPanic s!"setting an invalid discriminant ({value})"
   | _ => specPanic "setting the discriminant type of a non-enum contradicts well-formedness"
 
-/-- Polymorphic `Machine::eval_statement` (`spec/lang/step/statements.md`);
-see `evalStatement`:
+/-- Polymorphic `Machine::eval_statement` for every `Statement` (including
+`Statement::SetDiscriminant` via `evalSetDiscriminantM`;
+`spec/lang/step/statements.md`); see `evalStatement`:
 > "fn eval_statement(&mut self, Statement::Assign { destination, source }: Statement) -> NdResult {
 >     let (place, ty) = self.eval_place(destination)?;
 >     let (val, _) = self.eval_value(source)?;
@@ -8700,8 +8701,8 @@ def evalCallM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) (callee : Func
   let (_, m) ← mutateCurStackM m (fun stack => pure ((), stack ++ [frame]))
   pure m
 
-/-- Polymorphic teardown loop of `Terminator::Return` (`spec/lang/step/terminators.md`);
-see `deallocAll`:
+/-- Polymorphic teardown loop of `Terminator::Return` and
+`Terminator::ResumeUnwind` (`spec/lang/step/terminators.md`); see `deallocAll`:
 > "while let Some(local) = frame.locals.keys().next() {
 >      frame.storage_dead(&mut self.mem, local)?;
 >  }" -/
@@ -8874,7 +8875,9 @@ see `evalTerminator`:
 >     } )?;
 >     self.jump_to_block(block_name)?;
 >     ret(())
-> }" -/
+> }"
+`Terminator::Return` is `evalReturnM` and `Terminator::ResumeUnwind` is
+`evalResumeUnwindM`. -/
 def evalTerminatorM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
     Terminator → Interp (Machine M)
   | .Goto blockName => jumpToBlockM m blockName

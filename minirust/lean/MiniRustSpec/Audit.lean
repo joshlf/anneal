@@ -5735,6 +5735,8 @@ open MiniRustSpec.Correspondence in
   evalLIntrinsic_panicUnwind_minirust_correspondence
   minirust_bitops_char_and_layout_negative_controls
   minirust_unwind_terminators_supported
+  minirust_unwind_concrete_witnesses
+  minirust_setDiscriminant_supported
   evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout
   evalLoweredIntrinsicCall_target_none_minirust_ub
   lintrinsicOp_exhaustive_minirust_classification
