@@ -418,24 +418,31 @@ def isNativeDecideAxiom (n : Name) : Bool :=
 /-- Structural validation of an auxiliary native-evaluation axiom.
 
     Lean `v4.34.1`'s `Lean.Meta.nativeEqTrue` (the engine behind `native_decide` and
-    `bv_decide`) emits exactly one shape: an axiom whose final name component starts
-    with `ax_` and whose type is the binder-free proposition `@Eq.{1} Bool e Bool.true`
-    for a closed `e`. A hand-written `axiom foo._native.bar : False` merely *named*
-    like such an axiom fails this check and is never treated as native evaluation.
+    `bv_decide`) emits an axiom whose final name component starts with `ax_`, whose
+    `isUnsafe` flag is `false`, and whose type is the binder-free proposition
+    `@Eq.{1} Bool e Bool.true` using the toolchain stdlib `Eq`, `Bool`, and `Bool.true`
+    for a closed `e` (never literally `Bool.false`). A hand-written `axiom foo._native.bar : False`,
+    a `prelude` module re-declaring its own `Eq`/`Bool`, an `unsafe` axiom, or a literal
+    `false = true` axiom all fail this check and are rejected as `.unapprovedAxiom`.
 
     This is a necessary condition only: a hand-written axiom that also copies the
-    shape (`axiom x._native.t.ax_1 : b = true`) cannot be told apart from genuine
-    compiler output without re-running the evaluation, which is why accepted native
-    axioms are always surfaced in `AuditStats.provisionalNativeAxioms`. -/
-def isWellFormedNativeAxiom (n : Name) (ci : ConstantInfo) : Bool :=
+    name and `@Eq Bool e true` shape with a non-literal `e` cannot be told apart from
+    genuine compiler output without re-running the evaluation, which is why accepted
+    native axioms are always surfaced in `AuditStats.provisionalNativeAxioms`. -/
+def isWellFormedNativeAxiom (privEnv : Environment) (n : Name) (ci : ConstantInfo) : Bool :=
   let nameOk := match n with
     | .str _ s => s.startsWith "ax_"
     | _ => false
+  let stdlibCoreOk :=
+    (originModule? privEnv ``Eq).any isStdlibMod &&
+    (originModule? privEnv ``Bool).any isStdlibMod &&
+    (originModule? privEnv ``Bool.true).any isStdlibMod
   let typeOk := match ci.type with
     | .app (.app (.app (.const ``Eq [lvl]) (.const ``Bool [])) e) (.const ``Bool.true []) =>
-      lvl == Level.succ Level.zero && !e.hasLooseBVars && !e.hasFVar && !e.hasMVar
+      lvl == Level.succ Level.zero && !e.hasLooseBVars && !e.hasFVar && !e.hasMVar &&
+      !(e.isConstOf ``Bool.false)
     | _ => false
-  ci.isAxiom && nameOk && typeOk
+  ci.isAxiom && !ci.isUnsafe && nameOk && stdlibCoreOk && typeOk
 
 /-- Test whether `n` is `Lean.trustCompiler`. -/
 def isTrustCompilerAxiom (n : Name) : Bool :=
@@ -448,7 +455,8 @@ def hasUnsafeRecComponent (n : Name) : Bool :=
   | _ => (n.toString.splitOn "._unsafe_rec").length > 1
 
 /-- Check whether `ci` is the Lean equation compiler's dead codegen-only `_unsafe_rec`
-    companion for a safe, total, non-partial parent `defnInfo` in the same module.
+    companion for a safe, total, non-partial parent `defnInfo` in the same module
+    with matching kernel `type` and `levelParams`.
     Such companions are skipped during module inventory scans, but are ALWAYS rejected
     if ever reached in any declaration's transitive closure. -/
 def isCodegenUnsafeRec (env : Environment) (modName? : Option Name) (ci : ConstantInfo) : Bool :=
@@ -461,7 +469,10 @@ def isCodegenUnsafeRec (env : Environment) (modName? : Option Name) (ci : Consta
         if parentCi.isUnsafe || parentCi.isPartial then false
         else
           match parentCi with
-          | .defnInfo _ => originModule? env parent == modName?
+          | .defnInfo _ =>
+            originModule? env parent == modName? &&
+            ci.type == parentCi.type &&
+            ci.levelParams == parentCi.levelParams
           | _ => false
       | none => false
     | _ => false
@@ -527,21 +538,41 @@ structure CSimpIndex where
   thmNames : NameSet := {}
   fromToThm : Std.HashMap Name (Name × Name) := {}
 
-/-- Build `CSimpIndex` across all non-stdlib imported modules and the live local state. -/
+/-- Build `CSimpIndex` across all non-stdlib imported modules and the live local state,
+    including closed-scope `@[scoped csimp]` entries recorded in `StateStack.newEntries`
+    and `StateStack.scopedEntries`. -/
 def buildCSimpIndex (privEnv : Environment) : CSimpIndex := Id.run do
   let mut thmNames : NameSet := {}
   let mut fromToThm : Std.HashMap Name (Name × Name) := {}
-  -- 1. Live local state (populated during elaboration or `loadExts := true`).
-  let st := Lean.Compiler.CSimp.ext.getState privEnv
-  thmNames := st.thmNames.fold (init := thmNames) fun acc thm => acc.insert thm
-  let (thmNames', fromToThm') := st.map.fold (init := (thmNames, fromToThm)) fun (tAcc, mAcc) fromDecl ent =>
+  let addEntry (tAcc : NameSet) (mAcc : Std.HashMap Name (Name × Name))
+      (ent : Lean.Compiler.CSimp.Entry) : NameSet × Std.HashMap Name (Name × Name) :=
     if !((originModule? privEnv ent.thmName).any isStdlibMod) then
-      (tAcc.insert ent.thmName, mAcc.insert fromDecl (ent.toDeclName, ent.thmName))
+      (tAcc.insert ent.thmName, mAcc.insert ent.fromDeclName (ent.toDeclName, ent.thmName))
     else
       (tAcc, mAcc)
-  thmNames := thmNames'
-  fromToThm := fromToThm'
-  -- 2. Raw imported module entries (works even under `loadExts := false`!).
+  -- 1. Live active state (global, local, and currently open scoped entries).
+  let st := Lean.Compiler.CSimp.ext.getState privEnv
+  thmNames := st.thmNames.fold (init := thmNames) fun acc thm =>
+    if !((originModule? privEnv thm).any isStdlibMod) then acc.insert thm else acc
+  let (t1, m1) := st.map.fold (init := (thmNames, fromToThm)) fun (tAcc, mAcc) _ ent =>
+    addEntry tAcc mAcc ent
+  thmNames := t1
+  fromToThm := m1
+  -- 2. Live `StateStack` `newEntries` & `scopedEntries` (catches closed-scope
+  --    `@[scoped csimp]` entries whose namespace ended before auditing!).
+  let stack := Lean.Compiler.CSimp.ext.ext.getState privEnv
+  for raw in stack.newEntries do
+    let ent := match raw with
+      | .global e => e
+      | .scoped _ e => e
+    let (t', m') := addEntry thmNames fromToThm ent
+    thmNames := t'
+    fromToThm := m'
+  let (t2, m2) := stack.scopedEntries.map.fold (init := (thmNames, fromToThm)) fun acc _ arr =>
+    arr.foldl (init := acc) fun (tAcc, mAcc) ent => addEntry tAcc mAcc ent
+  thmNames := t2
+  fromToThm := m2
+  -- 3. Raw imported module entries (works even under `loadExts := false`!).
   let mods := privEnv.header.modules
   for h : modIdx in [:mods.size] do
     let modName := mods[modIdx].module
@@ -640,14 +671,17 @@ def checkAxiomAllowed (privEnv : Environment) (policy : AuditPolicy)
   if axName == ``sorryAx || axName == `sorryAx then
     some (.sorryAxiomReached target axName)
   else if axName == ``Lean.ofReduceBool || axName == ``Lean.ofReduceNat then
-    if policy.allowProvisionalNative && fromStdlib then none
+    if !fromStdlib then
+      some (.unapprovedAxiom target axName modName?
+        "native-evaluation axiom name declared outside the toolchain stdlib")
+    else if policy.allowProvisionalNative then none
     else some (.nativeDecideReached target axName modName?)
   else if isNativeDecideAxiom axName then
     match privEnv.checked.get.find? axName with
     | some ci =>
-      if !isWellFormedNativeAxiom axName ci then
+      if !isWellFormedNativeAxiom privEnv axName ci then
         some (.unapprovedAxiom target axName modName?
-          "axiom name mimics a native_decide auxiliary axiom but is not of the form `@Eq Bool e Bool.true`")
+          "axiom name mimics a native_decide auxiliary axiom but fails structural/stdlib validation")
       else if policy.allowProvisionalNative then none
       else some (.nativeDecideReached target axName modName?)
     | none =>
@@ -786,13 +820,16 @@ def statementOriginWalk (privEnv : Environment) (policy : AuditPolicy)
         matchesAnyRoot n modName? policy.statementUnfoldRoots ||
         (!isAllowedBoundary && !isForbidden)
       if shouldUnfold then
-        if let some depCi := kenv.find? n then
+        match kenv.find? n with
+        | some depCi =>
           let (depEdges, openVs) := declarationEdges target depCi
           vs := openVs.foldl pushUniqueViolation vs
           for d in depEdges.toArray.qsort Name.lt do
             if !seen.contains d then
               seen := seen.insert d
               pending := pending.push (d, chain.push d)
+        | none =>
+          vs := pushUniqueViolation vs (.missingDeclaration n)
     if !pending.isEmpty then
       vs := pushUniqueViolation vs (.auditFuelExhausted target "statement-origin walk")
     return (vs, if vs.isEmpty then seen else cleanSeen)
@@ -1021,53 +1058,105 @@ def checkModuleProvenanceIO (moduleNames : Array Name)
     (toolchainLibDir? : Option System.FilePath := none)
     (pinnedModuleRoots : Array (Name × System.FilePath) := #[]) :
     IO (Array AuditViolation) := do
-  let realDir (d : System.FilePath) : IO System.FilePath :=
-    try IO.FS.realPath d catch _ => pure d
+  let realDir? (d : System.FilePath) : IO (Option System.FilePath) :=
+    try
+      let rp ← IO.FS.realPath d
+      pure (some rp)
+    catch _ =>
+      pure none
   let libDir ← match toolchainLibDir? with
     | some d => pure d
     | none => Lean.getLibDir (← Lean.getBuildDir)
-  let libDirReal ← realDir libDir
-  let mut pinnedReal : Array (Name × System.FilePath) := #[]
+  let libDirReal? ← realDir? libDir
+  let mut pinnedReal : Array (Name × Option System.FilePath) := #[]
   for (r, d) in pinnedModuleRoots do
-    pinnedReal := pinnedReal.push (r, ← realDir d)
+    pinnedReal := pinnedReal.push (r, ← realDir? d)
   let isToolchainName (m : Name) : Bool := isStdlibMod m || isLeanCompilerMod m
   let trustRoots :=
     ((if policy.checkStatementOrigin then policy.statementAllowedRoots else #[]) ++
       policy.allowedAxiomModuleRoots).filter (!isToolchainName ·)
-  let isUnder (p dir : System.FilePath) : Bool :=
-    p.toString.startsWith (dir.toString ++ System.FilePath.pathSeparator.toString)
+  let sep := System.FilePath.pathSeparator.toString
+  let isEqualOrUnder (p dir : System.FilePath) : Bool :=
+    let ds := dir.toString
+    let ps := p.toString
+    if ds == sep then ps.startsWith sep
+    else
+      let dsNorm := if ds.endsWith sep then (ds.dropEnd sep.length).toString else ds
+      ps == dsNorm || ps.startsWith (dsNorm ++ sep)
   let mut violations : Array AuditViolation := #[]
   for m in moduleNames do
-    -- `none`: name carries no trust. `some (none, why)`: trust-bearing but unpinned.
+    -- `none`: name carries no trust. `some (none, why)`: trust-bearing but unpinned / missing pin dir.
     let expected? : Option (Option System.FilePath × String) :=
       if isToolchainName m then
-        some (some libDirReal, "the pinned toolchain library directory")
+        match libDirReal? with
+        | some d => some (some d, "the pinned toolchain library directory")
+        | none => some (none, s!"pinned toolchain library directory does not exist: {libDir}")
       else
         match trustRoots.find? (matchesRootPrefix m ·) with
         | none => none
         | some r =>
           match pinnedReal.find? (·.1 == r) with
-          | some (_, d) => some (some d, s!"the directory pinned for module root {r}")
-          | none => some (none, s!"module root {r} carries trust but has no pinnedModuleRoots entry")
+          | some (_, some d) => some (some d, s!"the directory pinned for module root {r}")
+          | some (_, none) =>
+            some (none, s!"pinned directory for module root {r} does not exist")
+          | none =>
+            some (none, s!"module root {r} carries trust but has no pinnedModuleRoots entry")
     match expected? with
     | none => pure ()
     | some (none, why) =>
       violations := pushUniqueViolation violations (.moduleProvenanceSpoofed m "<unpinned>" why)
     | some (some dir, why) =>
-      let resolved? ← try
+      let oleanPath? ← try
         let p ← Lean.findOLean m
-        let pReal ← IO.FS.realPath p
-        pure (some (p, pReal))
+        pure (some p)
       catch _ =>
         pure none
-      match resolved? with
+      match oleanPath? with
       | none =>
         violations := pushUniqueViolation violations
           (.moduleProvenanceSpoofed m "<unresolvable>" s!"expected under {why}")
-      | some (p, pReal) =>
-        unless isUnder pReal dir do
+      | some p =>
+        -- 1. Verify the containing directory of `p` itself resides under `dir`, so a
+        --    symlinked `.olean` inside an untrusted search-path directory cannot hijack
+        --    sibling `.olean.server` / `.olean.private` / `.ir` files from outside `dir`.
+        match p.parent with
+        | none =>
           violations := pushUniqueViolation violations
-            (.moduleProvenanceSpoofed m p.toString s!"expected under {why}")
+            (.moduleProvenanceSpoofed m p.toString s!"missing parent directory; expected under {why}")
+        | some parentDir =>
+          match (← realDir? parentDir) with
+          | none =>
+            violations := pushUniqueViolation violations
+              (.moduleProvenanceSpoofed m parentDir.toString s!"unresolvable parent; expected under {why}")
+          | some parentReal =>
+            unless isEqualOrUnder parentReal dir do
+              violations := pushUniqueViolation violations
+                (.moduleProvenanceSpoofed m parentDir.toString
+                  s!"artifact directory resolves outside {why}")
+        -- 2. Verify the `.olean` file itself AND every existing companion part
+        --    (`.olean.server`, `.olean.private`, `.ir.sig`, `.ir`) resolve via `realPath`
+        --    inside `dir` (blocking split-artifact symlink attacks).
+        let parts : Array (String × System.FilePath) := #[
+          ("olean", p),
+          ("olean.server", OLeanLevel.server.adjustFileName p),
+          ("olean.private", OLeanLevel.private.adjustFileName p),
+          ("ir.sig", p.withExtension "ir.sig"),
+          ("ir", p.withExtension "ir")
+        ]
+        for (partLabel, partPath) in parts do
+          let mustExist := partLabel == "olean"
+          let existsNow ← partPath.pathExists
+          if mustExist || existsNow then
+            match (← realDir? partPath) with
+            | none =>
+              violations := pushUniqueViolation violations
+                (.moduleProvenanceSpoofed m partPath.toString
+                  s!"unresolvable {partLabel} artifact; expected under {why}")
+            | some partReal =>
+              unless isEqualOrUnder partReal dir do
+                violations := pushUniqueViolation violations
+                  (.moduleProvenanceSpoofed m partPath.toString
+                    s!"{partLabel} artifact resolves outside {why}")
   return violations
 
 /-- Run a computation with `extraSearchPaths` temporarily prepended to `Lean.searchPathRef`,
@@ -1180,6 +1269,24 @@ def auditLoadedModulesIO
     if !provenanceViolations.isEmpty then
       let t1 ← IO.monoNanosNow
       return .rejected provenanceViolations (finish t1 {})
+    let mut inventoryViolations : Array AuditViolation := #[]
+    for m in privEnv.header.modules, data in privEnv.header.moduleData do
+      if targetModules.contains m.module then
+        unless data.constNames == data.constants.map ConstantInfo.name do
+          inventoryViolations := pushUniqueViolation inventoryViolations
+            (.environmentLoadFailed s!"constNames/constants inventory mismatch in module {m.module}")
+        for ci in data.constants do
+          match privEnv.checked.get.find? ci.name with
+          | none =>
+            inventoryViolations := pushUniqueViolation inventoryViolations
+              (.environmentLoadFailed s!"inventoried constant {ci.name} missing from kernel env in {m.module}")
+          | some stored =>
+            unless stored.type == ci.type && stored.value? true == ci.value? true do
+              inventoryViolations := pushUniqueViolation inventoryViolations
+                (.environmentLoadFailed s!"stored kernel declaration differs from module inventory for {ci.name} in {m.module}")
+    if !inventoryViolations.isEmpty then
+      let t1 ← IO.monoNanosNow
+      return .rejected inventoryViolations (finish t1 {})
     let targets : Array Name := match explicitTargets? with
       | some ts => ts
       | none => Id.run do
@@ -1195,15 +1302,20 @@ def auditLoadedModulesIO
     let mut violations := verdict.violations
     let mut replayedCount : Nat := 0
     if runKernelReplay && violations.isEmpty then
+      let pinnedRoots := pinnedModuleRoots.map (·.1)
+      let isBaseTrustedMod (modName : Name) : Bool :=
+        !targetModules.contains modName &&
+        (isStdlibMod modName || isLeanCompilerMod modName ||
+          pinnedRoots.any (matchesRootPrefix modName ·))
       let mut replayLocals : Std.HashMap Name ConstantInfo := {}
       let mut baseMods : Array Name := #[]
       for m in privEnv.header.modules, data in privEnv.header.moduleData do
-        if targetModules.contains m.module then
+        if isBaseTrustedMod m.module then
+          baseMods := baseMods.push m.module
+        else
           for ci in data.constants do
             if !isCodegenUnsafeRec privEnv (some m.module) ci then
               replayLocals := replayLocals.insert ci.name ci
-        else
-          baseMods := baseMods.push m.module
       try
         let baseEnv ← Lean.importModules (baseMods.map fun m => ({ module := m } : Import)) {}
           (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := OLeanLevel.private)
@@ -1557,6 +1669,66 @@ theorem no_modularItemSpec_cert_of_vacuous_envAssumed (defId : String)
     ModularItemSpecStrengthCert defId → False :=
   fun c => c.handler_valid
 
+/-- Constructive direct specification-strength certificate for a modular rely–guarantee
+    contract `(envAssumed, pre, post)`: pairs a non-vacuous external-call handler witness
+    `handler_valid : envAssumed handler` with a `SpecStrengthCert` over `(pre, post)`. -/
+structure ModularSpecStrengthCert
+    (envAssumed : ExternalCallHandler → Prop)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) : Type where
+  handler : ExternalCallHandler
+  handler_valid : envAssumed handler
+  cert : SpecStrengthCert
+    (fun (p : List Value × Memory) => pre p.1 p.2)
+    (fun (p : List Value × Memory) (r : Value × Memory) => post p.1 p.2 r.1 r.2)
+
+/-- Constructive direct multi-mutant specification-strength certificate for a modular
+    rely–guarantee contract `(envAssumed, pre, post)`. -/
+structure ModularMultiMutantSpecCert
+    (envAssumed : ExternalCallHandler → Prop)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) : Type where
+  handler : ExternalCallHandler
+  handler_valid : envAssumed handler
+  cert : MultiMutantSpecCert
+    (fun (p : List Value × Memory) => pre p.1 p.2)
+    (fun (p : List Value × Memory) (r : Value × Memory) => post p.1 p.2 r.1 r.2)
+
+/-- Constructive direct deterministic specification-strength certificate for a modular
+    rely–guarantee contract `(envAssumed, pre, post)`. -/
+structure ModularDeterministicSpecCert
+    (envAssumed : ExternalCallHandler → Prop)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) : Prop where
+  handler_nonvacuous : ∃ h, envAssumed h
+  cert : DeterministicSpecCert
+    (fun (p : List Value × Memory) => pre p.1 p.2)
+    (fun (p : List Value × Memory) (r : Value × Memory) => post p.1 p.2 r.1 r.2)
+
+/-- A modular contract with vacuous rely predicate `envAssumed := fun _ => False`
+    can never admit a `ModularSpecStrengthCert`. -/
+theorem no_modular_cert_of_vacuous_envAssumed
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) :
+    ModularSpecStrengthCert (fun _ => False) pre post → False :=
+  fun c => c.handler_valid
+
+/-- A modular contract with vacuous precondition `pre := fun _ _ => False`
+    can never admit a `ModularSpecStrengthCert`. -/
+theorem no_modular_cert_of_vacuous_req
+    (envAssumed : ExternalCallHandler → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) :
+    ModularSpecStrengthCert envAssumed (fun _ _ => False) post → False :=
+  fun c => c.cert.req_nonvacuous
+
+/-- A modular contract with trivial postcondition `post := fun _ _ _ _ => True`
+    can never admit a `ModularSpecStrengthCert`. -/
+theorem no_modular_cert_of_trivial_ens
+    (envAssumed : ExternalCallHandler → Prop)
+    (pre : List Value → Memory → Prop) :
+    ModularSpecStrengthCert envAssumed pre (fun _ _ _ _ => True) → False :=
+  fun c => c.cert.mutant_killed trivial
+
 /-! ### `MetaM` Spec-Strength Gate (`auditSpecStrengthCertInEnv`) -/
 
 /-- Certificate heads stated directly over `(In, Out, req, ens)`. -/
@@ -1564,6 +1736,13 @@ private def directCertHeads : Array Name := #[
   ``SpecStrengthCert,
   ``MultiMutantSpecCert,
   ``DeterministicSpecCert
+]
+
+/-- Direct modular certificate heads stated over `(envAssumed, pre, post)`. -/
+private def directModularCertHeads : Array Name := #[
+  ``ModularSpecStrengthCert,
+  ``ModularMultiMutantSpecCert,
+  ``ModularDeterministicSpecCert
 ]
 
 /-- Certificate typeclass heads paired with the specification class they certify. -/
@@ -1579,90 +1758,296 @@ private def classCertHeads : Array (Name × Name) := #[
 /-- Certificate heads whose witness carries a categorized `MultiMutantSpecCert`. -/
 private def multiMutantCertHeads : Array Name := #[
   ``MultiMutantSpecCert,
+  ``ModularMultiMutantSpecCert,
   ``ItemMultiMutantCert,
   ``StatefulItemMultiMutantCert,
   ``ModularItemMultiMutantCert
 ]
 
-/-- If the conclusion of `ty` (after stripping binders and delta-unfolding up to `fuel`
-    head definitions, regardless of their reducibility) is an application of `specClass`,
-    return its first argument (the `defId` expression). Unfolding makes a specification
-    declared at an alias type (`abbrev MySpec := ItemSpec "x"`) visible. -/
-def specClassConclusionArg? (kenv : Kernel.Environment) (specClass : Name) (ty : Expr)
-    (fuel : Nat := 8) : Option Expr :=
+/-- Outcome of normalizing a declaration's conclusion type against `specClass`.
+    `fuelExhausted` is treated fail-closed as a potential competing instance so deep
+    alias/let/beta chains cannot slip past the uniqueness scan. -/
+private inductive SpecConclusionMatch where
+  | matched (arg : Expr)
+  | notMatched
+  | fuelExhausted
+
+/-- Weakly normalize an extracted `defId` argument expression (stripping `.mdata`,
+    zeta-reducing `.letE`, beta-reducing `.lam` applications, reducing `.proj` of
+    constructors, and unfolding `.defnInfo` aliases up to `fuel`) so wrapped string
+    literals resolve cleanly. -/
+private def normalizeDefIdArg (kenv : Kernel.Environment) (e : Expr) (fuel : Nat := 32) : Expr :=
   match fuel with
-  | 0 => none
+  | 0 => e
   | fuel + 1 =>
-    let concl := ty.getForallBody
-    match concl.getAppFn with
-    | .const c lvls =>
-      if c == specClass then
-        some (concl.getAppArgs[0]?.getD (.bvar 0))
-      else
+    match e with
+    | .mdata _ inner => normalizeDefIdArg kenv inner fuel
+    | .letE _ _ val body _ => normalizeDefIdArg kenv (body.instantiate1 val) fuel
+    | .proj structName idx s =>
+      let s' := normalizeDefIdArg kenv s fuel
+      match s'.getAppFn with
+      | .const ctorName _ =>
+        match kenv.find? ctorName with
+        | some (.ctorInfo cinfo) =>
+          let sArgs := s'.getAppArgs
+          if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
+            normalizeDefIdArg kenv sArgs[cinfo.numParams + idx]! fuel
+          else e
+        | _ => e
+      | _ => e
+    | _ =>
+      let fn := e.getAppFn
+      let args := e.getAppArgs
+      match fn with
+      | .mdata _ inner => normalizeDefIdArg kenv (mkAppN inner args) fuel
+      | .lam .. => normalizeDefIdArg kenv (fn.beta args) fuel
+      | .letE _ _ val body _ => normalizeDefIdArg kenv (mkAppN (body.instantiate1 val) args) fuel
+      | .proj structName idx s =>
+        let s' := normalizeDefIdArg kenv s fuel
+        match s'.getAppFn with
+        | .const ctorName _ =>
+          match kenv.find? ctorName with
+          | some (.ctorInfo cinfo) =>
+            let sArgs := s'.getAppArgs
+            if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
+              normalizeDefIdArg kenv (mkAppN sArgs[cinfo.numParams + idx]! args) fuel
+            else e
+          | _ => e
+        | _ => e
+      | .const c lvls =>
         match kenv.find? c with
         | some (.defnInfo v) =>
           if v.levelParams.length == lvls.length then
-            specClassConclusionArg? kenv specClass
-              ((v.value.instantiateLevelParams v.levelParams lvls).beta concl.getAppArgs) fuel
-          else none
-        | _ => none
-    | _ => none
+            normalizeDefIdArg kenv ((v.value.instantiateLevelParams v.levelParams lvls).beta args) fuel
+          else e
+        | _ => e
+      | _ => e
 
-/-- All non-constructor constants whose type concludes (up to unfolding type aliases) in
-    `specClass "<defId>"`, or in `specClass e` for a non-literal `e` (which could match
-    any `defId`).
+/-- Pure structural normalizer for testing whether `ty` concludes in `specClass <arg>`
+    (stripping `∀` telescopes via `getForallBody` without consuming fuel, stripping
+    `.mdata`, zeta-reducing `.letE`, beta-reducing `.lam`, reducing `.proj` of
+    constructors, and delta-unfolding `.defnInfo` heads up to `fuel`).
+    Returns `.fuelExhausted` (fail-closed) if `fuel` runs out before reaching a
+    non-reducible head. -/
+private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Name) (ty : Expr)
+    (fuel : Nat := 64) : SpecConclusionMatch :=
+  match fuel with
+  | 0 => .fuelExhausted
+  | fuel + 1 =>
+    let ty := ty.getForallBody
+    match ty with
+    | .mdata _ inner => specClassConclusionMatch kenv specClass inner fuel
+    | .letE _ _ val body _ =>
+      specClassConclusionMatch kenv specClass (body.instantiate1 val) fuel
+    | .proj structName idx s =>
+      let s' := normalizeDefIdArg kenv s fuel
+      match s'.getAppFn with
+      | .const ctorName _ =>
+        match kenv.find? ctorName with
+        | some (.ctorInfo cinfo) =>
+          let sArgs := s'.getAppArgs
+          if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
+            specClassConclusionMatch kenv specClass sArgs[cinfo.numParams + idx]! fuel
+          else .notMatched
+        | _ => .notMatched
+      | _ => .notMatched
+    | _ =>
+      let fn := ty.getAppFn
+      let args := ty.getAppArgs
+      match fn with
+      | .mdata _ inner =>
+        specClassConclusionMatch kenv specClass (mkAppN inner args) fuel
+      | .lam .. =>
+        specClassConclusionMatch kenv specClass (fn.beta args) fuel
+      | .letE _ _ val body _ =>
+        specClassConclusionMatch kenv specClass (mkAppN (body.instantiate1 val) args) fuel
+      | .proj structName idx s =>
+        let s' := normalizeDefIdArg kenv s fuel
+        match s'.getAppFn with
+        | .const ctorName _ =>
+          match kenv.find? ctorName with
+          | some (.ctorInfo cinfo) =>
+            let sArgs := s'.getAppArgs
+            if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
+              specClassConclusionMatch kenv specClass (mkAppN sArgs[cinfo.numParams + idx]! args) fuel
+            else .notMatched
+          | _ => .notMatched
+        | _ => .notMatched
+      | .const c lvls =>
+        if c == specClass then
+          .matched (normalizeDefIdArg kenv (args[0]?.getD (.bvar 0)))
+        else
+          match kenv.find? c with
+          | some (.defnInfo v) =>
+            if v.levelParams.length == lvls.length then
+              specClassConclusionMatch kenv specClass
+                ((v.value.instantiateLevelParams v.levelParams lvls).beta args) fuel
+            else .notMatched
+          | _ => .notMatched
+      | _ => .notMatched
 
-    Scans the whole kernel environment rather than the instance table, so that neither
-    `attribute [-instance]`, a plain non-`instance` `def`, nor an alias-typed instance
-    can hide a competing specification for the same `defId`. The only constants skipped
-    are the structure auxiliaries Lean generates next to the class itself (e.g.
-    `ItemSpec.mk._flat_ctor`): names under `specClass` that originate in the module
-    declaring `specClass`. -/
+/-- Compatibility wrapper returning `some arg` when `ty` concludes in `specClass arg`
+    (or `some (.bvar 0)` on fuel exhaustion so callers fail closed). -/
+def specClassConclusionArg? (kenv : Kernel.Environment) (specClass : Name) (ty : Expr)
+    (fuel : Nat := 64) : Option Expr :=
+  match specClassConclusionMatch kenv specClass ty fuel with
+  | .matched arg => some arg
+  | .fuelExhausted => some (.bvar 0)
+  | .notMatched => none
+
+/-- Compute the exact subset of imported modules that transitively import the module
+    declaring `declName` (plus that module itself). Any module outside this set cannot
+    reference `declName` directly or transitively under any kernel reduction. -/
+private def modulesReachingDecl (privEnv : Environment) (declName : Name) : Array Bool :=
+  let nMods := privEnv.header.moduleNames.size
+  match privEnv.getModuleIdxFor? declName with
+  | none => Array.replicate nMods false
+  | some targetIdx => Id.run do
+    let mut modIdxMap : Std.HashMap Name Nat := {}
+    for i in [:nMods] do
+      modIdxMap := modIdxMap.insert privEnv.header.moduleNames[i]! i
+    let mut r := Array.replicate nMods false
+    if targetIdx.toNat < nMods then
+      r := r.set! targetIdx.toNat true
+    for _ in [:nMods] do
+      let mut changed := false
+      for i in [:nMods] do
+        if !r[i]! then
+          for imp in privEnv.header.moduleData[i]!.imports do
+            if let some j := modIdxMap[imp.module]? then
+              if r[j]! then
+                r := r.set! i true
+                changed := true
+                break
+      if !changed then break
+    return r
+
+/-- Collect all kernel constants declared in any module that transitively imports
+    `specClass`'s module, plus all local constants in `kenv.constants.map₂`. -/
+private def constantsReachingSpecClass (privEnv : Environment) (specClass : Name) :
+    Array (Name × ConstantInfo) := Id.run do
+  let kenv := privEnv.checked.get
+  let reaches := modulesReachingDecl privEnv specClass
+  let mut seen : NameSet := {}
+  let mut out : Array (Name × ConstantInfo) := #[]
+  for i in [:reaches.size] do
+    if reaches[i]! then
+      let mdata := privEnv.header.moduleData[i]!
+      for n in mdata.constNames do
+        if !seen.contains n then
+          if let some ci := kenv.find? n then
+            seen := seen.insert n
+            out := out.push (n, ci)
+      for n in mdata.extraConstNames do
+        if !seen.contains n then
+          if let some ci := kenv.find? n then
+            seen := seen.insert n
+            out := out.push (n, ci)
+  for (n, ci) in kenv.constants.map₂.toList do
+    if !seen.contains n then
+      seen := seen.insert n
+      out := out.push (n, ci)
+  return out
+
+/-- Pure fast-skip test: returns `true` only when `ci.type`'s conclusion head is a
+    non-reducible kernel constant (inductive, constructor, axiom, opaque, or theorem)
+    different from `specClass`, or a non-reducible non-constant (`sort`, `lit`, `bvar`).
+    Never skips `.letE`, `.lam`, `.mdata`, `.proj`, `.defnInfo`, `.recInfo`, or `.quotInfo`. -/
+private def canFastSkipSpecCandidate (kenv : Kernel.Environment) (specClass : Name)
+    (ci : ConstantInfo) : Bool :=
+  let concl := ci.type.getForallBody
+  match concl with
+  | .letE .. | .mdata .. | .proj .. => false
+  | _ =>
+    match concl.getAppFn with
+    | .const head _ =>
+      if head == specClass then false
+      else match kenv.find? head with
+        | some (.inductInfo _) | some (.ctorInfo _) | some (.axiomInfo _)
+        | some (.opaqueInfo _) | some (.thmInfo _) => true
+        | _ => false
+    | .lam .. | .letE .. | .mdata .. | .proj .. => false
+    | _ => true
+
+/-- Pure scan for all non-constructor constants in modules reaching `specClass` (plus
+    local constants) whose type concludes (up to `getForallBody`, `.mdata`, `.letE`,
+    `.lam`, `.proj`, and `.defnInfo` unfolding) in `specClass "<defId>"`, or in
+    `specClass e` for a non-literal `e` (or exhausts fuel, fail-closed).
+
+    Scans the kernel environment rather than the instance table, so `attribute [-instance]`,
+    plain non-`instance` `def`s, `let`/`lam`/`proj`-wrapped types, and alias chains
+    cannot hide a competing specification for the same `defId`. -/
 def specInstanceCandidates (privEnv : Environment) (specClass : Name) (defId : String) :
-    Array Name :=
+    Array Name := Id.run do
   let kenv := privEnv.checked.get
   let classMod? := originModule? privEnv specClass
-  -- `skip` memoises conclusion heads already known not to be definitions (inductives,
-  -- structures, axioms, ...), so the alias-unfolding path only runs for the rare
-  -- declarations whose type is headed by a definition.
-  let (found, _) := kenv.constants.fold (init := ((#[] : Array Name), ({} : NameSet)))
-    fun (acc, skip) n ci =>
-      match ci with
-      | .defnInfo _ | .opaqueInfo _ | .axiomInfo _ | .thmInfo _ =>
-        match ci.type.getForallBody.getAppFn with
-        | .const head _ =>
-          if skip.contains head then (acc, skip)
-          else
-            let headIsDefn := match kenv.find? head with
-              | some (.defnInfo _) => true
-              | _ => false
-            if head != specClass && !headIsDefn then (acc, skip.insert head)
+  let mut found : Array Name := #[]
+  for (n, ci) in constantsReachingSpecClass privEnv specClass do
+    match ci with
+    | .defnInfo _ | .opaqueInfo _ | .axiomInfo _ | .thmInfo _ =>
+      if specClass.isPrefixOf n && originModule? privEnv n == classMod? then
+        continue
+      if canFastSkipSpecCandidate kenv specClass ci then
+        continue
+      match specClassConclusionMatch kenv specClass ci.type with
+      | .notMatched => pure ()
+      | .fuelExhausted => found := found.push n
+      | .matched arg =>
+        match arg with
+        | Expr.lit (Literal.strVal s) =>
+          if s == defId then found := found.push n
+        | _ => found := found.push n
+    | _ => pure ()
+  return found.qsort Name.lt
+
+/-- Full `MetaM` scan for all non-constructor constants in modules reaching `specClass`
+    (plus local constants) whose type reduces under `Meta.withTransparency .all`
+    (`Meta.forallTelescopeReducing` + `Meta.whnf`, covering β/ζ/δ/ι/projection/quotient
+    reductions) to `specClass "<defId>"`, or to `specClass e` for a non-literal `e`, or
+    fails to reduce cleanly (fail-closed). -/
+def specInstanceCandidatesMeta (specClass : Name) (defId : String) : MetaM (Array Name) := do
+  let privEnv := (← getEnv).setExporting false
+  let kenv := privEnv.checked.get
+  let classMod? := originModule? privEnv specClass
+  let mut found : Array Name := #[]
+  for (n, ci) in constantsReachingSpecClass privEnv specClass do
+    match ci with
+    | .defnInfo _ | .opaqueInfo _ | .axiomInfo _ | .thmInfo _ =>
+      if specClass.isPrefixOf n && originModule? privEnv n == classMod? then
+        continue
+      if canFastSkipSpecCandidate kenv specClass ci then
+        continue
+      let isCandidate ← try
+        Meta.withTransparency .all do
+          Meta.forallTelescopeReducing ci.type fun _ body => do
+            let body ← Meta.whnf body
+            if body.getAppFn.constName? == some specClass then
+              let arg := body.getAppArgs[0]?.getD (.bvar 0)
+              let arg ← Meta.whnf arg
+              match arg with
+              | Expr.lit (Literal.strVal s) => return (s == defId)
+              | _ => return true
             else
-              match specClassConclusionArg? kenv specClass ci.type with
-              | none => (acc, skip)
-              | some arg =>
-                if specClass.isPrefixOf n && originModule? privEnv n == classMod? then (acc, skip)
-                else
-                  match arg with
-                  | Expr.lit (Literal.strVal s) =>
-                    if s == defId then (acc.push n, skip) else (acc, skip)
-                  | _ => (acc.push n, skip)
-        | _ => (acc, skip)
-      | _ => (acc, skip)
-  found.qsort Name.lt
+              return false
+      catch _ =>
+        -- Fail closed if reduction throws (e.g. heartbeat/recursion limit).
+        pure true
+      if isCandidate then
+        found := found.push n
+    | _ => pure ()
+  return found.qsort Name.lt
 
 /-- Resolve *the* specification instance of `specClass` for `defId`, failing closed
     unless exactly one candidate constant exists and typeclass synthesis selects it.
 
     A verification claim is stated against whichever instance resolved when the claim
     was elaborated. If a second instance for the same `defId` exists (declared later,
-    with higher priority, or after erasing the first), a certificate could be checked
-    against a stronger specification than the one actually verified; uniqueness rules
-    that substitution out. -/
+    with higher priority, after erasing the first, or hidden behind `let`/beta/projection/
+    alias/recursor reductions), a certificate could be checked against a stronger
+    specification than the one actually verified; uniqueness rules that substitution out. -/
 def resolveUniqueSpecInstance (specName : Name) (specClass : Name) (defId : String) :
     MetaM (Except AuditViolation Expr) := do
-  let privEnv := (← getEnv).setExporting false
-  let candidates := specInstanceCandidates privEnv specClass defId
+  let candidates ← specInstanceCandidatesMeta specClass defId
   if candidates.isEmpty then
     return .error (.specStrengthCertMissing specName
       s!"no {specClass} instance found for \"{defId}\"")
@@ -1688,7 +2073,8 @@ def resolveUniqueSpecInstance (specName : Name) (specClass : Name) (defId : Stri
     `expectedEns?`; typeclass certificates need `expectedDefId?` and must mention the
     unique specification instance for that `defId`. -/
 private def checkCertBinding (specName certDecl : Name) (ty : Expr)
-    (expectedReq? expectedEns? : Option Expr) (expectedDefId? : Option String) :
+    (expectedReq? expectedEns? : Option Expr) (expectedDefId? : Option String)
+    (expectedEnvAssumed? : Option Expr := none) :
     MetaM (Option AuditViolation) := do
   let fn := ty.getAppFn
   let args := ty.getAppArgs
@@ -1698,6 +2084,8 @@ private def checkCertBinding (specName certDecl : Name) (ty : Expr)
   let some head := fn.constName?
     | return some (invalid "not a SpecStrengthCert type")
   if directCertHeads.contains head then
+    if expectedEnvAssumed?.isSome then
+      return some (invalid "expected Modular*SpecCert binding envAssumed, got")
     if args.size != 4 then
       return some (invalid "malformed direct certificate type")
     match expectedReq?, expectedEns? with
@@ -1710,12 +2098,27 @@ private def checkCertBinding (specName certDecl : Name) (ty : Expr)
     | _, _ =>
       return some (invalid
         "unbound certificate (both expectedReq? and expectedEns? are required to bind a direct certificate to its specification)")
+  else if directModularCertHeads.contains head then
+    if args.size != 3 then
+      return some (invalid "malformed direct modular certificate type")
+    match expectedEnvAssumed?, expectedReq?, expectedEns? with
+    | some expEnv, some expPre, some expPost =>
+      unless (← Meta.isDefEq args[0]! expEnv) do
+        return some (invalid "rely predicate (envAssumed) mismatch")
+      unless (← Meta.isDefEq args[1]! expPre) do
+        return some (invalid "precondition mismatch")
+      unless (← Meta.isDefEq args[2]! expPost) do
+        return some (invalid "postcondition mismatch")
+      return none
+    | _, _, _ =>
+      return some (invalid
+        "unbound modular certificate (expectedEnvAssumed?, expectedReq?, and expectedEns? are all required)")
   else
     match classCertHeads.find? (·.1 == head) with
     | none => return some (invalid "not a SpecStrengthCert type")
     | some (_, specClass) =>
-      if expectedReq?.isSome || expectedEns?.isSome then
-        return some (invalid "expected direct SpecStrengthCert/MultiMutantSpecCert, got")
+      if expectedReq?.isSome || expectedEns?.isSome || expectedEnvAssumed?.isSome then
+        return some (invalid "expected direct SpecStrengthCert/MultiMutantSpecCert/Modular*SpecCert, got")
       let some defId := expectedDefId?
         | return some (invalid
             "unbound certificate (expectedDefId? is required to bind a typeclass certificate to its specification)")
@@ -1812,7 +2215,8 @@ def auditSpecStrengthCertInEnv
     (expectedEns? : Option Expr := none)
     (policy : AuditPolicy := { AuditPolicy.constructive with checkStatementOrigin := false })
     (expectedDefId? : Option String := none)
-    (requiredCategories : List MutantCategory := []) :
+    (requiredCategories : List MutantCategory := [])
+    (expectedEnvAssumed? : Option Expr := none) :
     MetaM AuditVerdict := do
   let t0 ← IO.monoNanosNow
   let reject (vs : Array AuditViolation) : MetaM AuditVerdict := do
@@ -1829,41 +2233,76 @@ def auditSpecStrengthCertInEnv
     | none => reject #[.missingDeclaration certDecl]
     | some ci =>
       let ty ← Meta.whnf ci.type
-      match (← checkCertBinding specName certDecl ty expectedReq? expectedEns? expectedDefId?) with
+      match (← checkCertBinding specName certDecl ty expectedReq? expectedEns? expectedDefId?
+          expectedEnvAssumed?) with
       | some v => reject #[v]
       | none =>
-        let certExpr := mkConst certDecl (ci.levelParams.map mkLevelParam)
-        let head := ty.getAppFn.constName?.getD .anonymous
-        match (← checkCategoryCoverage certDecl head certExpr requiredCategories) with
-        | some v => reject #[v]
-        | none =>
-          -- Audit the certificate declaration itself so `sorry`-faked or unsound certs
-          -- are rejected.
-          let envVerdict ← liftM <| auditDeclsInEnvIO privEnv #[certDecl] policy
+        -- Audit the certificate declaration BEFORE reducing it via `Meta.whnf` in
+        -- `checkCategoryCoverage`, so `sorry`-faked, `partial`, `unsafe`, or
+        -- `Classical.choice`-tainted certs always fail with their true soundness
+        -- violation rather than being masked by `.specStrengthCoverageGap` (and
+        -- unaudited terms are never evaluated by `whnf`).
+        let envVerdict ← liftM <| auditDeclsInEnvIO privEnv #[certDecl] policy
+        match envVerdict with
+        | .rejected vs s =>
           let t1 ← IO.monoNanosNow
-          let elapsedMicros := (t1 - t0) / 1000
-          return match envVerdict with
-            | .ok s => .ok { s with elapsedMicros }
-            | .rejected vs s => .rejected vs { s with elapsedMicros }
+          return .rejected vs { s with elapsedMicros := (t1 - t0) / 1000 }
+        | .ok s =>
+          let certExpr := mkConst certDecl (ci.levelParams.map mkLevelParam)
+          let head := ty.getAppFn.constName?.getD .anonymous
+          match (← checkCategoryCoverage certDecl head certExpr requiredCategories) with
+          | some v =>
+            let t1 ← IO.monoNanosNow
+            return .rejected #[v] { s with elapsedMicros := (t1 - t0) / 1000 }
+          | none =>
+            let t1 ← IO.monoNanosNow
+            return .ok { s with elapsedMicros := (t1 - t0) / 1000 }
+
+/-- Pair a 2-ary precondition `pre : A → M → Prop` and 4-ary postcondition
+    `post : A → M → R → M → Prop` into `A × M → Prop` and `A × M → R × M → Prop`. -/
+private def pairStatefulContract (pre post : Expr) : MetaM (Option (Expr × Expr)) := do
+  let postTy ← Meta.whnf (← Meta.inferType post)
+  Meta.forallBoundedTelescope postTy (some 4) fun xs _ => do
+    if xs.size != 4 then
+      return none
+    else
+      let aTy ← Meta.inferType xs[0]!
+      let mTy ← Meta.inferType xs[1]!
+      let rTy ← Meta.inferType xs[2]!
+      let inTy ← Meta.mkAppM ``Prod #[aTy, mTy]
+      let outTy ← Meta.mkAppM ``Prod #[rTy, mTy]
+      let req ← Meta.withLocalDeclD `p inTy fun p => do
+        Meta.mkLambdaFVars #[p]
+          (mkApp2 pre (← Meta.mkAppM ``Prod.fst #[p]) (← Meta.mkAppM ``Prod.snd #[p]))
+      let ens ← Meta.withLocalDeclD `p inTy fun p =>
+        Meta.withLocalDeclD `r outTy fun r => do
+          Meta.mkLambdaFVars #[p, r]
+            (mkApp4 post (← Meta.mkAppM ``Prod.fst #[p]) (← Meta.mkAppM ``Prod.snd #[p])
+              (← Meta.mkAppM ``Prod.fst #[r]) (← Meta.mkAppM ``Prod.snd #[r]))
+      return some (req, ens)
 
 /-- Claim-bound specification-strength gate.
 
-    Reads the contract straight out of the audited verification claim: `claimDecl` must
-    be a `VerificationResult c` or `StatefulVerificationResult c`, and the certificate
-    must be a direct `SpecStrengthCert` / `MultiMutantSpecCert` / `DeterministicSpecCert`
-    over exactly `c.pre` / `c.post` (paired as `(args, mem)` / `(ret, mem')` for stateful
-    claims). Because the expected `(req, ens)` come from the claim's own statement, a
-    certificate for any other specification (a stronger sibling instance, a shadowing
-    instance, a spec that was never the one verified) cannot be substituted.
+    Reads the contract straight out of the audited verification claim (`claimDecl`, which
+    must be a `.thmInfo` when `requireClaimTheorem := true`):
+    - `VerificationResult c`: binds a direct `SpecStrengthCert` / `MultiMutantSpecCert` /
+      `DeterministicSpecCert` against `(c.pre, c.post)`.
+    - `StatefulVerificationResult c` / `TotalVerificationResult c`: binds a direct
+      certificate against paired `(c.pre, c.post)` over `(List Value × Memory, Value × Memory)`.
+    - `ModularVerificationResult c`: binds a direct `ModularSpecStrengthCert` /
+      `ModularMultiMutantSpecCert` / `ModularDeterministicSpecCert` against ALL THREE
+      components `(c.envAssumed, c.pre, c.post)` (witnessing rely non-vacuity as well as
+      pre/post strength).
 
-    `ModularVerificationResult` claims are rejected here on purpose: their strength also
-    depends on a non-vacuous rely predicate `envAssumed`, which only the typeclass
-    certificates (`ModularItem*Cert.handler_valid`) witness. -/
+    Because the expected contract comes from the claim's own statement, a certificate
+    for any other specification (a stronger sibling instance, a shadowing instance, or a
+    spec that was never verified) cannot be substituted. -/
 def auditClaimSpecStrengthInEnv
     (claimDecl : Name)
     (certDecl? : Option Name)
     (policy : AuditPolicy := { AuditPolicy.constructive with checkStatementOrigin := false })
-    (requiredCategories : List MutantCategory := []) :
+    (requiredCategories : List MutantCategory := [])
+    (requireClaimTheorem : Bool := true) :
     MetaM AuditVerdict := do
   let t0 ← IO.monoNanosNow
   let reject (vs : Array AuditViolation) : MetaM AuditVerdict := do
@@ -1873,56 +2312,56 @@ def auditClaimSpecStrengthInEnv
   match privEnv.checked.get.find? claimDecl with
   | none => reject #[.missingDeclaration claimDecl]
   | some ci =>
-    let ty ← Meta.whnf ci.type
-    let args := ty.getAppArgs
-    let head := ty.getAppFn.constName?.getD .anonymous
-    let tyStr := toString (← Meta.ppExpr ty)
-    let notClaim (why : String) : AuditViolation :=
-      .specStrengthCertInvalidType claimDecl claimDecl s!"{why}: {tyStr}"
-    if args.size != 1 then
-      reject #[notClaim "claim is not a VerificationResult / StatefulVerificationResult"]
-    else if head == ``VerificationResult then
-      let c := args[0]!
-      let pre ← Meta.mkAppM ``Claim.pre #[c]
-      let post ← Meta.mkAppM ``Claim.post #[c]
-      auditSpecStrengthCertInEnv claimDecl certDecl? (some pre) (some post) policy none
-        requiredCategories
-    else if head == ``StatefulVerificationResult then
-      let c := args[0]!
-      let pre ← Meta.mkAppM ``StatefulClaim.pre #[c]
-      let post ← Meta.mkAppM ``StatefulClaim.post #[c]
-      -- `pre : A → M → Prop`, `post : A → M → R → M → Prop`; the harness states the
-      -- contract over `In := A × M` and `Out := R × M`.
-      let postTy ← Meta.whnf (← Meta.inferType post)
-      Meta.forallBoundedTelescope postTy (some 4) fun xs _ => do
-        if xs.size != 4 then
-          reject #[notClaim "stateful claim postcondition is not 4-ary"]
-        else
-          let aTy ← Meta.inferType xs[0]!
-          let mTy ← Meta.inferType xs[1]!
-          let rTy ← Meta.inferType xs[2]!
-          let inTy ← Meta.mkAppM ``Prod #[aTy, mTy]
-          let outTy ← Meta.mkAppM ``Prod #[rTy, mTy]
-          let req ← Meta.withLocalDeclD `p inTy fun p => do
-            Meta.mkLambdaFVars #[p]
-              (mkApp2 pre (← Meta.mkAppM ``Prod.fst #[p]) (← Meta.mkAppM ``Prod.snd #[p]))
-          let ens ← Meta.withLocalDeclD `p inTy fun p =>
-            Meta.withLocalDeclD `r outTy fun r => do
-              Meta.mkLambdaFVars #[p, r]
-                (mkApp4 post (← Meta.mkAppM ``Prod.fst #[p]) (← Meta.mkAppM ``Prod.snd #[p])
-                  (← Meta.mkAppM ``Prod.fst #[r]) (← Meta.mkAppM ``Prod.snd #[r]))
+    if requireClaimTheorem && !ci.isTheorem then
+      reject #[.notTheoremKind claimDecl (constantInfoKind ci)]
+    else
+      let ty ← Meta.whnf ci.type
+      let args := ty.getAppArgs
+      let head := ty.getAppFn.constName?.getD .anonymous
+      let tyStr := toString (← Meta.ppExpr ty)
+      let notClaim (why : String) : AuditViolation :=
+        .specStrengthCertInvalidType claimDecl claimDecl s!"{why}: {tyStr}"
+      if args.size != 1 then
+        reject #[notClaim "claim is not a supported VerificationResult"]
+      else if head == ``VerificationResult then
+        let c := args[0]!
+        let pre ← Meta.mkAppM ``Claim.pre #[c]
+        let post ← Meta.mkAppM ``Claim.post #[c]
+        auditSpecStrengthCertInEnv claimDecl certDecl? (some pre) (some post) policy none
+          requiredCategories
+      else if head == ``StatefulVerificationResult then
+        let c := args[0]!
+        let pre ← Meta.mkAppM ``StatefulClaim.pre #[c]
+        let post ← Meta.mkAppM ``StatefulClaim.post #[c]
+        match (← pairStatefulContract pre post) with
+        | none => reject #[notClaim "stateful claim postcondition is not 4-ary"]
+        | some (req, ens) =>
           auditSpecStrengthCertInEnv claimDecl certDecl? (some req) (some ens) policy none
             requiredCategories
-    else if head == ``ModularVerificationResult then
-      reject #[notClaim
-        "modular claims need a rely non-vacuity witness; use the ModularItem*Cert typeclass gate"]
-    else
-      reject #[notClaim "claim is not a VerificationResult / StatefulVerificationResult"]
+      else if head == ``TotalVerificationResult then
+        let c := args[0]!
+        let pre ← Meta.mkAppM ``TotalClaim.pre #[c]
+        let post ← Meta.mkAppM ``TotalClaim.post #[c]
+        match (← pairStatefulContract pre post) with
+        | none => reject #[notClaim "total claim postcondition is not 4-ary"]
+        | some (req, ens) =>
+          auditSpecStrengthCertInEnv claimDecl certDecl? (some req) (some ens) policy none
+            requiredCategories
+      else if head == ``ModularVerificationResult then
+        let c := args[0]!
+        let envAssumed ← Meta.mkAppM ``ModularClaim.envAssumed #[c]
+        let pre ← Meta.mkAppM ``ModularClaim.pre #[c]
+        let post ← Meta.mkAppM ``ModularClaim.post #[c]
+        auditSpecStrengthCertInEnv claimDecl certDecl? (some pre) (some post) policy none
+          requiredCategories (expectedEnvAssumed? := some envAssumed)
+      else
+        reject #[notClaim "claim is not a VerificationResult / StatefulVerificationResult / TotalVerificationResult / ModularVerificationResult"]
 
 /-- Shared implementation of the typeclass-synthesis gates: resolves the unique
     specification instance of `specClass` for `defId`, synthesizes a
     `multiCertClass` (falling back to `singleCertClass` unless `requireMultiMutant`)
-    certificate for exactly that instance, and audits every constant of the witness. -/
+    certificate for exactly that instance, audits every constant of the witness FIRST,
+    and then checks any required mutant-category coverage. -/
 private def auditSpecStrengthBySynthCore
     (specClass multiCertClass singleCertClass : Name)
     (defId : String) (policy : AuditPolicy) (requireMultiMutant : Bool)
@@ -1951,22 +2390,26 @@ private def auditSpecStrengthBySynthCore
         else s!"{singleCertClass} or {multiCertClass}"
       reject #[.specStrengthCertMissing specName s!"no {wanted} instance found for \"{defId}\""]
     | some (certInst, certHead) =>
-      match (← checkCategoryCoverage specName certHead certInst requiredCategories) with
-      | some v => reject #[v]
-      | none =>
-        match expressionEdges certInst with
-        | .error msg =>
-          reject #[.openTermExpression specName specName s!"synthesized cert instance: {msg}"]
-        | .ok constSet =>
-          let env ← getEnv
-          let privEnv := env.setExporting false
-          let targets := constSet.toArray.qsort Name.lt
-          let envVerdict ← liftM <| auditDeclsInEnvIO privEnv targets policy
+      match expressionEdges certInst with
+      | .error msg =>
+        reject #[.openTermExpression specName specName s!"synthesized cert instance: {msg}"]
+      | .ok constSet =>
+        let env ← getEnv
+        let privEnv := env.setExporting false
+        let targets := constSet.toArray.qsort Name.lt
+        let envVerdict ← liftM <| auditDeclsInEnvIO privEnv targets policy
+        match envVerdict with
+        | .rejected vs s =>
           let t1 ← IO.monoNanosNow
-          let elapsedMicros := (t1 - t0) / 1000
-          return match envVerdict with
-            | .ok s => .ok { s with elapsedMicros }
-            | .rejected vs s => .rejected vs { s with elapsedMicros }
+          return .rejected vs { s with elapsedMicros := (t1 - t0) / 1000 }
+        | .ok s =>
+          match (← checkCategoryCoverage specName certHead certInst requiredCategories) with
+          | some v =>
+            let t1 ← IO.monoNanosNow
+            return .rejected #[v] { s with elapsedMicros := (t1 - t0) / 1000 }
+          | none =>
+            let t1 ← IO.monoNanosNow
+            return .ok { s with elapsedMicros := (t1 - t0) / 1000 }
 
 /-- `MetaM` gate using typeclass synthesis to locate an `ItemSpecStrengthCert` (or
     `ItemMultiMutantCert`) for the unique `ItemSpec defId`, rejecting fail-closed if the
@@ -2519,6 +2962,18 @@ instance fuchsiaUsercopyCopyinModularSingleCert :
   handler_valid := fuchsiaHermeticCopyWitnessHandler_valid
   cert := fuchsiaUsercopyCopyinMultiCert.toSpecStrengthCert
 
+/-- Direct claim-bound multi-mutant certificate for `ModularVerificationResult`
+    of `fuchsia_usercopy::usercopy_copyin_bracketed` (constructive: `[propext, Quot.sound]`
+    via `Trusted.ITree.ret`, zero `Classical.choice`). -/
+def fuchsiaUsercopyCopyinModularDirectMultiCert :
+    ModularMultiMutantSpecCert
+      fuchsiaHermeticCopyRely
+      fuchsiaUsercopyCopyinPre
+      fuchsiaUsercopyCopyinPost where
+  handler := fuchsiaHermeticCopyWitnessHandler
+  handler_valid := fuchsiaHermeticCopyWitnessHandler_valid
+  cert := fuchsiaUsercopyCopyinMultiCert
+
 /-- Proof that `fuchsiaUsercopyCopyinMultiCert` covers all 4 required usercopy mutant categories. -/
 theorem fuchsiaUsercopyCopyin_covers_required_categories :
     fuchsiaUsercopyCopyinMultiCert.coversAllCategories
@@ -2573,6 +3028,17 @@ theorem fuchsiaUsercopyCopyin_deterministic :
             [ .scalar { bits := fo, sizeBytes := 8 }
             , .scalar { bits := dest_len - fo, sizeBytes := 8 } ] := e2
         rw [e1', e2', hm1', hm2']
+
+/-- Direct claim-bound deterministic certificate for `ModularVerificationResult`
+    of `fuchsia_usercopy::usercopy_copyin_bracketed` (constructive: `[propext, Quot.sound]`
+    via `Trusted.ITree.ret`, zero `Classical.choice`). -/
+theorem fuchsiaUsercopyCopyinModularDirectDetCert :
+    ModularDeterministicSpecCert
+      fuchsiaHermeticCopyRely
+      fuchsiaUsercopyCopyinPre
+      fuchsiaUsercopyCopyinPost where
+  handler_nonvacuous := ⟨fuchsiaHermeticCopyWitnessHandler, fuchsiaHermeticCopyWitnessHandler_valid⟩
+  cert := fuchsiaUsercopyCopyin_deterministic
 
 /-! ### Diagnostic Contrast: Weak Upper-Bound-Only Spec (`weak_vmo_subslice_upper_bound_only`) -/
 

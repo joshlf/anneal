@@ -844,6 +844,174 @@ run_cmd do
     , formatVerdictTags "R11_claim_bound_coverage_gap" vCoverage
     , formatVerdictTags "R11_not_a_verification_claim" vNotClaim ]
 
+/-! ## Pass A1 Hardening Regressions: Shadowing, Scoped `csimp`, Ordering, Modular/Total Claims -/
+
+/-- Type-level refutation for direct `ModularSpecStrengthCert` with vacuous rely predicate. -/
+theorem testA1_modular_vacuous_rely_refuted :
+    ModularSpecStrengthCert (fun _ => False) fuchsiaUsercopyCopyinPre fuchsiaUsercopyCopyinPost → False :=
+  no_modular_cert_of_vacuous_envAssumed _ _
+
+/--
+info: A1_let_typed_instance_shadowing: rejected [specInstanceAmbiguous]
+A1_beta_redex_instance_shadowing: rejected [specInstanceAmbiguous]
+A1_deep_alias_instance_shadowing: rejected [specInstanceAmbiguous]
+A1_proj_typed_instance_shadowing: rejected [specInstanceAmbiguous]
+A1_closed_scoped_csimp_caught: rejected [compilerOverrideAttribute]
+A1_sorry_multi_cert_reports_sorry_not_coverage_gap: rejected [sorryAxiomReached]
+A1_literal_false_eq_true_native_ax: rejected [unapprovedAxiom]
+A1_forged_unsafe_rec_not_skipped: ok
+A1_claim_bound_modular_multi_cert: ok []
+A1_claim_bound_modular_det_cert: ok []
+A1_claim_bound_modular_wrong_envAssumed: rejected [specStrengthCertInvalidType]
+A1_claim_bound_modular_coverage_gap: rejected [specStrengthCoverageGap]
+A1_claim_bound_total_cert: ok []
+A1_claim_bound_non_theorem_rejected: rejected [notTheoremKind]
+-/
+#guard_msgs in
+run_cmd do
+  let mut lines : List String := []
+  let kw := "sor" ++ "ry"
+
+  -- A1-2a/b/c: `let`-wrapped, beta-redex, and 9-deep alias chain shadowing instances
+  -- used to slip past `specInstanceCandidates` (fail-open); all three are now rejected.
+  let envLet ← elabInSandbox <|
+    "open Trusted.VerificationResult Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "instance a1LetWeak : (let T := ItemSpec \"proto::a1let\"; T) := { pre := fun _ => True }\n" ++
+    "instance a1LetStrong : ItemSpec \"proto::a1let\" := { pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n" ++
+    "instance a1LetCert : ItemMultiMutantCert \"proto::a1let\" := { cert := fxfsVmoSubsliceMultiCert }\n"
+  let vLet ← withSandboxEnv envLet <| auditItemSpecStrengthBySynth "proto::a1let"
+  liftIO <| assertRejectedWithTag "A1_let_typed_instance_shadowing" vLet "specInstanceAmbiguous"
+  lines := lines ++ [formatVerdictTags "A1_let_typed_instance_shadowing" vLet]
+
+  let envLam ← elabInSandbox <|
+    "open Trusted.VerificationResult Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "instance a1LamWeak : (fun s => ItemSpec s) \"proto::a1lam\" := { pre := fun _ => True }\n" ++
+    "instance a1LamStrong : ItemSpec \"proto::a1lam\" := { pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n" ++
+    "instance a1LamCert : ItemMultiMutantCert \"proto::a1lam\" := { cert := fxfsVmoSubsliceMultiCert }\n"
+  let vLam ← withSandboxEnv envLam <| auditItemSpecStrengthBySynth "proto::a1lam"
+  liftIO <| assertRejectedWithTag "A1_beta_redex_instance_shadowing" vLam "specInstanceAmbiguous"
+  lines := lines ++ [formatVerdictTags "A1_beta_redex_instance_shadowing" vLam]
+
+  let envDeep ← elabInSandbox <|
+    "open Trusted.VerificationResult Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "abbrev A1D1 := ItemSpec \"proto::a1deep\"\n" ++
+    "abbrev A1D2 := A1D1\nabbrev A1D3 := A1D2\nabbrev A1D4 := A1D3\nabbrev A1D5 := A1D4\n" ++
+    "abbrev A1D6 := A1D5\nabbrev A1D7 := A1D6\nabbrev A1D8 := A1D7\nabbrev A1D9 := A1D8\n" ++
+    "instance a1DeepWeak : A1D9 := { pre := fun _ => True }\n" ++
+    "instance a1DeepStrong : ItemSpec \"proto::a1deep\" := { pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n" ++
+    "instance a1DeepCert : ItemMultiMutantCert \"proto::a1deep\" := { cert := fxfsVmoSubsliceMultiCert }\n"
+  let vDeep ← withSandboxEnv envDeep <| auditItemSpecStrengthBySynth "proto::a1deep"
+  liftIO <| assertRejectedWithTag "A1_deep_alias_instance_shadowing" vDeep "specInstanceAmbiguous"
+  lines := lines ++ [formatVerdictTags "A1_deep_alias_instance_shadowing" vDeep]
+
+  let envProj ← elabInSandbox <|
+    "open Trusted.VerificationResult Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "abbrev a1WrapPair : Type 1 × Type := (ItemSpec \"proto::a1proj\", Nat)\n" ++
+    "instance a1ProjWeak : a1WrapPair.1 := { pre := fun _ => True }\n" ++
+    "instance a1ProjStrong : ItemSpec \"proto::a1proj\" := { pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n" ++
+    "instance a1ProjCert : ItemMultiMutantCert \"proto::a1proj\" := { cert := fxfsVmoSubsliceMultiCert }\n"
+  let vProj ← withSandboxEnv envProj <| auditItemSpecStrengthBySynth "proto::a1proj"
+  liftIO <| assertRejectedWithTag "A1_proj_typed_instance_shadowing" vProj "specInstanceAmbiguous"
+  lines := lines ++ [formatVerdictTags "A1_proj_typed_instance_shadowing" vProj]
+
+  -- A1-3: closed-scope `@[scoped csimp]` used to vanish from `CSimp.ext.getState`
+  -- once the namespace ended; scanning `StateStack.newEntries` / `scopedEntries` catches it.
+  let envScoped ← elabInSandbox <|
+    "def a1MyAdd (a b : Nat) : Nat := a + b\n" ++
+    "namespace A1HiddenScope\n" ++
+    "@[scoped csimp] theorem a1ScopedAdd : @Nat.add = @a1MyAdd := by funext a b; rfl\n" ++
+    "end A1HiddenScope\n" ++
+    "theorem a1UsesAdd : Nat.add 2 3 = 5 := rfl\n"
+  let vScoped ← liftIO <| auditDeclsInEnvIO envScoped #[`a1UsesAdd] { checkStatementOrigin := false }
+  liftIO <| assertRejectedWithTag "A1_closed_scoped_csimp_caught" vScoped "compilerOverrideAttribute"
+  lines := lines ++ [formatVerdictTags "A1_closed_scoped_csimp_caught" vScoped]
+
+  -- A1-4: a `sorry`-faked `MultiMutantSpecCert` checked with non-empty `requiredCategories`
+  -- must report `.sorryAxiomReached`, NOT `.specStrengthCoverageGap`.
+  let envSorryMulti ← elabInSandbox <|
+    "open Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "def a1Pre (n : Nat) : Prop := n = 0\n" ++
+    "def a1Post (_ : Nat) (y : Nat) : Prop := y = 0\n" ++
+    s!"def a1FakeMulti : MultiMutantSpecCert a1Pre a1Post := by {kw}\n"
+  let vSorryMulti ← withSandboxEnv envSorryMulti <|
+    auditSpecStrengthCertInEnv `a1.sorryMulti (some `a1FakeMulti)
+      (expectedReq? := some (mkConst `a1Pre))
+      (expectedEns? := some (mkConst `a1Post))
+      (requiredCategories := [.wrongReturn])
+  liftIO <| assertRejectedWithTag "A1_sorry_multi_cert_reports_sorry_not_coverage_gap" vSorryMulti "sorryAxiomReached"
+  lines := lines ++ [formatVerdictTags "A1_sorry_multi_cert_reports_sorry_not_coverage_gap" vSorryMulti]
+
+  -- A1-5: literal `false = true` native-named axiom rejected even under `allowProvisionalNative`.
+  let envFalseNat ← elabInSandbox <|
+    "axiom a1Bad._native.native_decide.ax_1_1 : false = true\n" ++
+    "theorem a1UsesFalseNat : False := Bool.noConfusion a1Bad._native.native_decide.ax_1_1\n"
+  let vFalseNat ← liftIO <| auditDeclsInEnvIO envFalseNat #[`a1UsesFalseNat]
+    { checkStatementOrigin := false, allowProvisionalNative := true }
+  liftIO <| assertRejectedWithTag "A1_literal_false_eq_true_native_ax" vFalseNat "unapprovedAxiom"
+  lines := lines ++ [formatVerdictTags "A1_literal_false_eq_true_native_ax" vFalseNat]
+
+  -- A1-7a: forged `foo._unsafe_rec` with mismatched type is NOT treated as a dead codegen companion.
+  let envForgedRec ← elabInSandbox <|
+    "def a1SafeParent : Nat := 0\n" ++
+    "partial def a1SafeParent._unsafe_rec (n : Nat) : Nat := a1SafeParent._unsafe_rec n\n"
+  let some forgedCi := envForgedRec.checked.get.find? `a1SafeParent._unsafe_rec
+    | throwError "expected a1SafeParent._unsafe_rec in sandbox"
+  if isCodegenUnsafeRec envForgedRec none forgedCi then
+    throwError "forged-type _unsafe_rec was wrongly classified as codegen companion"
+  lines := lines ++ ["A1_forged_unsafe_rec_not_skipped: ok"]
+
+  -- A1-6: claim-bound `ModularVerificationResult` & `TotalVerificationResult` gates,
+  -- plus rejection of non-theorem (`axiom`) claim declarations.
+  let envModClaims ← elabInSandbox <|
+    "open Trusted.VerificationResult Trusted.MirSemantics Trusted.MirAst\n" ++
+    "open Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "axiom a1Body : CapturedMir\n" ++
+    "noncomputable def a1ModClaim : ModularClaim :=\n" ++
+    "  { body := a1Body, envAssumed := fuchsiaHermeticCopyRely,\n" ++
+    "    pre := fuchsiaUsercopyCopyinPre, post := fuchsiaUsercopyCopyinPost }\n" ++
+    s!"theorem a1ModVerified : ModularVerificationResult a1ModClaim := by {kw}\n" ++
+    "noncomputable def a1ModVacuousRelyClaim : ModularClaim :=\n" ++
+    "  { body := a1Body, envAssumed := fun _ => False,\n" ++
+    "    pre := fuchsiaUsercopyCopyinPre, post := fuchsiaUsercopyCopyinPost }\n" ++
+    s!"theorem a1ModVacuousVerified : ModularVerificationResult a1ModVacuousRelyClaim := by {kw}\n" ++
+    "noncomputable def a1TotalClaim : TotalClaim :=\n" ++
+    "  { body := a1Body, pre := fuchsiaUsercopyCopyinPre, post := fuchsiaUsercopyCopyinPost }\n" ++
+    s!"theorem a1TotalVerified : TotalVerificationResult a1TotalClaim := by {kw}\n" ++
+    "noncomputable def a1SimpleClaim : Claim :=\n" ++
+    "  { body := a1Body, pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n" ++
+    "axiom a1AxiomClaim : VerificationResult a1SimpleClaim\n"
+  let usercopyCats : List MutantCategory :=
+    [.wrongBranchTag, .truncatedLength, .offByOneScalar, .unpreservedFrame]
+  let vModMulti ← withSandboxEnv envModClaims <|
+    auditClaimSpecStrengthInEnv `a1ModVerified (some ``fuchsiaUsercopyCopyinModularDirectMultiCert)
+      (requiredCategories := usercopyCats)
+  let vModDet ← withSandboxEnv envModClaims <|
+    auditClaimSpecStrengthInEnv `a1ModVerified (some ``fuchsiaUsercopyCopyinModularDirectDetCert)
+  let vModWrongEnv ← withSandboxEnv envModClaims <|
+    auditClaimSpecStrengthInEnv `a1ModVacuousVerified (some ``fuchsiaUsercopyCopyinModularDirectMultiCert)
+  let vModGap ← withSandboxEnv envModClaims <|
+    auditClaimSpecStrengthInEnv `a1ModVerified (some ``fuchsiaUsercopyCopyinModularDirectMultiCert)
+      (requiredCategories := [.swappedByteOrder])
+  let vTotal ← withSandboxEnv envModClaims <|
+    auditClaimSpecStrengthInEnv `a1TotalVerified (some ``fuchsiaUsercopyCopyinMultiCert)
+      (requiredCategories := usercopyCats)
+  let vNonThm ← withSandboxEnv envModClaims <|
+    auditClaimSpecStrengthInEnv `a1AxiomClaim (some ``fxfsVmoSubsliceMultiCert)
+  liftIO <| assertAuditOk "A1_claim_bound_modular_multi_cert" vModMulti
+  liftIO <| assertAuditOk "A1_claim_bound_modular_det_cert" vModDet
+  liftIO <| assertRejectedWithTag "A1_claim_bound_modular_wrong_envAssumed" vModWrongEnv "specStrengthCertInvalidType"
+  liftIO <| assertRejectedWithTag "A1_claim_bound_modular_coverage_gap" vModGap "specStrengthCoverageGap"
+  liftIO <| assertAuditOk "A1_claim_bound_total_cert" vTotal
+  liftIO <| assertRejectedWithTag "A1_claim_bound_non_theorem_rejected" vNonThm "notTheoremKind"
+  lines := lines ++
+    [ formatVerdictTags "A1_claim_bound_modular_multi_cert" vModMulti
+    , formatVerdictTags "A1_claim_bound_modular_det_cert" vModDet
+    , formatVerdictTags "A1_claim_bound_modular_wrong_envAssumed" vModWrongEnv
+    , formatVerdictTags "A1_claim_bound_modular_coverage_gap" vModGap
+    , formatVerdictTags "A1_claim_bound_total_cert" vTotal
+    , formatVerdictTags "A1_claim_bound_non_theorem_rejected" vNonThm ]
+  logInfo (String.intercalate "\n" lines)
+
 /-! ### Type-Level Refutations for Discriminating Kills and Deterministic Specifications -/
 
 /-- A specification that is satisfiable at input `0` but unimplementable everywhere else.
@@ -1257,6 +1425,55 @@ def runDiskHardeningRegressions : IO String := do
     let vNoRoots ← auditCompiledModulesIO #[] pol
     assertRejectedWithTag "D6_no_root_modules" vNoRoots "noAuditTargets"
     lines := lines.push (formatVerdictTags "D6_no_root_modules" vNoRoots)
+
+    -- A1-1: split-artifact symlink attack (`Std/Time.olean` & `.olean.server` symlinked
+    --       into the real toolchain while `Std/Time.olean.private` is attacker-owned in
+    --       `tmpDir`). Checking ONLY `.olean`'s `realPath` used to pass; checking parent
+    --       dir + all companion artifact `realPath`s rejects it fail-closed.
+    let symlinkRoot := tmpDir / "SymlinkSplit"
+    IO.FS.createDirAll (symlinkRoot / "Std")
+    let libDir ← Lean.getLibDir (← Lean.getBuildDir)
+    let _ ← IO.Process.output {
+      cmd := "ln"
+      args := #["-s", (libDir / "Std" / "Time.olean").toString,
+                (symlinkRoot / "Std" / "Time.olean").toString]
+    }
+    let _ ← IO.Process.output {
+      cmd := "ln"
+      args := #["-s", (libDir / "Std" / "Time.olean.server").toString,
+                (symlinkRoot / "Std" / "Time.olean.server").toString]
+    }
+    IO.FS.writeFile (symlinkRoot / "Std" / "Time.olean.private") "attacker-private-payload"
+    let vSymSplit ← withExtraSearchPaths [symlinkRoot] do
+      let vs ← checkModuleProvenanceIO #[`Std.Time]
+      pure (if vs.isEmpty then AuditVerdict.ok {} else AuditVerdict.rejected vs {})
+    assertRejectedWithTag "A1_symlink_split_provenance" vSymSplit "moduleProvenanceSpoofed"
+    lines := lines.push (formatVerdictTags "A1_symlink_split_provenance" vSymSplit)
+
+    -- A1-5a/b: `prelude` module re-declaring its own `Eq`/`Bool`/`Bool.true` + forged
+    --          native axiom AND re-declaring `Lean.ofReduceBool`. Both must be rejected
+    --          as `.unapprovedAxiom` (never accepted provisionally or misclassified).
+    let preludeNatLean := tmpDir / "ProtoDiskPreludeFakeNat.lean"
+    IO.FS.writeFile preludeNatLean <|
+      "prelude\n" ++
+      "inductive Eq.{u} {α : Sort u} (a : α) : α → Prop | refl : Eq a a\n" ++
+      "inductive Bool : Type | true | false\n" ++
+      "axiom spoof._native.native_decide.ax_1_1 : Eq Bool.false Bool.true\n" ++
+      "axiom Lean.ofReduceBool : ∀ (P : Prop), P\n" ++
+      "theorem useFakeNat : Eq Bool.false Bool.true := spoof._native.native_decide.ax_1_1\n" ++
+      "theorem useFakeOfRB (P : Prop) : P := Lean.ofReduceBool P\n"
+    compileTempModuleToOlean tmpDir preludeNatLean (tmpDir / "ProtoDiskPreludeFakeNat.olean")
+    let loadedPreludeNat ← loadOrThrow "A1_prelude_nat_load" #[`ProtoDiskPreludeFakeNat] pol [tmpDir]
+    let vPreludeFakeNat ← auditLoadedModulesIO loadedPreludeNat
+      { checkStatementOrigin := false, allowProvisionalNative := true }
+      (explicitTargets? := some #[`useFakeNat])
+    let vPreludeFakeOfRB ← auditLoadedModulesIO loadedPreludeNat
+      { checkStatementOrigin := false, allowProvisionalNative := false }
+      (explicitTargets? := some #[`useFakeOfRB])
+    assertRejectedWithTag "A1_prelude_fake_native_eq_bool" vPreludeFakeNat "unapprovedAxiom"
+    assertRejectedWithTag "A1_prelude_redeclared_ofReduceBool" vPreludeFakeOfRB "unapprovedAxiom"
+    lines := lines.push (formatVerdictTags "A1_prelude_fake_native_eq_bool" vPreludeFakeNat)
+    lines := lines.push (formatVerdictTags "A1_prelude_redeclared_ofReduceBool" vPreludeFakeOfRB)
     return lines
   let lines ← try body finally IO.FS.removeDirAll tmpDir
   let clean := !(← tmpDir.pathExists)
@@ -1273,6 +1490,9 @@ D7_spoofed_trusted_unpinned_boundary: rejected [moduleProvenanceSpoofed]
 D7_spoofed_trusted_pinned_elsewhere: rejected [moduleProvenanceSpoofed]
 D7_pinned_root_honoured: ok []
 D6_no_root_modules: rejected [noAuditTargets]
+A1_symlink_split_provenance: rejected [moduleProvenanceSpoofed]
+A1_prelude_fake_native_eq_bool: rejected [unapprovedAxiom]
+A1_prelude_redeclared_ofReduceBool: rejected [unapprovedAxiom]
 tmp_clean=true
 -/
 #guard_msgs in
@@ -1287,7 +1507,8 @@ run_cmd do
     typeclass bridges, and the `fxfs` / `fuchsia_usercopy` examples. -/
 def pureSpecHalfPrefixes : Array String := #[
   "SpecStrengthCert", "MutantCategory", "NamedMutantKill", "MultiMutantSpecCert",
-  "DeterministicSpecCert", "no_", "mutant_impl", "multi_mutant", "ItemSpecStrengthCert",
+  "DeterministicSpecCert", "ModularSpecStrengthCert", "ModularMultiMutantSpecCert",
+  "ModularDeterministicSpecCert", "no_", "mutant_impl", "multi_mutant", "ItemSpecStrengthCert",
   "ItemMultiMutantCert", "StatefulItem", "ModularItem", "fxfs", "fuchsia", "weak",
   "truncated", "strong", "mutatedFrameMemory", "instDecidableEqMutantCategory",
   "instReprMutantCategory", "instInhabitedMutantCategory"]
@@ -1438,5 +1659,23 @@ run_cmd do
 /-- info: 'Anneal.OleanSpecStrengthAuditorProtoTests.testFxfsEveryDeviationKilled' does not depend on any axioms -/
 #guard_msgs in
 #print axioms Anneal.OleanSpecStrengthAuditorProtoTests.testFxfsEveryDeviationKilled
+
+/--
+info: 'Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinModularDirectMultiCert' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinModularDirectMultiCert
+
+/--
+info: 'Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinModularDirectDetCert' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinModularDirectDetCert
+
+/-- info: 'Anneal.OleanSpecStrengthAuditorProto.no_modular_cert_of_vacuous_envAssumed' does not depend on any axioms -/
+#guard_msgs in
+#print axioms Anneal.OleanSpecStrengthAuditorProto.no_modular_cert_of_vacuous_envAssumed
 
 end Anneal.OleanSpecStrengthAuditorProtoTests
