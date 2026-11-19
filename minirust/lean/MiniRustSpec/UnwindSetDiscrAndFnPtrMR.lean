@@ -1059,6 +1059,30 @@ theorem c1_setDiscriminant_local_three_way_witness :
       (m1.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB), m1.threads[0]?.bind (fun t => t.stack[0]?.map (·.next_stmt))) =
       (some (c1LocalExpectedBytes.map (projByteTB ∘ liftByteTB)), some 1)) :=
   ⟨⟨rfl, rfl⟩, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel)⟩
+/-- Concrete niche-encoded `Option<NonZeroU8>` `SetDiscriminant` 3-way witness
+across Trusted, `Mach`, and `MachTB` (with `MachTB.wfLive`): setting `Some`
+(`1`, empty `tagger = []`) performs zero memory writes preserving `[.Init 7
+none]`, while setting `None` (`0`) writes `[.Init 0 none]`. -/
+theorem c1_niche_optionNonZeroU8_three_way_witness :
+    let optMir (tag : Nat) := mkMirBody "ep2::c1_niche_opt" [mkDecl twoVarMirTy, mkDecl twoVarMirTy] 1
+      [mkBb [mkSt (.setDiscriminant (locPlace 1) tag)] .return_] twoVarLayouts
+    let optMach (tag : Int) : Mach :=
+      let fn := mkMrFn [(localName 0, optionNonZeroU8MrTy), (localName 1, optionNonZeroU8MrTy)] [localName 1] (localName 0)
+        [(bbName 0, ⟨[.SetDiscriminant (.Local (localName 1)) tag], .Return, .Regular⟩)]
+      mkMrMach (mkMrProg [(fnName 0, fn)]) [mkStackAlloc 128 [.Uninit] 1, mkStackAlloc 256 [.Init 7 none] 1]
+        [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }), (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]]
+    (match stepMirFn (optMir 1) (initMachineState (optMir 1) [.aggregate 1 [.scalar ⟨7, 1⟩]]) with
+     | .tau (.running s1) => get? s1.frame.locals 1 = some (.init (.aggregate 1 [.scalar ⟨7, 1⟩])) | _ => False) ∧
+    (∃ m1, Interp.step (optMach 1) = .ok m1 ∧ m1.mem.memory.allocations[1]?.map (·.data) = some [.Init 7 none]) ∧
+    (∃ m1, Interp.stepTB (liftMachToTB (optMach 1)) = .ok m1 ∧ MachTB.wfLive m1 ∧
+      m1.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB) = some [.initNoProv 7]) ∧
+    (match stepMirFn (optMir 0) (initMachineState (optMir 0) [.aggregate 1 [.scalar ⟨7, 1⟩]]) with
+     | .tau (.running s1) => get? s1.frame.locals 1 = some (.init (.aggregate 0 [.scalar ⟨7, 1⟩])) | _ => False) ∧
+    (∃ m1, Interp.step (optMach 0) = .ok m1 ∧ m1.mem.memory.allocations[1]?.map (·.data) = some [.Init 0 none]) ∧
+    (∃ m1, Interp.stepTB (liftMachToTB (optMach 0)) = .ok m1 ∧ MachTB.wfLive m1 ∧
+      m1.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB) = some [.initNoProv 0]) :=
+  ⟨rfl, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel),
+   rfl, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel)⟩
 /-- Concrete deref `SetDiscriminant` witness (`(*_2) = variant 1`) across
 Trusted, `Mach`, and `MachTB` (with payload preservation & `MachTB.wfLive`). -/
 def c1DerefMir : MirAst.CapturedMir := mkMirBody "ep2::c1_set_discr_deref" [mkDecl twoVarMirTy, mkDecl twoVarMirTy,
@@ -1382,6 +1406,14 @@ theorem unwindResume_continue_chain_fault_and_root_terminals {M : Type} [Gen.Mem
       fr1.stack_pop_action = .BackToCaller nextBlock none retPtr →
       MirSemantics.evalTerminator s { kind := .unwindResume, span := span } curBody = MirStepNode.fail .ub ∧ stepsM (conts.length + 1) m =
         .error (.ub "unwinding from a function where the caller did not specify an unwind_block")) ∧
+    (∀ caller rest fr blk, s.memory.callStack = conts ++ (caller :: rest) → caller.returnUnwind = .unreachable →
+      mK.threads.any (fun th => decide (th.state = .Enabled)) = true →
+      pickActiveThreadM { mK with mem := { mK.mem with accesses := [] } } = .ok mK.active_thread →
+      curFrameM { mK with mem := { mK.mem with accesses := [] } } = .ok fr →
+      mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk →
+      fr.next_stmt = (blk.statements.length : Int) → blk.terminator = .Unreachable →
+      MirSemantics.evalTerminator s { kind := .unwindResume, span := span } curBody = MirStepNode.fail .ub ∧
+      stepsM (conts.length + 1) m = .error (.ub "reached unreachable code")) ∧
     (∀ caller rest fr blk, s.memory.callStack = conts ++ (caller :: rest) → caller.returnUnwind = .terminate →
       mK.threads.any (fun th => decide (th.state = .Enabled)) = true →
       pickActiveThreadM { mK with mem := { mK.mem with accesses := [] } } = .ok mK.active_thread →
@@ -1400,13 +1432,19 @@ theorem unwindResume_continue_chain_fault_and_root_terminals {M : Type} [Gen.Mem
       ConcurrentMemory.end_call cm1 fr1.extra = .ok cm2 → fr1.stack_pop_action = .BottomOfStack →
       MirSemantics.evalTerminator s { kind := .unwindResume, span := span } curBody = MirStepNode.retOutcome .panic ∧
       stepsM (conts.length + 1) m = .error (.ub "the function at the bottom of the stack must not unwind")) := by
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_⟩
   · intro caller rest t fr fr1 blk threads' cm1 cm2 nextBlock retPtr hStk hUnr hEn hPick hTid hLast hBlk hStmt hTerm hSet hDe hEnd hAct
     have hCur : curFrameM { mK with mem := { mK.mem with accesses := [] } } = .ok fr := by
       unfold curFrameM; simp only [hTid, hLast, bind, Except.bind, pure, Except.pure]
     have hErr : stepM mK = .error (.ub "unwinding from a function where the caller did not specify an unwind_block") := by
       refine stepM_error_of_evalTerminatorM fr blk hEn hPick hCur hBlk hStmt ?_
       rw [hTerm]; unfold evalTerminatorM evalResumeUnwindM; simp only [hTid, hLast, hSet, hDe, hEnd, hAct, pure, Except.pure, bind, Except.bind, ub]
+    refine ⟨?_, by rw [stepsM_add conts.length 1 m mK hChain.to_stepsM]; simp only [stepsM, hErr, bind, Except.bind]⟩
+    simp only [MirSemantics.evalTerminator, hStk,
+      trusted_unwindFromCallStack_continue_chain conts (caller :: rest) s.memory hCont, unwindFromCallStack, hUnr]
+  · intro caller rest fr blk hStk hUnr hEn hPick hCur hBlk hStmt hUnrTm
+    have hErr : stepM mK = .error (.ub "reached unreachable code") :=
+      stepM_error_of_evalTerminatorM fr blk hEn hPick hCur hBlk hStmt (by rw [hUnrTm]; rfl)
     refine ⟨?_, by rw [stepsM_add conts.length 1 m mK hChain.to_stepsM]; simp only [stepsM, hErr, bind, Except.bind]⟩
     simp only [MirSemantics.evalTerminator, hStk,
       trusted_unwindFromCallStack_continue_chain conts (caller :: rest) s.memory hCont, unwindFromCallStack, hUnr]
@@ -1530,9 +1568,35 @@ theorem minirust_start_resume_stop_unwind_stepsM {M : Type} [Gen.Memory M] [Memo
   refine ⟨mEnd, tEnd, hFull, hActEnd, hPayEnd, ?_, ?_⟩
   · rw [hLenEnd, hLenMid, hLenS]
   · rw [hStkEnd, (getLast?_dropLast_snoc _ _).1]; rfl
-theorem minirust_start_resume_stop_unwind_tb_wfLive (m0 mEnd : MachTB) (k : Nat) (hwf : MachTB.wfLive m0)
-    (hSteps : stepsM (1 + k + 1) m0 = .ok mEnd) :
-    Interp.stepsTB (1 + k + 1) m0 = .ok mEnd ∧ MachTB.wfLive mEnd := ⟨hSteps, stepsTB_wfLive hwf hSteps⟩
+theorem minirust_start_resume_stop_unwind_tb_wfLive (m0 m1 mStart mMid : MachTB) (t1 : Gen.Thread TBM)
+    (fr0 fr1 frStop : StackFrame TBM) (blk0 blkStop : Gen.BasicBlock) (payloadExpr : Gen.ValueExpr)
+    (p : Gen.Pointer TreeBorrowsProvenance) (ubBb catchBb : Gen.BbName) (k : Nat) (hwf : MachTB.wfLive m0)
+    (hEn0 : m0.threads.any (fun th => decide (th.state = .Enabled)) = true)
+    (hPick0 : pickActiveThreadM { m0 with mem := { m0.mem with accesses := [] } } = .ok m0.active_thread)
+    (hCur0 : curFrameM { m0 with mem := { m0.mem with accesses := [] } } = .ok fr0)
+    (hBlk0 : mapIndex fr0.func.blocks fr0.next_block "frame.func.blocks[frame.next_block]" = .ok blk0)
+    (hStmt0 : fr0.next_stmt = (blk0.statements.length : Int)) (hTerm0 : blk0.terminator = .StartUnwind payloadExpr ubBb)
+    (hVal : evalValueM { m0 with mem := { m0.mem with accesses := [] } } payloadExpr = .ok ((.Ptr p, .Ptr (.Raw .None)), m1))
+    (hTid1 : activeThreadM m1 = .ok t1) (hLast1 : t1.stack.getLast? = some fr1)
+    (hEvalStart : evalTerminatorM { m0 with mem := { m0.mem with accesses := [] } } (.StartUnwind payloadExpr ubBb) = .ok mStart)
+    (hRace0 : ConcurrentMemory.check_data_races mStart.mem mStart.active_thread
+      (setInsert m0.synchronized_threads m0.active_thread, m0.mem.accesses) = .ok ())
+    (hChain : ResumeUnwindChainM k mStart mMid) (hEnS : mMid.threads.any (fun th => decide (th.state = .Enabled)) = true)
+    (hPickS : pickActiveThreadM { mMid with mem := { mMid.mem with accesses := [] } } = .ok mMid.active_thread)
+    (hCurS : curFrameM { mMid with mem := { mMid.mem with accesses := [] } } = .ok frStop)
+    (hBlkS : mapIndex frStop.func.blocks frStop.next_block "frame.func.blocks[frame.next_block]" = .ok blkStop)
+    (hStmtS : frStop.next_stmt = (blkStop.statements.length : Int)) (hTermS : blkStop.terminator = .StopUnwind catchBb)
+    (hRaceS : ∀ mEnd, evalTerminatorM { mMid with mem := { mMid.mem with accesses := [] } } (.StopUnwind catchBb) = .ok mEnd →
+      ConcurrentMemory.check_data_races mEnd.mem mEnd.active_thread
+        (setInsert mMid.synchronized_threads mMid.active_thread, mMid.mem.accesses) = .ok ()) :
+    ∃ mEnd tEnd, Interp.stepsTB (1 + k + 1) m0 = .ok mEnd ∧ MachTB.wfLive mEnd ∧ activeThreadM mEnd = .ok tEnd ∧
+      tEnd.unwind_payloads = t1.unwind_payloads ∧ tEnd.stack.length + k = t1.stack.length ∧
+      tEnd.stack.getLast?.map (fun fr => (fr.next_block, fr.next_stmt)) = some (catchBb, 0) := by
+  obtain ⟨mEnd, tEnd, hSteps, hAct, hPay, hLen, hLast⟩ :=
+    minirust_start_resume_stop_unwind_stepsM m0 m1 mStart mMid t1 fr0 fr1 frStop blk0 blkStop payloadExpr p
+      ubBb catchBb k hEn0 hPick0 hCur0 hBlk0 hStmt0 hTerm0 hVal hTid1 hLast1 hEvalStart hRace0 hChain hEnS hPickS
+      hCurS hBlkS hStmtS hTermS hRaceS
+  exact ⟨mEnd, tEnd, hSteps, stepsTB_wfLive hwf hSteps, hAct, hPay, hLen, hLast⟩
 /-- **C2c Trusted `.unreachable` UB Law**: unwinding into `.unreachable`
 faults with `MirStepNode.fail .ub`. -/
 theorem trusted_unwindResume_unreachable_ub (s : MachineState) (caller : SavedCallerFrame) (rest : List SavedCallerFrame)
@@ -2597,23 +2661,49 @@ theorem reify_unsafe_fnPtrToPtr_pipeline (locals locals1 locals2 locals3 : List 
       (by simp [hTy3, fnPtrUnsafeU32MirTy, callConvEq])
       (by simp [mem', p, lookupFnPtr, Nat.beq_refl, fnPtrSafeU32MirTy, callConvEq])
     exact hF.1
-/-- **C8 Cached `internFnPtr` Idempotence & Polymorphic `fnFromPtrM` Indirect
-Call Lookup (`Mach` & `MachTB`)**: (1) Re-reifying an already-interned
-function or ZST closure (`findFnPtrEntry? = some existing`) returns
-`(existing.allocId, mem)` without growing `mem.fnPtrs`; (2) `fnFromPtrM`
-resolves the coerced thin function pointer back to `calleeFn` across `Mach` &
-`MachTB`, and faults with UB on wide metadata or non-pointer operands. -/
+/-- **C8 Cached `internFnPtr` Idempotence & Arbitrary-Index `fnFromPtrM`
+Round-Trip / UB (`reify_cached_and_fnFromPtrM_roundtrip`)**: (1) Reifying an
+already-interned function or ZST closure (`findFnPtrEntry? = some existing`)
+returns `(existing.allocId, mem)` in `internFnPtr` AND `evalRvalue` without
+growing `mem.fnPtrs`; (2) `fnFromPtrM` resolves ANY registered `fnNm` at
+arbitrary position in `m.fn_ptrs` back to `calleeFn` across `Mach` & `MachTB`;
+(3) unregistered pointers, wide pointers, and non-pointers fault with exact UB
+messages. -/
 theorem reify_cached_and_fnFromPtrM_roundtrip {M : Type} [Gen.Memory M] [MemoryOps M]
-    (mem : MirSemantics.Memory) (dp : DefPath) (targs : List RigidTy) (sig : Option RigidTy)
-    (existing : FnPtrEntry) (m : Machine M) (fnNm : Gen.FnName) (mrPtr : ThinPointer (Gen.Memory.Provenance M))
-    (restFnPtrs : List (Gen.FnName × ThinPointer (Gen.Memory.Provenance M))) (calleeFn : Gen.Function) :
-    (findFnPtrEntry? mem.fnPtrs dp targs sig = some existing → internFnPtr mem dp targs sig = (existing.allocId, mem)) ∧
-    (m.fn_ptrs = ⟨(fnNm, mrPtr) :: restFnPtrs⟩ → mapIndex m.prog.functions fnNm "self.prog.functions[func_name]" = .ok calleeFn →
+    (locals locals' : List LocalSlot) (op : MirAst.Operand) (mem : MirSemantics.Memory)
+    (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (ck : String) (dp : DefPath) (targs : List RigidTy)
+    (fnIns : List RigidTy) (fnOut : RigidTy) (fnSaf : Safety) (fnAbi : CallConv) (existing : FnPtrEntry)
+    (m : Machine M) (fnNm : Gen.FnName) (mrPtr : ThinPointer (Gen.Memory.Provenance M)) (calleeFn : Gen.Function) :
+    let targetTy : MirAst.Ty := { kind := .fnPtr fnIns fnOut fnSaf fnAbi, layoutIdx := 0 }
+    (findFnPtrEntry? mem.fnPtrs dp targs (some targetTy.kind) = some existing →
+      internFnPtr mem dp targs (some targetTy.kind) = (existing.allocId, mem) ∧
+      ∀ zstVal, (zstVal = .unit ∨ zstVal = .aggregate 0 []) → isReifyFnPointerCoercion ck = true →
+        stringEq ck "UnsafeFnPointer" = false →
+        evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals (callStack := mem.callStack) = .ok zstVal locals' →
+        callConvEq fnAbi .rustIntrinsic = false → reifyCoercionSafetyCompatible ck fnSaf = true →
+        extractReifyCoercionTarget? ck (operandTy decls layouts op) = some (dp, targs) →
+        checkCalleeSig mem.callees dp fnIns fnOut fnAbi targs mem.traitImpls = true →
+        evalRvalue locals (.cast (.pointerCoercion ck) op targetTy) mem decls layouts =
+          .ok (.ptr { allocId := existing.allocId, offsetBytes := 0 } 8) locals' mem) ∧
+    (m.fn_ptrs.entries.find? (fun x => decide (x.2 = mrPtr)) = some (fnNm, mrPtr) →
+      mapIndex m.prog.functions fnNm "self.prog.functions[func_name]" = .ok calleeFn →
       fnFromPtrM m (.Ptr (ThinPointer.widen mrPtr none)) = .ok calleeFn) ∧
+    (m.fn_ptrs.entries.find? (fun x => decide (x.2 = mrPtr)) = none →
+      fnFromPtrM m (.Ptr (ThinPointer.widen mrPtr none)) = .error (.ub "invalid pointer for function lookup")) ∧
     (∀ metaVal, fnFromPtrM m (.Ptr ⟨mrPtr, some metaVal⟩) = .error (.ub "invalid pointer for function lookup")) ∧
     (∀ i, fnFromPtrM m (.Int i) = .error (.ub "trying to look up a function based on a non-pointer value")) := by
-  refine ⟨fun hHit => by unfold internFnPtr; simp [hHit], fun hFps hFn => ?_, fun _ => rfl, fun _ => rfl⟩
-  unfold fnFromPtrM; simp [hFps, ThinPointer.widen, Option.isSome, hFn]
+  intro targetTy; refine ⟨fun hHit => ⟨by unfold internFnPtr; simp [hHit], ?_⟩, ?_, ?_, fun _ => rfl, fun _ => rfl⟩
+  · intro zstVal hZst hReify hNotU hOp hAbi hSaf hExt hSig
+    have hInt : internFnPtr mem dp targs (some targetTy.kind) = (existing.allocId, mem) := by unfold internFnPtr; simp [hHit]
+    show evalReifyFnPointer locals op targetTy mem decls layouts ck = _; unfold evalReifyFnPointer
+    rcases hZst with rfl | rfl <;>
+      simp only [hReify, hNotU, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self, hExt, hSig, hInt]
+  · intro hFind hFn; unfold fnFromPtrM
+    have hF' : List.find? (fun x : Gen.FnName × ThinPointer (Gen.Memory.Provenance M) => decide (x.2 = mrPtr)) m.fn_ptrs.entries = some (fnNm, mrPtr) := hFind
+    dsimp only [ThinPointer.widen, Option.isSome, Bool.false_eq_true, ↓reduceIte]; rw [hF']; exact hFn
+  · intro hMiss; unfold fnFromPtrM
+    have hM' : List.find? (fun x : Gen.FnName × ThinPointer (Gen.Memory.Provenance M) => decide (x.2 = mrPtr)) m.fn_ptrs.entries = none := hMiss
+    dsimp only [ThinPointer.widen, Option.isSome, Bool.false_eq_true, ↓reduceIte]; rw [hM']; rfl
 /-- **C8.3 (`UnsafeFnPointer`) Exhaustive Signature-Mismatch, Nonzero-Offset,
 Stack-Borrow, & Scalar-Operand UB Laws (`unsafeFnPointer_ptr_and_sig_ub`)**:
 Without assuming `FnPtrEntryRel`, characterizes the remaining
@@ -2782,8 +2872,8 @@ UB**: Couples Trusted `ArrayToPointer` with MiniRust `Transmute thinRawPtrTy`
 on `Mach` & `MachTB`, proving: (1) global/raw pointer lockstep; (2)
 stack-borrow `deriveStackElemThinPtr` minting a fresh `[.subslice 0 2 false]`
 tag at offset `0`, preserving already-subslice tags, and faulting on
-`.disabled` OR ANY nonzero `p.offsetBytes ≠ 0`; (3) scalar address wrap; (4)
-const-to-mut UB. -/
+`.disabled`, `.uninit`/`.dead` backing locals, or ANY nonzero
+`p.offsetBytes ≠ 0`; (3) scalar address wrap; (4) const-to-mut UB. -/
 theorem arrayToPointer_global_stack_scalar_and_ub (locals locals' : List LocalSlot) (op : MirAst.Operand)
     (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl) (p : ProvenancePtr) (addr : Nat) (hAddr : addr < 2 ^ 64)
     (provBM : Option Prov) (provTB : Option TreeBorrowsProvenance) (mBM : Option Mach) (mTB : Option MachTB) :
@@ -2927,9 +3017,10 @@ theorem c8_all_five_pointer_coercions_three_way_witness : runAVal c8AllFiveMir 1
        some ((ptrBytes 4096 (some (⟨0⟩, ()))).map (projByteTB ∘ liftByteTB)),
        some ((ptrBytes 640 (some (⟨6⟩, ()))).map (projByteTB ∘ liftByteTB))]) :=
   ⟨rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel)⟩
-/-- Concrete C8 wide-slice (`*mut [u32] → *const [u32]`), wide-dyn (`*mut dyn
-Tr → *const dyn Tr`), and negative witnesses across Trusted, `Mach`, and
-`MachTB` (capturing closure `.ub`, already-`unsafe` `UnsafeFnPointer` `.ub`,
+/-- Concrete C8 stack-borrow deref (`ArrayToPointer → MutToConstPointer →
+*_ptr`), wide-slice (`*mut [u32] → *const [u32]`), wide-dyn (`*mut dyn Tr →
+*const dyn Tr`), and negative witnesses across Trusted, `Mach`, and `MachTB`
+(capturing closure `.ub`, already-`unsafe` `UnsafeFnPointer` `.ub`,
 shape-mismatch `.ub`, and unrecognized coercion tag `.unsupported`). -/
 theorem c8_capturing_closure_wide_and_unknown_tag_witness :
     let capDecls := [mkDecl fnPtrSafeU32MirTy, mkDecl (closureCapMirTy "ep2::cap_cl")]
@@ -3244,13 +3335,16 @@ def c9BinderMach (local1Live : Bool := true) (local1Init : Bool := true) : Mach 
     [mkRootFrame c9BinderMrFn locs]
 /-- Concrete C9 positive witness (read, write, `Move`, deref, `Rvalue.len`,
 wrapper `Transmute`, `MachTB.wfLive`), `.uninit`-wrapper `Assign` divergence,
-and dead-local UB witness across Trusted, `Mach`, and `MachTB`. -/
+projected-`.move` non-deinit vs. whole-local `.move` deinit contrast, and
+dead-local UB witness across Trusted, `Mach`, and `MachTB`. -/
 theorem c9_unwrapUnsafeBinder_three_way_len_and_ub_witness :
     let sliceLenPlaceAfter : MirAst.Place := locPlace 0 [.deref, .unwrapUnsafeBinder { kind := .slice (.uint .u32), layoutIdx := 0 }]
     let sliceLenPlaceBefore : MirAst.Place := locPlace 0 [.unwrapUnsafeBinder rawConstSliceU32MirTy, .deref]
     let sliceMem := (initMachineState c9BinderReadWriteMir []).memory
     let sliceLocs : List LocalSlot := [.init (annealWidePtrVal { allocId := 9, offsetBytes := 0 } 4 8)]
     let wrapTransMach := c7MkTransmuteMach (mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩) u32MrTy (scalarBytes u32 88) 4
+    let moveContrastLocs : List LocalSlot := [.uninit, .init (.scalar ⟨10, 4⟩)]
+    let moveDecls := [mkDecl u32MirTy, mkDecl u32MirTy]
     runAVal c9BinderReadWriteMir 12 (initMachineState c9BinderReadWriteMir [.scalar ⟨10, 4⟩]) =
       some (.scalar ⟨88, 4⟩) ∧ (∃ m5, Interp.steps 5 (c9BinderMach true) = .ok m5 ∧
       m5.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 88)) ∧
@@ -3265,6 +3359,13 @@ theorem c9_unwrapUnsafeBinder_three_way_len_and_ub_witness :
     (∃ m1, Interp.step (c9BinderMach true false) = .ok m1 ∧ m1.mem.memory.allocations[1]?.map (·.data) = some (scalarBytes u32 55)) ∧
     (∃ m1, Interp.stepTB (liftMachToTB (c9BinderMach true false)) = .ok m1 ∧ MachTB.wfLive m1 ∧
       m1.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB) = some ((scalarBytes u32 55).map (projByteTB ∘ liftByteTB))) ∧
+    (match evalOperand moveContrastLocs (.move (locPlace 1 [.unwrapUnsafeBinder u32MirTy])) [] [] emptyLayoutTable [] moveDecls [] with
+     | .ok (.scalar ⟨10, 4⟩) l1 =>
+       evalOperand l1 (.copy (locPlace 1)) [] [] emptyLayoutTable [] moveDecls [] = .ok (.scalar ⟨10, 4⟩) l1
+     | _ => False) ∧
+    (match evalOperand moveContrastLocs (.move (locPlace 1)) [] [] emptyLayoutTable [] moveDecls [] with
+     | .ok (.scalar ⟨10, 4⟩) l2 => evalOperand l2 (.copy (locPlace 1)) [] [] emptyLayoutTable [] moveDecls [] = .ub
+     | _ => False) ∧
     evalRvalue sliceLocs (.len sliceLenPlaceAfter) sliceMem [mkDecl rawConstSliceU32MirTy]
       emptyLayoutTable = .ok (.scalar ⟨4, 8⟩) sliceLocs sliceMem ∧
     evalRvalue sliceLocs (.len sliceLenPlaceBefore) sliceMem [mkDecl rawConstSliceU32MirTy]
@@ -3275,7 +3376,7 @@ theorem c9_unwrapUnsafeBinder_three_way_len_and_ub_witness :
     Interp.stepTB (liftMachToTB (c9BinderMach false)) = .error (.ub "access to a dead local") :=
   ⟨rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
    ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel),
-   rfl, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel), rfl, rfl, rfl,
+   rfl, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel), rfl, rfl, rfl, rfl, rfl,
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
 /-! ## §10 (`C10`): `AggregateKind.closure` (`Mach` & `MachTB`) -/
@@ -3413,24 +3514,27 @@ theorem closure_two_capture_ltr_and_ub_M {M : Type} [Gen.Memory M] [MemoryOps M]
 /-- MiniRust 16-byte closure tuple type capturing `(u32, *const u32)`: field
 0 (`u32`) at offset 0, field 1 (`*const u32`) at offset 8, align 8. -/
 def mrClosureCapTy : Gen.Type := .Tuple [(⟨0⟩, u32MrTy), (⟨8⟩, thinRawPtrTy)] ⟨⟨16⟩, ⟨8⟩, none⟩ none
-/-- **C10.5 Captured-Upvar `.Field` Read-Back Projection Lockstep (`Mach` &
-`MachTB`)**: Reading captured upvars `.field 0` / `.field 1` from Trusted
-`.aggregate 0 [v0, v1]` matches MiniRust `.Field base 0` (offset `0`,
-`u32MrTy`) and `.Field base 1` (offset `8`, `thinRawPtrTy`) on
-`mrClosureCapTy`. -/
+/-- **C10.5 Captured-Upvar `.Field` Read/Write & OOB Projection Lockstep
+(`Mach` & `MachTB`)**: Reading/mutating captured upvars `.field 0` / `.field 1`
+on Trusted `.aggregate 0 [v0, v1]` matches MiniRust `.Field base 0` (offset `0`,
+`u32MrTy`) and `.Field base 1` (offset `8`, `thinRawPtrTy`) on `mrClosureCapTy`,
+while OOB field `2` faults (`.ub` vs `specPanic`). -/
 theorem closure_cap_field_projection_lockstep_M {M : Type} [Gen.Memory M] [MemoryOps M]
-    (locals : List LocalSlot) (v0 v1 : MirSemantics.Value) (m m1 : Machine M)
+    (locals : List LocalSlot) (v0 v0' v1 : MirSemantics.Value) (m m1 : Machine M)
     (base : Gen.PlaceExpr) (place : Gen.Place M) (ptr0 ptr8 : ThinPointer (Gen.Memory.Provenance M))
     (hBase : evalPlaceM m base = .ok ((place, mrClosureCapTy), m1)) (hMeta : place.ptr.metadata = none)
     (hOff0 : ptrOffsetInboundsM m1 place.ptr.thin_pointer 0 = .ok ptr0) (hOff8 : ptrOffsetInboundsM m1 place.ptr.thin_pointer 8 = .ok ptr8) :
     readProjectedValue locals (.aggregate 0 [v0, v1]) [.field 0 u32MirTy] = .ok v0 ∧
     readProjectedValue locals (.aggregate 0 [v0, v1]) [.field 1 rawConstU32MirTy] = .ok v1 ∧
+    writeProjectedValue locals (.aggregate 0 [v0, v1]) [.field 0 u32MirTy] v0' = .ok (.aggregate 0 [v0', v1]) ∧
+    readProjectedValue locals (.aggregate 0 [v0, v1]) [.field 2 u32MirTy] = .ub ∧
     evalPlaceM m (.Field base 0) = .ok (({ place with ptr := ThinPointer.widen ptr0 none }, u32MrTy), m1) ∧
-    evalPlaceM m (.Field base 1) = .ok (({ place with ptr := ThinPointer.widen ptr8 none }, thinRawPtrTy), m1) := by
+    evalPlaceM m (.Field base 1) = .ok (({ place with ptr := ThinPointer.widen ptr8 none }, thinRawPtrTy), m1) ∧
+    evalPlaceM m (.Field base 2) = .error (.specPanic "field projection to non-existing unsized tail") := by
   have hSz : computeSizeM m1 (.Sized ⟨16⟩ ⟨8⟩) place.ptr.metadata = .ok ⟨16⟩ := by
     simp only [computeSizeM, LayoutStrategy.compute_size_and_align, hMeta, pure, Except.pure, bind, Except.bind]
   have hLayCl : Type.layout mrClosureCapTy = .ok (.Sized ⟨16⟩ ⟨8⟩) := rfl
-  refine ⟨rfl, rfl, ?_, ?_⟩
+  refine ⟨rfl, rfl, rfl, rfl, ?_, ?_, ?_⟩
   · unfold evalPlaceM; rw [hBase, ok_bind]; dsimp only [mrClosureCapTy, List.length]
     have hC0 : (0 : Int) ≤ 0 ∧ (0 : Int) < (2 : Nat) := by decide
     have hI0 : listIndex [(({ bytes := 0 } : LibSpecr.Size), u32MrTy), (⟨8⟩, thinRawPtrTy)] 0 "sized_fields[field]" = .ok (⟨0⟩, u32MrTy) := rfl
@@ -3449,6 +3553,7 @@ theorem closure_cap_field_projection_lockstep_M {M : Type} [Gen.Memory M] [Memor
     have hLe8 : (!decide (({ bytes := 8 } : LibSpecr.Size).bytes ≤ (16 : Nat))) = false := rfl
     rw [hLe8, ite_eq_right_iff.mpr (fun hy : false = true => by cases hy)]
     rw [show ((8 : Nat) : Int) = 8 from rfl, hOff8, ok_bind, layout_thinRawPtr, ok_bind]; rfl
+  · unfold evalPlaceM; rw [hBase, ok_bind]; rfl
 /-- `Classical.choice`-free polymorphic 16-byte closure memory codec
 (`encodeM_decodeM_mrClosureCapTy`): encodes field 0 (`u32`) at `0..4`,
 preserves 4 `.Uninit` padding bytes at `4..8`, encodes field 1 (`*const u32`
@@ -3589,9 +3694,26 @@ def c10ZstMach : Mach :=
   mkMrMach (mkMrProg [(fnName 0, fn)]) [mkStackAlloc 128 [] 1] [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]]
 def c10ExpectedCapBytes : List Byte := scalarBytes u32 7 ++ List.replicate 4 .Uninit ++ ptrBytes 256 (some (⟨1⟩, ()))
 /-- Concrete C10 witnesses across Trusted, `Mach`, and `MachTB` (with
-`MachTB.wfLive`): 0-capture ZST, 2-capture `(u32, *const u32)`, dead upvar
-UB, and uninitialized upvar UB. -/
+`MachTB.wfLive`): 0-capture ZST, 2-capture `(u32, *const u32)` with `.field 0`
+& `*(.field 1)` read-back, dead upvar UB, and uninitialized upvar UB. -/
 theorem c10_closure_zst_capture_and_ub_three_way_witness :
+    let capReadMir := mkMirBody "ep2::c10_cap_read"
+      [mkDecl u32MirTy, mkDecl u32MirTy, mkDecl rawConstU32MirTy, mkDecl (closureCapMirTy "ep2::cap"), mkDecl rawConstU32MirTy] 1
+      [mkBb [mkSt (.storageLive 2), mkSt (.storageLive 3), mkSt (.storageLive 4),
+             mkSt (.assign (locPlace 2) (.rawPtr .not (locPlace 1))),
+             mkSt (.assign (locPlace 3) (.aggregate (.closure "ep2::cap") [.copy (locPlace 1), .copy (locPlace 2)])),
+             mkSt (.assign (locPlace 4) (.use (.copy (locPlace 3 [.field 1 rawConstU32MirTy])))),
+             mkSt (.assign (locPlace 0) (.use (.copy (locPlace 4 [.deref]))))] .return_]
+    let capReadFn := mkMrFn [(localName 0, u32MrTy), (localName 1, u32MrTy), (localName 2, thinRawPtrTy), (localName 3, mrClosureCapTy)]
+      [localName 1] (localName 0)
+      [(bbName 0, ⟨[.Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (.Raw .None)),
+          .Assign (.Local (localName 3)) (.Tuple [.Load (.Local (localName 1)), .Load (.Local (localName 2))] mrClosureCapTy),
+          .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Field (.Local (localName 3)) 1)) u32MrTy))], .Return, .Regular⟩)]
+    let capReadMach := mkMrMach (mkMrProg [(fnName 0, capReadFn)])
+      [mkStackAlloc 128 (List.replicate 4 .Uninit) 4, mkStackAlloc 256 (scalarBytes u32 7) 4,
+       mkStackAlloc 384 (List.replicate 8 .Uninit) 8, mkStackAlloc 512 (List.replicate 16 .Uninit) 8]
+      [mkRootFrame capReadFn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }), (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+        (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }), (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) })]]
     runAVal c10ZstClosureMir 4 (initMachineState c10ZstClosureMir []) = some (.aggregate 0 []) ∧
     (∃ m1, Interp.step c10ZstMach = .ok m1 ∧ m1.mem.memory.allocations[0]?.map (·.data) = some []) ∧
     (∃ m1, Interp.stepTB (liftMachToTB c10ZstMach) = .ok m1 ∧ MachTB.wfLive m1 ∧
@@ -3601,7 +3723,12 @@ theorem c10_closure_zst_capture_and_ub_three_way_witness :
     (∃ m2, Interp.steps 2 (c10CapMach true) = .ok m2 ∧ m2.mem.memory.allocations[0]?.map (·.data) = some c10ExpectedCapBytes) ∧
     (∃ m2, Interp.stepsTB 2 (liftMachToTB (c10CapMach true)) = .ok m2 ∧ MachTB.wfLive m2 ∧
       m2.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
-        some (c10ExpectedCapBytes.map (projByteTB ∘ liftByteTB))) ∧ stepMirFn c10CapClosureMir
+        some (c10ExpectedCapBytes.map (projByteTB ∘ liftByteTB))) ∧
+    runAVal capReadMir 10 (initMachineState capReadMir [.scalar ⟨7, 4⟩]) = some (.scalar ⟨7, 4⟩) ∧
+    (∃ m3, Interp.steps 3 capReadMach = .ok m3 ∧ m3.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 7)) ∧
+    (∃ m3, Interp.stepsTB 3 (liftMachToTB capReadMach) = .ok m3 ∧ MachTB.wfLive m3 ∧
+      m3.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) = some ((scalarBytes u32 7).map (projByteTB ∘ liftByteTB))) ∧
+    stepMirFn c10CapClosureMir
       { frame := { blockIdx := 0, stmtIdx := 2, locals := [.uninit, .init (.scalar ⟨7, 4⟩), .dead] },
         memory := (initMachineState c10CapClosureMir []).memory } = MirStepNode.fail .ub ∧
     Interp.step (c10CapMach false) = .error (.ub "access to a dead local") ∧
@@ -3611,6 +3738,7 @@ theorem c10_closure_zst_capture_and_ub_three_way_witness :
     Interp.step (c10CapMach true false) = .error (.ub "load at type but the data in memory violates the language invariant") ∧
     Interp.stepTB (liftMachToTB (c10CapMach true false)) = .error (.ub "load at type but the data in memory violates the language invariant") :=
   ⟨rfl, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel),
+   rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
    rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel), rfl,
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
    rfl, eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
