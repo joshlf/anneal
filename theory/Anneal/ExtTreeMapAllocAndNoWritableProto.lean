@@ -4110,7 +4110,13 @@ def stepNodesAncestorFirst (allNodes : List TreeTagNode) (targetTag : Nat)
 
 /-- **Upstream Traversal-Order-Faithful `FnEntry` Mutable Retag (`execFnEntryMutRetagSourceOrder`,
 `[adv A2]`)**: matches both `RetagPipeline.accessTreeForReborrow`'s single-parent-access rule AND
-`TraversalTree.traverse`'s `localEvents ++ foreignEvents` ancestor-before-foreign order. -/
+`TraversalTree.traverse`'s `localEvents ++ foreignEvents` ancestor-before-foreign order.
+*Honest scope (`[adv B3]`)*: `checkAncestorsM` steps the local nodes in **flat-list** order, whereas
+upstream's `ancestorPath` is bottom-up (accessed node first, then parent, …, root). The two coincide
+on newest-first lists (as built by `childNode :: nodes` insertion); on other list orders only the
+*reported* local error can differ (`.ancestorWriteForbidden` vs. `.conflictedProtectedChildWrite`),
+never success vs. failure (`checkAncestorsM` succeeds iff every local step succeeds), see
+`execFnEntryMutRetag_ok_iff_upstream_ok_iff_sourceOrder_ok`. -/
 def execFnEntryMutRetagSourceOrder (w : FnEntryBorrowWorld) (parentTag off len : Nat)
     (facts : RetagTypeFacts) (implicitWrites : Bool) (paramPolicy : FnEntryRetagPolicy) :
     Except RetagStepErr (FnEntryBorrowWorld × Option Nat) := do
@@ -4891,6 +4897,301 @@ theorem sourceOrder_rustcNoWritable_preserves_all_frozen_nodes
             injection hpair with hw' _
             subst hw'
             exact List.mem_cons_of_mem _ hmem
+
+/-- `[adv B3]` helper: a successful `mapNodesM` succeeded on every visited node. -/
+private theorem mapNodesM_ok_each {ε : Type} (f : TreeTagNode → Except ε TreeTagNode) :
+    ∀ (ns ns' : List TreeTagNode), mapNodesM f ns = .ok ns' →
+      ∀ n ∈ ns, ∃ n', f n = .ok n'
+  | [], _, _, _, hn => nomatch hn
+  | hd :: tl, ns', h, n, hn => by
+    unfold mapNodesM at h
+    cases hhd : f hd with
+    | error _ => rw [hhd] at h; nomatch h
+    | ok hd' =>
+      rw [hhd] at h
+      dsimp only [Bind.bind, Except.bind] at h
+      cases htl : mapNodesM f tl with
+      | error _ => rw [htl] at h; nomatch h
+      | ok tl' =>
+        rcases List.mem_cons.mp hn with heq | hmem
+        · exact ⟨hd', heq ▸ hhd⟩
+        · exact mapNodesM_ok_each f tl tl' htl n hmem
+
+/-- `[adv B3]` helper: the ancestor-first pre-pass never changes *whether* a traversal succeeds. -/
+private theorem stepNodesAncestorFirst_ok_iff
+    (allNodes : List TreeTagNode) (targetTag : Nat)
+    (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode) (nodes ns' : List TreeTagNode) :
+    stepNodesAncestorFirst allNodes targetTag stepFn nodes = .ok ns' ↔
+      mapNodesM stepFn nodes = .ok ns' := by
+  unfold stepNodesAncestorFirst
+  constructor
+  · intro h
+    cases hca : checkAncestorsM allNodes targetTag stepFn nodes with
+    | error _ => rw [hca] at h; nomatch h
+    | ok _ => rw [hca] at h; exact h
+  · intro h
+    have hca : checkAncestorsM allNodes targetTag stepFn nodes = .ok () :=
+      checkAncestorsM_ok_of_anc_ok allNodes targetTag stepFn nodes
+        (fun n hn _ => mapNodesM_ok_each stepFn nodes ns' h n hn)
+    rw [hca]
+    exact h
+
+private theorem stepNodesAncestorFirst_bind_ok_iff {β : Type}
+    (allNodes : List TreeTagNode) (targetTag : Nat)
+    (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode) (nodes : List TreeTagNode)
+    (k : List TreeTagNode → Except RetagStepErr β) (r : β) :
+    (stepNodesAncestorFirst allNodes targetTag stepFn nodes >>= k) = .ok r ↔
+      (mapNodesM stepFn nodes >>= k) = .ok r := by
+  cases hm : mapNodesM stepFn nodes with
+  | ok ns' =>
+    rw [(stepNodesAncestorFirst_ok_iff allNodes targetTag stepFn nodes ns').mpr hm]
+  | error e =>
+    cases hs : stepNodesAncestorFirst allNodes targetTag stepFn nodes with
+    | ok ns' =>
+      rw [(stepNodesAncestorFirst_ok_iff allNodes targetTag stepFn nodes ns').mp hs] at hm
+      nomatch hm
+    | error e' =>
+      constructor <;> intro h <;> nomatch h
+
+/-- **Flat Single-Pass vs. Ancestor-First: Identical Successes
+(`execFnEntryMutRetagUpstream_ok_iff_sourceOrder_ok`, `[adv B3]`)**: on **every** world (no
+well-formedness needed), `execFnEntryMutRetagUpstream` and `execFnEntryMutRetagSourceOrder` return
+`.ok r` for exactly the same `r`; the ancestor-first pre-pass only reorders *which* error is
+reported. -/
+theorem execFnEntryMutRetagUpstream_ok_iff_sourceOrder_ok
+    (w : FnEntryBorrowWorld) (parentTag off len : Nat)
+    (facts : RetagTypeFacts) (implicitWrites : Bool) (paramPolicy : FnEntryRetagPolicy)
+    (r : FnEntryBorrowWorld × Option Nat) :
+    execFnEntryMutRetagUpstream w parentTag off len facts implicitWrites paramPolicy = .ok r ↔
+      execFnEntryMutRetagSourceOrder w parentTag off len facts implicitWrites paramPolicy = .ok r := by
+  unfold execFnEntryMutRetagUpstream execFnEntryMutRetagSourceOrder
+  cases selectFnEntryPolicy facts .mutable implicitWrites paramPolicy with
+  | none => exact Iff.rfl
+  | some selected =>
+    dsimp only
+    cases findTagNode? w.nodes parentTag with
+    | none => exact Iff.rfl
+    | some parentNode =>
+      dsimp only
+      cases parentNode.perm == .disabled
+      · simp only [Bool.false_eq_true, ↓reduceIte]
+        if hob : w.bytes.length < off + len then
+          simp [hob, throw, throwThe, MonadExceptOf.throw, Bind.bind, Except.bind]
+        else
+          simp only [hob, ↓reduceIte]
+          cases Nat.beq len 0
+          · simp only [Bool.false_eq_true, ↓reduceIte]
+            cases selected.performsImplicitWrite && !false
+            · exact (stepNodesAncestorFirst_bind_ok_iff _ _ _ _ _ _).symm
+            · exact (stepNodesAncestorFirst_bind_ok_iff _ _ _ _ _ _).symm
+          · exact Iff.rfl
+      · exact Iff.rfl
+
+/-- `[adv B3]` helper: a successful *local* write step proves the node writable. -/
+private theorem stepNodeOnRangeWrite_local_ok_writable
+    (allNodes : List TreeTagNode) (ps : ProtectorSet) (allocId off len writerTag : Nat)
+    (n n' : TreeTagNode)
+    (hlen0 : Nat.beq len 0 = false)
+    (hanc : isDescendantOrSelf allNodes writerTag n.tag = true)
+    (halloc : Nat.beq n.allocId allocId = true)
+    (hok : stepNodeOnRangeWrite allNodes ps allocId off len writerTag n = .ok n') :
+    n.perm ≠ .frozen ∧ n.perm ≠ .disabled ∧
+      (n.perm = .reservedFrz true → n.isProtected ps = false) := by
+  unfold stepNodeOnRangeWrite at hok
+  simp only [hlen0, hanc, halloc, Bool.false_eq_true, Bool.not_true, ↓reduceIte] at hok
+  cases hp : n.perm with
+  | frozen => rw [hp] at hok; nomatch hok
+  | disabled => rw [hp] at hok; nomatch hok
+  | reservedFrz conf =>
+    refine ⟨(fun h => nomatch h), (fun h => nomatch h), fun hc => ?_⟩
+    injection hc with hconf
+    subst hconf
+    rw [hp] at hok
+    cases hpr : n.isProtected ps with
+    | false => rfl
+    | true =>
+      rw [hpr] at hok
+      simp at hok
+  | cell => exact ⟨(fun h => nomatch h), (fun h => nomatch h), (fun h => nomatch h)⟩
+  | reservedIM => exact ⟨(fun h => nomatch h), (fun h => nomatch h), (fun h => nomatch h)⟩
+  | unique => exact ⟨(fun h => nomatch h), (fun h => nomatch h), (fun h => nomatch h)⟩
+
+/-- `[adv B3]` helper: a successful *local* read step proves the node non-`.disabled` and fixed. -/
+private theorem stepNodeOnRangeRead_local_ok
+    (allNodes : List TreeTagNode) (ps : ProtectorSet) (allocId off len readerTag : Nat)
+    (n n' : TreeTagNode)
+    (hlen0 : Nat.beq len 0 = false)
+    (hanc : isDescendantOrSelf allNodes readerTag n.tag = true)
+    (halloc : Nat.beq n.allocId allocId = true)
+    (hok : stepNodeOnRangeRead allNodes ps allocId off len readerTag n = .ok n') :
+    n.perm ≠ .disabled ∧ stepNodeOnRangeRead allNodes ps allocId off len readerTag n = .ok n := by
+  have hfix : n.perm ≠ .disabled → stepNodeOnRangeRead allNodes ps allocId off len readerTag n =
+      .ok n := by
+    intro hnd
+    unfold stepNodeOnRangeRead
+    cases hp : n.perm with
+    | disabled => exact False.elim (hnd hp)
+    | cell | frozen | reservedIM | unique =>
+      simp only [hlen0, hanc, halloc, Bool.false_eq_true, Bool.not_true, ↓reduceIte]
+    | reservedFrz _ =>
+      simp only [hlen0, hanc, halloc, Bool.false_eq_true, Bool.not_true, ↓reduceIte]
+  have hnd : n.perm ≠ .disabled := by
+    intro hp
+    unfold stepNodeOnRangeRead at hok
+    simp only [hlen0, hanc, halloc, Bool.false_eq_true, Bool.not_true, ↓reduceIte, hp] at hok
+    nomatch hok
+  exact ⟨hnd, hfix hnd⟩
+
+/-- `[adv B3]` helper: flat single-pass success in the implicit-write case forces writable
+ancestors. -/
+private theorem execFnEntryMutRetagUpstream_write_ok_writableAncestors
+    (w : FnEntryBorrowWorld) (parentTag off len : Nat) (facts : RetagTypeFacts)
+    (hunpin : facts.tyIsUnpin = true) (hlen0 : Nat.beq len 0 = false)
+    (r : FnEntryBorrowWorld × Option Nat)
+    (hok : execFnEntryMutRetagUpstream w parentTag off len facts true .writableChildWrite = .ok r) :
+    AncestorsWritableIn w parentTag := by
+  have hselSome : selectFnEntryPolicy facts .mutable true .writableChildWrite =
+      some ⟨.active, .active, .reservedFrz false, .strong, true⟩ := by
+    simp [selectFnEntryPolicy, hunpin]
+  unfold execFnEntryMutRetagUpstream at hok
+  rw [hselSome] at hok
+  dsimp only [Bind.bind, Except.bind] at hok
+  cases hf : findTagNode? w.nodes parentTag with
+  | none => rw [hf] at hok; nomatch hok
+  | some parentNode =>
+    rw [hf] at hok
+    dsimp only at hok
+    cases hdis : (parentNode.perm == .disabled)
+    · by_cases hob : off + len > w.bytes.length
+      · simp [hdis, hob, throw, throwThe, MonadExceptOf.throw] at hok
+      · simp only [hdis, hob, hlen0, Bool.false_eq_true, ↓reduceIte, Bool.not_false,
+          Bool.true_and] at hok
+        cases hm : mapNodesM (stepNodeOnRangeWrite w.nodes w.activeProtectors w.allocId off len
+            parentTag) w.nodes with
+        | error e => rw [hm] at hok; nomatch hok
+        | ok ns =>
+          intro n hn hanc halloc
+          obtain ⟨n', hn'⟩ := mapNodesM_ok_each _ w.nodes ns hm n hn
+          exact stepNodeOnRangeWrite_local_ok_writable w.nodes w.activeProtectors w.allocId off len
+            parentTag n n' hlen0 hanc halloc hn'
+    · simp [hdis, throw, throwThe, MonadExceptOf.throw] at hok
+
+/-- `[adv B3]` helper: two-pass success in the implicit-write case forces writable ancestors. -/
+private theorem execFnEntryMutRetag_write_ok_writableAncestors
+    (w : FnEntryBorrowWorld) (parentTag off len : Nat) (facts : RetagTypeFacts)
+    (hwf : BorrowTreeTagsWF w) (hunpin : facts.tyIsUnpin = true) (hlen0 : Nat.beq len 0 = false)
+    (r : FnEntryBorrowWorld × Option Nat)
+    (hok : execFnEntryMutRetag w parentTag off len facts true .writableChildWrite false = .ok r) :
+    AncestorsWritableIn w parentTag := by
+  have hselSome : selectFnEntryPolicy facts .mutable true .writableChildWrite =
+      some ⟨.active, .active, .reservedFrz false, .strong, true⟩ := by
+    simp [selectFnEntryPolicy, hunpin]
+  unfold execFnEntryMutRetag at hok
+  rw [hselSome] at hok
+  dsimp only [Bind.bind, Except.bind] at hok
+  cases hf : findTagNode? w.nodes parentTag with
+  | none => rw [hf] at hok; nomatch hok
+  | some parentNode =>
+    rw [hf] at hok
+    dsimp only at hok
+    cases hdis : (parentNode.perm == .disabled)
+    · by_cases hob : off + len > w.bytes.length
+      · simp [hdis, hob, throw, throwThe, MonadExceptOf.throw] at hok
+      · simp only [hdis, hob, hlen0, Bool.false_eq_true, ↓reduceIte, Bool.not_false,
+          Bool.true_and, Bool.false_and] at hok
+        cases hread : mapNodesM (stepNodeOnRangeRead w.nodes w.activeProtectors w.allocId off len
+            parentTag) w.nodes with
+        | error e => rw [hread] at hok; nomatch hok
+        | ok nsRead =>
+          rw [hread] at hok
+          dsimp only at hok
+          let childBase : TreeTagNode :=
+            ⟨w.nextTag, w.allocId, off, len, .reservedFrz false, some w.nextProtector, some parentTag⟩
+          cases hwrite : mapNodesM (stepNodeOnRangeWrite (childBase :: nsRead)
+              (w.activeProtectors.insert w.nextProtector) w.allocId off len w.nextTag)
+              (childBase :: nsRead) with
+          | error e => rw [hwrite] at hok; nomatch hok
+          | ok nsW =>
+            intro n hn hanc halloc
+            obtain ⟨nr, hnr⟩ := mapNodesM_ok_each _ w.nodes nsRead hread n hn
+            obtain ⟨_, hfix⟩ := stepNodeOnRangeRead_local_ok w.nodes w.activeProtectors w.allocId off
+              len parentTag n nr hlen0 hanc halloc hnr
+            have hnMem : n ∈ nsRead := mapNodesM_preserves_fixed_mem _ w.nodes nsRead n hread hn hfix
+            obtain ⟨nw, hnw⟩ := mapNodesM_ok_each _ (childBase :: nsRead) nsW hwrite n
+              (List.mem_cons_of_mem _ hnMem)
+            obtain ⟨hlenEq, hfindEq⟩ := mapNodesM_read_length_and_findTag w.nodes w.activeProtectors
+              w.allocId off len parentTag w.nodes nsRead hread
+            have hparLt : parentTag < w.nextTag :=
+              findTagNode?_some_tag w.nodes parentTag parentNode hf ▸
+                (hwf parentNode (findTagNode?_some_mem w.nodes parentTag parentNode hf)).1
+            have hdescEq := isDescendantOrSelf_withChild_eq w hwf parentTag hparLt childBase rfl rfl
+              nsRead hlenEq hfindEq n hn
+            have hanc' : isDescendantOrSelf (childBase :: nsRead) w.nextTag n.tag = true :=
+              hdescEq.trans hanc
+            have hprotEq := isProtected_insert_fresh w hwf n hn
+            obtain ⟨h1, h2, h3⟩ := stepNodeOnRangeWrite_local_ok_writable (childBase :: nsRead)
+              (w.activeProtectors.insert w.nextProtector) w.allocId off len w.nextTag n nw hlen0 hanc'
+              halloc hnw
+            refine ⟨h1, h2, fun hc => ?_⟩
+            rw [← hprotEq]
+            exact h3 hc
+    · simp [hdis, throw, throwThe, MonadExceptOf.throw] at hok
+
+/-- **Success-Path Equivalence of All Three `FnEntry` Models on Every Well-Formed World
+(`execFnEntryMutRetag_ok_iff_upstream_ok_iff_sourceOrder_ok`, `[adv B3]`)**: strengthens A2's
+`execFnEntryMutRetag_eq_sourceOrder_of_writableAncestors` (which *assumes* `AncestorsWritableIn`)
+to **every** `w` with fresh tag/protector counters (`BorrowTreeTagsWF w`): two-pass
+`execFnEntryMutRetag` (`requireInit = false`), flat single-pass `execFnEntryMutRetagUpstream`, and
+ancestor-first `execFnEntryMutRetagSourceOrder` return `.ok r` for exactly the same `r` — across all
+policies, lengths, permissions, protector states and list orders (the second equivalence needs no
+well-formedness at all). Hence every success-path Part 2A theorem proved on the two-pass model
+transfers verbatim to the upstream-order model, and the three models fail on exactly the same
+inputs; they can differ **only** in *which* `RetagStepErr` they report
+(`execFnEntryMutRetagUpstream_reversedList_violates_traversalOrder`,
+`execFnEntryMutRetag_frozenParent_protectedChild_diverges_from_upstream`). -/
+theorem execFnEntryMutRetag_ok_iff_upstream_ok_iff_sourceOrder_ok
+    (w : FnEntryBorrowWorld) (parentTag off len : Nat)
+    (facts : RetagTypeFacts) (implicitWrites : Bool) (paramPolicy : FnEntryRetagPolicy)
+    (hwf : BorrowTreeTagsWF w) (r : FnEntryBorrowWorld × Option Nat) :
+    (execFnEntryMutRetag w parentTag off len facts implicitWrites paramPolicy false = .ok r ↔
+      execFnEntryMutRetagUpstream w parentTag off len facts implicitWrites paramPolicy = .ok r) ∧
+    (execFnEntryMutRetagUpstream w parentTag off len facts implicitWrites paramPolicy = .ok r ↔
+      execFnEntryMutRetagSourceOrder w parentTag off len facts implicitWrites paramPolicy = .ok r) := by
+  refine ⟨?_, execFnEntryMutRetagUpstream_ok_iff_sourceOrder_ok w parentTag off len facts
+    implicitWrites paramPolicy r⟩
+  by_cases hnoWr : paramPolicy = .rustcNoWritable ∨ implicitWrites = false ∨ len = 0
+  · rw [execFnEntryMutRetag_eq_upstream_when_no_implicitWrite _ _ _ _ _ _ _ hnoWr]
+  · have hpol : paramPolicy = .writableChildWrite := by
+      cases paramPolicy with
+      | writableChildWrite => rfl
+      | rustcNoWritable => exact False.elim (hnoWr (.inl rfl))
+    have himp : implicitWrites = true := by
+      cases implicitWrites with
+      | true => rfl
+      | false => exact False.elim (hnoWr (.inr (.inl rfl)))
+    have hlen0 : Nat.beq len 0 = false := by
+      cases len with
+      | zero => exact False.elim (hnoWr (.inr (.inr rfl)))
+      | succ _ => rfl
+    subst hpol himp
+    cases hunpin : facts.tyIsUnpin
+    · have hselNone : selectFnEntryPolicy facts .mutable true .writableChildWrite = none := by
+        simp [selectFnEntryPolicy, hunpin]
+      unfold execFnEntryMutRetag execFnEntryMutRetagUpstream
+      rw [hselNone]
+    · constructor
+      · intro h2
+        have hwrit := execFnEntryMutRetag_write_ok_writableAncestors w parentTag off len facts hwf
+          hunpin hlen0 r h2
+        rw [← (execFnEntryMutRetag_eq_sourceOrder_of_writableAncestors w parentTag off len facts true
+          .writableChildWrite hwf hwrit).1]
+        exact h2
+      · intro hU
+        have hwrit := execFnEntryMutRetagUpstream_write_ok_writableAncestors w parentTag off len facts
+          hunpin hlen0 r hU
+        rw [(execFnEntryMutRetag_eq_sourceOrder_of_writableAncestors w parentTag off len facts true
+          .writableChildWrite hwf hwrit).1]
+        exact hU
 
 /-- **Operational `Trusted.MirSemantics` Overlay (`applyParamFnEntryImplicitWrite`)**:
 upgrades `evalStmt` on `StatementKind.retag .fnEntry place` with per-parameter
@@ -6128,16 +6429,27 @@ def validateRawPtrLayoutFirst (maxSize : Nat) (pointee : ProtoTy) (val : PtrRepr
     | none => .error .expectedWideSliceMeta
     | some mk => validateUnsizedRawPtrMeta mk val
 
-/-- **`lean-miri#79` Syntactic `Sized` & Tail-Metadata Fast-Path Raw-Pointer Validator
-(`[adv A2]` custom-DST fix)**: consults `isSyntacticallySized pointee` (and `unsizedMetadataTail`
-only when unsized) *without* invoking `computeTyLayout`! -/
-def validateRawPtrFastPath (pointee : ProtoTy) (val : PtrReprVal) :
+/-- **`lean-miri#79` Syntactic `Sized` Fast-Path Raw-Pointer Validator** (`[adv A2]` custom-DST
+metadata tails; `[adv B3]` unsized-pointee layout query), mirroring `ValidityVisitor.primitive`
+`.rawPointer _ sized` (`ValidityVisitor.lean:317–327`):
+- `sized = true` (syntactically `Sized`, i.e. rustc's trait-based `is_sized`): **no** pointee layout
+  query at all — this is the `#79` fast path that makes `*const [u8; usize::MAX]` valid;
+- `sized = false`: `h.ptrToPlace` (`PointerPlaceMachine.fromImmediate`, `PointerPlaceMachine.lean:81`:
+  `compiler.layoutOf choice ty`) **does** compute the pointee layout *before* `checkMetadata`, so an
+  unsized pointee whose layout overflows (`*const ([u8; usize::MAX], [u8])`,
+  `*const [[u8; usize::MAX]]`) is rejected exactly as by the layout-first validator. A0–A2 skipped this
+  query and accepted such pointers (A2 even stated it as a "separation").
+- `dyn` tails: only the metadata *shape* (non-null vtable word) is checked here; upstream
+  `checkMetadata` additionally requires vtable identity (`VTable.getPtrVTableType`), modeled by
+  `validateRawWideDynPtrMeta` in Part 3C because it needs the vtable registry. -/
+def validateRawPtrFastPath (maxSize : Nat) (pointee : ProtoTy) (val : PtrReprVal) :
     Except PtrValErr Unit :=
   if isSyntacticallySized pointee then
     match val with
     | .thin _ _ => .ok ()
     | _ => .error .expectedThinRawPtr
-  else
+  else do
+    let _ ← (computeTyLayout maxSize pointee).mapError PtrValErr.layoutErr
     match unsizedMetadataTail pointee with
     | none => .error .expectedWideSliceMeta
     | some mk => validateUnsizedRawPtrMeta mk val
@@ -6164,10 +6476,49 @@ def validateSafeThinRef (maxSize : Nat) (w : KeyedAllocWorld) (pointee : ProtoTy
 theorem validateRawPtrFastPath_eq_layoutFirst_of_layoutOk
     (maxSize : Nat) (pointee : ProtoTy) (layout : ComputedTyLayout) (val : PtrReprVal)
     (hok : computeTyLayout maxSize pointee = .ok layout) :
-    validateRawPtrFastPath pointee val = validateRawPtrLayoutFirst maxSize pointee val := by
+    validateRawPtrFastPath maxSize pointee val = validateRawPtrLayoutFirst maxSize pointee val := by
   unfold validateRawPtrFastPath validateRawPtrLayoutFirst
   rw [hok, isSyntacticallySized_eq_of_computeTyLayout_ok maxSize pointee layout hok]
-  rfl
+  cases hsz : layout.isSized <;> simp [hsz, Except.mapError, Bind.bind, Except.bind]
+
+/-- **Unsized-Pointee Agreement (`validateRawPtrFastPath_eq_layoutFirst_of_unsized`, `[adv B3]`)**:
+for *every* pointee that is **not** syntactically `Sized` — whether or not its layout computation
+succeeds — the fast path and the layout-first validator coincide on every `PtrReprVal`, because
+upstream (`ValidityVisitor.lean:323–326` + `PointerPlaceMachine.lean:81`) queries `layoutOf` for
+every unsized raw-pointer pointee. -/
+theorem validateRawPtrFastPath_eq_layoutFirst_of_unsized
+    (maxSize : Nat) (pointee : ProtoTy) (val : PtrReprVal)
+    (hunsized : isSyntacticallySized pointee = false) :
+    validateRawPtrFastPath maxSize pointee val = validateRawPtrLayoutFirst maxSize pointee val := by
+  unfold validateRawPtrFastPath validateRawPtrLayoutFirst
+  rw [hunsized]
+  cases hc : computeTyLayout maxSize pointee with
+  | error e => simp [Except.mapError, Bind.bind, Except.bind]
+  | ok layout =>
+    have hsz : layout.isSized = false := by
+      rw [← isSyntacticallySized_eq_of_computeTyLayout_ok maxSize pointee layout hc]
+      exact hunsized
+    simp [hsz, Except.mapError, Bind.bind, Except.bind]
+
+/-- **Exact `lean-miri#79` Separation Characterization
+(`validateRawPtrFastPath_ne_layoutFirst_imp`, `[adv B3]`)**: the fast path and the layout-first
+validator can disagree **only** on a syntactically `Sized` pointee whose layout computation fails
+(the `too-big-type-behind-raw-ptr` class, e.g. `*const [u8; usize::MAX]`); on every unsized pointee
+and on every pointee with a valid layout they agree. -/
+theorem validateRawPtrFastPath_ne_layoutFirst_imp
+    (maxSize : Nat) (pointee : ProtoTy) (val : PtrReprVal)
+    (hne : validateRawPtrFastPath maxSize pointee val ≠
+      validateRawPtrLayoutFirst maxSize pointee val) :
+    isSyntacticallySized pointee = true ∧ ∃ e, computeTyLayout maxSize pointee = .error e := by
+  cases hs : isSyntacticallySized pointee with
+  | false =>
+    exact absurd (validateRawPtrFastPath_eq_layoutFirst_of_unsized maxSize pointee val hs) hne
+  | true =>
+    refine ⟨rfl, ?_⟩
+    cases hc : computeTyLayout maxSize pointee with
+    | error e => exact ⟨e, rfl⟩
+    | ok layout =>
+      exact absurd (validateRawPtrFastPath_eq_layoutFirst_of_layoutOk maxSize pointee layout val hc) hne
 
 /-- **Strict Separation Theorem (`oversized_array_rawPtr_separation`)**: on `*const [elem; count]`
 whenever `elem` has layout size `elemSz > 0` and `elemSz * count > maxSize` (such as
@@ -6182,7 +6533,7 @@ theorem oversized_array_rawPtr_separation
     (hel : computeTyLayout maxSize elem = .ok el)
     (hsized : el.isSized = true)
     (hoverflow : el.sizeBytes * count > maxSize) :
-    validateRawPtrFastPath (.array elem count) (.thin addr prov) = .ok () ∧
+    validateRawPtrFastPath maxSize (.array elem count) (.thin addr prov) = .ok () ∧
     validateRawPtrLayoutFirst maxSize (.array elem count) (.thin addr prov) =
       .error (.layoutErr (.sizeOverflow (el.sizeBytes * count) maxSize)) ∧
     validateSafeThinRef maxSize w (.array elem count) addr prov =
@@ -6195,25 +6546,40 @@ theorem oversized_array_rawPtr_separation
     simp [hel, hsized, hoverflow, Except.mapError, Bind.bind, Except.bind,
       throw, throwThe, MonadExceptOf.throw]
 
-/-- **Slice DST Contrast Theorem (`slice_dst_rawPtr_requires_wideSliceMeta`)**: unlike fixed-length
-arrays `[T; N]`, unsized slice DSTs `[T]` (`.slice elem`) are **not** syntactically `Sized`; a thin
-raw pointer `*const [T]` fails with `.expectedWideSliceMeta`, whereas a wide slice raw pointer
-carrying `elemCount` metadata succeeds! -/
+/-- **Slice DST Contrast Theorem (`slice_dst_rawPtr_requires_wideSliceMeta`, `[adv B3]` layout
+premise)**: unlike fixed-length arrays `[T; N]`, unsized slice DSTs `[T]` (`.slice elem`) are **not**
+syntactically `Sized`; for an element type with a valid `Sized` layout, a thin raw pointer
+`*const [T]` fails with `.expectedWideSliceMeta`, whereas a wide slice raw pointer carrying `elemCount`
+metadata succeeds. The element-layout premise is necessary: upstream computes `layoutOf [T]` for
+every unsized raw-pointer pointee (`unsized_rawPtr_layoutOverflow_rejected_like_upstream`). -/
 theorem slice_dst_rawPtr_requires_wideSliceMeta
-    (elem : ProtoTy) (addr elemCount : UInt64) (prov : Option MiriAllocId) :
+    (maxSize : Nat) (elem : ProtoTy) (el : ComputedTyLayout)
+    (addr elemCount : UInt64) (prov : Option MiriAllocId)
+    (hel : computeTyLayout maxSize elem = .ok el) (hsized : el.isSized = true) :
     isSyntacticallySized (.slice elem) = false ∧
-    validateRawPtrFastPath (.slice elem) (.thin addr prov) = .error .expectedWideSliceMeta ∧
-    validateRawPtrFastPath (.slice elem) (.wideSlice addr prov elemCount) = .ok () :=
-  ⟨rfl, rfl, rfl⟩
+    validateRawPtrFastPath maxSize (.slice elem) (.thin addr prov) = .error .expectedWideSliceMeta ∧
+    validateRawPtrFastPath maxSize (.slice elem) (.wideSlice addr prov elemCount) = .ok () := by
+  have hslice : computeTyLayout maxSize (.slice elem) = .ok ⟨0, el.alignBytes, false, true⟩ := by
+    unfold computeTyLayout
+    simp [hel, hsized, Bind.bind, Except.bind, Pure.pure, Except.pure]
+  refine ⟨rfl, ?_, ?_⟩
+  · unfold validateRawPtrFastPath
+    simp [isSyntacticallySized, hslice, Except.mapError, Bind.bind, Except.bind,
+      unsizedMetadataTail, validateUnsizedRawPtrMeta]
+  · unfold validateRawPtrFastPath
+    simp [isSyntacticallySized, hslice, Except.mapError, Bind.bind, Except.bind,
+      unsizedMetadataTail, validateUnsizedRawPtrMeta]
 
-/-- **Custom Struct/Tuple DST Raw-Pointer Fast-Path & Oversized-Head Separation
-(`customDst_oversizedHead_rawPtr_separation`, `[adv A2]`)**: on a custom tuple DST
-`*const ([elem; count], [tailElem])` whose sized head field `[elem; count]` overflows `maxSize`:
-1. `validateRawPtrFastPath` walks `unsizedMetadataTail` (`some .sliceMeta`) without computing
-   `el.sizeBytes * count`, **succeeding** on `.wideSlice` and rejecting `.thin` with
-   `.expectedWideSliceMeta` (A0–B2 rejected `.wideSlice` on *all* custom tuple/ADT DSTs!),
-2. `validateRawPtrLayoutFirst` spuriously fails with `.error (.layoutErr (.sizeOverflow ...))`! -/
-theorem customDst_oversizedHead_rawPtr_separation
+/-- **Unsized Raw Pointers Still Query Their Pointee Layout
+(`unsized_rawPtr_layoutOverflow_rejected_like_upstream`, `[adv B3]`)** — corrects A2's
+`customDst_oversizedHead_rawPtr_separation`, which claimed the fast path *accepts*
+`*const ([elem; count], [tailElem])` with an overflowing `[elem; count]` head while the layout-first
+validator "spuriously" rejects it. Upstream skips the pointee layout query only when `sized = true`
+(`ValidityVisitor.lean:323`); for unsized pointees `h.ptrToPlace` runs `layoutOf`
+(`PointerPlaceMachine.lean:81`), which overflows. Hence the custom tuple DST and the slice
+`*const [[elem; count]]` are both rejected by **both** validators with the same `.sizeOverflow`, while
+the syntactically `Sized` `*const [elem; count]` itself stays valid (`oversized_array_rawPtr_separation`). -/
+theorem unsized_rawPtr_layoutOverflow_rejected_like_upstream
     (maxSize : Nat) (elem tailElem : ProtoTy) (el : ComputedTyLayout)
     (count : Nat) (addr elemCount : UInt64) (prov : Option MiriAllocId)
     (hel : computeTyLayout maxSize elem = .ok el)
@@ -6221,18 +6587,31 @@ theorem customDst_oversizedHead_rawPtr_separation
     (hoverflow : el.sizeBytes * count > maxSize) :
     let dstTy : ProtoTy := .tuple [.array elem count, .slice tailElem]
     unsizedMetadataTail dstTy = some .sliceMeta ∧
-    validateRawPtrFastPath dstTy (.wideSlice addr prov elemCount) = .ok () ∧
-    validateRawPtrFastPath dstTy (.thin addr prov) = .error .expectedWideSliceMeta ∧
+    validateRawPtrFastPath maxSize dstTy (.wideSlice addr prov elemCount) =
+      .error (.layoutErr (.sizeOverflow (el.sizeBytes * count) maxSize)) ∧
     validateRawPtrLayoutFirst maxSize dstTy (.wideSlice addr prov elemCount) =
+      .error (.layoutErr (.sizeOverflow (el.sizeBytes * count) maxSize)) ∧
+    validateRawPtrFastPath maxSize (.slice (.array elem count)) (.wideSlice addr prov elemCount) =
       .error (.layoutErr (.sizeOverflow (el.sizeBytes * count) maxSize)) := by
-  refine ⟨rfl, rfl, rfl, ?_⟩
   have harr : computeTyLayout maxSize (.array elem count) =
       .error (.sizeOverflow (el.sizeBytes * count) maxSize) := by
     unfold computeTyLayout
     simp [hel, hsized, hoverflow, Bind.bind, Except.bind,
       throw, throwThe, MonadExceptOf.throw]
-  unfold validateRawPtrLayoutFirst computeTyLayout computeFieldsLayout
-  simp [harr, Except.mapError, Bind.bind, Except.bind]
+  have hsl : computeTyLayout maxSize (.slice (.array elem count)) =
+      .error (.sizeOverflow (el.sizeBytes * count) maxSize) := by
+    unfold computeTyLayout
+    simp [harr, Bind.bind, Except.bind]
+  have hlayFirst : validateRawPtrLayoutFirst maxSize (.tuple [.array elem count, .slice tailElem])
+      (.wideSlice addr prov elemCount) =
+      .error (.layoutErr (.sizeOverflow (el.sizeBytes * count) maxSize)) := by
+    unfold validateRawPtrLayoutFirst computeTyLayout computeFieldsLayout
+    simp [harr, Except.mapError, Bind.bind, Except.bind]
+  refine ⟨rfl, ?_, hlayFirst, ?_⟩
+  · rw [validateRawPtrFastPath_eq_layoutFirst_of_unsized maxSize _ _ rfl]
+    exact hlayFirst
+  · unfold validateRawPtrFastPath
+    simp [isSyntacticallySized, hsl, Except.mapError, Bind.bind, Except.bind]
 
 /-! ### Part 3B: Principal-Less Auto-Trait `dyn Send` VTable Keys & Registry (`lean-miri#75`) -/
 
@@ -7686,14 +8065,20 @@ theorem SaltedVTableWorldWF.internSalted_roundTrip
    `addr.toNat + sz.toNat ≥ usizeMax64` (`ValidityVisitor.lean:215–218`, `.addressTooClose sz`,
    `[adv A2]`).
 4. Checks non-nullness (`scalarMayBeNull`, line 225) and alignment (`checkPointerAlignResult`,
-   lines 227–228) **before** `!mayDangle` recursive `unpackDynTrait` concrete-pointee inhabitedness
-   (lines 230 & 412–418; at line 226 `place.layout.ty` is `dyn Trait`, which is inhabited, so
-   `mayDangle = true` e.g. `ManuallyDrop<Box<dyn Send>>` from `!` does NOT raise
-   `.uninhabitedPointee`, and under `mayDangle = false` `.unalignedSafePointer` precedes
-   `.uninhabitedPointee`, `[adv A2]`). -/
+   lines 227–228). Line 226 (`opsemInhabited c place.layout.ty`) never fires here: `place.layout.ty`
+   is `dyn Trait`, which is inhabited (`[adv A2]`).
+5. `[adv B3]` — concrete-pointee inhabitedness is checked **only** under `recursive && !mayDangle`.
+   Upstream visits the vtable's concrete type (`unpackDynTrait`, lines 412–418) solely through the
+   reference tracker of `validatePlace … (recursive := true)` (lines 534, 542–556,
+   `-Zmiri-recursive-validation`), which tracks a pointee only when `!mayDangle` (line 230) and runs
+   *after* the whole root value has been validated. Miri's default runtime validation is
+   non-recursive (`recursive := false`), where a `&dyn Send` to an uninhabited concrete type passes —
+   A2's unconditional `!mayDangle` check was a false UB there. In recursive mode `.uninhabitedPointee`
+   abstracts the deferred failure of the concrete value's own visit (e.g. its `!` field); other
+   recursive pointee-content failures are not modeled. -/
 def validateWideDynSafePtr (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
     (expectedSpec : DynExistentialSpec) (mayDangle : Bool)
-    (dataPtr vtablePtr : ScalarPtrHalf) :
+    (dataPtr vtablePtr : ScalarPtrHalf) (recursive : Bool := false) :
     Except WideDynValidityErr (ProtoTy × UInt64 × UInt64) := do
   let desc ← validateVTableHalf w reg vtablePtr expectedSpec
   let sz := desc.sizeBytes
@@ -7727,7 +8112,7 @@ def validateWideDynSafePtr (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize
     if addr == 0 then throw (WideDynValidityErr.nullSafePointer false)
     if al > 0 && (addr % al != 0) then
       throw (WideDynValidityErr.unalignedSafePointer al addr)
-    if !mayDangle then
+    if recursive && !mayDangle then
       let inhabited :=
         match computeTyLayout maxSize desc.concreteTy with
         | .ok l => l.isInhabited
@@ -7870,15 +8255,19 @@ theorem wideDyn_validVTable_danglingIntZero_reports_null
       Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
 
 /-- **`mayDangle` Address-Space End Guard & Uninhabited Concrete Type Soundness
-(`wideDyn_mayDangle_addressTooClose_and_uninhabited_concrete_ok`, `[adv A2]`)**: matching
-`ValidityVisitor.lean` lines 215–230 & 412–418:
+(`wideDyn_mayDangle_addressTooClose_and_uninhabited_concrete_ok`, `[adv A2]`, recursive-mode split
+`[adv B3]`)**: matching `ValidityVisitor.lean` lines 213–230, 412–418 & 529–556:
 1. Under `mayDangle = true`, a `.danglingInt closeAddr` with `closeAddr.toNat + desc.sizeBytes.toNat ≥
-   usizeMax64` faults with `.error (.addressTooClose desc.sizeBytes)` *before* alignment or nullness!
+   usizeMax64` faults with `.error (.addressTooClose desc.sizeBytes)` *before* alignment or nullness.
 2. Under `mayDangle = true`, an in-bounds aligned nonzero `.danglingInt okAddr` **succeeds** with
    `.ok (desc.concreteTy, desc.sizeBytes, desc.alignBytes)` **even when `desc.concreteTy` is
-   uninhabited** (e.g. `ManuallyDrop<Box<dyn Send>>` constructed from `!`), whereas `mayDangle =
-   false` on a live aligned pointer to the same uninhabited concrete type faults with
-   `.error .uninhabitedPointee`! -/
+   uninhabited** (e.g. `ManuallyDrop<Box<dyn Send>>` constructed from `!`).
+3. Under `mayDangle = false` **and recursive validation** (`-Zmiri-recursive-validation`), a live
+   aligned pointer to the same uninhabited concrete type faults with `.error .uninhabitedPointee`
+   (the deferred tracker visit of the concrete pointee fails).
+4. `[adv B3]` Under Miri's **default non-recursive** validation the very same `mayDangle = false`
+   pointer is **valid** (`.ok …`): `checkSafe` only tests `opsemInhabited` of `dyn Trait` (line 226)
+   and never visits the concrete type. A2 reported conjunct 3's UB unconditionally. -/
 theorem wideDyn_mayDangle_addressTooClose_and_uninhabited_concrete_ok
     (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
     (expectedSpec : DynExistentialSpec) (vtablePtr : ScalarPtrHalf)
@@ -7898,8 +8287,10 @@ theorem wideDyn_mayDangle_addressTooClose_and_uninhabited_concrete_ok
       .error (.addressTooClose desc.sizeBytes) ∧
     validateWideDynSafePtr w reg maxSize expectedSpec true (.danglingInt okAddr) vtablePtr =
       .ok (desc.concreteTy, desc.sizeBytes, desc.alignBytes) ∧
+    validateWideDynSafePtr w reg maxSize expectedSpec false (.provenanced okAddr dataId 0) vtablePtr
+      (recursive := true) = .error .uninhabitedPointee ∧
     validateWideDynSafePtr w reg maxSize expectedSpec false (.provenanced okAddr dataId 0) vtablePtr =
-      .error .uninhabitedPointee := by
+      .ok (desc.concreteTy, desc.sizeBytes, desc.alignBytes) := by
   have hcloseD : decide (closeAddr.toNat + desc.sizeBytes.toNat ≥ usizeMax64) = true :=
     decide_eq_true hclose
   have hnotCloseD : decide (okAddr.toNat + desc.sizeBytes.toNat ≥ usizeMax64) = false :=
@@ -7909,30 +8300,37 @@ theorem wideDyn_mayDangle_addressTooClose_and_uninhabited_concrete_ok
     by_cases hal : desc.alignBytes > 0
     · simp [hal, hokAlign hal]
     · simp [hal]
-  refine ⟨?_, ?_, ?_⟩
+  have hkindF : (info.kind != .liveData) = false := by rw [hkind]; rfl
+  refine ⟨?_, ?_, ?_, ?_⟩
   · unfold validateWideDynSafePtr
     simp [hv, hcloseD, Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
   · unfold validateWideDynSafePtr
     simp [hv, hnotCloseD, hok0, halFalse, Pure.pure, Except.pure, Bind.bind, Except.bind]
-  · have hkindF : (info.kind != .liveData) = false := by rw [hkind]; rfl
-    unfold validateWideDynSafePtr
+  · unfold validateWideDynSafePtr
     if hsz : desc.sizeBytes > 0 then
       simp [hv, hsz, hlive, hkindF, hfit, hok0, halFalse, hlay, huninh,
         Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
     else
       simp [hv, hsz, hok0, halFalse, hlay, huninh,
         Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
+  · unfold validateWideDynSafePtr
+    if hsz : desc.sizeBytes > 0 then
+      simp [hv, hsz, hlive, hkindF, hfit, hok0, halFalse,
+        Pure.pure, Except.pure, Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
+    else
+      simp [hv, hsz, hok0, halFalse, Pure.pure, Except.pure, Bind.bind, Except.bind]
 
 /-- **Alignment Precedes Concrete-Type Uninhabitedness (`wideDyn_unaligned_precedes_concrete_uninhabited`,
-`[adv A2]`)**: matching `ValidityVisitor.lean` lines 227–228 (`checkPointerAlignResult` inside
-`checkSafe`) vs. lines 412–418 (`unpackDynTrait` during recursive place visitation), an unaligned
-live non-null wide `dyn` safe pointer whose concrete type is uninhabited (e.g. `(u32, !) as dyn Send`
-at `addr = 2`) reports `.unalignedSafePointer` **before** `.uninhabitedPointee`! -/
+`[adv A2]`, generalized over the validation mode in `[adv B3]`)**: matching `ValidityVisitor.lean`
+lines 227–228 (`checkPointerAlignResult` inside `checkSafe`) vs. lines 412–418 (`unpackDynTrait`,
+reached only by the recursive tracker after the root completes), an unaligned live non-null wide `dyn`
+safe pointer whose concrete type is uninhabited (e.g. `(u32, !) as dyn Send` at `addr = 2`) reports
+`.unalignedSafePointer` in **both** recursive and non-recursive validation. -/
 theorem wideDyn_unaligned_precedes_concrete_uninhabited
     (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
     (expectedSpec : DynExistentialSpec) (vtablePtr : ScalarPtrHalf)
     (desc : VTableDescriptor) (lay : ComputedTyLayout)
-    (addr : UInt64) (dataId : MiriAllocId) (info : AllocInfo)
+    (addr : UInt64) (dataId : MiriAllocId) (info : AllocInfo) (recursive : Bool)
     (hv : validateVTableHalf w reg vtablePtr expectedSpec = .ok desc)
     (hlive : w.getAllocInfo dataId = .ok info)
     (hkind : info.kind = .liveData)
@@ -7942,8 +8340,8 @@ theorem wideDyn_unaligned_precedes_concrete_uninhabited
     (hunalign : addr % desc.alignBytes ≠ 0)
     (hlay : computeTyLayout maxSize desc.concreteTy = .ok lay)
     (huninh : lay.isInhabited = false) :
-    validateWideDynSafePtr w reg maxSize expectedSpec false (.provenanced addr dataId 0) vtablePtr =
-      .error (.unalignedSafePointer desc.alignBytes addr) ∧
+    validateWideDynSafePtr w reg maxSize expectedSpec false (.provenanced addr dataId 0) vtablePtr
+      recursive = .error (.unalignedSafePointer desc.alignBytes addr) ∧
     (computeTyLayout maxSize desc.concreteTy).map ComputedTyLayout.isInhabited = .ok false := by
   have haddr0 : (addr == 0) = false := beq_false_of_ne hnz
   have hmod : (addr % desc.alignBytes != 0) = true := bne_iff_ne.mpr hunalign
@@ -7956,6 +8354,66 @@ theorem wideDyn_unaligned_precedes_concrete_uninhabited
   else
     simp [hv, hsz, haddr0, hal_pos, hmod,
       Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
+
+/-- **Raw `*const dyn Trait` Metadata Validation (`validateRawWideDynPtrMeta`, `[adv B3]`)**:
+upstream `ValidityVisitor.primitive` `.rawPointer _ false` → `checkMetadata` →
+`VTable.getPtrVTableType h.vtable c pointer (some expected)` (`ValidityVisitor.lean:184–195,
+317–327`; likewise `PointerPlaceMachine.dereference`, lines 108–113) requires a *raw* wide `dyn`
+pointer to carry a **genuine vtable for the expected trait**, while performing **no** null /
+alignment / dangling check on its data half. The `ProtoTy`-level `validateUnsizedRawPtrMeta .dynMeta`
+used by both Part 3A raw validators checks only the metadata *shape* (non-null vtable word) and is
+therefore strictly weaker (`rawWideDyn_shapeCheck_misses_invalid_vtable`). -/
+def validateRawWideDynPtrMeta (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (expectedSpec : DynExistentialSpec) (vtablePtr : ScalarPtrHalf) :
+    Except WideDynValidityErr Unit :=
+  (validateVTableHalf w reg vtablePtr expectedSpec).map (fun _ => ())
+
+/-- **Raw Wide `dyn` Pointers: VTable Identity Checked, Data Half Unchecked
+(`rawWideDyn_vtable_checked_data_unchecked`, `[adv B3]`)**: for every world, registry, expected spec
+and vtable half:
+1. the raw check fails with exactly the vtable error the *safe* validator reports first for **every**
+   data half (`wideDyn_invalidVTable_precedes_all_data_ub`), and
+2. whenever the vtable is valid the raw check succeeds, although the safe validator still rejects a
+   null data half (`.nullSafePointer false`) — raw pointers skip all data-pointer checks. -/
+theorem rawWideDyn_vtable_checked_data_unchecked
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
+    (expectedSpec : DynExistentialSpec) (vtablePtr : ScalarPtrHalf) (mayDangle : Bool) :
+    (∀ (vErr : WideDynValidityErr) (dataPtr : ScalarPtrHalf),
+      validateVTableHalf w reg vtablePtr expectedSpec = .error vErr →
+      validateRawWideDynPtrMeta w reg expectedSpec vtablePtr = .error vErr ∧
+      validateWideDynSafePtr w reg maxSize expectedSpec mayDangle dataPtr vtablePtr = .error vErr) ∧
+    (∀ (desc : VTableDescriptor),
+      validateVTableHalf w reg vtablePtr expectedSpec = .ok desc →
+      validateRawWideDynPtrMeta w reg expectedSpec vtablePtr = .ok () ∧
+      validateWideDynSafePtr w reg maxSize expectedSpec mayDangle .null vtablePtr =
+        .error (.nullSafePointer false)) := by
+  refine ⟨fun vErr dataPtr hv => ⟨?_, ?_⟩, fun desc hv => ⟨?_, ?_⟩⟩
+  · unfold validateRawWideDynPtrMeta
+    rw [hv]; rfl
+  · exact wideDyn_invalidVTable_precedes_all_data_ub w reg maxSize expectedSpec mayDangle
+      dataPtr vtablePtr vErr hv
+  · unfold validateRawWideDynPtrMeta
+    rw [hv]; rfl
+  · exact wideDyn_validVTable_nullData_reports_nullSafePointer w reg maxSize expectedSpec mayDangle
+      vtablePtr desc hv
+
+/-- **The `ProtoTy`-Level Raw `dyn` Check Is Shape-Only
+(`rawWideDyn_shapeCheck_misses_invalid_vtable`, `[adv B3]`)**: for every *non-null* integer vtable
+word `vAddr` without provenance, `validateUnsizedRawPtrMeta .dynMeta` (hence `validateRawPtrFastPath`
+and `validateRawPtrLayoutFirst` on any `dyn`-tailed pointee) accepts the raw wide pointer, whereas the
+upstream vtable-identity check rejects the same vtable half with `.invalidVTableDanglingInt` in every
+world and registry. This is the precise residual gap between the Part 3A raw validators and upstream
+`checkMetadata`; Track A must route `dyn` raw metadata through `validateRawWideDynPtrMeta`. -/
+theorem rawWideDyn_shapeCheck_misses_invalid_vtable
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (expectedSpec : DynExistentialSpec)
+    (dataAddr vAddr : UInt64) (dataProv : Option MiriAllocId) (hvNz : vAddr ≠ 0) :
+    validateUnsizedRawPtrMeta .dynMeta (.wideDyn dataAddr dataProv vAddr none) = .ok () ∧
+    validateRawWideDynPtrMeta w reg expectedSpec (.danglingInt vAddr) =
+      .error .invalidVTableDanglingInt := by
+  have hv0 : (vAddr == 0) = false := beq_false_of_ne hvNz
+  refine ⟨?_, rfl⟩
+  unfold validateUnsizedRawPtrMeta
+  simp [hv0]
 
 /-- **Salted VTable Distinct-Allocation & Shared-Validity Theorem
 (`saltedVTable_distinct_salts_distinct_allocIds_both_valid`, `[adv A1]`)**: matching

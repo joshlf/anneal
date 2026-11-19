@@ -1334,6 +1334,85 @@ theorem canary_part2A_sourceOrder_traversal_and_arbitraryWorld_equivalence :
   rw [hrunNoWr]
   exact hpres
 
+/-- **`[adv B3]` Closed canary — success-path equivalence of all three `FnEntry` models, failure
+agreement with error-only divergence**:
+1. On the well-formed child-first world (`BorrowTreeTagsWF`), two-pass `execFnEntryMutRetag` and
+   ancestor-first `execFnEntryMutRetagSourceOrder` *both fail*, but with different diagnostics
+   (`.protectedForeignConflict` vs. `.ancestorWriteForbidden`), so the equivalence below cannot be
+   strengthened to equality of results.
+2. On `multiLevelBorrowWorld`, the two-pass success result transfers — via
+   `execFnEntryMutRetag_ok_iff_upstream_ok_iff_sourceOrder_ok`, not by recomputation — to the flat
+   single-pass and ancestor-first models, under both `.writableChildWrite` and `.rustcNoWritable`. -/
+theorem canary_part2A_successEquivalence_and_errorOnlyDivergence :
+    (let wChildFirst : FnEntryBorrowWorld := {
+       allocId := 10
+       bytes := [.uninit, .uninit, .uninit, .uninit]
+       nodes := [
+         ⟨5, 10, 0, 4, .unique, some 7, some 1⟩,
+         ⟨1, 10, 0, 4, .frozen, none, none⟩
+       ]
+       activeProtectors := ProtectorSet.empty.insert 7
+       nextTag := 6
+       nextProtector := 8
+     }
+     BorrowTreeTagsWF wChildFirst ∧
+     execFnEntryMutRetag wChildFirst 1 0 4 unpinFreezeFacts true .writableChildWrite false =
+       .error .protectedForeignConflict ∧
+     execFnEntryMutRetagSourceOrder wChildFirst 1 0 4 unpinFreezeFacts true .writableChildWrite =
+       .error .ancestorWriteForbidden) ∧
+    (∃ r, execFnEntryMutRetag multiLevelBorrowWorld 2 0 4 unpinFreezeFacts true .writableChildWrite
+        false = .ok r ∧
+      execFnEntryMutRetagUpstream multiLevelBorrowWorld 2 0 4 unpinFreezeFacts true
+        .writableChildWrite = .ok r ∧
+      execFnEntryMutRetagSourceOrder multiLevelBorrowWorld 2 0 4 unpinFreezeFacts true
+        .writableChildWrite = .ok r) ∧
+    (∃ r, execFnEntryMutRetag multiLevelBorrowWorld 2 0 4 unpinFreezeFacts true .rustcNoWritable
+        false = .ok r ∧
+      execFnEntryMutRetagSourceOrder multiLevelBorrowWorld 2 0 4 unpinFreezeFacts true
+        .rustcNoWritable = .ok r) := by
+  have hwfML : BorrowTreeTagsWF multiLevelBorrowWorld := by
+    intro n hmem
+    unfold multiLevelBorrowWorld at hmem
+    rcases List.mem_cons.mp hmem with rfl | h1
+    · refine ⟨by decide, fun p hp => by injection hp with hp'; subst hp'; decide, fun pr hpr => nomatch hpr⟩
+    · rcases List.mem_cons.mp h1 with rfl | h2
+      · refine ⟨by decide, fun p hp => by injection hp with hp'; subst hp'; decide,
+          fun pr hpr => by injection hpr with hpr'; subst hpr'; decide⟩
+      · rcases List.mem_cons.mp h2 with rfl | h3
+        · refine ⟨by decide, fun p hp => by injection hp with hp'; subst hp'; decide, fun pr hpr => nomatch hpr⟩
+        · rcases List.mem_cons.mp h3 with rfl | h4
+          · refine ⟨by decide, (fun p hp => nomatch hp), (fun pr hpr => nomatch hpr)⟩
+          · nomatch h4
+  have hwfCF : BorrowTreeTagsWF {
+      allocId := 10
+      bytes := [.uninit, .uninit, .uninit, .uninit]
+      nodes := [
+        ⟨5, 10, 0, 4, .unique, some 7, some 1⟩,
+        ⟨1, 10, 0, 4, .frozen, none, none⟩
+      ]
+      activeProtectors := ProtectorSet.empty.insert 7
+      nextTag := 6
+      nextProtector := 8 } := by
+    intro n hmem
+    rcases List.mem_cons.mp hmem with rfl | h1
+    · refine ⟨by decide, fun p hp => by injection hp with hp'; subst hp'; decide,
+        fun pr hpr => by injection hpr with hpr'; subst hpr'; decide⟩
+    · rcases List.mem_cons.mp h1 with rfl | h2
+      · exact ⟨by decide, (fun p hp => nomatch hp), (fun pr hpr => nomatch hpr)⟩
+      · nomatch h2
+  have hrev := execFnEntryMutRetagUpstream_reversedList_violates_traversalOrder
+    10 4 [.uninit, .uninit, .uninit, .uninit] unpinFreezeFacts (by decide) (by decide) rfl
+  obtain ⟨rW, hW⟩ : ∃ r, execFnEntryMutRetag multiLevelBorrowWorld 2 0 4 unpinFreezeFacts true
+      .writableChildWrite false = .ok r := ⟨_, rfl⟩
+  have hiffW := execFnEntryMutRetag_ok_iff_upstream_ok_iff_sourceOrder_ok multiLevelBorrowWorld 2 0 4
+    unpinFreezeFacts true .writableChildWrite hwfML rW
+  obtain ⟨rN, hN⟩ : ∃ r, execFnEntryMutRetag multiLevelBorrowWorld 2 0 4 unpinFreezeFacts true
+      .rustcNoWritable false = .ok r := ⟨_, rfl⟩
+  have hiffN := execFnEntryMutRetag_ok_iff_upstream_ok_iff_sourceOrder_ok multiLevelBorrowWorld 2 0 4
+    unpinFreezeFacts true .rustcNoWritable hwfML rN
+  exact ⟨⟨hwfCF, by decide, hrev.2⟩, ⟨rW, hW, hiffW.1.mp hW, hiffW.2.mp (hiffW.1.mp hW)⟩,
+    ⟨rN, hN, hiffN.2.mp (hiffN.1.mp hN)⟩⟩
+
 /-- **`[adv B1]` Closed canary — `charon#1620` separation under Miri's allocation mutability**:
 a mixed `(Freeze, UnsafeCell)` static is interned *mutable*, so the read-only check does not save
 the erased lowering: writing the `Freeze` `flag` byte through pre-`#1620` erased
@@ -1437,21 +1516,21 @@ theorem canary_part2B_general_mixed_static_miri_theorems :
 theorem canary_part3A_syntacticSized_agreement_and_separation :
     isSyntacticallySized (.array .u8 64) = true ∧
     fieldsTailSyntacticallySized true [.u32, .array .u16 8] = true ∧
-    validateRawPtrFastPath (.tuple [.u32, .array .u16 8]) (.thin 16 none) =
+    validateRawPtrFastPath maxRepresentableSize64 (.tuple [.u32, .array .u16 8]) (.thin 16 none) =
       validateRawPtrLayoutFirst maxRepresentableSize64 (.tuple [.u32, .array .u16 8]) (.thin 16 none) ∧
-    validateRawPtrFastPath (.tuple [.u32, .slice .u8]) (.thin 16 none) =
+    validateRawPtrFastPath maxRepresentableSize64 (.tuple [.u32, .slice .u8]) (.thin 16 none) =
       validateRawPtrLayoutFirst maxRepresentableSize64 (.tuple [.u32, .slice .u8]) (.thin 16 none) ∧
-    validateRawPtrFastPath (.array .u8 usizeMax64) (.thin 0 none) = .ok () ∧
+    validateRawPtrFastPath maxRepresentableSize64 (.array .u8 usizeMax64) (.thin 0 none) = .ok () ∧
     validateRawPtrLayoutFirst maxRepresentableSize64 (.array .u8 usizeMax64) (.thin 0 none) =
       .error (.layoutErr (.sizeOverflow (1 * usizeMax64) maxRepresentableSize64)) ∧
     validateSafeThinRef maxRepresentableSize64 KeyedAllocWorld.empty (.array .u8 usizeMax64) 16 (some testId1) =
       .error (.layoutErr (.sizeOverflow (1 * usizeMax64) maxRepresentableSize64)) ∧
-    validateRawPtrFastPath (.array (.array .u8 2) usizeMax64) (.thin 16 none) = .ok () ∧
+    validateRawPtrFastPath maxRepresentableSize64 (.array (.array .u8 2) usizeMax64) (.thin 16 none) = .ok () ∧
     validateRawPtrLayoutFirst maxRepresentableSize64 (.array (.array .u8 2) usizeMax64) (.thin 16 none) =
       .error (.layoutErr (.sizeOverflow (2 * usizeMax64) maxRepresentableSize64)) ∧
-    validateRawPtrFastPath (.tuple [.u32, .array .u8 usizeMax64]) (.thin 0 none) = .ok () ∧
-    validateRawPtrFastPath (.slice .u8) (.thin 16 none) = .error .expectedWideSliceMeta ∧
-    validateRawPtrFastPath (.slice .u8) (.wideSlice 16 none 5) = .ok () ∧
+    validateRawPtrFastPath maxRepresentableSize64 (.tuple [.u32, .array .u8 usizeMax64]) (.thin 0 none) = .ok () ∧
+    validateRawPtrFastPath maxRepresentableSize64 (.slice .u8) (.thin 16 none) = .error .expectedWideSliceMeta ∧
+    validateRawPtrFastPath maxRepresentableSize64 (.slice .u8) (.wideSlice 16 none 5) = .ok () ∧
     (ProtoTy.array .u8 usizeMax64).toRigidTy = RigidTy.array (.uint .u8) usizeMax64 := by
   have hlayTup :
       computeTyLayout maxRepresentableSize64 (.tuple [.u32, .array .u16 8]) =
@@ -1477,7 +1556,8 @@ theorem canary_part3A_syntacticSized_agreement_and_separation :
   have hsep2 := oversized_array_rawPtr_separation
     maxRepresentableSize64 KeyedAllocWorld.empty (.array .u8 2) ⟨2, 1, true, true⟩ usizeMax64 16 none
     (by decide) rfl (by decide)
-  have hslice := slice_dst_rawPtr_requires_wideSliceMeta .u8 16 5 none
+  have hslice := slice_dst_rawPtr_requires_wideSliceMeta maxRepresentableSize64 .u8
+    ⟨1, 1, true, true⟩ 16 5 none rfl rfl
   exact ⟨
     hszEq,
     hfieldsEq,
@@ -1494,38 +1574,63 @@ theorem canary_part3A_syntacticSized_agreement_and_separation :
     rfl
   ⟩
 
-/-- **`[adv A2]` Closed canary — custom struct/tuple DST `unsizedMetadataTail` & oversized-head
-custom DST separation**:
+/-- **`[adv A2]` + `[adv B3]` Closed canary — custom struct/tuple DST metadata tails & upstream
+unsized-pointee layout query**:
 1. `isSyntacticallySized_eq_metadataTail_isNone` & `fieldsTailSized_eq_metadataTail_isNone` classify
-   `(u32, [u8])` as `some .sliceMeta`, `MyDynDst(u32, dyn Send)` as `some .dynMeta`, and
-   `MyExtern(u32, extern F)` as `some .externThin`!
-2. `validateRawPtrFastPath` now **accepts** `.wideSlice` on `(u32, [u8])`, `.wideDyn` (non-null
-   vtable) on `MyDynDst`, and `.thin` on `MyExtern` (A0–B2 rejected all three with
-   `.expectedWideSliceMeta`!).
-3. `customDst_oversizedHead_rawPtr_separation` proves `*const ([u8; usize::MAX], [u8])` succeeds on
-   `.wideSlice` under `validateRawPtrFastPath` while failing with `.sizeOverflow` under
-   `validateRawPtrLayoutFirst`! -/
-theorem canary_part3A_customDst_metadataTail_and_oversizedHead_separation :
+   `(u32, [u8])` as `some .sliceMeta` and `MyDynDst(u32, dyn Send)` as `some .dynMeta`; the fast path
+   accepts `.wideSlice` on `(u32, [u8])`, a non-null `.wideDyn` on `MyDynDst` (metadata *shape* only —
+   vtable identity is `validateRawWideDynPtrMeta`), and `.thin` on `MyExtern(u32, extern F)`
+   (`[adv A2]`; A0–B2 rejected all three).
+2. `[adv B3]` `unsized_rawPtr_layoutOverflow_rejected_like_upstream`: upstream computes the pointee
+   layout for every *unsized* raw-pointer pointee, so `*const ([u8; usize::MAX], [u8])` and
+   `*const [[u8; usize::MAX]]` are rejected by **both** validators with `.sizeOverflow` (A2 claimed the
+   fast path accepts the former); `validateRawPtrFastPath_eq_layoutFirst_of_unsized` gives the same
+   agreement on that DST's thin pointer.
+3. `[adv B3]` `validateRawPtrFastPath_ne_layoutFirst_imp`: the observed `*const [u8; usize::MAX]`
+   disagreement forces a syntactically `Sized` pointee whose layout fails. -/
+theorem canary_part3A_customDst_metadataTail_and_unsizedLayout_like_upstream :
     isSyntacticallySized (.tuple [.u32, .slice .u8]) =
       (unsizedMetadataTail (.tuple [.u32, .slice .u8])).isNone ∧
     fieldsTailSyntacticallySized true [.u32, .dynamic "Send"] =
       (fieldsUnsizedMetadataTail none [.u32, .dynamic "Send"]).isNone ∧
-    validateRawPtrFastPath (.tuple [.u32, .slice .u8]) (.wideSlice 16 none 5) = .ok () ∧
-    validateRawPtrFastPath (.adt "MyDynDst" [.u32, .dynamic "Send"]) (.wideDyn 16 none 0x1000 (some testId1)) = .ok () ∧
-    validateRawPtrFastPath (.adt "MyDynDst" [.u32, .dynamic "Send"]) (.wideDyn 16 none 0 none) =
-      .error .expectedWideDynMeta ∧
-    validateRawPtrFastPath (.adt "MyExtern" [.u32, .foreign "ExternF"]) (.thin 16 none) = .ok () ∧
+    validateRawPtrFastPath maxRepresentableSize64 (.tuple [.u32, .slice .u8]) (.wideSlice 16 none 5) =
+      .ok () ∧
+    validateRawPtrFastPath maxRepresentableSize64 (.adt "MyDynDst" [.u32, .dynamic "Send"])
+      (.wideDyn 16 none 0x1000 (some testId1)) = .ok () ∧
+    validateRawPtrFastPath maxRepresentableSize64 (.adt "MyDynDst" [.u32, .dynamic "Send"])
+      (.wideDyn 16 none 0 none) = .error .expectedWideDynMeta ∧
+    validateRawPtrFastPath maxRepresentableSize64 (.adt "MyExtern" [.u32, .foreign "ExternF"])
+      (.thin 16 none) = .ok () ∧
     (let dstTy : ProtoTy := .tuple [.array .u8 usizeMax64, .slice .u8]
      unsizedMetadataTail dstTy = some .sliceMeta ∧
-     validateRawPtrFastPath dstTy (.wideSlice 0 none 3) = .ok () ∧
-     validateRawPtrFastPath dstTy (.thin 0 none) = .error .expectedWideSliceMeta ∧
+     validateRawPtrFastPath maxRepresentableSize64 dstTy (.wideSlice 0 none 3) =
+       .error (.layoutErr (.sizeOverflow (1 * usizeMax64) maxRepresentableSize64)) ∧
      validateRawPtrLayoutFirst maxRepresentableSize64 dstTy (.wideSlice 0 none 3) =
-       .error (.layoutErr (.sizeOverflow (1 * usizeMax64) maxRepresentableSize64))) := by
+       .error (.layoutErr (.sizeOverflow (1 * usizeMax64) maxRepresentableSize64)) ∧
+     validateRawPtrFastPath maxRepresentableSize64 (.slice (.array .u8 usizeMax64))
+       (.wideSlice 0 none 3) =
+       .error (.layoutErr (.sizeOverflow (1 * usizeMax64) maxRepresentableSize64))) ∧
+    validateRawPtrFastPath maxRepresentableSize64 (.tuple [.array .u8 usizeMax64, .slice .u8])
+      (.thin 0 none) =
+      validateRawPtrLayoutFirst maxRepresentableSize64 (.tuple [.array .u8 usizeMax64, .slice .u8])
+        (.thin 0 none) ∧
+    (isSyntacticallySized (.array .u8 usizeMax64) = true ∧
+      ∃ e, computeTyLayout maxRepresentableSize64 (.array .u8 usizeMax64) = .error e) := by
   have h1 := isSyntacticallySized_eq_metadataTail_isNone (.tuple [.u32, .slice .u8])
   have h2 := fieldsTailSized_eq_metadataTail_isNone none [.u32, .dynamic "Send"]
-  have hsep := customDst_oversizedHead_rawPtr_separation
+  have hrej := unsized_rawPtr_layoutOverflow_rejected_like_upstream
     maxRepresentableSize64 .u8 .u8 ⟨1, 1, true, true⟩ usizeMax64 0 3 none rfl rfl (by decide)
-  exact ⟨h1, h2, rfl, rfl, rfl, rfl, hsep⟩
+  have hunsz := validateRawPtrFastPath_eq_layoutFirst_of_unsized maxRepresentableSize64
+    (.tuple [.array .u8 usizeMax64, .slice .u8]) (.thin 0 none) rfl
+  have hsep := oversized_array_rawPtr_separation maxRepresentableSize64 KeyedAllocWorld.empty .u8
+    ⟨1, 1, true, true⟩ usizeMax64 0 none rfl rfl (by decide)
+  have hne : validateRawPtrFastPath maxRepresentableSize64 (.array .u8 usizeMax64) (.thin 0 none) ≠
+      validateRawPtrLayoutFirst maxRepresentableSize64 (.array .u8 usizeMax64) (.thin 0 none) := by
+    rw [hsep.1, hsep.2.1]
+    intro h
+    nomatch h
+  exact ⟨h1, h2, rfl, rfl, rfl, rfl, hrej, hunsz,
+    validateRawPtrFastPath_ne_layoutFirst_imp maxRepresentableSize64 _ _ hne⟩
 
 def debugPrincipal : PrincipalTraitRef :=
   { traitDefPath := "core::fmt::Debug", normalizedPredicates := [1], methodNames := ["u64::fmt"] }
@@ -2088,8 +2193,12 @@ theorem canary_part3C_mayDangle_addressTooClose_and_unaligned_before_uninhabited
      validateWideDynSafePtr uninhDynWorld uninhDynReg maxRepresentableSize64 specSend
        true (.danglingInt 16) vtPtr = .ok (.tuple [.u32, .never], 4, 4) ∧
      validateWideDynSafePtr uninhDynWorld uninhDynReg maxRepresentableSize64 specSend
-       false (.provenanced 16 testId3 0) vtPtr = .error .uninhabitedPointee) ∧
+       false (.provenanced 16 testId3 0) vtPtr true = .error .uninhabitedPointee ∧
+     validateWideDynSafePtr uninhDynWorld uninhDynReg maxRepresentableSize64 specSend
+       false (.provenanced 16 testId3 0) vtPtr = .ok (.tuple [.u32, .never], 4, 4)) ∧
     (validateWideDynSafePtr uninhDynWorld uninhDynReg maxRepresentableSize64 specSend
+       false (.provenanced 2 testId3 0) vtPtr true = .error (.unalignedSafePointer 4 2) ∧
+     validateWideDynSafePtr uninhDynWorld uninhDynReg maxRepresentableSize64 specSend
        false (.provenanced 2 testId3 0) vtPtr = .error (.unalignedSafePointer 4 2) ∧
      (computeTyLayout maxRepresentableSize64 uninhDynDesc.concreteTy).map ComputedTyLayout.isInhabited =
        .ok false) := by
@@ -2103,12 +2212,57 @@ theorem canary_part3C_mayDangle_addressTooClose_and_unaligned_before_uninhabited
     (.provenanced 0x1000 testId1 0) uninhDynDesc ⟨4, 4, true, false⟩
     0xFFFF_FFFF_FFFF_FFFC 16 testId3 ⟨8, 8, .liveData, .mut⟩
     hv (by decide) (by decide) (by decide) (fun _ => by decide) hlive rfl (by decide) hlay rfl
-  have hunal := wideDyn_unaligned_precedes_concrete_uninhabited
+  have hunalR := wideDyn_unaligned_precedes_concrete_uninhabited
     uninhDynWorld uninhDynReg maxRepresentableSize64 (.principalLess [.send])
     (.provenanced 0x1000 testId1 0) uninhDynDesc ⟨4, 4, true, false⟩
-    2 testId3 ⟨8, 8, .liveData, .mut⟩
+    2 testId3 ⟨8, 8, .liveData, .mut⟩ true
     hv hlive rfl (by decide) (by decide) (by decide) (by decide) hlay rfl
-  exact ⟨hmay, hunal⟩
+  have hunalN := wideDyn_unaligned_precedes_concrete_uninhabited
+    uninhDynWorld uninhDynReg maxRepresentableSize64 (.principalLess [.send])
+    (.provenanced 0x1000 testId1 0) uninhDynDesc ⟨4, 4, true, false⟩
+    2 testId3 ⟨8, 8, .liveData, .mut⟩ false
+    hv hlive rfl (by decide) (by decide) (by decide) (by decide) hlay rfl
+  exact ⟨hmay, hunalR.1, hunalN.1, hunalR.2⟩
+
+/-- **`[adv B3]` Closed canary — raw `*const dyn Trait` vtable identity**: upstream
+`checkMetadata` (`ValidityVisitor.lean:184–195, 317–327`) requires a raw wide `dyn` pointer to carry
+a genuine vtable but checks nothing about its data half:
+1. the Part 3A validators accept the integer vtable word `0x1000` (no provenance) on `*const dyn Send`
+   (shape-only check), while `validateRawWideDynPtrMeta` rejects it with `.invalidVTableDanglingInt`
+   (`rawWideDyn_shapeCheck_misses_invalid_vtable`);
+2. with the valid `u64 as dyn Send` vtable the raw check succeeds although the *safe* validator rejects
+   the null data half with `.nullSafePointer false`, and with a null vtable both report
+   `.invalidVTableNull` (`rawWideDyn_vtable_checked_data_unchecked`). -/
+theorem canary_part3C_rawWideDyn_vtable_identity :
+    let (w, reg, _) := wideDynWorldAndReg
+    let specSend := DynExistentialSpec.principalLess [.send]
+    let validVt := ScalarPtrHalf.provenanced 0x1000 testId1 0
+    validateRawPtrFastPath maxRepresentableSize64 (.dynamic "Send") (.wideDyn 16 none 0x1000 none) =
+      .ok () ∧
+    validateUnsizedRawPtrMeta .dynMeta (.wideDyn 16 none 0x1000 none) = .ok () ∧
+    validateRawWideDynPtrMeta w reg specSend (.danglingInt 0x1000) = .error .invalidVTableDanglingInt ∧
+    validateRawWideDynPtrMeta w reg specSend validVt = .ok () ∧
+    validateWideDynSafePtr w reg maxRepresentableSize64 specSend false .null validVt =
+      .error (.nullSafePointer false) ∧
+    validateRawWideDynPtrMeta w reg specSend .null = .error .invalidVTableNull ∧
+    validateWideDynSafePtr w reg maxRepresentableSize64 specSend false .null .null =
+      .error .invalidVTableNull := by
+  dsimp only [wideDynWorldAndReg]
+  let w := wideDynWorldAndReg.1
+  let reg := wideDynWorldAndReg.2.1
+  let descU64 := wideDynWorldAndReg.2.2
+  have hvOk : validateVTableHalf w reg (.provenanced 0x1000 testId1 0) (.principalLess [.send]) =
+      .ok descU64 := by decide +kernel
+  have hvNull : validateVTableHalf w reg .null (.principalLess [.send]) = .error .invalidVTableNull :=
+    rfl
+  have hshape := rawWideDyn_shapeCheck_misses_invalid_vtable w reg (.principalLess [.send]) 16 0x1000
+    none (by decide)
+  have hraw := rawWideDyn_vtable_checked_data_unchecked w reg maxRepresentableSize64
+    (.principalLess [.send]) (.provenanced 0x1000 testId1 0) false
+  have hrawNull := rawWideDyn_vtable_checked_data_unchecked w reg maxRepresentableSize64
+    (.principalLess [.send]) .null false
+  exact ⟨rfl, hshape.1, hshape.2, (hraw.2 descU64 hvOk).1, (hraw.2 descU64 hvOk).2,
+    (hrawNull.1 _ .null hvNull).1, (hrawNull.1 _ .null hvNull).2⟩
 
 /-! ## Section 4: Explicit `#guard_msgs in #print axioms` Verification -/
 
@@ -2233,11 +2387,32 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.sourceOrder_rustcNoWritable_pres
 #print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.sourceOrder_rustcNoWritable_preserves_all_frozen_nodes
 
 /--
-info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.customDst_oversizedHead_rawPtr_separation' depends on axioms: [propext,
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.unsized_rawPtr_layoutOverflow_rejected_like_upstream' depends on axioms: [propext,
  Quot.sound]
 -/
 #guard_msgs in
-#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.customDst_oversizedHead_rawPtr_separation
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.unsized_rawPtr_layoutOverflow_rejected_like_upstream
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.validateRawPtrFastPath_ne_layoutFirst_imp' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.validateRawPtrFastPath_ne_layoutFirst_imp
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.execFnEntryMutRetag_ok_iff_upstream_ok_iff_sourceOrder_ok' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.execFnEntryMutRetag_ok_iff_upstream_ok_iff_sourceOrder_ok
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.rawWideDyn_vtable_checked_data_unchecked' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.rawWideDyn_vtable_checked_data_unchecked
 
 /-- info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.VTableWorldWF.intern_roundTrip' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
@@ -2344,7 +2519,7 @@ def runSuite3LayoutFirst (m : Nat) : Bool :=
   (validateRawPtrLayoutFirst maxRepresentableSize64 (mkNestedUnitArrayTy m) (.thin 16 none)).isOk
 
 def runSuite3FastPath (m : Nat) : Bool :=
-  (validateRawPtrFastPath (mkNestedUnitArrayTy m) (.thin 16 none)).isOk
+  (validateRawPtrFastPath maxRepresentableSize64 (mkNestedUnitArrayTy m) (.thin 16 none)).isOk
 
 /-- Closed sanity check that every benchmark workload across `M = 16` reduces to `true` in the kernel. -/
 theorem canary_benchmarks_all_succeed_M16 :
