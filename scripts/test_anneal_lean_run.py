@@ -143,34 +143,39 @@ def _file_identity(path: Path) -> tuple[int, int, str]:
 
 def setUpModule() -> None:
     global _ENV_PATCHER, _XDG_TMPDIR, _SLICE_UNIT_SEED
-    _XDG_TMPDIR = tempfile.TemporaryDirectory(prefix="anneal-test-xdg-")
-    patch_vals = {**_HERMETIC_GIT_ENV, "XDG_CONFIG_HOME": _XDG_TMPDIR.name}
-    _ENV_PATCHER = mock.patch.dict(os.environ, patch_vals)
-    _ENV_PATCHER.start()
-    # `patch.dict` restores the full original environment on stop.
-    for name in alr._GIT_LOCAL_ENV_VARS:
-        os.environ.pop(name, None)
-    _scrub_ambient_anneal_env(os.environ)
-    # The re-entrancy pass-through of `alr.main` `os.execvp`s its command.  In-process that
-    # would replace the unittest runner and end the run early with the command's own exit
-    # status (`true` -> 0: a truncated run reported as success), so fail loudly instead.
-    # Subprocesses are unaffected (`subprocess` does not go through `os.exec*`).
-    for name in _GUARDED_EXEC_FUNCTIONS:
-        guard = mock.patch.object(os, name, side_effect=_forbid_in_process_exec)
-        guard.start()
-        _EXEC_GUARDS.append(guard)
-    # In-process `alr.main([... "--", cmd])` runs reconcile the unit under this module-wide
-    # `XDG_CONFIG_HOME`; seed it so they never reload the live user manager either.
-    _SLICE_UNIT_SEED = _render_live_workloads_slice_unit()
-    _seed_workloads_slice_unit(Path(_XDG_TMPDIR.name))
+    try:
+        _XDG_TMPDIR = tempfile.TemporaryDirectory(prefix="anneal-test-xdg-")
+        patch_vals = {**_HERMETIC_GIT_ENV, "XDG_CONFIG_HOME": _XDG_TMPDIR.name}
+        _ENV_PATCHER = mock.patch.dict(os.environ, patch_vals)
+        _ENV_PATCHER.start()
+        # `patch.dict` restores the full original environment on stop.
+        for name in alr._GIT_LOCAL_ENV_VARS:
+            os.environ.pop(name, None)
+        _scrub_ambient_anneal_env(os.environ)
+        # The re-entrancy pass-through of `alr.main` `os.execvp`s its command.  In-process that
+        # would replace the unittest runner and end the run early with the command's own exit
+        # status (`true` -> 0: a truncated run reported as success), so fail loudly instead.
+        # Subprocesses are unaffected (`subprocess` does not go through `os.exec*`).
+        for name in _GUARDED_EXEC_FUNCTIONS:
+            guard = mock.patch.object(os, name, side_effect=_forbid_in_process_exec)
+            guard.start()
+            _EXEC_GUARDS.append(guard)
+        # In-process `alr.main([... "--", cmd])` runs reconcile the unit under this module-wide
+        # `XDG_CONFIG_HOME`; seed it so they never reload the live user manager either.
+        _SLICE_UNIT_SEED = _render_live_workloads_slice_unit()
+        _seed_workloads_slice_unit(Path(_XDG_TMPDIR.name))
+    except BaseException:
+        tearDownModule()
+        raise
 
 
 def tearDownModule() -> None:
-    global _XDG_TMPDIR, _SLICE_UNIT_SEED
+    global _ENV_PATCHER, _XDG_TMPDIR, _SLICE_UNIT_SEED
     while _EXEC_GUARDS:
         _EXEC_GUARDS.pop().stop()
     if _ENV_PATCHER is not None:
         _ENV_PATCHER.stop()
+        _ENV_PATCHER = None
     if _XDG_TMPDIR is not None:
         _XDG_TMPDIR.cleanup()
         _XDG_TMPDIR = None
@@ -995,10 +1000,24 @@ class TestCliAndLimits(unittest.TestCase):
         # would really replace this process.  The direct calls name a missing binary, so
         # even an unguarded primitive could only raise.
         self.assertEqual(len(_EXEC_GUARDS), len(_GUARDED_EXEC_FUNCTIONS))
-        for name in _GUARDED_EXEC_FUNCTIONS:
+        missing_bin = "/nonexistent/anneal-test-exec"
+        for name, call_args in (
+            ("execv", (missing_bin, ["anneal-test-exec"])),
+            ("execve", (missing_bin, ["anneal-test-exec"], {})),
+            ("execvp", (missing_bin, ["anneal-test-exec"])),
+            ("execvpe", (missing_bin, ["anneal-test-exec"], {})),
+        ):
             self.assertIsInstance(getattr(os, name), mock.Mock, name)
             with self.assertRaisesRegex(AssertionError, "replace the unittest runner"):
-                getattr(os, name)("/nonexistent/anneal-test-exec", ["anneal-test-exec"])
+                getattr(os, name)(*call_args)
+        for name, call_args in (
+            ("execl", (missing_bin, "anneal-test-exec")),
+            ("execle", (missing_bin, "anneal-test-exec", {})),
+            ("execlp", (missing_bin, "anneal-test-exec")),
+            ("execlpe", (missing_bin, "anneal-test-exec", {})),
+        ):
+            with self.assertRaisesRegex(AssertionError, "replace the unittest runner"):
+                getattr(os, name)(*call_args)
         with mock.patch.dict(os.environ, {"ANNEAL_LEAN_RUN_IN_SCOPE": "1"}):
             with self.assertRaisesRegex(AssertionError, "replace the unittest runner"):
                 alr.main(["--mode", "file", "--no-slot-lock", "--", "true"])
@@ -1503,7 +1522,7 @@ class TestCliSubprocess(unittest.TestCase):
         """
         ambient_overrides = {
             "ANNEAL_WORKTREE_CONCURRENCY": "6",
-            "ANNEAL_LEAN_MEMORY_MAX_MB": "1234",
+            "ANNEAL_LEAN_MEMORY_MAX_MB": "17",
             "ANNEAL_LEAN_TIMEOUT_SEC": "55",
         }
         with tempfile.TemporaryDirectory(prefix="anneal-ambient-") as tmp:
@@ -1611,14 +1630,14 @@ class TestCliSubprocess(unittest.TestCase):
                 if live_data is not None:
                     self._assert_concurrency(live_data, 1)
                     self.assertEqual(live_data["timeout_sec"], 900)
-                    if live_clean["memory_max_mb"] != 1234:
-                        self.assertNotEqual(live_data["memory_max_mb"], 1234)
+                    if live_clean["memory_max_mb"] != 17:
+                        self.assertNotEqual(live_data["memory_max_mb"], 17)
 
             # Positive controls: each poison is honored once passed explicitly, so the
             # equality above is not vacuous.
             leaked_env = synthetic(env_extra=ambient_overrides)
             self._assert_concurrency(leaked_env, 6)
-            self.assertEqual(leaked_env["memory_max_mb"], 1234)
+            self.assertEqual(leaked_env["memory_max_mb"], 17)
             self.assertEqual(leaked_env["timeout_sec"], 55)
             leaked_xdg = synthetic(env_extra={"XDG_CONFIG_HOME": str(poisoned_xdg)})
             self._assert_concurrency(leaked_xdg, 7)
@@ -1881,7 +1900,49 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                 self.assertEqual(cap1_mem_unsafe["memory_max_mb"], over_mb)
                 self.assertEqual(cap1_mem_unsafe["concurrency"], 1)
 
+            with mock.patch.dict(
+                os.environ,
+                {"XDG_CONFIG_HOME": str(populated_xdg)},
+                clear=False,
+            ):
+                os.environ.pop("ANNEAL_WORKTREE_CONCURRENCY", None)
+                cap1_xdg = alr.probe_host_envelope(
+                    meminfo_path=meminfo,
+                    cgroup_root=capped_1slot_cg,
+                    proc_cgroup_path=proc_cg,
+                    cpu_cores=SYNTHETIC_HOST_CORES,
+                    user_systemd_active=False,
+                    runtime_base=root,
+                    is_probe=True,
+                )
+                self.assertTrue(cap1_xdg["is_cg_capped"])
+                self.assertEqual(cap1_xdg["s_heavy_safe"], 1)
+                self.assertEqual(cap1_xdg["concurrency"], 1)
+                self.assertEqual(cap1_xdg["build_slots"], 1)
+
             # Capped 2-slot regime: s_heavy_safe == 2 keeps env=2 and clamps xdg=3 to 2.
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "XDG_CONFIG_HOME": str(empty_xdg),
+                    "ANNEAL_WORKTREE_CONCURRENCY": "2",
+                },
+                clear=False,
+            ):
+                cap2_env = alr.probe_host_envelope(
+                    meminfo_path=meminfo,
+                    cgroup_root=capped_2slot_cg,
+                    proc_cgroup_path=proc_cg,
+                    cpu_cores=SYNTHETIC_HOST_CORES,
+                    user_systemd_active=False,
+                    runtime_base=root,
+                    is_probe=True,
+                )
+                self.assertTrue(cap2_env["is_cg_capped"])
+                self.assertEqual(cap2_env["s_heavy_safe"], 2)
+                self.assertEqual(cap2_env["concurrency"], 2)
+                self.assertEqual(cap2_env["build_slots"], 2)
+
             with mock.patch.dict(
                 os.environ,
                 {"XDG_CONFIG_HOME": str(populated_xdg)},
