@@ -252,8 +252,8 @@ theorem canary_part1_permutation_burden_vs_keyed_ext :
 theorem canary_part1_allocWorldRel_totality_and_simulation :
     let lw0 := LinearAllocWorld.empty
     let kw0 := KeyedAllocWorld.empty
-    let lw1 := (lw0.registerGlobal id10 ⟨.static, 4, 2, .not⟩).insertLive id1 entryU32
-    let kw1 := (kw0.registerGlobal id10 ⟨.static, 4, 2, .not⟩).insertLive id1 entryU32
+    let lw1 := (lw0.registerGlobal id10 ⟨.static, 4, 2, .not, []⟩).insertLive id1 entryU32
+    let kw1 := (kw0.registerGlobal id10 ⟨.static, 4, 2, .not, []⟩).insertLive id1 entryU32
     let clk : RaceClockEntry := ⟨1, 2, 0, 0, []⟩
     let lw2 := (lw1.setRace id1 clk).updateLiveBytes id1 [.init 9 none]
     let kw2 := (kw1.setRace id1 clk).updateLiveBytes id1 [.init 9 none]
@@ -276,7 +276,7 @@ theorem canary_part1_allocWorldRel_totality_and_simulation :
     AllocWorldRel lw3 (KeyedAllocWorld.ofLinear lw3) := by
   dsimp only
   have hrel0 : AllocWorldRel LinearAllocWorld.empty KeyedAllocWorld.empty := allocWorldRel_empty
-  have hrelG := allocWorldRel_registerGlobal hrel0 id10 ⟨.static, 4, 2, .not⟩
+  have hrelG := allocWorldRel_registerGlobal hrel0 id10 ⟨.static, 4, 2, .not, []⟩
   have hrel1 := allocWorldRel_insertLive hrelG id1 entryU32
   have hrelR := allocWorldRel_setRace hrel1 id1 ⟨1, 2, 0, 0, []⟩
   have hrel2 := allocWorldRel_updateLiveBytes hrelR id1 [.init 9 none]
@@ -288,9 +288,9 @@ theorem canary_part1_allocWorldRel_totality_and_simulation :
   have hallocM := (allocWorldRel_allocateMachine hrel0 entryU32 (.configured true) 1 5).2
   have hdealloc := (allocWorldRel_deallocate hrel1 (.provenanced id1 0) (some (4, 2)) .stack .ok).2.2
   have hdeallocM := (allocWorldRel_deallocateMachine hrel2 (.provenanced id1 0) (some (4, 2)) .stack (.configured true) ⟨1, 5, []⟩ .ok).2.2
-  have hroundTrip : KeyedAllocWorld.ofLinear (LinearAllocWorld.ofKeyed (((((KeyedAllocWorld.empty.registerGlobal id10 ⟨.static, 4, 2, .not⟩).insertLive id1 entryU32).setRace id1 ⟨1, 2, 0, 0, []⟩).updateLiveBytes id1 [.init 9 none]).removeRace id1 |>.removeLive id1 |>.1 |>.insertDead id1 ⟨4, 2⟩)) =
-      (((((KeyedAllocWorld.empty.registerGlobal id10 ⟨.static, 4, 2, .not⟩).insertLive id1 entryU32).setRace id1 ⟨1, 2, 0, 0, []⟩).updateLiveBytes id1 [.init 9 none]).removeRace id1 |>.removeLive id1 |>.1 |>.insertDead id1 ⟨4, 2⟩) := by
-    have hofK := allocWorldRel_ofKeyed (((((KeyedAllocWorld.empty.registerGlobal id10 ⟨.static, 4, 2, .not⟩).insertLive id1 entryU32).setRace id1 ⟨1, 2, 0, 0, []⟩).updateLiveBytes id1 [.init 9 none]).removeRace id1 |>.removeLive id1 |>.1 |>.insertDead id1 ⟨4, 2⟩)
+  have hroundTrip : KeyedAllocWorld.ofLinear (LinearAllocWorld.ofKeyed (((((KeyedAllocWorld.empty.registerGlobal id10 ⟨.static, 4, 2, .not, []⟩).insertLive id1 entryU32).setRace id1 ⟨1, 2, 0, 0, []⟩).updateLiveBytes id1 [.init 9 none]).removeRace id1 |>.removeLive id1 |>.1 |>.insertDead id1 ⟨4, 2⟩)) =
+      (((((KeyedAllocWorld.empty.registerGlobal id10 ⟨.static, 4, 2, .not, []⟩).insertLive id1 entryU32).setRace id1 ⟨1, 2, 0, 0, []⟩).updateLiveBytes id1 [.init 9 none]).removeRace id1 |>.removeLive id1 |>.1 |>.insertDead id1 ⟨4, 2⟩) := by
+    have hofK := allocWorldRel_ofKeyed (((((KeyedAllocWorld.empty.registerGlobal id10 ⟨.static, 4, 2, .not, []⟩).insertLive id1 entryU32).setRace id1 ⟨1, 2, 0, 0, []⟩).updateLiveBytes id1 [.init 9 none]).removeRace id1 |>.removeLive id1 |>.1 |>.insertDead id1 ⟨4, 2⟩)
     exact (allocWorldRel_keyed_unique hofK (allocWorldRel_ofLinear _)).symm
   exact ⟨allocWorldRel_containsId hrel1 id1,
     allocWorldRel_isAllocLive hrel1 id1,
@@ -299,6 +299,67 @@ theorem canary_part1_allocWorldRel_totality_and_simulation :
     hrel3,
     hres.symm, halloc.symm, hallocM.symm, hdealloc.symm, hdeallocM.symm,
     hroundTrip, allocWorldRel_ofLinear _⟩
+
+theorem canary_part1_findAllocBytes?_precedence_and_allocWorldRel :
+    let staticBytes : List MemByte := [.init 0x2A none]
+    let liveBytes : List MemByte := [.init 0x7F none]
+    let lw := ((LinearAllocWorld.empty.registerGlobal id1 ⟨.static, 1, 0, .not, staticBytes⟩)
+      |>.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩)
+      |>.insertLive id3 ⟨1, 0, .stack, .mut, liveBytes⟩
+    let kw := ((KeyedAllocWorld.empty.registerGlobal id1 ⟨.static, 1, 0, .not, staticBytes⟩)
+      |>.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩)
+      |>.insertLive id3 ⟨1, 0, .stack, .mut, liveBytes⟩
+    kw.findAllocBytes? id3 = some liveBytes ∧
+    kw.findAllocBytes? id1 = some staticBytes ∧
+    kw.findAllocBytes? id2 = none ∧
+    lw.findAllocBytes? id1 = kw.findAllocBytes? id1 ∧
+    lw.findAllocBytes? id3 = kw.findAllocBytes? id3 := by
+  dsimp only
+  have hrel : AllocWorldRel
+      (((LinearAllocWorld.empty.registerGlobal id1 ⟨.static, 1, 0, .not, [.init 0x2A none]⟩)
+        |>.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩)
+        |>.insertLive id3 ⟨1, 0, .stack, .mut, [.init 0x7F none]⟩)
+      (((KeyedAllocWorld.empty.registerGlobal id1 ⟨.static, 1, 0, .not, [.init 0x2A none]⟩)
+        |>.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩)
+        |>.insertLive id3 ⟨1, 0, .stack, .mut, [.init 0x7F none]⟩) :=
+    allocWorldRel_insertLive
+      (allocWorldRel_registerGlobal
+        (allocWorldRel_registerGlobal allocWorldRel_empty id1 ⟨.static, 1, 0, .not, [.init 0x2A none]⟩)
+        id2 ⟨.function, 0, 0, .not, []⟩)
+      id3 ⟨1, 0, .stack, .mut, [.init 0x7F none]⟩
+  have hlive3 : (((KeyedAllocWorld.empty.registerGlobal id1 ⟨.static, 1, 0, .not, [.init 0x2A none]⟩)
+      |>.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩)
+      |>.insertLive id3 ⟨1, 0, .stack, .mut, [.init 0x7F none]⟩).findLive? id3 =
+      some ⟨1, 0, .stack, .mut, [.init 0x7F none]⟩ := by
+    simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self]
+  have hnl1 : (((KeyedAllocWorld.empty.registerGlobal id1 ⟨.static, 1, 0, .not, [.init 0x2A none]⟩)
+      |>.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩)
+      |>.insertLive id3 ⟨1, 0, .stack, .mut, [.init 0x7F none]⟩).findLive? id1 = none := by
+    simp only [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal,
+      KeyedAllocWorld.empty]
+    rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id1 ≠ id3), ExtTreeMap0.get?_empty]
+  have hg1 : (((KeyedAllocWorld.empty.registerGlobal id1 ⟨.static, 1, 0, .not, [.init 0x2A none]⟩)
+      |>.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩)
+      |>.insertLive id3 ⟨1, 0, .stack, .mut, [.init 0x7F none]⟩).findGlobal? id1 =
+      some ⟨.static, 1, 0, .not, [.init 0x2A none]⟩ := by
+    simp only [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal]
+    rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id1 ≠ id2), ExtTreeMap0.get?_insert_self]
+  have hnl2 : (((KeyedAllocWorld.empty.registerGlobal id1 ⟨.static, 1, 0, .not, [.init 0x2A none]⟩)
+      |>.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩)
+      |>.insertLive id3 ⟨1, 0, .stack, .mut, [.init 0x7F none]⟩).findLive? id2 = none := by
+    simp only [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal,
+      KeyedAllocWorld.empty]
+    rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id2 ≠ id3), ExtTreeMap0.get?_empty]
+  have hg2 : (((KeyedAllocWorld.empty.registerGlobal id1 ⟨.static, 1, 0, .not, [.init 0x2A none]⟩)
+      |>.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩)
+      |>.insertLive id3 ⟨1, 0, .stack, .mut, [.init 0x7F none]⟩).findGlobal? id2 =
+      some ⟨.function, 0, 0, .not, []⟩ := by
+    simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal,
+      ExtTreeMap0.get?_insert_self]
+  have hp3 := (keyedFindAllocBytes?_precedence _ id3).1 _ hlive3
+  have hp1 := ((keyedFindAllocBytes?_precedence _ id1).2 hnl1 _ hg1).1 (Or.inl rfl)
+  have hp2 := ((keyedFindAllocBytes?_precedence _ id2).2 hnl2 _ hg2).2 (Or.inl rfl)
+  exact ⟨hp3, hp1, hp2, allocWorldRel_findAllocBytes? hrel id1, allocWorldRel_findAllocBytes? hrel id3⟩
 
 theorem canary_part1_highWater_and_wrapAround_exhaustion :
     let wHi : KeyedAllocWorld := { KeyedAllocWorld.empty with nextAllocId := MiriAllocId.maxValue.value }
@@ -351,7 +412,7 @@ theorem canary_part1_highWater_and_wrapAround_exhaustion :
   · rw [hcol]; exact hretry
 
 theorem canary_part1_registerReservedGlobal_validation :
-    let g : GlobalAllocEntry := ⟨.vtable, 24, 3, .not⟩
+    let g : GlobalAllocEntry := ⟨.vtable, 24, 3, .not, []⟩
     let w1 : KeyedAllocWorld :=
       { KeyedAllocWorld.empty with
         nextAllocId := KeyedAllocWorld.empty.nextAllocId + 1
@@ -381,20 +442,20 @@ theorem canary_part1_registerReservedGlobal_validation :
   have hunissued : KeyedAllocWorld.empty.hasIssued id1 = false := by
     simp [KeyedAllocWorld.hasIssued, KeyedAllocWorld.empty, ExtTreeMap0.contains_eq_isSome_get?,
       ExtTreeMap0.get?_empty]
-  have hrej0 := (keyedRegisterReservedGlobal_rejections KeyedAllocWorld.empty id1 ⟨.vtable, 24, 3, .not⟩).2
+  have hrej0 := (keyedRegisterReservedGlobal_rejections KeyedAllocWorld.empty id1 ⟨.vtable, 24, 3, .not, []⟩).2
     hgNone (Or.inr (Or.inr hunissued))
-  have hok := keyedRegisterReservedGlobal_after_reserve ⟨.vtable, 24, 3, .not⟩ hres
+  have hok := keyedRegisterReservedGlobal_after_reserve ⟨.vtable, 24, 3, .not, []⟩ hres
   have hdup := (keyedRegisterReservedGlobal_rejections
     (({ KeyedAllocWorld.empty with
         nextAllocId := KeyedAllocWorld.empty.nextAllocId + 1
         issued := KeyedAllocWorld.empty.issued.insert id1 () } : KeyedAllocWorld).registerGlobal id1
-      ⟨.vtable, 24, 3, .not⟩) id1 ⟨.vtable, 24, 3, .not⟩).1
+      ⟨.vtable, 24, 3, .not, []⟩) id1 ⟨.vtable, 24, 3, .not, []⟩).1
     (by simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.registerGlobal, ExtTreeMap0.get?_insert_self])
   have hlive := (keyedRegisterReservedGlobal_rejections
     (({ KeyedAllocWorld.empty with
         nextAllocId := KeyedAllocWorld.empty.nextAllocId + 1
         issued := KeyedAllocWorld.empty.issued.insert id1 () } : KeyedAllocWorld).insertLive id1 entryU32)
-    id1 ⟨.vtable, 24, 3, .not⟩).2
+    id1 ⟨.vtable, 24, 3, .not, []⟩).2
     (by simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertLive, KeyedAllocWorld.empty,
       ExtTreeMap0.get?_empty])
     (Or.inl (by simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self]))
@@ -402,19 +463,19 @@ theorem canary_part1_registerReservedGlobal_validation :
     (({ KeyedAllocWorld.empty with
         nextAllocId := KeyedAllocWorld.empty.nextAllocId + 1
         issued := KeyedAllocWorld.empty.issued.insert id1 () } : KeyedAllocWorld).insertDead id1 ⟨4, 2⟩)
-    id1 ⟨.vtable, 24, 3, .not⟩).2
+    id1 ⟨.vtable, 24, 3, .not, []⟩).2
     (by simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.empty,
       ExtTreeMap0.get?_empty])
     (Or.inr (Or.inl (by simp [KeyedAllocWorld.findDead?, KeyedAllocWorld.insertDead,
       ExtTreeMap0.get?_insert_self])))
-  have hlin := (allocWorldRel_registerReservedGlobal allocWorldRel_empty id1 ⟨.vtable, 24, 3, .not⟩).2
+  have hlin := (allocWorldRel_registerReservedGlobal allocWorldRel_empty id1 ⟨.vtable, 24, 3, .not, []⟩).2
   exact ⟨hres, congrArg Prod.snd hrej0, hok, congrArg Prod.snd hdup, congrArg Prod.snd hlive,
     congrArg Prod.snd hdead, hlin⟩
 
 theorem canary_part1_deallocate_failure_ordering_and_state_retention :
     let wLive := KeyedAllocWorld.empty.insertLive id1 entryU32
     let wDead := KeyedAllocWorld.empty.insertDead id1 ⟨4, 2⟩
-    let wGlob := KeyedAllocWorld.empty.registerGlobal id2 ⟨.vtable, 24, 3, .not⟩
+    let wGlob := KeyedAllocWorld.empty.registerGlobal id2 ⟨.vtable, 24, 3, .not, []⟩
     let wDup := (KeyedAllocWorld.empty.insertLive id1 entryU32).insertDead id1 ⟨99, 0⟩
     (wLive.deallocate (.provenanced id1 1) (some (4, 2)) .stack .ok).outcome = .error (.nonzeroOffset id1 1) ∧
     (wLive.deallocate (.provenanced id1 1) (some (4, 2)) .stack .ok).world.findLive? id1 = some entryU32 ∧
@@ -449,9 +510,9 @@ theorem canary_part1_deallocate_failure_ordering_and_state_retention :
       (by simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.empty, ExtTreeMap0.get?_empty])
       (by simp [KeyedAllocWorld.findDead?, KeyedAllocWorld.insertDead, ExtTreeMap0.get?_insert_self])
       (some (999, 7)) .heap .ok]
-  have h4 : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.vtable, 24, 3, .not⟩).deallocate (.provenanced id2 0) (some (24, 3)) .stack .ok).outcome = .error (.globalErr id2 .vtable) := by
-    rw [keyedDeallocate_global_reports_globalErr (KeyedAllocWorld.empty.registerGlobal id2 ⟨.vtable, 24, 3, .not⟩)
-      id2 ⟨.vtable, 24, 3, .not⟩
+  have h4 : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.vtable, 24, 3, .not, []⟩).deallocate (.provenanced id2 0) (some (24, 3)) .stack .ok).outcome = .error (.globalErr id2 .vtable) := by
+    rw [keyedDeallocate_global_reports_globalErr (KeyedAllocWorld.empty.registerGlobal id2 ⟨.vtable, 24, 3, .not, []⟩)
+      id2 ⟨.vtable, 24, 3, .not, []⟩
       (by simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.empty, ExtTreeMap0.get?_empty])
       (by simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.registerGlobal, ExtTreeMap0.get?_insert_self])
       (some (24, 3)) .stack .ok]
@@ -746,7 +807,7 @@ theorem canary_part2A_twoPass_vs_upstream_and_uninit_frozen :
   have hnodeProt := stepNodeOnRangeWrite_foreign_protected_conflict
     [7] 0 4
     { tag := 5, parentTag := some 1, perm := .unique, rangeOffset := 0, rangeLen := 4, protector := some 7 }
-    rfl rfl (Or.inr (Or.inr (Or.inr (Or.inl rfl))))
+    rfl rfl rfl (Or.inr (Or.inr (Or.inr (Or.inl rfl))))
   have hdis := execFnEntryMutRetag_disabledGrandparent_diverges_from_upstream
   have hfrz := execFnEntryMutRetag_frozenParent_protectedChild_diverges_from_upstream
   exact ⟨hzst.1, hno, htwo, huninit.1, huninit.2.1, hlat, hpar, hnodeProt, ⟨_, hdis⟩, ⟨_, hfrz⟩⟩
@@ -804,9 +865,12 @@ theorem canary_part2A_sourceOrder_bottomUp_and_equivalence :
         stepNodeOnRangeRead, rangesOverlap] at hbad
     | ok res =>
       rcases res with ⟨w', tag⟩
-      refine ⟨w', tag, rfl, sourceOrder_rustcNoWritable_preserves_all_frozen_nodes
-        multiLevelBorrowWorld w' 2 0 4 tag false hr _ ?_ rfl⟩
-      simp [multiLevelBorrowWorld]
+      rcases sourceOrder_rustcNoWritable_preserves_all_frozen_nodes
+        multiLevelBorrowWorld w' 2 0 4 tag false hr
+        { tag := 3, parentTag := some 1, perm := .frozen, rangeOffset := 0, rangeLen := 4, protector := none }
+        (by simp [multiLevelBorrowWorld]) rfl with
+        ⟨n', hn'Mem, _, _, _, heq⟩
+      exact ⟨w', tag, rfl, heq rfl ▸ hn'Mem⟩
   exact ⟨hheadAux, hheadTags, hheadNodes, ⟨_, hrev⟩, ⟨_, hbot.2.1, hbot.2.2⟩, heq3, heqUp, hokEquiv, hrun⟩
 
 theorem canary_part2A_readOnlyAlloc_implicitWrite_rejected_noWritable_ok :
@@ -815,6 +879,7 @@ theorem canary_part2A_readOnlyAlloc_implicitWrite_rejected_noWritable_ok :
     execFnEntryMutRetag wRo 1 0 4 .writableChildWrite = .error .writeToReadOnlyAlloc ∧
     execFnEntryMutRetagUpstream wRo 1 0 4 .writableChildWrite = .error .writeToReadOnlyAlloc ∧
     execFnEntryMutRetagSourceOrder wRo 1 0 4 .writableChildWrite = .error .writeToReadOnlyAlloc ∧
+    execFnEntryMutRetagPrunedSourceOrder wRo 1 0 4 .writableChildWrite = .error .writeToReadOnlyAlloc ∧
     (execFnEntryMutRetagSourceOrder wRo 1 0 4 .rustcNoWritable).isOk = true ∧
     (execFnEntryMutRetagSourceOrder wRo 1 0 4 .rustcNoWritable).map
         (fun r => (r.1.nodes, r.1.activeProtectors, r.1.nextTag, r.1.nextProtector, r.2)) =
@@ -825,10 +890,71 @@ theorem canary_part2A_readOnlyAlloc_implicitWrite_rejected_noWritable_ok :
   dsimp only
   have hrej := fnEntryMutRetag_readOnlyAlloc_writable_rejected
     { mkTwoBranchWorld .unique .frozen with allocReadOnly := true } 1 0 4 false
-    ⟨1, some 0, .unique, 0, 4, none⟩ rfl rfl (by decide) (by decide)
+    ⟨1, some 0, .unique, 0, 4, none, true⟩ rfl rfl (by decide)
   have hign := sourceOrder_rustcNoWritable_ignores_allocReadOnly
     (mkTwoBranchWorld .unique .frozen) true 1 0 4 false
-  exact ⟨hrej.1, hrej.2.1, hrej.2.2, by decide, hign, by decide, by decide⟩
+  exact ⟨hrej.1, hrej.2.1, hrej.2.2.1, hrej.2.2.2, by decide, hign, by decide, by decide⟩
+
+theorem canary_part2A_disabledParent_unaccessedProtected_and_skipSelfAndChildren :
+    let unaccNode : TreeTagNode :=
+      { tag := 9, parentTag := some 0, perm := .reservedFrz false, rangeOffset := 0, rangeLen := 4,
+        protector := some 7, accessed := false }
+    stepNodeOnRangeWrite [7] false 0 4 unaccNode = .ok { unaccNode with perm := .disabled } ∧
+    (let wDis : FnEntryBorrowWorld := {
+       nodes := [⟨0, none, .unique, 0, 8, none, true⟩, ⟨1, some 0, .disabled, 0, 4, none, true⟩]
+       activeProtectors := []
+       nextTag := 2
+       nextProtector := 10
+     }
+     let wDisRo : FnEntryBorrowWorld := { wDis with allocReadOnly := true }
+     (execFnEntryMutRetagSourceOrder wDis 1 0 0 .rustcNoWritable).isOk = true ∧
+     (execFnEntryMutRetagSourceOrder wDis 1 4 4 .writableChildWrite).isOk = true ∧
+     execFnEntryMutRetagSourceOrder wDis 1 0 4 .rustcNoWritable = .error (.disabledParentTag 1) ∧
+     execFnEntryMutRetagSourceOrder wDisRo 1 0 4 .writableChildWrite = .error .writeToReadOnlyAlloc) ∧
+    (execFnEntryMutRetagPrunedSourceOrder multiLevelBorrowWorld 2 0 4 .rustcNoWritable false =
+      execFnEntryMutRetagSourceOrder multiLevelBorrowWorld 2 0 4 .rustcNoWritable false) ∧
+    (let wDisSub : FnEntryBorrowWorld := {
+       nodes := [
+         ⟨0, none, .unique, 0, 4, none, true⟩,
+         ⟨1, some 0, .unique, 0, 4, none, true⟩,
+         ⟨2, some 0, .disabled, 0, 4, none, true⟩,
+         ⟨3, some 2, .cell, 0, 4, none, true⟩,
+         ⟨4, some 3, .unique, 0, 4, some 7, true⟩
+       ]
+       activeProtectors := [7]
+       nextTag := 5
+       nextProtector := 10
+     }
+     let wFrzSub : FnEntryBorrowWorld := {
+       nodes := [
+         ⟨0, none, .unique, 0, 4, none, true⟩,
+         ⟨1, some 0, .unique, 0, 4, none, true⟩,
+         ⟨2, some 0, .frozen, 0, 4, none, true⟩,
+         ⟨3, some 2, .unique, 0, 4, some 7, true⟩
+       ]
+       activeProtectors := [7]
+       nextTag := 4
+       nextProtector := 10
+     }
+     execFnEntryMutRetagSourceOrder wDisSub 1 0 4 .writableChildWrite = .error (.protectedForeignConflict 4) ∧
+     (execFnEntryMutRetagPrunedSourceOrder wDisSub 1 0 4 .writableChildWrite).isOk = true ∧
+     execFnEntryMutRetagSourceOrder wFrzSub 1 0 4 .rustcNoWritable = .error (.protectedForeignConflict 3) ∧
+     (execFnEntryMutRetagPrunedSourceOrder wFrzSub 1 0 4 .rustcNoWritable).isOk = true ∧
+     execFnEntryMutRetagPrunedSourceOrder wFrzSub 1 0 4 .writableChildWrite = .error (.protectedForeignConflict 3)) := by
+  have hunacc := stepNodeOnRangeWrite_unaccessed_protected_foreign_disables_without_ub
+    [7] 0 4
+    { tag := 9, parentTag := some 0, perm := .reservedFrz false, rangeOffset := 0, rangeLen := 4,
+      protector := some 7, accessed := false }
+    rfl rfl rfl (Or.inl rfl)
+  have hdis := fnEntryMutRetag_disabledParent_zst_disjoint_and_readOnly_precedence
+  have heqPruned := execFnEntryMutRetagPrunedSourceOrder_eq_sourceOrder_of_noSkippedForeignSubtree
+    multiLevelBorrowWorld 2 0 4 .rustcNoWritable false (by
+      intro n hn
+      simp only [multiLevelBorrowWorld, List.mem_cons, List.not_mem_nil, or_false] at hn
+      rcases hn with rfl | rfl | rfl | rfl <;> rfl)
+  have hsep := execFnEntryMutRetagPrunedSourceOrder_skipSelfAndChildren_separation
+  exact ⟨hunacc, ⟨hdis.1, hdis.2.2.2.1, hdis.2.2.2.2.1, hdis.2.2.2.2.2.2⟩, heqPruned,
+    ⟨hsep.2.1, hsep.2.2.2.1, hsep.2.2.2.2.1, hsep.2.2.2.2.2.1, hsep.2.2.2.2.2.2.2⟩⟩
 
 theorem canary_part2B_pureFreeze_pureUnsafeCell_mixed_and_zstUnsafeCell :
     evalRawMutStaticWriteTB (retagStaticPreservedAt (.freezeScalar 4) 1 2) 0 1 = .ub ∧
@@ -876,7 +1002,7 @@ theorem canary_part3A_syntacticSized_customDst_and_safeThinRef :
     validateRawPtrFastPath (.slice (.uint 1)) (.thin 4096) = .error .expectedWideSliceMeta ∧
     validateRawPtrFastPath (.tuple [.array (.uint 1) usizeMax64, .slice (.uint 1)]) (.wideSlice 4096 1) =
       .error (.layoutFailed .layoutOverflow) ∧
-    (let wStatic := KeyedAllocWorld.empty.registerGlobal id1 ⟨.static, 4, 2, .not⟩
+    (let wStatic := KeyedAllocWorld.empty.registerGlobal id1 ⟨.static, 4, 2, .not, []⟩
      validateSafeThinRef wStatic (.uint 4) ⟨16, some (id1, 0)⟩ = .ok () ∧
      validateSafeThinRef wStatic .unit ⟨0, some (id1, 0)⟩ = .error .nullSafePtr ∧
      validateSafeThinRef wStatic (.uint 4) ⟨2, none⟩ = .error .danglingOrOutOfBoundsSafePtr) := by
@@ -897,7 +1023,7 @@ theorem canary_part3A_syntacticSized_customDst_and_safeThinRef :
 
 theorem canary_part3A_safeThinRef_zstNeverDangles_and_nullDeadFn_classification :
     let wMix : KeyedAllocWorld :=
-      (KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩
+      (KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩
     validateSafeThinRef wMix .unit ⟨16, some (id3, 0)⟩ = .ok () ∧
     validateSafeThinRef wMix .unit ⟨16, some (id10, 999)⟩ = .ok () ∧
     validateSafeThinRef wMix .unit ⟨0, some (id3, 0)⟩ = .error .nullSafePtr ∧
@@ -912,42 +1038,42 @@ theorem canary_part3A_safeThinRef_zstNeverDangles_and_nullDeadFn_classification 
     wMix.getLiveAllocSizeAndAlign id10 = .error (.unavailable id10) ∧
     wMix.getAllocInfo id2 = some ⟨0, 0, .function, .not⟩ := by
   dsimp only
-  have hdeadNotLive : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findLive? id3 = none := by
+  have hdeadNotLive : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩).findLive? id3 = none := by
     simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
       KeyedAllocWorld.empty, ExtTreeMap0.get?_empty]
-  have hdeadNotGlobal : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findGlobal? id3 = none := by
+  have hdeadNotGlobal : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩).findGlobal? id3 = none := by
     simp only [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
       KeyedAllocWorld.empty]
     rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id3 ≠ id2), ExtTreeMap0.get?_empty]
-  have hdead : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findDead? id3 = some ⟨4, 2⟩ := by
+  have hdead : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩).findDead? id3 = some ⟨4, 2⟩ := by
     simp [KeyedAllocWorld.findDead?, KeyedAllocWorld.insertDead, ExtTreeMap0.get?_insert_self]
-  have hfnNotLive : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findLive? id2 = none := by
+  have hfnNotLive : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩).findLive? id2 = none := by
     simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
       KeyedAllocWorld.empty, ExtTreeMap0.get?_empty]
-  have hfn : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findGlobal? id2 =
-      some ⟨.function, 0, 0, .not⟩ := by
+  have hfn : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩).findGlobal? id2 =
+      some ⟨.function, 0, 0, .not, []⟩ := by
     simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
       ExtTreeMap0.get?_insert_self]
-  have h10NotLive : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findLive? id10 = none := by
+  have h10NotLive : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩).findLive? id10 = none := by
     simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
       KeyedAllocWorld.empty, ExtTreeMap0.get?_empty]
-  have h10NotGlobal : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findGlobal? id10 = none := by
+  have h10NotGlobal : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩).findGlobal? id10 = none := by
     simp only [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
       KeyedAllocWorld.empty]
     rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id10 ≠ id2), ExtTreeMap0.get?_empty]
-  have h10NotDead : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findDead? id10 = none := by
+  have h10NotDead : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩).findDead? id10 = none := by
     simp only [KeyedAllocWorld.findDead?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
       KeyedAllocWorld.empty]
     rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id10 ≠ id3), ExtTreeMap0.get?_empty]
   have hz1 := validateSafeThinRef_zst_never_dangles
-    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩) ⟨16, some (id3, 0)⟩
+    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩) ⟨16, some (id3, 0)⟩
   have hz2 := validateSafeThinRef_zst_never_dangles
-    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩) ⟨16, some (id10, 999)⟩
+    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩) ⟨16, some (id10, 999)⟩
   have hz3 := validateSafeThinRef_zst_never_dangles
-    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩) ⟨0, some (id3, 0)⟩
+    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩) ⟨0, some (id3, 0)⟩
   have hcls := validateSafeThinRef_nullInt_dead_and_fnGlobal_classification
-    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩)
-    id3 id2 ⟨4, 2⟩ ⟨.function, 0, 0, .not⟩ hdeadNotLive hdeadNotGlobal hdead hfnNotLive hfn (Or.inl rfl)
+    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not, []⟩).insertDead id3 ⟨4, 2⟩)
+    id3 id2 ⟨4, 2⟩ ⟨.function, 0, 0, .not, []⟩ hdeadNotLive hdeadNotGlobal hdead hfnNotLive hfn (Or.inl rfl)
   have hliveG := keyedIsAllocLive_of_global _ id2 _ hfn
   have hdeadInfo := (keyedGetAllocInfo_dead_and_unavailable _ id3 hdeadNotLive hdeadNotGlobal).1 ⟨4, 2⟩ hdead
   have hunavail := (keyedGetAllocInfo_dead_and_unavailable _ id10 h10NotLive h10NotGlobal).2 h10NotDead
@@ -1021,7 +1147,7 @@ theorem canary_part3B_traitCheck_upcast_and_worldWF_roundTrip :
      let orphanCachedKeyReg : VTableRegistry :=
        { keyToAlloc := ExtTreeMap0.empty.insert (encodeVTableKeyCode kSend) id1
          allocToData := ExtTreeMap0.empty.insert id1 vtSend }
-     let wOrphan : KeyedAllocWorld := KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩
+     let wOrphan : KeyedAllocWorld := KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩
      VTableRegistry.KeyWF orphanCachedKeyReg ∧
      VTableRegistry.AllocWF orphanCachedKeyReg wOrphan ∧
      validateVTableHalf KeyedAllocWorld.empty orphanCachedKeyReg (.provenanced id1 0) ⟨none, AutoTraitSet.empty, []⟩ =
@@ -1093,21 +1219,21 @@ theorem canary_part3B_traitCheck_upcast_and_worldWF_roundTrip :
   have hOrphAllocWF : VTableRegistry.AllocWF
       { keyToAlloc := ExtTreeMap0.empty.insert (encodeVTableKeyCode kSend) id1
         allocToData := ExtTreeMap0.empty.insert id1 vtSend }
-      (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩) := by
+      (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩) := by
     refine ⟨fun q dq hq => ?_⟩
     by_cases hq1 : q = id1
     · subst hq1
-      exact ⟨⟨.vtable, 24, 3, .not⟩,
+      exact ⟨⟨.vtable, 24, 3, .not, []⟩,
         by simp [KeyedAllocWorld.registerGlobal, KeyedAllocWorld.findGlobal?, ExtTreeMap0.get?_insert_self], rfl⟩
     · rw [ExtTreeMap0.get?_insert_ne _ _ hq1, ExtTreeMap0.get?_empty] at hq; cases hq
   have hValAuto := validateVTableHalf_principalLess_ignores_autoTraits
-    (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩)
+    (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩)
     { keyToAlloc := ExtTreeMap0.empty.insert (encodeVTableKeyCode kSend) id1
       allocToData := ExtTreeMap0.empty.insert id1 vtSend }
     id1 vtSend (AutoTraitSet.ofList [.send]) (AutoTraitSet.ofList [.sync])
     hOrphAllocWF (by simp [ExtTreeMap0.get?_insert_self]) rfl
   have hValMis := validateVTableHalf_principalLess_vs_principal_invalidTrait
-    (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩)
+    (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩)
     { keyToAlloc := ExtTreeMap0.empty.insert (encodeVTableKeyCode kSend) id1
       allocToData := ExtTreeMap0.empty.insert id1 vtSend }
     id1 vtSend (AutoTraitSet.ofList [.send]) (AutoTraitSet.ofList [.send]) 7
@@ -1218,7 +1344,7 @@ theorem canary_part3C_wideDyn_vtable_precedence_and_mayDangle :
     let reg : VTableRegistry :=
       { keyToAlloc := ExtTreeMap0.empty, allocToData := ExtTreeMap0.empty.insert id1 vtUninhab }
     let w : KeyedAllocWorld :=
-      (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩).insertLive id10 entryU32
+      (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩).insertLive id10 entryU32
     validateWideDynSafePtr w reg .null .null spec false false = .error .invalidVTableNull ∧
     validateWideDynSafePtr w reg (.danglingInt 16) (.danglingInt 0) spec false true =
       .error (.invalidVTableDanglingInt 16) ∧
@@ -1245,7 +1371,7 @@ theorem canary_part3C_wideDyn_vtable_precedence_and_mayDangle :
   let reg : VTableRegistry :=
     { keyToAlloc := ExtTreeMap0.empty, allocToData := ExtTreeMap0.empty.insert id1 vtUninhab }
   let w : KeyedAllocWorld :=
-    (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩).insertLive id10 entryU32
+    (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩).insertLive id10 entryU32
   have hvtOk : validateVTableHalf w reg (.provenanced id1 0) spec = .ok vtUninhab := by
     have hmatch : vtableMatchesExpectedSpec vtUninhab.spec spec = true := rfl
     simp [w, reg, vtUninhab, spec, validateVTableHalf, KeyedAllocWorld.findGlobal?,
@@ -1285,8 +1411,8 @@ theorem canary_part3C_zstConcrete_neverDangles_and_provenanced_addressTooClose :
       { keyToAlloc := ExtTreeMap0.empty,
         allocToData := (ExtTreeMap0.empty.insert id1 vtZst).insert id2 vtU32 }
     let w : KeyedAllocWorld :=
-      ((KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩).registerGlobal id2
-        ⟨.vtable, 24, 3, .not⟩).insertDead id3 ⟨4, 2⟩
+      ((KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩).registerGlobal id2
+        ⟨.vtable, 24, 3, .not, []⟩).insertDead id3 ⟨4, 2⟩
     validateWideDynSafePtr w reg (.provenanced id1 0) (.provenanced id3 0 16) spec false false = .ok vtZst ∧
     validateWideDynSafePtr w reg (.provenanced id1 0) (.maybeNull id10 77 16) spec false false = .ok vtZst ∧
     validateWideDynSafePtr w reg (.provenanced id1 0) (.maybeNull id3 0 0) spec false false =
@@ -1313,11 +1439,11 @@ theorem canary_part3C_zstConcrete_neverDangles_and_provenanced_addressTooClose :
     { keyToAlloc := ExtTreeMap0.empty,
       allocToData := (ExtTreeMap0.empty.insert id1 vtZst).insert id2 vtU32 }
   let w : KeyedAllocWorld :=
-    ((KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩).registerGlobal id2
-      ⟨.vtable, 24, 3, .not⟩).insertDead id3 ⟨4, 2⟩
+    ((KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩).registerGlobal id2
+      ⟨.vtable, 24, 3, .not, []⟩).insertDead id3 ⟨4, 2⟩
   have hvtZst : validateVTableHalf w reg (.provenanced id1 0) spec = .ok vtZst := by
     have hmatch : vtableMatchesExpectedSpec vtZst.spec spec = true := rfl
-    have hg : w.findGlobal? id1 = some ⟨.vtable, 24, 3, .not⟩ := by
+    have hg : w.findGlobal? id1 = some ⟨.vtable, 24, 3, .not, []⟩ := by
       simp only [w, KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal]
       rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id1 ≠ id2), ExtTreeMap0.get?_insert_self]
     have hd : reg.allocToData.get? id1 = some vtZst := by
@@ -1326,7 +1452,7 @@ theorem canary_part3C_zstConcrete_neverDangles_and_provenanced_addressTooClose :
     simp [validateVTableHalf, hg, hd, hmatch]
   have hvtU32 : validateVTableHalf w reg (.provenanced id2 0) spec = .ok vtU32 := by
     have hmatch : vtableMatchesExpectedSpec vtU32.spec spec = true := rfl
-    have hg : w.findGlobal? id2 = some ⟨.vtable, 24, 3, .not⟩ := by
+    have hg : w.findGlobal? id2 = some ⟨.vtable, 24, 3, .not, []⟩ := by
       simp [w, KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
         ExtTreeMap0.get?_insert_self]
     have hd : reg.allocToData.get? id2 = some vtU32 := by
@@ -1366,7 +1492,7 @@ theorem canary_part3C_unified_validateRawPtrFull :
     let resolve : String → DynExistentialSpec := fun _ => ⟨none, AutoTraitSet.ofList [.send], []⟩
     let vtSend := buildPrincipalLessVTable (.uint 4) 42 none 4 2 [.send]
     let reg : VTableRegistry := { keyToAlloc := ExtTreeMap0.empty, allocToData := ExtTreeMap0.empty.insert id1 vtSend }
-    let w : KeyedAllocWorld := KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩
+    let w : KeyedAllocWorld := KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩
     (unsizedDynTailTrait? (.adt "MyDynDst" [.uint 4, .dynamic "Send"])).isSome =
       (unsizedMetadataTail (.adt "MyDynDst" [.uint 4, .dynamic "Send"]) == some .dynVTable) ∧
     (fieldsUnsizedDynTailTrait? [.uint 4, .dynamic "Send"]).isSome =
@@ -1382,7 +1508,7 @@ theorem canary_part3C_unified_validateRawPtrFull :
   let resolve : String → DynExistentialSpec := fun _ => ⟨none, AutoTraitSet.ofList [.send], []⟩
   let vtSend := buildPrincipalLessVTable (.uint 4) 42 none 4 2 [.send]
   let reg : VTableRegistry := { keyToAlloc := ExtTreeMap0.empty, allocToData := ExtTreeMap0.empty.insert id1 vtSend }
-  let w : KeyedAllocWorld := KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩
+  let w : KeyedAllocWorld := KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩
   have h1 := unsizedDynTailTrait?_isSome_eq_dynMeta (.adt "MyDynDst" [.uint 4, .dynamic "Send"])
   have h2 := fieldsDynTailTrait?_isSome_eq_dynMeta [.uint 4, .dynamic "Send"]
   have h3 := validateRawPtrFull_sized_skips_layout_and_vtable w reg resolve (.array (.uint 1) usizeMax64) 4096 rfl
@@ -1407,7 +1533,7 @@ theorem canary_part3C_recursive_pointee_bytes :
       { keyToAlloc := ExtTreeMap0.empty
         allocToData := ((ExtTreeMap0.empty.insert idVtBool vtBool).insert idVtRefU32 vtRefU32).insert idVtRefNever vtRefNever }
     let wBase1 : KeyedAllocWorld :=
-      ((KeyedAllocWorld.empty.registerGlobal idVtBool ⟨.vtable, 24, 3, .not⟩).registerGlobal idVtRefU32 ⟨.vtable, 24, 3, .not⟩).registerGlobal idVtRefNever ⟨.vtable, 24, 3, .not⟩
+      ((KeyedAllocWorld.empty.registerGlobal idVtBool ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtRefU32 ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtRefNever ⟨.vtable, 24, 3, .not, []⟩
     let wDanglingRef := wBase1.insertLive id10 ⟨8, 3, .stack, .mut, encodeLeUInt64Bytes 16⟩
     validateWideDynSafePtrWithBytes wDanglingRef reg1 (.provenanced idVtRefU32 0) (.provenanced id10 0 16) spec false true =
       .ok vtRefU32 ∧
@@ -1423,7 +1549,7 @@ theorem canary_part3C_recursive_pointee_bytes :
        { keyToAlloc := ExtTreeMap0.empty
          allocToData := (((ExtTreeMap0.empty.insert idVtPair vtPair).insert idVtChar vtChar).insert idVtFn vtFn).insert idVtUninhab vtUninhab }
      let wBase2 : KeyedAllocWorld :=
-       (((KeyedAllocWorld.empty.registerGlobal idVtPair ⟨.vtable, 24, 3, .not⟩).registerGlobal idVtChar ⟨.vtable, 24, 3, .not⟩).registerGlobal idVtFn ⟨.vtable, 24, 3, .not⟩).registerGlobal idVtUninhab ⟨.vtable, 24, 3, .not⟩
+       (((KeyedAllocWorld.empty.registerGlobal idVtPair ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtChar ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtFn ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtUninhab ⟨.vtable, 24, 3, .not, []⟩
      let wCharSurr := wBase2.insertLive id10 ⟨4, 2, .stack, .mut, encodeLeUInt32Bytes 0xD800⟩
      validateWideDynSafePtrWithBytes wCharSurr reg2 (.provenanced idVtChar 0) (.provenanced id10 0 16) spec false true =
        .error (.pointeeErr (.invalidCharScalar 0xD800))) ∧
@@ -1444,13 +1570,113 @@ theorem canary_part3C_recursive_pointee_bytes :
        { keyToAlloc := ExtTreeMap0.empty
          allocToData := ((((((ExtTreeMap0.empty.insert idVtBoolNever vtBoolNever).insert idVtU32Never vtU32Never).insert idVtFn vtFn).insert idVtZstUnitArr vtZstUnitArr).insert idVtZstNeverEmpty vtZstNeverEmpty).insert idVtZstNeverBig vtZstNeverBig).insert idVtDeep vtDeep }
      let wBase3 : KeyedAllocWorld :=
-       ((((((KeyedAllocWorld.empty.registerGlobal idVtBoolNever ⟨.vtable, 24, 3, .not⟩).registerGlobal idVtU32Never ⟨.vtable, 24, 3, .not⟩).registerGlobal idVtFn ⟨.vtable, 24, 3, .not⟩).registerGlobal idVtZstUnitArr ⟨.vtable, 24, 3, .not⟩).registerGlobal idVtZstNeverEmpty ⟨.vtable, 24, 3, .not⟩).registerGlobal idVtZstNeverBig ⟨.vtable, 24, 3, .not⟩).registerGlobal idVtDeep ⟨.vtable, 24, 3, .not⟩
+       ((((((KeyedAllocWorld.empty.registerGlobal idVtBoolNever ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtU32Never ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtFn ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtZstUnitArr ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtZstNeverEmpty ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtZstNeverBig ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtDeep ⟨.vtable, 24, 3, .not, []⟩
      let wDeepBool := wBase3.insertLive id10 ⟨1, 0, .stack, .mut, [.init 1 none]⟩
      validateWideDynSafePtrWithBytes wDeepBool reg3 (.provenanced idVtDeep 0) (.provenanced id10 0 16) spec false true 64 =
        .error (.pointeeErr .traversalFuelExhausted)) := by
   exact ⟨wideDyn_recursive_bytes_and_childSession_mayDangle.2.2.2.2.2.2,
     wideDyn_recursive_aggregate_char_fnPtr_contents.2.2.2.1,
     wideDyn_recursive_fieldOrder_nullProvFn_zstArray_and_fuel.2.2.2.2.2.2⟩
+
+theorem canary_part3C_widePtrLayout_malformedAlign_unsizedNestedRef_and_staticBytes :
+    computeTyLayout (.ref false (.uint 4)) = .ok ⟨8, 8, true, true, none⟩ ∧
+    computeTyLayout (.ref false (.slice (.uint 4))) = .ok ⟨16, 8, true, true, none⟩ ∧
+    computeTyLayout (.rawPtr false (.dynamic "Send")) = .ok ⟨16, 8, true, true, none⟩ ∧
+    checkNestedSafeRefChildSession (.slice (.uint 4)) (List.replicate 8 (16, none)) =
+      .error (.layoutErr .unsizedField) ∧
+    checkNestedSafeRefChildSession (.dynamic "Send") (List.replicate 8 (16, none)) =
+      .error (.layoutErr .unsizedField) ∧
+    (let spec : DynExistentialSpec := ⟨none, AutoTraitSet.ofList [.send], []⟩
+     let vtBad64 := buildPrincipalLessVTable (.uint 4) 601 none 4 64 [.send]
+     let vtBad30 := buildPrincipalLessVTable (.uint 4) 602 none 4 30 [.send]
+     let vtBadLay := buildPrincipalLessVTable (.uint 3) 603 none 4 2 [.send]
+     let reg : VTableRegistry :=
+       { keyToAlloc := ExtTreeMap0.empty
+         allocToData := ((ExtTreeMap0.empty.insert id1 vtBad64).insert id2 vtBad30).insert id3 vtBadLay }
+     let w : KeyedAllocWorld :=
+       (((KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩)
+         |>.registerGlobal id2 ⟨.vtable, 24, 3, .not, []⟩)
+         |>.registerGlobal id3 ⟨.vtable, 24, 3, .not, []⟩)
+         |>.insertLive id10 entryU32
+     validateWideDynSafePtr w reg (.provenanced id1 0) (.provenanced id10 0 16) spec false false =
+       .error (.malformedVTableAlign 64) ∧
+     validateWideDynSafePtr w reg (.provenanced id2 0) (.provenanced id10 0 16) spec false false =
+       .error (.malformedVTableAlign 30) ∧
+     validateWideDynSafePtr w reg (.provenanced id3 0) (.provenanced id10 0 16) spec false true =
+       .error (.pointeeErr (.layoutErr (.invalidScalarSize 3)))) ∧
+    (let spec : DynExistentialSpec := ⟨none, AutoTraitSet.ofList [.send], []⟩
+     let idVtBool : MiriAllocId := ⟨1, by decide⟩
+     let idStaticOk : MiriAllocId := ⟨20, by decide⟩
+     let idStaticBad : MiriAllocId := ⟨21, by decide⟩
+     let idMemUninit : MiriAllocId := ⟨22, by decide⟩
+     let vtBool := buildPrincipalLessVTable .bool 401 none 1 0 [.send]
+     let reg : VTableRegistry :=
+       { keyToAlloc := ExtTreeMap0.empty
+         allocToData := ExtTreeMap0.empty.insert idVtBool vtBool }
+     let w : KeyedAllocWorld :=
+       (((KeyedAllocWorld.empty.registerGlobal idVtBool ⟨.vtable, 24, 3, .not, []⟩)
+         |>.registerGlobal idStaticOk ⟨.static, 1, 0, .not, [.init 1 none]⟩)
+         |>.registerGlobal idStaticBad ⟨.static, 1, 0, .not, [.init 2 none]⟩)
+         |>.registerGlobal idMemUninit ⟨.memory, 1, 0, .not, [.uninit]⟩
+     validateWideDynSafePtrWithBytes w reg (.provenanced idVtBool 0) (.provenanced idStaticOk 0 16) spec false true =
+       .ok vtBool ∧
+     validateWideDynSafePtrWithBytes w reg (.provenanced idVtBool 0) (.provenanced idStaticBad 0 16) spec false true =
+       .error (.pointeeErr (.invalidBoolScalar 2)) ∧
+     validateWideDynSafePtrWithBytes w reg (.provenanced idVtBool 0) (.provenanced idMemUninit 0 16) spec false true =
+       .error (.pointeeErr .uninitPointeeByte)) := by
+  have hwp := computeTyLayout_widePtr_vs_thinPtr_size
+  have huns := checkNestedSafeRefChildSession_unsizedInner_rejected (List.replicate 8 (16, none))
+  have hst := wideDyn_recursive_staticGlobal_bytes_validated
+  let spec : DynExistentialSpec := ⟨none, AutoTraitSet.ofList [.send], []⟩
+  let vtBad64 := buildPrincipalLessVTable (.uint 4) 601 none 4 64 [.send]
+  let vtBad30 := buildPrincipalLessVTable (.uint 4) 602 none 4 30 [.send]
+  let vtBadLay := buildPrincipalLessVTable (.uint 3) 603 none 4 2 [.send]
+  let reg : VTableRegistry :=
+    { keyToAlloc := ExtTreeMap0.empty
+      allocToData := ((ExtTreeMap0.empty.insert id1 vtBad64).insert id2 vtBad30).insert id3 vtBadLay }
+  let w : KeyedAllocWorld :=
+    (((KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩)
+      |>.registerGlobal id2 ⟨.vtable, 24, 3, .not, []⟩)
+      |>.registerGlobal id3 ⟨.vtable, 24, 3, .not, []⟩)
+      |>.insertLive id10 entryU32
+  have hlive10 : w.findLive? id10 = some entryU32 := by
+    simp [w, KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self]
+  have hvt1 : validateVTableHalf w reg (.provenanced id1 0) spec = .ok vtBad64 := by
+    have hg : w.findGlobal? id1 = some ⟨.vtable, 24, 3, .not, []⟩ := by
+      simp only [w, KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal]
+      rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id1 ≠ id3),
+        ExtTreeMap0.get?_insert_ne _ _ (by decide : id1 ≠ id2), ExtTreeMap0.get?_insert_self]
+    have hd : reg.allocToData.get? id1 = some vtBad64 := by
+      simp only [reg]
+      rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id1 ≠ id3),
+        ExtTreeMap0.get?_insert_ne _ _ (by decide : id1 ≠ id2), ExtTreeMap0.get?_insert_self]
+    have hm : vtableMatchesExpectedSpec vtBad64.spec spec = true := rfl
+    simp [validateVTableHalf, hg, hd, hm]
+  have hvt2 : validateVTableHalf w reg (.provenanced id2 0) spec = .ok vtBad30 := by
+    have hg : w.findGlobal? id2 = some ⟨.vtable, 24, 3, .not, []⟩ := by
+      simp only [w, KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal]
+      rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id2 ≠ id3), ExtTreeMap0.get?_insert_self]
+    have hd : reg.allocToData.get? id2 = some vtBad30 := by
+      simp only [reg]
+      rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id2 ≠ id3), ExtTreeMap0.get?_insert_self]
+    have hm : vtableMatchesExpectedSpec vtBad30.spec spec = true := rfl
+    simp [validateVTableHalf, hg, hd, hm]
+  have hvt3 : validateVTableHalf w reg (.provenanced id3 0) spec = .ok vtBadLay := by
+    have hg : w.findGlobal? id3 = some ⟨.vtable, 24, 3, .not, []⟩ := by
+      simp [w, KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal,
+        ExtTreeMap0.get?_insert_self]
+    have hd : reg.allocToData.get? id3 = some vtBadLay := by
+      simp [reg, ExtTreeMap0.get?_insert_self]
+    have hm : vtableMatchesExpectedSpec vtBadLay.spec spec = true := rfl
+    simp [validateVTableHalf, hg, hd, hm]
+  have hfc1 := (wideDyn_malformedAlign_and_malformedConcreteLayout_failClosed w reg (.provenanced id1 0) spec
+    vtBad64 vtBad30 vtBadLay id10 entryU32 hlive10 (by decide)).1 hvt1 rfl rfl
+  have hfc2 := (wideDyn_malformedAlign_and_malformedConcreteLayout_failClosed w reg (.provenanced id2 0) spec
+    vtBad64 vtBad30 vtBadLay id10 entryU32 hlive10 (by decide)).2.1 hvt2 rfl rfl
+  have hfc3 := (wideDyn_malformedAlign_and_malformedConcreteLayout_failClosed w reg (.provenanced id3 0) spec
+    vtBad64 vtBad30 vtBadLay id10 entryU32 hlive10 (by decide)).2.2 hvt3 rfl rfl rfl
+  exact ⟨hwp.1, hwp.2.2.2.1, hwp.2.2.2.2.2.2.2, huns.1, huns.2, ⟨hfc1, hfc2, hfc3⟩,
+    ⟨hst.2.2.1, hst.2.2.2.1, hst.2.2.2.2⟩⟩
 
 /-! ## Section 4: Fast `M = 16` Closed Workload Canary -/
 
@@ -1712,6 +1938,42 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_mayDangle_provenanced_address
 -/
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_mayDangle_provenanced_addressTooClose
 
+/-- info: 'Anneal.ExtTreeMapAllocAndNoWritable.allocWorldRel_findAllocBytes?' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.allocWorldRel_findAllocBytes?
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.stepNodeOnRangeWrite_unaccessed_protected_foreign_disables_without_ub' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.stepNodeOnRangeWrite_unaccessed_protected_foreign_disables_without_ub
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.fnEntryMutRetag_disabledParent_zst_disjoint_and_readOnly_precedence' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.fnEntryMutRetag_disabledParent_zst_disjoint_and_readOnly_precedence
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_eq_sourceOrder_of_noSkippedForeignSubtree' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_eq_sourceOrder_of_noSkippedForeignSubtree
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_skipSelfAndChildren_separation' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_skipSelfAndChildren_separation
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_malformedAlign_and_malformedConcreteLayout_failClosed' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_malformedAlign_and_malformedConcreteLayout_failClosed
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_recursive_staticGlobal_bytes_validated' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_recursive_staticGlobal_bytes_validated
+
 /-! ## Section 6: Meta-Level `run_cmd` Audit & Rolled-Back Self-Tests -/
 
 section MetaAudit
@@ -1735,19 +1997,40 @@ private def nameHasComponent (nm : Name) (pred : String → Bool) : Bool :=
   | .str p s => pred s || nameHasComponent p pred
   | .num p _ => nameHasComponent p pred
 
+private def isNonEmptyDigits (cs : List Char) : Bool :=
+  !cs.isEmpty && cs.all Char.isDigit
+
+private def isDigitUnderscoreSuffix (cs : List Char) : Bool :=
+  !cs.isEmpty && cs.all (fun c => c.isDigit || c == '_') && cs.any Char.isDigit
+
+private def hasNumericPrefix (s pfx : String) : Bool :=
+  s.startsWith pfx && isNonEmptyDigits (s.toList.drop pfx.length)
+
 private def isCompilerGeneratedAuxThm (env : Environment) (nm : Name) : Bool :=
   if env.isProjectionFn nm then true
   else if nameHasComponent nm (fun s => s == "decEq" || s.startsWith "_sparseCasesOn" || s == "_unary") then true
   else
     match nm with
-    | .str _ s =>
-      s == "inj" || s == "injEq" || s == "sizeOf_spec" || s == "ext_iff" ||
-      s == "ext_get?_iff" || s == "ofNat_ctorIdx" || s == "ctorIdx_eq" ||
-      s == "else_eq" || s == "eq" || s == "eq_def" || s == "congr_simp" ||
-      s == "noConfusion_eq" || s == "induct_unfolding" ||
-      s.startsWith "_proof_" || s.startsWith "_simp_" || s.startsWith "_cstage" ||
-      s.startsWith "_sizeOf_" || s.startsWith "eq_" || s.startsWith "match_" ||
-      s.startsWith "proof_" || s.startsWith "brecOn"
+    | .str p s =>
+      let hasParentDecl := env.contains p
+      let isExactAuxSuffix :=
+        s == "inj" || s == "injEq" || s == "sizeOf_spec" || s == "ext_iff" ||
+        s == "ext_get?_iff" || s == "ofNat_ctorIdx" || s == "ctorIdx_eq" ||
+        s == "else_eq" || s == "eq" || s == "eq_def" || s == "congr_simp" ||
+        s == "noConfusion_eq" || s == "induct_unfolding" || s == "brecOn"
+      let isNumericAuxSuffix :=
+        hasNumericPrefix s "eq_" || hasNumericPrefix s "match_" || hasNumericPrefix s "proof_" ||
+        (s.startsWith "_proof_" && isDigitUnderscoreSuffix (s.toList.drop "_proof_".length)) ||
+        (s.startsWith "_simp_" && isDigitUnderscoreSuffix (s.toList.drop "_simp_".length)) ||
+        hasNumericPrefix s "_cstage" ||
+        (s.startsWith "_sizeOf_" &&
+          (isNonEmptyDigits (s.toList.drop "_sizeOf_".length) ||
+           (s.endsWith "_eq" &&
+             isNonEmptyDigits ((s.toList.drop "_sizeOf_".length).dropLast.dropLast.dropLast))))
+      (hasParentDecl && (isExactAuxSuffix || isNumericAuxSuffix)) ||
+        (s.startsWith "_proof_" && isDigitUnderscoreSuffix (s.toList.drop "_proof_".length)) ||
+        (s.startsWith "_simp_" && isDigitUnderscoreSuffix (s.toList.drop "_simp_".length)) ||
+        hasNumericPrefix s "_cstage"
     | _ => false
 
 /-- Collect unpruned transitive constant closure (used for axiom soundness — never prunes dead code). -/
@@ -1847,11 +2130,20 @@ private partial def collectPrunedReachableClosure (env : Environment)
 private def exprMentionsAudited (env : Environment) (theoryModIdx? : Option ModuleIdx) (e : Expr) : Bool :=
   e.getUsedConstants.any (isAuditedDecl env theoryModIdx?)
 
+private def isAuditedTheoryThm (env : Environment) (theoryModIdx? : Option ModuleIdx) (nm : Name) : Bool :=
+  if isAuditedTheoryDecl env theoryModIdx? nm then
+    match env.find? nm with
+    | some (.thmInfo _) => !isCompilerGeneratedAuxThm env nm
+    | _ => false
+  else false
+
+private def exprMentionsAuditedThm (env : Environment) (theoryModIdx? : Option ModuleIdx) (e : Expr) : Bool :=
+  e.getUsedConstants.any (isAuditedTheoryThm env theoryModIdx?)
+
 /-- Detect dead placeholder bindings (`.letE`, beta-redex, `letFun` where binder `0` is unused
-and the discarded value references an audited declaration). DAG-aware: every shared subterm is
-inspected once (detection is context-free per subterm). -/
-private partial def hasPlaceholderBinding (env : Environment) (theoryModIdx? : Option ModuleIdx)
-    (e : Expr) : Bool :=
+and the discarded value satisfies `mentions`). DAG-aware: every shared subterm is inspected once
+(detection is context-free per subterm). -/
+private partial def hasPlaceholderBindingWith (mentions : Expr → Bool) (e : Expr) : Bool :=
   ((go e).run {}).1
 where
   go (e : Expr) : StateM (Std.HashSet Expr) Bool := do
@@ -1859,7 +2151,7 @@ where
     modify fun vis => vis.insert e
     match e with
     | .letE _ t v b _ =>
-      if (!b.hasLooseBVar 0) && exprMentionsAudited env theoryModIdx? v then return true
+      if (!b.hasLooseBVar 0) && mentions v then return true
       if ← go t then return true
       if ← go v then return true
       go b
@@ -1869,7 +2161,7 @@ where
       if head.isConstOf ``letFun && args.size == 4 then
         match args[3]! with
         | .lam _ _ b _ =>
-          if (!b.hasLooseBVar 0) && exprMentionsAudited env theoryModIdx? args[2]! then return true
+          if (!b.hasLooseBVar 0) && mentions args[2]! then return true
           if ← go args[2]! then return true
           go b
         | other =>
@@ -1878,7 +2170,7 @@ where
       else
         match fn with
         | .lam _ _ b _ =>
-          if (!b.hasLooseBVar 0) && exprMentionsAudited env theoryModIdx? arg then return true
+          if (!b.hasLooseBVar 0) && mentions arg then return true
           if ← go arg then return true
           go b
         | _ =>
@@ -1893,6 +2185,14 @@ where
     | .mdata _ inner => go inner
     | .proj _ _ s => go s
     | _ => return false
+
+private def hasPlaceholderBinding (env : Environment) (theoryModIdx? : Option ModuleIdx)
+    (e : Expr) : Bool :=
+  hasPlaceholderBindingWith (exprMentionsAudited env theoryModIdx?) e
+
+private def hasTheoryThmPlaceholderBinding (env : Environment) (theoryModIdx? : Option ModuleIdx)
+    (e : Expr) : Bool :=
+  hasPlaceholderBindingWith (exprMentionsAuditedThm env theoryModIdx?) e
 
 /-- Strip `let`/`letFun` wrappers from a `Prop` expression for tautology inspection. -/
 private partial def stripLetBindings (e : Expr) : Expr :=
@@ -1951,7 +2251,7 @@ private def isConditionalPublicTestThm (env : Environment) (nm : Name) (ci : Con
   | .thmInfo _ =>
     if !isPrivateName nm && !isCompilerGeneratedAuxThm env nm then
       let isCanary := match nm with | .str _ s => s.startsWith "canary_" | _ => false
-      ci.type.isForall || !isCanary
+      (stripLetBindings ci.type).isForall || !isCanary
     else false
   | _ => false
 
@@ -1981,6 +2281,10 @@ run_cmd do
         if !isPrivateName nm && !isCompilerGeneratedAuxThm env nm then
           theoryPubThms := nm :: theoryPubThms
       | _ => pure ()
+      if !isCompilerGeneratedAuxThm env nm then
+        if let some val := ci.value? (allowOpaque := true) then
+          if hasTheoryThmPlaceholderBinding env theoryModIdx? val then
+            placeholderDecls := nm :: placeholderDecls
 
   for (nm, ci) in env.constants.map₂.toList do
     -- Skip the meta-audit helpers themselves (MetaAudit uses `Lean.Elab` / `NameSet`, not object-level proofs)
@@ -1988,18 +2292,24 @@ run_cmd do
       match nm with
       | .str _ s =>
         s == "isAuditedTheoryDecl" || s == "isAuditedTestDecl" || s == "isAuditedDecl" ||
-        s == "nameHasComponent" || s == "isCompilerGeneratedAuxThm" ||
+        s == "isAuditedTheoryThm" ||
+        s == "nameHasComponent" || s == "isNonEmptyDigits" || s == "isDigitUnderscoreSuffix" ||
+        s == "hasNumericPrefix" || s == "isCompilerGeneratedAuxThm" ||
         s == "collectTransitiveClosure" || s == "collectPrunedExprConsts" ||
         s == "collectPrunedReachableClosure" || s == "exprMentionsAudited" ||
-        s == "hasPlaceholderBinding" || s == "stripLetBindings" ||
+        s == "exprMentionsAuditedThm" || s == "hasPlaceholderBindingWith" ||
+        s == "hasPlaceholderBinding" || s == "hasTheoryThmPlaceholderBinding" ||
+        s == "stripLetBindings" ||
         s == "hasTautologicalConjunct" || s == "checkDeclAxioms" ||
         s == "isConditionalPublicTestThm"
       | _ => false
     if !isMetaHelper && !nameHasComponent nm (fun s =>
         s == "collectTransitiveClosure" || s == "collectPrunedExprConsts" ||
-        s == "collectPrunedReachableClosure" || s == "hasPlaceholderBinding" ||
+        s == "collectPrunedReachableClosure" || s == "hasPlaceholderBindingWith" ||
+        s == "hasPlaceholderBinding" || s == "hasTheoryThmPlaceholderBinding" ||
         s == "stripLetBindings" || s == "hasTautologicalConjunct" ||
-        s == "isCompilerGeneratedAuxThm" || s == "nameHasComponent") then
+        s == "isCompilerGeneratedAuxThm" || s == "nameHasComponent" ||
+        s == "isNonEmptyDigits" || s == "isDigitUnderscoreSuffix" || s == "hasNumericPrefix") then
       auditedRoots := nm :: auditedRoots
       totalDecls := totalDecls + 1
       if ci.isUnsafe then
@@ -2152,7 +2462,42 @@ run_cmd do
   let st12 := (checkDeclAxioms env ``ExtTreeMap0.ext_get?).isEmpty
   unless st12 do throwError "SELF-TEST 12 FAILED: clean ExtTreeMap0.ext_get? falsely flagged"
 
-  logInfo m!"audit passed: {totalDecls} declarations ({theoryPubThms.length} theory public theorems, {closedCanaries.length} closed test canaries, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 unexpected axioms, 0 placeholder uses, 0 tautological conjuncts, 0 conditional test theorems, 100% pruned theorem reachability; 12/12 rolled-back self-tests passed)"
+  -- Self-test 13: user-written theorems named `eq_*` / `proof_*` / `match_*` are NOT exempted
+  let st13 : Bool ← withoutModifyingEnv do
+    let fakeEq := `Anneal.ExtTreeMapAllocAndNoWritable.eq_fake_untested
+    let fakeProof := `Anneal.ExtTreeMapAllocAndNoWritable.proof_fake_untested
+    let fakeMatch := `Anneal.ExtTreeMapAllocAndNoWritable.match_fake_untested
+    let fakeNum := `Anneal.ExtTreeMapAllocAndNoWritable.eq_1
+    let e ← getEnv
+    pure (!isCompilerGeneratedAuxThm e fakeEq &&
+          !isCompilerGeneratedAuxThm e fakeProof &&
+          !isCompilerGeneratedAuxThm e fakeMatch &&
+          !isCompilerGeneratedAuxThm e fakeNum)
+  unless st13 do throwError "SELF-TEST 13 FAILED: user-named eq_/proof_/match_ theorem falsely exempted"
+
+  -- Self-test 14: `let`-wrapped universally quantified canary is caught as conditional (rolled back)
+  let st14 : Bool ← withoutModifyingEnv do
+    let letCondName := `Anneal.ExtTreeMapAllocAndNoWritableTests.canary_let_wrapped_forall
+    let ty := Expr.letE `k (mkConst ``Nat) (mkNatLit 1)
+      (Expr.forallE `x (mkConst ``Nat)
+        (mkApp3 (mkConst ``Eq [Level.succ Level.zero]) (mkConst ``Nat) (Expr.bvar 0) (Expr.bvar 0)) .default) false
+    let val := Expr.letE `k (mkConst ``Nat) (mkNatLit 1)
+      (Expr.lam `x (mkConst ``Nat)
+        (mkApp2 (mkConst ``Eq.refl [Level.succ Level.zero]) (mkConst ``Nat) (Expr.bvar 0)) .default) false
+    liftCoreM <| addDecl (.thmDecl { name := letCondName, levelParams := [], type := ty, value := val })
+    let e ← getEnv
+    match e.find? letCondName with
+    | some ci => pure (isConditionalPublicTestThm e letCondName ci)
+    | none => pure false
+  unless st14 do throwError "SELF-TEST 14 FAILED: let-wrapped conditional canary not caught"
+
+  -- Self-test 15: dead theorem placeholder inside a theory declaration is caught by `hasTheoryThmPlaceholderBinding`
+  let st15 := hasTheoryThmPlaceholderBinding env theoryModIdx?
+    (Expr.lam `x (mkConst ``Nat)
+      (Expr.letE `unused (mkConst ``True) (mkConst ``MiriAllocId.ofUInt64_zero) (Expr.bvar 1) false) .default)
+  unless st15 do throwError "SELF-TEST 15 FAILED: dead theorem placeholder inside lambda body not caught"
+
+  logInfo m!"audit passed: {totalDecls} declarations ({theoryPubThms.length} theory public theorems, {closedCanaries.length} closed test canaries, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 unexpected axioms, 0 placeholder uses, 0 tautological conjuncts, 0 conditional test theorems, 100% pruned theorem reachability; 15/15 rolled-back self-tests passed)"
 
 end MetaAudit
 
