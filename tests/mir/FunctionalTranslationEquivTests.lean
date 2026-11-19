@@ -2882,6 +2882,511 @@ theorem callerRefactored_mirTree_exactPass_with_gaps :
     mirContextEquivOn_mirTree_toPartial_eq hEqOn ⟨(false, 7), rfl⟩
       (hClosed _ ⟨(false, 7), rfl⟩)⟩
 
+/-! ### Part 5G: Standalone Caller-Frame Preservation, Reachable-Request Env Linking, Kernel `VerificationResult` Transfer, Open-World `mirHandledTreeWithCallees` `ExactPass`, and Partition/Query-Scoped Transfer -/
+
+/-- Standalone external MIR body: `fn ext_double(x: u32) -> u32 { x + x }`. -/
+def extDoubleBody : CapturedMir :=
+  mkMirBody "test::ext_double" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [mkStmt (.assign (locPlace 0)
+            (.binaryOp .add (.copy (locPlace 1)) (.copy (locPlace 1))))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/--
+Modeled-phase inline middle helper calling standalone `"test::ext_double"`:
+`fn mid_ext_call(x: u32) -> u32 { let y = ext_double(x); y }`.
+-/
+def midExtCallHelperBody : CapturedMir :=
+  mkMirBody "test::mid_ext_call" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy, mkDecl .mut u32MirTy]
+    [ { statements := [mkStmt (.storageLive 2)]
+        terminator := mkTerm
+          (.call (fnItemOp "test::ext_double") [.copy (locPlace 1)]
+            (locPlace 2) (some 1) .continue_)
+        isCleanup := false },
+      { statements :=
+          [mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 2))))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+def outerMidBranchingBody : CapturedMir :=
+  mkMirBody "test::outer_mid_branching" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy]
+    [ flagSwitchBlock,
+      { statements :=
+          [mkStmt (.assign (locPlace 0)
+            (.binaryOp .add (.copy (locPlace 2)) (.copy (locPlace 2))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      helperCallBlock "test::mid_ext_call",
+      returnBlock ]
+
+def outerMidRefactoredBody : CapturedMir :=
+  mkMirBody "test::outer_mid_refactored" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy,
+     mkDecl .mut u32MirTy]
+    [ flagSwitchBlock,
+      { statements :=
+          [mkStmt (.storageLive 3),
+           mkStmt (.assign (locPlace 3)
+             (.binaryOp .mul (.copy (locPlace 2)) (u32ConstOp 2))),
+           mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 3))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      helperCallBlock "test::mid_ext_call",
+      returnBlock ]
+
+/-- Raw `MirCallEnv.ofMirOutcome` wrapping standalone `runMirWithGap` on `extDoubleBody`. -/
+def buggyStandaloneEnv : MirCallEnv :=
+  MirCallEnv.ofMirOutcome (fun req =>
+    runMirWithGap MirCallEnv.unresolved [] extDoubleBody 3 req.args)
+
+/-- Frame-preserving `MirCallEnv.ofStandaloneBody` wrapping standalone `extDoubleBody`. -/
+def safeStandaloneEnv : MirCallEnv :=
+  MirCallEnv.ofStandaloneBody [] 3
+    (fun dp => if dp == "test::ext_double" then some extDoubleBody else none)
+
+/--
+Standalone caller-frame corruption vs. `MirCallEnv.ofStandaloneBody` canary:
+1. Summarizing standalone `extDoubleBody` via raw `MirCallEnv.ofMirOutcome`
+   wipes out `activeCallee = some midExtCallHelperBody` and `callStack` upon
+   return, causing `outerMidBranchingBody` on `(false, 3)` to execute its own
+   `bb1` (`_2 + _2`) against `midExtCallHelperBody`'s local `_2 = 6` (returning
+   `12` instead of `6`!) while `outerMidRefactoredBody` hits spurious `.fault .ub`
+   on out-of-bounds local `_3`, falsifying `PreservesCallFrame` and breaking
+   `ContextEquiv`;
+2. Summarizing the same `extDoubleBody` via `MirCallEnv.ofStandaloneBody`
+   satisfies `PreservesCallFrame` (`callFramePreserved`), returns `6` on both
+   callers, and preserves `ContextEquiv` (`r₁.1 = r₂.1`) across all `(flag, x)`.
+-/
+theorem ofMirOutcome_frame_corruption_vs_ofStandaloneBody :
+    ¬ buggyStandaloneEnv.PreservesCallFrame ∧
+      (runMirWithGap buggyStandaloneEnv [midExtCallHelperBody]
+          outerMidBranchingBody 10 (callerArgs (false, 3))).map Prod.fst =
+        .ok (.scalar ⟨12, 4⟩) ∧
+      runMirWithGap buggyStandaloneEnv [midExtCallHelperBody]
+          outerMidRefactoredBody 10 (callerArgs (false, 3)) = .fault .ub ∧
+      ¬ ContextEquiv (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·)
+        (fun q : Bool × Nat =>
+          mirGapBehaviors buggyStandaloneEnv [midExtCallHelperBody]
+            outerMidBranchingBody (callerArgs q))
+        (fun q : Bool × Nat =>
+          mirGapBehaviors buggyStandaloneEnv [midExtCallHelperBody]
+            outerMidRefactoredBody (callerArgs q)) ∧
+      safeStandaloneEnv.PreservesCallFrame ∧
+      (runMirWithGap safeStandaloneEnv [midExtCallHelperBody]
+          outerMidBranchingBody 10 (callerArgs (false, 3))).map Prod.fst =
+        .ok (.scalar ⟨6, 4⟩) ∧
+      (runMirWithGap safeStandaloneEnv [midExtCallHelperBody]
+          outerMidRefactoredBody 10 (callerArgs (false, 3))).map Prod.fst =
+        .ok (.scalar ⟨6, 4⟩) ∧
+      ContextEquiv (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·)
+        (fun q : Bool × Nat =>
+          mirGapBehaviors safeStandaloneEnv [midExtCallHelperBody]
+            outerMidBranchingBody (callerArgs q))
+        (fun q : Bool × Nat =>
+          mirGapBehaviors safeStandaloneEnv [midExtCallHelperBody]
+            outerMidRefactoredBody (callerArgs q)) := by
+  have hNoFrame : ¬ buggyStandaloneEnv.PreservesCallFrame := by
+    intro h
+    let memActive : Memory :=
+      { (initMachineStateWithCallees outerMidBranchingBody (callerArgs (false, 3))
+          [midExtCallHelperBody]).memory with
+        activeCallee := some midExtCallHelperBody }
+    let req : MirCallReq :=
+      { defPath := "test::ext_double", typeArgs := [], args := [.scalar ⟨3, 4⟩],
+        memory := memActive }
+    have hok : buggyStandaloneEnv req =
+        .ok (.returned (.scalar ⟨6, 4⟩)
+          (initMachineStateWithCallees extDoubleBody [.scalar ⟨3, 4⟩] []).memory) := rfl
+    have hpres := h req _ hok
+    cases hpres.2.2.1
+  have hBuggy₂ : runMirWithGap buggyStandaloneEnv [midExtCallHelperBody]
+      outerMidRefactoredBody 10 (callerArgs (false, 3)) = .fault .ub := rfl
+  have hNotCtx : ¬ ContextEquiv (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·)
+      (fun q : Bool × Nat =>
+        mirGapBehaviors buggyStandaloneEnv [midExtCallHelperBody]
+          outerMidBranchingBody (callerArgs q))
+      (fun q : Bool × Nat =>
+        mirGapBehaviors buggyStandaloneEnv [midExtCallHelperBody]
+          outerMidRefactoredBody (callerArgs q)) := by
+    intro hEq
+    have h₁ : runMirWithGap buggyStandaloneEnv [midExtCallHelperBody]
+        outerMidBranchingBody 10 (callerArgs (false, 3)) =
+        .ok (.scalar ⟨12, 4⟩,
+          (initMachineStateWithCallees extDoubleBody [.scalar ⟨3, 4⟩] []).memory) := rfl
+    have hrel := (mirGapBehaviors_equiv_iff_of_runs
+      (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀))
+      (ne_outOfFuel_of_eq hBuggy₂ (fun h₀ => by cases h₀))).mp (hEq (false, 3))
+    rw [h₁, hBuggy₂] at hrel
+    exact False.elim hrel
+  have hSafeCtx : ContextEquiv (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·)
+      (fun q : Bool × Nat =>
+        mirGapBehaviors safeStandaloneEnv [midExtCallHelperBody]
+          outerMidBranchingBody (callerArgs q))
+      (fun q : Bool × Nat =>
+        mirGapBehaviors safeStandaloneEnv [midExtCallHelperBody]
+          outerMidRefactoredBody (callerArgs q)) := by
+    intro ⟨flag, x⟩
+    cases flag with
+    | true =>
+      have h₁ : runMirWithGap safeStandaloneEnv [midExtCallHelperBody]
+          outerMidBranchingBody 3 (callerArgs (true, x)) =
+          .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩,
+            (initMachineStateWithCallees outerMidBranchingBody []
+              [midExtCallHelperBody]).memory) := rfl
+      have h₂ : runMirWithGap safeStandaloneEnv [midExtCallHelperBody]
+          outerMidRefactoredBody 5 (callerArgs (true, x)) =
+          .ok (.scalar ⟨wrapScalarBits (x * 2) (scalarModulus 4), 4⟩,
+            (initMachineStateWithCallees outerMidBranchingBody []
+              [midExtCallHelperBody]).memory) := rfl
+      refine mirGapBehaviors_equiv_of_runs (fuel₂ := 5)
+        (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) ?_
+      rw [h₁, h₂, Nat.mul_two]
+      exact (rfl : Value.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩ = _)
+    | false =>
+      have hm₁ : (runMirWithGap safeStandaloneEnv [midExtCallHelperBody]
+          outerMidBranchingBody 10 (callerArgs (false, x))).map Prod.fst =
+          .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩) := rfl
+      have hm₂ : (runMirWithGap safeStandaloneEnv [midExtCallHelperBody]
+          outerMidRefactoredBody 10 (callerArgs (false, x))).map Prod.fst =
+          .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩) := rfl
+      have hne₁ : runMirWithGap safeStandaloneEnv [midExtCallHelperBody]
+          outerMidBranchingBody 10 (callerArgs (false, x)) ≠ .gap .outOfFuel := by
+        intro h₀; rw [h₀] at hm₁; cases hm₁
+      refine mirGapBehaviors_equiv_of_runs (fuel₂ := 10) hne₁ ?_
+      cases ho₁ : runMirWithGap safeStandaloneEnv [midExtCallHelperBody]
+          outerMidBranchingBody 10 (callerArgs (false, x)) with
+      | ok r₁ =>
+        cases ho₂ : runMirWithGap safeStandaloneEnv [midExtCallHelperBody]
+            outerMidRefactoredBody 10 (callerArgs (false, x)) with
+        | ok r₂ =>
+          rw [ho₁] at hm₁; rw [ho₂] at hm₂
+          exact (OutcomeWithGap.ok.inj hm₁).trans (OutcomeWithGap.ok.inj hm₂).symm
+        | fault _ => rw [ho₂] at hm₂; cases hm₂
+        | gap _ => rw [ho₂] at hm₂; cases hm₂
+      | fault _ => rw [ho₁] at hm₁; cases hm₁
+      | gap _ => rw [ho₁] at hm₁; cases hm₁
+  exact ⟨hNoFrame, rfl, hBuggy₂, hNotCtx,
+    MirCallEnv.ofStandaloneBody_preservesCallFrame [] 3 _, rfl, rfl, hSafeCtx⟩
+
+/-- Partial callee table resolving only `"test::ext_helper"`. -/
+def partialLinkEnv : MirCallEnv :=
+  MirCallEnv.ofPure (fun dp args =>
+    if dp == "test::ext_helper" then incHelperSummary dp args else .gap (.unresolved dp))
+
+/-- Extended callee table adding a summary for `"test::unrelated_fn"`. -/
+def extendedLinkEnv : MirCallEnv :=
+  MirCallEnv.ofPure (fun dp args =>
+    if dp == "test::ext_helper" then incHelperSummary dp args
+    else if dp == "test::unrelated_fn" then .ok (.scalar ⟨99, 4⟩)
+    else .gap (.unresolved dp))
+
+/--
+Reachable-request modular environment linking canary (`mirGapBehaviors_env_congr_on`):
+upgrading `"test::unrelated_fn"` from `.gap (.unresolved "test::unrelated_fn")` to
+`.ok 99` falsifies global `∀ req, GapEqErr ...`, yet `mirGapBehaviors_env_congr_on`
+proves `OutcomeSetEquiv` on `seqCallerBody` across all `x : Nat` because only
+`extHelperReq x` is `MirCallReachable`.
+-/
+theorem incremental_env_linking_congr_on_reachable :
+    (¬ ∀ req, GapEqErr (· = ·) (· = ·) (partialLinkEnv.seal req) (extendedLinkEnv.seal req)) ∧
+      ∀ x : Nat,
+        OutcomeSetEquiv (GapEqErr (· = ·) (· = ·))
+          (mirGapBehaviors partialLinkEnv [] seqCallerBody [.scalar ⟨x, 4⟩])
+          (mirGapBehaviors extendedLinkEnv [] seqCallerBody [.scalar ⟨x, 4⟩]) := by
+  refine ⟨?_, fun x => mirGapBehaviors_env_congr_on (fun req hreach => ?_)⟩
+  · intro hAll
+    let unrReq : MirCallReq := { extHelperReq 0 with defPath := "test::unrelated_fn" }
+    have hBad := hAll unrReq
+    exact False.elim hBad
+  · obtain ⟨n, t, k, hr, ht⟩ := hreach
+    cases hr with
+    | refl => cases ht
+    | @step _ _ t₁ _ hn₁ hr₁ =>
+      have ht₁ : t₁ = mirSiteOfExec seqCallerBody (.running (seqCallerAtCall seqCallerBody x)) :=
+        GapStep.next.inj hn₁.symm
+      subst ht₁
+      cases hr₁ with
+      | refl =>
+        have hStep₁ : stepMirSiteState seqCallerBody
+            (mirSiteOfExec seqCallerBody (.running (seqCallerAtCall seqCallerBody x))) =
+            .vis (.inr (.inr (.call (extHelperReq x))))
+              (fun ans => mirNextSiteState seqCallerBody
+                (mirSiteOfExec seqCallerBody (.running (seqCallerAtCall seqCallerBody x)))
+                (resumeExternalCall (seqCallerAtCall seqCallerBody x)
+                  (seqCallerAtCall seqCallerBody x).frame.locals (locPlace 2) 1 .continue_ ans)) :=
+          rfl
+        rw [hStep₁] at ht
+        injection ht with hi _
+        have hreq : extHelperReq x = req := CallReq.call.inj (Sum.inr.inj (Sum.inr.inj hi))
+        subst hreq
+        exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+      | @step _ _ t₂ _ hn₂ hr₂ =>
+        let postCallExec := resumeExternalCall (seqCallerAtCall seqCallerBody x)
+          (seqCallerAtCall seqCallerBody x).frame.locals (locPlace 2) 1 .continue_
+          (.returned (.scalar ⟨wrapScalarBits (x + 1) (scalarModulus 4), 4⟩) unlinkedMemory)
+        change mirSiteGapStep partialLinkEnv seqCallerBody _ = .next t₂ at hn₂
+        have hStep₁' : mirSiteGapStep partialLinkEnv seqCallerBody
+            (mirSiteOfExec seqCallerBody (.running (seqCallerAtCall seqCallerBody x))) =
+            .next (mirNextSiteState seqCallerBody
+              (mirSiteOfExec seqCallerBody (.running (seqCallerAtCall seqCallerBody x)))
+              postCallExec) := rfl
+        rw [hStep₁'] at hn₂
+        cases GapStep.next.inj hn₂
+        cases hr₂ with
+        | refl => cases ht
+        | @step _ _ t₃ _ hn₃ hr₃ =>
+          let postAddState : MachineState :=
+            { frame :=
+                { blockIdx := 1
+                  stmtIdx := 1
+                  locals :=
+                    [ .init (.scalar ⟨wrapScalarBits
+                        (wrapScalarBits (x + 1) (scalarModulus 4) +
+                         wrapScalarBits (x + 1) (scalarModulus 4))
+                        (scalarModulus 4), 4⟩),
+                      .init (.scalar ⟨x, 4⟩),
+                      .init (.scalar ⟨wrapScalarBits (x + 1) (scalarModulus 4), 4⟩) ] }
+              memory := unlinkedMemory }
+          change mirSiteGapStep partialLinkEnv seqCallerBody _ = .next t₃ at hn₃
+          have hStep₂ : mirSiteGapStep partialLinkEnv seqCallerBody
+              (mirNextSiteState seqCallerBody
+                (mirSiteOfExec seqCallerBody (.running (seqCallerAtCall seqCallerBody x)))
+                postCallExec) =
+              .next (.running postAddState) := rfl
+          rw [hStep₂] at hn₃
+          cases GapStep.next.inj hn₃
+          cases hr₃ with
+          | refl => cases ht
+          | step hn₄ _ => cases hn₄
+
+/--
+Kernel `Trusted.VerificationResult` certificate transfer and open-world
+`mirHandledTreeWithCallees` `ExactPass` canary:
+1. Global `hClosed` fails on `tailCallerBody` (which calls unresolved
+   `"test::ext_helper"` on `flag = false`), yet `VerificationResult.of_contextEquiv`
+   transfers a kernel `Trusted.VerificationResult.VerificationResult` certificate
+   on `flag = true ∧ x + x < 2^32` from `tailCallerBody` to `tailCallerRefactoredBody`;
+2. `mirContextEquivOn_mirHandledTree_exactPass` establishes an open-world
+   `ExactPass` on `mirHandledTraceErasedSem MirCallEnv.unresolved []` between
+   `tailCallerBody` and `tailCallerRefactoredBody` across BOTH `flag = true` AND
+   `flag = false` (where `MirCallEnv.unresolved` emits `.gap (.unresolved "test::ext_helper")`
+   with ZERO `hClosed` assumption!); and
+3. `mirContextEquivOn_mirHandledTree_exactPass` and
+   `mirContextEquivOn_mirHandledTree_toPartial_eq` prove open-world `ExactPass`
+   and `toPartial` equality on `mirHandledTraceErasedSem (MirCallEnv.ofPure f) []`
+   for EVERY pure summary `f` (including gapping `unmodeledHelperSummary`).
+-/
+theorem tailCaller_verificationResult_and_openWorld_mirHandledTree :
+    let pre : List Value → Prop :=
+      fun args => ∃ x, x + x < 4294967296 ∧ args = callerArgs (true, x)
+    let post : List Value → Value → Prop :=
+      fun args ret => ∃ x, args = callerArgs (true, x) ∧ ret = .scalar ⟨x + x, 4⟩
+    let qPre : List Value × Memory → Prop :=
+      fun am => ∃ q' : Bool × Nat, am = (callerArgs q', unlinkedMemory)
+    (∃ args site,
+        mirGapBehaviors MirCallEnv.unresolved [] tailCallerBody args (.gap (.unresolved site))) ∧
+      Nonempty (Trusted.VerificationResult.VerificationResult
+        { body := tailCallerRefactoredBody, pre := pre, post := post, callees := [] }) ∧
+      ExactPass
+        (fun b (q : { am : List Value × Memory // qPre am }) =>
+          mirHandledTraceErasedSem MirCallEnv.unresolved [] b q.1)
+        (fun b (q : { am : List Value × Memory // qPre am }) =>
+          mirHandledTraceErasedSem MirCallEnv.unresolved [] b q.1)
+        id id tailCallerBody tailCallerRefactoredBody ∧
+      ∀ (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value),
+        ExactPass
+          (fun b (q : { am : List Value × Memory // qPre am }) =>
+            mirHandledTraceErasedSem (MirCallEnv.ofPure f) [] b q.1)
+          (fun b (q : { am : List Value × Memory // qPre am }) =>
+            mirHandledTraceErasedSem (MirCallEnv.ofPure f) [] b q.1)
+          id id tailCallerBody tailCallerRefactoredBody ∧
+        ∀ (q : Bool × Nat),
+          mirHandledTraceErasedSem (MirCallEnv.ofPure f) [] tailCallerBody
+              (callerArgs q, unlinkedMemory) =
+            mirHandledTraceErasedSem (MirCallEnv.ofPure f) [] tailCallerRefactoredBody
+              (callerArgs q, unlinkedMemory) := by
+  dsimp only
+  let pre : List Value → Prop :=
+    fun args => ∃ x, x + x < 4294967296 ∧ args = callerArgs (true, x)
+  let post : List Value → Value → Prop :=
+    fun args ret => ∃ x, args = callerArgs (true, x) ∧ ret = .scalar ⟨x + x, 4⟩
+  let qPre : List Value × Memory → Prop :=
+    fun am => ∃ q' : Bool × Nat, am = (callerArgs q', unlinkedMemory)
+  have hOpen : ∃ args site,
+      mirGapBehaviors MirCallEnv.unresolved [] tailCallerBody args (.gap (.unresolved site)) := by
+    have hrun := (tailCaller_run_false_unresolved 0).1
+    exact ⟨callerArgs (false, 0), "test::ext_helper",
+      (mirGapBehaviors_iff_of_run
+        (ne_outOfFuel_of_eq hrun (fun h₀ => by cases h₀)) _).mpr hrun.symm⟩
+  have vBase : Trusted.VerificationResult.VerificationResult
+      { body := tailCallerBody, pre := pre, post := post, callees := [] } :=
+    { proof := by
+        rintro _ ⟨x, hx, rfl⟩
+        have hrun : runMirWithGap MirCallEnv.unresolved [] tailCallerBody 3
+            (callerArgs (true, x)) =
+            classifyOutcome (.normal (.scalar ⟨x + x, 4⟩, unlinkedMemory)) := by
+          change runMirWithGap MirCallEnv.unresolved [] tailCallerBody 3
+              (callerArgs (true, x)) =
+            .ok (.scalar ⟨x + x, 4⟩, unlinkedMemory)
+          have h₀ : runMirWithGap MirCallEnv.unresolved [] tailCallerBody 3
+              (callerArgs (true, x)) =
+              .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, unlinkedMemory) := rfl
+          rw [h₀, wrapScalarBits_of_lt (show x + x < scalarModulus 4 from hx)]
+        obtain ⟨hsafe, _, huniq⟩ := mirTree_adequate_of_defined hrun
+        refine ⟨hsafe, fun outPair hrr _ retVal mem' hout => ?_⟩
+        rcases outPair with ⟨tr, out⟩
+        dsimp only at hout
+        subst hout
+        have heq := huniq tr (.normal (retVal, mem')) hrr
+        injection heq with hpair
+        injection hpair with hret _
+        exact ⟨x, rfl, hret⟩ }
+  have hTailEqOn : ContextEquivOn pre (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·)
+      (mirGapBehaviors MirCallEnv.unresolved [] tailCallerBody)
+      (mirGapBehaviors MirCallEnv.unresolved [] tailCallerRefactoredBody) := by
+    rintro _ ⟨x, _, rfl⟩
+    have h₁ : runMirWithGap MirCallEnv.unresolved [] tailCallerBody 3
+        (callerArgs (true, x)) =
+        .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, unlinkedMemory) := rfl
+    have h₂ : runMirWithGap MirCallEnv.unresolved [] tailCallerRefactoredBody 5
+        (callerArgs (true, x)) =
+        .ok (.scalar ⟨wrapScalarBits (x * 2) (scalarModulus 4), 4⟩, unlinkedMemory) := rfl
+    refine mirGapBehaviors_equiv_of_runs (fuel₂ := 5)
+      (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) ?_
+    rw [h₁, h₂, Nat.mul_two]
+    exact (rfl : Value.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩ = _)
+  have hTailClosedOn : ∀ args, pre args → ∀ site,
+      ¬ mirGapBehaviors MirCallEnv.unresolved [] tailCallerBody args (.gap (.unresolved site)) := by
+    rintro _ ⟨x, _, rfl⟩ site hm
+    have h₁ : runMirWithGap MirCallEnv.unresolved [] tailCallerBody 3
+        (callerArgs (true, x)) =
+        .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, unlinkedMemory) := rfl
+    have heq := (mirGapBehaviors_iff_of_run
+      (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) _).mp hm
+    rw [h₁] at heq
+    cases heq
+  have vRefactored := VerificationResult.of_contextEquiv hTailEqOn hTailClosedOn vBase
+  have hUnresStateful : ContextEquivOn qPre (· = ·) (· = ·)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved [] tailCallerBody)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved [] tailCallerRefactoredBody) := by
+    rintro _ ⟨q', rfl⟩
+    exact tailCallerRefactored_contextEquiv_any_env MirCallEnv.unresolved
+      (fun x _ _ he => by cases he) (fun x _ he => by cases he) q'
+  refine ⟨hOpen, ⟨vRefactored⟩, mirContextEquivOn_mirHandledTree_exactPass hUnresStateful,
+    fun f => ?_⟩
+  have hTailStateful : ContextEquivOn qPre (· = ·) (· = ·)
+      (mirStatefulGapBehaviors (MirCallEnv.ofPure f) [] tailCallerBody)
+      (mirStatefulGapBehaviors (MirCallEnv.ofPure f) [] tailCallerRefactoredBody) := by
+    rintro _ ⟨q', rfl⟩
+    exact tailCallerRefactored_contextEquiv_any_env (MirCallEnv.ofPure f)
+      (fun x v mem he => MirCallEnv.ofPure_preservesCallStack f (extHelperReq x) _ he)
+      (fun x mem he => MirCallEnv.ofPure_preservesCallStack f (extHelperReq x) _ he) q'
+  exact ⟨mirContextEquivOn_mirHandledTree_exactPass hTailStateful,
+    fun q => mirContextEquivOn_mirHandledTree_toPartial_eq hTailStateful ⟨q, rfl⟩⟩
+
+/--
+Query-scoped specification transfer (`ContextEquivOn.valTransfer_spec` and
+`ContextEquivOn.outcomeTransfer_spec`), constructive Boolean partition patching
+(`ContextEquiv.of_boolPartition`), and injective gap reflection
+(`ContextEquiv.mapGap_iff_of_injective`) canary.
+-/
+theorem queryScoped_transfer_boolPartition_and_mapGap :
+    let valSpec : (valLanguage callerGapSem).Behavior :=
+      Language.ContractSpec (valLanguage callerGapSem)
+        (fun q => q.1 = true)
+        (fun _ => True)
+        (fun q r => r.1 = Value.scalar ⟨q.2, 4⟩)
+    let outSpec : (outcomeLanguage callerGapSem).Behavior :=
+      Language.ContractSpec (outcomeLanguage callerGapSem)
+        (fun q => q.1 = true)
+        (fun _ => True)
+        (fun q out => out = .normal (Value.scalar ⟨q.2, 4⟩, linkedMemory))
+    ¬ ContextEquiv (· = ·) (· = ·) (callerGapSem returnArgBody) (callerGapSem assumeFlagBody) ∧
+      ((valLanguage callerGapSem).sem assumeFlagBody ≤ valSpec) ∧
+      ((outcomeLanguage callerGapSem).sem assumeFlagBody ≤ outSpec) ∧
+      ContextEquiv (· = ·) (· = ·)
+        (callerGapSem callerBranchingBody) (callerGapSem callerRefactoredBody) ∧
+      (ContextEquiv (· = ·) (· = ·)
+          (fun q => OutcomeSet.mapGap (Sum.inl (β := Nat)) (callerGapSem callerBranchingBody q))
+          (fun q => OutcomeSet.mapGap (Sum.inl (β := Nat)) (callerGapSem callerRefactoredBody q)) ↔
+        ContextEquiv (· = ·) (· = ·)
+          (callerGapSem callerBranchingBody) (callerGapSem callerRefactoredBody)) := by
+  dsimp only
+  have hNotGlobal : ¬ ContextEquiv (· = ·) (· = ·)
+      (callerGapSem returnArgBody) (callerGapSem assumeFlagBody) := by
+    intro h
+    have h₁ : runMirWithGap MirCallEnv.unresolved linkedHelpers
+        returnArgBody 3 (callerArgs (false, 0)) = .ok (.scalar ⟨0, 4⟩, linkedMemory) := rfl
+    have h₂ : runMirWithGap MirCallEnv.unresolved linkedHelpers
+        assumeFlagBody 3 (callerArgs (false, 0)) = .fault .ub := rfl
+    have hEq := (mirGapBehaviors_equiv_iff_of_runs
+      (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀))
+      (ne_outOfFuel_of_eq h₂ (fun h₀ => by cases h₀))).mp (h (false, 0))
+    rw [h₁, h₂] at hEq
+    exact False.elim hEq
+  have hOnTrue : ContextEquivOn (fun q : Bool × Nat => q.1 = true) (· = ·) (· = ·)
+      (callerGapSem returnArgBody) (callerGapSem assumeFlagBody) := by
+    rintro ⟨flag, x⟩ hflag
+    dsimp only at hflag
+    subst hflag
+    have h₁ : runMirWithGap MirCallEnv.unresolved linkedHelpers
+        returnArgBody 3 (callerArgs (true, x)) =
+        .ok (.scalar ⟨x, 4⟩, linkedMemory) := rfl
+    have h₂ : runMirWithGap MirCallEnv.unresolved linkedHelpers
+        assumeFlagBody 3 (callerArgs (true, x)) =
+        .ok (.scalar ⟨x, 4⟩, linkedMemory) := rfl
+    refine mirGapBehaviors_equiv_of_runs (fuel₂ := 3)
+      (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) ?_
+    rw [h₁, h₂]
+    exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+  have hValTrans : (valLanguage callerGapSem).sem assumeFlagBody ≤
+      Language.ContractSpec (valLanguage callerGapSem)
+        (fun q => q.1 = true) (fun _ => True) (fun q r => r.1 = Value.scalar ⟨q.2, 4⟩) := by
+    refine ContextEquivOn.valTransfer_spec hOnTrue (fun _ hq => hq) ?_
+    rintro ⟨flag, x⟩ (rfl : flag = true)
+    have h₁ : runMirWithGap MirCallEnv.unresolved linkedHelpers
+        returnArgBody 3 (callerArgs (true, x)) = .ok (.scalar ⟨x, 4⟩, linkedMemory) := rfl
+    have hne : runMirWithGap MirCallEnv.unresolved linkedHelpers
+        returnArgBody 3 (callerArgs (true, x)) ≠ .gap .outOfFuel :=
+      ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)
+    refine ⟨fun o ho => ?_, fun r hr _ => ?_⟩
+    · rw [(mirGapBehaviors_iff_of_run hne o).mp ho, h₁]
+      exact ⟨_, rfl⟩
+    · have heq := (mirGapBehaviors_iff_of_run hne (.ok r)).mp hr
+      rw [h₁] at heq
+      cases OutcomeWithGap.ok.inj heq
+      rfl
+  have hOutTrans : (outcomeLanguage callerGapSem).sem assumeFlagBody ≤
+      Language.ContractSpec (outcomeLanguage callerGapSem)
+        (fun q => q.1 = true) (fun _ => True)
+        (fun q out => out = .normal (Value.scalar ⟨q.2, 4⟩, linkedMemory)) := by
+    refine ContextEquivOn.outcomeTransfer_spec hOnTrue (fun _ hq => hq) ?_
+    rintro ⟨flag, x⟩ (rfl : flag = true)
+    have h₁ : runMirWithGap MirCallEnv.unresolved linkedHelpers
+        returnArgBody 3 (callerArgs (true, x)) = .ok (.scalar ⟨x, 4⟩, linkedMemory) := rfl
+    have hne : runMirWithGap MirCallEnv.unresolved linkedHelpers
+        returnArgBody 3 (callerArgs (true, x)) ≠ .gap .outOfFuel :=
+      ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)
+    have hDef : OutcomeSet.Defined ExecFault.isUB (callerGapSem returnArgBody (true, x)) :=
+      defined_mirGapBehaviors_of_run (fuel := 3) (by rw [h₁]; exact trivial)
+    refine ⟨hDef, fun out hout _ => ?_⟩
+    have heq := (mirGapBehaviors_iff_of_run hne (classifyOutcome out)).mp hout
+    rw [h₁] at heq
+    cases out with
+    | normal r => cases OutcomeWithGap.ok.inj heq; rfl
+    | panic => cases heq
+    | abort => cases heq
+  have hPart : ContextEquiv (· = ·) (· = ·)
+      (callerGapSem callerBranchingBody) (callerGapSem callerRefactoredBody) :=
+    ContextEquiv.of_boolPartition Prod.fst callerRefactored_programEquivOn
+      (fun q _ => callerRefactored_contextEquiv q)
+  exact ⟨hNotGlobal, hValTrans, hOutTrans, hPart,
+    ContextEquiv.mapGap_iff_of_injective (fun _ _ h => Sum.inl.inj h)⟩
+
 end GapPreservingCanaries
 
 end Anneal.FunctionalTranslationEquivTests
