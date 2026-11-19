@@ -47,7 +47,31 @@ Headline results:
   `f32ToF64_exact_and_roundtrip`, `convertFloatBits_nan_quiet`,
   `f64ToF32_signaling_nan_quietized`;
 - decoding: `decodeBits_agrees_miriDecode`, `pack_unpack_f32`,
-  `pack_unpack_f64`.
+  `pack_unpack_f64`;
+- `lean-miri` bridges (§4b): `ratioExponent_eq_miri`, `powScale_eq_miri`,
+  `roundQuotientTiesToEven_eq_miri`, `floatToIntValue_eq_miri`,
+  `ratioExponent_floor_log2`, `ratioExponent_eq_iff_powScale_bounds`
+  (uniqueness of `⌊log₂(n / d)⌋`), `roundRatioTiesToEven_consistent`, the width
+  bounds `roundRatioTiesToEven_lt` / `evalIntToFloatRoundTiesToEven_lt` /
+  `evalFloatToFloatRoundTiesToEven_lt` / `evalFloatToIntSaturating_bits_lt`,
+  `isNaNBits_evalFloatToFloatRoundTiesToEven`, universal NaN-inclusive self and
+  widening round-trips (`evalFloatToFloatRoundTiesToEven_self_eq`,
+  `evalFloatToFloatRoundTiesToEven_f32_f64_f32_eq_self`), `BitVec 32` / `BitVec 64`
+  → `BitVec 128` `setWidth` conversion bridges (`f32ToF64_setWidth128`,
+  `f64ToF32_setWidth128`), and two's-complement `BitVec w` / `BitVec 128`
+  round-trip bridges (`encodeTwosComplement_eq_toNat_ofInt`,
+  `bitVec_ofNat_encodeTwosComplement`, `encodeTwosComplement_bitVec_toInt`,
+  `intValueOfBits_signed_bounds`, `bitVec128_ofInt_intValueOfBits_toInt`,
+  `bitVec128_ofNat_intValueOfBits_toNat`, `evalFloatToIntSaturating_bitVec_eq`), the
+  saturation endpoints `evalFloatToIntSaturating_infBits` (`+∞ ↦ MAX`, `-∞ ↦ MIN`, via
+  `encodeTwosComplement_maxValue` / `encodeTwosComplement_minValue`),
+  `evalFloatToIntSaturating_zeroBits` (`±0.0 ↦ 0`),
+  `evalFloatToIntSaturating_of_ge_maxValue` / `evalFloatToIntSaturating_of_le_minValue`
+  (finite truncation saturation), `evalFloatToIntSaturating_of_in_range` (exact in-range
+  truncation), `evalFloatToIntSaturating_finite_eq` (complete finite-case trichotomy),
+  `evalIntToFloatRoundTiesToEven_zero` (`0 : iN/uN ↦ +0.0`),
+  `intValueOfBits_{unsigned_eq_mod,signed_min,signed_neg_one}`, and
+  `evalFloatToFloatRoundTiesToEven_{zeroBits,infBits}`.
 
 Every theorem is kernel-checked and depends only on `propext` / `Quot.sound` (no
 `Classical.choice`); see the `#guard_msgs in #print axioms` block at the end of
@@ -2412,6 +2436,1040 @@ theorem evalFloatToFloatRoundTiesToEven_sound :
 
 end Theorems
 
+/-! ## §4b. Bridge lemmas to `lean-miri`'s `Miri.Interpreter.FloatBits`
+
+`lean-miri/vendor/Miri/Interpreter/Float.lean` runs the same exact-rational pipeline
+as `MirSemantics/Scalars.lean`, but through `private` helpers written in a `Bool` /
+`Int.ofNat` style (`ratioExponent`, `powScale`, `roundQuotientEven`, `encode`,
+`signedNumerator`) inside `Except`, with `throw`s for a zero denominator and for
+"inconsistent rounding". The lemmas below
+
+* restate the trusted helpers in that literal formulation
+  (`ratioExponent_eq_miri`, `powScale_eq_miri`, `roundQuotientTiesToEven_eq_miri`,
+  `floatToIntValue_eq_miri`), so `LeanMiriSpec.FloatCastLM` identifies each
+  vendored helper with its trusted counterpart;
+* pin `ratioExponent` to the integer logarithm (`ratioExponent_floor_log2`) and prove
+  that both `inconsistentRounding` throws are unreachable
+  (`roundRatioTiesToEven_consistent`);
+* bound every encoder and every cast result below `2 ^ width` on **all** inputs
+  (`zeroBits_lt`, `infBits_lt`, `preferredNaNBits_lt`, `roundRatioTiesToEven_lt`,
+  `evalIntToFloatRoundTiesToEven_lt`, `evalFloatToFloatRoundTiesToEven_lt`,
+  `evalFloatToIntSaturating_bits_lt`), characterize decoded finite values and NaN
+  payloads (`decodeBits_finite_den_pos`, `decodeBits_nan_payload`) and NaN
+  conversion (`evalFloatToFloatRoundTiesToEven_of_nan`,
+  `decodeBits_evalFloatToFloatRoundTiesToEven_of_nan`); and
+* relate the two's-complement helpers to `BitVec`
+  (`encodeTwosComplement_eq_toNat_ofInt`, `intValueOfBits_true_eq_toInt`,
+  `intValueOfBits_false_eq_toNat`, `intValueOfBits_encodeTwosComplement`).
+
+Everything here depends only on `propext` / `Quot.sound` (see §5). -/
+
+section MiriBridge
+
+/-! ### Literal `Miri.Interpreter.FloatBits` formulations -/
+
+/-- `ratioExponent` is literally `Miri.Interpreter.FloatBits.ratioExponent`
+(`Float.lean:85-89`): `Int.ofNat (n / d).log2` when `n ≥ d`, otherwise `-(Int.ofNat k)`
+or `-(Int.ofNat k + 1)` for `k := (d / n).log2`. -/
+theorem ratioExponent_eq_miri (n d : Nat) :
+    ratioExponent n d =
+      if n ≥ d then Int.ofNat (n / d).log2
+      else
+        let k := (d / n).log2
+        if n * 2 ^ k ≥ d then -(Int.ofNat k) else -(Int.ofNat k + 1) := rfl
+
+/-- `powScale` is literally `Miri.Interpreter.FloatBits.powScale` (`Float.lean:47-49`). -/
+theorem powScale_eq_miri (n d : Nat) (e : Int) :
+    powScale n d e = if e ≥ 0 then (n * 2 ^ e.toNat, d) else (n, d * 2 ^ (-e).toNat) := by
+  cases e with
+  | ofNat _ => rfl
+  | negSucc _ => rfl
+
+/-- `roundQuotientTiesToEven` is literally `Miri.Interpreter.FloatBits.roundQuotientEven`
+(`Float.lean:90-93`), whose tie test is a `Bool` formula. -/
+theorem roundQuotientTiesToEven_eq_miri (n d : Nat) :
+    roundQuotientTiesToEven n d =
+      (let q := n / d
+       let remainder := n % d
+       if remainder * 2 > d || (remainder * 2 == d && q % 2 == 1) then q + 1 else q) := by
+  unfold roundQuotientTiesToEven
+  simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq]
+
+/-- `floatToIntValue` in the literal `Miri.Interpreter.FloatBits.toInteger`
+formulation (`Float.lean:232-240`) on the Miri decoding `floatKindToMiri`: a NaN gives
+`0`, an infinity the bound of its sign, and a finite value (including a zero, which
+Miri decodes as `.finite 0 _`) clamps `signedNumerator neg (n / d)` with
+`max lo (min hi ·)`, for any bounds `lo ≤ 0 ≤ hi`. -/
+theorem floatToIntValue_eq_miri (f : IeeeFormat) (k : FloatKind) (lo hi : Int)
+    (h0 : lo ≤ 0) (h1 : 0 ≤ hi) :
+    floatToIntValue k lo hi =
+      match (floatKindToMiri f k).value with
+      | .nan _ => 0
+      | .infinite => if (floatKindToMiri f k).negative then lo else hi
+      | .finite n d =>
+        max lo (min hi
+          (if (floatKindToMiri f k).negative then -(Int.ofNat (n / d)) else Int.ofNat (n / d))) := by
+  cases k with
+  | zero neg =>
+    simp only [floatToIntValue, floatKindToMiri, Nat.zero_div]
+    cases neg
+    · simp only [Bool.false_eq_true, ↓reduceIte]
+      have h : max lo (min hi (Int.ofNat 0)) = 0 := by
+        have h' : Int.ofNat 0 = 0 := rfl
+        rw [h']; omega
+      exact h.symm
+    · simp only [↓reduceIte]
+      have h : max lo (min hi (-(Int.ofNat 0))) = 0 := by
+        have h' : -(Int.ofNat 0) = 0 := rfl
+        rw [h']; omega
+      exact h.symm
+  | finite neg n d => rfl
+  | inf neg => rfl
+  | nan neg q p => rfl
+
+/-! ### Integer logarithm and rounding consistency -/
+
+/-- `ratioExponent n d` is `⌊log₂ (n / d)⌋` for positive `n`, `d`: a nonnegative
+`e` satisfies `d * 2 ^ e ≤ n < d * 2 ^ (e + 1)`, and a negative `e` satisfies
+`d ≤ n * 2 ^ (-e) < 2 * d`. -/
+theorem ratioExponent_floor_log2 (n d : Nat) (hn : 0 < n) (hd : 0 < d) :
+    (0 ≤ ratioExponent n d →
+      d * 2 ^ (ratioExponent n d).toNat ≤ n ∧ n < d * 2 ^ ((ratioExponent n d).toNat + 1)) ∧
+    (ratioExponent n d < 0 →
+      d ≤ n * 2 ^ (-ratioExponent n d).toNat ∧ n * 2 ^ (-ratioExponent n d).toNat < 2 * d) := by
+  obtain ⟨hlo, hhi⟩ := powScale_neg_ratioExponent_bounds n d hn hd
+  rw [powScale_eq_miri] at hlo hhi
+  generalize ratioExponent n d = e at hlo hhi ⊢
+  refine ⟨fun he => ?_, fun he => ?_⟩
+  · by_cases hz : -e ≥ 0
+    · rw [if_pos' hz] at hlo hhi
+      have he0 : e = 0 := by omega
+      subst he0
+      simp only [Int.neg_zero, Int.toNat_zero, Nat.pow_zero, Nat.mul_one, Nat.zero_add,
+        Nat.pow_one] at hlo hhi ⊢
+      refine ⟨hlo, ?_⟩
+      rw [Nat.mul_comm]; exact hhi
+    · rw [if_neg' hz] at hlo hhi
+      simp only [Int.neg_neg] at hlo hhi
+      refine ⟨hlo, ?_⟩
+      rw [Nat.pow_succ, ← Nat.mul_assoc, Nat.mul_comm (d * 2 ^ e.toNat) 2]
+      exact hhi
+  · have hz : -e ≥ 0 := by omega
+    rw [if_pos' hz] at hlo hhi
+    exact ⟨hlo, hhi⟩
+
+/-- **Rounding consistency** (`Miri.Interpreter.FloatBits.roundRatio`'s two
+`throw .inconsistentRounding` branches are unreachable): for positive `n`, `d`, with
+`exponent := max (ratioExponent n d) f.minExponent`,
+`scaled := powScale n d (f.fractionBits - exponent)`, and
+`sig := roundQuotientTiesToEven scaled.1 scaled.2`, the rounded significand never
+exceeds `2 ^ (fractionBits + 1)` (so after a carry it is exactly `2 ^ fractionBits`),
+and a significand below `2 ^ fractionBits` only occurs at `exponent = minExponent`. -/
+theorem roundRatioTiesToEven_consistent (f : IeeeFormat) (n d : Nat) (hn : 0 < n) (hd : 0 < d) :
+    let exponent := max (ratioExponent n d) f.minExponent
+    let scaled := powScale n d ((f.fractionBits : Int) - exponent)
+    let sig := roundQuotientTiesToEven scaled.1 scaled.2
+    sig ≤ 2 ^ (f.fractionBits + 1) ∧ (sig < 2 ^ f.fractionBits → exponent = f.minExponent) := by
+  intro exponent scaled sig
+  obtain ⟨hhi, hlo_ge, _⟩ := powScale_roundRatio_scaled_bounds f n d hn hd
+  have hds : 0 < scaled.2 := powScale_snd_pos_gen n d hd _
+  refine ⟨roundQuotient_le_of_lt_mul .tiesToEven scaled.1 scaled.2 _ hds hhi, fun hsub => ?_⟩
+  by_cases hge : f.minExponent ≤ ratioExponent n d
+  · have hge_sig : 2 ^ f.fractionBits ≤ sig :=
+      roundQuotient_ge_of_mul_le .tiesToEven scaled.1 scaled.2 _ hds (hlo_ge hge)
+    exact absurd hsub (Nat.not_lt.mpr hge_sig)
+  · exact int_max_eq_right hge
+
+/-! ### Width bounds and decoded shapes -/
+
+theorem zeroBits_lt (f : IeeeFormat) (neg : Bool) : zeroBits f neg < 2 ^ f.width := by
+  rw [zeroBits_eq_encodeBits]
+  exact encodeBits_lt f neg 0 0 (Nat.two_pow_pos _) (Nat.two_pow_pos _)
+
+theorem infBits_lt (f : IeeeFormat) (neg : Bool) : infBits f neg < 2 ^ f.width :=
+  encodeBits_lt f neg _ 0 (Nat.sub_lt (Nat.two_pow_pos _) (by decide)) (Nat.two_pow_pos _)
+
+theorem preferredNaNBits_lt (f : IeeeFormat) : preferredNaNBits f < 2 ^ f.width := by
+  cases f <;> decide
+
+/-- `roundRatioTiesToEven` always produces an in-width bit pattern. -/
+theorem roundRatioTiesToEven_lt (f : IeeeFormat) (neg : Bool) (n d : Nat) (hd : 0 < d) :
+    roundRatioTiesToEven f neg n d < 2 ^ f.width :=
+  (roundRatioBits_valid_and_not_nan .tiesToEven f neg n d hd).1
+
+/-- Every int-to-float cast result is an in-width `dst` bit pattern. -/
+theorem evalIntToFloatRoundTiesToEven_lt (signed : Bool) (w bits : Nat) (dst : IeeeFormat) :
+    evalIntToFloatRoundTiesToEven signed w bits dst < 2 ^ dst.width :=
+  roundRatioTiesToEven_lt dst _ _ 1 Nat.one_pos
+
+/-- Every float-to-int cast result is canonical for its byte width. -/
+theorem evalFloatToIntSaturating_bits_lt (src : IeeeFormat) (bits : Nat) (t : FloatIntTarget)
+    (pw : FloatPtrWidth) :
+    (evalFloatToIntSaturating src bits t pw).bits < 2 ^ t.bitWidth pw ∧
+      (evalFloatToIntSaturating src bits t pw).sizeBytes = t.bitWidth pw / 8 := by
+  obtain ⟨_, hlt, _, _, _⟩ := evalFloatToIntSaturating_sound src bits t pw
+  have hw := FloatIntTarget.bitWidth_cases t pw
+  obtain ⟨hmod, _⟩ := scalarModulus_div8 _ hw
+  have hsz : (evalFloatToIntSaturating src bits t pw).sizeBytes = t.bitWidth pw / 8 := rfl
+  rw [hsz, hmod] at hlt
+  exact ⟨hlt, hsz⟩
+
+/-- A decoded finite value has a positive (power-of-two) denominator. -/
+theorem decodeBits_finite_den_pos (f : IeeeFormat) (bits : Nat) (neg : Bool) (n d : Nat)
+    (h : decodeBits f bits = .finite neg n d) : 0 < d := by
+  unfold decodeBits at h
+  simp only at h
+  split at h
+  · split at h <;> cases h
+  · split at h
+    · split at h
+      · cases h
+      · injection h with _ _ hd
+        rw [← hd]; exact powScale_snd_pos _ _
+    · injection h with _ _ hd
+      rw [← hd]; exact powScale_snd_pos _ _
+
+/-- A decoded NaN carries the full, nonzero fraction field as its payload. -/
+theorem decodeBits_nan_payload (f : IeeeFormat) (bits : Nat) (neg q : Bool) (payload : Nat)
+    (h : decodeBits f bits = .nan neg q payload) :
+    payload = bits % 2 ^ f.fractionBits ∧ payload ≠ 0 ∧ payload < 2 ^ f.fractionBits ∧
+      q = Nat.beq ((payload / 2 ^ (f.fractionBits - 1)) % 2) 1 := by
+  unfold decodeBits at h
+  simp only at h
+  split at h
+  · split at h
+    · cases h
+    · rename_i hF
+      injection h with _ hq hp
+      subst hp
+      exact ⟨rfl, hF, unpackBits_fraction_lt f bits, hq.symm⟩
+  · split at h
+    · split at h <;> cases h
+    · cases h
+
+/-- The quieted, precision-shifted NaN payload of `evalFloatToFloatRoundTiesToEven`
+(with the `dst` quiet bit forced) fits in the `dst` fraction field. -/
+theorem convertNaNPayload_lt (src dst : IeeeFormat) (payload : Nat)
+    (hp : payload < 2 ^ src.fractionBits) :
+    Nat.lor
+        (if src.fractionBits ≤ dst.fractionBits then
+          Nat.lor payload (2 ^ (src.fractionBits - 1)) * 2 ^ (dst.fractionBits - src.fractionBits)
+        else Nat.lor payload (2 ^ (src.fractionBits - 1)) / 2 ^ (src.fractionBits - dst.fractionBits))
+        (2 ^ (dst.fractionBits - 1)) < 2 ^ dst.fractionBits := by
+  have hq : Nat.lor payload (2 ^ (src.fractionBits - 1)) < 2 ^ src.fractionBits :=
+    Nat.or_lt_two_pow hp (two_pow_lt_two_pow (Nat.sub_lt (IeeeFormat.one_le_fb src) (by decide)))
+  apply Nat.or_lt_two_pow _ (two_pow_lt_two_pow (Nat.sub_lt (IeeeFormat.one_le_fb dst) (by decide)))
+  generalize Nat.lor payload (2 ^ (src.fractionBits - 1)) = quiet at hq
+  cases src <;> cases dst <;>
+    simp only [IeeeFormat.fractionBits, Nat.reducePow, Nat.reduceSub, Nat.reduceLeDiff,
+      ↓reduceIte, Nat.pow_zero, Nat.mul_one] at hq ⊢ <;> omega
+
+/-- NaN conversion: a NaN input keeps its sign and gets the quieted,
+precision-shifted payload with the `dst` quiet bit forced, exactly as
+`Miri.Interpreter.FloatBits.convert` (`Float.lean:122-128`). -/
+theorem evalFloatToFloatRoundTiesToEven_of_nan (src dst : IeeeFormat) (bits : Nat) (neg q : Bool)
+    (payload : Nat) (h : decodeBits src bits = .nan neg q payload) :
+    evalFloatToFloatRoundTiesToEven src dst bits =
+      encodeBits dst neg (2 ^ dst.exponentBits - 1)
+        (Nat.lor
+          (if src.fractionBits ≤ dst.fractionBits then
+            Nat.lor payload (2 ^ (src.fractionBits - 1)) * 2 ^ (dst.fractionBits - src.fractionBits)
+          else Nat.lor payload (2 ^ (src.fractionBits - 1)) / 2 ^ (src.fractionBits - dst.fractionBits))
+          (2 ^ (dst.fractionBits - 1))) := by
+  unfold evalFloatToFloatRoundTiesToEven
+  rw [h]
+
+/-- The converted NaN decodes back to a quiet NaN of the input's sign whose payload
+is exactly the converted fraction field. -/
+theorem decodeBits_evalFloatToFloatRoundTiesToEven_of_nan (src dst : IeeeFormat) (bits : Nat)
+    (neg q : Bool) (payload : Nat) (h : decodeBits src bits = .nan neg q payload) :
+    decodeBits dst (evalFloatToFloatRoundTiesToEven src dst bits) =
+      .nan neg true (Nat.lor
+        (if src.fractionBits ≤ dst.fractionBits then
+          Nat.lor payload (2 ^ (src.fractionBits - 1)) * 2 ^ (dst.fractionBits - src.fractionBits)
+        else Nat.lor payload (2 ^ (src.fractionBits - 1)) / 2 ^ (src.fractionBits - dst.fractionBits))
+        (2 ^ (dst.fractionBits - 1))) := by
+  obtain ⟨_, _, hp, _⟩ := decodeBits_nan_payload src bits neg q payload h
+  have hlt := convertNaNPayload_lt src dst payload hp
+  generalize hpay : Nat.lor
+      (if src.fractionBits ≤ dst.fractionBits then
+        Nat.lor payload (2 ^ (src.fractionBits - 1)) * 2 ^ (dst.fractionBits - src.fractionBits)
+      else Nat.lor payload (2 ^ (src.fractionBits - 1)) / 2 ^ (src.fractionBits - dst.fractionBits))
+      (2 ^ (dst.fractionBits - 1)) = payload' at hlt
+  have hge : 2 ^ (dst.fractionBits - 1) ≤ payload' := by
+    rw [← hpay]; exact Nat.right_le_or
+  have hE : 2 ^ dst.exponentBits - 1 < 2 ^ dst.exponentBits :=
+    Nat.sub_lt (Nat.two_pow_pos _) (by decide)
+  rw [evalFloatToFloatRoundTiesToEven_of_nan src dst bits neg q payload h, hpay,
+    decodeBits_encodeBits dst neg _ _ hE hlt, if_pos' rfl]
+  have hpos := Nat.two_pow_pos (dst.fractionBits - 1)
+  have hne : ¬ (payload' = 0) := by
+    intro h0
+    rw [h0] at hge
+    omega
+  rw [if_neg' hne]
+  have hsplit : 2 ^ dst.fractionBits = 2 * 2 ^ (dst.fractionBits - 1) := by
+    cases dst <;> decide
+  have hdiv1 : payload' / 2 ^ (dst.fractionBits - 1) = 1 := by
+    apply Nat.le_antisymm
+    · have hlt2 : payload' / 2 ^ (dst.fractionBits - 1) < 2 :=
+        nat_div_lt_of_lt_mul (by rw [Nat.mul_comm, ← hsplit]; exact hlt)
+      have hne2 : ¬ (payload' / 2 ^ (dst.fractionBits - 1) = 0) := by
+        intro h0
+        have := (Nat.le_div_iff_mul_le hpos).mpr (by rw [Nat.one_mul]; exact hge)
+        omega
+      omega
+    · exact (Nat.le_div_iff_mul_le hpos).mpr (by rw [Nat.one_mul]; exact hge)
+  rw [hdiv1]
+  rfl
+
+/-- Every float-to-float cast result is an in-width `dst` bit pattern, on **every**
+`src` bit pattern (zeros, subnormals, normals, infinities, and every quiet or
+signaling NaN payload). -/
+theorem evalFloatToFloatRoundTiesToEven_lt (src dst : IeeeFormat) (bits : Nat) :
+    evalFloatToFloatRoundTiesToEven src dst bits < 2 ^ dst.width := by
+  cases hdec : decodeBits src bits with
+  | zero neg =>
+    rw [← convertFloatBits_tiesToEven, convertFloatBits_of_zero _ _ _ _ _ hdec]
+    exact zeroBits_lt dst neg
+  | finite neg n d =>
+    rw [← convertFloatBits_tiesToEven, convertFloatBits_of_finite _ _ _ _ _ _ _ hdec]
+    exact roundRatioTiesToEven_lt dst neg n d (decodeBits_finite_den_pos src bits neg n d hdec)
+  | inf neg =>
+    rw [← convertFloatBits_tiesToEven, convertFloatBits_of_inf _ _ _ _ _ hdec]
+    exact infBits_lt dst neg
+  | nan neg q payload =>
+    obtain ⟨_, _, hp, _⟩ := decodeBits_nan_payload src bits neg q payload hdec
+    rw [evalFloatToFloatRoundTiesToEven_of_nan src dst bits neg q payload hdec]
+    exact encodeBits_lt dst neg _ _ (Nat.sub_lt (Nat.two_pow_pos _) (by decide))
+      (convertNaNPayload_lt src dst payload hp)
+
+/-- A float-to-float cast produces a NaN exactly when its input is a NaN (finite,
+zero, and infinite inputs never round to a NaN). -/
+theorem isNaNBits_evalFloatToFloatRoundTiesToEven (src dst : IeeeFormat) (bits : Nat) :
+    isNaNBits dst (evalFloatToFloatRoundTiesToEven src dst bits) = isNaNBits src bits := by
+  have hsrc : ∀ k, decodeBits src bits = k → isNaNBits src bits = (match k with
+      | .nan _ _ _ => true
+      | _ => false) := by
+    intro k hk; unfold isNaNBits; rw [hk]
+  have hE : 2 ^ dst.exponentBits - 1 < 2 ^ dst.exponentBits :=
+    Nat.sub_lt (Nat.two_pow_pos _) (by decide)
+  cases hdec : decodeBits src bits with
+  | zero neg =>
+    rw [hsrc _ hdec, ← convertFloatBits_tiesToEven, convertFloatBits_of_zero _ _ _ _ _ hdec,
+      zeroBits_eq_encodeBits]
+    unfold isNaNBits
+    rw [decodeBits_encodeBits dst neg 0 0 (Nat.two_pow_pos _) (Nat.two_pow_pos _),
+      if_neg' (IeeeFormat.max_exp_ne_zero dst), if_pos' rfl, if_pos' rfl]
+  | finite neg n d =>
+    rw [hsrc _ hdec, ← convertFloatBits_tiesToEven, convertFloatBits_of_finite _ _ _ _ _ _ _ hdec]
+    exact (roundRatioBits_valid_and_not_nan .tiesToEven dst neg n d
+      (decodeBits_finite_den_pos src bits neg n d hdec)).2
+  | inf neg =>
+    rw [hsrc _ hdec, ← convertFloatBits_tiesToEven, convertFloatBits_of_inf _ _ _ _ _ hdec]
+    unfold isNaNBits infBits
+    rw [decodeBits_encodeBits dst neg _ 0 hE (Nat.two_pow_pos _), if_pos' rfl, if_pos' rfl]
+  | nan neg q payload =>
+    rw [hsrc _ hdec]
+    unfold isNaNBits
+    rw [decodeBits_evalFloatToFloatRoundTiesToEven_of_nan src dst bits neg q payload hdec]
+
+/-! ### Two's complement and `BitVec` -/
+
+/-- `encodeTwosComplement` is `BitVec.ofInt` read back as a natural number. -/
+theorem encodeTwosComplement_eq_toNat_ofInt (w : Nat) (v : Int) :
+    encodeTwosComplement w v = (BitVec.ofInt w v).toNat := by
+  rw [BitVec.toNat_ofInt]
+  rfl
+
+/-- Signed `intValueOfBits` is `BitVec.toInt` of the truncated pattern. -/
+theorem intValueOfBits_true_eq_toInt (w bits : Nat) :
+    intValueOfBits true w bits = (BitVec.ofNat w bits).toInt := by
+  rw [BitVec.toInt_eq_toNat_cond, BitVec.toNat_ofNat]
+  unfold intValueOfBits
+  simp only [true_and]
+  generalize hb : bits % 2 ^ w = b
+  have hblt : b < 2 ^ w := by rw [← hb]; exact Nat.mod_lt _ (Nat.two_pow_pos _)
+  cases w with
+  | zero =>
+    have hb0 : b = 0 := by simp only [Nat.pow_zero] at hblt; omega
+    subst hb0
+    rfl
+  | succ w =>
+    have hsplit : 2 ^ (w + 1) = 2 * 2 ^ w := by rw [Nat.pow_succ, Nat.mul_comm]
+    simp only [Nat.add_sub_cancel]
+    by_cases hge : 2 ^ w ≤ b
+    · have hn : ¬ (2 * b < 2 ^ (w + 1)) := by omega
+      rw [if_pos' hge, if_neg' hn]
+    · have hy : 2 * b < 2 ^ (w + 1) := by omega
+      rw [if_neg' hge, if_pos' hy]
+
+/-- Unsigned `intValueOfBits` is `BitVec.toNat` of the truncated pattern. -/
+theorem intValueOfBits_false_eq_toNat (w bits : Nat) :
+    intValueOfBits false w bits = ((BitVec.ofNat w bits).toNat : Int) := by
+  rw [BitVec.toNat_ofNat]
+  unfold intValueOfBits
+  simp only [Bool.false_eq_true, false_and, ↓reduceIte]
+
+/-- Two's-complement round trip at every Rust integer width: decoding the canonical
+encoding of any in-range value recovers it, and the encoding is in width. -/
+theorem intValueOfBits_encodeTwosComplement (signed : Bool) (w : Nat)
+    (hw : w = 8 ∨ w = 16 ∨ w = 32 ∨ w = 64 ∨ w = 128) (v : Int)
+    (hlo : (if signed = true then -((2 ^ (w - 1) : Nat) : Int) else 0) ≤ v)
+    (hhi : v ≤
+      (if signed = true then ((2 ^ (w - 1) : Nat) : Int) - 1 else ((2 ^ w : Nat) : Int) - 1)) :
+    intValueOfBits signed w (encodeTwosComplement w v) = v ∧ encodeTwosComplement w v < 2 ^ w :=
+  twos_roundtrip signed w hw v hlo hhi
+
+/-- **Uniqueness of integer-logarithm exponent selection**: for positive `n`, `d`,
+`ratioExponent n d` is the unique integer `e` scaling `n / d` by `2 ^ (-e)` into `[1, 2)`. -/
+theorem ratioExponent_eq_of_powScale_bounds (n d : Nat) (e : Int) (hn : 0 < n) (hd : 0 < d)
+    (hlo : (powScale n d (-e)).2 ≤ (powScale n d (-e)).1)
+    (hhi : (powScale n d (-e)).1 < 2 * (powScale n d (-e)).2) :
+    ratioExponent n d = e := by
+  obtain ⟨rlo, rhi⟩ := powScale_neg_ratioExponent_bounds n d hn hd
+  generalize ratioExponent n d = r at rlo rhi ⊢
+  have hno_lt : ∀ (a b : Int), a < b →
+      (powScale n d (-b)).2 ≤ (powScale n d (-b)).1 →
+      (powScale n d (-a)).1 < 2 * (powScale n d (-a)).2 → False := by
+    intro a b hab hblo ha_hi
+    have hcross := powScale_diff_cross n d (-b) (-a) (by omega)
+    have hdb : 0 < (powScale n d (-b)).2 := powScale_snd_pos_gen n d hd (-b)
+    have hda : 0 < (powScale n d (-a)).2 := powScale_snd_pos_gen n d hd (-a)
+    have hk : 1 ≤ ((-a) - (-b)).toNat := by omega
+    have hpow2 : 2 ≤ 2 ^ ((-a) - (-b)).toNat := two_pow_le_two_pow hk
+    have hmul1 : (powScale n d (-b)).2 * (powScale n d (-a)).2 * 2 ≤
+        (powScale n d (-b)).1 * (powScale n d (-a)).2 * 2 ^ ((-a) - (-b)).toNat :=
+      Nat.mul_le_mul (Nat.mul_le_mul_right _ hblo) hpow2
+    rw [hcross] at hmul1
+    have hmul2 : (powScale n d (-a)).1 * (powScale n d (-b)).2 <
+        2 * (powScale n d (-a)).2 * (powScale n d (-b)).2 :=
+      (nat_mul_lt_mul_right_iff hdb).mpr ha_hi
+    have hcomm : (powScale n d (-b)).2 * (powScale n d (-a)).2 * 2 =
+        2 * (powScale n d (-a)).2 * (powScale n d (-b)).2 := by
+      rw [Nat.mul_comm ((powScale n d (-b)).2) ((powScale n d (-a)).2),
+        Nat.mul_comm _ 2, Nat.mul_assoc]
+    omega
+  by_cases hlt : e < r
+  · exact False.elim (hno_lt e r hlt rlo hhi)
+  · by_cases hgt : r < e
+    · exact False.elim (hno_lt r e hgt hlo rhi)
+    · omega
+
+/-- Exact characterization of `ratioExponent n d` as `⌊log₂ (n / d)⌋` via `powScale`. -/
+theorem ratioExponent_eq_iff_powScale_bounds (n d : Nat) (e : Int) (hn : 0 < n) (hd : 0 < d) :
+    ratioExponent n d = e ↔
+      (powScale n d (-e)).2 ≤ (powScale n d (-e)).1 ∧
+        (powScale n d (-e)).1 < 2 * (powScale n d (-e)).2 := by
+  constructor
+  · rintro rfl
+    exact powScale_neg_ratioExponent_bounds n d hn hd
+  · rintro ⟨hlo, hhi⟩
+    exact ratioExponent_eq_of_powScale_bounds n d e hn hd hlo hhi
+
+/-- Adding `b < 2 ^ k` to a multiple of `2 ^ k` is a bitwise `or` (no carries). -/
+theorem mul_two_pow_add_eq_lor (a b k : Nat) (hb : b < 2 ^ k) :
+    a * 2 ^ k + b = Nat.lor (a * 2 ^ k) b := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  change (a * 2 ^ k + b).testBit i = ((a * 2 ^ k) ||| b).testBit i
+  rw [Nat.mul_comm a (2 ^ k), Nat.testBit_two_pow_mul_add _ hb, Nat.testBit_or,
+    Nat.testBit_two_pow_mul]
+  by_cases hi : i < k
+  · have hge : ¬ (k ≤ i) := by omega
+    rw [if_pos' hi]
+    simp [hge]
+  · have hge : k ≤ i := by omega
+    have hb_false : b.testBit i = false :=
+      Nat.testBit_lt_two_pow (Nat.lt_of_lt_of_le hb (two_pow_le_two_pow hge))
+    rw [if_neg' hi]
+    simp [hge, hb_false]
+
+/-- Same-format `evalFloatToFloatRoundTiesToEven f f bits` on an in-width pattern is the
+identity on every non-NaN and every quiet NaN, and sets only the quiet bit on a signaling NaN. -/
+theorem evalFloatToFloatRoundTiesToEven_self_eq (f : IeeeFormat) (bits : Nat)
+    (hbits : bits < 2 ^ f.width) :
+    evalFloatToFloatRoundTiesToEven f f bits =
+      match decodeBits f bits with
+      | .nan _ false _ => Nat.lor bits (2 ^ (f.fractionBits - 1))
+      | _ => bits := by
+  have henc := encodeBits_unpackBits f bits hbits
+  have hEl := unpackBits_exponent_lt f bits
+  have hFl := unpackBits_fraction_lt f bits
+  by_cases hnan : isNaNBits f bits = true
+  · have hdec : ∃ neg q payload, decodeBits f bits = .nan neg q payload := by
+      unfold isNaNBits at hnan
+      cases hd : decodeBits f bits with
+      | nan neg q payload => exact ⟨neg, q, payload, rfl⟩
+      | _ => rw [hd] at hnan; cases hnan
+    obtain ⟨neg, q, payload, hd⟩ := hdec
+    obtain ⟨hp_eq, _, hp_lt, hq_eq⟩ := decodeBits_nan_payload f bits neg q payload hd
+    rw [evalFloatToFloatRoundTiesToEven_of_nan f f bits neg q payload hd, hd]
+    have hsame :
+        (if f.fractionBits ≤ f.fractionBits then
+          Nat.lor payload (2 ^ (f.fractionBits - 1)) * 2 ^ (f.fractionBits - f.fractionBits)
+        else Nat.lor payload (2 ^ (f.fractionBits - 1)) / 2 ^ (f.fractionBits - f.fractionBits)) =
+          Nat.lor payload (2 ^ (f.fractionBits - 1)) := by
+      rw [if_pos' (Nat.le_refl _), Nat.sub_self, Nat.pow_zero, Nat.mul_one]
+    have hlor_idem : ∀ a b : Nat, Nat.lor (Nat.lor a b) b = Nat.lor a b := by
+      intro a b; change (a ||| b) ||| b = a ||| b; rw [Nat.or_assoc, Nat.or_self]
+    rw [hsame, hlor_idem]
+    have hexp_max : (unpackBits f bits).exponent = 2 ^ f.exponentBits - 1 := by
+      unfold decodeBits at hd
+      simp only at hd
+      by_cases hE : (unpackBits f bits).exponent = 2 ^ f.exponentBits - 1
+      · exact hE
+      · rw [if_neg' hE] at hd
+        by_cases hZ : (unpackBits f bits).exponent = 0
+        · rw [if_pos' hZ] at hd
+          by_cases hFZ : (unpackBits f bits).fraction = 0
+          · rw [if_pos' hFZ] at hd; cases hd
+          · rw [if_neg' hFZ] at hd; cases hd
+        · rw [if_neg' hZ] at hd; cases hd
+    have hsign_eq : (unpackBits f bits).neg = neg := by
+      unfold decodeBits at hd
+      rw [if_pos' hexp_max] at hd
+      by_cases hFZ : (unpackBits f bits).fraction = 0
+      · rw [if_pos' hFZ] at hd; cases hd
+      · rw [if_neg' hFZ] at hd; injection hd
+    have hfrac_eq : (unpackBits f bits).fraction = payload := by
+      unfold unpackBits; exact hp_eq.symm
+    cases q with
+    | false =>
+      have hhi_shift :
+          encodeBits f neg (2 ^ f.exponentBits - 1) (Nat.lor payload (2 ^ (f.fractionBits - 1))) =
+            Nat.lor (encodeBits f neg (2 ^ f.exponentBits - 1) payload) (2 ^ (f.fractionBits - 1)) := by
+        have hlt2 : payload / 2 ^ (f.fractionBits - 1) < 2 := by
+          have hsp : 2 ^ f.fractionBits = 2 ^ (f.fractionBits - 1) * 2 := by
+            cases f <;> decide
+          exact nat_div_lt_of_lt_mul (by rw [← hsp]; exact hp_lt)
+        have hne1 : (payload / 2 ^ (f.fractionBits - 1)) % 2 ≠ 1 := by
+          intro h1
+          have hb1 : Nat.beq ((payload / 2 ^ (f.fractionBits - 1)) % 2) 1 = true :=
+            (nat_beq_eq_decide _ _).trans (decide_eq_true h1)
+          rw [hb1] at hq_eq
+          cases hq_eq
+        have hdiv0 : payload / 2 ^ (f.fractionBits - 1) = 0 := by
+          rcases h01 : payload / 2 ^ (f.fractionBits - 1) with _ | _ | k
+          · rfl
+          · rw [h01] at hne1; exact absurd rfl hne1
+          · omega
+        have hlt_half : payload < 2 ^ (f.fractionBits - 1) := by
+          by_cases hge : 2 ^ (f.fractionBits - 1) ≤ payload
+          · have hge1 : 1 ≤ payload / 2 ^ (f.fractionBits - 1) :=
+              (Nat.le_div_iff_mul_le (Nat.two_pow_pos _)).mpr (by rw [Nat.one_mul]; exact hge)
+            omega
+          · omega
+        have hor_p : Nat.lor payload (2 ^ (f.fractionBits - 1)) =
+            payload + 2 ^ (f.fractionBits - 1) := by
+          have h := mul_two_pow_add_eq_lor 1 payload (f.fractionBits - 1) hlt_half
+          rw [Nat.one_mul, Nat.add_comm] at h
+          change payload ||| 2 ^ (f.fractionBits - 1) = _
+          rw [Nat.or_comm]
+          exact h.symm
+        have hor_add : ∀ base : Nat,
+            Nat.lor (base * 2 ^ f.fractionBits + payload) (2 ^ (f.fractionBits - 1)) =
+              base * 2 ^ f.fractionBits + (payload + 2 ^ (f.fractionBits - 1)) := by
+          intro base
+          have h1 := mul_two_pow_add_eq_lor base payload f.fractionBits hp_lt
+          have hsum_lt : payload + 2 ^ (f.fractionBits - 1) < 2 ^ f.fractionBits := by
+            have hsp : 2 ^ f.fractionBits = 2 * 2 ^ (f.fractionBits - 1) := by
+              cases f <;> decide
+            omega
+          have h3 := mul_two_pow_add_eq_lor base (payload + 2 ^ (f.fractionBits - 1)) f.fractionBits
+            hsum_lt
+          change (base * 2 ^ f.fractionBits + payload) ||| 2 ^ (f.fractionBits - 1) = _
+          change _ = (base * 2 ^ f.fractionBits) ||| payload at h1
+          change _ = (base * 2 ^ f.fractionBits) ||| (payload + 2 ^ (f.fractionBits - 1)) at h3
+          change (payload ||| 2 ^ (f.fractionBits - 1)) = _ at hor_p
+          rw [h1, Nat.or_assoc, hor_p, ← h3]
+        unfold encodeBits zeroBits
+        have hexp_base :
+            ∀ x : Nat,
+              (if neg = true then 2 ^ (f.width - 1) else 0) + (2 ^ f.exponentBits - 1) * 2 ^ f.fractionBits + x =
+                ((if neg = true then 2 ^ f.exponentBits else 0) + (2 ^ f.exponentBits - 1)) * 2 ^ f.fractionBits + x := by
+          intro x
+          cases f <;> cases neg <;>
+            simp [IeeeFormat.width, IeeeFormat.exponentBits, IeeeFormat.fractionBits] <;> omega
+        rw [hexp_base (Nat.lor payload (2 ^ (f.fractionBits - 1))), hexp_base payload, hor_p, hor_add]
+      rw [hhi_shift, ← hsign_eq, ← hexp_max, ← hfrac_eq, henc]
+    | true =>
+      have hlor_id : Nat.lor payload (2 ^ (f.fractionBits - 1)) = payload := by
+        have h1 : (payload / 2 ^ (f.fractionBits - 1)) % 2 = 1 :=
+          of_decide_eq_true ((nat_beq_eq_decide _ _).symm.trans hq_eq.symm)
+        have htest : payload.testBit (f.fractionBits - 1) = true := by
+          rw [Nat.testBit_eq_decide_div_mod_eq]
+          exact decide_eq_true h1
+        apply Nat.eq_of_testBit_eq
+        intro i
+        change (payload ||| 2 ^ (f.fractionBits - 1)).testBit i = payload.testBit i
+        rw [Nat.testBit_or, Nat.testBit_two_pow]
+        by_cases hi : f.fractionBits - 1 = i
+        · subst hi; simp [htest]
+        · simp [hi]
+      rw [hlor_id, ← hsign_eq, ← hexp_max, ← hfrac_eq, henc]
+  · have hnot_nan : isNaNBits f bits = false := Bool.eq_false_iff.mpr hnan
+    have hmatch : (match decodeBits f bits with
+        | .nan _ false _ => Nat.lor bits (2 ^ (f.fractionBits - 1))
+        | _ => bits) = bits := by
+      unfold isNaNBits at hnot_nan
+      cases hd : decodeBits f bits with
+      | nan _ _ _ => rw [hd] at hnot_nan; cases hnot_nan
+      | _ => rfl
+    rw [hmatch, ← convertFloatBits_tiesToEven]
+    generalize hc : unpackBits f bits = c at henc hEl hFl
+    rcases c with ⟨neg, E, F⟩
+    dsimp only at henc hEl hFl
+    rw [← henc] at hnot_nan ⊢
+    by_cases hEmax : E = 2 ^ f.exponentBits - 1
+    · subst hEmax
+      by_cases hF0 : F = 0
+      · subst hF0
+        have hd : decodeBits f (encodeBits f neg (2 ^ f.exponentBits - 1) 0) = .inf neg := by
+          rw [decodeBits_encodeBits f neg _ 0 hEl hFl, if_pos' rfl, if_pos' rfl]
+        rw [convertFloatBits_of_inf _ _ _ _ _ hd]; rfl
+      · have hd : decodeBits f (encodeBits f neg (2 ^ f.exponentBits - 1) F) =
+            .nan neg (Nat.beq ((F / 2 ^ (f.fractionBits - 1)) % 2) 1) F := by
+          rw [decodeBits_encodeBits f neg _ F hEl hFl, if_pos' rfl, if_neg' hF0]
+        rw [isNaNBits_of_nan _ _ _ _ _ hd] at hnot_nan
+        cases hnot_nan
+    · by_cases hE0 : E = 0
+      · subst hE0
+        by_cases hF0 : F = 0
+        · subst hF0
+          have hd : decodeBits f (encodeBits f neg 0 0) = .zero neg := by
+            rw [decodeBits_encodeBits f neg 0 0 hEl hFl, if_neg' (IeeeFormat.max_exp_ne_zero f),
+              if_pos' rfl, if_pos' rfl]
+          rw [convertFloatBits_of_zero _ _ _ _ _ hd, zeroBits_eq_encodeBits]
+        · have hd : decodeBits f (encodeBits f neg 0 F) =
+              .finite neg (powScale F 1 (f.minExponent - f.fractionBits)).1
+                (powScale F 1 (f.minExponent - f.fractionBits)).2 := by
+            rw [decodeBits_encodeBits f neg 0 F hEl hFl, if_neg' hEmax, if_pos' rfl, if_neg' hF0]
+          rw [convertFloatBits_of_finite _ _ _ _ _ _ _ hd,
+            roundRatioBits_subnormal .tiesToEven f neg F (Nat.pos_of_ne_zero hF0) hFl]
+      · have hd : decodeBits f (encodeBits f neg E F) =
+            .finite neg (powScale (2 ^ f.fractionBits + F) 1 ((E : Int) - f.bias - f.fractionBits)).1
+              (powScale (2 ^ f.fractionBits + F) 1 ((E : Int) - f.bias - f.fractionBits)).2 := by
+          rw [decodeBits_encodeBits f neg E F hEl hFl, if_neg' hEmax, if_neg' hE0]
+        have hS1 : 2 ^ f.fractionBits ≤ 2 ^ f.fractionBits + F := Nat.le_add_right _ _
+        have hS2 : 2 ^ f.fractionBits + F < 2 ^ (f.fractionBits + 1) := by
+          have : 2 ^ (f.fractionBits + 1) = 2 * 2 ^ f.fractionBits := by rw [Nat.pow_succ]; omega
+          omega
+        have hE1 : f.minExponent ≤ ((E : Int) - f.bias - f.fractionBits) + f.fractionBits := by
+          unfold IeeeFormat.minExponent; omega
+        have hE2 : ((E : Int) - f.bias - f.fractionBits) + f.fractionBits ≤ f.maxExponent := by
+          unfold IeeeFormat.maxExponent IeeeFormat.bias at *; cases f <;>
+            simp [IeeeFormat.exponentBits] at hEl hEmax ⊢ <;> omega
+        rw [convertFloatBits_of_finite _ _ _ _ _ _ _ hd,
+          roundRatioBits_normal .tiesToEven f neg _ _ hS1 hS2 hE1 hE2]
+        have hE_rec : ((((E : Int) - f.bias - f.fractionBits) + f.fractionBits + f.bias).toNat) = E := by
+          omega
+        have hF_rec : (2 ^ f.fractionBits + F) - 2 ^ f.fractionBits = F :=
+          Nat.add_sub_cancel_left _ _
+        rw [hE_rec, hF_rec]
+
+/-- **Universal `f32 → f64 → f32` round trip across all `2 ^ 32` bit patterns** (zeros,
+subnormals, normals, infinities, quiet NaNs, and signaling NaNs): widening `f32 → f64`
+and narrowing back `f64 → f32` equals `evalFloatToFloatRoundTiesToEven .binary32 .binary32 bits`
+(identical to `bits` on every non-sNaN, and setting only the quiet bit on sNaNs). -/
+theorem evalFloatToFloatRoundTiesToEven_f32_f64_f32_eq_self (bits : Nat) (hbits : bits < 2 ^ 32) :
+    evalFloatToFloatRoundTiesToEven .binary64 .binary32
+        (evalFloatToFloatRoundTiesToEven .binary32 .binary64 bits) =
+      evalFloatToFloatRoundTiesToEven .binary32 .binary32 bits := by
+  by_cases hnan : isNaNBits .binary32 bits = true
+  · have hdec : ∃ neg q payload, decodeBits .binary32 bits = .nan neg q payload := by
+      unfold isNaNBits at hnan
+      cases hd : decodeBits .binary32 bits with
+      | nan neg q payload => exact ⟨neg, q, payload, rfl⟩
+      | _ => rw [hd] at hnan; cases hnan
+    obtain ⟨neg, q, payload, hd⟩ := hdec
+    obtain ⟨_, _, hp_lt, _⟩ := decodeBits_nan_payload .binary32 bits neg q payload hd
+    have hd64 := decodeBits_evalFloatToFloatRoundTiesToEven_of_nan .binary32 .binary64 bits neg q
+      payload hd
+    rw [evalFloatToFloatRoundTiesToEven_of_nan .binary64 .binary32 _ neg true _ hd64,
+      evalFloatToFloatRoundTiesToEven_of_nan .binary32 .binary32 bits neg q payload hd]
+    congr 1
+    simp only [IeeeFormat.fractionBits, Nat.reduceSub, Nat.reduceLeDiff, ↓reduceIte, Nat.pow_zero,
+      Nat.mul_one, Nat.reducePow]
+    generalize hq_val : Nat.lor payload 4194304 = quiet
+    have hlor_hi : Nat.lor (quiet * 536870912) 2251799813685248 = quiet * 536870912 := by
+      have htest_q : quiet.testBit 22 = true := by
+        rw [← hq_val]
+        change (payload ||| 2 ^ 22).testBit 22 = true
+        rw [Nat.testBit_or, Nat.testBit_two_pow_self, Bool.or_true]
+      apply Nat.eq_of_testBit_eq
+      intro i
+      change ((quiet * 2 ^ 29) ||| 2 ^ 51).testBit i = (quiet * 2 ^ 29).testBit i
+      rw [Nat.testBit_or, Nat.testBit_two_pow]
+      by_cases hi : 51 = i
+      · subst hi
+        have hmul_bit : (quiet * 2 ^ 29).testBit 51 = quiet.testBit 22 := by
+          rw [Nat.mul_comm, Nat.testBit_two_pow_mul]
+          simp
+        simp [hmul_bit, htest_q]
+      · simp [hi]
+    rw [hlor_hi, hlor_hi, Nat.mul_div_cancel quiet (show 0 < 536870912 by decide)]
+  · have hnot_nan : isNaNBits .binary32 bits = false := Bool.eq_false_iff.mpr hnan
+    let x : F32Bits := BitVec.ofNat 32 bits
+    have hx_nat : x.toNat = bits := by
+      dsimp [x]; rw [BitVec.toNat_ofNat]; exact Nat.mod_eq_of_lt hbits
+    have hx_nn : isNaNBits .binary32 x.toNat = false := by rw [hx_nat]; exact hnot_nan
+    obtain ⟨W, _, hw, _, hn⟩ := f32_roundtrip_core x hx_nn
+    rw [hx_nat, convertFloatBits_tiesToEven] at hw
+    rw [hx_nat, convertFloatBits_tiesToEven] at hn
+    rw [hw, hn, evalFloatToFloatRoundTiesToEven_self_eq .binary32 bits hbits]
+    unfold isNaNBits at hnot_nan
+    cases hd : decodeBits .binary32 bits with
+    | nan _ _ _ => rw [hd] at hnot_nan; cases hnot_nan
+    | _ => rfl
+
+/-! ### Extended `BitVec` (`BitVec w`, `BitVec 32`, `BitVec 64`, `BitVec 128`) conversions -/
+
+/-- `BitVec.ofNat w` of `encodeTwosComplement w v` is identically `BitVec.ofInt w v`. -/
+theorem bitVec_ofNat_encodeTwosComplement (w : Nat) (v : Int) :
+    BitVec.ofNat w (encodeTwosComplement w v) = BitVec.ofInt w v := by
+  apply BitVec.eq_of_toNat_eq
+  rw [BitVec.toNat_ofNat, encodeTwosComplement_eq_toNat_ofInt, Nat.mod_eq_of_lt (BitVec.isLt _)]
+
+/-- Encoding `b.toInt` in two's complement at width `w` recovers `b.toNat`
+(`Classical.choice`-free). -/
+theorem encodeTwosComplement_bitVec_toInt (w : Nat) (b : BitVec w) :
+    encodeTwosComplement w b.toInt = b.toNat := by
+  unfold encodeTwosComplement
+  rw [BitVec.toInt_eq_toNat_cond]
+  have hlt := b.isLt
+  by_cases h : 2 * b.toNat < 2 ^ w
+  · rw [if_pos' h, Int.emod_eq_of_lt (Int.natCast_nonneg _) (Int.ofNat_lt.mpr hlt),
+      Int.toNat_natCast]
+  · rw [if_neg' h]
+    have hsub : (b.toNat : Int) - ((2 ^ w : Nat) : Int) =
+        (b.toNat : Int) + ((2 ^ w : Nat) : Int) * (-1) := by omega
+    rw [hsub, Int.add_mul_emod_self_left,
+      Int.emod_eq_of_lt (Int.natCast_nonneg _) (Int.ofNat_lt.mpr hlt), Int.toNat_natCast]
+
+/-- Reading `b : BitVec w` through `intValueOfBits signed w` yields `b.toInt` when `signed`
+and `(b.toNat : Int)` when unsigned. -/
+theorem intValueOfBits_bitVec_toNat (signed : Bool) (w : Nat) (b : BitVec w) :
+    intValueOfBits signed w b.toNat = if signed then b.toInt else (b.toNat : Int) := by
+  cases signed with
+  | false =>
+    rw [intValueOfBits_false_eq_toNat, BitVec.ofNat_toNat, BitVec.setWidth_eq]
+    rfl
+  | true =>
+    rw [intValueOfBits_true_eq_toInt, BitVec.ofNat_toNat, BitVec.setWidth_eq]
+    rfl
+
+/-- Signed `intValueOfBits true w bits` always lies in `[-2^(w-1), 2^(w-1))` for `0 < w`. -/
+theorem intValueOfBits_signed_bounds (w bits : Nat) (hw : 0 < w) :
+    -((2 ^ (w - 1) : Nat) : Int) ≤ intValueOfBits true w bits ∧
+      intValueOfBits true w bits < ((2 ^ (w - 1) : Nat) : Int) := by
+  rw [intValueOfBits_true_eq_toInt, BitVec.toInt_eq_toNat_cond, BitVec.toNat_ofNat]
+  generalize hb : bits % 2 ^ w = b
+  have hmod : b < 2 ^ w := by rw [← hb]; exact Nat.mod_lt _ (Nat.two_pow_pos _)
+  cases w with
+  | zero => omega
+  | succ k =>
+    simp only [Nat.add_sub_cancel]
+    have hsplit : 2 ^ (k + 1) = 2 * 2 ^ k := by rw [Nat.pow_succ, Nat.mul_comm]
+    by_cases hlt : 2 * b < 2 ^ (k + 1)
+    · rw [if_pos' hlt]; exact ⟨by omega, by omega⟩
+    · rw [if_neg' hlt]; exact ⟨by omega, by omega⟩
+
+/-- `(BitVec.ofInt w v).toInt = v` whenever `0 < w` and `v ∈ [-2^(w-1), 2^(w-1))`. -/
+theorem bitVec_toInt_ofInt_in_bounds (w : Nat) (hw : 0 < w) (v : Int)
+    (hlo : -((2 ^ (w - 1) : Nat) : Int) ≤ v)
+    (hhi : v < ((2 ^ (w - 1) : Nat) : Int)) :
+    (BitVec.ofInt w v).toInt = v := by
+  rw [← bitVec_ofNat_encodeTwosComplement, ← intValueOfBits_true_eq_toInt]
+  unfold intValueOfBits encodeTwosComplement
+  cases w with
+  | zero => omega
+  | succ k =>
+    simp only [true_and, Nat.add_sub_cancel] at hlo hhi ⊢
+    have hsplit : 2 ^ (k + 1) = 2 * 2 ^ k := by rw [Nat.pow_succ, Nat.mul_comm]
+    by_cases hneg : v < 0
+    · have hadd_nn : 0 ≤ v + ((2 ^ (k + 1) : Nat) : Int) := by omega
+      have hadd_lt : v + ((2 ^ (k + 1) : Nat) : Int) < ((2 ^ (k + 1) : Nat) : Int) := by omega
+      have hmod_eq : v % ((2 ^ (k + 1) : Nat) : Int) = v + ((2 ^ (k + 1) : Nat) : Int) := by
+        have hrew : v = (v + ((2 ^ (k + 1) : Nat) : Int)) + ((2 ^ (k + 1) : Nat) : Int) * (-1) := by
+          omega
+        conv => lhs; rw [hrew]
+        rw [Int.add_mul_emod_self_left, Int.emod_eq_of_lt hadd_nn hadd_lt]
+      rw [hmod_eq]
+      have hnat_lt : (v + ((2 ^ (k + 1) : Nat) : Int)).toNat < 2 ^ (k + 1) := by omega
+      rw [Nat.mod_eq_of_lt hnat_lt]
+      have hge : 2 ^ k ≤ (v + ((2 ^ (k + 1) : Nat) : Int)).toNat := by omega
+      rw [if_pos' hge]
+      omega
+    · have hnn : 0 ≤ v := by omega
+      have hlt_w : v < ((2 ^ (k + 1) : Nat) : Int) := by omega
+      rw [Int.emod_eq_of_lt hnn hlt_w]
+      have hlt_full : v.toNat < 2 ^ (k + 1) := by omega
+      rw [Nat.mod_eq_of_lt hlt_full]
+      have hnge : ¬ (2 ^ k ≤ v.toNat) := by omega
+      rw [if_neg' hnge]
+      omega
+
+/-- Sign-extending a `w`-bit signed integer (`0 < w ≤ 128`) into `BitVec 128` preserves its
+`Int` value (`Miri.Interpreter.Cast.intLikeValue`'s `U128` signed intermediate). -/
+theorem bitVec128_ofInt_intValueOfBits_toInt (w bits : Nat) (hw0 : 0 < w) (hw128 : w ≤ 128) :
+    (BitVec.ofInt 128 (intValueOfBits true w bits)).toInt = intValueOfBits true w bits := by
+  obtain ⟨hlo, hhi⟩ := intValueOfBits_signed_bounds w bits hw0
+  have hle : 2 ^ (w - 1) ≤ 2 ^ 127 := two_pow_le_two_pow (by omega)
+  exact bitVec_toInt_ofInt_in_bounds 128 (by decide) _ (by omega) (by omega)
+
+/-- Zero-extending a `w`-bit unsigned pattern (`w ≤ 128`) into `BitVec 128` recovers
+`intValueOfBits false w bits` (`Miri.Interpreter.Cast.intLikeValue`'s unsigned intermediate). -/
+theorem bitVec128_ofNat_intValueOfBits_toNat (w bits : Nat) (hw128 : w ≤ 128) :
+    ((BitVec.ofNat 128 (bits % 2 ^ w)).toNat : Int) = intValueOfBits false w bits := by
+  rw [BitVec.toNat_ofNat]
+  have hlt : bits % 2 ^ w < 2 ^ 128 :=
+    Nat.lt_of_lt_of_le (Nat.mod_lt _ (Nat.two_pow_pos _)) (two_pow_le_two_pow hw128)
+  rw [Nat.mod_eq_of_lt hlt]
+  unfold intValueOfBits
+  simp only [Bool.false_eq_true, false_and, ↓reduceIte]
+
+/-- `BitVec`-level view of `evalFloatToIntSaturating`: at target width `t.bitWidth pw`,
+its bit pattern is `BitVec.ofInt (t.bitWidth pw) (floatToIntValue ...)`. -/
+theorem evalFloatToIntSaturating_bitVec_eq (src : IeeeFormat) (bits : Nat)
+    (t : FloatIntTarget) (pw : FloatPtrWidth) :
+    BitVec.ofNat (t.bitWidth pw) (evalFloatToIntSaturating src bits t pw).bits =
+      BitVec.ofInt (t.bitWidth pw)
+        (floatToIntValue (decodeBits src bits) (t.minValue pw) (t.maxValue pw)) :=
+  bitVec_ofNat_encodeTwosComplement (t.bitWidth pw) _
+
+/-- Zero-extending an in-width `BitVec f.width` (`BitVec 32` / `BitVec 64`) to `BitVec 128`
+agrees with `BitVec.ofNat 128 bits`. -/
+theorem bitVec_zeroExtend128_of_lt_width (f : IeeeFormat) (bits : Nat) (h : bits < 2 ^ f.width) :
+    (BitVec.ofNat f.width bits).setWidth 128 = BitVec.ofNat 128 bits := by
+  apply BitVec.eq_of_toNat_eq
+  rw [BitVec.toNat_setWidth, BitVec.toNat_ofNat, BitVec.toNat_ofNat, Nat.mod_eq_of_lt h]
+
+/-- `f32ToF64` (`BitVec 32 → BitVec 64`) zero-extended to `BitVec 128` matches
+`evalFloatToFloatRoundTiesToEven .binary32 .binary64` on **every** `x : BitVec 32`
+(including NaNs). -/
+theorem f32ToF64_setWidth128 (x : F32Bits) :
+    (f32ToF64 x).setWidth 128 =
+      BitVec.ofNat 128 (evalFloatToFloatRoundTiesToEven .binary32 .binary64 x.toNat) :=
+  bitVec_zeroExtend128_of_lt_width .binary64 _
+    (evalFloatToFloatRoundTiesToEven_lt .binary32 .binary64 x.toNat)
+
+/-- `f64ToF32` (`BitVec 64 → BitVec 32`) zero-extended to `BitVec 128` matches
+`evalFloatToFloatRoundTiesToEven .binary64 .binary32` on **every** `x : BitVec 64`
+(including NaNs). -/
+theorem f64ToF32_setWidth128 (x : F64Bits) :
+    (f64ToF32 x).setWidth 128 =
+      BitVec.ofNat 128 (evalFloatToFloatRoundTiesToEven .binary64 .binary32 x.toNat) :=
+  bitVec_zeroExtend128_of_lt_width .binary32 _
+    (evalFloatToFloatRoundTiesToEven_lt .binary64 .binary32 x.toNat)
+
+/-! ### Saturation endpoints of `evalFloatToIntSaturating` (`±∞`, `±0.0`, `MIN` / `MAX`) -/
+
+/-- `floatToIntValue` saturates `+∞` to `hi` and `-∞` to `lo`. -/
+theorem floatToIntValue_inf (neg : Bool) (lo hi : Int) :
+    floatToIntValue (.inf neg) lo hi = if neg then lo else hi := rfl
+
+/-- `floatToIntValue` sends both zeros (in particular `-0.0`) to `0`. -/
+theorem floatToIntValue_zero (neg : Bool) (lo hi : Int) :
+    floatToIntValue (.zero neg) lo hi = 0 := rfl
+
+/-- Two's-complement encoding of the target minimum: `2 ^ (w - 1)` for signed targets and `0`
+for unsigned targets (`w = t.bitWidth pw`). -/
+theorem encodeTwosComplement_minValue (t : FloatIntTarget) (pw : FloatPtrWidth) :
+    encodeTwosComplement (t.bitWidth pw) (t.minValue pw) =
+      if t.isSigned then 2 ^ (t.bitWidth pw - 1) else 0 := by
+  unfold FloatIntTarget.minValue
+  have hw := FloatIntTarget.bitWidth_cases t pw
+  generalize t.bitWidth pw = w at hw ⊢
+  cases t.isSigned <;> rcases hw with rfl | rfl | rfl | rfl | rfl <;> decide
+
+/-- Two's-complement encoding of the target maximum: `2 ^ (w - 1) - 1` for signed targets and
+`2 ^ w - 1` for unsigned targets (`w = t.bitWidth pw`). -/
+theorem encodeTwosComplement_maxValue (t : FloatIntTarget) (pw : FloatPtrWidth) :
+    encodeTwosComplement (t.bitWidth pw) (t.maxValue pw) =
+      if t.isSigned then 2 ^ (t.bitWidth pw - 1) - 1 else 2 ^ t.bitWidth pw - 1 := by
+  unfold FloatIntTarget.maxValue
+  have hw := FloatIntTarget.bitWidth_cases t pw
+  generalize t.bitWidth pw = w at hw ⊢
+  cases t.isSigned <;> rcases hw with rfl | rfl | rfl | rfl | rfl <;> decide
+
+/-- **`+∞ ↦ MAX`, `-∞ ↦ MIN`**: `evalFloatToIntSaturating` on `infBits src neg` is the
+two's-complement encoding of the target's `minValue` (`-∞`) or `maxValue` (`+∞`), i.e.
+`2 ^ (w - 1)` / `0` for `-∞` and `2 ^ (w - 1) - 1` / `2 ^ w - 1` for `+∞` (signed / unsigned),
+across all twelve integer targets (including `isize` / `usize` at either pointer width). -/
+theorem evalFloatToIntSaturating_infBits (src : IeeeFormat) (neg : Bool) (t : FloatIntTarget)
+    (pw : FloatPtrWidth) :
+    (evalFloatToIntSaturating src (infBits src neg) t pw).bits =
+      if neg then (if t.isSigned then 2 ^ (t.bitWidth pw - 1) else 0)
+      else (if t.isSigned then 2 ^ (t.bitWidth pw - 1) - 1 else 2 ^ t.bitWidth pw - 1) := by
+  simp only [evalFloatToIntSaturating, decodeBits_infBits, floatToIntValue]
+  cases neg
+  · simp only [Bool.false_eq_true, ↓reduceIte]; exact encodeTwosComplement_maxValue t pw
+  · simp only [↓reduceIte]; exact encodeTwosComplement_minValue t pw
+
+/-- **`±0.0 ↦ 0`**: `evalFloatToIntSaturating` maps both zero encodings (`zeroBits src neg`, in
+particular `-0.0`) to the all-zero target pattern, dropping the sign. -/
+theorem evalFloatToIntSaturating_zeroBits (src : IeeeFormat) (neg : Bool) (t : FloatIntTarget)
+    (pw : FloatPtrWidth) :
+    (evalFloatToIntSaturating src (zeroBits src neg) t pw).bits = 0 := by
+  simp only [evalFloatToIntSaturating, decodeBits_zeroBits, floatToIntValue, encodeTwosComplement,
+    Int.zero_emod]
+  rfl
+
+/-- The target width of `evalFloatToIntSaturating` is `t.bitWidth pw / 8` bytes. -/
+theorem evalFloatToIntSaturating_sizeBytes (src : IeeeFormat) (bits : Nat) (t : FloatIntTarget)
+    (pw : FloatPtrWidth) :
+    (evalFloatToIntSaturating src bits t pw).sizeBytes = t.bitWidth pw / 8 := rfl
+
+/-- **Finite upper saturation (`truncRatio ≥ maxValue ↦ MAX`)**: when `bits` decodes to a
+finite rational whose truncated integer value meets or exceeds `t.maxValue pw`,
+`evalFloatToIntSaturating` saturates to the target maximum's two's-complement bit pattern. -/
+theorem evalFloatToIntSaturating_of_ge_maxValue (src : IeeeFormat) (bits : Nat) (neg : Bool)
+    (n d : Nat) (t : FloatIntTarget) (pw : FloatPtrWidth)
+    (hdec : decodeBits src bits = .finite neg n d)
+    (hge : t.maxValue pw ≤ truncRatio neg n d) :
+    (evalFloatToIntSaturating src bits t pw).bits =
+      if t.isSigned then 2 ^ (t.bitWidth pw - 1) - 1 else 2 ^ t.bitWidth pw - 1 := by
+  have hp1 : 1 ≤ 2 ^ (t.bitWidth pw - 1) := Nat.one_le_two_pow
+  have hp2 : 1 ≤ 2 ^ t.bitWidth pw := Nat.one_le_two_pow
+  have hle : t.minValue pw ≤ t.maxValue pw := by
+    unfold FloatIntTarget.minValue FloatIntTarget.maxValue
+    cases t.isSigned <;> simp only [Bool.false_eq_true, ↓reduceIte] <;> omega
+  have hclamp : clampInt (t.minValue pw) (t.maxValue pw) (truncRatio neg n d) = t.maxValue pw := by
+    unfold clampInt
+    rw [Int.min_eq_left hge, Int.max_eq_right hle]
+  simp only [evalFloatToIntSaturating, hdec, floatToIntValue, hclamp]
+  exact encodeTwosComplement_maxValue t pw
+
+/-- **Finite lower saturation (`truncRatio ≤ minValue ↦ MIN`)**: when `bits` decodes to a
+finite rational whose truncated integer value is at or below `t.minValue pw` (including all
+negative finite floats on unsigned targets, where `minValue = 0`),
+`evalFloatToIntSaturating` saturates to the target minimum's two's-complement bit pattern. -/
+theorem evalFloatToIntSaturating_of_le_minValue (src : IeeeFormat) (bits : Nat) (neg : Bool)
+    (n d : Nat) (t : FloatIntTarget) (pw : FloatPtrWidth)
+    (hdec : decodeBits src bits = .finite neg n d)
+    (hle_min : truncRatio neg n d ≤ t.minValue pw) :
+    (evalFloatToIntSaturating src bits t pw).bits =
+      if t.isSigned then 2 ^ (t.bitWidth pw - 1) else 0 := by
+  have hp1 : 1 ≤ 2 ^ (t.bitWidth pw - 1) := Nat.one_le_two_pow
+  have hp2 : 1 ≤ 2 ^ t.bitWidth pw := Nat.one_le_two_pow
+  have hle : t.minValue pw ≤ t.maxValue pw := by
+    unfold FloatIntTarget.minValue FloatIntTarget.maxValue
+    cases t.isSigned <;> simp only [Bool.false_eq_true, ↓reduceIte] <;> omega
+  have hclamp : clampInt (t.minValue pw) (t.maxValue pw) (truncRatio neg n d) = t.minValue pw := by
+    unfold clampInt
+    rw [Int.min_eq_right (Int.le_trans hle_min hle), Int.max_eq_left hle_min]
+  simp only [evalFloatToIntSaturating, hdec, floatToIntValue, hclamp]
+  exact encodeTwosComplement_minValue t pw
+
+/-- **Finite in-range truncation (no saturation)**: when `bits` decodes to a finite rational
+whose truncation toward zero lies in `[minValue, maxValue]`, `evalFloatToIntSaturating` is exactly
+the two's-complement encoding of the truncated value (complementing the saturating cases
+`evalFloatToIntSaturating_of_ge_maxValue` / `evalFloatToIntSaturating_of_le_minValue`). -/
+theorem evalFloatToIntSaturating_of_in_range (src : IeeeFormat) (bits : Nat) (neg : Bool)
+    (n d : Nat) (t : FloatIntTarget) (pw : FloatPtrWidth)
+    (hdec : decodeBits src bits = .finite neg n d)
+    (hlo : t.minValue pw ≤ truncRatio neg n d) (hhi : truncRatio neg n d ≤ t.maxValue pw) :
+    (evalFloatToIntSaturating src bits t pw).bits =
+      encodeTwosComplement (t.bitWidth pw) (truncRatio neg n d) := by
+  have hclamp : clampInt (t.minValue pw) (t.maxValue pw) (truncRatio neg n d) =
+      truncRatio neg n d := by
+    unfold clampInt
+    rw [Int.min_eq_right hhi, Int.max_eq_right hlo]
+  simp only [evalFloatToIntSaturating, hdec, floatToIntValue, hclamp]
+
+/-- **Signed zero preservation in `floatToFloat`**: `zeroBits src neg` maps to `zeroBits dst neg`
+(preserving `-0.0` vs `+0.0`, in contrast to `evalFloatToIntSaturating_zeroBits`). -/
+theorem evalFloatToFloatRoundTiesToEven_zeroBits (src dst : IeeeFormat) (neg : Bool) :
+    evalFloatToFloatRoundTiesToEven src dst (zeroBits src neg) = zeroBits dst neg := by
+  simp only [evalFloatToFloatRoundTiesToEven, decodeBits_zeroBits]
+
+/-- **Signed infinity preservation in `floatToFloat`**: `infBits src neg` maps to
+`infBits dst neg`. -/
+theorem evalFloatToFloatRoundTiesToEven_infBits (src dst : IeeeFormat) (neg : Bool) :
+    evalFloatToFloatRoundTiesToEven src dst (infBits src neg) = infBits dst neg := by
+  simp only [evalFloatToFloatRoundTiesToEven, decodeBits_infBits]
+
+/-- **Complete finite-case trichotomy for `evalFloatToIntSaturating`**: on any finite
+`decodeBits src bits = .finite neg n d`, `evalFloatToIntSaturating` yields `MIN` when
+`truncRatio neg n d ≤ minValue`, `MAX` when `maxValue ≤ truncRatio neg n d`, and the exact
+two's-complement encoding `encodeTwosComplement` strictly in between. -/
+theorem evalFloatToIntSaturating_finite_eq (src : IeeeFormat) (bits : Nat) (neg : Bool)
+    (n d : Nat) (t : FloatIntTarget) (pw : FloatPtrWidth)
+    (hdec : decodeBits src bits = .finite neg n d) :
+    (evalFloatToIntSaturating src bits t pw).bits =
+      if truncRatio neg n d ≤ t.minValue pw then
+        if t.isSigned then 2 ^ (t.bitWidth pw - 1) else 0
+      else if t.maxValue pw ≤ truncRatio neg n d then
+        if t.isSigned then 2 ^ (t.bitWidth pw - 1) - 1 else 2 ^ t.bitWidth pw - 1
+      else
+        encodeTwosComplement (t.bitWidth pw) (truncRatio neg n d) := by
+  by_cases hlo : truncRatio neg n d ≤ t.minValue pw
+  · simp only [hlo, ↓reduceIte]
+    exact evalFloatToIntSaturating_of_le_minValue src bits neg n d t pw hdec hlo
+  · simp only [hlo, ↓reduceIte]
+    by_cases hhi : t.maxValue pw ≤ truncRatio neg n d
+    · simp only [hhi, ↓reduceIte]
+      exact evalFloatToIntSaturating_of_ge_maxValue src bits neg n d t pw hdec hhi
+    · simp only [hhi, ↓reduceIte]
+      exact evalFloatToIntSaturating_of_in_range src bits neg n d t pw hdec
+        (by omega) (by omega)
+
+/-- **Zero integer to `+0.0` in `intToFloat`**: for every signedness `signed`, bit-width `w`, and
+destination format `dst`, `0` maps to positive zero `zeroBits dst false` (`0`). -/
+theorem evalIntToFloatRoundTiesToEven_zero (signed : Bool) (w : Nat) (dst : IeeeFormat) :
+    evalIntToFloatRoundTiesToEven signed w 0 dst = zeroBits dst false := by
+  have hiv : intValueOfBits signed w 0 = 0 := by
+    unfold intValueOfBits
+    dsimp only
+    rw [if_neg']
+    · simp only [Nat.zero_mod, Int.natCast_zero]
+    · rintro ⟨_, hle⟩
+      have hp : 1 ≤ 2 ^ (w - 1) := Nat.one_le_two_pow
+      rw [Nat.zero_mod] at hle
+      omega
+  unfold evalIntToFloatRoundTiesToEven roundRatioTiesToEven
+  rw [hiv]
+  rfl
+
+/-- Unsigned `intValueOfBits` is the canonical residue modulo `2 ^ w`. -/
+theorem intValueOfBits_unsigned_eq_mod (w bits : Nat) :
+    intValueOfBits false w bits = ((bits % 2 ^ w : Nat) : Int) := by
+  unfold intValueOfBits
+  dsimp only
+  rw [if_neg' (fun ⟨h, _⟩ => Bool.noConfusion h)]
+
+/-- Signed `intValueOfBits` at the sign bit `2 ^ (w - 1)` (`0 < w`) is `-2 ^ (w - 1)` (`iN::MIN`). -/
+theorem intValueOfBits_signed_min (w : Nat) (hw : 0 < w) :
+    intValueOfBits true w (2 ^ (w - 1)) = -((2 ^ (w - 1) : Nat) : Int) := by
+  have hlt : 2 ^ (w - 1) < 2 ^ w := two_pow_lt_two_pow (by omega)
+  have hpow : 2 ^ w = 2 * 2 ^ (w - 1) := by
+    have h1 : w = (w - 1) + 1 := by omega
+    conv => lhs; rw [h1]
+    rw [Nat.pow_succ, Nat.mul_comm]
+  unfold intValueOfBits
+  dsimp only
+  rw [if_pos' ⟨rfl, by rw [Nat.mod_eq_of_lt hlt]; exact Nat.le_refl _⟩]
+  rw [Nat.mod_eq_of_lt hlt, hpow]
+  omega
+
+/-- Signed `intValueOfBits` at all-ones `2 ^ w - 1` (`0 < w`) is `-1`. -/
+theorem intValueOfBits_signed_neg_one (w : Nat) (hw : 0 < w) :
+    intValueOfBits true w (2 ^ w - 1) = -1 := by
+  have hp1 : 1 ≤ 2 ^ (w - 1) := Nat.one_le_two_pow
+  have hpow : 2 ^ w = 2 * 2 ^ (w - 1) := by
+    have h1 : w = (w - 1) + 1 := by omega
+    conv => lhs; rw [h1]
+    rw [Nat.pow_succ, Nat.mul_comm]
+  have hlt : 2 ^ w - 1 < 2 ^ w := by omega
+  unfold intValueOfBits
+  dsimp only
+  rw [if_pos' ⟨rfl, by rw [Nat.mod_eq_of_lt hlt]; omega⟩]
+  rw [Nat.mod_eq_of_lt hlt]
+  omega
+
+end MiriBridge
+
 /-! ## §5. Axiom guards
 
 Every headline theorem (and every `rfl` bridge to the trusted primitives) is
@@ -2673,6 +3731,777 @@ does not depend on any axioms
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms evalIntToFloatRoundTiesToEven_eq_roundRatioBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_eq_miri' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms ratioExponent_eq_miri
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_eq_miri' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms powScale_eq_miri
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotientTiesToEven_eq_miri' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms roundQuotientTiesToEven_eq_miri
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.floatToIntValue_eq_miri' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms floatToIntValue_eq_miri
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_floor_log2' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms ratioExponent_floor_log2
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundRatioTiesToEven_consistent' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms roundRatioTiesToEven_consistent
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.zeroBits_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms zeroBits_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.infBits_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms infBits_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.preferredNaNBits_lt' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms preferredNaNBits_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundRatioTiesToEven_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms roundRatioTiesToEven_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalIntToFloatRoundTiesToEven_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalIntToFloatRoundTiesToEven_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_bits_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_bits_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_finite_den_pos' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms decodeBits_finite_den_pos
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_nan_payload' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms decodeBits_nan_payload
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.convertNaNPayload_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms convertNaNPayload_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_of_nan' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToFloatRoundTiesToEven_of_nan
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_evalFloatToFloatRoundTiesToEven_of_nan' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms decodeBits_evalFloatToFloatRoundTiesToEven_of_nan
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToFloatRoundTiesToEven_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.isNaNBits_evalFloatToFloatRoundTiesToEven' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms isNaNBits_evalFloatToFloatRoundTiesToEven
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeTwosComplement_eq_toNat_ofInt' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms encodeTwosComplement_eq_toNat_ofInt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_true_eq_toInt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms intValueOfBits_true_eq_toInt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_false_eq_toNat' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms intValueOfBits_false_eq_toNat
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_encodeTwosComplement' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms intValueOfBits_encodeTwosComplement
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_eq_of_powScale_bounds' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms ratioExponent_eq_of_powScale_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_eq_iff_powScale_bounds' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms ratioExponent_eq_iff_powScale_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_self_eq' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToFloatRoundTiesToEven_self_eq
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_f32_f64_f32_eq_self' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToFloatRoundTiesToEven_f32_f64_f32_eq_self
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.bitVec_ofNat_encodeTwosComplement' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms bitVec_ofNat_encodeTwosComplement
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeTwosComplement_bitVec_toInt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms encodeTwosComplement_bitVec_toInt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_bitVec_toNat' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms intValueOfBits_bitVec_toNat
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_signed_bounds' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms intValueOfBits_signed_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.bitVec_toInt_ofInt_in_bounds' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms bitVec_toInt_ofInt_in_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.bitVec128_ofInt_intValueOfBits_toInt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms bitVec128_ofInt_intValueOfBits_toInt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.bitVec128_ofNat_intValueOfBits_toNat' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms bitVec128_ofNat_intValueOfBits_toNat
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_bitVec_eq' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_bitVec_eq
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.bitVec_zeroExtend128_of_lt_width' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms bitVec_zeroExtend128_of_lt_width
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f32ToF64_setWidth128' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms f32ToF64_setWidth128
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f64ToF32_setWidth128' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms f64ToF32_setWidth128
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.mul_two_pow_add_eq_lor' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms mul_two_pow_add_eq_lor
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.floatToIntValue_inf' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms floatToIntValue_inf
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.floatToIntValue_zero' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms floatToIntValue_zero
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeTwosComplement_minValue' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms encodeTwosComplement_minValue
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeTwosComplement_maxValue' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms encodeTwosComplement_maxValue
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_infBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_infBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_zeroBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_zeroBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_sizeBytes' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_sizeBytes
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_of_ge_maxValue' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_of_ge_maxValue
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_of_le_minValue' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_of_le_minValue
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_zeroBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToFloatRoundTiesToEven_zeroBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_infBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToFloatRoundTiesToEven_infBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_of_in_range' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_of_in_range
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalFloatToIntSaturating_finite_eq' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFloatToIntSaturating_finite_eq
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.evalIntToFloatRoundTiesToEven_zero' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms evalIntToFloatRoundTiesToEven_zero
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_unsigned_eq_mod' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms intValueOfBits_unsigned_eq_mod
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_signed_min' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms intValueOfBits_signed_min
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.intValueOfBits_signed_neg_one' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms intValueOfBits_signed_neg_one
+
+/-! Axiom guards for the remaining (helper) theorems: together with the guards above,
+all theorems of this file are pinned to `⊆ {propext, Quot.sound}` (no `Classical.choice`). -/
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.if_pos'' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.if_pos'
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.if_neg'' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.if_neg'
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.two_pow_le_two_pow' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.two_pow_le_two_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.two_pow_lt_two_pow' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.two_pow_lt_two_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.lt_of_two_pow_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.lt_of_two_pow_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_mul_lt_mul_right_iff' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_mul_lt_mul_right_iff
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_beq_eq_decide' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_beq_eq_decide
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_div_lt_of_lt_mul' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_div_lt_of_lt_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.unpackBits_encodeBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.unpackBits_encodeBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeBits_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.encodeBits_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_zero_fst' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_zero_fst
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_beq_op_eq_decide' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_beq_op_eq_decide
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.floatToIntValue_mem' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.floatToIntValue_mem
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.twos_roundtrip' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.twos_roundtrip
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.FloatIntTarget.bitWidth_cases' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.FloatIntTarget.bitWidth_cases
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.scalarModulus_div8' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.scalarModulus_div8
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_log2_eq_of_bounds' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_log2_eq_of_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.nat_log2_two_pow' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.nat_log2_two_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.pow_mul_pow' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.pow_mul_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_mul_pow' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.ratioExponent_mul_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_div_pow' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.ratioExponent_div_pow
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_mul' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.ratioExponent_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_mul' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_mul' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_exact' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_exact
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundRatioBits_mul' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundRatioBits_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_snd_pos' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_snd_pos
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_fst_pos' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_fst_pos
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_powScale_neg' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_powScale_neg
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.ratioExponent_powScale' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.ratioExponent_powScale
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.IeeeFormat.fb_le_bias' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.IeeeFormat.fb_le_bias
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.IeeeFormat.one_le_fb' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.IeeeFormat.one_le_fb
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_encodeBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.decodeBits_encodeBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeBits_unpackBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.encodeBits_unpackBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.unpackBits_exponent_lt' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.unpackBits_exponent_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.unpackBits_fraction_lt' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.unpackBits_fraction_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.IeeeFormat.two_bias_lt' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.IeeeFormat.two_bias_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.IeeeFormat.max_exp_ne_zero' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.IeeeFormat.max_exp_ne_zero
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_roundRatio_normal' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.decodeBits_roundRatio_normal
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_roundRatio_subnormal' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.decodeBits_roundRatio_subnormal
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_shift_cross' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_shift_cross
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.IeeeFormat.fb_add_bias_lt' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.IeeeFormat.fb_add_bias_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.zeroBits_eq_encodeBits' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.zeroBits_eq_encodeBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f64_encode_lt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f64_encode_lt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.convertFloatBits_of_zero' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.convertFloatBits_of_zero
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.convertFloatBits_of_inf' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.convertFloatBits_of_inf
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.convertFloatBits_of_finite' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.convertFloatBits_of_finite
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.isNaNBits_of_nan' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.isNaNBits_of_nan
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f32_rt_inf' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f32_rt_inf
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f32_rt_zero' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f32_rt_zero
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f32_rt_subnormal' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f32_rt_subnormal
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f32_rt_normal' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f32_rt_normal
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.f32_roundtrip_core' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.f32_roundtrip_core
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.isQuietNaNBits_of_nan' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.isQuietNaNBits_of_nan
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_snd_pos_gen' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_snd_pos_gen
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_diff_cross' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_diff_cross
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_neg_ratioExponent_bounds' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_neg_ratioExponent_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.scale_lo_helper' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.scale_lo_helper
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.scale_hi_helper' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.scale_hi_helper
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.scale_sub_helper' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.scale_sub_helper
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.powScale_roundRatio_scaled_bounds' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.powScale_roundRatio_scaled_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_bounds' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_bounds
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_le_of_lt_mul' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_le_of_lt_mul
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.roundQuotient_ge_of_mul_le' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.roundQuotient_ge_of_mul_le
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.int_le_max_right' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.int_le_max_right
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.int_max_eq_right' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.int_max_eq_right
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_zeroBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.decodeBits_zeroBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.decodeBits_infBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.decodeBits_infBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.floatToIntValue_of_denotesInt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.floatToIntValue_of_denotesInt
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.encodeTwosComplement_intValueOfBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.encodeTwosComplement_intValueOfBits
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.clampInt_monotone' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.clampInt_monotone
+
+/--
+info: 'Anneal.Mir.IeeeFloatCast.truncRatio_monotone_nonneg' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.IeeeFloatCast.truncRatio_monotone_nonneg
 
 end AxiomGuards
 
