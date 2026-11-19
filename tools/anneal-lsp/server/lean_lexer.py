@@ -168,6 +168,13 @@ class LineCounter:
         self.line = 1
 
     def __call__(self, offset: int) -> int:
+        if offset <= 0:
+            self.off = 0
+            self.line = 1
+            return 1
+        n = len(self.text)
+        if offset > n:
+            offset = n
         if offset >= self.off:
             self.line += self.text.count("\n", self.off, offset)
         elif offset * 2 < self.off:
@@ -182,6 +189,8 @@ def offset_to_line(text_or_offsets: str | list[int], offset: int) -> int:
     """1-based line number of `offset`, given either the text itself (`O(offset)`) or the
     sorted offsets of its `\\n` characters (`O(log N)`). Both forms agree at every offset: a
     newline character belongs to the line it ends."""
+    if offset <= 0:
+        return 1
     if isinstance(text_or_offsets, str):
         return text_or_offsets.count("\n", 0, offset) + 1
     return bisect_left(text_or_offsets, offset) + 1
@@ -394,8 +403,11 @@ def _scan(
                 continue
             # Guillemet identifier `«...»` on one line: everything inside is part of the
             # name. Without a closing `»` on the line, `«` is an ordinary character.
-            g_end = find("»", nxt + 1)
-            if g_end != -1 and find("\n", nxt + 1, g_end) == -1:
+            # Bound the `»` search to the current line so repeated unclosed `«` never
+            # scan quadratically to EOF.
+            nl = find("\n", nxt + 1)
+            g_end = find("»", nxt + 1, n if nl == -1 else nl)
+            if g_end != -1:
                 app(text[nxt : g_end + 1])
                 pos = g_end + 1
             else:
@@ -534,10 +546,10 @@ def _inside_guillemets(stripped: str, pos: int) -> bool:
     g = stripped.rfind("«", line_start, pos)
     if g == -1:
         return False
-    close = stripped.find("»", g + 1)
-    if close == -1 or close < pos:
-        return False
-    return stripped.find("\n", pos, close) == -1
+    nl = stripped.find("\n", pos)
+    line_end = len(stripped) if nl == -1 else nl
+    close = stripped.find("»", g + 1, line_end)
+    return close != -1 and close >= pos
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +588,7 @@ class AttributeSpan(tuple):
         return "AttributeSpan(start_pos=%r, end_pos=%r, line_no=%r, content=%r)" % tuple(self)
 
 
-_CLOSER_OF = {"(": ")", "[": "]", "{": "}"}
+_CLOSER_OF = {"(": ")", "[": "]", "{": "}", "⟨": "⟩"}
 _ATTR_TOKEN_RE = None  # compiled by `_attr_token_re` on first use
 
 
@@ -593,9 +605,15 @@ def _attr_token_re():
         _ATTR_TOKEN_RE = re.compile(
             r"«[^»\n]*»"
             r"|(?<![\w'!?\u00bb])'(?:\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)|[^'\\\n])'"
-            r"|@\[|[\[\](){}]"
+            r"|@\[|[\[\](){}⟨⟩]"
         )
     return _ATTR_TOKEN_RE
+
+
+def _is_as_pattern_at(stripped: str, pos: int) -> bool:
+    """True when `@[` at `pos` immediately follows an identifier (`xs@[a, b]`, `«xs»@[a]`),
+    making it a Lean 4 as-pattern rather than an attribute list opener."""
+    return pos > 0 and (is_ident_char(stripped[pos - 1]) or stripped[pos - 1] == "»")
 
 
 def match_balanced_attribute(stripped: str, pos: int) -> int | None:
@@ -603,23 +621,27 @@ def match_balanced_attribute(stripped: str, pos: int) -> int | None:
     `stripped[pos]`, or `None` when `pos` is not at `@[` or the list is malformed.
 
     `stripped` must be comment- and string-blanked code (see
-    `strip_comments_and_strings_preserving_offsets`). Nested `[...]`, `(...)` and `{...}`
-    are tracked; brackets inside guillemet identifiers and character literals are ignored,
-    and `@[` inside a guillemet identifier (`«@[foo]»`) is not an attribute. The list is
-    malformed, and rejected, when a closing bracket does not match the innermost open one,
-    when another `@[` starts before it is closed (attribute lists do not nest, so a missing
+    `strip_comments_and_strings_preserving_offsets`). Nested `[...]`, `(...)`, `{...}` and
+    `⟨...⟩` are tracked; brackets inside guillemet identifiers and character literals are
+    ignored, and `@[` inside a guillemet identifier (`«@[foo]»`) or attached to an
+    identifier as an as-pattern (`xs@[a, b]`) is not an attribute. The list is malformed,
+    and rejected, when a closing bracket does not match the innermost open one, when another
+    standalone `@[` starts before it is closed (attribute lists do not nest, so a missing
     `]` never swallows the following declaration), or when the text ends first. Every
     rejection stops at the offending token, so scanning is linear.
     """
     if pos < 0 or not stripped.startswith("@[", pos):
         return None
-    if _inside_guillemets(stripped, pos):
+    if _is_as_pattern_at(stripped, pos) or _inside_guillemets(stripped, pos):
         return None
     expected = ["]"]
     for m in _attr_token_re().finditer(stripped, pos + 2):
         tok = m.group()
         if len(tok) != 1:
             if tok == "@[":
+                if _is_as_pattern_at(stripped, m.start()):
+                    expected.append("]")
+                    continue
                 return None
             continue  # guillemet identifier or character literal
         closer = _CLOSER_OF.get(tok)
@@ -699,17 +721,34 @@ _DECL_MODIFIERS = (
     "local",
 )
 
+_NON_CMD_AFTER_CHARS = frozenset(":=<>≤≥≠+-*/,)]}|")
+_NON_CMD_BEFORE_CHARS = frozenset(":=<>≤≥≠+-*/,|([{→")
+_NON_CMD_BEFORE_WORDS = frozenset(
+    (
+        "let", "have", "show", "exact", "apply", "refine", "return", "fun", "λ",
+        "match", "if", "then", "else", "do", "by", "from", "with", "case", "cases",
+        "induction", "rcases", "obtain", "intro", "intros", "rw", "erw", "rewrite",
+        "simp", "dsimp", "simpa", "unfold", "change", "suffices", "where", "for",
+        "while", "unless",
+    )
+)  # fmt: skip
+_SCOPE_BLOCK_WINDOW = 8192
+
 _SCOPE_RES = None  # compiled by `_scope_res` on first use
 
 
 def _scope_res():
     """Compiled regex bundle `(name_re, part_re, bracket_re, line_re, cont_re, cmd_re,
-    in_prefix_re, in_tok_re)` for `NamespaceTracker`, compiled once on first use."""
+    strict_cmd_re, in_prefix_re, in_tok_re)` for `NamespaceTracker`, compiled once on
+    first use."""
     global _SCOPE_RES
     if _SCOPE_RES is None:
         import re  # deferred: importing this module must stay cheap
 
-        part = r"(?:[^\W\d][\w'!?]*|«[^»\n]+»)"
+        # Match Lean 4 `isIdFirst` for non-guillemet parts: exclude digits, binder symbols
+        # (`λ`, `Π`, `Σ`), and Lean subscript letters/digits (`₀`..`ₜ`, `ᵢ`..`ᵪ`, `ⱼ`).
+        id_start = r"[^\W\d\u03bb\u03a0\u03a3\u2080-\u209c\u1d62-\u1d6a\u2c7c]"
+        part = rf"(?:{id_start}[\w'!?]*|«[^»\n]+»)"
         name_re = re.compile(part + r"(?:\." + part + r")*")
         part_re = re.compile(part)
         bracket_re = re.compile(
@@ -730,6 +769,14 @@ def _scope_res():
             r"omit|include|add_decl_doc|register_option|run_cmd|run_elab|run_meta|alias)"
             r"(?![\w'!?.])"
         )
+        # Subset of `cmd_re` that cannot start a tactic inside `:= by ...` on the same line.
+        strict_cmd_re = re.compile(
+            r"#[A-Za-z_]\w*(?!\[)|"
+            r"(?:theorem|lemma|def|abbrev|structure|inductive|class|instance|axiom|opaque|example|"
+            r"end|namespace|section|mutual|declare_syntax_cat|initialize|builtin_initialize|"
+            r"deriving|import|add_decl_doc|register_option|alias)"
+            r"(?![\w'!?.])"
+        )
         in_prefix_re = re.compile(
             r"(?:namespace|section|set_option|open|variable|universe|attribute|include|omit|export|"
             r"notation|infix|infixl|infixr|prefix|postfix|macro|macro_rules|syntax|elab|elab_rules)"
@@ -747,10 +794,26 @@ def _scope_res():
             line_re,
             cont_re,
             cmd_re,
+            strict_cmd_re,
             in_prefix_re,
             in_tok_re,
         )
     return _SCOPE_RES
+
+
+def _merge_spans(raw: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not raw:
+        return []
+    raw.sort()
+    merged = [raw[0]]
+    for lo, hi in raw[1:]:
+        prev_lo, prev_hi = merged[-1]
+        if lo <= prev_hi:
+            if hi > prev_hi:
+                merged[-1] = (prev_lo, hi)
+        else:
+            merged.append((lo, hi))
+    return merged
 
 
 def _closed_bracket_spans(stripped: str, bracket_re) -> list[tuple[int, int]]:
@@ -772,26 +835,15 @@ def _closed_bracket_spans(stripped: str, bracket_re) -> list[tuple[int, int]]:
             raw.append((open_pos, m.start()))
         else:
             stack.clear()
-    if not raw:
-        return []
-    raw.sort()
-    merged = [raw[0]]
-    for lo, hi in raw[1:]:
-        prev_lo, prev_hi = merged[-1]
-        if lo <= prev_hi:
-            if hi > prev_hi:
-                merged[-1] = (prev_lo, hi)
-        else:
-            merged.append((lo, hi))
-    return merged
+    return _merge_spans(raw)
 
 
 def _quotation_spans(stripped: str, bracket_re) -> list[tuple[int, int]]:
-    """`(open_pos, close_pos)` spans of Lean syntax quotations (`` `(...) `` / `` `[...] ``)."""
+    """Merged `(open_pos, close_pos)` spans of Lean syntax quotations (`` `(...) ``,
+    `` `[...] ``, `` `{...} ``)."""
     spans: list[tuple[int, int]] = []
     find = stripped.find
-    n = len(stripped)
-    for opener, closer_ch in (("`(", ")"), ("`[", "]")):
+    for opener, closer_ch in (("`(", ")"), ("`[", "]"), ("`{", "}")):
         q = find(opener)
         while q != -1:
             open_pos = q + 1
@@ -816,8 +868,7 @@ def _quotation_spans(stripped: str, bracket_re) -> list[tuple[int, int]]:
                 q = -1
             if q != -1 and q <= open_pos:
                 q = find(opener, open_pos + 1)
-    spans.sort()
-    return spans
+    return _merge_spans(spans)
 
 
 def _inside_spans(spans: list[tuple[int, int]], pos: int) -> bool:
@@ -827,7 +878,63 @@ def _inside_spans(spans: list[tuple[int, int]], pos: int) -> bool:
     return i >= 0 and spans[i][0] < pos < spans[i][1]
 
 
-def _scope_keyword_hits(stripped: str, bracket_re) -> list[tuple[int, str]]:
+def _is_non_command_scope_token(stripped: str, pos: int, kw: str, line_start: int, n: int) -> bool:
+    """True when a standalone `namespace`/`section`/`mutual`/`end` token at `pos` is in
+    expression/field/tactic position rather than a top-level scope command."""
+    after = pos + len(kw)
+    k = after
+    while k < n and stripped[k] in _WHITESPACE:
+        k += 1
+    if k < n and stripped[k] in _NON_CMD_AFTER_CHARS:
+        return True
+    b = pos - 1
+    while b >= line_start and stripped[b] in " \t":
+        b -= 1
+    if b >= line_start:
+        ch = stripped[b]
+        if ch in _NON_CMD_BEFORE_CHARS:
+            return True
+        if is_ident_char(ch) or ch == "λ":
+            w_start = b
+            while w_start > line_start and is_ident_char(stripped[w_start - 1]):
+                w_start -= 1
+            if stripped[w_start : b + 1] in _NON_CMD_BEFORE_WORDS:
+                return True
+    return False
+
+
+def _enclosing_col0_block(stripped: str, pos: int, line_start: int, cmd_re, n: int) -> tuple[int, int]:
+    """Bounded `(blk_start, blk_end)` enclosing `pos` between column-0 command lines."""
+    lo_limit = max(0, line_start - _SCOPE_BLOCK_WINDOW)
+    blk_start = lo_limit
+    cur = line_start
+    while cur > lo_limit:
+        prev_nl = stripped.rfind("\n", lo_limit, cur)
+        cand = 0 if prev_nl == -1 else prev_nl + 1
+        if cand < n and stripped[cand] not in _WHITESPACE:
+            kw_pos = _skip_attrs_and_mods(stripped, cand)
+            if cmd_re.match(stripped, kw_pos) is not None:
+                blk_start = cand
+                break
+        if prev_nl == -1:
+            blk_start = 0
+            break
+        cur = prev_nl
+    hi_limit = min(n, pos + _SCOPE_BLOCK_WINDOW)
+    blk_end = hi_limit
+    cur = stripped.find("\n", pos, hi_limit)
+    while cur != -1 and cur + 1 < hi_limit:
+        cand = cur + 1
+        if stripped[cand] not in _WHITESPACE:
+            kw_pos = _skip_attrs_and_mods(stripped, cand)
+            if cmd_re.match(stripped, kw_pos) is not None:
+                blk_end = cand
+                break
+        cur = stripped.find("\n", cand, hi_limit)
+    return blk_start, blk_end
+
+
+def _scope_keyword_hits(stripped: str, bracket_re, cmd_re) -> list[tuple[int, str]]:
     """Offsets of standalone top-level `namespace`, `section`, `mutual` and `end` tokens,
     sorted by offset."""
     n = len(stripped)
@@ -857,16 +964,20 @@ def _scope_keyword_hits(stripped: str, bracket_re) -> list[tuple[int, str]]:
     hits.sort()
     quot_spans = (
         _quotation_spans(stripped, bracket_re)
-        if ("`(" in stripped or "`[" in stripped)
+        if ("`(" in stripped or "`[" in stripped or "`{" in stripped)
         else []
     )
     filtered: list[tuple[int, str]] = []
     cached_line_start = -1
     cached_line_spans: list[tuple[int, int]] = []
+    cached_blk_bounds = (-1, -1)
+    cached_blk_spans: list[tuple[int, int]] = []
     for p, kw in hits:
         if quot_spans and _inside_spans(quot_spans, p):
             continue
         line_start = stripped.rfind("\n", 0, p) + 1
+        if _is_non_command_scope_token(stripped, p, kw, line_start, n):
+            continue
         prefix = stripped[line_start:p]
         if any(c in prefix for c in "([{"):
             if line_start != cached_line_start:
@@ -880,6 +991,18 @@ def _scope_keyword_hits(stripped: str, bracket_re) -> list[tuple[int, str]]:
                 ]
             if _inside_spans(cached_line_spans, p):
                 continue
+        if p > line_start:
+            blk_bounds = _enclosing_col0_block(stripped, p, line_start, cmd_re, n)
+            blk_start, blk_end = blk_bounds
+            if blk_start < line_start and any(c in stripped[blk_start:line_start] for c in "([{"):
+                if blk_bounds != cached_blk_bounds:
+                    cached_blk_bounds = blk_bounds
+                    cached_blk_spans = [
+                        (blk_start + lo, blk_start + hi)
+                        for lo, hi in _closed_bracket_spans(stripped[blk_start:blk_end], bracket_re)
+                    ]
+                if _inside_spans(cached_blk_spans, p):
+                    continue
         filtered.append((p, kw))
     return filtered
 
@@ -932,12 +1055,16 @@ def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[
     `end_offset` is the offset where the governed command ends (`in_end` when `in` is
     dangling before `end` or EOF).
     """
-    _, _, _, line_re, cont_re, cmd_re, in_prefix_re, in_tok_re = _scope_res()
+    _, _, _, line_re, cont_re, cmd_re, strict_cmd_re, in_prefix_re, in_tok_re = _scope_res()
     n = len(stripped)
 
     def is_cmd_start(cand: int) -> bool:
         kw = _skip_attrs_and_mods(stripped, cand)
         return cmd_re.match(stripped, kw) is not None
+
+    def is_strict_top_cmd(cand: int) -> bool:
+        kw = _skip_attrs_and_mods(stripped, cand)
+        return strict_cmd_re.match(stripped, kw) is not None
 
     # Advance past any chained `<cmd> in` prefixes (`open ... in`, `set_option ... in`,
     # `namespace ... in`, ...) and leading `@[...]` / modifiers to the target command head.
@@ -996,7 +1123,8 @@ def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[
     if line_end == -1:
         line_end = n
     depth = 0
-    saw_body = False
+    body_eq_end = -1
+    in_by_tactic = False
     after_head = cmd_re.match(stripped, p)
     scan_from = after_head.end() if after_head is not None else p
     for tm in in_tok_re.finditer(stripped, scan_from, line_end):
@@ -1010,25 +1138,56 @@ def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[
                 depth -= 1
         elif depth == 0:
             if tok == ";":
-                return tm.start(), False
-            if tok == ":=":
-                saw_body = True
-    if saw_body:
-        # Look for an inline command keyword after `:= <atom>` on the same line.
-        body_pos = stripped.find(":=", scan_from, line_end) + 2
+                if not in_by_tactic:
+                    return tm.start(), False
+                after_semi = tm.end()
+                while after_semi < line_end and stripped[after_semi] in " \t":
+                    after_semi += 1
+                if after_semi < line_end and is_strict_top_cmd(after_semi):
+                    return tm.start(), False
+            elif tok == ":=" and body_eq_end == -1:
+                body_eq_end = tm.end()
+                after_eq = body_eq_end
+                while after_eq < line_end and stripped[after_eq] in " \t":
+                    after_eq += 1
+                if stripped.startswith("by", after_eq) and (
+                    after_eq + 2 >= line_end
+                    or not (is_ident_char(stripped[after_eq + 2]) or stripped[after_eq + 2] == ".")
+                ):
+                    in_by_tactic = True
+    if body_eq_end != -1:
+        # Look for an inline command keyword after `:= <atom>` at bracket depth 0 on the same
+        # line. Inside `:= by ...`, tactic-mode prefixes (`open`, `set_option`, ...) belong
+        # to the proof block rather than starting a sibling top-level command.
+        body_pos = body_eq_end
         while body_pos < line_end and stripped[body_pos] in " \t":
             body_pos += 1
-        # Skip the first token of the inline body before checking for a sibling command.
-        while body_pos < line_end and stripped[body_pos] not in " \t":
-            body_pos += 1
+        b_depth = 0
+        saw_atom = False
         while body_pos < line_end:
-            while body_pos < line_end and stripped[body_pos] in " \t":
+            ch = stripped[body_pos]
+            if ch in " \t":
+                if b_depth == 0:
+                    saw_atom = True
                 body_pos += 1
-            if body_pos >= line_end:
-                break
-            if is_cmd_start(body_pos):
-                return body_pos, False
-            while body_pos < line_end and stripped[body_pos] not in " \t":
+                continue
+            if ch == "«":
+                g_end = stripped.find("»", body_pos + 1, line_end)
+                body_pos = g_end + 1 if g_end != -1 else body_pos + 1
+                continue
+            if ch in "({[":
+                b_depth += 1
+                body_pos += 1
+                continue
+            if ch in ")}]":
+                if b_depth > 0:
+                    b_depth -= 1
+                body_pos += 1
+                continue
+            if b_depth == 0 and saw_atom:
+                if is_strict_top_cmd(body_pos) if in_by_tactic else is_cmd_start(body_pos):
+                    return body_pos, False
+            while body_pos < line_end and stripped[body_pos] not in " \t(){}[]«":
                 body_pos += 1
 
     # Multi-line scan: any non-continuation command starting at `indent <= cmd_indent` ends
@@ -1123,7 +1282,7 @@ class NamespaceTracker:
         if stripped is None or len(stripped) != len(text):
             stripped = strip_comments_and_strings_preserving_offsets(text)
         n = len(stripped)
-        name_re, part_re, bracket_re, *_ = _scope_res()
+        name_re, part_re, bracket_re, _, _, cmd_re, *_ = _scope_res()
         line_of = LineCounter(stripped)
         offsets: list[int] = []
         namespaces: list[tuple[str, ...]] = []
@@ -1183,7 +1342,7 @@ class NamespaceTracker:
                 return -1
             return k + 2
 
-        for pos, kw in _scope_keyword_hits(stripped, bracket_re):
+        for pos, kw in _scope_keyword_hits(stripped, bracket_re, cmd_re):
             if pos < consumed:
                 continue
             flush_pending_up_to(pos)

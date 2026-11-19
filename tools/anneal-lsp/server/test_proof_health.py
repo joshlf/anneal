@@ -5716,5 +5716,206 @@ class TestEpisode2ProjectionAndRewriteOrderHazards(unittest.TestCase):
             f"ByteCodec incremental scan with advisories took {inc_ms:.2f} ms",
         )
 
+    def test_shared_auditor_section_remains_byte_identical(self) -> None:
+        ph_text = (SERVER_DIR / "proof_health.py").read_text(encoding="utf-8")
+        ct_text = CHECK_TRUSTED_PATH.read_text(encoding="utf-8")
+        self.assertEqual(_shared_section(ph_text), _shared_section(ct_text))
+
+    def test_b1_lexer_attribute_namespace_and_advisory_regressions(self) -> None:
+        import lean_lexer
+
+        # 1. Negative / out-of-bounds offsets must clamp cleanly in `LineCounter` & `offset_to_line`.
+        sample = "a\nb\nc"
+        nl_offsets = [1, 3]
+        lc = lean_lexer.LineCounter(sample)
+        self.assertEqual(lean_lexer.offset_to_line(sample, -1), 1)
+        self.assertEqual(lean_lexer.offset_to_line(nl_offsets, -1), 1)
+        self.assertEqual(lc(-5), 1)
+        self.assertEqual(lc(0), 1)
+        self.assertEqual(lc(4), 3)
+        self.assertEqual(lc(999), 3)
+        self.assertEqual(lc(2), 2)
+
+        # 2. Unclosed `«` followed by a distant `»` must stay linear (not scan to EOF per `«`).
+        unclosed_stress = ("def x := «unclosed\n" * 1000) + "»\n"
+        self.assertEqual(
+            lean_lexer.strip_comments_and_strings_preserving_offsets(unclosed_stress),
+            unclosed_stress,
+        )
+        stress_ms = best_of_ms(
+            lambda: lean_lexer.strip_comments_and_strings_preserving_offsets(unclosed_stress),
+            budget_ms=5.0,
+        )
+        self.assertLess(stress_ms, 5.0, f"Unclosed guillemet scan took {stress_ms:.2f} ms")
+
+        # 3. Balanced attributes: reject as-patterns `xs@[a, b]`, allow them nested inside `@[...]`,
+        # and track `⟨...⟩` bracket matching.
+        attr_src = (
+            "def f := fun xs@[a, b] => xs\n"
+            "@[my_attr (fun xs@[a, b] => xs)]\n"
+            "theorem t1 : True := trivial\n"
+            "@[bad ⟨a, b]\n"
+            "@[ok ⟨a, b⟩] def g : Nat := 0\n"
+        )
+        self.assertEqual(
+            [(a.line_no, a.content) for a in lean_lexer.scan_balanced_attributes(attr_src)],
+            [(2, "my_attr (fun xs@[a, b] => xs)"), (5, "ok ⟨a, b⟩")],
+        )
+
+        # 4. NamespaceTracker: multi-line brackets, `{...}` and nested syntax quotations,
+        # non-command `end` / `section` tokens, `namespace ... in` with `:= by ...; ...` /
+        # `:= by open ... in ...` / default-arg `:=`, and rejecting binder `λ` as scope name.
+        ns_multiline = (
+            "namespace Foo\n"
+            "def f (\n"
+            "  section : Nat\n"
+            ") : Nat := section\n"
+            "def q1 := `{\n"
+            "  namespace Bar\n"
+            "  def x := 1\n"
+            "  end Bar\n"
+            "}\n"
+            "def q2 := `(command|\n"
+            "  def inner := `[tactic| exact 1]\n"
+            "  namespace Fake\n"
+            "  end Fake\n"
+            ")\n"
+            "structure Span where\n"
+            "  start : Nat\n"
+            "  end : Nat\n"
+            "def mkSpan (s e : Nat) : Span :=\n"
+            "  { start := s,\n"
+            "    end := e }\n"
+            "theorem tac (h : Nat) : Nat := by\n"
+            "  let end := h\n"
+            "  exact end\n"
+            "def stillInFoo : Nat := 0\n"
+            "end Foo\n"
+            "section λ\n"
+            "  def inAnonSec : Nat := 1\n"
+            "end\n"
+        )
+        tr = lean_lexer.track_namespaces(ns_multiline)
+        self.assertEqual(tr.violations, ())
+        self.assertEqual(tr.namespace_at(ns_multiline.index("def stillInFoo")), ("Foo",))
+        self.assertEqual(tr.namespace_at(ns_multiline.index("def inAnonSec")), ())
+
+        ns_in_cases = (
+            "namespace A in theorem t1 : True := by simp; trivial\n"
+            "def out1 := 0\n"
+            "namespace B in theorem t2 : True := by open Classical in trivial\n"
+            "def out2 := 0\n"
+            "namespace C in def f (x : Nat := 0) (y : Nat := by open Nat; exact 1) : Nat := x\n"
+            "def out3 := 0\n"
+        )
+        tr_in = lean_lexer.track_namespaces(ns_in_cases)
+        self.assertEqual(tr_in.violations, ())
+        self.assertEqual(tr_in.namespace_at(ns_in_cases.index("trivial")), ("A",))
+        self.assertEqual(tr_in.namespace_at(ns_in_cases.index("def out1")), ())
+        self.assertEqual(
+            tr_in.namespace_at(ns_in_cases.index("trivial", ns_in_cases.index("t2"))),
+            ("B",),
+        )
+        self.assertEqual(tr_in.namespace_at(ns_in_cases.index("def out2")), ())
+        self.assertEqual(tr_in.namespace_at(ns_in_cases.index(":= x")), ("C",))
+        self.assertEqual(tr_in.namespace_at(ns_in_cases.index("def out3")), ())
+
+        # 5. Advisory hazard regressions: `simpa ... at h using ...`, exact `dsimp only` unfold
+        # matching (rejecting `advanceStmt_*`, `-advanceStmt`, `← advanceStmt`, and wrong-target
+        # `dsimp only [advanceStmt] at hOther`), nested `show` inside `change`, trailing comments /
+        # spaces / CRLF in `try rw ... at ...`, `try` blocks with parenthesised first step, and
+        # no false positives on indented tactics (`push_neg at ⊢`) or term-position `try`.
+        R_PROJ = proof_health.RULE_SIMP_DEEP_PROJECTION_CHAIN
+        S_ARG = proof_health.SUBRULE_PROJECTION_IN_SIMP_ARGS
+        S_STMT = proof_health.SUBRULE_SIMP_AFTER_PROJECTION_STATEMENT
+        R_TRY = proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET
+
+        adv_pos = (
+            "theorem p : P := by\n"
+            "  simpa [foo] at h using bar (advanceStmt s l m).memory.locals\n"
+            "  change (advanceStmt s l m).memory.locals = l\n"
+            "  dsimp only [advanceStmt_locals_eq]\n"
+            "  simp\n"
+            "  change (advanceStmt s l m).memory.locals = l\n"
+            "  dsimp only [-advanceStmt, ← advanceStmt]\n"
+            "  simp\n"
+            "  change (advanceStmt s l m).memory.locals = l\n"
+            "  dsimp only [advanceStmt] at hOther\n"
+            "  simp\n"
+            "  change (show (advanceStmt s l m).memory.locals = l from h)\n"
+            "  simp\n"
+            "  try rw [h1] at hEval -- comment before turnstile\n"
+            "    ⊢\n"
+            "  try rw [h1] at \n"
+            "    hEval ⊢\n"
+            "  try\n"
+            "    (simp [h1])\n"
+            "    rw [h2] at hEval ⊢\n"
+            "  try (simp [h1]) <;> rw [h2] at hEval ⊢\n"
+        )
+        got_pos = [
+            (f.line, f.rule, f.subrule, f.symbol)
+            for f in proof_health.scan_projection_and_rewrite_order_hazards(adv_pos)
+        ]
+        self.assertEqual(
+            got_pos,
+            [
+                (2, R_PROJ, S_ARG, "(advanceStmt ...).memory.locals"),
+                (5, R_PROJ, S_STMT, "(advanceStmt ...).memory.locals"),
+                (8, R_PROJ, S_STMT, "(advanceStmt ...).memory.locals"),
+                (11, R_PROJ, S_STMT, "(advanceStmt ...).memory.locals"),
+                (13, R_PROJ, S_STMT, "(advanceStmt ...).memory.locals"),
+                (14, R_TRY, "", "try rw [...] at hEval ⊢"),
+                (16, R_TRY, "", "try rw [...] at hEval ⊢"),
+                (20, R_TRY, "", "try rw [...] at hEval ⊢"),
+                (21, R_TRY, "", "try rw [...] at hEval ⊢"),
+            ],
+        )
+
+        # CRLF multi-line `at` clause
+        crlf_src = "theorem p : P := by\r\n  try rw [h1] at hEval\r\n    ⊢\r\n"
+        self.assertEqual(
+            [(f.line, f.rule, f.symbol) for f in proof_health.scan_projection_and_rewrite_order_hazards(crlf_src)],
+            [(2, R_TRY, "try rw [...] at hEval ⊢")],
+        )
+
+        # Negative regressions: goal-collapsing `dsimp only [advanceStmt] at h ⊢`, `change ... at h`
+        # followed by `dsimp only [advanceStmt] at h`, indented tactic with `at ⊢` after `try rw`,
+        # and term-position `try`.
+        adv_neg = (
+            "theorem clean (try : Nat → Nat) : P := by\n"
+            "  change (advanceStmt s l m).memory.locals = l\n"
+            "  dsimp only [Mir.advanceStmt] at hOther ⊢\n"
+            "  simp\n"
+            "  change (advanceStmt s l m).memory.locals = l at h\n"
+            "  dsimp only [advanceStmt] at h\n"
+            "  simp\n"
+            "  try rw [h1] at hEval\n"
+            "    push_neg at ⊢\n"
+            "  try rw [h1] at hEval\n"
+            "    custom_user_tactic at ⊢\n"
+            "  have _ := try (by\n"
+            "    rw [h] at hEval ⊢\n"
+            "    exact 0)\n"
+        )
+        self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(adv_neg), [])
+
+        # 6. Symmetric memo derivation: scanning with `include_advisories=True` first and then
+        # `include_advisories=False` must reuse cached results without re-scanning.
+        sym_src = "theorem t (h hEval : 1 = 1) : 1 = 1 := by\n  try rw [h] at hEval ⊢\n  exact h\n"
+        clear_in_process_caches()
+        with patch.object(
+            proof_health, "_scan_lean_text_uncached", wraps=proof_health._scan_lean_text_uncached
+        ) as spy:
+            adv_first = proof_health.scan_lean_text(
+                sym_src, scan_siblings=False, include_advisories=True
+            )
+            def_second = proof_health.scan_lean_text(
+                sym_src, scan_siblings=False, include_advisories=False
+            )
+            self.assertEqual(len(adv_first), 1)
+            self.assertEqual(def_second, [])
+            self.assertEqual(spy.call_count, 1)
+
 if __name__ == "__main__":
     unittest.main()

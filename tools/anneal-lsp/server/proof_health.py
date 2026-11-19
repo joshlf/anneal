@@ -2152,15 +2152,42 @@ def scan_lean_text(
                 )
                 merged.sort(key=lambda f: (f.line, f.rule, f.symbol, f.subrule))
                 merged_tup = tuple(merged)
+                _SCAN_RESULT_CACHE.pop(cache_key, None)
                 _SCAN_RESULT_CACHE[cache_key] = (text, sib_names, sib_lists, merged_tup)
                 while len(_SCAN_RESULT_CACHE) > _SCAN_RESULT_CACHE_MAX:
                     del _SCAN_RESULT_CACHE[next(iter(_SCAN_RESULT_CACHE))]
                 if base_prev is not None and base_prev[0] == text:
+                    if len(_LAST_LEAN_SCAN) >= 16:
+                        _LAST_LEAN_SCAN.clear()
                     _LAST_LEAN_SCAN[(cache_key[3], cache_key[4], cache_key[5], True)] = (
                         *base_prev[:6],
                         merged_tup,
                     )
                 return merged
+        else:
+            adv_hit = _SCAN_RESULT_CACHE.get((*cache_key[:6], True))
+            if (
+                adv_hit is not None
+                and adv_hit[0] == text
+                and adv_hit[1] == sib_names
+                and len(adv_hit[2]) == len(sib_lists)
+                and all(a is b for a, b in zip(adv_hit[2], sib_lists))
+            ):
+                filtered = [f for f in adv_hit[3] if f.rule not in _ADVISORY_RULE_SET]
+                filtered_tup = tuple(filtered)
+                _SCAN_RESULT_CACHE.pop(cache_key, None)
+                _SCAN_RESULT_CACHE[cache_key] = (text, sib_names, sib_lists, filtered_tup)
+                while len(_SCAN_RESULT_CACHE) > _SCAN_RESULT_CACHE_MAX:
+                    del _SCAN_RESULT_CACHE[next(iter(_SCAN_RESULT_CACHE))]
+                adv_prev = _LAST_LEAN_SCAN.get((cache_key[3], cache_key[4], cache_key[5], True))
+                if adv_prev is not None and adv_prev[0] == text:
+                    if len(_LAST_LEAN_SCAN) >= 16:
+                        _LAST_LEAN_SCAN.clear()
+                    _LAST_LEAN_SCAN[(cache_key[3], cache_key[4], cache_key[5], False)] = (
+                        *adv_prev[:6],
+                        filtered_tup,
+                    )
+                return filtered
     findings = _scan_lean_text_uncached(
         text,
         file_path=file_path,
@@ -2626,6 +2653,53 @@ _ADV_STEP_STOPS = frozenset((";", "<;>"))
 _ADV_USING_STOPS = frozenset((";", "<;>", ","))
 _ADV_NO_STOPS: frozenset[str] = frozenset()
 _ADV_TURNSTILES = ("⊢", "|-")
+_ADV_LOC_STOP_WORDS: frozenset[str] = _UNFOLD_STOP_WORDS | frozenset(
+    (
+        "try",
+        "erw",
+        "rewrite",
+        "rwa",
+        "all_goals",
+        "any_goals",
+        "repeat",
+        "repeat'",
+        "focus",
+        "first",
+        "push_neg",
+        "ring",
+        "ring_nf",
+        "norm_num",
+        "norm_cast",
+        "field_simp",
+        "aesop",
+        "grind",
+        "linarith",
+        "nlinarith",
+        "clear",
+        "subst",
+        "revert",
+        "generalize",
+        "generalize_proofs",
+        "specialize",
+        "split",
+        "rename_i",
+        "congr",
+        "ext",
+        "funext",
+        "tauto",
+        "exfalso",
+        "left",
+        "right",
+        "use",
+        "then",
+        "else",
+        "for",
+        "while",
+        "unless",
+    )
+)
+_ADV_NON_TACTIC_BEFORE_TRY_CHARS = frozenset(":=+-*/,→")
+_ADV_NON_TACTIC_BEFORE_TRY_WORDS = frozenset(("let", "exact", "apply", "return", "fun", "λ"))
 _ADV_GUI_OR_CHAR = (
     r"«[^»\n]*»"
     r"|(?<![\w'!?\u00bb])'(?:\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)|[^'\\\n])'"
@@ -2640,6 +2714,7 @@ class _AdvisoryRegexes:
         "step_token",
         "bracket",
         "projection",
+        "advance_stmt_sym",
         "config_item",
         "step_prefix",
         "rw_head",
@@ -2659,6 +2734,10 @@ class _AdvisoryRegexes:
         self.bracket = re.compile(_ADV_GUI_OR_CHAR + r"|[()\[\]{}⟨⟩]")
         # One projection: `.field`, `.1`, `.«field»`.
         self.projection = re.compile(r"\.(?:[^\W\d][\w'!?]*|\d+|«[^»\n]+»)")
+        # Unfolded `advanceStmt` symbol (optionally qualified or `.eq_def` / `.eq_unfold` / `.eq_N`).
+        self.advance_stmt_sym = re.compile(
+            _IDENT_BEFORE + _QUAL_PREFIX + r"advanceStmt" + _UNFOLD_EQ_SUFFIX + _IDENT_AFTER
+        )
         # `(config := ...)`, `(disch := ...)`, `(occs := ...)`: a named argument group.
         self.config_item = re.compile(r"\(\s*[^\W\d][\w'!?]*\s*:=")
         # Combinators that run the tactic after them on the current goal(s).
@@ -2787,6 +2866,56 @@ def _adv_scan_to(
     return hard_end, "", -1
 
 
+def _adv_scan_at_locations(
+    stripped: str, at_end: int, n: int, rw_col: int, *, stop_before_using: bool = False
+) -> tuple[list[str], int]:
+    """Scan the location list following `at` (ending at `at_end`), crossing blank/comment
+    tails and CRLF line breaks into lines indented strictly past `rw_col`. Returns
+    `(locations, stop_offset)` stopping before tactic/clause keywords."""
+    res = _advisory_regexes()
+    location = res.location
+    next_line = res.next_line
+    locs: list[str] = []
+    k = at_end
+    while True:
+        m = location.match(stripped, k)
+        if m is not None:
+            tok = m.group(1)
+            if (stop_before_using and tok == "using") or tok in _ADV_LOC_STOP_WORDS:
+                return locs, m.start(1)
+            locs.append(tok)
+            k = m.end()
+            continue
+        k_eol = k
+        while k_eol < n and stripped[k_eol] in " \t\r":
+            k_eol += 1
+        if k_eol < n and stripped[k_eol] == "\n":
+            line = next_line.match(stripped, k_eol + 1)
+            nxt_k = line.end()
+            if nxt_k < n and nxt_k - line.start(1) > rw_col:
+                m = location.match(stripped, nxt_k)
+                if m is not None:
+                    tok = m.group(1)
+                    if (stop_before_using and tok == "using") or tok in _ADV_LOC_STOP_WORDS:
+                        return locs, m.start(1)
+                    locs.append(tok)
+                    k = m.end()
+                    continue
+        return locs, k
+
+
+def _bracket_unfolds_advance_stmt(bracket_text: str) -> bool:
+    """True when `dsimp only [<bracket_text>]` actually unfolds `advanceStmt` (or a
+    qualified / `.eq_def` form), excluding erasures `-advanceStmt`, reverse rewrites
+    `← advanceStmt`, unrelated `advanceStmt_*` lemmas, or argument occurrences."""
+    if "advanceStmt" not in bracket_text:
+        return False
+    for m in _advisory_regexes().advance_stmt_sym.finditer(bracket_text):
+        if _is_simp_unfold_entry(bracket_text, m.start(), m.end()):
+            return True
+    return False
+
+
 def _parse_simp_call(
     stripped: str, s_idx: int, n: int, has_guillemets: bool = False
 ) -> tuple[str, bool, int, bool, str] | None:
@@ -2797,7 +2926,8 @@ def _parse_simp_call(
 
     `stripped[s_idx:end]` is everything the call hands to `simp`: named argument groups
     (`(config := ...)`, `(disch := ...)`), `+opt` / `-opt`, `only`, the `[...]` lemma list
-    and, for `simpa`, the `using` term. A call without any of these ends at its keyword.
+    and, for `simpa`, the optional `at <locs>` and `using` term. A call without any of these
+    ends at its keyword.
     """
     if has_guillemets and lean_lexer._inside_guillemets(stripped, s_idx):
         return None
@@ -2858,11 +2988,13 @@ def _parse_simp_call(
         else:
             break
     if variant == "a":
+        step_col = _adv_step_col(stripped, s_idx)
         k = _adv_skip_ws(stripped, end, n)
+        if _adv_word_at(stripped, k, "at", n):
+            _, k = _adv_scan_at_locations(stripped, k + 2, n, step_col, stop_before_using=True)
+            k = _adv_skip_ws(stripped, k, n)
         if _adv_word_at(stripped, k, "using", n):
-            end = _adv_scan_to(
-                stripped, k + 5, n, _adv_step_col(stripped, s_idx) + 1, _ADV_USING_STOPS
-            )[0]
+            end = _adv_scan_to(stripped, k + 5, n, step_col + 1, _ADV_USING_STOPS)[0]
     return tactic_kind, is_dsimp, end, has_only, bracket_text
 
 
@@ -2962,14 +3094,20 @@ def _enclosing_simp_call(
 
 
 def _simp_step_at(
-    stripped: str, p: int, n: int, has_guillemets: bool = False
+    stripped: str,
+    p: int,
+    n: int,
+    has_guillemets: bool = False,
+    *,
+    goal_only: bool = False,
 ) -> tuple[str, int] | None:
     """`(tactic_kind, offset)` when the tactic step starting at `p` is a simp-family call
     other than `dsimp` (or follows a `dsimp only [...]` step that did not unfold
-    `advanceStmt`), looking through focusing bullets, parentheses and the combinators
-    `try` / `all_goals` / `any_goals` / `repeat` / `focus`."""
+    `advanceStmt`, or for a goal-only statement a `dsimp ... at <hyps>` that did not touch
+    the goal), looking through focusing bullets, parentheses and the combinators `try` /
+    `all_goals` / `any_goals` / `repeat` / `focus`."""
     step_prefix = _advisory_regexes().step_prefix
-    for _ in range(3):
+    for _ in range(8):
         step_col = _adv_col(stripped, p) if 0 <= p < n else 0
         for _ in range(8):
             if p < 0 or p >= n:
@@ -2993,9 +3131,19 @@ def _simp_step_at(
         tactic_kind, is_dsimp, call_end, has_only, bracket_text = call
         if not is_dsimp:
             return tactic_kind, s
-        # `dsimp only [...]` that does not mention `advanceStmt` leaves `(advanceStmt ...)`
-        # uncollapsed for a `simp` on the immediately following tactic step.
-        if not has_only or "advanceStmt" in bracket_text:
+        # `dsimp` silences the hazard only if it collapses `advanceStmt` on the affected
+        # target: `dsimp only [...]` without an unfolded `advanceStmt` entry, or (for a
+        # goal-only statement) `dsimp ... at <hyps>` without `⊢` / `|-` / `*`, leaves the
+        # projection chain uncollapsed for the immediately following `simp`.
+        unfolds_adv = (not has_only) or _bracket_unfolds_advance_stmt(bracket_text)
+        touches_target = True
+        if unfolds_adv and goal_only:
+            at_k = _adv_skip_ws(stripped, call_end, n)
+            if _adv_word_at(stripped, at_k, "at", n):
+                d_locs, _ = _adv_scan_at_locations(stripped, at_k + 2, n, step_col)
+                if d_locs and not any(loc in _ADV_TURNSTILES or loc == "*" for loc in d_locs):
+                    touches_target = False
+        if unfolds_adv and touches_target:
             return None
         _, tok, nxt = _adv_scan_to(stripped, call_end, n, step_col + 1, _ADV_STEP_STOPS)
         if tok in (";", "<;>"):
@@ -3044,6 +3192,7 @@ def _simp_after_statement(
         end, tok, nxt = _adv_scan_to(stripped, kw_end, n, col + 1, _ADV_STATEMENT_STOPS)
         if end < b:
             continue  # this statement ends before the chain does: try an enclosing one
+        statement_has_at = tok == "at"
         p = -1
         if tok in (":=", "from", "by"):
             p = _adv_skip_ws(stripped, nxt, n)
@@ -3060,11 +3209,38 @@ def _simp_after_statement(
                 p = _adv_skip_ws(stripped, nxt, n)
             elif tok == "\n" and _adv_col(stripped, nxt) == col:
                 p = nxt
-        step = _simp_step_at(stripped, p, n, has_guillemets) if p != -1 else None
+        goal_only = statement_kw in ("change", "show") and not statement_has_at
+        step = (
+            _simp_step_at(stripped, p, n, has_guillemets, goal_only=goal_only)
+            if p != -1
+            else None
+        )
         if step is None:
-            return None
+            continue  # inner term/statement did not lead to `simp`: try an enclosing one
         return statement_kw, kw_pos, step[0], step[1]
     return None
+
+
+def _is_non_tactic_try(stripped: str, t: int) -> bool:
+    """True when `try` at `t` sits immediately after a term-position operator or keyword
+    on the same line (e.g. `have _ := try (by ...)`), so it is a term rather than the
+    `try` tactic."""
+    line_start = stripped.rfind("\n", 0, t) + 1
+    b = t - 1
+    while b >= line_start and stripped[b] in " \t":
+        b -= 1
+    if b < line_start:
+        return False
+    ch = stripped[b]
+    if ch in _ADV_NON_TACTIC_BEFORE_TRY_CHARS:
+        return True
+    if _is_ident_char(ch) or ch == "λ":
+        w_start = b
+        while w_start > line_start and _is_ident_char(stripped[w_start - 1]):
+            w_start -= 1
+        if stripped[w_start : b + 1] in _ADV_NON_TACTIC_BEFORE_TRY_WORDS:
+            return True
+    return False
 
 
 def _try_rewrite_hyp_before_target(
@@ -3082,7 +3258,6 @@ def _try_rewrite_hyp_before_target(
     n = len(stripped)
     find = stripped.find
     rw_head = res.rw_head
-    location = res.location
     config_item = res.config_item
     flat_line = res.flat_line
     next_line = res.next_line
@@ -3113,23 +3288,7 @@ def _try_rewrite_hyp_before_target(
         if not _adv_word_at(stripped, at_pos, "at", n):
             return
         rw_col = _adv_step_col(stripped, h_pos)
-        locs: list[str] = []
-        k = at_pos + 2
-        while True:
-            m = location.match(stripped, k)
-            if m is None:
-                if k < n and stripped[k] == "\n":
-                    line = next_line.match(stripped, k + 1)
-                    nxt_k = line.end()
-                    if nxt_k < n and nxt_k - line.start(1) > rw_col:
-                        m = location.match(stripped, nxt_k)
-                        if m is not None and m.group(1) not in _UNFOLD_STOP_WORDS:
-                            locs.append(m.group(1))
-                            k = m.end()
-                            continue
-                break
-            locs.append(m.group(1))
-            k = m.end()
+        locs, _ = _adv_scan_at_locations(stripped, at_pos + 2, n, rw_col)
         for i, loc in enumerate(locs):
             if loc in _ADV_TURNSTILES:
                 if any(prev != "*" for prev in locs[:i]):
@@ -3148,25 +3307,23 @@ def _try_rewrite_hyp_before_target(
             continue  # `try?`, `tryFoo`
         if has_guillemets and lean_lexer._inside_guillemets(stripped, t):
             continue
+        if _is_non_tactic_try(stripped, t):
+            continue
         try_col = _adv_col(stripped, t)
         first = _adv_skip_ws(stripped, after_try, n)
-        has_nl_after_try = find("\n", after_try, first) != -1
-        group_open = -1
-        while first < n and stripped[first] in "({":
-            if group_open == -1:
-                group_open = first
-            first = _adv_skip_ws(stripped, first + 1, n)
         if first >= n:
             continue
-        if group_open != -1:
-            close = _adv_match_close(stripped, group_open, n)
-            scope_end = close if close != -1 else min(n, first + _ADV_SCAN_LIMIT)
-        else:
-            first_col = _adv_col(stripped, first)
-            if has_nl_after_try and first_col <= try_col:
+        has_nl_after_try = find("\n", after_try, first) != -1
+        first_col = _adv_col(stripped, first)
+        if has_nl_after_try and first_col <= try_col:
+            if stripped[first] in "({":
+                close = _adv_match_close(stripped, first, n)
+                scope_end = close if close != -1 else min(n, first + _ADV_SCAN_LIMIT)
+            else:
                 continue  # `try` with no indented tactic block before a sibling step
+        else:
             min_indent = min(first_col, try_col + 1) if first_col > try_col else first_col
-            if not has_nl_after_try:
+            if not has_nl_after_try and stripped[first] not in "({":
                 flat = flat_line.match(stripped, first)
                 if flat is not None:
                     flat_end = flat.end()
@@ -3229,7 +3386,7 @@ def scan_projection_and_rewrite_order_hazards(
     line_of = _LineCounter(stripped)
     found: dict[tuple[str, int, str, str], ProofHealthFinding] = {}
 
-    if has_chain_name:
+    if has_chain_name and "advanceStmt" in stripped:
         why = (
             "`Simp.simpProj` builds and typechecks a `fun s => e = s.i` motive at every "
             "projection level (leanprover/lean4#16532)."
@@ -3279,7 +3436,7 @@ def scan_projection_and_rewrite_order_hazards(
                 ),
             )
 
-    if has_try:
+    if has_try and "try" in stripped and ("⊢" in stripped or "|-" in stripped):
         for at_pos, rewrite_kw, locs in _try_rewrite_hyp_before_target(stripped, has_guillemets):
             line = line_of(at_pos)
             written = " ".join(locs)
