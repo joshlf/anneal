@@ -73,14 +73,30 @@ structure AuditPolicy where
   statementUnfoldRoots : Array Name := #[`Specs, `Mir, `Obligations, `Verify, `CrateVerify, `Proof]
   /-- Namespace/module roots forbidden anywhere in the unfolded `ci.type` closure. -/
   statementForbiddenRoots : Array Name := #[`Proof, `Anneal]
-  /-- Trusted boundary roots where statement-origin unfolding stops (unless a
-      constant also matches `statementForbiddenRoots`). -/
-  statementAllowedRoots : Array Name := #[`Init, `Std, `Trusted]
+  /-- Module roots where statement-origin unfolding stops (unless a constant also
+      matches `statementForbiddenRoots`). A boundary is trusted by module *name*, and
+      only toolchain names are path-verified by `auditCompiledModulesIO`, so the default
+      is the toolchain stdlib alone. `Trusted` is deliberately NOT a default boundary:
+      unfolding the genuine `Trusted.*` library is harmless (it cannot reach `Proof.*` /
+      `Anneal.*`), while a package-provided module merely *named* `Trusted.*` then gets
+      no cover. Any extra root listed here must be pinned to a directory through
+      `auditCompiledModulesIO (pinnedModuleRoots := ...)`. -/
+  statementAllowedRoots : Array Name := #[`Init, `Std]
   /-- Whether to enforce statement-vs.-proof origin separation on targets. -/
   checkStatementOrigin : Bool := true
   /-- Whether to cross-check transitive axioms against `Lean.collectAxioms` in
       `env.setExporting false`. -/
   crossCheckCollectAxioms : Bool := true
+  /-- Extra module roots (beyond the toolchain `Init` / `Std` libraries) whose axioms
+      are honoured when their names appear in `allowedAxioms`. An allowed axiom *name*
+      declared anywhere else (e.g. a `prelude` module re-declaring `propext`) is rejected. -/
+  allowedAxiomModuleRoots : Array Name := #[]
+  /-- Whether an audit over an empty target set may report `ok`. Defaults to `false`
+      so that an audit which inspected nothing can never be mistaken for a pass. -/
+  allowEmptyTargetSet : Bool := false
+  /-- Optional override of the closure / statement-walk fuel (used to exercise the
+      fail-closed fuel-exhaustion path; `none` selects the environment-sized default). -/
+  fuelOverride? : Option Nat := none
   deriving Repr, Inhabited
 
 /-- Constructive policy forbidding `Classical.choice` (allowing only `propext` and `Quot.sound`). -/
@@ -113,6 +129,22 @@ inductive AuditViolation where
   | specStrengthCertMissing (specName : Name) (reason : String)
   | specStrengthCertInvalidType (certDecl : Name) (expectedSpec : Name) (actualType : String)
   | kernelReplayFailed (detail : String)
+  /-- A module whose *name* carries trust (toolchain `Init.*` / `Std.*` / `Lean.*`, or a
+      root listed in `statementAllowedRoots` / `allowedAxiomModuleRoots`) resolved to an
+      `.olean` outside the directory that name is pinned to, or has no pin at all. -/
+  | moduleProvenanceSpoofed (moduleName : Name) (resolvedPath : String) (expected : String)
+  /-- `importModules` (or reading a module header) failed; reported structurally
+      instead of escaping as an untyped `IO` exception. -/
+  | environmentLoadFailed (detail : String)
+  /-- The audit selected zero target declarations. -/
+  | noAuditTargets (context : String)
+  /-- A bounded graph walk ran out of fuel before reaching a fixed point. -/
+  | auditFuelExhausted (target : Name) (phase : String)
+  /-- More than one (or zero) candidate specification instance exists for a `defId`,
+      so a certificate cannot be bound to the specification a claim was proven against. -/
+  | specInstanceAmbiguous (specName : Name) (specClass : Name) (candidates : Array Name)
+  /-- A certificate does not kill every mutant category required by the gate. -/
+  | specStrengthCoverageGap (certDecl : Name) (missing : Array String) (reason : String)
   deriving Repr, BEq
 
 /-- Deterministic metrics recorded for every audit run. -/
@@ -120,9 +152,14 @@ structure AuditStats where
   targetsAudited : Nat := 0
   reachableDeclarations : Nat := 0
   axiomsFound : Array Name := #[]
+  /-- Native-evaluation axioms accepted only because `allowProvisionalNative := true`.
+      A non-empty list means the verdict is *provisional*, never kernel-checked. -/
+  provisionalNativeAxioms : Array Name := #[]
   modulesLoaded : Nat := 0
   privateArtifactsChecked : Nat := 0
   kernelReplayedDeclarations : Nat := 0
+  /-- Wall-clock time spent in `importModules` (part of `elapsedMicros`). -/
+  importMicros : Nat := 0
   elapsedMicros : Nat := 0
   deriving Repr, BEq, Inhabited
 
@@ -159,6 +196,12 @@ def AuditViolation.tag : AuditViolation → String
   | .specStrengthCertMissing _ _ => "specStrengthCertMissing"
   | .specStrengthCertInvalidType _ _ _ => "specStrengthCertInvalidType"
   | .kernelReplayFailed _ => "kernelReplayFailed"
+  | .moduleProvenanceSpoofed _ _ _ => "moduleProvenanceSpoofed"
+  | .environmentLoadFailed _ => "environmentLoadFailed"
+  | .noAuditTargets _ => "noAuditTargets"
+  | .auditFuelExhausted _ _ => "auditFuelExhausted"
+  | .specInstanceAmbiguous _ _ _ => "specInstanceAmbiguous"
+  | .specStrengthCoverageGap _ _ _ => "specStrengthCoverageGap"
 
 private def optNameToJson : Option Name → Json
   | none => Json.null
@@ -244,6 +287,37 @@ instance : ToJson AuditViolation where
       Json.mkObj [
         ("kind", toJson "kernelReplayFailed"),
         ("detail", toJson detail)]
+    | .moduleProvenanceSpoofed moduleName resolvedPath expected =>
+      Json.mkObj [
+        ("kind", toJson "moduleProvenanceSpoofed"),
+        ("module", toJson moduleName.toString),
+        ("resolvedPath", toJson resolvedPath),
+        ("expected", toJson expected)]
+    | .environmentLoadFailed detail =>
+      Json.mkObj [
+        ("kind", toJson "environmentLoadFailed"),
+        ("detail", toJson detail)]
+    | .noAuditTargets context =>
+      Json.mkObj [
+        ("kind", toJson "noAuditTargets"),
+        ("context", toJson context)]
+    | .auditFuelExhausted target phase =>
+      Json.mkObj [
+        ("kind", toJson "auditFuelExhausted"),
+        ("target", toJson target.toString),
+        ("phase", toJson phase)]
+    | .specInstanceAmbiguous specName specClass candidates =>
+      Json.mkObj [
+        ("kind", toJson "specInstanceAmbiguous"),
+        ("specName", toJson specName.toString),
+        ("specClass", toJson specClass.toString),
+        ("candidates", toJson ((candidates.qsort Name.lt).map Name.toString))]
+    | .specStrengthCoverageGap certDecl missing reason =>
+      Json.mkObj [
+        ("kind", toJson "specStrengthCoverageGap"),
+        ("certDecl", toJson certDecl.toString),
+        ("missing", toJson missing),
+        ("reason", toJson reason)]
 
 instance : ToJson AuditStats where
   toJson s :=
@@ -251,9 +325,12 @@ instance : ToJson AuditStats where
       ("targetsAudited", toJson s.targetsAudited),
       ("reachableDeclarations", toJson s.reachableDeclarations),
       ("axiomsFound", toJson ((s.axiomsFound.qsort Name.lt).map Name.toString)),
+      ("provisionalNativeAxioms",
+        toJson ((s.provisionalNativeAxioms.qsort Name.lt).map Name.toString)),
       ("modulesLoaded", toJson s.modulesLoaded),
       ("privateArtifactsChecked", toJson s.privateArtifactsChecked),
       ("kernelReplayedDeclarations", toJson s.kernelReplayedDeclarations),
+      ("importMicros", toJson s.importMicros),
       ("elapsedMicros", toJson s.elapsedMicros)]
 
 instance : ToJson AuditVerdict where
@@ -337,6 +414,28 @@ def isNativeDecideAxiom (n : Name) : Bool :=
   n == ``Lean.ofReduceBool || n == ``Lean.ofReduceNat ||
   n == `Lean.ofReduceBool || n == `Lean.ofReduceNat ||
   (n.toString.splitOn "._native.").length > 1
+
+/-- Structural validation of an auxiliary native-evaluation axiom.
+
+    Lean `v4.34.1`'s `Lean.Meta.nativeEqTrue` (the engine behind `native_decide` and
+    `bv_decide`) emits exactly one shape: an axiom whose final name component starts
+    with `ax_` and whose type is the binder-free proposition `@Eq.{1} Bool e Bool.true`
+    for a closed `e`. A hand-written `axiom foo._native.bar : False` merely *named*
+    like such an axiom fails this check and is never treated as native evaluation.
+
+    This is a necessary condition only: a hand-written axiom that also copies the
+    shape (`axiom x._native.t.ax_1 : b = true`) cannot be told apart from genuine
+    compiler output without re-running the evaluation, which is why accepted native
+    axioms are always surfaced in `AuditStats.provisionalNativeAxioms`. -/
+def isWellFormedNativeAxiom (n : Name) (ci : ConstantInfo) : Bool :=
+  let nameOk := match n with
+    | .str _ s => s.startsWith "ax_"
+    | _ => false
+  let typeOk := match ci.type with
+    | .app (.app (.app (.const ``Eq [lvl]) (.const ``Bool [])) e) (.const ``Bool.true []) =>
+      lvl == Level.succ Level.zero && !e.hasLooseBVars && !e.hasFVar && !e.hasMVar
+    | _ => false
+  ci.isAxiom && nameOk && typeOk
 
 /-- Test whether `n` is `Lean.trustCompiler`. -/
 def isTrustCompilerAxiom (n : Name) : Bool :=
@@ -524,29 +623,59 @@ def collectAxiomsBatchPrivate (env : Environment) (targets : Array Name) : Array
 private def pushUniqueViolation (vs : Array AuditViolation) (v : AuditViolation) : Array AuditViolation :=
   if vs.contains v then vs else vs.push v
 
-/-- Validate an axiom `axName` reached from `target` under `policy`. -/
+/-- Validate an axiom `axName` reached from `target` under `policy`.
+
+    Trust is granted by *module provenance*, never by name alone:
+    - names in `policy.allowedAxioms` are honoured only when declared in the toolchain
+      stdlib (`Init` / `Std`) or under `policy.allowedAxiomModuleRoots`, so a `prelude`
+      module re-declaring `propext` with a different statement is rejected;
+    - `policy.allowAssumptionsNamespace` admits axioms declared in `Assumptions.*`
+      *modules*; an `axiom Assumptions.foo` declared in any other module is rejected;
+    - `._native.`-named axioms must additionally satisfy `isWellFormedNativeAxiom`. -/
 def checkAxiomAllowed (privEnv : Environment) (policy : AuditPolicy)
     (target : Name) (axName : Name) : Option AuditViolation :=
   let modName? := originModule? privEnv axName
+  let effMod? := effectiveModule? privEnv axName
+  let fromStdlib := modName?.any isStdlibMod
   if axName == ``sorryAx || axName == `sorryAx then
     some (.sorryAxiomReached target axName)
-  else if isNativeDecideAxiom axName then
-    if policy.allowProvisionalNative then none
+  else if axName == ``Lean.ofReduceBool || axName == ``Lean.ofReduceNat then
+    if policy.allowProvisionalNative && fromStdlib then none
     else some (.nativeDecideReached target axName modName?)
+  else if isNativeDecideAxiom axName then
+    match privEnv.checked.get.find? axName with
+    | some ci =>
+      if !isWellFormedNativeAxiom axName ci then
+        some (.unapprovedAxiom target axName modName?
+          "axiom name mimics a native_decide auxiliary axiom but is not of the form `@Eq Bool e Bool.true`")
+      else if policy.allowProvisionalNative then none
+      else some (.nativeDecideReached target axName modName?)
+    | none =>
+      some (.unapprovedAxiom target axName modName? "native-named axiom missing from kernel environment")
   else if isTrustCompilerAxiom axName then
-    if policy.allowTrustCompiler then none
+    if policy.allowTrustCompiler && fromStdlib then none
     else some (.unapprovedAxiom target axName modName? "Lean.trustCompiler is disallowed by policy")
   else if policy.allowedAxioms.contains axName then
-    none
+    if fromStdlib ||
+       effMod?.any (fun m => policy.allowedAxiomModuleRoots.any (matchesRootPrefix m ·)) then
+      none
+    else
+      some (.unapprovedAxiom target axName modName?
+        "allowed axiom name declared outside the toolchain stdlib and policy.allowedAxiomModuleRoots")
   else if policy.allowAssumptionsNamespace &&
-          matchesAnyRoot axName modName? #[`Assumptions] then
+          effMod?.any (fun m => matchesRootPrefix m `Assumptions) then
     none
   else
     some (.unapprovedAxiom target axName modName? "axiom not in policy.allowedAxioms")
 
-/-- Check whether `n` is a `partial def` (either `.defnInfo` with `safety == .partial`,
-    a `._unsafe_rec` symbol, or an `.opaqueInfo` backed by `@[implemented_by ..._unsafe_rec]`
-    or a sibling `n._unsafe_rec` partial/unsafe helper). -/
+/-- Check whether `n` is a `partial def` or a reachable `._unsafe_rec` helper.
+
+    In Lean `v4.34.1` a user `partial def foo` is stored as a *safe* `.opaqueInfo foo`
+    (`isPartial = false`, `isUnsafe = false`, carrying no `@[implemented_by]` entry)
+    next to a sibling `.defnInfo foo._unsafe_rec` with `safety = .partial`, which the
+    code generator selects purely by name. The sibling lookup below is therefore the
+    only compiled trace of `partial`; `@[implemented_by]` is reported separately (and
+    always) by `checkCompilerOverridesOnDecl`. -/
 def detectPartialOrUnsafeRec (privEnv : Environment) (n : Name) (ci : ConstantInfo) : Option String :=
   if ci.isPartial then
     some "constant marked partial in kernel ConstantInfo"
@@ -555,79 +684,96 @@ def detectPartialOrUnsafeRec (privEnv : Environment) (n : Name) (ci : ConstantIn
   else
     match ci with
     | .opaqueInfo _ =>
-      match Lean.Compiler.getImplementedBy? privEnv n with
-      | some imp =>
-        let impIsPartial := match privEnv.checked.get.find? imp with
-          | some impCi => impCi.isPartial || impCi.isUnsafe
-          | none => false
-        if hasUnsafeRecComponent imp || impIsPartial then
-          some s!"opaque partial definition backed by implemented_by {imp}"
+      let recName := n.str "_unsafe_rec"
+      match privEnv.checked.get.find? recName with
+      | some recCi =>
+        if recCi.isPartial || recCi.isUnsafe then
+          some s!"opaque partial definition with sibling {recName}"
         else none
-      | none =>
-        let recName := n.str "_unsafe_rec"
-        match privEnv.checked.get.find? recName with
-        | some recCi =>
-          if recCi.isPartial || recCi.isUnsafe then
-            some s!"opaque partial definition with sibling {recName}"
-          else none
-        | none => none
+      | none => none
     | _ => none
 
 /-- Check compiler override attributes (`@[implemented_by]`, `@[extern]`, `@[csimp]`)
-    on non-stdlib declaration `n`. Skips `implemented_by` entries that were already
-    classified as `partial def` backing (`_unsafe_rec`). -/
+    affecting declaration `n`.
+
+    Attributes *attached to* `n` are skipped only when `n` itself lives in the toolchain
+    stdlib. `@[csimp]` redirections are different: the theorem may live in an untrusted
+    module while redirecting a stdlib function (`@[csimp] theorem : @Nat.add = @evil`),
+    so the redirection lookup runs for every `n` (`CSimpIndex.fromToThm` only ever
+    indexes non-stdlib theorems). -/
 def checkCompilerOverridesOnDecl (privEnv : Environment) (csimpIdx : CSimpIndex)
-    (target : Name) (n : Name) (ci : ConstantInfo) (alreadyPartial : Bool) : Array AuditViolation := Id.run do
-  let modName? := originModule? privEnv n
-  if modName?.any isStdlibMod then
-    return #[]
+    (target : Name) (n : Name) : Array AuditViolation := Id.run do
+  let declIsStdlib := (originModule? privEnv n).any isStdlibMod
   let mut vs : Array AuditViolation := #[]
-  if !alreadyPartial then
+  if !declIsStdlib then
     if let some imp := Lean.Compiler.getImplementedBy? privEnv n then
-      vs := vs.push (.compilerOverrideAttribute target n "implemented_by" s!"implemented_by {imp}")
-  if Lean.isExternC privEnv n then
-    let cSym := (Lean.getExternNameFor privEnv `all n).getD "<extern_c>"
-    vs := vs.push (.compilerOverrideAttribute target n "extern_c" s!"extern \"{cSym}\"")
-  else if Lean.isExtern privEnv n then
-    vs := vs.push (.compilerOverrideAttribute target n "extern" "extern compiler attribute")
-  if Lean.Compiler.hasCSimpAttribute privEnv n || csimpIdx.thmNames.contains n then
-    vs := vs.push (.compilerOverrideAttribute target n "csimp" "declaration tagged @[csimp]")
+      let impNote := match privEnv.checked.get.find? imp with
+        | some impCi =>
+          if impCi.isUnsafe then " (unsafe implementation)"
+          else if impCi.isPartial then " (partial implementation)"
+          else ""
+        | none => " (implementation absent from kernel environment)"
+      vs := vs.push (.compilerOverrideAttribute target n "implemented_by" s!"implemented_by {imp}{impNote}")
+    if Lean.isExternC privEnv n then
+      let cSym := (Lean.getExternNameFor privEnv `all n).getD "<extern_c>"
+      vs := vs.push (.compilerOverrideAttribute target n "extern_c" s!"extern \"{cSym}\"")
+    else if Lean.isExtern privEnv n then
+      vs := vs.push (.compilerOverrideAttribute target n "extern" "extern compiler attribute")
+    if Lean.Compiler.hasCSimpAttribute privEnv n || csimpIdx.thmNames.contains n then
+      vs := vs.push (.compilerOverrideAttribute target n "csimp" "declaration tagged @[csimp]")
   if let some (toDecl, thmName) := csimpIdx.fromToThm[n]? then
     vs := vs.push (.compilerOverrideAttribute target n "csimp_target"
       s!"replaced in compiled code by {toDecl} via @[csimp] {thmName}")
-  -- Also detect `.opaqueInfo` whose `implemented_by` was not classified as partial.
-  let _ := ci
   return vs
 
+/-- Graph-walk fuel for `privEnv`: `policy.fuelOverride?` when set, otherwise twice the
+    imported constant count plus slack (every walk visits each constant at most once). -/
+def auditFuel (privEnv : Environment) (policy : AuditPolicy) (extra : Nat := 0) : Nat :=
+  match policy.fuelOverride? with
+  | some f => f
+  | none =>
+    let modConstTotal :=
+      privEnv.header.moduleData.foldl (init := 0) fun acc d => acc + d.constants.size
+    max 250000 (modConstTotal * 2 + extra * 2 + 16384)
+
 /-- Fuel-bounded (structurally total, zero `partial`) statement-origin separation walk
-    over `ci.type` of `target`.
+    over the statement `rootType` of `target`.
+
     Rejects any constant matching `policy.statementForbiddenRoots` (by module origin
     OR unmangled namespace prefix). Unfolds constants in `policy.statementUnfoldRoots`
     as well as any non-boundary local/helper definitions (stopping only at
     `policy.statementAllowedRoots` when not forbidden), catching leaks hidden inside
-    `Specs.*`, `Mir.*`, reducible `abbrev` aliases, or typeclass instances. -/
-def checkStatementOriginsInEnv (privEnv : Environment) (policy : AuditPolicy)
-    (target : Name) (rootType : Expr) : Array AuditViolation := Id.run do
+    `Specs.*`, `Mir.*`, reducible `abbrev` aliases, structure fields, or typeclass
+    instances.
+
+    Module attribution uses `effectiveModule?`, so declarations of the module currently
+    being elaborated (which carry no imported-module index) are attributed to
+    `env.header.mainModule`; an in-process audit running inside a `Proof.*` / `Anneal.*`
+    module therefore cannot launder un-namespaced helpers into a statement.
+
+    `cleanSeen` carries constants already proven leak-free by earlier fully clean walks;
+    the returned set extends it only when this walk found no violation. -/
+def statementOriginWalk (privEnv : Environment) (policy : AuditPolicy)
+    (target : Name) (rootType : Expr) (cleanSeen : NameSet) :
+    Array AuditViolation × NameSet := Id.run do
   match expressionEdges rootType with
   | .error msg =>
-    return #[.openTermExpression target target s!"statement type: {msg}"]
+    return (#[.openTermExpression target target s!"statement type: {msg}"], cleanSeen)
   | .ok initEdges =>
     let kenv := privEnv.checked.get
-    let initSorted := initEdges.toArray.qsort Name.lt
     let mut pending : Array (Name × Array Name) := #[]
-    let mut seen : NameSet := {}
+    let mut seen : NameSet := cleanSeen
     let mut vs : Array AuditViolation := #[]
-    for n in initSorted do
-      seen := seen.insert n
-      pending := pending.push (n, #[n])
-    let modConstTotal := privEnv.header.moduleData.foldl (init := 0) fun acc d => acc + d.constants.size
-    let fuel := max 200000 (modConstTotal * 2 + 8192)
-    for _ in [:fuel] do
+    for n in initEdges.toArray.qsort Name.lt do
+      if !seen.contains n then
+        seen := seen.insert n
+        pending := pending.push (n, #[n])
+    for _ in [:auditFuel privEnv policy] do
       if pending.isEmpty then
         break
       let (n, chain) := pending.back!
       pending := pending.pop
-      let modName? := originModule? privEnv n
+      let modName? := effectiveModule? privEnv n
       let isForbidden := matchesAnyRoot n modName? policy.statementForbiddenRoots
       if isForbidden then
         vs := pushUniqueViolation vs (.statementOriginLeak target n modName? chain)
@@ -648,13 +794,24 @@ def checkStatementOriginsInEnv (privEnv : Environment) (policy : AuditPolicy)
               seen := seen.insert d
               pending := pending.push (d, chain.push d)
     if !pending.isEmpty then
-      vs := pushUniqueViolation vs (.statementOriginLeak target target none #[`fuel_exhausted])
-    return vs
+      vs := pushUniqueViolation vs (.auditFuelExhausted target "statement-origin walk")
+    return (vs, if vs.isEmpty then seen else cleanSeen)
+
+/-- Statement-origin separation check for a single `target` (see `statementOriginWalk`). -/
+def checkStatementOriginsInEnv (privEnv : Environment) (policy : AuditPolicy)
+    (target : Name) (rootType : Expr) : Array AuditViolation :=
+  (statementOriginWalk privEnv policy target rootType {}).1
 
 /-- Audit a list of target declarations in a given `Environment` (pure total core,
     always inspecting `env.setExporting false` and `env.checked.get`).
     Uses an iterative, bounded $O(V + E)$ worklist (zero `partial`, zero `unsafe`,
-    $O(1)$ call-stack space in the Lean interpreter) with per-edge root attribution. -/
+    $O(1)$ call-stack space in the Lean interpreter) with per-edge root attribution.
+
+    Fails closed on an empty target set (unless `policy.allowEmptyTargetSet`), on fuel
+    exhaustion (`.auditFuelExhausted`), and on environments imported below
+    `OLeanLevel.private` (`.environmentLoadFailed`). Stdlib trust in this pure entrypoint is by
+    module *name* as recorded in `env.header`; `auditCompiledModulesIO` additionally
+    verifies that such modules were loaded from the pinned toolchain directory. -/
 def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
     (policy : AuditPolicy := {}) : AuditVerdict := Id.run do
   let privEnv := env.setExporting false
@@ -662,11 +819,21 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
   let csimpIdx := if policy.checkCompilerOverrides then buildCSimpIndex privEnv else {}
   let mut violations : Array AuditViolation := #[]
   let mut allAxioms : NameSet := {}
+  let mut provisional : NameSet := {}
   let mut pending : Array (Name × Name) := #[]
   let mut visited : NameSet := {}
   let mut stmtSeen : NameSet := {}
-  let modConstTotal := privEnv.header.moduleData.foldl (init := 0) fun acc d => acc + d.constants.size
-  let fuel := max 250000 (modConstTotal * 2 + targets.size * 2 + 16384)
+  let fuel := auditFuel privEnv policy targets.size
+  if privEnv.header.isModule then
+    -- `header.isModule` is set exactly when imports were loaded below
+    -- `OLeanLevel.private` (elaboration inside a `module` file): theorem bodies and
+    -- private constants of imports are then absent, so nothing can be concluded.
+    violations := violations.push
+      (.environmentLoadFailed
+        "environment was imported below OLeanLevel.private; private constants and theorem bodies of imports are unavailable")
+  if targets.isEmpty && !policy.allowEmptyTargetSet then
+    violations := violations.push
+      (.noAuditTargets "empty target set (policy.allowEmptyTargetSet = false)")
   for target in targets do
     match kenv.find? target with
     | none =>
@@ -676,50 +843,9 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
         violations := pushUniqueViolation violations
           (.notTheoremKind target (constantInfoKind rootCi))
       if policy.checkStatementOrigin then
-        match expressionEdges rootCi.type with
-        | .error msg =>
-          violations := pushUniqueViolation violations
-            (.openTermExpression target target s!"statement type: {msg}")
-        | .ok initEdges =>
-          let sortedInit := initEdges.toArray.qsort Name.lt
-          let mut pendingStmt : Array (Name × Array Name) := #[]
-          let mut localStmtSeen : NameSet := stmtSeen
-          let prevViolCount := violations.size
-          for n in sortedInit do
-            if !localStmtSeen.contains n then
-              localStmtSeen := localStmtSeen.insert n
-              pendingStmt := pendingStmt.push (n, #[n])
-          for _ in [:fuel] do
-            if pendingStmt.isEmpty then
-              break
-            let (n, chain) := pendingStmt.back!
-            pendingStmt := pendingStmt.pop
-            let modName? := originModule? privEnv n
-            let isForbidden := matchesAnyRoot n modName? policy.statementForbiddenRoots
-            if isForbidden then
-              violations := pushUniqueViolation violations
-                (.statementOriginLeak target n modName? chain)
-            let isAllowedBoundary :=
-              !isForbidden &&
-              match modName? with
-              | some m => policy.statementAllowedRoots.any (matchesRootPrefix m ·)
-              | none => false
-            let shouldUnfold :=
-              matchesAnyRoot n modName? policy.statementUnfoldRoots ||
-              (!isAllowedBoundary && !isForbidden)
-            if shouldUnfold then
-              if let some depCi := kenv.find? n then
-                let (depEdges, openVs) := declarationEdges target depCi
-                violations := openVs.foldl pushUniqueViolation violations
-                for d in depEdges.toArray.qsort Name.lt do
-                  if !localStmtSeen.contains d then
-                    localStmtSeen := localStmtSeen.insert d
-                    pendingStmt := pendingStmt.push (d, chain.push d)
-          if !pendingStmt.isEmpty then
-            violations := pushUniqueViolation violations
-              (.statementOriginLeak target target none #[`fuel_exhausted])
-          if violations.size == prevViolCount then
-            stmtSeen := localStmtSeen
+        let (stmtVs, stmtSeen') := statementOriginWalk privEnv policy target rootCi.type stmtSeen
+        violations := stmtVs.foldl pushUniqueViolation violations
+        stmtSeen := stmtSeen'
       if !visited.contains target then
         visited := visited.insert target
         pending := pending.push (target, target)
@@ -736,19 +862,18 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
       let modName? := originModule? privEnv n
       if policy.forbidPartialAndUnsafe && ci.isUnsafe then
         violations := pushUniqueViolation violations (.unsafeDeclaration rootTarget n modName?)
-      let partialReason? :=
-        if policy.forbidPartialAndUnsafe then detectPartialOrUnsafeRec privEnv n ci
-        else none
-      if let some reason := partialReason? then
-        violations := pushUniqueViolation violations
-          (.partialOrUnsafeRecDependency rootTarget n modName? reason)
+      if policy.forbidPartialAndUnsafe then
+        if let some reason := detectPartialOrUnsafeRec privEnv n ci then
+          violations := pushUniqueViolation violations
+            (.partialOrUnsafeRecDependency rootTarget n modName? reason)
       if policy.checkCompilerOverrides then
-        let ovs := checkCompilerOverridesOnDecl privEnv csimpIdx rootTarget n ci partialReason?.isSome
+        let ovs := checkCompilerOverridesOnDecl privEnv csimpIdx rootTarget n
         violations := ovs.foldl pushUniqueViolation violations
       if ci.isAxiom then
         allAxioms := allAxioms.insert n
-        if let some axViol := checkAxiomAllowed privEnv policy rootTarget n then
-          violations := pushUniqueViolation violations axViol
+        match checkAxiomAllowed privEnv policy rootTarget n with
+        | some axViol => violations := pushUniqueViolation violations axViol
+        | none => if isNativeDecideAxiom n then provisional := provisional.insert n
       let (edges, openVs) := declarationEdges rootTarget ci
       violations := openVs.foldl pushUniqueViolation violations
       for d in edges.toArray.qsort Name.lt do
@@ -757,7 +882,7 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
           pending := pending.push (rootTarget, d)
   if !pending.isEmpty then
     violations := pushUniqueViolation violations
-      (.kernelReplayFailed "closure fuel exhausted during batch audit")
+      (.auditFuelExhausted (targets[0]?.getD .anonymous) "kernel dependency closure")
   -- Cross-check against `Lean.collectAxioms` in `env.setExporting false`.
   if policy.crossCheckCollectAxioms then
     if targets.size <= 32 then
@@ -766,15 +891,17 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
           let collected := collectAxiomsPrivate privEnv target
           for ax in collected do
             allAxioms := allAxioms.insert ax
-            if let some axViol := checkAxiomAllowed privEnv policy target ax then
-              violations := pushUniqueViolation violations axViol
+            match checkAxiomAllowed privEnv policy target ax with
+            | some axViol => violations := pushUniqueViolation violations axViol
+            | none => if isNativeDecideAxiom ax then provisional := provisional.insert ax
     else
       let batchAxs := collectAxiomsBatchPrivate privEnv targets
       let repTarget := targets[0]!
       for ax in batchAxs do
         allAxioms := allAxioms.insert ax
-        if let some axViol := checkAxiomAllowed privEnv policy repTarget ax then
-          violations := pushUniqueViolation violations axViol
+        match checkAxiomAllowed privEnv policy repTarget ax with
+        | some axViol => violations := pushUniqueViolation violations axViol
+        | none => if isNativeDecideAxiom ax then provisional := provisional.insert ax
       for idx in [0, targets.size - 1] do
         if h : idx < targets.size then
           let target := targets[idx]
@@ -782,12 +909,14 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
             let collected := collectAxiomsPrivate privEnv target
             for ax in collected do
               allAxioms := allAxioms.insert ax
-              if let some axViol := checkAxiomAllowed privEnv policy target ax then
-                violations := pushUniqueViolation violations axViol
+              match checkAxiomAllowed privEnv policy target ax with
+              | some axViol => violations := pushUniqueViolation violations axViol
+              | none => if isNativeDecideAxiom ax then provisional := provisional.insert ax
   let stats : AuditStats := {
     targetsAudited := targets.size
     reachableDeclarations := visited.size
     axiomsFound := allAxioms.toArray.qsort Name.lt
+    provisionalNativeAxioms := provisional.toArray.qsort Name.lt
     modulesLoaded := privEnv.header.modules.size
   }
   if violations.isEmpty then
@@ -811,11 +940,14 @@ def auditDeclsInMetaM (targets : Array Name) (policy : AuditPolicy := {}) : Meta
   let env ← getEnv
   liftM <| auditDeclsInEnvIO env targets policy
 
-/-- Check on-disk `.olean` and `.olean.private` artifact integrity across the
-    module import closure starting from `rootModules`.
+/-- Check on-disk `.olean` / `.olean.server` / `.olean.private` artifact integrity across
+    the module import closure starting from `rootModules`.
     For every Lean `v4.34.1` `module`-system `.olean` (`ModuleData.isModule = true`),
-    verifies that the companion `.olean.private` exists when
-    `policy.requirePrivateOleanForModuleSystem = true`. -/
+    verifies that the companion `.olean.server` and `.olean.private` parts exist when
+    `policy.requirePrivateOleanForModuleSystem = true`. Lean's own loader needs all three
+    parts at `OLeanLevel.private`; checking them here turns what would otherwise be an
+    untyped `IO` exception into a structured `.missingPrivateArtifact`. Unreadable
+    module headers are reported as `.environmentLoadFailed`. -/
 def checkPrivateOleanArtifactsIO (rootModules : Array Name)
     (policy : AuditPolicy := {}) (checkToolchainMods : Bool := false) :
     IO (Array AuditViolation × Nat) := do
@@ -824,7 +956,7 @@ def checkPrivateOleanArtifactsIO (rootModules : Array Name)
   let mut pending : Array Name := rootModules
   let mut seen : NameSet := {}
   for m in rootModules do seen := seen.insert m
-  let fuel : Nat := 10000
+  let fuel : Nat := 100000
   for _ in [:fuel] do
     if pending.isEmpty then
       break
@@ -847,20 +979,96 @@ def checkPrivateOleanArtifactsIO (rootModules : Array Name)
         violations := pushUniqueViolation violations
           (.missingPrivateArtifact modName oleanPath.toString)
       else
-        let (modData, _region) ← Lean.readModuleData oleanPath
-        checkedCount := checkedCount + 1
-        if modData.isModule && policy.requirePrivateOleanForModuleSystem then
-          let privPath := OLeanLevel.private.adjustFileName oleanPath
-          if !(← privPath.pathExists) then
-            violations := pushUniqueViolation violations
-              (.missingPrivateArtifact modName privPath.toString)
-        for imp in modData.imports do
-          if !seen.contains imp.module then
-            seen := seen.insert imp.module
-            pending := pending.push imp.module
+        match (← (Lean.readModuleData oleanPath).toBaseIO) with
+        | .error err =>
+          violations := pushUniqueViolation violations
+            (.environmentLoadFailed s!"cannot read module header {oleanPath}: {err}")
+        | .ok (modData, _region) =>
+          checkedCount := checkedCount + 1
+          if modData.isModule && policy.requirePrivateOleanForModuleSystem then
+            for level in [OLeanLevel.server, OLeanLevel.private] do
+              let partPath := level.adjustFileName oleanPath
+              if !(← partPath.pathExists) then
+                violations := pushUniqueViolation violations
+                  (.missingPrivateArtifact modName partPath.toString)
+          for imp in modData.imports do
+            if !seen.contains imp.module then
+              seen := seen.insert imp.module
+              pending := pending.push imp.module
   if !pending.isEmpty then
-    violations := pushUniqueViolation violations (.kernelReplayFailed "artifact scan fuel exhausted")
+    violations := pushUniqueViolation violations
+      (.auditFuelExhausted (rootModules[0]?.getD .anonymous) "artifact scan")
   return (violations, checkedCount)
+
+/-- Verify that every loaded module whose *name* carries trust was resolved from the
+    directory that name is pinned to.
+
+    Stdlib exemptions elsewhere in the auditor (compiler-override checks, foundational
+    axiom provenance, the statement-origin boundary, the artifact scan) key on module
+    names. Without this check a package could ship its own `Std/Evil.lean` and inherit
+    that trust. Two classes of names are checked:
+    - toolchain names (`Init.*`, `Std.*`, `Lean.*`) must resolve under the pinned
+      toolchain library directory (`toolchainLibDir?`, default: the running toolchain);
+    - any non-toolchain root listed in `policy.statementAllowedRoots` (when statement
+      origins are checked) or `policy.allowedAxiomModuleRoots` must have an entry in
+      `pinnedModuleRoots` and resolve under it. An unpinned trust-bearing root fails
+      closed.
+
+    Paths are compared after `IO.FS.realPath`, so neither `..` segments in a search-path
+    entry nor a symlinked directory can fake the prefix. -/
+def checkModuleProvenanceIO (moduleNames : Array Name)
+    (policy : AuditPolicy := {})
+    (toolchainLibDir? : Option System.FilePath := none)
+    (pinnedModuleRoots : Array (Name × System.FilePath) := #[]) :
+    IO (Array AuditViolation) := do
+  let realDir (d : System.FilePath) : IO System.FilePath :=
+    try IO.FS.realPath d catch _ => pure d
+  let libDir ← match toolchainLibDir? with
+    | some d => pure d
+    | none => Lean.getLibDir (← Lean.getBuildDir)
+  let libDirReal ← realDir libDir
+  let mut pinnedReal : Array (Name × System.FilePath) := #[]
+  for (r, d) in pinnedModuleRoots do
+    pinnedReal := pinnedReal.push (r, ← realDir d)
+  let isToolchainName (m : Name) : Bool := isStdlibMod m || isLeanCompilerMod m
+  let trustRoots :=
+    ((if policy.checkStatementOrigin then policy.statementAllowedRoots else #[]) ++
+      policy.allowedAxiomModuleRoots).filter (!isToolchainName ·)
+  let isUnder (p dir : System.FilePath) : Bool :=
+    p.toString.startsWith (dir.toString ++ System.FilePath.pathSeparator.toString)
+  let mut violations : Array AuditViolation := #[]
+  for m in moduleNames do
+    -- `none`: name carries no trust. `some (none, why)`: trust-bearing but unpinned.
+    let expected? : Option (Option System.FilePath × String) :=
+      if isToolchainName m then
+        some (some libDirReal, "the pinned toolchain library directory")
+      else
+        match trustRoots.find? (matchesRootPrefix m ·) with
+        | none => none
+        | some r =>
+          match pinnedReal.find? (·.1 == r) with
+          | some (_, d) => some (some d, s!"the directory pinned for module root {r}")
+          | none => some (none, s!"module root {r} carries trust but has no pinnedModuleRoots entry")
+    match expected? with
+    | none => pure ()
+    | some (none, why) =>
+      violations := pushUniqueViolation violations (.moduleProvenanceSpoofed m "<unpinned>" why)
+    | some (some dir, why) =>
+      let resolved? ← try
+        let p ← Lean.findOLean m
+        let pReal ← IO.FS.realPath p
+        pure (some (p, pReal))
+      catch _ =>
+        pure none
+      match resolved? with
+      | none =>
+        violations := pushUniqueViolation violations
+          (.moduleProvenanceSpoofed m "<unresolvable>" s!"expected under {why}")
+      | some (p, pReal) =>
+        unless isUnder pReal dir do
+          violations := pushUniqueViolation violations
+            (.moduleProvenanceSpoofed m p.toString s!"expected under {why}")
+  return violations
 
 /-- Run a computation with `extraSearchPaths` temporarily prepended to `Lean.searchPathRef`,
     restoring the previous search path in `finally`. -/
@@ -875,41 +1083,109 @@ def withExtraSearchPaths (extraSearchPaths : List System.FilePath) (act : IO α)
     finally
       Lean.searchPathRef.set prev
 
-/-- End-to-end on-disk compiled `.olean` / `.olean.private` module auditor:
-    1. Checks `.olean` / `.olean.private` presence via `checkPrivateOleanArtifactsIO`.
-    2. Loads `rootModules` at `trustLevel := 0`, `loadExts := false`, `level := OLeanLevel.private`.
-    3. Applies `env.setExporting false` so private constants and theorem proofs are visible.
-    4. Selects `explicitTargets` (or all non-codegen-`_unsafe_rec` declarations—or all theorems
-       when `theoremsOnly := true`—declared in `rootModules`).
-    5. Audits all selected targets via `auditDeclsInEnvPure` (full `ConstantInfo` graph closure
-       + `Lean.collectAxioms` cross-check + compiler overrides + statement-origin separation).
-    6. Optionally replays target-module declarations in `baseEnv.toKernelEnv.replay`. -/
-def auditCompiledModulesIO
+/-- Compiled modules loaded at `OLeanLevel.private` and ready to be audited, possibly
+    several times under different policies or target selections.
+
+    Re-importing a module that is already mapped in the current process cannot reuse
+    its compacted region (the region's base address is taken), so every additional
+    `importModules` call costs the full size of the import closure in heap memory.
+    Loading once and auditing many times keeps batch audits inside a fixed memory budget. -/
+structure LoadedModules where
+  /-- Environment with `setExporting false` already applied. -/
+  privEnv : Environment
+  rootModules : Array Name
+  extraSearchPaths : List System.FilePath
+  privateArtifactsChecked : Nat
+  /-- Wall-clock time of the artifact scan plus `importModules`. -/
+  importMicros : Nat
+
+/-- Phase 1 of the on-disk auditor: check `.olean` / `.olean.server` / `.olean.private`
+    artifact presence (`checkPrivateOleanArtifactsIO`) and load `rootModules` at
+    `trustLevel := 0`, `loadExts := false`, `level := OLeanLevel.private`. Any failure
+    is returned as a structured `AuditVerdict.rejected` (`.noAuditTargets`,
+    `.missingPrivateArtifact`, `.environmentLoadFailed`), never as an `IO` exception. -/
+def loadCompiledModulesIO
     (rootModules : Array Name)
     (policy : AuditPolicy := {})
-    (explicitTargets? : Option (Array Name) := none)
-    (theoremsOnly : Bool := false)
-    (extraSearchPaths : List System.FilePath := [])
-    (runKernelReplay : Bool := false) : IO AuditVerdict := do
+    (extraSearchPaths : List System.FilePath := []) : IO (Except AuditVerdict LoadedModules) := do
   let t0 ← IO.monoNanosNow
   withExtraSearchPaths extraSearchPaths do
+    if rootModules.isEmpty then
+      let t1 ← IO.monoNanosNow
+      return .error (.rejected #[.noAuditTargets "no root modules supplied"]
+        { elapsedMicros := (t1 - t0) / 1000 })
     let (artifactViolations, privChecked) ← checkPrivateOleanArtifactsIO rootModules policy
     if !artifactViolations.isEmpty then
       let t1 ← IO.monoNanosNow
-      return .rejected artifactViolations {
+      return .error (.rejected artifactViolations {
         privateArtifactsChecked := privChecked
         elapsedMicros := (t1 - t0) / 1000
-      }
+      })
     let imports := rootModules.map fun m => ({ module := m } : Import)
-    let env ← Lean.importModules imports {} (trustLevel := 0) (plugins := #[])
-      (loadExts := false) (level := OLeanLevel.private)
-    let privEnv := env.setExporting false
+    let loaded ← (Lean.importModules imports {} (trustLevel := 0) (plugins := #[])
+      (loadExts := false) (level := OLeanLevel.private)).toBaseIO
+    let t1 ← IO.monoNanosNow
+    match loaded with
+    | .error err =>
+      return .error (.rejected #[.environmentLoadFailed err.toString] {
+        privateArtifactsChecked := privChecked
+        importMicros := (t1 - t0) / 1000
+        elapsedMicros := (t1 - t0) / 1000
+      })
+    | .ok env =>
+      return .ok {
+        privEnv := env.setExporting false
+        rootModules
+        extraSearchPaths
+        privateArtifactsChecked := privChecked
+        importMicros := (t1 - t0) / 1000
+      }
+
+/-- Phase 2 of the on-disk auditor, run against an already loaded `LoadedModules`:
+    1. Verifies that modules whose names carry trust were loaded from the directories
+       those names are pinned to (`checkModuleProvenanceIO`, `.moduleProvenanceSpoofed`).
+    2. Selects `explicitTargets?` (or all non-codegen-`_unsafe_rec` declarations—or all
+       theorems when `theoremsOnly := true`—declared in `targetModules?`, defaulting to
+       the loaded root modules).
+    3. Audits all selected targets via `auditDeclsInEnvPure` (full `ConstantInfo` graph
+       closure + `Lean.collectAxioms` cross-check + compiler overrides + statement-origin
+       separation).
+    4. Optionally replays the selected modules' declarations in
+       `baseEnv.toKernelEnv.replay` (one additional `importModules` of the base modules).
+
+    `elapsedMicros` in the result covers load plus audit; `importMicros` isolates the
+    load so repeated audits of one `LoadedModules` can be compared fairly. -/
+def auditLoadedModulesIO
+    (loaded : LoadedModules)
+    (policy : AuditPolicy := {})
+    (explicitTargets? : Option (Array Name) := none)
+    (theoremsOnly : Bool := false)
+    (runKernelReplay : Bool := false)
+    (toolchainLibDir? : Option System.FilePath := none)
+    (pinnedModuleRoots : Array (Name × System.FilePath) := #[])
+    (targetModules? : Option (Array Name) := none) : IO AuditVerdict := do
+  let t0 ← IO.monoNanosNow
+  let privEnv := loaded.privEnv
+  let targetModules := targetModules?.getD loaded.rootModules
+  let finish (t1 : Nat) (s : AuditStats) : AuditStats :=
+    { s with
+      modulesLoaded := privEnv.header.modules.size
+      privateArtifactsChecked := loaded.privateArtifactsChecked
+      importMicros := loaded.importMicros
+      elapsedMicros := loaded.importMicros + (t1 - t0) / 1000 }
+  withExtraSearchPaths loaded.extraSearchPaths do
+    let provenanceViolations ←
+      checkModuleProvenanceIO (privEnv.header.modules.map (·.module)) policy
+        toolchainLibDir? pinnedModuleRoots
+    if !provenanceViolations.isEmpty then
+      let t1 ← IO.monoNanosNow
+      return .rejected provenanceViolations (finish t1 {})
     let targets : Array Name := match explicitTargets? with
       | some ts => ts
       | none => Id.run do
         let mut acc : Array Name := #[]
         for m in privEnv.header.modules, data in privEnv.header.moduleData do
-          if rootModules.contains m.module then
+          if targetModules.contains m.module then
             for ci in data.constants do
               if !isCodegenUnsafeRec privEnv (some m.module) ci then
                 if !theoremsOnly || ci.isTheorem then
@@ -922,7 +1198,7 @@ def auditCompiledModulesIO
       let mut replayLocals : Std.HashMap Name ConstantInfo := {}
       let mut baseMods : Array Name := #[]
       for m in privEnv.header.modules, data in privEnv.header.moduleData do
-        if rootModules.contains m.module then
+        if targetModules.contains m.module then
           for ci in data.constants do
             if !isCodegenUnsafeRec privEnv (some m.module) ci then
               replayLocals := replayLocals.insert ci.name ci
@@ -936,17 +1212,40 @@ def auditCompiledModulesIO
       catch err =>
         violations := pushUniqueViolation violations (.kernelReplayFailed err.toString)
     let t1 ← IO.monoNanosNow
-    let baseStats := verdict.stats
-    let finalStats : AuditStats := {
-      baseStats with
-      privateArtifactsChecked := privChecked
-      kernelReplayedDeclarations := replayedCount
-      elapsedMicros := (t1 - t0) / 1000
-    }
+    let finalStats := finish t1 { verdict.stats with kernelReplayedDeclarations := replayedCount }
     if violations.isEmpty then
       return .ok finalStats
     else
       return .rejected violations finalStats
+
+/-- End-to-end on-disk compiled `.olean` / `.olean.private` module auditor
+    (`loadCompiledModulesIO` followed by `auditLoadedModulesIO`):
+    1. Checks `.olean` / `.olean.server` / `.olean.private` presence via
+       `checkPrivateOleanArtifactsIO`.
+    2. Loads `rootModules` at `trustLevel := 0`, `loadExts := false`, `level := OLeanLevel.private`
+       (load failures surface as `.environmentLoadFailed`).
+    3. Verifies that modules whose names carry trust were loaded from the directories
+       those names are pinned to (`checkModuleProvenanceIO`, `.moduleProvenanceSpoofed`).
+    4. Applies `env.setExporting false` so private constants and theorem proofs are visible.
+    5. Selects `explicitTargets` (or all non-codegen-`_unsafe_rec` declarations—or all theorems
+       when `theoremsOnly := true`—declared in `rootModules`).
+    6. Audits all selected targets via `auditDeclsInEnvPure` (full `ConstantInfo` graph closure
+       + `Lean.collectAxioms` cross-check + compiler overrides + statement-origin separation).
+    7. Optionally replays target-module declarations in `baseEnv.toKernelEnv.replay`. -/
+def auditCompiledModulesIO
+    (rootModules : Array Name)
+    (policy : AuditPolicy := {})
+    (explicitTargets? : Option (Array Name) := none)
+    (theoremsOnly : Bool := false)
+    (extraSearchPaths : List System.FilePath := [])
+    (runKernelReplay : Bool := false)
+    (toolchainLibDir? : Option System.FilePath := none)
+    (pinnedModuleRoots : Array (Name × System.FilePath) := #[]) : IO AuditVerdict := do
+  match (← loadCompiledModulesIO rootModules policy extraSearchPaths) with
+  | .error verdict => return verdict
+  | .ok loaded =>
+    auditLoadedModulesIO loaded policy explicitTargets? theoremsOnly runKernelReplay
+      toolchainLibDir? pinnedModuleRoots
 
 /-! ## Part 2: Constructive *DafnyCert*-Style Specification-Strength Mutant Harness -/
 
@@ -976,13 +1275,22 @@ inductive MutantCategory where
   | custom (label : String)
   deriving DecidableEq, Repr, Inhabited
 
-/-- A single named, categorized constructive mutant kill against `(req, ens)`. -/
+/-- A single named, categorized, *discriminating* constructive mutant kill against
+    `(req, ens)`.
+
+    Besides the rejected `mutantOutput`, a kill must exhibit a `referenceOutput` that
+    the specification *accepts on the same input*. Without it, a specification that is
+    simply unsatisfiable on `input` (`∀ y, ¬ ens input y`, i.e. unimplementable there)
+    would "kill" every mutant vacuously; with it, each kill proves the specification
+    genuinely separates a correct behaviour from the buggy one. -/
 structure NamedMutantKill {In : Type u} {Out : Type v}
     (req : In → Prop) (ens : In → Out → Prop) : Type (max u v) where
   name : String
   category : MutantCategory
   input : In
   input_valid : req input
+  referenceOutput : Out
+  reference_accepted : ens input referenceOutput
   mutantOutput : Out
   killed : ¬ ens input mutantOutput
 
@@ -1118,6 +1426,68 @@ theorem multi_mutant_impl_rejected_by_spec {In : Type u} {Out : Type v}
     ¬ (∀ x, req x → ens x (f_mut x)) :=
   fun hSpec => k.killed (hMut ▸ hSpec k.input k.input_valid)
 
+/-- A discriminating kill's accepted reference output and rejected mutant output are
+    provably distinct. -/
+theorem NamedMutantKill.reference_ne_mutant {In : Type u} {Out : Type v}
+    {req : In → Prop} {ens : In → Out → Prop}
+    (k : NamedMutantKill req ens) : k.referenceOutput ≠ k.mutantOutput :=
+  fun h => k.killed (h ▸ k.reference_accepted)
+
+/-- No kill can sit at an input where the specification is unimplementable
+    (`∀ y, ¬ ens x y`): rejecting a mutant there would be vacuous. This closes the gap
+    left by `MultiMutantSpecCert.ens_realizable`, which only witnesses realizability
+    at the single input `x₀`. -/
+theorem no_kill_at_unrealizable_input {In : Type u} {Out : Type v}
+    {req : In → Prop} {ens : In → Out → Prop}
+    (k : NamedMutantKill req ens) (hDead : ∀ y, ¬ ens k.input y) : False :=
+  hDead k.referenceOutput k.reference_accepted
+
+/-- Strongest specification-strength certificate: `(req, ens)` is satisfiable, is
+    realizable on *every* valid input, and pins the output *uniquely*.
+
+    A finite mutant list only shows that a handful of hand-picked wrong outputs are
+    rejected. A deterministic specification rejects every deviating output on every
+    valid input at once (`DeterministicSpecCert.kills_every_deviation`), so no mutant
+    category can be silently missing from the suite. -/
+structure DeterministicSpecCert {In : Type u} {Out : Type v}
+    (req : In → Prop) (ens : In → Out → Prop) : Prop where
+  req_nonvacuous : ∃ x, req x
+  realizable : ∀ x, req x → ∃ y, ens x y
+  unique : ∀ x y y', req x → ens x y → ens x y' → y = y'
+
+/-- Under a deterministic specification, any output differing from an accepted
+    reference output on a valid input is rejected. -/
+theorem DeterministicSpecCert.kills_every_deviation {In : Type u} {Out : Type v}
+    {req : In → Prop} {ens : In → Out → Prop}
+    (c : DeterministicSpecCert req ens) {x : In} {yRef yMut : Out}
+    (hReq : req x) (hRef : ens x yRef) (hNe : yMut ≠ yRef) : ¬ ens x yMut :=
+  fun hMut => hNe (c.unique x yMut yRef hReq hMut hRef)
+
+/-- Under a deterministic specification, any implementation that deviates from a
+    spec-satisfying reference implementation on even one valid input violates the
+    specification. -/
+theorem DeterministicSpecCert.deviating_impl_rejected {In : Type u} {Out : Type v}
+    {req : In → Prop} {ens : In → Out → Prop}
+    (c : DeterministicSpecCert req ens) (fRef fMut : In → Out)
+    (hRef : ∀ x, req x → ens x (fRef x)) {x : In} (hReq : req x)
+    (hNe : fMut x ≠ fRef x) : ¬ (∀ x, req x → ens x (fMut x)) :=
+  fun hSpec => hNe (c.unique x (fMut x) (fRef x) hReq (hSpec x hReq) (hRef x hReq))
+
+/-- A trivial `ensures := True` postcondition over an output type with two distinct
+    values is never deterministic. -/
+theorem no_deterministic_cert_of_trivial_ens {In : Type u} {Out : Type v}
+    (req : In → Prop) (y₁ y₂ : Out) (hNe : y₁ ≠ y₂) :
+    DeterministicSpecCert req (fun (_ : In) (_ : Out) => True) → False :=
+  fun c => match c.req_nonvacuous with
+    | ⟨x, hx⟩ => hNe (c.unique x y₁ y₂ hx trivial trivial)
+
+/-- A vacuous `requires := False` precondition is never deterministic. -/
+theorem no_deterministic_cert_of_vacuous_req {In : Type u} {Out : Type v}
+    (ens : In → Out → Prop) :
+    DeterministicSpecCert (fun (_ : In) => False) ens → False :=
+  fun c => match c.req_nonvacuous with
+    | ⟨_, hx⟩ => hx
+
 /-- Bridging metatheorem to `Trusted.VerificationResult.ItemSpec`: an `ItemSpec`
     that leaves `post` at its default (`fun _ _ => True`) can never admit a
     `SpecStrengthCert`. -/
@@ -1189,136 +1559,445 @@ theorem no_modularItemSpec_cert_of_vacuous_envAssumed (defId : String)
 
 /-! ### `MetaM` Spec-Strength Gate (`auditSpecStrengthCertInEnv`) -/
 
-private def recognisedCertHeads : Array Name := #[
+/-- Certificate heads stated directly over `(In, Out, req, ens)`. -/
+private def directCertHeads : Array Name := #[
   ``SpecStrengthCert,
   ``MultiMutantSpecCert,
-  ``ItemSpecStrengthCert,
+  ``DeterministicSpecCert
+]
+
+/-- Certificate typeclass heads paired with the specification class they certify. -/
+private def classCertHeads : Array (Name × Name) := #[
+  (``ItemSpecStrengthCert, ``ItemSpec),
+  (``ItemMultiMutantCert, ``ItemSpec),
+  (``StatefulItemSpecStrengthCert, ``StatefulItemSpec),
+  (``StatefulItemMultiMutantCert, ``StatefulItemSpec),
+  (``ModularItemSpecStrengthCert, ``ModularItemSpec),
+  (``ModularItemMultiMutantCert, ``ModularItemSpec)
+]
+
+/-- Certificate heads whose witness carries a categorized `MultiMutantSpecCert`. -/
+private def multiMutantCertHeads : Array Name := #[
+  ``MultiMutantSpecCert,
   ``ItemMultiMutantCert,
-  ``StatefulItemSpecStrengthCert,
   ``StatefulItemMultiMutantCert,
-  ``ModularItemSpecStrengthCert,
   ``ModularItemMultiMutantCert
 ]
 
+/-- If the conclusion of `ty` (after stripping binders and delta-unfolding up to `fuel`
+    head definitions, regardless of their reducibility) is an application of `specClass`,
+    return its first argument (the `defId` expression). Unfolding makes a specification
+    declared at an alias type (`abbrev MySpec := ItemSpec "x"`) visible. -/
+def specClassConclusionArg? (kenv : Kernel.Environment) (specClass : Name) (ty : Expr)
+    (fuel : Nat := 8) : Option Expr :=
+  match fuel with
+  | 0 => none
+  | fuel + 1 =>
+    let concl := ty.getForallBody
+    match concl.getAppFn with
+    | .const c lvls =>
+      if c == specClass then
+        some (concl.getAppArgs[0]?.getD (.bvar 0))
+      else
+        match kenv.find? c with
+        | some (.defnInfo v) =>
+          if v.levelParams.length == lvls.length then
+            specClassConclusionArg? kenv specClass
+              ((v.value.instantiateLevelParams v.levelParams lvls).beta concl.getAppArgs) fuel
+          else none
+        | _ => none
+    | _ => none
+
+/-- All non-constructor constants whose type concludes (up to unfolding type aliases) in
+    `specClass "<defId>"`, or in `specClass e` for a non-literal `e` (which could match
+    any `defId`).
+
+    Scans the whole kernel environment rather than the instance table, so that neither
+    `attribute [-instance]`, a plain non-`instance` `def`, nor an alias-typed instance
+    can hide a competing specification for the same `defId`. The only constants skipped
+    are the structure auxiliaries Lean generates next to the class itself (e.g.
+    `ItemSpec.mk._flat_ctor`): names under `specClass` that originate in the module
+    declaring `specClass`. -/
+def specInstanceCandidates (privEnv : Environment) (specClass : Name) (defId : String) :
+    Array Name :=
+  let kenv := privEnv.checked.get
+  let classMod? := originModule? privEnv specClass
+  -- `skip` memoises conclusion heads already known not to be definitions (inductives,
+  -- structures, axioms, ...), so the alias-unfolding path only runs for the rare
+  -- declarations whose type is headed by a definition.
+  let (found, _) := kenv.constants.fold (init := ((#[] : Array Name), ({} : NameSet)))
+    fun (acc, skip) n ci =>
+      match ci with
+      | .defnInfo _ | .opaqueInfo _ | .axiomInfo _ | .thmInfo _ =>
+        match ci.type.getForallBody.getAppFn with
+        | .const head _ =>
+          if skip.contains head then (acc, skip)
+          else
+            let headIsDefn := match kenv.find? head with
+              | some (.defnInfo _) => true
+              | _ => false
+            if head != specClass && !headIsDefn then (acc, skip.insert head)
+            else
+              match specClassConclusionArg? kenv specClass ci.type with
+              | none => (acc, skip)
+              | some arg =>
+                if specClass.isPrefixOf n && originModule? privEnv n == classMod? then (acc, skip)
+                else
+                  match arg with
+                  | Expr.lit (Literal.strVal s) =>
+                    if s == defId then (acc.push n, skip) else (acc, skip)
+                  | _ => (acc.push n, skip)
+        | _ => (acc, skip)
+      | _ => (acc, skip)
+  found.qsort Name.lt
+
+/-- Resolve *the* specification instance of `specClass` for `defId`, failing closed
+    unless exactly one candidate constant exists and typeclass synthesis selects it.
+
+    A verification claim is stated against whichever instance resolved when the claim
+    was elaborated. If a second instance for the same `defId` exists (declared later,
+    with higher priority, or after erasing the first), a certificate could be checked
+    against a stronger specification than the one actually verified; uniqueness rules
+    that substitution out. -/
+def resolveUniqueSpecInstance (specName : Name) (specClass : Name) (defId : String) :
+    MetaM (Except AuditViolation Expr) := do
+  let privEnv := (← getEnv).setExporting false
+  let candidates := specInstanceCandidates privEnv specClass defId
+  if candidates.isEmpty then
+    return .error (.specStrengthCertMissing specName
+      s!"no {specClass} instance found for \"{defId}\"")
+  if candidates.size != 1 then
+    return .error (.specInstanceAmbiguous specName specClass candidates)
+  let specTy := mkApp (mkConst specClass) (mkStrLit defId)
+  match (← Meta.synthInstance? specTy) with
+  | none =>
+    return .error (.specStrengthCertMissing specName
+      s!"no {specClass} instance found for \"{defId}\"")
+  | some inst =>
+    if inst.getAppFn.constName? == some candidates[0]! then
+      return .ok inst
+    else
+      return .error (.specInstanceAmbiguous specName specClass
+        (candidates.push (inst.getAppFn.constName?.getD .anonymous)))
+
+/-- Bind the (weak-head-normal) certificate type `ty` of `certDecl` to the target
+    specification. Returns `none` when bound, or the violation explaining why not.
+
+    A certificate that cannot be tied to the specification under audit is worthless, so
+    binding information is mandatory: direct certificates need *both* `expectedReq?` and
+    `expectedEns?`; typeclass certificates need `expectedDefId?` and must mention the
+    unique specification instance for that `defId`. -/
+private def checkCertBinding (specName certDecl : Name) (ty : Expr)
+    (expectedReq? expectedEns? : Option Expr) (expectedDefId? : Option String) :
+    MetaM (Option AuditViolation) := do
+  let fn := ty.getAppFn
+  let args := ty.getAppArgs
+  let tyStr := toString (← Meta.ppExpr ty)
+  let invalid (msg : String) : AuditViolation :=
+    .specStrengthCertInvalidType certDecl specName s!"{msg}: {tyStr}"
+  let some head := fn.constName?
+    | return some (invalid "not a SpecStrengthCert type")
+  if directCertHeads.contains head then
+    if args.size != 4 then
+      return some (invalid "malformed direct certificate type")
+    match expectedReq?, expectedEns? with
+    | some expReq, some expEns =>
+      unless (← Meta.isDefEq args[2]! expReq) do
+        return some (invalid "precondition mismatch")
+      unless (← Meta.isDefEq args[3]! expEns) do
+        return some (invalid "postcondition mismatch")
+      return none
+    | _, _ =>
+      return some (invalid
+        "unbound certificate (both expectedReq? and expectedEns? are required to bind a direct certificate to its specification)")
+  else
+    match classCertHeads.find? (·.1 == head) with
+    | none => return some (invalid "not a SpecStrengthCert type")
+    | some (_, specClass) =>
+      if expectedReq?.isSome || expectedEns?.isSome then
+        return some (invalid "expected direct SpecStrengthCert/MultiMutantSpecCert, got")
+      let some defId := expectedDefId?
+        | return some (invalid
+            "unbound certificate (expectedDefId? is required to bind a typeclass certificate to its specification)")
+      if args.size != 2 then
+        return some (invalid "malformed typeclass certificate type")
+      unless (← Meta.isDefEq args[0]! (mkStrLit defId)) do
+        return some (invalid s!"certificate is for a different defId than \"{defId}\"")
+      match (← resolveUniqueSpecInstance specName specClass defId) with
+      | .error v => return some v
+      | .ok inst =>
+        unless (← Meta.isDefEq args[1]! inst) do
+          return some (invalid "certificate is stated against a different specification instance")
+        return none
+
+/-- Stable human-readable label of a `MutantCategory` (used in audit receipts). -/
+def MutantCategory.label : MutantCategory → String
+  | .wrongReturn => "wrongReturn"
+  | .offByOneScalar => "offByOneScalar"
+  | .swappedByteOrder => "swappedByteOrder"
+  | .wrapOverflow => "wrapOverflow"
+  | .truncatedLength => "truncatedLength"
+  | .wrongBranchTag => "wrongBranchTag"
+  | .unpreservedFrame => "unpreservedFrame"
+  | .custom label => s!"custom:{label}"
+
+/-- Reflect a `MutantCategory` value into the `Expr` denoting it. -/
+def MutantCategory.toExpr : MutantCategory → Expr
+  | .wrongReturn => mkConst ``MutantCategory.wrongReturn
+  | .offByOneScalar => mkConst ``MutantCategory.offByOneScalar
+  | .swappedByteOrder => mkConst ``MutantCategory.swappedByteOrder
+  | .wrapOverflow => mkConst ``MutantCategory.wrapOverflow
+  | .truncatedLength => mkConst ``MutantCategory.truncatedLength
+  | .wrongBranchTag => mkConst ``MutantCategory.wrongBranchTag
+  | .unpreservedFrame => mkConst ``MutantCategory.unpreservedFrame
+  | .custom label => mkApp (mkConst ``MutantCategory.custom) (mkStrLit label)
+
+/-- Decide, by reducing `MultiMutantSpecCert.coversCategory multiExpr cat` to a `Bool`
+    literal, which of the `required` categories the certificate term `multiExpr` fails
+    to kill. Anything that does not reduce to `Bool.true` counts as missing. -/
+private def missingMutantCategories (multiExpr : Expr) (required : List MutantCategory) :
+    MetaM (Array String) := do
+  let mut missing : Array String := #[]
+  for cat in required do
+    let covers ← Meta.mkAppM ``MultiMutantSpecCert.coversCategory #[multiExpr, cat.toExpr]
+    let r ← Meta.whnf covers
+    unless r.isConstOf ``Bool.true do
+      missing := missing.push cat.label
+  return missing
+
+/-- Enforce `required` mutant-category coverage on the certificate expression `certExpr`
+    whose weak-head-normal type has head constant `head`. Single-mutant and
+    `DeterministicSpecCert` witnesses carry no categorized kills and therefore cannot
+    satisfy a non-empty `required` list. -/
+private def checkCategoryCoverage (certLabel : Name) (head : Name) (certExpr : Expr)
+    (required : List MutantCategory) : MetaM (Option AuditViolation) := do
+  if required.isEmpty then
+    return none
+  let multiExpr? : Option Expr ←
+    if head == ``MultiMutantSpecCert then pure (some certExpr)
+    else if multiMutantCertHeads.contains head then
+      pure (some (← Meta.mkProjection certExpr `cert))
+    else pure none
+  match multiExpr? with
+  | none =>
+    return some (.specStrengthCoverageGap certLabel (required.map (·.label)).toArray
+      "certificate carries no categorized mutant kills")
+  | some multiExpr =>
+    let missing ← missingMutantCategories multiExpr required
+    if missing.isEmpty then
+      return none
+    else
+      return some (.specStrengthCoverageGap certLabel missing
+        "required mutant categories are not killed by the certificate")
+
 /-- `MetaM` specification-strength gate verifying that:
-    1. A registered `SpecStrengthCert` / `MultiMutantSpecCert` (or `*Item*Cert`)
-       declaration `certDecl` exists in the environment;
-    2. Its kernel type reduces via `whnf` to a recognised certificate constructor
-       matching `expectedReq?` / `expectedEns?` (when supplied) via `Meta.isDefEq`
-       (preventing certificate substitution from an unrelated strong specification);
+    1. A registered `SpecStrengthCert` / `MultiMutantSpecCert` / `DeterministicSpecCert`
+       (or `*Item*Cert`) declaration `certDecl` exists in the environment;
+    2. Its kernel type reduces via `whnf` to a recognised certificate head that is
+       *bound* to the target specification (`checkCertBinding`): direct certificates
+       must match both `expectedReq?` and `expectedEns?` up to `Meta.isDefEq`;
+       typeclass certificates must match `expectedDefId?` and the unique specification
+       instance for it. Omitting the binding information is rejected, never waved
+       through (preventing certificate substitution from an unrelated strong spec);
     3. The certificate declaration itself passes the `MetaM` environment audit under
        `policy` (default `AuditPolicy.constructive`, preventing `sorry`-faked,
-       `Classical.choice`-tainted, `partial`, `unsafe`, or `@[implemented_by]` certs). -/
+       `Classical.choice`-tainted, `partial`, `unsafe`, or `@[implemented_by]` certs);
+    4. When `requiredCategories` is non-empty, the certificate is a categorized
+       multi-mutant certificate whose kills cover every required `MutantCategory`
+       (`.specStrengthCoverageGap` otherwise). -/
 def auditSpecStrengthCertInEnv
     (specName : Name)
     (certDecl? : Option Name)
     (expectedReq? : Option Expr := none)
     (expectedEns? : Option Expr := none)
-    (policy : AuditPolicy := { AuditPolicy.constructive with checkStatementOrigin := false }) :
+    (policy : AuditPolicy := { AuditPolicy.constructive with checkStatementOrigin := false })
+    (expectedDefId? : Option String := none)
+    (requiredCategories : List MutantCategory := []) :
     MetaM AuditVerdict := do
   let t0 ← IO.monoNanosNow
+  let reject (vs : Array AuditViolation) : MetaM AuditVerdict := do
+    let t1 ← IO.monoNanosNow
+    return .rejected vs { elapsedMicros := (t1 - t0) / 1000 }
   match certDecl? with
   | none =>
-    let t1 ← IO.monoNanosNow
-    return .rejected
-      #[.specStrengthCertMissing specName "no registered SpecStrengthCert or MultiMutantSpecCert declaration"]
-      { elapsedMicros := (t1 - t0) / 1000 }
+    reject #[.specStrengthCertMissing specName
+      "no registered SpecStrengthCert or MultiMutantSpecCert declaration"]
   | some certDecl =>
     let env ← getEnv
     let privEnv := env.setExporting false
     match privEnv.checked.get.find? certDecl with
-    | none =>
-      let t1 ← IO.monoNanosNow
-      return .rejected #[.missingDeclaration certDecl] { elapsedMicros := (t1 - t0) / 1000 }
+    | none => reject #[.missingDeclaration certDecl]
     | some ci =>
       let ty ← Meta.whnf ci.type
-      let fn := ty.getAppFn
-      let args := ty.getAppArgs
-      let headOk := match fn with
-        | .const n _ => recognisedCertHeads.contains n
-        | _ => false
-      if !headOk then
-        let tyStr := toString (← Meta.ppExpr ty)
-        let t1 ← IO.monoNanosNow
-        return .rejected
-          #[.specStrengthCertInvalidType certDecl specName s!"not a SpecStrengthCert type: {tyStr}"]
-          { elapsedMicros := (t1 - t0) / 1000 }
-      -- When `expectedReq?` / `expectedEns?` are provided, verify definitional match on
-      -- `SpecStrengthCert` / `MultiMutantSpecCert` arguments `[In, Out, req, ens]`.
-      let isDirectCert := fn.isConstOf ``SpecStrengthCert || fn.isConstOf ``MultiMutantSpecCert
-      if isDirectCert && args.size >= 4 then
-        if let some expReq := expectedReq? then
-          unless (← Meta.isDefEq args[2]! expReq) do
-            let tyStr := toString (← Meta.ppExpr ty)
-            let t1 ← IO.monoNanosNow
-            return .rejected
-              #[.specStrengthCertInvalidType certDecl specName s!"precondition mismatch: {tyStr}"]
-              { elapsedMicros := (t1 - t0) / 1000 }
-        if let some expEns := expectedEns? then
-          unless (← Meta.isDefEq args[3]! expEns) do
-            let tyStr := toString (← Meta.ppExpr ty)
-            let t1 ← IO.monoNanosNow
-            return .rejected
-              #[.specStrengthCertInvalidType certDecl specName s!"postcondition mismatch: {tyStr}"]
-              { elapsedMicros := (t1 - t0) / 1000 }
-      else if expectedReq?.isSome || expectedEns?.isSome then
-        let tyStr := toString (← Meta.ppExpr ty)
-        let t1 ← IO.monoNanosNow
-        return .rejected
-          #[.specStrengthCertInvalidType certDecl specName s!"expected direct SpecStrengthCert/MultiMutantSpecCert, got {tyStr}"]
-          { elapsedMicros := (t1 - t0) / 1000 }
-      -- Audit the certificate declaration itself so `sorry`-faked or unsound certs are rejected.
-      let envVerdict ← liftM <| auditDeclsInEnvIO privEnv #[certDecl] policy
-      let t1 ← IO.monoNanosNow
-      let elapsedMicros := (t1 - t0) / 1000
-      return match envVerdict with
-        | .ok s => .ok { s with elapsedMicros }
-        | .rejected vs s => .rejected vs { s with elapsedMicros }
+      match (← checkCertBinding specName certDecl ty expectedReq? expectedEns? expectedDefId?) with
+      | some v => reject #[v]
+      | none =>
+        let certExpr := mkConst certDecl (ci.levelParams.map mkLevelParam)
+        let head := ty.getAppFn.constName?.getD .anonymous
+        match (← checkCategoryCoverage certDecl head certExpr requiredCategories) with
+        | some v => reject #[v]
+        | none =>
+          -- Audit the certificate declaration itself so `sorry`-faked or unsound certs
+          -- are rejected.
+          let envVerdict ← liftM <| auditDeclsInEnvIO privEnv #[certDecl] policy
+          let t1 ← IO.monoNanosNow
+          let elapsedMicros := (t1 - t0) / 1000
+          return match envVerdict with
+            | .ok s => .ok { s with elapsedMicros }
+            | .rejected vs s => .rejected vs { s with elapsedMicros }
 
-/-- `MetaM` gate using typeclass synthesis to locate an `ItemSpecStrengthCert` (or
-    `ItemMultiMutantCert`) for `ItemSpec defId`, rejecting fail-closed if none is
-    registered or if any constant in the synthesized witness fails the environment audit. -/
-def auditItemSpecStrengthBySynth (defId : String)
-    (policy : AuditPolicy := { AuditPolicy.constructive with checkStatementOrigin := false }) :
+/-- Claim-bound specification-strength gate.
+
+    Reads the contract straight out of the audited verification claim: `claimDecl` must
+    be a `VerificationResult c` or `StatefulVerificationResult c`, and the certificate
+    must be a direct `SpecStrengthCert` / `MultiMutantSpecCert` / `DeterministicSpecCert`
+    over exactly `c.pre` / `c.post` (paired as `(args, mem)` / `(ret, mem')` for stateful
+    claims). Because the expected `(req, ens)` come from the claim's own statement, a
+    certificate for any other specification (a stronger sibling instance, a shadowing
+    instance, a spec that was never the one verified) cannot be substituted.
+
+    `ModularVerificationResult` claims are rejected here on purpose: their strength also
+    depends on a non-vacuous rely predicate `envAssumed`, which only the typeclass
+    certificates (`ModularItem*Cert.handler_valid`) witness. -/
+def auditClaimSpecStrengthInEnv
+    (claimDecl : Name)
+    (certDecl? : Option Name)
+    (policy : AuditPolicy := { AuditPolicy.constructive with checkStatementOrigin := false })
+    (requiredCategories : List MutantCategory := []) :
     MetaM AuditVerdict := do
   let t0 ← IO.monoNanosNow
+  let reject (vs : Array AuditViolation) : MetaM AuditVerdict := do
+    let t1 ← IO.monoNanosNow
+    return .rejected vs { elapsedMicros := (t1 - t0) / 1000 }
+  let privEnv := (← getEnv).setExporting false
+  match privEnv.checked.get.find? claimDecl with
+  | none => reject #[.missingDeclaration claimDecl]
+  | some ci =>
+    let ty ← Meta.whnf ci.type
+    let args := ty.getAppArgs
+    let head := ty.getAppFn.constName?.getD .anonymous
+    let tyStr := toString (← Meta.ppExpr ty)
+    let notClaim (why : String) : AuditViolation :=
+      .specStrengthCertInvalidType claimDecl claimDecl s!"{why}: {tyStr}"
+    if args.size != 1 then
+      reject #[notClaim "claim is not a VerificationResult / StatefulVerificationResult"]
+    else if head == ``VerificationResult then
+      let c := args[0]!
+      let pre ← Meta.mkAppM ``Claim.pre #[c]
+      let post ← Meta.mkAppM ``Claim.post #[c]
+      auditSpecStrengthCertInEnv claimDecl certDecl? (some pre) (some post) policy none
+        requiredCategories
+    else if head == ``StatefulVerificationResult then
+      let c := args[0]!
+      let pre ← Meta.mkAppM ``StatefulClaim.pre #[c]
+      let post ← Meta.mkAppM ``StatefulClaim.post #[c]
+      -- `pre : A → M → Prop`, `post : A → M → R → M → Prop`; the harness states the
+      -- contract over `In := A × M` and `Out := R × M`.
+      let postTy ← Meta.whnf (← Meta.inferType post)
+      Meta.forallBoundedTelescope postTy (some 4) fun xs _ => do
+        if xs.size != 4 then
+          reject #[notClaim "stateful claim postcondition is not 4-ary"]
+        else
+          let aTy ← Meta.inferType xs[0]!
+          let mTy ← Meta.inferType xs[1]!
+          let rTy ← Meta.inferType xs[2]!
+          let inTy ← Meta.mkAppM ``Prod #[aTy, mTy]
+          let outTy ← Meta.mkAppM ``Prod #[rTy, mTy]
+          let req ← Meta.withLocalDeclD `p inTy fun p => do
+            Meta.mkLambdaFVars #[p]
+              (mkApp2 pre (← Meta.mkAppM ``Prod.fst #[p]) (← Meta.mkAppM ``Prod.snd #[p]))
+          let ens ← Meta.withLocalDeclD `p inTy fun p =>
+            Meta.withLocalDeclD `r outTy fun r => do
+              Meta.mkLambdaFVars #[p, r]
+                (mkApp4 post (← Meta.mkAppM ``Prod.fst #[p]) (← Meta.mkAppM ``Prod.snd #[p])
+                  (← Meta.mkAppM ``Prod.fst #[r]) (← Meta.mkAppM ``Prod.snd #[r]))
+          auditSpecStrengthCertInEnv claimDecl certDecl? (some req) (some ens) policy none
+            requiredCategories
+    else if head == ``ModularVerificationResult then
+      reject #[notClaim
+        "modular claims need a rely non-vacuity witness; use the ModularItem*Cert typeclass gate"]
+    else
+      reject #[notClaim "claim is not a VerificationResult / StatefulVerificationResult"]
+
+/-- Shared implementation of the typeclass-synthesis gates: resolves the unique
+    specification instance of `specClass` for `defId`, synthesizes a
+    `multiCertClass` (falling back to `singleCertClass` unless `requireMultiMutant`)
+    certificate for exactly that instance, and audits every constant of the witness. -/
+private def auditSpecStrengthBySynthCore
+    (specClass multiCertClass singleCertClass : Name)
+    (defId : String) (policy : AuditPolicy) (requireMultiMutant : Bool)
+    (requiredCategories : List MutantCategory) :
+    MetaM AuditVerdict := do
+  let t0 ← IO.monoNanosNow
+  let reject (vs : Array AuditViolation) : MetaM AuditVerdict := do
+    let t1 ← IO.monoNanosNow
+    return .rejected vs { elapsedMicros := (t1 - t0) / 1000 }
   let specName := Name.mkSimple defId
   let defIdExpr := mkStrLit defId
-  let itemSpecTy := mkApp (mkConst ``ItemSpec) defIdExpr
-  let some itemSpecInst ← Meta.synthInstance? itemSpecTy
-    | do
-      let t1 ← IO.monoNanosNow
-      return .rejected
-        #[.specStrengthCertMissing specName s!"no ItemSpec instance found for \"{defId}\""]
-        { elapsedMicros := (t1 - t0) / 1000 }
-  let singleCertTy := mkApp2 (mkConst ``ItemSpecStrengthCert) defIdExpr itemSpecInst
-  let multiCertTy := mkApp2 (mkConst ``ItemMultiMutantCert) defIdExpr itemSpecInst
-  let certInst? ← match (← Meta.synthInstance? multiCertTy) with
-    | some inst => pure (some inst)
-    | none => Meta.synthInstance? singleCertTy
-  match certInst? with
-  | none =>
-    let t1 ← IO.monoNanosNow
-    return .rejected
-      #[.specStrengthCertMissing specName s!"no ItemSpecStrengthCert or ItemMultiMutantCert instance found for \"{defId}\""]
-      { elapsedMicros := (t1 - t0) / 1000 }
-  | some certInst =>
-    match expressionEdges certInst with
-    | .error msg =>
-      let t1 ← IO.monoNanosNow
-      return .rejected
-        #[.openTermExpression specName specName s!"synthesized cert instance: {msg}"]
-        { elapsedMicros := (t1 - t0) / 1000 }
-    | .ok constSet =>
-      let env ← getEnv
-      let privEnv := env.setExporting false
-      let targets := constSet.toArray.qsort Name.lt
-      let envVerdict ← liftM <| auditDeclsInEnvIO privEnv targets policy
-      let t1 ← IO.monoNanosNow
-      let elapsedMicros := (t1 - t0) / 1000
-      return match envVerdict with
-        | .ok s => .ok { s with elapsedMicros }
-        | .rejected vs s => .rejected vs { s with elapsedMicros }
+  match (← resolveUniqueSpecInstance specName specClass defId) with
+  | .error v => reject #[v]
+  | .ok specInst =>
+    let singleCertTy := mkApp2 (mkConst singleCertClass) defIdExpr specInst
+    let multiCertTy := mkApp2 (mkConst multiCertClass) defIdExpr specInst
+    let needMulti := requireMultiMutant || !requiredCategories.isEmpty
+    let cert? : Option (Expr × Name) ← match (← Meta.synthInstance? multiCertTy) with
+      | some inst => pure (some (inst, multiCertClass))
+      | none =>
+        if needMulti then pure none
+        else pure ((← Meta.synthInstance? singleCertTy).map (·, singleCertClass))
+    match cert? with
+    | none =>
+      let wanted := if needMulti then s!"{multiCertClass}"
+        else s!"{singleCertClass} or {multiCertClass}"
+      reject #[.specStrengthCertMissing specName s!"no {wanted} instance found for \"{defId}\""]
+    | some (certInst, certHead) =>
+      match (← checkCategoryCoverage specName certHead certInst requiredCategories) with
+      | some v => reject #[v]
+      | none =>
+        match expressionEdges certInst with
+        | .error msg =>
+          reject #[.openTermExpression specName specName s!"synthesized cert instance: {msg}"]
+        | .ok constSet =>
+          let env ← getEnv
+          let privEnv := env.setExporting false
+          let targets := constSet.toArray.qsort Name.lt
+          let envVerdict ← liftM <| auditDeclsInEnvIO privEnv targets policy
+          let t1 ← IO.monoNanosNow
+          let elapsedMicros := (t1 - t0) / 1000
+          return match envVerdict with
+            | .ok s => .ok { s with elapsedMicros }
+            | .rejected vs s => .rejected vs { s with elapsedMicros }
+
+/-- `MetaM` gate using typeclass synthesis to locate an `ItemSpecStrengthCert` (or
+    `ItemMultiMutantCert`) for the unique `ItemSpec defId`, rejecting fail-closed if the
+    specification instance is missing or ambiguous, if no certificate is registered, or
+    if any constant in the synthesized witness fails the environment audit. -/
+def auditItemSpecStrengthBySynth (defId : String)
+    (policy : AuditPolicy := { AuditPolicy.constructive with checkStatementOrigin := false })
+    (requireMultiMutant : Bool := false)
+    (requiredCategories : List MutantCategory := []) :
+    MetaM AuditVerdict :=
+  auditSpecStrengthBySynthCore ``ItemSpec ``ItemMultiMutantCert ``ItemSpecStrengthCert
+    defId policy requireMultiMutant requiredCategories
+
+/-- `auditItemSpecStrengthBySynth` for `StatefulItemSpec defId`. -/
+def auditStatefulItemSpecStrengthBySynth (defId : String)
+    (policy : AuditPolicy := { AuditPolicy.constructive with checkStatementOrigin := false })
+    (requireMultiMutant : Bool := false)
+    (requiredCategories : List MutantCategory := []) :
+    MetaM AuditVerdict :=
+  auditSpecStrengthBySynthCore ``StatefulItemSpec ``StatefulItemMultiMutantCert
+    ``StatefulItemSpecStrengthCert defId policy requireMultiMutant requiredCategories
+
+/-- `auditItemSpecStrengthBySynth` for `ModularItemSpec defId` (the certificate also
+    carries a constructive witness that the rely predicate `envAssumed` is non-vacuous). -/
+def auditModularItemSpecStrengthBySynth (defId : String)
+    (policy : AuditPolicy := { AuditPolicy.constructive with checkStatementOrigin := false })
+    (requireMultiMutant : Bool := false)
+    (requiredCategories : List MutantCategory := []) :
+    MetaM AuditVerdict :=
+  auditSpecStrengthBySynthCore ``ModularItemSpec ``ModularItemMultiMutantCert
+    ``ModularItemSpecStrengthCert defId policy requireMultiMutant requiredCategories
 
 /-! ## Part 3: Representative Constructive `MultiMutantSpecCert` Examples -/
 
@@ -1354,9 +2033,36 @@ instance fxfsVmoSubsliceItemSpec :
   pre := fxfsVmoSubslicePre
   post := fxfsVmoSubslicePost
 
+/-- Introduction rule: on well-formed arguments `fxfsVmoSubslicePost` accepts exactly
+    `base_offset + (sub_end - sub_start)`. Used as the accepted reference output of
+    every discriminating kill below. -/
+theorem fxfsVmoSubslicePost_exact (base len s e : Nat) :
+    fxfsVmoSubslicePost
+      [ .scalar { bits := base, sizeBytes := 8 }
+      , .scalar { bits := len, sizeBytes := 8 }
+      , .scalar { bits := s, sizeBytes := 8 }
+      , .scalar { bits := e, sizeBytes := 8 } ]
+      (.scalar { bits := base + (e - s), sizeBytes := 8 }) := by
+  intro base' len' s' e' h
+  injection h with h1 hRest1
+  injection h1 with h1s
+  injection h1s with hBase _
+  injection hRest1 with h2 hRest2
+  injection h2 with h2s
+  injection h2s with hLen _
+  injection hRest2 with h3 hRest3
+  injection h3 with h3s
+  injection h3s with hS _
+  injection hRest3 with h4 _
+  injection h4 with h4s
+  injection h4s with hE _
+  subst hBase; subst hLen; subst hS; subst hE
+  rfl
+
 /-- Constructive `MultiMutantSpecCert` for `fxfs_storage_boundary::vmo_subslice_bounds_valid`,
     certifying realizability and killing `wrongReturn`, `wrapOverflow`, `truncatedLength`,
-    and `swappedByteOrder` mutants with zero `Classical.choice` and zero `sorryAx`. -/
+    `swappedByteOrder`, and `offByOneScalar` mutants (each against an accepted reference
+    output on the same input) with zero `Classical.choice` and zero `sorryAx`. -/
 def fxfsVmoSubsliceMultiCert :
     MultiMutantSpecCert fxfsVmoSubslicePre fxfsVmoSubslicePost where
   x₀ :=
@@ -1366,22 +2072,7 @@ def fxfsVmoSubsliceMultiCert :
     , .scalar { bits := 192, sizeBytes := 8 } ]
   req_nonvacuous := ⟨4096, 4096, 64, 192, by decide, by decide, by decide, rfl⟩
   y₀ := .scalar { bits := 4224, sizeBytes := 8 }
-  ens_realizable := by
-    intro base len s e h
-    injection h with h1 hRest1
-    injection h1 with h1s
-    injection h1s with hBase _
-    injection hRest1 with h2 hRest2
-    injection h2 with h2s
-    injection h2s with hLen _
-    injection hRest2 with h3 hRest3
-    injection h3 with h3s
-    injection h3s with hS _
-    injection hRest3 with h4 _
-    injection h4 with h4s
-    injection h4s with hE _
-    subst hBase; subst hLen; subst hS; subst hE
-    rfl
+  ens_realizable := fxfsVmoSubslicePost_exact 4096 4096 64 192
   kills :=
     [ { name := "fxfs_wrong_return_zero"
         category := .wrongReturn
@@ -1391,6 +2082,8 @@ def fxfsVmoSubsliceMultiCert :
           , .scalar { bits := 64, sizeBytes := 8 }
           , .scalar { bits := 192, sizeBytes := 8 } ]
         input_valid := ⟨4096, 4096, 64, 192, by decide, by decide, by decide, rfl⟩
+        referenceOutput := .scalar { bits := 4224, sizeBytes := 8 }
+        reference_accepted := fxfsVmoSubslicePost_exact 4096 4096 64 192
         mutantOutput := .scalar { bits := 0, sizeBytes := 8 }
         killed := by
           intro h
@@ -1406,6 +2099,8 @@ def fxfsVmoSubsliceMultiCert :
           , .scalar { bits := 0, sizeBytes := 8 }
           , .scalar { bits := 16, sizeBytes := 8 } ]
         input_valid := ⟨4294967288, 32, 0, 16, by decide, by decide, by decide, rfl⟩
+        referenceOutput := .scalar { bits := 4294967304, sizeBytes := 8 }
+        reference_accepted := fxfsVmoSubslicePost_exact 4294967288 32 0 16
         -- Mutant wraps `(0xFFFF_FFF8 + 16)` modulo `2^32` to `8`.
         mutantOutput := .scalar { bits := 8, sizeBytes := 8 }
         killed := by
@@ -1422,6 +2117,8 @@ def fxfsVmoSubsliceMultiCert :
           , .scalar { bits := 64, sizeBytes := 8 }
           , .scalar { bits := 192, sizeBytes := 8 } ]
         input_valid := ⟨4096, 4096, 64, 192, by decide, by decide, by decide, rfl⟩
+        referenceOutput := .scalar { bits := 4224, sizeBytes := 8 }
+        reference_accepted := fxfsVmoSubslicePost_exact 4096 4096 64 192
         -- Mutant omits `(sub_end - sub_start)` and returns bare `base_offset`.
         mutantOutput := .scalar { bits := 4096, sizeBytes := 8 }
         killed := by
@@ -1430,7 +2127,7 @@ def fxfsVmoSubsliceMultiCert :
           injection hEq with hS
           injection hS with hBits _
           exact absurd hBits (by decide) }
-    , { name := "fxfs_swapped_byte_order_be64"
+    , { name := "fxfs_swapped_byte_order_bswap64"
         category := .swappedByteOrder
         input :=
           [ .scalar { bits := 0x0102, sizeBytes := 8 }
@@ -1438,11 +2135,32 @@ def fxfsVmoSubsliceMultiCert :
           , .scalar { bits := 0, sizeBytes := 8 }
           , .scalar { bits := 0x0010, sizeBytes := 8 } ]
         input_valid := ⟨0x0102, 0x0400, 0, 0x0010, by decide, by decide, by decide, rfl⟩
-        -- Expected `0x0112`; mutant returns byte-swapped `0x1201`.
-        mutantOutput := .scalar { bits := 0x1201, sizeBytes := 8 }
+        referenceOutput := .scalar { bits := 0x0112, sizeBytes := 8 }
+        reference_accepted := fxfsVmoSubslicePost_exact 0x0102 0x0400 0 0x0010
+        -- Expected `0x0000_0000_0000_0112`; mutant returns the full 64-bit byte swap
+        -- `0x1201_0000_0000_0000`.
+        mutantOutput := .scalar { bits := 0x1201000000000000, sizeBytes := 8 }
         killed := by
           intro h
           have hEq := h 0x0102 0x0400 0 0x0010 rfl
+          injection hEq with hS
+          injection hS with hBits _
+          exact absurd hBits (by decide) }
+    , { name := "fxfs_off_by_one_inclusive_end"
+        category := .offByOneScalar
+        input :=
+          [ .scalar { bits := 4096, sizeBytes := 8 }
+          , .scalar { bits := 4096, sizeBytes := 8 }
+          , .scalar { bits := 64, sizeBytes := 8 }
+          , .scalar { bits := 192, sizeBytes := 8 } ]
+        input_valid := ⟨4096, 4096, 64, 192, by decide, by decide, by decide, rfl⟩
+        referenceOutput := .scalar { bits := 4224, sizeBytes := 8 }
+        reference_accepted := fxfsVmoSubslicePost_exact 4096 4096 64 192
+        -- Mutant treats `sub_end` as inclusive and returns `base + (e - s) + 1`.
+        mutantOutput := .scalar { bits := 4225, sizeBytes := 8 }
+        killed := by
+          intro h
+          have hEq := h 4096 4096 64 192 rfl
           injection hEq with hS
           injection hS with hBits _
           exact absurd hBits (by decide) }
@@ -1457,10 +2175,31 @@ instance fxfsVmoSubsliceItemSingleCert :
     ItemSpecStrengthCert "fxfs_storage_boundary::vmo_subslice_bounds_valid" where
   cert := fxfsVmoSubsliceMultiCert.toSpecStrengthCert
 
-/-- Proof that `fxfsVmoSubsliceMultiCert` covers all 4 required storage-boundary mutant categories. -/
+/-- Proof that `fxfsVmoSubsliceMultiCert` covers all required storage-boundary mutant categories. -/
 theorem fxfsVmoSubslice_covers_required_categories :
     fxfsVmoSubsliceMultiCert.coversAllCategories
-      [.wrongReturn, .wrapOverflow, .truncatedLength, .swappedByteOrder] = true := rfl
+      [.wrongReturn, .wrapOverflow, .truncatedLength, .swappedByteOrder, .offByOneScalar] = true := rfl
+
+/-- `fxfs_storage_boundary::vmo_subslice_bounds_valid` is a *deterministic* specification:
+    realizable on every valid input and pinning the returned offset uniquely, so every
+    deviating return value on every valid input is rejected, not just the five sampled
+    mutants above. -/
+theorem fxfsVmoSubslice_deterministic :
+    DeterministicSpecCert fxfsVmoSubslicePre fxfsVmoSubslicePost where
+  req_nonvacuous := ⟨_, fxfsVmoSubsliceMultiCert.req_nonvacuous⟩
+  realizable := by
+    intro args hPre
+    match hPre with
+    | ⟨base, len, s, e, _, _, _, hArgs⟩ =>
+      subst hArgs
+      exact ⟨_, fxfsVmoSubslicePost_exact base len s e⟩
+  unique := by
+    intro args y y' hPre h h'
+    match hPre with
+    | ⟨base, len, s, e, _, _, _, hArgs⟩ =>
+      have e1 := h base len s e hArgs
+      have e2 := h' base len s e hArgs
+      rw [e1, e2]
 
 /-! ### Example 2: `fuchsia_usercopy::usercopy_copyin_bracketed` -/
 
@@ -1538,9 +2277,62 @@ instance fuchsiaUsercopyCopyinModularSpec :
 def mutatedFrameMemory : Memory :=
   { emptyMemory with nextAllocId := 1 }
 
+/-- Introduction rule for the faulting branch (`source_in_restricted_range = 1`): the
+    postcondition accepts `(fault_offset, dest_len - fault_offset)` with memory preserved. -/
+theorem fuchsiaUsercopyCopyinPost_fault (dest_len fo v : Nat) (mem : Memory) :
+    fuchsiaUsercopyCopyinPost
+      [ .scalar { bits := 1, sizeBytes := 1 }
+      , .scalar { bits := dest_len, sizeBytes := 8 }
+      , .scalar { bits := fo, sizeBytes := 8 }
+      , .scalar { bits := v, sizeBytes := 1 } ]
+      mem
+      (.aggregate 0
+        [ .scalar { bits := fo, sizeBytes := 8 }
+        , .scalar { bits := dest_len - fo, sizeBytes := 8 } ])
+      mem := by
+  refine ⟨rfl, ?_⟩
+  intro in_range dest_len' fo' v' h
+  injection h with h1 hRest1
+  injection h1 with h1s; injection h1s with hIR _
+  injection hRest1 with h2 hRest2
+  injection h2 with h2s; injection h2s with hDL _
+  injection hRest2 with h3 hRest3
+  injection h3 with h3s; injection h3s with hFO _
+  injection hRest3 with h4 _
+  injection h4 with h4s; injection h4s with hV _
+  subst hIR; subst hDL; subst hFO; subst hV
+  rfl
+
+/-- Introduction rule for the non-faulting branch (`source_in_restricted_range = 0`):
+    the postcondition accepts `(0, dest_len)` with memory preserved. -/
+theorem fuchsiaUsercopyCopyinPost_noFault (dest_len fo v : Nat) (mem : Memory) :
+    fuchsiaUsercopyCopyinPost
+      [ .scalar { bits := 0, sizeBytes := 1 }
+      , .scalar { bits := dest_len, sizeBytes := 8 }
+      , .scalar { bits := fo, sizeBytes := 8 }
+      , .scalar { bits := v, sizeBytes := 1 } ]
+      mem
+      (.aggregate 0
+        [ .scalar { bits := 0, sizeBytes := 8 }
+        , .scalar { bits := dest_len, sizeBytes := 8 } ])
+      mem := by
+  refine ⟨rfl, ?_⟩
+  intro in_range dest_len' fo' v' h
+  injection h with h1 hRest1
+  injection h1 with h1s; injection h1s with hIR _
+  injection hRest1 with h2 hRest2
+  injection h2 with h2s; injection h2s with hDL _
+  injection hRest2 with h3 hRest3
+  injection h3 with h3s; injection h3s with hFO _
+  injection hRest3 with h4 _
+  injection h4 with h4s; injection h4s with hV _
+  subst hIR; subst hDL; subst hFO; subst hV
+  rfl
+
 /-- Constructive `MultiMutantSpecCert` for `fuchsia_usercopy::usercopy_copyin_bracketed`,
-    certifying realizability and killing `wrongBranchTag`, `truncatedLength`,
-    `offByOneScalar`, and `unpreservedFrame` mutants with zero `Classical.choice`. -/
+    certifying realizability and killing `wrongBranchTag` (in both directions),
+    `truncatedLength`, `offByOneScalar`, and `unpreservedFrame` mutants, each against an
+    accepted reference output on the same input, with zero axioms. -/
 def fuchsiaUsercopyCopyinMultiCert :
     MultiMutantSpecCert
       (fun (p : List Value × Memory) => fuchsiaUsercopyCopyinPre p.1 p.2)
@@ -1558,19 +2350,7 @@ def fuchsiaUsercopyCopyinMultiCert :
         [ .scalar { bits := 64, sizeBytes := 8 }
         , .scalar { bits := 192, sizeBytes := 8 } ]
     , emptyMemory )
-  ens_realizable := by
-    refine ⟨rfl, ?_⟩
-    intro in_range dest_len fo v h
-    injection h with h1 hRest1
-    injection h1 with h1s; injection h1s with hIR _
-    injection hRest1 with h2 hRest2
-    injection h2 with h2s; injection h2s with hDL _
-    injection hRest2 with h3 hRest3
-    injection h3 with h3s; injection h3s with hFO _
-    injection hRest3 with h4 _
-    injection h4 with h4s; injection h4s with hV _
-    subst hIR; subst hDL; subst hFO; subst hV
-    rfl
+  ens_realizable := fuchsiaUsercopyCopyinPost_fault 256 64 1 emptyMemory
   kills :=
     [ { name := "usercopy_wrong_branch_tag_ignores_in_range"
         category := .wrongBranchTag
@@ -1581,6 +2361,12 @@ def fuchsiaUsercopyCopyinMultiCert :
             , .scalar { bits := 1, sizeBytes := 1 } ]
           , emptyMemory )
         input_valid := ⟨1, 256, 64, 1, Or.inr rfl, by decide, by decide, Or.inr rfl, rfl, rfl⟩
+        referenceOutput :=
+          ( .aggregate 0
+              [ .scalar { bits := 64, sizeBytes := 8 }
+              , .scalar { bits := 192, sizeBytes := 8 } ]
+          , emptyMemory )
+        reference_accepted := fuchsiaUsercopyCopyinPost_fault 256 64 1 emptyMemory
         -- Mutant takes the `in_range = 0` branch and returns `(0, 256)`.
         mutantOutput :=
           ( .aggregate 0
@@ -1589,8 +2375,37 @@ def fuchsiaUsercopyCopyinMultiCert :
           , emptyMemory )
         killed := by
           intro h
-          have hVal := h.2 1 256 64 1 rfl
-          simp only [ite_true] at hVal
+          have hVal := (ite_eq_left rfl).mp (h.2 1 256 64 1 rfl)
+          injection hVal with _ hFields
+          injection hFields with hF0 _
+          injection hF0 with hS
+          injection hS with hBits _
+          exact Nat.noConfusion hBits }
+    , { name := "usercopy_wrong_branch_tag_spurious_fault"
+        category := .wrongBranchTag
+        input :=
+          ( [ .scalar { bits := 0, sizeBytes := 1 }
+            , .scalar { bits := 256, sizeBytes := 8 }
+            , .scalar { bits := 64, sizeBytes := 8 }
+            , .scalar { bits := 1, sizeBytes := 1 } ]
+          , emptyMemory )
+        input_valid := ⟨0, 256, 64, 1, Or.inl rfl, by decide, by decide, Or.inr rfl, rfl, rfl⟩
+        referenceOutput :=
+          ( .aggregate 0
+              [ .scalar { bits := 0, sizeBytes := 8 }
+              , .scalar { bits := 256, sizeBytes := 8 } ]
+          , emptyMemory )
+        reference_accepted := fuchsiaUsercopyCopyinPost_noFault 256 64 1 emptyMemory
+        -- Mutant takes the `in_range = 1` branch although the source is not in the
+        -- restricted range, returning `(64, 192)` instead of `(0, 256)`.
+        mutantOutput :=
+          ( .aggregate 0
+              [ .scalar { bits := 64, sizeBytes := 8 }
+              , .scalar { bits := 192, sizeBytes := 8 } ]
+          , emptyMemory )
+        killed := by
+          intro h
+          have hVal := (ite_eq_right (by decide)).mp (h.2 0 256 64 1 rfl)
           injection hVal with _ hFields
           injection hFields with hF0 _
           injection hF0 with hS
@@ -1605,6 +2420,12 @@ def fuchsiaUsercopyCopyinMultiCert :
             , .scalar { bits := 1, sizeBytes := 1 } ]
           , emptyMemory )
         input_valid := ⟨1, 256, 64, 1, Or.inr rfl, by decide, by decide, Or.inr rfl, rfl, rfl⟩
+        referenceOutput :=
+          ( .aggregate 0
+              [ .scalar { bits := 64, sizeBytes := 8 }
+              , .scalar { bits := 192, sizeBytes := 8 } ]
+          , emptyMemory )
+        reference_accepted := fuchsiaUsercopyCopyinPost_fault 256 64 1 emptyMemory
         -- Mutant drops `uninit_len` to `0`, returning `(64, 0)` instead of `(64, 192)`.
         mutantOutput :=
           ( .aggregate 0
@@ -1613,14 +2434,13 @@ def fuchsiaUsercopyCopyinMultiCert :
           , emptyMemory )
         killed := by
           intro h
-          have hVal := h.2 1 256 64 1 rfl
-          simp only [ite_true] at hVal
+          have hVal := (ite_eq_left rfl).mp (h.2 1 256 64 1 rfl)
           injection hVal with _ hFields
           injection hFields with _ hRest
           injection hRest with hF1 _
           injection hF1 with hS
           injection hS with hBits _
-          exact Nat.noConfusion hBits }
+          exact absurd hBits (by decide) }
     , { name := "usercopy_off_by_one_fault_offset"
         category := .offByOneScalar
         input :=
@@ -1630,6 +2450,12 @@ def fuchsiaUsercopyCopyinMultiCert :
             , .scalar { bits := 1, sizeBytes := 1 } ]
           , emptyMemory )
         input_valid := ⟨1, 256, 64, 1, Or.inr rfl, by decide, by decide, Or.inr rfl, rfl, rfl⟩
+        referenceOutput :=
+          ( .aggregate 0
+              [ .scalar { bits := 64, sizeBytes := 8 }
+              , .scalar { bits := 192, sizeBytes := 8 } ]
+          , emptyMemory )
+        reference_accepted := fuchsiaUsercopyCopyinPost_fault 256 64 1 emptyMemory
         -- Mutant returns `(65, 191)` (off-by-one `fault_offset + 1`).
         mutantOutput :=
           ( .aggregate 0
@@ -1638,8 +2464,7 @@ def fuchsiaUsercopyCopyinMultiCert :
           , emptyMemory )
         killed := by
           intro h
-          have hVal := h.2 1 256 64 1 rfl
-          simp only [ite_true] at hVal
+          have hVal := (ite_eq_left rfl).mp (h.2 1 256 64 1 rfl)
           injection hVal with _ hFields
           injection hFields with hF0 _
           injection hF0 with hS
@@ -1654,6 +2479,12 @@ def fuchsiaUsercopyCopyinMultiCert :
             , .scalar { bits := 1, sizeBytes := 1 } ]
           , emptyMemory )
         input_valid := ⟨0, 256, 0, 1, Or.inl rfl, by decide, by decide, Or.inr rfl, rfl, rfl⟩
+        referenceOutput :=
+          ( .aggregate 0
+              [ .scalar { bits := 0, sizeBytes := 8 }
+              , .scalar { bits := 256, sizeBytes := 8 } ]
+          , emptyMemory )
+        reference_accepted := fuchsiaUsercopyCopyinPost_noFault 256 0 1 emptyMemory
         -- Mutant returns the right tuple `(0, 256)` but corrupts output memory frame.
         mutantOutput :=
           ( .aggregate 0
@@ -1692,6 +2523,56 @@ instance fuchsiaUsercopyCopyinModularSingleCert :
 theorem fuchsiaUsercopyCopyin_covers_required_categories :
     fuchsiaUsercopyCopyinMultiCert.coversAllCategories
       [.wrongBranchTag, .truncatedLength, .offByOneScalar, .unpreservedFrame] = true := rfl
+
+/-- `fuchsia_usercopy::usercopy_copyin_bracketed` is a *deterministic* specification:
+    realizable on every valid input and pinning both the returned tuple and the output
+    memory uniquely, so every deviating `(ret, mem')` on every valid input is rejected. -/
+theorem fuchsiaUsercopyCopyin_deterministic :
+    DeterministicSpecCert
+      (fun (p : List Value × Memory) => fuchsiaUsercopyCopyinPre p.1 p.2)
+      (fun (p : List Value × Memory) (r : Value × Memory) =>
+        fuchsiaUsercopyCopyinPost p.1 p.2 r.1 r.2) where
+  req_nonvacuous := ⟨_, fuchsiaUsercopyCopyinMultiCert.req_nonvacuous⟩
+  realizable := by
+    intro p hPre
+    match p, hPre with
+    | (args, mem), ⟨in_range, dest_len, fo, v, hIR, _, _, _, hArgs, _⟩ =>
+      subst hArgs
+      cases hIR with
+      | inl h0 =>
+        subst h0
+        exact ⟨(_, mem), fuchsiaUsercopyCopyinPost_noFault dest_len fo v mem⟩
+      | inr h1 =>
+        subst h1
+        exact ⟨(_, mem), fuchsiaUsercopyCopyinPost_fault dest_len fo v mem⟩
+  unique := by
+    intro p r r' hPre h h'
+    match p, r, r', hPre, h, h' with
+    | (args, mem), (ret, m1), (ret', m2),
+      ⟨in_range, dest_len, fo, v, hIR, _, _, _, hArgs, _⟩, ⟨hm1, hv1⟩, ⟨hm2, hv2⟩ =>
+      have e1 := hv1 in_range dest_len fo v hArgs
+      have e2 := hv2 in_range dest_len fo v hArgs
+      have hm1' : m1 = mem := hm1
+      have hm2' : m2 = mem := hm2
+      cases hIR with
+      | inl h0 =>
+        subst h0
+        have e1' : ret = .aggregate 0
+            [ .scalar { bits := 0, sizeBytes := 8 }
+            , .scalar { bits := dest_len, sizeBytes := 8 } ] := e1
+        have e2' : ret' = .aggregate 0
+            [ .scalar { bits := 0, sizeBytes := 8 }
+            , .scalar { bits := dest_len, sizeBytes := 8 } ] := e2
+        rw [e1', e2', hm1', hm2']
+      | inr h1 =>
+        subst h1
+        have e1' : ret = .aggregate 0
+            [ .scalar { bits := fo, sizeBytes := 8 }
+            , .scalar { bits := dest_len - fo, sizeBytes := 8 } ] := e1
+        have e2' : ret' = .aggregate 0
+            [ .scalar { bits := fo, sizeBytes := 8 }
+            , .scalar { bits := dest_len - fo, sizeBytes := 8 } ] := e2
+        rw [e1', e2', hm1', hm2']
 
 /-! ### Diagnostic Contrast: Weak Upper-Bound-Only Spec (`weak_vmo_subslice_upper_bound_only`) -/
 
@@ -1746,6 +2627,39 @@ theorem weak_vmo_subslice_truncated_mutant_survives :
   intro args _hPre base len s e hArgs
   subst hArgs
   exact ⟨base, rfl, Nat.le_add_right base len⟩
+
+/-- The weak upper-bound-only specification is provably *not* deterministic: on the
+    sampled valid input it accepts both the correct offset `4224` and the truncated
+    offset `4096`, so it can never obtain a `DeterministicSpecCert`. -/
+theorem weak_vmo_subslice_not_deterministic :
+    DeterministicSpecCert fxfsVmoSubslicePre weak_vmo_subslice_upper_bound_only → False := by
+  intro c
+  have hInput : fxfsVmoSubslicePre
+      [ .scalar { bits := 4096, sizeBytes := 8 }
+      , .scalar { bits := 4096, sizeBytes := 8 }
+      , .scalar { bits := 64, sizeBytes := 8 }
+      , .scalar { bits := 192, sizeBytes := 8 } ] :=
+    ⟨4096, 4096, 64, 192, by decide, by decide, by decide, rfl⟩
+  have accepts : ∀ r : Nat, r ≤ 8192 →
+      weak_vmo_subslice_upper_bound_only
+        [ .scalar { bits := 4096, sizeBytes := 8 }
+        , .scalar { bits := 4096, sizeBytes := 8 }
+        , .scalar { bits := 64, sizeBytes := 8 }
+        , .scalar { bits := 192, sizeBytes := 8 } ]
+        (.scalar { bits := r, sizeBytes := 8 }) := by
+    intro r hr base len s e h
+    injection h with h1 hRest1
+    injection h1 with h1s
+    injection h1s with hBase _
+    injection hRest1 with h2 _
+    injection h2 with h2s
+    injection h2s with hLen _
+    subst hBase; subst hLen
+    exact ⟨r, rfl, hr⟩
+  have hEq := c.unique _ _ _ hInput (accepts 4224 (by decide)) (accepts 4096 (by decide))
+  injection hEq with hS
+  injection hS with hBits _
+  exact absurd hBits (by decide)
 
 /-- Conversely, the strong specification `fxfsVmoSubslicePost` (backed by
     `fxfsVmoSubsliceMultiCert`'s `.truncatedLength` kill) constructively rejects
