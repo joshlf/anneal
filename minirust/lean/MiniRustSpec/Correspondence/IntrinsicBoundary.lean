@@ -2602,10 +2602,11 @@ for every target block `blk`, both `Interp.evalTerminator` (`Mach`) and
 `Interp.evalTerminatorM` (`Machine M`, instantiating `MachTB`) execute
 `StartUnwind`, `StopUnwind`, and `ResumeUnwind` faithfully instead of stopping
 with `.unsupported`:
-- `StartUnwind` on a thin raw pointer payload appends `p.thin_pointer` at the
-  back of the active thread's `unwind_payloads` and jumps to `blk` without
-  touching memory, while any other `(val, ty)` pair (wide raw pointers, safe
-  references, boxes, fn pointers, integers, Booleans, etc.) raises `specPanic`;
+- `StartUnwind` propagates any `evalValue` / `evalValueM` error unchanged; on a
+  thin raw pointer payload it appends `p.thin_pointer` at the back of the
+  active thread's `unwind_payloads` and jumps to `blk` without touching memory,
+  while any other `(val, ty)` pair (wide raw pointers, safe references, boxes,
+  fn pointers, integers, Booleans, etc.) raises `specPanic`;
 - `StopUnwind` raises UB on an empty payload stack, and otherwise pops the back
   payload (LIFO) and jumps to `blk`;
 - `ResumeUnwind` raises `specPanic "stack.pop().unwrap()"` on an empty call
@@ -2643,6 +2644,9 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
       Interp.evalValue m payload = .ok ((v, ty), m1) →
       Interp.evalTerminator m (.StartUnwind payload blk) =
         .error (.specPanic "StartUnwind: the unwind payload is not a raw pointer")) ∧
+    (∀ (payload : Gen.ValueExpr) (e : Interp.Stop),
+      Interp.evalValue m payload = .error e →
+      Interp.evalTerminator m (.StartUnwind payload blk) = .error e) ∧
     (∀ (t : Gen.Thread BM),
       Interp.activeThread m = .ok t → t.unwind_payloads = [] →
       Interp.evalTerminator m (.StopUnwind blk) =
@@ -2707,6 +2711,9 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
         Interp.evalValueM mM payload = .ok ((v, ty), m1) →
         Interp.evalTerminatorM mM (.StartUnwind payload blk) =
           .error (.specPanic "StartUnwind: the unwind payload is not a raw pointer")) ∧
+      (∀ (payload : Gen.ValueExpr) (e : Interp.Stop),
+        Interp.evalValueM mM payload = .error e →
+        Interp.evalTerminatorM mM (.StartUnwind payload blk) = .error e) ∧
       (∀ (t : Gen.Thread M),
         Interp.activeThreadM mM = .ok t → t.unwind_payloads = [] →
         Interp.evalTerminatorM mM (.StopUnwind blk) =
@@ -2757,7 +2764,7 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
               m'.mem = cm2 ∧
               m'.threads.length = mM.threads.length ∧
               (∀ i, i ≠ mM.active_thread.toNat → m'.threads[i]? = mM.threads[i]?))))) := by
-  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_⟩, ?_⟩
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ?_⟩
   · intro payload p m1 t fr hev ht hfr
     obtain ⟨m', hj, hact, hmem, hlen, hne⟩ := jumpToBlock_activeThread (fr := fr) blk
       (activeThread_set
@@ -2796,6 +2803,8 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
     | Tuple _ => rfl
     | Union _ => rfl
     | Variant _ _ => rfl
+  · intro payload e herr
+    simp [Interp.evalTerminator, herr, error_bind]
   · intro t ht hemp
     simp only [Interp.evalTerminator]
     rw [mutateActiveThread_eq _ ht]
@@ -2864,7 +2873,7 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
       rw [hpop, hspa, hback]
       exact hj
   · intro M _ _ mM
-    refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+    refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
     · intro payload p m1 t fr hev ht hfr
       obtain ⟨m', hj, hact, hmem, hlen, hne⟩ := jumpToBlockM_activeThread (fr := fr) blk
         (activeThreadM_set
@@ -2903,6 +2912,8 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
       | Tuple _ => rfl
       | Union _ => rfl
       | Variant _ _ => rfl
+    · intro payload e herr
+      simp [Interp.evalTerminatorM, herr, error_bind]
     · intro t ht hemp
       simp only [Interp.evalTerminatorM]
       rw [mutateActiveThreadM_eq _ ht]
@@ -3256,30 +3267,34 @@ private def sdEnumTy : Gen.Type :=
 empty-tagger laws (across `Mach` and polymorphic `Machine M`) with concrete
 kernel-checked witnesses on both `Mach` and `MachTB`:
 - Universal laws (both `evalStatement` and `evalStatementM`):
-  1. Non-enum destination raises `specPanic` before checking alignment;
-  2. Misaligned enum destination raises `ub` before looking up `value`;
-  3. Missing variant `value` raises
+  1. Any `evalPlace` / `evalPlaceM` error propagates unchanged;
+  2. Non-enum destination raises `specPanic` before checking alignment;
+  3. Misaligned enum destination raises `ub` before looking up `value`;
+  4. Missing variant `value` raises
      `specPanic s!"setting an invalid discriminant ({value})"`;
-  4. Empty `tagger` (niche variant) returns `m1` unchanged with zero stores;
+  5. Empty `tagger` (niche variant) returns `m1` unchanged with zero stores;
 - Concrete witnesses (`Mach` and `MachTB`):
-  5. Multi-entry tagger writes `u8` (`0x03`) at offset `0` and little-endian
+  6. Multi-entry tagger writes `u8` (`0x03`) at offset `0` and little-endian
      `u16` (`0x5678` → `[0x78, 0x56]`) at offset `4`, leaving all five payload
      bytes (`0xBB, 0xCC, 0xDD, 0x11, 0x22`) untouched, recording the two
      `Store` accesses in `tagger.entries` order, and round-tripping through
      `decodeDiscriminant` to `some 7`;
-  6. Concrete negative controls on both `Mach` and `MachTB`: misaligned enum
+  7. Concrete negative controls on both `Mach` and `MachTB`: misaligned enum
      with missing variant `99` (UB wins over missing variant), misaligned
      non-enum (`specPanic` wins over misaligned UB), missing negative
      discriminant `-1`, empty-tagger niche variant through an aligned raw
      pointer without provenance (succeeds with zero accesses: nothing is
      stored, so the missing provenance never matters), and out-of-bounds
      tagger offset (`ptr_offset_inbounds` UB);
-  7. Concrete Tree Borrows per-byte aliasing witnesses on `MachTB`:
+  8. Concrete Tree Borrows per-byte aliasing witnesses on `MachTB`:
      `SetDiscriminant` through a `Frozen` pointer raises
      `"Tree Borrows: local write of Frozen reference"`, while a pointer that is
      `Unique` on tag bytes `{0, 4, 5}` and `Frozen` on payload bytes
      `{1, 2, 3, 6, 7}` succeeds (confirming only tag bytes are accessed). -/
 theorem minirust_setDiscriminant_supported :
+    (∀ (m : Mach) (dst : Gen.PlaceExpr) (value : Int) (e : Interp.Stop),
+      Interp.evalPlace m dst = .error e →
+      Interp.evalStatement m (.SetDiscriminant dst value) = .error e) ∧
     (∀ (m m1 : Mach) (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place BM) (ty : Gen.Type),
       Interp.evalPlace m dst = .ok ((place, ty), m1) →
       (∀ (vs : Map Int Gen.Variant) dt d sz al, ty ≠ .Enum vs dt d sz al) →
@@ -3298,6 +3313,10 @@ theorem minirust_setDiscriminant_supported :
           .error (.specPanic s!"setting an invalid discriminant ({value})")) ∧
       (∀ vTy, place.aligned = true → mapGet vs value = some ⟨vTy, ⟨[]⟩⟩ →
         Interp.evalStatement m (.SetDiscriminant dst value) = .ok m1)) ∧
+    (∀ {M : Type} [Gen.Memory M] [Interp.MemoryOps M] (m : Gen.Machine M)
+        (dst : Gen.PlaceExpr) (value : Int) (e : Interp.Stop),
+      Interp.evalPlaceM m dst = .error e →
+      Interp.evalStatementM m (.SetDiscriminant dst value) = .error e) ∧
     (∀ {M : Type} [Gen.Memory M] [Interp.MemoryOps M] (m m1 : Gen.Machine M)
         (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place M) (ty : Gen.Type),
       Interp.evalPlaceM m dst = .ok ((place, ty), m1) →
@@ -3387,8 +3406,10 @@ theorem minirust_setDiscriminant_supported :
        .error (.ub "Tree Borrows: local write of Frozen reference") ∧
       ∃ m', Interp.evalStatementM mTBTagOnly (.SetDiscriminant loc 7) = .ok m' ∧
         m'.mem.memory.mem.allocations.map (·.data) = [sdExpectedBytes])) := by
-  refine ⟨?_, ?_, ?_, ?_, ⟨_, rfl, rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl⟩,
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ⟨_, rfl, rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl⟩,
     ⟨rfl, rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩, ⟨rfl, _, rfl, rfl⟩⟩
+  · intro m dst value e herr
+    simp [Interp.evalStatement, Interp.evalSetDiscriminant, herr, error_bind]
   · intro m m1 dst value place ty hp hne
     simp only [Interp.evalStatement, Interp.evalSetDiscriminant, hp, ok_bind]
     cases ty with
@@ -3407,6 +3428,8 @@ theorem minirust_setDiscriminant_supported :
     · simp [Interp.evalStatement, Interp.evalSetDiscriminant, hp, ha, hnone, specPanic]
     · simp [Interp.evalStatement, Interp.evalSetDiscriminant, hp, ha, hsome,
         Interp.encodeDiscriminant]
+  · intro M _ _ m dst value e herr
+    simp [Interp.evalStatementM, Interp.evalSetDiscriminantM, herr, error_bind]
   · intro M _ _ m m1 dst value place ty hp hne
     simp only [Interp.evalStatementM, Interp.evalSetDiscriminantM, hp, ok_bind]
     cases ty with
@@ -4052,6 +4075,277 @@ theorem minirust_setDiscriminant_field_and_encode_witness :
      Interp.evalStatementM mTB (.SetDiscriminant (.Local ⟨⟨2⟩⟩) 1) =
       .error (.specPanic badEncMsg)) :=
   ⟨⟨_, rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl⟩, ⟨rfl, rfl⟩⟩
+
+private def uwMtCalleeFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8), (⟨⟨1⟩⟩, .Ptr (.Raw .None))]⟩
+    args := [⟨⟨1⟩⟩]
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[], .StartUnwind (.Load (.Local ⟨⟨1⟩⟩)) ⟨⟨1⟩⟩, .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .ResumeUnwind, .Cleanup⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwMtOuterFn : Gen.Function :=
+  { locals :=
+      ⟨[(⟨⟨0⟩⟩, .Int u16), (⟨⟨1⟩⟩, .Int u16),
+        (⟨⟨2⟩⟩, .Ptr (.Raw .None)), (⟨⟨3⟩⟩, .Int u8)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[],
+        .Call (fnPtrExpr (fnName 1)) .Rust
+          [.ByValue (.AddrOf (.Local ⟨⟨1⟩⟩) (.Raw .None))]
+          (.Local ⟨⟨3⟩⟩) (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩), .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .Unreachable, .Regular⟩),
+      (⟨⟨2⟩⟩, ⟨[], .Intrinsic .GetUnwindPayload [] (.Local ⟨⟨2⟩⟩) (some ⟨⟨3⟩⟩), .Catch⟩),
+      (⟨⟨3⟩⟩, ⟨[], .StopUnwind ⟨⟨4⟩⟩, .Catch⟩),
+      (⟨⟨4⟩⟩, ⟨[.Assign (.Local ⟨⟨0⟩⟩) (.Load (.Deref (.Load (.Local ⟨⟨2⟩⟩)) (.Int u16)))],
+        .Unreachable, .Regular⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwMtProg : Gen.Program :=
+  { functions := ⟨[(fnName 0, uwMtOuterFn), (fnName 1, uwMtCalleeFn)]⟩
+    start := fnName 0
+    globals := ⟨[]⟩
+    traits := ⟨[]⟩
+    vtables := ⟨[]⟩ }
+
+private def uwMtT0FrameBM : Frame :=
+  { func := uwMtOuterFn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+    next_block := ⟨⟨9⟩⟩, next_stmt := 0, extra := () }
+
+private def uwMtT0FrameTB : Gen.StackFrame TBM :=
+  { func := uwMtOuterFn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+    next_block := ⟨⟨9⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+
+private def uwMtMachBM : Mach :=
+  let a0 : Gen.Allocation Unit Unit :=
+    { data := [.Init 0 none, .Init 0 none], addr := 0x100, align := ⟨2⟩, kind := .Stack,
+      live := true, extra := () }
+  let a1 : Gen.Allocation Unit Unit :=
+    { data := [.Init 0xEF none, .Init 0xBE none], addr := 0x200, align := ⟨2⟩, kind := .Stack,
+      live := true, extra := () }
+  let a2 : Gen.Allocation Unit Unit :=
+    { data := List.replicate 8 .Uninit, addr := 0x300, align := ⟨8⟩, kind := .Stack,
+      live := true, extra := () }
+  let a3 : Gen.Allocation Unit Unit :=
+    { data := [.Init 0 none], addr := 0x400, align := ⟨1⟩, kind := .Stack,
+      live := true, extra := () }
+  let fr1 : Frame :=
+    { func := uwMtOuterFn
+      locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩),
+                  (⟨⟨2⟩⟩, ⟨0x300, some (⟨2⟩, ())⟩), (⟨⟨3⟩⟩, ⟨0x400, some (⟨3⟩, ())⟩)]⟩
+      stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+  { prog := uwMtProg
+    mem := { memory := { allocations := [a0, a1, a2, a3], _phantom := ⟨⟩ }, accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads :=
+      [{ stack := [uwMtT0FrameBM], state := .Terminated, unwind_payloads := [⟨0x9000, none⟩] },
+       { stack := [fr1], state := .Enabled, unwind_payloads := [] }]
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩
+    vtable_ptrs := ⟨[]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+private def uwMtMachTB : MachTB :=
+  let mkA (addr : Int) (al : Nat) (bs : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) :
+      Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+    { data := bs, addr := addr, align := ⟨al⟩, kind := .Stack, live := true,
+      extra :=
+        { root :=
+            { children := [], permissions := List.replicate bs.length (.Unprot .Unique),
+              «protected» := .No } } }
+  let fr1 : Gen.StackFrame TBM :=
+    { func := uwMtOuterFn
+      locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩),
+                  (⟨⟨2⟩⟩, ⟨0x300, some (⟨2⟩, [])⟩), (⟨⟨3⟩⟩, ⟨0x400, some (⟨3⟩, [])⟩)]⟩
+      stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+  { prog := uwMtProg
+    mem :=
+      { memory :=
+          { params := { implicit_writes := false }
+            mem :=
+              { allocations :=
+                  [mkA 0x100 2 [.Init 0 none, .Init 0 none],
+                   mkA 0x200 2 [.Init 0xEF none, .Init 0xBE none],
+                   mkA 0x300 8 (List.replicate 8 .Uninit),
+                   mkA 0x400 1 [.Init 0 none]]
+                _phantom := ⟨⟩ } }
+        accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads :=
+      [{ stack := [uwMtT0FrameTB], state := .Terminated, unwind_payloads := [⟨0x9000, none⟩] },
+       { stack := [fr1], state := .Enabled, unwind_payloads := [] }]
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩
+    vtable_ptrs := ⟨[]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+/-- **Provenance-carrying unwind payload, non-zero `active_thread = 1`
+multi-thread isolation, and `Return` vs `ResumeUnwind` contrast on a non-main
+thread (`minirust_unwind_provenance_multithread_step_witness`)**:
+1. On a two-thread machine (`Mach` and `MachTB`) where thread `0` is
+   `.Terminated` (holding its own stack frame and `unwind_payloads = [0x9000]`)
+   and thread `1` is the sole `.Enabled` thread (`pickActiveThread` chooses
+   `active_thread = 1`):
+   - outer calls `uwMtCalleeFn` passing `AddrOf (.Local _1) (.Raw .None)` (a
+     raw pointer carrying real provenance to the live `u16` `0xBEEF`);
+   - callee loads that pointer via `.Load (.Local _1)` in `StartUnwind` and
+     propagates via `ResumeUnwind`;
+   - outer catches via `GetUnwindPayload`, clears via `StopUnwind`, and
+     dereferences the caught pointer to load `0xBEEF` (`[0xEF, 0xBE]`) into
+     `_0`, proving provenance survived the full unwind cycle (a provenance-free
+     pointer would raise UB on dereference);
+   - thread `0` stays completely untouched (same state, stack, and payload list)
+     and step `7` hits `Unreachable`.
+2. Non-main thread `BottomOfStack` contrast (`active_thread = 1`): on both
+   `Mach` and `MachTB`, `Terminator.Return` at `BottomOfStack` terminates
+   thread `1` normally, whereas `Terminator.ResumeUnwind` on the exact same
+   state raises UB
+   `"the function at the bottom of the stack must not unwind"`. -/
+theorem minirust_unwind_provenance_multithread_step_witness :
+    let botFn := uwFn [(⟨⟨0⟩⟩, .Int u8)]
+    let botFrBM : Frame :=
+      { func := botFn, locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩)]⟩,
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+    let botMachBM : Mach :=
+      { uwMachBM [uwLiveStackAllocBM 0x100] [] [] with
+        threads :=
+          [{ stack := [uwMtT0FrameBM], state := .Enabled, unwind_payloads := [⟨0x9000, none⟩] },
+           { stack := [botFrBM], state := .Enabled, unwind_payloads := [] }]
+        active_thread := 1 }
+    let botFrTB : Gen.StackFrame TBM :=
+      { func := botFn, locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩)]⟩,
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+    let botMachTB : MachTB :=
+      { uwMachTB [uwLiveAllocTB 0x100 .Stack (uwRootWithChildren [])] [] [] with
+        threads :=
+          [{ stack := [uwMtT0FrameTB], state := .Enabled, unwind_payloads := [⟨0x9000, none⟩] },
+           { stack := [botFrTB], state := .Enabled, unwind_payloads := [] }]
+        active_thread := 1 }
+    ((Interp.steps 6 uwMtMachBM).toOption.map (fun m =>
+      (m.active_thread,
+       m.mem.memory.allocations[0]?.map (·.data),
+       m.mem.memory.allocations.map (·.live),
+       m.threads.map (fun t => (t.state, t.unwind_payloads, t.stack.length)))) =
+      some (1, some [.Init 0xEF none, .Init 0xBE none],
+        [true, true, true, true, false, false],
+        [(.Terminated, [⟨0x9000, none⟩], 1), (.Enabled, [], 1)]) ∧
+     Interp.steps 7 uwMtMachBM = .error (.ub "reached unreachable code")) ∧
+    ((Interp.stepsTB 6 uwMtMachTB).toOption.map (·.active_thread) = some 1 ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.mem.memory.mem.allocations[0]?.map (·.data)) =
+       some (some [.Init 0xEF none, .Init 0xBE none]) ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.mem.memory.mem.allocations.map (·.live)) =
+       some [true, true, true, true, false, false] ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.threads.map (·.unwind_payloads)) =
+       some [[⟨0x9000, none⟩], []] ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m => m.threads.map (·.state)) =
+       some [.Terminated, .Enabled] ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m => m.threads.map (·.stack.length)) =
+       some [1, 1] ∧
+     Interp.stepsTB 7 uwMtMachTB = .error (.ub "reached unreachable code")) ∧
+    ((Interp.evalTerminator botMachBM .Return).toOption.map (fun m =>
+       m.threads.map (fun t => (t.state, t.unwind_payloads))) =
+       some [(.Enabled, [⟨0x9000, none⟩]), (.Terminated, [])] ∧
+     Interp.evalTerminator botMachBM .ResumeUnwind =
+       .error (.ub "the function at the bottom of the stack must not unwind") ∧
+     (Interp.evalTerminatorM botMachTB .Return).toOption.map (fun m =>
+       m.threads.map (fun t => (t.state, t.unwind_payloads))) =
+       some [(.Enabled, [⟨0x9000, none⟩]), (.Terminated, [])] ∧
+     Interp.evalTerminatorM botMachTB .ResumeUnwind =
+       .error (.ub "the function at the bottom of the stack must not unwind")) := by
+  refine ⟨⟨rfl, rfl⟩,
+    ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, eq_error_of_interpStopOf (by decide +kernel)⟩,
+    ⟨rfl, rfl, rfl, rfl⟩⟩
+
+private def sdPayloadEnumTy : Gen.Type :=
+  let payloadTuple : Gen.Type :=
+    .Tuple [(⟨2⟩, .Int u16)] ⟨⟨4⟩, ⟨2⟩, none⟩ none
+  let v0 : Gen.Variant := { ty := payloadTuple, tagger := ⟨[(⟨0⟩, (u8, 0))]⟩ }
+  let v1 : Gen.Variant := { ty := payloadTuple, tagger := ⟨[(⟨0⟩, (u8, 1))]⟩ }
+  let disc : Gen.Discriminator :=
+    .Branch ⟨0⟩ u8 .Invalid ⟨[((0, 1), .Known 0), ((1, 2), .Known 1)]⟩
+  .Enum ⟨[(0, v0), (1, v1)]⟩ u8 disc ⟨4⟩ ⟨2⟩
+
+/-- **`SetDiscriminant` + `ValueExpr.Load` full enum round-trip and error
+propagation controls (`minirust_setDiscriminant_load_roundtrip_witness`)**:
+1. On both `Mach` and `MachTB`, starting from a 4-byte enum carrying `u8` tag
+   `0` at offset `0`, uninitialized padding at offset `1`, and `u16` payload
+   `0xBEEF` at offset `2`, executing `Statement.SetDiscriminant (.Local 1) 1`
+   writes only byte `0` (`0x01`) while preserving padding and payload, and
+   `ValueExpr.Load (.Local 1)` decodes `.Variant 1 (.Tuple [.Int 0xBEEF])`;
+2. Concrete error-propagation controls on both `Mach` and `MachTB`:
+   `SetDiscriminant` on a dead local raises `.ub "access to a dead local"`, and
+   `StartUnwind` with an uninitialized raw-pointer local raises `typedLoad` UB
+   without pushing onto `unwind_payloads`. -/
+theorem minirust_setDiscriminant_load_roundtrip_witness :
+    let initBytes {P : Type} : List (Gen.AbstractByte P) :=
+      [.Init 0x00 none, .Uninit, .Init 0xEF none, .Init 0xBE none]
+    let afterBytes {P : Type} : List (Gen.AbstractByte P) :=
+      [.Init 0x01 none, .Uninit, .Init 0xEF none, .Init 0xBE none]
+    let fn := uwFn [(⟨⟨1⟩⟩, sdPayloadEnumTy), (⟨⟨2⟩⟩, sdPayloadEnumTy),
+                    (⟨⟨3⟩⟩, .Ptr (.Raw .None))]
+    let allocEnumBM : Gen.Allocation Unit Unit :=
+      { data := initBytes, addr := 0x100, align := ⟨2⟩, kind := .Stack, live := true,
+        extra := () }
+    let allocPtrBM : Gen.Allocation Unit Unit :=
+      { data := List.replicate 8 .Uninit, addr := 0x200, align := ⟨8⟩, kind := .Stack,
+        live := true, extra := () }
+    let frBM : Frame :=
+      { func := fn
+        locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨3⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩)]⟩
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+    let mBM := uwMachBM [allocEnumBM, allocPtrBM] [frBM] []
+    let mkAllocTB (addr : Int) (al : Nat)
+        (bs : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) :
+        Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+      { data := bs, addr := addr, align := ⟨al⟩, kind := .Stack, live := true,
+        extra :=
+          { root :=
+              { children := [], permissions := List.replicate bs.length (.Unprot .Unique),
+                «protected» := .No } } }
+    let frTB : Gen.StackFrame TBM :=
+      { func := fn
+        locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨3⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩)]⟩
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+    let mTB := uwMachTB
+      [mkAllocTB 0x100 2 initBytes, mkAllocTB 0x200 8 (List.replicate 8 .Uninit)] [frTB] []
+    let loadUb := "load at type but the data in memory violates the language invariant"
+    (∃ m1 m2,
+      Interp.evalStatement mBM (.SetDiscriminant (.Local ⟨⟨1⟩⟩) 1) = .ok m1 ∧
+      m1.mem.memory.allocations[0]?.map (·.data) = some afterBytes ∧
+      Interp.evalValue m1 (.Load (.Local ⟨⟨1⟩⟩)) =
+        .ok ((.Variant 1 (.Tuple [.Int 0xBEEF]), sdPayloadEnumTy), m2)) ∧
+    (∃ m1 m2,
+      Interp.evalStatementM mTB (.SetDiscriminant (.Local ⟨⟨1⟩⟩) 1) = .ok m1 ∧
+      m1.mem.memory.mem.allocations[0]?.map (·.data) = some afterBytes ∧
+      Interp.evalValueM m1 (.Load (.Local ⟨⟨1⟩⟩)) =
+        .ok ((.Variant 1 (.Tuple [.Int 0xBEEF]), sdPayloadEnumTy), m2)) ∧
+    (Interp.evalStatement mBM (.SetDiscriminant (.Local ⟨⟨2⟩⟩) 1) =
+      .error (.ub "access to a dead local") ∧
+     Interp.evalStatementM mTB (.SetDiscriminant (.Local ⟨⟨2⟩⟩) 1) =
+      .error (.ub "access to a dead local") ∧
+     Interp.evalTerminator mBM (.StartUnwind (.Load (.Local ⟨⟨3⟩⟩)) ⟨⟨1⟩⟩) =
+      .error (.ub loadUb) ∧
+     Interp.evalTerminatorM mTB (.StartUnwind (.Load (.Local ⟨⟨3⟩⟩)) ⟨⟨1⟩⟩) =
+      .error (.ub loadUb)) :=
+  ⟨⟨_, _, rfl, rfl, rfl⟩, ⟨_, _, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩
 
 /-- **`sizeOfVal` & `alignOfVal` on unsized `RigidTy.str` (`&str` / `*const str`) ↔ MiniRust
 `Type.layout (.Slice (.Int u8))` (`evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout`,
