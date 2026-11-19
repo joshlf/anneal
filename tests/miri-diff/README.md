@@ -249,23 +249,32 @@ statement) or agreement with Miri:
 - Same-tag disjoint `copy_nonoverlapping` (Nightly Campaign #16:
   `ub_copy_nonoverlapping_partial_overlap_array` with `offset(p, 1isize)`
   perturbed to `offset(p, 2isize)`).
-  `pass_copy_nonoverlapping_same_tag_disjoint_array_halves` (Miri `30`) and
-  `pass_copy_nonoverlapping_same_tag_disjoint_struct_fields` (Miri `44`) copy
-  between disjoint parts of one local through two pointers that share one tag.
-  `Statements.lean` rejects a copy whose source and destination share a tag
-  before it compares their ranges, so Anneal reports UB at the
-  `copy_nonoverlapping` (`false_positive_ub`, `sound_conservative_abstraction`),
-  both when a candidate calls a probe and when it runs the probe's body in the
-  root frame. A true same-tag overlap agrees (UB at the copy in both).
+  `pass_copy_nonoverlapping_same_tag_disjoint_array_halves` (Miri `30`, `&raw
+  mut arr[0]` on `[u32; 4]`, exercising `Statements.lean`'s `copyViaBytes`
+  same-tag guard),
+  `pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves` (Miri
+  `285803779`, `(&raw mut arr) as *mut u8` on `[u8; 8]`, directly entering
+  `Statements.lean`'s `sameContainer` array-slice branch and hitting `Nat.beq
+  srcPtr.tag dstPtr.tag`), and
+  `pass_copy_nonoverlapping_same_tag_disjoint_struct_fields` (Miri `44`, `&raw
+  mut pair.a` on `PairU32`) copy between disjoint parts of one local through two
+  pointers that share one tag. Both forward (`src < dst`) and backward (`dst <
+  src`) disjoint copies, plus whole-struct `(&raw mut pair) as *mut u32`, report
+  UB at the `copy_nonoverlapping` (`false_positive_ub`,
+  `sound_conservative_abstraction`), both when a candidate calls a probe and
+  when it runs the probe's body in the root frame. True same-tag overlaps on
+  both `[u32; 4]` and `[u8; 8]` agree (UB at the copy in both).
 - `static` accesses. Anneal reports UB at the first access to any `static`,
   reads included. `pass_static_const_raw_ptr_read_and_freeze_retag` (Miri
-  `8996`) is a `false_positive_ub`.
+  `8996`) and an isolated `UnsafeCell` write to `STATIC_FREEZE_AND_CELL.cell`
+  (Miri `5379`) are `false_positive_ub`.
   `ub_static_unsafe_cell_raw_const_cast_mut_write` (Miri: UB at the write to the
-  frozen field of `STATIC_FREEZE_AND_CELL`) and a write through
-  `(&raw const STATIC_FROZEN_PAIR.a) as *mut u32` (Miri: UB, because an
+  frozen field of `STATIC_FREEZE_AND_CELL`), a direct write to
+  `STATIC_FREEZE_AND_CELL.frozen` without touching `cell` first (Miri: Tree
+  Borrows UB `"is forbidden"` on the writable static allocation), and a write
+  through `(&raw const STATIC_FROZEN_PAIR.a) as *mut u32` (Miri: UB, because an
   immutable `static` is read-only) are `ub_location_mismatch`
-  (`value_mismatch`): Anneal reports UB at the first static access, before
-  Miri's write, and never passes.
+  (`value_mismatch`): Anneal reports UB before Miri's write and never passes.
 - `UnsafeCell` fields. A write to the `UnsafeCell` field of a struct through a
   shared reborrow of the struct, which Miri allows, is UB in Anneal
   (`false_positive_ub`). The static UB probe writes its `cell` field this way

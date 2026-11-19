@@ -868,5 +868,5 @@ name = "ub_shared_temp_unsafe_cell_raw_const_cast_mut_write"
 category = "tree_borrows"
 upstream_path = "tests/fail/both_borrows/shr_frozen_violation1.rs"
 miri_verdict = "ub"
-miri_ub_span = "src/lib.rs:1430:9"
+miri_ub_span = "src/lib.rs:1456:9"
 fuel = 128

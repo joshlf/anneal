@@ -478,6 +478,7 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         "Verify.MiriDiffCorpus.panic_multi_callee_unwind_chain",
         "Verify.MiriDiffCorpus.pass_fn_entry_returns_reborrowed_child",
         "Verify.MiriDiffCorpus.panic_multi_callee_unwind_cleanup_guard",
+        "Verify.MiriDiffCorpus.pass_shared_temp_const_raw_ptr_read_and_freeze_retag",
     ] {
         assert!(
             report.audited_certificate_modules.iter().any(|m| m == module),
@@ -590,6 +591,41 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
             mir.contains("NonDivergingIntrinsic.copyNonOverlapping"),
             "`{name}` must lower to `NonDivergingIntrinsic.copyNonOverlapping`:\n{mir}"
         );
+    }
+
+    // Category 11's same-tag disjoint `copy_nonoverlapping` probes must mint
+    // exactly one raw borrow (`Rvalue.rawPtr` == 1, `Rvalue.ref` == 0), derive
+    // `dst` via `BinOp.offset`, and execute `NonDivergingIntrinsic.copyNonOverlapping`,
+    // mechanically guaranteeing `srcPtr.tag == dstPtr.tag`. Moreover, the `[u8; 8]`
+    // probe's single `Rvalue.rawPtr` must have `projection := List.nil` so it
+    // enters `Statements.lean`'s `sameContainer` array-slice branch directly.
+    for (name, expect_whole_local_raw_ptr) in [
+        ("pass_copy_nonoverlapping_same_tag_disjoint_array_halves", false),
+        ("pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves", true),
+        ("pass_copy_nonoverlapping_same_tag_disjoint_struct_fields", false),
+    ] {
+        let mir = captured_mir(name);
+        assert_eq!(
+            mir.matches("Rvalue.rawPtr ").count(),
+            1,
+            "`{name}` must mint exactly one `Rvalue.rawPtr` tag:\n{mir}"
+        );
+        assert_eq!(
+            mir.matches("Rvalue.ref ").count(),
+            0,
+            "`{name}` must not mint any `Rvalue.ref` tag:\n{mir}"
+        );
+        assert!(
+            mir.contains("BinOp.offset")
+                && mir.contains("NonDivergingIntrinsic.copyNonOverlapping"),
+            "`{name}` must lower `offset` + `copy_nonoverlapping` inline:\n{mir}"
+        );
+        if expect_whole_local_raw_ptr {
+            assert!(
+                mir.contains("Rvalue.rawPtr Mutability.mut { local_ := 1, projection := List.nil }"),
+                "`{name}` must take `&raw mut arr` with `projection := List.nil`:\n{mir}"
+            );
+        }
     }
 
     // Category 9's multi-callee `Verify` modules link their transitive helper

@@ -1334,9 +1334,11 @@ pub const __ANNEAL_MODEL_pass_copy_nonoverlapping_same_tag_disjoint_array_halves
     "pass_copy_nonoverlapping_same_tag_disjoint_array_halves";
 /// Campaign #16 (`ub_copy_nonoverlapping_partial_overlap_array` with its
 /// `offset(p, 1isize)` perturbed to `offset(p, 2isize)`): `arr[0..2]` is copied
-/// onto the disjoint `arr[2..4]` through `p` and `offset(p, 2isize)`, which
-/// share the tag of `p`. `arr` becomes `[10, 20, 10, 20]`, so the result is
-/// `10 ^ 20 = 30` (no copy gives `54`, and a one-element copy gives `34`).
+/// onto the disjoint `arr[2..4]` through `p = &raw mut arr[0]` and
+/// `offset(p, 2isize)`, which share the tag of `p` (exercising `Statements.lean`'s
+/// `copyViaBytes` same-tag check). `arr` becomes `[10, 20, 10, 20]`, so the
+/// result is `10 ^ 20 = 30` (no copy gives `54`, and a one-element copy gives
+/// `34`).
 #[inline(never)]
 pub fn pass_copy_nonoverlapping_same_tag_disjoint_array_halves() -> u32 {
     let mut arr: [u32; 4] = [10u32, 20u32, 30u32, 40u32];
@@ -1346,6 +1348,30 @@ pub fn pass_copy_nonoverlapping_same_tag_disjoint_array_halves() -> u32 {
         copy_nonoverlapping(p as *const u32, dst, 2usize);
     }
     arr[2] ^ arr[3]
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves: &str =
+    "pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves";
+/// Whole-array `[u8; 8]` raw-cast variant (`p = (&raw mut arr) as *mut u8`,
+/// `dst = offset(p, 4isize)`, `copy_nonoverlapping(p as *const u8, dst, 4usize)`):
+/// unlike `&raw mut arr[0]` on `[u32; 4]`, `p` has empty `targetProjection` and
+/// unit byte stride (`dstStart = 4`, `n = 4`, `length dstElems = 8`), directly
+/// entering `Statements.lean`'s `sameContainer` array-slice branch (`Nat.beq
+/// srcPtr.tag dstPtr.tag` before `[0..4)` vs. `[4..8)`). Packs `arr[4..8]` into
+/// `0x1109_0503 = 285803779` so any 0..=3-byte partial copy yields a distinct `u32`.
+#[inline(never)]
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves() -> u32 {
+    let mut arr: [u8; 8] = [3u8, 5u8, 9u8, 17u8, 33u8, 65u8, 129u8, 250u8];
+    let p: *mut u8 = (&raw mut arr) as *mut u8;
+    unsafe {
+        let dst: *mut u8 = offset(p, 4isize);
+        copy_nonoverlapping(p as *const u8, dst, 4usize);
+    }
+    (arr[4] as u32)
+        | ((arr[5] as u32) << 8u32)
+        | ((arr[6] as u32) << 16u32)
+        | ((arr[7] as u32) << 24u32)
 }
 
 #[allow(non_upper_case_globals)]

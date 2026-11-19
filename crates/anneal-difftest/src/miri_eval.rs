@@ -5273,6 +5273,7 @@ fn run_linked_difftest_oracle_pipeline(
 
 fn discover_reproducer_candidate_fn(source: &str) -> Option<String> {
     if let Ok(parsed) = syn::parse_file(source) {
+        let local_models = crate::mutators_miri::model_marked_names_in_file(&parsed);
         let mut pub_zero_arg = Vec::new();
         for item in parsed.items {
             if let syn::Item::Fn(func) = item
@@ -5280,7 +5281,7 @@ fn discover_reproducer_candidate_fn(source: &str) -> Option<String> {
                 && func.sig.inputs.is_empty()
             {
                 let name = func.sig.ident.to_string();
-                if !crate::mutators_miri::is_corpus_helper_fn_name(&name) {
+                if !crate::mutators_miri::is_helper_fn_name_in_set(&name, &local_models) {
                     pub_zero_arg.push(name);
                 }
             }
@@ -12093,6 +12094,36 @@ pub fn cand_shadow() -> u32 {
             offenders.is_empty(),
             "process-environment mutation in anneal-difftest sources:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn discover_reproducer_candidate_fn_honors_file_local_model_markers() {
+        // 1. Standalone minimal reproducer reusing a Category 11 probe name without
+        //    `__ANNEAL_MODEL_*` must be discovered rather than globally blocklisted.
+        let minimal_repro = "\
+#![no_std]
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_array_halves() -> u32 {
+    30u32
+}
+";
+        assert_eq!(
+            discover_reproducer_candidate_fn(minimal_repro).as_deref(),
+            Some("pass_copy_nonoverlapping_same_tag_disjoint_array_halves")
+        );
+
+        // 2. Preamble-backed reproducer skips model-marked preamble probes and picks
+        //    the candidate function, even when a custom file-local model-marked
+        //    helper follows it.
+        let with_preamble_and_trailing_model = format!(
+            "{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n\
+             pub fn cand_under_test() -> u32 {{ 42u32 }}\n\
+             pub const __ANNEAL_MODEL_trailing_zero_arg_helper: &str = \"trailing_zero_arg_helper\";\n\
+             pub fn trailing_zero_arg_helper() -> u32 {{ 99u32 }}\n"
+        );
+        assert_eq!(
+            discover_reproducer_candidate_fn(&with_preamble_and_trailing_model).as_deref(),
+            Some("cand_under_test")
         );
     }
 }

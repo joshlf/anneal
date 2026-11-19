@@ -221,6 +221,113 @@ def extract_ub_span_from_stderr(stderr: str) -> str:
     raise RuntimeError(f"Could not extract UB source span from Miri stderr:\n{stderr}")
 
 
+_CHAR_LIT_RE = re.compile(
+    r"b?'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^'\\\n])'"
+)
+_RAW_STR_START_RE = re.compile(r'b?r(#*)"')
+
+
+def _strip_rust_comments(src: str, *, blank_strings: bool = False) -> str:
+    """Strip Rust line and nested block comments while preserving line structure.
+
+    When ``blank_strings`` is True, string literal interiors are also replaced
+    with spaces (keeping outer quotes and newlines) so string contents cannot
+    masquerade as top-level Rust items or markers.
+    """
+    out: list[str] = []
+    n = len(src)
+    i = 0
+    while i < n:
+        ch = src[i]
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            i += 2
+            out.append("  ")
+            while i < n and src[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and src[i + 1] == "*":
+            depth = 1
+            i += 2
+            out.append("  ")
+            while i < n and depth > 0:
+                if src[i] == "/" and i + 1 < n and src[i + 1] == "*":
+                    depth += 1
+                    out.append("  ")
+                    i += 2
+                elif src[i] == "*" and i + 1 < n and src[i + 1] == "/":
+                    depth -= 1
+                    out.append("  ")
+                    i += 2
+                else:
+                    out.append("\n" if src[i] == "\n" else " ")
+                    i += 1
+            continue
+        if i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"):
+            raw_m = _RAW_STR_START_RE.match(src, i)
+            if raw_m is not None:
+                hashes = raw_m.group(1)
+                closing = '"' + hashes
+                out.append(raw_m.group(0))
+                i = raw_m.end()
+                end_idx = src.find(closing, i)
+                body_end = n if end_idx < 0 else end_idx
+                body = src[i:body_end]
+                if blank_strings:
+                    out.append("".join("\n" if c == "\n" else " " for c in body))
+                else:
+                    out.append(body)
+                if end_idx >= 0:
+                    out.append(closing)
+                    i = end_idx + len(closing)
+                else:
+                    i = n
+                continue
+        if ch == '"' or (
+            ch == "b"
+            and i + 1 < n
+            and src[i + 1] == '"'
+            and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"))
+        ):
+            if ch == "b":
+                out.append('b"')
+                i += 2
+            else:
+                out.append('"')
+                i += 1
+            while i < n:
+                c = src[i]
+                if c == "\\":
+                    esc = src[i : min(i + 2, n)]
+                    if blank_strings:
+                        out.append("".join("\n" if ec == "\n" else " " for ec in esc))
+                    else:
+                        out.append(esc)
+                    i += len(esc)
+                elif c == '"':
+                    out.append('"')
+                    i += 1
+                    break
+                else:
+                    out.append("\n" if c == "\n" else (" " if blank_strings else c))
+                    i += 1
+            continue
+        if ch == "'" or (
+            ch == "b"
+            and i + 1 < n
+            and src[i + 1] == "'"
+            and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"))
+        ):
+            cm = _CHAR_LIT_RE.match(src, i)
+            if cm is not None:
+                out.append(cm.group(0))
+                i = cm.end()
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
     with manifest_path.open("rb") as f:
         manifest = tomllib.load(f)
@@ -230,35 +337,68 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
 
     lib_rs = (corpus_dir / "src" / "lib.rs").read_text(encoding="utf-8")
     eval_rs = (corpus_dir / "examples" / "miri_eval.rs").read_text(encoding="utf-8")
+    clean_lib = _strip_rust_comments(lib_rs, blank_strings=False)
+    clean_lib_no_str = _strip_rust_comments(lib_rs, blank_strings=True)
+    clean_eval = _strip_rust_comments(eval_rs, blank_strings=False)
 
-    # A `const __ANNEAL_MODEL_<name>: &str = "<name>";` marker makes `<name>` a
-    # model item (an intra-crate callee or a static), never a manifest test,
-    # exactly as `corpus_model_helper_names` in
-    # `crates/anneal-difftest/src/mutators_miri.rs` treats it. The capture
-    # driver also treats the marker's value as a model item, so the value must
-    # repeat the name.
-    model_names = set(
-        re.findall(r"^(?:pub\s+)?const\s+__ANNEAL_MODEL_([A-Za-z0-9_]+)\s*:", lib_rs, re.MULTILINE)
+    # A `const __ANNEAL_MODEL_<name>: &str = "<name>";` (or `: () = ();`) marker
+    # makes `<name>` a model item (an intra-crate callee or a static), never a
+    # manifest test, matching `trusted/rustc-capture` (`specs.rs`) and
+    # `crates/anneal-difftest/src/mutators_miri.rs`.
+    raw_marker_names = re.findall(
+        r"^(?:pub(?:\s*\([^)]*\))?\s+)?const\s+__ANNEAL_MODEL_([A-Za-z0-9_]+)\b",
+        clean_lib_no_str,
+        re.MULTILINE,
     )
-    marker_values = dict(
-        re.findall(
-            r'^(?:pub\s+)?const\s+__ANNEAL_MODEL_([A-Za-z0-9_]+)\s*:\s*&str\s*=\s*"([^"]*)"\s*;',
-            lib_rs,
-            re.MULTILINE,
+    seen_markers: set[str] = set()
+    dup_markers: set[str] = set()
+    for m_name in raw_marker_names:
+        if m_name in seen_markers:
+            dup_markers.add(m_name)
+        seen_markers.add(m_name)
+    if dup_markers:
+        raise ValueError(
+            "corpus/src/lib.rs declares duplicate __ANNEAL_MODEL_* markers: "
+            f"{sorted(dup_markers)}"
         )
-    )
-    mismatched_markers = sorted(
-        name for name in model_names if marker_values.get(name) != name
-    )
+
+    parsed_markers: dict[str, tuple[str, str]] = {}
+    for m in re.finditer(
+        r"^(?:pub(?:\s*\([^)]*\))?\s+)?const\s+__ANNEAL_MODEL_([A-Za-z0-9_]+)\s*:\s*([^=;]+?)\s*=\s*([^;]+?)\s*;",
+        clean_lib,
+        re.MULTILINE,
+    ):
+        m_name = m.group(1)
+        m_ty = re.sub(r"\s+", "", m.group(2))
+        m_val = m.group(3).strip()
+        parsed_markers[m_name] = (m_ty, m_val)
+
+    mismatched_markers: list[str] = []
+    for m_name in sorted(seen_markers):
+        entry_tv = parsed_markers.get(m_name)
+        if entry_tv is None:
+            mismatched_markers.append(m_name)
+            continue
+        m_ty, m_val = entry_tv
+        if m_ty in ("&str", "&'staticstr"):
+            if m_val != f'"{m_name}"':
+                mismatched_markers.append(m_name)
+        elif m_ty == "()":
+            if re.sub(r"\s+", "", m_val) != "()":
+                mismatched_markers.append(m_name)
+        else:
+            mismatched_markers.append(m_name)
     if mismatched_markers:
         raise ValueError(
-            "corpus/src/lib.rs declares __ANNEAL_MODEL_<name> markers whose value is "
-            f"not the string \"<name>\": {mismatched_markers}"
+            "corpus/src/lib.rs declares __ANNEAL_MODEL_<name> markers whose type/value "
+            f"is neither `&str = \"<name>\"` nor `() = ()`: {mismatched_markers}"
         )
+
+    model_names = seen_markers
     item_names = set(
         re.findall(
-            r"^(?:pub\s+)?(?:fn|static|struct|enum|union)\s+([A-Za-z0-9_]+)\b",
-            lib_rs,
+            r"^(?:pub(?:\s*\([^)]*\))?\s+)?(?:const\s+)?(?:unsafe\s+)?(?:fn|static(?:\s+mut)?|struct|enum|union|type)\s+([A-Za-z0-9_]+)\b",
+            clean_lib_no_str,
             re.MULTILINE,
         )
     )
@@ -270,7 +410,11 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
         )
     fn_names_in_lib = [
         m.group(1)
-        for m in re.finditer(r"^pub fn ([a-z0-9_]+)\(\)", lib_rs, re.MULTILINE)
+        for m in re.finditer(
+            r"^pub(?:\s*\([^)]*\))?\s+(?:const\s+)?(?:unsafe\s+)?fn\s+([A-Za-z0-9_]+)\s*\(\s*\)",
+            clean_lib_no_str,
+            re.MULTILINE,
+        )
         if m.group(1) != "helper_add_ten" and m.group(1) not in model_names
     ]
 
@@ -283,6 +427,25 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
             f"Manifest test list does not match corpus/src/lib.rs: "
             f"missing_in_manifest={sorted(missing_in_manifest)}, "
             f"missing_in_lib={sorted(missing_in_lib)}"
+        )
+
+    eval_arms = re.findall(r'"([^"]+)"\s*=>', clean_eval)
+    seen_eval_arms: set[str] = set()
+    dup_eval_arms: set[str] = set()
+    for arm in eval_arms:
+        if arm in seen_eval_arms:
+            dup_eval_arms.add(arm)
+        seen_eval_arms.add(arm)
+    if dup_eval_arms:
+        raise ValueError(
+            "corpus/examples/miri_eval.rs declares duplicate dispatch arms: "
+            f"{sorted(dup_eval_arms)}"
+        )
+    extra_eval_arms = sorted(seen_eval_arms - set(manifest_names))
+    if extra_eval_arms:
+        raise ValueError(
+            "corpus/examples/miri_eval.rs has dispatch arms absent from manifest.toml "
+            f"(e.g. orphaned or model-marked items): {extra_eval_arms}"
         )
 
     allowed_test_keys = {
@@ -316,7 +479,7 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
                 f"Test '{name}' has invalid upstream_path '{upstream_path}'; "
                 "must start with tests/pass/, tests/panic/, or tests/fail/"
             )
-        if f'"{name}" =>' not in eval_rs:
+        if name not in seen_eval_arms:
             raise ValueError(
                 f"Test '{name}' is missing a dispatch arm in corpus/examples/miri_eval.rs"
             )
