@@ -2993,7 +2993,7 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
           rw [hpre, hok, ok_bind, hback]
           exact hj
 
-/-! ### Concrete unwinding and `SetDiscriminant` witnesses -/
+/-! ### Unwinding and `SetDiscriminant`: concrete witnesses and general laws -/
 
 private def uwEmptyProg : Gen.Program :=
   { functions := ⟨[]⟩
@@ -4280,7 +4280,17 @@ both `Mach` (`BasicMemory`) and `MachTB` (`TreeBorrowsMemory`):
    succeeds with `bytes`, and whenever `0 < ity.size.bytes` and no later entry
    in `post` covers byte `(base + off - a.addr) + i`, the resulting allocation
    holds `bytes[i]?` at that byte (exact last-write-wins tag semantics, and
-   exact simultaneous tag bytes whenever tag ranges are pairwise disjoint). -/
+   exact simultaneous tag bytes whenever tag ranges are pairwise disjoint).
+
+Every clause compares against `m1`, the machine that `eval_place` returned
+for `destination`, and not against the machine the statement started from:
+evaluating `destination` can itself load from memory (the pointer operand of
+a `Deref`), which is recorded in the access log and, on `MachTB`, is a read
+access to a borrow tree. In clause 4, `base` is the address of the place and
+`a` is the allocation that its provenance names. On `MachTB` the borrow tree
+of that one allocation is outside this law: every tag store is a write access
+that may update it, so for that allocation the law covers the bytes and the
+listed metadata only. -/
 theorem minirust_setDiscriminant_memory_frame_law :
     (∀ (m m1 m' : Mach) (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place BM)
         (vs : Map Int Gen.Variant) (dt : Gen.IntType) (d : Gen.Discriminator)
