@@ -100,14 +100,11 @@ open MiniRustSpec.Correspondence.WideSliceDst
 Codecs -/
 
 @[reducible] def dummySpan : String := "ep2.rs:1:1"
-@[reducible] def mkSt (k : MirAst.StatementKind) : MirAst.Statement :=
-  { kind := k, span := dummySpan }
-@[reducible] def mkTm (k : MirAst.TerminatorKind) : MirAst.Terminator :=
-  { kind := k, span := dummySpan }
+@[reducible] def mkSt (k : MirAst.StatementKind) : MirAst.Statement := { kind := k, span := dummySpan }
+@[reducible] def mkTm (k : MirAst.TerminatorKind) : MirAst.Terminator := { kind := k, span := dummySpan }
 @[reducible] def mkBb (stmts : List MirAst.Statement) (term : MirAst.TerminatorKind)
     (isCleanup : Bool := false) : MirAst.BasicBlockData :=
-  { statements := stmts, terminator := mkTm term, isCleanup := isCleanup }
-
+  { statements := stmts, terminator := mkTm term, isCleanup }
 @[reducible] def u8MirTy : MirAst.Ty := { kind := .uint .u8, layoutIdx := 0 }
 @[reducible] def u32MirTy : MirAst.Ty := { kind := .uint .u32, layoutIdx := 0 }
 @[reducible] def i32MirTy : MirAst.Ty := { kind := .int .i32, layoutIdx := 0 }
@@ -115,16 +112,11 @@ Codecs -/
 @[reducible] def usizeMirTy : MirAst.Ty := { kind := .uint .usize, layoutIdx := 0 }
 @[reducible] def boolMirTy : MirAst.Ty := { kind := .bool, layoutIdx := 0 }
 @[reducible] def unitMirTy : MirAst.Ty := { kind := .tuple [], layoutIdx := 0 }
-@[reducible] def rawConstUnitMirTy : MirAst.Ty :=
-  { kind := .rawPtr .not (.tuple []), layoutIdx := 0 }
-@[reducible] def rawConstU32MirTy : MirAst.Ty :=
-  { kind := .rawPtr .not (.uint .u32), layoutIdx := 0 }
-@[reducible] def rawMutU32MirTy : MirAst.Ty :=
-  { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
-@[reducible] def refMutU32MirTy : MirAst.Ty :=
-  { kind := .ref .mut (.uint .u32), layoutIdx := 0 }
-@[reducible] def arr2U32MirTy : MirAst.Ty :=
-  { kind := .array (.uint .u32) 2, layoutIdx := 0 }
+@[reducible] def rawConstUnitMirTy : MirAst.Ty := { kind := .rawPtr .not (.tuple []), layoutIdx := 0 }
+@[reducible] def rawConstU32MirTy : MirAst.Ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 0 }
+@[reducible] def rawMutU32MirTy : MirAst.Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
+@[reducible] def refMutU32MirTy : MirAst.Ty := { kind := .ref .mut (.uint .u32), layoutIdx := 0 }
+@[reducible] def arr2U32MirTy : MirAst.Ty := { kind := .array (.uint .u32) 2, layoutIdx := 0 }
 @[reducible] def rawMutArr2U32MirTy : MirAst.Ty :=
   { kind := .rawPtr .mut (.array (.uint .u32) 2), layoutIdx := 0 }
 @[reducible] def rawConstArr2U32MirTy : MirAst.Ty :=
@@ -133,38 +125,24 @@ Codecs -/
   { kind := .rawPtr .mut (.slice (.uint .u32)), layoutIdx := 0 }
 @[reducible] def rawConstSliceU32MirTy : MirAst.Ty :=
   { kind := .rawPtr .not (.slice (.uint .u32)), layoutIdx := 0 }
-@[reducible] def rawMutDynMirTy : MirAst.Ty :=
-  { kind := .rawPtr .mut (.dynamic "ep2::Tr"), layoutIdx := 0 }
-@[reducible] def rawConstDynMirTy : MirAst.Ty :=
-  { kind := .rawPtr .not (.dynamic "ep2::Tr"), layoutIdx := 0 }
-
+@[reducible] def rawMutDynMirTy : MirAst.Ty := { kind := .rawPtr .mut (.dynamic "ep2::Tr"), layoutIdx := 0 }
+@[reducible] def rawConstDynMirTy : MirAst.Ty := { kind := .rawPtr .not (.dynamic "ep2::Tr"), layoutIdx := 0 }
 @[reducible] def fnPtrSafeU32MirTy : MirAst.Ty :=
   { kind := .fnPtr [.uint .u32] (.uint .u32) .safe .rust, layoutIdx := 0 }
 @[reducible] def fnPtrUnsafeU32MirTy : MirAst.Ty :=
   { kind := .fnPtr [.uint .u32] (.uint .u32) .unsafe_ .rust, layoutIdx := 0 }
 @[reducible] def fnPtrIntrinsicU32MirTy : MirAst.Ty :=
   { kind := .fnPtr [.uint .u32] (.uint .u32) .safe .rustIntrinsic, layoutIdx := 0 }
-@[reducible] def fnDefU32MirTy (dp : String) : MirAst.Ty :=
-  { kind := .fnDef dp [], layoutIdx := 0 }
-@[reducible] def closureZstMirTy (dp : String) : MirAst.Ty :=
-  { kind := .closure dp [], layoutIdx := 0 }
+@[reducible] def fnDefU32MirTy (dp : String) : MirAst.Ty := { kind := .fnDef dp [], layoutIdx := 0 }
+@[reducible] def closureZstMirTy (dp : String) : MirAst.Ty := { kind := .closure dp [], layoutIdx := 0 }
 @[reducible] def closureCapMirTy (dp : String) : MirAst.Ty :=
   { kind := .closure dp [.uint .u32, .rawPtr .not (.uint .u32)], layoutIdx := 0 }
-
-@[reducible] def mkDecl (ty : MirAst.Ty) : MirAst.LocalDecl :=
-  { mutability := .mut, ty := ty, debugName := none }
-
-@[reducible] def locPlace (i : Nat) (proj : List MirAst.ProjectionElem := []) :
-    MirAst.Place :=
+@[reducible] def mkDecl (ty : MirAst.Ty) : MirAst.LocalDecl := { mutability := .mut, ty, debugName := none }
+@[reducible] def locPlace (i : Nat) (proj : List MirAst.ProjectionElem := []) : MirAst.Place :=
   { local_ := i, projection := proj }
-
-@[reducible] def constU8 (n : Nat) : MirAst.Operand :=
-  .constant { ty := u8MirTy, val := .scalar (.int ⟨n, 1⟩) }
-@[reducible] def constU32 (n : Nat) : MirAst.Operand :=
-  .constant { ty := u32MirTy, val := .scalar (.int ⟨n, 4⟩) }
-@[reducible] def constZst (ty : MirAst.Ty) : MirAst.Operand :=
-  .constant { ty := ty, val := .zeroSized }
-
+@[reducible] def constU8 (n : Nat) : MirAst.Operand := .constant { ty := u8MirTy, val := .scalar (.int ⟨n, 1⟩) }
+@[reducible] def constU32 (n : Nat) : MirAst.Operand := .constant { ty := u32MirTy, val := .scalar (.int ⟨n, 4⟩) }
+@[reducible] def constZst (ty : MirAst.Ty) : MirAst.Operand := .constant { ty, val := .zeroSized }
 @[reducible] def u8MrTy : Gen.Type := .Int ⟨.Unsigned, ⟨1⟩⟩
 @[reducible] def u32MrTy : Gen.Type := .Int u32
 @[reducible] def i32MrTy : Gen.Type := .Int ⟨.Signed, ⟨4⟩⟩
@@ -172,8 +150,7 @@ Codecs -/
 @[reducible] def usizeMrTy : Gen.Type := .Int IntType.usize_ty
 @[reducible] def wideSlicePtrMrTy : Gen.Type := .Ptr (.Raw .ElementCount)
 @[reducible] def traitNameOf (idx : Nat) : Gen.TraitName := ⟨⟨idx⟩⟩
-@[reducible] def wideDynPtrMrTy (idx : Nat := 0) : Gen.Type :=
-  .Ptr (.Raw (.VTablePointer (traitNameOf idx)))
+@[reducible] def wideDynPtrMrTy (idx : Nat := 0) : Gen.Type := .Ptr (.Raw (.VTablePointer (traitNameOf idx)))
 
 /-- Dummy non-null return-value pointer placeholder for frames whose caller
 ignores the return place during unwind tests. -/
@@ -183,108 +160,73 @@ ignores the return place during unwind tests. -/
 def mkMirBody (defPath : String) (decls : List MirAst.LocalDecl) (argCount : Nat)
     (blocks : List MirAst.BasicBlockData) (layouts : LayoutTable := emptyLayoutTable) :
     MirAst.CapturedMir :=
-  { defPath := defPath
-    phase := .runtimePostCleanup
-    role := .subject
-    argCount := argCount
-    localDecls := decls
-    basicBlocks := blocks
+  { defPath, phase := .runtimePostCleanup, role := .subject, argCount, localDecls := decls,
+    basicBlocks := blocks,
     fnAbi := { args := [], ret := { layout := i8Layout, mode := .direct },
-               conv := .rust, canUnwind := true }
-    layouts := layouts
-    allocations := [] }
+               conv := .rust, canUnwind := true },
+    layouts, allocations := [] }
 
 /-- Build a MiniRust `Gen.Function` with `minimize`'s default `implicit_writes
 := true`. -/
 def mkMrFn (locals : List (Gen.LocalName × Gen.Type)) (args : List Gen.LocalName)
     (ret : Gen.LocalName) (blocks : List (Gen.BbName × Gen.BasicBlock))
     (start : Gen.BbName := bbName 0) : Gen.Function :=
-  { locals := ⟨locals⟩
-    args := args
-    ret := ret
-    calling_convention := .Rust
-    blocks := ⟨blocks⟩
-    start := start
-    implicit_writes := true }
+  { locals := ⟨locals⟩, args, ret, calling_convention := .Rust,
+    blocks := ⟨blocks⟩, start, implicit_writes := true }
 
 /-- Build a minimal `Gen.Program` from an association list of functions. -/
 def mkMrProg (fns : List (Gen.FnName × Gen.Function)) (start : Gen.FnName := fnName 0) :
     Gen.Program :=
-  { functions := ⟨fns⟩
-    start := start
-    globals := ⟨[]⟩
-    traits := ⟨[]⟩
-    vtables := ⟨[]⟩ }
+  { functions := ⟨fns⟩, start, globals := ⟨[]⟩, traits := ⟨[]⟩, vtables := ⟨[]⟩ }
 
 /-- Build a single-thread `BasicMemory` MiniRust machine (`Mach`). -/
 def mkMrMach (prog : Gen.Program) (allocs : List Gen.Allocation) (stack : List Frame)
-    (fnPtrs : List (Gen.FnName × Ptr) := [])
-    (globalPtrs : List (Gen.GlobalName × Ptr) := [])
+    (fnPtrs : List (Gen.FnName × Ptr) := []) (globalPtrs : List (Gen.GlobalName × Ptr) := [])
     (unwindPayloads : List Ptr := []) : Mach :=
-  { prog := prog
-    mem := { memory := { allocations := allocs, _phantom := {} }, accesses := [] }
-    intptrcast := ⟨⟨[]⟩⟩
-    threads := [{ stack := stack, state := .Enabled, unwind_payloads := unwindPayloads }]
-    active_thread := 0
-    synchronized_threads := ⟨[]⟩
-    locks := []
-    global_ptrs := ⟨globalPtrs⟩
-    fn_ptrs := ⟨fnPtrs⟩
-    vtable_ptrs := ⟨[]⟩
-    stdout := ⟨[]⟩
-    stderr := ⟨[]⟩ }
+  { prog, mem := { memory := { allocations := allocs, _phantom := {} }, accesses := [] },
+    intptrcast := ⟨⟨[]⟩⟩,
+    threads := [{ stack, state := .Enabled, unwind_payloads := unwindPayloads }],
+    active_thread := 0, synchronized_threads := ⟨[]⟩, locks := [],
+    global_ptrs := ⟨globalPtrs⟩, fn_ptrs := ⟨fnPtrs⟩, vtable_ptrs := ⟨[]⟩,
+    stdout := ⟨[]⟩, stderr := ⟨[]⟩ }
 
-/-- Build a `BasicMemory` stack allocation at `addr` with initial byte contents
-`data`. -/
+/-- Build a `BasicMemory` stack allocation at `addr` with bytes `data`. -/
 def mkStackAlloc (addr : Int) (data : List Byte) (align : Nat := 8) : Gen.Allocation :=
-  { addr := addr
-    data := data
-    align := ⟨align⟩
-    kind := .Stack
-    live := true
-    extra := () }
+  { addr, data, align := ⟨align⟩, kind := .Stack, live := true, extra := () }
 
-/-- Build a `BasicMemory` function allocation at `addr` (size `0`, align `1`).
--/
+/-- Build a `BasicMemory` function allocation at `addr` (size 0, align 1). -/
 def mkFnAlloc (addr : Int) : Gen.Allocation :=
-  { addr := addr
-    data := []
-    align := ⟨1⟩
-    kind := .Function
-    live := true
-    extra := () }
+  { addr, data := [], align := ⟨1⟩, kind := .Function, live := true, extra := () }
+
+/-- Build a root `BasicMemory` `Frame` (`BottomOfStack`). -/
+def mkRootFrame (fn : Gen.Function) (locs : List (Gen.LocalName × Ptr))
+    (nextBb : Gen.BbName := bbName 0) (nextStmt : Int := 0) : Frame :=
+  { func := fn, locals := ⟨locs⟩, stack_pop_action := .BottomOfStack,
+    next_block := nextBb, next_stmt := nextStmt, extra := () }
 
 /-- Extract the return value of a clean event-free `runA` execution. -/
 def runAVal (body : CapturedMir) (fuel : Nat) (s : MachineState) : Option MirSemantics.Value :=
-  match runA body fuel s with
-  | some ([], .normal (v, _)) => some v
-  | _ => none
+  match runA body fuel s with | some ([], .normal (v, _)) => some v | _ => none
 
 /-- Decidable UB-message projection for `Interp α`. -/
 def interpUbMsg {α : Type} : Interp α → Option String
-  | .error (.ub msg) => some msg
-  | _ => none
+  | .error (.ub msg) => some msg | _ => none
 
 /-- Decidable `.abort` check for `Interp α`. -/
 def interpIsAbort {α : Type} : Interp α → Bool
-  | .error .abort => true
-  | _ => false
+  | .error .abort => true | _ => false
 
 theorem eq_error_ub_of_interpUbMsg {α : Type} {r : Interp α} {msg : String}
     (h : interpUbMsg r = some msg) : r = .error (.ub msg) := by
   cases r with
   | ok _ => simp [interpUbMsg] at h
-  | error e =>
-    cases e <;> simp [interpUbMsg] at h
-    subst h; rfl
+  | error e => cases e <;> simp [interpUbMsg] at h; subst h; rfl
 
 theorem eq_error_abort_of_interpIsAbort {α : Type} {r : Interp α}
     (h : interpIsAbort r = true) : r = .error .abort := by
   cases r with
   | ok _ => simp [interpIsAbort] at h
-  | error e =>
-    cases e <;> simp [interpIsAbort] at h
-    rfl
+  | error e => cases e <;> simp [interpIsAbort] at h; rfl
 
 theorem ok_of_map_toOption {α β : Type} {r : Interp α} {f : α → β} {b : β}
     (h : r.toOption.map f = some b) : ∃ a, r = .ok a ∧ f a = b := by
@@ -293,8 +235,7 @@ theorem ok_of_map_toOption {α β : Type} {r : Interp α} {f : α → β} {b : �
   | ok a => simp [Except.toOption] at h; exact ⟨a, rfl, h⟩
 
 private theorem size_ne_self_ite_local {α : Type} (s : LibSpecr.Size) (a b : α) :
-    (if s ≠ s then a else b) = b := by
-  simp
+    (if s ≠ s then a else b) = b := by simp
 
 /-- Polymorphic helper: `evalPlaceM` on `unitPlace` succeeds on any `Machine M`,
 returning the aligned pointer at address `1` with `unitType`. -/
@@ -375,35 +316,38 @@ theorem encode_usize_cf (addr : Nat) (h : addr < 2 ^ 64) :
   rw [hmod]
   rfl
 
+/-- `Classical.choice`-free base-256 remainder-splitting identity shared by both
+MiniRust `leValue_leBytes_cf` and Trusted `decodeLittleEndianBytes_encode`. -/
+theorem mod_256_succ (v n : Nat) :
+    v % 256 + 256 * (v / 256 % 256 ^ n) = v % 256 ^ (n + 1) := by
+  rw [Nat.pow_succ']
+  have h1 := Nat.mod_add_div v 256
+  have h2 := Nat.mod_add_div (v / 256) (256 ^ n)
+  have hlt1 : v % 256 < 256 := Nat.mod_lt v (by decide)
+  have hlt2 : v / 256 % 256 ^ n < 256 ^ n := Nat.mod_lt _ (Nat.pow_pos (by decide))
+  have hlt : v % 256 + 256 * (v / 256 % 256 ^ n) < 256 * 256 ^ n := by
+    have hmul : 256 * (v / 256 % 256 ^ n + 1) ≤ 256 * 256 ^ n :=
+      Nat.mul_le_mul_left 256 hlt2
+    have hmul' : 256 * (v / 256 % 256 ^ n) + 256 ≤ 256 * 256 ^ n := by
+      simpa [Nat.mul_add] using hmul
+    exact Nat.lt_of_lt_of_le (Nat.add_lt_add_right hlt1 _) (by rw [Nat.add_comm]; exact hmul')
+  have heq : v = (v % 256 + 256 * (v / 256 % 256 ^ n)) +
+      (256 * 256 ^ n) * (v / 256 / 256 ^ n) := by
+    calc v = v % 256 + 256 * (v / 256) := h1.symm
+      _ = v % 256 + 256 * (v / 256 % 256 ^ n + 256 ^ n * (v / 256 / 256 ^ n)) := by rw [h2]
+      _ = (v % 256 + 256 * (v / 256 % 256 ^ n)) +
+          (256 * 256 ^ n) * (v / 256 / 256 ^ n) := by
+        rw [Nat.mul_add, ← Nat.add_assoc, ← Nat.mul_assoc]
+  conv => rhs; rw [heq]
+  rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hlt]
+
 /-- `Classical.choice`-free little-endian decode/encode round-trip. -/
 theorem leValue_leBytes_cf (v : Nat) : ∀ n, leValue (leBytes v n) = v % 256 ^ n
   | 0 => by simp [leBytes, leValue, Nat.mod_one]
   | n + 1 => by
     simp only [leBytes, leValue, UInt8.toNat_ofNat', leValue_leBytes_cf (v / 256) n]
-    have h256 : (2 : Nat) ^ 8 = 256 := by decide
-    rw [h256, Nat.mod_mod, Nat.pow_succ']
-    have h1 := Nat.mod_add_div v 256
-    have h2 := Nat.mod_add_div (v / 256) (256 ^ n)
-    have hlt1 : v % 256 < 256 := Nat.mod_lt v (by decide)
-    have hlt2 : v / 256 % 256 ^ n < 256 ^ n := Nat.mod_lt _ (Nat.pow_pos (by decide))
-    have hlt : v % 256 + 256 * (v / 256 % 256 ^ n) < 256 * 256 ^ n := by
-      have hmul : 256 * (v / 256 % 256 ^ n + 1) ≤ 256 * 256 ^ n :=
-        Nat.mul_le_mul_left 256 hlt2
-      have hmul' : 256 * (v / 256 % 256 ^ n) + 256 ≤ 256 * 256 ^ n := by
-        simpa [Nat.mul_add] using hmul
-      exact Nat.lt_of_lt_of_le (Nat.add_lt_add_right hlt1 _) (by
-        rw [Nat.add_comm]; exact hmul')
-    have heq :
-        v = (v % 256 + 256 * (v / 256 % 256 ^ n)) +
-          (256 * 256 ^ n) * (v / 256 / 256 ^ n) := by
-      calc v = v % 256 + 256 * (v / 256) := h1.symm
-        _ = v % 256 + 256 * (v / 256 % 256 ^ n + 256 ^ n * (v / 256 / 256 ^ n)) := by
-          rw [h2]
-        _ = (v % 256 + 256 * (v / 256 % 256 ^ n)) +
-            (256 * 256 ^ n) * (v / 256 / 256 ^ n) := by
-          rw [Nat.mul_add, ← Nat.add_assoc, ← Nat.mul_assoc]
-    conv => rhs; rw [heq]
-    rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hlt]
+    rw [show (2 : Nat) ^ 8 = 256 by decide, Nat.mod_mod]
+    exact mod_256_succ v n
 
 /-- `Classical.choice`-free `inBounds` proof for `intFromBits bits it`. -/
 theorem inBounds_intFromBits_cf (it : Gen.IntType) (hsz : 0 < it.size.bytes)
@@ -469,45 +413,32 @@ theorem encodePtrM_of_encode {M : Type} [Gen.Memory M]
     (ptr : ThinPointer (Gen.Memory.Provenance M)) (data : List UInt8)
     (henc : Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE ptr.addr = some data) :
     encodePtrM (M := M) ptr = .ok (encodePtrBytesM (M := M) ptr.provenance 0 data) := by
-  unfold encodePtrM
-  rw [henc]
-  rfl
+  unfold encodePtrM; rw [henc]; rfl
 
-/-- Polymorphic thin-pointer encode (`Classical.choice`-free) across any `Memory
-M`
-(`BasicMemory` and `TreeBorrowsMemory`). -/
+/-- Polymorphic thin-pointer encode (`Classical.choice`-free) across `Mach` and
+`MachTB`. -/
 theorem encodePtrM_eq {M : Type} [Gen.Memory M]
     (addr : Nat) (h : addr < 2 ^ 64) (prov : Option (Gen.Memory.Provenance M)) :
     encodePtrM (M := M) { addr := addr, provenance := prov } =
       .ok (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) :=
-  encodePtrM_of_encode { addr := addr, provenance := prov } (leBytes addr 8)
-    (encode_usize_cf addr h)
+  encodePtrM_of_encode { addr, provenance := prov } (leBytes addr 8) (encode_usize_cf addr h)
 
-/-- Polymorphic thin-pointer decode (`Classical.choice`-free) across any `Memory
-M`
-(`BasicMemory` and `TreeBorrowsMemory`). -/
+/-- Polymorphic thin-pointer decode (`Classical.choice`-free) across `Mach` and
+`MachTB`. -/
 theorem decodePtrM_encodePtrBytesM {M : Type} [Gen.Memory M] [MemoryOps M]
     (addr : Nat) (h : addr < 2 ^ 64) (prov : Option (Gen.Memory.Provenance M)) :
     decodePtrM (M := M) (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) =
       .ok (some { addr := addr, provenance := prov }) := by
-  have hlen : (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)).length =
-      x86_64.PTR_SIZE.bytes := by
+  have hlen : (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)).length = x86_64.PTR_SIZE.bytes := by
     rw [encodePtrBytesM_length, leBytes_length]; rfl
-  have h256 : addr < 256 ^ 8 := by
-    have : (256 : Nat) ^ 8 = 2 ^ 64 := by decide
-    rw [this]; exact h
+  have h256 : addr < 256 ^ 8 := by rw [show (256 : Nat) ^ 8 = 2 ^ 64 by decide]; exact h
   have hval : Endianness.decode x86_64.ENDIANNESS .Unsigned (leBytes addr 8) = (addr : Int) := by
     simp only [Endianness.decode, x86_64.ENDIANNESS, leValue_leBytes_cf, Nat.mod_eq_of_lt h256]
-  have hfirst :
-      firstProvenanceM (M := M) (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) = prov := by
-    have hcons : leBytes addr 8 = UInt8.ofNat (addr % 256) :: leBytes (addr / 256) 7 := rfl
-    rw [hcons]; exact firstProvenanceM_encode prov _ _
+  have hfirst : firstProvenanceM (M := M) (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) = prov :=
+    firstProvenanceM_encode prov _ _
   unfold decodePtrM
-  rw [ite_eq_right_iff.mpr (fun hn => absurd hlen hn)]
-  rw [encodePtrBytesM_data]
-  dsimp only
-  rw [hval, hfirst, decodePtrProvenanceM_encode]
-  rfl
+  rw [ite_eq_right_iff.mpr (fun hn => absurd hlen hn), encodePtrBytesM_data]
+  dsimp only; rw [hval, hfirst, decodePtrProvenanceM_encode]; rfl
 
 /-- Polymorphic helper (`Classical.choice`-free): `transmuteM` on `thinRawPtrTy`
 from explicit `inBounds`, `encodeM`, and `decodeM` witnesses. -/
@@ -522,23 +453,17 @@ theorem transmuteM_thinRawPtr_of_codec {M : Type} [Gen.Memory M] [MemoryOps M]
     let p : Gen.Pointer (Gen.Memory.Provenance M) :=
       ThinPointer.widen { addr := addr, provenance := prov } none
     transmuteM (M := M) (.Ptr p) thinRawPtrTy thinRawPtrTy m = .ok (.Ptr p) := by
-  intro p
-  unfold transmuteM
-  rw [layout_thinRawPtr]
+  intro p; unfold transmuteM; rw [layout_thinRawPtr]
   simp only [ok_bind, expect_size_sized, size_ne_self_ite_local]
   rw [show Type.encodeM (M := M) thinRawPtrTy (.Ptr p) = .ok bs from henc, ok_bind,
     show Type.decodeM (M := M) thinRawPtrTy bs = .ok (some (.Ptr p)) from hdec, ok_bind]
-  dsimp only []
-  unfold checkValueM checkPtrM
+  dsimp only []; unfold checkValueM checkPtrM
   simp only [thinRawPtrTy, p, ThinPointer.widen, ensureElseUb, hin, ↓reduceIte,
-    PtrType.meta_kind, checkPtrMetadataM, PtrType.safe_pointee,
-    pure, Except.pure, bind, Except.bind]
+    PtrType.meta_kind, checkPtrMetadataM, PtrType.safe_pointee, pure, Except.pure, bind, Except.bind]
   rfl
 
-/-- Polymorphic `transmuteM` identity for thin raw pointers (`*const T` / `*mut
-T` /
-fn pointers) across EVERY `Memory M` (`BasicMemory` and `TreeBorrowsMemory`),
-proved completely `Classical.choice`-free. -/
+/-- Polymorphic `transmuteM` identity for thin raw pointers across EVERY
+`Memory M` (`Mach` and `MachTB`), strictly `Classical.choice`-free. -/
 theorem transmuteM_thinRawPtr_id {M : Type} [Gen.Memory M] [MemoryOps M]
     (addr : Nat) (h : addr < 2 ^ 64) (prov : Option (Gen.Memory.Provenance M))
     (m : Option (Machine M)) :
@@ -546,32 +471,23 @@ theorem transmuteM_thinRawPtr_id {M : Type} [Gen.Memory M] [MemoryOps M]
       ThinPointer.widen { addr := addr, provenance := prov } none
     transmuteM (M := M) (.Ptr p) thinRawPtrTy thinRawPtrTy m = .ok (.Ptr p) := by
   intro p
-  have hin := inBounds_usize_cf addr h
   have henc : Type.encodeM (M := M) thinRawPtrTy (.Ptr p) =
       .ok (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) := by
-    simp only [thinRawPtrTy, Type.encodeM, PtrType.as_wide_pair, PtrType.meta_kind,
-      p, ThinPointer.widen]
-    exact encodePtrM_eq addr h prov
+    simp only [thinRawPtrTy, Type.encodeM, PtrType.as_wide_pair, PtrType.meta_kind, p,
+      ThinPointer.widen]; exact encodePtrM_eq addr h prov
   have hdec : Type.decodeM (M := M) thinRawPtrTy
       (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) = .ok (some (.Ptr p)) := by
-    simp only [thinRawPtrTy, Type.decodeM, PtrType.as_wide_pair, PtrType.meta_kind,
-      p, ThinPointer.widen]
-    rw [decodePtrM_encodePtrBytesM addr h prov, ok_bind]
-    rfl
-  exact transmuteM_thinRawPtr_of_codec (addr : Int) prov _ m hin henc hdec
+    simp only [thinRawPtrTy, Type.decodeM, PtrType.as_wide_pair, PtrType.meta_kind, p,
+      ThinPointer.widen]; rw [decodePtrM_encodePtrBytesM addr h prov, ok_bind]; rfl
+  exact transmuteM_thinRawPtr_of_codec (addr : Int) prov _ m (inBounds_usize_cf addr h) henc hdec
 
-/-- Polymorphic helper (`Classical.choice`-free): `evalCastOpM` from an explicit
-`transmuteM` witness on `thinRawPtrTy`. -/
 theorem evalCastOpM_transmute_thinRawPtr_of_transmute {M : Type} [Gen.Memory M] [MemoryOps M]
     (p : Gen.Pointer (Gen.Memory.Provenance M)) (m : Option (Machine M))
     (ht : transmuteM (M := M) (.Ptr p) thinRawPtrTy thinRawPtrTy m = .ok (.Ptr p)) :
     evalCastOpM (M := M) (.Transmute thinRawPtrTy) (.Ptr p, thinRawPtrTy) m =
       .ok (.Ptr p, thinRawPtrTy) := by
-  unfold evalCastOpM
-  dsimp only []
-  rw [layout_thinRawPtr]
-  simp only [ok_bind, expect_size_sized, size_ne_self_ite_local, ht, pure, Except.pure,
-    bind, Except.bind]
+  unfold evalCastOpM; dsimp only []; rw [layout_thinRawPtr]
+  simp only [ok_bind, expect_size_sized, size_ne_self_ite_local, ht, pure, Except.pure, bind, Except.bind]
 
 /-- Polymorphic `evalCastOpM` identity for thin raw pointers across `Mach` and
 `MachTB` (`Classical.choice`-free). -/
@@ -584,8 +500,6 @@ theorem evalCastOpM_transmute_thinRawPtr_id {M : Type} [Gen.Memory M] [MemoryOps
       .ok (.Ptr p, thinRawPtrTy) :=
   evalCastOpM_transmute_thinRawPtr_of_transmute _ m (transmuteM_thinRawPtr_id addr h prov m)
 
-/-- `Classical.choice`-free helper for `BasicMemory` `evalCastOp` on
-`thinRawPtrTy`. -/
 theorem evalCastOp_transmute_thinRawPtr_of_codec
     (addr : Int) (prov : Option Prov) (bs : List Byte) (m : Option Mach)
     (hin : inBounds addr .Unsigned x86_64.PTR_SIZE = true)
@@ -594,74 +508,45 @@ theorem evalCastOp_transmute_thinRawPtr_of_codec
     (hdec : Type.decode thinRawPtrTy bs =
       .ok (some (.Ptr (ThinPointer.widen { addr := addr, provenance := prov } none)))) :
     let p : Gen.Pointer Prov := ThinPointer.widen { addr := addr, provenance := prov } none
-    evalCastOp (.Transmute thinRawPtrTy) (.Ptr p, thinRawPtrTy) m =
-      .ok (.Ptr p, thinRawPtrTy) := by
-  intro p
-  unfold evalCastOp transmute
-  dsimp only []
-  rw [layout_thinRawPtr]
+    evalCastOp (.Transmute thinRawPtrTy) (.Ptr p, thinRawPtrTy) m = .ok (.Ptr p, thinRawPtrTy) := by
+  intro p; unfold evalCastOp transmute; dsimp only []; rw [layout_thinRawPtr]
   simp only [ok_bind, expect_size_sized, size_ne_self_ite_local]
   rw [show Type.encode thinRawPtrTy (.Ptr p) = .ok bs from henc, ok_bind,
     show Type.decode thinRawPtrTy bs = .ok (some (.Ptr p)) from hdec, ok_bind]
-  dsimp only []
-  unfold checkValue checkPtr
+  dsimp only []; unfold checkValue checkPtr
   simp only [thinRawPtrTy, p, ThinPointer.widen, ensureElseUb, hin, ↓reduceIte,
-    PtrType.meta_kind, checkPtrMetadata, PtrType.safe_pointee,
-    pure, Except.pure, bind, Except.bind]
+    PtrType.meta_kind, checkPtrMetadata, PtrType.safe_pointee, pure, Except.pure, bind, Except.bind]
   rfl
 
-/-- `Classical.choice`-free `BasicMemory` thin-pointer encode. -/
 theorem encode_thinRawPtr_cf (addr : Nat) (h : addr < 2 ^ 64) (prov : Option Prov) :
-    Type.encode thinRawPtrTy
-      (.Ptr (ThinPointer.widen { addr := addr, provenance := prov } none)) =
+    Type.encode thinRawPtrTy (.Ptr (ThinPointer.widen { addr := addr, provenance := prov } none)) =
       .ok (ptrBytes addr prov) := by
-  simp only [thinRawPtrTy, Type.encode, PtrType.as_wide_pair, PtrType.meta_kind,
-    ThinPointer.widen]
-  exact encodePtr_of_encode { addr := addr, provenance := prov } (leBytes addr 8)
-    (encode_usize_cf addr h)
+  simp only [thinRawPtrTy, Type.encode, PtrType.as_wide_pair, PtrType.meta_kind, ThinPointer.widen]
+  exact encodePtr_of_encode { addr, provenance := prov } (leBytes addr 8) (encode_usize_cf addr h)
 
-/-- `Classical.choice`-free `BasicMemory` thin-pointer decode. -/
 theorem decode_thinRawPtr_cf (addr : Nat) (h : addr < 2 ^ 64) (prov : Option Prov) :
     Type.decode thinRawPtrTy (ptrBytes addr prov) =
       .ok (some (.Ptr (ThinPointer.widen { addr := addr, provenance := prov } none))) := by
-  have hdata := encodePtrBytes_data prov 0 (leBytes addr 8)
-  have h256 : addr < 256 ^ 8 := by
-    have : (256 : Nat) ^ 8 = 2 ^ 64 := by decide
-    rw [this]; exact h
+  have h256 : addr < 256 ^ 8 := by rw [show (256 : Nat) ^ 8 = 2 ^ 64 by decide]; exact h
   have hval : Endianness.decode x86_64.ENDIANNESS .Unsigned (leBytes addr 8) = (addr : Int) := by
     simp only [Endianness.decode, x86_64.ENDIANNESS, leValue_leBytes_cf, Nat.mod_eq_of_lt h256]
   have hlen : (ptrBytes addr prov).length = x86_64.PTR_SIZE.bytes := ptrBytes_length addr prov
-  have hfirst : firstProvenance (ptrBytes addr prov) = prov := by
-    have hcons : leBytes addr 8 = UInt8.ofNat (addr % 256) :: leBytes (addr / 256) 7 := rfl
-    unfold ptrBytes; rw [hcons]; exact firstProvenance_encodePtrBytes prov _ _
+  have hfirst : firstProvenance (ptrBytes addr prov) = prov := firstProvenance_encodePtrBytes prov _ _
   simp only [thinRawPtrTy, Type.decode, PtrType.as_wide_pair, PtrType.meta_kind]
   unfold decodePtr
   rw [ite_eq_right_iff.mpr (fun hn => absurd hlen hn), hfirst]
-  unfold ptrBytes
-  rw [hdata]
-  simp only [hval, decodePtrProvenance_encode]
-  rfl
+  unfold ptrBytes; rw [encodePtrBytes_data]; simp only [hval, decodePtrProvenance_encode]; rfl
 
-/-- `Classical.choice`-free `BasicMemory` specialization of
-`evalCastOp_transmute_thinRawPtr_id`. -/
 theorem evalCastOp_transmute_thinRawPtr_id
     (addr : Nat) (h : addr < 2 ^ 64) (prov : Option Prov) (m : Option Mach) :
     let p : Gen.Pointer Prov := ThinPointer.widen { addr := addr, provenance := prov } none
-    evalCastOp (.Transmute thinRawPtrTy) (.Ptr p, thinRawPtrTy) m =
-      .ok (.Ptr p, thinRawPtrTy) :=
+    evalCastOp (.Transmute thinRawPtrTy) (.Ptr p, thinRawPtrTy) m = .ok (.Ptr p, thinRawPtrTy) :=
   evalCastOp_transmute_thinRawPtr_of_codec (addr : Int) prov (ptrBytes addr prov) m
-    (inBounds_usize_cf addr h) (encode_thinRawPtr_cf addr h prov)
-    (decode_thinRawPtr_cf addr h prov)
+    (inBounds_usize_cf addr h) (encode_thinRawPtr_cf addr h prov) (decode_thinRawPtr_cf addr h prov)
 
-/-- `Classical.choice`-free polymorphic little-endian integer encode bridge:
-for any `it : IntType` with `0 < it.size.bytes` and `bits < 2^(8 *
-it.size.bytes)`,
-`Type.encodeIntM it (.Int (intFromBits bits it))` emits `leBytes bits
-it.size.bytes`
-with `none` provenance. -/
+/-- `Classical.choice`-free polymorphic little-endian integer encode bridge. -/
 theorem encodeIntM_intFromBits {M : Type} [Gen.Memory M]
-    (it : Gen.IntType) (hsz : 0 < it.size.bytes)
-    (bits : Nat) (hb : bits < 2 ^ (8 * it.size.bytes)) :
+    (it : Gen.IntType) (hsz : 0 < it.size.bytes) (bits : Nat) (hb : bits < 2 ^ (8 * it.size.bytes)) :
     Type.encodeIntM (M := M) it (.Int (intFromBits bits it)) =
       .ok ((leBytes bits it.size.bytes).map (fun b => .Init b none)) := by
   have hbits : Interp.Size.bits it.size = 8 * it.size.bytes := rfl
@@ -671,27 +556,20 @@ theorem encodeIntM_intFromBits {M : Type} [Gen.Memory M]
   unfold Type.encodeIntM Endianness.encode
   simp only [hin, ↓reduceIte, hmod, x86_64.ENDIANNESS, pure, Except.pure]
 
-/-- `Classical.choice`-free helper: `mapM AbstractByte.dataM` over no-provenance
-initialized bytes recovers the underlying byte list. -/
 theorem mapM_dataM_initNone {M : Type} [Gen.Memory M] (bs : List UInt8) :
     (bs.map (fun b => (AbstractByte.Init b none : AbstractByte (Gen.Memory.Provenance M)))).mapM
       AbstractByte.dataM = some bs := by
-  induction bs with
-  | nil => rfl
-  | cons b rest ih => simp [AbstractByte.dataM, ih]
+  induction bs with | nil => rfl | cons _ _ ih => simp [AbstractByte.dataM, ih]
 
-/-- `Classical.choice`-free polymorphic integer decode of `leBytes bits
-it.size.bytes`. -/
+/-- `Classical.choice`-free polymorphic integer decode of `leBytes`. -/
 theorem decodeIntM_leBytes {M : Type} [Gen.Memory M]
-    (it : Gen.IntType) (hsz : 0 < it.size.bytes)
-    (bits : Nat) (hb : bits < 2 ^ (8 * it.size.bytes)) :
+    (it : Gen.IntType) (hsz : 0 < it.size.bytes) (bits : Nat) (hb : bits < 2 ^ (8 * it.size.bytes)) :
     Type.decodeIntM (M := M) it ((leBytes bits it.size.bytes).map (fun b => .Init b none)) =
       .ok (some (.Int (intFromBits bits it))) := by
   rcases it with ⟨signed, sz⟩
   have hlen : ((leBytes bits sz.bytes).map
       (fun b => (AbstractByte.Init b none : AbstractByte (Gen.Memory.Provenance M)))).length =
-      sz.bytes := by
-    simp [leBytes_length]
+      sz.bytes := by simp [leBytes_length]
   have h256 : 256 ^ sz.bytes = 2 ^ (8 * sz.bytes) := by
     rw [show (256 : Nat) = 2 ^ 8 by decide, ← Nat.pow_mul]
   have hle : leValue (leBytes bits sz.bytes) = bits := by
@@ -699,8 +577,7 @@ theorem decodeIntM_leBytes {M : Type} [Gen.Memory M]
   have hdec : Endianness.decode x86_64.ENDIANNESS signed (leBytes bits sz.bytes) =
       intFromBits bits ⟨signed, sz⟩ := by
     cases signed with
-    | Unsigned =>
-      simp only [Endianness.decode, x86_64.ENDIANNESS, hle, intFromBits]
+    | Unsigned => simp only [Endianness.decode, x86_64.ENDIANNESS, hle, intFromBits]
     | Signed =>
       have hlenNat : (leBytes bits sz.bytes).length = sz.bytes := leBytes_length bits _
       simp only [Endianness.decode, x86_64.ENDIANNESS, hle, intFromBits, hlenNat]
@@ -714,24 +591,16 @@ theorem decodeIntM_leBytes {M : Type} [Gen.Memory M]
           rw [← two_pow_int_cf]; intro hlt'; exact hlt (Int.ofNat_lt.mp hlt')
         rw [ite_eq_right_iff.mpr (fun hy => absurd hy hlt),
             ite_eq_right_iff.mpr (fun hy => absurd hy hgeI)]
-  unfold Type.decodeIntM
-  dsimp only []
-  rw [ite_eq_right_iff.mpr (fun hn => absurd hlen hn), mapM_dataM_initNone]
-  dsimp only
-  rw [hdec]
-  rfl
+  unfold Type.decodeIntM; dsimp only []
+  rw [ite_eq_right_iff.mpr (fun hn => absurd hlen hn), mapM_dataM_initNone]; dsimp only; rw [hdec]; rfl
 
 /-- `Classical.choice`-free polymorphic `transmuteM` between any two same-size
-integer types (`u32 ↔ i32`, `u64 ↔ i64`, `u8 ↔ i8`, etc.) across BOTH `Mach`
-and `MachTB`! -/
+integer types across BOTH `Mach` and `MachTB`. -/
 theorem transmuteM_int_sameSize {M : Type} [Gen.Memory M] [MemoryOps M]
-    (srcIt dstIt : Gen.IntType) (hEq : srcIt.size = dstIt.size)
-    (hsz : 0 < srcIt.size.bytes)
-    (al : LibSpecr.Align)
-    (hlay1 : Type.layout (.Int srcIt) = .ok (.Sized srcIt.size al))
+    (srcIt dstIt : Gen.IntType) (hEq : srcIt.size = dstIt.size) (hsz : 0 < srcIt.size.bytes)
+    (al : LibSpecr.Align) (hlay1 : Type.layout (.Int srcIt) = .ok (.Sized srcIt.size al))
     (hlay2 : Type.layout (.Int dstIt) = .ok (.Sized dstIt.size al))
-    (bits : Nat) (hb : bits < 2 ^ (8 * srcIt.size.bytes))
-    (m : Option (Machine M)) :
+    (bits : Nat) (hb : bits < 2 ^ (8 * srcIt.size.bytes)) (m : Option (Machine M)) :
     transmuteM (M := M) (.Int (intFromBits bits srcIt)) (.Int srcIt) (.Int dstIt) m =
       .ok (.Int (intFromBits bits dstIt)) := by
   have hdstSz : 0 < dstIt.size.bytes := by rw [← hEq]; exact hsz
@@ -744,8 +613,7 @@ theorem transmuteM_int_sameSize {M : Type} [Gen.Memory M] [MemoryOps M]
   rw [encodeIntM_intFromBits srcIt hsz bits hb, ok_bind, hEq,
     decodeIntM_leBytes dstIt hdstSz bits hdstBits, ok_bind]
   simp only [checkValueM, IntType.can_represent, ensureElseUb, hwinDst, ↓reduceIte,
-    pure, Except.pure, bind, Except.bind]
-  rfl
+    pure, Except.pure, bind, Except.bind]; rfl
 
 /-- MiniRust transparent single-field wrapper `#[repr(transparent)] struct
 Binder(T)`: offset-0 field 0 with identical size and alignment to `inner`. -/
@@ -754,16 +622,12 @@ Binder(T)`: offset-0 field 0 with identical size and alignment to `inner`. -/
   .Tuple [(⟨0⟩, inner)] ⟨sz, al, none⟩ none
 
 /-- `Classical.choice`-free polymorphic wide-slice raw pointer (`*const [T]` /
-`*mut [T]`) encoder across EVERY `Memory M` (`Mach` and `MachTB`). -/
+`*mut [T]`) codecs across `Mach` and `MachTB`. -/
 theorem encodeUsizeIntM_of_encode {M : Type} [Gen.Memory M]
     (len : Int) (data : List UInt8)
     (henc : Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE len = some data) :
-    Type.encodeIntM (M := M) IntType.usize_ty (.Int len) =
-      .ok (data.map (fun b => .Init b none)) := by
-  unfold Type.encodeIntM
-  dsimp only [IntType.usize_ty]
-  rw [henc]
-  rfl
+    Type.encodeIntM (M := M) IntType.usize_ty (.Int len) = .ok (data.map (fun b => .Init b none)) := by
+  unfold Type.encodeIntM; dsimp only [IntType.usize_ty]; rw [henc]; rfl
 
 theorem encodeWideSliceRawPtrM_of_encode {M : Type} [Gen.Memory M]
     (addr len : Int) (prov : Option (Gen.Memory.Provenance M))
@@ -771,14 +635,11 @@ theorem encodeWideSliceRawPtrM_of_encode {M : Type} [Gen.Memory M]
     (hPtrEnc : encodePtrM (M := M) { addr := addr, provenance := prov } = .ok thinBs)
     (hMetaEnc : Type.encodeIntM (M := M) IntType.usize_ty (.Int len) = .ok metaBs) :
     Type.encodeM (M := M) wideSlicePtrMrTy
-        (mrWidePtrValM { addr := addr, provenance := prov } len) =
-      .ok (thinBs ++ metaBs) := by
+        (mrWidePtrValM { addr := addr, provenance := prov } len) = .ok (thinBs ++ metaBs) := by
   change encodeWidePtrM (M := M) .ElementCount
-      (ThinPointer.widen { addr := addr, provenance := prov } (some (.ElementCount len))) =
-    .ok (thinBs ++ metaBs)
+      (ThinPointer.widen { addr, provenance := prov } (some (.ElementCount len))) = _
   unfold encodeWidePtrM PointerMetaKind.encode_as_valueM ThinPointer.widen
-  dsimp only [pure, Except.pure, bind, Except.bind]
-  rw [hPtrEnc, hMetaEnc]
+  dsimp only [pure, Except.pure, bind, Except.bind]; rw [hPtrEnc, hMetaEnc]
 
 theorem encodeWideSliceRawPtrM_eq {M : Type} [Gen.Memory M]
     (addr len : Nat) (hAddr : addr < 2 ^ 64) (hLen : len < 2 ^ 64)
@@ -791,8 +652,6 @@ theorem encodeWideSliceRawPtrM_eq {M : Type} [Gen.Memory M]
     (encodePtrM_eq addr hAddr prov)
     (encodeUsizeIntM_of_encode (len : Int) (leBytes len 8) (encode_usize_cf len hLen))
 
-/-- `Classical.choice`-free polymorphic wide-slice raw pointer decoder across
-EVERY `Memory M` (`Mach` and `MachTB`). -/
 theorem decodeWideSliceRawPtrM_eq {M : Type} [Gen.Memory M] [MemoryOps M]
     (addr len : Nat) (hAddr : addr < 2 ^ 64) (hLen : len < 2 ^ 64)
     (prov : Option (Gen.Memory.Provenance M)) :
@@ -803,34 +662,22 @@ theorem decodeWideSliceRawPtrM_eq {M : Type} [Gen.Memory M] [MemoryOps M]
   let thinBs := encodePtrBytesM (M := M) prov 0 (leBytes addr 8)
   let metaBs : List (AbstractByte (Gen.Memory.Provenance M)) :=
     (leBytes len 8).map (fun b => .Init b none)
-  have hLenThin : thinBs.length = 8 := by
-    dsimp only [thinBs]; rw [encodePtrBytesM_length, leBytes_length]
-  have hLenMeta : metaBs.length = 8 := by
-    dsimp only [metaBs]; rw [List.length_map, leBytes_length]
+  have hLenThin : thinBs.length = 8 := by dsimp only [thinBs]; rw [encodePtrBytesM_length, leBytes_length]
+  have hLenMeta : metaBs.length = 8 := by dsimp only [metaBs]; rw [List.length_map, leBytes_length]
   have hLenAll : (thinBs ++ metaBs).length = 2 * x86_64.PTR_SIZE.bytes := by
     rw [List.length_append, hLenThin, hLenMeta]; rfl
   have hTake : (thinBs ++ metaBs).take x86_64.PTR_SIZE.bytes = thinBs := by
-    change (thinBs ++ metaBs).take 8 = thinBs
-    rw [← hLenThin, List.take_left]
+    change (thinBs ++ metaBs).take 8 = thinBs; rw [← hLenThin, List.take_left]
   have hDrop : (thinBs ++ metaBs).drop x86_64.PTR_SIZE.bytes = metaBs := by
-    change (thinBs ++ metaBs).drop 8 = metaBs
-    rw [← hLenThin, List.drop_left]
-  have hLenBits : len < 2 ^ (8 * IntType.usize_ty.size.bytes) := by
-    rw [show 8 * IntType.usize_ty.size.bytes = 64 from rfl]; exact hLen
-  have hMetaDec : Type.decodeIntM (M := M) IntType.usize_ty metaBs =
-      .ok (some (.Int (len : Int))) :=
-    decodeIntM_leBytes (M := M) IntType.usize_ty (by decide) len hLenBits
+    change (thinBs ++ metaBs).drop 8 = metaBs; rw [← hLenThin, List.drop_left]
+  have hMetaDec : Type.decodeIntM (M := M) IntType.usize_ty metaBs = .ok (some (.Int (len : Int))) :=
+    decodeIntM_leBytes (M := M) IntType.usize_ty (by decide) len hLen
   simp only [wideSlicePtrMrTy, Type.decodeM, PtrType.as_wide_pair, PtrType.meta_kind]
   unfold decodeWidePtrM
-  rw [ite_eq_right_iff.mpr (fun hn => absurd hLenAll hn), hTake, hDrop]
-  rw [decodePtrM_encodePtrBytesM addr hAddr prov, ok_bind]
-  dsimp only [decodeMetaFieldM]
-  rw [hMetaDec, ok_bind]
-  rfl
+  rw [ite_eq_right_iff.mpr (fun hn => absurd hLenAll hn), hTake, hDrop,
+    decodePtrM_encodePtrBytesM addr hAddr prov, ok_bind]
+  dsimp only [decodeMetaFieldM]; rw [hMetaDec, ok_bind]; rfl
 
-/-- Polymorphic helper (`Classical.choice`-free): `transmuteM` on
-`wideSlicePtrMrTy` from explicit `inBounds`, `encodeM`, and `decodeM` witnesses
-(parameterized over `Int` so `2 ^ 64` is never unfolded in the kernel). -/
 theorem transmuteM_wideSliceRawPtr_of_codec {M : Type} [Gen.Memory M] [MemoryOps M]
     (addr len : Int) (prov : Option (Gen.Memory.Provenance M))
     (bs : List (AbstractByte (Gen.Memory.Provenance M))) (m : Option (Machine M))
@@ -842,22 +689,16 @@ theorem transmuteM_wideSliceRawPtr_of_codec {M : Type} [Gen.Memory M] [MemoryOps
       .ok (some (mrWidePtrValM { addr := addr, provenance := prov } len))) :
     let v := mrWidePtrValM { addr := addr, provenance := prov } len
     transmuteM (M := M) v wideSlicePtrMrTy wideSlicePtrMrTy m = .ok v := by
-  intro v
-  have hlay : Type.layout wideSlicePtrMrTy = .ok (.Sized ⟨16⟩ ⟨8⟩) := rfl
+  intro v; have hlay : Type.layout wideSlicePtrMrTy = .ok (.Sized ⟨16⟩ ⟨8⟩) := rfl
   have hCanRep : IntType.can_represent IntType.usize_ty len = true := hinLen
-  unfold transmuteM
-  rw [hlay]
-  simp only [ok_bind, expect_size_sized, size_ne_self_ite_local]
+  unfold transmuteM; rw [hlay]; simp only [ok_bind, expect_size_sized, size_ne_self_ite_local]
   rw [show Type.encodeM (M := M) wideSlicePtrMrTy v = .ok bs from henc, ok_bind,
       show Type.decodeM (M := M) wideSlicePtrMrTy bs = .ok (some v) from hdec, ok_bind]
-  dsimp only [v, mrWidePtrValM]
-  unfold checkValueM checkPtrM
+  dsimp only [v, mrWidePtrValM]; unfold checkValueM checkPtrM
   simp only [wideSlicePtrMrTy, ThinPointer.widen, ensureElseUb, hinAddr, ↓reduceIte,
-    PtrType.meta_kind, checkPtrMetadataM, hCanRep,
-    PtrType.safe_pointee, Bool.not_true, Bool.false_eq_true, pure, Except.pure, bind, Except.bind]
+    PtrType.meta_kind, checkPtrMetadataM, hCanRep, PtrType.safe_pointee,
+    Bool.not_true, Bool.false_eq_true, pure, Except.pure, bind, Except.bind]
 
-/-- `Classical.choice`-free polymorphic `transmuteM` identity for wide raw slice
-pointers (`*mut [T]` ↔ `*const [T]`) across BOTH `Mach` and `MachTB`. -/
 theorem transmuteM_wideSliceRawPtr_id {M : Type} [Gen.Memory M] [MemoryOps M]
     (addr len : Nat) (hAddr : addr < 2 ^ 64) (hLen : len < 2 ^ 64)
     (prov : Option (Gen.Memory.Provenance M)) (m : Option (Machine M)) :
@@ -868,23 +709,15 @@ theorem transmuteM_wideSliceRawPtr_id {M : Type} [Gen.Memory M] [MemoryOps M]
     (encodeWideSliceRawPtrM_eq addr len hAddr hLen prov)
     (decodeWideSliceRawPtrM_eq addr len hAddr hLen prov)
 
-/-- Polymorphic helper (`Classical.choice`-free): `evalCastOpM` on
-`wideSlicePtrMrTy` from an explicit `transmuteM` witness. -/
-theorem evalCastOpM_transmute_wideSliceRawPtr_of_transmute
-    {M : Type} [Gen.Memory M] [MemoryOps M]
+theorem evalCastOpM_transmute_wideSliceRawPtr_of_transmute {M : Type} [Gen.Memory M] [MemoryOps M]
     (v : Gen.Value M) (m : Option (Machine M))
     (ht : transmuteM (M := M) v wideSlicePtrMrTy wideSlicePtrMrTy m = .ok v) :
     evalCastOpM (M := M) (.Transmute wideSlicePtrMrTy) (v, wideSlicePtrMrTy) m =
       .ok (v, wideSlicePtrMrTy) := by
   have hlay : Type.layout wideSlicePtrMrTy = .ok (.Sized ⟨16⟩ ⟨8⟩) := rfl
-  unfold evalCastOpM
-  dsimp only []
-  rw [hlay]
-  simp only [ok_bind, expect_size_sized, size_ne_self_ite_local, ht, pure, Except.pure,
-    bind, Except.bind]
+  unfold evalCastOpM; dsimp only []; rw [hlay]
+  simp only [ok_bind, expect_size_sized, size_ne_self_ite_local, ht, pure, Except.pure, bind, Except.bind]
 
-/-- `Classical.choice`-free polymorphic `evalCastOpM` identity for wide raw
-slice pointers across `Mach` and `MachTB`. -/
 theorem evalCastOpM_transmute_wideSliceRawPtr_id {M : Type} [Gen.Memory M] [MemoryOps M]
     (addr len : Nat) (hAddr : addr < 2 ^ 64) (hLen : len < 2 ^ 64)
     (prov : Option (Gen.Memory.Provenance M)) (m : Option (Machine M)) :
@@ -895,16 +728,13 @@ theorem evalCastOpM_transmute_wideSliceRawPtr_id {M : Type} [Gen.Memory M] [Memo
     (transmuteM_wideSliceRawPtr_id addr len hAddr hLen prov m)
 
 /-- `Classical.choice`-free polymorphic encoder/decoder & bidirectional
-`transmuteM` identity for `mrBinderWrapperTy inner sz al` (`Binder(T) ↔ T`)
-across BOTH `Mach` and `MachTB`. -/
+`transmuteM` identity for `mrBinderWrapperTy inner sz al` (`Binder(T) ↔ T`). -/
 theorem transmuteM_binderWrapper_roundtrip {M : Type} [Gen.Memory M] [MemoryOps M]
     (inner : Gen.Type) (sz : LibSpecr.Size) (al : LibSpecr.Align)
-    (v : Gen.Value M) (bs : List (AbstractByte (Gen.Memory.Provenance M)))
-    (m : Option (Machine M))
+    (v : Gen.Value M) (bs : List (AbstractByte (Gen.Memory.Provenance M))) (m : Option (Machine M))
     (hInnerLay : Type.layout inner = .ok (.Sized sz al))
     (hHead : TupleHeadLayout.head_size_and_align ⟨sz, al, none⟩ = (sz, al))
-    (hEnc : Type.encodeM (M := M) inner v = .ok bs)
-    (hLen : bs.length = sz.bytes)
+    (hEnc : Type.encodeM (M := M) inner v = .ok bs) (hLen : bs.length = sz.bytes)
     (hDec : Type.decodeM (M := M) inner bs = .ok (some v))
     (hChk : checkValueM (M := M) v inner m = .ok ()) :
     Type.encodeM (M := M) (mrBinderWrapperTy inner sz al) (.Tuple [v]) = .ok bs ∧
@@ -920,48 +750,111 @@ theorem transmuteM_binderWrapper_roundtrip {M : Type} [Gen.Memory M] [MemoryOps 
         ((List.replicate sz.bytes
             (AbstractByte.Uninit : AbstractByte (Gen.Memory.Provenance M))).length : Int) := by
       simp [hLen]
-    unfold writeSubsliceAtIndex
-    rw [ite_eq_left_iff.mpr (fun hn => absurd hCond hn)]
-    simp [hLen]
+    unfold writeSubsliceAtIndex; rw [ite_eq_left_iff.mpr (fun hn => absurd hCond hn)]; simp [hLen]
   have hSub0 : subsliceWithLength bs 0 sz.bytes = .ok bs := by
     have hCond : (0 : Int) ≤ 0 ∧ (0 : Int) ≤ (sz.bytes : Int) ∧
-        (0 : Int) + (sz.bytes : Int) ≤ (bs.length : Int) := by
-      simp [hLen, Int.natCast_nonneg]
-    unfold subsliceWithLength
-    rw [ite_eq_left_iff.mpr (fun hn => absurd hCond hn)]
-    have hToNat : (sz.bytes : Int).toNat = bs.length := by
-      rw [Int.toNat_natCast, hLen]
+        (0 : Int) + (sz.bytes : Int) ≤ (bs.length : Int) := by simp [hLen, Int.natCast_nonneg]
+    unfold subsliceWithLength; rw [ite_eq_left_iff.mpr (fun hn => absurd hCond hn)]
+    have hToNat : (sz.bytes : Int).toNat = bs.length := by rw [Int.toNat_natCast, hLen]
     simp [hToNat]
   have hEncWrap : Type.encodeM (M := M) (mrBinderWrapperTy inner sz al) (.Tuple [v]) = .ok bs := by
     simp only [mrBinderWrapperTy, Type.encodeM, hHead, List.length, ne_eq, not_true_eq_false,
       ↓reduceIte, Type.encodeFieldsM]
-    rw [hEnc, ok_bind, show ((0 : Nat) : Int) = 0 from rfl, hWrite0, ok_bind]
-    rfl
-  have hDecWrap : Type.decodeM (M := M) (mrBinderWrapperTy inner sz al) bs =
-      .ok (some (.Tuple [v])) := by
+    rw [hEnc, ok_bind, show ((0 : Nat) : Int) = 0 from rfl, hWrite0, ok_bind]; rfl
+  have hDecWrap : Type.decodeM (M := M) (mrBinderWrapperTy inner sz al) bs = .ok (some (.Tuple [v])) := by
     simp only [mrBinderWrapperTy, Type.decodeM, hHead, hLen, ne_eq, not_true_eq_false,
       ↓reduceIte, Type.decodeFieldsM]
     rw [hInnerLay, ok_bind, expect_size_sized, ok_bind,
-        show ((0 : Nat) : Int) = 0 from rfl, hSub0, ok_bind, hDec, ok_bind]
-    rfl
+        show ((0 : Nat) : Int) = 0 from rfl, hSub0, ok_bind, hDec, ok_bind]; rfl
   have hChkWrap : checkValueM (M := M) (.Tuple [v]) (mrBinderWrapperTy inner sz al) m = .ok () := by
     simp only [mrBinderWrapperTy, checkValueM, ensureElseUb, beq_self_eq_true, ↓reduceIte,
-      Bool.not_true, Bool.false_eq_true, checkFieldsM]
-    rw [hChk, ok_bind]
-    rfl
+      Bool.not_true, Bool.false_eq_true, checkFieldsM]; rw [hChk, ok_bind]; rfl
   refine ⟨hEncWrap, hDecWrap, ?_, ?_⟩
   · unfold transmuteM
     rw [hLayWrap, ok_bind, expect_size_sized, ok_bind, hInnerLay, ok_bind,
         expect_size_sized, ok_bind, size_ne_self_ite_local, hEncWrap, ok_bind, hDec, ok_bind]
-    dsimp only []
-    rw [hChk, ok_bind]
-    rfl
+    dsimp only []; rw [hChk, ok_bind]; rfl
   · unfold transmuteM
     rw [hInnerLay, ok_bind, expect_size_sized, ok_bind, hLayWrap, ok_bind,
         expect_size_sized, ok_bind, size_ne_self_ite_local, hEnc, ok_bind, hDecWrap, ok_bind]
-    dsimp only []
-    rw [hChkWrap, ok_bind]
+    dsimp only []; rw [hChkWrap, ok_bind]; rfl
+
+/-- `Classical.choice`-free byte-0 overwrite frame law for
+`writeSubsliceAtIndex`: overwriting `[new0]` at offset `0` updates ONLY byte `0`
+and preserves the entire tail `rest` verbatim. -/
+theorem writeSubsliceAtIndex_byte0 {α : Type} (old0 new0 : α) (rest : List α) :
+    writeSubsliceAtIndex (old0 :: rest) 0 [new0] = .ok (new0 :: rest) := by
+  have hCond : (0 : Int) ≤ 0 ∧ (0 : Int) + (([new0] : List α).length : Int) ≤
+      (((old0 :: rest) : List α).length : Int) :=
+    ⟨Int.le_refl 0, by
+      simp only [List.length_cons, List.length_nil, Int.zero_add]
+      exact Int.ofNat_le.mpr (Nat.succ_le_succ (Nat.zero_le _))⟩
+  unfold writeSubsliceAtIndex
+  rw [ite_eq_left_iff.mpr (fun hn => absurd hCond hn)]
+  rfl
+
+/-- Byte-0 tag-write frame law for `BM.store`: storing `[new0]` at offset `0` of
+an allocation whose bytes are `old0 :: rest` updates ONLY byte `0` to `new0` and
+preserves all trailing bytes `rest` verbatim. -/
+theorem bm_store_byte0_frame (mem : BM) (ptr : Ptr) (old0 new0 : Byte) (rest : List Byte)
+    (id : Gen.AllocId) (alloc : Gen.Allocation) (allocs' : List Gen.Allocation)
+    (hCheck : BM.check_ptr mem ptr ⟨1⟩ = .ok (some (id, (), ⟨0⟩)))
+    (hIdx : listIndex mem.allocations id._0 "self.allocations[id.0]" = .ok alloc)
+    (hData : alloc.data = old0 :: rest)
+    (hSet : listSet mem.allocations id._0 { alloc with data := new0 :: rest } "set" = .ok allocs') :
+    BM.store mem ptr [new0] ⟨1⟩ = .ok { mem with allocations := allocs' } := by
+  have hAl : Align.is_aligned ⟨1⟩ ptr.addr = true := by simp [Align.is_aligned, Int.emod_one]
+  unfold BM.store; rw [hAl]
+  simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, List.length_singleton, hCheck,
+    ok_bind, hIdx, hData]
+  rw [show (({ bytes := 0 } : Gen.Offset).bytes : Int) = 0 from rfl,
+      writeSubsliceAtIndex_byte0, ok_bind, hSet, ok_bind]
+  rfl
+
+/-- `Classical.choice`-free Trusted little-endian byte codec lemmas backing
+hypothesis-free universal `C7` `evalByteCast` correspondence. -/
+theorem mergeByteProvenance_self (prov : Option (Nat × Nat)) :
+    mergeByteProvenance prov prov = prov := by
+  cases prov with
+  | none => rfl
+  | some p => rcases p with ⟨a, t⟩; simp [mergeByteProvenance]
+
+theorem decodeLittleEndianBytes_encode (v : Nat) :
+    ∀ n (prov : Option (Nat × Nat)),
+      decodeLittleEndianBytes (encodeLittleEndianBytes v n prov) =
+        some (v % 256 ^ n, if n = 0 then none else prov)
+  | 0, _ => by simp [decodeLittleEndianBytes, Nat.mod_one]
+  | n + 1, prov => by
+    have ih := decodeLittleEndianBytes_encode (Nat.div v 256) n prov
+    have hByte : (UInt8.ofNat v).toBitVec.toNat = v % 256 := by
+      change (UInt8.ofNat v).toNat = v % 256; exact UInt8.toNat_ofNat'
+    have hProv : mergeByteProvenance prov (if n = 0 then none else prov) = prov := by
+      cases n with | zero => cases prov <;> rfl | succ _ => exact mergeByteProvenance_self prov
+    change (match decodeLittleEndianBytes (encodeLittleEndianBytes (Nat.div v 256) n prov) with
+      | some (highBits, restProv) =>
+        some (Nat.add (UInt8.ofNat v).toBitVec.toNat (Nat.mul 256 highBits),
+              mergeByteProvenance prov restProv)
+      | none => none) = some (v % 256 ^ (n + 1), prov)
+    rw [ih]
+    change some ((UInt8.ofNat v).toBitVec.toNat + 256 * (v / 256 % 256 ^ n),
+      mergeByteProvenance prov (if n = 0 then none else prov)) = some (v % 256 ^ (n + 1), prov)
+    rw [hByte, mod_256_succ v n, hProv]
+
+theorem abstractBytesAllProvAux_encode (a t v : Nat) :
+    ∀ n, abstractBytesAllProvAux a t (encodeLittleEndianBytes v n (some (a, t))) = true
+  | 0 => rfl
+  | n + 1 => by
+    change (Bool.and (Nat.beq a a) (Nat.beq t t) &&
+      abstractBytesAllProvAux a t (encodeLittleEndianBytes (Nat.div v 256) n (some (a, t)))) = true
+    rw [Nat.beq_refl, Nat.beq_refl, abstractBytesAllProvAux_encode a t (Nat.div v 256) n]
     rfl
+
+theorem encodeLittleEndianBytes_len (v : Nat) :
+    ∀ n prov, Trusted.Sequence.length (encodeLittleEndianBytes v n prov) = n
+  | 0, _ => rfl
+  | n + 1, prov => by
+    change Trusted.Sequence.length (encodeLittleEndianBytes (Nat.div v 256) n prov) + 1 = n + 1
+    rw [encodeLittleEndianBytes_len (Nat.div v 256) n prov]
 
 /-! ## §1 (`C1`): `StatementKind.setDiscriminant` (`Mach` & `MachTB`) -/
 
@@ -1100,43 +993,29 @@ theorem minirust_setDiscriminantM_twoVar_tagStore
     (cm' : Gen.ConcurrentMemory M)
     (hst : ConcurrentMemory.store m1.mem ptr0 [.Init (UInt8.ofNat tag) none] ⟨1⟩ .None = .ok cm') :
     evalSetDiscriminantM m dst (Int.ofNat tag) = .ok { m1 with mem := cm' } := by
+  have hAux : ∀ (t : Nat),
+      Type.encodeIntM (M := M) ⟨.Unsigned, ⟨1⟩⟩ (.Int (Int.ofNat t)) =
+        .ok [.Init (UInt8.ofNat t) none] →
+      mapGet twoVarEnumVariants (Int.ofNat t) =
+        some ⟨.Tuple [(⟨4⟩, u32MrTy)] ⟨⟨8⟩, ⟨4⟩, none⟩ none,
+              ⟨[(⟨0⟩, (⟨.Unsigned, ⟨1⟩⟩, Int.ofNat t))]⟩⟩ →
+      ConcurrentMemory.store m1.mem ptr0 [.Init (UInt8.ofNat t) none] ⟨1⟩ .None = .ok cm' →
+      evalSetDiscriminantM m dst (Int.ofNat t) = .ok { m1 with mem := cm' } := by
+    intro t hEnc hMap hSt
+    unfold evalSetDiscriminantM
+    rw [hp, ok_bind]
+    dsimp only [twoVarEnumMrTy]
+    rw [hal]
+    simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, hMap, encodeDiscriminantM,
+      List.foldlM_cons, List.foldlM_nil, ok_bind, pure, Except.pure, bind, Except.bind]
+    rw [hEnc]
+    dsimp only []
+    rw [show ((0 : Nat) : Int) = 0 from rfl, hoff]
+    dsimp only []
+    rw [hSt]
   rcases htag with rfl | rfl
-  · have hEnc0 : Type.encodeIntM (M := M) ⟨.Unsigned, ⟨1⟩⟩ (.Int 0) =
-        .ok [.Init (UInt8.ofNat 0) none] := rfl
-    have hMap0 : mapGet twoVarEnumVariants (Int.ofNat 0) =
-        some ⟨.Tuple [(⟨4⟩, u32MrTy)] ⟨⟨8⟩, ⟨4⟩, none⟩ none,
-              ⟨[(⟨0⟩, (⟨.Unsigned, ⟨1⟩⟩, 0))]⟩⟩ := rfl
-    unfold evalSetDiscriminantM
-    rw [hp, ok_bind]
-    dsimp only [twoVarEnumMrTy]
-    rw [hal]
-    simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-    rw [hMap0]
-    simp only [encodeDiscriminantM, List.foldlM_cons, List.foldlM_nil, ok_bind, pure, Except.pure,
-      bind, Except.bind]
-    rw [hEnc0]
-    dsimp only []
-    rw [show ((0 : Nat) : Int) = 0 from rfl, hoff]
-    dsimp only []
-    rw [hst]
-  · have hEnc1 : Type.encodeIntM (M := M) ⟨.Unsigned, ⟨1⟩⟩ (.Int 1) =
-        .ok [.Init (UInt8.ofNat 1) none] := rfl
-    have hMap1 : mapGet twoVarEnumVariants (Int.ofNat 1) =
-        some ⟨.Tuple [(⟨4⟩, u32MrTy)] ⟨⟨8⟩, ⟨4⟩, none⟩ none,
-              ⟨[(⟨0⟩, (⟨.Unsigned, ⟨1⟩⟩, 1))]⟩⟩ := rfl
-    unfold evalSetDiscriminantM
-    rw [hp, ok_bind]
-    dsimp only [twoVarEnumMrTy]
-    rw [hal]
-    simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-    rw [hMap1]
-    simp only [encodeDiscriminantM, List.foldlM_cons, List.foldlM_nil, ok_bind, pure, Except.pure,
-      bind, Except.bind]
-    rw [hEnc1]
-    dsimp only []
-    rw [show ((0 : Nat) : Int) = 0 from rfl, hoff]
-    dsimp only []
-    rw [hst]
+  · exact hAux 0 rfl rfl hst
+  · exact hAux 1 rfl rfl hst
 
 /-- **C1 Universal Deref Step, `.uninit` Deref, & Dangling/OOB UB Law
 (`trusted_setDiscriminant_deref_step_and_ub`)**:
@@ -1149,11 +1028,12 @@ Invoking real `evalStmt` and `evalSetDiscriminantDerefWrite` on
    invalidating conflicting deref borrows.
 2. When `rest = []`, reading `p` faults with `.ub` because the active-frame
    referent `entry.targetLocal` is `.uninit` (`entry.perm` mutable, offset `0`,
-   ADT pointee), `evalStmt` initializes the referent to the payload-free tag
-   shell `.aggregate newVar []` via `evalSetDiscriminantDerefWrite`.
+   `entry.targetProjection = []`, ADT pointee & decl), `evalStmt` initializes
+   the referent to the payload-free tag shell `.aggregate newVar []` via
+   `evalSetDiscriminantDerefWrite`.
 3. When reading `p` yields a non-aggregate (e.g., scalar) value, or `p`
-   dereferences a `.disabled` (dangling) borrow or unbacked/OOB global address,
-   `evalStmt` faults with `MirStepNode.fail .ub`. -/
+   dereferences an unbacked/OOB pointer (`lookupBorrow = none`), `evalStmt`
+   faults with `MirStepNode.fail .ub`. -/
 theorem trusted_setDiscriminant_deref_step_and_ub
     (s : MachineState) (ptrLoc oldVar newVar : Nat)
     (rest : List MirAst.ProjectionElem) (fields : List MirSemantics.Value)
@@ -1178,12 +1058,30 @@ theorem trusted_setDiscriminant_deref_step_and_ub
             { s.memory with
               borrows := invalidateDerefWriteBorrowsWithLayouts decls layouts locals₁
                 s.memory.borrows p rest s.memory.callStack })) ∧
-    -- (2) Non-aggregate pointee faults with UB
+    -- (2) `.uninit` active-frame deref initializes tag shell via
+    -- evalSetDiscriminantDerefWrite
+    (∀ ptrVal sz entry,
+      evalOperand s.frame.locals (.copy ⟨ptrLoc, [.deref]⟩) s.memory.borrows s.memory.globals
+        layouts s.memory.callerLocals decls s.memory.callStack = .ub →
+      get? s.frame.locals ptrLoc = some (.init (.ptr ptrVal sz)) →
+      lookupBorrow s.memory.borrows ptrVal.tag = some entry →
+      entry.perm = .active →
+      entry.targetProjection = [] →
+      ptrVal.offsetBytes = 0 →
+      activeFrameSlot? s.frame.locals s.memory.callStack entry.targetFrameDepth
+        entry.targetLocal = some .uninit →
+      placeTyResolved decls layouts ⟨ptrLoc, [.deref]⟩ = some twoVarMirTy →
+      setDiscriminantUninitDeclOk decls entry.targetLocal = true →
+      evalStmt s { kind := .setDiscriminant ⟨ptrLoc, [.deref]⟩ newVar, span := span }
+        decls layouts =
+        evalSetDiscriminantDerefWrite s s.frame.locals ⟨ptrLoc, [.deref]⟩ []
+          (.aggregate newVar []) decls layouts) ∧
+    -- (3) Non-aggregate pointee faults with UB
     (∀ sc, evalOperand s.frame.locals (.copy p) s.memory.borrows s.memory.globals layouts
         s.memory.callerLocals decls s.memory.callStack = .ok (.scalar sc) locals₁ →
       evalStmt s { kind := .setDiscriminant p newVar, span := span } decls layouts =
         MirStepNode.fail .ub) ∧
-    -- (3) Unbacked/OOB pointer (`lookupBorrow = none` & `evalOperand = .ub`)
+    -- (4) Unbacked/OOB pointer (`lookupBorrow = none` & `evalOperand = .ub`)
     -- faults with UB
     (∀ ptrVal sz,
       evalOperand s.frame.locals (.copy ⟨ptrLoc, [.deref]⟩) s.memory.borrows s.memory.globals
@@ -1193,30 +1091,32 @@ theorem trusted_setDiscriminant_deref_step_and_ub
       evalStmt s { kind := .setDiscriminant ⟨ptrLoc, [.deref]⟩ newVar, span := span }
         decls layouts = MirStepNode.fail .ub) := by
   intro p
-  refine ⟨?_, ?_, ?_, ?_⟩
-  · intro hOp
-    simp only [evalStmt, p, hOp]
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · intro hOp; simp only [evalStmt, p, hOp]
   · intro hWr hTree hUnion
     unfold evalSetDiscriminantDerefWrite
     simp only [hWr, hTree, hUnion, Bool.or_self]
-  · intro sc hOp
-    simp only [evalStmt, p, hOp]
-  · intro ptrVal sz hUb hSlot hNoB
-    simp only [evalStmt, hUb, hSlot, hNoB]
+  · intro ptrVal sz entry hUb hSlot hB hPerm hProj hOff hAct hPtTy hDeclOk
+    simp only [evalStmt, hUb, hSlot, hB, hPerm, hProj, hOff, Nat.beq_refl, hAct,
+      hPtTy, twoVarMirTy, hDeclOk, Bool.and_self]
+  · intro sc hOp; simp only [evalStmt, p, hOp]
+  · intro ptrVal sz hUb hSlot hNoB; simp only [evalStmt, hUb, hSlot, hNoB]
 
-/-- **C1 Coupled Two-Sided Step Simulation & `MachTB.wfLive` Preservation
-(`setDiscriminant_twoVar_coupled_lockstep_and_wfLive`)**:
+/-- **C1 Coupled Two-Sided Step Simulation, Byte-Level Payload Preservation, &
+`MachTB.wfLive` (`setDiscriminant_twoVar_coupled_lockstep_and_wfLive`)**:
 Simultaneously relates Trusted `evalStmt` (`evalSetDiscriminantLocal`),
-MiniRust `BasicMemory` `Interp.evalStatement` (`Mach`), and MiniRust
-`TreeBorrowsMemory` `evalStatementM` (`MachTB`) on `twoVarEnumMrTy` — proving
-tag update (`oldVar → tag`), payload preservation, and `MachTB.wfLive`
-preservation (`evalStatementM_tb_wfLive`). -/
+MiniRust `BasicMemory` `Interp.evalStatement` (`Mach`, proving explicitly via
+`basicMemory_store_byte0_frame` that ONLY byte `0` becomes
+`.Init (UInt8.ofNat tag) none` while trailing bytes `payloadTail` at `1..7`
+remain byte-for-byte identical!), and MiniRust `TreeBorrowsMemory`
+`evalStatementM` (`MachTB`, preserving `MachTB.wfLive`). -/
 theorem setDiscriminant_twoVar_coupled_lockstep_and_wfLive
     (s : MachineState) (loc oldVar tag : Nat) (fields : List MirSemantics.Value)
     (locals' : List LocalSlot) (span : String)
     (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
     (mBM mBM1 : Mach) (dst : Gen.PlaceExpr) (placeBM : Gen.Place BM)
-    (ptrBM0 : Ptr) (cmBM' : Gen.ConcurrentMemory BM)
+    (ptrBM0 : Ptr) (idBM : Gen.AllocId) (allocBM : Gen.Allocation)
+    (oldByte0 : Byte) (payloadTail : List Byte) (allocsBM' : List Gen.Allocation)
     (mTB mTB1 : MachTB) (placeTB : Gen.Place TBM)
     (ptrTB0 : ThinPointer TreeBorrowsProvenance) (cmTB' : Gen.ConcurrentMemory TBM)
     (htag : tag = 0 ∨ tag = 1)
@@ -1226,14 +1126,18 @@ theorem setDiscriminant_twoVar_coupled_lockstep_and_wfLive
     (hpBM : evalPlaceM mBM dst = .ok ((placeBM, twoVarEnumMrTy), mBM1))
     (halBM : placeBM.aligned = true)
     (hoffBM : ptrOffsetInboundsM mBM1 placeBM.ptr.thin_pointer 0 = .ok ptrBM0)
-    (hstBM : ConcurrentMemory.store mBM1.mem ptrBM0 [.Init (UInt8.ofNat tag) none] ⟨1⟩ .None =
-      .ok cmBM')
+    (hChkBM : BM.check_ptr mBM1.mem.memory ptrBM0 ⟨1⟩ = .ok (some (idBM, (), ⟨0⟩)))
+    (hIdxBM : listIndex mBM1.mem.memory.allocations idBM._0 "self.allocations[id.0]" = .ok allocBM)
+    (hDataBM : allocBM.data = oldByte0 :: payloadTail)
+    (hSetBM : listSet mBM1.mem.memory.allocations idBM._0
+      { allocBM with data := .Init (UInt8.ofNat tag) none :: payloadTail } "set" = .ok allocsBM')
     (hwfTB : MachTB.wfLive mTB)
     (hpTB : evalPlaceM mTB dst = .ok ((placeTB, twoVarEnumMrTy), mTB1))
     (halTB : placeTB.aligned = true)
     (hoffTB : ptrOffsetInboundsM mTB1 placeTB.ptr.thin_pointer 0 = .ok ptrTB0)
     (hstTB : ConcurrentMemory.store mTB1.mem ptrTB0 [.Init (UInt8.ofNat tag) none] ⟨1⟩ .None =
       .ok cmTB') :
+    let accBM : Gen.Access := ⟨.Store, .None, ptrBM0.addr, ⟨1⟩⟩
     evalStmt s { kind := .setDiscriminant (locPlace loc) tag, span := span } decls layouts =
       MirStepNode.step
         (advanceStmt s locals'
@@ -1241,18 +1145,32 @@ theorem setDiscriminant_twoVar_coupled_lockstep_and_wfLive
             borrows := invalidateConflictingBorrows s.memory.borrows loc .none
               (length s.memory.callStack) }) ∧
     Interp.evalStatement mBM (.SetDiscriminant dst (Int.ofNat tag)) =
-      .ok { mBM1 with mem := cmBM' } ∧
+      .ok { mBM1 with
+            mem := { memory := { mBM1.mem.memory with allocations := allocsBM' },
+                     accesses := mBM1.mem.accesses ++ [accBM] } } ∧
     evalStatementM mTB (.SetDiscriminant dst (Int.ofNat tag)) =
       .ok { mTB1 with mem := cmTB' } ∧
     MachTB.wfLive { mTB1 with mem := cmTB' } := by
+  intro accBM
+  have hMemBM := bm_store_byte0_frame mBM1.mem.memory ptrBM0 oldByte0 (.Init (UInt8.ofNat tag) none)
+    payloadTail idBM allocBM allocsBM' hChkBM hIdxBM hDataBM hSetBM
+  have hStoreBM : ConcurrentMemory.store mBM1.mem ptrBM0 [.Init (UInt8.ofNat tag) none] ⟨1⟩ .None =
+      .ok { memory := { mBM1.mem.memory with allocations := allocsBM' },
+            accesses := mBM1.mem.accesses ++ [accBM] } := by
+    change (do
+      let memory ← BM.store mBM1.mem.memory ptrBM0 [.Init (UInt8.ofNat tag) none] ⟨1⟩
+      pure ({ memory, accesses := mBM1.mem.accesses ++ [accBM] } : Gen.ConcurrentMemory BM)) = _
+    rw [hMemBM]; rfl
   have hBM : evalStatementM mBM (.SetDiscriminant dst (Int.ofNat tag)) =
-      .ok { mBM1 with mem := cmBM' } :=
-    minirust_setDiscriminantM_twoVar_tagStore mBM mBM1 dst placeBM tag htag hpBM halBM ptrBM0
-      hoffBM cmBM' hstBM
+      .ok { mBM1 with
+            mem := { memory := { mBM1.mem.memory with allocations := allocsBM' },
+                     accesses := mBM1.mem.accesses ++ [accBM] } } :=
+    minirust_setDiscriminantM_twoVar_tagStore mBM mBM1 dst placeBM tag htag hpBM halBM
+      ptrBM0 hoffBM _ hStoreBM
   have hTB : evalStatementM mTB (.SetDiscriminant dst (Int.ofNat tag)) =
       .ok { mTB1 with mem := cmTB' } :=
-    minirust_setDiscriminantM_twoVar_tagStore mTB mTB1 dst placeTB tag htag hpTB halTB ptrTB0
-      hoffTB cmTB' hstTB
+    minirust_setDiscriminantM_twoVar_tagStore mTB mTB1 dst placeTB tag htag hpTB halTB
+      ptrTB0 hoffTB cmTB' hstTB
   refine ⟨trusted_setDiscriminant_local_preserves_payload s loc oldVar tag fields locals'
             span decls layouts hget hset hprot,
           ?_, hTB, evalStatementM_tb_wfLive hwfTB hTB⟩
@@ -1285,168 +1203,124 @@ def c1LocalExpectedBytes : List Byte :=
    .Init 42 none, .Init 0 none, .Init 0 none, .Init 0 none]
 
 def c1LocalMach : Mach :=
-  let alloc0 := mkStackAlloc 128 (List.replicate 8 .Uninit) 4
-  let alloc1 := mkStackAlloc 256 c1LocalInitBytes 4
-  let fr : Frame :=
-    { func := c1SetDiscrLocalMrFn
-      locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
-                  (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]⟩
-      stack_pop_action := .BottomOfStack
-      next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach c1SetDiscrLocalProg [alloc0, alloc1] [fr]
+  mkMrMach c1SetDiscrLocalProg
+    [mkStackAlloc 128 (List.replicate 8 .Uninit) 4, mkStackAlloc 256 c1LocalInitBytes 4]
+    [mkRootFrame c1SetDiscrLocalMrFn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]]
 
-/-- **C1 Concrete Positive Witness
-(`c1_setDiscriminant_local_three_way_witness`)**:
-On `stepMirFn`, `Interp.step` (`Mach`), and `Interp.stepTB` (`MachTB`),
-`SetDiscriminant` updates ONLY the tag (`0 → 1`) while preserving payload `42`.
--/
+/-- **C1 Positive Witness (`c1_setDiscriminant_local_three_way_witness`)**:
+On `stepMirFn`, `Interp.step`, and `Interp.stepTB` (with `MachTB.wfLive`),
+`SetDiscriminant` updates ONLY tag (`0 → 1`) while preserving payload `42`. -/
 theorem c1_setDiscriminant_local_three_way_witness :
-    let s0 : MachineState :=
-      initMachineState c1SetDiscrLocalMir [.aggregate 0 [.scalar ⟨42, 4⟩]]
+    let s0 : MachineState := initMachineState c1SetDiscrLocalMir [.aggregate 0 [.scalar ⟨42, 4⟩]]
     (match stepMirFn c1SetDiscrLocalMir s0 with
      | .tau (.running s1) =>
-       s1.frame.stmtIdx = 1 ∧
-       get? s1.frame.locals 1 = some (.init (.aggregate 1 [.scalar ⟨42, 4⟩]))
+       s1.frame.stmtIdx = 1 ∧ get? s1.frame.locals 1 = some (.init (.aggregate 1 [.scalar ⟨42, 4⟩]))
      | _ => False) ∧
     (∃ m1, Interp.step c1LocalMach = .ok m1 ∧
       (m1.mem.memory.allocations[1]?.map (·.data),
        m1.threads[0]?.bind (fun t => t.stack[0]?.map (·.next_stmt))) =
       (some c1LocalExpectedBytes, some 1)) ∧
-    (∃ m1, Interp.stepTB (liftMachToTB c1LocalMach) = .ok m1 ∧
+    (∃ m1, Interp.stepTB (liftMachToTB c1LocalMach) = .ok m1 ∧ MachTB.wfLive m1 ∧
       (m1.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB),
        m1.threads[0]?.bind (fun t => t.stack[0]?.map (·.next_stmt))) =
-      (some (c1LocalExpectedBytes.map (projByteTB ∘ liftByteTB)), some 1)) :=
-  ⟨⟨rfl, rfl⟩,
-   ok_of_map_toOption (by decide +kernel),
-   ok_of_map_toOption (by decide +kernel)⟩
+      (some (c1LocalExpectedBytes.map (projByteTB ∘ liftByteTB)), some 1)) := by
+  refine ⟨⟨rfl, rfl⟩, ok_of_map_toOption (by decide +kernel), ?_⟩
+  obtain ⟨m1, hm1, hOut⟩ := ok_of_map_toOption (r := Interp.stepTB (liftMachToTB c1LocalMach))
+    (f := fun m1 => (m1.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB),
+      m1.threads[0]?.bind (fun t => t.stack[0]?.map (·.next_stmt))))
+    (b := (some (c1LocalExpectedBytes.map (projByteTB ∘ liftByteTB)), some 1)) (by decide +kernel)
+  exact ⟨m1, hm1, stepTB_wfLive (liftMachToTB_wfLive _) hm1, hOut⟩
 
 /-- Concrete deref `SetDiscriminant` witness (`(*_2) = variant 1`) across
-Trusted,
-`Mach`, and `MachTB` (verifying payload preservation through a pointer deref).
--/
+Trusted, `Mach`, and `MachTB` (with payload preservation & `MachTB.wfLive`). -/
 def c1DerefMir : MirAst.CapturedMir :=
-  let ptrDecl := mkDecl { kind := .rawPtr .mut twoVarMirTy.kind, layoutIdx := 0 }
   mkMirBody "ep2::c1_set_discr_deref"
-    [mkDecl twoVarMirTy, mkDecl twoVarMirTy, ptrDecl] 1
-    [mkBb
-      [mkSt (.storageLive 2),
-       mkSt (.assign (locPlace 2) (.rawPtr .mut (locPlace 1))),
-       mkSt (.setDiscriminant (locPlace 2 [.deref]) 1)]
-      .return_]
-    twoVarLayouts
+    [mkDecl twoVarMirTy, mkDecl twoVarMirTy,
+     mkDecl { kind := .rawPtr .mut twoVarMirTy.kind, layoutIdx := 0 }] 1
+    [mkBb [mkSt (.storageLive 2), mkSt (.assign (locPlace 2) (.rawPtr .mut (locPlace 1))),
+           mkSt (.setDiscriminant (locPlace 2 [.deref]) 1)] .return_] twoVarLayouts
 
 def c1DerefMrFn : Gen.Function :=
-  mkMrFn [(localName 0, twoVarEnumMrTy), (localName 1, twoVarEnumMrTy),
-          (localName 2, thinRawPtrTy)]
+  mkMrFn [(localName 0, twoVarEnumMrTy), (localName 1, twoVarEnumMrTy), (localName 2, thinRawPtrTy)]
     [localName 1] (localName 0)
-    [(bbName 0,
-      ⟨[.Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (.Raw .None)),
-        .SetDiscriminant (.Deref (.Load (.Local (localName 2))) twoVarEnumMrTy) 1],
-       .Return, .Regular⟩)]
+    [(bbName 0, ⟨[.Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (.Raw .None)),
+        .SetDiscriminant (.Deref (.Load (.Local (localName 2))) twoVarEnumMrTy) 1], .Return, .Regular⟩)]
 
 def c1DerefMach : Mach :=
-  let prog := mkMrProg [(fnName 0, c1DerefMrFn)]
-  let alloc0 := mkStackAlloc 128 (List.replicate 8 .Uninit) 4
-  let alloc1 := mkStackAlloc 256 c1LocalInitBytes 4
-  let alloc2 := mkStackAlloc 384 (List.replicate 8 .Uninit) 8
-  let fr : Frame :=
-    { func := c1DerefMrFn
-      locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
-                  (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
-                  (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) })]⟩
-      stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach prog [alloc0, alloc1, alloc2] [fr]
+  mkMrMach (mkMrProg [(fnName 0, c1DerefMrFn)])
+    [mkStackAlloc 128 (List.replicate 8 .Uninit) 4, mkStackAlloc 256 c1LocalInitBytes 4,
+     mkStackAlloc 384 (List.replicate 8 .Uninit) 8]
+    [mkRootFrame c1DerefMrFn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) })]]
 
 theorem c1_setDiscriminant_deref_three_way_witness :
     let s0 := initMachineState c1DerefMir [.aggregate 0 [.scalar ⟨42, 4⟩]]
     (match stepMirFn c1DerefMir s0 with
-     | .tau (.running s1) =>
-       match stepMirFn c1DerefMir s1 with
-       | .tau (.running s2) =>
-         match stepMirFn c1DerefMir s2 with
+     | .tau (.running s1) => (match stepMirFn c1DerefMir s1 with
+       | .tau (.running s2) => (match stepMirFn c1DerefMir s2 with
          | .tau (.running s3) =>
-           s3.frame.stmtIdx = 3 ∧
-           get? s3.frame.locals 1 = some (.init (.aggregate 1 [.scalar ⟨42, 4⟩]))
-         | _ => False
-       | _ => False
-     | _ => False) ∧
+           s3.frame.stmtIdx = 3 ∧ get? s3.frame.locals 1 = some (.init (.aggregate 1 [.scalar ⟨42, 4⟩]))
+         | _ => False) | _ => False) | _ => False) ∧
     (∃ m2, Interp.steps 2 c1DerefMach = .ok m2 ∧
       m2.mem.memory.allocations[1]?.map (·.data) = some c1LocalExpectedBytes) ∧
-    (∃ m2, Interp.stepsTB 2 (liftMachToTB c1DerefMach) = .ok m2 ∧
+    (∃ m2, Interp.stepsTB 2 (liftMachToTB c1DerefMach) = .ok m2 ∧ MachTB.wfLive m2 ∧
       m2.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB) =
-        some (c1LocalExpectedBytes.map (projByteTB ∘ liftByteTB))) :=
-  ⟨⟨rfl, rfl⟩,
-   ok_of_map_toOption (by decide +kernel),
-   ok_of_map_toOption (by decide +kernel)⟩
+        some (c1LocalExpectedBytes.map (projByteTB ∘ liftByteTB))) := by
+  refine ⟨⟨rfl, rfl⟩, ok_of_map_toOption (by decide +kernel), ?_⟩
+  obtain ⟨m2, hm2, hOut⟩ := ok_of_map_toOption (r := Interp.stepsTB 2 (liftMachToTB c1DerefMach))
+    (f := fun m2 => m2.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB))
+    (b := some (c1LocalExpectedBytes.map (projByteTB ∘ liftByteTB))) (by decide +kernel)
+  exact ⟨m2, hm2, liftMachToTB_stepsTB_wfLive hm2, hOut⟩
 
-/-- Concrete `.uninit` shell witness for C1 across Trusted, `Mach`, and
-`MachTB`. -/
+/-- Concrete `.uninit` shell C1 witness across Trusted, `Mach`, and `MachTB`. -/
 def c1UninitMach : Mach :=
-  let alloc0 := mkStackAlloc 128 (List.replicate 8 .Uninit) 4
-  let alloc1 := mkStackAlloc 256 (List.replicate 8 .Uninit) 4
-  let fr : Frame :=
-    { func := c1SetDiscrLocalMrFn
-      locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
-                  (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]⟩
-      stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach c1SetDiscrLocalProg [alloc0, alloc1] [fr]
+  mkMrMach c1SetDiscrLocalProg
+    [mkStackAlloc 128 (List.replicate 8 .Uninit) 4, mkStackAlloc 256 (List.replicate 8 .Uninit) 4]
+    [mkRootFrame c1SetDiscrLocalMrFn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]]
 
 theorem c1_setDiscriminant_uninit_shell_witness :
     let s0 : MachineState :=
-      { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] }
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] },
         memory := (initMachineState c1SetDiscrLocalMir []).memory }
     (match stepMirFn c1SetDiscrLocalMir s0 with
-     | .tau (.running s1) => get? s1.frame.locals 1 = some (.init (.aggregate 1 []))
-     | _ => False) ∧
+     | .tau (.running s1) => get? s1.frame.locals 1 = some (.init (.aggregate 1 [])) | _ => False) ∧
     (∃ m1, Interp.step c1UninitMach = .ok m1 ∧
-      m1.mem.memory.allocations[1]?.map (·.data) =
-        some (.Init 1 none :: List.replicate 7 .Uninit)) ∧
+      m1.mem.memory.allocations[1]?.map (·.data) = some (.Init 1 none :: List.replicate 7 .Uninit)) ∧
     Type.decode twoVarEnumMrTy (.Init 1 none :: List.replicate 7 .Uninit) = .ok none ∧
     (∃ m1, Interp.stepTB (liftMachToTB c1UninitMach) = .ok m1 ∧
       m1.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB) =
         some (TBByteOutcome.initNoProv 1 :: List.replicate 7 TBByteOutcome.uninit)) :=
-  ⟨rfl,
-   ok_of_map_toOption (by decide +kernel),
-   rfl,
-   ok_of_map_toOption (by decide +kernel)⟩
+  ⟨rfl, ok_of_map_toOption (by decide +kernel), rfl, ok_of_map_toOption (by decide +kernel)⟩
 
-/-- Concrete dead-local UB witness for C1 across Trusted, `Mach`, and `MachTB`.
--/
+/-- Concrete dead-local UB C1 witness across Trusted, `Mach`, and `MachTB`. -/
 def c1DeadLocalMach : Mach :=
-  let alloc0 := mkStackAlloc 128 (List.replicate 8 .Uninit) 4
-  let fr : Frame :=
-    { func := c1SetDiscrLocalMrFn
-      locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]⟩
-      stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach c1SetDiscrLocalProg [alloc0] [fr]
+  mkMrMach c1SetDiscrLocalProg [mkStackAlloc 128 (List.replicate 8 .Uninit) 4]
+    [mkRootFrame c1SetDiscrLocalMrFn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]]
 
 theorem c1_setDiscriminant_dead_local_ub_witness :
     let s0 : MachineState :=
-      { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .dead] }
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .dead] },
         memory := (initMachineState c1SetDiscrLocalMir []).memory }
     stepMirFn c1SetDiscrLocalMir s0 = MirStepNode.fail .ub ∧
     Interp.step c1DeadLocalMach = .error (.ub "access to a dead local") ∧
     Interp.stepTB (liftMachToTB c1DeadLocalMach) = .error (.ub "access to a dead local") :=
-  ⟨rfl,
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+  ⟨rfl, eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
-/-- Concrete misaligned-pointer & frozen-borrow UB witness for C1 across
-Trusted,
-`Mach`, and `MachTB`. -/
+/-- Concrete misaligned-pointer, OOB-deref, & frozen-borrow UB witness for C1
+across Trusted, `Mach`, and `MachTB` (exact `.error (.ub ...)` strings). -/
 def c1MisalignedMach : Mach :=
-  let fn := mkMrFn [(localName 0, twoVarEnumMrTy), (localName 1, thinRawPtrTy)]
-    [] (localName 0)
-    [(bbName 0,
-      ⟨[.SetDiscriminant (.Deref (.Constant (.PointerWithoutProvenance 257) thinRawPtrTy)
-          twoVarEnumMrTy) 1], .Return, .Regular⟩)]
-  let alloc0 := mkStackAlloc 128 (List.replicate 8 .Uninit) 4
-  let alloc1 := mkStackAlloc 256 c1LocalInitBytes 4
-  let fr : Frame :=
-    { func := fn
-      locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]⟩
-      stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach (mkMrProg [(fnName 0, fn)]) [alloc0, alloc1] [fr]
+  let fn := mkMrFn [(localName 0, twoVarEnumMrTy), (localName 1, thinRawPtrTy)] [] (localName 0)
+    [(bbName 0, ⟨[.SetDiscriminant (.Deref (.Constant (.PointerWithoutProvenance 257) thinRawPtrTy)
+        twoVarEnumMrTy) 1], .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 8 .Uninit) 4, mkStackAlloc 256 c1LocalInitBytes 4]
+    [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]]
 
 theorem c1_setDiscriminant_misaligned_and_frozen_ub_witness :
     let sFrozen : MachineState :=
@@ -1471,11 +1345,9 @@ theorem c1_setDiscriminant_misaligned_and_frozen_ub_witness :
       let alloc0 := mkStackAlloc 128 (List.replicate 8 .Uninit) 4
       let alloc1 := mkStackAlloc 256 c1LocalInitBytes 4
       let allocPtr := mkStackAlloc 384 (ptrBytes 264 (some (⟨1⟩, ()))) 8
-      let fr : Frame :=
-        { func := fn
-          locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
-                      (localName 1, { addr := 384, provenance := some (⟨2⟩, ()) })]⟩
-          stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
+      let fr := mkRootFrame fn
+        [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+         (localName 1, { addr := 384, provenance := some (⟨2⟩, ()) })]
       mkMrMach (mkMrProg [(fnName 0, fn)]) [alloc0, alloc1, allocPtr] [fr]
     stepMirFn c1DerefMir sFrozen = MirStepNode.fail .ub ∧
     stepMirFn c1DerefMir sOob = MirStepNode.fail .ub ∧
@@ -1483,13 +1355,15 @@ theorem c1_setDiscriminant_misaligned_and_frozen_ub_witness :
       .error (.ub "setting the discriminant of a place based on a misaligned pointer") ∧
     Interp.stepTB (liftMachToTB c1MisalignedMach) =
       .error (.ub "setting the discriminant of a place based on a misaligned pointer") ∧
-    (Interp.step oobMach).toOption = none ∧
-    (Interp.stepTB (liftMachToTB oobMach)).toOption = none :=
+    Interp.step oobMach =
+      .error (.ub "dereferencing pointer outside the bounds of its allocation") ∧
+    Interp.stepTB (liftMachToTB oobMach) =
+      .error (.ub "dereferencing pointer outside the bounds of its allocation") :=
   ⟨rfl, rfl,
    eq_error_ub_of_interpUbMsg (by decide +kernel),
    eq_error_ub_of_interpUbMsg (by decide +kernel),
-   by decide +kernel,
-   by decide +kernel⟩
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
 /-! ## §2 (`C2`): `TerminatorKind.unwindResume` (`Mach` & `MachTB`) -/
 
@@ -1560,19 +1434,75 @@ theorem trusted_unwindFromCallStack_continue_chain :
     simp only [List.cons_append, unwindFromCallStack, hc, unwindContinueChainMem]
     exact trusted_unwindFromCallStack_continue_chain cs tail _ hcs
 
+/-- Bundled witness that `m` takes a genuine MiniRust `.ResumeUnwind` step to
+`mAfter` (`deallocAllM` + `ConcurrentMemory.end_call` + frame pop +
+`jumpToBlockM ubBb` + data-race check). -/
+structure ResumeUnwindStepM {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m mAfter : Machine M) : Type where
+  t : Gen.Thread M
+  fr : StackFrame M
+  fr1 : StackFrame M
+  blk : Gen.BasicBlock
+  threads' : List (Gen.Thread M)
+  cm1 : Gen.ConcurrentMemory M
+  cm2 : Gen.ConcurrentMemory M
+  nextBlock : Option Gen.BbName
+  ubBb : Gen.BbName
+  retPtr : ThinPointer (Gen.Memory.Provenance M)
+  hEnabled : m.threads.any (fun th => decide (th.state = .Enabled)) = true
+  hPick : pickActiveThreadM { m with mem := { m.mem with accesses := [] } } = .ok m.active_thread
+  hTid : activeThreadM { m with mem := { m.mem with accesses := [] } } = .ok t
+  hLast : t.stack.getLast? = some fr
+  hBlk : mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk
+  hStmt : fr.next_stmt = (blk.statements.length : Int)
+  hTerm : blk.terminator = .ResumeUnwind
+  hSet : listSet m.threads m.active_thread { t with stack := t.stack.dropLast } "pop" = .ok threads'
+  hDealloc : deallocAllM fr.locals.entries.length fr { m.mem with accesses := [] } = .ok (fr1, cm1)
+  hEnd : ConcurrentMemory.end_call cm1 fr1.extra = .ok cm2
+  hAct : fr1.stack_pop_action = .BackToCaller nextBlock (some ubBb) retPtr
+  hJump : jumpToBlockM
+    { { { m with mem := { m.mem with accesses := [] } } with threads := threads' } with
+      mem := cm2 } ubBb = .ok mAfter
+  hRace : ConcurrentMemory.check_data_races mAfter.mem mAfter.active_thread
+    (setInsert m.synchronized_threads m.active_thread, m.mem.accesses) = .ok ()
+
+/-- **C2 Single-Step `.ResumeUnwind` Execution Law (`stepM_resumeUnwind`)**. -/
+theorem stepM_resumeUnwind {M : Type} [Gen.Memory M] [MemoryOps M]
+    {m mAfter : Machine M} (w : ResumeUnwindStepM m mAfter) :
+    stepM m = .ok mAfter := by
+  have hCur : curFrameM { m with mem := { m.mem with accesses := [] } } = .ok w.fr := by
+    unfold curFrameM; simp only [w.hTid, w.hLast, bind, Except.bind, pure, Except.pure]
+  unfold stepM
+  simp only [w.hEnabled, Bool.not_true, Bool.false_eq_true, ↓reduceIte, resetDataRaceTrackingM,
+    w.hPick, hCur, w.hBlk, w.hStmt, w.hTerm, evalTerminatorM, evalResumeUnwindM, w.hTid, w.hLast,
+    w.hSet, w.hDealloc, w.hEnd, w.hAct, w.hJump, w.hRace, bind, Except.bind, pure, Except.pure]
+
+/-- Inductive `k`-step MiniRust `.ResumeUnwind` chain where EVERY single step
+executes a `.ResumeUnwind` terminator (`ResumeUnwindStepM`). -/
+inductive ResumeUnwindChainM {M : Type} [Gen.Memory M] [MemoryOps M] :
+    Nat → Machine M → Machine M → Prop
+  | zero (m : Machine M) : ResumeUnwindChainM 0 m m
+  | step {k : Nat} {m m1 m2 : Machine M} :
+      ResumeUnwindStepM m m1 → ResumeUnwindChainM k m1 m2 → ResumeUnwindChainM (k + 1) m m2
+
+theorem ResumeUnwindChainM.to_stepsM {M : Type} [Gen.Memory M] [MemoryOps M]
+    {k : Nat} {m m' : Machine M} (h : ResumeUnwindChainM k m m') :
+    stepsM k m = .ok m' := by
+  induction h with
+  | zero _ => rfl
+  | step w _ ih => simp only [stepsM, stepM_resumeUnwind w, bind, Except.bind]; exact ih
+
 theorem unwindResume_continue_chain_coupled_steps_and_wfLive
     (s : MachineState) (conts : List SavedCallerFrame) (caller : SavedCallerFrame)
     (rest : List SavedCallerFrame) (cleanupBb : Nat) (span : String)
     (curBody : Option CapturedMir)
-    (mBM mBMk mBMf : Mach) (mTB mTBk mTBf : MachTB)
+    (mBM mBMf : Mach) (mTB mTBf : MachTB)
     (hStack : s.memory.callStack = conts ++ (caller :: rest))
     (hCont : ∀ c ∈ conts, c.returnUnwind = .continue_)
     (hClean : caller.returnUnwind = .cleanup cleanupBb)
-    (hBMk : Interp.steps conts.length mBM = .ok mBMk)
-    (hBM1 : Interp.step mBMk = .ok mBMf)
+    (hChainBM : ResumeUnwindChainM (conts.length + 1) mBM mBMf)
     (hwfTB : MachTB.wfLive mTB)
-    (hTBk : Interp.stepsTB conts.length mTB = .ok mTBk)
-    (hTB1 : Interp.stepTB mTBk = .ok mTBf) :
+    (hChainTB : ResumeUnwindChainM (conts.length + 1) mTB mTBf) :
     let memMid := unwindContinueChainMem conts (caller :: rest) s.memory
     MirSemantics.evalTerminator s { kind := .unwindResume, span := span } curBody =
       MirStepNode.step {
@@ -1590,46 +1520,8 @@ theorem unwindResume_continue_chain_coupled_steps_and_wfLive
     MachTB.wfLive mTBf := by
   intro memMid
   have hStepsBM : Interp.steps (conts.length + 1) mBM = .ok mBMf := by
-    have hSplit : ∀ k (x y z : Mach), Interp.steps k x = .ok y → Interp.step y = .ok z →
-        Interp.steps (k + 1) x = .ok z := by
-      intro k
-      induction k with
-      | zero =>
-        intro x y z h0 h1
-        simp only [Interp.steps, pure, Except.pure, Except.ok.injEq] at h0
-        subst h0
-        simp only [Nat.zero_add, Interp.steps, h1, ok_bind, pure, Except.pure]
-      | succ k' ih =>
-        intro x y z hsk h1
-        simp only [Interp.steps] at hsk
-        rcases hs1 : Interp.step x with e | x1
-        · simp [hs1, bind, Except.bind] at hsk
-        · rw [hs1, ok_bind] at hsk
-          have ih' := ih x1 y z hsk h1
-          simp only [Nat.succ_add, Interp.steps, hs1, ok_bind]
-          exact ih'
-    exact hSplit conts.length mBM mBMk mBMf hBMk hBM1
-  have hStepsTB : Interp.stepsTB (conts.length + 1) mTB = .ok mTBf := by
-    have hSplitTB : ∀ k (x y z : MachTB), Interp.stepsTB k x = .ok y → Interp.stepTB y = .ok z →
-        Interp.stepsTB (k + 1) x = .ok z := by
-      intro k
-      induction k with
-      | zero =>
-        intro x y z h0 h1
-        simp only [Interp.stepsTB, Interp.stepsM, pure, Except.pure, Except.ok.injEq] at h0
-        subst h0
-        have h1' : stepM x = .ok z := h1
-        simp only [Nat.zero_add, Interp.stepsTB, Interp.stepsM, h1', ok_bind, pure, Except.pure]
-      | succ k' ih =>
-        intro x y z hsk h1
-        simp only [Interp.stepsTB, Interp.stepsM] at hsk
-        rcases hs1 : stepM x with e | x1
-        · simp [hs1, bind, Except.bind] at hsk
-        · rw [hs1, ok_bind] at hsk
-          have ih' := ih x1 y z hsk h1
-          simp only [Nat.succ_add, Interp.stepsTB, Interp.stepsM, hs1, ok_bind]
-          exact ih'
-    exact hSplitTB conts.length mTB mTBk mTBf hTBk hTB1
+    rw [← stepsM_bm_eq]; exact hChainBM.to_stepsM
+  have hStepsTB : Interp.stepsTB (conts.length + 1) mTB = .ok mTBf := hChainTB.to_stepsM
   refine ⟨?_, hStepsBM, hStepsTB, stepsTB_wfLive hwfTB hStepsTB⟩
   simp only [MirSemantics.evalTerminator, hStack,
     trusted_unwindFromCallStack_continue_chain conts (caller :: rest) s.memory hCont,
@@ -1777,44 +1669,32 @@ def c2Prog : Gen.Program :=
 
 def c2MkStackMach (unwindActionBb : Option Gen.BbName) (withMidContinue : Bool := false)
     (payloads : List Ptr := []) : Mach :=
-  let alloc0 := mkStackAlloc 128 (List.replicate 4 .Uninit) 4
-  let rootFr : Frame :=
-    { func := c2CallerMrFn
-      locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]⟩
-      stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
+  let rootFr := mkRootFrame c2CallerMrFn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]
   let midFr : Frame :=
-    { func := c2MidContinueMrFn, locals := ⟨[]⟩
-      stack_pop_action := .BackToCaller none unwindActionBb dummyRetPtr
+    { func := c2MidContinueMrFn, locals := ⟨[]⟩,
+      stack_pop_action := .BackToCaller none unwindActionBb dummyRetPtr,
       next_block := bbName 0, next_stmt := 0, extra := () }
   let leafFr : Frame :=
-    { func := c2LeafMrFn, locals := ⟨[]⟩
-      stack_pop_action :=
-        if withMidContinue then .BackToCaller none (some (bbName 0)) dummyRetPtr
-        else .BackToCaller none unwindActionBb dummyRetPtr
+    { func := c2LeafMrFn, locals := ⟨[]⟩,
+      stack_pop_action := .BackToCaller none (if withMidContinue then some (bbName 0) else unwindActionBb)
+        dummyRetPtr,
       next_block := bbName 0, next_stmt := 0, extra := () }
-  let stack := if withMidContinue then [rootFr, midFr, leafFr] else [rootFr, leafFr]
-  mkMrMach c2Prog [alloc0] stack [] [] payloads
+  mkMrMach c2Prog [mkStackAlloc 128 (List.replicate 4 .Uninit) 4]
+    (if withMidContinue then [rootFr, midFr, leafFr] else [rootFr, leafFr]) [] [] payloads
 
 /-- **C2 Concrete Witness covering ALL 5 regimes on Trusted, `Mach`, and
 `MachTB`**. -/
 theorem c2_unwindResume_all_five_regimes_witness :
     let callerBase (ua : UnwindAction) : SavedCallerFrame :=
-      { callerBody := c2CallerMir
-        frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit] }
-        destination := locPlace 0
-        returnTarget := 0
-        returnUnwind := ua }
+      { callerBody := c2CallerMir, frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit] },
+        destination := locPlace 0, returnTarget := 0, returnUnwind := ua }
     let sWith (cs : List SavedCallerFrame) : MachineState :=
-      { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit] }
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit] },
         memory := { (initMachineState c2LeafMir []).memory with callStack := cs } }
-    let rootLeafMach :=
-      mkMrMach c2Prog []
-        [{ func := c2LeafMrFn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
-           next_block := bbName 0, next_stmt := 0, extra := () }]
+    let rootLeafMach := mkMrMach c2Prog [] [mkRootFrame c2LeafMrFn []]
     -- (a) .cleanup 1
     (match stepMirFn c2LeafMir (sWith [callerBase (.cleanup 1)]) with
-     | .tau (.running s1) => s1.frame.blockIdx = 1 ∧ s1.memory.callStack = []
-     | _ => False) ∧
+     | .tau (.running s1) => s1.frame.blockIdx = 1 ∧ s1.memory.callStack = [] | _ => False) ∧
     (∃ m1, Interp.step (c2MkStackMach (some (bbName 1))) = .ok m1 ∧
       m1.threads[0]?.map (fun t => (t.stack.length, t.stack[0]?.map (·.next_block))) =
         some (1, some (bbName 1))) ∧
@@ -1823,8 +1703,7 @@ theorem c2_unwindResume_all_five_regimes_witness :
         some (1, some (bbName 1))) ∧
     -- (b) .continue_ chain (1 Trusted step ↔ 2 MiniRust steps)
     (match stepMirFn c2LeafMir (sWith [callerBase .continue_, callerBase (.cleanup 1)]) with
-     | .tau (.running s1) => s1.frame.blockIdx = 1 ∧ s1.memory.callStack = []
-     | _ => False) ∧
+     | .tau (.running s1) => s1.frame.blockIdx = 1 ∧ s1.memory.callStack = [] | _ => False) ∧
     (∃ m2, Interp.steps 2 (c2MkStackMach (some (bbName 1)) true) = .ok m2 ∧
       m2.threads[0]?.map (fun t => (t.stack.length, t.stack[0]?.map (·.next_block))) =
         some (1, some (bbName 1))) ∧
@@ -1850,54 +1729,35 @@ theorem c2_unwindResume_all_five_regimes_witness :
       .error (.ub "the function at the bottom of the stack must not unwind") ∧
     Interp.stepTB (liftMachToTB rootLeafMach) =
       .error (.ub "the function at the bottom of the stack must not unwind") :=
-  ⟨⟨rfl, rfl⟩,
-   ok_of_map_toOption (by decide +kernel),
-   ok_of_map_toOption (by decide +kernel),
-   ⟨rfl, rfl⟩,
-   ok_of_map_toOption (by decide +kernel),
-   ok_of_map_toOption (by decide +kernel),
-   rfl,
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   rfl,
-   eq_error_abort_of_interpIsAbort (by decide +kernel),
-   eq_error_abort_of_interpIsAbort (by decide +kernel),
-   rfl,
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+  ⟨⟨rfl, rfl⟩, ok_of_map_toOption (by decide +kernel), ok_of_map_toOption (by decide +kernel),
+   ⟨rfl, rfl⟩, ok_of_map_toOption (by decide +kernel), ok_of_map_toOption (by decide +kernel),
+   rfl, eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   rfl, eq_error_abort_of_interpIsAbort (by decide +kernel),
+   eq_error_abort_of_interpIsAbort (by decide +kernel), rfl,
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
 /-- **C2 `StartUnwind -> ResumeUnwind -> StopUnwind` Composition Witness** on
 both
 `Mach` and `MachTB` (plus empty-stack `StopUnwind` UB witness). -/
 def c2UnwindLifecycleMach : Mach :=
   let calleeFn := mkMrFn [] [] (localName 0)
-    [(bbName 0,
-      ⟨[], .StartUnwind (.Constant (.PointerWithoutProvenance 4096) thinRawPtrTy) (bbName 1),
-       .Regular⟩),
-     (bbName 1, ⟨[], .ResumeUnwind, .Cleanup⟩)]
+    [(bbName 0, ⟨[], .StartUnwind (.Constant (.PointerWithoutProvenance 4096) thinRawPtrTy)
+      (bbName 1), .Regular⟩), (bbName 1, ⟨[], .ResumeUnwind, .Cleanup⟩)]
   let callerFn := mkMrFn [] [] (localName 0)
     [(bbName 0, ⟨[], .Goto (bbName 0), .Regular⟩),
-     (bbName 1, ⟨[], .StopUnwind (bbName 2), .Cleanup⟩),
-     (bbName 2, ⟨[], .Return, .Regular⟩)]
-  let prog := mkMrProg [(fnName 0, callerFn), (fnName 1, calleeFn)]
-  let callerFr : Frame :=
-    { func := callerFn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
-      next_block := bbName 0, next_stmt := 0, extra := () }
+     (bbName 1, ⟨[], .StopUnwind (bbName 2), .Cleanup⟩), (bbName 2, ⟨[], .Return, .Regular⟩)]
   let calleeFr : Frame :=
     { func := calleeFn, locals := ⟨[]⟩,
       stack_pop_action := .BackToCaller (some (bbName 0)) (some (bbName 1)) dummyRetPtr,
       next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach prog [] [callerFr, calleeFr]
+  mkMrMach (mkMrProg [(fnName 0, callerFn), (fnName 1, calleeFn)]) []
+    [mkRootFrame callerFn [], calleeFr]
 
 def c2StopUnwindEmptyMach : Mach :=
   let fn := mkMrFn [] [] (localName 0)
-    [(bbName 0, ⟨[], .StopUnwind (bbName 1), .Cleanup⟩),
-     (bbName 1, ⟨[], .Return, .Regular⟩)]
-  mkMrMach (mkMrProg [(fnName 0, fn)]) []
-    [{ func := fn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
-       next_block := bbName 0, next_stmt := 0, extra := () }]
+    [(bbName 0, ⟨[], .StopUnwind (bbName 1), .Cleanup⟩), (bbName 1, ⟨[], .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)]) [] [mkRootFrame fn []]
 
 theorem c2_start_resume_stop_unwind_composition_witness :
     (∃ m1, Interp.step c2UnwindLifecycleMach = .ok m1 ∧
@@ -1931,36 +1791,39 @@ the caller's `u32` allocation via `&mut u32` arg `_1`), then unwinds via
 `ResumeUnwind`; `end_call` releases the callee's protector so caller cleanup
 writes `99` without protector UB. -/
 def c2TbProtectorUnwindMach : Mach :=
-  let refMutU32MrTy : Gen.Type := refTy .mut u32
-  let calleeFn := mkMrFn [(localName 0, unitType), (localName 1, refMutU32MrTy)]
+  let calleeFn := mkMrFn [(localName 0, unitType), (localName 1, refTy .mut u32)]
     [localName 1] (localName 0)
     [(bbName 0, ⟨[.Validate (.Local (localName 1)) true], .ResumeUnwind, .Regular⟩)]
   let callerFn := mkMrFn [(localName 0, u32MrTy)] [] (localName 0)
     [(bbName 0, ⟨[], .Goto (bbName 1), .Regular⟩),
-     (bbName 1,
-       ⟨[.Assign (.Local (localName 0)) (.Constant (.Int 99) u32MrTy)], .Return, .Cleanup⟩)]
-  let prog := mkMrProg [(fnName 0, callerFn), (fnName 1, calleeFn)]
-  let alloc0 := mkStackAlloc 128 (scalarBytes u32 5) 4
-  let alloc1 := mkStackAlloc 256 (ptrBytes 128 (some (⟨0⟩, ()))) 8
-  let callerFr : Frame :=
-    { func := callerFn
-      locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]⟩
-      stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
+     (bbName 1, ⟨[.Assign (.Local (localName 0)) (.Constant (.Int 99) u32MrTy)], .Return, .Cleanup⟩)]
+  let callerFr := mkRootFrame callerFn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]
   let calleeFr : Frame :=
-    { func := calleeFn
-      locals := ⟨[(localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]⟩
-      stack_pop_action := .BackToCaller (some (bbName 0)) (some (bbName 1)) dummyRetPtr
+    { func := calleeFn, locals := ⟨[(localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]⟩,
+      stack_pop_action := .BackToCaller (some (bbName 0)) (some (bbName 1)) dummyRetPtr,
       next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach prog [alloc0, alloc1] [callerFr, calleeFr]
+  mkMrMach (mkMrProg [(fnName 0, callerFn), (fnName 1, calleeFn)])
+    [mkStackAlloc 128 (scalarBytes u32 5) 4, mkStackAlloc 256 (ptrBytes 128 (some (⟨0⟩, ()))) 8]
+    [callerFr, calleeFr]
 
 theorem c2_machTB_protector_release_on_resumeUnwind_witness :
-    -- (a) Positive: `ResumeUnwind` runs `end_call`, releasing callee protector
+    -- (a) Non-vacuous contrast: step 1 (`Validate`) installs 1 protector on
+    -- `calleeFr` so a pre-`ResumeUnwind` caller write to `alloc0` triggers
+    -- Tree Borrows protector UB!
+    (∃ m1, Interp.stepTB (liftMachToTB c2TbProtectorUnwindMach) = .ok m1 ∧
+      m1.threads[0]?.bind (fun t => t.stack[1]?.map (fun (fr : StackFrame TBM) =>
+        fr.extra.protectors.length)) = some 1 ∧
+      ConcurrentMemory.store m1.mem { addr := 128, provenance := some (⟨0⟩, []) }
+        ((scalarBytes u32 99).map liftByteTB) ⟨4⟩ .None =
+        .error (.ub "Tree Borrows: foreign read of protected Unique reference")) ∧
+    -- (b) Positive: step 2 (`ResumeUnwind`) runs `end_call`, releasing the
+    -- callee protector so step 3's caller write of `99` succeeds with `wfLive`
     (∃ m3, Interp.stepsTB 3 (liftMachToTB c2TbProtectorUnwindMach) = .ok m3 ∧
       MachTB.wfLive m3 ∧
       (m3.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB)),
        m3.mem.memory.mem.allocations[1]?.map (·.live)) =
       (some (true, (scalarBytes u32 99).map (projByteTB ∘ liftByteTB)), some false)) ∧
-    -- (b) Trusted non-vacuous borrow disabling & protector restore on cleanup
+    -- (c) Trusted non-vacuous borrow disabling & protector restore on cleanup
     (let callerSaved : SavedCallerFrame :=
        { callerBody := c2CallerMir
          frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar ⟨5, 4⟩)] }
@@ -1987,15 +1850,31 @@ theorem c2_machTB_protector_release_on_resumeUnwind_witness :
        (lookupBorrow sAfter.memory.borrows 11).map (·.perm) = some .disabled ∧
        (lookupBorrow sAfter.memory.borrows 10).map (·.perm) = some (.reservedFrz false)
      | _ => False) := by
-  refine ⟨?_, ⟨rfl, rfl, rfl, rfl⟩⟩
-  obtain ⟨m3, hm3, hOut⟩ :=
-    ok_of_map_toOption (r := Interp.stepsTB 3 (liftMachToTB c2TbProtectorUnwindMach))
-      (f := fun m3 =>
-        (m3.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB)),
-         m3.mem.memory.mem.allocations[1]?.map (·.live)))
-      (b := (some (true, (scalarBytes u32 99).map (projByteTB ∘ liftByteTB)), some false))
-      (by decide +kernel)
-  exact ⟨m3, hm3, liftMachToTB_stepsTB_wfLive hm3, hOut⟩
+  refine ⟨?_, ?_, ⟨rfl, rfl, rfl, rfl⟩⟩
+  · obtain ⟨m1, hm1, hProt⟩ :=
+      ok_of_map_toOption (r := Interp.stepTB (liftMachToTB c2TbProtectorUnwindMach))
+        (f := fun m1 =>
+          (m1.threads[0]?.bind (fun t => t.stack[1]?.map (fun (fr : StackFrame TBM) =>
+            fr.extra.protectors.length)),
+           interpUbMsg (ConcurrentMemory.store m1.mem { addr := 128, provenance := some (⟨0⟩, []) }
+             ((scalarBytes u32 99).map liftByteTB) ⟨4⟩ .None)))
+        (b := (some 1, some "Tree Borrows: foreign read of protected Unique reference"))
+        (by decide +kernel)
+    have hP1 : m1.threads[0]?.bind (fun t => t.stack[1]?.map (fun (fr : StackFrame TBM) =>
+        fr.extra.protectors.length)) = some 1 := congrArg Prod.fst hProt
+    have hUbMsg : interpUbMsg (ConcurrentMemory.store m1.mem
+        { addr := 128, provenance := some (⟨0⟩, []) }
+        ((scalarBytes u32 99).map liftByteTB) ⟨4⟩ .None) =
+        some "Tree Borrows: foreign read of protected Unique reference" := congrArg Prod.snd hProt
+    exact ⟨m1, hm1, hP1, eq_error_ub_of_interpUbMsg hUbMsg⟩
+  · obtain ⟨m3, hm3, hOut⟩ :=
+      ok_of_map_toOption (r := Interp.stepsTB 3 (liftMachToTB c2TbProtectorUnwindMach))
+        (f := fun m3 =>
+          (m3.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB)),
+           m3.mem.memory.mem.allocations[1]?.map (·.live)))
+        (b := (some (true, (scalarBytes u32 99).map (projByteTB ∘ liftByteTB)), some false))
+        (by decide +kernel)
+    exact ⟨m3, hm3, liftMachToTB_stepsTB_wfLive hm3, hOut⟩
 
 /-! ## §3 (`C3`): `TerminatorKind.unwindTerminate` (`Mach` & `MachTB`) -/
 
@@ -2046,9 +1925,7 @@ def c3UnwindTerminateMir : MirAst.CapturedMir :=
 
 def c3AbortMach : Mach :=
   let fn := mkMrFn [] [] (localName 0) [(bbName 0, ⟨[], buildAbort, .Cleanup⟩)]
-  mkMrMach (mkMrProg [(fnName 0, fn)]) []
-    [{ func := fn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
-       next_block := bbName 0, next_stmt := 0, extra := () }]
+  mkMrMach (mkMrProg [(fnName 0, fn)]) [] [mkRootFrame fn []]
 
 theorem c3_unwindTerminate_three_way_witness :
     stepMirFn c3UnwindTerminateMir (initMachineState c3UnwindTerminateMir []) =
@@ -2317,31 +2194,18 @@ theorem fnPtrToPtr_extra_checks_divergence
     evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB none⟩
   · intro hNe
     have hBeq : Nat.beq p.offsetBytes 0 = false := by
-      cases ho : p.offsetBytes with
-      | zero => exact absurd ho hNe
-      | succ _ => rfl
-    show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub
-    unfold evalFnPtrToPtr
-    simp [hOp, hBeq]
-  · intro entry hB
-    show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub
-    unfold evalFnPtrToPtr
-    simp [hOp, hB]
-  · intro ins out saf hIntr
-    show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub
-    unfold evalFnPtrToPtr
-    simp [hOp, hIntr, callConvEq]
+      cases ho : p.offsetBytes with | zero => exact absurd ho hNe | succ _ => rfl
+    show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub; unfold evalFnPtrToPtr; simp [hOp, hBeq]
+  · intro entry hB; show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub
+    unfold evalFnPtrToPtr; simp [hOp, hB]
+  · intro ins out saf hIntr; show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub
+    unfold evalFnPtrToPtr; simp [hOp, hIntr, callConvEq]
   · intro fpHead fpTail hFps hMiss
-    have hMiss' : lookupFnPtr (fpHead :: fpTail) p.allocId = none := by
-      simpa [hFps] using hMiss
-    show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub
-    unfold evalFnPtrToPtr
-    cases hB : lookupBorrow mem.borrows p.tag <;>
-      simp [hOp, hFps, hMiss', hB, Bool.and_false]
-  · intro hNotThin
-    show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub
-    unfold evalFnPtrToPtr
-    simp [hOp, hNotThin]
+    have hMiss' : lookupFnPtr (fpHead :: fpTail) p.allocId = none := by simpa [hFps] using hMiss
+    show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub; unfold evalFnPtrToPtr
+    cases hB : lookupBorrow mem.borrows p.tag <;> simp [hOp, hFps, hMiss', hB, Bool.and_false]
+  · intro hNotThin; show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub
+    unfold evalFnPtrToPtr; simp [hOp, hNotThin]
 
 /-- Concrete C6 positive, dead-operand UB, and extra-check divergence witnesses
 across `stepMirFn`, `Interp.step`, and `Interp.stepTB`. -/
@@ -2360,21 +2224,14 @@ def c6FnPtrToPtrMrFn : Gen.Function :=
        .Return, .Regular⟩)]
 
 def c6FnPtrMach (local1Live : Bool := true) (local1Init : Bool := true) : Mach :=
-  let prog := mkMrProg [(fnName 0, c6FnPtrToPtrMrFn)]
-  let fnAlloc := mkFnAlloc 4096
-  let alloc0 := mkStackAlloc 128 (List.replicate 8 .Uninit) 8
   let alloc1 := mkStackAlloc 256
     (if local1Init then ptrBytes 4096 (some (⟨0⟩, ())) else List.replicate 8 .Uninit) 8
   let locs : List (Gen.LocalName × Ptr) :=
-    if local1Live then
-      [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
-       (localName 1, { addr := 256, provenance := some (⟨2⟩, ()) })]
-    else
-      [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) })]
-  let fr : Frame :=
-    { func := c6FnPtrToPtrMrFn, locals := ⟨locs⟩, stack_pop_action := .BottomOfStack,
-      next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach prog [fnAlloc, alloc0, alloc1] [fr]
+    (localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }) ::
+      (if local1Live then [(localName 1, { addr := 256, provenance := some (⟨2⟩, ()) })] else [])
+  mkMrMach (mkMrProg [(fnName 0, c6FnPtrToPtrMrFn)])
+    [mkFnAlloc 4096, mkStackAlloc 128 (List.replicate 8 .Uninit) 8, alloc1]
+    [mkRootFrame c6FnPtrToPtrMrFn locs]
     [(fnName 0, { addr := 4096, provenance := some (⟨0⟩, ()) })]
 
 theorem c6_fnPtrToPtr_three_way_and_ub_witness :
@@ -2500,30 +2357,31 @@ theorem transmuteM_u8_to_bool {M : Type} [Gen.Memory M] [MemoryOps M]
     rw [henc, ok_bind, hDecNone _ hU8Ne0 hU8Ne1, ok_bind]
     rfl
 
-/-- **C7 Coupled Two-Sided Thin-Pointer & Integer `CastKind.subtype` Simulation
-(`subtype_thinPtr_and_u32_coupled_lockstep`)**:
-Proves universal lockstep between Trusted `evalRvalue ... (.cast .subtype ...)`
-(`evalByteCast`) and MiniRust `evalCastOp` (`Mach`) + `evalCastOpM` (`MachTB`)
-across BOTH variance/lifetime pointer subtyping (`*mut u32 → *const u32`) and
-same-width integer reinterpretation (`u32 → i32`), completely
-`Classical.choice`-
-free on the MiniRust codecs. -/
+/-- **C7 Hypothesis-Free Coupled Two-Sided Thin-Pointer, Integer, & Bool
+`CastKind.subtype` Simulation (`subtype_thinPtr_and_u32_coupled_lockstep`)**:
+Using our `Classical.choice`-free Trusted and MiniRust byte codecs (ZERO
+unproved codec hypotheses!), proves universal lockstep between Trusted
+`evalRvalue ... (.cast .subtype ...)` (`evalByteCast`) and MiniRust
+`evalCastOp` (`Mach`) + `evalCastOpM` (`MachTB`) across:
+1. `*mut u32 → *const u32` for EVERY `p` with `p.offsetBytes < 2 ^ 64`,
+2. `u32 → i32` for EVERY `bits < 2 ^ 32` (BOTH Trusted and MiniRust!), and
+3. `u8 → bool` for EVERY `b < 256` (`b ∈ {0, 1}` valid lockstep; `2 ≤ b`
+   universal lockstep UB on BOTH Trusted and MiniRust `Mach`/`MachTB`!). -/
 theorem subtype_thinPtr_and_u32_coupled_lockstep
     (locals locals' : List LocalSlot) (op : MirAst.Operand)
     (mem : MirSemantics.Memory)
-    (p : ProvenancePtr) (bs : List MirSemantics.AbstractByte)
-    (addr bits : Nat) (hAddr : addr < 2 ^ 64) (hBits : bits < 2 ^ 32)
+    (p : ProvenancePtr) (hpOff : p.offsetBytes < 2 ^ 64)
+    (addr bits b : Nat) (hAddr : addr < 2 ^ 64) (hBits : bits < 2 ^ 32) (hb : b < 256)
     (provBM : Option Prov) (provTB : Option TreeBorrowsProvenance)
     (mBM : Option Mach) (mTB : Option MachTB) :
-    let decls := [mkDecl rawConstU32MirTy, mkDecl rawMutU32MirTy]
-    (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls
+    let declsPtr := [mkDecl rawConstU32MirTy, mkDecl rawMutU32MirTy]
+    let declsInt := [mkDecl i32MirTy, mkDecl u32MirTy]
+    let declsBool := [mkDecl boolMirTy, mkDecl u8MirTy]
+    -- (1) Universal thin pointer subtyping (*mut u32 -> *const u32)
+    (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals declsPtr
         mem.callStack = .ok (.ptr p 8) locals' →
-      operandTy decls emptyLayoutTable op = some rawMutU32MirTy →
-      encodeByteCastSourceBytes emptyLayoutTable rawMutU32MirTy (.ptr p 8) = some bs →
-      length bs = 8 →
-      decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable rawConstU32MirTy bs =
-        some (.ptr p 8) →
-      evalRvalue locals (.cast .subtype op rawConstU32MirTy) mem decls emptyLayoutTable =
+      operandTy declsPtr emptyLayoutTable op = some rawMutU32MirTy →
+      evalRvalue locals (.cast .subtype op rawConstU32MirTy) mem declsPtr emptyLayoutTable =
         .ok (.ptr p 8) locals' mem ∧
       evalCastOp (.Transmute thinRawPtrTy)
         (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) mBM =
@@ -2531,101 +2389,157 @@ theorem subtype_thinPtr_and_u32_coupled_lockstep
       evalCastOpM (M := TBM) (.Transmute thinRawPtrTy)
         (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) mTB =
         .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy)) ∧
-    evalRvalue [.uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
-      (.cast .subtype (.copy (locPlace 1)) rawConstU32MirTy) mem decls emptyLayoutTable =
-      .ok (.ptr { allocId := 1, offsetBytes := 0 } 8)
-          [.uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] mem ∧
-    transmuteM (M := BM) (.Int (intFromBits bits u32)) u32MrTy i32MrTy mBM =
-      .ok (.Int (intFromBits bits ⟨.Signed, ⟨4⟩⟩)) ∧
-    transmuteM (M := TBM) (.Int (intFromBits bits u32)) u32MrTy i32MrTy mTB =
-      .ok (.Int (intFromBits bits ⟨.Signed, ⟨4⟩⟩)) := by
-  intro decls
-  refine ⟨?_, rfl, transmuteM_u32_to_i32 bits hBits mBM, transmuteM_u32_to_i32 bits hBits mTB⟩
-  intro hOp hSrcTy hEnc hLen hDec
-  refine ⟨?_,
-    evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM,
-    evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB mTB⟩
-  have hResDst : resolveTyWithLocalDecls decls emptyLayoutTable rawConstU32MirTy =
-      rawConstU32MirTy := rfl
-  have hResSrc : resolveTyWithLocalDecls decls emptyLayoutTable rawMutU32MirTy =
-      rawMutU32MirTy := rfl
-  have hSzDst : tyByteSize decls emptyLayoutTable rawConstU32MirTy = some 8 := rfl
-  have hSzSrc : tyByteSize decls emptyLayoutTable rawMutU32MirTy = some 8 := rfl
-  show evalByteCast locals op rawConstU32MirTy mem decls emptyLayoutTable = _
-  unfold evalByteCast
-  simp only [hOp, hResDst, hSzDst, hSrcTy, hResSrc, hSzSrc, hEnc, hLen, hDec, Nat.beq_refl]
+    -- (2) Universal int reinterpretation (u32 -> i32) on Trusted, Mach, MachTB
+    (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals declsInt
+        mem.callStack = .ok (.scalar ⟨bits, 4⟩) locals' →
+      operandTy declsInt emptyLayoutTable op = some u32MirTy →
+      evalRvalue locals (.cast .subtype op i32MirTy) mem declsInt emptyLayoutTable =
+        .ok (.scalar ⟨bits, 4⟩) locals' mem ∧
+      transmuteM (M := BM) (.Int (intFromBits bits u32)) u32MrTy i32MrTy mBM =
+        .ok (.Int (intFromBits bits ⟨.Signed, ⟨4⟩⟩)) ∧
+      transmuteM (M := TBM) (.Int (intFromBits bits u32)) u32MrTy i32MrTy mTB =
+        .ok (.Int (intFromBits bits ⟨.Signed, ⟨4⟩⟩))) ∧
+    -- (3) Universal invalid-bool UB (u8 b >= 2 -> bool), Trusted/Mach/MachTB
+    (2 ≤ b →
+      evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals declsBool
+        mem.callStack = .ok (.scalar ⟨b, 1⟩) locals' →
+      operandTy declsBool emptyLayoutTable op = some u8MirTy →
+      evalRvalue locals (.cast .subtype op boolMirTy) mem declsBool emptyLayoutTable = .ub ∧
+      transmuteM (M := BM) (.Int (Int.ofNat b)) u8MrTy .Bool mBM =
+        .error (.ub "transmuted value is not valid at new type") ∧
+      transmuteM (M := TBM) (.Int (Int.ofNat b)) u8MrTy .Bool mTB =
+        .error (.ub "transmuted value is not valid at new type")) := by
+  intro declsPtr declsInt declsBool
+  refine ⟨?_, ?_, ?_⟩
+  · intro hOp hSrcTy
+    refine ⟨?_,
+      evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM,
+      evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB mTB⟩
+    have hEnc : encodeByteCastSourceBytes emptyLayoutTable rawMutU32MirTy (.ptr p 8) =
+        some (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) := rfl
+    have hLen : length (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) = 8 :=
+      encodeLittleEndianBytes_len p.offsetBytes 8 _
+    have h256 : p.offsetBytes < 256 ^ 8 := by
+      rw [show (256 : Nat) ^ 8 = 2 ^ 64 by decide]; exact hpOff
+    have hDecAux : ∀ bs, length bs = 8 →
+        decodeLittleEndianBytes bs = some (p.offsetBytes, some (p.allocId, p.tag)) →
+        abstractBytesUniformProv bs = true →
+        decodePtrBytesNoForge false (.uint .u32) 8 bs = some (.ptr p 8) := by
+      intro bs hl hd hu; unfold decodePtrBytesNoForge decodeScalarBytes; simp [hl, hd, hu]
+    have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable rawConstU32MirTy
+        (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) = some (.ptr p 8) :=
+      hDecAux _ hLen
+        (by rw [decodeLittleEndianBytes_encode, Nat.mod_eq_of_lt h256]; rfl)
+        (abstractBytesAllProvAux_encode p.allocId p.tag (Nat.div p.offsetBytes 256) 7)
+    have hResDst : resolveTyWithLocalDecls declsPtr emptyLayoutTable rawConstU32MirTy =
+        rawConstU32MirTy := rfl
+    have hResSrc : resolveTyWithLocalDecls declsPtr emptyLayoutTable rawMutU32MirTy =
+        rawMutU32MirTy := rfl
+    have hSzDst : tyByteSize declsPtr emptyLayoutTable rawConstU32MirTy = some 8 := rfl
+    have hSzSrc : tyByteSize declsPtr emptyLayoutTable rawMutU32MirTy = some 8 := rfl
+    show evalByteCast locals op rawConstU32MirTy mem declsPtr emptyLayoutTable = _
+    unfold evalByteCast
+    simp only [hOp, hResDst, hSzDst, hSrcTy, hResSrc, hSzSrc, hEnc, hLen, hDec, Nat.beq_refl]
+  · intro hOp hSrcTy
+    refine ⟨?_, transmuteM_u32_to_i32 bits hBits mBM, transmuteM_u32_to_i32 bits hBits mTB⟩
+    have hEnc : encodeByteCastSourceBytes emptyLayoutTable u32MirTy (.scalar ⟨bits, 4⟩) =
+        some (encodeLittleEndianBytes bits 4 none) := rfl
+    have hLen : length (encodeLittleEndianBytes bits 4 none) = 4 :=
+      encodeLittleEndianBytes_len bits 4 none
+    have h256 : bits < 256 ^ 4 := by
+      rw [show (256 : Nat) ^ 4 = 2 ^ 32 by decide]; exact hBits
+    have hDecAux : ∀ bs, length bs = 4 →
+        decodeLittleEndianBytes bs = some (bits, none) →
+        decodeValueFromBytes 16 emptyLayoutTable i32MirTy bs = some (.scalar ⟨bits, 4⟩) := by
+      intro bs hl hd; unfold decodeValueFromBytes decodeScalarBytes; simp [i32MirTy, hl, hd]; rfl
+    have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable i32MirTy
+        (encodeLittleEndianBytes bits 4 none) = some (.scalar ⟨bits, 4⟩) :=
+      hDecAux _ hLen (by rw [decodeLittleEndianBytes_encode, Nat.mod_eq_of_lt h256]; rfl)
+    have hResDst : resolveTyWithLocalDecls declsInt emptyLayoutTable i32MirTy = i32MirTy := rfl
+    have hResSrc : resolveTyWithLocalDecls declsInt emptyLayoutTable u32MirTy = u32MirTy := rfl
+    have hSzDst : tyByteSize declsInt emptyLayoutTable i32MirTy = some 4 := rfl
+    have hSzSrc : tyByteSize declsInt emptyLayoutTable u32MirTy = some 4 := rfl
+    show evalByteCast locals op i32MirTy mem declsInt emptyLayoutTable = _
+    unfold evalByteCast
+    simp only [hOp, hResDst, hSzDst, hSrcTy, hResSrc, hSzSrc, hEnc, hLen, hDec, Nat.beq_refl]
+  · intro hGe hOp hSrcTy
+    refine ⟨?_, (transmuteM_u8_to_bool b hb mBM).2.2 hGe,
+      (transmuteM_u8_to_bool b hb mTB).2.2 hGe⟩
+    have hEnc : encodeByteCastSourceBytes emptyLayoutTable u8MirTy (.scalar ⟨b, 1⟩) =
+        some (encodeLittleEndianBytes b 1 none) := rfl
+    have hLen : length (encodeLittleEndianBytes b 1 none) = 1 :=
+      encodeLittleEndianBytes_len b 1 none
+    have hB : (UInt8.ofNat b).toBitVec.toNat = b := by
+      change (UInt8.ofNat b).toNat = b; rw [UInt8.toNat_ofNat']; exact Nat.mod_eq_of_lt hb
+    have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable boolMirTy
+        (encodeLittleEndianBytes b 1 none) = none := by
+      change (match (UInt8.ofNat b).toBitVec.toNat.beq 0 with
+        | true => some (MirSemantics.Value.scalar ⟨0, 1⟩)
+        | false =>
+          match (UInt8.ofNat b).toBitVec.toNat.beq 1 with
+          | true => some (MirSemantics.Value.scalar ⟨1, 1⟩)
+          | false => none) = none
+      rw [hB]
+      cases b with
+      | zero => exact absurd hGe (by decide)
+      | succ k => cases k with | zero => exact absurd hGe (by decide) | succ _ => rfl
+    have hResDst : resolveTyWithLocalDecls declsBool emptyLayoutTable boolMirTy = boolMirTy := rfl
+    have hResSrc : resolveTyWithLocalDecls declsBool emptyLayoutTable u8MirTy = u8MirTy := rfl
+    have hSzDst : tyByteSize declsBool emptyLayoutTable boolMirTy = some 1 := rfl
+    have hSzSrc : tyByteSize declsBool emptyLayoutTable u8MirTy = some 1 := rfl
+    show evalByteCast locals op boolMirTy mem declsBool emptyLayoutTable = .ub
+    unfold evalByteCast
+    simp only [hOp, hResDst, hSzDst, hSrcTy, hResSrc, hSzSrc, hEnc, hLen, hDec, Nat.beq_refl]
 
-/-- `NonZeroU8` MiniRust `Type.Enum` rejecting byte `0` (modeled identically to
-`Translate.orderingTy` with `.Invalid` fallback at `0`). -/
+/-- `NonZeroU8` MiniRust `Type.Enum` rejecting byte `0` (`.Invalid`). -/
 def nonZeroU8MrTy : Gen.Type :=
   let unitV : Gen.Type := .Tuple [] ⟨⟨1⟩, ⟨1⟩, none⟩ none
-  .Enum
-    ⟨[(1, ⟨unitV, ⟨[(⟨0⟩, (⟨.Unsigned, ⟨1⟩⟩, 1))]⟩⟩),
-      (7, ⟨unitV, ⟨[(⟨0⟩, (⟨.Unsigned, ⟨1⟩⟩, 7))]⟩⟩)]⟩
-    ⟨.Unsigned, ⟨1⟩⟩
-    (.Branch ⟨0⟩ ⟨.Unsigned, ⟨1⟩⟩ .Invalid
-      ⟨[((1, 2), .Known 1), ((7, 8), .Known 7)]⟩)
+  .Enum ⟨[(1, ⟨unitV, ⟨[(⟨0⟩, (⟨.Unsigned, ⟨1⟩⟩, 1))]⟩⟩),
+          (7, ⟨unitV, ⟨[(⟨0⟩, (⟨.Unsigned, ⟨1⟩⟩, 7))]⟩⟩)]⟩
+    ⟨.Unsigned, ⟨1⟩⟩ (.Branch ⟨0⟩ ⟨.Unsigned, ⟨1⟩⟩ .Invalid ⟨[((1, 2), .Known 1), ((7, 8), .Known 7)]⟩)
     ⟨1⟩ ⟨1⟩
 
 /-- `NonZeroU8` Anneal `TypeLayout` (1-field struct enforcing `validRange := ⟨1,
 255⟩`). -/
 def nonZeroU8MirLayout : TypeLayout :=
-  { size := ⟨1⟩
-    align := ⟨1⟩
-    backendRepr := .scalar (.initialized (.int 8 false) ⟨1, 255⟩)
-    fields := .arbitrary [⟨0⟩] [0]
-    variants := .single 0
-    isUninhabited := false }
+  { size := ⟨1⟩, align := ⟨1⟩, backendRepr := .scalar (.initialized (.int 8 false) ⟨1, 255⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false }
 
 def nonZeroU8Layouts : LayoutTable :=
   { pointerBits := 64, isLittleEndian := true, entries := [nonZeroU8MirLayout] }
-
 @[reducible] def nonZeroU8MirTy : MirAst.Ty :=
   { kind := .adt "core::num::nonzero::NonZero" [.uint .u8], layoutIdx := 0 }
 
 def c7SubtypeU32ToI32Mir : MirAst.CapturedMir :=
   mkMirBody "ep2::c7_subtype_u32_i32" [mkDecl i32MirTy, mkDecl u32MirTy] 1
     [mkBb [mkSt (.assign (locPlace 0) (.cast .subtype (.copy (locPlace 1)) i32MirTy))] .return_]
-
 def c7SubtypeU8ToBoolMir : MirAst.CapturedMir :=
   mkMirBody "ep2::c7_subtype_u8_bool" [mkDecl boolMirTy, mkDecl u8MirTy] 1
     [mkBb [mkSt (.assign (locPlace 0) (.cast .subtype (.copy (locPlace 1)) boolMirTy))] .return_]
-
 def c7SubtypeU8ToNzMir : MirAst.CapturedMir :=
   mkMirBody "ep2::c7_subtype_u8_nz" [mkDecl nonZeroU8MirTy, mkDecl u8MirTy] 1
-    [mkBb [mkSt (.assign (locPlace 0) (.cast .subtype (.copy (locPlace 1)) nonZeroU8MirTy))]
-      .return_]
+    [mkBb [mkSt (.assign (locPlace 0) (.cast .subtype (.copy (locPlace 1)) nonZeroU8MirTy))] .return_]
     nonZeroU8Layouts
 
 def c7MkTransmuteMach (srcTy dstTy : Gen.Type) (srcBytes : List Byte) (sz : Nat) : Mach :=
-  let fn := mkMrFn [(localName 0, dstTy), (localName 1, srcTy)]
-    [localName 1] (localName 0)
-    [(bbName 0,
-      ⟨[.Assign (.Local (localName 0))
-          (.UnOp (.Cast (.Transmute dstTy)) (.Load (.Local (localName 1))))],
-       .Return, .Regular⟩)]
-  let alloc0 := mkStackAlloc 128 (List.replicate sz .Uninit) sz
-  let alloc1 := mkStackAlloc 256 srcBytes sz
-  let fr : Frame :=
-    { func := fn
-      locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
-                  (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]⟩
-      stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach (mkMrProg [(fnName 0, fn)]) [alloc0, alloc1] [fr]
+  let fn := mkMrFn [(localName 0, dstTy), (localName 1, srcTy)] [localName 1] (localName 0)
+    [(bbName 0, ⟨[.Assign (.Local (localName 0))
+        (.UnOp (.Cast (.Transmute dstTy)) (.Load (.Local (localName 1))))], .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate sz .Uninit) sz, mkStackAlloc 256 srcBytes sz]
+    [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+                     (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]]
 
 /-- **C7 Concrete Positive & Invalid-Bit-Pattern UB Witness (`Mach` &
-`MachTB`)**:
-- `u32(42) → i32(42)` via `CastKind.subtype` ↔ MiniRust `Transmute i32`.
-- `u8(1) → bool(true)` valid lockstep vs. `u8(2) → bool` **lockstep UB**.
-- `u8(7) → NonZeroU8` valid lockstep vs. `u8(0) → NonZeroU8` **lockstep UB**. -/
+`MachTB`)**: `u32(42)→i32(42)`, `u8(1)→bool(true)` vs. `u8(2)→bool` UB, and
+`u8(7)→NonZeroU8` vs. `u8(0)→NonZeroU8` UB. -/
 theorem c7_subtype_positive_and_invalid_ub_three_way_witness :
     runAVal c7SubtypeU32ToI32Mir 4 (initMachineState c7SubtypeU32ToI32Mir [.scalar ⟨42, 4⟩]) =
       some (.scalar ⟨42, 4⟩) ∧
     (∃ m1, Interp.step (c7MkTransmuteMach u32MrTy i32MrTy (scalarBytes u32 42) 4) = .ok m1 ∧
       m1.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 42)) ∧
     (∃ m1, Interp.stepTB (liftMachToTB (c7MkTransmuteMach u32MrTy i32MrTy (scalarBytes u32 42) 4)) =
-      .ok m1 ∧
-      m1.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
+      .ok m1 ∧ m1.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
         some ((scalarBytes u32 42).map (projByteTB ∘ liftByteTB))) ∧
     runAVal c7SubtypeU8ToBoolMir 4 (initMachineState c7SubtypeU8ToBoolMir [.scalar ⟨1, 1⟩]) =
       some (.scalar ⟨1, 1⟩) ∧
@@ -2640,8 +2554,7 @@ theorem c7_subtype_positive_and_invalid_ub_three_way_witness :
     (∃ m1, Interp.step (c7MkTransmuteMach u8MrTy nonZeroU8MrTy [.Init 7 none] 1) = .ok m1 ∧
       m1.mem.memory.allocations[0]?.map (·.data) = some [.Init 7 none]) ∧
     (∃ m1, Interp.stepTB (liftMachToTB (c7MkTransmuteMach u8MrTy nonZeroU8MrTy [.Init 7 none] 1)) =
-      .ok m1 ∧
-      m1.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
+      .ok m1 ∧ m1.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
         some [.initNoProv 7]) ∧
     stepMirFn c7SubtypeU8ToNzMir (initMachineState c7SubtypeU8ToNzMir [.scalar ⟨0, 1⟩]) =
       MirStepNode.fail .ub ∧
@@ -2649,17 +2562,10 @@ theorem c7_subtype_positive_and_invalid_ub_three_way_witness :
       .error (.ub "transmuted value is not valid at new type") ∧
     Interp.stepTB (liftMachToTB (c7MkTransmuteMach u8MrTy nonZeroU8MrTy [.Init 0 none] 1)) =
       .error (.ub "transmuted value is not valid at new type") :=
-  ⟨rfl,
-   ok_of_map_toOption (by decide +kernel),
-   ok_of_map_toOption (by decide +kernel),
-   rfl, rfl,
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   rfl,
-   ok_of_map_toOption (by decide +kernel),
-   ok_of_map_toOption (by decide +kernel),
-   rfl,
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
+  ⟨rfl, ok_of_map_toOption (by decide +kernel), ok_of_map_toOption (by decide +kernel),
+   rfl, rfl, eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), rfl, ok_of_map_toOption (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), rfl, eq_error_ub_of_interpUbMsg (by decide +kernel),
    eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
 /-! ## §8 (`C8`): Exhaustive 5 Non-`Unsize` `CastKind.pointerCoercion` Kinds -/
@@ -2677,13 +2583,12 @@ theorem translateRvalue_pointerCoercion_none
 /-- **C8.1 & C8.2 (`ReifyFnPointer` & `ClosureFnPointer`) Universal Two-Sided
 Lockstep & Strict-Check UB Law (`Mach` & `MachTB`)**:
 Couples Trusted `evalRvalue ... (.cast (.pointerCoercion ck) op targetTy)`
-(`evalReifyFnPointer` + `internFnPtr` across `"ReifyFnPointer"`,
-`"ReifyFnPointer(Safe)"`, `"ReifyFnPointer(Unsafe)"`, `"ClosureFnPointer"`,
-`"ClosureFnPointer(Safe)"`, and `"ClosureFnPointer(Unsafe)"`) directly with
-MiniRust `evalConstantM` / `evalValueM` on `Constant.FnPointer fnNm` (`Mach` &
-`MachTB`), plus universal `.ub` characterization for non-ZST/capturing closures,
-safety mismatches (`"ReifyFnPointer(Safe)"` → `.unsafe_`), and
-`.rustIntrinsic`. -/
+(`evalReifyFnPointer` + `internFnPtr` across ALL 6 reify/closure coercion tags,
+for BOTH `fnDef` ZST values `.unit` AND 0-capture closure values `.aggregate 0
+[]`!) directly with MiniRust `evalConstantM` / `evalValueM` on
+`Constant.FnPointer fnNm` (`Mach` & `MachTB`), plus universal `.ub`
+characterization for safety mismatches (`"ReifyFnPointer(Safe)"` → `.unsafe_`),
+`.rustIntrinsic` ABI targets, and capturing closures. -/
 theorem reify_and_closure_fnPointer_lockstep_M
     {M : Type} [Gen.Memory M] [MemoryOps M]
     (locals locals' : List LocalSlot) (op : MirAst.Operand)
@@ -2692,11 +2597,13 @@ theorem reify_and_closure_fnPointer_lockstep_M
     (fnIns : List RigidTy) (fnOut : RigidTy) (fnSaf : Safety) (fnAbi : CallConv)
     (m : Machine M) (fnNm : Gen.FnName) (mrPtr : ThinPointer (Gen.Memory.Provenance M)) :
     let targetTy : MirAst.Ty := { kind := .fnPtr fnIns fnOut fnSaf fnAbi, layoutIdx := 0 }
-    -- (1) Positive two-sided lockstep (`internFnPtr` ↔ `Constant.FnPointer`)
-    (isReifyFnPointerCoercion ck = true →
+    -- (1) Positive two-sided lockstep for BOTH `.unit` (fnDef) and
+    -- `.aggregate 0 []` (0-capture closure)
+    (∀ zstVal, (zstVal = .unit ∨ zstVal = .aggregate 0 []) →
+      isReifyFnPointerCoercion ck = true →
       stringEq ck "UnsafeFnPointer" = false →
       evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
-        (callStack := mem.callStack) = .ok (.aggregate 0 []) locals' →
+        (callStack := mem.callStack) = .ok zstVal locals' →
       callConvEq fnAbi .rustIntrinsic = false →
       reifyCoercionSafetyCompatible ck fnSaf = true →
       extractReifyCoercionTarget? ck (operandTy decls layouts op) = some (dp, targs) →
@@ -2713,68 +2620,88 @@ theorem reify_and_closure_fnPointer_lockstep_M
         (callStack := mem.callStack) = .ok .unit locals' →
       evalRvalue locals (.cast (.pointerCoercion "ReifyFnPointer(Safe)") op fnPtrUnsafeU32MirTy)
         mem decls layouts = .ub) ∧
-    -- (3) Capturing closure UB (`ClosureFnPointer` on non-empty capture list)
+    -- (3) `.rustIntrinsic` ABI target UB
+    (evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+        (callStack := mem.callStack) = .ok .unit locals' →
+      evalRvalue locals (.cast (.pointerCoercion "ReifyFnPointer") op fnPtrIntrinsicU32MirTy)
+        mem decls layouts = .ub) ∧
+    -- (4) Capturing closure UB (`ClosureFnPointer` on non-empty capture list)
     (∀ v0 vs,
       evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
         (callStack := mem.callStack) = .ok (.aggregate 0 (v0 :: vs)) locals' →
       evalRvalue locals (.cast (.pointerCoercion "ClosureFnPointer") op targetTy)
         mem decls layouts = .ub) := by
   intro targetTy
-  refine ⟨?_, ?_, ?_⟩
-  · intro hReify hNotUnsafe hOp hAbi hSaf hExt hSig hLookup
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro zstVal hZst hReify hNotUnsafe hOp hAbi hSaf hExt hSig hLookup
     refine ⟨?_, ?_⟩
     · show evalReifyFnPointer locals op targetTy mem decls layouts ck = _
       unfold evalReifyFnPointer
-      simp only [hReify, hNotUnsafe, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self,
-        hExt, hSig]
+      rcases hZst with rfl | rfl <;>
+        simp only [hReify, hNotUnsafe, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self,
+          hExt, hSig]
     · unfold evalValueM evalConstantM
       simp only [hLookup, bind, Except.bind, pure, Except.pure, and_self]
   · intro hOp
-    have h1 : isReifyFnPointerCoercion "ReifyFnPointer(Safe)" = true := rfl
-    have h2 : stringEq "ReifyFnPointer(Safe)" "UnsafeFnPointer" = false := rfl
-    have h3 : reifyCoercionSafetyCompatible "ReifyFnPointer(Safe)" .unsafe_ = false := rfl
     show evalReifyFnPointer locals op fnPtrUnsafeU32MirTy mem decls layouts
       "ReifyFnPointer(Safe)" = .ub
     unfold evalReifyFnPointer
-    simp only [h1, h2, hOp, fnPtrUnsafeU32MirTy, h3, Bool.and_false]
+    simp only [show isReifyFnPointerCoercion "ReifyFnPointer(Safe)" = true from rfl,
+      show stringEq "ReifyFnPointer(Safe)" "UnsafeFnPointer" = false from rfl, hOp,
+      fnPtrUnsafeU32MirTy, show reifyCoercionSafetyCompatible "ReifyFnPointer(Safe)" .unsafe_ = false
+        from rfl, Bool.and_false]
+  · intro hOp
+    show evalReifyFnPointer locals op fnPtrIntrinsicU32MirTy mem decls layouts "ReifyFnPointer" = .ub
+    unfold evalReifyFnPointer
+    simp only [show isReifyFnPointerCoercion "ReifyFnPointer" = true from rfl,
+      show stringEq "ReifyFnPointer" "UnsafeFnPointer" = false from rfl, hOp,
+      fnPtrIntrinsicU32MirTy, show callConvEq .rustIntrinsic .rustIntrinsic = true from rfl,
+      Bool.not_true, Bool.false_and]
   · intro v0 vs hOp
-    have h1 : isReifyFnPointerCoercion "ClosureFnPointer" = true := rfl
-    have h2 : stringEq "ClosureFnPointer" "UnsafeFnPointer" = false := rfl
     show evalReifyFnPointer locals op targetTy mem decls layouts "ClosureFnPointer" = .ub
     unfold evalReifyFnPointer
-    simp only [h1, h2, hOp]
+    simp only [show isReifyFnPointerCoercion "ClosureFnPointer" = true from rfl,
+      show stringEq "ClosureFnPointer" "UnsafeFnPointer" = false from rfl, hOp]
 
-/-- **C8.3 (`UnsafeFnPointer`) Positive Two-Sided Lockstep & Strict-Check
+/-- **C8.3 (`UnsafeFnPointer`) Coupled Positive Lockstep & Strict-Check
 Divergences (`Mach` & `MachTB`)**:
-1. **Positive Lockstep**: When `op` evaluates to `.ptr p 8` at a `.safe` fn-ptr
-   type matching `.unsafe_` target `fnPtrUnsafeU32MirTy` (`offsetBytes = 0`,
-   `lookupBorrow = none`, valid `fnPtrs`), Trusted `evalUnsafeFnPointer`
+1. **Positive Lockstep (coupled via `FnPtrEntryRel` across empty AND non-empty
+   `mem.fnPtrs`)**: When `(mem, p)` and `(mBM/mTB, fnNm, addr, prov)` satisfy
+   `FnPtrEntryRel` and `op` has matching `.safe` fn-ptr type + valid `fnPtrs`
+   entry (covering post-`ReifyFnPointer` states!), Trusted `evalUnsafeFnPointer`
    returns `.ok (.ptr p 8) locals' mem` in lockstep with MiniRust `Transmute
    thinRawPtrTy` on BOTH `Mach` and `MachTB`.
-2. **Strict-Check Divergences**: Trusted faults with `.ub` when coercing to a
-   `.safe` target, coercing an already-`.unsafe_` source fn pointer
-   (`.unsafe_ → .unsafe_`), or coercing to `rustIntrinsic` ABI — whereas
-   MiniRust erases fn-ptr safety/ABI into `thinRawPtrTy` so `Transmute` succeeds
-   on `Mach` and `MachTB`.
-3. **Unrecognized Coercion Tag**: tags outside the 6 recognized coercion
-   families (e.g., `"UnsafeFnPointer(Unsafe)"`) return `.unsupported`. -/
+2. **Strict-Check Divergences**: Trusted faults with `.ub` on `.safe` targets,
+   already-`.unsafe_` sources, or `rustIntrinsic` ABI targets — whereas MiniRust
+   erases fn-ptr safety/ABI into `thinRawPtrTy` so `Transmute` succeeds.
+3. **Unrecognized Coercion Tag**: returns `.unsupported`. -/
 theorem unsafeFnPointer_ground_truth_and_divergences
     (locals locals' : List LocalSlot) (op : MirAst.Operand)
     (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
-    (p : ProvenancePtr) (addr : Nat) (hAddr : addr < 2 ^ 64)
+    (p : ProvenancePtr) (fnNm : Gen.FnName) (addr : Nat)
     (provBM : Option Prov) (provTB : Option TreeBorrowsProvenance)
+    (mBM : Mach) (mTB : MachTB)
+    (hRelBM : FnPtrEntryRel mem p mBM fnNm addr provBM)
+    (hRelTB : FnPtrEntryRel mem p mTB fnNm addr provTB)
     (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals decls
       mem.callStack = .ok (.ptr p 8) locals') :
     isReifyFnPointerCoercion "UnsafeFnPointer" = true ∧
     evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op fnPtrUnsafeU32MirTy)
       mem decls layouts =
       evalUnsafeFnPointer locals op fnPtrUnsafeU32MirTy mem decls layouts ∧
-    -- Positive safe -> unsafe lockstep
+    -- Positive safe -> unsafe lockstep (both empty AND populated mem.fnPtrs!)
     (operandTy decls layouts op = some fnPtrSafeU32MirTy →
-      p.offsetBytes = 0 →
-      lookupBorrow mem.borrows p.tag = none →
-      mem.fnPtrs = [] →
-      isFnPtrAllocId p.allocId = true →
+      (match mem.fnPtrs with
+       | [] => isFnPtrAllocId p.allocId
+       | _ :: _ =>
+         match lookupFnPtr mem.fnPtrs p.allocId with
+         | none => false
+         | some e =>
+           match e.fnSig with
+           | none => true
+           | some (.fnPtr ins out .safe abi) =>
+             callConvEq abi .rust && rigidTyListEq ins [.uint .u32] && rigidTyEq out (.uint .u32)
+           | some _ => false) = true →
       evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op fnPtrUnsafeU32MirTy)
         mem decls layouts = .ok (.ptr p 8) locals' mem) ∧
     -- Strict-check UB (safe target, already-unsafe source, intrinsic target)
@@ -2786,35 +2713,69 @@ theorem unsafeFnPointer_ground_truth_and_divergences
     evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op
         { kind := .fnPtr [.uint .u32] (.uint .u32) .unsafe_ .rustIntrinsic, layoutIdx := 0 })
       mem decls layouts = .ub ∧
-    -- MiniRust type-erased Transmute succeeds on Mach & MachTB
+    -- MiniRust fn_ptrs lookup & type-erased Transmute succeed on Mach & MachTB
+    evalConstantM mBM (.FnPointer fnNm) =
+      .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none)) ∧
+    evalConstantM mTB (.FnPointer fnNm) =
+      .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none)) ∧
     evalCastOp (.Transmute thinRawPtrTy)
-      (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) none =
+      (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy)
+      (some mBM) =
       .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) ∧
     evalCastOpM (M := TBM) (.Transmute thinRawPtrTy)
-      (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) none =
+      (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy)
+      (some mTB) =
       .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) ∧
     evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer(Unsafe)") op fnPtrUnsafeU32MirTy)
       mem decls layouts = .unsupported := by
+  rcases hRelBM with ⟨hOff, hNoB, hAddr, hMapBM⟩
+  rcases hRelTB with ⟨_, _, _, hMapTB⟩
   refine ⟨rfl, rfl, ?_, ?_, ?_, ?_,
-    evalCastOp_transmute_thinRawPtr_id addr hAddr provBM none,
-    evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB none, rfl⟩
-  · intro hSrc hOff hNoB hFps hFnId
+    by unfold evalConstantM; simp only [hMapBM, bind, Except.bind, pure, Except.pure],
+    by unfold evalConstantM; simp only [hMapTB, bind, Except.bind, pure, Except.pure],
+    evalCastOp_transmute_thinRawPtr_id addr hAddr provBM (some mBM),
+    evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB (some mTB), rfl⟩
+  · intro hSrc hFnAlloc
     show evalUnsafeFnPointer locals op fnPtrUnsafeU32MirTy mem decls layouts = _
     unfold evalUnsafeFnPointer
-    simp [hOp, hSrc, hOff, hNoB, hFps, hFnId, fnPtrUnsafeU32MirTy, fnPtrSafeU32MirTy,
-      callConvEq, rigidTyListEq, rigidTyEq]
+    simp only [hOp, hSrc, hOff, hNoB, fnPtrUnsafeU32MirTy, fnPtrSafeU32MirTy,
+      callConvEq, rigidTyListEq, rigidTyEq, Nat.beq_refl]
+    have hB : ∀ b : Bool, b = true →
+        (match Bool.and true (Bool.and true (Bool.and true b)) with
+         | true => RvalueEvalResult.ok (.ptr p 8) locals' mem
+         | false => .ub) = .ok (.ptr p 8) locals' mem := by
+      intro b hb; subst hb; rfl
+    apply hB
+    cases hF : mem.fnPtrs with
+    | nil => simpa [hF] using hFnAlloc
+    | cons fh ft =>
+      rw [hF] at hFnAlloc
+      dsimp only [] at hFnAlloc ⊢
+      cases hL : lookupFnPtr (fh :: ft) p.allocId with
+      | none => simp [hL] at hFnAlloc
+      | some e =>
+        rw [hL] at hFnAlloc
+        dsimp only [] at hFnAlloc ⊢
+        cases hS : e.fnSig with
+        | none => simp [hS]
+        | some rty =>
+          rw [hS] at hFnAlloc
+          cases rty with
+          | fnPtr ins out saf abi =>
+            cases saf with
+            | safe =>
+              simpa [hS, callConvEq, rigidTyListEq, rigidTyEq, Bool.and_assoc] using hFnAlloc
+            | unsafe_ => simp at hFnAlloc
+          | _ => simp at hFnAlloc
   · show evalUnsafeFnPointer locals op fnPtrSafeU32MirTy mem decls layouts = .ub
-    unfold evalUnsafeFnPointer
-    simp [hOp, fnPtrSafeU32MirTy]
+    unfold evalUnsafeFnPointer; simp [hOp, fnPtrSafeU32MirTy]
   · intro hAlreadyUnsafe
     show evalUnsafeFnPointer locals op fnPtrUnsafeU32MirTy mem decls layouts = .ub
-    unfold evalUnsafeFnPointer
-    simp [hOp, hAlreadyUnsafe, fnPtrUnsafeU32MirTy, callConvEq]
+    unfold evalUnsafeFnPointer; simp [hOp, hAlreadyUnsafe, fnPtrUnsafeU32MirTy, callConvEq]
   · show evalUnsafeFnPointer locals op
       { kind := .fnPtr [.uint .u32] (.uint .u32) .unsafe_ .rustIntrinsic, layoutIdx := 0 }
       mem decls layouts = .ub
-    unfold evalUnsafeFnPointer
-    simp [hOp, callConvEq]
+    unfold evalUnsafeFnPointer; simp [hOp, callConvEq]
 
 private theorem mutToConst_dispatch_flags :
     isReifyFnPointerCoercion "MutToConstPointer" = false ∧
@@ -2875,6 +2836,14 @@ theorem mutToConstPointer_all_shapes_and_ub
       evalCastOpM (M := TBM) (.Transmute wideSlicePtrMrTy)
         (mrWidePtrValM { addr := addr, provenance := provTB } (len : Int), wideSlicePtrMrTy) mTB =
         .ok (mrWidePtrValM { addr := addr, provenance := provTB } (len : Int), wideSlicePtrMrTy)) ∧
+    -- (c') Provenance-free wide slice pointer preservation
+    (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls
+        mem.callStack = .ok (.aggregate 0 [.scalar ⟨addr, 8⟩, .scalar ⟨len, 8⟩]) locals' →
+      operandTy decls emptyLayoutTable op = some rawMutSliceU32MirTy →
+      evalRvalue locals (.cast (.pointerCoercion "MutToConstPointer") op rawConstSliceU32MirTy)
+        mem decls emptyLayoutTable =
+        .ok (.aggregate 0 [.scalar ⟨wrapScalarBits addr (scalarModulus 8), 8⟩,
+                           .scalar ⟨wrapScalarBits len (scalarModulus 8), 8⟩]) locals' mem) ∧
     -- (d) Wide dyn-vtable pointer preservation (*mut dyn Tr -> *const dyn Tr)
     (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls
         mem.callStack = .ok (.aggregate 0 [.ptr p 8, .ptr vt 8]) locals' →
@@ -2897,20 +2866,17 @@ theorem mutToConstPointer_all_shapes_and_ub
           "check_ptr_metadata for vtable pointer metadata (Machine::vtable_from_ptr)")) := by
   obtain ⟨h1, h2, h3, h4⟩ := mutToConst_dispatch_flags
   have hL8 : layoutPointerBytes emptyLayoutTable = 8 := rfl
-  refine ⟨?_, ?_, ?_, ?_, ?_, ⟨rfl, fun _ => rfl⟩⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ⟨rfl, fun _ => rfl⟩⟩
   · intro hOp hTy
     have hSh : mutToConstTargetShape? (some rawMutU32MirTy) rawConstU32MirTy = some none := rfl
-    refine ⟨?_,
-      evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM,
+    refine ⟨?_, evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM,
       evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB mTB⟩
     show evalReifyFnPointer locals op rawConstU32MirTy mem decls emptyLayoutTable "MutToConstPointer" = _
-    unfold evalReifyFnPointer
-    simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh, Nat.beq_refl]
+    unfold evalReifyFnPointer; simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh, Nat.beq_refl]
   · intro hOp hTy
     have hSh : mutToConstTargetShape? (some rawMutU32MirTy) rawConstU32MirTy = some none := rfl
     show evalReifyFnPointer locals op rawConstU32MirTy mem decls emptyLayoutTable "MutToConstPointer" = _
-    unfold evalReifyFnPointer
-    simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh, Nat.beq_refl]
+    unfold evalReifyFnPointer; simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh, Nat.beq_refl]
   · intro hOp hTy
     have hSh : mutToConstTargetShape? (some rawMutSliceU32MirTy) rawConstSliceU32MirTy =
         some (some false) := rfl
@@ -2921,39 +2887,39 @@ theorem mutToConstPointer_all_shapes_and_ub
     unfold evalReifyFnPointer
     simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh, annealWidePtrVal, Nat.beq_refl, Bool.and_self]
   · intro hOp hTy
-    have hSh : mutToConstTargetShape? (some rawMutDynMirTy) rawConstDynMirTy =
-        some (some true) := rfl
+    have hSh : mutToConstTargetShape? (some rawMutSliceU32MirTy) rawConstSliceU32MirTy =
+        some (some false) := rfl
+    show evalReifyFnPointer locals op rawConstSliceU32MirTy mem decls emptyLayoutTable "MutToConstPointer" = _
+    unfold evalReifyFnPointer; simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh, Nat.beq_refl, Bool.and_self]
+  · intro hOp hTy
+    have hSh : mutToConstTargetShape? (some rawMutDynMirTy) rawConstDynMirTy = some (some true) := rfl
     show evalReifyFnPointer locals op rawConstDynMirTy mem decls emptyLayoutTable "MutToConstPointer" = _
-    unfold evalReifyFnPointer
-    simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh, Nat.beq_refl, Bool.and_self]
+    unfold evalReifyFnPointer; simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh, Nat.beq_refl, Bool.and_self]
   · intro hOp
     have hShape : ∀ s, mutToConstTargetShape? s rawConstSliceU32MirTy ≠ some none := by
-      intro s
-      cases s with
+      intro s; cases s with
       | none => decide
-      | some ty =>
-        cases ty with
-        | mk kind lidx =>
+      | some ty => cases ty with
+        | mk kind _ =>
           cases kind <;> simp [mutToConstTargetShape?, rawConstSliceU32MirTy, isWideRawPtrTy]
           all_goals split <;> simp
     show evalReifyFnPointer locals op rawConstSliceU32MirTy mem decls emptyLayoutTable "MutToConstPointer" = .ub
-    unfold evalReifyFnPointer
-    simp only [h1, h2, h3, h4, hL8, hOp]
+    unfold evalReifyFnPointer; simp only [h1, h2, h3, h4, hL8, hOp]
     cases hS : mutToConstTargetShape? (operandTy decls emptyLayoutTable op) rawConstSliceU32MirTy with
     | none => rfl
-    | some o =>
-      cases o with
-      | none => exact absurd hS (hShape _)
-      | some _ => rfl
+    | some o => cases o with | none => exact absurd hS (hShape _) | some _ => rfl
 
 /-- **C8.5 (`ArrayToPointer`) Coupled Two-Sided Preservation (Global,
-Stack-Borrow `deriveStackElemThinPtr`, Scalar) & UB**:
+Stack-Borrow `deriveStackElemThinPtr` Positive Subslice-Tag Minting +
+`.disabled` UB, Scalar) & Const-to-Mut UB**:
 Couples Trusted `ArrayToPointer` directly with MiniRust `Transmute thinRawPtrTy`
-on `Mach` & `MachTB`, AND explicitly characterizes `deriveStackElemThinPtr` on
-both `.disabled` stack borrows (`.ub`) and live root `[u32; 2]` borrows at
-`offsetBytes = 0` (minting narrowed subslice tag `mem.nextTag` at
-`targetProjection := [.subslice 0 2 false]`, while MiniRust preserves the thin
-pointer unchanged). -/
+on `Mach` & `MachTB`, AND proves BOTH:
+1. `.disabled` stack borrow faults with `.ub`, AND
+2. Live non-disabled root `[u32; 2]` borrow at `offsetBytes = 0` mints narrowed
+   subslice tag `mem.nextTag` at `targetProjection := [.subslice 0 2 false]` and
+   returns `.ok (.ptr { allocId := mem.nextTag, offsetBytes := 0 } 8) locals'
+   mem'`, while MiniRust `Transmute thinRawPtrTy` preserves the thin pointer
+   unchanged on `Mach` & `MachTB`. -/
 theorem arrayToPointer_global_stack_scalar_and_ub
     (locals locals' : List LocalSlot) (op : MirAst.Operand)
     (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl)
@@ -2981,7 +2947,21 @@ theorem arrayToPointer_global_stack_scalar_and_ub
         mem decls emptyLayoutTable =
         deriveStackElemThinPtr locals' mem p parentEntry (some 2) 8 ∧
       (parentEntry.perm = .disabled →
-        deriveStackElemThinPtr locals' mem p parentEntry (some 2) 8 = .ub)) ∧
+        deriveStackElemThinPtr locals' mem p parentEntry (some 2) 8 = .ub) ∧
+      (∀ v0 v1,
+        parentEntry.perm ≠ .disabled →
+        parentEntry.targetProjection = [] →
+        p.offsetBytes = 0 →
+        parentEntry.targetFrameDepth = length mem.callStack →
+        get? locals' parentEntry.targetLocal =
+          some (.init (.aggregate 0 [.scalar ⟨v0, 4⟩, .scalar ⟨v1, 4⟩])) →
+        let subEntry : BorrowEntry :=
+          { tag := mem.nextTag, targetLocal := parentEntry.targetLocal,
+            targetFrameDepth := parentEntry.targetFrameDepth, allocDead := parentEntry.allocDead,
+            targetProjection := [.subslice 0 2 false], perm := parentEntry.perm }
+        deriveStackElemThinPtr locals' mem p parentEntry (some 2) 8 =
+          .ok (.ptr { allocId := mem.nextTag, offsetBytes := 0 } 8) locals'
+            { mem with borrows := subEntry :: mem.borrows, nextTag := mem.nextTag + 1 })) ∧
     (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls
         mem.callStack = .ok (.scalar ⟨addr, 8⟩) locals' →
       operandTy decls emptyLayoutTable op = some rawMutArr2U32MirTy →
@@ -2999,79 +2979,73 @@ theorem arrayToPointer_global_stack_scalar_and_ub
   have hArrBad : arrayToPointerElemLen? (some rawConstArr2U32MirTy) rawMutU32MirTy = none := rfl
   refine ⟨?_, ?_, ?_, ?_⟩
   · intro hOp hTy hNoB
-    refine ⟨?_,
-      evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM,
+    refine ⟨?_, evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM,
       evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB mTB⟩
     show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = _
-    unfold evalReifyFnPointer
-    simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, hNoB, Nat.beq_refl]
+    unfold evalReifyFnPointer; simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, hNoB, Nat.beq_refl]
   · intro parentEntry hOp hTy hB
-    refine ⟨?_, ?_⟩
+    refine ⟨?_, ?_, ?_⟩
     · show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = _
-      unfold evalReifyFnPointer
-      simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, hB, Nat.beq_refl]
-    · intro hDis
+      unfold evalReifyFnPointer; simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, hB, Nat.beq_refl]
+    · intro hDis; unfold deriveStackElemThinPtr; simp [hDis]
+    · intro v0 v1 hLive hProj hOff hDepth hSlot
+      have hAct : activeFrameSlot? locals' mem.callStack parentEntry.targetFrameDepth
+          parentEntry.targetLocal =
+          some (.init (.aggregate 0 [.scalar ⟨v0, 4⟩, .scalar ⟨v1, 4⟩])) := by
+        cases hCs : mem.callStack <;>
+          simp [activeFrameSlot?, hDepth, hCs, Nat.beq_refl, hSlot]
       unfold deriveStackElemThinPtr
-      simp [hDis]
+      cases hP : parentEntry.perm with
+      | disabled => exact absurd hP hLive
+      | _ =>
+        have hStr : inferElemListByteStride [.scalar ⟨v0, 4⟩, .scalar ⟨v1, 4⟩] = 4 := rfl
+        simp only [hProj, hOff, hAct, stripTransparentProjections, normalizeSubsliceProjections,
+          readSliceBackingAggregate?, hStr, byteOffsetToElemIdx?, endsWithSubslice,
+          Nat.add_zero, Nat.zero_add, Nat.ble, Nat.beq_refl]
+        rfl
   · intro hOp hTy
     show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = _
-    unfold evalReifyFnPointer
-    simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, Nat.beq_refl]
+    unfold evalReifyFnPointer; simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, Nat.beq_refl]
   · intro hOp hTy
     show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = .ub
-    unfold evalReifyFnPointer
-    simp only [h1, h2, h3, hL8, hOp, hTy, hArrBad, Nat.beq_refl]
+    unfold evalReifyFnPointer; simp only [h1, h2, h3, hL8, hOp, hTy, hArrBad, Nat.beq_refl]
 
 /-! ### C8 Concrete End-to-End Witnesses covering ALL 5 Coercion Kinds (`Mach` &
 `MachTB`) -/
 
 def c8AllFiveMir : MirAst.CapturedMir :=
   mkMirBody "ep2::c8_all_five"
-    [mkDecl rawConstU32MirTy,
-     mkDecl fnPtrSafeU32MirTy,
-     mkDecl fnPtrSafeU32MirTy,
-     mkDecl fnPtrUnsafeU32MirTy,
-     mkDecl arr2U32MirTy,
-     mkDecl rawMutArr2U32MirTy,
+    [mkDecl rawConstU32MirTy, mkDecl fnPtrSafeU32MirTy, mkDecl fnPtrSafeU32MirTy,
+     mkDecl fnPtrUnsafeU32MirTy, mkDecl arr2U32MirTy, mkDecl rawMutArr2U32MirTy,
      mkDecl rawMutU32MirTy] 0
     [mkBb
       [mkSt (.storageLive 1), mkSt (.storageLive 2), mkSt (.storageLive 3),
        mkSt (.storageLive 4), mkSt (.storageLive 5), mkSt (.storageLive 6),
-       mkSt (.assign (locPlace 1)
-         (.cast (.pointerCoercion "ReifyFnPointer")
-           (constZst (fnDefU32MirTy "ep2::target_fn")) fnPtrSafeU32MirTy)),
-       mkSt (.assign (locPlace 2)
-         (.cast (.pointerCoercion "ClosureFnPointer")
-           (constZst (closureZstMirTy "ep2::zst_closure")) fnPtrSafeU32MirTy)),
-       mkSt (.assign (locPlace 3)
-         (.cast (.pointerCoercion "UnsafeFnPointer")
-           (.copy (locPlace 1)) fnPtrUnsafeU32MirTy)),
+       mkSt (.assign (locPlace 1) (.cast (.pointerCoercion "ReifyFnPointer")
+         (constZst (fnDefU32MirTy "ep2::target_fn")) fnPtrSafeU32MirTy)),
+       mkSt (.assign (locPlace 2) (.cast (.pointerCoercion "ClosureFnPointer")
+         (constZst (closureZstMirTy "ep2::zst_closure")) fnPtrSafeU32MirTy)),
+       mkSt (.assign (locPlace 3) (.cast (.pointerCoercion "UnsafeFnPointer")
+         (.copy (locPlace 1)) fnPtrUnsafeU32MirTy)),
        mkSt (.assign (locPlace 4) (.aggregate (.array u32MirTy) [constU32 10, constU32 20])),
        mkSt (.assign (locPlace 5) (.rawPtr .mut (locPlace 4))),
-       mkSt (.assign (locPlace 6)
-         (.cast (.pointerCoercion "ArrayToPointer") (.copy (locPlace 5)) rawMutU32MirTy)),
-       mkSt (.assign (locPlace 0)
-         (.cast (.pointerCoercion "MutToConstPointer") (.copy (locPlace 6)) rawConstU32MirTy))]
+       mkSt (.assign (locPlace 6) (.cast (.pointerCoercion "ArrayToPointer")
+         (.copy (locPlace 5)) rawMutU32MirTy)),
+       mkSt (.assign (locPlace 0) (.cast (.pointerCoercion "MutToConstPointer")
+         (.copy (locPlace 6)) rawConstU32MirTy))]
       .return_]
 
 def c8MrFn : Gen.Function :=
-  mkMrFn
-    [(localName 0, thinRawPtrTy),
-     (localName 1, thinRawPtrTy),
-     (localName 2, thinRawPtrTy),
-     (localName 3, thinRawPtrTy),
-     (localName 4, .Array u32MrTy 2),
-     (localName 5, thinRawPtrTy),
-     (localName 6, thinRawPtrTy)]
-    [] (localName 0)
+  mkMrFn [(localName 0, thinRawPtrTy), (localName 1, thinRawPtrTy), (localName 2, thinRawPtrTy),
+          (localName 3, thinRawPtrTy), (localName 4, .Array u32MrTy 2),
+          (localName 5, thinRawPtrTy), (localName 6, thinRawPtrTy)] [] (localName 0)
     [(bbName 0,
       ⟨[.Assign (.Local (localName 1)) (.Constant (.FnPointer (fnName 1)) thinRawPtrTy),
         .Assign (.Local (localName 2)) (.Constant (.FnPointer (fnName 2)) thinRawPtrTy),
         .Assign (.Local (localName 3))
           (.UnOp (.Cast (.Transmute thinRawPtrTy)) (.Load (.Local (localName 1)))),
         .Assign (.Local (localName 4))
-          (.Tuple [.Constant (.Int 10) u32MrTy, .Constant (.Int 20) u32MrTy]
-            (.Array u32MrTy 2)),
+          (.Tuple [.Constant (.Int 10) u32MrTy, .Constant (.Int 20) u32MrTy] (.Array u32MrTy 2)),
         .Assign (.Local (localName 5)) (.AddrOf (.Local (localName 4)) (.Raw .None)),
         .Assign (.Local (localName 6))
           (.UnOp (.Cast (.Transmute thinRawPtrTy)) (.Load (.Local (localName 5)))),
@@ -3081,27 +3055,20 @@ def c8MrFn : Gen.Function :=
 
 def c8AllFiveMach : Mach :=
   let dummyTargetFn := mkMrFn [] [] (localName 0) [(bbName 0, ⟨[], .Return, .Regular⟩)]
-  let prog := mkMrProg [(fnName 0, c8MrFn), (fnName 1, dummyTargetFn), (fnName 2, dummyTargetFn)]
-  let fnAlloc1 := mkFnAlloc 4096
-  let fnAlloc2 := mkFnAlloc 8192
-  let a0 := mkStackAlloc 128 (List.replicate 8 .Uninit) 8
-  let a1 := mkStackAlloc 256 (List.replicate 8 .Uninit) 8
-  let a2 := mkStackAlloc 384 (List.replicate 8 .Uninit) 8
-  let a3 := mkStackAlloc 512 (List.replicate 8 .Uninit) 8
-  let a4 := mkStackAlloc 640 (List.replicate 8 .Uninit) 4
-  let a5 := mkStackAlloc 768 (List.replicate 8 .Uninit) 8
-  let a6 := mkStackAlloc 896 (List.replicate 8 .Uninit) 8
-  let fr : Frame :=
-    { func := c8MrFn
-      locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨2⟩, ()) }),
-                  (localName 1, { addr := 256, provenance := some (⟨3⟩, ()) }),
-                  (localName 2, { addr := 384, provenance := some (⟨4⟩, ()) }),
-                  (localName 3, { addr := 512, provenance := some (⟨5⟩, ()) }),
-                  (localName 4, { addr := 640, provenance := some (⟨6⟩, ()) }),
-                  (localName 5, { addr := 768, provenance := some (⟨7⟩, ()) }),
-                  (localName 6, { addr := 896, provenance := some (⟨8⟩, ()) })]⟩
-      stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach prog [fnAlloc1, fnAlloc2, a0, a1, a2, a3, a4, a5, a6] [fr]
+  let u8b := List.replicate 8 (AbstractByte.Uninit : Byte)
+  let fr := mkRootFrame c8MrFn
+    [(localName 0, { addr := 128, provenance := some (⟨2⟩, ()) }),
+     (localName 1, { addr := 256, provenance := some (⟨3⟩, ()) }),
+     (localName 2, { addr := 384, provenance := some (⟨4⟩, ()) }),
+     (localName 3, { addr := 512, provenance := some (⟨5⟩, ()) }),
+     (localName 4, { addr := 640, provenance := some (⟨6⟩, ()) }),
+     (localName 5, { addr := 768, provenance := some (⟨7⟩, ()) }),
+     (localName 6, { addr := 896, provenance := some (⟨8⟩, ()) })]
+  mkMrMach (mkMrProg [(fnName 0, c8MrFn), (fnName 1, dummyTargetFn), (fnName 2, dummyTargetFn)])
+    [mkFnAlloc 4096, mkFnAlloc 8192, mkStackAlloc 128 u8b 8, mkStackAlloc 256 u8b 8,
+     mkStackAlloc 384 u8b 8, mkStackAlloc 512 u8b 8, mkStackAlloc 640 u8b 4,
+     mkStackAlloc 768 u8b 8, mkStackAlloc 896 u8b 8]
+    [fr]
     [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) }),
      (fnName 2, { addr := 8192, provenance := some (⟨1⟩, ()) })]
 
@@ -3109,20 +3076,27 @@ theorem c8_all_five_pointer_coercions_three_way_witness :
     runAVal c8AllFiveMir 16 (initMachineState c8AllFiveMir []) =
       some (.ptr { allocId := 2, offsetBytes := 0 } 8) ∧
     (∃ m7, Interp.steps 7 c8AllFiveMach = .ok m7 ∧
-      ([3, 4, 5, 2].map (fun i => m7.mem.memory.allocations[i]?.map (fun a => a.data.map (projByteTB ∘ liftByteTB)))) =
-      [some ((ptrBytes 4096 (some (⟨0⟩, ()))).map (projByteTB ∘ liftByteTB)),
-       some ((ptrBytes 8192 (some (⟨1⟩, ()))).map (projByteTB ∘ liftByteTB)),
-       some ((ptrBytes 4096 (some (⟨0⟩, ()))).map (projByteTB ∘ liftByteTB)),
-       some ((ptrBytes 640 (some (⟨6⟩, ()))).map (projByteTB ∘ liftByteTB))]) ∧
+      ([3, 4, 5, 2].map (fun i => m7.mem.memory.allocations[i]?.map (·.data))) =
+      [some (ptrBytes 4096 (some (⟨0⟩, ()))), some (ptrBytes 8192 (some (⟨1⟩, ()))),
+       some (ptrBytes 4096 (some (⟨0⟩, ()))), some (ptrBytes 640 (some (⟨6⟩, ())))]) ∧
     (∃ m7, Interp.stepsTB 7 (liftMachToTB c8AllFiveMach) = .ok m7 ∧
+      MachTB.wfLive m7 ∧
       ([3, 4, 5, 2].map (fun i => m7.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
       [some ((ptrBytes 4096 (some (⟨0⟩, ()))).map (projByteTB ∘ liftByteTB)),
        some ((ptrBytes 8192 (some (⟨1⟩, ()))).map (projByteTB ∘ liftByteTB)),
        some ((ptrBytes 4096 (some (⟨0⟩, ()))).map (projByteTB ∘ liftByteTB)),
-       some ((ptrBytes 640 (some (⟨6⟩, ()))).map (projByteTB ∘ liftByteTB))]) :=
-  ⟨rfl,
-   ok_of_map_toOption (by decide +kernel),
-   ok_of_map_toOption (by decide +kernel)⟩
+       some ((ptrBytes 640 (some (⟨6⟩, ()))).map (projByteTB ∘ liftByteTB))]) := by
+  refine ⟨rfl, ok_of_map_toOption (by decide +kernel), ?_⟩
+  obtain ⟨m7, hm7, hOut⟩ := ok_of_map_toOption
+    (r := Interp.stepsTB 7 (liftMachToTB c8AllFiveMach))
+    (f := fun m7 =>
+      [3, 4, 5, 2].map (fun i => m7.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB)))
+    (b := [some ((ptrBytes 4096 (some (⟨0⟩, ()))).map (projByteTB ∘ liftByteTB)),
+           some ((ptrBytes 8192 (some (⟨1⟩, ()))).map (projByteTB ∘ liftByteTB)),
+           some ((ptrBytes 4096 (some (⟨0⟩, ()))).map (projByteTB ∘ liftByteTB)),
+           some ((ptrBytes 640 (some (⟨6⟩, ()))).map (projByteTB ∘ liftByteTB))])
+    (by decide +kernel)
+  exact ⟨m7, hm7, liftMachToTB_stepsTB_wfLive hm7, hOut⟩
 
 /-- Concrete C8 wide-slice (`*mut [u32] → *const [u32]`), wide-dyn
 (`*mut dyn Tr → *const dyn Tr`), and negative witnesses across Trusted, `Mach`,
@@ -3163,6 +3137,10 @@ theorem c8_capturing_closure_wide_and_unknown_tag_witness :
     evalRvalue [.uninit, .init (.ptr { allocId := fnPtrAllocBase, offsetBytes := 0 } 8)]
       (.cast (.pointerCoercion "UnsafeFnPointer") (.copy (locPlace 1)) fnPtrUnsafeU32MirTy)
       mem0 [mkDecl fnPtrUnsafeU32MirTy, mkDecl fnPtrUnsafeU32MirTy] emptyLayoutTable = .ub ∧
+    -- Shape-mismatch UB (thin ptr with wide slice target)
+    evalRvalue [.uninit, .init (.ptr { allocId := 5, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "MutToConstPointer") (.copy (locPlace 1)) rawConstSliceU32MirTy)
+      mem0 [mkDecl rawConstSliceU32MirTy, mkDecl rawMutU32MirTy] emptyLayoutTable = .ub ∧
     -- Unrecognized coercion tag returns .unsupported
     evalRvalue [.uninit, .init (.ptr { allocId := fnPtrAllocBase, offsetBytes := 0 } 8)]
       (.cast (.pointerCoercion "UnknownCoercion") (.copy (locPlace 1)) fnPtrUnsafeU32MirTy)
@@ -3171,7 +3149,7 @@ theorem c8_capturing_closure_wide_and_unknown_tag_witness :
   ⟨rfl,
    ok_of_map_toOption (by decide +kernel),
    ok_of_map_toOption (by decide +kernel),
-   rfl, rfl, rfl, rfl⟩
+   rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## §9 (`C9`): `ProjectionElem.unwrapUnsafeBinder` (`Mach` & `MachTB`) -/
 
@@ -3187,7 +3165,7 @@ theorem translatePlace_unwrapUnsafeBinder_none
 
 /-- **C9 Trusted Universal Transparency Laws (`evalPlaceRead`,
 `writePlaceValue`, `readProjectedValue`, `writeProjectedValue`,
-`splitLastDeref?`)**:
+`readProjectedValueUnionAware`, `splitLastDeref?`)**:
 1. `ProjectionElem.unwrapUnsafeBinder` is definitionally transparent across
    `readProjectedValue`, `writeProjectedValue`, `readProjectedValueUnionAware`,
    `splitLastDeref?` (both `[*p].unwrapUnsafeBinder` AND
@@ -3197,16 +3175,20 @@ theorem translatePlace_unwrapUnsafeBinder_none
    `localDecls = []`), `evalPlaceRead` and `writePlaceValue` equal the bare
    local read/write `⟨loc, []⟩` on every initialized slot, while an unlowered
    non-leading `.deref` (`⟨loc, [.unwrapUnsafeBinder ptrTy, .deref]⟩`) returns
-   `.unsupported` (because Rust `Runtime(PostCleanup)` MIR lowers `*(_p.unwrap)`
-   via `_tmp = copy (_p.unwrap); (*_tmp)`). -/
+   `.unsupported` on BOTH `evalPlaceRead` and `writePlaceValue`. -/
 theorem trusted_unwrapUnsafeBinder_transparent
     (locals : List LocalSlot) (loc : Nat) (val newVal : MirSemantics.Value)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (innerTy : MirAst.Ty) (rest : List MirAst.ProjectionElem) :
+    (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
+    (baseTy innerTy : MirAst.Ty) (rest : List MirAst.ProjectionElem) :
     readProjectedValue locals val (.unwrapUnsafeBinder innerTy :: rest) =
       readProjectedValue locals val rest ∧
     writeProjectedValue locals val (.unwrapUnsafeBinder innerTy :: rest) newVal =
       writeProjectedValue locals val rest newVal ∧
+    readProjectedValueUnionAware locals decls layouts val baseTy
+        (.unwrapUnsafeBinder innerTy :: rest) =
+      readProjectedValueUnionAware locals decls layouts val
+        (resolveTyWithLocalDecls decls layouts innerTy) rest ∧
     splitLastDeref? (.unwrapUnsafeBinder innerTy :: rest) = splitLastDeref? rest ∧
     splitLastDeref? [.deref, .unwrapUnsafeBinder innerTy] = some [] ∧
     splitLastDeref? [.unwrapUnsafeBinder innerTy, .deref] = some [] ∧
@@ -3219,23 +3201,17 @@ theorem trusted_unwrapUnsafeBinder_transparent
         .ok val locals ∧
       writePlaceValue locals borrows ⟨loc, [.unwrapUnsafeBinder innerTy]⟩ newVal =
         writePlaceValue locals borrows ⟨loc, []⟩ newVal ∧
+      evalPlaceRead locals ⟨loc, [.unwrapUnsafeBinder innerTy, .deref]⟩ borrows globals =
+        .unsupported ∧
       writePlaceValue locals borrows ⟨loc, [.unwrapUnsafeBinder innerTy, .deref]⟩ newVal =
         .unsupported) := by
-  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_⟩
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_⟩
   intro hSlot
-  refine ⟨?_, ?_, ?_⟩
-  · unfold evalPlaceRead
-    dsimp only []
-    rw [hSlot]
-    rfl
-  · unfold writePlaceValue
-    dsimp only []
-    rw [hSlot]
-    rfl
-  · unfold writePlaceValue
-    dsimp only []
-    rw [hSlot]
-    rfl
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · unfold evalPlaceRead; dsimp only []; rw [hSlot]; rfl
+  · unfold writePlaceValue; dsimp only []; rw [hSlot]; rfl
+  · unfold evalPlaceRead; dsimp only []; rw [hSlot]; rfl
+  · unfold writePlaceValue; dsimp only []; rw [hSlot]; rfl
 
 /-- **C9 MiniRust Polymorphic Field-0 Wrapper Place & `Transmute` Identity
 (`Mach` & `MachTB`)**:
@@ -3269,48 +3245,33 @@ theorem transmuteM_binderWrapper_u32_and_thinPtr {M : Type} [Gen.Memory M] [Memo
     (prov : Option (Gen.Memory.Provenance M)) (m : Option (Machine M)) :
     let vInt : Gen.Value M := .Int (intFromBits bits u32)
     let vPtr : Gen.Value M := .Ptr (ThinPointer.widen { addr := addr, provenance := prov } none)
-    transmuteM (M := M) (.Tuple [vInt]) (mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩) u32MrTy m =
-      .ok vInt ∧
-    transmuteM (M := M) vInt u32MrTy (mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩) m =
-      .ok (.Tuple [vInt]) ∧
+    transmuteM (M := M) (.Tuple [vInt]) (mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩) u32MrTy m = .ok vInt ∧
+    transmuteM (M := M) vInt u32MrTy (mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩) m = .ok (.Tuple [vInt]) ∧
     transmuteM (M := M) (.Tuple [vPtr]) (mrBinderWrapperTy thinRawPtrTy ⟨8⟩ ⟨8⟩) thinRawPtrTy m =
       .ok vPtr ∧
     transmuteM (M := M) vPtr thinRawPtrTy (mrBinderWrapperTy thinRawPtrTy ⟨8⟩ ⟨8⟩) m =
       .ok (.Tuple [vPtr]) := by
   intro vInt vPtr
-  have hEncI : Type.encodeM (M := M) u32MrTy vInt =
-      .ok ((leBytes bits 4).map (fun b => .Init b none)) :=
-    encodeIntM_intFromBits u32 (by decide) bits hBits
-  have hDecI : Type.decodeM (M := M) u32MrTy ((leBytes bits 4).map (fun b => .Init b none)) =
-      .ok (some vInt) :=
-    decodeIntM_leBytes u32 (by decide) bits hBits
   have hLenI : ((leBytes bits 4).map
       (fun b => (AbstractByte.Init b none : AbstractByte (Gen.Memory.Provenance M)))).length = 4 := by
     rw [List.length_map, leBytes_length]
-  have hChkI : checkValueM (M := M) vInt u32MrTy m = .ok () :=
-    checkValueM_int_of_inBounds (intFromBits bits u32) u32 m
-      (inBounds_intFromBits_cf u32 (by decide) bits hBits)
-  have hRoundI :=
-    transmuteM_binderWrapper_roundtrip (M := M) u32MrTy ⟨4⟩ ⟨4⟩ vInt _ m rfl rfl hEncI hLenI
-      hDecI hChkI
+  have hRoundI := transmuteM_binderWrapper_roundtrip (M := M) u32MrTy ⟨4⟩ ⟨4⟩ vInt _ m rfl rfl
+    (encodeIntM_intFromBits u32 (by decide) bits hBits) hLenI
+    (decodeIntM_leBytes u32 (by decide) bits hBits)
+    (checkValueM_int_of_inBounds _ u32 m (inBounds_intFromBits_cf u32 (by decide) bits hBits))
   have hEncP : Type.encodeM (M := M) thinRawPtrTy vPtr =
       .ok (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) := by
-    simp only [thinRawPtrTy, Type.encodeM, PtrType.as_wide_pair, PtrType.meta_kind,
-      vPtr, ThinPointer.widen]
-    exact encodePtrM_eq addr hAddr prov
+    simp only [thinRawPtrTy, Type.encodeM, PtrType.as_wide_pair, PtrType.meta_kind, vPtr,
+      ThinPointer.widen]; exact encodePtrM_eq addr hAddr prov
   have hDecP : Type.decodeM (M := M) thinRawPtrTy
       (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) = .ok (some vPtr) := by
-    simp only [thinRawPtrTy, Type.decodeM, PtrType.as_wide_pair, PtrType.meta_kind,
-      vPtr, ThinPointer.widen]
-    rw [decodePtrM_encodePtrBytesM addr hAddr prov, ok_bind]
-    rfl
+    simp only [thinRawPtrTy, Type.decodeM, PtrType.as_wide_pair, PtrType.meta_kind, vPtr,
+      ThinPointer.widen]; rw [decodePtrM_encodePtrBytesM addr hAddr prov, ok_bind]; rfl
   have hLenP : (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)).length = 8 := by
     rw [encodePtrBytesM_length, leBytes_length]
-  have hChkP : checkValueM (M := M) vPtr thinRawPtrTy m = .ok () :=
-    checkValueM_thinRawPtr_of_inBounds (addr : Int) prov m (inBounds_usize_cf addr hAddr)
-  have hRoundP :=
-    transmuteM_binderWrapper_roundtrip (M := M) thinRawPtrTy ⟨8⟩ ⟨8⟩ vPtr _ m layout_thinRawPtr
-      rfl hEncP hLenP hDecP hChkP
+  have hRoundP := transmuteM_binderWrapper_roundtrip (M := M) thinRawPtrTy ⟨8⟩ ⟨8⟩ vPtr _ m
+    layout_thinRawPtr rfl hEncP hLenP hDecP
+    (checkValueM_thinRawPtr_of_inBounds (addr : Int) prov m (inBounds_usize_cf addr hAddr))
   exact ⟨hRoundI.2.2.1, hRoundI.2.2.2, hRoundP.2.2.1, hRoundP.2.2.2⟩
 
 theorem minirust_evalPlaceM_binderWrapper_field0
@@ -3333,45 +3294,32 @@ theorem minirust_evalPlaceM_binderWrapper_field0
   have hSzWrap : computeSizeM m1 (.Sized sz al) place.ptr.metadata = .ok sz := by
     simp only [computeSizeM, LayoutStrategy.compute_size_and_align, hMeta,
       pure, Except.pure, bind, Except.bind]
-  unfold evalPlaceM
-  rw [hBase, ok_bind]
-  dsimp only [mrBinderWrapperTy]
-  rw [ite_eq_left_iff.mpr (fun hn => absurd hCond hn), hIdx, ok_bind]
-  dsimp only []
+  unfold evalPlaceM; rw [hBase, ok_bind]; dsimp only [mrBinderWrapperTy]
+  rw [ite_eq_left_iff.mpr (fun hn => absurd hCond hn), hIdx, ok_bind]; dsimp only []
   rw [show Type.layout (.Tuple [(⟨0⟩, inner)] ⟨sz, al, none⟩ none) = .ok (.Sized sz al) from hLayWrap,
     ok_bind, hSzWrap, ok_bind]
-  have hLe : (!decide (({ bytes := 0 } : LibSpecr.Size).bytes ≤ sz.bytes)) = false := by
-    simp
-  rw [hLe]
-  simp only [Bool.false_eq_true, ↓reduceIte]
+  have hLe : (!decide (({ bytes := 0 } : LibSpecr.Size).bytes ≤ sz.bytes)) = false := by simp
+  rw [hLe]; simp only [Bool.false_eq_true, ↓reduceIte]
   rw [show (({ bytes := 0 } : LibSpecr.Size).bytes : Int) = 0 from rfl, hPtr0, ok_bind,
-    hInnerLay, ok_bind]
-  rfl
+    hInnerLay, ok_bind]; rfl
 
 def c9BinderReadWriteMir : MirAst.CapturedMir :=
   mkMirBody "ep2::c9_binder_rw"
     [mkDecl u32MirTy, mkDecl u32MirTy, mkDecl rawMutU32MirTy, mkDecl rawMutU32MirTy,
      mkDecl rawConstSliceU32MirTy] 1
     [mkBb
-      [mkSt (.storageLive 2),
-       mkSt (.storageLive 3),
-       -- Write & Copy through .unwrapUnsafeBinder on local 1
+      [mkSt (.storageLive 2), mkSt (.storageLive 3),
        mkSt (.assign (locPlace 1 [.unwrapUnsafeBinder u32MirTy]) (.use (constU32 55))),
        mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.unwrapUnsafeBinder u32MirTy])))),
-       -- Move via .unwrapUnsafeBinder BEFORE .deref (`_3 = move (_2.unwrap)`)
-       mkSt (.assign (locPlace 2)
-         (.rawPtr .mut (locPlace 1 [.unwrapUnsafeBinder u32MirTy]))),
+       mkSt (.assign (locPlace 2) (.rawPtr .mut (locPlace 1 [.unwrapUnsafeBinder u32MirTy]))),
        mkSt (.assign (locPlace 3) (.use (.move (locPlace 2 [.unwrapUnsafeBinder rawMutU32MirTy])))),
-       -- Deref followed by .unwrapUnsafeBinder (`(*_3).unwrap = 88`)
        mkSt (.assign (locPlace 3 [.deref, .unwrapUnsafeBinder u32MirTy]) (.use (constU32 88))),
-       mkSt (.assign (locPlace 0)
-         (.use (.move (locPlace 3 [.deref, .unwrapUnsafeBinder u32MirTy]))))]
+       mkSt (.assign (locPlace 0) (.use (.move (locPlace 3 [.deref, .unwrapUnsafeBinder u32MirTy]))))]
       .return_]
 
 def c9BinderMrFn : Gen.Function :=
-  let wrapU32 := mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩
-  let wrapPtr := mrBinderWrapperTy thinRawPtrTy ⟨8⟩ ⟨8⟩
-  mkMrFn [(localName 0, u32MrTy), (localName 1, wrapU32), (localName 2, wrapPtr)]
+  mkMrFn [(localName 0, u32MrTy), (localName 1, mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩),
+          (localName 2, mrBinderWrapperTy thinRawPtrTy ⟨8⟩ ⟨8⟩)]
     [localName 1] (localName 0)
     [(bbName 0,
       ⟨[.Assign (.Field (.Local (localName 1)) 0) (.Constant (.Int 55) u32MrTy),
@@ -3385,26 +3333,17 @@ def c9BinderMrFn : Gen.Function :=
        .Return, .Regular⟩)]
 
 def c9BinderMach (local1Live : Bool := true) : Mach :=
-  let prog := mkMrProg [(fnName 0, c9BinderMrFn)]
-  let a0 := mkStackAlloc 128 (List.replicate 4 .Uninit) 4
-  let a1 := mkStackAlloc 256 (scalarBytes u32 10) 4
-  let a2 := mkStackAlloc 384 (List.replicate 8 .Uninit) 8
   let locs : List (Gen.LocalName × Ptr) :=
-    if local1Live then
-      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
-       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
-       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) })]
-    else
-      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
-       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) })]
-  let fr : Frame :=
-    { func := c9BinderMrFn, locals := ⟨locs⟩, stack_pop_action := .BottomOfStack,
-      next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach prog [a0, a1, a2] [fr]
+    (localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }) ::
+      (if local1Live then [(localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })] else []) ++
+      [(localName 2, { addr := 384, provenance := some (⟨2⟩, ()) })]
+  mkMrMach (mkMrProg [(fnName 0, c9BinderMrFn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4, mkStackAlloc 256 (scalarBytes u32 10) 4,
+     mkStackAlloc 384 (List.replicate 8 .Uninit) 8]
+    [mkRootFrame c9BinderMrFn locs]
 
-/-- Concrete C9 positive witness (read, write, deref chain `*p` +
-`.unwrapUnsafeBinder`,
-`Rvalue.len` via `splitLastDeref?`) and dead-local UB witness across Trusted,
+/-- Concrete C9 positive witness (read, write, `Move`, deref, `Rvalue.len`,
+wrapper `Transmute`, `MachTB.wfLive`) and dead-local UB witness across Trusted,
 `Mach`, and `MachTB`. -/
 theorem c9_unwrapUnsafeBinder_three_way_len_and_ub_witness :
     let sliceLenPlaceAfter : MirAst.Place :=
@@ -3414,12 +3353,18 @@ theorem c9_unwrapUnsafeBinder_three_way_len_and_ub_witness :
     let sliceMem := (initMachineState c9BinderReadWriteMir []).memory
     let sliceLocs : List LocalSlot :=
       [.init (annealWidePtrVal { allocId := 9, offsetBytes := 0 } 4 8)]
+    let wrapTransMach := c7MkTransmuteMach (mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩) u32MrTy
+      (scalarBytes u32 88) 4
     runAVal c9BinderReadWriteMir 12 (initMachineState c9BinderReadWriteMir [.scalar ⟨10, 4⟩]) =
       some (.scalar ⟨88, 4⟩) ∧
     (∃ m5, Interp.steps 5 (c9BinderMach true) = .ok m5 ∧
       m5.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 88)) ∧
     (∃ m5, Interp.stepsTB 5 (liftMachToTB (c9BinderMach true)) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
       m5.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes u32 88).map (projByteTB ∘ liftByteTB))) ∧
+    (∃ m1, Interp.stepTB (liftMachToTB wrapTransMach) = .ok m1 ∧
+      m1.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
         some ((scalarBytes u32 88).map (projByteTB ∘ liftByteTB))) ∧
     evalRvalue sliceLocs (.len sliceLenPlaceAfter) sliceMem [mkDecl rawConstSliceU32MirTy]
       emptyLayoutTable = .ok (.scalar ⟨4, 8⟩) sliceLocs sliceMem ∧
@@ -3430,13 +3375,15 @@ theorem c9_unwrapUnsafeBinder_three_way_len_and_ub_witness :
                    locals := [.uninit, .dead, .uninit, .uninit, .uninit] }
         memory := sliceMem } = MirStepNode.fail .ub ∧
     Interp.step (c9BinderMach false) = .error (.ub "access to a dead local") ∧
-    Interp.stepTB (liftMachToTB (c9BinderMach false)) = .error (.ub "access to a dead local") :=
-  ⟨rfl,
-   ok_of_map_toOption (by decide +kernel),
-   ok_of_map_toOption (by decide +kernel),
-   rfl, rfl, rfl,
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+    Interp.stepTB (liftMachToTB (c9BinderMach false)) = .error (.ub "access to a dead local") := by
+  refine ⟨rfl, ok_of_map_toOption (by decide +kernel), ?_, ok_of_map_toOption (by decide +kernel),
+    rfl, rfl, rfl, eq_error_ub_of_interpUbMsg (by decide +kernel),
+    eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+  obtain ⟨m5, hm5, hOut⟩ := ok_of_map_toOption
+    (r := Interp.stepsTB 5 (liftMachToTB (c9BinderMach true)))
+    (f := fun m5 => m5.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB))
+    (b := some ((scalarBytes u32 88).map (projByteTB ∘ liftByteTB))) (by decide +kernel)
+  exact ⟨m5, hm5, liftMachToTB_stepsTB_wfLive hm5, hOut⟩
 
 /-! ## §10 (`C10`): `AggregateKind.closure` (`Mach` & `MachTB`) -/
 
@@ -3462,31 +3409,140 @@ theorem closure_zst_lockstep_M
     evalValueM m (.Tuple [] unitType) = .ok ((.Tuple [], unitType), m) :=
   ⟨rfl, rfl⟩
 
-/-- **C10.2 Universal `n`-Capture Closure Inductive Lockstep Law (`Mach` &
-`MachTB`)**:
-For ANY number `n` of captured upvars (`ops` ↔ `es`), left-to-right operand
-evaluation in `evalRvalue ... (.aggregate (.closure dp) ops)` and MiniRust
-`evalValueM ... (.Tuple es mrClTy)` steps in exact lockstep on EVERY `Machine M`
-(`Mach` and `MachTB`). -/
+/-- **C10.2 Genuine Inductive `n`-Capture Closure Lockstep, Length Preservation,
+& Arbitrary-Index Left-to-Right UB Propagation (`Mach` & `MachTB`)**:
+By structural induction on the captured upvar list:
+1. `evalOperands` / `evalValuesM` preserve exact capture arity
+   (`vals.length = ops.length`, `mvals.length = es.length`).
+2. `evalRvalue ... (.aggregate (.closure dp) ops)` and `evalValueM ... (.Tuple
+   es mrClTy)` step in exact lockstep for ANY `n` upvars on BOTH `Mach` and
+   `MachTB`.
+3. Left-to-right UB propagation at ANY index `i` (`pre ++ bad :: suf` ↔
+   `mpre ++ mbad :: msuf`): if the prefix evaluates cleanly and index `i` faults
+   with UB, the entire closure aggregate faults immediately without evaluating
+   suffix `suf` / `msuf`. -/
+theorem evalOperands_length_and_ltr_ub
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (decls : List MirAst.LocalDecl) (callStack : List SavedCallerFrame) :
+    (∀ ops locals vals locals',
+      evalOperands locals ops borrows globals layouts callerLocals decls callStack =
+        .ok vals locals' → vals.length = ops.length) ∧
+    (∀ pre bad suf locals preVals localsMid,
+      evalOperands locals pre borrows globals layouts callerLocals decls callStack =
+        .ok preVals localsMid →
+      evalOperand localsMid bad borrows globals layouts callerLocals decls callStack = .ub →
+      evalOperands locals (pre ++ bad :: suf) borrows globals layouts callerLocals decls
+        callStack = .ub) := by
+  constructor
+  · intro ops; induction ops with
+    | nil => intro locals vals locals' h; simp [evalOperands] at h; rcases h with ⟨rfl, _⟩; rfl
+    | cons op rest ih =>
+      intro locals vals locals' h; simp only [evalOperands] at h
+      cases h1 : evalOperand locals op borrows globals layouts callerLocals decls callStack with
+      | ub | unsupported => simp [h1] at h
+      | ok v l1 =>
+        rw [h1] at h
+        cases h2 : evalOperands l1 rest borrows globals layouts callerLocals decls callStack with
+        | ub | unsupported => simp [h2] at h
+        | ok vs l2 =>
+          simp only [h2, OperandsEvalResult.ok.injEq] at h; rcases h with ⟨rfl, _⟩
+          simp [ih l1 vs l2 h2]
+  · intro pre; induction pre with
+    | nil =>
+      intro bad suf locals preVals localsMid hPre hBad
+      simp [evalOperands] at hPre; rcases hPre with ⟨_, rfl⟩; simp [evalOperands, hBad]
+    | cons op rest ih =>
+      intro bad suf locals preVals localsMid hPre hBad; simp only [evalOperands] at hPre
+      cases h1 : evalOperand locals op borrows globals layouts callerLocals decls callStack with
+      | ub | unsupported => simp [h1] at hPre
+      | ok v l1 =>
+        rw [h1] at hPre
+        cases h2 : evalOperands l1 rest borrows globals layouts callerLocals decls callStack with
+        | ub | unsupported => simp [h2] at hPre
+        | ok vs l2 =>
+          simp only [h2, OperandsEvalResult.ok.injEq] at hPre; rcases hPre with ⟨_, rfl⟩
+          simp only [List.cons_append, evalOperands, h1, ih bad suf l1 vs l2 h2 hBad]
+
+theorem evalValuesM_length_and_ltr_ub {M : Type} [Gen.Memory M] [MemoryOps M] :
+    (∀ es (m m' : Machine M) mvals,
+      evalValuesM m es = .ok (mvals, m') → mvals.length = es.length) ∧
+    (∀ pre bad suf (m mMid : Machine M) preVals msg,
+      evalValuesM m pre = .ok (preVals, mMid) → evalValueM mMid bad = .error (.ub msg) →
+      evalValuesM m (pre ++ bad :: suf) = .error (.ub msg)) := by
+  constructor
+  · intro es; induction es with
+    | nil => intro m m' mvals h; simp [evalValuesM, pure, Except.pure] at h; rcases h with ⟨rfl, _⟩; rfl
+    | cons e rest ih =>
+      intro m m' mvals h; simp only [evalValuesM] at h
+      cases h1 : evalValueM m e with
+      | error _ => simp [h1, bind, Except.bind] at h
+      | ok r1 =>
+        rcases r1 with ⟨⟨v, _⟩, m1⟩; rw [h1, ok_bind] at h
+        cases h2 : evalValuesM m1 rest with
+        | error _ => simp [h2, bind, Except.bind] at h
+        | ok r2 =>
+          rcases r2 with ⟨vs, m2⟩
+          simp only [h2, ok_bind, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+          rcases h with ⟨rfl, _⟩; simp [ih m1 m2 vs h2]
+  · intro pre; induction pre with
+    | nil =>
+      intro bad suf m mMid preVals msg hPre hBad
+      simp [evalValuesM, pure, Except.pure] at hPre; rcases hPre with ⟨_, rfl⟩
+      simp [evalValuesM, hBad, bind, Except.bind]
+    | cons e rest ih =>
+      intro bad suf m mMid preVals msg hPre hBad; simp only [evalValuesM] at hPre
+      cases h1 : evalValueM m e with
+      | error _ => simp [h1, bind, Except.bind] at hPre
+      | ok r1 =>
+        rcases r1 with ⟨⟨v, _⟩, m1⟩; rw [h1, ok_bind] at hPre
+        cases h2 : evalValuesM m1 rest with
+        | error _ => simp [h2, bind, Except.bind] at hPre
+        | ok r2 =>
+          rcases r2 with ⟨vs, m2⟩
+          simp only [h2, ok_bind, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at hPre
+          rcases hPre with ⟨_, rfl⟩
+          simp only [List.cons_append, evalValuesM, h1, ok_bind,
+            ih bad suf m1 m2 vs msg h2 hBad, bind, Except.bind]
+
 theorem closure_n_capture_lockstep_M
     {M : Type} [Gen.Memory M] [MemoryOps M]
     (locals locals' : List LocalSlot) (dp : DefPath) (ops : List MirAst.Operand)
     (vals : List MirSemantics.Value)
     (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
     (m m' : Machine M) (es : List Gen.ValueExpr) (mvals : List (Gen.Value M))
-    (mrClTy : Gen.Type)
-    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals decls
-      mem.callStack = .ok vals locals')
-    (hEs : evalValuesM m es = .ok (mvals, m')) :
-    evalRvalue locals (.aggregate (.closure dp) ops) mem decls layouts =
-      .ok (.aggregate 0 vals) locals' mem ∧
-    evalValueM m (.Tuple es mrClTy) = .ok ((.Tuple mvals, mrClTy), m') := by
-  constructor
-  · simp only [evalRvalue, hOps]
-  · simp only [evalValueM, hEs, bind, Except.bind, pure, Except.pure]
+    (mrClTy : Gen.Type) :
+    (evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals decls
+        mem.callStack = .ok vals locals' →
+      evalValuesM m es = .ok (mvals, m') →
+      vals.length = ops.length ∧ mvals.length = es.length ∧
+      evalRvalue locals (.aggregate (.closure dp) ops) mem decls layouts =
+        .ok (.aggregate 0 vals) locals' mem ∧
+      evalValueM m (.Tuple es mrClTy) = .ok ((.Tuple mvals, mrClTy), m')) ∧
+    (∀ pre bad suf preVals localsMid mpre mbad msuf mpreVals mMid msg,
+      evalOperands locals pre mem.borrows mem.globals layouts mem.callerLocals decls
+        mem.callStack = .ok preVals localsMid →
+      evalOperand localsMid bad mem.borrows mem.globals layouts mem.callerLocals decls
+        mem.callStack = .ub →
+      evalValuesM m mpre = .ok (mpreVals, mMid) →
+      evalValueM mMid mbad = .error (.ub msg) →
+      evalRvalue locals (.aggregate (.closure dp) (pre ++ bad :: suf)) mem decls layouts = .ub ∧
+      evalValueM m (.Tuple (mpre ++ mbad :: msuf) mrClTy) = .error (.ub msg)) := by
+  refine ⟨?_, ?_⟩
+  · intro hOps hEs
+    exact ⟨(evalOperands_length_and_ltr_ub ..).1 ops locals vals locals' hOps,
+      (evalValuesM_length_and_ltr_ub (M := M)).1 es m m' mvals hEs,
+      by simp only [evalRvalue, hOps],
+      by simp only [evalValueM, hEs, bind, Except.bind, pure, Except.pure]⟩
+  · intro pre bad suf preVals localsMid mpre mbad msuf mpreVals mMid msg hPre hBad hmPre hmBad
+    have hT := (evalOperands_length_and_ltr_ub mem.borrows mem.globals layouts mem.callerLocals
+      decls mem.callStack).2 pre bad suf locals preVals localsMid hPre hBad
+    have hM := (evalValuesM_length_and_ltr_ub (M := M)).2 mpre mbad msuf m mMid mpreVals msg
+      hmPre hmBad
+    exact ⟨by simp only [evalRvalue, hT], by simp only [evalValueM, hM, bind, Except.bind]⟩
 
 /-- **C10.3 Universal Two-Capture Closure Left-to-Right Evaluation & UB Law
-(`Mach` & `MachTB`)**. -/
+(`Mach` & `MachTB`)** (corollary of `closure_n_capture_lockstep_M`). -/
 theorem closure_two_capture_ltr_and_ub_M
     {M : Type} [Gen.Memory M] [MemoryOps M]
     (locals locals1 locals2 : List LocalSlot) (dp : DefPath) (op0 op1 : MirAst.Operand)
@@ -3519,17 +3575,16 @@ theorem closure_two_capture_ltr_and_ub_M
       evalValueM m (.Tuple [e0, e1] mrClTy) = .error (.ub msg)) := by
   refine ⟨?_, ?_, ?_⟩
   · intro v0 v1 mv0 mv1 t0 t1 h0 h1 hm0 hm1
-    constructor
-    · simp only [evalRvalue, evalOperands, h0, h1]
-    · simp only [evalValueM, evalValuesM, hm0, hm1, bind, Except.bind, pure, Except.pure]
+    exact ⟨by simp only [evalRvalue, evalOperands, h0, h1],
+           by simp only [evalValueM, evalValuesM, hm0, hm1, bind, Except.bind, pure, Except.pure]⟩
   · intro msg h0 hm0
-    constructor
-    · simp only [evalRvalue, evalOperands, h0]
-    · simp only [evalValueM, evalValuesM, hm0, bind, Except.bind]
+    exact (closure_n_capture_lockstep_M locals locals dp [] [] mem decls layouts m m [] []
+      mrClTy).2 [] op0 [op1] [] locals [] e0 [e1] [] m msg rfl h0 rfl hm0
   · intro v0 mv0 t0 msg h0 h1 hm0 hm1
-    constructor
-    · simp only [evalRvalue, evalOperands, h0, h1]
-    · simp only [evalValueM, evalValuesM, hm0, hm1, bind, Except.bind]
+    exact (closure_n_capture_lockstep_M locals locals1 dp [] [] mem decls layouts m m1 [] []
+      mrClTy).2 [op0] op1 [] [v0] locals1 [e0] e1 [] [mv0] m1 msg
+      (by simp only [evalOperands, h0]) h1
+      (by simp only [evalValuesM, hm0, bind, Except.bind, pure, Except.pure]) hm1
 
 /-- MiniRust 16-byte closure tuple type capturing `(u32, *const u32)`:
 field 0 (`u32`) at offset 0, field 1 (`*const u32`) at offset 8, align 8. -/
@@ -3560,43 +3615,28 @@ def c10CapMrFn : Gen.Function :=
        .Return, .Regular⟩)]
 
 def c10CapMach (local2Live : Bool := true) (local1Init : Bool := true) : Mach :=
-  let prog := mkMrProg [(fnName 0, c10CapMrFn)]
-  let a0 := mkStackAlloc 128 (List.replicate 16 .Uninit) 8
-  let a1 := mkStackAlloc 256
-    (if local1Init then scalarBytes u32 7 else List.replicate 4 .Uninit) 4
-  let a2 := mkStackAlloc 384 (List.replicate 8 .Uninit) 8
+  let a1 := mkStackAlloc 256 (if local1Init then scalarBytes u32 7 else List.replicate 4 .Uninit) 4
   let locs : List (Gen.LocalName × Ptr) :=
-    if local2Live then
-      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
-       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
-       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) })]
-    else
-      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
-       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]
-  let fr : Frame :=
-    { func := c10CapMrFn, locals := ⟨locs⟩, stack_pop_action := .BottomOfStack,
-      next_block := bbName 0, next_stmt := if local2Live && local1Init then 0 else 1,
-      extra := () }
-  mkMrMach prog [a0, a1, a2] [fr]
+    [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+     (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })] ++
+    (if local2Live then [(localName 2, { addr := 384, provenance := some (⟨2⟩, ()) })] else [])
+  mkMrMach (mkMrProg [(fnName 0, c10CapMrFn)])
+    [mkStackAlloc 128 (List.replicate 16 .Uninit) 8, a1,
+     mkStackAlloc 384 (List.replicate 8 .Uninit) 8]
+    [mkRootFrame c10CapMrFn locs (bbName 0) (if local2Live && local1Init then 0 else 1)]
 
 def c10ZstMach : Mach :=
   let fn := mkMrFn [(localName 0, unitType)] [] (localName 0)
     [(bbName 0, ⟨[.Assign (.Local (localName 0)) (.Tuple [] unitType)], .Return, .Regular⟩)]
-  let a0 := mkStackAlloc 128 [] 1
-  let fr : Frame :=
-    { func := fn
-      locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]⟩
-      stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
-  mkMrMach (mkMrProg [(fnName 0, fn)]) [a0] [fr]
+  mkMrMach (mkMrProg [(fnName 0, fn)]) [mkStackAlloc 128 [] 1]
+    [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]]
 
 def c10ExpectedCapBytes : List Byte :=
   scalarBytes u32 7 ++ List.replicate 4 .Uninit ++ ptrBytes 256 (some (⟨1⟩, ()))
 
-/-- Concrete C10 witnesses across Trusted, `Mach`, and `MachTB`:
-1. 0-capture ZST closure (`[]`).
-2. 2-capture `(u32(7), &raw const _1)` closure preserving scalar + provenance.
-3. Dead-upvar UB propagation on the 2nd captured operand.
-4. Uninitialized-upvar UB propagation on the 1st captured operand. -/
+/-- Concrete C10 witnesses across Trusted, `Mach`, and `MachTB` (with
+`MachTB.wfLive`): 0-capture ZST, 2-capture `(u32, *const u32)`, dead upvar UB,
+and uninitialized upvar UB. -/
 theorem c10_closure_zst_capture_and_ub_three_way_witness :
     runAVal c10ZstClosureMir 4 (initMachineState c10ZstClosureMir []) =
       some (.aggregate 0 []) ∧
@@ -3609,6 +3649,7 @@ theorem c10_closure_zst_capture_and_ub_three_way_witness :
     (∃ m2, Interp.steps 2 (c10CapMach true) = .ok m2 ∧
       m2.mem.memory.allocations[0]?.map (·.data) = some c10ExpectedCapBytes) ∧
     (∃ m2, Interp.stepsTB 2 (liftMachToTB (c10CapMach true)) = .ok m2 ∧
+      MachTB.wfLive m2 ∧
       m2.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
         some (c10ExpectedCapBytes.map (projByteTB ∘ liftByteTB))) ∧
     stepMirFn c10CapClosureMir
@@ -3624,19 +3665,17 @@ theorem c10_closure_zst_capture_and_ub_three_way_witness :
     Interp.step (c10CapMach true false) =
       .error (.ub "load at type but the data in memory violates the language invariant") ∧
     Interp.stepTB (liftMachToTB (c10CapMach true false)) =
-      .error (.ub "load at type but the data in memory violates the language invariant") :=
-  ⟨rfl,
-   ok_of_map_toOption (by decide +kernel),
-   ok_of_map_toOption (by decide +kernel),
-   rfl,
-   ok_of_map_toOption (by decide +kernel),
-   ok_of_map_toOption (by decide +kernel),
-   rfl,
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   rfl,
-   eq_error_ub_of_interpUbMsg (by decide +kernel),
-   eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+      .error (.ub "load at type but the data in memory violates the language invariant") := by
+  refine ⟨rfl, ok_of_map_toOption (by decide +kernel), ok_of_map_toOption (by decide +kernel),
+    rfl, ok_of_map_toOption (by decide +kernel), ?_, rfl,
+    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+    rfl, eq_error_ub_of_interpUbMsg (by decide +kernel),
+    eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+  obtain ⟨m2, hm2, hOut⟩ := ok_of_map_toOption
+    (r := Interp.stepsTB 2 (liftMachToTB (c10CapMach true)))
+    (f := fun m2 => m2.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB))
+    (b := some (c10ExpectedCapBytes.map (projByteTB ∘ liftByteTB))) (by decide +kernel)
+  exact ⟨m2, hm2, liftMachToTB_stepsTB_wfLive hm2, hOut⟩
 
 /-! ## §11. Exhaustive Axiom, Import-Isolation, & `Classical.choice`-Free Codec
 Audit -/
@@ -3686,7 +3725,10 @@ elab "#assert_unwind_setdiscr_mr_standard_axioms" : command => do
      ``transmuteM_wideSliceRawPtr_id,
      ``evalCastOpM_transmute_wideSliceRawPtr_id,
      ``transmuteM_binderWrapper_roundtrip,
-     ``transmuteM_binderWrapper_u32_and_thinPtr]
+     ``transmuteM_binderWrapper_u32_and_thinPtr,
+     ``writeSubsliceAtIndex_byte0,
+     ``decodeLittleEndianBytes_encode,
+     ``abstractBytesAllProvAux_encode]
   for c in choiceFreeCodecs do
     let axs ← liftCoreM <| Lean.collectAxioms c
     if axs.contains ``Classical.choice then
