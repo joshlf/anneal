@@ -554,6 +554,78 @@ theorem prod_comp_tighten {γ₁ : Type w₁} {γ₂ : Type w₂}
   prod_comp c₁ d₁.tighten c₂ d₂.tighten d₁.tighten_tightValidRep
     d₂.tighten_tightValidRep
 
+/-- `CodecLaws.tighten` fixes `CodecLaws.id`. -/
+theorem tighten_id (α : Type u) : (CodecLaws.id α).tighten = CodecLaws.id α :=
+  (tighten_eq_self_iff (CodecLaws.id α)).mpr (id_tightValidRep α)
+
+/-- `CodecLaws.tighten` fixes `CodecLaws.ofEquiv`. -/
+theorem tighten_ofEquiv (f : α → β) (g : β → α)
+    (left_inv : ∀ a, g (f a) = a) (right_inv : ∀ b, f (g b) = b) :
+    (ofEquiv f g left_inv right_inv).tighten =
+      ofEquiv f g left_inv right_inv :=
+  (tighten_eq_self_iff _).mpr (ofEquiv_tightValidRep f g left_inv right_inv)
+
+/-- Strict functoriality of `CodecLaws.tighten` over sequential composition
+`comp`: `(c₁.comp c₂).tighten = c₁.tighten.comp c₂.tighten`. -/
+theorem tighten_comp (c₁ : CodecLaws α β) (c₂ : CodecLaws β γ) :
+    (c₁.comp c₂).tighten = c₁.tighten.comp c₂.tighten := by
+  refine ext (fun _ => rfl) (fun _ => rfl) (fun g => ?_)
+  constructor
+  · intro ⟨⟨hv₂, hvc₁⟩, a, hbind⟩
+    have hbind' : (c₂.decode g).bind c₁.decode = some a := hbind
+    cases hb : c₂.decode g with
+    | none => rw [hb] at hbind'; cases hbind'
+    | some b₀ =>
+      rw [hb] at hbind'
+      refine ⟨⟨hv₂, b₀, hb⟩, fun b hb' => ?_⟩
+      have hbEq : b₀ = b := Option.some.inj (hb.symm.trans hb')
+      subst hbEq
+      exact ⟨hvc₁ b₀ hb, a, hbind'⟩
+  · intro ⟨⟨hv₂, b₀, hb₀⟩, hvc₁⟩
+    obtain ⟨hv₁, a, ha⟩ := hvc₁ b₀ hb₀
+    refine ⟨⟨hv₂, fun b hb => (hvc₁ b hb).1⟩, a, ?_⟩
+    show (c₂.decode g).bind c₁.decode = some a
+    rw [hb₀]
+    exact ha
+
+/-- Strict symmetric monoidal functoriality of `CodecLaws.tighten` over
+`prod`: `(c₁.prod c₂).tighten = c₁.tighten.prod c₂.tighten`. -/
+theorem tighten_prod (c₁ : CodecLaws α₁ β₁) (c₂ : CodecLaws α₂ β₂) :
+    (c₁.prod c₂).tighten = c₁.tighten.prod c₂.tighten := by
+  refine ext (fun _ => rfl) (fun _ => rfl) (fun q => ?_)
+  constructor
+  · intro ⟨⟨hv₁, hv₂⟩, p, hbind⟩
+    have hbind' :
+        ((c₁.decode q.1).bind fun a₁ =>
+          (c₂.decode q.2).bind fun a₂ => some (a₁, a₂)) = some p := hbind
+    cases ha₁ : c₁.decode q.1 with
+    | none => rw [ha₁] at hbind'; cases hbind'
+    | some a₁ =>
+      cases ha₂ : c₂.decode q.2 with
+      | none => rw [ha₁, ha₂] at hbind'; cases hbind'
+      | some a₂ =>
+        exact ⟨⟨hv₁, a₁, ha₁⟩, ⟨hv₂, a₂, ha₂⟩⟩
+  · intro ⟨⟨hv₁, a₁, ha₁⟩, ⟨hv₂, a₂, ha₂⟩⟩
+    refine ⟨⟨hv₁, hv₂⟩, (a₁, a₂), ?_⟩
+    show ((c₁.decode q.1).bind fun x =>
+        (c₂.decode q.2).bind fun y => some (x, y)) = some (a₁, a₂)
+    rw [ha₁, ha₂]
+    rfl
+
+/-- **Unconditional tightened interchange law**: for arbitrary codecs
+`c₁, d₁, c₂, d₂` (even with unrestricted default `ValidRep`), tightening both
+sides equates `(c₁.comp d₁).prod (c₂.comp d₂)` and
+`(c₁.prod c₂).comp (d₁.prod d₂)` as records. -/
+theorem tighten_prod_comp_interchange {γ₁ : Type w₁} {γ₂ : Type w₂}
+    (c₁ : CodecLaws α₁ β₁) (d₁ : CodecLaws β₁ γ₁)
+    (c₂ : CodecLaws α₂ β₂) (d₂ : CodecLaws β₂ γ₂) :
+    ((c₁.comp d₁).prod (c₂.comp d₂)).tighten =
+      ((c₁.prod c₂).comp (d₁.prod d₂)).tighten := by
+  rw [tighten_prod, tighten_comp, tighten_comp, tighten_comp, tighten_prod,
+    tighten_prod]
+  exact prod_comp c₁.tighten d₁.tighten c₂.tighten d₂.tighten
+    d₁.tighten_tightValidRep d₂.tighten_tightValidRep
+
 end CodecLaws
 
 /--
@@ -652,6 +724,10 @@ theorem mirFailCodec_validRep_iff (r : MirFailE.I) :
 /-- `mirFailCodec` satisfies `TightValidRep`. -/
 theorem mirFailCodec_tightValidRep : mirFailCodec.TightValidRep :=
   fun r hv => (mirFailCodec_validRep_iff r).mp hv
+
+/-- `mirFailCodec` is a fixed point of `CodecLaws.tighten`. -/
+theorem mirFailCodec_tighten : mirFailCodec.tighten = mirFailCodec :=
+  (CodecLaws.tighten_eq_self_iff mirFailCodec).mpr mirFailCodec_tightValidRep
 
 /--
 There is no lawful codec with value domain `MirFailE.I` and representation
@@ -3227,6 +3303,38 @@ def restrictMode {ModeMR' : Type uMM'} {ModeLM' : Type uML'}
   lmFlip := B.lmFlip.liftModeAt fLM mLMFlip hLMFlip lmMode?
 
 /--
+Canonical codec-tightening reflector on a `DualCorrespondenceBundle`: replaces
+`B.codec` with `B.codec.tighten` while preserving `mrRel`, `lmRel`, `mrSim`,
+`lmSim`, `ExecAnneal`, and all witnesses identically (since `tighten` leaves
+`encode` unchanged). Ensures `(B.tightenCodec).codec.TightValidRep`
+unconditionally for product/vertical bundle compositions.
+-/
+def tightenCodec
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM) :
+    DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR ChoiceMR
+      RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM :=
+  { B with codec := B.codec.tighten }
+
+/-- Every `tightenCodec` bundle has a `TightValidRep` codec. -/
+theorem tightenCodec_tightValidRep
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM) :
+    B.tightenCodec.codec.TightValidRep :=
+  B.codec.tighten_tightValidRep
+
+/-- `tightenCodec` is idempotent on bundles. -/
+theorem tightenCodec_idem
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM) :
+    B.tightenCodec.tightenCodec = B.tightenCodec := by
+  cases B
+  unfold tightenCodec
+  dsimp only []
+  congr 1
+  exact CodecLaws.tighten_idem _
+
+/--
 Reindex the authority modes of a bundle along `fMR` / `fLM`. The sections
 `gMR` / `gLM` (with `fMR (gMR m) = m` and `fLM (gLM m) = m`) transport the
 witnesses to the new mode types.
@@ -4329,6 +4437,93 @@ theorem fromEquiv_productiveBoth_of_reverseTotal
     B.mrRel.ProductiveBoth ∧ B.lmRel.ProductiveBoth :=
   ⟨⟨hpMR, B.mrSim.productiveRef_of_reverseTotal hrevMR hpMR⟩,
    ⟨hpLM, B.lmSim.productiveRef_of_reverseTotal hrevLM hpLM⟩⟩
+
+/-- Whenever a bundle records `reverse_total? = some ...` on both simulations
+(such as `fromEquiv` or `fromEquivGated` called with `mrRevTotal? = some ...`
+and `lmRevTotal? = some ...`), Anneal productivity upgrades directly to
+two-sided `ProductiveBoth`. -/
+theorem productiveBoth_of_reverseTotal_some
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (hpMR : B.mrRel.ProductiveAnneal) (hpLM : B.lmRel.ProductiveAnneal)
+    {hMR : PLift B.mrRel.ReverseTotal} {hLM : PLift B.lmRel.ReverseTotal}
+    (_hmMR : B.mrSim.reverse_total? = some hMR)
+    (_hmLM : B.lmSim.reverse_total? = some hLM) :
+    B.mrRel.ProductiveBoth ∧ B.lmRel.ProductiveBoth :=
+  B.fromEquiv_productiveBoth_of_reverseTotal hpMR hpLM hMR.down hLM.down
+
+/-- Choice-gated bundles built with `fromEquivGated` and `ReverseTotal` on both
+authorities automatically satisfy full two-sided `ProductiveBoth` from
+`hChoiceMR` and `hChoiceLM` alone. -/
+theorem fromEquivGated_productiveBoth_of_reverseTotal
+    (codec : CodecLaws RetA Rep) (repMR : RetMR → Rep) (repLM : RetLM → Rep)
+    (evalA : ModeA → Prog → Query → ExecOutcome4 RetA UnwA)
+    (toAnnealMR : ModeMR → ModeA) (toAnnealLM : ModeLM → ModeA)
+    (gateMR : ModeMR → Prog → Query → Prop)
+    (gateLM : ModeLM → Prog → Query → Prop)
+    (validChoiceMR : ModeMR → Prog → Query → ChoiceMR → Prop)
+    (validChoiceLM : ModeLM → Prog → Query → ChoiceLM → Prop)
+    (hChoiceMR : ∀ m p q, ∃ c, validChoiceMR m p q c)
+    (hChoiceLM : ∀ m p q, ∃ c, validChoiceLM m p q c)
+    (ExecMR :
+      ModeMR → Prog → Query → ChoiceMR → ExecOutcome4 RetMR UnwMR → Prop)
+    (ExecLM :
+      ModeLM → Prog → Query → ChoiceLM → ExecOutcome4 RetLM UnwLM → Prop)
+    (RetRelMR : RetA → RetMR → Prop) (UnwRelMR : UnwA → UnwMR → Prop)
+    (RetRelLM : RetA → RetLM → Prop) (UnwRelLM : UnwA → UnwLM → Prop)
+    (hRetMR : ∀ a r, RetRelMR a r → repMR r = codec.encode a)
+    (hRetLM : ∀ a r, RetRelLM a r → repLM r = codec.encode a)
+    (fwdMR : ∀ m p q c out, gateMR m p q → ExecMR m p q c out →
+      validChoiceMR m p q c ∧
+      ChoiceCoupledOutcomeRel RetRelMR UnwRelMR (evalA (toAnnealMR m) p q) out)
+    (revMR : ∀ m p q c k, gateMR m p q → validChoiceMR m p q c →
+      evalA (toAnnealMR m) p q = .fault k → ExecMR m p q c (.fault k))
+    (fwdLM : ∀ m p q c out, gateLM m p q → ExecLM m p q c out →
+      validChoiceLM m p q c ∧
+      ChoiceCoupledOutcomeRel RetRelLM UnwRelLM (evalA (toAnnealLM m) p q) out)
+    (revLM : ∀ m p q c k, gateLM m p q → validChoiceLM m p q c →
+      evalA (toAnnealLM m) p q = .fault k → ExecLM m p q c (.fault k))
+    (mrPositive : PositiveWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealMR gateMR validChoiceMR evalA
+        ExecMR RetRelMR UnwRelMR))
+    (lmPositive : PositiveWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealLM gateLM validChoiceLM evalA
+        ExecLM RetRelLM UnwRelLM))
+    (mrFault : FaultEquivWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealMR gateMR validChoiceMR evalA
+        ExecMR RetRelMR UnwRelMR))
+    (lmFault : FaultEquivWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealLM gateLM validChoiceLM evalA
+        ExecLM RetRelLM UnwRelLM))
+    (hmMR : mrFault.m = mrPositive.m) (hmLM : lmFault.m = lmPositive.m)
+    (mrMode? : Option (ModeSensitivityWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealMR gateMR validChoiceMR evalA
+        ExecMR RetRelMR UnwRelMR)) := none)
+    (lmMode? : Option (ModeSensitivityWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealLM gateLM validChoiceLM evalA
+        ExecLM RetRelLM UnwRelLM)) := none)
+    (hrevMR :
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealMR gateMR validChoiceMR evalA
+        ExecMR RetRelMR UnwRelMR).ReverseTotal)
+    (hrevLM :
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealLM gateLM validChoiceLM evalA
+        ExecLM RetRelLM UnwRelLM).ReverseTotal) :
+    let B :=
+      fromEquivGated codec repMR repLM evalA toAnnealMR toAnnealLM gateMR
+        gateLM validChoiceMR validChoiceLM hChoiceMR hChoiceLM ExecMR ExecLM
+        RetRelMR UnwRelMR RetRelLM UnwRelLM hRetMR hRetLM fwdMR revMR fwdLM
+        revLM mrPositive lmPositive mrFault lmFault hmMR hmLM mrMode? lmMode?
+        (some ⟨hrevMR⟩) (some ⟨hrevLM⟩)
+    B.mrRel.ProductiveBoth ∧ B.lmRel.ProductiveBoth := by
+  intro B
+  have hProdA :=
+    fromEquivGated_productiveAnneal codec repMR repLM evalA toAnnealMR
+      toAnnealLM gateMR gateLM validChoiceMR validChoiceLM hChoiceMR hChoiceLM
+      ExecMR ExecLM RetRelMR UnwRelMR RetRelLM UnwRelLM hRetMR hRetLM fwdMR
+      revMR fwdLM revLM mrPositive lmPositive mrFault lmFault hmMR hmLM mrMode?
+      lmMode? (some ⟨hrevMR⟩) (some ⟨hrevLM⟩)
+  exact B.fromEquiv_productiveBoth_of_reverseTotal hProdA.1 hProdA.2 hrevMR
+    hrevLM
 
 /--
 Tightness of `ProductiveBoth` vs `fromEquiv_productiveAnneal`
