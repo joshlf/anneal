@@ -77,6 +77,12 @@ bit-for-bit after every step. No shadow evaluator is defined.
   formats), `wfcW4_signed_negative_ties` (signed negative `i32` / `i64` halfway ties and
   `i64::MIN + 1`), and `wfcW4_ties_all_wide_sources` (the `2²⁴ ± …` / `2⁵³ ± …` tie behaviour is
   the same for **every** source type wide enough to hold it).
+* **`Cast.cast` level**: `wfc_cast_two_sided` / `wfcCast_two_sided_table` pin
+  `Miri.Interpreter.Cast.cast` (refinement hooks) to the `ScalarRel`-image of Anneal's
+  `evalFloatCast` for **every** related source scalar, on `.FloatToFloat`, `.FloatToInt`, and
+  `.IntToFloat` instances (subnormal tie, `-0.0`, sNaN quieting, saturation, NaN `↦ 0`, truncation,
+  `u128::MAX ↦ +∞`, ties to even, `i128::MIN`). `wfcLockstep_eq_mode` / `wfcReturns_eq_mode` /
+  `wfcRun_iff_mode` show the refinement-witness predicates are instances of the mode-generic ones.
 * **(W5)** `wfcW5_uninit_source_ub`, `wfcW5_moved_from_ub`, `wfcW5_dead_source_ub` (from program
   entry, through `StorageLive` / `StorageDead`) fault with `.ub` in both machines
   (`StepRelLM3_1.ub`); `wfcW5_f16_f128_fail_closed` + `wfcW5_f16_f128_uninit_source_vs_target`
@@ -1050,6 +1056,30 @@ def WfcReturnsMode (b : CapturedMir) (nondet : Bool)
   ∃ decl0 imm, get? b.localDecls 0 = some decl0 ∧
     annealControlHooks.returnOperand () m = (m, .ok (.immediate imm)) ∧
     ImmediateRel decl0.ty b.layouts v imm
+
+/-- The refinement-witness lockstep step `WfcLockstep` *is* the `nondet := true`,
+`chooseNaN := annealChooseQuietedNaN` instance of `WfcLockstepMode` (one specification, not two). -/
+theorem wfcLockstep_eq_mode (b : CapturedMir) (s s' : MachineState) (m m' : AnnealStepState)
+    (k bits w : Nat) :
+    WfcLockstep b s s' m m' k bits w =
+      WfcLockstepMode b true annealChooseQuietedNaN s s' m m' k bits w := rfl
+
+/-- `WfcReturns` *is* the refinement-witness instance of `WfcReturnsMode`. -/
+theorem wfcReturns_eq_mode (b : CapturedMir) (s : MachineState) (m : AnnealStepState)
+    (v : Value) : WfcReturns b s m v = WfcReturnsMode b true annealChooseQuietedNaN s m v := rfl
+
+/-- `WfcRun` coincides with the refinement-witness instance of `WfcRunMode`. -/
+theorem wfcRun_iff_mode {b : CapturedMir} {s s' : MachineState} {m m' : AnnealStepState} :
+    WfcRun b s m s' m' ↔ WfcRunMode b true annealChooseQuietedNaN s m s' m' := by
+  constructor
+  · intro h
+    induction h with
+    | refl s m => exact .refl s m
+    | step h₁ h₂ h₃ _ ih => exact .step h₁ h₂ h₃ ih
+  · intro h
+    induction h with
+    | refl s m => exact .refl s m
+    | step h₁ h₂ h₃ _ ih => exact .step h₁ h₂ h₃ ih
 
 /-- `FloatCastDetAgrees` witness for `.floatToFloat` between concrete `srcTy` / `castTy`. -/
 theorem wfc_detAgrees_f2f {srcTy castTy : Ty} {sf df : IeeeFormat} {bits : Nat}
@@ -3188,6 +3218,69 @@ theorem wfcW4_ties_all_wide_sources (s : FloatIntTarget) :
         wfc_fromInteger _ _ _ _ (by decide +kernel),
         wfc_fromInteger _ _ _ _ (by decide +kernel)⟩
 
+/-! ## Two-sided `Miri.Interpreter.Cast.cast` witnesses for all three cast kinds -/
+
+/-- **Two-sided `Cast.cast` instance**: if Anneal's `evalFloatCast` maps the source scalar `sc` to
+`⟨V, w⟩`, then for **every** `ScalarRel`-related `lean-miri` source scalar, `lean-miri`'s
+`Cast.cast` under `annealCastHooksFloat emptyLayoutTable` writes exactly a `ScalarRel`-image of
+`⟨V, w⟩` into the destination (`floatCast_result_spec`). -/
+theorem wfc_cast_two_sided {kind : CastKind} {srcTy dstTy : Ty} (hsig : FloatCastSig kind srcTy dstTy)
+    {sc : MirAst.ScalarInt} {V w : Nat}
+    (hsz : (translateTy srcTy emptyLayoutTable).layout.size = translateSizeBytes sc.sizeBytes)
+    (hev : evalFloatCast kind (some srcTy) dstTy emptyLayoutTable (.scalar sc) =
+      some (.scalar ⟨V, w⟩))
+    (destRef : Miri.Interpreter.RuntimePlaceRef AnnealProv) :
+    evalFloatCast kind (some srcTy) dstTy emptyLayoutTable (.scalar sc) = some (.scalar ⟨V, w⟩) ∧
+    ∀ msc, ScalarRel sc msc → ∃ msc', ScalarRel ⟨V, w⟩ msc' ∧
+      Miri.Interpreter.Cast.cast (annealCastHooksFloat emptyLayoutTable) () 16
+          ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy emptyLayoutTable⟩
+          (translateCastKind kind) (encodeTyId dstTy) ⟨destRef, translateTy dstTy emptyLayoutTable⟩ =
+        annealWriteImmediate (.scalar (.fromScalarInt msc'))
+          ⟨destRef, translateTy dstTy emptyLayoutTable⟩ := by
+  refine ⟨hev, fun msc hrel => ?_⟩
+  obtain ⟨sc', msc', hev', hrel', _, hcast⟩ :=
+    floatCast_result_spec emptyLayoutTable rfl hsig hrel hsz destRef
+  rw [hev] at hev'
+  injection hev' with h₁
+  injection h₁ with h₂
+  subst h₂
+  exact ⟨msc', hrel', hcast⟩
+
+/-- **Two-sided `Miri.Interpreter.Cast.cast` table for `.FloatToFloat`, `.FloatToInt`, and
+`.IntToFloat`** (refinement-witness hooks): for every `ScalarRel`-related source, `lean-miri`'s
+`Cast.cast` writes the image of Anneal's `evalFloatCast` result: the subnormal tie
+`1.5·2⁻¹⁴⁹_f64 ↦ 0x0000_0002_f32`, `-0.0_f64 ↦ -0.0_f32`, the signaling `0x7F80_0001_f32 ↦
+0x7FF8_0000_2000_0000_f64`, `+∞_f32 ↦ i8::MAX`, `NaN_f64 ↦ 0_u128`, `-2.9_f64 ↦ -2_i64`,
+`u128::MAX ↦ +∞_f32`, `(2⁵³ + 1)_u64 ↦ 2⁵³_f64` (tie to even), and `i128::MIN ↦ -2¹²⁷_f32`. -/
+theorem wfcCast_two_sided_table (destRef : Miri.Interpreter.RuntimePlaceRef AnnealProv) :
+    let castOK (kind : CastKind) (srcTy dstTy : Ty) (sc : MirAst.ScalarInt) (V w : Nat) :=
+      evalFloatCast kind (some srcTy) dstTy emptyLayoutTable (.scalar sc) = some (.scalar ⟨V, w⟩) ∧
+      ∀ msc, ScalarRel sc msc → ∃ msc', ScalarRel ⟨V, w⟩ msc' ∧
+        Miri.Interpreter.Cast.cast (annealCastHooksFloat emptyLayoutTable) () 16
+            ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy emptyLayoutTable⟩
+            (translateCastKind kind) (encodeTyId dstTy) ⟨destRef, translateTy dstTy emptyLayoutTable⟩ =
+          annealWriteImmediate (.scalar (.fromScalarInt msc'))
+            ⟨destRef, translateTy dstTy emptyLayoutTable⟩
+    castOK .floatToFloat wfcF64Ty wfcF32Ty ⟨0x36A8000000000000, 8⟩ 0x2 4 ∧
+    castOK .floatToFloat wfcF64Ty wfcF32Ty ⟨0x8000000000000000, 8⟩ 0x80000000 4 ∧
+    castOK .floatToFloat wfcF32Ty wfcF64Ty ⟨0x7F800001, 4⟩ 0x7FF8000020000000 8 ∧
+    castOK .floatToInt wfcF32Ty (wfcIntTy .i8) ⟨0x7F800000, 4⟩ 0x7F 1 ∧
+    castOK .floatToInt wfcF64Ty (wfcUintTy .u128) ⟨0x7FF8000000000000, 8⟩ 0 16 ∧
+    castOK .floatToInt wfcF64Ty (wfcIntTy .i64) ⟨0xC007333333333333, 8⟩ 0xFFFFFFFFFFFFFFFE 8 ∧
+    castOK .intToFloat (wfcUintTy .u128) wfcF32Ty ⟨2 ^ 128 - 1, 16⟩ 0x7F800000 4 ∧
+    castOK .intToFloat (wfcUintTy .u64) wfcF64Ty ⟨2 ^ 53 + 1, 8⟩ 0x4340000000000000 8 ∧
+    castOK .intToFloat (wfcIntTy .i128) wfcF32Ty ⟨2 ^ 127, 16⟩ 0xFF000000 4 := by
+  intro castOK
+  exact ⟨wfc_cast_two_sided (.floatToFloat rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided (.floatToFloat rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided (.floatToFloat rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided (.floatToInt rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided (.floatToInt rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided (.floatToInt rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided (.intToFloat rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided (.intToFloat rfl rfl) rfl rfl destRef,
+    wfc_cast_two_sided (.intToFloat rfl rfl) rfl rfl destRef⟩
+
 /-! ## (W5) Negative controls: UB, fail-closed boundaries, and memory-backed locals -/
 
 /-- **(W5a) uninitialized-source body** `bb0: StorageLive(_1); _0 = copy _1 as u32; return`
@@ -5215,6 +5308,27 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_step_storageDead' depends on
 #print axioms wfc_step_storageDead
 
 /--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcLockstep_eq_mode' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcLockstep_eq_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcReturns_eq_mode' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcReturns_eq_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcRun_iff_mode' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcRun_iff_mode
+
+/--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_detAgrees_f2f' depends on axioms:
   [propext]
 -/
@@ -5516,6 +5630,20 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW4_ties_all_wide_sources' dep
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW4_ties_all_wide_sources
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_cast_two_sided' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_cast_two_sided
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcCast_two_sided_table' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcCast_two_sided_table
 
 /--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5U_anneal_run' depends on axioms:
