@@ -10,8 +10,7 @@
 """Fail-closed verifier for `lean-miri/UPSTREAM_PIN.json`, the vendored
 `lean-miri/vendor/` tree, and the active `elan` Lean toolchain.
 
-Stdlib-only Python 3 (promoted from the validated `af95b30265`
-`verify_lean_miri_pin_proto.py` prototype). Every check fails closed: anything
+Stdlib-only Python 3. Every check fails closed: anything
 that is not positively verified is reported as an error, and the CLI exits
 non-zero listing every error found. The module defines no `@dataclass` (result
 records are `typing.NamedTuple`s), so it also loads through
@@ -1788,6 +1787,8 @@ def elf_dynamic_entries(
                 strsz = val
         if not saw_dt_null:
             raise ValueError("unterminated PT_DYNAMIC segment (missing DT_NULL)")
+        if any(t in (0x7FFFFFFD, 0x7FFFFFFF) for t, _ in entries):  # DT_AUXILIARY, DT_FILTER
+            raise ValueError("unsupported ELF dynamic filter tag (DT_AUXILIARY/DT_FILTER)")
         if strtab is None or strsz is None:
             if any(t in (1, 15, 29) for t, _ in entries):
                 raise ValueError("DT_NEEDED/DT_RUNPATH present without DT_STRTAB/DT_STRSZ")
@@ -1835,6 +1836,8 @@ def _validate_runpath_entry(entry: str, origin: str, real_root: str) -> Tuple[Op
     if not os.path.isabs(expanded):
         return None, "unsupported"
     m = _ORIGIN_DST_RE.match(entry)
+    if m is None and _ORIGIN_DST_RE.search(entry) is not None:
+        return None, "unsupported"
     if m is not None:
         rest = entry[m.end():]
         if _ORIGIN_DST_RE.search(rest) is not None:
@@ -1861,10 +1864,39 @@ def _validate_runpath_entry(entry: str, origin: str, real_root: str) -> Tuple[Op
     else:
         if any(part in (".", "..") for part in expanded.split("/")):
             return None, "outside"
+        if expanded != "/" and (expanded.endswith("/") or "//" in expanded):
+            return None, "unsupported"
     real = os.path.realpath(expanded)
     if real == real_root or not real.startswith(real_root + os.sep):
         return None, "outside"
     return Path(os.path.normpath(expanded)), None
+
+
+def _runpath_dir_problem(root: Path, directory: Path) -> Optional[str]:
+    """Why `directory` (or an existing ancestor up to `root`) is unsafe as a
+    `DT_RUNPATH` search directory: symlink, non-directory, or world-writable."""
+    dir_rel = os.path.relpath(directory, root).replace(os.sep, "/")
+    try:
+        root_st = os.lstat(root)
+    except OSError as exc:
+        return f"DT_RUNPATH search directory {dir_rel} is unreadable ({exc.strerror})"
+    if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode) or (root_st.st_mode & stat.S_IWOTH):
+        return f"DT_RUNPATH search directory {dir_rel} is world-writable or not a directory"
+    parts = [p for p in dir_rel.split("/") if p and p != "."]
+    for i in range(1, len(parts) + 1):
+        cur = root.joinpath(*parts[:i])
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            # The parent component (`i - 1`, or `root` when `i == 1`) is an existing
+            # non-symlink, non-world-writable directory, so an unprivileged account
+            # cannot create `cur` after this check.
+            break
+        except OSError as exc:
+            return f"DT_RUNPATH search directory {dir_rel} is unreadable ({exc.strerror})"
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or (st.st_mode & stat.S_IWOTH):
+            return f"DT_RUNPATH search directory {dir_rel} is world-writable or not a directory"
+    return None
 
 
 def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequence[str], files: Mapping[str, str], c: _Collector) -> None:
@@ -1930,13 +1962,9 @@ def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequ
                 continue
             if directory not in search_dirs:
                 search_dirs.append(directory)
-                try:
-                    dir_st = os.stat(directory)
-                except OSError:
-                    dir_st = None
-                if dir_st is not None and (not stat.S_ISDIR(dir_st.st_mode) or dir_st.st_mode & stat.S_IWOTH):
-                    dir_rel = os.path.relpath(directory, toolchain_dir).replace(os.sep, "/")
-                    c.err("toolchain", f"{rel}: DT_RUNPATH search directory {dir_rel} is world-writable or not a directory")
+                dir_problem = _runpath_dir_problem(toolchain_dir, directory)
+                if dir_problem is not None:
+                    c.err("toolchain", f"{rel}: {dir_problem}")
         for soname in needed:
             if "/" in soname or "\\" in soname or "$" in soname or soname in ("", ".", ".."):
                 c.err("toolchain", f"{rel}: DT_NEEDED entry {soname!r} is a path")
@@ -2055,6 +2083,7 @@ def _verify_toolchain_impl(
             "toolchain",
             f"toolchain drift: {LEAN_TOOLCHAIN_RELPATH} is {name!r} but UPSTREAM_PIN.json build_lean_toolchain is {expected_toolchain!r}",
         )
+    integrity_errors_before = len(c.errors)
     resolved_by = "override"
     home: Optional[Path] = None
     if toolchain_dir is None:
@@ -2068,7 +2097,6 @@ def _verify_toolchain_impl(
         c.fatal("toolchain", f"active toolchain {name!r} is not installed as a real directory at {toolchain_dir}")
     real_root = os.path.realpath(toolchain_dir)
 
-    integrity_errors_before = len(c.errors)
     for rel in ("bin", "lib", "lib/lean"):
         _check_toolchain_path(toolchain_dir, real_root, rel, want_dir=True, c=c)
     parent_lib_dir = toolchain_dir / "lib"

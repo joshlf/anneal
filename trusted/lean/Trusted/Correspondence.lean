@@ -2733,10 +2733,24 @@ def claimDerefBorrows : List BorrowEntry :=
        `.uninit`, `[copy _l, move _l]` returns `[v, v]`, and `[move _l, copy _l]` /
        `[move _l, move _l]` fault with `.ub`; if it is zero-sized (a `0`-byte
        declared type) the move deinitializes nothing and `[move _l, copy _l]`
-       returns `[v, v]` with `locals` unchanged; and
+       returns `[v, v]` with `locals` unchanged;
    14. (*non-vacuity of the zero-sized polarity of 13*) some typed context holds
        a non-`unit` value that is zero-sized there (but not in the untyped
-       context) and survives `[move _l, copy _l]`. -/
+       context) and survives `[move _l, copy _l]`;
+   15. (*projected field moves in every non-union typed context, all states*) for
+       any local declarations in which `_l.idx` does not touch a union, copying an
+       initialized aggregate field `_l.idx` (without a moved-out leaf) returns its
+       value; if the moved field is not zero-sized (`moveValueIsZeroSized`), moving
+       `_l.idx` returns it and deinitializes only that field so `[copy _l.idx,
+       move _l.idx]` returns `[v, v]`, `[move _l.idx, copy _l.idx]` and `[move _l.idx,
+       move _l.idx]` fault with `.ub`, and `[move _l.idx, copy _l.j]` returns
+       `[v, w]` on every non-union sibling field `j ≠ idx`; if the moved field is
+       zero-sized, moving `_l.idx` leaves the aggregate intact so both
+       `[move _l.idx, copy _l.idx]` and `[move _l.idx, copy _l]` succeed; and
+   16. (*non-vacuity of both polarities of 15*) on a typed aggregate `_1 : ((), u8)`
+       whose `0`-byte field holds `.aggregate 0 [] ≠ .unit`, `[move _1.0, copy _1]`
+       succeeds in the typed context while faulting with `.ub` in the untyped
+       context, and `[move _1.1, copy _1]` faults with `.ub`. -/
 def TrustedProjectedMoveDeinitClaim : Prop :=
   -- (a) root moves (legacy `false` and `deinitProjectedMoves := true`)
   (∀ (locals locals' : List LocalSlot) (l : Local) (v : Value) (borrows : List BorrowEntry)
@@ -3026,6 +3040,66 @@ def TrustedProjectedMoveDeinitClaim : Prop :=
       true ∧
     moveValueIsZeroSized [] layouts (placeTyResolved [] layouts ⟨l, []⟩) v = false ∧
     evalOperands locals [.move ⟨l, []⟩, .copy ⟨l, []⟩] [] [] layouts [] localDecls [] true =
-      .ok [v, v] locals)
+      .ok [v, v] locals) ∧
+  -- (c15) projected field moves in every non-union typed context (any `localDecls`),
+  --       both zero-sized polarities, sibling preservation, and live `evalOperands` order
+  (∀ (locals : List LocalSlot) (l : Local) (variant : VariantIdx) (fields : List Value)
+      (idx : FieldIdx) (fty : Ty) (v : Value) (borrows : List BorrowEntry)
+      (globals : List CapturedAllocation) (layouts : LayoutTable)
+      (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+      (callStack : List SavedCallerFrame),
+    Trusted.Sequence.get? locals l = some (.init (.aggregate variant fields)) →
+    Trusted.Sequence.get? fields idx = some v →
+    placeTouchesUnion localDecls layouts ⟨l, [.field idx fty]⟩ = false →
+    valueContainsMovedUninit v = false →
+    evalOperand locals (.copy ⟨l, [.field idx fty]⟩) borrows globals layouts callerLocals
+      localDecls callStack true = .ok v locals ∧
+    (moveValueIsZeroSized localDecls layouts
+        (placeTyResolved localDecls layouts ⟨l, [.field idx fty]⟩) v = false →
+      ∃ locals',
+        evalOperand locals (.move ⟨l, [.field idx fty]⟩) borrows globals layouts callerLocals
+          localDecls callStack true = .ok v locals' ∧
+        evalOperands locals [.copy ⟨l, [.field idx fty]⟩, .move ⟨l, [.field idx fty]⟩]
+          borrows globals layouts callerLocals localDecls callStack true = .ok [v, v] locals' ∧
+        evalOperands locals [.move ⟨l, [.field idx fty]⟩, .copy ⟨l, [.field idx fty]⟩]
+          borrows globals layouts callerLocals localDecls callStack true = .ub ∧
+        evalOperands locals [.move ⟨l, [.field idx fty]⟩, .move ⟨l, [.field idx fty]⟩]
+          borrows globals layouts callerLocals localDecls callStack true = .ub ∧
+        ∀ (j : FieldIdx) (jty : Ty) (w : Value), j ≠ idx →
+          Trusted.Sequence.get? fields j = some w →
+          placeTouchesUnion localDecls layouts ⟨l, [.field j jty]⟩ = false →
+          valueContainsMovedUninit w = false →
+          evalOperands locals [.move ⟨l, [.field idx fty]⟩, .copy ⟨l, [.field j jty]⟩]
+            borrows globals layouts callerLocals localDecls callStack true =
+              .ok [v, w] locals') ∧
+    (moveValueIsZeroSized localDecls layouts
+        (placeTyResolved localDecls layouts ⟨l, [.field idx fty]⟩) v = true →
+      evalOperand locals (.move ⟨l, [.field idx fty]⟩) borrows globals layouts callerLocals
+        localDecls callStack true = .ok v locals ∧
+      evalOperands locals [.move ⟨l, [.field idx fty]⟩, .copy ⟨l, [.field idx fty]⟩]
+        borrows globals layouts callerLocals localDecls callStack true = .ok [v, v] locals ∧
+      (valueListContainsMovedUninit fields = false →
+        evalOperands locals [.move ⟨l, [.field idx fty]⟩, .copy ⟨l, []⟩]
+          borrows globals layouts callerLocals localDecls callStack true =
+            .ok [v, .aggregate variant fields] locals))) ∧
+  -- (c16) non-vacuity of both polarities of (c15) on `_1 : ((), u8)`
+  (∃ (locals : List LocalSlot) (l : Local) (fty0 fty1 : Ty) (v0 v1 root : Value)
+      (layouts : LayoutTable) (localDecls : List LocalDecl),
+    v0 ≠ .unit ∧
+    Trusted.Sequence.get? locals l = some (.init root) ∧
+    placeTouchesUnion localDecls layouts ⟨l, [.field 0 fty0]⟩ = false ∧
+    placeTouchesUnion localDecls layouts ⟨l, [.field 1 fty1]⟩ = false ∧
+    moveValueIsZeroSized localDecls layouts
+      (placeTyResolved localDecls layouts ⟨l, [.field 0 fty0]⟩) v0 = true ∧
+    moveValueIsZeroSized [] layouts
+      (placeTyResolved [] layouts ⟨l, [.field 0 fty0]⟩) v0 = false ∧
+    moveValueIsZeroSized localDecls layouts
+      (placeTyResolved localDecls layouts ⟨l, [.field 1 fty1]⟩) v1 = false ∧
+    evalOperands locals [.move ⟨l, [.field 0 fty0]⟩, .copy ⟨l, []⟩] [] [] layouts [] localDecls
+      [] true = .ok [v0, root] locals ∧
+    evalOperands locals [.move ⟨l, [.field 0 fty0]⟩, .copy ⟨l, []⟩] [] [] layouts [] []
+      [] true = .ub ∧
+    evalOperands locals [.move ⟨l, [.field 1 fty1]⟩, .copy ⟨l, []⟩] [] [] layouts [] localDecls
+      [] true = .ub)
 
 end Trusted.Correspondence

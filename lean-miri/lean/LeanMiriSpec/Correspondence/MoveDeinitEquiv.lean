@@ -197,12 +197,38 @@ elab "unfold_named " n:str : tactic => do
         evalTactic (← `(tactic| unfold $(mkIdent name):ident))
     unless found do throwError "constant {target} not found"
 
+open Lean Elab Tactic in
+/-- Unfold auxiliary `.match_*` and `._sparseCasesOn_*` constants in the current goal so
+structural congruence lemmas can step lockstep across a definition and its legacy copy. -/
+elab "unfold_wstd_matches" : tactic => do
+  for _ in [:4] do
+    let goal ← getMainTarget
+    let mut names : Array Ident := #[]
+    for n in goal.getUsedConstants do
+      let s := n.toString
+      if (s.splitOn ".match_").length > 1 || (s.splitOn "._sparseCasesOn_").length > 1 then
+        names := names.push (mkIdent n)
+    if names.isEmpty then break
+    evalTactic (← `(tactic| delta $names*))
+
+open Lean Elab Tactic in
+/-- Generalize and case-split the shared discriminant of a `Bool.rec` application on the LHS. -/
+elab "cases_lhs_app_fn_arg" : tactic => withMainContext do
+  let mvar ← getMainGoal
+  let tgt ← Lean.instantiateMVars (← mvar.getType)
+  let some (_, lhs, _) := tgt.eq? | throwError "not an eq"
+  let scrut := lhs.appFn!.appArg!
+  let (fvars, mvar') ← mvar.generalize #[{ expr := scrut }]
+  let subgoals ← mvar'.cases fvars[0]!
+  replaceMainGoal (subgoals.toList.map (·.mvarId))
+
 end LeanMiriSpec.Correspondence.MoveDeinitEquivTactic
 
 namespace LeanMiriSpec.Correspondence.MoveDeinitEquiv
 
 section TrustedPart
 
+open LeanMiriSpec.Correspondence.MoveDeinitEquivTactic
 open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01
 open Trusted.Rustc.V2026_06_01.Layout
@@ -801,6 +827,453 @@ def legacyInferElemListByteStride : List Value → Nat
     | .none => 1
   | _ => 1
 
+/-- Verbatim copy of `Trusted.Rustc.V2026_06_01.MirSemantics.writeStackThinPtrTypedDeref`
+before the `movedUninitValue` re-initialization branch was added in Episode 1. -/
+def legacyWriteStackThinPtrTypedDeref
+    (indexLocals : List LocalSlot)
+    (targetLocals : List LocalSlot)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (restProj : List ProjectionElem)
+    (val : Value)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (pointeeTyOpt : Option Ty)
+    (accessedTyOpt : Option Ty)
+    (targetDecls : List LocalDecl := localDecls)
+    (targetLayouts : LayoutTable := layouts) :
+    PlaceWriteResult :=
+  let isSyntheticFieldOnScalarPointee : Bool :=
+    match stripTransparentProjections restProj, pointeeTyOpt with
+    | .field _ _ :: _, .some { kind := .bool, .. } => true
+    | .field _ _ :: _, .some { kind := .char, .. } => true
+    | .field _ _ :: _, .some { kind := .int _, .. } => true
+    | .field _ _ :: _, .some { kind := .uint _, .. } => true
+    | .field _ _ :: _, .some { kind := .float _, .. } => true
+    | _, _ => false
+  let effPointeeTyOpt : Option Ty :=
+    match isSyntheticFieldOnScalarPointee, pointeeTyOpt with
+    | true, _ => .none
+    | false, .some pt => .some (resolveTyWithLocalDecls localDecls layouts pt)
+    | false, .none => .none
+  let resolvedAccTyOpt : Option Ty :=
+    match accessedTyOpt with
+    | .some accTy => .some (resolveTyWithLocalDecls localDecls layouts accTy)
+    | .none => .none
+  let alignTyOpt : Option Ty :=
+    match effPointeeTyOpt, restProj with
+    | .some pt, _ => .some pt
+    | .none, .nil => resolvedAccTyOpt
+    | .none, _ :: _ => .none
+  let targetRootValOpt : Option Value :=
+    match get? targetLocals entry.targetLocal with
+    | .some (.init v) => .some v
+    | _ => .none
+  match
+    Bool.and
+      (checkDerefAlign localDecls layouts alignTyOpt ptrVal.offsetBytes)
+      (Bool.and
+        (checkTargetPlaceAlign
+          targetDecls
+          layouts
+          alignTyOpt
+          entry
+          ptrVal
+          targetRootValOpt
+          targetLayouts
+          localDecls)
+        (validateValueForTy? layouts resolvedAccTyOpt val))
+  with
+  | false => .ub
+  | true =>
+    let rawFullProj :=
+      match entry.targetProjection with
+      | .nil => restProj
+      | ph :: pt => ph :: appendProjections pt restProj
+    let effTargetDecls : List LocalDecl :=
+      match targetDecls with
+      | _ :: _ => targetDecls
+      | .nil =>
+        inferCallerTargetDecls
+          localDecls
+          layouts
+          entry
+          rawFullProj
+          ptrVal.offsetBytes
+          effPointeeTyOpt
+    let inScalarSpliceOpt : Option PlaceWriteResult :=
+      match restProj, val, get? targetLocals entry.targetLocal with
+      | .nil, .scalar wSc, .some (.init targetRootVal) =>
+        match
+          readProjectedForLocal
+            indexLocals
+            effTargetDecls
+            targetLayouts
+            entry.targetLocal
+            targetRootVal
+            rawFullProj
+        with
+        | .ok (.scalar oldSc) =>
+          match spliceScalarSlice? oldSc ptrVal.offsetBytes wSc with
+          | .none => .none
+          | .some mergedSc =>
+            match rawFullProj with
+            | .nil =>
+              match set? targetLocals entry.targetLocal (.init (.scalar mergedSc)) with
+              | .some targetLocals' => .some (.ok targetLocals')
+              | .none => .some .ub
+            | pHead :: pTail =>
+              match
+                writeProjectedForLocal
+                  indexLocals
+                  effTargetDecls
+                  targetLayouts
+                  entry.targetLocal
+                  targetRootVal
+                  (pHead :: pTail)
+                  (.scalar mergedSc)
+              with
+              | .ok targetRootVal' =>
+                match set? targetLocals entry.targetLocal (.init targetRootVal') with
+                | .some targetLocals' => .some (.ok targetLocals')
+                | .none => .some .ub
+              | .ub => .some .ub
+              | .unsupported => .some .unsupported
+        | _ => .none
+      | _, _, _ => .none
+    match inScalarSpliceOpt with
+    | .some res => res
+    | .none =>
+      match get? targetLocals entry.targetLocal with
+      | .some (.init targetRootVal) =>
+        let commitAtProj : List ProjectionElem → Value → PlaceWriteResult :=
+          fun proj storeVal =>
+            match proj with
+            | .nil =>
+              match set? targetLocals entry.targetLocal (.init storeVal) with
+              | .some targetLocals' => .ok targetLocals'
+              | .none => .ub
+            | pHead :: pTail =>
+              match
+                writeProjectedForLocal
+                  indexLocals
+                  effTargetDecls
+                  targetLayouts
+                  entry.targetLocal
+                  targetRootVal
+                  (pHead :: pTail)
+                  storeVal
+              with
+              | .ok targetRootVal' =>
+                match set? targetLocals entry.targetLocal (.init targetRootVal') with
+                | .some targetLocals' => .ok targetLocals'
+                | .none => .ub
+              | .ub => .ub
+              | .unsupported => .unsupported
+        let spliceIntoRootViaEntryOffset : PlaceWriteResult :=
+          match restProj, get? effTargetDecls entry.targetLocal with
+          | .nil, .some rootDecl =>
+            let normEntryProj :=
+              normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
+            match
+              projectionChainByteOffset?
+                targetLayouts
+                (.some rootDecl.ty)
+                (.some targetRootVal)
+                .none
+                0
+                effTargetDecls
+                normEntryProj
+            with
+            | .none => .ub
+            | .some baseOff =>
+              match
+                spliceSubValueAtByteOffset?
+                  localDecls
+                  effTargetDecls
+                  targetLayouts
+                  (.some (resolveTyWithLocalDecls effTargetDecls targetLayouts rootDecl.ty))
+                  targetRootVal
+                  (Nat.add baseOff ptrVal.offsetBytes)
+                  resolvedAccTyOpt
+                  val
+                  layouts
+              with
+              | .some splicedRoot => commitAtProj .nil splicedRoot
+              | .none => .ub
+          | _, _ => .ub
+        let reqBytesOpt : Option Nat :=
+          match restProj, val with
+          | .nil, .scalar wSc => .some wSc.sizeBytes
+          | .nil, _ =>
+            match resolvedAccTyOpt with
+            | .some accTy => tyByteSize localDecls layouts accTy
+            | .none => .none
+          | _ :: _, _ => .none
+        match isSyntheticFieldOnScalarPointee, entry.targetProjection with
+        | true, .nil => commitAtProj rawFullProj val
+        | _, _ =>
+          let resolvedProjOpt : Option (List ProjectionElem × Nat) :=
+            resolveStackThinPtrTargetProjWithResidual?
+              indexLocals
+              targetRootVal
+              entry
+              ptrVal
+              restProj
+              effTargetDecls
+              targetLayouts
+              effPointeeTyOpt
+              reqBytesOpt
+              localDecls
+              layouts
+          match resolvedProjOpt with
+          | .none =>
+            match restProj with
+            | _ :: _ => .ub
+            | .nil =>
+              match
+                readProjectedForLocal
+                  indexLocals
+                  effTargetDecls
+                  targetLayouts
+                  entry.targetLocal
+                  targetRootVal
+                  entry.targetProjection
+              with
+              | .ok oldBaseVal =>
+                let baseSubTyOpt :=
+                  placeTyResolved
+                    effTargetDecls
+                    targetLayouts
+                    { local_ := entry.targetLocal, projection := entry.targetProjection }
+                match
+                  spliceSubValueAtByteOffset?
+                    localDecls
+                    effTargetDecls
+                    targetLayouts
+                    baseSubTyOpt
+                    oldBaseVal
+                    ptrVal.offsetBytes
+                    resolvedAccTyOpt
+                    val
+                    layouts
+                with
+                | .some splicedBase => commitAtProj entry.targetProjection splicedBase
+                | .none => .ub
+              | .ub =>
+                match
+                  placeTouchesUnion
+                    effTargetDecls
+                    targetLayouts
+                    { local_ := entry.targetLocal, projection := entry.targetProjection }
+                with
+                | true => spliceIntoRootViaEntryOffset
+                | false => .ub
+              | .unsupported => .unsupported
+          | .some (fullProj, residualBytes) =>
+            match
+              readProjectedForLocal
+                indexLocals
+                effTargetDecls
+                targetLayouts
+                entry.targetLocal
+                targetRootVal
+                fullProj
+            with
+            | .ub =>
+              match
+                placeTouchesUnion
+                  effTargetDecls
+                  targetLayouts
+                  { local_ := entry.targetLocal, projection := fullProj }
+              with
+              | false => .ub
+              | true =>
+                let subTyOpt : Option Ty :=
+                  placeTyResolved
+                    effTargetDecls
+                    targetLayouts
+                    { local_ := entry.targetLocal, projection := fullProj }
+                let directUnionInitOk : Bool :=
+                  match Nat.beq residualBytes 0, resolvedAccTyOpt, subTyOpt with
+                  | true, .some { kind := .never, .. }, _ => false
+                  | true, .some accTy, .some subTy =>
+                    Bool.and
+                      (Bool.not (endsWithSubslice fullProj))
+                      (rigidTyEq accTy.kind subTy.kind)
+                  | true, .none, _ => Bool.not (endsWithSubslice fullProj)
+                  | _, _, _ => false
+                match directUnionInitOk with
+                | true => commitAtProj fullProj val
+                | false => spliceIntoRootViaEntryOffset
+            | .unsupported => .unsupported
+            | .ok oldVal =>
+              let subTyOpt : Option Ty :=
+                placeTyResolved
+                  effTargetDecls
+                  targetLayouts
+                  { local_ := entry.targetLocal, projection := fullProj }
+              let storeValOpt : Option Value :=
+                match resolvedAccTyOpt with
+                | .some { kind := .never, .. } => .none
+                | _ =>
+                  match val with
+                  | .scalar wSc =>
+                    match oldVal with
+                    | .scalar oldSc =>
+                      match spliceScalarSlice? oldSc residualBytes wSc with
+                      | .some mergedSc => .some (.scalar mergedSc)
+                      | .none => .none
+                    | _ =>
+                      spliceSubValueAtByteOffset?
+                        localDecls
+                        effTargetDecls
+                        targetLayouts
+                        subTyOpt
+                        oldVal
+                        residualBytes
+                        resolvedAccTyOpt
+                        val
+                        layouts
+                  | _ =>
+                    match Nat.beq residualBytes 0 with
+                    | false =>
+                      spliceSubValueAtByteOffset?
+                        localDecls
+                        effTargetDecls
+                        targetLayouts
+                        subTyOpt
+                        oldVal
+                        residualBytes
+                        resolvedAccTyOpt
+                        val
+                        layouts
+                    | true =>
+                      let directStoreOpt : Option (Option Value) :=
+                        match resolvedAccTyOpt, subTyOpt with
+                        | .some accTy, .some subTy =>
+                          match
+                            Bool.and
+                              (Bool.not (endsWithSubslice fullProj))
+                              (rigidTyEq accTy.kind subTy.kind)
+                          with
+                          | true => .some (.some val)
+                          | false =>
+                            match accTy.kind, subTy.kind with
+                            | .array accEk accLen, .array subEk _ =>
+                              match rigidTyEq accEk subEk with
+                              | true =>
+                                match val, oldVal with
+                                | .aggregate 0 newElems, .aggregate 0 oldElems =>
+                                  match
+                                    Bool.and
+                                      (Nat.beq (length newElems) accLen)
+                                      (Nat.beq (length oldElems) accLen)
+                                  with
+                                  | true => .some (.some val)
+                                  | false => .some .none
+                                | _, _ => .some .none
+                              | false => .none
+                            | .array accEk accLen, .slice subEk =>
+                              match rigidTyEq accEk subEk with
+                              | true =>
+                                match val, oldVal with
+                                | .aggregate 0 newElems, .aggregate 0 oldElems =>
+                                  match
+                                    Bool.and
+                                      (Nat.beq (length newElems) accLen)
+                                      (Nat.beq (length oldElems) accLen)
+                                  with
+                                  | true => .some (.some val)
+                                  | false => .some .none
+                                | _, _ => .some .none
+                              | false => .none
+                            | _, _ => .none
+                        | .some accTy, .none =>
+                          match oldVal with
+                          | .unit =>
+                            match tyByteSize localDecls layouts accTy with
+                            | .some 0 => .some (.some .unit)
+                            | .some _ => .some .none
+                            | .none => .some (.some val)
+                          | .scalar _ => .none
+                          | .ptr _ pSz =>
+                            match isThinPtrKind accTy.kind with
+                            | true =>
+                              match Nat.beq pSz (layoutPointerBytes layouts) with
+                              | true => .some (.some val)
+                              | false => .some .none
+                            | false => .none
+                          | .aggregate _ _ => .some (.some val)
+                        | .none, _ =>
+                          match oldVal, val with
+                          | .unit, .unit => .some (.some .unit)
+                          | .unit, _ => .some .none
+                          | _, _ => .some (.some val)
+                      match directStoreOpt with
+                      | .some res => res
+                      | .none =>
+                        spliceSubValueAtByteOffset?
+                          localDecls
+                          effTargetDecls
+                          targetLayouts
+                          subTyOpt
+                          oldVal
+                          0
+                          resolvedAccTyOpt
+                          val
+                          layouts
+              match storeValOpt with
+              | .none => .ub
+              | .some storeVal => commitAtProj fullProj storeVal
+      | .some .uninit =>
+        match rawFullProj, Nat.beq ptrVal.offsetBytes 0 with
+        | .nil, true =>
+          let initValOpt : Option Value :=
+            match resolvedAccTyOpt, get? effTargetDecls entry.targetLocal with
+            | .some { kind := .never, .. }, _ => .none
+            | .some accTy, .some decl =>
+              let declTy := resolveTyWithLocalDecls effTargetDecls targetLayouts decl.ty
+              match rigidTyEq accTy.kind declTy.kind with
+              | true => .some val
+              | false =>
+                match tyByteSize localDecls layouts accTy, tyByteSize effTargetDecls targetLayouts declTy with
+                | .some wB, .some dB =>
+                  match Nat.beq wB dB with
+                  | false => .none
+                  | true =>
+                    match isPrimitiveScalarKind accTy.kind, isPrimitiveScalarKind declTy.kind with
+                    | true, true => .some val
+                    | _, _ =>
+                      let codecDecls :=
+                        match effTargetDecls with
+                        | .nil => localDecls
+                        | _ :: _ => effTargetDecls
+                      decodeSubValueAtByteOffset? layouts (.some accTy) val 0 declTy localDecls
+                        targetLayouts codecDecls
+                | _, _ => .none
+            | .none, .some decl =>
+              let declTy := resolveTyWithLocalDecls effTargetDecls targetLayouts decl.ty
+              match val, tyByteSize effTargetDecls targetLayouts declTy with
+              | .scalar wSc, .some dB =>
+                match Nat.beq wSc.sizeBytes dB with
+                | true => .some val
+                | false => .none
+              | .unit, .some dB =>
+                match Nat.beq dB 0 with
+                | true => .some val
+                | false => .none
+              | _, _ => .some val
+            | _, .none => .some val
+          match initValOpt with
+          | .none => .ub
+          | .some initVal =>
+            match set? targetLocals entry.targetLocal (.init initVal) with
+            | .some targetLocals' => .ok targetLocals'
+            | .none => .ub
+        | _, _ => .ub
+      | _ => .ub
+
 end Legacy
 
 section TrustedPlaces
@@ -1052,6 +1525,398 @@ theorem inferElemListByteStride_eq_legacy (elems : List Value)
       rw [hfields]
       rfl
     · rfl
+
+theorem get?_preserves_no_movedUninit (elems : List Value) :
+    ∀ (idx : Nat) (v : Value),
+      valueListContainsMovedUninit elems = false →
+      get? elems idx = .some v →
+      valueContainsMovedUninit v = false := by
+  induction elems with
+  | nil =>
+    intro idx _ _ hg
+    cases idx <;> cases hg
+  | cons x xs ih =>
+    intro idx v h hg
+    have hx : valueContainsMovedUninit x = false := by
+      cases hc : valueContainsMovedUninit x
+      · rfl
+      · simp only [valueListContainsMovedUninit, hc] at h
+        exact absurd h (by decide)
+    have hxs : valueListContainsMovedUninit xs = false := by
+      simp only [valueListContainsMovedUninit, hx] at h
+      exact h
+    cases idx with
+    | zero =>
+      simp only [get?] at hg
+      cases hg
+      exact hx
+    | succ idx' =>
+      exact ih idx' v hxs hg
+
+theorem dropValues_preserves_no_movedUninit :
+    ∀ (k : Nat) (elems : List Value),
+      valueListContainsMovedUninit elems = false →
+      valueListContainsMovedUninit (dropValues k elems) = false
+  | .zero, _, h => h
+  | .succ _, .nil, _ => rfl
+  | .succ k, x :: xs, h => by
+    have hx : valueContainsMovedUninit x = false := by
+      cases hc : valueContainsMovedUninit x
+      · rfl
+      · simp only [valueListContainsMovedUninit, hc] at h
+        exact absurd h (by decide)
+    have hxs : valueListContainsMovedUninit xs = false := by
+      simp only [valueListContainsMovedUninit, hx] at h
+      exact h
+    exact dropValues_preserves_no_movedUninit k xs hxs
+
+theorem takeValues_preserves_no_movedUninit :
+    ∀ (k : Nat) (elems : List Value),
+      valueListContainsMovedUninit elems = false →
+      valueListContainsMovedUninit (takeValues k elems) = false
+  | .zero, _, _ => rfl
+  | .succ _, .nil, _ => rfl
+  | .succ k, x :: xs, h => by
+    have hx : valueContainsMovedUninit x = false := by
+      cases hc : valueContainsMovedUninit x
+      · rfl
+      · simp only [valueListContainsMovedUninit, hc] at h
+        exact absurd h (by decide)
+    have hxs : valueListContainsMovedUninit xs = false := by
+      simp only [valueListContainsMovedUninit, hx] at h
+      exact h
+    have hrec := takeValues_preserves_no_movedUninit k xs hxs
+    simp only [takeValues, valueListContainsMovedUninit, hx, hrec]
+
+theorem extractSubslice_preserves_no_movedUninit
+    (elems : List Value) (fromIdx toIdx : Nat) (fromEnd : Bool) (sub : List Value)
+    (h : valueListContainsMovedUninit elems = false)
+    (he : extractSubslice elems fromIdx toIdx fromEnd = .some sub) :
+    valueListContainsMovedUninit sub = false := by
+  unfold extractSubslice at he
+  dsimp only at he
+  split at he
+  · cases he
+  · split at he
+    · cases he
+    · cases he
+      exact takeValues_preserves_no_movedUninit _ _ (dropValues_preserves_no_movedUninit _ _ h)
+
+/-- **Marker-free closure of `readProjectedValue`.** Reading any projection chain
+from a `rootVal` that contains no `movedUninitValue` never yields a value
+containing `movedUninitValue`. -/
+theorem readProjectedValue_preserves_no_movedUninit
+    (locals : List LocalSlot) (proj : List ProjectionElem) :
+    ∀ (rootVal v : Value),
+      valueContainsMovedUninit rootVal = false →
+      readProjectedValue locals rootVal proj = .ok v →
+      valueContainsMovedUninit v = false := by
+  induction proj with
+  | nil =>
+    intro rootVal v h hr
+    cases hr
+    exact h
+  | cons elem rest ih =>
+    intro rootVal v h hr
+    cases elem with
+    | deref =>
+      cases rootVal <;> cases hr
+    | field idx fty =>
+      cases rootVal with
+      | unit =>
+        cases idx with
+        | zero => exact ih .unit v h hr
+        | succ _ => cases hr
+      | scalar sc =>
+        cases idx with
+        | zero => exact ih (.scalar sc) v h hr
+        | succ _ => cases hr
+      | ptr p sz =>
+        cases idx with
+        | zero => exact ih (.ptr p sz) v h hr
+        | succ _ => cases hr
+      | aggregate varIdx fields =>
+        simp only [readProjectedValue] at hr
+        cases hg : get? fields idx with
+        | none => rw [hg] at hr; cases hr
+        | some fv =>
+          rw [hg] at hr
+          exact ih fv v (get?_preserves_no_movedUninit fields idx fv h hg) hr
+    | downcast _ variantIdx =>
+      cases rootVal with
+      | aggregate actualVariant fields =>
+        simp only [readProjectedValue] at hr
+        cases hb : Nat.beq actualVariant variantIdx with
+        | false => rw [hb] at hr; cases hr
+        | true =>
+          rw [hb] at hr
+          exact ih (.aggregate actualVariant fields) v h hr
+      | _ => cases hr
+    | index idxLocal =>
+      cases rootVal with
+      | aggregate varIdx fields =>
+        cases varIdx with
+        | succ _ => cases hr
+        | zero =>
+          simp only [readProjectedValue] at hr
+          cases hloc : get? locals idxLocal with
+          | none => rw [hloc] at hr; cases hr
+          | some slot =>
+            cases slot with
+            | uninit => rw [hloc] at hr; cases hr
+            | dead => rw [hloc] at hr; cases hr
+            | init idxVal =>
+              cases idxVal with
+              | scalar sc =>
+                rw [hloc] at hr
+                dsimp only at hr
+                cases hg : get? fields sc.bits with
+                | none => rw [hg] at hr; cases hr
+                | some elemVal =>
+                  rw [hg] at hr
+                  exact ih elemVal v (get?_preserves_no_movedUninit fields sc.bits elemVal h hg) hr
+              | _ => rw [hloc] at hr; cases hr
+      | _ => cases hr
+    | constantIndex offset minLen fromEnd =>
+      cases rootVal with
+      | aggregate varIdx fields =>
+        cases varIdx with
+        | succ _ => cases hr
+        | zero =>
+          have hr' :
+              (match Nat.ble minLen (length fields) with
+              | true =>
+                match get? fields (if fromEnd then Nat.sub (length fields) offset else offset) with
+                | .some elemVal => readProjectedValue locals elemVal rest
+                | .none => .ub
+              | false => .ub) = .ok v := by
+            cases fromEnd <;> exact hr
+          cases hble : Nat.ble minLen (length fields) with
+          | false => rw [hble] at hr'; cases hr'
+          | true =>
+            rw [hble] at hr'
+            dsimp only at hr'
+            cases hg : get? fields (if fromEnd then Nat.sub (length fields) offset else offset) with
+            | none => rw [hg] at hr'; cases hr'
+            | some elemVal =>
+              rw [hg] at hr'
+              exact ih elemVal v (get?_preserves_no_movedUninit fields _ elemVal h hg) hr'
+      | _ => cases hr
+    | subslice fromIdx toIdx fromEnd =>
+      cases rootVal with
+      | aggregate varIdx fields =>
+        cases varIdx with
+        | succ _ => cases hr
+        | zero =>
+          simp only [readProjectedValue] at hr
+          cases hsub : extractSubslice fields fromIdx toIdx fromEnd with
+          | none => rw [hsub] at hr; cases hr
+          | some subElems =>
+            rw [hsub] at hr
+            exact ih (.aggregate 0 subElems) v
+              (extractSubslice_preserves_no_movedUninit fields fromIdx toIdx fromEnd subElems h hsub) hr
+      | _ => cases hr
+    | opaqueCast _ =>
+      exact ih rootVal v h hr
+    | unwrapUnsafeBinder _ =>
+      exact ih rootVal v h hr
+
+private theorem rec_bool_eq {α : Type} (b : Bool) (f t₁ t₂ : α) (h : t₁ = t₂) :
+    Bool.rec (motive := fun _ => α) f t₁ b = Bool.rec (motive := fun _ => α) f t₂ b := by
+  rw [h]
+
+private theorem rec_opt_none_eq {α β : Type} (o : Option α) (n₁ n₂ : β) (s : α → β) (h : n₁ = n₂) :
+    Option.rec (motive := fun _ => β) n₁ s o = Option.rec (motive := fun _ => β) n₂ s o := by
+  rw [h]
+
+private theorem rec_opt_some_pair_eq {α β γ : Type} (o : Option (α × β)) (n : γ)
+    (s₁ s₂ : α × β → γ) (h : ∀ a b, s₁ (a, b) = s₂ (a, b)) :
+    Option.rec (motive := fun _ => γ) n s₁ o = Option.rec (motive := fun _ => γ) n s₂ o := by
+  cases o with
+  | none => rfl
+  | some p => exact h p.1 p.2
+
+private theorem rec_projRead_eq {α : Type} (r : ProjReadResult) (u s : α)
+    (k₁ k₂ : Value → α) (h : ∀ v, r = .ok v → k₁ v = k₂ v) :
+    ProjReadResult.rec (motive := fun _ => α) k₁ u s r =
+      ProjReadResult.rec (motive := fun _ => α) k₂ u s r := by
+  cases r with
+  | ok v => exact h v rfl
+  | ub => rfl
+  | unsupported => rfl
+
+private theorem rec_opt_arg_eq {α β : Type} (n : β) (s : α → β) (o₁ o₂ : Option α)
+    (h : o₁ = o₂) :
+    Option.rec (motive := fun _ => β) n s o₁ = Option.rec (motive := fun _ => β) n s o₂ := by
+  rw [h]
+
+/-- **Backward compatibility of `writeStackThinPtrTypedDeref`.** Whenever no
+projected read of the target local yields a value containing `movedUninitValue`
+(every state produced by the default `deinitProjectedMoves = false` statement
+semantics), `writeStackThinPtrTypedDeref` equals the pre-Episode-1
+`legacyWriteStackThinPtrTypedDeref`. -/
+theorem writeStackThinPtrTypedDeref_eq_legacy_of_no_movedUninit
+    (indexLocals targetLocals : List LocalSlot)
+    (entry : BorrowEntry) (ptrVal : ProvenancePtr) (restProj : List ProjectionElem)
+    (val : Value) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (pointeeTyOpt accessedTyOpt : Option Ty)
+    (targetDecls : List LocalDecl) (targetLayouts : LayoutTable)
+    (hno : ∀ effDecls targetRootVal fullProj oldVal,
+      get? targetLocals entry.targetLocal = .some (.init targetRootVal) →
+      readProjectedForLocal indexLocals effDecls targetLayouts entry.targetLocal targetRootVal
+        fullProj = .ok oldVal →
+      valueContainsMovedUninit oldVal = false) :
+    writeStackThinPtrTypedDeref indexLocals targetLocals entry ptrVal restProj val localDecls
+        layouts pointeeTyOpt accessedTyOpt targetDecls targetLayouts =
+      legacyWriteStackThinPtrTypedDeref indexLocals targetLocals entry ptrVal restProj val
+        localDecls layouts pointeeTyOpt accessedTyOpt targetDecls targetLayouts := by
+  unfold writeStackThinPtrTypedDeref legacyWriteStackThinPtrTypedDeref
+  unfold_wstd_matches
+  dsimp only
+  refine rec_bool_eq _ _ _ _ ?_
+  refine rec_opt_none_eq _ _ _ _ ?_
+  cases hslot : get? targetLocals entry.targetLocal with
+  | none => rfl
+  | some slot =>
+    cases slot with
+    | uninit => rfl
+    | dead => rfl
+    | init targetRootVal =>
+      dsimp only
+      cases_lhs_app_fn_arg
+      · dsimp only
+        refine rec_opt_some_pair_eq _ _ _ _ fun fullProj residualBytes => ?_
+        dsimp only
+        refine rec_projRead_eq _ _ _ _ _ fun oldVal hread => ?_
+        have holdNo : valueContainsMovedUninit oldVal = false :=
+          hno _ targetRootVal fullProj oldVal hslot hread
+        refine rec_opt_arg_eq _ _ _ _ ?_
+        cases accessedTyOpt with
+        | none =>
+          dsimp only
+          cases val with
+          | unit => rfl
+          | ptr _ _ => rfl
+          | aggregate _ _ => rfl
+          | scalar wSc =>
+            rcases oldVal with _ | ⟨bits, _ | n⟩ | _ | _
+            · rfl
+            · have hbits : Nat.beq bits 1 = false := holdNo
+              cases fullProj with
+              | nil => rfl
+              | cons _ _ =>
+                cases Nat.beq residualBytes 0 with
+                | false => rfl
+                | true => dsimp only; rw [hbits]; rfl
+            · cases fullProj <;> rfl
+            · rfl
+            · rfl
+        | some accTyOrig =>
+          dsimp only
+          cases resolveTyWithLocalDecls localDecls layouts accTyOrig with
+          | mk accKind accLayout =>
+            cases accKind <;> (
+              first
+              | rfl
+              | (dsimp only
+                 cases val with
+                 | unit => rfl
+                 | ptr _ _ => rfl
+                 | aggregate _ _ => rfl
+                 | scalar wSc =>
+                   rcases oldVal with _ | ⟨bits, _ | n⟩ | _ | _
+                   · rfl
+                   · have hbits : Nat.beq bits 1 = false := holdNo
+                     cases fullProj with
+                     | nil => rfl
+                     | cons _ _ =>
+                       cases Nat.beq residualBytes 0 with
+                       | false => rfl
+                       | true => dsimp only; rw [hbits]; rfl
+                   · cases fullProj <;> rfl
+                   · rfl
+                   · rfl))
+      · cases entry.targetProjection with
+        | nil => rfl
+        | cons _ _ =>
+          dsimp only
+          refine rec_opt_some_pair_eq _ _ _ _ fun fullProj residualBytes => ?_
+          dsimp only
+          refine rec_projRead_eq _ _ _ _ _ fun oldVal hread => ?_
+          have holdNo : valueContainsMovedUninit oldVal = false :=
+            hno _ targetRootVal fullProj oldVal hslot hread
+          refine rec_opt_arg_eq _ _ _ _ ?_
+          cases accessedTyOpt with
+          | none =>
+            dsimp only
+            cases val with
+            | unit => rfl
+            | ptr _ _ => rfl
+            | aggregate _ _ => rfl
+            | scalar wSc =>
+              rcases oldVal with _ | ⟨bits, _ | n⟩ | _ | _
+              · rfl
+              · have hbits : Nat.beq bits 1 = false := holdNo
+                cases fullProj with
+                | nil => rfl
+                | cons _ _ =>
+                  cases Nat.beq residualBytes 0 with
+                  | false => rfl
+                  | true => dsimp only; rw [hbits]; rfl
+              · cases fullProj <;> rfl
+              · rfl
+              · rfl
+          | some accTyOrig =>
+            dsimp only
+            cases resolveTyWithLocalDecls localDecls layouts accTyOrig with
+            | mk accKind accLayout =>
+              cases accKind <;> (
+                first
+                | rfl
+                | (dsimp only
+                   cases val with
+                   | unit => rfl
+                   | ptr _ _ => rfl
+                   | aggregate _ _ => rfl
+                   | scalar wSc =>
+                     rcases oldVal with _ | ⟨bits, _ | n⟩ | _ | _
+                     · rfl
+                     · have hbits : Nat.beq bits 1 = false := holdNo
+                       cases fullProj with
+                       | nil => rfl
+                       | cons _ _ =>
+                         cases Nat.beq residualBytes 0 with
+                         | false => rfl
+                         | true => dsimp only; rw [hbits]; rfl
+                     · cases fullProj <;> rfl
+                     · rfl
+                     · rfl))
+
+/-- **Backward compatibility of `writeStackThinPtrTypedDeref` on marker-free
+non-union targets.** When the target root value contains no `movedUninitValue`
+and the target local does not touch a union, `writeStackThinPtrTypedDeref` is
+equal to `legacyWriteStackThinPtrTypedDeref`. -/
+theorem writeStackThinPtrTypedDeref_eq_legacy_nonUnion
+    (indexLocals targetLocals : List LocalSlot)
+    (entry : BorrowEntry) (ptrVal : ProvenancePtr) (restProj : List ProjectionElem)
+    (val : Value) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (pointeeTyOpt accessedTyOpt : Option Ty)
+    (targetDecls : List LocalDecl) (targetLayouts : LayoutTable)
+    (hroot : ∀ targetRootVal,
+      get? targetLocals entry.targetLocal = .some (.init targetRootVal) →
+      valueContainsMovedUninit targetRootVal = false)
+    (hnoUnion : ∀ effDecls fullProj,
+      placeTouchesUnion effDecls targetLayouts
+        { local_ := entry.targetLocal, projection := fullProj } = false) :
+    writeStackThinPtrTypedDeref indexLocals targetLocals entry ptrVal restProj val localDecls
+        layouts pointeeTyOpt accessedTyOpt targetDecls targetLayouts =
+      legacyWriteStackThinPtrTypedDeref indexLocals targetLocals entry ptrVal restProj val
+        localDecls layouts pointeeTyOpt accessedTyOpt targetDecls targetLayouts := by
+  apply writeStackThinPtrTypedDeref_eq_legacy_of_no_movedUninit
+  intro effDecls targetRootVal fullProj oldVal hslot hread
+  rw [readProjectedForLocal, hnoUnion effDecls fullProj] at hread
+  exact readProjectedValue_preserves_no_movedUninit indexLocals fullProj targetRootVal oldVal
+    (hroot targetRootVal hslot) hread
 
 /-- Leading `.opaqueCast` is transparent to `lastStructuralProjection?`. -/
 theorem lastStructuralProjection?_opaqueCast_prefix (ty : Ty) (proj : List ProjectionElem) :
@@ -6490,16 +7355,14 @@ elab "#assert_move_deinit_equiv_axioms" : command => do
   let ns := `LeanMiriSpec.Correspondence.MoveDeinitEquiv
   let names : Array Name := env.constants.map₂.foldl (init := #[]) fun acc n _ =>
     if ns.isPrefixOf n then acc.push n else acc
-  if names.size < 100 then
+  if names.size < 700 then
     throwError "MoveDeinitEquiv axiom audit found only {names.size} declarations"
   let mut inherited : Nat := 0
   for n in names do
     let axs ← liftCoreM <| Lean.collectAxioms n
     for a in axs do
-      if a == ``sorryAx || a == `Lean.ofReduceBool || a == `Lean.trustCompiler then
-        throwError "{n} depends on the forbidden axiom {a}"
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
-        throwError "{n} depends on the unexpected axiom {a}"
+        throwError "{n} depends on the non-standard axiom {a}"
     if axs.contains ``Classical.choice then inherited := inherited + 1
   let mut visited : NameSet := {}
   let mut todo : Array Name := names

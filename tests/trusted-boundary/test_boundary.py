@@ -833,7 +833,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         # Group 19: pre-execution toolchain admission (the struct-free ELF64 parser and the
         # DT_NEEDED x DT_RUNPATH / DT_RPATH analysis of `lean_release_findings`), the root
         # manifest, and the Lean-child environment. Pure Python: nothing is executed.
-        def elf64(needed, runpath=(), *, rpath=(), rpath_tag=29, unterminated=False):
+        def elf64(needed, runpath=(), *, rpath=(), rpath_tag=29, unterminated=False, extra_dyn=()):
             """Minimal ELF64 LE ET_DYN image (EM_BPF, so it can never run): one PT_LOAD over
             the file, a PT_DYNAMIC with DT_NEEDED*, [DT_RPATH], [DT_RUNPATH/DT_RPATH],
             DT_STRTAB, DT_STRSZ, DT_NULL."""
@@ -841,6 +841,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             for name in needed:
                 dyn.append((1, len(strtab)))
                 strtab += name.encode() + b"\0"
+            for tag, val_str in extra_dyn:
+                dyn.append((tag, len(strtab)))
+                strtab += val_str.encode() + b"\0"
             if rpath:
                 dyn.append((15, len(strtab)))
                 strtab += ":".join(rpath).encode() + b"\0"
@@ -914,7 +917,18 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         (prefix / "lib/extra").chmod(0o777)
         expect_finding(install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean", "$ORIGIN/../lib/extra"])),
                        "bin/lean: DT_RUNPATH search directory lib/extra is world-writable or not a directory")
-        (prefix / "lib/extra").rmdir()
+        (prefix / "lib/extra/sub").mkdir()
+        (prefix / "lib/extra/sub").chmod(0o755)
+        expect_finding(install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean", "$ORIGIN/../lib/extra/sub"])),
+                       "bin/lean: DT_RUNPATH search directory lib/extra/sub is world-writable or not a directory")
+        expect_finding(install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean", "$ORIGIN/../lib/extra/missing"])),
+                       "bin/lean: DT_RUNPATH search directory lib/extra/missing is world-writable or not a directory")
+        shutil.rmtree(prefix / "lib/extra")
+        expect_finding(install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"], extra_dyn=[(0x7FFFFFFD, "libaux.so")])),
+                       "cannot parse the ELF dynamic section of bin/lean: unsupported ELF dynamic filter tag (DT_AUXILIARY/DT_FILTER)")
+        prefix.chmod(0o777)
+        expect_finding(clean, "toolchain root is world-writable")
+        prefix.chmod(0o755)
         expect_finding(install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"], unterminated=True)),
                        "cannot parse the ELF dynamic section of bin/lean: unterminated")
         release = install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"]))

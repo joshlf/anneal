@@ -4938,26 +4938,29 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_translateStatement_transmute_t
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_translateStatement_transmute_to_float
 
+-- `evalRvalue` / `evalByteCast` reach Trusted `evalOperand`, whose consumer-side
+-- `deinitProjectedMoves` branch (`Places.lean`) depends on the standard axiom
+-- `Quot.sound`; still no `Classical.choice`.
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_floatToInt_eq' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_floatToInt_eq' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_floatToInt_eq
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_intToFloat_eq' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_intToFloat_eq' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_intToFloat_eq
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_floatToFloat_eq' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_floatToFloat_eq' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_floatToFloat_eq
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_float_cast_ub' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_float_cast_ub' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_float_cast_ub
@@ -5077,25 +5080,25 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_decode_int_none_iff' depends o
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_decode_int_none_iff
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalByteCast_eq' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalByteCast_eq' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_evalByteCast_eq
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalByteCast_of_encode' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalByteCast_of_encode' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_evalByteCast_of_encode
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalByteCast_size_mismatch' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalByteCast_size_mismatch' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_evalByteCast_size_mismatch
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_transmute_ub' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_transmute_ub' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_transmute_ub
@@ -5347,97 +5350,97 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_leByteVals_complete' depends o
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_leByteVals_complete
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_transmute_via_le' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_transmute_via_le' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_evalRvalue_transmute_via_le
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f32_to_u32' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f32_to_u32' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f32_to_u32
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_u32_to_f32' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_u32_to_f32' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_u32_to_f32
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f32_to_i32' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f32_to_i32' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f32_to_i32
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_i32_to_f32' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_i32_to_f32' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_i32_to_f32
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f32_to_bytes4' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f32_to_bytes4' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f32_to_bytes4
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_bytes4_to_f32' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_bytes4_to_f32' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_bytes4_to_f32
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f64_to_u64' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f64_to_u64' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f64_to_u64
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_u64_to_f64' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_u64_to_f64' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_u64_to_f64
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f64_to_i64' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f64_to_i64' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f64_to_i64
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_i64_to_f64' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_i64_to_f64' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_i64_to_f64
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f64_to_bytes8' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f64_to_bytes8' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_f64_to_bytes8
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_bytes8_to_f64' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_bytes8_to_f64' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_bytes8_to_f64
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_size_mismatch' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_size_mismatch' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_size_mismatch
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_f32_roundtrip' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_f32_roundtrip' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_f32_roundtrip
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_f64_roundtrip' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_f64_roundtrip' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_f64_roundtrip
@@ -5449,7 +5452,7 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_tyByteSize_rawPtrU8' depends o
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_tyByteSize_rawPtrU8
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_ptr_to_f64_ub' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_ptr_to_f64_ub' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_ptr_to_f64_ub
@@ -5857,7 +5860,7 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_decodeTyped_any_layouts' depen
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_decodeTyped_any_layouts
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_float_scalar_any_layouts' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_float_scalar_any_layouts' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_float_scalar_any_layouts
@@ -5971,7 +5974,7 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_ptr_boundary' de
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_ptr_boundary
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_anneal_ptr_transmute_and_cast_boundary' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_anneal_ptr_transmute_and_cast_boundary' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_anneal_ptr_transmute_and_cast_boundary
@@ -6127,7 +6130,7 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_decodeTyped_f16_f128_eq' depen
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_decodeTyped_f16_f128_eq
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_f16_f128_from_bits' depends on axioms: [propext]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_f16_f128_from_bits' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_f16_f128_from_bits

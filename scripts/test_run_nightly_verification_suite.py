@@ -1209,7 +1209,10 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             base = tmp_dir / "baseline"
-            for rel in suite.flip_direction_tracked_files():
+            tracked_seeds = suite.flip_direction_tracked_files()
+            for rel in dict.fromkeys(
+                [*tracked_seeds, *suite._repo_lean_import_closure_toposort(REPO_ROOT, tracked_seeds)]
+            ):
                 src = REPO_ROOT / rel
                 if src.is_file():
                     dst = base / rel
@@ -2464,7 +2467,10 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             run_git("commit", "-q", "-m", "baseline")
             dest = Path(tmp) / "baseline_tree"
             suite.materialize_flip_baseline_tree(repo, "HEAD", dest)
-            for rel in suite.flip_direction_tracked_files():
+            tracked_seeds = suite.flip_direction_tracked_files()
+            for rel in dict.fromkeys(
+                [*tracked_seeds, *suite._repo_lean_import_closure_toposort(repo, tracked_seeds)]
+            ):
                 if (repo / rel).is_file():
                     self.assertTrue((dest / rel).is_file(), rel)
                     self.assertEqual((dest / rel).read_bytes(), (repo / rel).read_bytes(), rel)

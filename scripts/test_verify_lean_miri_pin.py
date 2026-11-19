@@ -283,6 +283,7 @@ def make_elf64(
     overlapping_loads: bool = False,
     omit_dt_null: bool = False,
     dyn_outside_load: bool = False,
+    extra_dyn_strings: Sequence[Tuple[int, str]] = (),
 ) -> bytes:
     """Minimal ELF64 little-endian ET_DYN image: one PT_LOAD covering the whole
     file plus a PT_DYNAMIC segment with DT_NEEDED*, DT_RUNPATH (29) / DT_RPATH
@@ -295,6 +296,9 @@ def make_elf64(
     for name in needed:
         dyn.append((1, len(strtab) + (4096 if needed_index_oob else 0)))
         strtab += name.encode() + b"\0"
+    for tag, val_str in extra_dyn_strings:
+        dyn.append((tag, len(strtab)))
+        strtab += val_str.encode() + b"\0"
     if rpath:
         dyn.append((15, len(strtab)))
         strtab += ":".join(rpath).encode() + b"\0"
@@ -349,6 +353,9 @@ def malformed_elf_cases() -> List[Tuple[str, bytes, str]]:
         ("overlapping PT_LOAD segments", make_elf64(["libfoo.so"], ["$ORIGIN"], overlapping_loads=True), "overlapping PT_LOAD"),
         ("PT_DYNAMIC without DT_NULL", make_elf64(["libfoo.so"], ["$ORIGIN"], omit_dt_null=True), "missing DT_NULL"),
         ("PT_DYNAMIC outside PT_LOAD", make_elf64(["libfoo.so"], ["$ORIGIN"], dyn_outside_load=True), "PT_DYNAMIC segment is not inside a PT_LOAD"),
+        ("DT_AUXILIARY filter tag", make_elf64(["libfoo.so"], ["$ORIGIN"], extra_dyn_strings=[(0x7FFFFFFD, "libaux.so")]), "DT_AUXILIARY/DT_FILTER"),
+        ("DT_FILTER filter tag", make_elf64(["libfoo.so"], ["$ORIGIN"], extra_dyn_strings=[(0x7FFFFFFF, "libflt.so")]), "DT_AUXILIARY/DT_FILTER"),
+        ("DT_AUXILIARY without DT_STRTAB", make_elf64([], [], omit_strtab=True, extra_dyn_strings=[(0x7FFFFFFD, "libaux.so")]), "DT_AUXILIARY/DT_FILTER"),
         ("ELFCLASS32", good[:4] + b"\x01" + good[5:], "unsupported ELF object"),
         ("big-endian", good[:5] + b"\x02" + good[6:], "unsupported ELF object"),
         ("truncated ELF header", good[:40], "unsupported ELF object"),
@@ -1493,6 +1500,23 @@ class ToolchainTests(TempCase):
         self.assertRejected(self.verify, "SHA-256 mismatch for bin/lean", "skipped `bin/lean --version`")
         self.assertFalse(canary.exists(), "tampered bin/lean was executed before pin digest verification!")
 
+    def test_world_writable_toolchain_root_never_executes_binaries(self) -> None:
+        canary = self.tmp / "ww-root-executed"
+        (self.tc / "bin" / "lean").write_text(
+            f"#!/bin/sh\necho pwned > {shlex.quote(str(canary))}\n"
+            f"echo 'Lean (version {REPO_LEAN_VERSION}, x86_64-unknown-linux-gnu, commit {FAKE_COMMIT}, Release)'\n"
+        )
+        os.chmod(self.tc / "bin" / "lean", 0o755)
+        doc = json.loads(self.pin.read_text(encoding="utf-8"))
+        doc["files"]["bin/lean"] = _sha256((self.tc / "bin" / "lean").read_bytes())
+        self.pin.write_text(json.dumps(doc), encoding="utf-8")
+        os.chmod(self.tc, 0o777)
+        try:
+            self.assertRejected(self.verify, "toolchain root", "is world-writable", "skipped `bin/lean --version`")
+            self.assertFalse(canary.exists(), "bin/lean executed inside a world-writable toolchain root!")
+        finally:
+            os.chmod(self.tc, 0o755)
+
     def test_companion_executable_tamper_or_addition_rejected_and_not_executed(self) -> None:
         canary = self.tmp / "companion-executed"
         self.canary_lean(canary)
@@ -1662,6 +1686,22 @@ class ToolchainTests(TempCase):
         (self.tc / "lib" / "extra").write_bytes(b"not a directory")
         os.chmod(self.tc / "lib" / "extra", 0o644)
         self.assertRejected(self.verify, "bin/lean: DT_RUNPATH search directory lib/extra is world-writable or not a directory")
+        (self.tc / "lib" / "extra").unlink()
+        # World-writable intermediate ancestor (`lib/extra` 0777) with a 0755 leaf (`lib/extra/sub`)
+        # or a not-yet-created leaf (`lib/extra/missing`), and an internal symlink (`lib/link -> lean`),
+        # must all be rejected before execution.
+        (extra / "sub").mkdir(parents=True)
+        os.chmod(extra, 0o777)
+        os.chmod(extra / "sub", 0o755)
+        self.repin_bin_lean(make_elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean", "$ORIGIN/../lib/extra/sub"]))
+        self.assertRejected(self.verify, "bin/lean: DT_RUNPATH search directory lib/extra/sub is world-writable or not a directory", "skipped `bin/lean --version`")
+        self.repin_bin_lean(make_elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean", "$ORIGIN/../lib/extra/missing"]))
+        self.assertRejected(self.verify, "bin/lean: DT_RUNPATH search directory lib/extra/missing is world-writable or not a directory", "skipped `bin/lean --version`")
+        shutil.rmtree(extra)
+        os.symlink("lean", self.tc / "lib" / "link")
+        self.repin_bin_lean(make_elf64(["libleanshared.so"], ["$ORIGIN/../lib/link"]))
+        self.assertRejected(self.verify, "bin/lean: DT_RUNPATH search directory lib/link is world-writable or not a directory", "skipped `bin/lean --version`")
+        (self.tc / "lib" / "link").unlink()
 
     def test_runpath_checked_companions_vs_digest_only_companions(self) -> None:
         # `bin/leanc` (run by check_trusted.py --fast) is RUNPATH-checked like
@@ -1840,9 +1880,12 @@ class ElfDynamicParserTests(TempCase):
         for entry in ("", "$ORIGIN", "${ORIGIN}", "$ORIGIN/..", "$ORIGIN/../lib", "$ORIGIN/../lib/lean", "$ORIGIN/../lib/escape",
                       "$ORIGIN/../lib/..", "$ORIGIN/../../x", "$ORIGIN//lib", "$ORIGIN/../lib/", "$ORIGIN/./lib", "$ORIGINX",
                       "${ORIGIN", "$LIB", "/abs", real_root + "/lib", real_root + "/lib/../lib", "$ORIGIN$ORIGIN", "lib",
-                      real_root, real_root + "/", "$ORIGIN/..//lib", "${ORIGIN}/../lib/lean"):
+                      real_root, real_root + "/", real_root + "/lib/", real_root + "//lib", real_root + "/lib/$ORIGIN",
+                      "$ORIGIN/..//lib", "${ORIGIN}/../lib/lean"):
             with self.subTest(entry=entry):
                 self.assertEqual(CT._validate_runpath_entry(entry, origin, real_root), V._validate_runpath_entry(entry, origin, real_root))
+        for bad_entry in (real_root + "/lib/$ORIGIN", real_root + "/lib/${ORIGIN}", real_root + "//lib", real_root + "/lib/"):
+            self.assertEqual(V._validate_runpath_entry(bad_entry, origin, real_root), (None, "unsupported"))
 
 
 # ---------------------------------------------------------------------------
@@ -2353,6 +2396,26 @@ class CheckTrustedIntegrationTests(TempCase):
             (link_prefix / "bin").mkdir(parents=True)
             os.symlink(real / "lean", link_prefix / "bin" / "lean")
             self.assertRejectedBeforeExecution(self.checker(root, link_prefix / "bin" / "lean"), 1, "toolchain", "expected a regular file")
+        with self.subTest("world-writable toolchain root or bin/ directory"):
+            ww_prefix = self.tmp / "ww-prefix"
+            (ww_prefix / "bin").mkdir(parents=True)
+            ww_lean = ww_prefix / "bin" / "lean"
+            ww_lean.write_text("#!/bin/sh\nexit 0\n")
+            os.chmod(ww_lean, 0o755)
+            os.chmod(ww_prefix, 0o777)
+            try:
+                self.assertRejectedBeforeExecution(self.checker(root, ww_lean), 2, "toolchain", "is world-writable")
+            finally:
+                os.chmod(ww_prefix, 0o755)
+            os.chmod(ww_prefix / "bin", 0o777)
+            try:
+                self.assertRejectedBeforeExecution(self.checker(root, ww_lean), 2, "toolchain", "is world-writable")
+            finally:
+                os.chmod(ww_prefix / "bin", 0o755)
+        with self.subTest("symlinked toolchain root directory"):
+            sym_prefix = self.tmp / "sym-prefix"
+            os.symlink(ww_prefix, sym_prefix)
+            self.assertRejectedBeforeExecution(self.checker(root, sym_prefix / "bin" / "lean"), 2, "toolchain", "is a symlink or not a directory")
 
     def test_check_trusted_runpath_semantics_on_a_synthetic_release(self) -> None:
         prefix = self.tmp / "synthetic-release"
@@ -2429,6 +2492,29 @@ class CheckTrustedIntegrationTests(TempCase):
             self.assertFindings(CT.lean_release_findings(prefix, release),
                                 "bin/lean: DT_RUNPATH search directory lib/extra is world-writable or not a directory")
             extra.unlink()
+            (extra / "sub").mkdir(parents=True)
+            os.chmod(extra, 0o777)
+            os.chmod(extra / "sub", 0o755)
+            release = install(make_elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean", "$ORIGIN/../lib/extra/sub"]))
+            self.assertFindings(CT.lean_release_findings(prefix, release),
+                                "bin/lean: DT_RUNPATH search directory lib/extra/sub is world-writable or not a directory")
+            release = install(make_elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean", "$ORIGIN/../lib/extra/missing"]))
+            self.assertFindings(CT.lean_release_findings(prefix, release),
+                                "bin/lean: DT_RUNPATH search directory lib/extra/missing is world-writable or not a directory")
+            shutil.rmtree(extra)
+            os.symlink("lean", prefix / "lib" / "link")
+            release = install(make_elf64(["libleanshared.so"], ["$ORIGIN/../lib/link"]))
+            self.assertFindings(CT.lean_release_findings(prefix, release),
+                                "bin/lean: DT_RUNPATH search directory lib/link is world-writable or not a directory")
+            (prefix / "lib" / "link").unlink()
+            os.chmod(prefix, 0o777)
+            try:
+                self.assertFindings(CT.lean_release_findings(prefix, release), "toolchain root is world-writable")
+            finally:
+                os.chmod(prefix, 0o755)
+            sym_root = self.tmp / "sym-release"
+            os.symlink(prefix, sym_root)
+            self.assertFindings(CT.lean_release_findings(sym_root, release), "toolchain root is a symlink")
         with self.subTest("unparseable pinned ELF"):
             release = install(make_elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"], unterminated=True))
             self.assertFindings(CT.lean_release_findings(prefix, release), "cannot parse the ELF dynamic section of bin/lean: unterminated")
@@ -2900,10 +2986,9 @@ def parse_self_axiom_audits(src: str) -> Tuple[List[str], List[str]]:
         body = code[m.end(): m.end() + invocation.start()] if invocation else code[m.end():]
         if invocation is None:
             problems.append(f"{command} is defined but never invoked")
-        for forbidden in ("``sorryAx", "`Lean.ofReduceBool", "`Lean.trustCompiler"):
-            if forbidden not in body:
-                problems.append(f"{command} does not reject {forbidden.lstrip('`')}")
-        admitted = set(re.findall(r"a == ``([A-Za-z_.]+)", body)) - {"sorryAx"}
+        if "unless" not in body:
+            problems.append(f"{command} has no `unless` standard-axiom whitelist")
+        admitted = set(re.findall(r"a == ``?([A-Za-z_.]+)", body))
         if not admitted or not admitted <= ALLOWED_AXIOMS:
             problems.append(f"{command} admits {sorted(admitted)} (allowed: {sorted(ALLOWED_AXIOMS)})")
         if "collectAxioms" not in body or "throwError" not in body:
@@ -2965,8 +3050,6 @@ class LeanHygieneScannerSelfTests(unittest.TestCase):
             'elab "#assert_x_axioms" : command => do\n'
             "  let axs ← liftCoreM <| Lean.collectAxioms n\n"
             "  for a in axs do\n"
-            "    if a == ``sorryAx || a == `Lean.ofReduceBool || a == `Lean.trustCompiler then\n"
-            '      throwError "forbidden"\n'
             "    unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do\n"
             '      throwError "unexpected"\n'
             "\n#assert_x_axioms\n"
@@ -2974,8 +3057,9 @@ class LeanHygieneScannerSelfTests(unittest.TestCase):
         self.assertEqual(parse_self_axiom_audits(audit), (["#assert_x_axioms"], []))
         for bad, needle in (
             (audit.replace("\n#assert_x_axioms\n", "\n"), "never invoked"),
-            (audit.replace("a == `Lean.trustCompiler", "false"), "does not reject Lean.trustCompiler"),
+            (audit.replace("unless", "if"), "no `unless` standard-axiom whitelist"),
             (audit.replace("``Classical.choice", "``myAxiom"), "admits"),
+            (audit.replace("``Classical.choice", "`Lean.trustCompiler"), "admits"),
         ):
             with self.subTest(needle):
                 self.assertTrue(any(needle in p for p in parse_self_axiom_audits(bad)[1]), parse_self_axiom_audits(bad))

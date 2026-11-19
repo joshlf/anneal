@@ -27077,6 +27077,9 @@ section MoveDeinitEquivPins
   MoveDeinitEquiv.evalOperand_deinitProjectedMoves_false_eq_legacy
   MoveDeinitEquiv.evalOperands_deinitProjectedMoves_false_eq_legacy
   MoveDeinitEquiv.inferElemListByteStride_eq_legacy
+  MoveDeinitEquiv.readProjectedValue_preserves_no_movedUninit
+  MoveDeinitEquiv.writeStackThinPtrTypedDeref_eq_legacy_of_no_movedUninit
+  MoveDeinitEquiv.writeStackThinPtrTypedDeref_eq_legacy_nonUnion
   MoveDeinitEquiv.movedUninitValue_ne_wellFormed_scalar
   MoveDeinitEquiv.evalOperand_move_root_deinit
   MoveDeinitEquiv.evalOperand_copy_deinit_movedUninit_ub
@@ -27147,6 +27150,25 @@ example (ops : List Operand) (locals : List LocalSlot) (borrows : List BorrowEnt
 example (elems : List Value) (h : valueListContainsMovedUninit elems = false) :
     inferElemListByteStride elems = MoveDeinitEquiv.legacyInferElemListByteStride elems :=
   MoveDeinitEquiv.inferElemListByteStride_eq_legacy elems h
+
+example (indexLocals targetLocals : List LocalSlot)
+    (entry : BorrowEntry) (ptrVal : ProvenancePtr) (restProj : List ProjectionElem)
+    (val : Value) (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable)
+    (pointeeTyOpt accessedTyOpt : Option MirAst.Ty)
+    (targetDecls : List MirAst.LocalDecl) (targetLayouts : Layout.LayoutTable)
+    (hroot : ∀ targetRootVal,
+      Trusted.Sequence.get? targetLocals entry.targetLocal = .some (.init targetRootVal) →
+      valueContainsMovedUninit targetRootVal = false)
+    (hnoUnion : ∀ effDecls fullProj,
+      placeTouchesUnion effDecls targetLayouts
+        { local_ := entry.targetLocal, projection := fullProj } = false) :
+    writeStackThinPtrTypedDeref indexLocals targetLocals entry ptrVal restProj val localDecls
+        layouts pointeeTyOpt accessedTyOpt targetDecls targetLayouts =
+      MoveDeinitEquiv.legacyWriteStackThinPtrTypedDeref indexLocals targetLocals entry ptrVal
+        restProj val localDecls layouts pointeeTyOpt accessedTyOpt targetDecls targetLayouts :=
+  MoveDeinitEquiv.writeStackThinPtrTypedDeref_eq_legacy_nonUnion indexLocals targetLocals entry
+    ptrVal restProj val localDecls layouts pointeeTyOpt accessedTyOpt targetDecls targetLayouts
+    hroot hnoUnion
 
 example (sc : MirAst.ScalarInt) (hrange : sc.bits < 2 ^ (8 * sc.sizeBytes)) :
     Value.scalar sc ≠ movedUninitValue ∧ valueContainsMovedUninit (.scalar sc) = false :=
