@@ -60,6 +60,7 @@ import LeanMiriSpec.Correspondence.WitLM4_2
 import LeanMiriSpec.Correspondence.Safety
 import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 import LeanMiriSpec.Correspondence.WideSliceDstLM
+import LeanMiriSpec.Correspondence.MoveDeinitEquiv
 
 /-!
 # Axiom Audit (`LeanMiriSpec.Audit`)
@@ -114,7 +115,22 @@ weakened theorem keeps its name:
   witnesses (`w1_tail_call_class_divergence`, `anneal_extCall_boundary`,
   `w6_rotate_left_extCall_boundary`, `w6_write_bytes_extCall_boundary`,
   `w6_write_bytes_oob_extCall_divergence`,
-  `w6_write_bytes_read_extCall_divergence`).
+  `w6_write_bytes_read_extCall_divergence`);
+* `MoveDeinitEquiv` (consumer-side move deinitialization, also covered by the
+  environment-wide walk): `deinitProjectedMoves = false` is the pre-extension
+  Trusted `evalOperand` / `evalOperands`
+  (`evalOperand_deinitProjectedMoves_false_eq_legacy`,
+  `evalOperands_deinitProjectedMoves_false_eq_legacy`), the element stride and
+  the moved-out marker are inert on well-formed values
+  (`inferElemListByteStride_eq_legacy`, `movedUninitValue_ne_wellFormed_scalar`),
+  the flag-off patched `lean-miri` is the verbatim source (`cast_eq_src`,
+  `castMoving_off`, `placeMachine_readImmediate_off`,
+  `place_copyRuntimePlaceNoValidate_off`, `call_evalCallTerminator_eq_src`,
+  `call_evalTailCallTerminator_eq_src`), the deinitialization hooks perform no
+  Tree Borrows or race access (`tbSilentAccessHooks_beforeMemoryWrite`), every
+  step clears the latch (`step_clears_pendingMoveDeinit`), and every
+  consumer-side call error path rethrows the original error
+  (`call_deallocateTempArgsOnError_preserves_error`).
 -/
 
 namespace LeanMiriSpec.Audit
@@ -27046,6 +27062,169 @@ example :
           nullImm 0 AnnealMachine.empty) =
         (mNull, .error (.undefinedBehavior "dereferencing a null reference")) :=
   div_ptrMetadata_invalidSafeWideRef
+
+/-! ### `MoveDeinitEquiv` statement pins
+
+The consumer-side move deinitialization (`deinitMovedPlace` in the ten patched
+`lean-miri/vendor/Miri/Interpreter/*` files, `deinitProjectedMoves` in Trusted
+`Places`) must be invisible with the flags off, Tree-Borrows-silent with them
+on, and simulated by the two machines; these pins keep the exact statements of
+those headline results (and their axiom closures) from weakening silently. -/
+
+section MoveDeinitEquivPins
+
+#assert_standard_axioms
+  MoveDeinitEquiv.evalOperand_deinitProjectedMoves_false_eq_legacy
+  MoveDeinitEquiv.evalOperands_deinitProjectedMoves_false_eq_legacy
+  MoveDeinitEquiv.inferElemListByteStride_eq_legacy
+  MoveDeinitEquiv.movedUninitValue_ne_wellFormed_scalar
+  MoveDeinitEquiv.evalOperand_move_root_deinit
+  MoveDeinitEquiv.evalOperand_copy_deinit_movedUninit_ub
+  MoveDeinitEquiv.evalOperand_move_deinit_movedUninit_ub
+  MoveDeinitEquiv.localAccess_evalOperand_off
+  MoveDeinitEquiv.localAccess_evalOperandImmediate_off
+  MoveDeinitEquiv.operandMachine_evalOperand_off
+  MoveDeinitEquiv.operandMachine_evalOperandAt_off
+  MoveDeinitEquiv.placeMachine_readImmediate_off
+  MoveDeinitEquiv.place_copyRuntimePlaceNoValidate_off
+  MoveDeinitEquiv.placeMachine_placeHooks_take_off
+  MoveDeinitEquiv.executionMachine_projectionHooks_take_off
+  MoveDeinitEquiv.cast_eq_src
+  MoveDeinitEquiv.castMoving_off
+  MoveDeinitEquiv.call_evalFnCallArgumentAt_eq_src
+  MoveDeinitEquiv.call_evalCalleeAndArgs_eq_src
+  MoveDeinitEquiv.call_passArgument_eq_src
+  MoveDeinitEquiv.call_evalCallTerminator_eq_src
+  MoveDeinitEquiv.call_evalTailCallTerminator_eq_src
+  MoveDeinitEquiv.tbSilentAccessHooks_beforeMemoryRead
+  MoveDeinitEquiv.tbSilentAccessHooks_beforeMemoryWrite
+  MoveDeinitEquiv.placeMachine_rawAccessHooks_eq
+  MoveDeinitEquiv.placeMachine_accessHooks_write_performs_treeBorrows_write
+  MoveDeinitEquiv.placeMachine_readImmediate_moving
+  MoveDeinitEquiv.step_clears_pendingMoveDeinit
+  MoveDeinitEquiv.call_initFnTailCallMoving_eq
+  MoveDeinitEquiv.call_initFnTailCallMoving_inPlace
+  MoveDeinitEquiv.call_deallocateTempArgsOnError_preserves_error
+  MoveDeinitEquiv.call_tryCatch_deallocateTempArgsOnError
+  MoveDeinitEquiv.call_evalCallTerminatorMoving_dest_before_args
+  MoveDeinitEquiv.root_move_simulation
+  MoveDeinitEquiv.indirect_move_simulation
+  MoveDeinitEquiv.projected_subplace_move_simulation
+  MoveDeinitEquiv.d7_call_arg_move_deref_sibling_frozen_simulation
+  MoveDeinitEquiv.d7_call_arg_move_deref_projected_sibling_frozen_simulation
+  MoveDeinitEquiv.witness_root_move_simulation
+  MoveDeinitEquiv.witness_projected_subplace_move_simulation
+  MoveDeinitEquiv.witness_d7_call_arg_move_deref_projected_sibling_frozen_simulation
+  MoveDeinitEquiv.canary_D5_sibling_frozen_reads_uninit
+  MoveDeinitEquiv.canary_D5_typed_deref_equal_values_exact_target
+
+-- `deinitProjectedMoves = false` (the default every statement-level caller uses)
+-- is definitionally the pre-extension `evalOperand` / `evalOperands`.
+example (locals : List LocalSlot) (op : Operand) (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation) (layouts : Layout.LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List MirAst.LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    MirSemantics.evalOperand locals op borrows globals layouts callerLocals localDecls callStack
+        false =
+      MoveDeinitEquiv.legacyEvalOperand locals op borrows globals layouts callerLocals localDecls
+        callStack :=
+  MoveDeinitEquiv.evalOperand_deinitProjectedMoves_false_eq_legacy locals op borrows globals
+    layouts callerLocals localDecls callStack
+
+example (ops : List Operand) (locals : List LocalSlot) (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation) (layouts : Layout.LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List MirAst.LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    MirSemantics.evalOperands locals ops borrows globals layouts callerLocals localDecls callStack
+        false =
+      MoveDeinitEquiv.legacyEvalOperands locals ops borrows globals layouts callerLocals localDecls
+        callStack :=
+  MoveDeinitEquiv.evalOperands_deinitProjectedMoves_false_eq_legacy ops locals borrows globals
+    layouts callerLocals localDecls callStack
+
+-- The element stride only changed on lists holding a moved-out leaf, and the
+-- moved-out marker is no well-formed scalar.
+example (elems : List Value) (h : valueListContainsMovedUninit elems = false) :
+    inferElemListByteStride elems = MoveDeinitEquiv.legacyInferElemListByteStride elems :=
+  MoveDeinitEquiv.inferElemListByteStride_eq_legacy elems h
+
+example (sc : MirAst.ScalarInt) (hrange : sc.bits < 2 ^ (8 * sc.sizeBytes)) :
+    Value.scalar sc ≠ movedUninitValue ∧ valueContainsMovedUninit (.scalar sc) = false :=
+  MoveDeinitEquiv.movedUninitValue_ne_wellFormed_scalar sc hrange
+
+-- `lean-miri` with the flags off is the unpatched source (verbatim `src…` copies).
+example {P S C V : Type} [Miri.Memory.PointerProvenance P] (h : Miri.Interpreter.CastHooks P S C V)
+    (choice : C) (fuel : Nat) (source : Miri.Interpreter.OpTy P) (kind : Miri.MIR.CastKind)
+    (castTy : Miri.MIR.TyId) (dest : V) :
+    Miri.Interpreter.Cast.cast h choice fuel source kind castTy dest =
+      MoveDeinitEquiv.srcCast h choice fuel source kind castTy dest :=
+  MoveDeinitEquiv.cast_eq_src h choice fuel source kind castTy dest
+
+example {P S C V : Type} [Miri.Memory.PointerProvenance P] (h : Miri.Interpreter.CastHooks P S C V)
+    (choice : C) (fuel : Nat) (source : Miri.Interpreter.OpTy P) (kind : Miri.MIR.CastKind)
+    (castTy : Miri.MIR.TyId) (dest : V) (htake : h.takePendingMoveDeinit = pure false)
+    (hrestore : h.restorePendingMoveDeinit false = pure ()) :
+    Miri.Interpreter.Cast.castMoving h choice fuel source kind castTy dest =
+      MoveDeinitEquiv.srcCast h choice fuel source kind castTy dest :=
+  MoveDeinitEquiv.castMoving_off h choice fuel source kind castTy dest htake hrestore
+
+example {K User : Type} [DecidableEq K] (config : Miri.Interpreter.PlaceMachine.AccessConfig K User)
+    (operand : Miri.Interpreter.OpTy Miri.Memory.Provenance)
+    (hoff : config.deinitMovedPlace = false) :
+    Miri.Interpreter.PlaceMachine.readImmediate config operand =
+      MoveDeinitEquiv.srcReadImmediate config operand :=
+  MoveDeinitEquiv.placeMachine_readImmediate_off config operand hoff
+
+example {P S C E : Type} (h : Miri.Interpreter.PlaceHooks P S C E)
+    (copy : Miri.Interpreter.PlaceCopyHooks P S C) (choice : C) (source : Miri.Interpreter.OpTy P)
+    (dest : Miri.Interpreter.RuntimePlace P) (allowTransmute : Bool)
+    (htake : h.takePendingMoveDeinit = pure false) :
+    Miri.Interpreter.copyRuntimePlaceNoValidate h copy choice source dest allowTransmute =
+      MoveDeinitEquiv.srcCopyRuntimePlaceNoValidate h copy choice source dest allowTransmute :=
+  MoveDeinitEquiv.place_copyRuntimePlaceNoValidate_off h copy choice source dest allowTransmute
+    htake
+
+example {P S C E Other Extern FnABI ArgABI : Type}
+    (h : Miri.Interpreter.CallHooks P S C E Other Extern FnABI ArgABI)
+    (choice : C) (budget : Nat) (terminator : Miri.MIR.Terminator) :
+    Miri.Interpreter.Call.evalCallTerminator h choice budget terminator =
+      MoveDeinitEquiv.srcEvalCallTerminator h choice budget terminator :=
+  MoveDeinitEquiv.call_evalCallTerminator_eq_src h choice budget terminator
+
+example {P S C E Other Extern FnABI ArgABI : Type}
+    (h : Miri.Interpreter.CallHooks P S C E Other Extern FnABI ArgABI)
+    (choice : C) (budget : Nat) (terminator : Miri.MIR.Terminator) :
+    Miri.Interpreter.Call.evalTailCallTerminator h choice budget terminator =
+      MoveDeinitEquiv.srcEvalTailCallTerminator h choice budget terminator :=
+  MoveDeinitEquiv.call_evalTailCallTerminator_eq_src h choice budget terminator
+
+-- With the flags on, the deinitialization hooks perform no Tree Borrows / race
+-- access, while the source write hook performs a Tree Borrows `.Write`.
+example {Prov MemExtra Kind HookState ProvExtra : Type}
+    (hooks : Miri.Memory.AllocationAccessHooks Prov MemExtra Kind HookState ProvExtra)
+    (state : HookState) (extra : MemExtra) (ptr : Miri.Memory.Pointer (Option Prov))
+    (id : Miri.Memory.AllocId) (prov : ProvExtra) (range : Miri.Memory.AllocRange) :
+    (Miri.Interpreter.tbSilentAccessHooks hooks).beforeMemoryWrite state extra ptr id prov range =
+      ⟨state, extra, .ok ()⟩ :=
+  MoveDeinitEquiv.tbSilentAccessHooks_beforeMemoryWrite hooks state extra ptr id prov range
+
+example {K User C O X Host : Type} [DecidableEq K]
+    (h : Miri.Interpreter.ExecutionMachine.Config K User C O X Host)
+    (limits : Miri.Interpreter.ExecutionMachine.Limits) (c : C)
+    (state : Miri.Interpreter.MachineHooks.State K User) :
+    (Miri.Interpreter.ExecutionMachine.step h limits c state).1.machine.pendingMoveDeinit = false ∧
+    (Miri.Interpreter.ExecutionMachine.step h limits c state).1.machine.pendingMoveDeinits = #[] :=
+  MoveDeinitEquiv.step_clears_pendingMoveDeinit h limits c state
+
+-- Every error path of the consumer-side call keeps the original error.
+example {P S C E Other Extern FnABI ArgABI A : Type}
+    (h : Miri.Interpreter.CallHooks P S C E Other Extern FnABI ArgABI) (choice : C)
+    (temps : Array (Miri.Memory.Pointer (Option P))) (err : Miri.Interpreter.StepError) (s : S) :
+    ∃ s', (Miri.Interpreter.Call.deallocateTempArgsOnError h choice temps err :
+      Miri.Interpreter.CallM S A) s = .error err s' :=
+  MoveDeinitEquiv.call_deallocateTempArgsOnError_preserves_error h choice temps err s
+
+end MoveDeinitEquivPins
 
 end StatementPins
 

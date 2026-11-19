@@ -2714,7 +2714,7 @@ def claimDerefBorrows : List BorrowEntry :=
        returns `[v, v]` and deinitializes field `idx`, `[move _l.idx, copy _l.idx]`
        and `[move _l.idx, move _l.idx]` fault with `.ub`, `[move _l.idx, copy _l.j]`
        (`j ≠ idx`) returns `[v, w]`, and legacy `false` mode returns `[v, v]` on
-       `[move _l.idx, copy _l.idx]`; and
+       `[move _l.idx, copy _l.idx]`;
    12. (*`D7` multi-operand `Deref` evaluation on `evalOperands` with a sibling
        `.frozen` borrow*) on untyped `*mut u8` (`_2`) with sibling `&u8` (`_3`
        `.frozen`), `[copy (*_2), move (*_2)]` and `[copy (*_3), move (*_2)]`
@@ -2725,7 +2725,18 @@ def claimDerefBorrows : List BorrowEntry :=
        returns `[3, 3]`, `[move (*_2).0, copy (*_2).0]` and
        `[move (*_2).0, copy (*_3).0]` fault with `.ub`, and
        `[move (*_2).0, copy (*_3).1]` returns `[3, 4]` while preserving the
-       sibling `.frozen` borrow. -/
+       sibling `.frozen` borrow;
+   13. (*root moves in every typed context, all states*) for any local
+       declarations, copying an initialized root local `_l` (without a moved-out
+       leaf) returns its value; if the moved value is not zero-sized
+       (`moveValueIsZeroSized`), moving `_l` returns it and sets the slot to
+       `.uninit`, `[copy _l, move _l]` returns `[v, v]`, and `[move _l, copy _l]` /
+       `[move _l, move _l]` fault with `.ub`; if it is zero-sized (a `0`-byte
+       declared type) the move deinitializes nothing and `[move _l, copy _l]`
+       returns `[v, v]` with `locals` unchanged; and
+   14. (*non-vacuity of the zero-sized polarity of 13*) some typed context holds
+       a non-`unit` value that is zero-sized there (but not in the untyped
+       context) and survives `[move _l, copy _l]`. -/
 def TrustedProjectedMoveDeinitClaim : Prop :=
   -- (a) root moves (legacy `false` and `deinitProjectedMoves := true`)
   (∀ (locals locals' : List LocalSlot) (l : Local) (v : Value) (borrows : List BorrowEntry)
@@ -2978,6 +2989,43 @@ def TrustedProjectedMoveDeinitClaim : Prop :=
     evalOperands initTyped
       [.move ⟨2, [.deref, .field 0 claimU8Ty]⟩, .copy ⟨3, [.deref, .field 1 claimU8Ty]⟩]
       claimDerefBorrows [] claimPairArrLayouts [] claimPairArrDecls [] true =
-        .ok [u8Value 3, u8Value 4] localsTyped)
+        .ok [u8Value 3, u8Value 4] localsTyped) ∧
+  -- (c13) root moves in every typed context (any `localDecls`), both zero-sized
+  --       polarities, and their left-to-right order on live `evalOperands`
+  (∀ (locals locals' : List LocalSlot) (l : Local) (v : Value) (borrows : List BorrowEntry)
+      (globals : List CapturedAllocation) (layouts : LayoutTable)
+      (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+      (callStack : List SavedCallerFrame),
+    Trusted.Sequence.get? locals l = some (.init v) →
+    Trusted.Sequence.set? locals l .uninit = some locals' →
+    valueContainsMovedUninit v = false →
+    evalOperand locals (.copy ⟨l, []⟩) borrows globals layouts callerLocals localDecls callStack
+      true = .ok v locals ∧
+    (moveValueIsZeroSized localDecls layouts (placeTyResolved localDecls layouts ⟨l, []⟩) v =
+        false →
+      evalOperand locals (.move ⟨l, []⟩) borrows globals layouts callerLocals localDecls
+        callStack true = .ok v locals' ∧
+      evalOperands locals [.copy ⟨l, []⟩, .move ⟨l, []⟩] borrows globals layouts callerLocals
+        localDecls callStack true = .ok [v, v] locals' ∧
+      evalOperands locals [.move ⟨l, []⟩, .copy ⟨l, []⟩] borrows globals layouts callerLocals
+        localDecls callStack true = .ub ∧
+      evalOperands locals [.move ⟨l, []⟩, .move ⟨l, []⟩] borrows globals layouts callerLocals
+        localDecls callStack true = .ub) ∧
+    (moveValueIsZeroSized localDecls layouts (placeTyResolved localDecls layouts ⟨l, []⟩) v =
+        true →
+      evalOperand locals (.move ⟨l, []⟩) borrows globals layouts callerLocals localDecls
+        callStack true = .ok v locals ∧
+      evalOperands locals [.move ⟨l, []⟩, .copy ⟨l, []⟩] borrows globals layouts callerLocals
+        localDecls callStack true = .ok [v, v] locals)) ∧
+  -- (c14) non-vacuity of the zero-sized polarity of (c13) for a non-`unit` value
+  --       that the untyped context would deinitialize
+  (∃ (locals : List LocalSlot) (l : Local) (v : Value) (layouts : LayoutTable)
+      (localDecls : List LocalDecl),
+    v ≠ .unit ∧ Trusted.Sequence.get? locals l = some (.init v) ∧
+    moveValueIsZeroSized localDecls layouts (placeTyResolved localDecls layouts ⟨l, []⟩) v =
+      true ∧
+    moveValueIsZeroSized [] layouts (placeTyResolved [] layouts ⟨l, []⟩) v = false ∧
+    evalOperands locals [.move ⟨l, []⟩, .copy ⟨l, []⟩] [] [] layouts [] localDecls [] true =
+      .ok [v, v] locals)
 
 end Trusted.Correspondence

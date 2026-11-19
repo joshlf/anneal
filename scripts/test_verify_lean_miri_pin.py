@@ -621,7 +621,15 @@ class LiveCheckoutTests(TempCase):
         locked = run("--require-locked-deinit-patch")
         self.assertEqual(locked.returncode, 0, locked.stdout + locked.stderr)
         self.assertEqual(json.loads(locked.stdout)["mode"], "locked-deinit-patch")
-        strict = run()
+        # The flagless run verifies the live pin (which declares the reviewed overlay)
+        # exactly as --require-locked-deinit-patch, with the locked toolchain pin.
+        default = run()
+        self.assertEqual(default.returncode, 0, default.stdout + default.stderr)
+        summary = json.loads(default.stdout)
+        self.assertEqual((summary["ok"], summary["mode"], summary["deinit_patch_lock"]), (True, "locked-deinit-patch", "matched"))
+        if V.host_platform_triple() == V.LOCKED_TOOLCHAIN_PINS[V.read_lean_toolchain(REPO_ROOT)]["platform"]:
+            self.assertEqual(summary["toolchain"]["pin_status"], "locked-verified")
+        strict = run("--strict")
         self.assertEqual(strict.returncode, 1, strict.stdout + strict.stderr)
         failure = json.loads(strict.stdout)
         self.assertEqual((failure["ok"], failure["mode"]), (False, "strict"))
@@ -1597,9 +1605,63 @@ class ToolchainTests(TempCase):
             with self.subTest(needed=needed, runpath=runpath):
                 self.repin_bin_lean(make_elf64(needed, runpath))
                 self.assertRejected(self.verify, needle, "skipped `bin/lean --version`", absent=("SHA-256 mismatch",))
-        # DT_RPATH (15) is resolved exactly like DT_RUNPATH here.
+        # DT_RPATH (15) directories are searched exactly like DT_RUNPATH ones here,
+        # and a DT_RPATH-only object is rejected on top of the shadowing finding.
         self.repin_bin_lean(make_elf64(["libz.so.1"], ["$ORIGIN/../lib"], rpath_tag=15))
-        self.assertRejected(self.verify, "which ld.so can resolve to the unpinned toolchain file lib/libz.so.1", absent=("SHA-256 mismatch",))
+        self.assertRejected(
+            self.verify,
+            "which ld.so can resolve to the unpinned toolchain file lib/libz.so.1",
+            "bin/lean: DT_RPATH without DT_RUNPATH is unsupported",
+            absent=("SHA-256 mismatch",),
+        )
+
+    def test_dt_rpath_without_dt_runpath_rejected_before_execution(self) -> None:
+        # glibc honors DT_RPATH unless the same object has DT_RUNPATH, and an
+        # honored DT_RPATH also serves the dependencies of the *system* libraries
+        # and glibc-internal dlopen (`libgcc_s.so.1`, NSS modules): sonames no
+        # pinned object lists in DT_NEEDED. The official release's lib/ holds an
+        # unpinned libgcc_s.so.1, so a DT_RPATH-only bin/lean must be rejected
+        # even when no DT_NEEDED soname is shadowed.
+        planted = self.tc / "lib" / "libgcc_s.so.1"
+        planted.write_bytes(b"\x7fELF-trojan-libgcc_s")
+        os.chmod(planted, 0o644)
+        self.repin_bin_lean(make_elf64(["libleanshared.so", "libc.so.6"], ["$ORIGIN/../lib", "$ORIGIN/../lib/lean"], rpath_tag=15))
+        self.assertRejected(
+            self.verify,
+            "bin/lean: DT_RPATH without DT_RUNPATH is unsupported",
+            "skipped `bin/lean --version`",
+            absent=("RUNPATH shadowing", "SHA-256 mismatch"),
+        )
+        # Control: next to a DT_RUNPATH the (ignored) DT_RPATH is accepted and the
+        # run reaches the exec gate (EM_BPF, so it cannot actually run).
+        self.repin_bin_lean(make_elf64(["libleanshared.so", "libc.so.6"], ["$ORIGIN/../lib/lean"], rpath=["$ORIGIN/../lib"]))
+        self.assertRejected(self.verify, "cannot execute `bin/lean --version`", absent=("DT_RPATH", "RUNPATH", "SHA-256 mismatch"))
+        # A companion library with DT_RPATH only is rejected the same way.
+        self.repin_bin_lean(
+            make_elf64(["libleanshared.so", "libc.so.6"], ["$ORIGIN/../lib", "$ORIGIN/../lib/lean"]),
+            extra_libs={"libleanshared_1.so": make_elf64(["libc.so.6"], ["$ORIGIN/..", "$ORIGIN"], rpath_tag=15)},
+        )
+        self.assertRejected(self.verify, "lib/lean/libleanshared_1.so: DT_RPATH without DT_RUNPATH is unsupported", absent=("SHA-256 mismatch",))
+
+    def test_world_writable_runpath_search_directory_rejected(self) -> None:
+        # Any user could plant a library in a world-writable DT_RUNPATH directory
+        # after the point-in-time check, while the verified toolchain runs.
+        extra = self.tc / "lib" / "extra"
+        extra.mkdir()
+        os.chmod(extra, 0o777)
+        self.repin_bin_lean(make_elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean", "$ORIGIN/../lib/extra"]))
+        self.assertRejected(
+            self.verify,
+            "bin/lean: DT_RUNPATH search directory lib/extra is world-writable or not a directory",
+            "skipped `bin/lean --version`",
+            absent=("SHA-256 mismatch",),
+        )
+        os.chmod(extra, 0o755)
+        self.assertRejected(self.verify, "cannot execute `bin/lean --version`", absent=("DT_RUNPATH search directory", "SHA-256 mismatch"))
+        os.rmdir(extra)
+        (self.tc / "lib" / "extra").write_bytes(b"not a directory")
+        os.chmod(self.tc / "lib" / "extra", 0o644)
+        self.assertRejected(self.verify, "bin/lean: DT_RUNPATH search directory lib/extra is world-writable or not a directory")
 
     def test_runpath_checked_companions_vs_digest_only_companions(self) -> None:
         # `bin/leanc` (run by check_trusted.py --fast) is RUNPATH-checked like
@@ -1722,10 +1784,20 @@ class ElfDynamicParserTests(TempCase):
             with self.subTest(index=index):
                 path = self.put(data, f"img{index}")
                 self.assertEqual(CT.elf_dynamic_info(path), V.elf_dynamic_info(path))
+                self.assertEqual(CT.elf_dynamic_entries(path), V.elf_dynamic_entries(path))
+        # The tagged view keeps each DT_RPATH (15) / DT_RUNPATH (29) entry apart, in
+        # dynamic-section order; the flattened view is its concatenation.
+        tagged = self.put(make_elf64(["libz.so.1"], ["$ORIGIN/../lib"], rpath=["$ORIGIN/../lib/lean", ""]), "tagged")
+        self.assertEqual(V.elf_dynamic_entries(tagged), (("libz.so.1",), ((15, ("$ORIGIN/../lib/lean", "")), (29, ("$ORIGIN/../lib",)))))
+        self.assertEqual(V.elf_dynamic_info(tagged), (("libz.so.1",), ("$ORIGIN/../lib/lean", "", "$ORIGIN/../lib")))
+        self.assertEqual(CT.elf_dynamic_entries(tagged), V.elf_dynamic_entries(tagged))
+        self.assertIsNone(V.elf_dynamic_entries(self.put(b"#!/bin/sh\n", "script-entries")))
         for label, data, needle in malformed_elf_cases():
             with self.subTest(label):
                 with self.assertRaisesRegex(ValueError, needle):
                     CT.elf_dynamic_info(self.put(data))
+                with self.assertRaisesRegex(ValueError, needle):
+                    CT.elf_dynamic_entries(self.put(data))
 
     def test_parser_and_runpath_parity_on_randomized_inputs(self) -> None:
         """Seeded differential parity of the two ELF64 parsers (on corrupted and
@@ -1751,13 +1823,15 @@ class ElfDynamicParserTests(TempCase):
             if rng.random() < 0.05:
                 kw["phnum_override"] = rng.choice([0, 1, 3, 0xFFFF, 5000])
             data = bytearray(make_elf64(rng.sample(names, rng.randint(0, 3)), rng.sample(entries, rng.randint(0, 3)),
-                                        rpath=rng.sample(entries, rng.randint(0, 2)), **kw))
+                                        rpath=rng.sample(entries, rng.randint(0, 2)),
+                                        rpath_tag=rng.choice([15, 29, 29]), **kw))
             for _ in range(rng.choice([0, 0, 1, 2, 4])):
                 data[rng.randrange(len(data))] = rng.randrange(256)
             if rng.random() < 0.1:
                 data = data[: rng.randrange(len(data))]
             path = self.put(bytes(data), f"fuzz{index}")
             self.assertEqual(outcome(CT.elf_dynamic_info, path), outcome(V.elf_dynamic_info, path), (index, kw))
+            self.assertEqual(outcome(CT.elf_dynamic_entries, path), outcome(V.elf_dynamic_entries, path), (index, kw))
         root = self.tmp / "root"
         (root / "bin").mkdir(parents=True)
         (root / "lib" / "lean").mkdir(parents=True)
@@ -1807,10 +1881,16 @@ class CliTests(TempCase):
     def test_cli_patch_modes_and_human_output(self) -> None:
         ws = self.workspace()
         tc = make_fake_toolchain(self.tmp)
-        strict = self.run_cli("--repo-root", str(ws.root), "--toolchain-dir", str(tc))
+        strict = self.run_cli("--repo-root", str(ws.root), "--toolchain-dir", str(tc), "--strict")
         self.assertEqual(strict.returncode, 1, strict.stdout + strict.stderr)
         self.assertIn("lean-miri pin verification FAILED", strict.stderr)
         self.assertIn("strict mode", strict.stderr)
+        # Without a patch-mode flag the repository's own pin (which declares the
+        # reviewed 10-file overlay) is verified exactly as --require-locked-deinit-patch.
+        default = self.run_cli("--repo-root", str(ws.root), "--toolchain-dir", str(tc))
+        self.assertEqual(default.returncode, 0, default.stdout + default.stderr)
+        self.assertIn("lean-miri pin verification OK (mode=locked-deinit-patch)", default.stdout)
+        self.assertIn("(deinit patch lock: matched)", default.stdout)
         patched = self.run_cli("--repo-root", str(ws.root), "--toolchain-dir", str(tc), "--allow-deinit-patch")
         self.assertEqual(patched.returncode, 0, patched.stdout + patched.stderr)
         self.assertIn("verified_vendor_files: 608", patched.stdout)
@@ -1819,6 +1899,41 @@ class CliTests(TempCase):
         locked = self.run_cli("--repo-root", str(ws.root), "--toolchain-dir", str(tc), "--require-locked-deinit-patch")
         self.assertEqual(locked.returncode, 0, locked.stdout + locked.stderr)
         self.assertIn("lean-miri pin verification OK (mode=locked-deinit-patch)", locked.stdout)
+        for flag in ("--allow-deinit-patch", "--require-locked-deinit-patch"):
+            with self.subTest(conflict=flag):
+                proc = self.run_cli("--repo-root", str(ws.root), "--toolchain-dir", str(tc), "--strict", flag)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("--strict cannot be combined", proc.stderr)
+
+    def test_cli_default_mode_fails_closed_off_the_two_reviewed_states(self) -> None:
+        # The flagless default accepts exactly two states: byte-identical upstream
+        # sources (strict) and the compiled-in reviewed overlay (locked).
+        up = self.upstream_workspace("upstream-default")
+        tc = make_fake_toolchain(self.tmp)
+        clean = self.run_cli("--repo-root", str(up.root), "--toolchain-dir", str(tc), "--json")
+        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+        self.assertEqual(json.loads(clean.stdout)["mode"], "strict")
+        # A proper-subset overlay (accepted only with --allow-deinit-patch) fails.
+        up.apply_overlay(ALLOWLIST[:3])
+        subset = self.run_cli("--repo-root", str(up.root), "--toolchain-dir", str(tc), "--json")
+        self.assertEqual(subset.returncode, 1, subset.stdout + subset.stderr)
+        failure = json.loads(subset.stdout)
+        self.assertEqual(failure["mode"], "locked-deinit-patch")
+        self.assertTrue(any("missing patched_files entry" in e for e in failure["errors"]), failure)
+        # A self-consistent synthetic full overlay fails the compiled-in lock.
+        up.restore_upstream()
+        up.apply_overlay(ALLOWLIST)
+        synthetic = self.run_cli("--repo-root", str(up.root), "--toolchain-dir", str(tc), "--json")
+        self.assertEqual(synthetic.returncode, 1, synthetic.stdout + synthetic.stderr)
+        self.assertTrue(any("locked deinit patch" in e for e in json.loads(synthetic.stdout)["errors"]))
+        # Patched bytes on disk without any declared patched_files fail strict mode.
+        up.restore_upstream()
+        (up.root / "lean-miri" / "vendor" / ALLOWLIST[0]).write_bytes(
+            (up.root / "lean-miri" / "vendor" / ALLOWLIST[0]).read_bytes() + b"\n-- drift\n")
+        drift = self.run_cli("--repo-root", str(up.root), "--toolchain-dir", str(tc), "--json")
+        self.assertEqual(drift.returncode, 1, drift.stdout + drift.stderr)
+        self.assertEqual(json.loads(drift.stdout)["mode"], "strict")
+        self.assertTrue(any(f"SHA-256 mismatch for {ALLOWLIST[0]}" in e for e in json.loads(drift.stdout)["errors"]))
 
     def test_cli_synthetic_full_overlay_rejected_by_the_lock(self) -> None:
         ws = self.upstream_workspace()
@@ -2107,14 +2222,25 @@ class CheckTrustedIntegrationTests(TempCase):
         """`LD_LIBRARY_PATH` is searched before `DT_RUNPATH` and `LD_PRELOAD` /
         `LD_AUDIT` inject code: `Checker` must strip them (like `DYLD_*` and like
         `_scrubbed_env` in the verifier), or the pre-execution DT_RUNPATH admission
-        would be bypassed when `lean` actually runs."""
+        would be bypassed when `lean` actually runs. The other variables glibc drops
+        for secure-execution processes (`GCONV_PATH` makes `iconv_open` dlopen
+        unpinned gconv modules, `GLIBC_TUNABLES` reconfigures ld.so, ...) are
+        stripped too, while `TMPDIR` is kept."""
         root = make_check_trusted_fixture(self.tmp)
         hostile = {"LD_PRELOAD": str(self.tmp / "evil.so"), "LD_LIBRARY_PATH": str(self.tmp),
                    "LD_AUDIT": str(self.tmp / "audit.so"), "DYLD_INSERT_LIBRARIES": str(self.tmp / "evil.dylib"),
-                   "LEAN_PATH": str(self.tmp)}
+                   "LEAN_PATH": str(self.tmp), "GCONV_PATH": str(self.tmp / "gconv"),
+                   "GLIBC_TUNABLES": "glibc.rtld.optional_static_tls=1", "LOCPATH": str(self.tmp / "locale"),
+                   "NLSPATH": str(self.tmp / "nls"), "HOSTALIASES": str(self.tmp / "hosts"),
+                   "RESOLV_HOST_CONF": str(self.tmp / "host.conf"), "TZDIR": str(self.tmp / "zoneinfo"),
+                   "MALLOC_TRACE": str(self.tmp / "mtrace"), "TMPDIR": str(self.tmp)}
         with mock.patch.dict(os.environ, hostile):
             checker = self.checker(root, self.tmp / "bin" / "lean")
         self.assertFalse({key for key in checker.environment if key.startswith(("LD_", "DYLD_", "LEAN"))})
+        self.assertFalse(set(checker.environment) & CT.GLIBC_UNSECURE_ENVVARS)
+        self.assertTrue({"GCONV_PATH", "GLIBC_TUNABLES", "LOCPATH", "NLSPATH", "HOSTALIASES", "RESOLV_HOST_CONF",
+                         "TZDIR", "MALLOC_TRACE"} <= CT.GLIBC_UNSECURE_ENVVARS)
+        self.assertEqual(checker.environment.get("TMPDIR"), str(self.tmp))
         self.assertEqual(checker.environment["PATH"], os.defpath)
         self.assertEqual(set(V._scrubbed_env()), {"PATH", "LC_ALL", "LANG"})
 
@@ -2278,6 +2404,31 @@ class CheckTrustedIntegrationTests(TempCase):
             release = install(make_elf64(["libz.so.1"], ["$ORIGIN/../lib"], rpath=["$ORIGIN/../lib/lean"]), {"lib/lean/libz.so.1": b"pinned-zlib"})
             self.assertFindings(CT.lean_release_findings(prefix, release), "which ld.so can resolve to the unpinned toolchain file lib/libz.so.1", absent=("lib/lean/libz.so.1,",))
             (prefix / "lib" / "lean" / "libz.so.1").unlink()
+        with self.subTest("DT_RPATH without DT_RUNPATH (inherited by system dependencies and glibc dlopen)"):
+            (prefix / "lib" / "libgcc_s.so.1").write_bytes(b"\x7fELF-trojan-libgcc_s")
+            release = install(make_elf64(["libleanshared.so", "libc.so.6"], ["$ORIGIN/../lib", "$ORIGIN/../lib/lean"], rpath_tag=15))
+            self.assertFindings(CT.lean_release_findings(prefix, release), "bin/lean: DT_RPATH without DT_RUNPATH is unsupported",
+                                absent=("RUNPATH shadowing", "SHA-256 mismatch"))
+            release = install(make_elf64(["libleanshared.so", "libc.so.6"], ["$ORIGIN/../lib/lean"], rpath=["$ORIGIN/../lib"]))
+            self.assertEqual(CT.lean_release_findings(prefix, release), [])  # an ignored DT_RPATH next to DT_RUNPATH
+            release = install(make_elf64(["libleanshared.so", "libc.so.6"], ["$ORIGIN/../lib", "${ORIGIN}/../lib/lean"]),
+                              {"lib/lean/libleanshared.so": make_elf64(["libc.so.6"], ["$ORIGIN/..", "$ORIGIN"], rpath_tag=15)})
+            self.assertFindings(CT.lean_release_findings(prefix, release), "lib/lean/libleanshared.so: DT_RPATH without DT_RUNPATH is unsupported")
+            (prefix / "lib" / "libgcc_s.so.1").unlink()
+        with self.subTest("world-writable or non-directory DT_RUNPATH search directory"):
+            extra = prefix / "lib" / "extra"
+            extra.mkdir()
+            os.chmod(extra, 0o777)
+            release = install(make_elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean", "$ORIGIN/../lib/extra"]))
+            self.assertFindings(CT.lean_release_findings(prefix, release),
+                                "bin/lean: DT_RUNPATH search directory lib/extra is world-writable or not a directory")
+            os.chmod(extra, 0o755)
+            self.assertEqual(CT.lean_release_findings(prefix, release), [])
+            os.rmdir(extra)
+            extra.write_bytes(b"not a directory")
+            self.assertFindings(CT.lean_release_findings(prefix, release),
+                                "bin/lean: DT_RUNPATH search directory lib/extra is world-writable or not a directory")
+            extra.unlink()
         with self.subTest("unparseable pinned ELF"):
             release = install(make_elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"], unterminated=True))
             self.assertFindings(CT.lean_release_findings(prefix, release), "cannot parse the ELF dynamic section of bin/lean: unterminated")
@@ -2362,6 +2513,40 @@ class CheckTrustedIntegrationTests(TempCase):
             self.assertIn("is reached through a symlink", str(cm.exception))
             manifest.unlink()
         self.assertEqual(CT.verify_root_manifest(root), {})  # absent manifest: test_boundary.py fixtures
+
+    def test_root_manifest_deletion_or_shrunk_coverage_rejected(self) -> None:
+        """Deleting `trusted/root-manifest.sha256`, or deleting one of its lines, must not
+        silently drop the verification of the repository inputs it is required to cover."""
+        root = make_check_trusted_fixture(self.tmp)
+        manifest = self.write_root_manifest(root, {"Cargo.lock": b"# lock\n", "flake.nix": b"{ }\n",
+                                                   "scripts/verify_lean_miri_pin.py": b"# verifier\n"})
+        good = manifest.read_text(encoding="utf-8")
+        self.assertEqual(CT.verify_root_manifest(root)["coveredFiles"], 3)
+        never = self.tmp / "never" / "bin" / "lean"
+        with self.subTest("manifest deleted while repository markers remain"):
+            manifest.unlink()
+            with self.assertRaises(CT.Failure) as cm:
+                CT.verify_root_manifest(root)
+            self.assertEqual((cm.exception.code, cm.exception.phase), (1, "root-manifest"))
+            self.assertIn("trusted/root-manifest.sha256 is missing, but the checkout carries Cargo.lock, flake.nix, "
+                          "scripts/verify_lean_miri_pin.py", str(cm.exception))
+            self.assertRejectedBeforeExecution(self.checker(root, never), 1, "root-manifest", "is missing, but the checkout carries")
+            manifest.write_text(good, encoding="utf-8")
+        for rel in ("flake.nix", "scripts/verify_lean_miri_pin.py", "Cargo.lock"):
+            with self.subTest(f"{rel} line deleted"):
+                manifest.write_text("".join(line for line in good.splitlines(keepends=True) if not line.endswith(f"  {rel}\n")),
+                                    encoding="utf-8")
+                self.assertRejectedBeforeExecution(self.checker(root, never), 1, "root-manifest",
+                                                   f"{rel} is present but not covered (required root-manifest coverage)")
+                manifest.write_text(good, encoding="utf-8")
+        with self.subTest("a newly added required input must be covered too"):
+            (root / "Cargo.toml").write_bytes(b"[workspace]\n")
+            with self.assertRaises(CT.Failure) as cm:
+                CT.verify_root_manifest(root)
+            self.assertIn("Cargo.toml is present but not covered", str(cm.exception))
+            (root / "Cargo.toml").unlink()
+        self.assertEqual(CT.verify_root_manifest(root)["coveredFiles"], 3)
+        self.assertEqual(set(CT.ROOT_MANIFEST_REPO_MARKERS) <= set(CT.ROOT_MANIFEST_REQUIRED_COVERAGE), True)
 
     def test_live_root_manifest_covers_the_pin_and_this_verifier(self) -> None:
         text = (REPO_ROOT / "trusted" / "root-manifest.sha256").read_text(encoding="utf-8")

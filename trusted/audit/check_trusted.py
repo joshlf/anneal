@@ -28,6 +28,12 @@ TOOLCHAIN = "leanprover/lean4:v4.34.1"
 PARTS = ("olean", "olean.server", "olean.private", "ir.sig", "ir")
 MAX_BYTES = 512 * 1024 * 1024
 CHILD_TIMEOUT_SECS = 600
+# glibc's `UNSECURE_ENVVARS` (`sysdeps/generic/unsecvars.h`) plus `GLIBC_TUNABLES`, minus
+# the `LD_*` names (stripped by prefix) and `TMPDIR`: never passed to a Lean child.
+GLIBC_UNSECURE_ENVVARS = frozenset({
+    "GCONV_PATH", "GETCONF_DIR", "GLIBC_TUNABLES", "HOSTALIASES", "LOCALDOMAIN", "LOCPATH",
+    "MALLOC_TRACE", "NIS_PATH", "NLSPATH", "RESOLV_HOST_CONF", "RES_OPTIONS", "TZDIR",
+})
 
 # Each entry is (module_name, relative_path, direct_imports, role)
 # where role is "theory", "examples", "claim", or "test".
@@ -386,9 +392,15 @@ class Checker:
         # Lean children never see the dynamic-loader variables either: `LD_LIBRARY_PATH` is
         # searched before `DT_RUNPATH` and `LD_PRELOAD` / `LD_AUDIT` inject code, which would
         # bypass the pre-execution toolchain admission (`_scrubbed_env` in
-        # `scripts/verify_lean_miri_pin.py` likewise runs `--version` without them).
+        # `scripts/verify_lean_miri_pin.py` likewise runs `--version` without them). Nor do
+        # they see the other variables glibc itself drops for secure-execution processes
+        # (`UNSECURE_ENVVARS`, `GLIBC_UNSECURE_ENVVARS` below): `GCONV_PATH` makes
+        # `iconv_open` dlopen unpinned gconv modules, `GLIBC_TUNABLES` reconfigures ld.so,
+        # and the NSS / locale / resolver paths redirect files glibc loads at run time.
+        # (`TMPDIR` is kept: build sandboxes may provide no writable `/tmp`.)
         self.environment = {k: v for k, v in os.environ.items()
-                            if not k.startswith(("LEAN", "LAKE", "ELAN", "DYLD_", "LD_"))}
+                            if not k.startswith(("LEAN", "LAKE", "ELAN", "DYLD_", "LD_"))
+                            and k not in GLIBC_UNSECURE_ENVVARS}
         self.environment["PATH"] = os.defpath
         self.artifacts: dict[str, list[list[str]]] = {}
         self.graph: dict = {}
@@ -5267,6 +5279,12 @@ LEAN_MIRI_PIN_PHASE = "lean-miri-pin"
 ROOT_MANIFEST_RELPATH = "trusted/root-manifest.sha256"
 LEAN_MIRI_PIN_RELPATH = "lean-miri/UPSTREAM_PIN.json"
 LEAN_MIRI_VENDOR_RELPATH = "lean-miri/vendor"
+#: Files the root manifest must cover whenever they exist in the checkout.
+ROOT_MANIFEST_REQUIRED_COVERAGE = ("Cargo.toml", "Cargo.lock", "flake.nix", "flake.lock",
+                                   LEAN_MIRI_PIN_RELPATH, "scripts/verify_lean_miri_pin.py")
+#: Repository-root files whose presence makes the root manifest itself mandatory (the
+#: `test_boundary.py` / pin-test fixtures carry none of them and may omit the manifest).
+ROOT_MANIFEST_REPO_MARKERS = ("Cargo.lock", "flake.nix", "flake.lock", "scripts/verify_lean_miri_pin.py")
 _PREFLIGHT_CHUNK = 1 << 20
 _PREFLIGHT_MAX_SHOWN = 8
 
@@ -5566,9 +5584,23 @@ def _le(data: bytes, offset: int, size: int, *, signed: bool = False) -> int:
 
 def elf_dynamic_info(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
     """`(DT_NEEDED sonames, DT_RPATH + DT_RUNPATH components)` of a 64-bit little-endian
-    ELF object, or None without ELF magic (e.g. a shell script); malformed or unsupported
-    ELF objects raise ValueError (same contract as `elf_dynamic_info` in
-    `scripts/verify_lean_miri_pin.py`, written without `struct`). Only the headers, the
+    ELF object (search-path components flattened in dynamic-section order), or None
+    without ELF magic; same contract as `elf_dynamic_info` in
+    `scripts/verify_lean_miri_pin.py`. `elf_dynamic_entries` keeps every entry's tag."""
+    info = elf_dynamic_entries(path)
+    if info is None:
+        return None
+    needed, search_paths = info
+    return needed, tuple(component for _tag, components in search_paths for component in components)
+
+
+def elf_dynamic_entries(path: Path) -> tuple[tuple[str, ...], tuple[tuple[int, tuple[str, ...]], ...]] | None:
+    """`(DT_NEEDED sonames, ((tag, components), ...))` of a 64-bit little-endian ELF
+    object -- one `(15, ...)` (DT_RPATH) or `(29, ...)` (DT_RUNPATH) pair per search-path
+    entry in dynamic-section order, split on `:` -- or None without ELF magic (e.g. a
+    shell script); malformed or unsupported ELF objects raise ValueError (same contract
+    as `elf_dynamic_entries` in `scripts/verify_lean_miri_pin.py`, written without
+    `struct`). Only the headers, the
     PT_INTERP / PT_DYNAMIC segments and the referenced dynamic strings are read (the
     dynamic string table of `libleanshared.so` alone is ~24 MiB). Empty RUNPATH
     components are kept: glibc's `fillin_rpath` searches the current directory for them."""
@@ -5702,11 +5734,11 @@ def elf_dynamic_info(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]] | No
             return chunk[:end].decode("utf-8", "surrogateescape")
 
         needed = tuple(string_at(value) for tag, value in entries if tag == 1)  # DT_NEEDED
-        runpath: list[str] = []
+        search_paths: list[tuple[int, tuple[str, ...]]] = []
         for tag, value in entries:
             if tag in (15, 29):  # DT_RPATH, DT_RUNPATH
-                runpath.extend(string_at(value).split(":"))
-    return needed, tuple(runpath)
+                search_paths.append((tag, tuple(string_at(value).split(":"))))
+    return needed, tuple(search_paths)
 
 
 def _validate_runpath_entry(entry: str, origin: str, real_root: str) -> tuple[Path | None, str | None]:
@@ -5760,10 +5792,16 @@ def runpath_shadowing_findings(prefix: Path, elf_rels: list[str], pinned: set[st
 
     Over-approximates glibc: every RUNPATH/RPATH directory of every object is searched
     for every DT_NEEDED soname of every object, so the verdict is independent of entry
-    order, DT_RUNPATH-over-DT_RPATH precedence and DT_RPATH inheritance. Entries follow
-    glibc's `fillin_rpath` / `is_dst`: an empty component (the current directory), a
-    `$` other than a `$ORIGIN` / `${ORIGIN}` DST, a relative result, or a directory
-    resolving outside the toolchain root is rejected; a DT_NEEDED path is rejected."""
+    order and DT_RUNPATH-over-DT_RPATH precedence. Entries follow glibc's
+    `fillin_rpath` / `is_dst`: an empty component (the current directory), a `$` other
+    than a `$ORIGIN` / `${ORIGIN}` DST, a relative result, a directory resolving outside
+    the toolchain root, or an existing world-writable (or non-directory) search
+    directory is rejected; a DT_NEEDED path is rejected. An object with DT_RPATH but no
+    DT_RUNPATH is rejected outright: glibc honors its DT_RPATH (`elf_get_dynamic_info`
+    drops DT_RPATH only next to DT_RUNPATH), and an honored DT_RPATH is inherited by the
+    system libraries' own dependencies and searched by glibc-internal `dlopen`
+    (`libgcc_s.so.1`, NSS modules), which no DT_NEEDED analysis can enumerate (same
+    policy as `_check_runpath_shadowing` in `scripts/verify_lean_miri_pin.py`)."""
     problems: list[str] = []
     real_root = os.path.realpath(prefix)
     needs: list[tuple[str, str]] = []
@@ -5771,13 +5809,19 @@ def runpath_shadowing_findings(prefix: Path, elf_rels: list[str], pinned: set[st
     for rel in elf_rels:
         path = prefix / rel
         try:
-            info = elf_dynamic_info(path)
+            info = elf_dynamic_entries(path)
         except (OSError, ValueError) as error:
             problems.append(f"cannot parse the ELF dynamic section of {rel}: {error}")
             continue
         if info is None:
             continue
-        needed, runpath = info
+        needed, search_paths = info
+        tags = {tag for tag, _components in search_paths}
+        if 15 in tags and 29 not in tags:
+            problems.append(f"{rel}: DT_RPATH without DT_RUNPATH is unsupported (an honored DT_RPATH is inherited by "
+                            "the system libraries' dependencies and searched by glibc-internal dlopen, e.g. "
+                            "libgcc_s.so.1 and NSS modules, which no DT_NEEDED analysis can enumerate)")
+        runpath = [component for _tag, components in search_paths for component in components]
         origin = str(path.parent)
         for entry in runpath:
             directory, reason = _validate_runpath_entry(entry, origin, real_root)
@@ -5792,6 +5836,13 @@ def runpath_shadowing_findings(prefix: Path, elf_rels: list[str], pinned: set[st
                 continue
             if directory not in search_dirs:
                 search_dirs.append(directory)
+                try:
+                    dir_st = os.stat(directory)
+                except OSError:
+                    dir_st = None
+                if dir_st is not None and (not stat.S_ISDIR(dir_st.st_mode) or dir_st.st_mode & stat.S_IWOTH):
+                    dir_rel = os.path.relpath(directory, prefix).replace(os.sep, "/")
+                    problems.append(f"{rel}: DT_RUNPATH search directory {dir_rel} is world-writable or not a directory")
         for soname in needed:
             if "/" in soname or "\\" in soname or "$" in soname or soname in ("", ".", ".."):
                 problems.append(f"{rel}: DT_NEEDED entry {soname!r} is a path")
@@ -5952,11 +6003,19 @@ def verify_root_manifest(checkout: Path) -> dict:
     `sha256sum` lines (`#` comments and blank lines allowed; the format
     `ci/update_root_manifest.py` refreshes) naming at least one canonical relative path,
     each at most once and never the manifest itself; every covered file must be a
-    regular file reached without symlinks whose SHA-256 matches. Raises
-    `Failure(1, "root-manifest")`. Returns `{"sha256": ..., "coveredFiles": n}`, or {}
-    when the checkout has no manifest (the `test_boundary.py` fixtures)."""
+    regular file reached without symlinks whose SHA-256 matches. Coverage cannot shrink
+    silently: every `ROOT_MANIFEST_REQUIRED_COVERAGE` file present in the checkout must be
+    covered, and a checkout carrying any `ROOT_MANIFEST_REPO_MARKERS` file must carry the
+    manifest (deleting it, or deleting its `flake.nix` line, would otherwise leave those
+    inputs unverified). Raises `Failure(1, "root-manifest")`. Returns
+    `{"sha256": ..., "coveredFiles": n}`, or {} when a checkout without any repository
+    marker has no manifest (the `test_boundary.py` fixtures)."""
     phase = ROOT_MANIFEST_PHASE
     if not os.path.lexists(checkout / ROOT_MANIFEST_RELPATH):
+        markers = [rel for rel in ROOT_MANIFEST_REPO_MARKERS if os.path.lexists(checkout / rel)]
+        if markers:
+            raise Failure(1, phase, f"{ROOT_MANIFEST_RELPATH} is missing, but the checkout carries "
+                                    f"{', '.join(markers)}, which it must cover")
         return {}
     problem = _symlink_free_problem(checkout, ROOT_MANIFEST_RELPATH)
     if problem is not None:
@@ -5991,6 +6050,9 @@ def verify_root_manifest(checkout: Path) -> dict:
             covered[name] = match[1].decode("ascii")
     if not covered and not problems:
         problems.append("contains no checksum entries")
+    for rel in ROOT_MANIFEST_REQUIRED_COVERAGE:
+        if rel not in covered and os.path.lexists(checkout / rel):
+            problems.append(f"{rel} is present but not covered (required root-manifest coverage)")
     for name, expected in covered.items():
         bad = _symlink_free_problem(checkout, name)
         if bad is not None:

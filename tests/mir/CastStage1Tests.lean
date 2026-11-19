@@ -906,9 +906,12 @@ info: 'Anneal.CastStage1Tests.evalRvalue_cast_float_unsupported_of_no_format_ins
 #guard_msgs (whitespace := lax) in
 #print axioms evalRvalue_cast_float_unsupported_of_no_format_inst
 
+-- `stepMirFn` reaches Trusted `evalOperand`, whose consumer-side
+-- `deinitProjectedMoves` branch (`evalMoveOperandDeinit`, `Places.lean`) depends on
+-- the standard axiom `Quot.sound`; still no `Classical.choice`.
 /--
 info: 'Anneal.CastStage1Tests.step_float_casts_concrete' depends on axioms:
-  [propext]
+  [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms step_float_casts_concrete

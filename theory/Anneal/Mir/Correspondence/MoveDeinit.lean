@@ -2095,6 +2095,109 @@ theorem trusted_evalOperands_deref_move_order :
   ⟨d5TrustedAfterMove, d5TrustedTypedDerefAfterMove,
    rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-- **Root moves in every typed context, both zero-sized polarities (all
+states).** For *any* local declarations (not only the untyped `[]` context of
+`trusted_evalOperand_root_move_deinits`), copying an initialized root local `_l`
+without a moved-out leaf returns its value. When the moved value is not
+zero-sized (`moveValueIsZeroSized … = false`, which without local declarations
+holds exactly for non-`unit` values) the move returns the value and sets the slot
+to `.uninit`, `[copy _l, move _l]` returns `[v, v]`, and `[move _l, copy _l]` /
+`[move _l, move _l]` fault with `.ub`. When it is zero-sized (a `0`-byte
+declared type) the move deinitializes nothing, so `[move _l, copy _l]` returns
+`[v, v]` with `locals` unchanged, as in `lean-miri`, where a zero-sized
+deinitialization writes no byte. -/
+theorem trusted_evalOperand_root_move_typed
+    (locals locals' : List LocalSlot) (l : Local) (v : Value)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame)
+    (hget : Trusted.Sequence.get? locals l = some (.init v))
+    (hset : Trusted.Sequence.set? locals l .uninit = some locals')
+    (hmv : valueContainsMovedUninit v = false) :
+    evalOperand locals (.copy ⟨l, []⟩) borrows globals layouts callerLocals localDecls callStack
+      true = .ok v locals ∧
+    (moveValueIsZeroSized localDecls layouts (placeTyResolved localDecls layouts ⟨l, []⟩) v =
+        false →
+      evalOperand locals (.move ⟨l, []⟩) borrows globals layouts callerLocals localDecls
+        callStack true = .ok v locals' ∧
+      evalOperands locals [.copy ⟨l, []⟩, .move ⟨l, []⟩] borrows globals layouts callerLocals
+        localDecls callStack true = .ok [v, v] locals' ∧
+      evalOperands locals [.move ⟨l, []⟩, .copy ⟨l, []⟩] borrows globals layouts callerLocals
+        localDecls callStack true = .ub ∧
+      evalOperands locals [.move ⟨l, []⟩, .move ⟨l, []⟩] borrows globals layouts callerLocals
+        localDecls callStack true = .ub) ∧
+    (moveValueIsZeroSized localDecls layouts (placeTyResolved localDecls layouts ⟨l, []⟩) v =
+        true →
+      evalOperand locals (.move ⟨l, []⟩) borrows globals layouts callerLocals localDecls
+        callStack true = .ok v locals ∧
+      evalOperands locals [.move ⟨l, []⟩, .copy ⟨l, []⟩] borrows globals layouts callerLocals
+        localDecls callStack true = .ok [v, v] locals) := by
+  have hll := seq_lt_of_get? hget
+  have hsl := seq_set?_of_lt hll LocalSlot.uninit
+  have heq : locals' = locals.set l .uninit := by
+    rw [hsl] at hset; exact (Option.some.inj hset).symm
+  have hget' : Trusted.Sequence.get? locals' l = some .uninit := by
+    rw [heq]; exact seq_get?_set_self hll _
+  have hcopy : evalOperand locals (.copy ⟨l, []⟩) borrows globals layouts callerLocals localDecls
+      callStack true = .ok v locals := by
+    simp [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hget, readProjectedValue, hmv]
+  have hcopy' : evalOperand locals' (.copy ⟨l, []⟩) borrows globals layouts callerLocals
+      localDecls callStack true = .ub := by
+    simp [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hget']
+  have hmove' : evalOperand locals' (.move ⟨l, []⟩) borrows globals layouts callerLocals
+      localDecls callStack true = .ub := by
+    simp [evalOperand, evalMoveOperandDeinit, evalCopyPlaceRead, hget']
+  refine ⟨hcopy, fun hzst => ?_, fun hzst => ?_⟩
+  · have hmove : evalOperand locals (.move ⟨l, []⟩) borrows globals layouts callerLocals
+        localDecls callStack true = .ok v locals' := by
+      simp [evalOperand, evalMoveOperandDeinit, evalCopyPlaceRead, hget, readProjectedValue, hmv,
+        hzst, deinitMovedSubPlace, hset]
+    refine ⟨hmove, ?_, ?_, ?_⟩
+    · simp [evalOperands, hcopy, hmove]
+    · simp [evalOperands, hmove, hcopy']
+    · simp [evalOperands, hmove, hmove']
+  · have hmove : evalOperand locals (.move ⟨l, []⟩) borrows globals layouts callerLocals
+        localDecls callStack true = .ok v locals := by
+      simp [evalOperand, evalMoveOperandDeinit, evalCopyPlaceRead, hget, readProjectedValue, hmv,
+        hzst]
+    refine ⟨hmove, ?_⟩
+    simp [evalOperands, hmove, hcopy]
+
+/-- A `0`-byte `()` layout for the typed zero-sized root-move witness. -/
+def typedZstUnitLayout : TypeLayout :=
+  { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .arbitrary [] [],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+
+/-- Layout table whose only entry is `typedZstUnitLayout`. -/
+def typedZstLayouts : LayoutTable := { emptyLayoutTable with entries := [typedZstUnitLayout] }
+
+/-- Local declarations `_0 : (), _1 : ()` (both at the `0`-byte layout `0`). -/
+def typedZstDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 }, debugName := .none },
+   { mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 }, debugName := .none }]
+
+/-- The field-less aggregate of the typed zero-sized witness is not `unit`. -/
+theorem typedZst_value_ne_unit : (Value.aggregate 0 [] : Value) ≠ Value.unit := by
+  intro h
+  cases h
+
+/-- **Non-vacuity of the zero-sized polarity of `trusted_evalOperand_root_move_typed`
+for a non-`unit` value.** `_1 : ()` declared at a `0`-byte layout holds the
+field-less aggregate `.aggregate 0 []` (which the untyped context would treat as
+a non-zero-sized value and deinitialize); in the typed context it is zero-sized,
+so `[move _1, copy _1]` returns it twice and leaves `locals` unchanged. -/
+theorem trusted_evalOperand_root_move_typed_zst_nonvacuous :
+    ∃ (locals : List LocalSlot) (l : Local) (v : Value) (layouts : LayoutTable)
+        (localDecls : List LocalDecl),
+      v ≠ .unit ∧ Trusted.Sequence.get? locals l = some (.init v) ∧
+      moveValueIsZeroSized localDecls layouts (placeTyResolved localDecls layouts ⟨l, []⟩) v =
+        true ∧
+      moveValueIsZeroSized [] layouts (placeTyResolved [] layouts ⟨l, []⟩) v = false ∧
+      evalOperands locals [.move ⟨l, []⟩, .copy ⟨l, []⟩] [] [] layouts [] localDecls [] true =
+        .ok [v, v] locals :=
+  ⟨[.uninit, .init (.aggregate 0 [])], 1, .aggregate 0 [], typedZstLayouts, typedZstDecls,
+   typedZst_value_ne_unit, rfl, rfl, rfl, rfl⟩
+
 /-- **`TrustedProjectedMoveDeinitClaim`** (proved here; restated in
 `Anneal.Mir.Correspondence.Claims`). -/
 theorem trustedProjectedMoveDeinitClaim_proof : TrustedProjectedMoveDeinitClaim :=
@@ -2111,7 +2214,9 @@ theorem trustedProjectedMoveDeinitClaim_proof : TrustedProjectedMoveDeinitClaim 
    trusted_evalOperand_movedUninit_read_ub,
    trusted_evalOperand_movedUninit_read_nonvacuous,
    trusted_evalOperands_field_move_order,
-   trusted_evalOperands_deref_move_order⟩
+   trusted_evalOperands_deref_move_order,
+   trusted_evalOperand_root_move_typed,
+   trusted_evalOperand_root_move_typed_zst_nonvacuous⟩
 
 /-! ## Part 10c — Fail-closed pointer constants, destination-first
 assignments, and a non-vacuity witness for the assignment Tree Borrows theorem -/

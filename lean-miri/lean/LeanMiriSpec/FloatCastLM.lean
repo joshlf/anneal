@@ -12318,8 +12318,11 @@ info: 'LeanMiriSpec.Correspondence.operandTy_move_local' depends on axioms: [pro
 #guard_msgs (whitespace := lax) in
 #print axioms LeanMiriSpec.Correspondence.operandTy_move_local
 
+-- `evalRvalue` reaches Trusted `evalOperand`, whose consumer-side
+-- `deinitProjectedMoves` branch (`evalMoveOperandDeinit`, `Places.lean`) depends on
+-- the standard axiom `Quot.sound`; still no `Classical.choice`.
 /--
-info: 'LeanMiriSpec.Correspondence.evalRvalue_floatCast_eq' depends on axioms: [propext]
+info: 'LeanMiriSpec.Correspondence.evalRvalue_floatCast_eq' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms LeanMiriSpec.Correspondence.evalRvalue_floatCast_eq

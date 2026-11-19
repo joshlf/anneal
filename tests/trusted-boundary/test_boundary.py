@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -828,6 +829,137 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                        2, "base-snapshot", "not read-only")
         shutil.rmtree(snap)
         done("waiver pins, annotated-claim vacuity, read-only staged inputs, and --base-snapshot TCB drift")
+
+        # Group 19: pre-execution toolchain admission (the struct-free ELF64 parser and the
+        # DT_NEEDED x DT_RUNPATH / DT_RPATH analysis of `lean_release_findings`), the root
+        # manifest, and the Lean-child environment. Pure Python: nothing is executed.
+        def elf64(needed, runpath=(), *, rpath=(), rpath_tag=29, unterminated=False):
+            """Minimal ELF64 LE ET_DYN image (EM_BPF, so it can never run): one PT_LOAD over
+            the file, a PT_DYNAMIC with DT_NEEDED*, [DT_RPATH], [DT_RUNPATH/DT_RPATH],
+            DT_STRTAB, DT_STRSZ, DT_NULL."""
+            strtab, dyn = bytearray(b"\0"), []
+            for name in needed:
+                dyn.append((1, len(strtab)))
+                strtab += name.encode() + b"\0"
+            if rpath:
+                dyn.append((15, len(strtab)))
+                strtab += ":".join(rpath).encode() + b"\0"
+            if runpath:
+                dyn.append((rpath_tag, len(strtab)))
+                strtab += ":".join(runpath).encode() + b"\0"
+            if unterminated:
+                del strtab[-1]
+            dyn_off, slots = 64 + 2 * 56, len(dyn) + 3
+            str_off = dyn_off + 16 * slots
+            total = str_off + len(strtab)
+            dyn += [(5, str_off), (10, len(strtab)), (0, 0)]
+            ehdr = struct.pack("<4sBBBBB7sHHIQQQIHHHHHH", b"\x7fELF", 2, 1, 1, 0, 0, bytes(7), 3, 247, 1, 0,
+                               64, 0, 0, 64, 56, 2, 64, 0, 0)
+            load = struct.pack("<IIQQQQQQ", 1, 4, 0, 0, 0, total, total, 0x1000)
+            dynamic = struct.pack("<IIQQQQQQ", 2, 6, dyn_off, dyn_off, dyn_off, 16 * slots, 16 * slots, 8)
+            return ehdr + load + dynamic + b"".join(struct.pack("<qQ", t, v) for t, v in dyn) + bytes(strtab)
+
+        prefix = suite / "toolchain-fixture"
+        for directory in (prefix, prefix / "bin", prefix / "lib", prefix / "lib/lean"):
+            directory.mkdir(exist_ok=True)
+            directory.chmod(0o755)
+
+        def install(bin_lean, extra=None):
+            images = {"bin/lean": bin_lean,
+                      "bin/lake": elf64(["libleanshared.so", "libc.so.6"], ["$ORIGIN/../lib", "$ORIGIN/../lib/lean"]),
+                      "lib/lean/libleanshared.so": elf64(["libc.so.6"], ["$ORIGIN/..", "$ORIGIN"])}
+            images.update(extra or {})
+            for rel, data in images.items():
+                (prefix / rel).write_bytes(data)
+                (prefix / rel).chmod(0o755 if rel.startswith("bin/") else 0o644)
+            return {"files": {rel: runner.digest(prefix / rel) for rel in images}}
+
+        def expect_finding(release, needle, absent=()):
+            problems = runner.lean_release_findings(prefix, release)
+            assert any(needle in p for p in problems), (needle, problems)
+            assert not any(bad in p for bad in absent for p in problems), (absent, problems)
+
+        clean = install(elf64(["libleanshared.so", "libc.so.6"], ["$ORIGIN/../lib", "${ORIGIN}/../lib/lean"]))
+        assert runner.lean_release_findings(prefix, clean) == [], runner.lean_release_findings(prefix, clean)
+        assert runner.elf_dynamic_entries(prefix / "bin/lean") == (
+            ("libleanshared.so", "libc.so.6"), ((29, ("$ORIGIN/../lib", "${ORIGIN}/../lib/lean")),))
+        assert runner.elf_dynamic_info(prefix / "bin/lean") == (
+            ("libleanshared.so", "libc.so.6"), ("$ORIGIN/../lib", "${ORIGIN}/../lib/lean"))
+        # An honored DT_RPATH (no DT_RUNPATH next to it) is inherited by the system libraries'
+        # dependencies and searched by glibc-internal dlopen (`libgcc_s.so.1`, NSS modules):
+        # rejected even without a shadowed DT_NEEDED soname; an ignored one is accepted.
+        (prefix / "lib/libgcc_s.so.1").write_bytes(b"\x7fELF-planted-libgcc_s")
+        expect_finding(install(elf64(["libleanshared.so"], ["$ORIGIN/../lib", "$ORIGIN/../lib/lean"], rpath_tag=15)),
+                       "bin/lean: DT_RPATH without DT_RUNPATH is unsupported", absent=("RUNPATH shadowing",))
+        ignored = install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"], rpath=["$ORIGIN/../lib"]))
+        assert runner.lean_release_findings(prefix, ignored) == [], runner.lean_release_findings(prefix, ignored)
+        expect_finding(install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"]),
+                               {"lib/lean/libleanshared.so": elf64(["libc.so.6"], ["$ORIGIN/..", "$ORIGIN"], rpath_tag=15)}),
+                       "lib/lean/libleanshared.so: DT_RPATH without DT_RUNPATH is unsupported")
+        (prefix / "lib/libgcc_s.so.1").unlink()
+        # glibc `fillin_rpath` / `is_dst` semantics and generic DT_NEEDED x DT_RUNPATH shadowing.
+        (prefix / "lib/libz.so.1").write_bytes(b"\x7fELF-planted-zlib")
+        for needed, runpath, needle in (
+            (["libleanshared.so"], ["$ORIGIN/../lib/lean", ""], "bin/lean: empty DT_RUNPATH/DT_RPATH component"),
+            (["libleanshared.so"], ["$LIB/x"], "bin/lean: unsupported DT_RUNPATH entry '$LIB/x'"),
+            (["libleanshared.so"], ["$ORIGINX/../lib/lean"], "bin/lean: unsupported DT_RUNPATH entry '$ORIGINX/../lib/lean'"),
+            (["libleanshared.so"], ["$ORIGIN/../.."], "bin/lean: DT_RUNPATH entry '$ORIGIN/../..' resolves outside"),
+            (["$ORIGIN/evil.so"], ["$ORIGIN/../lib/lean"], "bin/lean: DT_NEEDED entry '$ORIGIN/evil.so' is a path"),
+            (["libz.so.1"], ["$ORIGIN/../lib"], "RUNPATH shadowing: bin/lean needs 'libz.so.1'"),
+        ):
+            expect_finding(install(elf64(needed, runpath)), needle)
+        (prefix / "lib/libz.so.1").unlink()
+        # World-writable search directory, unparseable pinned ELF, planted companion, digest drift.
+        (prefix / "lib/extra").mkdir()
+        (prefix / "lib/extra").chmod(0o777)
+        expect_finding(install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean", "$ORIGIN/../lib/extra"])),
+                       "bin/lean: DT_RUNPATH search directory lib/extra is world-writable or not a directory")
+        (prefix / "lib/extra").rmdir()
+        expect_finding(install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"], unterminated=True)),
+                       "cannot parse the ELF dynamic section of bin/lean: unterminated")
+        release = install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"]))
+        (prefix / "lib/lean/libleanshared_evil.so").write_bytes(b"evil")
+        (prefix / "lib/lean/libleanshared_evil.so").chmod(0o644)
+        expect_finding(release, "unpinned toolchain file added: lib/lean/libleanshared_evil.so")
+        (prefix / "lib/lean/libleanshared_evil.so").unlink()
+        (prefix / "bin/lake").write_bytes(b"#!/bin/sh\n")
+        expect_finding(release, "SHA-256 mismatch for bin/lake")
+        shutil.rmtree(prefix)
+        # Root manifest: exact SHA-256 coverage, fail-closed on drift, and no silent shrinking
+        # (a deleted manifest or a deleted line for a required input is rejected).
+        mroot = suite / "root-manifest-fixture"
+        (mroot / "trusted").mkdir(parents=True)
+        (mroot / "covered.txt").write_text("covered\n")
+        (mroot / runner.ROOT_MANIFEST_RELPATH).write_text(
+            f"# fixture\n{runner.digest(mroot / 'covered.txt')}  covered.txt\n")
+        assert runner.verify_root_manifest(mroot)["coveredFiles"] == 1
+        (mroot / "covered.txt").write_text("drifted\n")
+        expect_failure(lambda: runner.verify_root_manifest(mroot), 1, runner.ROOT_MANIFEST_PHASE,
+                       "SHA-256 mismatch for covered.txt")
+        (mroot / "covered.txt").write_text("covered\n")
+        (mroot / "flake.lock").write_text("{}\n")
+        expect_failure(lambda: runner.verify_root_manifest(mroot), 1, runner.ROOT_MANIFEST_PHASE,
+                       "flake.lock is present but not covered")
+        (mroot / runner.ROOT_MANIFEST_RELPATH).unlink()
+        expect_failure(lambda: runner.verify_root_manifest(mroot), 1, runner.ROOT_MANIFEST_PHASE,
+                       "trusted/root-manifest.sha256 is missing, but the checkout carries flake.lock")
+        (mroot / "flake.lock").unlink()
+        assert runner.verify_root_manifest(mroot) == {}  # marker-free fixture without a manifest
+        shutil.rmtree(mroot)
+        # Lean children never inherit loader variables or glibc's secure-execution variables.
+        with patch.dict(os.environ, {"LD_PRELOAD": str(suite / "evil.so"), "GCONV_PATH": str(suite),
+                                     "GLIBC_TUNABLES": "glibc.rtld.optional_static_tls=1", "TMPDIR": str(suite)}):
+            env_checker = runner.Checker(fixture(), lean, temp_parent=suite)
+        disposable.append(env_checker.stage)
+        assert not {k for k in env_checker.environment
+                    if k.startswith(("LD_", "DYLD_")) or k in runner.GLIBC_UNSECURE_ENVVARS}, env_checker.environment
+        assert env_checker.environment.get("TMPDIR") == str(suite)
+        # Positive control: the installed locked release itself is admitted.
+        live_prefix = (lean or Path.home() / ".elan/toolchains/leanprover--lean4---v4.34.1/bin/lean").resolve().parent.parent
+        if (live_prefix.name == runner.LOCKED_LEAN_RELEASE["directory"]
+                and runner._host_platform() == runner.LOCKED_LEAN_RELEASE["platform"]):
+            assert runner.lean_release_findings(live_prefix) == [], runner.lean_release_findings(live_prefix)
+        done("pre-execution toolchain admission (DT_NEEDED x DT_RUNPATH/DT_RPATH), root manifest, Lean-child env")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)

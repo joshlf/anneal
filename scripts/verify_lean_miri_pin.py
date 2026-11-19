@@ -56,8 +56,9 @@ Vendor checks (`verify_vendor`)
    upstream pin therefore requires a reviewed change to this file as well. The
    pin's `build_lean_toolchain` must name a toolchain with compiled-in release
    digests (`LOCKED_TOOLCHAIN_PINS`), like `check_trusted.py`'s locked `TOOLCHAIN`.
-6. Patch modes. Strict mode (the CLI default) rejects any `patched_files`
-   entry and any byte difference from upstream. With `allow_deinit_patch=True`
+6. Patch modes. Strict mode (`--strict`, and the API default) rejects any
+   `patched_files` entry and any byte difference from upstream. With
+   `allow_deinit_patch=True`
    (`--allow-deinit-patch`), `patched_files` may overlay a subset of the closed
    10-file `PATCH_ALLOWLIST` (the Episode 1 `deinitMovedPlace` /
    `pendingMoveDeinit` patch); each entry needs `path`, distinct valid
@@ -78,7 +79,11 @@ Vendor checks (`verify_vendor`)
    a proper subset (synthetic overlays) is accepted with the flag alone.
    `require_locked_deinit_patch=False` (API only, for synthetic full overlays)
    disables the lock. Updating the patch requires a reviewed change here and
-   in `trusted/audit/check_trusted.py`.
+   in `trusted/audit/check_trusted.py`. The CLI without a patch-mode flag
+   verifies a pin that declares a non-empty `patched_files` list exactly as
+   `--require-locked-deinit-patch` (the state `check_trusted.py` requires, so
+   the default run accepts the repository's own reviewed overlay and nothing
+   else) and every other pin in strict mode.
 7. Optional `execution_machine_closure` (`[{path, sha256}]`, `.olean` paths
    relative to an explicit `--olean-dir`): verified only when `olean_dir` is
    supplied, otherwise reported as `skipped`.
@@ -116,11 +121,15 @@ the compiled-in `LOCKED_TOOLCHAIN_PINS` (the official
 `leanprover/lean4:v4.34.1` `x86_64-unknown-linux-gnu` release archive: all 16
 files were checked against `lean-4.34.1-linux.zip` from the GitHub release),
 so any added, deleted or modified pinned file fails closed. Before anything is
-executed, the stdlib ELF64 parser (`elf_dynamic_info`) and the glibc-faithful
-`_check_runpath_shadowing` resolve every `DT_NEEDED` soname of every
-RUNPATH-checked object (`RUNPATH_CHECKED_BINARIES` plus `lib/lean/*.so`)
-through every `DT_RUNPATH` / `DT_RPATH` directory, and glibc / Lean sonames
-planted in `lib/` or `lib/lean/` are rejected. Only when every file check
+executed, the stdlib ELF64 parser (`elf_dynamic_entries` / `elf_dynamic_info`)
+and the glibc-faithful `_check_runpath_shadowing` resolve every `DT_NEEDED`
+soname of every RUNPATH-checked object (`RUNPATH_CHECKED_BINARIES` plus
+`lib/lean/*.so`) through every `DT_RUNPATH` / `DT_RPATH` directory (each of
+which must be a non-world-writable directory inside the toolchain root), an
+object with `DT_RPATH` but no `DT_RUNPATH` (whose inherited search path also
+serves the system libraries' dependencies and glibc-internal `dlopen`) is
+rejected, and glibc / Lean sonames planted in `lib/` or `lib/lean/` are
+rejected. Only when every file check
 passed are `bin/lean --version` and `bin/lake --version` executed (with
 `stdin=DEVNULL`, a scrubbed environment and a timeout); both must report the
 toolchain's version and the same build commit.
@@ -1648,8 +1657,25 @@ def _run_version(binary: Path, label: str, timeout: float, c: _Collector) -> Opt
 
 def elf_dynamic_info(path: os.PathLike | str) -> Optional[Tuple[Tuple[str, ...], Tuple[str, ...]]]:
     """Return `(DT_NEEDED sonames, DT_RUNPATH + DT_RPATH entries)` of a 64-bit
-    little-endian ELF object, or `None` if `path` has no ELF magic at all (e.g.
-    a shell script). Malformed or unsupported ELF objects raise `ValueError`.
+    little-endian ELF object (search-path components flattened in
+    dynamic-section order), or `None` if `path` has no ELF magic at all (e.g. a
+    shell script). Malformed or unsupported ELF objects raise `ValueError`.
+    `elf_dynamic_entries` keeps the DT_RPATH / DT_RUNPATH tag of every entry."""
+    info = elf_dynamic_entries(path)
+    if info is None:
+        return None
+    needed, search_paths = info
+    return needed, tuple(component for _tag, components in search_paths for component in components)
+
+
+def elf_dynamic_entries(
+    path: os.PathLike | str,
+) -> Optional[Tuple[Tuple[str, ...], Tuple[Tuple[int, Tuple[str, ...]], ...]]]:
+    """Return `(DT_NEEDED sonames, ((tag, components), ...))` of a 64-bit
+    little-endian ELF object, with one `(15, ...)` (DT_RPATH) or `(29, ...)`
+    (DT_RUNPATH) pair per search-path entry in dynamic-section order (each
+    entry split on `:`), or `None` if `path` has no ELF magic at all (e.g. a
+    shell script). Malformed or unsupported ELF objects raise `ValueError`.
 
     Only the ELF header, program headers, the PT_INTERP/PT_DYNAMIC segments and
     the individual NUL-terminated dynamic strings that are referenced are read:
@@ -1787,13 +1813,13 @@ def elf_dynamic_info(path: os.PathLike | str) -> Optional[Tuple[Tuple[str, ...],
             return chunk[:end].decode("utf-8", "surrogateescape")
 
         needed = tuple(string_at(v) for t, v in entries if t == 1)  # DT_NEEDED
-        runpath: List[str] = []
+        search_paths: List[Tuple[int, Tuple[str, ...]]] = []
         for t, v in entries:
             if t in (15, 29):  # DT_RPATH, DT_RUNPATH
                 # Empty components are kept: glibc's `fillin_rpath` searches the
                 # current working directory for an empty RUNPATH/RPATH element.
-                runpath.extend(string_at(v).split(":"))
-    return needed, tuple(runpath)
+                search_paths.append((t, tuple(string_at(v).split(":"))))
+    return needed, tuple(search_paths)
 
 
 def _validate_runpath_entry(entry: str, origin: str, real_root: str) -> Tuple[Optional[Path], Optional[str]]:
@@ -1851,25 +1877,45 @@ def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequ
     `/lib/x86_64-linux-gnu/libm.so.6`. This check over-approximates the loader:
     every RUNPATH/RPATH directory of every checked object is searched for every
     DT_NEEDED soname of every checked object, so the verdict is independent of
-    entry order, of DT_RUNPATH-over-DT_RPATH precedence and of DT_RPATH
-    inheritance; every existing entry found must be a pinned/verified file. All
-    RUNPATH/RPATH directories must resolve strictly inside the toolchain root.
+    entry order and of DT_RUNPATH-over-DT_RPATH precedence; every existing entry
+    found must be a pinned/verified file. All RUNPATH/RPATH directories must
+    resolve strictly inside the toolchain root, and an existing one must be a
+    directory that is not world-writable (or any user could plant a library in
+    it after this point-in-time check, while the verified toolchain runs).
     Entries are interpreted like glibc's `fillin_rpath` / `is_dst`: an empty
     component means the current working directory and is rejected, and only
     `$ORIGIN` / `${ORIGIN}` tokens not followed by an identifier character are
-    expanded."""
+    expanded.
+
+    An object with DT_RPATH but no DT_RUNPATH is rejected outright (glibc's
+    `elf_get_dynamic_info` ignores DT_RPATH only when DT_RUNPATH is present): an
+    honored DT_RPATH is inherited by every object loaded below it, including the
+    *system* libraries' own dependencies, and is searched by glibc-internal
+    `dlopen` (`libgcc_s.so.1` for unwinding and thread cancellation, NSS
+    `libnss_*.so.2` modules, ...), none of which is a DT_NEEDED soname of a
+    checked object, so no DT_NEEDED analysis can enumerate what it may load
+    (the official release's `lib/` holds an unpinned `libgcc_s.so.1`)."""
     needs: List[Tuple[str, str]] = []
     search_dirs: List[Path] = []
     for rel in elf_rels:
         path = toolchain_dir / rel
         try:
-            info = elf_dynamic_info(path)
+            info = elf_dynamic_entries(path)
         except (OSError, ValueError, struct.error) as exc:
             c.err("toolchain", f"cannot parse the ELF dynamic section of {rel}: {exc}")
             continue
         if info is None:
             continue
-        needed, runpath = info
+        needed, search_paths = info
+        tags = {tag for tag, _components in search_paths}
+        if 15 in tags and 29 not in tags:
+            c.err(
+                "toolchain",
+                f"{rel}: DT_RPATH without DT_RUNPATH is unsupported (an honored DT_RPATH is inherited by "
+                "the system libraries' dependencies and searched by glibc-internal dlopen, e.g. "
+                "libgcc_s.so.1 and NSS modules, which no DT_NEEDED analysis can enumerate)",
+            )
+        runpath = [component for _tag, components in search_paths for component in components]
         origin = str(path.parent)
         for entry in runpath:
             directory, reason = _validate_runpath_entry(entry, origin, real_root)
@@ -1884,6 +1930,13 @@ def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequ
                 continue
             if directory not in search_dirs:
                 search_dirs.append(directory)
+                try:
+                    dir_st = os.stat(directory)
+                except OSError:
+                    dir_st = None
+                if dir_st is not None and (not stat.S_ISDIR(dir_st.st_mode) or dir_st.st_mode & stat.S_IWOTH):
+                    dir_rel = os.path.relpath(directory, toolchain_dir).replace(os.sep, "/")
+                    c.err("toolchain", f"{rel}: DT_RUNPATH search directory {dir_rel} is world-writable or not a directory")
         for soname in needed:
             if "/" in soname or "\\" in soname or "$" in soname or soname in ("", ".", ".."):
                 c.err("toolchain", f"{rel}: DT_NEEDED entry {soname!r} is a path")
@@ -2309,6 +2362,13 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     )
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parent.parent, help="repository root (default: the checkout containing this script)")
     parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="reject every patched_files entry, even the compiled-in reviewed Episode 1 patch: the vendored "
+        "sources must be byte-identical to upstream (by default a pin that declares patched_files is "
+        "verified as --require-locked-deinit-patch, and one that declares none in this strict mode)",
+    )
+    parser.add_argument(
         "--allow-deinit-patch",
         action="store_true",
         help="accept patched_files overlays restricted to the closed 10-file deinitMovedPlace allowlist "
@@ -2329,6 +2389,8 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument("--toolchain-dir", type=Path, help=argparse.SUPPRESS)  # test-only override
     parser.add_argument("--elan-home", type=Path, help=argparse.SUPPRESS)  # test-only override
     args = parser.parse_args(argv)
+    if args.strict and (args.allow_deinit_patch or args.require_locked_deinit_patch):
+        parser.error("--strict cannot be combined with --allow-deinit-patch or --require-locked-deinit-patch")
     if args.expected_pin_sha256 is not None and not _is_hex64(args.expected_pin_sha256):
         parser.error("--expected-pin-sha256 must be 64 lowercase hex digits")
     if args.timeout <= 0:
@@ -2336,13 +2398,39 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     return args
 
 
+def _cli_patch_mode(args: argparse.Namespace) -> Tuple[bool, Optional[bool]]:
+    """`(allow_deinit_patch, require_locked_deinit_patch)` for the CLI.
+
+    Explicit flags win. Without any, a pin that declares a non-empty
+    `patched_files` list is verified exactly as `--require-locked-deinit-patch`
+    (only the compiled-in reviewed Episode 1 patch, which
+    `trusted/audit/check_trusted.py` also requires, is accepted), and any other
+    pin in strict mode. Both defaults fail closed on every other state; an
+    unreadable or malformed pin falls back to strict mode, where the full
+    verification reports it."""
+    if args.strict:
+        return False, None
+    if args.require_locked_deinit_patch:
+        return True, True
+    if args.allow_deinit_patch:
+        return True, None
+    try:
+        pin = _load_json_strict(_read_small_regular_file(Path(args.repo_root) / PIN_RELPATH))
+    except (OSError, ValueError, PinVerificationError):
+        return False, None
+    if isinstance(pin, dict) and isinstance(pin.get("patched_files"), list) and pin["patched_files"]:
+        return True, True
+    return False, None
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
+    allow_deinit_patch, require_locked_deinit_patch = _cli_patch_mode(args)
     try:
         result = verify_all(
             args.repo_root,
-            allow_deinit_patch=args.allow_deinit_patch,
-            require_locked_deinit_patch=True if args.require_locked_deinit_patch else None,
+            allow_deinit_patch=allow_deinit_patch,
+            require_locked_deinit_patch=require_locked_deinit_patch,
             olean_dir=args.olean_dir,
             toolchain_dir=args.toolchain_dir,
             elan_home=args.elan_home,
@@ -2360,7 +2448,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps({
                 "ok": False,
                 "repo_root": str(args.repo_root),
-                "mode": vendor_mode(args.allow_deinit_patch, args.require_locked_deinit_patch or None),
+                "mode": vendor_mode(allow_deinit_patch, require_locked_deinit_patch),
                 "errors": list(exc.errors),
                 "warnings": list(exc.warnings),
             }, indent=2))

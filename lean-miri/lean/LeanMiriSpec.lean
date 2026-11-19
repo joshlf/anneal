@@ -59,6 +59,8 @@ import LeanMiriSpec.Correspondence.Safety
 import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 import LeanMiriSpec.Correspondence.WideSliceDstLM
 import LeanMiriSpec.Correspondence.MoveDeinitEquiv
+import LeanMiriSpec.FloatCastLM
+import LeanMiriSpec.WitFloatCastLM
 import LeanMiriSpec.Audit
 
 /-!
@@ -509,6 +511,16 @@ import LeanMiriSpec.Audit
   documented known limitations
   (niche-encoded enum tags, untyped offsets over moved-out leaves, reinterpreting
   `Deref` moves) and an axiom audit.
+* `LeanMiriSpec.FloatCastLM`: IEEE-754 float-cast correspondence for
+  `CastKind.floatToInt` / `intToFloat` / `floatToFloat` on `f32` / `f64` and all
+  integer widths, relating the trusted float-cast primitives, `evalRvalue` and
+  `stepMirFn` directly to `Miri.Interpreter.FloatBits`, `FloatOps`, `Cast.cast` and
+  `Step.step` (no shadow evaluator), with its own axiom guards. Imported here so
+  that `lake --dir examples build LeanMiriSpec` keeps checking it against the
+  patched interpreter (`Cast.cast` is the unchanged source, `cast_eq_src`).
+* `LeanMiriSpec.WitFloatCastLM`: concrete multi-step two-sided float-cast
+  execution witnesses (`stepMirFn` vs `Step.step` under `annealStepHooksFloat`)
+  instantiating `FloatCastLM`'s step simulations, with its own axiom guards.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
