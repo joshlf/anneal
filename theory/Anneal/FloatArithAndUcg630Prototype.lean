@@ -11146,34 +11146,99 @@ inductive EnumDecodeSpec where
       (variantShapes : List FieldsShape) (variantFieldTys : List (List Ty))
   | nichePointer (nicheVariant dataVariant : Nat) (dataFieldTy : Ty)
 
-/-- Primitive / pointer / float structural byte size extending
-`Trusted.Bytes.rigidTyKindByteSize` with the four IEEE float kinds (`f16`, `f32`,
-`f64`, `f128`) and float arrays (`[f32; n]`, `[f64; n]`). Returns `.none` for
-`.adt` and non-empty `.tuple` so aggregate padding still comes from `LayoutTable`. -/
-def protoRigidTyKindByteSize : RigidTy → Option Nat
+/-- Primitive / pointer / float structural byte size parameterized by target
+pointer width `ptrBytes` (default `8`), extending `Trusted.Bytes.rigidTyKindByteSize`
+with the four IEEE float kinds (`f16`, `f32`, `f64`, `f128`), float arrays, and
+target-width thin/wide pointers (`ptrBytes` / `2 * ptrBytes`, matching
+`decodePtrBytesNoForgeWithPolicy` on both 32-bit and 64-bit `LayoutTable`s).
+Returns `.none` for `.adt` and non-empty `.tuple` (and `.ref`/`.rawPtr` to
+`.adt`/`.foreign`, whose thin vs custom-DST wide width is consulted in
+`LayoutTable` with `ptrBytes` fallback in `protoFieldByteSize`). -/
+def protoRigidTyKindByteSize (ptrBytes : Nat := 8) : RigidTy → Option Nat
+  | .bool => .some 1
+  | .char => .some 4
+  | .uint w => intCastTargetBytes (.uint w)
+  | .int w => intCastTargetBytes (.int w)
   | .float .f16 => .some 2
   | .float .f32 => .some 4
   | .float .f64 => .some 8
   | .float .f128 => .some 16
+  | .tuple .nil | .fnDef _ _ => .some 0
+  | .fnPtr _ _ _ _ => .some ptrBytes
+  | .ref _ pointee | .rawPtr _ pointee =>
+    match pointee with
+    | .slice _ | .str | .dynamic _ => .some (Nat.add ptrBytes ptrBytes)
+    | .adt _ _ | .foreign _ => .none
+    | _ => .some ptrBytes
   | .array elemKind n =>
-    match protoRigidTyKindByteSize elemKind with
+    match protoRigidTyKindByteSize ptrBytes elemKind with
     | .some elemSz => .some (Nat.mul elemSz n)
     | .none => .none
-  | k => rigidTyKindByteSize k
+  | _ => .none
 
-/-- Field byte-size lookup checking `protoRigidTyKindByteSize fTy.kind` **before**
-`LayoutTable.lookup layouts fTy.layoutIdx`. Prevents placeholder `layoutIdx := 0`
-on primitive MIR fields (`{ kind := .uint .u64, layoutIdx := 0 }`,
-`{ kind := .float .f64, layoutIdx := 0 }`, etc.) from colliding with a 0-byte
-ZST (`()`) at `LayoutTable` slot `0`, while still consulting `LayoutTable` first
-for `.adt` and non-empty `.tuple` fields. -/
+/-- Sequential byte size of a layout-free tuple `[k_0, ..., k_{m-1}]` when each
+element has a known structural width under `protoRigidTyKindByteSize ptrBytes`
+(handling `(u32, u32)`, `(f32, f32)`, `([f32; 2], u64)`, and 32-bit `(&u8, u32)`). -/
+def protoTupleFieldsByteSize (ptrBytes : Nat) : List RigidTy → Option Nat
+  | .nil => .some 0
+  | k :: rest =>
+    match protoRigidTyKindByteSize ptrBytes k, protoTupleFieldsByteSize ptrBytes rest with
+    | .some sz, .some restSz => .some (Nat.add sz restSz)
+    | _, _ => .none
+
+/-- Field byte-size lookup checking `protoRigidTyKindByteSize (layoutPointerBytes layouts) fTy.kind`
+**before** `LayoutTable.lookup layouts fTy.layoutIdx`. Prevents placeholder `layoutIdx := 0`
+on primitive/float/pointer/tuple MIR fields from colliding with a 0-byte ZST (`()`) at
+`LayoutTable` slot `0`, respects `layoutPointerBytes layouts` (`4` on 32-bit, `8` on
+64-bit), checks `layoutMatchesAggregateVariant` on non-empty `.tuple` layouts before
+trusting `fl.size.bytes`, and preserves `LayoutTable` padding for `.adt` and padded
+`.tuple` layouts (as well as `2 * ptrBytes` custom-DST wide `.ref`/`.rawPtr` layouts). -/
 def protoFieldByteSize (layouts : LayoutTable) (fTy : Ty) : Option Nat :=
-  match protoRigidTyKindByteSize fTy.kind with
+  let ptrBytes := layoutPointerBytes layouts
+  match protoRigidTyKindByteSize ptrBytes fTy.kind with
   | .some sz => .some sz
   | .none =>
-    match LayoutTable.lookup layouts fTy.layoutIdx with
-    | .some fl => .some fl.size.bytes
-    | .none => rigidTyByteSize layouts fTy
+    match fTy.kind with
+    | .ref _ _ | .rawPtr _ _ =>
+      match LayoutTable.lookup layouts fTy.layoutIdx with
+      | .some fl =>
+        match Nat.ble ptrBytes fl.size.bytes with
+        | true => .some fl.size.bytes
+        | false => .some ptrBytes
+      | .none => .some ptrBytes
+    | .tuple (k :: ks) =>
+      match LayoutTable.lookup layouts fTy.layoutIdx with
+      | .some fl =>
+        match layoutMatchesAggregateVariant fl 0 (length (k :: ks)) with
+        | true => .some fl.size.bytes
+        | false => protoTupleFieldsByteSize ptrBytes (k :: ks)
+      | .none => protoTupleFieldsByteSize ptrBytes (k :: ks)
+    | .array elemKind n =>
+      match LayoutTable.lookup layouts fTy.layoutIdx with
+      | .some fl =>
+        match fl.fields with
+        | .array _ count =>
+          match Nat.beq count n with
+          | true => .some fl.size.bytes
+          | false => .none
+        | _ =>
+          match elemKind with
+          | .tuple ks =>
+            match protoTupleFieldsByteSize ptrBytes ks with
+            | .some elemSz => .some (Nat.mul elemSz n)
+            | .none => .none
+          | _ => .none
+      | .none =>
+        match elemKind with
+        | .tuple ks =>
+          match protoTupleFieldsByteSize ptrBytes ks with
+          | .some elemSz => .some (Nat.mul elemSz n)
+          | .none => .none
+        | _ => .none
+    | _ =>
+      match LayoutTable.lookup layouts fTy.layoutIdx with
+      | .some fl => .some fl.size.bytes
+      | .none => rigidTyByteSize layouts fTy
 
 /-- Decode aggregate fields at `offsets` using each field's **full `Ty`**
 (`RigidTy` + `LayoutIdx`), slicing each field via `protoFieldByteSize` (checking
@@ -12273,9 +12338,13 @@ theorem niche_wide_and_multifield_bug_and_complete_fix_witness :
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- **Fuel-indexed rich typed decoder** integrating `RichAdtSpec` across nested
-ADTs, arrays (`[Option<&u8>; N]`, `[Wrap(&u8); N]`), and tuples
-(`(Option<&u8>, Wrap(&u8))`), while collapsing definitionally to
-`decodeTypedValueFromBytesWithPolicy` when `richSpecs = []`. -/
+ADTs (including unregistered single-variant structs AND unregistered
+`FieldsShape.array` ADTs), arrays (`[Option<&u8>; N]`, `[Wrap(&u8); N]`,
+`[(f32, f32); N]`), and tuples (`(Option<&u8>, Wrap(&u8))`, `(u32, u32)`,
+`([f32; 2], u64)` — checking `layoutMatchesAggregateVariant` so placeholder
+`layoutIdx := 0` never collides with `()` at slot `0`, closing TCB Finding 6!),
+while collapsing definitionally to `decodeTypedValueFromBytesWithPolicy` when
+`richSpecs = []`. -/
 def decodeTypedValueRichWithPolicy
     (policy : Ptr2IntTransmutePolicy) :
     Nat → LayoutTable → List (LayoutIdx × RichAdtSpec) → Ty → List AbstractByte → Option Value
@@ -12309,6 +12378,22 @@ def decodeTypedValueRichWithPolicy
                   | .none => .none
                 | false =>
                   decodeTypedValueFromBytesWithPolicy policy (.succ fuel') layouts ty bytes
+              | .array stride count =>
+                match Nat.beq count 0 with
+                | true =>
+                  match bytes with
+                  | .nil => .some (.aggregate variantIdx .nil)
+                  | _ :: _ => .none
+                | false =>
+                  match l.fieldLayouts with
+                  | elemFlIdx :: _ =>
+                    match decodeArrayChunksWith
+                        (decodeChild { kind := .adt "" .nil, layoutIdx := elemFlIdx })
+                        stride.bytes count bytes with
+                    | .some vals => .some (.aggregate variantIdx vals)
+                    | .none => .none
+                  | .nil =>
+                    decodeTypedValueFromBytesWithPolicy policy (.succ fuel') layouts ty bytes
               | _ =>
                 decodeTypedValueFromBytesWithPolicy policy (.succ fuel') layouts ty bytes
             | _ =>
@@ -12322,6 +12407,18 @@ def decodeTypedValueRichWithPolicy
           | .nil => .some (.aggregate 0 .nil)
           | _ :: _ => .none
         | false =>
+          let arrayFallback (elemSzOpt : Option Nat) : Option Value :=
+            match elemSzOpt with
+            | .none => .none
+            | .some elemSz =>
+              match Nat.beq (length bytes) (Nat.mul elemSz n) with
+              | false => .none
+              | true =>
+                match decodeArrayChunksWith
+                    (decodeChild { kind := elemKind, layoutIdx := 0 })
+                    elemSz n bytes with
+                | .some elems => .some (.aggregate 0 elems)
+                | .none => .none
           match LayoutTable.lookup layouts rTy.layoutIdx with
           | .some l =>
             match l.fields, l.fieldLayouts with
@@ -12334,29 +12431,51 @@ def decodeTypedValueRichWithPolicy
                     stride.bytes n bytes with
                 | .some elems => .some (.aggregate 0 elems)
                 | .none => .none
+            | .array stride _, .nil =>
+              arrayFallback
+                (match protoFieldByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                 | .some sz => .some sz
+                 | .none => .some stride.bytes)
             | _, _ =>
-              decodeTypedValueFromBytesWithPolicy policy (.succ fuel') layouts ty bytes
+              arrayFallback (protoFieldByteSize layouts { kind := elemKind, layoutIdx := 0 })
           | .none =>
-            decodeTypedValueFromBytesWithPolicy policy (.succ fuel') layouts ty bytes
+            arrayFallback (protoFieldByteSize layouts { kind := elemKind, layoutIdx := 0 })
       | .tuple (kHead :: kTail) =>
         let ks := kHead :: kTail
+        let decodeTypedKind := fun (k : RigidTy) (bs : List AbstractByte) =>
+          decodeChild { kind := k, layoutIdx := 0 } bs
+        let sizeOfKind := fun (k : RigidTy) =>
+          protoFieldByteSize layouts { kind := k, layoutIdx := 0 }
         match LayoutTable.lookup layouts rTy.layoutIdx with
         | .some l =>
-          match Nat.beq (length bytes) l.size.bytes, l.fields with
-          | true, .arbitrary offsets _ =>
-            match Bool.and (Nat.beq (length ks) (length offsets))
-                (Nat.beq (length l.fieldLayouts) (length offsets)) with
-            | true =>
-              match decodeTypedKindsAndLayoutsAtOffsets decodeChild layouts bytes
-                  offsets ks l.fieldLayouts with
+          match layoutMatchesAggregateVariant l 0 (length ks) with
+          | false =>
+            match decodeSeqFieldsWith decodeTypedKind sizeOfKind ks bytes with
+            | .some vals => .some (.aggregate 0 vals)
+            | .none => .none
+          | true =>
+            match Nat.beq (length bytes) l.size.bytes, l.fields with
+            | true, .arbitrary offsets _ =>
+              match Bool.and (Nat.beq (length ks) (length offsets))
+                  (Nat.beq (length l.fieldLayouts) (length offsets)) with
+              | true =>
+                match decodeTypedKindsAndLayoutsAtOffsets decodeChild layouts bytes
+                    offsets ks l.fieldLayouts with
+                | .some vals => .some (.aggregate 0 vals)
+                | .none => .none
+              | false =>
+                match decodeFieldsAtOffsetsWith decodeTypedKind sizeOfKind bytes offsets ks with
+                | .some vals => .some (.aggregate 0 vals)
+                | .none => .none
+            | true, _ =>
+              match decodeSeqFieldsWith decodeTypedKind sizeOfKind ks bytes with
               | .some vals => .some (.aggregate 0 vals)
               | .none => .none
-            | false =>
-              decodeTypedValueFromBytesWithPolicy policy (.succ fuel') layouts ty bytes
-          | _, _ =>
-            decodeTypedValueFromBytesWithPolicy policy (.succ fuel') layouts ty bytes
+            | false, _ => .none
         | .none =>
-          decodeTypedValueFromBytesWithPolicy policy (.succ fuel') layouts ty bytes
+          match decodeSeqFieldsWith decodeTypedKind sizeOfKind ks bytes with
+          | .some vals => .some (.aggregate 0 vals)
+          | .none => .none
       | _ =>
         decodeTypedValueFromBytesWithPolicy policy (.succ fuel') layouts ty bytes
 
@@ -12412,10 +12531,33 @@ theorem decodeTypedValueRichWithPolicy_strict_refines_strip
               | single variantIdx =>
                 rw [hv] at h; dsimp only at h ⊢
                 cases hf : l.fields with
-                | primitive | union _ | array _ _ =>
+                | primitive | union _ =>
                   rw [hf] at h
                   exact decodeTypedValueFromBytesWithPolicy_strict_refines_strip
                     (.succ fuel') layouts ty bytes v h
+                | array stride count =>
+                  rw [hf] at h; dsimp only at h ⊢
+                  cases hc0 : Nat.beq count 0 with
+                  | true => rw [hc0] at h; exact h
+                  | false =>
+                    rw [hc0] at h; dsimp only at h ⊢
+                    cases hfls : l.fieldLayouts with
+                    | nil =>
+                      rw [hfls] at h
+                      exact decodeTypedValueFromBytesWithPolicy_strict_refines_strip
+                        (.succ fuel') layouts ty bytes v h
+                    | cons elemFlIdx flRest =>
+                      rw [hfls] at h; dsimp only at h ⊢
+                      cases hch : decodeArrayChunksWith
+                          (decodeTypedValueRichWithPolicy .strictUcg630Ub fuel' layouts
+                            (specHd :: specTl) { kind := .adt "" .nil, layoutIdx := elemFlIdx })
+                          stride.bytes count bytes with
+                      | none => rw [hch] at h; cases h
+                      | some vals =>
+                        rw [hch] at h
+                        rw [decodeArrayChunksWith_mono _ _ stride.bytes
+                          (fun bs cv hc => ih _ bs cv hc) count bytes vals hch]
+                        exact h
                 | arbitrary offsets _ =>
                   rw [hf] at h
                   cases offsets with
@@ -12454,9 +12596,8 @@ theorem decodeTypedValueRichWithPolicy_strict_refines_strip
           rw [hn] at h; dsimp only at h ⊢
           cases hlk : LayoutTable.lookup layouts (normalizeCodecTy ty).layoutIdx with
           | none =>
-            rw [hlk] at h
-            exact decodeTypedValueFromBytesWithPolicy_strict_refines_strip
-              (.succ fuel') layouts ty bytes v h
+            rw [hlk] at h; dsimp only at h ⊢
+            exact arrayFallbackElemSize_mono _ _ (fun bs cv hc => ih _ bs cv hc) _ n bytes v h
           | some l =>
             rw [hlk] at h; dsimp only at h ⊢
             cases hf : l.fields with
@@ -12464,9 +12605,8 @@ theorem decodeTypedValueRichWithPolicy_strict_refines_strip
               rw [hf] at h
               cases hfl : l.fieldLayouts with
               | nil =>
-                rw [hfl] at h
-                exact decodeTypedValueFromBytesWithPolicy_strict_refines_strip
-                  (.succ fuel') layouts ty bytes v h
+                rw [hfl] at h; dsimp only at h ⊢
+                exact arrayFallbackElemSize_mono _ _ (fun bs cv hc => ih _ bs cv hc) _ n bytes v h
               | cons elemFlIdx flRest =>
                 rw [hfl] at h; dsimp only at h ⊢
                 cases hlen : Nat.beq (length bytes) (Nat.mul stride.bytes n) with
@@ -12484,9 +12624,8 @@ theorem decodeTypedValueRichWithPolicy_strict_refines_strip
                       (fun bs cv hc => ih _ bs cv hc) n bytes elems hch]
                     exact h
             | primitive | union _ | arbitrary _ _ =>
-              rw [hf] at h
-              exact decodeTypedValueFromBytesWithPolicy_strict_refines_strip
-                (.succ fuel') layouts ty bytes v h
+              rw [hf] at h; dsimp only at h ⊢
+              exact arrayFallbackElemSize_mono _ _ (fun bs cv hc => ih _ bs cv hc) _ n bytes v h
       | tuple ks =>
         rw [hk] at h
         cases ks with
@@ -12495,46 +12634,79 @@ theorem decodeTypedValueRichWithPolicy_strict_refines_strip
             (.succ fuel') layouts ty bytes v h
         | cons kHead kTail =>
           dsimp only at h ⊢
+          have hseq_mono :
+              (match decodeSeqFieldsWith
+                  (fun k bs => decodeTypedValueRichWithPolicy .strictUcg630Ub fuel' layouts
+                    (specHd :: specTl) { kind := k, layoutIdx := 0 } bs)
+                  (fun k => protoFieldByteSize layouts { kind := k, layoutIdx := 0 })
+                  (kHead :: kTail) bytes with
+               | .some vals => Option.some (Value.aggregate 0 vals)
+               | .none => .none) = .some v →
+              (match decodeSeqFieldsWith
+                  (fun k bs => decodeTypedValueRichWithPolicy .stripProvenance fuel' layouts
+                    (specHd :: specTl) { kind := k, layoutIdx := 0 } bs)
+                  (fun k => protoFieldByteSize layouts { kind := k, layoutIdx := 0 })
+                  (kHead :: kTail) bytes with
+               | .some vals => Option.some (Value.aggregate 0 vals)
+               | .none => .none) = .some v := by
+            intro hs
+            cases hd : decodeSeqFieldsWith
+                (fun k bs => decodeTypedValueRichWithPolicy .strictUcg630Ub fuel' layouts
+                  (specHd :: specTl) { kind := k, layoutIdx := 0 } bs)
+                (fun k => protoFieldByteSize layouts { kind := k, layoutIdx := 0 })
+                (kHead :: kTail) bytes with
+            | none => rw [hd] at hs; cases hs
+            | some vals =>
+              rw [hd] at hs
+              rw [decodeSeqFieldsWith_mono _ _ _ (fun k bs cv hc => ih _ bs cv hc) _ _ vals hd]
+              exact hs
           cases hlk : LayoutTable.lookup layouts (normalizeCodecTy ty).layoutIdx with
           | none =>
-            rw [hlk] at h
-            exact decodeTypedValueFromBytesWithPolicy_strict_refines_strip
-              (.succ fuel') layouts ty bytes v h
+            rw [hlk] at h; exact hseq_mono h
           | some l =>
             rw [hlk] at h; dsimp only at h ⊢
-            cases hsz : Nat.beq (length bytes) l.size.bytes with
+            cases hmv : layoutMatchesAggregateVariant l 0 (length (kHead :: kTail)) with
             | false =>
-              rw [hsz] at h
-              exact decodeTypedValueFromBytesWithPolicy_strict_refines_strip
-                (.succ fuel') layouts ty bytes v h
+              rw [hmv] at h; exact hseq_mono h
             | true =>
-              rw [hsz] at h
-              cases hf : l.fields with
-              | arbitrary offsets memOrder =>
-                rw [hf] at h; dsimp only at h ⊢
-                cases hmatch : Bool.and
-                    (Nat.beq (length (kHead :: kTail)) (length offsets))
-                    (Nat.beq (length l.fieldLayouts) (length offsets)) with
-                | false =>
-                  rw [hmatch] at h
-                  exact decodeTypedValueFromBytesWithPolicy_strict_refines_strip
-                    (.succ fuel') layouts ty bytes v h
-                | true =>
-                  rw [hmatch] at h; dsimp only at h ⊢
-                  cases hdec : decodeTypedKindsAndLayoutsAtOffsets
-                      (decodeTypedValueRichWithPolicy .strictUcg630Ub fuel' layouts (specHd :: specTl))
-                      layouts bytes offsets (kHead :: kTail) l.fieldLayouts with
-                  | none => rw [hdec] at h; cases h
-                  | some vals =>
-                    rw [hdec] at h
-                    rw [decodeTypedKindsAndLayoutsAtOffsets_mono _ _ layouts bytes
-                      (fun cTy bs cv hc => ih cTy bs cv hc)
-                      offsets (kHead :: kTail) l.fieldLayouts vals hdec]
-                    exact h
-              | primitive | union _ | array _ _ =>
-                rw [hf] at h
-                exact decodeTypedValueFromBytesWithPolicy_strict_refines_strip
-                  (.succ fuel') layouts ty bytes v h
+              rw [hmv] at h; dsimp only at h ⊢
+              cases hsz : Nat.beq (length bytes) l.size.bytes with
+              | false => rw [hsz] at h; cases h
+              | true =>
+                rw [hsz] at h
+                cases hf : l.fields with
+                | arbitrary offsets memOrder =>
+                  rw [hf] at h; dsimp only at h ⊢
+                  cases hmatch : Bool.and
+                      (Nat.beq (length (kHead :: kTail)) (length offsets))
+                      (Nat.beq (length l.fieldLayouts) (length offsets)) with
+                  | false =>
+                    rw [hmatch] at h; dsimp only at h ⊢
+                    cases hdec : decodeFieldsAtOffsetsWith
+                        (fun k bs => decodeTypedValueRichWithPolicy .strictUcg630Ub fuel' layouts
+                          (specHd :: specTl) { kind := k, layoutIdx := 0 } bs)
+                        (fun k => protoFieldByteSize layouts { kind := k, layoutIdx := 0 })
+                        bytes offsets (kHead :: kTail) with
+                    | none => rw [hdec] at h; cases h
+                    | some vals =>
+                      rw [hdec] at h
+                      rw [decodeFieldsAtOffsetsWith_mono _ _ _ bytes
+                        (fun k bs cv hc => ih _ bs cv hc) offsets (kHead :: kTail) vals hdec]
+                      exact h
+                  | true =>
+                    rw [hmatch] at h; dsimp only at h ⊢
+                    cases hdec : decodeTypedKindsAndLayoutsAtOffsets
+                        (decodeTypedValueRichWithPolicy .strictUcg630Ub fuel' layouts (specHd :: specTl))
+                        layouts bytes offsets (kHead :: kTail) l.fieldLayouts with
+                    | none => rw [hdec] at h; cases h
+                    | some vals =>
+                      rw [hdec] at h
+                      rw [decodeTypedKindsAndLayoutsAtOffsets_mono _ _ layouts bytes
+                        (fun cTy bs cv hc => ih cTy bs cv hc)
+                        offsets (kHead :: kTail) l.fieldLayouts vals hdec]
+                      exact h
+                | primitive | union _ | array _ _ =>
+                  rw [hf] at h; exact hseq_mono h
       | _ =>
         rw [hk] at h
         exact decodeTypedValueFromBytesWithPolicy_strict_refines_strip
@@ -12582,9 +12754,23 @@ theorem decodeTypedValueRichWithPolicy_strip_eq_strict_of_no_prov
               | single variantIdx =>
                 dsimp only
                 cases l.fields with
-                | primitive | union _ | array _ _ =>
+                | primitive | union _ =>
                   exact decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov
                     (.succ fuel') layouts ty bytes hnp
+                | array stride count =>
+                  dsimp only
+                  cases Nat.beq count 0 with
+                  | true => rfl
+                  | false =>
+                    dsimp only
+                    cases l.fieldLayouts with
+                    | nil =>
+                      exact decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov
+                        (.succ fuel') layouts ty bytes hnp
+                    | cons elemFlIdx _ =>
+                      dsimp only
+                      rw [decodeArrayChunksWith_congr_no_prov _ _ stride.bytes
+                        (fun bs hbs => ih _ bs hbs) count bytes hnp]
                 | arbitrary offsets _ =>
                   cases offsets with
                   | nil =>
@@ -12611,16 +12797,16 @@ theorem decodeTypedValueRichWithPolicy_strip_eq_strict_of_no_prov
           dsimp only
           cases LayoutTable.lookup layouts (normalizeCodecTy ty).layoutIdx with
           | none =>
-            exact decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov
-              (.succ fuel') layouts ty bytes hnp
+            exact arrayFallbackElemSize_congr_no_prov _ _
+              (fun bs hbs => ih _ bs hbs) _ n bytes hnp
           | some l =>
             dsimp only
             cases l.fields with
             | array stride count =>
               cases l.fieldLayouts with
               | nil =>
-                exact decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov
-                  (.succ fuel') layouts ty bytes hnp
+                exact arrayFallbackElemSize_congr_no_prov _ _
+                  (fun bs hbs => ih _ bs hbs) _ n bytes hnp
               | cons elemFlIdx flRest =>
                 dsimp only
                 cases Nat.beq (length bytes) (Nat.mul stride.bytes n) with
@@ -12630,8 +12816,8 @@ theorem decodeTypedValueRichWithPolicy_strip_eq_strict_of_no_prov
                   rw [decodeArrayChunksWith_congr_no_prov _ _ stride.bytes
                     (fun bs hbs => ih _ bs hbs) n bytes hnp]
             | primitive | union _ | arbitrary _ _ =>
-              exact decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov
-                (.succ fuel') layouts ty bytes hnp
+              exact arrayFallbackElemSize_congr_no_prov _ _
+                (fun bs hbs => ih _ bs hbs) _ n bytes hnp
       | tuple ks =>
         cases ks with
         | nil =>
@@ -12641,31 +12827,39 @@ theorem decodeTypedValueRichWithPolicy_strip_eq_strict_of_no_prov
           dsimp only
           cases LayoutTable.lookup layouts (normalizeCodecTy ty).layoutIdx with
           | none =>
-            exact decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov
-              (.succ fuel') layouts ty bytes hnp
+            dsimp only
+            rw [decodeSeqFieldsWith_congr_no_prov _ _ _
+              (fun k bs hbs => ih _ bs hbs) (kHead :: kTail) bytes hnp]
           | some l =>
             dsimp only
-            cases Nat.beq (length bytes) l.size.bytes with
+            cases layoutMatchesAggregateVariant l 0 (length (kHead :: kTail)) with
             | false =>
-              exact decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov
-                (.succ fuel') layouts ty bytes hnp
+              dsimp only
+              rw [decodeSeqFieldsWith_congr_no_prov _ _ _
+                (fun k bs hbs => ih _ bs hbs) (kHead :: kTail) bytes hnp]
             | true =>
-              cases l.fields with
-              | arbitrary offsets memOrder =>
-                dsimp only
-                cases Bool.and
-                    (Nat.beq (length (kHead :: kTail)) (length offsets))
-                    (Nat.beq (length l.fieldLayouts) (length offsets)) with
-                | false =>
-                  exact decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov
-                    (.succ fuel') layouts ty bytes hnp
-                | true =>
+              dsimp only
+              cases Nat.beq (length bytes) l.size.bytes with
+              | false => rfl
+              | true =>
+                cases l.fields with
+                | arbitrary offsets memOrder =>
                   dsimp only
-                  rw [decodeTypedKindsAndLayoutsAtOffsets_congr_no_prov _ _ layouts bytes hnp
-                    (fun cTy bs hbs => ih cTy bs hbs) offsets (kHead :: kTail) l.fieldLayouts]
-              | primitive | union _ | array _ _ =>
-                exact decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov
-                  (.succ fuel') layouts ty bytes hnp
+                  cases Bool.and
+                      (Nat.beq (length (kHead :: kTail)) (length offsets))
+                      (Nat.beq (length l.fieldLayouts) (length offsets)) with
+                  | false =>
+                    dsimp only
+                    rw [decodeFieldsAtOffsetsWith_congr_no_prov _ _ _ bytes hnp
+                      (fun k bs hbs => ih _ bs hbs) offsets (kHead :: kTail)]
+                  | true =>
+                    dsimp only
+                    rw [decodeTypedKindsAndLayoutsAtOffsets_congr_no_prov _ _ layouts bytes hnp
+                      (fun cTy bs hbs => ih cTy bs hbs) offsets (kHead :: kTail) l.fieldLayouts]
+                | primitive | union _ | array _ _ =>
+                  dsimp only
+                  rw [decodeSeqFieldsWith_congr_no_prov _ _ _
+                    (fun k bs hbs => ih _ bs hbs) (kHead :: kTail) bytes hnp]
       | _ =>
         exact decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov
           (.succ fuel') layouts ty bytes hnp
@@ -13286,17 +13480,46 @@ theorem EvalRvalueFloatRelProto.cmp_laws_float
 /-! ## §18. Field-Size Precedence & Float Size Fix, Non-Pointer Niche Enums, Multi-Field No-Forgery, Nested Struct Propagation, Conservativity & Unconditional Cast-Level No-Prov Equivalence -/
 
 /-- Whenever a field's `LayoutTable` entry `fl` agrees with
-`protoRigidTyKindByteSize fTy.kind` (or the kind has no fixed primitive width,
-e.g. `.adt` / non-empty `.tuple`), `protoFieldByteSize` returns `fl.size.bytes`. -/
+`protoRigidTyKindByteSize (layoutPointerBytes layouts) fTy.kind` (and satisfies
+the aggregate/pointer validity shape when `protoRigidTyKindByteSize = .none`),
+`protoFieldByteSize` returns `fl.size.bytes`. -/
 theorem protoFieldByteSize_eq_layout_of_agree
     (layouts : LayoutTable) (fTy : Ty) (fl : TypeLayout)
     (hlk : LayoutTable.lookup layouts fTy.layoutIdx = .some fl)
-    (hagree : ∀ sz, protoRigidTyKindByteSize fTy.kind = .some sz → sz = fl.size.bytes) :
+    (hvalid : match fTy.kind with
+      | .ref _ _ | .rawPtr _ _ => Nat.ble (layoutPointerBytes layouts) fl.size.bytes = true
+      | .tuple (k :: ks) => layoutMatchesAggregateVariant fl 0 (length (k :: ks)) = true
+      | .array _ n =>
+        match fl.fields with
+        | .array _ count => Nat.beq count n = true
+        | _ => False
+      | _ => True)
+    (hagree : ∀ sz, protoRigidTyKindByteSize (layoutPointerBytes layouts) fTy.kind = .some sz →
+      sz = fl.size.bytes) :
     protoFieldByteSize layouts fTy = .some fl.size.bytes := by
   unfold protoFieldByteSize
-  cases hk : protoRigidTyKindByteSize fTy.kind with
+  dsimp only
+  cases hk : protoRigidTyKindByteSize (layoutPointerBytes layouts) fTy.kind with
   | some sz => rw [hagree sz hk]
-  | none => rw [hlk]
+  | none =>
+    cases hkind : fTy.kind with
+    | ref _ _ | rawPtr _ _ =>
+      rw [hkind] at hvalid; rw [hlk]; dsimp only at hvalid ⊢; rw [hvalid]
+    | tuple ks =>
+      cases ks with
+      | nil => rw [hkind] at hk; cases hk
+      | cons k rest => rw [hkind] at hvalid; rw [hlk]; dsimp only at hvalid ⊢; rw [hvalid]
+    | array elemKind n =>
+      rw [hkind] at hvalid; rw [hlk]; dsimp only at hvalid ⊢
+      cases hfl : fl.fields with
+      | array stride count =>
+        rw [hfl] at hvalid; dsimp only at hvalid ⊢; rw [hvalid]
+      | primitive | union _ | arbitrary _ _ =>
+        rw [hfl] at hvalid; cases hvalid
+    | bool | char | int _ | uint _ | float _ | never | str | slice _ | adt _ _
+    | fnDef _ _ | fnPtr _ _ _ _ | closure _ _ | dynamic _ | foreign _ | param _
+    | alias _ | other _ =>
+      dsimp only; rw [hlk]
 
 /-- **Kernel-checked witness (`by rfl`) of B3's unfixed `layoutIdx := 0` field-size
 bug, the missing `.float` arm in `Trusted.Bytes.rigidTyKindByteSize`, and their
@@ -14872,5 +15095,890 @@ theorem EvalRvalueFloatRelProto.cmp_mode_indep
       EvalRvalueFloatRelProto .nondeterministic locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts res := by
   rw [EvalRvalueFloatRelProto.nonArith_binOp_iff .deterministic op lhsOp rhsOp locals mem localDecls layouts res hnarith,
       EvalRvalueFloatRelProto.nonArith_binOp_iff .nondeterministic op lhsOp rhsOp locals mem localDecls layouts res hnarith]
+
+/-! ## §20. TCB Finding 6 (Layout-Free Tuple / Nested Float Aggregate False `.ub`), 32-Bit Pointer-Width & Nonzero-Offset Niche Fixes, Full `RichAdtSpec` No-Forgery, `rem` Divisibility & Complete Relational `mul`/`div`/`rem` Sign Symmetry -/
+
+/-- **Reference no-forgery for `decodeTypedValueRichWithPolicy` across arbitrary
+`richSpecs`**: under **both** policies and for **every** `richSpecs` table,
+provenance-free bytes decoded at any thin or wide reference target `.ref m pointee`
+always fail with `.none` (never forging a reference). -/
+theorem decodeTypedValueRichWithPolicy_no_forge_ref
+    (policy : Ptr2IntTransmutePolicy) (fuel : Nat) (layouts : LayoutTable)
+    (richSpecs : List (LayoutIdx × RichAdtSpec))
+    (m : Mutability) (pointee : RigidTy) (layoutIdx : LayoutIdx)
+    (bytes : List AbstractByte)
+    (hnp : abstractBytesHaveProv bytes = false) :
+    decodeTypedValueRichWithPolicy policy (.succ fuel) layouts richSpecs
+        { kind := .ref m pointee, layoutIdx := layoutIdx } bytes = .none := by
+  cases richSpecs with
+  | nil =>
+    exact decodeTypedValueFromBytesWithPolicy_no_forge_ref policy fuel layouts m pointee
+      layoutIdx bytes hnp
+  | cons _ _ =>
+    unfold decodeTypedValueRichWithPolicy
+    dsimp only [normalizeCodecTy]
+    exact decodeTypedValueFromBytesWithPolicy_no_forge_ref policy fuel layouts m pointee
+      layoutIdx bytes hnp
+
+/-- **Unified reference no-forgery theorem for `decodeAdtRichWithPolicy` with
+`decodeTypedValueRichWithPolicy` across ALL four `RichAdtSpec` constructors**:
+whenever `abstractBytesHaveProv bytes = false` and the target variant's `fTys`
+contains at least one `.ref m pointee` field:
+1. `.structFields`: returns `.none` under both policies (closing Finding 5);
+2. `.taggedEnum`: never decodes to `.some (.aggregate varIdx vals)` under either policy;
+3. `.nichePointerEnum` (`dataVariant ≠ nicheVariant`): never decodes to the
+   dataful variant `.some (.aggregate dataVariant vals)` under either policy;
+4. `.nicheScalarEnum` (`dataVariant ≠ nicheVariant`): never decodes to the
+   dataful variant `.some (.aggregate dataVariant vals)` under either policy! -/
+theorem decodeAdtRichWithPolicy_ref_no_forge_all_specs
+    (policy : Ptr2IntTransmutePolicy) (fuel : Nat) (layouts : LayoutTable)
+    (richSpecs : List (LayoutIdx × RichAdtSpec))
+    (l : TypeLayout) (variantIdx varIdx nicheVariant dataVariant : Nat)
+    (nicheOffset : Size) (nicheBytes nicheValue tagField : Nat)
+    (tagLayout : ScalarLayout)
+    (offsets dataOffsets : List Size)
+    (variantShapes : List FieldsShape)
+    (variantFieldTys : List (List Ty))
+    (fTys : List Ty) (bytes : List AbstractByte) (vals : List Value)
+    (hnp : abstractBytesHaveProv bytes = false)
+    (hmem : ∃ m pointee lIdx, { kind := .ref m pointee, layoutIdx := lIdx } ∈ fTys)
+    (hne : dataVariant ≠ nicheVariant)
+    (hvarTys : get? variantFieldTys varIdx = .some fTys) :
+    decodeAdtRichWithPolicy policy
+        (decodeTypedValueRichWithPolicy policy (.succ fuel) layouts richSpecs)
+        layouts l (.structFields variantIdx offsets fTys) bytes = .none ∧
+    decodeAdtRichWithPolicy policy
+        (decodeTypedValueRichWithPolicy policy (.succ fuel) layouts richSpecs)
+        layouts l (.taggedEnum tagLayout tagField variantShapes variantFieldTys) bytes ≠
+      .some (.aggregate varIdx vals) ∧
+    decodeAdtRichWithPolicy policy
+        (decodeTypedValueRichWithPolicy policy (.succ fuel) layouts richSpecs)
+        layouts l (.nichePointerEnum nicheOffset nicheBytes nicheVariant dataVariant dataOffsets fTys)
+        bytes ≠ .some (.aggregate dataVariant vals) ∧
+    decodeAdtRichWithPolicy policy
+        (decodeTypedValueRichWithPolicy policy (.succ fuel) layouts richSpecs)
+        layouts l (.nicheScalarEnum nicheOffset nicheBytes nicheValue nicheVariant dataVariant dataOffsets fTys)
+        bytes ≠ .some (.aggregate dataVariant vals) := by
+  have hfieldsNone : ∀ offs,
+      decodeFieldsByTysWithPolicy
+          (decodeTypedValueRichWithPolicy policy (.succ fuel) layouts richSpecs)
+          layouts bytes offs fTys = .none :=
+    fun offs =>
+      decodeFieldsByTysWithPolicy_none_of_ref_member_no_prov _ layouts bytes offs fTys hnp
+        (fun m pointee lIdx bs hbs =>
+          decodeTypedValueRichWithPolicy_no_forge_ref policy fuel layouts richSpecs m pointee
+            lIdx bs hbs)
+        hmem
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · unfold decodeAdtRichWithPolicy
+    cases Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
+    | true => rfl
+    | false => dsimp only; rw [hfieldsNone offsets]
+  · intro h
+    unfold decodeAdtRichWithPolicy decodeMultiVariantEnumRichWithPolicy at h
+    cases hu : Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
+    | true => rw [hu] at h; cases h
+    | false =>
+      rw [hu] at h; dsimp only at h
+      cases hf : l.fields with
+      | arbitrary outerOffsets _ =>
+        rw [hf] at h
+        cases htw : scalarLayoutByteWidth tagLayout with
+        | none => rw [htw] at h; cases h
+        | some tagSz =>
+          rw [htw] at h; dsimp only at h
+          cases hg : get? outerOffsets tagField with
+          | none => rw [hg] at h; cases h
+          | some tagOff =>
+            rw [hg] at h; dsimp only at h
+            cases hsl : sliceAbstractBytes bytes tagOff.bytes tagSz with
+            | none => rw [hsl] at h; cases h
+            | some tagSlice =>
+              rw [hsl] at h; dsimp only at h
+              cases htd : decodeScalarLayoutBytesWithPolicy policy tagLayout tagSlice with
+              | none => rw [htd] at h; cases h
+              | some tv =>
+                rw [htd] at h
+                cases tv with
+                | scalar tagSc =>
+                  dsimp only at h
+                  cases hvs : get? variantShapes tagSc.bits with
+                  | none => rw [hvs] at h; cases h
+                  | some vs =>
+                    rw [hvs] at h
+                    cases vs with
+                    | arbitrary varOffsets _ =>
+                      cases hft : get? variantFieldTys tagSc.bits with
+                      | none => rw [hft] at h; cases h
+                      | some fTys' =>
+                        rw [hft] at h; dsimp only at h
+                        cases hdf : decodeFieldsByTysWithPolicy
+                            (decodeTypedValueRichWithPolicy policy (.succ fuel) layouts richSpecs)
+                            layouts bytes varOffsets fTys' with
+                        | none => rw [hdf] at h; cases h
+                        | some vals' =>
+                          rw [hdf] at h
+                          injection h with hagg
+                          injection hagg with hidx _
+                          rw [hidx, hvarTys] at hft
+                          injection hft with hft_eq
+                          rw [← hft_eq, hfieldsNone varOffsets] at hdf
+                          cases hdf
+                    | primitive | union _ | array _ _ => cases h
+                | unit | ptr _ _ | aggregate _ _ => cases h
+      | primitive | union _ | array _ _ => rw [hf] at h; cases h
+  · intro h
+    unfold decodeAdtRichWithPolicy at h
+    cases hu : Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
+    | true => rw [hu] at h; cases h
+    | false =>
+      rw [hu] at h; dsimp only at h
+      cases hsl : sliceAbstractBytes bytes nicheOffset.bytes nicheBytes with
+      | none => rw [hsl] at h; cases h
+      | some nicheSlice =>
+        rw [hsl] at h; dsimp only at h
+        cases hsc : decodeScalarBytes nicheSlice false with
+        | none => rw [hsc] at h; cases h
+        | some p =>
+          rw [hsc] at h; dsimp only at h
+          cases hup : abstractBytesUniformProv nicheSlice with
+          | true =>
+            rw [hup, hfieldsNone dataOffsets] at h; cases h
+          | false =>
+            rw [hup] at h; dsimp only at h
+            cases hz : Nat.beq p.1.bits 0 with
+            | true =>
+              rw [hz] at h; dsimp only at h
+              cases hp : policyRejectsProv policy nicheSlice with
+              | true => rw [hp] at h; cases h
+              | false =>
+                rw [hp] at h
+                injection h with hval
+                injection hval with hv _
+                exact hne hv.symm
+            | false =>
+              rw [hz, hfieldsNone dataOffsets] at h; cases h
+  · intro h
+    unfold decodeAdtRichWithPolicy at h
+    cases hu : Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
+    | true => rw [hu] at h; cases h
+    | false =>
+      rw [hu] at h; dsimp only at h
+      cases hsl : sliceAbstractBytes bytes nicheOffset.bytes nicheBytes with
+      | none => rw [hsl] at h; cases h
+      | some nicheSlice =>
+        rw [hsl] at h; dsimp only at h
+        cases hsc : decodeScalarBytes nicheSlice false with
+        | none => rw [hsc] at h; cases h
+        | some p =>
+          rw [hsc] at h; dsimp only at h
+          cases hz : Nat.beq p.1.bits nicheValue with
+          | true =>
+            rw [hz] at h; dsimp only at h
+            cases hp : policyRejectsProv policy nicheSlice with
+            | true => rw [hp] at h; cases h
+            | false =>
+              rw [hp] at h
+              injection h with hval
+              injection hval with hv _
+              exact hne hv.symm
+          | false =>
+            rw [hz, hfieldsNone dataOffsets] at h; cases h
+
+/-- **General cast-level closure of TCB Finding 5 (`evalByteCastRichWithPolicy_struct_ref_no_forge`)**:
+for **every** provenance-free source value `valueHasProv v = false` (scalars,
+arrays, tuples, structs, AND provenance-free `MaybeUninit`/union values) and
+**every** target struct registered in `richSpecs` as `.structFields variantIdx
+offsets fieldTys` containing at least one `.ref m pointee` field,
+`evalByteCastRichWithPolicy` **never** returns `.ok` under either
+`.strictUcg630Ub` or `.stripProvenance`! -/
+theorem evalByteCastRichWithPolicy_struct_ref_no_forge
+    (policy : Ptr2IntTransmutePolicy) (richSpecs : List (LayoutIdx × RichAdtSpec))
+    (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (v : Value) (locals' : List LocalSlot)
+    (defPath : DefPath) (args : List RigidTy) (l : TypeLayout)
+    (variantIdx : Nat) (offsets : List Size) (fieldTys : List Ty)
+    (vOut : Value) (locOut : List LocalSlot) (memOut : Memory)
+    (hev : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+      localDecls mem.callStack = .ok v locals')
+    (hnp : valueHasProv v = false)
+    (hrk : (resolveTyWithLocalDecls localDecls layouts targetTy).kind = .adt defPath args)
+    (hlk : LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts targetTy).layoutIdx =
+      .some l)
+    (hsp : lookupRichAdtSpec richSpecs (resolveTyWithLocalDecls localDecls layouts targetTy).layoutIdx =
+      .some (.structFields variantIdx offsets fieldTys))
+    (hmem : ∃ m pointee lIdx, { kind := .ref m pointee, layoutIdx := lIdx } ∈ fieldTys) :
+    evalByteCastRichWithPolicy policy richSpecs locals op targetTy mem localDecls layouts ≠
+      .ok vOut locOut memOut := by
+  have hdecNone : ∀ bs, abstractBytesHaveProv bs = false →
+      decodeTypedValueRichWithPolicy policy defaultCodecFuel layouts richSpecs
+        (resolveTyWithLocalDecls localDecls layouts targetTy) bs = .none := by
+    intro bs hbs
+    cases richSpecs with
+    | nil => cases hsp
+    | cons sHd sTl =>
+      have hnorm : normalizeCodecTy (resolveTyWithLocalDecls localDecls layouts targetTy) =
+          resolveTyWithLocalDecls localDecls layouts targetTy := by
+        cases hrt : resolveTyWithLocalDecls localDecls layouts targetTy with
+        | mk rk rIdx =>
+          rw [hrt] at hrk; dsimp only at hrk; subst hrk; rfl
+      show decodeTypedValueRichWithPolicy policy (.succ 15) layouts (sHd :: sTl) _ bs = .none
+      unfold decodeTypedValueRichWithPolicy
+      dsimp only
+      rw [hnorm, hrk]; dsimp only
+      rw [hlk, hsp]
+      exact (decodeAdtRichWithPolicy_ref_no_forge_all_specs policy 14 layouts (sHd :: sTl)
+        l variantIdx 0 0 1 { bytes := 0 } 8 0 0 (.initialized (.int 8 false) ⟨0, 1⟩)
+        offsets .nil .nil [fieldTys] fieldTys bs .nil hbs hmem (by decide) rfl).1
+  intro hcast
+  unfold evalByteCastRichWithPolicy at hcast
+  rw [hev] at hcast; dsimp only at hcast
+  cases hdst : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts targetTy) with
+  | none => rw [hdst] at hcast; cases hcast
+  | some dstSize =>
+    rw [hdst] at hcast; dsimp only at hcast
+    cases hopTy : operandTy localDecls layouts op with
+    | some srcTy =>
+      rw [hopTy] at hcast; dsimp only at hcast
+      cases hsrc : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts srcTy) with
+      | none => rw [hsrc] at hcast; cases hcast
+      | some srcSize =>
+        rw [hsrc] at hcast; dsimp only at hcast
+        cases hsz : Nat.beq srcSize dstSize with
+        | false => rw [hsz] at hcast; cases hcast
+        | true =>
+          rw [hsz] at hcast; dsimp only at hcast
+          cases hbs : encodeByteCastSourceBytes layouts
+              (resolveTyWithLocalDecls localDecls layouts srcTy) v with
+          | none => rw [hbs] at hcast; cases hcast
+          | some bs =>
+            rw [hbs] at hcast; dsimp only at hcast
+            cases hlen : Nat.beq (length bs) dstSize with
+            | false => rw [hlen] at hcast; cases hcast
+            | true =>
+              rw [hlen, hdecNone bs
+                (abstractBytesHaveProv_encodeByteCastSourceBytes_of_no_prov layouts _ v bs hnp hbs)] at hcast
+              cases hcast
+    | none =>
+      rw [hopTy] at hcast; dsimp only at hcast
+      cases hbs : encodeUntypedValueToBytes defaultCodecFuel v with
+      | none => rw [hbs] at hcast; cases hcast
+      | some bs =>
+        rw [hbs] at hcast; dsimp only at hcast
+        cases hlen : Nat.beq (length bs) dstSize with
+        | false => rw [hlen] at hcast; cases hcast
+        | true =>
+          rw [hlen, hdecNone bs
+            (abstractBytesHaveProv_encodeUntypedValueToBytes_of_no_prov defaultCodecFuel v bs hnp hbs)] at hcast
+          cases hcast
+
+/-- `f32` primitive layout & cast declarations witnessing TCB Finding 6's false
+`.ub` at the `evalByteCast` layer on `transmute::<u64, [(f32, f32); 1]>`. -/
+def protoF32Layout : TypeLayout := {
+  size := { bytes := 4 }
+  align := { bytes := 4 }
+  backendRepr := .scalar (.initialized (.float 32) ⟨0, scalarModulus 4 - 1⟩)
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+def protoFloatAggCastLayouts : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [protoUnitLayout, protoF32Layout]
+}
+
+def protoFloatAggCastDecls : List LocalDecl := [
+  { mutability := .not, ty := { kind := .uint .u64, layoutIdx := 0 }, debugName := none },
+  { mutability := .not, ty := { kind := .float .f32, layoutIdx := 1 }, debugName := none }
+]
+
+def protoFloatAggCastLocals : List LocalSlot := [
+  .init (.scalar ⟨0x400000003F800000, 8⟩),
+  .init (.scalar ⟨0x3F800000, 4⟩)
+]
+
+/-- 32-bit (`pointerBits := 32`) fixtures witnessing A3's hardcoded 64-bit pointer
+size bug (`Wrap32(&u8)` = 4 bytes, `Option<(&u8, u32)>` = 8 bytes). -/
+def protoNonNullPtr32Layout : TypeLayout := {
+  size := { bytes := 4 }
+  align := { bytes := 4 }
+  backendRepr := .scalar (.initialized (.pointer 0) ⟨1, scalarModulus 4 - 1⟩)
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+def protoWrapRef32Layout : TypeLayout := {
+  size := { bytes := 4 }
+  align := { bytes := 4 }
+  backendRepr := .scalar (.initialized (.pointer 0) ⟨1, scalarModulus 4 - 1⟩)
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .single 0
+  fieldLayouts := [1]
+  isUninhabited := false
+}
+
+def protoNicheOptRefU32Layout32 : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 4 }
+  backendRepr := .scalarPair
+    (.initialized (.pointer 0) ⟨0, scalarModulus 4 - 1⟩)
+    (.union (.int 32 false))
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple (.initialized (.pointer 0) ⟨0, scalarModulus 4 - 1⟩) 0
+    [.arbitrary [] [], .arbitrary [{ bytes := 0 }] [0]]
+  isUninhabited := false
+}
+
+def protoRich32Layouts : LayoutTable := {
+  pointerBits := 32
+  isLittleEndian := true
+  entries := [protoUnitLayout, protoNonNullPtr32Layout, protoWrapRef32Layout, protoNicheOptRefU32Layout32]
+}
+
+def protoRef32Ty : Ty := { kind := .ref .not (.uint .u8), layoutIdx := 1 }
+def protoWrapRef32Ty : Ty := { kind := .adt "Wrap32" [], layoutIdx := 2 }
+def protoOffsetZeroRef32Bytes : List AbstractByte := encodeLittleEndianBytes 0 4 (.some (7, 7))
+
+def protoRich32Specs : List (LayoutIdx × RichAdtSpec) := [
+  (2, .structFields 0 [{ bytes := 0 }] [protoRef32Ty]),
+  (3, .nichePointerEnum { bytes := 0 } 4 0 1
+    [{ bytes := 0 }, { bytes := 4 }] [protoRef32Ty, { kind := .uint .u32, layoutIdx := 0 }])
+]
+
+/-- Unregistered `FieldsShape.array` ADT (`struct SimdOptRef([Option<&u8>; 2])`)
+with `fieldLayouts := [4]` (`Option<&u8>` in `protoRichExt2Layouts`). -/
+def protoSimdOptRefLayout : TypeLayout := {
+  size := { bytes := 16 }
+  align := { bytes := 8 }
+  backendRepr := .memory
+  fields := .array { bytes := 8 } 2
+  variants := .single 0
+  fieldLayouts := [4]
+  isUninhabited := false
+}
+
+def protoRichExt3Layouts : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [
+    protoUnitLayout,              -- 0
+    protoNonNullPtrFieldLayout,   -- 1
+    protoWrapRefLayout,           -- 2
+    protoRefPayloadEnumLayout,    -- 3
+    protoNicheOptionRefLayout,    -- 4
+    protoWideSliceEnumLayout,     -- 5
+    protoWideSliceRefLayout,      -- 6
+    protoU32FieldLayout,          -- 7
+    protoU32PairStructLayout,     -- 8
+    protoNicheWide16Layout,       -- 9
+    protoOptionRefArray2Layout,   -- 10
+    protoNonZeroU64Layout,        -- 11
+    protoOptionNonZeroU64Layout,  -- 12
+    protoOptionBoolLayout,        -- 13
+    protoOuterStructOptRefLayout, -- 14
+    protoSimdOptRefLayout         -- 15
+  ]
+}
+
+/-- **Kernel-checked witness (`by rfl`) of TCB Finding 6, A3's 32-bit pointer-size
+& nested `FieldsShape.array` drop-off bugs, and nonzero `nicheOffset = 8`
+(`Option<(u64, &u8)>`)**:
+1. **TCB Finding 6 (`Places.lean:7913–7950` & `Bytes.lean:473–526`)**:
+   - At the cast layer (`evalByteCast`), completely safe, provenance-free
+     `transmute::<u64, [(f32, f32); 1]>(0x40000000_3F800000)` passes
+     `Places.tyByteSize` (`dstSize = 8`) yet **falsely returns `.ub`** under
+     `Trusted.MirSemantics.evalByteCast` (and `evalByteCastWithPolicy .stripProvenance`!)
+     because `Bytes.tupleFieldsByteSize` / `rigidTyKindByteSize` omits `.float`;
+   - At the direct byte-decoder layer (`Places.decodeTypedValueFromBytes`, called
+     by memory/projection reads `8425–11071` without `resolveTyWithLocalDecls`),
+     `{ kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 }` collides with
+     `protoUnitLayout` (`size = 0`) at slot `0` because `decodeTypedValueFromBytes`
+     omits `layoutMatchesAggregateVariant`, returning **`.none`** even on
+     provenance-free bytes (and likewise on `([f32; 2], u64)`);
+   - Upgraded `evalByteCastRichWithPolicy` / `decodeTypedValueRichWithPolicy`
+     decodes all of them to `.ok`/`.some` under both policies and flips
+     `*const u8 -> (u32, u32)` between `.ub` (`.strictUcg630Ub`) and `.ok`
+     (`.stripProvenance`)!
+2. **32-bit `pointerBits := 32` fix (`protoFieldByteSize`)**: while
+   `Trusted.Bytes.rigidTyKindByteSize` hardcodes `8` bytes for `&u8`, upgraded
+   `protoFieldByteSize` uses `layoutPointerBytes` (`4` bytes), decoding 32-bit
+   `Wrap32(&x_at_0)` and `Option<(&u8, u32)>` (`Some((&x_at_0, 99))`) with `4`-byte
+   `Value.ptr` under both policies and rejecting forged 32-bit `0x1000` under both!
+3. **Unregistered `FieldsShape.array` ADT propagation**: `SimdOptRef([None, Some(&x_at_0)])`
+   preserves `Value.ptr` under both policies while rejecting `[None, forged_0x1000]`!
+4. **Nonzero `nicheOffset = 8` (`Option<(u64, &u8)>`)**: `None` ignores `.uninit`
+   bytes at `0..8` under both policies, `Some((42, &x_at_0))` succeeds under both,
+   forged `Some((42, 0x1000))` fails under both, and provenance in `u64` at `0..8`
+   flips `.strictUcg630Ub = .none` vs `.stripProvenance = .some`! -/
+theorem trusted_finding6_and_b4_complete_rich_witness :
+    -- 1a. TCB Finding 6 (cast layer): safe `u64 -> [(f32, f32); 1]` falsely returns `.ub` in TCB!
+    evalByteCast protoFloatAggCastLocals (.copy ⟨0, []⟩)
+        { kind := .array (.tuple [.float .f32, .float .f32]) 1, layoutIdx := 0 } emptyMemory
+        protoFloatAggCastDecls protoFloatAggCastLayouts = .ub ∧
+    evalByteCastRichWithPolicy .strictUcg630Ub protoRichExtSpecs protoFloatAggCastLocals
+        (.copy ⟨0, []⟩) { kind := .array (.tuple [.float .f32, .float .f32]) 1, layoutIdx := 0 }
+        emptyMemory protoFloatAggCastDecls protoFloatAggCastLayouts =
+      .ok (.aggregate 0 [.aggregate 0 [.scalar ⟨0x3F800000, 4⟩, .scalar ⟨0x40000000, 4⟩]])
+        protoFloatAggCastLocals emptyMemory ∧
+    -- 1b. TCB Finding 6 (decoder layer): `(u32, u32)` at `layoutIdx := 0` collides with `()` in TCB,
+    --     whereas `decodeTypedValueRichWithPolicy` decodes it & flips `*const u8 -> (u32, u32)`!
+    decodeTypedValueFromBytes 4 protoEnumLayouts
+        { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 }
+        (encodeLittleEndianBytes 0x0000002A00000001 8 .none) = .none ∧
+    decodeTypedValueRichWithPolicy .strictUcg630Ub 4 protoEnumLayouts protoRichExtSpecs
+        { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 }
+        (encodeLittleEndianBytes 0x0000002A00000001 8 .none) =
+      .some (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨42, 4⟩]) ∧
+    evalByteCastRichWithPolicy .strictUcg630Ub protoRichExtSpecs protoEnumLocals (.copy ⟨0, []⟩)
+        { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 } emptyMemory
+        protoEnumDecls protoEnumLayouts = .ub ∧
+    evalByteCastRichWithPolicy .stripProvenance protoRichExtSpecs protoEnumLocals (.copy ⟨0, []⟩)
+        { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 } emptyMemory
+        protoEnumDecls protoEnumLayouts =
+      .ok (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨42, 4⟩]) protoEnumLocals emptyMemory ∧
+    -- 1c. Nested float aggregates `([f32; 2], u64)` & `[(f32, f32); 1]`: TCB `.none` vs B4 `.some`!
+    decodeTypedValueFromBytes 4 protoRichExtLayouts
+        { kind := .tuple [.array (.float .f32) 2, .uint .u64], layoutIdx := 0 }
+        (appendAbstractBytes (encodeLittleEndianBytes 0x400000003F800000 8 .none)
+          (encodeLittleEndianBytes 9 8 .none)) = .none ∧
+    decodeTypedValueRichWithPolicy .strictUcg630Ub 4 protoRichExtLayouts protoRichExtSpecs
+        { kind := .tuple [.array (.float .f32) 2, .uint .u64], layoutIdx := 0 }
+        (appendAbstractBytes (encodeLittleEndianBytes 0x400000003F800000 8 .none)
+          (encodeLittleEndianBytes 9 8 .none)) =
+      .some (.aggregate 0 [.aggregate 0 [.scalar ⟨0x3F800000, 4⟩, .scalar ⟨0x40000000, 4⟩],
+        .scalar ⟨9, 8⟩]) ∧
+    decodeTypedValueFromBytes 4 protoRichExtLayouts
+        { kind := .array (.tuple [.float .f32, .float .f32]) 1, layoutIdx := 0 }
+        (encodeLittleEndianBytes 0x400000003F800000 8 .none) = .none ∧
+    decodeTypedValueRichWithPolicy .strictUcg630Ub 4 protoRichExtLayouts protoRichExtSpecs
+        { kind := .array (.tuple [.float .f32, .float .f32]) 1, layoutIdx := 0 }
+        (encodeLittleEndianBytes 0x400000003F800000 8 .none) =
+      .some (.aggregate 0 [.aggregate 0 [.scalar ⟨0x3F800000, 4⟩, .scalar ⟨0x40000000, 4⟩]]) ∧
+    -- 2. 32-bit `pointerBits := 32`: `protoFieldByteSize` = 4 (vs hardcoded 8) and 32-bit ADTs work!
+    rigidTyKindByteSize protoRef32Ty.kind = .some 8 ∧
+    protoFieldByteSize protoRich32Layouts protoRef32Ty = .some 4 ∧
+    decodeTypedValueRichWithPolicy .strictUcg630Ub 4 protoRich32Layouts protoRich32Specs
+        protoWrapRef32Ty protoOffsetZeroRef32Bytes =
+      .some (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 4]) ∧
+    decodeTypedValueRichWithPolicy .stripProvenance 4 protoRich32Layouts protoRich32Specs
+        protoWrapRef32Ty (encodeLittleEndianBytes 0x1000 4 .none) = .none ∧
+    decodeTypedValueRichWithPolicy .strictUcg630Ub 4 protoRich32Layouts protoRich32Specs
+        { kind := .adt "Option" [], layoutIdx := 3 }
+        (appendAbstractBytes protoOffsetZeroRef32Bytes (encodeLittleEndianBytes 99 4 .none)) =
+      .some (.aggregate 1 [.ptr { allocId := 7, offsetBytes := 0 } 4, .scalar ⟨99, 4⟩]) ∧
+    -- 3. Unregistered `FieldsShape.array` ADT `SimdOptRef([Option<&u8>; 2])` propagates `richSpecs`!
+    decodeTypedValueRichWithPolicy .strictUcg630Ub 4 protoRichExt3Layouts protoRichExtSpecs
+        { kind := .adt "SimdOptRef" [], layoutIdx := 15 }
+        (appendAbstractBytes (encodeLittleEndianBytes 0 8 .none) protoOffsetZeroRefBytes) =
+      .some (.aggregate 0 [.aggregate 0 [],
+        .aggregate 1 [.ptr { allocId := 7, offsetBytes := 0 } 8]]) ∧
+    decodeTypedValueRichWithPolicy .stripProvenance 4 protoRichExt3Layouts protoRichExtSpecs
+        { kind := .adt "SimdOptRef" [], layoutIdx := 15 }
+        (appendAbstractBytes (encodeLittleEndianBytes 0 8 .none)
+          (encodeLittleEndianBytes 0x1000 8 .none)) = .none ∧
+    -- 4. Nonzero `nicheOffset = 8` (`Option<(u64, &u8)>`): `None` ignores `.uninit` at `0..8`,
+    --    `Some((42, &x_at_0))` succeeds, forged `0x1000` fails, and provenance at `0..8` flips!
+    decodeAdtRichWithPolicy .strictUcg630Ub
+        (decodeTypedValueRichWithPolicy .strictUcg630Ub 4 protoRichExtLayouts protoRichExtSpecs)
+        protoRichExtLayouts protoNicheWide16Layout
+        (.nichePointerEnum { bytes := 8 } 8 0 1
+          [{ bytes := 0 }, { bytes := 8 }] [{ kind := .uint .u64, layoutIdx := 0 }, protoRefTy])
+        (appendAbstractBytes (replicateUninitBytes 8) (encodeLittleEndianBytes 0 8 .none)) =
+      .some (.aggregate 0 []) ∧
+    decodeAdtRichWithPolicy .strictUcg630Ub
+        (decodeTypedValueRichWithPolicy .strictUcg630Ub 4 protoRichExtLayouts protoRichExtSpecs)
+        protoRichExtLayouts protoNicheWide16Layout
+        (.nichePointerEnum { bytes := 8 } 8 0 1
+          [{ bytes := 0 }, { bytes := 8 }] [{ kind := .uint .u64, layoutIdx := 0 }, protoRefTy])
+        (appendAbstractBytes (encodeLittleEndianBytes 42 8 .none) protoOffsetZeroRefBytes) =
+      .some (.aggregate 1 [.scalar ⟨42, 8⟩, .ptr { allocId := 7, offsetBytes := 0 } 8]) ∧
+    decodeAdtRichWithPolicy .stripProvenance
+        (decodeTypedValueRichWithPolicy .stripProvenance 4 protoRichExtLayouts protoRichExtSpecs)
+        protoRichExtLayouts protoNicheWide16Layout
+        (.nichePointerEnum { bytes := 8 } 8 0 1
+          [{ bytes := 0 }, { bytes := 8 }] [{ kind := .uint .u64, layoutIdx := 0 }, protoRefTy])
+        (appendAbstractBytes (encodeLittleEndianBytes 42 8 .none)
+          (encodeLittleEndianBytes 0x1000 8 .none)) = .none ∧
+    decodeAdtRichWithPolicy .strictUcg630Ub
+        (decodeTypedValueRichWithPolicy .strictUcg630Ub 4 protoRichExtLayouts protoRichExtSpecs)
+        protoRichExtLayouts protoNicheWide16Layout
+        (.nichePointerEnum { bytes := 8 } 8 0 1
+          [{ bytes := 0 }, { bytes := 8 }] [{ kind := .uint .u64, layoutIdx := 0 }, protoRefTy])
+        (appendAbstractBytes (encodeLittleEndianBytes 42 8 (.some (9, 9))) protoOffsetZeroRefBytes) =
+      .none ∧
+    decodeAdtRichWithPolicy .stripProvenance
+        (decodeTypedValueRichWithPolicy .stripProvenance 4 protoRichExtLayouts protoRichExtSpecs)
+        protoRichExtLayouts protoNicheWide16Layout
+        (.nichePointerEnum { bytes := 8 } 8 0 1
+          [{ bytes := 0 }, { bytes := 8 }] [{ kind := .uint .u64, layoutIdx := 0 }, protoRefTy])
+        (appendAbstractBytes (encodeLittleEndianBytes 42 8 (.some (9, 9))) protoOffsetZeroRefBytes) =
+      .some (.aggregate 1 [.scalar ⟨42, 8⟩, .ptr { allocId := 7, offsetBytes := 0 } 8]) := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ### §20.1 Exact Divisibility Characterization of Finite `rem = ±0.0` & Complete Relational `mul`/`div`/`rem` Sign Symmetry -/
+
+/-- **Exact divisibility characterization of finite `rem = ±0.0`**:
+for any two finite nonzero `f32`/`f64` operands `a` (`lnum / lden`) and `b`
+(`rnum / rden`), `a % b` equals `zeroBits f ln` (and decodes to `.zero` of any
+sign) **if and only if** `|a|` is an exact integer multiple of `|b|`, i.e.,
+`(lnum * rden) % (lden * rnum) = 0` (confirming that nonzero finite IEEE-754
+remainders never underflow to `±0.0`). -/
+theorem evalFloatArithBaseProto_rem_finite_eq_zero_iff (f : IeeeFormat) (a b : Nat)
+    (ln rn : Bool) (lnum lden rnum rden : Nat)
+    (hl : decodeBits f a = .finite ln lnum lden)
+    (hr : decodeBits f b = .finite rn rnum rden) :
+    (evalFloatArithBaseProto .rem f a b = zeroBits f ln ↔
+      (lnum * rden) % (lden * rnum) = 0) ∧
+    ((∃ zneg, decodeBits f (evalFloatArithBaseProto .rem f a b) = .zero zneg) ↔
+      (lnum * rden) % (lden * rnum) = 0) := by
+  obtain ⟨h0, hpos⟩ := evalFloatArithBaseProto_rem_finite_exact f a b ln rn lnum lden rnum rden hl hr
+  refine ⟨⟨?_, h0⟩, ⟨?_, fun hm => ⟨ln, by rw [h0 hm, decodeBits_zeroBits]⟩⟩⟩
+  · intro hz
+    cases hm : (lnum * rden) % (lden * rnum) with
+    | zero => rfl
+    | succ k =>
+      obtain ⟨remN, remD, hdec, _, _⟩ := hpos (by rw [hm]; exact Nat.succ_pos k)
+      rw [hz, decodeBits_zeroBits] at hdec
+      cases hdec
+  · rintro ⟨zneg, hz⟩
+    cases hm : (lnum * rden) % (lden * rnum) with
+    | zero => rfl
+    | succ k =>
+      obtain ⟨remN, remD, hdec, _, _⟩ := hpos (by rw [hm]; exact Nat.succ_pos k)
+      rw [hz] at hdec
+      cases hdec
+
+/-- Negating the first binary input preserves the `nanChoicesProto` candidate set
+in both `FloatArithMode`s (symmetric counterpart of `nanChoicesProto_mem_neg_second`). -/
+theorem nanChoicesProto_mem_neg_first (f : IeeeFormat) (a b : Nat)
+    (mode : FloatArithMode) (c : Nat) :
+    c ∈ nanChoicesProto f [(f, evalFloatNegProto f a), (f, b)] mode ↔
+      c ∈ nanChoicesProto f [(f, a), (f, b)] mode := by
+  rw [nanChoicesProto_mem_swap_pair f (f, evalFloatNegProto f a) (f, b) mode c,
+      nanChoicesProto_mem_neg_second f b a mode c,
+      nanChoicesProto_mem_swap_pair f (f, b) (f, a) mode c]
+
+/-- Under `.nondeterministic` mode (`miri#5643`), `nanChoicesProto` is closed
+under bitwise sign flip `evalFloatNegProto`: for every canonical `out < 2 ^ f.width`,
+`evalFloatNegProto f out` is an admissible NaN choice iff `out` is! -/
+theorem nanChoicesProto_nondet_neg_iff (f : IeeeFormat)
+    (inputs : List (IeeeFormat × Nat)) (out : Nat) (hout : out < 2 ^ f.width) :
+    evalFloatNegProto f out ∈ nanChoicesProto f inputs .nondeterministic ↔
+      out ∈ nanChoicesProto f inputs .nondeterministic := by
+  have hclosed : ∀ c, c ∈ nanChoicesProto f inputs .nondeterministic →
+      evalFloatNegProto f c ∈ nanChoicesProto f inputs .nondeterministic := by
+    intro c hc
+    unfold nanChoicesProto at hc ⊢
+    rw [expandNaNSigns_mem_iff] at hc ⊢
+    obtain ⟨base, hbase, hcb⟩ := hc
+    have hbase_mem : base ∈ nanChoicesProto f inputs .nondeterministic := by
+      unfold nanChoicesProto; rw [expandNaNSigns_mem_iff]; exact ⟨base, hbase, Or.inl rfl⟩
+    have hbase_lt : base < 2 ^ f.width :=
+      (nanChoicesProto_mem_lt_and_nan f inputs .nondeterministic base hbase_mem).1
+    rcases hcb with rfl | rfl
+    · exact ⟨c, hbase, Or.inr rfl⟩
+    · exact ⟨base, hbase, Or.inl (evalFloatNegProto_involutive f base hbase_lt)⟩
+  constructor
+  · intro hneg
+    have h1 := hclosed (evalFloatNegProto f out) hneg
+    rwa [evalFloatNegProto_involutive f out hout] at h1
+  · exact hclosed out
+
+/-- **Unconditional right-negation invariance of relational `rem`**:
+under **both** `.deterministic` and `.nondeterministic` modes and across **all**
+bit patterns `a, b, out` (including NaNs, `0`, and `±Inf`), `a % (-b)` and `a % b`
+have the exact same set of relational outcomes! -/
+theorem EvalFloatBinOpRel.rem_neg_right (mode : FloatArithMode) (f : IeeeFormat)
+    (a b out : Nat) :
+    EvalFloatBinOpRel mode .rem f a (evalFloatNegProto f b) out ↔
+      EvalFloatBinOpRel mode .rem f a b out := by
+  unfold EvalFloatBinOpRel
+  dsimp only
+  rw [evalFloatArithBaseProto_rem_neg_right f a b]
+  by_cases hnan : isNaNBits f (evalFloatArithBaseProto .rem f a b) = true
+  · rw [if_pos' hnan, if_pos' hnan, nanChoicesProto_mem_neg_second]
+  · rw [if_neg' hnan, if_neg' hnan]
+
+private theorem isNaNBits_base_neg_left_eq (op : BinOp) (f : IeeeFormat) (a b : Nat)
+    (hop : op = .mul ∨ op = .div ∨ op = .rem) :
+    isNaNBits f (evalFloatArithBaseProto op f (evalFloatNegProto f a) b) =
+      isNaNBits f (evalFloatArithBaseProto op f a b) := by
+  have hstep : ∀ x,
+      isNaNBits f (evalFloatArithBaseProto op f x b) = false →
+      isNaNBits f (evalFloatArithBaseProto op f (evalFloatNegProto f x) b) = false := by
+    intro x hx
+    have heq : evalFloatArithBaseProto op f (evalFloatNegProto f x) b =
+        evalFloatNegProto f (evalFloatArithBaseProto op f x b) := by
+      rcases hop with rfl | rfl | rfl
+      · exact evalFloatArithBaseProto_mul_neg_left f x b hx
+      · exact evalFloatArithBaseProto_div_neg_left f x b hx
+      · exact evalFloatArithBaseProto_rem_neg_left f x b hx
+    rw [heq, isNaNBits_evalFloatNegProto, hx]
+  cases hna : isNaNBits f (evalFloatArithBaseProto op f a b) with
+  | false => exact hstep a hna
+  | true =>
+    cases hnb : isNaNBits f (evalFloatArithBaseProto op f (evalFloatNegProto f a) b) with
+    | true => rfl
+    | false =>
+      have hback := hstep (evalFloatNegProto f a) hnb
+      have hinv : evalFloatNegProto f (evalFloatNegProto f a) = a % 2 ^ f.width := by
+        have hm : evalFloatNegProto f a = evalFloatNegProto f (a % 2 ^ f.width) := by
+          unfold evalFloatNegProto; rw [Nat.mod_mod]
+        rw [hm, evalFloatNegProto_involutive f (a % 2 ^ f.width) (Nat.mod_lt _ (Nat.two_pow_pos _))]
+      have hmod_a : evalFloatArithBaseProto op f (a % 2 ^ f.width) b =
+          evalFloatArithBaseProto op f a b := by
+        rw [← evalFloatArithBaseProto_mod_width op f a b,
+            ← evalFloatArithBaseProto_mod_width op f (a % 2 ^ f.width) b, Nat.mod_mod]
+      rw [hinv, hmod_a, hna] at hback
+      cases hback
+
+private theorem isNaNBits_base_neg_right_eq (op : BinOp) (f : IeeeFormat) (a b : Nat)
+    (hop : op = .mul ∨ op = .div) :
+    isNaNBits f (evalFloatArithBaseProto op f a (evalFloatNegProto f b)) =
+      isNaNBits f (evalFloatArithBaseProto op f a b) := by
+  have hstep : ∀ y,
+      isNaNBits f (evalFloatArithBaseProto op f a y) = false →
+      isNaNBits f (evalFloatArithBaseProto op f a (evalFloatNegProto f y)) = false := by
+    intro y hy
+    have heq : evalFloatArithBaseProto op f a (evalFloatNegProto f y) =
+        evalFloatNegProto f (evalFloatArithBaseProto op f a y) := by
+      rcases hop with rfl | rfl
+      · exact evalFloatArithBaseProto_mul_neg_right f a y hy
+      · exact evalFloatArithBaseProto_div_neg_right f a y hy
+    rw [heq, isNaNBits_evalFloatNegProto, hy]
+  cases hna : isNaNBits f (evalFloatArithBaseProto op f a b) with
+  | false => exact hstep b hna
+  | true =>
+    cases hnb : isNaNBits f (evalFloatArithBaseProto op f a (evalFloatNegProto f b)) with
+    | true => rfl
+    | false =>
+      have hback := hstep (evalFloatNegProto f b) hnb
+      have hinv : evalFloatNegProto f (evalFloatNegProto f b) = b % 2 ^ f.width := by
+        have hm : evalFloatNegProto f b = evalFloatNegProto f (b % 2 ^ f.width) := by
+          unfold evalFloatNegProto; rw [Nat.mod_mod]
+        rw [hm, evalFloatNegProto_involutive f (b % 2 ^ f.width) (Nat.mod_lt _ (Nat.two_pow_pos _))]
+      have hmod_b : evalFloatArithBaseProto op f a (b % 2 ^ f.width) =
+          evalFloatArithBaseProto op f a b := by
+        rw [← evalFloatArithBaseProto_mod_width op f a b,
+            ← evalFloatArithBaseProto_mod_width op f a (b % 2 ^ f.width), Nat.mod_mod]
+      rw [hinv, hmod_b, hna] at hback
+      cases hback
+
+/-- **Deterministic relational `mul`/`div`/`rem` sign symmetry on non-NaNs AND
+sharp counterexample on indeterminate NaNs (`(+0.0) * Inf` vs `(-0.0) * Inf`)**:
+1. In `.deterministic` mode, whenever `evalFloatArithBaseProto op f a b` is
+   non-NaN and `out < 2 ^ f.width`, `(-a) op b` relates to `-out` iff `a op b`
+   relates to `out` (for `op ∈ {.mul, .div, .rem}`);
+2. Conversely, when the base result IS NaN (e.g. `(+0.0) * (+Inf) = +qNaN`),
+   `.deterministic` mode emits `+preferredNaN` (`0x7FC00000`) on `(+0.0) * (+Inf)`
+   yet **rejects** `-preferredNaN` (`0xFFC00000`) on `(-0.0) * (+Inf)` — proving
+   the `isNaNBits = false` guard is strictly necessary in `.deterministic` mode! -/
+theorem EvalFloatBinOpRel.det_mul_div_rem_neg_and_counterexample
+    (op : BinOp) (f : IeeeFormat) (a b out : Nat)
+    (hop : op = .mul ∨ op = .div ∨ op = .rem)
+    (hnan : isNaNBits f (evalFloatArithBaseProto op f a b) = false)
+    (hout : out < 2 ^ f.width) :
+    (EvalFloatBinOpRel .deterministic op f (evalFloatNegProto f a) b (evalFloatNegProto f out) ↔
+      EvalFloatBinOpRel .deterministic op f a b out) ∧
+    EvalFloatBinOpRel .deterministic .mul .binary32 0x00000000 0x7F800000 0x7FC00000 ∧
+    ¬ EvalFloatBinOpRel .deterministic .mul .binary32
+        (evalFloatNegProto .binary32 0x00000000) 0x7F800000
+        (evalFloatNegProto .binary32 0x7FC00000) := by
+  have hop_arith : isFloatArithBinOp op = true := by rcases hop with rfl | rfl | rfl <;> rfl
+  have hbase_neg : evalFloatArithBaseProto op f (evalFloatNegProto f a) b =
+      evalFloatNegProto f (evalFloatArithBaseProto op f a b) := by
+    rcases hop with rfl | rfl | rfl
+    · exact evalFloatArithBaseProto_mul_neg_left f a b hnan
+    · exact evalFloatArithBaseProto_div_neg_left f a b hnan
+    · exact evalFloatArithBaseProto_rem_neg_left f a b hnan
+  refine ⟨?_, ?_, ?_⟩
+  · rw [EvalFloatBinOpRel.det_iff, EvalFloatBinOpRel.det_iff, hbase_neg]
+    constructor
+    · rintro ⟨_, heq⟩
+      refine ⟨hop_arith, ?_⟩
+      have h1 := congrArg (evalFloatNegProto f) heq
+      rwa [evalFloatNegProto_involutive f out hout,
+           evalFloatNegProto_involutive f _ (evalFloatArithBaseProto_lt op f a b)] at h1
+    · rintro ⟨_, rfl⟩
+      exact ⟨hop_arith, rfl⟩
+  · rw [EvalFloatBinOpRel.det_iff]
+    exact ⟨rfl, by decide⟩
+  · rw [EvalFloatBinOpRel.det_iff]
+    rintro ⟨_, hbad⟩
+    exact absurd hbad (by decide)
+
+/-- **100% Unconditional left-negation sign symmetry of `.nondeterministic`
+(`miri#5643`) `mul`, `div`, and `rem`**:
+unlike `.deterministic` mode, because `nanChoicesProto .nondeterministic` closes
+every NaN candidate under sign flip (`nanChoicesProto_nondet_neg_iff`) and is
+invariant under input negation (`nanChoicesProto_mem_neg_first`),
+`EvalFloatBinOpRel .nondeterministic op f (neg a) b (neg out) ↔
+ EvalFloatBinOpRel .nondeterministic op f a b out` holds **for ALL `a, b` and ALL
+`out < 2 ^ f.width` with ZERO `isNaNBits = false` side condition** (covering
+finite, infinite, signed-zero, `sNaN`/`qNaN`, `0 * Inf`, `Inf / Inf`, `0 / 0`,
+`Inf % y`, and `x % 0`)! -/
+theorem EvalFloatBinOpRel.nondet_mul_div_rem_neg_left
+    (op : BinOp) (f : IeeeFormat) (a b out : Nat)
+    (hop : op = .mul ∨ op = .div ∨ op = .rem)
+    (hout : out < 2 ^ f.width) :
+    EvalFloatBinOpRel .nondeterministic op f (evalFloatNegProto f a) b (evalFloatNegProto f out) ↔
+      EvalFloatBinOpRel .nondeterministic op f a b out := by
+  have hop_arith : isFloatArithBinOp op = true := by rcases hop with rfl | rfl | rfl <;> rfl
+  unfold EvalFloatBinOpRel
+  dsimp only
+  rw [isNaNBits_base_neg_left_eq op f a b hop]
+  cases hnan : isNaNBits f (evalFloatArithBaseProto op f a b) with
+  | true =>
+    simp only [hop_arith, ↓reduceIte, true_and]
+    rw [nanChoicesProto_nondet_neg_iff f _ out hout,
+        nanChoicesProto_mem_neg_first f a b .nondeterministic out]
+  | false =>
+    simp only [hop_arith, Bool.false_eq_true, ↓reduceIte, true_and]
+    have hbase_neg : evalFloatArithBaseProto op f (evalFloatNegProto f a) b =
+        evalFloatNegProto f (evalFloatArithBaseProto op f a b) := by
+      rcases hop with rfl | rfl | rfl
+      · exact evalFloatArithBaseProto_mul_neg_left f a b hnan
+      · exact evalFloatArithBaseProto_div_neg_left f a b hnan
+      · exact evalFloatArithBaseProto_rem_neg_left f a b hnan
+    rw [hbase_neg]
+    constructor
+    · intro heq
+      have h1 := congrArg (evalFloatNegProto f) heq
+      rwa [evalFloatNegProto_involutive f out hout,
+           evalFloatNegProto_involutive f _ (evalFloatArithBaseProto_lt op f a b)] at h1
+    · rintro rfl; rfl
+
+/-- **100% Unconditional right-negation sign symmetry of `.nondeterministic`
+(`miri#5643`) `mul` and `div`**: for **every** `op ∈ {.mul, .div}`, **every**
+`a, b`, and **every** `out < 2 ^ f.width` (including NaNs and indeterminate forms
+`0 * Inf`, `Inf / Inf`, `0 / 0`), `a op (-b)` relates to `-out` iff `a op b`
+relates to `out`! -/
+theorem EvalFloatBinOpRel.nondet_mul_div_neg_right
+    (op : BinOp) (f : IeeeFormat) (a b out : Nat)
+    (hop : op = .mul ∨ op = .div)
+    (hout : out < 2 ^ f.width) :
+    EvalFloatBinOpRel .nondeterministic op f a (evalFloatNegProto f b) (evalFloatNegProto f out) ↔
+      EvalFloatBinOpRel .nondeterministic op f a b out := by
+  have hop_arith : isFloatArithBinOp op = true := by rcases hop with rfl | rfl <;> rfl
+  unfold EvalFloatBinOpRel
+  dsimp only
+  rw [isNaNBits_base_neg_right_eq op f a b hop]
+  cases hnan : isNaNBits f (evalFloatArithBaseProto op f a b) with
+  | true =>
+    simp only [hop_arith, ↓reduceIte, true_and]
+    rw [nanChoicesProto_nondet_neg_iff f _ out hout,
+        nanChoicesProto_mem_neg_second f a b .nondeterministic out]
+  | false =>
+    simp only [hop_arith, Bool.false_eq_true, ↓reduceIte, true_and]
+    have hbase_neg : evalFloatArithBaseProto op f a (evalFloatNegProto f b) =
+        evalFloatNegProto f (evalFloatArithBaseProto op f a b) := by
+      rcases hop with rfl | rfl
+      · exact evalFloatArithBaseProto_mul_neg_right f a b hnan
+      · exact evalFloatArithBaseProto_div_neg_right f a b hnan
+    rw [hbase_neg]
+    constructor
+    · intro heq
+      have h1 := congrArg (evalFloatNegProto f) heq
+      rwa [evalFloatNegProto_involutive f out hout,
+           evalFloatNegProto_involutive f _ (evalFloatArithBaseProto_lt op f a b)] at h1
+    · rintro rfl; rfl
+
+/-- **MIR `Rvalue` dispatcher lifting of `rem` right-negation invariance (both
+modes) and `.nondeterministic` `mul`/`div`/`rem` left-negation sign symmetry**:
+1. Under **both** `FloatArithMode`s, `.binaryOp .rem lhsOp rhsNegOp` and
+   `.binaryOp .rem lhsOp rhsOp` admit the **exact same `RvalueEvalResult`s**;
+2. Under `.nondeterministic` mode, for `op ∈ {.mul, .div, .rem}` and every
+   `out < 2 ^ fmt.width` (including NaNs!), `.binaryOp op lhsNegOp rhsOp`
+   relates to `⟨evalFloatNegProto fmt out, fmt.byteWidth⟩` iff
+   `.binaryOp op lhsOp rhsOp` relates to `⟨out, fmt.byteWidth⟩`! -/
+theorem EvalRvalueFloatRelProto.rem_neg_right_and_nondet_neg_left_float_of_ok
+    (mode : FloatArithMode) (op : BinOp)
+    (locals : List LocalSlot) (lhsOp lhsNegOp rhsOp rhsNegOp : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (fk : FloatTy) (fmt : IeeeFormat)
+    (lhsSc lhsNegSc rhsSc rhsNegSc : ScalarVal)
+    (out : Nat) (res : RvalueEvalResult)
+    (hop : op = .mul ∨ op = .div ∨ op = .rem)
+    (hout : out < 2 ^ fmt.width)
+    (hlTy : floatTyOf? (operandTy localDecls layouts lhsOp) = .some fk)
+    (hlnTy : floatTyOf? (operandTy localDecls layouts lhsNegOp) = .some fk)
+    (hrTy : floatTyOf? (operandTy localDecls layouts rhsOp) = .some fk)
+    (hrnTy : floatTyOf? (operandTy localDecls layouts rhsNegOp) = .some fk)
+    (hfmt : ieeeFormatOfFloatTy? fk = .some fmt)
+    (hwL : Nat.beq lhsSc.sizeBytes fmt.byteWidth = true)
+    (hwLN : Nat.beq lhsNegSc.sizeBytes fmt.byteWidth = true)
+    (hwR : Nat.beq rhsSc.sizeBytes fmt.byteWidth = true)
+    (hwRN : Nat.beq rhsNegSc.sizeBytes fmt.byteWidth = true)
+    (hnegL : lhsNegSc.bits = evalFloatNegProto fmt lhsSc.bits)
+    (hnegR : rhsNegSc.bits = evalFloatNegProto fmt rhsSc.bits)
+    (hl : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals
+      localDecls mem.callStack = .ok (.scalar lhsSc) locals)
+    (hln : evalOperand locals lhsNegOp mem.borrows mem.globals layouts mem.callerLocals
+      localDecls mem.callStack = .ok (.scalar lhsNegSc) locals)
+    (hr : evalOperand locals rhsOp mem.borrows mem.globals layouts mem.callerLocals
+      localDecls mem.callStack = .ok (.scalar rhsSc) locals)
+    (hrn : evalOperand locals rhsNegOp mem.borrows mem.globals layouts mem.callerLocals
+      localDecls mem.callStack = .ok (.scalar rhsNegSc) locals) :
+    (EvalRvalueFloatRelProto mode locals (.binaryOp .rem lhsOp rhsNegOp) mem localDecls layouts res ↔
+      EvalRvalueFloatRelProto mode locals (.binaryOp .rem lhsOp rhsOp) mem localDecls layouts res) ∧
+    (EvalRvalueFloatRelProto .nondeterministic locals (.binaryOp op lhsNegOp rhsOp) mem localDecls layouts
+        (.ok (.scalar ⟨evalFloatNegProto fmt out, fmt.byteWidth⟩) locals mem) ↔
+      EvalRvalueFloatRelProto .nondeterministic locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts
+        (.ok (.scalar ⟨out, fmt.byteWidth⟩) locals mem)) := by
+  have hchar : ∀ (m : FloatArithMode) (bop : BinOp) (lOp rOp : Operand)
+      (lSc rSc : ScalarVal) (r : RvalueEvalResult),
+      isFloatArithBinOp bop = true →
+      floatTyOf? (operandTy localDecls layouts lOp) = .some fk →
+      floatTyOf? (operandTy localDecls layouts rOp) = .some fk →
+      Nat.beq lSc.sizeBytes fmt.byteWidth = true →
+      Nat.beq rSc.sizeBytes fmt.byteWidth = true →
+      evalOperand locals lOp mem.borrows mem.globals layouts mem.callerLocals
+        localDecls mem.callStack = .ok (.scalar lSc) locals →
+      evalOperand locals rOp mem.borrows mem.globals layouts mem.callerLocals
+        localDecls mem.callStack = .ok (.scalar rSc) locals →
+      (EvalRvalueFloatRelProto m locals (.binaryOp bop lOp rOp) mem localDecls layouts r ↔
+        ∃ o, EvalFloatBinOpRel m bop fmt lSc.bits rSc.bits o ∧
+          r = .ok (.scalar ⟨o, fmt.byteWidth⟩) locals mem) := by
+    intro m bop lOp rOp lSc rSc r harith hlT hrT hwL' hwR' hlEv hrEv
+    unfold EvalRvalueFloatRelProto
+    dsimp only
+    rw [hlT, hrT]; dsimp only
+    rw [hlEv]; dsimp only
+    rw [hrEv]; dsimp only
+    rw [hfmt]; dsimp only
+    have hc : (fmt == fmt && Nat.beq lSc.sizeBytes fmt.byteWidth &&
+        Nat.beq rSc.sizeBytes fmt.byteWidth && isFloatArithBinOp bop) = true := by
+      cases fmt <;> simp [hwL', hwR', harith]
+    rw [if_pos' hc]
+  have hop_arith : isFloatArithBinOp op = true := by rcases hop with rfl | rfl | rfl <;> rfl
+  refine ⟨?_, ?_⟩
+  · rw [hchar mode .rem lhsOp rhsNegOp lhsSc rhsNegSc res rfl hlTy hrnTy hwL hwRN hl hrn,
+        hchar mode .rem lhsOp rhsOp lhsSc rhsSc res rfl hlTy hrTy hwL hwR hl hr, hnegR]
+    constructor
+    · rintro ⟨o, hrel, hres⟩
+      exact ⟨o, (EvalFloatBinOpRel.rem_neg_right mode fmt lhsSc.bits rhsSc.bits o).mp hrel, hres⟩
+    · rintro ⟨o, hrel, hres⟩
+      exact ⟨o, (EvalFloatBinOpRel.rem_neg_right mode fmt lhsSc.bits rhsSc.bits o).mpr hrel, hres⟩
+  · rw [hchar .nondeterministic op lhsNegOp rhsOp lhsNegSc rhsSc _ hop_arith hlnTy hrTy hwLN hwR hln hr,
+        hchar .nondeterministic op lhsOp rhsOp lhsSc rhsSc _ hop_arith hlTy hrTy hwL hwR hl hr, hnegL]
+    constructor
+    · rintro ⟨o, hrel, hres⟩
+      injection hres with hv _ _
+      injection hv with hsc
+      injection hsc with ho _
+      rw [← ho] at hrel
+      exact ⟨out, (EvalFloatBinOpRel.nondet_mul_div_rem_neg_left op fmt lhsSc.bits rhsSc.bits
+        out hop hout).mp hrel, rfl⟩
+    · rintro ⟨o, hrel, hres⟩
+      injection hres with hv _ _
+      injection hv with hsc
+      injection hsc with ho _
+      rw [← ho] at hrel
+      exact ⟨evalFloatNegProto fmt out, (EvalFloatBinOpRel.nondet_mul_div_rem_neg_left op fmt
+        lhsSc.bits rhsSc.bits out hop hout).mpr hrel, rfl⟩
 
 end Anneal.FloatArithAndUcg630Prototype
