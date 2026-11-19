@@ -118,7 +118,13 @@ theorem canary_part1_rawAATree_and_extTreeMap0_laws :
     sampleExtMapAsc.toList = sampleExtMapDesc.toList ∧
     ExtTreeMap0.AgreesWithStdRaw
       (∅ : ExtTreeMap0 MiriAllocId Nat)
-      (Std.TreeMap.Raw.empty : Std.TreeMap.Raw MiriAllocId Nat compare) := by
+      (Std.TreeMap.Raw.empty : Std.TreeMap.Raw MiriAllocId Nat compare) ∧
+    (let ops : List (ExtTreeMap0.MapTraceOp MiriAllocId Nat) :=
+       [.insert testId1 10, .insert testIdMax 90, .insert testId1 77, .insert testId2 20, .erase testIdMax]
+     (ExtTreeMap0.execMapTraceExt0 (cmp := compare) (ops ++ [.insert testId3 33])).get? testId3 = some 33 ∧
+     ∀ k ∈ [testId1, testId2, testId3, testIdMax],
+       (ExtTreeMap0.execMapTraceExt0 (cmp := compare) ops).get? k =
+         (ExtTreeMap0.execMapTraceStdRaw (cmp := compare) ops).get? k) := by
   have hne21 : testId2 ≠ testId1 := by decide
   have hne2Max : testId2 ≠ testIdMax := by decide
   have hnone2 : sampleExtMapAsc.get? testId2 = none := rfl
@@ -170,7 +176,11 @@ theorem canary_part1_rawAATree_and_extTreeMap0_laws :
     ExtTreeMap0.erase_insert_self_of_none sampleExtMapAsc testId2 22 hnone2,
     hextElem,
     (ExtTreeMap0.toList_inj).mpr hextElem,
-    ExtTreeMap0.agreesWithStdRaw_empty
+    ExtTreeMap0.agreesWithStdRaw_empty,
+    ⟨(ExtTreeMap0.execMapTraceExt0_snoc_insert (cmp := compare)
+        [.insert testId1 10, .insert testIdMax 90, .insert testId1 77, .insert testId2 20, .erase testIdMax]
+        testId3 testId3 33).trans (by decide +kernel),
+     by decide +kernel⟩
   ⟩
 
 def entryHeap8 : LocalAllocEntry :=
@@ -243,12 +253,12 @@ theorem canary_part1_allocWorldRel_lifecycle :
      let kw0 := KeyedAllocWorld.empty
      let lw1 := (lw0.reserveAllocId).1
      let kw1 := (kw0.reserveAllocId).1
-     let lw2 := (lw1.allocate entryHeap8 1024 (some ⟨1, 10, 5, false⟩)).1
-     let kw2 := (kw1.allocate entryHeap8 1024 (some ⟨1, 10, 5, false⟩)).1
-     let lw8 := ((((lw2.setRace testId2 ⟨2, 20, 12, false⟩).removeRace testId2).registerGlobal
+     let lw2 := (lw1.allocate entryHeap8 1024 (some ⟨1, 10, 5, false, none⟩)).1
+     let kw2 := (kw1.allocate entryHeap8 1024 (some ⟨1, 10, 5, false, none⟩)).1
+     let lw8 := ((((lw2.setRace testId2 ⟨2, 20, 12, false, none⟩).removeRace testId2).registerGlobal
        ⟨testIdMaxPrev, .vtable, 0, 8, .not⟩).insertLive testId3 entryStack16).removeLive testId3 |>.1.insertDead
        ⟨testId3, 16, 8⟩
-     let kw8 := ((((kw2.setRace testId2 ⟨2, 20, 12, false⟩).removeRace testId2).registerGlobal
+     let kw8 := ((((kw2.setRace testId2 ⟨2, 20, 12, false, none⟩).removeRace testId2).registerGlobal
        ⟨testIdMaxPrev, .vtable, 0, 8, .not⟩).insertLive testId3 entryStack16).removeLive testId3 |>.1.insertDead
        ⟨testId3, 16, 8⟩
      (lw8.containsId testId2 = kw8.containsId testId2) ∧
@@ -283,9 +293,9 @@ theorem canary_part1_allocWorldRel_lifecycle :
     allocWorldRel_keyed_unique (allocWorldRel_ofLinear lwPermAsc) hrelAsc
   have hupd_miss := allocWorldRel_updateLiveBytes r0 testId1 [(.init 9 none)]
   have ⟨_, r1⟩ := allocWorldRel_reserveAllocId r0
-  have ⟨_, r2⟩ := allocWorldRel_allocate r1 entryHeap8 1024 (some ⟨1, 10, 5, false⟩)
+  have ⟨_, r2⟩ := allocWorldRel_allocate r1 entryHeap8 1024 (some ⟨1, 10, 5, false, none⟩)
   have hupd_hit := allocWorldRel_updateLiveBytes r2 testId2 [(.init 0xAA none), (.init 0xBB none)]
-  have r3 := allocWorldRel_setRace r2 testId2 ⟨2, 20, 12, false⟩
+  have r3 := allocWorldRel_setRace r2 testId2 ⟨2, 20, 12, false, none⟩
   have r4 := allocWorldRel_removeRace r3 testId2
   have r5 := allocWorldRel_registerGlobal r4 ⟨testIdMaxPrev, .vtable, 0, 8, .not⟩
   have r6 := allocWorldRel_insertLive r5 testId3 entryStack16
@@ -350,7 +360,7 @@ theorem canary_part1_highWater_and_wrapAround_exhaustion :
   exact ⟨rfl, hnext0, hiss, hresWrap, hlatch, congrArg Prod.snd hpersist⟩
 
 def deallocRichKeyedWorld : KeyedAllocWorld :=
-  (((((KeyedAllocWorld.empty.insertLive testId1 entryHeap8).setRace testId1 ⟨1, 7, 3, false⟩).insertDead
+  (((((KeyedAllocWorld.empty.insertLive testId1 entryHeap8).setRace testId1 ⟨1, 7, 3, false, none⟩).insertDead
       ⟨testId2, 32, 16⟩).registerGlobal ⟨testIdMaxPrev, .vtable, 0, 8, .not⟩).insertLive
       testId3 ⟨.heap, 16, 8, .not, [(.init 1 none)]⟩)
 
@@ -482,11 +492,11 @@ theorem canary_part1_deallocate_failure_ordering_and_state_retention :
 /-- `[adv B1]` keyed world: live heap allocation `testId1` whose race clock records a write by
 thread `1` at time `7` (last read at `3`). -/
 def raceWorld : KeyedAllocWorld :=
-  (KeyedAllocWorld.empty.insertLive testId1 entryHeap8).setRace testId1 ⟨1, 7, 3, false⟩
+  (KeyedAllocWorld.empty.insertLive testId1 entryHeap8).setRace testId1 ⟨1, 7, 3, false, none⟩
 
 /-- Linear twin of `raceWorld`. -/
 def raceWorldLinear : LinearAllocWorld :=
-  (LinearAllocWorld.empty.insertLive testId1 entryHeap8).setRace testId1 ⟨1, 7, 3, false⟩
+  (LinearAllocWorld.empty.insertLive testId1 entryHeap8).setRace testId1 ⟨1, 7, 3, false, none⟩
 
 /-- Linear world with a *shadowed duplicate* `live` key (unreachable by `filter`+`push`). -/
 def lwShadow : LinearAllocWorld :=
@@ -577,17 +587,17 @@ theorem canary_part1_useAfterFree_totality_and_race_order :
       KeyedAllocWorld.empty
     dsimp only
     rw [ExtTreeMap0.get?_empty]
-  have hRaceClk : raceWorld.findRace? testId1 = some ⟨1, 7, 3, false⟩ := by
+  have hRaceClk : raceWorld.findRace? testId1 = some ⟨1, 7, 3, false, none⟩ := by
     unfold raceWorld KeyedAllocWorld.findRace? KeyedAllocWorld.insertLive KeyedAllocWorld.setRace
       KeyedAllocWorld.empty
     dsimp only
     rw [ExtTreeMap0.get?_insert_self]
-  have hracy : raceDeallocVerdict ⟨2, 5⟩ ⟨1, 7, 3, false⟩ ≠ .ok := by decide
+  have hracy : raceDeallocVerdict ⟨2, 5⟩ ⟨1, 7, 3, false, none⟩ ≠ .ok := by decide
   have horder := keyedDeallocateMachine_race_checked_before_cleanup raceWorld testId1 entryHeap8
-    ⟨1, 7, 3, false⟩ ⟨2, 5⟩ .ok hRaceLive rfl hRaceNoDead hRaceClk hracy
+    ⟨1, 7, 3, false, none⟩ ⟨2, 5⟩ .ok hRaceLive (by decide) rfl hRaceNoDead hRaceClk hracy
   have hrelRace : AllocWorldRel raceWorldLinear raceWorld :=
     allocWorldRel_setRace (allocWorldRel_insertLive allocWorldRel_empty testId1 entryHeap8)
-      testId1 ⟨1, 7, 3, false⟩
+      testId1 ⟨1, 7, 3, false, none⟩
   have hmachine := allocWorldRel_deallocateMachine hrelRace (.provenanced testId1 0)
     (some (8, 8)) .heap ⟨2, 5⟩ .ok
   exact ⟨
@@ -601,6 +611,64 @@ theorem canary_part1_useAfterFree_totality_and_race_order :
     rfl,
     hmachine
   ⟩
+
+def sameWriterForeignReadWorld : KeyedAllocWorld :=
+  (KeyedAllocWorld.empty.insertLive testId1 entryHeap8).setRace testId1 ⟨1, 2, 7, false, some 2⟩
+
+def zstRaceEntry : LocalAllocEntry :=
+  ⟨.heap, 0, 1, .mut, []⟩
+
+def zstRaceWorld : KeyedAllocWorld :=
+  (KeyedAllocWorld.empty.insertLive testId1 zstRaceEntry).setRace testId1 ⟨1, 99, 88, false, some 2⟩
+
+/-- **`[adv A1]` Closed canary — same-writer foreign-read deallocation race & ZST race-skip**:
+1. Thread `1` writes at `t = 2`, Thread `2` reads concurrently at `t = 7` (`lastReaderThread = some 2`),
+   and **Thread `1` itself** (`actor = ⟨1, 3⟩`, `actor.thread == writerThread`!) deallocates before
+   synchronizing with Thread `2` (`3 < 7`): faults with `.hookFailure "DataRace"` (`[adv B1]` missed
+   this by gating both checks behind `writerThread != actor.thread`).
+2. Once Thread `1` synchronizes (`actor = ⟨1, 7⟩`), its deallocation succeeds with `.ok ()`.
+3. Deallocating a zero-sized (`sizeBytes = 0`) heap allocation skips the per-byte race detector
+   (`DataRace.runRangeLoop` `remaining = 0`) and succeeds with `.ok ()` while dropping the `race`
+   entry (`[adv B1]` falsely reported `DataRace` on ZST deallocations). -/
+theorem canary_part1_sameWriter_foreignRead_and_zst_race_fixes :
+    (sameWriterForeignReadWorld.deallocateMachine (.provenanced testId1 0)
+      (some (8, 8)) .heap ⟨1, 3⟩ .ok).2.2 = .error (.hookFailure "DataRace") ∧
+    (sameWriterForeignReadWorld.deallocateMachine (.provenanced testId1 0)
+      (some (8, 8)) .heap ⟨1, 7⟩ .ok).2.2 = .ok () ∧
+    (let rz := zstRaceWorld.deallocateMachine (.provenanced testId1 0)
+       (some (0, 1)) .heap ⟨3, 0⟩ .ok
+     rz.2.2 = .ok () ∧ rz.1.findLive? testId1 = none ∧ rz.1.findRace? testId1 = none) := by
+  have hLiveSW : sameWriterForeignReadWorld.findLive? testId1 = some entryHeap8 := by
+    unfold sameWriterForeignReadWorld KeyedAllocWorld.findLive? KeyedAllocWorld.insertLive
+      KeyedAllocWorld.setRace KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
+  have hNoDeadSW : sameWriterForeignReadWorld.findDead? testId1 = none := by
+    unfold sameWriterForeignReadWorld KeyedAllocWorld.findDead? KeyedAllocWorld.insertLive
+      KeyedAllocWorld.setRace KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_empty]
+  have hClkSW : sameWriterForeignReadWorld.findRace? testId1 = some ⟨1, 2, 7, false, some 2⟩ := by
+    unfold sameWriterForeignReadWorld KeyedAllocWorld.findRace? KeyedAllocWorld.insertLive
+      KeyedAllocWorld.setRace KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
+  have hsw := keyedDeallocateMachine_sameWriter_foreignRead_races
+    sameWriterForeignReadWorld testId1 entryHeap8 ⟨1, 2, 7, false, some 2⟩ ⟨1, 3⟩ 2 .ok
+    hLiveSW (by decide) rfl hNoDeadSW hClkSW rfl rfl (by decide) (by decide)
+  have hLiveZ : zstRaceWorld.findLive? testId1 = some zstRaceEntry := by
+    unfold zstRaceWorld KeyedAllocWorld.findLive? KeyedAllocWorld.insertLive
+      KeyedAllocWorld.setRace KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
+  have hNoDeadZ : zstRaceWorld.findDead? testId1 = none := by
+    unfold zstRaceWorld KeyedAllocWorld.findDead? KeyedAllocWorld.insertLive
+      KeyedAllocWorld.setRace KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_empty]
+  have hzst := keyedDeallocateMachine_zst_skips_race_check
+    zstRaceWorld testId1 zstRaceEntry ⟨3, 0⟩ hLiveZ rfl rfl hNoDeadZ
+  exact ⟨hsw, by decide +kernel, hzst⟩
 
 /-! ## Section 2: Part 2A & 2B Closed Canaries (`charon#1619/#1620` + `minirust#295`) -/
 
@@ -966,6 +1034,59 @@ theorem canary_part2A_upstream_create_mirror_and_parent_write_conflict :
     (by decide) (by decide)
   exact ⟨rfl, rfl, rfl, rfl, rfl, hmirW, hmirN, hparent⟩
 
+/-- **`[adv A1]` Closed canary — upstream `RetagPipeline.accessTreeForReborrow` single-access
+equivalence & disabled-ancestor diagnostic separation**:
+1. Node-level `stepNode_read_then_childWrite_eq_parentWrite` on a foreign `.frozen` sibling,
+2. Unconditional world-level equality `execFnEntryMutRetag_eq_upstream_when_no_implicitWrite` under
+   `rustcNoWritable`,
+3. Two-branch world equality `execFnEntryMutRetag_mkTwoBranch_eq_upstream` under
+   `writableChildWrite`, and
+4. Exact diagnostic separation `execFnEntryMutRetag_disabledGrandparent_diverges_from_upstream`
+   (`.parentDisabled` vs. `.ancestorWriteForbidden`) when a grandparent is `.disabled`! -/
+theorem canary_part2A_upstream_reborrow_equivalence_and_disabled_ancestor :
+    (let allNodes : List TreeTagNode :=
+       [⟨2, 10, 0, 4, .frozen, none, some 1⟩, ⟨1, 10, 0, 4, .unique, none, none⟩]
+     let withChild : List TreeTagNode :=
+       ⟨3, 10, 0, 4, .reservedFrz false, some 1, some 1⟩ :: allNodes
+     let ps := ProtectorSet.empty
+     let ps' := ps.insert 1
+     let sib : TreeTagNode := ⟨2, 10, 0, 4, .frozen, none, some 1⟩
+     (stepNodeOnRangeRead allNodes ps 10 0 4 1 sib >>=
+        stepNodeOnRangeWrite withChild ps' 10 0 4 3) =
+      stepNodeOnRangeWrite allNodes ps 10 0 4 1 sib) ∧
+    (let w := mkTwoBranchBorrowWorld 10 4 [.uninit, .uninit, .uninit, .uninit]
+     execFnEntryMutRetag w 1 0 4 unpinFreezeFacts true .rustcNoWritable false =
+       execFnEntryMutRetagUpstream w 1 0 4 unpinFreezeFacts true .rustcNoWritable ∧
+     execFnEntryMutRetag w 1 0 4 unpinFreezeFacts true .writableChildWrite false =
+       execFnEntryMutRetagUpstream w 1 0 4 unpinFreezeFacts true .writableChildWrite) ∧
+    (let wDis : FnEntryBorrowWorld := {
+       allocId := 10
+       bytes := [.uninit, .uninit, .uninit, .uninit]
+       nodes := [⟨2, 10, 0, 4, .unique, none, some 1⟩, ⟨1, 10, 0, 4, .disabled, none, none⟩]
+       activeProtectors := ProtectorSet.empty
+       nextTag := 3
+       nextProtector := 1
+     }
+     execFnEntryMutRetag wDis 2 0 4 unpinFreezeFacts true .writableChildWrite false =
+       .error .parentDisabled ∧
+     execFnEntryMutRetagUpstream wDis 2 0 4 unpinFreezeFacts true .writableChildWrite =
+       .error .ancestorWriteForbidden) := by
+  have hnode := stepNode_read_then_childWrite_eq_parentWrite
+    [⟨2, 10, 0, 4, .frozen, none, some 1⟩, ⟨1, 10, 0, 4, .unique, none, none⟩]
+    [⟨3, 10, 0, 4, .reservedFrz false, some 1, some 1⟩,
+     ⟨2, 10, 0, 4, .frozen, none, some 1⟩, ⟨1, 10, 0, 4, .unique, none, none⟩]
+    ProtectorSet.empty (ProtectorSet.empty.insert 1) 10 0 4 1 3
+    ⟨2, 10, 0, 4, .frozen, none, some 1⟩
+    rfl rfl (fun h _ _ => by nomatch h)
+  have hnoWr := execFnEntryMutRetag_eq_upstream_when_no_implicitWrite
+    (mkTwoBranchBorrowWorld 10 4 [.uninit, .uninit, .uninit, .uninit])
+    1 0 4 unpinFreezeFacts true .rustcNoWritable (.inl rfl)
+  have htwoBr := execFnEntryMutRetag_mkTwoBranch_eq_upstream
+    10 4 [.uninit, .uninit, .uninit, .uninit] unpinFreezeFacts true .writableChildWrite (by decide)
+  have hdiv := execFnEntryMutRetag_disabledGrandparent_diverges_from_upstream
+    10 4 [.uninit, .uninit, .uninit, .uninit] unpinFreezeFacts (by decide) (by decide) rfl
+  exact ⟨hnode, ⟨hnoWr, htwoBr⟩, hdiv⟩
+
 /-- **`[adv B1]` Closed canary — `charon#1620` separation under Miri's allocation mutability**:
 a mixed `(Freeze, UnsafeCell)` static is interned *mutable*, so the read-only check does not save
 the erased lowering: writing the `Freeze` `flag` byte through pre-`#1620` erased
@@ -1003,6 +1124,57 @@ theorem canary_part2B_mixed_static_erasure_unsound_under_miri_mutability :
     [(.init 99 none), (.init 0 none), (.init 0 none), (.init 0 none)] (by decide)
   exact ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, hpure⟩
+
+/-- **`[adv A1]` Closed canary — general mixed-static Miri separation (`static_mixed_miri_separation`
+& `static_mixed_miri_unsafeCell_write_ok`) at non-default tags (`rootTag = 10, childTag = 20`) and
+multiple byte offsets**:
+1. Writing to inter-field padding (`writeOff = 1`) OR trailing padding (`writeOff = 8`) on
+   `mixedCompositeStaticDesc` faults with `.ub` under `retagStaticPreservedAt 10 20` while
+   unsoundly succeeding under `retagStaticErasedAt 10`!
+2. Writing 4 bytes to the `AtomicI32` `UnsafeCell` sub-range (`writeOff = 4`) succeeds on
+   `retagStaticPreservedAt 10 20` and preserves every segment permission! -/
+theorem canary_part2B_general_mixed_static_miri_theorems :
+    (staticAllocMutability mixedCompositeStaticDesc = .mut ∧
+     evalRawMutStaticWriteMiri mixedCompositeStaticDesc
+       (retagStaticPreservedAt 10 20 60 mixedCompositeStaticDesc mixedCompositeInitBytes) 1
+       [(.init 7 none)] = .ub ∧
+     ∃ st', evalRawMutStaticWriteMiri mixedCompositeStaticDesc
+       (retagStaticErasedAt 10 60 mixedCompositeStaticDesc mixedCompositeInitBytes) 1
+       [(.init 7 none)] = .ok st') ∧
+    (staticAllocMutability mixedCompositeStaticDesc = .mut ∧
+     evalRawMutStaticWriteMiri mixedCompositeStaticDesc
+       (retagStaticPreservedAt 10 20 60 mixedCompositeStaticDesc mixedCompositeInitBytes) 8
+       [(.init 9 none)] = .ub ∧
+     ∃ st', evalRawMutStaticWriteMiri mixedCompositeStaticDesc
+       (retagStaticErasedAt 10 60 mixedCompositeStaticDesc mixedCompositeInitBytes) 8
+       [(.init 9 none)] = .ok st') ∧
+    evalRawMutStaticWriteMiri mixedCompositeStaticDesc
+      (retagStaticPreservedAt 10 20 60 mixedCompositeStaticDesc mixedCompositeInitBytes) 4
+      [(.init 1 none), (.init 2 none), (.init 3 none), (.init 4 none)] =
+      .ok {
+        retagStaticPreservedAt 10 20 60 mixedCompositeStaticDesc mixedCompositeInitBytes with
+        bytes := (writeAbstractBytesAt mixedCompositeInitBytes 4
+          [(.init 1 none), (.init 2 none), (.init 3 none), (.init 4 none)]).getD
+          mixedCompositeInitBytes
+      } := by
+  have hhasUC : ∃ uc ∈ (staticFreezeSegments mixedCompositeStaticDesc).2, uc.kind = .unsafeCell :=
+    ⟨⟨4, 4, .unsafeCell⟩, by decide, rfl⟩
+  have hpad1 : ∃ frz ∈ (staticFreezeSegments mixedCompositeStaticDesc).2,
+      frz.kind = .freeze ∧ byteRangesOverlapBool frz.offset frz.len 1 1 = true :=
+    ⟨⟨1, 3, .freeze⟩, by decide, rfl, rfl⟩
+  have hpad8 : ∃ frz ∈ (staticFreezeSegments mixedCompositeStaticDesc).2,
+      frz.kind = .freeze ∧ byteRangesOverlapBool frz.offset frz.len 8 1 = true :=
+    ⟨⟨8, 4, .freeze⟩, by decide, rfl, rfl⟩
+  have hsep1 := static_mixed_miri_separation mixedCompositeStaticDesc 10 20 60 1
+    mixedCompositeInitBytes [(.init 7 none)]
+    (by decide) (by decide) (by decide) (by decide) hhasUC hpad1
+  have hsep8 := static_mixed_miri_separation mixedCompositeStaticDesc 10 20 60 8
+    mixedCompositeInitBytes [(.init 9 none)]
+    (by decide) (by decide) (by decide) (by decide) hhasUC hpad8
+  have hucOk := static_mixed_miri_unsafeCell_write_ok mixedCompositeStaticDesc 10 20 60 4
+    mixedCompositeInitBytes [(.init 1 none), (.init 2 none), (.init 3 none), (.init 4 none)]
+    (by decide) (by decide) (by decide) (by decide) hhasUC (by decide)
+  exact ⟨hsep1, hsep8, hucOk⟩
 
 /-! ## Section 3: Part 3A, 3B, & 3C Closed Canaries (`lean-miri#75/#79/#82`) -/
 
@@ -1214,6 +1386,109 @@ theorem canary_part3B_vtable_trait_check_ignores_autoTraits :
   exact ⟨hign1.trans (by decide +kernel), hign2.trans (by decide +kernel), by decide +kernel,
     by decide +kernel, hperm.trans (by decide +kernel), hsub⟩
 
+def canonicalDropFnOf : ProtoTy → DefPath
+  | .u64 => "core::ptr::drop_in_place::<u64>"
+  | _ => "core::ptr::drop_in_place::<other>"
+
+/-- **`[adv A1]` Closed canary — `VTableRegistry.KeyWF`, general upcast preservation
+(`upcastVTableToAutoTraits_preserves_drop_size_align`), and salted vtable allocations
+(`saltedVTable_distinct_salts_distinct_allocIds_both_valid`)**:
+1. Starting from `VTableRegistry.keyWF_empty`, interning `u64 as dyn Debug + Send + Sync`
+   preserves `KeyWF` (`VTableRegistry.keyWF_intern`),
+2. `upcastVTableToAutoTraits_preserves_drop_size_align` proves `dyn Debug + Send + Sync -> dyn Send`
+   preserves `KeyWF`, `concreteTy = .u64`, `dropInPlaceFn`, `sizeBytes = 8`, `alignBytes = 8`, and
+   the 3-slot principal-less header while rejecting `dyn Send -> dyn Sync` with `.invalidVTableTrait`,
+3. Interning `u64 as dyn Send` with distinct salts `salt₁ = 100 ≠ salt₂ = 200` mints two *distinct*
+   `MiriAllocId`s (`desc₁.allocId ≠ desc₂.allocId`) that both pass `validateVTableHalf` with
+   identical `(concreteTy, sizeBytes, alignBytes)`! -/
+theorem canary_part3B_keyWF_general_upcast_and_salted_vtables :
+    (SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.send]) 100 =
+      SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.send]) 100) ∧
+    (∃ sreg₂ w₂ desc₁ desc₂,
+      (do
+        let (sreg₁, w₁, d₁) ←
+          ({} : SaltedVTableRegistry).internSalted KeyedAllocWorld.empty maxRepresentableSize64
+            .u64 "drop_u64" none [.send] 100
+        let (sreg₂, w₂, d₂) ←
+          sreg₁.internSalted w₁ maxRepresentableSize64 .u64 "drop_u64" none [.send] 200
+        return (sreg₂, w₂, d₁, d₂)) = .ok (sreg₂, w₂, desc₁, desc₂) ∧
+      desc₁.allocId ≠ desc₂.allocId ∧
+      desc₁.concreteTy = desc₂.concreteTy ∧
+      desc₁.sizeBytes = desc₂.sizeBytes ∧
+      desc₁.alignBytes = desc₂.alignBytes ∧
+      validateVTableHalf w₂ sreg₂.toVTableRegistry (.provenanced 0x1000 desc₁.allocId 0)
+        (.principalLess [.send]) = .ok desc₁ ∧
+      validateVTableHalf w₂ sreg₂.toVTableRegistry (.provenanced 0x2000 desc₂.allocId 0)
+        (.principalLess [.send]) = .ok desc₂) ∧
+    (match ({} : VTableRegistry).intern KeyedAllocWorld.empty maxRepresentableSize64
+        .u64 (canonicalDropFnOf .u64) (some debugPrincipal) [.send, .sync] with
+     | .ok (reg1, w1, descDebug) =>
+       match upcastVTableToAutoTraits reg1 w1 maxRepresentableSize64 descDebug [.send] with
+       | .ok (reg2, w2, descSend) =>
+         reg2.KeyWF maxRepresentableSize64 canonicalDropFnOf ∧
+         descSend.concreteTy = descDebug.concreteTy ∧
+         descSend.spec = .principalLess [.send] ∧
+         descSend.dropInPlaceFn = descDebug.dropInPlaceFn ∧
+         descSend.sizeBytes = descDebug.sizeBytes ∧
+         descSend.alignBytes = descDebug.alignBytes ∧
+         descSend.entries =
+           [.dropInPlace descDebug.dropInPlaceFn, .size descDebug.sizeBytes,
+            .align descDebug.alignBytes] ∧
+         upcastVTableToAutoTraits reg2 w2 maxRepresentableSize64 descSend [.sync] =
+           .error .invalidVTableTrait
+       | .error _ => False
+     | .error _ => False) := by
+  have hsaltedInj :
+      SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.send]) 100 =
+        SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.send]) 100 :=
+    encodeSaltedVTableKeyCode_injective rfl
+  have hsalted := saltedVTable_distinct_salts_distinct_allocIds_both_valid
+    maxRepresentableSize64 .u64 ⟨8, 8, true, true⟩ "drop_u64" none [.send] 100 200 0x1000 0x2000
+    rfl rfl (by decide)
+  let descDebug : VTableDescriptor :=
+    ⟨testId1, .u64, ⟨some debugPrincipal, AutoTraitSet.ofList [.send, .sync]⟩,
+      canonicalDropFnOf .u64, 8, 8,
+      [.dropInPlace (canonicalDropFnOf .u64), .size 8, .align 8, .method "u64::fmt"]⟩
+  let reg1 : VTableRegistry := {
+    byKey := (∅ : ExtTreeMap0 VTableKey VTableDescriptor).insert
+      (mkCanonicalVTableKey .u64 (some debugPrincipal) [.send, .sync]) descDebug
+    byAlloc := (∅ : ExtTreeMap0 MiriAllocId VTableDescriptor).insert testId1 descDebug
+  }
+  let w1 : KeyedAllocWorld :=
+    (KeyedAllocWorld.empty.reserveAllocId).1.registerGlobal ⟨testId1, .vtable, 0, 8, .not⟩
+  have hintern1 :
+      ({} : VTableRegistry).intern KeyedAllocWorld.empty maxRepresentableSize64
+        .u64 (canonicalDropFnOf .u64) (some debugPrincipal) [.send, .sync] =
+      .ok (reg1, w1, descDebug) := rfl
+  have hwf0 := VTableRegistry.keyWF_empty maxRepresentableSize64 canonicalDropFnOf
+  have ⟨hwf1, _⟩ := VTableRegistry.keyWF_intern maxRepresentableSize64 canonicalDropFnOf
+    {} reg1 KeyedAllocWorld.empty w1 .u64 (some debugPrincipal) [.send, .sync] descDebug
+    hwf0 hintern1
+  let descSend : VTableDescriptor :=
+    ⟨testId2, .u64, .principalLess [.send], canonicalDropFnOf .u64, 8, 8,
+      [.dropInPlace (canonicalDropFnOf .u64), .size 8, .align 8]⟩
+  let reg2 : VTableRegistry := {
+    byKey := reg1.byKey.insert (mkCanonicalVTableKey .u64 none [.send]) descSend
+    byAlloc := reg1.byAlloc.insert testId2 descSend
+  }
+  let w2 : KeyedAllocWorld :=
+    (w1.reserveAllocId).1.registerGlobal ⟨testId2, .vtable, 0, 8, .not⟩
+  have hupOk : upcastVTableToAutoTraits reg1 w1 maxRepresentableSize64 descDebug [.send] =
+      .ok (reg2, w2, descSend) := rfl
+  have hupPres := (upcastVTableToAutoTraits_preserves_drop_size_align
+    maxRepresentableSize64 canonicalDropFnOf reg1 w1 descDebug ⟨8, 8, true, true⟩ [.send]
+    hwf1 rfl rfl rfl rfl).2 reg2 w2 descSend hupOk
+  have hupRej := (upcastVTableToAutoTraits_preserves_drop_size_align
+    maxRepresentableSize64 canonicalDropFnOf reg2 w2 descSend ⟨8, 8, true, true⟩ [.sync]
+    hupPres.1 rfl rfl rfl rfl).1 (by decide)
+  refine ⟨hsaltedInj, hsalted, ?_⟩
+  rw [hintern1]
+  dsimp only
+  rw [hupOk]
+  dsimp only
+  exact ⟨hupPres.1, hupPres.2.1, hupPres.2.2.1, hupPres.2.2.2.1,
+    hupPres.2.2.2.2.1, hupPres.2.2.2.2.2.1, hupPres.2.2.2.2.2.2, hupRej⟩
+
 def wideDynWorldAndReg : KeyedAllocWorld × VTableRegistry × VTableDescriptor :=
   let descU64 : VTableDescriptor :=
     ⟨testId1, .u64, .principalLess [.send], "drop_u64", 8, 8,
@@ -1276,6 +1551,12 @@ theorem canary_part3C_wideDyn_vtable_precedence_and_valid_preservation :
       .error (.nullSafePointer false) ∧
     validateWideDynSafePtr w reg maxRepresentableSize64 specSend false (.maybeNull testId3 0) validVt =
       .error (.nullSafePointer true) ∧
+    (validateWideDynSafePtr w reg maxRepresentableSize64 specSend false (.maybeNull testIdMax 0) validVt =
+       .error .danglingSafePointer ∧
+     validateWideDynSafePtr w reg maxRepresentableSize64 specSend true (.maybeNull testIdMax 0) validVt =
+       .error (.nullSafePointer true)) ∧
+    validateWideDynSafePtr w reg maxRepresentableSize64 specSend false (.danglingInt 0) validVt =
+      .error (.nullSafePointer false) ∧
     validateWideDynSafePtr w reg maxRepresentableSize64 specSend false (.danglingInt 3) validVt =
       .error .danglingSafePointer ∧
     validateWideDynSafePtr w reg maxRepresentableSize64 specSend true (.danglingInt 3) validVt =
@@ -1331,6 +1612,8 @@ theorem canary_part3C_wideDyn_vtable_precedence_and_valid_preservation :
     wideDyn_validVTable_nullData_reports_nullSafePointer w reg maxRepresentableSize64 specSend false validVt descU64 hvOkU64,
     wideDyn_validVTable_nullData_reports_nullSafePointer w reg maxRepresentableSize64 specSend true validUnitVt descUnit hvOkUnit,
     by decide +kernel,
+    wideDyn_validVTable_maybeNull_dangling_precedes_null w reg maxRepresentableSize64 specSend validVt descU64 testIdMax 0 (.unavailable testIdMax) hvOkU64 (by decide) (by decide +kernel),
+    wideDyn_validVTable_danglingIntZero_reports_null w reg maxRepresentableSize64 specSend false validVt descU64 hvOkU64,
     hdangUnalign.1,
     hdangUnalign.2,
     by decide +kernel,
@@ -1408,6 +1691,35 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.keyedDeallocateMachine_race_chec
 /-- info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.vtableMatchesExpectedSpec_ignores_autoTraits' depends on axioms: [propext] -/
 #guard_msgs in
 #print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.vtableMatchesExpectedSpec_ignores_autoTraits
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.keyedDeallocateMachine_sameWriter_foreignRead_races' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.keyedDeallocateMachine_sameWriter_foreignRead_races
+
+/-- info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.stepNode_read_then_childWrite_eq_parentWrite' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.stepNode_read_then_childWrite_eq_parentWrite
+
+/-- info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.static_mixed_miri_separation' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.static_mixed_miri_separation
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.upcastVTableToAutoTraits_preserves_drop_size_align' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.upcastVTableToAutoTraits_preserves_drop_size_align
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.saltedVTable_distinct_salts_distinct_allocIds_both_valid' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.saltedVTable_distinct_salts_distinct_allocIds_both_valid
 
 /-! ## Section 5: Deterministic Workload Generators & Elaboration Benchmarks (`M = 16, 64, 128, 256`) -/
 
@@ -1611,7 +1923,8 @@ run_cmd do
             worklist := worklist.push dep
     return (visited, unsafeDecls, choiceAxioms, sorryAxioms, reduceBoolAxioms)
 
-  let rec exprHasUnusedPlaceholderTo (targetSet : NameSet) : Expr → Bool
+  let rec exprHasUnusedPlaceholderTo (targetSet : NameSet) (e : Expr) : Bool :=
+    match e with
     | .letE _ ty val body _ =>
       let unusedAndMentionsTarget :=
         (!body.hasLooseBVars) && val.getUsedConstants.any (fun nm => targetSet.contains nm)
@@ -1620,25 +1933,30 @@ run_cmd do
         exprHasUnusedPlaceholderTo targetSet val ||
         exprHasUnusedPlaceholderTo targetSet body
     | .app f a =>
-      -- `[adv B1]`: depending on the elaborator path, `have _ := @thm; b` can also surface as
-      -- `letFun thm (fun _ => b)` or as a beta-redex `(fun _ => b) thm`; flag both when the bound
-      -- value is unused (A0 only matched `.letE` and only self-tested a hand-built `.letE`).
+      -- `[adv B1]` + `[adv A1]`: flag beta-redex `(fun _ => b) thm` and `letFun` at any application
+      -- spine depth when a lambda argument ignores its bound variable while another argument mentions
+      -- a prototype public theorem.
       let betaUnused :=
         match f with
         | .lam _ _ b _ => (!b.hasLooseBVars) && a.getUsedConstants.any (fun nm => targetSet.contains nm)
         | _ => false
       let letFunUnused :=
-        match f, a with
-        | .app (.app (.app (.const nm _) _) _) v, .lam _ _ b _ =>
-          nm == `letFun && (!b.hasLooseBVars) &&
-            v.getUsedConstants.any (fun c => targetSet.contains c)
-        | _, _ => false
+        match e.getAppFn with
+        | .const nm _ =>
+          if nm == ``letFun then
+            let args := e.getAppArgs
+            args.any (fun | .lam _ _ b _ => !b.hasLooseBVars | _ => false) &&
+              args.any (fun
+                | .lam _ _ _ _ => false
+                | arg => arg.getUsedConstants.any (fun c => targetSet.contains c))
+          else false
+        | _ => false
       betaUnused || letFunUnused ||
         exprHasUnusedPlaceholderTo targetSet f || exprHasUnusedPlaceholderTo targetSet a
     | .lam _ ty b _ => exprHasUnusedPlaceholderTo targetSet ty || exprHasUnusedPlaceholderTo targetSet b
     | .forallE _ ty b _ => exprHasUnusedPlaceholderTo targetSet ty || exprHasUnusedPlaceholderTo targetSet b
-    | .mdata _ e => exprHasUnusedPlaceholderTo targetSet e
-    | .proj _ _ e => exprHasUnusedPlaceholderTo targetSet e
+    | .mdata _ e' => exprHasUnusedPlaceholderTo targetSet e'
+    | .proj _ _ e' => exprHasUnusedPlaceholderTo targetSet e'
     | _ => false
 
   let isCompilerGeneratedAuxThm (nm : Name) : Bool :=
@@ -1669,21 +1987,25 @@ run_cmd do
         protoPublicThms := protoPublicThms.push nm
         protoPublicThmSet := protoPublicThmSet.insert nm
 
-  -- Collect all declarations in the current test file
+  -- Collect all declarations in the current test file (`[adv A1]`: scan `ci.value?` across ALL
+  -- declarations in `map₂` — including `def`, `private`, and `_`-prefixed helpers where
+  -- `Name.isInternalDetail` is `true` — so placeholder laundering via `private def` cannot evade
+  -- `placeholderUses`).
   let mut testAllDecls : Array Name := #[]
   let mut closedTestWitnesses : Array Name := #[]
   let mut conditionalTests : Array Name := #[]
   let mut placeholderUses : Array Name := #[]
   for (nm, ci) in env.constants.map₂.toList do
     testAllDecls := testAllDecls.push nm
+    if let some val := ci.value? (allowOpaque := true) then
+      if exprHasUnusedPlaceholderTo protoPublicThmSet val then
+        placeholderUses := placeholderUses.push nm
     if let .thmInfo tv := ci then
       if !isPrivateName nm && !isCompilerGeneratedAuxThm nm then
         if tv.type.isForall then
           conditionalTests := conditionalTests.push nm
         else
           closedTestWitnesses := closedTestWitnesses.push nm
-        if exprHasUnusedPlaceholderTo protoPublicThmSet tv.value then
-          placeholderUses := placeholderUses.push nm
 
   let allAuditRoots := protoAllDecls ++ testAllDecls
   let (auditVisited, unsafeDecls, choiceAx, sorryAxFound, reduceAx) :=
@@ -1792,6 +2114,39 @@ run_cmd do
     if (foreignAxiomsIn (← getEnv) vis6).isEmpty then
       throwError "audit self-test 6 FAILED: missed a user-declared axiom!"
 
-  logInfo s!"axiom audit passed: {allAuditRoots.size} declarations ({protoPublicThms.size} prototype public theorems, {closedTestWitnesses.size} closed test witnesses, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 axioms outside propext/Quot.sound, 0 placeholder uses, 0 undischarged conditional test theorems, 100% theorem reachability from closed test witnesses; 7/7 rolled-back self-tests passed)"
+  -- Self-test 7 (`[adv A1]`): a rolled-back `private def` laundering an unused `let _ := @thm`
+  -- placeholder (which B1's public-`.thmInfo`-only scan missed, and where `Name.isInternalDetail`
+  -- is `true` because of `_private`) must be flagged via `map₂` + `ci.value?`.
+  withoutModifyingEnv do
+    let Except.ok stx7 := Parser.runParserCategory (← getEnv) `command
+      "private def _probeDefLaunder : Bool := let _ := @Anneal.ExtTreeMapAllocAndNoWritableProto.KeyedAllocWorld.ext; true" "<probe7>"
+      | throwError "self-test 7 parse failed"
+    elabCommand stx7
+    let mut caught7 := false
+    for (nm, ci) in (← getEnv).constants.map₂.toList do
+      if nm.toString.endsWith "_probeDefLaunder" then
+        if let some val := ci.value? (allowOpaque := true) then
+          if exprHasUnusedPlaceholderTo protoPublicThmSet val then
+            caught7 := true
+    if !caught7 then
+      throwError "audit self-test 7 FAILED: missed `private def` placeholder laundering!"
+
+  -- Self-test 8 (`[adv A1]`): a rolled-back term-mode `private theorem` using `have _ := @thm; ...`
+  -- must also be flagged via `map₂` + `ci.value? (allowOpaque := true)`.
+  withoutModifyingEnv do
+    let Except.ok stx8 := Parser.runParserCategory (← getEnv) `command
+      "private theorem _probePrivHaveLaunder : True := have _ := @Anneal.ExtTreeMapAllocAndNoWritableProto.KeyedAllocWorld.ext; True.intro" "<probe8>"
+      | throwError "self-test 8 parse failed"
+    elabCommand stx8
+    let mut caught8 := false
+    for (nm, ci) in (← getEnv).constants.map₂.toList do
+      if nm.toString.endsWith "_probePrivHaveLaunder" then
+        if let some val := ci.value? (allowOpaque := true) then
+          if exprHasUnusedPlaceholderTo protoPublicThmSet val then
+            caught8 := true
+    if !caught8 then
+      throwError "audit self-test 8 FAILED: missed `private theorem` term-mode `have` placeholder!"
+
+  logInfo s!"axiom audit passed: {allAuditRoots.size} declarations ({protoPublicThms.size} prototype public theorems, {closedTestWitnesses.size} closed test witnesses, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 axioms outside propext/Quot.sound, 0 placeholder uses, 0 undischarged conditional test theorems, 100% theorem reachability from closed test witnesses; 9/9 rolled-back self-tests passed)"
 
 end Anneal.ExtTreeMapAllocAndNoWritableProtoTests
