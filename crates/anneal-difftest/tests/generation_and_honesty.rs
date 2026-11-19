@@ -3514,3 +3514,347 @@ fn ep2_a3_lockstep_parity_on_local_mut_aliases_mixed_sched_keys_old_refs_clause_
     assert_eq!(unwind_walk.broken_env_links(), 1);
     assert_eq!(unwind_walk.steps_observed(), 0);
 }
+
+#[test]
+fn ep2_b4_lockstep_parity_on_shadowed_aliases_mut_ret_helpers_match_mut_enums_and_old_proj_refs() {
+    use anneal_difftest::{
+        EnumVariantLayout, SpecContractOracleProbe, SpecExecPhase, SpecExternalCallee,
+        SpecParamBinding, SpecPostconditionVerdict, SpecViolationKind,
+    };
+
+    let u8_layout = LayoutSpec::Scalar(ScalarLayout::u8());
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let bool_layout = LayoutSpec::Scalar(ScalarLayout::bool_layout());
+    let padded_item_layout = LayoutSpec::Struct {
+        name: "PaddedItem".to_string(),
+        total_size: 8,
+        fields: vec![
+            FieldLayout {
+                name: "tag".to_string(),
+                offset: 0,
+                layout: u8_layout,
+            },
+            FieldLayout {
+                name: "word".to_string(),
+                offset: 4,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+    let framed_items_layout = LayoutSpec::Array {
+        elem: Box::new(padded_item_layout),
+        elem_stride: 8,
+        len: 2,
+    };
+    let lanes_layout = LayoutSpec::Array {
+        elem: Box::new(u32_layout.clone()),
+        elem_stride: 4,
+        len: 3,
+    };
+    let delta_layout = LayoutSpec::Enum {
+        name: "TaggedDelta".to_string(),
+        total_size: 12,
+        tag_offset: 0,
+        tag_size: 1,
+        variants: vec![
+            EnumVariantLayout {
+                name: "Empty".to_string(),
+                discriminant: 0,
+                payload_offset: 4,
+                payload: None,
+            },
+            EnumVariantLayout {
+                name: "Single".to_string(),
+                discriminant: 1,
+                payload_offset: 4,
+                payload: Some(Box::new(u32_layout.clone())),
+            },
+            EnumVariantLayout {
+                name: "Pair".to_string(),
+                discriminant: 2,
+                payload_offset: 4,
+                payload: Some(Box::new(LayoutSpec::Tuple {
+                    total_size: 8,
+                    elements: vec![(0, u32_layout.clone()), (4, u32_layout.clone())],
+                })),
+            },
+            EnumVariantLayout {
+                name: "Shift".to_string(),
+                discriminant: 3,
+                payload_offset: 4,
+                payload: Some(Box::new(LayoutSpec::Struct {
+                    name: "ShiftPayload".to_string(),
+                    total_size: 8,
+                    fields: vec![
+                        FieldLayout {
+                            name: "dx".to_string(),
+                            offset: 0,
+                            layout: u32_layout.clone(),
+                        },
+                        FieldLayout {
+                            name: "dy".to_string(),
+                            offset: 4,
+                            layout: u32_layout.clone(),
+                        },
+                    ],
+                })),
+            },
+        ],
+    };
+    let state_layout = LayoutSpec::Struct {
+        name: "B4ParityState".to_string(),
+        total_size: 44,
+        fields: vec![
+            FieldLayout {
+                name: "framed_items".to_string(),
+                offset: 0,
+                layout: framed_items_layout,
+            },
+            FieldLayout {
+                name: "lanes".to_string(),
+                offset: 16,
+                layout: lanes_layout,
+            },
+            FieldLayout {
+                name: "act".to_string(),
+                offset: 28,
+                layout: delta_layout,
+            },
+            FieldLayout {
+                name: "total".to_string(),
+                offset: 40,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises all 5 `ep2-B4` findings in lockstep with `rustc --edition=2024 -D warnings`:
+    // 1. Framed strided `[PaddedItem; 2]` array with poisoned `0xA5` padding bytes preserved
+    //    across `coerce_value_to_syn_type`,
+    // 2. Evacuating shadowed variables targeted by live `&mut` aliases (`let r = &mut x; { let x = 999; *r += 5; }`,
+    //    `{ let x = &mut x; *x += 2; }`, `{ let st = &mut st.total; *st += 1; }`) + helper `mut dst: &mut u32`
+    //    rebound to `&mut scratch` without clobbering caller's `x`,
+    // 3. `old({ let _ = u32::max(st.total, 1u32); &st.total }) == old(&st.total)` (zero `E0515` false positive!)
+    //    alongside local-alias scratch mutation `old({ let r = st; r.total += 3u32; (scratch_bump)(r) })`,
+    // 4. Conditional `if` `&mut` place selection + `&mut`-returning helper `select_lane_mut(st, idx)`
+    //    (including early `return &mut s.lanes[0];`),
+    // 5. `match &mut st.act`, `if let ... = &mut st.act` (with NLL reassignment!), `while let`,
+    //    and `let B4ParityState { ref mut total, .. } = *st;`.
+    let probe = SpecContractOracleProbe::new(
+        "ep2_b4_parity_probe",
+        vec![
+            SpecParamBinding::mut_ref("st", "B4ParityState", state_layout)
+                .with_frame_preserved_fields(["framed_items"]),
+            SpecParamBinding::by_value("pick_first", "bool", bool_layout),
+            SpecParamBinding::by_value("mode", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "if mode == 77u32 {\n    \
+             st.framed_items[1].word += 1u32;\n\
+         }\n\
+         let mut x: u32 = 10u32;\n\
+         let r = &mut x;\n\
+         {\n    \
+             let x: u32 = 999u32;\n    \
+             let _ = x;\n    \
+             *r += 5u32;\n\
+         }\n\
+         {\n    \
+             let x = &mut x;\n    \
+             *x += 2u32;\n\
+         }\n\
+         let mut scratch_slot: u32 = 50u32;\n\
+         let redir_out: u32 = redirect_helper(&mut x, &mut scratch_slot, true);\n\
+         assert!(redir_out == 150u32 && scratch_slot == 150u32);\n\
+         let chosen = if pick_first {\n    \
+             &mut st.lanes[0]\n\
+         } else {\n    \
+             select_lane_mut(st, 2usize)\n\
+         };\n\
+         *chosen += 10u32;\n\
+         *select_lane_mut(st, 1usize) += 4u32;\n\
+         while let TaggedDelta::Single(cnt) = &mut st.act {\n    \
+             if *cnt >= 3u32 { break; }\n    \
+             *cnt += 1u32;\n\
+         }\n\
+         match &mut st.act {\n    \
+             TaggedDelta::Single(v) => { *v += 5u32; }\n    \
+             TaggedDelta::Pair(a, b) => {\n        \
+                 *a += 1u32;\n        \
+                 *b += 2u32;\n    \
+             }\n    \
+             TaggedDelta::Shift { dx, dy } => {\n        \
+                 *dx += *dy;\n        \
+                 st.act = TaggedDelta::Single(*dx);\n    \
+             }\n    \
+             TaggedDelta::Empty => {}\n\
+         }\n\
+         if let TaggedDelta::Pair(ref mut a, b_copy) = st.act {\n    \
+             *a += b_copy;\n\
+         }\n\
+         let B4ParityState { ref mut total, .. } = *st;\n\
+         *total += x;\n\
+         let act_sum: u32 = match st.act {\n    \
+             TaggedDelta::Single(v) => v,\n    \
+             TaggedDelta::Pair(a, b) => a + b,\n    \
+             TaggedDelta::Shift { dx, dy } => dx + dy,\n    \
+             TaggedDelta::Empty => 0u32,\n\
+         };\n\
+         let ext_v: u32 = ext_step();\n\
+         {\n    \
+             let st = &mut st.total;\n    \
+             *st += act_sum + ext_v;\n\
+         }\n\
+         st.total + st.lanes[0] + st.lanes[1] + st.lanes[2]",
+    )
+    .with_type_defs(
+        "#[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct PaddedItem { pub tag: u8, pub word: u32 }\n\
+         #[repr(C, u8)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub enum TaggedDelta {\n    \
+             Empty = 0,\n    \
+             Single(u32) = 1,\n    \
+             Pair(u32, u32) = 2,\n    \
+             Shift { dx: u32, dy: u32 } = 3,\n\
+         }\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct B4ParityState {\n    \
+             pub framed_items: [PaddedItem; 2],\n    \
+             pub lanes: [u32; 3],\n    \
+             pub act: TaggedDelta,\n    \
+             pub total: u32,\n\
+         }\n\
+         pub fn select_lane_mut(s: &mut B4ParityState, idx: usize) -> &mut u32 {\n    \
+             if idx == 0usize { return &mut s.lanes[0]; }\n    \
+             &mut s.lanes[idx]\n\
+         }\n\
+         pub fn redirect_helper<'a>(mut dst: &'a mut u32, fallback: &'a mut u32, redirect: bool) -> u32 {\n    \
+             if redirect { dst = fallback; }\n    \
+             *dst += 100u32;\n    \
+             *dst\n\
+         }\n\
+         pub fn by_val_total(s: B4ParityState) -> u32 { s.total }\n\
+         pub fn scratch_bump(s: &mut B4ParityState) -> u32 {\n    \
+             s.total += 7u32;\n    \
+             s.total\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_step",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout,
+    ))
+    .with_requires(
+        "bounded_inputs",
+        "st.total <= 500u32 && st.lanes[0] <= 50u32 && st.lanes[1] <= 50u32 && st.lanes[2] <= 50u32",
+    )
+    .with_ensures(
+        "old_proj_ref_no_e0515_and_local_alias_mut",
+        "old({ let _ = u32::max(st.total, 1u32); let _ = by_val_total(*st); &st.total }) == old(&st.total) \
+         && old({ let r = st; r.total += 3u32; (scratch_bump)(r) }) == old(st.total) + 10u32",
+    )
+    .with_ensures(
+        "exact_post_check",
+        "mode != 9u32 \
+         && st.lanes[1] == old(st.lanes[1]) + 4u32 \
+         && ((pick_first && st.lanes[0] == old(st.lanes[0]) + 10u32 && st.lanes[2] == old(st.lanes[2])) \
+             || (!pick_first && st.lanes[2] == old(st.lanes[2]) + 10u32 && st.lanes[0] == old(st.lanes[0]))) \
+         && st.total >= old(st.total) + 17u32",
+    );
+
+    let make_trial = |disc: u8, p0: u32, p1: u32, total: u32, pick_first: bool, mode: u32| -> Vec<u8> {
+        let mut b = vec![0xA5u8; 49];
+        b[0] = 3u8;
+        b[4..8].copy_from_slice(&11u32.to_le_bytes());
+        b[8] = 5u8;
+        b[12..16].copy_from_slice(&22u32.to_le_bytes());
+        b[16..20].copy_from_slice(&1u32.to_le_bytes()); // lanes[0] = 1
+        b[20..24].copy_from_slice(&2u32.to_le_bytes()); // lanes[1] = 2
+        b[24..28].copy_from_slice(&3u32.to_le_bytes()); // lanes[2] = 3
+        b[28] = disc;
+        b[32..36].copy_from_slice(&p0.to_le_bytes());
+        b[36..40].copy_from_slice(&p1.to_le_bytes());
+        b[40..44].copy_from_slice(&total.to_le_bytes());
+        b[44] = u8::from(pick_first);
+        b[45..49].copy_from_slice(&mode.to_le_bytes());
+        b
+    };
+
+    let mut base_sched = EnvSchedule::new().with_callee_return_size("ext_step", 4);
+    base_sched.set_callee_default("ext_step", 6u32.to_le_bytes().to_vec());
+
+    let trials = vec![
+        // Trial 0: `Pair(4, 5)`, `pick_first = false` (`select_lane_mut(st, 2)`), `mode = 0` -> HOLD
+        (make_trial(2, 4, 5, 20, false, 0), Some(base_sched.clone())),
+        // Trial 1: `Single(1)` (`while let` bumps 1 -> 3, then `match &mut` bumps 3 -> 8), `pick_first = true` -> HOLD
+        (make_trial(1, 1, 0, 20, true, 0), Some(base_sched.clone())),
+        // Trial 2: `Shift { dx: 3, dy: 4 }` (`match &mut` mutates `*dx += *dy` -> 7, then NLL reassigns `st.act = Single(7)`!) -> HOLD
+        (make_trial(3, 3, 4, 20, false, 0), Some(base_sched.clone())),
+        // Trial 3: `total = 900` fails `requires` -> FILTERED
+        (make_trial(0, 0, 0, 900, true, 0), Some(base_sched.clone())),
+        // Trial 4: `mode = 77` mutates framed `st.framed_items[1].word` -> FRAME:st.framed_items
+        (make_trial(2, 4, 5, 20, true, 77), Some(base_sched.clone())),
+        // Trial 5: `mode = 9` fails `exact_post_check` -> VIOLATION:exact_post_check
+        (make_trial(2, 4, 5, 20, false, 9), Some(base_sched.clone())),
+        // Trial 6: scheduled panic on `ext_step` -> TRAP
+        (
+            make_trial(2, 4, 5, 20, false, 0),
+            Some(base_sched.with_panic_on_call(0)),
+        ),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-B4 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[1], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[2], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::VacuouslyFiltered { .. }
+    ));
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "st" && field == "framed_items"
+    ));
+    assert!(matches!(
+        &report.verdicts[5],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause { label, .. },
+            ..
+        } if label == "exact_post_check"
+    ));
+    assert!(matches!(
+        &report.verdicts[6],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-B4 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_b4_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:HOLD",
+            "TRIAL:2:HOLD",
+            "TRIAL:3:FILTERED",
+            "TRIAL:4:FRAME:st.framed_items",
+            "TRIAL:5:VIOLATION:exact_post_check",
+            "TRIAL:6:TRAP",
+        ]
+    );
+}
