@@ -2658,7 +2658,137 @@ theorem test_b4_rem_divisibility_and_relational_sign_symmetry_applied
     hrv.1,
     hrv.2⟩
 
-/-! ## §21. Automated `run_cmd` Constructive Axiom, Projection-Discipline & Reachability Audit -/
+/-! ## §21. Pass A4 Final Hardening Tests: 32-Bit `usize`/`isize` & Slot-0 Collision Fixes, Complete `fnPtr` & Cast-Level Enum No-Forgery, Unconditional `.nondeterministic` Additive/Subtractive Sign Symmetry & MIR Right-Negation Lifting -/
+
+/-- Applied witness of A4's 32-bit `usize`/`isize` and oversized slot-0 ref fixes
+(`b4_usize32_and_ref_slot0_collision_fix_witness`), complete `fnPtr` no-forgery
+across `decodeTypedValueRichWithPolicy` (`decodeTypedValueRichWithPolicy_no_forge_fnPtr`),
+all four `RichAdtSpec` constructors (`decodeAdtRichWithPolicy_fnPtr_no_forge_all_specs`),
+cast-level `fn()` struct closure (`evalByteCastRichWithPolicy_struct_fnPtr_no_forge`),
+and unified cast-level enum+struct no-forgery for `.ref` and `.fnPtr`
+(`evalByteCastRichWithPolicy_enum_no_forge_ref_and_fnPtr`). -/
+theorem test_a4_usize32_slot0_fnptr_and_cast_enum_no_forge_applied
+    (policy : Ptr2IntTransmutePolicy) (fuel : Nat)
+    (richSpecs : List (LayoutIdx × RichAdtSpec))
+    (bytes : List AbstractByte) (vals : List Value)
+    (vOut : Value) (locOut : List LocalSlot) (memOut : Memory)
+    (hnp : abstractBytesHaveProv bytes = false) :
+    decodeTypedValueRichWithPolicy .strictUcg630Ub 4 protoRich32ExtLayouts protoRich32ExtSpecs
+        { kind := .tuple [.ref .not (.uint .u8), .uint .usize], layoutIdx := 0 }
+        (appendAbstractBytes protoOffsetZeroRef32Bytes (encodeLittleEndianBytes 99 4 .none)) =
+      .some (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 4, .scalar ⟨99, 4⟩]) ∧
+    protoFieldByteSize protoSlot0Big64Layouts
+        { kind := .ref .not (.adt "Foo" []), layoutIdx := 0 } = .some 8 ∧
+    protoFieldByteSize protoSlot0Big64Layouts
+        { kind := .ref .not (.adt "MyDst" []), layoutIdx := 1 } = .some 16 ∧
+    decodeTypedValueRichWithPolicy policy (.succ fuel) protoRichExtLayouts richSpecs
+        { kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 } bytes = .none ∧
+    decodeAdtRichWithPolicy policy
+        (decodeTypedValueRichWithPolicy policy (.succ fuel) protoRichExtLayouts richSpecs)
+        protoRichExtLayouts protoWrapRefLayout
+        (.structFields 0 [{ bytes := 0 }]
+          [{ kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 }]) bytes = .none ∧
+    decodeAdtRichWithPolicy policy
+        (decodeTypedValueRichWithPolicy policy (.succ fuel) protoRichExtLayouts richSpecs)
+        protoRichExtLayouts protoNicheOptionRefLayout
+        (.nichePointerEnum { bytes := 0 } 8 0 1 [{ bytes := 0 }]
+          [{ kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 }]) bytes ≠
+      .some (.aggregate 1 vals) ∧
+    evalByteCastRichWithPolicy policy
+        [(2, .structFields 0 [{ bytes := 0 }]
+          [{ kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 }])]
+        protoWrapRefLocals (.copy ⟨0, []⟩) protoWrapRefTy emptyMemory
+        protoWrapRefDecls protoRichExtLayouts ≠
+      .ok vOut locOut memOut ∧
+    evalByteCastRichWithPolicy policy protoRichExtSpecs protoWrapRefLocals (.copy ⟨0, []⟩)
+        { kind := .adt "OptionRef" [], layoutIdx := 4 } emptyMemory
+        protoWrapRefDecls protoRichExtLayouts ≠
+      .ok (.aggregate 1 vals) locOut memOut := by
+  have hw := b4_usize32_and_ref_slot0_collision_fix_witness
+  have hfn := decodeAdtRichWithPolicy_fnPtr_no_forge_all_specs policy fuel protoRichExtLayouts
+    richSpecs protoWrapRefLayout 0 0 0 1 { bytes := 0 } 8 0 0
+    (.initialized (.int 64 false) ⟨0, 1⟩) [{ bytes := 0 }] [{ bytes := 0 }]
+    [.arbitrary [{ bytes := 8 }] [0]]
+    [[{ kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 }]]
+    [{ kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 }] bytes vals hnp
+    ⟨[], .tuple [], .safe, .rust, 0, List.Mem.head _⟩ (by decide) rfl
+  have hfnNiche := decodeAdtRichWithPolicy_fnPtr_no_forge_all_specs policy fuel protoRichExtLayouts
+    richSpecs protoNicheOptionRefLayout 0 0 0 1 { bytes := 0 } 8 0 0
+    (.initialized (.int 64 false) ⟨0, 1⟩) [{ bytes := 0 }] [{ bytes := 0 }]
+    [.arbitrary [{ bytes := 8 }] [0]]
+    [[{ kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 }]]
+    [{ kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 }] bytes vals hnp
+    ⟨[], .tuple [], .safe, .rust, 0, List.Mem.head _⟩ (by decide) rfl
+  exact ⟨hw.2.2.2.2.1,
+    hw.2.2.2.2.2.2.2.2.2.1,
+    hw.2.2.2.2.2.2.2.2.2.2.1,
+    decodeTypedValueRichWithPolicy_no_forge_fnPtr policy fuel protoRichExtLayouts richSpecs
+      [] (.tuple []) .safe .rust 0 bytes hnp,
+    hfn.1,
+    hfnNiche.2.2.1,
+    evalByteCastRichWithPolicy_struct_fnPtr_no_forge policy
+      [(2, .structFields 0 [{ bytes := 0 }]
+        [{ kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 }])]
+      protoWrapRefLocals (.copy ⟨0, []⟩) protoWrapRefTy emptyMemory
+      protoWrapRefDecls protoRichExtLayouts (.scalar ⟨0x1000, 8⟩) protoWrapRefLocals
+      "Wrap" [] protoWrapRefLayout 0 [{ bytes := 0 }]
+      [{ kind := .fnPtr [] (.tuple []) .safe .rust, layoutIdx := 0 }]
+      vOut locOut memOut rfl rfl rfl rfl rfl
+      ⟨[], .tuple [], .safe, .rust, 0, List.Mem.head _⟩,
+    evalByteCastRichWithPolicy_enum_no_forge_ref_and_fnPtr policy protoRichExtSpecs
+      protoWrapRefLocals (.copy ⟨0, []⟩) { kind := .adt "OptionRef" [], layoutIdx := 4 }
+      emptyMemory protoWrapRefDecls protoRichExtLayouts (.scalar ⟨0x1000, 8⟩) protoWrapRefLocals
+      "OptionRef" [] protoNicheOptionRefLayout
+      (.nichePointerEnum { bytes := 0 } 8 0 1 [{ bytes := 0 }] [protoRefTy])
+      1 [protoRefTy] vals locOut memOut rfl rfl rfl rfl rfl ⟨rfl, by decide, rfl⟩
+      (Or.inl ⟨.not, .uint .u8, 1, List.Mem.head _⟩)⟩
+
+/-- Unconditional `.nondeterministic` (`miri#5643`) additive & subtractive sign
+symmetry across ALL bit patterns (instantiated on both NaN/indeterminate
+`(+Inf) + (-Inf)` & `(+Inf) - (+Inf)` AND exact `+0.0` zero-cancellation
+`(+0.0) + (-0.0)` & `(+0.0) - (+0.0)`!), plus MIR `Rvalue` right-negation
+lifting for `.mul`/`.div` (`nondet_mul_div_neg_right_float_of_ok`). -/
+theorem test_a4_nondet_add_sub_sign_symmetry_and_rv_neg_right_applied
+    (out : Nat) (hout : out < 2 ^ IeeeFormat.binary32.width) :
+    (EvalFloatBinOpRel .nondeterministic .add .binary32
+        (evalFloatNegProto .binary32 0x7F800000) (evalFloatNegProto .binary32 0xFF800000)
+        (evalFloatNegProto .binary32 out) ↔
+      EvalFloatBinOpRel .nondeterministic .add .binary32 0x7F800000 0xFF800000 out) ∧
+    (EvalFloatBinOpRel .nondeterministic .add .binary32 0x00000000 0x80000000
+        (zeroBits .binary32 false) ∧
+      ¬ EvalFloatBinOpRel .nondeterministic .add .binary32
+        (evalFloatNegProto .binary32 0x00000000) (evalFloatNegProto .binary32 0x80000000)
+        (evalFloatNegProto .binary32 (zeroBits .binary32 false))) ∧
+    (EvalFloatBinOpRel .nondeterministic .sub .binary32
+        (evalFloatNegProto .binary32 0x7F800000) (evalFloatNegProto .binary32 0x7F800000)
+        (evalFloatNegProto .binary32 out) ↔
+      EvalFloatBinOpRel .nondeterministic .sub .binary32 0x7F800000 0x7F800000 out) ∧
+    (EvalFloatBinOpRel .nondeterministic .sub .binary32 0x00000000 0x00000000
+        (zeroBits .binary32 false) ∧
+      ¬ EvalFloatBinOpRel .nondeterministic .sub .binary32
+        (evalFloatNegProto .binary32 0x00000000) (evalFloatNegProto .binary32 0x00000000)
+        (evalFloatNegProto .binary32 (zeroBits .binary32 false))) ∧
+    (EvalRvalueFloatRelProto .nondeterministic floatMisdispatchLocals
+        (.binaryOp .div (.copy ⟨3, []⟩) (.copy ⟨2, []⟩)) emptyMemory floatMisdispatchDecls
+        emptyLayoutTable
+        (.ok (.scalar ⟨evalFloatNegProto .binary32 out, 4⟩) floatMisdispatchLocals emptyMemory) ↔
+      EvalRvalueFloatRelProto .nondeterministic floatMisdispatchLocals
+        (.binaryOp .div (.copy ⟨3, []⟩) (.copy ⟨3, []⟩)) emptyMemory floatMisdispatchDecls
+        emptyLayoutTable (.ok (.scalar ⟨out, 4⟩) floatMisdispatchLocals emptyMemory)) :=
+  ⟨(EvalFloatBinOpRel.nondet_add_neg_both_iff .binary32 0x7F800000 0xFF800000 out hout).1
+      (fun h => absurd h.1 (by decide)),
+   (EvalFloatBinOpRel.nondet_add_neg_both_iff .binary32 0x00000000 0x80000000 out hout).2
+      ⟨by decide, by decide⟩,
+   (EvalFloatBinOpRel.nondet_sub_neg_both_iff .binary32 0x7F800000 0x7F800000 out hout).1
+      (fun h => absurd h.1 (by decide)),
+   (EvalFloatBinOpRel.nondet_sub_neg_both_iff .binary32 0x00000000 0x00000000 out hout).2
+      ⟨by decide, by decide⟩,
+   EvalRvalueFloatRelProto.nondet_mul_div_neg_right_float_of_ok .div floatMisdispatchLocals
+      (.copy ⟨3, []⟩) (.copy ⟨3, []⟩) (.copy ⟨2, []⟩) emptyMemory floatMisdispatchDecls
+      emptyLayoutTable .f32 .binary32 ⟨0x00000000, 4⟩ ⟨0x00000000, 4⟩ ⟨0x80000000, 4⟩
+      out (Or.inr rfl) hout rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl⟩
+
+/-! ## §22. Automated `run_cmd` Constructive Axiom, Projection-Discipline & Reachability Audit -/
 
 /-
 Audit rules (every violation is a hard `throwError`):
@@ -2676,7 +2806,7 @@ Audit rules (every violation is a hard `throwError`):
    may have a stripped return type equal to `True` (preventing empty `have _ := ...; trivial`
    reachability stubs).
 5. 100% **direct** applied coverage: every public theorem of
-   `Anneal.FloatArithAndUcg630Prototype` (≥ 294 theorems) is referenced *directly* by the
+   `Anneal.FloatArithAndUcg630Prototype` (≥ 302 theorems) is referenced *directly* by the
    proof or statement of a non-`True`-typed test declaration. Being reached only
    transitively (because another module theorem's proof happens to use it) does not count:
    that rule let 55 theorems — including brief headlines such as
@@ -2691,7 +2821,7 @@ run_cmd do
   let prodElims : List Name := [``Prod.casesOn, ``Prod.rec, ``Prod.recOn]
   let modName : Name := `Anneal.FloatArithAndUcg630Prototype
   let testNs : Name := `Anneal.FloatArithAndUcg630ProtoTests
-  let minPublicTheorems : Nat := 294
+  let minPublicTheorems : Nat := 302
   let some modIdx := env.getModuleIdx? modName | throwError "module {modName} not imported"
   let isHostFloat : Name → Bool := fun c =>
     let user := (privateToUserName? c).getD c
