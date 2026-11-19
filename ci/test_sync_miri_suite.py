@@ -196,6 +196,95 @@ fn main() {
             with self.assertRaisesRegex(ValueError, "missing a dispatch arm"):
                 SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
 
+    def test_handles_inline_attrs_indentation_nested_blocks_cstrings_and_restricted_vis(
+        self,
+    ) -> None:
+        # 1. Valid: inline attributes on the same line as markers/items, Rust 2024
+        #    `c"..."` / `cr#"..."#` literals, `const` model targets, and nested
+        #    items inside function/macro bodies at column 0.
+        valid_lib = """\
+#![no_std]
+pub const C_COOKED: &core::ffi::CStr = c"pub fn fake_cstr() {}";
+pub const C_RAW: &core::ffi::CStr = cr#"
+pub fn fake_raw_cstr() -> u32 { 0 }
+"#;
+#[allow(non_upper_case_globals)] pub const __ANNEAL_MODEL_CONST_TARGET: &str = "CONST_TARGET";
+pub const CONST_TARGET: u32 = 7;
+/* attr-comment */ #[inline(never)] pub const __ANNEAL_MODEL_inline_probe: () = ();
+  #[inline(never)] pub unsafe const fn inline_probe() -> u32 {
+pub fn nested_inside_fn_body() -> u32 { 0 }
+0
+}
+/* lead */ #[inline(never)] pub fn pass_demo() -> u32 { 1 }
+"""
+        eval_rs = 'fn main() { match "" { "pass_demo" => {}, _ => {} } }\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path, corpus_dir = _write_fixture(
+                Path(tmp),
+                manifest_toml=_BASE_MANIFEST,
+                lib_rs=valid_lib,
+                eval_rs=eval_rs,
+            )
+            manifest = SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
+            self.assertEqual([t["name"] for t in manifest["tests"]], ["pass_demo"])
+
+        # 2. Rejects unmarked functions hidden behind leading spaces, same-line
+        #    attributes, inline block comments, `extern "C"`, or `pub(crate)`.
+        sneaky_cases = [
+            (
+                "indented-pub-fn",
+                "pub fn pass_demo() -> u32 { 1 }\n    pub fn sneak_indent() -> u32 { 0 }\n",
+                "sneak_indent",
+            ),
+            (
+                "same-line-attr-pub-fn",
+                "pub fn pass_demo() -> u32 { 1 }\n#[inline(never)] pub fn sneak_attr() -> u32 { 0 }\n",
+                "sneak_attr",
+            ),
+            (
+                "block-comment-prefix-pub-fn",
+                "pub fn pass_demo() -> u32 { 1 }\n/* doc */ pub fn sneak_comment() -> u32 { 0 }\n",
+                "sneak_comment",
+            ),
+            (
+                "extern-c-pub-fn",
+                'pub fn pass_demo() -> u32 { 1 }\npub extern "C" fn sneak_extern() -> u32 { 0 }\n',
+                "sneak_extern",
+            ),
+            (
+                "restricted-pub-crate-fn",
+                "pub fn pass_demo() -> u32 { 1 }\npub(crate) fn bad_restricted() -> u32 { 0 }\n",
+                "non-exported `pub(...)` zero-arg functions",
+            ),
+            (
+                "self-referential-marker",
+                "pub const __ANNEAL_MODEL___ANNEAL_MODEL_self: () = ();\npub fn pass_demo() -> u32 { 1 }\n",
+                "name no top-level item",
+            ),
+        ]
+        for label, bad_lib, expected in sneaky_cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                manifest_path, corpus_dir = _write_fixture(
+                    Path(tmp),
+                    manifest_toml=_BASE_MANIFEST,
+                    lib_rs=bad_lib,
+                    eval_rs=eval_rs,
+                )
+                with self.assertRaisesRegex(ValueError, re.escape(expected)):
+                    SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
+
+        # 3. Rejects duplicate `[[tests]]` names in `manifest.toml`.
+        dup_manifest = _BASE_MANIFEST + "\n" + _BASE_MANIFEST.split("\n", 2)[2]
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path, corpus_dir = _write_fixture(
+                Path(tmp),
+                manifest_toml=dup_manifest,
+                lib_rs="pub fn pass_demo() -> u32 { 1 }\npub fn pass_demo() -> u32 { 1 }\n",
+                eval_rs=eval_rs,
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate \\[\\[tests\\]\\] names"):
+                SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
+
 
 if __name__ == "__main__":
     unittest.main()

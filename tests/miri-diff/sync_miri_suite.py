@@ -224,14 +224,16 @@ def extract_ub_span_from_stderr(stderr: str) -> str:
 _CHAR_LIT_RE = re.compile(
     r"b?'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^'\\\n])'"
 )
-_RAW_STR_START_RE = re.compile(r'b?r(#*)"')
+_RAW_STR_START_RE = re.compile(r'(?:b|c)?r(#*)"')
 
 
 def _strip_rust_comments(src: str, *, blank_strings: bool = False) -> str:
     """Strip Rust line and nested block comments while preserving line structure.
 
-    When ``blank_strings`` is True, string literal interiors are also replaced
-    with spaces (keeping outer quotes and newlines) so string contents cannot
+    Handles cooked strings (`"..."`, `b"..."`, `c"..."`), raw strings
+    (`r#"..."#`, `br#"..."#`, `cr#"..."#`), and char literals. When
+    ``blank_strings`` is True, string literal interiors are also replaced with
+    spaces (keeping outer quotes and newlines) so string contents cannot
     masquerade as top-level Rust items or markers.
     """
     out: list[str] = []
@@ -284,13 +286,13 @@ def _strip_rust_comments(src: str, *, blank_strings: bool = False) -> str:
                     i = n
                 continue
         if ch == '"' or (
-            ch == "b"
+            ch in ("b", "c")
             and i + 1 < n
             and src[i + 1] == '"'
             and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"))
         ):
-            if ch == "b":
-                out.append('b"')
+            if ch in ("b", "c"):
+                out.append(ch + '"')
                 i += 2
             else:
                 out.append('"')
@@ -328,6 +330,127 @@ def _strip_rust_comments(src: str, *, blank_strings: bool = False) -> str:
     return "".join(out)
 
 
+def _mask_nested_blocks_and_attrs(clean_src: str) -> str:
+    """Blank `{ ... }` bodies (`brace_depth >= 1`) and top-level `#[...]`/`#![...]`
+    attributes in comment-stripped Rust source while keeping outer `{`/`}` and
+    string/char literals at depth 0 intact.
+    """
+    out: list[str] = []
+    n = len(clean_src)
+    i = 0
+    brace_depth = 0
+    while i < n:
+        ch = clean_src[i]
+        # Skip string / raw-string / char literals at any depth so braces or
+        # brackets inside literals never skew delimiter tracking.
+        if i == 0 or not (clean_src[i - 1].isalnum() or clean_src[i - 1] == "_"):
+            raw_m = _RAW_STR_START_RE.match(clean_src, i)
+            if raw_m is not None:
+                closing = '"' + raw_m.group(1)
+                end_idx = clean_src.find(closing, raw_m.end())
+                lit_end = n if end_idx < 0 else end_idx + len(closing)
+                seg = clean_src[i:lit_end]
+                if brace_depth == 0:
+                    out.append(seg)
+                else:
+                    out.append("".join("\n" if c == "\n" else " " for c in seg))
+                i = lit_end
+                continue
+        if ch == '"' or (
+            ch in ("b", "c")
+            and i + 1 < n
+            and clean_src[i + 1] == '"'
+            and (i == 0 or not (clean_src[i - 1].isalnum() or clean_src[i - 1] == "_"))
+        ):
+            start = i
+            i += 2 if ch in ("b", "c") else 1
+            while i < n:
+                if clean_src[i] == "\\":
+                    i = min(i + 2, n)
+                elif clean_src[i] == '"':
+                    i += 1
+                    break
+                else:
+                    i += 1
+            seg = clean_src[start:i]
+            if brace_depth == 0:
+                out.append(seg)
+            else:
+                out.append("".join("\n" if c == "\n" else " " for c in seg))
+            continue
+        if ch == "'" or (
+            ch == "b"
+            and i + 1 < n
+            and clean_src[i + 1] == "'"
+            and (i == 0 or not (clean_src[i - 1].isalnum() or clean_src[i - 1] == "_"))
+        ):
+            cm = _CHAR_LIT_RE.match(clean_src, i)
+            if cm is not None:
+                seg = cm.group(0)
+                out.append(seg if brace_depth == 0 else " " * len(seg))
+                i = cm.end()
+                continue
+        if brace_depth == 0 and ch == "#":
+            j = i + 1
+            while j < n and clean_src[j] in (" ", "\t"):
+                j += 1
+            if j < n and clean_src[j] == "!":
+                j += 1
+                while j < n and clean_src[j] in (" ", "\t"):
+                    j += 1
+            if j < n and clean_src[j] == "[":
+                bracket_depth = 1
+                k = j + 1
+                while k < n and bracket_depth > 0:
+                    kc = clean_src[k]
+                    if kc == "[":
+                        bracket_depth += 1
+                        k += 1
+                    elif kc == "]":
+                        bracket_depth -= 1
+                        k += 1
+                    elif kc == '"':
+                        k += 1
+                        while k < n:
+                            if clean_src[k] == "\\":
+                                k = min(k + 2, n)
+                            elif clean_src[k] == '"':
+                                k += 1
+                                break
+                            else:
+                                k += 1
+                    else:
+                        k += 1
+                seg = clean_src[i:k]
+                out.append("".join("\n" if c == "\n" else " " for c in seg))
+                i = k
+                continue
+        if ch == "{":
+            if brace_depth == 0:
+                out.append("{")
+            else:
+                out.append(" ")
+            brace_depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            if brace_depth > 0:
+                brace_depth -= 1
+            out.append("}" if brace_depth == 0 else " ")
+            i += 1
+            continue
+        if brace_depth > 0:
+            out.append("\n" if ch == "\n" else " ")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+_TOP_PREFIX = r"(?:^|[;}])\s*"
+_FN_QUALS = r"(?:const\s+|unsafe\s+|extern(?:\s+\"[^\"]*\")?\s+)*"
+
+
 def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
     with manifest_path.open("rb") as f:
         manifest = tomllib.load(f)
@@ -339,6 +462,8 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
     eval_rs = (corpus_dir / "examples" / "miri_eval.rs").read_text(encoding="utf-8")
     clean_lib = _strip_rust_comments(lib_rs, blank_strings=False)
     clean_lib_no_str = _strip_rust_comments(lib_rs, blank_strings=True)
+    top_lib = _mask_nested_blocks_and_attrs(clean_lib)
+    top_lib_no_str = _mask_nested_blocks_and_attrs(clean_lib_no_str)
     clean_eval = _strip_rust_comments(eval_rs, blank_strings=False)
 
     # A `const __ANNEAL_MODEL_<name>: &str = "<name>";` (or `: () = ();`) marker
@@ -346,9 +471,9 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
     # manifest test, matching `trusted/rustc-capture` (`specs.rs`) and
     # `crates/anneal-difftest/src/mutators_miri.rs`.
     raw_marker_names = re.findall(
-        r"^(?:pub(?:\s*\([^)]*\))?\s+)?const\s+__ANNEAL_MODEL_([A-Za-z0-9_]+)\b",
-        clean_lib_no_str,
-        re.MULTILINE,
+        _TOP_PREFIX
+        + r"(?:pub(?:\s*\([^)]*\))?\s+)?const\s+__ANNEAL_MODEL_([A-Za-z0-9_]+)\b",
+        top_lib_no_str,
     )
     seen_markers: set[str] = set()
     dup_markers: set[str] = set()
@@ -364,9 +489,9 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
 
     parsed_markers: dict[str, tuple[str, str]] = {}
     for m in re.finditer(
-        r"^(?:pub(?:\s*\([^)]*\))?\s+)?const\s+__ANNEAL_MODEL_([A-Za-z0-9_]+)\s*:\s*([^=;]+?)\s*=\s*([^;]+?)\s*;",
-        clean_lib,
-        re.MULTILINE,
+        _TOP_PREFIX
+        + r"(?:pub(?:\s*\([^)]*\))?\s+)?const\s+__ANNEAL_MODEL_([A-Za-z0-9_]+)\s*:\s*([^=;]+?)\s*=\s*([^;]+?)\s*;",
+        top_lib,
     ):
         m_name = m.group(1)
         m_ty = re.sub(r"\s+", "", m.group(2))
@@ -395,31 +520,63 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
         )
 
     model_names = seen_markers
-    item_names = set(
-        re.findall(
-            r"^(?:pub(?:\s*\([^)]*\))?\s+)?(?:const\s+)?(?:unsafe\s+)?(?:fn|static(?:\s+mut)?|struct|enum|union|type)\s+([A-Za-z0-9_]+)\b",
-            clean_lib_no_str,
-            re.MULTILINE,
+    item_names = {
+        ident
+        for ident in re.findall(
+            _TOP_PREFIX
+            + r"(?:pub(?:\s*\([^)]*\))?\s+)?"
+            + _FN_QUALS
+            + r"(?:fn|const|static(?:\s+mut)?|struct|enum|union|type)\s+([A-Za-z0-9_]+)\b",
+            top_lib_no_str,
         )
-    )
+        if not ident.startswith("__ANNEAL_MODEL_")
+    }
     stale_markers = sorted(model_names - item_names)
     if stale_markers:
         raise ValueError(
             "corpus/src/lib.rs declares __ANNEAL_MODEL_* markers that name no "
             f"top-level item: {stale_markers}"
         )
+
+    restricted_zero_arg_fns = sorted(
+        m.group(1)
+        for m in re.finditer(
+            _TOP_PREFIX
+            + r"pub\s*\([^)]*\)\s+"
+            + _FN_QUALS
+            + r"fn\s+([A-Za-z0-9_]+)\s*\(\s*\)",
+            top_lib_no_str,
+        )
+        if m.group(1) != "helper_add_ten" and m.group(1) not in model_names
+    )
+    if restricted_zero_arg_fns:
+        raise ValueError(
+            "corpus/src/lib.rs declares non-exported `pub(...)` zero-arg functions "
+            "without `__ANNEAL_MODEL_*` markers (not callable from examples/miri_eval.rs): "
+            f"{restricted_zero_arg_fns}"
+        )
+
     fn_names_in_lib = [
         m.group(1)
         for m in re.finditer(
-            r"^pub(?:\s*\([^)]*\))?\s+(?:const\s+)?(?:unsafe\s+)?fn\s+([A-Za-z0-9_]+)\s*\(\s*\)",
-            clean_lib_no_str,
-            re.MULTILINE,
+            _TOP_PREFIX + r"pub\s+" + _FN_QUALS + r"fn\s+([A-Za-z0-9_]+)\s*\(\s*\)",
+            top_lib_no_str,
         )
         if m.group(1) != "helper_add_ten" and m.group(1) not in model_names
     ]
 
     tests = manifest.get("tests", [])
     manifest_names = [t["name"] for t in tests]
+    seen_manifest: set[str] = set()
+    dup_manifest: set[str] = set()
+    for name in manifest_names:
+        if name in seen_manifest:
+            dup_manifest.add(name)
+        seen_manifest.add(name)
+    if dup_manifest:
+        raise ValueError(
+            f"manifest.toml declares duplicate [[tests]] names: {sorted(dup_manifest)}"
+        )
     if manifest_names != fn_names_in_lib:
         missing_in_manifest = set(fn_names_in_lib) - set(manifest_names)
         missing_in_lib = set(manifest_names) - set(fn_names_in_lib)

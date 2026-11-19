@@ -2504,6 +2504,24 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
         syn::visit::visit_item_macro(self, mac);
     }
 
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        self.aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(quote::ToTokens::to_token_stream(item));
+        syn::visit::visit_item_static(self, item);
+    }
+
+    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+        if !item.ident.to_string().starts_with("__ANNEAL_MODEL_") {
+            self.aux_tokens
+                .entry(item.ident.to_string())
+                .or_default()
+                .push(quote::ToTokens::to_token_stream(item));
+        }
+        syn::visit::visit_item_const(self, item);
+    }
+
     fn visit_item_impl(&mut self, imp: &'ast syn::ItemImpl) {
         let mut self_idents = BTreeSet::new();
         collect_ident_tokens(
@@ -5286,13 +5304,12 @@ fn discover_reproducer_candidate_fn(source: &str) -> Option<String> {
                 }
             }
         }
-        if let Some(last) = pub_zero_arg.pop() {
-            return Some(last);
-        }
+        return pub_zero_arg.pop();
     }
+    let local_models = crate::mutators_miri::model_marked_names_in_source_text(source);
     discover_zero_arg_pub_fns(source)
         .into_iter()
-        .filter(|name| !crate::mutators_miri::is_corpus_helper_fn_name(name))
+        .filter(|name| !crate::mutators_miri::is_helper_fn_name_in_set(name, &local_models))
         .last()
 }
 
@@ -12125,5 +12142,52 @@ pub fn pass_copy_nonoverlapping_same_tag_disjoint_array_halves() -> u32 {
             discover_reproducer_candidate_fn(&with_preamble_and_trailing_model).as_deref(),
             Some("cand_under_test")
         );
+
+        // 3. When every zero-arg `pub fn` in a parseable file is model-marked,
+        //    discovery must return `None` rather than falling through to the
+        //    regex fallback and returning a file-local model helper.
+        let only_local_models = "\
+#![no_std]
+pub const __ANNEAL_MODEL_only_helper_a: () = ();
+pub fn only_helper_a() -> u32 { 1u32 }
+pub const __ANNEAL_MODEL_alias_b: &str = \"only_helper_b\";
+pub fn only_helper_b() -> u32 { 2u32 }
+";
+        assert_eq!(discover_reproducer_candidate_fn(only_local_models), None);
+
+        // 4. The non-`syn` fallback path (triggered by syntax `syn` rejects)
+        //    still honors file-local `__ANNEAL_MODEL_*` markers, ignores
+        //    commented-out markers, and allows unmarked Category 11 probe names.
+        let fallback_src = "\
+#![no_std]
+// pub const __ANNEAL_MODEL_pass_copy_nonoverlapping_same_tag_disjoint_array_halves: () = ();
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_array_halves() -> u32 { @@@ }
+pub const __ANNEAL_MODEL_fallback_helper: &str = \"fallback_helper\";
+pub fn fallback_helper() -> u32 { 0u32 }
+";
+        assert!(syn::parse_file(fallback_src).is_err());
+        assert_eq!(
+            discover_reproducer_candidate_fn(fallback_src).as_deref(),
+            Some("pass_copy_nonoverlapping_same_tag_disjoint_array_halves")
+        );
+
+        // 5. `staged_helper_fns_reachable_from_candidates` traverses `static`
+        //    and `const` initializers so model-marked `const fn` helpers only
+        //    referenced via a `static` are still linked when reached.
+        let via_static = "\
+#![no_std]
+pub const __ANNEAL_MODEL_const_init_helper: &str = \"const_init_helper\";
+pub const fn const_init_helper() -> u32 { 7u32 }
+pub static VIA_STATIC: u32 = const_init_helper();
+pub fn cand_reads_static() -> u32 { VIA_STATIC }
+pub const __ANNEAL_MODEL_unreached_helper: () = ();
+pub fn unreached_helper() -> u32 { 9u32 }
+";
+        let reached = staged_helper_fns_reachable_from_candidates(
+            via_static,
+            &[OracleItemSpec::with_fuel("cand_reads_static".to_string(), 64)],
+        );
+        assert!(reached.contains("const_init_helper"), "{reached:?}");
+        assert!(!reached.contains("unreached_helper"), "{reached:?}");
     }
 }

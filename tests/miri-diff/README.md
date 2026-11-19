@@ -262,8 +262,12 @@ statement) or agreement with Miri:
   src`) disjoint copies, plus whole-struct `(&raw mut pair) as *mut u32`, report
   UB at the `copy_nonoverlapping` (`false_positive_ub`,
   `sound_conservative_abstraction`), both when a candidate calls a probe and
-  when it runs the probe's body in the root frame. True same-tag overlaps on
-  both `[u32; 4]` and `[u8; 8]` agree (UB at the copy in both).
+  when it runs the probe's body in the root frame. Zero-byte same-tag copies
+  (`count == 0` on `[u32; 4]` and `[u8; 8]`, plus `count == 1` on `()` in
+  `Statements.lean`'s `evalCopySingleDirect`) likewise report `false_positive_ub`,
+  whereas same-tag disjoint byte copies inside `OverlayU32` (`evalCopyUnionBytes`
+  via `rangesDisjoint`) and true same-tag overlaps on both `[u32; 4]` and
+  `[u8; 8]` agree with Miri today.
 - `static` accesses. Anneal reports UB at the first access to any `static`,
   reads included. `pass_static_const_raw_ptr_read_and_freeze_retag` (Miri
   `8996`) and an isolated `UnsafeCell` write to `STATIC_FREEZE_AND_CELL.cell`

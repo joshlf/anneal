@@ -3465,6 +3465,61 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
             .to_string(),
         ),
         (
+            "c16_zero_count_u32_same_tag_copy".to_string(),
+            r#"pub fn c16_zero_count_u32_same_tag_copy() -> u32 {
+    let mut arr: [u32; 4] = [10u32, 20u32, 30u32, 40u32];
+    let p: *mut u32 = &raw mut arr[0];
+    unsafe {
+        copy_nonoverlapping(p as *const u32, p, 0usize);
+    }
+    arr[0] + arr[3]
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_zero_count_u8_same_tag_copy".to_string(),
+            r#"pub fn c16_zero_count_u8_same_tag_copy() -> u32 {
+    let mut arr: [u8; 8] = [3u8, 5u8, 9u8, 17u8, 33u8, 65u8, 129u8, 250u8];
+    let p: *mut u8 = (&raw mut arr) as *mut u8;
+    unsafe {
+        copy_nonoverlapping(p as *const u8, p, 0usize);
+    }
+    (arr[0] as u32) + (arr[3] as u32) + 2u32
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_zst_unit_single_direct_same_tag_copy".to_string(),
+            r#"pub fn c16_zst_unit_single_direct_same_tag_copy() -> u32 {
+    let mut z: () = ();
+    let p: *mut () = &raw mut z;
+    unsafe {
+        copy_nonoverlapping(p as *const (), p, 1usize);
+    }
+    77u32
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_union_same_tag_disjoint_bytes_agree".to_string(),
+            r#"pub fn c16_union_same_tag_disjoint_bytes_agree() -> u32 {
+    let mut u: OverlayU32 = OverlayU32 {
+        bytes: [3u8, 5u8, 9u8, 17u8],
+    };
+    let p: *mut u8 = (&raw mut u.bytes) as *mut u8;
+    unsafe {
+        let dst: *mut u8 = offset(p, 2isize);
+        copy_nonoverlapping(p as *const u8, dst, 2usize);
+        u.word
+    }
+}
+"#
+            .to_string(),
+        ),
+        (
             "c16_same_tag_overlap_control".to_string(),
             r#"pub fn c16_same_tag_overlap_control() -> u32 {
     let mut arr: [u32; 4] = [10u32, 20u32, 30u32, 40u32];
@@ -3568,7 +3623,7 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
         ),
     ];
     let total_expected = named_sources.len();
-    assert_eq!(total_expected, 20);
+    assert_eq!(total_expected, 24);
     let candidates: Vec<GeneratedMiriCandidate> = named_sources
         .iter()
         .enumerate()
@@ -3695,6 +3750,24 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
             8481,
             "copy_nonoverlapping(src, p, 1usize);",
         ),
+        (
+            "c16_zero_count_u32_same_tag_copy",
+            probe_header("c16_zero_count_u32_same_tag_copy"),
+            50,
+            "copy_nonoverlapping(p as *const u32, p, 0usize);",
+        ),
+        (
+            "c16_zero_count_u8_same_tag_copy",
+            probe_header("c16_zero_count_u8_same_tag_copy"),
+            22,
+            "copy_nonoverlapping(p as *const u8, p, 0usize);",
+        ),
+        (
+            "c16_zst_unit_single_direct_same_tag_copy",
+            probe_header("c16_zst_unit_single_direct_same_tag_copy"),
+            77,
+            "copy_nonoverlapping(p as *const (), p, 1usize);",
+        ),
     ] {
         let rep = item(name);
         assert_eq!(
@@ -3763,6 +3836,29 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
             overlap.anneal
         );
     }
+
+    // Union (`OverlayU32`) same-tag disjoint byte copy routes through
+    // `Statements.lean`'s `evalCopyUnionBytes` (`rangesDisjoint`) and already
+    // agrees live (`[3, 5, 3, 5]` -> `0x0503_0503 = 84_083_971`).
+    let union_copy = item("c16_union_same_tag_disjoint_bytes_agree");
+    assert_eq!(
+        union_copy.verdict,
+        ComparisonVerdict::Agree,
+        "{union_copy:?}"
+    );
+    assert_eq!(
+        (&union_copy.miri, &union_copy.anneal),
+        (
+            &MiriOutcome::PassScalar {
+                bits: 0x0503_0503,
+                size_bytes: 4
+            },
+            &AnnealOutcome::PassScalar {
+                bits: 0x0503_0503,
+                size_bytes: 4
+            }
+        )
+    );
 
     // Static reads, isolated static `UnsafeCell` writes, and the local
     // `UnsafeCell` field write: Miri returns normally; Anneal reports UB at one
@@ -4009,6 +4105,50 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
             "incomplete finding bundle for `{}`",
             f.fn_name
         );
+        // Callee-reachability isolation in chunked `MiriOracleConfirm.lean`:
+        // unreached Category 9 helpers/Drop impls are never linked in any chunk,
+        // and each callee-wrapper finding links its called Category 11 model
+        // probe in its confirm chunk.
+        for unrelated in [
+            "helper_reborrow_",
+            "helper_shared_",
+            "helper_frozen_",
+            "helper_unwind_",
+            "UnwindCleanupGuard",
+        ] {
+            assert!(
+                !f.kernel_confirm_theorems.contains(unrelated),
+                "confirm module for `{}` linked unrelated Category 9 helper `{unrelated}`:\n{}",
+                f.fn_name,
+                f.kernel_confirm_theorems
+            );
+        }
+        let own_probe = match f.fn_name.as_str() {
+            "c16_call_array_halves" => {
+                Some("pass_copy_nonoverlapping_same_tag_disjoint_array_halves")
+            }
+            "c16_call_u8_array_halves" => {
+                Some("pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves")
+            }
+            "c16_call_struct_fields" => {
+                Some("pass_copy_nonoverlapping_same_tag_disjoint_struct_fields")
+            }
+            "c16_call_static_freeze_read" => {
+                Some("pass_static_const_raw_ptr_read_and_freeze_retag")
+            }
+            "c16_call_static_cell_then_frozen_write" => {
+                Some("ub_static_unsafe_cell_raw_const_cast_mut_write")
+            }
+            _ => None,
+        };
+        if let Some(probe) = own_probe {
+            assert!(
+                f.kernel_confirm_theorems.contains(probe),
+                "confirm chunk for `{}` failed to link its called model probe `{probe}`:\n{}",
+                f.fn_name,
+                f.kernel_confirm_theorems
+            );
+        }
     }
 
     // Round-trip `reproduce_miri_finding` (`--reproduce`) on both:
@@ -4022,11 +4162,15 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
         .iter()
         .find(|f| f.fn_name == "c16_call_u8_array_halves")
     {
-        let repro_rep = reproduce_miri_finding(
-            u8_finding.repro_path.as_deref().unwrap(),
-            Some(&root),
-        )
-        .expect("reproduce_miri_finding on preamble-callee finding bundle");
+        let repro_path = u8_finding.repro_path.as_deref().unwrap();
+        let repro_src = fs::read_to_string(repro_path).expect("read finding repro.rs");
+        let expected_repro_ub_line = c16_line_after(
+            &repro_src,
+            &probe_header("pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves"),
+            "copy_nonoverlapping(p as *const u8, dst, 4usize);",
+        );
+        let repro_rep = reproduce_miri_finding(repro_path, Some(&root))
+            .expect("reproduce_miri_finding on preamble-callee finding bundle");
         assert_eq!(repro_rep.name, "c16_call_u8_array_halves");
         assert_eq!(
             repro_rep.miri,
@@ -4034,6 +4178,25 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
                 bits: 285_803_779,
                 size_bytes: 4
             }
+        );
+        assert!(
+            matches!(
+                repro_rep.verdict,
+                ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
+            ),
+            "unexpected verdict on finding repro: {repro_rep:?}"
+        );
+        assert!(
+            matches!(
+                &repro_rep.anneal,
+                AnnealOutcome::Ub { span: Some(s) } if s.start_line == expected_repro_ub_line
+            ),
+            "expected Anneal UB at repro.rs line {expected_repro_ub_line}, got {:?}",
+            repro_rep.anneal
+        );
+        assert_eq!(
+            repro_rep.anneal.summary_tag(),
+            u8_finding.anneal_outcome_tag
         );
         assert!(repro_rep.kernel_confirmed);
     }
