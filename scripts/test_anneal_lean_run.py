@@ -59,26 +59,53 @@ _HERMETIC_GIT_ENV = {
     "GIT_COMMITTER_NAME": "Test User",
     "GIT_COMMITTER_EMAIL": "test@example.com",
 }
+_AMBIENT_ANNEAL_ENV_PREFIXES: tuple[str, ...] = (
+    "ANNEAL_LEAN_",
+    "ANNEAL_WORKTREE_",
+    "ANNEAL_LSP_",
+    "ANNEAL_OOM_",
+)
 _ENV_PATCHER: Any = None
+_XDG_TMPDIR: tempfile.TemporaryDirectory[str] | None = None
+
+
+def _scrub_ambient_anneal_env(env: dict[str, str]) -> None:
+    for key in list(env):
+        if key.startswith(_AMBIENT_ANNEAL_ENV_PREFIXES):
+            env.pop(key, None)
+
+
+def _isolated_cli_env(
+    xdg_config_home: Path, env_extra: dict[str, str] | None = None
+) -> dict[str, str]:
+    env = dict(os.environ)
+    _scrub_ambient_anneal_env(env)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["XDG_CONFIG_HOME"] = str(xdg_config_home)
+    if env_extra:
+        env.update(env_extra)
+    return env
 
 
 def setUpModule() -> None:
-    global _ENV_PATCHER
-    _ENV_PATCHER = mock.patch.dict(os.environ, _HERMETIC_GIT_ENV)
+    global _ENV_PATCHER, _XDG_TMPDIR
+    _XDG_TMPDIR = tempfile.TemporaryDirectory(prefix="anneal-test-xdg-")
+    patch_vals = {**_HERMETIC_GIT_ENV, "XDG_CONFIG_HOME": _XDG_TMPDIR.name}
+    _ENV_PATCHER = mock.patch.dict(os.environ, patch_vals)
     _ENV_PATCHER.start()
     # `patch.dict` restores the full original environment on stop.
-    for name in (
-        *alr._GIT_LOCAL_ENV_VARS,
-        "ANNEAL_WORKTREE_CONCURRENCY",
-        "ANNEAL_LEAN_MEMORY_MAX_MB",
-        "ANNEAL_LEAN_TIMEOUT_SEC",
-    ):
+    for name in alr._GIT_LOCAL_ENV_VARS:
         os.environ.pop(name, None)
+    _scrub_ambient_anneal_env(os.environ)
 
 
 def tearDownModule() -> None:
+    global _XDG_TMPDIR
     if _ENV_PATCHER is not None:
         _ENV_PATCHER.stop()
+    if _XDG_TMPDIR is not None:
+        _XDG_TMPDIR.cleanup()
+        _XDG_TMPDIR = None
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +809,7 @@ class TestCliAndLimits(unittest.TestCase):
 
     def test_run_bounded_command_success_and_timeout(self) -> None:
         rc_file = alr.main(
-            ["--mode", "file", "--concurrency", "1", "--", "true"]
+            ["--mode", "file", "--no-slot-lock", "--concurrency", "1", "--", "true"]
         )
         self.assertEqual(rc_file, 0)
 
@@ -946,35 +973,35 @@ class TestCliSubprocess(unittest.TestCase):
     def _cli(
         self, *args: str, env_extra: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        env = dict(os.environ)
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-        if env_extra:
-            env.update(env_extra)
-        return subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), *args],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            timeout=120,
-        )
-
-    def test_cli_backward_compatible_probe_and_execution(self) -> None:
-        if os.access(SCRIPT_PATH, os.X_OK):
-            direct = subprocess.run(
-                [str(SCRIPT_PATH), "--print-limits", "--json"],
+        with tempfile.TemporaryDirectory(prefix="anneal-cli-xdg-") as xdg_dir:
+            env = _isolated_cli_env(Path(xdg_dir), env_extra)
+            return subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), *args],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 check=False,
+                env=env,
                 timeout=120,
             )
+
+    def test_cli_backward_compatible_probe_and_execution(self) -> None:
+        if os.access(SCRIPT_PATH, os.X_OK):
+            with tempfile.TemporaryDirectory(prefix="anneal-cli-xdg-") as xdg_dir:
+                direct = subprocess.run(
+                    [str(SCRIPT_PATH), "--print-limits", "--json"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=_isolated_cli_env(Path(xdg_dir)),
+                    timeout=120,
+                )
             self.assertEqual(direct.returncode, 0, direct.stderr)
             self.assertIn("cgroup_avail_mib", json.loads(direct.stdout))
 
         probe = self._cli("--probe")
-        self.assertEqual(probe.returncode, 0)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
         self.assertIn("Cgroup v2", probe.stdout)
         self.assertIn("Hard RAM Cap", probe.stdout)
 
@@ -987,10 +1014,78 @@ class TestCliSubprocess(unittest.TestCase):
                 "ANNEAL_LEAN_TIMEOUT_SEC": "77",
             },
         )
+        self.assertEqual(env_json.returncode, 0, env_json.stderr)
         data = json.loads(env_json.stdout)
-        self.assertEqual(data["concurrency"], 2)
-        self.assertEqual(data["memory_max_mb"], 3000)
+        expected_conc = (
+            min(2, data["s_heavy_safe"]) if data["is_cg_capped"] else 2
+        )
+        expected_mem = (
+            min(3000, data["w_slice_max_mb"]) if data["is_cg_capped"] else 3000
+        )
+        self.assertEqual(data["concurrency"], expected_conc)
+        self.assertEqual(data["w_eff"], expected_conc)
+        self.assertEqual(data["build_slots"], expected_conc)
+        self.assertEqual(data["memory_max_mb"], expected_mem)
+        if data["w_slice_max_mb"] >= 3000:
+            self.assertEqual(data["memory_max_mb"], 3000)
         self.assertEqual(data["timeout_sec"], 77)
+
+        # `--unsafe-ignore-cgroup` bypasses the `w_slice_max_mb` cap on explicit
+        # `--memory-max-mb` overrides while keeping `is_cg_capped` and
+        # `s_heavy_safe` concurrency clamping fail-closed.
+        over_cap_mb = data["w_slice_max_mb"] + 1024
+        capped_override = self._cli(
+            "--memory-max-mb",
+            str(over_cap_mb),
+            "--probe",
+            "--json",
+            env_extra={"ANNEAL_WORKTREE_CONCURRENCY": "2"},
+        )
+        self.assertEqual(capped_override.returncode, 0, capped_override.stderr)
+        capped_data = json.loads(capped_override.stdout)
+        self.assertEqual(
+            capped_data["memory_max_mb"],
+            capped_data["w_slice_max_mb"]
+            if capped_data["is_cg_capped"]
+            else over_cap_mb,
+        )
+        self.assertEqual(capped_data["concurrency"], expected_conc)
+
+        unsafe_override = self._cli(
+            "--unsafe-ignore-cgroup",
+            "--memory-max-mb",
+            str(over_cap_mb),
+            "--probe",
+            "--json",
+            env_extra={"ANNEAL_WORKTREE_CONCURRENCY": "2"},
+        )
+        self.assertEqual(unsafe_override.returncode, 0, unsafe_override.stderr)
+        unsafe_data = json.loads(unsafe_override.stdout)
+        self.assertEqual(unsafe_data["memory_max_mb"], over_cap_mb)
+        self.assertEqual(unsafe_data["is_cg_capped"], data["is_cg_capped"])
+        self.assertEqual(unsafe_data["concurrency"], expected_conc)
+
+        # Populated `$XDG_CONFIG_HOME/anneal/concurrency` is read and subject to
+        # the same host cgroup cap (`min(3, s_heavy_safe)` when capped else `3`).
+        with tempfile.TemporaryDirectory(prefix="anneal-xdg-cfg-") as cfg_dir:
+            cfg_file = Path(cfg_dir) / "anneal" / "concurrency"
+            cfg_file.parent.mkdir(parents=True, exist_ok=True)
+            cfg_file.write_text("3\n", encoding="utf-8")
+            cfg_probe = self._cli(
+                "--probe",
+                "--json",
+                env_extra={"XDG_CONFIG_HOME": cfg_dir},
+            )
+            self.assertEqual(cfg_probe.returncode, 0, cfg_probe.stderr)
+            cfg_data = json.loads(cfg_probe.stdout)
+            expected_cfg_conc = (
+                min(3, cfg_data["s_heavy_safe"])
+                if cfg_data["is_cg_capped"]
+                else 3
+            )
+            self.assertEqual(cfg_data["concurrency"], expected_cfg_conc)
+            self.assertEqual(cfg_data["w_eff"], expected_cfg_conc)
+            self.assertEqual(cfg_data["build_slots"], expected_cfg_conc)
 
         bad_env = self._cli(
             "--probe", "--json", env_extra={"ANNEAL_WORKTREE_CONCURRENCY": "abc"}
@@ -1002,12 +1097,19 @@ class TestCliSubprocess(unittest.TestCase):
             "--concurrency", "1", "--memory-max-mb", "2500", "--timeout", "60",
             "--probe", "--json",
         )
+        self.assertEqual(flags.returncode, 0, flags.stderr)
         flag_data = json.loads(flags.stdout)
-        self.assertEqual(flag_data["memory_max_mb"], 2500)
+        self.assertEqual(flag_data["concurrency"], 1)
+        self.assertEqual(
+            flag_data["memory_max_mb"],
+            min(2500, flag_data["w_slice_max_mb"])
+            if flag_data["is_cg_capped"]
+            else 2500,
+        )
         self.assertEqual(flag_data["timeout_sec"], 60)
 
         for argv, expected_rc in (
-            (["--mode", "file", "--concurrency", "1", "--", "true"], 0),
+            (["--mode", "file", "--no-slot-lock", "--concurrency", "1", "--", "true"], 0),
             (["--mode", "build", "--no-slot-lock", "--concurrency", "1", "--", "true"], 0),
             (["--no-slot-lock", "--", "sh", "-c", "exit 5"], 5),
         ):
@@ -1085,19 +1187,218 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                 self.assertEqual(slots, [1, 2, 3])
                 self.assertEqual(alr.count_active_build_slots(rt), 3)
 
-            env_in = os.environ.copy()
-            env_in["ANNEAL_LEAN_RUN_IN_SCOPE"] = "1"
-            env_in["XDG_RUNTIME_DIR"] = str(rt)
-            res = subprocess.run(
-                [sys.executable, str(SCRIPT_PATH), "--mode", "build", "--", sys.executable, "-c", "print('ok')"],
-                env=env_in,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=10.0,
-            )
+            with tempfile.TemporaryDirectory(prefix="anneal-excl-xdg-") as xdg_dir:
+                env_in = _isolated_cli_env(
+                    Path(xdg_dir),
+                    {
+                        "ANNEAL_LEAN_RUN_IN_SCOPE": "1",
+                        "XDG_RUNTIME_DIR": str(rt),
+                    },
+                )
+                res = subprocess.run(
+                    [sys.executable, str(SCRIPT_PATH), "--mode", "build", "--", sys.executable, "-c", "print('ok')"],
+                    env=env_in,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10.0,
+                )
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertEqual(res.stdout.strip(), "ok")
+
+    def test_concurrency_isolation_uncapped_and_capped(self) -> None:
+        """Hermetically verifies `XDG_CONFIG_HOME` / `HOME` isolation and
+        `ANNEAL_WORKTREE_CONCURRENCY` behavior under both uncapped and cgroup-capped
+        regimes (even when tests run on a 1-slot cgroup-capped capsule)."""
+        with tempfile.TemporaryDirectory(prefix="anneal-conc-iso-") as tmp:
+            root = Path(tmp)
+            meminfo = root / "meminfo"
+            meminfo.write_text(
+                "MemTotal:       67108864 kB\nMemAvailable:   50331648 kB\n",
+                encoding="utf-8",
+            )
+            proc_cg = root / "proc_cgroup"
+            proc_cg.write_text("0::/user.slice/job.scope\n", encoding="utf-8")
+
+            uncapped_cg = root / "cg_uncapped"
+            _write_cgroup_file(uncapped_cg / "user.slice" / "memory.max", "max\n")
+            _write_cgroup_file(uncapped_cg / "user.slice" / "job.scope" / "memory.max", "max\n")
+            _write_cgroup_file(
+                uncapped_cg / "user.slice" / "job.scope" / "memory.stat",
+                f"anon {512 * MIB}\nshmem 0\nfile {1024 * MIB}\n",
+            )
+
+            capped_1slot_cg = root / "cg_capped_1"
+            _write_cgroup_file(
+                capped_1slot_cg / "user.slice" / "memory.max", f"{12288 * MIB}\n"
+            )
+            _write_cgroup_file(
+                capped_1slot_cg / "user.slice" / "job.scope" / "memory.max", "max\n"
+            )
+            _write_cgroup_file(
+                capped_1slot_cg / "user.slice" / "job.scope" / "memory.stat",
+                f"anon {512 * MIB}\nshmem 0\nfile {1024 * MIB}\n",
+            )
+
+            capped_2slot_cg = root / "cg_capped_2"
+            _write_cgroup_file(
+                capped_2slot_cg / "user.slice" / "memory.max", f"{32768 * MIB}\n"
+            )
+            _write_cgroup_file(
+                capped_2slot_cg / "user.slice" / "job.scope" / "memory.max", "max\n"
+            )
+            _write_cgroup_file(
+                capped_2slot_cg / "user.slice" / "job.scope" / "memory.stat",
+                f"anon {512 * MIB}\nshmem 0\nfile {1024 * MIB}\n",
+            )
+
+            fake_home = root / "home"
+            _write_cgroup_file(fake_home / ".config" / "anneal" / "concurrency", "5\n")
+            empty_xdg = root / "xdg_empty"
+            empty_xdg.mkdir()
+            populated_xdg = root / "xdg_three"
+            _write_cgroup_file(populated_xdg / "anneal" / "concurrency", "3\n")
+
+            # Empty XDG_CONFIG_HOME masks $HOME/.config/anneal/concurrency; unset XDG falls back to HOME.
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": str(fake_home), "XDG_CONFIG_HOME": str(empty_xdg)},
+                clear=False,
+            ):
+                os.environ.pop("ANNEAL_WORKTREE_CONCURRENCY", None)
+                self.assertIsNone(alr.read_concurrency_config_file())
+                env_default = alr.probe_host_envelope(
+                    meminfo_path=meminfo,
+                    cgroup_root=uncapped_cg,
+                    proc_cgroup_path=proc_cg,
+                    cpu_cores=16,
+                    user_systemd_active=False,
+                    runtime_base=root,
+                    is_probe=True,
+                )
+                self.assertFalse(env_default["is_cg_capped"])
+                self.assertEqual(env_default["concurrency"], 1)
+                self.assertEqual(env_default["build_slots"], 1)
+
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": str(fake_home), "XDG_CONFIG_HOME": ""},
+                clear=False,
+            ):
+                self.assertEqual(alr.read_concurrency_config_file(), 5)
+
+            # Uncapped regime: ANNEAL_WORKTREE_CONCURRENCY=2 -> 2; XDG file "3" -> 3.
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "XDG_CONFIG_HOME": str(empty_xdg),
+                    "ANNEAL_WORKTREE_CONCURRENCY": "2",
+                },
+                clear=False,
+            ):
+                uncapped_env = alr.probe_host_envelope(
+                    meminfo_path=meminfo,
+                    cgroup_root=uncapped_cg,
+                    proc_cgroup_path=proc_cg,
+                    cpu_cores=16,
+                    user_systemd_active=False,
+                    runtime_base=root,
+                    is_probe=True,
+                )
+                self.assertFalse(uncapped_env["is_cg_capped"])
+                self.assertEqual(uncapped_env["concurrency"], 2)
+                self.assertEqual(uncapped_env["build_slots"], 2)
+
+            with mock.patch.dict(
+                os.environ,
+                {"XDG_CONFIG_HOME": str(populated_xdg)},
+                clear=False,
+            ):
+                os.environ.pop("ANNEAL_WORKTREE_CONCURRENCY", None)
+                uncapped_cfg = alr.probe_host_envelope(
+                    meminfo_path=meminfo,
+                    cgroup_root=uncapped_cg,
+                    proc_cgroup_path=proc_cg,
+                    cpu_cores=16,
+                    user_systemd_active=False,
+                    runtime_base=root,
+                    is_probe=True,
+                )
+                self.assertFalse(uncapped_cfg["is_cg_capped"])
+                self.assertEqual(uncapped_cfg["concurrency"], 3)
+                self.assertEqual(uncapped_cfg["build_slots"], 3)
+
+            # Capped 1-slot regime: env=2 and xdg=3 both clamp to s_heavy_safe == 1,
+            # and unsafe_ignore_cgroup lifts only override_mem_mb above w_slice_max_mb.
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "XDG_CONFIG_HOME": str(empty_xdg),
+                    "ANNEAL_WORKTREE_CONCURRENCY": "2",
+                },
+                clear=False,
+            ):
+                cap1 = alr.probe_host_envelope(
+                    meminfo_path=meminfo,
+                    cgroup_root=capped_1slot_cg,
+                    proc_cgroup_path=proc_cg,
+                    cpu_cores=16,
+                    user_systemd_active=False,
+                    runtime_base=root,
+                    is_probe=True,
+                )
+                self.assertTrue(cap1["is_cg_capped"])
+                self.assertEqual(cap1["s_heavy_safe"], 1)
+                self.assertEqual(cap1["concurrency"], 1)
+                self.assertEqual(cap1["build_slots"], 1)
+                over_mb = cap1["w_slice_max_mb"] + 1024
+                cap1_mem_clamped = alr.probe_host_envelope(
+                    meminfo_path=meminfo,
+                    cgroup_root=capped_1slot_cg,
+                    proc_cgroup_path=proc_cg,
+                    cpu_cores=16,
+                    user_systemd_active=False,
+                    runtime_base=root,
+                    is_probe=True,
+                    override_mem_mb=over_mb,
+                    unsafe_ignore_cgroup=False,
+                )
+                self.assertEqual(cap1_mem_clamped["memory_max_mb"], cap1["w_slice_max_mb"])
+                cap1_mem_unsafe = alr.probe_host_envelope(
+                    meminfo_path=meminfo,
+                    cgroup_root=capped_1slot_cg,
+                    proc_cgroup_path=proc_cg,
+                    cpu_cores=16,
+                    user_systemd_active=False,
+                    runtime_base=root,
+                    is_probe=True,
+                    override_mem_mb=over_mb,
+                    unsafe_ignore_cgroup=True,
+                )
+                self.assertEqual(cap1_mem_unsafe["memory_max_mb"], over_mb)
+                self.assertEqual(cap1_mem_unsafe["concurrency"], 1)
+
+            # Capped 2-slot regime: s_heavy_safe == 2 keeps env=2 and clamps xdg=3 to 2.
+            with mock.patch.dict(
+                os.environ,
+                {"XDG_CONFIG_HOME": str(populated_xdg)},
+                clear=False,
+            ):
+                os.environ.pop("ANNEAL_WORKTREE_CONCURRENCY", None)
+                cap2 = alr.probe_host_envelope(
+                    meminfo_path=meminfo,
+                    cgroup_root=capped_2slot_cg,
+                    proc_cgroup_path=proc_cg,
+                    cpu_cores=16,
+                    user_systemd_active=False,
+                    runtime_base=root,
+                    is_probe=True,
+                )
+                self.assertTrue(cap2["is_cg_capped"])
+                self.assertEqual(cap2["s_heavy_safe"], 2)
+                self.assertEqual(cap2["concurrency"], 2)
+                self.assertEqual(cap2["build_slots"], 2)
 
     def test_oom_retry_guard_blocks_watchdog_and_timeout(self) -> None:
         common = dict(

@@ -1891,17 +1891,18 @@ theorem polyChain_and_empty_intrinsic_narrow_clean_decidable :
 
 /-! ## Kernel axiom audit -/
 
-/-! Audits every declaration added to `Anneal.SepLogicLenses` (section `SliceWidePtrLenses`,
-starting at `WidePtrVal`) and `Anneal.MirLiftCore` (section `CallConeNarrowing`, starting at
-`CalleeEnv`), plus every witness in this file: no `unsafe` declaration; every module declaration
-is *constructive* (axioms within `{propext, Quot.sound}`, so no `Classical.choice`), and every
-witness uses only `{propext, Classical.choice, Quot.sound}` (so no `sorryAx` and no
-`Lean.ofReduceBool` / `native_decide` anywhere). Fails if fewer declarations than expected are
+/-! Audits every declaration in the bounded half-open intervals `[startLine, endLine)` for
+`Anneal.SepLogicLenses` (`[WidePtrVal, WidePtrVal.dataVal)`) and `Anneal.MirLiftCore`
+(`[CalleeEnv, updateBorrowPerm_tag)`), plus every witness in this file: no `unsafe` declaration;
+every module declaration is *constructive* (axioms within `{propext, Quot.sound}`, so no
+`Classical.choice`), and every witness uses only `{propext, Classical.choice, Quot.sound}` (so no
+`sorryAx` and no `Lean.ofReduceBool` / `native_decide` anywhere). Fails closed if any anchor is
+missing, belongs to the wrong module, is misordered, or if fewer declarations than expected are
 found.
 
 Non-vacuity: additionally fails unless *every* audited module theorem (public or private) is
 reachable from the concrete witnesses of this file, following used constants through auxiliary
-declarations (`match_`, `_f`, `proof_`) of both modules, so no new theorem is left
+declarations (`match_`, `_f`, `proof_`) of both modules, so no audited theorem is left
 uninstantiated. -/
 open Lean Elab Command in
 run_cmd do
@@ -1913,18 +1914,28 @@ run_cmd do
   let mut auditedSet : NameSet := {}
   let mut auditedThms : Array Name := #[]
   let mut modIdxs : Array ModuleIdx := #[]
-  for (modName, anchor, minCount) in
-      [(`Anneal.SepLogicLenses, ``Anneal.SepLogicLenses.WidePtrVal, 100),
-       (`Anneal.MirLiftCore, ``Anneal.MirLiftCore.CalleeEnv, 185)] do
+  for (modName, startAnchor, endAnchor, minCount) in
+      [(`Anneal.SepLogicLenses, ``Anneal.SepLogicLenses.WidePtrVal,
+          ``Anneal.SepLogicLenses.WidePtrVal.dataVal, 100),
+       (`Anneal.MirLiftCore, ``Anneal.MirLiftCore.CalleeEnv,
+          ``Anneal.MirLiftCore.updateBorrowPerm_tag, 185)] do
     let some modIdx := env.getModuleIdx? modName | throwError "module {modName} not imported"
     modIdxs := modIdxs.push modIdx
-    let some anchorRange ← findDeclarationRanges? anchor | throwError "no range for {anchor}"
-    let startLine := anchorRange.range.pos.line
+    unless env.getModuleIdxFor? startAnchor == some modIdx do
+      throwError "start anchor {startAnchor} does not belong to module {modName}"
+    unless env.getModuleIdxFor? endAnchor == some modIdx do
+      throwError "end anchor {endAnchor} does not belong to module {modName}"
+    let some startRange ← findDeclarationRanges? startAnchor | throwError "no range for {startAnchor}"
+    let some endRange ← findDeclarationRanges? endAnchor | throwError "no range for {endAnchor}"
+    let startLine := startRange.range.pos.line
+    let endLine := endRange.range.pos.line
+    if endLine ≤ startLine then
+      throwError "{modName}: invalid anchor range [{startLine}, {endLine}) for {startAnchor} .. {endAnchor}"
     let mut count : Nat := 0
     for (n, ci) in env.constants.map₁.toList do
       if env.getModuleIdxFor? n == some modIdx then
         if let some r ← findDeclarationRanges? n then
-          if r.range.pos.line ≥ startLine then
+          if startLine ≤ r.range.pos.line && r.range.pos.line < endLine then
             if ci.isUnsafe then throwError "unsafe declaration: {n}"
             let axs ← collectAxioms n
             for a in axs do
@@ -1935,6 +1946,10 @@ run_cmd do
             if ci matches .thmInfo _ then
               theorems := theorems + 1
               auditedThms := auditedThms.push n
+    unless auditedSet.contains startAnchor do
+      throwError "{modName}: start anchor {startAnchor} was not audited"
+    if auditedSet.contains endAnchor then
+      throwError "{modName}: exclusive end anchor {endAnchor} was unexpectedly audited"
     if count < minCount then
       throwError "{modName}: audited only {count} declarations (expected ≥ {minCount})"
     audited := audited + count
