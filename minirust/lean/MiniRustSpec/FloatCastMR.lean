@@ -74,6 +74,31 @@ represent: IEEE-754 bit patterns carried by `u32` / `i32` / `[u8; 4]`
    exactly those carriers free of UB, and the translated carrier body
    `transmute::<u32, i32>` runs under `Interp.steps` (`BasicMemory`) and
    `Interp.stepsTB` (`TreeBorrowsMemory`) to Anneal's bytes.
+5. **Strengthened fragment boundaries, layout-parametric transmutes, and signed
+   two's-complement carriers (§11).** Characterizes raw pointers vs. safe
+   references/boxes to floats (`translateTy`, `rawPtrPointeeOf`, `localDeclOk`),
+   whole-function float-cast rejection without float locals (`translateFn`,
+   `translateFnWithIntrinsics`, `inFragment`, `progInFragment` across entry and
+   callees, witnessed by `fcConstF32CastBody`), layout-table-parametric scalar
+   float transmutes (`fc_transmute_float_scalar_any_layouts`), the `f16`/`f128`
+   transmute-ok vs. numeric-float-cast-unsupported dichotomy, and the signed
+   two's-complement `encodeTwosComplement` ↔ `intValueOfBits` ↔ `intFromBits`
+   bijection across `Type.encode` and `transmuteM` (`BasicMemory` + `TreeBorrowsMemory`).
+6. **Symbolic MiniRust `[u8; 4]` & `[u8; 8]` byte-array transmutes (§12).**
+   Proves symbolic `Type.encode` / `Type.decode` / `Type.encodeM` / `Type.decodeM`
+   and bidirectional `transmute` + polymorphic `transmuteM` (`BasicMemory` and
+   `TreeBorrowsMemory`) between `u32`/`i32` and `[u8; 4]` (`∀ bits < 2^32`) and
+   between `u64`/`i64` and `[u8; 8]` (`∀ bits < 2^64`).
+7. **Uninitialized-byte UB, polymorphic size-mismatch UB, and pointer-provenance
+   transmute boundaries (§13).** Proves uninitialized-byte `Type.Union → Int`
+   transmute UB across `Interp.transmute` and polymorphic `transmuteM`,
+   polymorphic `evalCastOpM (.Transmute ...)` size-mismatch UB, and the full
+   pointer-provenance transmute matrix across MiniRust (`ptr → u64/i64/[u8; 8]`
+   provenance stripping vs. `ptr → *const T` provenance preservation vs.
+   `u64 → *const T` provenance-free synthesis, over both `BasicMemory` and
+   `TreeBorrowsMemory`) and Anneal (`ptr → [u8; 8]/i64` UB, `ptr → *const u8`
+   provenance-preserving `decodePtrBytesNoForge`, `f64 → *const u8` no-forge
+   scalar vs. `f64 → &u8` UB, and numeric float-cast `.unsupported`).
 
 Every public theorem is guarded by `#print axioms` at the end of the file.
 -/
@@ -127,7 +152,9 @@ def fcLayouts : LayoutTable :=
       fcByteArrayLayout 8,              -- 9: [u8; 8]
       fcPrimLayout 2 (.float 16),       -- 10: f16
       fcPrimLayout 16 (.float 128),     -- 11: f128
-      fcPrimLayout 8 (.pointer 0)] }    -- 12: *const u8
+      fcPrimLayout 8 (.pointer 0),      -- 12: *const u8
+      fcPrimLayout 2 (.int 16 false),   -- 13: u16
+      fcPrimLayout 16 (.int 128 false)] } -- 14: u128
 
 /-- `f32`. -/
 def fcF32Ty : Ty := { kind := .float .f32, layoutIdx := 1 }
@@ -2001,6 +2028,1189 @@ theorem fc_mr_transmute_byte_arrays :
         .ok (.Int 1) := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> rfl
 
+/-! ## 11. Strengthened fragment boundaries, layout-parametric transmutes, and signed two's-complement carriers -/
+
+/-- Safe pointers to floats (`&ft`, `&mut ft`, `Box<ft>`) are rejected by `translateTy`, whereas
+raw pointers (`*const ft`, `*mut ft`) erase their pointee to `PointerMetaKind::None` in
+`translateTy` yet are rejected by `rawPtrPointeeOf` and `localDeclOk` (hence by `inFragment`). -/
+theorem fc_ptr_ref_box_float_boundary (layouts : LayoutTable) (mutbl : MirAst.Mutability)
+    (ft : FloatTy) (idx : Nat) (declMut : MirAst.Mutability) (dbg : Option String) :
+    refTypeOf ⟨.ref mutbl (.float ft), idx⟩ = none ∧
+    translateTy layouts ⟨.ref mutbl (.float ft), idx⟩ = none ∧
+    boxTypeOf ⟨.adt "alloc::boxed::Box" [.float ft], idx⟩ = none ∧
+    translateTy layouts ⟨.rawPtr mutbl (.float ft), idx⟩ = some (.Ptr (.Raw .None)) ∧
+    rawPtrPointeeOf ⟨.rawPtr mutbl (.float ft), idx⟩ = none ∧
+    localDeclOk layouts (LocalDecl.mk declMut ⟨.rawPtr mutbl (.float ft), idx⟩ dbg) = false ∧
+    localDeclOk layouts (LocalDecl.mk declMut ⟨.float ft, idx⟩ dbg) = false := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩
+  · simp [localDeclOk, scalarTypeOf, isBoolTy, isOrderingTy, intBoolTupleOf, intTypeOf, intTyBytes,
+      isPtrTy, ptrPointeeOf, arrayTypeOf, tupleTypeOf]
+  · simp [localDeclOk, scalarTypeOf, isBoolTy, isOrderingTy, intBoolTupleOf, intTypeOf, intTyBytes,
+      isPtrTy, ptrPointeeOf, arrayTypeOf, tupleTypeOf]
+
+/-- Helper: `List.mapM f xs = none` whenever an element of `xs` maps to `none`. -/
+theorem fc_list_mapM_option_eq_none {α β : Type} (f : α → Option β) :
+    ∀ (xs : List α), (∃ x ∈ xs, f x = none) → xs.mapM f = none
+  | [], ⟨_, hx, _⟩ => by simp at hx
+  | x :: rest, ⟨y, hy, hfy⟩ => by
+    rcases List.mem_cons.mp hy with rfl | hmem
+    · simp [List.mapM_cons, hfy]
+    · have ih := fc_list_mapM_option_eq_none f rest ⟨y, hmem, hfy⟩
+      simp only [List.mapM_cons]
+      cases f x with
+      | none => rfl
+      | some _ => simp [ih]
+
+/-- `translateBlock` fails whenever any statement in the block fails `translateStatement`. -/
+theorem fc_translateBlock_eq_none_of_stmt (layouts : LayoutTable) (decls : List LocalDecl)
+    (bb : BasicBlockData) (h : ∃ s ∈ bb.statements, translateStatement decls s layouts = none) :
+    translateBlock layouts decls bb = none := by
+  unfold translateBlock
+  rw [fc_list_mapM_option_eq_none (translateStatement decls · layouts) bb.statements h]
+  rfl
+
+/-- `translateBlocks` fails whenever any block in the list fails `translateBlock`. -/
+theorem fc_translateBlocks_eq_none_of_block (layouts : LayoutTable) (decls : List LocalDecl) :
+    ∀ (i : Nat) (bbs : List BasicBlockData),
+      (∃ bb ∈ bbs, translateBlock layouts decls bb = none) →
+      translateBlocks layouts decls i bbs = none
+  | _, [], ⟨_, hbb, _⟩ => by simp at hbb
+  | i, bb :: rest, ⟨bb', hbb, hnone⟩ => by
+    rcases List.mem_cons.mp hbb with rfl | hmem
+    · simp [translateBlocks, hnone]
+    · have ih := fc_translateBlocks_eq_none_of_block layouts decls (i + 1) rest ⟨bb', hmem, hnone⟩
+      simp only [translateBlocks]
+      cases translateBlock layouts decls bb with
+      | none => rfl
+      | some _ => simp [ih]
+
+/-- **Local-free whole-function rejection**: `translateFn` and `inFragment` reject *every* MIR body
+containing a float-cast assignment (or transmute-to-float assignment) in any basic block, **even if
+the body declares zero float locals** (e.g. casting a float constant directly into an integer
+local). -/
+theorem fc_translateFn_and_inFragment_of_float_cast_stmt (body : CapturedMir)
+    (h : ∃ bb ∈ body.basicBlocks, ∃ s ∈ bb.statements,
+      ∃ (dst : Place) (k : CastKind) (op : Operand) (ty : Ty) (span : String),
+        fcIsFloatCastKind k = true ∧ s = ⟨.assign dst (.cast k op ty), span⟩) :
+    translateFn body = none ∧ inFragment body = false := by
+  obtain ⟨bb, hbb, s, hs, dst, k, op, ty, span, hk, rfl⟩ := h
+  have hstmt := fc_translateStatement_float_cast body.localDecls dst k hk op ty span body.layouts
+  have hblk := fc_translateBlock_eq_none_of_stmt body.layouts body.localDecls bb ⟨_, hs, hstmt⟩
+  have hblks := fc_translateBlocks_eq_none_of_block body.layouts body.localDecls 0 body.basicBlocks
+    ⟨bb, hbb, hblk⟩
+  have hfn : translateFn body = none := by
+    unfold translateFn
+    cases translateCallConv body.fnAbi.conv with
+    | none => rfl
+    | some _ =>
+      cases translateLocals body.layouts 0 body.localDecls with
+      | none => rfl
+      | some _ => simp [hblks]
+  exact ⟨hfn, by simp [inFragment, hfn]⟩
+
+/-- `translateBlocksWithIntrinsics` fails whenever any statement fails `translateStmtOrIntrinsic`. -/
+theorem fc_translateBlocksWithIntrinsics_eq_none (layouts : LayoutTable) (decls : List LocalDecl) :
+    ∀ (i nextFresh : Nat) (bbs : List BasicBlockData),
+      (∃ bb ∈ bbs, ∃ s ∈ bb.statements, translateStmtOrIntrinsic decls s layouts = none) →
+      translateBlocksWithIntrinsics layouts decls i nextFresh bbs = none
+  | _, _, [], ⟨_, hbb, _⟩ => by simp at hbb
+  | i, nf, bb :: rest, ⟨bb', hbb, hs⟩ => by
+    rcases List.mem_cons.mp hbb with rfl | hmem
+    · simp only [translateBlocksWithIntrinsics,
+        fc_list_mapM_option_eq_none (translateStmtOrIntrinsic decls · layouts) bb'.statements hs]
+      rfl
+    · simp only [translateBlocksWithIntrinsics]
+      cases bb.statements.mapM (translateStmtOrIntrinsic decls · layouts) with
+      | none => rfl
+      | some trs =>
+        cases translateTerminator layouts decls bb.terminator with
+        | none => rfl
+        | some term =>
+          simp [fc_translateBlocksWithIntrinsics_eq_none layouts decls (i + 1) _ rest
+            ⟨bb', hmem, hs⟩]
+
+/-- **`translateFnWithIntrinsics` rejects float locals and float-cast statements alike.** -/
+theorem fc_translateFnWithIntrinsics_float_rejected (body : CapturedMir) :
+    ((∃ d ∈ body.localDecls, ∃ (ft : FloatTy) (idx : Nat), d.ty = ⟨.float ft, idx⟩) →
+      translateFnWithIntrinsics body = none) ∧
+    ((∃ bb ∈ body.basicBlocks, ∃ s ∈ bb.statements,
+        ∃ (dst : Place) (k : CastKind) (op : Operand) (ty : Ty) (span : String),
+          fcIsFloatCastKind k = true ∧ s = ⟨.assign dst (.cast k op ty), span⟩) →
+      translateFnWithIntrinsics body = none) := by
+  refine ⟨fun hloc => ?_, fun hst => ?_⟩
+  · have hl := fc_translateLocals_eq_none_of_float body.layouts 0 body.localDecls hloc
+    unfold translateFnWithIntrinsics
+    cases translateCallConv body.fnAbi.conv <;> simp [hl]
+  · obtain ⟨bb, hbb, s, hs, dst, k, op, ty, span, hk, rfl⟩ := hst
+    have hso : translateStmtOrIntrinsic body.localDecls ⟨.assign dst (.cast k op ty), span⟩
+        body.layouts = none := by
+      have hst0 := fc_translateStatement_float_cast body.localDecls dst k hk op ty span body.layouts
+      cases k <;> simp [fcIsFloatCastKind] at hk <;> simp [translateStmtOrIntrinsic, hst0]
+    have hblks := fc_translateBlocksWithIntrinsics_eq_none body.layouts body.localDecls 0
+      body.basicBlocks.length body.basicBlocks ⟨bb, hbb, _, hs, hso⟩
+    unfold translateFnWithIntrinsics
+    cases translateCallConv body.fnAbi.conv with
+    | none => rfl
+    | some _ =>
+      cases translateLocals body.layouts 0 body.localDecls with
+      | none => rfl
+      | some _ => simp [hblks]
+
+/-- **`progInFragment` rejects float locals and float-cast statements in *any* function of
+`entry :: callees` (not only `entry`).** -/
+theorem fc_progInFragment_any_fn_rejected (entry : CapturedMir) (callees : List CapturedMir)
+    (b : CapturedMir) (hb : b ∈ entry :: callees)
+    (h : (∃ d ∈ b.localDecls, ∃ (ft : FloatTy) (idx : Nat), d.ty = ⟨.float ft, idx⟩) ∨
+      (∃ bb ∈ b.basicBlocks, ∃ s ∈ bb.statements,
+        ∃ (dst : Place) (k : CastKind) (op : Operand) (ty : Ty) (span : String),
+          fcIsFloatCastKind k = true ∧ s = ⟨.assign dst (.cast k op ty), span⟩)) :
+    progInFragment entry callees = false := by
+  have hfn : translateFnInProg (fnNameMap entry callees) b = none := by
+    rcases h with ⟨d, hd, ft, idx, hty⟩ | ⟨bb, hbb, s, hs, dst, k, op, ty, span, hk, rfl⟩
+    · have hl := fc_translateLocals_eq_none_of_float b.layouts 0 b.localDecls ⟨d, hd, ft, idx, hty⟩
+      unfold translateFnInProg
+      cases translateCallConv b.fnAbi.conv <;> simp [hl]
+    · have hsr : translateStmtResult b.localDecls ⟨.assign dst (.cast k op ty), span⟩ b.layouts =
+          none := by
+        simp [translateStmtResult,
+          fc_translateStatement_float_cast b.localDecls dst k hk op ty span b.layouts]
+      have hblks : ∀ (i nc : Nat) (bbs : List BasicBlockData),
+          bb ∈ bbs → translateBlocksInProg (fnNameMap entry callees) b.layouts b.localDecls i nc
+            bbs = none := by
+        intro i nc bbs hmem
+        induction bbs generalizing i nc with
+        | nil => simp at hmem
+        | cons bb0 rest ih =>
+          rcases List.mem_cons.mp hmem with heq | hrest
+          · subst heq
+            simp only [translateBlocksInProg,
+              fc_list_mapM_option_eq_none (translateStmtResult b.localDecls · b.layouts)
+                bb.statements ⟨_, hs, hsr⟩]
+            rfl
+          · simp only [translateBlocksInProg]
+            cases bb0.statements.mapM (translateStmtResult b.localDecls · b.layouts) with
+            | none => rfl
+            | some rs =>
+              simp only [bind, Option.bind]
+              cases translateTerminatorInProg (fnNameMap entry callees) b.layouts b.localDecls
+                  (splitStmts (bbName i) [] nc rs).2.2.2 bb0.terminator with
+              | none => rfl
+              | some t => simp [ih (i + 1) t.2.1 hrest]
+      unfold translateFnInProg
+      cases translateCallConv b.fnAbi.conv with
+      | none => rfl
+      | some _ =>
+        cases translateLocals b.layouts 0 b.localDecls with
+        | none => rfl
+        | some _ => simp [hblks 0 (b.basicBlocks.length + 1) b.basicBlocks hbb]
+  have hpfns : ∀ (idx : Nat) (fns : List CapturedMir),
+      b ∈ fns → translateProgFns (fnNameMap entry callees) idx fns = none := by
+    intro idx fns hmem
+    induction fns generalizing idx with
+    | nil => simp at hmem
+    | cons b0 rest ih =>
+      rcases List.mem_cons.mp hmem with rfl | hrest
+      · simp [translateProgFns, hfn]
+      · simp only [translateProgFns]
+        cases translateFnInProg (fnNameMap entry callees) b0 with
+        | none => rfl
+        | some _ => simp [ih (idx + 1) hrest]
+  have hprog : translateProg entry callees = none := by
+    simp [translateProg, hpfns 0 (entry :: callees) hb]
+  simp [progInFragment, hprog]
+
+/-- Concrete float-local-free witness: `fn const_f32_as_i32(_x: u32) -> i32 { -3.14159f32 as i32 }`
+has only integer locals (`translateLocals` succeeds!), executes cleanly in Anneal to `-3`, and is
+nonetheless rejected at the statement/block level by `translateFn` and `inFragment`. -/
+def fcConstF32CastBody : CapturedMir :=
+  fcBody "float_cast::const_f32_as_i32" [fcDecl fcI32Ty, fcDecl fcU32Ty]
+    [.assign (local_ 0) (.cast .floatToInt
+      (.constant { ty := fcF32Ty, val := .scalar (.int ⟨0xC0490FDB, 4⟩) }) fcI32Ty)]
+
+theorem fc_const_f32_cast_witness :
+    (translateLocals fcConstF32CastBody.layouts 0 fcConstF32CastBody.localDecls).isSome = true ∧
+    (∃ mem, ReachesRet (mirCallTree fcConstF32CastBody [.scalar ⟨0, 4⟩]) []
+      (.normal (.scalar ⟨0xFFFFFFFD, 4⟩, mem))) ∧
+    MirNoUBTree (mirCallTree fcConstF32CastBody [.scalar ⟨0, 4⟩]) ∧
+    translateFn fcConstF32CastBody = none ∧
+    inFragment fcConstF32CastBody = false :=
+  ⟨rfl, ⟨_, runA_sound fcConstF32CastBody 10 _ _ _ rfl⟩,
+   runA_noUB fcConstF32CastBody 10 _ _ _ rfl, rfl, rfl⟩
+
+/-- `u16` and `u128` types in `fcLayouts` (for the `f16` / `f128` transmute dichotomy). -/
+def fcU16Ty : Ty := { kind := .uint .u16, layoutIdx := 13 }
+def fcU128Ty : Ty := { kind := .uint .u128, layoutIdx := 14 }
+
+/-- Layout-parametric `f32 ↔ u32 / i32` and `f64 ↔ u64 / i64` decoding for *any* `LayoutTable`!
+Because `normalizeCodecTy` rewrites `.float .f32` to `{ kind := .uint .u32, layoutIdx := 0 }` and
+`.float .f64` to `{ kind := .uint .u64, layoutIdx := 0 }`, decoding `encodeLittleEndianBytes` at
+any `Ty` with `.kind ∈ {.float .f32, .uint .u32, .int .i32}` (or `.f64 / .u64 / .i64`) is completely
+independent of `layouts` and `ty.layoutIdx`! -/
+theorem fc_decodeTyped_any_layouts (layouts : LayoutTable) (idx : Nat) :
+    (∀ bits < 2 ^ 32,
+      decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.float .f32, idx⟩
+          (encodeLittleEndianBytes bits 4 none) = some (.scalar ⟨bits, 4⟩) ∧
+      decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.uint .u32, idx⟩
+          (encodeLittleEndianBytes bits 4 none) = some (.scalar ⟨bits, 4⟩) ∧
+      decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.int .i32, idx⟩
+          (encodeLittleEndianBytes bits 4 none) = some (.scalar ⟨bits, 4⟩)) ∧
+    (∀ bits < 2 ^ 64,
+      decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.float .f64, idx⟩
+          (encodeLittleEndianBytes bits 8 none) = some (.scalar ⟨bits, 8⟩) ∧
+      decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.uint .u64, idx⟩
+          (encodeLittleEndianBytes bits 8 none) = some (.scalar ⟨bits, 8⟩) ∧
+      decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.int .i64, idx⟩
+          (encodeLittleEndianBytes bits 8 none) = some (.scalar ⟨bits, 8⟩)) := by
+  refine ⟨fun bits h32 => ⟨?_, ?_, ?_⟩, fun bits h64 => ⟨?_, ?_, ?_⟩⟩
+  · change (match abstractBytesHaveProv (encodeLittleEndianBytes bits 4 none) with
+      | true => none
+      | false =>
+        match Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits 4 none)) 4 with
+        | false => none
+        | true =>
+          match decodeScalarBytes (encodeLittleEndianBytes bits 4 none) false with
+          | some (sv, _) => some (Value.scalar sv)
+          | none => none) = _
+    rw [fc_abstractBytesHaveProv_encode_none, fc_seqLength_encodeLittleEndianBytes,
+      fc_decodeScalarBytes_encode none false 3 bits (fc_lt_256_pow_4 h32)]
+  · change (match abstractBytesHaveProv (encodeLittleEndianBytes bits 4 none) with
+      | true => none
+      | false =>
+        match Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits 4 none)) 4 with
+        | false => none
+        | true =>
+          match decodeScalarBytes (encodeLittleEndianBytes bits 4 none) false with
+          | some (sv, _) => some (Value.scalar sv)
+          | none => none) = _
+    rw [fc_abstractBytesHaveProv_encode_none, fc_seqLength_encodeLittleEndianBytes,
+      fc_decodeScalarBytes_encode none false 3 bits (fc_lt_256_pow_4 h32)]
+  · change (match abstractBytesHaveProv (encodeLittleEndianBytes bits 4 none) with
+      | true => none
+      | false =>
+        match Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits 4 none)) 4 with
+        | false => none
+        | true =>
+          match decodeScalarBytes (encodeLittleEndianBytes bits 4 none) true with
+          | some (sv, _) => some (Value.scalar sv)
+          | none => none) = _
+    rw [fc_abstractBytesHaveProv_encode_none, fc_seqLength_encodeLittleEndianBytes,
+      fc_decodeScalarBytes_encode none true 3 bits (fc_lt_256_pow_4 h32)]
+  · change (match abstractBytesHaveProv (encodeLittleEndianBytes bits 8 none) with
+      | true => none
+      | false =>
+        match Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits 8 none)) 8 with
+        | false => none
+        | true =>
+          match decodeScalarBytes (encodeLittleEndianBytes bits 8 none) false with
+          | some (sv, _) => some (Value.scalar sv)
+          | none => none) = _
+    rw [fc_abstractBytesHaveProv_encode_none, fc_seqLength_encodeLittleEndianBytes,
+      fc_decodeScalarBytes_encode none false 7 bits (fc_lt_256_pow_8 h64)]
+  · change (match abstractBytesHaveProv (encodeLittleEndianBytes bits 8 none) with
+      | true => none
+      | false =>
+        match Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits 8 none)) 8 with
+        | false => none
+        | true =>
+          match decodeScalarBytes (encodeLittleEndianBytes bits 8 none) false with
+          | some (sv, _) => some (Value.scalar sv)
+          | none => none) = _
+    rw [fc_abstractBytesHaveProv_encode_none, fc_seqLength_encodeLittleEndianBytes,
+      fc_decodeScalarBytes_encode none false 7 bits (fc_lt_256_pow_8 h64)]
+  · change (match abstractBytesHaveProv (encodeLittleEndianBytes bits 8 none) with
+      | true => none
+      | false =>
+        match Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits 8 none)) 8 with
+        | false => none
+        | true =>
+          match decodeScalarBytes (encodeLittleEndianBytes bits 8 none) true with
+          | some (sv, _) => some (Value.scalar sv)
+          | none => none) = _
+    rw [fc_abstractBytesHaveProv_encode_none, fc_seqLength_encodeLittleEndianBytes,
+      fc_decodeScalarBytes_encode none true 7 bits (fc_lt_256_pow_8 h64)]
+
+/-- **Layout-parametric Anneal `f32`/`f64` ↔ `u32`/`i32`/`u64`/`i64` transmute**: for *any*
+`layouts : LayoutTable` and `decls : List LocalDecl` (not restricted to `fcLayouts`) that resolve
+`srcTy` and `dstTy` to 4-byte (`f32`/`u32`/`i32`) or 8-byte (`f64`/`u64`/`i64`) types, `evalRvalue
+(.cast .transmute op dstTy)` preserves every in-range bit pattern unchanged! -/
+theorem fc_transmute_float_scalar_any_layouts
+    {locals locals' : List LocalSlot} {op : Operand} {mem : Memory}
+    {decls : List LocalDecl} {layouts : LayoutTable} {srcTy dstTy : Ty} :
+    (∀ {bits : Nat}, bits < 2 ^ 32 →
+      evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals decls
+          mem.callStack = .ok (.scalar ⟨bits, 4⟩) locals' →
+      operandTy decls layouts op = some srcTy →
+      tyByteSize decls layouts (resolveTyWithLocalDecls decls layouts srcTy) = some 4 →
+      tyByteSize decls layouts (resolveTyWithLocalDecls decls layouts dstTy) = some 4 →
+      ((resolveTyWithLocalDecls decls layouts srcTy).kind = .float .f32 ∨
+       (resolveTyWithLocalDecls decls layouts srcTy).kind = .uint .u32 ∨
+       (resolveTyWithLocalDecls decls layouts srcTy).kind = .int .i32) →
+      ((resolveTyWithLocalDecls decls layouts dstTy).kind = .float .f32 ∨
+       (resolveTyWithLocalDecls decls layouts dstTy).kind = .uint .u32 ∨
+       (resolveTyWithLocalDecls decls layouts dstTy).kind = .int .i32) →
+      evalRvalue locals (.cast .transmute op dstTy) mem decls layouts =
+        .ok (.scalar ⟨bits, 4⟩) locals' mem) ∧
+    (∀ {bits : Nat}, bits < 2 ^ 64 →
+      evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals decls
+          mem.callStack = .ok (.scalar ⟨bits, 8⟩) locals' →
+      operandTy decls layouts op = some srcTy →
+      tyByteSize decls layouts (resolveTyWithLocalDecls decls layouts srcTy) = some 8 →
+      tyByteSize decls layouts (resolveTyWithLocalDecls decls layouts dstTy) = some 8 →
+      ((resolveTyWithLocalDecls decls layouts srcTy).kind = .float .f64 ∨
+       (resolveTyWithLocalDecls decls layouts srcTy).kind = .uint .u64 ∨
+       (resolveTyWithLocalDecls decls layouts srcTy).kind = .int .i64) →
+      ((resolveTyWithLocalDecls decls layouts dstTy).kind = .float .f64 ∨
+       (resolveTyWithLocalDecls decls layouts dstTy).kind = .uint .u64 ∨
+       (resolveTyWithLocalDecls decls layouts dstTy).kind = .int .i64) →
+      evalRvalue locals (.cast .transmute op dstTy) mem decls layouts =
+        .ok (.scalar ⟨bits, 8⟩) locals' mem) := by
+  refine ⟨fun {bits} h32 hop hty hssz hdsz hsk hdk => ?_,
+    fun {bits} h64 hop hty hssz hdsz hsk hdk => ?_⟩
+  · have henc : encodeByteCastSourceBytes layouts (resolveTyWithLocalDecls decls layouts srcTy)
+        (.scalar ⟨bits, 4⟩) = some (encodeLittleEndianBytes bits 4 none) := by
+      cases hrs : resolveTyWithLocalDecls decls layouts srcTy with
+      | mk ks ls =>
+        rw [hrs] at hsk; rcases hsk with hk | hk | hk <;> simp only at hk <;> subst hk <;> rfl
+    have hdec : decodeTypedValueFromBytes defaultCodecFuel layouts
+        (resolveTyWithLocalDecls decls layouts dstTy)
+        (encodeLittleEndianBytes bits 4 none) = some (.scalar ⟨bits, 4⟩) := by
+      cases hrd : resolveTyWithLocalDecls decls layouts dstTy with
+      | mk kd ld =>
+        obtain ⟨hf, hu, hi⟩ := (fc_decodeTyped_any_layouts layouts ld).1 bits h32
+        rw [hrd] at hdk; rcases hdk with hk | hk | hk <;> simp only at hk <;> subst hk
+        · exact hf
+        · exact hu
+        · exact hi
+    show evalByteCast locals op dstTy mem decls layouts = _
+    rw [fc_evalByteCast_of_encode locals locals' op mem decls layouts _ srcTy dstTy 4 _
+      hop hdsz hty hssz henc (fc_seqLength_encodeLittleEndianBytes none 4 bits), hdec]
+  · have henc : encodeByteCastSourceBytes layouts (resolveTyWithLocalDecls decls layouts srcTy)
+        (.scalar ⟨bits, 8⟩) = some (encodeLittleEndianBytes bits 8 none) := by
+      cases hrs : resolveTyWithLocalDecls decls layouts srcTy with
+      | mk ks ls =>
+        rw [hrs] at hsk; rcases hsk with hk | hk | hk <;> simp only at hk <;> subst hk <;> rfl
+    have hdec : decodeTypedValueFromBytes defaultCodecFuel layouts
+        (resolveTyWithLocalDecls decls layouts dstTy)
+        (encodeLittleEndianBytes bits 8 none) = some (.scalar ⟨bits, 8⟩) := by
+      cases hrd : resolveTyWithLocalDecls decls layouts dstTy with
+      | mk kd ld =>
+        obtain ⟨hf, hu, hi⟩ := (fc_decodeTyped_any_layouts layouts ld).2 bits h64
+        rw [hrd] at hdk; rcases hdk with hk | hk | hk <;> simp only at hk <;> subst hk
+        · exact hf
+        · exact hu
+        · exact hi
+    show evalByteCast locals op dstTy mem decls layouts = _
+    rw [fc_evalByteCast_of_encode locals locals' op mem decls layouts _ srcTy dstTy 8 _
+      hop hdsz hty hssz henc (fc_seqLength_encodeLittleEndianBytes none 8 bits), hdec]
+
+/-- **`f16` / `f128` transmute vs. numeric float-cast dichotomy**: in Anneal, numeric `as` casts
+(`CastKind.{floatToInt, intToFloat, floatToFloat}`) fail closed (`.unsupported`) on `f16` and `f128`,
+whereas byte-level `CastKind.transmute` (`f16 ↔ u16` at 2 bytes, `f128 ↔ u128` at 16 bytes via
+`byteCodecScalarKind`) succeeds and preserves every 16-bit and 128-bit pattern! -/
+theorem fc_f16_f128_transmute_vs_float_cast
+    {locals locals' : List LocalSlot} {op : Operand} {mem : Memory} {decls : List LocalDecl} :
+    (∀ {bits : Nat}, bits < 2 ^ 16 →
+      evalOperand locals op mem.borrows mem.globals fcLayouts mem.callerLocals decls
+          mem.callStack = .ok (.scalar ⟨bits, 2⟩) locals' →
+      operandTy decls fcLayouts op = some fcF16Ty →
+      evalRvalue locals (.cast .transmute op fcU16Ty) mem decls fcLayouts =
+          .ok (.scalar ⟨bits, 2⟩) locals' mem ∧
+      evalRvalue locals (.cast .floatToInt op fcI32Ty) mem decls fcLayouts = .unsupported ∧
+      evalRvalue locals (.cast .floatToFloat op fcF32Ty) mem decls fcLayouts = .unsupported) ∧
+    (∀ {bits : Nat}, bits < 2 ^ 128 →
+      evalOperand locals op mem.borrows mem.globals fcLayouts mem.callerLocals decls
+          mem.callStack = .ok (.scalar ⟨bits, 16⟩) locals' →
+      operandTy decls fcLayouts op = some fcF128Ty →
+      evalRvalue locals (.cast .transmute op fcU128Ty) mem decls fcLayouts =
+          .ok (.scalar ⟨bits, 16⟩) locals' mem ∧
+      evalRvalue locals (.cast .floatToInt op fcI32Ty) mem decls fcLayouts = .unsupported ∧
+      evalRvalue locals (.cast .floatToFloat op fcF64Ty) mem decls fcLayouts = .unsupported) := by
+  refine ⟨fun {bits} h16 hop hty => ?_, fun {bits} h128 hop hty => ?_⟩
+  · have hdec : decodeTypedValueFromBytes defaultCodecFuel fcLayouts
+        (resolveTyWithLocalDecls decls fcLayouts fcU16Ty)
+        (encodeLittleEndianBytes bits 2 none) = some (.scalar ⟨bits, 2⟩) := by
+      change (match abstractBytesHaveProv (encodeLittleEndianBytes bits 2 none) with
+        | true => none
+        | false =>
+          match Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits 2 none)) 2 with
+          | false => none
+          | true =>
+            match decodeScalarBytes (encodeLittleEndianBytes bits 2 none) false with
+            | some (sv, _) => some (Value.scalar sv)
+            | none => none) = _
+      rw [fc_abstractBytesHaveProv_encode_none, fc_seqLength_encodeLittleEndianBytes,
+        fc_decodeScalarBytes_encode none false 1 bits (by simpa using h16)]
+    exact ⟨fc_evalRvalue_transmute_via_le hop hty rfl rfl rfl hdec,
+      ((fc_evalRvalue_float_cast_unsupported_of_no_format (dstTy := fcI32Ty) hop hty).1
+        fc_ieeeFormatOfTy_f16).1,
+      ((fc_evalRvalue_float_cast_unsupported_of_no_format (dstTy := fcF32Ty) hop hty).1
+        fc_ieeeFormatOfTy_f16).2⟩
+  · have hdec : decodeTypedValueFromBytes defaultCodecFuel fcLayouts
+        (resolveTyWithLocalDecls decls fcLayouts fcU128Ty)
+        (encodeLittleEndianBytes bits 16 none) = some (.scalar ⟨bits, 16⟩) := by
+      change (match abstractBytesHaveProv (encodeLittleEndianBytes bits 16 none) with
+        | true => none
+        | false =>
+          match Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits 16 none)) 16 with
+          | false => none
+          | true =>
+            match decodeScalarBytes (encodeLittleEndianBytes bits 16 none) false with
+            | some (sv, _) => some (Value.scalar sv)
+            | none => none) = _
+      rw [fc_abstractBytesHaveProv_encode_none, fc_seqLength_encodeLittleEndianBytes,
+        fc_decodeScalarBytes_encode none false 15 bits (by simpa using h128)]
+    exact ⟨fc_evalRvalue_transmute_via_le hop hty rfl rfl rfl hdec,
+      ((fc_evalRvalue_float_cast_unsupported_of_no_format (dstTy := fcI32Ty) hop hty).1
+        fc_ieeeFormatOfTy_f128).1,
+      ((fc_evalRvalue_float_cast_unsupported_of_no_format (dstTy := fcF64Ty) hop hty).1
+        fc_ieeeFormatOfTy_f128).2⟩
+
+/-- **Signed two's-complement carrier bijection (`encodeTwosComplement` ↔ `intValueOfBits` ↔
+`intFromBits`)**: for every signed integer `z` in `i32` or `i64` bounds (`n ∈ {1, 2, 4, 8}`),
+`encodeTwosComplement (8 * n) z` produces the unique `< 2 ^ (8 * n)` bit pattern whose Anneal
+`intValueOfBits` and MiniRust `intFromBits` both equal `z`, and MiniRust's `Type.encode` /
+`transmuteM` (`BasicMemory` and `TreeBorrowsMemory`) maps `.Int z` at `i32`/`i64` to the exact
+same unsigned bit pattern `encodeTwosComplement (8 * n) z` at `u32`/`u64`. -/
+theorem fc_encodeTwosComplement_carrier_bridge (n : Nat)
+    (hn : n = 1 ∨ n = 2 ∨ n = 4 ∨ n = 8) (z : Int)
+    (hlo : -((2 ^ (8 * n - 1) : Nat) : Int) ≤ z)
+    (hhi : z ≤ ((2 ^ (8 * n - 1) : Nat) : Int) - 1) :
+    encodeTwosComplement (8 * n) z < 2 ^ (8 * n) ∧
+    intValueOfBits true (8 * n) (encodeTwosComplement (8 * n) z) = z ∧
+    intFromBits (encodeTwosComplement (8 * n) z) ⟨.Signed, ⟨n⟩⟩ = z ∧
+    Type.encode (.Int ⟨.Signed, ⟨n⟩⟩) (.Int z) =
+      .ok ((encodeLittleEndianBytes (encodeTwosComplement (8 * n) z) n none).map fcByteToMR) ∧
+    transmuteM (M := BM) (.Int z) (.Int ⟨.Signed, ⟨n⟩⟩) (.Int ⟨.Unsigned, ⟨n⟩⟩) =
+      .ok (.Int (encodeTwosComplement (8 * n) z : Int)) ∧
+    transmuteM (M := TBM) (.Int z) (.Int ⟨.Signed, ⟨n⟩⟩) (.Int ⟨.Unsigned, ⟨n⟩⟩) =
+      .ok (.Int (encodeTwosComplement (8 * n) z : Int)) := by
+  have hgood : GoodSize n := by rcases hn with rfl | rfl | rfl | rfl <;> unfold GoodSize <;> omega
+  have hlt : encodeTwosComplement (8 * n) z < 2 ^ (8 * n) := by
+    rcases hn with rfl | rfl | rfl | rfl <;>
+      simp only [encodeTwosComplement, Nat.reduceMul, Nat.reducePow, Nat.reduceSub] at hlo hhi ⊢ <;>
+      omega
+  have hiv : intValueOfBits true (8 * n) (encodeTwosComplement (8 * n) z) = z := by
+    rcases hn with rfl | rfl | rfl | rfl <;>
+      simp only [encodeTwosComplement, intValueOfBits, Nat.reduceMul, Nat.reducePow,
+        Nat.reduceSub, true_and] at hlo hhi ⊢ <;>
+      split <;> omega
+  have hifb : intFromBits (encodeTwosComplement (8 * n) z) ⟨.Signed, ⟨n⟩⟩ = z := by
+    have h0 := fc_intValueOfBits_eq_intFromBits true n (encodeTwosComplement (8 * n) z) hlt
+    simp only [↓reduceIte] at h0
+    exact h0.symm.trans hiv
+  have hu : intFromBits (encodeTwosComplement (8 * n) z) ⟨.Unsigned, ⟨n⟩⟩ =
+      (encodeTwosComplement (8 * n) z : Int) := rfl
+  have henc := fc_mr_encode_eq_anneal .Signed n (encodeTwosComplement (8 * n) z) hgood hlt
+  have hbm := fc_mrBM_transmute_int .Signed .Unsigned n (encodeTwosComplement (8 * n) z) hgood hlt
+    none
+  have htb := fc_mrTB_transmute_int .Signed .Unsigned n (encodeTwosComplement (8 * n) z) hgood hlt
+    none
+  rw [hifb] at henc
+  rw [hifb, hu] at hbm htb
+  exact ⟨hlt, hiv, hifb, henc, hbm, htb⟩
+
+/-! ## 12. Symbolic MiniRust `[u8; 4]` & `[u8; 8]` `Type.encode`/`Type.decode` & `transmuteM` -/
+
+/-- Polymorphic MiniRust `[u8; n]` element values of the `n` little-endian bytes of `bits`, for
+any memory model `M`. -/
+def fcLeByteValsMRM {M : Type} [Gen.Memory M] (bits : Nat) : Nat → List (Gen.Value M)
+  | 0 => []
+  | n + 1 => .Int ((bits % 256 : Nat) : Int) :: fcLeByteValsMRM (bits / 256) n
+
+/-- Raw definitional output of `Type.decodeM` / `Type.decode` on `n` little-endian `u8` bytes
+before simplifying `(UInt8.ofNat (k % 256)).toNat + 256 * 0 = k % 256`. -/
+def fcLeBytesDecodeMRM {M : Type} [Gen.Memory M] (bits : Nat) : Nat → List (Gen.Value M)
+  | 0 => []
+  | n + 1 =>
+    .Int (((UInt8.ofNat (bits % 256)).toNat + 256 * 0 : Nat) : Int) ::
+      fcLeBytesDecodeMRM (bits / 256) n
+
+theorem fc_leByteValsMRM_eq_BM (bits n : Nat) :
+    fcLeByteValsMRM (M := BM) bits n = fcLeByteValsMR bits n := by
+  induction n generalizing bits with
+  | zero => rfl
+  | succ k ih => simp [fcLeByteValsMRM, fcLeByteValsMR, ih]
+
+theorem fc_uint8_mod_toNat (k : Nat) : (UInt8.ofNat (k % 256)).toNat = k % 256 := by
+  show (UInt8.ofNat (k % 256)).toBitVec.toNat = k % 256
+  rw [fc_uint8_ofNat_toNat, Nat.mod_mod]
+
+theorem fc_leBytesDecodeMRM_eq {M : Type} [Gen.Memory M] (bits n : Nat) :
+    fcLeBytesDecodeMRM (M := M) bits n = fcLeByteValsMRM (M := M) bits n := by
+  induction n generalizing bits with
+  | zero => rfl
+  | succ k ih =>
+    simp only [fcLeBytesDecodeMRM, fcLeByteValsMRM, Nat.mul_zero, Nat.add_zero,
+      fc_uint8_mod_toNat, ih]
+
+theorem fc_u8_inBounds_mod (k : Nat) :
+    inBounds ((k % 256 : Nat) : Int) .Unsigned ⟨1⟩ = true := by
+  unfold inBounds Size.bits
+  simp only [Nat.reduceMul, Bool.and_eq_true, decide_eq_true_eq]
+  omega
+
+theorem fc_u8_emod_toNat_mod (k : Nat) :
+    (((k % 256 : Nat) : Int) % (2 : Int) ^ Size.bits ⟨1⟩).toNat = k % 256 := by
+  simp only [Size.bits, Nat.reduceMul]
+  omega
+
+theorem fc_u8_encodeIntM_mod {M : Type} [Gen.Memory M] (k : Nat) :
+    Type.encodeIntM (M := M) fcU8It (.Int ((k % 256 : Nat) : Int)) =
+      .ok [.Init (UInt8.ofNat (k % 256)) none] := by
+  simp only [Type.encodeIntM, fcU8It, Endianness.encode, x86_64.ENDIANNESS,
+    fc_u8_inBounds_mod k, ↓reduceIte, fc_u8_emod_toNat_mod k, leBytes, Nat.mod_mod, List.map,
+    pure, Except.pure]
+
+theorem fc_u8_encodeInt_mod (k : Nat) :
+    Type.encodeInt fcU8It (.Int ((k % 256 : Nat) : Int)) =
+      .ok [.Init (UInt8.ofNat (k % 256)) none] := by
+  simp only [Type.encodeInt, fcU8It, Endianness.encode, x86_64.ENDIANNESS,
+    fc_u8_inBounds_mod k, ↓reduceIte, fc_u8_emod_toNat_mod k, leBytes, Nat.mod_mod, List.map,
+    pure, Except.pure]
+
+theorem fc_layout_u8 : Type.layout (.Int fcU8It) = .ok (.Sized ⟨1⟩ ⟨1⟩) := rfl
+
+/-- **Symbolic MiniRust `Type.encodeM` and `Type.decodeM` for `[u8; 4]` and `[u8; 8]`**, for
+*every* memory model `M` (`BasicMemory` and `TreeBorrowsMemory`) and *every* bit pattern `bits`:
+encoding `fcLeByteValsMRM bits n` produces the exact little-endian `Init b none` byte sequence, and
+decoding those bytes recovers `fcLeByteValsMRM bits n`. -/
+theorem fc_mrM_array_u8_encode_decode {M : Type} [Gen.Memory M] [MemoryOps M] (bits : Nat) :
+    Type.encodeM (M := M) (.Array (.Int fcU8It) 4) (.Tuple (fcLeByteValsMRM bits 4)) =
+      .ok ((leBytes bits 4).map (fun b => .Init b none)) ∧
+    Type.decodeM (M := M) (.Array (.Int fcU8It) 4)
+        ((leBytes bits 4).map (fun b => .Init b none)) =
+      .ok (some (.Tuple (fcLeByteValsMRM bits 4))) ∧
+    Type.encodeM (M := M) (.Array (.Int fcU8It) 8) (.Tuple (fcLeByteValsMRM bits 8)) =
+      .ok ((leBytes bits 8).map (fun b => .Init b none)) ∧
+    Type.decodeM (M := M) (.Array (.Int fcU8It) 8)
+        ((leBytes bits 8).map (fun b => .Init b none)) =
+      .ok (some (.Tuple (fcLeByteValsMRM bits 8))) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · dsimp only [fcLeByteValsMRM, Type.encodeM, List.length, List.mapM, List.mapM.loop,
+      bind, Except.bind, pure, Except.pure, List.reverse, List.reverseAux]
+    simp only [ne_eq, fc_u8_encodeIntM_mod, fc_layout_u8, LayoutStrategy.expect_size,
+      List.length_singleton, leBytes, List.map]
+    rfl
+  · rw [← fc_leBytesDecodeMRM_eq (M := M) bits 4]; rfl
+  · dsimp only [fcLeByteValsMRM, Type.encodeM, List.length, List.mapM, List.mapM.loop,
+      bind, Except.bind, pure, Except.pure, List.reverse, List.reverseAux]
+    simp only [ne_eq, fc_u8_encodeIntM_mod, fc_layout_u8, LayoutStrategy.expect_size,
+      List.length_singleton, leBytes, List.map]
+    rfl
+  · rw [← fc_leBytesDecodeMRM_eq (M := M) bits 8]; rfl
+
+/-- Non-polymorphic `Type.encode` / `Type.decode` on `[u8; 4]` and `[u8; 8]` equals Anneal's
+`encodeLittleEndianBytes` image under `fcByteToMR`, byte for byte. -/
+theorem fc_mr_array_u8_eq_anneal (bits : Nat) (prov : Option (Nat × Nat)) :
+    Type.encode (.Array (.Int fcU8It) 4) (.Tuple (fcLeByteValsMR bits 4)) =
+      .ok ((encodeLittleEndianBytes bits 4 none).map fcByteToMR) ∧
+    Type.decode (.Array (.Int fcU8It) 4)
+        ((encodeLittleEndianBytes bits 4 prov).map fcByteToMR) =
+      .ok (some (.Tuple (fcLeByteValsMR bits 4))) ∧
+    Type.encode (.Array (.Int fcU8It) 8) (.Tuple (fcLeByteValsMR bits 8)) =
+      .ok ((encodeLittleEndianBytes bits 8 none).map fcByteToMR) ∧
+    Type.decode (.Array (.Int fcU8It) 8)
+        ((encodeLittleEndianBytes bits 8 prov).map fcByteToMR) =
+      .ok (some (.Tuple (fcLeByteValsMR bits 8))) := by
+  rw [fc_map_encodeLittleEndianBytes .Unsigned none 4 bits,
+    fc_map_encodeLittleEndianBytes .Unsigned prov 4 bits,
+    fc_map_encodeLittleEndianBytes .Unsigned none 8 bits,
+    fc_map_encodeLittleEndianBytes .Unsigned prov 8 bits]
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · dsimp only [fcLeByteValsMR, Type.encode, List.length, List.mapM, List.mapM.loop,
+      bind, Except.bind, pure, Except.pure, List.reverse, List.reverseAux]
+    simp only [ne_eq, fc_u8_encodeInt_mod, fc_layout_u8, LayoutStrategy.expect_size,
+      List.length_singleton, scalarBytes, leBytes, List.map]
+    rfl
+  · rw [← fc_leByteValsMRM_eq_BM bits 4, ← fc_leBytesDecodeMRM_eq (M := BM) bits 4]; rfl
+  · dsimp only [fcLeByteValsMR, Type.encode, List.length, List.mapM, List.mapM.loop,
+      bind, Except.bind, pure, Except.pure, List.reverse, List.reverseAux]
+    simp only [ne_eq, fc_u8_encodeInt_mod, fc_layout_u8, LayoutStrategy.expect_size,
+      List.length_singleton, scalarBytes, leBytes, List.map]
+    rfl
+  · rw [← fc_leByteValsMRM_eq_BM bits 8, ← fc_leBytesDecodeMRM_eq (M := BM) bits 8]; rfl
+
+/-- **Polymorphic symbolic bidirectional `transmuteM` between `u32`/`i32` and `[u8; 4]`**, for
+*every* memory model `M` (in particular `BasicMemory` and `TreeBorrowsMemory`) and *every*
+`bits < 2 ^ 32`, for both signednesses `s ∈ {.Unsigned, .Signed}`! -/
+theorem fc_mrM_transmute_int_bytes4 {M : Type} [Gen.Memory M] [MemoryOps M]
+    (s : Signedness) (bits : Nat) (hbits : bits < 2 ^ 32) (m : Option (Gen.Machine M)) :
+    transmuteM (M := M) (.Int (intFromBits bits ⟨s, ⟨4⟩⟩)) (.Int ⟨s, ⟨4⟩⟩)
+        (.Array (.Int fcU8It) 4) m = .ok (.Tuple (fcLeByteValsMRM bits 4)) ∧
+    transmuteM (M := M) (.Tuple (fcLeByteValsMRM bits 4)) (.Array (.Int fcU8It) 4)
+        (.Int ⟨s, ⟨4⟩⟩) m = .ok (.Int (intFromBits bits ⟨s, ⟨4⟩⟩)) := by
+  have hbits' : bits < 2 ^ (8 * 4) := hbits
+  have hrep := canRepresent_intFromBits ⟨s, ⟨4⟩⟩ bits fc_goodSize_4 hbits'
+  have hmod : (intFromBits bits ⟨s, ⟨4⟩⟩ % 2 ^ Size.bits ⟨4⟩).toNat = bits := by
+    have := intFromBits_emod bits ⟨s, ⟨4⟩⟩ hbits'
+    simp only [Size.bits] at this ⊢
+    rw [this]; rfl
+  have hencI : Endianness.encode .LittleEndian s ⟨4⟩ (intFromBits bits ⟨s, ⟨4⟩⟩) =
+      some (leBytes bits 4) := by
+    rw [encode_eq s ⟨4⟩ _ hrep, hmod]
+  have hdecI := decode_leBytes s 4 bits hbits'
+  obtain ⟨hencA, hdecA, _, _⟩ := fc_mrM_array_u8_encode_decode (M := M) bits
+  have hlayA : Type.layout (.Array (.Int fcU8It) 4) = .ok (.Sized ⟨4⟩ ⟨1⟩) := rfl
+  have hchkA : checkValueM (M := M) (.Tuple (fcLeByteValsMRM bits 4))
+      (.Array (.Int fcU8It) 4) m = .ok () := by
+    dsimp only [fcLeByteValsMRM, checkValueM, ensureElseUb, List.length, List.forM,
+      bind, Except.bind, pure, Except.pure]
+    simp only [IntType.can_represent, fcU8It, fc_u8_inBounds_mod, Bool.not_true,
+      Bool.false_eq_true, ↓reduceIte]; rfl
+  constructor
+  · unfold transmuteM
+    simp only [layout_eq ⟨s, ⟨4⟩⟩ fc_goodSize_4, hlayA, bind, Except.bind, expect_size_sized,
+      ne_eq, not_true_eq_false, ↓reduceIte, Type.encodeM, Type.encodeIntM, x86_64.ENDIANNESS,
+      hencI, hdecA, hchkA, pure, Except.pure]
+  · unfold transmuteM
+    simp only [layout_eq ⟨s, ⟨4⟩⟩ fc_goodSize_4, hlayA, bind, Except.bind, expect_size_sized,
+      ne_eq, not_true_eq_false, ↓reduceIte, hencA, Type.decodeM, Type.decodeIntM,
+      List.length_map, leBytes_length, fc_mapM_dataM_init, x86_64.ENDIANNESS, hdecI, checkValueM,
+      ensureElseUb, hrep, Bool.not_true, Bool.false_eq_true, pure, Except.pure]
+
+/-- **Polymorphic symbolic bidirectional `transmuteM` between `u64`/`i64` and `[u8; 8]`**, for
+*every* memory model `M` (`BasicMemory` and `TreeBorrowsMemory`) and *every* `bits < 2 ^ 64`,
+for both signednesses `s ∈ {.Unsigned, .Signed}`! -/
+theorem fc_mrM_transmute_int_bytes8 {M : Type} [Gen.Memory M] [MemoryOps M]
+    (s : Signedness) (bits : Nat) (hbits : bits < 2 ^ 64) (m : Option (Gen.Machine M)) :
+    transmuteM (M := M) (.Int (intFromBits bits ⟨s, ⟨8⟩⟩)) (.Int ⟨s, ⟨8⟩⟩)
+        (.Array (.Int fcU8It) 8) m = .ok (.Tuple (fcLeByteValsMRM bits 8)) ∧
+    transmuteM (M := M) (.Tuple (fcLeByteValsMRM bits 8)) (.Array (.Int fcU8It) 8)
+        (.Int ⟨s, ⟨8⟩⟩) m = .ok (.Int (intFromBits bits ⟨s, ⟨8⟩⟩)) := by
+  have hbits' : bits < 2 ^ (8 * 8) := hbits
+  have hrep := canRepresent_intFromBits ⟨s, ⟨8⟩⟩ bits fc_goodSize_8 hbits'
+  have hmod : (intFromBits bits ⟨s, ⟨8⟩⟩ % 2 ^ Size.bits ⟨8⟩).toNat = bits := by
+    have := intFromBits_emod bits ⟨s, ⟨8⟩⟩ hbits'
+    simp only [Size.bits] at this ⊢
+    rw [this]; rfl
+  have hencI : Endianness.encode .LittleEndian s ⟨8⟩ (intFromBits bits ⟨s, ⟨8⟩⟩) =
+      some (leBytes bits 8) := by
+    rw [encode_eq s ⟨8⟩ _ hrep, hmod]
+  have hdecI := decode_leBytes s 8 bits hbits'
+  obtain ⟨_, _, hencA, hdecA⟩ := fc_mrM_array_u8_encode_decode (M := M) bits
+  have hlayA : Type.layout (.Array (.Int fcU8It) 8) = .ok (.Sized ⟨8⟩ ⟨1⟩) := rfl
+  have hchkA : checkValueM (M := M) (.Tuple (fcLeByteValsMRM bits 8))
+      (.Array (.Int fcU8It) 8) m = .ok () := by
+    dsimp only [fcLeByteValsMRM, checkValueM, ensureElseUb, List.length, List.forM,
+      bind, Except.bind, pure, Except.pure]
+    simp only [IntType.can_represent, fcU8It, fc_u8_inBounds_mod, Bool.not_true,
+      Bool.false_eq_true, ↓reduceIte]; rfl
+  constructor
+  · unfold transmuteM
+    simp only [layout_eq ⟨s, ⟨8⟩⟩ fc_goodSize_8, hlayA, bind, Except.bind, expect_size_sized,
+      ne_eq, not_true_eq_false, ↓reduceIte, Type.encodeM, Type.encodeIntM, x86_64.ENDIANNESS,
+      hencI, hdecA, hchkA, pure, Except.pure]
+  · unfold transmuteM
+    simp only [layout_eq ⟨s, ⟨8⟩⟩ fc_goodSize_8, hlayA, bind, Except.bind, expect_size_sized,
+      ne_eq, not_true_eq_false, ↓reduceIte, hencA, Type.decodeM, Type.decodeIntM,
+      List.length_map, leBytes_length, fc_mapM_dataM_init, x86_64.ENDIANNESS, hdecI, checkValueM,
+      ensureElseUb, hrep, Bool.not_true, Bool.false_eq_true, pure, Except.pure]
+
+/-- Non-polymorphic `Interp.transmute` + `BasicMemory` + `TreeBorrowsMemory` bundle for all 4-byte
+(`u32 ↔ [u8; 4]`, `i32 ↔ [u8; 4]`) and 8-byte (`u64 ↔ [u8; 8]`, `i64 ↔ [u8; 8]`) IEEE-754 byte
+carriers. -/
+theorem fc_mr_transmute_byte_arrays_symbolic (s : Signedness) :
+    (∀ bits < 2 ^ 32,
+      transmute (.Int (intFromBits bits ⟨s, ⟨4⟩⟩)) (.Int ⟨s, ⟨4⟩⟩) (.Array (.Int fcU8It) 4) =
+        .ok (.Tuple (fcLeByteValsMR bits 4)) ∧
+      transmute (.Tuple (fcLeByteValsMR bits 4)) (.Array (.Int fcU8It) 4) (.Int ⟨s, ⟨4⟩⟩) =
+        .ok (.Int (intFromBits bits ⟨s, ⟨4⟩⟩)) ∧
+      transmuteM (M := BM) (.Int (intFromBits bits ⟨s, ⟨4⟩⟩)) (.Int ⟨s, ⟨4⟩⟩)
+          (.Array (.Int fcU8It) 4) = .ok (.Tuple (fcLeByteValsMR bits 4)) ∧
+      transmuteM (M := TBM) (.Int (intFromBits bits ⟨s, ⟨4⟩⟩)) (.Int ⟨s, ⟨4⟩⟩)
+          (.Array (.Int fcU8It) 4) = .ok (.Tuple (fcLeByteValsMRM bits 4)) ∧
+      transmuteM (M := TBM) (.Tuple (fcLeByteValsMRM bits 4)) (.Array (.Int fcU8It) 4)
+          (.Int ⟨s, ⟨4⟩⟩) = .ok (.Int (intFromBits bits ⟨s, ⟨4⟩⟩))) ∧
+    (∀ bits < 2 ^ 64,
+      transmute (.Int (intFromBits bits ⟨s, ⟨8⟩⟩)) (.Int ⟨s, ⟨8⟩⟩) (.Array (.Int fcU8It) 8) =
+        .ok (.Tuple (fcLeByteValsMR bits 8)) ∧
+      transmute (.Tuple (fcLeByteValsMR bits 8)) (.Array (.Int fcU8It) 8) (.Int ⟨s, ⟨8⟩⟩) =
+        .ok (.Int (intFromBits bits ⟨s, ⟨8⟩⟩)) ∧
+      transmuteM (M := BM) (.Int (intFromBits bits ⟨s, ⟨8⟩⟩)) (.Int ⟨s, ⟨8⟩⟩)
+          (.Array (.Int fcU8It) 8) = .ok (.Tuple (fcLeByteValsMR bits 8)) ∧
+      transmuteM (M := TBM) (.Int (intFromBits bits ⟨s, ⟨8⟩⟩)) (.Int ⟨s, ⟨8⟩⟩)
+          (.Array (.Int fcU8It) 8) = .ok (.Tuple (fcLeByteValsMRM bits 8)) ∧
+      transmuteM (M := TBM) (.Tuple (fcLeByteValsMRM bits 8)) (.Array (.Int fcU8It) 8)
+          (.Int ⟨s, ⟨8⟩⟩) = .ok (.Int (intFromBits bits ⟨s, ⟨8⟩⟩))) := by
+  refine ⟨fun bits h32 => ?_, fun bits h64 => ?_⟩
+  · have hbits' : bits < 2 ^ (8 * 4) := h32
+    have hencI := fc_mr_encode_intFromBits ⟨s, ⟨4⟩⟩ bits fc_goodSize_4 hbits'
+    have hdecI := decode_int_scalarBytes ⟨s, ⟨4⟩⟩ bits hbits'
+    have hrep := canRepresent_intFromBits ⟨s, ⟨4⟩⟩ bits fc_goodSize_4 hbits'
+    obtain ⟨hencA, hdecA, _, _⟩ := fc_mr_array_u8_eq_anneal bits none
+    rw [fc_map_encodeLittleEndianBytes .Unsigned none 4 bits] at hencA hdecA
+    have hlayA : Type.layout (.Array (.Int fcU8It) 4) = .ok (.Sized ⟨4⟩ ⟨1⟩) := rfl
+    have hchkA : checkValue (.Tuple (fcLeByteValsMR bits 4)) (.Array (.Int fcU8It) 4) none =
+        .ok () := by
+      dsimp only [fcLeByteValsMR, checkValue, ensureElseUb, List.length, List.forM,
+        bind, Except.bind, pure, Except.pure]
+      simp only [IntType.can_represent, fcU8It, fc_u8_inBounds_mod, Bool.not_true,
+        Bool.false_eq_true, ↓reduceIte]; rfl
+    have hbm := fc_mrM_transmute_int_bytes4 (M := BM) s bits h32 none
+    rw [fc_leByteValsMRM_eq_BM] at hbm
+    have htb := fc_mrM_transmute_int_bytes4 (M := TBM) s bits h32 none
+    refine ⟨?_, ?_, hbm.1, htb.1, htb.2⟩
+    · unfold transmute
+      simp only [layout_eq ⟨s, ⟨4⟩⟩ fc_goodSize_4, hlayA, bind, Except.bind, expect_size_sized,
+        ne_eq, not_true_eq_false, ↓reduceIte, hencI, fc_scalarBytes_sign s .Unsigned, hdecA, hchkA,
+        pure, Except.pure]
+    · unfold transmute
+      simp only [layout_eq ⟨s, ⟨4⟩⟩ fc_goodSize_4, hlayA, bind, Except.bind, expect_size_sized,
+        ne_eq, not_true_eq_false, ↓reduceIte, hencA, fc_scalarBytes_sign .Unsigned s, hdecI,
+        checkValue_int hrep, pure, Except.pure]
+  · have hbits' : bits < 2 ^ (8 * 8) := h64
+    have hencI := fc_mr_encode_intFromBits ⟨s, ⟨8⟩⟩ bits fc_goodSize_8 hbits'
+    have hdecI := decode_int_scalarBytes ⟨s, ⟨8⟩⟩ bits hbits'
+    have hrep := canRepresent_intFromBits ⟨s, ⟨8⟩⟩ bits fc_goodSize_8 hbits'
+    obtain ⟨_, _, hencA, hdecA⟩ := fc_mr_array_u8_eq_anneal bits none
+    rw [fc_map_encodeLittleEndianBytes .Unsigned none 8 bits] at hencA hdecA
+    have hlayA : Type.layout (.Array (.Int fcU8It) 8) = .ok (.Sized ⟨8⟩ ⟨1⟩) := rfl
+    have hchkA : checkValue (.Tuple (fcLeByteValsMR bits 8)) (.Array (.Int fcU8It) 8) none =
+        .ok () := by
+      dsimp only [fcLeByteValsMR, checkValue, ensureElseUb, List.length, List.forM,
+        bind, Except.bind, pure, Except.pure]
+      simp only [IntType.can_represent, fcU8It, fc_u8_inBounds_mod, Bool.not_true,
+        Bool.false_eq_true, ↓reduceIte]; rfl
+    have hbm := fc_mrM_transmute_int_bytes8 (M := BM) s bits h64 none
+    rw [fc_leByteValsMRM_eq_BM] at hbm
+    have htb := fc_mrM_transmute_int_bytes8 (M := TBM) s bits h64 none
+    refine ⟨?_, ?_, hbm.1, htb.1, htb.2⟩
+    · unfold transmute
+      simp only [layout_eq ⟨s, ⟨8⟩⟩ fc_goodSize_8, hlayA, bind, Except.bind, expect_size_sized,
+        ne_eq, not_true_eq_false, ↓reduceIte, hencI, fc_scalarBytes_sign s .Unsigned, hdecA, hchkA,
+        pure, Except.pure]
+    · unfold transmute
+      simp only [layout_eq ⟨s, ⟨8⟩⟩ fc_goodSize_8, hlayA, bind, Except.bind, expect_size_sized,
+        ne_eq, not_true_eq_false, ↓reduceIte, hencA, fc_scalarBytes_sign .Unsigned s, hdecI,
+        checkValue_int hrep, pure, Except.pure]
+
+/-! ## 13. Uninitialized-byte UB, size-mismatch UB, and pointer-provenance transmute boundaries -/
+
+/-- Single-chunk `n`-byte MiniRust `Type.Union` carrier, capable of holding arbitrary
+`AbstractByte` lists (including `.Uninit` padding bytes). -/
+def fcUnionTy (n : Nat) : Gen.Type :=
+  .Union [] [(⟨0⟩, ⟨n⟩)] ⟨n⟩ ⟨1⟩
+
+private theorem fc_mapM_dataM_loop_none {P : Type} :
+    ∀ (bs : List (Gen.AbstractByte P)) (acc : List UInt8),
+      .Uninit ∈ bs → List.mapM.loop AbstractByte.dataM bs acc = none
+  | [], _, h => nomatch h
+  | .Uninit :: _, _, _ => rfl
+  | .Init b _ :: rest, acc, h => by
+    rcases List.mem_cons.mp h with h0 | hmem
+    · nomatch h0
+    · exact fc_mapM_dataM_loop_none rest (b :: acc) hmem
+
+private theorem fc_mapM_dataM_none_of_uninit {P : Type}
+    (bs : List (Gen.AbstractByte P)) (h : .Uninit ∈ bs) :
+    bs.mapM AbstractByte.dataM = none :=
+  fc_mapM_dataM_loop_none bs [] h
+
+private theorem fc_mapM_data_loop_none :
+    ∀ (bs : List Byte) (acc : List UInt8),
+      .Uninit ∈ bs → List.mapM.loop AbstractByte.data bs acc = none
+  | [], _, h => nomatch h
+  | .Uninit :: _, _, _ => rfl
+  | .Init b _ :: rest, acc, h => by
+    rcases List.mem_cons.mp h with h0 | hmem
+    · nomatch h0
+    · exact fc_mapM_data_loop_none rest (b :: acc) hmem
+
+private theorem fc_mapM_data_none_of_uninit (bs : List Byte) (h : .Uninit ∈ bs) :
+    bs.mapM AbstractByte.data = none :=
+  fc_mapM_data_loop_none bs [] h
+
+private theorem fc_encodeUnion_uninitM {M : Type} [Gen.Memory M]
+    (n : Nat) (bytes : List (Gen.AbstractByte (Gen.Memory.Provenance M))) (hlen : bytes.length = n) :
+    Type.encodeM (M := M) (fcUnionTy n) (.Union [bytes]) = .ok bytes := by
+  have hrep : (List.replicate n (Gen.AbstractByte.Uninit : Gen.AbstractByte (Gen.Memory.Provenance M))).length = n :=
+    List.length_replicate
+  have hdrop : (List.replicate n (Gen.AbstractByte.Uninit : Gen.AbstractByte (Gen.Memory.Provenance M))).drop n = [] := by
+    rw [List.drop_eq_nil_iff, hrep]; exact Nat.le_refl n
+  have hws : writeSubsliceAtIndex
+      (List.replicate n (Gen.AbstractByte.Uninit : Gen.AbstractByte (Gen.Memory.Provenance M)))
+      ((0 : Nat) : Int) bytes = .ok bytes := by
+    unfold writeSubsliceAtIndex
+    split
+    · simp [hlen, hdrop]
+    · exfalso; rename_i hneg; apply hneg; rw [hrep, hlen]; omega
+  dsimp only [fcUnionTy, Type.encodeM, Type.encodeUnionChunksM, List.length, bind, Except.bind,
+    pure, Except.pure]
+  simp only [ne_eq, hlen, not_true_eq_false, ↓reduceIte]
+  rw [hws]
+
+/-- **Uninitialized-byte transmute UB in MiniRust (`Interp.transmute` and polymorphic `transmuteM`
+over both `BasicMemory` and `TreeBorrowsMemory`)**: transmuting an `n`-byte `Type.Union` value
+whose byte list contains *any* `.Uninit` byte into `.Int ⟨s, ⟨n⟩⟩` (`u32`, `i32`, `u64`, `i64`, etc.)
+raises UB (`"transmuted value is not valid at new type"`). -/
+theorem fc_mrM_uninit_union_transmute_ub {M : Type} [Gen.Memory M] [MemoryOps M]
+    (s : Signedness) (n : Nat) (hgood : GoodSize n)
+    (bytes : List (Gen.AbstractByte (Gen.Memory.Provenance M)))
+    (hlen : bytes.length = n) (huninit : .Uninit ∈ bytes) (m : Option (Gen.Machine M))
+    (bytesBM : List Byte) (hlenBM : bytesBM.length = n) (huninitBM : .Uninit ∈ bytesBM) :
+    Type.decodeM (M := M) (.Int ⟨s, ⟨n⟩⟩) bytes = .ok none ∧
+    transmuteM (M := M) (.Union [bytes]) (fcUnionTy n) (.Int ⟨s, ⟨n⟩⟩) m =
+      .error (.ub "transmuted value is not valid at new type") ∧
+    transmute (.Union [bytesBM]) (fcUnionTy n) (.Int ⟨s, ⟨n⟩⟩) =
+      .error (.ub "transmuted value is not valid at new type") := by
+  have hdecM : Type.decodeM (M := M) (.Int ⟨s, ⟨n⟩⟩) bytes = .ok none := by
+    dsimp only [Type.decodeM, Type.decodeIntM]
+    simp only [ne_eq, hlen, not_true_eq_false, ↓reduceIte, fc_mapM_dataM_none_of_uninit bytes huninit,
+      pure, Except.pure]
+  have hlayU : Type.layout (fcUnionTy n) = .ok (.Sized ⟨n⟩ ⟨1⟩) := rfl
+  refine ⟨hdecM, ?_, ?_⟩
+  · unfold transmuteM
+    simp only [hlayU, layout_eq ⟨s, ⟨n⟩⟩ hgood, bind, Except.bind, expect_size_sized,
+      ne_eq, not_true_eq_false, ↓reduceIte, fc_encodeUnion_uninitM (M := M) n bytes hlen,
+      hdecM, ub]
+  · have hdecB : Type.decode (.Int ⟨s, ⟨n⟩⟩) bytesBM = .ok none := by
+      dsimp only [Type.decode, Type.decodeInt]
+      simp only [ne_eq, hlenBM, not_true_eq_false, ↓reduceIte,
+        fc_mapM_data_none_of_uninit bytesBM huninitBM, pure, Except.pure]
+    have hencB : Type.encode (fcUnionTy n) (.Union [bytesBM]) = .ok bytesBM := by
+      have hrep : (List.replicate n (Gen.AbstractByte.Uninit : Byte)).length = n :=
+        List.length_replicate
+      have hdrop : (List.replicate n (Gen.AbstractByte.Uninit : Byte)).drop n = [] := by
+        rw [List.drop_eq_nil_iff, hrep]; exact Nat.le_refl n
+      have hws : writeSubsliceAtIndex (List.replicate n (Gen.AbstractByte.Uninit : Byte))
+          ((0 : Nat) : Int) bytesBM = .ok bytesBM := by
+        unfold writeSubsliceAtIndex
+        split
+        · simp [hlenBM, hdrop]
+        · exfalso; rename_i hneg; apply hneg; rw [hrep, hlenBM]; omega
+      dsimp only [fcUnionTy, Type.encode, Type.encodeUnionChunks, List.length, bind, Except.bind,
+        pure, Except.pure]
+      simp only [ne_eq, hlenBM, not_true_eq_false, ↓reduceIte]
+      rw [hws]
+    unfold transmute
+    simp only [hlayU, layout_eq ⟨s, ⟨n⟩⟩ hgood, bind, Except.bind, expect_size_sized,
+      ne_eq, not_true_eq_false, ↓reduceIte, hencB, hdecB, ub]
+
+/-- **Polymorphic `evalCastOpM (.Transmute ...)` size-mismatch UB** across *every* memory model `M`
+(`BasicMemory` and `TreeBorrowsMemory`) and *every* source value `v`: mismatched widths (`4 ↔ 8`
+across `u32`/`u64`, `[u8; 4]`/`[u8; 8]`, and thin raw pointers) raise UB before inspecting `v`. -/
+theorem fc_mrM_evalCastOpM_size_mismatch_ub {M : Type} [Gen.Memory M] [MemoryOps M]
+    (v : Gen.Value M) (m : Option (Gen.Machine M)) :
+    evalCastOpM (M := M) (.Transmute (.Int fcU64It)) (v, .Int fcU32It) m =
+      .error (.ub "transmute between types of different size") ∧
+    evalCastOpM (M := M) (.Transmute (.Int fcU32It)) (v, .Int fcU64It) m =
+      .error (.ub "transmute between types of different size") ∧
+    evalCastOpM (M := M) (.Transmute (.Array (.Int fcU8It) 8)) (v, .Int fcU32It) m =
+      .error (.ub "transmute between types of different size") ∧
+    evalCastOpM (M := M) (.Transmute (.Int fcU64It)) (v, .Array (.Int fcU8It) 4) m =
+      .error (.ub "transmute between types of different size") ∧
+    evalCastOpM (M := M) (.Transmute (.Int fcU32It)) (v, .Ptr (.Raw .None)) m =
+      .error (.ub "transmute between types of different size") :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+private theorem fc_encodePtrBytesM_len {M : Type} [Gen.Memory M]
+    (prov : Option (Gen.Memory.Provenance M)) :
+    ∀ (idx : Nat) (bs : List UInt8), (encodePtrBytesM (M := M) prov idx bs).length = bs.length
+  | _, [] => rfl
+  | idx, _ :: rest => congrArg Nat.succ (fc_encodePtrBytesM_len prov (idx + 1) rest)
+
+private theorem fc_encodePtrBytesM_dataM_loop {M : Type} [Gen.Memory M]
+    (prov : Option (Gen.Memory.Provenance M)) :
+    ∀ (idx : Nat) (bs acc : List UInt8),
+      List.mapM.loop AbstractByte.dataM (encodePtrBytesM (M := M) prov idx bs) acc =
+        some (acc.reverse ++ bs)
+  | _, [], acc => by simp [encodePtrBytesM, List.mapM.loop]
+  | idx, b :: rest, acc => by
+    dsimp only [encodePtrBytesM, List.mapM.loop, AbstractByte.dataM, bind, Option.bind]
+    rw [fc_encodePtrBytesM_dataM_loop prov (idx + 1) rest (b :: acc)]
+    simp [List.reverse_cons]
+
+private theorem fc_encodePtrBytesM_dataM {M : Type} [Gen.Memory M]
+    (prov : Option (Gen.Memory.Provenance M)) (idx : Nat) (bs : List UInt8) :
+    (encodePtrBytesM (M := M) prov idx bs).mapM AbstractByte.dataM = some bs :=
+  fc_encodePtrBytesM_dataM_loop prov idx bs []
+
+private theorem fc_decodePtrProvenanceM_encode {M : Type} [Gen.Memory M] [MemoryOps M]
+    (p : Gen.Memory.Provenance M) :
+    ∀ (idx : Nat) (bs : List UInt8),
+      decodePtrProvenanceM (M := M) idx (some p) (encodePtrBytesM (M := M) (some p) idx bs) = some p
+  | _, [] => rfl
+  | idx, _ :: rest => by
+    dsimp only [encodePtrBytesM, decodePtrProvenanceM, AbstractByte.provenance_fragM, Option.map]
+    simp only [and_self, ↓reduceIte]
+    exact fc_decodePtrProvenanceM_encode p (idx + 1) rest
+
+private theorem fc_decodePtrM_encodePtrBytesM {M : Type} [Gen.Memory M] [MemoryOps M]
+    (prov : Option (Gen.Memory.Provenance M)) (addr : Nat) (haddr : addr < 2 ^ 64) :
+    decodePtrM (M := M) (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) =
+      .ok (some { addr := (addr : Int), provenance := prov }) := by
+  have hbits' : addr < 2 ^ (8 * 8) := haddr
+  have hdec := decode_leBytes .Unsigned 8 addr hbits'
+  simp only [intFromBits] at hdec
+  dsimp only [decodePtrM]
+  simp only [ne_eq, fc_encodePtrBytesM_len, leBytes_length, x86_64.PTR_SIZE, not_true_eq_false,
+    ↓reduceIte, fc_encodePtrBytesM_dataM, x86_64.ENDIANNESS, hdec, pure, Except.pure]
+  cases prov with
+  | none => rfl
+  | some p =>
+    have hf : firstProvenanceM (M := M) (encodePtrBytesM (M := M) (some p) 0 (leBytes addr 8)) =
+        some p := rfl
+    rw [hf, fc_decodePtrProvenanceM_encode (M := M) p 0 (leBytes addr 8)]
+
+private theorem fc_decodeArray8_encodePtrBytesM {M : Type} [Gen.Memory M] [MemoryOps M]
+    (prov : Option (Gen.Memory.Provenance M)) (addr : Nat) :
+    Type.decodeM (M := M) (.Array (.Int fcU8It) 8)
+      (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) =
+      .ok (some (.Tuple (fcLeByteValsMRM addr 8))) := by
+  rw [← fc_leBytesDecodeMRM_eq (M := M) addr 8]
+  cases prov <;> rfl
+
+private theorem fc_layout_rawPtrNone :
+    Type.layout (.Ptr (.Raw .None)) = .ok (.Sized ⟨8⟩ ⟨8⟩) := rfl
+
+private theorem fc_canRepresent_eq_inBounds (signed : Signedness) (size : LibSpecr.Size) (v : Int) :
+    IntType.can_represent ⟨signed, size⟩ v = inBounds v signed size := rfl
+
+private theorem fc_intFromBits_unsigned (n addr : Nat) :
+    intFromBits addr ⟨.Unsigned, ⟨n⟩⟩ = (addr : Int) := rfl
+
+private theorem fc_inBounds_u64 (addr : Nat) (haddr : addr < 2 ^ 64) :
+    inBounds (addr : Int) .Unsigned ⟨8⟩ = true := by
+  have hbits' : addr < 2 ^ (8 * (⟨.Unsigned, ⟨8⟩⟩ : Gen.IntType).size.bytes) := haddr
+  have h := canRepresent_intFromBits ⟨.Unsigned, ⟨8⟩⟩ addr fc_goodSize_8 hbits'
+  rw [fc_canRepresent_eq_inBounds, fc_intFromBits_unsigned] at h
+  exact h
+
+private theorem fc_encodePtrM_of_encode {M : Type} [Gen.Memory M]
+    (ptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (data : List UInt8)
+    (henc : Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE ptr.addr = some data) :
+    encodePtrM (M := M) ptr = .ok (encodePtrBytesM (M := M) ptr.provenance 0 data) := by
+  unfold encodePtrM
+  rw [henc]
+  rfl
+
+private theorem fc_encodePtrM_u64 {M : Type} [Gen.Memory M]
+    (addr : Nat) (haddr : addr < 2 ^ 64) (prov : Option (Gen.Memory.Provenance M)) :
+    encodePtrM (M := M) ⟨(addr : Int), prov⟩ =
+      .ok (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) :=
+  fc_encodePtrM_of_encode (M := M) ⟨(addr : Int), prov⟩ (leBytes addr 8) (encode_usize addr haddr)
+
+private theorem fc_encodeIntM_of_encode {M : Type} [Gen.Memory M]
+    (it : Gen.IntType) (v : Int) (data : List UInt8)
+    (henc : Endianness.encode x86_64.ENDIANNESS it.signed it.size v = some data) :
+    Type.encodeM (M := M) (.Int it) (.Int v) =
+      .ok (data.map (fun b => Gen.AbstractByte.Init b none)) := by
+  simp only [Type.encodeM, Type.encodeIntM, henc, pure, Except.pure]
+
+private theorem fc_map_init_eq_encodePtrBytesM_none {M : Type} [Gen.Memory M] :
+    ∀ (idx : Nat) (data : List UInt8),
+      data.map (fun b => (Gen.AbstractByte.Init b none : Gen.AbstractByte (Gen.Memory.Provenance M))) =
+        encodePtrBytesM (M := M) none idx data
+  | _, [] => rfl
+  | idx, b :: rest =>
+    congrArg (Gen.AbstractByte.Init b none :: ·)
+      (fc_map_init_eq_encodePtrBytesM_none (idx + 1) rest)
+
+private theorem fc_encodeM_rawPtrNone {M : Type} [Gen.Memory M]
+    (addr : Nat) (haddr : addr < 2 ^ 64) (prov : Option (Gen.Memory.Provenance M)) :
+    Type.encodeM (M := M) (.Ptr (.Raw .None)) (.Ptr ⟨⟨(addr : Int), prov⟩, none⟩) =
+      .ok (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) := by
+  simp only [Type.encodeM, PtrType.as_wide_pair, PtrType.meta_kind, Option.map]
+  exact fc_encodePtrM_u64 (M := M) addr haddr prov
+
+private theorem fc_decodeM_rawPtrNone {M : Type} [Gen.Memory M] [MemoryOps M]
+    (addr : Nat) (haddr : addr < 2 ^ 64) (p' : Option (Gen.Memory.Provenance M)) :
+    Type.decodeM (M := M) (.Ptr (.Raw .None))
+      (encodePtrBytesM (M := M) p' 0 (leBytes addr 8)) =
+      .ok (some (.Ptr ⟨⟨(addr : Int), p'⟩, none⟩)) := by
+  simp only [Type.decodeM, PtrType.as_wide_pair, PtrType.meta_kind, Option.map,
+    bind, Except.bind, pure, Except.pure, fc_decodePtrM_encodePtrBytesM (M := M) p' addr haddr]
+  rfl
+
+private theorem fc_checkPtrM_rawPtrNone {M : Type} [Gen.Memory M] [MemoryOps M]
+    (addr : Nat) (haddr : addr < 2 ^ 64) (p' : Option (Gen.Memory.Provenance M))
+    (m : Option (Gen.Machine M)) :
+    checkPtrM (M := M) ⟨⟨(addr : Int), p'⟩, none⟩ (.Raw .None) m = .ok () := by
+  unfold checkPtrM
+  have hp : x86_64.PTR_SIZE = ⟨8⟩ := rfl
+  rw [hp, fc_inBounds_u64 addr haddr]
+  rfl
+
+private theorem fc_checkValueM_rawPtrNone {M : Type} [Gen.Memory M] [MemoryOps M]
+    (addr : Nat) (haddr : addr < 2 ^ 64) (p' : Option (Gen.Memory.Provenance M))
+    (m : Option (Gen.Machine M)) :
+    checkValueM (M := M) (.Ptr ⟨⟨(addr : Int), p'⟩, none⟩) (.Ptr (.Raw .None)) m = .ok () := by
+  simp only [checkValueM]
+  exact fc_checkPtrM_rawPtrNone (M := M) addr haddr p' m
+
+private theorem fc_transmuteM_of_steps {M : Type} [Gen.Memory M] [MemoryOps M]
+    (v v' : Gen.Value M) (ty1 ty2 : Gen.Type) (sz : LibSpecr.Size) (a1 a2 : LibSpecr.Align)
+    (bytes : List (Gen.AbstractByte (Gen.Memory.Provenance M))) (m : Option (Gen.Machine M))
+    (hl1 : Type.layout ty1 = .ok (.Sized sz a1))
+    (hl2 : Type.layout ty2 = .ok (.Sized sz a2))
+    (henc : Type.encodeM (M := M) ty1 v = .ok bytes)
+    (hdec : Type.decodeM (M := M) ty2 bytes = .ok (some v'))
+    (hchk : checkValueM (M := M) v' ty2 m = .ok ()) :
+    transmuteM (M := M) v ty1 ty2 m = .ok v' := by
+  unfold transmuteM
+  simp only [hl1, hl2, bind, Except.bind, expect_size_sized, ne_eq, not_true_eq_false, ↓reduceIte,
+    henc, hdec, hchk, pure, Except.pure]
+
+private theorem fc_decodeIntM_encodePtrBytesM {M : Type} [Gen.Memory M] [MemoryOps M]
+    (s : Signedness) (addr : Nat) (haddr : addr < 2 ^ 64)
+    (prov : Option (Gen.Memory.Provenance M)) :
+    Type.decodeM (M := M) (.Int ⟨s, ⟨8⟩⟩) (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) =
+      .ok (some (.Int (intFromBits addr ⟨s, ⟨8⟩⟩))) := by
+  have hbits' : addr < 2 ^ (8 * 8) := haddr
+  simp only [Type.decodeM, Type.decodeIntM, fc_encodePtrBytesM_len, leBytes_length, ne_eq,
+    not_true_eq_false, ↓reduceIte, fc_encodePtrBytesM_dataM, x86_64.ENDIANNESS,
+    decode_leBytes s 8 addr hbits', pure, Except.pure]
+
+/-- **Polymorphic pointer-provenance `transmuteM` boundary in MiniRust**, valid across *every*
+memory model `M` (`BasicMemory` and `TreeBorrowsMemory`), *every* 64-bit address `addr < 2 ^ 64`,
+and *every* provenance `prov`:
+1. Transmuting `.Ptr ⟨⟨addr, prov⟩, none⟩` at `.Ptr (.Raw .None)` (`*const f32`, `*const u32`, ...)
+   to `.Int ⟨s, ⟨8⟩⟩` (`u64` or `i64`) **succeeds and strips provenance** (contrast Anneal, where
+   pointer-to-integer/float transmute is UB!).
+2. Transmuting `.Ptr ⟨⟨addr, prov⟩, none⟩` to `[u8; 8]` **succeeds and strips provenance** into
+   8 `u8` elements (contrast Anneal, where `ptr -> [u8; 8]` is UB!).
+3. Transmuting `.Ptr ⟨⟨addr, prov⟩, none⟩` to `.Ptr (.Raw .None)` **preserves both `addr` and
+   `prov` intact** (under both `BasicMemory` and `TreeBorrowsMemory`).
+4. Transmuting `u64` (`addr`) to `.Ptr (.Raw .None)` produces the provenance-free raw pointer
+   `⟨⟨addr, none⟩, none⟩`. -/
+theorem fc_mrM_transmute_ptr_boundary {M : Type} [Gen.Memory M] [MemoryOps M]
+    (s : Signedness) (addr : Nat) (haddr : addr < 2 ^ 64)
+    (prov : Option (Gen.Memory.Provenance M)) (m : Option (Gen.Machine M)) :
+    transmuteM (M := M) (.Ptr ⟨⟨(addr : Int), prov⟩, none⟩) (.Ptr (.Raw .None))
+        (.Int ⟨s, ⟨8⟩⟩) m = .ok (.Int (intFromBits addr ⟨s, ⟨8⟩⟩)) ∧
+    transmuteM (M := M) (.Ptr ⟨⟨(addr : Int), prov⟩, none⟩) (.Ptr (.Raw .None))
+        (.Array (.Int fcU8It) 8) m = .ok (.Tuple (fcLeByteValsMRM addr 8)) ∧
+    transmuteM (M := M) (.Ptr ⟨⟨(addr : Int), prov⟩, none⟩) (.Ptr (.Raw .None))
+        (.Ptr (.Raw .None)) m = .ok (.Ptr ⟨⟨(addr : Int), prov⟩, none⟩) ∧
+    transmuteM (M := M) (.Int (addr : Int)) (.Int fcU64It)
+        (.Ptr (.Raw .None)) m = .ok (.Ptr ⟨⟨(addr : Int), none⟩, none⟩) := by
+  have hbits' : addr < 2 ^ (8 * 8) := haddr
+  have hrepS := canRepresent_intFromBits ⟨s, ⟨8⟩⟩ addr fc_goodSize_8 hbits'
+  have hchkS : checkValueM (M := M) (.Int (intFromBits addr ⟨s, ⟨8⟩⟩)) (.Int ⟨s, ⟨8⟩⟩) m =
+      .ok () := by
+    simp only [checkValueM, ensureElseUb, hrepS, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+      pure, Except.pure]
+  have hlayA : Type.layout (.Array (.Int fcU8It) 8) = .ok (.Sized ⟨8⟩ ⟨1⟩) := rfl
+  have hchkA : checkValueM (M := M) (.Tuple (fcLeByteValsMRM addr 8))
+      (.Array (.Int fcU8It) 8) m = .ok () := by
+    dsimp only [fcLeByteValsMRM, checkValueM, ensureElseUb, List.length, List.forM,
+      bind, Except.bind, pure, Except.pure]
+    simp only [IntType.can_represent, fcU8It, fc_u8_inBounds_mod, Bool.not_true,
+      Bool.false_eq_true, ↓reduceIte]; rfl
+  have hencU : Type.encodeM (M := M) (.Int fcU64It) (.Int (addr : Int)) =
+      .ok (encodePtrBytesM (M := M) none 0 (leBytes addr 8)) := by
+    rw [← fc_map_init_eq_encodePtrBytesM_none (M := M) 0 (leBytes addr 8)]
+    exact fc_encodeIntM_of_encode (M := M) fcU64It (addr : Int) (leBytes addr 8)
+      (encode_usize addr haddr)
+  exact ⟨
+    fc_transmuteM_of_steps _ _ _ _ _ _ _ _ m fc_layout_rawPtrNone (layout_eq ⟨s, ⟨8⟩⟩ fc_goodSize_8)
+      (fc_encodeM_rawPtrNone (M := M) addr haddr prov)
+      (fc_decodeIntM_encodePtrBytesM (M := M) s addr haddr prov) hchkS,
+    fc_transmuteM_of_steps _ _ _ _ _ _ _ _ m fc_layout_rawPtrNone hlayA
+      (fc_encodeM_rawPtrNone (M := M) addr haddr prov)
+      (fc_decodeArray8_encodePtrBytesM (M := M) prov addr) hchkA,
+    fc_transmuteM_of_steps _ _ _ _ _ _ _ _ m fc_layout_rawPtrNone fc_layout_rawPtrNone
+      (fc_encodeM_rawPtrNone (M := M) addr haddr prov)
+      (fc_decodeM_rawPtrNone (M := M) addr haddr prov)
+      (fc_checkValueM_rawPtrNone (M := M) addr haddr prov m),
+    fc_transmuteM_of_steps _ _ _ _ _ _ _ _ m (layout_eq fcU64It fc_goodSize_8) fc_layout_rawPtrNone
+      hencU (fc_decodeM_rawPtrNone (M := M) addr haddr none)
+      (fc_checkValueM_rawPtrNone (M := M) addr haddr none m)⟩
+
+/-- **Anneal pointer-provenance transmute and float-cast boundary**:
+1. Transmuting `Value.ptr p 8` to `[u8; 8]` (`fcBytes8Ty`) or `i64` (`fcI64Ty`) is **UB** (`.ub`),
+   because integer/byte-array elements reject pointer provenance (`abstractBytesHaveProv = true`).
+2. Transmuting `Value.ptr p 8` (`p.offsetBytes < 2 ^ 64`) to `*const u8` (`fcRawPtrU8Ty`) **succeeds**
+   and decodes via `decodePtrBytesNoForge` to `.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } 8`
+   (` locals' mem`).
+3. Transmuting a `f64`/`u64` scalar `⟨bits, 8⟩` (`bits < 2 ^ 64`) to `*const u8` (`fcRawPtrU8Ty`)
+   **never fabricates provenance**, yielding `.ok (.scalar ⟨bits, 8⟩) locals' mem`, whereas
+   transmuting it to `&u8` (`isRef = true`) is **UB** (`.ub`).
+4. Applying numeric `CastKind.floatToInt` or `CastKind.floatToFloat` to `Value.ptr p 8` fails closed
+   (`.unsupported`). -/
+theorem fc_anneal_ptr_transmute_and_cast_boundary
+    {locals locals' : List LocalSlot} {op opScalar : Operand} {mem : Memory}
+    {decls : List LocalDecl} {p : ProvenancePtr} (hp : p.offsetBytes < 2 ^ 64)
+    {bits : Nat} (hbits : bits < 2 ^ 64)
+    (hOpPtr : evalOperand locals op mem.borrows mem.globals fcLayouts mem.callerLocals decls
+      mem.callStack = .ok (.ptr p 8) locals')
+    (hTyPtr : operandTy decls fcLayouts op = some fcRawPtrU8Ty)
+    (hOpSc : evalOperand locals opScalar mem.borrows mem.globals fcLayouts mem.callerLocals decls
+      mem.callStack = .ok (.scalar ⟨bits, 8⟩) locals')
+    (hTySc : operandTy decls fcLayouts opScalar = some fcF64Ty) :
+    evalRvalue locals (.cast .transmute op fcBytes8Ty) mem decls fcLayouts = .ub ∧
+    evalRvalue locals (.cast .transmute op fcI64Ty) mem decls fcLayouts = .ub ∧
+    evalRvalue locals (.cast .transmute op fcRawPtrU8Ty) mem decls fcLayouts =
+      .ok (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } 8) locals' mem ∧
+    evalRvalue locals (.cast .transmute opScalar fcRawPtrU8Ty) mem decls fcLayouts =
+      .ok (.scalar ⟨bits, 8⟩) locals' mem ∧
+    evalRvalue locals (.cast .transmute opScalar ⟨.ref .not (.uint .u8), 12⟩)
+        mem decls fcLayouts = .ub ∧
+    evalRvalue locals (.cast .floatToInt op fcI64Ty) mem decls fcLayouts = .unsupported ∧
+    evalRvalue locals (.cast .floatToFloat op fcF64Ty) mem decls fcLayouts = .unsupported := by
+  have hp256 : p.offsetBytes < 256 ^ 8 := fc_lt_256_pow_8 hp
+  have hb256 : bits < 256 ^ 8 := fc_lt_256_pow_8 hbits
+  have hEncPtr : encodeByteCastSourceBytes fcLayouts
+      (resolveTyWithLocalDecls decls fcLayouts fcRawPtrU8Ty) (.ptr p 8) =
+      some (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) := rfl
+  have hLenPtr := fc_seqLength_encodeLittleEndianBytes (some (p.allocId, p.tag)) 8 p.offsetBytes
+  have hEncSc : encodeByteCastSourceBytes fcLayouts
+      (resolveTyWithLocalDecls decls fcLayouts fcF64Ty) (.scalar ⟨bits, 8⟩) =
+      some (encodeLittleEndianBytes bits 8 none) := rfl
+  have hLenSc := fc_seqLength_encodeLittleEndianBytes none 8 bits
+  let refU8Ty : Ty := ⟨.ref .not (.uint .u8), 12⟩
+  have hSzRef : tyByteSize decls fcLayouts (resolveTyWithLocalDecls decls fcLayouts refU8Ty) =
+      some 8 := rfl
+  have hResPtr : resolveTyWithLocalDecls decls fcLayouts fcRawPtrU8Ty = fcRawPtrU8Ty := rfl
+  have hResRef : resolveTyWithLocalDecls decls fcLayouts refU8Ty = refU8Ty := rfl
+  refine ⟨?_, (fc_transmute_ptr_to_f64_ub hOpPtr hTyPtr).2.2, ?_, ?_, ?_, ?_, ?_⟩
+  · have hDecB8 : decodeTypedValueFromBytes defaultCodecFuel fcLayouts fcBytes8Ty
+        (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) = none := rfl
+    show evalByteCast locals op fcBytes8Ty mem decls fcLayouts = _
+    rw [fc_evalByteCast_of_encode locals locals' op mem decls fcLayouts _ _ _ 8 _ hOpPtr
+      (fc_tyByteSize_bytes8 decls) hTyPtr (fc_tyByteSize_rawPtrU8 decls) hEncPtr hLenPtr,
+      fc_resolve_bytes8, hDecB8]
+  · have hUnif : abstractBytesUniformProv
+        (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) = true := by
+      simp [abstractBytesUniformProv, abstractBytesAllProvAux, Nat.beq_refl]
+    have hDecPtr : decodeTypedValueFromBytes defaultCodecFuel fcLayouts fcRawPtrU8Ty
+        (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) =
+        some (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } 8) := by
+      change decodePtrBytesNoForge false (.uint .u8) 8
+          (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) = _
+      dsimp only [decodePtrBytesNoForge]
+      rw [fc_seqLength_encodeLittleEndianBytes,
+        fc_decodeScalarBytes_encode (some (p.allocId, p.tag)) false 7 p.offsetBytes hp256, hUnif]
+    show evalByteCast locals op fcRawPtrU8Ty mem decls fcLayouts = _
+    rw [fc_evalByteCast_of_encode locals locals' op mem decls fcLayouts _ _ _ 8 _ hOpPtr
+      (fc_tyByteSize_rawPtrU8 decls) hTyPtr (fc_tyByteSize_rawPtrU8 decls) hEncPtr hLenPtr,
+      hResPtr, hDecPtr]
+  · have hDecSc : decodeTypedValueFromBytes defaultCodecFuel fcLayouts fcRawPtrU8Ty
+        (encodeLittleEndianBytes bits 8 none) = some (.scalar ⟨bits, 8⟩) := by
+      change decodePtrBytesNoForge false (.uint .u8) 8 (encodeLittleEndianBytes bits 8 none) = _
+      dsimp only [decodePtrBytesNoForge]
+      rw [fc_seqLength_encodeLittleEndianBytes,
+        fc_decodeScalarBytes_encode none false 7 bits hb256]
+    show evalByteCast locals opScalar fcRawPtrU8Ty mem decls fcLayouts = _
+    rw [fc_evalByteCast_of_encode locals locals' opScalar mem decls fcLayouts _ _ _ 8 _ hOpSc
+      (fc_tyByteSize_rawPtrU8 decls) hTySc (fc_tyByteSize_f64 decls) hEncSc hLenSc,
+      hResPtr, hDecSc]
+  · have hDecRef : decodeTypedValueFromBytes defaultCodecFuel fcLayouts refU8Ty
+        (encodeLittleEndianBytes bits 8 none) = none := by
+      change decodePtrBytesNoForge true (.uint .u8) 8 (encodeLittleEndianBytes bits 8 none) = _
+      dsimp only [decodePtrBytesNoForge]
+      rw [fc_seqLength_encodeLittleEndianBytes,
+        fc_decodeScalarBytes_encode none false 7 bits hb256]
+    show evalByteCast locals opScalar refU8Ty mem decls fcLayouts = _
+    rw [fc_evalByteCast_of_encode locals locals' opScalar mem decls fcLayouts _ _ _ 8 _ hOpSc
+      hSzRef hTySc (fc_tyByteSize_f64 decls) hEncSc hLenSc,
+      hResRef, hDecRef]
+  · show evalFloatCastRvalue locals .floatToInt op fcI64Ty mem decls fcLayouts = _
+    unfold evalFloatCastRvalue; rw [hOpPtr, hTyPtr]; rfl
+  · show evalFloatCastRvalue locals .floatToFloat op fcF64Ty mem decls fcLayouts = _
+    unfold evalFloatCastRvalue; rw [hOpPtr, hTyPtr]; rfl
+
+
 /-! ## Axiom guards
 
 Every public theorem of this module depends at most on `propext`, `Classical.choice`, and
@@ -2982,6 +4192,186 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_byte_arrays' depe
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_byte_arrays
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_ptr_ref_box_float_boundary' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_ptr_ref_box_float_boundary
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_list_mapM_option_eq_none' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_list_mapM_option_eq_none
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_translateBlock_eq_none_of_stmt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_translateBlock_eq_none_of_stmt
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_translateBlocks_eq_none_of_block' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_translateBlocks_eq_none_of_block
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_translateFn_and_inFragment_of_float_cast_stmt' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_translateFn_and_inFragment_of_float_cast_stmt
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_translateBlocksWithIntrinsics_eq_none' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_translateBlocksWithIntrinsics_eq_none
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_translateFnWithIntrinsics_float_rejected' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_translateFnWithIntrinsics_float_rejected
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_progInFragment_any_fn_rejected' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_progInFragment_any_fn_rejected
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_const_f32_cast_witness' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_const_f32_cast_witness
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_decodeTyped_any_layouts' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_decodeTyped_any_layouts
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_float_scalar_any_layouts' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_transmute_float_scalar_any_layouts
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_f16_f128_transmute_vs_float_cast' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_f16_f128_transmute_vs_float_cast
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_encodeTwosComplement_carrier_bridge' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_encodeTwosComplement_carrier_bridge
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_leByteValsMRM_eq_BM' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_leByteValsMRM_eq_BM
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_uint8_mod_toNat' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_uint8_mod_toNat
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_leBytesDecodeMRM_eq' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_leBytesDecodeMRM_eq
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_u8_inBounds_mod' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_u8_inBounds_mod
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_u8_emod_toNat_mod' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_u8_emod_toNat_mod
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_u8_encodeIntM_mod' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_u8_encodeIntM_mod
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_u8_encodeInt_mod' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_u8_encodeInt_mod
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_layout_u8' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_layout_u8
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_array_u8_encode_decode' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_array_u8_encode_decode
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_array_u8_eq_anneal' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mr_array_u8_eq_anneal
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int_bytes4' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int_bytes4
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int_bytes8' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int_bytes8
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_byte_arrays_symbolic' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_byte_arrays_symbolic
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_uninit_union_transmute_ub' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_uninit_union_transmute_ub
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_evalCastOpM_size_mismatch_ub' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_evalCastOpM_size_mismatch_ub
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_ptr_boundary' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_ptr_boundary
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_anneal_ptr_transmute_and_cast_boundary' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_anneal_ptr_transmute_and_cast_boundary
 
 end AxiomGuards
 
