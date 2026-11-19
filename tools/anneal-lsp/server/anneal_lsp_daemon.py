@@ -2669,6 +2669,28 @@ def serve_daemon(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
 
     srv = ThreadedUnixServer(sock_path, Handler)
     os.chmod(sock_path, 0o600)
+    bound_sock_ino: int | None = None
+    try:
+        bound_sock_ino = os.stat(sock_path).st_ino
+    except OSError:
+        bound_sock_ino = None
+    pid_path = sock_path + ".pid"
+    try:
+        tmp_pid = f"{pid_path}.tmp.{os.getpid()}"
+        Path(tmp_pid).write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "sock_ino": bound_sock_ino,
+                    "script_sha256": SCRIPT_SHA256,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp_pid, pid_path)
+    except OSError:
+        pass
     server_ref.append(srv)
 
     def _sig_handler(_signum: int, _frame: Any) -> None:
@@ -2681,9 +2703,17 @@ def serve_daemon(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
     finally:
         srv.server_close()
         coordinator.shutdown_all()
+        # Only unlink sock_path / pid_path if they still belong to THIS daemon instance
         try:
-            os.unlink(sock_path)
+            if bound_sock_ino is not None and os.stat(sock_path).st_ino == bound_sock_ino:
+                os.unlink(sock_path)
         except OSError:
+            pass
+        try:
+            raw_pid = json.loads(Path(pid_path).read_text(encoding="utf-8"))
+            if isinstance(raw_pid, dict) and raw_pid.get("pid") == os.getpid():
+                os.unlink(pid_path)
+        except Exception:
             pass
 
 
@@ -2739,10 +2769,83 @@ def _ping_matches_expected(
     return not bool(systemd_active_fn())
 
 
+def _reap_displaced_lsp_daemons(sock_path: str, keep_pid: int | None = None) -> list[int]:
+    """Terminates any displaced own-UID `anneal_lsp_daemon.py --serve` processes on `sock_path`."""
+    uid = os.getuid()
+    self_pids = {os.getpid(), os.getppid()}
+    if keep_pid is not None:
+        self_pids.add(int(keep_pid))
+    target_sock = os.path.abspath(sock_path)
+    target_script = os.path.abspath(__file__)
+    victims: set[int] = set()
+
+    pid_path = Path(sock_path + ".pid")
+    if pid_path.is_file():
+        try:
+            doc = json.loads(pid_path.read_text(encoding="utf-8"))
+            rec_pid = int(doc.get("pid") or 0) if isinstance(doc, dict) else 0
+            if rec_pid > 1 and rec_pid not in self_pids:
+                victims.add(rec_pid)
+        except Exception:
+            pass
+
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid in self_pids:
+                continue
+            try:
+                if entry.stat().st_uid != uid:
+                    continue
+                raw_cmd = (entry / "cmdline").read_bytes()
+                parts = [p for p in raw_cmd.decode("utf-8", errors="ignore").split("\x00") if p]
+                if len(parts) < 3 or "--serve" not in parts[2:]:
+                    continue
+                if not Path(parts[0]).name.startswith("python"):
+                    continue
+                if os.path.abspath(parts[1]) != target_script and Path(parts[1]).name != "anneal_lsp_daemon.py":
+                    continue
+                cmd_sock = DEFAULT_SOCKET_PATH
+                for idx, arg in enumerate(parts):
+                    if arg == "--socket" and idx + 1 < len(parts):
+                        cmd_sock = parts[idx + 1]
+                        break
+                    if arg.startswith("--socket="):
+                        cmd_sock = arg.split("=", 1)[1]
+                        break
+                if os.path.abspath(cmd_sock) == target_sock:
+                    victims.add(pid)
+            except OSError:
+                continue
+
+    if not victims:
+        return []
+    victim_list = sorted(victims)
+    for pid in victim_list:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline:
+        if not any(Path(f"/proc/{pid}").exists() for pid in victim_list):
+            return victim_list
+        time.sleep(0.08)
+    for pid in victim_list:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return victim_list
+
+
 def ensure_daemon_running(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
     disk_sha = compute_script_sha256()
     try:
-        ping = _raw_unix_call("ping", {}, timeout_s=2.0, sock_path=sock_path)
+        ping = _raw_unix_call("ping", {}, timeout_s=5.0, sock_path=sock_path)
         if _ping_matches_expected(ping, disk_sha):
             return
     except Exception:
@@ -2754,17 +2857,21 @@ def ensure_daemon_running(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         disk_sha = compute_script_sha256()
         try:
-            ping2 = _raw_unix_call("ping", {}, timeout_s=2.0, sock_path=sock_path)
+            ping2 = _raw_unix_call("ping", {}, timeout_s=6.0, sock_path=sock_path)
             if ping2.get("ok"):
                 if _ping_matches_expected(ping2, disk_sha):
+                    _reap_displaced_lsp_daemons(sock_path, keep_pid=ping2.get("pid"))
                     return
                 try:
-                    _raw_unix_call("shutdown", {}, timeout_s=2.0, sock_path=sock_path)
-                    time.sleep(0.25)
+                    _raw_unix_call("shutdown", {}, timeout_s=3.0, sock_path=sock_path)
+                    time.sleep(0.3)
                 except Exception:
                     pass
         except Exception:
             pass
+
+        # Reap any wedged/duplicate daemon scopes before spawning so `anneal-workloads.slice` stays clean
+        _reap_displaced_lsp_daemons(sock_path, keep_pid=None)
 
         # Single `systemd-run` launcher lives strictly inside `serve_daemon()`.
         spawn_env = os.environ.copy()
@@ -2788,7 +2895,7 @@ def ensure_daemon_running(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
         finally:
             log_f.close()
 
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             rc = proc.poll()
             if rc is not None and rc != 0:
@@ -2796,11 +2903,11 @@ def ensure_daemon_running(sock_path: str = DEFAULT_SOCKET_PATH) -> None:
                     f"`anneal_lsp_daemon.py` exited early with code {rc} while starting on {sock_path}"
                 )
             try:
-                p = _raw_unix_call("ping", {}, timeout_s=0.5, sock_path=sock_path)
+                p = _raw_unix_call("ping", {}, timeout_s=0.8, sock_path=sock_path)
                 if p.get("ok"):
                     return
             except Exception:
-                time.sleep(0.08)
+                time.sleep(0.1)
         raise RuntimeError("Failed to start `anneal_lsp_daemon.py` on " + sock_path)
 
 
