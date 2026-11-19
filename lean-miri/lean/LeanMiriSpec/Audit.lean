@@ -27108,6 +27108,8 @@ section MoveDeinitEquivPins
   MoveDeinitEquiv.placeMachine_mplacesOverlap_zst_or_unsized_false
   MoveDeinitEquiv.placeMachine_mplacesOverlap_resolved
   MoveDeinitEquiv.place_copyRuntimePlaceNoValidate_overlapping_move_ub
+  MoveDeinitEquiv.place_copyRuntimePlaceNoValidate_memory_move
+  MoveDeinitEquiv.place_copyRuntimePlaceNoValidate_immediate_move
   MoveDeinitEquiv.step_clears_pendingMoveDeinit
   MoveDeinitEquiv.call_initFnTailCallMoving_eq
   MoveDeinitEquiv.call_initFnTailCallMoving_inPlace
@@ -27291,6 +27293,43 @@ example {P S C E : Type} (h : Miri.Interpreter.PlaceHooks P S C E)
       .error (.undefinedBehavior "copy_nonoverlapping called on overlapping ranges") s₃ :=
   MoveDeinitEquiv.place_copyRuntimePlaceNoValidate_overlapping_move_ub h copy choice mplace
     srcLayout dest allowTransmute s s₁ s₂ s₃ target hcompat hpad htake hforce hoverlap
+
+example {P S C E : Type} (h : Miri.Interpreter.PlaceHooks P S C E)
+    (copy : Miri.Interpreter.PlaceCopyHooks P S C) (choice : C)
+    (mplace : Miri.Interpreter.MemPlace P) (srcLayout : Miri.Interpreter.LocalLayout)
+    (dest : Miri.Interpreter.RuntimePlace P) (allowTransmute : Bool) (s s₁ s₂ s₃ : S)
+    (target : Miri.Interpreter.MPlaceTy P)
+    (hcompat : copy.compatible srcLayout dest.layout = .ok true)
+    (hpad : copy.hasPadding srcLayout = .ok true)
+    (htake : h.takePendingMoveDeinit s = .ok true s₁)
+    (hforce : Miri.Interpreter.forceAllocation h choice dest s₁ = .ok target s₂)
+    (hdisjoint : h.moveCopyOverlaps choice ⟨mplace, srcLayout⟩ target s₂ = .ok false s₃) :
+    Miri.Interpreter.copyRuntimePlaceNoValidate h copy choice ⟨.indirect mplace, srcLayout⟩ dest
+        allowTransmute s =
+      (do
+        copy.memoryCopy choice ⟨mplace, srcLayout⟩ target
+        h.deinitMemoryRaw choice ⟨mplace, srcLayout⟩) s₃ :=
+  MoveDeinitEquiv.place_copyRuntimePlaceNoValidate_memory_move h copy choice mplace srcLayout dest
+    allowTransmute s s₁ s₂ s₃ target hcompat hpad htake hforce hdisjoint
+
+example {P S C E : Type} (h : Miri.Interpreter.PlaceHooks P S C E)
+    (copy : Miri.Interpreter.PlaceCopyHooks P S C) (choice : C)
+    (mplace : Miri.Interpreter.MemPlace P) (srcLayout : Miri.Interpreter.LocalLayout)
+    (dest : Miri.Interpreter.RuntimePlace P) (allowTransmute : Bool) (s s₁ s₂ : S)
+    (v : Miri.Interpreter.ImmediateValue P)
+    (hcompat : copy.compatible srcLayout dest.layout = .ok true)
+    (hpad : copy.hasPadding srcLayout = .ok false)
+    (htake : h.takePendingMoveDeinit s = .ok true s₁)
+    (hread : copy.readRaw choice ⟨.indirect mplace, srcLayout⟩ s₁ = .ok (.immediate v) s₂)
+    (hsized : srcLayout.layout.isSized = true) (hdsized : dest.layout.layout.isSized = true)
+    (hsize : (srcLayout.layout.size != dest.layout.layout.size) = false) :
+    Miri.Interpreter.copyRuntimePlaceNoValidate h copy choice ⟨.indirect mplace, srcLayout⟩ dest
+        allowTransmute s =
+      (do
+        h.deinitMemoryRaw choice ⟨mplace, srcLayout⟩
+        Miri.Interpreter.writePlaceImmediateNoValidate h choice v.value dest) s₂ :=
+  MoveDeinitEquiv.place_copyRuntimePlaceNoValidate_immediate_move h copy choice mplace srcLayout
+    dest allowTransmute s s₁ s₂ v hcompat hpad htake hread hsized hdsized hsize
 
 example {K User : Type} [DecidableEq K] (config : Miri.Interpreter.PlaceMachine.AccessConfig K User)
     (src dst : Miri.Interpreter.MPlaceTy Miri.Memory.Provenance)

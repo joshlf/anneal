@@ -2740,6 +2740,431 @@ theorem trusted_evalOperand_elem_and_index_move_typed_zst_nonvacuous :
    typedArrElemLayouts, typedArrZstDecls, typedArrU8Decls,
    by decide, typedZst_value_ne_unit, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+theorem dropValues_eq_drop : ∀ (n : Nat) (xs : List Value), dropValues n xs = xs.drop n
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | n + 1, _ :: xs => dropValues_eq_drop n xs
+
+theorem takeValues_eq_take : ∀ (n : Nat) (xs : List Value), takeValues n xs = xs.take n
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | n + 1, x :: xs => congrArg (x :: ·) (takeValues_eq_take n xs)
+
+theorem appendValueList_eq_append :
+    ∀ (xs ys : List Value), appendValueList xs ys = xs ++ ys
+  | [], _ => rfl
+  | x :: xs, ys => congrArg (x :: ·) (appendValueList_eq_append xs ys)
+
+theorem markMovedElems_length : ∀ (xs : List Value), (markMovedElems xs).length = xs.length
+  | [] => rfl
+  | _ :: xs => congrArg Nat.succ (markMovedElems_length xs)
+
+theorem replaceSubslice_markMovedElems_list {elems subElems : List Value}
+    {fromIdx endIdx : Nat}
+    (hend_le : endIdx ≤ elems.length) (hfrom : fromIdx ≤ endIdx)
+    (hext : (elems.drop fromIdx).take (endIdx - fromIdx) = subElems) :
+    let elems' := elems.take fromIdx ++ (markMovedElems subElems ++ elems.drop endIdx)
+    (markMovedElems subElems).length = endIdx - fromIdx ∧
+    elems'.length = elems.length ∧
+    (elems'.drop fromIdx).take (endIdx - fromIdx) = markMovedElems subElems ∧
+    ∀ (j : Nat), (j < fromIdx ∨ endIdx ≤ j) → elems'[j]? = elems[j]? := by
+  have hsub_len : subElems.length = endIdx - fromIdx := by
+    rw [← hext, List.length_take, List.length_drop]; omega
+  have hmark_len : (markMovedElems subElems).length = endIdx - fromIdx :=
+    (markMovedElems_length subElems).trans hsub_len
+  let elems' := elems.take fromIdx ++ (markMovedElems subElems ++ elems.drop endIdx)
+  have helen' : elems'.length = elems.length := by
+    simp only [elems', List.length_append, List.length_take, List.length_drop, hmark_len]; omega
+  have hpre_len : (elems.take fromIdx).length = fromIdx := by
+    simp only [List.length_take]; omega
+  have hslice : (elems'.drop fromIdx).take (endIdx - fromIdx) = markMovedElems subElems := by
+    have hdrop : elems'.drop fromIdx = markMovedElems subElems ++ elems.drop endIdx := by
+      have hd := @List.drop_left Value (elems.take fromIdx) (markMovedElems subElems ++ elems.drop endIdx)
+      rw [hpre_len] at hd
+      exact hd
+    rw [hdrop, List.take_append_of_le_length (by omega), ← hmark_len, List.take_length]
+  refine ⟨hmark_len, helen', hslice, ?_⟩
+  intro j hj
+  rcases hj with hjlt | hjge
+  · rw [List.getElem?_append_left (by omega), List.getElem?_take_of_lt hjlt]
+  · rw [List.getElem?_append_right (by omega), hpre_len,
+      List.getElem?_append_right (by omega), hmark_len, List.getElem?_drop]
+    congr 1; omega
+
+theorem replaceSubslice_markMovedElems_of_extract {elems subElems : List Value}
+    {fromIdx toIdx : Nat} {fromEnd : Bool}
+    (hext : extractSubslice elems fromIdx toIdx fromEnd = some subElems) :
+    ∃ elems',
+      replaceSubslice elems fromIdx toIdx fromEnd (markMovedElems subElems) = some elems' ∧
+      elems'.length = elems.length ∧
+      extractSubslice elems' fromIdx toIdx fromEnd = some (markMovedElems subElems) ∧
+      ∀ (j : Nat),
+        (j < fromIdx ∨ (if fromEnd then elems.length - toIdx else toIdx) ≤ j) →
+        elems'[j]? = elems[j]? := by
+  cases fromEnd with
+  | false =>
+    unfold extractSubslice at hext; dsimp only at hext
+    cases hb1 : Nat.ble toIdx (Trusted.Sequence.length elems) with
+    | false => rw [hb1] at hext; cases hext
+    | true =>
+      rw [hb1] at hext; dsimp only at hext
+      cases hb2 : Nat.ble fromIdx toIdx with
+      | false => rw [hb2] at hext; cases hext
+      | true =>
+        rw [hb2] at hext; dsimp only at hext
+        injection hext with hext
+        rw [takeValues_eq_take, dropValues_eq_drop, Nat.sub_eq] at hext
+        obtain ⟨hmark_len, helen', hslice, hout⟩ :=
+          replaceSubslice_markMovedElems_list (Nat.ble_eq.mp hb1) (Nat.ble_eq.mp hb2) hext
+        let elems' := elems.take fromIdx ++ (markMovedElems subElems ++ elems.drop toIdx)
+        have hlen'_seq : Trusted.Sequence.length elems' = Trusted.Sequence.length elems := helen'
+        have hbeq : Nat.beq (Trusted.Sequence.length (markMovedElems subElems))
+            (Nat.sub toIdx fromIdx) = true := by
+          simp only [Trusted.Sequence.length, Nat.sub_eq, Nat.beq_eq, hmark_len]
+        refine ⟨elems', ?_, helen', ?_, ?_⟩
+        · unfold replaceSubslice; dsimp only
+          rw [hb1]; dsimp only; rw [hb2]; dsimp only; rw [hbeq]; dsimp only
+          simp only [appendValueList_eq_append, takeValues_eq_take, dropValues_eq_drop, elems']
+        · unfold extractSubslice; dsimp only
+          rw [hlen'_seq, hb1]; dsimp only; rw [hb2]; dsimp only
+          simp only [takeValues_eq_take, dropValues_eq_drop, Nat.sub_eq, Option.some.injEq]
+          exact hslice
+        · intro j hj; simp only [Bool.false_eq_true, ↓reduceIte] at hj; exact hout j hj
+  | true =>
+    unfold extractSubslice at hext; dsimp only at hext
+    cases hb1 : Nat.ble toIdx (Trusted.Sequence.length elems) with
+    | false => rw [hb1] at hext; cases hext
+    | true =>
+      rw [hb1] at hext; dsimp only at hext
+      cases hb2 : Nat.ble fromIdx (Nat.sub (Trusted.Sequence.length elems) toIdx) with
+      | false => rw [hb2] at hext; cases hext
+      | true =>
+        rw [hb2] at hext; dsimp only at hext
+        injection hext with hext
+        have hto : toIdx ≤ elems.length := Nat.ble_eq.mp hb1
+        have hfrom : fromIdx ≤ elems.length - toIdx := by
+          have := Nat.ble_eq.mp hb2; simp only [Nat.sub_eq] at this; exact this
+        rw [takeValues_eq_take, dropValues_eq_drop, Nat.sub_eq, Nat.sub_eq] at hext
+        obtain ⟨hmark_len, helen', hslice, hout⟩ :=
+          replaceSubslice_markMovedElems_list (by omega : elems.length - toIdx ≤ elems.length)
+            hfrom hext
+        let elems' :=
+          elems.take fromIdx ++ (markMovedElems subElems ++ elems.drop (elems.length - toIdx))
+        have hlen'_seq : Trusted.Sequence.length elems' = Trusted.Sequence.length elems := helen'
+        have hbeq : Nat.beq (Trusted.Sequence.length (markMovedElems subElems))
+            (Nat.sub (Nat.sub (Trusted.Sequence.length elems) toIdx) fromIdx) = true := by
+          simp only [Trusted.Sequence.length, Nat.sub_eq, Nat.beq_eq, hmark_len]
+        refine ⟨elems', ?_, helen', ?_, ?_⟩
+        · unfold replaceSubslice; dsimp only
+          rw [hb1]; dsimp only; rw [hb2]; dsimp only; rw [hbeq]; dsimp only
+          simp only [appendValueList_eq_append, takeValues_eq_take, dropValues_eq_drop,
+            Nat.sub_eq, elems']
+          rfl
+        · unfold extractSubslice; dsimp only
+          rw [hlen'_seq, hb1]; dsimp only; rw [hb2]; dsimp only
+          simp only [takeValues_eq_take, dropValues_eq_drop, Nat.sub_eq, Option.some.injEq]
+          exact hslice
+        · intro j hj; simp only [↓reduceIte] at hj; exact hout j hj
+
+/-- **Projected `.subslice` (both `fromEnd` polarities) and `fromEnd = true`
+`.constantIndex` moves in every non-union typed context (any `localDecls`).** -/
+theorem trusted_evalOperand_subslice_and_fromEnd_move_typed :
+    (∀ (locals : List LocalSlot) (l : Local) (elems : List Value) (off minLen : Nat) (v : Value)
+        (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
+        (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+        (callStack : List SavedCallerFrame),
+      Trusted.Sequence.get? locals l = some (.init (.aggregate 0 elems)) →
+      minLen ≤ Trusted.Sequence.length elems →
+      Trusted.Sequence.get? elems (Trusted.Sequence.length elems - off) = some v →
+      placeTouchesUnion localDecls layouts ⟨l, [.constantIndex off minLen true]⟩ = false →
+      valueContainsMovedUninit v = false →
+      evalOperand locals (.copy ⟨l, [.constantIndex off minLen true]⟩) borrows globals layouts
+        callerLocals localDecls callStack true = .ok v locals ∧
+      (moveValueIsZeroSized localDecls layouts
+          (placeTyResolved localDecls layouts ⟨l, [.constantIndex off minLen true]⟩) v = false →
+        ∃ locals',
+          evalOperand locals (.move ⟨l, [.constantIndex off minLen true]⟩) borrows globals
+            layouts callerLocals localDecls callStack true = .ok v locals' ∧
+          evalOperands locals
+            [.copy ⟨l, [.constantIndex off minLen true]⟩,
+             .move ⟨l, [.constantIndex off minLen true]⟩]
+            borrows globals layouts callerLocals localDecls callStack true = .ok [v, v] locals' ∧
+          evalOperands locals
+            [.move ⟨l, [.constantIndex off minLen true]⟩,
+             .copy ⟨l, [.constantIndex off minLen true]⟩]
+            borrows globals layouts callerLocals localDecls callStack true = .ub ∧
+          evalOperands locals
+            [.move ⟨l, [.constantIndex off minLen true]⟩,
+             .move ⟨l, [.constantIndex off minLen true]⟩]
+            borrows globals layouts callerLocals localDecls callStack true = .ub ∧
+          ∀ (j : Nat) (w : Value), j ≠ Trusted.Sequence.length elems - off →
+            Trusted.Sequence.get? elems j = some w →
+            placeTouchesUnion localDecls layouts ⟨l, [.constantIndex j minLen false]⟩ = false →
+            valueContainsMovedUninit w = false →
+            evalOperands locals
+              [.move ⟨l, [.constantIndex off minLen true]⟩,
+               .copy ⟨l, [.constantIndex j minLen false]⟩]
+              borrows globals layouts callerLocals localDecls callStack true =
+                .ok [v, w] locals') ∧
+      (moveValueIsZeroSized localDecls layouts
+          (placeTyResolved localDecls layouts ⟨l, [.constantIndex off minLen true]⟩) v = true →
+        evalOperand locals (.move ⟨l, [.constantIndex off minLen true]⟩) borrows globals layouts
+          callerLocals localDecls callStack true = .ok v locals ∧
+        evalOperands locals
+          [.move ⟨l, [.constantIndex off minLen true]⟩,
+           .copy ⟨l, [.constantIndex off minLen true]⟩]
+          borrows globals layouts callerLocals localDecls callStack true = .ok [v, v] locals ∧
+        (valueListContainsMovedUninit elems = false →
+          evalOperands locals
+            [.move ⟨l, [.constantIndex off minLen true]⟩, .copy ⟨l, []⟩]
+            borrows globals layouts callerLocals localDecls callStack true =
+              .ok [v, .aggregate 0 elems] locals))) ∧
+    (∀ (locals : List LocalSlot) (l : Local) (elems subElems : List Value)
+        (fromIdx toIdx : Nat) (fromEnd : Bool)
+        (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
+        (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+        (callStack : List SavedCallerFrame),
+      Trusted.Sequence.get? locals l = some (.init (.aggregate 0 elems)) →
+      extractSubslice elems fromIdx toIdx fromEnd = some subElems →
+      placeTouchesUnion localDecls layouts ⟨l, [.subslice fromIdx toIdx fromEnd]⟩ = false →
+      valueListContainsMovedUninit subElems = false →
+      evalOperand locals (.copy ⟨l, [.subslice fromIdx toIdx fromEnd]⟩) borrows globals layouts
+        callerLocals localDecls callStack true = .ok (.aggregate 0 subElems) locals ∧
+      (moveValueIsZeroSized localDecls layouts
+          (placeTyResolved localDecls layouts ⟨l, [.subslice fromIdx toIdx fromEnd]⟩)
+          (.aggregate 0 subElems) = false →
+        valueListContainsMovedUninit (markMovedElems subElems) = true →
+        ∃ locals',
+          evalOperand locals (.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩) borrows globals
+            layouts callerLocals localDecls callStack true =
+              .ok (.aggregate 0 subElems) locals' ∧
+          evalOperands locals
+            [.copy ⟨l, [.subslice fromIdx toIdx fromEnd]⟩,
+             .move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩]
+            borrows globals layouts callerLocals localDecls callStack true =
+              .ok [.aggregate 0 subElems, .aggregate 0 subElems] locals' ∧
+          evalOperands locals
+            [.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩,
+             .copy ⟨l, [.subslice fromIdx toIdx fromEnd]⟩]
+            borrows globals layouts callerLocals localDecls callStack true = .ub ∧
+          evalOperands locals
+            [.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩,
+             .move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩]
+            borrows globals layouts callerLocals localDecls callStack true = .ub ∧
+          ∀ (j : Nat) (w : Value),
+            (j < fromIdx ∨
+              (if fromEnd then Trusted.Sequence.length elems - toIdx else toIdx) ≤ j) →
+            Trusted.Sequence.get? elems j = some w →
+            placeTouchesUnion localDecls layouts ⟨l, [.constantIndex j 0 false]⟩ = false →
+            valueContainsMovedUninit w = false →
+            evalOperands locals
+              [.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩,
+               .copy ⟨l, [.constantIndex j 0 false]⟩]
+              borrows globals layouts callerLocals localDecls callStack true =
+                .ok [.aggregate 0 subElems, w] locals') ∧
+      (moveValueIsZeroSized localDecls layouts
+          (placeTyResolved localDecls layouts ⟨l, [.subslice fromIdx toIdx fromEnd]⟩)
+          (.aggregate 0 subElems) = true →
+        evalOperand locals (.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩) borrows globals layouts
+          callerLocals localDecls callStack true = .ok (.aggregate 0 subElems) locals ∧
+        evalOperands locals
+          [.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩,
+           .copy ⟨l, [.subslice fromIdx toIdx fromEnd]⟩]
+          borrows globals layouts callerLocals localDecls callStack true =
+            .ok [.aggregate 0 subElems, .aggregate 0 subElems] locals ∧
+        (valueListContainsMovedUninit elems = false →
+          evalOperands locals
+            [.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩, .copy ⟨l, []⟩]
+            borrows globals layouts callerLocals localDecls callStack true =
+              .ok [.aggregate 0 subElems, .aggregate 0 elems] locals))) := by
+  refine ⟨?_, ?_⟩
+  · intro locals l elems off minLen v borrows globals layouts callerLocals localDecls callStack
+      hl hmin hv hnu hmv
+    have hidx := seq_lt_of_get? hv
+    have hll := seq_lt_of_get? hl
+    have hble : Nat.ble minLen (Trusted.Sequence.length elems) = true := Nat.ble_eq.mpr hmin
+    have hcopy : evalOperand locals (.copy ⟨l, [.constantIndex off minLen true]⟩) borrows globals
+        layouts callerLocals localDecls callStack true = .ok v locals := by
+      simp only [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hl, hnu, readProjectedValue,
+        hble, Nat.sub_eq, hv, hmv]
+    refine ⟨hcopy, fun hzst => ?_, fun hzst => ?_⟩
+    · let mval := movedMarkerValue [.constantIndex off minLen true] v
+      let elems' := elems.set (Trusted.Sequence.length elems - off) mval
+      let locals' := locals.set l (.init (.aggregate 0 elems'))
+      have hmark : valueContainsMovedUninit mval = true :=
+        movedMarkerValue_contains_of_not_subslice _ v (by intro a b c h; cases h)
+      have hl' : Trusted.Sequence.get? locals' l = some (.init (.aggregate 0 elems')) :=
+        seq_get?_set_self hll _
+      have helen' : Trusted.Sequence.length elems' = Trusted.Sequence.length elems := by
+        simp only [elems', Trusted.Sequence.length, List.length_set]
+      have hm' : Trusted.Sequence.get? elems' (Trusted.Sequence.length elems' - off) =
+          some mval := by
+        rw [helen']; exact seq_get?_set_self hidx _
+      have hble' : Nat.ble minLen (Trusted.Sequence.length elems') = true := by
+        rw [helen']; exact hble
+      have hse := seq_set?_of_lt hidx mval
+      have hsl := seq_set?_of_lt hll (LocalSlot.init (.aggregate 0 elems'))
+      have hmove : evalOperand locals (.move ⟨l, [.constantIndex off minLen true]⟩) borrows
+          globals layouts callerLocals localDecls callStack true = .ok v locals' := by
+        simp only [evalOperand, evalMoveOperandDeinit, evalCopyPlaceRead, hl, hnu,
+          readProjectedValue, hble, Nat.sub_eq, hv, hmv, hzst, deinitMovedSubPlace, projHasDeref,
+          writeProjectedValue, hse, hsl, locals', elems', mval]
+      have hcopy' : evalOperand locals' (.copy ⟨l, [.constantIndex off minLen true]⟩) borrows
+          globals layouts callerLocals localDecls callStack true = .ub := by
+        simp only [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hl', hnu,
+          readProjectedValue, hble', Nat.sub_eq, hm', hmark]
+      have hmove' : evalOperand locals' (.move ⟨l, [.constantIndex off minLen true]⟩) borrows
+          globals layouts callerLocals localDecls callStack true = .ub := by
+        simp only [evalOperand, evalMoveOperandDeinit, evalCopyPlaceRead, hl', hnu,
+          readProjectedValue, hble', Nat.sub_eq, hm', hmark]
+      refine ⟨locals', hmove, ?_, ?_, ?_, ?_⟩
+      · simp only [evalOperands, hcopy, hmove]
+      · simp only [evalOperands, hmove, hcopy']
+      · simp only [evalOperands, hmove, hmove']
+      · intro j w hj hw hnuj hmw
+        have hw' : Trusted.Sequence.get? elems' j = some w := by
+          dsimp only [elems']; rw [seq_get?_set_ne _ _ hj]; exact hw
+        have hcopyJ : evalOperand locals' (.copy ⟨l, [.constantIndex j minLen false]⟩) borrows
+            globals layouts callerLocals localDecls callStack true = .ok w locals' := by
+          simp only [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hl', hnuj,
+            readProjectedValue, hble', hw', hmw]
+        simp only [evalOperands, hmove, hcopyJ]
+    · have hmove : evalOperand locals (.move ⟨l, [.constantIndex off minLen true]⟩) borrows
+          globals layouts callerLocals localDecls callStack true = .ok v locals := by
+        simp only [evalOperand, evalMoveOperandDeinit, evalCopyPlaceRead, hl, hnu,
+          readProjectedValue, hble, Nat.sub_eq, hv, hmv, hzst]
+      refine ⟨hmove, ?_, fun helems => ?_⟩
+      · simp only [evalOperands, hmove, hcopy]
+      · have hrootCopy : evalOperand locals (.copy ⟨l, []⟩) borrows globals layouts callerLocals
+            localDecls callStack true = .ok (.aggregate 0 elems) locals := by
+          simp only [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hl, readProjectedValue,
+            valueContainsMovedUninit, helems]
+        simp only [evalOperands, hmove, hrootCopy]
+  · intro locals l elems subElems fromIdx toIdx fromEnd borrows globals layouts callerLocals
+      localDecls callStack hl hext hnu hmv
+    have hll := seq_lt_of_get? hl
+    have hmv_agg : valueContainsMovedUninit (.aggregate 0 subElems) = false := hmv
+    have hcopy : evalOperand locals (.copy ⟨l, [.subslice fromIdx toIdx fromEnd]⟩) borrows globals
+        layouts callerLocals localDecls callStack true = .ok (.aggregate 0 subElems) locals := by
+      simp only [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hl, hnu, readProjectedValue,
+        hext, hmv_agg]
+    refine ⟨hcopy, fun hzst hmark_sub => ?_, fun hzst => ?_⟩
+    · obtain ⟨elems', hrep, helen', hext', hout⟩ :=
+        replaceSubslice_markMovedElems_of_extract hext
+      let locals' := locals.set l (.init (.aggregate 0 elems'))
+      have hl' : Trusted.Sequence.get? locals' l = some (.init (.aggregate 0 elems')) :=
+        seq_get?_set_self hll _
+      have hsl := seq_set?_of_lt hll (LocalSlot.init (.aggregate 0 elems'))
+      have hmval : movedMarkerValue [.subslice fromIdx toIdx fromEnd] (.aggregate 0 subElems) =
+          .aggregate 0 (markMovedElems subElems) := rfl
+      have hmark_agg : valueContainsMovedUninit (.aggregate 0 (markMovedElems subElems)) = true :=
+        hmark_sub
+      have hmove : evalOperand locals (.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩) borrows
+          globals layouts callerLocals localDecls callStack true =
+            .ok (.aggregate 0 subElems) locals' := by
+        simp only [evalOperand, evalMoveOperandDeinit, evalCopyPlaceRead, hl, hnu,
+          readProjectedValue, hext, hmv_agg, hzst, deinitMovedSubPlace, projHasDeref, hmval,
+          writeProjectedValue, hrep, hsl, locals']
+      have hcopy' : evalOperand locals' (.copy ⟨l, [.subslice fromIdx toIdx fromEnd]⟩) borrows
+          globals layouts callerLocals localDecls callStack true = .ub := by
+        simp only [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hl', hnu,
+          readProjectedValue, hext', hmark_agg]
+      have hmove' : evalOperand locals' (.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩) borrows
+          globals layouts callerLocals localDecls callStack true = .ub := by
+        simp only [evalOperand, evalMoveOperandDeinit, evalCopyPlaceRead, hl', hnu,
+          readProjectedValue, hext', hmark_agg]
+      refine ⟨locals', hmove, ?_, ?_, ?_, ?_⟩
+      · simp only [evalOperands, hcopy, hmove]
+      · simp only [evalOperands, hmove, hcopy']
+      · simp only [evalOperands, hmove, hmove']
+      · intro j w hj hw hnuj hmw
+        have hw' : Trusted.Sequence.get? elems' j = some w := by
+          simp only [seq_get?_eq] at hw ⊢
+          exact (hout j hj).trans hw
+        have hble0 : Nat.ble 0 (Trusted.Sequence.length elems') = true := by
+          simp only [Nat.ble_eq]; omega
+        have hcopyJ : evalOperand locals' (.copy ⟨l, [.constantIndex j 0 false]⟩) borrows globals
+            layouts callerLocals localDecls callStack true = .ok w locals' := by
+          simp only [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hl', hnuj,
+            readProjectedValue, hble0, hw', hmw]
+        simp only [evalOperands, hmove, hcopyJ]
+    · have hmove : evalOperand locals (.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩) borrows
+          globals layouts callerLocals localDecls callStack true =
+            .ok (.aggregate 0 subElems) locals := by
+        simp only [evalOperand, evalMoveOperandDeinit, evalCopyPlaceRead, hl, hnu,
+          readProjectedValue, hext, hmv_agg, hzst]
+      refine ⟨hmove, ?_, fun helems => ?_⟩
+      · simp only [evalOperands, hmove, hcopy]
+      · have hrootCopy : evalOperand locals (.copy ⟨l, []⟩) borrows globals layouts callerLocals
+            localDecls callStack true = .ok (.aggregate 0 elems) locals := by
+          simp only [evalOperand, guardMovedUninitRead, evalCopyPlaceRead, hl, readProjectedValue,
+            valueContainsMovedUninit, helems]
+        simp only [evalOperands, hmove, hrootCopy]
+
+/-- Layout table `[(), [(); 4], u8, [u8; 4]]` for typed subslice and `fromEnd` move witnesses. -/
+def typedSubsliceLayouts : LayoutTable :=
+  { emptyLayoutTable with
+    entries := [
+      typedZstUnitLayout,
+      { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .array ⟨0⟩ 4,
+        variants := .single 0, isUninhabited := false, fieldLayouts := [0] },
+      claimU8Layout,
+      { size := ⟨4⟩, align := ⟨1⟩, backendRepr := .memory, fields := .array ⟨1⟩ 4,
+        variants := .single 0, isUninhabited := false, fieldLayouts := [2] }] }
+
+/-- Local declarations `_0 : (), _1 : [(); 4]` for the ZST subslice witness. -/
+def typedSubsliceZstDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 }, debugName := .none },
+   { mutability := .mut, ty := { kind := .array (.tuple []) 4, layoutIdx := 1 }, debugName := .none }]
+
+/-- Local declarations `_0 : u8, _1 : [u8; 4]` for the empty vs non-empty `u8` subslice witness. -/
+def typedSubsliceU8Decls : List LocalDecl :=
+  [{ mutability := .mut, ty := { kind := .uint .u8, layoutIdx := 2 }, debugName := .none },
+   { mutability := .mut, ty := { kind := .array (.uint .u8) 4, layoutIdx := 3 }, debugName := .none }]
+
+/-- **Non-vacuity of both polarities of `trusted_evalOperand_subslice_and_fromEnd_move_typed`.** -/
+theorem trusted_evalOperand_subslice_and_fromEnd_move_typed_zst_nonvacuous :
+    ∃ (localsZst localsU8 : List LocalSlot) (l : Local) (vZst subZst rootZst rootU8 : Value)
+        (layouts : LayoutTable) (declsZst declsU8 : List LocalDecl),
+      vZst ≠ .unit ∧
+      Trusted.Sequence.get? localsZst l = some (.init rootZst) ∧
+      Trusted.Sequence.get? localsU8 l = some (.init rootU8) ∧
+      placeTouchesUnion declsZst layouts ⟨l, [.subslice 1 3 false]⟩ = false ∧
+      placeTouchesUnion declsZst layouts ⟨l, [.subslice 1 1 true]⟩ = false ∧
+      placeTouchesUnion declsZst layouts ⟨l, [.constantIndex 1 4 true]⟩ = false ∧
+      placeTouchesUnion declsU8 layouts ⟨l, [.subslice 2 2 false]⟩ = false ∧
+      placeTouchesUnion declsU8 layouts ⟨l, [.subslice 1 3 false]⟩ = false ∧
+      moveValueIsZeroSized declsZst layouts
+        (placeTyResolved declsZst layouts ⟨l, [.subslice 1 3 false]⟩) subZst = true ∧
+      moveValueIsZeroSized [] layouts
+        (placeTyResolved [] layouts ⟨l, [.subslice 1 3 false]⟩) subZst = false ∧
+      moveValueIsZeroSized declsU8 layouts
+        (placeTyResolved declsU8 layouts ⟨l, [.subslice 2 2 false]⟩) (.aggregate 0 []) = true ∧
+      evalOperands localsZst [.move ⟨l, [.subslice 1 3 false]⟩, .copy ⟨l, []⟩] [] [] layouts
+        [] declsZst [] true = .ok [subZst, rootZst] localsZst ∧
+      evalOperands localsZst [.move ⟨l, [.subslice 1 1 true]⟩, .copy ⟨l, []⟩] [] [] layouts
+        [] declsZst [] true = .ok [subZst, rootZst] localsZst ∧
+      evalOperands localsZst [.move ⟨l, [.constantIndex 1 4 true]⟩, .copy ⟨l, []⟩] [] [] layouts
+        [] declsZst [] true = .ok [vZst, rootZst] localsZst ∧
+      evalOperands localsZst [.move ⟨l, [.subslice 1 3 false]⟩, .copy ⟨l, []⟩] [] [] layouts
+        [] [] [] true = .ub ∧
+      evalOperands localsU8 [.move ⟨l, [.subslice 2 2 false]⟩, .copy ⟨l, []⟩] [] [] layouts
+        [] declsU8 [] true = .ok [.aggregate 0 [], rootU8] localsU8 ∧
+      evalOperands localsU8 [.move ⟨l, [.subslice 1 3 false]⟩, .copy ⟨l, []⟩] [] [] layouts
+        [] declsU8 [] true = .ub :=
+  ⟨[.uninit,
+    .init (.aggregate 0 [.aggregate 0 [], .aggregate 0 [], .aggregate 0 [], .aggregate 0 []])],
+   [.uninit,
+    .init (.aggregate 0 [u8Value 10, u8Value 20, u8Value 30, u8Value 40])],
+   1,
+   .aggregate 0 [],
+   .aggregate 0 [.aggregate 0 [], .aggregate 0 []],
+   .aggregate 0 [.aggregate 0 [], .aggregate 0 [], .aggregate 0 [], .aggregate 0 []],
+   .aggregate 0 [u8Value 10, u8Value 20, u8Value 30, u8Value 40],
+   typedSubsliceLayouts, typedSubsliceZstDecls, typedSubsliceU8Decls,
+   typedZst_value_ne_unit, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+   rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 /-- **`TrustedProjectedMoveDeinitClaim`** (proved here; restated in
 `Anneal.Mir.Correspondence.Claims`). -/
 theorem trustedProjectedMoveDeinitClaim_proof : TrustedProjectedMoveDeinitClaim :=
@@ -2764,7 +3189,9 @@ theorem trustedProjectedMoveDeinitClaim_proof : TrustedProjectedMoveDeinitClaim 
    trusted_evalOperand_transparent_root_move,
    trusted_evalOperand_subscalar_vs_union_deref_move,
    trusted_evalOperand_elem_and_index_move_typed,
-   trusted_evalOperand_elem_and_index_move_typed_zst_nonvacuous⟩
+   trusted_evalOperand_elem_and_index_move_typed_zst_nonvacuous,
+   trusted_evalOperand_subslice_and_fromEnd_move_typed,
+   trusted_evalOperand_subslice_and_fromEnd_move_typed_zst_nonvacuous⟩
 
 /-! ## Part 10c — Fail-closed pointer constants, destination-first
 assignments, and a non-vacuity witness for the assignment Tree Borrows theorem -/

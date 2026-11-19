@@ -1144,12 +1144,13 @@ inductive Instr : Type where
 
 /-! ### Places -/
 
-/-- Byte offset of field `i` in layout `l`. -/
+/-- Byte offset of field `i` in layout `l` (checked against `count` for arrays and unions). -/
 def fieldOffset (l : TypeLayout) (i : Nat) : Option Nat :=
   match l.fields with
   | .arbitrary offsets _ => (nth? offsets i).map Size.bytes
-  | .array stride _ => some (i * stride.bytes)
-  | _ => none
+  | .array stride count => if Nat.blt i count then some (i * stride.bytes) else none
+  | .union count => if Nat.blt i count then some 0 else none
+  | .primitive => none
 
 /-- The memory place a pointer value of type `ty` points to. -/
 def derefTarget (ptrBits : Nat) (b : Bytes) (ty : SemTy) : Except Fault (MPlace × SemTy) :=
@@ -1192,7 +1193,10 @@ def walkProjs (ptrBits : Nat) (st : PState) (fr : PFrame) :
   | mp, ty, .field i fty :: rest =>
     match fieldOffset ty.2 i with
     | none => .error .unsupported
-    | some fo => walkProjs ptrBits st fr ⟨mp.alloc, mp.offset + fo, fty.2.size.bytes, mp.tag⟩ fty rest
+    | some fo =>
+      match Nat.ble (fo + fty.2.size.bytes) mp.size with
+      | false => .error .unsupported
+      | true => walkProjs ptrBits st fr ⟨mp.alloc, mp.offset + fo, fty.2.size.bytes, mp.tag⟩ fty rest
   | mp, ty, .constantIndex off minLen fromEnd :: rest =>
     match ty.1 with
     | .array _ n =>
@@ -1571,13 +1575,17 @@ def evalBinOpBytes (o : BinOp) (lb rb : Bytes) : Except Fault Bytes :=
     | _ => .error .unsupported
   | _, _ => .error (.ub .invalidUninitBytes)
 
-/-- Place the field byte strings at their layout offsets. -/
+/-- Place the field byte strings at their layout offsets, failing closed if a
+field overruns the aggregate's byte size. -/
 def buildAggregateAux (l : TypeLayout) : Nat → Bytes → List Bytes → Except Fault Bytes
   | _, acc, [] => .ok acc
   | i, acc, fb :: rest =>
     match fieldOffset l i with
     | none => .error .unsupported
-    | some off => buildAggregateAux l (i + 1) (overwriteBytes acc off fb) rest
+    | some off =>
+      match Nat.ble (off + fb.length) acc.length with
+      | false => .error .unsupported
+      | true => buildAggregateAux l (i + 1) (overwriteBytes acc off fb) rest
 
 /-- Build an aggregate's bytes (padding stays uninitialized). -/
 def buildAggregate (l : TypeLayout) (fields : List Bytes) : Except Fault Bytes :=
@@ -2821,12 +2829,28 @@ def claimUnionPtrDecls : List LocalDecl :=
        copy _l[j]]` returns `[v, w]` on every non-union sibling element `j ≠ idx`;
        if the element is zero-sized, moving `_l[idx]` leaves the array intact so
        both `[move _l[idx], copy _l[idx]]` and `[move _l[idx], copy _l]` succeed;
-       and
    20. (*non-vacuity of both polarities of 19*) on a typed array `_1 : [(); 2]`
        whose `0`-byte elements hold `.aggregate 0 [] ≠ .unit`, `[move _1[0],
        copy _1]` (both `.constantIndex` and `.index`) succeeds in the typed
        context while faulting with `.ub` in the untyped context, whereas on
-       `_1 : [u8; 2]` `[move _1[0], copy _1]` faults with `.ub`. -/
+       `_1 : [u8; 2]` `[move _1[0], copy _1]` faults with `.ub`;
+   21. (*projected `.subslice` and `fromEnd = true` `.constantIndex` moves in
+       every non-union typed context, all states*) for any local declarations,
+       both `fromEnd` polarities (`fromEnd = false` and `fromEnd = true`) on
+       `.subslice fromIdx toIdx fromEnd` (and `fromEnd = true` on
+       `.constantIndex off minLen true`) copy an initialized non-moved window;
+       when non-zero-sized, moving the window deinitializes only the moved
+       elements so `[copy, move]` succeeds, `[move, copy]` and `[move, move]`
+       fault with `.ub`, and every non-union element outside `[fromIdx, endIdx)`
+       stays readable via `evalOperands`; when zero-sized (`0`-byte element array
+       or empty `[fromIdx..fromIdx]` subslice), moving leaves `locals` intact so
+       both `[move, copy sub]` and `[move, copy _l]` succeed; and
+   22. (*non-vacuity of both polarities of 21*) on `_1 : [(); 4]` holding
+       non-`.unit` `.aggregate 0 []` elements, `[move _1[1..3], copy _1]`,
+       `[move _1[1..-1], copy _1]`, and `[move _1[-1], copy _1]` succeed in the
+       typed context while faulting with `.ub` in the untyped context, and on
+       `_1 : [u8; 4]`, empty `[move _1[2..2], copy _1]` succeeds while non-empty
+       `[move _1[1..3], copy _1]` faults with `.ub`. -/
 def TrustedProjectedMoveDeinitClaim : Prop :=
   -- (a) root moves (legacy `false` and `deinitProjectedMoves := true`)
   (∀ (locals locals' : List LocalSlot) (l : Local) (v : Value) (borrows : List BorrowEntry)
@@ -3376,6 +3400,145 @@ def TrustedProjectedMoveDeinitClaim : Prop :=
     evalOperands localsZst [.move ⟨l, [.constantIndex 0 2 false]⟩, .copy ⟨l, []⟩] [] [] layouts
       [] [] [] true = .ub ∧
     evalOperands localsU8 [.move ⟨l, [.constantIndex 0 2 false]⟩, .copy ⟨l, []⟩] [] [] layouts
+      [] declsU8 [] true = .ub) ∧
+  -- (c21) projected `.subslice` (both `fromEnd` polarities) and `fromEnd = true`
+  --       `.constantIndex` moves in every non-union typed context (any `localDecls`)
+  ((∀ (locals : List LocalSlot) (l : Local) (elems : List Value) (off minLen : Nat) (v : Value)
+        (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
+        (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+        (callStack : List SavedCallerFrame),
+      Trusted.Sequence.get? locals l = some (.init (.aggregate 0 elems)) →
+      minLen ≤ Trusted.Sequence.length elems →
+      Trusted.Sequence.get? elems (Trusted.Sequence.length elems - off) = some v →
+      placeTouchesUnion localDecls layouts ⟨l, [.constantIndex off minLen true]⟩ = false →
+      valueContainsMovedUninit v = false →
+      evalOperand locals (.copy ⟨l, [.constantIndex off minLen true]⟩) borrows globals layouts
+        callerLocals localDecls callStack true = .ok v locals ∧
+      (moveValueIsZeroSized localDecls layouts
+          (placeTyResolved localDecls layouts ⟨l, [.constantIndex off minLen true]⟩) v = false →
+        ∃ locals',
+          evalOperand locals (.move ⟨l, [.constantIndex off minLen true]⟩) borrows globals
+            layouts callerLocals localDecls callStack true = .ok v locals' ∧
+          evalOperands locals
+            [.copy ⟨l, [.constantIndex off minLen true]⟩,
+             .move ⟨l, [.constantIndex off minLen true]⟩]
+            borrows globals layouts callerLocals localDecls callStack true = .ok [v, v] locals' ∧
+          evalOperands locals
+            [.move ⟨l, [.constantIndex off minLen true]⟩,
+             .copy ⟨l, [.constantIndex off minLen true]⟩]
+            borrows globals layouts callerLocals localDecls callStack true = .ub ∧
+          evalOperands locals
+            [.move ⟨l, [.constantIndex off minLen true]⟩,
+             .move ⟨l, [.constantIndex off minLen true]⟩]
+            borrows globals layouts callerLocals localDecls callStack true = .ub ∧
+          ∀ (j : Nat) (w : Value), j ≠ Trusted.Sequence.length elems - off →
+            Trusted.Sequence.get? elems j = some w →
+            placeTouchesUnion localDecls layouts ⟨l, [.constantIndex j minLen false]⟩ = false →
+            valueContainsMovedUninit w = false →
+            evalOperands locals
+              [.move ⟨l, [.constantIndex off minLen true]⟩,
+               .copy ⟨l, [.constantIndex j minLen false]⟩]
+              borrows globals layouts callerLocals localDecls callStack true =
+                .ok [v, w] locals') ∧
+      (moveValueIsZeroSized localDecls layouts
+          (placeTyResolved localDecls layouts ⟨l, [.constantIndex off minLen true]⟩) v = true →
+        evalOperand locals (.move ⟨l, [.constantIndex off minLen true]⟩) borrows globals layouts
+          callerLocals localDecls callStack true = .ok v locals ∧
+        evalOperands locals
+          [.move ⟨l, [.constantIndex off minLen true]⟩,
+           .copy ⟨l, [.constantIndex off minLen true]⟩]
+          borrows globals layouts callerLocals localDecls callStack true = .ok [v, v] locals ∧
+        (valueListContainsMovedUninit elems = false →
+          evalOperands locals
+            [.move ⟨l, [.constantIndex off minLen true]⟩, .copy ⟨l, []⟩]
+            borrows globals layouts callerLocals localDecls callStack true =
+              .ok [v, .aggregate 0 elems] locals))) ∧
+   (∀ (locals : List LocalSlot) (l : Local) (elems subElems : List Value)
+        (fromIdx toIdx : Nat) (fromEnd : Bool)
+        (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
+        (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+        (callStack : List SavedCallerFrame),
+      Trusted.Sequence.get? locals l = some (.init (.aggregate 0 elems)) →
+      extractSubslice elems fromIdx toIdx fromEnd = some subElems →
+      placeTouchesUnion localDecls layouts ⟨l, [.subslice fromIdx toIdx fromEnd]⟩ = false →
+      valueListContainsMovedUninit subElems = false →
+      evalOperand locals (.copy ⟨l, [.subslice fromIdx toIdx fromEnd]⟩) borrows globals layouts
+        callerLocals localDecls callStack true = .ok (.aggregate 0 subElems) locals ∧
+      (moveValueIsZeroSized localDecls layouts
+          (placeTyResolved localDecls layouts ⟨l, [.subslice fromIdx toIdx fromEnd]⟩)
+          (.aggregate 0 subElems) = false →
+        valueListContainsMovedUninit (markMovedElems subElems) = true →
+        ∃ locals',
+          evalOperand locals (.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩) borrows globals
+            layouts callerLocals localDecls callStack true =
+              .ok (.aggregate 0 subElems) locals' ∧
+          evalOperands locals
+            [.copy ⟨l, [.subslice fromIdx toIdx fromEnd]⟩,
+             .move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩]
+            borrows globals layouts callerLocals localDecls callStack true =
+              .ok [.aggregate 0 subElems, .aggregate 0 subElems] locals' ∧
+          evalOperands locals
+            [.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩,
+             .copy ⟨l, [.subslice fromIdx toIdx fromEnd]⟩]
+            borrows globals layouts callerLocals localDecls callStack true = .ub ∧
+          evalOperands locals
+            [.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩,
+             .move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩]
+            borrows globals layouts callerLocals localDecls callStack true = .ub ∧
+          ∀ (j : Nat) (w : Value),
+            (j < fromIdx ∨
+              (if fromEnd then Trusted.Sequence.length elems - toIdx else toIdx) ≤ j) →
+            Trusted.Sequence.get? elems j = some w →
+            placeTouchesUnion localDecls layouts ⟨l, [.constantIndex j 0 false]⟩ = false →
+            valueContainsMovedUninit w = false →
+            evalOperands locals
+              [.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩,
+               .copy ⟨l, [.constantIndex j 0 false]⟩]
+              borrows globals layouts callerLocals localDecls callStack true =
+                .ok [.aggregate 0 subElems, w] locals') ∧
+      (moveValueIsZeroSized localDecls layouts
+          (placeTyResolved localDecls layouts ⟨l, [.subslice fromIdx toIdx fromEnd]⟩)
+          (.aggregate 0 subElems) = true →
+        evalOperand locals (.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩) borrows globals layouts
+          callerLocals localDecls callStack true = .ok (.aggregate 0 subElems) locals ∧
+        evalOperands locals
+          [.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩,
+           .copy ⟨l, [.subslice fromIdx toIdx fromEnd]⟩]
+          borrows globals layouts callerLocals localDecls callStack true =
+            .ok [.aggregate 0 subElems, .aggregate 0 subElems] locals ∧
+        (valueListContainsMovedUninit elems = false →
+          evalOperands locals
+            [.move ⟨l, [.subslice fromIdx toIdx fromEnd]⟩, .copy ⟨l, []⟩]
+            borrows globals layouts callerLocals localDecls callStack true =
+              .ok [.aggregate 0 subElems, .aggregate 0 elems] locals)))) ∧
+  -- (c22) non-vacuity of both polarities of (c21) on `_1 : [(); 4]` vs `_1 : [u8; 4]`
+  (∃ (localsZst localsU8 : List LocalSlot) (l : Local) (vZst subZst rootZst rootU8 : Value)
+      (layouts : LayoutTable) (declsZst declsU8 : List LocalDecl),
+    vZst ≠ .unit ∧
+    Trusted.Sequence.get? localsZst l = some (.init rootZst) ∧
+    Trusted.Sequence.get? localsU8 l = some (.init rootU8) ∧
+    placeTouchesUnion declsZst layouts ⟨l, [.subslice 1 3 false]⟩ = false ∧
+    placeTouchesUnion declsZst layouts ⟨l, [.subslice 1 1 true]⟩ = false ∧
+    placeTouchesUnion declsZst layouts ⟨l, [.constantIndex 1 4 true]⟩ = false ∧
+    placeTouchesUnion declsU8 layouts ⟨l, [.subslice 2 2 false]⟩ = false ∧
+    placeTouchesUnion declsU8 layouts ⟨l, [.subslice 1 3 false]⟩ = false ∧
+    moveValueIsZeroSized declsZst layouts
+      (placeTyResolved declsZst layouts ⟨l, [.subslice 1 3 false]⟩) subZst = true ∧
+    moveValueIsZeroSized [] layouts
+      (placeTyResolved [] layouts ⟨l, [.subslice 1 3 false]⟩) subZst = false ∧
+    moveValueIsZeroSized declsU8 layouts
+      (placeTyResolved declsU8 layouts ⟨l, [.subslice 2 2 false]⟩) (.aggregate 0 []) = true ∧
+    evalOperands localsZst [.move ⟨l, [.subslice 1 3 false]⟩, .copy ⟨l, []⟩] [] [] layouts
+      [] declsZst [] true = .ok [subZst, rootZst] localsZst ∧
+    evalOperands localsZst [.move ⟨l, [.subslice 1 1 true]⟩, .copy ⟨l, []⟩] [] [] layouts
+      [] declsZst [] true = .ok [subZst, rootZst] localsZst ∧
+    evalOperands localsZst [.move ⟨l, [.constantIndex 1 4 true]⟩, .copy ⟨l, []⟩] [] [] layouts
+      [] declsZst [] true = .ok [vZst, rootZst] localsZst ∧
+    evalOperands localsZst [.move ⟨l, [.subslice 1 3 false]⟩, .copy ⟨l, []⟩] [] [] layouts
+      [] [] [] true = .ub ∧
+    evalOperands localsU8 [.move ⟨l, [.subslice 2 2 false]⟩, .copy ⟨l, []⟩] [] [] layouts
+      [] declsU8 [] true = .ok [.aggregate 0 [], rootU8] localsU8 ∧
+    evalOperands localsU8 [.move ⟨l, [.subslice 1 3 false]⟩, .copy ⟨l, []⟩] [] [] layouts
       [] declsU8 [] true = .ub)
 
 end Trusted.Correspondence

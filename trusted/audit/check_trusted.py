@@ -940,7 +940,10 @@ class Checker:
         if "leanMiriPin" in self.preflight and verify_lean_miri_pin(self.checkout) != self.preflight["leanMiriPin"]:
             raise Failure(2, "freshness", "lean-miri pin or vendor tree changed during check")
         if getattr(self, "_admitted_lean_sha", None) is not None:
+            regular(self._selected_lean, "freshness")
             regular(self.lean, "freshness")
+            if self._selected_lean.resolve() != self.lean:
+                raise Failure(2, "freshness", "selected Lean path resolved to a different executable during check")
             if admit_lean_before_execution(self._selected_lean, self.lean, self.lock) != self._admitted_lean_sha:
                 raise Failure(2, "freshness", "admitted Lean toolchain changed during check")
         if digest(self.inspector) != self.inspector_hash:
@@ -5679,8 +5682,9 @@ def elf_dynamic_entries(path: Path) -> tuple[tuple[str, ...], tuple[tuple[int, t
                 or interp_path.endswith("/")
                 or any(part in ("", ".", "..") for part in interp_parts[1:])
                 or not all(0x21 <= ord(ch) <= 0x7E for ch in interp_path)
-                or interp_parts[1] in ("tmp", "proc", "sys", "dev", "run")
-                or interp_parts[1:3] in (["var", "tmp"], ["var", "run"], ["usr", "tmp"])
+                or interp_parts[1] in ("tmp", "proc", "sys", "dev", "run", "home", "Users", "mnt", "media")
+                or interp_parts[1:3] in (["var", "tmp"], ["var", "run"], ["usr", "tmp"], ["private", "tmp"])
+                or interp_parts[1:4] in (["private", "var", "tmp"], ["private", "var", "run"])
             ):
                 raise ValueError(f"invalid PT_INTERP path {interp_path!r}")
             if dynamic is None:
@@ -5927,11 +5931,13 @@ def runpath_shadowing_findings(prefix: Path, elf_rels: list[str], pinned: set[st
     return problems
 
 
-def _ancestor_rename_problem(real_root_path: Path) -> str | None:
-    """Why an ancestor above `real_root_path` allows an unprivileged local user
-    to `rename()`-swap the toolchain directory after admission."""
+def _ancestor_rename_problem(root_path: Path) -> str | None:
+    """Why an ancestor or symlink-hop parent visited when resolving `root_path`
+    allows an unprivileged local user to `rename()`-swap or retarget the
+    toolchain directory after admission."""
     uid = os.getuid() if hasattr(os, "getuid") else -1
-    for anc in real_root_path.parents:
+
+    def _dir_problem(anc: Path) -> str | None:
         try:
             anc_st = os.lstat(anc)
         except OSError as error:
@@ -5945,6 +5951,51 @@ def _ancestor_rename_problem(real_root_path: Path) -> str | None:
                 f"toolchain ancestor directory {anc} is world-writable without root/owner sticky "
                 "protection (allows rename-swap of the toolchain)"
             )
+        return None
+
+    abs_path = Path(os.path.abspath(root_path))
+    cur = Path(abs_path.anchor or os.sep)
+    prob = _dir_problem(cur)
+    if prob is not None:
+        return prob
+    queue = [part for part in abs_path.parts[1:] if part not in ("", ".")]
+    hops = 0
+    while len(queue) > 1:
+        part = queue.pop(0)
+        if part == "..":
+            cur = cur.parent
+            prob = _dir_problem(cur)
+            if prob is not None:
+                return prob
+            continue
+        nxt = cur / part
+        try:
+            nxt_st = os.lstat(nxt)
+        except OSError as error:
+            return f"toolchain ancestor directory {nxt} is unreadable ({error.strerror})"
+        if stat.S_ISLNK(nxt_st.st_mode):
+            hops += 1
+            if hops > 40:
+                return f"too many symlink hops above toolchain root {root_path}"
+            try:
+                target = os.readlink(nxt)
+            except OSError as error:
+                return f"toolchain ancestor symlink {nxt} is unreadable ({error.strerror})"
+            if os.path.isabs(target):
+                cur = Path(Path(target).anchor or os.sep)
+                prob = _dir_problem(cur)
+                if prob is not None:
+                    return prob
+            queue = [part_t for part_t in target.split(os.sep) if part_t not in ("", ".")] + queue
+            continue
+        cur = nxt
+        prob = _dir_problem(cur)
+        if prob is not None:
+            return prob
+    for anc in Path(os.path.realpath(abs_path)).parents:
+        prob = _dir_problem(anc)
+        if prob is not None:
+            return prob
     return None
 
 
@@ -5980,7 +6031,7 @@ def lean_release_findings(prefix: Path, release: dict | None = None) -> list[str
             return ["toolchain root is a symlink or not a directory (symlinks at or below the toolchain prefix are forbidden)"]
         if real_st.st_mode & stat.S_IWOTH:
             return ["toolchain root is world-writable"]
-    anc_problem = _ancestor_rename_problem(real_prefix)
+    anc_problem = _ancestor_rename_problem(prefix)
     if anc_problem is not None:
         return [anc_problem]
     for rel in ("bin", "lib", "lib/lean"):
@@ -6108,9 +6159,10 @@ def admit_lean_before_execution(selected: Path, lean: Path, lock: dict) -> str:
                     raise Failure(2, phase, f"elan settings {settings} is a symlink or not a regular file; nothing was executed")
                 if settings_st.st_mode & stat.S_IWOTH:
                     raise Failure(2, phase, f"elan settings {settings} is world-writable; nothing was executed")
-    anc_problem = _ancestor_rename_problem(Path(os.path.realpath(lean.parent.parent)))
-    if anc_problem is not None:
-        raise Failure(2, phase, f"{anc_problem}; nothing was executed")
+    for root_candidate in (selected.parent.parent, lean.parent.parent):
+        anc_problem = _ancestor_rename_problem(root_candidate)
+        if anc_problem is not None:
+            raise Failure(2, phase, f"{anc_problem}; nothing was executed")
     if selected.parent.name != "bin" or lean.parent.name != "bin":
         # `lean_release_findings` inventories `<prefix>/bin/` and resolves the DT_RUNPATH
         # of `<prefix>/bin/lean`: the executable that runs must be that very file, not a

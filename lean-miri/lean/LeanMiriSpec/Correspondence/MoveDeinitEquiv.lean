@@ -68,7 +68,8 @@ true)`).
   step-boundary latch clearing; the moved copy of
   `Place.copyRuntimePlaceNoValidate` (immediate path: read, then deinitialize, then
   write, `place_copyRuntimePlaceNoValidate_immediate_move`; padded memory path:
-  overlapping-copy UB, `place_copyRuntimePlaceNoValidate_overlapping_move_ub`),
+  overlapping-copy UB `place_copyRuntimePlaceNoValidate_overlapping_move_ub` and
+  non-overlapping copy-then-deinit `place_copyRuntimePlaceNoValidate_memory_move`),
   with concrete `D3`/`D6`/`D9` runs of the real copy (self-moves, a subslice
   window move, an element move and re-initialization,
   `canary_D3_D6_D9_copyRuntimePlace`); universal call
@@ -4611,6 +4612,30 @@ theorem place_copyRuntimePlaceNoValidate_overlapping_move_ub
   simp only [bind, EStateM.bind, pure, EStateM.pure, hcompat, hpad, htake, hforce, hoverlap,
     Bool.not_true, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
   rfl
+
+/-- **Memory-path non-overlapping move: copy first, then deinitialize (`Finding 4`),
+universal (`ep2-A4`).** When `h.takePendingMoveDeinit` returns `true` on a
+padded/memory-path copy whose source and destination do not overlap
+(`h.moveCopyOverlaps = false`), `Place.copyRuntimePlaceNoValidate` runs
+`copy.memoryCopy` first and `h.deinitMemoryRaw` second (matching
+`refCopyRuntimePlaceNoValidate` in `Trusted.Correspondence`). -/
+theorem place_copyRuntimePlaceNoValidate_memory_move
+    (h : PlaceHooks P S C E) (copy : PlaceCopyHooks P S C) (choice : C)
+    (mplace : MemPlace P) (srcLayout : LocalLayout) (dest : RuntimePlace P)
+    (allowTransmute : Bool) (s s₁ s₂ s₃ : S) (target : MPlaceTy P)
+    (hcompat : copy.compatible srcLayout dest.layout = .ok true)
+    (hpad : copy.hasPadding srcLayout = .ok true)
+    (htake : h.takePendingMoveDeinit s = .ok true s₁)
+    (hforce : forceAllocation h choice dest s₁ = .ok target s₂)
+    (hdisjoint : h.moveCopyOverlaps choice ⟨mplace, srcLayout⟩ target s₂ = .ok false s₃) :
+    copyRuntimePlaceNoValidate h copy choice ⟨.indirect mplace, srcLayout⟩ dest allowTransmute s =
+      (do
+        copy.memoryCopy choice ⟨mplace, srcLayout⟩ target
+        h.deinitMemoryRaw choice ⟨mplace, srcLayout⟩) s₃ := by
+  unfold copyRuntimePlaceNoValidate
+  unfold_named "_private.Miri.Interpreter.Place.0.Miri.Interpreter.placeLift"
+  simp only [bind, EStateM.bind, pure, EStateM.pure, hcompat, hpad, htake, hforce, hdisjoint,
+    Bool.not_true, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
 
 /-- **Immediate-path moved copy: read, then deinitialize, then write (`D6`),
 universal (`ep1-A3`).** When the latch reports a move

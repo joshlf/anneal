@@ -1763,8 +1763,9 @@ def elf_dynamic_entries(
                 or ipath.endswith("/")
                 or any(part in ("", ".", "..") for part in iparts[1:])
                 or not all(0x21 <= ord(ch) <= 0x7E for ch in ipath)
-                or iparts[1] in ("tmp", "proc", "sys", "dev", "run")
-                or iparts[1:3] in (["var", "tmp"], ["var", "run"], ["usr", "tmp"])
+                or iparts[1] in ("tmp", "proc", "sys", "dev", "run", "home", "Users", "mnt", "media")
+                or iparts[1:3] in (["var", "tmp"], ["var", "run"], ["usr", "tmp"], ["private", "tmp"])
+                or iparts[1:4] in (["private", "var", "tmp"], ["private", "var", "run"])
             ):
                 raise ValueError(f"invalid PT_INTERP path {ipath!r}")
             if dynamic is None:
@@ -2114,11 +2115,13 @@ def _load_toolchain_pin(path: Path, c: _Collector) -> Optional[Dict[str, Any]]:
     return pin if len(c.errors) == before else None
 
 
-def _ancestor_rename_problem(real_root_path: Path) -> Optional[str]:
-    """Why an ancestor above `real_root_path` allows an unprivileged local user
-    to `rename()`-swap the toolchain directory after admission."""
+def _ancestor_rename_problem(root_path: Path) -> Optional[str]:
+    """Why an ancestor or symlink-hop parent visited when resolving `root_path`
+    allows an unprivileged local user to `rename()`-swap or retarget the
+    toolchain directory after admission."""
     uid = os.getuid() if hasattr(os, "getuid") else -1
-    for anc in real_root_path.parents:
+
+    def _dir_problem(anc: Path) -> Optional[str]:
         try:
             anc_st = os.lstat(anc)
         except OSError as exc:
@@ -2132,6 +2135,51 @@ def _ancestor_rename_problem(real_root_path: Path) -> Optional[str]:
                 f"toolchain ancestor directory {anc} is world-writable without root/owner sticky "
                 "protection (allows rename-swap of the toolchain)"
             )
+        return None
+
+    abs_path = Path(os.path.abspath(root_path))
+    cur = Path(abs_path.anchor or os.sep)
+    prob = _dir_problem(cur)
+    if prob is not None:
+        return prob
+    queue = [part for part in abs_path.parts[1:] if part not in ("", ".")]
+    hops = 0
+    while len(queue) > 1:
+        part = queue.pop(0)
+        if part == "..":
+            cur = cur.parent
+            prob = _dir_problem(cur)
+            if prob is not None:
+                return prob
+            continue
+        nxt = cur / part
+        try:
+            nxt_st = os.lstat(nxt)
+        except OSError as exc:
+            return f"toolchain ancestor directory {nxt} is unreadable ({exc.strerror})"
+        if stat.S_ISLNK(nxt_st.st_mode):
+            hops += 1
+            if hops > 40:
+                return f"too many symlink hops above toolchain root {root_path}"
+            try:
+                target = os.readlink(nxt)
+            except OSError as exc:
+                return f"toolchain ancestor symlink {nxt} is unreadable ({exc.strerror})"
+            if os.path.isabs(target):
+                cur = Path(Path(target).anchor or os.sep)
+                prob = _dir_problem(cur)
+                if prob is not None:
+                    return prob
+            queue = [p for p in target.split(os.sep) if p not in ("", ".")] + queue
+            continue
+        cur = nxt
+        prob = _dir_problem(cur)
+        if prob is not None:
+            return prob
+    for anc in Path(os.path.realpath(abs_path)).parents:
+        prob = _dir_problem(anc)
+        if prob is not None:
+            return prob
     return None
 
 
@@ -2174,7 +2222,7 @@ def _verify_toolchain_impl(
     exec_tc_dir = Path(real_root)
     if exec_tc_dir != toolchain_dir and _lstat_real_dir(exec_tc_dir, f"resolved toolchain root {exec_tc_dir}", c, "toolchain") is None:
         c.fatal("toolchain", f"active toolchain {name!r} is not installed as a real directory at {exec_tc_dir}")
-    anc_problem = _ancestor_rename_problem(exec_tc_dir)
+    anc_problem = _ancestor_rename_problem(toolchain_dir)
     if anc_problem is not None:
         c.err("toolchain", anc_problem)
 

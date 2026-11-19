@@ -317,6 +317,75 @@ theorem canary_D9_subslice_fromEnd_underflow_ub :
     bothObs d9SubsliceFromEndOobProg = (.ub .outOfBounds, .ub .outOfBounds) := by
   decide
 
+/-- Out-of-bounds `.field` on `FieldsShape.array`, sub-place escape via an
+oversized `.field` (`fo + fty.size > mp.size` inside a larger allocation), and
+excess `Rvalue.aggregate` operands all fail closed with `.unsupported` in both
+`M_anneal` and `M_ref` (`Place.projectRuntimePlace` local bounds parity). -/
+def d2SubplaceFieldOobProg (tailProj : ProjectionElem) : V2026Prog := prog1 <| mkBody "d2oob" 0
+  [tU8, tArr4, tArr4]
+  [blk [asg (loc 1) (.aggregate (.array tU8) [cU8 10, cU8 11, cU8 12, cU8 13]),
+        asg (loc 0) (.use (.move ⟨1, [.subslice 0 2 false, tailProj]⟩))] .return_]
+
+def d2OversizedSubplaceFieldProg : V2026Prog := prog1 <| mkBody "d2over" 0
+  [tU8, tArr4, tArr4]
+  [blk [asg (loc 1) (.aggregate (.array tU8) [cU8 10, cU8 11, cU8 12, cU8 13]),
+        asg (loc 2) (.use (.move ⟨1, [.subslice 0 2 false, .field 0 tArr4]⟩)),
+        asg (loc 0) (.use (cU8 1))] .return_]
+
+def d2ExcessAggregateOperandsProg : V2026Prog := prog1 <| mkBody "d2agg" 0
+  [tU8, tPair]
+  [blk [asg (loc 1) (.aggregate .tuple [cU8 1, cU8 2, cU8 3]),
+        asg (loc 0) (.use (.copy (fld 1 0 tU8)))] .return_]
+
+theorem canary_D2_field_bounds_and_subplace_containment :
+    bothObs (d2SubplaceFieldOobProg (.field 1 tU8)) =
+      (.returned (some 11) 1, .returned (some 11) 1) ∧
+    bothObs (d2SubplaceFieldOobProg (.field 2 tU8)) = (.unsupported, .unsupported) ∧
+    bothObs d2OversizedSubplaceFieldProg = (.unsupported, .unsupported) ∧
+    bothObs d2ExcessAggregateOperandsProg = (.unsupported, .unsupported) := by
+  decide
+
+/-- Real `CapturedMir` body over `union U { a: u8, b: u16 }` (`claimUnionLayouts`)
+exercising `D3` partial union move, overlapping-field UB, re-initialization, and
+`FieldsShape.union` field-count bounds through `bothObs` (`M_anneal` & `M_ref`). -/
+def d3UnionProg (ss : List Statement) (retIsU16 : Bool := false) : V2026Prog :=
+  let uTy : Ty := { kind := .adt "U" [], layoutIdx := 2 }
+  let retTy : Ty := if retIsU16 then claimU16Ty else claimU8Ty
+  ⟨[{ defPath := "d3union", phase := .runtimePostCleanup, role := .subject, argCount := 0
+      localDecls := [⟨.mut, retTy, none⟩, ⟨.mut, uTy, none⟩, ⟨.mut, claimU8Ty, none⟩]
+      basicBlocks := [blk ss .return_]
+      fnAbi := ⟨[], ⟨claimU8Layout, .ignore⟩, .rust, true⟩
+      layouts := claimUnionLayouts, allocations := [] }], 0⟩
+
+theorem canary_D3_union_field_move_and_reinit_bothObs :
+    let cU16_770 : Operand := .constant ⟨claimU16Ty, .scalar (.int ⟨770, 2⟩)⟩
+    let cU8_9 : Operand := .constant ⟨claimU8Ty, .scalar (.int ⟨9, 1⟩)⟩
+    bothObs (d3UnionProg
+      [asg (fld 1 1 claimU16Ty) (.use cU16_770),
+       asg (loc 0) (.use (.move (fld 1 0 claimU8Ty)))]) =
+      (.returned (some 2) 1, .returned (some 2) 1) ∧
+    bothObs (d3UnionProg
+      [asg (fld 1 1 claimU16Ty) (.use cU16_770),
+       asg (loc 2) (.use (.move (fld 1 0 claimU8Ty))),
+       asg (loc 0) (.use (.copy (fld 1 0 claimU8Ty)))]) =
+      (.ub .invalidUninitBytes, .ub .invalidUninitBytes) ∧
+    bothObs (d3UnionProg
+      [asg (fld 1 1 claimU16Ty) (.use cU16_770),
+       asg (loc 2) (.use (.move (fld 1 0 claimU8Ty))),
+       asg (loc 0) (.use (.copy (fld 1 1 claimU16Ty)))] true) =
+      (.ub .invalidUninitBytes, .ub .invalidUninitBytes) ∧
+    bothObs (d3UnionProg
+      [asg (fld 1 1 claimU16Ty) (.use cU16_770),
+       asg (loc 2) (.use (.move (fld 1 0 claimU8Ty))),
+       asg (fld 1 0 claimU8Ty) (.use cU8_9),
+       asg (loc 0) (.use (.copy (fld 1 1 claimU16Ty)))] true) =
+      (.returned (some 777) 2, .returned (some 777) 2) ∧
+    bothObs (d3UnionProg
+      [asg (fld 1 1 claimU16Ty) (.use cU16_770),
+       asg (loc 0) (.use (.copy (fld 1 2 claimU8Ty)))]) =
+      (.unsupported, .unsupported) := by
+  decide
+
 /-! ## Live `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` canaries
 
 Concrete runs of the Episode 1 consumer-side move deinitialization

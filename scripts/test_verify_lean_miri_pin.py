@@ -380,6 +380,11 @@ def malformed_elf_cases() -> List[Tuple[str, bytes, str]]:
         ("PT_INTERP under /var/run", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/var/run/evil-ld.so\0"), "invalid PT_INTERP path"),
         ("PT_INTERP under /usr/tmp", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/usr/tmp/evil-ld.so\0"), "invalid PT_INTERP path"),
         ("PT_INTERP under /sys", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/sys/kernel/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /home", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/home/attacker/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /Users", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/Users/attacker/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /private/tmp", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/private/tmp/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /private/var/tmp", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/private/var/tmp/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /private/var/run", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/private/var/run/evil-ld.so\0"), "invalid PT_INTERP path"),
         ("PT_INTERP double slash", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/lib64//ld-linux-x86-64.so.2\0"), "invalid PT_INTERP path"),
         ("PT_INTERP dot segment", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/lib64/./ld-linux-x86-64.so.2\0"), "invalid PT_INTERP path"),
         ("PT_INTERP trailing slash", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/lib64/\0"), "invalid PT_INTERP path"),
@@ -2068,6 +2073,90 @@ class ElfDynamicParserTests(TempCase):
             self.assertIn("is world-writable", str(cm_ww.exception))
         finally:
             os.chmod(elan_ct / "settings.toml", 0o644)
+
+    def test_symlink_hop_through_unsticky_world_writable_dir_and_midrun_retarget_rejected(self) -> None:
+        ws = self.workspace()
+        root = make_check_trusted_fixture(self.tmp)
+        safe_parent = self.tmp / "safe-real-parent"
+        safe_parent.mkdir()
+        os.chmod(safe_parent, 0o755)
+        tc_real = make_fake_toolchain(safe_parent, name="tc")
+        canary = self.tmp / "sym-hop-canary"
+        (tc_real / "bin" / "lean").write_text(
+            f"#!/bin/sh\necho pwned > {shlex.quote(str(canary))}\n"
+            f"echo 'Lean (version {REPO_LEAN_VERSION}, x86_64-unknown-linux-gnu, commit {FAKE_COMMIT}, Release)'\n"
+        )
+        os.chmod(tc_real / "bin" / "lean", 0o755)
+        pin_file = self.tmp / "sym-hop-pin.json"
+        V.write_toolchain_pin(V.verify_toolchain(ws.root, toolchain_dir=tc_real), pin_file)
+        if canary.exists():
+            canary.unlink()
+
+        # Both a direct symlink inside an unsticky 0777 directory (`ww_hop/sym_parent/tc`)
+        # and a multi-hop symlink jumping through an unsticky 0777 directory
+        # (`safe_entry/hop1 -> ww_hop/hop2 -> safe_parent`) must fail closed before execution,
+        # even though `realpath(tc)` sits entirely under 0755 `safe_parent`.
+        ww_hop = self.tmp / "ww-sym-hop"
+        ww_hop.mkdir()
+        os.symlink(safe_parent, ww_hop / "sym-parent")
+        os.symlink(safe_parent, ww_hop / "hop2")
+        safe_entry = self.tmp / "safe-entry"
+        safe_entry.mkdir()
+        os.chmod(safe_entry, 0o755)
+        os.symlink(ww_hop / "hop2", safe_entry / "hop1")
+        os.chmod(ww_hop, 0o777)  # no S_ISVTX
+        try:
+            for candidate in (ww_hop / "sym-parent" / "tc", safe_entry / "hop1" / "tc"):
+                with self.subTest(candidate=str(candidate)):
+                    self.assertRejected(
+                        lambda c=candidate: V.verify_toolchain(
+                            ws.root, toolchain_dir=c, toolchain_pin_json=pin_file, environ={}
+                        ),
+                        "toolchain ancestor directory",
+                        "without root/owner sticky protection",
+                        "skipped `bin/lean --version`",
+                    )
+                    self.assertFalse(canary.exists())
+                    findings = CT.lean_release_findings(candidate, {"files": {"bin/lean": "0" * 64}})
+                    self.assertTrue(
+                        any("without root/owner sticky protection" in f for f in findings), findings
+                    )
+                    with mock.patch.object(CT.subprocess, "run", side_effect=AssertionError("a subprocess was spawned")):
+                        with self.assertRaises(CT.Failure) as cm_hop:
+                            CT.Checker(root, candidate / "bin" / "lean", temp_parent=self.tmp).run()
+                    self.assertEqual((cm_hop.exception.code, cm_hop.exception.phase), (2, "toolchain"))
+                    self.assertIn("without root/owner sticky protection", str(cm_hop.exception))
+                    self.assertFalse(canary.exists())
+        finally:
+            os.chmod(ww_hop, 0o755)
+
+        # Mid-run ancestor symlink retargeting on `Checker._selected_lean` fails `freshness()`.
+        safe_alt = self.tmp / "safe-alt-parent"
+        safe_alt.mkdir()
+        os.chmod(safe_alt, 0o755)
+        tc_alt = make_fake_toolchain(safe_alt, name="tc")
+        retarget_dir = self.tmp / "retarget-holder"
+        retarget_dir.mkdir()
+        os.chmod(retarget_dir, 0o755)
+        retarget_sym = retarget_dir / "active-parent"
+        os.symlink(safe_parent, retarget_sym)
+        checker = CT.Checker(root, retarget_sym / "tc" / "bin" / "lean", temp_parent=self.tmp)
+        try:
+            checker._selected_lean = retarget_sym / "tc" / "bin" / "lean"
+            checker.lean = (retarget_sym / "tc" / "bin" / "lean").resolve()
+            checker._admitted_lean_sha = "0" * 64
+            checker.initial, checker.modules = CT.snapshot(checker.source)
+            checker.source_copy = checker.source
+            checker.inspector = checker.checkout / "trusted/audit/TrustedBoundary.lean"
+            checker.inspector_hash = CT.digest(checker.inspector)
+            retarget_sym.unlink()
+            os.symlink(safe_alt, retarget_sym)
+            with self.assertRaises(CT.Failure) as cm_fresh:
+                checker.freshness()
+            self.assertEqual((cm_fresh.exception.code, cm_fresh.exception.phase), (2, "freshness"))
+            self.assertIn("selected Lean path resolved to a different executable during check", str(cm_fresh.exception))
+        finally:
+            shutil.rmtree(checker.stage, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

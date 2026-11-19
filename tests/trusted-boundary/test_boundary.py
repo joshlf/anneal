@@ -947,6 +947,11 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         ww_tc.chmod(0o755)
         ww_problems = runner.lean_release_findings(ww_tc, anc_release)
         assert any("without root/owner sticky protection" in p for p in ww_problems), ww_problems
+        os.symlink(os.path.realpath(prefix).rsplit("/", 1)[0], ww_anc / "sym-to-safe")
+        ww_sym_problems = runner.lean_release_findings(
+            ww_anc / "sym-to-safe" / os.path.basename(os.path.realpath(prefix)), anc_release
+        )
+        assert any("without root/owner sticky protection" in p for p in ww_sym_problems), ww_sym_problems
         ww_anc.chmod(0o755)
         shutil.rmtree(ww_anc)
         prefix.chmod(0o777)
