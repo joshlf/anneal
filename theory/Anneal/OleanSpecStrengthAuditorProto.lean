@@ -97,6 +97,13 @@ structure AuditPolicy where
   /-- Optional override of the closure / statement-walk fuel (used to exercise the
       fail-closed fuel-exhaustion path; `none` selects the environment-sized default). -/
   fuelOverride? : Option Nat := none
+  /-- Heartbeat budget for re-checking each provisionally accepted native-evaluation
+      axiom `ax : e = true` (`recheckProvisionalNativeIO`). `e` is first evaluated by
+      `Meta.whnf` under this budget; only if that settles on a Bool literal is the
+      kernel asked to certify the result by reduction alone. A confirmed axiom no longer
+      depends on trusting the compiler, a refuted one is rejected, and an axiom that
+      cannot be decided within the budget stays provisional. `0` disables the re-check. -/
+  nativeRecheckHeartbeats : Nat := 200000
   deriving Repr, Inhabited
 
 /-- Constructive policy forbidding `Classical.choice` (allowing only `propext` and `Quot.sound`). -/
@@ -155,6 +162,10 @@ structure AuditStats where
   /-- Native-evaluation axioms accepted only because `allowProvisionalNative := true`.
       A non-empty list means the verdict is *provisional*, never kernel-checked. -/
   provisionalNativeAxioms : Array Name := #[]
+  /-- Native-evaluation axioms `ax : e = true` whose statement the kernel re-proved by
+      reduction within `AuditPolicy.nativeRecheckHeartbeats`; they no longer rest on the
+      compiler and are therefore not listed as provisional. -/
+  kernelConfirmedNativeAxioms : Array Name := #[]
   modulesLoaded : Nat := 0
   privateArtifactsChecked : Nat := 0
   kernelReplayedDeclarations : Nat := 0
@@ -327,6 +338,8 @@ instance : ToJson AuditStats where
       ("axiomsFound", toJson ((s.axiomsFound.qsort Name.lt).map Name.toString)),
       ("provisionalNativeAxioms",
         toJson ((s.provisionalNativeAxioms.qsort Name.lt).map Name.toString)),
+      ("kernelConfirmedNativeAxioms",
+        toJson ((s.kernelConfirmedNativeAxioms.qsort Name.lt).map Name.toString)),
       ("modulesLoaded", toJson s.modulesLoaded),
       ("privateArtifactsChecked", toJson s.privateArtifactsChecked),
       ("kernelReplayedDeclarations", toJson s.kernelReplayedDeclarations),
@@ -917,6 +930,40 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
         if !visited.contains d then
           visited := visited.insert d
           pending := pending.push (rootTarget, d)
+      -- Name-based compiler override. Lean's code generator compiles `n` from a sibling
+      -- constant `n._unsafe_rec` whenever one exists, with no attribute involved, so a
+      -- plain `def foo._unsafe_rec` declared before `def foo` silently replaces the
+      -- compiled code of `foo`. The kernel closure never reaches such a sibling, so it is
+      -- looked up explicitly. A sibling that is not shaped like an equation-compiler
+      -- companion is a compiler override; a companion-shaped one is the code that
+      -- actually runs, so its dependencies are audited like those of `n` itself.
+      -- (`.opaqueInfo` parents are `partial def`s, reported by `detectPartialOrUnsafeRec`.)
+      if policy.checkCompilerOverrides && !(modName?.any isStdlibMod) then
+        let recName := n.str "_unsafe_rec"
+        if let some recCi := kenv.find? recName then
+          let parentIsOpaque := match ci with
+            | .opaqueInfo _ => true
+            | _ => false
+          if !parentIsOpaque then
+            if isCodegenUnsafeRec privEnv modName? recCi then
+              let (recEdges, recOpenVs) := declarationEdges rootTarget recCi
+              violations := recOpenVs.foldl pushUniqueViolation violations
+              for d in recEdges.toArray.qsort Name.lt do
+                -- Companions of the same recursion group are audited through their owners.
+                let d' := match d with
+                  | .str owner "_unsafe_rec" =>
+                    match kenv.find? d with
+                    | some dCi =>
+                      if isCodegenUnsafeRec privEnv (originModule? privEnv owner) dCi then owner else d
+                    | none => d
+                  | _ => d
+                if !visited.contains d' then
+                  visited := visited.insert d'
+                  pending := pending.push (rootTarget, d')
+            else
+              violations := pushUniqueViolation violations
+                (.compilerOverrideAttribute rootTarget n "unsafe_rec_sibling"
+                  s!"compiled code for {n} is taken from sibling {recName}, which is not an equation-compiler companion ({constantInfoKind recCi}, partial={recCi.isPartial}, unsafe={recCi.isUnsafe})")
   if !pending.isEmpty then
     violations := pushUniqueViolation violations
       (.auditFuelExhausted (targets[0]?.getD .anonymous) "kernel dependency closure")
@@ -961,11 +1008,127 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
   else
     return .rejected violations stats
 
-/-- Timed `IO` wrapper around `auditDeclsInEnvPure`. -/
+/-- Ask the kernel whether the Bool expression `e` of the native-evaluation axiom
+    `axName : e = true` reduces to `rhs`, by type-checking `Eq.refl rhs : e = rhs` as a
+    throw-away theorem. `maxHeartbeats` is the kernel's absolute per-thread heartbeat
+    threshold; exceeding it (or any other kernel failure) yields `false`. Nothing is
+    added to `privEnv`. -/
+def kernelProvesNativeEq (privEnv : Environment) (axName : Name) (ci : ConstantInfo)
+    (rhs : Bool) (maxHeartbeats : Nat) : Bool :=
+  match ci.type with
+  | .app (.app (.app (.const ``Eq [lvl]) boolTy) e) _ =>
+    let rhsExpr := if rhs then mkConst ``Bool.true else mkConst ``Bool.false
+    let decl := Declaration.thmDecl {
+      name := (axName.str "_kernel_recheck").str (if rhs then "true" else "false")
+      levelParams := ci.levelParams
+      type := mkApp3 (mkConst ``Eq [lvl]) boolTy e rhsExpr
+      value := mkApp2 (mkConst ``Eq.refl [lvl]) boolTy rhsExpr
+    }
+    match privEnv.checked.get.addDeclCore maxHeartbeats.toUSize 512 decl none with
+    | .ok _ => true
+    | .error _ => false
+  | _ => false
+
+/-- Evaluate the closed Bool expression `e` with `Meta.whnf` under a heartbeat budget.
+    Returns `some b` when `e` weak-head-reduces to the literal `b`, and `none` on
+    timeout, on any elaborator exception, or when reduction gets stuck.
+
+    The kernel only polls its heartbeat threshold at coarse intervals (measured: a
+    unary recursion over a `10^8` literal ran for seconds past a small threshold), so
+    it cannot be handed an expression of unknown cost. `Meta.whnf` checks its budget at
+    every step and therefore serves as the cost gate; its answer is never trusted on
+    its own, only used to decide whether asking the kernel is affordable. -/
+def boundedEvalBoolIO (privEnv : Environment) (e : Expr) (maxHeartbeats : Nat) :
+    IO (Option Bool) := do
+  let coreCtx : Core.Context := {
+    fileName := "<native-recheck>"
+    fileMap := default
+    maxHeartbeats := maxHeartbeats
+    initHeartbeats := (← IO.getNumHeartbeats)
+  }
+  let coreState : Core.State := { env := privEnv }
+  let act : MetaM (Option Bool) := do
+    let r ← Meta.whnf e
+    if r.isConstOf ``Bool.true then return some true
+    else if r.isConstOf ``Bool.false then return some false
+    else return none
+  try
+    let (r, _, _) ← act.toIO coreCtx coreState
+    return r
+  catch _ =>
+    return none
+
+/-- Post-pass over a verdict of `auditDeclsInEnvPure`: re-check every provisionally
+    accepted native-evaluation axiom `ax : e = true`, within
+    `policy.nativeRecheckHeartbeats`.
+
+    `e` is evaluated by `boundedEvalBoolIO`; if that settles on a literal, the kernel
+    is asked to certify it (`kernelProvesNativeEq`), so the outcome rests on the kernel
+    alone:
+    - kernel proves `e = true`: the axiom is kernel-provable and is moved from
+      `provisionalNativeAxioms` to `kernelConfirmedNativeAxioms`.
+    - kernel proves `e = false`: the axiom is false. This is what a forged "native"
+      axiom looks like, and also what a genuine `native_decide` produces when compiled
+      code disagrees with kernel semantics (`@[implemented_by]`, `@[csimp]`, a forged
+      `_unsafe_rec` sibling, a miscompilation). Rejected as `.unapprovedAxiom`.
+    - undecided within budget: stays provisional. A false axiom can still hide behind
+      an expression that is too expensive to evaluate, which is exactly why such
+      axioms keep the provisional label.
+
+    Both `Meta.whnf` and the kernel run *compiled* code when they reduce
+    `Lean.reduceBool` / `Lean.reduceNat`. An axiom whose dependencies reach those
+    (visible as a dependency on `Lean.trustCompiler`) is never re-checked, so the
+    auditor never executes untrusted compiled code. -/
+def recheckProvisionalNativeIO (privEnv : Environment) (policy : AuditPolicy)
+    (verdict : AuditVerdict) : IO AuditVerdict := do
+  let stats := verdict.stats
+  if policy.nativeRecheckHeartbeats == 0 || stats.provisionalNativeAxioms.isEmpty then
+    return verdict
+  let kenv := privEnv.checked.get
+  let budget := policy.nativeRecheckHeartbeats
+  let mut confirmed : Array Name := #[]
+  let mut stillProvisional : Array Name := #[]
+  let mut violations := verdict.violations
+  for ax in stats.provisionalNativeAxioms do
+    let decided? : Option (ConstantInfo × Bool) ← match kenv.find? ax with
+      | none => pure none
+      | some ci =>
+        let reachesNativeHook := (collectAxiomsPrivate privEnv ax).any fun a =>
+          isTrustCompilerAxiom a || a == ``Lean.ofReduceBool || a == ``Lean.ofReduceNat
+        if reachesNativeHook then
+          pure none
+        else
+          match ci.type with
+          | .app (.app (.app (.const ``Eq _) _) e) _ =>
+            pure ((← boundedEvalBoolIO privEnv e budget).map (ci, ·))
+          | _ => pure none
+    match decided? with
+    | none => stillProvisional := stillProvisional.push ax
+    | some (ci, value) =>
+      -- `Meta.whnf` found the evaluation cheap; let the kernel be the judge.
+      let threshold := (← IO.getNumHeartbeats) + 100 * budget
+      if kernelProvesNativeEq privEnv ax ci value threshold then
+        if value then
+          confirmed := confirmed.push ax
+        else
+          violations := pushUniqueViolation violations
+            (.unapprovedAxiom ax ax (originModule? privEnv ax)
+              "native-evaluation axiom is refuted by kernel evaluation: its Bool expression reduces to `false`")
+      else
+        stillProvisional := stillProvisional.push ax
+  let stats' : AuditStats :=
+    { stats with
+      provisionalNativeAxioms := stillProvisional
+      kernelConfirmedNativeAxioms := confirmed }
+  return if violations.isEmpty then .ok stats' else .rejected violations stats'
+
+/-- Timed `IO` wrapper around `auditDeclsInEnvPure` followed by
+    `recheckProvisionalNativeIO`. -/
 def auditDeclsInEnvIO (env : Environment) (targets : Array Name)
     (policy : AuditPolicy := {}) : IO AuditVerdict := do
   let t0 ← IO.monoNanosNow
-  let verdict := auditDeclsInEnvPure env targets policy
+  let verdict ← recheckProvisionalNativeIO (env.setExporting false) policy
+    (auditDeclsInEnvPure env targets policy)
   let t1 ← IO.monoNanosNow
   let elapsedMicros := (t1 - t0) / 1000
   return match verdict with
@@ -1157,6 +1320,14 @@ def checkModuleProvenanceIO (moduleNames : Array Name)
                 violations := pushUniqueViolation violations
                   (.moduleProvenanceSpoofed m partPath.toString
                     s!"{partLabel} artifact resolves outside {why}")
+              -- The resolved `.olean` must be the file that *this* module name denotes
+              -- inside the pinned directory. A symlinked directory can otherwise alias
+              -- one genuine module under another trusted name (`Std/Alias` pointing at
+              -- the toolchain's `Lean/Meta`), relabelling its declarations as stdlib.
+              if partLabel == "olean" && partReal != Lean.modToFilePath dir m "olean" then
+                violations := pushUniqueViolation violations
+                  (.moduleProvenanceSpoofed m partPath.toString
+                    s!"resolves to a different module's artifact inside {why}")
   return violations
 
 /-- Run a computation with `extraSearchPaths` temporarily prepended to `Lean.searchPathRef`,
@@ -1298,7 +1469,8 @@ def auditLoadedModulesIO
                 if !theoremsOnly || ci.isTheorem then
                   acc := acc.push ci.name
         return acc
-    let verdict := auditDeclsInEnvPure privEnv targets policy
+    let verdict ← recheckProvisionalNativeIO privEnv policy
+      (auditDeclsInEnvPure privEnv targets policy)
     let mut violations := verdict.violations
     let mut replayedCount : Nat := 0
     if runKernelReplay && violations.isEmpty then
@@ -1600,6 +1772,60 @@ theorem no_deterministic_cert_of_vacuous_req {In : Type u} {Out : Type v}
   fun c => match c.req_nonvacuous with
     | ⟨_, hx⟩ => hx
 
+/-- Witness that a contract constrains behaviour on more than a single point: two valid
+    inputs whose accepted outputs are not interchangeable.
+
+    Every other certificate in this harness can be satisfied by a contract whose
+    precondition admits exactly one input (`requires := x = 5`): it is non-vacuous,
+    realizable, kills mutants, and is even deterministic, yet it says nothing about any
+    other input. Such an over-restrictive precondition is the dual of a vacuous one.
+    `InputSensitiveSpecCert` rules it out, together with contracts whose postcondition
+    ignores the input altogether. -/
+structure InputSensitiveSpecCert {In : Type u} {Out : Type v}
+    (req : In → Prop) (ens : In → Out → Prop) : Type (max u v) where
+  x₁ : In
+  x₂ : In
+  req₁ : req x₁
+  req₂ : req x₂
+  y₁ : Out
+  y₂ : Out
+  ens₁ : ens x₁ y₁
+  ens₂ : ens x₂ y₂
+  not_interchangeable : ¬ ens x₁ y₂
+
+/-- The two inputs of an `InputSensitiveSpecCert` are provably distinct. -/
+theorem InputSensitiveSpecCert.inputs_ne {In : Type u} {Out : Type v}
+    {req : In → Prop} {ens : In → Out → Prop}
+    (c : InputSensitiveSpecCert req ens) : c.x₁ ≠ c.x₂ :=
+  fun h => c.not_interchangeable (h ▸ c.ens₂)
+
+/-- An `InputSensitiveSpecCert` yields a single-mutant `SpecStrengthCert`: the output
+    required at `x₂` is a rejected mutant at `x₁`. -/
+def InputSensitiveSpecCert.toSpecStrengthCert {In : Type u} {Out : Type v}
+    {req : In → Prop} {ens : In → Out → Prop}
+    (c : InputSensitiveSpecCert req ens) : SpecStrengthCert req ens :=
+  { x₀ := c.x₁
+    req_nonvacuous := c.req₁
+    x₁ := c.x₁
+    mutant_req := c.req₁
+    y_mutant := c.y₂
+    mutant_killed := c.not_interchangeable }
+
+/-- A precondition satisfied by at most one input can never be input-sensitive. -/
+theorem no_input_sensitive_cert_of_singleton_req {In : Type u} {Out : Type v}
+    {req : In → Prop} {ens : In → Out → Prop}
+    (hSingle : ∀ x x', req x → req x' → x = x') :
+    InputSensitiveSpecCert req ens → False :=
+  fun c => c.inputs_ne (hSingle c.x₁ c.x₂ c.req₁ c.req₂)
+
+/-- A postcondition that does not depend on the input (any output accepted for one valid
+    input is accepted for every valid input) can never be input-sensitive. -/
+theorem no_input_sensitive_cert_of_input_independent_ens {In : Type u} {Out : Type v}
+    {req : In → Prop} {ens : In → Out → Prop}
+    (hIndep : ∀ x x' y, req x → req x' → ens x y → ens x' y) :
+    InputSensitiveSpecCert req ens → False :=
+  fun c => c.not_interchangeable (hIndep c.x₂ c.x₁ c.y₂ c.req₂ c.req₁ c.ens₂)
+
 /-- Bridging metatheorem to `Trusted.VerificationResult.ItemSpec`: an `ItemSpec`
     that leaves `post` at its default (`fun _ _ => True`) can never admit a
     `SpecStrengthCert`. -/
@@ -1735,7 +1961,8 @@ theorem no_modular_cert_of_trivial_ens
 private def directCertHeads : Array Name := #[
   ``SpecStrengthCert,
   ``MultiMutantSpecCert,
-  ``DeterministicSpecCert
+  ``DeterministicSpecCert,
+  ``InputSensitiveSpecCert
 ]
 
 /-- Direct modular certificate heads stated over `(envAssumed, pre, post)`. -/
@@ -2059,7 +2286,12 @@ def resolveUniqueSpecInstance (specName : Name) (specClass : Name) (defId : Stri
     return .error (.specStrengthCertMissing specName
       s!"no {specClass} instance found for \"{defId}\"")
   | some inst =>
-    if inst.getAppFn.constName? == some candidates[0]! then
+    -- The instance must be the candidate constant itself, with no arguments. If it is
+    -- an application (`@Ext.toItemSpec extInst`, `@paramSpec cfgInst`), the specification
+    -- depends on further instance arguments whose own uniqueness is not established: a
+    -- second `extInst` / `cfgInst` declared later would silently change which
+    -- specification this resolves to.
+    if inst.isConstOf candidates[0]! then
       return .ok inst
     else
       return .error (.specInstanceAmbiguous specName specClass
@@ -2644,6 +2876,34 @@ theorem fxfsVmoSubslice_deterministic :
       have e2 := h' base len s e hArgs
       rw [e1, e2]
 
+/-- `fxfs_storage_boundary::vmo_subslice_bounds_valid` is input-sensitive: two valid
+    argument tuples require different offsets (`4224` vs. `0x112`), so the precondition
+    is not a single point and the postcondition genuinely depends on the arguments. -/
+def fxfsVmoSubsliceInputSensitive :
+    InputSensitiveSpecCert fxfsVmoSubslicePre fxfsVmoSubslicePost where
+  x₁ :=
+    [ .scalar { bits := 4096, sizeBytes := 8 }
+    , .scalar { bits := 4096, sizeBytes := 8 }
+    , .scalar { bits := 64, sizeBytes := 8 }
+    , .scalar { bits := 192, sizeBytes := 8 } ]
+  x₂ :=
+    [ .scalar { bits := 0x0102, sizeBytes := 8 }
+    , .scalar { bits := 0x0400, sizeBytes := 8 }
+    , .scalar { bits := 0, sizeBytes := 8 }
+    , .scalar { bits := 0x0010, sizeBytes := 8 } ]
+  req₁ := ⟨4096, 4096, 64, 192, by decide, by decide, by decide, rfl⟩
+  req₂ := ⟨0x0102, 0x0400, 0, 0x0010, by decide, by decide, by decide, rfl⟩
+  y₁ := .scalar { bits := 4224, sizeBytes := 8 }
+  y₂ := .scalar { bits := 0x0112, sizeBytes := 8 }
+  ens₁ := fxfsVmoSubslicePost_exact 4096 4096 64 192
+  ens₂ := fxfsVmoSubslicePost_exact 0x0102 0x0400 0 0x0010
+  not_interchangeable := by
+    intro h
+    have hEq := h 4096 4096 64 192 rfl
+    injection hEq with hS
+    injection hS with hBits _
+    exact absurd hBits (by decide)
+
 /-! ### Example 2: `fuchsia_usercopy::usercopy_copyin_bracketed` -/
 
 /-- Precondition modeled on `fuchsia_usercopy::usercopy_copyin_bracketed`. -/
@@ -3039,6 +3299,49 @@ theorem fuchsiaUsercopyCopyinModularDirectDetCert :
       fuchsiaUsercopyCopyinPost where
   handler_nonvacuous := ⟨fuchsiaHermeticCopyWitnessHandler, fuchsiaHermeticCopyWitnessHandler_valid⟩
   cert := fuchsiaUsercopyCopyin_deterministic
+
+/-- `fuchsia_usercopy::usercopy_copyin_bracketed` is input-sensitive: the faulting and
+    non-faulting argument tuples require different result tuples (`(64, 192)` vs.
+    `(0, 256)`). -/
+def fuchsiaUsercopyCopyinInputSensitive :
+    InputSensitiveSpecCert
+      (fun (p : List Value × Memory) => fuchsiaUsercopyCopyinPre p.1 p.2)
+      (fun (p : List Value × Memory) (r : Value × Memory) =>
+        fuchsiaUsercopyCopyinPost p.1 p.2 r.1 r.2) where
+  x₁ :=
+    ( [ .scalar { bits := 1, sizeBytes := 1 }
+      , .scalar { bits := 256, sizeBytes := 8 }
+      , .scalar { bits := 64, sizeBytes := 8 }
+      , .scalar { bits := 1, sizeBytes := 1 } ]
+    , emptyMemory )
+  x₂ :=
+    ( [ .scalar { bits := 0, sizeBytes := 1 }
+      , .scalar { bits := 256, sizeBytes := 8 }
+      , .scalar { bits := 64, sizeBytes := 8 }
+      , .scalar { bits := 1, sizeBytes := 1 } ]
+    , emptyMemory )
+  req₁ := ⟨1, 256, 64, 1, Or.inr rfl, by decide, by decide, Or.inr rfl, rfl, rfl⟩
+  req₂ := ⟨0, 256, 64, 1, Or.inl rfl, by decide, by decide, Or.inr rfl, rfl, rfl⟩
+  y₁ :=
+    ( .aggregate 0
+        [ .scalar { bits := 64, sizeBytes := 8 }
+        , .scalar { bits := 192, sizeBytes := 8 } ]
+    , emptyMemory )
+  y₂ :=
+    ( .aggregate 0
+        [ .scalar { bits := 0, sizeBytes := 8 }
+        , .scalar { bits := 256, sizeBytes := 8 } ]
+    , emptyMemory )
+  ens₁ := fuchsiaUsercopyCopyinPost_fault 256 64 1 emptyMemory
+  ens₂ := fuchsiaUsercopyCopyinPost_noFault 256 64 1 emptyMemory
+  not_interchangeable := by
+    intro h
+    have hVal := (ite_eq_left rfl).mp (h.2 1 256 64 1 rfl)
+    injection hVal with _ hFields
+    injection hFields with hF0 _
+    injection hF0 with hS
+    injection hS with hBits _
+    exact Nat.noConfusion hBits
 
 /-! ### Diagnostic Contrast: Weak Upper-Bound-Only Spec (`weak_vmo_subslice_upper_bound_only`) -/
 

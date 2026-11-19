@@ -45,6 +45,22 @@ elab "proto_synth_hole" : tactic => do
   let holeTerm := Lean.mkApp2 (Lean.mkConst axName [Level.zero]) goalType (Lean.mkConst ``Bool.false)
   goal.assign holeTerm
 
+/-- Test-only command declaring `<parent>._unsafe_rec` as a `partial`-safety definition,
+    i.e. with the exact shape of an equation-compiler code-generation companion.
+    Ordinary source cannot produce that shape for a non-recursive parent, but a hostile
+    metaprogram can; this command stands in for one inside sandboxed snippets. -/
+elab "proto_forge_unsafe_rec_companion " parent:ident " : " ty:term " := " val:term : command => do
+  liftTermElabM do
+    let tyE ← instantiateMVars (← Term.elabType ty)
+    let v ← Term.elabTermEnsuringType val tyE
+    Term.synthesizeSyntheticMVarsNoPostponing
+    let v ← instantiateMVars v
+    let n := parent.getId.str "_unsafe_rec"
+    let defn : DefinitionVal := {
+      name := n, levelParams := [], type := tyE, value := v,
+      hints := ReducibilityHints.«opaque», safety := DefinitionSafety.«partial», all := [n] }
+    addDecl (Declaration.mutualDefnDecl [defn])
+
 /-! ## Helper: Sandboxed Elaboration & Deterministic Receipt Formatting -/
 
 /-- Elaborate Lean source code against a copy of the live `Environment` without
@@ -87,10 +103,12 @@ def formatVerdictTags (label : String) (v : AuditVerdict) : String :=
     let tags := (vs.map AuditViolation.tag).toList.eraseDups.mergeSort (· < ·)
     s!"{label}: rejected {tags}"
 
-/-- `formatVerdictTags` plus the number of provisionally accepted native axioms. -/
+/-- `formatVerdictTags` plus the numbers of provisionally accepted and kernel-confirmed
+    native axioms. -/
 def formatVerdictProvisional (label : String) (v : AuditVerdict) : String :=
   match v with
-  | .ok s => s!"{label}: ok [] provisionalNative={s.provisionalNativeAxioms.size}"
+  | .ok s =>
+    s!"{label}: ok [] provisionalNative={s.provisionalNativeAxioms.size} kernelConfirmed={s.kernelConfirmedNativeAxioms.size}"
   | .rejected _ _ => formatVerdictTags label v
 
 /-- Assert that `v` is `.rejected` and contains at least one violation with tag `expectedTag`. -/
@@ -451,9 +469,9 @@ run_cmd do
 info: R1_native_name_spoof_provisional: rejected [unapprovedAxiom]
 R1_native_name_spoof_strict: rejected [unapprovedAxiom]
 R1_native_genuine_strict: rejected [nativeDecideReached]
-R1_native_genuine_provisional: ok [] provisionalNative=1
+R1_native_genuine_provisional: ok [] provisionalNative=0 kernelConfirmed=1
 R1_native_forged_shape_strict: rejected [nativeDecideReached]
-R1_native_forged_shape_provisional: ok [] provisionalNative=1
+R1_native_forged_shape_provisional: rejected [unapprovedAxiom]
 R2_assumptions_name_spoof: rejected [unapprovedAxiom]
 R2_assumptions_module_allowed: ok []
 R2_assumptions_module_not_opted_in: rejected [unapprovedAxiom]
@@ -477,23 +495,25 @@ run_cmd do
     [ formatVerdictTags "R1_native_name_spoof_provisional" vSpoofProv
     , formatVerdictTags "R1_native_name_spoof_strict" vSpoofStrict ]
 
-  -- R1b: a genuine `native_decide` proof is rejected by default and, when opted in, is
-  -- accepted only *provisionally* (surfaced in `provisionalNativeAxioms`).
+  -- R1b: a genuine `native_decide` proof is rejected by default. When opted in, its
+  -- statement is re-proved by the kernel within the re-check budget, so it is reported
+  -- as kernel-confirmed instead of provisional.
   let envReal ← elabInSandbox "theorem r1real : (2 + 2 == 4) = true := by native_decide\n"
   let vRealStrict ← liftIO <| auditDeclsInEnvIO envReal #[`r1real] strict
   let vRealProv ← liftIO <| auditDeclsInEnvIO envReal #[`r1real] prov
   liftIO <| assertRejectedWithTag "R1_native_genuine_strict" vRealStrict "nativeDecideReached"
   liftIO <| assertAuditOk "R1_native_genuine_provisional" vRealProv
-  unless vRealProv.stats.provisionalNativeAxioms.size == 1 do
-    throwError "expected exactly one provisional native axiom, got {vRealProv.stats.provisionalNativeAxioms}"
+  unless vRealProv.stats.provisionalNativeAxioms.isEmpty &&
+      vRealProv.stats.kernelConfirmedNativeAxioms.size == 1 do
+    throwError "expected exactly one kernel-confirmed native axiom, got provisional={vRealProv.stats.provisionalNativeAxioms} confirmed={vRealProv.stats.kernelConfirmedNativeAxioms}"
   lines := lines ++
     [ formatVerdictTags "R1_native_genuine_strict" vRealStrict
     , formatVerdictProvisional "R1_native_genuine_provisional" vRealProv ]
 
-  -- R1c (documented residual risk): an axiom that copies BOTH the name and the
-  -- `@Eq Bool e true` shape of compiler output is indistinguishable from a genuine one
-  -- in compiled form. It is rejected by default and can only ever be accepted
-  -- provisionally, never silently: it is listed in `provisionalNativeAxioms`.
+  -- R1c: an axiom that copies BOTH the name and the `@Eq Bool e true` shape of compiler
+  -- output is indistinguishable from a genuine one by shape alone, and used to be
+  -- accepted provisionally. Its expression evaluates to `false` in the kernel, so the
+  -- re-check now refutes it outright.
   let envForge ← elabInSandbox <|
     "def r1b : Bool := false\n" ++
     "axiom r1forge._native.native_decide.ax_1_1 : r1b = true\n" ++
@@ -502,11 +522,10 @@ run_cmd do
   let vForgeStrict ← liftIO <| auditDeclsInEnvIO envForge #[`r1forged] strict
   let vForgeProv ← liftIO <| auditDeclsInEnvIO envForge #[`r1forged] prov
   liftIO <| assertRejectedWithTag "R1_native_forged_shape_strict" vForgeStrict "nativeDecideReached"
-  unless vForgeProv.stats.provisionalNativeAxioms.size == 1 do
-    throwError "forged native axiom must be surfaced as provisional"
+  liftIO <| assertRejectedWithTag "R1_native_forged_shape_provisional" vForgeProv "unapprovedAxiom"
   lines := lines ++
     [ formatVerdictTags "R1_native_forged_shape_strict" vForgeStrict
-    , formatVerdictProvisional "R1_native_forged_shape_provisional" vForgeProv ]
+    , formatVerdictTags "R1_native_forged_shape_provisional" vForgeProv ]
 
   -- R2: `allowAssumptionsNamespace` trusts `Assumptions.*` *modules*, not axioms that are
   -- merely named `Assumptions.foo` inside some other module.
@@ -1012,6 +1031,168 @@ run_cmd do
     , formatVerdictTags "A1_claim_bound_non_theorem_rejected" vNonThm ]
   logInfo (String.intercalate "\n" lines)
 
+/-! ## Pass B2 Hardening Regressions: `_unsafe_rec` Sibling Overrides, Kernel Re-Check of Native Axioms, Instance Chains -/
+
+/--
+info: S1_unsafe_rec_sibling_override: rejected [compilerOverrideAttribute]
+S1_unsafe_rec_sibling_false_proof_provisional: rejected [compilerOverrideAttribute, unapprovedAxiom]
+S1_genuine_recursion_companions: ok []
+S1_forged_companion_hides_axiom: rejected [unapprovedAxiom]
+S1_forged_companion_shape_residual: ok []
+S2_native_not_true_forged: rejected [unapprovedAxiom]
+S2_native_expensive_forged_stays_provisional: ok [] provisionalNative=1 kernelConfirmed=0
+S2_native_recheck_disabled: ok [] provisionalNative=1 kernelConfirmed=0
+S3_subclass_chain_instance_shadowing: rejected [specInstanceAmbiguous]
+S3_parametric_instance_argument_shadowing: rejected [specInstanceAmbiguous]
+S5_input_sensitive_cert_bound: ok []
+S5_input_sensitive_cert_claim_bound: ok []
+S5_input_sensitive_cert_wrong_spec: rejected [specStrengthCertInvalidType]
+-/
+#guard_msgs in
+run_cmd do
+  let strict : AuditPolicy := { checkStatementOrigin := false }
+  let prov : AuditPolicy := { checkStatementOrigin := false, allowProvisionalNative := true }
+  let mut lines : List String := []
+
+  -- S1: Lean's code generator compiles `foo` from a sibling constant `foo._unsafe_rec`
+  -- whenever one exists, with no attribute involved. A plain `def foo._unsafe_rec`
+  -- declared before `def foo` therefore replaces the compiled code of `foo`: below,
+  -- `native_decide` "proves" `s1foo 1 = 2` while the kernel proves `s1foo 1 = 1`, giving
+  -- a proof of `False` that used to be accepted provisionally with no override reported.
+  let envSibling ← elabInSandbox <|
+    "def s1foo._unsafe_rec (n : Nat) : Nat := n + 1\n" ++
+    "def s1foo (n : Nat) : Nat := n\n" ++
+    "theorem s1kernel : s1foo 1 = 1 := rfl\n" ++
+    "theorem s1native : s1foo 1 = 2 := by native_decide\n" ++
+    "theorem s1false : False := absurd (s1kernel.symm.trans s1native) (by decide)\n"
+  let vSibling ← liftIO <| auditDeclsInEnvIO envSibling #[`s1kernel] strict
+  let vSiblingFalse ← liftIO <| auditDeclsInEnvIO envSibling #[`s1false] prov
+  liftIO <| assertRejectedWithTag "S1_unsafe_rec_sibling_override" vSibling "compilerOverrideAttribute"
+  let namesSibling := vSibling.violations.any fun
+    | .compilerOverrideAttribute _ decl kind _ => decl == `s1foo && kind == "unsafe_rec_sibling"
+    | _ => false
+  unless namesSibling do
+    throwError "expected unsafe_rec_sibling override on s1foo:\n{(auditReportJson vSibling).pretty}"
+  -- The false native axiom is also refuted independently by the kernel re-check.
+  liftIO <| assertRejectedWithTag "S1_unsafe_rec_sibling_false_proof_provisional" vSiblingFalse "unapprovedAxiom"
+  -- Genuine equation-compiler companions (well-founded, structural, mutual) stay clean.
+  let envGenuine ← elabInSandbox <|
+    "def s1gcd (a b : Nat) : Nat := if h : b = 0 then a else s1gcd b (a % b)\n" ++
+    "termination_by b\ndecreasing_by exact Nat.mod_lt a (Nat.pos_of_ne_zero h)\n" ++
+    "def s1len : List Nat → Nat\n  | [] => 0\n  | _ :: t => s1len t + 1\n" ++
+    "mutual\ndef s1even : Nat → Bool\n  | 0 => true\n  | n + 1 => s1odd n\n" ++
+    "def s1odd : Nat → Bool\n  | 0 => false\n  | n + 1 => s1even n\nend\n" ++
+    "theorem s1a : s1gcd 6 4 = 2 := by simp [s1gcd]\n" ++
+    "theorem s1b : s1len [1, 2] = 2 := rfl\n" ++
+    "theorem s1c : s1even 2 = true := by simp [s1even, s1odd]\n"
+  let vGenuine ← liftIO <| auditDeclsInEnvIO envGenuine #[`s1a, `s1b, `s1c] strict
+  liftIO <| assertAuditOk "S1_genuine_recursion_companions" vGenuine
+  -- A companion-shaped sibling is the code that actually runs, so its dependencies are
+  -- audited: a forged companion cannot hide an axiom. A forged companion whose body is
+  -- otherwise clean remains indistinguishable from a genuine one (documented residual).
+  let envForged ← elabInSandbox <|
+    "axiom s1hidden : Nat\n" ++
+    "def s1bar (n : Nat) : Nat := n\n" ++
+    "proto_forge_unsafe_rec_companion s1bar : Nat → Nat := fun n => n + s1hidden\n" ++
+    "theorem s1d : s1bar 1 = 1 := rfl\n" ++
+    "def s1baz (n : Nat) : Nat := n\n" ++
+    "proto_forge_unsafe_rec_companion s1baz : Nat → Nat := fun n => n + 1\n" ++
+    "theorem s1e : s1baz 1 = 1 := rfl\n"
+  let vForgedAxiom ← liftIO <| auditDeclsInEnvIO envForged #[`s1d] strict
+  let vForgedShape ← liftIO <| auditDeclsInEnvIO envForged #[`s1e] strict
+  liftIO <| assertRejectedWithTag "S1_forged_companion_hides_axiom" vForgedAxiom "unapprovedAxiom"
+  lines := lines ++
+    [ formatVerdictTags "S1_unsafe_rec_sibling_override" vSibling
+    , formatVerdictTags "S1_unsafe_rec_sibling_false_proof_provisional" vSiblingFalse
+    , formatVerdictTags "S1_genuine_recursion_companions" vGenuine
+    , formatVerdictTags "S1_forged_companion_hides_axiom" vForgedAxiom
+    , formatVerdictTags "S1_forged_companion_shape_residual" vForgedShape ]
+
+  -- S2: provisionally accepted native axioms are re-checked in the kernel. A forged
+  -- axiom over a non-literal but cheap false expression (`!true`) used to be accepted
+  -- provisionally; it is now refuted. Only an expression too expensive to evaluate
+  -- within the budget stays provisional (documented residual), and the re-check can be
+  -- switched off.
+  let envNative ← elabInSandbox <|
+    "axiom s2f._native.native_decide.ax_1_1 : (!true) = true\n" ++
+    "theorem s2false : False :=\n" ++
+    "  Bool.noConfusion (show false = true from s2f._native.native_decide.ax_1_1)\n" ++
+    "def s2slow : Nat → Bool\n  | 0 => true\n  | n + 1 => s2slow n\n" ++
+    "axiom s2s._native.native_decide.ax_1_1 : (s2slow 100000000 && false) = true\n" ++
+    "theorem s2expensive : False :=\n" ++
+    "  Bool.noConfusion ((Bool.and_false _).symm.trans s2s._native.native_decide.ax_1_1)\n" ++
+    "theorem s2real : (2 + 2 == 4) = true := by native_decide\n"
+  let vNotTrue ← liftIO <| auditDeclsInEnvIO envNative #[`s2false] prov
+  let vExpensive ← liftIO <| auditDeclsInEnvIO envNative #[`s2expensive] prov
+  let vDisabled ← liftIO <| auditDeclsInEnvIO envNative #[`s2real]
+    { prov with nativeRecheckHeartbeats := 0 }
+  liftIO <| assertRejectedWithTag "S2_native_not_true_forged" vNotTrue "unapprovedAxiom"
+  liftIO <| assertAuditOk "S2_native_expensive_forged_stays_provisional" vExpensive
+  liftIO <| assertAuditOk "S2_native_recheck_disabled" vDisabled
+  lines := lines ++
+    [ formatVerdictTags "S2_native_not_true_forged" vNotTrue
+    , formatVerdictProvisional "S2_native_expensive_forged_stays_provisional" vExpensive
+    , formatVerdictProvisional "S2_native_recheck_disabled" vDisabled ]
+
+  -- S3: the unique-instance gate only counted constants whose type concludes in
+  -- `ItemSpec "<defId>"`. When the specification is reached through an instance chain,
+  -- that constant is a function (`Ext.toItemSpec`, or a parametric instance) and the
+  -- ambiguity sits in its instance *argument*: a weak argument instance followed by a
+  -- strong one passed the gate. The resolved instance must now be a bare constant.
+  let header :=
+    "open Trusted.VerificationResult Trusted.MirSemantics Anneal.OleanSpecStrengthAuditorProto\n"
+  let envChain ← elabInSandbox <| header ++
+    "class S3Ext extends ItemSpec \"proto::s3chain\" where\n  tag : Nat\n" ++
+    "instance s3Weak : S3Ext := { pre := fun _ => True, tag := 0 }\n" ++
+    "instance s3Strong : S3Ext :=\n" ++
+    "  { pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost, tag := 1 }\n" ++
+    "instance s3Cert : ItemMultiMutantCert \"proto::s3chain\" where\n" ++
+    "  cert := fxfsVmoSubsliceMultiCert\n"
+  let envParam ← elabInSandbox <| header ++
+    "class S3Cfg where\n  pre : List Value → Prop\n  post : List Value → Value → Prop\n" ++
+    "instance s3CfgWeak : S3Cfg := { pre := fun _ => True, post := fun _ _ => True }\n" ++
+    "instance s3Spec [c : S3Cfg] : ItemSpec \"proto::s3param\" := { pre := c.pre, post := c.post }\n" ++
+    "instance s3CfgStrong : S3Cfg := { pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n" ++
+    "instance s3ParamCert : ItemMultiMutantCert \"proto::s3param\" where\n" ++
+    "  cert := fxfsVmoSubsliceMultiCert\n"
+  let vChain ← withSandboxEnv envChain <| auditItemSpecStrengthBySynth "proto::s3chain"
+  let vParam ← withSandboxEnv envParam <| auditItemSpecStrengthBySynth "proto::s3param"
+  liftIO <| assertRejectedWithTag "S3_subclass_chain_instance_shadowing" vChain "specInstanceAmbiguous"
+  liftIO <| assertRejectedWithTag "S3_parametric_instance_argument_shadowing" vParam "specInstanceAmbiguous"
+  lines := lines ++
+    [ formatVerdictTags "S3_subclass_chain_instance_shadowing" vChain
+    , formatVerdictTags "S3_parametric_instance_argument_shadowing" vParam ]
+
+  -- S5: `InputSensitiveSpecCert` goes through the same binding and environment audit as
+  -- the other direct certificates, including the claim-bound gate.
+  let fxfsReq := mkConst ``fxfsVmoSubslicePre
+  let fxfsEns := mkConst ``fxfsVmoSubslicePost
+  let vSensitive ← liftTermElabM <|
+    auditSpecStrengthCertInEnv `fxfs (some ``fxfsVmoSubsliceInputSensitive)
+      (expectedReq? := some fxfsReq) (expectedEns? := some fxfsEns)
+  let vSensitiveWrong ← liftTermElabM <|
+    auditSpecStrengthCertInEnv `fxfs_weak (some ``fxfsVmoSubsliceInputSensitive)
+      (expectedReq? := some fxfsReq)
+      (expectedEns? := some (mkConst ``weak_vmo_subslice_upper_bound_only))
+  let kw := "sor" ++ "ry"
+  let envStatefulClaim ← elabInSandbox <|
+    "open Trusted.VerificationResult Trusted.MirSemantics Trusted.MirAst\n" ++
+    "open Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "axiom s5Body : CapturedMir\n" ++
+    "noncomputable def s5Claim : StatefulClaim :=\n" ++
+    "  { body := s5Body, pre := fuchsiaUsercopyCopyinPre, post := fuchsiaUsercopyCopyinPost }\n" ++
+    s!"theorem s5Verified : StatefulVerificationResult s5Claim := by {kw}\n"
+  let vSensitiveClaim ← withSandboxEnv envStatefulClaim <|
+    auditClaimSpecStrengthInEnv `s5Verified (some ``fuchsiaUsercopyCopyinInputSensitive)
+  liftIO <| assertAuditOk "S5_input_sensitive_cert_bound" vSensitive
+  liftIO <| assertAuditOk "S5_input_sensitive_cert_claim_bound" vSensitiveClaim
+  liftIO <| assertRejectedWithTag "S5_input_sensitive_cert_wrong_spec" vSensitiveWrong "specStrengthCertInvalidType"
+  lines := lines ++
+    [ formatVerdictTags "S5_input_sensitive_cert_bound" vSensitive
+    , formatVerdictTags "S5_input_sensitive_cert_claim_bound" vSensitiveClaim
+    , formatVerdictTags "S5_input_sensitive_cert_wrong_spec" vSensitiveWrong ]
+  logInfo (String.intercalate "\n" lines)
+
 /-! ### Type-Level Refutations for Discriminating Kills and Deterministic Specifications -/
 
 /-- A specification that is satisfiable at input `0` but unimplementable everywhere else.
@@ -1057,6 +1238,30 @@ theorem testFxfsEveryDeviationKilled (bogus : Nat) (hNe : bogus ≠ 4224) :
       injection hS with hBits _
       exact hNe hBits)
 
+/-- A contract whose precondition admits exactly one input. -/
+def singlePointPre (n : Nat) : Prop := n = 5
+
+/-- Its postcondition pins the output for that one input. -/
+def singlePointPost (n y : Nat) : Prop := y = n + 1
+
+/-- The single-point contract satisfies even the deterministic certificate: non-vacuous,
+    realizable everywhere it applies, unique output. Every certificate available before
+    `InputSensitiveSpecCert` therefore accepted a specification that covers one input. -/
+theorem testSinglePointSpecIsDeterministic :
+    DeterministicSpecCert singlePointPre singlePointPost :=
+  ⟨⟨5, rfl⟩, fun x _ => ⟨x + 1, rfl⟩, fun _ _ _ _ h h' => h.trans h'.symm⟩
+
+/-- ...whereas it can never be input-sensitive. -/
+theorem testSinglePointSpecNotInputSensitive :
+    InputSensitiveSpecCert singlePointPre singlePointPost → False :=
+  no_input_sensitive_cert_of_singleton_req (fun _ _ h h' => h.trans h'.symm)
+
+/-- A contract whose postcondition ignores the input (here: "the result is zero") is not
+    input-sensitive either, however many inputs its precondition admits. -/
+theorem testInputIndependentSpecNotInputSensitive :
+    InputSensitiveSpecCert (fun (n : Nat) => n < 10) (fun _ (y : Nat) => y = 0) → False :=
+  no_input_sensitive_cert_of_input_independent_ens (fun _ _ _ _ _ h => h)
+
 /-! ## Hardening Regressions: Empty Target Sets, Fuel Exhaustion, JSON Receipt Schema -/
 
 /--
@@ -1092,7 +1297,7 @@ run_cmd do
     , formatVerdictTags "R10_fuel_exhaustion_closure" vFuelClosure
     , formatVerdictTags "R10_fuel_exhaustion_statement" vFuelStmt ]
 
-/-- info: {"stats":{"axiomsFound":[],"elapsedMicros":7,"importMicros":0,"kernelReplayedDeclarations":0,"modulesLoaded":0,"privateArtifactsChecked":0,"provisionalNativeAxioms":["a._native.t.ax_1","z._native.t.ax_1"],"reachableDeclarations":0,"targetsAudited":1},"status":"rejected","violations":[{"context":"ctx","kind":"noAuditTargets"},{"expected":"toolchain","kind":"moduleProvenanceSpoofed","module":"Std.Evil","resolvedPath":"/x/Std/Evil.olean"},{"certDecl":"c","kind":"specStrengthCoverageGap","missing":["wrongReturn"],"reason":"why"},{"candidates":["a","b"],"kind":"specInstanceAmbiguous","specClass":"K","specName":"s"},{"kind":"auditFuelExhausted","phase":"closure","target":"t"},{"detail":"boom","kind":"environmentLoadFailed"}]} -/
+/-- info: {"stats":{"axiomsFound":[],"elapsedMicros":7,"importMicros":0,"kernelConfirmedNativeAxioms":["k._native.t.ax_1"],"kernelReplayedDeclarations":0,"modulesLoaded":0,"privateArtifactsChecked":0,"provisionalNativeAxioms":["a._native.t.ax_1","z._native.t.ax_1"],"reachableDeclarations":0,"targetsAudited":1},"status":"rejected","violations":[{"context":"ctx","kind":"noAuditTargets"},{"expected":"toolchain","kind":"moduleProvenanceSpoofed","module":"Std.Evil","resolvedPath":"/x/Std/Evil.olean"},{"certDecl":"c","kind":"specStrengthCoverageGap","missing":["wrongReturn"],"reason":"why"},{"candidates":["a","b"],"kind":"specInstanceAmbiguous","specClass":"K","specName":"s"},{"kind":"auditFuelExhausted","phase":"closure","target":"t"},{"detail":"boom","kind":"environmentLoadFailed"}]} -/
 #guard_msgs in
 #eval IO.println (auditReportJson (.rejected
   #[ .noAuditTargets "ctx"
@@ -1102,7 +1307,7 @@ run_cmd do
    , .auditFuelExhausted `t "closure"
    , .environmentLoadFailed "boom" ]
   { targetsAudited := 1, provisionalNativeAxioms := #[`z._native.t.ax_1, `a._native.t.ax_1]
-    elapsedMicros := 7 })).compress
+    kernelConfirmedNativeAxioms := #[`k._native.t.ax_1], elapsedMicros := 7 })).compress
 
 /-! ## Synthetic `ConstantInfo` Graph-Edge Completeness Regression Checks -/
 
@@ -1450,6 +1655,27 @@ def runDiskHardeningRegressions : IO String := do
     assertRejectedWithTag "A1_symlink_split_provenance" vSymSplit "moduleProvenanceSpoofed"
     lines := lines.push (formatVerdictTags "A1_symlink_split_provenance" vSymSplit)
 
+    -- S4: a symlinked *directory* aliasing one genuine toolchain module under another
+    --     trusted name. Every artifact of `Std.ProtoAlias.Nat.Basic` then resolves
+    --     inside the toolchain (so directory and part checks pass), but the file is
+    --     `Init/Data/Nat/Basic.olean`: a different module relabelled as `Std.*`.
+    let aliasRoot := tmpDir / "AliasRoot"
+    IO.FS.createDirAll (aliasRoot / "Std")
+    let _ ← IO.Process.output {
+      cmd := "ln"
+      args := #["-s", (libDir / "Init" / "Data").toString,
+                (aliasRoot / "Std" / "ProtoAlias").toString]
+    }
+    let vAlias ← withExtraSearchPaths [aliasRoot] do
+      let vs ← checkModuleProvenanceIO #[`Std.ProtoAlias.Nat.Basic]
+      pure (if vs.isEmpty then AuditVerdict.ok {} else AuditVerdict.rejected vs {})
+    assertRejectedWithTag "S4_symlinked_directory_module_alias" vAlias "moduleProvenanceSpoofed"
+    let genuineViolations ←
+      checkModuleProvenanceIO #[`Init.Data.Nat.Basic, `Std.Data.HashMap.Basic, `Lean.Meta.Basic]
+    unless genuineViolations.isEmpty do
+      throw <| IO.userError s!"genuine toolchain modules failed provenance: {genuineViolations.map AuditViolation.tag}"
+    lines := lines.push (formatVerdictTags "S4_symlinked_directory_module_alias" vAlias)
+
     -- A1-5a/b: `prelude` module re-declaring its own `Eq`/`Bool`/`Bool.true` + forged
     --          native axiom AND re-declaring `Lean.ofReduceBool`. Both must be rejected
     --          as `.unapprovedAxiom` (never accepted provisionally or misclassified).
@@ -1491,6 +1717,7 @@ D7_spoofed_trusted_pinned_elsewhere: rejected [moduleProvenanceSpoofed]
 D7_pinned_root_honoured: ok []
 D6_no_root_modules: rejected [noAuditTargets]
 A1_symlink_split_provenance: rejected [moduleProvenanceSpoofed]
+S4_symlinked_directory_module_alias: rejected [moduleProvenanceSpoofed]
 A1_prelude_fake_native_eq_bool: rejected [unapprovedAxiom]
 A1_prelude_redeclared_ofReduceBool: rejected [unapprovedAxiom]
 tmp_clean=true
@@ -1507,7 +1734,8 @@ run_cmd do
     typeclass bridges, and the `fxfs` / `fuchsia_usercopy` examples. -/
 def pureSpecHalfPrefixes : Array String := #[
   "SpecStrengthCert", "MutantCategory", "NamedMutantKill", "MultiMutantSpecCert",
-  "DeterministicSpecCert", "ModularSpecStrengthCert", "ModularMultiMutantSpecCert",
+  "DeterministicSpecCert", "InputSensitiveSpecCert", "ModularSpecStrengthCert",
+  "ModularMultiMutantSpecCert",
   "ModularDeterministicSpecCert", "no_", "mutant_impl", "multi_mutant", "ItemSpecStrengthCert",
   "ItemMultiMutantCert", "StatefulItem", "ModularItem", "fxfs", "fuchsia", "weak",
   "truncated", "strong", "mutatedFrameMemory", "instDecidableEqMutantCategory",
@@ -1677,5 +1905,21 @@ info: 'Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinModularDirectDe
 /-- info: 'Anneal.OleanSpecStrengthAuditorProto.no_modular_cert_of_vacuous_envAssumed' does not depend on any axioms -/
 #guard_msgs in
 #print axioms Anneal.OleanSpecStrengthAuditorProto.no_modular_cert_of_vacuous_envAssumed
+
+/-- info: 'Anneal.OleanSpecStrengthAuditorProto.fxfsVmoSubsliceInputSensitive' does not depend on any axioms -/
+#guard_msgs in
+#print axioms Anneal.OleanSpecStrengthAuditorProto.fxfsVmoSubsliceInputSensitive
+
+/-- info: 'Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinInputSensitive' does not depend on any axioms -/
+#guard_msgs in
+#print axioms Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinInputSensitive
+
+/-- info: 'Anneal.OleanSpecStrengthAuditorProto.no_input_sensitive_cert_of_singleton_req' does not depend on any axioms -/
+#guard_msgs in
+#print axioms Anneal.OleanSpecStrengthAuditorProto.no_input_sensitive_cert_of_singleton_req
+
+/-- info: 'Anneal.OleanSpecStrengthAuditorProtoTests.testSinglePointSpecNotInputSensitive' does not depend on any axioms -/
+#guard_msgs in
+#print axioms Anneal.OleanSpecStrengthAuditorProtoTests.testSinglePointSpecNotInputSensitive
 
 end Anneal.OleanSpecStrengthAuditorProtoTests
