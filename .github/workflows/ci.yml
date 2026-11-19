@@ -404,8 +404,10 @@ jobs:
           cargo run --locked -p cargo-anneal --example regenerate_bundle -- \
             --root . --check
           # Guard the Fuchsia/RBE hermetic build mode: `--no-default-features`
-          # must stay free of `exocrate`/`dirs` and pass CLI/unit/harness tests.
-          hermetic_tree="$(cargo tree -p cargo-anneal --no-default-features -e normal --depth 1)"
+          # must keep `exocrate`, `dirs`, and their network stack out of the
+          # whole normal dependency tree and pass CLI/unit/harness tests.
+          hermetic_tree="$(cargo tree --locked -p cargo-anneal \
+            --no-default-features -e normal)"
           printf '%s\n' "$hermetic_tree"
           if printf '%s\n' "$hermetic_tree" | grep -E '\b(exocrate|dirs|ureq|rustls)\b'; then
             echo "error: forbidden non-hermetic crate in --no-default-features tree" >&2
