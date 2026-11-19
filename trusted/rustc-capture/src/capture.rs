@@ -659,9 +659,10 @@ fn collect(
     // https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_metadata/src/locator.rs#L934-L945
     let canonical_sysroot = sysroot.canonicalize().map_err(Failure::io)?;
     let sysroot_rustlib = canonical_sysroot.join("lib/rustlib");
-    let raw_sysroot_rustlib = std::path::absolute(sysroot.join("lib/rustlib"))
-        .and_then(|p| p.normalize_lexically().map_err(io::Error::other))
-        .ok();
+    let raw_sysroot_rustlib = std::path::absolute(&sysroot)
+        .ok()
+        .filter(|p| is_clean_absolute_path(p))
+        .map(|p| p.join("lib/rustlib"));
     let canonical_rustlib = sysroot_rustlib.canonicalize().ok();
     let mut observed_externs = BTreeMap::<(String, PathBuf), ir::ExternFile>::new();
     for &cnum in tcx.crates(()) {
@@ -684,9 +685,6 @@ fn collect(
             .flatten()
         {
             any_source_path = true;
-            let norm_candidate = std::path::absolute(candidate)
-                .and_then(|p| p.normalize_lexically().map_err(io::Error::other))
-                .map_err(Failure::io)?;
             let path = candidate.canonicalize().map_err(Failure::io)?;
             let meta = std::fs::symlink_metadata(&path).map_err(Failure::io)?;
             if let Some(expected_sha256) = externs.allowed_artifacts.get(&path) {
@@ -713,13 +711,13 @@ fn collect(
                     },
                 );
             } else if meta.is_file()
-                && (norm_candidate.starts_with(&sysroot_rustlib)
-                    || raw_sysroot_rustlib
-                        .as_ref()
-                        .is_some_and(|rl| norm_candidate.starts_with(rl))
-                    || canonical_rustlib
-                        .as_ref()
-                        .is_some_and(|rl| norm_candidate.starts_with(rl) || path.starts_with(rl)))
+                && is_admitted_sysroot_crate(
+                    candidate,
+                    &path,
+                    &sysroot_rustlib,
+                    raw_sysroot_rustlib.as_deref(),
+                    canonical_rustlib.as_deref(),
+                )
             {
                 // Standard-library crates under `<sysroot>/lib/rustlib` belong
                 // to the compiler distribution authenticated by the host.
@@ -942,9 +940,143 @@ fn compiler_path(path: &Path) -> Result<&str, Failure> {
     })
 }
 
+/// Return `true` when `path` is absolute, carries no trailing directory
+/// separator, and contains only prefix, root, and normal components (no `.` or
+/// `..` traversal segments).
+fn is_clean_absolute_path(path: &Path) -> bool {
+    let raw = path.as_os_str().as_encoded_bytes();
+    if raw.is_empty() || raw.ends_with(b"/") || raw.ends_with(&[std::path::MAIN_SEPARATOR as u8]) {
+        return false;
+    }
+    path.is_absolute()
+        && path.components().all(|comp| {
+            matches!(
+                comp,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::Normal(_)
+            )
+        })
+}
+
+/// Admit a standard-library crate discovered under `<sysroot>/lib/rustlib`
+/// without allowing lexical `..` traversal across intermediate symlinks.
+///
+/// `Path::normalize_lexically` collapses `..` without inspecting the
+/// filesystem, so `<sysroot>/lib/rustlib/sym/../rogue.rlib` (where `sym` points
+/// outside the sysroot) would lexically match `<sysroot>/lib/rustlib` while
+/// opening `/outside/rogue.rlib`. Require either `canonical_target` beneath
+/// `canonical_rustlib`, or a dot-free `candidate` path beneath
+/// `sysroot_rustlib` / `raw_sysroot_rustlib` whose `canonicalize()` resolves to
+/// `canonical_target` (supporting `pkgs.symlinkJoin` and CAS symlink farms).
+fn is_admitted_sysroot_crate(
+    candidate: &Path,
+    canonical_target: &Path,
+    sysroot_rustlib: &Path,
+    raw_sysroot_rustlib: Option<&Path>,
+    canonical_rustlib: Option<&Path>,
+) -> bool {
+    if canonical_rustlib.is_some_and(|rl| canonical_target.starts_with(rl)) {
+        return true;
+    }
+    let Ok(abs_candidate) = std::path::absolute(candidate) else {
+        return false;
+    };
+    if !is_clean_absolute_path(&abs_candidate) {
+        return false;
+    }
+    let under_sysroot_rustlib = abs_candidate.starts_with(sysroot_rustlib)
+        || raw_sysroot_rustlib.is_some_and(|rl| abs_candidate.starts_with(rl));
+    under_sysroot_rustlib
+        && std::fs::symlink_metadata(&abs_candidate).is_ok()
+        && abs_candidate
+            .canonicalize()
+            .is_ok_and(|resolved| resolved == canonical_target)
+}
+
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn sysroot_crate_admission_accepts_symlink_join_and_rejects_dotdot_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let sysroot = root.join("sysroot");
+        let rustlib = sysroot.join("lib/rustlib");
+        let target_lib = rustlib.join("x86_64-unknown-linux-gnu/lib");
+        std::fs::create_dir_all(&target_lib).unwrap();
+
+        let store = root.join("nix-store-rust-std");
+        std::fs::create_dir_all(store.join("aarch64-unknown-fuchsia/lib")).unwrap();
+        let store_std = store.join("libstd.rlib");
+        std::fs::write(&store_std, b"std").unwrap();
+        let store_fuchsia_core = store.join("aarch64-unknown-fuchsia/lib/libcore.rlib");
+        std::fs::write(&store_fuchsia_core, b"fuchsia-core").unwrap();
+
+        // Regular file directly inside `<sysroot>/lib/rustlib`.
+        let direct_core = target_lib.join("libcore.rlib");
+        std::fs::write(&direct_core, b"core").unwrap();
+
+        // `pkgs.symlinkJoin` leaf symlink and target-directory symlink.
+        let joined_std = target_lib.join("libstd.rlib");
+        symlink(&store_std, &joined_std).unwrap();
+        symlink(
+            store.join("aarch64-unknown-fuchsia"),
+            rustlib.join("aarch64-unknown-fuchsia"),
+        )
+        .unwrap();
+        let joined_fuchsia_core = rustlib.join("aarch64-unknown-fuchsia/lib/libcore.rlib");
+
+        // Outside directory reachable via `sym/..` lexical symlink escape.
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        let rogue = outside.join("rogue.rlib");
+        std::fs::write(&rogue, b"rogue").unwrap();
+        symlink(outside.join("sub"), rustlib.join("sym")).unwrap();
+        let dotdot_escape = rustlib.join("sym/../rogue.rlib");
+        assert_eq!(dotdot_escape.canonicalize().unwrap(), rogue);
+
+        let canonical_rustlib = rustlib.canonicalize().ok();
+        assert!(is_admitted_sysroot_crate(
+            &direct_core,
+            &direct_core.canonicalize().unwrap(),
+            &rustlib,
+            Some(&rustlib),
+            canonical_rustlib.as_deref(),
+        ));
+        assert!(is_admitted_sysroot_crate(
+            &joined_std,
+            &joined_std.canonicalize().unwrap(),
+            &rustlib,
+            Some(&rustlib),
+            canonical_rustlib.as_deref(),
+        ));
+        assert!(is_admitted_sysroot_crate(
+            &joined_fuchsia_core,
+            &joined_fuchsia_core.canonicalize().unwrap(),
+            &rustlib,
+            Some(&rustlib),
+            canonical_rustlib.as_deref(),
+        ));
+        assert!(!is_admitted_sysroot_crate(
+            &dotdot_escape,
+            &rogue,
+            &rustlib,
+            Some(&rustlib),
+            canonical_rustlib.as_deref(),
+        ));
+        assert!(!is_admitted_sysroot_crate(
+            &rogue,
+            &rogue,
+            &rustlib,
+            Some(&rustlib),
+            canonical_rustlib.as_deref(),
+        ));
+    }
 
     #[test]
     fn duplicate_function_identities_are_refused() {

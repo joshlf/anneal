@@ -403,6 +403,19 @@ jobs:
           exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/workspace.log") 2>&1
           cargo run --locked -p cargo-anneal --example regenerate_bundle -- \
             --root . --check
+          # Guard the Fuchsia/RBE hermetic build mode: `--no-default-features`
+          # must stay free of `exocrate`/`dirs` and pass CLI/unit/harness tests.
+          hermetic_tree="$(cargo tree -p cargo-anneal --no-default-features -e normal --depth 1)"
+          printf '%s\n' "$hermetic_tree"
+          if printf '%s\n' "$hermetic_tree" | grep -E '\b(exocrate|dirs|ureq|rustls)\b'; then
+            echo "error: forbidden non-hermetic crate in --no-default-features tree" >&2
+            exit 1
+          fi
+          (
+            unset ANNEAL_CLI ANNEAL_MVP_CLI ANNEAL_TEST_CARGO_ANNEAL
+            cargo test --locked -p cargo-anneal --no-default-features \
+              --lib --bins --test cli --test harness
+          )
           cargo test --workspace --locked
 
       - name: Verify production Starnix fixture and mutations
@@ -450,6 +463,8 @@ jobs:
           # Compile the packaged tests too, so omitted fixtures or helpers
           # cannot hide behind a successful source-tree test build.
           cargo test --locked --manifest-path "$prepared_manifest" --no-run
+          cargo test --locked --no-default-features \
+            --manifest-path "$prepared_manifest" --no-run
 
       - name: Run installed smoke suite
         id: smoke

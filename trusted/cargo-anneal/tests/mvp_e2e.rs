@@ -381,6 +381,7 @@ fn verifies_real_source_and_rejects_boundary_mutations() {
         "request_sha256",
         "capture_sha256",
         "capture_binary_sha256",
+        "lean_binary_sha256",
         "model_manifest_sha256",
         "specification_manifest_sha256",
     ] {
@@ -1071,6 +1072,63 @@ end Proof"#,
             "{loaded:?}"
         );
     }
+
+    // Positive crate-renaming + multi-alias shared-artifact verification:
+    // two `--extern` aliases (`alias_b` and `alias_a`) pointing at the same
+    // `deps/libdep_types.rmeta` file normalize cleanly, stage once, and bind
+    // `loaded_externs` by `tcx.crate_name` (`dep_types` and `leaf_types`).
+    let subject_src = fs::read_to_string(fixture.path("rust/lib.rs")).unwrap();
+    fixture.write(
+        "rust/lib.rs",
+        "use alias_a::Mode;\n\
+         use alias_b::LeafBit;\n\
+         pub fn classify(mode: Mode, bit: LeafBit) -> u64 {\n\
+             match mode {\n\
+                 Mode::Little => match bit {\n\
+                     LeafBit::Zero => 0x0f,\n\
+                     LeafBit::One => 0xff,\n\
+                 },\n\
+                 Mode::Big => 0,\n\
+             }\n\
+         }\n",
+    );
+    let mut alias_req = fixture.request.clone();
+    alias_req["compilation"]["externs"] = json!([
+        {"crate_name": "alias_b", "path": "deps/libdep_types.rmeta"},
+        {"crate_name": "alias_a", "path": "deps/libdep_types.rmeta"},
+    ]);
+    alias_req["compilation"]["dependency_dirs"] = json!(["deps"]);
+    let alias_receipt = fixture.run(&tools, "multi-crate-renamed-aliases", &alias_req);
+    alias_receipt.expect(0, "crate_verified", None);
+    assert_eq!(
+        alias_receipt.value["externs"],
+        json!([
+            {
+                "crate_name": "alias_a",
+                "relative_path": "deps/libdep_types.rmeta",
+                "sha256": dep_rmeta_sha,
+            },
+            {
+                "crate_name": "alias_b",
+                "relative_path": "deps/libdep_types.rmeta",
+                "sha256": dep_rmeta_sha,
+            },
+        ])
+    );
+    let alias_loaded = alias_receipt.value["loaded_externs"].as_array().unwrap();
+    assert!(
+        alias_loaded
+            .iter()
+            .any(|e| e["crate_name"] == "dep_types" && e["sha256"] == dep_rmeta_sha),
+        "{alias_loaded:?}"
+    );
+    assert!(
+        alias_loaded
+            .iter()
+            .any(|e| e["crate_name"] == "leaf_types" && e["sha256"] == leaf_rmeta_sha),
+        "{alias_loaded:?}"
+    );
+    fixture.write("rust/lib.rs", &subject_src);
 
     let mut base_req = fixture.request.clone();
     base_req["compilation"]["externs"] = json!([

@@ -1526,6 +1526,8 @@ struct LibraryLock {
 pub struct AdmittedToolchain {
     /// Staged path of `TrustedBoundary.lean`.
     pub inspector: PathBuf,
+    /// Verified lowercase hex SHA-256 digest of the `lean` executable.
+    pub lean_sha256: String,
     /// Verified `lean --version` string matching `foundation-lock.json`.
     pub version: String,
     /// Canonical `lean --print-prefix` sysroot directory.
@@ -2465,6 +2467,7 @@ impl Checker {
 
         self.admitted = Some(AdmittedToolchain {
             inspector,
+            lean_sha256: lean_sha,
             version: actual_version,
             prefix,
             axioms: parsed_lock.axioms,

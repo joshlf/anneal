@@ -158,6 +158,11 @@ def run(arguments, work):
         raise RuntimeError(
             "receipt unexpectedly populated rustc_binary_sha256 without --rustc-version: "
             f"{baseline.get('rustc_binary_sha256')}")
+    expected_lean_sha = hashlib.sha256(arguments.lean.read_bytes()).hexdigest()
+    if baseline.get("lean_binary_sha256") != expected_lean_sha:
+        raise RuntimeError(
+            f"receipt lean_binary_sha256 {baseline.get('lean_binary_sha256')} "
+            f"!= {expected_lean_sha}")
     # Positively exercise the same candidate producer used for mutations.
     # Exact byte equality reuses the baseline's successful kernel check and
     # prevents an invalid-Lean producer from satisfying only negative cases.

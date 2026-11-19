@@ -13,8 +13,8 @@ model, authored specifications and proofs, and exact theorem acceptance. Its
 first production example verifies Starnix's endianness conversion in the
 original multi-file `ebpf_core` compilation.
 
-The commands below target x86_64 Linux. Capture pins Rust nightly
-`2026-10-23`, commit `7189d39d9ce936881b8132c6addeaf3e295cd455` (`V2026_10_22_R7189d39d9`;
+The commands below target x86_64 Linux. Capture pins Rust nightly `2026-10-23`,
+commit `7189d39d9ce936881b8132c6addeaf3e295cd455` (`V2026_10_22_R7189d39d9`;
 also admitting `nightly-2026-06-01` / `V2026_05_31_R14210df0e` and
 `nightly-2026-05-31` / `V2026_05_30_Rf8a08b688` for local development), and
 `Runtime(PostCleanup)` MIR. The capture driver's build script identifies the
@@ -186,9 +186,12 @@ Fuchsia triples (`{x86_64,aarch64,riscv64gc}-unknown-{linux-gnu,fuchsia}`).
 Optional `externs` (`{crate_name, path}` `.rmeta`/`.rlib` files) and
 `dependency_dirs` (clean relative directories whose `.rmeta`, `.rlib`, and
 `.so` artifacts are staged and SHA-256-bound) declare precompiled crate
-metadata; the format does not expose arbitrary compiler flags. A request proves
-this configured source subject; correspondence to a different Cargo profile or
-deployed binary requires separate evidence.
+metadata; the format does not expose arbitrary compiler flags. Because `.so`
+artifacts (such as host procedural macros) execute native code inside the
+compiler process during capture, any staged `.so` belongs to the configured TCB
+authenticated by its recorded `dependency_artifacts` / `loaded_externs` SHA-256
+digest. A request proves this configured source subject; correspondence to a
+different Cargo profile or deployed binary requires separate evidence.
 
 Declared regular files and their ancestor directories define the compilation's
 source namespace. Source reads and existence checks resolve within that

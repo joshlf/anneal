@@ -1227,24 +1227,36 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             ));
         }
         let original = declared_file(&base_canon, &ext.path)?;
-        let sha256 = if let Some((_, existing_sha)) = artifact_snapshots.get(&original) {
-            existing_sha.clone()
-        } else {
-            let bytes = fs::read(&original).map_err(|e| io("inputs", e))?;
-            let sha256 = digest(&bytes);
-            write(&deps_stage.join(&ext.path), &bytes)?;
-            originals.push((original.clone(), sha256.clone()));
-            artifact_snapshots.insert(original, (bytes, sha256.clone()));
-            sha256
-        };
-        let staged = deps_stage.join(&ext.path);
-        if !staged.is_file() {
-            let (bytes, _) = artifact_snapshots
-                .get(&declared_file(&base_canon, &ext.path)?)
-                .unwrap();
-            write(&staged, bytes)?;
+        let (bytes, sha256) =
+            if let Some((existing_bytes, existing_sha)) = artifact_snapshots.get(&original) {
+                (existing_bytes.clone(), existing_sha.clone())
+            } else {
+                let bytes = fs::read(&original).map_err(|e| io("inputs", e))?;
+                let sha256 = digest(&bytes);
+                originals.push((original.clone(), sha256.clone()));
+                artifact_snapshots.insert(original, (bytes.clone(), sha256.clone()));
+                (bytes, sha256)
+            };
+        let staged_rel = deps_stage.join(&ext.path);
+        match fs::symlink_metadata(&staged_rel) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(error(
+                        "tool_failed",
+                        "staging",
+                        format!(
+                            "staged extern crate path collided with a non-file entry: {}",
+                            staged_rel.display()
+                        ),
+                    ));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                write(&staged_rel, &bytes)?;
+            }
+            Err(err) => return Err(io("staging", err)),
         }
-        let staged = fs::canonicalize(&staged).map_err(|e| io("staging", e))?;
+        let staged = fs::canonicalize(&staged_rel).map_err(|e| io("staging", e))?;
         let Some(staged_utf8) = staged.to_str().map(str::to_owned) else {
             return Err(error(
                 "tool_failed",
@@ -1299,11 +1311,26 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             }
             expected_dir_digests.insert(file_name.clone(), sha256.clone());
             let rel_file = rel_dir.join(&file_name);
-            let staged_file = staged_dir.join(&file_name);
-            if !staged_file.is_file() {
-                write(&staged_file, &bytes)?;
+            let staged_rel = staged_dir.join(&file_name);
+            match fs::symlink_metadata(&staged_rel) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() || !meta.is_file() {
+                        return Err(error(
+                            "tool_failed",
+                            "staging",
+                            format!(
+                                "staged dependency artifact collided with a non-file entry: {}",
+                                staged_rel.display()
+                            ),
+                        ));
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    write(&staged_rel, &bytes)?;
+                }
+                Err(err) => return Err(io("staging", err)),
             }
-            let staged_file = fs::canonicalize(&staged_file).map_err(|e| io("staging", e))?;
+            let staged_file = fs::canonicalize(&staged_rel).map_err(|e| io("staging", e))?;
             let Some(staged_file_utf8) = staged_file.to_str().map(str::to_owned) else {
                 return Err(error(
                     "tool_failed",
@@ -1867,6 +1894,11 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             e.to_string(),
         )
     })?;
+    let lean_binary_sha256 = checker
+        .admitted()
+        .map_err(|e| error("tool_failed", "audit", e.to_string()))?
+        .lean_sha256
+        .clone();
     let proof_ms = proof_start.elapsed().as_millis();
     // Snapshot identity is checked again at the accepting boundary. Logical
     // type equality cannot authenticate unused source or configuration hashes.
@@ -1902,6 +1934,13 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             "capture executable changed during verification",
         ));
     }
+    if regular_tool_digest(&checker.lean, "binding")? != lean_binary_sha256 {
+        return Err(error(
+            "tool_failed",
+            "binding",
+            "lean executable changed during verification",
+        ));
+    }
     if let Some(declared) = &declared
         && regular_tool_digest(&declared.rustc, "binding")? != declared.sha256
     {
@@ -1922,6 +1961,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         "schema_version": 1, "status": status, "experimental": true,
         "request_sha256": request_sha256, "capture_sha256": capture_sha256,
         "capture_binary_sha256": capture_binary_sha256,
+        "lean_binary_sha256": lean_binary_sha256,
         "compiler": manifest["compiler"],
         "rustc_binary_sha256": declared.as_ref().map(|declared| &declared.sha256),
         "model_manifest_sha256": model_manifest_sha256,
@@ -2651,8 +2691,21 @@ mod tests {
         let dep_dir = declared_dir(&root, Path::new("deps")).unwrap();
         assert!(declared_dir(&root, Path::new("")).is_err());
         assert!(declared_dir(&root, Path::new(".")).is_err());
+        assert!(declared_dir(&root, Path::new("deps/")).is_err());
         assert!(declared_dir(&root, Path::new("../deps")).is_err());
         assert!(declared_dir(&root, Path::new("/deps")).is_err());
+        assert!(declared_file(&root, Path::new("deps//liba.rmeta")).is_err());
+        assert!(declared_file(&root, Path::new("deps/liba.rmeta/")).is_err());
+
+        let tool_bin = root.join("lean-bin");
+        fs::write(&tool_bin, b"lean-v1").unwrap();
+        let initial_tool_sha = regular_tool_digest(&tool_bin, "binding").unwrap();
+        fs::write(&tool_bin, b"lean-v2").unwrap();
+        assert_ne!(
+            regular_tool_digest(&tool_bin, "binding").unwrap(),
+            initial_tool_sha
+        );
+        assert!(regular_tool_digest(&dep_dir, "binding").is_err());
 
         let scanned = scan_dependency_dir(&dep_dir, "inputs").unwrap();
         assert_eq!(scanned.len(), 2);
@@ -2668,6 +2721,9 @@ mod tests {
             use std::os::unix::fs::symlink;
             symlink("deps", root.join("deps-link")).unwrap();
             assert!(declared_dir(&root, Path::new("deps-link")).is_err());
+            assert!(declared_dir(&root, Path::new("deps-link/")).is_err());
+            symlink(&tool_bin, root.join("lean-link")).unwrap();
+            assert!(regular_tool_digest(&root.join("lean-link"), "binding").is_err());
             symlink("liba.rmeta", root.join("deps/link.rmeta")).unwrap();
             assert!(scan_dependency_dir(&dep_dir, "inputs").is_err());
         }
