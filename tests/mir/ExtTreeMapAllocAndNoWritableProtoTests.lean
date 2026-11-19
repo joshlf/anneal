@@ -1734,6 +1734,26 @@ theorem canary_part3A_customDst_metadataTail_and_unsizedLayout_like_upstream :
   exact ⟨h1, h2, rfl, rfl, rfl, rfl, hrej, hunsz,
     validateRawPtrFastPath_ne_layoutFirst_imp maxRepresentableSize64 _ _ hne⟩
 
+/-- **`[adv A4]` Closed canary — `validateSafeThinRef` static-global `.liveData`, zero-address
+provenanced `&()`, & access-before-alignment (`ValidityVisitor.lean:205–228`,
+`ValidityMachine.lean:202–206`)**:
+1. `&u32` at aligned `16` into an uncached `.static` global (`KeyedAllocWorld.empty.registerGlobal
+   ⟨testId1, .static, 4, 4, .not⟩`) succeeds via `getAllocInfo` (A0–B4's `w.findLive?` rejected it),
+2. zero-address provenanced `&()` (`addr = 0, prov = some testId1`) fails with `.nullSafePtr`
+   (A0–B4 falsely accepted it), and
+3. unaligned dangling `&u32` (`addr = 2, prov = none`) reports `.danglingOrOutOfBoundsSafePtr`
+   *before* `.unalignedSafePtr`. -/
+theorem canary_part3A_safeThinRef_staticGlobal_nullProv_and_accessOrder :
+    let wGlob := KeyedAllocWorld.empty.registerGlobal ⟨testId1, .static, 4, 4, .not⟩
+    validateSafeThinRef maxRepresentableSize64 wGlob .u32 16 (some testId1) = .ok () ∧
+    validateSafeThinRef maxRepresentableSize64 wGlob (.tuple []) 0 (some testId1) =
+      .error .nullSafePtr ∧
+    validateSafeThinRef maxRepresentableSize64 wGlob .u32 2 none =
+      .error .danglingOrOutOfBoundsSafePtr :=
+  validateSafeThinRef_staticGlobal_nullProv_and_accessOrder maxRepresentableSize64
+    KeyedAllocWorld.empty testId1 4 4 16 (ExtTreeMap0.get?_empty _)
+    (by decide) (by decide) (by decide)
+
 def debugPrincipal : PrincipalTraitRef :=
   { traitDefPath := "core::fmt::Debug", normalizedPredicates := [1], methodNames := ["u64::fmt"] }
 
@@ -2590,6 +2610,110 @@ theorem canary_part3C_recursive_aggregate_char_fnPtr_pointees :
     (.provenanced 0x4000 testIdMaxPrev 0) b4DescPair b4DescChar b4DescFn b4DescNever testIdMax 16
     hvP rfl rfl rfl hvC rfl rfl rfl hvF rfl rfl rfl hvN rfl rfl rfl (by decide) (by decide) (by decide)
 
+def a4Id4 : MiriAllocId := ⟨4, by decide⟩
+def a4Id5 : MiriAllocId := ⟨5, by decide⟩
+def a4Id6 : MiriAllocId := ⟨6, by decide⟩
+def a4Id7 : MiriAllocId := ⟨7, by decide⟩
+
+def a4DescBoolNever : VTableDescriptor :=
+  ⟨testId1, .tuple [.bool, .never], .principalLess [.send], "drop_bool_never", 1, 1,
+    [.dropInPlace "drop_bool_never", .size 1, .align 1]⟩
+
+def a4DescZstArrOk : VTableDescriptor :=
+  ⟨a4Id4, .array (.tuple []) usizeMax64, .principalLess [.send], "drop_zst_arr_max", 0, 1,
+    [.dropInPlace "drop_zst_arr_max", .size 0, .align 1]⟩
+
+def a4DescNeverArr0 : VTableDescriptor :=
+  ⟨a4Id5, .array .never 0, .principalLess [.send], "drop_never_arr0", 0, 1,
+    [.dropInPlace "drop_never_arr0", .size 0, .align 1]⟩
+
+def a4DescNeverArrMax : VTableDescriptor :=
+  ⟨a4Id6, .array .never usizeMax64, .principalLess [.send], "drop_never_arr_max", 0, 1,
+    [.dropInPlace "drop_never_arr_max", .size 0, .align 1]⟩
+
+def a4DescDeepBool : VTableDescriptor :=
+  ⟨a4Id7, nestSingleElemArray 64 .bool, .principalLess [.send], "drop_deep_bool", 1, 1,
+    [.dropInPlace "drop_deep_bool", .size 1, .align 1]⟩
+
+def a4RecursiveWorld : KeyedAllocWorld :=
+  ((((((KeyedAllocWorld.empty.registerGlobal ⟨testId1, .vtable, 0, 1, .not⟩).registerGlobal
+    ⟨testIdMaxPrev, .vtable, 0, 4, .not⟩).registerGlobal
+    ⟨testId3, .vtable, 0, 8, .not⟩).registerGlobal
+    ⟨a4Id4, .vtable, 0, 1, .not⟩).registerGlobal
+    ⟨a4Id5, .vtable, 0, 1, .not⟩).registerGlobal
+    ⟨a4Id6, .vtable, 0, 1, .not⟩).registerGlobal
+    ⟨a4Id7, .vtable, 0, 1, .not⟩
+
+def a4RecursiveReg : VTableRegistry where
+  byKey := ∅
+  byAlloc := (((((((∅ : ExtTreeMap0 MiriAllocId VTableDescriptor).insert testId1 a4DescBoolNever).insert
+      testIdMaxPrev b4DescNever).insert testId3 b4DescFn).insert a4Id4 a4DescZstArrOk).insert
+      a4Id5 a4DescNeverArr0).insert a4Id6 a4DescNeverArrMax).insert a4Id7 a4DescDeepBool
+
+/-- **`[adv A4]` Closed canary — field-before-inhabited precedence, zero-address provenanced `fn()`,
+`O(1)` ZST-array index-`0` fast path, & fail-closed fuel exhaustion**
+(`wideDyn_recursive_fieldOrder_nullProvFn_zstArray_and_fuel`):
+1. `(bool, !)` holding `[0x02]` fails on field `0` with `.invalidBoolScalar 2`, and `(u32, !)`
+   holding `.uninit` bytes fails on field `0` with `.uninitPointeeByte` (B4 short-circuited both to
+   `.uninhabitedPointee`);
+2. zero-address **provenanced** `fn()` (`List.replicate 8 (.init 0 (some testId2))`) fails with
+   `.nullFnPtr` (B4 falsely accepted it);
+3. `[(); usize::MAX]` and `[!; 0]` at `.danglingInt 16` succeed in `O(1)`, while `[!; usize::MAX]`
+   visits index `0` once in `O(1)` and fails with `.uninhabitedPointee` (B4's `List.range usizeMax64`
+   blew up);
+4. `nestSingleElemArray 64 .bool` holding `[0x02]` fails closed with `.traversalFuelExhausted`
+   (B4's `| 0, _, _ => .ok ()` silently accepted it). -/
+theorem canary_part3C_recursive_fieldOrder_nullProvFn_zstArray_and_fuel :
+    let specSend := DynExistentialSpec.principalLess [.send]
+    let vtBN := ScalarPtrHalf.provenanced 0x1000 testId1 0
+    let vtUN := ScalarPtrHalf.provenanced 0x4000 testIdMaxPrev 0
+    let vtFn := ScalarPtrHalf.provenanced 0x3000 testId3 0
+    let vtZA := ScalarPtrHalf.provenanced 0x5000 a4Id4 0
+    let vtNA0 := ScalarPtrHalf.provenanced 0x6000 a4Id5 0
+    let vtNAM := ScalarPtrHalf.provenanced 0x7000 a4Id6 0
+    let vtDB := ScalarPtrHalf.provenanced 0x8000 a4Id7 0
+    let wBadBool := a4RecursiveWorld.insertLive testIdMax ⟨.heap, 8, 8, .mut, [.init 2 none]⟩
+    let wUninit := a4RecursiveWorld.insertLive testIdMax ⟨.heap, 8, 8, .mut, List.replicate 8 .uninit⟩
+    let wNullProvFn := a4RecursiveWorld.insertLive testIdMax
+      ⟨.heap, 8, 8, .mut, List.replicate 8 (.init 0 (some (testId2.toTrustedAllocId, 0)))⟩
+    validateWideDynSafePtrWithBytes wBadBool a4RecursiveReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtBN true = .error (.pointeeErr (.invalidBoolScalar 2)) ∧
+    validateWideDynSafePtrWithBytes wUninit a4RecursiveReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtUN true = .error (.pointeeErr .uninitPointeeByte) ∧
+    validateWideDynSafePtrWithBytes wNullProvFn a4RecursiveReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtFn true = .error (.pointeeErr .nullFnPtr) ∧
+    validateWideDynSafePtrWithBytes a4RecursiveWorld a4RecursiveReg maxRepresentableSize64 specSend false
+      (.danglingInt 16) vtZA true = .ok (.array (.tuple []) usizeMax64, 0, 1) ∧
+    validateWideDynSafePtrWithBytes a4RecursiveWorld a4RecursiveReg maxRepresentableSize64 specSend false
+      (.danglingInt 16) vtNA0 true = .ok (.array .never 0, 0, 1) ∧
+    validateWideDynSafePtrWithBytes a4RecursiveWorld a4RecursiveReg maxRepresentableSize64 specSend false
+      (.danglingInt 16) vtNAM true = .error (.pointeeErr .uninhabitedPointee) ∧
+    validateWideDynSafePtrWithBytes wBadBool a4RecursiveReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtDB true = .error (.pointeeErr .traversalFuelExhausted) := by
+  have hvBN : validateVTableHalf a4RecursiveWorld a4RecursiveReg
+      (.provenanced 0x1000 testId1 0) (.principalLess [.send]) = .ok a4DescBoolNever := by decide +kernel
+  have hvUN : validateVTableHalf a4RecursiveWorld a4RecursiveReg
+      (.provenanced 0x4000 testIdMaxPrev 0) (.principalLess [.send]) = .ok b4DescNever := by decide +kernel
+  have hvFn : validateVTableHalf a4RecursiveWorld a4RecursiveReg
+      (.provenanced 0x3000 testId3 0) (.principalLess [.send]) = .ok b4DescFn := by decide +kernel
+  have hvZA : validateVTableHalf a4RecursiveWorld a4RecursiveReg
+      (.provenanced 0x5000 a4Id4 0) (.principalLess [.send]) = .ok a4DescZstArrOk := by decide +kernel
+  have hvNA0 : validateVTableHalf a4RecursiveWorld a4RecursiveReg
+      (.provenanced 0x6000 a4Id5 0) (.principalLess [.send]) = .ok a4DescNeverArr0 := by decide +kernel
+  have hvNAM : validateVTableHalf a4RecursiveWorld a4RecursiveReg
+      (.provenanced 0x7000 a4Id6 0) (.principalLess [.send]) = .ok a4DescNeverArrMax := by decide +kernel
+  have hvDB : validateVTableHalf a4RecursiveWorld a4RecursiveReg
+      (.provenanced 0x8000 a4Id7 0) (.principalLess [.send]) = .ok a4DescDeepBool := by decide +kernel
+  exact wideDyn_recursive_fieldOrder_nullProvFn_zstArray_and_fuel
+    a4RecursiveWorld a4RecursiveReg (.principalLess [.send])
+    (.provenanced 0x1000 testId1 0) (.provenanced 0x4000 testIdMaxPrev 0)
+    (.provenanced 0x3000 testId3 0) (.provenanced 0x5000 a4Id4 0)
+    (.provenanced 0x6000 a4Id5 0) (.provenanced 0x7000 a4Id6 0) (.provenanced 0x8000 a4Id7 0)
+    a4DescBoolNever b4DescNever b4DescFn a4DescZstArrOk a4DescNeverArr0 a4DescNeverArrMax a4DescDeepBool
+    testIdMax testId2 usizeMax64 16 (by unfold usizeMax64; omega)
+    hvBN rfl rfl rfl hvUN rfl rfl rfl hvFn rfl rfl rfl hvZA rfl rfl rfl
+    hvNA0 rfl rfl rfl hvNAM rfl rfl rfl hvDB rfl rfl rfl (by decide) (by decide) (by decide)
+
 /-! ## Section 4: Explicit `#guard_msgs in #print axioms` Verification -/
 
 /-- info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.KeyedAllocWorld.ext' depends on axioms: [propext, Quot.sound] -/
@@ -2799,6 +2923,20 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_recursive_aggregate_char
 -/
 #guard_msgs in
 #print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_recursive_aggregate_char_fnPtr_contents
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.validateSafeThinRef_staticGlobal_nullProv_and_accessOrder' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.validateSafeThinRef_staticGlobal_nullProv_and_accessOrder
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_recursive_fieldOrder_nullProvFn_zstArray_and_fuel' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_recursive_fieldOrder_nullProvFn_zstArray_and_fuel
 
 /-! ## Section 5: Deterministic Workload Generators & Elaboration Benchmarks (`M = 16, 64, 128, 256`) -/
 

@@ -6898,21 +6898,94 @@ def validateRawPtrFastPath (maxSize : Nat) (pointee : ProtoTy) (val : PtrReprVal
     | none => .error .expectedWideSliceMeta
     | some mk => validateUnsizedRawPtrMeta mk val
 
-/-- Safe-reference validator (`&pointee` / `&mut pointee`): *always* enforces `computeTyLayout`,
-non-nullness, alignment, inhabitedness, and live allocation bounds! -/
+/-- Safe-reference validator (`&pointee` / `&mut pointee`, `[adv A4]` `ValidityVisitor.checkSafe`
+& `ValidityMachine.scalarMayBeNull` fixes):
+1. Queries `computeTyLayout` and rejects unsized pointees (`.expectedWideSliceMeta`).
+2. When `layout.sizeBytes > 0`, runs `checkPointerAccess` **first** (`ValidityVisitor.lean:205–208`):
+   - `prov = none`: classifies `addr == 0` as `.nullSafePtr` (`classifyPointerAccessError` line 132)
+     and nonzero integer addresses as `.danglingOrOutOfBoundsSafePtr` (*before* alignment!),
+   - `prov = some id`: consults `w.getAllocInfo id` (accepting **both** `w.live` and interned
+     `.static`/`.memory` globals in `w.globals` via `.liveData`; A0–B4 called `w.findLive? id` and
+     falsely rejected valid `&STATIC` references to uncached globals!).
+3. Enforces `scalarMayBeNull` (`if addr == 0 then throw .nullSafePtr`, `ValidityVisitor.lean:225` +
+   `ValidityMachine.lean:202–206`) **regardless of `prov`** (A0–B4 tested `addr == 0 && prov.isNone`,
+   falsely accepting zero-address provenanced `&()` safe references!).
+4. Checks `layout.isInhabited` (`line 226`) and `addr % layout.alignBytes == 0` (`lines 227–228`). -/
 def validateSafeThinRef (maxSize : Nat) (w : KeyedAllocWorld) (pointee : ProtoTy)
     (addr : UInt64) (prov : Option MiriAllocId) : Except PtrValErr Unit := do
   let layout ← (computeTyLayout maxSize pointee).mapError PtrValErr.layoutErr
   if !layout.isSized then throw PtrValErr.expectedWideSliceMeta
-  if addr == 0 && prov.isNone then throw PtrValErr.nullSafePtr
+  if layout.sizeBytes > 0 then
+    match prov with
+    | none =>
+      if addr == 0 then throw PtrValErr.nullSafePtr
+      else throw PtrValErr.danglingOrOutOfBoundsSafePtr
+    | some id =>
+      match w.getAllocInfo id with
+      | .ok info =>
+        if info.kind != .liveData || layout.sizeBytes > info.sizeBytes.toNat then
+          throw PtrValErr.danglingOrOutOfBoundsSafePtr
+      | .error _ => throw PtrValErr.danglingOrOutOfBoundsSafePtr
+  if addr == 0 then throw PtrValErr.nullSafePtr
   if !layout.isInhabited then throw PtrValErr.uninhabitedSafePtr
   if layout.alignBytes > 0 && (addr.toNat % layout.alignBytes != 0) then
     throw PtrValErr.unalignedSafePtr
-  if layout.sizeBytes > 0 then
-    let some id := prov | throw PtrValErr.danglingOrOutOfBoundsSafePtr
-    let some live := w.findLive? id | throw PtrValErr.danglingOrOutOfBoundsSafePtr
-    if layout.sizeBytes > live.sizeBytes.toNat then throw PtrValErr.danglingOrOutOfBoundsSafePtr
   return ()
+
+/-- **`validateSafeThinRef` Static-Global, Zero-Address Provenance, & Access-Before-Alignment
+Soundness (`validateSafeThinRef_staticGlobal_nullProv_and_accessOrder`, `[adv A4]`)**:
+1. A non-null aligned `&u32` pointing to an interned `.static` global (`w₀.registerGlobal ⟨id, .static,
+   sz, al, .not⟩`, `w₀.findLive? id = none`, `sz ≥ 4`) succeeds with `.ok ()` via `getAllocInfo`
+   (A0–B4's `w.findLive?` check falsely rejected it with `.danglingOrOutOfBoundsSafePtr`).
+2. A zero-address **provenanced** ZST reference `&()` (`addr = 0, prov = some id`) fails with
+   `.error .nullSafePtr` (`ValidityMachine.scalarMayBeNull` line 204; A0–B4 falsely accepted it!).
+3. An unaligned dangling non-null `&u32` (`addr = 2, prov = none`) reports
+   `.error .danglingOrOutOfBoundsSafePtr` *before* `.unalignedSafePtr` (`ValidityVisitor.lean:205–208`
+   before `227–228`). -/
+theorem validateSafeThinRef_staticGlobal_nullProv_and_accessOrder
+    (maxSize : Nat) (w₀ : KeyedAllocWorld) (id : MiriAllocId)
+    (sz al okAddr : UInt64)
+    (hnoLive : w₀.findLive? id = none)
+    (hsz : 4 ≤ sz.toNat)
+    (hokNz : okAddr ≠ 0)
+    (hokAl : okAddr.toNat % 4 = 0) :
+    let wGlob := w₀.registerGlobal ⟨id, .static, sz, al, .not⟩
+    validateSafeThinRef maxSize wGlob .u32 okAddr (some id) = .ok () ∧
+    validateSafeThinRef maxSize wGlob (.tuple []) 0 (some id) = .error .nullSafePtr ∧
+    validateSafeThinRef maxSize wGlob .u32 2 none = .error .danglingOrOutOfBoundsSafePtr := by
+  intro wGlob
+  have hinfo : wGlob.getAllocInfo id = .ok ⟨sz, al, .liveData, .not⟩ := by
+    unfold wGlob KeyedAllocWorld.getAllocInfo KeyedAllocWorld.registerGlobal
+      KeyedAllocWorld.findLive? KeyedAllocWorld.findGlobal?
+    dsimp only
+    have hnl : w₀.live.get? id = none := hnoLive
+    rw [hnl, ExtTreeMap0.get?_insert_self]
+  have hnotGt : decide (4 > sz.toNat) = false := by
+    cases h : decide (4 > sz.toNat)
+    · rfl
+    · have hgt : 4 > sz.toNat := of_decide_eq_true h
+      omega
+  have hok0 : (okAddr == 0) = false := beq_false_of_ne hokNz
+  have hmod : (okAddr.toNat % 4 != 0) = false := by rw [hokAl]; rfl
+  have hunitLay : computeTyLayout maxSize (.tuple []) = .ok ⟨0, 1, true, true⟩ := by
+    unfold computeTyLayout computeFieldsLayout
+    dsimp only [roundUpToAlign, Nat.mod_one, Nat.sub_zero, Nat.add_zero, GT.gt, LT.lt, ite]
+    cases Nat.decLt maxSize 0 with
+    | isFalse _ => rfl
+    | isTrue hgt => exact absurd hgt (Nat.not_lt_zero maxSize)
+  have hkF : (AllocInfoKind.liveData != AllocInfoKind.liveData) = false := rfl
+  refine ⟨?_, ?_, ?_⟩
+  · unfold validateSafeThinRef computeTyLayout
+    dsimp only [Except.mapError, Bind.bind, Except.bind, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    rw [hinfo]
+    dsimp only
+    rw [hkF, hnotGt, hok0, hmod]
+    rfl
+  · unfold validateSafeThinRef
+    rw [hunitLay]
+    rfl
+  · unfold validateSafeThinRef computeTyLayout
+    rfl
 
 /-- **Agreement Theorem (`validateRawPtrFastPath_eq_layoutFirst_of_layoutOk`)**: for *every*
 `pointee` whose layout computation succeeds, `validateRawPtrFastPath` and
@@ -9215,9 +9288,12 @@ theorem validateRawPtrFull_customDynDst_layout_and_vtable_soundness
     simp [hunszAdt, hadtOk, htailAdt, htrAdt, hvOk, Except.mapError, Except.map,
       Bind.bind, Except.bind]
 
-/-- Deferred recursive `childSession` pointee errors (`ValidityVisitor.lean:302–339, 412–418, 527–556`,
-`[adv A3]`; `char` / function-pointer cases added in `[adv B4]`). -/
+/-- Deferred recursive `childSession` pointee errors (`ValidityVisitor.lean:302–346, 381–386, 412–418,
+527–556`, `[adv A3]`; `char`/`fnPtr` added in `[adv B4]`; `pointeeLayoutErr` & fail-closed
+`traversalFuelExhausted` added in `[adv A4]`). -/
 inductive TrackedDynPointeeErr where
+  | pointeeLayoutErr (err : LayoutComputeErr)
+  | traversalFuelExhausted
   | uninhabitedPointee
   | uninitPointeeByte
   | invalidBoolScalar (byte : UInt8)
@@ -9288,78 +9364,99 @@ def checkNestedSafeRefChildSession (maxSize : Nat) (innerPt : ProtoTy)
     throw (.unalignedNestedSafePtr innerLay.alignBytes addr)
   return ()
 
+/-- Element-slice fold helper for array visitation in `visitConcreteValue` (`[adv A4]`). -/
+def foldArrayVisit (f : ProtoTy → List AbstractByte → Except TrackedDynPointeeErr Unit)
+    (elem : ProtoTy) (stride : Nat) (bytes : List AbstractByte) :
+    List Nat → Except TrackedDynPointeeErr Unit
+  | [] => .ok ()
+  | i :: is => do
+    f elem ((bytes.drop (i * stride)).take stride)
+    foldArrayVisit f elem stride bytes is
+
+/-- Field-slice fold helper for aggregate visitation in `visitConcreteValue` (`[adv A4]`). -/
+def foldFieldVisit (maxSize : Nat)
+    (f : ProtoTy → List AbstractByte → Except TrackedDynPointeeErr Unit)
+    (bytes : List AbstractByte) : List (Nat × ProtoTy) → Except TrackedDynPointeeErr Unit
+  | [] => .ok ()
+  | p :: ps =>
+    match computeTyLayout maxSize p.2 with
+    | .ok fl => do
+      f p.2 ((bytes.drop p.1).take fl.sizeBytes)
+      foldFieldVisit maxSize f bytes ps
+    | .error e => .error (.pointeeLayoutErr e)
+
 /-- Fuel-bounded recursive value visitor for the concrete pointee of a tracked `&dyn Trait`
-(`ValidityVisitor.visit` + `primitive`, lines 299–339 & 344–473, under `childSession`; `[adv B4]`).
-A3's `visitTrackedConcretePointee` checked only `bool`, integer scalars and nested references and
-**accepted every other pointee of the right length** (tuples, structs, arrays, raw and function
-pointers), and checked `char` only for initialization — missing UB that upstream's recursive mode
-reports. This visitor follows upstream:
-- `!` fails (`primitive .never`); `bool` must be `0`/`1`; `char` must be an initialized Unicode scalar
-  value (`Scalar.toChar`); integers and raw pointers must be initialized (`readImmediate`);
-- function pointers must be initialized and non-null (`refTracking = none` ⇒ `scalarMayBeNull`,
-  line 334); nested references use `checkNestedSafeRefChildSession`;
-- arrays visit every element at stride `elemSize`; tuples/structs visit every field at its
-  `fieldByteOffsets` offset, in memory order, stopping at the first failure (padding is not read).
-Depth beyond the fuel bound is accepted (upstream reports resource exhaustion instead). -/
+(`ValidityVisitor.visit` + `primitive`, lines 299–473, under `childSession`; `[adv B4]`, fail-closed
+fuel, provenanced zero `fnPtr`, & ZST-array index-`0` fixes `[adv A4]`):
+- `fuel = 0` **fails closed** with `.error .traversalFuelExhausted` (`ValidityVisitor.lean:342–346`:
+  *"Fuel exhaustion is visible resource failure; it never validates an unexplored subvalue"*; B4's
+  `| 0, _, _ => .ok ()` silently accepted invalid bytes nested past depth `64`);
+- `!` fails (`primitive .never`); `bool` must be `0`/`1`; `char` must pass `isUnicodeScalarValue`;
+  integers and raw pointers must be initialized (`readImmediate`);
+- function pointers must be initialized and have nonzero address **regardless of provenance**
+  (`ValidityMachine.scalarMayBeNull`, `ValidityMachine.lean:202–206` + `ValidityVisitor.lean:334`;
+  B4's `&& allBytesWithoutProvenance s` falsely accepted zero-address provenanced `fn()` pointers!);
+- arrays with ZST elements (`el.sizeBytes = 0`, e.g. `[(); usize::MAX]`, `[!; 0]`, `[!; usize::MAX]`)
+  visit **only index `0` once when `n > 0`** in `O(1)` (`ValidityVisitor.lean:381–386`; B4's
+  `(List.range n).foldlM` blew up on `[(); usize::MAX]`), while non-ZST arrays visit every element at
+  stride `el.sizeBytes`;
+- tuples/structs visit every field at its `fieldByteOffsets` offset in memory order (`lines 442–446`). -/
 def visitConcreteValue (maxSize : Nat) : Nat → ProtoTy → List AbstractByte →
     Except TrackedDynPointeeErr Unit
-  | 0, _, _ => .ok ()
-  | fuel + 1, ty, bytes =>
-    match ty with
-    | .never => .error .uninhabitedPointee
-    | .bool =>
-      match bytes with
-      | .init b _ :: _ => if b ≤ 1 then .ok () else .error (.invalidBoolScalar b)
-      | _ => .error .uninitPointeeByte
-    | .char =>
-      let s := bytes.take 4
-      if !(Nat.beq s.length 4) || !(allBytesInitialized s) then .error .uninitPointeeByte
-      else if isUnicodeScalarValue (decodeLittleEndianU64 s) then .ok ()
-      else .error (.invalidCharScalar (decodeLittleEndianU64 s))
-    | .u8 | .u16 | .u32 | .u64 | .usize | .i32 | .i64 | .isize | .rawPtr _ _ =>
-      let need :=
-        match computeTyLayout maxSize ty with
-        | .ok l => l.sizeBytes
-        | .error _ => 0
-      let s := bytes.take need
-      if !(Nat.beq s.length need) || !(allBytesInitialized s) then .error .uninitPointeeByte
-      else .ok ()
-    | .fnPtr =>
-      let s := bytes.take 8
-      if !(Nat.beq s.length 8) || !(allBytesInitialized s) then .error .uninitPointeeByte
-      else if decodeLittleEndianU64 s == 0 && allBytesWithoutProvenance s then .error .nullFnPtr
-      else .ok ()
-    | .ref _ innerPt => checkNestedSafeRefChildSession maxSize innerPt (bytes.take 8)
-    | .array elem n =>
-      match computeTyLayout maxSize elem with
-      | .ok el =>
-        (List.range n).foldlM (fun _ i =>
-          visitConcreteValue maxSize fuel elem ((bytes.drop (i * el.sizeBytes)).take el.sizeBytes)) ()
-      | .error _ => .ok ()
-    | .tuple fields | .adt _ fields =>
-      (fieldByteOffsets maxSize 0 fields).foldlM (fun _ p =>
-        match computeTyLayout maxSize p.2 with
-        | .ok fl => visitConcreteValue maxSize fuel p.2 ((bytes.drop p.1).take fl.sizeBytes)
-        | .error _ => .ok ()) ()
-    | .str | .slice _ | .dynamic _ | .foreign _ => .ok ()
+  | 0 => fun _ _ => .error .traversalFuelExhausted
+  | fuel + 1 => fun ty bytes =>
+      match ty with
+      | .never => .error .uninhabitedPointee
+      | .bool =>
+        match bytes with
+        | .init b _ :: _ => if b ≤ 1 then .ok () else .error (.invalidBoolScalar b)
+        | _ => .error .uninitPointeeByte
+      | .char =>
+        let s := bytes.take 4
+        if !(Nat.beq s.length 4) || !(allBytesInitialized s) then .error .uninitPointeeByte
+        else if isUnicodeScalarValue (decodeLittleEndianU64 s) then .ok ()
+        else .error (.invalidCharScalar (decodeLittleEndianU64 s))
+      | .u8 | .u16 | .u32 | .u64 | .usize | .i32 | .i64 | .isize | .rawPtr _ _ =>
+        let need :=
+          match computeTyLayout maxSize ty with
+          | .ok l => l.sizeBytes
+          | .error _ => 0
+        let s := bytes.take need
+        if !(Nat.beq s.length need) || !(allBytesInitialized s) then .error .uninitPointeeByte
+        else .ok ()
+      | .fnPtr =>
+        let s := bytes.take 8
+        if !(Nat.beq s.length 8) || !(allBytesInitialized s) then .error .uninitPointeeByte
+        else if decodeLittleEndianU64 s == 0 then .error .nullFnPtr
+        else .ok ()
+      | .ref _ innerPt => checkNestedSafeRefChildSession maxSize innerPt (bytes.take 8)
+      | .array elem n =>
+        match computeTyLayout maxSize elem with
+        | .ok el =>
+          if Nat.beq el.sizeBytes 0 then
+            if Nat.beq n 0 then .ok ()
+            else visitConcreteValue maxSize fuel elem (bytes.take 0)
+          else
+            foldArrayVisit (visitConcreteValue maxSize fuel) elem el.sizeBytes bytes (List.range n)
+        | .error e => .error (.pointeeLayoutErr e)
+      | .tuple fields | .adt _ fields =>
+        foldFieldVisit maxSize (visitConcreteValue maxSize fuel) bytes (fieldByteOffsets maxSize 0 fields)
+      | .str | .slice _ | .dynamic _ | .foreign _ => .ok ()
 
 /-- Deferred recursive reference-tracker visitor on the unpacked concrete pointee of `&dyn Trait`
-(`ValidityVisitor.lean:302–339, 412–418, 552`, `[adv A3]`, full value visitor `[adv B4]`):
-`validatePlace … (recursive := true)` pops each tracked `(mplace, dyn Trait)` under
-`childSession := { flags := { reset := false, mayDangle := true }, refTracking := none }`, unpacks
-`dyn Trait` to `desc.concreteTy`, and visits the pointee bytes: uninhabited concrete types fail first,
-then `visitConcreteValue` checks the contents (an aligned non-null **dangling** integer `&u32` inside
-`&(&u32 as dyn Send)` succeeds even under `-Zmiri-recursive-validation`, whereas `&!` inside fails
-`opsemInhabited`, line 226). -/
+(`ValidityVisitor.lean:302–473, 552`, `[adv A3]`, value visitor `[adv B4]`, field-before-inhabited
+precedence fix `[adv A4]`):
+Upstream `ValidityVisitor.visit` visits aggregate fields in memory order **first** (`lines 442–446`)
+and asserts `opsemInhabited` only **after** field visitation (`line 471`). B4 checked `!lay.isInhabited`
+*before* `visitConcreteValue`, falsely reporting `.uninhabitedPointee` on `(bool, !)` holding `[0x02]`
+and `(u32, !)` holding `[.uninit, ...]` where upstream fails on field `0` first! -/
 def visitTrackedConcretePointee (maxSize : Nat) (concreteTy : ProtoTy)
     (pointeeSlice : List AbstractByte) : Except TrackedDynPointeeErr Unit := do
-  let lay ←
-    match computeTyLayout maxSize concreteTy with
-    | .ok l => .ok l
-    | .error _ => .error .uninhabitedPointee
+  let lay ← (computeTyLayout maxSize concreteTy).mapError TrackedDynPointeeErr.pointeeLayoutErr
+  visitConcreteValue maxSize 64 concreteTy pointeeSlice
   if !lay.isInhabited then
     throw .uninhabitedPointee
-  visitConcreteValue maxSize 64 concreteTy pointeeSlice
+  return ()
 
 /-- Memory-content-aware wide `dyn` safe-pointer validator (`[adv A3]`, attribution fix `[adv B4]`):
 runs the *root* `checkSafe` (`validateWideDynSafePtr … (recursive := false)`) first and, under
@@ -9626,5 +9723,318 @@ theorem wideDyn_recursive_aggregate_char_fnPtr_contents
   · unfold validateWideDynSafePtrWithBytes; dsimp only [wChar]; rw [hrootC, hfind]; rfl
   · unfold validateWideDynSafePtrWithBytes; dsimp only [wZero]; rw [hrootF, hfind]; rfl
   · unfold validateWideDynSafePtrWithBytes; dsimp only [wZero]; rw [hrootN, hfind]; rfl
+
+/-- Depth-`k` nested 1-element array `[...[ty; 1]...; 1]` (`[adv A4]`). -/
+def nestSingleElemArray : Nat → ProtoTy → ProtoTy
+  | 0, ty => ty
+  | k + 1, ty => .array (nestSingleElemArray k ty) 1
+
+private theorem computeTyLayout_nestSingleElemArray_bool :
+    ∀ k : Nat, computeTyLayout maxRepresentableSize64 (nestSingleElemArray k .bool) =
+      .ok ⟨1, 1, true, true⟩
+  | 0 => rfl
+  | k + 1 => by
+    unfold nestSingleElemArray computeTyLayout
+    rw [computeTyLayout_nestSingleElemArray_bool k]
+    rfl
+
+private theorem visitConcreteValue_nestSingleElemArray_bool_exhausts :
+    ∀ (k : Nat) (bytes : List AbstractByte),
+      visitConcreteValue maxRepresentableSize64 k (nestSingleElemArray k .bool) bytes =
+        .error .traversalFuelExhausted
+  | 0, _ => rfl
+  | k + 1, bytes => by
+    unfold nestSingleElemArray visitConcreteValue
+    dsimp only
+    rw [computeTyLayout_nestSingleElemArray_bool k]
+    dsimp only [Nat.beq, Bool.false_eq_true, ↓reduceIte, List.range, List.range.loop,
+      foldArrayVisit, Bind.bind, Except.bind]
+    rw [visitConcreteValue_nestSingleElemArray_bool_exhausts k ((bytes.drop (0 * 1)).take 1)]
+    rfl
+
+private theorem visitTrackedConcretePointee_zst_unit_array (zstCount : Nat) (hzstPos : zstCount ≠ 0) :
+    visitTrackedConcretePointee maxRepresentableSize64 (.array (.tuple []) zstCount) [] = .ok () := by
+  cases zstCount with
+  | zero => exact absurd rfl hzstPos
+  | succ m =>
+    have hmul : 0 * (m + 1) = 0 := Nat.zero_mul (m + 1)
+    have hgt0 : ¬ (0 > maxRepresentableSize64) := by unfold maxRepresentableSize64; omega
+    have hunit : computeTyLayout maxRepresentableSize64 (.tuple []) = .ok ⟨0, 1, true, true⟩ := rfl
+    have hlay : computeTyLayout maxRepresentableSize64 (.array (.tuple []) (m + 1)) =
+        .ok ⟨0, 1, true, true⟩ := by
+      unfold computeTyLayout
+      rw [hunit]
+      dsimp only [Bind.bind, Except.bind]
+      simp only [hmul, hgt0, Bool.or_true, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+        Pure.pure, Except.pure]
+    unfold visitTrackedConcretePointee
+    rw [hlay]
+    rfl
+
+private theorem visitTrackedConcretePointee_zst_never_array (zstCount : Nat) (hzstPos : zstCount ≠ 0) :
+    visitTrackedConcretePointee maxRepresentableSize64 (.array .never zstCount) [] =
+      .error .uninhabitedPointee := by
+  cases zstCount with
+  | zero => exact absurd rfl hzstPos
+  | succ m =>
+    have hmul : 0 * (m + 1) = 0 := Nat.zero_mul (m + 1)
+    have hb0 : (m + 1 == 0) = false := rfl
+    have hgt0 : ¬ (0 > maxRepresentableSize64) := by unfold maxRepresentableSize64; omega
+    have hnev : computeTyLayout maxRepresentableSize64 .never = .ok ⟨0, 1, true, false⟩ := rfl
+    have hlay : computeTyLayout maxRepresentableSize64 (.array .never (m + 1)) =
+        .ok ⟨0, 1, true, false⟩ := by
+      unfold computeTyLayout
+      rw [hnev]
+      dsimp only [Bind.bind, Except.bind]
+      simp only [hmul, hgt0, hb0, Bool.or_false, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+        Pure.pure, Except.pure]
+    unfold visitTrackedConcretePointee
+    rw [hlay]
+    rfl
+
+private theorem validateWideDynSafePtr_root_live8_ok
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
+    (expectedSpec : DynExistentialSpec) (vt : ScalarPtrHalf) (desc : VTableDescriptor)
+    (dataId : MiriAllocId) (addr : UInt64) (bs : List AbstractByte)
+    (ct : ProtoTy) (sz al : UInt64)
+    (hv : validateVTableHalf w reg vt expectedSpec = .ok desc)
+    (hct : desc.concreteTy = ct) (hsz : desc.sizeBytes = sz) (hal : desc.alignBytes = al)
+    (hszPos : sz > 0) (hszFit : decide (sz.toNat > (8 : UInt64).toNat) = false)
+    (haddr0 : (addr == 0) = false) (halOk : (decide (al > 0) && (addr % al != 0)) = false) :
+    validateWideDynSafePtr (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩) reg maxSize
+      expectedSpec false (.provenanced addr dataId 0) vt false = .ok (ct, sz, al) := by
+  have hv' : validateVTableHalf (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩) reg vt expectedSpec =
+      .ok desc :=
+    (validateVTableHalf_insertLive_eq w dataId ⟨.heap, 8, 8, .mut, bs⟩ reg vt expectedSpec).trans hv
+  have hinfo : (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩).getAllocInfo dataId =
+      .ok ⟨8, 8, .liveData, .mut⟩ := by
+    unfold KeyedAllocWorld.getAllocInfo KeyedAllocWorld.findLive? KeyedAllocWorld.insertLive
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
+  unfold validateWideDynSafePtr
+  rw [hv']
+  dsimp only [Bind.bind, Except.bind, Bool.not_false, ↓reduceIte]
+  rw [hsz, hal, hct, hinfo]
+  have hzeroAdd : (0 : UInt64).toNat + sz.toNat = sz.toNat := Nat.zero_add sz.toNat
+  have hkF : (AllocInfoKind.liveData != AllocInfoKind.liveData) = false := rfl
+  simp only [hszPos, hzeroAdd, hkF, hszFit, haddr0, halOk, Bool.false_or, Bool.not_false,
+    Bool.false_and, Bool.false_eq_true, ↓reduceIte, Pure.pure, Except.pure]
+
+private theorem validateWideDynSafePtrWithBytes_live_rec
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
+    (expectedSpec : DynExistentialSpec) (addr : UInt64) (dataId : MiriAllocId)
+    (vt : ScalarPtrHalf) (liveEntry : LocalAllocEntry)
+    (ct : ProtoTy) (sz al : UInt64)
+    (hroot : validateWideDynSafePtr w reg maxSize expectedSpec false
+      (.provenanced addr dataId 0) vt false = .ok (ct, sz, al))
+    (hfind : w.findLive? dataId = some liveEntry) :
+    validateWideDynSafePtrWithBytes w reg maxSize expectedSpec false
+      (.provenanced addr dataId 0) vt true =
+      (do
+        (visitTrackedConcretePointee maxSize ct (liveEntry.bytes.take sz.toNat)).mapError
+          WideDynFullErr.pointeeErr
+        return (ct, sz, al)) := by
+  unfold validateWideDynSafePtrWithBytes
+  rw [hroot]
+  dsimp only [Except.mapError, Bind.bind, Except.bind]
+  rw [hfind]
+  rfl
+
+private theorem validateWideDynSafePtrWithBytes_dangling_rec
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
+    (expectedSpec : DynExistentialSpec) (addr : UInt64)
+    (vt : ScalarPtrHalf) (ct : ProtoTy) (sz al : UInt64)
+    (hroot : validateWideDynSafePtr w reg maxSize expectedSpec false
+      (.danglingInt addr) vt false = .ok (ct, sz, al)) :
+    validateWideDynSafePtrWithBytes w reg maxSize expectedSpec false
+      (.danglingInt addr) vt true =
+      (do
+        (visitTrackedConcretePointee maxSize ct []).mapError WideDynFullErr.pointeeErr
+        return (ct, sz, al)) := by
+  unfold validateWideDynSafePtrWithBytes
+  rw [hroot]
+  rfl
+
+private theorem visitTrackedConcretePointee_bool_never_bad :
+    visitTrackedConcretePointee maxRepresentableSize64 (.tuple [.bool, .never]) [.init 2 none] =
+      .error (.invalidBoolScalar 2) := rfl
+
+private theorem visitTrackedConcretePointee_u32_never_uninit :
+    visitTrackedConcretePointee maxRepresentableSize64 (.tuple [.u32, .never])
+      [.uninit, .uninit, .uninit, .uninit] = .error .uninitPointeeByte := rfl
+
+private theorem decodeLittleEndianU64_replicate_zero (prov : Option (Nat × Nat)) :
+    ∀ n : Nat, decodeLittleEndianU64 (List.replicate n (AbstractByte.init 0 prov)) = 0
+  | 0 => rfl
+  | n + 1 => by
+    unfold List.replicate decodeLittleEndianU64
+    rw [decodeLittleEndianU64_replicate_zero prov n]
+    rfl
+
+private theorem visitTrackedConcretePointee_nullProv_fnPtr (p : Nat × Nat) :
+    visitTrackedConcretePointee maxRepresentableSize64 .fnPtr
+      (List.replicate 8 (AbstractByte.init 0 (some p))) = .error .nullFnPtr := by
+  have htake : (List.replicate 8 (AbstractByte.init 0 (some p))).take 8 =
+      List.replicate 8 (AbstractByte.init 0 (some p)) := rfl
+  have hlen : Nat.beq (List.replicate 8 (AbstractByte.init 0 (some p))).length 8 = true := rfl
+  have hinit : allBytesInitialized (List.replicate 8 (AbstractByte.init 0 (some p))) = true := rfl
+  unfold visitTrackedConcretePointee
+  dsimp only [computeTyLayout, Except.mapError, Bind.bind, Except.bind]
+  rw [visitConcreteValue.eq_def]
+  dsimp only
+  rw [htake, hlen, hinit, decodeLittleEndianU64_replicate_zero (some p) 8]
+  rfl
+
+private theorem visitTrackedConcretePointee_never_arr0 :
+    visitTrackedConcretePointee maxRepresentableSize64 (.array .never 0) [] = .ok () := rfl
+
+private theorem visitTrackedConcretePointee_deep64_bool_exhausts (bs : List AbstractByte) :
+    visitTrackedConcretePointee maxRepresentableSize64 (nestSingleElemArray 64 .bool) bs =
+      .error .traversalFuelExhausted := by
+  unfold visitTrackedConcretePointee
+  rw [computeTyLayout_nestSingleElemArray_bool 64]
+  dsimp only [Except.mapError, Bind.bind, Except.bind]
+  rw [visitConcreteValue_nestSingleElemArray_bool_exhausts 64 bs]
+
+private theorem validateWideDynSafePtr_root_danglingZst_ok
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
+    (expectedSpec : DynExistentialSpec) (vt : ScalarPtrHalf) (desc : VTableDescriptor)
+    (addr : UInt64) (ct : ProtoTy)
+    (hv : validateVTableHalf w reg vt expectedSpec = .ok desc)
+    (hct : desc.concreteTy = ct) (hsz : desc.sizeBytes = 0) (hal : desc.alignBytes = 1)
+    (haddr0 : (addr == 0) = false) :
+    validateWideDynSafePtr w reg maxSize expectedSpec false (.danglingInt addr) vt false =
+      .ok (ct, 0, 1) := by
+  have hmod1 : (addr % 1 != 0) = false := by
+    have h1 : addr % 1 = 0 := UInt64.mod_one
+    rw [h1]; rfl
+  unfold validateWideDynSafePtr
+  rw [hv]
+  dsimp only [Bind.bind, Except.bind]
+  rw [hsz, hal, hct, haddr0, hmod1]
+  rfl
+
+/-- **Field-Before-Uninhabited Precedence, Zero-Address Provenanced `fn()`, `O(1)` ZST-Array
+Visitation, & Fail-Closed Fuel Exhaustion (`wideDyn_recursive_fieldOrder_nullProvFn_zstArray_and_fuel`,
+`[adv A4]`)**: catching & fixing four upstream divergences in `[adv B4]`'s recursive visitor
+(`ValidityVisitor.lean:302, 334, 342–346, 381–386, 442–471` + `ValidityMachine.lean:202–206`):
+1. **In-memory field order precedes uninhabited sibling (`(bool, !)` & `(u32, !)`)**:
+   - `(bool, !)` holding `[0x02]` fails on field `0` (`bool`) with `.pointeeErr (.invalidBoolScalar 2)`,
+   - `(u32, !)` holding `.uninit` bytes fails on field `0` (`u32`) with `.pointeeErr .uninitPointeeByte`
+     (B4's upfront `if !lay.isInhabited` pre-check short-circuited and falsely reported
+     `.uninhabitedPointee` in both cases!).
+2. **Zero-address provenanced `fn()` pointer**: `List.replicate 8 (.init 0 (some (fnProvId.toTrustedAllocId, 0)))`
+   fails with `.pointeeErr .nullFnPtr` (`ValidityMachine.scalarMayBeNull` checks `addr == 0` regardless
+   of provenance; B4's `&& allBytesWithoutProvenance` falsely accepted it as `.ok`!).
+3. **`O(1)` ZST-array index-`0` fast path (`ValidityVisitor.lean:381–386`)**: for any nonzero
+   `zstCount ≠ 0` (such as `usizeMax64 = usize::MAX`), at aligned non-null `.danglingInt addr`,
+   `[(); zstCount]` and `[!; 0]` succeed in `O(1)`, while `[!; zstCount]` visits index `0` once in
+   `O(1)` and fails with `.pointeeErr .uninhabitedPointee` (B4's `List.range zstCount` blew up on
+   `[(); usize::MAX]`).
+4. **Fail-closed fuel exhaustion (`ValidityVisitor.lean:342–346`)**: `nestSingleElemArray 64 .bool`
+   holding `[0x02]` exhausts the 64-level traversal fuel and fails closed with
+   `.pointeeErr .traversalFuelExhausted` (B4's `| 0, _, _ => .ok ()` silently accepted `[0x02]`!). -/
+theorem wideDyn_recursive_fieldOrder_nullProvFn_zstArray_and_fuel
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (expectedSpec : DynExistentialSpec)
+    (vtBoolNever vtU32Never vtFn vtZstArrOk vtNeverArr0 vtNeverArrMax vtDeepBool : ScalarPtrHalf)
+    (descBoolNever descU32Never descFn descZstArrOk descNeverArr0 descNeverArrMax descDeepBool :
+      VTableDescriptor)
+    (dataId fnProvId : MiriAllocId) (zstCount : Nat) (addr : UInt64)
+    (hzstPos : zstCount ≠ 0)
+    (hvBN : validateVTableHalf w reg vtBoolNever expectedSpec = .ok descBoolNever)
+    (hctBN : descBoolNever.concreteTy = .tuple [.bool, .never])
+    (hszBN : descBoolNever.sizeBytes = 1) (halBN : descBoolNever.alignBytes = 1)
+    (hvUN : validateVTableHalf w reg vtU32Never expectedSpec = .ok descU32Never)
+    (hctUN : descU32Never.concreteTy = .tuple [.u32, .never])
+    (hszUN : descU32Never.sizeBytes = 4) (halUN : descU32Never.alignBytes = 4)
+    (hvFn : validateVTableHalf w reg vtFn expectedSpec = .ok descFn)
+    (hctFn : descFn.concreteTy = .fnPtr)
+    (hszFn : descFn.sizeBytes = 8) (halFn : descFn.alignBytes = 8)
+    (hvZA : validateVTableHalf w reg vtZstArrOk expectedSpec = .ok descZstArrOk)
+    (hctZA : descZstArrOk.concreteTy = .array (.tuple []) zstCount)
+    (hszZA : descZstArrOk.sizeBytes = 0) (halZA : descZstArrOk.alignBytes = 1)
+    (hvNA0 : validateVTableHalf w reg vtNeverArr0 expectedSpec = .ok descNeverArr0)
+    (hctNA0 : descNeverArr0.concreteTy = .array .never 0)
+    (hszNA0 : descNeverArr0.sizeBytes = 0) (halNA0 : descNeverArr0.alignBytes = 1)
+    (hvNAM : validateVTableHalf w reg vtNeverArrMax expectedSpec = .ok descNeverArrMax)
+    (hctNAM : descNeverArrMax.concreteTy = .array .never zstCount)
+    (hszNAM : descNeverArrMax.sizeBytes = 0) (halNAM : descNeverArrMax.alignBytes = 1)
+    (hvDB : validateVTableHalf w reg vtDeepBool expectedSpec = .ok descDeepBool)
+    (hctDB : descDeepBool.concreteTy = nestSingleElemArray 64 .bool)
+    (hszDB : descDeepBool.sizeBytes = 1) (halDB : descDeepBool.alignBytes = 1)
+    (hnz : addr ≠ 0) (halign4 : addr % 4 = 0) (halign8 : addr % 8 = 0) :
+    let wBadBool := w.insertLive dataId ⟨.heap, 8, 8, .mut, [.init 2 none]⟩
+    let wUninit := w.insertLive dataId ⟨.heap, 8, 8, .mut, List.replicate 8 .uninit⟩
+    let wNullProvFn := w.insertLive dataId ⟨.heap, 8, 8, .mut,
+      List.replicate 8 (.init 0 (some (fnProvId.toTrustedAllocId, 0)))⟩
+    validateWideDynSafePtrWithBytes wBadBool reg maxRepresentableSize64 expectedSpec false
+      (.provenanced addr dataId 0) vtBoolNever true = .error (.pointeeErr (.invalidBoolScalar 2)) ∧
+    validateWideDynSafePtrWithBytes wUninit reg maxRepresentableSize64 expectedSpec false
+      (.provenanced addr dataId 0) vtU32Never true = .error (.pointeeErr .uninitPointeeByte) ∧
+    validateWideDynSafePtrWithBytes wNullProvFn reg maxRepresentableSize64 expectedSpec false
+      (.provenanced addr dataId 0) vtFn true = .error (.pointeeErr .nullFnPtr) ∧
+    validateWideDynSafePtrWithBytes w reg maxRepresentableSize64 expectedSpec false
+      (.danglingInt addr) vtZstArrOk true = .ok (.array (.tuple []) zstCount, 0, 1) ∧
+    validateWideDynSafePtrWithBytes w reg maxRepresentableSize64 expectedSpec false
+      (.danglingInt addr) vtNeverArr0 true = .ok (.array .never 0, 0, 1) ∧
+    validateWideDynSafePtrWithBytes w reg maxRepresentableSize64 expectedSpec false
+      (.danglingInt addr) vtNeverArrMax true = .error (.pointeeErr .uninhabitedPointee) ∧
+    validateWideDynSafePtrWithBytes wBadBool reg maxRepresentableSize64 expectedSpec false
+      (.provenanced addr dataId 0) vtDeepBool true = .error (.pointeeErr .traversalFuelExhausted) := by
+  intro wBadBool wUninit wNullProvFn
+  have haddr0 : (addr == 0) = false := beq_false_of_ne hnz
+  have hal1 : (decide ((1 : UInt64) > 0) && (addr % 1 != 0)) = false := by
+    have h1 : addr % 1 = 0 := UInt64.mod_one
+    rw [h1]; rfl
+  have hal4 : (decide ((4 : UInt64) > 0) && (addr % 4 != 0)) = false := by rw [halign4]; rfl
+  have hal8 : (decide ((8 : UInt64) > 0) && (addr % 8 != 0)) = false := by rw [halign8]; rfl
+  have hfind : ∀ bs, (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩).findLive? dataId =
+      some ⟨.heap, 8, 8, .mut, bs⟩ := by
+    intro bs
+    unfold KeyedAllocWorld.findLive? KeyedAllocWorld.insertLive
+    exact ExtTreeMap0.get?_insert_self _ _ _
+  have hrootBN := validateWideDynSafePtr_root_live8_ok w reg maxRepresentableSize64 expectedSpec
+    vtBoolNever descBoolNever dataId addr [.init 2 none] (.tuple [.bool, .never]) 1 1
+    hvBN hctBN hszBN halBN (by decide) rfl haddr0 hal1
+  have hrootUN := validateWideDynSafePtr_root_live8_ok w reg maxRepresentableSize64 expectedSpec
+    vtU32Never descU32Never dataId addr (List.replicate 8 .uninit) (.tuple [.u32, .never]) 4 4
+    hvUN hctUN hszUN halUN (by decide) rfl haddr0 hal4
+  have hrootFn := validateWideDynSafePtr_root_live8_ok w reg maxRepresentableSize64 expectedSpec
+    vtFn descFn dataId addr (List.replicate 8 (.init 0 (some (fnProvId.toTrustedAllocId, 0))))
+    .fnPtr 8 8 hvFn hctFn hszFn halFn (by decide) rfl haddr0 hal8
+  have hrootZA := validateWideDynSafePtr_root_danglingZst_ok w reg maxRepresentableSize64
+    expectedSpec vtZstArrOk descZstArrOk addr (.array (.tuple []) zstCount)
+    hvZA hctZA hszZA halZA haddr0
+  have hrootNA0 := validateWideDynSafePtr_root_danglingZst_ok w reg maxRepresentableSize64
+    expectedSpec vtNeverArr0 descNeverArr0 addr (.array .never 0)
+    hvNA0 hctNA0 hszNA0 halNA0 haddr0
+  have hrootNAM := validateWideDynSafePtr_root_danglingZst_ok w reg maxRepresentableSize64
+    expectedSpec vtNeverArrMax descNeverArrMax addr (.array .never zstCount)
+    hvNAM hctNAM hszNAM halNAM haddr0
+  have hrootDB := validateWideDynSafePtr_root_live8_ok w reg maxRepresentableSize64 expectedSpec
+    vtDeepBool descDeepBool dataId addr [.init 2 none] (nestSingleElemArray 64 .bool) 1 1
+    hvDB hctDB hszDB halDB (by decide) rfl haddr0 hal1
+  have ht1 : (1 : UInt64).toNat = 1 := rfl
+  have ht4 : (4 : UInt64).toNat = 4 := rfl
+  have ht8 : (8 : UInt64).toNat = 8 := rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · rw [validateWideDynSafePtrWithBytes_live_rec _ _ _ _ _ _ _ _ _ _ _ hrootBN (hfind _), ht1]
+    dsimp only [List.take]
+    rw [visitTrackedConcretePointee_bool_never_bad]; rfl
+  · rw [validateWideDynSafePtrWithBytes_live_rec _ _ _ _ _ _ _ _ _ _ _ hrootUN (hfind _), ht4]
+    dsimp only [List.replicate, List.take]
+    rw [visitTrackedConcretePointee_u32_never_uninit]; rfl
+  · rw [validateWideDynSafePtrWithBytes_live_rec _ _ _ _ _ _ _ _ _ _ _ hrootFn (hfind _), ht8]
+    have htake8 : (List.replicate 8 (AbstractByte.init 0 (some (fnProvId.toTrustedAllocId, 0)))).take 8 =
+        List.replicate 8 (AbstractByte.init 0 (some (fnProvId.toTrustedAllocId, 0))) := rfl
+    rw [htake8, visitTrackedConcretePointee_nullProv_fnPtr]; rfl
+  · rw [validateWideDynSafePtrWithBytes_dangling_rec _ _ _ _ _ _ _ _ _ hrootZA,
+        visitTrackedConcretePointee_zst_unit_array zstCount hzstPos]; rfl
+  · rw [validateWideDynSafePtrWithBytes_dangling_rec _ _ _ _ _ _ _ _ _ hrootNA0,
+        visitTrackedConcretePointee_never_arr0]; rfl
+  · rw [validateWideDynSafePtrWithBytes_dangling_rec _ _ _ _ _ _ _ _ _ hrootNAM,
+        visitTrackedConcretePointee_zst_never_array zstCount hzstPos]; rfl
+  · rw [validateWideDynSafePtrWithBytes_live_rec _ _ _ _ _ _ _ _ _ _ _ hrootDB (hfind _),
+        visitTrackedConcretePointee_deep64_bool_exhausts]; rfl
 
 end Anneal.ExtTreeMapAllocAndNoWritableProto
