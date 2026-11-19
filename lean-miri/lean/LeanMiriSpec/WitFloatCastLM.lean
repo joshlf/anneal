@@ -28,9 +28,9 @@ bit-for-bit after every step. No shadow evaluator is defined.
 
 * **Part 0 (machinery)**: `wfc_stateRel_entry` (the program-entry states `initMachineState body []`
   and `wfcMiriEntry body` of **any** argument-free body are `StateRelLM3_1`-related: `_0` live,
-  every other local dead), `wfc_stateRel_init` (post-`StorageLive`-prologue states, used for
-  hand-built intermediate states), the lockstep-run closure `WfcRun`, the lockstep predicates
-  `WfcLockstep` / `WfcReturns` /
+  every other local dead), `wfc_stateRel_init` (all-live `.uninit` start states: the program
+  entry of single-local bodies, a hand-built start state otherwise), the lockstep-run closure
+  `WfcRun`, the lockstep predicates `WfcLockstep` / `WfcReturns` /
   `WfcUB` (carrying explicit `StepRelLM3_1` over arbitrary `allocMap`) and read-backs
   `MiriHoldsScalar` / `MiriHoldsUninit` / `MiriHoldsIndirectScalar` / `MiriHoldsIndirectUninit` /
   `MiriPromotedFreed` (`wfc_miri_scalar_at`, `wfc_miri_uninit_at`, `wfc_miri_indirect_scalar`,
