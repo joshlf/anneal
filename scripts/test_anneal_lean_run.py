@@ -1329,7 +1329,7 @@ class TestCliSubprocess(unittest.TestCase):
                 "--probe", "--json",
             )
         )
-        self.assertEqual(flag_data["concurrency"], 1)
+        self._assert_concurrency(flag_data, 1)
         self.assertEqual(
             flag_data["memory_max_mb"],
             min(2500, flag_data["w_slice_max_mb"])
@@ -1428,18 +1428,43 @@ class TestCliSubprocess(unittest.TestCase):
                         self.assertIs(from_file["is_cg_capped"], capped)
                         self._assert_concurrency(from_file, conc_for_3)
 
+                    # Host concurrency file acts as the floor for env concurrency, while
+                    # explicit `--concurrency` during `--probe` overrides `w_eff` yet leaves
+                    # `build_slots` pinned to the host file value.
+                    file_plus_env = probe(
+                        env_extra={
+                            "XDG_CONFIG_HOME": str(xdg_three),
+                            "ANNEAL_WORKTREE_CONCURRENCY": "2",
+                        }
+                    )
+                    self._assert_concurrency(file_plus_env, conc_for_3)
+                    file_plus_cli = probe(
+                        "--concurrency",
+                        "1",
+                        env_extra={"XDG_CONFIG_HOME": str(xdg_three)},
+                    )
+                    self.assertEqual(file_plus_cli["concurrency"], 1)
+                    self.assertEqual(file_plus_cli["w_eff"], 1)
+                    self.assertEqual(file_plus_cli["build_slots"], conc_for_3)
+
                     over_cap_mb = w_slice_max_mb + 1024
-                    clamped = probe("--memory-max-mb", str(over_cap_mb))
-                    self.assertEqual(
-                        clamped["memory_max_mb"],
-                        w_slice_max_mb if capped else over_cap_mb,
-                    )
-                    lifted = probe(
-                        "--unsafe-ignore-cgroup", "--memory-max-mb", str(over_cap_mb)
-                    )
-                    self.assertEqual(lifted["memory_max_mb"], over_cap_mb)
-                    self.assertIs(lifted["is_cg_capped"], capped)
-                    self._assert_concurrency(lifted, 1)
+                    for clamp_args, clamp_env in (
+                        (("--memory-max-mb", str(over_cap_mb)), None),
+                        ((), {"ANNEAL_LEAN_MEMORY_MAX_MB": str(over_cap_mb)}),
+                    ):
+                        clamped = probe(*clamp_args, env_extra=clamp_env)
+                        expected_clamped = w_slice_max_mb if capped else over_cap_mb
+                        self.assertEqual(clamped["memory_max_mb"], expected_clamped)
+                        self.assertEqual(
+                            clamped["lean_m_mb"], (75 * expected_clamped) // 100
+                        )
+                        lifted = probe(
+                            "--unsafe-ignore-cgroup", *clamp_args, env_extra=clamp_env
+                        )
+                        self.assertEqual(lifted["memory_max_mb"], over_cap_mb)
+                        self.assertEqual(lifted["lean_m_mb"], (75 * over_cap_mb) // 100)
+                        self.assertIs(lifted["is_cg_capped"], capped)
+                        self._assert_concurrency(lifted, 1)
 
     def test_scrubbed_prefixes_cover_every_anneal_variable_of_the_script(self) -> None:
         """An `ANNEAL_*` variable added to `scripts/anneal-lean-run` must be scrubbed too."""
@@ -1502,6 +1527,21 @@ class TestCliSubprocess(unittest.TestCase):
             self.assertIs(clean["is_cg_capped"], False)
             self._assert_concurrency(clean, 1)
             self.assertEqual(clean["timeout_sec"], 900)
+            clean_file = self._probe_json(
+                self._synthetic_cli(
+                    root, "cg_uncapped", "--mode", "file", "--probe", "--json"
+                )
+            )
+            self.assertGreater(clean_file["lean_m_mb"], 99)
+            live_clean = self._probe_json(self._cli("--probe", "--json"))
+            child_env_cmd = [
+                sys.executable,
+                "-c",
+                "import json, os; print(json.dumps({"
+                "k: os.environ.get(k) for k in ("
+                "'ANNEAL_LEAN_RUN_LEAN_M_MB', 'ANNEAL_LSP_NO_EVICT', 'ANNEAL_OOM_OFFLOAD_CMD'"
+                ")}))",
+            ]
 
             with mock.patch.dict(os.environ, poison):
                 fresh_xdg = root / "fresh_xdg"
@@ -1524,6 +1564,15 @@ class TestCliSubprocess(unittest.TestCase):
                 self.assertNotIn("ANNEAL_LEAN_TIMEOUT_SEC", explicit)
 
                 isolated = synthetic()
+                isolated_exec = self._synthetic_cli(
+                    root,
+                    "cg_uncapped",
+                    "--mode",
+                    "file",
+                    "--no-slot-lock",
+                    "--",
+                    *child_env_cmd,
+                )
                 live = self._probe_json(self._cli("--probe", "--json"))
                 direct = (
                     self._probe_json(
@@ -1537,10 +1586,21 @@ class TestCliSubprocess(unittest.TestCase):
 
             # The synthetic host is deterministic: a poisoned parent changes nothing.
             self.assertEqual(isolated, clean)
+            self.assertEqual(isolated_exec.returncode, 0, isolated_exec.stderr)
+            self.assertEqual(
+                json.loads(isolated_exec.stdout),
+                {
+                    "ANNEAL_LEAN_RUN_LEAN_M_MB": str(clean_file["lean_m_mb"]),
+                    "ANNEAL_LSP_NO_EVICT": None,
+                    "ANNEAL_OOM_OFFLOAD_CMD": None,
+                },
+            )
             for live_data in (live, direct):
                 if live_data is not None:
                     self._assert_concurrency(live_data, 1)
                     self.assertEqual(live_data["timeout_sec"], 900)
+                    if live_clean["memory_max_mb"] != 1234:
+                        self.assertNotEqual(live_data["memory_max_mb"], 1234)
 
             # Positive controls: each poison is honored once passed explicitly, so the
             # equality above is not vacuous.
@@ -1556,6 +1616,30 @@ class TestCliSubprocess(unittest.TestCase):
                 env_extra={"HOME": str(poisoned_home), "XDG_CONFIG_HOME": ""}
             )
             self._assert_concurrency(leaked_home, 5)
+            leaked_passthrough = self._synthetic_cli(
+                root,
+                "cg_uncapped",
+                "--mode",
+                "file",
+                "--no-slot-lock",
+                "--",
+                *child_env_cmd,
+                env_extra={
+                    "ANNEAL_LEAN_RUN_IN_SCOPE": "1",
+                    "ANNEAL_LEAN_RUN_LEAN_M_MB": "99",
+                    "ANNEAL_LSP_NO_EVICT": "1",
+                    "ANNEAL_OOM_OFFLOAD_CMD": "false",
+                },
+            )
+            self.assertEqual(leaked_passthrough.returncode, 0, leaked_passthrough.stderr)
+            self.assertEqual(
+                json.loads(leaked_passthrough.stdout),
+                {
+                    "ANNEAL_LEAN_RUN_LEAN_M_MB": "99",
+                    "ANNEAL_LSP_NO_EVICT": "1",
+                    "ANNEAL_OOM_OFFLOAD_CMD": "false",
+                },
+            )
 
 
 class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):

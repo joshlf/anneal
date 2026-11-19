@@ -2245,8 +2245,9 @@ run_cmd do
     let some startRange ← findDeclarationRanges? startAnchor | throwError "no range for {startAnchor}"
     let some endRange ← findDeclarationRanges? endAnchor | throwError "no range for {endAnchor}"
     let startLine := startRange.range.pos.line
+    let startEndLine := startRange.range.endPos.line
     let endLine := endRange.range.endPos.line
-    if endRange.range.pos.line < startLine || endLine < endRange.range.pos.line then
+    if startEndLine < startLine || endRange.range.pos.line < startLine || endLine < endRange.range.pos.line then
       throwError "{modName}: invalid anchor range [{startLine}, {endLine}] for {startAnchor} .. {endAnchor}"
     -- `(prevAnchor, last line of its declaration range)` for intervals with a seam neighbor.
     let mut prev? : Option (Name × Nat) := none
@@ -2254,7 +2255,10 @@ run_cmd do
       unless env.getModuleIdxFor? prevAnchor == some modIdx do
         throwError "previous anchor {prevAnchor} does not belong to module {modName}"
       let some prevRange ← findDeclarationRanges? prevAnchor | throwError "no range for {prevAnchor}"
+      let prevLine := prevRange.range.pos.line
       let prevEndLine := prevRange.range.endPos.line
+      if prevEndLine < prevLine then
+        throwError "{modName}: previous anchor {prevAnchor} has inverted declaration range ({prevLine}-{prevEndLine})"
       unless prevEndLine < startLine do
         throwError "{modName}: previous anchor {prevAnchor} (last line {prevEndLine}) does not end \
           before start anchor {startAnchor} (line {startLine})"
@@ -2266,6 +2270,8 @@ run_cmd do
         if let some r ← findDeclarationRanges? n then
           let declLine := r.range.pos.line
           let declEndLine := r.range.endPos.line
+          if declEndLine < declLine then
+            throwError "{modName}: {n} has inverted declaration range ({declLine}-{declEndLine})"
           if declLine < startLine && startLine ≤ declEndLine then
             throwError "{modName}: {n} (lines {declLine}-{declEndLine}) spans start anchor \
               {startAnchor} (line {startLine})"
@@ -2274,6 +2280,9 @@ run_cmd do
               throwError "{modName}: {n} (line {declLine}) starts after previous anchor \
                 {prevAnchor} (last line {prevEndLine}) and before start anchor {startAnchor} (line \
                 {startLine}); update the seam here and in MirSliceWidePtrLensTests.lean together"
+            if declLine ≤ prevEndLine && prevEndLine < declEndLine then
+              throwError "{modName}: {n} (lines {declLine}-{declEndLine}) extends past previous \
+                anchor {prevAnchor} (last line {prevEndLine})"
           if startLine ≤ declLine && declLine ≤ endLine then
             if endLine < declEndLine then
               throwError "{modName}: {n} (lines {declLine}-{declEndLine}) extends past end anchor \
@@ -2314,6 +2323,9 @@ run_cmd do
             if ci matches .thmInfo _ then
               theorems := theorems + 1
               auditedThms := auditedThms.push n
+    if let some (prevAnchor, _) := prev? then
+      if modAudited.contains prevAnchor then
+        throwError "{modName}: previous anchor {prevAnchor} was unexpectedly audited"
     unless modAudited.contains startAnchor do
       throwError "{modName}: start anchor {startAnchor} was not audited"
     unless modAudited.contains endAnchor do

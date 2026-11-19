@@ -1927,7 +1927,6 @@ run_cmd do
   let constructive : List Name := [``propext, ``Quot.sound]
   let mut audited : Nat := 0
   let mut theorems : Nat := 0
-  let mut auditedSet : NameSet := {}
   let mut auditedThms : Array Name := #[]
   let mut modIdxs : Array ModuleIdx := #[]
   for (modName, startAnchor, lastAnchor, endAnchor, minCount) in
@@ -1946,20 +1945,27 @@ run_cmd do
     let some lastRange ← findDeclarationRanges? lastAnchor | throwError "no range for {lastAnchor}"
     let some endRange ← findDeclarationRanges? endAnchor | throwError "no range for {endAnchor}"
     let startLine := startRange.range.pos.line
+    let startEndLine := startRange.range.endPos.line
     let lastLine := lastRange.range.pos.line
     let lastEndLine := lastRange.range.endPos.line
     let endLine := endRange.range.pos.line
+    let endEndLine := endRange.range.endPos.line
+    if startEndLine < startLine || lastEndLine < lastLine || endEndLine < endLine then
+      throwError "{modName}: inverted anchor declaration range for {startAnchor} / {lastAnchor} / {endAnchor}"
     if endLine ≤ startLine then
       throwError "{modName}: invalid anchor range [{startLine}, {endLine}) for {startAnchor} .. {endAnchor}"
     unless startLine ≤ lastLine && lastEndLine < endLine do
       throwError "{modName}: last anchor {lastAnchor} (lines {lastLine}-{lastEndLine}) does not lie \
         inside [{startLine}, {endLine}) of {startAnchor} .. {endAnchor}"
     let mut count : Nat := 0
+    let mut modAudited : NameSet := {}
     for (n, ci) in env.constants.map₁.toList do
       if env.getModuleIdxFor? n == some modIdx then
         if let some r ← findDeclarationRanges? n then
           let declLine := r.range.pos.line
           let declEndLine := r.range.endPos.line
+          if declEndLine < declLine then
+            throwError "{modName}: {n} has inverted declaration range ({declLine}-{declEndLine})"
           if declLine < startLine && startLine ≤ declEndLine then
             throwError "{modName}: {n} (lines {declLine}-{declEndLine}) spans start anchor \
               {startAnchor} (line {startLine})"
@@ -1971,21 +1977,24 @@ run_cmd do
               throwError "{modName}: {n} (line {declLine}) starts after last anchor {lastAnchor} \
                 (last line {lastEndLine}) and before exclusive end anchor {endAnchor} (line \
                 {endLine}); update the seam here and in UnsizedDstMetadataLensTests.lean together"
+            if lastEndLine < declEndLine then
+              throwError "{modName}: {n} (lines {declLine}-{declEndLine}) extends past last \
+                anchor {lastAnchor} (last line {lastEndLine})"
             if ci.isUnsafe then throwError "unsafe declaration: {n}"
             let axs ← collectAxioms n
             for a in axs do
               unless constructive.contains a do
                 throwError "{n} depends on non-constructive or disallowed axiom {a}"
             count := count + 1
-            auditedSet := auditedSet.insert n
+            modAudited := modAudited.insert n
             if ci matches .thmInfo _ then
               theorems := theorems + 1
               auditedThms := auditedThms.push n
-    unless auditedSet.contains startAnchor do
+    unless modAudited.contains startAnchor do
       throwError "{modName}: start anchor {startAnchor} was not audited"
-    unless auditedSet.contains lastAnchor do
+    unless modAudited.contains lastAnchor do
       throwError "{modName}: last anchor {lastAnchor} was not audited"
-    if auditedSet.contains endAnchor then
+    if modAudited.contains endAnchor then
       throwError "{modName}: exclusive end anchor {endAnchor} was unexpectedly audited"
     if count < minCount then
       throwError "{modName}: audited only {count} declarations (expected ≥ {minCount})"
