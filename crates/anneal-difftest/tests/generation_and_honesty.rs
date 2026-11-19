@@ -2339,3 +2339,158 @@ fn external_spec_oracle_lockstep_parity_on_lazy_old_padding_eq_mut_helpers_and_m
         ]
     );
 }
+
+#[test]
+fn ep2_a1_lockstep_parity_on_diverging_returns_loops_old_ref_rewrites_and_prestepped_schedules() {
+    use anneal_difftest::{
+        SpecContractOracleProbe, SpecExternalCallee, SpecParamBinding, SpecPostconditionVerdict,
+    };
+
+    let u8_layout = LayoutSpec::Scalar(ScalarLayout::u8());
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let pair_layout = LayoutSpec::Struct {
+        name: "ShortPair".to_string(),
+        total_size: 8,
+        fields: vec![
+            FieldLayout {
+                name: "x".to_string(),
+                offset: 0,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "framed".to_string(),
+                offset: 4,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    let probe = SpecContractOracleProbe::new(
+        "ep2_a1_control_and_schedule_probe",
+        vec![
+            SpecParamBinding::mut_ref("pair", "ShortPair", pair_layout)
+                .with_frame_preserved_fields(["framed"]),
+            SpecParamBinding::by_value("x", "u8", u8_layout),
+            SpecParamBinding::by_value("framed", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "let ext_v: u32 = ext_hop();\n\
+         let () = if x == 0u8 {\n    \
+             early_bump(&mut (*pair).x, ext_v & 7u32);\n    \
+             return pair.x;\n\
+         } else {\n    \
+             ()\n\
+         };\n\
+         let next_x: u8 = x + if x == 255u8 { return pair.x; } else { 1u8 };\n\
+         x = next_x;\n\
+         let mut i: u32 = 0u32;\n\
+         let mut acc: u32 = 0u32;\n\
+         while i < 6u32 {\n    \
+             i += 1u32;\n    \
+             if i == 2u32 { continue; }\n    \
+             if i == 5u32 { break; }\n    \
+             acc += i;\n\
+         }\n\
+         let tag_bonus: u32 = loop {\n    \
+             break match x {\n        \
+                 2u8 | 3u8 => 9u32,\n        \
+                 n if n > 10u8 => n as u32,\n        \
+                 _ => 4u32,\n    \
+             };\n\
+         };\n\
+         pair.x = pair.x + acc + tag_bonus + (ext_v & 3u32) + (framed & 0u32);\n\
+         pair.x",
+    )
+    .with_type_defs(
+        "#[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct ShortPair { pub x: u32, pub framed: u32 }\n\
+         pub fn read_pair_x(p: &ShortPair) -> u32 { p.x }\n\
+         pub fn early_bump(dst: &mut u32, add: u32) {\n    \
+             *dst += add;\n    \
+             let () = if *dst >= 1u32 { return; } else { () };\n    \
+             *dst += 500u32;\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_hop",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout,
+    ))
+    .with_requires("bounded_x", "pair.x <= 1000u32")
+    .with_ensures(
+        "old_ref_shorthand_and_closure",
+        "old(read_pair_x(pair)) == old(pair.x) \
+         && old(ShortPair { x: 1u32, framed }).framed == framed \
+         && old((|x: u32| x + 1u32)(5u32)) == 6u32",
+    )
+    .with_ensures("monotonic", "result >= old(pair.x)");
+
+    let make_args = |px: u32, pframed: u32, x: u8, framed_arg: u32| -> Vec<u8> {
+        let mut b = Vec::with_capacity(13);
+        b.extend_from_slice(&px.to_le_bytes());
+        b.extend_from_slice(&pframed.to_le_bytes());
+        b.push(x);
+        b.extend_from_slice(&framed_arg.to_le_bytes());
+        b
+    };
+
+    let mut clean_sched = EnvSchedule::new().with_callee_return_size("ext_hop", 4);
+    clean_sched.set_callee_default("ext_hop", 5u32.to_le_bytes().to_vec());
+
+    // Pre-stepped schedule: consume call 0 beforehand so `callee_call_counts["ext_hop"] == 1`,
+    // and arm `set_callee_panic_on_call("ext_hop", 1)` — the VERY FIRST call inside the trial
+    // MUST panic in BOTH `verify_spec_postcondition_against_schedule` AND compiled `rustc`!
+    let mut prestepped_panic_sched = clean_sched.clone();
+    prestepped_panic_sched.set_callee_panic_on_call("ext_hop", 1);
+    let _ = prestepped_panic_sched.next_action("ext_hop", 0);
+
+    // Mismatched `callee_return_sizes` (`2` bytes vs `u32` 4 bytes) must ALSO trap in both!
+    let mut mismatched_size_sched = EnvSchedule::new();
+    mismatched_size_sched.push_callee_response("ext_hop", 5u32.to_le_bytes().to_vec());
+    mismatched_size_sched.register_callee_return_size("ext_hop", 2);
+
+    let trials = vec![
+        (make_args(10, 99, 0, 77), Some(clean_sched.clone())),
+        (make_args(10, 99, 255, 77), Some(clean_sched.clone())),
+        (make_args(10, 99, 1, 77), Some(clean_sched.clone())),
+        (make_args(10, 99, 25, 77), Some(clean_sched)),
+        (make_args(10, 99, 1, 77), Some(prestepped_panic_sched)),
+        (make_args(10, 99, 1, 77), Some(mismatched_size_sched)),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-A1 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[1], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[2], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[3], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+    assert!(matches!(
+        &report.verdicts[5],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-A1 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_a1_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:HOLD",
+            "TRIAL:2:HOLD",
+            "TRIAL:3:HOLD",
+            "TRIAL:4:TRAP",
+            "TRIAL:5:TRAP",
+        ]
+    );
+}
