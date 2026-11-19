@@ -3805,6 +3805,182 @@ theorem minirust_tb_call_validate_unwind_protector_step_witness :
     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, eq_error_of_interpStopOf (by decide +kernel)⟩
 
+/-- Innermost function of `minirust_nested_unwind_step_witness`: it starts
+unwinding at once and resumes it from its cleanup block. -/
+private def uwNestInnerFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[], .StartUnwind (uwRawThinPtrExpr 0x1000) ⟨⟨1⟩⟩, .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .ResumeUnwind, .Cleanup⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+/-- Middle function of `minirust_nested_unwind_step_witness`: it calls
+`uwNestInnerFn` with unwind block `2`, a cleanup block that only resumes
+unwinding into its own caller. -/
+private def uwNestMiddleFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[], .Call (fnPtrExpr (fnName 2)) .Rust [] (.Local ⟨⟨0⟩⟩)
+        (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩), .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .Unreachable, .Regular⟩),
+      (⟨⟨2⟩⟩, ⟨[], .ResumeUnwind, .Cleanup⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+/-- Outermost function of `minirust_nested_unwind_step_witness`: it calls
+`uwNestMiddleFn` with unwind block `2`, a catch block that reads the unwind
+payload into the raw-pointer local `_1` and then, in block `3`, stops
+unwinding and continues in block `4`. -/
+private def uwNestOuterFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8), (⟨⟨1⟩⟩, .Ptr (.Raw .None))]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[], .Call (fnPtrExpr (fnName 1)) .Rust [] (.Local ⟨⟨0⟩⟩)
+        (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩), .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .Unreachable, .Regular⟩),
+      (⟨⟨2⟩⟩, ⟨[], .Intrinsic .GetUnwindPayload [] (.Local ⟨⟨1⟩⟩) (some ⟨⟨3⟩⟩), .Catch⟩),
+      (⟨⟨3⟩⟩, ⟨[], .StopUnwind ⟨⟨4⟩⟩, .Catch⟩),
+      (⟨⟨4⟩⟩, ⟨[], .Unreachable, .Regular⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwNestProg : Gen.Program :=
+  { functions :=
+      ⟨[(fnName 0, uwNestOuterFn), (fnName 1, uwNestMiddleFn), (fnName 2, uwNestInnerFn)]⟩
+    start := fnName 0
+    globals := ⟨[]⟩
+    traits := ⟨[]⟩
+    vtables := ⟨[]⟩ }
+
+/-- `uwNestOuterFn` about to execute its `Call`, on `Mach`: its `u8` return
+place is live at `0x100` and its raw-pointer local `_1` at `0x200`. -/
+private def uwNestMachBM : Mach :=
+  { uwMachBM
+      [uwLiveStackAllocBM 0x100,
+       { data := List.replicate 8 .Uninit, addr := 0x200, align := ⟨8⟩, kind := .Stack,
+         live := true, extra := () }]
+      [{ func := uwNestOuterFn
+         locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩)]⟩
+         stack_pop_action := .BottomOfStack
+         next_block := ⟨⟨0⟩⟩
+         next_stmt := 0
+         extra := () }]
+      [] with
+    prog := uwNestProg
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩), (fnName 2, ⟨0x8001, none⟩)]⟩ }
+
+/-- The machine of `uwNestMachBM` on `MachTB`. -/
+private def uwNestMachTB : MachTB :=
+  { uwMachTB
+      [uwLiveAllocTB 0x100 .Stack (uwRootWithChildren []),
+       { data := List.replicate 8 .Uninit, addr := 0x200, align := ⟨8⟩, kind := .Stack,
+         live := true,
+         extra :=
+           { root :=
+               { children := [], permissions := List.replicate 8 (.Unprot .Unique),
+                 «protected» := .No } } }]
+      [{ func := uwNestOuterFn
+         locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩)]⟩
+         stack_pop_action := .BottomOfStack
+         next_block := ⟨⟨0⟩⟩
+         next_stmt := 0
+         extra := ⟨[]⟩ }]
+      [] with
+    prog := uwNestProg
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩), (fnName 2, ⟨0x8001, none⟩)]⟩ }
+
+/-- The payload pointer `0x1000` (without provenance) as `GetUnwindPayload`
+stores it: eight little-endian bytes, none carrying provenance. -/
+private def uwNestPayloadBytes {P : Type} : List (Gen.AbstractByte P) :=
+  [.Init 0x00 none, .Init 0x10 none, .Init 0 none, .Init 0 none,
+   .Init 0 none, .Init 0 none, .Init 0 none, .Init 0 none]
+
+/-- **Unwinding through two frames via `Machine::step` on `Mach` and `MachTB`
+(`minirust_nested_unwind_step_witness`)**: every other witness of this section
+unwinds exactly one frame. Here `uwNestOuterFn` calls `uwNestMiddleFn`, which
+calls `uwNestInnerFn`, and the unwind started in the innermost frame travels
+up through both callers. With `pcs` the `(next_block, next_stmt)` of every
+frame, bottom frame first, `Interp.steps` and `Interp.stepsTB` agree:
+- after 4 steps (`Call`, `Call`, `StartUnwind`, `ResumeUnwind`) the innermost
+  frame is gone and its return local is dead, and the middle frame is at its
+  cleanup block `2`, the unwind block of its own `Call`;
+- after 5 steps (a second `ResumeUnwind`, now from that cleanup block) the
+  middle frame is gone and its return local is dead as well, the outer frame
+  is at its catch block `2`, and the payload pushed two frames further down
+  is still on the payload stack;
+- after 6 steps (`GetUnwindPayload` in the catch block) the outer local `_1`
+  holds that payload pointer and the payload stack is unchanged: reading the
+  payload does not pop it;
+- after 7 steps (`StopUnwind`) the payload stack is empty and the outer frame
+  is in block `4`;
+- the 8th step reaches the `Unreachable` of block `4`.
+
+The run has one thread and a payload pointer without provenance. -/
+theorem minirust_nested_unwind_step_witness :
+    let pcsBM (m : Mach) :=
+      m.threads.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))
+    let pcsTB (m : MachTB) :=
+      m.threads.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))
+    let payload : Ptr := ⟨0x1000, none⟩
+    let payloadTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, none⟩
+    ((Interp.steps 4 uwNestMachBM).toOption.map
+          (fun m => (pcsBM m, m.threads.map (·.unwind_payloads),
+            m.mem.memory.allocations.map (·.live))) =
+        some ([[(⟨⟨0⟩⟩, 0), (⟨⟨2⟩⟩, 0)]], [[payload]], [true, true, true, false]) ∧
+      (Interp.steps 5 uwNestMachBM).toOption.map
+          (fun m => (pcsBM m, m.threads.map (·.unwind_payloads),
+            m.mem.memory.allocations.map (·.live))) =
+        some ([[(⟨⟨2⟩⟩, 0)]], [[payload]], [true, true, false, false]) ∧
+      (Interp.steps 6 uwNestMachBM).toOption.map
+          (fun m => (pcsBM m, m.threads.map (·.unwind_payloads),
+            m.mem.memory.allocations[1]?.map (·.data))) =
+        some ([[(⟨⟨3⟩⟩, 0)]], [[payload]], some uwNestPayloadBytes) ∧
+      (Interp.steps 7 uwNestMachBM).toOption.map
+          (fun m => (pcsBM m, m.threads.map (·.unwind_payloads))) =
+        some ([[(⟨⟨4⟩⟩, 0)]], [[]]) ∧
+      Interp.steps 8 uwNestMachBM = .error (.ub "reached unreachable code")) ∧
+    ((Interp.stepsTB 4 uwNestMachTB).toOption.map pcsTB =
+        some [[(⟨⟨0⟩⟩, 0), (⟨⟨2⟩⟩, 0)]] ∧
+      (Interp.stepsTB 4 uwNestMachTB).toOption.map
+          (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[payloadTB]] ∧
+      (Interp.stepsTB 4 uwNestMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations.map (·.live)) =
+        some [true, true, true, false] ∧
+      (Interp.stepsTB 5 uwNestMachTB).toOption.map pcsTB = some [[(⟨⟨2⟩⟩, 0)]] ∧
+      (Interp.stepsTB 5 uwNestMachTB).toOption.map
+          (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[payloadTB]] ∧
+      (Interp.stepsTB 5 uwNestMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations.map (·.live)) =
+        some [true, true, false, false] ∧
+      (Interp.stepsTB 6 uwNestMachTB).toOption.map pcsTB = some [[(⟨⟨3⟩⟩, 0)]] ∧
+      (Interp.stepsTB 6 uwNestMachTB).toOption.map
+          (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[payloadTB]] ∧
+      (Interp.stepsTB 6 uwNestMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations[1]?.map (·.data)) =
+        some (some uwNestPayloadBytes) ∧
+      (Interp.stepsTB 7 uwNestMachTB).toOption.map pcsTB = some [[(⟨⟨4⟩⟩, 0)]] ∧
+      (Interp.stepsTB 7 uwNestMachTB).toOption.map
+          (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[]] ∧
+      Interp.stepsTB 8 uwNestMachTB = .error (.ub "reached unreachable code")) := by
+  refine ⟨⟨rfl, rfl, rfl, rfl, rfl⟩,
+    ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, by decide +kernel,
+     eq_error_of_interpStopOf (by decide +kernel)⟩⟩
+
 private def sdStructTy : Gen.Type :=
   .Tuple [(⟨0⟩, .Int u32), (⟨4⟩, sdEnumTy), (⟨12⟩, .Int u32)] ⟨⟨16⟩, ⟨4⟩, none⟩ none
 
