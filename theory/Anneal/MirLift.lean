@@ -113,7 +113,7 @@ macro_rules
     | apply_residual_block
     | apply_lift_block_of_lookup
     | apply LiftStmtsTerminator.term_goto (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
-    | apply LiftStmtsTerminator.term_return (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
+    | refine LiftStmtsTerminator.term_return (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by dsimp [initPureEnv, initLocals, initLocalsAux, List.set, Trusted.Sequence.get?]; rfl) ?_ (by rfl)
     | apply LiftStmtsTerminator.cons_eval (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
     | apply LiftStmtsTerminator.term_switchInt (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
     | apply LiftStmtsTerminator.term_assert (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl) (by rfl)
@@ -167,12 +167,13 @@ macro_rules
          | apply Anneal.MirLiftCore.LiftTerminator.switchInt (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.assert (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.drop (by rfl) (by rfl) (by rfl)
-             (by rfl)
-         | apply Anneal.MirLiftCore.LiftTerminator.dropProjected (by rfl)
              (by rfl) (by rfl)
-         | apply Anneal.MirLiftCore.LiftTerminator.return_ (by rfl) (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.dropProjected (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.return_ (by rfl) (by rfl)
+             (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.returnToCaller (by rfl) (by rfl)
-             (by rfl) (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.callDirect (by rfl) (by rfl)
              (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.callFnItem (by rfl) (by rfl)
@@ -193,6 +194,9 @@ macro_rules
            Anneal.MirLiftCore.tailCallFrameMem,
            Anneal.MirLiftCore.returnFrameMem,
            invalidateDirectDestWriteBorrows,
+           invalidateConflictingBorrows,
+           invalidateConflictingBorrowsAtProj,
+           resolveBorrowWriteLocalProj,
            disableFrameBorrows, restoreCallerProtectors, lookupSwitchTarget,
            Option.getD, List.set, Nat.add]))
 

@@ -589,8 +589,8 @@ theorem liftPolyLayoutCaller_lift :
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- bb1 terminator: projected drop of `_1.0 -> bb2`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.dropProjected (by rfl) (by rfl) (by rfl) (by rfl)
-  dsimp only [FrameStep.Continues]
+  apply LiftTerminator.dropProjected (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, invalidateConflictingBorrowsAtProj]
   -- bb2[0]: `StorageLive(_3)`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
@@ -1138,8 +1138,8 @@ theorem liftClosureAndTraitCaller_lift :
   dsimp only [FrameStep.Continues, List.set]
   -- bb3 terminator: `drop(_2) -> bb4`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.drop (by rfl) (by rfl) (by rfl) (by rfl)
-  dsimp only [FrameStep.Continues, List.set]
+  apply LiftTerminator.drop (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, List.set, invalidateConflictingBorrows]
   -- bb4 terminator: `assert(true) -> bb5`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.assert (by rfl) (by rfl)

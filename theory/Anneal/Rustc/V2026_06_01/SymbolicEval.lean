@@ -1766,52 +1766,37 @@ def finishAssignStmtNode
       match get? locals₁ dst.local_ with
       | .some (.init rootVal) =>
         match
-          writeProjectedForLocal
-            locals₁
+          ensureNestedFieldShells
+            rootVal
+            (proj :: rest)
             localDecls
             layouts
-            dst.local_
-            (ensureNestedFieldShells rootVal (proj :: rest))
-            (proj :: rest)
-            val
+            (placeTy localDecls layouts { local_ := dst.local_, projection := .nil })
         with
-        | .ok rootVal' =>
-          match set? locals₁ dst.local_ (.init rootVal') with
-          | .some locals₂ =>
-            let resolvedLocalProj :=
-              resolveBorrowWriteLocalProj
-                localDecls
-                layouts
-                locals₁
-                dst.local_
-                (proj :: rest)
-            match mem₁.activeProtectors with
-            | .nil =>
-              let borrows' :=
-                invalidateConflictingBorrowsAtProj
-                  mem₁.borrows
+        | .none => MirStepNode.fail .ub
+        | .some shelledRoot =>
+          match
+            writeProjectedForLocal
+              locals₁
+              localDecls
+              layouts
+              dst.local_
+              shelledRoot
+              (proj :: rest)
+              val
+          with
+          | .ok rootVal' =>
+            match set? locals₁ dst.local_ (.init rootVal') with
+            | .some locals₂ =>
+              let resolvedLocalProj :=
+                resolveBorrowWriteLocalProj
+                  localDecls
+                  layouts
+                  locals₁
                   dst.local_
-                  .none
-                  resolvedLocalProj
-                  0
-                  0
-                  (length mem₁.callStack)
-              MirStepNode.step
-                (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
-            | protHead :: protTail =>
-              match
-                hasProtectedWriteConflict
-                  mem₁.borrows
-                  (protHead :: protTail)
-                  dst.local_
-                  .none
-                  resolvedLocalProj
-                  0
-                  0
-                  (length mem₁.callStack)
-              with
-              | true => MirStepNode.fail .ub
-              | false =>
+                  (proj :: rest)
+              match mem₁.activeProtectors with
+              | .nil =>
                 let borrows' :=
                   invalidateConflictingBorrowsAtProj
                     mem₁.borrows
@@ -1823,9 +1808,34 @@ def finishAssignStmtNode
                     (length mem₁.callStack)
                 MirStepNode.step
                   (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
-          | .none => MirStepNode.fail .ub
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
+              | protHead :: protTail =>
+                match
+                  hasProtectedWriteConflict
+                    mem₁.borrows
+                    (protHead :: protTail)
+                    dst.local_
+                    .none
+                    resolvedLocalProj
+                    0
+                    0
+                    (length mem₁.callStack)
+                with
+                | true => MirStepNode.fail .ub
+                | false =>
+                  let borrows' :=
+                    invalidateConflictingBorrowsAtProj
+                      mem₁.borrows
+                      dst.local_
+                      .none
+                      resolvedLocalProj
+                      0
+                      0
+                      (length mem₁.callStack)
+                  MirStepNode.step
+                    (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+            | .none => MirStepNode.fail .ub
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
       | .some .uninit =>
         match uninitFieldWriteShell? localDecls layouts dst.local_ proj rest with
         | .some rootVal =>
