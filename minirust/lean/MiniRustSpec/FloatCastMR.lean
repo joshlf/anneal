@@ -122,6 +122,14 @@ represent: IEEE-754 bit patterns carried by `u32` / `i32` / `[u8; 4]`
    `inFragmentWithIntrinsics`, `progInFragment`, `progInFragmentWithIntrinsics`) against both float
    locals and float-cast statements in any entry or callee, and proves symbolic bridges for unsigned
    `f32 → u32`, narrow `f32 → u8`, and rounding `u64 → f64`.
+10. **Choice-free MiniRust codecs (§6.0, `[adv shard-b A4]`).** `Classical.choice`-free
+   replacements of the library's integer codec lemmas (`fc_leValue_leBytes`,
+   `fc_decode_leBytes`, `fc_decode_int_scalarBytes`, `fc_canRepresent_intFromBits`) remove the
+   choice principle from the MiniRust-side encode / decode / transmute / bridge theorems; it
+   remains only where a library theorem such as `mirCall_ret` or `decodePtr_ptrBytes` is used.
+   The symbolic machine runs are `BasicMemory` runs (via `mirCall_ret`); `TreeBorrowsMemory`
+   machine runs are kernel-computed on concrete bit patterns, and `TreeBorrowsMemory` is symbolic
+   at the operator level (`transmuteM`, `evalCastOpM`).
 
 Every public theorem is guarded by `#print axioms` at the end of the file.
 -/
@@ -1312,6 +1320,115 @@ theorem fc_ptr_bytes_erased (addr : Nat) (p : Nat × Nat) :
 theorem fc_goodSize_4 : GoodSize 4 := by unfold GoodSize; omega
 theorem fc_goodSize_8 : GoodSize 8 := by unfold GoodSize; omega
 
+/-! ### 6.0 `Classical.choice`-free MiniRust integer codec lemmas (`[adv shard-b A4]`)
+
+Drop-in replacements for the library's `decode_leBytes`, `decode_int_scalarBytes`, and
+`canRepresent_intFromBits` (which depend on `Classical.choice` through `leValue_leBytes`,
+`intFromBits_window`, and `inBounds_iff`), proved from `propext` / `Quot.sound` only, so the
+MiniRust-side bit-carrier theorems below need no choice principle. -/
+
+theorem fc_u8_toNat_mod (k : Nat) : (UInt8.ofNat (k % 256)).toNat = k % 256 := by simp
+
+theorem fc_leValue_leBytes_aux : ∀ (u k : Nat),
+    leValue (leBytes u k) < 256 ^ k ∧ leValue (leBytes u k) + 256 ^ k * (u / 256 ^ k) = u
+  | u, 0 => by simp [leBytes, leValue]
+  | u, k + 1 => by
+    obtain ⟨hlt, heq⟩ := fc_leValue_leBytes_aux (u / 256) k
+    have hval : leValue (leBytes u (k + 1)) = u % 256 + 256 * leValue (leBytes (u / 256) k) := by
+      show (UInt8.ofNat (u % 256)).toNat + 256 * leValue (leBytes (u / 256) k) = _
+      rw [fc_u8_toNat_mod]
+    have hdiv : u / 256 ^ (k + 1) = u / 256 / 256 ^ k := by
+      rw [Nat.pow_succ', Nat.div_div_eq_div_mul]
+    have hmod := Nat.mod_add_div u 256
+    have hm256 := Nat.mod_lt u (show 256 > 0 by decide)
+    rw [hval, hdiv, Nat.pow_succ']
+    generalize leValue (leBytes (u / 256) k) = L at hlt heq ⊢
+    generalize 256 ^ k = P at hlt heq ⊢
+    generalize u / 256 / P = Q at heq ⊢
+    constructor
+    · have h1 : 256 * (L + 1) ≤ 256 * P := Nat.mul_le_mul_left 256 hlt
+      omega
+    · rw [Nat.mul_assoc, Nat.add_assoc, ← Nat.mul_add, heq]
+      exact hmod
+
+theorem fc_leValue_leBytes (u k : Nat) : leValue (leBytes u k) = u % 256 ^ k := by
+  obtain ⟨hlt, heq⟩ := fc_leValue_leBytes_aux u k
+  conv => rhs; rw [← heq]
+  rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hlt]
+
+theorem fc_decode_leBytes (signed : Signedness) (k bits : Nat) (hb : bits < 2 ^ (8 * k)) :
+    Endianness.decode .LittleEndian signed (leBytes bits k) = intFromBits bits ⟨signed, ⟨k⟩⟩ := by
+  have hv : leValue (leBytes bits k) = bits := by
+    rw [fc_leValue_leBytes, show (256 : Nat) ^ k = 2 ^ (8 * k) by rw [Nat.pow_mul]]
+    exact Nat.mod_eq_of_lt hb
+  cases signed with
+  | Unsigned => simp only [Endianness.decode, intFromBits, hv]
+  | Signed =>
+    simp only [Endianness.decode, intFromBits, hv, leBytes_length]
+    by_cases hlt : bits < 2 ^ (8 * k - 1)
+    · have h2 : (bits : Int) < 2 ^ (8 * k - 1) := by
+        have := Int.ofNat_lt.mpr hlt
+        simpa [Int.natCast_pow] using this
+      simp [hlt, h2]
+    · have h2 : ¬ (bits : Int) < 2 ^ (8 * k - 1) := by
+        intro h'
+        apply hlt
+        have : ((bits : Nat) : Int) < ((2 ^ (8 * k - 1) : Nat) : Int) := by
+          simpa [Int.natCast_pow] using h'
+        exact Int.ofNat_lt.mp this
+      simp [hlt, h2]
+
+theorem fc_canRepresent_intFromBits (it : Gen.IntType) (bits : Nat) (hgood : GoodSize it.size.bytes)
+    (hb : bits < 2 ^ (8 * it.size.bytes)) : IntType.can_represent it (intFromBits bits it) = true := by
+  obtain ⟨signed, ⟨n⟩⟩ := it
+  have hpos : 0 < n := hgood.pos
+  simp only at hb
+  have hY : ((2 : Int) ^ (8 * n)) = 2 * (2 : Int) ^ (8 * n - 1) := by
+    rw [← Int.pow_succ']
+    congr 1
+    omega
+  have hbI : (bits : Int) < (2 : Int) ^ (8 * n) := by
+    have := Int.ofNat_lt.mpr hb
+    simpa [Int.natCast_pow] using this
+  have hpow : (0 : Int) < (2 : Int) ^ (8 * n - 1) := Int.pow_pos (by decide)
+  unfold IntType.can_represent inBounds intFromBits
+  cases signed with
+  | Unsigned =>
+    simp only [Size.bits, Bool.and_eq_true, decide_eq_true_eq]
+    constructor
+    · first | exact Int.natCast_nonneg _ | exact decide_eq_true (Int.natCast_nonneg _)
+    · first | exact hbI | exact decide_eq_true hbI
+  | Signed =>
+    simp only [Size.bits, Bool.and_eq_true, decide_eq_true_eq]
+    generalize hX : ((2 : Int) ^ (8 * n - 1)) = X at *
+    rw [hY] at hbI
+    by_cases hlt : bits < 2 ^ (8 * n - 1)
+    · have h2 : (bits : Int) < X := by
+        rw [← hX]
+        have := Int.ofNat_lt.mpr hlt
+        simpa [Int.natCast_pow] using this
+      simp only [hlt, ↓reduceIte]
+      have := Int.natCast_nonneg bits
+      constructor <;> omega
+    · have h2 : X ≤ (bits : Int) := by
+        rw [← hX]
+        have : 2 ^ (8 * n - 1) ≤ bits := Nat.le_of_not_lt hlt
+        have := Int.ofNat_le.mpr this
+        simpa [Int.natCast_pow] using this
+      simp only [hlt, ↓reduceIte]
+      rw [hY]
+      constructor <;> omega
+
+theorem fc_decode_int_scalarBytes (it : Gen.IntType) (bits : Nat)
+    (hbits : bits < 2 ^ (8 * it.size.bytes)) :
+    Type.decode (.Int it) (scalarBytes it bits) = .ok (some (.Int (intFromBits bits it))) := by
+  obtain ⟨signed, ⟨n⟩⟩ := it
+  have hlen : (scalarBytes ⟨signed, ⟨n⟩⟩ bits).length = n := by
+    simp [scalarBytes, leBytes_length]
+  simp only [Type.decode, Type.decodeInt, hlen, ne_eq, not_true_eq_false, ↓reduceIte,
+    mapM_data_scalarBytes, x86_64.ENDIANNESS, fc_decode_leBytes signed n bits hbits]
+  rfl
+
 /-- **Signed readings agree**: Anneal's `intValueOfBits` (`Anneal.Mir.IeeeFloatCast`, the value a
 two's-complement bit pattern denotes) is MiniRust's `intFromBits` (`minimize`'s
 `int_from_bits`) on every in-range pattern of every positive byte width, for both signednesses. -/
@@ -1346,7 +1463,7 @@ theorem fc_intValueOfBits_carriers (bits : Nat) :
 theorem fc_mr_encode_intFromBits (it : Gen.IntType) (bits : Nat) (hgood : GoodSize it.size.bytes)
     (hbits : bits < 2 ^ (8 * it.size.bytes)) :
     Type.encode (.Int it) (.Int (intFromBits bits it)) = .ok (scalarBytes it bits) := by
-  rw [encode_int it _ hgood (canRepresent_intFromBits it bits hgood hbits),
+  rw [encode_int it _ hgood (fc_canRepresent_intFromBits it bits hgood hbits),
     intFromBits_emod bits it hbits]
   rfl
 
@@ -1367,7 +1484,7 @@ theorem fc_mr_decode_eq_anneal (s : Signedness) (n bits : Nat) (prov : Option (N
     Type.decode (.Int ⟨s, ⟨n⟩⟩) ((encodeLittleEndianBytes bits n prov).map fcByteToMR) =
       .ok (some (.Int (intFromBits bits ⟨s, ⟨n⟩⟩))) := by
   rw [fc_map_encodeLittleEndianBytes s prov n bits]
-  exact decode_int_scalarBytes ⟨s, ⟨n⟩⟩ bits hbits
+  exact fc_decode_int_scalarBytes ⟨s, ⟨n⟩⟩ bits hbits
 
 /-- `scalarBytes` depends only on the width. -/
 theorem fc_scalarBytes_sign (s₁ s₂ : Signedness) (n bits : Nat) :
@@ -1381,8 +1498,8 @@ theorem fc_mr_transmute_int (s₁ s₂ : Signedness) (n bits : Nat) (hgood : Goo
     transmute (.Int (intFromBits bits ⟨s₁, ⟨n⟩⟩)) (.Int ⟨s₁, ⟨n⟩⟩) (.Int ⟨s₂, ⟨n⟩⟩) m =
       .ok (.Int (intFromBits bits ⟨s₂, ⟨n⟩⟩)) := by
   have henc := fc_mr_encode_intFromBits ⟨s₁, ⟨n⟩⟩ bits hgood hbits
-  have hdec := decode_int_scalarBytes ⟨s₂, ⟨n⟩⟩ bits hbits
-  have hrep := canRepresent_intFromBits ⟨s₂, ⟨n⟩⟩ bits hgood hbits
+  have hdec := fc_decode_int_scalarBytes ⟨s₂, ⟨n⟩⟩ bits hbits
+  have hrep := fc_canRepresent_intFromBits ⟨s₂, ⟨n⟩⟩ bits hgood hbits
   unfold transmute
   simp only [layout_eq ⟨s₁, ⟨n⟩⟩ hgood, layout_eq ⟨s₂, ⟨n⟩⟩ hgood, bind, Except.bind,
     expect_size_sized, ne_eq, not_true_eq_false, ↓reduceIte, henc, fc_scalarBytes_sign s₁ s₂, hdec,
@@ -1409,8 +1526,8 @@ theorem fc_mrM_transmute_int {M : Type} [Gen.Memory M] [MemoryOps M] (s₁ s₂ 
     (m : Option (Gen.Machine M)) :
     transmuteM (M := M) (.Int (intFromBits bits ⟨s₁, ⟨n⟩⟩)) (.Int ⟨s₁, ⟨n⟩⟩) (.Int ⟨s₂, ⟨n⟩⟩) m =
       .ok (.Int (intFromBits bits ⟨s₂, ⟨n⟩⟩)) := by
-  have hrep₁ := canRepresent_intFromBits ⟨s₁, ⟨n⟩⟩ bits hgood hbits
-  have hrep₂ := canRepresent_intFromBits ⟨s₂, ⟨n⟩⟩ bits hgood hbits
+  have hrep₁ := fc_canRepresent_intFromBits ⟨s₁, ⟨n⟩⟩ bits hgood hbits
+  have hrep₂ := fc_canRepresent_intFromBits ⟨s₂, ⟨n⟩⟩ bits hgood hbits
   have hmod : (intFromBits bits ⟨s₁, ⟨n⟩⟩ % 2 ^ Size.bits ⟨n⟩).toNat = bits := by
     have := intFromBits_emod bits ⟨s₁, ⟨n⟩⟩ hbits
     simp only [Size.bits] at this ⊢
@@ -1418,7 +1535,7 @@ theorem fc_mrM_transmute_int {M : Type} [Gen.Memory M] [MemoryOps M] (s₁ s₂ 
   have henc : Endianness.encode .LittleEndian s₁ ⟨n⟩ (intFromBits bits ⟨s₁, ⟨n⟩⟩) =
       some (leBytes bits n) := by
     rw [encode_eq s₁ ⟨n⟩ _ hrep₁, hmod]
-  have hdec := decode_leBytes s₂ n bits hbits
+  have hdec := fc_decode_leBytes s₂ n bits hbits
   unfold transmuteM
   simp only [layout_eq ⟨s₁, ⟨n⟩⟩ hgood, layout_eq ⟨s₂, ⟨n⟩⟩ hgood, bind, Except.bind,
     expect_size_sized, ne_eq, not_true_eq_false,
@@ -1491,7 +1608,7 @@ theorem fc_mr_decode_ptrBytes (addr : Nat) (h : addr < 2 ^ 64) (prov : Option Pr
         .ok (some (.Ptr { thin_pointer := { addr := addr, provenance := prov }, metadata := none })) := by
   constructor
   · have hdata := encodePtrBytes_data prov 0 (leBytes addr 8)
-    have hdec := decode_leBytes .Unsigned 8 addr (by simpa using h)
+    have hdec := fc_decode_leBytes .Unsigned 8 addr (by simpa using h)
     simp only [Type.decode, Type.decodeInt, fcU64It, ptrBytes, ne_eq, hdata, x86_64.ENDIANNESS,
       hdec]
     rfl
@@ -2668,7 +2785,7 @@ theorem fc_mrM_transmute_int_bytes4 {M : Type} [Gen.Memory M] [MemoryOps M]
     transmuteM (M := M) (.Tuple (fcLeByteValsMRM bits 4)) (.Array (.Int fcU8It) 4)
         (.Int ⟨s, ⟨4⟩⟩) m = .ok (.Int (intFromBits bits ⟨s, ⟨4⟩⟩)) := by
   have hbits' : bits < 2 ^ (8 * 4) := hbits
-  have hrep := canRepresent_intFromBits ⟨s, ⟨4⟩⟩ bits fc_goodSize_4 hbits'
+  have hrep := fc_canRepresent_intFromBits ⟨s, ⟨4⟩⟩ bits fc_goodSize_4 hbits'
   have hmod : (intFromBits bits ⟨s, ⟨4⟩⟩ % 2 ^ Size.bits ⟨4⟩).toNat = bits := by
     have := intFromBits_emod bits ⟨s, ⟨4⟩⟩ hbits'
     simp only [Size.bits] at this ⊢
@@ -2676,7 +2793,7 @@ theorem fc_mrM_transmute_int_bytes4 {M : Type} [Gen.Memory M] [MemoryOps M]
   have hencI : Endianness.encode .LittleEndian s ⟨4⟩ (intFromBits bits ⟨s, ⟨4⟩⟩) =
       some (leBytes bits 4) := by
     rw [encode_eq s ⟨4⟩ _ hrep, hmod]
-  have hdecI := decode_leBytes s 4 bits hbits'
+  have hdecI := fc_decode_leBytes s 4 bits hbits'
   obtain ⟨hencA, hdecA, _, _⟩ := fc_mrM_array_u8_encode_decode (M := M) bits
   have hlayA : Type.layout (.Array (.Int fcU8It) 4) = .ok (.Sized ⟨4⟩ ⟨1⟩) := rfl
   have hchkA : checkValueM (M := M) (.Tuple (fcLeByteValsMRM bits 4))
@@ -2706,7 +2823,7 @@ theorem fc_mrM_transmute_int_bytes8 {M : Type} [Gen.Memory M] [MemoryOps M]
     transmuteM (M := M) (.Tuple (fcLeByteValsMRM bits 8)) (.Array (.Int fcU8It) 8)
         (.Int ⟨s, ⟨8⟩⟩) m = .ok (.Int (intFromBits bits ⟨s, ⟨8⟩⟩)) := by
   have hbits' : bits < 2 ^ (8 * 8) := hbits
-  have hrep := canRepresent_intFromBits ⟨s, ⟨8⟩⟩ bits fc_goodSize_8 hbits'
+  have hrep := fc_canRepresent_intFromBits ⟨s, ⟨8⟩⟩ bits fc_goodSize_8 hbits'
   have hmod : (intFromBits bits ⟨s, ⟨8⟩⟩ % 2 ^ Size.bits ⟨8⟩).toNat = bits := by
     have := intFromBits_emod bits ⟨s, ⟨8⟩⟩ hbits'
     simp only [Size.bits] at this ⊢
@@ -2714,7 +2831,7 @@ theorem fc_mrM_transmute_int_bytes8 {M : Type} [Gen.Memory M] [MemoryOps M]
   have hencI : Endianness.encode .LittleEndian s ⟨8⟩ (intFromBits bits ⟨s, ⟨8⟩⟩) =
       some (leBytes bits 8) := by
     rw [encode_eq s ⟨8⟩ _ hrep, hmod]
-  have hdecI := decode_leBytes s 8 bits hbits'
+  have hdecI := fc_decode_leBytes s 8 bits hbits'
   obtain ⟨_, _, hencA, hdecA⟩ := fc_mrM_array_u8_encode_decode (M := M) bits
   have hlayA : Type.layout (.Array (.Int fcU8It) 8) = .ok (.Sized ⟨8⟩ ⟨1⟩) := rfl
   have hchkA : checkValueM (M := M) (.Tuple (fcLeByteValsMRM bits 8))
@@ -2763,8 +2880,8 @@ theorem fc_mr_transmute_byte_arrays_symbolic (s : Signedness) :
   refine ⟨fun bits h32 => ?_, fun bits h64 => ?_⟩
   · have hbits' : bits < 2 ^ (8 * 4) := h32
     have hencI := fc_mr_encode_intFromBits ⟨s, ⟨4⟩⟩ bits fc_goodSize_4 hbits'
-    have hdecI := decode_int_scalarBytes ⟨s, ⟨4⟩⟩ bits hbits'
-    have hrep := canRepresent_intFromBits ⟨s, ⟨4⟩⟩ bits fc_goodSize_4 hbits'
+    have hdecI := fc_decode_int_scalarBytes ⟨s, ⟨4⟩⟩ bits hbits'
+    have hrep := fc_canRepresent_intFromBits ⟨s, ⟨4⟩⟩ bits fc_goodSize_4 hbits'
     obtain ⟨hencA, hdecA, _, _⟩ := fc_mr_array_u8_eq_anneal bits none
     rw [fc_map_encodeLittleEndianBytes .Unsigned none 4 bits] at hencA hdecA
     have hlayA : Type.layout (.Array (.Int fcU8It) 4) = .ok (.Sized ⟨4⟩ ⟨1⟩) := rfl
@@ -2788,8 +2905,8 @@ theorem fc_mr_transmute_byte_arrays_symbolic (s : Signedness) :
         checkValue_int hrep, pure, Except.pure]
   · have hbits' : bits < 2 ^ (8 * 8) := h64
     have hencI := fc_mr_encode_intFromBits ⟨s, ⟨8⟩⟩ bits fc_goodSize_8 hbits'
-    have hdecI := decode_int_scalarBytes ⟨s, ⟨8⟩⟩ bits hbits'
-    have hrep := canRepresent_intFromBits ⟨s, ⟨8⟩⟩ bits fc_goodSize_8 hbits'
+    have hdecI := fc_decode_int_scalarBytes ⟨s, ⟨8⟩⟩ bits hbits'
+    have hrep := fc_canRepresent_intFromBits ⟨s, ⟨8⟩⟩ bits fc_goodSize_8 hbits'
     obtain ⟨_, _, hencA, hdecA⟩ := fc_mr_array_u8_eq_anneal bits none
     rw [fc_map_encodeLittleEndianBytes .Unsigned none 8 bits] at hencA hdecA
     have hlayA : Type.layout (.Array (.Int fcU8It) 8) = .ok (.Sized ⟨8⟩ ⟨1⟩) := rfl
@@ -2968,7 +3085,7 @@ private theorem fc_decodePtrM_encodePtrBytesM {M : Type} [Gen.Memory M] [MemoryO
     decodePtrM (M := M) (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) =
       .ok (some { addr := (addr : Int), provenance := prov }) := by
   have hbits' : addr < 2 ^ (8 * 8) := haddr
-  have hdec := decode_leBytes .Unsigned 8 addr hbits'
+  have hdec := fc_decode_leBytes .Unsigned 8 addr hbits'
   simp only [intFromBits] at hdec
   dsimp only [decodePtrM]
   simp only [ne_eq, fc_encodePtrBytesM_len, leBytes_length, x86_64.PTR_SIZE, not_true_eq_false,
@@ -3000,7 +3117,7 @@ private theorem fc_intFromBits_unsigned (n addr : Nat) :
 private theorem fc_inBounds_u64 (addr : Nat) (haddr : addr < 2 ^ 64) :
     inBounds (addr : Int) .Unsigned ⟨8⟩ = true := by
   have hbits' : addr < 2 ^ (8 * (⟨.Unsigned, ⟨8⟩⟩ : Gen.IntType).size.bytes) := haddr
-  have h := canRepresent_intFromBits ⟨.Unsigned, ⟨8⟩⟩ addr fc_goodSize_8 hbits'
+  have h := fc_canRepresent_intFromBits ⟨.Unsigned, ⟨8⟩⟩ addr fc_goodSize_8 hbits'
   rw [fc_canRepresent_eq_inBounds, fc_intFromBits_unsigned] at h
   exact h
 
@@ -3087,7 +3204,7 @@ private theorem fc_decodeIntM_encodePtrBytesM {M : Type} [Gen.Memory M] [MemoryO
   have hbits' : addr < 2 ^ (8 * 8) := haddr
   simp only [Type.decodeM, Type.decodeIntM, fc_encodePtrBytesM_len, leBytes_length, ne_eq,
     not_true_eq_false, ↓reduceIte, fc_encodePtrBytesM_dataM, x86_64.ENDIANNESS,
-    decode_leBytes s 8 addr hbits', pure, Except.pure]
+    fc_decode_leBytes s 8 addr hbits', pure, Except.pure]
 
 /-- **Polymorphic pointer-provenance `transmuteM` boundary in MiniRust**, valid across *every*
 memory model `M` (`BasicMemory` and `TreeBorrowsMemory`), *every* 64-bit address `addr < 2 ^ 64`,
@@ -3113,7 +3230,7 @@ theorem fc_mrM_transmute_ptr_boundary {M : Type} [Gen.Memory M] [MemoryOps M]
     transmuteM (M := M) (.Int (addr : Int)) (.Int fcU64It)
         (.Ptr (.Raw .None)) m = .ok (.Ptr ⟨⟨(addr : Int), none⟩, none⟩) := by
   have hbits' : addr < 2 ^ (8 * 8) := haddr
-  have hrepS := canRepresent_intFromBits ⟨s, ⟨8⟩⟩ addr fc_goodSize_8 hbits'
+  have hrepS := fc_canRepresent_intFromBits ⟨s, ⟨8⟩⟩ addr fc_goodSize_8 hbits'
   have hchkS : checkValueM (M := M) (.Int (intFromBits addr ⟨s, ⟨8⟩⟩)) (.Int ⟨s, ⟨8⟩⟩) m =
       .ok () := by
     simp only [checkValueM, ensureElseUb, hrepS, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
@@ -4664,9 +4781,10 @@ theorem fc_bytes_to_int_carriers_steps_and_wfLive :
 
 Every public theorem of this module depends at most on `propext`, `Classical.choice`, and
 `Quot.sound` (no `sorryAx`, no `Lean.ofReduceBool`); the Anneal-side transmute, decoding, and
-symbolic-run theorems avoid `Classical.choice`, which enters only through MiniRust-side
-library lemmas (`decode_int_scalarBytes`, `canRepresent_intFromBits`, `decode_leBytes`,
-`decodePtr_ptrBytes`, and the simulation theorem `mirCall_ret`). -/
+symbolic-run theorems, and (via the choice-free codec lemmas of §6.0) the MiniRust-side
+encode / decode / transmute / bridge theorems, avoid `Classical.choice`, which enters only
+through remaining library lemmas such as `decodePtr_ptrBytes` and the simulation theorem
+`mirCall_ret`. -/
 
 section AxiomGuards
 
@@ -5355,6 +5473,42 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_goodSize_8' depends on axioms:
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_goodSize_8
 
 /--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_u8_toNat_mod' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_u8_toNat_mod
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_leValue_leBytes_aux' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_leValue_leBytes_aux
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_leValue_leBytes' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_leValue_leBytes
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_decode_leBytes' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_decode_leBytes
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_canRepresent_intFromBits' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_canRepresent_intFromBits
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_decode_int_scalarBytes' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_decode_int_scalarBytes
+
+/--
 info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_intValueOfBits_eq_intFromBits' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
@@ -5367,19 +5521,19 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_intValueOfBits_carriers' depen
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_intValueOfBits_carriers
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_encode_intFromBits' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_encode_intFromBits' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mr_encode_intFromBits
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_encode_eq_anneal' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_encode_eq_anneal' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mr_encode_eq_anneal
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_decode_eq_anneal' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_decode_eq_anneal' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mr_decode_eq_anneal
@@ -5391,7 +5545,7 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_scalarBytes_sign' does not dep
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_scalarBytes_sign
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_int' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_int' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_int
@@ -5403,31 +5557,31 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mapM_dataM_init' depends on ax
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mapM_dataM_init
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrBM_transmute_int' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrBM_transmute_int' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrBM_transmute_int
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrTB_transmute_int' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrTB_transmute_int' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrTB_transmute_int
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_u32_i32' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_u32_i32' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_u32_i32
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_u64_i64' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_u64_i64' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_u64_i64
@@ -5481,19 +5635,19 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrier_runs' depends on axiom
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrier_runs
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_floatToInt' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_floatToInt' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_floatToInt
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_f32_as_i32' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_f32_as_i32' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_f32_as_i32
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_f64_as_u64' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_f64_as_u64' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_f64_as_u64
@@ -5511,13 +5665,13 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_goodSize_byteWidth' depends on
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_goodSize_byteWidth
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_intToFloat' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_intToFloat' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_intToFloat
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_floatToFloat' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_floatToFloat' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_bridge_floatToFloat
@@ -5541,7 +5695,7 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_e2e_bit_carrier_runs' depends 
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_e2e_bit_carrier_runs
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_e2e_neg_inf_as_i32_both' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_e2e_neg_inf_as_i32_both' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_e2e_neg_inf_as_i32_both
@@ -5613,13 +5767,13 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_widen_bits' depends on axi
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_widen_bits
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_from_bits_as_i32' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_from_bits_as_i32' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_from_bits_as_i32
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_widen_bits' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_widen_bits' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_widen_bits
@@ -5715,7 +5869,7 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_f16_f128_transmute_vs_float_ca
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_f16_f128_transmute_vs_float_cast
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_encodeTwosComplement_carrier_bridge' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_encodeTwosComplement_carrier_bridge' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_encodeTwosComplement_carrier_bridge
@@ -5781,19 +5935,19 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_array_u8_eq_anneal' depends
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mr_array_u8_eq_anneal
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int_bytes4' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int_bytes4' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int_bytes4
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int_bytes8' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int_bytes8' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_int_bytes8
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_byte_arrays_symbolic' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_byte_arrays_symbolic' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mr_transmute_byte_arrays_symbolic
@@ -5925,19 +6079,19 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_narrow_bits_raw' depends o
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_narrow_bits_raw
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_f64_from_bits_as_i64' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_f64_from_bits_as_i64' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_f64_from_bits_as_i64
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_narrow_bits' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_narrow_bits' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_narrow_bits
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_int_as_f64_bits' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_int_as_f64_bits' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_int_as_f64_bits
