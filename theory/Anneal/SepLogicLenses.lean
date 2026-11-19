@@ -4334,6 +4334,7 @@ theorem mirWpConverges_drop_of_lens
       bb.terminator.kind =
         .drop { local_ := loc, projection := [] } target unwind)
     (hCallee : m.activeCallee = .none)
+    (hAbove : ∀ b ∈ m.borrows, env.length ≤ b.targetLocal)
     (hGet : get? env loc = .some oldSlot)
     (hNotDead : oldSlot ≠ .dead)
     (hSet : set? env loc .uninit = .some env')
@@ -4351,6 +4352,11 @@ theorem mirWpConverges_drop_of_lens
         memory := m }
       Φ := by
   refine MirWpConverges.step_tau ?_ hNext
+  have hLtFrame : loc < env.length := (List.getElem?_eq_some_iff.mp hGet).1
+  have hInval :
+      invalidateConflictingBorrows m.borrows loc .none (length m.callStack) =
+        m.borrows :=
+    invalidateConflictingBorrows_eq_self_of_lt_frame hAbove hLtFrame
   rw [stepMirFn_of_isRuntimeMirPhase body bbIdx bb.statements.length env m
     hCallee hPhase hBb]
   have hGetNone : get? bb.statements bb.statements.length = .none :=
@@ -4369,11 +4375,25 @@ theorem mirWpConverges_drop_of_lens
   | uninit =>
     dsimp only
     rw [hSet]
-    rfl
+    dsimp only
+    cases hAP : m.activeProtectors with
+    | nil => simp [MirStepNode.step, hInval, ← hAP]
+    | cons pHead pTail =>
+      dsimp only
+      rw [hasProtectedWriteConflict_eq_false_of_lt_frame
+        (pHead :: pTail) hAbove hLtFrame]
+      simp [MirStepNode.step, hInval, ← hAP]
   | init _ =>
     dsimp only
     rw [hSet]
-    rfl
+    dsimp only
+    cases hAP : m.activeProtectors with
+    | nil => simp [MirStepNode.step, hInval, ← hAP]
+    | cons pHead pTail =>
+      dsimp only
+      rw [hasProtectedWriteConflict_eq_false_of_lt_frame
+        (pHead :: pTail) hAbove hLtFrame]
+      simp [MirStepNode.step, hInval, ← hAP]
 
 
 /-- Pure operand lifting preserves the length of the local slot environment. -/
@@ -4536,7 +4556,7 @@ theorem mirWpConverges_of_liftLensBlock
       (List.nil_append _).symm hInv hFrame hKeys
       (fun m' hInv' hFrame' hKeys' => ?_)
     exact mirWpConverges_drop_of_lens hPhase hBb hTerm
-      hInv'.activeCallee_none hGet hNotDead hSet
+      hInv'.activeCallee_none hInv'.borrows_above_frame hGet hNotDead hSet
       (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
         (fun m_final hInvF hFrameF =>
           hPost m_final (by rw [← hLen, ← hLen₂]; exact hInvF) hFrameF))
@@ -9953,7 +9973,7 @@ theorem mirWpConverges_of_liftLensBlock_subplace
       (List.nil_append _).symm hInv hFrame hKeys
       (fun m' hInv' hFrame' hKeys' =>
         mirWpConverges_drop_of_lens hPhase hBb hTerm hInv'.activeCallee_none
-          hGet hNotDead hSet
+          hInv'.borrows_above_frame hGet hNotDead hSet
           (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
             (fun m_final hInvF hFrameF =>
               hPost m_final (by rw [← hLen₁, ← hLen₂]; exact hInvF) hFrameF)))

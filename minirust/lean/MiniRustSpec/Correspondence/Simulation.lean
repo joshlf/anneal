@@ -6655,6 +6655,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
         have hi : i < s.frame.locals.length := by rw [hnA]; exact hin
         obtain ⟨hMlive, hMdead⟩ := evalStatement_deinit hframe i d hd hscalar
         obtain ⟨hAlive, hAdead⟩ := evalStmt_deinit s body.localDecls body.layouts i span hi
+          (hbo.target_ne_of_not_addrTaken hi_addr)
         by_cases hdead : s.frame.locals[i]? = some .dead
         · rw [hAdead hdead]
           obtain ⟨msg, hmsg⟩ := hMdead ((hrel.stale.dead_iff i).mp hdead) hal
@@ -10438,6 +10439,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         obtain ⟨hMlive, hMdead⟩ := evalStatement_deinit hframe i d hd
           (.inl (List.all_eq_true.mp hallSc d (List.mem_of_getElem? hd)))
         obtain ⟨hAlive, hAdead⟩ := evalStmt_deinit s curBody.localDecls curBody.layouts i span hi
+          (fun b hb => by rw [hrel.borrows] at hb; cases hb)
         by_cases hdead : s.frame.locals[i]? = some .dead
         · rw [hAdead hdead]
           obtain ⟨msg, hmsg⟩ := hMdead ((hrel.stale.dead_iff i).mp hdead) hal

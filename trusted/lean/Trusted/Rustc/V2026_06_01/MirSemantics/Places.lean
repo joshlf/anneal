@@ -8803,18 +8803,39 @@ def unionActiveSlotIsZstPlaceholder
       | _, _ => false
   | _, _ => false
 
-/--
-True when `v` is an unpopulated intermediate shell `.aggregate 0 fields`
-materialized by `ensureNestedFieldShells` (every slot is `.unit`, `.uninit`, or
-recursively an unpopulated shell).
--/
-def isUnpopulatedFieldShell : Value → Bool
-  | .unit => true
-  | .uninit => true
-  | .aggregate 0 .nil => true
-  | .aggregate 0 (f :: fs) =>
-    Bool.and (isUnpopulatedFieldShell f) (isUnpopulatedFieldShell (.aggregate 0 fs))
-  | _ => false
+mutual
+  /--
+  True when `v` is `.unit`, `.uninit`, or an unpopulated intermediate shell
+  `.aggregate 0 fields` materialized by `ensureNestedFieldShells` (every slot is
+  `.unit`, `.uninit`, or recursively an unpopulated shell).
+
+  Reference (The Rust Reference 1.98.0, "Union types"):
+  <https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+  > "Unions have no notion of an \"active field\". Instead, every union access
+  > just interprets the storage as the type of the field used for the access."
+  -/
+  @[reducible]
+  def isUnpopulatedFieldShell : Value → Bool
+    | .unit => true
+    | .uninit => true
+    | .aggregate 0 fields => isUnpopulatedFieldShellList fields
+    | _ => false
+
+  /--
+  True when every element of `fields` satisfies `isUnpopulatedFieldShell`.
+
+  Reference (The Rust Reference 1.98.0, "Union types"):
+  <https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+  > "Unions have no notion of an \"active field\". Instead, every union access
+  > just interprets the storage as the type of the field used for the access."
+  -/
+  @[reducible]
+  def isUnpopulatedFieldShellList : List Value → Bool
+    | .nil => true
+    | f :: fs => Bool.and (isUnpopulatedFieldShell f) (isUnpopulatedFieldShellList fs)
+end
 
 /--
 True when every element of `vs` is `.unit` or `.uninit`.

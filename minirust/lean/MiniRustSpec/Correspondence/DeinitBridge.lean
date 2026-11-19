@@ -15,8 +15,9 @@ import MiniRustSpec.Correspondence.DeinitLemmas
 /-!
 # Projected `Deinit`: Anneal's `PartialShell` model and MiniRust's byte-slice `Uninit` store
 
-`Trusted.MirSemantics.evalStmt` keeps the value of a projected `Deinit` place (it only checks that
-the place is readable, `Statements.lean:2593-2600`), whereas MiniRust's `Statement::Deinit` stores
+`Trusted.MirSemantics.evalStmt` deinitializes non-union sub-places to `Value.uninit`
+(`deinitProjectedForLocal`), enforces Tree Borrows write invalidation and active-protector UB, and
+validates typed `deinitTailOk` on `.uninit` roots, while MiniRust's `Statement::Deinit` stores
 `AbstractByte::Uninit` over the place's byte slice and leaves every other byte intact.
 `crates/anneal-mir`'s projected `Deinit` (formalized as
 `Anneal.Mir.AdtAndControl.evalDeinitPlace`) explodes the local into a `PartialShell` whose
@@ -1583,19 +1584,27 @@ theorem adt_control_residual_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.deinitFieldSlot_niche_write_needs_setDiscriminant
   let _ := @Anneal.Mir.AdtAndControl.deinitFieldSlot_init_read_ok
   let _ := @Anneal.Mir.AdtAndControl.evalStmt_deinit_root_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_deinit_projected_refines
   let _ := @Anneal.Mir.AdtAndControl.evalStmt_deinit_projected_init_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_deinit_projected_init_iff
   let _ := @Anneal.Mir.AdtAndControl.evalStmt_deinit_projected_uninit_root_agrees
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_deinit_projected_uninit_iff
   let _ := @Anneal.Mir.AdtAndControl.evalValueProjRead_nil_eq_ok_iff
   let _ := @Anneal.Mir.AdtAndControl.readProjectedValue_nil_eq_ok_iff
   let _ := @Anneal.Mir.AdtAndControl.valueContainsUninit_eq_false_of_evalValueProjRead
   let _ := @Anneal.Mir.AdtAndControl.valueContainsUninit_eq_false_of_readProjectedValue
   let _ := @Anneal.Mir.AdtAndControl.valueContainsUninit_of_getElem?_false
   let _ := @Anneal.Mir.AdtAndControl.FieldListBelow.set_both
+  let _ := @Anneal.Mir.AdtAndControl.deinitTailOk_trusted_none_curTy_false
+  let _ := @Anneal.Mir.AdtAndControl.deinitTailOk_typed_eq_trusted
   let _ := @Anneal.Mir.AdtAndControl.deinitTailOk_implies_trusted
+  let _ := @Anneal.Mir.AdtAndControl.deinitProjectedValue_eq_untyped_of_deinitFieldSlot_init
   let _ := @Anneal.Mir.AdtAndControl.deinitFieldSlot_init_deinitProjectedValue
   let _ := @Anneal.Mir.AdtAndControl.deinitFieldSlot_below_deinitProjectedValue
   let _ := @Anneal.Mir.AdtAndControl.readProjectedValue_of_deinitFieldSlot_ub
   let _ := @Anneal.Mir.AdtAndControl.deinitProjectedValue_aggregate_shape
+  let _ := @Anneal.Mir.AdtAndControl.projListHasDeref_eq_projectionHasDeref
+  let _ := @Anneal.Mir.AdtAndControl.deinitFieldSlot_init_exact_iff_trusted
   let _ := @Anneal.Mir.AdtAndControl.fieldSlotInitWf_of_getElem?
   let _ := @Anneal.Mir.AdtAndControl.length_deinitBytes
   let _ := @Anneal.Mir.AdtAndControl.fieldBytes_frame
@@ -1738,7 +1747,10 @@ theorem adt_control_residual_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_index_oob_none
   let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_deref_none
   let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_projected_init_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_projected_init_iff
   let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_projected_uninit_agrees
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_projected_uninit_iff
+  let _ := @Anneal.Mir.AdtAndControl.StateCorr.jumpBorrows
   let _ := @Anneal.Mir.AdtAndControl.BodyCorr.toBodyCorrWithStmts
   let _ := @Anneal.Mir.AdtAndControl.stepMirFn_deinit_root_trustedRun
   let _ := @Anneal.Mir.AdtAndControl.stripUnitElems_append_unit

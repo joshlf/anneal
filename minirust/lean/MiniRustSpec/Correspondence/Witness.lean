@@ -13522,10 +13522,17 @@ theorem evalStmt_deinit_proj_deinits (s : MachineState) (decls : List LocalDecl)
     (span : String) (rootVal rootVal' : Value) (newLocals : List LocalSlot)
     (hs : s.frame.locals[i]? = some (.init rootVal))
     (hd : deinitProjectedForLocal s.frame.locals decls layouts i rootVal (pe :: rest) = .ok rootVal')
-    (hset : Trusted.Sequence.set? s.frame.locals i (.init rootVal') = some newLocals) :
+    (hset : Trusted.Sequence.set? s.frame.locals i (.init rootVal') = some newLocals)
+    (hbor : s.memory.borrows = [] := by rfl)
+    (hprot : s.memory.activeProtectors = [] := by rfl) :
     evalStmt s ⟨.deinit ⟨i, pe :: rest⟩, span⟩ decls layouts =
       MirStepNode.step (advanceStmt s newLocals) := by
-  simp [evalStmt, Trusted.Sequence.get?, hs, hd, hset]
+  cases pe with
+  | deref => simp [deinitProjectedForLocal, projListHasDeref] at hd
+  | _ =>
+    simp [evalStmt, Trusted.Sequence.get?, hs, hd, hset, hbor, hprot,
+      invalidateConflictingBorrowsAtProj, MirStepNode.step, advanceStmt]
+    cases hm : s.memory; simp_all
 
 /-- The ABI of a function with one `Padded(u8, u32, u16)` argument returning
 `u32`. -/

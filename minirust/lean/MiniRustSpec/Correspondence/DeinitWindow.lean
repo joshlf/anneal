@@ -953,10 +953,58 @@ theorem step_projDeinit {body : CapturedMir} {f : Gen.Function}
                     (hrel.stale.agree hnm').trans hsV
                   have hslotsA : SlotsOk body.layouts body.localDecls s.frame.locals :=
                     hrel.stale.slots hlo.slots
+                  have hbor_t : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ t := by
+                    have hCloseAux : ∀ (sts : List MirAst.Statement) (ps : List ProjectionElem),
+                        sts.foldl (holeAfter body) (some (t, ps)) = none →
+                        ∃ stC ∈ sts, ∃ ps' rvC, stC.kind = .assign ⟨t, ps'⟩ rvC := by
+                      intro sts
+                      induction sts with
+                      | nil => intro _ h; nomatch h
+                      | cons st1 sts1 ih1 =>
+                        intro ps h
+                        simp only [List.foldl_cons, holeAfter] at h
+                        cases hk1 : st1.kind with
+                        | assign dst1 rv1 =>
+                          rcases dst1 with ⟨t1, ps1⟩
+                          rw [hk1] at h
+                          by_cases hC : t1 = t ∧ holeRange body t1 ps1 = holeRange body t ps
+                          · exact ⟨st1, .head _, ps1, rv1, by rw [hk1, hC.1]⟩
+                          · simp only [hC, ↓reduceIte] at h
+                            obtain ⟨st2, hm2, ps2, rv2, hk2⟩ := ih1 ps h
+                            exact ⟨st2, .tail _ hm2, ps2, rv2, hk2⟩
+                        | _ =>
+                          rw [hk1] at h
+                          obtain ⟨st2, hm2, ps2, rv2, hk2⟩ := ih1 ps h
+                          exact ⟨st2, .tail _ hm2, ps2, rv2, hk2⟩
+                    have hEnd := (deinitWindowOk_spec hwin hbb).2
+                    have hStep1 : holeAt body s.frame.blockIdx (s.frame.stmtIdx + 1) =
+                        some (t, .field idx fTy :: rest) := by
+                      rw [holeAt_succ hbb hst, hh]; rfl
+                    simp only [holeAt, hbb, List.take_length] at hEnd hStep1
+                    have hSplit : bb.statements =
+                        bb.statements.take (s.frame.stmtIdx + 1) ++
+                        bb.statements.drop (s.frame.stmtIdx + 1) :=
+                      (List.take_append_drop (s.frame.stmtIdx + 1) bb.statements).symm
+                    rw [hSplit, List.foldl_append, hStep1] at hEnd
+                    obtain ⟨stC, hmemDrop, ps', rvC, hkC⟩ :=
+                      hCloseAux (bb.statements.drop (s.frame.stmtIdx + 1)) (.field idx fTy :: rest) hEnd
+                    have hmemBB : stC ∈ bb.statements := List.mem_of_mem_drop hmemDrop
+                    have hmemErased : stC ∈ (eraseDeinitBlock bb).statements := by
+                      simp only [eraseDeinitBlock, List.mem_map]
+                      exact ⟨stC, hmemBB, by simp [eraseDeinitStmt, hkC]⟩
+                    have hbbErased : eraseDeinitBlock bb ∈ (eraseDeinit body).basicBlocks :=
+                      List.mem_of_getElem? (eraseDeinit_block hbb)
+                    obtain ⟨hpa, _⟩ := inFragment_ptr (eraseDeinit body) hfrag
+                    obtain ⟨_, hpresAll, _⟩ := ptrAliasingOk_spec hpa
+                    have hnotAddr : t ∉ bodyAddrTakenLocals (eraseDeinit body) :=
+                      (stmtPreservesAddrTaken_not_target
+                        ((hpresAll (eraseDeinitBlock bb) hbbErased).1 stC hmemErased)).1
+                        ⟨t, ps'⟩ rvC hkC
+                    exact hbo.target_ne_of_not_addrTaken hnotAddr
                   -- Anneal: the projected `Deinit` overwrites the field with `Value.uninit`.
                   obtain ⟨deinitValU, hwU, _, hevalA⟩ :=
                     DeinitBridge.evalStmt_deinit_field s body.localDecls t d fields size align off
-                      (.scalar it) (.field idx fTy) rest span rootVal hd ht hslotsA hsA hres
+                      (.scalar it) (.field idx fTy) rest span rootVal hd ht hslotsA hsA hres hbor_t
                   rw [stepMirFn_stmt body s bb _ hrel.activeCallee hphase hbb hst, hevalA]
                   -- MiniRust: `Deinit` stores `Uninit` over the field's bytes.
                   obtain ⟨tb, htb, hgetb⟩ := (translateFn_spec body f hf).2.2 _ bb hbb
@@ -1798,8 +1846,12 @@ private theorem stepMirFn_reinit_setLocalVal {body : CapturedMir} {s0 : MachineS
   have hwdumH : writeFieldPath deinitVal (.field idx fTy :: rest) (.scalar ⟨0, it.size.bytes⟩) =
       some dumRoot := (hsame (.scalar ⟨0, it.size.bytes⟩)).1.trans hwdum0
   have hshell0 := ensureNestedFieldShells_eq_self_of_populated _ _
+    body.localDecls body.layouts
+    (MirSemantics.placeTy body.localDecls body.layouts { local_ := t, projection := .nil })
     (fieldShellChainPopulated_of_writeFieldPath _ _ _ _ hwdum0)
   have hshellH := ensureNestedFieldShells_eq_self_of_populated _ _
+    body.localDecls body.layouts
+    (MirSemantics.placeTy body.localDecls body.layouts { local_ := t, projection := .nil })
     (fieldShellChainPopulated_of_writeFieldPath _ _ _ _ hwdumH)
   have hlt : t < s0.frame.locals.length := (List.getElem?_eq_some_iff.mp hs0).1
   have hnu := placeTouchesUnion_false_of_tupleTypeOf body.localDecls ht ⟨t, .field idx fTy :: rest⟩

@@ -2325,7 +2325,14 @@ def symStepTermConcrete
       | .some (.concrete .dead) => .none
       | .some _ =>
         match set? st.slots place.local_ (.concrete .uninit) with
-        | .some slots' => .some { st with blockIdx := target, stmtIdx := 0, slots := slots' }
+        | .some slots' =>
+          .some {
+            st with
+            blockIdx := target
+            stmtIdx := 0
+            slots := slots'
+            borrows := invalidateConflictingBorrows st.borrows place.local_ .none
+          }
         | .none => .none
     | _ :: _ => .none
   | .switchInt discr targets =>
@@ -2618,7 +2625,7 @@ theorem symStepTermConcrete_sound
         | cons _ _ => nomatch h
         | nil =>
           dsimp only [symStepTermConcrete] at h
-          dsimp only [evalTerminator, concretizeSymState]
+          dsimp only [evalTerminator, concretizeSymState, concretizeSymMemory]
           rw [get?_concretizeSymSlots args st.slots loc]
           cases hGet : get? st.slots loc with
           | none =>

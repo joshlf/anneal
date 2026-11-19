@@ -3556,8 +3556,7 @@ theorem pureAdtMultiBlock_pureConverges
         (PureState.toMachineState { bb := 0, stmtIdx := 4, env := env4 } emptyMemory) := by
     unfold evalStmt evalRvalue evalPlaceDiscriminant
     simp only [env3, env4, PureState.toMachineState, pureAdtMultiBlockBody, emptyMemory, get?, set?,
-      advanceStmt, invalidateConflictingBorrows, h_init, List.getElem?_cons_succ,
-      List.getElem?_cons_zero]
+      advanceStmt, h_init, List.getElem?_cons_succ, List.getElem?_cons_zero]
     rfl
   unfold wpMirExecSym
   rw [evalSymNodeTree_eq, stepMirExecSymTree_eval]

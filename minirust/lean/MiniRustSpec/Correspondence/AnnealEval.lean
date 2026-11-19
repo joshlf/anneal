@@ -5020,6 +5020,21 @@ theorem invalidateConflictingBorrowsAtProj_of_ne (borrows : List BorrowEntry) (l
     simp [invalidateConflictingBorrowsAtProj, updateBorrowPermAtProj, hne,
       ih (fun e he => h e (.tail _ he))]
 
+theorem hasProtectedWriteConflict_of_ne (borrows : List BorrowEntry)
+    (activeProtectors : List Nat) (loc : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (writeRangeOff : Nat := 0) (writeRangeLen : Nat := 0)
+    (h : ∀ e ∈ borrows, e.targetLocal ≠ loc) :
+    ∀ (targetFrameDepth : Nat),
+      hasProtectedWriteConflict borrows activeProtectors loc writerTag writeProj
+        writeRangeOff writeRangeLen targetFrameDepth = false := by
+  intro targetFrameDepth
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    have hne : Nat.beq entry.targetLocal loc = false := by
+      rw [nat_beq_eq_decide, decide_eq_false (h entry (.head _))]
+    simp [hasProtectedWriteConflict, hne, ih (fun e he => h e (.tail _ he))]
+
 /-- A successful fragment field-path write (`writeFieldPath`) traverses only
 present, non-`.unit` intermediate aggregate fields, so the projected
 assignment's `D13b` shell materialization (`ensureNestedFieldShells`) leaves the
@@ -5109,17 +5124,19 @@ theorem fieldShellChainPopulated_of_readFieldPath :
 
 /-- Any well-formed `TupleSpec` root value (`rootSpec.valOk rootVal = true`) has
 every intermediate field shell along a valid `resolveFieldPath` already populated,
-so `ensureNestedFieldShells rootVal projs = rootVal` even before `writeFieldPath`
-is evaluated. -/
+so `ensureNestedFieldShells` returns `.some rootVal` unchanged even before
+`writeFieldPath` is evaluated. -/
 theorem fieldShellChainPopulated_of_resolveFieldPath {layouts : Layout.LayoutTable}
     {rootSpec leafSpec : TupleSpec} {projs : List ProjectionElem} {totalOff : Nat} {rootVal : Value}
     (hwf : rootSpec.wf = true) (hval : rootSpec.valOk rootVal = true)
     (hres : resolveFieldPath layouts rootSpec projs = some (totalOff, leafSpec)) :
     fieldShellChainPopulated rootVal projs = true ∧
-    ensureNestedFieldShells rootVal projs = rootVal := by
+    ∀ (decls : List LocalDecl) (lt : Layout.LayoutTable) (curTyOpt : Option MirAst.Ty),
+      ensureNestedFieldShells rootVal projs decls lt curTyOpt = .some rootVal := by
   obtain ⟨leafVal, hread, _, _, _⟩ := resolveFieldPath_read hwf hval hres
   have hpop := fieldShellChainPopulated_of_readFieldPath projs rootVal leafVal hread
-  exact ⟨hpop, ensureNestedFieldShells_eq_self_of_populated _ _ hpop⟩
+  exact ⟨hpop, fun decls lt curTyOpt =>
+    ensureNestedFieldShells_eq_self_of_populated _ _ decls lt curTyOpt hpop⟩
 
 /-- Anneal's assignment to a live local `_i` from an rvalue that evaluates to
 a scalar (or to UB). -/
@@ -5358,8 +5375,10 @@ theorem evalStmt_assign_tuple (s : MachineState) (decls : List LocalDecl) (layou
       cases p with
       | field idx fieldTy =>
         have hw := hwsem s.frame.locals
-        have hshell := ensureNestedFieldShells_eq_self_of_populated _ _
-          (fieldShellChainPopulated_of_writeFieldPath _ _ _ _ hwpath)
+        have hshell : ∀ curTyOpt, ensureNestedFieldShells rootVal (.field idx fieldTy :: rest) decls layouts curTyOpt =
+            .some rootVal :=
+          fun curTyOpt => ensureNestedFieldShells_eq_self_of_populated _ _ decls layouts curTyOpt
+            (fieldShellChainPopulated_of_writeFieldPath _ _ _ _ hwpath)
         have hinv : ∀ pr d, invalidateConflictingBorrowsAtProj s.memory.borrows i .none pr 0 0 d =
             s.memory.borrows :=
           fun pr d => invalidateConflictingBorrowsAtProj_of_ne s.memory.borrows i .none pr 0 0 hbor d
@@ -5553,8 +5572,10 @@ theorem evalStmt_assign_field_scalar (s : MachineState) (decls : List LocalDecl)
   refine ⟨fun r newRootVal hr hwpath hwsem => ?_, fun hnone => ?_⟩
   · have hnu := placeTouchesUnion_false_of_writeFieldPath_slotOk hslots hi hsl hwpath
     have hw := hwsem s.frame.locals
-    have hshell := ensureNestedFieldShells_eq_self_of_populated _ _
-      (fieldShellChainPopulated_of_writeFieldPath _ _ _ _ hwpath)
+    have hshell : ∀ curTyOpt, ensureNestedFieldShells rootVal (.field idx fieldTy :: rest) decls layouts curTyOpt =
+        .some rootVal :=
+      fun curTyOpt => ensureNestedFieldShells_eq_self_of_populated _ _ decls layouts curTyOpt
+        (fieldShellChainPopulated_of_writeFieldPath _ _ _ _ hwpath)
     have hinv : ∀ pr d, invalidateConflictingBorrowsAtProj s.memory.borrows i .none pr 0 0 d =
         s.memory.borrows :=
       fun pr d => invalidateConflictingBorrowsAtProj_of_ne s.memory.borrows i .none pr 0 0 hbor d
@@ -5853,22 +5874,43 @@ theorem evalStmt_storageDead_nil_borrows (s : MachineState) (decls : List LocalD
       .tau (.running (advanceStmt s (s.frame.locals.set i .dead))) :=
   evalStmt_storageDead s decls layouts i span hi (by rw [hbor]; intro _ h; cases h)
 
-/-- Anneal's `Deinit(_i)` of a root local: the slot of a live local becomes
-`.uninit`; a dead local is UB. -/
+/-- Anneal's `Deinit(_i)` of a root local that no borrow targets: the slot of a
+live local becomes `.uninit` with unchanged memory; a dead local is UB. -/
 theorem evalStmt_deinit (s : MachineState) (decls : List LocalDecl)
-    (layouts : Layout.LayoutTable) (i : Nat) (span : String) (hi : i < s.frame.locals.length) :
+    (layouts : Layout.LayoutTable) (i : Nat) (span : String) (hi : i < s.frame.locals.length)
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) :
     (s.frame.locals[i]? ≠ some .dead →
       evalStmt s ⟨.deinit ⟨i, []⟩, span⟩ decls layouts =
         .tau (.running (advanceStmt s (s.frame.locals.set i .uninit)))) ∧
     (s.frame.locals[i]? = some .dead →
       evalStmt s ⟨.deinit ⟨i, []⟩, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hi]
+  have hinv := invalidateConflictingBorrows_of_ne s.memory.borrows i .none hbor
+    (length s.memory.callStack)
   refine ⟨fun hlive => ?_, fun hdead => ?_⟩
   · simp only [evalStmt, get?, hs]
     cases hsl : s.frame.locals[i] with
     | dead => rw [hsl] at hs; exact absurd hs hlive
-    | uninit => simp [set?, hi, MirStepNode.step]
-    | init v => simp [set?, hi, MirStepNode.step]
+    | uninit =>
+      cases hp : s.memory.activeProtectors with
+      | nil =>
+        simp [set?, hi, hinv, MirStepNode.step, advanceStmt, memory_mk_nil_prot s.memory hp]
+      | cons p0 ps0 =>
+        have hconf := hasProtectedWriteConflict_of_ne s.memory.borrows (p0 :: ps0) i .none .nil 0 0
+          hbor (length s.memory.callStack)
+        have hmem : { s.memory with borrows := s.memory.borrows, activeProtectors := p0 :: ps0 } = s.memory := by
+          rw [← hp]
+        simp [set?, hi, hconf, hinv, MirStepNode.step, advanceStmt, hmem]
+    | init v =>
+      cases hp : s.memory.activeProtectors with
+      | nil =>
+        simp [set?, hi, hinv, MirStepNode.step, advanceStmt, memory_mk_nil_prot s.memory hp]
+      | cons p0 ps0 =>
+        have hconf := hasProtectedWriteConflict_of_ne s.memory.borrows (p0 :: ps0) i .none .nil 0 0
+          hbor (length s.memory.callStack)
+        have hmem : { s.memory with borrows := s.memory.borrows, activeProtectors := p0 :: ps0 } = s.memory := by
+          rw [← hp]
+        simp [set?, hi, hconf, hinv, MirStepNode.step, advanceStmt, hmem]
   · simp [evalStmt, get?, hdead]
 
 /-- Anneal's `PlaceMention` of a place based on a dead local is UB. -/

@@ -345,7 +345,8 @@ theorem resolveFieldPath_deinit_uninit {layouts : Trusted.Rustc.V2026_06_01.Layo
         writeFieldPath rVal projs' .uninit = some dVal ∧
         rSpec.encodeVal dVal =
           spliceAt (rSpec.encodeVal rVal) tOff (leafSpec.encodeVal .uninit) ∧
-        ∀ locals, deinitProjectedValue locals rVal projs' = .ok dVal := by
+        ∀ locals decls' layouts' curTyOpt,
+          deinitProjectedValue locals rVal projs' decls' layouts' curTyOpt = .ok dVal := by
     intro projs'
     induction projs' with
     | nil =>
@@ -354,7 +355,7 @@ theorem resolveFieldPath_deinit_uninit {layouts : Trusted.Rustc.V2026_06_01.Layo
       rcases hrRes with ⟨rfl, rfl⟩
       have hlen1 := TupleSpec.encodeVal_length rSpec rVal hrWf
       have hlen2 := TupleSpec.encodeVal_length rSpec .uninit hrWf
-      refine ⟨.uninit, rfl, ?_, fun _ => rfl⟩
+      refine ⟨.uninit, rfl, ?_, fun _ _ _ _ => rfl⟩
       rw [spliceAt_zero_full _ _ (by omega)]
     | cons p rest ih =>
       intro rSpec tOff rVal hrWf hrVal hrRes
@@ -411,17 +412,17 @@ theorem resolveFieldPath_deinit_uninit {layouts : Trusted.Rustc.V2026_06_01.Layo
                           (TupleSpec.encodeFields fields vals (List.replicate size .Uninit))
                           off subSpec.size restOff (leafSpec'.encodeVal .uninit)
                           (by omega) (by omega)
-                      · intro locals
+                      · intro locals decls' layouts' curTyOpt
                         have hfv' : vals[idx] = fv :=
                           Option.some.inj (by rw [← hfv, List.getElem?_eq_getElem hidx_lt])
                         simp [deinitProjectedValue, Trusted.Sequence.get?, Trusted.Sequence.set?,
-                          hidx_lt, hfv', hprojDeinit locals]
+                          hidx_lt, hfv', hprojDeinit locals decls' layouts']
                     | succ _ => simp [TupleSpec.valOk] at hrVal
                   | _ => simp [TupleSpec.valOk] at hrVal
               · simp [heq] at hrRes
         | _ => simp [resolveFieldPath] at hrRes
   obtain ⟨deinitVal, hwUninit, hEncUninit, hDeinit⟩ := hEnc projs rootSpec totalOff rootVal hwf hval hres
-  refine ⟨deinitVal, hwUninit, ?_, hDeinit, fun newLeafVal hnew => ?_⟩
+  refine ⟨deinitVal, hwUninit, ?_, fun locals => hDeinit locals .nil emptyLayoutTable .none, fun newLeafVal hnew => ?_⟩
   · rw [hEncUninit, TupleSpec.encodeVal_uninit]
   · obtain ⟨newRootVal, hwNew, hnewOk, hnewEnc, _⟩ := resolveFieldPath_write hwf hval hres hnew
     have hwIdem := writeFieldPath_idem projs rootVal deinitVal .uninit newLeafVal hwUninit
@@ -447,7 +448,8 @@ theorem evalStmt_deinit_field {layouts : Trusted.Rustc.V2026_06_01.Layout.Layout
     (hslots : SlotsOk layouts decls s.frame.locals)
     (hs : s.frame.locals[i]? = some (.init rootVal))
     (hres : resolveFieldPath layouts (.tuple rootFields rootSize rootAlign) (proj :: rest) =
-      some (totalOff, leafSpec)) :
+      some (totalOff, leafSpec))
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) :
     ∃ deinitVal,
       writeFieldPath rootVal (proj :: rest) .uninit = some deinitVal ∧
       (TupleSpec.tuple rootFields rootSize rootAlign).encodeVal deinitVal =
@@ -456,14 +458,100 @@ theorem evalStmt_deinit_field {layouts : Trusted.Rustc.V2026_06_01.Layout.Layout
       evalStmt s ⟨.deinit ⟨i, proj :: rest⟩, span⟩ decls layouts =
         .tau (.running (advanceStmt s (s.frame.locals.set i (.init deinitVal)))) := by
   obtain ⟨hwf, hval⟩ := (DeclSlotOk_of_tupleTypeOf ht (.init rootVal)).mp (hslots i d (.init rootVal) hd hs)
+  have hdeinitTyped : ∀ (projs' : List ProjectionElem) (rSpec : TupleSpec) (tOff : Nat) (rVal : Value),
+      rSpec.wf = true → rSpec.valOk rVal = true →
+      resolveFieldPath layouts rSpec projs' = some (tOff, leafSpec) →
+      ∀ (curTyOpt : Option Trusted.Rustc.V2026_06_01.MirAst.Ty),
+        deinitProjectedValue s.frame.locals rVal projs' decls layouts curTyOpt =
+          deinitProjectedValue s.frame.locals rVal projs' := by
+    intro projs'
+    induction projs' with
+    | nil => intros _ _ rVal _ _ _ _; cases rVal <;> rfl
+    | cons p tl ih =>
+      intro rSpec tOff rVal hrWf hrVal hrRes curTyOpt
+      cases rSpec with
+      | scalar _ => cases p <;> simp [resolveFieldPath] at hrRes
+      | tuple fields size align =>
+        cases p with
+        | field idx fieldTy =>
+          simp only [resolveFieldPath, Option.bind_eq_bind] at hrRes
+          cases hf : fields[idx]? with
+          | none => simp [hf] at hrRes
+          | some pair =>
+            obtain ⟨off, subSpec⟩ := pair
+            simp only [hf, Option.bind_some] at hrRes
+            cases hexp : specOfRigidTy layouts fieldTy.kind fieldTy.layoutIdx with
+            | none => simp [hexp] at hrRes
+            | some expectedSpec =>
+              simp only [hexp, Option.bind_some] at hrRes
+              by_cases heq : subSpec = expectedSpec
+              · simp only [heq, ↓reduceIte] at hrRes
+                cases hrest : resolveFieldPath layouts expectedSpec tl with
+                | none => simp [hrest] at hrRes
+                | some rpair =>
+                  obtain ⟨restOff, leafSpec'⟩ := rpair
+                  simp [hrest] at hrRes
+                  rcases hrRes with ⟨rfl, rfl⟩
+                  subst heq
+                  cases rVal with
+                  | aggregate vIdx vals =>
+                    cases vIdx with
+                    | zero =>
+                      simp only [TupleSpec.wf, Bool.and_eq_true, decide_eq_true_eq] at hrWf
+                      simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hrVal
+                      obtain ⟨fv, hfv, hfvOk⟩ := TupleSpec.fieldsValOk_getElem? hrVal.2 hf
+                      have hslice := TupleSpec.encodeFields_field_slice size align fields vals
+                        (List.replicate size .Uninit) idx off subSpec fv hrWf.2 (by simp) hf hfv
+                      have hidx_lt : idx < vals.length := (List.getElem?_eq_some_iff.mp hfv).1
+                      have hfv' : vals[idx] = fv :=
+                        Option.some.inj (by rw [← hfv, List.getElem?_eq_getElem hidx_lt])
+                      have ihEq := ih subSpec restOff fv hslice.1 hfvOk hrest
+                      cases curTyOpt <;>
+                        simp [deinitProjectedValue, Trusted.Sequence.get?, hidx_lt, hfv', ihEq]
+                    | succ _ => simp [TupleSpec.valOk] at hrVal
+                  | _ => simp [TupleSpec.valOk] at hrVal
+              · simp [heq] at hrRes
+        | _ => simp [resolveFieldPath] at hrRes
   obtain ⟨deinitVal, hw, henc, hdeinit, _⟩ := resolveFieldPath_deinit_uninit hwf hval hres
   have hi_lt : i < s.frame.locals.length := (List.getElem?_eq_some_iff.mp hs).1
   have hElem : s.frame.locals[i]'hi_lt = .init rootVal :=
     Option.some.inj ((List.getElem?_eq_getElem hi_lt).symm.trans hs)
   have hnu := placeTouchesUnion_false_of_tupleTypeOf decls ht ⟨i, proj :: rest⟩
+  have hf := resolveFieldPath_allFields hres
+  have hpd : projListHasDeref (proj :: rest) = false := by
+    revert hf
+    generalize proj :: rest = ps
+    intro hf
+    induction ps with
+    | nil => rfl
+    | cons p rs ih => cases p <;> simp_all [allFields, projListHasDeref]
+  have hdp : deinitProjectedForLocal s.frame.locals decls layouts i rootVal (proj :: rest) =
+      .ok deinitVal := by
+    unfold deinitProjectedForLocal
+    rw [hpd, hnu]
+    dsimp only
+    rw [hdeinitTyped (proj :: rest) (.tuple rootFields rootSize rootAlign) totalOff rootVal
+      hwf hval hres]
+    exact hdeinit s.frame.locals
+  have hinv := invalidateConflictingBorrowsAtProj_of_ne s.memory.borrows i .none
+    (resolveBorrowWriteLocalProj decls layouts s.frame.locals i (proj :: rest)) 0 0 hbor
+    (Trusted.Sequence.length s.memory.callStack)
   refine ⟨deinitVal, hw, henc, ?_⟩
-  simp [evalStmt, deinitProjectedForLocal, hnu, Trusted.Sequence.get?, Trusted.Sequence.set?,
-    hi_lt, hElem, hdeinit s.frame.locals, MirStepNode.step]
+  cases proj with
+  | field fIdx fTy =>
+    cases hp : s.memory.activeProtectors with
+    | nil =>
+      simp [evalStmt, hdp, Trusted.Sequence.get?, Trusted.Sequence.set?,
+        hi_lt, hElem, hinv, MirStepNode.step, advanceStmt]
+      cases hm : s.memory; simp_all
+    | cons p0 ps0 =>
+      have hconf := hasProtectedWriteConflict_of_ne s.memory.borrows (p0 :: ps0) i .none
+        (resolveBorrowWriteLocalProj decls layouts s.frame.locals i (.field fIdx fTy :: rest)) 0 0 hbor
+        (Trusted.Sequence.length s.memory.callStack)
+      simp [evalStmt, hdp, Trusted.Sequence.get?, Trusted.Sequence.set?,
+        hi_lt, hElem, hinv, MirStepNode.step, advanceStmt]
+      cases hm : s.memory; simp_all
+  | _ => simp [allFields] at hf
 
 private theorem scalar_wf_size_pos {it : Gen.IntType} (hwf : (TupleSpec.scalar it).wf = true) :
     0 < it.size.bytes := by
