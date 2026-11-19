@@ -736,10 +736,41 @@ theorem isDefined.isGapFree {isUB : Fault → Prop}
   | gap g => exact h
 
 @[simp]
+theorem map_id (m : OutcomeWithGap Fault Gap Val) :
+    m.map id = m := by
+  cases m <;> rfl
+
+@[simp]
+theorem mapFault_id (m : OutcomeWithGap Fault Gap Val) :
+    m.mapFault id = m := by
+  cases m <;> rfl
+
+@[simp]
+theorem mapGap_id (m : OutcomeWithGap Fault Gap Val) :
+    m.mapGap id = m := by
+  cases m <;> rfl
+
+@[simp]
 theorem isDefined_map_iff {Val' : Type uV'} {isUB : Fault → Prop}
     (f : Val → Val') (m : OutcomeWithGap Fault Gap Val) :
     (m.map f).isDefined isUB ↔ m.isDefined isUB := by
   cases m <;> exact Iff.rfl
+
+@[simp]
+theorem isDefined_mapGap_iff {Gap' : Type uG'} {isUB : Fault → Prop}
+    (f : Gap → Gap') (m : OutcomeWithGap Fault Gap Val) :
+    (m.mapGap f).isDefined isUB ↔ m.isDefined isUB := by
+  cases m <;> exact Iff.rfl
+
+theorem isDefined_mapFault_iff {Fault' : Type uF'}
+    {isUB : Fault → Prop} {isUB' : Fault' → Prop} {f : Fault → Fault'}
+    (hf : ∀ e, isUB' (f e) ↔ isUB e) (m : OutcomeWithGap Fault Gap Val) :
+    (m.mapFault f).isDefined isUB' ↔ m.isDefined isUB := by
+  cases m with
+  | ok _ => exact Iff.rfl
+  | fault e =>
+    exact ⟨fun h he => h ((hf e).mpr he), fun h he' => h ((hf e).mp he')⟩
+  | gap _ => exact Iff.rfl
 
 theorem isDefined_bind_iff {Val' : Type uV'} {isUB : Fault → Prop}
     (m : OutcomeWithGap Fault Gap Val)
@@ -1199,6 +1230,62 @@ theorem mapFault_congr {FaultB₁ : Type uF''} {FaultB₂ : Type uP}
     | exact hf _ _ hm
     | exact hm
     | exact False.elim hm
+
+/--
+Because `GapForbidEq` forbids gaps altogether, remapping gap tags with arbitrary
+functions `f₁` and `f₂` (even non-injective ones) preserves `GapForbidEq` iff.
+-/
+@[simp]
+theorem mapGap_iff {GapB₁ : Type uG''} {GapB₂ : Type uP}
+    (f₁ : Gap₁ → GapB₁) (f₂ : Gap₂ → GapB₂)
+    {m₁ : OutcomeWithGap Fault₁ Gap₁ Val₁} {m₂ : OutcomeWithGap Fault₂ Gap₂ Val₂} :
+    GapForbidEq rVal rFault (m₁.mapGap f₁) (m₂.mapGap f₂) ↔
+      GapForbidEq rVal rFault m₁ m₂ := by
+  cases m₁ <;> cases m₂ <;> exact Iff.rfl
+
+theorem ok_iff {v₁ : Val₁} {o₂ : OutcomeWithGap Fault₂ Gap₂ Val₂} :
+    GapForbidEq (Gap₁ := Gap₁) rVal rFault (.ok v₁) o₂ ↔
+      ∃ v₂, o₂ = .ok v₂ ∧ rVal v₁ v₂ := by
+  cases o₂ with
+  | ok v => exact ⟨fun h => ⟨v, rfl, h⟩, fun ⟨_, h, hr⟩ => by cases h; exact hr⟩
+  | fault _ => exact ⟨False.elim, fun ⟨_, h, _⟩ => by cases h⟩
+  | gap _ => exact ⟨False.elim, fun ⟨_, h, _⟩ => by cases h⟩
+
+theorem ok_iff_right {v₂ : Val₂} {o₁ : OutcomeWithGap Fault₁ Gap₁ Val₁} :
+    GapForbidEq (Gap₂ := Gap₂) rVal rFault o₁ (.ok v₂) ↔
+      ∃ v₁, o₁ = .ok v₁ ∧ rVal v₁ v₂ := by
+  cases o₁ with
+  | ok v => exact ⟨fun h => ⟨v, rfl, h⟩, fun ⟨_, h, hr⟩ => by cases h; exact hr⟩
+  | fault _ => exact ⟨False.elim, fun ⟨_, h, _⟩ => by cases h⟩
+  | gap _ => exact ⟨False.elim, fun ⟨_, h, _⟩ => by cases h⟩
+
+theorem fault_iff {e₁ : Fault₁} {o₂ : OutcomeWithGap Fault₂ Gap₂ Val₂} :
+    GapForbidEq (Gap₁ := Gap₁) rVal rFault (.fault e₁) o₂ ↔
+      ∃ e₂, o₂ = .fault e₂ ∧ rFault e₁ e₂ := by
+  cases o₂ with
+  | ok _ => exact ⟨False.elim, fun ⟨_, h, _⟩ => by cases h⟩
+  | fault e => exact ⟨fun h => ⟨e, rfl, h⟩, fun ⟨_, h, hr⟩ => by cases h; exact hr⟩
+  | gap _ => exact ⟨False.elim, fun ⟨_, h, _⟩ => by cases h⟩
+
+theorem fault_iff_right {e₂ : Fault₂} {o₁ : OutcomeWithGap Fault₁ Gap₁ Val₁} :
+    GapForbidEq (Gap₂ := Gap₂) rVal rFault o₁ (.fault e₂) ↔
+      ∃ e₁, o₁ = .fault e₁ ∧ rFault e₁ e₂ := by
+  cases o₁ with
+  | ok _ => exact ⟨False.elim, fun ⟨_, h, _⟩ => by cases h⟩
+  | fault e => exact ⟨fun h => ⟨e, rfl, h⟩, fun ⟨_, h, hr⟩ => by cases h; exact hr⟩
+  | gap _ => exact ⟨False.elim, fun ⟨_, h, _⟩ => by cases h⟩
+
+theorem eq_iff {Fault : Type uF} {Gap : Type uG} {Val : Type uV}
+    {o₁ o₂ : OutcomeWithGap Fault Gap Val} :
+    GapForbidEq (· = ·) (· = ·) o₁ o₂ ↔ o₁ = o₂ ∧ o₁.isGapFree := by
+  constructor
+  · intro h
+    cases o₁ <;> cases o₂ <;> first | exact ⟨congrArg _ h, trivial⟩ | exact False.elim h
+  · rintro ⟨rfl, hgf⟩
+    cases o₁ with
+    | ok _ => rfl
+    | fault _ => rfl
+    | gap _ => exact False.elim hgf
 
 theorem isDefined_iff {isUB₁ : Fault₁ → Prop} {isUB₂ : Fault₂ → Prop}
     (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
@@ -2824,6 +2911,143 @@ theorem ProgramEquiv.toValExactPass_eq {Prog₁ : Type uP} {Prog₂ : Type uP'}
     obtain ⟨v₁, rfl⟩ := h₁ ho₁
     cases (hr : v₁ = v₂)
     exact ho₁
+
+/--
+`OutcomeSet.bind S k` admits only normal values iff `S` admits only normal
+values and every continuation `k v` for `S (.ok v)` admits only normal values.
+-/
+theorem OutcomeSet.onlyValues_bind_iff {ValB₁ : Type uV''}
+    {S : OutcomeSet Fault₁ Gap₁ Val₁}
+    {k : Val₁ → OutcomeSet Fault₁ Gap₁ ValB₁} :
+    OutcomeSet.OnlyValues (OutcomeSet.bind S k) ↔
+      OutcomeSet.OnlyValues S ∧
+        ∀ v, S (.ok v) → OutcomeSet.OnlyValues (k v) := by
+  constructor
+  · intro h
+    refine ⟨fun m hm => ?_, fun v hv o ho => h ⟨.ok v, hv, ho⟩⟩
+    cases m with
+    | ok v => exact ⟨v, rfl⟩
+    | fault e =>
+      obtain ⟨w, hw⟩ := h ⟨.fault e, hm, rfl⟩
+      cases hw
+    | gap g =>
+      obtain ⟨w, hw⟩ := h ⟨.gap g, hm, rfl⟩
+      cases hw
+  · rintro ⟨hS, hk⟩ o ⟨m, hm, ho⟩
+    obtain ⟨v, rfl⟩ := hS hm
+    exact hk v hm ho
+
+/--
+Exact-value `ContextEquiv` across arbitrary `Fault₁`, `Fault₂` and arbitrary
+`rFault` induces an identity-observation `ExactPass` on `valSemantics`, WITHOUT
+requiring global gap-freedom (`ProgramEquiv`): on queries where either side hits
+a gap or fault, both `valSemantics` projections are `Partial.ub` (`⊤`), while on
+queries where one side returns only values, `ContextEquiv` forces the other side
+to be gap-free, fault-free, and value-identical.
+-/
+theorem ContextEquiv.toValExactPass_eq {Prog₁ : Type uP} {Prog₂ : Type uP'}
+    {Gap : Type uG} {Val : Type uV}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap Val}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap Val}
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ContextEquiv (· = ·) rFault (sem₁ p₁) (sem₂ p₂)) :
+    ExactPass (valSemantics sem₁) (valSemantics sem₂) id id p₁ p₂ where
+  up_refines _ q h₂ := by
+    refine ⟨(h q).onlyValues_iff.mpr h₂, fun v₁ hv₁ => ?_⟩
+    obtain ⟨o₂, ho₂, hr⟩ := (h q).forward hv₁
+    obtain ⟨v₂, rfl⟩ := h₂ ho₂
+    cases (hr : v₁ = v₂)
+    exact ho₂
+  down_refines _ q h₁ := by
+    refine ⟨(h q).onlyValues_iff.mp h₁, fun v₂ hv₂ => ?_⟩
+    obtain ⟨o₁, ho₁, hr⟩ := (h q).backward hv₂
+    obtain ⟨v₁, rfl⟩ := h₁ ho₁
+    cases (hr : v₁ = v₂)
+    exact ho₁
+
+/-- Layer 1A `Compiles` on `valLanguage` induced by exact-value `ContextEquiv`. -/
+theorem ContextEquiv.valCompiles_eq
+    {Prog₁ Prog₂ Query Fault₁ Fault₂ Gap Val : Type}
+    {rFault : Fault₁ → Fault₂ → Prop}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap Val}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap Val}
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ContextEquiv (· = ·) rFault (sem₁ p₁) (sem₂ p₂)) :
+    Compiles (valLanguage sem₁) (valLanguage sem₂) id p₁ p₂ :=
+  (h.toValExactPass_eq).down_refines trivial
+
+/--
+Transfer any Layer 1A specification (such as `Language.ContractSpec safetyPre
+funcPre post` scoped to the gap-free queries `safetyPre`) across `valLanguage`
+along an exact-value `ContextEquiv`, even when both programs hit shared gaps
+outside `safetyPre`.
+-/
+theorem ContextEquiv.valTransfer_spec
+    {Prog₁ Prog₂ Query Fault₁ Fault₂ Gap Val : Type}
+    {rFault : Fault₁ → Fault₂ → Prop}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap Val}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap Val}
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ContextEquiv (· = ·) rFault (sem₁ p₁) (sem₂ p₂))
+    {spec : (valLanguage sem₁).Behavior}
+    (h₁ : (valLanguage sem₁).sem p₁ ≤ spec) :
+    (valLanguage sem₂).sem p₂ ≤ spec :=
+  fun q hspec =>
+    let ⟨hd₁, hle₁⟩ := h₁ q hspec
+    let ⟨hd₂, hle₂⟩ := (h.valCompiles_eq) q hd₁
+    ⟨hd₂, fun v hv => hle₁ v (hle₂ v hv)⟩
+
+/-- At least one outcome is admitted by `S` (non-empty / terminating behavior set). -/
+def OutcomeSet.Terminates (S : OutcomeSet Fault₁ Gap₁ Val₁) : Prop :=
+  ∃ o, S o
+
+/-- Total definedness: non-empty AND every reachable outcome is gap-free and non-UB. -/
+def OutcomeSet.TotalDefined (isUB : Fault₁ → Prop)
+    (S : OutcomeSet Fault₁ Gap₁ Val₁) : Prop :=
+  S.Terminates ∧ S.Defined isUB
+
+/--
+Any `OutcomeSetEquiv` preserves non-emptiness (`Terminates`) in both directions:
+a diverging empty behavior set is never equivalent to a terminating, faulting,
+or gapping behavior set.
+-/
+theorem OutcomeSetEquiv.terminates_iff {α : Type uV} {β : Type uV'}
+    {R : α → β → Prop} {S₁ : BehaviorSet α} {S₂ : BehaviorSet β}
+    (h : OutcomeSetEquiv R S₁ S₂) :
+    (∃ a, S₁ a) ↔ (∃ b, S₂ b) :=
+  ⟨fun ⟨_, ha⟩ => let ⟨b, hb, _⟩ := h.forward ha; ⟨b, hb⟩,
+   fun ⟨_, hb⟩ => let ⟨a, ha, _⟩ := h.backward hb; ⟨a, ha⟩⟩
+
+/--
+Under a UB-preserving fault relation, `GapEqErr`-equivalence transfers total
+definedness (termination + gap-freedom + UB-freedom) in both directions.
+-/
+theorem OutcomeSetEquiv.totalDefined_iff {Gap : Type uG}
+    {isUB₁ : Fault₁ → Prop} {isUB₂ : Fault₂ → Prop}
+    {S₁ : OutcomeSet Fault₁ Gap Val₁} {S₂ : OutcomeSet Fault₂ Gap Val₂}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    (h : OutcomeSetEquiv (GapEqErr rVal rFault) S₁ S₂) :
+    OutcomeSet.TotalDefined isUB₁ S₁ ↔ OutcomeSet.TotalDefined isUB₂ S₂ :=
+  ⟨fun ⟨ht, hd⟩ => ⟨h.terminates_iff.mp ht, (h.defined_iff hUB).mp hd⟩,
+   fun ⟨ht, hd⟩ => ⟨h.terminates_iff.mpr ht, (h.defined_iff hUB).mpr hd⟩⟩
+
+/--
+Total-correctness upgrade: when the baseline is totally defined on `pre`,
+`ContextEquivOn pre` upgrades to gap-free `ProgramEquivOn pre` AND establishes
+total definedness (termination + gap-freedom + UB-freedom) of the refactored
+program on `pre`.
+-/
+theorem ContextEquivOn.toProgramEquivOn_of_totalDefined
+    {Gap : Type uG} {pre : Query → Prop}
+    {isUB₁ : Fault₁ → Prop} {isUB₂ : Fault₂ → Prop}
+    {sem₁ : GapSem Query Fault₁ Gap Val₁} {sem₂ : GapSem Query Fault₂ Gap Val₂}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    (h : ContextEquivOn pre rVal rFault sem₁ sem₂)
+    (h₁ : ∀ q, pre q → OutcomeSet.TotalDefined isUB₁ (sem₁ q)) :
+    ProgramEquivOn pre rVal rFault sem₁ sem₂ ∧
+      ∀ q, pre q → OutcomeSet.TotalDefined isUB₂ (sem₂ q) :=
+  ⟨h.toProgramEquivOn (fun q hq => (OutcomeSet.defined_iff.mp (h₁ q hq).2).1),
+   fun q hq => ((h q hq).totalDefined_iff hUB).mp (h₁ q hq)⟩
 
 end ValueProjectionBridges
 
