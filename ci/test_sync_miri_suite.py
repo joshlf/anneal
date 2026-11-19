@@ -364,6 +364,43 @@ pub fn nested_inside_fn_body() -> u32 { 0 }
             manifest = SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
             self.assertEqual([t["name"] for t in manifest["tests"]], ["pass_demo"])
 
+        # 5. Unmarked private, parameterized, or generic top-level `fn`s (which
+        #    `rustc-capture` would capture as rogue `Subject`s) must be rejected,
+        #    and `'"'` char literals in `miri_eval.rs` must not spoof match arms.
+        char_quote_eval_rs = (
+            "fn main() {\n"
+            "    let q = '\"';\n"
+            "    let _ = match q { '\"' => 1, _ => 0 };\n"
+            '    match "" { r#"pass_demo"# => {}, _ => {} }\n'
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path, corpus_dir = _write_fixture(
+                Path(tmp),
+                manifest_toml=_BASE_MANIFEST,
+                lib_rs="pub fn pass_demo() -> u32 { 1 }\n",
+                eval_rs=char_quote_eval_rs,
+            )
+            manifest = SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
+            self.assertEqual([t["name"] for t in manifest["tests"]], ["pass_demo"])
+
+        for label, rogue_fn in [
+            ("private-fn", "fn unmarked_private_helper() -> u32 { 0 }\n"),
+            ("parameterized-pub-fn", "pub fn unmarked_callee(x: u32) -> u32 { x }\n"),
+            ("generic-pub-fn", "pub fn unmarked_generic<'a>() -> &'a u32 { &0 }\n"),
+        ]:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                manifest_path, corpus_dir = _write_fixture(
+                    Path(tmp),
+                    manifest_toml=_BASE_MANIFEST,
+                    lib_rs="pub fn pass_demo() -> u32 { 1 }\n" + rogue_fn,
+                    eval_rs=char_quote_eval_rs,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "without `__ANNEAL_MODEL_\\*` markers"
+                ):
+                    SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
+
 
 if __name__ == "__main__":
     unittest.main()

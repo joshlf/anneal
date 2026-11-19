@@ -4243,39 +4243,104 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
         other => panic!("unexpected minimal repro Anneal outcome: {other:?}"),
     }
 
-    // Multi-candidate batch from a custom multi-item seed carrying both a local
-    // `struct` and a trailing `__ANNEAL_MODEL_*` helper must stage cleanly
-    // without `E0428` duplicate-item errors and compare both candidates live.
+    // Multi-candidate batch combining:
+    // (a) 2 mutated candidates from a multi-item seed carrying a local `struct`,
+    //     an UNMARKED non-integer-returning helper `fn`, and a trailing
+    //     `__ANNEAL_MODEL_*` helper (deduped at crate root without mutating
+    //     the unmarked helper),
+    // (b) a conflicting agreeing candidate redefining `C16LocalPair` +
+    //     `c16_unmarked_step` with incompatible fields/body (isolated into
+    //     `stage_ns_0`), and
+    // (c) a conflicting divergent candidate redefining `C16LocalPair` +
+    //     `c16_unmarked_step` whose UB fault occurs inside `stage_ns_1`'s local
+    //     helper (verifying `stage_ns_1` MIR extraction, kernel confirmation
+    //     helper linking, zero-drift `repro.rs` span translation, and standalone
+    //     `reproduce_miri_finding`).
     let multi_item_seed = "\
+#[derive(Copy, Clone)]
 pub struct C16LocalPair {
     pub a: u32,
     pub b: u32,
 }
+fn c16_unmarked_step(pair: C16LocalPair) -> C16LocalPair {
+    C16LocalPair {
+        a: wrapping_add(pair.a, 1u32),
+        b: wrapping_add(pair.b, 2u32),
+    }
+}
 pub fn pass_c16_multi_item_seed() -> u32 {
-    c16_local_model_sum(C16LocalPair { a: 19u32, b: 23u32 })
+    let stepped = c16_unmarked_step(C16LocalPair { a: 18u32, b: 21u32 });
+    c16_local_model_sum(stepped)
 }
 pub const __ANNEAL_MODEL_c16_local_model_sum: &str = \"c16_local_model_sum\";
 pub fn c16_local_model_sum(pair: C16LocalPair) -> u32 {
     wrapping_add(pair.a, pair.b)
 }
 ";
-    let multi_batch = generate_miri_batch(&[multi_item_seed], 2, 0xC16_B201);
+    let mut multi_batch = generate_miri_batch(&[multi_item_seed], 2, 0xC16_B201);
+    let conflict_agree_src = "\
+pub struct C16LocalPair {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+fn c16_unmarked_step(triple: C16LocalPair) -> u32 {
+    wrapping_add(wrapping_add(triple.x, triple.y), triple.z)
+}
+pub fn pass_c16_conflicting_aux_agree() -> u32 {
+    c16_unmarked_step(C16LocalPair { x: 10u32, y: 20u32, z: 12u32 })
+}
+";
+    let conflict_div_src = "\
+pub struct C16LocalPair {
+    pub buf: [u32; 4],
+}
+fn c16_unmarked_step(mut box_arr: C16LocalPair) -> u32 {
+    unsafe {
+        let base: *mut u32 = &raw mut box_arr.buf as *mut u32;
+        let src: *const u32 = base as *const u32;
+        let dst: *mut u32 = offset(base as *const u32, 2isize) as *mut u32;
+        copy_nonoverlapping(src, dst, 2usize);
+    }
+    wrapping_add(box_arr.buf[2], box_arr.buf[3])
+}
+pub fn pass_c16_conflicting_aux_div() -> u32 {
+    c16_unmarked_step(C16LocalPair { buf: [7u32, 8u32, 0u32, 0u32] })
+}
+";
+    multi_batch.push(handwritten_candidate(
+        2,
+        "pass_c16_conflicting_aux_agree",
+        "pass_c16_conflicting_aux_agree",
+        "identity",
+        conflict_agree_src,
+    ));
+    let mut conflict_div_cand = handwritten_candidate(
+        3,
+        "pass_c16_conflicting_aux_div",
+        "pass_c16_conflicting_aux_div",
+        "identity",
+        conflict_div_src,
+    );
+    conflict_div_cand.applied_mutators.clear();
+    multi_batch.push(conflict_div_cand);
+
     let multi_findings_dir = dir.join("multi_item_findings");
     let multi_report = evaluate_miri_batches_with_options(
         "c16_multi_item_batch",
         0xC16_B201,
         &[multi_batch],
-        2,
+        4,
         &MiriEvalOptions {
             findings_dir: Some(multi_findings_dir),
             anneal_repo_root: Some(root.clone()),
             shrink_seeds: Some(vec![multi_item_seed.to_string()]),
         },
     )
-    .expect("2-candidate multi-item model-helper batch must stage and evaluate without E0428");
-    assert_eq!(multi_report.compiled_candidates, 2);
+    .expect("4-candidate unmarked + conflicting multi-item batch must stage without E0428");
+    assert_eq!(multi_report.compiled_candidates, 4);
     assert_eq!(multi_report.compile_failed_candidates, 0);
-    assert_eq!(multi_report.compared_candidates, 2);
+    assert_eq!(multi_report.compared_candidates, 4);
     assert_eq!(multi_report.not_compared_count, 0);
     assert_eq!(
         multi_report
@@ -4283,4 +4348,54 @@ pub fn c16_local_model_sum(pair: C16LocalPair) -> u32 {
             .get("unsound_missed_fault"),
         Some(&0)
     );
+    let agree_ns_rep = multi_report
+        .item_reports
+        .iter()
+        .find(|r| r.name == "pass_c16_conflicting_aux_agree")
+        .expect("conflicting stage_ns_0 agree item report");
+    assert_eq!(agree_ns_rep.verdict, ComparisonVerdict::Agree);
+    assert_eq!(
+        agree_ns_rep.miri,
+        MiriOutcome::PassScalar {
+            bits: 42,
+            size_bytes: 4
+        }
+    );
+
+    if let Some(ns_finding) = multi_report
+        .findings
+        .iter()
+        .find(|f| f.fn_name == "pass_c16_conflicting_aux_div")
+    {
+        assert_eq!(ns_finding.divergence_class, "false_positive_ub");
+        assert!(ns_finding.kernel_confirmed);
+        assert!(
+            ns_finding
+                .mir_neighborhood
+                .contains("def body : CapturedMir :="),
+            "stage_ns_1 MIR neighborhood must be extracted:\n{}",
+            ns_finding.mir_neighborhood
+        );
+        assert!(
+            ns_finding
+                .kernel_confirm_theorems
+                .contains("Mir.MiriDiffCorpus.stage_ns_1_c16_unmarked_step.body"),
+            "stage_ns_1 confirm module must link stage_ns_1 local helper:\n{}",
+            ns_finding.kernel_confirm_theorems
+        );
+        let ns_repro_path = ns_finding
+            .repro_path
+            .as_ref()
+            .expect("stage_ns_1 finding repro.rs");
+        let ns_repro_rep = reproduce_miri_finding(ns_repro_path, Some(&root))
+            .expect("reproduce stage_ns_1 finding standalone");
+        let ns_repro_anneal_tag = match &ns_repro_rep.anneal {
+            AnnealOutcome::Ub { span: Some(s) } => format!("ub@{}", s.display_short()),
+            other => other.summary_tag(),
+        };
+        assert_eq!(
+            ns_repro_anneal_tag, ns_finding.anneal_outcome_tag,
+            "stage_ns_1 translated UB span must match standalone repro.rs byte-for-byte"
+        );
+    }
 }

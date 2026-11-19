@@ -580,7 +580,7 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
             _TOP_PREFIX
             + r"pub\s*\([^)]*\)\s+"
             + _FN_QUALS
-            + r"fn\s+([A-Za-z0-9_]+)\s*\(\s*\)",
+            + r"fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>\s*)?\(\s*\)",
             top_lib_no_str,
         )
         if m.group(1) != "helper_add_ten" and m.group(1) not in model_names
@@ -600,6 +600,24 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
         )
         if m.group(1) != "helper_add_ten" and m.group(1) not in model_names
     ]
+    all_unmarked_top_fns = [
+        m.group(1)
+        for m in re.finditer(
+            _TOP_PREFIX
+            + r"(?:pub(?:\s*\([^)]*\))?\s+)?"
+            + _FN_QUALS
+            + r"fn\s+([A-Za-z0-9_]+)\b",
+            top_lib_no_str,
+        )
+        if m.group(1) != "helper_add_ten" and m.group(1) not in model_names
+    ]
+    rogue_top_fns = sorted(set(all_unmarked_top_fns) - set(fn_names_in_lib))
+    if rogue_top_fns:
+        raise ValueError(
+            "corpus/src/lib.rs declares top-level functions (private, parameterized, "
+            "`pub(...)`, or generic) without `__ANNEAL_MODEL_*` markers: "
+            f"{rogue_top_fns}"
+        )
 
     tests = manifest.get("tests", [])
     manifest_names = [t["name"] for t in tests]
@@ -622,11 +640,25 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
             f"missing_in_lib={sorted(missing_in_lib)}"
         )
 
-    eval_arms = [
-        m.group(1)
-        for m in re.finditer(r'"([^"]+)"\s*=>', clean_eval)
-        if clean_eval_no_str[m.end() - 2 : m.end()] == "=>"
-    ]
+    eval_arms: list[str] = []
+    for m in re.finditer(r'(r(#*))?"([^"]+)"(#*)\s*=>', clean_eval):
+        if m.start() > 0 and (
+            clean_eval[m.start() - 1].isalnum() or clean_eval[m.start() - 1] == "_"
+        ):
+            continue
+        is_raw = m.group(1) is not None
+        open_hashes = m.group(2) or ""
+        arm_name = m.group(3)
+        close_hashes = m.group(4)
+        if (not is_raw and close_hashes) or (is_raw and open_hashes != close_hashes):
+            continue
+        prefix = f"r{open_hashes}" if is_raw else ""
+        expected_masked = f'{prefix}"' + (" " * len(arm_name)) + f'"{close_hashes}'
+        if (
+            clean_eval_no_str[m.start() : m.end(4)] == expected_masked
+            and clean_eval_no_str[m.end() - 2 : m.end()] == "=>"
+        ):
+            eval_arms.append(arm_name)
     seen_eval_arms: set[str] = set()
     dup_eval_arms: set[str] = set()
     for arm in eval_arms:
