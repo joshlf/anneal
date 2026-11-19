@@ -232,7 +232,11 @@ fn body(ast: &str, body: &ir::Body) -> String {
         list(&body.local_tys, |t| ty(ast, t)),
         list(&body.blocks, |block| format!(
             "({{ statements := {}, terminator := {}, cleanup := false }} : {ast}.BasicBlock)",
-            list(&block.statements, |stmt| statement(ast, &body.local_tys, stmt)),
+            list(&block.statements, |stmt| statement(
+                ast,
+                &body.local_tys,
+                stmt
+            )),
             terminator(ast, &block.terminator)
         )),
         identity(&body.identity)

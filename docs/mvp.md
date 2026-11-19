@@ -23,14 +23,16 @@ MIR dialect; building it with any other compiler fails. Proof checking pins
 Lean 4.34.1 and authenticates its foundation and checked library artifacts
 against the repository locks.
 
-Archive variants select the host executables used to run Anneal. Verification
-admits only `x86_64-unknown-linux-gnu`; the Cargo shortcut uses that same fixed
-profile. Each default archive includes its host Rust standard library, so an
-archive for another host may lack libraries for the verification target. A
-compatible custom compiler/sysroot can provide those libraries without
-changing the verified target. Cross-host verification remains unqualified
-here; the compiler reports missing target libraries rather than retargeting
-the program or rejecting the host itself.
+Archive variants select the host executables used to run Anneal. Explicit
+requests admit the six 64-bit little-endian Linux and Fuchsia targets
+(`{x86_64,aarch64,riscv64gc}-unknown-{linux-gnu,fuchsia}`), while the Cargo
+shortcut uses the fixed `x86_64-unknown-linux-gnu` profile. Each default
+archive includes its host Rust standard library, so an archive for another host
+or target may lack target libraries. A compatible custom compiler/sysroot (or
+explicit `--extern` target libraries) can provide those libraries without
+changing the verified target. Cross-host verification remains unqualified here;
+the compiler reports missing target libraries rather than retargeting the
+program or rejecting the host itself.
 
 ## Install from the workspace
 
@@ -88,6 +90,13 @@ target/debug/cargo-anneal verify --request /path/to/request.json \
   --capture "$PWD/target/debug/anneal-rustc-capture" \
   --sysroot "$anneal_sysroot" --lean "$anneal_lean_prefix/bin/lean"
 ```
+
+For hermetic GN, Bazel, or RBE actions that forbid network/cache-directory
+crates and use a read-only `/tmp`, build `cargo-anneal` with
+`--no-default-features` (omitting `setup`, `exocrate`, and `dirs` so explicit
+`--capture`, `--lean`, and `--sysroot` or `--rustc` flags are mandatory) and
+pass `--work-dir <writable_dir>` so staging and child `TMPDIR` stay inside the
+action's scratch directory.
 
 The native-library search path and rpath must reference the same compiler
 distribution used to build the capture driver. Building it with an unrelated
@@ -170,12 +179,16 @@ cargo anneal verify --request /path/to/example/request.json \
 ```
 
 Every request compiles a library with optimization level 0, debug assertions
-disabled and overflow checks disabled. The initial target is
-`x86_64-unknown-linux-gnu`, with 64-bit pointers and little-endian layout.
-`cfg` contains the resolved compiler cfg arguments for this compilation. The
-format does not expose arbitrary compiler flags or external dependency inputs.
-A request proves this configured source subject; correspondence to a different
-Cargo profile or deployed binary requires separate evidence.
+disabled and overflow checks disabled. `target` defaults to
+`x86_64-unknown-linux-gnu` and admits the six 64-bit little-endian Linux and
+Fuchsia triples (`{x86_64,aarch64,riscv64gc}-unknown-{linux-gnu,fuchsia}`).
+`cfg` contains the resolved compiler cfg arguments for this compilation.
+Optional `externs` (`{crate_name, path}` `.rmeta`/`.rlib` files) and
+`dependency_dirs` (clean relative directories whose `.rmeta`, `.rlib`, and
+`.so` artifacts are staged and SHA-256-bound) declare precompiled crate
+metadata; the format does not expose arbitrary compiler flags. A request proves
+this configured source subject; correspondence to a different Cargo profile or
+deployed binary requires separate evidence.
 
 Declared regular files and their ancestor directories define the compilation's
 source namespace. Source reads and existence checks resolve within that
@@ -219,11 +232,11 @@ cargo anneal verify --manifest-path /path/to/package/Cargo.toml \
 Omit `--select` to require the whole crate. The shortcut uses the same fixed
 Anneal profile. It refuses Cargo features, dependencies, build scripts,
 procedural macros and package- or workspace-level compiler overrides. An
-explicit request can supply supported resolved cfg and source inputs; external
-dependencies and unsupported MIR remain unavailable. The shortcut marks `Spec`
-and `Spec.*` modules as specifications and other proof-directory modules as
-proofs. Use an explicit request when specification helpers need other module
-names.
+explicit request can supply supported resolved cfg, source inputs, and
+SHA-256-authenticated `externs` and `dependency_dirs`; unsupported MIR remains
+unavailable. The shortcut marks `Spec` and `Spec.*` modules as specifications
+and other proof-directory modules as proofs. Use an explicit request when
+specification helpers need other module names.
 
 The shortcut declares regular `.rs` files below the package root, excluding
 hidden names and `target` directories. It does not discover Rust dependencies
@@ -324,12 +337,13 @@ to nondeterministic execution needs a bridge covering every relevant path.
 ## Supported fragment and results
 
 The operational fragment supports booleans, integers up to 64 bits, unit and
-never locals, and local fieldless enums with at least two distinct `isize`
-discriminants. It preserves storage markers, moves and copies; MIR retag flags
-on these reference-free values have no borrow-tracking effect and lower to
-ordinary operand uses, while reference and pointer types are refused. Operations
-include ordinary bitwise, shift, wrapping arithmetic and comparison operations,
-discriminant reads, scalar assignment, branches, returns and loops.
+never locals, and local or authenticated external fieldless enums with unique
+discriminants up to 64 bits. It preserves storage markers, moves and copies;
+MIR retag flags on these reference-free values have no borrow-tracking effect
+and lower to ordinary operand uses, while reference and pointer types are
+refused. Operations include ordinary bitwise, shift, wrapping arithmetic and
+comparison operations, discriminant reads, scalar assignment, branches, returns
+and loops.
 
 The model represents logical scalar values and local storage slots. Physical
 allocations, padding, pointer provenance and general memory operations are

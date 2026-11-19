@@ -1566,16 +1566,122 @@ pub fn selected(m: Mode, b: LeafBit, l: LocalMode) -> u64 {
     assert!(!out.status.success());
     missing_dep_dir.assert_no_capture_artifacts();
 
-    // Symlinked .rmeta is rejected fail-closed.
+    // Symlinked .rmeta and trailing-slash symlinked -L dependency=<dir>/ are
+    // rejected fail-closed (POSIX `lstat("sym/")` must not bypass the check).
     let sym_rmeta = workspace.path().join("sym.rmeta");
     std::os::unix::fs::symlink(&dep_rmeta, &sym_rmeta).unwrap();
-    let sym_fix = Capture::new(subject_src);
-    let out = sym_fix
-        .selected_command()
-        .arg(format!("--extern=dep_types={}", sym_rmeta.display()))
+    for ext_arg in [
+        format!("--extern=dep_types={}", sym_rmeta.display()),
+        format!("--extern=dep_types={}/", dep_rmeta.display()),
+    ] {
+        let sym_fix = Capture::new(subject_src);
+        let out = sym_fix.selected_command().arg(&ext_arg).output().unwrap();
+        assert!(!out.status.success(), "{ext_arg}");
+        assert_eq!(status(&out)["status"], "unsupported", "{ext_arg}: {out:?}");
+        assert!(!sym_fix.output.exists());
+    }
+
+    let sym_deps_dir = workspace.path().join("sym-deps");
+    std::os::unix::fs::symlink(&deps_dir, &sym_deps_dir).unwrap();
+    for search_arg in [
+        format!("-Ldependency={}", sym_deps_dir.display()),
+        format!("-Ldependency={}/", sym_deps_dir.display()),
+        format!("-Ldependency={}/", deps_dir.display()),
+    ] {
+        let sym_dir_fix = Capture::new(subject_src);
+        let out = sym_dir_fix
+            .selected_command()
+            .arg(format!("--extern=dep_types={}", dep_rmeta.display()))
+            .arg(&search_arg)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{search_arg}");
+        assert_eq!(
+            status(&out)["status"],
+            "unsupported",
+            "{search_arg}: {out:?}"
+        );
+        assert!(!sym_dir_fix.output.exists());
+    }
+
+    // Invalid `--crate-name` and hyphen-prefixed `--select` values fail closed
+    // as `unsupported` rather than triggering `--help` (`ExitCode::SUCCESS`).
+    for bad_crate in ["--help", "-v", "_", "my-crate"] {
+        let bad_crate_fix = Capture::new(b"pub fn selected() {}\n");
+        let out = bad_crate_fix
+            .command_with(bad_crate, true)
+            .arg("--select=selected")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{bad_crate}: {out:?}");
+        assert_eq!(status(&out)["status"], "unsupported", "{bad_crate}");
+        assert!(!bad_crate_fix.output.exists());
+    }
+    let dash_select_fix = Capture::new(b"pub fn selected() {}\n");
+    let out = dash_select_fix
+        .command()
+        .arg("--select=--help")
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    assert_eq!(status(&out)["status"], "unsupported");
-    assert!(!sym_fix.output.exists());
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(status(&out)["status"], "unsupported", "{out:?}");
+    assert!(!dash_select_fix.output.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn admits_symlink_joined_sysroot_libraries() {
+    let real_sysroot = PathBuf::from(sysroot()).canonicalize().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let joined = temp.path().join("anneal-symlink-join-sysroot");
+    std::fs::create_dir_all(joined.join("bin")).unwrap();
+    std::fs::create_dir_all(joined.join("lib/rustlib")).unwrap();
+    std::os::unix::fs::symlink(real_sysroot.join("bin/rustc"), joined.join("bin/rustc")).unwrap();
+    // Mirror `pkgs.symlinkJoin` / Bazel CAS trees where target library entries
+    // beneath `<sysroot>/lib/rustlib/<triple>/lib/` are symlinks into a store.
+    for entry in std::fs::read_dir(real_sysroot.join("lib/rustlib")).unwrap() {
+        let entry = entry.unwrap();
+        let target_dir = joined.join("lib/rustlib").join(entry.file_name());
+        if entry.path().join("lib").is_dir() {
+            std::fs::create_dir_all(target_dir.join("lib")).unwrap();
+            for lib_entry in std::fs::read_dir(entry.path().join("lib")).unwrap() {
+                let lib_entry = lib_entry.unwrap();
+                std::os::unix::fs::symlink(
+                    lib_entry.path(),
+                    target_dir.join("lib").join(lib_entry.file_name()),
+                )
+                .unwrap();
+            }
+        } else {
+            std::os::unix::fs::symlink(entry.path(), target_dir).unwrap();
+        }
+    }
+
+    let fixture = Capture::new(b"pub fn selected(x: u64) -> u64 { x }\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_anneal-rustc-capture"))
+        .current_dir(fixture.directory.path())
+        .arg("capture")
+        .arg("--crate-root")
+        .arg(&fixture.source)
+        .arg("--crate-name=session")
+        .arg("--target=x86_64-unknown-linux-gnu")
+        .arg("--out-dir")
+        .arg(&fixture.output)
+        .arg("--sysroot")
+        .arg(&joined)
+        .arg("--source-file")
+        .arg(&fixture.source)
+        .arg("--select=selected")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "symlink-joined sysroot failed:\nstdout:\n{}\nstderr:\n{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert_eq!(
+        fixture.manifest()["compiler"]["sysroot"],
+        joined.canonicalize().unwrap().to_str().unwrap()
+    );
 }

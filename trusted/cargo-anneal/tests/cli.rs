@@ -1057,6 +1057,15 @@ fn rejects_non_utf8_and_missing_work_dir_and_bypasses_missing_tmpdir() {
         assert_eq!(receipt["phase"], "staging", "{receipt}");
     }
 
+    // Empty `--work-dir ""` is rejected by clap as an argument error (exit 2).
+    let mut empty_work_cmd = command(Route::Direct, project.path());
+    empty_work_cmd.args(["verify", "--request"]);
+    empty_work_cmd.arg(&request);
+    empty_work_cmd.args(["--work-dir", ""]);
+    add_hermetic_tool_stubs(&mut empty_work_cmd, true, true);
+    let empty_work_out = empty_work_cmd.output().unwrap();
+    assert_result(&empty_work_out, 2, "", "error:");
+
     // With a valid --work-dir, an absent TMPDIR is ignored during staging.
     let valid_work = project.path().join("valid-work");
     fs::create_dir(&valid_work).unwrap();

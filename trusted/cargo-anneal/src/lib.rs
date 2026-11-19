@@ -1826,6 +1826,12 @@ impl Checker {
                 ));
             }
         };
+        if lean_raw.as_os_str().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Lean binary path (--lean) must not be empty",
+            ));
+        }
         let lean = if lean_raw.is_absolute() {
             lean_raw
         } else {

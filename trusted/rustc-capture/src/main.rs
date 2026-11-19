@@ -199,7 +199,7 @@ fn check_compiler(rustc: &Path) -> Result<(), Failure> {
         .args(["--version", "--verbose"])
         .env_clear()
         .env("PATH", "/usr/bin:/bin");
-    if let Some(tmpdir) = env::var_os("TMPDIR") {
+    if let Some(tmpdir) = env::var_os("TMPDIR").filter(|v| !v.is_empty()) {
         probe.env("TMPDIR", tmpdir);
     }
     let output = probe.output().map_err(|error| {
@@ -275,7 +275,12 @@ fn prepare_externs(args: &Args) -> Result<PreparedExterns, Failure> {
                 "--extern {name} path must not be empty"
             )));
         }
-        let given = Path::new(raw_path);
+        if raw_path.ends_with('/') || raw_path.ends_with(std::path::MAIN_SEPARATOR) {
+            return Err(Failure::unsupported(format!(
+                "--extern {name} path must not end with a directory separator: {raw_path:?}"
+            )));
+        }
+        let given: PathBuf = Path::new(raw_path).components().collect();
         if !matches!(
             given.extension().and_then(|ext| ext.to_str()),
             Some("rmeta" | "rlib")
@@ -284,14 +289,14 @@ fn prepare_externs(args: &Args) -> Result<PreparedExterns, Failure> {
                 "--extern {name} path must end in .rmeta or .rlib: {raw_path:?}"
             )));
         }
-        let given_meta = fs::symlink_metadata(given).map_err(Failure::io)?;
+        let given_meta = fs::symlink_metadata(&given).map_err(Failure::io)?;
         if given_meta.file_type().is_symlink() || !given_meta.is_file() {
             return Err(Failure::unsupported(format!(
                 "--extern {name} must be a regular file (not a symlink): {}",
                 given.display()
             )));
         }
-        let canon = fs::canonicalize(given).map_err(Failure::io)?;
+        let canon = fs::canonicalize(&given).map_err(Failure::io)?;
         if canon.to_str().is_none() {
             return Err(Failure::unsupported(format!(
                 "--extern {name} target path must be UTF-8: {canon:?}"
@@ -345,15 +350,22 @@ fn prepare_externs(args: &Args) -> Result<PreparedExterns, Failure> {
                 "-L dependency=<dir> directory path must not be empty",
             ));
         }
-        let given_dir = Path::new(raw_dir);
-        let given_dir_meta = fs::symlink_metadata(given_dir).map_err(Failure::io)?;
+        // Reject trailing slashes before `symlink_metadata`: on POSIX, `lstat`
+        // on `symlink/` dereferences the symlink and hides `is_symlink()`.
+        if raw_dir.ends_with('/') || raw_dir.ends_with(std::path::MAIN_SEPARATOR) {
+            return Err(Failure::unsupported(format!(
+                "-L dependency path must not end with a directory separator: {raw_dir:?}"
+            )));
+        }
+        let given_dir: PathBuf = Path::new(raw_dir).components().collect();
+        let given_dir_meta = fs::symlink_metadata(&given_dir).map_err(Failure::io)?;
         if given_dir_meta.file_type().is_symlink() || !given_dir_meta.is_dir() {
             return Err(Failure::unsupported(format!(
                 "-L dependency path must be a regular directory (not a symlink): {}",
                 given_dir.display()
             )));
         }
-        let canon_dir = fs::canonicalize(given_dir).map_err(Failure::io)?;
+        let canon_dir = fs::canonicalize(&given_dir).map_err(Failure::io)?;
         if canon_dir.to_str().is_none() {
             return Err(Failure::unsupported(format!(
                 "-L dependency directory path must be UTF-8: {canon_dir:?}"
@@ -424,6 +436,12 @@ fn prepare_externs(args: &Args) -> Result<PreparedExterns, Failure> {
 }
 
 fn run(mut args: Args) -> Result<serde_json::Value, Failure> {
+    if !compilers::is_ascii_crate_ident(&args.crate_name) {
+        return Err(Failure::unsupported(format!(
+            "invalid --crate-name {:?}; expected an ASCII Rust crate identifier",
+            args.crate_name
+        )));
+    }
     if !compilers::is_supported_target(&args.target) {
         return Err(Failure::unsupported(format!(
             "unsupported target {:?}; supported 64-bit little-endian targets are: {}",

@@ -1236,6 +1236,69 @@ end Proof"#,
         )
         .expect(2, "tool_failed", Some("binding"));
     let _ = fs::remove_file(&rogue_rmeta);
+
+    // Negative 6: unclean relative paths (trailing `/` or repeated `//`),
+    // invalid `crate_name`/`edition`, and hyphen-prefixed `roots` fail closed
+    // as `unsupported` (`exit 1`) rather than `tool_failed` (`exit 2`).
+    for (idx, (bad_req, expected_phase)) in [
+        (
+            {
+                let mut r = base_req.clone();
+                r["compilation"]["dependency_dirs"] = json!(["deps/"]);
+                r
+            },
+            "inputs",
+        ),
+        (
+            {
+                let mut r = base_req.clone();
+                r["compilation"]["externs"] = json!([
+                    {"crate_name": "dep_types", "path": "deps//libdep_types.rmeta"}
+                ]);
+                r
+            },
+            "inputs",
+        ),
+        (
+            {
+                let mut r = base_req.clone();
+                r["compilation"]["source_files"] = json!(["lib.rs/"]);
+                r
+            },
+            "inputs",
+        ),
+        (
+            {
+                let mut r = base_req.clone();
+                r["compilation"]["crate_name"] = json!("--help");
+                r
+            },
+            "request",
+        ),
+        (
+            {
+                let mut r = base_req.clone();
+                r["compilation"]["edition"] = json!("9999");
+                r
+            },
+            "request",
+        ),
+        (
+            {
+                let mut r = base_req.clone();
+                r["scope"] = json!({"kind": "selected_unit", "roots": ["--help"]});
+                r
+            },
+            "capture",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fixture
+            .run(&tools, &format!("unclean-or-flag-req-{idx}"), &bad_req)
+            .expect(1, "unsupported", Some(expected_phase));
+    }
 }
 
 #[cfg(unix)]

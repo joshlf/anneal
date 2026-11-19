@@ -646,16 +646,23 @@ fn module_of(name: &str) -> Result<String> {
     Ok(name.rsplit_once('.').unwrap().0.to_owned())
 }
 
+/// Require non-empty `Component::Normal` segments without leading, trailing, or
+/// repeated path separators (preventing POSIX `lstat("symlink/")` dereferencing
+/// and keeping normalized `request_sha256` spellings canonical).
+fn is_clean_relative_path_buf(relative: &Path) -> bool {
+    !relative.as_os_str().is_empty()
+        && relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+        && relative.components().collect::<PathBuf>().as_os_str() == relative.as_os_str()
+}
+
 /// Require a declared regular file beneath an already canonical root.
 ///
 /// Relative paths cannot escape the staging namespace. Canonical equality
 /// also rejects symlink traversal; adjacent compiled Lean files are never read.
 fn declared_file(root: &Path, relative: &Path) -> Result<PathBuf> {
-    if relative.as_os_str().is_empty()
-        || relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
+    if !is_clean_relative_path_buf(relative) {
         return Err(error(
             "unsupported",
             "inputs",
@@ -678,13 +685,10 @@ fn declared_file(root: &Path, relative: &Path) -> Result<PathBuf> {
 }
 
 /// Require a declared regular directory beneath an already canonical root,
-/// rejecting `..`, absolute paths, and symlinks along every relative segment.
+/// rejecting `..`, absolute paths, trailing slashes, and symlinks along every
+/// relative segment.
 fn declared_dir(root: &Path, relative: &Path) -> Result<PathBuf> {
-    if relative.as_os_str().is_empty()
-        || relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
+    if !is_clean_relative_path_buf(relative) {
         return Err(error(
             "unsupported",
             "inputs",
@@ -760,7 +764,7 @@ fn scan_dependency_dir(dir: &Path, phase: &'static str) -> Result<ScannedDepArti
             }
             let Some(name_utf8) = entry.file_name().to_str().map(str::to_owned) else {
                 return Err(error(
-                    "tool_failed",
+                    err_status,
                     phase,
                     format!(
                         "non-UTF-8 crate artifact filename: {}",
@@ -1063,6 +1067,29 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             "unsupported or empty compilation request",
         ));
     }
+    if !compilers::is_ascii_crate_ident(&request.compilation.crate_name) {
+        return Err(error(
+            "unsupported",
+            "request",
+            format!(
+                "invalid crate_name {:?}; expected an ASCII Rust crate identifier",
+                request.compilation.crate_name
+            ),
+        ));
+    }
+    if !matches!(
+        request.compilation.edition.as_str(),
+        "2015" | "2018" | "2021" | "2024"
+    ) {
+        return Err(error(
+            "unsupported",
+            "request",
+            format!(
+                "unsupported Rust edition {:?}; expected 2015, 2018, 2021, or 2024",
+                request.compilation.edition
+            ),
+        ));
+    }
     if !compilers::is_supported_target(&request.compilation.target) {
         return Err(error(
             "unsupported",
@@ -1180,6 +1207,9 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     let mut expected_staged_dep_artifacts: Vec<(String, Value)> = Vec::new();
     let mut staged_artifact_map: BTreeMap<PathBuf, (PathBuf, String)> = BTreeMap::new();
     let mut watched_dep_dirs: Vec<(PathBuf, BTreeMap<String, String>)> = Vec::new();
+    // Cache `(bytes, sha256)` by canonical original path so overlapping
+    // `externs` and `dependency_dirs` entries share one consistent snapshot.
+    let mut artifact_snapshots: BTreeMap<PathBuf, (Vec<u8>, String)> = BTreeMap::new();
 
     for ext in &request.compilation.externs {
         if !matches!(
@@ -1197,10 +1227,23 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             ));
         }
         let original = declared_file(&base_canon, &ext.path)?;
-        let bytes = fs::read(&original).map_err(|e| io("inputs", e))?;
-        let sha256 = digest(&bytes);
+        let sha256 = if let Some((_, existing_sha)) = artifact_snapshots.get(&original) {
+            existing_sha.clone()
+        } else {
+            let bytes = fs::read(&original).map_err(|e| io("inputs", e))?;
+            let sha256 = digest(&bytes);
+            write(&deps_stage.join(&ext.path), &bytes)?;
+            originals.push((original.clone(), sha256.clone()));
+            artifact_snapshots.insert(original, (bytes, sha256.clone()));
+            sha256
+        };
         let staged = deps_stage.join(&ext.path);
-        write(&staged, &bytes)?;
+        if !staged.is_file() {
+            let (bytes, _) = artifact_snapshots
+                .get(&declared_file(&base_canon, &ext.path)?)
+                .unwrap();
+            write(&staged, bytes)?;
+        }
         let staged = fs::canonicalize(&staged).map_err(|e| io("staging", e))?;
         let Some(staged_utf8) = staged.to_str().map(str::to_owned) else {
             return Err(error(
@@ -1209,7 +1252,6 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
                 "staged extern crate path must be UTF-8",
             ));
         };
-        originals.push((original, sha256.clone()));
         declared_externs.push(ExternCrateIdentity {
             crate_name: ext.crate_name.clone(),
             relative_path: ext.path.clone(),
@@ -1240,10 +1282,27 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         expected_staged_dep_dirs.push(staged_dir_utf8);
         let mut expected_dir_digests = BTreeMap::new();
         for (file_name, (orig_file, bytes, sha256)) in scanned {
+            if let Some((_, prev_sha)) = artifact_snapshots.get(&orig_file) {
+                if prev_sha != &sha256 {
+                    return Err(error(
+                        "tool_failed",
+                        "inputs",
+                        format!(
+                            "external crate artifact changed while staging: {}",
+                            orig_file.display()
+                        ),
+                    ));
+                }
+            } else {
+                originals.push((orig_file.clone(), sha256.clone()));
+                artifact_snapshots.insert(orig_file, (bytes.clone(), sha256.clone()));
+            }
             expected_dir_digests.insert(file_name.clone(), sha256.clone());
             let rel_file = rel_dir.join(&file_name);
             let staged_file = staged_dir.join(&file_name);
-            write(&staged_file, &bytes)?;
+            if !staged_file.is_file() {
+                write(&staged_file, &bytes)?;
+            }
             let staged_file = fs::canonicalize(&staged_file).map_err(|e| io("staging", e))?;
             let Some(staged_file_utf8) = staged_file.to_str().map(str::to_owned) else {
                 return Err(error(
@@ -1252,7 +1311,6 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
                     "staged dependency artifact path must be UTF-8",
                 ));
             };
-            originals.push((orig_file, sha256.clone()));
             declared_dep_artifacts.push(DependencyArtifactIdentity {
                 relative_path: rel_file.clone(),
                 sha256: sha256.clone(),
@@ -1280,8 +1338,13 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // The invocation owns tool selection; target requests cannot name a
     // compiler executable. Adapter correctness is a stated TCB assumption.
     // Its digest identifies the selected build and detects later changes.
+    // Probe the user-global setup cache only when an explicit `--capture` or
+    // `--sysroot`/`--rustc` flag was omitted, so explicit builds never `stat`
+    // `$HOME/.cache` or `$XDG_CACHE_HOME` inside hermetic action tracers.
     #[cfg(feature = "setup")]
-    let installed = crate::setup::installed();
+    let installed_cache: std::cell::OnceCell<Option<PathBuf>> = std::cell::OnceCell::new();
+    #[cfg(feature = "setup")]
+    let resolve_installed = || installed_cache.get_or_init(crate::setup::installed);
     if let Some(given_capture) = &args.capture
         && given_capture.to_str().is_none()
     {
@@ -1296,7 +1359,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         .capture
         .clone()
         .or_else(|| {
-            installed
+            resolve_installed()
                 .as_ref()
                 .map(|root| root.join("bin/anneal-rustc-capture"))
         })
@@ -1346,15 +1409,10 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         .env("TMPDIR", &work_tmp)
         .args(["capture", "--crate-root"])
         .arg(rust_stage.join(&request.compilation.crate_root))
-        .args([
-            "--crate-name",
-            &request.compilation.crate_name,
-            "--edition",
-            &request.compilation.edition,
-            "--target",
-            &request.compilation.target,
-            "--out-dir",
-        ])
+        .arg(format!("--crate-name={}", request.compilation.crate_name))
+        .arg(format!("--edition={}", request.compilation.edition))
+        .arg(format!("--target={}", request.compilation.target))
+        .arg("--out-dir")
         .arg(&capture_dir)
         .current_dir(&rust_stage);
     if let Some(given_sysroot) = &args.sysroot
@@ -1372,7 +1430,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     let selected_sysroot = match (&args.sysroot, &declared) {
         (Some(sysroot), _) => Some(sysroot.clone()),
         (None, Some(declared)) => Some(distribution_sysroot(&declared.given, &declared.rustc)?),
-        (None, None) => installed.as_ref().map(|root| root.join("rust")),
+        (None, None) => resolve_installed().as_ref().map(|root| root.join("rust")),
     };
     #[cfg(not(feature = "setup"))]
     let selected_sysroot = match (&args.sysroot, &declared) {
@@ -1416,7 +1474,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
                 return Err(error("unsupported", "request", "empty selected scope"));
             }
             for name in roots {
-                command.arg("--select").arg(name);
+                command.arg(format!("--select={name}"));
             }
         }
     }
@@ -1526,11 +1584,16 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     };
     let expected_dep_dirs_json: Vec<Value> =
         expected_staged_dep_dirs.iter().map(|s| json!(s)).collect();
+    let expected_crate_root = rust_stage.join(&request.compilation.crate_root);
     if manifest["scope"]["kind"] != scope_kind
         || manifest["scope"]["roots"] != json!(requested_roots)
         || manifest["program"]["scope"] != program_scope
+        || config["crate_root"] != json!(expected_crate_root)
         || config["crate_name"] != request.compilation.crate_name
         || config["target"] != request.compilation.target
+        || config["opt_level"] != 0
+        || config["debug_assertions"] != false
+        || config["overflow_checks"] != false
         || config["pointer_bits"] != 64
         || config["endian"] != "little"
         || config["edition"] != request.compilation.edition
@@ -1577,19 +1640,14 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // staged, SHA-256-authenticated artifact from `externs` or
     // `dependency_dirs`.
     let mut loaded_externs = Vec::new();
-    let observed_extern_entries = match manifest.get("externs") {
-        None => &[][..],
-        Some(val) => val
-            .as_array()
-            .ok_or_else(|| {
-                error(
-                    "tool_failed",
-                    "capture",
-                    "malformed observed externs inventory",
-                )
-            })?
-            .as_slice(),
-    };
+    let mut seen_loaded_externs = BTreeSet::new();
+    let observed_extern_entries = manifest["externs"].as_array().ok_or_else(|| {
+        error(
+            "tool_failed",
+            "capture",
+            "missing or malformed observed externs inventory",
+        )
+    })?;
     for ext_val in observed_extern_entries {
         let Some(crate_name) = ext_val["crate_name"]
             .as_str()
@@ -1602,6 +1660,13 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             ));
         };
         let path = PathBuf::from(ext_val["path"].as_str().unwrap_or_default());
+        if !seen_loaded_externs.insert((crate_name.to_owned(), path.clone())) {
+            return Err(error(
+                "tool_failed",
+                "capture",
+                format!("capture reported duplicate observed extern entry for {crate_name}"),
+            ));
+        }
         let Some((rel_path, expected_sha)) = staged_artifact_map.get(&path) else {
             return Err(error(
                 "tool_failed",
@@ -1923,15 +1988,23 @@ pub fn main(args: VerifyArgs) -> ExitCode {
         },
         None => None,
     };
-    if let Some(work_dir) = args.work_dir.as_deref()
-        && work_dir.to_str().is_none()
-    {
-        println!(
-            "{}",
-            json!({"schema_version":1,"status":"tool_failed","phase":"staging",
-                "detail":"--work-dir path must be UTF-8"})
-        );
-        return ExitCode::from(2);
+    if let Some(work_dir) = args.work_dir.as_deref() {
+        if work_dir.as_os_str().is_empty() {
+            println!(
+                "{}",
+                json!({"schema_version":1,"status":"tool_failed","phase":"staging",
+                    "detail":"--work-dir path must not be empty"})
+            );
+            return ExitCode::from(2);
+        }
+        if work_dir.to_str().is_none() {
+            println!(
+                "{}",
+                json!({"schema_version":1,"status":"tool_failed","phase":"staging",
+                    "detail":"--work-dir path must be UTF-8"})
+            );
+            return ExitCode::from(2);
+        }
     }
     let stage = match verification_stage(args.work_dir.as_deref()) {
         Ok(stage) => stage,

@@ -2028,7 +2028,9 @@ fn rejects_library_lock_imports_in_repository_audit() {
         fix.root.join("trusted/audit/library-lock.json"),
     )
     .unwrap();
-    let err = fix.check_expected(Some(1), Some("preflight"), Some(false)).unwrap_err();
+    let err = fix
+        .check_expected(Some(1), Some("preflight"), Some(false))
+        .unwrap_err();
     assert!(
         err.message
             .contains("foreign/missing import Init.Data.BitVec.Lemmas in Trusted"),

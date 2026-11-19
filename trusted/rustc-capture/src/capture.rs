@@ -637,34 +637,59 @@ fn collect(
     // `std::fs::File::open` and `Mmap::map` ("mmap the file, because only a
     // small fraction of it is read"), bypassing `FileLoader` and
     // `file_depinfo`.
+    //
     // Every loaded crate reports its filesystem paths in `CrateSource` ("Where
     // a crate came from on the local filesystem. One of these three options
-    // must be non-None", plus `sdylib_interface`). Authenticate all four path
-    // slots across `tcx.crates(())` against either the declared `--extern` /
-    // `-L dependency=` SHA-256 inventory or the canonical `--sysroot`.
+    // must be non-None", plus unstable `sdylib_interface` `.rs` builds).
+    // `locator` records the discovered search-path entry before leaf symlink
+    // resolution ("Use the original path (potentially with unresolved
+    // symlinks)"), so symlink-joined sysroots (`pkgs.symlinkJoin` or RBE/Bazel
+    // CAS trees) carry `<sysroot>/lib/rustlib/...` in `CrateSource` while
+    // `canonicalize()` resolves into the backing store. Reject unstable
+    // `sdylib_interface` crates outright, and authenticate `rmeta`, `rlib`, and
+    // `dylib` slots against either the declared SHA-256 inventory or a regular
+    // file reached beneath `<sysroot>/lib/rustlib`.
     // https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_crate_store/src/cstore.rs#L21-L29
     // https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_session/src/cstore.rs#L20-L28
+    // https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_metadata/src/locator.rs#L461-L468
+    // https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_metadata/src/locator.rs#L458-L465
+    // https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_metadata/src/locator.rs#L832-L880
+    // https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_metadata/src/locator.rs#L830-L878
     // https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_metadata/src/locator.rs#L936-L947
     // https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_metadata/src/locator.rs#L934-L945
     let canonical_sysroot = sysroot.canonicalize().map_err(Failure::io)?;
+    let sysroot_rustlib = canonical_sysroot.join("lib/rustlib");
+    let raw_sysroot_rustlib = std::path::absolute(sysroot.join("lib/rustlib"))
+        .and_then(|p| p.normalize_lexically().map_err(io::Error::other))
+        .ok();
+    let canonical_rustlib = sysroot_rustlib.canonicalize().ok();
     let mut observed_externs = BTreeMap::<(String, PathBuf), ir::ExternFile>::new();
     for &cnum in tcx.crates(()) {
         let crate_name = tcx.crate_name(cnum).as_str().to_owned();
+        if !crate::compilers::is_ascii_crate_ident(&crate_name) {
+            return Err(Failure::unsupported(format!(
+                "loaded external crate has non-ASCII or invalid identifier {crate_name:?}"
+            )));
+        }
         let source = tcx.used_crate_source(cnum);
+        if let Some(sdylib) = &source.sdylib_interface {
+            return Err(Failure::unsupported(format!(
+                "unstable sdylib interface crates are unsupported ({crate_name}): {}",
+                sdylib.display()
+            )));
+        }
         let mut any_source_path = false;
-        for candidate in [
-            &source.rmeta,
-            &source.rlib,
-            &source.dylib,
-            &source.sdylib_interface,
-        ]
-        .into_iter()
-        .flatten()
+        for candidate in [&source.rmeta, &source.rlib, &source.dylib]
+            .into_iter()
+            .flatten()
         {
             any_source_path = true;
+            let norm_candidate = std::path::absolute(candidate)
+                .and_then(|p| p.normalize_lexically().map_err(io::Error::other))
+                .map_err(Failure::io)?;
             let path = candidate.canonicalize().map_err(Failure::io)?;
+            let meta = std::fs::symlink_metadata(&path).map_err(Failure::io)?;
             if let Some(expected_sha256) = externs.allowed_artifacts.get(&path) {
-                let meta = std::fs::symlink_metadata(&path).map_err(Failure::io)?;
                 if !meta.is_file() {
                     return Err(Failure::unsupported(format!(
                         "external crate input is no longer a regular file: {}",
@@ -687,9 +712,17 @@ fn collect(
                         sha256: actual_sha256,
                     },
                 );
-            } else if path.starts_with(&canonical_sysroot) && path.is_file() {
-                // Standard-library crates inside the selected sysroot belong to
-                // the compiler distribution authenticated by the host.
+            } else if meta.is_file()
+                && (norm_candidate.starts_with(&sysroot_rustlib)
+                    || raw_sysroot_rustlib
+                        .as_ref()
+                        .is_some_and(|rl| norm_candidate.starts_with(rl))
+                    || canonical_rustlib
+                        .as_ref()
+                        .is_some_and(|rl| norm_candidate.starts_with(rl) || path.starts_with(rl)))
+            {
+                // Standard-library crates under `<sysroot>/lib/rustlib` belong
+                // to the compiler distribution authenticated by the host.
             } else {
                 return Err(Failure::unsupported(format!(
                     "compiler loaded an undeclared external crate ({crate_name}): {}",

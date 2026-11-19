@@ -2868,4 +2868,50 @@ fn rejects_tampered_capture_compiler_fields() {
             "case {index}: Lean staging began"
         );
     }
+
+    // Omitting `externs` or tampering with fixed compilation profile fields in
+    // `capture.json` also fails closed at `capture` before Lean staging.
+    for (idx, (sed_expr, expected_msg)) in [
+        (
+            "-e 's/\"externs\": \\[/\"omitted_externs\": [/g'",
+            "missing or malformed observed externs inventory",
+        ),
+        (
+            "-e 's/\"overflow_checks\": false/\"overflow_checks\": true/g'",
+            "capture differs from the requested compilation or scope",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let wrappers = tempfile::tempdir().unwrap();
+        let wrapper = wrappers.path().join("tampering-config");
+        executable_script(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nout=\nprevious=\nfor argument in \"$@\"; do\n\
+                 if [ \"$previous\" = --out-dir ]; then out=\"$argument\"; fi\n\
+                 previous=\"$argument\"\ndone\n\
+                 receipt=$('{}' \"$@\")\nstatus=$?\n\
+                 if [ \"$status\" -eq 0 ]; then sed -i {sed_expr} \"$out/capture.json\" || exit 70; fi\n\
+                 printf '%s\\n' \"$receipt\"\nexit \"$status\"\n",
+                tools.capture.display()
+            ),
+        );
+        let sandbox = declared_sandbox(&format!("tampered-profile-{idx}"));
+        let (code, receipt) = run_declared(&tools, &sandbox, &wrapper, None, true);
+        assert_eq!(code, Some(2), "{receipt}");
+        assert_eq!(receipt["status"], "tool_failed", "{receipt}");
+        assert_eq!(receipt["phase"], "capture", "{receipt}");
+        assert!(
+            receipt["detail"].as_str().unwrap().contains(expected_msg),
+            "{receipt}"
+        );
+        assert!(
+            !sandbox
+                .artifacts_dir
+                .join("generated/Expected.lean")
+                .exists()
+        );
+    }
 }

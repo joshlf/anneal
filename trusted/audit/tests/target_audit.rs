@@ -891,8 +891,7 @@ fn kernel_result_channels_preserve_success_mismatch_and_operational_error() {
 #[test]
 fn accepts_dialect_qualified_canonical_root_and_rejects_cross_dialect_crate_mismatch() {
     let mut f = Fixture::new(PROOF);
-    f.request.canonical_root =
-        "Trusted.MirSemantics.V2026_10_22_R7189d39d9.UnitTheorem".into();
+    f.request.canonical_root = "Trusted.MirSemantics.V2026_10_22_R7189d39d9.UnitTheorem".into();
     f.set(
         "Model",
         TargetRole::Model,
@@ -937,16 +936,14 @@ fn accepts_dialect_qualified_canonical_root_and_rejects_cross_dialect_crate_mism
 
     // Cross-dialect canonical_root against `V2026_10_22_R7189d39d9` Captured.program
     // must fail kernel type-checking on `<OtherDialect>.Crate.mk`.
-    f.request.canonical_root =
-        "Trusted.MirSemantics.V2026_05_30_Rf8a08b688.UnitTheorem".into();
+    f.request.canonical_root = "Trusted.MirSemantics.V2026_05_30_Rf8a08b688.UnitTheorem".into();
     let cross_err = f.run().unwrap_err();
     assert!(
         cross_err.message.contains("canonical root type check")
             || cross_err.message.contains("Type mismatch"),
         "{cross_err}"
     );
-    f.request.canonical_root =
-        "Trusted.MirSemantics.V2026_10_22_R7189d39d9.UnitTheorem".into();
+    f.request.canonical_root = "Trusted.MirSemantics.V2026_10_22_R7189d39d9.UnitTheorem".into();
 
     // Bypassing the canonical `<Dialect>.Crate.mk` spec binding in `Expected.claim`
     // must fail the kernel Expected body comparison even when `Proof` proves it.
