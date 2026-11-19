@@ -61,7 +61,10 @@ Complete, kernel-checked, `Classical.choice`-free theory covering:
 | `foreignVisitScheduleNodes`, `execFnEntryMutRetagTraversalOrder`, `execFnEntryMutRetagTraversalOrderDirect` | `TraversalTree.initialForeignRoots` + `foreignPostorder` (`foreignEvents` visit order; exact standalone equivalence on `BorrowTreeRootedWF`) |
 | `IdempotentForeignAccess`, `sifa_foreign_transition_idempotent` | `Miri.TreeBorrows.IdempotentForeignAccess` + `LocationState.skipIfKnownNoop` (per-node idempotence only) |
 | `sortCellsByOffset`, `staticFreezeSegments` | `FreezeVisitor.visitValue` (`FieldsShape::Arbitrary` in `memoryOrder`) + `unsafeCellAction` cursor walk |
-| `RetagShape`, `BorrowTreeFreshWF`, `FnEntryBorrowInv` | shape and full-lifecycle inductive invariants (`singleRoot`, retags, `execWorldRange{Read,Write}`, `releaseProtector`) |
+| `RetagShape`, `BorrowTreeFreshWF`, `FnEntryBorrowInv` | shape and full-lifecycle inductive invariants (`singleRoot`, retags, `execWorldRange{Read,Write}`, `execReleaseProtector`, `execFrameExitMiri`, `execFrameExitMiniRust`) |
+| `protectorEndAccessIsWrite?`, `execProtectorEndAccess`, `execReleaseProtector`, `execFrameExitMiri` | `Permission.associatedAccess` + `BorrowTree.releaseProtector` (`SkipChildrenOfAccessed`) + `MachineHooks.beforeStackPopWithEnsure` + `GlobalState.endCall` |
+| `protectorEndAccessIsWriteMiniRust?`, `execFrameExitSequential`, `execFrameExitMiniRust` | MiniRust `PermissionProt::unprotect` + `Node::release_protector` + `TreeBorrowsMemory::end_call` |
+| `evalRawMutStaticWriteMiri` | `AllocationAccess.getPtrAllocation` (`write := true`): zero-size, `getAllocRawMut` read-only, `checkedBounds`, write hook |
 | `RetagStepErr.protectedReservedIMInvariant` | `AccessOutcome.ImpossibleProtectedReservedIM` / `NormalAccessStatus.PermissionInvariantFailure` (not UB) |
 | `KeyedAllocWorld.checkPtrAccess`, `LinearAllocWorld.checkPtrAccess` | `Miri.Memory.sizeAsI64` + `checkAndDerefPtr` via `ValidityMachine.checkPointerAccessResult` |
 | `checkNestedWideSafeRefChildSession`, `dynSizeAlign` | `ValidityVisitor.checkSafe` on wide places (`checkMetadata`, `size_and_align_of_val`) |
@@ -82,7 +85,17 @@ models cover `&mut` / `Box` parameters only
 (upstream mints `.frozen` / `.cell` children for shared references, see
 `fnEntry_shared_childPerms_outside_mut_models`); Models 1-4 blame the first failing FOREIGN node in list
 order whereas Model 5 and standalone `execFnEntryMutRetagTraversalOrderDirect` follow upstream reverse-
-children postorder (proved identical with no fallback on every `BorrowTreeRootedWF` tree); allocations
+children postorder (proved identical with no fallback on every `BorrowTreeRootedWF` tree), and the
+explicit accesses `execWorldRange{Read,Write}` and the protector-end access `execProtectorEndAccess` use
+the same list-order foreign blame (their success results are order-independent, see the `_ok_inv`
+inversions); function exit is modeled per allocation with the coarse node range, so a protected node
+written on only part of its range performs its implicit protector-end WRITE over the whole range (upstream
+decides per location), the wildcard-exposure update `updateExposureForProtectorRelease` is not modeled,
+and pinned Miri (`execFrameExitMiri`: all implicit accesses, then pop every protector) and MiniRust
+(`execFrameExitMiniRust`: access and unprotect entry by entry, no protected-self step, different kind
+table on unreachable shapes) are kept as separate definitions that coincide on single-entry frames whose
+protected node is neither `.disabled` nor an unaccessed `.unique`
+(`execFrameExit_miri_eq_miniRust_singleton`), with no agreement theorem for multi-entry frames; allocations
 carry no base addresses, so nested `dyn` vtable words are resolved through an explicit non-zero `vtBase`
 map (`validateWideDynSafePtrDeep`) and fail closed without one; only `.static` / `.memory` globals
 carry a byte payload; and `StaticTyDesc` models scalar/padding/`UnsafeCell`/struct composites
@@ -4628,7 +4641,11 @@ def execFnEntryMutRetagPrunedSourceOrder (w : FnEntryBorrowWorld)
 `Miri.Memory.Access` + `NormalTreeState.performAccess`): zero-sized writes succeed without resolving
 `writerTag` or checking mutability; non-zero writes reject `allocReadOnly` first, require `writerTag`
 to exist in `w.nodes`, check ancestors bottom-up before unpruned foreign nodes (`SkipSelfAndChildren`),
-and commit pruned updates. -/
+and commit pruned updates. The read-only check precedes the tag lookup exactly as upstream
+(`getAllocRawMut` runs before the Tree Borrows write hook reports `MissingTag`). As in Model 4, a failing
+FOREIGN node is blamed in `w.nodes` list order (upstream: reverse-children postorder); the success result
+is order-independent (`execWorldRangeWrite_ok_inv`). The writer's own descendants are FOREIGN
+(`VisitChildrenOfAccessed`), unlike in `execProtectorEndAccess`. -/
 def execWorldRangeWrite (w : FnEntryBorrowWorld) (writerTag rangeOffset rangeLen : Nat) :
     Except RetagStepErr FnEntryBorrowWorld :=
   if rangeLen == 0 then .ok w
@@ -4662,7 +4679,10 @@ def execWorldRangeWrite (w : FnEntryBorrowWorld) (writerTag rangeOffset rangeLen
 /-- Explicit range read through `readerTag` in a `FnEntryBorrowWorld` (aligned with pinned
 `Miri.Memory.Access` + `NormalTreeState.performAccess`): zero-sized reads succeed without resolving
 `readerTag`; non-zero reads require `readerTag` to exist in `w.nodes`, check ancestors bottom-up before
-unpruned foreign nodes (`SkipSelfAndChildren`), and commit pruned updates. -/
+unpruned foreign nodes (`SkipSelfAndChildren`), and commit pruned updates. As in Model 4, a failing
+FOREIGN node is blamed in `w.nodes` list order (upstream: reverse-children postorder); the success result
+is order-independent (`execWorldRangeRead_ok_inv`). The reader's own descendants are FOREIGN
+(`VisitChildrenOfAccessed`), unlike in `execProtectorEndAccess`. -/
 def execWorldRangeRead (w : FnEntryBorrowWorld) (readerTag rangeOffset rangeLen : Nat) :
     Except RetagStepErr FnEntryBorrowWorld :=
   if rangeLen == 0 then .ok w
@@ -4985,7 +5005,7 @@ def ForeignReadWriteErrorAligned (w : FnEntryBorrowWorld) (parentTag rangeOffset
     (stepNodeOnRangeRead w.activeProtectors false rangeOffset rangeLen n).isOk =
       (stepNodeOnRangeWrite w.activeProtectors false rangeOffset rangeLen n).isOk)
 
-private theorem mem_ancestorPathNodes_iff (nodes : List TreeTagNode) (start : Nat) (n : TreeTagNode) :
+theorem mem_ancestorPathNodes_iff (nodes : List TreeTagNode) (start : Nat) (n : TreeTagNode) :
     n ∈ ancestorPathNodes nodes start ↔
       n ∈ nodes ∧ (ancestorPathTags nodes start).contains n.tag = true := by
   unfold ancestorPathNodes
@@ -5003,7 +5023,7 @@ private theorem mem_ancestorPathNodes_iff (nodes : List TreeTagNode) (start : Na
     rw [List.mem_filter]
     exact ⟨hn, beq_self_eq_true n.tag⟩
 
-private theorem check_anc_and_foreign_ok_iff_mapNodesM
+theorem check_anc_and_foreign_ok_iff_mapNodesM
     (w : FnEntryBorrowWorld) (parentTag : Nat)
     (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode) (ys : List TreeTagNode) :
     (checkAncestorPathM w parentTag (step true) = .ok () ∧
@@ -5979,7 +5999,7 @@ def PrunedStepRel (w : FnEntryBorrowWorld) (parentTag : Nat) (isWrite : Bool) (o
     isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off len n = false ∧
     step false n = .ok n')
 
-private theorem prunedStep_ok_imp_rel (w : FnEntryBorrowWorld) (parentTag : Nat) (isWrite : Bool)
+theorem prunedStep_ok_imp_rel (w : FnEntryBorrowWorld) (parentTag : Nat) (isWrite : Bool)
     (off len : Nat) (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode) (x y : TreeTagNode)
     (hxy : (if (ancestorPathTags w.nodes parentTag).contains x.tag = true then step true x
       else if isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off len x = true then .ok x
@@ -6162,7 +6182,7 @@ theorem stepNodeOnRangeWrite_local_error_classification
           simp [hov, hprot] at h
           exact Or.inr ⟨rfl, rfl, h.symm⟩
 
-private theorem prunedPhases_ok_of_flat_ok (w : FnEntryBorrowWorld) (parentTag : Nat) (isWrite : Bool)
+theorem prunedPhases_ok_of_flat_ok (w : FnEntryBorrowWorld) (parentTag : Nat) (isWrite : Bool)
     (off len : Nat) (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode)
     (nodes3 : List TreeTagNode)
     (hm : mapNodesM (fun n => step ((ancestorPathTags w.nodes parentTag).contains n.tag) n) w.nodes =
@@ -6679,7 +6699,7 @@ structure BorrowTreeRootedWF (w : FnEntryBorrowWorld) (rootTag : Nat) : Prop whe
   tagsNodup : (w.nodes.map (·.tag)).Nodup
   reachesRoot : ∀ n ∈ w.nodes, ∃ d < w.nodes.length, ReachesRoot w.nodes rootTag d n.tag
 
-private theorem mem_of_findNode?_eq_some {nodes : List TreeTagNode} {t : Nat} {n : TreeTagNode}
+theorem mem_of_findNode?_eq_some {nodes : List TreeTagNode} {t : Nat} {n : TreeTagNode}
     (h : findNode? nodes t = some n) : n ∈ nodes ∧ n.tag = t := by
   induction nodes with
   | nil => simp [findNode?] at h
@@ -6696,7 +6716,7 @@ private theorem mem_of_findNode?_eq_some {nodes : List TreeTagNode} {t : Nat} {n
       rcases ih h with ⟨hm, ht⟩
       exact ⟨List.mem_cons_of_mem _ hm, ht⟩
 
-private theorem findNode?_eq_some_of_mem_of_nodup {nodes : List TreeTagNode}
+theorem findNode?_eq_some_of_mem_of_nodup {nodes : List TreeTagNode}
     (hnodup : (nodes.map (·.tag)).Nodup) {n : TreeTagNode} (hn : n ∈ nodes) :
     findNode? nodes n.tag = some n := by
   induction nodes with
@@ -6715,7 +6735,7 @@ private theorem findNode?_eq_some_of_mem_of_nodup {nodes : List TreeTagNode}
       rw [hb]
       exact ih hnodupRest hmem
 
-private theorem eq_of_mem_tag_eq_of_nodup {nodes : List TreeTagNode}
+theorem eq_of_mem_tag_eq_of_nodup {nodes : List TreeTagNode}
     (hnodup : (nodes.map (·.tag)).Nodup) {n₁ n₂ : TreeTagNode}
     (h₁ : n₁ ∈ nodes) (h₂ : n₂ ∈ nodes) (ht : n₁.tag = n₂.tag) : n₁ = n₂ := by
   have hf₁ := findNode?_eq_some_of_mem_of_nodup hnodup h₁
@@ -6724,7 +6744,7 @@ private theorem eq_of_mem_tag_eq_of_nodup {nodes : List TreeTagNode}
   rw [hf₁] at hf₂
   injection hf₂
 
-private theorem reachesRoot_depth_unique {nodes : List TreeTagNode} {rootTag d₁ d₂ t : Nat}
+theorem reachesRoot_depth_unique {nodes : List TreeTagNode} {rootTag d₁ d₂ t : Nat}
     (h₁ : ReachesRoot nodes rootTag d₁ t) (h₂ : ReachesRoot nodes rootTag d₂ t) : d₁ = d₂ := by
   induction h₁ generalizing d₂ with
   | root r hr hpar =>
@@ -6753,7 +6773,7 @@ private theorem reachesRoot_depth_unique {nodes : List TreeTagNode} {rootTag d�
       subst hp
       exact congrArg (· + 1) (ih hprev')
 
-private theorem ancestorPathTagsAux_fuel_irrel {nodes : List TreeTagNode} {rootTag d t : Nat}
+theorem ancestorPathTagsAux_fuel_irrel {nodes : List TreeTagNode} {rootTag d t : Nat}
     (h : ReachesRoot nodes rootTag d t) :
     ∀ f₁ f₂, f₁ ≥ d → f₂ ≥ d → ancestorPathTagsAux nodes f₁ t = ancestorPathTagsAux nodes f₂ t := by
   induction h with
@@ -6771,7 +6791,7 @@ private theorem ancestorPathTagsAux_fuel_irrel {nodes : List TreeTagNode} {rootT
         simp only [ancestorPathTagsAux, hn, hpar]
         exact congrArg (t :: ·) (ih f₁' f₂' (by omega) (by omega))
 
-private theorem root_mem_ancestorPathTagsAux {nodes : List TreeTagNode} {rootTag d t : Nat}
+theorem root_mem_ancestorPathTagsAux {nodes : List TreeTagNode} {rootTag d t : Nat}
     (h : ReachesRoot nodes rootTag d t) :
     ∀ fuel ≥ d, rootTag ∈ ancestorPathTagsAux nodes fuel t := by
   induction h with
@@ -6786,7 +6806,7 @@ private theorem root_mem_ancestorPathTagsAux {nodes : List TreeTagNode} {rootTag
       simp only [ancestorPathTagsAux, hn, hpar]
       exact List.mem_cons_of_mem _ (ih f' (by omega))
 
-private theorem mem_ancestorPathTagsAux_reachesRoot_le {nodes : List TreeTagNode} {rootTag d t : Nat}
+theorem mem_ancestorPathTagsAux_reachesRoot_le {nodes : List TreeTagNode} {rootTag d t : Nat}
     (h : ReachesRoot nodes rootTag d t) :
     ∀ fuel ≥ d, ∀ a ∈ ancestorPathTagsAux nodes fuel t,
       ∃ da ≤ d, ReachesRoot nodes rootTag da a := by
@@ -6810,7 +6830,7 @@ private theorem mem_ancestorPathTagsAux_reachesRoot_le {nodes : List TreeTagNode
       · rcases ih f' (by omega) a htail with ⟨da, hda, hra⟩
         exact ⟨da, by omega, hra⟩
 
-private theorem parent_mem_ancestorPathTagsAux_of_mem {nodes : List TreeTagNode} {rootTag d t : Nat}
+theorem parent_mem_ancestorPathTagsAux_of_mem {nodes : List TreeTagNode} {rootTag d t : Nat}
     (h : ReachesRoot nodes rootTag d t) :
     ∀ fuel ≥ d, ∀ a n p, a ∈ ancestorPathTagsAux nodes fuel t →
       findNode? nodes a = some n → n.parentTag = some p → p ∈ ancestorPathTagsAux nodes fuel t := by
@@ -7256,7 +7276,7 @@ theorem mem_foreignVisitScheduleNodes_iff_activeForeign_of_rootedWF
     · rw [List.mem_filter]
       exact ⟨hnMem, beq_self_eq_true n.tag⟩
 
-private theorem stepNode_foreign_ok_of_skip (activeProtectors : List Nat) (isWrite : Bool)
+theorem stepNode_foreign_ok_of_skip (activeProtectors : List Nat) (isWrite : Bool)
     (off len : Nat) (n : TreeTagNode) (hskip : foreignNodeSkipsSubtree isWrite off len n = true) :
     (if isWrite then stepNodeOnRangeWrite activeProtectors false off len n
      else stepNodeOnRangeRead activeProtectors false off len n) = .ok n := by
@@ -8067,7 +8087,7 @@ theorem RetagShape.freshWF {w w' : FnEntryBorrowWorld} {parentTag off len : Nat}
     · exact Nat.lt_succ_self _
     · exact Nat.lt_succ_of_lt (hwf.activeBelow q hq')
 
-private theorem reachesRoot_cons_fresh_of_nodeMetaRel {w : FnEntryBorrowWorld}
+theorem reachesRoot_cons_fresh_of_nodeMetaRel {w : FnEntryBorrowWorld}
     (hwf : BorrowTreeFreshWF w) {child : TreeTagNode} (hct : child.tag = w.nextTag)
     {nodes' : List TreeTagNode} (hrel : ListRel NodeMetaRel w.nodes nodes')
     {rootTag d t : Nat} (h : ReachesRoot w.nodes rootTag d t) :
@@ -8149,7 +8169,7 @@ theorem RetagShape.noProtectedReservedIM {w w' : FnEntryBorrowWorld} {parentTag 
       simp only [List.any_cons, hne, Bool.false_or]
       exact hmProt
 
-private theorem prunedStepRel_read_nodeMetaRel (w : FnEntryBorrowWorld) (parentTag : Nat)
+theorem prunedStepRel_read_nodeMetaRel (w : FnEntryBorrowWorld) (parentTag : Nat)
     (isWrite : Bool) (off len : Nat) (n n' : TreeTagNode)
     (h : PrunedStepRel w parentTag isWrite off len
       (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m) n n') :
@@ -8159,7 +8179,7 @@ private theorem prunedStepRel_read_nodeMetaRel (w : FnEntryBorrowWorld) (parentT
   · subst hs; exact NodeMetaRel.refl _
   · exact stepNodeOnRangeRead_nodeMetaRel hs
 
-private theorem prunedStepRel_write_nodeMetaRel (w : FnEntryBorrowWorld) (parentTag : Nat)
+theorem prunedStepRel_write_nodeMetaRel (w : FnEntryBorrowWorld) (parentTag : Nat)
     (isWrite : Bool) (off len : Nat) (n n' : TreeTagNode)
     (h : PrunedStepRel w parentTag isWrite off len
       (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m) n n') :
@@ -8339,12 +8359,16 @@ theorem borrowTreeTagsWF_not_inductive :
     rcases hn with rfl | rfl <;> decide
   · exact ⟨rfl, rfl⟩
 
-/-- Function-exit protector release (`TreeBorrows` `end_call`): removes `protId` from `activeProtectors`,
-leaving tags, parent links, permissions, and fresh counters unchanged. -/
+/-- Protector bookkeeping pop ONLY (`GlobalState.endCall`, `GlobalState.lean:146-148`): removes `protId`
+from `activeProtectors`, leaving tags, parent links, permissions, and fresh counters unchanged. This is NOT
+the whole upstream function exit: pinned Miri first performs the implicit protector-end access
+(`BorrowTree.releaseProtector`, `TreeState.lean:1036-1060`) while the protector is still active, which can
+mutate foreign nodes and can be UB. The faithful step is `execReleaseProtector` / `execFrameExitMiri`
+(`execReleaseProtector_implicitAccess_separation`). -/
 def releaseProtector (w : FnEntryBorrowWorld) (protId : Nat) : FnEntryBorrowWorld :=
   { w with activeProtectors := w.activeProtectors.filter (· != protId) }
 
-private theorem reachesRoot_of_listRel_nodeMetaRel {xs ys : List TreeTagNode}
+theorem reachesRoot_of_listRel_nodeMetaRel {xs ys : List TreeTagNode}
     (hrel : ListRel NodeMetaRel xs ys) {rootTag d t : Nat} (h : ReachesRoot xs rootTag d t) :
     ReachesRoot ys rootTag d t := by
   induction h with
@@ -8355,7 +8379,7 @@ private theorem reachesRoot_of_listRel_nodeMetaRel {xs ys : List TreeTagNode}
     rcases ListRel.nodeMetaRel_findNode? hrel hn with ⟨y, hy, hmr⟩
     exact ReachesRoot.step d t p y hy (by rw [hmr.2.1]; exact hpar) ih
 
-private theorem fnEntryBorrowInv_of_listRel_nodeMetaRel {w : FnEntryBorrowWorld} {rootTag : Nat}
+theorem fnEntryBorrowInv_of_listRel_nodeMetaRel {w : FnEntryBorrowWorld} {rootTag : Nat}
     (hinv : FnEntryBorrowInv w rootTag) {nodes' : List TreeTagNode}
     (hrel : ListRel NodeMetaRel w.nodes nodes') :
     FnEntryBorrowInv { w with nodes := nodes' } rootTag := by
@@ -8488,8 +8512,10 @@ theorem execWorldRangeRead_preserves_inv {w w' : FnEntryBorrowWorld} {rootTag : 
                 · exact stepNodeOnRangeRead_nodeMetaRel hxy
             exact fnEntryBorrowInv_of_listRel_nodeMetaRel hinv hrel
 
-/-- **Full-lifecycle preservation**: releasing a protector on function exit (`releaseProtector`)
-preserves `FnEntryBorrowInv` (filtering `activeProtectors` only weakens protection). -/
+/-- **Full-lifecycle preservation (bookkeeping pop)**: popping a protector id (`releaseProtector`)
+preserves `FnEntryBorrowInv` (filtering `activeProtectors` only weakens protection). The faithful
+function exit, including the implicit protector-end access, is covered by
+`execReleaseProtector_preserves_inv` / `execFrameExitMiri_preserves_inv`. -/
 theorem releaseProtector_preserves_inv {w : FnEntryBorrowWorld} {rootTag : Nat}
     (protId : Nat) (hinv : FnEntryBorrowInv w rootTag) :
     FnEntryBorrowInv (releaseProtector w protId) rootTag := by
@@ -8534,6 +8560,717 @@ theorem execWorldRangeWrite_readOnly_and_missingTag_rejected
   · intro hlen hfn
     have hb : (len == 0) = false := beq_false_of_ne hlen
     simp [execWorldRangeRead, hb, hfn]
+
+/-! ### 2A.9 Function-Exit Protector Release: Implicit Protector-End Access (`perform_protector_end_access`) -/
+
+/-- Pinned Miri `Permission.associatedAccess` (`Permissions.lean:268-271`) gated by the per-location
+`accessed` bit (`BorrowTree.releaseProtector`, `TreeState.lean:1047-1052`): the implicit access performed
+THROUGH a protected tag when its protector is released. `none` = no access (`.cell`, or a location never
+accessed through the tag), `some true` = WRITE (`.unique`), `some false` = READ (every other permission,
+including `.disabled`). -/
+def protectorEndAccessIsWrite? (n : TreeTagNode) : Option Bool :=
+  if n.accessed then
+    match n.perm with
+    | .cell => none
+    | .unique => some true
+    | _ => some false
+  else none
+
+/-- MiniRust `PermissionProt::unprotect` (`spec/mem/tree_borrows/state_machine_protected.md`): `Unique`
+always emits a WRITE; `Reserved` / `Frozen` emit a READ only when `had_local_read`; `Disabled` and `Cell`
+emit nothing. Differs from `protectorEndAccessIsWrite?` exactly on an accessed `.disabled` node and on an
+unaccessed `.unique` node (`protectorEndAccess_miri_eq_miniRust`,
+`protectorEndAccess_miri_miniRust_separation`). -/
+def protectorEndAccessIsWriteMiniRust? (n : TreeTagNode) : Option Bool :=
+  match n.perm with
+  | .unique => some true
+  | .reservedFrz _ | .reservedIM | .frozen => if n.accessed then some false else none
+  | .disabled | .cell => none
+
+/-- The Miri and MiniRust protector-end access kinds agree on every node that is not `.disabled` and whose
+`.unique` permission has been accessed (both hold for every protected node reachable upstream: a protected
+accessed node never becomes `.disabled` without UB, and `.unique` only arises from a local write). -/
+theorem protectorEndAccess_miri_eq_miniRust (n : TreeTagNode)
+    (hdis : n.perm ≠ .disabled) (huniq : n.perm = .unique → n.accessed = true) :
+    protectorEndAccessIsWrite? n = protectorEndAccessIsWriteMiniRust? n := by
+  unfold protectorEndAccessIsWrite? protectorEndAccessIsWriteMiniRust?
+  cases hp : n.perm with
+  | disabled => exact absurd hp hdis
+  | unique => simp [huniq hp]
+  | cell => cases n.accessed <;> rfl
+  | frozen => cases n.accessed <;> rfl
+  | reservedIM => cases n.accessed <;> rfl
+  | reservedFrz c => cases n.accessed <;> rfl
+
+/-- Separation of the two access-kind tables outside that envelope: an accessed `.disabled` node (Miri
+READ, MiniRust nothing) and an unaccessed `.unique` node (Miri nothing, MiniRust WRITE). -/
+theorem protectorEndAccess_miri_miniRust_separation :
+    protectorEndAccessIsWrite? ⟨1, some 0, .disabled, 0, 8, some 7, true⟩ = some false ∧
+    protectorEndAccessIsWriteMiniRust? ⟨1, some 0, .disabled, 0, 8, some 7, true⟩ = none ∧
+    protectorEndAccessIsWrite? ⟨1, some 0, .unique, 0, 8, some 7, false⟩ = none ∧
+    protectorEndAccessIsWriteMiniRust? ⟨1, some 0, .unique, 0, 8, some 7, false⟩ = some true :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Whether `n` is a STRICT descendant of `sourceTag` (`sourceTag` occurs strictly above `n` on its
+bottom-up ancestor path). -/
+def isStrictDescendantOf (nodes : List TreeTagNode) (sourceTag : Nat) (n : TreeTagNode) : Bool :=
+  (ancestorPathTags nodes n.tag).tail.contains sourceTag
+
+/-- Per-kind single-node step shared by the protector-end access. -/
+def stepNodeOnRangeAccess (activeProtectors : List Nat) (isWrite isLocal : Bool) (off len : Nat)
+    (n : TreeTagNode) : Except RetagStepErr TreeTagNode :=
+  if isWrite then stepNodeOnRangeWrite activeProtectors isLocal off len n
+  else stepNodeOnRangeRead activeProtectors isLocal off len n
+
+/-- Implicit protector-end access through `sourceTag` on `[off, off + len)` (pinned
+`BorrowTree.releaseProtector` → `performTreeAccessAt … .SkipChildrenOfAccessed`, `TreeState.lean:1036-1060`;
+`TraversalTree.traverse`, `Traversal.lean:71-84, 102-112`): `sourceTag` and its ancestors take the LOCAL
+step bottom-up; the STRICT DESCENDANTS of `sourceTag` are not visited at all (`SkipChildrenOfAccessed`,
+unlike an ordinary access, which treats them as foreign); every other node takes the FOREIGN step unless it
+sits beneath a `SkipSelfAndChildren` foreign ancestor. `activeProtectors` is left untouched: the released
+tag — and every other protector of the exiting frame — is still protected during this access. No
+allocation-mutability check is made (the release operates on the borrow tree directly, not through
+`getAllocRawMut`). -/
+def execProtectorEndAccess (w : FnEntryBorrowWorld) (sourceTag : Nat) (isWrite : Bool)
+    (off len : Nat) : Except RetagStepErr FnEntryBorrowWorld :=
+  let ancestors := ancestorPathTags w.nodes sourceTag
+  let stepPruned (n : TreeTagNode) : Except RetagStepErr TreeTagNode :=
+    if ancestors.contains n.tag then
+      stepNodeOnRangeAccess w.activeProtectors isWrite true off len n
+    else if isStrictDescendantOf w.nodes sourceTag n ||
+        isPrunedForeignNode w.nodes ancestors isWrite off len n then
+      .ok n
+    else
+      stepNodeOnRangeAccess w.activeProtectors isWrite false off len n
+  let activeForeign := w.nodes.filter (fun n =>
+    !ancestors.contains n.tag &&
+      !(isStrictDescendantOf w.nodes sourceTag n ||
+        isPrunedForeignNode w.nodes ancestors isWrite off len n))
+  match checkAncestorPathM w sourceTag
+      (stepNodeOnRangeAccess w.activeProtectors isWrite true off len) with
+  | .error e => .error e
+  | .ok () =>
+    match checkNodesM (stepNodeOnRangeAccess w.activeProtectors isWrite false off len) activeForeign with
+    | .error e => .error e
+    | .ok () =>
+      match mapNodesM stepPruned w.nodes with
+      | .error e => .error e
+      | .ok nodes' => .ok { w with nodes := nodes' }
+
+/-- Per-node success relation of `execProtectorEndAccess`: LOCAL step on the access path, identity on the
+strict descendants of the released tag and beneath skipped foreign subtrees, FOREIGN step elsewhere. -/
+def ProtectorEndStepRel (w : FnEntryBorrowWorld) (sourceTag : Nat) (isWrite : Bool) (off len : Nat)
+    (n n' : TreeTagNode) : Prop :=
+  ((ancestorPathTags w.nodes sourceTag).contains n.tag = true ∧
+    stepNodeOnRangeAccess w.activeProtectors isWrite true off len n = .ok n') ∨
+  ((ancestorPathTags w.nodes sourceTag).contains n.tag = false ∧
+    (isStrictDescendantOf w.nodes sourceTag n = true ∨
+      isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len n = true) ∧
+    n' = n) ∨
+  ((ancestorPathTags w.nodes sourceTag).contains n.tag = false ∧
+    isStrictDescendantOf w.nodes sourceTag n = false ∧
+    isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len n = false ∧
+    stepNodeOnRangeAccess w.activeProtectors isWrite false off len n = .ok n')
+
+theorem stepNodeOnRangeAccess_nodeMetaRel {activeProtectors : List Nat} {isWrite isLocal : Bool}
+    {off len : Nat} {n n' : TreeTagNode}
+    (h : stepNodeOnRangeAccess activeProtectors isWrite isLocal off len n = .ok n') :
+    NodeMetaRel n n' := by
+  unfold stepNodeOnRangeAccess at h
+  cases isWrite with
+  | true => exact stepNodeOnRangeWrite_nodeMetaRel h
+  | false => exact stepNodeOnRangeRead_nodeMetaRel h
+
+theorem ProtectorEndStepRel.nodeMetaRel {w : FnEntryBorrowWorld} {sourceTag : Nat} {isWrite : Bool}
+    {off len : Nat} {n n' : TreeTagNode}
+    (h : ProtectorEndStepRel w sourceTag isWrite off len n n') : NodeMetaRel n n' := by
+  rcases h with ⟨_, hs⟩ | ⟨_, _, hs⟩ | ⟨_, _, _, hs⟩
+  · exact stepNodeOnRangeAccess_nodeMetaRel hs
+  · subst hs; exact NodeMetaRel.refl _
+  · exact stepNodeOnRangeAccess_nodeMetaRel hs
+
+/-- **Inversion for the protector-end access**: on success only `nodes` changes, pointwise by
+`ProtectorEndStepRel` (so `activeProtectors`, the counters, and the allocation flags are untouched). -/
+theorem execProtectorEndAccess_ok_inv {w w' : FnEntryBorrowWorld} {sourceTag : Nat} {isWrite : Bool}
+    {off len : Nat} (hok : execProtectorEndAccess w sourceTag isWrite off len = .ok w') :
+    ∃ nodes', w' = { w with nodes := nodes' } ∧
+      ListRel (ProtectorEndStepRel w sourceTag isWrite off len) w.nodes nodes' := by
+  unfold execProtectorEndAccess at hok
+  cases hanc : checkAncestorPathM w sourceTag
+      (stepNodeOnRangeAccess w.activeProtectors isWrite true off len) with
+  | error _ => rw [hanc] at hok; cases hok
+  | ok _ =>
+    rw [hanc] at hok
+    simp only at hok
+    split at hok
+    · cases hok
+    · split at hok
+      · cases hok
+      · rename_i nodes' hmap
+        injection hok with hw
+        refine ⟨nodes', hw.symm, ?_⟩
+        have hrel0 := (mapNodesM_ok_iff _ _ _).1 hmap
+        refine ListRel.imp (fun x y hxy => ?_) hrel0
+        unfold ProtectorEndStepRel
+        cases ha : (ancestorPathTags w.nodes sourceTag).contains x.tag with
+        | true =>
+          simp only [ha, ↓reduceIte] at hxy
+          exact Or.inl ⟨rfl, hxy⟩
+        | false =>
+          simp only [ha, Bool.false_eq_true, ↓reduceIte] at hxy
+          cases hd : isStrictDescendantOf w.nodes sourceTag x with
+          | true =>
+            simp only [hd, Bool.true_or, ↓reduceIte] at hxy
+            injection hxy with hEq
+            exact Or.inr (Or.inl ⟨rfl, Or.inl rfl, hEq.symm⟩)
+          | false =>
+            simp only [hd, Bool.false_or] at hxy
+            cases hp : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len x with
+            | true =>
+              simp only [hp, ↓reduceIte] at hxy
+              injection hxy with hEq
+              exact Or.inr (Or.inl ⟨rfl, Or.inr rfl, hEq.symm⟩)
+            | false =>
+              simp only [hp, Bool.false_eq_true, ↓reduceIte] at hxy
+              exact Or.inr (Or.inr ⟨rfl, rfl, rfl, hxy⟩)
+
+/-- `SkipChildrenOfAccessed`: a successful protector-end access leaves every strict descendant of the
+released tag (that is not itself on the access path) literally unchanged. -/
+theorem execProtectorEndAccess_descendants_untouched {w w' : FnEntryBorrowWorld} {sourceTag : Nat}
+    {isWrite : Bool} {off len : Nat}
+    (hok : execProtectorEndAccess w sourceTag isWrite off len = .ok w') :
+    ListRel (fun n n' =>
+      (ancestorPathTags w.nodes sourceTag).contains n.tag = false →
+        isStrictDescendantOf w.nodes sourceTag n = true → n' = n) w.nodes w'.nodes := by
+  rcases execProtectorEndAccess_ok_inv hok with ⟨nodes', hw, hrel⟩
+  subst hw
+  refine ListRel.imp (fun x y hxy hanc hdesc => ?_) hrel
+  rcases hxy with ⟨ha, _⟩ | ⟨_, _, hEq⟩ | ⟨_, hd, _, _⟩
+  · rw [ha] at hanc; cases hanc
+  · exact hEq
+  · rw [hd] at hdesc; cases hdesc
+
+/-- The protector-end access preserves `FnEntryBorrowInv`. -/
+theorem execProtectorEndAccess_preserves_inv {w w' : FnEntryBorrowWorld} {rootTag sourceTag : Nat}
+    {isWrite : Bool} {off len : Nat} (hinv : FnEntryBorrowInv w rootTag)
+    (hok : execProtectorEndAccess w sourceTag isWrite off len = .ok w') :
+    FnEntryBorrowInv w' rootTag := by
+  rcases execProtectorEndAccess_ok_inv hok with ⟨nodes', hw, hrel⟩
+  subst hw
+  exact fnEntryBorrowInv_of_listRel_nodeMetaRel hinv
+    (ListRel.imp (fun _ _ h => ProtectorEndStepRel.nodeMetaRel h) hrel)
+
+/-- MiniRust `Node::release_protector` skips the protected node itself because "the nodes are all
+invariant under the respective access" (`spec/mem/tree_borrows/tree.md`). This is that invariance for the
+pinned Miri local step: on an accessed, non-`.disabled` node, the LOCAL step of its own associated access
+kind is the identity, under any protector set. -/
+theorem protectorEnd_self_step_invariant (activeProtectors : List Nat) (off len : Nat) (n : TreeTagNode)
+    (isWrite : Bool) (hkind : protectorEndAccessIsWrite? n = some isWrite) (hdis : n.perm ≠ .disabled) :
+    stepNodeOnRangeAccess activeProtectors isWrite true off len n = .ok n := by
+  rcases n with ⟨tag, par, perm, ro, rl, prot, acc⟩
+  unfold protectorEndAccessIsWrite? at hkind
+  simp only at hkind hdis
+  cases acc with
+  | false => simp at hkind
+  | true =>
+    simp only [↓reduceIte] at hkind
+    unfold stepNodeOnRangeAccess stepNodeOnRangeWrite stepNodeOnRangeRead
+    cases perm with
+    | disabled => exact absurd rfl hdis
+    | cell => cases hkind
+    | unique =>
+      injection hkind with hk; subst hk
+      cases rangesOverlap off len ro rl <;> rfl
+    | frozen =>
+      injection hkind with hk; subst hk
+      cases rangesOverlap off len ro rl <;> rfl
+    | reservedIM =>
+      injection hkind with hk; subst hk
+      cases rangesOverlap off len ro rl <;> rfl
+    | reservedFrz c =>
+      injection hkind with hk; subst hk
+      cases rangesOverlap off len ro rl <;> rfl
+
+/-- Tag-level protector-end access under an access-kind table `kind?` (`protectorEndAccessIsWrite?` for
+pinned Miri, `protectorEndAccessIsWriteMiniRust?` for MiniRust): look the protected tag up (a missing tag
+is the upstream machine-invariant failure `ProtectorReleaseStatus.MissingTag`, reported as
+`.missingParentTag`), and perform the implicit access over the node's own range when the table asks for
+one. Protector bookkeeping is NOT changed here. -/
+def execProtectorEndAccessFor (kind? : TreeTagNode → Option Bool) (w : FnEntryBorrowWorld)
+    (protectedTag : Nat) : Except RetagStepErr FnEntryBorrowWorld :=
+  match findNode? w.nodes protectedTag with
+  | none => .error (.missingParentTag protectedTag)
+  | some n =>
+    match kind? n with
+    | none => .ok w
+    | some isWrite => execProtectorEndAccess w protectedTag isWrite n.rangeOffset n.rangeLen
+
+theorem execProtectorEndAccessFor_preserves_inv {kind? : TreeTagNode → Option Bool}
+    {w w' : FnEntryBorrowWorld} {rootTag protectedTag : Nat} (hinv : FnEntryBorrowInv w rootTag)
+    (hok : execProtectorEndAccessFor kind? w protectedTag = .ok w') :
+    FnEntryBorrowInv w' rootTag ∧ w'.activeProtectors = w.activeProtectors := by
+  unfold execProtectorEndAccessFor at hok
+  cases hfn : findNode? w.nodes protectedTag with
+  | none => rw [hfn] at hok; cases hok
+  | some n =>
+    rw [hfn] at hok
+    simp only at hok
+    cases hk : kind? n with
+    | none =>
+      rw [hk] at hok
+      injection hok with hw
+      subst hw
+      exact ⟨hinv, rfl⟩
+    | some isWrite =>
+      rw [hk] at hok
+      refine ⟨execProtectorEndAccess_preserves_inv hinv hok, ?_⟩
+      rcases execProtectorEndAccess_ok_inv hok with ⟨nodes', hw, _⟩
+      subst hw
+      rfl
+
+/-- Single-protector function exit, pinned-Miri kind table: the implicit protector-end access through
+`protectedTag` (protector still active), THEN the bookkeeping pop `releaseProtector` (`end_call`). -/
+def execReleaseProtector (w : FnEntryBorrowWorld) (protectedTag protId : Nat) :
+    Except RetagStepErr FnEntryBorrowWorld :=
+  match execProtectorEndAccessFor protectorEndAccessIsWrite? w protectedTag with
+  | .error e => .error e
+  | .ok w' => .ok (releaseProtector w' protId)
+
+/-- Pop a list of protector ids (`GlobalState.endCall`, `GlobalState.lean:146-148`). -/
+def releaseProtectors (w : FnEntryBorrowWorld) (protIds : List Nat) : FnEntryBorrowWorld :=
+  protIds.foldl releaseProtector w
+
+theorem releaseProtectors_preserves_inv {rootTag : Nat} (protIds : List Nat) :
+    ∀ {w : FnEntryBorrowWorld}, FnEntryBorrowInv w rootTag →
+      FnEntryBorrowInv (releaseProtectors w protIds) rootTag := by
+  induction protIds with
+  | nil => intro w h; exact h
+  | cons p rest ih =>
+    intro w h
+    exact ih (releaseProtector_preserves_inv p h)
+
+/-- All implicit protector-end accesses of an exiting frame, in frame order, WITHOUT popping any
+protector in between (`MachineHooks.beforeStackPopWithEnsure`, `MachineHooks.lean:400-423`). -/
+def execProtectorEndAccesses (kind? : TreeTagNode → Option Bool) :
+    FnEntryBorrowWorld → List Nat → Except RetagStepErr FnEntryBorrowWorld
+  | w, [] => .ok w
+  | w, t :: rest =>
+    match execProtectorEndAccessFor kind? w t with
+    | .error e => .error e
+    | .ok w' => execProtectorEndAccesses kind? w' rest
+
+/-- **Pinned-Miri frame exit** over the frame's `(protectedTag, protId)` list: every implicit
+protector-end access runs while ALL of the frame's protectors are still active; only afterwards does
+`end_call` pop them all (`MachineHooks.lean:400-428`). -/
+def execFrameExitMiri (w : FnEntryBorrowWorld) (frame : List (Nat × Nat)) :
+    Except RetagStepErr FnEntryBorrowWorld :=
+  match execProtectorEndAccesses protectorEndAccessIsWrite? w (frame.map (·.1)) with
+  | .error e => .error e
+  | .ok w' => .ok (releaseProtectors w' (frame.map (·.2)))
+
+/-- **Sequential frame exit** (MiniRust `end_call`: `extra.protectors.try_map(release_protector)`,
+`spec/mem/tree_borrows/memory.md`): each entry performs its implicit access and is unprotected BEFORE the
+next entry is processed. -/
+def execFrameExitSequential (kind? : TreeTagNode → Option Bool) :
+    FnEntryBorrowWorld → List (Nat × Nat) → Except RetagStepErr FnEntryBorrowWorld
+  | w, [] => .ok w
+  | w, (t, p) :: rest =>
+    match execProtectorEndAccessFor kind? w t with
+    | .error e => .error e
+    | .ok w' => execFrameExitSequential kind? (releaseProtector w' p) rest
+
+/-- MiniRust frame exit: sequential order with the MiniRust access-kind table. -/
+def execFrameExitMiniRust (w : FnEntryBorrowWorld) (frame : List (Nat × Nat)) :
+    Except RetagStepErr FnEntryBorrowWorld :=
+  execFrameExitSequential protectorEndAccessIsWriteMiniRust? w frame
+
+theorem execProtectorEndAccesses_preserves_inv {kind? : TreeTagNode → Option Bool} {rootTag : Nat}
+    (tags : List Nat) :
+    ∀ {w w' : FnEntryBorrowWorld}, FnEntryBorrowInv w rootTag →
+      execProtectorEndAccesses kind? w tags = .ok w' →
+      FnEntryBorrowInv w' rootTag ∧ w'.activeProtectors = w.activeProtectors := by
+  induction tags with
+  | nil =>
+    intro w w' hinv hok
+    injection hok with hw
+    subst hw
+    exact ⟨hinv, rfl⟩
+  | cons t rest ih =>
+    intro w w' hinv hok
+    simp only [execProtectorEndAccesses] at hok
+    cases h1 : execProtectorEndAccessFor kind? w t with
+    | error _ => rw [h1] at hok; cases hok
+    | ok w1 =>
+      rw [h1] at hok
+      rcases execProtectorEndAccessFor_preserves_inv hinv h1 with ⟨hinv1, hact1⟩
+      rcases ih hinv1 hok with ⟨hinv', hact'⟩
+      exact ⟨hinv', hact'.trans hact1⟩
+
+/-- **Full-lifecycle preservation (function exit)**: the faithful single-protector release — implicit
+protector-end access followed by the pop — preserves `FnEntryBorrowInv`. -/
+theorem execReleaseProtector_preserves_inv {w w' : FnEntryBorrowWorld} {rootTag : Nat}
+    (protectedTag protId : Nat) (hinv : FnEntryBorrowInv w rootTag)
+    (hok : execReleaseProtector w protectedTag protId = .ok w') :
+    FnEntryBorrowInv w' rootTag := by
+  unfold execReleaseProtector at hok
+  cases h1 : execProtectorEndAccessFor protectorEndAccessIsWrite? w protectedTag with
+  | error _ => rw [h1] at hok; cases hok
+  | ok w1 =>
+    rw [h1] at hok
+    injection hok with hw
+    subst hw
+    exact releaseProtector_preserves_inv protId (execProtectorEndAccessFor_preserves_inv hinv h1).1
+
+/-- The pinned-Miri frame exit preserves `FnEntryBorrowInv`. -/
+theorem execFrameExitMiri_preserves_inv {w w' : FnEntryBorrowWorld} {rootTag : Nat}
+    (frame : List (Nat × Nat)) (hinv : FnEntryBorrowInv w rootTag)
+    (hok : execFrameExitMiri w frame = .ok w') :
+    FnEntryBorrowInv w' rootTag := by
+  unfold execFrameExitMiri at hok
+  cases h1 : execProtectorEndAccesses protectorEndAccessIsWrite? w (frame.map (·.1)) with
+  | error _ => rw [h1] at hok; cases hok
+  | ok w1 =>
+    rw [h1] at hok
+    injection hok with hw
+    subst hw
+    exact releaseProtectors_preserves_inv _ (execProtectorEndAccesses_preserves_inv _ hinv h1).1
+
+/-- The sequential frame exit (hence the MiniRust frame exit) preserves `FnEntryBorrowInv` for every
+access-kind table. -/
+theorem execFrameExitSequential_preserves_inv {kind? : TreeTagNode → Option Bool} {rootTag : Nat}
+    (frame : List (Nat × Nat)) :
+    ∀ {w w' : FnEntryBorrowWorld}, FnEntryBorrowInv w rootTag →
+      execFrameExitSequential kind? w frame = .ok w' → FnEntryBorrowInv w' rootTag := by
+  induction frame with
+  | nil =>
+    intro w w' hinv hok
+    injection hok with hw
+    subst hw
+    exact hinv
+  | cons tp rest ih =>
+    intro w w' hinv hok
+    rcases tp with ⟨t, p⟩
+    simp only [execFrameExitSequential] at hok
+    cases h1 : execProtectorEndAccessFor kind? w t with
+    | error _ => rw [h1] at hok; cases hok
+    | ok w1 =>
+      rw [h1] at hok
+      exact ih (releaseProtector_preserves_inv p (execProtectorEndAccessFor_preserves_inv hinv h1).1) hok
+
+/-- On a single-entry frame the pinned-Miri order and the sequential order coincide with
+`execReleaseProtector` (same kind table). -/
+theorem execFrameExit_singleton_eq (w : FnEntryBorrowWorld) (protectedTag protId : Nat) :
+    execFrameExitMiri w [(protectedTag, protId)] = execReleaseProtector w protectedTag protId ∧
+    execFrameExitSequential protectorEndAccessIsWrite? w [(protectedTag, protId)] =
+      execReleaseProtector w protectedTag protId := by
+  constructor
+  · simp only [execFrameExitMiri, execReleaseProtector, List.map_cons, List.map_nil,
+      execProtectorEndAccesses, releaseProtectors, List.foldl_cons, List.foldl_nil]
+    cases execProtectorEndAccessFor protectorEndAccessIsWrite? w protectedTag <;> rfl
+  · simp only [execFrameExitSequential, execReleaseProtector]
+
+/-- When the kind table asks for no access (`.cell`, or a node never accessed through the tag), the
+faithful release IS the bookkeeping pop. -/
+theorem execReleaseProtector_eq_pop_of_noAccess (w : FnEntryBorrowWorld) (protectedTag protId : Nat)
+    (n : TreeTagNode) (hfn : findNode? w.nodes protectedTag = some n)
+    (hnone : n.perm = .cell ∨ n.accessed = false) :
+    execReleaseProtector w protectedTag protId = .ok (releaseProtector w protId) := by
+  have hk : protectorEndAccessIsWrite? n = none := by
+    unfold protectorEndAccessIsWrite?
+    rcases hnone with hc | ha
+    · rw [hc]; cases n.accessed <;> rfl
+    · rw [ha]; rfl
+  simp [execReleaseProtector, execProtectorEndAccessFor, hfn, hk]
+
+/-- **Separation: the implicit protector-end access is observable.** World: root `0`; protected accessed
+`.unique` child `1` (protector `7`); its unprotected `.reservedFrz` sibling `2`; and `1`'s own unprotected
+`.reservedFrz` child `3`. (i) The faithful release WRITES through `1`: sibling `2` is disabled, while `1`'s
+child `3` is untouched (`SkipChildrenOfAccessed`) — so it differs from the bookkeeping pop. (ii) An explicit
+write through `1` (`execWorldRangeWrite`) ALSO disables child `3`. (iii) If sibling `2` is itself protected
+by a still-active protector, the release is UB (`protectedForeignConflict`), which the pop can never be. -/
+theorem execReleaseProtector_implicitAccess_separation :
+    let x : TreeTagNode := ⟨1, some 0, .unique, 0, 8, some 7, true⟩
+    let y : TreeTagNode := ⟨2, some 0, .reservedFrz false, 0, 8, none, true⟩
+    let c : TreeTagNode := ⟨3, some 1, .reservedFrz false, 0, 8, none, true⟩
+    let r : TreeTagNode := ⟨0, none, .unique, 0, 8, none, true⟩
+    let w : FnEntryBorrowWorld :=
+      { nodes := [c, y, x, r], activeProtectors := [7], nextTag := 4, nextProtector := 8 }
+    let wProt : FnEntryBorrowWorld :=
+      { nodes := [c, { y with protector := some 5 }, x, r], activeProtectors := [7, 5]
+        nextTag := 4, nextProtector := 8 }
+    execReleaseProtector w 1 7 =
+      .ok { w with nodes := [c, { y with perm := .disabled }, x, r], activeProtectors := [] } ∧
+    execReleaseProtector w 1 7 ≠ .ok (releaseProtector w 7) ∧
+    execWorldRangeWrite w 1 0 8 =
+      .ok { w with nodes := [{ c with perm := .disabled }, { y with perm := .disabled }, x, r] } ∧
+    execReleaseProtector wProt 1 7 = .error (.protectedForeignConflict 2) := by
+  intro x y c r w wProt
+  have h1 : execReleaseProtector w 1 7 =
+      .ok { w with nodes := [c, { y with perm := .disabled }, x, r], activeProtectors := [] } := rfl
+  refine ⟨h1, ?_, rfl, rfl⟩
+  intro h
+  rw [h1] at h
+  injection h with h
+  exact absurd (congrArg (fun w' => w'.nodes.map (·.perm)) h) (by decide)
+
+/-- **Separation: pinned-Miri vs sequential (MiniRust) frame order.** World: root `0`; protected accessed
+CONFLICTED `.reservedFrz true` node `1` (protector `8`); its protected accessed `.unique` child `2`
+(protector `7`). Frame order `[(1, 8), (2, 7)]`. Pinned Miri keeps protector `8` active while `2`'s implicit
+WRITE reaches its ancestor `1`, so the local write on a protected conflicted `Reserved` is UB
+(`conflictedProtectedChildWrite`); the sequential order has already unprotected `1`, whose local write then
+succeeds. The kind tables agree on both nodes, so the divergence is purely the pop order. (This world is
+not reachable upstream — `2` could not have become `.unique` beneath a protected conflicted parent — which
+is exactly why the two exits agree on reachable states.) -/
+theorem execFrameExit_miri_vs_sequential_separation :
+    let a : TreeTagNode := ⟨1, some 0, .reservedFrz true, 0, 8, some 8, true⟩
+    let x : TreeTagNode := ⟨2, some 1, .unique, 0, 8, some 7, true⟩
+    let r : TreeTagNode := ⟨0, none, .unique, 0, 8, none, true⟩
+    let w : FnEntryBorrowWorld :=
+      { nodes := [x, a, r], activeProtectors := [7, 8], nextTag := 3, nextProtector := 9 }
+    execFrameExitMiri w [(1, 8), (2, 7)] = .error (.conflictedProtectedChildWrite 1) ∧
+    execFrameExitSequential protectorEndAccessIsWrite? w [(1, 8), (2, 7)] =
+      .ok { w with nodes := [x, { a with perm := .unique }, r], activeProtectors := [] } ∧
+    execFrameExitMiniRust w [(1, 8), (2, 7)] =
+      .ok { w with nodes := [x, { a with perm := .unique }, r], activeProtectors := [] } ∧
+    protectorEndAccessIsWrite? a = protectorEndAccessIsWriteMiniRust? a ∧
+    protectorEndAccessIsWrite? x = protectorEndAccessIsWriteMiniRust? x := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **Inversion for explicit range writes** (non-zero length): the allocation is writable, the writer tag
+exists, and only `nodes` changes, pointwise by Model 4's `PrunedStepRel` under the write step. -/
+theorem execWorldRangeWrite_ok_inv {w w' : FnEntryBorrowWorld} {writerTag off len : Nat}
+    (hlen : len ≠ 0) (hok : execWorldRangeWrite w writerTag off len = .ok w') :
+    w.allocReadOnly = false ∧ (∃ n, findNode? w.nodes writerTag = some n) ∧
+    ∃ nodes', w' = { w with nodes := nodes' } ∧
+      ListRel (PrunedStepRel w writerTag true off len
+        (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m)) w.nodes nodes' := by
+  have hlen0 : (len == 0) = false := beq_false_of_ne hlen
+  unfold execWorldRangeWrite at hok
+  simp only [hlen0, Bool.false_eq_true, ↓reduceIte] at hok
+  cases hro : w.allocReadOnly with
+  | true => simp [hro] at hok
+  | false =>
+    simp only [hro, Bool.false_eq_true, ↓reduceIte] at hok
+    cases hfn : findNode? w.nodes writerTag with
+    | none => simp [hfn] at hok
+    | some pn =>
+      simp only [hfn] at hok
+      refine ⟨rfl, ⟨pn, rfl⟩, ?_⟩
+      split at hok
+      · cases hok
+      · split at hok
+        · cases hok
+        · split at hok
+          · cases hok
+          · rename_i nodes' hmap
+            injection hok with hw
+            refine ⟨nodes', hw.symm, ?_⟩
+            exact ListRel.imp (fun x y hxy => prunedStep_ok_imp_rel w writerTag true off len
+              (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m) x y hxy)
+              ((mapNodesM_ok_iff _ _ _).1 hmap)
+
+/-- **Inversion for explicit range reads** (non-zero length): the reader tag exists, and only `nodes`
+changes, pointwise by Model 4's `PrunedStepRel` under the read step. -/
+theorem execWorldRangeRead_ok_inv {w w' : FnEntryBorrowWorld} {readerTag off len : Nat}
+    (hlen : len ≠ 0) (hok : execWorldRangeRead w readerTag off len = .ok w') :
+    (∃ n, findNode? w.nodes readerTag = some n) ∧
+    ∃ nodes', w' = { w with nodes := nodes' } ∧
+      ListRel (PrunedStepRel w readerTag false off len
+        (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m)) w.nodes nodes' := by
+  have hlen0 : (len == 0) = false := beq_false_of_ne hlen
+  unfold execWorldRangeRead at hok
+  simp only [hlen0, Bool.false_eq_true, ↓reduceIte] at hok
+  cases hfn : findNode? w.nodes readerTag with
+  | none => simp [hfn] at hok
+  | some pn =>
+    simp only [hfn] at hok
+    refine ⟨⟨pn, rfl⟩, ?_⟩
+    split at hok
+    · cases hok
+    · split at hok
+      · cases hok
+      · split at hok
+        · cases hok
+        · rename_i nodes' hmap
+          injection hok with hw
+          refine ⟨nodes', hw.symm, ?_⟩
+          exact ListRel.imp (fun x y hxy => prunedStep_ok_imp_rel w readerTag false off len
+            (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m) x y hxy)
+            ((mapNodesM_ok_iff _ _ _).1 hmap)
+
+/-- **Order-independence of the protector-end access**: it succeeds with result `w'` EXACTLY when every
+node admits its `ProtectorEndStepRel` step. The bottom-up ancestor check and the list-order foreign check
+never reject a world on which every per-node step succeeds, so only the BLAMED tag of a failing access
+depends on the visit order (upstream reverse-children postorder, MiniRust root-first pre-order). -/
+theorem execProtectorEndAccess_ok_iff (w w' : FnEntryBorrowWorld) (sourceTag : Nat) (isWrite : Bool)
+    (off len : Nat) :
+    execProtectorEndAccess w sourceTag isWrite off len = .ok w' ↔
+      ∃ nodes', w' = { w with nodes := nodes' } ∧
+        ListRel (ProtectorEndStepRel w sourceTag isWrite off len) w.nodes nodes' := by
+  constructor
+  · exact execProtectorEndAccess_ok_inv
+  · rintro ⟨nodes', hw, hrel⟩
+    subst hw
+    have hmap : mapNodesM (fun n =>
+        if (ancestorPathTags w.nodes sourceTag).contains n.tag then
+          stepNodeOnRangeAccess w.activeProtectors isWrite true off len n
+        else if isStrictDescendantOf w.nodes sourceTag n ||
+            isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len n then
+          .ok n
+        else stepNodeOnRangeAccess w.activeProtectors isWrite false off len n) w.nodes = .ok nodes' := by
+      rw [mapNodesM_ok_iff]
+      refine ListRel.imp (fun x y hxy => ?_) hrel
+      rcases hxy with ⟨ha, hs⟩ | ⟨ha, hsk, hEq⟩ | ⟨ha, hd, hp, hs⟩
+      · simp only [ha, ↓reduceIte]; exact hs
+      · subst hEq
+        rcases hsk with hd | hp
+        · simp only [ha, hd, Bool.false_eq_true, ↓reduceIte, Bool.true_or]
+        · simp only [ha, hp, Bool.false_eq_true, ↓reduceIte, Bool.or_true]
+      · simp only [ha, hd, hp, Bool.false_eq_true, ↓reduceIte, Bool.or_self]; exact hs
+    have hanc : checkAncestorPathM w sourceTag
+        (stepNodeOnRangeAccess w.activeProtectors isWrite true off len) = .ok () := by
+      rw [checkAncestorPathM, checkNodesM_ok_iff]
+      intro n hn
+      rcases (mem_ancestorPathNodes_iff w.nodes sourceTag n).1 hn with ⟨hmem, hc⟩
+      rcases ListRel.exists_of_mem_left hrel hmem with ⟨y, _, hxy⟩
+      rcases hxy with ⟨_, hs⟩ | ⟨ha, _, _⟩ | ⟨ha, _, _, _⟩
+      · exact ⟨y, hs⟩
+      · rw [hc] at ha; cases ha
+      · rw [hc] at ha; cases ha
+    have hfor : checkNodesM (stepNodeOnRangeAccess w.activeProtectors isWrite false off len)
+        (w.nodes.filter (fun n =>
+          !(ancestorPathTags w.nodes sourceTag).contains n.tag &&
+            !(isStrictDescendantOf w.nodes sourceTag n ||
+              isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len n))) =
+        .ok () := by
+      rw [checkNodesM_ok_iff]
+      intro n hn
+      rw [List.mem_filter] at hn
+      rcases hn with ⟨hmem, hcond⟩
+      simp only [Bool.and_eq_true, Bool.not_eq_true', Bool.or_eq_false_iff] at hcond
+      rcases ListRel.exists_of_mem_left hrel hmem with ⟨y, _, hxy⟩
+      rcases hxy with ⟨ha, _⟩ | ⟨_, hsk, _⟩ | ⟨_, _, _, hs⟩
+      · rw [hcond.1] at ha; cases ha
+      · rcases hsk with hd | hp
+        · rw [hcond.2.1] at hd; cases hd
+        · rw [hcond.2.2] at hp; cases hp
+      · exact ⟨y, hs⟩
+    unfold execProtectorEndAccess
+    simp only [hanc, hfor, hmap]
+
+/-- Converse of `prunedStep_ok_imp_rel` at the level of the three Model 4 phases: whenever every node
+admits its `PrunedStepRel` step, the bottom-up ancestor check, the list-order unpruned-foreign check, and
+the committing map ALL succeed (with exactly the related node list). -/
+theorem prunedPhases_ok_of_listRel (w : FnEntryBorrowWorld) (parentTag : Nat) (isWrite : Bool)
+    (off len : Nat) (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode)
+    (nodes' : List TreeTagNode)
+    (hrel : ListRel (PrunedStepRel w parentTag isWrite off len step) w.nodes nodes') :
+    checkAncestorPathM w parentTag (step true) = .ok () ∧
+    checkNodesM (step false) (w.nodes.filter (fun n =>
+      !(ancestorPathTags w.nodes parentTag).contains n.tag &&
+        !isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off len n)) = .ok () ∧
+    mapNodesM (fun n =>
+        if (ancestorPathTags w.nodes parentTag).contains n.tag then step true n
+        else if isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off len n then .ok n
+        else step false n) w.nodes = .ok nodes' := by
+  refine ⟨?_, ?_, ?_⟩
+  · rw [checkAncestorPathM, checkNodesM_ok_iff]
+    intro n hn
+    rcases (mem_ancestorPathNodes_iff w.nodes parentTag n).1 hn with ⟨hmem, hc⟩
+    rcases ListRel.exists_of_mem_left hrel hmem with ⟨y, _, hxy⟩
+    rcases hxy with ⟨_, hs⟩ | ⟨ha, _, _⟩ | ⟨ha, _, _⟩
+    · exact ⟨y, hs⟩
+    · rw [hc] at ha; cases ha
+    · rw [hc] at ha; cases ha
+  · rw [checkNodesM_ok_iff]
+    intro n hn
+    rw [List.mem_filter] at hn
+    rcases hn with ⟨hmem, hcond⟩
+    simp only [Bool.and_eq_true, Bool.not_eq_true'] at hcond
+    rcases ListRel.exists_of_mem_left hrel hmem with ⟨y, _, hxy⟩
+    rcases hxy with ⟨ha, _⟩ | ⟨_, hp, _⟩ | ⟨_, _, hs⟩
+    · rw [hcond.1] at ha; cases ha
+    · rw [hcond.2] at hp; cases hp
+    · exact ⟨y, hs⟩
+  · rw [mapNodesM_ok_iff]
+    refine ListRel.imp (fun x y hxy => ?_) hrel
+    rcases hxy with ⟨ha, hs⟩ | ⟨ha, hp, hEq⟩ | ⟨ha, hp, hs⟩
+    · simp only [ha, ↓reduceIte]; exact hs
+    · subst hEq; simp only [ha, hp, Bool.false_eq_true, ↓reduceIte]
+    · simp only [ha, hp, Bool.false_eq_true, ↓reduceIte]; exact hs
+
+/-- **Order-independence of explicit range writes** (non-zero length): `execWorldRangeWrite` succeeds with
+`w'` EXACTLY when the allocation is writable, the writer tag exists, and every node admits its Model 4
+`PrunedStepRel` write step. -/
+theorem execWorldRangeWrite_ok_iff (w w' : FnEntryBorrowWorld) (writerTag off len : Nat)
+    (hlen : len ≠ 0) :
+    execWorldRangeWrite w writerTag off len = .ok w' ↔
+      w.allocReadOnly = false ∧ (∃ n, findNode? w.nodes writerTag = some n) ∧
+      ∃ nodes', w' = { w with nodes := nodes' } ∧
+        ListRel (PrunedStepRel w writerTag true off len
+          (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m)) w.nodes nodes' := by
+  constructor
+  · exact execWorldRangeWrite_ok_inv hlen
+  · rintro ⟨hro, ⟨pn, hfn⟩, nodes', hw, hrel⟩
+    subst hw
+    have hlen0 : (len == 0) = false := beq_false_of_ne hlen
+    rcases prunedPhases_ok_of_listRel w writerTag true off len _ nodes' hrel with ⟨h1, h2, h3⟩
+    have h1' : checkAncestorPathM w writerTag
+        (stepNodeOnRangeWrite w.activeProtectors true off len) = .ok () := h1
+    have h2' : checkNodesM (stepNodeOnRangeWrite w.activeProtectors false off len)
+        (w.nodes.filter (fun n => !(ancestorPathTags w.nodes writerTag).contains n.tag &&
+          !isPrunedForeignNode w.nodes (ancestorPathTags w.nodes writerTag) true off len n)) = .ok () := h2
+    have h3' : mapNodesM (fun n =>
+        if (ancestorPathTags w.nodes writerTag).contains n.tag then
+          stepNodeOnRangeWrite w.activeProtectors true off len n
+        else if isPrunedForeignNode w.nodes (ancestorPathTags w.nodes writerTag) true off len n then .ok n
+        else stepNodeOnRangeWrite w.activeProtectors false off len n) w.nodes = .ok nodes' := h3
+    unfold execWorldRangeWrite
+    simp only [hlen0, hro, hfn, h1', h2', h3', Bool.false_eq_true, ↓reduceIte]
+
+/-- **Order-independence of explicit range reads** (non-zero length): `execWorldRangeRead` succeeds with
+`w'` EXACTLY when the reader tag exists and every node admits its Model 4 `PrunedStepRel` read step. -/
+theorem execWorldRangeRead_ok_iff (w w' : FnEntryBorrowWorld) (readerTag off len : Nat)
+    (hlen : len ≠ 0) :
+    execWorldRangeRead w readerTag off len = .ok w' ↔
+      (∃ n, findNode? w.nodes readerTag = some n) ∧
+      ∃ nodes', w' = { w with nodes := nodes' } ∧
+        ListRel (PrunedStepRel w readerTag false off len
+          (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m)) w.nodes nodes' := by
+  constructor
+  · exact execWorldRangeRead_ok_inv hlen
+  · rintro ⟨⟨pn, hfn⟩, nodes', hw, hrel⟩
+    subst hw
+    have hlen0 : (len == 0) = false := beq_false_of_ne hlen
+    rcases prunedPhases_ok_of_listRel w readerTag false off len _ nodes' hrel with ⟨h1, h2, h3⟩
+    have h1' : checkAncestorPathM w readerTag
+        (stepNodeOnRangeRead w.activeProtectors true off len) = .ok () := h1
+    have h2' : checkNodesM (stepNodeOnRangeRead w.activeProtectors false off len)
+        (w.nodes.filter (fun n => !(ancestorPathTags w.nodes readerTag).contains n.tag &&
+          !isPrunedForeignNode w.nodes (ancestorPathTags w.nodes readerTag) false off len n)) = .ok () := h2
+    have h3' : mapNodesM (fun n =>
+        if (ancestorPathTags w.nodes readerTag).contains n.tag then
+          stepNodeOnRangeRead w.activeProtectors true off len n
+        else if isPrunedForeignNode w.nodes (ancestorPathTags w.nodes readerTag) false off len n then .ok n
+        else stepNodeOnRangeRead w.activeProtectors false off len n) w.nodes = .ok nodes' := h3
+    unfold execWorldRangeRead
+    simp only [hlen0, hfn, h1', h2', h3', Bool.false_eq_true, ↓reduceIte]
+
+/-- **Miri / MiniRust agreement on single-protector frames**: when the protected node lies in the
+reachable envelope of `protectorEndAccess_miri_eq_miniRust` (not `.disabled`; `.unique` only if accessed),
+the MiniRust frame exit and the pinned-Miri frame exit of a one-entry frame are the SAME computation —
+same implicit access, same pop. This is the case of a single protected `&mut` / `Box` parameter. -/
+theorem execFrameExit_miri_eq_miniRust_singleton (w : FnEntryBorrowWorld) (protectedTag protId : Nat)
+    (n : TreeTagNode) (hfn : findNode? w.nodes protectedTag = some n)
+    (hdis : n.perm ≠ .disabled) (huniq : n.perm = .unique → n.accessed = true) :
+    execFrameExitMiniRust w [(protectedTag, protId)] = execFrameExitMiri w [(protectedTag, protId)] := by
+  have hk := protectorEndAccess_miri_eq_miniRust n hdis huniq
+  have hfor : execProtectorEndAccessFor protectorEndAccessIsWriteMiniRust? w protectedTag =
+      execProtectorEndAccessFor protectorEndAccessIsWrite? w protectedTag := by
+    simp only [execProtectorEndAccessFor, hfn, hk]
+  simp only [execFrameExitMiniRust, execFrameExitSequential, execFrameExitMiri, List.map_cons,
+    List.map_nil, execProtectorEndAccesses, releaseProtectors, List.foldl_cons, List.foldl_nil, hfor]
+  cases execProtectorEndAccessFor protectorEndAccessIsWrite? w protectedTag <;> rfl
 
 /-! ### 2B. Static-Access Temporary Retag (`charon#1620`) & Syntactic `is_freeze` Static Mutability -/
 
@@ -8615,7 +9352,7 @@ def sortCellsByOffset : List (Nat × Nat) → List (Nat × Nat)
 each interval (clamped to `totalSize` so malformed out-of-bounds cell offsets never emit `.freeze`
 segments extending past `totalSize`), then the interval itself. The cursor never moves backwards (`max`),
 so even overlapping intervals cannot produce a `.freeze` segment over interior-mutable bytes. -/
-private def buildFreezeSegmentsAux (cursor totalSize : Nat) : List (Nat × Nat) → List StaticFreezeSegment
+def buildFreezeSegmentsAux (cursor totalSize : Nat) : List (Nat × Nat) → List StaticFreezeSegment
   | [] =>
     if cursor < totalSize then [⟨cursor, totalSize - cursor, .freeze⟩] else []
   | (cellOff, cellLen) :: rest =>
@@ -8680,13 +9417,20 @@ def evalRawMutStaticWriteTB (st : StaticBorrowState) (writeOff writeLen : Nat) :
         | _ => false
     if blocked then .ub else .ok
 
-/-- Full Miri static write check: zero-sized writes succeed without checking bounds or mutability
-(`Access.lean:139`), then bounds, then `staticAllocMutability desc`, then Tree Borrows. -/
+/-- Full Miri static write check, in the order of pinned `AllocationAccess.getPtrAllocation`
+(`write := true`, `AllocationAccess.lean:52-88`): zero-sized writes succeed without resolving the pointer
+(`Access.lean:139`); a non-zero write first reaches `MemoryState.getAllocRawMut`, which rejects
+`Mutability::Not` allocations (`readOnlyAllocation`, `MemoryState.lean:875-876`) BEFORE `checkedBounds`
+runs; only then come the bounds check and the Tree Borrows write hook. So an out-of-bounds non-zero write
+into an immutable static reports `.readOnlyAlloc`, not `.outOfBounds`
+(`static_readOnly_precedes_outOfBounds`). The upstream `sizeAsI64` rejection of sizes `≥ 2^63` is not
+modeled as a separate outcome: such a write is `.outOfBounds` on mutable statics whose descriptor fits in
+`isize::MAX` bytes. -/
 def evalRawMutStaticWriteMiri (desc : StaticTyDesc) (st : StaticBorrowState)
     (writeOff writeLen : Nat) : StaticWriteOutcome :=
   if writeLen == 0 then .ok
-  else if writeOff + writeLen > st.totalSize then .outOfBounds
   else if staticAllocMutability desc == .not then .readOnlyAlloc
+  else if writeOff + writeLen > st.totalSize then .outOfBounds
   else evalRawMutStaticWriteTB st writeOff writeLen
 
 private theorem rangesOverlap_one_true {writeOff segOff segLen : Nat}
@@ -8726,15 +9470,23 @@ theorem static_pureFreeze_preserved_ub_vs_erased_unsound
       StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells, sortCellsByOffset, buildFreezeSegmentsAux, hsz, hle, hov]
   · simp [evalRawMutStaticWriteTB, retagStaticErasedAt, StaticTyDesc.totalByteSize, hnz, hle]
 
+/-- **Read-only precedes bounds** (`MemoryState.getAllocRawMut`, `MemoryState.lean:875-876`, runs before
+`checkedBounds` in `AllocationAccess.getPtrAllocation`): EVERY non-zero-sized write into a
+`Mutability::Not` static — in bounds or not, whatever the borrow state — reports `.readOnlyAlloc`. -/
+theorem static_readOnly_precedes_outOfBounds (desc : StaticTyDesc) (st : StaticBorrowState)
+    (writeOff writeLen : Nat) (hmut : staticAllocMutability desc = .not) (hlen : writeLen ≠ 0) :
+    evalRawMutStaticWriteMiri desc st writeOff writeLen = .readOnlyAlloc := by
+  have hb : (writeLen == 0) = false := beq_false_of_ne hlen
+  simp [evalRawMutStaticWriteMiri, hb, hmut]
+
+/-- The erased raw write into a pure-`Freeze` static is caught by the read-only allocation check at EVERY
+offset (the mutability check precedes the bounds check, so no in-bounds hypothesis is needed). -/
 theorem static_pureFreeze_erased_write_caught_by_readOnly_alloc
-    (sz rootTag writeOff : Nat) (hoff : writeOff < sz) :
+    (sz rootTag writeOff : Nat) :
     staticAllocMutability (.freezeScalar sz) = .not ∧
     evalRawMutStaticWriteMiri (.freezeScalar sz)
-      (retagStaticErasedAt (.freezeScalar sz) rootTag) writeOff 1 = .readOnlyAlloc := by
-  have hle : ¬ (writeOff + 1 > sz) := by omega
-  refine ⟨rfl, ?_⟩
-  simp [evalRawMutStaticWriteMiri, retagStaticErasedAt, StaticTyDesc.totalByteSize,
-    staticAllocMutability, StaticTyDesc.isSyntacticFreeze, hle]
+      (retagStaticErasedAt (.freezeScalar sz) rootTag) writeOff 1 = .readOnlyAlloc :=
+  ⟨rfl, static_readOnly_precedes_outOfBounds _ _ _ _ rfl (by decide)⟩
 
 theorem static_pureUnsafeCell_preserved_write_ok
     (sz rootTag tmpTag writeOff : Nat) (hsz : 0 < sz) (hoff : writeOff < sz) :
@@ -8927,7 +9679,7 @@ theorem sortCellsByOffset_sorted (xs : List (Nat × Nat)) :
 
 /-- `.freeze` segments emitted for memory-ordered intervals are EXACTLY the in-bounds bytes at or
 after the cursor that lie in no interval — for arbitrary (even overlapping) intervals. -/
-private theorem buildFreezeSegmentsAux_freeze_iff (total : Nat) :
+theorem buildFreezeSegmentsAux_freeze_iff (total : Nat) :
     ∀ (cells : List (Nat × Nat)) (cursor : Nat), CellsOffsetSorted cells →
       ∀ b, b < total →
         ((∃ s ∈ buildFreezeSegmentsAux cursor total cells,
@@ -8996,7 +9748,7 @@ private theorem buildFreezeSegmentsAux_freeze_iff (total : Nat) :
           ⟨hmax, fun d hd => hall d (List.mem_cons_of_mem _ hd)⟩ with ⟨s, hs, hk, hlo, hhi⟩
         exact ⟨s, Or.inr hs, hk, hlo, hhi⟩
 
-private theorem buildFreezeSegmentsAux_freeze_in_bounds (total : Nat) :
+theorem buildFreezeSegmentsAux_freeze_in_bounds (total : Nat) :
     ∀ (cells : List (Nat × Nat)) (cursor : Nat) (s : StaticFreezeSegment),
       s ∈ buildFreezeSegmentsAux cursor total cells → s.kind = .freeze →
       0 < s.len ∧ s.offset + s.len ≤ total := by
@@ -9069,7 +9821,7 @@ theorem staticFreezeSegments_freeze_byte_iff (desc : StaticTyDesc) (b : Nat)
   rw [hcore, hany]
   exact ⟨fun h => h.2, fun h => ⟨Nat.zero_le _, h⟩⟩
 
-private theorem rangesOverlap_iff_exists_byte (off len so sl : Nat) :
+theorem rangesOverlap_iff_exists_byte (off len so sl : Nat) :
     rangesOverlap off len so sl = true ↔ ∃ b, off ≤ b ∧ b < off + len ∧ so ≤ b ∧ b < so + sl := by
   unfold rangesOverlap
   simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, decide_eq_true_eq]
@@ -9083,7 +9835,7 @@ private theorem rangesOverlap_iff_exists_byte (off len so sl : Nat) :
 
 /-- Tree Borrows write check on a non-empty in-bounds range: UB exactly when some overlapping segment is
 `.frozen` or `.disabled`, and `.ok` otherwise. -/
-private theorem evalRawMutStaticWriteTB_ub_iff (st : StaticBorrowState) (off len : Nat)
+theorem evalRawMutStaticWriteTB_ub_iff (st : StaticBorrowState) (off len : Nat)
     (hin : off + len ≤ st.totalSize) (hlen : len ≠ 0) :
     (evalRawMutStaticWriteTB st off len = .ub ↔
       ∃ p ∈ st.segments, rangesOverlap off len p.1.offset p.1.len = true ∧
@@ -9630,7 +10382,7 @@ inductive RawPtrErr where
   | expectedWideDynMeta
   deriving DecidableEq, Repr
 
-private def checkRawPtrShape (metaKind : Option DstMetadataKind) (ptr : RawPtrVal) :
+def checkRawPtrShape (metaKind : Option DstMetadataKind) (ptr : RawPtrVal) :
     Except RawPtrErr Unit :=
   match metaKind, ptr with
   | none, .thin _ => .ok ()
@@ -10105,7 +10857,7 @@ def DynExistentialSpec.effectivePreds (s : DynExistentialSpec) : List VTablePred
   | none => s.predicates
 
 /-- Canonical pair-based sorting & deduplication of non-auto-trait predicates (`(stableKey, id)`). -/
-private def insertKeyIdSorted (p : Nat × Nat) : List (Nat × Nat) → List (Nat × Nat)
+def insertKeyIdSorted (p : Nat × Nat) : List (Nat × Nat) → List (Nat × Nat)
   | [] => [p]
   | h :: t =>
     if p.1 < h.1 || (p.1 == h.1 && p.2 < h.2) then
@@ -10115,11 +10867,11 @@ private def insertKeyIdSorted (p : Nat × Nat) : List (Nat × Nat) → List (Nat
     else
       h :: insertKeyIdSorted p t
 
-private def sortDedupKeyIds : List (Nat × Nat) → List (Nat × Nat)
+def sortDedupKeyIds : List (Nat × Nat) → List (Nat × Nat)
   | [] => []
   | h :: t => insertKeyIdSorted h (sortDedupKeyIds t)
 
-private theorem insertKeyIdSorted_comm (a b : Nat × Nat) (xs : List (Nat × Nat)) :
+theorem insertKeyIdSorted_comm (a b : Nat × Nat) (xs : List (Nat × Nat)) :
     insertKeyIdSorted a (insertKeyIdSorted b xs) = insertKeyIdSorted b (insertKeyIdSorted a xs) := by
   have htrich : ∀ p q : Nat × Nat,
       (p.1 < q.1 || (p.1 == q.1 && p.2 < q.2)) = true ∨
@@ -10200,7 +10952,7 @@ private theorem insertKeyIdSorted_comm (a b : Nat × Nat) (xs : List (Nat × Nat
       · rcases hanti x b hxb with ⟨hbxn, hbxeq, hxbeq⟩
         simp [haxn, haxeq, hbxn, hbxeq, insertKeyIdSorted, ih]
 
-private theorem sortDedupKeyIds_perm {xs ys : List (Nat × Nat)} (h : List.Perm xs ys) :
+theorem sortDedupKeyIds_perm {xs ys : List (Nat × Nat)} (h : List.Perm xs ys) :
     sortDedupKeyIds xs = sortDedupKeyIds ys := by
   induction h with
   | nil => rfl
