@@ -2847,14 +2847,13 @@ def _adv_col(stripped: str, pos: int) -> int:
 
 
 def _adv_step_col(stripped: str, pos: int) -> int:
-    """Column that later lines must exceed to continue the tactic starting at `pos`: the
-    tactic's own column when it starts its line (after optional focusing bullets), else the
-    indentation of the line it sits on (`have h := by simpa using` + continuation lines)."""
+    """Column of the first tactic token on `pos`'s line (after leading whitespace and any
+    focusing bullets `·`, `.`, `-`, `+`, `*`). Later lines must exceed this column to
+    continue the tactic sequence starting on that line."""
     line_start = stripped.rfind("\n", 0, pos) + 1
     k = line_start
     while k < pos and stripped[k] in " \t":
         k += 1
-    indent = k - line_start
     while k < pos:
         ch = stripped[k]
         if ch in " \t·":
@@ -2863,7 +2862,7 @@ def _adv_step_col(stripped: str, pos: int) -> int:
             k += 1
         else:
             break
-    return pos - line_start if k == pos else indent
+    return k - line_start
 
 
 def _adv_match_close(stripped: str, open_idx: int, n: int) -> int:
@@ -2996,12 +2995,13 @@ def _bracket_unfolds_advance_stmt(bracket_text: str) -> bool:
 
 def _parse_simp_call(
     stripped: str, s_idx: int, n: int, has_guillemets: bool = False
-) -> tuple[str, bool, int, bool, str, tuple[str, ...] | None, int] | None:
-    """`(tactic_kind, is_dsimp, end, has_only, bracket_text, at_locs, using_pos)` of the
-    simp-family call whose `simp` is at `s_idx` (`dsimp`, `simp`, `simp?`, `simp!`, `simpa`,
-    `simp_all`, `simp_arith`, `simp_rw`, ...), or `None` when `simp` is only part of a longer
-    name (`foo.simp`, `simp_wf`, `my_simp`, `«simp»`). `using_pos` is the offset of `simpa`'s
-    `using` keyword or `-1`.
+) -> tuple[str, bool, int, int, bool, str, tuple[str, ...] | None, int] | None:
+    """`(tactic_kind, is_dsimp, args_start, end, has_only, bracket_text, at_locs, using_pos)`
+    of the simp-family call whose `simp` is at `s_idx` (`dsimp`, `simp`, `simp?`, `simp!`,
+    `simpa`, `simpa ? !`, `simp_all`, `simp_arith`, `simp_rw`, ...), or `None` when `simp`
+    is only part of a longer name (`foo.simp`, `simp_wf`, `my_simp`, `«simp»`). `args_start`
+    is the offset immediately past the tactic head and any `?`/`!` marks; `using_pos` is the
+    offset of `simpa`'s `using` keyword or `-1`.
 
     `stripped[s_idx:end]` covers named argument groups (`(config := ...)`, `(disch := ...)`),
     `+opt` / `-opt`, `only`, the `[...]` lemma list, optional `at <locs>`, and (for `simpa`)
@@ -3032,15 +3032,21 @@ def _parse_simp_call(
     if cur < n and (_is_ident_char(stripped[cur]) or stripped[cur] in ".»"):
         return None
     marks = stripped[marks_start:cur]
-    if not marks:
-        k_mark = _adv_skip_ws(stripped, cur, n)
-        if k_mark < n and stripped[k_mark] in "!?":
-            m_end = k_mark
-            while m_end < n and m_end - k_mark < 2 and stripped[m_end] in "!?":
-                m_end += 1
-            if m_end >= n or not (_is_ident_char(stripped[m_end]) or stripped[m_end] in ".«»"):
-                marks = stripped[k_mark:m_end]
-                cur = m_end
+    # Allow same-line whitespace-separated `?` / `!` marks (e.g. `simpa ? !`, `simp !`).
+    while len(marks) < 2:
+        k_mark = cur
+        while k_mark < n and stripped[k_mark] in " \t":
+            k_mark += 1
+        if k_mark >= n or stripped[k_mark] not in "!?":
+            break
+        m_end = k_mark
+        while m_end < n and len(marks) + (m_end - k_mark) < 2 and stripped[m_end] in "!?":
+            m_end += 1
+        if m_end < n and (_is_ident_char(stripped[m_end]) or stripped[m_end] in ".«»"):
+            break
+        marks += stripped[k_mark:m_end]
+        cur = m_end
+    args_start = cur
     tactic_kind = ("d" if is_dsimp else "") + "simp" + variant + marks
 
     res = _advisory_regexes()
@@ -3090,7 +3096,7 @@ def _parse_simp_call(
         if _adv_word_at(stripped, k, "using", n):
             using_pos = k
             end = _adv_scan_to(stripped, k + 5, n, step_col + 1, _ADV_USING_STOPS)[0]
-    return tactic_kind, is_dsimp, end, has_only, bracket_text, at_locs, using_pos
+    return tactic_kind, is_dsimp, args_start, end, has_only, bracket_text, at_locs, using_pos
 
 
 def _advance_stmt_projection_chains(
@@ -3182,7 +3188,7 @@ def _enclosing_simp_call(
     while s != -1 and calls < _ADV_MAX_SIMP_CANDIDATES:
         call = _parse_simp_call(stripped, s, n, has_guillemets)
         if call is not None:
-            if call[2] >= b:
+            if call[3] >= b:
                 return call[0], call[1]
             calls += 1
         s = stripped.rfind("simp", lo, s)
@@ -3298,7 +3304,7 @@ def _simp_step_at(
         call = _parse_simp_call(stripped, s, n, has_guillemets)
         if call is None:
             return None
-        tactic_kind, is_dsimp, call_end, _, bracket_text, at_locs, using_pos = call
+        tactic_kind, is_dsimp, args_start, call_end, _, bracket_text, at_locs, using_pos = call
         has_star = at_locs is not None and "*" in at_locs
         loc_set = (
             frozenset(("⊢",))
@@ -3310,7 +3316,6 @@ def _simp_step_at(
                 return tactic_kind, s
             if rem_targets & loc_set:
                 return tactic_kind, s
-            args_start = s + len(tactic_kind)
             args_slice = stripped[args_start:call_end]
             using_rel = using_pos + 5 - args_start if using_pos != -1 else -1
             for hyp in rem_targets:
@@ -3373,8 +3378,9 @@ def _extract_statement_bound_hyp(stripped: str, kw_end: int, stmt_end: int) -> s
 
 def _statement_seq_col(stripped: str, kw_pos: int, col: int) -> int:
     """When `statement_kw` at `kw_pos` immediately follows a top-level `;` or `<;>` tactic
-    separator on the same line (e.g. `  intro h; change <chain>\\n  simp`), return the
-    line's step column so a dedented sibling tactic at that column is checked too."""
+    separator on the same line (e.g. `  intro h; change <chain>\\n  simp` or
+    `  have h0 := 1; change <chain>\\n  simp`), return the tactic sequence's column so a
+    dedented sibling tactic at that column is checked too."""
     line_start = stripped.rfind("\n", 0, kw_pos) + 1
     if ";" not in stripped[line_start:kw_pos]:
         return col
@@ -3386,6 +3392,8 @@ def _statement_seq_col(stripped: str, kw_pos: int, col: int) -> int:
     ):
         return col
     depth = 0
+    arrow_end = -1
+    has_arrow = "=>" in stripped[line_start:kw_pos]
     for m in _advisory_regexes().step_token.finditer(stripped, line_start, kw_pos):
         tok = m.group()
         ch = tok[0]
@@ -3397,9 +3405,51 @@ def _statement_seq_col(stripped: str, kw_pos: int, col: int) -> int:
             if depth == 0:
                 return col
             depth -= 1
-        elif depth == 0 and tok == ":=":
+        elif depth == 0 and tok == "by":
+            # A `;` after an unparenthesised `by` stays inside that `by` block rather than
+            # continuing the enclosing line's tactic sequence.
             return col
-    return _adv_step_col(stripped, kw_pos) if depth == 0 else col
+    if depth != 0:
+        return col
+    if has_arrow:
+        # Inside `| pat => tac1; change ...`, a sibling of `tac1` aligns with `tac1` after `=>`.
+        d = 0
+        pos = line_start
+        while pos < kw_pos:
+            ch = stripped[pos]
+            if ch in "([{⟨":
+                d += 1
+            elif ch in ")]}⟩" and d > 0:
+                d -= 1
+            elif d == 0 and stripped.startswith("=>", pos):
+                arrow_end = pos + 2
+                pos += 2
+                continue
+            pos += 1
+        if arrow_end != -1:
+            k = arrow_end
+            while k < kw_pos and stripped[k] in " \t":
+                k += 1
+            return k - line_start
+    return _adv_step_col(stripped, kw_pos)
+
+
+def _enclosing_tactic_paren_col(stripped: str, kw_pos: int, col: int) -> int:
+    """When `statement_kw` at `kw_pos` is directly wrapped in a tactic-position `(` or `{`
+    on the same line (`  (suffices ... by ...)` or `  (change ...)`), return the enclosing
+    step's column, else `-1`."""
+    line_start = stripped.rfind("\n", 0, kw_pos) + 1
+    b = kw_pos - 1
+    while b >= line_start and stripped[b] in " \t":
+        b -= 1
+    if b < line_start or stripped[b] not in "({":
+        return -1
+    b_col = b - line_start
+    step_c = _adv_step_col(stripped, b)
+    if b_col == step_c:
+        return step_c
+    seq_c = _statement_seq_col(stripped, b, b_col)
+    return seq_c if seq_c != b_col else -1
 
 
 def _simp_after_statement(
@@ -3434,6 +3484,7 @@ def _simp_after_statement(
         end, tok, nxt = _adv_scan_to(stripped, kw_end, n, min_col + 1, _ADV_STATEMENT_STOPS)
         if end < b:
             continue  # this statement ends before the chain does: try an enclosing one
+        step_end = end
         targets: frozenset[str] | None = None
         if statement_kw in ("change", "show"):
             targets = frozenset(("⊢",))
@@ -3447,7 +3498,7 @@ def _simp_after_statement(
                 p = _adv_skip_ws(stripped, p + 2, n)
                 entered_own_by = True
             else:
-                tok, nxt = _adv_scan_to(stripped, p, n, min_col + 1, _ADV_STEP_STOPS)[1:]
+                step_end, tok, nxt = _adv_scan_to(stripped, p, n, min_col + 1, _ADV_STEP_STOPS)
                 p = -1
         elif tok == "at":
             c_locs, after_at = _adv_scan_at_locations(stripped, nxt, n, min_col)
@@ -3455,7 +3506,7 @@ def _simp_after_statement(
                 targets = frozenset("⊢" if l in _ADV_TURNSTILES else l for l in c_locs)
             else:
                 targets = None
-            tok, nxt = _adv_scan_to(stripped, after_at, n, min_col + 1, _ADV_STEP_STOPS)[1:]
+            step_end, tok, nxt = _adv_scan_to(stripped, after_at, n, min_col + 1, _ADV_STEP_STOPS)
         if statement_kw == "have":
             if entered_own_by:
                 targets = frozenset(("⊢",))
@@ -3473,6 +3524,16 @@ def _simp_after_statement(
                 p = _adv_skip_ws(stripped, nxt, n)
             elif tok == "\n" and _adv_col(stripped, nxt) in (col, seq_col):
                 p = nxt
+            elif tok == ")" and step_end < n:
+                wrap_col = _enclosing_tactic_paren_col(stripped, kw_pos, col)
+                if wrap_col != -1:
+                    _, tok_w, nxt_w = _adv_scan_to(
+                        stripped, step_end + 1, n, wrap_col + 1, _ADV_STEP_STOPS
+                    )
+                    if tok_w in (";", "<;>"):
+                        p = _adv_skip_ws(stripped, nxt_w, n)
+                    elif tok_w == "\n" and _adv_col(stripped, nxt_w) in (col, seq_col, wrap_col):
+                        p = nxt_w
         step = (
             _simp_step_at(stripped, p, n, has_guillemets, targets=targets)
             if p != -1
@@ -3495,11 +3556,19 @@ def _simp_after_statement(
                 if tok2 == "\n" and _adv_col(stripped, nxt2) in (col, seq_col):
                     post_p = nxt2
                 elif tok2 == ")" and end2 < n:
-                    _, tok3, nxt3 = _adv_scan_to(
-                        stripped, end2 + 1, n, min_col + 1, _ADV_STEP_STOPS
-                    )
-                    if tok3 in (";", "<;>"):
-                        post_p = _adv_skip_ws(stripped, nxt3, n)
+                    wrap_col = _enclosing_tactic_paren_col(stripped, kw_pos, col)
+                    if wrap_col != -1:
+                        _, tok3, nxt3 = _adv_scan_to(
+                            stripped, end2 + 1, n, wrap_col + 1, _ADV_STEP_STOPS
+                        )
+                        if tok3 in (";", "<;>"):
+                            post_p = _adv_skip_ws(stripped, nxt3, n)
+                        elif tok3 == "\n" and _adv_col(stripped, nxt3) in (
+                            col,
+                            seq_col,
+                            wrap_col,
+                        ):
+                            post_p = nxt3
             if post_p != -1:
                 step = _simp_step_at(
                     stripped, post_p, n, has_guillemets, targets=frozenset(("⊢",))
@@ -3658,6 +3727,7 @@ def _try_rewrite_hyp_before_target(
         if _is_non_tactic_try(stripped, t):
             continue
         try_col = _adv_step_col(stripped, t)
+        t_col = _adv_col(stripped, t)
         first = _adv_skip_ws(stripped, after_try, n)
         if first >= n or stripped[first] in ":)]}⟩,=":
             continue
@@ -3678,7 +3748,7 @@ def _try_rewrite_hyp_before_target(
             same_line_stops = (
                 _ADV_TRY_STOPS if (in_first_arm and not has_nl_after_try) else _ADV_NO_STOPS
             )
-            min_indent = min(first_col, try_col + 1) if first_col > try_col else first_col
+            min_indent = first_col if has_nl_after_try else min(first_col, t_col + 1)
             if not has_nl_after_try and not in_first_arm and stripped[first] not in "({":
                 flat = flat_line.match(stripped, first)
                 if flat is not None:

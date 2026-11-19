@@ -805,12 +805,15 @@ def _scope_res():
             r"deriving|import|add_decl_doc|register_option|alias)"
             r"(?![\w'!?.])"
         )
-        # Reserved declaration heads (excluding `end`/`namespace`/`section`/`mutual`, which
-        # can appear as identifiers inside multi-line bracket expressions) for col-0 block bounds.
+        # Reserved declaration/command heads (excluding `end`/`namespace`/`section`/`mutual`
+        # and words like `open`/`prefix`/`postfix`/`attribute` that can appear as identifiers
+        # inside multi-line bracket expressions) for col-0 block bounds.
         decl_boundary_re = re.compile(
             r"#[A-Za-z_]\w*(?!\[)|"
             r"(?:theorem|lemma|def|abbrev|structure|inductive|class|instance|axiom|opaque|example|"
-            r"declare_syntax_cat|initialize|builtin_initialize|import|add_decl_doc|register_option|alias)"
+            r"export|variable|universe|set_option|notation|infix|infixl|infixr|macro|macro_rules|"
+            r"syntax|elab|elab_rules|deriving|declare_syntax_cat|initialize|builtin_initialize|"
+            r"import|add_decl_doc|register_option|run_cmd|run_elab|run_meta|alias)"
             r"(?![\w'!?.])"
         )
         in_prefix_re = re.compile(
@@ -954,6 +957,9 @@ def _is_non_command_scope_token(stripped: str, pos: int, kw: str, line_start: in
     return False
 
 
+_MOD_OR_ATTR_FIRST = frozenset("@pnusl")
+
+
 def _enclosing_col0_block(stripped: str, pos: int, line_start: int, cmd_re, n: int) -> tuple[int, int]:
     """Bounded `(blk_start, blk_end)` enclosing `pos` between column-0 command lines."""
     lo_limit = max(0, line_start - _SCOPE_BLOCK_WINDOW)
@@ -962,11 +968,13 @@ def _enclosing_col0_block(stripped: str, pos: int, line_start: int, cmd_re, n: i
     while cur > lo_limit:
         prev_nl = stripped.rfind("\n", lo_limit, cur)
         cand = 0 if prev_nl == -1 else prev_nl + 1
-        if cand < n and stripped[cand] not in _WHITESPACE:
-            kw_pos = _skip_attrs_and_mods(stripped, cand)
-            if cmd_re.match(stripped, kw_pos) is not None:
-                blk_start = cand
-                break
+        if cand < n:
+            ch = stripped[cand]
+            if "a" <= ch <= "z" or ch in "@#":
+                kw_pos = _skip_attrs_and_mods(stripped, cand) if ch in _MOD_OR_ATTR_FIRST else cand
+                if cmd_re.match(stripped, kw_pos) is not None:
+                    blk_start = cand
+                    break
         if prev_nl == -1:
             blk_start = 0
             break
@@ -976,13 +984,41 @@ def _enclosing_col0_block(stripped: str, pos: int, line_start: int, cmd_re, n: i
     cur = stripped.find("\n", pos, hi_limit)
     while cur != -1 and cur + 1 < hi_limit:
         cand = cur + 1
-        if stripped[cand] not in _WHITESPACE:
-            kw_pos = _skip_attrs_and_mods(stripped, cand)
+        ch = stripped[cand]
+        if "a" <= ch <= "z" or ch in "@#":
+            kw_pos = _skip_attrs_and_mods(stripped, cand) if ch in _MOD_OR_ATTR_FIRST else cand
             if cmd_re.match(stripped, kw_pos) is not None:
                 blk_end = cand
                 break
         cur = stripped.find("\n", cand, hi_limit)
     return blk_start, blk_end
+
+
+def _has_unmatched_closer(tail: str, bracket_re) -> bool:
+    """True when `tail` contains a `)`, `]`, `}`, or `⟩` that does not match an earlier
+    opener inside `tail` (necessary for a bracket opened before `tail` to close inside it)."""
+    if ")" not in tail and "]" not in tail and "}" not in tail and "⟩" not in tail:
+        return False
+    if (
+        tail.count(")") > tail.count("(")
+        or tail.count("]") > tail.count("[")
+        or tail.count("}") > tail.count("{")
+        or tail.count("⟩") > tail.count("⟨")
+    ):
+        return True
+    stack: list[str] = []
+    for m in bracket_re.finditer(tail):
+        tok = m.group()
+        if len(tok) != 1:
+            continue
+        closer = _CLOSER_OF.get(tok)
+        if closer is not None:
+            stack.append(closer)
+        elif stack and stack[-1] == tok:
+            stack.pop()
+        else:
+            return True
+    return False
 
 
 def _may_have_unclosed_bracket(seg: str, bracket_re) -> bool:
@@ -1056,6 +1092,7 @@ def _scope_keyword_hits(
     filtered: list[tuple[int, str]] = []
     cached_line_start = -1
     cached_line_spans: list[tuple[int, int]] = []
+    last_blk_bounds = (-1, -1)
     cached_blk_bounds = (-1, -1)
     cached_blk_spans: list[tuple[int, int]] = []
     for p, kw in hits:
@@ -1078,19 +1115,36 @@ def _scope_keyword_hits(
             if _inside_spans(cached_line_spans, p):
                 continue
         if line_start > 0:
-            blk_bounds = _enclosing_col0_block(stripped, p, line_start, decl_boundary_re, n)
-            blk_start, blk_end = blk_bounds
-            if blk_start < line_start and _may_have_unclosed_bracket(
-                stripped[blk_start:line_start], bracket_re
+            lb_start, lb_end = last_blk_bounds
+            if (
+                lb_start != -1
+                and lb_start < line_start
+                and p < lb_end
+                and (lb_start == 0 or lb_start > line_start - _SCOPE_BLOCK_WINDOW)
+                and (lb_end == n or lb_end < p + _SCOPE_BLOCK_WINDOW)
             ):
-                if blk_bounds != cached_blk_bounds:
+                blk_bounds = last_blk_bounds
+            else:
+                blk_bounds = _enclosing_col0_block(stripped, p, line_start, decl_boundary_re, n)
+                if not prefix.strip():
+                    last_blk_bounds = blk_bounds
+            blk_start, blk_end = blk_bounds
+            if blk_start < line_start:
+                if blk_bounds == cached_blk_bounds:
+                    if _inside_spans(cached_blk_spans, p):
+                        continue
+                elif _has_unmatched_closer(
+                    stripped[p:blk_end], bracket_re
+                ) and _may_have_unclosed_bracket(stripped[blk_start:line_start], bracket_re):
                     cached_blk_bounds = blk_bounds
                     cached_blk_spans = [
                         (blk_start + lo, blk_start + hi)
-                        for lo, hi in _closed_bracket_spans(stripped[blk_start:blk_end], bracket_re)
+                        for lo, hi in _closed_bracket_spans(
+                            stripped[blk_start:blk_end], bracket_re
+                        )
                     ]
-                if _inside_spans(cached_blk_spans, p):
-                    continue
+                    if _inside_spans(cached_blk_spans, p):
+                        continue
         filtered.append((p, kw))
     return filtered
 
@@ -1182,7 +1236,7 @@ def _true_line_indent(text: str, stripped: str, line_start: int, first_tok_pos: 
     `stripped`."""
     n = len(text)
     n_st = len(stripped)
-    for _ in range(8):
+    while True:
         if first_tok_pos <= line_start:
             return 0
         k = line_start
@@ -1197,7 +1251,6 @@ def _true_line_indent(text: str, stripped: str, line_start: int, first_tok_pos: 
         c_line = text.rfind("\n", 0, outer_open) + 1
         first_tok_pos = outer_open
         line_start = c_line
-    return 0
 
 
 def _skip_attrs_and_mods(stripped: str, pos: int) -> int:
@@ -1242,7 +1295,7 @@ def _find_in_governed_end(
     `end_offset` is the offset where the governed command ends (`in_end` when `in` is
     dangling before `end` or EOF).
     """
-    _, _, bracket_re, _, line_re, cont_re, cmd_re, strict_cmd_re, _, in_prefix_re, in_tok_re = (
+    name_re, _, bracket_re, _, line_re, cont_re, cmd_re, strict_cmd_re, _, in_prefix_re, in_tok_re = (
         _scope_res()
     )
     n = len(stripped)
@@ -1269,6 +1322,38 @@ def _find_in_governed_end(
             return in_end, False
         pm = in_prefix_re.match(stripped, q)
         if pm is None:
+            p = q
+            break
+        head_kw = pm.group()
+        if head_kw in (SCOPE_NAMESPACE, SCOPE_SECTION):
+            # `namespace <name> in` / `section [name] in` only accept an optional scope name
+            # directly before `in`; never scan past into a non-`in` scope block's body.
+            kw_col = _column_of(stripped, q)
+            k_after = pm.end()
+            crossed = False
+            while k_after < n and stripped[k_after] in _WHITESPACE:
+                if stripped[k_after] == "\n":
+                    crossed = True
+                k_after += 1
+            nm = None
+            if k_after < n and not (crossed and _column_of(stripped, k_after) <= kw_col):
+                cand_nm = name_re.match(stripped, k_after)
+                if cand_nm is not None and cand_nm.group() not in _NOT_A_SCOPE_NAME:
+                    nm = cand_nm
+                    k_after = nm.end()
+                    while k_after < n and stripped[k_after] in _WHITESPACE:
+                        k_after += 1
+            if (
+                (head_kw == SCOPE_SECTION or nm is not None)
+                and k_after < n
+                and stripped.startswith("in", k_after)
+                and (
+                    k_after + 2 >= n
+                    or not (is_ident_char(stripped[k_after + 2]) or stripped[k_after + 2] == ".")
+                )
+            ):
+                p = k_after + 2
+                continue
             p = q
             break
         depth = 0
@@ -1543,7 +1628,7 @@ class NamespaceTracker:
                 or (pending_in[-1][2] == -2 and pending_in[-1][0] < limit_off)
             ):
                 end_off, count, _, base = pending_in.pop()
-                if len(stack) >= base + count:
+                if len(stack) > base:
                     del stack[base : base + count]
                 record(end_off)
 
@@ -1665,7 +1750,7 @@ class NamespaceTracker:
                 record(pos)
                 while pending_in and pending_in[-1][2] >= 0 and len(stack) <= pending_in[-1][2]:
                     _, p_count, _, base = pending_in.pop()
-                    if len(stack) >= base + p_count:
+                    if len(stack) > base:
                         del stack[base : base + p_count]
                     record(name_end)
                 continue
@@ -1674,7 +1759,7 @@ class NamespaceTracker:
                 violations.append(f"line {line_of(pos)}: `namespace` without a name")
                 while pending_in and pending_in[-1][2] == -2 and pending_in[-1][0] == pos:
                     _, p_count, _, base = pending_in.pop()
-                    if len(stack) >= base + p_count:
+                    if len(stack) > base:
                         del stack[base : base + p_count]
                     record(after_kw)
                 continue

@@ -6508,6 +6508,164 @@ class TestEpisode2ProjectionAndRewriteOrderHazards(unittest.TestCase):
         )
         self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(a3_neg), [])
 
+    def test_b4_tail_perf_namespace_in_marks_try_siblings_and_seq_regressions(self) -> None:
+        import lean_lexer
+
+        # 1. `NamespaceTracker` hot-path latency: the tail unmatched-closer gate and col-0 block
+        # reuse keep `ByteCodec.lean` (< 5.0 ms) and repeated `namespace ... export ... end`
+        # blocks linear instead of rescanning balanced 8 KiB windows per scope keyword.
+        bc_text = EPISODE1_BYTECODEC.read_text(encoding="utf-8")
+        bc_st = lean_lexer.strip_comments_and_strings_preserving_offsets(bc_text)
+        lean_lexer.NamespaceTracker.from_source(bc_text, stripped=bc_st)  # warm regex cache
+        bc_ms = best_of_ms(
+            lambda: lean_lexer.NamespaceTracker.from_source(bc_text, stripped=bc_st),
+            budget_ms=5.0,
+        )
+        self.assertLess(bc_ms, 5.0, f"ByteCodec NamespaceTracker took {bc_ms:.2f} ms")
+
+        export_blocks = "".join(
+            f"namespace N{i}\nexport Foo.N{i} (a b c)\nend N{i}\n" for i in range(80)
+        )
+        eb_st = lean_lexer.strip_comments_and_strings_preserving_offsets(export_blocks)
+        eb_ms = best_of_ms(
+            lambda: lean_lexer.NamespaceTracker.from_source(export_blocks, stripped=eb_st),
+            budget_ms=5.0,
+        )
+        self.assertLess(eb_ms, 5.0, f"80 export-block NamespaceTracker took {eb_ms:.2f} ms")
+
+        # 2. `NamespaceTracker` correctness: partial `end` on multi-component `namespace A.B in`,
+        # non-`in` `namespace`/`section` containing body `in` tokens, and >8 chained block comments.
+        ns_partial = (
+            "namespace Outer\n"
+            "namespace A.B in\n"
+            "namespace C\n"
+            "  def x := 1\n"
+            "end B.C\n"
+            "def after := 2\n"
+            "end Outer\n"
+        )
+        tr_p = lean_lexer.track_namespaces(ns_partial)
+        self.assertEqual(tr_p.violations, ())
+        self.assertEqual(tr_p.namespace_at(ns_partial.index("def after")), ("Outer",))
+
+        ns_body_in = (
+            "namespace A in\n"
+            "namespace B\n"
+            "  custom_cmd x in y\n"
+            "  def inAB := 1\n"
+            "end B\n"
+            "def afterAB := 2\n"
+            "namespace C in\n"
+            "section S\n"
+            "  custom_cmd x in y\n"
+            "  def inCS := 1\n"
+            "end S\n"
+            "def afterCS := 2\n"
+        )
+        tr_bi = lean_lexer.track_namespaces(ns_body_in)
+        self.assertEqual(tr_bi.violations, ())
+        self.assertEqual(tr_bi.namespace_at(ns_body_in.index("def inAB")), ("A", "B"))
+        self.assertEqual(tr_bi.namespace_at(ns_body_in.index("def afterAB")), ())
+        self.assertEqual(tr_bi.namespace_at(ns_body_in.index("def inCS")), ("C",))
+        self.assertEqual(tr_bi.namespace_at(ns_body_in.index("def afterCS")), ())
+
+        ns_chain10 = (
+            "namespace Deep in\n"
+            "def inDeep := by\n"
+            "    /- c0\n"
+            + "    -/ /- c\n" * 10
+            + "    -/ open Nat in\n"
+            "    exact 1\n"
+            "def outDeep := 2\n"
+        )
+        tr_c10 = lean_lexer.track_namespaces(ns_chain10)
+        self.assertEqual(tr_c10.violations, ())
+        self.assertEqual(tr_c10.namespace_at(ns_chain10.index("exact 1")), ("Deep",))
+        self.assertEqual(tr_c10.namespace_at(ns_chain10.index("def outDeep")), ())
+
+        # 3. Advisory regressions: exact `args_start` after whitespace-separated `?`/`!`,
+        # `simpa ? !`, aligned siblings outside `try`, bullet-prefixed `; change` / `; try`,
+        # `have h0 := 1; change`, `| pat => tac; change`, and parenthesised statements.
+        R_PROJ = proof_health.RULE_SIMP_DEEP_PROJECTION_CHAIN
+        S_ARG = proof_health.SUBRULE_PROJECTION_IN_SIMP_ARGS
+        S_STMT = proof_health.SUBRULE_SIMP_AFTER_PROJECTION_STATEMENT
+        R_TRY = proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET
+
+        b4_pos = (
+            "theorem p : P := by\n"
+            "  have h1 : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simpa ? ! using h1\n"
+            "  simpa ? ! [foo] using (advanceStmt s l m).memory.locals\n"
+            "  have h2 : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simpa ? ! [foo] at hOther using h2\n"
+            "  have h0 := 1; change (advanceStmt s l m).memory.locals = l\n"
+            "  simp\n"
+            "  · intro h0; change (advanceStmt s l m).memory.locals = l\n"
+            "    simp\n"
+            "  - intro h0; have h3 : (advanceStmt s l m).memory.locals = l := h4\n"
+            "    simp [h3]\n"
+            "  cases hc with\n"
+            "  | inl _ => intro h0; change (advanceStmt s l m).memory.locals = l\n"
+            "             simp\n"
+            "  (suffices h5 : (advanceStmt s l m).memory.locals = l by exact h0 h5)\n"
+            "  simp\n"
+            "  (change (advanceStmt s l m).memory.locals = l)\n"
+            "  simp\n"
+            "  all_goals try rw [h]\n"
+            "    at hEval ⊢\n"
+            "  have h6 : P := by try\n"
+            "    rw [h] at hEval ⊢\n"
+        )
+        self.assertEqual(
+            [
+                (f.line, f.rule, f.subrule)
+                for f in proof_health.scan_projection_and_rewrite_order_hazards(b4_pos)
+            ],
+            [
+                (3, R_PROJ, S_STMT),
+                (4, R_PROJ, S_ARG),
+                (6, R_PROJ, S_STMT),
+                (8, R_PROJ, S_STMT),
+                (10, R_PROJ, S_STMT),
+                (12, R_PROJ, S_STMT),
+                (15, R_PROJ, S_STMT),
+                (17, R_PROJ, S_STMT),
+                (19, R_PROJ, S_STMT),
+                (21, R_TRY, ""),
+                (23, R_TRY, ""),
+            ],
+        )
+
+        b4_neg = (
+            "theorem clean : P := by\n"
+            "  have zeta : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simp !-zeta [foo]\n"
+            "  have zeta2 : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simpa !-zeta2 [foo] using h1\n"
+            "  cases hc with\n"
+            "  | inl _ => try trivial\n"
+            "             rw [h] at hEval ⊢\n"
+            "             exact h0\n"
+            "  | inr _ => try\n"
+            "               trivial\n"
+            "             rw [h] at hEval ⊢\n"
+            "  have h1 : P := by try trivial\n"
+            "                    rw [h] at hEval ⊢\n"
+            "  all_goals try trivial\n"
+            "            rw [h] at hEval ⊢\n"
+            "  · simp; try trivial\n"
+            "    rw [h] at hEval ⊢\n"
+            "  have h2 : True := by trivial; change (advanceStmt s l m).memory.locals = l\n"
+            "  simp\n"
+            "  have hProof : Nat := (show (advanceStmt s l m).memory.locals = l from rfl)\n"
+            "  simp\n"
+            "  have _ : P := (by suffices h3 : (advanceStmt s l m).memory.locals = l by exact h0 h3); simp\n"
+            "  cases hc with\n"
+            "  | inl _ => intro h0; change (advanceStmt s l m).memory.locals = l\n"
+            "  | inr _ => simp\n"
+        )
+        self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(b4_neg), [])
+
 
 if __name__ == "__main__":
     unittest.main()
