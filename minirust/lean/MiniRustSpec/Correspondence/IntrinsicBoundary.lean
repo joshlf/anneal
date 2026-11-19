@@ -2993,7 +2993,7 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
           rw [hpre, hok, ok_bind, hback]
           exact hj
 
-/-! ### Concrete unwinding and `SetDiscriminant` witnesses (`Mach` & `MachTB`) -/
+/-! ### Concrete unwinding and `SetDiscriminant` witnesses -/
 
 private def uwEmptyProg : Gen.Program :=
   { functions := ⟨[]⟩
@@ -3706,6 +3706,660 @@ theorem minirust_setDiscriminant_accesses_law :
       rfl
     exact ⟨⟨cm, rfl⟩, by rw [hlog, haddr]⟩
 
+/-- Whether byte index `k` of an allocation at `allocAddr` lies inside the byte
+range written by tagger entry `e` for a place at address `base`. -/
+private def sdInTagRange (base allocAddr : Int)
+    (e : Gen.Offset × (Gen.IntType × Int)) (k : Nat) : Prop :=
+  base + (e.1.bytes : Int) ≤ allocAddr + (k : Int) ∧
+    allocAddr + (k : Int) < base + (e.1.bytes : Int) + (e.2.1.size.bytes : Int)
+
+/-- `writeSubsliceAtIndex` preserves list length and every element outside
+`[start, start + src.length)`, and writes `src[i]` at `start + i`. -/
+private theorem writeSubsliceAtIndex_spec {T : Type} {xs src xs' : List T} {start : Int}
+    (h : Interp.writeSubsliceAtIndex xs start src = .ok xs') :
+    0 ≤ start ∧
+    start.toNat + src.length ≤ xs.length ∧
+    xs'.length = xs.length ∧
+    (∀ k : Nat, k < start.toNat ∨ start.toNat + src.length ≤ k → xs'[k]? = xs[k]?) ∧
+    (∀ i : Nat, i < src.length → xs'[start.toNat + i]? = src[i]?) := by
+  unfold Interp.writeSubsliceAtIndex at h
+  split at h
+  · rename_i hcond
+    cases h
+    have hle : start.toNat + src.length ≤ xs.length := by omega
+    have htake : (xs.take start.toNat).length = start.toNat :=
+      List.length_take_of_le (by omega)
+    refine ⟨hcond.1, hle, ?_, ?_, ?_⟩
+    · simp only [List.length_append, htake, List.length_drop]
+      omega
+    · intro k hk
+      rcases hk with hlt | hge
+      · rw [List.getElem?_append_left (by simp only [List.length_append, htake]; omega)]
+        rw [List.getElem?_append_left (by rw [htake]; exact hlt)]
+        exact List.getElem?_take_of_lt hlt
+      · rw [List.getElem?_append_right (by simp only [List.length_append, htake]; exact hge)]
+        simp only [List.length_append, htake, List.getElem?_drop]
+        congr 1
+        omega
+    · intro i hi
+      rw [List.getElem?_append_left (by simp only [List.length_append, htake]; omega)]
+      rw [List.getElem?_append_right (by rw [htake]; omega)]
+      rw [htake]
+      simp
+  · cases h
+
+/-- Single-store frame and write law for `BM.store`: preserves allocation
+count, every non-target allocation verbatim, target metadata, and every byte
+outside `[ptr.addr, ptr.addr + bytes.length)`, and writes `bytes` in range. -/
+private theorem bmStore_frame {mem mem' : BM} {ptr : Ptr} {bytes : List Byte}
+    {align : LibSpecr.Align} (h : Interp.BM.store mem ptr bytes align = .ok mem') :
+    mem'.allocations.length = mem.allocations.length ∧
+    (∀ j : Nat, ptr.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+      mem'.allocations[j]? = mem.allocations[j]?) ∧
+    (∀ (j : Nat) (a a' : Gen.Allocation Unit Unit),
+      mem.allocations[j]? = some a → mem'.allocations[j]? = some a' →
+      a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+      a'.data.length = a.data.length ∧
+      (∀ k : Nat, ¬(ptr.addr ≤ a.addr + (k : Int) ∧
+          a.addr + (k : Int) < ptr.addr + (bytes.length : Int)) →
+        a'.data[k]? = a.data[k]?)) ∧
+    (0 < bytes.length →
+      ∃ (aid : Gen.AllocId) (pex : Unit) (a a' : Gen.Allocation Unit Unit),
+        ptr.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+        mem.allocations[aid._0.toNat]? = some a ∧
+        mem'.allocations[aid._0.toNat]? = some a' ∧
+        0 ≤ ptr.addr - a.addr ∧
+        ∀ i : Nat, i < bytes.length →
+          a'.data[(ptr.addr - a.addr).toNat + i]? = bytes[i]?) := by
+  unfold Interp.BM.store at h
+  split at h
+  · cases h
+  · obtain ⟨chk, hchk, h⟩ := interpBind_ok h
+    cases chk with
+    | none =>
+      cases h
+      refine ⟨rfl, fun _ _ => rfl,
+        fun j a a' ha ha' => by
+          rw [ha] at ha'
+          cases ha'
+          exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩,
+        fun hpos => ?_⟩
+      unfold Interp.BM.check_ptr at hchk
+      split at hchk
+      · rename_i hzero
+        simp only at hzero
+        omega
+      · cases hprov : ptr.provenance with
+        | none => simp [hprov, ub] at hchk
+        | some pp =>
+          simp only [hprov] at hchk
+          obtain ⟨a, _, hchk⟩ := interpBind_ok hchk
+          split at hchk
+          · cases hchk
+          · split at hchk <;> cases hchk
+    | some res =>
+      obtain ⟨aid, pex, offset⟩ := res
+      obtain ⟨a0, hidx, h⟩ := interpBind_ok h
+      obtain ⟨data', hws, h⟩ := interpBind_ok h
+      obtain ⟨allocs', hset, h⟩ := interpBind_ok h
+      cases h
+      unfold Interp.BM.check_ptr at hchk
+      split at hchk
+      · cases hchk
+      · cases hprov : ptr.provenance with
+        | none => simp [hprov, ub] at hchk
+        | some pp =>
+          obtain ⟨aid', pex'⟩ := pp
+          simp only [hprov] at hchk
+          obtain ⟨aChk, hidxChk, hchk⟩ := interpBind_ok hchk
+          split at hchk
+          · cases hchk
+          · split at hchk
+            · cases hchk
+            · rename_i hnotoob
+              cases hchk
+              obtain ⟨hgeId, hget0⟩ := listIndex_ok_get hidx
+              obtain ⟨_, hgetChk⟩ := listIndex_ok_get hidxChk
+              rw [hget0] at hgetChk
+              cases hgetChk
+              unfold listSet at hset
+              split at hset
+              · rename_i hsetcond
+                cases hset
+                obtain ⟨_, _, hLenEq, hOut, hIn⟩ := writeSubsliceAtIndex_spec hws
+                have htoNat :
+                    (({ bytes := (ptr.addr - a0.addr).toNat } : LibSpecr.Size).bytes : Int).toNat =
+                      (ptr.addr - a0.addr).toNat := rfl
+                rw [htoNat] at hOut hIn
+                have hoffGe : 0 ≤ ptr.addr - a0.addr :=
+                  Int.not_lt.mp (fun hlt => hnotoob (Or.inl hlt))
+                refine ⟨List.length_set, ?_, ?_, ?_⟩
+                · intro j hne
+                  have hij : aid._0.toNat ≠ j := by
+                    intro heq
+                    apply hne
+                    simp only [Option.map_some, Option.some.injEq]
+                    cases aid
+                    simp only at hgeId heq ⊢
+                    congr 1
+                    omega
+                  exact List.getElem?_set_ne hij
+                · intro j a a' ha ha'
+                  by_cases hij : aid._0.toNat = j
+                  · subst hij
+                    rw [hget0] at ha
+                    cases ha
+                    rw [List.getElem?_set_self hsetcond.2] at ha'
+                    cases ha'
+                    refine ⟨rfl, rfl, rfl, rfl, hLenEq, fun k hk => ?_⟩
+                    let pa : Int := ptr.addr
+                    let aa : Int := a0.addr
+                    have hge0 : (0 : Int) ≤ pa - aa := hoffGe
+                    have hk' : ¬(pa ≤ aa + (k : Int) ∧
+                        aa + (k : Int) < pa + (bytes.length : Int)) := hk
+                    have hko : k < (pa - aa).toNat ∨ (pa - aa).toNat + bytes.length ≤ k := by
+                      omega
+                    exact hOut k hko
+                  · rw [List.getElem?_set_ne hij, ha] at ha'
+                    cases ha'
+                    exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩
+                · intro _
+                  refine ⟨aid, pex, a0, { a0 with data := data' }, rfl, hgeId, hget0,
+                    List.getElem?_set_self hsetcond.2, hoffGe, fun i hi => hIn i hi⟩
+              · cases hset
+
+/-- Single-store frame and write law for polymorphic `BasicMemory.store`
+(applied below to `TreeBorrowsMemory.store`): preserves allocation count, every
+non-target allocation verbatim (including `extra`), target metadata, and every
+byte outside `[ptr.addr, ptr.addr + bytes.length)`, and writes `bytes`. -/
+private theorem basicMemoryStore_frame {ProvExtra AllocExtra : Type}
+    {mem mem' : Gen.BasicMemory Gen.x86_64 ProvExtra AllocExtra}
+    {ptr : Gen.ThinPointer (Gen.Provenance ProvExtra)}
+    {bytes : List (Gen.AbstractByte (Gen.Provenance ProvExtra))}
+    {align : LibSpecr.Align}
+    {handleExtra : AllocExtra → ProvExtra → Gen.Offset → Interp AllocExtra}
+    (h : Interp.BasicMemory.store mem ptr bytes align handleExtra = .ok mem') :
+    mem'.allocations.length = mem.allocations.length ∧
+    (∀ j : Nat, ptr.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+      mem'.allocations[j]? = mem.allocations[j]?) ∧
+    (∀ (j : Nat) (a a' : Gen.Allocation ProvExtra AllocExtra),
+      mem.allocations[j]? = some a → mem'.allocations[j]? = some a' →
+      a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+      a'.data.length = a.data.length ∧
+      (∀ k : Nat, ¬(ptr.addr ≤ a.addr + (k : Int) ∧
+          a.addr + (k : Int) < ptr.addr + (bytes.length : Int)) →
+        a'.data[k]? = a.data[k]?)) ∧
+    (0 < bytes.length →
+      ∃ (aid : Gen.AllocId) (pex : ProvExtra)
+          (a a' : Gen.Allocation ProvExtra AllocExtra),
+        ptr.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+        mem.allocations[aid._0.toNat]? = some a ∧
+        mem'.allocations[aid._0.toNat]? = some a' ∧
+        0 ≤ ptr.addr - a.addr ∧
+        ∀ i : Nat, i < bytes.length →
+          a'.data[(ptr.addr - a.addr).toNat + i]? = bytes[i]?) := by
+  unfold Interp.BasicMemory.store at h
+  split at h
+  · cases h
+  · obtain ⟨chk, hchk, h⟩ := interpBind_ok h
+    cases chk with
+    | none =>
+      cases h
+      refine ⟨rfl, fun _ _ => rfl,
+        fun j a a' ha ha' => by
+          rw [ha] at ha'
+          cases ha'
+          exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩,
+        fun hpos => ?_⟩
+      unfold Interp.BasicMemory.check_ptr at hchk
+      split at hchk
+      · rename_i hzero
+        simp only at hzero
+        omega
+      · cases hprov : ptr.provenance with
+        | none => simp [hprov, ub] at hchk
+        | some pp =>
+          simp only [hprov] at hchk
+          obtain ⟨a, _, hchk⟩ := interpBind_ok hchk
+          split at hchk
+          · cases hchk
+          · split at hchk <;> cases hchk
+    | some res =>
+      obtain ⟨aid, pex, offset⟩ := res
+      obtain ⟨a0, hidx, h⟩ := interpBind_ok h
+      obtain ⟨extra', _, h⟩ := interpBind_ok h
+      obtain ⟨data', hws, h⟩ := interpBind_ok h
+      obtain ⟨allocs', hset, h⟩ := interpBind_ok h
+      cases h
+      unfold Interp.BasicMemory.check_ptr at hchk
+      split at hchk
+      · cases hchk
+      · cases hprov : ptr.provenance with
+        | none => simp [hprov, ub] at hchk
+        | some pp =>
+          obtain ⟨aid', pex'⟩ := pp
+          simp only [hprov] at hchk
+          obtain ⟨aChk, hidxChk, hchk⟩ := interpBind_ok hchk
+          split at hchk
+          · cases hchk
+          · split at hchk
+            · cases hchk
+            · rename_i hnotoob
+              cases hchk
+              obtain ⟨hgeId, hget0⟩ := listIndex_ok_get hidx
+              obtain ⟨_, hgetChk⟩ := listIndex_ok_get hidxChk
+              rw [hget0] at hgetChk
+              cases hgetChk
+              unfold listSet at hset
+              split at hset
+              · rename_i hsetcond
+                cases hset
+                obtain ⟨_, _, hLenEq, hOut, hIn⟩ := writeSubsliceAtIndex_spec hws
+                have htoNat :
+                    (({ bytes := (ptr.addr - a0.addr).toNat } : LibSpecr.Size).bytes : Int).toNat =
+                      (ptr.addr - a0.addr).toNat := rfl
+                rw [htoNat] at hOut hIn
+                have hoffGe : 0 ≤ ptr.addr - a0.addr :=
+                  Int.not_lt.mp (fun hlt => hnotoob (Or.inl hlt))
+                refine ⟨List.length_set, ?_, ?_, ?_⟩
+                · intro j hne
+                  have hij : aid._0.toNat ≠ j := by
+                    intro heq
+                    apply hne
+                    simp only [Option.map_some, Option.some.injEq]
+                    cases aid
+                    simp only at hgeId heq ⊢
+                    congr 1
+                    omega
+                  exact List.getElem?_set_ne hij
+                · intro j a a' ha ha'
+                  by_cases hij : aid._0.toNat = j
+                  · subst hij
+                    rw [hget0] at ha
+                    cases ha
+                    rw [List.getElem?_set_self hsetcond.2] at ha'
+                    cases ha'
+                    refine ⟨rfl, rfl, rfl, rfl, hLenEq, fun k hk => ?_⟩
+                    let pa : Int := ptr.addr
+                    let aa : Int := a0.addr
+                    have hge0 : (0 : Int) ≤ pa - aa := hoffGe
+                    have hk' : ¬(pa ≤ aa + (k : Int) ∧
+                        aa + (k : Int) < pa + (bytes.length : Int)) := hk
+                    have hko : k < (pa - aa).toNat ∨ (pa - aa).toNat + bytes.length ≤ k := by
+                      omega
+                    exact hOut k hko
+                  · rw [List.getElem?_set_ne hij, ha] at ha'
+                    cases ha'
+                    exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩
+                · intro _
+                  refine ⟨aid, pex, a0, { a0 with data := data', extra := extra' }, rfl, hgeId,
+                    hget0, List.getElem?_set_self hsetcond.2, hoffGe, fun i hi => hIn i hi⟩
+              · cases hset
+
+/-- Inductive memory-frame and tag-write law for `encodeDiscriminant` on
+`Mach`. -/
+private theorem encodeDiscriminant_memory_frame (p : Ptr)
+    (tagger : Map Gen.Offset (Gen.IntType × Int)) {s s' : Mach}
+    (h : Interp.encodeDiscriminant
+      (fun (m : Mach) offset bytes => do
+        let ptr ← Interp.ptrOffsetInbounds m p (offset.bytes : Int)
+        let cm ← Interp.CM.store m.mem ptr bytes ⟨1⟩ .None
+        pure { m with mem := cm }) tagger s = .ok s') :
+    s'.mem.memory.allocations.length = s.mem.memory.allocations.length ∧
+    (∀ j : Nat, p.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+      s'.mem.memory.allocations[j]? = s.mem.memory.allocations[j]?) ∧
+    (∀ (j : Nat) (a a' : Gen.Allocation Unit Unit),
+      s.mem.memory.allocations[j]? = some a →
+      s'.mem.memory.allocations[j]? = some a' →
+      a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+      a'.data.length = a.data.length ∧
+      (∀ k : Nat, (∀ e ∈ tagger.entries, ¬ sdInTagRange p.addr a.addr e k) →
+        a'.data[k]? = a.data[k]?)) ∧
+    (∀ pre off ity val post, tagger.entries = pre ++ (off, (ity, val)) :: post →
+      ∃ bytes, Interp.Type.encodeInt ity (.Int val) = .ok bytes ∧
+        (0 < ity.size.bytes →
+          ∃ (aid : Gen.AllocId) (pex : Unit) (a a' : Gen.Allocation Unit Unit),
+            p.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+            s.mem.memory.allocations[aid._0.toNat]? = some a ∧
+            s'.mem.memory.allocations[aid._0.toNat]? = some a' ∧
+            0 ≤ p.addr + (off.bytes : Int) - a.addr ∧
+            ∀ i : Nat, i < bytes.length →
+              (∀ e' ∈ post,
+                ¬ sdInTagRange p.addr a.addr e'
+                  ((p.addr + (off.bytes : Int) - a.addr).toNat + i)) →
+              a'.data[(p.addr + (off.bytes : Int) - a.addr).toNat + i]? = bytes[i]?)) := by
+  unfold Interp.encodeDiscriminant at h
+  generalize tagger.entries = entries at h ⊢
+  induction entries generalizing s with
+  | nil =>
+    cases h
+    refine ⟨rfl, fun _ _ => rfl,
+      fun j a a' ha ha' => by
+        rw [ha] at ha'
+        cases ha'
+        exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩,
+      fun pre off ity val post hsplit => by
+        cases pre <;> simp at hsplit⟩
+  | cons e0 es ih =>
+    obtain ⟨off0, ity0, val0⟩ := e0
+    rw [List.foldlM_cons] at h
+    obtain ⟨s1, h1, h⟩ := interpBind_ok h
+    obtain ⟨bytes0, henc0, h1⟩ := interpBind_ok h1
+    obtain ⟨ptr0, hptr0, h1⟩ := interpBind_ok h1
+    obtain ⟨cm1, hcm1, h1⟩ := interpBind_ok h1
+    cases h1
+    have hptrEq : ptr0 = { p with addr := p.addr + (off0.bytes : Int) } := by
+      unfold Interp.ptrOffsetInbounds at hptr0
+      obtain ⟨_, _, hptr0⟩ := interpBind_ok hptr0
+      split at hptr0
+      · cases hptr0
+      · split at hptr0
+        · cases hptr0
+        · cases hptr0
+          rfl
+    subst hptrEq
+    unfold Interp.CM.store at hcm1
+    obtain ⟨mem1, hst1, hcm1⟩ := interpBind_ok hcm1
+    cases hcm1
+    obtain ⟨hlen1, hother1, hmeta1, hwr1⟩ := bmStore_frame hst1
+    obtain ⟨hlen2, hother2, hmeta2, hwr2⟩ := ih h
+    have hblen0 : bytes0.length = ity0.size.bytes := encodeInt_length henc0
+    refine ⟨hlen2.trans hlen1,
+      fun j hj => (hother2 j hj).trans (hother1 j hj),
+      ?_, ?_⟩
+    · intro j a a' ha ha'
+      have hjlt : j < mem1.allocations.length := by
+        rw [hlen1]
+        exact (List.getElem?_eq_some_iff.mp ha).1
+      let a1 := mem1.allocations[j]
+      have ha1 : mem1.allocations[j]? = some a1 := List.getElem?_eq_getElem hjlt
+      obtain ⟨haddr1, hal1, hk1, hl1, hd1, hout1⟩ := hmeta1 j a a1 ha ha1
+      obtain ⟨haddr2, hal2, hk2, hl2, hd2, hout2⟩ := hmeta2 j a1 a' ha1 ha'
+      refine ⟨haddr2.trans haddr1, hal2.trans hal1, hk2.trans hk1, hl2.trans hl1, hd2.trans hd1,
+        fun k hk => ?_⟩
+      have hk0 : ¬(p.addr + (off0.bytes : Int) ≤ a.addr + (k : Int) ∧
+          a.addr + (k : Int) < p.addr + (off0.bytes : Int) + (bytes0.length : Int)) := by
+        rw [hblen0]
+        exact hk (off0, (ity0, val0)) (by simp)
+      have hkes : ∀ e ∈ es, ¬ sdInTagRange p.addr a1.addr e k := by
+        intro e he
+        rw [haddr1]
+        exact hk e (by simp [he])
+      exact (hout2 k hkes).trans (hout1 k hk0)
+    · intro pre off ity val post hsplit
+      cases pre with
+      | nil =>
+        simp only [List.nil_append, List.cons.injEq, Prod.mk.injEq] at hsplit
+        obtain ⟨⟨rfl, rfl, rfl⟩, rfl⟩ := hsplit
+        refine ⟨bytes0, henc0, fun hpos => ?_⟩
+        obtain ⟨aid, pex, a, a1, hprov, hgeId, ha, ha1, hoffGe, hbytes1⟩ :=
+          hwr1 (by omega)
+        have hidlt : aid._0.toNat < s'.mem.memory.allocations.length := by
+          rw [hlen2]
+          exact (List.getElem?_eq_some_iff.mp ha1).1
+        let a' := s'.mem.memory.allocations[aid._0.toNat]
+        have ha' : s'.mem.memory.allocations[aid._0.toNat]? = some a' :=
+          List.getElem?_eq_getElem hidlt
+        obtain ⟨haddr1, _, _, _, _, _⟩ := hmeta1 aid._0.toNat a a1 ha ha1
+        obtain ⟨_, _, _, _, _, hout2⟩ := hmeta2 aid._0.toNat a1 a' ha1 ha'
+        refine ⟨aid, pex, a, a', hprov, hgeId, ha, ha', hoffGe, fun i hi hnotpost => ?_⟩
+        have hpost1 : ∀ e' ∈ es,
+            ¬ sdInTagRange p.addr a1.addr e' ((p.addr + (off0.bytes : Int) - a.addr).toNat + i) :=
+          fun e' he' => by rw [haddr1]; exact hnotpost e' he'
+        exact (hout2 _ hpost1).trans (hbytes1 i hi)
+      | cons e0' pre' =>
+        simp only [List.cons_append, List.cons.injEq] at hsplit
+        obtain ⟨rfl, htail⟩ := hsplit
+        obtain ⟨bytes, henc, hrest⟩ := hwr2 pre' off ity val post htail
+        refine ⟨bytes, henc, fun hpos => ?_⟩
+        obtain ⟨aid, pex, a1, a', hprov, hgeId, ha1, ha', hoffGe, hbytes2⟩ := hrest hpos
+        have hidlt : aid._0.toNat < s.mem.memory.allocations.length := by
+          rw [← hlen1]
+          exact (List.getElem?_eq_some_iff.mp ha1).1
+        let a := s.mem.memory.allocations[aid._0.toNat]
+        have ha : s.mem.memory.allocations[aid._0.toNat]? = some a :=
+          List.getElem?_eq_getElem hidlt
+        obtain ⟨haddr1, _, _, _, _, _⟩ := hmeta1 aid._0.toNat a a1 ha ha1
+        refine ⟨aid, pex, a, a', hprov, hgeId, ha, ha', by rw [← haddr1]; exact hoffGe,
+          fun i hi hnotpost => ?_⟩
+        simpa [haddr1] using hbytes2 i hi (by simpa [haddr1] using hnotpost)
+
+/-- Inductive memory-frame and tag-write law for `encodeDiscriminantM` on
+`MachTB` (`TreeBorrowsMemory`). -/
+private theorem encodeDiscriminantM_tb_memory_frame
+    (p : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+    (tagger : Map Gen.Offset (Gen.IntType × Int)) {s s' : MachTB}
+    (h : Interp.encodeDiscriminantM (M := TBM)
+      (fun (m : MachTB) offset bytes => do
+        let ptr ← Interp.ptrOffsetInboundsM m p (offset.bytes : Int)
+        let cm ← Interp.ConcurrentMemory.store m.mem ptr bytes ⟨1⟩ .None
+        pure { m with mem := cm }) tagger s = .ok s') :
+    s'.mem.memory.params = s.mem.memory.params ∧
+    s'.mem.memory.mem.allocations.length = s.mem.memory.mem.allocations.length ∧
+    (∀ j : Nat, p.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+      s'.mem.memory.mem.allocations[j]? = s.mem.memory.mem.allocations[j]?) ∧
+    (∀ (j : Nat) (a a' : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+      s.mem.memory.mem.allocations[j]? = some a →
+      s'.mem.memory.mem.allocations[j]? = some a' →
+      a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+      a'.data.length = a.data.length ∧
+      (∀ k : Nat, (∀ e ∈ tagger.entries, ¬ sdInTagRange p.addr a.addr e k) →
+        a'.data[k]? = a.data[k]?)) ∧
+    (∀ pre off ity val post, tagger.entries = pre ++ (off, (ity, val)) :: post →
+      ∃ bytes, Interp.Type.encodeIntM (M := TBM) ity (.Int val) = .ok bytes ∧
+        (0 < ity.size.bytes →
+          ∃ (aid : Gen.AllocId) (pex : Gen.Path)
+              (a a' : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+            p.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+            s.mem.memory.mem.allocations[aid._0.toNat]? = some a ∧
+            s'.mem.memory.mem.allocations[aid._0.toNat]? = some a' ∧
+            0 ≤ p.addr + (off.bytes : Int) - a.addr ∧
+            ∀ i : Nat, i < bytes.length →
+              (∀ e' ∈ post,
+                ¬ sdInTagRange p.addr a.addr e'
+                  ((p.addr + (off.bytes : Int) - a.addr).toNat + i)) →
+              a'.data[(p.addr + (off.bytes : Int) - a.addr).toNat + i]? = bytes[i]?)) := by
+  unfold Interp.encodeDiscriminantM at h
+  generalize tagger.entries = entries at h ⊢
+  induction entries generalizing s with
+  | nil =>
+    cases h
+    refine ⟨rfl, rfl, fun _ _ => rfl,
+      fun j a a' ha ha' => by
+        rw [ha] at ha'
+        cases ha'
+        exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩,
+      fun pre off ity val post hsplit => by
+        cases pre <;> simp at hsplit⟩
+  | cons e0 es ih =>
+    obtain ⟨off0, ity0, val0⟩ := e0
+    rw [List.foldlM_cons] at h
+    obtain ⟨s1, h1, h⟩ := interpBind_ok h
+    obtain ⟨bytes0, henc0, h1⟩ := interpBind_ok h1
+    obtain ⟨ptr0, hptr0, h1⟩ := interpBind_ok h1
+    obtain ⟨cm1, hcm1, h1⟩ := interpBind_ok h1
+    cases h1
+    have hptrEq : ptr0 = { p with addr := p.addr + (off0.bytes : Int) } := by
+      unfold Interp.ptrOffsetInboundsM at hptr0
+      obtain ⟨_, _, hptr0⟩ := interpBind_ok hptr0
+      split at hptr0
+      · cases hptr0
+      · split at hptr0
+        · cases hptr0
+        · cases hptr0
+          rfl
+    subst hptrEq
+    unfold Interp.ConcurrentMemory.store at hcm1
+    obtain ⟨tbm1, htbm1, hcm1⟩ := interpBind_ok hcm1
+    cases hcm1
+    change Interp.TreeBorrowsMemory.store s.mem.memory
+      { p with addr := p.addr + (off0.bytes : Int) } bytes0 ⟨1⟩ = .ok tbm1 at htbm1
+    unfold Interp.TreeBorrowsMemory.store at htbm1
+    obtain ⟨mem1, hst1, htbm1⟩ := interpBind_ok htbm1
+    cases htbm1
+    obtain ⟨hlen1, hother1, hmeta1, hwr1⟩ := basicMemoryStore_frame hst1
+    obtain ⟨hpar2, hlen2, hother2, hmeta2, hwr2⟩ := ih h
+    have hblen0 : bytes0.length = ity0.size.bytes := encodeIntM_length henc0
+    refine ⟨hpar2, hlen2.trans hlen1,
+      fun j hj => (hother2 j hj).trans (hother1 j hj),
+      ?_, ?_⟩
+    · intro j a a' ha ha'
+      have hjlt : j < mem1.allocations.length := by
+        rw [hlen1]
+        exact (List.getElem?_eq_some_iff.mp ha).1
+      let a1 := mem1.allocations[j]
+      have ha1 : mem1.allocations[j]? = some a1 := List.getElem?_eq_getElem hjlt
+      obtain ⟨haddr1, hal1, hk1, hl1, hd1, hout1⟩ := hmeta1 j a a1 ha ha1
+      obtain ⟨haddr2, hal2, hk2, hl2, hd2, hout2⟩ := hmeta2 j a1 a' ha1 ha'
+      refine ⟨haddr2.trans haddr1, hal2.trans hal1, hk2.trans hk1, hl2.trans hl1, hd2.trans hd1,
+        fun k hk => ?_⟩
+      have hk0 : ¬(p.addr + (off0.bytes : Int) ≤ a.addr + (k : Int) ∧
+          a.addr + (k : Int) < p.addr + (off0.bytes : Int) + (bytes0.length : Int)) := by
+        rw [hblen0]
+        exact hk (off0, (ity0, val0)) (by simp)
+      have hkes : ∀ e ∈ es, ¬ sdInTagRange p.addr a1.addr e k := by
+        intro e he
+        rw [haddr1]
+        exact hk e (by simp [he])
+      exact (hout2 k hkes).trans (hout1 k hk0)
+    · intro pre off ity val post hsplit
+      cases pre with
+      | nil =>
+        simp only [List.nil_append, List.cons.injEq, Prod.mk.injEq] at hsplit
+        obtain ⟨⟨rfl, rfl, rfl⟩, rfl⟩ := hsplit
+        refine ⟨bytes0, henc0, fun hpos => ?_⟩
+        obtain ⟨aid, pex, a, a1, hprov, hgeId, ha, ha1, hoffGe, hbytes1⟩ :=
+          hwr1 (by omega)
+        have hidlt : aid._0.toNat < s'.mem.memory.mem.allocations.length := by
+          rw [hlen2]
+          exact (List.getElem?_eq_some_iff.mp ha1).1
+        let a' := s'.mem.memory.mem.allocations[aid._0.toNat]
+        have ha' : s'.mem.memory.mem.allocations[aid._0.toNat]? = some a' :=
+          List.getElem?_eq_getElem hidlt
+        obtain ⟨haddr1, _, _, _, _, _⟩ := hmeta1 aid._0.toNat a a1 ha ha1
+        obtain ⟨_, _, _, _, _, hout2⟩ := hmeta2 aid._0.toNat a1 a' ha1 ha'
+        refine ⟨aid, pex, a, a', hprov, hgeId, ha, ha', hoffGe, fun i hi hnotpost => ?_⟩
+        have hpost1 : ∀ e' ∈ es,
+            ¬ sdInTagRange p.addr a1.addr e' ((p.addr + (off0.bytes : Int) - a.addr).toNat + i) :=
+          fun e' he' => by rw [haddr1]; exact hnotpost e' he'
+        exact (hout2 _ hpost1).trans (hbytes1 i hi)
+      | cons e0' pre' =>
+        simp only [List.cons_append, List.cons.injEq] at hsplit
+        obtain ⟨rfl, htail⟩ := hsplit
+        obtain ⟨bytes, henc, hrest⟩ := hwr2 pre' off ity val post htail
+        refine ⟨bytes, henc, fun hpos => ?_⟩
+        obtain ⟨aid, pex, a1, a', hprov, hgeId, ha1, ha', hoffGe, hbytes2⟩ := hrest hpos
+        have hidlt : aid._0.toNat < s.mem.memory.mem.allocations.length := by
+          rw [← hlen1]
+          exact (List.getElem?_eq_some_iff.mp ha1).1
+        let a := s.mem.memory.mem.allocations[aid._0.toNat]
+        have ha : s.mem.memory.mem.allocations[aid._0.toNat]? = some a :=
+          List.getElem?_eq_getElem hidlt
+        obtain ⟨haddr1, _, _, _, _, _⟩ := hmeta1 aid._0.toNat a a1 ha ha1
+        refine ⟨aid, pex, a, a', hprov, hgeId, ha, ha', by rw [← haddr1]; exact hoffGe,
+          fun i hi hnotpost => ?_⟩
+        simpa [haddr1] using hbytes2 i hi (by simpa [haddr1] using hnotpost)
+
+/-- **Universal memory-contents and allocation-frame law for
+`Statement::SetDiscriminant` on `Mach` and `MachTB`
+(`minirust_setDiscriminant_memory_frame_law`)**: whereas
+`minirust_setDiscriminant_accesses_law` characterizes only the concurrency
+access log (`mem.accesses`), this theorem characterizes the actual memory state
+produced by any successful `SetDiscriminant` on any aligned enum place, for
+both `Mach` (`BasicMemory`) and `MachTB` (`TreeBorrowsMemory`):
+1. Allocation count (and `TreeBorrowsMemory.params` on `MachTB`) is preserved;
+2. Every allocation whose `AllocId` is not `place.ptr.thin_pointer`'s
+   provenance is preserved verbatim (including all bytes and, on `MachTB`, its
+   entire Tree Borrows borrow tree); if the pointer carries no provenance, all
+   allocations are preserved verbatim;
+3. Every allocation preserves `addr`, `align`, `kind`, `live`, and
+   `data.length`, and every byte index `k` outside every entry of
+   `variant.tagger.entries` (`¬ sdInTagRange`) is preserved unchanged;
+4. For every tagger entry `(off, (ity, val))` in `variant.tagger.entries =
+   pre ++ (off, (ity, val)) :: post`, `Type.encodeInt` / `Type.encodeIntM`
+   succeeds with `bytes`, and whenever `0 < ity.size.bytes` and no later entry
+   in `post` covers byte `(base + off - a.addr) + i`, the resulting allocation
+   holds `bytes[i]?` at that byte (exact last-write-wins tag semantics, and
+   exact simultaneous tag bytes whenever tag ranges are pairwise disjoint). -/
+theorem minirust_setDiscriminant_memory_frame_law :
+    (∀ (m m1 m' : Mach) (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place BM)
+        (vs : Map Int Gen.Variant) (dt : Gen.IntType) (d : Gen.Discriminator)
+        (sz : LibSpecr.Size) (al : LibSpecr.Align) (variant : Gen.Variant),
+      Interp.evalPlace m dst = .ok ((place, .Enum vs dt d sz al), m1) →
+      place.aligned = true → mapGet vs value = some variant →
+      Interp.evalStatement m (.SetDiscriminant dst value) = .ok m' →
+      m'.mem.memory.allocations.length = m1.mem.memory.allocations.length ∧
+      (∀ j : Nat, place.ptr.thin_pointer.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+        m'.mem.memory.allocations[j]? = m1.mem.memory.allocations[j]?) ∧
+      (∀ (j : Nat) (a a' : Gen.Allocation Unit Unit),
+        m1.mem.memory.allocations[j]? = some a →
+        m'.mem.memory.allocations[j]? = some a' →
+        a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+        a'.data.length = a.data.length ∧
+        (∀ k : Nat,
+          (∀ e ∈ variant.tagger.entries,
+            ¬ sdInTagRange place.ptr.thin_pointer.addr a.addr e k) →
+          a'.data[k]? = a.data[k]?)) ∧
+      (∀ pre off ity val post,
+        variant.tagger.entries = pre ++ (off, (ity, val)) :: post →
+        ∃ bytes, Interp.Type.encodeInt ity (.Int val) = .ok bytes ∧
+          (0 < ity.size.bytes →
+            ∃ (aid : Gen.AllocId) (pex : Unit) (a a' : Gen.Allocation Unit Unit),
+              place.ptr.thin_pointer.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+              m1.mem.memory.allocations[aid._0.toNat]? = some a ∧
+              m'.mem.memory.allocations[aid._0.toNat]? = some a' ∧
+              0 ≤ place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr ∧
+              ∀ i : Nat, i < bytes.length →
+                (∀ e' ∈ post,
+                  ¬ sdInTagRange place.ptr.thin_pointer.addr a.addr e'
+                    ((place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr).toNat + i)) →
+                a'.data[(place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr).toNat + i]? =
+                  bytes[i]?))) ∧
+    (∀ (m m1 m' : MachTB) (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place TBM)
+        (vs : Map Int Gen.Variant) (dt : Gen.IntType) (d : Gen.Discriminator)
+        (sz : LibSpecr.Size) (al : LibSpecr.Align) (variant : Gen.Variant),
+      Interp.evalPlaceM m dst = .ok ((place, .Enum vs dt d sz al), m1) →
+      place.aligned = true → mapGet vs value = some variant →
+      Interp.evalStatementM m (.SetDiscriminant dst value) = .ok m' →
+      m'.mem.memory.params = m1.mem.memory.params ∧
+      m'.mem.memory.mem.allocations.length = m1.mem.memory.mem.allocations.length ∧
+      (∀ j : Nat, place.ptr.thin_pointer.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+        m'.mem.memory.mem.allocations[j]? = m1.mem.memory.mem.allocations[j]?) ∧
+      (∀ (j : Nat) (a a' : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+        m1.mem.memory.mem.allocations[j]? = some a →
+        m'.mem.memory.mem.allocations[j]? = some a' →
+        a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+        a'.data.length = a.data.length ∧
+        (∀ k : Nat,
+          (∀ e ∈ variant.tagger.entries,
+            ¬ sdInTagRange place.ptr.thin_pointer.addr a.addr e k) →
+          a'.data[k]? = a.data[k]?)) ∧
+      (∀ pre off ity val post,
+        variant.tagger.entries = pre ++ (off, (ity, val)) :: post →
+        ∃ bytes, Interp.Type.encodeIntM (M := TBM) ity (.Int val) = .ok bytes ∧
+          (0 < ity.size.bytes →
+            ∃ (aid : Gen.AllocId) (pex : Gen.Path)
+                (a a' : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+              place.ptr.thin_pointer.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+              m1.mem.memory.mem.allocations[aid._0.toNat]? = some a ∧
+              m'.mem.memory.mem.allocations[aid._0.toNat]? = some a' ∧
+              0 ≤ place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr ∧
+              ∀ i : Nat, i < bytes.length →
+                (∀ e' ∈ post,
+                  ¬ sdInTagRange place.ptr.thin_pointer.addr a.addr e'
+                    ((place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr).toNat + i)) →
+                a'.data[(place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr).toNat + i]? =
+                  bytes[i]?))) := by
+  refine ⟨?_, ?_⟩
+  · intro m m1 m' dst value place vs dt d sz al variant hp ha hsome h
+    simp only [Interp.evalStatement, Interp.evalSetDiscriminant, hp, ok_bind, ha,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte, hsome] at h
+    exact encodeDiscriminant_memory_frame place.ptr.thin_pointer variant.tagger h
+  · intro m m1 m' dst value place vs dt d sz al variant hp ha hsome h
+    simp only [Interp.evalStatementM, Interp.evalSetDiscriminantM, hp, ok_bind, ha,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte, hsome] at h
+    exact encodeDiscriminantM_tb_memory_frame place.ptr.thin_pointer variant.tagger h
+
 /-- **`ResumeUnwind` propagates a failing frame teardown
 (`minirust_resumeUnwind_teardown_error`)**: this closes the case analysis of
 `minirust_unwind_terminators_supported`, whose `ResumeUnwind` clauses assume
@@ -4401,12 +5055,14 @@ thread (`minirust_unwind_provenance_multithread_step_witness`)**:
      dereferences the caught pointer to load `0xBEEF` (`[0xEF, 0xBE]`) into
      `_0`, proving provenance survived the full unwind cycle (a provenance-free
      pointer would raise UB on dereference);
-   - thread `0` keeps its state, its payload list, and its stack depth (the
-     three things checked here), and step `7` hits `Unreachable`.
+   - thread `0` is preserved (`m.threads[0]? = uwMtMachBM.threads[0]?`
+     verbatim on `Mach`, and matching `state`, `unwind_payloads`, and every
+     stack frame's `locals`, `stack_pop_action`, `next_block`, `next_stmt`, and
+     `extra.protectors` on `MachTB`), and step `7` hits `Unreachable`.
 2. Non-main thread `BottomOfStack` contrast (`active_thread = 1`): on both
    `Mach` and `MachTB`, `Terminator.Return` at `BottomOfStack` terminates
-   thread `1` normally, whereas `Terminator.ResumeUnwind` on the exact same
-   state raises UB
+   thread `1` normally while leaving thread `0` verbatim untouched, whereas
+   `Terminator.ResumeUnwind` on the exact same state raises UB
    `"the function at the bottom of the stack must not unwind"`. -/
 theorem minirust_unwind_provenance_multithread_step_witness :
     let botFn := uwFn [(⟨⟨0⟩⟩, .Int u8)]
@@ -4432,10 +5088,11 @@ theorem minirust_unwind_provenance_multithread_step_witness :
       (m.active_thread,
        m.mem.memory.allocations[0]?.map (·.data),
        m.mem.memory.allocations.map (·.live),
-       m.threads.map (fun t => (t.state, t.unwind_payloads, t.stack.length)))) =
+       m.threads.length,
+       m.threads[1]?.map (fun t => (t.state, t.unwind_payloads, t.stack.length)))) =
       some (1, some [.Init 0xEF none, .Init 0xBE none],
-        [true, true, true, true, false, false],
-        [(.Terminated, [⟨0x9000, none⟩], 1), (.Enabled, [], 1)]) ∧
+        [true, true, true, true, false, false], 2, some (.Enabled, [], 1)) ∧
+     (Interp.steps 6 uwMtMachBM).toOption.map (·.threads[0]?) = some uwMtMachBM.threads[0]? ∧
      Interp.steps 7 uwMtMachBM = .error (.ub "reached unreachable code")) ∧
     ((Interp.stepsTB 6 uwMtMachTB).toOption.map (·.active_thread) = some 1 ∧
      (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
@@ -4451,19 +5108,35 @@ theorem minirust_unwind_provenance_multithread_step_witness :
        some [.Terminated, .Enabled] ∧
      (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m => m.threads.map (·.stack.length)) =
        some [1, 1] ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.threads[0]?.map (fun t => t.stack.map (fun f => f.locals.entries.isEmpty))) =
+       some (some [true]) ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.threads[0]?.map (fun t => t.stack.map (fun f =>
+         match f.stack_pop_action with
+         | .BottomOfStack => true
+         | .BackToCaller _ _ _ => false))) =
+       some (some [true]) ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.threads[0]?.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))) =
+       some (some [(⟨⟨9⟩⟩, 0)]) ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.threads[0]?.map (fun t => t.stack.map (fun f => f.extra.protectors))) =
+       some (some [[]]) ∧
      Interp.stepsTB 7 uwMtMachTB = .error (.ub "reached unreachable code")) ∧
     ((Interp.evalTerminator botMachBM .Return).toOption.map (fun m =>
-       m.threads.map (fun t => (t.state, t.unwind_payloads))) =
-       some [(.Enabled, [⟨0x9000, none⟩]), (.Terminated, [])] ∧
+       (m.threads[0]?, m.threads[1]?.map (fun t => (t.state, t.unwind_payloads)))) =
+       some (botMachBM.threads[0]?, some (.Terminated, [])) ∧
      Interp.evalTerminator botMachBM .ResumeUnwind =
        .error (.ub "the function at the bottom of the stack must not unwind") ∧
      (Interp.evalTerminatorM botMachTB .Return).toOption.map (fun m =>
-       m.threads.map (fun t => (t.state, t.unwind_payloads))) =
-       some [(.Enabled, [⟨0x9000, none⟩]), (.Terminated, [])] ∧
+       (m.threads[0]?, m.threads[1]?.map (fun t => (t.state, t.unwind_payloads)))) =
+       some (botMachTB.threads[0]?, some (.Terminated, [])) ∧
      Interp.evalTerminatorM botMachTB .ResumeUnwind =
        .error (.ub "the function at the bottom of the stack must not unwind")) := by
-  refine ⟨⟨rfl, rfl⟩,
+  refine ⟨⟨rfl, rfl, rfl⟩,
     ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
      by decide +kernel, by decide +kernel, eq_error_of_interpStopOf (by decide +kernel)⟩,
     ⟨rfl, rfl, rfl, rfl⟩⟩
 
