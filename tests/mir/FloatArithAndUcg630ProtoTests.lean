@@ -2112,7 +2112,210 @@ theorem test_finding5_and_rich_enum_decoder_applied
       protoNicheOptionRefLayout 0 1 .not (.uint .u8) 1 bytes dv hnp (by decide),
     hr.2.2.2.2.2.2.2.1⟩
 
-/-! ## §18. Automated `run_cmd` Constructive Axiom, Projection-Discipline & Reachability Audit -/
+/-! ## §18. Round 3 (`B3`) Applied Tests: Provenance-Aware & Offset-Sliced Niche Enums, Rich Cast Integration, Sterbenz Exactness & Relational Comparison Determinism -/
+
+/-- Provenance-aware niche decoding (`decodeNichePointerEnumProvAware`) closing
+the offset-zero reference misclassification bug in `EnumDecodeSpec.nichePointer`
+(`Rvalue.ref` fresh borrows have `offsetBytes = 0` with intact provenance). -/
+theorem test_prov_aware_niche_enum_applied
+    (policy : Ptr2IntTransmutePolicy) (fuel : Nat) (bytes provBytes : List AbstractByte)
+    (v vProv dv : Value)
+    (hnp : abstractBytesHaveProv bytes = false)
+    (hprov : abstractBytesHaveProv provBytes = true)
+    (hdecProv : decodeNichePointerEnumProvAware
+      (decodeTypedValueFromBytesWithPolicy policy (.succ fuel) protoRichEnumLayouts)
+      protoNicheOptionRefLayout 0 1 protoRefTy provBytes = .some vProv)
+    (hdecStrict : decodeNichePointerEnumProvAware
+      (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub (.succ fuel) protoRichEnumLayouts)
+      protoNicheOptionRefLayout 0 1 protoRefTy bytes = .some v) :
+    decodeMultiVariantEnumRichWithPolicy .stripProvenance
+        (decodeTypedValueFromBytesWithPolicy .stripProvenance 4 protoRichEnumLayouts)
+        protoRichEnumLayouts protoNicheOptionRefLayout (.nichePointer 0 1 protoRefTy)
+        protoOffsetZeroRefBytes = .some (.aggregate 0 []) ∧
+    decodeNichePointerEnumProvAware
+        (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub 4 protoRichEnumLayouts)
+        protoNicheOptionRefLayout 0 1 protoRefTy protoOffsetZeroRefBytes =
+      .some (.aggregate 1 [.ptr { allocId := 7, offsetBytes := 0 } 8]) ∧
+    (∃ inner,
+      decodeTypedValueFromBytesWithPolicy policy (.succ fuel) protoRichEnumLayouts
+        protoRefTy provBytes = .some inner ∧
+      vProv = .aggregate 1 [inner]) ∧
+    decodeNichePointerEnumProvAware
+        (decodeTypedValueFromBytesWithPolicy .stripProvenance (.succ fuel) protoRichEnumLayouts)
+        protoNicheOptionRefLayout 0 1 protoRefTy bytes = .some v ∧
+    decodeNichePointerEnumProvAware
+        (decodeTypedValueFromBytesWithPolicy policy (.succ fuel) protoRichEnumLayouts)
+        protoNicheOptionRefLayout 0 1 protoRefTy bytes ≠ .some (.aggregate 1 [dv]) ∧
+    decodeNichePointerEnumProvAware
+        (decodeTypedValueFromBytesWithPolicy policy (.succ fuel) protoRichEnumLayouts)
+        protoNicheOptionRefLayout 0 1 protoRefTy bytes =
+      decodeMultiVariantEnumRichWithPolicy policy
+        (decodeTypedValueFromBytesWithPolicy policy (.succ fuel) protoRichEnumLayouts)
+        protoRichEnumLayouts protoNicheOptionRefLayout (.nichePointer 0 1 protoRefTy) bytes := by
+  have hw := niche_offset_zero_ref_misclassified_and_provAware_fix_witness
+  refine ⟨hw.1, hw.2.2.2.1,
+    decodeNichePointerEnumProvAware_prov_imp_dataful _ protoNicheOptionRefLayout 0 1
+      protoRefTy provBytes vProv hprov hdecProv,
+    decodeNichePointerEnumProvAware_mono _ _ protoNicheOptionRefLayout 0 1 protoRefTy bytes v
+      (fun bs cv => decodeTypedValueFromBytesWithPolicy_strict_refines_strip
+        (.succ fuel) protoRichEnumLayouts protoRefTy bs cv)
+      hdecStrict,
+    decodeNichePointerEnumProvAware_ref_no_forge policy fuel protoRichEnumLayouts
+      protoNicheOptionRefLayout 0 1 .not (.uint .u8) 1 bytes dv hnp (by decide),
+    decodeNichePointerEnumProvAware_eq_rich_of_no_prov policy _ protoRichEnumLayouts
+      protoNicheOptionRefLayout 0 1 protoRefTy bytes hnp⟩
+
+/-- Offset-sliced multi-field niche enums (`Option<&[u8]>`, `Option<(&u8, u64)>`)
+and fuel-indexed `decodeTypedValueRichWithPolicy` / `evalByteCastRichWithPolicy`
+closing TCB Findings 3, 4, and 5 end-to-end. -/
+theorem test_rich_adt_and_cast_integration_applied
+    (policy : Ptr2IntTransmutePolicy) (fuel : Nat) (ty : Ty)
+    (bytes : List AbstractByte) (spec : RichAdtSpec)
+    (richSpecs : List (LayoutIdx × RichAdtSpec))
+    (vAdt vRich vCast : Value) (locals' : List LocalSlot) (mem' : Memory)
+    (hnp : abstractBytesHaveProv bytes = false)
+    (hAdtStrict : decodeAdtRichWithPolicy .strictUcg630Ub
+      (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub (.succ fuel) protoRichExtLayouts)
+      protoRichExtLayouts protoNicheWide16Layout spec bytes = .some vAdt)
+    (hRichStrict : decodeTypedValueRichWithPolicy .strictUcg630Ub fuel protoRichExtLayouts
+      richSpecs ty bytes = .some vRich)
+    (hCastStrict : evalByteCastRichWithPolicy .strictUcg630Ub richSpecs protoEnumLocals
+      (.copy ⟨0, []⟩) protoTwoVariantEnumTy emptyMemory protoEnumDecls protoEnumLayouts =
+      .ok vCast locals' mem') :
+    decodeAdtRichWithPolicy .stripProvenance
+        (decodeTypedValueFromBytesWithPolicy .stripProvenance (.succ fuel) protoRichExtLayouts)
+        protoRichExtLayouts protoNicheWide16Layout spec bytes = .some vAdt ∧
+    decodeAdtRichWithPolicy .stripProvenance
+        (decodeTypedValueFromBytesWithPolicy .stripProvenance (.succ fuel) protoRichExtLayouts)
+        protoRichExtLayouts protoNicheWide16Layout spec bytes =
+      decodeAdtRichWithPolicy .strictUcg630Ub
+        (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub (.succ fuel) protoRichExtLayouts)
+        protoRichExtLayouts protoNicheWide16Layout spec bytes ∧
+    decodeAdtRichWithPolicy .strictUcg630Ub
+        (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub 4 protoRichExtLayouts)
+        protoRichExtLayouts protoNicheWide16Layout
+        (.nichePointerEnum { bytes := 0 } 8 0 1 [{ bytes := 0 }] [protoWideSliceRefTy])
+        (appendAbstractBytes (encodeLittleEndianBytes 0 8 .none) (replicateUninitBytes 8)) =
+      .some (.aggregate 0 []) ∧
+    decodeTypedValueRichWithPolicy policy fuel protoRichExtLayouts .nil ty bytes =
+      decodeTypedValueFromBytesWithPolicy policy fuel protoRichExtLayouts ty bytes ∧
+    decodeTypedValueRichWithPolicy .stripProvenance fuel protoRichExtLayouts richSpecs ty bytes =
+      .some vRich ∧
+    decodeTypedValueRichWithPolicy .stripProvenance fuel protoRichExtLayouts richSpecs ty bytes =
+      decodeTypedValueRichWithPolicy .strictUcg630Ub fuel protoRichExtLayouts richSpecs ty bytes ∧
+    evalByteCastRichWithPolicy .stripProvenance richSpecs protoEnumLocals
+        (.copy ⟨0, []⟩) protoTwoVariantEnumTy emptyMemory protoEnumDecls protoEnumLayouts =
+      .ok vCast locals' mem' ∧
+    evalByteCastRichWithPolicy .strictUcg630Ub protoRichExtSpecs
+        protoWrapRefLocals (.copy ⟨0, []⟩) protoWrapRefTy emptyMemory
+        protoWrapRefDecls protoRichExtLayouts = .ub := by
+  have hw := niche_wide_and_multifield_bug_and_complete_fix_witness
+  have hc := evalByteCastRichWithPolicy_closing_findings_3_4_5_witness
+  refine ⟨decodeAdtRichWithPolicy_strict_refines_strip _ _ protoRichExtLayouts
+      protoNicheWide16Layout spec bytes vAdt
+      (fun cTy bs cv => decodeTypedValueFromBytesWithPolicy_strict_refines_strip
+        (.succ fuel) protoRichExtLayouts cTy bs cv)
+      hAdtStrict,
+    decodeAdtRichWithPolicy_strip_eq_strict_of_no_prov _ _ protoRichExtLayouts
+      protoNicheWide16Layout spec bytes hnp
+      (fun cTy bs => decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov
+        (.succ fuel) protoRichExtLayouts cTy bs),
+    hw.2.2.2.1,
+    decodeTypedValueRichWithPolicy_empty_eq policy fuel protoRichExtLayouts ty bytes,
+    decodeTypedValueRichWithPolicy_strict_refines_strip fuel protoRichExtLayouts
+      richSpecs ty bytes vRich hRichStrict,
+    decodeTypedValueRichWithPolicy_strip_eq_strict_of_no_prov fuel protoRichExtLayouts
+      richSpecs ty bytes hnp,
+    evalByteCastRichWithPolicy_strict_refines_strip richSpecs protoEnumLocals
+      (.copy ⟨0, []⟩) protoTwoVariantEnumTy emptyMemory protoEnumDecls protoEnumLayouts
+      vCast locals' mem' hCastStrict,
+    hc.1⟩
+
+/-- Additive rational overflow/underflow thresholds (`add` and `sub`) and
+**Sterbenz's exact-subtraction theorem** instantiated on:
+- `f32` exact cancellation (`1.0 + (-1.0) = +0.0`, `1.0 - 1.0 = +0.0`);
+- `f32` `MAX + MAX` and `MAX - (-MAX)` overflow to `+Inf`;
+- Sterbenz normal boundary (`1.5 - 1.0 = 0.5`), negative normal (`(-1.0) - (-1.75) = 0.75`),
+  and subnormal boundary (`(3 * min_subnormal) - (2 * min_subnormal) = min_subnormal`,
+  `0x00000003 - 0x00000002 = 0x00000001`) with zero rounding error! -/
+theorem test_add_sub_thresholds_and_sterbenz_applied :
+    evalFloatArithBaseProto .add .binary32 0x3F800000 0xBF800000 = zeroBits .binary32 false ∧
+    evalFloatArithBaseProto .add .binary32 0x7F7FFFFF 0x7F7FFFFF = infBits .binary32 false ∧
+    evalFloatArithBaseProto .sub .binary32 0x3F800000 0x3F800000 = zeroBits .binary32 false ∧
+    evalFloatArithBaseProto .sub .binary32 0x7F7FFFFF 0xFF7FFFFF = infBits .binary32 false ∧
+    (∃ diffN diffD,
+      decodeBits .binary32 (evalFloatArithBaseProto .sub .binary32 0x3FC00000 0x3F800000) =
+        .finite false diffN diffD ∧
+      diffN * (8388608 * 8388608) = (12582912 * 8388608 - 8388608 * 8388608) * diffD ∧
+      0 < diffD) ∧
+    (∃ subN subD,
+      decodeBits .binary32 (evalFloatArithBaseProto .sub .binary32 0x00000003 0x00000002) =
+        .finite false subN subD ∧
+      subN * (2 ^ 149 * 2 ^ 149) = 2 ^ 149 * subD ∧
+      0 < subD) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · exact (evalFloatArithBaseProto_add_finite_underflow_iff .binary32 0x3F800000 0xBF800000
+      false true 8388608 8388608 8388608 8388608 rfl rfl).mpr (by decide)
+  · exact (evalFloatArithBaseProto_add_finite_overflow_iff .binary32 0x7F7FFFFF 0x7F7FFFFF
+      false false 340282346638528859811704183484516925440 1
+      340282346638528859811704183484516925440 1 rfl rfl).mpr (by decide)
+  · exact (evalFloatArithBaseProto_sub_finite_underflow_iff .binary32 0x3F800000 0x3F800000
+      false false 8388608 8388608 8388608 8388608 rfl rfl).mpr (by decide)
+  · exact (evalFloatArithBaseProto_sub_finite_overflow_iff .binary32 0x7F7FFFFF 0xFF7FFFFF
+      false true 340282346638528859811704183484516925440 1
+      340282346638528859811704183484516925440 1 rfl rfl).mpr (by decide)
+  · have hst := (evalFloatArithBaseProto_sub_sterbenz_exact .binary32 0x3FC00000 0x3F800000
+      false 12582912 8388608 8388608 8388608 rfl rfl (by decide) (by decide)).2 (by decide)
+    exact hst
+  · have hst := (evalFloatArithBaseProto_sub_sterbenz_exact .binary32 0x00000003 0x00000002
+      false 3 (2 ^ 149) 2 (2 ^ 149) rfl rfl (by decide) (by decide)).2 (by decide)
+    exact hst
+
+/-- Relational MIR dispatcher determinism on unary ops (`.neg` on NaNs) and all
+6 comparison ops (`eq`, `ne`, `lt`, `le`, `gt`, `ge`), plus relational `gt`/`lt`
+swap, `ge`/`le` swap, and `ne = !eq` duality on NaN & signed-zero operands under
+both `FloatArithMode`s. -/
+theorem test_relational_dispatcher_unary_and_cmp_determinism_applied
+    (mode : FloatArithMode) (res : RvalueEvalResult) :
+    (EvalRvalueFloatRelProto mode floatMisdispatchLocals
+        (.unaryOp .neg (.copy ⟨4, []⟩)) emptyMemory floatMisdispatchDecls
+        emptyLayoutTable res ↔
+      res = .ok (.scalar ⟨0xFFC00000, 4⟩) floatMisdispatchLocals emptyMemory) ∧
+    (EvalRvalueFloatRelProto mode floatMisdispatchLocals
+        (.binaryOp .eq (.copy ⟨4, []⟩) (.copy ⟨4, []⟩)) emptyMemory floatMisdispatchDecls
+        emptyLayoutTable res ↔
+      res = .ok (.scalar ⟨0, 1⟩) floatMisdispatchLocals emptyMemory) ∧
+    (EvalRvalueFloatRelProto mode floatMisdispatchLocals
+        (.binaryOp .gt (.copy ⟨4, []⟩) (.copy ⟨0, []⟩)) emptyMemory floatMisdispatchDecls
+        emptyLayoutTable res ↔
+      EvalRvalueFloatRelProto mode floatMisdispatchLocals
+        (.binaryOp .lt (.copy ⟨0, []⟩) (.copy ⟨4, []⟩)) emptyMemory floatMisdispatchDecls
+        emptyLayoutTable res) ∧
+    (EvalRvalueFloatRelProto mode floatMisdispatchLocals
+        (.binaryOp .ge (.copy ⟨2, []⟩) (.copy ⟨3, []⟩)) emptyMemory floatMisdispatchDecls
+        emptyLayoutTable res ↔
+      EvalRvalueFloatRelProto mode floatMisdispatchLocals
+        (.binaryOp .le (.copy ⟨3, []⟩) (.copy ⟨2, []⟩)) emptyMemory floatMisdispatchDecls
+        emptyLayoutTable res) ∧
+    EvalRvalueFloatRelProto mode floatMisdispatchLocals
+        (.binaryOp .ne (.copy ⟨4, []⟩) (.copy ⟨4, []⟩)) emptyMemory floatMisdispatchDecls
+        emptyLayoutTable (.ok (.scalar ⟨1, 1⟩) floatMisdispatchLocals emptyMemory) := by
+  have h1 := EvalRvalueFloatRelProto.unaryOp_iff mode .neg (.copy ⟨4, []⟩)
+    floatMisdispatchLocals emptyMemory floatMisdispatchDecls emptyLayoutTable res
+  have h2 := EvalRvalueFloatRelProto.nonArith_binOp_iff mode .eq (.copy ⟨4, []⟩) (.copy ⟨4, []⟩)
+    floatMisdispatchLocals emptyMemory floatMisdispatchDecls emptyLayoutTable res rfl
+  have hcmp1 := EvalRvalueFloatRelProto.cmp_laws_float mode floatMisdispatchLocals
+    (.copy ⟨4, []⟩) (.copy ⟨0, []⟩) emptyMemory floatMisdispatchDecls emptyLayoutTable
+    .f32 .binary32 ⟨0x7FC00000, 4⟩ ⟨0x3F800000, 4⟩ res rfl rfl rfl rfl rfl rfl rfl
+  have hcmp2 := EvalRvalueFloatRelProto.cmp_laws_float mode floatMisdispatchLocals
+    (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) emptyMemory floatMisdispatchDecls emptyLayoutTable
+    .f32 .binary32 ⟨0x80000000, 4⟩ ⟨0x00000000, 4⟩ res rfl rfl rfl rfl rfl rfl rfl
+  have hcmp3 := (EvalRvalueFloatRelProto.cmp_laws_float mode floatMisdispatchLocals
+    (.copy ⟨4, []⟩) (.copy ⟨4, []⟩) emptyMemory floatMisdispatchDecls emptyLayoutTable
+    .f32 .binary32 ⟨0x7FC00000, 4⟩ ⟨0x7FC00000, 4⟩ res rfl rfl rfl rfl rfl rfl rfl).2.2
+  exact ⟨h1, h2, hcmp1.1, hcmp2.2.1, hcmp3⟩
+
+/-! ## §19. Automated `run_cmd` Constructive Axiom, Projection-Discipline & Reachability Audit -/
 
 /-
 Audit rules (every violation is a hard `throwError`):
@@ -2145,7 +2348,7 @@ run_cmd do
   let prodElims : List Name := [``Prod.casesOn, ``Prod.rec, ``Prod.recOn]
   let modName : Name := `Anneal.FloatArithAndUcg630Prototype
   let testNs : Name := `Anneal.FloatArithAndUcg630ProtoTests
-  let minPublicTheorems : Nat := 243
+  let minPublicTheorems : Nat := 264
   let some modIdx := env.getModuleIdx? modName | throwError "module {modName} not imported"
   let isHostFloat : Name → Bool := fun c =>
     let user := (privateToUserName? c).getD c
