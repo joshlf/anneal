@@ -61,7 +61,7 @@ Complete, kernel-checked, `Classical.choice`-free theory covering:
 | `foreignVisitScheduleNodes`, `execFnEntryMutRetagTraversalOrder`, `execFnEntryMutRetagTraversalOrderDirect` | `TraversalTree.initialForeignRoots` + `foreignPostorder` (`foreignEvents` visit order; exact standalone equivalence on `BorrowTreeRootedWF`) |
 | `IdempotentForeignAccess`, `sifa_foreign_transition_idempotent` | `Miri.TreeBorrows.IdempotentForeignAccess` + `LocationState.skipIfKnownNoop` (per-node idempotence only) |
 | `sortCellsByOffset`, `staticFreezeSegments` | `FreezeVisitor.visitValue` (`FieldsShape::Arbitrary` in `memoryOrder`) + `unsafeCellAction` cursor walk |
-| `RetagShape`, `BorrowTreeFreshWF`, `FnEntryBorrowInv` | shape and inductive invariants of `RetagPipeline.accessTreeForReborrow` + `newChild` (fresh `BorTag` / protector ids) |
+| `RetagShape`, `BorrowTreeFreshWF`, `FnEntryBorrowInv` | shape and full-lifecycle inductive invariants (`singleRoot`, retags, `execWorldRange{Read,Write}`, `releaseProtector`) |
 | `RetagStepErr.protectedReservedIMInvariant` | `AccessOutcome.ImpossibleProtectedReservedIM` / `NormalAccessStatus.PermissionInvariantFailure` (not UB) |
 | `KeyedAllocWorld.checkPtrAccess`, `LinearAllocWorld.checkPtrAccess` | `Miri.Memory.sizeAsI64` + `checkAndDerefPtr` via `ValidityMachine.checkPointerAccessResult` |
 | `checkNestedWideSafeRefChildSession`, `dynSizeAlign` | `ValidityVisitor.checkSafe` on wide places (`checkMetadata`, `size_and_align_of_val`) |
@@ -84,8 +84,10 @@ models cover `&mut` / `Box` parameters only
 order whereas Model 5 and standalone `execFnEntryMutRetagTraversalOrderDirect` follow upstream reverse-
 children postorder (proved identical with no fallback on every `BorrowTreeRootedWF` tree); allocations
 carry no base addresses, so nested `dyn` vtable words are resolved through an explicit non-zero `vtBase`
-map (`validateWideDynSafePtrDeep`) and fail closed without one; and only `.static` / `.memory` globals
-carry a byte payload.
+map (`validateWideDynSafePtrDeep`) and fail closed without one; only `.static` / `.memory` globals
+carry a byte payload; and `StaticTyDesc` models scalar/padding/`UnsafeCell`/struct composites
+(upstream `FreezeVisitor` additionally treats non-`Freeze` unions and multi-variant enums as
+`wholeUnsafeCell`).
 -/
 
 namespace Anneal.ExtTreeMapAllocAndNoWritable
@@ -2762,6 +2764,52 @@ theorem keyedAllocate_ok_inv {w w' : KeyedAllocWorld} {entry : LiveAllocEntry} {
       · intro k; rfl
       · intro k; rfl
 
+/-- Post-state characterization of `KeyedAllocWorld.allocateMachine` on success (ergonomic bridge for
+Episode 2 `LeanMiriSpec` machine-allocation correspondence): fresh live entry installed, `RaceClockEntry`
+seeded iff `mode = .configured _`, and all unrelated live/dead/global/race entries preserved. -/
+theorem keyedAllocateMachine_ok_inv {w w' : KeyedAllocWorld} {entry : LiveAllocEntry}
+    {mode : RaceDetectorMode} {creatorThread : UInt32} {timestamp : UInt64} {id : MiriAllocId}
+    (h : w.allocateMachine entry mode creatorThread timestamp = (w', .ok id)) :
+    w.hasIssued id = false ∧ w.containsId id = false ∧
+    w'.hasIssued id = true ∧ w'.findLive? id = some entry ∧
+    (∀ k, k ≠ id → w'.findLive? k = w.findLive? k) ∧
+    (∀ k, w'.findDead? k = w.findDead? k) ∧
+    (∀ k, w'.findGlobal? k = w.findGlobal? k) ∧
+    (∀ k, k ≠ id → w'.findRace? k = w.findRace? k) ∧
+    (match mode with
+     | .unconfigured => w'.findRace? id = w.findRace? id
+     | .configured _ =>
+       w'.findRace? id = some ⟨creatorThread, timestamp, creatorThread, 0, []⟩) := by
+  unfold KeyedAllocWorld.allocateMachine at h
+  cases halloc : w.allocate entry with
+  | mk w1 r =>
+    rw [halloc] at h
+    cases r with
+    | error e => simp at h
+    | ok id' =>
+      simp only at h
+      rcases keyedAllocate_ok_inv halloc with
+        ⟨hfresh, hnotIn, hissued, hlive, hliveOther, hdead, hglob, hrace⟩
+      cases mode with
+      | unconfigured =>
+        simp only at h
+        injection h with hw hres
+        injection hres with hid
+        subst hid; subst hw
+        exact ⟨hfresh, hnotIn, hissued, hlive, hliveOther, hdead, hglob,
+          fun k _ => hrace k, hrace id'⟩
+      | configured rd =>
+        simp only at h
+        injection h with hw hres
+        injection hres with hid
+        subst hid; subst hw
+        refine ⟨hfresh, hnotIn, hissued, hlive, hliveOther, hdead, hglob, ?_, ?_⟩
+        · intro k hk
+          simp only [KeyedAllocWorld.setRace, KeyedAllocWorld.findRace?,
+            ExtTreeMap0.get?_insert_ne _ _ hk]
+          exact hrace k
+        · simp [KeyedAllocWorld.setRace, KeyedAllocWorld.findRace?, ExtTreeMap0.get?_insert_self]
+
 theorem keyedReserveAllocId_of_highWater (w : KeyedAllocWorld) (id : MiriAllocId)
     (hnotExh : w.idSupplyExhausted = false)
     (hnext : MiriAllocId.ofUInt64 w.nextAllocId = some id)
@@ -4576,41 +4624,73 @@ def execFnEntryMutRetagPrunedSourceOrder (w : FnEntryBorrowWorld)
                     nextProtector := protId + 1 }, childTag)
         | .skipRetag => .ok (w, parentTag)
 
-/-- Explicit child write through `writerTag` in a `FnEntryBorrowWorld` (used for post-retag activation and parent-write tests). -/
+/-- Explicit child write through `writerTag` in a `FnEntryBorrowWorld` (aligned with pinned
+`Miri.Memory.Access` + `NormalTreeState.performAccess`): zero-sized writes succeed without resolving
+`writerTag` or checking mutability; non-zero writes reject `allocReadOnly` first, require `writerTag`
+to exist in `w.nodes`, check ancestors bottom-up before unpruned foreign nodes (`SkipSelfAndChildren`),
+and commit pruned updates. -/
 def execWorldRangeWrite (w : FnEntryBorrowWorld) (writerTag rangeOffset rangeLen : Nat) :
     Except RetagStepErr FnEntryBorrowWorld :=
   if rangeLen == 0 then .ok w
+  else if w.allocReadOnly then .error .writeToReadOnlyAlloc
   else
-    let ancestors := ancestorPathTags w.nodes writerTag
-    match checkAncestorPathM w writerTag
-        (stepNodeOnRangeWrite w.activeProtectors true rangeOffset rangeLen) with
-    | .error e => .error e
-    | .ok () =>
-      let foreignNodes := w.nodes.filter (fun n => !ancestors.contains n.tag)
-      match checkNodesM (stepNodeOnRangeWrite w.activeProtectors false rangeOffset rangeLen) foreignNodes with
+    match findNode? w.nodes writerTag with
+    | none => .error (.missingParentTag writerTag)
+    | some _ =>
+      let ancestors := ancestorPathTags w.nodes writerTag
+      let stepPruned (n : TreeTagNode) : Except RetagStepErr TreeTagNode :=
+        if ancestors.contains n.tag then
+          stepNodeOnRangeWrite w.activeProtectors true rangeOffset rangeLen n
+        else if isPrunedForeignNode w.nodes ancestors true rangeOffset rangeLen n then
+          .ok n
+        else
+          stepNodeOnRangeWrite w.activeProtectors false rangeOffset rangeLen n
+      let activeForeign := w.nodes.filter (fun n =>
+        !ancestors.contains n.tag &&
+          !isPrunedForeignNode w.nodes ancestors true rangeOffset rangeLen n)
+      match checkAncestorPathM w writerTag
+          (stepNodeOnRangeWrite w.activeProtectors true rangeOffset rangeLen) with
       | .error e => .error e
       | .ok () =>
-        match mapNodesM (fun n => stepNodeOnRangeWrite w.activeProtectors (ancestors.contains n.tag) rangeOffset rangeLen n) w.nodes with
+        match checkNodesM (stepNodeOnRangeWrite w.activeProtectors false rangeOffset rangeLen) activeForeign with
         | .error e => .error e
-        | .ok nodes' => .ok { w with nodes := nodes' }
+        | .ok () =>
+          match mapNodesM stepPruned w.nodes with
+          | .error e => .error e
+          | .ok nodes' => .ok { w with nodes := nodes' }
 
-/-- Explicit range read through `readerTag` in a `FnEntryBorrowWorld` (used to latch `conflicted := true`). -/
+/-- Explicit range read through `readerTag` in a `FnEntryBorrowWorld` (aligned with pinned
+`Miri.Memory.Access` + `NormalTreeState.performAccess`): zero-sized reads succeed without resolving
+`readerTag`; non-zero reads require `readerTag` to exist in `w.nodes`, check ancestors bottom-up before
+unpruned foreign nodes (`SkipSelfAndChildren`), and commit pruned updates. -/
 def execWorldRangeRead (w : FnEntryBorrowWorld) (readerTag rangeOffset rangeLen : Nat) :
     Except RetagStepErr FnEntryBorrowWorld :=
   if rangeLen == 0 then .ok w
   else
-    let ancestors := ancestorPathTags w.nodes readerTag
-    match checkAncestorPathM w readerTag
-        (stepNodeOnRangeRead w.activeProtectors true rangeOffset rangeLen) with
-    | .error e => .error e
-    | .ok () =>
-      let foreignNodes := w.nodes.filter (fun n => !ancestors.contains n.tag)
-      match checkNodesM (stepNodeOnRangeRead w.activeProtectors false rangeOffset rangeLen) foreignNodes with
+    match findNode? w.nodes readerTag with
+    | none => .error (.missingParentTag readerTag)
+    | some _ =>
+      let ancestors := ancestorPathTags w.nodes readerTag
+      let stepPruned (n : TreeTagNode) : Except RetagStepErr TreeTagNode :=
+        if ancestors.contains n.tag then
+          stepNodeOnRangeRead w.activeProtectors true rangeOffset rangeLen n
+        else if isPrunedForeignNode w.nodes ancestors false rangeOffset rangeLen n then
+          .ok n
+        else
+          stepNodeOnRangeRead w.activeProtectors false rangeOffset rangeLen n
+      let activeForeign := w.nodes.filter (fun n =>
+        !ancestors.contains n.tag &&
+          !isPrunedForeignNode w.nodes ancestors false rangeOffset rangeLen n)
+      match checkAncestorPathM w readerTag
+          (stepNodeOnRangeRead w.activeProtectors true rangeOffset rangeLen) with
       | .error e => .error e
       | .ok () =>
-        match mapNodesM (fun n => stepNodeOnRangeRead w.activeProtectors (ancestors.contains n.tag) rangeOffset rangeLen n) w.nodes with
+        match checkNodesM (stepNodeOnRangeRead w.activeProtectors false rangeOffset rangeLen) activeForeign with
         | .error e => .error e
-        | .ok nodes' => .ok { w with nodes := nodes' }
+        | .ok () =>
+          match mapNodesM stepPruned w.nodes with
+          | .error e => .error e
+          | .ok nodes' => .ok { w with nodes := nodes' }
 
 theorem fnEntryMutRetag_zst_no_write (w : FnEntryBorrowWorld) (parentTag rangeOffset : Nat)
     (requireInit : Bool) :
@@ -8259,6 +8339,202 @@ theorem borrowTreeTagsWF_not_inductive :
     rcases hn with rfl | rfl <;> decide
   · exact ⟨rfl, rfl⟩
 
+/-- Function-exit protector release (`TreeBorrows` `end_call`): removes `protId` from `activeProtectors`,
+leaving tags, parent links, permissions, and fresh counters unchanged. -/
+def releaseProtector (w : FnEntryBorrowWorld) (protId : Nat) : FnEntryBorrowWorld :=
+  { w with activeProtectors := w.activeProtectors.filter (· != protId) }
+
+private theorem reachesRoot_of_listRel_nodeMetaRel {xs ys : List TreeTagNode}
+    (hrel : ListRel NodeMetaRel xs ys) {rootTag d t : Nat} (h : ReachesRoot xs rootTag d t) :
+    ReachesRoot ys rootTag d t := by
+  induction h with
+  | root r hr hpar =>
+    rcases ListRel.nodeMetaRel_findNode? hrel hr with ⟨y, hy, hmr⟩
+    exact ReachesRoot.root y hy (by rw [hmr.2.1]; exact hpar)
+  | step d t p n hn hpar _ ih =>
+    rcases ListRel.nodeMetaRel_findNode? hrel hn with ⟨y, hy, hmr⟩
+    exact ReachesRoot.step d t p y hy (by rw [hmr.2.1]; exact hpar) ih
+
+private theorem fnEntryBorrowInv_of_listRel_nodeMetaRel {w : FnEntryBorrowWorld} {rootTag : Nat}
+    (hinv : FnEntryBorrowInv w rootTag) {nodes' : List TreeTagNode}
+    (hrel : ListRel NodeMetaRel w.nodes nodes') :
+    FnEntryBorrowInv { w with nodes := nodes' } rootTag := by
+  have htagsEq := ListRel.nodeMetaRel_map_tag_eq hrel
+  have hlenEq := ListRel.length_eq hrel
+  refine ⟨⟨?_, ?_, ?_, ?_, hinv.fresh.activeBelow⟩, ⟨?_, ?_⟩, ?_⟩
+  · rw [htagsEq]; exact hinv.fresh.tagsNodup
+  · intro n hn
+    rcases ListRel.exists_of_mem_right hrel hn with ⟨m, hm, hmr⟩
+    rw [hmr.1]; exact hinv.fresh.tagsBelow m hm
+  · intro n hn p hpar
+    rcases ListRel.exists_of_mem_right hrel hn with ⟨m, hm, hmr⟩
+    rw [hmr.2.1] at hpar; exact hinv.fresh.parentsBelow m hm p hpar
+  · intro n hn q hq
+    rcases ListRel.exists_of_mem_right hrel hn with ⟨m, hm, hmr⟩
+    rw [hmr.2.2.1] at hq; exact hinv.fresh.protectorsBelow m hm q hq
+  · rw [htagsEq]; exact hinv.rooted.tagsNodup
+  · intro n hn
+    rcases ListRel.exists_of_mem_right hrel hn with ⟨m, hm, hmr⟩
+    rcases hinv.rooted.reachesRoot m hm with ⟨d, hd, hreach⟩
+    refine ⟨d, ?_, ?_⟩
+    · show d < nodes'.length
+      rw [hlenEq]; exact hd
+    · rw [hmr.1]
+      exact reachesRoot_of_listRel_nodeMetaRel hrel hreach
+  · intro n hn hperm
+    rcases ListRel.exists_of_mem_right hrel hn with ⟨m, hm, hmr⟩
+    have hmPerm : m.perm = .reservedIM := hmr.2.2.2.2.2 hperm
+    have hmProt := hinv.noProtectedReservedIM m hm hmPerm
+    unfold TreeTagNode.isProtected at hmProt ⊢
+    rw [hmr.2.2.1]
+    exact hmProt
+
+/-- **Full-lifecycle preservation**: explicit writes (`execWorldRangeWrite`) preserve `FnEntryBorrowInv`. -/
+theorem execWorldRangeWrite_preserves_inv {w w' : FnEntryBorrowWorld} {rootTag : Nat}
+    (writerTag off len : Nat) (hinv : FnEntryBorrowInv w rootTag)
+    (hok : execWorldRangeWrite w writerTag off len = .ok w') :
+    FnEntryBorrowInv w' rootTag := by
+  unfold execWorldRangeWrite at hok
+  cases hlen0 : (len == 0) with
+  | true =>
+    simp only [hlen0, ↓reduceIte] at hok
+    injection hok with hw; subst hw; exact hinv
+  | false =>
+    simp only [hlen0, Bool.false_eq_true, ↓reduceIte] at hok
+    cases hro : w.allocReadOnly with
+    | true => simp [hro] at hok
+    | false =>
+      simp only [hro, Bool.false_eq_true, ↓reduceIte] at hok
+      cases hfn : findNode? w.nodes writerTag with
+      | none => simp [hfn] at hok
+      | some _ =>
+        simp only [hfn] at hok
+        cases hanc : checkAncestorPathM w writerTag
+            (stepNodeOnRangeWrite w.activeProtectors true off len) with
+        | error _ => rw [hanc] at hok; cases hok
+        | ok _ =>
+          rw [hanc] at hok
+          cases hfor : checkNodesM (stepNodeOnRangeWrite w.activeProtectors false off len)
+              (w.nodes.filter (fun n => !(ancestorPathTags w.nodes writerTag).contains n.tag &&
+                !isPrunedForeignNode w.nodes (ancestorPathTags w.nodes writerTag) true off len n)) with
+          | error _ => rw [hfor] at hok; cases hok
+          | ok _ =>
+            rw [hfor] at hok
+            cases hmap : mapNodesM (fun n =>
+                if (ancestorPathTags w.nodes writerTag).contains n.tag then
+                  stepNodeOnRangeWrite w.activeProtectors true off len n
+                else if isPrunedForeignNode w.nodes (ancestorPathTags w.nodes writerTag) true off len n then
+                  .ok n
+                else stepNodeOnRangeWrite w.activeProtectors false off len n) w.nodes with
+            | error _ => rw [hmap] at hok; cases hok
+            | ok nodes' =>
+              rw [hmap] at hok
+              injection hok with hw; subst hw
+              have hrel0 := (mapNodesM_ok_iff _ _ _).1 hmap
+              have hrel : ListRel NodeMetaRel w.nodes nodes' := by
+                refine ListRel.imp (fun x y hxy => ?_) hrel0
+                split at hxy
+                · exact stepNodeOnRangeWrite_nodeMetaRel hxy
+                · split at hxy
+                  · injection hxy with h; subst h; exact NodeMetaRel.refl _
+                  · exact stepNodeOnRangeWrite_nodeMetaRel hxy
+              have hres := fnEntryBorrowInv_of_listRel_nodeMetaRel hinv hrel
+              simpa [hro] using hres
+
+/-- **Full-lifecycle preservation**: explicit reads (`execWorldRangeRead`) preserve `FnEntryBorrowInv`. -/
+theorem execWorldRangeRead_preserves_inv {w w' : FnEntryBorrowWorld} {rootTag : Nat}
+    (readerTag off len : Nat) (hinv : FnEntryBorrowInv w rootTag)
+    (hok : execWorldRangeRead w readerTag off len = .ok w') :
+    FnEntryBorrowInv w' rootTag := by
+  unfold execWorldRangeRead at hok
+  cases hlen0 : (len == 0) with
+  | true =>
+    simp only [hlen0, ↓reduceIte] at hok
+    injection hok with hw; subst hw; exact hinv
+  | false =>
+    simp only [hlen0, Bool.false_eq_true, ↓reduceIte] at hok
+    cases hfn : findNode? w.nodes readerTag with
+    | none => simp [hfn] at hok
+    | some _ =>
+      simp only [hfn] at hok
+      cases hanc : checkAncestorPathM w readerTag
+          (stepNodeOnRangeRead w.activeProtectors true off len) with
+      | error _ => rw [hanc] at hok; cases hok
+      | ok _ =>
+        rw [hanc] at hok
+        cases hfor : checkNodesM (stepNodeOnRangeRead w.activeProtectors false off len)
+            (w.nodes.filter (fun n => !(ancestorPathTags w.nodes readerTag).contains n.tag &&
+              !isPrunedForeignNode w.nodes (ancestorPathTags w.nodes readerTag) false off len n)) with
+        | error _ => rw [hfor] at hok; cases hok
+        | ok _ =>
+          rw [hfor] at hok
+          cases hmap : mapNodesM (fun n =>
+              if (ancestorPathTags w.nodes readerTag).contains n.tag then
+                stepNodeOnRangeRead w.activeProtectors true off len n
+              else if isPrunedForeignNode w.nodes (ancestorPathTags w.nodes readerTag) false off len n then
+                .ok n
+              else stepNodeOnRangeRead w.activeProtectors false off len n) w.nodes with
+          | error _ => rw [hmap] at hok; cases hok
+          | ok nodes' =>
+            rw [hmap] at hok
+            injection hok with hw; subst hw
+            have hrel0 := (mapNodesM_ok_iff _ _ _).1 hmap
+            have hrel : ListRel NodeMetaRel w.nodes nodes' := by
+              refine ListRel.imp (fun x y hxy => ?_) hrel0
+              split at hxy
+              · exact stepNodeOnRangeRead_nodeMetaRel hxy
+              · split at hxy
+                · injection hxy with h; subst h; exact NodeMetaRel.refl _
+                · exact stepNodeOnRangeRead_nodeMetaRel hxy
+            exact fnEntryBorrowInv_of_listRel_nodeMetaRel hinv hrel
+
+/-- **Full-lifecycle preservation**: releasing a protector on function exit (`releaseProtector`)
+preserves `FnEntryBorrowInv` (filtering `activeProtectors` only weakens protection). -/
+theorem releaseProtector_preserves_inv {w : FnEntryBorrowWorld} {rootTag : Nat}
+    (protId : Nat) (hinv : FnEntryBorrowInv w rootTag) :
+    FnEntryBorrowInv (releaseProtector w protId) rootTag := by
+  refine ⟨⟨hinv.fresh.tagsNodup, hinv.fresh.tagsBelow, hinv.fresh.parentsBelow,
+    hinv.fresh.protectorsBelow, ?_⟩, ⟨hinv.rooted.tagsNodup, hinv.rooted.reachesRoot⟩, ?_⟩
+  · intro q hq
+    simp only [releaseProtector, List.mem_filter] at hq
+    exact hinv.fresh.activeBelow q hq.1
+  · intro n hn hperm
+    have hfalse := hinv.noProtectedReservedIM n hn hperm
+    unfold TreeTagNode.isProtected at hfalse ⊢
+    cases hp : n.protector with
+    | none => rfl
+    | some p =>
+      rw [hp] at hfalse
+      simp only [releaseProtector]
+      rw [List.any_eq_false] at hfalse ⊢
+      intro x hx
+      rw [List.mem_filter] at hx
+      exact hfalse x hx.1
+
+/-- Guard soundness for explicit range writes/reads: zero-sized accesses always succeed, non-zero writes
+into `allocReadOnly` fail before tag lookup, and non-zero reads/writes through a missing tag fail closed
+with `.missingParentTag` (never mutating or disabling unrelated nodes). -/
+theorem execWorldRangeWrite_readOnly_and_missingTag_rejected
+    (w : FnEntryBorrowWorld) (tag off len : Nat) :
+    execWorldRangeWrite w tag off 0 = .ok w ∧
+    execWorldRangeRead w tag off 0 = .ok w ∧
+    (len ≠ 0 → w.allocReadOnly = true →
+      execWorldRangeWrite w tag off len = .error .writeToReadOnlyAlloc) ∧
+    (len ≠ 0 → w.allocReadOnly = false → findNode? w.nodes tag = none →
+      execWorldRangeWrite w tag off len = .error (.missingParentTag tag)) ∧
+    (len ≠ 0 → findNode? w.nodes tag = none →
+      execWorldRangeRead w tag off len = .error (.missingParentTag tag)) := by
+  refine ⟨rfl, rfl, ?_, ?_, ?_⟩
+  · intro hlen hro
+    have hb : (len == 0) = false := beq_false_of_ne hlen
+    simp [execWorldRangeWrite, hb, hro]
+  · intro hlen hro hfn
+    have hb : (len == 0) = false := beq_false_of_ne hlen
+    simp [execWorldRangeWrite, hb, hro, hfn]
+  · intro hlen hfn
+    have hb : (len == 0) = false := beq_false_of_ne hlen
+    simp [execWorldRangeRead, hb, hfn]
+
 /-! ### 2B. Static-Access Temporary Retag (`charon#1620`) & Syntactic `is_freeze` Static Mutability -/
 
 /-- Type descriptor for static allocation mutability (`intern.rs:222-229`) and `FreezeVisitor` layout decomposition. -/
@@ -8336,14 +8612,15 @@ def sortCellsByOffset : List (Nat × Nat) → List (Nat × Nat)
   | c :: rest => insertCellByOffset c (sortCellsByOffset rest)
 
 /-- Cursor walk of `FreezeVisitor.unsafeCellAction` over memory-ordered intervals: a `.freeze` gap before
-each interval, then the interval itself. The cursor never moves backwards (`max`), so even overlapping
-intervals (which upstream rejects as `invalidProgram`) cannot produce a `.freeze` segment over
-interior-mutable bytes. -/
+each interval (clamped to `totalSize` so malformed out-of-bounds cell offsets never emit `.freeze`
+segments extending past `totalSize`), then the interval itself. The cursor never moves backwards (`max`),
+so even overlapping intervals cannot produce a `.freeze` segment over interior-mutable bytes. -/
 private def buildFreezeSegmentsAux (cursor totalSize : Nat) : List (Nat × Nat) → List StaticFreezeSegment
   | [] =>
     if cursor < totalSize then [⟨cursor, totalSize - cursor, .freeze⟩] else []
   | (cellOff, cellLen) :: rest =>
-    let lead := if cursor < cellOff then [⟨cursor, cellOff - cursor, .freeze⟩] else []
+    let leadEnd := min cellOff totalSize
+    let lead := if cursor < leadEnd then [⟨cursor, leadEnd - cursor, .freeze⟩] else []
     let cell := [⟨cellOff, cellLen, .unsafeCell⟩]
     lead ++ cell ++ buildFreezeSegmentsAux (max cursor (cellOff + cellLen)) totalSize rest
 
@@ -8390,10 +8667,11 @@ inductive StaticWriteOutcome where
   | outOfBounds
   deriving DecidableEq, Repr
 
-/-- Tree-Borrows-only write check (without Miri allocation mutability check). -/
+/-- Tree-Borrows-only write check (without Miri allocation mutability check; zero-sized writes succeed
+unconditionally per `Miri.Memory.checkAndDerefPtr ... 0 = .ok none`). -/
 def evalRawMutStaticWriteTB (st : StaticBorrowState) (writeOff writeLen : Nat) : StaticWriteOutcome :=
-  if writeOff + writeLen > st.totalSize then .outOfBounds
-  else if writeLen == 0 then .ok
+  if writeLen == 0 then .ok
+  else if writeOff + writeLen > st.totalSize then .outOfBounds
   else
     let blocked := st.segments.any fun (seg, perm) =>
       rangesOverlap writeOff writeLen seg.offset seg.len &&
@@ -8402,10 +8680,12 @@ def evalRawMutStaticWriteTB (st : StaticBorrowState) (writeOff writeLen : Nat) :
         | _ => false
     if blocked then .ub else .ok
 
-/-- Full Miri static write check: enforces `staticAllocMutability desc` first, then Tree Borrows. -/
+/-- Full Miri static write check: zero-sized writes succeed without checking bounds or mutability
+(`Access.lean:139`), then bounds, then `staticAllocMutability desc`, then Tree Borrows. -/
 def evalRawMutStaticWriteMiri (desc : StaticTyDesc) (st : StaticBorrowState)
     (writeOff writeLen : Nat) : StaticWriteOutcome :=
-  if writeOff + writeLen > st.totalSize then .outOfBounds
+  if writeLen == 0 then .ok
+  else if writeOff + writeLen > st.totalSize then .outOfBounds
   else if staticAllocMutability desc == .not then .readOnlyAlloc
   else evalRawMutStaticWriteTB st writeOff writeLen
 
@@ -8490,12 +8770,13 @@ theorem static_mixed_miri_separation
       (.composite (frzLen + cellLen + tailLen)
         [(0, .freezeScalar frzLen), (frzLen, .unsafeCell cellLen), (frzLen + cellLen, .padding tailLen)]) = .mut := by
     simp [staticAllocMutability, StaticTyDesc.isSyntacticFreeze, fieldsSyntacticFreeze]
+  have hmin : min frzLen (frzLen + cellLen + tailLen) = frzLen := Nat.min_eq_left (by omega)
   refine ⟨hmut, ?_, ?_⟩
   · simp only [evalRawMutStaticWriteMiri, evalRawMutStaticWriteTB, retagStaticPreservedAt,
       staticFreezeSegments, StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells,
       collectFieldsNonZeroUnsafeCells, Nat.zero_add, hcellNz, Bool.false_eq_true, ↓reduceIte,
       List.nil_append, List.append_nil, sortCellsByOffset, insertCellByOffset, buildFreezeSegmentsAux,
-      Nat.zero_max, hfrz, hmut, hle]
+      hmin, Nat.zero_max, hfrz, hmut, hle]
     rcases hwrite with hlead | ⟨htailLo, htailHi⟩
     · have hovLead : rangesOverlap writeOff 1 0 frzLen = true :=
         rangesOverlap_one_true (Nat.zero_le _) (by omega)
@@ -8529,18 +8810,20 @@ theorem static_mixed_miri_unsafeCell_write_ok
   by_cases htail : tailLen = 0
   · subst htail
     simp only [Nat.add_zero] at hmut hle
+    have hmin0 : min frzLen (frzLen + cellLen) = frzLen := Nat.min_eq_left (by omega)
     simp [evalRawMutStaticWriteMiri, evalRawMutStaticWriteTB, retagStaticPreservedAt,
       staticFreezeSegments, StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells,
       collectFieldsNonZeroUnsafeCells, hcellNz, sortCellsByOffset, insertCellByOffset,
-      buildFreezeSegmentsAux, hfrz, hmut, hle, hnoLead]
+      buildFreezeSegmentsAux, hmin0, hfrz, hmut, hle, hnoLead]
   · have htailLt : frzLen + cellLen < frzLen + cellLen + tailLen := by omega
     have hsub : frzLen + cellLen + tailLen - (frzLen + cellLen) = tailLen := by omega
     have hnoTail : rangesOverlap writeOff 1 (frzLen + cellLen) tailLen = false :=
       rangesOverlap_one_false_of_lt (by omega)
+    have hmin : min frzLen (frzLen + cellLen + tailLen) = frzLen := Nat.min_eq_left (by omega)
     simp [evalRawMutStaticWriteMiri, evalRawMutStaticWriteTB, retagStaticPreservedAt,
       staticFreezeSegments, StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells,
       collectFieldsNonZeroUnsafeCells, hcellNz, sortCellsByOffset, insertCellByOffset,
-      buildFreezeSegmentsAux, hfrz, hmut, hle,
+      buildFreezeSegmentsAux, hmin, hfrz, hmut, hle,
       htailLt, hsub, hnoLead, hnoTail]
 
 /-- Zero-sized `UnsafeCell<()>` composite static `(Freeze[frzLen], UnsafeCell<()>)`:
@@ -8700,10 +8983,11 @@ private theorem buildFreezeSegmentsAux_freeze_iff (total : Nat) :
       have hhead := hall (o, l) (List.mem_cons_self ..)
       simp only at hhead
       by_cases hbo : b < o
-      · have hco : cursor < o := Nat.lt_of_le_of_lt hcur hbo
-        refine ⟨⟨cursor, o - cursor, .freeze⟩, Or.inl (Or.inl (by simp [hco])), rfl, hcur, ?_⟩
-        show b < cursor + (o - cursor)
-        omega
+      · have hco : cursor < min o total := by
+          rw [Nat.min_def]; split <;> omega
+        refine ⟨⟨cursor, min o total - cursor, .freeze⟩, Or.inl (Or.inl (by simp [hco])), rfl, hcur, ?_⟩
+        show b < cursor + (min o total - cursor)
+        rw [Nat.min_def]; split <;> omega
       · have hol : o + l ≤ b :=
           Nat.le_of_not_lt (fun hlt => hhead ⟨Nat.le_of_not_lt hbo, hlt⟩)
         have hmax : max cursor (o + l) ≤ b := by
@@ -8711,6 +8995,52 @@ private theorem buildFreezeSegmentsAux_freeze_iff (total : Nat) :
         rcases (ih (max cursor (o + l)) hsorted.2 b hb).2
           ⟨hmax, fun d hd => hall d (List.mem_cons_of_mem _ hd)⟩ with ⟨s, hs, hk, hlo, hhi⟩
         exact ⟨s, Or.inr hs, hk, hlo, hhi⟩
+
+private theorem buildFreezeSegmentsAux_freeze_in_bounds (total : Nat) :
+    ∀ (cells : List (Nat × Nat)) (cursor : Nat) (s : StaticFreezeSegment),
+      s ∈ buildFreezeSegmentsAux cursor total cells → s.kind = .freeze →
+      0 < s.len ∧ s.offset + s.len ≤ total := by
+  intro cells
+  induction cells with
+  | nil =>
+    intro cursor s hs _
+    simp only [buildFreezeSegmentsAux] at hs
+    split at hs
+    · simp only [List.mem_singleton] at hs
+      subst hs
+      simp only
+      exact ⟨by omega, by omega⟩
+    · cases hs
+  | cons c rest ih =>
+    intro cursor s hs hkind
+    rcases c with ⟨o, l⟩
+    simp only [buildFreezeSegmentsAux, List.mem_append, List.mem_singleton] at hs
+    rcases hs with (hs | hs) | hs
+    · split at hs
+      · rename_i hlt
+        simp only [List.mem_singleton] at hs
+        subst hs
+        simp only
+        refine ⟨by omega, ?_⟩
+        by_cases ho : o ≤ total <;> simp only [Nat.min_def, ho, ↓reduceIte] at hlt ⊢ <;> omega
+      · cases hs
+    · subst hs; cases hkind
+    · exact ih (max cursor (o + l)) s hs hkind
+
+/-- Every `.freeze` segment emitted by `staticFreezeSegments desc` is non-empty and lies strictly inside
+`[0, desc.totalByteSize)`, even on malformed descriptors with out-of-bounds cell offsets. -/
+theorem staticFreezeSegments_freeze_segments_in_bounds (desc : StaticTyDesc)
+    (s : StaticFreezeSegment) (hs : s ∈ (staticFreezeSegments desc).2) (hkind : s.kind = .freeze) :
+    0 < s.len ∧ s.offset + s.len ≤ desc.totalByteSize :=
+  buildFreezeSegmentsAux_freeze_in_bounds desc.totalByteSize
+    (sortCellsByOffset (collectNonZeroUnsafeCells 0 desc)) 0 s hs hkind
+
+/-- Zero-sized static writes (`writeLen = 0`) succeed unconditionally (`Miri.Memory.checkAndDerefPtr`
+line 139), even on read-only `Freeze` statics (`staticAllocMutability desc = .not`) and arbitrary offsets. -/
+theorem static_zstWrite_always_ok (desc : StaticTyDesc) (st : StaticBorrowState) (writeOff : Nat) :
+    evalRawMutStaticWriteMiri desc st writeOff 0 = .ok ∧
+    evalRawMutStaticWriteTB st writeOff 0 = .ok :=
+  ⟨rfl, rfl⟩
 
 /-- Byte-level meaning of the `FreezeVisitor` decomposition, for EVERY descriptor (any field order, any
 nesting): an in-bounds byte lies in a `.freeze` segment iff it lies in no non-zero-sized `UnsafeCell`. -/
@@ -8802,8 +9132,11 @@ theorem static_preserved_write_ok_iff_all_bytes_in_unsafeCell
   have hMiri : evalRawMutStaticWriteMiri desc (retagStaticPreservedAt desc rootTag tmpTag) off len =
       evalRawMutStaticWriteTB (retagStaticPreservedAt desc rootTag tmpTag) off len := by
     unfold evalRawMutStaticWriteMiri
-    rw [htot]
-    simp only [hnot, ↓reduceIte, hmutB, Bool.false_eq_true]
+    cases hlen0 : (len == 0) with
+    | true => simp [evalRawMutStaticWriteTB, hlen0]
+    | false =>
+      rw [htot]
+      simp only [Bool.false_eq_true, ↓reduceIte, hnot, hmutB]
   rw [hMiri]
   -- "some frozen / disabled segment overlaps" is "some written byte lies outside every UnsafeCell"
   have hblockedByte : (∃ p ∈ (retagStaticPreservedAt desc rootTag tmpTag).segments,
@@ -8830,10 +9163,7 @@ theorem static_preserved_write_ok_iff_all_bytes_in_unsafeCell
       simp only [hk]
   by_cases hlen : len = 0
   · subst hlen
-    have hv : evalRawMutStaticWriteTB (retagStaticPreservedAt desc rootTag tmpTag) off 0 = .ok := by
-      unfold evalRawMutStaticWriteTB
-      rw [htot]
-      simp only [hnot, ↓reduceIte, beq_self_eq_true]
+    have hv : evalRawMutStaticWriteTB (retagStaticPreservedAt desc rootTag tmpTag) off 0 = .ok := rfl
     rw [hv]
     exact ⟨⟨fun _ b h1 h2 => absurd h2 (by omega), fun _ => rfl⟩, Or.inl rfl⟩
   · rcases evalRawMutStaticWriteTB_ub_iff (retagStaticPreservedAt desc rootTag tmpTag) off len
@@ -9177,6 +9507,98 @@ theorem fieldsTailSyntacticallySized_eq_of_ok (curSize curAlign : Nat) (curInhab
       · split at h
         · cases h
         · exact fieldsTailSyntacticallySized_eq_of_ok _ _ _ (a :: rest) h
+end
+
+mutual
+/-- Every successful `computeTyLayout` satisfies `lay.sizeBytes ≤ maxObjectSize64` (`isize::MAX`). -/
+theorem computeTyLayout_size_le_maxObjectSize64 :
+    ∀ (ty : ProtoTy) {lay : ProtoLayout}, computeTyLayout ty = .ok lay →
+      lay.sizeBytes ≤ maxObjectSize64
+  | .unit, lay, h => by simp [computeTyLayout] at h; subst h; decide
+  | .never, lay, h => by simp [computeTyLayout] at h; subst h; decide
+  | .bool, lay, h => by simp [computeTyLayout] at h; subst h; decide
+  | .char, lay, h => by simp [computeTyLayout] at h; subst h; decide
+  | .uint sz, lay, h => by
+    unfold computeTyLayout at h
+    split at h
+    · rename_i hsz
+      injection h with h; subst h
+      simp only [Bool.or_eq_true, beq_iff_eq] at hsz
+      rcases hsz with (((rfl | rfl) | rfl) | rfl) | rfl <;> decide
+    · cases h
+  | .fnPtr, lay, h => by simp [computeTyLayout] at h; subst h; decide
+  | .ref _ inner, lay, h => by
+    unfold computeTyLayout at h
+    split at h <;> (injection h with h; subst h; decide)
+  | .rawPtr _ inner, lay, h => by
+    unfold computeTyLayout at h
+    split at h <;> (injection h with h; subst h; decide)
+  | .array elem len, lay, h => by
+    unfold computeTyLayout at h
+    cases hl : computeTyLayout elem with
+    | error _ => simp [hl] at h
+    | ok el =>
+      simp only [hl] at h
+      split at h
+      · cases h
+      · split at h
+        · cases h
+        · rename_i hle
+          injection h with h; subst h
+          exact Nat.le_of_not_lt hle
+  | .slice elem, lay, h => by
+    unfold computeTyLayout at h
+    cases hl : computeTyLayout elem with
+    | error _ => simp [hl] at h
+    | ok el =>
+      simp only [hl] at h
+      split at h
+      · cases h
+      · injection h with h; subst h; exact Nat.zero_le _
+  | .str, lay, h => by simp [computeTyLayout] at h; subst h; decide
+  | .dynamic _, lay, h => by simp [computeTyLayout] at h; subst h; decide
+  | .foreign, lay, h => by simp [computeTyLayout] at h; subst h; decide
+  | .tuple fields, lay, h => computeFieldsLayout_size_le_maxObjectSize64 0 1 true fields h
+  | .adt _ fields, lay, h => computeFieldsLayout_size_le_maxObjectSize64 0 1 true fields h
+
+theorem computeFieldsLayout_size_le_maxObjectSize64 (curSize curAlign : Nat) (curInhab : Bool) :
+    ∀ (fields : List ProtoTy) {lay : ProtoLayout},
+      computeFieldsLayout curSize curAlign curInhab fields = .ok lay →
+      lay.sizeBytes ≤ maxObjectSize64
+  | [], lay, h => by
+    unfold computeFieldsLayout at h
+    dsimp only at h
+    split at h
+    · cases h
+    · rename_i hle
+      injection h with h; subst h
+      exact Nat.le_of_not_lt hle
+  | [last], lay, h => by
+    unfold computeFieldsLayout at h
+    cases hl : computeTyLayout last with
+    | error _ => simp [hl] at h
+    | ok l =>
+      simp only [hl] at h
+      split at h <;> split at h
+      · cases h
+      · rename_i hle
+        injection h with h; subst h
+        exact Nat.le_of_not_lt hle
+      · cases h
+      · rename_i hle
+        injection h with h; subst h
+        exact Nat.le_of_not_lt hle
+  | f :: a :: rest, lay, h => by
+    unfold computeFieldsLayout at h
+    cases hf : computeTyLayout f with
+    | error _ => simp [hf] at h
+    | ok fl =>
+      simp only [hf] at h
+      split at h
+      · cases h
+      · split at h
+        · cases h
+        · exact computeFieldsLayout_size_le_maxObjectSize64 _ _ _ (a :: rest) h
 end
 
 /-- Pointer width layout fidelity: thin references / raw pointers (`Sized` or `extern type` pointee)
@@ -11162,6 +11584,8 @@ def checkNestedSafeRefChildSession (inner : ProtoTy) (rawBytes : List (UInt8 × 
   | .ok lay =>
     if !lay.isSized then
       .error (.layoutErr .unsizedField)
+    else if rawBytes.length != 8 then
+      .error .outOfBoundsPointeeRead
     else
       let addr := decodeLeUInt64 rawBytes
       if addr.toNat + lay.sizeBytes ≥ usizeMax64 then
@@ -12357,6 +12781,69 @@ theorem checkNestedWideSafeRefChildSession_sliceTail_no_layoutErr
   · unfold checkNestedSafeRefWord
     repeat' split
     all_goals (intro h; cases h)
+
+/-- `dyn`-tail counterpart to `checkNestedWideSafeRefChildSession_sliceTail_no_layoutErr`: whenever the
+static layout of `inner` exists with `dyn` metadata (bare `dyn` or custom struct / tuple DST with a
+`dyn` tail), `rawBytes.length = 16`, and the vtable oracle does not itself return `.layoutErr`,
+`checkNestedWideSafeRefChildSession` NEVER spuriously reports a `.layoutErr`. -/
+theorem checkNestedWideSafeRefChildSession_dynTail_no_layoutErr
+    (oracle : NestedDynMetaOracle) (inner : ProtoTy) (lay : ProtoLayout)
+    (rawBytes : List (UInt8 × Option MiriAllocId))
+    (hl : computeTyLayout inner = .ok lay) (hk : lay.metaKind = some .dynVTable)
+    (hw : rawBytes.length = 16) (e : LayoutErr)
+    (horacle : oracle ((unsizedDynTailTrait? inner).getD "") (rawBytes.drop 8) ≠ .error (.layoutErr e)) :
+    checkNestedWideSafeRefChildSession oracle inner rawBytes ≠ .error (.layoutErr e) := by
+  unfold checkNestedWideSafeRefChildSession
+  simp only [hl, hk, hw, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+  cases ho : oracle ((unsizedDynTailTrait? inner).getD "") (rawBytes.drop 8) with
+  | error oe =>
+    rw [ho] at horacle
+    intro h
+    simp only at h
+    injection h with hEq
+    exact horacle (congrArg Except.error hEq)
+  | ok p =>
+    rcases p with ⟨sz0, al0⟩
+    rcases dynSizeAlign_total_of_layout_ok inner (.vtable sz0 al0) hl (by rw [hk]; rfl) with ⟨⟨sz, al⟩, hr⟩
+    simp only [hr]
+    split
+    · intro h; cases h
+    · unfold checkNestedSafeRefWord
+      repeat' split
+      all_goals (intro h; cases h)
+
+/-- Thin/wide child-session coherence: on EVERY sized pointee (`computeTyLayout inner = .ok lay`,
+`lay.isSized = true`), `checkNestedSafeRefChildSession` and `checkNestedWideSafeRefChildSession`
+agree identically for EVERY byte list (including truncated buffers) and EVERY vtable oracle. -/
+theorem checkNestedSafeRefChildSession_eq_wide_of_sized
+    (oracle : NestedDynMetaOracle) (inner : ProtoTy) (lay : ProtoLayout)
+    (rawBytes : List (UInt8 × Option MiriAllocId))
+    (hl : computeTyLayout inner = .ok lay) (hsized : lay.isSized = true) :
+    checkNestedSafeRefChildSession inner rawBytes =
+      checkNestedWideSafeRefChildSession oracle inner rawBytes := by
+  have hmkNone : lay.metaKind = none := by
+    have h1 := isSyntacticallySized_eq_of_computeTyLayout_ok inner hl
+    have h2 := isSyntacticallySized_eq_metadataTail_isNone inner
+    rw [h1.1, hsized] at h2
+    cases hmk : lay.metaKind with
+    | none => rfl
+    | some k =>
+      rw [← h1.2] at hmk
+      rw [hmk] at h2
+      cases h2
+  have hszLe : lay.sizeBytes ≤ maxObjectSize64 := computeTyLayout_size_le_maxObjectSize64 inner hl
+  have hnotBig : ¬ (lay.sizeBytes > maxObjectSize64) := Nat.not_lt.2 hszLe
+  unfold checkNestedSafeRefChildSession checkNestedWideSafeRefChildSession
+  simp only [hl, hsized, hmkNone, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+  cases hlen : (rawBytes.length != 8) with
+  | true => simp
+  | false =>
+    have hlenEq : rawBytes.length = 8 := by
+      have hbeq : (rawBytes.length == 8) = true := by
+        simpa [bne] using hlen
+      exact eq_of_beq hbeq
+    have htake : rawBytes.take 8 = rawBytes := List.take_of_length_le (Nat.le_of_eq hlenEq)
+    simp only [Bool.false_eq_true, ↓reduceIte, hnotBig, checkNestedSafeRefWord, htake]
 
 /-- Custom-DST wide references on concrete bytes: `&(u32, [u8])` uses the DYNAMIC size
 `align_up(4 + len, 4)` and the struct alignment `4` (a 3-byte tail at an aligned address is accepted, a
