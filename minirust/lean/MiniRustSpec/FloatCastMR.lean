@@ -111,16 +111,17 @@ represent: IEEE-754 bit patterns carried by `u32` / `i32` / `[u8; 4]`
    `f64::from_bits(x) as i64`, narrowing `(f64::from_bits(x) as f32).to_bits()`, and
    exact `(x as f64).to_bits()` (the carrier decodes to exactly `x`), and the
    reverse `f16` / `f128` transmute directions complete the carrier matrix.
-9. **`Transmute` & `[u8; 4]`/`[u8; 8]` machine carriers, `TreeBorrowsMemory` + `MachTB.wfLive`
-   preservation, carrier operator/function factorization, and unsigned / narrow / rounding
-   float-cast bridges (§§15–17).** Proves `BasicMemory` (`Interp.steps`) and `TreeBorrowsMemory`
-   (`Interp.stepsTB` + `MachTB.wfLive`) executions of `fcCarrierBody` (`u32 → i32`),
-   `fcCarrier64Body` (`u64 → i64`), `fcU32ToBytes4CarrierBody` (`u32 → [u8; 4]`), and
-   `fcU64ToBytes8CarrierBody` (`u64 → [u8; 8]`), factors the whole `Gen.Function` translations of
-   32-bit and 64-bit `Transmute` vs. `IntToInt` carriers (`fc_carrier_fn_factorization`) alongside
-   polymorphic operator agreement (`fc_mrM_transmute_eq_intToInt`), lifts all five
-   signed/widening/narrowing pipelines to unified symbolic `BM` + `TBM` bridges, and proves
-   symbolic bridges for unsigned `f32 → u32`, narrow `f32 → u8`, and rounding `u64 → f64`.
+9. **`Transmute` & `[u8; 4]`/`[u8; 8]` bidirectional machine carriers, `TreeBorrowsMemory` +
+   `MachTB.wfLive` preservation, carrier operator/function factorization, complete 4-fragment
+   rejection, and unsigned / narrow / rounding float-cast bridges (§§15–19).** Proves `BasicMemory`
+   (`Interp.steps`) and `TreeBorrowsMemory` (`Interp.stepsTB` + `MachTB.wfLive`) executions of
+   `fcCarrierBody` (`u32 → i32`), `fcCarrier64Body` (`u64 → i64`), and both directions of `[u8; 4]`
+   and `[u8; 8]` byte-array carriers (`to_le_bytes` and `from_le_bytes`), factors the whole
+   `Gen.Function` translations of 32-bit and 64-bit `Transmute` vs. `IntToInt` carriers
+   (`fc_carrier_fn_factorization`), closes all four fragment predicates (`inFragment`,
+   `inFragmentWithIntrinsics`, `progInFragment`, `progInFragmentWithIntrinsics`) against both float
+   locals and float-cast statements in any entry or callee, and proves symbolic bridges for unsigned
+   `f32 → u32`, narrow `f32 → u8`, and rounding `u64 → f64`.
 
 Every public theorem is guarded by `#print axioms` at the end of the file.
 -/
@@ -4381,6 +4382,284 @@ theorem fc_float_bodies_rejected_with_intrinsics :
       (List.mem_cons_of_mem _ (List.mem_cons_self ..))
       ⟨_, List.mem_cons_of_mem _ (List.mem_cons_self ..), _, _, rfl⟩⟩
 
+/-! ## 19. Complete multi-function float-cast statement rejection (`progInFragment` &
+`progInFragmentWithIntrinsics`) and inverse `from_le_bytes` machine carriers (`[adv shard-b B4]`) -/
+
+/-- **Every statement well-formedness predicate (`statementOk`, `progStatementOk`, `provCastStmtOk`,
+`statementOkWithIntrinsics`) rejects every float-cast assignment**, regardless of local declarations
+(even if all locals are integer-typed), destination projections, or layout table. -/
+theorem fc_statementOkWithIntrinsics_floatCast_eq_false (layouts : LayoutTable)
+    (decls : List LocalDecl) (dst : Place) (k : CastKind) (op : Operand) (ty : Ty)
+    (span : String) (hk : fcIsFloatCastKind k = true) :
+    statementOk decls ⟨.assign dst (.cast k op ty), span⟩ layouts = false ∧
+    progStatementOk decls ⟨.assign dst (.cast k op ty), span⟩ layouts = false ∧
+    provCastStmtOk decls ⟨.assign dst (.cast k op ty), span⟩ layouts = false ∧
+    statementOkWithIntrinsics decls ⟨.assign dst (.cast k op ty), span⟩ layouts = false := by
+  have hs : statementOk decls ⟨.assign dst (.cast k op ty), span⟩ layouts = false := by
+    rcases dst with ⟨i, projs⟩
+    cases k <;> simp [fcIsFloatCastKind] at hk <;>
+    (cases projs with
+     | nil =>
+       simp only [statementOk, copyRv, rvalueOkB, rvalueOkO, rvalueOkTuple, rvalueOk,
+         ptrDerefReadOk, arrayRvalueOk, tupleRvalueOk, ptrRvalueOk, Bool.or_false]
+       cases decls[i]? with
+       | none => rfl
+       | some d =>
+         cases hb : isBoolTy d.ty <;> simp only [hb, Bool.false_eq_true, ↓reduceIte]
+         cases ho : isOrderingTy d.ty <;> simp only [Bool.false_eq_true, ↓reduceIte]
+         cases intBoolTupleOf d.ty with
+         | some _ => rfl
+         | none =>
+           cases intTypeOf d.ty with
+           | some _ => rfl
+           | none =>
+             cases arrayTypeOf d.ty with
+             | some v => rcases v with ⟨_, _⟩; rfl
+             | none =>
+               cases tupleTypeOf layouts d.ty with
+               | some v => rcases v with ⟨_, _, _⟩; rfl
+               | none =>
+                 cases ptrPointeeOf d.ty with
+                 | some v => rcases v with ⟨_, _⟩; rfl
+                 | none => rfl
+     | cons p rest =>
+       cases p with
+       | field idx fieldTy =>
+         simp only [statementOk, rvalueOk, tupleRvalueOk, Bool.and_false]
+         cases placeIntType layouts decls ⟨i, .field idx fieldTy :: rest⟩ with
+         | some _ => simp
+         | none =>
+           cases tuplePlaceSpec layouts decls ⟨i, .field idx fieldTy :: rest⟩ with
+           | none => simp
+           | some v =>
+             rcases v with ⟨_, _, _⟩
+             cases placeMirTy decls ⟨i, .field idx fieldTy :: rest⟩ <;> simp
+       | deref =>
+         cases rest with
+         | nil =>
+           simp only [statementOk, copyRv, rvalueOk, ptrDerefReadOk, Bool.or_false]
+           cases (decls[i]? >>= (ptrPointeeOf ·.ty)) with
+           | none => simp
+           | some v => rcases v with ⟨m, _⟩; cases m <;> simp
+         | cons _ _ => rfl
+       | _ =>
+         cases rest with
+         | nil =>
+           simp only [statementOk, rvalueOk, Bool.and_false]
+           cases (decls[i]? >>= (arrayTypeOf ·.ty)) with
+           | none => rfl
+           | some v => rcases v with ⟨_, _⟩; simp
+         | cons _ _ => rfl)
+  have hp : provCastStmtOk decls ⟨.assign dst (.cast k op ty), span⟩ layouts = false := by
+    rcases dst with ⟨i, projs⟩
+    cases k <;> simp [fcIsFloatCastKind] at hk <;>
+    (cases projs with
+     | nil =>
+       simp only [provCastStmtOk, copyRv, exposeCastOk, withExposedCastOk]
+       cases decls[i]? with
+       | none => rfl
+       | some d =>
+         dsimp only []
+         cases h1 : intTypeOf d.ty with
+         | some _ => rfl
+         | none =>
+           dsimp only []
+           cases h2 : ptrPointeeOf d.ty with
+           | none => rfl
+           | some v => rcases v with ⟨_, _⟩; rfl
+     | cons _ _ => rfl)
+  have hps : progStatementOk decls ⟨.assign dst (.cast k op ty), span⟩ layouts = false := by
+    simpa [progStatementOk] using hs
+  exact ⟨hs, hps, hp, by simp [statementOkWithIntrinsics, hps, hp]⟩
+
+/-- **Complete multi-function rejection (`progInFragment` and `progInFragmentWithIntrinsics`)**:
+if *any* function `b ∈ entry :: callees` has either (a) a float local `d ∈ b.localDecls` OR
+(b) a float-cast assignment `⟨.assign dst (.cast k op ty), span⟩` in any basic block (even when
+`b.localDecls` contains zero float locals), **both** `progInFragment entry callees = false` **and**
+`progInFragmentWithIntrinsics entry callees = false`. -/
+theorem fc_progInFragment_both_float_or_stmt_rejected (entry : CapturedMir)
+    (callees : List CapturedMir) (b : CapturedMir) (hb : b ∈ entry :: callees)
+    (h : (∃ d ∈ b.localDecls, ∃ (ft : FloatTy) (idx : Nat), d.ty = ⟨.float ft, idx⟩) ∨
+      (∃ bb ∈ b.basicBlocks, ∃ s ∈ bb.statements,
+        ∃ (dst : Place) (k : CastKind) (op : Operand) (ty : Ty) (span : String),
+          fcIsFloatCastKind k = true ∧ s = ⟨.assign dst (.cast k op ty), span⟩)) :
+    progInFragment entry callees = false ∧ progInFragmentWithIntrinsics entry callees = false := by
+  have hwi : progInFragmentWithIntrinsics entry callees = false := by
+    rcases h with hloc | ⟨bb, hbb, s, hs, dst, k, op, ty, span, hk, rfl⟩
+    · exact fc_progInFragmentWithIntrinsics_float_rejected entry callees b hb hloc
+    · have hswi := (fc_statementOkWithIntrinsics_floatCast_eq_false b.layouts b.localDecls
+        dst k op ty span hk).2.2.2
+      have hstAll : bb.statements.all (statementOkWithIntrinsics b.localDecls · b.layouts) =
+          false := by
+        cases hall : bb.statements.all (statementOkWithIntrinsics b.localDecls · b.layouts) with
+        | false => rfl
+        | true =>
+          have := List.all_eq_true.mp hall _ hs
+          rw [hswi] at this
+          cases this
+      obtain ⟨blk, hblkLt, hbbEq⟩ := List.mem_iff_getElem.mp hbb
+      have hbbOpt : b.basicBlocks[blk]? = some bb := by simp [hblkLt, hbbEq]
+      have hbody : bodyInProgFragmentWithIntrinsics (fnNameMap entry callees) callees b =
+          false := by
+        cases hbf : bodyInProgFragmentWithIntrinsics (fnNameMap entry callees) callees b with
+        | false => rfl
+        | true =>
+          simp only [bodyInProgFragmentWithIntrinsics, Bool.and_eq_true, List.all_eq_true,
+            List.mem_range] at hbf
+          obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨_, hrng⟩, _⟩, _⟩, _⟩, _⟩, _⟩, _⟩, _⟩, _⟩, _⟩ := hbf
+          have hblkOk := hrng blk hblkLt
+          simp [hbbOpt, hstAll] at hblkOk
+      have hallB : (entry :: callees).all
+          (bodyInProgFragmentWithIntrinsics (fnNameMap entry callees) callees) = false := by
+        cases hbAll : (entry :: callees).all
+            (bodyInProgFragmentWithIntrinsics (fnNameMap entry callees) callees) with
+        | false => rfl
+        | true =>
+          have := List.all_eq_true.mp hbAll b hb
+          rw [hbody] at this
+          cases this
+      simp only [progInFragmentWithIntrinsics, hallB, Bool.and_false, Bool.false_and]
+  have hp : progInFragment entry callees = false := by
+    cases hpf : progInFragment entry callees with
+    | false => rfl
+    | true =>
+      have := progInFragment_implies_progInFragmentWithIntrinsics hpf
+      rw [hwi] at this
+      cases this
+  exact ⟨hp, hwi⟩
+
+/-- An ill-typed callee whose locals are exclusively `u32` (zero float locals) yet whose body
+executes `.assign (local_ 0) (.cast .floatToInt (.copy (local_ 1)) u32Ty)`. -/
+def fcIllTypedIntFloatCastCallee : CapturedMir :=
+  ptrBody "float_cast::ill_typed_int_f2i" [fcDecl u32Ty, fcDecl u32Ty]
+    [.assign (local_ 0) (.cast .floatToInt (.copy (local_ 1)) u32Ty)]
+
+/-- Non-vacuity of the local-free multi-function float-cast rejection: `fcIllTypedIntFloatCastCallee`
+has zero float locals, yet poisoning `callees` with it causes both `progInFragment` and
+`progInFragmentWithIntrinsics` to return `false` even when `entry = fcCarrierCastBody` is itself in
+`inFragment`. -/
+theorem fc_illTyped_floatCast_callee_rejected :
+    inFragment fcCarrierCastBody = true ∧
+    (∀ d ∈ fcIllTypedIntFloatCastCallee.localDecls, ∀ ft idx, d.ty ≠ ⟨.float ft, idx⟩) ∧
+    progInFragment fcCarrierCastBody [fcIllTypedIntFloatCastCallee] = false ∧
+    progInFragmentWithIntrinsics fcCarrierCastBody [fcIllTypedIntFloatCastCallee] = false := by
+  have hrej := fc_progInFragment_both_float_or_stmt_rejected
+    fcCarrierCastBody [fcIllTypedIntFloatCastCallee] fcIllTypedIntFloatCastCallee
+    (List.mem_cons_of_mem _ (List.mem_cons_self ..))
+    (.inr ⟨_, List.mem_cons_self .., _, List.mem_cons_self ..,
+      local_ 0, .floatToInt, .copy (local_ 1), u32Ty, _, rfl, rfl⟩)
+  refine ⟨fc_carrierCast_inFragment, ?_, hrej.1, hrej.2⟩
+  intro d hd ft idx hty
+  simp only [fcIllTypedIntFloatCastCallee, ptrBody, fcDecl, u32Ty, List.mem_cons,
+    List.not_mem_nil, or_false] at hd
+  rcases hd with rfl | rfl <;> cases hty
+
+/-! ### 19.1 Inverse `from_le_bytes` (`[u8; 4] → u32` and `[u8; 8] → u64`) machine carriers -/
+
+/-- `fn bytes4_to_u32(b: [u8; 4]) -> u32 { transmute(b) }`: the inverse `u32::from_le_bytes`
+MiniRust-representable bit carrier. -/
+def fcBytes4ToU32CarrierBody : CapturedMir :=
+  fcBody "float_cast::carrier_bytes4_u32" [fcDecl fcU32Ty, fcDecl fcBytes4Ty]
+    [.assign (local_ 0) (.cast .transmute (.copy (local_ 1)) fcU32Ty)]
+
+def fcBytes4ToU32CarrierFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int fcU32It), (localName 1, .Array (.Int fcU8It) 4)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.Transmute (.Int fcU32It))) (.Load (.Local (localName 1))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem fc_translateFn_bytes4ToU32Carrier :
+    translateFn fcBytes4ToU32CarrierBody = some fcBytes4ToU32CarrierFn := rfl
+
+/-- `fn bytes8_to_u64(b: [u8; 8]) -> u64 { transmute(b) }`: the inverse `u64::from_le_bytes`
+MiniRust-representable bit carrier. -/
+def fcBytes8ToU64CarrierBody : CapturedMir :=
+  fcBody "float_cast::carrier_bytes8_u64" [fcDecl fcU64Ty, fcDecl fcBytes8Ty]
+    [.assign (local_ 0) (.cast .transmute (.copy (local_ 1)) fcU64Ty)]
+
+def fcBytes8ToU64CarrierFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int fcU64It), (localName 1, .Array (.Int fcU8It) 8)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.Transmute (.Int fcU64It))) (.Load (.Local (localName 1))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem fc_translateFn_bytes8ToU64Carrier :
+    translateFn fcBytes8ToU64CarrierBody = some fcBytes8ToU64CarrierFn := rfl
+
+/-- **Bidirectional `from_le_bytes` (`[u8; 4] → u32` and `[u8; 8] → u64`) symbolic `BM`+`TBM`
+`transmuteM` + concrete `BM` + `TBM` + `MachTB.wfLive` machine executions** across sNaN
+(`0x7F800001`), `-1.5f32` (`0xBFC00000`), sNaN64 (`0x7FF0000000000001`), and `-0.0f64`
+(`0x8000000000000000`). -/
+theorem fc_bytes_to_int_carriers_steps_and_wfLive :
+    (∀ bits < 2 ^ 32,
+      transmuteM (M := BM) (.Tuple (fcLeByteValsMRM bits 4))
+        (.Array (.Int fcU8It) 4) (.Int fcU32It) = .ok (.Int (intFromBits bits fcU32It)) ∧
+      transmuteM (M := TBM) (.Tuple (fcLeByteValsMRM bits 4))
+        (.Array (.Int fcU8It) 4) (.Int fcU32It) = .ok (.Int (intFromBits bits fcU32It))) ∧
+    (∀ bits < 2 ^ 64,
+      transmuteM (M := BM) (.Tuple (fcLeByteValsMRM bits 8))
+        (.Array (.Int fcU8It) 8) (.Int fcU64It) = .ok (.Int (intFromBits bits fcU64It)) ∧
+      transmuteM (M := TBM) (.Tuple (fcLeByteValsMRM bits 8))
+        (.Array (.Int fcU8It) 8) (.Int fcU64It) = .ok (.Int (intFromBits bits fcU64It))) ∧
+    retAfter fcBytes4ToU32CarrierBody [.aggregate 0 (fcLeByteVals 0x7F800001 4)] 3 =
+      some (some { retAlloc with data := scalarBytes fcU32It 0x7F800001 }, [1]) ∧
+    retAfterTB fcBytes4ToU32CarrierBody [.aggregate 0 (fcLeByteVals 0x7F800001 4)] 3 =
+      tbRetU32 0x7F800001 ∧
+    retAfterTB fcBytes4ToU32CarrierBody [.aggregate 0 (fcLeByteVals 0xBFC00000 4)] 3 =
+      tbRetU32 0xBFC00000 ∧
+    (∃ m0 m',
+      startMachineTB fcBytes4ToU32CarrierBody [.aggregate 0 (fcLeByteVals 0x7F800001 4)] =
+        some m0 ∧
+      Interp.stepsTB 3 m0 = .ok m' ∧
+      MachTB.wfLive m') ∧
+    fcRetAfter8 fcBytes8ToU64CarrierBody [.aggregate 0 (fcLeByteVals 0x7FF0000000000001 8)] 3 =
+      some (some { fcRetAlloc8 with data := scalarBytes fcU64It 0x7FF0000000000001 }, [1]) ∧
+    fcRetAfterTB8 fcBytes8ToU64CarrierBody [.aggregate 0 (fcLeByteVals 0x7FF0000000000001 8)] 3 =
+      tbRetU64 0x7FF0000000000001 ∧
+    fcRetAfterTB8 fcBytes8ToU64CarrierBody [.aggregate 0 (fcLeByteVals 0x8000000000000000 8)] 3 =
+      tbRetU64 0x8000000000000000 ∧
+    (∃ m0 m',
+      fcStartMachineTB8 fcBytes8ToU64CarrierBody
+          [.aggregate 0 (fcLeByteVals 0x7FF0000000000001 8)] = some m0 ∧
+      Interp.stepsTB 3 m0 = .ok m' ∧
+      MachTB.wfLive m') := by
+  refine ⟨fun bits h => ⟨(fc_mrM_transmute_int_bytes4 (M := BM) .Unsigned bits h none).2,
+    (fc_mrM_transmute_int_bytes4 (M := TBM) .Unsigned bits h none).2⟩,
+    fun bits h => ⟨(fc_mrM_transmute_int_bytes8 (M := BM) .Unsigned bits h none).2,
+      (fc_mrM_transmute_int_bytes8 (M := TBM) .Unsigned bits h none).2⟩,
+    by decide +kernel, by decide +kernel, by decide +kernel, ?_,
+    by decide +kernel, by decide +kernel, by decide +kernel, ?_⟩
+  · simp only [startMachineTB, startMachine, fc_translateFn_bytes4ToU32Carrier, Option.map]
+    exact fc_wfLive_of_stepsTB_isOk
+      (machine fcBytes4ToU32CarrierBody fcBytes4ToU32CarrierFn
+        (initMachineState fcBytes4ToU32CarrierBody
+          [.aggregate 0 (fcLeByteVals 0x7F800001 4)]).frame.locals
+        fcBytes4ToU32CarrierFn.start)
+      3 (by decide +kernel)
+  · simp only [fcStartMachineTB8, fcStartMachine8, fc_translateFn_bytes8ToU64Carrier, Option.map]
+    exact fc_wfLive_of_stepsTB_isOk
+      (machineWithCtx fcCtx8 fcBytes8ToU64CarrierBody fcBytes8ToU64CarrierFn
+        (initMachineState fcBytes8ToU64CarrierBody
+          [.aggregate 0 (fcLeByteVals 0x7FF0000000000001 8)]).frame.locals
+        fcBytes8ToU64CarrierFn.start)
+      3 (by decide +kernel)
+
 /-! ## Axiom guards
 
 Every public theorem of this module depends at most on `propext`, `Classical.choice`, and
@@ -5860,6 +6139,42 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_float_bodies_rejected_with_int
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_float_bodies_rejected_with_intrinsics
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_statementOkWithIntrinsics_floatCast_eq_false' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_statementOkWithIntrinsics_floatCast_eq_false
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_progInFragment_both_float_or_stmt_rejected' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_progInFragment_both_float_or_stmt_rejected
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_illTyped_floatCast_callee_rejected' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_illTyped_floatCast_callee_rejected
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_translateFn_bytes4ToU32Carrier' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_translateFn_bytes4ToU32Carrier
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_translateFn_bytes8ToU64Carrier' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_translateFn_bytes8ToU64Carrier
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_bytes_to_int_carriers_steps_and_wfLive' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_bytes_to_int_carriers_steps_and_wfLive
 
 end AxiomGuards
 
