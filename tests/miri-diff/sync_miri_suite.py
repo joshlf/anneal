@@ -322,7 +322,13 @@ def _strip_rust_comments(src: str, *, blank_strings: bool = False) -> str:
         ):
             cm = _CHAR_LIT_RE.match(src, i)
             if cm is not None:
-                out.append(cm.group(0))
+                lit = cm.group(0)
+                if blank_strings:
+                    prefix_len = 2 if lit.startswith("b'") else 1
+                    inner_len = len(lit) - prefix_len - 1
+                    out.append(lit[:prefix_len] + (" " * inner_len) + "'")
+                else:
+                    out.append(lit)
                 i = cm.end()
                 continue
         out.append(ch)
@@ -330,10 +336,43 @@ def _strip_rust_comments(src: str, *, blank_strings: bool = False) -> str:
     return "".join(out)
 
 
+def _advance_rust_literal(src: str, i: int) -> int | None:
+    """If ``src[i:]`` begins a raw string, cooked string, or char literal, return
+    its end index; otherwise return ``None``.
+    """
+    n = len(src)
+    ch = src[i]
+    at_word_start = i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")
+    if at_word_start:
+        raw_m = _RAW_STR_START_RE.match(src, i)
+        if raw_m is not None:
+            closing = '"' + raw_m.group(1)
+            end_idx = src.find(closing, raw_m.end())
+            return n if end_idx < 0 else end_idx + len(closing)
+    if ch == '"' or (
+        ch in ("b", "c") and i + 1 < n and src[i + 1] == '"' and at_word_start
+    ):
+        k = i + (2 if ch in ("b", "c") else 1)
+        while k < n:
+            if src[k] == "\\":
+                k = min(k + 2, n)
+            elif src[k] == '"':
+                return k + 1
+            else:
+                k += 1
+        return n
+    if ch == "'" or (ch == "b" and i + 1 < n and src[i + 1] == "'" and at_word_start):
+        cm = _CHAR_LIT_RE.match(src, i)
+        if cm is not None:
+            return cm.end()
+    return None
+
+
 def _mask_nested_blocks_and_attrs(clean_src: str) -> str:
-    """Blank `{ ... }` bodies (`brace_depth >= 1`) and top-level `#[...]`/`#![...]`
-    attributes in comment-stripped Rust source while keeping outer `{`/`}` and
-    string/char literals at depth 0 intact.
+    """Blank `{ ... }` bodies (`brace_depth >= 1`), top-level `#[...]`/`#![...]`
+    attributes, and top-level `macro!(...)`/`macro![...]` bodies in
+    comment-stripped Rust source while keeping outer `{`/`}` and string/char
+    literals at depth 0 intact.
     """
     out: list[str] = []
     n = len(clean_src)
@@ -343,53 +382,15 @@ def _mask_nested_blocks_and_attrs(clean_src: str) -> str:
         ch = clean_src[i]
         # Skip string / raw-string / char literals at any depth so braces or
         # brackets inside literals never skew delimiter tracking.
-        if i == 0 or not (clean_src[i - 1].isalnum() or clean_src[i - 1] == "_"):
-            raw_m = _RAW_STR_START_RE.match(clean_src, i)
-            if raw_m is not None:
-                closing = '"' + raw_m.group(1)
-                end_idx = clean_src.find(closing, raw_m.end())
-                lit_end = n if end_idx < 0 else end_idx + len(closing)
-                seg = clean_src[i:lit_end]
-                if brace_depth == 0:
-                    out.append(seg)
-                else:
-                    out.append("".join("\n" if c == "\n" else " " for c in seg))
-                i = lit_end
-                continue
-        if ch == '"' or (
-            ch in ("b", "c")
-            and i + 1 < n
-            and clean_src[i + 1] == '"'
-            and (i == 0 or not (clean_src[i - 1].isalnum() or clean_src[i - 1] == "_"))
-        ):
-            start = i
-            i += 2 if ch in ("b", "c") else 1
-            while i < n:
-                if clean_src[i] == "\\":
-                    i = min(i + 2, n)
-                elif clean_src[i] == '"':
-                    i += 1
-                    break
-                else:
-                    i += 1
-            seg = clean_src[start:i]
+        lit_end = _advance_rust_literal(clean_src, i)
+        if lit_end is not None:
+            seg = clean_src[i:lit_end]
             if brace_depth == 0:
                 out.append(seg)
             else:
                 out.append("".join("\n" if c == "\n" else " " for c in seg))
+            i = lit_end
             continue
-        if ch == "'" or (
-            ch == "b"
-            and i + 1 < n
-            and clean_src[i + 1] == "'"
-            and (i == 0 or not (clean_src[i - 1].isalnum() or clean_src[i - 1] == "_"))
-        ):
-            cm = _CHAR_LIT_RE.match(clean_src, i)
-            if cm is not None:
-                seg = cm.group(0)
-                out.append(seg if brace_depth == 0 else " " * len(seg))
-                i = cm.end()
-                continue
         if brace_depth == 0 and ch == "#":
             j = i + 1
             while j < n and clean_src[j] in (" ", "\t"):
@@ -402,29 +403,55 @@ def _mask_nested_blocks_and_attrs(clean_src: str) -> str:
                 bracket_depth = 1
                 k = j + 1
                 while k < n and bracket_depth > 0:
+                    inner_lit_end = _advance_rust_literal(clean_src, k)
+                    if inner_lit_end is not None:
+                        k = inner_lit_end
+                        continue
                     kc = clean_src[k]
                     if kc == "[":
                         bracket_depth += 1
-                        k += 1
                     elif kc == "]":
                         bracket_depth -= 1
-                        k += 1
-                    elif kc == '"':
-                        k += 1
-                        while k < n:
-                            if clean_src[k] == "\\":
-                                k = min(k + 2, n)
-                            elif clean_src[k] == '"':
-                                k += 1
-                                break
-                            else:
-                                k += 1
-                    else:
-                        k += 1
+                    k += 1
                 seg = clean_src[i:k]
                 out.append("".join("\n" if c == "\n" else " " for c in seg))
                 i = k
                 continue
+        # Mask top-level `ident!(...)` / `ident![...]` macro invocation bodies so
+        # tokens inside bracketed/parenthesized macros cannot masquerade as items.
+        if (
+            brace_depth == 0
+            and ch == "!"
+            and i > 0
+            and (clean_src[i - 1].isalnum() or clean_src[i - 1] == "_" or clean_src[i - 1] in (" ", "\t"))
+        ):
+            p = i - 1
+            while p >= 0 and clean_src[p] in (" ", "\t"):
+                p -= 1
+            if p >= 0 and (clean_src[p].isalnum() or clean_src[p] == "_"):
+                j = i + 1
+                while j < n and clean_src[j] in (" ", "\t", "\n", "\r"):
+                    j += 1
+                if j < n and clean_src[j] in ("(", "["):
+                    open_d = clean_src[j]
+                    close_d = ")" if open_d == "(" else "]"
+                    d = 1
+                    k = j + 1
+                    while k < n and d > 0:
+                        inner_lit_end = _advance_rust_literal(clean_src, k)
+                        if inner_lit_end is not None:
+                            k = inner_lit_end
+                            continue
+                        if clean_src[k] == open_d:
+                            d += 1
+                        elif clean_src[k] == close_d:
+                            d -= 1
+                        k += 1
+                    out.append("!")
+                    seg = clean_src[i + 1 : k]
+                    out.append("".join("\n" if c == "\n" else " " for c in seg))
+                    i = k
+                    continue
         if ch == "{":
             if brace_depth == 0:
                 out.append("{")
@@ -448,7 +475,7 @@ def _mask_nested_blocks_and_attrs(clean_src: str) -> str:
 
 
 _TOP_PREFIX = r"(?:^|[;}])\s*"
-_FN_QUALS = r"(?:const\s+|unsafe\s+|extern(?:\s+\"[^\"]*\")?\s+)*"
+_FN_QUALS = r"(?:const\s+|unsafe\s+|extern(?:\s+(?:(?:b|c)?r#*)?\"[^\"]*\"#*)?\s+)*"
 
 
 def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
@@ -465,6 +492,7 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
     top_lib = _mask_nested_blocks_and_attrs(clean_lib)
     top_lib_no_str = _mask_nested_blocks_and_attrs(clean_lib_no_str)
     clean_eval = _strip_rust_comments(eval_rs, blank_strings=False)
+    clean_eval_no_str = _strip_rust_comments(eval_rs, blank_strings=True)
 
     # A `const __ANNEAL_MODEL_<name>: &str = "<name>";` (or `: () = ();`) marker
     # makes `<name>` a model item (an intra-crate callee or a static), never a
@@ -493,6 +521,10 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
         + r"(?:pub(?:\s*\([^)]*\))?\s+)?const\s+__ANNEAL_MODEL_([A-Za-z0-9_]+)\s*:\s*([^=;]+?)\s*=\s*([^;]+?)\s*;",
         top_lib,
     ):
+        # Guard against `; pub const __ANNEAL_MODEL_...` text inside a top-level
+        # string literal in `top_lib` overwriting a real marker declaration.
+        if "const" not in top_lib_no_str[m.start() : m.start(2)]:
+            continue
         m_name = m.group(1)
         m_ty = re.sub(r"\s+", "", m.group(2))
         m_val = m.group(3).strip()
@@ -506,7 +538,11 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
             continue
         m_ty, m_val = entry_tv
         if m_ty in ("&str", "&'staticstr"):
-            if m_val != f'"{m_name}"':
+            raw_val_m = re.fullmatch(r'r(#*)"([^"]*)"\1', m_val)
+            str_ok = (m_val == f'"{m_name}"') or (
+                raw_val_m is not None and raw_val_m.group(2) == m_name
+            )
+            if not str_ok:
                 mismatched_markers.append(m_name)
         elif m_ty == "()":
             if re.sub(r"\s+", "", m_val) != "()":
@@ -586,7 +622,11 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
             f"missing_in_lib={sorted(missing_in_lib)}"
         )
 
-    eval_arms = re.findall(r'"([^"]+)"\s*=>', clean_eval)
+    eval_arms = [
+        m.group(1)
+        for m in re.finditer(r'"([^"]+)"\s*=>', clean_eval)
+        if clean_eval_no_str[m.end() - 2 : m.end()] == "=>"
+    ]
     seen_eval_arms: set[str] = set()
     dup_eval_arms: set[str] = set()
     for arm in eval_arms:

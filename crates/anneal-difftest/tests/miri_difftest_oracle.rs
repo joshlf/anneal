@@ -4242,4 +4242,45 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
         }
         other => panic!("unexpected minimal repro Anneal outcome: {other:?}"),
     }
+
+    // Multi-candidate batch from a custom multi-item seed carrying both a local
+    // `struct` and a trailing `__ANNEAL_MODEL_*` helper must stage cleanly
+    // without `E0428` duplicate-item errors and compare both candidates live.
+    let multi_item_seed = "\
+pub struct C16LocalPair {
+    pub a: u32,
+    pub b: u32,
+}
+pub fn pass_c16_multi_item_seed() -> u32 {
+    c16_local_model_sum(C16LocalPair { a: 19u32, b: 23u32 })
+}
+pub const __ANNEAL_MODEL_c16_local_model_sum: &str = \"c16_local_model_sum\";
+pub fn c16_local_model_sum(pair: C16LocalPair) -> u32 {
+    wrapping_add(pair.a, pair.b)
+}
+";
+    let multi_batch = generate_miri_batch(&[multi_item_seed], 2, 0xC16_B201);
+    let multi_findings_dir = dir.join("multi_item_findings");
+    let multi_report = evaluate_miri_batches_with_options(
+        "c16_multi_item_batch",
+        0xC16_B201,
+        &[multi_batch],
+        2,
+        &MiriEvalOptions {
+            findings_dir: Some(multi_findings_dir),
+            anneal_repo_root: Some(root.clone()),
+            shrink_seeds: Some(vec![multi_item_seed.to_string()]),
+        },
+    )
+    .expect("2-candidate multi-item model-helper batch must stage and evaluate without E0428");
+    assert_eq!(multi_report.compiled_candidates, 2);
+    assert_eq!(multi_report.compile_failed_candidates, 0);
+    assert_eq!(multi_report.compared_candidates, 2);
+    assert_eq!(multi_report.not_compared_count, 0);
+    assert_eq!(
+        multi_report
+            .witness_polarity_counts
+            .get("unsound_missed_fault"),
+        Some(&0)
+    );
 }

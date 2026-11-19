@@ -285,6 +285,85 @@ pub fn nested_inside_fn_body() -> u32 { 0 }
             with self.assertRaisesRegex(ValueError, "duplicate \\[\\[tests\\]\\] names"):
                 SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
 
+    def test_attr_raw_strings_char_literals_macro_bodies_and_string_spoofing(self) -> None:
+        eval_rs = (
+            'fn main() {\n'
+            '    eprintln!("format hint: \\"ghost_arm\\" => 0");\n'
+            '    match "" { "pass_demo" => {}, _ => {} }\n'
+            '}\n'
+        )
+        # 1. Attribute containing raw string ending in `\"` + unbalanced `]` must
+        #    NOT swallow subsequent unmarked `pub fn` items.
+        attr_raw_backslash_lib = (
+            '#[doc = r#"trailing backslash ] \\"#]\n'
+            "pub fn pass_demo() -> u32 { 1 }\n"
+            "pub fn sneak_after_raw_attr() -> u32 { 0 }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path, corpus_dir = _write_fixture(
+                Path(tmp),
+                manifest_toml=_BASE_MANIFEST,
+                lib_rs=attr_raw_backslash_lib,
+                eval_rs=eval_rs,
+            )
+            with self.assertRaisesRegex(ValueError, "sneak_after_raw_attr"):
+                SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
+
+        # 2. Attribute containing `'"'` or `']'` char literal must NOT open a
+        #    runaway string or terminate attribute masking early.
+        attr_char_quote_lib = (
+            "#[cfg_attr(any(), allow(unused))]\n"
+            "#[doc_char('\"')]\n"
+            "pub fn pass_demo() -> u32 { 1 }\n"
+            'pub extern r#"C"# fn sneak_raw_abi() -> u32 { 0 }\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path, corpus_dir = _write_fixture(
+                Path(tmp),
+                manifest_toml=_BASE_MANIFEST,
+                lib_rs=attr_char_quote_lib,
+                eval_rs=eval_rs,
+            )
+            with self.assertRaisesRegex(ValueError, "sneak_raw_abi"):
+                SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
+
+        # 3. String literal containing `; pub const __ANNEAL_MODEL_probe_a: &str = "probe_a";`
+        #    after a mismatched marker must NOT overwrite and mask the mismatch.
+        spoofed_marker_lib = (
+            'pub const __ANNEAL_MODEL_probe_a: &str = "wrong";\n'
+            'pub const SPOOF: &str = "; pub const __ANNEAL_MODEL_probe_a: &str = \\"probe_a\\";";\n'
+            "pub fn probe_a() -> u32 { 0 }\n"
+            "pub fn pass_demo() -> u32 { 1 }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path, corpus_dir = _write_fixture(
+                Path(tmp),
+                manifest_toml=_BASE_MANIFEST,
+                lib_rs=spoofed_marker_lib,
+                eval_rs=eval_rs,
+            )
+            with self.assertRaisesRegex(ValueError, re.escape('neither `&str = "<name>"` nor `() = ()`')):
+                SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
+
+        # 4. Valid raw-string marker value + bracketed macro invocation body +
+        #    `"=>"` inside an `eprintln!` string in `miri_eval.rs` all pass cleanly.
+        valid_edge_lib = (
+            '#[doc = r#"backslash ] \\"#]\n'
+            'pub const __ANNEAL_MODEL_raw_probe: &str = r#"raw_probe"#;\n'
+            "pub fn raw_probe() -> u32 { 9 }\n"
+            "my_macro![\n;\npub fn inside_bracket_macro() -> u32 { 0 }\n];\n"
+            "pub fn pass_demo() -> u32 { 1 }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path, corpus_dir = _write_fixture(
+                Path(tmp),
+                manifest_toml=_BASE_MANIFEST,
+                lib_rs=valid_edge_lib,
+                eval_rs=eval_rs,
+            )
+            manifest = SYNC.check_manifest_and_corpus(manifest_path, corpus_dir)
+            self.assertEqual([t["name"] for t in manifest["tests"]], ["pass_demo"])
+
 
 if __name__ == "__main__":
     unittest.main()

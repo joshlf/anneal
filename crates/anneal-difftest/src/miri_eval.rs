@@ -26,7 +26,7 @@ use cargo_anneal::{
     DifftestOracleReport, DivergenceKind, ItemOracleReport, MiriOracleConfig, MiriOutcome,
     MiriToolchain, NotComparedReason, OracleItemSpec, ScaffoldConfig, SourcePos, SourceSpan,
     aggregate_unit_manifests, build_lake_build_command, compare_miri_and_anneal,
-    derive_item_module_suffix, discover_zero_arg_pub_fns, normalize_path_against,
+    derive_item_module_suffix, normalize_path_against,
     parse_anneal_probe_output, probe_effective_memory_kib, resolve_default_lake_jobs,
     resolve_rustc_wrapper, run_miri_oracle, scaffold_workspace_with_config, source_files_match,
 };
@@ -2239,20 +2239,143 @@ fn format_miri_excerpt(outcome: &MiriOutcome, translated_pos: Option<&str>) -> S
     }
 }
 
-fn translate_pos_to_repro(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DedupedAuxLineMap {
+    emitted_start_line: u32,
+    emitted_end_line: u32,
+    repro_item_start_line: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SeenStagedAuxItem {
+    tokens: String,
+    emitted_start_line: u32,
+    emitted_end_line: u32,
+}
+
+fn blank_char_intervals_preserving_lines(
+    src: &str,
+    intervals: &[((usize, usize), (usize, usize))],
+) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for ch in src.chars() {
+        if ch == '\n' {
+            out.push('\n');
+            line += 1;
+            col = 1;
+        } else {
+            let masked = intervals
+                .iter()
+                .any(|&(start, end_excl)| (line, col) >= start && (line, col) < end_excl);
+            out.push(if masked { ' ' } else { ch });
+            col += 1;
+        }
+    }
+    out
+}
+
+/// Stage `cand.fn_source` into a multi-candidate crate at `batch_start_line`,
+/// blanking any non-entry auxiliary item whose `aux_item_dedup_key` and token
+/// stream already appeared earlier in the same staged `src/lib.rs` so multiple
+/// candidates drawn from a multi-item seed never collide with `E0428` while
+/// candidate body line numbers and fault translations into `repro.rs` remain exact.
+fn stage_candidate_source_for_batch(
+    cand: &GeneratedMiriCandidate,
+    batch_start_line: u32,
+    repro_start_line: u32,
+    seen_aux: &mut BTreeMap<String, SeenStagedAuxItem>,
+) -> (String, Vec<DedupedAuxLineMap>) {
+    let trimmed = cand.fn_source.trim();
+    let Ok(parsed) = syn::parse_file(trimmed) else {
+        return (trimmed.to_string(), Vec::new());
+    };
+    let mut blank_intervals = Vec::new();
+    let mut aux_maps = Vec::new();
+    for item in &parsed.items {
+        if let syn::Item::Fn(func) = item
+            && func.sig.ident == cand.fn_name
+        {
+            continue;
+        }
+        let Some(key) = crate::mutators_miri::aux_item_dedup_key(item) else {
+            continue;
+        };
+        let Some((start, end_excl)) = node_span_bounds(item) else {
+            continue;
+        };
+        let local_start = start.0 as u32;
+        let local_end = end_excl.0 as u32;
+        let emitted_start = batch_start_line + local_start.saturating_sub(1);
+        let emitted_end = batch_start_line + local_end.saturating_sub(1);
+        let tokens = quote::ToTokens::to_token_stream(item).to_string();
+        if let Some(prev) = seen_aux.get(&key) {
+            if prev.tokens == tokens {
+                blank_intervals.push((start, end_excl));
+                aux_maps.push(DedupedAuxLineMap {
+                    emitted_start_line: prev.emitted_start_line,
+                    emitted_end_line: prev.emitted_end_line,
+                    repro_item_start_line: repro_start_line + local_start.saturating_sub(1),
+                });
+            }
+        } else {
+            seen_aux.insert(
+                key,
+                SeenStagedAuxItem {
+                    tokens,
+                    emitted_start_line: emitted_start,
+                    emitted_end_line: emitted_end,
+                },
+            );
+        }
+    }
+    if blank_intervals.is_empty() {
+        (trimmed.to_string(), aux_maps)
+    } else {
+        (
+            blank_char_intervals_preserving_lines(trimmed, &blank_intervals),
+            aux_maps,
+        )
+    }
+}
+
+fn translate_line_to_repro_with_aux(
+    line: u32,
+    batch_start_line: u32,
+    repro_start_line: u32,
+    aux_maps: &[DedupedAuxLineMap],
+) -> u32 {
+    if line >= batch_start_line {
+        // Subtract before adding: `batch_start_line` may be smaller than
+        // `repro_start_line` (for example when the span already comes from a
+        // single-candidate run), and `u32` cannot represent a negative delta.
+        line - batch_start_line + repro_start_line
+    } else if let Some(m) = aux_maps
+        .iter()
+        .find(|m| line >= m.emitted_start_line && line <= m.emitted_end_line)
+    {
+        m.repro_item_start_line + (line - m.emitted_start_line)
+    } else {
+        line
+    }
+}
+
+fn translate_pos_to_repro_with_aux(
     pos: &SourcePos,
     batch_start_line: u32,
     repro_start_line: u32,
+    aux_maps: &[DedupedAuxLineMap],
 ) -> SourcePos {
     if source_files_match(&pos.file, "src/lib.rs") {
-        let line = if pos.line >= batch_start_line {
-            pos.line - batch_start_line + repro_start_line
-        } else {
-            pos.line
-        };
         SourcePos {
             file: "src/lib.rs".to_string(),
-            line,
+            line: translate_line_to_repro_with_aux(
+                pos.line,
+                batch_start_line,
+                repro_start_line,
+                aux_maps,
+            ),
             col: pos.col,
         }
     } else {
@@ -2260,37 +2383,51 @@ fn translate_pos_to_repro(
     }
 }
 
-fn translate_span_to_repro(
+#[cfg(test)]
+fn translate_pos_to_repro(
+    pos: &SourcePos,
+    batch_start_line: u32,
+    repro_start_line: u32,
+) -> SourcePos {
+    translate_pos_to_repro_with_aux(pos, batch_start_line, repro_start_line, &[])
+}
+
+fn translate_span_to_repro_with_aux(
     span: &SourceSpan,
     batch_start_line: u32,
     repro_start_line: u32,
+    aux_maps: &[DedupedAuxLineMap],
 ) -> SourceSpan {
     if source_files_match(&span.file, "src/lib.rs") {
-        // Subtract before adding: `batch_start_line` may be smaller than
-        // `repro_start_line` (for example when the span already comes from a
-        // single-candidate run), and `u32` cannot represent a negative delta.
-        // Lines below `batch_start_line` (preamble lines or `end_line == 0`)
-        // stay at their original line numbers.
-        let start_line = if span.start_line >= batch_start_line {
-            span.start_line - batch_start_line + repro_start_line
-        } else {
-            span.start_line
-        };
-        let end_line = if span.end_line >= batch_start_line {
-            span.end_line - batch_start_line + repro_start_line
-        } else {
-            span.end_line
-        };
         SourceSpan {
             file: "src/lib.rs".to_string(),
-            start_line,
+            start_line: translate_line_to_repro_with_aux(
+                span.start_line,
+                batch_start_line,
+                repro_start_line,
+                aux_maps,
+            ),
             start_col: span.start_col,
-            end_line,
+            end_line: translate_line_to_repro_with_aux(
+                span.end_line,
+                batch_start_line,
+                repro_start_line,
+                aux_maps,
+            ),
             end_col: span.end_col,
         }
     } else {
         span.clone()
     }
+}
+
+#[cfg(test)]
+fn translate_span_to_repro(
+    span: &SourceSpan,
+    batch_start_line: u32,
+    repro_start_line: u32,
+) -> SourceSpan {
+    translate_span_to_repro_with_aux(span, batch_start_line, repro_start_line, &[])
 }
 
 fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str) -> String {
@@ -2520,6 +2657,38 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
                 .push(quote::ToTokens::to_token_stream(item));
         }
         syn::visit::visit_item_const(self, item);
+    }
+
+    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        self.aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(quote::ToTokens::to_token_stream(item));
+        syn::visit::visit_item_struct(self, item);
+    }
+
+    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+        self.aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(quote::ToTokens::to_token_stream(item));
+        syn::visit::visit_item_enum(self, item);
+    }
+
+    fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+        self.aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(quote::ToTokens::to_token_stream(item));
+        syn::visit::visit_item_union(self, item);
+    }
+
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        self.aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(quote::ToTokens::to_token_stream(item));
+        syn::visit::visit_item_type(self, item);
     }
 
     fn visit_item_impl(&mut self, imp: &'ast syn::ItemImpl) {
@@ -5307,7 +5476,7 @@ fn discover_reproducer_candidate_fn(source: &str) -> Option<String> {
         return pub_zero_arg.pop();
     }
     let local_models = crate::mutators_miri::model_marked_names_in_source_text(source);
-    discover_zero_arg_pub_fns(source)
+    crate::mutators_miri::discover_top_level_zero_arg_pub_fns_in_source_text(source)
         .into_iter()
         .filter(|name| !crate::mutators_miri::is_helper_fn_name_in_set(name, &local_models))
         .last()
@@ -5508,7 +5677,11 @@ pub fn evaluate_miri_batches_with_options(
 
     let mut staged_lib_rs = repro_prefix;
     let mut item_specs: Vec<OracleItemSpec> = Vec::with_capacity(compiled_candidates);
-    let mut cand_by_name: BTreeMap<String, (&GeneratedMiriCandidate, u32)> = BTreeMap::new();
+    let mut cand_by_name: BTreeMap<
+        String,
+        (&GeneratedMiriCandidate, u32, Vec<DedupedAuxLineMap>),
+    > = BTreeMap::new();
+    let mut seen_staged_aux: BTreeMap<String, SeenStagedAuxItem> = BTreeMap::new();
 
     for (b_idx, batch) in batches.iter().enumerate() {
         for (c_idx, cand) in batch.iter().enumerate() {
@@ -5516,7 +5689,13 @@ pub fn evaluate_miri_batches_with_options(
                 continue;
             }
             let batch_start_line = staged_lib_rs.lines().count() as u32 + 1;
-            staged_lib_rs.push_str(cand.fn_source.trim());
+            let (staged_cand_src, aux_maps) = stage_candidate_source_for_batch(
+                cand,
+                batch_start_line,
+                repro_start_line,
+                &mut seen_staged_aux,
+            );
+            staged_lib_rs.push_str(&staged_cand_src);
             staged_lib_rs.push_str("\n\n");
             let candidate_fuel = if mode == "identity" {
                 DEFAULT_ORACLE_FUEL
@@ -5527,7 +5706,7 @@ pub fn evaluate_miri_batches_with_options(
                 cand.fn_name.clone(),
                 candidate_fuel,
             ));
-            cand_by_name.insert(cand.fn_name.clone(), (cand, batch_start_line));
+            cand_by_name.insert(cand.fn_name.clone(), (cand, batch_start_line, aux_maps));
         }
     }
 
@@ -5613,7 +5792,7 @@ pub fn evaluate_miri_batches_with_options(
                 NotComparedReason::CaptureFailed(_) => "not_compared_capture_failed".to_string(),
             },
         };
-        let template_and_chain = if let Some((cand, _)) = cand_by_name.get(&item_rep.name) {
+        let template_and_chain = if let Some((cand, _, _)) = cand_by_name.get(&item_rep.name) {
             if cand.applied_mutators.is_empty() {
                 format!("{}@identity", cand.seed_name)
             } else {
@@ -5688,7 +5867,7 @@ pub fn evaluate_miri_batches_with_options(
                         fn_name: item_rep.name.clone(),
                         seed_name: cand_by_name
                             .get(&item_rep.name)
-                            .map(|(cand, _)| cand.seed_name.clone())
+                            .map(|(cand, _, _)| cand.seed_name.clone())
                             .unwrap_or_default(),
                         batch_miri_pos,
                         anneal_span: item_rep.anneal.span().map(SourceSpan::display_short),
@@ -5737,7 +5916,7 @@ pub fn evaluate_miri_batches_with_options(
                 *divergence_classes.entry(class_slug.clone()).or_insert(0) += 1;
                 let mut item_kernel_confirmed = item_rep.kernel_confirmed;
 
-                if let Some((cand, batch_start_line)) = cand_by_name.get(&item_rep.name) {
+                if let Some((cand, batch_start_line, aux_maps)) = cand_by_name.get(&item_rep.name) {
                     let (shrink_res, shrink_status) = shrink_divergent_miri_candidate(
                         cand,
                         &shrink_seed_refs,
@@ -5753,10 +5932,10 @@ pub fn evaluate_miri_batches_with_options(
                     let eff_item_rep = reduced.map_or(item_rep, |sr| &sr.minimized_report);
                     item_kernel_confirmed = eff_item_rep.kernel_confirmed;
                     let eff_cand = reduced.map_or(*cand, |sr| &sr.minimized_candidate);
-                    let eff_start_line = if reduced.is_some() {
-                        repro_start_line
+                    let (eff_start_line, eff_aux_maps) = if reduced.is_some() {
+                        (repro_start_line, &[][..])
                     } else {
-                        *batch_start_line
+                        (*batch_start_line, aux_maps.as_slice())
                     };
 
                     let raw_miri_pos = match &eff_item_rep.miri {
@@ -5772,13 +5951,27 @@ pub fn evaluate_miri_batches_with_options(
                         _ => None,
                     };
                     let repro_miri_pos = raw_miri_pos
-                        .map(|p| translate_pos_to_repro(p, eff_start_line, repro_start_line))
+                        .map(|p| {
+                            translate_pos_to_repro_with_aux(
+                                p,
+                                eff_start_line,
+                                repro_start_line,
+                                eff_aux_maps,
+                            )
+                        })
                         .map(|p| p.display_short());
 
                     let raw_anneal_span = eff_item_rep.anneal.span();
                     let batch_anneal_span = item_rep.anneal.span().map(SourceSpan::display_short);
                     let repro_anneal_span = raw_anneal_span
-                        .map(|s| translate_span_to_repro(s, eff_start_line, repro_start_line))
+                        .map(|s| {
+                            translate_span_to_repro_with_aux(
+                                s,
+                                eff_start_line,
+                                repro_start_line,
+                                eff_aux_maps,
+                            )
+                        })
                         .map(|s| s.display_short());
 
                     let miri_outcome_tag = match &eff_item_rep.miri {
@@ -12189,5 +12382,134 @@ pub fn unreached_helper() -> u32 { 9u32 }
         );
         assert!(reached.contains("const_init_helper"), "{reached:?}");
         assert!(!reached.contains("unreached_helper"), "{reached:?}");
+
+        // 6. `FnAndAuxCollector` traverses `struct`, `enum`, `union`, and `type`
+        //    declarations so transitive `Drop` impls (`UnwindCleanupGuard`) and
+        //    `const fn` array-length helpers reached via ADTs/type aliases are
+        //    linked into `reached_fns` / `reached_aux`.
+        let via_adt_and_type = "\
+#![no_std]
+pub struct UnwindCleanupGuard {
+    pub counter: *mut u32,
+}
+impl Drop for UnwindCleanupGuard {
+    fn drop(&mut self) {}
+}
+pub const __ANNEAL_MODEL_adt_len_helper: &str = \"adt_len_helper\";
+pub const fn adt_len_helper() -> usize { 4usize }
+pub struct FixedBuf(pub [u8; adt_len_helper()]);
+pub enum MaybeCleanup {
+    Empty,
+    Armed(UnwindCleanupGuard),
+}
+pub union RawSlot {
+    pub buf: core::mem::ManuallyDrop<FixedBuf>,
+    pub raw: u32,
+}
+pub type CleanupAlias = MaybeCleanup;
+pub fn cand_touches_alias_and_union() -> u32 {
+    let _a: CleanupAlias = MaybeCleanup::Empty;
+    let u = RawSlot { raw: 5u32 };
+    unsafe { u.raw }
+}
+";
+        let (adt_fns, adt_aux) = staged_fns_and_aux_reachable_from_candidates(
+            via_adt_and_type,
+            &[OracleItemSpec::with_fuel(
+                "cand_touches_alias_and_union".to_string(),
+                64,
+            )],
+        );
+        assert!(adt_fns.contains("adt_len_helper"), "{adt_fns:?}");
+        assert!(adt_aux.contains("UnwindCleanupGuard"), "{adt_aux:?}");
+
+        // 7. Non-`syn` fallback discovery ignores `pub fn` and `__ANNEAL_MODEL_*`
+        //    inside string/raw-string literals and block comments, while honoring
+        //    same-line `#[inline(never)] pub const fn` / `pub extern \"C\" fn`.
+        let fallback_strings_and_attrs = "\
+#![no_std]
+const SPOOF: &str = \"/* not a comment\npub const __ANNEAL_MODEL_real_cand: () = ();\npub fn fake_cand() {}\";
+const RAW_SPOOF: &str = r#\"pub fn fake_raw_cand() {}\"#;
+#[inline(never)] pub extern \"C\" fn real_cand() -> u32 { @@@ }
+pub const __ANNEAL_MODEL_raw_alias: &str = r#\"attr_helper\"#;
+#[inline(never)] pub const fn attr_helper() -> u32 { 7u32 }
+";
+        assert!(syn::parse_file(fallback_strings_and_attrs).is_err());
+        assert_eq!(
+            discover_reproducer_candidate_fn(fallback_strings_and_attrs).as_deref(),
+            Some("real_cand")
+        );
+
+        // 8. Multi-candidate batch staging deduplicates identical seed-local
+        //    auxiliary items (`struct`, `__ANNEAL_MODEL_*`, helper `fn`) across
+        //    candidates without `E0428`, preserves candidate body line numbers,
+        //    and translates helper-interior spans back into `repro.rs` lines.
+        let seed_with_local_aux = "\
+pub struct SeedPair {
+    pub a: u32,
+    pub b: u32,
+}
+pub const __ANNEAL_MODEL_seed_local_helper: &str = \"seed_local_helper\";
+pub fn seed_local_helper(p: SeedPair) -> u32 {
+    p.a.wrapping_add(p.b)
+}
+pub fn pass_seed_uses_local_aux() -> u32 {
+    seed_local_helper(SeedPair { a: 10u32, b: 20u32 })
+}
+";
+        let unrelated_seed = "pub fn pass_unrelated_scalar() -> u32 { 5u32 }\n";
+        let mut batch_cands =
+            crate::mutators_miri::generate_miri_batch(&[unrelated_seed], 1, 0xB2_0001);
+        let aux_cands =
+            crate::mutators_miri::generate_miri_batch(&[seed_with_local_aux], 2, 0xB2_0002);
+        batch_cands.extend(aux_cands);
+
+        let repro_start_line = 500u32;
+        let mut staged = (0..repro_start_line - 1)
+            .map(|_| "// pre")
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let mut seen = BTreeMap::new();
+        let mut staged_meta = Vec::new();
+        for cand in &batch_cands {
+            let b_start = staged.lines().count() as u32 + 1;
+            let (text, maps) =
+                stage_candidate_source_for_batch(cand, b_start, repro_start_line, &mut seen);
+            staged.push_str(&text);
+            staged.push_str("\n\n");
+            staged_meta.push((b_start, maps));
+        }
+        let parsed_staged = syn::parse_file(&staged).expect("staged crate must parse cleanly");
+        let helper_defs = parsed_staged
+            .items
+            .iter()
+            .filter(|it| matches!(it, syn::Item::Fn(f) if f.sig.ident == "seed_local_helper"))
+            .count();
+        let struct_defs = parsed_staged
+            .items
+            .iter()
+            .filter(|it| matches!(it, syn::Item::Struct(s) if s.ident == "SeedPair"))
+            .count();
+        assert_eq!(helper_defs, 1, "duplicate helper fn in staged crate");
+        assert_eq!(struct_defs, 1, "duplicate struct in staged crate");
+
+        let (b1_start, b1_maps) = &staged_meta[1];
+        let (b2_start, b2_maps) = &staged_meta[2];
+        assert!(b1_maps.is_empty(), "first aux copy is emitted intact");
+        assert_eq!(b2_maps.len(), 3, "second aux copy blanks struct+const+fn");
+
+        let helper_body_batch_line = b1_start + 6;
+        let translated_pos = translate_pos_to_repro_with_aux(
+            &SourcePos {
+                file: "src/lib.rs".to_string(),
+                line: helper_body_batch_line,
+                col: 5,
+            },
+            *b2_start,
+            repro_start_line,
+            b2_maps,
+        );
+        assert_eq!(translated_pos.line, repro_start_line + 6);
     }
 }

@@ -450,86 +450,374 @@ pub(crate) fn model_marked_names_in_file(file: &File) -> std::collections::BTree
     names
 }
 
-/// Extract model-marked item names from raw Rust `source` when `syn::parse_file`
-/// fails (for example on nightly syntax inside a function body), ignoring line
-/// and nested block comments.
-pub(crate) fn model_marked_names_in_source_text(
-    source: &str,
-) -> std::collections::BTreeSet<String> {
+fn advance_rust_literal_bytes(source: &str, i: usize) -> Option<usize> {
     let bytes = source.as_bytes();
-    let mut clean = String::with_capacity(source.len());
+    let n = bytes.len();
+    if i >= n {
+        return None;
+    }
+    let at_word_start = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+    if at_word_start {
+        let mut r_pos = i;
+        if (bytes[r_pos] == b'b' || bytes[r_pos] == b'c') && r_pos + 1 < n && bytes[r_pos + 1] == b'r' {
+            r_pos += 1;
+        }
+        if bytes[r_pos] == b'r' {
+            let mut q = r_pos + 1;
+            let mut hashes = 0usize;
+            while q < n && bytes[q] == b'#' {
+                hashes += 1;
+                q += 1;
+            }
+            if q < n && bytes[q] == b'"' {
+                let mut k = q + 1;
+                while k < n {
+                    if bytes[k] == b'"'
+                        && k + 1 + hashes <= n
+                        && bytes[k + 1..k + 1 + hashes].iter().all(|&b| b == b'#')
+                    {
+                        return Some(k + 1 + hashes);
+                    }
+                    k += 1;
+                }
+                return Some(n);
+            }
+        }
+    }
+    if bytes[i] == b'"'
+        || ((bytes[i] == b'b' || bytes[i] == b'c')
+            && i + 1 < n
+            && bytes[i + 1] == b'"'
+            && at_word_start)
+    {
+        let mut k = i + if bytes[i] == b'"' { 1 } else { 2 };
+        while k < n {
+            if bytes[k] == b'\\' {
+                if k + 1 < n {
+                    let next_ch = source[k + 1..].chars().next().unwrap();
+                    k += 1 + next_ch.len_utf8();
+                } else {
+                    return Some(n);
+                }
+            } else if bytes[k] == b'"' {
+                return Some(k + 1);
+            } else {
+                let ch = source[k..].chars().next().unwrap();
+                k += ch.len_utf8();
+            }
+        }
+        return Some(n);
+    }
+    if bytes[i] == b'\''
+        || (bytes[i] == b'b' && i + 1 < n && bytes[i + 1] == b'\'' && at_word_start)
+    {
+        let k = i + if bytes[i] == b'\'' { 1 } else { 2 };
+        if k < n {
+            if bytes[k] == b'\\' && k + 1 < n {
+                let esc = bytes[k + 1];
+                if esc == b'x' && k + 4 < n && bytes[k + 4] == b'\'' {
+                    return Some(k + 5);
+                }
+                if esc == b'u' && k + 2 < n && bytes[k + 2] == b'{' {
+                    if let Some(rel_close) = source[k + 3..].find('}') {
+                        let after_brace = k + 3 + rel_close + 1;
+                        if after_brace < n && bytes[after_brace] == b'\'' {
+                            return Some(after_brace + 1);
+                        }
+                    }
+                } else {
+                    let ch = source[k + 1..].chars().next().unwrap();
+                    let close_idx = k + 1 + ch.len_utf8();
+                    if close_idx < n && bytes[close_idx] == b'\'' {
+                        return Some(close_idx + 1);
+                    }
+                }
+            } else if bytes[k] != b'\'' && bytes[k] != b'\n' {
+                let ch = source[k..].chars().next().unwrap();
+                let close_idx = k + ch.len_utf8();
+                if close_idx < n && bytes[close_idx] == b'\'' {
+                    return Some(close_idx + 1);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn push_blanked_preserving_len(out: &mut String, seg: &str) {
+    for b in seg.bytes() {
+        out.push(if b == b'\n' { '\n' } else { ' ' });
+    }
+}
+
+/// Mask Rust line/nested-block comments, `{ ... }` bodies (`brace_depth >= 1`),
+/// top-level `#[...]` / `#![...]` attributes, and (when `!keep_top_level_strings`)
+/// string/char literal contents into ASCII spaces of identical byte length.
+fn mask_rust_top_level_source(source: &str, keep_top_level_strings: bool) -> String {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
     let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+    let mut brace_depth = 0usize;
+    while i < n {
+        if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'/' {
+            let start = i;
             i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
+            while i < n && bytes[i] != b'\n' {
                 i += 1;
             }
+            push_blanked_preserving_len(&mut out, &source[start..i]);
             continue;
         }
-        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+        if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+            let start = i;
             let mut depth = 1usize;
             i += 2;
-            while i < bytes.len() && depth > 0 {
-                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            while i < n && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
                     depth += 1;
                     i += 2;
-                } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                } else if bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'/' {
                     depth -= 1;
                     i += 2;
                 } else {
-                    if bytes[i] == b'\n' {
-                        clean.push('\n');
-                    } else {
-                        clean.push(' ');
-                    }
                     i += 1;
                 }
             }
+            push_blanked_preserving_len(&mut out, &source[start..i]);
+            continue;
+        }
+        if let Some(lit_end) = advance_rust_literal_bytes(source, i) {
+            let seg = &source[i..lit_end];
+            let is_char_lit = bytes[i] == b'\'' || (bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'\''));
+            if brace_depth == 0 && keep_top_level_strings && !is_char_lit {
+                out.push_str(seg);
+            } else {
+                push_blanked_preserving_len(&mut out, seg);
+            }
+            i = lit_end;
+            continue;
+        }
+        if brace_depth == 0 && bytes[i] == b'#' {
+            let mut j = i + 1;
+            while j < n && matches!(bytes[j], b' ' | b'\t') {
+                j += 1;
+            }
+            if j < n && bytes[j] == b'!' {
+                j += 1;
+                while j < n && matches!(bytes[j], b' ' | b'\t') {
+                    j += 1;
+                }
+            }
+            if j < n && bytes[j] == b'[' {
+                let mut bdepth = 1usize;
+                let mut k = j + 1;
+                while k < n && bdepth > 0 {
+                    if bytes[k] == b'/' && k + 1 < n && bytes[k + 1] == b'/' {
+                        k += 2;
+                        while k < n && bytes[k] != b'\n' {
+                            k += 1;
+                        }
+                        continue;
+                    }
+                    if bytes[k] == b'/' && k + 1 < n && bytes[k + 1] == b'*' {
+                        let mut cdepth = 1usize;
+                        k += 2;
+                        while k < n && cdepth > 0 {
+                            if bytes[k] == b'/' && k + 1 < n && bytes[k + 1] == b'*' {
+                                cdepth += 1;
+                                k += 2;
+                            } else if bytes[k] == b'*' && k + 1 < n && bytes[k + 1] == b'/' {
+                                cdepth -= 1;
+                                k += 2;
+                            } else {
+                                k += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(inner_end) = advance_rust_literal_bytes(source, k) {
+                        k = inner_end;
+                        continue;
+                    }
+                    if bytes[k] == b'[' {
+                        bdepth += 1;
+                    } else if bytes[k] == b']' {
+                        bdepth -= 1;
+                    }
+                    k += 1;
+                }
+                push_blanked_preserving_len(&mut out, &source[i..k]);
+                i = k;
+                continue;
+            }
+        }
+        if bytes[i] == b'{' {
+            out.push(if brace_depth == 0 { '{' } else { ' ' });
+            brace_depth += 1;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'}' {
+            brace_depth = brace_depth.saturating_sub(1);
+            out.push(if brace_depth == 0 { '}' } else { ' ' });
+            i += 1;
             continue;
         }
         let ch = source[i..].chars().next().unwrap();
-        clean.push(ch);
+        if brace_depth > 0 {
+            push_blanked_preserving_len(&mut out, &source[i..i + ch.len_utf8()]);
+        } else {
+            out.push(ch);
+        }
         i += ch.len_utf8();
     }
+    out
+}
+
+fn parse_rust_str_literal_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    if let Some(rest) = trimmed.strip_prefix('r') {
+        let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+        let after_hashes = &rest[hashes..];
+        let closing_hashes: String = "#".repeat(hashes);
+        let suffix = format!("\"{closing_hashes}");
+        if let Some(inner_and_close) = after_hashes.strip_prefix('"')
+            && let Some(inner) = inner_and_close.strip_suffix(&suffix)
+        {
+            return Some(inner.to_string());
+        }
+        return None;
+    }
+    if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+        && !inner.contains('"')
+        && !inner.contains('\\')
+    {
+        return Some(inner.to_string());
+    }
+    None
+}
+
+/// Extract model-marked item names from raw Rust `source` when `syn::parse_file`
+/// fails (for example on nightly syntax inside a function body), ignoring
+/// comments, string/char literals, attributes, and nested `{ ... }` bodies.
+pub(crate) fn model_marked_names_in_source_text(
+    source: &str,
+) -> std::collections::BTreeSet<String> {
+    let top_no_str = mask_rust_top_level_source(source, false);
+    let top_with_str = mask_rust_top_level_source(source, true);
+    debug_assert_eq!(top_no_str.len(), top_with_str.len());
 
     let mut names = std::collections::BTreeSet::new();
-    let mut cursor = clean.as_str();
-    while let Some(pos) = cursor.find("__ANNEAL_MODEL_") {
-        let before = &cursor[..pos];
+    let mut offset = 0usize;
+    while let Some(rel_pos) = top_no_str[offset..].find("__ANNEAL_MODEL_") {
+        let pos = offset + rel_pos;
+        let before = &top_no_str[..pos];
         let is_const_decl = before
             .trim_end()
             .rsplit_once(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .map_or(before.trim_end(), |(_, kw)| kw)
             == "const";
-        let after = &cursor[pos + "__ANNEAL_MODEL_".len()..];
-        let ident_len = after
+        let after_idx = pos + "__ANNEAL_MODEL_".len();
+        let after_no_str = &top_no_str[after_idx..];
+        let ident_len = after_no_str
             .bytes()
             .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
             .count();
         if is_const_decl && ident_len > 0 {
-            names.insert(after[..ident_len].to_string());
-            let rest = &after[ident_len..];
-            if let Some(semi) = rest.find(';') {
-                let decl_tail = &rest[..semi];
-                if let Some((_, rhs)) = decl_tail.split_once('=') {
-                    let rhs = rhs.trim().trim_start_matches('(').trim_end_matches(')').trim();
-                    if rhs.starts_with('"')
-                        && rhs.ends_with('"')
-                        && rhs.len() >= 2
-                        && !rhs[1..rhs.len() - 1].contains('"')
-                    {
-                        let target = &rhs[1..rhs.len() - 1];
-                        if !target.is_empty() {
-                            names.insert(target.to_string());
-                        }
-                    }
+            names.insert(after_no_str[..ident_len].to_string());
+            let tail_start = after_idx + ident_len;
+            if let Some(rel_semi) = top_no_str[tail_start..].find(';') {
+                let decl_tail = &top_with_str[tail_start..tail_start + rel_semi];
+                if let Some((_, rhs)) = decl_tail.split_once('=')
+                    && let Some(target) = parse_rust_str_literal_value(rhs)
+                    && !target.is_empty()
+                {
+                    names.insert(target);
                 }
             }
         }
-        cursor = &after[ident_len.max(1)..];
+        offset = after_idx + ident_len.max(1);
     }
     names
+}
+
+/// Discover top-level exported zero-argument `pub ... fn <name>()` items in raw
+/// Rust `source` when `syn::parse_file` fails, ignoring comments, string/char
+/// literals, attributes, nested `{ ... }` bodies, and `pub(...)` items.
+pub(crate) fn discover_top_level_zero_arg_pub_fns_in_source_text(source: &str) -> Vec<String> {
+    let top_no_str = mask_rust_top_level_source(source, false);
+    let mut out = Vec::new();
+    for segment in top_no_str.split([';', '}']) {
+        let mut s = segment.trim_start();
+        let Some(after_pub) = s.strip_prefix("pub") else {
+            continue;
+        };
+        if after_pub
+            .bytes()
+            .next()
+            .is_none_or(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            continue;
+        }
+        s = after_pub.trim_start();
+        // Exclude restricted visibility `pub(crate)` / `pub(super)` / `pub(in ...)`.
+        if s.starts_with('(') {
+            continue;
+        }
+        loop {
+            if let Some(rest) = s.strip_prefix("const")
+                && rest
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| !b.is_ascii_alphanumeric() && b != b'_')
+            {
+                s = rest.trim_start();
+                continue;
+            }
+            if let Some(rest) = s.strip_prefix("unsafe")
+                && rest
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| !b.is_ascii_alphanumeric() && b != b'_')
+            {
+                s = rest.trim_start();
+                continue;
+            }
+            if let Some(rest) = s.strip_prefix("extern")
+                && rest
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| !b.is_ascii_alphanumeric() && b != b'_')
+            {
+                s = rest.trim_start();
+                continue;
+            }
+            break;
+        }
+        let Some(after_fn) = s.strip_prefix("fn") else {
+            continue;
+        };
+        if after_fn
+            .bytes()
+            .next()
+            .is_none_or(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            continue;
+        }
+        let rest = after_fn.trim_start();
+        let Some((ident, after_open)) = rest.split_once('(') else {
+            continue;
+        };
+        let ident = ident.trim();
+        if !ident.is_empty()
+            && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && after_open.trim_start().starts_with(')')
+        {
+            out.push(ident.to_string());
+        }
+    }
+    out
 }
 
 /// Whether `name` is a helper/model function given `model_names` rather than a
@@ -544,6 +832,7 @@ pub(crate) fn is_helper_fn_name_in_set(
 /// Names of the corpus call-chain helpers: every `<name>` for which
 /// `tests/miri-diff/corpus/src/lib.rs` declares an Anneal model marker
 /// `const __ANNEAL_MODEL_<name>: &str` (or `: () = ()`).
+#[cfg(test)]
 fn corpus_model_helper_names() -> &'static std::collections::BTreeSet<String> {
     static NAMES: std::sync::OnceLock<std::collections::BTreeSet<String>> =
         std::sync::OnceLock::new();
@@ -552,13 +841,6 @@ fn corpus_model_helper_names() -> &'static std::collections::BTreeSet<String> {
             .map(|file| model_marked_names_in_file(&file))
             .unwrap_or_default()
     })
-}
-
-/// Whether `name` is a corpus helper rather than a test entry point:
-/// `helper_add_ten`, an `__ANNEAL_MODEL_*` marker, or a model-marked call-chain
-/// helper ([`corpus_model_helper_names`]).
-pub(crate) fn is_corpus_helper_fn_name(name: &str) -> bool {
-    is_helper_fn_name_in_set(name, corpus_model_helper_names())
 }
 
 /// Parse `corpus_source` and extract all zero-argument `pub fn` items other
@@ -4965,18 +5247,62 @@ impl MiriSeedDraw {
     }
 }
 
+/// Canonical namespace-qualified key for a top-level auxiliary item so
+/// `close_miri_seed` and multi-candidate crate staging can recognize preamble
+/// or repeated seed-local items without conflating `const` markers and `fn`s.
+pub(crate) fn aux_item_dedup_key(item: &Item) -> Option<String> {
+    match item {
+        Item::Fn(f) => Some(format!("fn:{}", f.sig.ident)),
+        Item::Const(c) => Some(format!("const:{}", c.ident)),
+        Item::Static(s) => Some(format!("static:{}", s.ident)),
+        Item::Struct(s) => Some(format!("struct:{}", s.ident)),
+        Item::Enum(e) => Some(format!("enum:{}", e.ident)),
+        Item::Union(u) => Some(format!("union:{}", u.ident)),
+        Item::Type(t) => Some(format!("type:{}", t.ident)),
+        Item::Impl(im) => {
+            let trait_part = im
+                .trait_
+                .as_ref()
+                .map(|(_, p, _)| p.to_token_stream().to_string())
+                .unwrap_or_default();
+            Some(format!(
+                "impl:{trait_part}:{}",
+                im.self_ty.to_token_stream()
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn preamble_defined_item_keys() -> &'static std::collections::BTreeSet<String> {
+    static KEYS: std::sync::OnceLock<std::collections::BTreeSet<String>> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        syn::parse_file(MIRI_CORPUS_MODULE_PREAMBLE)
+            .map(|file| {
+                file.items
+                    .iter()
+                    .filter_map(aux_item_dedup_key)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
 /// Close a parsed seed in place: locate its target entry function (the last
 /// `Item::Fn` not marked as a file-local `__ANNEAL_MODEL_*` helper or
-/// `helper_add_ten`), keep any non-preamble helper functions (normalizing method
-/// calls in non-model helpers) and their file-local `__ANNEAL_MODEL_*` markers
-/// ahead of the target function, and rename + close the target function.
-/// Returns `(seed_name, fn_name)`, or `None` when no target function exists.
+/// `helper_add_ten`), keep any non-preamble auxiliary items (`struct`, `enum`,
+/// `union`, `type`, `static`, `const`, `impl`, and helper `fn`s — normalizing
+/// method calls in non-model helper `fn`s) ahead of the target function, and
+/// rename + close the target function. Returns `(seed_name, fn_name)`, or
+/// `None` when no target function exists.
 fn close_miri_seed(
     parsed: &mut File,
     cand_rng: &mut DetRng,
     fn_name_for: impl FnOnce(&str) -> String,
 ) -> Option<(String, String)> {
     let local_models = model_marked_names_in_file(parsed);
+    let preamble_keys = preamble_defined_item_keys();
     let target_idx = parsed.items.iter().rposition(|item| match item {
         Item::Fn(f) => !is_helper_fn_name_in_set(&f.sig.ident.to_string(), &local_models),
         _ => false,
@@ -4995,7 +5321,7 @@ fn close_miri_seed(
         match item {
             Item::Fn(mut helper_fn) => {
                 let name = helper_fn.sig.ident.to_string();
-                if is_corpus_helper_fn_name(&name) {
+                if name == "helper_add_ten" || preamble_keys.contains(&format!("fn:{name}")) {
                     continue;
                 }
                 if !is_helper_fn_name_in_set(&name, &local_models) {
@@ -5003,14 +5329,13 @@ fn close_miri_seed(
                 }
                 kept_items.push(Item::Fn(helper_fn));
             }
-            Item::Const(c) => {
-                if let Some(model_ident) = c.ident.to_string().strip_prefix("__ANNEAL_MODEL_")
-                    && !is_corpus_helper_fn_name(model_ident)
+            other => {
+                if let Some(key) = aux_item_dedup_key(&other)
+                    && !preamble_keys.contains(&key)
                 {
-                    kept_items.push(Item::Const(c));
+                    kept_items.push(other);
                 }
             }
-            _ => {}
         }
     }
     let mut func = target_fn?;
@@ -7753,7 +8078,74 @@ pub fn trailing_local_model_fn() -> u32 {
                 cand.fn_name,
                 cand.source
             );
+            let (base, steps) =
+                reconstruct_miri_mutation_steps(cand, &[trailing_model_seed])
+                    .expect("reconstruct trailing-model-helper candidate");
+            assert!(miri_candidate_replay_is_faithful(cand, &base, &steps));
         }
+
+        // Seed-local `struct`, `const`, and aliased `__ANNEAL_MODEL_helper_add_ten`
+        // marker (whose marker suffix is in `is_corpus_helper_fn_name` even though
+        // `MIRI_CORPUS_MODULE_PREAMBLE` defines no such `const`) must be preserved
+        // by `close_miri_seed` and keep `aliased_local_callee` unmutated.
+        let aux_and_aliased_seed = "\
+#[repr(C)]
+pub struct SeedLocalPair {
+    pub lo: u32,
+    pub hi: u32,
+}
+pub const SEED_LOCAL_BIAS: u32 = 5u32;
+pub fn seed_with_local_aux(x: u32) -> u32 {
+    let p = SeedLocalPair { lo: x, hi: SEED_LOCAL_BIAS };
+    p.lo ^ p.hi ^ aliased_local_callee()
+}
+pub const __ANNEAL_MODEL_helper_add_ten: &str = \"aliased_local_callee\";
+pub fn aliased_local_callee() -> u32 {
+    60u32 + 3u32
+}
+";
+        let aux_batch = generate_miri_batch(&[aux_and_aliased_seed], 4, 0xC16_B201);
+        assert_eq!(aux_batch.len(), 4);
+        for cand in &aux_batch {
+            assert_eq!(cand.seed_name, "seed_with_local_aux");
+            assert!(
+                cand.fn_source
+                    .contains("pub fn aliased_local_callee() -> u32 {\n    60u32 + 3u32\n}"),
+                "aliased model helper must stay unmutated:\n{}",
+                cand.fn_source
+            );
+            assert!(
+                crate::miri_eval::compile_rust_snippet("aux_and_aliased_cand", &cand.source),
+                "seed-local aux candidate `{}` failed rustc typecheck:\n{}",
+                cand.fn_name,
+                cand.source
+            );
+            let (base, steps) =
+                reconstruct_miri_mutation_steps(cand, &[aux_and_aliased_seed])
+                    .expect("reconstruct seed-local aux candidate");
+            assert!(miri_candidate_replay_is_faithful(cand, &base, &steps));
+        }
+
+        // Source-text fallback lexers ignore `"/*"` and `"const __ANNEAL_MODEL_..."`
+        // inside string literals, honor raw-string marker targets, and skip `pub fn`
+        // inside comments/strings while recognizing attributes, `const fn`, and `extern "C"`.
+        let tricky_fallback_src = "\
+#![no_std]
+pub const STR_OPEN_COMMENT: &str = \"/* not a real comment\";
+pub const STR_FAKE_MARKER: &str = \"pub const __ANNEAL_MODEL_cand_keep: () = (); pub fn ghost_str() {}\";
+/* nested /* block comment
+pub fn ghost_comment() -> u32 { 0 }
+*/ end */
+pub const __ANNEAL_MODEL_raw_alias: &str = r#\"raw_marked_helper\"#;
+#[inline(never)] pub const fn raw_marked_helper() -> u32 { 7u32 }
+pub(crate) fn restricted_not_exported() -> u32 { 1u32 }
+/* doc */ #[inline(never)] pub extern \"C\" fn cand_keep() -> u32 { @@@ }
+";
+        let marked = model_marked_names_in_source_text(tricky_fallback_src);
+        assert!(marked.contains("raw_alias") && marked.contains("raw_marked_helper"));
+        assert!(!marked.contains("cand_keep"));
+        let discovered = discover_top_level_zero_arg_pub_fns_in_source_text(tricky_fallback_src);
+        assert_eq!(discovered, vec!["raw_marked_helper", "cand_keep"]);
 
         // 2. `close_miri_seed` / `seeded_type_expr` must synthesize valid `FreezeAndCell`,
         //    `NonCopyU32`, `UnwindCleanupGuard`, and `UnsafeCell<u32>` arguments and
