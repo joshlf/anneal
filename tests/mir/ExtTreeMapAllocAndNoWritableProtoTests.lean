@@ -509,8 +509,9 @@ def lwShadow : LinearAllocWorld :=
    semantics, every keyed world has a linear partner, and the relation is the graph of `ofLinear`.
 3. The race verdict is computed from the race entry *before* cleanup: a racing actor (thread `2`,
    view `5 < 7`) faults with `DataRace` and the entry is dropped only afterwards; cleaning the entry
-   *first* (buggy order) silently succeeds; a synchronized actor (view `9`) succeeds; a race-free
-   actor then reaches the Tree Borrows protector verdict; linear and keyed machines agree. -/
+   *first* (buggy order) is reported as a lost clock (`MissingVectorClockExtra`, `[adv B2]`) rather
+   than the race; a synchronized actor (view `9`) succeeds; a race-free actor then reaches the Tree
+   Borrows protector verdict; linear and keyed machines agree. -/
 theorem canary_part1_useAfterFree_totality_and_race_order :
     deallocRichKeyedWorld.deallocate (.provenanced testIdMax 0) (some (8, 8)) .heap .ok =
       (deallocRichKeyedWorld, none, .error (.useAfterFree testIdMax)) ∧
@@ -529,7 +530,7 @@ theorem canary_part1_useAfterFree_totality_and_race_order :
      r.1.findDead? testId1 = none ∧
      ((raceWorld.removeRace testId1).deallocateMachine (.provenanced testId1 0)
        (some (entryHeap8.sizeBytes, entryHeap8.alignBytes)) entryHeap8.kind ⟨2, 5⟩ .ok).2.2 =
-       .ok ()) ∧
+       .error (.hookFailure "MissingVectorClockExtra")) ∧
     (raceWorld.deallocateMachine (.provenanced testId1 0) (some (8, 8)) .heap ⟨2, 9⟩ .ok).2.2 =
       .ok () ∧
     (raceWorld.deallocateMachine (.provenanced testId1 0) (some (8, 8)) .heap ⟨1, 0⟩
@@ -599,7 +600,7 @@ theorem canary_part1_useAfterFree_totality_and_race_order :
     allocWorldRel_setRace (allocWorldRel_insertLive allocWorldRel_empty testId1 entryHeap8)
       testId1 ⟨1, 7, 3, false, none⟩
   have hmachine := allocWorldRel_deallocateMachine hrelRace (.provenanced testId1 0)
-    (some (8, 8)) .heap ⟨2, 5⟩ .ok
+    (some (8, 8)) .heap ⟨2, 5⟩ .ok (.configured true)
   exact ⟨
     huafMax.1,
     huaf2.2,
@@ -666,9 +667,72 @@ theorem canary_part1_sameWriter_foreignRead_and_zst_race_fixes :
       KeyedAllocWorld.setRace KeyedAllocWorld.empty
     dsimp only
     rw [ExtTreeMap0.get?_empty]
+  have hClkZ : zstRaceWorld.findRace? testId1 = some ⟨1, 99, 88, false, some 2⟩ := by
+    unfold zstRaceWorld KeyedAllocWorld.findRace? KeyedAllocWorld.insertLive
+      KeyedAllocWorld.setRace KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
   have hzst := keyedDeallocateMachine_zst_skips_race_check
-    zstRaceWorld testId1 zstRaceEntry ⟨3, 0⟩ hLiveZ rfl rfl hNoDeadZ
+    zstRaceWorld testId1 zstRaceEntry ⟨1, 99, 88, false, some 2⟩ ⟨3, 0⟩ hLiveZ rfl rfl hNoDeadZ hClkZ
   exact ⟨hsw, by decide +kernel, hzst⟩
+
+/-- **`[adv B2]` Closed canary — race-detector configuration follows `memoryRaceAccess`**:
+1. With the (default) configured detector, a live allocation that *lost* its race clock is an
+   invalid program (`MissingVectorClockExtra`), even when zero-sized — B1/A1 silently treated a
+   missing clock as race-free.
+2. With no detector configured (`dataRace = none`), the same deallocation is plain `deallocate`.
+3. With a configured but not-yet-detecting detector (single-threaded), a clock that would race
+   (`raceWorld` vs. actor view `5 < 7`) is not inspected and the deallocation succeeds. -/
+theorem canary_part1_raceDetectorMode_missingClock_and_singleThreaded :
+    (let r := (raceWorld.removeRace testId1).deallocateMachine (.provenanced testId1 0)
+       (some (entryHeap8.sizeBytes, entryHeap8.alignBytes)) entryHeap8.kind ⟨2, 5⟩ .ok
+       (.configured true)
+     r.2.1 = some (testId1, entryHeap8) ∧
+     r.2.2 = .error (.hookFailure "MissingVectorClockExtra") ∧
+     r.1.findLive? testId1 = none) ∧
+    (let rz := (zstRaceWorld.removeRace testId1).deallocateMachine (.provenanced testId1 0)
+       (some (zstRaceEntry.sizeBytes, zstRaceEntry.alignBytes)) zstRaceEntry.kind ⟨3, 0⟩ .ok
+       (.configured false)
+     rz.2.1 = some (testId1, zstRaceEntry) ∧
+     rz.2.2 = .error (.hookFailure "MissingVectorClockExtra") ∧
+     rz.1.findLive? testId1 = none) ∧
+    (raceWorld.removeRace testId1).deallocateMachine (.provenanced testId1 0) (some (8, 8)) .heap
+        ⟨2, 5⟩ .ok .unconfigured =
+      (raceWorld.removeRace testId1).deallocate (.provenanced testId1 0) (some (8, 8)) .heap .ok ∧
+    raceWorld.deallocateMachine (.provenanced testId1 0) (some (8, 8)) .heap ⟨2, 5⟩ .ok
+        (.configured false) =
+      raceWorld.deallocate (.provenanced testId1 0) (some (8, 8)) .heap .ok ∧
+    (raceWorld.deallocate (.provenanced testId1 0) (some (8, 8)) .heap .ok).2.2 = .ok () := by
+  have hLiveR : (raceWorld.removeRace testId1).findLive? testId1 = some entryHeap8 := by
+    unfold raceWorld KeyedAllocWorld.findLive? KeyedAllocWorld.removeRace
+      KeyedAllocWorld.insertLive KeyedAllocWorld.setRace KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
+  have hNoRaceR : (raceWorld.removeRace testId1).findRace? testId1 = none := by
+    unfold KeyedAllocWorld.findRace? KeyedAllocWorld.removeRace
+    exact ExtTreeMap0.get?_erase_self _ _
+  have hLiveZR : (zstRaceWorld.removeRace testId1).findLive? testId1 = some zstRaceEntry := by
+    unfold zstRaceWorld KeyedAllocWorld.findLive? KeyedAllocWorld.removeRace
+      KeyedAllocWorld.insertLive KeyedAllocWorld.setRace KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
+  have hNoRaceZR : (zstRaceWorld.removeRace testId1).findRace? testId1 = none := by
+    unfold KeyedAllocWorld.findRace? KeyedAllocWorld.removeRace
+    exact ExtTreeMap0.get?_erase_self _ _
+  have hClk : raceWorld.findRace? testId1 = some ⟨1, 7, 3, false, none⟩ := by
+    unfold raceWorld KeyedAllocWorld.findRace? KeyedAllocWorld.insertLive KeyedAllocWorld.setRace
+      KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
+  have hmiss := keyedDeallocateMachine_missingClock_invalid (raceWorld.removeRace testId1)
+    testId1 entryHeap8 ⟨2, 5⟩ .ok true hLiveR rfl hNoRaceR
+  have hmissZ := keyedDeallocateMachine_missingClock_invalid (zstRaceWorld.removeRace testId1)
+    testId1 zstRaceEntry ⟨3, 0⟩ .ok false hLiveZR rfl hNoRaceZR
+  have hunconf := keyedDeallocateMachine_unconfigured_eq_deallocate (raceWorld.removeRace testId1)
+    (.provenanced testId1 0) (some (8, 8)) .heap ⟨2, 5⟩ .ok
+  have hsingle := keyedDeallocateMachine_notDetecting_eq_deallocate raceWorld testId1 0
+    ⟨1, 7, 3, false, none⟩ (some (8, 8)) .heap ⟨2, 5⟩ .ok hClk
+  exact ⟨hmiss, hmissZ, hunconf, hsingle, by decide +kernel⟩
 
 /-! ## Section 2: Part 2A & 2B Closed Canaries (`charon#1619/#1620` + `minirust#295`) -/
 
@@ -1087,6 +1151,30 @@ theorem canary_part2A_upstream_reborrow_equivalence_and_disabled_ancestor :
     10 4 [.uninit, .uninit, .uninit, .uninit] unpinFreezeFacts (by decide) (by decide) rfl
   exact ⟨hnode, ⟨hnoWr, htwoBr⟩, hdiv⟩
 
+/-- **`[adv B2]` Closed canary — two-pass vs. upstream reborrow diverge without any `.disabled`
+node**: a `.frozen` parent listed before a protected `.unique` foreign node makes the two-pass model
+report the read pass's `.protectedForeignConflict`, while upstream's single parent write stops at the
+frozen parent with `.ancestorWriteForbidden` (A1's docstring called the disabled-grandparent witness
+"the sole case"). -/
+theorem canary_part2A_frozenParent_protectedChild_divergence :
+    (let w : FnEntryBorrowWorld := {
+       allocId := 10
+       bytes := [.uninit, .uninit, .uninit, .uninit]
+       nodes := [
+         ⟨1, 10, 0, 4, .frozen, none, none⟩,
+         ⟨5, 10, 0, 4, .unique, some 7, some 1⟩
+       ]
+       activeProtectors := ProtectorSet.empty.insert 7
+       nextTag := 6
+       nextProtector := 8
+     }
+     execFnEntryMutRetag w 1 0 4 unpinFreezeFacts true .writableChildWrite false =
+       .error .protectedForeignConflict ∧
+     execFnEntryMutRetagUpstream w 1 0 4 unpinFreezeFacts true .writableChildWrite =
+       .error .ancestorWriteForbidden) :=
+  execFnEntryMutRetag_frozenParent_protectedChild_diverges_from_upstream 10 4
+    [.uninit, .uninit, .uninit, .uninit] unpinFreezeFacts (by decide) (by decide) rfl
+
 /-- **`[adv B1]` Closed canary — `charon#1620` separation under Miri's allocation mutability**:
 a mixed `(Freeze, UnsafeCell)` static is interned *mutable*, so the read-only check does not save
 the erased lowering: writing the `Freeze` `flag` byte through pre-`#1620` erased
@@ -1261,7 +1349,7 @@ def debugPrincipal : PrincipalTraitRef :=
 5. `upcastVTableToAutoTraits` succeeding on `dyn Debug + Send + Sync -> dyn Send` while rejecting
    `dyn Send -> dyn Sync` with `.invalidVTableTrait`! -/
 theorem canary_part3B_principalLess_vtables_and_upcast :
-    (AutoTrait.send = AutoTrait.send) ∧
+    ((canonicalizeAutoTraits [.sync, .send]).headD .unpin = AutoTrait.send) ∧
     (AutoTrait.sync ∈ canonicalizeAutoTraits [.sync, .send, .sync]) ∧
     AutoTraitSet.ofList [.send, .sync] = AutoTraitSet.ofList [.sync, .send, .send] ∧
     mkCanonicalVTableKey .u64 none [.send, .sync] =
@@ -1294,7 +1382,10 @@ theorem canary_part3B_principalLess_vtables_and_upcast :
             | .error _ => false)
          | .error _ => false) = true)
      | .error _ => False) := by
-  have hrank : AutoTrait.send = AutoTrait.send := AutoTrait.rank_injective rfl
+  -- `[adv B2]`: A0 "exercised" `rank_injective` via the tautology `send = send`; here it identifies
+  -- a *computed* canonical head with `send` from equal ranks.
+  have hrank : (canonicalizeAutoTraits [.sync, .send]).headD .unpin = AutoTrait.send :=
+    AutoTrait.rank_injective (by decide)
   have hmemCanon : AutoTrait.sync ∈ canonicalizeAutoTraits [.sync, .send, .sync] :=
     (mem_canonicalizeAutoTraits_iff [.sync, .send, .sync] .sync).mpr (by decide)
   have hpermMem : ∀ x : AutoTrait, x ∈ [.send, .sync] ↔ x ∈ [.sync, .send, .send] := by
@@ -1402,8 +1493,8 @@ def canonicalDropFnOf : ProtoTy → DefPath
    `MiriAllocId`s (`desc₁.allocId ≠ desc₂.allocId`) that both pass `validateVTableHalf` with
    identical `(concreteTy, sizeBytes, alignBytes)`! -/
 theorem canary_part3B_keyWF_general_upcast_and_salted_vtables :
-    (SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.send]) 100 =
-      SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.send]) 100) ∧
+    (SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.send, .sync]) 100 =
+      SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.sync, .send, .send]) 100) ∧
     (∃ sreg₂ w₂ desc₁ desc₂,
       (do
         let (sreg₁, w₁, d₁) ←
@@ -1438,10 +1529,12 @@ theorem canary_part3B_keyWF_general_upcast_and_salted_vtables :
            .error .invalidVTableTrait
        | .error _ => False
      | .error _ => False) := by
+  -- `[adv B2]`: A1 used the tautology `k = k` here; injectivity now identifies two *syntactically
+  -- different* salted keys (permuted/duplicated auto traits) from their equal encodings.
   have hsaltedInj :
-      SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.send]) 100 =
-        SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.send]) 100 :=
-    encodeSaltedVTableKeyCode_injective rfl
+      SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.send, .sync]) 100 =
+        SaltedVTableKey.mk (mkCanonicalVTableKey .u64 none [.sync, .send, .send]) 100 :=
+    encodeSaltedVTableKeyCode_injective (by decide +kernel)
   have hsalted := saltedVTable_distinct_salts_distinct_allocIds_both_valid
     maxRepresentableSize64 .u64 ⟨8, 8, true, true⟩ "drop_u64" none [.send] 100 200 0x1000 0x2000
     rfl rfl (by decide)
@@ -1488,6 +1581,55 @@ theorem canary_part3B_keyWF_general_upcast_and_salted_vtables :
   dsimp only
   exact ⟨hupPres.1, hupPres.2.1, hupPres.2.2.1, hupPres.2.2.2.1,
     hupPres.2.2.2.2.1, hupPres.2.2.2.2.2.1, hupPres.2.2.2.2.2.2, hupRej⟩
+
+/-- `[adv B2]` descriptor for `u64 as dyn Debug + Send + Sync` interned with canonical drop glue. -/
+def b2DescDebug : VTableDescriptor :=
+  ⟨testId1, .u64, ⟨some debugPrincipal, AutoTraitSet.ofList [.send, .sync]⟩,
+    canonicalDropFnOf .u64, 8, 8,
+    [.dropInPlace (canonicalDropFnOf .u64), .size 8, .align 8, .method "u64::fmt"]⟩
+
+def b2Reg1 : VTableRegistry := {
+  byKey := (∅ : ExtTreeMap0 VTableKey VTableDescriptor).insert
+    (mkCanonicalVTableKey .u64 (some debugPrincipal) [.send, .sync]) b2DescDebug
+  byAlloc := (∅ : ExtTreeMap0 MiriAllocId VTableDescriptor).insert testId1 b2DescDebug
+}
+
+def b2W1 : KeyedAllocWorld :=
+  (KeyedAllocWorld.empty.reserveAllocId).1.registerGlobal ⟨testId1, .vtable, 0, 8, .not⟩
+
+/-- **`[adv B2]` Closed canary — `byAlloc` coherence & validation lookup soundness**: interning
+`u64 as dyn Debug + Send + Sync` into the empty registry preserves `AllocWF`
+(`VTableRegistry.allocWF_empty`, `VTableRegistry.allocWF_intern`; A1's `KeyWF` constrained only
+`byKey`, which `validateVTableHalf` never reads), and the descriptor `validateVTableHalf` accepts as a
+`dyn Debug + Send` vtable provably carries `canonicalDropFnOf .u64` and the `u64` layout
+(`validateVTableHalf_sound_of_allocWF`). -/
+theorem canary_part3B_allocWF_validation_lookup_soundness :
+    ({} : VTableRegistry).intern KeyedAllocWorld.empty maxRepresentableSize64 .u64
+        (canonicalDropFnOf .u64) (some debugPrincipal) [.send, .sync] =
+      .ok (b2Reg1, b2W1, b2DescDebug) ∧
+    b2Reg1.AllocWF maxRepresentableSize64 canonicalDropFnOf ∧
+    validateVTableHalf b2W1 b2Reg1 (.provenanced 0x1000 testId1 0)
+        ⟨some debugPrincipal, AutoTraitSet.ofList [.send]⟩ = .ok b2DescDebug ∧
+    b2DescDebug.dropInPlaceFn = canonicalDropFnOf b2DescDebug.concreteTy ∧
+    (∃ lay : ComputedTyLayout,
+      computeTyLayout maxRepresentableSize64 b2DescDebug.concreteTy = .ok lay ∧
+      lay.isSized = true ∧
+      b2DescDebug.sizeBytes = UInt64.ofNat lay.sizeBytes ∧
+      b2DescDebug.alignBytes = UInt64.ofNat lay.alignBytes) := by
+  have hintern1 :
+      ({} : VTableRegistry).intern KeyedAllocWorld.empty maxRepresentableSize64 .u64
+        (canonicalDropFnOf .u64) (some debugPrincipal) [.send, .sync] =
+      .ok (b2Reg1, b2W1, b2DescDebug) := rfl
+  have hkwf0 := VTableRegistry.keyWF_empty maxRepresentableSize64 canonicalDropFnOf
+  have hawf0 := VTableRegistry.allocWF_empty maxRepresentableSize64 canonicalDropFnOf
+  have hawf1 := VTableRegistry.allocWF_intern maxRepresentableSize64 canonicalDropFnOf
+    {} b2Reg1 KeyedAllocWorld.empty b2W1 .u64 (some debugPrincipal) [.send, .sync] b2DescDebug
+    hkwf0 hawf0 hintern1
+  have hv : validateVTableHalf b2W1 b2Reg1 (.provenanced 0x1000 testId1 0)
+      ⟨some debugPrincipal, AutoTraitSet.ofList [.send]⟩ = .ok b2DescDebug := by decide +kernel
+  have hsound := validateVTableHalf_sound_of_allocWF maxRepresentableSize64 canonicalDropFnOf
+    b2W1 b2Reg1 _ _ b2DescDebug hawf1 hv
+  exact ⟨hintern1, hawf1, hv, hsound.1, hsound.2⟩
 
 def wideDynWorldAndReg : KeyedAllocWorld × VTableRegistry × VTableDescriptor :=
   let descU64 : VTableDescriptor :=
@@ -1959,6 +2101,28 @@ run_cmd do
     | .proj _ _ e' => exprHasUnusedPlaceholderTo targetSet e'
     | _ => false
 
+  -- `[adv B2]`: tautological equations / iffs (syntactically identical sides) anywhere in a closed
+  -- witness *statement* "exercise" a theorem without content — A0's `AutoTrait.send = AutoTrait.send`
+  -- (via `rank_injective rfl`), A0's `kw0 = kw0` (caught in B1), and A1's
+  -- `SaltedVTableKey.mk k 100 = SaltedVTableKey.mk k 100` (via `encodeSaltedVTableKeyCode_injective rfl`).
+  let rec exprHasTautology (e : Expr) : Bool :=
+    match e with
+    | .app f a =>
+      let args := e.getAppArgs
+      let here :=
+        match e.getAppFn with
+        | .const nm _ =>
+          (nm == ``Eq && args.size == 3 && args[1]! == args[2]!) ||
+            (nm == ``Iff && args.size == 2 && args[0]! == args[1]!)
+        | _ => false
+      here || exprHasTautology f || exprHasTautology a
+    | .lam _ ty b _ => exprHasTautology ty || exprHasTautology b
+    | .forallE _ ty b _ => exprHasTautology ty || exprHasTautology b
+    | .letE _ ty v b _ => exprHasTautology ty || exprHasTautology v || exprHasTautology b
+    | .mdata _ e' => exprHasTautology e'
+    | .proj _ _ e' => exprHasTautology e'
+    | _ => false
+
   let isCompilerGeneratedAuxThm (nm : Name) : Bool :=
     if nm.isInternalDetail then true
     else
@@ -1995,6 +2159,7 @@ run_cmd do
   let mut closedTestWitnesses : Array Name := #[]
   let mut conditionalTests : Array Name := #[]
   let mut placeholderUses : Array Name := #[]
+  let mut tautologicalWitnesses : Array Name := #[]
   for (nm, ci) in env.constants.map₂.toList do
     testAllDecls := testAllDecls.push nm
     if let some val := ci.value? (allowOpaque := true) then
@@ -2006,6 +2171,8 @@ run_cmd do
           conditionalTests := conditionalTests.push nm
         else
           closedTestWitnesses := closedTestWitnesses.push nm
+          if exprHasTautology tv.type then
+            tautologicalWitnesses := tautologicalWitnesses.push nm
 
   let allAuditRoots := protoAllDecls ++ testAllDecls
   let (auditVisited, unsafeDecls, choiceAx, sorryAxFound, reduceAx) :=
@@ -2034,6 +2201,8 @@ run_cmd do
     throwError "axiom audit FAILED: undischarged conditional test theorems found: {conditionalTests}"
   if !placeholderUses.isEmpty then
     throwError "axiom audit FAILED: `have _ := @thm` placeholder uses found: {placeholderUses}"
+  if !tautologicalWitnesses.isEmpty then
+    throwError "axiom audit FAILED: closed witnesses with tautological `a = a` / `a ↔ a` conjuncts: {tautologicalWitnesses}"
 
   -- Verify 100% public theorem reachability from closed test witnesses alone
   let (closedReachable, _, _, _, _) := collectTransitiveClosure env closedTestWitnesses
@@ -2147,6 +2316,23 @@ run_cmd do
     if !caught8 then
       throwError "audit self-test 8 FAILED: missed `private theorem` term-mode `have` placeholder!"
 
-  logInfo s!"axiom audit passed: {allAuditRoots.size} declarations ({protoPublicThms.size} prototype public theorems, {closedTestWitnesses.size} closed test witnesses, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 axioms outside propext/Quot.sound, 0 placeholder uses, 0 undischarged conditional test theorems, 100% theorem reachability from closed test witnesses; 9/9 rolled-back self-tests passed)"
+  -- Self-test 10 (`[adv B2]`): a rolled-back closed witness with a tautological `a = a` conjunct must
+  -- be flagged by the tautology detector, while a genuine canary statement must not be.
+  withoutModifyingEnv do
+    let Except.ok stx9 := Parser.runParserCategory (← getEnv) `command
+      "theorem _probeTautology : (2 : Nat) = 2 ∧ (1 : Nat) < 2 := ⟨rfl, by decide⟩" "<probe10>"
+      | throwError "self-test 10 parse failed"
+    elabCommand stx9
+    let some (.thmInfo tv9) := (← getEnv).find? `Anneal.ExtTreeMapAllocAndNoWritableProtoTests._probeTautology
+      | throwError "self-test 10 lookup failed"
+    if !exprHasTautology tv9.type then
+      throwError "audit self-test 10 FAILED: missed a tautological `a = a` conjunct!"
+  let some (.thmInfo tvClean) :=
+      env.find? `Anneal.ExtTreeMapAllocAndNoWritableProtoTests.canary_part3B_allocWF_validation_lookup_soundness
+    | throwError "self-test 10 clean lookup failed"
+  if exprHasTautology tvClean.type then
+    throwError "audit self-test 10 FAILED: false tautology positive on a genuine canary!"
+
+  logInfo s!"axiom audit passed: {allAuditRoots.size} declarations ({protoPublicThms.size} prototype public theorems, {closedTestWitnesses.size} closed test witnesses, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 axioms outside propext/Quot.sound, 0 placeholder uses, 0 tautological conjuncts, 0 undischarged conditional test theorems, 100% theorem reachability from closed test witnesses; 10/10 rolled-back self-tests passed)"
 
 end Anneal.ExtTreeMapAllocAndNoWritableProtoTests

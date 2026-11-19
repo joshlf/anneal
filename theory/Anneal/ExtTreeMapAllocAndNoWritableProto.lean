@@ -1335,6 +1335,9 @@ inductive DeallocHookSpec where
   | ok
   | raceDataRaceFault (writerThread : UInt32) (timestamp : UInt64)
   | protectedBorrowFault (tag : Nat)
+  /-- `[adv B2]`: `memoryRaceAccess` found no `raceAllocations` entry although the detector is
+  configured — upstream `.invalidProgram "allocation missing vector-clock extra"`. -/
+  | missingRaceClock
   deriving DecidableEq, Repr
 
 /-- Deallocating thread's view (`[adv B1]`), projected onto the scalar per-allocation clock of
@@ -1343,6 +1346,16 @@ inductive DeallocHookSpec where
 structure DeallocActor where
   thread : UInt32
   observedTimestamp : UInt64
+  deriving DecidableEq, Repr
+
+/-- Data-race detector configuration consulted by `MachineHooks.memoryRaceAccess`
+(`MachineHooks.lean:231–237`, `[adv B2]`): `unconfigured` ≙ `machine.dataRace = none`
+(`-Zmiri-disable-data-race-detector`: no check at all, no clocks required); `configured detecting`
+≙ `machine.dataRace = some global` with `global.raceDetecting = detecting` (false while the program
+is single-threaded). Miri's default is `configured`. -/
+inductive RaceDetectorMode where
+  | unconfigured
+  | configured (raceDetecting : Bool)
   deriving DecidableEq, Repr
 
 /-- Scalar projection of `MachineHooks.memoryRaceAccess … (some .Deallocate)` in
@@ -1365,25 +1378,33 @@ def raceDeallocVerdict (actor : DeallocActor) (clk : RaceClockEntry) : DeallocHo
   else
     .ok
 
-/-- Machine deallocation hook in exact `AllocationMachine.before` order (`[adv B1]`, ZST-fixed in
-`[adv A1]`):
-1. In `DataRace.runRangeLoop` (`DataRace.lean:551`), a zero-sized allocation (`sizeBytes == 0`) runs
-   `0` byte iterations and returns `.ok` without consulting cell clocks (`[adv B1]` omitted the
-   `sizeBytes == 0` guard and falsely reported `DataRace` on ZST deallocations).
-2. For `sizeBytes > 0`, the data-race access is checked against the per-allocation race entry *as it
-   exists when the hook runs* before `raceAllocations` cleanup, and only a race-free deallocation
-   proceeds to the Tree Borrows protector verdict `tb`. -/
+/-- Machine deallocation hook in exact `AllocationMachine.before` / `MachineHooks.memoryRaceAccess`
+order (`[adv B1]`, ZST-fixed in `[adv A1]`, detector-mode-fixed in `[adv B2]`):
+1. `unconfigured` detector (`machine.dataRace = none`): no race check at all → `tb`.
+2. Configured detector: the per-allocation entry is looked up *first*; a missing entry is
+   `.missingRaceClock` (upstream `invalidProgram "allocation missing vector-clock extra"`) — even for
+   a zero-sized allocation. `[adv B2]`: B1/A1 treated a missing entry as race-free (`tb`),
+   conflating "detector disabled" with "clock lost".
+3. `raceDetecting = false` (single-threaded) → `tb` without consulting clocks.
+4. Otherwise the scalar happens-before verdict runs on the *still-present* entry (before
+   `raceAllocations` cleanup), except that a zero-sized allocation (`sizeBytes == 0`) checks `0`
+   bytes (`DataRace.runRangeLoop`), and only a race-free deallocation proceeds to the Tree Borrows
+   protector verdict `tb`. -/
 def machineDeallocHook (allocSizeBytes : Option UInt64) (raceEntry : Option RaceClockEntry)
-    (actor : DeallocActor) (tb : DeallocHookSpec) : DeallocHookSpec :=
-  if allocSizeBytes == some 0 then
-    tb
-  else
+    (actor : DeallocActor) (tb : DeallocHookSpec)
+    (mode : RaceDetectorMode := .configured true) : DeallocHookSpec :=
+  match mode with
+  | .unconfigured => tb
+  | .configured detecting =>
     match raceEntry with
-    | none => tb
+    | none => .missingRaceClock
     | some clk =>
-      match raceDeallocVerdict actor clk with
-      | .ok => tb
-      | fault => fault
+      if !detecting || allocSizeBytes == some 0 then
+        tb
+      else
+        match raceDeallocVerdict actor clk with
+        | .ok => tb
+        | fault => fault
 
 /-- Lifecycle errors for allocation and deallocation (`Miri.Memory.MemoryLifecycleError`). -/
 inductive AllocLifecycleErr where
@@ -1716,6 +1737,8 @@ def deallocate (w : LinearAllocWorld) (ptr : ResolvedDeallocPtr)
               (afterFailCleanup, detached, .error (.hookFailure "DataRace"))
             | .protectedBorrowFault _ =>
               (afterFailCleanup, detached, .error (.hookFailure "TreeBorrowsProtectedDealloc"))
+            | .missingRaceClock =>
+              (afterFailCleanup, detached, .error (.hookFailure "MissingVectorClockExtra"))
             | .ok =>
               let alreadyDead := (afterRemove.findDead? id).isSome
               let deadEntry : DeadAllocEntry := ⟨id, entry.sizeBytes, entry.alignBytes⟩
@@ -1878,6 +1901,8 @@ def deallocate (w : KeyedAllocWorld) (ptr : ResolvedDeallocPtr)
               (afterFailCleanup, detached, .error (.hookFailure "DataRace"))
             | .protectedBorrowFault _ =>
               (afterFailCleanup, detached, .error (.hookFailure "TreeBorrowsProtectedDealloc"))
+            | .missingRaceClock =>
+              (afterFailCleanup, detached, .error (.hookFailure "MissingVectorClockExtra"))
             | .ok =>
               let alreadyDead := (afterRemove.findDead? id).isSome
               let deadEntry : DeadAllocEntry := ⟨id, entry.sizeBytes, entry.alignBytes⟩
@@ -1894,22 +1919,23 @@ the hook verdict is *computed* from the world's own live size and per-allocation
 before any race cleanup, instead of being supplied as an unconstrained parameter. -/
 def LinearAllocWorld.deallocateMachine (w : LinearAllocWorld) (ptr : ResolvedDeallocPtr)
     (reqLayout : Option (UInt64 × UInt64)) (reqKind : AllocMemoryKind)
-    (actor : DeallocActor) (tb : DeallocHookSpec) :
+    (actor : DeallocActor) (tb : DeallocHookSpec) (mode : RaceDetectorMode := .configured true) :
     LinearAllocWorld × Option (MiriAllocId × LocalAllocEntry) × Except AllocLifecycleErr Unit :=
   let (szOpt, raceEntry) := match ptr with
     | .provenanced id _ => ((w.findLive? id).map (·.sizeBytes), w.findRace? id)
     | .danglingAddress _ => (none, none)
-  w.deallocate ptr reqLayout reqKind (machineDeallocHook szOpt raceEntry actor tb)
+  w.deallocate ptr reqLayout reqKind (machineDeallocHook szOpt raceEntry actor tb mode)
 
-/-- Keyed counterpart of `LinearAllocWorld.deallocateMachine` (`[adv B1]`, ZST-fixed `[adv A1]`). -/
+/-- Keyed counterpart of `LinearAllocWorld.deallocateMachine` (`[adv B1]`, ZST-fixed `[adv A1]`,
+detector-mode `[adv B2]`). -/
 def KeyedAllocWorld.deallocateMachine (w : KeyedAllocWorld) (ptr : ResolvedDeallocPtr)
     (reqLayout : Option (UInt64 × UInt64)) (reqKind : AllocMemoryKind)
-    (actor : DeallocActor) (tb : DeallocHookSpec) :
+    (actor : DeallocActor) (tb : DeallocHookSpec) (mode : RaceDetectorMode := .configured true) :
     KeyedAllocWorld × Option (MiriAllocId × LocalAllocEntry) × Except AllocLifecycleErr Unit :=
   let (szOpt, raceEntry) := match ptr with
     | .provenanced id _ => ((w.findLive? id).map (·.sizeBytes), w.findRace? id)
     | .danglingAddress _ => (none, none)
-  w.deallocate ptr reqLayout reqKind (machineDeallocHook szOpt raceEntry actor tb)
+  w.deallocate ptr reqLayout reqKind (machineDeallocHook szOpt raceEntry actor tb mode)
 
 /-- Keyed projection of one linear table (`[adv B1]`): `foldr` inserts rows right-to-left, so the
 *first* row for each key (the one `linearFind?` returns) is inserted last and wins — reproducing
@@ -2465,6 +2491,7 @@ theorem allocWorldRel_deallocate {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
                   cases hook with
                   | raceDataRaceFault _ _ => exact ⟨rfl, rfl, hfail_rel⟩
                   | protectedBorrowFault _ => exact ⟨rfl, rfl, hfail_rel⟩
+                  | missingRaceClock => exact ⟨rfl, rfl, hfail_rel⟩
                   | ok =>
                     dsimp only
                     rw [hrem_rel.dead_eq id]
@@ -2491,6 +2518,7 @@ theorem allocWorldRel_deallocate {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
                     cases hook with
                     | raceDataRaceFault _ _ => exact ⟨rfl, rfl, hfail_rel⟩
                     | protectedBorrowFault _ => exact ⟨rfl, rfl, hfail_rel⟩
+                    | missingRaceClock => exact ⟨rfl, rfl, hfail_rel⟩
                     | ok =>
                       dsimp only
                       rw [hrem_rel.dead_eq id]
@@ -2617,6 +2645,9 @@ theorem keyedDeallocate_postRemovalFailure_retains_detached_state
         | protectedBorrowFault _ =>
           simp [KeyedAllocWorld.removeRace, KeyedAllocWorld.findLive?,
             KeyedAllocWorld.findRace?, KeyedAllocWorld.findDead?, Except.isOk, Except.toBool]
+        | missingRaceClock =>
+          simp [KeyedAllocWorld.removeRace, KeyedAllocWorld.findLive?,
+            KeyedAllocWorld.findRace?, KeyedAllocWorld.findDead?, Except.isOk, Except.toBool]
       | some reqPair =>
         rcases reqPair with ⟨reqSz, reqAl⟩
         dsimp only
@@ -2650,6 +2681,9 @@ theorem keyedDeallocate_postRemovalFailure_retains_detached_state
           | protectedBorrowFault _ =>
             simp [KeyedAllocWorld.removeRace, KeyedAllocWorld.findLive?,
               KeyedAllocWorld.findRace?, KeyedAllocWorld.findDead?, Except.isOk, Except.toBool]
+          | missingRaceClock =>
+            simp [KeyedAllocWorld.removeRace, KeyedAllocWorld.findLive?,
+              KeyedAllocWorld.findRace?, KeyedAllocWorld.findDead?, Except.isOk, Except.toBool]
 
 /-- **Failure Ordering 5 (Duplicate-`dead` Replacement Before Error)**: when `id` is live with
 valid layout/kind/hook `.ok` AND already has a stale `oldDead` entry in `dead`, deallocation
@@ -2677,35 +2711,38 @@ theorem keyedDeallocate_duplicateDead_replaces_before_error
   simp [KeyedAllocWorld.insertDead, KeyedAllocWorld.removeRace,
     KeyedAllocWorld.findLive?, KeyedAllocWorld.findRace?, KeyedAllocWorld.findDead?]
 
-/-- **Machine Deallocation Refinement (`allocWorldRel_deallocateMachine`, `[adv B1]`)**: with the hook
-verdict computed from each world's own race table, linear and keyed machine deallocation still agree
-on detached owner, outcome, and successor `AllocWorldRel`. -/
+/-- **Machine Deallocation Refinement (`allocWorldRel_deallocateMachine`, `[adv B1]`, all detector
+modes `[adv B2]`)**: with the hook verdict computed from each world's own race table, linear and
+keyed machine deallocation agree on detached owner, outcome, and successor `AllocWorldRel` for
+every `RaceDetectorMode`. -/
 theorem allocWorldRel_deallocateMachine {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
     (hrel : AllocWorldRel lw kw) (ptr : ResolvedDeallocPtr)
     (reqLayout : Option (UInt64 × UInt64)) (reqKind : AllocMemoryKind)
-    (actor : DeallocActor) (tb : DeallocHookSpec) :
-    let (lw', detL, outL) := lw.deallocateMachine ptr reqLayout reqKind actor tb
-    let (kw', detK, outK) := kw.deallocateMachine ptr reqLayout reqKind actor tb
+    (actor : DeallocActor) (tb : DeallocHookSpec) (mode : RaceDetectorMode) :
+    let (lw', detL, outL) := lw.deallocateMachine ptr reqLayout reqKind actor tb mode
+    let (kw', detK, outK) := kw.deallocateMachine ptr reqLayout reqKind actor tb mode
     detL = detK ∧ outL = outK ∧ AllocWorldRel lw' kw' := by
   unfold LinearAllocWorld.deallocateMachine KeyedAllocWorld.deallocateMachine
   cases ptr with
   | danglingAddress addr =>
     exact allocWorldRel_deallocate hrel (.danglingAddress addr) reqLayout reqKind
-      (machineDeallocHook none none actor tb)
+      (machineDeallocHook none none actor tb mode)
   | provenanced id off =>
     dsimp only
     have hlive : lw.findLive? id = kw.findLive? id := hrel.live_eq id
     have hrace : lw.findRace? id = kw.findRace? id := hrel.race_eq id
     rw [hlive, hrace]
     exact allocWorldRel_deallocate hrel (.provenanced id off) reqLayout reqKind
-      (machineDeallocHook ((kw.findLive? id).map (·.sizeBytes)) (kw.findRace? id) actor tb)
+      (machineDeallocHook ((kw.findLive? id).map (·.sizeBytes)) (kw.findRace? id) actor tb mode)
 
 /-- **Race Check Precedes Race Cleanup (`keyedDeallocateMachine_race_checked_before_cleanup`,
-`[adv B1]`, ZST-refined `[adv A1]`)**: when `id` is live (`sizeBytes ≠ 0`), passes the
-mutability/kind/layout checks, has no tombstone, and its *still-present* race clock `clk` races with
-`actor`, machine deallocation reports `.hookFailure "DataRace"`, retains the detached owner, drops
-`id` from `live` and only *then* from `race`, and does not tombstone it. The order is observable:
-the identical deallocation run on `w.removeRace id` misses the race and succeeds. -/
+`[adv B1]`, ZST-refined `[adv A1]`, detector-mode `[adv B2]`)**: under the (default) configured,
+detecting race detector, when `id` is live (`sizeBytes ≠ 0`), passes the mutability/kind/layout
+checks, has no tombstone, and its *still-present* race clock `clk` races with `actor`, machine
+deallocation reports `.hookFailure "DataRace"`, retains the detached owner, drops `id` from `live`
+and only *then* from `race`, and does not tombstone it. The order is observable: on
+`w.removeRace id` (cleanup-first) the lost clock is reported as an invalid program
+(`MissingVectorClockExtra`, upstream `memoryRaceAccess`) instead of the race. -/
 theorem keyedDeallocateMachine_race_checked_before_cleanup
     (w : KeyedAllocWorld) (id : MiriAllocId) (entry : LocalAllocEntry) (clk : RaceClockEntry)
     (actor : DeallocActor) (tb : DeallocHookSpec)
@@ -2723,7 +2760,8 @@ theorem keyedDeallocateMachine_race_checked_before_cleanup
     r.1.findRace? id = none ∧
     r.1.findDead? id = none ∧
     ((w.removeRace id).deallocateMachine (.provenanced id 0)
-      (some (entry.sizeBytes, entry.alignBytes)) entry.kind actor .ok).2.2 = .ok () := by
+      (some (entry.sizeBytes, entry.alignBytes)) entry.kind actor .ok).2.2 =
+      .error (.hookFailure "MissingVectorClockExtra") := by
   have hfault : ∃ th ts, raceDeallocVerdict actor clk = .raceDataRaceFault th ts := by
     unfold raceDeallocVerdict at hracy ⊢
     dsimp only at hracy ⊢
@@ -2749,7 +2787,7 @@ theorem keyedDeallocateMachine_race_checked_before_cleanup
   have hdead' : w.dead.get? id = none := hnodead
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
     simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocate,
-      KeyedAllocWorld.removeLive, KeyedAllocWorld.removeRace, KeyedAllocWorld.insertDead,
+      KeyedAllocWorld.removeLive, KeyedAllocWorld.removeRace,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findRace?, KeyedAllocWorld.findDead?,
       machineDeallocHook, hsz_false, hfaultEq, hlive', hrace', hdead', hmut_false]
 
@@ -2783,16 +2821,19 @@ theorem keyedDeallocateMachine_sameWriter_foreignRead_races
     hlive hsz hmut hnodead hrace hracy).2.1
 
 /-- **Zero-Sized Deallocation Skips Race Detector (`keyedDeallocateMachine_zst_skips_race_check`,
-`[adv A1]`)**: when `entry.sizeBytes = 0`, `deallocateMachine` skips the per-byte race clock check
+`[adv A1]`, clock premise added `[adv B2]`)**: when `entry.sizeBytes = 0` and the allocation still
+carries its race clock (any clock, even one that would race), `deallocateMachine` checks `0` bytes
 (matching `DataRace.runRangeLoop` `remaining = 0`) and succeeds with `.ok ()` while still removing
-`id` from `live` and `race` and recording the zero-sized tombstone. -/
+`id` from `live` and `race` and recording the zero-sized tombstone. Without the clock premise the
+configured detector reports `MissingVectorClockExtra` (`keyedDeallocateMachine_missingClock_invalid`). -/
 theorem keyedDeallocateMachine_zst_skips_race_check
-    (w : KeyedAllocWorld) (id : MiriAllocId) (entry : LocalAllocEntry)
+    (w : KeyedAllocWorld) (id : MiriAllocId) (entry : LocalAllocEntry) (clk : RaceClockEntry)
     (actor : DeallocActor)
     (hlive : w.findLive? id = some entry)
     (hsz0 : entry.sizeBytes = 0)
     (hmut : entry.mutability = .mut)
-    (hnodead : w.findDead? id = none) :
+    (hnodead : w.findDead? id = none)
+    (hrace : w.findRace? id = some clk) :
     let r := w.deallocateMachine (.provenanced id 0)
       (some (entry.sizeBytes, entry.alignBytes)) entry.kind actor .ok
     r.2.2 = .ok () ∧ r.1.findLive? id = none ∧ r.1.findRace? id = none := by
@@ -2800,11 +2841,64 @@ theorem keyedDeallocateMachine_zst_skips_race_check
   have hmut_false : (entry.mutability == .not) = false := by rw [hmut]; rfl
   have hlive' : w.live.get? id = some entry := hlive
   have hdead' : w.dead.get? id = none := hnodead
+  have hrace' : w.race.get? id = some clk := hrace
   refine ⟨?_, ?_, ?_⟩ <;>
     simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocate,
       KeyedAllocWorld.removeLive, KeyedAllocWorld.removeRace, KeyedAllocWorld.insertDead,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findRace?, KeyedAllocWorld.findDead?,
-      machineDeallocHook, hsz_true, hlive', hdead', hmut_false]
+      machineDeallocHook, hsz_true, hlive', hdead', hrace', hmut_false]
+
+/-- **Lost Race Clock Is an Invalid Program, Even for ZSTs
+(`keyedDeallocateMachine_missingClock_invalid`, `[adv B2]`)**: with a configured detector
+(detecting or not), a live allocation that passes the mutability/kind/layout checks but has no
+`raceAllocations` entry fails with `.hookFailure "MissingVectorClockExtra"` — upstream
+`memoryRaceAccess` looks the entry up *before* the `raceDetecting` and byte-range checks
+(`MachineHooks.lean:234–237`). B1/A1 silently treated a missing entry as race-free. The detached
+owner is still returned and `id` stays removed from `live`. -/
+theorem keyedDeallocateMachine_missingClock_invalid
+    (w : KeyedAllocWorld) (id : MiriAllocId) (entry : LocalAllocEntry)
+    (actor : DeallocActor) (tb : DeallocHookSpec) (detecting : Bool)
+    (hlive : w.findLive? id = some entry)
+    (hmut : entry.mutability = .mut)
+    (hnorace : w.findRace? id = none) :
+    let r := w.deallocateMachine (.provenanced id 0)
+      (some (entry.sizeBytes, entry.alignBytes)) entry.kind actor tb (.configured detecting)
+    r.2.1 = some (id, entry) ∧
+    r.2.2 = .error (.hookFailure "MissingVectorClockExtra") ∧
+    r.1.findLive? id = none := by
+  have hmut_false : (entry.mutability == .not) = false := by rw [hmut]; rfl
+  have hlive' : w.live.get? id = some entry := hlive
+  have hrace' : w.race.get? id = none := hnorace
+  refine ⟨?_, ?_, ?_⟩ <;>
+    simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocate,
+      KeyedAllocWorld.removeLive, KeyedAllocWorld.removeRace,
+      KeyedAllocWorld.findLive?, KeyedAllocWorld.findRace?,
+      machineDeallocHook, hlive', hrace', hmut_false]
+
+/-- **No Detector, No Race Check (`keyedDeallocateMachine_unconfigured_eq_deallocate`, `[adv B2]`)**:
+with `machine.dataRace = none` the race table is never consulted: machine deallocation is plain
+`deallocate` with the Tree Borrows verdict, for every pointer. -/
+theorem keyedDeallocateMachine_unconfigured_eq_deallocate
+    (w : KeyedAllocWorld) (ptr : ResolvedDeallocPtr)
+    (reqLayout : Option (UInt64 × UInt64)) (reqKind : AllocMemoryKind)
+    (actor : DeallocActor) (tb : DeallocHookSpec) :
+    w.deallocateMachine ptr reqLayout reqKind actor tb .unconfigured =
+      w.deallocate ptr reqLayout reqKind tb := by
+  cases ptr <;> rfl
+
+/-- **Single-Threaded Phase Skips the Verdict (`keyedDeallocateMachine_notDetecting_eq_deallocate`,
+`[adv B2]`)**: with a configured detector that is not `raceDetecting` (single-threaded program), a
+present clock is not inspected — even a clock that would race — and machine deallocation is plain
+`deallocate` with the Tree Borrows verdict. -/
+theorem keyedDeallocateMachine_notDetecting_eq_deallocate
+    (w : KeyedAllocWorld) (id : MiriAllocId) (off : UInt64) (clk : RaceClockEntry)
+    (reqLayout : Option (UInt64 × UInt64)) (reqKind : AllocMemoryKind)
+    (actor : DeallocActor) (tb : DeallocHookSpec)
+    (hrace : w.findRace? id = some clk) :
+    w.deallocateMachine (.provenanced id off) reqLayout reqKind actor tb (.configured false) =
+      w.deallocate (.provenanced id off) reqLayout reqKind tb := by
+  unfold KeyedAllocWorld.deallocateMachine machineDeallocHook
+  simp [hrace]
 
 /-! ## Section 3: Part 2 — `#[rustc_no_writable]` (`charon#1619` + `minirust#295`) & Static-Access Temporary Retags (`charon#1620`) -/
 
@@ -3691,10 +3785,13 @@ theorem execFnEntryMutRetag_mkTwoBranch_eq_upstream
             TreeTagNode.isProtected, hov, Bind.bind, Except.bind, Pure.pure, Except.pure]
 
 /-- **Disabled-Grandparent Diagnostic Separation (`execFnEntryMutRetag_disabledGrandparent_diverges_from_upstream`,
-`[adv A1]`)**: pinpoints the *sole* case where read-then-child-write diverges from upstream's
-single parent write: when `parentTag = 2` (`.unique`) has a `.disabled` grandparent `tag = 1` and
+`[adv A1]`)**: witnesses *one* case where read-then-child-write diverges from upstream's single
+parent write: when `parentTag = 2` (`.unique`) has a `.disabled` grandparent `tag = 1` and
 `performsImplicitWrite = true` (`len > 0`), `execFnEntryMutRetag` reports `.parentDisabled` during
-its preliminary read pass whereas `execFnEntryMutRetagUpstream` reports `.ancestorWriteForbidden`! -/
+its preliminary read pass whereas `execFnEntryMutRetagUpstream` reports `.ancestorWriteForbidden`.
+`[adv B2]`: A1 called this "the *sole* case"; it is not —
+`execFnEntryMutRetag_frozenParent_protectedChild_diverges_from_upstream` diverges with no `.disabled`
+node at all. -/
 theorem execFnEntryMutRetag_disabledGrandparent_diverges_from_upstream
     (allocId len : Nat) (bytes : List AbstractByte) (facts : RetagTypeFacts)
     (hlen : 0 < len) (hbound : len ≤ bytes.length) (hunpin : facts.tyIsUnpin = true) :
@@ -3725,6 +3822,58 @@ theorem execFnEntryMutRetag_disabledGrandparent_diverges_from_upstream
     simp [hunpin, findTagNode?, hbound, hlen0, mapNodesM, stepNodeOnRangeWrite,
       isDescendantOrSelf, isDescendantOrSelfAux, Bind.bind, Except.bind,
       throw, throwThe, MonadExceptOf.throw]
+
+/-- **List-Order Diagnostic Divergence Without Any `.disabled` Node
+(`execFnEntryMutRetag_frozenParent_protectedChild_diverges_from_upstream`, `[adv B2]`)**: the
+node-level `stepNode_read_then_childWrite_eq_parentWrite` does **not** lift to worlds, because the
+two-pass model runs the *whole* read pass before any write. With a `.frozen` parent listed before a
+protected `.unique` foreign node, the two-pass model reports the read pass's
+`.protectedForeignConflict`, whereas upstream's single parent write stops first at the frozen parent
+with `.ancestorWriteForbidden` — refuting A1's "sole case" claim. (Both models still report UB; only
+the diagnostic differs, and this configuration may be unreachable by legal Tree Borrows histories.) -/
+theorem execFnEntryMutRetag_frozenParent_protectedChild_diverges_from_upstream
+    (allocId len : Nat) (bytes : List AbstractByte) (facts : RetagTypeFacts)
+    (hlen : 0 < len) (hbound : len ≤ bytes.length) (hunpin : facts.tyIsUnpin = true) :
+    let w : FnEntryBorrowWorld := {
+      allocId := allocId
+      bytes := bytes
+      nodes := [
+        ⟨1, allocId, 0, len, .frozen, none, none⟩,
+        ⟨5, allocId, 0, len, .unique, some 7, some 1⟩
+      ]
+      activeProtectors := ProtectorSet.empty.insert 7
+      nextTag := 6
+      nextProtector := 8
+    }
+    execFnEntryMutRetag w 1 0 len facts true .writableChildWrite false =
+      .error .protectedForeignConflict ∧
+    execFnEntryMutRetagUpstream w 1 0 len facts true .writableChildWrite =
+      .error .ancestorWriteForbidden := by
+  have hlen0 : Nat.beq len 0 = false := by
+    cases len with
+    | zero => omega
+    | succ _ => rfl
+  have hov : ∀ (tg : Nat) (p : AbstractPerm) (pr : Option Nat),
+      byteRangeOverlapsWrite ⟨tg, allocId, 0, len, p, pr⟩ allocId 0 len = true := by
+    intro tg p pr
+    unfold byteRangeOverlapsWrite
+    simp only [Nat.beq_refl, Bool.true_and]
+    unfold byteRangesOverlapBool
+    cases len with
+    | zero => omega
+    | succ _ => rfl
+  have hprot7 : (ProtectorSet.empty.insert 7).contains 7 = true :=
+    ProtectorSet.contains_insert_self _ _
+  refine ⟨?_, ?_⟩
+  · unfold execFnEntryMutRetag selectFnEntryPolicy
+    simp [hunpin, findTagNode?, hbound, hlen0, mapNodesM, stepNodeOnRangeRead,
+      isDescendantOrSelf, isDescendantOrSelfAux, TreeTagNode.toByteRangePerm,
+      TreeBorrowPerm.toAbstractPerm, TreeTagNode.isProtected, hov, hprot7,
+      Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
+  · unfold execFnEntryMutRetagUpstream selectFnEntryPolicy
+    simp [hunpin, findTagNode?, hbound, hlen0, mapNodesM, stepNodeOnRangeWrite,
+      isDescendantOrSelf, isDescendantOrSelfAux,
+      Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
 
 /-- **Operational `Trusted.MirSemantics` Overlay (`applyParamFnEntryImplicitWrite`)**:
 upgrades `evalStmt` on `StatementKind.retag .fnEntry place` with per-parameter
@@ -5774,6 +5923,77 @@ theorem upcastVTableToAutoTraits_preserves_drop_size_align
       refine ⟨hwf', hcty, hspec, hdropFinal, hszFinal, halFinal, ?_⟩
       rw [hentries, hdropFinal, hszFinal, halFinal]
 
+/-- `byAlloc` coherence (`[adv B2]`): `validateVTableHalf` resolves descriptors through
+`reg.byAlloc`, which A1's `KeyWF` (a `byKey`-only invariant) left unconstrained. Every `byAlloc`
+entry is keyed by its own `allocId` and is well-formed for some canonical key. -/
+def VTableRegistry.AllocWF (maxSize : Nat) (dropFnOf : ProtoTy → DefPath)
+    (reg : VTableRegistry) : Prop :=
+  ∀ (id : MiriAllocId) (d : VTableDescriptor),
+    reg.byAlloc.get? id = some d → d.allocId = id ∧ ∃ k, VTableEntryWF maxSize dropFnOf k d
+
+theorem VTableRegistry.allocWF_empty (maxSize : Nat) (dropFnOf : ProtoTy → DefPath) :
+    VTableRegistry.AllocWF maxSize dropFnOf {} := by
+  intro id d hget
+  rw [ExtTreeMap0.get?_empty] at hget
+  nomatch hget
+
+/-- **`VTableRegistry.intern` Preserves `AllocWF` (`VTableRegistry.allocWF_intern`, `[adv B2]`)**:
+on a `KeyWF ∧ AllocWF` registry, interning with `dropFn = dropFnOf concreteTy` keeps every
+`byAlloc` entry self-keyed and well-formed (fresh entries are built with `allocId := id`; reused
+entries leave the registry unchanged). -/
+theorem VTableRegistry.allocWF_intern
+    (maxSize : Nat) (dropFnOf : ProtoTy → DefPath)
+    (reg reg' : VTableRegistry) (w w' : KeyedAllocWorld)
+    (concreteTy : ProtoTy) (principal : Option PrincipalTraitRef)
+    (rawAutoTraits : List AutoTrait) (desc : VTableDescriptor)
+    (hkwf : reg.KeyWF maxSize dropFnOf) (hawf : reg.AllocWF maxSize dropFnOf)
+    (hres : reg.intern w maxSize concreteTy (dropFnOf concreteTy) principal rawAutoTraits =
+      .ok (reg', w', desc)) :
+    reg'.AllocWF maxSize dropFnOf := by
+  have hentry := (VTableRegistry.keyWF_intern maxSize dropFnOf reg reg' w w'
+    concreteTy principal rawAutoTraits desc hkwf hres).2
+  unfold VTableRegistry.intern at hres
+  dsimp only at hres
+  cases hex : reg.byKey.get? (mkCanonicalVTableKey concreteTy principal rawAutoTraits) with
+  | some existing =>
+    rw [hex] at hres
+    simp only [Pure.pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at hres
+    rcases hres with ⟨rfl, _, rfl⟩
+    exact hawf
+  | none =>
+    rw [hex] at hres
+    cases hid : (w.reserveAllocId).2 with
+    | error e =>
+      simp [hid, Except.mapError, Bind.bind, Except.bind] at hres
+    | ok id =>
+      rw [hid] at hres
+      simp only [Except.mapError, Bind.bind, Except.bind] at hres
+      unfold buildVTableDescriptor at hres
+      cases hlay : computeTyLayout maxSize concreteTy with
+      | error le =>
+        simp [hlay, Except.mapError, Bind.bind, Except.bind] at hres
+      | ok lay =>
+        rw [hlay] at hres
+        simp only [Except.mapError, Bind.bind, Except.bind] at hres
+        cases hsz : lay.isSized with
+        | false =>
+          simp [hsz, throw, throwThe, MonadExceptOf.throw] at hres
+        | true =>
+          simp only [hsz, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+            Pure.pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at hres
+          rcases hres with ⟨hreg', _, hdesc'⟩
+          subst hreg' hdesc'
+          intro id' d' hget'
+          rw [ExtTreeMap0.get?_insert] at hget'
+          split at hget'
+          · rename_i hcmp
+            have hideq : id = id' := LawfulEqCmp.eq_of_compare hcmp
+            subst hideq
+            injection hget' with hd'
+            subst hd'
+            exact ⟨rfl, _, hentry⟩
+          · exact hawf id' d' hget'
+
 /-- Salted vtable key (`Miri.Interpreter.VTable.getPointer`, `[adv A1]`): Miri draws a global
 allocation salt (`globalSalt`) per non-CTFE vtable request so two vtable expressions for the same
 `(concreteTy, dynSpec)` can receive distinct `MiriAllocId`s while carrying identical layout/trait
@@ -5919,6 +6139,58 @@ theorem validateVTableHalf_principalLess_vs_principal_invalidTrait
   have hk : (glob.kind != .vtable) = false := by rw [hkind]; rfl
   unfold validateVTableHalf
   simp [hglob, hdesc, hk, vtableMatchesExpectedSpec, hprin]
+
+/-- **Validated VTables Carry Their Concrete Type's Layout & Drop Glue
+(`validateVTableHalf_sound_of_allocWF`, `[adv B2]`)**: on an `AllocWF` registry, every descriptor
+that `validateVTableHalf` accepts — for *any* pointer and *any* expected spec — has
+`dropInPlaceFn = dropFnOf concreteTy` and `(sizeBytes, alignBytes)` equal to the `computeTyLayout`
+of its concrete type (which is `Sized`). This is the key-lookup soundness the wide-pointer validator
+relies on when it reports `(size, align)` "from the vtable"; A1's `KeyWF` alone could not give it
+because validation never consults `byKey`. -/
+theorem validateVTableHalf_sound_of_allocWF
+    (maxSize : Nat) (dropFnOf : ProtoTy → DefPath)
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (vtablePtr : ScalarPtrHalf)
+    (expectedSpec : DynExistentialSpec) (desc : VTableDescriptor)
+    (hawf : reg.AllocWF maxSize dropFnOf)
+    (hv : validateVTableHalf w reg vtablePtr expectedSpec = .ok desc) :
+    desc.dropInPlaceFn = dropFnOf desc.concreteTy ∧
+    ∃ lay : ComputedTyLayout, computeTyLayout maxSize desc.concreteTy = .ok lay ∧
+      lay.isSized = true ∧
+      desc.sizeBytes = UInt64.ofNat lay.sizeBytes ∧
+      desc.alignBytes = UInt64.ofNat lay.alignBytes := by
+  cases vtablePtr with
+  | null => simp [validateVTableHalf] at hv
+  | maybeNull _ _ => simp [validateVTableHalf] at hv
+  | danglingInt _ => simp [validateVTableHalf] at hv
+  | provenanced addr allocId off =>
+    unfold validateVTableHalf at hv
+    by_cases hoff : (off != 0) = true
+    · simp [hoff] at hv
+    · have hoff' : (off != 0) = false := Bool.eq_false_iff.mpr hoff
+      simp only [hoff', Bool.false_eq_true, ↓reduceIte] at hv
+      cases hg : w.findGlobal? allocId with
+      | none => simp [hg] at hv
+      | some glob =>
+        cases ha : reg.byAlloc.get? allocId with
+        | none => simp [hg, ha] at hv
+        | some d =>
+          simp only [hg, ha] at hv
+          by_cases hk : (glob.kind != .vtable) = true
+          · simp [hk] at hv
+          · have hk' : (glob.kind != .vtable) = false := Bool.eq_false_iff.mpr hk
+            simp only [hk', Bool.false_eq_true, ↓reduceIte] at hv
+            by_cases hm : (!vtableMatchesExpectedSpec d.spec expectedSpec) = true
+            · simp [hm] at hv
+            · have hm' : (!vtableMatchesExpectedSpec d.spec expectedSpec) = false :=
+                Bool.eq_false_iff.mpr hm
+              simp only [hm', Bool.false_eq_true, ↓reduceIte] at hv
+              injection hv with hdeq
+              subst hdeq
+              obtain ⟨_, k, hcty, _, hdrop, ⟨lay, hlay, hsz, hszEq, halEq⟩, _⟩ := hawf allocId _ ha
+              refine ⟨?_, lay, ?_, hsz, hszEq, halEq⟩
+              · rw [hdrop, hcty]
+              · rw [hcty]
+                exact hlay
 
 /-- **`lean-miri#82` Source-Ordered Wide `dyn` Safe-Pointer Validator (`validateWideDynSafePtr`)**:
 1. Validates `vtablePtr` metadata **FIRST** (`validateVTableHalf`), extracting `(sizeBytes, alignBytes)`
