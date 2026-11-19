@@ -688,6 +688,7 @@ Kernel-checked positive and negative non-vacuity canaries for
 
 section GapPreservingCanaries
 
+open Trusted.Refinement
 open Anneal.Refinement
 open Anneal.Pass
 
@@ -996,6 +997,32 @@ theorem callerRefactored_mirTree_returns (x : Nat) (hx : x + x < 4294967296) :
   mirGapBehaviors_ok_reachesRet (callerRefactored_value_of_true x hx)
 
 /--
+Full end-to-end adequacy on `flag = true`: from `callerRefactored_contextEquiv`
+and the baseline's single bounded run alone (without re-evaluating
+`callerRefactoredBody`), BOTH trusted `mirTree`s satisfy `MirNoUBTree` and have
+literally equal trace-erased Layer 1A `ITree.toPartial` semantics.
+-/
+theorem callerRefactored_mirTree_adequate_and_toPartial_eq (x : Nat) :
+    let t₁ := mirTree callerBranchingBody
+      (initMachineStateWithCallees callerBranchingBody (callerArgs (true, x))
+        linkedHelpers)
+    let t₂ := mirTree callerRefactoredBody
+      (initMachineStateWithCallees callerRefactoredBody (callerArgs (true, x))
+        linkedHelpers)
+    MirNoUBTree t₁ ∧ MirNoUBTree t₂ ∧
+      Partial.map (BehaviorSet.map Prod.snd) t₁.toPartial =
+        Partial.map (BehaviorSet.map Prod.snd) t₂.toPartial := by
+  refine mirContextEquivOn_toPartial_eq
+    (pre := fun args => ∃ n : Nat, args = callerArgs (true, n))
+    (body₁ := callerBranchingBody) (body₂ := callerRefactoredBody)
+    (hEq := fun args hpre => by
+      obtain ⟨n, rfl⟩ := hpre
+      exact callerRefactored_contextEquiv (true, n))
+    (hpre := ⟨x, rfl⟩)
+    (out := .normal (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, linkedMemory))
+    (callerBranching_run_true x)
+
+/--
 On `flag = false` the trusted interaction tree of either caller reaches the
 helper's `unsupported` fault, so the trusted Layer 1A semantics is undefined
 there and says nothing. `ContextEquiv` still records that both callers hit the
@@ -1008,8 +1035,147 @@ theorem callers_not_mirNoUBTree_of_false (x : Nat) :
       ¬ MirNoUBTree (mirTree callerRefactoredBody
         (initMachineStateWithCallees callerRefactoredBody (callerArgs (false, x))
           linkedHelpers)) :=
-  ⟨not_mirNoUBTree_of_run_undefined (callerBranching_run_false x) (Or.inr ⟨_, rfl⟩),
-   not_mirNoUBTree_of_run_undefined (callerRefactored_run_false x) (Or.inr ⟨_, rfl⟩)⟩
+  ⟨not_mirNoUBTree_of_run_undefined (callerBranching_run_false x)
+      (Or.inr (Or.inl ⟨_, rfl⟩)),
+   not_mirNoUBTree_of_run_undefined (callerRefactored_run_false x)
+      (Or.inr (Or.inl ⟨_, rfl⟩))⟩
+
+/--
+A third equivalent caller computing `0 + (x + x)` on `flag = true` and calling
+the same shared unmodeled helper on `flag = false`, used to exercise
+certificate-checker composition (`VerifiedContextChecker.trans`) and
+query-scoped upgrade (`toExactChecker_of_gapFreeOn`).
+-/
+def callerZeroAddBody : CapturedMir :=
+  mkMirBody "test::caller_zero_add" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy,
+     mkDecl .mut u32MirTy]
+    [ flagSwitchBlock,
+      { statements :=
+          [mkStmt (.storageLive 3),
+           mkStmt (.assign (locPlace 3)
+             (.binaryOp .add (u32ConstOp 0) (.copy (locPlace 2)))),
+           mkStmt (.assign (locPlace 0)
+             (.binaryOp .add (.copy (locPlace 3)) (.copy (locPlace 2))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      helperCallBlock "test::unmodeled_helper",
+      returnBlock ]
+
+theorem callerZeroAdd_run_true (x : Nat) :
+    callerRun callerZeroAddBody 5 (true, x) =
+      .ok (.scalar
+        ⟨wrapScalarBits (wrapScalarBits (0 + x) (scalarModulus 4) + x)
+          (scalarModulus 4), 4⟩, linkedMemory) :=
+  rfl
+
+theorem callerZeroAdd_run_false (x : Nat) :
+    callerRun callerZeroAddBody 5 (false, x) =
+      .gap (.unsupported "test::unmodeled_helper") :=
+  rfl
+
+private theorem wrapScalarBits_eq_mod (v m : Nat) :
+    wrapScalarBits v m = v % m := by
+  unfold wrapScalarBits
+  cases h : Nat.ble m v with
+  | true => rfl
+  | false =>
+    have hlt : v < m :=
+      Nat.lt_of_not_le (fun hle => by rw [nat_ble_eq_true_of_le hle] at h; cases h)
+    exact (Nat.mod_eq_of_lt hlt).symm
+
+private theorem wrapScalarBits_zero_add_add (x : Nat) :
+    wrapScalarBits (wrapScalarBits (0 + x) (scalarModulus 4) + x) (scalarModulus 4) =
+      wrapScalarBits (x + x) (scalarModulus 4) := by
+  rw [Nat.zero_add, wrapScalarBits_eq_mod, wrapScalarBits_eq_mod, wrapScalarBits_eq_mod]
+  rw [Nat.add_mod, Nat.mod_mod, ← Nat.add_mod]
+
+theorem callerRefactored_to_zeroAdd_contextEquiv :
+    ContextEquiv (· = ·) (· = ·) (callerGapSem callerRefactoredBody)
+      (callerGapSem callerZeroAddBody) := by
+  intro ⟨flag, x⟩
+  cases flag with
+  | true =>
+    refine mirGapBehaviors_equiv_of_runs (fuel₂ := 5)
+      (callerRefactored_run_ne_outOfFuel (true, x)) ?_
+    change GapEqErr (· = ·) (· = ·)
+      (callerRun callerRefactoredBody 5 (true, x))
+      (callerRun callerZeroAddBody 5 (true, x))
+    rw [callerRefactored_run_true, callerZeroAdd_run_true,
+      wrapScalarBits_zero_add_add, Nat.mul_two]
+    exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+  | false =>
+    refine mirGapBehaviors_equiv_of_runs (fuel₂ := 5)
+      (callerRefactored_run_ne_outOfFuel (false, x)) ?_
+    change GapEqErr (· = ·) (· = ·)
+      (callerRun callerRefactoredBody 5 (false, x))
+      (callerRun callerZeroAddBody 5 (false, x))
+    rw [callerRefactored_run_false, callerZeroAdd_run_false]
+    exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+
+/-- Decidable identifiers for the three caller bodies in the certificate pipeline. -/
+inductive CallerId : Type where
+  | branching
+  | refactored
+  | zeroAdd
+  deriving DecidableEq
+
+/-- Resolve a `CallerId` to its concrete `V2026_06_01` `CapturedMir` body. -/
+def callerOfId : CallerId → CapturedMir
+  | .branching => callerBranchingBody
+  | .refactored => callerRefactoredBody
+  | .zeroAdd => callerZeroAddBody
+
+/-- Semantics of a `CallerId` via `callerGapSem`. -/
+def callerIdSem (id : CallerId) :
+    GapSem (Bool × Nat) ExecFault (GapTag DefPath) MirReturn :=
+  callerGapSem (callerOfId id)
+
+/--
+Certificate-checker canary: compose two concrete `VerifiedContextChecker`s via
+`VerifiedContextChecker.trans` (`branching → refactored → zeroAdd`) and upgrade
+with a query-scoped `VerifiedGapFreeOnChecker` (`flag = true`) to a
+`VerifiedExactChecker` over `{q // q.1 = true}`, certifying gap-freedom of
+`callerZeroAddBody` on `flag = true` without inspecting its body.
+-/
+theorem callerPipeline_verifiedCheckers :
+    let chk₁₂ : CallerId → CallerId → Unit → Bool :=
+      fun p₁ p₂ _ => decide (p₁ = .branching ∧ p₂ = .refactored)
+    let chk₂₃ : CallerId → CallerId → Unit → Bool :=
+      fun p₂ p₃ _ => decide (p₂ = .refactored ∧ p₃ = .zeroAdd)
+    let chkComp := fun p₁ p₃ (c : CallerId × Unit × Unit) =>
+      chk₁₂ p₁ c.1 c.2.1 && chk₂₃ c.1 p₃ c.2.2
+    VerifiedContextChecker (· = ·) (· = ·) callerIdSem callerIdSem chkComp ∧
+      VerifiedExactChecker (gapSemantics ExecFault.isUB callerIdSem)
+        (gapSemantics ExecFault.isUB callerIdSem) id id chkComp ∧
+      GapFreeOn (fun q : Bool × Nat => q.1 = true) (callerGapSem callerZeroAddBody) := by
+  dsimp only
+  have h₁₂ : VerifiedContextChecker (· = ·) (· = ·) callerIdSem callerIdSem
+      (fun p₁ p₂ (_ : Unit) => decide (p₁ = .branching ∧ p₂ = .refactored)) :=
+    { sound := fun hc => by
+        obtain ⟨rfl, rfl⟩ := of_decide_eq_true hc
+        exact callerRefactored_contextEquiv }
+  have h₂₃ : VerifiedContextChecker (· = ·) (· = ·) callerIdSem callerIdSem
+      (fun p₂ p₃ (_ : Unit) => decide (p₂ = .refactored ∧ p₃ = .zeroAdd)) :=
+    { sound := fun hc => by
+        obtain ⟨rfl, rfl⟩ := of_decide_eq_true hc
+        exact callerRefactored_to_zeroAdd_contextEquiv }
+  have hComp := h₁₂.trans (fun _ _ _ h₁ h₂ => h₁.trans h₂)
+    (fun _ _ _ h₁ h₂ => h₁.trans h₂) h₂₃
+  have hGap : VerifiedGapFreeOnChecker (fun q : Bool × Nat => q.1 = true)
+      callerIdSem (fun p (_ : Unit) => decide (p = .branching)) :=
+    { sound := fun hc => by
+        cases of_decide_eq_true hc
+        exact callerBranching_gapFreeOn }
+  have hUpg := hComp.toExactChecker_of_gapFreeOn ExecFault.eq_preserves_isUB hGap
+  have hAccept :
+      ((decide (CallerId.branching = .branching ∧ CallerId.refactored = .refactored) &&
+        decide (CallerId.refactored = .refactored ∧ CallerId.zeroAdd = .zeroAdd)) &&
+        decide (CallerId.branching = .branching)) = true := by
+    decide
+  exact ⟨hComp, hComp.toExactChecker_eq,
+    (hUpg.2 (p₁ := .branching) (p₂ := .zeroAdd)
+      (c := ((.refactored, (), ()), ())) hAccept).2⟩
 
 
 /-! ### Part 5B: Negative Canaries (Rejected Gaps, Gap Tags, and Faults) -/
@@ -1154,6 +1320,12 @@ theorem ub_not_gapEqErr_panic :
       (· = ·) (· = ·) (.fault ExecFault.ub) (.fault ExecFault.panic) :=
   fun h => by cases h
 
+/-- Outcome level: under exact fault matching panic is never related to abort. -/
+theorem panic_not_gapEqErr_abort :
+    ¬ GapEqErr (Gap := GapTag DefPath) (Val₁ := MirReturn) (Val₂ := MirReturn)
+      (· = ·) (· = ·) (.fault ExecFault.panic) (.fault ExecFault.abort) :=
+  fun h => by cases h
+
 /-- Outcome level: a gap is never related to a fault, in either direction. -/
 theorem gap_not_gapEqErr_ub (g : GapTag DefPath) :
     ¬ GapEqErr (Val₁ := MirReturn) (Val₂ := MirReturn) (· = ·) (· = ·)
@@ -1237,6 +1409,174 @@ theorem conflating_fault_relation_rejected (x : Nat) :
         (assumeFlag_run_false x).symm
     exact hdef hmem trivial
 
+/-! #### Rust Unwind Soundness Canaries (`MirCallEnv` + `UnwindAction`) -/
+
+/--
+Caller of `"test::ext_helper"` with an explicit `UnwindAction`:
+exercises `.continue_`, `.unreachable` (`nounwind`), `.terminate`, and
+`.cleanup 2` (whose cleanup block calls `unsupportedHelperBody`).
+-/
+def unwindCallerBody (name : DefPath) (unwind : UnwindAction) : CapturedMir :=
+  mkMirBody name 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy]
+    [ { statements := []
+        terminator := mkTerm
+          (.call (fnItemOp "test::ext_helper") [.copy (locPlace 1)]
+            (locPlace 0) (some 1) unwind)
+        isCleanup := false },
+      returnBlock,
+      { statements := []
+        terminator := mkTerm
+          (.call (fnItemOp "test::unmodeled_helper") [.copy (locPlace 1)]
+            (locPlace 0) (some 1) .continue_)
+        isCleanup := true } ]
+
+/-- External callee summary that always panics. -/
+def panickingHelperSummary (_ : DefPath) (_ : List Value) :
+    OutcomeWithGap ExecFault (GapTag DefPath) Value :=
+  .fault .panic
+
+/--
+Unwind soundness: a panicking external callee called through
+`MirCallEnv.ofPure` MUST route through `MirCallAns.panicked` into the caller's
+`UnwindAction`:
+- `.continue_` -> defined `.fault .panic`;
+- `.unreachable` (`nounwind`) -> undefined behavior `.fault .ub` (never masked as panic!);
+- `.terminate` -> defined `.fault .abort` (never left as panic!);
+- `.cleanup 2` -> executes cleanup block `bb2` (reaching `unsupportedHelperBody`'s gap!).
+-/
+theorem unwindAction_soundness_of_panicking_callee (x : Nat) :
+    let env := MirCallEnv.ofPure panickingHelperSummary
+    let args := [Value.scalar ⟨x, 4⟩]
+    runMirWithGap env linkedHelpers
+        (unwindCallerBody "test::unwind_continue" .continue_) 3 args =
+        .fault .panic ∧
+      runMirWithGap env linkedHelpers
+          (unwindCallerBody "test::unwind_unreachable" .unreachable) 3 args =
+        .fault .ub ∧
+      runMirWithGap env linkedHelpers
+          (unwindCallerBody "test::unwind_terminate" .terminate) 3 args =
+        .fault .abort ∧
+      runMirWithGap env linkedHelpers
+          (unwindCallerBody "test::unwind_cleanup" (.cleanup 2)) 4 args =
+        .gap (.unsupported "test::unmodeled_helper") :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/--
+Because `UnwindAction.unreachable` turns a callee panic into UB while
+`UnwindAction.continue_` produces a defined panic, the two callers are NOT
+`ContextEquiv` under `MirCallEnv.ofPure panickingHelperSummary`.
+-/
+theorem unwindContinue_not_contextEquiv_unwindUnreachable :
+    let env := MirCallEnv.ofPure panickingHelperSummary
+    ¬ ContextEquiv (· = ·) (· = ·)
+      (mirGapBehaviors env linkedHelpers
+        (unwindCallerBody "test::unwind_continue" .continue_))
+      (mirGapBehaviors env linkedHelpers
+        (unwindCallerBody "test::unwind_unreachable" .unreachable)) := by
+  dsimp only
+  intro h
+  have h1 : runMirWithGap (MirCallEnv.ofPure panickingHelperSummary) linkedHelpers
+      (unwindCallerBody "test::unwind_continue" .continue_) 3 [.scalar ⟨0, 4⟩] =
+      .fault .panic := rfl
+  have h2 : runMirWithGap (MirCallEnv.ofPure panickingHelperSummary) linkedHelpers
+      (unwindCallerBody "test::unwind_unreachable" .unreachable) 3 [.scalar ⟨0, 4⟩] =
+      .fault .ub := rfl
+  have hEq := (mirGapBehaviors_equiv_iff_of_runs
+    (ne_outOfFuel_of_eq h1 (fun h₀ => by cases h₀))
+    (ne_outOfFuel_of_eq h2 (fun h₀ => by cases h₀))).mp (h [.scalar ⟨0, 4⟩])
+  rw [h1, h2] at hEq
+  cases hEq
+
+/-! #### Nondeterministic `OutcomeSet` Canaries (`OutcomeSetEquiv.bind_congr` & `valSemantics`) -/
+
+/--
+Nondeterministic positive canary: a prefix behavior set containing both a
+normal value and a modeling gap composes with two refactored nondeterministic
+continuations via `OutcomeSetEquiv.bind_congr`, without requiring gap-freedom;
+on a gap-free nondeterministic prefix, `ContextEquiv.toProgramEquiv` upgrades to
+`ProgramEquiv` and `ProgramEquiv.toValExactPass_eq` erases both `Gap` and `Fault`.
+-/
+theorem nondet_outcomeSet_bind_congr_and_val_bridge :
+    let S_gap : OutcomeSet ExecFault String Nat :=
+      fun o => o = .ok 3 ∨ o = .gap "nondet_helper"
+    let S_ok : OutcomeSet ExecFault String Nat :=
+      fun o => o = .ok 3 ∨ o = .ok 5
+    let k₁ : Nat → OutcomeSet ExecFault String Nat :=
+      fun v o => o = .ok (v + v) ∨ o = .ok (v + 1)
+    let k₂ : Nat → OutcomeSet ExecFault String Nat :=
+      fun v o => o = .ok (v * 2) ∨ o = .ok (1 + v)
+    OutcomeSetEquiv (GapEqErr (· = ·) (· = ·))
+        (OutcomeSet.bind S_gap k₁) (OutcomeSet.bind S_gap k₂) ∧
+      ProgramEquiv (· = ·) (· = ·)
+        (fun (_ : Unit) => OutcomeSet.bind S_ok k₁)
+        (fun (_ : Unit) => OutcomeSet.bind S_ok k₂) ∧
+      ExactPass
+        (valSemantics (fun (b : Bool) (_ : Unit) =>
+          OutcomeSet.bind S_ok (if b then k₁ else k₂)))
+        (valSemantics (fun (b : Bool) (_ : Unit) =>
+          OutcomeSet.bind S_ok (if b then k₁ else k₂)))
+        id id true false := by
+  dsimp only
+  have hk : ∀ a₁ a₂ : Nat, a₁ = a₂ →
+      OutcomeSetEquiv (GapEqErr (· = ·) (· = ·))
+        (fun o : OutcomeWithGap ExecFault String Nat => o = .ok (a₁ + a₁) ∨ o = .ok (a₁ + 1))
+        (fun o : OutcomeWithGap ExecFault String Nat => o = .ok (a₂ * 2) ∨ o = .ok (1 + a₂)) := by
+    intro a₁ a₂ ha; cases ha
+    constructor
+    · rintro o (rfl | rfl)
+      · exact ⟨.ok (a₁ * 2), Or.inl rfl, (Nat.mul_two a₁).symm⟩
+      · exact ⟨.ok (1 + a₁), Or.inr rfl, Nat.add_comm a₁ 1⟩
+    · rintro o (rfl | rfl)
+      · exact ⟨.ok (a₁ + a₁), Or.inl rfl, (Nat.mul_two a₁).symm⟩
+      · exact ⟨.ok (a₁ + 1), Or.inr rfl, Nat.add_comm a₁ 1⟩
+  have hGap : OutcomeSetEquiv (GapEqErr (· = ·) (· = ·))
+      (OutcomeSet.bind (fun o => o = .ok 3 ∨ o = .gap "nondet_helper")
+        (fun v o => o = .ok (v + v) ∨ o = .ok (v + 1)))
+      (OutcomeSet.bind (fun o => o = .ok 3 ∨ o = .gap "nondet_helper")
+        (fun v o => o = .ok (v * 2) ∨ o = .ok (1 + v))) :=
+    (OutcomeSetEquiv.refl (GapEqErr.refl (fun _ => rfl) (fun _ => rfl)) _).bind_congr hk
+  have hCtxOk : ContextEquiv (· = ·) (· = ·)
+      (fun (_ : Unit) =>
+        OutcomeSet.bind (fun o => o = .ok 3 ∨ o = .ok 5)
+          (fun v o => o = .ok (v + v) ∨ o = .ok (v + 1)))
+      (fun (_ : Unit) =>
+        OutcomeSet.bind (fun o => o = .ok 3 ∨ o = .ok 5)
+          (fun v o => o = .ok (v * 2) ∨ o = .ok (1 + v))) :=
+    fun _ =>
+      (OutcomeSetEquiv.refl (GapEqErr.refl (fun _ => rfl) (fun _ => rfl)) _).bind_congr hk
+  have hGapFree : AllGapFree (fun (_ : Unit) =>
+      OutcomeSet.bind (fun o : OutcomeWithGap ExecFault String Nat => o = .ok 3 ∨ o = .ok 5)
+        (fun v o => o = .ok (v + v) ∨ o = .ok (v + 1))) := by
+    intro _
+    refine (OutcomeSet.neverGap_bind_iff _ _).mpr ⟨?_, ?_⟩
+    · rintro o (rfl | rfl) <;> trivial
+    · rintro v _ o (rfl | rfl) <;> trivial
+  have hProg := hCtxOk.toProgramEquiv hGapFree
+  exact ⟨hGap, hProg, ProgramEquiv.toValExactPass_eq
+    (sem₁ := fun (b : Bool) (_ : Unit) =>
+      OutcomeSet.bind (fun o : OutcomeWithGap ExecFault String Nat => o = .ok 3 ∨ o = .ok 5)
+        (if b then (fun v o => o = .ok (v + v) ∨ o = .ok (v + 1))
+         else (fun v o => o = .ok (v * 2) ∨ o = .ok (1 + v))))
+    (sem₂ := fun (b : Bool) (_ : Unit) =>
+      OutcomeSet.bind (fun o : OutcomeWithGap ExecFault String Nat => o = .ok 3 ∨ o = .ok 5)
+        (if b then (fun v o => o = .ok (v + v) ∨ o = .ok (v + 1))
+         else (fun v o => o = .ok (v * 2) ∨ o = .ok (1 + v))))
+    hProg⟩
+
+/--
+Nondeterministic negative canary: a nondeterministic behavior set that may hit
+a gap `{.ok 1, .gap "site"}` is NEVER `OutcomeSetEquiv` to the gap-free `{.ok 1}`.
+-/
+theorem nondet_gap_branch_not_contextEquiv :
+    ¬ OutcomeSetEquiv (GapEqErr (· = ·) (· = ·))
+      (fun o : OutcomeWithGap ExecFault String Nat => o = .ok 1 ∨ o = .gap "site")
+      (BehaviorSet.singleton (.ok 1)) := by
+  intro h
+  obtain ⟨o₂, ho₂, hr⟩ := h.forward (Or.inr rfl)
+  cases ho₂
+  exact hr
+
 /-! ### Part 5C: Any Callee Environment (`GapEqErr.bind_congr`) -/
 
 /--
@@ -1304,7 +1644,7 @@ the environment's answer with the rest of the run, for every environment.
 -/
 theorem tailCaller_run_false (env : MirCallEnv) (x fuel : Nat) :
     runMirWithGap env [] tailCallerBody (fuel + 2) (callerArgs (false, x)) =
-      (env (extHelperReq x)).bind (fun ans =>
+      ((env (extHelperReq x)).mapFault (fun _ => .ub)).bind (fun ans =>
         runMirStepsWithGap env tailCallerBody fuel (resumeExternalTailCall ans)) :=
   (runGapSteps_succ_of_next (mirGapStep env tailCallerBody)
       (s := .running (initMachineStateWithCallees tailCallerBody
@@ -1318,7 +1658,7 @@ theorem tailCaller_run_false (env : MirCallEnv) (x fuel : Nat) :
 /-- Call-handler law on the refactored caller: the same request and `bind`. -/
 theorem tailCallerRefactored_run_false (env : MirCallEnv) (x fuel : Nat) :
     runMirWithGap env [] tailCallerRefactoredBody (fuel + 2) (callerArgs (false, x)) =
-      (env (extHelperReq x)).bind (fun ans =>
+      ((env (extHelperReq x)).mapFault (fun _ => .ub)).bind (fun ans =>
         runMirStepsWithGap env tailCallerRefactoredBody fuel
           (resumeExternalTailCall ans)) :=
   (runGapSteps_succ_of_next (mirGapStep env tailCallerRefactoredBody)
@@ -1332,8 +1672,9 @@ theorem tailCallerRefactored_run_false (env : MirCallEnv) (x fuel : Nat) :
       (i := .inr (.call (extHelperReq x))) (k := resumeExternalTailCall) rfl fuel)
 
 /--
-For **every** helper summary `f` (returning, faulting, or hitting any gap), the
-baseline's `flag = false` run is `f`'s outcome on the helper request.
+For **every** helper summary `f` (returning, panicking, aborting, UB, or hitting
+any gap), the baseline's `flag = false` run is `f`'s outcome on the helper
+request (with panics and aborts routed through `resumeExternalTailCall`).
 -/
 theorem tailCaller_run_false_pure
     (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
@@ -1343,9 +1684,12 @@ theorem tailCaller_run_false_pure
   show runMirWithGap (MirCallEnv.ofPure f) [] tailCallerBody (1 + 2)
     (callerArgs (false, x)) = _
   rw [tailCaller_run_false]
-  show ((f "test::ext_helper" [.scalar ⟨x, 4⟩]).map
-    (fun v => MirCallAns.returned v unlinkedMemory)).bind _ = _
-  cases f "test::ext_helper" [.scalar ⟨x, 4⟩] <;> rfl
+  unfold MirCallEnv.ofPure extHelperReq
+  dsimp only
+  cases f "test::ext_helper" [.scalar ⟨x, 4⟩] with
+  | ok v => rfl
+  | fault e => cases e <;> rfl
+  | gap g => rfl
 
 theorem tailCallerRefactored_run_false_pure
     (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
@@ -1355,9 +1699,12 @@ theorem tailCallerRefactored_run_false_pure
   show runMirWithGap (MirCallEnv.ofPure f) [] tailCallerRefactoredBody (1 + 2)
     (callerArgs (false, x)) = _
   rw [tailCallerRefactored_run_false]
-  show ((f "test::ext_helper" [.scalar ⟨x, 4⟩]).map
-    (fun v => MirCallAns.returned v unlinkedMemory)).bind _ = _
-  cases f "test::ext_helper" [.scalar ⟨x, 4⟩] <;> rfl
+  unfold MirCallEnv.ofPure extHelperReq
+  dsimp only
+  cases f "test::ext_helper" [.scalar ⟨x, 4⟩] with
+  | ok v => rfl
+  | fault e => cases e <;> rfl
+  | gap g => rfl
 
 theorem tailCaller_run_true
     (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
@@ -1393,6 +1740,76 @@ theorem tailCallerRefactored_gapEqErr_any_helper
     show GapEqErr _ _ _ (tailRun f tailCallerRefactoredBody 3 (false, x))
     rw [tailCaller_run_false_pure, tailCallerRefactored_run_false_pure]
     exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+
+/--
+Fuel-free `ContextEquiv` for **every** stack-preserving callee environment
+`env : MirCallEnv` (returning with arbitrary heap memory, panicking, aborting,
+UB, or hitting any gap), proved directly by stuttering congruence
+(`gapBehaviors_equiv_of_stutter`) with no fuel-budget asymmetry.
+-/
+theorem tailCallerRefactored_contextEquiv_any_env (env : MirCallEnv)
+    (hStackRet : ∀ x v mem,
+      env (extHelperReq x) = .ok (.returned v mem) → mem.callStack = [])
+    (hStackPanic : ∀ x mem,
+      env (extHelperReq x) = .ok (.panicked mem) → mem.callStack = []) :
+    ContextEquiv (· = ·) (· = ·)
+      (fun q : Bool × Nat => mirGapBehaviors env [] tailCallerBody (callerArgs q))
+      (fun q : Bool × Nat =>
+        mirGapBehaviors env [] tailCallerRefactoredBody (callerArgs q)) := by
+  intro ⟨flag, x⟩
+  cases flag with
+  | true =>
+    have h₁ : runMirWithGap env [] tailCallerBody 3 (callerArgs (true, x)) =
+        .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, unlinkedMemory) :=
+      rfl
+    have h₂ : runMirWithGap env [] tailCallerRefactoredBody 5 (callerArgs (true, x)) =
+        .ok (.scalar ⟨wrapScalarBits (x * 2) (scalarModulus 4), 4⟩, unlinkedMemory) :=
+      rfl
+    refine mirGapBehaviors_equiv_of_runs (fuel₂ := 5)
+      (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) ?_
+    rw [h₁, h₂, Nat.mul_two]
+    exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+  | false =>
+    let s₁₀ : MirExecState :=
+      .running (initMachineStateWithCallees tailCallerBody (callerArgs (false, x)) [])
+    let s₂₀ : MirExecState :=
+      .running (initMachineStateWithCallees tailCallerRefactoredBody
+        (callerArgs (false, x)) [])
+    let R : MirExecState → MirExecState → Prop :=
+      fun a b => (a = s₁₀ ∧ b = s₂₀) ∨ ∃ out, a = .halted out ∧ b = .halted out
+    refine gapBehaviors_equiv_of_stutter (R := R) ?_ (Or.inl ⟨rfl, rfl⟩)
+    intro a b hR
+    rcases hR with ⟨rfl, rfl⟩ | ⟨out, rfl, rfl⟩
+    · refine ⟨1, 1, .running (tailCallerAtCall tailCallerBody x),
+        .running (tailCallerAtCall tailCallerRefactoredBody x),
+        .step rfl (.refl _), .step rfl (.refl _), ?_⟩
+      unfold mirGapStep
+      rw [gapStep_of_vis (step := stepMirState tailCallerBody)
+            (site := mirGapSite tailCallerBody) (handle := mirGapHandle env)
+            (i := .inr (.call (extHelperReq x))) (k := resumeExternalTailCall) rfl,
+          gapStep_of_vis (step := stepMirState tailCallerRefactoredBody)
+            (site := mirGapSite tailCallerRefactoredBody) (handle := mirGapHandle env)
+            (i := .inr (.call (extHelperReq x))) (k := resumeExternalTailCall) rfl]
+      dsimp only [mirGapHandle]
+      cases he : env (extHelperReq x) with
+      | ok ans =>
+        cases ans with
+        | returned v mem =>
+          have hcs := hStackRet x v mem he
+          dsimp only [OutcomeWithGap.mapFault, GapStep.Rel, resumeExternalTailCall]
+          rw [hcs]
+          exact Or.inr ⟨.normal (v, mem), rfl, rfl⟩
+        | panicked mem =>
+          have hcs := hStackPanic x mem he
+          dsimp only [OutcomeWithGap.mapFault, GapStep.Rel, resumeExternalTailCall]
+          rw [hcs]
+          exact Or.inr ⟨.panic, rfl, rfl⟩
+        | aborted =>
+          exact Or.inr ⟨.abort, rfl, rfl⟩
+      | fault f => exact (rfl : ExecFault.ub = ExecFault.ub)
+      | gap g => exact (rfl : g = g)
+    · exact ⟨0, 0, .halted out, .halted out, .refl _, .refl _,
+        GapEqErr.refl (fun _ => rfl) (fun _ => rfl) (classifyOutcome out)⟩
 
 /--
 Summary of the unmodeled helper obtained by *running* `unsupportedHelperBody`:
@@ -1431,6 +1848,311 @@ theorem tailCaller_run_false_unresolved (x : Nat) :
           (callerArgs (false, x)) =
         .gap (.unresolved "test::ext_helper") :=
   ⟨rfl, rfl⟩
+
+/-! ### Part 5D: Sequential Non-Tail Call + Refactored Continuation (`GapEqErr.bind_congr` & `mirGapBehaviors_env_congr`) -/
+
+/--
+Sequential caller using non-tail `TerminatorKind.call` with a post-call
+continuation:
+`fn seq_caller(x: u32) -> u32 { let y = ext_helper(x); y + y }`.
+-/
+def seqCallerBody : CapturedMir :=
+  mkMirBody "test::seq_caller" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy, mkDecl .mut u32MirTy]
+    [ { statements := [mkStmt (.storageLive 2)]
+        terminator := mkTerm
+          (.call (fnItemOp "test::ext_helper") [.copy (locPlace 1)]
+            (locPlace 2) (some 1) .continue_)
+        isCleanup := false },
+      { statements :=
+          [mkStmt (.assign (locPlace 0)
+            (.binaryOp .add (.copy (locPlace 2)) (.copy (locPlace 2))))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/--
+Refactored sequential caller with a different post-call continuation
+(`StorageLive(_3); _3 = y * 2; _0 = copy _3; return`, taking two extra steps):
+`fn seq_caller_refactored(x: u32) -> u32 { let y = ext_helper(x); let t = y * 2; t }`.
+-/
+def seqCallerRefactoredBody : CapturedMir :=
+  mkMirBody "test::seq_caller_refactored" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy, mkDecl .mut u32MirTy,
+     mkDecl .mut u32MirTy]
+    [ { statements := [mkStmt (.storageLive 2)]
+        terminator := mkTerm
+          (.call (fnItemOp "test::ext_helper") [.copy (locPlace 1)]
+            (locPlace 2) (some 1) .continue_)
+        isCleanup := false },
+      { statements :=
+          [mkStmt (.storageLive 3),
+           mkStmt (.assign (locPlace 3)
+             (.binaryOp .mul (.copy (locPlace 2)) (u32ConstOp 2))),
+           mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 3))))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/-- Machine state of `seqCallerBody` right at the external call terminator. -/
+def seqCallerAtCall (body : CapturedMir) (x : Nat) : MachineState :=
+  let init := initMachineState body [.scalar ⟨x, 4⟩]
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := 1
+        locals := init.frame.locals.set 2 .uninit }
+    memory := init.memory }
+
+/--
+Call-handler law for `seqCallerBody`: the bounded run is literally the monadic
+`bind` of the external helper's outcome with the post-call continuation.
+-/
+theorem seqCaller_run_eq_bind (env : MirCallEnv) (x fuel : Nat) :
+    runMirWithGap env [] seqCallerBody (fuel + 2) [.scalar ⟨x, 4⟩] =
+      ((env (extHelperReq x)).mapFault (fun _ => .ub)).bind (fun ans =>
+        runMirStepsWithGap env seqCallerBody fuel
+          (resumeExternalCall (seqCallerAtCall seqCallerBody x)
+            (seqCallerAtCall seqCallerBody x).frame.locals
+            (locPlace 2) 1 .continue_ ans)) :=
+  (runGapSteps_succ_of_next (mirGapStep env seqCallerBody)
+      (s := .running (initMachineStateWithCallees seqCallerBody [.scalar ⟨x, 4⟩] []))
+      (s' := .running (seqCallerAtCall seqCallerBody x)) rfl (fuel + 1)).trans
+    (runStepsWithGap_of_vis (step := stepMirState seqCallerBody)
+      (site := mirGapSite seqCallerBody) (handle := mirGapHandle env)
+      (s := .running (seqCallerAtCall seqCallerBody x))
+      (i := .inr (.call (extHelperReq x)))
+      (k := resumeExternalCall (seqCallerAtCall seqCallerBody x)
+        (seqCallerAtCall seqCallerBody x).frame.locals
+        (locPlace 2) 1 .continue_)
+      rfl fuel)
+
+/-- Call-handler law for `seqCallerRefactoredBody`: same request, different continuation. -/
+theorem seqCallerRefactored_run_eq_bind (env : MirCallEnv) (x fuel : Nat) :
+    runMirWithGap env [] seqCallerRefactoredBody (fuel + 2) [.scalar ⟨x, 4⟩] =
+      ((env (extHelperReq x)).mapFault (fun _ => .ub)).bind (fun ans =>
+        runMirStepsWithGap env seqCallerRefactoredBody fuel
+          (resumeExternalCall (seqCallerAtCall seqCallerRefactoredBody x)
+            (seqCallerAtCall seqCallerRefactoredBody x).frame.locals
+            (locPlace 2) 1 .continue_ ans)) :=
+  (runGapSteps_succ_of_next (mirGapStep env seqCallerRefactoredBody)
+      (s := .running (initMachineStateWithCallees seqCallerRefactoredBody [.scalar ⟨x, 4⟩] []))
+      (s' := .running (seqCallerAtCall seqCallerRefactoredBody x)) rfl (fuel + 1)).trans
+    (runStepsWithGap_of_vis (step := stepMirState seqCallerRefactoredBody)
+      (site := mirGapSite seqCallerRefactoredBody) (handle := mirGapHandle env)
+      (s := .running (seqCallerAtCall seqCallerRefactoredBody x))
+      (i := .inr (.call (extHelperReq x)))
+      (k := resumeExternalCall (seqCallerAtCall seqCallerRefactoredBody x)
+        (seqCallerAtCall seqCallerRefactoredBody x).frame.locals
+        (locPlace 2) 1 .continue_)
+      rfl fuel)
+
+/--
+Post-call continuation agreement via `GapEqErr.bind_congr`: for **every**
+`u32`-returning, panicking, aborting, UB, or gap-producing pure helper summary
+`f`, the baseline continuation (`y + y`, 3 post-call steps) and the refactored
+continuation (`let t = y * 2; t`, 5 post-call steps) are `GapEqErr`-related.
+When `f` hits a gap, `GapEqErr.bind_congr` matches both runs without executing
+either continuation.
+-/
+theorem seqCallerRefactored_gapEqErr_via_bind_congr
+    (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
+    (hU32 : ∀ x v, f "test::ext_helper" [.scalar ⟨x, 4⟩] = .ok v →
+      ∃ y, v = .scalar ⟨y, 4⟩)
+    (x : Nat) :
+    GapEqErr (· = ·) (· = ·)
+      (runMirWithGap (MirCallEnv.ofPure f) [] seqCallerBody 5 [.scalar ⟨x, 4⟩])
+      (runMirWithGap (MirCallEnv.ofPure f) [] seqCallerRefactoredBody 7 [.scalar ⟨x, 4⟩]) := by
+  show GapEqErr (· = ·) (· = ·)
+    (runMirWithGap (MirCallEnv.ofPure f) [] seqCallerBody (3 + 2) [.scalar ⟨x, 4⟩])
+    (runMirWithGap (MirCallEnv.ofPure f) [] seqCallerRefactoredBody (5 + 2) [.scalar ⟨x, 4⟩])
+  rw [seqCaller_run_eq_bind, seqCallerRefactored_run_eq_bind]
+  refine GapEqErr.bind_congr
+    (rVal := fun a₁ a₂ => a₁ = a₂ ∧
+      ((∃ y, a₁ = .returned (.scalar ⟨y, 4⟩) unlinkedMemory) ∨
+       a₁ = .panicked unlinkedMemory ∨ a₁ = .aborted))
+    ?_ ?_
+  · unfold MirCallEnv.ofPure extHelperReq
+    cases hf : f "test::ext_helper" [.scalar ⟨x, 4⟩] with
+    | ok v =>
+      obtain ⟨y, rfl⟩ := hU32 x v hf
+      exact ⟨rfl, Or.inl ⟨y, rfl⟩⟩
+    | fault e =>
+      cases e with
+      | ub => exact (rfl : ExecFault.ub = ExecFault.ub)
+      | panic => exact ⟨rfl, Or.inr (Or.inl rfl)⟩
+      | abort => exact ⟨rfl, Or.inr (Or.inr rfl)⟩
+    | gap g => exact (rfl : g = g)
+  · rintro a₁ a₂ ⟨rfl, ⟨y, rfl⟩ | rfl | rfl⟩
+    · change GapEqErr (· = ·) (· = ·)
+        (OutcomeWithGap.ok
+          (Value.scalar ⟨wrapScalarBits (y + y) (scalarModulus 4), 4⟩, unlinkedMemory))
+        (OutcomeWithGap.ok
+          (Value.scalar ⟨wrapScalarBits (y * 2) (scalarModulus 4), 4⟩, unlinkedMemory))
+      rw [Nat.mul_two]
+      exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+    · exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl)
+        (OutcomeWithGap.fault ExecFault.panic)
+    · exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl)
+        (OutcomeWithGap.fault ExecFault.abort)
+
+/--
+Fuel-free `ContextEquiv` for sequential non-tail callers over all `x : Nat` and
+all `u32`-typed helper summaries `f` (including unmodeled/gapping helpers!).
+-/
+theorem seqCallerRefactored_contextEquiv_any_pure
+    (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
+    (hU32 : ∀ x v, f "test::ext_helper" [.scalar ⟨x, 4⟩] = .ok v →
+      ∃ y, v = .scalar ⟨y, 4⟩)
+    (hNoOOF : ∀ x, f "test::ext_helper" [.scalar ⟨x, 4⟩] ≠ .gap .outOfFuel) :
+    ContextEquiv (· = ·) (· = ·)
+      (fun x : Nat =>
+        mirGapBehaviors (MirCallEnv.ofPure f) [] seqCallerBody [.scalar ⟨x, 4⟩])
+      (fun x : Nat =>
+        mirGapBehaviors (MirCallEnv.ofPure f) [] seqCallerRefactoredBody [.scalar ⟨x, 4⟩]) := by
+  intro x
+  have hne : runMirWithGap (MirCallEnv.ofPure f) [] seqCallerBody 5 [.scalar ⟨x, 4⟩] ≠
+      .gap .outOfFuel := by
+    show runMirWithGap (MirCallEnv.ofPure f) [] seqCallerBody (3 + 2) [.scalar ⟨x, 4⟩] ≠ _
+    rw [seqCaller_run_eq_bind]
+    unfold MirCallEnv.ofPure extHelperReq
+    cases hf : f "test::ext_helper" [.scalar ⟨x, 4⟩] with
+    | ok v =>
+      obtain ⟨y, rfl⟩ := hU32 x v hf
+      exact fun h₀ => by cases h₀
+    | fault e =>
+      cases e <;> exact fun h₀ => by cases h₀
+    | gap g =>
+      intro h₀
+      change OutcomeWithGap.gap g = OutcomeWithGap.gap GapTag.outOfFuel at h₀
+      cases OutcomeWithGap.gap.inj h₀
+      exact hNoOOF x hf
+  exact mirGapBehaviors_equiv_of_runs hne
+    (seqCallerRefactored_gapEqErr_via_bind_congr f hU32 x)
+
+/-- Concrete gap-free pure helper: `x ↦ x + 1 (mod 2^32)`. -/
+def incHelperSummary (_ : DefPath) (args : List Value) :
+    OutcomeWithGap ExecFault (GapTag DefPath) Value :=
+  match args with
+  | [.scalar ⟨x, 4⟩] => .ok (.scalar ⟨wrapScalarBits (x + 1) (scalarModulus 4), 4⟩)
+  | _ => .fault .ub
+
+/-- Refactored pure helper: `x ↦ 1 + x (mod 2^32)`. -/
+def incHelperRefactoredSummary (_ : DefPath) (args : List Value) :
+    OutcomeWithGap ExecFault (GapTag DefPath) Value :=
+  match args with
+  | [.scalar ⟨x, 4⟩] => .ok (.scalar ⟨wrapScalarBits (1 + x) (scalarModulus 4), 4⟩)
+  | _ => .fault .ub
+
+private theorem incHelperSummary_eq_refactored (dp : DefPath) (args : List Value) :
+    incHelperSummary dp args = incHelperRefactoredSummary dp args := by
+  unfold incHelperSummary incHelperRefactoredSummary
+  cases args with
+  | nil => rfl
+  | cons a rest =>
+    cases a with
+    | scalar sc =>
+      cases sc with
+      | mk bits sz =>
+        cases sz with
+        | zero => rfl
+        | succ sz1 =>
+          cases sz1 with
+          | zero => rfl
+          | succ sz2 =>
+            cases sz2 with
+            | zero => rfl
+            | succ sz3 =>
+              cases sz3 with
+              | zero => rfl
+              | succ sz4 =>
+                cases sz4 with
+                | zero =>
+                  cases rest with
+                  | nil =>
+                    change OutcomeWithGap.ok
+                        (Value.scalar ⟨wrapScalarBits (bits + 1) (scalarModulus 4), 4⟩) =
+                      OutcomeWithGap.ok
+                        (Value.scalar ⟨wrapScalarBits (1 + bits) (scalarModulus 4), 4⟩)
+                    rw [Nat.add_comm bits 1]
+                  | cons _ _ => rfl
+                | succ _ => rfl
+    | unit => rfl
+    | ptr _ _ => rfl
+    | aggregate _ _ => rfl
+
+/--
+Full modular composition canary:
+1. Refactoring the sequential caller (`seqCallerBody → seqCallerRefactoredBody`)
+   and refactoring the callee environment (`incHelperSummary →
+   incHelperRefactoredSummary`) compose via `ContextEquiv.trans` and
+   `mirGapBehaviors_env_congr`;
+2. Because `incHelperSummary` is gap-free, `ContextEquiv.toProgramEquiv`
+   upgrades the composed equivalence to full gap-free `ProgramEquiv` across all
+   `x : Nat`; and
+3. Against `unmodeledHelperSummary`, `ContextEquiv` still holds with zero
+   gap-freedom proof for the helper!
+-/
+theorem seqCallerRefactored_modular_composition_and_upgrade :
+    ProgramEquiv (· = ·) (· = ·)
+        (fun x : Nat =>
+          mirGapBehaviors (MirCallEnv.ofPure incHelperSummary) []
+            seqCallerBody [.scalar ⟨x, 4⟩])
+        (fun x : Nat =>
+          mirGapBehaviors (MirCallEnv.ofPure incHelperRefactoredSummary) []
+            seqCallerRefactoredBody [.scalar ⟨x, 4⟩]) ∧
+      ContextEquiv (· = ·) (· = ·)
+        (fun x : Nat =>
+          mirGapBehaviors (MirCallEnv.ofPure unmodeledHelperSummary) []
+            seqCallerBody [.scalar ⟨x, 4⟩])
+        (fun x : Nat =>
+          mirGapBehaviors (MirCallEnv.ofPure unmodeledHelperSummary) []
+            seqCallerRefactoredBody [.scalar ⟨x, 4⟩]) := by
+  have hCallerInc : ContextEquiv (· = ·) (· = ·)
+      (fun x : Nat =>
+        mirGapBehaviors (MirCallEnv.ofPure incHelperSummary) []
+          seqCallerBody [.scalar ⟨x, 4⟩])
+      (fun x : Nat =>
+        mirGapBehaviors (MirCallEnv.ofPure incHelperSummary) []
+          seqCallerRefactoredBody [.scalar ⟨x, 4⟩]) :=
+    seqCallerRefactored_contextEquiv_any_pure incHelperSummary
+      (fun x v hv => by cases hv; exact ⟨_, rfl⟩)
+      (fun x h => by cases h)
+  have hEnv : ∀ req, GapEqErr (· = ·) (· = ·)
+      (MirCallEnv.ofPure incHelperSummary req)
+      (MirCallEnv.ofPure incHelperRefactoredSummary req) := fun req => by
+    unfold MirCallEnv.ofPure
+    rw [incHelperSummary_eq_refactored]
+    exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+  have hCallee : ContextEquiv (· = ·) (· = ·)
+      (fun x : Nat =>
+        mirGapBehaviors (MirCallEnv.ofPure incHelperSummary) []
+          seqCallerRefactoredBody [.scalar ⟨x, 4⟩])
+      (fun x : Nat =>
+        mirGapBehaviors (MirCallEnv.ofPure incHelperRefactoredSummary) []
+          seqCallerRefactoredBody [.scalar ⟨x, 4⟩]) :=
+    fun x => mirGapBehaviors_env_congr hEnv [.scalar ⟨x, 4⟩]
+  have hComposed := ContextEquiv.trans
+    (fun _ _ _ h₁ h₂ => h₁.trans h₂) (fun _ _ _ h₁ h₂ => h₁.trans h₂)
+    hCallerInc hCallee
+  have hGapFree : AllGapFree (fun x : Nat =>
+      mirGapBehaviors (MirCallEnv.ofPure incHelperSummary) []
+        seqCallerBody [.scalar ⟨x, 4⟩]) := fun x => by
+    have hrun : (runMirWithGap (MirCallEnv.ofPure incHelperSummary) []
+        seqCallerBody 5 [.scalar ⟨x, 4⟩]).isGapFree := by
+      show (runMirWithGap (MirCallEnv.ofPure incHelperSummary) []
+        seqCallerBody (3 + 2) [.scalar ⟨x, 4⟩]).isGapFree
+      rw [seqCaller_run_eq_bind]
+      exact trivial
+    exact neverGap_mirGapBehaviors_of_run hrun
+  have hUnmodeled : ContextEquiv (· = ·) (· = ·)
+      (fun x : Nat =>
+        mirGapBehaviors (MirCallEnv.ofPure unmodeledHelperSummary) []
+          seqCallerBody [.scalar ⟨x, 4⟩])
+      (fun x : Nat =>
+        mirGapBehaviors (MirCallEnv.ofPure unmodeledHelperSummary) []
+          seqCallerRefactoredBody [.scalar ⟨x, 4⟩]) :=
+    seqCallerRefactored_contextEquiv_any_pure unmodeledHelperSummary
+      (fun x v hv => by rw [unmodeledHelperSummary_eq] at hv; cases hv)
+      (fun x h => by rw [unmodeledHelperSummary_eq] at h; cases h)
+  exact ⟨hComposed.toProgramEquiv hGapFree, hUnmodeled⟩
 
 end GapPreservingCanaries
 

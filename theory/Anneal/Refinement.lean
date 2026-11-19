@@ -562,6 +562,7 @@ instance instDecidableIsGapFree :
 instance : Monad (OutcomeWithGap Fault Gap) where
   pure := .ok
   bind := bind
+  map := map
 
 @[simp]
 theorem bind_ok {Val' : Type uV'} (v : Val)
@@ -674,6 +675,36 @@ theorem isGapFree_mapFault_iff {Fault' : Type uF'} (f : Fault → Fault')
     (m.mapFault f).isGapFree ↔ m.isGapFree := by
   cases m <;> exact Iff.rfl
 
+@[simp]
+theorem isGapFree_mapGap_iff {Gap' : Type uG'} (f : Gap → Gap')
+    (m : OutcomeWithGap Fault Gap Val) :
+    (m.mapGap f).isGapFree ↔ m.isGapFree := by
+  cases m <;> exact Iff.rfl
+
+theorem mapFault_mapFault {Fault' : Type uF'} {Fault'' : Type uF''}
+    (f : Fault → Fault') (g : Fault' → Fault'')
+    (m : OutcomeWithGap Fault Gap Val) :
+    (m.mapFault f).mapFault g = m.mapFault (fun e => g (f e)) := by
+  cases m <;> rfl
+
+theorem mapGap_mapGap {Gap' : Type uG'} {Gap'' : Type uG''}
+    (f : Gap → Gap') (g : Gap' → Gap'')
+    (m : OutcomeWithGap Fault Gap Val) :
+    (m.mapGap f).mapGap g = m.mapGap (fun x => g (f x)) := by
+  cases m <;> rfl
+
+theorem mapFault_bind {Fault' : Type uF'} {Val' : Type uV'} (f : Fault → Fault')
+    (m : OutcomeWithGap Fault Gap Val)
+    (k : Val → OutcomeWithGap Fault Gap Val') :
+    (m.bind k).mapFault f = (m.mapFault f).bind (fun v => (k v).mapFault f) := by
+  cases m <;> rfl
+
+theorem mapGap_bind {Gap' : Type uG'} {Val' : Type uV'} (f : Gap → Gap')
+    (m : OutcomeWithGap Fault Gap Val)
+    (k : Val → OutcomeWithGap Fault Gap Val') :
+    (m.bind k).mapGap f = (m.mapGap f).bind (fun v => (k v).mapGap f) := by
+  cases m <;> rfl
+
 /--
 Definedness of a single outcome relative to `isUB`: values and defined runtime
 faults (panics, aborts) are defined; UB faults and gaps are not.
@@ -683,12 +714,45 @@ def isDefined (isUB : Fault → Prop) : OutcomeWithGap Fault Gap Val → Prop
   | .fault e => ¬ isUB e
   | .gap _ => False
 
+@[simp]
+theorem isDefined_ok {isUB : Fault → Prop} (v : Val) :
+    (OutcomeWithGap.ok v : OutcomeWithGap Fault Gap Val).isDefined isUB := trivial
+
+@[simp]
+theorem isDefined_fault_iff {isUB : Fault → Prop} (e : Fault) :
+    (OutcomeWithGap.fault e : OutcomeWithGap Fault Gap Val).isDefined isUB ↔
+      ¬ isUB e := Iff.rfl
+
+@[simp]
+theorem not_isDefined_gap {isUB : Fault → Prop} (g : Gap) :
+    ¬ (OutcomeWithGap.gap g : OutcomeWithGap Fault Gap Val).isDefined isUB :=
+  fun h => h
+
 theorem isDefined.isGapFree {isUB : Fault → Prop}
     {o : OutcomeWithGap Fault Gap Val} (h : o.isDefined isUB) : o.isGapFree := by
   cases o with
   | ok v => trivial
   | fault e => trivial
   | gap g => exact h
+
+@[simp]
+theorem isDefined_map_iff {Val' : Type uV'} {isUB : Fault → Prop}
+    (f : Val → Val') (m : OutcomeWithGap Fault Gap Val) :
+    (m.map f).isDefined isUB ↔ m.isDefined isUB := by
+  cases m <;> exact Iff.rfl
+
+theorem isDefined_bind_iff {Val' : Type uV'} {isUB : Fault → Prop}
+    (m : OutcomeWithGap Fault Gap Val)
+    (k : Val → OutcomeWithGap Fault Gap Val') :
+    (m.bind k).isDefined isUB ↔
+      m.isDefined isUB ∧ ∀ v, m = .ok v → (k v).isDefined isUB := by
+  cases m with
+  | ok v =>
+    exact ⟨fun h => ⟨trivial, fun v' hv => by cases hv; exact h⟩,
+      fun h => h.2 v rfl⟩
+  | fault e =>
+    exact ⟨fun h => ⟨h, fun _ hv => by cases hv⟩, fun h => h.1⟩
+  | gap g => exact ⟨fun h => False.elim h, fun h => h.1⟩
 
 end OutcomeWithGap
 
@@ -952,6 +1016,39 @@ theorem map_congr {ValB₁ : Type uV''} {ValB₂ : Type uP}
     | exact hm
     | exact False.elim hm
 
+theorem mapFault_congr {FaultB₁ : Type uF''} {FaultB₂ : Type uP}
+    {rFaultB : FaultB₁ → FaultB₂ → Prop}
+    {f₁ : Fault₁ → FaultB₁} {f₂ : Fault₂ → FaultB₂}
+    {m₁ : OutcomeWithGap Fault₁ Gap Val₁} {m₂ : OutcomeWithGap Fault₂ Gap Val₂}
+    (hm : GapEqErr rVal rFault m₁ m₂)
+    (hf : ∀ e₁ e₂, rFault e₁ e₂ → rFaultB (f₁ e₁) (f₂ e₂)) :
+    GapEqErr rVal rFaultB (m₁.mapFault f₁) (m₂.mapFault f₂) := by
+  cases m₁ <;> cases m₂ <;>
+    first
+    | exact hf _ _ hm
+    | exact hm
+    | exact False.elim hm
+
+theorem mapGap_congr {Gap' : Type uG'} (f : Gap → Gap')
+    {m₁ : OutcomeWithGap Fault₁ Gap Val₁} {m₂ : OutcomeWithGap Fault₂ Gap Val₂}
+    (hm : GapEqErr rVal rFault m₁ m₂) :
+    GapEqErr rVal rFault (m₁.mapGap f) (m₂.mapGap f) := by
+  cases m₁ <;> cases m₂ <;>
+    first
+    | exact congrArg f hm
+    | exact hm
+    | exact False.elim hm
+
+theorem mapGap_iff_of_injective {Gap' : Type uG'} {f : Gap → Gap'}
+    (hinj : ∀ g₁ g₂, f g₁ = f g₂ → g₁ = g₂)
+    {m₁ : OutcomeWithGap Fault₁ Gap Val₁} {m₂ : OutcomeWithGap Fault₂ Gap Val₂} :
+    GapEqErr rVal rFault (m₁.mapGap f) (m₂.mapGap f) ↔
+      GapEqErr rVal rFault m₁ m₂ := by
+  cases m₁ <;> cases m₂ <;>
+    first
+    | exact Iff.rfl
+    | exact ⟨fun h => hinj _ _ h, fun h => congrArg f h⟩
+
 /-- Related outcomes agree on definedness when `rFault` preserves UB-ness. -/
 theorem isDefined_iff {isUB₁ : Fault₁ → Prop} {isUB₂ : Fault₂ → Prop}
     (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
@@ -1004,6 +1101,124 @@ namespace GapForbidEq
 variable {Fault₁ : Type uF} {Fault₂ : Type uF'} {Gap₁ : Type uG} {Gap₂ : Type uG'}
   {Val₁ : Type uV} {Val₂ : Type uV'}
   {rVal : Val₁ → Val₂ → Prop} {rFault : Fault₁ → Fault₂ → Prop}
+
+instance instDecidable
+    [∀ v₁ v₂, Decidable (rVal v₁ v₂)] [∀ e₁ e₂, Decidable (rFault e₁ e₂)] :
+    (o₁ : OutcomeWithGap Fault₁ Gap₁ Val₁) → (o₂ : OutcomeWithGap Fault₂ Gap₂ Val₂) →
+      Decidable (GapForbidEq rVal rFault o₁ o₂)
+  | .ok v₁, .ok v₂ => inferInstanceAs (Decidable (rVal v₁ v₂))
+  | .fault e₁, .fault e₂ => inferInstanceAs (Decidable (rFault e₁ e₂))
+  | .ok _, .fault _ => isFalse (fun h => h)
+  | .ok _, .gap _ => isFalse (fun h => h)
+  | .fault _, .ok _ => isFalse (fun h => h)
+  | .fault _, .gap _ => isFalse (fun h => h)
+  | .gap _, .ok _ => isFalse (fun h => h)
+  | .gap _, .fault _ => isFalse (fun h => h)
+  | .gap _, .gap _ => isFalse (fun h => h)
+
+@[simp]
+theorem ok_ok_iff {v₁ : Val₁} {v₂ : Val₂} :
+    GapForbidEq (Gap₁ := Gap₁) (Gap₂ := Gap₂) rVal rFault (.ok v₁) (.ok v₂) ↔
+      rVal v₁ v₂ := Iff.rfl
+
+@[simp]
+theorem fault_fault_iff {e₁ : Fault₁} {e₂ : Fault₂} :
+    GapForbidEq (Gap₁ := Gap₁) (Gap₂ := Gap₂) rVal rFault (.fault e₁) (.fault e₂) ↔
+      rFault e₁ e₂ := Iff.rfl
+
+theorem refl {Fault : Type uF} {Gap : Type uG} {Val : Type uV}
+    {rVal : Val → Val → Prop} {rFault : Fault → Fault → Prop}
+    (hVal : ∀ v, rVal v v) (hFault : ∀ e, rFault e e)
+    {o : OutcomeWithGap Fault Gap Val} (hgf : o.isGapFree) :
+    GapForbidEq rVal rFault o o := by
+  cases o with
+  | ok v => exact hVal v
+  | fault e => exact hFault e
+  | gap g => exact False.elim hgf
+
+theorem symm {Fault : Type uF} {Gap : Type uG} {Val : Type uV}
+    {rVal : Val → Val → Prop} {rFault : Fault → Fault → Prop}
+    (hVal : ∀ a b, rVal a b → rVal b a) (hFault : ∀ a b, rFault a b → rFault b a)
+    {o₁ o₂ : OutcomeWithGap Fault Gap Val} (h : GapForbidEq rVal rFault o₁ o₂) :
+    GapForbidEq rVal rFault o₂ o₁ := by
+  cases o₁ <;> cases o₂ <;>
+    first
+    | exact hVal _ _ h
+    | exact hFault _ _ h
+    | exact h
+
+theorem trans {Fault : Type uF} {Gap : Type uG} {Val : Type uV}
+    {rVal : Val → Val → Prop} {rFault : Fault → Fault → Prop}
+    (hVal : ∀ a b c, rVal a b → rVal b c → rVal a c)
+    (hFault : ∀ a b c, rFault a b → rFault b c → rFault a c)
+    {o₁ o₂ o₃ : OutcomeWithGap Fault Gap Val}
+    (h₁₂ : GapForbidEq rVal rFault o₁ o₂) (h₂₃ : GapForbidEq rVal rFault o₂ o₃) :
+    GapForbidEq rVal rFault o₁ o₃ := by
+  cases o₁ <;> cases o₂ <;> cases o₃ <;>
+    first
+    | exact hVal _ _ _ h₁₂ h₂₃
+    | exact hFault _ _ _ h₁₂ h₂₃
+    | exact False.elim h₁₂
+    | exact False.elim h₂₃
+
+theorem bind_congr {ValB₁ : Type uV''} {ValB₂ : Type uP}
+    {rValB : ValB₁ → ValB₂ → Prop}
+    {m₁ : OutcomeWithGap Fault₁ Gap₁ Val₁} {m₂ : OutcomeWithGap Fault₂ Gap₂ Val₂}
+    {k₁ : Val₁ → OutcomeWithGap Fault₁ Gap₁ ValB₁}
+    {k₂ : Val₂ → OutcomeWithGap Fault₂ Gap₂ ValB₂}
+    (hm : GapForbidEq rVal rFault m₁ m₂)
+    (hk : ∀ a₁ a₂, rVal a₁ a₂ → GapForbidEq rValB rFault (k₁ a₁) (k₂ a₂)) :
+    GapForbidEq rValB rFault (m₁.bind k₁) (m₂.bind k₂) := by
+  cases m₁ <;> cases m₂ <;>
+    first
+    | exact hk _ _ hm
+    | exact hm
+    | exact False.elim hm
+
+theorem map_congr {ValB₁ : Type uV''} {ValB₂ : Type uP}
+    {rValB : ValB₁ → ValB₂ → Prop} {f₁ : Val₁ → ValB₁} {f₂ : Val₂ → ValB₂}
+    {m₁ : OutcomeWithGap Fault₁ Gap₁ Val₁} {m₂ : OutcomeWithGap Fault₂ Gap₂ Val₂}
+    (hm : GapForbidEq rVal rFault m₁ m₂)
+    (hf : ∀ a₁ a₂, rVal a₁ a₂ → rValB (f₁ a₁) (f₂ a₂)) :
+    GapForbidEq rValB rFault (m₁.map f₁) (m₂.map f₂) := by
+  cases m₁ <;> cases m₂ <;>
+    first
+    | exact hf _ _ hm
+    | exact hm
+    | exact False.elim hm
+
+theorem mapFault_congr {FaultB₁ : Type uF''} {FaultB₂ : Type uP}
+    {rFaultB : FaultB₁ → FaultB₂ → Prop}
+    {f₁ : Fault₁ → FaultB₁} {f₂ : Fault₂ → FaultB₂}
+    {m₁ : OutcomeWithGap Fault₁ Gap₁ Val₁} {m₂ : OutcomeWithGap Fault₂ Gap₂ Val₂}
+    (hm : GapForbidEq rVal rFault m₁ m₂)
+    (hf : ∀ e₁ e₂, rFault e₁ e₂ → rFaultB (f₁ e₁) (f₂ e₂)) :
+    GapForbidEq rVal rFaultB (m₁.mapFault f₁) (m₂.mapFault f₂) := by
+  cases m₁ <;> cases m₂ <;>
+    first
+    | exact hf _ _ hm
+    | exact hm
+    | exact False.elim hm
+
+theorem isDefined_iff {isUB₁ : Fault₁ → Prop} {isUB₂ : Fault₂ → Prop}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    {o₁ : OutcomeWithGap Fault₁ Gap₁ Val₁} {o₂ : OutcomeWithGap Fault₂ Gap₂ Val₂}
+    (h : GapForbidEq rVal rFault o₁ o₂) :
+    o₁.isDefined isUB₁ ↔ o₂.isDefined isUB₂ := by
+  cases o₁ with
+  | ok v₁ =>
+    cases o₂ with
+    | ok v₂ => exact Iff.rfl
+    | fault e₂ => exact False.elim h
+    | gap g₂ => exact False.elim h
+  | fault e₁ =>
+    cases o₂ with
+    | ok v₂ => exact False.elim h
+    | fault e₂ =>
+      exact ⟨fun h₁ h₂ => h₁ ((hUB e₁ e₂ h).mpr h₂),
+        fun h₂ h₁ => h₂ ((hUB e₁ e₂ h).mp h₁)⟩
+    | gap g₂ => exact False.elim h
+  | gap g₁ => cases o₂ <;> exact False.elim h
 
 theorem isGapFree_left {o₁ : OutcomeWithGap Fault₁ Gap₁ Val₁}
     {o₂ : OutcomeWithGap Fault₂ Gap₂ Val₂} (h : GapForbidEq rVal rFault o₁ o₂) :
@@ -1356,6 +1571,138 @@ theorem OutcomeSet.bind_singleton_iff {Fault : Type uF} {Gap : Type uG}
     refine ⟨m, rfl, ?_⟩
     cases m <;> exact ho
 
+theorem OutcomeSet.bind_ok_left {Fault : Type uF} {Gap : Type uG}
+    {Val : Type uV} {Val' : Type uV'} (v : Val)
+    (k : Val → OutcomeSet Fault Gap Val') :
+    OutcomeSet.bind (BehaviorSet.singleton (.ok v)) k = k v := by
+  funext o; apply propext
+  constructor
+  · rintro ⟨m, hm, ho⟩; cases hm; exact ho
+  · intro ho; exact ⟨.ok v, rfl, ho⟩
+
+theorem OutcomeSet.bind_ok_right {Fault : Type uF} {Gap : Type uG}
+    {Val : Type uV} (S : OutcomeSet Fault Gap Val) :
+    OutcomeSet.bind S (fun v => BehaviorSet.singleton (.ok v)) = S := by
+  funext o; apply propext
+  constructor
+  · rintro ⟨m, hm, ho⟩
+    cases m with
+    | ok v => cases ho; exact hm
+    | fault e => cases ho; exact hm
+    | gap g => cases ho; exact hm
+  · intro ho
+    refine ⟨o, ho, ?_⟩
+    cases o <;> rfl
+
+theorem OutcomeSet.bind_assoc {Fault : Type uF} {Gap : Type uG}
+    {Val : Type uV} {Val' : Type uV'} {Val'' : Type uV''}
+    (S : OutcomeSet Fault Gap Val)
+    (k₁ : Val → OutcomeSet Fault Gap Val')
+    (k₂ : Val' → OutcomeSet Fault Gap Val'') :
+    OutcomeSet.bind (OutcomeSet.bind S k₁) k₂ =
+      OutcomeSet.bind S (fun v => OutcomeSet.bind (k₁ v) k₂) := by
+  funext o; apply propext
+  constructor
+  · rintro ⟨m', ⟨m, hm, hm'⟩, ho⟩
+    cases m with
+    | ok v => exact ⟨.ok v, hm, m', hm', ho⟩
+    | fault e =>
+      cases hm'
+      cases ho
+      exact ⟨.fault e, hm, rfl⟩
+    | gap g =>
+      cases hm'
+      cases ho
+      exact ⟨.gap g, hm, rfl⟩
+  · rintro ⟨m, hm, ho⟩
+    cases m with
+    | ok v =>
+      obtain ⟨m', hm', ho'⟩ := ho
+      exact ⟨m', ⟨.ok v, hm, hm'⟩, ho'⟩
+    | fault e =>
+      cases ho
+      exact ⟨.fault e, ⟨.fault e, hm, rfl⟩, rfl⟩
+    | gap g =>
+      cases ho
+      exact ⟨.gap g, ⟨.gap g, hm, rfl⟩, rfl⟩
+
+/--
+`OutcomeSet.bind S k` is gap-free exactly when `S` is gap-free and every
+value `v` admitted by `S` has a gap-free continuation `k v`.
+-/
+theorem OutcomeSet.neverGap_bind_iff {Fault : Type uF} {Gap : Type uG}
+    {Val : Type uV} {Val' : Type uV'}
+    (S : OutcomeSet Fault Gap Val) (k : Val → OutcomeSet Fault Gap Val') :
+    NeverGap (OutcomeSet.bind S k) ↔
+      NeverGap S ∧ ∀ v, S (.ok v) → NeverGap (k v) := by
+  constructor
+  · intro h
+    refine ⟨fun m hm => ?_, fun v hv o ho => h ⟨.ok v, hv, ho⟩⟩
+    cases m with
+    | ok v => trivial
+    | fault e => trivial
+    | gap g => exact h ⟨.gap g, hm, rfl⟩
+  · rintro ⟨hS, hk⟩ o ⟨m, hm, ho⟩
+    cases m with
+    | ok v => exact hk v hm ho
+    | fault e => cases ho; trivial
+    | gap g => exact False.elim (hS hm)
+
+/--
+Set-level `bind` congruence for gap-forbidding `GapForbidEq` across possibly
+distinct gap alphabets.
+-/
+theorem OutcomeSetEquiv.forbid_bind_congr {Fault₁ : Type uF} {Fault₂ : Type uF'}
+    {Gap₁ : Type uG} {Gap₂ : Type uG'} {ValA₁ : Type uV} {ValA₂ : Type uV'}
+    {ValB₁ : Type uV''} {ValB₂ : Type uP}
+    {rValA : ValA₁ → ValA₂ → Prop} {rValB : ValB₁ → ValB₂ → Prop}
+    {rFault : Fault₁ → Fault₂ → Prop}
+    {S₁ : OutcomeSet Fault₁ Gap₁ ValA₁} {S₂ : OutcomeSet Fault₂ Gap₂ ValA₂}
+    {k₁ : ValA₁ → OutcomeSet Fault₁ Gap₁ ValB₁}
+    {k₂ : ValA₂ → OutcomeSet Fault₂ Gap₂ ValB₂}
+    (hS : OutcomeSetEquiv (GapForbidEq rValA rFault) S₁ S₂)
+    (hk : ∀ a₁ a₂, rValA a₁ a₂ →
+      OutcomeSetEquiv (GapForbidEq rValB rFault) (k₁ a₁) (k₂ a₂)) :
+    OutcomeSetEquiv (GapForbidEq rValB rFault)
+      (OutcomeSet.bind S₁ k₁) (OutcomeSet.bind S₂ k₂) := by
+  constructor
+  · rintro o₁ ⟨m₁, hm₁, ho₁⟩
+    obtain ⟨m₂, hm₂, hr⟩ := hS.forward hm₁
+    cases m₁ with
+    | ok a₁ =>
+      cases m₂ with
+      | ok a₂ =>
+        obtain ⟨o₂, ho₂, hro⟩ := (hk a₁ a₂ hr).forward ho₁
+        exact ⟨o₂, ⟨.ok a₂, hm₂, ho₂⟩, hro⟩
+      | fault e₂ => exact False.elim hr
+      | gap g₂ => exact False.elim hr
+    | fault e₁ =>
+      cases m₂ with
+      | ok a₂ => exact False.elim hr
+      | fault e₂ =>
+        cases ho₁
+        exact ⟨.fault e₂, ⟨.fault e₂, hm₂, rfl⟩, hr⟩
+      | gap g₂ => exact False.elim hr
+    | gap g₁ => exact False.elim hr.isGapFree_left
+  · rintro o₂ ⟨m₂, hm₂, ho₂⟩
+    obtain ⟨m₁, hm₁, hr⟩ := hS.backward hm₂
+    cases m₂ with
+    | ok a₂ =>
+      cases m₁ with
+      | ok a₁ =>
+        obtain ⟨o₁, ho₁, hro⟩ := (hk a₁ a₂ hr).backward ho₂
+        exact ⟨o₁, ⟨.ok a₁, hm₁, ho₁⟩, hro⟩
+      | fault e₁ => exact False.elim hr
+      | gap g₁ => exact False.elim hr
+    | fault e₂ =>
+      cases m₁ with
+      | ok a₁ => exact False.elim hr
+      | fault e₁ =>
+        cases ho₂
+        exact ⟨.fault e₁, ⟨.fault e₁, hm₁, rfl⟩, hr⟩
+      | gap g₁ => exact False.elim hr
+    | gap g₂ => exact False.elim hr.isGapFree_right
+
 /--
 Set-level `bind` congruence: related prefixes followed by continuations that
 are related on related values give related composites. Behaviors on which both
@@ -1689,6 +2036,16 @@ theorem ContextEquivOn.bind_congr {ValB₁ : Type uV''} {ValB₂ : Type uP}
     ContextEquivOn pre rValB rFault (sem₁.bind k₁) (sem₂.bind k₂) :=
   fun q hq => (h q hq).bind_congr (hk q hq)
 
+theorem ContextEquiv.bind_congr {ValB₁ : Type uV''} {ValB₂ : Type uP}
+    {rValB : ValB₁ → ValB₂ → Prop}
+    {k₁ : Query → Val₁ → OutcomeSet Fault₁ Gap ValB₁}
+    {k₂ : Query → Val₂ → OutcomeSet Fault₂ Gap ValB₂}
+    (h : ContextEquiv rVal rFault sem₁ sem₂)
+    (hk : ∀ q a₁ a₂, rVal a₁ a₂ →
+      OutcomeSetEquiv (GapEqErr rValB rFault) (k₁ q a₁) (k₂ q a₂)) :
+    ContextEquiv rValB rFault (sem₁.bind k₁) (sem₂.bind k₂) :=
+  fun q => (h q).bind_congr (hk q)
+
 /-- On deterministic evaluators `ContextEquivOn` is pointwise `GapEqErr`. -/
 theorem contextEquivOn_det_iff
     {f₁ : Query → OutcomeWithGap Fault₁ Gap Val₁}
@@ -1866,6 +2223,27 @@ theorem ProgramEquiv.trans {Fault : Type uF} {Gap : Type uG} {Val : Type uV}
   (h₁₂.comp h₂₃).mono (fun a c ⟨b, hab, hbc⟩ => hVal a b c hab hbc)
     (fun a c ⟨b, hab, hbc⟩ => hFault a b c hab hbc)
 
+/-- Sequential-composition congruence for gap-free `ProgramEquivOn`. -/
+theorem ProgramEquivOn.bind_congr {ValB₁ : Type uV''} {ValB₂ : Type uP}
+    {rValB : ValB₁ → ValB₂ → Prop}
+    {k₁ : Query → Val₁ → OutcomeSet Fault₁ Gap₁ ValB₁}
+    {k₂ : Query → Val₂ → OutcomeSet Fault₂ Gap₂ ValB₂}
+    (h : ProgramEquivOn pre rVal rFault sem₁ sem₂)
+    (hk : ∀ q, pre q → ∀ a₁ a₂, rVal a₁ a₂ →
+      OutcomeSetEquiv (GapForbidEq rValB rFault) (k₁ q a₁) (k₂ q a₂)) :
+    ProgramEquivOn pre rValB rFault (sem₁.bind k₁) (sem₂.bind k₂) :=
+  fun q hq => (h q hq).forbid_bind_congr (hk q hq)
+
+theorem ProgramEquiv.bind_congr {ValB₁ : Type uV''} {ValB₂ : Type uP}
+    {rValB : ValB₁ → ValB₂ → Prop}
+    {k₁ : Query → Val₁ → OutcomeSet Fault₁ Gap₁ ValB₁}
+    {k₂ : Query → Val₂ → OutcomeSet Fault₂ Gap₂ ValB₂}
+    (h : ProgramEquiv rVal rFault sem₁ sem₂)
+    (hk : ∀ q a₁ a₂, rVal a₁ a₂ →
+      OutcomeSetEquiv (GapForbidEq rValB rFault) (k₁ q a₁) (k₂ q a₂)) :
+    ProgramEquiv rValB rFault (sem₁.bind k₁) (sem₂.bind k₂) :=
+  fun q => (h q).forbid_bind_congr (hk q)
+
 /-- On deterministic evaluators `ProgramEquivOn` is pointwise `GapForbidEq`. -/
 theorem programEquivOn_det_iff
     {f₁ : Query → OutcomeWithGap Fault₁ Gap₁ Val₁}
@@ -1874,6 +2252,14 @@ theorem programEquivOn_det_iff
       ∀ q, pre q → GapForbidEq rVal rFault (f₁ q) (f₂ q) :=
   ⟨fun h q hq => OutcomeSetEquiv.singleton_iff.mp (h q hq),
    fun h q hq => OutcomeSetEquiv.singleton_iff.mpr (h q hq)⟩
+
+theorem programEquiv_det_iff
+    {f₁ : Query → OutcomeWithGap Fault₁ Gap₁ Val₁}
+    {f₂ : Query → OutcomeWithGap Fault₂ Gap₂ Val₂} :
+    ProgramEquiv rVal rFault (GapSem.det f₁) (GapSem.det f₂) ↔
+      ∀ q, GapForbidEq rVal rFault (f₁ q) (f₂ q) :=
+  ⟨fun h q => OutcomeSetEquiv.singleton_iff.mp (h q),
+   fun h q => OutcomeSetEquiv.singleton_iff.mpr (h q)⟩
 
 end ProgramEquivLaws
 
@@ -1915,6 +2301,25 @@ theorem OutcomeSet.defined_iff {S : OutcomeSet Fault₁ Gap Val₁} :
     | ok v => trivial
     | fault e => exact hu ho
     | gap g => exact hg ho
+
+theorem OutcomeSet.defined_bind_iff {ValB₁ : Type uV''}
+    {S : OutcomeSet Fault₁ Gap Val₁}
+    {k : Val₁ → OutcomeSet Fault₁ Gap ValB₁} :
+    OutcomeSet.Defined isUB₁ (OutcomeSet.bind S k) ↔
+      OutcomeSet.Defined isUB₁ S ∧
+        ∀ v, S (.ok v) → OutcomeSet.Defined isUB₁ (k v) := by
+  constructor
+  · intro h
+    refine ⟨fun m hm => ?_, fun v hv o ho => h ⟨.ok v, hv, ho⟩⟩
+    cases m with
+    | ok v => trivial
+    | fault e => exact h ⟨.fault e, hm, rfl⟩
+    | gap g => exact h ⟨.gap g, hm, rfl⟩
+  · rintro ⟨hS, hk⟩ o ⟨m, hm, ho⟩
+    cases m with
+    | ok v => exact hk v hm ho
+    | fault e => cases ho; exact hS hm
+    | gap g => exact False.elim (hS hm)
 
 /--
 Project a gap-aware behavior set into Layer 1A's Smyth `Partial` domain: the
@@ -2123,7 +2528,304 @@ theorem ProgramEquiv.toExactPass {Prog₁ : Type uP} {Prog₂ : Type uP'}
       p₁ p₂ :=
   h.toContextEquiv.toExactPass hUB
 
+/-- Query-scoped `CompilerPass` over `{q // pre q}`. -/
+theorem ContextEquivOn.toCompilerPass {Prog₁ : Type uP} {Prog₂ : Type uP'}
+    {pre : Query → Prop}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap Val₁}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap Val₂}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ContextEquivOn pre rVal rFault (sem₁ p₁) (sem₂ p₂))
+    (G₁ : Spec ({ q : Query // pre q } → Partial (OutcomeSet Fault₁ Gap Val₁))) :
+    CompilerPass (gapSemantics isUB₁ (fun p => (sem₁ p).restrict pre))
+      (gapSemantics isUB₂ (fun p => (sem₂ p).restrict pre)) G₁
+      (gapObsMap rVal rFault) p₁ p₂ :=
+  (h.toExactPass hUB).toCompilerPass G₁
+
+/-- Query-scoped `VerifierPass` over `{q // pre q}`. -/
+theorem ContextEquivOn.toVerifierPass {Prog₁ : Type uP} {Prog₂ : Type uP'}
+    {pre : Query → Prop}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap Val₁}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap Val₂}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ContextEquivOn pre rVal rFault (sem₁ p₁) (sem₂ p₂))
+    (G₂ : Spec ({ q : Query // pre q } → Partial (OutcomeSet Fault₂ Gap Val₂))) :
+    VerifierPass (gapSemantics isUB₁ (fun p => (sem₁ p).restrict pre))
+      (gapSemantics isUB₂ (fun p => (sem₂ p).restrict pre)) G₂
+      (gapObsMap (fun v₂ v₁ => rVal v₁ v₂) (fun e₂ e₁ => rFault e₁ e₂))
+      p₁ p₂ :=
+  (h.toExactPass hUB).toVerifierPass G₂
+
+/--
+Cross-gap-alphabet observation map for gap-free `ProgramEquiv`: relational
+image along `GapForbidEq rVal rFault`, requiring no shared gap type.
+-/
+def gapForbidObsMap {Gap₁ : Type uG} {Gap₂ : Type uG'}
+    (rVal : Val₁ → Val₂ → Prop) (rFault : Fault₁ → Fault₂ → Prop) :
+    (Query → Partial (OutcomeSet Fault₁ Gap₁ Val₁)) →
+      Query → Partial (OutcomeSet Fault₂ Gap₂ Val₂) :=
+  fun b q => Partial.map (BehaviorSet.relImage (GapForbidEq rVal rFault)) (b q)
+
+theorem gapForbidObsMap_monotone {Gap₁ : Type uG} {Gap₂ : Type uG'} :
+    Monotone (gapForbidObsMap (Query := Query) (Gap₁ := Gap₁) (Gap₂ := Gap₂)
+      rVal rFault) :=
+  fun _ _ h q => Partial.map_monotone (BehaviorSet.relImage_monotone _) (h q)
+
+theorem OutcomeSetEquiv.forbid_toPartial_le {Gap₁ : Type uG} {Gap₂ : Type uG'}
+    {S₁ : OutcomeSet Fault₁ Gap₁ Val₁} {S₂ : OutcomeSet Fault₂ Gap₂ Val₂}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → isUB₂ e₂ → isUB₁ e₁)
+    (h : OutcomeSetEquiv (GapForbidEq rVal rFault) S₁ S₂) :
+    OutcomeSet.toPartial isUB₂ S₂ ≤
+      Partial.map (BehaviorSet.relImage (GapForbidEq rVal rFault))
+        (OutcomeSet.toPartial isUB₁ S₁) := by
+  intro h₁
+  refine ⟨fun o₂ ho₂ => ?_, fun o₂ ho₂ => h.backward ho₂⟩
+  obtain ⟨o₁, ho₁, hr⟩ := h.backward ho₂
+  have hd : o₁.isDefined isUB₁ := h₁ ho₁
+  cases o₁ with
+  | ok v₁ =>
+    cases o₂ with
+    | ok v₂ => trivial
+    | fault e₂ => exact False.elim hr
+    | gap g₂ => exact False.elim hr
+  | fault e₁ =>
+    cases o₂ with
+    | ok v₂ => exact False.elim hr
+    | fault e₂ => exact fun h₂ => hd (hUB e₁ e₂ hr h₂)
+    | gap g₂ => exact False.elim hr
+  | gap g₁ => exact False.elim hd
+
+/--
+Gap-free `ProgramEquiv` induces an `ExactPass` even across distinct gap
+alphabets `Gap₁` and `Gap₂`.
+-/
+theorem ProgramEquiv.toExactPass_crossGap {Prog₁ : Type uP} {Prog₂ : Type uP'}
+    {Gap₁ : Type uG} {Gap₂ : Type uG'}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap₁ Val₁}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap₂ Val₂}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ProgramEquiv rVal rFault (sem₁ p₁) (sem₂ p₂)) :
+    ExactPass (gapSemantics isUB₁ sem₁) (gapSemantics isUB₂ sem₂)
+      (gapForbidObsMap rVal rFault)
+      (gapForbidObsMap (fun v₂ v₁ => rVal v₁ v₂) (fun e₂ e₁ => rFault e₁ e₂))
+      p₁ p₂ where
+  up_refines _ q :=
+    (h.flip q).forbid_toPartial_le (fun e₂ e₁ hr hu => (hUB e₁ e₂ hr).mp hu)
+  down_refines _ q :=
+    (h q).forbid_toPartial_le (fun e₁ e₂ hr hu => (hUB e₁ e₂ hr).mpr hu)
+
+theorem ProgramEquiv.toCompilerPass {Prog₁ : Type uP} {Prog₂ : Type uP'}
+    {Gap₁ : Type uG} {Gap₂ : Type uG'}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap₁ Val₁}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap₂ Val₂}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ProgramEquiv rVal rFault (sem₁ p₁) (sem₂ p₂))
+    (G₁ : Spec (Query → Partial (OutcomeSet Fault₁ Gap₁ Val₁))) :
+    CompilerPass (gapSemantics isUB₁ sem₁) (gapSemantics isUB₂ sem₂) G₁
+      (gapForbidObsMap rVal rFault) p₁ p₂ :=
+  (h.toExactPass_crossGap hUB).toCompilerPass G₁
+
+theorem ProgramEquiv.toVerifierPass {Prog₁ : Type uP} {Prog₂ : Type uP'}
+    {Gap₁ : Type uG} {Gap₂ : Type uG'}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap₁ Val₁}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap₂ Val₂}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ProgramEquiv rVal rFault (sem₁ p₁) (sem₂ p₂))
+    (G₂ : Spec (Query → Partial (OutcomeSet Fault₂ Gap₂ Val₂))) :
+    VerifierPass (gapSemantics isUB₁ sem₁) (gapSemantics isUB₂ sem₂) G₂
+      (gapForbidObsMap (fun v₂ v₁ => rVal v₁ v₂) (fun e₂ e₁ => rFault e₁ e₂))
+      p₁ p₂ :=
+  (h.toExactPass_crossGap hUB).toVerifierPass G₂
+
 end LayerOneABridges
+
+/-! ### Fault-Free / Gap-Free Value Projection (`Partial (BehaviorSet Val)`)
+
+Projecting an `OutcomeSet Fault Gap Val` directly into `Partial (BehaviorSet Val)`
+erases both `Fault` and `Gap` from the Layer 1A observation domain: the
+projection is defined precisely when every reachable behavior is a normal value
+(`NeverGap ∧ NoFault`). Both `ContextEquiv` and cross-gap `ProgramEquiv` induce
+`ExactPass`, `CompilerPass`, and `VerifierPass` on this value domain without any
+side condition on `rFault`, because neither `GapEqErr` nor `GapForbidEq` ever
+relates `.ok` to `.fault` or `.gap`.
+-/
+
+section ValueProjectionBridges
+
+variable {Query : Type uQ} {Fault₁ : Type uF} {Fault₂ : Type uF'}
+  {Gap₁ : Type uG} {Gap₂ : Type uG'} {Val₁ : Type uV} {Val₂ : Type uV'}
+  {rVal : Val₁ → Val₂ → Prop} {rFault : Fault₁ → Fault₂ → Prop}
+
+/-- No behavior in `S` is a runtime fault. -/
+def OutcomeSet.NoFault (S : OutcomeSet Fault₁ Gap₁ Val₁) : Prop :=
+  ∀ ⦃e⦄, ¬ S (.fault e)
+
+/-- Every behavior in `S` is a normal `.ok` value (gap-free and fault-free). -/
+def OutcomeSet.OnlyValues (S : OutcomeSet Fault₁ Gap₁ Val₁) : Prop :=
+  ∀ ⦃o⦄, S o → ∃ v, o = .ok v
+
+theorem OutcomeSet.onlyValues_iff {S : OutcomeSet Fault₁ Gap₁ Val₁} :
+    OutcomeSet.OnlyValues S ↔ NeverGap S ∧ OutcomeSet.NoFault S := by
+  constructor
+  · intro h
+    refine ⟨fun o ho => ?_, fun e he => ?_⟩
+    · obtain ⟨v, rfl⟩ := h ho; trivial
+    · obtain ⟨v, hv⟩ := h he; cases hv
+  · rintro ⟨hg, hf⟩ o ho
+    cases o with
+    | ok v => exact ⟨v, rfl⟩
+    | fault e => exact False.elim (hf ho)
+    | gap g => exact False.elim (hg ho)
+
+/--
+Fault-free, gap-free projection of `OutcomeSet Fault Gap Val` into Layer 1A's
+`Partial (BehaviorSet Val)`.
+-/
+def OutcomeSet.toValPartial (S : OutcomeSet Fault₁ Gap₁ Val₁) :
+    Partial (BehaviorSet Val₁) where
+  defined := OutcomeSet.OnlyValues S
+  val _ v := S (.ok v)
+
+/-- Layer 1A value-domain `Semantics` erasing both faults and gaps. -/
+def valSemantics {Prog : Type uP}
+    (sem : Prog → GapSem Query Fault₁ Gap₁ Val₁) :
+    Semantics Prog (Query → Partial (BehaviorSet Val₁)) :=
+  fun p q => OutcomeSet.toValPartial (sem p q)
+
+/-- Observation map between value-domain behaviors via `BehaviorSet.relImage rVal`. -/
+def valObsMap (rVal : Val₁ → Val₂ → Prop) :
+    (Query → Partial (BehaviorSet Val₁)) → Query → Partial (BehaviorSet Val₂) :=
+  fun b q => Partial.map (BehaviorSet.relImage rVal) (b q)
+
+theorem valObsMap_monotone :
+    Monotone (valObsMap (Query := Query) rVal) :=
+  fun _ _ h q => Partial.map_monotone (BehaviorSet.relImage_monotone rVal) (h q)
+
+/-- Layer 1A value-domain `Language` erasing both `Fault` and `Gap`. -/
+def valLanguage {Prog Query Fault Gap Val : Type}
+    (sem : Prog → GapSem Query Fault Gap Val) : Language where
+  Prog := Prog
+  Query := Query
+  Out := Val
+  sem p q := OutcomeSet.toValPartial (sem p q)
+
+theorem OutcomeSetEquiv.onlyValues_iff {Gap : Type uG}
+    {S₁ : OutcomeSet Fault₁ Gap Val₁} {S₂ : OutcomeSet Fault₂ Gap Val₂}
+    (h : OutcomeSetEquiv (GapEqErr rVal rFault) S₁ S₂) :
+    OutcomeSet.OnlyValues S₁ ↔ OutcomeSet.OnlyValues S₂ := by
+  constructor
+  · intro h₁ o₂ ho₂
+    obtain ⟨o₁, ho₁, hr⟩ := h.backward ho₂
+    obtain ⟨v₁, rfl⟩ := h₁ ho₁
+    cases o₂ with
+    | ok v₂ => exact ⟨v₂, rfl⟩
+    | fault _ => exact False.elim hr
+    | gap _ => exact False.elim hr
+  · intro h₂ o₁ ho₁
+    obtain ⟨o₂, ho₂, hr⟩ := h.forward ho₁
+    obtain ⟨v₂, rfl⟩ := h₂ ho₂
+    cases o₁ with
+    | ok v₁ => exact ⟨v₁, rfl⟩
+    | fault _ => exact False.elim hr
+    | gap _ => exact False.elim hr
+
+theorem OutcomeSetEquiv.toValPartial_le {Gap : Type uG}
+    {S₁ : OutcomeSet Fault₁ Gap Val₁} {S₂ : OutcomeSet Fault₂ Gap Val₂}
+    (h : OutcomeSetEquiv (GapEqErr rVal rFault) S₁ S₂) :
+    OutcomeSet.toValPartial S₂ ≤
+      Partial.map (BehaviorSet.relImage rVal) (OutcomeSet.toValPartial S₁) := by
+  intro h₁
+  refine ⟨h.onlyValues_iff.mp h₁, fun v₂ hv₂ => ?_⟩
+  obtain ⟨o₁, ho₁, hr⟩ := h.backward hv₂
+  obtain ⟨v₁, rfl⟩ := h₁ ho₁
+  exact ⟨v₁, ho₁, hr⟩
+
+theorem OutcomeSetEquiv.forbid_toValPartial_le
+    {S₁ : OutcomeSet Fault₁ Gap₁ Val₁} {S₂ : OutcomeSet Fault₂ Gap₂ Val₂}
+    (h : OutcomeSetEquiv (GapForbidEq rVal rFault) S₁ S₂) :
+    OutcomeSet.toValPartial S₂ ≤
+      Partial.map (BehaviorSet.relImage rVal) (OutcomeSet.toValPartial S₁) := by
+  intro h₁
+  refine ⟨fun o₂ ho₂ => ?_, fun v₂ hv₂ => ?_⟩
+  · obtain ⟨o₁, ho₁, hr⟩ := h.backward ho₂
+    obtain ⟨v₁, rfl⟩ := h₁ ho₁
+    cases o₂ with
+    | ok v₂ => exact ⟨v₂, rfl⟩
+    | fault _ => exact False.elim hr
+    | gap _ => exact False.elim hr
+  · obtain ⟨o₁, ho₁, hr⟩ := h.backward hv₂
+    obtain ⟨v₁, rfl⟩ := h₁ ho₁
+    exact ⟨v₁, ho₁, hr⟩
+
+/-- `ContextEquiv` induces a gap- and fault-erased `ExactPass` on `valSemantics`. -/
+theorem ContextEquiv.toValExactPass {Prog₁ : Type uP} {Prog₂ : Type uP'}
+    {Gap : Type uG}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap Val₁}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap Val₂}
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ContextEquiv rVal rFault (sem₁ p₁) (sem₂ p₂)) :
+    ExactPass (valSemantics sem₁) (valSemantics sem₂)
+      (valObsMap rVal) (valObsMap (fun v₂ v₁ => rVal v₁ v₂)) p₁ p₂ where
+  up_refines _ q := (h.flip q).toValPartial_le
+  down_refines _ q := (h q).toValPartial_le
+
+/--
+Gap-free `ProgramEquiv` induces a gap- and fault-erased `ExactPass` on
+`valSemantics` across arbitrary `Fault₁`, `Fault₂`, `Gap₁`, and `Gap₂`.
+-/
+theorem ProgramEquiv.toValExactPass {Prog₁ : Type uP} {Prog₂ : Type uP'}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap₁ Val₁}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap₂ Val₂}
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ProgramEquiv rVal rFault (sem₁ p₁) (sem₂ p₂)) :
+    ExactPass (valSemantics sem₁) (valSemantics sem₂)
+      (valObsMap rVal) (valObsMap (fun v₂ v₁ => rVal v₁ v₂)) p₁ p₂ where
+  up_refines _ q := (h.flip q).forbid_toValPartial_le
+  down_refines _ q := (h q).forbid_toValPartial_le
+
+/--
+Exact-value `ProgramEquiv` across arbitrary `Fault₁`, `Fault₂`, `Gap₁`, `Gap₂`
+induces an identity-observation `ExactPass` on `valSemantics`.
+-/
+theorem ProgramEquiv.toValExactPass_eq {Prog₁ : Type uP} {Prog₂ : Type uP'}
+    {Val : Type uV}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap₁ Val}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap₂ Val}
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ProgramEquiv (· = ·) rFault (sem₁ p₁) (sem₂ p₂)) :
+    ExactPass (valSemantics sem₁) (valSemantics sem₂) id id p₁ p₂ where
+  up_refines _ q h₂ := by
+    have h₁ : OutcomeSet.OnlyValues (sem₁ p₁ q) := fun o₁ ho₁ => by
+      obtain ⟨o₂, ho₂, hr⟩ := (h q).forward ho₁
+      obtain ⟨v₂, rfl⟩ := h₂ ho₂
+      cases o₁ with
+      | ok v₁ => exact ⟨v₁, rfl⟩
+      | fault _ => exact False.elim hr
+      | gap _ => exact False.elim hr
+    refine ⟨h₁, fun v₁ hv₁ => ?_⟩
+    obtain ⟨o₂, ho₂, hr⟩ := (h q).forward hv₁
+    obtain ⟨v₂, rfl⟩ := h₂ ho₂
+    cases (hr : v₁ = v₂)
+    exact ho₂
+  down_refines _ q h₁ := by
+    have h₂ : OutcomeSet.OnlyValues (sem₂ p₂ q) := fun o₂ ho₂ => by
+      obtain ⟨o₁, ho₁, hr⟩ := (h q).backward ho₂
+      obtain ⟨v₁, rfl⟩ := h₁ ho₁
+      cases o₂ with
+      | ok v₂ => exact ⟨v₂, rfl⟩
+      | fault _ => exact False.elim hr
+      | gap _ => exact False.elim hr
+    refine ⟨h₂, fun v₂ hv₂ => ?_⟩
+    obtain ⟨o₁, ho₁, hr⟩ := (h q).backward hv₂
+    obtain ⟨v₁, rfl⟩ := h₁ ho₁
+    cases (hr : v₁ = v₂)
+    exact ho₁
+
+end ValueProjectionBridges
 
 section ExactBridges
 
