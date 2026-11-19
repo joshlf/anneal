@@ -393,6 +393,7 @@ pub fn nested_inside_fn_body() -> u32 { 0 }
             ("nospace-priv-extern-abi-fn", 'extern"C"fn unmarked_nospace_abi() -> u32 { 0 }\n', "without `__ANNEAL_MODEL_\\*` markers"),
             ("nospace-pub-extern-abi-fn", 'pub extern"C"fn unmarked_pub_nospace_abi() -> u32 { 0 }\n', "missing_in_manifest"),
             ("raw-ident-fn", "fn r#unmarked_raw_ident() -> u32 { 0 }\n", "without `__ANNEAL_MODEL_\\*` markers"),
+            ("restricted-raw-ident-fn", "pub(crate) fn r#hidden_raw() -> u32 { 0 }\n", "non-exported `pub\\(\\.\\.\\.\\)` zero-arg functions"),
             ("restricted-nested-generic", "pub(crate) fn hidden_fn_ptr<F = fn() -> u32>() -> u32 { 0 }\n", "non-exported `pub\\(\\.\\.\\.\\)` zero-arg functions"),
         ]:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:

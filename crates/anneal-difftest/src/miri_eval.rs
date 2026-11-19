@@ -4123,8 +4123,10 @@ fn confirm_helper_module_suffixes(
                 .unwrap_or(&empty_set);
 
             let enclosing_top_fn = |short: &str, suf: &str| -> Option<String> {
-                let rel_raw = suf.strip_prefix(&crate_prefix)?;
-                let rel = split_stage_ns_rel(rel_raw).map_or(rel_raw, |(_, rest)| rest);
+                let mut rel = suf.strip_prefix(&crate_prefix)?;
+                while let Some((_, rest)) = split_stage_ns_rel(rel) {
+                    rel = rest;
+                }
                 if rel == short {
                     return None;
                 }
@@ -4196,14 +4198,18 @@ fn confirm_helper_module_suffixes(
                 .any(|(short, _)| {
                     let is_opaque = !scope_graph.fn_bodies.contains_key(short)
                         && !scope_graph.impl_method_names.contains(short);
-                    if scope_graph.fn_bodies.contains_key(short)
-                        && let Some(enclosing) = enclosing_top_fn(short, suffix)
-                    {
-                        let enclosing_reached = entries
-                            .iter()
-                            .any(|s| s.name == enclosing && entry_is_in_target_scope(&s.name))
-                            || scope_fns.contains(&enclosing);
-                        return enclosing_reached && (scope_fns.contains(short) || is_opaque);
+                    if let Some(enclosing) = enclosing_top_fn(short, suffix) {
+                        let ambiguous_with_type_impl = scope_graph
+                            .defined_type_names
+                            .contains(&enclosing)
+                            && scope_graph.impl_method_names.contains(short);
+                        if !ambiguous_with_type_impl {
+                            let enclosing_reached = entries
+                                .iter()
+                                .any(|s| s.name == enclosing && entry_is_in_target_scope(&s.name))
+                                || scope_fns.contains(&enclosing);
+                            return enclosing_reached && (scope_fns.contains(short) || is_opaque);
+                        }
                     }
                     if let Some(self_ty) = matching_impl_self_ty(short, suffix) {
                         let root_aux = scoped.reached_aux_by_scope.get(&None).unwrap_or(&empty_set);
@@ -4212,13 +4218,6 @@ fn confirm_helper_module_suffixes(
                             && !scope_graph.defined_type_names.contains(&self_ty)
                             && root_aux.contains(&self_ty);
                         return scope_aux.contains(&self_ty) || reached_via_super;
-                    }
-                    if let Some(enclosing) = enclosing_top_fn(short, suffix) {
-                        let enclosing_reached = entries
-                            .iter()
-                            .any(|s| s.name == enclosing && entry_is_in_target_scope(&s.name))
-                            || scope_fns.contains(&enclosing);
-                        return enclosing_reached && (scope_fns.contains(short) || is_opaque);
                     }
                     scope_fns.contains(short) || is_opaque
                 })
@@ -13923,6 +13922,57 @@ pub fn cand_ep1_b4_rename() -> u32 {
             ns_spec_linked,
             vec!["MiriDiffCorpus.stage_ns_0_stage_ns_0_Uninit_stage_ns_0_LocalB_clash"],
             "stage_ns_0 candidate must link specialized Uninit<LocalB>::clash: {ns_spec_linked:?}"
+        );
+
+        // Closures inside a candidate whose name starts with a preamble type prefix
+        // (`Uninit_closure_cand__b0_c0__closure_0`) must bind to `enclosing_top_fn`
+        // rather than being misclassified by `matching_impl_self_ty` as an `impl`
+        // method on `Uninit` (neither dropped when `Uninit` is unreferenced nor
+        // leaked into another candidate that references `Uninit`).
+        let closure_prefix_src = format!(
+            "{exact_prefix}\n\
+             pub fn Uninit_closure_cand__b0_c0() -> u32 {{\n\
+                 let f = |x: u32| x + 1u32;\n\
+                 f(41u32)\n\
+             }}\n\
+             pub fn other_touches_uninit__b0_c1() -> u32 {{\n\
+                 let u: Uninit<u32> = Uninit {{ value: 7u32 }};\n\
+                 unsafe {{ u.value }}\n\
+             }}\n"
+        );
+        let closure_pairs = vec![(
+            "{closure#0}".to_string(),
+            "MiriDiffCorpus.Uninit_closure_cand__b0_c0__closure_0".to_string(),
+        )];
+        let closure_helpers =
+            vec!["MiriDiffCorpus.Uninit_closure_cand__b0_c0__closure_0".to_string()];
+        assert_eq!(
+            confirm_helper_module_suffixes(
+                &closure_prefix_src,
+                "MiriDiffCorpus",
+                &closure_pairs,
+                &closure_helpers,
+                &[OracleItemSpec::with_fuel(
+                    "Uninit_closure_cand__b0_c0".to_string(),
+                    200
+                )],
+            ),
+            closure_helpers,
+            "Uninit_closure_cand must retain its own closure even without referencing Uninit"
+        );
+        assert!(
+            confirm_helper_module_suffixes(
+                &closure_prefix_src,
+                "MiriDiffCorpus",
+                &closure_pairs,
+                &closure_helpers,
+                &[OracleItemSpec::with_fuel(
+                    "other_touches_uninit__b0_c1".to_string(),
+                    200
+                )],
+            )
+            .is_empty(),
+            "other_touches_uninit must not link Uninit_closure_cand's closure"
         );
     }
 }

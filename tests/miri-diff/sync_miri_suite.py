@@ -562,15 +562,15 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
 
     model_names = seen_markers
     item_names = {
-        ident
+        ident.removeprefix("r#")
         for ident in re.findall(
             _TOP_PREFIX
             + r"(?:pub(?:\s*\([^)]*\))?\s+)?"
             + _ANY_FN_QUALS
-            + r"(?:fn|const|static(?:\s+mut)?|struct|enum|union|type|trait|mod)\s+([A-Za-z0-9_]+)\b",
+            + r"(?:fn|const|static(?:\s+mut)?|struct|enum|union|type|trait|mod)\s+((?:r#)?[A-Za-z0-9_]+)\b",
             top_lib_no_str,
         )
-        if not ident.startswith("__ANNEAL_MODEL_")
+        if not ident.removeprefix("r#").startswith("__ANNEAL_MODEL_")
     }
     stale_markers = sorted(model_names - item_names)
     if stale_markers:
@@ -618,10 +618,10 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
 
     restricted_zero_arg_fns: list[str] = []
     for m in re.finditer(
-        _TOP_PREFIX + r"pub\s*\([^)]*\)\s+" + _FN_QUALS + r"fn\s+([A-Za-z0-9_]+)\b",
+        _TOP_PREFIX + r"pub\s*\([^)]*\)\s+" + _FN_QUALS + r"fn\s+((?:r#)?[A-Za-z0-9_]+)\b",
         top_lib_no_str,
     ):
-        name = m.group(1)
+        name = m.group(1).removeprefix("r#")
         if name == "helper_add_ten" or name in model_names:
             continue
         after_gen = _after_optional_generics(top_lib_no_str, m.end())

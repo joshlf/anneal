@@ -888,6 +888,7 @@ pub(crate) fn discover_top_level_zero_arg_pub_fns_in_source_text(source: &str) -
             continue;
         }
         let rest = after_fn.trim_start();
+        let rest = rest.strip_prefix("r#").unwrap_or(rest);
         let ident_len = rest
             .bytes()
             .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
@@ -1047,7 +1048,8 @@ pub(crate) fn is_helper_fn_name_in_set(
     name: &str,
     model_names: &std::collections::BTreeSet<String>,
 ) -> bool {
-    name == "helper_add_ten" || name.starts_with("__ANNEAL_MODEL_") || model_names.contains(name)
+    let norm = name.strip_prefix("r#").unwrap_or(name);
+    norm == "helper_add_ten" || norm.starts_with("__ANNEAL_MODEL_") || model_names.contains(norm)
 }
 
 /// Names of the corpus call-chain helpers: every `<name>` for which
@@ -5814,6 +5816,26 @@ fn close_miri_seed(
                     kept_items.push(Item::Use(u));
                 }
             }
+            Item::Impl(mut im) => {
+                let keys = aux_item_namespace_keys(&Item::Impl(im.clone()));
+                if !keys.is_empty() && keys.iter().all(|k| !preamble_keys.contains(k)) {
+                    for sub in &mut im.items {
+                        if let syn::ImplItem::Fn(m) = sub
+                            && !is_helper_fn_name_in_set(&m.sig.ident.to_string(), &local_models)
+                        {
+                            MethodCallNormalizer.visit_impl_item_fn_mut(m);
+                        }
+                    }
+                    kept_items.push(Item::Impl(im));
+                }
+            }
+            Item::Trait(mut tr) => {
+                let keys = aux_item_namespace_keys(&Item::Trait(tr.clone()));
+                if !keys.is_empty() && keys.iter().all(|k| !preamble_keys.contains(k)) {
+                    MethodCallNormalizer.visit_item_trait_mut(&mut tr);
+                    kept_items.push(Item::Trait(tr));
+                }
+            }
             other => {
                 let keys = aux_item_namespace_keys(&other);
                 if !keys.is_empty() && keys.iter().all(|k| !preamble_keys.contains(k)) {
@@ -8815,6 +8837,33 @@ pub async fn trailing_async_helper() -> u32 {
         assert_eq!(
             aux_item_namespace_keys(&foreign_block),
             vec!["val:ext_sym".to_string(), "val:EXT_SLOT".to_string()]
+        );
+
+        // `close_miri_seed` must also run `MethodCallNormalizer` inside seed-local
+        // `impl` method bodies (so `.wrapping_add(...)` becomes `wrapping_add(...)`)
+        // and honor `r#<ident>` raw-identifier model markers.
+        let impl_method_norm_seed = "\
+pub struct SeedAdder(pub u32);
+impl SeedAdder {
+    pub fn add_bias(&self, y: u32) -> u32 {
+        self.0.wrapping_add(y)
+    }
+}
+pub const __ANNEAL_MODEL_raw_marked_fn: &str = \"raw_marked_fn\";
+pub fn r#raw_marked_fn() -> u32 { 7u32 }
+pub fn pass_impl_method_norm_seed() -> u32 {
+    SeedAdder(4u32).add_bias(5u32)
+}
+";
+        let norm_cands = generate_miri_batch(&[impl_method_norm_seed], 1, 0xC16_A401);
+        assert_eq!(norm_cands.len(), 1);
+        assert_eq!(norm_cands[0].seed_name, "pass_impl_method_norm_seed");
+        assert!(
+            norm_cands[0]
+                .fn_source
+                .contains("wrapping_add(self.0, y)"),
+            "impl method body must normalize `.wrapping_add(...)` -> `wrapping_add(...)`:\n{}",
+            norm_cands[0].fn_source
         );
 
         // 2. `close_miri_seed` / `seeded_type_expr` must synthesize valid `FreezeAndCell`,
