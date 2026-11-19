@@ -74,8 +74,10 @@ superfluous details or session narrative.
      SHA-1 hash, and commits in other repos by public commit URL);
   4. **Other ephemeral entities** that may not make sense to future readers.
   <!-- TODO-check-disable -->
-  Never include `TODO` markers (or their disable/enable directives) in commit
-  messages; `./ci/check_todo.sh` rejects them across `origin/main..HEAD`.
+  Never include `TODO` markers or their disable/enable directives in commit
+  messages (`./ci/check_todo.sh` rejects un-disabled `TODO` markers across
+  `origin/main..HEAD`; verify the absence of disable/enable directives
+  manually).
   <!-- TODO-check-enable -->
 - **Authorship disclosure and privacy:** Include the `Agent-authored-by:`
   trailer per [`authorship-disclosure`](../authorship-disclosure/SKILL.md)
@@ -115,17 +117,35 @@ isolated worker agents or bundles.
 
 ### Mandatory fail-closed quarantine sequence
 
-Run this exact sequence from the coordinator repository with `set -euo
-pipefail` (replace variables with the task values; set `ALLOWED_PREFIXES` to
-the worker's explicit non-root assigned path prefix allowlist—never `.`):
+Run this exact sequence as a **standalone `bash` script** (never `source` it
+inside a shell conditional such as `if`, `&&`, or `||`, which disables `set -e`
+across the entire script) from the coordinator repository (replace variables
+with the task values; set `ALLOWED_PREFIXES` to the worker's explicit non-root
+assigned path prefix allowlist—never `.`; pass any authorized per-run
+exceptions only via `--allow-exec <path>` or `--allow-policy <path>` flags):
 
 ```bash
 set -euo pipefail
 : "${task:?}" "${base:?}" "${expected_worker_sha:?}" "${bundle:?}"
 : "${ALLOWED_PREFIXES:?}"
-export ALLOWED_PREFIXES
-export ALLOW_EXEC_PATHS="${ALLOW_EXEC_PATHS:-}"
-export ALLOW_POLICY_PATHS="${ALLOW_POLICY_PATHS:-}"
+# Always reset inherited allowlists so prior runs cannot leak privileges; pass
+# per-run exceptions only via --allow-exec / --allow-policy flags.
+ALLOW_EXEC_PATHS=""
+ALLOW_POLICY_PATHS=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --allow-exec)
+      [ "$#" -ge 2 ] && [ -n "$2" ] && [[ "$2" != *:* ]] \
+        || { echo "quarantine failed: invalid arg for $1" >&2; exit 1; }
+      ALLOW_EXEC_PATHS="${ALLOW_EXEC_PATHS:+$ALLOW_EXEC_PATHS:}$2"; shift 2 ;;
+    --allow-policy)
+      [ "$#" -ge 2 ] && [ -n "$2" ] && [[ "$2" != *:* ]] \
+        || { echo "quarantine failed: invalid arg for $1" >&2; exit 1; }
+      ALLOW_POLICY_PATHS="${ALLOW_POLICY_PATHS:+$ALLOW_POLICY_PATHS:}$2"; shift 2 ;;
+    *) echo "quarantine failed: unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+export ALLOWED_PREFIXES ALLOW_EXEC_PATHS ALLOW_POLICY_PATHS
 
 qgit() {
   git -c core.hooksPath=/dev/null \
@@ -134,7 +154,6 @@ qgit() {
       -c fetch.fsckObjects=true "$@"
 }
 
-base="$(qgit rev-parse --verify "${base}^{commit}")"
 quarantine_keep=0
 cleanup_quarantine() {
   if [ "$quarantine_keep" -ne 1 ]; then
@@ -144,33 +163,39 @@ cleanup_quarantine() {
 trap cleanup_quarantine EXIT
 fail() { echo "quarantine failed: $*" >&2; exit 1; }
 
+base="$(qgit rev-parse --verify "${base}^{commit}")" \
+  || fail "invalid base commit"
+
 # 1. Import into a quarantine ref without touching the working tree.
 # Preferred transport: git bundle created with `git bundle create <file> HEAD`.
-qgit bundle verify "$bundle" >/dev/null
+qgit bundle verify "$bundle" >/dev/null || fail "bundle verify failed"
 qgit fetch --no-tags --no-write-fetch-head --no-recurse-submodules "$bundle" \
-  "+HEAD:refs/quarantine/$task"
+  "+HEAD:refs/quarantine/$task" || fail "quarantine fetch failed"
 
 # Fallback transport (separate local clone; neutralize target repo config):
 # qgit fetch --no-tags --no-write-fetch-head --no-recurse-submodules \
 #   --upload-pack='git -c core.hooksPath=/dev/null -c core.fsmonitor=false '\
 # 'upload-pack' \
-#   "$worker_repo" "+$worker_ref:refs/quarantine/$task"
+#   "$worker_repo" "+$worker_ref:refs/quarantine/$task" \
+#   || fail "quarantine fetch failed"
 
-head="$(qgit rev-parse --verify "refs/quarantine/$task^{commit}")"
+head="$(qgit rev-parse --verify "refs/quarantine/$task^{commit}")" \
+  || fail "missing quarantine commit"
 if [ "$head" != "$expected_worker_sha" ]; then fail "unexpected SHA"; fi
 if ! qgit merge-base --is-ancestor "$base" "$head"; then
   fail "worker head does not descend from base"
 fi
 if [ "$base" = "$head" ]; then fail "worker produced no new commits"; fi
-merges="$(qgit rev-list --count --min-parents=2 "$base..$head")"
+merges="$(qgit rev-list --count --min-parents=2 "$base..$head")" \
+  || fail "merge-commit count failed"
 if [ "$merges" -ne 0 ]; then fail "merge commit in worker range"; fi
 
 # Mechanically audit EVERY commit in base..head (catches add-then-delete,
 # forbidden modes, out-of-scope, hidden dot-directories/dotfiles, policy/config
 # paths, non-ASCII/homoglyph/bidi/control characters) plus full-tree path and
 # directory-prefix casefold/NFC collisions.
-# Env vars: ALLOWED_PREFIXES (required, colon-separated, never '.'); optional
-# exact-path allowlists ALLOW_EXEC_PATHS and ALLOW_POLICY_PATHS.
+# Env vars: ALLOWED_PREFIXES (required, colon-separated, never '.'); per-run
+# --allow-exec / --allow-policy flags populate ALLOW_EXEC_PATHS / ALLOW_POLICY_PATHS.
 qgit rev-list --reverse "$base..$head" | qgit diff-tree --stdin -r -z \
   --no-commit-id --no-renames -m --root | python3 -B -c '
 import os, pathlib, sys, unicodedata
@@ -282,25 +307,28 @@ quarantine_keep=1
 ```
 
 On any failure (including unset variables), the `EXIT` trap removes
-`refs/quarantine/$task` automatically and rejects the worker result. Only when
-a worker's assigned scope explicitly authorizes an executable script (`100755`)
-or a TCB, CI, governing-doc, dot-prefixed, or policy path may the coordinator
-pass that exact path via `ALLOW_EXEC_PATHS` or `ALLOW_POLICY_PATHS` (note that
-an executable script inside a forbidden directory or extension—such as a `.sh`
-or `.py` file under `ci/` or `trusted/`—must be listed in **both**
-`ALLOW_EXEC_PATHS` and `ALLOW_POLICY_PATHS`; neither ever bypasses mode, ASCII,
-scope, `.git` / `.git*`, `.cargo`, `rust-toolchain*`, `.envrc`, non-TCB
-`lean-toolchain`, `AGENTS.override.md`, or build-artifact (`target`, `.lake`,
-`/result*`, `.olean`/`.ilean`/`.ir*`) checks)—and must then route the
-integrated result to [`trust-review`](../trust-review/SKILL.md) (converging
-local Pass 2 or Pass 1 trust review across `main..<head>` before any push per
+`refs/quarantine/$task` automatically and rejects the worker result. The script
+always clears any inherited `ALLOW_EXEC_PATHS` and `ALLOW_POLICY_PATHS`
+environment variables; only when a worker's assigned scope explicitly
+authorizes an executable script (`100755`) or a TCB, CI, governing-doc,
+dot-prefixed, or policy path may the coordinator pass that exact path per run
+via `--allow-exec <path>` or `--allow-policy <path>` (note that an executable
+script inside a forbidden directory or extension—such as a `.sh` or `.py` file
+under `ci/` or `trusted/`—must be passed to **both** `--allow-exec` and
+`--allow-policy`; neither ever bypasses mode, ASCII, scope, `.git` / `.git*`,
+`.cargo`, `rust-toolchain*`, `.envrc`, non-TCB `lean-toolchain`,
+`AGENTS.override.md`, or build-artifact (`target`, `.lake`, `/result*`,
+`.olean`/`.ilean`/`.ir*`) checks)—and must then route the integrated result to
+[`trust-review`](../trust-review/SKILL.md) (converging local Pass 2 or Pass 1
+trust review across `main..<head>` before any push per
 [`change-review`](../change-review/SKILL.md#schedule-by-data-dependency)).
 
 Only after every check passes may the coordinator integrate the commits (via
-fast-forward when linear history permits, or `qgit cherry-pick "$base..$head"`,
+fast-forward when linear history permits, or `git -c core.hooksPath=/dev/null
+-c core.fsmonitor=false -c core.symlinks=false cherry-pick "$base..$head"`,
 passing `-c user.name=... -c user.email=...` if your committer identity is not
-configured locally in the coordinator repo), delete `refs/quarantine/$task`, run
-non-elaborating syntactic audits before any OS-sandboxed build or Lean
+configured locally in the coordinator repo), delete `refs/quarantine/$task`,
+run non-elaborating syntactic audits before any OS-sandboxed build or Lean
 elaboration on untrusted worker code, and route the integrated result into
 [`trust-review`](../trust-review/SKILL.md).
 

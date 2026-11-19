@@ -31,11 +31,11 @@ integration, publication, and stack locking or rebasing.
 - **Part II (Authors and coordinators):** Authors and coordinators read
   [Part II](#part-ii-for-authors-and-coordinators) to size refinement, delegate
   review, pipeline work, adjudicate findings, and converge merge gates. Part II
-  grants no authority to push, open, update, merge, or close pull requests, add
-  or remove approval reactions, author or simulate human maintainer
-  dispositions, launch services, spend paid compute, acquire paid capabilities,
-  or expose private context to a new service; scale fan-out strictly within the
-  already authorized environment and budget.
+  grants no authority to push, open, update, merge, or close pull requests,
+  self-approve pull requests, author or simulate human maintainer dispositions,
+  launch services, spend paid compute, acquire paid capabilities, or expose
+  private context to a new service; scale fan-out strictly within the already
+  authorized environment and budget.
 
 ---
 
@@ -293,18 +293,18 @@ trivial edits incur zero needless ceremony:
 - **Independent fresh-context review:** Inspect actual host capabilities rather
   than assuming subagents exist. Launch delegated reviewers from a clean
   `<target_base>` worktree or neutral directory—never inside an unaudited
-  candidate-head checkout when instructions or agent configs change. Pass fresh
-  confirmation reviewers only the governing contract, exact comparison tuple,
-  relevant requirements or design decisions, drafted PR `Human review surface`
-  block and relevant commit messages (as untrusted claims to verify), reference
-  preflight receipt, and source—never prior review transcripts, prior findings,
-  author self-defense, or an expected verdict (verify closure of prior findings
-  in a separate warm check or coordinator adjudication, keeping fresh
-  confirmation unanchored). Assign the strongest available reviewer capability
-  to `trust-review` and complex diffs. Use distinct model families across
-  authoring, review, challenger, and fresh-critic roles when available within
-  authorized compute, and cross-check any accepted repair that implements a
-  reviewer's concrete design on a different model family when available.
+  candidate-head checkout. Pass fresh confirmation reviewers only the governing
+  contract, exact comparison tuple, relevant requirements or design decisions,
+  drafted PR `Human review surface` block and relevant commit messages (as
+  untrusted claims to verify), reference preflight receipt, and source—never
+  prior review transcripts, prior findings, author self-defense, or an expected
+  verdict (verify closure of prior findings in a separate warm check or
+  coordinator adjudication, keeping fresh confirmation unanchored). Assign the
+  strongest available reviewer capability to `trust-review` and complex diffs.
+  Use distinct model families across authoring, review, challenger, and
+  fresh-critic roles when available within authorized compute, and cross-check
+  any accepted repair that implements a reviewer's concrete design on a
+  different model family when available.
 - **Bounded read-only slice-sharding:** For large multi-subsystem diffs
   (especially touching `trusted/`, `ci/`, or `.github/`), only the coordinator
   may partition the inventory into one level of disjoint read-only domain
@@ -353,8 +353,8 @@ than serializing independent work, while keeping coordinator compute lean:
   **CI-executed surfaces** as any Pass 2 trigger in
   [`trust-review`](../trust-review/SKILL.md#map-every-path-to-a-surface) plus
   non-Pass-2 CI-executed paths (`build.rs`, proc-macros, editor, agent, or
-  toolchain configs, or worker code integrated via `ALLOW_EXEC_PATHS` or
-  `ALLOW_POLICY_PATHS`). Freeze SHA -> complete static Pass 1 hygiene and
+  toolchain configs, or worker code integrated via `--allow-exec` or
+  `--allow-policy`). Freeze SHA -> complete static Pass 1 hygiene and
   deterministic preflight -> apply the cumulative gate:
   - If `main..<head>` touches **no CI-executed surfaces**, when authorized,
     publish a draft PR per

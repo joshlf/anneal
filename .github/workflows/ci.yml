@@ -111,7 +111,10 @@ jobs:
           exec > >(tee "$ANNEAL_BUILD_DIAGNOSTICS/startup.log") 2>&1
           sha256sum --check --strict trusted/root-manifest.sha256
           for p in .cargo rust-toolchain rust-toolchain.toml; do
-            test ! -e "$p" && test ! -L "$p"
+            if [ -e "$p" ] || [ -L "$p" ]; then
+              echo "forbidden root config override: $p" >&2
+              exit 1
+            fi
           done
           printf 'source_revision=%s\n' "$(git rev-parse HEAD)"
 
@@ -244,7 +247,10 @@ jobs:
           exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/startup.log") 2>&1
           sha256sum --check --strict trusted/root-manifest.sha256
           for p in .cargo rust-toolchain rust-toolchain.toml; do
-            test ! -e "$p" && test ! -L "$p"
+            if [ -e "$p" ] || [ -L "$p" ]; then
+              echo "forbidden root config override: $p" >&2
+              exit 1
+            fi
           done
           revision="$(git rev-parse HEAD)"
           printf 'ANNEAL_TEST_SOURCE_REVISION=%s\n' "$revision" >> "$GITHUB_ENV"
