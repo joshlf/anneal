@@ -255,7 +255,7 @@ theorem canary_part1_allocWorldRel_lifecycle :
      (lw8.isAllocLive testId2 = kw8.isAllocLive testId2) ∧
      (lw8.getAllocInfo testId3 = kw8.getAllocInfo testId3) ∧
      (lw8.getLiveAllocSizeAndAlign testId3 = kw8.getLiveAllocSizeAndAlign testId3) ∧
-     kw0 = kw0 ∧
+     KeyedAllocWorld.ofLinear lwPermAsc = kwPermAsc ∧
      (match lw0.updateLiveBytes testId1 [(.init 9 none)], kw0.updateLiveBytes testId1 [(.init 9 none)] with
       | .error e₁, .error e₂ => e₁ = e₂
       | .ok lw', .ok kw' => AllocWorldRel lw' kw'
@@ -274,7 +274,13 @@ theorem canary_part1_allocWorldRel_lifecycle :
     simp
   have hlin2 := linearContains_eq_isSome_linearFind? [(testId1, 5)] testId1
   have r0 := allocWorldRel_empty
-  have huniq : KeyedAllocWorld.empty = KeyedAllocWorld.empty := allocWorldRel_keyed_unique r0 r0
+  -- `[adv B1]`: A0 instantiated uniqueness on the *same* world twice (`kw0 = kw0`, a tautology);
+  -- here two syntactically different keyed constructions — the `foldr` first-match projection and
+  -- an `insertLive` history — are identified by `allocWorldRel_keyed_unique`.
+  have hrelAsc : AllocWorldRel lwPermAsc kwPermAsc :=
+    allocWorldRel_insertLive (allocWorldRel_insertLive r0 testId1 entryHeap8) testIdMax entryStack16
+  have huniq : KeyedAllocWorld.ofLinear lwPermAsc = kwPermAsc :=
+    allocWorldRel_keyed_unique (allocWorldRel_ofLinear lwPermAsc) hrelAsc
   have hupd_miss := allocWorldRel_updateLiveBytes r0 testId1 [(.init 9 none)]
   have ⟨_, r1⟩ := allocWorldRel_reserveAllocId r0
   have ⟨_, r2⟩ := allocWorldRel_allocate r1 entryHeap8 1024 (some ⟨1, 10, 5, false⟩)
@@ -357,7 +363,7 @@ def dupDeadKeyedWorld : KeyedAllocWorld :=
 properties:
 1. Dangling address `.danglingAddress 0x1000` -> `.danglingPointer`,
 2. Nonzero offset `.provenanced testId1 4` -> `.nonzeroAllocationOffset` & `testId1` stays live,
-3. Double-free `.provenanced testId2 0` with wrong layout & wrong kind -> `.alreadyDeallocated`
+3. Double-free `.provenanced testId2 0` with wrong layout & wrong kind -> `.useAfterFree`
    beats layout/kind mismatch,
 4. Global vtable `.provenanced testIdMaxPrev 0` -> `.globalAllocationDeallocation _ .vtable`,
 5. Post-removal failure (immutable, wrong kind, wrong layout, AND hook fault) detaches `live` & `race`
@@ -369,7 +375,7 @@ theorem canary_part1_deallocate_failure_ordering_and_state_retention :
     deallocRichKeyedWorld.deallocate (.provenanced testId1 4) (some (8, 8)) .heap .ok =
       (deallocRichKeyedWorld, none, .error (.nonzeroAllocationOffset testId1 4)) ∧
     (deallocRichKeyedWorld.deallocate (.provenanced testId2 0) (some (999, 64)) .stack .ok).2.2 =
-      .error (.alreadyDeallocated testId2) ∧
+      .error (.useAfterFree testId2) ∧
     deallocRichKeyedWorld.deallocate (.provenanced testIdMaxPrev 0) none .heap .ok =
       (deallocRichKeyedWorld, none, .error (.globalAllocationDeallocation testIdMaxPrev .vtable)) ∧
     (let resK := deallocRichKeyedWorld.deallocate (.provenanced testId1 0) (some (8, 8)) .stack .ok
@@ -471,6 +477,129 @@ theorem canary_part1_deallocate_failure_ordering_and_state_retention :
     hpostKind,
     hpostHook,
     hdup
+  ⟩
+
+/-- `[adv B1]` keyed world: live heap allocation `testId1` whose race clock records a write by
+thread `1` at time `7` (last read at `3`). -/
+def raceWorld : KeyedAllocWorld :=
+  (KeyedAllocWorld.empty.insertLive testId1 entryHeap8).setRace testId1 ⟨1, 7, 3, false⟩
+
+/-- Linear twin of `raceWorld`. -/
+def raceWorldLinear : LinearAllocWorld :=
+  (LinearAllocWorld.empty.insertLive testId1 entryHeap8).setRace testId1 ⟨1, 7, 3, false⟩
+
+/-- Linear world with a *shadowed duplicate* `live` key (unreachable by `filter`+`push`). -/
+def lwShadow : LinearAllocWorld :=
+  { LinearAllocWorld.empty with live := [(testId1, entryHeap8), (testId1, entryStack16)] }
+
+/-- **`[adv B1]` Closed canary — upstream `useAfterFree`, bidirectional totality, race-check order**:
+1. Freeing a never-issued id (`testIdMax`) and a double free whose tombstone was GC-pruned
+   (`dead := ∅`) both report `.useAfterFree` — `deallocate` never consults `dead`.
+2. `AllocWorldRel` is total both ways: a shadowed-duplicate linear world projects with first-match
+   semantics, every keyed world has a linear partner, and the relation is the graph of `ofLinear`.
+3. The race verdict is computed from the race entry *before* cleanup: a racing actor (thread `2`,
+   view `5 < 7`) faults with `DataRace` and the entry is dropped only afterwards; cleaning the entry
+   *first* (buggy order) silently succeeds; a synchronized actor (view `9`) succeeds; a race-free
+   actor then reaches the Tree Borrows protector verdict; linear and keyed machines agree. -/
+theorem canary_part1_useAfterFree_totality_and_race_order :
+    deallocRichKeyedWorld.deallocate (.provenanced testIdMax 0) (some (8, 8)) .heap .ok =
+      (deallocRichKeyedWorld, none, .error (.useAfterFree testIdMax)) ∧
+    ({ deallocRichKeyedWorld with dead := ∅ } : KeyedAllocWorld).deallocate (.provenanced testId2 0)
+        (some (999, 64)) .stack .ok =
+      ({ deallocRichKeyedWorld with dead := ∅ }, none, .error (.useAfterFree testId2)) ∧
+    (KeyedAllocWorld.ofLinear lwShadow).findLive? testId1 = some entryHeap8 ∧
+    AllocWorldRel (LinearAllocWorld.ofKeyed kwPermDesc) kwPermDesc ∧
+    (AllocWorldRel lwPermAsc kwPermDesc ↔ kwPermDesc = KeyedAllocWorld.ofLinear lwPermAsc) ∧
+    (let r := raceWorld.deallocateMachine (.provenanced testId1 0)
+       (some (entryHeap8.sizeBytes, entryHeap8.alignBytes)) entryHeap8.kind ⟨2, 5⟩ .ok
+     r.2.1 = some (testId1, entryHeap8) ∧
+     r.2.2 = .error (.hookFailure "DataRace") ∧
+     r.1.findLive? testId1 = none ∧
+     r.1.findRace? testId1 = none ∧
+     r.1.findDead? testId1 = none ∧
+     ((raceWorld.removeRace testId1).deallocateMachine (.provenanced testId1 0)
+       (some (entryHeap8.sizeBytes, entryHeap8.alignBytes)) entryHeap8.kind ⟨2, 5⟩ .ok).2.2 =
+       .ok ()) ∧
+    (raceWorld.deallocateMachine (.provenanced testId1 0) (some (8, 8)) .heap ⟨2, 9⟩ .ok).2.2 =
+      .ok () ∧
+    (raceWorld.deallocateMachine (.provenanced testId1 0) (some (8, 8)) .heap ⟨1, 0⟩
+      (.protectedBorrowFault 4)).2.2 = .error (.hookFailure "TreeBorrowsProtectedDealloc") ∧
+    (let (lw', detL, outL) := raceWorldLinear.deallocateMachine (.provenanced testId1 0)
+       (some (8, 8)) .heap ⟨2, 5⟩ .ok
+     let (kw', detK, outK) := raceWorld.deallocateMachine (.provenanced testId1 0)
+       (some (8, 8)) .heap ⟨2, 5⟩ .ok
+     detL = detK ∧ outL = outK ∧ AllocWorldRel lw' kw') := by
+  have hNotLiveMax : deallocRichKeyedWorld.findLive? testIdMax = none := by
+    unfold deallocRichKeyedWorld KeyedAllocWorld.findLive? KeyedAllocWorld.insertLive
+      KeyedAllocWorld.setRace KeyedAllocWorld.insertDead KeyedAllocWorld.registerGlobal
+      KeyedAllocWorld.empty
+    dsimp only
+    repeat rw [ExtTreeMap0.get?_insert]
+    rw [ExtTreeMap0.get?_empty]
+    decide
+  have hNotGlobMax : deallocRichKeyedWorld.findGlobal? testIdMax = none := by
+    unfold deallocRichKeyedWorld KeyedAllocWorld.findGlobal? KeyedAllocWorld.insertLive
+      KeyedAllocWorld.setRace KeyedAllocWorld.insertDead KeyedAllocWorld.registerGlobal
+      KeyedAllocWorld.empty
+    dsimp only
+    repeat rw [ExtTreeMap0.get?_insert]
+    rw [ExtTreeMap0.get?_empty]
+    decide
+  have hNotLive2 : deallocRichKeyedWorld.findLive? testId2 = none := by
+    unfold deallocRichKeyedWorld KeyedAllocWorld.findLive? KeyedAllocWorld.insertLive
+      KeyedAllocWorld.setRace KeyedAllocWorld.insertDead KeyedAllocWorld.registerGlobal
+      KeyedAllocWorld.empty
+    dsimp only
+    repeat rw [ExtTreeMap0.get?_insert]
+    rw [ExtTreeMap0.get?_empty]
+    decide
+  have hNotGlob2 : deallocRichKeyedWorld.findGlobal? testId2 = none := by
+    unfold deallocRichKeyedWorld KeyedAllocWorld.findGlobal? KeyedAllocWorld.insertLive
+      KeyedAllocWorld.setRace KeyedAllocWorld.insertDead KeyedAllocWorld.registerGlobal
+      KeyedAllocWorld.empty
+    dsimp only
+    repeat rw [ExtTreeMap0.get?_insert]
+    rw [ExtTreeMap0.get?_empty]
+    decide
+  have huafMax := keyedDeallocate_absent_reports_useAfterFree deallocRichKeyedWorld testIdMax
+    hNotLiveMax hNotGlobMax (some (8, 8)) .heap .ok ∅
+  have huaf2 := keyedDeallocate_absent_reports_useAfterFree deallocRichKeyedWorld testId2
+    hNotLive2 hNotGlob2 (some (999, 64)) .stack .ok ∅
+  have hshadow : (KeyedAllocWorld.ofLinear lwShadow).findLive? testId1 = some entryHeap8 :=
+    ((allocWorldRel_ofLinear lwShadow).live_eq testId1).symm.trans (by decide)
+  have hRaceLive : raceWorld.findLive? testId1 = some entryHeap8 := by
+    unfold raceWorld KeyedAllocWorld.findLive? KeyedAllocWorld.insertLive KeyedAllocWorld.setRace
+      KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
+  have hRaceNoDead : raceWorld.findDead? testId1 = none := by
+    unfold raceWorld KeyedAllocWorld.findDead? KeyedAllocWorld.insertLive KeyedAllocWorld.setRace
+      KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_empty]
+  have hRaceClk : raceWorld.findRace? testId1 = some ⟨1, 7, 3, false⟩ := by
+    unfold raceWorld KeyedAllocWorld.findRace? KeyedAllocWorld.insertLive KeyedAllocWorld.setRace
+      KeyedAllocWorld.empty
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
+  have hracy : raceDeallocVerdict ⟨2, 5⟩ ⟨1, 7, 3, false⟩ ≠ .ok := by decide
+  have horder := keyedDeallocateMachine_race_checked_before_cleanup raceWorld testId1 entryHeap8
+    ⟨1, 7, 3, false⟩ ⟨2, 5⟩ .ok hRaceLive rfl hRaceNoDead hRaceClk hracy
+  have hrelRace : AllocWorldRel raceWorldLinear raceWorld :=
+    allocWorldRel_setRace (allocWorldRel_insertLive allocWorldRel_empty testId1 entryHeap8)
+      testId1 ⟨1, 7, 3, false⟩
+  have hmachine := allocWorldRel_deallocateMachine hrelRace (.provenanced testId1 0)
+    (some (8, 8)) .heap ⟨2, 5⟩ .ok
+  exact ⟨
+    huafMax.1,
+    huaf2.2,
+    hshadow,
+    allocWorldRel_ofKeyed kwPermDesc,
+    allocWorldRel_iff_eq_ofLinear lwPermAsc kwPermDesc,
+    horder,
+    rfl,
+    rfl,
+    hmachine
   ⟩
 
 /-! ## Section 2: Part 2A & 2B Closed Canaries (`charon#1619/#1620` + `minirust#295`) -/
@@ -783,6 +912,98 @@ theorem canary_part2B_mixed_composite_static_with_padding :
      evalRawMutStaticWrite st 3 [(.init 1 none), (.init 2 none)] = .ub) := by
   decide +kernel
 
+/-- **`[adv B1]` Closed canary — upstream `RetagPolicy.create` mirror & world-level protector
+conflict**:
+1. Pinned upstream `create` at `FnEntry` gives `&mut T` an inside permission `.Unique` (parent
+   `.Write` access) with implicit writes, but `.ReservedFrz false` (parent `.Read` access only) under
+   `#[rustc_no_writable]`; implicit writes never occur outside `FnEntry` (`.Default` mode).
+2. `selectFnEntryPolicy_eq_upstream_create` instantiated on both policies.
+3. After a `rustcNoWritable` retag, a write through the parent tag `1` faults with
+   `.protectedForeignConflict` at the `execBorrowWrite` level. -/
+theorem canary_part2A_upstream_create_mirror_and_parent_write_conflict :
+    (MiriRetagPolicyMirror.create ⟨true, true, true⟩ .Mutable .FnEntry ⟨true, false⟩).map
+      (·.freezePermission) = some .Unique ∧
+    MiriRetagPolicyMirror.Permission.associatedAccess .Unique = some .Write ∧
+    (MiriRetagPolicyMirror.create ⟨true, true, true⟩ .Mutable .FnEntry ⟨true, true⟩).map
+      (·.freezePermission) = some (.ReservedFrz false) ∧
+    MiriRetagPolicyMirror.Permission.associatedAccess (.ReservedFrz false) = some .Read ∧
+    (MiriRetagPolicyMirror.create ⟨true, true, true⟩ .Mutable .Default ⟨true, false⟩).map
+      (·.freezePermission) = some (.ReservedFrz false) ∧
+    (selectFnEntryPolicy unpinFreezeFacts .mutable true .writableChildWrite).map
+        (fun s => (s.freezePerm, s.nonfreezePerm, s.outsidePerm, some s.protector,
+          s.performsImplicitWrite)) =
+      (MiriRetagPolicyMirror.create ⟨true, true, true⟩ .Mutable .FnEntry ⟨true, false⟩).map
+        (fun n => (n.freezePermission.toAbstractPerm, n.nonfreezePermission.toAbstractPerm,
+          n.outsidePermission.toAbstractPerm,
+          n.protector.map MiriRetagPolicyMirror.ProtectorKind.toStrength,
+          n.freezePermission.associatedAccess == some .Write)) ∧
+    (selectFnEntryPolicy unpinNonFreezeFacts .box true .rustcNoWritable).map
+        (fun s => (s.freezePerm, s.nonfreezePerm, s.outsidePerm, some s.protector,
+          s.performsImplicitWrite)) =
+      (MiriRetagPolicyMirror.create ⟨true, true, false⟩ .Box .FnEntry ⟨true, true⟩).map
+        (fun n => (n.freezePermission.toAbstractPerm, n.nonfreezePermission.toAbstractPerm,
+          n.outsidePermission.toAbstractPerm,
+          n.protector.map MiriRetagPolicyMirror.ProtectorKind.toStrength,
+          n.freezePermission.associatedAccess == some .Write)) ∧
+    execBorrowWrite {
+        allocId := 10
+        bytes := [.uninit, .uninit, .uninit, .uninit]
+        nodes := [
+          ⟨3, 10, 0, 4, .reservedFrz false, some 1, some 1⟩,
+          ⟨2, 10, 0, 4, .frozen, none, some 1⟩,
+          ⟨1, 10, 0, 4, .unique, none, none⟩
+        ]
+        activeProtectors := ProtectorSet.empty.insert 1
+        nextTag := 4
+        nextProtector := 2
+      } 1 0 [(.init 0x2A none), (.init 0x00 none), (.init 0x00 none), (.init 0x00 none)] =
+      .error .protectedForeignConflict := by
+  have hmirW := selectFnEntryPolicy_eq_upstream_create unpinFreezeFacts .mutable true false
+  have hmirN := selectFnEntryPolicy_eq_upstream_create unpinNonFreezeFacts .box true true
+  have hparent := rustcNoWritable_parentWrite_faults_on_protected_child 10
+    [.uninit, .uninit, .uninit, .uninit]
+    [(.init 0x2A none), (.init 0x00 none), (.init 0x00 none), (.init 0x00 none)]
+    (by decide) (by decide)
+  exact ⟨rfl, rfl, rfl, rfl, rfl, hmirW, hmirN, hparent⟩
+
+/-- **`[adv B1]` Closed canary — `charon#1620` separation under Miri's allocation mutability**:
+a mixed `(Freeze, UnsafeCell)` static is interned *mutable*, so the read-only check does not save
+the erased lowering: writing the `Freeze` `flag` byte through pre-`#1620` erased
+`&raw const STATIC` succeeds (genuinely unsound), the preserved temporary retag faults, and the
+`UnsafeCell` field stays writable. A pure `Freeze` static, by contrast, is interned read-only, so
+Miri catches the erased write anyway (A0's pure-`Freeze` separation needs a semantics without
+allocation mutability). -/
+theorem canary_part2B_mixed_static_erasure_unsound_under_miri_mutability :
+    staticAllocMutability mixedCompositeStaticDesc = .mut ∧
+    staticAllocMutability (.unsafeCell 4) = .mut ∧
+    (match evalRawMutStaticWriteMiri mixedCompositeStaticDesc
+        (retagStaticErased 60 mixedCompositeStaticDesc mixedCompositeInitBytes) 0
+        [(.init 1 none)] with
+     | .ok st => st.bytes.head? == some (.init 1 none)
+     | .ub => false) = true ∧
+    evalRawMutStaticWriteMiri mixedCompositeStaticDesc
+      (retagStaticPreserved 60 mixedCompositeStaticDesc mixedCompositeInitBytes) 0
+      [(.init 1 none)] = .ub ∧
+    (match evalRawMutStaticWriteMiri mixedCompositeStaticDesc
+        (retagStaticPreserved 60 mixedCompositeStaticDesc mixedCompositeInitBytes) 4
+        [(.init 1 none), (.init 2 none), (.init 3 none), (.init 4 none)] with
+     | .ok _ => true
+     | .ub => false) = true ∧
+    (staticAllocMutability (.freezeScalar 4) = .not ∧
+     evalRawMutStaticWriteMiri (.freezeScalar 4)
+       (retagStaticErased 50 (.freezeScalar 4)
+         [(.init 42 none), (.init 0 none), (.init 0 none), (.init 0 none)]) 0
+       [(.init 99 none), (.init 0 none), (.init 0 none), (.init 0 none)] = .ub ∧
+     evalRawMutStaticWriteMiri (.freezeScalar 4)
+       (retagStaticPreserved 50 (.freezeScalar 4)
+         [(.init 42 none), (.init 0 none), (.init 0 none), (.init 0 none)]) 0
+       [(.init 99 none), (.init 0 none), (.init 0 none), (.init 0 none)] = .ub) := by
+  have hpure := static_pureFreeze_erased_write_caught_by_readOnly_alloc 50 4 0
+    [(.init 42 none), (.init 0 none), (.init 0 none), (.init 0 none)]
+    [(.init 99 none), (.init 0 none), (.init 0 none), (.init 0 none)] (by decide)
+  exact ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, hpure⟩
+
 /-! ## Section 3: Part 3A, 3B, & 3C Closed Canaries (`lean-miri#75/#79/#82`) -/
 
 /-- Closed canary for Part 3A (`lean-miri#79`):
@@ -956,6 +1177,43 @@ theorem canary_part3B_principalLess_vtables_and_upcast :
   refine ⟨hidemp, hneLookup, hslotFail, ?_⟩
   decide +kernel
 
+/-- **`[adv B1]` Closed canary — upstream `checkForTypeRead` ignores auto traits and predicate
+order**:
+1. A principal-less `dyn Send` vtable matches an expected `dyn Sync` (A0 rejected it: false UB),
+2. `dyn Debug + Send + Sync` matches `dyn Debug`,
+3. principal-less vs principal-bearing still mismatches, as do distinct principals (`Debug` vs
+   `Display`),
+4. permuted/duplicated normalized predicates `[3, 1, 3]` vs `[1, 3]` match. -/
+theorem canary_part3B_vtable_trait_check_ignores_autoTraits :
+    vtableMatchesExpectedSpec (.principalLess [.send]) (.principalLess [.sync]) = true ∧
+    vtableMatchesExpectedSpec ⟨some debugPrincipal, AutoTraitSet.ofList [.send, .sync]⟩
+      ⟨some debugPrincipal, AutoTraitSet.ofList []⟩ = true ∧
+    vtableMatchesExpectedSpec (.principalLess [.send])
+      ⟨some debugPrincipal, AutoTraitSet.ofList [.send]⟩ = false ∧
+    vtableMatchesExpectedSpec ⟨some ⟨"core::fmt::Debug", [1], []⟩, AutoTraitSet.ofList []⟩
+      ⟨some ⟨"core::fmt::Display", [1], []⟩, AutoTraitSet.ofList []⟩ = false ∧
+    vtableMatchesExpectedSpec ⟨some ⟨"core::fmt::Debug", [3, 1, 3], []⟩, AutoTraitSet.ofList [.send]⟩
+      ⟨some ⟨"core::fmt::Debug", [1, 3], []⟩, AutoTraitSet.ofList []⟩ = true ∧
+    natListSubset [3, 1, 3] [1, 3] = true := by
+  have hign1 := vtableMatchesExpectedSpec_ignores_autoTraits none none
+    (AutoTraitSet.ofList [.send]) (AutoTraitSet.ofList []) (AutoTraitSet.ofList [.sync])
+    (AutoTraitSet.ofList [])
+  have hign2 := vtableMatchesExpectedSpec_ignores_autoTraits (some debugPrincipal)
+    (some debugPrincipal) (AutoTraitSet.ofList [.send, .sync]) (AutoTraitSet.ofList [])
+    (AutoTraitSet.ofList []) (AutoTraitSet.ofList [])
+  have hmem : ∀ x : Nat, x ∈ [3, 1, 3] ↔ x ∈ [1, 3] := by
+    intro x
+    simp only [List.mem_cons, List.not_mem_nil, or_false]
+    constructor
+    · rintro (h | h | h) <;> simp [h]
+    · rintro (h | h) <;> simp [h]
+  have hperm := vtableMatchesExpectedSpec_predicate_perm "core::fmt::Debug" "core::fmt::Debug"
+    [3, 1, 3] [1, 3] [1, 3] [] [] (AutoTraitSet.ofList [.send]) (AutoTraitSet.ofList []) hmem
+  have hsub : natListSubset [3, 1, 3] [1, 3] = true :=
+    (natListSubset_iff [3, 1, 3] [1, 3]).mpr (fun x hx => (hmem x).mp hx)
+  exact ⟨hign1.trans (by decide +kernel), hign2.trans (by decide +kernel), by decide +kernel,
+    by decide +kernel, hperm.trans (by decide +kernel), hsub⟩
+
 def wideDynWorldAndReg : KeyedAllocWorld × VTableRegistry × VTableDescriptor :=
   let descU64 : VTableDescriptor :=
     ⟨testId1, .u64, .principalLess [.send], "drop_u64", 8, 8,
@@ -979,7 +1237,11 @@ def wideDynWorldAndReg : KeyedAllocWorld × VTableRegistry × VTableDescriptor :
 1. Double-null separation (`(.null, .null)` reports `.invalidVTableNull` vs. legacy data-first
    `.nullSafePointer false`),
 2. All 6 invalid-vtable forms (`null`, `maybeNull`, `danglingInt`, `nonzeroOffset`, `notGlobalVTable`,
-   `invalidVTableTrait`) beat simultaneously invalid `.null` or unaligned `.danglingInt 3` data!
+   `invalidVTableTrait`) beat simultaneously invalid `.null` or unaligned `.danglingInt 3` data! The
+   trait-mismatch case uses a genuine *principal* mismatch (`u64 as dyn Send` vtable where
+   `dyn Debug + Send` is expected); `[adv B1]`: A0 used an auto-trait-only mismatch
+   (`dyn Send` vtable vs. expected `dyn Sync`), which upstream `checkForTypeRead` accepts — that
+   pointer now correctly reaches the data checks and reports `.danglingSafePointer`.
 3. When `vtablePtr` is valid (`u64 as dyn Send`), null data reports `.nullSafePointer false`,
    maybe-null data reports `.nullSafePointer true`, dangling data reports `.danglingSafePointer`
    (`mayDangle = false`), unaligned address `3` reports `.unalignedSafePointer 8 3` (`mayDangle = true`),
@@ -989,6 +1251,7 @@ theorem canary_part3C_wideDyn_vtable_precedence_and_valid_preservation :
     let (w, reg, _) := wideDynWorldAndReg
     let specSend := DynExistentialSpec.principalLess [.send]
     let specSync := DynExistentialSpec.principalLess [.sync]
+    let specDebugSend : DynExistentialSpec := ⟨some debugPrincipal, AutoTraitSet.ofList [.send]⟩
     let validVt := ScalarPtrHalf.provenanced 0x1000 testId1 0
     let validUnitVt := ScalarPtrHalf.provenanced 0x2000 testId2 0
     (validateWideDynSafePtr w reg maxRepresentableSize64 specSend false .null .null =
@@ -1003,8 +1266,10 @@ theorem canary_part3C_wideDyn_vtable_precedence_and_valid_preservation :
       .error .invalidVTableNonzeroOffset ∧
     validateWideDynSafePtr w reg maxRepresentableSize64 specSend false .null (.provenanced 0x3000 testIdMaxPrev 0) =
       .error .invalidVTableNotGlobalVTable ∧
-    validateWideDynSafePtr w reg maxRepresentableSize64 specSync false (.danglingInt 3) validVt =
+    validateWideDynSafePtr w reg maxRepresentableSize64 specDebugSend false (.danglingInt 3) validVt =
       .error .invalidVTableTrait ∧
+    validateWideDynSafePtr w reg maxRepresentableSize64 specSync false (.danglingInt 3) validVt =
+      .error .danglingSafePointer ∧
     validateWideDynSafePtr w reg maxRepresentableSize64 specSend false .null validVt =
       .error (.nullSafePointer false) ∧
     validateWideDynSafePtr w reg maxRepresentableSize64 specSend true .null validUnitVt =
@@ -1028,6 +1293,7 @@ theorem canary_part3C_wideDyn_vtable_precedence_and_valid_preservation :
       [.dropInPlace "drop_unit", .size 0, .align 1]⟩
   let specSend := DynExistentialSpec.principalLess [.send]
   let specSync := DynExistentialSpec.principalLess [.sync]
+  let specDebugSend : DynExistentialSpec := ⟨some debugPrincipal, AutoTraitSet.ofList [.send]⟩
   let validVt := ScalarPtrHalf.provenanced 0x1000 testId1 0
   let validUnitVt := ScalarPtrHalf.provenanced 0x2000 testId2 0
   have hdbl := wideDyn_doubleNull_separation w reg maxRepresentableSize64 specSend false
@@ -1037,19 +1303,31 @@ theorem canary_part3C_wideDyn_vtable_precedence_and_valid_preservation :
       .error .invalidVTableNonzeroOffset := rfl
   have hvNotGlob : validateVTableHalf w reg (.provenanced 0x3000 testIdMaxPrev 0) specSend =
       .error .invalidVTableNotGlobalVTable := by decide +kernel
-  have hvTrait : validateVTableHalf w reg validVt specSync = .error .invalidVTableTrait := by decide +kernel
+  have hglob1 : w.findGlobal? testId1 = some ⟨testId1, .vtable, 0, 8, .not⟩ := by decide +kernel
+  have hdesc1 : reg.byAlloc.get? testId1 = some descU64 := by decide +kernel
+  have hvTrait : validateVTableHalf w reg validVt specDebugSend = .error .invalidVTableTrait :=
+    validateVTableHalf_principalLess_vs_principal_invalidTrait w reg 0x1000 testId1
+      ⟨testId1, .vtable, 0, 8, .not⟩ descU64 debugPrincipal (AutoTraitSet.ofList [.send])
+      hglob1 rfl hdesc1 rfl
+  have hvSyncOk : validateVTableHalf w reg validVt specSync = .ok descU64 :=
+    validateVTableHalf_principalLess_ignores_autoTraits w reg 0x1000 testId1
+      ⟨testId1, .vtable, 0, 8, .not⟩ descU64 (AutoTraitSet.ofList [.sync]) hglob1 rfl hdesc1 rfl
   have hvOkU64 : validateVTableHalf w reg validVt specSend = .ok descU64 := by decide +kernel
   have hvOkUnit : validateVTableHalf w reg validUnitVt specSend = .ok descUnit := by decide +kernel
   have hdangUnalign := wideDyn_validVTable_dangling_and_unaligned
     w reg maxRepresentableSize64 specSend validVt descU64 ⟨8, 8, true, true⟩ 3
     hvOkU64 (by decide) (by decide) rfl rfl (by decide) (by decide)
+  have hdangSync := wideDyn_validVTable_dangling_and_unaligned
+    w reg maxRepresentableSize64 specSync validVt descU64 ⟨8, 8, true, true⟩ 3
+    hvSyncOk (by decide) (by decide) rfl rfl (by decide) (by decide)
   exact ⟨
     hdbl,
     wideDyn_invalidVTable_precedes_all_data_ub w reg maxRepresentableSize64 specSend false .null _ _ hvMaybe,
     wideDyn_invalidVTable_precedes_all_data_ub w reg maxRepresentableSize64 specSend false .null _ _ hvDang,
     wideDyn_invalidVTable_precedes_all_data_ub w reg maxRepresentableSize64 specSend false .null _ _ hvOff,
     wideDyn_invalidVTable_precedes_all_data_ub w reg maxRepresentableSize64 specSend false .null _ _ hvNotGlob,
-    wideDyn_invalidVTable_precedes_all_data_ub w reg maxRepresentableSize64 specSync false (.danglingInt 3) _ _ hvTrait,
+    wideDyn_invalidVTable_precedes_all_data_ub w reg maxRepresentableSize64 specDebugSend false (.danglingInt 3) _ _ hvTrait,
+    hdangSync.1,
     wideDyn_validVTable_nullData_reports_nullSafePointer w reg maxRepresentableSize64 specSend false validVt descU64 hvOkU64,
     wideDyn_validVTable_nullData_reports_nullSafePointer w reg maxRepresentableSize64 specSend true validUnitVt descUnit hvOkUnit,
     by decide +kernel,
@@ -1111,6 +1389,25 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_invalidVTable_precedes_a
 -/
 #guard_msgs in
 #print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_invalidVTable_precedes_all_data_ub
+
+/-- info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.allocWorldRel_iff_eq_ofLinear' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.allocWorldRel_iff_eq_ofLinear
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.keyedDeallocateMachine_race_checked_before_cleanup' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.keyedDeallocateMachine_race_checked_before_cleanup
+
+/-- info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.selectFnEntryPolicy_eq_upstream_create' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.selectFnEntryPolicy_eq_upstream_create
+
+/-- info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.vtableMatchesExpectedSpec_ignores_autoTraits' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.vtableMatchesExpectedSpec_ignores_autoTraits
 
 /-! ## Section 5: Deterministic Workload Generators & Elaboration Benchmarks (`M = 16, 64, 128, 256`) -/
 
@@ -1238,20 +1535,43 @@ run_cmd do
   let _ ← measureKernelDecideArm "Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite3LayoutFirst 8"
   let _ ← measureKernelDecideArm "Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite3FastPath 8"
 
-  let mut benchLines : Array String := #["=== BENCHMARK RECEIPTS (decide +kernel, warmed & interleaved) ==="]
+  let mut benchLines : Array String := #["=== BENCHMARK RECEIPTS (decide +kernel, warmed & interleaved, arm order alternates per scale) ==="]
+  -- `[adv B1]`: A0 always ran the baseline arm first at every scale; the first arm now alternates
+  -- (`M = 64, 256` run the second arm first) so neither arm systematically inherits warm caches.
   for m in sizes do
-    let (hbL, msL) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite1Linear {m}"
-    let (hbK, msK) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite1Keyed {m}"
+    let flip := m == 64 || m == 256
+    let (hbL, msL, hbK, msK) ← if flip then do
+        let (hbK, msK) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite1Keyed {m}"
+        let (hbL, msL) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite1Linear {m}"
+        pure (hbL, msL, hbK, msK)
+      else do
+        let (hbL, msL) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite1Linear {m}"
+        let (hbK, msK) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite1Keyed {m}"
+        pure (hbL, msL, hbK, msK)
     benchLines := benchLines.push
       s!"[Suite1 AllocWorld M={m}] Linear={hbL} hb ({msL.toString} ms) | Keyed={hbK} hb ({msK.toString} ms)"
   for m in sizes do
-    let (hbW, msW) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite2Writable {m}"
-    let (hbN, msN) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite2NoWritable {m}"
+    let flip := m == 64 || m == 256
+    let (hbW, msW, hbN, msN) ← if flip then do
+        let (hbN, msN) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite2NoWritable {m}"
+        let (hbW, msW) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite2Writable {m}"
+        pure (hbW, msW, hbN, msN)
+      else do
+        let (hbW, msW) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite2Writable {m}"
+        let (hbN, msN) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite2NoWritable {m}"
+        pure (hbW, msW, hbN, msN)
     benchLines := benchLines.push
       s!"[Suite2 FnEntryRetag M={m}] writableChildWrite={hbW} hb ({msW.toString} ms) | rustcNoWritable={hbN} hb ({msN.toString} ms)"
   for m in sizes do
-    let (hbLF, msLF) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite3LayoutFirst {m}"
-    let (hbFP, msFP) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite3FastPath {m}"
+    let flip := m == 64 || m == 256
+    let (hbLF, msLF, hbFP, msFP) ← if flip then do
+        let (hbFP, msFP) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite3FastPath {m}"
+        let (hbLF, msLF) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite3LayoutFirst {m}"
+        pure (hbLF, msLF, hbFP, msFP)
+      else do
+        let (hbLF, msLF) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite3LayoutFirst {m}"
+        let (hbFP, msFP) ← measureKernelDecideArm s!"Anneal.ExtTreeMapAllocAndNoWritableProtoTests.runSuite3FastPath {m}"
+        pure (hbLF, msLF, hbFP, msFP)
     benchLines := benchLines.push
       s!"[Suite3 RawPtrSized M={m}] LayoutFirst={hbLF} hb ({msLF.toString} ms) | FastPath={hbFP} hb ({msFP.toString} ms)"
   logInfo (String.intercalate "\n" benchLines.toList)
@@ -1299,7 +1619,22 @@ run_cmd do
         exprHasUnusedPlaceholderTo targetSet ty ||
         exprHasUnusedPlaceholderTo targetSet val ||
         exprHasUnusedPlaceholderTo targetSet body
-    | .app f a => exprHasUnusedPlaceholderTo targetSet f || exprHasUnusedPlaceholderTo targetSet a
+    | .app f a =>
+      -- `[adv B1]`: depending on the elaborator path, `have _ := @thm; b` can also surface as
+      -- `letFun thm (fun _ => b)` or as a beta-redex `(fun _ => b) thm`; flag both when the bound
+      -- value is unused (A0 only matched `.letE` and only self-tested a hand-built `.letE`).
+      let betaUnused :=
+        match f with
+        | .lam _ _ b _ => (!b.hasLooseBVars) && a.getUsedConstants.any (fun nm => targetSet.contains nm)
+        | _ => false
+      let letFunUnused :=
+        match f, a with
+        | .app (.app (.app (.const nm _) _) _) v, .lam _ _ b _ =>
+          nm == `letFun && (!b.hasLooseBVars) &&
+            v.getUsedConstants.any (fun c => targetSet.contains c)
+        | _, _ => false
+      betaUnused || letFunUnused ||
+        exprHasUnusedPlaceholderTo targetSet f || exprHasUnusedPlaceholderTo targetSet a
     | .lam _ ty b _ => exprHasUnusedPlaceholderTo targetSet ty || exprHasUnusedPlaceholderTo targetSet b
     | .forallE _ ty b _ => exprHasUnusedPlaceholderTo targetSet ty || exprHasUnusedPlaceholderTo targetSet b
     | .mdata _ e => exprHasUnusedPlaceholderTo targetSet e
@@ -1351,8 +1686,17 @@ run_cmd do
           placeholderUses := placeholderUses.push nm
 
   let allAuditRoots := protoAllDecls ++ testAllDecls
-  let (_, unsafeDecls, choiceAx, sorryAxFound, reduceAx) :=
+  let (auditVisited, unsafeDecls, choiceAx, sorryAxFound, reduceAx) :=
     collectTransitiveClosure env allAuditRoots
+  -- `[adv B1]`: A0 only looked for three *named* axioms, so a user-declared `axiom` anywhere in the
+  -- closure would have passed. Flag every axiom outside `{propext, Quot.sound}`.
+  let foreignAxiomsIn (env : Environment) (visited : NameSet) : Array Name := Id.run do
+    let mut out : Array Name := #[]
+    for nm in visited do
+      if let some (.axiomInfo _) := env.find? nm then
+        if nm != ``propext && nm != ``Quot.sound then
+          out := out.push nm
+    return out
   if !unsafeDecls.isEmpty then
     throwError "axiom audit FAILED: unsafe declarations found: {unsafeDecls}"
   if !choiceAx.isEmpty then
@@ -1361,6 +1705,9 @@ run_cmd do
     throwError "axiom audit FAILED: sorryAx dependency found!"
   if !reduceAx.isEmpty then
     throwError "axiom audit FAILED: Lean.ofReduceBool / native_decide dependency found!"
+  let foreignAx := foreignAxiomsIn env auditVisited
+  if !foreignAx.isEmpty then
+    throwError "axiom audit FAILED: axioms outside propext/Quot.sound found: {foreignAx}"
   if !conditionalTests.isEmpty then
     throwError "axiom audit FAILED: undischarged conditional test theorems found: {conditionalTests}"
   if !placeholderUses.isEmpty then
@@ -1405,6 +1752,18 @@ run_cmd do
     if !exprHasUnusedPlaceholderTo protoPublicThmSet placeholderExpr then
       throwError "audit self-test 3 FAILED: missed unused let placeholder!"
 
+  -- Self-test 3b (`[adv B1]`): rolled-back *elaborated* `have _ := @thm` placeholder probe (A0's
+  -- self-test 3 only checked a hand-built `.letE`, never what the elaborator actually emits).
+  withoutModifyingEnv do
+    let Except.ok stx3b := Parser.runParserCategory (← getEnv) `command
+      "theorem _probePlaceholderReal : True := by\n  have _ := @Anneal.ExtTreeMapAllocAndNoWritableProto.KeyedAllocWorld.ext\n  exact True.intro" "<probe3b>"
+      | throwError "self-test 3b parse failed"
+    elabCommand stx3b
+    let some (.thmInfo tv3b) := (← getEnv).find? `Anneal.ExtTreeMapAllocAndNoWritableProtoTests._probePlaceholderReal
+      | throwError "self-test 3b lookup failed"
+    if !exprHasUnusedPlaceholderTo protoPublicThmSet tv3b.value then
+      throwError "audit self-test 3b FAILED: missed an elaborated `have _ := @thm` placeholder!"
+
   -- Self-test 4: rolled-back conditional test theorem probe
   withoutModifyingEnv do
     let Except.ok stx4 := Parser.runParserCategory (← getEnv) `command
@@ -1417,11 +1776,22 @@ run_cmd do
       throwError "audit self-test 4 FAILED: missed conditional test theorem!"
 
   -- Self-test 5: clean constant false-positive guard
-  let (_, uClean, cClean, sClean, rClean) :=
+  let (visClean, uClean, cClean, sClean, rClean) :=
     collectTransitiveClosure env #[``Anneal.ExtTreeMapAllocAndNoWritableProto.KeyedAllocWorld.ext]
-  if !uClean.isEmpty || !cClean.isEmpty || !sClean.isEmpty || !rClean.isEmpty then
+  if !uClean.isEmpty || !cClean.isEmpty || !sClean.isEmpty || !rClean.isEmpty ||
+      !(foreignAxiomsIn env visClean).isEmpty then
     throwError "audit self-test 5 FAILED: false positive on clean theorem!"
 
-  logInfo s!"axiom audit passed: {allAuditRoots.size} declarations ({protoPublicThms.size} prototype public theorems, {closedTestWitnesses.size} closed test witnesses, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 placeholder uses, 0 undischarged conditional test theorems, 100% theorem reachability from closed test witnesses; 5/5 rolled-back self-tests passed)"
+  -- Self-test 6 (`[adv B1]`): a rolled-back user-declared axiom (added via `addDecl`, so no axiom
+  -- command appears in this file) must be flagged by the foreign-axiom check.
+  withoutModifyingEnv do
+    let probeAx : AxiomVal :=
+      { name := `probeForeignAxiomB1, levelParams := [], type := mkConst ``False, isUnsafe := false }
+    liftCoreM <| addDecl (.axiomDecl probeAx)
+    let (vis6, _, _, _, _) := collectTransitiveClosure (← getEnv) #[`probeForeignAxiomB1]
+    if (foreignAxiomsIn (← getEnv) vis6).isEmpty then
+      throwError "audit self-test 6 FAILED: missed a user-declared axiom!"
+
+  logInfo s!"axiom audit passed: {allAuditRoots.size} declarations ({protoPublicThms.size} prototype public theorems, {closedTestWitnesses.size} closed test witnesses, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 axioms outside propext/Quot.sound, 0 placeholder uses, 0 undischarged conditional test theorems, 100% theorem reachability from closed test witnesses; 7/7 rolled-back self-tests passed)"
 
 end Anneal.ExtTreeMapAllocAndNoWritableProtoTests

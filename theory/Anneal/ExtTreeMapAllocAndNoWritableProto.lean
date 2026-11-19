@@ -1309,6 +1309,40 @@ inductive DeallocHookSpec where
   | protectedBorrowFault (tag : Nat)
   deriving DecidableEq, Repr
 
+/-- Deallocating thread's view (`[adv B1]`), projected onto the scalar per-allocation clock of
+`RaceClockEntry` (the happens-before check `Miri.Concurrency.DataRace` performs for a
+`.Deallocate` write). -/
+structure DeallocActor where
+  thread : UInt32
+  observedTimestamp : UInt64
+  deriving DecidableEq, Repr
+
+/-- Scalar projection of `MachineHooks.memoryRaceAccess … (some .Deallocate)` in
+`AllocationMachine.before` (`[adv B1]`): a deallocation by a thread other than the recorded writer
+races unless the actor's view has caught up with both the last write and the last read timestamp. -/
+def raceDeallocVerdict (actor : DeallocActor) (clk : RaceClockEntry) : DeallocHookSpec :=
+  if clk.writerThread != actor.thread &&
+      (decide (actor.observedTimestamp < clk.writeTimestamp) ||
+        decide (actor.observedTimestamp < clk.readTimestamp)) then
+    .raceDataRaceFault clk.writerThread clk.writeTimestamp
+  else
+    .ok
+
+/-- Machine deallocation hook in exact `AllocationMachine.before` order (`[adv B1]`): the data-race
+access is checked against the per-allocation race entry *as it exists when the hook runs* (the
+`raceAllocations` filter only happens at the end of `before` and again after `deallocatePtrWith`
+returns a detached owner), and only a race-free deallocation proceeds to the Tree Borrows protector
+verdict `tb` (`deallocateBorrowRange`). A0's `deallocate` took the verdict as a free parameter, so it
+could not distinguish a check-then-cleanup machine from a buggy cleanup-then-check one. -/
+def machineDeallocHook (raceEntry : Option RaceClockEntry) (actor : DeallocActor)
+    (tb : DeallocHookSpec) : DeallocHookSpec :=
+  match raceEntry with
+  | none => tb
+  | some clk =>
+    match raceDeallocVerdict actor clk with
+    | .ok => tb
+    | fault => fault
+
 /-- Lifecycle errors for allocation and deallocation (`Miri.Memory.MemoryLifecycleError`). -/
 inductive AllocLifecycleErr where
   | allocationIdError (err : AllocIdErr)
@@ -1317,7 +1351,11 @@ inductive AllocLifecycleErr where
   | danglingPointer (addr : UInt64)
   | nonzeroAllocationOffset (allocId : MiriAllocId) (offsetBytes : UInt64)
   | globalAllocationDeallocation (allocId : MiriAllocId) (kind : GlobalAllocKind)
-  | alreadyDeallocated (allocId : MiriAllocId)
+  /-- Upstream `MemoryLifecycleError.useAfterFree` (`[adv B1]`, renamed from A0's invented
+  `alreadyDeallocated`): reported whenever `id` is absent from both `live` and the global table.
+  `deallocatePtrWith` never consults `dead` on this path, so a tombstoned double free, a never-issued
+  id, and a GC-pruned tombstone (`pruneDead`) are indistinguishable. -/
+  | useAfterFree (allocId : MiriAllocId)
   | immutableAllocation (allocId : MiriAllocId)
   | memoryKindMismatch (allocId : MiriAllocId)
   | layoutMismatch (allocId : MiriAllocId) (actualSize reqSize actualAlign reqAlign : UInt64)
@@ -1612,7 +1650,7 @@ def deallocate (w : LinearAllocWorld) (ptr : ResolvedDeallocPtr)
       | none =>
         match w.findGlobal? id with
         | some glob => (w, none, .error (.globalAllocationDeallocation id glob.kind))
-        | none => (w, none, .error (.alreadyDeallocated id))
+        | none => (w, none, .error (.useAfterFree id))
       | some entry =>
         let detached := some (id, entry)
         let afterFailCleanup := afterRemove.removeRace id
@@ -1774,7 +1812,7 @@ def deallocate (w : KeyedAllocWorld) (ptr : ResolvedDeallocPtr)
       | none =>
         match w.findGlobal? id with
         | some glob => (w, none, .error (.globalAllocationDeallocation id glob.kind))
-        | none => (w, none, .error (.alreadyDeallocated id))
+        | none => (w, none, .error (.useAfterFree id))
       | some entry =>
         let detached := some (id, entry)
         let afterFailCleanup := afterRemove.removeRace id
@@ -1808,6 +1846,123 @@ def deallocate (w : KeyedAllocWorld) (ptr : ResolvedDeallocPtr)
                 (afterDead, detached, .ok ())
 
 end KeyedAllocWorld
+
+/-- Machine-level deallocation (`AllocationMachine.deallocate`, `[adv B1]`): the hook verdict is
+*computed* from the world's own per-allocation race entry, read before any race cleanup, instead of
+being supplied as an unconstrained parameter. -/
+def LinearAllocWorld.deallocateMachine (w : LinearAllocWorld) (ptr : ResolvedDeallocPtr)
+    (reqLayout : Option (UInt64 × UInt64)) (reqKind : AllocMemoryKind)
+    (actor : DeallocActor) (tb : DeallocHookSpec) :
+    LinearAllocWorld × Option (MiriAllocId × LocalAllocEntry) × Except AllocLifecycleErr Unit :=
+  let raceEntry := match ptr with
+    | .provenanced id _ => w.findRace? id
+    | .danglingAddress _ => none
+  w.deallocate ptr reqLayout reqKind (machineDeallocHook raceEntry actor tb)
+
+/-- Keyed counterpart of `LinearAllocWorld.deallocateMachine` (`[adv B1]`). -/
+def KeyedAllocWorld.deallocateMachine (w : KeyedAllocWorld) (ptr : ResolvedDeallocPtr)
+    (reqLayout : Option (UInt64 × UInt64)) (reqKind : AllocMemoryKind)
+    (actor : DeallocActor) (tb : DeallocHookSpec) :
+    KeyedAllocWorld × Option (MiriAllocId × LocalAllocEntry) × Except AllocLifecycleErr Unit :=
+  let raceEntry := match ptr with
+    | .provenanced id _ => w.findRace? id
+    | .danglingAddress _ => none
+  w.deallocate ptr reqLayout reqKind (machineDeallocHook raceEntry actor tb)
+
+/-- Keyed projection of one linear table (`[adv B1]`): `foldr` inserts rows right-to-left, so the
+*first* row for each key (the one `linearFind?` returns) is inserted last and wins — reproducing
+first-match lookup even on linear tables that carry shadowed duplicate keys. -/
+def ofLinearRows {V : Type} (rows : List (MiriAllocId × V)) : ExtTreeMap0 MiriAllocId V :=
+  rows.foldr (fun row m => m.insert row.1 row.2) ∅
+
+theorem get?_ofLinearRows {V : Type} (rows : List (MiriAllocId × V)) (a : MiriAllocId) :
+    (ofLinearRows rows).get? a = linearFind? rows a := by
+  induction rows with
+  | nil => rfl
+  | cons hd tl ih =>
+    rcases hd with ⟨k, v⟩
+    show ((ofLinearRows tl).insert k v).get? a = linearFind? ((k, v) :: tl) a
+    rw [ExtTreeMap0.get?_insert, ih]
+    by_cases hka : k = a
+    · subst hka
+      simp [linearFind?, ReflCmp.compare_self]
+    · have hcmp : compare k a ≠ .eq := fun h => hka (LawfulEqCmp.eq_of_compare h)
+      have hbeq : (k == a) = false := beq_false_of_ne hka
+      simp [linearFind?, hcmp, hbeq, List.find?]
+
+private theorem linearFind?_none_of_all_gt {V : Type} {rows : List (MiriAllocId × V)}
+    {a : MiriAllocId} (h : ∀ q ∈ rows, compare a q.1 = .lt) : linearFind? rows a = none := by
+  induction rows with
+  | nil => rfl
+  | cons q rest ih =>
+    have hq : compare a q.1 = .lt := h q (List.mem_cons_self ..)
+    have hne : q.1 ≠ a := by
+      intro hqa
+      rw [hqa, ReflCmp.compare_self (cmp := compare)] at hq
+      nomatch hq
+    have hbeq : (q.1 == a) = false := beq_false_of_ne hne
+    have ih' := ih (fun q' hq' => h q' (List.mem_cons_of_mem _ hq'))
+    unfold linearFind? at ih' ⊢
+    simp [List.find?, hbeq, ih']
+
+private theorem lookupSorted_eq_linearFind? {V : Type} :
+    ∀ {rows : List (MiriAllocId × V)}, RawAATree.StrictlySorted compare rows →
+      ∀ a : MiriAllocId, RawAATree.lookupSorted compare rows a = linearFind? rows a
+  | [], _, _ => rfl
+  | (kx, vx) :: rest, hs, a => by
+    obtain ⟨hhead, hrest⟩ := List.pairwise_cons.mp hs
+    unfold RawAATree.lookupSorted
+    cases hc : compare a kx with
+    | lt =>
+      have hall : ∀ q ∈ (kx, vx) :: rest, compare a q.1 = .lt := by
+        intro q hq
+        rcases List.mem_cons.mp hq with rfl | hq'
+        · exact hc
+        · exact TransCmp.lt_trans hc (hhead q hq')
+      exact (linearFind?_none_of_all_gt hall).symm
+    | eq =>
+      have hak : a = kx := LawfulEqCmp.eq_of_compare hc
+      subst hak
+      simp [linearFind?, List.find?]
+    | gt =>
+      have hne : kx ≠ a := by
+        intro hka
+        subst hka
+        rw [ReflCmp.compare_self (cmp := compare)] at hc
+        nomatch hc
+      have hbeq : (kx == a) = false := beq_false_of_ne hne
+      rw [lookupSorted_eq_linearFind? hrest a]
+      simp [linearFind?, List.find?, hbeq]
+
+/-- The canonical sorted `toList` of a keyed table answers `linearFind?` exactly like `get?`
+(`[adv B1]`). -/
+theorem ExtTreeMap0.linearFind?_toList {V : Type} (m : ExtTreeMap0 MiriAllocId V)
+    (a : MiriAllocId) : linearFind? m.toList a = m.get? a := by
+  rcases m with ⟨q⟩
+  refine Quotient.inductionOn q (fun t => ?_)
+  change linearFind? t.val.toList a = t.val.get? compare a
+  rw [RawAATree.get?_eq_lookupSorted t.val t.property a]
+  exact (lookupSorted_eq_linearFind? (rows := t.val.toList) t.property a).symm
+
+/-- Keyed projection of an arbitrary (possibly duplicate-carrying) linear world (`[adv B1]`). -/
+def KeyedAllocWorld.ofLinear (lw : LinearAllocWorld) : KeyedAllocWorld where
+  nextAllocId := lw.nextAllocId
+  idSupplyExhausted := lw.idSupplyExhausted
+  issuedIds := ofLinearRows lw.issuedIds
+  live := ofLinearRows lw.live
+  dead := ofLinearRows lw.dead
+  globals := ofLinearRows lw.globals
+  race := ofLinearRows lw.race
+
+/-- Linear (sorted, duplicate-free) image of a keyed world (`[adv B1]`). -/
+def LinearAllocWorld.ofKeyed (kw : KeyedAllocWorld) : LinearAllocWorld where
+  nextAllocId := kw.nextAllocId
+  idSupplyExhausted := kw.idSupplyExhausted
+  issuedIds := kw.issuedIds.toList
+  live := kw.live.toList
+  dead := kw.dead.toList
+  globals := kw.globals.toList
+  race := kw.race.toList
 
 /-! ### Bidirectional Refinement Relation `AllocWorldRel` & Equivalence Theorems -/
 
@@ -1844,6 +1999,43 @@ theorem allocWorldRel_keyed_unique {lw : LinearAllocWorld} {kw₁ kw₂ : KeyedA
     (fun id => (h₁.dead_eq id).symm.trans (h₂.dead_eq id))
     (fun id => (h₁.globals_eq id).symm.trans (h₂.globals_eq id))
     (fun id => (h₁.race_eq id).symm.trans (h₂.race_eq id))
+
+/-- **Totality, Linear → Keyed (`allocWorldRel_ofLinear`, `[adv B1]`)**: *every* linear world —
+including ones carrying shadowed duplicate keys that no `filter`+`push` history produces — has a
+keyed refinement partner, namely its first-match projection `KeyedAllocWorld.ofLinear`. -/
+theorem allocWorldRel_ofLinear (lw : LinearAllocWorld) :
+    AllocWorldRel lw (KeyedAllocWorld.ofLinear lw) where
+  nextAllocId_eq := rfl
+  exhausted_eq := rfl
+  issued_eq a := (get?_ofLinearRows lw.issuedIds a).symm
+  live_eq a := (get?_ofLinearRows lw.live a).symm
+  dead_eq a := (get?_ofLinearRows lw.dead a).symm
+  globals_eq a := (get?_ofLinearRows lw.globals a).symm
+  race_eq a := (get?_ofLinearRows lw.race a).symm
+
+/-- **Totality, Keyed → Linear (`allocWorldRel_ofKeyed`, `[adv B1]`)**: every keyed world is the
+refinement of its sorted duplicate-free linear image, so `AllocWorldRel` is total in both directions
+(A0 proved only partner uniqueness and step preservation). -/
+theorem allocWorldRel_ofKeyed (kw : KeyedAllocWorld) :
+    AllocWorldRel (LinearAllocWorld.ofKeyed kw) kw where
+  nextAllocId_eq := rfl
+  exhausted_eq := rfl
+  issued_eq a := ExtTreeMap0.linearFind?_toList kw.issuedIds a
+  live_eq a := ExtTreeMap0.linearFind?_toList kw.live a
+  dead_eq a := ExtTreeMap0.linearFind?_toList kw.dead a
+  globals_eq a := ExtTreeMap0.linearFind?_toList kw.globals a
+  race_eq a := ExtTreeMap0.linearFind?_toList kw.race a
+
+/-- **`AllocWorldRel` Is Exactly the Graph of `ofLinear` (`allocWorldRel_iff_eq_ofLinear`,
+`[adv B1]`)**: the refinement relation is a total function from linear to keyed worlds. -/
+theorem allocWorldRel_iff_eq_ofLinear (lw : LinearAllocWorld) (kw : KeyedAllocWorld) :
+    AllocWorldRel lw kw ↔ kw = KeyedAllocWorld.ofLinear lw := by
+  constructor
+  · intro h
+    exact allocWorldRel_keyed_unique h (allocWorldRel_ofLinear lw)
+  · intro h
+    subst h
+    exact allocWorldRel_ofLinear lw
 
 theorem allocWorldRel_containsId_eq {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
     (hrel : AllocWorldRel lw kw) (id : MiriAllocId) :
@@ -2285,8 +2477,10 @@ theorem keyedDeallocate_nonzeroOffset_preserves_live (w : KeyedAllocWorld) (id :
   simp [KeyedAllocWorld.deallocate, hne]
 
 /-- **Failure Ordering 2**: Double-free (`id` absent from `live`, present in `dead`) reports
-`alreadyDeallocated id` *before* checking `reqKind`, `reqLayout`, or `hook` (even when `reqLayout`
-mismatches the tombstoned layout). -/
+`useAfterFree id` *before* checking `reqKind`, `reqLayout`, or `hook` (even when `reqLayout`
+mismatches the tombstoned layout), and keeps the tombstone. *Honest scope (`[adv B1]`)*: the
+`hdead` premise is used only for the tombstone-retention conjunct — `deallocate` never consults
+`dead` here; see `keyedDeallocate_absent_reports_useAfterFree`. -/
 theorem keyedDeallocate_doubleFree_precedes_layout_and_kind (w : KeyedAllocWorld) (id : MiriAllocId)
     (deadEntry : DeadAllocEntry)
     (hnotLive : w.findLive? id = none)
@@ -2294,8 +2488,27 @@ theorem keyedDeallocate_doubleFree_precedes_layout_and_kind (w : KeyedAllocWorld
     (hdead : w.findDead? id = some deadEntry)
     (reqLayout : Option (UInt64 × UInt64)) (reqKind : AllocMemoryKind) (hook : DeallocHookSpec) :
     let (w', det, out) := w.deallocate (.provenanced id 0) reqLayout reqKind hook
-    w' = w ∧ det = none ∧ out = .error (.alreadyDeallocated id) ∧ w'.findDead? id = some deadEntry := by
+    w' = w ∧ det = none ∧ out = .error (.useAfterFree id) ∧ w'.findDead? id = some deadEntry := by
   simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.removeLive, hnotLive, hnotGlobal, hdead]
+
+/-- **Use-After-Free Never Consults `dead` (`keyedDeallocate_absent_reports_useAfterFree`,
+`[adv B1]`)**: whenever `id` is absent from both `live` and the global table, deallocation reports
+`.useAfterFree id` and leaves the world untouched *whatever* the `dead` table contains — a tombstoned
+double free, a never-issued id, and a GC-pruned tombstone coincide, exactly as in upstream
+`deallocatePtrWith` (whose `removeLive` miss falls through to `findGlobal?` and then `useAfterFree`). -/
+theorem keyedDeallocate_absent_reports_useAfterFree (w : KeyedAllocWorld) (id : MiriAllocId)
+    (hnotLive : w.findLive? id = none) (hnotGlobal : w.findGlobal? id = none)
+    (reqLayout : Option (UInt64 × UInt64)) (reqKind : AllocMemoryKind) (hook : DeallocHookSpec)
+    (dead' : ExtTreeMap0 MiriAllocId DeadAllocEntry) :
+    w.deallocate (.provenanced id 0) reqLayout reqKind hook = (w, none, .error (.useAfterFree id)) ∧
+    ({ w with dead := dead' } : KeyedAllocWorld).deallocate (.provenanced id 0) reqLayout reqKind hook =
+      ({ w with dead := dead' }, none, .error (.useAfterFree id)) := by
+  have hl' : ({ w with dead := dead' } : KeyedAllocWorld).findLive? id = none := hnotLive
+  have hg' : ({ w with dead := dead' } : KeyedAllocWorld).findGlobal? id = none := hnotGlobal
+  constructor
+  · simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.removeLive, hnotLive, hnotGlobal]
+  · simp only [KeyedAllocWorld.deallocate, KeyedAllocWorld.removeLive, hl', hg',
+      bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
 
 /-- **Failure Ordering 3**: Attempting to deallocate a compiler global (`function`, `vtable`,
 `static`, etc.) reports `globalAllocationDeallocation id glob.kind` without mutating `w`. -/
@@ -2422,6 +2635,67 @@ theorem keyedDeallocate_duplicateDead_replaces_before_error
   simp [KeyedAllocWorld.insertDead, KeyedAllocWorld.removeRace,
     KeyedAllocWorld.findLive?, KeyedAllocWorld.findRace?, KeyedAllocWorld.findDead?]
 
+/-- **Machine Deallocation Refinement (`allocWorldRel_deallocateMachine`, `[adv B1]`)**: with the hook
+verdict computed from each world's own race table, linear and keyed machine deallocation still agree
+on detached owner, outcome, and successor `AllocWorldRel`. -/
+theorem allocWorldRel_deallocateMachine {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
+    (hrel : AllocWorldRel lw kw) (ptr : ResolvedDeallocPtr)
+    (reqLayout : Option (UInt64 × UInt64)) (reqKind : AllocMemoryKind)
+    (actor : DeallocActor) (tb : DeallocHookSpec) :
+    let (lw', detL, outL) := lw.deallocateMachine ptr reqLayout reqKind actor tb
+    let (kw', detK, outK) := kw.deallocateMachine ptr reqLayout reqKind actor tb
+    detL = detK ∧ outL = outK ∧ AllocWorldRel lw' kw' := by
+  unfold LinearAllocWorld.deallocateMachine KeyedAllocWorld.deallocateMachine
+  cases ptr with
+  | danglingAddress addr =>
+    exact allocWorldRel_deallocate hrel (.danglingAddress addr) reqLayout reqKind
+      (machineDeallocHook none actor tb)
+  | provenanced id off =>
+    dsimp only
+    rw [hrel.race_eq id]
+    exact allocWorldRel_deallocate hrel (.provenanced id off) reqLayout reqKind
+      (machineDeallocHook (kw.findRace? id) actor tb)
+
+/-- **Race Check Precedes Race Cleanup (`keyedDeallocateMachine_race_checked_before_cleanup`,
+`[adv B1]`)**: when `id` is live, passes the mutability/kind/layout checks, has no tombstone, and its
+*still-present* race clock `clk` races with `actor`, machine deallocation reports
+`.hookFailure "DataRace"`, retains the detached owner, drops `id` from `live` and only *then* from
+`race`, and does not tombstone it. The order is observable: the identical deallocation run on the
+world whose race entry was cleaned up *first* (`w.removeRace id`) misses the race and succeeds. -/
+theorem keyedDeallocateMachine_race_checked_before_cleanup
+    (w : KeyedAllocWorld) (id : MiriAllocId) (entry : LocalAllocEntry) (clk : RaceClockEntry)
+    (actor : DeallocActor) (tb : DeallocHookSpec)
+    (hlive : w.findLive? id = some entry)
+    (hmut : entry.mutability = .mut)
+    (hnodead : w.findDead? id = none)
+    (hrace : w.findRace? id = some clk)
+    (hracy : raceDeallocVerdict actor clk ≠ .ok) :
+    let r := w.deallocateMachine (.provenanced id 0)
+      (some (entry.sizeBytes, entry.alignBytes)) entry.kind actor tb
+    r.2.1 = some (id, entry) ∧
+    r.2.2 = .error (.hookFailure "DataRace") ∧
+    r.1.findLive? id = none ∧
+    r.1.findRace? id = none ∧
+    r.1.findDead? id = none ∧
+    ((w.removeRace id).deallocateMachine (.provenanced id 0)
+      (some (entry.sizeBytes, entry.alignBytes)) entry.kind actor .ok).2.2 = .ok () := by
+  have hfault : raceDeallocVerdict actor clk =
+      .raceDataRaceFault clk.writerThread clk.writeTimestamp := by
+    unfold raceDeallocVerdict at hracy ⊢
+    split
+    · rfl
+    · rename_i hcond
+      simp [hcond] at hracy
+  have hmut_false : (entry.mutability == .not) = false := by rw [hmut]; rfl
+  have hlive' : w.live.get? id = some entry := hlive
+  have hrace' : w.race.get? id = some clk := hrace
+  have hdead' : w.dead.get? id = none := hnodead
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+    simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocate,
+      KeyedAllocWorld.removeLive, KeyedAllocWorld.removeRace, KeyedAllocWorld.insertDead,
+      KeyedAllocWorld.findLive?, KeyedAllocWorld.findRace?, KeyedAllocWorld.findDead?,
+      machineDeallocHook, hfault, hlive', hrace', hdead', hmut_false]
+
 /-! ## Section 3: Part 2 — `#[rustc_no_writable]` (`charon#1619` + `minirust#295`) & Static-Access Temporary Retags (`charon#1620`) -/
 
 /-! ### Part 2A: Per-Parameter `FnEntryRetagPolicy` (`writableChildWrite` vs. `rustcNoWritable`) -/
@@ -2524,6 +2798,156 @@ theorem selectFnEntryPolicy_rustcNoWritable_mut (facts : RetagTypeFacts)
         performsImplicitWrite := false
       } := by
   simp [selectFnEntryPolicy, hunpin]
+
+/-! ### `[adv B1]` Verbatim Mirror of Pinned `Miri.TreeBorrows.RetagPolicy.create`
+
+`lean-miri/vendor/Miri` is not a Lake library of this workspace, so the pinned upstream policy
+(`lean-miri/vendor/Miri/TreeBorrows/RetagPolicy.lean`, which *already* carries
+`PolicyConfig.rustcNoWritable`) is transcribed verbatim below and `selectFnEntryPolicy` is proved
+equal to it on every input at `RetagMode.FnEntry`. -/
+
+namespace MiriRetagPolicyMirror
+
+/-- `Miri.TreeBorrows.Permission` (pinned `Permissions.lean`). -/
+inductive Permission where
+  | Cell
+  | ReservedIM
+  | ReservedFrz (conflicted : Bool)
+  | Unique
+  | Frozen
+  | Disabled
+  deriving DecidableEq, Repr
+
+inductive AccessKind where
+  | Read
+  | Write
+  deriving DecidableEq, Repr
+
+/-- `Permission.associatedAccess`: the parent access a reborrow performs for a byte carrying this
+initial permission (`RetagPipeline.accessTreeForReborrow`). -/
+def Permission.associatedAccess : Permission → Option AccessKind
+  | .Cell => none
+  | .Unique => some .Write
+  | _ => some .Read
+
+def Permission.toAbstractPerm : Permission → AbstractPerm
+  | .Cell => .cell
+  | .ReservedIM => .reservedIM
+  | .ReservedFrz c => .reservedFrz c
+  | .Unique => .active
+  | .Frozen => .frozen
+  | .Disabled => .disabled
+
+inductive RetagMode where
+  | None
+  | Default
+  | TwoPhase
+  | FnEntry
+  | Raw
+  deriving DecidableEq, Repr
+
+inductive ReferenceKind where
+  | Shared
+  | Mutable
+  | Box
+  deriving DecidableEq, Repr
+
+structure TypeFacts where
+  isUnpin : Bool
+  isUnsafeUnpin : Bool
+  isFreeze : Bool
+  deriving DecidableEq, Repr
+
+structure PolicyConfig where
+  implicitWrites : Bool
+  rustcNoWritable : Bool
+  deriving DecidableEq, Repr
+
+inductive ProtectorKind where
+  | WeakProtector
+  | StrongProtector
+  deriving DecidableEq, Repr
+
+def ProtectorKind.toStrength : ProtectorKind → ProtectorStrength
+  | .WeakProtector => .weak
+  | .StrongProtector => .strong
+
+structure NewPermission where
+  freezePermission : Permission
+  nonfreezePermission : Permission
+  outsidePermission : Permission
+  protector : Option ProtectorKind
+  deriving DecidableEq, Repr
+
+inductive Part where
+  | InsideFrozen
+  | InsideUnsafeCell
+  | Outside
+  deriving DecidableEq, Repr
+
+def selectedPermission (kind : ReferenceKind) (part : Part)
+    (frozen isProtected implicitWrites : Bool) : Permission :=
+  match kind with
+  | .Shared => if frozen then .Frozen else .Cell
+  | .Mutable | .Box =>
+      if implicitWrites && part != .Outside then .Unique
+      else if isProtected || frozen then .ReservedFrz false
+      else .ReservedIM
+
+def create (facts : TypeFacts) (kind : ReferenceKind) (mode : RetagMode)
+    (config : PolicyConfig) : Option NewPermission := Id.run do
+  if mode == .None then return none
+  let tyIsUnpin := facts.isUnpin && facts.isUnsafeUnpin
+  let isProtected := mode == .FnEntry
+  let implicitWritesEnabled := isProtected && config.implicitWrites &&
+    !config.rustcNoWritable
+  if (kind == .Mutable || kind == .Box) && !tyIsUnpin then
+    return none
+  let choose (part : Part) :=
+    let frozen := match part with
+      | .InsideFrozen => true
+      | .InsideUnsafeCell => false
+      | .Outside => facts.isFreeze
+    selectedPermission kind part frozen isProtected implicitWritesEnabled
+  let protector :=
+    if isProtected then
+      some (if kind == .Box then .WeakProtector else .StrongProtector)
+    else none
+  return some {
+    freezePermission := choose .InsideFrozen
+    nonfreezePermission := choose .InsideUnsafeCell
+    outsidePermission := choose .Outside
+    protector
+  }
+
+end MiriRetagPolicyMirror
+
+def RetagRefKind.toMirror : RetagRefKind → MiriRetagPolicyMirror.ReferenceKind
+  | .shared => .Shared
+  | .mutable => .Mutable
+  | .box => .Box
+
+/-- **`selectFnEntryPolicy` = Upstream `RetagPolicy.create` at `FnEntry`
+(`selectFnEntryPolicy_eq_upstream_create`, `[adv B1]`)**: for *every* type-fact triple, reference
+kind, `implicitWrites` flag, and `#[rustc_no_writable]` bit, the prototype policy agrees with the
+verbatim transcription of pinned `RetagPolicy.create … .FnEntry ⟨implicitWrites, rustcNoWritable⟩`
+on all three permissions and the protector (including the `!Unpin` `none` early return), and its
+`performsImplicitWrite` flag is exactly "upstream's inside-frozen permission performs a `.Write`
+parent access" (`associatedAccess .Unique = some .Write`), i.e. the A0 flag is not an invented knob. -/
+theorem selectFnEntryPolicy_eq_upstream_create (facts : RetagTypeFacts) (kind : RetagRefKind)
+    (implicitWrites rustcNoWritable : Bool) :
+    (selectFnEntryPolicy facts kind implicitWrites
+        (if rustcNoWritable then .rustcNoWritable else .writableChildWrite)).map
+      (fun s => (s.freezePerm, s.nonfreezePerm, s.outsidePerm, some s.protector,
+        s.performsImplicitWrite)) =
+    (MiriRetagPolicyMirror.create ⟨facts.isUnpin, facts.isUnsafeUnpin, facts.isFreeze⟩
+        kind.toMirror .FnEntry ⟨implicitWrites, rustcNoWritable⟩).map
+      (fun n => (n.freezePermission.toAbstractPerm, n.nonfreezePermission.toAbstractPerm,
+        n.outsidePermission.toAbstractPerm, n.protector.map MiriRetagPolicyMirror.ProtectorKind.toStrength,
+        n.freezePermission.associatedAccess == some .Write)) := by
+  rcases facts with ⟨isFreeze, isUnpin, isUnsafeUnpin⟩
+  cases kind <;> cases implicitWrites <;> cases rustcNoWritable <;> cases isFreeze <;>
+    cases isUnpin <;> cases isUnsafeUnpin <;> decide
 
 /-- Per-parameter `#[rustc_no_writable]` attribute map keyed by MIR parameter `LocalIdx` (`Nat`)
 using `ExtTreeMap0`, defaulting to `.writableChildWrite` when absent (`charon#1619`). -/
@@ -2951,6 +3375,49 @@ theorem rustcNoWritable_foreignRead_latches_conflicted
       TreeBorrowPerm.toAbstractPerm, TreeTagNode.isProtected, hov,
       Bind.bind, Except.bind, Pure.pure, Except.pure]
 
+/-- **World-Level Protector Conflict (`rustcNoWritable_parentWrite_faults_on_protected_child`,
+`[adv B1]`)**: after a `.rustcNoWritable` `FnEntry` retag on `mkTwoBranchBorrowWorld`, an explicit
+write through the *parent* tag `1` into the protected range faults with
+`.protectedForeignConflict` at the `execBorrowWrite` level — the brief's "foreign writes to the
+protected range still fault" (A0 proved only the node-level `stepNodeOnRangeWrite` instance). -/
+theorem rustcNoWritable_parentWrite_faults_on_protected_child
+    (allocId : Nat) (bytes newBytes : List AbstractByte)
+    (hlen : 0 < newBytes.length) (hbound : newBytes.length ≤ bytes.length) :
+    let len := newBytes.length
+    let wAfter : FnEntryBorrowWorld := {
+      allocId := allocId
+      bytes := bytes
+      nodes := [
+        ⟨3, allocId, 0, len, .reservedFrz false, some 1, some 1⟩,
+        ⟨2, allocId, 0, len, .frozen, none, some 1⟩,
+        ⟨1, allocId, 0, len, .unique, none, none⟩
+      ]
+      activeProtectors := ProtectorSet.empty.insert 1
+      nextTag := 4
+      nextProtector := 2
+    }
+    execBorrowWrite wAfter 1 0 newBytes = .error .protectedForeignConflict := by
+  have hlen0 : Nat.beq newBytes.length 0 = false := by
+    cases h : newBytes.length with
+    | zero => omega
+    | succ _ => rfl
+  have hov : ∀ (tg : Nat) (p : AbstractPerm) (pr : Option Nat),
+      byteRangeOverlapsWrite ⟨tg, allocId, 0, newBytes.length, p, pr⟩ allocId 0
+        newBytes.length = true := by
+    intro tg p pr
+    unfold byteRangeOverlapsWrite
+    simp only [Nat.beq_refl, Bool.true_and]
+    unfold byteRangesOverlapBool
+    cases h : newBytes.length with
+    | zero => omega
+    | succ _ => rfl
+  dsimp only
+  unfold execBorrowWrite
+  simp [hbound, hlen0, mapNodesM, stepNodeOnRangeWrite, findTagNode?,
+    isDescendantOrSelf, isDescendantOrSelfAux, TreeTagNode.toByteRangePerm,
+    TreeBorrowPerm.toAbstractPerm, TreeTagNode.isProtected, hov,
+    Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
+
 /-- **Operational `Trusted.MirSemantics` Overlay (`applyParamFnEntryImplicitWrite`)**:
 upgrades `evalStmt` on `StatementKind.retag .fnEntry place` with per-parameter
 `FnEntryRetagPolicy` (`charon#1619` + `minirust#295`), gating the implicit child write on
@@ -3342,6 +3809,49 @@ theorem static_pureUnsafeCell_preserved_write_ok
     simp [hovRoot, stepSelfWriteByteRange, permAllowsWrite, permAfterSelfWrite, hstep2]
   rw [hstep1]
   rfl
+
+/-- Allocation mutability rustc's const-eval interner assigns an immutable `static` item
+(`intern_const_alloc_recursive`, `InternKind::Static(Mutability::Not)`, `[adv B1]`):
+`Mutability::Not` iff the type is `Freeze` (no `UnsafeCell` byte), `Mutability::Mut` otherwise. -/
+def staticAllocMutability (desc : StaticTyDesc) : Mutability :=
+  if (staticFreezeSegments desc).2.any (fun seg => seg.kind == .unsafeCell) then .mut else .not
+
+/-- Miri-faithful raw static write (`[adv B1]`): the allocation-mutability gate (Miri's
+`writeToReadOnly` / read-only allocation check) runs before any Tree Borrows transition; zero-sized
+writes are always permitted. `evalRawMutStaticWrite` alone is the Tree-Borrows-only semantics
+(no allocation mutability), which is the setting in which A0's pure-`Freeze` separation holds. -/
+def evalRawMutStaticWriteMiri (desc : StaticTyDesc) (st : StaticRawPtrState) (writeOff : Nat)
+    (newBytes : List AbstractByte) : StaticWriteResult :=
+  match staticAllocMutability desc with
+  | .not => if Nat.beq newBytes.length 0 then evalRawMutStaticWrite st writeOff newBytes else .ub
+  | .mut => evalRawMutStaticWrite st writeOff newBytes
+
+/-- **Pure-`Freeze` Erasure Is Caught by the Read-Only Allocation in Miri
+(`static_pureFreeze_erased_write_caught_by_readOnly_alloc`, `[adv B1]`)**: an immutable `Freeze`
+static lives in a `Mutability::Not` allocation, so even Charon's pre-`#1620` erased
+`&raw const STATIC` cannot mutate it without UB under Miri's semantics — the separation of
+`static_pureFreeze_preserved_ub_vs_erased_unsound` is specific to a Tree-Borrows-only semantics
+that drops allocation mutability. The case where erasure is genuinely unsound even with allocation
+mutability is a *mixed* `(Freeze, UnsafeCell)` static (mutable allocation, `.frozen` `Freeze`
+bytes): see `canary_part2B_mixed_static_erasure_unsound_under_miri_mutability`. -/
+theorem static_pureFreeze_erased_write_caught_by_readOnly_alloc
+    (allocId sizeBytes writeOff : Nat) (initBytes newBytes : List AbstractByte)
+    (hne : 0 < newBytes.length) :
+    staticAllocMutability (.freezeScalar sizeBytes) = .not ∧
+    evalRawMutStaticWriteMiri (.freezeScalar sizeBytes)
+      (retagStaticErased allocId (.freezeScalar sizeBytes) initBytes) writeOff newBytes = .ub ∧
+    evalRawMutStaticWriteMiri (.freezeScalar sizeBytes)
+      (retagStaticPreserved allocId (.freezeScalar sizeBytes) initBytes) writeOff newBytes = .ub := by
+  have hmut : staticAllocMutability (.freezeScalar sizeBytes) = .not := by
+    unfold staticAllocMutability staticFreezeSegments
+    by_cases hsz : 0 < sizeBytes
+    · simp [hsz]
+    · simp [hsz]
+  have hlen0 : Nat.beq newBytes.length 0 = false := by
+    cases h : newBytes.length with
+    | zero => omega
+    | succ _ => rfl
+  refine ⟨hmut, ?_, ?_⟩ <;> simp only [evalRawMutStaticWriteMiri, hmut, hlen0] <;> rfl
 
 /-! ## Section 4: Part 3 — Array `[T; N]` `Sized` Fast-Path (`lean-miri#79`), Principal-Less `dyn Send` VTables (`lean-miri#75`), & Null-VTable Precedence (`lean-miri#82`) -/
 
@@ -4513,15 +5023,53 @@ theorem vtableRegistry_intern_idempotent
   rw [← mkCanonicalVTableKey_perm_eq concreteTy principal as₁ as₂ hmem, hexist]
   rfl
 
+/-- Decidable subset test on normalized predicate ids (`[adv B1]`, `0` axioms). -/
+def natListSubset (xs ys : List Nat) : Bool :=
+  xs.all (fun x => ys.any (fun y => x == y))
+
+theorem natListSubset_iff (xs ys : List Nat) :
+    natListSubset xs ys = true ↔ ∀ x ∈ xs, x ∈ ys := by
+  simp [natListSubset, List.all_eq_true, List.any_eq_true]
+
+/-- Upstream `VTable.checkForTypeRead` (`[adv B1]`; A0 additionally demanded
+`actual.autoTraits.containsAll expected.autoTraits`, a false-UB divergence): auto traits are
+dropped (`filter (!·.autoTrait)`), the remaining principal predicates are sorted by stable key and
+deduplicated (`sortPredicates` + `eraseDups`), and the two lists are compared pointwise — i.e.
+principal-trait equality plus set equality of the normalized predicates. -/
 def vtableMatchesExpectedSpec (actual expected : DynExistentialSpec) : Bool :=
-  let principalOk :=
-    match actual.principal, expected.principal with
-    | none, none => true
-    | some actP, some expP =>
-      actP.traitDefPath == expP.traitDefPath &&
-        actP.normalizedPredicates == expP.normalizedPredicates
-    | _, _ => false
-  principalOk && actual.autoTraits.containsAll expected.autoTraits
+  match actual.principal, expected.principal with
+  | none, none => true
+  | some actP, some expP =>
+    actP.traitDefPath == expP.traitDefPath &&
+      natListSubset actP.normalizedPredicates expP.normalizedPredicates &&
+      natListSubset expP.normalizedPredicates actP.normalizedPredicates
+  | _, _ => false
+
+/-- **Auto Traits Never Affect the VTable Trait Check
+(`vtableMatchesExpectedSpec_ignores_autoTraits`, `[adv B1]`)**: replacing the auto-trait sets on
+either side never changes the verdict (so a `dyn Send` vtable is accepted where `dyn Sync` is
+expected, and a `dyn Debug + Send` vtable where `dyn Debug` is expected), exactly as upstream
+`checkForTypeRead` filters auto traits before comparing. -/
+theorem vtableMatchesExpectedSpec_ignores_autoTraits (p₁ p₂ : Option PrincipalTraitRef)
+    (a₁ b₁ a₂ b₂ : AutoTraitSet) :
+    vtableMatchesExpectedSpec ⟨p₁, a₁⟩ ⟨p₂, a₂⟩ = vtableMatchesExpectedSpec ⟨p₁, b₁⟩ ⟨p₂, b₂⟩ := rfl
+
+/-- **Predicate Order/Duplicates Never Affect the VTable Trait Check
+(`vtableMatchesExpectedSpec_predicate_perm`, `[adv B1]`)**: permuting or duplicating the actual
+vtable's normalized predicates leaves the verdict unchanged (upstream `sortPredicates` + `eraseDups`). -/
+theorem vtableMatchesExpectedSpec_predicate_perm (dp₁ dp₂ : DefPath) (ps₁ ps₁' ps₂ : List Nat)
+    (ms₁ ms₂ : List DefPath) (a₁ a₂ : AutoTraitSet) (hperm : ∀ x, x ∈ ps₁ ↔ x ∈ ps₁') :
+    vtableMatchesExpectedSpec ⟨some ⟨dp₁, ps₁, ms₁⟩, a₁⟩ ⟨some ⟨dp₂, ps₂, ms₂⟩, a₂⟩ =
+      vtableMatchesExpectedSpec ⟨some ⟨dp₁, ps₁', ms₁⟩, a₁⟩ ⟨some ⟨dp₂, ps₂, ms₂⟩, a₂⟩ := by
+  have h1 : natListSubset ps₁ ps₂ = natListSubset ps₁' ps₂ := by
+    apply Bool.eq_iff_iff.mpr
+    rw [natListSubset_iff, natListSubset_iff]
+    exact ⟨fun h x hx => h x ((hperm x).mpr hx), fun h x hx => h x ((hperm x).mp hx)⟩
+  have h2 : natListSubset ps₂ ps₁ = natListSubset ps₂ ps₁' := by
+    apply Bool.eq_iff_iff.mpr
+    rw [natListSubset_iff, natListSubset_iff]
+    exact ⟨fun h x hx => (hperm x).mp (h x hx), fun h x hx => (hperm x).mpr (h x hx)⟩
+  simp only [vtableMatchesExpectedSpec, h1, h2]
 
 def unpackDynFromRegistry (reg : VTableRegistry) (vtableAllocId : MiriAllocId)
     (expected : DynExistentialSpec) : Except VTableBuildErr VTableDescriptor := do
@@ -4538,7 +5086,10 @@ def resolveVirtualMethod (desc : VTableDescriptor) (slotIdx : Nat) :
 
 /-- Upcast a trait-object vtable `srcDesc` to a principal-less auto-trait existential `targetTraits`
 (e.g. `dyn Debug + Send + Sync -> dyn Send`), verifying `srcDesc.spec.autoTraits` covers
-`targetTraits` and interning the principal-less target vtable preserving `concreteTy` and `dropFn`. -/
+`targetTraits` and interning the principal-less target vtable preserving `concreteTy` and `dropFn`.
+*Honest scope (`[adv B1]`)*: the auto-trait coverage check models rustc's *static* unsizing-coercion
+rule (`dyn Send -> dyn Sync` is a type error); it is not a runtime vtable-validity check, which
+ignores auto traits (`vtableMatchesExpectedSpec_ignores_autoTraits`). -/
 def upcastVTableToAutoTraits (reg : VTableRegistry) (w : KeyedAllocWorld) (maxSize : Nat)
     (srcDesc : VTableDescriptor) (targetTraits : List AutoTrait) :
     Except VTableBuildErr (VTableRegistry × KeyedAllocWorld × VTableDescriptor) := do
@@ -4614,6 +5165,37 @@ def validateVTableHalf (w : KeyedAllocWorld) (reg : VTableRegistry)
         else
           .ok desc
       | _, _ => .error .invalidVTableNotGlobalVTable
+
+/-- **Auto-Trait-Only Mismatch Is Not `invalidVTableTrait`
+(`validateVTableHalf_principalLess_ignores_autoTraits`, `[adv B1]`)**: a registered principal-less
+vtable (e.g. `u64 as dyn Send`) validates against *every* expected principal-less spec (e.g.
+`dyn Sync`, `dyn Send + Sync`). A0's validator reported `.invalidVTableTrait` here — a false UB
+that upstream `checkForTypeRead` (and rustc's `check_vtable_for_type`) never raises. -/
+theorem validateVTableHalf_principalLess_ignores_autoTraits
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (addr : UInt64) (vtId : MiriAllocId)
+    (glob : GlobalAllocEntry) (desc : VTableDescriptor) (expectedTraits : AutoTraitSet)
+    (hglob : w.findGlobal? vtId = some glob) (hkind : glob.kind = .vtable)
+    (hdesc : reg.byAlloc.get? vtId = some desc) (hprin : desc.spec.principal = none) :
+    validateVTableHalf w reg (.provenanced addr vtId 0) ⟨none, expectedTraits⟩ = .ok desc := by
+  have hk : (glob.kind != .vtable) = false := by rw [hkind]; rfl
+  unfold validateVTableHalf
+  simp [hglob, hdesc, hk, vtableMatchesExpectedSpec, hprin]
+
+/-- **Principal Mismatch Remains `invalidVTableTrait`
+(`validateVTableHalf_principalLess_vs_principal_invalidTrait`, `[adv B1]`)**: a principal-less vtable
+used where a principal-bearing trait object (`dyn Debug + …`) is expected still fails with
+`.invalidVTableTrait`, whatever the auto traits (the non-auto predicate lists differ in length). -/
+theorem validateVTableHalf_principalLess_vs_principal_invalidTrait
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (addr : UInt64) (vtId : MiriAllocId)
+    (glob : GlobalAllocEntry) (desc : VTableDescriptor) (p : PrincipalTraitRef)
+    (expectedTraits : AutoTraitSet)
+    (hglob : w.findGlobal? vtId = some glob) (hkind : glob.kind = .vtable)
+    (hdesc : reg.byAlloc.get? vtId = some desc) (hprin : desc.spec.principal = none) :
+    validateVTableHalf w reg (.provenanced addr vtId 0) ⟨some p, expectedTraits⟩ =
+      .error .invalidVTableTrait := by
+  have hk : (glob.kind != .vtable) = false := by rw [hkind]; rfl
+  unfold validateVTableHalf
+  simp [hglob, hdesc, hk, vtableMatchesExpectedSpec, hprin]
 
 /-- **`lean-miri#82` Source-Ordered Wide `dyn` Safe-Pointer Validator (`validateWideDynSafePtr`)**:
 1. Validates `vtablePtr` metadata **FIRST** (`validateVTableHalf`), extracting `(sizeBytes, alignBytes)`
