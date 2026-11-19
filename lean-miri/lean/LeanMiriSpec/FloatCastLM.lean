@@ -146,7 +146,10 @@ split into a 4-layer acyclic diamond DAG of submodules with minimal per-layer im
 that no single translation unit elaborates the whole development and per-file elaboration memory
 stays bounded. Every declaration lives in `namespace LeanMiriSpec.Correspondence`, so declaration
 names do not depend on the submodule layout, and `import LeanMiriSpec.FloatCastLM` provides all of
-them.
+them while preserving the full baseline transitive import closure (`Anneal.Mir.IeeeFloatCast`,
+`LeanMiriSpec.Correspondence.SimLM3_1`, `LeanMiriSpec.Correspondence.WitLM1_2` / `Witness` via
+`WitnessesAndAxioms`, and `Miri.Interpreter.{Float,FloatOps,Cast,Step}`) relied on by downstream
+importers such as `LeanMiriSpec.WitFloatCastLM`.
 
 1. `LeanMiriSpec.FloatCastLM.CodecAndCast` (Parts 0–7; imports `SimLM1_2`, `PtrLM3_1`,
    `IeeeFloatCast`, `Miri.Interpreter.{Float,FloatOps,Cast,Step}`): vendored private-helper bridges,
