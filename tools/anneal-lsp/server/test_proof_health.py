@@ -5041,5 +5041,680 @@ class TestA4MultiDocstringInPrefixesAndOperatorTriviality(unittest.TestCase):
             )
 
 
+
+class TestEpisode2SharedLeanLexer(unittest.TestCase):
+    """Unit, cold-import hygiene, and seeded property tests (`0xA44EA1`) for `lean_lexer.py`."""
+
+    def test_lean_lexer_stdlib_hygiene_and_isolated_import(self) -> None:
+        # Run in a fresh `python3 -B` subprocess with `cwd=/tmp` and without `SERVER_DIR` on
+        # `sys.path`: `lean_lexer` must not pull in `dataclasses`, `typing`, `ast`, `inspect`,
+        # or `re` at import time, and `proof_health` loaded via `spec_from_file_location` must
+        # resolve its sibling `lean_lexer` cleanly.
+        lexer_path = SERVER_DIR / "lean_lexer.py"
+        ph_path = SERVER_DIR / "proof_health.py"
+        code = (
+            "import importlib.util, sys\n"
+            f"spec_ll = importlib.util.spec_from_file_location('lean_lexer_iso', {str(lexer_path)!r})\n"
+            "mod_ll = importlib.util.module_from_spec(spec_ll)\n"
+            "spec_ll.loader.exec_module(mod_ll)\n"
+            "forbidden = {'dataclasses', 'typing', 'ast', 'inspect', 're'}\n"
+            "leaked = sorted(forbidden.intersection(sys.modules))\n"
+            "assert not leaked, f'lean_lexer imported forbidden modules: {leaked}'\n"
+            "assert sys.dont_write_bytecode is True\n"
+            f"spec_ph = importlib.util.spec_from_file_location('proof_health_iso', {str(ph_path)!r})\n"
+            "mod_ph = importlib.util.module_from_spec(spec_ph)\n"
+            "spec_ph.loader.exec_module(mod_ph)\n"
+            "assert mod_ph.lean_lexer.__file__ == str(" + repr(str(lexer_path)) + ")\n"
+            "assert mod_ph.strip_lean_comments_and_strings('a -- b\\nc') == 'a     \\nc'\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-B", "-c", code],
+            cwd=tempfile.gettempdir(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_ident_and_line_primitives(self) -> None:
+        import lean_lexer
+
+        for ch in ("a", "Z", "_", "α", "ω", "ℕ", "ℤ", "𝒜", "é"):
+            self.assertTrue(lean_lexer.is_ident_start(ch), repr(ch))
+            self.assertTrue(lean_lexer.is_ident_char(ch), repr(ch))
+        for ch in ("0", "9", "'", "!", "?", "₀", "₁", "₉", "ₐ", "ᵢ", "ⱼ"):
+            self.assertFalse(lean_lexer.is_ident_start(ch), repr(ch))
+            self.assertTrue(lean_lexer.is_ident_char(ch), repr(ch))
+        for bad in ("", "ab", "_x", "λ", "Π", "Σ", ".", "«", "»", "⊢", " ", "\n"):
+            self.assertFalse(lean_lexer.is_ident_start(bad), repr(bad))
+        for bad in ("", "ab", ".", "«", "»", "⊢", " ", "\n"):
+            self.assertFalse(lean_lexer.is_ident_char(bad), repr(bad))
+
+        for seg in ("", "abc", "ab\ncd\nef", "αβ\n⊢«x»\n"):
+            blanked = lean_lexer.blank_preserving_newlines(seg)
+            self.assertEqual(len(blanked), len(seg))
+            for a, b in zip(seg, blanked):
+                self.assertEqual(b, "\n" if a == "\n" else " ")
+
+        sample = "l1\nl22\n\nl444\nl5"
+        nl_offsets = [i for i, c in enumerate(sample) if c == "\n"]
+        lc = lean_lexer.LineCounter(sample)
+        for off in [0, 2, 3, 6, 7, 8, 12, 13, len(sample), 8, 7, 1, 0, 13, 3]:
+            expected = sample.count("\n", 0, off) + 1
+            self.assertEqual(lc(off), expected, off)
+            self.assertEqual(lean_lexer.offset_to_line(sample, off), expected, off)
+            self.assertEqual(lean_lexer.offset_to_line(nl_offsets, off), expected, off)
+
+    def test_scanner_modes_doc_spans_and_unclosed_delimiters(self) -> None:
+        import lean_lexer
+
+        src = (
+            "/-! Module header\nwith two lines -/\n"
+            "/--/\n"
+            "/-- Theorem doc\n  /- nested /- deep -/ block -/\n-/\n"
+            'def s1 := "a\\"b\\\\" -- trailing -- comment\n'
+            'def s2 := r#"raw "quote" -- not comment"#\n'
+            'def s3 := obj.r"\\"field proj normal string"\n'
+            "def cs := ('\"', '\\\"', '\\\\', '\\'', '«', '»', '\\n', '\\x22', '\\u0022')\n"
+            "def pr := (f x'\"str\", f '\\''\"str\", «id--with/-quotes\"»)\n"
+        )
+        res = lean_lexer.scan_lean_source(src)
+        self.assertEqual(res.unclosed_block_comment_pos, -1)
+        self.assertEqual(res.unclosed_string_pos, -1)
+        self.assertEqual(len(res.stripped), len(src))
+        self.assertEqual(
+            res.stripped,
+            lean_lexer.strip_comments_and_strings_preserving_offsets(src),
+        )
+        self.assertEqual(res.stripped, proof_health.strip_lean_comments_and_strings(src))
+        self.assertEqual(len(res.doc_comments), 2)
+        self.assertEqual(res.doc_comments[0].kind, lean_lexer.MODULE_DOC_COMMENT)
+        self.assertEqual(res.doc_comments[0].line_no, 1)
+        self.assertTrue(src[res.doc_comments[0].start_pos : res.doc_comments[0].end_pos].startswith("/-!"))
+        self.assertEqual(res.doc_comments[1].kind, lean_lexer.DOC_COMMENT)
+        self.assertEqual(res.doc_comments[1].line_no, 4)
+        self.assertIn("«id--with/-quotes\"»", res.stripped)
+        with self.assertRaises(AttributeError):
+            res.stripped = ""  # type: ignore[misc]
+
+        # `retain_quotes=True` keeps opening/closing string delimiters (`"..."`, `r#"..."#`)
+        # while blanking string interiors and comments.
+        rq = lean_lexer.strip_comments_and_strings_preserving_offsets(src, retain_quotes=True)
+        self.assertEqual(len(rq), len(src))
+        self.assertIn('def s1 := "      "', rq)
+        self.assertIn('def s2 := r#"                          "#', rq)
+        self.assertNotIn("Theorem doc", rq)
+        self.assertNotIn("trailing", rq)
+
+        # `keep_strings=True` blanks only comments, keeping all string and char literals verbatim.
+        ks = lean_lexer.strip_comments_and_strings_preserving_offsets(src, keep_strings=True)
+        self.assertEqual(len(ks), len(src))
+        self.assertIn('"a\\"b\\\\"', ks)
+        self.assertIn('r#"raw "quote" -- not comment"#', ks)
+        self.assertNotIn("trailing -- comment", ks)
+
+        # Unclosed block comments and strings record exact opening offsets and preserve newlines.
+        unclosed_blk = "def x := 1\n/- outer /- inner -/\ndef y := 2\n"
+        rb = lean_lexer.scan_lean_source(unclosed_blk)
+        self.assertEqual(rb.unclosed_block_comment_pos, unclosed_blk.index("/- outer"))
+        self.assertEqual(rb.unclosed_string_pos, -1)
+        self.assertEqual(len(rb.stripped), len(unclosed_blk))
+        self.assertNotIn("def y", rb.stripped)
+
+        unclosed_str = 'def x := 1\ndef s := "multi\nline\\"\n'
+        rs = lean_lexer.scan_lean_source(unclosed_str, retain_quotes=True)
+        self.assertEqual(rs.unclosed_string_pos, unclosed_str.index('"multi'))
+        self.assertEqual(rs.unclosed_block_comment_pos, -1)
+        self.assertEqual(len(rs.stripped), len(unclosed_str))
+        self.assertEqual([i for i, c in enumerate(rs.stripped) if c == "\n"], [i for i, c in enumerate(unclosed_str) if c == "\n"])
+        self.assertEqual(rs.stripped[rs.unclosed_string_pos], '"')
+
+        unclosed_raw = 'def s := r##"unterminated "#" raw\n'
+        rr = lean_lexer.scan_lean_source(unclosed_raw)
+        self.assertEqual(rr.unclosed_string_pos, unclosed_raw.index('"unterminated'))
+
+    def test_balanced_attribute_scanner_edge_cases(self) -> None:
+        import lean_lexer
+
+        src = (
+            "-- @[ignored_in_comment]\n"
+            'def strAttr := "@[ignored_in_string]"\n'
+            "def «@[ignored_in_guillemet]» := 0\n"
+            "@[simp, aesop safe [constructors, (apply «a]b»)], custom ']' «x»' ']' {k := \"v]\"}]\n"
+            "theorem t1 : True := trivial\n"
+            "@[unclosed_before_next\n"
+            "@[inline, reducible] def f : Nat := 1\n"
+            "@[mismatched (a] @[recover] def g : Nat := 2\n"
+        )
+        spans = lean_lexer.scan_balanced_attributes(src)
+        self.assertEqual(
+            [(sp.line_no, sp.content) for sp in spans],
+            [
+                (4, 'simp, aesop safe [constructors, (apply «a]b»)], custom \']\' «x»\' \']\' {k := "v]"}'),
+                (7, "inline, reducible"),
+                (8, "recover"),
+            ],
+        )
+        stripped = lean_lexer.strip_comments_and_strings_preserving_offsets(src)
+        self.assertIsNone(lean_lexer.match_balanced_attribute(stripped, -5))
+        self.assertIsNone(
+            lean_lexer.match_balanced_attribute(stripped, src.index("@[ignored_in_guillemet]"))
+        )
+
+    def test_namespace_tracker_scopes_inline_in_and_violations(self) -> None:
+        import lean_lexer
+
+        src = (
+            "namespace A.B\n"
+            "  def inAB : Nat := 1\n"
+            "  section Sec1\n"
+            "    def q := `(command| namespace Quoted def qx := 0 end Quoted)\n"
+            "    theorem tac (h : Range) : True := by\n"
+            "      let _ := (h.end, «end», Mir.Demo.«end»)\n"
+            "      trivial\n"
+            "    namespace Inline.Sub in\n"
+            "    set_option maxHeartbeats 200000 in\n"
+            "    @[simp] theorem inlineThm : True := by\n"
+            "      trivial\n"
+            "    def afterInline : Nat := 2\n"
+            "    namespace MutNs in\n"
+            "    mutual\n"
+            "      def mf : Nat := mg\n"
+            "      def mg : Nat := 0\n"
+            "    end\n"
+            "    def afterMut : Nat := 3\n"
+            "  end Sec1\n"
+            "end A.B\n"
+            "namespace One; def sameLineIn := 1; end One; def sameLineOut := 2\n"
+            "namespace Two def noSemiIn := 1 end Two def noSemiOut := 2\n"
+        )
+        tr = lean_lexer.NamespaceTracker.from_source(src)
+        self.assertEqual(tr.violations, ())
+        self.assertEqual(tr.namespace_at(0), ())
+        self.assertEqual(tr.namespace_at(src.index("def inAB")), ("A", "B"))
+        self.assertEqual(tr.namespace_at(src.index("let _ :=")), ("A", "B"))
+        self.assertEqual(
+            tr.scopes_at(src.index("let _ :=")),
+            (("namespace", "A"), ("namespace", "B"), ("section", "Sec1")),
+        )
+        self.assertEqual(
+            tr.namespace_at(src.index("theorem inlineThm")),
+            ("A", "B", "Inline", "Sub"),
+        )
+        self.assertEqual(tr.namespace_at(src.index("def afterInline")), ("A", "B"))
+        self.assertEqual(tr.namespace_at(src.index("def mf")), ("A", "B", "MutNs"))
+        self.assertEqual(tr.namespace_at(src.index("def afterMut")), ("A", "B"))
+        self.assertEqual(tr.namespace_at(src.index("def sameLineIn")), ("One",))
+        self.assertEqual(tr.namespace_at(src.index("def sameLineOut")), ())
+        self.assertEqual(tr.namespace_at(src.index("def noSemiIn")), ("Two",))
+        self.assertEqual(tr.namespace_at(src.index("def noSemiOut")), ())
+
+        # Mismatch & structural violation reporting
+        bad = (
+            "end Orphan\n"
+            "namespace\n"
+            "namespace Foo\n"
+            "  end\n"
+            "namespace Bar\n"
+            "  end Wrong\n"
+            "section S\n"
+            "  end S.Extra\n"
+            "mutual\n"
+            "  def u : Nat := 1\n"
+        )
+        bad_tr = lean_lexer.track_namespaces(bad)
+        self.assertEqual(len(bad_tr.violations), 6, bad_tr.violations)
+        self.assertTrue(any("no open scope" in v for v in bad_tr.violations))
+        self.assertTrue(any("without a name" in v for v in bad_tr.violations))
+        self.assertTrue(any("missing the name" in v for v in bad_tr.violations))
+        self.assertTrue(any("does not match" in v for v in bad_tr.violations))
+        self.assertTrue(any("closes 2 scopes" in v for v in bad_tr.violations))
+        self.assertTrue(any("`mutual` block is never closed" in v for v in bad_tr.violations))
+
+    def test_seeded_property_lexer_attributes_and_namespaces(self) -> None:
+        import random
+        import lean_lexer
+
+        rng = random.Random(0xA44EA1)
+
+        # Part 1: 600 adversarial delimiter soups checking exact length, newline indices,
+        # blanking discipline, and 3-way lexer parity (`lean_lexer` vs `proof_health` vs
+        # shared auditor `_scan_lean_comments_and_strings`).
+        vocab = [
+            "--", "/-", "-/", "/--", "/-!", "/--/", '"', '\\"', "\\\\", "'", "'\"'", "'\\\"'",
+            "'\\''", "'«'", "'»'", "«", "»", "«a--b»", "«end»", 'r"', 'r#"', '"#', 'r##"',
+            '"##', ".r\"", "x'\"", "#[", "@[", "]", "(", ")", "{", "}", "\n", " ", "\t",
+            "a", "r", "x'", "α", "₁", "ⱼ", "⊢",
+        ]
+        for _ in range(600):
+            raw = "".join(rng.choice(vocab) for _ in range(rng.randint(0, 55)))
+            nl_idx = [i for i, ch in enumerate(raw) if ch == "\n"]
+            st = lean_lexer.strip_comments_and_strings_preserving_offsets(raw)
+            scan_res = lean_lexer.scan_lean_source(raw)
+            self.assertEqual(st, scan_res.stripped)
+            self.assertEqual(st, proof_health.strip_lean_comments_and_strings(raw))
+            self.assertEqual(st, proof_health._scan_lean_comments_and_strings(raw)[0])
+            for mode_out in (
+                st,
+                lean_lexer.strip_comments_and_strings_preserving_offsets(raw, keep_strings=True),
+                lean_lexer.strip_comments_and_strings_preserving_offsets(raw, retain_quotes=True),
+            ):
+                self.assertEqual(len(mode_out), len(raw))
+                self.assertEqual([i for i, ch in enumerate(mode_out) if ch == "\n"], nl_idx)
+                for r_ch, o_ch in zip(raw, mode_out):
+                    if o_ch != r_ch:
+                        self.assertEqual(o_ch, " ")
+                        self.assertNotEqual(r_ch, "\n")
+
+        # Part 2: 200 structured attribute + namespace documents with ground-truth scopes
+        # and planted balanced `@[...]` spans surrounded by decoy comments/strings/guillemets.
+        ns_atoms = ["Alpha", "Beta", "«Gam--ma»", "Delta_1"]
+        attr_atoms = [
+            "simp",
+            'aesop safe [constructors, (apply «x]y»)]',
+            'custom "str ] @[fake]"',
+            "tag ']' «p»' ']'",
+            "cfg { a := [1, (2, 3)] }",
+        ]
+        decoys = [
+            "-- @[decoy] namespace Bad end\n",
+            "/- @[decoy]\n  /- nested end -/ namespace Bad -/\n",
+            'def strDecoy := "@[decoy] namespace Bad end"\n',
+            'def rawDecoy := r#"@[decoy] " end "#\n',
+            "def guiDecoy (h : T) := (h.end, «end», «@[decoy]»)\n",
+        ]
+        for _ in range(200):
+            pieces: list[str] = []
+            cursor = 0
+            expected_attrs: list[tuple[int, int, str]] = []
+            open_stack: list[tuple[str, str]] = []
+            probes: list[tuple[int, tuple[str, ...]]] = []
+
+            def emit(chunk: str) -> None:
+                nonlocal cursor
+                pieces.append(chunk)
+                cursor += len(chunk)
+
+            def cur_ns() -> tuple[str, ...]:
+                return tuple(nm for k, nm in open_stack if k == "namespace")
+
+            for _step in range(rng.randint(8, 20)):
+                choice = rng.randrange(6)
+                if choice == 0:
+                    emit(rng.choice(decoys))
+                    probes.append((cursor - 2, cur_ns()))
+                elif choice == 1:
+                    k_parts = rng.randint(1, 2)
+                    parts = [rng.choice(ns_atoms) for _ in range(k_parts)]
+                    dotted = ".".join(parts)
+                    emit(f"namespace {dotted}\n")
+                    for p_nm in parts:
+                        open_stack.append(("namespace", p_nm))
+                    probes.append((cursor - 1, cur_ns()))
+                elif choice == 2:
+                    sec_nm = rng.choice(["", "SecA", "«Sec-B»"])
+                    emit(f"section {sec_nm}\n" if sec_nm else "section\n")
+                    open_stack.append(("section", sec_nm))
+                    probes.append((cursor - 1, cur_ns()))
+                elif choice == 3:
+                    emit("mutual\n  def m1 : Nat := 0\nend\n")
+                    probes.append((cursor - 6, cur_ns()))
+                elif choice == 4 and open_stack:
+                    # Pop 1 or 2 named scopes when possible, or 1 anonymous section.
+                    top_kind, top_nm = open_stack[-1]
+                    if not top_nm:
+                        open_stack.pop()
+                        emit("end\n")
+                    else:
+                        pop_n = (
+                            2
+                            if len(open_stack) >= 2
+                            and open_stack[-2][1]
+                            and rng.random() < 0.4
+                            else 1
+                        )
+                        popped = [open_stack.pop()[1] for _ in range(pop_n)]
+                        popped.reverse()
+                        emit(f"end {'.'.join(popped)}\n")
+                    probes.append((cursor - 1, cur_ns()))
+                else:
+                    body = ", ".join(rng.sample(attr_atoms, k=rng.randint(1, 2)))
+                    start_off = cursor
+                    emit(f"@[{body}]\n")
+                    end_off = cursor - 1
+                    expected_attrs.append((start_off, end_off, body))
+                    probe_off = cursor + 4
+                    emit("theorem probe_thm : True := trivial\n")
+                    probes.append((probe_off, cur_ns()))
+
+            doc = "".join(pieces)
+            st = lean_lexer.strip_comments_and_strings_preserving_offsets(doc)
+            got_attrs = [(a.start_pos, a.end_pos, a.content) for a in lean_lexer.scan_balanced_attributes(doc, stripped=st)]
+            self.assertEqual(got_attrs, expected_attrs)
+            tr = lean_lexer.NamespaceTracker.from_source(doc, stripped=st)
+            self.assertEqual(tr.violations, ())
+            for off, want_ns in probes:
+                self.assertEqual(tr.namespace_at(off), want_ns)
+
+
+class TestEpisode2ProjectionAndRewriteOrderHazards(unittest.TestCase):
+    """Unit, incremental cache/splicing, CLI `--advisories`, and `< 5.0 ms` benchmark tests
+    for `scan_projection_and_rewrite_order_hazards`."""
+
+    def test_backward_compatibility_of_all_rules_and_defaults(self) -> None:
+        self.assertEqual(len(proof_health.ALL_RULES), 7)
+        self.assertEqual(
+            proof_health.ADVISORY_RULES,
+            (
+                proof_health.RULE_SIMP_DEEP_PROJECTION_CHAIN,
+                proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET,
+            ),
+        )
+        self.assertTrue(set(proof_health.ALL_RULES).isdisjoint(proof_health.ADVISORY_RULES))
+        # `AdtAndControl.lean` contains legacy `try rw [...] at hEval ⊢` lines: default
+        # `scan_lean_file` MUST remain `[]`, while `include_advisories=True` surfaces them.
+        self.assertEqual(proof_health.scan_lean_file(EPISODE1_ADT_AND_CONTROL), [])
+        adv = proof_health.scan_lean_file(EPISODE1_ADT_AND_CONTROL, include_advisories=True)
+        self.assertEqual(
+            [(f.rule, f.line) for f in adv],
+            [
+                (proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET, 26879),
+                (proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET, 26880),
+            ],
+        )
+        # Subsequent default scan must still return `[]` (no cache cross-talk).
+        self.assertEqual(proof_health.scan_lean_file(EPISODE1_ADT_AND_CONTROL), [])
+
+    def test_simp_deep_projection_chain_positive_and_negative_cases(self) -> None:
+        R_PROJ = proof_health.RULE_SIMP_DEEP_PROJECTION_CHAIN
+        S_ARG = proof_health.SUBRULE_PROJECTION_IN_SIMP_ARGS
+        S_STMT = proof_health.SUBRULE_SIMP_AFTER_PROJECTION_STATEMENT
+
+        positives = (
+            "theorem p1 : P := by\n"
+            "  simp [foo, (advanceStmt s l m).memory.locals, bar]\n"
+            "  simp only [\n"
+            "    h (Mir.advanceStmt s l).frame.stmtIdx\n"
+            "  ] at h ⊢\n"
+            "  simpa [foo] using bar ((@advanceStmt s l m)).memory.allocs.len\n"
+            "  simp_all (disch := exact (advanceStmt s l).frame.locals_wf) [baz]\n"
+            "  change (advanceStmt s l m).memory.locals = l; simp\n"
+            "  show (advanceStmt s l m).frame.blockIdx = b\n"
+            "  simp only [foo]\n"
+            "  have h1 : (advanceStmt s l m).memory.locals = l := by simp [advanceStmt]\n"
+            "  suffices h2 : Q (advanceStmt s l).frame.locals from by simpa using h2\n"
+            "  change (advanceStmt s l m).memory.callStack = cs\n"
+            "  dsimp only [unrelatedDef]\n"
+            "  simp\n"
+        )
+        got = [
+            (f.line, f.rule, f.subrule, f.symbol)
+            for f in proof_health.scan_projection_and_rewrite_order_hazards(positives)
+        ]
+        self.assertEqual(
+            got,
+            [
+                (2, R_PROJ, S_ARG, "(advanceStmt ...).memory.locals"),
+                (4, R_PROJ, S_ARG, "(Mir.advanceStmt ...).frame.stmtIdx"),
+                (6, R_PROJ, S_ARG, "(advanceStmt ...).memory.allocs.len"),
+                (7, R_PROJ, S_ARG, "(advanceStmt ...).frame.locals_wf"),
+                (8, R_PROJ, S_STMT, "(advanceStmt ...).memory.locals"),
+                (10, R_PROJ, S_STMT, "(advanceStmt ...).frame.blockIdx"),
+                (11, R_PROJ, S_STMT, "(advanceStmt ...).memory.locals"),
+                (12, R_PROJ, S_STMT, "(advanceStmt ...).frame.locals"),
+                (15, R_PROJ, S_STMT, "(advanceStmt ...).memory.callStack"),
+            ],
+        )
+        for f in proof_health.scan_projection_and_rewrite_order_hazards(positives):
+            self.assertIn("dsimp only [advanceStmt", f.suggestion)
+            self.assertIn("leanprover/lean4#16532", f.message)
+
+        negatives = (
+            "-- simp [(advanceStmt s l m).memory.locals]\n"
+            "/- change (advanceStmt s l m).memory.locals = l; simp -/\n"
+            'def msg := "simp [(advanceStmt s l m).memory.locals]"\n'
+            "def «simp [(advanceStmt s l).memory.locals]» : Nat := 0\n"
+            "@[simp] theorem attr_not_tactic : (advanceStmt s l m).memory.locals = l := rfl\n"
+            "theorem clean : P := by\n"
+            "  dsimp only [advanceStmt, (advanceStmt s l m).memory.locals]\n"
+            "  simp [(advanceStmt s l m).memory]\n"
+            "  simp [(advanceStmt' s l m).memory.locals]\n"
+            "  simp [(wrap (advanceStmt s l m)).memory.locals]\n"
+            "  change (advanceStmt s l m).memory.locals = l\n"
+            "  dsimp only [other, advanceStmt]\n"
+            "  simp\n"
+            "  have h : (advanceStmt s l m).memory.locals = l := by\n"
+            "    exact rfl\n"
+            "  simp [h]\n"
+            "  have hProofOnly : Nat := foo (advanceStmt s l m).memory.locals\n"
+            "  simp\n"
+        )
+        self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(negatives), [])
+
+    def test_try_rw_hyp_before_target_positive_and_negative_cases(self) -> None:
+        R_TRY = proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET
+
+        positives = (
+            "theorem p : P := by\n"
+            "  try rw [h1, h2] at hEval ⊢\n"
+            "  try erw [show x = y by\n"
+            "             simp at h0\n"
+            "             exact h0] at _hg h2 ⊢\n"
+            "  try rewrite [«a]b», show c = ']' from rfl] at «h» |-\n"
+            "  try rwa (config := { occs := .pos [1] }) [h1] at\n"
+            "    hEval ⊢\n"
+            "  try (simp; rw [h1] at hA ⊢)\n"
+            "  try simp <;> erw [h1] at hB ⊢\n"
+            "  try all_goals rw [h1] at hC ⊢\n"
+            "  try\n"
+            "    simp\n"
+            "    rw [h1] at hD ⊢\n"
+        )
+        got = [
+            (f.line, f.rule, f.symbol)
+            for f in proof_health.scan_projection_and_rewrite_order_hazards(positives)
+        ]
+        self.assertEqual(
+            got,
+            [
+                (2, R_TRY, "try rw [...] at hEval ⊢"),
+                (5, R_TRY, "try erw [...] at _hg h2 ⊢"),
+                (6, R_TRY, "try rewrite [...] at «h» |-"),
+                (7, R_TRY, "try rwa [...] at hEval ⊢"),
+                (9, R_TRY, "try rw [...] at hA ⊢"),
+                (10, R_TRY, "try erw [...] at hB ⊢"),
+                (11, R_TRY, "try rw [...] at hC ⊢"),
+                (14, R_TRY, "try rw [...] at hD ⊢"),
+            ],
+        )
+        first = proof_health.scan_projection_and_rewrite_order_hazards(positives)[0]
+        self.assertIn("at ⊢ hEval", first.suggestion)
+
+        negatives = (
+            "-- try rw [h] at hEval ⊢\n"
+            'def s := "try erw [h] at hEval ⊢"\n'
+            "def «try rw [h] at hEval ⊢» : Nat := 0\n"
+            "theorem clean : P := by\n"
+            "  try rw [h] at ⊢ hEval\n"
+            "  try erw [h] at |- _hg h2\n"
+            "  rw [h] at hEval ⊢\n"
+            "  erw [h] at hEval ⊢\n"
+            "  try rw [h] at hEval\n"
+            "  try rw [h]\n"
+            "  try rw [h] at *\n"
+            "  retry rw [h] at hEval ⊢\n"
+            "  try? rw [h] at hEval ⊢\n"
+            "  try simp [h]\n"
+            "  rw [h] at hEval ⊢\n"
+            "  try\n"
+            "  rw [h] at hEval ⊢\n"
+        )
+        self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(negatives), [])
+
+    def test_cli_advisories_text_and_json_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lean_file = Path(tmp) / "Adv.lean"
+            lean_file.write_text(
+                "theorem t (h hEval : 1 = 1) : 1 = 1 := by\n"
+                "  try rw [h] at hEval ⊢\n"
+                "  exact h\n",
+                encoding="utf-8",
+            )
+            # Without `--advisories`, clean exit 0 and 0 findings.
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                rc = proof_health.main(["--json", "--no-siblings", str(lean_file)])
+            self.assertEqual(rc, 0)
+            rep0 = json.loads(buf.getvalue())
+            self.assertTrue(rep0["ok"])
+            self.assertEqual(rep0["finding_count"], 0)
+            self.assertNotIn("advisory_count", rep0)
+
+            # With `--advisories --json`, advisory is surfaced while `ok` and exit code stay 0.
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                rc = proof_health.main(["--json", "--advisories", "--no-siblings", str(lean_file)])
+            self.assertEqual(rc, 0)
+            rep1 = json.loads(buf.getvalue())
+            self.assertTrue(rep1["ok"])
+            self.assertEqual(rep1["finding_count"], 1)
+            self.assertEqual(rep1["advisory_count"], 1)
+            self.assertEqual(rep1["counts"][proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET], 1)
+            self.assertTrue(rep1["findings"][0]["advisory"])
+
+            # Plain-text `--advisories` marks findings with `[advisory:...]`.
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                rc = proof_health.main(["--advisories", "--no-siblings", str(lean_file)])
+            self.assertEqual(rc, 0)
+            self.assertIn(f"[advisory:{proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET}]", buf.getvalue())
+
+            # When a blocking rule (e.g. R4) also fires, exit status is 1 and `ok` is False.
+            lean_file.write_text(
+                "set_option trace.profiler.threshold 10\n"
+                "theorem t (h hEval : 1 = 1) : 1 = 1 := by\n"
+                "  try rw [h] at hEval ⊢\n"
+                "  exact h\n",
+                encoding="utf-8",
+            )
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                rc = proof_health.main(["--json", "--advisories", "--no-siblings", str(lean_file)])
+            self.assertEqual(rc, 1)
+            rep2 = json.loads(buf.getvalue())
+            self.assertFalse(rep2["ok"])
+            self.assertEqual(rep2["finding_count"], 2)
+            self.assertEqual(rep2["advisory_count"], 1)
+
+    def test_incremental_splicing_and_sub_5ms_benchmarks(self) -> None:
+        import random
+        import lean_lexer
+
+        # 1. Seeded incremental splicing parity with `include_advisories=True` vs `False`.
+        base_theorems = [
+            f"theorem thm_{i} (s : State) (h hEval : 1 = 1) : 1 = 1 := by\n"
+            + (
+                "  try rw [h] at hEval ⊢\n"
+                if i in (2, 18)
+                else "  have _ := s\n"
+            )
+            + "  exact h\n\n"
+            for i in range(24)
+        ]
+        pad = "-- padding line for >= 32 KiB incremental splicing threshold\n" * 600
+        base_doc = pad + "".join(base_theorems)
+        self.assertGreaterEqual(len(base_doc), 32768)
+
+        clear_in_process_caches()
+        self.assertEqual(proof_health.scan_lean_text(base_doc, scan_siblings=False), [])
+        base_adv = proof_health.scan_lean_text(
+            base_doc, scan_siblings=False, include_advisories=True
+        )
+        self.assertEqual(len(base_adv), 2)
+
+        rng = random.Random(0xE92AD7)
+        edits = [
+            "  simp [(advanceStmt s l m).memory.locals]\n",
+            "  change (advanceStmt s l m).frame.stmtIdx = 0\n  simp\n",
+            "  try erw [h] at hEval ⊢\n",
+            "  dsimp only [advanceStmt]\n",
+            "  -- multi-line\n  -- comment shift\n",
+        ]
+        cur_doc = base_doc
+        for step in range(20):
+            target_idx = rng.randint(4, 15)
+            marker = f"theorem thm_{target_idx} "
+            pos = cur_doc.index(marker)
+            nl = cur_doc.index("\n", pos) + 1
+            injected = rng.choice(edits)
+            next_doc = cur_doc[:nl] + injected + cur_doc[nl:]
+
+            inc_adv = proof_health.scan_lean_text(
+                next_doc, scan_siblings=False, include_advisories=True
+            )
+            inc_def = proof_health.scan_lean_text(
+                next_doc, scan_siblings=False, include_advisories=False
+            )
+            drop_scan_memo()
+            cold_adv = proof_health.scan_lean_text(
+                next_doc, scan_siblings=False, include_advisories=True
+            )
+            cold_def = proof_health.scan_lean_text(
+                next_doc, scan_siblings=False, include_advisories=False
+            )
+            self.assertEqual(inc_adv, cold_adv, f"step {step}")
+            self.assertEqual(inc_def, cold_def, f"step {step}")
+            self.assertEqual(inc_def, [], f"step {step}")
+            cur_doc = next_doc
+
+        # 2. `< 5.0 ms` CPU latency benchmarks on `lean_lexer`, hazard scanner, and
+        # incremental `scan_lean_text(..., include_advisories=True)` on `ByteCodec.lean`.
+        bc_text = EPISODE1_BYTECODEC.read_text(encoding="utf-8")
+        bc_stripped = lean_lexer.strip_comments_and_strings_preserving_offsets(bc_text)
+        lex_ms = best_of_ms(
+            lambda: lean_lexer.strip_comments_and_strings_preserving_offsets(bc_text),
+            budget_ms=5.0,
+        )
+        self.assertLess(lex_ms, 5.0, f"ByteCodec lexing took {lex_ms:.2f} ms")
+
+        scan_src_ms = best_of_ms(lambda: lean_lexer.scan_lean_source(bc_text), budget_ms=5.0)
+        self.assertLess(scan_src_ms, 5.0, f"ByteCodec scan_lean_source took {scan_src_ms:.2f} ms")
+
+        ns_ms = best_of_ms(
+            lambda: lean_lexer.NamespaceTracker.from_source(bc_text, stripped=bc_stripped),
+            budget_ms=5.0,
+        )
+        self.assertLess(ns_ms, 5.0, f"ByteCodec NamespaceTracker took {ns_ms:.2f} ms")
+
+        haz_ms = best_of_ms(
+            lambda: proof_health.scan_projection_and_rewrite_order_hazards(
+                bc_text, stripped=bc_stripped
+            ),
+            budget_ms=5.0,
+        )
+        self.assertLess(haz_ms, 5.0, f"ByteCodec hazard scan took {haz_ms:.2f} ms")
+
+        anchor = "theorem scalarValidRange_isExactWidth (sz : Nat)"
+        proof_health.scan_lean_text(
+            bc_text, file_path=EPISODE1_BYTECODEC, scan_siblings=True, include_advisories=True
+        )
+        seq = iter(range(10**6))
+
+        def inc_with_advisories() -> None:
+            k = next(seq)
+            proof_health.scan_lean_text(
+                bc_text.replace(anchor, f"{anchor} (hAdv{k} : {k} ≤ {k} + 1)", 1),
+                file_path=EPISODE1_BYTECODEC,
+                scan_siblings=True,
+                include_advisories=True,
+            )
+
+        inc_ms = best_of_ms(inc_with_advisories, budget_ms=5.0)
+        self.assertLess(
+            inc_ms,
+            5.0,
+            f"ByteCodec incremental scan with advisories took {inc_ms:.2f} ms",
+        )
+
 if __name__ == "__main__":
     unittest.main()
