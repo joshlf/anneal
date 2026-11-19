@@ -113,7 +113,7 @@ theorem canary_part1_miriAllocId_fullWidth :
     MiriAllocId.ofUInt64 (UInt64.ofNat (2^64 - 1)) = some idMax ∧
     0 < idMax.toTrustedAllocId ∧
     idMaxM1.toTrustedAllocId ≠ idMax.toTrustedAllocId ∧
-    (idMaxM1 = ⟨UInt64.ofNat (2^64 - 2), by decide⟩) := by
+    Function.Injective MiriAllocId.value := by
   have hzero := MiriAllocId.ofUInt64_zero
   have hsome1 : MiriAllocId.ofUInt64 (UInt64.ofNat (2^64 - 2)) = some idMaxM1 :=
     MiriAllocId.ofUInt64_eq_some_iff.2 rfl
@@ -124,7 +124,7 @@ theorem canary_part1_miriAllocId_fullWidth :
     have hEq := MiriAllocId.toTrustedAllocId_injective heq
     have hv : idMaxM1.value = idMax.value := congrArg MiriAllocId.value hEq
     exact (by decide : idMaxM1.value ≠ idMax.value) hv
-  have hext : idMaxM1 = ⟨UInt64.ofNat (2^64 - 2), by decide⟩ := MiriAllocId.ext rfl
+  have hext : Function.Injective MiriAllocId.value := fun _ _ h => MiriAllocId.ext h
   exact ⟨hzero, hsome1, hsome2, hpos, hne, hext⟩
 
 theorem canary_part1_rawAATree_and_extTreeMap0_laws :
@@ -302,10 +302,18 @@ theorem canary_part1_allocWorldRel_totality_and_simulation :
 
 theorem canary_part1_highWater_and_wrapAround_exhaustion :
     let wHi : KeyedAllocWorld := { KeyedAllocWorld.empty with nextAllocId := MiriAllocId.maxValue.value }
+    let wCol : KeyedAllocWorld := KeyedAllocWorld.empty.insertLive id1 entryU32
     (wHi.reserveAllocId).2 = .ok MiriAllocId.maxValue ∧
     (wHi.reserveAllocId).1.nextAllocId = 0 ∧
-    (wHi.reserveAllocId).1.idSupplyExhausted = true ∧
-    ((wHi.reserveAllocId).1.reserveAllocId).2 = .error .exhausted := by
+    (wHi.reserveAllocId).1.idSupplyExhausted = false ∧
+    ((wHi.reserveAllocId).1.reserveAllocId).2 = .error .exhausted ∧
+    ((wHi.reserveAllocId).1.reserveAllocId).1.nextAllocId = 1 ∧
+    ((wHi.reserveAllocId).1.reserveAllocId).1.idSupplyExhausted = true ∧
+    (((wHi.reserveAllocId).1.reserveAllocId).1.reserveAllocId).2 = .error .exhausted ∧
+    (wCol.reserveAllocId).2 = .error (.alreadyIssued id1) ∧
+    (wCol.reserveAllocId).1.nextAllocId = 2 ∧
+    (wCol.reserveAllocId).1.findLive? id1 = some entryU32 ∧
+    ((wCol.reserveAllocId).1.reserveAllocId).2 = .ok id2 := by
   dsimp only
   have hfresh : ({ KeyedAllocWorld.empty with nextAllocId := MiriAllocId.maxValue.value } : KeyedAllocWorld).hasIssued MiriAllocId.maxValue = false := by
     simp [KeyedAllocWorld.hasIssued, KeyedAllocWorld.empty, ExtTreeMap0.contains_eq_isSome_get?, ExtTreeMap0.get?_empty]
@@ -316,7 +324,92 @@ theorem canary_part1_highWater_and_wrapAround_exhaustion :
     MiriAllocId.maxValue rfl (MiriAllocId.ofUInt64_eq_some_iff.2 rfl) hfresh hnotIn
   have h2 := keyedReserveAllocId_wrapAround_latches_exhausted { KeyedAllocWorld.empty with nextAllocId := MiriAllocId.maxValue.value }
     rfl rfl hfresh hnotIn
-  exact ⟨h1.1, h2.2.1, h2.2.2.1, h2.2.2.2.1⟩
+  have hcolLive : (KeyedAllocWorld.empty.insertLive id1 entryU32).findLive? id1 = some entryU32 := by
+    simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self]
+  have hcol := keyedReserveAllocId_alreadyIssued_advances_cursor (KeyedAllocWorld.empty.insertLive id1 entryU32)
+    id1 rfl (MiriAllocId.ofUInt64_eq_some_iff.2 rfl)
+    (by simp [KeyedAllocWorld.containsId, hcolLive])
+  have hretry : (({ KeyedAllocWorld.empty.insertLive id1 entryU32 with
+      nextAllocId := (KeyedAllocWorld.empty.insertLive id1 entryU32).nextAllocId + 1 } : KeyedAllocWorld).reserveAllocId).2 =
+      .ok id2 := by
+    have hfresh2 : ({ KeyedAllocWorld.empty.insertLive id1 entryU32 with
+        nextAllocId := (KeyedAllocWorld.empty.insertLive id1 entryU32).nextAllocId + 1 } : KeyedAllocWorld).hasIssued id2 = false := by
+      simp [KeyedAllocWorld.hasIssued, KeyedAllocWorld.insertLive, KeyedAllocWorld.empty,
+        ExtTreeMap0.contains_eq_isSome_get?, ExtTreeMap0.get?_empty]
+    have hnotIn2 : ({ KeyedAllocWorld.empty.insertLive id1 entryU32 with
+        nextAllocId := (KeyedAllocWorld.empty.insertLive id1 entryU32).nextAllocId + 1 } : KeyedAllocWorld).containsId id2 = false := by
+      simp only [KeyedAllocWorld.containsId, KeyedAllocWorld.findLive?, KeyedAllocWorld.findDead?,
+        KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertLive, KeyedAllocWorld.empty]
+      rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id2 ≠ id1), ExtTreeMap0.get?_empty,
+        ExtTreeMap0.get?_empty, ExtTreeMap0.get?_empty]
+      rfl
+    exact (keyedReserveAllocId_of_highWater _ id2 rfl (MiriAllocId.ofUInt64_eq_some_iff.2 rfl) hfresh2 hnotIn2).1
+  refine ⟨h1.1, h2.2.1, h2.2.2.1, h2.2.2.2.1, h2.2.2.2.2.1, h2.2.2.2.2.2.1, h2.2.2.2.2.2.2.1, ?_, ?_, ?_, ?_⟩
+  · rw [hcol]
+  · rw [hcol]; rfl
+  · rw [hcol]; exact hcolLive
+  · rw [hcol]; exact hretry
+
+theorem canary_part1_registerReservedGlobal_validation :
+    let g : GlobalAllocEntry := ⟨.vtable, 24, 3, .not⟩
+    let w1 : KeyedAllocWorld :=
+      { KeyedAllocWorld.empty with
+        nextAllocId := KeyedAllocWorld.empty.nextAllocId + 1
+        issued := KeyedAllocWorld.empty.issued.insert id1 () }
+    KeyedAllocWorld.empty.reserveAllocId = (w1, .ok id1) ∧
+    (KeyedAllocWorld.empty.registerReservedGlobal id1 g).2 = .error (.globalIdAlreadyPresent id1) ∧
+    w1.registerReservedGlobal id1 g = (w1.registerGlobal id1 g, .ok ()) ∧
+    ((w1.registerGlobal id1 g).registerReservedGlobal id1 g).2 = .error (.duplicateRuntimeId id1) ∧
+    ((w1.insertLive id1 entryU32).registerReservedGlobal id1 g).2 = .error (.globalIdAlreadyPresent id1) ∧
+    ((w1.insertDead id1 ⟨4, 2⟩).registerReservedGlobal id1 g).2 = .error (.globalIdAlreadyPresent id1) ∧
+    (LinearAllocWorld.empty.registerReservedGlobal id1 g).2 =
+      (KeyedAllocWorld.empty.registerReservedGlobal id1 g).2 := by
+  dsimp only
+  have hres0 : KeyedAllocWorld.empty.reserveAllocId = ((KeyedAllocWorld.empty.reserveAllocId).1, .ok id1) := by
+    simp [KeyedAllocWorld.reserveAllocId, KeyedAllocWorld.empty, KeyedAllocWorld.hasIssued,
+      KeyedAllocWorld.containsId, KeyedAllocWorld.findLive?, KeyedAllocWorld.findDead?,
+      KeyedAllocWorld.findGlobal?, ExtTreeMap0.contains_eq_isSome_get?, ExtTreeMap0.get?_empty,
+      MiriAllocId.ofUInt64, id1]
+  have hw1 := (keyedReserveAllocId_ok_inv hres0).2.2.2.2
+  have hres : KeyedAllocWorld.empty.reserveAllocId =
+      ({ KeyedAllocWorld.empty with
+          nextAllocId := KeyedAllocWorld.empty.nextAllocId + 1
+          issued := KeyedAllocWorld.empty.issued.insert id1 () }, .ok id1) := by
+    rw [← hw1]; exact hres0
+  have hgNone : (KeyedAllocWorld.empty.findGlobal? id1).isSome = false := by
+    simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.empty, ExtTreeMap0.get?_empty]
+  have hunissued : KeyedAllocWorld.empty.hasIssued id1 = false := by
+    simp [KeyedAllocWorld.hasIssued, KeyedAllocWorld.empty, ExtTreeMap0.contains_eq_isSome_get?,
+      ExtTreeMap0.get?_empty]
+  have hrej0 := (keyedRegisterReservedGlobal_rejections KeyedAllocWorld.empty id1 ⟨.vtable, 24, 3, .not⟩).2
+    hgNone (Or.inr (Or.inr hunissued))
+  have hok := keyedRegisterReservedGlobal_after_reserve ⟨.vtable, 24, 3, .not⟩ hres
+  have hdup := (keyedRegisterReservedGlobal_rejections
+    (({ KeyedAllocWorld.empty with
+        nextAllocId := KeyedAllocWorld.empty.nextAllocId + 1
+        issued := KeyedAllocWorld.empty.issued.insert id1 () } : KeyedAllocWorld).registerGlobal id1
+      ⟨.vtable, 24, 3, .not⟩) id1 ⟨.vtable, 24, 3, .not⟩).1
+    (by simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.registerGlobal, ExtTreeMap0.get?_insert_self])
+  have hlive := (keyedRegisterReservedGlobal_rejections
+    (({ KeyedAllocWorld.empty with
+        nextAllocId := KeyedAllocWorld.empty.nextAllocId + 1
+        issued := KeyedAllocWorld.empty.issued.insert id1 () } : KeyedAllocWorld).insertLive id1 entryU32)
+    id1 ⟨.vtable, 24, 3, .not⟩).2
+    (by simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertLive, KeyedAllocWorld.empty,
+      ExtTreeMap0.get?_empty])
+    (Or.inl (by simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self]))
+  have hdead := (keyedRegisterReservedGlobal_rejections
+    (({ KeyedAllocWorld.empty with
+        nextAllocId := KeyedAllocWorld.empty.nextAllocId + 1
+        issued := KeyedAllocWorld.empty.issued.insert id1 () } : KeyedAllocWorld).insertDead id1 ⟨4, 2⟩)
+    id1 ⟨.vtable, 24, 3, .not⟩).2
+    (by simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.empty,
+      ExtTreeMap0.get?_empty])
+    (Or.inr (Or.inl (by simp [KeyedAllocWorld.findDead?, KeyedAllocWorld.insertDead,
+      ExtTreeMap0.get?_insert_self])))
+  have hlin := (allocWorldRel_registerReservedGlobal allocWorldRel_empty id1 ⟨.vtable, 24, 3, .not⟩).2
+  exact ⟨hres, congrArg Prod.snd hrej0, hok, congrArg Prod.snd hdup, congrArg Prod.snd hlive,
+    congrArg Prod.snd hdead, hlin⟩
 
 theorem canary_part1_deallocate_failure_ordering_and_state_retention :
     let wLive := KeyedAllocWorld.empty.insertLive id1 entryU32
@@ -332,7 +425,12 @@ theorem canary_part1_deallocate_failure_ordering_and_state_retention :
     (wLive.deallocate (.provenanced id1 0) (some (4, 2)) .heap .ok).world.findLive? id1 = none ∧
     (wLive.deallocate (.provenanced id1 0) (some (4, 2)) .heap .ok).detached = some (id1, entryU32) ∧
     (wDup.deallocate (.provenanced id1 0) none .stack .ok).outcome = .error (.duplicateDeadAllocation id1) ∧
-    (wDup.deallocate (.provenanced id1 0) none .stack .ok).world.findDead? id1 = some ⟨4, 2⟩ := by
+    (wDup.deallocate (.provenanced id1 0) none .stack .ok).world.findDead? id1 = some ⟨4, 2⟩ ∧
+    (wLive.deallocate (.provenanced id1 0) none .stack .protectedDealloc).outcome =
+      .error (.hookFailure "TreeBorrowsProtectedDealloc") ∧
+    (wLive.deallocate (.provenanced id1 0) none .stack .protectedDealloc).detached = some (id1, entryU32) ∧
+    (wLive.deallocate (.provenanced id1 0) none .stack .protectedDealloc).world.findLive? id1 = none ∧
+    (wLive.deallocate (.provenanced id1 0) none .stack .protectedDealloc).world.findDead? id1 = none := by
   dsimp only
   have h1 := keyedDeallocate_nonzeroOffset_preserves_live (KeyedAllocWorld.empty.insertLive id1 entryU32)
     id1 1 (by decide) (some (4, 2)) .stack .ok
@@ -358,16 +456,23 @@ theorem canary_part1_deallocate_failure_ordering_and_state_retention :
       (by simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.registerGlobal, ExtTreeMap0.get?_insert_self])
       (some (24, 3)) .stack .ok]
   have h5 := keyedDeallocate_postRemovalFailure_retains_detached_state (KeyedAllocWorld.empty.insertLive id1 entryU32)
-    id1 entryU32
+    id1 entryU32 (some (4, 2)) .heap .ok
     (by simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self])
-    rfl (expectedKind := .heap) (expectedLayout := some (4, 2)) (tb := .ok) (by decide)
+    rfl (by decide)
   have h6 := keyedDeallocate_duplicateDead_replaces_before_error
     ((KeyedAllocWorld.empty.insertLive id1 entryU32).insertDead id1 ⟨99, 0⟩)
     id1 entryU32 ⟨99, 0⟩
     (by simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertDead, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self])
     (by simp [KeyedAllocWorld.findDead?, KeyedAllocWorld.insertDead, ExtTreeMap0.get?_insert_self])
     rfl
-  exact ⟨h1Out, h1Live, h2, h3, h4, h5.1, h5.2.2, h5.2.1, h6.1, h6.2.2.2⟩
+  have h7 := keyedDeallocate_hookFailure_retains_detached_state_without_tombstone
+    (KeyedAllocWorld.empty.insertLive id1 entryU32) id1 entryU32 .protectedDealloc "TreeBorrowsProtectedDealloc"
+    (by simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self])
+    rfl rfl
+  have h7Dead : (KeyedAllocWorld.empty.insertLive id1 entryU32).findDead? id1 = none := by
+    simp [KeyedAllocWorld.findDead?, KeyedAllocWorld.insertLive, KeyedAllocWorld.empty, ExtTreeMap0.get?_empty]
+  exact ⟨h1Out, h1Live, h2, h3, h4, h5.1, h5.2.2.1, h5.2.1, h6.1, h6.2.2.2,
+    h7.1, h7.2.1, h7.2.2.1, h7.2.2.2.trans h7Dead⟩
 
 theorem canary_part1_raceDetectorMode_and_deallocateMachine :
     let wLive := KeyedAllocWorld.empty.insertLive id1 entryU32
@@ -379,38 +484,75 @@ theorem canary_part1_raceDetectorMode_and_deallocateMachine :
       wLive.deallocate (.provenanced id1 0) (some (4, 2)) .stack .ok ∧
     (wLive.deallocateMachine (.provenanced id1 0) none .stack (.configured true) ⟨1, 0, []⟩ .ok).outcome =
       .error (.hookFailure "MissingVectorClockExtra") ∧
+    wWithRace.deallocateMachine (.provenanced id1 0) none .stack (.configured false) ⟨1, 0, []⟩ .ok =
+      KeyedAllocWorld.detachRaceClock (wWithRace.deallocate (.provenanced id1 0) none .stack .ok) ∧
     (wWithRace.deallocateMachine (.provenanced id1 0) none .stack (.configured false) ⟨1, 0, []⟩ .ok).outcome =
       (wWithRace.deallocate (.provenanced id1 0) none .stack .ok).outcome ∧
     (wWithRace.deallocateMachine (.provenanced id1 0) none .stack (.configured true) ⟨1, 3, []⟩ .ok).outcome =
       .error (.hookFailure "DataRace") ∧
+    (wWithRace.deallocateMachine (.provenanced id1 0) none .stack (.configured true) ⟨1, 3, []⟩ .ok).world.findLive? id1 =
+      none ∧
+    (wWithRace.deallocateMachine (.provenanced id1 0) none .stack (.configured true) ⟨1, 3, []⟩ .ok).world.findRace? id1 =
+      none ∧
+    (wWithRace.deallocateMachine (.provenanced id1 0) none .stack (.configured true) ⟨1, 3, []⟩ .ok).world.findDead? id1 =
+      none ∧
+    ((wWithRace.removeRace id1).deallocateMachine (.provenanced id1 0) none .stack (.configured true) ⟨1, 3, []⟩ .ok).outcome =
+      .error (.hookFailure "MissingVectorClockExtra") ∧
+    (wWithRace.deallocateMachine (.provenanced id1 0) none .stack .unconfigured ⟨1, 0, []⟩ .ok).world.findRace? id1 =
+      none ∧
+    (wWithRace.deallocate (.provenanced id1 0) none .stack .ok).world.findRace? id1 =
+      some ⟨2, 5, 0, 0, []⟩ ∧
     (wSameWriter.deallocateMachine (.provenanced id1 0) none .stack (.configured true) ⟨1, 3, []⟩ .ok).outcome =
       .error (.hookFailure "DataRace") ∧
     (wMultiReader.deallocateMachine (.provenanced id1 0) none .stack (.configured true) ⟨1, 10, [(2, 10), (3, 2)]⟩ .ok).outcome =
       .error (.hookFailure "DataRace") ∧
     (wZst.deallocateMachine (.provenanced id1 0) none .stack (.configured true) ⟨1, 0, []⟩ .ok).outcome = .ok () ∧
     ((KeyedAllocWorld.empty.allocateMachine entryU32 (.configured true) 1 5).1.deallocateMachine
-      (.provenanced id1 0) (some (4, 2)) .stack (.configured true) (DeallocActor.ofVClock 1 [(1, 5)]) .ok).outcome = .ok () := by
+      (.provenanced id1 0) (some (4, 2)) .stack (.configured true) (DeallocActor.ofVClock 1 [(1, 5)]) .ok).outcome = .ok () ∧
+    ((KeyedAllocWorld.empty.allocateMachine entryU32 (.configured true) 1 5).1.deallocateMachine
+      (.provenanced id1 0) (some (4, 2)) .stack (.configured true) (DeallocActor.ofVClock 1 [(1, 5)]) .ok).world.findRace? id1 =
+      none := by
   dsimp only
+  have hLiveRaceNone : (KeyedAllocWorld.empty.insertLive id1 entryU32).findRace? id1 = none := by
+    simp [KeyedAllocWorld.findRace?, KeyedAllocWorld.insertLive, KeyedAllocWorld.empty, ExtTreeMap0.get?_empty]
   have hUnconf := keyedDeallocateMachine_unconfigured_eq_deallocate
     (KeyedAllocWorld.empty.insertLive id1 entryU32) (.provenanced id1 0) (some (4, 2)) .stack ⟨1, 0, []⟩ .ok
+    (fun id off h => by
+      cases h
+      exact hLiveRaceNone)
   have hMiss := keyedDeallocateMachine_missingClock_invalid
     (KeyedAllocWorld.empty.insertLive id1 entryU32) id1 entryU32 true ⟨1, 0, []⟩ .ok
     (by simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self])
-    rfl
-    (by simp [KeyedAllocWorld.findRace?, KeyedAllocWorld.insertLive, KeyedAllocWorld.empty, ExtTreeMap0.get?_empty])
+    rfl hLiveRaceNone
+  have hWithRaceLive : ((KeyedAllocWorld.empty.insertLive id1 entryU32).setRace id1 ⟨2, 5, 0, 0, []⟩).findLive? id1 =
+      some entryU32 := by
+    simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.setRace, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self]
+  have hWithRaceClk : ((KeyedAllocWorld.empty.insertLive id1 entryU32).setRace id1 ⟨2, 5, 0, 0, []⟩).findRace? id1 =
+      some ⟨2, 5, 0, 0, []⟩ := by
+    simp [KeyedAllocWorld.findRace?, KeyedAllocWorld.setRace, ExtTreeMap0.get?_insert_self]
+  have hWithRaceDead : ((KeyedAllocWorld.empty.insertLive id1 entryU32).setRace id1 ⟨2, 5, 0, 0, []⟩).findDead? id1 =
+      none := by
+    simp [KeyedAllocWorld.findDead?, KeyedAllocWorld.setRace, KeyedAllocWorld.insertLive, KeyedAllocWorld.empty,
+      ExtTreeMap0.get?_empty]
   have hNotDet := keyedDeallocateMachine_notDetecting_eq_deallocate
     ((KeyedAllocWorld.empty.insertLive id1 entryU32).setRace id1 ⟨2, 5, 0, 0, []⟩)
-    id1 entryU32 ⟨2, 5, 0, 0, []⟩ ⟨1, 0, []⟩ .ok
-    (by simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.setRace, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self])
-    rfl
-    (by simp [KeyedAllocWorld.findRace?, KeyedAllocWorld.setRace, ExtTreeMap0.get?_insert_self])
+    id1 0 ⟨2, 5, 0, 0, []⟩ none .stack ⟨1, 0, []⟩ .ok hWithRaceClk
+  have hNotDetOut := (keyedDetachRaceClock_preserves_outcome_detached_and_tables
+    (((KeyedAllocWorld.empty.insertLive id1 entryU32).setRace id1 ⟨2, 5, 0, 0, []⟩).deallocate
+      (.provenanced id1 0) none .stack .ok) id1).1
   have hRace := keyedDeallocateMachine_race_checked_before_cleanup
     ((KeyedAllocWorld.empty.insertLive id1 entryU32).setRace id1 ⟨2, 5, 0, 0, []⟩)
     id1 entryU32 ⟨2, 5, 0, 0, []⟩ ⟨1, 3, []⟩
-    (by simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.setRace, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self])
-    rfl (by decide)
-    (by simp [KeyedAllocWorld.findRace?, KeyedAllocWorld.setRace, ExtTreeMap0.get?_insert_self])
-    (by decide)
+    hWithRaceLive rfl (by decide) hWithRaceClk (by decide)
+  have hDrop := keyedDeallocateMachine_detached_drops_raceClock
+    ((KeyedAllocWorld.empty.insertLive id1 entryU32).setRace id1 ⟨2, 5, 0, 0, []⟩)
+    (.provenanced id1 0) none .stack (.configured true) ⟨1, 3, []⟩ .ok id1 entryU32 hRace.2.1
+  have hUnconfStale := (keyedDeallocateMachine_live_always_detaches_entry_and_clock
+    ((KeyedAllocWorld.empty.insertLive id1 entryU32).setRace id1 ⟨2, 5, 0, 0, []⟩)
+    id1 entryU32 none .stack .unconfigured ⟨1, 0, []⟩ .ok hWithRaceLive).2.2
+  have hCoreKeeps := keyedDeallocateWith_preserves_raceClocks
+    ((KeyedAllocWorld.empty.insertLive id1 entryU32).setRace id1 ⟨2, 5, 0, 0, []⟩)
+    (.provenanced id1 0) none .stack (fun _ _ _ => DeallocHookSpec.ok.run) id1
   have hSameW := keyedDeallocateMachine_sameWriter_foreignRead_races
     ((KeyedAllocWorld.empty.insertLive id1 entryU32).setRace id1 ⟨1, 2, 2, 7, []⟩)
     id1 entryU32 ⟨1, 2, 2, 7, []⟩ ⟨1, 3, []⟩
@@ -439,10 +581,13 @@ theorem canary_part1_raceDetectorMode_and_deallocateMachine :
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findDead?, KeyedAllocWorld.findGlobal?,
       ExtTreeMap0.contains_eq_isSome_get?, ExtTreeMap0.get?_empty, MiriAllocId.ofUInt64, id1]
   have hAllocDealloc := keyedAllocateMachine_deallocateMachine_sameThread_ok
-    KeyedAllocWorld.empty entryU32 (.configured true) 1 5 id1 rfl
+    KeyedAllocWorld.empty _ entryU32 (.configured true) 1 5 id1 rfl
     (by simp [KeyedAllocWorld.findDead?, KeyedAllocWorld.empty, ExtTreeMap0.get?_empty])
     hAllocEq
-  exact ⟨hUnconf, hMiss.1, hNotDet.1, hRace.1, hSameW, hMulti, hZst, hAllocDealloc⟩
+  exact ⟨hUnconf, hMiss.1, hNotDet, (congrArg DeallocResult.outcome hNotDet).trans hNotDetOut,
+    hRace.1, hRace.2.2.1, hDrop.1, hRace.2.2.2.2.1.trans hWithRaceDead, hRace.2.2.2.2.2,
+    hUnconfStale, hCoreKeeps.trans hWithRaceClk, hSameW, hMulti, hZst,
+    hAllocDealloc.1, hAllocDealloc.2.1⟩
 
 theorem canary_part1_ofVClock_unlisted_zero_vs_nonzeroFallback :
     (DeallocActor.ofVClock 1 [(2, 10)]).viewFor 3 = 0 ∧
@@ -664,6 +809,27 @@ theorem canary_part2A_sourceOrder_bottomUp_and_equivalence :
       simp [multiLevelBorrowWorld]
   exact ⟨hheadAux, hheadTags, hheadNodes, ⟨_, hrev⟩, ⟨_, hbot.2.1, hbot.2.2⟩, heq3, heqUp, hokEquiv, hrun⟩
 
+theorem canary_part2A_readOnlyAlloc_implicitWrite_rejected_noWritable_ok :
+    let wMut : FnEntryBorrowWorld := mkTwoBranchWorld .unique .frozen
+    let wRo : FnEntryBorrowWorld := { mkTwoBranchWorld .unique .frozen with allocReadOnly := true }
+    execFnEntryMutRetag wRo 1 0 4 .writableChildWrite = .error .writeToReadOnlyAlloc ∧
+    execFnEntryMutRetagUpstream wRo 1 0 4 .writableChildWrite = .error .writeToReadOnlyAlloc ∧
+    execFnEntryMutRetagSourceOrder wRo 1 0 4 .writableChildWrite = .error .writeToReadOnlyAlloc ∧
+    (execFnEntryMutRetagSourceOrder wRo 1 0 4 .rustcNoWritable).isOk = true ∧
+    (execFnEntryMutRetagSourceOrder wRo 1 0 4 .rustcNoWritable).map
+        (fun r => (r.1.nodes, r.1.activeProtectors, r.1.nextTag, r.1.nextProtector, r.2)) =
+      (execFnEntryMutRetagSourceOrder wMut 1 0 4 .rustcNoWritable).map
+        (fun r => (r.1.nodes, r.1.activeProtectors, r.1.nextTag, r.1.nextProtector, r.2)) ∧
+    (execFnEntryMutRetagSourceOrder wRo 1 0 0 .writableChildWrite).isOk = true ∧
+    (execFnEntryMutRetagSourceOrder wMut 1 0 4 .writableChildWrite).isOk = true := by
+  dsimp only
+  have hrej := fnEntryMutRetag_readOnlyAlloc_writable_rejected
+    { mkTwoBranchWorld .unique .frozen with allocReadOnly := true } 1 0 4 false
+    ⟨1, some 0, .unique, 0, 4, none⟩ rfl rfl (by decide) (by decide)
+  have hign := sourceOrder_rustcNoWritable_ignores_allocReadOnly
+    (mkTwoBranchWorld .unique .frozen) true 1 0 4 false
+  exact ⟨hrej.1, hrej.2.1, hrej.2.2, by decide, hign, by decide, by decide⟩
+
 theorem canary_part2B_pureFreeze_pureUnsafeCell_mixed_and_zstUnsafeCell :
     evalRawMutStaticWriteTB (retagStaticPreservedAt (.freezeScalar 4) 1 2) 0 1 = .ub ∧
     evalRawMutStaticWriteTB (retagStaticErasedAt (.freezeScalar 4) 1) 0 1 = .ok ∧
@@ -728,6 +894,66 @@ theorem canary_part3A_syntacticSized_customDst_and_safeThinRef :
   have hov := unsized_rawPtr_layoutOverflow_rejected_like_upstream 4096 1
   have hthin := validateSafeThinRef_staticGlobal_nullProv_and_accessOrder
   exact ⟨hmeta, hfmeta, hfok.1, hfok.2, hok, huns, hsep.1, hsep.2, himp, hsl.1, hov.1, ⟨hthin.2.1, hthin.2.2.1, hthin.2.2.2⟩⟩
+
+theorem canary_part3A_safeThinRef_zstNeverDangles_and_nullDeadFn_classification :
+    let wMix : KeyedAllocWorld :=
+      (KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩
+    validateSafeThinRef wMix .unit ⟨16, some (id3, 0)⟩ = .ok () ∧
+    validateSafeThinRef wMix .unit ⟨16, some (id10, 999)⟩ = .ok () ∧
+    validateSafeThinRef wMix .unit ⟨0, some (id3, 0)⟩ = .error .nullSafePtr ∧
+    validateSafeThinRef wMix (.uint 4) ⟨0, none⟩ = .error .nullSafePtr ∧
+    validateSafeThinRef wMix (.uint 4) ⟨16, none⟩ = .error .danglingOrOutOfBoundsSafePtr ∧
+    validateSafeThinRef wMix (.uint 4) ⟨16, some (id3, 0)⟩ = .error .danglingOrOutOfBoundsSafePtr ∧
+    validateSafeThinRef wMix (.uint 4) ⟨16, some (id2, 0)⟩ = .error .danglingOrOutOfBoundsSafePtr ∧
+    wMix.isAllocLive id2 = true ∧
+    wMix.isAllocLive id3 = false ∧
+    wMix.getAllocInfo id3 = some ⟨4, 2, .dead, .not⟩ ∧
+    wMix.getLiveAllocSizeAndAlign id3 = .error (.useAfterFree id3) ∧
+    wMix.getLiveAllocSizeAndAlign id10 = .error (.unavailable id10) ∧
+    wMix.getAllocInfo id2 = some ⟨0, 0, .function, .not⟩ := by
+  dsimp only
+  have hdeadNotLive : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findLive? id3 = none := by
+    simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
+      KeyedAllocWorld.empty, ExtTreeMap0.get?_empty]
+  have hdeadNotGlobal : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findGlobal? id3 = none := by
+    simp only [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
+      KeyedAllocWorld.empty]
+    rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id3 ≠ id2), ExtTreeMap0.get?_empty]
+  have hdead : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findDead? id3 = some ⟨4, 2⟩ := by
+    simp [KeyedAllocWorld.findDead?, KeyedAllocWorld.insertDead, ExtTreeMap0.get?_insert_self]
+  have hfnNotLive : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findLive? id2 = none := by
+    simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
+      KeyedAllocWorld.empty, ExtTreeMap0.get?_empty]
+  have hfn : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findGlobal? id2 =
+      some ⟨.function, 0, 0, .not⟩ := by
+    simp [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
+      ExtTreeMap0.get?_insert_self]
+  have h10NotLive : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findLive? id10 = none := by
+    simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
+      KeyedAllocWorld.empty, ExtTreeMap0.get?_empty]
+  have h10NotGlobal : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findGlobal? id10 = none := by
+    simp only [KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
+      KeyedAllocWorld.empty]
+    rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id10 ≠ id2), ExtTreeMap0.get?_empty]
+  have h10NotDead : ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩).findDead? id10 = none := by
+    simp only [KeyedAllocWorld.findDead?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
+      KeyedAllocWorld.empty]
+    rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id10 ≠ id3), ExtTreeMap0.get?_empty]
+  have hz1 := validateSafeThinRef_zst_never_dangles
+    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩) ⟨16, some (id3, 0)⟩
+  have hz2 := validateSafeThinRef_zst_never_dangles
+    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩) ⟨16, some (id10, 999)⟩
+  have hz3 := validateSafeThinRef_zst_never_dangles
+    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩) ⟨0, some (id3, 0)⟩
+  have hcls := validateSafeThinRef_nullInt_dead_and_fnGlobal_classification
+    ((KeyedAllocWorld.empty.registerGlobal id2 ⟨.function, 0, 0, .not⟩).insertDead id3 ⟨4, 2⟩)
+    id3 id2 ⟨4, 2⟩ ⟨.function, 0, 0, .not⟩ hdeadNotLive hdeadNotGlobal hdead hfnNotLive hfn (Or.inl rfl)
+  have hliveG := keyedIsAllocLive_of_global _ id2 _ hfn
+  have hdeadInfo := (keyedGetAllocInfo_dead_and_unavailable _ id3 hdeadNotLive hdeadNotGlobal).1 ⟨4, 2⟩ hdead
+  have hunavail := (keyedGetAllocInfo_dead_and_unavailable _ id10 h10NotLive h10NotGlobal).2 h10NotDead
+  have hfnInfo := (keyedGetAllocInfo_global_kinds _ id2 _ hfnNotLive hfn).1
+  exact ⟨hz1.trans rfl, hz2.trans rfl, hz3.trans rfl, hcls.1, hcls.2.1, hcls.2.2.1, hcls.2.2.2,
+    hliveG, hdeadInfo.2.2, hdeadInfo.1, hdeadInfo.2.1, hunavail.2, hfnInfo⟩
 
 theorem canary_part3B_autoTraits_keys_and_principalLess_vtables :
     AutoTrait.rank .send ≠ AutoTrait.rank .sync ∧
@@ -1028,9 +1254,10 @@ theorem canary_part3C_wideDyn_vtable_precedence_and_mayDangle :
     simp [w, KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self]
   have hno2 : w.getAllocInfo id2 = none := by
     simp only [w, KeyedAllocWorld.getAllocInfo, KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?,
-      KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.empty]
+      KeyedAllocWorld.findDead?, KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.empty]
     rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id2 ≠ id10), ExtTreeMap0.get?_empty,
-        ExtTreeMap0.get?_insert_ne _ _ (by decide : id2 ≠ id1), ExtTreeMap0.get?_empty]
+        ExtTreeMap0.get?_insert_ne _ _ (by decide : id2 ≠ id1), ExtTreeMap0.get?_empty,
+        ExtTreeMap0.get?_empty]
   have hdbl := wideDyn_doubleNull_separation w reg spec false false
   have hprec := wideDyn_invalidVTable_precedes_all_data_ub w reg (.danglingInt 16) (.danglingInt 0) spec false true
     (.invalidVTableDanglingInt 16) rfl
@@ -1039,7 +1266,7 @@ theorem canary_part3C_wideDyn_vtable_precedence_and_mayDangle :
   have hdang := wideDyn_validVTable_dangling_and_unaligned w reg (.provenanced id1 0) spec vtUninhab id10 entryU32
     hvtOk rfl rfl hlive (by decide)
   have hmaybe := wideDyn_validVTable_maybeNull_dangling_precedes_null w reg (.provenanced id1 0) spec vtUninhab id2
-    hvtOk hno2
+    hvtOk (by decide) (fun info hinfo => by rw [hno2] at hinfo; cases hinfo)
   have hdzero := wideDyn_validVTable_danglingIntZero_reports_null w reg (.provenanced id1 0) spec vtUninhab true hvtOk
   have hclose := wideDyn_mayDangle_addressTooClose_and_uninhabited_concrete_ok w reg (.provenanced id1 0) spec vtUninhab
     hvtOk rfl rfl rfl
@@ -1049,6 +1276,91 @@ theorem canary_part3C_wideDyn_vtable_precedence_and_mayDangle :
   have hshape := rawWideDyn_shapeCheck_misses_invalid_vtable w reg spec 0 .null
   exact ⟨hdbl, hprec, hnull, hdang.1, hmaybe, hdzero, hclose.1, hclose.2,
     hunal.2.1, hunal.2.2.1, hunal.2.2.2, hraw, hshape.1, hshape.2⟩
+
+theorem canary_part3C_zstConcrete_neverDangles_and_provenanced_addressTooClose :
+    let spec : DynExistentialSpec := ⟨none, AutoTraitSet.ofList [.send], []⟩
+    let vtZst := buildPrincipalLessVTable .unit 501 none 0 0 [.send]
+    let vtU32 := buildPrincipalLessVTable (.uint 4) 502 none 4 2 [.send]
+    let reg : VTableRegistry :=
+      { keyToAlloc := ExtTreeMap0.empty,
+        allocToData := (ExtTreeMap0.empty.insert id1 vtZst).insert id2 vtU32 }
+    let w : KeyedAllocWorld :=
+      ((KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩).registerGlobal id2
+        ⟨.vtable, 24, 3, .not⟩).insertDead id3 ⟨4, 2⟩
+    validateWideDynSafePtr w reg (.provenanced id1 0) (.provenanced id3 0 16) spec false false = .ok vtZst ∧
+    validateWideDynSafePtr w reg (.provenanced id1 0) (.maybeNull id10 77 16) spec false false = .ok vtZst ∧
+    validateWideDynSafePtr w reg (.provenanced id1 0) (.maybeNull id3 0 0) spec false false =
+      .error .nullSafePointer ∧
+    validateWideDynSafePtr w reg (.provenanced id2 0) (.maybeNull id3 0 0) spec false false =
+      .error (.danglingOrOutOfBoundsData 0) ∧
+    validateWideDynSafePtr w reg (.provenanced id2 0)
+      (.provenanced id3 0 (UInt64.ofNat (usizeMax64 - 4))) spec true false = .error (.addressTooClose 4) ∧
+    validateWideDynSafePtr w reg (.provenanced id2 0)
+      (.maybeNull id3 0 (UInt64.ofNat (usizeMax64 - 4))) spec true true = .error (.addressTooClose 4) ∧
+    checkNestedSafeRefChildSession (.uint 4)
+      [(0xFB, some id3), (0xFF, some id3), (0xFF, some id3), (0xFF, some id3),
+       (0xFF, some id3), (0xFF, some id3), (0xFF, some id3), (0xFF, some id3)] =
+      .error (.nestedAddressTooClose 4) ∧
+    checkNestedSafeRefChildSession (.uint 4)
+      [(0xFB, none), (0xFF, none), (0xFF, none), (0xFF, none),
+       (0xFF, none), (0xFF, none), (0xFF, none), (0xFF, none)] =
+      .error (.nestedAddressTooClose 4) := by
+  dsimp only
+  let spec : DynExistentialSpec := ⟨none, AutoTraitSet.ofList [.send], []⟩
+  let vtZst := buildPrincipalLessVTable .unit 501 none 0 0 [.send]
+  let vtU32 := buildPrincipalLessVTable (.uint 4) 502 none 4 2 [.send]
+  let reg : VTableRegistry :=
+    { keyToAlloc := ExtTreeMap0.empty,
+      allocToData := (ExtTreeMap0.empty.insert id1 vtZst).insert id2 vtU32 }
+  let w : KeyedAllocWorld :=
+    ((KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not⟩).registerGlobal id2
+      ⟨.vtable, 24, 3, .not⟩).insertDead id3 ⟨4, 2⟩
+  have hvtZst : validateVTableHalf w reg (.provenanced id1 0) spec = .ok vtZst := by
+    have hmatch : vtableMatchesExpectedSpec vtZst.spec spec = true := rfl
+    have hg : w.findGlobal? id1 = some ⟨.vtable, 24, 3, .not⟩ := by
+      simp only [w, KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal]
+      rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id1 ≠ id2), ExtTreeMap0.get?_insert_self]
+    have hd : reg.allocToData.get? id1 = some vtZst := by
+      simp only [reg]
+      rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id1 ≠ id2), ExtTreeMap0.get?_insert_self]
+    simp [validateVTableHalf, hg, hd, hmatch]
+  have hvtU32 : validateVTableHalf w reg (.provenanced id2 0) spec = .ok vtU32 := by
+    have hmatch : vtableMatchesExpectedSpec vtU32.spec spec = true := rfl
+    have hg : w.findGlobal? id2 = some ⟨.vtable, 24, 3, .not⟩ := by
+      simp [w, KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
+        ExtTreeMap0.get?_insert_self]
+    have hd : reg.allocToData.get? id2 = some vtU32 := by
+      simp [reg, ExtTreeMap0.get?_insert_self]
+    simp [validateVTableHalf, hg, hd, hmatch]
+  have hdeadInfo : w.getAllocInfo id3 = some ⟨4, 2, .dead, .not⟩ := by
+    have hnotLive : w.findLive? id3 = none := by
+      simp [w, KeyedAllocWorld.findLive?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
+        KeyedAllocWorld.empty, ExtTreeMap0.get?_empty]
+    have hnotGlobal : w.findGlobal? id3 = none := by
+      simp only [w, KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertDead, KeyedAllocWorld.registerGlobal,
+        KeyedAllocWorld.empty]
+      rw [ExtTreeMap0.get?_insert_ne _ _ (by decide : id3 ≠ id2),
+        ExtTreeMap0.get?_insert_ne _ _ (by decide : id3 ≠ id1), ExtTreeMap0.get?_empty]
+    have hdead : w.findDead? id3 = some ⟨4, 2⟩ := by
+      simp [w, KeyedAllocWorld.findDead?, KeyedAllocWorld.insertDead, ExtTreeMap0.get?_insert_self]
+    exact ((keyedGetAllocInfo_dead_and_unavailable w id3 hnotLive hnotGlobal).1 ⟨4, 2⟩ hdead).1
+  have hzst1 := wideDyn_zstConcrete_never_dangles w reg (.provenanced id1 0) spec vtZst id3 0 16
+    hvtZst rfl rfl (by decide)
+  have hzst2 := wideDyn_zstConcrete_never_dangles w reg (.provenanced id1 0) spec vtZst id10 77 16
+    hvtZst rfl rfl (by decide)
+  have hmaybe := wideDyn_validVTable_maybeNull_dangling_precedes_null w reg (.provenanced id2 0) spec vtU32 id3
+    hvtU32 (by decide) (fun info hinfo => by
+      rw [hdeadInfo] at hinfo
+      injection hinfo with hinfo
+      subst hinfo
+      rfl)
+  have hclose1 := wideDyn_mayDangle_provenanced_addressTooClose w reg (.provenanced id2 0) spec vtU32 id3 0 false
+    hvtU32 rfl
+  have hclose2 := wideDyn_mayDangle_provenanced_addressTooClose w reg (.provenanced id2 0) spec vtU32 id3 0 true
+    hvtU32 rfl
+  exact ⟨hzst1.1, hzst2.2.1, hzst1.2.2, hmaybe, hclose1.1, hclose2.2,
+    checkNestedSafeRefChildSession_addressTooClose_ignores_provenance (some id3),
+    checkNestedSafeRefChildSession_addressTooClose_ignores_provenance none⟩
 
 theorem canary_part3C_unified_validateRawPtrFull :
     let resolve : String → DynExistentialSpec := fun _ => ⟨none, AutoTraitSet.ofList [.send], []⟩
@@ -1358,6 +1670,48 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_recursive_fieldOrder_nullProv
 -/
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_recursive_fieldOrder_nullProvFn_zstArray_and_fuel
 
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.keyedReserveAllocId_wrapAround_latches_exhausted' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.keyedReserveAllocId_wrapAround_latches_exhausted
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.keyedDeallocateMachine_live_always_detaches_entry_and_clock' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.keyedDeallocateMachine_live_always_detaches_entry_and_clock
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.keyedDeallocateMachine_race_checked_before_cleanup' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.keyedDeallocateMachine_race_checked_before_cleanup
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.fnEntryMutRetag_readOnlyAlloc_writable_rejected' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.fnEntryMutRetag_readOnlyAlloc_writable_rejected
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.sourceOrder_rustcNoWritable_ignores_allocReadOnly' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.sourceOrder_rustcNoWritable_ignores_allocReadOnly
+
+/-- info: 'Anneal.ExtTreeMapAllocAndNoWritable.validateSafeThinRef_zst_never_dangles' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.validateSafeThinRef_zst_never_dangles
+
+/-- info: 'Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_zstConcrete_never_dangles' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_zstConcrete_never_dangles
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_mayDangle_provenanced_addressTooClose' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_mayDangle_provenanced_addressTooClose
+
 /-! ## Section 6: Meta-Level `run_cmd` Audit & Rolled-Back Self-Tests -/
 
 section MetaAudit
@@ -1417,33 +1771,55 @@ private partial def collectTransitiveClosure (env : Environment) (roots : List N
           go next2 seen'
   go roots {}
 
-/-- Collect constants from an `Expr` while pruning dead `.letE`, beta-redex, and `letFun` bindings. -/
+/-- Collect constants from an `Expr` while pruning dead `.letE`, beta-redex, and `letFun` bindings.
+DAG-aware: every shared subterm is visited once (collection is context-free per subterm), so heavily
+shared `simp` / `decide` proof terms are traversed in time linear in their DAG size. -/
 private partial def collectPrunedExprConsts (e : Expr) (acc : NameSet) : NameSet :=
-  match e with
-  | .const n _ => acc.insert n
-  | .letE _ t v b _ =>
-    if !b.hasLooseBVar 0 then collectPrunedExprConsts b acc
-    else collectPrunedExprConsts b (collectPrunedExprConsts v (collectPrunedExprConsts t acc))
-  | .app fn arg =>
-    let head := e.getAppFn
-    let args := e.getAppArgs
-    if head.isConstOf ``letFun && args.size == 4 then
-      match args[3]! with
-      | .lam _ _ b _ =>
-        if !b.hasLooseBVar 0 then collectPrunedExprConsts b acc
-        else collectPrunedExprConsts b (collectPrunedExprConsts args[2]! acc)
-      | other => collectPrunedExprConsts other (collectPrunedExprConsts args[2]! acc)
-    else
-      match fn with
-      | .lam _ _ b _ =>
-        if !b.hasLooseBVar 0 then collectPrunedExprConsts b acc
-        else collectPrunedExprConsts b (collectPrunedExprConsts arg acc)
-      | _ => collectPrunedExprConsts arg (collectPrunedExprConsts fn acc)
-  | .lam _ d b _ => collectPrunedExprConsts b (collectPrunedExprConsts d acc)
-  | .forallE _ d b _ => collectPrunedExprConsts b (collectPrunedExprConsts d acc)
-  | .mdata _ inner => collectPrunedExprConsts inner acc
-  | .proj _ _ s => collectPrunedExprConsts s acc
-  | _ => acc
+  ((go e).run ({}, acc)).2.2
+where
+  go (e : Expr) : StateM (Std.HashSet Expr × NameSet) Unit := do
+    if (← get).1.contains e then return
+    modify fun st => (st.1.insert e, st.2)
+    match e with
+    | .const n _ => modify fun st => (st.1, st.2.insert n)
+    | .letE _ t v b _ =>
+      if !b.hasLooseBVar 0 then go b
+      else
+        go t
+        go v
+        go b
+    | .app fn arg =>
+      let head := e.getAppFn
+      let args := e.getAppArgs
+      if head.isConstOf ``letFun && args.size == 4 then
+        match args[3]! with
+        | .lam _ _ b _ =>
+          if !b.hasLooseBVar 0 then go b
+          else
+            go args[2]!
+            go b
+        | other =>
+          go args[2]!
+          go other
+      else
+        match fn with
+        | .lam _ _ b _ =>
+          if !b.hasLooseBVar 0 then go b
+          else
+            go arg
+            go b
+        | _ =>
+          go fn
+          go arg
+    | .lam _ d b _ =>
+      go d
+      go b
+    | .forallE _ d b _ =>
+      go d
+      go b
+    | .mdata _ inner => go inner
+    | .proj _ _ s => go s
+    | _ => pure ()
 
 /-- Pruned transitive closure scoped to audited modules for genuine theorem reachability. -/
 private partial def collectPrunedReachableClosure (env : Environment)
@@ -1472,43 +1848,51 @@ private def exprMentionsAudited (env : Environment) (theoryModIdx? : Option Modu
   e.getUsedConstants.any (isAuditedDecl env theoryModIdx?)
 
 /-- Detect dead placeholder bindings (`.letE`, beta-redex, `letFun` where binder `0` is unused
-and the discarded value references an audited declaration). -/
+and the discarded value references an audited declaration). DAG-aware: every shared subterm is
+inspected once (detection is context-free per subterm). -/
 private partial def hasPlaceholderBinding (env : Environment) (theoryModIdx? : Option ModuleIdx)
     (e : Expr) : Bool :=
-  match e with
-  | .letE _ t v b _ =>
-    ((!b.hasLooseBVar 0) && exprMentionsAudited env theoryModIdx? v) ||
-      hasPlaceholderBinding env theoryModIdx? t ||
-      hasPlaceholderBinding env theoryModIdx? v ||
-      hasPlaceholderBinding env theoryModIdx? b
-  | .app fn arg =>
-    let head := e.getAppFn
-    let args := e.getAppArgs
-    if head.isConstOf ``letFun && args.size == 4 then
-      match args[3]! with
-      | .lam _ _ b _ =>
-        ((!b.hasLooseBVar 0) && exprMentionsAudited env theoryModIdx? args[2]!) ||
-          hasPlaceholderBinding env theoryModIdx? args[2]! ||
-          hasPlaceholderBinding env theoryModIdx? b
-      | other =>
-        hasPlaceholderBinding env theoryModIdx? args[2]! ||
-          hasPlaceholderBinding env theoryModIdx? other
-    else
-      match fn with
-      | .lam _ _ b _ =>
-        ((!b.hasLooseBVar 0) && exprMentionsAudited env theoryModIdx? arg) ||
-          hasPlaceholderBinding env theoryModIdx? arg ||
-          hasPlaceholderBinding env theoryModIdx? b
-      | _ =>
-        hasPlaceholderBinding env theoryModIdx? fn ||
-          hasPlaceholderBinding env theoryModIdx? arg
-  | .lam _ d b _ =>
-    hasPlaceholderBinding env theoryModIdx? d || hasPlaceholderBinding env theoryModIdx? b
-  | .forallE _ d b _ =>
-    hasPlaceholderBinding env theoryModIdx? d || hasPlaceholderBinding env theoryModIdx? b
-  | .mdata _ inner => hasPlaceholderBinding env theoryModIdx? inner
-  | .proj _ _ s => hasPlaceholderBinding env theoryModIdx? s
-  | _ => false
+  ((go e).run {}).1
+where
+  go (e : Expr) : StateM (Std.HashSet Expr) Bool := do
+    if (← get).contains e then return false
+    modify fun vis => vis.insert e
+    match e with
+    | .letE _ t v b _ =>
+      if (!b.hasLooseBVar 0) && exprMentionsAudited env theoryModIdx? v then return true
+      if ← go t then return true
+      if ← go v then return true
+      go b
+    | .app fn arg =>
+      let head := e.getAppFn
+      let args := e.getAppArgs
+      if head.isConstOf ``letFun && args.size == 4 then
+        match args[3]! with
+        | .lam _ _ b _ =>
+          if (!b.hasLooseBVar 0) && exprMentionsAudited env theoryModIdx? args[2]! then return true
+          if ← go args[2]! then return true
+          go b
+        | other =>
+          if ← go args[2]! then return true
+          go other
+      else
+        match fn with
+        | .lam _ _ b _ =>
+          if (!b.hasLooseBVar 0) && exprMentionsAudited env theoryModIdx? arg then return true
+          if ← go arg then return true
+          go b
+        | _ =>
+          if ← go fn then return true
+          go arg
+    | .lam _ d b _ =>
+      if ← go d then return true
+      go b
+    | .forallE _ d b _ =>
+      if ← go d then return true
+      go b
+    | .mdata _ inner => go inner
+    | .proj _ _ s => go s
+    | _ => return false
 
 /-- Strip `let`/`letFun` wrappers from a `Prop` expression for tautology inspection. -/
 private partial def stripLetBindings (e : Expr) : Expr :=

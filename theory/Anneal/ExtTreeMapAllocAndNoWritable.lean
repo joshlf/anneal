@@ -42,6 +42,30 @@ Complete, kernel-checked, `Classical.choice`-free theory covering:
   preservation, wide-`dyn` vtable-before-data UB precedence, unified
   `validateRawPtrFull`, and deferred recursive `childSession` (`mayDangle = true`)
   pointee byte visitor (`validateWideDynSafePtrWithBytes`).
+
+## Upstream Correspondence Map (pinned `lean-miri/vendor/Miri`)
+
+| Definition in this module | Upstream source |
+| :--- | :--- |
+| `reserveAllocId` | `Miri.Memory.MemoryState.reserveAllocId` (`AllocMap::reserve`, `fetch_add`) |
+| `registerReservedGlobal` | `Miri.Memory.MemoryState.registerReservedGlobal` (`validateReservedGlobal`) |
+| `isAllocLive`, `getAllocInfo`, `getLiveAllocSizeAndAlign` | same-named `Miri.Memory.MemoryState` queries |
+| `deallocateWith` | `Miri.Memory.MemoryState.deallocatePtrWith` (`Memory::deallocate_ptr`) |
+| `machineDeallocHook` | `Miri.Interpreter.AllocationMachine.before` (`MachineHooks.memoryRaceAccess`, then Tree Borrows) |
+| `detachRaceClock`, `deallocateMachine` | `Miri.Interpreter.AllocationMachine.deallocate` |
+| `MiriRetagPolicyMirror.create` | `Miri.TreeBorrows.RetagPolicy.create` (`NewPermission::new`) |
+| `stepNodeOnRangeRead` / `stepNodeOnRangeWrite` | `Miri.TreeBorrows.performAccess` + `Tree.LocationState.performAccess` |
+| `execFnEntryMutRetagSourceOrder` | `Miri.TreeBorrows.RetagPipeline` (`accessTreeForReborrow`) over `TraversalTree.traverse` |
+| `KeyedAllocWorld.checkPtrAccess` | `Miri.Memory.checkAndDerefPtr` via `ValidityMachine.checkPointerAccessResult` |
+| `validateSafeThinRef`, `validateWideDynSafePtr` | `Miri.Interpreter.ValidityVisitor.checkSafe` |
+| `validateVTableHalf`, `vtableMatchesExpectedSpec` | `Miri.Interpreter.VTable.getPtrVTableTypeRead`, `checkForTypeRead` |
+| `visitConcreteValue`, `validateWideDynSafePtrWithBytes` | `Miri.Interpreter.ValidityVisitor.visit`, `validatePlace … recursive` |
+
+Honest scope: Miri's `extra_fn_ptr_map` / va-list tables, export-ID tables, and wildcard provenance are
+not modeled; the machine hook has no memory side effects beyond the race-clock detach; borrow-tree nodes
+carry one coarse byte range (no per-byte lazy permissions, no `SkipSelfAndChildren` subtree pruning);
+pointers are 8 bytes (wide nested pointers are validated on their data word); and global allocations
+are metadata-only (no byte payload).
 -/
 
 namespace Anneal.ExtTreeMapAllocAndNoWritable
@@ -1379,13 +1403,41 @@ structure GlobalAllocEntry where
   mutability : AllocMutability := .not
   deriving DecidableEq, Repr, Inhabited
 
-/-- Unified allocation info returned by `getAllocInfo` (live local or global). -/
+/-- Allocation classification returned by `getAllocInfo`, mirroring `Miri.Memory.AllocationKind`
+(`rustc_const_eval::interpret::AllocKind`). Miri's `extra_fn_ptr_map` and va-list tables are not
+modeled, so `.function` arises only from `GlobalAllocKind.function` globals. -/
+inductive AllocInfoKind where
+  | liveData
+  | function
+  | vtable
+  | typeId
+  | dead
+  deriving DecidableEq, Repr, Inhabited
+
+/-- Unified allocation info returned by `getAllocInfo` (`Miri.Memory.AllocationInfo`). -/
 structure AllocInfo where
   sizeBytes : UInt64
   alignPow2 : UInt8
+  kind : AllocInfoKind
   mutability : AllocMutability
-  isLive : Bool
-  globalKind : Option GlobalAllocKind := none
+  deriving DecidableEq, Repr
+
+/-- Kind-specific `(size, align, kind, mutability)` reported by `get_alloc_info` for a compiler global
+(`Miri.Memory.MemoryState.getAllocInfo`): functions and type-ids are `0`-byte align-`1` immutable,
+vtables are `0`-byte with their recorded alignment, and only `.static` / `.memory` globals expose
+dereferenceable `.liveData` bytes. -/
+def GlobalAllocEntry.toAllocInfo (g : GlobalAllocEntry) : AllocInfo :=
+  match g.kind with
+  | .function => ⟨0, 0, .function, .not⟩
+  | .vtable => ⟨0, g.alignPow2, .vtable, .not⟩
+  | .typeId => ⟨0, 0, .typeId, .not⟩
+  | .static => ⟨g.sizeBytes, g.alignPow2, .liveData, g.mutability⟩
+  | .memory => ⟨g.sizeBytes, g.alignPow2, .liveData, g.mutability⟩
+
+/-- Failure modes of `getLiveAllocSizeAndAlign` (`Miri.Memory.LiveAllocationInfoError`). -/
+inductive LiveAllocInfoErr where
+  | unavailable (allocId : MiriAllocId)
+  | useAfterFree (allocId : MiriAllocId)
   deriving DecidableEq, Repr
 
 /-- Per-allocation vector-clock summary tracking writer, primary reader, and additional concurrent readers. -/
@@ -1460,10 +1512,43 @@ def DeallocHookSpec.run : DeallocHookSpec → Except String Unit
   | .missingRaceClock => .error "MissingVectorClockExtra"
   | .customFailure reason => .error reason
 
+/-- Verdict of Miri's machine `before_memory_deallocation` hook on the detached allocation
+(`Miri.Interpreter.AllocationMachine.before`): the data-race stage
+(`MachineHooks.memoryRaceAccess … (some .Deallocate)`) runs first — a no-op when the detector is
+`unconfigured`, reporting a missing vector clock BEFORE the `raceDetecting` gate, and never racing on
+`0`-byte ranges — followed by the Tree Borrows / machine verdict `tb`. -/
+def machineDeallocHook (mode : RaceDetectorMode) (actor : DeallocActor) (tb : DeallocHookSpec)
+    (clk? : Option RaceClockEntry) (sizeBytes : UInt64) : Except String Unit :=
+  match mode with
+  | .unconfigured => tb.run
+  | .configured raceDetecting =>
+    match clk? with
+    | none => .error "MissingVectorClockExtra"
+    | some clk =>
+      if raceDetecting && sizeBytes != 0 && hasDeallocDataRace actor clk then .error "DataRace"
+      else tb.run
+
+/-- Requested-layout check of `deallocate_ptr` (`old_size_and_align`): returns the requested
+`(size, align)` iff a layout was requested and it differs from the detached allocation's layout. -/
+def deallocLayoutMismatch? (entry : LiveAllocEntry) (expectedLayout : Option (UInt64 × UInt8)) :
+    Option (UInt64 × UInt8) :=
+  match expectedLayout with
+  | some (reqSize, reqAlign) =>
+    if reqSize != entry.sizeBytes || reqAlign != entry.alignPow2 then some (reqSize, reqAlign)
+    else none
+  | none => none
+
 /-- Allocation-ID reservation errors. -/
 inductive AllocIdErr where
   | exhausted
   | alreadyIssued (allocId : MiriAllocId)
+  deriving DecidableEq, Repr
+
+/-- Global-registration failures mirroring `Miri.Memory.MemoryMetadataError`
+(`validateReservedGlobal`). -/
+inductive GlobalRegErr where
+  | duplicateRuntimeId (allocId : MiriAllocId)
+  | globalIdAlreadyPresent (allocId : MiriAllocId)
   deriving DecidableEq, Repr
 
 /-- Pointer passed to `deallocate` / `deallocateMachine`. -/
@@ -1695,19 +1780,36 @@ theorem ext {w₁ w₂ : KeyedAllocWorld}
 def containsId (w : KeyedAllocWorld) (id : MiriAllocId) : Bool :=
   (w.findLive? id).isSome || (w.findDead? id).isSome || (w.findGlobal? id).isSome
 
+/-- `is_alloc_live` (`Miri.Memory.MemoryState.isAllocLive`): live local allocations AND compiler
+globals (function / vtable / type-id / static / memory) are live; only tombstoned or never-registered
+IDs are not. -/
 def isAllocLive (w : KeyedAllocWorld) (id : MiriAllocId) : Bool :=
-  (w.findLive? id).isSome
+  (w.findLive? id).isSome || (w.findGlobal? id).isSome
 
+/-- `get_alloc_info` (`Miri.Memory.MemoryState.getAllocInfo`) precedence: live local bytes, compiler
+globals (kind-specific size/align), then dead-allocation (tombstone) metadata; `none` only for IDs
+with no metadata at all. -/
 def getAllocInfo (w : KeyedAllocWorld) (id : MiriAllocId) : Option AllocInfo :=
   match w.findLive? id with
-  | some e => some ⟨e.sizeBytes, e.alignPow2, e.mutability, true, none⟩
+  | some e => some ⟨e.sizeBytes, e.alignPow2, .liveData, e.mutability⟩
   | none =>
     match w.findGlobal? id with
-    | some g => some ⟨g.sizeBytes, g.alignPow2, g.mutability, false, some g.kind⟩
-    | none => none
+    | some g => some g.toAllocInfo
+    | none =>
+      match w.findDead? id with
+      | some d => some ⟨d.sizeBytes, d.alignPow2, .dead, .not⟩
+      | none => none
 
-def getLiveAllocSizeAndAlign (w : KeyedAllocWorld) (id : MiriAllocId) : Option (UInt64 × UInt8) :=
-  (w.findLive? id).map fun e => (e.sizeBytes, e.alignPow2)
+/-- `get_live_alloc_size_and_align` (`Miri.Memory.MemoryState.getLiveAllocSizeAndAlign`): reports
+size/align for live locals AND globals, distinguishing a tombstoned allocation (`.useAfterFree`)
+from absent metadata (`.unavailable`). -/
+def getLiveAllocSizeAndAlign (w : KeyedAllocWorld) (id : MiriAllocId) :
+    Except LiveAllocInfoErr (UInt64 × UInt8) :=
+  match w.getAllocInfo id with
+  | none => .error (.unavailable id)
+  | some info =>
+    if info.kind == .dead then .error (.useAfterFree id)
+    else .ok (info.sizeBytes, info.alignPow2)
 
 def insertLive (w : KeyedAllocWorld) (id : MiriAllocId) (entry : LiveAllocEntry) : KeyedAllocWorld :=
   { w with table := { w.table with live := w.table.live.insert id entry } }
@@ -1731,26 +1833,40 @@ def registerGlobal (w : KeyedAllocWorld) (id : MiriAllocId) (entry : GlobalAlloc
     issued := w.issued.insert id ()
     globals := w.globals.insert id entry }
 
+/-- Validated registration of a compiler global under an ALREADY-RESERVED ID
+(`Miri.Memory.MemoryState.registerReservedGlobal` / `validateReservedGlobal`): rejects an ID that already
+names a global (`.duplicateRuntimeId`), that is live or tombstoned, or that was never issued
+(`.globalIdAlreadyPresent`); validation precedes every table update, so a failure returns the exact
+input world. Unlike the unvalidated `registerGlobal`, success never touches `issued`. -/
+def registerReservedGlobal (w : KeyedAllocWorld) (id : MiriAllocId) (entry : GlobalAllocEntry) :
+    KeyedAllocWorld × Except GlobalRegErr Unit :=
+  if (w.findGlobal? id).isSome then (w, .error (.duplicateRuntimeId id))
+  else if (w.findLive? id).isSome || (w.findDead? id).isSome || !w.hasIssued id then
+    (w, .error (.globalIdAlreadyPresent id))
+  else ({ w with globals := w.globals.insert id entry }, .ok ())
+
 def updateLiveBytes (w : KeyedAllocWorld) (id : MiriAllocId) (bytes : List MemByte) : KeyedAllocWorld :=
   match w.findLive? id with
   | none => w
   | some e => w.insertLive id { e with bytes := bytes }
 
+/-- `AllocMap::reserve` (`Miri.Memory.MemoryState.reserveAllocId`, `AtomicU64::fetch_add`): the cursor
+advances on EVERY non-exhausted attempt — including the `alreadyIssued` collision path and the
+zero-sentinel path — and `idSupplyExhausted` latches only when a reservation *observes* the wrapped
+`0` sentinel (never eagerly on the successful reservation of `2^64 - 1`). -/
 def reserveAllocId (w : KeyedAllocWorld) : KeyedAllocWorld × Except AllocIdErr MiriAllocId :=
   if w.idSupplyExhausted then
     (w, .error .exhausted)
   else
     match MiriAllocId.ofUInt64 w.nextAllocId with
-    | none => ({ w with idSupplyExhausted := true }, .error .exhausted)
+    | none =>
+      ({ w with nextAllocId := w.nextAllocId + 1, idSupplyExhausted := true }, .error .exhausted)
     | some id =>
       if w.hasIssued id || w.containsId id then
-        (w, .error (.alreadyIssued id))
+        ({ w with nextAllocId := w.nextAllocId + 1 }, .error (.alreadyIssued id))
       else
-        let next := w.nextAllocId + 1
-        let exhausted := next == 0
         ({ w with
-          nextAllocId := next
-          idSupplyExhausted := exhausted
+          nextAllocId := w.nextAllocId + 1
           issued := w.issued.insert id () }, .ok id)
 
 def allocate (w : KeyedAllocWorld) (entry : LiveAllocEntry) :
@@ -1779,108 +1895,70 @@ def allocateMachine (w : KeyedAllocWorld) (entry : LiveAllocEntry)
           extraReaders := [] }
       (w1.setRace id initClk, .ok id)
 
-/-- Core Miri deallocation with exact failure ordering and detached-state retention. -/
-def deallocate (w : KeyedAllocWorld) (ptr : DeallocPtr)
+/-- Core `Memory::deallocate_ptr` (`Miri.Memory.MemoryState.deallocatePtrWith`) with exact failure
+ordering and detached-state retention, parameterized by the machine `before_memory_deallocation`
+hook. The hook observes the world AFTER the live entry was detached (`removeLive`); a hook failure
+retains that detached world without tombstoning. -/
+def deallocateWith (w : KeyedAllocWorld) (ptr : DeallocPtr)
     (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
-    (tb : DeallocHookSpec := .ok) : DeallocResult KeyedAllocWorld :=
+    (hook : KeyedAllocWorld → MiriAllocId → LiveAllocEntry → Except String Unit) :
+    DeallocResult KeyedAllocWorld :=
   match ptr with
   | .dangling addr => ⟨w, none, .error (.danglingPointer addr)⟩
   | .provenanced id off =>
     if off != 0 then
       ⟨w, none, .error (.nonzeroOffset id off)⟩
     else
-      let (wAfterRemove, entry?) := w.removeLive id
-      match entry? with
+      match (w.removeLive id).2 with
       | none =>
         match w.findGlobal? id with
         | some g => ⟨w, none, .error (.globalErr id g.kind)⟩
         | none => ⟨w, none, .error (.useAfterFree id)⟩
       | some entry =>
-        let detached := some (id, entry)
         if entry.mutability == .not then
-          ⟨wAfterRemove, detached, .error (.immutableAllocation id)⟩
+          ⟨(w.removeLive id).1, some (id, entry), .error (.immutableAllocation id)⟩
         else if entry.kind != expectedKind then
-          ⟨wAfterRemove, detached, .error (.memoryKindMismatch id)⟩
+          ⟨(w.removeLive id).1, some (id, entry), .error (.memoryKindMismatch id)⟩
         else
-          let layoutFail :=
-            match expectedLayout with
-            | some (reqSize, reqAlign) =>
-              entry.sizeBytes != reqSize || entry.alignPow2 != reqAlign
-            | none => false
-          if layoutFail then
-            match expectedLayout with
-            | some (reqSize, reqAlign) =>
-              ⟨wAfterRemove, detached,
-                .error (.layoutMismatch id entry.sizeBytes reqSize entry.alignPow2 reqAlign)⟩
-            | none => ⟨wAfterRemove, detached, .ok ()⟩
-          else
-            match tb.run with
-            | .error msg => ⟨wAfterRemove, detached, .error (.hookFailure msg)⟩
+          match deallocLayoutMismatch? entry expectedLayout with
+          | some (reqSize, reqAlign) =>
+            ⟨(w.removeLive id).1, some (id, entry),
+              .error (.layoutMismatch id entry.sizeBytes reqSize entry.alignPow2 reqAlign)⟩
+          | none =>
+            match hook (w.removeLive id).1 id entry with
+            | .error msg => ⟨(w.removeLive id).1, some (id, entry), .error (.hookFailure msg)⟩
             | .ok () =>
-              let alreadyDead := (wAfterRemove.findDead? id).isSome
-              let wAfterDead := wAfterRemove.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩
-              if alreadyDead then
-                ⟨wAfterDead, detached, .error (.duplicateDeadAllocation id)⟩
+              if ((w.removeLive id).1.findDead? id).isSome then
+                ⟨(w.removeLive id).1.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩,
+                  some (id, entry), .error (.duplicateDeadAllocation id)⟩
               else
-                ⟨wAfterDead, detached, .ok ()⟩
+                ⟨(w.removeLive id).1.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩,
+                  some (id, entry), .ok ()⟩
 
-/-- Mode-aware machine deallocation checking vector-clock presence, multi-reader races
-(before cleanup, skipped for ZSTs or `!raceDetecting`), and Tree Borrows hooks. -/
+/-- Core Miri deallocation (`deallocateWith` under a state-independent hook verdict `tb`). -/
+def deallocate (w : KeyedAllocWorld) (ptr : DeallocPtr)
+    (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
+    (tb : DeallocHookSpec := .ok) : DeallocResult KeyedAllocWorld :=
+  w.deallocateWith ptr expectedLayout expectedKind (fun _ _ _ => tb.run)
+
+/-- Machine-level detach cleanup (`Miri.Interpreter.AllocationMachine.deallocate`): whenever the live
+entry was detached — on success AND on every post-removal failure — the allocation's race clock
+leaves the machine together with the detached allocation. -/
+def detachRaceClock (res : DeallocResult KeyedAllocWorld) : DeallocResult KeyedAllocWorld :=
+  match res.detached with
+  | some (id, _) => { res with world := res.world.removeRace id }
+  | none => res
+
+/-- Mode-aware machine deallocation (`Miri.Interpreter.AllocationMachine.deallocate`): runs
+`deallocateWith` under `machineDeallocHook`, which reads the allocation's vector clock from the
+live-detached world (i.e. BEFORE any race-clock cleanup), then applies `detachRaceClock`. -/
 def deallocateMachine (w : KeyedAllocWorld) (ptr : DeallocPtr)
     (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
     (mode : RaceDetectorMode) (actor : DeallocActor)
     (tb : DeallocHookSpec := .ok) : DeallocResult KeyedAllocWorld :=
-  match mode with
-  | .unconfigured => w.deallocate ptr expectedLayout expectedKind tb
-  | .configured raceDetecting =>
-    match ptr with
-    | .dangling addr => ⟨w, none, .error (.danglingPointer addr)⟩
-    | .provenanced id off =>
-      if off != 0 then
-        ⟨w, none, .error (.nonzeroOffset id off)⟩
-      else
-        let (wAfterRemove, entry?) := w.removeLive id
-        match entry? with
-        | none =>
-          match w.findGlobal? id with
-          | some g => ⟨w, none, .error (.globalErr id g.kind)⟩
-          | none => ⟨w, none, .error (.useAfterFree id)⟩
-        | some entry =>
-          let detached := some (id, entry)
-          if entry.mutability == .not then
-            ⟨wAfterRemove, detached, .error (.immutableAllocation id)⟩
-          else if entry.kind != expectedKind then
-            ⟨wAfterRemove, detached, .error (.memoryKindMismatch id)⟩
-          else
-            let layoutFail :=
-              match expectedLayout with
-              | some (reqSize, reqAlign) =>
-                entry.sizeBytes != reqSize || entry.alignPow2 != reqAlign
-              | none => false
-            if layoutFail then
-              match expectedLayout with
-              | some (reqSize, reqAlign) =>
-                ⟨wAfterRemove, detached,
-                  .error (.layoutMismatch id entry.sizeBytes reqSize entry.alignPow2 reqAlign)⟩
-              | none => ⟨wAfterRemove, detached, .ok ()⟩
-            else
-              match wAfterRemove.findRace? id with
-              | none =>
-                ⟨wAfterRemove, detached, .error (.hookFailure "MissingVectorClockExtra")⟩
-              | some clk =>
-                if raceDetecting && entry.sizeBytes != 0 && hasDeallocDataRace actor clk then
-                  ⟨wAfterRemove, detached, .error (.hookFailure "DataRace")⟩
-                else
-                  match tb.run with
-                  | .error msg => ⟨wAfterRemove, detached, .error (.hookFailure msg)⟩
-                  | .ok () =>
-                    let wCleaned := wAfterRemove.removeRace id
-                    let alreadyDead := (wCleaned.findDead? id).isSome
-                    let wAfterDead := wCleaned.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩
-                    if alreadyDead then
-                      ⟨wAfterDead, detached, .error (.duplicateDeadAllocation id)⟩
-                    else
-                      ⟨wAfterDead, detached, .ok ()⟩
+  detachRaceClock (w.deallocateWith ptr expectedLayout expectedKind
+    (fun wDetached id entry =>
+      machineDeallocHook mode actor tb (wDetached.findRace? id) entry.sizeBytes))
 
 /-- Canonical keyed conversion from any `LinearAllocWorld` (preserving first-match shadowing). -/
 def ofLinear (lw : LinearAllocWorld) : KeyedAllocWorld where
@@ -1917,19 +1995,36 @@ def findRace? (lw : LinearAllocWorld) (id : MiriAllocId) : Option RaceClockEntry
 def containsId (lw : LinearAllocWorld) (id : MiriAllocId) : Bool :=
   (lw.findLive? id).isSome || (lw.findDead? id).isSome || (lw.findGlobal? id).isSome
 
+/-- `is_alloc_live` (`Miri.Memory.MemoryState.isAllocLive`): live local allocations AND compiler
+globals (function / vtable / type-id / static / memory) are live; only tombstoned or never-registered
+IDs are not. -/
 def isAllocLive (lw : LinearAllocWorld) (id : MiriAllocId) : Bool :=
-  (lw.findLive? id).isSome
+  (lw.findLive? id).isSome || (lw.findGlobal? id).isSome
 
+/-- `get_alloc_info` (`Miri.Memory.MemoryState.getAllocInfo`) precedence: live local bytes, compiler
+globals (kind-specific size/align), then dead-allocation (tombstone) metadata; `none` only for IDs
+with no metadata at all. -/
 def getAllocInfo (lw : LinearAllocWorld) (id : MiriAllocId) : Option AllocInfo :=
   match lw.findLive? id with
-  | some e => some ⟨e.sizeBytes, e.alignPow2, e.mutability, true, none⟩
+  | some e => some ⟨e.sizeBytes, e.alignPow2, .liveData, e.mutability⟩
   | none =>
     match lw.findGlobal? id with
-    | some g => some ⟨g.sizeBytes, g.alignPow2, g.mutability, false, some g.kind⟩
-    | none => none
+    | some g => some g.toAllocInfo
+    | none =>
+      match lw.findDead? id with
+      | some d => some ⟨d.sizeBytes, d.alignPow2, .dead, .not⟩
+      | none => none
 
-def getLiveAllocSizeAndAlign (lw : LinearAllocWorld) (id : MiriAllocId) : Option (UInt64 × UInt8) :=
-  (lw.findLive? id).map fun e => (e.sizeBytes, e.alignPow2)
+/-- `get_live_alloc_size_and_align` (`Miri.Memory.MemoryState.getLiveAllocSizeAndAlign`): reports
+size/align for live locals AND globals, distinguishing a tombstoned allocation (`.useAfterFree`)
+from absent metadata (`.unavailable`). -/
+def getLiveAllocSizeAndAlign (lw : LinearAllocWorld) (id : MiriAllocId) :
+    Except LiveAllocInfoErr (UInt64 × UInt8) :=
+  match lw.getAllocInfo id with
+  | none => .error (.unavailable id)
+  | some info =>
+    if info.kind == .dead then .error (.useAfterFree id)
+    else .ok (info.sizeBytes, info.alignPow2)
 
 def insertLive (lw : LinearAllocWorld) (id : MiriAllocId) (entry : LiveAllocEntry) : LinearAllocWorld :=
   { lw with live := lw.live.filter (fun p => p.1 != id) ++ [(id, entry)] }
@@ -1953,26 +2048,38 @@ def registerGlobal (lw : LinearAllocWorld) (id : MiriAllocId) (entry : GlobalAll
     issued := id :: lw.issued
     globals := lw.globals.filter (fun p => p.1 != id) ++ [(id, entry)] }
 
+/-- Validated registration of a compiler global under an ALREADY-RESERVED ID
+(`Miri.Memory.MemoryState.registerReservedGlobal` / `validateReservedGlobal`); see
+`KeyedAllocWorld.registerReservedGlobal`. -/
+def registerReservedGlobal (lw : LinearAllocWorld) (id : MiriAllocId) (entry : GlobalAllocEntry) :
+    LinearAllocWorld × Except GlobalRegErr Unit :=
+  if (lw.findGlobal? id).isSome then (lw, .error (.duplicateRuntimeId id))
+  else if (lw.findLive? id).isSome || (lw.findDead? id).isSome || !lw.hasIssued id then
+    (lw, .error (.globalIdAlreadyPresent id))
+  else ({ lw with globals := lw.globals.filter (fun p => p.1 != id) ++ [(id, entry)] }, .ok ())
+
 def updateLiveBytes (lw : LinearAllocWorld) (id : MiriAllocId) (bytes : List MemByte) : LinearAllocWorld :=
   match lw.findLive? id with
   | none => lw
   | some e => lw.insertLive id { e with bytes := bytes }
 
+/-- `AllocMap::reserve` (`Miri.Memory.MemoryState.reserveAllocId`, `AtomicU64::fetch_add`): the cursor
+advances on EVERY non-exhausted attempt — including the `alreadyIssued` collision path and the
+zero-sentinel path — and `idSupplyExhausted` latches only when a reservation *observes* the wrapped
+`0` sentinel (never eagerly on the successful reservation of `2^64 - 1`). -/
 def reserveAllocId (lw : LinearAllocWorld) : LinearAllocWorld × Except AllocIdErr MiriAllocId :=
   if lw.idSupplyExhausted then
     (lw, .error .exhausted)
   else
     match MiriAllocId.ofUInt64 lw.nextAllocId with
-    | none => ({ lw with idSupplyExhausted := true }, .error .exhausted)
+    | none =>
+      ({ lw with nextAllocId := lw.nextAllocId + 1, idSupplyExhausted := true }, .error .exhausted)
     | some id =>
       if lw.hasIssued id || lw.containsId id then
-        (lw, .error (.alreadyIssued id))
+        ({ lw with nextAllocId := lw.nextAllocId + 1 }, .error (.alreadyIssued id))
       else
-        let next := lw.nextAllocId + 1
-        let exhausted := next == 0
         ({ lw with
-          nextAllocId := next
-          idSupplyExhausted := exhausted
+          nextAllocId := lw.nextAllocId + 1
           issued := id :: lw.issued }, .ok id)
 
 def allocate (lw : LinearAllocWorld) (entry : LiveAllocEntry) :
@@ -1982,6 +2089,7 @@ def allocate (lw : LinearAllocWorld) (entry : LiveAllocEntry) :
   | .error e => (lw1, .error e)
   | .ok id => (lw1.insertLive id entry, .ok id)
 
+/-- Mode-aware machine allocation: seeds `RaceClockEntry` iff `mode` is `.configured _`. -/
 def allocateMachine (lw : LinearAllocWorld) (entry : LiveAllocEntry)
     (mode : RaceDetectorMode) (creatorThread : UInt32) (timestamp : UInt64) :
     LinearAllocWorld × Except AllocIdErr MiriAllocId :=
@@ -2000,105 +2108,70 @@ def allocateMachine (lw : LinearAllocWorld) (entry : LiveAllocEntry)
           extraReaders := [] }
       (lw1.setRace id initClk, .ok id)
 
-def deallocate (lw : LinearAllocWorld) (ptr : DeallocPtr)
+/-- Core `Memory::deallocate_ptr` (`Miri.Memory.MemoryState.deallocatePtrWith`) with exact failure
+ordering and detached-state retention, parameterized by the machine `before_memory_deallocation`
+hook. The hook observes the world AFTER the live entry was detached (`removeLive`); a hook failure
+retains that detached world without tombstoning. -/
+def deallocateWith (lw : LinearAllocWorld) (ptr : DeallocPtr)
     (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
-    (tb : DeallocHookSpec := .ok) : DeallocResult LinearAllocWorld :=
+    (hook : LinearAllocWorld → MiriAllocId → LiveAllocEntry → Except String Unit) :
+    DeallocResult LinearAllocWorld :=
   match ptr with
   | .dangling addr => ⟨lw, none, .error (.danglingPointer addr)⟩
   | .provenanced id off =>
     if off != 0 then
       ⟨lw, none, .error (.nonzeroOffset id off)⟩
     else
-      let (lwAfterRemove, entry?) := lw.removeLive id
-      match entry? with
+      match (lw.removeLive id).2 with
       | none =>
         match lw.findGlobal? id with
         | some g => ⟨lw, none, .error (.globalErr id g.kind)⟩
         | none => ⟨lw, none, .error (.useAfterFree id)⟩
       | some entry =>
-        let detached := some (id, entry)
         if entry.mutability == .not then
-          ⟨lwAfterRemove, detached, .error (.immutableAllocation id)⟩
+          ⟨(lw.removeLive id).1, some (id, entry), .error (.immutableAllocation id)⟩
         else if entry.kind != expectedKind then
-          ⟨lwAfterRemove, detached, .error (.memoryKindMismatch id)⟩
+          ⟨(lw.removeLive id).1, some (id, entry), .error (.memoryKindMismatch id)⟩
         else
-          let layoutFail :=
-            match expectedLayout with
-            | some (reqSize, reqAlign) =>
-              entry.sizeBytes != reqSize || entry.alignPow2 != reqAlign
-            | none => false
-          if layoutFail then
-            match expectedLayout with
-            | some (reqSize, reqAlign) =>
-              ⟨lwAfterRemove, detached,
-                .error (.layoutMismatch id entry.sizeBytes reqSize entry.alignPow2 reqAlign)⟩
-            | none => ⟨lwAfterRemove, detached, .ok ()⟩
-          else
-            match tb.run with
-            | .error msg => ⟨lwAfterRemove, detached, .error (.hookFailure msg)⟩
+          match deallocLayoutMismatch? entry expectedLayout with
+          | some (reqSize, reqAlign) =>
+            ⟨(lw.removeLive id).1, some (id, entry),
+              .error (.layoutMismatch id entry.sizeBytes reqSize entry.alignPow2 reqAlign)⟩
+          | none =>
+            match hook (lw.removeLive id).1 id entry with
+            | .error msg => ⟨(lw.removeLive id).1, some (id, entry), .error (.hookFailure msg)⟩
             | .ok () =>
-              let alreadyDead := (lwAfterRemove.findDead? id).isSome
-              let lwAfterDead := lwAfterRemove.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩
-              if alreadyDead then
-                ⟨lwAfterDead, detached, .error (.duplicateDeadAllocation id)⟩
+              if ((lw.removeLive id).1.findDead? id).isSome then
+                ⟨(lw.removeLive id).1.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩,
+                  some (id, entry), .error (.duplicateDeadAllocation id)⟩
               else
-                ⟨lwAfterDead, detached, .ok ()⟩
+                ⟨(lw.removeLive id).1.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩,
+                  some (id, entry), .ok ()⟩
 
+/-- Core Miri deallocation (`deallocateWith` under a state-independent hook verdict `tb`). -/
+def deallocate (lw : LinearAllocWorld) (ptr : DeallocPtr)
+    (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
+    (tb : DeallocHookSpec := .ok) : DeallocResult LinearAllocWorld :=
+  lw.deallocateWith ptr expectedLayout expectedKind (fun _ _ _ => tb.run)
+
+/-- Machine-level detach cleanup (`Miri.Interpreter.AllocationMachine.deallocate`): whenever the live
+entry was detached — on success AND on every post-removal failure — the allocation's race clock
+leaves the machine together with the detached allocation. -/
+def detachRaceClock (res : DeallocResult LinearAllocWorld) : DeallocResult LinearAllocWorld :=
+  match res.detached with
+  | some (id, _) => { res with world := res.world.removeRace id }
+  | none => res
+
+/-- Mode-aware machine deallocation (`Miri.Interpreter.AllocationMachine.deallocate`): runs
+`deallocateWith` under `machineDeallocHook`, which reads the allocation's vector clock from the
+live-detached world (i.e. BEFORE any race-clock cleanup), then applies `detachRaceClock`. -/
 def deallocateMachine (lw : LinearAllocWorld) (ptr : DeallocPtr)
     (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
     (mode : RaceDetectorMode) (actor : DeallocActor)
     (tb : DeallocHookSpec := .ok) : DeallocResult LinearAllocWorld :=
-  match mode with
-  | .unconfigured => lw.deallocate ptr expectedLayout expectedKind tb
-  | .configured raceDetecting =>
-    match ptr with
-    | .dangling addr => ⟨lw, none, .error (.danglingPointer addr)⟩
-    | .provenanced id off =>
-      if off != 0 then
-        ⟨lw, none, .error (.nonzeroOffset id off)⟩
-      else
-        let (lwAfterRemove, entry?) := lw.removeLive id
-        match entry? with
-        | none =>
-          match lw.findGlobal? id with
-          | some g => ⟨lw, none, .error (.globalErr id g.kind)⟩
-          | none => ⟨lw, none, .error (.useAfterFree id)⟩
-        | some entry =>
-          let detached := some (id, entry)
-          if entry.mutability == .not then
-            ⟨lwAfterRemove, detached, .error (.immutableAllocation id)⟩
-          else if entry.kind != expectedKind then
-            ⟨lwAfterRemove, detached, .error (.memoryKindMismatch id)⟩
-          else
-            let layoutFail :=
-              match expectedLayout with
-              | some (reqSize, reqAlign) =>
-                entry.sizeBytes != reqSize || entry.alignPow2 != reqAlign
-              | none => false
-            if layoutFail then
-              match expectedLayout with
-              | some (reqSize, reqAlign) =>
-                ⟨lwAfterRemove, detached,
-                  .error (.layoutMismatch id entry.sizeBytes reqSize entry.alignPow2 reqAlign)⟩
-              | none => ⟨lwAfterRemove, detached, .ok ()⟩
-            else
-              match lwAfterRemove.findRace? id with
-              | none =>
-                ⟨lwAfterRemove, detached, .error (.hookFailure "MissingVectorClockExtra")⟩
-              | some clk =>
-                if raceDetecting && entry.sizeBytes != 0 && hasDeallocDataRace actor clk then
-                  ⟨lwAfterRemove, detached, .error (.hookFailure "DataRace")⟩
-                else
-                  match tb.run with
-                  | .error msg => ⟨lwAfterRemove, detached, .error (.hookFailure msg)⟩
-                  | .ok () =>
-                    let lwCleaned := lwAfterRemove.removeRace id
-                    let alreadyDead := (lwCleaned.findDead? id).isSome
-                    let lwAfterDead := lwCleaned.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩
-                    if alreadyDead then
-                      ⟨lwAfterDead, detached, .error (.duplicateDeadAllocation id)⟩
-                    else
-                      ⟨lwAfterDead, detached, .ok ()⟩
+  detachRaceClock (lw.deallocateWith ptr expectedLayout expectedKind
+    (fun wDetached id entry =>
+      machineDeallocHook mode actor tb (wDetached.findRace? id) entry.sizeBytes))
 
 /-- Materialize a canonical sorted `LinearAllocWorld` from any `KeyedAllocWorld`. -/
 def ofKeyed (kw : KeyedAllocWorld) : LinearAllocWorld where
@@ -2211,19 +2284,19 @@ theorem allocWorldRel_containsId {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
 theorem allocWorldRel_isAllocLive {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
     (h : AllocWorldRel lw kw) (id : MiriAllocId) :
     lw.isAllocLive id = kw.isAllocLive id := by
-  simp [LinearAllocWorld.isAllocLive, KeyedAllocWorld.isAllocLive, h.live_rel id]
+  simp [LinearAllocWorld.isAllocLive, KeyedAllocWorld.isAllocLive, h.live_rel id, h.globals_rel id]
 
 theorem allocWorldRel_getAllocInfo {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
     (h : AllocWorldRel lw kw) (id : MiriAllocId) :
     lw.getAllocInfo id = kw.getAllocInfo id := by
   simp [LinearAllocWorld.getAllocInfo, KeyedAllocWorld.getAllocInfo,
-    h.live_rel id, h.globals_rel id]
+    h.live_rel id, h.globals_rel id, h.dead_rel id]
 
 theorem allocWorldRel_getLiveAllocSizeAndAlign {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
     (h : AllocWorldRel lw kw) (id : MiriAllocId) :
     lw.getLiveAllocSizeAndAlign id = kw.getLiveAllocSizeAndAlign id := by
   simp [LinearAllocWorld.getLiveAllocSizeAndAlign, KeyedAllocWorld.getLiveAllocSizeAndAlign,
-    h.live_rel id]
+    allocWorldRel_getAllocInfo h id]
 
 theorem allocWorldRel_insertLive {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
     (h : AllocWorldRel lw kw) (id : MiriAllocId) (entry : LiveAllocEntry) :
@@ -2360,6 +2433,37 @@ theorem allocWorldRel_registerGlobal {lw : LinearAllocWorld} {kw : KeyedAllocWor
   dead_rel := h.dead_rel
   race_rel := h.race_rel
 
+theorem allocWorldRel_registerReservedGlobal {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
+    (h : AllocWorldRel lw kw) (id : MiriAllocId) (entry : GlobalAllocEntry) :
+    AllocWorldRel (lw.registerReservedGlobal id entry).1 (kw.registerReservedGlobal id entry).1 ∧
+    (lw.registerReservedGlobal id entry).2 = (kw.registerReservedGlobal id entry).2 := by
+  unfold LinearAllocWorld.registerReservedGlobal KeyedAllocWorld.registerReservedGlobal
+  rw [h.globals_rel id, h.live_rel id, h.dead_rel id, h.issued_rel id]
+  cases (kw.findGlobal? id).isSome with
+  | true => exact ⟨h, rfl⟩
+  | false =>
+    cases ((kw.findLive? id).isSome || (kw.findDead? id).isSome || !kw.hasIssued id) with
+    | true => exact ⟨h, rfl⟩
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      refine ⟨?_, trivial⟩
+      exact
+        { nextAllocId_eq := h.nextAllocId_eq
+          idSupplyExhausted_eq := h.idSupplyExhausted_eq
+          issued_rel := h.issued_rel
+          globals_rel := fun k => by
+            simp only [LinearAllocWorld.findGlobal?, KeyedAllocWorld.findGlobal?]
+            rw [linearFind?_filter_append_single, ExtTreeMap0.get?_insert, cmp_miriAllocId_eq_iff]
+            by_cases hk : k = id
+            · subst hk; simp
+            · have h1 : (k == id) = false := beq_false_of_ne hk
+              have h2 : (id == k) = false := beq_false_of_ne (fun he => hk he.symm)
+              simp only [h1, h2]
+              exact h.globals_rel k
+          live_rel := h.live_rel
+          dead_rel := h.dead_rel
+          race_rel := h.race_rel }
+
 theorem allocWorldRel_updateLiveBytes {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
     (h : AllocWorldRel lw kw) (id : MiriAllocId) (bytes : List MemByte) :
     AllocWorldRel (lw.updateLiveBytes id bytes) (kw.updateLiveBytes id bytes) := by
@@ -2375,7 +2479,7 @@ theorem allocWorldRel_reserveAllocId {lw : LinearAllocWorld} {kw : KeyedAllocWor
     lw.reserveAllocId.2 = kw.reserveAllocId.2 := by
   unfold LinearAllocWorld.reserveAllocId KeyedAllocWorld.reserveAllocId
   rw [h.idSupplyExhausted_eq, h.nextAllocId_eq]
-  cases kw.idSupplyExhausted with
+  cases hexh : kw.idSupplyExhausted with
   | true => simp [h]
   | false =>
     simp only [Bool.false_eq_true, ↓reduceIte]
@@ -2385,7 +2489,9 @@ theorem allocWorldRel_reserveAllocId {lw : LinearAllocWorld} {kw : KeyedAllocWor
     | some id =>
       simp only [h.issued_rel id, allocWorldRel_containsId h id]
       cases hcon : kw.hasIssued id || kw.containsId id with
-      | true => simp [h]
+      | true =>
+        simp only [↓reduceIte]
+        exact ⟨⟨rfl, rfl, h.issued_rel, h.globals_rel, h.live_rel, h.dead_rel, h.race_rel⟩, trivial⟩
       | false =>
         simp only [Bool.false_eq_true, ↓reduceIte]
         refine ⟨?_, trivial⟩
@@ -2446,17 +2552,21 @@ theorem allocWorldRel_allocateMachine {lw : LinearAllocWorld} {kw : KeyedAllocWo
         | unconfigured => exact ⟨hrel, rfl⟩
         | configured _ => exact ⟨allocWorldRel_setRace hrel id _, rfl⟩
 
-theorem allocWorldRel_deallocate {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
+/-- Refinement of the hook-parameterized core deallocation: linear and keyed worlds stay related
+whenever the two machine hooks agree on related (live-detached) worlds. -/
+theorem allocWorldRel_deallocateWith {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
     (h : AllocWorldRel lw kw) (ptr : DeallocPtr)
     (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
-    (tb : DeallocHookSpec := .ok) :
-    AllocWorldRel (lw.deallocate ptr expectedLayout expectedKind tb).world
-      (kw.deallocate ptr expectedLayout expectedKind tb).world ∧
-    (lw.deallocate ptr expectedLayout expectedKind tb).detached =
-      (kw.deallocate ptr expectedLayout expectedKind tb).detached ∧
-    (lw.deallocate ptr expectedLayout expectedKind tb).outcome =
-      (kw.deallocate ptr expectedLayout expectedKind tb).outcome := by
-  unfold LinearAllocWorld.deallocate KeyedAllocWorld.deallocate
+    (lhook : LinearAllocWorld → MiriAllocId → LiveAllocEntry → Except String Unit)
+    (khook : KeyedAllocWorld → MiriAllocId → LiveAllocEntry → Except String Unit)
+    (hhook : ∀ lw' kw', AllocWorldRel lw' kw' → ∀ id entry, lhook lw' id entry = khook kw' id entry) :
+    AllocWorldRel (lw.deallocateWith ptr expectedLayout expectedKind lhook).world
+      (kw.deallocateWith ptr expectedLayout expectedKind khook).world ∧
+    (lw.deallocateWith ptr expectedLayout expectedKind lhook).detached =
+      (kw.deallocateWith ptr expectedLayout expectedKind khook).detached ∧
+    (lw.deallocateWith ptr expectedLayout expectedKind lhook).outcome =
+      (kw.deallocateWith ptr expectedLayout expectedKind khook).outcome := by
+  unfold LinearAllocWorld.deallocateWith KeyedAllocWorld.deallocateWith
   cases ptr with
   | dangling addr => exact ⟨h, rfl, rfl⟩
   | provenanced id off =>
@@ -2478,25 +2588,42 @@ theorem allocWorldRel_deallocate {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
           | true => simp [hmut, hkind, hrem]
           | false =>
             simp only [hmut, hkind, Bool.false_eq_true, ↓reduceIte]
-            cases expectedLayout with
+            cases deallocLayoutMismatch? entry expectedLayout with
+            | some lay => exact ⟨hrem, rfl, rfl⟩
             | none =>
-              simp only [Bool.false_eq_true, ↓reduceIte]
-              cases tb.run with
+              simp only [hhook _ _ hrem id entry]
+              cases khook (kw.removeLive id).1 id entry with
               | error msg => exact ⟨hrem, rfl, rfl⟩
               | ok u =>
                 simp only [hrem.dead_rel id]
                 split <;> exact ⟨allocWorldRel_insertDead hrem id _, rfl, rfl⟩
-            | some lay =>
-              rcases lay with ⟨reqSize, reqAlign⟩
-              cases hlay : (entry.sizeBytes != reqSize || entry.alignPow2 != reqAlign) with
-              | true => simp [hlay, hrem]
-              | false =>
-                simp only [hlay, Bool.false_eq_true, ↓reduceIte]
-                cases tb.run with
-                | error msg => exact ⟨hrem, rfl, rfl⟩
-                | ok u =>
-                  simp only [hrem.dead_rel id]
-                  split <;> exact ⟨allocWorldRel_insertDead hrem id _, rfl, rfl⟩
+
+theorem allocWorldRel_deallocate {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
+    (h : AllocWorldRel lw kw) (ptr : DeallocPtr)
+    (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
+    (tb : DeallocHookSpec := .ok) :
+    AllocWorldRel (lw.deallocate ptr expectedLayout expectedKind tb).world
+      (kw.deallocate ptr expectedLayout expectedKind tb).world ∧
+    (lw.deallocate ptr expectedLayout expectedKind tb).detached =
+      (kw.deallocate ptr expectedLayout expectedKind tb).detached ∧
+    (lw.deallocate ptr expectedLayout expectedKind tb).outcome =
+      (kw.deallocate ptr expectedLayout expectedKind tb).outcome :=
+  allocWorldRel_deallocateWith h ptr expectedLayout expectedKind _ _ (fun _ _ _ _ _ => rfl)
+
+/-- The machine-level detach cleanup preserves the refinement. -/
+theorem allocWorldRel_detachRaceClock
+    {lr : DeallocResult LinearAllocWorld} {kr : DeallocResult KeyedAllocWorld}
+    (hw : AllocWorldRel lr.world kr.world) (hd : lr.detached = kr.detached)
+    (ho : lr.outcome = kr.outcome) :
+    AllocWorldRel (LinearAllocWorld.detachRaceClock lr).world
+      (KeyedAllocWorld.detachRaceClock kr).world ∧
+    (LinearAllocWorld.detachRaceClock lr).detached = (KeyedAllocWorld.detachRaceClock kr).detached ∧
+    (LinearAllocWorld.detachRaceClock lr).outcome = (KeyedAllocWorld.detachRaceClock kr).outcome := by
+  unfold LinearAllocWorld.detachRaceClock KeyedAllocWorld.detachRaceClock
+  rw [hd]
+  cases hdet : kr.detached with
+  | none => exact ⟨hw, hd, ho⟩
+  | some p => exact ⟨allocWorldRel_removeRace hw p.1, rfl, ho⟩
 
 theorem allocWorldRel_deallocateMachine {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
     (h : AllocWorldRel lw kw) (ptr : DeallocPtr)
@@ -2509,144 +2636,39 @@ theorem allocWorldRel_deallocateMachine {lw : LinearAllocWorld} {kw : KeyedAlloc
       (kw.deallocateMachine ptr expectedLayout expectedKind mode actor tb).detached ∧
     (lw.deallocateMachine ptr expectedLayout expectedKind mode actor tb).outcome =
       (kw.deallocateMachine ptr expectedLayout expectedKind mode actor tb).outcome := by
-  unfold LinearAllocWorld.deallocateMachine KeyedAllocWorld.deallocateMachine
-  cases mode with
-  | unconfigured => exact allocWorldRel_deallocate h ptr expectedLayout expectedKind tb
-  | configured raceDetecting =>
-    cases ptr with
-    | dangling addr => exact ⟨h, rfl, rfl⟩
-    | provenanced id off =>
-      cases h_off : (off != 0) with
-      | true => simp [h_off, h]
-      | false =>
-        simp only [h_off, Bool.false_eq_true, ↓reduceIte]
-        rcases allocWorldRel_removeLive h id with ⟨hrem, hentry⟩
-        rw [hentry]
-        cases (kw.removeLive id).2 with
-        | none =>
-          rw [h.globals_rel id]
-          cases kw.findGlobal? id <;> exact ⟨h, rfl, rfl⟩
-        | some entry =>
-          cases hmut : (entry.mutability == .not) with
-          | true => simp [hmut, hrem]
-          | false =>
-            cases hkind : (entry.kind != expectedKind) with
-            | true => simp [hmut, hkind, hrem]
-            | false =>
-              simp only [hmut, hkind, Bool.false_eq_true, ↓reduceIte]
-              have htail :
-                  ∀ {wL : LinearAllocWorld} {wK : KeyedAllocWorld}, AllocWorldRel wL wK →
-                    AllocWorldRel
-                      (match wL.findRace? id with
-                      | none => ⟨wL, some (id, entry), .error (.hookFailure "MissingVectorClockExtra")⟩
-                      | some clk =>
-                        if raceDetecting && entry.sizeBytes != 0 && hasDeallocDataRace actor clk then
-                          ⟨wL, some (id, entry), .error (.hookFailure "DataRace")⟩
-                        else
-                          match tb.run with
-                          | .error msg => ⟨wL, some (id, entry), .error (.hookFailure msg)⟩
-                          | .ok () =>
-                            let wC := wL.removeRace id
-                            let ad := (wC.findDead? id).isSome
-                            let wD := wC.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩
-                            if ad then ⟨wD, some (id, entry), .error (.duplicateDeadAllocation id)⟩
-                            else ⟨wD, some (id, entry), .ok ()⟩ : DeallocResult LinearAllocWorld).world
-                      (match wK.findRace? id with
-                      | none => ⟨wK, some (id, entry), .error (.hookFailure "MissingVectorClockExtra")⟩
-                      | some clk =>
-                        if raceDetecting && entry.sizeBytes != 0 && hasDeallocDataRace actor clk then
-                          ⟨wK, some (id, entry), .error (.hookFailure "DataRace")⟩
-                        else
-                          match tb.run with
-                          | .error msg => ⟨wK, some (id, entry), .error (.hookFailure msg)⟩
-                          | .ok () =>
-                            let wC := wK.removeRace id
-                            let ad := (wC.findDead? id).isSome
-                            let wD := wC.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩
-                            if ad then ⟨wD, some (id, entry), .error (.duplicateDeadAllocation id)⟩
-                            else ⟨wD, some (id, entry), .ok ()⟩ : DeallocResult KeyedAllocWorld).world ∧
-                    (match wL.findRace? id with
-                      | none => ⟨wL, some (id, entry), .error (.hookFailure "MissingVectorClockExtra")⟩
-                      | some clk =>
-                        if raceDetecting && entry.sizeBytes != 0 && hasDeallocDataRace actor clk then
-                          ⟨wL, some (id, entry), .error (.hookFailure "DataRace")⟩
-                        else
-                          match tb.run with
-                          | .error msg => ⟨wL, some (id, entry), .error (.hookFailure msg)⟩
-                          | .ok () =>
-                            let wC := wL.removeRace id
-                            let ad := (wC.findDead? id).isSome
-                            let wD := wC.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩
-                            if ad then ⟨wD, some (id, entry), .error (.duplicateDeadAllocation id)⟩
-                            else ⟨wD, some (id, entry), .ok ()⟩ : DeallocResult LinearAllocWorld).detached =
-                      (match wK.findRace? id with
-                      | none => ⟨wK, some (id, entry), .error (.hookFailure "MissingVectorClockExtra")⟩
-                      | some clk =>
-                        if raceDetecting && entry.sizeBytes != 0 && hasDeallocDataRace actor clk then
-                          ⟨wK, some (id, entry), .error (.hookFailure "DataRace")⟩
-                        else
-                          match tb.run with
-                          | .error msg => ⟨wK, some (id, entry), .error (.hookFailure msg)⟩
-                          | .ok () =>
-                            let wC := wK.removeRace id
-                            let ad := (wC.findDead? id).isSome
-                            let wD := wC.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩
-                            if ad then ⟨wD, some (id, entry), .error (.duplicateDeadAllocation id)⟩
-                            else ⟨wD, some (id, entry), .ok ()⟩ : DeallocResult KeyedAllocWorld).detached ∧
-                    (match wL.findRace? id with
-                      | none => ⟨wL, some (id, entry), .error (.hookFailure "MissingVectorClockExtra")⟩
-                      | some clk =>
-                        if raceDetecting && entry.sizeBytes != 0 && hasDeallocDataRace actor clk then
-                          ⟨wL, some (id, entry), .error (.hookFailure "DataRace")⟩
-                        else
-                          match tb.run with
-                          | .error msg => ⟨wL, some (id, entry), .error (.hookFailure msg)⟩
-                          | .ok () =>
-                            let wC := wL.removeRace id
-                            let ad := (wC.findDead? id).isSome
-                            let wD := wC.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩
-                            if ad then ⟨wD, some (id, entry), .error (.duplicateDeadAllocation id)⟩
-                            else ⟨wD, some (id, entry), .ok ()⟩ : DeallocResult LinearAllocWorld).outcome =
-                      (match wK.findRace? id with
-                      | none => ⟨wK, some (id, entry), .error (.hookFailure "MissingVectorClockExtra")⟩
-                      | some clk =>
-                        if raceDetecting && entry.sizeBytes != 0 && hasDeallocDataRace actor clk then
-                          ⟨wK, some (id, entry), .error (.hookFailure "DataRace")⟩
-                        else
-                          match tb.run with
-                          | .error msg => ⟨wK, some (id, entry), .error (.hookFailure msg)⟩
-                          | .ok () =>
-                            let wC := wK.removeRace id
-                            let ad := (wC.findDead? id).isSome
-                            let wD := wC.insertDead id ⟨entry.sizeBytes, entry.alignPow2⟩
-                            if ad then ⟨wD, some (id, entry), .error (.duplicateDeadAllocation id)⟩
-                            else ⟨wD, some (id, entry), .ok ()⟩ : DeallocResult KeyedAllocWorld).outcome := by
-                intro wL wK hw
-                simp only [hw.race_rel id]
-                cases wK.findRace? id with
-                | none => exact ⟨hw, rfl, rfl⟩
-                | some clk =>
-                  cases hrc : (raceDetecting && entry.sizeBytes != 0 && hasDeallocDataRace actor clk) with
-                  | true =>
-                    simp only [hrc, ↓reduceIte]
-                    exact ⟨hw, trivial, trivial⟩
-                  | false =>
-                    simp only [hrc, Bool.false_eq_true, ↓reduceIte]
-                    cases tb.run with
-                    | error msg => exact ⟨hw, rfl, rfl⟩
-                    | ok u =>
-                      have hcl := allocWorldRel_removeRace hw id
-                      simp only [hcl.dead_rel id]
-                      split <;> exact ⟨allocWorldRel_insertDead hcl id _, rfl, rfl⟩
-              cases expectedLayout with
-              | none => exact htail hrem
-              | some lay =>
-                rcases lay with ⟨reqSize, reqAlign⟩
-                cases hlay : (entry.sizeBytes != reqSize || entry.alignPow2 != reqAlign) with
-                | true => simp [hlay, hrem]
-                | false => simp only [hlay, Bool.false_eq_true, ↓reduceIte]; exact htail hrem
+  have hcore := allocWorldRel_deallocateWith h ptr expectedLayout expectedKind
+    (fun lwD id entry => machineDeallocHook mode actor tb (lwD.findRace? id) entry.sizeBytes)
+    (fun kwD id entry => machineDeallocHook mode actor tb (kwD.findRace? id) entry.sizeBytes)
+    (fun lw' kw' hrel id entry => by rw [hrel.race_rel id])
+  exact allocWorldRel_detachRaceClock hcore.1 hcore.2.1 hcore.2.2
 
 /-! #### Exact Miri Allocation Supply, Deallocation Failure Ordering, and Race-Detector Theorems -/
+
+/-- Inversion of a successful reservation: the supply was not exhausted, the cursor decoded to the
+returned ID, that ID was fresh, and the post-state only advances the cursor and records the ID
+(the exhaustion flag is NOT latched, even when the cursor wraps to `0`). -/
+theorem keyedReserveAllocId_ok_inv {w w' : KeyedAllocWorld} {id : MiriAllocId}
+    (h : w.reserveAllocId = (w', .ok id)) :
+    w.idSupplyExhausted = false ∧
+    MiriAllocId.ofUInt64 w.nextAllocId = some id ∧
+    w.hasIssued id = false ∧ w.containsId id = false ∧
+    w' = { w with nextAllocId := w.nextAllocId + 1, issued := w.issued.insert id () } := by
+  unfold KeyedAllocWorld.reserveAllocId at h
+  split at h
+  · simp at h
+  · rename_i hexh
+    split at h
+    · simp at h
+    · rename_i id' hof
+      split at h
+      · simp at h
+      · rename_i hcon
+        injection h with hw hres
+        injection hres with hid
+        subst hid
+        have hcon' : (w.hasIssued id' || w.containsId id') = false := by simpa using hcon
+        rw [Bool.or_eq_false_iff] at hcon'
+        exact ⟨by simpa using hexh, hof, hcon'.1, hcon'.2, hw.symm⟩
 
 theorem keyedReserveAllocId_of_highWater (w : KeyedAllocWorld) (id : MiriAllocId)
     (hnotExh : w.idSupplyExhausted = false)
@@ -2654,12 +2676,26 @@ theorem keyedReserveAllocId_of_highWater (w : KeyedAllocWorld) (id : MiriAllocId
     (hfresh : w.hasIssued id = false) (hnotIn : w.containsId id = false) :
     let (w', res) := w.reserveAllocId
     res = .ok id ∧ w'.nextAllocId = w.nextAllocId + 1 ∧
-    w'.idSupplyExhausted = (w.nextAllocId + 1 == 0) ∧ w'.hasIssued id = true := by
+    w'.idSupplyExhausted = false ∧ w'.hasIssued id = true := by
   simp only [KeyedAllocWorld.reserveAllocId, hnotExh, hnext, hfresh, hnotIn, Bool.or_self,
     Bool.false_eq_true, ↓reduceIte]
   simp [KeyedAllocWorld.hasIssued, ExtTreeMap0.contains_eq_isSome_get?,
     ExtTreeMap0.get?_insert_self]
 
+/-- `AllocMap::reserve` is a `fetch_add`: a collision with an already-issued / already-present ID
+still consumes the cursor value, so a retry probes the NEXT ID instead of colliding forever. -/
+theorem keyedReserveAllocId_alreadyIssued_advances_cursor (w : KeyedAllocWorld) (id : MiriAllocId)
+    (hnotExh : w.idSupplyExhausted = false)
+    (hnext : MiriAllocId.ofUInt64 w.nextAllocId = some id)
+    (hcollide : (w.hasIssued id || w.containsId id) = true) :
+    w.reserveAllocId =
+      ({ w with nextAllocId := w.nextAllocId + 1 }, .error (.alreadyIssued id)) := by
+  simp [KeyedAllocWorld.reserveAllocId, hnotExh, hnext, hcollide]
+
+/-- Wrap-around exhaustion exactly as upstream: reserving `2^64 - 1` succeeds and wraps the cursor to
+`0` WITHOUT latching `idSupplyExhausted`; the next reservation observes the `0` sentinel, fails with
+`.exhausted`, advances the cursor to `1`, and latches the flag; every later reservation fails without
+changing the state (sticky). -/
 theorem keyedReserveAllocId_wrapAround_latches_exhausted (w : KeyedAllocWorld)
     (hnotExh : w.idSupplyExhausted = false)
     (hmax : w.nextAllocId = MiriAllocId.maxValue.value)
@@ -2667,15 +2703,107 @@ theorem keyedReserveAllocId_wrapAround_latches_exhausted (w : KeyedAllocWorld)
     (hnotIn : w.containsId MiriAllocId.maxValue = false) :
     let (w1, res1) := w.reserveAllocId
     let (w2, res2) := w1.reserveAllocId
+    let (w3, res3) := w2.reserveAllocId
     res1 = .ok MiriAllocId.maxValue ∧
-    w1.nextAllocId = 0 ∧
-    w1.idSupplyExhausted = true ∧
+    w1.nextAllocId = 0 ∧ w1.idSupplyExhausted = false ∧
     res2 = .error .exhausted ∧
-    w2 = w1 := by
+    w2.nextAllocId = 1 ∧ w2.idSupplyExhausted = true ∧
+    res3 = .error .exhausted ∧ w3 = w2 := by
   have hof : MiriAllocId.ofUInt64 MiriAllocId.maxValue.value = some MiriAllocId.maxValue :=
     (MiriAllocId.ofUInt64_eq_some_iff).2 rfl
   have hwrap : MiriAllocId.maxValue.value + 1 = 0 := by decide
-  simp [KeyedAllocWorld.reserveAllocId, hnotExh, hmax, hof, hfresh, hnotIn, hwrap]
+  simp [KeyedAllocWorld.reserveAllocId, hnotExh, hmax, hof, hfresh, hnotIn, hwrap,
+    MiriAllocId.ofUInt64_zero]
+
+/-- Reserve-then-register (the only order upstream performs, e.g. vtable / function interning): right
+after a successful reservation the validated `registerReservedGlobal` succeeds and coincides with the
+unvalidated `registerGlobal` (re-recording the already-issued ID is the identity by extensionality). -/
+theorem keyedRegisterReservedGlobal_after_reserve {w w1 : KeyedAllocWorld} {id : MiriAllocId}
+    (entry : GlobalAllocEntry) (hres : w.reserveAllocId = (w1, .ok id)) :
+    w1.registerReservedGlobal id entry = (w1.registerGlobal id entry, .ok ()) := by
+  rcases keyedReserveAllocId_ok_inv hres with ⟨_, _, _, hnotIn, hw1⟩
+  have hparts : w.findLive? id = none ∧ w.findDead? id = none ∧ w.findGlobal? id = none := by
+    simp only [KeyedAllocWorld.containsId, Bool.or_eq_false_iff, Option.isSome_eq_false_iff,
+      Option.isNone_iff_eq_none] at hnotIn
+    exact ⟨hnotIn.1.1, hnotIn.1.2, hnotIn.2⟩
+  have hissued : w1.hasIssued id = true := by
+    rw [hw1]
+    simp [KeyedAllocWorld.hasIssued, ExtTreeMap0.contains_eq_isSome_get?, ExtTreeMap0.get?_insert_self]
+  have hg : w1.findGlobal? id = none := by rw [hw1]; exact hparts.2.2
+  have hl : w1.findLive? id = none := by rw [hw1]; exact hparts.1
+  have hd : w1.findDead? id = none := by rw [hw1]; exact hparts.2.1
+  unfold KeyedAllocWorld.registerReservedGlobal
+  simp only [hg, hl, hd, hissued, Option.isSome_none, Bool.false_eq_true, ↓reduceIte, Bool.or_self,
+    Bool.not_true]
+  refine congrArg (fun x => (x, (Except.ok () : Except GlobalRegErr Unit))) ?_
+  refine KeyedAllocWorld.ext rfl rfl (fun k => ?_) (fun _ => rfl) (fun _ => rfl) (fun _ => rfl)
+    (fun _ => rfl)
+  simp only [KeyedAllocWorld.registerGlobal, KeyedAllocWorld.hasIssued,
+    ExtTreeMap0.contains_eq_isSome_get?]
+  rw [ExtTreeMap0.get?_insert]
+  split
+  · rename_i hk
+    have hkEq : k = id := Std.LawfulEqCmp.eq_of_compare (eq_of_beq hk)
+    subst hkEq
+    simpa [KeyedAllocWorld.hasIssued, ExtTreeMap0.contains_eq_isSome_get?] using hissued
+  · rfl
+
+/-- Validation order and state retention of `registerReservedGlobal`: an ID already naming a global is
+`.duplicateRuntimeId`; a live, tombstoned, or never-issued ID is `.globalIdAlreadyPresent`; every
+rejection returns the exact input world. -/
+theorem keyedRegisterReservedGlobal_rejections (w : KeyedAllocWorld) (id : MiriAllocId)
+    (entry : GlobalAllocEntry) :
+    ((w.findGlobal? id).isSome = true →
+      w.registerReservedGlobal id entry = (w, .error (.duplicateRuntimeId id))) ∧
+    ((w.findGlobal? id).isSome = false →
+      ((w.findLive? id).isSome = true ∨ (w.findDead? id).isSome = true ∨ w.hasIssued id = false) →
+      w.registerReservedGlobal id entry = (w, .error (.globalIdAlreadyPresent id))) := by
+  refine ⟨fun hg => ?_, fun hg hbad => ?_⟩
+  · simp [KeyedAllocWorld.registerReservedGlobal, hg]
+  · have hcond : ((w.findLive? id).isSome || (w.findDead? id).isSome || !w.hasIssued id) = true := by
+      rcases hbad with hb | hb | hb <;> simp [hb]
+    simp only [KeyedAllocWorld.registerReservedGlobal, hg, Bool.false_eq_true, ↓reduceIte, hcond]
+
+/-- `is_alloc_live` treats compiler globals as live (they can never be deallocated). -/
+theorem keyedIsAllocLive_of_global (w : KeyedAllocWorld) (id : MiriAllocId) (g : GlobalAllocEntry)
+    (hglobal : w.findGlobal? id = some g) : w.isAllocLive id = true := by
+  simp [KeyedAllocWorld.isAllocLive, hglobal]
+
+/-- `get_alloc_info` precedence on a tombstoned allocation: the dead metadata is reported with kind
+`.dead` (never `none`), and `get_live_alloc_size_and_align` classifies it as `.useAfterFree`, while an
+ID with no metadata at all is `.unavailable`. -/
+theorem keyedGetAllocInfo_dead_and_unavailable (w : KeyedAllocWorld) (id : MiriAllocId)
+    (hnotLive : w.findLive? id = none) (hnotGlobal : w.findGlobal? id = none) :
+    (∀ d, w.findDead? id = some d →
+      w.getAllocInfo id = some ⟨d.sizeBytes, d.alignPow2, .dead, .not⟩ ∧
+      w.getLiveAllocSizeAndAlign id = .error (.useAfterFree id) ∧
+      w.isAllocLive id = false) ∧
+    (w.findDead? id = none →
+      w.getAllocInfo id = none ∧
+      w.getLiveAllocSizeAndAlign id = .error (.unavailable id)) := by
+  refine ⟨fun d hd => ?_, fun hd => ?_⟩
+  · simp [KeyedAllocWorld.getAllocInfo, KeyedAllocWorld.getLiveAllocSizeAndAlign,
+      KeyedAllocWorld.isAllocLive, hnotLive, hnotGlobal, hd]
+  · simp [KeyedAllocWorld.getAllocInfo, KeyedAllocWorld.getLiveAllocSizeAndAlign,
+      hnotLive, hnotGlobal, hd]
+
+/-- `get_alloc_info` on compiler globals: functions, vtables, and type-ids expose `0` dereferenceable
+bytes, whereas `.static` / `.memory` globals are `.liveData` with their recorded size, alignment, and
+mutability (also reported by `get_live_alloc_size_and_align`). -/
+theorem keyedGetAllocInfo_global_kinds (w : KeyedAllocWorld) (id : MiriAllocId) (g : GlobalAllocEntry)
+    (hnotLive : w.findLive? id = none) (hglobal : w.findGlobal? id = some g) :
+    w.getAllocInfo id = some g.toAllocInfo ∧
+    (g.kind = .function ∨ g.kind = .vtable ∨ g.kind = .typeId → g.toAllocInfo.sizeBytes = 0 ∧
+      g.toAllocInfo.kind ≠ .liveData) ∧
+    (g.kind = .static ∨ g.kind = .memory →
+      g.toAllocInfo = ⟨g.sizeBytes, g.alignPow2, .liveData, g.mutability⟩ ∧
+      w.getLiveAllocSizeAndAlign id = .ok (g.sizeBytes, g.alignPow2)) := by
+  have hinfo : w.getAllocInfo id = some g.toAllocInfo := by
+    simp [KeyedAllocWorld.getAllocInfo, hnotLive, hglobal]
+  refine ⟨hinfo, fun hk => ?_, fun hk => ?_⟩
+  · rcases hk with hk | hk | hk <;> simp [GlobalAllocEntry.toAllocInfo, hk]
+  · rcases hk with hk | hk <;>
+      simp [KeyedAllocWorld.getLiveAllocSizeAndAlign, hinfo, GlobalAllocEntry.toAllocInfo, hk]
 
 theorem keyedDeallocate_nonzeroOffset_preserves_live (w : KeyedAllocWorld)
     (id : MiriAllocId) (off : UInt64) (hoff : off ≠ 0)
@@ -2684,7 +2812,7 @@ theorem keyedDeallocate_nonzeroOffset_preserves_live (w : KeyedAllocWorld)
     w.deallocate (.provenanced id off) expectedLayout expectedKind tb =
       ⟨w, none, .error (.nonzeroOffset id off)⟩ := by
   have hbne : (off != 0) = true := bne_iff_ne.2 hoff
-  simp [KeyedAllocWorld.deallocate, hbne]
+  simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.deallocateWith, hbne]
 
 theorem keyedDeallocate_absent_reports_useAfterFree (w : KeyedAllocWorld)
     (id : MiriAllocId)
@@ -2694,7 +2822,8 @@ theorem keyedDeallocate_absent_reports_useAfterFree (w : KeyedAllocWorld)
     (tb : DeallocHookSpec := .ok) :
     w.deallocate (.provenanced id 0) expectedLayout expectedKind tb =
       ⟨w, none, .error (.useAfterFree id)⟩ := by
-  simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.removeLive, hnotLive, hnotGlobal]
+  simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.deallocateWith, KeyedAllocWorld.removeLive,
+    hnotLive, hnotGlobal]
 
 theorem keyedDeallocate_doubleFree_precedes_layout_and_kind (w : KeyedAllocWorld)
     (id : MiriAllocId) (deadEntry : DeadAllocEntry)
@@ -2715,22 +2844,44 @@ theorem keyedDeallocate_global_reports_globalErr (w : KeyedAllocWorld)
     (tb : DeallocHookSpec := .ok) :
     w.deallocate (.provenanced id 0) expectedLayout expectedKind tb =
       ⟨w, none, .error (.globalErr id g.kind)⟩ := by
-  simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.removeLive, hnotLive, hglobal]
+  simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.deallocateWith, KeyedAllocWorld.removeLive,
+    hnotLive, hglobal]
 
 theorem keyedDeallocate_postRemovalFailure_retains_detached_state (w : KeyedAllocWorld)
     (id : MiriAllocId) (entry : LiveAllocEntry)
+    (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
+    (tb : DeallocHookSpec)
     (hlive : w.findLive? id = some entry)
     (hmut : entry.mutability = .mut)
     (hkindNe : entry.kind ≠ expectedKind) :
     let res := w.deallocate (.provenanced id 0) expectedLayout expectedKind tb
     res.outcome = .error (.memoryKindMismatch id) ∧
     res.detached = some (id, entry) ∧
-    res.world.findLive? id = none := by
+    res.world.findLive? id = none ∧
+    res.world.findDead? id = w.findDead? id := by
   have hmutF : (entry.mutability == .not) = false := by rw [hmut]; rfl
   have hkindT : (entry.kind != expectedKind) = true := bne_iff_ne.2 hkindNe
   simp only [KeyedAllocWorld.findLive?] at hlive
-  simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.removeLive, KeyedAllocWorld.findLive?,
-    hlive, hmutF, hkindT, ExtTreeMap0.get?_erase_self]
+  simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.deallocateWith, KeyedAllocWorld.removeLive,
+    KeyedAllocWorld.findLive?, KeyedAllocWorld.findDead?, hlive, hmutF, hkindT,
+    ExtTreeMap0.get?_erase_self]
+
+/-- A failing machine hook retains the live-detached world WITHOUT recording a tombstone. -/
+theorem keyedDeallocate_hookFailure_retains_detached_state_without_tombstone (w : KeyedAllocWorld)
+    (id : MiriAllocId) (entry : LiveAllocEntry) (tb : DeallocHookSpec) (msg : String)
+    (hlive : w.findLive? id = some entry)
+    (hmut : entry.mutability = .mut)
+    (hhook : tb.run = .error msg) :
+    let res := w.deallocate (.provenanced id 0) none entry.kind tb
+    res.outcome = .error (.hookFailure msg) ∧
+    res.detached = some (id, entry) ∧
+    res.world.findLive? id = none ∧
+    res.world.findDead? id = w.findDead? id := by
+  have hmutF : (entry.mutability == .not) = false := by rw [hmut]; rfl
+  simp only [KeyedAllocWorld.findLive?] at hlive
+  simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.deallocateWith, KeyedAllocWorld.removeLive,
+    KeyedAllocWorld.findLive?, KeyedAllocWorld.findDead?, hlive, hmutF, hhook,
+    deallocLayoutMismatch?, ExtTreeMap0.get?_erase_self]
 
 theorem keyedDeallocate_duplicateDead_replaces_before_error (w : KeyedAllocWorld)
     (id : MiriAllocId) (entry : LiveAllocEntry) (oldDead : DeadAllocEntry)
@@ -2745,16 +2896,214 @@ theorem keyedDeallocate_duplicateDead_replaces_before_error (w : KeyedAllocWorld
   have hmutF : (entry.mutability == .not) = false := by rw [hmut]; rfl
   simp only [KeyedAllocWorld.findLive?] at hlive
   simp only [KeyedAllocWorld.findDead?] at hdead
-  simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.removeLive, hlive, hmutF,
-    DeallocHookSpec.run, KeyedAllocWorld.findDead?, hdead,
+  simp [KeyedAllocWorld.deallocate, KeyedAllocWorld.deallocateWith, KeyedAllocWorld.removeLive,
+    hlive, hmutF, DeallocHookSpec.run, KeyedAllocWorld.findDead?, hdead, deallocLayoutMismatch?,
     KeyedAllocWorld.insertDead, KeyedAllocWorld.findLive?,
     ExtTreeMap0.get?_erase_self, ExtTreeMap0.get?_insert_self]
 
-theorem keyedDeallocateMachine_unconfigured_eq_deallocate (w : KeyedAllocWorld)
+/-- The core `deallocateWith` never touches race clocks; only the machine-level `detachRaceClock`
+wrapper does. -/
+theorem keyedDeallocateWith_preserves_raceClocks (w : KeyedAllocWorld) (ptr : DeallocPtr)
+    (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
+    (hook : KeyedAllocWorld → MiriAllocId → LiveAllocEntry → Except String Unit) (k : MiriAllocId) :
+    (w.deallocateWith ptr expectedLayout expectedKind hook).world.findRace? k = w.findRace? k := by
+  have hrem : ∀ id, (w.removeLive id).1.findRace? k = w.findRace? k := by
+    intro id
+    unfold KeyedAllocWorld.removeLive
+    cases w.findLive? id <;> rfl
+  unfold KeyedAllocWorld.deallocateWith
+  cases ptr with
+  | dangling addr => rfl
+  | provenanced id off =>
+    dsimp only
+    repeat' split
+    all_goals first | rfl | exact hrem id
+
+/-- The detached owner reported by `deallocateWith` is always the allocation named by the pointer. -/
+theorem keyedDeallocateWith_detached_id (w : KeyedAllocWorld) (ptr : DeallocPtr)
+    (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
+    (hook : KeyedAllocWorld → MiriAllocId → LiveAllocEntry → Except String Unit)
+    (id : MiriAllocId) (entry : LiveAllocEntry)
+    (hdet : (w.deallocateWith ptr expectedLayout expectedKind hook).detached = some (id, entry)) :
+    ptr = .provenanced id 0 ∧ w.findLive? id = some entry := by
+  unfold KeyedAllocWorld.deallocateWith at hdet
+  cases ptr with
+  | dangling addr => cases hdet
+  | provenanced id' off =>
+    dsimp only at hdet
+    cases hoff : (off != 0) with
+    | true => rw [hoff] at hdet; cases hdet
+    | false =>
+      have hoff0 : off = 0 := by
+        cases hdec : decide (off = 0) with
+        | true => exact of_decide_eq_true hdec
+        | false =>
+          have hne : off ≠ 0 := of_decide_eq_false hdec
+          rw [bne_iff_ne.2 hne] at hoff; cases hoff
+      have hremEq : (w.removeLive id').2 = w.findLive? id' := by
+        unfold KeyedAllocWorld.removeLive
+        cases w.findLive? id' <;> rfl
+      rw [hoff] at hdet
+      simp only [Bool.false_eq_true, ↓reduceIte] at hdet
+      rw [hremEq] at hdet
+      cases hl : w.findLive? id' with
+      | none =>
+        rw [hl] at hdet
+        dsimp only at hdet
+        split at hdet <;> cases hdet
+      | some e =>
+        rw [hl] at hdet
+        dsimp only at hdet
+        have hpair : some (id', e) = some (id, entry) := by
+          repeat' split at hdet
+          all_goals exact hdet
+        injection hpair with hpair
+        injection hpair with h1 h2
+        subst h1; subst h2; subst hoff0
+        exact ⟨rfl, hl⟩
+
+/-- Universal detached-state retention of the core deallocation: whenever the pointer names a live
+allocation at offset `0`, `deallocateWith` detaches it and removes it from `live` — on success and on
+EVERY post-removal failure (immutability, kind, layout, machine hook, duplicate tombstone), for every
+requested layout, kind, and hook. -/
+theorem keyedDeallocateWith_live_always_detaches (w : KeyedAllocWorld) (id : MiriAllocId)
+    (entry : LiveAllocEntry)
+    (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
+    (hook : KeyedAllocWorld → MiriAllocId → LiveAllocEntry → Except String Unit)
+    (hlive : w.findLive? id = some entry) :
+    (w.deallocateWith (.provenanced id 0) expectedLayout expectedKind hook).detached =
+      some (id, entry) ∧
+    (w.deallocateWith (.provenanced id 0) expectedLayout expectedKind hook).world.findLive? id =
+      none := by
+  have hrem2 : (w.removeLive id).2 = some entry := by
+    unfold KeyedAllocWorld.removeLive; rw [hlive]
+  have hrem1 : (w.removeLive id).1.findLive? id = none := by
+    unfold KeyedAllocWorld.removeLive; rw [hlive]
+    simp [KeyedAllocWorld.findLive?, ExtTreeMap0.get?_erase_self]
+  unfold KeyedAllocWorld.deallocateWith
+  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hrem2]
+  repeat' split
+  all_goals first | exact ⟨rfl, hrem1⟩ | exact ⟨rfl, by simpa [KeyedAllocWorld.insertDead, KeyedAllocWorld.findLive?] using hrem1⟩
+
+/-- Dropping an absent race clock is the identity (by keyed-world extensionality). -/
+theorem keyedRemoveRace_eq_self_of_noClock (w : KeyedAllocWorld) (id : MiriAllocId)
+    (hnoClk : w.findRace? id = none) : w.removeRace id = w := by
+  refine KeyedAllocWorld.ext rfl rfl (fun _ => rfl) (fun _ => rfl) (fun _ => rfl) (fun _ => rfl) ?_
+  intro k
+  simp only [KeyedAllocWorld.removeRace, KeyedAllocWorld.findRace?]
+  rw [ExtTreeMap0.get?_erase]
+  split
+  · rename_i hk
+    have hkEq : k = id := Std.LawfulEqCmp.eq_of_compare (eq_of_beq hk)
+    subst hkEq
+    exact hnoClk.symm
+  · rfl
+
+/-- The detach cleanup only edits race clocks: outcome, detached owner, and every non-race lookup of
+the result world are unchanged. -/
+theorem keyedDetachRaceClock_preserves_outcome_detached_and_tables
+    (res : DeallocResult KeyedAllocWorld) (k : MiriAllocId) :
+    (KeyedAllocWorld.detachRaceClock res).outcome = res.outcome ∧
+    (KeyedAllocWorld.detachRaceClock res).detached = res.detached ∧
+    (KeyedAllocWorld.detachRaceClock res).world.findLive? k = res.world.findLive? k ∧
+    (KeyedAllocWorld.detachRaceClock res).world.findDead? k = res.world.findDead? k ∧
+    (KeyedAllocWorld.detachRaceClock res).world.findGlobal? k = res.world.findGlobal? k := by
+  unfold KeyedAllocWorld.detachRaceClock
+  cases hd : res.detached with
+  | none => exact ⟨rfl, hd, rfl, rfl, rfl⟩
+  | some p => exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Upstream detach cleanup (`AllocationMachine.deallocate`): whenever machine deallocation detached
+the live entry — on success AND on every post-removal failure, in every `RaceDetectorMode` — the
+allocation's race clock has left the machine. -/
+theorem keyedDeallocateMachine_detached_drops_raceClock (w : KeyedAllocWorld) (ptr : DeallocPtr)
+    (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
+    (mode : RaceDetectorMode) (actor : DeallocActor) (tb : DeallocHookSpec)
+    (id : MiriAllocId) (entry : LiveAllocEntry)
+    (hdet : (w.deallocateMachine ptr expectedLayout expectedKind mode actor tb).detached =
+      some (id, entry)) :
+    (w.deallocateMachine ptr expectedLayout expectedKind mode actor tb).world.findRace? id = none ∧
+    ptr = .provenanced id 0 ∧ w.findLive? id = some entry := by
+  unfold KeyedAllocWorld.deallocateMachine KeyedAllocWorld.detachRaceClock at hdet ⊢
+  generalize hres : w.deallocateWith ptr expectedLayout expectedKind
+    (fun wDetached id entry =>
+      machineDeallocHook mode actor tb (wDetached.findRace? id) entry.sizeBytes) = res at hdet ⊢
+  cases hd : res.detached with
+  | none =>
+    rw [hd] at hdet
+    dsimp only at hdet
+    rw [hd] at hdet
+    cases hdet
+  | some p =>
+    rw [hd] at hdet
+    dsimp only at hdet
+    injection hdet with hp
+    subst hp
+    refine ⟨?_, ?_⟩
+    · simp [KeyedAllocWorld.removeRace, KeyedAllocWorld.findRace?, ExtTreeMap0.get?_erase_self]
+    · have := keyedDeallocateWith_detached_id w ptr expectedLayout expectedKind _ id entry
+        (by rw [hres]; exact hd)
+      exact this
+
+/-- Universal machine-level detached-state retention (`AllocationMachine.deallocate`): deallocating a
+live allocation at offset `0` ALWAYS detaches the live entry together with its race clock — whatever the
+`RaceDetectorMode`, requested layout / kind, actor clocks, and Tree Borrows verdict, and whatever the
+outcome (success, `DataRace`, missing clock, hook failure, layout / kind / mutability mismatch). -/
+theorem keyedDeallocateMachine_live_always_detaches_entry_and_clock (w : KeyedAllocWorld)
+    (id : MiriAllocId) (entry : LiveAllocEntry)
+    (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
+    (mode : RaceDetectorMode) (actor : DeallocActor) (tb : DeallocHookSpec)
+    (hlive : w.findLive? id = some entry) :
+    let res := w.deallocateMachine (.provenanced id 0) expectedLayout expectedKind mode actor tb
+    res.detached = some (id, entry) ∧ res.world.findLive? id = none ∧
+    res.world.findRace? id = none := by
+  have hcore := keyedDeallocateWith_live_always_detaches w id entry expectedLayout expectedKind
+    (fun wDetached id entry =>
+      machineDeallocHook mode actor tb (wDetached.findRace? id) entry.sizeBytes) hlive
+  have hproj := keyedDetachRaceClock_preserves_outcome_detached_and_tables
+    (w.deallocateWith (.provenanced id 0) expectedLayout expectedKind
+      (fun wDetached id entry =>
+        machineDeallocHook mode actor tb (wDetached.findRace? id) entry.sizeBytes)) id
+  have hdet : (w.deallocateMachine (.provenanced id 0) expectedLayout expectedKind mode actor tb).detached =
+      some (id, entry) := hproj.2.1.trans hcore.1
+  exact ⟨hdet, hproj.2.2.1.trans hcore.2,
+    (keyedDeallocateMachine_detached_drops_raceClock w (.provenanced id 0) expectedLayout
+      expectedKind mode actor tb id entry hdet).1⟩
+
+/-- With the race detector `unconfigured`, machine deallocation is core deallocation followed by the
+(unconditional) detach cleanup of the allocation's race clock. -/
+theorem keyedDeallocateMachine_unconfigured_eq_detachRaceClock (w : KeyedAllocWorld)
     (ptr : DeallocPtr) (expectedLayout : Option (UInt64 × UInt8))
     (expectedKind : AllocMemKind) (actor : DeallocActor) (tb : DeallocHookSpec := .ok) :
     w.deallocateMachine ptr expectedLayout expectedKind .unconfigured actor tb =
-      w.deallocate ptr expectedLayout expectedKind tb := rfl
+      KeyedAllocWorld.detachRaceClock (w.deallocate ptr expectedLayout expectedKind tb) := rfl
+
+/-- With the race detector `unconfigured` and no stale clock recorded for the pointed-to allocation
+(the invariant maintained by `allocateMachine … .unconfigured`), machine deallocation coincides with
+core deallocation. -/
+theorem keyedDeallocateMachine_unconfigured_eq_deallocate (w : KeyedAllocWorld)
+    (ptr : DeallocPtr) (expectedLayout : Option (UInt64 × UInt8))
+    (expectedKind : AllocMemKind) (actor : DeallocActor) (tb : DeallocHookSpec := .ok)
+    (hnoClk : ∀ id off, ptr = .provenanced id off → w.findRace? id = none) :
+    w.deallocateMachine ptr expectedLayout expectedKind .unconfigured actor tb =
+      w.deallocate ptr expectedLayout expectedKind tb := by
+  rw [keyedDeallocateMachine_unconfigured_eq_detachRaceClock w ptr expectedLayout expectedKind actor tb]
+  unfold KeyedAllocWorld.detachRaceClock KeyedAllocWorld.deallocate
+  have hid := keyedDeallocateWith_detached_id w ptr expectedLayout expectedKind (fun _ _ _ => tb.run)
+  have hrace := keyedDeallocateWith_preserves_raceClocks w ptr expectedLayout expectedKind
+    (fun _ _ _ => tb.run)
+  generalize w.deallocateWith ptr expectedLayout expectedKind (fun _ _ _ => tb.run) = res
+    at hid hrace ⊢
+  rcases res with ⟨resWorld, resDetached, resOutcome⟩
+  cases resDetached with
+  | none => rfl
+  | some p =>
+    rcases p with ⟨id, entry⟩
+    dsimp only
+    have hptr := (hid id entry rfl).1
+    have hno : resWorld.findRace? id = none := by
+      rw [hrace id]; exact hnoClk id 0 hptr
+    rw [keyedRemoveRace_eq_self_of_noClock _ id hno]
 
 theorem keyedDeallocateMachine_missingClock_invalid (w : KeyedAllocWorld)
     (id : MiriAllocId) (entry : LiveAllocEntry) (raceDetecting : Bool)
@@ -2769,32 +3118,32 @@ theorem keyedDeallocateMachine_missingClock_invalid (w : KeyedAllocWorld)
   have hmutF : (entry.mutability == .not) = false := by rw [hmut]; rfl
   simp only [KeyedAllocWorld.findLive?] at hlive
   simp only [KeyedAllocWorld.findRace?] at hnoClk
-  simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.removeLive, hlive, hmutF,
+  simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocateWith,
+    KeyedAllocWorld.detachRaceClock, machineDeallocHook, deallocLayoutMismatch?,
+    KeyedAllocWorld.removeLive, KeyedAllocWorld.removeRace, hlive, hmutF,
     KeyedAllocWorld.findRace?, hnoClk, KeyedAllocWorld.findLive?, ExtTreeMap0.get?_erase_self]
 
+/-- A configured-but-not-detecting race detector (`race_detecting = false`, e.g. single-threaded
+execution) skips the clock comparison: whenever the allocation's clock is present, machine
+deallocation is core deallocation followed by the detach cleanup. -/
 theorem keyedDeallocateMachine_notDetecting_eq_deallocate (w : KeyedAllocWorld)
-    (id : MiriAllocId) (entry : LiveAllocEntry) (clk : RaceClockEntry)
+    (id : MiriAllocId) (off : UInt64) (clk : RaceClockEntry)
+    (expectedLayout : Option (UInt64 × UInt8)) (expectedKind : AllocMemKind)
     (actor : DeallocActor) (tb : DeallocHookSpec := .ok)
-    (hlive : w.findLive? id = some entry)
-    (hmut : entry.mutability = .mut)
     (hclk : w.findRace? id = some clk) :
-    let rm := w.deallocateMachine (.provenanced id 0) none entry.kind (.configured false) actor tb
-    let rd := w.deallocate (.provenanced id 0) none entry.kind tb
-    rm.outcome = rd.outcome ∧ rm.detached = rd.detached := by
-  have hmutF : (entry.mutability == .not) = false := by rw [hmut]; rfl
-  simp only [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocate,
-    KeyedAllocWorld.removeLive, hlive, hmutF, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
-    Bool.false_and]
-  have hclk' : ({ w with table := { w.table with live := w.table.live.erase id } }).findRace? id = some clk := hclk
-  simp only [hclk']
-  cases tb.run with
-  | error msg => exact ⟨rfl, rfl⟩
-  | ok u =>
-    have hd : (({ w with table := { w.table with live := w.table.live.erase id } }).removeRace id).findDead? id =
-        ({ w with table := { w.table with live := w.table.live.erase id } }).findDead? id := rfl
-    simp only [hd]
-    split <;> exact ⟨rfl, rfl⟩
+    w.deallocateMachine (.provenanced id off) expectedLayout expectedKind (.configured false) actor tb =
+      KeyedAllocWorld.detachRaceClock
+        (w.deallocate (.provenanced id off) expectedLayout expectedKind tb) := by
+  have hrem : (w.removeLive id).1.findRace? id = some clk := by
+    unfold KeyedAllocWorld.removeLive
+    cases w.findLive? id <;> exact hclk
+  simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocate,
+    KeyedAllocWorld.deallocateWith, machineDeallocHook, hrem]
 
+/-- The data-race verdict is computed from the allocation's vector clock BEFORE the clock is cleaned
+up: the racing deallocation reports `DataRace` (a cleanup-first order would instead report
+`MissingVectorClockExtra`, as the last conjunct shows on the pre-cleaned world), and the failed
+deallocation still detaches the live entry AND its clock without recording a tombstone. -/
 theorem keyedDeallocateMachine_race_checked_before_cleanup (w : KeyedAllocWorld)
     (id : MiriAllocId) (entry : LiveAllocEntry) (clk : RaceClockEntry) (actor : DeallocActor)
     (hlive : w.findLive? id = some entry)
@@ -2806,13 +3155,19 @@ theorem keyedDeallocateMachine_race_checked_before_cleanup (w : KeyedAllocWorld)
     res.outcome = .error (.hookFailure "DataRace") ∧
     res.detached = some (id, entry) ∧
     res.world.findLive? id = none ∧
-    res.world.findRace? id = some clk := by
+    res.world.findRace? id = none ∧
+    res.world.findDead? id = w.findDead? id ∧
+    ((w.removeRace id).deallocateMachine (.provenanced id 0) none entry.kind (.configured true)
+      actor .ok).outcome = .error (.hookFailure "MissingVectorClockExtra") := by
   have hmutF : (entry.mutability == .not) = false := by rw [hmut]; rfl
   have hszT : (entry.sizeBytes != 0) = true := bne_iff_ne.2 hsize
   simp only [KeyedAllocWorld.findLive?] at hlive
   simp only [KeyedAllocWorld.findRace?] at hclk
-  simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.removeLive, hlive, hmutF, hszT,
-    KeyedAllocWorld.findRace?, hclk, hrace, KeyedAllocWorld.findLive?, ExtTreeMap0.get?_erase_self]
+  simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocateWith,
+    KeyedAllocWorld.detachRaceClock, machineDeallocHook, deallocLayoutMismatch?,
+    KeyedAllocWorld.removeLive, KeyedAllocWorld.removeRace, hlive, hmutF, hszT,
+    KeyedAllocWorld.findRace?, KeyedAllocWorld.findDead?, hclk, hrace, KeyedAllocWorld.findLive?,
+    ExtTreeMap0.get?_erase_self]
 
 theorem keyedDeallocateMachine_sameWriter_foreignRead_races (w : KeyedAllocWorld)
     (id : MiriAllocId) (entry : LiveAllocEntry) (clk : RaceClockEntry) (actor : DeallocActor)
@@ -2874,18 +3229,21 @@ theorem keyedDeallocateMachine_zst_skips_race_check (w : KeyedAllocWorld)
   simp only [KeyedAllocWorld.findLive?] at hlive
   simp only [KeyedAllocWorld.findRace?] at hclk
   simp only [KeyedAllocWorld.findDead?] at hnotDead
-  simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.removeLive, KeyedAllocWorld.findLive?,
+  simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocateWith,
+    KeyedAllocWorld.detachRaceClock, machineDeallocHook, deallocLayoutMismatch?,
+    KeyedAllocWorld.removeLive, KeyedAllocWorld.findLive?,
     hlive, hmutF, hzst, KeyedAllocWorld.findRace?, hclk, DeallocHookSpec.run,
-    KeyedAllocWorld.removeRace, KeyedAllocWorld.findDead?, hnotDead]
+    KeyedAllocWorld.findDead?, hnotDead]
 
-theorem keyedAllocateMachine_deallocateMachine_sameThread_ok (w : KeyedAllocWorld)
+theorem keyedAllocateMachine_deallocateMachine_sameThread_ok (w w1 : KeyedAllocWorld)
     (entry : LiveAllocEntry) (mode : RaceDetectorMode)
     (tid : UInt32) (ts : UInt64) (id : MiriAllocId)
     (hmut : entry.mutability = .mut)
     (hnotDead : w.findDead? id = none)
     (halloc : w.allocateMachine entry mode tid ts = (w1, .ok id)) :
-    (w1.deallocateMachine (.provenanced id 0) (some (entry.sizeBytes, entry.alignPow2))
-      entry.kind mode (DeallocActor.ofVClock tid [(tid, ts)]) .ok).outcome = .ok () := by
+    let res := w1.deallocateMachine (.provenanced id 0) (some (entry.sizeBytes, entry.alignPow2))
+      entry.kind mode (DeallocActor.ofVClock tid [(tid, ts)]) .ok
+    res.outcome = .ok () ∧ res.world.findRace? id = none ∧ res.world.findLive? id = none := by
   have hmutF : (entry.mutability == .not) = false := by rw [hmut]; rfl
   unfold KeyedAllocWorld.allocateMachine KeyedAllocWorld.allocate at halloc
   cases hres : w.reserveAllocId with
@@ -2895,46 +3253,40 @@ theorem keyedAllocateMachine_deallocateMachine_sameThread_ok (w : KeyedAllocWorl
     | error e => simp at halloc
     | ok id' =>
       simp only at halloc
+      have hEqId : id' = id := by
+        cases mode with
+        | unconfigured =>
+          injection halloc with _ hok; injection hok
+        | configured _ =>
+          injection halloc with _ hok; injection hok
+      subst hEqId
       have hdead_wr : wr.table.dead.get? id' = none := by
-        have hEqId : id' = id := by
-          cases mode with
-          | unconfigured =>
-            injection halloc with _ hok; injection hok
-          | configured _ =>
-            injection halloc with _ hok; injection hok
-        subst hEqId
-        unfold KeyedAllocWorld.reserveAllocId at hres
-        split at hres
-        · simp at hres
-        · split at hres
-          · simp at hres
-          · split at hres
-            · simp at hres
-            · injection hres with hwr _
-              rw [← hwr]; exact hnotDead
+        rw [(keyedReserveAllocId_ok_inv hres).2.2.2.2]
+        exact hnotDead
       cases mode with
       | unconfigured =>
         injection halloc with hw1 hok
-        injection hok with hid
-        subst hid; subst hw1
-        simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocate,
+        subst hw1
+        simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocateWith,
+          KeyedAllocWorld.detachRaceClock, machineDeallocHook, deallocLayoutMismatch?,
           KeyedAllocWorld.insertLive, KeyedAllocWorld.removeLive, KeyedAllocWorld.findLive?,
-          ExtTreeMap0.get?_insert_self, hmutF, DeallocHookSpec.run,
+          KeyedAllocWorld.removeRace, KeyedAllocWorld.findRace?, KeyedAllocWorld.insertDead,
+          ExtTreeMap0.get?_insert_self, ExtTreeMap0.get?_erase_self, hmutF, DeallocHookSpec.run,
           KeyedAllocWorld.findDead?, hdead_wr]
       | configured raceDetecting =>
         injection halloc with hw1 hok
-        injection hok with hid
-        subst hid; subst hw1
+        subst hw1
         have hnoRace :
             hasDeallocDataRace (DeallocActor.ofVClock tid [(tid, ts)])
               { writerThread := tid, writeTimestamp := ts, readerThread := tid, readTimestamp := 0, extraReaders := [] } = false := by
           simp [hasDeallocDataRace, DeallocActor.ofVClock]
-        simp only [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.setRace,
+        simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocateWith,
+          KeyedAllocWorld.detachRaceClock, machineDeallocHook, deallocLayoutMismatch?,
+          KeyedAllocWorld.setRace, KeyedAllocWorld.insertDead,
           KeyedAllocWorld.insertLive, KeyedAllocWorld.removeLive, KeyedAllocWorld.findLive?,
           KeyedAllocWorld.findRace?, KeyedAllocWorld.removeRace, KeyedAllocWorld.findDead?,
-          ExtTreeMap0.get?_insert_self, hmutF, hnoRace, DeallocHookSpec.run, hdead_wr,
-          bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, Bool.or_self, Bool.and_false,
-          Option.isSome_none]
+          ExtTreeMap0.get?_insert_self, ExtTreeMap0.get?_erase_self, hmutF, hnoRace,
+          DeallocHookSpec.run, hdead_wr]
 
 /-- Contrast theorem: `DeallocActor.ofVClock` catches an unlisted foreign reader (`viewFor = 0`),
 whereas a nonzero fallback `observedTimestamp` unsoundly accepts the racing deallocation. -/
@@ -2959,9 +3311,11 @@ theorem deallocActor_ofVClock_catches_unlisted_reader_vs_nonzeroFallback
     simp only [KeyedAllocWorld.findLive?] at hlive
     simp only [KeyedAllocWorld.findRace?] at hclk
     simp only [KeyedAllocWorld.findDead?] at hnotDead
-    simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.removeLive, KeyedAllocWorld.findLive?,
+    simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocateWith,
+      KeyedAllocWorld.detachRaceClock, machineDeallocHook, deallocLayoutMismatch?,
+      KeyedAllocWorld.removeLive, KeyedAllocWorld.findLive?,
       hlive, hmutF, KeyedAllocWorld.findRace?, hclk, hnoRace, DeallocHookSpec.run,
-      KeyedAllocWorld.removeRace, KeyedAllocWorld.findDead?, hnotDead]
+      KeyedAllocWorld.findDead?, hnotDead]
 
 /-! ## Part 2: `#[rustc_no_writable]` (`charon#1619` + `minirust#295`) & Static-Access Retags (`charon#1620`) -/
 
@@ -3324,19 +3678,24 @@ end TreeTagNode
 def rangesOverlap (aOff aLen bOff bLen : Nat) : Bool :=
   aLen != 0 && bLen != 0 && decide (aOff < bOff + bLen) && decide (bOff < aOff + aLen)
 
-/-- Borrow-tree world for function-entry mutable reference retagging. -/
+/-- Borrow-tree world for function-entry mutable reference retagging. `allocReadOnly` records whether
+the retagged pointer's allocation is immutable (`Mutability::Not`, e.g. a `Freeze` `static` or promoted
+constant): upstream `tb_reborrow` rejects an implicit FnEntry WRITE into such an allocation before any
+tree access (`RetagPipeline.accessTreeForReborrow`: `writeToReadOnly`), while read reborrows ignore it. -/
 structure FnEntryBorrowWorld where
   nodes : List TreeTagNode
   activeProtectors : List Nat
   nextTag : Nat
   nextProtector : Nat
   pointeeInitialized : Bool := true
+  allocReadOnly : Bool := false
   deriving DecidableEq, Repr, Inhabited
 
 /-- Structured errors for function-entry mutable borrow-tree retag execution. -/
 inductive RetagStepErr where
   | missingParentTag (tag : Nat)
   | disabledParentTag (tag : Nat)
+  | writeToReadOnlyAlloc
   | uninitializedPointeeWrite
   | ancestorWriteForbidden (tag : Nat)
   | conflictedProtectedChildWrite (tag : Nat)
@@ -3715,7 +4074,9 @@ def execFnEntryMutRetag (w : FnEntryBorrowWorld) (parentTag rangeOffset rangeLen
                 nextTag := childTag + 1
                 nextProtector := protId + 1 }, childTag)
           | .writableChildWrite =>
-            if requireInitOnImplicitWrite && !w.pointeeInitialized then
+            if w.allocReadOnly then
+              .error .writeToReadOnlyAlloc
+            else if requireInitOnImplicitWrite && !w.pointeeInitialized then
               .error .uninitializedPointeeWrite
             else
               match mapNodesM (fun n => stepNodeOnRangeRead w.activeProtectors (ancestors.contains n.tag) rangeOffset rangeLen n) w.nodes with
@@ -3782,7 +4143,9 @@ def execFnEntryMutRetagUpstream (w : FnEntryBorrowWorld) (parentTag rangeOffset 
                 nextTag := childTag + 1
                 nextProtector := protId + 1 }, childTag)
           | .writableChildWrite =>
-            if requireInitOnImplicitWrite && !w.pointeeInitialized then
+            if w.allocReadOnly then
+              .error .writeToReadOnlyAlloc
+            else if requireInitOnImplicitWrite && !w.pointeeInitialized then
               .error .uninitializedPointeeWrite
             else
               match mapNodesM (fun n => stepNodeOnRangeWrite w.activeProtectors (ancestors.contains n.tag) rangeOffset rangeLen n) w.nodes with
@@ -3867,7 +4230,9 @@ def execFnEntryMutRetagSourceOrder (w : FnEntryBorrowWorld) (parentTag rangeOffs
                     nextTag := childTag + 1
                     nextProtector := protId + 1 }, childTag)
           | .writableChildWrite =>
-            if requireInitOnImplicitWrite && !w.pointeeInitialized then
+            if w.allocReadOnly then
+              .error .writeToReadOnlyAlloc
+            else if requireInitOnImplicitWrite && !w.pointeeInitialized then
               .error .uninitializedPointeeWrite
             else
               match checkAncestorPathM w parentTag
@@ -3938,6 +4303,70 @@ theorem fnEntryMutRetag_zst_no_write (w : FnEntryBorrowWorld) (parentTag rangeOf
     cases findNode? w.nodes parentTag with
     | none => rfl
     | some p => cases p.perm == .disabled <;> rfl
+
+/-- Read-only allocation separation (`RetagPipeline.accessTreeForReborrow`: `writeToReadOnly`): on EVERY
+world whose retagged allocation is read-only, a non-zero-sized `writableChildWrite` FnEntry retag through
+a non-disabled parent is rejected with `.writeToReadOnlyAlloc` by all three models BEFORE any tree access
+(regardless of the tree shape, protectors, or `requireInit`). -/
+theorem fnEntryMutRetag_readOnlyAlloc_writable_rejected
+    (w : FnEntryBorrowWorld) (parentTag rangeOffset rangeLen : Nat) (requireInit : Bool)
+    (pNode : TreeTagNode)
+    (hro : w.allocReadOnly = true)
+    (hparent : findNode? w.nodes parentTag = some pNode)
+    (hnotDisabled : pNode.perm ≠ .disabled)
+    (hlen : rangeLen ≠ 0) :
+    execFnEntryMutRetag w parentTag rangeOffset rangeLen .writableChildWrite requireInit =
+      .error .writeToReadOnlyAlloc ∧
+    execFnEntryMutRetagUpstream w parentTag rangeOffset rangeLen .writableChildWrite requireInit =
+      .error .writeToReadOnlyAlloc ∧
+    execFnEntryMutRetagSourceOrder w parentTag rangeOffset rangeLen .writableChildWrite requireInit =
+      .error .writeToReadOnlyAlloc := by
+  refine ⟨?_, ?_, ?_⟩
+  · simp [execFnEntryMutRetag, hparent, hnotDisabled, hlen, hro]
+  · simp [execFnEntryMutRetagUpstream, hparent, hnotDisabled, hlen, hro]
+  · simp [execFnEntryMutRetagSourceOrder, hparent, hnotDisabled, hlen, hro]
+
+/-- `rustcNoWritable` performs a READ reborrow and therefore never consults allocation mutability:
+flipping `allocReadOnly` changes neither success / failure nor the produced nodes, protectors, fresh
+counters, or child tag of the source-order model. Together with
+`fnEntryMutRetag_readOnlyAlloc_writable_rejected`, `#[rustc_no_writable]` is exactly what makes a
+protected `&mut` reborrow into read-only memory acceptable. -/
+theorem sourceOrder_rustcNoWritable_ignores_allocReadOnly
+    (w : FnEntryBorrowWorld) (ro : Bool) (parentTag rangeOffset rangeLen : Nat) (requireInit : Bool) :
+    (execFnEntryMutRetagSourceOrder { w with allocReadOnly := ro } parentTag rangeOffset rangeLen
+        .rustcNoWritable requireInit).map
+      (fun r => (r.1.nodes, r.1.activeProtectors, r.1.nextTag, r.1.nextProtector, r.2)) =
+    (execFnEntryMutRetagSourceOrder w parentTag rangeOffset rangeLen .rustcNoWritable requireInit).map
+      (fun r => (r.1.nodes, r.1.activeProtectors, r.1.nextTag, r.1.nextProtector, r.2)) := by
+  unfold execFnEntryMutRetagSourceOrder checkAncestorPathM
+  dsimp only
+  cases findNode? w.nodes parentTag with
+  | none => rfl
+  | some pNode =>
+    dsimp only
+    cases (pNode.perm == .disabled) with
+    | true => rfl
+    | false =>
+      cases (rangeLen == 0) with
+      | true => rfl
+      | false =>
+        simp only [Bool.false_eq_true, ↓reduceIte]
+        cases checkNodesM (stepNodeOnRangeRead w.activeProtectors true rangeOffset rangeLen)
+            (ancestorPathNodes w.nodes parentTag) with
+        | error e => rfl
+        | ok u1 =>
+          cases u1
+          dsimp only
+          cases checkNodesM (stepNodeOnRangeRead w.activeProtectors false rangeOffset rangeLen)
+              (w.nodes.filter (fun n => !(ancestorPathTags w.nodes parentTag).contains n.tag)) with
+          | error e => rfl
+          | ok u2 =>
+            cases u2
+            dsimp only
+            cases mapNodesM (fun n => stepNodeOnRangeRead w.activeProtectors
+                ((ancestorPathTags w.nodes parentTag).contains n.tag) rangeOffset rangeLen n) w.nodes with
+            | error e => rfl
+            | ok nodes' => rfl
 
 theorem execFnEntryMutRetag_eq_upstream_when_no_implicitWrite
     (w : FnEntryBorrowWorld) (parentTag rangeOffset rangeLen : Nat) (requireInit : Bool) :
@@ -4235,6 +4664,9 @@ theorem execFnEntryMutRetagUpstream_ok_iff_sourceOrder_ok
         cases hlen : (rangeLen == 0) with
         | true => simp [hdis]
         | false =>
+          rcases Bool.eq_false_or_eq_true w.allocReadOnly with hro | hro
+          · simp [hro]
+          simp only [hro]
           cases hreq : (requireInit && !w.pointeeInitialized) with
           | true => simp [hdis]
           | false =>
@@ -4450,6 +4882,9 @@ theorem execFnEntryMutRetag_ok_iff_upstream_ok_iff_sourceOrder_ok
         | false =>
           have hlenNz : rangeLen ≠ 0 := fun h => by subst h; simp at hlen
           simp only [Bool.false_eq_true, ↓reduceIte]
+          rcases Bool.eq_false_or_eq_true w.allocReadOnly with hro | hro
+          · simp [hro]
+          simp only [hro]
           cases hreq : (requireInit && !w.pointeeInitialized) with
           | true =>
             simp
@@ -4668,6 +5103,9 @@ theorem execFnEntryMutRetagUpstream_eq_sourceOrder_of_writableAncestors
         cases hlen : (rangeLen == 0) with
         | true => simp [hdis]
         | false =>
+          rcases Bool.eq_false_or_eq_true w.allocReadOnly with hro | hro
+          · simp [hro]
+          simp only [hro]
           cases hreq : (requireInit && !w.pointeeInitialized) with
           | true => simp [hdis]
           | false =>
@@ -4716,6 +5154,10 @@ theorem execFnEntryMutRetag_eq_sourceOrder_of_writableAncestors
           | true => simp only [hlen, ↓reduceIte] at hup; cases hup
           | false =>
             simp only [hlen, Bool.false_eq_true, ↓reduceIte] at hup ⊢
+            rcases Bool.eq_false_or_eq_true w.allocReadOnly with hro | hro
+            · simp only [hro, ↓reduceIte] at hup ⊢
+              exact hup
+            simp only [hro] at hup ⊢
             cases hreq : (requireInit && !w.pointeeInitialized) with
             | true =>
               simp only [hreq, ↓reduceIte] at hup ⊢
@@ -5557,14 +5999,30 @@ inductive SafeThinRefErr where
   | unalignedSafePtr (requiredAlign : Nat) (addr : UInt64)
   deriving DecidableEq, Repr
 
-/-- Whether an `AllocInfo` entry represents dereferenceable memory (live allocation or `.static`/`.memory` global). -/
-def AllocInfo.isDereferenceableMemory (info : AllocInfo) : Bool :=
-  info.isLive || info.globalKind == some .static || info.globalKind == some .memory
+/-- Pointer-access check mirroring `Miri.Memory.checkAndDerefPtr` (`check_and_deref_ptr`) as consumed by
+`ValidityMachine.checkPointerAccessResult`:
+- a ZERO-sized access succeeds WITHOUT resolving the pointer or consulting any allocation, so dangling,
+  dead (use-after-free), or out-of-bounds provenance is irrelevant;
+- a non-zero access needs provenance into an allocation that `getAllocInfo` reports as non-`.dead`
+  with `[offset, offset + size)` in bounds (function / vtable / type-id globals expose `0` bytes, so
+  only live locals and `.static` / `.memory` globals are dereferenceable). -/
+def KeyedAllocWorld.checkPtrAccess (w : KeyedAllocWorld) (prov : Option (MiriAllocId × UInt64))
+    (sizeBytes : Nat) : Bool :=
+  if sizeBytes == 0 then true
+  else
+    match prov with
+    | none => false
+    | some (id, off) =>
+      match w.getAllocInfo id with
+      | some info => info.kind != .dead && decide (off.toNat + sizeBytes ≤ info.sizeBytes.toNat)
+      | none => false
 
 /-- Safe thin reference validator aligned with `Miri.Interpreter.ValidityVisitor.checkSafe` (`lines 205-228`)
 and `ValidityMachine.scalarMayBeNull`:
 1. Computes layout (must be sized).
-2. Checks pointer access FIRST via `w.getAllocInfo` (accepting live AND `.static`/`.memory` globals).
+2. Checks pointer access FIRST via `w.checkPtrAccess` (`getAllocInfo`-backed; zero-sized accesses never
+   dangle). A failing access through a provenance-free null address is classified as a null reference
+   (`DanglingIntPointer { addr: 0 }`), every other failure as dangling / out-of-bounds.
 3. Enforces provenance-agnostic `ptr.addr == 0` null rejection (`scalarMayBeNull`).
 4. Checks pointee inhabitedness.
 5. Checks alignment AFTER pointer access. -/
@@ -5574,28 +6032,13 @@ def validateSafeThinRef (w : KeyedAllocWorld) (pointee : ProtoTy) (ptr : ThinPtr
   | .error e => .error (.layoutFailed e)
   | .ok lay =>
     if !lay.isSized then .error .unsizedPointee
-    else
-      let accessOk : Bool :=
-        if lay.sizeBytes == 0 then
-          match ptr.prov with
-          | none => true
-          | some (id, off) =>
-            match w.getAllocInfo id with
-            | some info => info.isDereferenceableMemory && decide (off.toNat ≤ info.sizeBytes.toNat)
-            | none => false
-        else
-          match ptr.prov with
-          | none => false
-          | some (id, off) =>
-            match w.getAllocInfo id with
-            | some info =>
-              info.isDereferenceableMemory && decide (off.toNat + lay.sizeBytes ≤ info.sizeBytes.toNat)
-            | none => false
-      if !accessOk then .error .danglingOrOutOfBoundsSafePtr
-      else if ptr.addr == 0 then .error .nullSafePtr
-      else if !lay.isInhabited then .error .uninhabitedPointee
-      else if ptr.addr.toNat % lay.alignBytes != 0 then .error (.unalignedSafePtr lay.alignBytes ptr.addr)
-      else .ok ()
+    else if !w.checkPtrAccess ptr.prov lay.sizeBytes then
+      if ptr.prov.isNone && ptr.addr == 0 then .error .nullSafePtr
+      else .error .danglingOrOutOfBoundsSafePtr
+    else if ptr.addr == 0 then .error .nullSafePtr
+    else if !lay.isInhabited then .error .uninhabitedPointee
+    else if ptr.addr.toNat % lay.alignBytes != 0 then .error (.unalignedSafePtr lay.alignBytes ptr.addr)
+    else .ok ()
 
 /-- `validateSafeThinRef` matches `ValidityVisitor.checkSafe`:
 1. `&u32` into an uncached `.static` global (present in `w.globals`, absent from `w.table.live`) succeeds.
@@ -5614,13 +6057,46 @@ theorem validateSafeThinRef_staticGlobal_nullProv_and_accessOrder :
     simp [KeyedAllocWorld.empty, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?,
       ExtTreeMap0.get?_empty, ExtTreeMap0.get?_insert_self,
-      computeTyLayout, AllocInfo.isDereferenceableMemory]
+      computeTyLayout, KeyedAllocWorld.checkPtrAccess, GlobalAllocEntry.toAllocInfo]
   · unfold validateSafeThinRef
-    simp [KeyedAllocWorld.empty, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
-      KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?,
-      ExtTreeMap0.get?_empty, ExtTreeMap0.get?_insert_self,
-      computeTyLayout, AllocInfo.isDereferenceableMemory]
+    simp [computeTyLayout, KeyedAllocWorld.checkPtrAccess]
   · rfl
+
+/-- Zero-sized safe references never dangle (`check_and_deref_ptr`: "everything is okay with size 0"):
+for EVERY world and EVERY provenance — including provenance into a freed, never-registered, or
+out-of-bounds allocation — `&()` is valid iff its address is non-null. -/
+theorem validateSafeThinRef_zst_never_dangles (w : KeyedAllocWorld) (ptr : ThinPtrVal) :
+    validateSafeThinRef w .unit ptr =
+      if ptr.addr == 0 then .error .nullSafePtr else .ok () := by
+  unfold validateSafeThinRef
+  simp [computeTyLayout, KeyedAllocWorld.checkPtrAccess, Nat.mod_one]
+
+/-- Non-zero-sized safe references: a provenance-free null address is reported as a NULL reference
+(`DanglingIntPointer { addr: 0 }`), a provenance-free non-null address as dangling, and provenance into
+a tombstoned allocation (use-after-free) or a `0`-byte function / vtable global as dangling — even at
+a well-aligned non-null address. -/
+theorem validateSafeThinRef_nullInt_dead_and_fnGlobal_classification
+    (w : KeyedAllocWorld) (deadId fnId : MiriAllocId) (d : DeadAllocEntry) (g : GlobalAllocEntry)
+    (hdeadNotLive : w.findLive? deadId = none) (hdeadNotGlobal : w.findGlobal? deadId = none)
+    (hdead : w.findDead? deadId = some d)
+    (hfnNotLive : w.findLive? fnId = none) (hfn : w.findGlobal? fnId = some g)
+    (hfnKind : g.kind = .function ∨ g.kind = .vtable ∨ g.kind = .typeId) :
+    validateSafeThinRef w (.uint 4) ⟨0, none⟩ = .error .nullSafePtr ∧
+    validateSafeThinRef w (.uint 4) ⟨16, none⟩ = .error .danglingOrOutOfBoundsSafePtr ∧
+    validateSafeThinRef w (.uint 4) ⟨16, some (deadId, 0)⟩ = .error .danglingOrOutOfBoundsSafePtr ∧
+    validateSafeThinRef w (.uint 4) ⟨16, some (fnId, 0)⟩ = .error .danglingOrOutOfBoundsSafePtr := by
+  have hdeadInfo := ((keyedGetAllocInfo_dead_and_unavailable w deadId hdeadNotLive hdeadNotGlobal).1 d hdead).1
+  have hfnInfo := keyedGetAllocInfo_global_kinds w fnId g hfnNotLive hfn
+  have hfnSize : g.toAllocInfo.sizeBytes = 0 := (hfnInfo.2.1 hfnKind).1
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · unfold validateSafeThinRef
+    simp [computeTyLayout, KeyedAllocWorld.checkPtrAccess]
+  · unfold validateSafeThinRef
+    simp [computeTyLayout, KeyedAllocWorld.checkPtrAccess]
+  · unfold validateSafeThinRef
+    simp [computeTyLayout, KeyedAllocWorld.checkPtrAccess, hdeadInfo]
+  · unfold validateSafeThinRef
+    simp [computeTyLayout, KeyedAllocWorld.checkPtrAccess, hfnInfo.1, hfnSize]
 
 /-! ### 3B. Principal-Less Auto-Trait `dyn Send` VTables (`lean-miri#75`), `VTableWorldWF`, & `SaltedVTableWorldWF` -/
 
@@ -6870,9 +7346,11 @@ theorem saltedVTable_distinct_salts_distinct_allocIds_both_valid
 
 /-- Safe wide-`dyn` pointer validator matching `Miri.Interpreter.ValidityVisitor.checkSafe` (`lines 202-228`, `lean-miri#82`):
 1. VTable metadata check FIRST (precedes ALL data-pointer UB).
-2. If `!mayDangle`: pointer access check (where bare null / `danglingInt 0` classifies as `.nullSafePointer`
-   while provenanced `.maybeNull` checks allocation liveness/bounds BEFORE null).
-   If `mayDangle`: `addressTooClose` check (`addr + size ≥ 2^64 - 1`).
+2. If `!mayDangle`: pointer access check `w.checkPtrAccess` (where bare null / `danglingInt 0` classifies as
+   `.nullSafePointer`, provenanced `.maybeNull` checks allocation liveness/bounds BEFORE null, and a
+   zero-sized concrete pointee never dangles).
+   If `mayDangle`: `addressTooClose` check (`addr + size ≥ 2^64 - 1`) on the pointer's absolute address,
+   for integer AND provenanced pointers alike (Miri provenance has `OFFSET_IS_ADDR = true`).
 3. Null check (`scalarMayBeNull`).
 4. Alignment check (BEFORE concrete-pointee inhabitedness!).
 5. Optional byte-free concrete-pointee inhabitedness summary when `recursive && !mayDangle`. -/
@@ -6894,19 +7372,13 @@ def validateWideDynSafePtr (w : KeyedAllocWorld) (reg : VTableRegistry)
           else if size == 0 then .ok addr
           else .error (.danglingOrOutOfBoundsData addr)
         | .maybeNull id off addr =>
-          match w.getAllocInfo id with
-          | some info =>
-            if info.isDereferenceableMemory && decide (off.toNat + size.toNat ≤ info.sizeBytes.toNat) then
-              if addr == 0 then .error .nullSafePointer else .ok addr
-            else .error (.danglingOrOutOfBoundsData addr)
-          | none => .error (.danglingOrOutOfBoundsData addr)
+          if w.checkPtrAccess (some (id, off)) size.toNat then
+            if addr == 0 then .error .nullSafePointer else .ok addr
+          else .error (.danglingOrOutOfBoundsData addr)
         | .provenanced id off addr =>
-          match w.getAllocInfo id with
-          | some info =>
-            if info.isDereferenceableMemory && decide (off.toNat + size.toNat ≤ info.sizeBytes.toNat) then
-              if addr == 0 then .error .nullSafePointer else .ok addr
-            else .error (.danglingOrOutOfBoundsData addr)
-          | none => .error (.danglingOrOutOfBoundsData addr)
+          if w.checkPtrAccess (some (id, off)) size.toNat then
+            if addr == 0 then .error .nullSafePointer else .ok addr
+          else .error (.danglingOrOutOfBoundsData addr)
       else
         match dptr with
         | .null =>
@@ -6917,9 +7389,13 @@ def validateWideDynSafePtr (w : KeyedAllocWorld) (reg : VTableRegistry)
           else if addr == 0 then .error .nullSafePointer
           else .ok addr
         | .maybeNull _ _ addr =>
-          if addr == 0 then .error .nullSafePointer else .ok addr
+          if addr.toNat + size.toNat ≥ usizeMax64 then .error (.addressTooClose size)
+          else if addr == 0 then .error .nullSafePointer
+          else .ok addr
         | .provenanced _ _ addr =>
-          if addr == 0 then .error .nullSafePointer else .ok addr
+          if addr.toNat + size.toNat ≥ usizeMax64 then .error (.addressTooClose size)
+          else if addr == 0 then .error .nullSafePointer
+          else .ok addr
     match stepAccess with
     | .error e => .error e
     | .ok addr =>
@@ -7028,21 +7504,54 @@ theorem wideDyn_validVTable_dangling_and_unaligned
       .error (.danglingOrOutOfBoundsData 16) ∧
     validateWideDynSafePtr w reg vptr (.provenanced liveId 0 2) expected false false =
       .error (.unalignedSafePointer 4 2) := by
-  have hinfo : w.getAllocInfo liveId = some ⟨liveEntry.sizeBytes, liveEntry.alignPow2, liveEntry.mutability, true, none⟩ := by
+  have hinfo : w.getAllocInfo liveId = some ⟨liveEntry.sizeBytes, liveEntry.alignPow2, .liveData, liveEntry.mutability⟩ := by
     simp [KeyedAllocWorld.getAllocInfo, hlive]
   have hle : 4 ≤ liveEntry.sizeBytes.toNat := hbounds
   constructor
   · simp [validateWideDynSafePtr, hvt, hsz]
-  · simp [validateWideDynSafePtr, hvt, hsz, hal, hinfo, AllocInfo.isDereferenceableMemory, hle]; rfl
+  · simp [validateWideDynSafePtr, hvt, hsz, hal, hinfo, KeyedAllocWorld.checkPtrAccess, hle]; rfl
 
+/-- Access-before-null for provenanced maybe-null data pointers with a NON-zero-sized concrete pointee:
+a zero-address pointer into a never-registered OR tombstoned (use-after-free) allocation reports
+dangling, not null. -/
 theorem wideDyn_validVTable_maybeNull_dangling_precedes_null
     (w : KeyedAllocWorld) (reg : VTableRegistry) (vptr : VTablePtrVal)
     (expected : DynExistentialSpec) (vt : VTableData) (deadId : MiriAllocId)
     (hvt : validateVTableHalf w reg vptr expected = .ok vt)
-    (hnoInfo : w.getAllocInfo deadId = none) :
+    (hsz : vt.sizeBytes ≠ 0)
+    (hnoLiveInfo : ∀ info, w.getAllocInfo deadId = some info → info.kind = .dead) :
     validateWideDynSafePtr w reg vptr (.maybeNull deadId 0 0) expected false false =
       .error (.danglingOrOutOfBoundsData 0) := by
-  simp [validateWideDynSafePtr, hvt, hnoInfo]
+  have hszNat : (vt.sizeBytes.toNat == 0) = false := by
+    cases hb : (vt.sizeBytes.toNat == 0) with
+    | false => rfl
+    | true =>
+      exfalso
+      apply hsz
+      have h0 : vt.sizeBytes.toNat = 0 := eq_of_beq hb
+      exact UInt64.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq h0)
+  have hacc : w.checkPtrAccess (some (deadId, 0)) vt.sizeBytes.toNat = false := by
+    cases hinfo : w.getAllocInfo deadId with
+    | none => simp [KeyedAllocWorld.checkPtrAccess, hszNat, hinfo]
+    | some info => simp [KeyedAllocWorld.checkPtrAccess, hszNat, hinfo, hnoLiveInfo info hinfo]
+  simp [validateWideDynSafePtr, hvt, hacc]
+
+/-- Zero-sized concrete pointees never dangle behind a wide `dyn` pointer: with a `0`-byte align-`1`
+vtable type, a non-null provenanced data pointer into ANY allocation (freed, never registered, or out
+of bounds) is accepted, and a zero-address one reports null (never dangling). -/
+theorem wideDyn_zstConcrete_never_dangles
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (vptr : VTablePtrVal)
+    (expected : DynExistentialSpec) (vt : VTableData)
+    (id : MiriAllocId) (off addr : UInt64)
+    (hvt : validateVTableHalf w reg vptr expected = .ok vt)
+    (hsz : vt.sizeBytes = 0) (hal : vt.alignPow2 = 0) (haddr : addr ≠ 0) :
+    validateWideDynSafePtr w reg vptr (.provenanced id off addr) expected false false = .ok vt ∧
+    validateWideDynSafePtr w reg vptr (.maybeNull id off addr) expected false false = .ok vt ∧
+    validateWideDynSafePtr w reg vptr (.maybeNull id off 0) expected false false =
+      .error .nullSafePointer := by
+  have haddrF : (addr == 0) = false := beq_false_of_ne haddr
+  refine ⟨?_, ?_, ?_⟩ <;>
+    simp [validateWideDynSafePtr, hvt, hsz, hal, haddrF, KeyedAllocWorld.checkPtrAccess]
 
 theorem wideDyn_validVTable_danglingIntZero_reports_null
     (w : KeyedAllocWorld) (reg : VTableRegistry) (vptr : VTablePtrVal)
@@ -7065,6 +7574,23 @@ theorem wideDyn_mayDangle_addressTooClose_and_uninhabited_concrete_ok
   · simp [validateWideDynSafePtr, hvt, hsz, usizeMax64]
   · simp [validateWideDynSafePtr, hvt, hsz, hal, usizeMax64]
 
+/-- Under `mayDangle`, the address-space-end check applies to PROVENANCED data pointers as well (Miri
+pointers carry absolute addresses, so `try_to_scalar_int` succeeds on them): a provenanced or
+maybe-null pointer at `usize::MAX - 4` to a 4-byte pointee reports `.addressTooClose`, never `.ok`. -/
+theorem wideDyn_mayDangle_provenanced_addressTooClose
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (vptr : VTablePtrVal)
+    (expected : DynExistentialSpec) (vt : VTableData) (id : MiriAllocId) (off : UInt64)
+    (recursive : Bool)
+    (hvt : validateVTableHalf w reg vptr expected = .ok vt)
+    (hsz : vt.sizeBytes = 4) :
+    validateWideDynSafePtr w reg vptr
+      (.provenanced id off (UInt64.ofNat (usizeMax64 - 4))) expected true recursive =
+      .error (.addressTooClose 4) ∧
+    validateWideDynSafePtr w reg vptr
+      (.maybeNull id off (UInt64.ofNat (usizeMax64 - 4))) expected true recursive =
+      .error (.addressTooClose 4) := by
+  constructor <;> simp [validateWideDynSafePtr, hvt, hsz, usizeMax64]
+
 theorem wideDyn_unaligned_precedes_concrete_uninhabited
     (w : KeyedAllocWorld) (reg : VTableRegistry) (vptr : VTablePtrVal)
     (expected : DynExistentialSpec) (vt : VTableData)
@@ -7081,14 +7607,14 @@ theorem wideDyn_unaligned_precedes_concrete_uninhabited
     validateWideDynSafePtr w reg vptr (.provenanced liveId 0 16) expected false false = .ok vt ∧
     validateWideDynSafePtr w reg vptr (.provenanced liveId 0 16) expected false true =
       .error .uninhabitedPointee := by
-  have hinfo : w.getAllocInfo liveId = some ⟨liveEntry.sizeBytes, liveEntry.alignPow2, liveEntry.mutability, true, none⟩ := by
+  have hinfo : w.getAllocInfo liveId = some ⟨liveEntry.sizeBytes, liveEntry.alignPow2, .liveData, liveEntry.mutability⟩ := by
     simp [KeyedAllocWorld.getAllocInfo, hlive]
   have hle : 4 ≤ liveEntry.sizeBytes.toNat := hbounds
   refine ⟨?_, ?_, ?_, ?_⟩
-  · simp [validateWideDynSafePtr, hvt, hsz, hal, hinfo, AllocInfo.isDereferenceableMemory, hle]; rfl
-  · simp [validateWideDynSafePtr, hvt, hsz, hal, hinfo, AllocInfo.isDereferenceableMemory, hle]; rfl
-  · simp [validateWideDynSafePtr, hvt, hsz, hal, hinfo, AllocInfo.isDereferenceableMemory, hle]
-  · simp [validateWideDynSafePtr, hvt, hsz, hal, hconc, hinfo, AllocInfo.isDereferenceableMemory, hle,
+  · simp [validateWideDynSafePtr, hvt, hsz, hal, hinfo, KeyedAllocWorld.checkPtrAccess, hle]; rfl
+  · simp [validateWideDynSafePtr, hvt, hsz, hal, hinfo, KeyedAllocWorld.checkPtrAccess, hle]; rfl
+  · simp [validateWideDynSafePtr, hvt, hsz, hal, hinfo, KeyedAllocWorld.checkPtrAccess, hle]
+  · simp [validateWideDynSafePtr, hvt, hsz, hal, hconc, hinfo, KeyedAllocWorld.checkPtrAccess, hle,
       computeTyLayout, computeFieldsLayout, alignUpNat, maxObjectSize64]
 
 theorem rawWideDyn_vtable_checked_data_unchecked
@@ -7204,15 +7730,15 @@ def decodeLeUInt64 : List (UInt8 × Option MiriAllocId) → UInt64
 /-- Nested safe reference check under `childSession` (`flags.mayDangle = true, refTracking = none`):
 - Accepts aligned non-null dangling integer `&u32` (does NOT check allocation liveness).
 - Rejects zero-address pointers (provenance-agnostic `scalarMayBeNull`), `&!`, unaligned addresses,
-  and dangling integer addresses too close to address-space end. -/
+  and addresses too close to the address-space end (`addr + size ≥ 2^64 - 1`) — for integer AND
+  provenanced pointers alike, since Miri pointers carry absolute addresses (`OFFSET_IS_ADDR = true`). -/
 def checkNestedSafeRefChildSession (inner : ProtoTy) (rawBytes : List (UInt8 × Option MiriAllocId)) :
     Except PointeeByteErr Unit :=
   match computeTyLayout inner with
   | .error e => .error (.layoutErr e)
   | .ok lay =>
     let addr := decodeLeUInt64 rawBytes
-    let hasProv := rawBytes.any (fun p => p.2.isSome)
-    if !hasProv && addr.toNat + lay.sizeBytes ≥ usizeMax64 then
+    if addr.toNat + lay.sizeBytes ≥ usizeMax64 then
       .error (.nestedAddressTooClose (UInt64.ofNat lay.sizeBytes))
     else if addr == 0 then
       .error .nestedNullSafeRef
@@ -7221,6 +7747,16 @@ def checkNestedSafeRefChildSession (inner : ProtoTy) (rawBytes : List (UInt8 × 
     else if lay.alignBytes > 1 && addr.toNat % lay.alignBytes != 0 then
       .error (.nestedUnalignedSafeRef (UInt64.ofNat lay.alignBytes) addr)
     else .ok ()
+
+/-- Under `childSession` (`mayDangle = true`) the address-space-end check is provenance-agnostic:
+a nested `&u32` whose 8 data bytes encode `usize::MAX - 4` is rejected with `.nestedAddressTooClose`
+whether or not the bytes carry provenance (Miri pointers carry absolute addresses). -/
+theorem checkNestedSafeRefChildSession_addressTooClose_ignores_provenance (prov : Option MiriAllocId) :
+    checkNestedSafeRefChildSession (.uint 4)
+      [(0xFB, prov), (0xFF, prov), (0xFF, prov), (0xFF, prov),
+       (0xFF, prov), (0xFF, prov), (0xFF, prov), (0xFF, prov)] =
+      .error (.nestedAddressTooClose 4) := by
+  rfl
 
 mutual
 /-- Recursive pointee byte visitor matching `ValidityVisitor.visit` (`lines 300-471`):
@@ -7405,7 +7941,7 @@ theorem wideDyn_recursive_bytes_and_childSession_mayDangle :
       ExtTreeMap0.get?_insert,
       buildPrincipalLessVTable, vtableMatchesExpectedSpec, canonicalNonAutoPredIds,
       DynExistentialSpec.effectivePreds, sortDedupKeyIds,
-      AllocInfo.isDereferenceableMemory, visitTrackedConcretePointee, visitConcreteValue,
+      KeyedAllocWorld.checkPtrAccess, visitTrackedConcretePointee, visitConcreteValue,
       readInitBytesAt, readInitBytesAt.go, encodeLeUInt64Bytes, decodeLeUInt64,
       checkNestedSafeRefChildSession, computeTyLayout, usizeMax64]
     try rfl
@@ -7466,32 +8002,32 @@ theorem wideDyn_recursive_aggregate_char_fnPtr_contents :
     simp [KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?, ExtTreeMap0.get?_insert,
       buildPrincipalLessVTable, vtableMatchesExpectedSpec, canonicalNonAutoPredIds,
-      DynExistentialSpec.effectivePreds, sortDedupKeyIds, AllocInfo.isDereferenceableMemory]
+      DynExistentialSpec.effectivePreds, sortDedupKeyIds, KeyedAllocWorld.checkPtrAccess]
   · unfold validateWideDynSafePtrWithBytes validateWideDynSafePtr validateVTableHalf
     simp [KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?, ExtTreeMap0.get?_insert,
       buildPrincipalLessVTable, vtableMatchesExpectedSpec, canonicalNonAutoPredIds,
-      DynExistentialSpec.effectivePreds, sortDedupKeyIds, AllocInfo.isDereferenceableMemory, hv1]
+      DynExistentialSpec.effectivePreds, sortDedupKeyIds, KeyedAllocWorld.checkPtrAccess, hv1]
   · unfold validateWideDynSafePtrWithBytes validateWideDynSafePtr validateVTableHalf
     simp [KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?, ExtTreeMap0.get?_insert,
       buildPrincipalLessVTable, vtableMatchesExpectedSpec, canonicalNonAutoPredIds,
-      DynExistentialSpec.effectivePreds, sortDedupKeyIds, AllocInfo.isDereferenceableMemory, hv2]
+      DynExistentialSpec.effectivePreds, sortDedupKeyIds, KeyedAllocWorld.checkPtrAccess, hv2]
   · unfold validateWideDynSafePtrWithBytes validateWideDynSafePtr validateVTableHalf
     simp [KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?, ExtTreeMap0.get?_insert,
       buildPrincipalLessVTable, vtableMatchesExpectedSpec, canonicalNonAutoPredIds,
-      DynExistentialSpec.effectivePreds, sortDedupKeyIds, AllocInfo.isDereferenceableMemory, hv3]
+      DynExistentialSpec.effectivePreds, sortDedupKeyIds, KeyedAllocWorld.checkPtrAccess, hv3]
   · unfold validateWideDynSafePtrWithBytes validateWideDynSafePtr validateVTableHalf
     simp [KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?, ExtTreeMap0.get?_insert,
       buildPrincipalLessVTable, vtableMatchesExpectedSpec, canonicalNonAutoPredIds,
-      DynExistentialSpec.effectivePreds, sortDedupKeyIds, AllocInfo.isDereferenceableMemory, hv4]
+      DynExistentialSpec.effectivePreds, sortDedupKeyIds, KeyedAllocWorld.checkPtrAccess, hv4]
   · unfold validateWideDynSafePtrWithBytes validateWideDynSafePtr validateVTableHalf
     simp [KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?, ExtTreeMap0.get?_insert,
       buildPrincipalLessVTable, vtableMatchesExpectedSpec, canonicalNonAutoPredIds,
-      DynExistentialSpec.effectivePreds, sortDedupKeyIds, AllocInfo.isDereferenceableMemory, hv5]
+      DynExistentialSpec.effectivePreds, sortDedupKeyIds, KeyedAllocWorld.checkPtrAccess, hv5]
 
 /-- Field-before-inhabited precedence, provenance-agnostic zero-address `fn()` rejection,
 `O(1)` ZST-array index-`0` fast path (`[(); usize::MAX]`, `[!; 0]`, `[!; usize::MAX]`),
@@ -7557,21 +8093,21 @@ theorem wideDyn_recursive_fieldOrder_nullProvFn_zstArray_and_fuel :
     simp [KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?, ExtTreeMap0.get?_insert,
       buildPrincipalLessVTable, vtableMatchesExpectedSpec, canonicalNonAutoPredIds,
-      DynExistentialSpec.effectivePreds, sortDedupKeyIds, AllocInfo.isDereferenceableMemory,
+      DynExistentialSpec.effectivePreds, sortDedupKeyIds, KeyedAllocWorld.checkPtrAccess,
       visitTrackedConcretePointee, visitConcreteValue, visitFieldList, fieldByteOffsets,
       fieldByteOffsetsAux, alignUpNat, readInitBytesAt, readInitBytesAt.go, computeTyLayout]
   · unfold validateWideDynSafePtrWithBytes validateWideDynSafePtr validateVTableHalf
     simp [KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?, ExtTreeMap0.get?_insert,
       buildPrincipalLessVTable, vtableMatchesExpectedSpec, canonicalNonAutoPredIds,
-      DynExistentialSpec.effectivePreds, sortDedupKeyIds, AllocInfo.isDereferenceableMemory,
+      DynExistentialSpec.effectivePreds, sortDedupKeyIds, KeyedAllocWorld.checkPtrAccess,
       visitTrackedConcretePointee, visitConcreteValue, visitFieldList, fieldByteOffsets,
       fieldByteOffsetsAux, alignUpNat, readInitBytesAt, readInitBytesAt.go, computeTyLayout]
   · unfold validateWideDynSafePtrWithBytes validateWideDynSafePtr validateVTableHalf
     simp [KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?, ExtTreeMap0.get?_insert,
       buildPrincipalLessVTable, vtableMatchesExpectedSpec, canonicalNonAutoPredIds,
-      DynExistentialSpec.effectivePreds, sortDedupKeyIds, AllocInfo.isDereferenceableMemory,
+      DynExistentialSpec.effectivePreds, sortDedupKeyIds, KeyedAllocWorld.checkPtrAccess,
       visitTrackedConcretePointee, visitConcreteValue, readInitBytesAt, readInitBytesAt.go,
       encodeLeUInt64Bytes, decodeLeUInt64]
   · unfold validateWideDynSafePtrWithBytes validateWideDynSafePtr validateVTableHalf
@@ -7593,7 +8129,7 @@ theorem wideDyn_recursive_fieldOrder_nullProvFn_zstArray_and_fuel :
     simp [KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
       KeyedAllocWorld.findLive?, KeyedAllocWorld.findGlobal?, ExtTreeMap0.get?_insert,
       buildPrincipalLessVTable, vtableMatchesExpectedSpec, canonicalNonAutoPredIds,
-      DynExistentialSpec.effectivePreds, sortDedupKeyIds, AllocInfo.isDereferenceableMemory,
+      DynExistentialSpec.effectivePreds, sortDedupKeyIds, KeyedAllocWorld.checkPtrAccess,
       visitTrackedConcretePointee, hdeep]
 
 end Anneal.ExtTreeMapAllocAndNoWritable
