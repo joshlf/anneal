@@ -939,6 +939,16 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         assert runner.lean_release_findings(sym_anc / "toolchain-fixture", anc_release) == [], \
             runner.lean_release_findings(sym_anc / "toolchain-fixture", anc_release)
         sym_anc.unlink()
+        ww_anc = suite / "ww-anc-no-sticky"
+        ww_anc.mkdir()
+        ww_tc = ww_anc / "tc"
+        ww_tc.mkdir()
+        ww_anc.chmod(0o777)  # no S_ISVTX: allows rename-swap of `tc`
+        ww_tc.chmod(0o755)
+        ww_problems = runner.lean_release_findings(ww_tc, anc_release)
+        assert any("without root/owner sticky protection" in p for p in ww_problems), ww_problems
+        ww_anc.chmod(0o755)
+        shutil.rmtree(ww_anc)
         prefix.chmod(0o777)
         expect_finding(clean, "toolchain root is world-writable")
         prefix.chmod(0o755)

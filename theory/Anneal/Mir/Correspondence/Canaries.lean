@@ -284,6 +284,39 @@ theorem canary_D9_subslice_move_window :
     bothObs (d9Prog d9MoveSub 2) = (.ub .invalidUninitBytes, .ub .invalidUninitBytes) := by
   decide
 
+/-- `ConstantIndex` minimum-length check (`minLen > n` faults with `.ub .outOfBounds`),
+valid `fromEnd = true` element move (`_1[-1]` = `_1[3] = 13`), and malformed
+`fromEnd = true` `off = 0` / `off > minLen` failing closed with `.unsupported`
+instead of `Nat`-underflowing to `_1[0]`. -/
+def d9ConstIndexBoundsProg (proj : ProjectionElem) : V2026Prog := prog1 <| mkBody "d9ci" 0
+  [tU8, tArr4]
+  [blk [asg (loc 1) (.aggregate (.array tU8) [cU8 10, cU8 11, cU8 12, cU8 13]),
+        asg (loc 0) (.use (.move ⟨1, [proj]⟩))] .return_]
+
+theorem canary_D9_constIndex_minLen_and_fromEnd_bounds :
+    bothObs (d9ConstIndexBoundsProg (.constantIndex 0 5 false)) =
+      (.ub .outOfBounds, .ub .outOfBounds) ∧
+    bothObs (d9ConstIndexBoundsProg (.constantIndex 1 4 true)) =
+      (.returned (some 13) 1, .returned (some 13) 1) ∧
+    bothObs (d9ConstIndexBoundsProg (.constantIndex 0 4 true)) =
+      (.unsupported, .unsupported) ∧
+    bothObs (d9ConstIndexBoundsProg (.constantIndex 5 4 true)) =
+      (.unsupported, .unsupported) := by
+  decide
+
+/-- `Subslice` with `fromEnd = true` and `fromIdx + toIdx > n` (`_1[0..-5]` on
+`[u8; 4]`) faults with `.ub .outOfBounds` rather than `Nat`-underflowing `4 - 5 = 0`
+into an empty subslice. -/
+def d9SubsliceFromEndOobProg : V2026Prog := prog1 <| mkBody "d9sub" 0
+  [tU8, tArr4, { kind := .array (.uint .u8) 0, layoutIdx := 0 }]
+  [blk [asg (loc 1) (.aggregate (.array tU8) [cU8 10, cU8 11, cU8 12, cU8 13]),
+        asg (loc 2) (.use (.move ⟨1, [.subslice 0 5 true]⟩)),
+        asg (loc 0) (.use (cU8 1))] .return_]
+
+theorem canary_D9_subslice_fromEnd_underflow_ub :
+    bothObs d9SubsliceFromEndOobProg = (.ub .outOfBounds, .ub .outOfBounds) := by
+  decide
+
 /-! ## Live `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` canaries
 
 Concrete runs of the Episode 1 consumer-side move deinitialization

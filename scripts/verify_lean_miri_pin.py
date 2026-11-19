@@ -1728,12 +1728,16 @@ def elf_dynamic_entries(
                     raise ValueError("PT_LOAD segment overruns EOF")
                 if p_filesz > p_memsz:
                     raise ValueError("PT_LOAD segment has p_filesz > p_memsz")
+                if p_vaddr + p_memsz > (1 << 64):
+                    raise ValueError("PT_LOAD segment overflows 64-bit address space")
                 loads.append((p_vaddr, p_offset, p_filesz, p_memsz))
             elif p_type == 2:  # PT_DYNAMIC
                 if dynamic is not None:
                     raise ValueError("more than one PT_DYNAMIC segment")
                 if p_offset + p_filesz > file_size or p_filesz > p_memsz:
                     raise ValueError("truncated PT_DYNAMIC segment")
+                if p_vaddr + p_memsz > (1 << 64):
+                    raise ValueError("PT_DYNAMIC segment overflows 64-bit address space")
                 dynamic = (p_vaddr, p_offset, p_filesz, p_memsz)
             elif p_type == 3:  # PT_INTERP
                 if interp is not None:
@@ -1759,8 +1763,8 @@ def elf_dynamic_entries(
                 or ipath.endswith("/")
                 or any(part in ("", ".", "..") for part in iparts[1:])
                 or not all(0x21 <= ord(ch) <= 0x7E for ch in ipath)
-                or iparts[1] == "tmp"
-                or iparts[1:3] in (["var", "tmp"], ["dev", "shm"])
+                or iparts[1] in ("tmp", "proc", "sys", "dev", "run")
+                or iparts[1:3] in (["var", "tmp"], ["var", "run"], ["usr", "tmp"])
             ):
                 raise ValueError(f"invalid PT_INTERP path {ipath!r}")
             if dynamic is None:
@@ -2110,6 +2114,27 @@ def _load_toolchain_pin(path: Path, c: _Collector) -> Optional[Dict[str, Any]]:
     return pin if len(c.errors) == before else None
 
 
+def _ancestor_rename_problem(real_root_path: Path) -> Optional[str]:
+    """Why an ancestor above `real_root_path` allows an unprivileged local user
+    to `rename()`-swap the toolchain directory after admission."""
+    uid = os.getuid() if hasattr(os, "getuid") else -1
+    for anc in real_root_path.parents:
+        try:
+            anc_st = os.lstat(anc)
+        except OSError as exc:
+            return f"toolchain ancestor directory {anc} is unreadable ({exc.strerror})"
+        if stat.S_ISLNK(anc_st.st_mode) or not stat.S_ISDIR(anc_st.st_mode):
+            return f"toolchain ancestor {anc} is not a real directory"
+        if (anc_st.st_mode & stat.S_IWOTH) and (
+            not (anc_st.st_mode & stat.S_ISVTX) or anc_st.st_uid not in (0, uid)
+        ):
+            return (
+                f"toolchain ancestor directory {anc} is world-writable without root/owner sticky "
+                "protection (allows rename-swap of the toolchain)"
+            )
+    return None
+
+
 def _verify_toolchain_impl(
     repo_root: Path,
     expected_toolchain: Optional[str],
@@ -2146,10 +2171,16 @@ def _verify_toolchain_impl(
     if _lstat_real_dir(toolchain_dir, f"toolchain root {toolchain_dir}", c, "toolchain") is None:
         c.fatal("toolchain", f"active toolchain {name!r} is not installed as a real directory at {toolchain_dir}")
     real_root = os.path.realpath(toolchain_dir)
+    exec_tc_dir = Path(real_root)
+    if exec_tc_dir != toolchain_dir and _lstat_real_dir(exec_tc_dir, f"resolved toolchain root {exec_tc_dir}", c, "toolchain") is None:
+        c.fatal("toolchain", f"active toolchain {name!r} is not installed as a real directory at {exec_tc_dir}")
+    anc_problem = _ancestor_rename_problem(exec_tc_dir)
+    if anc_problem is not None:
+        c.err("toolchain", anc_problem)
 
     for rel in ("bin", "lib", "lib/lean"):
-        _check_toolchain_path(toolchain_dir, real_root, rel, want_dir=True, c=c)
-    parent_lib_dir = toolchain_dir / "lib"
+        _check_toolchain_path(exec_tc_dir, real_root, rel, want_dir=True, c=c)
+    parent_lib_dir = exec_tc_dir / "lib"
     try:
         parent_lib_names = sorted(entry.name for entry in os.scandir(parent_lib_dir))
     except OSError as exc:
@@ -2160,7 +2191,7 @@ def _verify_toolchain_impl(
         if _SYSTEM_SONAME_RE.match(n):
             c.err("toolchain", f"system soname planted in a toolchain RUNPATH directory: lib/{n}")
     try:
-        bin_names = sorted(entry.name for entry in os.scandir(toolchain_dir / "bin"))
+        bin_names = sorted(entry.name for entry in os.scandir(exec_tc_dir / "bin"))
     except OSError as exc:
         c.fatal("toolchain", f"cannot list bin in the toolchain: {exc.strerror}")
     # Every `bin/*` entry is a candidate: hashed and, under the locked release
@@ -2168,7 +2199,7 @@ def _verify_toolchain_impl(
     # companion executable (`leanc`, `leanchecker`, ...) nor a planted extra
     # one (e.g. a `bin/ld` that `clang` would prefer) can hide.
     candidates = [f"bin/{n}" for n in bin_names]
-    lib_dir = toolchain_dir / "lib" / "lean"
+    lib_dir = exec_tc_dir / "lib" / "lean"
     try:
         lib_names = sorted(entry.name for entry in os.scandir(lib_dir))
     except OSError as exc:
@@ -2180,11 +2211,11 @@ def _verify_toolchain_impl(
 
     files: Dict[str, str] = {}
     for rel in candidates:
-        st = _check_toolchain_path(toolchain_dir, real_root, rel, want_dir=False, c=c)
+        st = _check_toolchain_path(exec_tc_dir, real_root, rel, want_dir=False, c=c)
         if st is None:
             continue
         try:
-            files[rel] = _hash_open_file(toolchain_dir / rel, want_blob=False, expect=st)[0]
+            files[rel] = _hash_open_file(exec_tc_dir / rel, want_blob=False, expect=st)[0]
         except (OSError, ValueError) as exc:
             c.err("toolchain", f"cannot hash {rel}: {exc}")
     libleanshared = tuple(n for n in lib_names if _LIBLEANSHARED_RE.match(n))
@@ -2231,7 +2262,7 @@ def _verify_toolchain_impl(
     elf_rels = [rel for rel in candidates if rel in pinned_files and (rel in RUNPATH_CHECKED_BINARIES or rel.startswith("lib/lean/"))]
     # ld.so resolution of every DT_NEEDED soname through DT_RUNPATH must land on
     # a pinned/verified file (checked before anything in the toolchain is executed).
-    _check_runpath_shadowing(toolchain_dir, real_root, elf_rels, pinned_files, c)
+    _check_runpath_shadowing(exec_tc_dir, real_root, elf_rels, pinned_files, c)
 
     if active_pin is not None:
         errors_before_lock = len(c.errors)
@@ -2248,8 +2279,8 @@ def _verify_toolchain_impl(
         # Fail closed: never execute a toolchain whose files or pinned digests failed the checks.
         c.err("toolchain", "skipped `bin/lean --version` / `bin/lake --version`: toolchain file checks failed")
     else:
-        lean_version = _run_version(toolchain_dir / "bin" / "lean", "bin/lean", timeout, c) or ""
-        lake_version = _run_version(toolchain_dir / "bin" / "lake", "bin/lake", timeout, c) or ""
+        lean_version = _run_version(exec_tc_dir / "bin" / "lean", "bin/lean", timeout, c) or ""
+        lake_version = _run_version(exec_tc_dir / "bin" / "lake", "bin/lake", timeout, c) or ""
         if active_pin is not None:
             errors_before_ver = len(c.errors)
             _compare_toolchain_pin_versions(active_pin, {"bin/lean": lean_version, "bin/lake": lake_version}, c)

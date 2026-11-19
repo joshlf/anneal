@@ -27105,6 +27105,9 @@ section MoveDeinitEquivPins
   MoveDeinitEquiv.placeMachine_rawAccessHooks_eq
   MoveDeinitEquiv.placeMachine_accessHooks_write_performs_treeBorrows_write
   MoveDeinitEquiv.placeMachine_readImmediate_moving
+  MoveDeinitEquiv.placeMachine_mplacesOverlap_zst_or_unsized_false
+  MoveDeinitEquiv.placeMachine_mplacesOverlap_resolved
+  MoveDeinitEquiv.place_copyRuntimePlaceNoValidate_overlapping_move_ub
   MoveDeinitEquiv.step_clears_pendingMoveDeinit
   MoveDeinitEquiv.call_initFnTailCallMoving_eq
   MoveDeinitEquiv.call_initFnTailCallMoving_inPlace
@@ -27269,6 +27272,52 @@ example {P S C E Other Extern FnABI ArgABI A : Type}
     ∃ s', (Miri.Interpreter.Call.deallocateTempArgsOnError h choice temps err :
       Miri.Interpreter.CallM S A) s = .error err s' :=
   MoveDeinitEquiv.call_deallocateTempArgsOnError_preserves_error h choice temps err s
+
+-- Memory-path overlapping moves fault with `copy_nonoverlapping` UB (`Finding 4`),
+-- while ZST/unsized places never overlap and `PlaceMachine.mplacesOverlap` is a pure
+-- interval-intersection query over resolved pointers.
+example {P S C E : Type} (h : Miri.Interpreter.PlaceHooks P S C E)
+    (copy : Miri.Interpreter.PlaceCopyHooks P S C) (choice : C)
+    (mplace : Miri.Interpreter.MemPlace P) (srcLayout : Miri.Interpreter.LocalLayout)
+    (dest : Miri.Interpreter.RuntimePlace P) (allowTransmute : Bool) (s s₁ s₂ s₃ : S)
+    (target : Miri.Interpreter.MPlaceTy P)
+    (hcompat : copy.compatible srcLayout dest.layout = .ok true)
+    (hpad : copy.hasPadding srcLayout = .ok true)
+    (htake : h.takePendingMoveDeinit s = .ok true s₁)
+    (hforce : Miri.Interpreter.forceAllocation h choice dest s₁ = .ok target s₂)
+    (hoverlap : h.moveCopyOverlaps choice ⟨mplace, srcLayout⟩ target s₂ = .ok true s₃) :
+    Miri.Interpreter.copyRuntimePlaceNoValidate h copy choice ⟨.indirect mplace, srcLayout⟩ dest
+        allowTransmute s =
+      .error (.undefinedBehavior "copy_nonoverlapping called on overlapping ranges") s₃ :=
+  MoveDeinitEquiv.place_copyRuntimePlaceNoValidate_overlapping_move_ub h copy choice mplace
+    srcLayout dest allowTransmute s s₁ s₂ s₃ target hcompat hpad htake hforce hoverlap
+
+example {K User : Type} [DecidableEq K] (config : Miri.Interpreter.PlaceMachine.AccessConfig K User)
+    (src dst : Miri.Interpreter.MPlaceTy Miri.Memory.Provenance)
+    (state : Miri.Interpreter.MachineHooks.State K User)
+    (hzst : (!src.layout.layout.isSized || !dst.layout.layout.isSized ||
+      src.layout.layout.size.bytes == 0 || dst.layout.layout.size.bytes == 0) = true) :
+    Miri.Interpreter.PlaceMachine.mplacesOverlap config src dst state = .ok false state :=
+  MoveDeinitEquiv.placeMachine_mplacesOverlap_zst_or_unsized_false config src dst state hzst
+
+example {K User : Type} [DecidableEq K] (config : Miri.Interpreter.PlaceMachine.AccessConfig K User)
+    (src dst : Miri.Interpreter.MPlaceTy Miri.Memory.Provenance)
+    (state : Miri.Interpreter.MachineHooks.State K User)
+    (m₁ m₂ : Miri.Interpreter.MachineHooks.MachineState K User)
+    (rs rd : Miri.Memory.ResolvedPointer Miri.Memory.ProvenanceExtra)
+    (hnonzst : (!src.layout.layout.isSized || !dst.layout.layout.isSized ||
+      src.layout.layout.size.bytes == 0 || dst.layout.layout.size.bytes == 0) = false)
+    (hsrc : config.resolvePointer state.machine.memory src.mplace.ptr
+      (Int.ofNat src.layout.layout.size.bytes.toNat) state.machine = .ok (.ok rs) m₁)
+    (hdst : config.resolvePointer state.machine.memory dst.mplace.ptr
+      (Int.ofNat dst.layout.layout.size.bytes.toNat) state.machine = .ok (.ok rd) m₂) :
+    Miri.Interpreter.PlaceMachine.mplacesOverlap config src dst state =
+      .ok (rs.allocId == rd.allocId &&
+        decide (rs.offset.bytes.toNat < rd.offset.bytes.toNat + dst.layout.layout.size.bytes.toNat) &&
+        decide (rd.offset.bytes.toNat < rs.offset.bytes.toNat + src.layout.layout.size.bytes.toNat))
+        state :=
+  MoveDeinitEquiv.placeMachine_mplacesOverlap_resolved config src dst state m₁ m₂ rs rd hnonzst
+    hsrc hdst
 
 end MoveDeinitEquivPins
 

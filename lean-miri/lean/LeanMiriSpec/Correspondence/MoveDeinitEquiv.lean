@@ -4022,6 +4022,42 @@ theorem takePendingMoveDeinitFor_empty (m : MachineHooks.MachineState K User)
     (MachineHooks.takePendingMoveDeinitFor (m.withPendingMoves flag #[]) (some mplace)).2 = false := by
   simp [MachineHooks.takePendingMoveDeinitFor, pendingMoveDeinits_withPendingMoves]
 
+/-- **Zero-sized or unsized memory-path moves never report overlap (`D6` ZST).**
+`PlaceMachine.mplacesOverlap` returns `false` without consulting `resolvePointer`
+or mutating machine state whenever either place is unsized or has `0` byte size. -/
+theorem placeMachine_mplacesOverlap_zst_or_unsized_false [DecidableEq K]
+    (config : PlaceMachine.AccessConfig K User) (src dst : MPlaceTy Provenance)
+    (state : MachineHooks.State K User)
+    (hzst : (!src.layout.layout.isSized || !dst.layout.layout.isSized ||
+      src.layout.layout.size.bytes == 0 || dst.layout.layout.size.bytes == 0) = true) :
+    PlaceMachine.mplacesOverlap config src dst state = .ok false state := by
+  simp only [PlaceMachine.mplacesOverlap, hzst, ↓reduceIte, pure, EStateM.pure]
+
+/-- **Memory-path overlap query (`Finding 4` `PlaceMachine.mplacesOverlap`).**
+On sized, positive-size `src` and `dst` whose pointers resolve to `rs` and `rd`,
+`PlaceMachine.mplacesOverlap` discards any resolver machine effects (returning
+`state` unchanged) and reports `true` iff `rs.allocId == rd.allocId` with
+intersecting byte ranges `[rs.offset, rs.offset + srcSize)` and
+`[rd.offset, rd.offset + dstSize)`. -/
+theorem placeMachine_mplacesOverlap_resolved [DecidableEq K]
+    (config : PlaceMachine.AccessConfig K User) (src dst : MPlaceTy Provenance)
+    (state : MachineHooks.State K User) (m₁ m₂ : MachineHooks.MachineState K User)
+    (rs rd : ResolvedPointer Miri.Memory.ProvenanceExtra)
+    (hnonzst : (!src.layout.layout.isSized || !dst.layout.layout.isSized ||
+      src.layout.layout.size.bytes == 0 || dst.layout.layout.size.bytes == 0) = false)
+    (hsrc : config.resolvePointer state.machine.memory src.mplace.ptr
+      (Int.ofNat src.layout.layout.size.bytes.toNat) state.machine = .ok (.ok rs) m₁)
+    (hdst : config.resolvePointer state.machine.memory dst.mplace.ptr
+      (Int.ofNat dst.layout.layout.size.bytes.toNat) state.machine = .ok (.ok rd) m₂) :
+    PlaceMachine.mplacesOverlap config src dst state =
+      .ok (rs.allocId == rd.allocId &&
+        decide (rs.offset.bytes.toNat < rd.offset.bytes.toNat + dst.layout.layout.size.bytes.toNat) &&
+        decide (rd.offset.bytes.toNat < rs.offset.bytes.toNat + src.layout.layout.size.bytes.toNat))
+        state := by
+  simp only [PlaceMachine.mplacesOverlap, hnonzst, Bool.false_eq_true, ↓reduceIte,
+    bind, EStateM.bind, get, getThe, MonadStateOf.get, EStateM.get, pure, EStateM.pure,
+    hsrc, hdst]
+
 end ReadDecomposition
 
 /-! ### Operand latch behavior of `OperandMachine.evalOperand` -/
@@ -7449,7 +7485,7 @@ elab "#assert_move_deinit_equiv_axioms" : command => do
   let ns := `LeanMiriSpec.Correspondence.MoveDeinitEquiv
   let names : Array Name := env.constants.map₂.foldl (init := #[]) fun acc n _ =>
     if ns.isPrefixOf n then acc.push n else acc
-  if names.size < 700 then
+  if names.size < 750 then
     throwError "MoveDeinitEquiv axiom audit found only {names.size} declarations"
   let mut inherited : Nat := 0
   for n in names do

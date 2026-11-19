@@ -280,6 +280,7 @@ def make_elf64(
     phentsize: int = 56,
     phnum_override: Optional[int] = None,
     load_filesz_gt_memsz: bool = False,
+    load_vaddr_overflow: bool = False,
     overlapping_loads: bool = False,
     omit_dt_null: bool = False,
     dyn_outside_load: bool = False,
@@ -339,6 +340,10 @@ def make_elf64(
     if overlapping_loads:
         ph_overlap = struct.pack("<IIQQQQQQ", 1, 4, 0, 0x100, 0x100, 64, 64, 0x1000).ljust(phentsize, b"\0")
         phdrs_bytes += ph_overlap
+    if load_vaddr_overflow:
+        ph_wrap = struct.pack("<IIQQQQQQ", 1, 4, 0, (1 << 64) - 0x1000, (1 << 64) - 0x1000, 0, 0x2000, 0x1000).ljust(phentsize, b"\0")
+        phdrs_bytes += ph_wrap
+        ehdr = ehdr[:0x38] + struct.pack("<H", (phnum_override if phnum_override is not None else n_phdrs) + 1) + ehdr[0x3A:]
     return ehdr + phdrs_bytes + body + bytes(strtab) + interp_bytes
 
 
@@ -356,6 +361,7 @@ def malformed_elf_cases() -> List[Tuple[str, bytes, str]]:
         ("e_phentsize != 56", make_elf64(["libfoo.so"], ["$ORIGIN"], phentsize=64), "malformed ELF program header table"),
         ("e_phnum == PN_XNUM (0xffff)", make_elf64(["libfoo.so"], ["$ORIGIN"], phnum_override=0xFFFF), "PN_XNUM"),
         ("PT_LOAD p_filesz > p_memsz", make_elf64(["libfoo.so"], ["$ORIGIN"], load_filesz_gt_memsz=True), "p_filesz > p_memsz"),
+        ("PT_LOAD 64-bit vaddr+memsz overflow", make_elf64(["libfoo.so"], ["$ORIGIN"], load_vaddr_overflow=True), "PT_LOAD segment overflows 64-bit address space"),
         ("overlapping PT_LOAD segments", make_elf64(["libfoo.so"], ["$ORIGIN"], overlapping_loads=True), "overlapping PT_LOAD"),
         ("PT_DYNAMIC without DT_NULL", make_elf64(["libfoo.so"], ["$ORIGIN"], omit_dt_null=True), "missing DT_NULL"),
         ("PT_DYNAMIC outside PT_LOAD", make_elf64(["libfoo.so"], ["$ORIGIN"], dyn_outside_load=True), "PT_DYNAMIC segment is not inside a PT_LOAD"),
@@ -368,6 +374,12 @@ def malformed_elf_cases() -> List[Tuple[str, bytes, str]]:
         ("PT_INTERP under /tmp", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/tmp/evil-ld.so\0"), "invalid PT_INTERP path"),
         ("PT_INTERP under /var/tmp", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/var/tmp/evil-ld.so\0"), "invalid PT_INTERP path"),
         ("PT_INTERP under /dev/shm", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/dev/shm/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /proc/self/fd", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/proc/self/fd/3\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /dev/fd", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/dev/fd/3\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /run/shm", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/run/shm/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /var/run", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/var/run/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /usr/tmp", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/usr/tmp/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /sys", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/sys/kernel/evil-ld.so\0"), "invalid PT_INTERP path"),
         ("PT_INTERP double slash", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/lib64//ld-linux-x86-64.so.2\0"), "invalid PT_INTERP path"),
         ("PT_INTERP dot segment", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/lib64/./ld-linux-x86-64.so.2\0"), "invalid PT_INTERP path"),
         ("PT_INTERP trailing slash", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/lib64/\0"), "invalid PT_INTERP path"),
@@ -1999,6 +2011,64 @@ class ElfDynamicParserTests(TempCase):
         finally:
             os.chmod(elan / "settings.toml", 0o644)
 
+    def test_unsticky_world_writable_ancestor_and_check_trusted_settings_rejected_before_execution(self) -> None:
+        ws = self.workspace()
+        root = make_check_trusted_fixture(self.tmp)
+        ww_anc = self.tmp / "ww-anc-no-sticky"
+        ww_anc.mkdir()
+        os.chmod(ww_anc, 0o755)
+        tc_dir = make_fake_toolchain(ww_anc, name="tc")
+        canary = self.tmp / "ww-anc-canary"
+        (tc_dir / "bin" / "lean").write_text(
+            f"#!/bin/sh\necho pwned > {shlex.quote(str(canary))}\n"
+            f"echo 'Lean (version {REPO_LEAN_VERSION}, x86_64-unknown-linux-gnu, commit {FAKE_COMMIT}, Release)'\n"
+        )
+        os.chmod(tc_dir / "bin" / "lean", 0o755)
+        pin_file = self.tmp / "ww-anc-pin.json"
+        V.write_toolchain_pin(V.verify_toolchain(ws.root, toolchain_dir=tc_dir), pin_file)
+        if canary.exists():
+            canary.unlink()
+        os.chmod(ww_anc, 0o777)  # world-writable WITHOUT S_ISVTX: allows rename-swap of `tc`
+        try:
+            self.assertRejected(
+                lambda: V.verify_toolchain(ws.root, toolchain_dir=tc_dir, toolchain_pin_json=pin_file, environ={}),
+                "toolchain ancestor directory",
+                "without root/owner sticky protection",
+                "skipped `bin/lean --version`",
+            )
+            self.assertFalse(canary.exists())
+            findings = CT.lean_release_findings(tc_dir, {"files": {"bin/lean": "0" * 64}})
+            self.assertTrue(any("without root/owner sticky protection" in f for f in findings), findings)
+            with mock.patch.object(CT.subprocess, "run", side_effect=AssertionError("a subprocess was spawned")):
+                with self.assertRaises(CT.Failure) as cm:
+                    CT.Checker(root, tc_dir / "bin" / "lean", temp_parent=self.tmp).run()
+            self.assertEqual((cm.exception.code, cm.exception.phase), (2, "toolchain"))
+            self.assertIn("without root/owner sticky protection", str(cm.exception))
+            self.assertFalse(canary.exists())
+        finally:
+            os.chmod(ww_anc, 0o755)
+        # `check_trusted.py` also rejects a symlink or world-writable `elan/settings.toml` before executing `lean`.
+        elan_ct = self.tmp / "elan-ct"
+        (elan_ct / "toolchains" / "v4").mkdir(parents=True)
+        tc_ct = make_fake_toolchain(elan_ct / "toolchains", name="v4")
+        os.symlink("/nonexistent-settings", elan_ct / "settings.toml")
+        with mock.patch.object(CT.subprocess, "run", side_effect=AssertionError("a subprocess was spawned")):
+            with self.assertRaises(CT.Failure) as cm_sym:
+                CT.Checker(root, tc_ct / "bin" / "lean", temp_parent=self.tmp).run()
+        self.assertEqual((cm_sym.exception.code, cm_sym.exception.phase), (2, "toolchain"))
+        self.assertIn("elan settings", str(cm_sym.exception))
+        (elan_ct / "settings.toml").unlink()
+        (elan_ct / "settings.toml").write_text('default_toolchain = "stable"\n', encoding="utf-8")
+        os.chmod(elan_ct / "settings.toml", 0o666)
+        try:
+            with mock.patch.object(CT.subprocess, "run", side_effect=AssertionError("a subprocess was spawned")):
+                with self.assertRaises(CT.Failure) as cm_ww:
+                    CT.Checker(root, tc_ct / "bin" / "lean", temp_parent=self.tmp).run()
+            self.assertEqual((cm_ww.exception.code, cm_ww.exception.phase), (2, "toolchain"))
+            self.assertIn("is world-writable", str(cm_ww.exception))
+        finally:
+            os.chmod(elan_ct / "settings.toml", 0o644)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -2929,6 +2999,20 @@ class CheckTrustedIntegrationTests(TempCase):
             assert_freshness_fails("checker/policy inputs changed during check")
             (root / "Cargo.toml").unlink()
         checker.freshness()  # restored state passes again
+        with self.subTest("admitted toolchain RUNPATH shadow or companion tamper mid-run"):
+            tc_copy = copy_live_toolchain(self.tmp / "freshness-elan" / "toolchains")
+            tc_checker = self.checker(root, tc_copy / "bin" / "lean")
+            self.assertEqual(self.run_until_first_lean_process(tc_checker), [("version", ["--version"])])
+            tc_checker.freshness()
+            planted_shadow = tc_copy / "lib" / "libm.so.6"
+            planted_shadow.write_bytes(b"\x7fELF-mid-run-shadow")
+            os.chmod(planted_shadow, 0o644)
+            with self.assertRaises(CT.Failure) as cm_tc:
+                tc_checker.freshness()
+            self.assertEqual((cm_tc.exception.code, cm_tc.exception.phase), (2, "freshness"))
+            self.assertIn("RUNPATH shadowing", str(cm_tc.exception))
+            planted_shadow.unlink()
+            tc_checker.freshness()
 
 
 # ---------------------------------------------------------------------------

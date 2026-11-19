@@ -858,7 +858,8 @@ class Checker:
         # distribution, and for the locked x86_64 Linux release every companion
         # executable, Lean shared library and DT_RUNPATH resolution is verified too.
         # Pure Python: a rejection leaves `execution_began` False and no status file.
-        admit_lean_before_execution(selected, self.lean, self.lock)
+        self._selected_lean = selected
+        self._admitted_lean_sha = admit_lean_before_execution(selected, self.lean, self.lock)
         actual_version = self.process("version", ["--version"]).strip()
         expected_lean_sha = self.lock["distributions"].get(actual_version)
         if expected_lean_sha is None:
@@ -938,6 +939,10 @@ class Checker:
             raise Failure(2, "freshness", "root manifest or covered files changed during check")
         if "leanMiriPin" in self.preflight and verify_lean_miri_pin(self.checkout) != self.preflight["leanMiriPin"]:
             raise Failure(2, "freshness", "lean-miri pin or vendor tree changed during check")
+        if getattr(self, "_admitted_lean_sha", None) is not None:
+            regular(self.lean, "freshness")
+            if admit_lean_before_execution(self._selected_lean, self.lean, self.lock) != self._admitted_lean_sha:
+                raise Failure(2, "freshness", "admitted Lean toolchain changed during check")
         if digest(self.inspector) != self.inspector_hash:
             raise Failure(2, "freshness", "staged inspector changed")
         for path, expected in self.expected_artifacts.items():
@@ -5639,12 +5644,16 @@ def elf_dynamic_entries(path: Path) -> tuple[tuple[str, ...], tuple[tuple[int, t
                     raise ValueError("PT_LOAD segment overruns EOF")
                 if p_filesz > p_memsz:
                     raise ValueError("PT_LOAD segment has p_filesz > p_memsz")
+                if p_vaddr + p_memsz > (1 << 64):
+                    raise ValueError("PT_LOAD segment overflows 64-bit address space")
                 loads.append((p_vaddr, p_offset, p_filesz, p_memsz))
             elif p_type == 2:  # PT_DYNAMIC
                 if dynamic is not None:
                     raise ValueError("more than one PT_DYNAMIC segment")
                 if p_offset + p_filesz > size or p_filesz > p_memsz:
                     raise ValueError("truncated PT_DYNAMIC segment")
+                if p_vaddr + p_memsz > (1 << 64):
+                    raise ValueError("PT_DYNAMIC segment overflows 64-bit address space")
                 dynamic = (p_vaddr, p_offset, p_filesz, p_memsz)
             elif p_type == 3:  # PT_INTERP
                 if interp is not None:
@@ -5670,8 +5679,8 @@ def elf_dynamic_entries(path: Path) -> tuple[tuple[str, ...], tuple[tuple[int, t
                 or interp_path.endswith("/")
                 or any(part in ("", ".", "..") for part in interp_parts[1:])
                 or not all(0x21 <= ord(ch) <= 0x7E for ch in interp_path)
-                or interp_parts[1] == "tmp"
-                or interp_parts[1:3] in (["var", "tmp"], ["dev", "shm"])
+                or interp_parts[1] in ("tmp", "proc", "sys", "dev", "run")
+                or interp_parts[1:3] in (["var", "tmp"], ["var", "run"], ["usr", "tmp"])
             ):
                 raise ValueError(f"invalid PT_INTERP path {interp_path!r}")
             if dynamic is None:
@@ -5918,6 +5927,27 @@ def runpath_shadowing_findings(prefix: Path, elf_rels: list[str], pinned: set[st
     return problems
 
 
+def _ancestor_rename_problem(real_root_path: Path) -> str | None:
+    """Why an ancestor above `real_root_path` allows an unprivileged local user
+    to `rename()`-swap the toolchain directory after admission."""
+    uid = os.getuid() if hasattr(os, "getuid") else -1
+    for anc in real_root_path.parents:
+        try:
+            anc_st = os.lstat(anc)
+        except OSError as error:
+            return f"toolchain ancestor directory {anc} is unreadable ({error.strerror})"
+        if stat.S_ISLNK(anc_st.st_mode) or not stat.S_ISDIR(anc_st.st_mode):
+            return f"toolchain ancestor {anc} is not a real directory"
+        if (anc_st.st_mode & stat.S_IWOTH) and (
+            not (anc_st.st_mode & stat.S_ISVTX) or anc_st.st_uid not in (0, uid)
+        ):
+            return (
+                f"toolchain ancestor directory {anc} is world-writable without root/owner sticky "
+                "protection (allows rename-swap of the toolchain)"
+            )
+    return None
+
+
 def lean_release_findings(prefix: Path, release: dict | None = None) -> list[str]:
     """Pre-execution problems of the toolchain installed at `prefix` against `release`
     (default `LOCKED_LEAN_RELEASE`); empty when it is admitted. Nothing is executed.
@@ -5940,9 +5970,22 @@ def lean_release_findings(prefix: Path, release: dict | None = None) -> list[str
         return ["toolchain root is a symlink or not a directory (symlinks at or below the toolchain prefix are forbidden)"]
     if root_st.st_mode & stat.S_IWOTH:
         return ["toolchain root is world-writable"]
+    real_prefix = Path(os.path.realpath(prefix))
+    if real_prefix != prefix:
+        try:
+            real_st = os.lstat(real_prefix)
+        except OSError as error:
+            return [f"resolved toolchain root is missing or unreadable in the toolchain: {error.strerror}"]
+        if stat.S_ISLNK(real_st.st_mode) or not stat.S_ISDIR(real_st.st_mode):
+            return ["toolchain root is a symlink or not a directory (symlinks at or below the toolchain prefix are forbidden)"]
+        if real_st.st_mode & stat.S_IWOTH:
+            return ["toolchain root is world-writable"]
+    anc_problem = _ancestor_rename_problem(real_prefix)
+    if anc_problem is not None:
+        return [anc_problem]
     for rel in ("bin", "lib", "lib/lean"):
         try:
-            st = os.lstat(prefix / rel)
+            st = os.lstat(real_prefix / rel)
         except OSError as error:
             problems.append(f"{rel}/ is missing or unreadable in the toolchain: {error.strerror}")
             continue
@@ -5955,7 +5998,7 @@ def lean_release_findings(prefix: Path, release: dict | None = None) -> list[str
     listing: dict[str, list[str]] = {}
     for directory in ("bin", "lib", "lib/lean"):
         try:
-            listing[directory] = sorted(entry.name for entry in os.scandir(prefix / directory))
+            listing[directory] = sorted(entry.name for entry in os.scandir(real_prefix / directory))
         except OSError as error:
             problems.append(f"cannot list {directory}/ in the toolchain: {error.strerror}")
             listing[directory] = []
@@ -5968,7 +6011,7 @@ def lean_release_findings(prefix: Path, release: dict | None = None) -> list[str
         problems.append(f"pinned toolchain file deleted: {rel}")
     regular_files: set[str] = set()
     for rel in sorted(on_disk & expected):
-        path = prefix / rel
+        path = real_prefix / rel
         try:
             st = os.lstat(path)
         except OSError as error:
@@ -6007,7 +6050,7 @@ def lean_release_findings(prefix: Path, release: dict | None = None) -> list[str
                 problems.append(f"system soname planted in a toolchain RUNPATH directory: {directory}/{name}")
     elf_rels = [rel for rel in sorted(regular_files)
                 if rel in LEAN_RELEASE_RUNPATH_BINARIES or rel.startswith("lib/lean/")]
-    problems += runpath_shadowing_findings(prefix, elf_rels, expected)
+    problems += runpath_shadowing_findings(real_prefix, elf_rels, expected)
     return problems
 
 
@@ -6055,6 +6098,19 @@ def admit_lean_before_execution(selected: Path, lean: Path, lock: dict) -> str:
                     raise Failure(2, phase, f"{anc_dir} is a symlink or not a directory; nothing was executed")
                 if anc_st.st_mode & stat.S_IWOTH:
                     raise Failure(2, phase, f"{anc_dir} is world-writable; nothing was executed")
+            settings = toolchains_dir.parent / "settings.toml"
+            if os.path.lexists(settings):
+                try:
+                    settings_st = os.lstat(settings)
+                except OSError as error:
+                    raise Failure(2, phase, f"cannot inspect elan settings {settings}: {error}") from error
+                if stat.S_ISLNK(settings_st.st_mode) or not stat.S_ISREG(settings_st.st_mode):
+                    raise Failure(2, phase, f"elan settings {settings} is a symlink or not a regular file; nothing was executed")
+                if settings_st.st_mode & stat.S_IWOTH:
+                    raise Failure(2, phase, f"elan settings {settings} is world-writable; nothing was executed")
+    anc_problem = _ancestor_rename_problem(Path(os.path.realpath(lean.parent.parent)))
+    if anc_problem is not None:
+        raise Failure(2, phase, f"{anc_problem}; nothing was executed")
     if selected.parent.name != "bin" or lean.parent.name != "bin":
         # `lean_release_findings` inventories `<prefix>/bin/` and resolves the DT_RUNPATH
         # of `<prefix>/bin/lean`: the executable that runs must be that very file, not a
