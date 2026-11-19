@@ -4131,6 +4131,932 @@ theorem pruneForeignReadFrozenOrDisabled_preserves_disabledClosed
   exact pruneForeignReadFrozenOrDisabled_preserves_disabledClosed_for forest
     hDis (any_false_of_mem hNoUB)
 
+/-! #### Cell- and reservation-aware root-noop closure invariants
+
+`DisabledClosedForest` and `FrozenClosedForest` break when a `.unique` parent
+has an interior-mutable `.cell` child (`cexUniqueCellForest` in Section 1.7):
+a foreign write disables the `.unique` root while the `.cell` child stays
+`.cell`, and a foreign read freezes the `.unique` root while the `.cell` child
+stays `.cell`. Similarly, `ForeignWriteNoopForest` and `ForeignReadNoopForest`
+break when a `.cell` root has a `.unique` child (`cexCellUniqueForest`).
+
+Restricting the antecedent strictly to the permissions actually skipped by the
+conservative predicates (`root.perm = .disabled` for writes, and
+`root.perm = .frozen ∨ root.perm = .disabled` for reads) while allowing any
+foreign-noop descendant (`isForeignWriteNoopPerm` / `isForeignReadNoopPerm`,
+including `.cell` and unprotected reservations) yields invariants that:
+1. Hold simultaneously on BOTH `cexCellUniqueForest` and `cexUniqueCellForest`;
+2. Justify all conservative `*_equiv_fullScan` theorems with zero runtime code
+   change; and
+3. Are preserved across multi-step reads, direct whole-allocation writes, and
+   frame teardown even in the presence of `.cell` and reservation nodes.
+-/
+
+/-- Every foreign-write no-op permission at protection status `isProt` is also a
+foreign-read no-op permission at `isProt`. -/
+theorem isForeignReadNoopPerm_of_writeNoop {isProt : Bool}
+    {perm : TreeBorrowPerm} (h : isForeignWriteNoopPerm isProt perm = true) :
+    isForeignReadNoopPerm isProt perm = true := by
+  cases perm <;> cases isProt <;>
+    first
+      | rfl
+      | exact Bool.noConfusion h
+
+/--
+Cell-aware `.disabled`-root write-noop node invariant: every descendant of a
+`.disabled` root is a foreign-write no-op (`.disabled`, `.cell`, or unprotected
+`.reservedIM`). Never constrains `.cell` roots (`cexCellUniqueForest`), and
+remains valid when a `.unique` parent over a `.cell` child is disabled by a
+foreign write (`cexUniqueCellForest`).
+-/
+def DisabledRootWriteNoopNode (activeProtectors : List Nat)
+    (root : BorrowEntry) (children : List BorrowSubtree) : Prop :=
+  root.perm = .disabled →
+    ∀ e, e ∈ BorrowForest.toList children →
+      isForeignWriteNoopPerm (isBorrowProtected activeProtectors e) e.perm =
+        true
+
+/-- Forest form of `DisabledRootWriteNoopNode`. -/
+def DisabledRootWriteNoopForest (activeProtectors : List Nat)
+    (ts : BorrowForest) : Prop :=
+  AllSubtreesForest (DisabledRootWriteNoopNode activeProtectors) ts
+
+/--
+Cell-aware `.frozen`/`.disabled`-root read-noop node invariant: every descendant
+of a `.frozen` or `.disabled` root is a foreign-read no-op (`.frozen`,
+`.disabled`, `.cell`, conflicted/unprotected `.reservedFrz`, or unprotected
+`.reservedIM`). Never constrains `.cell` or `.unique` roots, and remains valid
+when a `.unique` parent over a `.cell` child is frozen or disabled.
+-/
+def FrozenOrDisabledRootReadNoopNode (activeProtectors : List Nat)
+    (root : BorrowEntry) (children : List BorrowSubtree) : Prop :=
+  root.perm = .frozen ∨ root.perm = .disabled →
+    ∀ e, e ∈ BorrowForest.toList children →
+      isForeignReadNoopPerm (isBorrowProtected activeProtectors e) e.perm =
+        true
+
+/-- Forest form of `FrozenOrDisabledRootReadNoopNode`. -/
+def FrozenOrDisabledRootReadNoopForest (activeProtectors : List Nat)
+    (ts : BorrowForest) : Prop :=
+  AllSubtreesForest (FrozenOrDisabledRootReadNoopNode activeProtectors) ts
+
+/-- `DisabledClosedForest` implies `DisabledRootWriteNoopForest` for any
+`activeProtectors`. -/
+theorem DisabledClosedForest.to_disabledRootWriteNoop
+    {activeProtectors : List Nat} {ts : BorrowForest}
+    (h : DisabledClosedForest ts) :
+    DisabledRootWriteNoopForest activeProtectors ts :=
+  AllSubtreesForest.mono_strong
+    (fun _ _ hh hr e he => by
+      have hD := (AllSubtrees.node_iff.mp hh).1
+      rw [hD hr e he]; rfl)
+    ts h
+
+/-- `ForeignWriteNoopForest` implies `DisabledRootWriteNoopForest`. -/
+theorem ForeignWriteNoopForest.to_disabledRootWriteNoop
+    {activeProtectors : List Nat} {ts : BorrowForest}
+    (h : ForeignWriteNoopForest activeProtectors ts) :
+    DisabledRootWriteNoopForest activeProtectors ts :=
+  AllSubtreesForest.mono_strong
+    (fun r _ hh hr e he => by
+      have hN := (AllSubtrees.node_iff.mp hh).1
+      exact hN (by rw [hr]; rfl) e he)
+    ts h
+
+/-- `DisabledClosedForest` together with `FrozenClosedForest` implies
+`FrozenOrDisabledRootReadNoopForest` for any `activeProtectors`. -/
+theorem FrozenClosedForest.to_frozenOrDisabledRootReadNoop
+    {activeProtectors : List Nat} {ts : BorrowForest}
+    (hDis : DisabledClosedForest ts) (hFrz : FrozenClosedForest ts) :
+    FrozenOrDisabledRootReadNoopForest activeProtectors ts :=
+  AllSubtreesForest.mono_strong
+    (fun _ _ hh hr e he => by
+      obtain ⟨hD, hF⟩ := (AllSubtrees.node_iff.mp hh).1
+      cases hr with
+      | inl hf =>
+        cases hF hf e he with
+        | inl h1 => rw [h1]; cases isBorrowProtected activeProtectors e <;> rfl
+        | inr h2 => rw [h2]; rfl
+      | inr hd =>
+        rw [hD hd e he]; rfl)
+    ts (AllSubtreesForest.and ts hDis hFrz)
+
+/-- `ForeignReadNoopForest` implies `FrozenOrDisabledRootReadNoopForest`. -/
+theorem ForeignReadNoopForest.to_frozenOrDisabledRootReadNoop
+    {activeProtectors : List Nat} {ts : BorrowForest}
+    (h : ForeignReadNoopForest activeProtectors ts) :
+    FrozenOrDisabledRootReadNoopForest activeProtectors ts :=
+  AllSubtreesForest.mono_strong
+    (fun r _ hh hr e he => by
+      have hN := (AllSubtrees.node_iff.mp hh).1
+      exact hN (by
+        cases hr with
+        | inl hf =>
+          rw [hf]; cases isBorrowProtected activeProtectors r <;> rfl
+        | inr hd => rw [hd]; rfl) e he)
+    ts h
+
+/-- **Cell-aware exact equivalence of `pruneForeignReadFrozenOrDisabled`.**
+Requires only `SameAllocForest` and `FrozenOrDisabledRootReadNoopForest`. -/
+theorem pruneForeignReadFrozenOrDisabled_rootNoop_equiv_fullScan
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hRead : FrozenOrDisabledRootReadNoopForest activeProtectors forest)
+    (targetLocal : Local) (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff readRangeLen targetFrameDepth : Nat) :
+    BorrowForest.toList
+        (pruneForeignReadFrozenOrDisabled allBorrows forest targetLocal
+          readerTag readProj readRangeOff readRangeLen activeProtectors
+          targetFrameDepth) =
+      freezeTreeBorrowsOnReadAtProj allBorrows (BorrowForest.toList forest)
+        targetLocal readerTag readProj readRangeOff readRangeLen
+        activeProtectors targetFrameDepth := by
+  rw [freezeTreeBorrowsOnReadAtProj_eq_map]
+  refine pruneMapForest_toList forest ?_
+  refine AllSubtreesForest.mono_strong (fun root children h hs => ?_) forest
+    (AllSubtreesForest.and forest hAlloc hRead)
+  obtain ⟨hA, hR⟩ := (AllSubtrees.node_iff.mp h).1
+  unfold readSkipFrozenOrDisabledRoot at hs
+  cases hu : isForeignUnrelatedRoot root targetLocal targetFrameDepth with
+  | true =>
+    refine ⟨updateBorrowPermOnReadAtProj_unrelated _ _ _ _ _ _ _ _ _
+      (unrelated_of_unrelated_root hu rfl rfl), fun e he => ?_⟩
+    exact updateBorrowPermOnReadAtProj_unrelated _ _ _ _ _ _ _ _ _
+      (unrelated_of_unrelated_root hu (hA.1 e he).1 (hA.1 e he).2)
+  | false =>
+    rw [hu] at hs
+    cases hp : root.perm with
+    | frozen =>
+      refine ⟨updateBorrowPermOnReadAtProj_frozen _ _ _ _ _ _ _ _ _ hp,
+        fun e he => ?_⟩
+      exact updateBorrowPermOnReadAtProj_noop _ _ _ _ _ _ _ _ _
+        (hR (Or.inl hp) e he)
+    | disabled =>
+      refine ⟨updateBorrowPermOnReadAtProj_disabled _ _ _ _ _ _ _ _ _ hp,
+        fun e he => ?_⟩
+      exact updateBorrowPermOnReadAtProj_noop _ _ _ _ _ _ _ _ _
+        (hR (Or.inr hp) e he)
+    | cell => rw [hp] at hs; exact Bool.noConfusion hs
+    | unique => rw [hp] at hs; exact Bool.noConfusion hs
+    | reservedFrz _ => rw [hp] at hs; exact Bool.noConfusion hs
+    | reservedIM => rw [hp] at hs; exact Bool.noConfusion hs
+
+/-- **Cell-aware exact equivalence of `pruneHasTreeReadUBFrozenOrDisabled`.** -/
+theorem pruneHasTreeReadUBFrozenOrDisabled_rootNoop_equiv_fullScan
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hRead : FrozenOrDisabledRootReadNoopForest activeProtectors forest)
+    (targetLocal : Local) (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff readRangeLen targetFrameDepth : Nat) :
+    pruneHasTreeReadUBFrozenOrDisabled allBorrows forest activeProtectors
+        targetLocal readerTag readProj readRangeOff readRangeLen
+        targetFrameDepth =
+      hasTreeReadUB allBorrows (BorrowForest.toList forest) activeProtectors
+        targetLocal readerTag readProj readRangeOff readRangeLen
+        targetFrameDepth := by
+  rw [hasTreeReadUB_eq_any]
+  refine pruneAnyForest_eq_any forest ?_
+  refine AllSubtreesForest.mono_strong (fun root children h hs => ?_) forest
+    (AllSubtreesForest.and forest hAlloc hRead)
+  obtain ⟨hA, hR⟩ := (AllSubtrees.node_iff.mp h).1
+  have hSub : SameAllocSubtree allBorrows (.node root children) :=
+    AllSubtrees.and_left h
+  unfold readUBSkipFrozenOrDisabledRoot at hs
+  cases hu : isForeignUnrelatedRoot root targetLocal targetFrameDepth with
+  | true =>
+    refine ⟨borrowEntryReadUB_unrelated _ _ _ _ _ _ _ _ _
+      (unrelated_of_unrelated_root hu rfl rfl), fun e he => ?_⟩
+    exact borrowEntryReadUB_unrelated _ _ _ _ _ _ _ _ _
+      (unrelated_of_unrelated_root hu (hA.1 e he).1 (hA.1 e he).2)
+  | false =>
+    rw [hu] at hs
+    obtain ⟨hf, hpm⟩ := and_eq_true_split hs
+    have hall := SameAllocSubtree.foreign_to_all hSub hf
+    cases hp : root.perm with
+    | frozen =>
+      have hrNoop :
+          isForeignReadNoopPerm (isBorrowProtected activeProtectors root)
+            root.perm = true := by
+        rw [hp]; cases isBorrowProtected activeProtectors root <;> rfl
+      refine ⟨borrowEntryReadUB_foreign_noop _ _ _ _ _ _ _ _ _
+        (fun tag htag => (hall root (by
+          rw [BorrowSubtree.toList_node]; exact List.mem_cons_self ..)
+          tag htag).1) hrNoop, fun e he => ?_⟩
+      exact borrowEntryReadUB_foreign_noop _ _ _ _ _ _ _ _ _
+        (fun tag htag => (hall e (by
+          rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)
+          tag htag).1) (hR (Or.inl hp) e he)
+    | disabled =>
+      have hrNoop :
+          isForeignReadNoopPerm (isBorrowProtected activeProtectors root)
+            root.perm = true := by
+        rw [hp]; rfl
+      refine ⟨borrowEntryReadUB_foreign_noop _ _ _ _ _ _ _ _ _
+        (fun tag htag => (hall root (by
+          rw [BorrowSubtree.toList_node]; exact List.mem_cons_self ..)
+          tag htag).1) hrNoop, fun e he => ?_⟩
+      exact borrowEntryReadUB_foreign_noop _ _ _ _ _ _ _ _ _
+        (fun tag htag => (hall e (by
+          rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)
+          tag htag).1) (hR (Or.inr hp) e he)
+    | cell => rw [hp] at hpm; exact Bool.noConfusion hpm
+    | unique => rw [hp] at hpm; exact Bool.noConfusion hpm
+    | reservedFrz _ => rw [hp] at hpm; exact Bool.noConfusion hpm
+    | reservedIM => rw [hp] at hpm; exact Bool.noConfusion hpm
+
+/-- Common case analysis for cell-aware `writeSkipDisabledRoot` skipping. -/
+private theorem writeSkipDisabledRoot_rootNoop_cases
+    {allBorrows : List BorrowEntry} {activeProtectors : List Nat}
+    {targetLocal : Local} {writerTag : Option Nat} {targetFrameDepth : Nat}
+    {root : BorrowEntry} {children : List BorrowSubtree}
+    (h : AllSubtrees
+      (fun r c =>
+        SameAllocNode allBorrows r c ∧
+          DisabledRootWriteNoopNode activeProtectors r c)
+      (.node root children))
+    (hs : writeSkipDisabledRoot allBorrows targetLocal writerTag
+      targetFrameDepth root = true) :
+    ∀ e, e ∈ (BorrowSubtree.node root children).toList →
+      Bool.and (Nat.beq e.targetFrameDepth targetFrameDepth)
+          (Nat.beq e.targetLocal targetLocal) = false ∨
+        ((∀ tag, writerTag = some tag →
+            isBorrowDescendantOrSelf allBorrows tag e.tag = false ∧
+              Nat.beq e.tag tag = false) ∧
+          isForeignWriteNoopPerm (isBorrowProtected activeProtectors e) e.perm =
+            true) := by
+  intro e he
+  obtain ⟨hA, hW⟩ := (AllSubtrees.node_iff.mp h).1
+  have hSub : SameAllocSubtree allBorrows (.node root children) :=
+    AllSubtrees.and_left h
+  have he' : e = root ∨ e ∈ BorrowForest.toList children := by
+    rw [BorrowSubtree.toList_node] at he
+    cases he with
+    | head => exact Or.inl rfl
+    | tail _ ht => exact Or.inr ht
+  unfold writeSkipDisabledRoot at hs
+  cases hu : isForeignUnrelatedRoot root targetLocal targetFrameDepth with
+  | true =>
+    cases he' with
+    | inl heq =>
+      rw [heq]; exact Or.inl (unrelated_of_unrelated_root hu rfl rfl)
+    | inr hch =>
+      exact Or.inl
+        (unrelated_of_unrelated_root hu (hA.1 e hch).1 (hA.1 e hch).2)
+  | false =>
+    rw [hu] at hs
+    obtain ⟨hf, hpm⟩ := and_eq_true_split hs
+    have hall := SameAllocSubtree.foreign_to_all hSub hf
+    have hdisRoot : root.perm = .disabled := by
+      cases hp : root.perm with
+      | disabled => rfl
+      | cell => rw [hp] at hpm; exact Bool.noConfusion hpm
+      | unique => rw [hp] at hpm; exact Bool.noConfusion hpm
+      | frozen => rw [hp] at hpm; exact Bool.noConfusion hpm
+      | reservedFrz _ => rw [hp] at hpm; exact Bool.noConfusion hpm
+      | reservedIM => rw [hp] at hpm; exact Bool.noConfusion hpm
+    refine Or.inr ⟨fun tag htag => hall e he tag htag, ?_⟩
+    cases he' with
+    | inl heq => rw [heq, hdisRoot]; rfl
+    | inr hch => exact hW hdisRoot e hch
+
+/-- **Cell-aware exact equivalence of `pruneForeignWriteDisabled`.** -/
+theorem pruneForeignWriteDisabled_rootNoop_equiv_fullScan
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hWrite : DisabledRootWriteNoopForest activeProtectors forest)
+    (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen targetFrameDepth : Nat) :
+    BorrowForest.toList
+        (pruneForeignWriteDisabled allBorrows forest targetLocal writerTag
+          writeProj writeRangeOff writeRangeLen targetFrameDepth) =
+      invalidateTreeBorrowsAtProj allBorrows (BorrowForest.toList forest)
+        targetLocal writerTag writeProj writeRangeOff writeRangeLen
+        targetFrameDepth := by
+  rw [invalidateTreeBorrowsAtProj_eq_map]
+  refine pruneMapForest_toList forest ?_
+  refine AllSubtreesForest.mono_strong (fun root children h hs => ?_) forest
+    (AllSubtreesForest.and forest hAlloc hWrite)
+  have key : ∀ e, e ∈ (BorrowSubtree.node root children).toList →
+      updateBorrowPermTreeAtProj allBorrows e targetLocal writerTag writeProj
+        writeRangeOff writeRangeLen targetFrameDepth = e := by
+    intro e he
+    cases writeSkipDisabledRoot_rootNoop_cases h hs e he with
+    | inl hu => exact updateBorrowPermTreeAtProj_unrelated _ _ _ _ _ _ _ _ hu
+    | inr hfn =>
+      exact updateBorrowPermTreeAtProj_foreign_noop _ _ _ _ _ _ _ _
+        (fun tag htag => (hfn.1 tag htag).1)
+        (isForeignWriteNoopPerm_unprotected hfn.2)
+  exact ⟨key root (by
+      rw [BorrowSubtree.toList_node]; exact List.mem_cons_self ..),
+    fun e he => key e (by
+      rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)⟩
+
+/-- **Cell-aware exact equivalence of `pruneForeignWriteSimpleDisabled`.** -/
+theorem pruneForeignWriteSimpleDisabled_rootNoop_equiv_fullScan
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hWrite : DisabledRootWriteNoopForest activeProtectors forest)
+    (targetLocal : Local) (writerTag : Option Nat) (targetFrameDepth : Nat) :
+    BorrowForest.toList
+        (pruneForeignWriteSimpleDisabled allBorrows forest targetLocal writerTag
+          targetFrameDepth) =
+      invalidateConflictingBorrows (BorrowForest.toList forest) targetLocal
+        writerTag targetFrameDepth := by
+  rw [invalidateConflictingBorrows_eq_map]
+  refine pruneMapForest_toList forest ?_
+  refine AllSubtreesForest.mono_strong (fun root children h hs => ?_) forest
+    (AllSubtreesForest.and forest hAlloc hWrite)
+  have key : ∀ e, e ∈ (BorrowSubtree.node root children).toList →
+      updateBorrowPerm e targetLocal writerTag targetFrameDepth = e := by
+    intro e he
+    cases writeSkipDisabledRoot_rootNoop_cases h hs e he with
+    | inl hu => exact updateBorrowPerm_unrelated _ _ _ _ hu
+    | inr hfn =>
+      exact updateBorrowPerm_foreign_noop _ _ _ _
+        (fun tag htag => (hfn.1 tag htag).2)
+        (isForeignWriteNoopPerm_unprotected hfn.2)
+  exact ⟨key root (by
+      rw [BorrowSubtree.toList_node]; exact List.mem_cons_self ..),
+    fun e he => key e (by
+      rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)⟩
+
+/-- **Cell-aware exact equivalence of `pruneForeignWriteProjDisabled`.** -/
+theorem pruneForeignWriteProjDisabled_rootNoop_equiv_fullScan
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hWrite : DisabledRootWriteNoopForest activeProtectors forest)
+    (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen targetFrameDepth : Nat) :
+    BorrowForest.toList
+        (pruneForeignWriteProjDisabled allBorrows forest targetLocal writerTag
+          writeProj writeRangeOff writeRangeLen targetFrameDepth) =
+      invalidateConflictingBorrowsAtProj (BorrowForest.toList forest)
+        targetLocal writerTag writeProj writeRangeOff writeRangeLen
+        targetFrameDepth := by
+  rw [invalidateConflictingBorrowsAtProj_eq_map]
+  refine pruneMapForest_toList forest ?_
+  refine AllSubtreesForest.mono_strong (fun root children h hs => ?_) forest
+    (AllSubtreesForest.and forest hAlloc hWrite)
+  have key : ∀ e, e ∈ (BorrowSubtree.node root children).toList →
+      updateBorrowPermAtProj e targetLocal writerTag writeProj writeRangeOff
+        writeRangeLen targetFrameDepth = e := by
+    intro e he
+    cases writeSkipDisabledRoot_rootNoop_cases h hs e he with
+    | inl hu => exact updateBorrowPermAtProj_unrelated _ _ _ _ _ _ _ hu
+    | inr hfn =>
+      exact updateBorrowPermAtProj_foreign_noop _ _ _ _ _ _ _
+        (fun tag htag => (hfn.1 tag htag).2)
+        (isForeignWriteNoopPerm_unprotected hfn.2)
+  exact ⟨key root (by
+      rw [BorrowSubtree.toList_node]; exact List.mem_cons_self ..),
+    fun e he => key e (by
+      rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)⟩
+
+/-- **Cell-aware exact equivalence of
+`pruneHasProtectedWriteConflictDisabled`.** -/
+theorem pruneHasProtectedWriteConflictDisabled_rootNoop_equiv_fullScan
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hWrite : DisabledRootWriteNoopForest activeProtectors forest)
+    (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen targetFrameDepth : Nat) :
+    pruneHasProtectedWriteConflictDisabled allBorrows forest activeProtectors
+        targetLocal writerTag writeProj writeRangeOff writeRangeLen
+        targetFrameDepth =
+      hasProtectedWriteConflict (BorrowForest.toList forest) activeProtectors
+        targetLocal writerTag writeProj writeRangeOff writeRangeLen
+        targetFrameDepth := by
+  rw [hasProtectedWriteConflict_eq_any]
+  refine pruneAnyForest_eq_any forest ?_
+  refine AllSubtreesForest.mono_strong (fun root children h hs => ?_) forest
+    (AllSubtreesForest.and forest hAlloc hWrite)
+  have key : ∀ e, e ∈ (BorrowSubtree.node root children).toList →
+      protectedWriteConflictAt activeProtectors targetLocal writerTag writeProj
+        writeRangeOff writeRangeLen targetFrameDepth e = false := by
+    intro e he
+    cases writeSkipDisabledRoot_rootNoop_cases h hs e he with
+    | inl hu => exact protectedWriteConflictAt_unrelated _ _ _ _ _ _ _ _ hu
+    | inr hfn =>
+      exact protectedWriteConflictAt_foreign_noop _ _ _ _ _ _ _ _
+        (fun tag htag => (hfn.1 tag htag).2) hfn.2
+  exact ⟨key root (by
+      rw [BorrowSubtree.toList_node]; exact List.mem_cons_self ..),
+    fun e he => key e (by
+      rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)⟩
+
+/-- **Cell-aware exact equivalence of
+`pruneHasProtectedTreeWriteConflictDisabled`.** -/
+theorem pruneHasProtectedTreeWriteConflictDisabled_rootNoop_equiv_fullScan
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hWrite : DisabledRootWriteNoopForest activeProtectors forest)
+    (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen targetFrameDepth : Nat) :
+    pruneHasProtectedTreeWriteConflictDisabled allBorrows forest
+        activeProtectors targetLocal writerTag writeProj writeRangeOff
+        writeRangeLen targetFrameDepth =
+      hasProtectedTreeWriteConflict allBorrows (BorrowForest.toList forest)
+        activeProtectors targetLocal writerTag writeProj writeRangeOff
+        writeRangeLen targetFrameDepth := by
+  rw [hasProtectedTreeWriteConflict_eq_any]
+  refine pruneAnyForest_eq_any forest ?_
+  refine AllSubtreesForest.mono_strong (fun root children h hs => ?_) forest
+    (AllSubtreesForest.and forest hAlloc hWrite)
+  have key : ∀ e, e ∈ (BorrowSubtree.node root children).toList →
+      protectedTreeWriteConflictAt allBorrows activeProtectors targetLocal
+        writerTag writeProj writeRangeOff writeRangeLen targetFrameDepth e =
+        false := by
+    intro e he
+    cases writeSkipDisabledRoot_rootNoop_cases h hs e he with
+    | inl hu =>
+      exact protectedTreeWriteConflictAt_unrelated _ _ _ _ _ _ _ _ _ hu
+    | inr hfn =>
+      exact protectedTreeWriteConflictAt_foreign_noop _ _ _ _ _ _ _ _ _
+        (fun tag htag => (hfn.1 tag htag).1) hfn.2
+  exact ⟨key root (by
+      rw [BorrowSubtree.toList_node]; exact List.mem_cons_self ..),
+    fun e he => key e (by
+      rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)⟩
+
+mutual
+private theorem pruneForeignReadFrozenOrDisabled_preserves_disabledRootNoop_sub
+    {allBorrows : List BorrowEntry} {activeProtectors : List Nat}
+    {targetLocal : Local} {readerTag : Option Nat}
+    {readProj : List ProjectionElem}
+    {readRangeOff readRangeLen targetFrameDepth : Nat} :
+    ∀ (t : BorrowSubtree),
+      AllSubtrees (DisabledRootWriteNoopNode activeProtectors) t →
+      (∀ e, e ∈ t.toList →
+        borrowEntryReadUB allBorrows activeProtectors e targetLocal readerTag
+          readProj readRangeOff readRangeLen targetFrameDepth = false) →
+      AllSubtrees (DisabledRootWriteNoopNode activeProtectors)
+        (pruneMapSubtree
+          (readSkipFrozenOrDisabledRoot targetLocal targetFrameDepth)
+          (fun e =>
+            updateBorrowPermOnReadAtProj allBorrows e targetLocal readerTag
+              readProj readRangeOff readRangeLen activeProtectors
+              targetFrameDepth)
+          t)
+  | .node root children, hW, hNoUB => by
+    cases hs : readSkipFrozenOrDisabledRoot targetLocal targetFrameDepth root
+      with
+    | true =>
+      rw [pruneMapSubtree_skip children hs]; exact hW
+    | false =>
+      have hW' := AllSubtrees.node_iff.mp hW
+      have hRootNe : root.perm ≠ .disabled := by
+        intro hEq
+        unfold readSkipFrozenOrDisabledRoot at hs
+        rw [hEq] at hs
+        cases hu : isForeignUnrelatedRoot root targetLocal targetFrameDepth <;>
+          rw [hu] at hs <;> exact Bool.noConfusion hs
+      have hRootNoUB := hNoUB root (by
+        rw [BorrowSubtree.toList_node]; exact List.mem_cons_self ..)
+      have hUpdNe := updateBorrowPermOnReadAtProj_ne_disabled_of_noUB
+        allBorrows activeProtectors root targetLocal readerTag readProj
+        readRangeOff readRangeLen targetFrameDepth hRootNoUB hRootNe
+      rw [pruneMapSubtree_visit children hs]
+      refine AllSubtrees.node_iff.mpr
+        ⟨fun h => False.elim (hUpdNe h),
+         pruneForeignReadFrozenOrDisabled_preserves_disabledRootNoop_for
+           children hW'.2 fun e he => hNoUB e (by
+             rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)⟩
+private theorem pruneForeignReadFrozenOrDisabled_preserves_disabledRootNoop_for
+    {allBorrows : List BorrowEntry} {activeProtectors : List Nat}
+    {targetLocal : Local} {readerTag : Option Nat}
+    {readProj : List ProjectionElem}
+    {readRangeOff readRangeLen targetFrameDepth : Nat} :
+    ∀ (ts : List BorrowSubtree),
+      DisabledRootWriteNoopForest activeProtectors ts →
+      (∀ e, e ∈ BorrowForest.toList ts →
+        borrowEntryReadUB allBorrows activeProtectors e targetLocal readerTag
+          readProj readRangeOff readRangeLen targetFrameDepth = false) →
+      DisabledRootWriteNoopForest activeProtectors
+        (pruneMapForest
+          (readSkipFrozenOrDisabledRoot targetLocal targetFrameDepth)
+          (fun e =>
+            updateBorrowPermOnReadAtProj allBorrows e targetLocal readerTag
+              readProj readRangeOff readRangeLen activeProtectors
+              targetFrameDepth)
+          ts)
+  | [], _, _ => by
+    rw [pruneMapForest_nil]; exact AllSubtreesForest.nil_iff.mpr True.intro
+  | t :: ts, hW, hNoUB => by
+    have hW' := AllSubtreesForest.cons_iff.mp hW
+    rw [pruneMapForest_cons]
+    exact AllSubtreesForest.cons_iff.mpr
+      ⟨pruneForeignReadFrozenOrDisabled_preserves_disabledRootNoop_sub t hW'.1
+        (fun e he => hNoUB e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_left _ he)),
+       pruneForeignReadFrozenOrDisabled_preserves_disabledRootNoop_for ts hW'.2
+        (fun e he => hNoUB e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_right _ he))⟩
+end
+
+/-- **Unconditional non-UB read preservation of `DisabledRootWriteNoopForest`**
+(for arbitrary projection, byte range, `readerTag`, and `.cell` nodes). -/
+theorem pruneForeignReadFrozenOrDisabled_preserves_disabledRootWriteNoop
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat}
+    (hWrite : DisabledRootWriteNoopForest activeProtectors forest)
+    (targetLocal : Local) (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff readRangeLen targetFrameDepth : Nat)
+    (hNoUB :
+      hasTreeReadUB allBorrows (BorrowForest.toList forest) activeProtectors
+        targetLocal readerTag readProj readRangeOff readRangeLen
+        targetFrameDepth = false) :
+    DisabledRootWriteNoopForest activeProtectors
+      (pruneForeignReadFrozenOrDisabled allBorrows forest targetLocal readerTag
+        readProj readRangeOff readRangeLen activeProtectors
+        targetFrameDepth) := by
+  rw [hasTreeReadUB_eq_any] at hNoUB
+  exact pruneForeignReadFrozenOrDisabled_preserves_disabledRootNoop_for forest
+    hWrite (any_false_of_mem hNoUB)
+
+mutual
+private theorem pruneForeignReadFrozenOrDisabled_preserves_readRootNoop_sub
+    {allBorrows : List BorrowEntry} {activeProtectors : List Nat}
+    {targetLocal : Local} {readerTag : Option Nat} {targetFrameDepth : Nat} :
+    ∀ (t : BorrowSubtree),
+      SameAllocSubtree allBorrows t →
+      AllSubtrees (FrozenOrDisabledRootReadNoopNode activeProtectors) t →
+      (∀ e, e ∈ t.toList → e.targetProjection = []) →
+      (∀ e, e ∈ t.toList →
+        borrowEntryReadUB allBorrows activeProtectors e targetLocal readerTag
+          [] 0 0 targetFrameDepth = false) →
+      AllSubtrees (FrozenOrDisabledRootReadNoopNode activeProtectors)
+        (pruneMapSubtree
+          (readSkipFrozenOrDisabledRoot targetLocal targetFrameDepth)
+          (fun e =>
+            updateBorrowPermOnReadAtProj allBorrows e targetLocal readerTag []
+              0 0 activeProtectors targetFrameDepth)
+          t)
+  | .node root children, hAlloc, hRead, hProj, hNoUB => by
+    cases hs : readSkipFrozenOrDisabledRoot targetLocal targetFrameDepth root
+      with
+    | true =>
+      rw [pruneMapSubtree_skip children hs]; exact hRead
+    | false =>
+      have hA := AllSubtrees.node_iff.mp hAlloc
+      have hR := AllSubtrees.node_iff.mp hRead
+      have hchProj : ∀ e, e ∈ BorrowForest.toList children →
+          e.targetProjection = [] := fun e he =>
+        hProj e (by
+          rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)
+      have hchNoUB : ∀ e, e ∈ BorrowForest.toList children →
+          borrowEntryReadUB allBorrows activeProtectors e targetLocal readerTag
+            [] 0 0 targetFrameDepth = false := fun e he =>
+        hNoUB e (by
+          rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)
+      rw [pruneMapSubtree_visit children hs]
+      refine AllSubtrees.node_iff.mpr ⟨?_,
+        pruneForeignReadFrozenOrDisabled_preserves_readRootNoop_for children
+          hA.2 hR.2 hchProj hchNoUB⟩
+      intro hroot' e he
+      unfold readSkipFrozenOrDisabledRoot at hs
+      obtain ⟨hu, hpm⟩ := or_eq_false_split hs
+      have htgt := related_of_not_unrelated_root hu
+      cases hfor : accessForeignToRoot allBorrows readerTag root with
+      | false =>
+        have hfix :
+            updateBorrowPermOnReadAtProj allBorrows root targetLocal readerTag
+                [] 0 0 activeProtectors targetFrameDepth = root := by
+          cases readerTag with
+          | none => exact Bool.noConfusion hfor
+          | some rTag =>
+            unfold accessForeignToRoot at hfor
+            dsimp only [] at hfor
+            have hdesc :
+                isBorrowDescendantOrSelf allBorrows rTag root.tag = true := by
+              cases hd : isBorrowDescendantOrSelf allBorrows rTag root.tag with
+              | true => rfl
+              | false => rw [hd] at hfor; exact Bool.noConfusion hfor
+            unfold updateBorrowPermOnReadAtProj
+            rw [htgt]
+            dsimp only []
+            split
+            · rfl
+            · rw [hdesc]
+        rw [hfix] at hroot'
+        cases hroot' with
+        | inl hf => rw [hf] at hpm; exact Bool.noConfusion hpm
+        | inr hd => rw [hd] at hpm; exact Bool.noConfusion hpm
+      | true =>
+        have hEq :=
+          pruneForeignReadFrozenOrDisabled_rootNoop_equiv_fullScan hA.2 hR.2
+            targetLocal readerTag [] 0 0 targetFrameDepth
+        rw [freezeTreeBorrowsOnReadAtProj_eq_map] at hEq
+        unfold pruneForeignReadFrozenOrDisabled at hEq
+        rw [hEq] at he
+        obtain ⟨e₁, he₁, rfl⟩ := List.mem_map.mp he
+        have htgt₁ :
+            Bool.and (Nat.beq e₁.targetFrameDepth targetFrameDepth)
+              (Nat.beq e₁.targetLocal targetLocal) = true := by
+          rw [(hA.1.1 e₁ he₁).1, (hA.1.1 e₁ he₁).2]; exact htgt
+        have hmem₁ : e₁ ∈ (BorrowSubtree.node root children).toList := by
+          rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he₁
+        exact updateBorrowPermOnReadAtProj_wholeAlloc_foreign_noop allBorrows
+          activeProtectors e₁ targetLocal readerTag targetFrameDepth htgt₁
+          (hchProj e₁ he₁)
+          (fun tag htag =>
+            (SameAllocSubtree.foreign_to_all hAlloc hfor e₁ hmem₁ tag htag).1)
+          (hchNoUB e₁ he₁)
+private theorem pruneForeignReadFrozenOrDisabled_preserves_readRootNoop_for
+    {allBorrows : List BorrowEntry} {activeProtectors : List Nat}
+    {targetLocal : Local} {readerTag : Option Nat} {targetFrameDepth : Nat} :
+    ∀ (ts : List BorrowSubtree),
+      SameAllocForest allBorrows ts →
+      FrozenOrDisabledRootReadNoopForest activeProtectors ts →
+      (∀ e, e ∈ BorrowForest.toList ts → e.targetProjection = []) →
+      (∀ e, e ∈ BorrowForest.toList ts →
+        borrowEntryReadUB allBorrows activeProtectors e targetLocal readerTag
+          [] 0 0 targetFrameDepth = false) →
+      FrozenOrDisabledRootReadNoopForest activeProtectors
+        (pruneMapForest
+          (readSkipFrozenOrDisabledRoot targetLocal targetFrameDepth)
+          (fun e =>
+            updateBorrowPermOnReadAtProj allBorrows e targetLocal readerTag []
+              0 0 activeProtectors targetFrameDepth)
+          ts)
+  | [], _, _, _, _ => by
+    rw [pruneMapForest_nil]; exact AllSubtreesForest.nil_iff.mpr True.intro
+  | t :: ts, hAlloc, hRead, hProj, hNoUB => by
+    have hA := AllSubtreesForest.cons_iff.mp hAlloc
+    have hR := AllSubtreesForest.cons_iff.mp hRead
+    rw [pruneMapForest_cons]
+    exact AllSubtreesForest.cons_iff.mpr
+      ⟨pruneForeignReadFrozenOrDisabled_preserves_readRootNoop_sub t hA.1 hR.1
+        (fun e he => hProj e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_left _ he))
+        (fun e he => hNoUB e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_left _ he)),
+       pruneForeignReadFrozenOrDisabled_preserves_readRootNoop_for ts hA.2 hR.2
+        (fun e he => hProj e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_right _ he))
+        (fun e he => hNoUB e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_right _ he))⟩
+end
+
+/-- **Cell-aware multi-step read preservation of
+`FrozenOrDisabledRootReadNoopForest`** across whole-allocation non-UB reads
+(holds even when `.unique` roots have `.cell` or reservation children!). -/
+theorem pruneForeignReadFrozenOrDisabled_preserves_frozenOrDisabledRootReadNoop
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hRead : FrozenOrDisabledRootReadNoopForest activeProtectors forest)
+    (targetLocal : Local) (readerTag : Option Nat) (targetFrameDepth : Nat)
+    (hProj : ∀ e, e ∈ BorrowForest.toList forest → e.targetProjection = [])
+    (hNoUB :
+      hasTreeReadUB allBorrows (BorrowForest.toList forest) activeProtectors
+        targetLocal readerTag [] 0 0 targetFrameDepth = false) :
+    FrozenOrDisabledRootReadNoopForest activeProtectors
+      (pruneForeignReadFrozenOrDisabled allBorrows forest targetLocal readerTag
+        [] 0 0 activeProtectors targetFrameDepth) := by
+  rw [hasTreeReadUB_eq_any] at hNoUB
+  exact pruneForeignReadFrozenOrDisabled_preserves_readRootNoop_for forest
+    hAlloc hRead hProj (any_false_of_mem hNoUB)
+
+mutual
+private theorem pruneForeignWriteDisabled_preserves_disabledRootNoop_direct_sub
+    {allBorrows : List BorrowEntry} {activeProtectors : List Nat}
+    {targetLocal : Local} {targetFrameDepth : Nat} :
+    ∀ (t : BorrowSubtree),
+      SameAllocSubtree allBorrows t →
+      AllSubtrees (DisabledRootWriteNoopNode activeProtectors) t →
+      (∀ e, e ∈ t.toList → e.targetProjection = []) →
+      (∀ e, e ∈ t.toList →
+        protectedTreeWriteConflictAt allBorrows activeProtectors targetLocal
+          none [] 0 0 targetFrameDepth e = false) →
+      AllSubtrees (DisabledRootWriteNoopNode activeProtectors)
+        (pruneMapSubtree
+          (writeSkipDisabledRoot allBorrows targetLocal none targetFrameDepth)
+          (fun e =>
+            updateBorrowPermTreeAtProj allBorrows e targetLocal none [] 0 0
+              targetFrameDepth)
+          t)
+  | .node root children, hAlloc, hWrite, hProj, hNoConf => by
+    cases hs : writeSkipDisabledRoot allBorrows targetLocal none
+        targetFrameDepth root with
+    | true =>
+      rw [pruneMapSubtree_skip children hs]; exact hWrite
+    | false =>
+      have hA := AllSubtrees.node_iff.mp hAlloc
+      have hW := AllSubtrees.node_iff.mp hWrite
+      have hchProj : ∀ e, e ∈ BorrowForest.toList children →
+          e.targetProjection = [] := fun e he =>
+        hProj e (by
+          rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)
+      have hchNoConf : ∀ e, e ∈ BorrowForest.toList children →
+          protectedTreeWriteConflictAt allBorrows activeProtectors targetLocal
+            none [] 0 0 targetFrameDepth e = false := fun e he =>
+        hNoConf e (by
+          rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)
+      rw [pruneMapSubtree_visit children hs]
+      refine AllSubtrees.node_iff.mpr ⟨?_,
+        pruneForeignWriteDisabled_preserves_disabledRootNoop_direct_for
+          children hA.2 hW.2 hchProj hchNoConf⟩
+      intro _ e he
+      unfold writeSkipDisabledRoot at hs
+      have hu := (or_eq_false_split hs).1
+      have htgt := related_of_not_unrelated_root hu
+      have hEq :=
+        pruneForeignWriteDisabled_rootNoop_equiv_fullScan hA.2 hW.2 targetLocal
+          none [] 0 0 targetFrameDepth
+      rw [invalidateTreeBorrowsAtProj_eq_map] at hEq
+      unfold pruneForeignWriteDisabled at hEq
+      rw [hEq] at he
+      obtain ⟨e₁, he₁, rfl⟩ := List.mem_map.mp he
+      have htgt₁ :
+          Bool.and (Nat.beq e₁.targetFrameDepth targetFrameDepth)
+            (Nat.beq e₁.targetLocal targetLocal) = true := by
+        rw [(hA.1.1 e₁ he₁).1, (hA.1.1 e₁ he₁).2]; exact htgt
+      exact updateBorrowPermTreeAtProj_wholeAlloc_direct_noop allBorrows
+        activeProtectors e₁ targetLocal targetFrameDepth htgt₁ (hchProj e₁ he₁)
+        (hchNoConf e₁ he₁)
+private theorem pruneForeignWriteDisabled_preserves_disabledRootNoop_direct_for
+    {allBorrows : List BorrowEntry} {activeProtectors : List Nat}
+    {targetLocal : Local} {targetFrameDepth : Nat} :
+    ∀ (ts : List BorrowSubtree),
+      SameAllocForest allBorrows ts →
+      DisabledRootWriteNoopForest activeProtectors ts →
+      (∀ e, e ∈ BorrowForest.toList ts → e.targetProjection = []) →
+      (∀ e, e ∈ BorrowForest.toList ts →
+        protectedTreeWriteConflictAt allBorrows activeProtectors targetLocal
+          none [] 0 0 targetFrameDepth e = false) →
+      DisabledRootWriteNoopForest activeProtectors
+        (pruneMapForest
+          (writeSkipDisabledRoot allBorrows targetLocal none targetFrameDepth)
+          (fun e =>
+            updateBorrowPermTreeAtProj allBorrows e targetLocal none [] 0 0
+              targetFrameDepth)
+          ts)
+  | [], _, _, _, _ => by
+    rw [pruneMapForest_nil]; exact AllSubtreesForest.nil_iff.mpr True.intro
+  | t :: ts, hAlloc, hWrite, hProj, hNoConf => by
+    have hA := AllSubtreesForest.cons_iff.mp hAlloc
+    have hW := AllSubtreesForest.cons_iff.mp hWrite
+    rw [pruneMapForest_cons]
+    exact AllSubtreesForest.cons_iff.mpr
+      ⟨pruneForeignWriteDisabled_preserves_disabledRootNoop_direct_sub t hA.1
+        hW.1
+        (fun e he => hProj e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_left _ he))
+        (fun e he => hNoConf e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_left _ he)),
+       pruneForeignWriteDisabled_preserves_disabledRootNoop_direct_for ts hA.2
+        hW.2
+        (fun e he => hProj e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_right _ he))
+        (fun e he => hNoConf e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_right _ he))⟩
+end
+
+/-- **Cell-aware multi-step write preservation of
+`DisabledRootWriteNoopForest`** across direct whole-allocation writes (survives
+both `cexCellUniqueForest` and `cexUniqueCellForest`!). -/
+theorem pruneForeignWriteDisabled_preserves_disabledRootWriteNoop_direct
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hWrite : DisabledRootWriteNoopForest activeProtectors forest)
+    (targetLocal : Local) (targetFrameDepth : Nat)
+    (hProj : ∀ e, e ∈ BorrowForest.toList forest → e.targetProjection = [])
+    (hNoConf :
+      hasProtectedTreeWriteConflict allBorrows (BorrowForest.toList forest)
+        activeProtectors targetLocal none [] 0 0 targetFrameDepth = false) :
+    DisabledRootWriteNoopForest activeProtectors
+      (pruneForeignWriteDisabled allBorrows forest targetLocal none [] 0 0
+        targetFrameDepth) := by
+  rw [hasProtectedTreeWriteConflict_eq_any] at hNoConf
+  exact pruneForeignWriteDisabled_preserves_disabledRootNoop_direct_for forest
+    hAlloc hWrite hProj (any_false_of_mem hNoConf)
+
+mutual
+private theorem pruneForeignWriteDisabled_preserves_readRootNoop_direct_sub
+    {allBorrows : List BorrowEntry} {activeProtectors : List Nat}
+    {targetLocal : Local} {targetFrameDepth : Nat} :
+    ∀ (t : BorrowSubtree),
+      SameAllocSubtree allBorrows t →
+      AllSubtrees (DisabledRootWriteNoopNode activeProtectors) t →
+      AllSubtrees (FrozenOrDisabledRootReadNoopNode activeProtectors) t →
+      (∀ e, e ∈ t.toList → e.targetProjection = []) →
+      (∀ e, e ∈ t.toList →
+        protectedTreeWriteConflictAt allBorrows activeProtectors targetLocal
+          none [] 0 0 targetFrameDepth e = false) →
+      AllSubtrees (FrozenOrDisabledRootReadNoopNode activeProtectors)
+        (pruneMapSubtree
+          (writeSkipDisabledRoot allBorrows targetLocal none targetFrameDepth)
+          (fun e =>
+            updateBorrowPermTreeAtProj allBorrows e targetLocal none [] 0 0
+              targetFrameDepth)
+          t)
+  | .node root children, hAlloc, hWrite, hRead, hProj, hNoConf => by
+    cases hs : writeSkipDisabledRoot allBorrows targetLocal none
+        targetFrameDepth root with
+    | true =>
+      rw [pruneMapSubtree_skip children hs]; exact hRead
+    | false =>
+      have hA := AllSubtrees.node_iff.mp hAlloc
+      have hW := AllSubtrees.node_iff.mp hWrite
+      have hR := AllSubtrees.node_iff.mp hRead
+      have hchProj : ∀ e, e ∈ BorrowForest.toList children →
+          e.targetProjection = [] := fun e he =>
+        hProj e (by
+          rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)
+      have hchNoConf : ∀ e, e ∈ BorrowForest.toList children →
+          protectedTreeWriteConflictAt allBorrows activeProtectors targetLocal
+            none [] 0 0 targetFrameDepth e = false := fun e he =>
+        hNoConf e (by
+          rw [BorrowSubtree.toList_node]; exact List.mem_cons_of_mem _ he)
+      rw [pruneMapSubtree_visit children hs]
+      refine AllSubtrees.node_iff.mpr ⟨?_,
+        pruneForeignWriteDisabled_preserves_readRootNoop_direct_for children
+          hA.2 hW.2 hR.2 hchProj hchNoConf⟩
+      intro _ e he
+      unfold writeSkipDisabledRoot at hs
+      have hu := (or_eq_false_split hs).1
+      have htgt := related_of_not_unrelated_root hu
+      have hEq :=
+        pruneForeignWriteDisabled_rootNoop_equiv_fullScan hA.2 hW.2 targetLocal
+          none [] 0 0 targetFrameDepth
+      rw [invalidateTreeBorrowsAtProj_eq_map] at hEq
+      unfold pruneForeignWriteDisabled at hEq
+      rw [hEq] at he
+      obtain ⟨e₁, he₁, rfl⟩ := List.mem_map.mp he
+      have htgt₁ :
+          Bool.and (Nat.beq e₁.targetFrameDepth targetFrameDepth)
+            (Nat.beq e₁.targetLocal targetLocal) = true := by
+        rw [(hA.1.1 e₁ he₁).1, (hA.1.1 e₁ he₁).2]; exact htgt
+      exact isForeignReadNoopPerm_of_writeNoop
+        (updateBorrowPermTreeAtProj_wholeAlloc_direct_noop allBorrows
+          activeProtectors e₁ targetLocal targetFrameDepth htgt₁
+          (hchProj e₁ he₁) (hchNoConf e₁ he₁))
+private theorem pruneForeignWriteDisabled_preserves_readRootNoop_direct_for
+    {allBorrows : List BorrowEntry} {activeProtectors : List Nat}
+    {targetLocal : Local} {targetFrameDepth : Nat} :
+    ∀ (ts : List BorrowSubtree),
+      SameAllocForest allBorrows ts →
+      DisabledRootWriteNoopForest activeProtectors ts →
+      FrozenOrDisabledRootReadNoopForest activeProtectors ts →
+      (∀ e, e ∈ BorrowForest.toList ts → e.targetProjection = []) →
+      (∀ e, e ∈ BorrowForest.toList ts →
+        protectedTreeWriteConflictAt allBorrows activeProtectors targetLocal
+          none [] 0 0 targetFrameDepth e = false) →
+      FrozenOrDisabledRootReadNoopForest activeProtectors
+        (pruneMapForest
+          (writeSkipDisabledRoot allBorrows targetLocal none targetFrameDepth)
+          (fun e =>
+            updateBorrowPermTreeAtProj allBorrows e targetLocal none [] 0 0
+              targetFrameDepth)
+          ts)
+  | [], _, _, _, _, _ => by
+    rw [pruneMapForest_nil]; exact AllSubtreesForest.nil_iff.mpr True.intro
+  | t :: ts, hAlloc, hWrite, hRead, hProj, hNoConf => by
+    have hA := AllSubtreesForest.cons_iff.mp hAlloc
+    have hW := AllSubtreesForest.cons_iff.mp hWrite
+    have hR := AllSubtreesForest.cons_iff.mp hRead
+    rw [pruneMapForest_cons]
+    exact AllSubtreesForest.cons_iff.mpr
+      ⟨pruneForeignWriteDisabled_preserves_readRootNoop_direct_sub t hA.1 hW.1
+        hR.1
+        (fun e he => hProj e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_left _ he))
+        (fun e he => hNoConf e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_left _ he)),
+       pruneForeignWriteDisabled_preserves_readRootNoop_direct_for ts hA.2 hW.2
+        hR.2
+        (fun e he => hProj e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_right _ he))
+        (fun e he => hNoConf e (by
+          rw [BorrowForest.toList_cons]; exact List.mem_append_right _ he))⟩
+end
+
+/-- **Cell-aware multi-step write preservation of
+`FrozenOrDisabledRootReadNoopForest`** across direct whole-allocation writes:
+both root-noop invariants compose across interleaved reads and writes! -/
+theorem pruneForeignWriteDisabled_preserves_frozenOrDisabledRootReadNoop_direct
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hWrite : DisabledRootWriteNoopForest activeProtectors forest)
+    (hRead : FrozenOrDisabledRootReadNoopForest activeProtectors forest)
+    (targetLocal : Local) (targetFrameDepth : Nat)
+    (hProj : ∀ e, e ∈ BorrowForest.toList forest → e.targetProjection = [])
+    (hNoConf :
+      hasProtectedTreeWriteConflict allBorrows (BorrowForest.toList forest)
+        activeProtectors targetLocal none [] 0 0 targetFrameDepth = false) :
+    FrozenOrDisabledRootReadNoopForest activeProtectors
+      (pruneForeignWriteDisabled allBorrows forest targetLocal none [] 0 0
+        targetFrameDepth) := by
+  rw [hasProtectedTreeWriteConflict_eq_any] at hNoConf
+  exact pruneForeignWriteDisabled_preserves_readRootNoop_direct_for forest
+    hAlloc hWrite hRead hProj (any_false_of_mem hNoConf)
+
 
 /-! ### 1.6 `MirLiftCore` integration: erasing unrelated foreign subtrees -/
 
@@ -4996,6 +5922,73 @@ theorem unique_root_cell_child_breaks_disabledClosed_and_frozenClosed :
     pruneForeignReadFrozenOrDisabled_preserves_disabledClosed hDis 0 none [] 0
       0 0 rfl
   exact ⟨hDis, hFrz, hBreakDis, hBreakFrz, hKeepDis⟩
+
+/--
+**Resolution of the fifth tightness witness via cell-aware root-noop
+invariants.** On `cexUniqueCellForest` (where a foreign write broke
+`DisabledClosedForest` and a foreign read broke `FrozenClosedForest`), BOTH
+`DisabledRootWriteNoopForest []` and `FrozenOrDisabledRootReadNoopForest []`
+hold initially AND survive BOTH the foreign write AND the foreign read!
+-/
+theorem cexUniqueCellForest_preserves_rootNoop_invariants :
+    SameAllocForest cexUniqueCellBorrows cexUniqueCellForest ∧
+    DisabledRootWriteNoopForest [] cexUniqueCellForest ∧
+    FrozenOrDisabledRootReadNoopForest [] cexUniqueCellForest ∧
+    DisabledRootWriteNoopForest []
+      (pruneForeignWriteDisabled cexUniqueCellBorrows cexUniqueCellForest 0
+        none [] 0 0 0) ∧
+    FrozenOrDisabledRootReadNoopForest []
+      (pruneForeignWriteDisabled cexUniqueCellBorrows cexUniqueCellForest 0
+        none [] 0 0 0) ∧
+    DisabledRootWriteNoopForest []
+      (pruneForeignReadFrozenOrDisabled cexUniqueCellBorrows
+        cexUniqueCellForest 0 none [] 0 0 [] 0) ∧
+    FrozenOrDisabledRootReadNoopForest []
+      (pruneForeignReadFrozenOrDisabled cexUniqueCellBorrows
+        cexUniqueCellForest 0 none [] 0 0 [] 0) := by
+  obtain ⟨hDis0, hFrz0, _, _, _⟩ :=
+    unique_root_cell_child_breaks_disabledClosed_and_frozenClosed
+  have hSame : SameAllocForest cexUniqueCellBorrows cexUniqueCellForest := by
+    let upd : BorrowEntry → BorrowEntry :=
+      fun e => if e.tag = 1 then { e with perm := .unique } else e
+    have hForestEq :
+        cexUniqueCellForest =
+          pruneMapForest (fun _ => false) upd (cexForestOf .cell) := rfl
+    have hBorrowsEq :
+        cexUniqueCellBorrows = (cexBorrows .cell).map upd := rfl
+    rw [hForestEq, hBorrowsEq]
+    exact pruneMapForest_preserves_sameAlloc
+      (fun e => by dsimp only [upd]; split <;> rfl)
+      (fun e => by dsimp only [upd]; split <;> rfl)
+      (fun e => by dsimp only [upd]; split <;> rfl)
+      (fun c a => isBorrowDescendantOrSelf_map
+        (fun e => by dsimp only [upd]; split <;> rfl)
+        (fun e => by dsimp only [upd]; split <;> rfl)
+        (cexBorrows .cell) c a)
+      (cexForestOf .cell) (cexForestOf_sameAlloc .cell)
+  have hW0 : DisabledRootWriteNoopForest [] cexUniqueCellForest :=
+    hDis0.to_disabledRootWriteNoop
+  have hR0 : FrozenOrDisabledRootReadNoopForest [] cexUniqueCellForest :=
+    hFrz0.to_frozenOrDisabledRootReadNoop hDis0
+  have hProj :
+      ∀ e, e ∈ BorrowForest.toList cexUniqueCellForest →
+        e.targetProjection = [] := by
+    intro e he
+    cases he with
+    | head => rfl
+    | tail _ ht =>
+      cases ht with
+      | head => rfl
+      | tail _ ht2 => cases ht2
+  exact ⟨hSame, hW0, hR0,
+    pruneForeignWriteDisabled_preserves_disabledRootWriteNoop_direct hSame hW0
+      0 0 hProj rfl,
+    pruneForeignWriteDisabled_preserves_frozenOrDisabledRootReadNoop_direct
+      hSame hW0 hR0 0 0 hProj rfl,
+    pruneForeignReadFrozenOrDisabled_preserves_disabledRootWriteNoop hW0 0 none
+      [] 0 0 0 rfl,
+    pruneForeignReadFrozenOrDisabled_preserves_frozenOrDisabledRootReadNoop
+      hSame hR0 0 none 0 hProj rfl⟩
 
 /--
 **Fourth tightness witness (partial-projection read breaks
@@ -6078,6 +7071,289 @@ theorem prepFnEntryRetagThin_pruned_borrows_conservative
    (pruneForeignReadFrozenOrDisabled_equiv_fullScan hAlloc hDis hFrz
       _ _ _ _ _ _ _).symm⟩
 
+/--
+**Cell-aware Part 1 ↔ Part 2 bridge on thin-reference function-entry retag.**
+Requires only `SameAllocForest` and `FrozenOrDisabledRootReadNoopForest`, so
+the bridge survives both `.cell` parents with `.unique` children AND `.unique`
+parents with `.cell` children after foreign reads or writes.
+-/
+theorem prepFnEntryRetagThin_pruned_borrows_rootNoop
+    {forest : BorrowForest} {activeProtectors : List Nat}
+    (hAlloc : SameAllocForest (BorrowForest.toList forest) forest)
+    (hRead : FrozenOrDisabledRootReadNoopForest activeProtectors forest)
+    (parentEntry : BorrowEntry) (ptrTag : Nat) :
+    hasTreeReadUB (BorrowForest.toList forest) (BorrowForest.toList forest)
+        activeProtectors parentEntry.targetLocal (.some ptrTag)
+        parentEntry.targetProjection parentEntry.rangeOffset
+        parentEntry.rangeLen parentEntry.targetFrameDepth =
+      pruneHasTreeReadUBFrozenOrDisabled (BorrowForest.toList forest) forest
+        activeProtectors parentEntry.targetLocal (.some ptrTag)
+        parentEntry.targetProjection parentEntry.rangeOffset
+        parentEntry.rangeLen parentEntry.targetFrameDepth ∧
+    freezeTreeBorrowsOnReadAtProj (BorrowForest.toList forest)
+        (BorrowForest.toList forest) parentEntry.targetLocal (.some ptrTag)
+        parentEntry.targetProjection parentEntry.rangeOffset
+        parentEntry.rangeLen activeProtectors parentEntry.targetFrameDepth =
+      BorrowForest.toList
+        (pruneForeignReadFrozenOrDisabled (BorrowForest.toList forest) forest
+          parentEntry.targetLocal (.some ptrTag) parentEntry.targetProjection
+          parentEntry.rangeOffset parentEntry.rangeLen activeProtectors
+          parentEntry.targetFrameDepth) :=
+  ⟨(pruneHasTreeReadUBFrozenOrDisabled_rootNoop_equiv_fullScan hAlloc hRead
+      _ _ _ _ _ _).symm,
+   (pruneForeignReadFrozenOrDisabled_rootNoop_equiv_fullScan hAlloc hRead
+      _ _ _ _ _ _).symm⟩
+
+/--
+Unified Stage-3 function-entry retag in `FramePrepM` (`prepFnEntryRetagAny`)
+matching `Statements.lean` across ALL typed reference representations at an
+unprojected parameter local `loc`:
+- thin pointers `.ptr ptrVal sz` (`&T` / `&mut T`): delegates to
+  `prepFnEntryRetagThin` (`evalFnEntryRetag`);
+- zero-sized scalar references `.scalar sc` (`&ZST` / `&mut ZST`): checks
+  non-null ZST validity and advances `stmtIdx`;
+- fat slice/str references `.aggregate 0 [.ptr ptrVal 8, .scalar _]`
+  (`&[T]` / `&mut [T]` / `&str`): checks `entry.perm ≠ .disabled` (and
+  `entry.perm ≠ .frozen` when `mutability = .mut`), attaches a fresh protector
+  via `attachBorrowProtector`, and advances `stmtIdx`.
+-/
+def prepFnEntryRetagAny (cur : CapturedMir) (loc : Local) :
+    FramePrepM Unit := fun s =>
+  let place : Place := { local_ := loc, projection := [] }
+  match
+    evalOperand s.frame.locals (.copy place) s.memory.borrows s.memory.globals
+      cur.layouts s.memory.callerLocals cur.localDecls s.memory.callStack
+  with
+  | .ub => .error (.fail .ub) s
+  | .unsupported => .error (.fail .unsupported) s
+  | .ok val locals' =>
+    match placeTy cur.localDecls cur.layouts place with
+    | .some { kind := .ref mutability pointee, .. } =>
+      match rigidTyIsUninhabited 16 pointee with
+      | true => .error (.fail .ub) s
+      | false =>
+        match val with
+        | .ptr _ _ => (prepFnEntryRetagThin cur loc).run s
+        | .scalar sc =>
+          match
+            Bool.and (rigidTyIsZeroSized 16 pointee)
+              (Bool.not (Nat.beq sc.bits 0))
+          with
+          | true => .ok () (advanceStmt s locals')
+          | false => .error (.fail .ub) s
+        | .aggregate variant (.ptr ptrVal sz :: .scalar _ :: .nil) =>
+          match Bool.and (Nat.beq variant 0) (Nat.beq sz 8) with
+          | false => .error (.fail .ub) s
+          | true =>
+            match lookupBorrow s.memory.borrows ptrVal.tag with
+            | .none => .error (.fail .unsupported) s
+            | .some entry =>
+              match entry.perm, mutability with
+              | .disabled, _ => .error (.fail .ub) s
+              | .frozen, .mut => .error (.fail .ub) s
+              | _, _ =>
+                let protId := s.memory.nextProtector
+                let mem' : Memory :=
+                  { s.memory with
+                    borrows :=
+                      attachBorrowProtector s.memory.borrows ptrVal.tag protId
+                    activeProtectors := protId :: s.memory.activeProtectors
+                    nextProtector := Nat.add protId 1 }
+                .ok () (advanceStmt s locals' mem')
+        | _ => .error (.fail .ub) s
+    | _ => .error (.fail .unsupported) s
+
+/-- Unified `prepFnEntryRetagAny` coincides with `stepMirFn` on typed thin
+references (`.ptr ptrVal sz`). -/
+theorem stepMirFn_retag_fnEntry_any_ptr {body cur : CapturedMir}
+    {s : MachineState} {blk : BasicBlockData} {loc : Local} {span : String}
+    {mutability : Mutability} {pointee : RigidTy} {lIdx sz : Nat}
+    {ptrVal : ProvenancePtr} {parentEntry : BorrowEntry}
+    {locals' : List LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hStmt : get? blk.statements s.frame.stmtIdx =
+      some { kind := .retag .fnEntry { local_ := loc, projection := [] },
+             span := span })
+    (hOp : evalOperand s.frame.locals
+      (.copy { local_ := loc, projection := [] }) s.memory.borrows
+      s.memory.globals cur.layouts s.memory.callerLocals cur.localDecls
+      s.memory.callStack = .ok (.ptr ptrVal sz) locals')
+    (hTy : placeTy cur.localDecls cur.layouts
+      { local_ := loc, projection := [] } =
+        some { kind := .ref mutability pointee, layoutIdx := lIdx })
+    (hLook : lookupBorrow s.memory.borrows ptrVal.tag = some parentEntry) :
+    (∀ s', (prepFnEntryRetagAny cur loc).run s = .ok () s' →
+      stepMirFn body s = MirStepNode.step s') ∧
+    ((prepFnEntryRetagAny cur loc).run s = .error (.fail .ub) s →
+      stepMirFn body s = MirStepNode.fail .ub) ∧
+    (∀ s', (prepFnEntryRetagAny cur loc).run s = .ok () s' →
+      s'.memory.callStack = s.memory.callStack) := by
+  have hEq :
+      (prepFnEntryRetagAny cur loc).run s =
+        (prepFnEntryRetagThin cur loc).run s := by
+    unfold prepFnEntryRetagAny prepFnEntryRetagThin EStateM.run
+    dsimp only []
+    rw [hOp]
+    dsimp only []
+    rw [hTy]
+    dsimp only []
+    cases rigidTyIsUninhabited 16 pointee <;> rfl
+  rw [hEq]
+  exact stepMirFn_retag_fnEntry_thinRef hCur hPhase hBb hStmt hOp hTy hLook
+
+/-- Unified `prepFnEntryRetagAny` coincides with `stepMirFn` on typed fat
+references (`.aggregate 0 [.ptr ptrVal 8, .scalar lenSc]`, e.g., `&[T]` and
+`&mut [T]`), including both normal protector attachment and `.ub` faults on
+uninhabited pointees, `.disabled` borrows, or `.frozen` `&mut [T]` borrows. -/
+theorem stepMirFn_retag_fnEntry_any_fat {body cur : CapturedMir}
+    {s : MachineState} {blk : BasicBlockData} {loc : Local} {span : String}
+    {mutability : Mutability} {pointee : RigidTy} {lIdx : Nat}
+    {ptrVal : ProvenancePtr} {lenSc : ScalarVal} {parentEntry : BorrowEntry}
+    {locals' : List LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hStmt : get? blk.statements s.frame.stmtIdx =
+      some { kind := .retag .fnEntry { local_ := loc, projection := [] },
+             span := span })
+    (hOp : evalOperand s.frame.locals
+      (.copy { local_ := loc, projection := [] }) s.memory.borrows
+      s.memory.globals cur.layouts s.memory.callerLocals cur.localDecls
+      s.memory.callStack =
+        .ok (.aggregate 0 [.ptr ptrVal 8, .scalar lenSc]) locals')
+    (hTy : placeTy cur.localDecls cur.layouts
+      { local_ := loc, projection := [] } =
+        some { kind := .ref mutability pointee, layoutIdx := lIdx })
+    (hLook : lookupBorrow s.memory.borrows ptrVal.tag = some parentEntry) :
+    (∀ s', (prepFnEntryRetagAny cur loc).run s = .ok () s' →
+      stepMirFn body s = MirStepNode.step s') ∧
+    ((prepFnEntryRetagAny cur loc).run s = .error (.fail .ub) s →
+      stepMirFn body s = MirStepNode.fail .ub) ∧
+    (∀ s', (prepFnEntryRetagAny cur loc).run s = .ok () s' →
+      s'.memory.callStack = s.memory.callStack) := by
+  have hStepEq := stepMirFn_frame_stmt hCur hPhase hBb hStmt
+  unfold prepFnEntryRetagAny EStateM.run
+  dsimp only []
+  rw [hOp]
+  dsimp only []
+  rw [hTy]
+  dsimp only []
+  cases hUninhab : rigidTyIsUninhabited 16 pointee with
+  | true =>
+    refine ⟨fun _ h => (by cases h), fun _ => ?_, fun _ h => by cases h⟩
+    rw [hStepEq]; unfold evalStmt; dsimp only []
+    rw [hOp]; dsimp only []; rw [hTy]; dsimp only []; rw [hUninhab]
+  | false =>
+    dsimp only []
+    rw [hLook]
+    dsimp only []
+    cases mutability with
+    | not =>
+      cases hpm : parentEntry.perm <;> dsimp only []
+      case disabled =>
+        refine ⟨fun _ h => (by cases h), fun _ => ?_, fun _ h => by cases h⟩
+        rw [hStepEq]; unfold evalStmt; dsimp only []
+        rw [hOp]; dsimp only []; rw [hTy]; dsimp only []; rw [hUninhab]
+        simp only []; rw [hLook]; simp only [hpm]
+      all_goals
+        refine ⟨fun s' h => ?_, fun h => (by cases h),
+          fun s' h => by cases h; rfl⟩
+        cases h
+        rw [hStepEq]; unfold evalStmt; dsimp only []
+        rw [hOp]; dsimp only []; rw [hTy]; dsimp only []; rw [hUninhab]
+        simp only []; rw [hLook]; simp only [hpm]
+    | «mut» =>
+      cases hpm : parentEntry.perm <;> dsimp only []
+      case disabled =>
+        refine ⟨fun _ h => (by cases h), fun _ => ?_, fun _ h => by cases h⟩
+        rw [hStepEq]; unfold evalStmt; dsimp only []
+        rw [hOp]; dsimp only []; rw [hTy]; dsimp only []; rw [hUninhab]
+        simp only []; rw [hLook]; simp only [hpm]
+      case frozen =>
+        refine ⟨fun _ h => (by cases h), fun _ => ?_, fun _ h => by cases h⟩
+        rw [hStepEq]; unfold evalStmt; dsimp only []
+        rw [hOp]; dsimp only []; rw [hTy]; dsimp only []; rw [hUninhab]
+        simp only []; rw [hLook]; simp only [hpm]
+      all_goals
+        refine ⟨fun s' h => ?_, fun h => (by cases h),
+          fun s' h => by cases h; rfl⟩
+        cases h
+        rw [hStepEq]; unfold evalStmt; dsimp only []
+        rw [hOp]; dsimp only []; rw [hTy]; dsimp only []; rw [hUninhab]
+        simp only []; rw [hLook]; simp only [hpm]
+
+/-- Unified `prepFnEntryRetagAny` coincides with `stepMirFn` on typed scalar
+zero-sized references (`.scalar sc`, e.g., `&()` / `&mut ()`). -/
+theorem stepMirFn_retag_fnEntry_any_zst {body cur : CapturedMir}
+    {s : MachineState} {blk : BasicBlockData} {loc : Local} {span : String}
+    {mutability : Mutability} {pointee : RigidTy} {lIdx : Nat}
+    {sc : ScalarVal} {locals' : List LocalSlot}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hStmt : get? blk.statements s.frame.stmtIdx =
+      some { kind := .retag .fnEntry { local_ := loc, projection := [] },
+             span := span })
+    (hOp : evalOperand s.frame.locals
+      (.copy { local_ := loc, projection := [] }) s.memory.borrows
+      s.memory.globals cur.layouts s.memory.callerLocals cur.localDecls
+      s.memory.callStack = .ok (.scalar sc) locals')
+    (hTy : placeTy cur.localDecls cur.layouts
+      { local_ := loc, projection := [] } =
+        some { kind := .ref mutability pointee, layoutIdx := lIdx }) :
+    (∀ s', (prepFnEntryRetagAny cur loc).run s = .ok () s' →
+      stepMirFn body s = MirStepNode.step s') ∧
+    ((prepFnEntryRetagAny cur loc).run s = .error (.fail .ub) s →
+      stepMirFn body s = MirStepNode.fail .ub) ∧
+    (∀ s', (prepFnEntryRetagAny cur loc).run s = .ok () s' →
+      s'.memory.callStack = s.memory.callStack) := by
+  have hStepEq := stepMirFn_frame_stmt hCur hPhase hBb hStmt
+  unfold prepFnEntryRetagAny EStateM.run
+  dsimp only []; rw [hOp]; dsimp only []; rw [hTy]; dsimp only []
+  cases hUninhab : rigidTyIsUninhabited 16 pointee with
+  | true =>
+    refine ⟨fun _ h => (by cases h), fun _ => ?_, fun _ h => by cases h⟩
+    rw [hStepEq]; unfold evalStmt; dsimp only []
+    rw [hOp]; dsimp only []; rw [hTy]; dsimp only []; rw [hUninhab]
+  | false =>
+    dsimp only []
+    cases hZ : Bool.and (rigidTyIsZeroSized 16 pointee)
+        (Bool.not (Nat.beq sc.bits 0)) with
+    | true =>
+      refine ⟨fun s' h => ?_, fun h => (by cases h),
+        fun s' h => by cases h; rfl⟩
+      cases h
+      rw [hStepEq]; unfold evalStmt; dsimp only []
+      rw [hOp]; dsimp only []; rw [hTy]; dsimp only []; rw [hUninhab]
+      dsimp only []; rw [hZ]
+    | false =>
+      refine ⟨fun _ h => (by cases h), fun _ => ?_, fun _ h => by cases h⟩
+      rw [hStepEq]; unfold evalStmt; dsimp only []
+      rw [hOp]; dsimp only []; rw [hTy]; dsimp only []; rw [hUninhab]
+      dsimp only []; rw [hZ]
+
+/-- Multi-parameter Stage-3 unified reference retag sequence: runs
+`prepFnEntryRetagAny` in order across arbitrary mixed thin (`&T`/`&mut T`),
+fat (`&[T]`/`&mut [T]`), and ZST (`&()`) reference parameter locals. -/
+def prepFnEntryRetags (cur : CapturedMir) :
+    List Local → FramePrepM Unit
+  | [] => pure ()
+  | loc :: locs =>
+    prepFnEntryRetagAny cur loc >>= fun _ => prepFnEntryRetags cur locs
+
+/-- 0-parameter fast path for `prepFnEntryRetags`. -/
+theorem prepFnEntryRetags_nil (cur : CapturedMir) :
+    prepFnEntryRetags cur [] = pure () := rfl
+
+/-- Step equation for `prepFnEntryRetags`. -/
+theorem prepFnEntryRetags_cons (cur : CapturedMir) (loc : Local)
+    (locs : List Local) :
+    prepFnEntryRetags cur (loc :: locs) =
+      (prepFnEntryRetagAny cur loc >>= fun _ =>
+        prepFnEntryRetags cur locs) := rfl
+
 /-- Multi-parameter Stage-3 thin-reference retag sequence: runs
 `prepFnEntryRetagThin` in order across a list of reference parameter locals. -/
 def prepFnEntryRetagThins (cur : CapturedMir) :
@@ -6220,6 +7496,256 @@ theorem prepFnEntryRetagThins_stepsTo {body cur : CapturedMir} :
       fun l st st₁ hl hblk hcal hrun =>
         hStep l st st₁ (List.mem_cons_of_mem _ hl)
           (hblk.trans hMeta.1) (hcal.trans hMeta.2.2.1) hrun
+    exact ⟨StepsTo.step hStep₁ hTail, hStackTail.trans hMeta.2.2.2⟩
+
+/-- `prepFnEntryRetagAny` preserves `blockIdx`, `activeCallee`, and
+`callStack`, and advances `stmtIdx` by `1`. -/
+theorem prepFnEntryRetagAny_preserves_meta {cur : CapturedMir} {loc : Local}
+    {s s' : MachineState}
+    (h : (prepFnEntryRetagAny cur loc).run s = .ok () s') :
+    s'.frame.blockIdx = s.frame.blockIdx ∧
+    s'.frame.stmtIdx = Nat.add s.frame.stmtIdx 1 ∧
+    s'.memory.activeCallee = s.memory.activeCallee ∧
+    s'.memory.callStack = s.memory.callStack := by
+  have h' := h
+  unfold prepFnEntryRetagAny EStateM.run at h'
+  dsimp only [] at h'
+  cases hOp : evalOperand s.frame.locals
+      (.copy { local_ := loc, projection := [] }) s.memory.borrows
+      s.memory.globals cur.layouts s.memory.callerLocals cur.localDecls
+      s.memory.callStack with
+  | ub => rw [hOp] at h'; cases h'
+  | unsupported => rw [hOp] at h'; cases h'
+  | ok val locals' =>
+    rw [hOp] at h'; dsimp only [] at h'
+    cases hTy : placeTy cur.localDecls cur.layouts
+        { local_ := loc, projection := [] } with
+    | none => rw [hTy] at h'; cases h'
+    | some ty =>
+      rw [hTy] at h'
+      cases ty with
+      | mk kind lIdx =>
+        cases kind with
+        | ref mutability pointee =>
+          dsimp only [] at h'
+          cases hU : rigidTyIsUninhabited 16 pointee with
+          | true => rw [hU] at h'; cases h'
+          | false =>
+            rw [hU] at h'; dsimp only [] at h'
+            cases val with
+            | ptr ptrVal sz =>
+              exact prepFnEntryRetagThin_preserves_meta h'
+            | scalar sc =>
+              dsimp only [] at h'
+              cases hZ : Bool.and (rigidTyIsZeroSized 16 pointee)
+                  (Bool.not (Nat.beq sc.bits 0)) with
+              | true => rw [hZ] at h'; cases h'; exact ⟨rfl, rfl, rfl, rfl⟩
+              | false => rw [hZ] at h'; cases h'
+            | aggregate variant fields =>
+              cases fields with
+              | nil => cases h'
+              | cons f1 fs =>
+                cases f1 with
+                | ptr ptrVal sz =>
+                  cases fs with
+                  | nil => cases h'
+                  | cons f2 fs2 =>
+                    cases f2 with
+                    | scalar lenSc =>
+                      cases fs2 with
+                      | nil =>
+                        dsimp only [] at h'
+                        cases hB : Bool.and (Nat.beq variant 0) (Nat.beq sz 8)
+                          with
+                        | false => rw [hB] at h'; cases h'
+                        | true =>
+                          rw [hB] at h'; dsimp only [] at h'
+                          cases hL : lookupBorrow s.memory.borrows ptrVal.tag
+                            with
+                          | none => rw [hL] at h'; cases h'
+                          | some entry =>
+                            rw [hL] at h'; dsimp only [] at h'
+                            cases mutability <;> cases hpm : entry.perm <;>
+                              rw [hpm] at h' <;> simp only [] at h' <;>
+                              first
+                                | (cases h'; done)
+                                | (cases h'; exact ⟨rfl, rfl, rfl, rfl⟩)
+                      | cons _ _ => cases h'
+                    | _ => cases h'
+                | _ => cases h'
+            | _ => cases h'
+        | _ => cases h'
+
+/--
+**Hypothesis-free unified Stage-3 retag soundness**
+(`stepMirFn_retag_fnEntry_any_ok`).
+Whenever `(prepFnEntryRetagAny cur loc).run s = .ok () s'` succeeds at a
+`StatementKind.retag .fnEntry { local_ := loc, projection := [] }` statement,
+`stepMirFn body s = MirStepNode.step s'` and `callStack` is preserved — with
+no separate `evalOperand`, `placeTy`, or `lookupBorrow` side conditions!
+-/
+theorem stepMirFn_retag_fnEntry_any_ok {body cur : CapturedMir}
+    {s s' : MachineState} {blk : BasicBlockData} {loc : Local} {span : String}
+    (hCur : s.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : get? cur.basicBlocks s.frame.blockIdx = some blk)
+    (hStmt : get? blk.statements s.frame.stmtIdx =
+      some { kind := .retag .fnEntry { local_ := loc, projection := [] },
+             span := span })
+    (hRun : (prepFnEntryRetagAny cur loc).run s = .ok () s') :
+    stepMirFn body s = MirStepNode.step s' ∧
+      s'.memory.callStack = s.memory.callStack := by
+  have h' := hRun
+  unfold prepFnEntryRetagAny EStateM.run at h'
+  dsimp only [] at h'
+  cases hOp : evalOperand s.frame.locals
+      (.copy { local_ := loc, projection := [] }) s.memory.borrows
+      s.memory.globals cur.layouts s.memory.callerLocals cur.localDecls
+      s.memory.callStack with
+  | ub => rw [hOp] at h'; cases h'
+  | unsupported => rw [hOp] at h'; cases h'
+  | ok val locals' =>
+    rw [hOp] at h'; dsimp only [] at h'
+    cases hTy : placeTy cur.localDecls cur.layouts
+        { local_ := loc, projection := [] } with
+    | none => rw [hTy] at h'; cases h'
+    | some ty =>
+      rw [hTy] at h'
+      cases ty with
+      | mk kind lIdx =>
+        cases kind with
+        | ref mutability pointee =>
+          dsimp only [] at h'
+          cases hU : rigidTyIsUninhabited 16 pointee with
+          | true => rw [hU] at h'; cases h'
+          | false =>
+            rw [hU] at h'; dsimp only [] at h'
+            cases val with
+            | ptr ptrVal sz =>
+              have hThin : (prepFnEntryRetagThin cur loc).run s = .ok () s' :=
+                h'
+              cases hLook : lookupBorrow s.memory.borrows ptrVal.tag with
+              | none =>
+                unfold prepFnEntryRetagThin EStateM.run at hThin
+                dsimp only [] at hThin; rw [hOp] at hThin
+                dsimp only [] at hThin; rw [hTy] at hThin
+                dsimp only [] at hThin; rw [hU] at hThin
+                dsimp only [] at hThin; rw [hLook] at hThin; cases hThin
+              | some parentEntry =>
+                have hRes := stepMirFn_retag_fnEntry_any_ptr hCur hPhase hBb
+                  hStmt hOp hTy hLook
+                exact ⟨hRes.1 s' hRun, hRes.2.2 s' hRun⟩
+            | scalar sc =>
+              have hRes :=
+                stepMirFn_retag_fnEntry_any_zst hCur hPhase hBb hStmt hOp hTy
+              exact ⟨hRes.1 s' hRun, hRes.2.2 s' hRun⟩
+            | aggregate variant fields =>
+              cases fields with
+              | nil => cases h'
+              | cons f1 fs =>
+                cases f1 with
+                | ptr ptrVal sz =>
+                  cases fs with
+                  | nil => cases h'
+                  | cons f2 fs2 =>
+                    cases f2 with
+                    | scalar lenSc =>
+                      cases fs2 with
+                      | nil =>
+                        dsimp only [] at h'
+                        cases hB : Bool.and (Nat.beq variant 0) (Nat.beq sz 8)
+                          with
+                        | false => rw [hB] at h'; cases h'
+                        | true =>
+                          obtain ⟨hv, hsz⟩ := and_eq_true_split hB
+                          have hv0 : variant = 0 := Nat.eq_of_beq_eq_true hv
+                          have hsz8 : sz = 8 := Nat.eq_of_beq_eq_true hsz
+                          subst hv0 hsz8
+                          rw [hB] at h'; dsimp only [] at h'
+                          cases hLook :
+                              lookupBorrow s.memory.borrows ptrVal.tag with
+                          | none => rw [hLook] at h'; cases h'
+                          | some parentEntry =>
+                            have hRes := stepMirFn_retag_fnEntry_any_fat hCur
+                              hPhase hBb hStmt hOp hTy hLook
+                            exact ⟨hRes.1 s' hRun, hRes.2.2 s' hRun⟩
+                      | cons _ _ => cases h'
+                    | _ => cases h'
+                | _ => cases h'
+            | _ => cases h'
+        | _ => cases h'
+
+/--
+**Statement-indexed multi-parameter Stage-3 stepping (`prepFnEntryRetags`).**
+Unlike `prepFnEntryRetagThins_stepsTo` (whose unindexed `loc ∈ locs` premise is
+unsatisfiable on 2+ parameters — see
+`prepFnEntryRetagThins_stepsTo_unindexed_premise_false_two_args`), `hStep`
+tracks the exact statement offset `st.frame.stmtIdx = s.frame.stmtIdx + i` for
+`get? locs i = some loc`, discharging arbitrary multi-parameter mixed
+thin/fat/ZST reference retag sequences cleanly!
+-/
+theorem prepFnEntryRetags_stepsTo {body cur : CapturedMir} :
+    ∀ (locs : List Local) {s s' : MachineState},
+      (prepFnEntryRetags cur locs).run s = .ok () s' →
+      (∀ (i : Nat) (loc : Local) (st st₁ : MachineState),
+        get? locs i = some loc →
+        st.frame.blockIdx = s.frame.blockIdx →
+        st.frame.stmtIdx = s.frame.stmtIdx + i →
+        st.memory.activeCallee = s.memory.activeCallee →
+        (prepFnEntryRetagAny cur loc).run st = .ok () st₁ →
+        stepMirFn body st = MirStepNode.step st₁) →
+      StepsTo body s (length locs) s' ∧
+        s'.memory.callStack = s.memory.callStack
+  | [], s, s', h, _ => by
+    have h' : EStateM.Result.ok (ε := FramePrepFault) () s = .ok () s' := h
+    cases h'
+    exact ⟨StepsTo.refl s, rfl⟩
+  | loc :: locs, s, s', h, hStep => by
+    obtain ⟨_, s₁, hOne, hRest⟩ := run_bind_ok_inv h
+    have hMeta := prepFnEntryRetagAny_preserves_meta hOne
+    have hStep₁ : stepMirFn body s = MirStepNode.step s₁ :=
+      hStep 0 loc s s₁ rfl rfl (Nat.add_zero s.frame.stmtIdx).symm rfl hOne
+    obtain ⟨hTail, hStackTail⟩ := prepFnEntryRetags_stepsTo locs hRest
+      fun i l st st₁ hget hblk hst hcal hrun =>
+        hStep (i + 1) l st st₁ hget (hblk.trans hMeta.1)
+          (by
+            rw [hst, hMeta.2.1]
+            show (s.frame.stmtIdx + 1) + i = s.frame.stmtIdx + (i + 1)
+            rw [Nat.add_assoc, Nat.add_comm 1 i])
+          (hcal.trans hMeta.2.2.1) hrun
+    exact ⟨StepsTo.step hStep₁ hTail, hStackTail.trans hMeta.2.2.2⟩
+
+/-- Statement-indexed multi-parameter stepping for `prepFnEntryRetagThins`
+(fixing `prepFnEntryRetagThins_stepsTo` for 2+ thin reference parameters). -/
+theorem prepFnEntryRetagThins_stepsTo_indexed {body cur : CapturedMir} :
+    ∀ (locs : List Local) {s s' : MachineState},
+      (prepFnEntryRetagThins cur locs).run s = .ok () s' →
+      (∀ (i : Nat) (loc : Local) (st st₁ : MachineState),
+        get? locs i = some loc →
+        st.frame.blockIdx = s.frame.blockIdx →
+        st.frame.stmtIdx = s.frame.stmtIdx + i →
+        st.memory.activeCallee = s.memory.activeCallee →
+        (prepFnEntryRetagThin cur loc).run st = .ok () st₁ →
+        stepMirFn body st = MirStepNode.step st₁) →
+      StepsTo body s (length locs) s' ∧
+        s'.memory.callStack = s.memory.callStack
+  | [], s, s', h, _ => by
+    have h' : EStateM.Result.ok (ε := FramePrepFault) () s = .ok () s' := h
+    cases h'
+    exact ⟨StepsTo.refl s, rfl⟩
+  | loc :: locs, s, s', h, hStep => by
+    obtain ⟨_, s₁, hOne, hRest⟩ := run_bind_ok_inv h
+    have hMeta := prepFnEntryRetagThin_preserves_meta hOne
+    have hStep₁ : stepMirFn body s = MirStepNode.step s₁ :=
+      hStep 0 loc s s₁ rfl rfl (Nat.add_zero s.frame.stmtIdx).symm rfl hOne
+    obtain ⟨hTail, hStackTail⟩ := prepFnEntryRetagThins_stepsTo_indexed locs
+      hRest fun i l st st₁ hget hblk hst hcal hrun =>
+        hStep (i + 1) l st st₁ hget (hblk.trans hMeta.1)
+          (by
+            rw [hst, hMeta.2.1]
+            show (s.frame.stmtIdx + 1) + i = s.frame.stmtIdx + (i + 1)
+            rw [Nat.add_assoc, Nat.add_comm 1 i])
+          (hcal.trans hMeta.2.2.1) hrun
     exact ⟨StepsTo.step hStep₁ hTail, hStackTail.trans hMeta.2.2.2⟩
 
 /--
@@ -7292,6 +8818,35 @@ theorem wpFramePrep_seq {body : CapturedMir} (C₁ C₂ : FramePrepContract body
           (wpFramePrep_triple_sound C₂ callerBody₂ func₂ argOps₂ destination₂
             targetBb₂ unwind₂ Q) s hs)
 
+/-- **Sequential `Std.Do.Triple` composition for general Stage-3 calls.**
+Composes two `framePrepCallStage3` pipelines with arbitrary Stage-3 retag
+actions `stage3₁` and `stage3₂` via `Triple.bind` over
+`wpFramePrepStage3_triple_sound`. -/
+theorem wpFramePrepStage3_seq {body : CapturedMir}
+    (C₁ C₂ : FramePrepContract body)
+    (callerBody₁ callerBody₂ : CapturedMir) (func₁ func₂ : Operand)
+    (argOps₁ argOps₂ : List Operand) (destination₁ destination₂ : Place)
+    (targetBb₁ targetBb₂ : BasicBlockIdx) (unwind₁ unwind₂ : UnwindAction)
+    (stage3₁ stage3₂ : FramePrepM Unit) (Q : MachineState → Prop) :
+    Triple
+      (framePrepCallStage3 body C₁ callerBody₁ func₁ argOps₁ destination₁
+          targetBb₁ unwind₁ stage3₁ >>= fun _ =>
+        framePrepCallStage3 body C₂ callerBody₂ func₂ argOps₂ destination₂
+          targetBb₂ unwind₂ stage3₂)
+      (wpFramePrepStage3 C₁ callerBody₁ func₁ argOps₁ destination₁ targetBb₁
+        unwind₁ stage3₁ fun s =>
+          (wpFramePrepStage3 C₂ callerBody₂ func₂ argOps₂ destination₂
+            targetBb₂ unwind₂ stage3₂ Q s).down)
+      (framePost fun _ s' => Q s') :=
+  Triple.bind _ _
+    (wpFramePrepStage3_triple_sound C₁ callerBody₁ func₁ argOps₁ destination₁
+      targetBb₁ unwind₁ stage3₁ _)
+    (fun _ =>
+      (triple_framePrep_iff _ _ _).mpr fun s hs =>
+        (triple_framePrep_iff _ _ _).mp
+          (wpFramePrepStage3_triple_sound C₂ callerBody₂ func₂ argOps₂
+            destination₂ targetBb₂ unwind₂ stage3₂ Q) s hs)
+
 /--
 **Prefix sharing.** A shared prefix `pre` (for example a sequence of call
 pipelines) that establishes `Mid` is verified once and discharges two
@@ -8303,6 +9858,232 @@ theorem pruneHasFrameDeallocProtectorConflict_equiv_fullScan
         (Nat.blt e.targetLocal nLocals) <;>
         cases isBorrowProtected activeProtectors e <;> rfl
     exact ⟨hDisZero root hdisRoot, fun e he => hDisZero e (hD hdisRoot e he)⟩
+
+/-- **Cell-aware exact equivalence of
+`pruneHasFrameDeallocProtectorConflict`.** Replaces `DisabledClosedForest` with
+`DisabledRootWriteNoopForest`: `.cell` and unprotected `.reservedIM` children
+under a `.disabled` root never conflict with frame deallocation
+(`preventsDeallocation .cell = false`). -/
+theorem pruneHasFrameDeallocProtectorConflict_rootNoop_equiv_fullScan
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hWrite : DisabledRootWriteNoopForest activeProtectors forest)
+    (depth nLocals : Nat) :
+    pruneHasFrameDeallocProtectorConflict forest activeProtectors depth
+        nLocals =
+      hasFrameDeallocProtectorConflict (BorrowForest.toList forest)
+        activeProtectors depth nLocals := by
+  rw [hasFrameDeallocProtectorConflict_eq_any]
+  refine pruneAnyForest_eq_any forest ?_
+  refine AllSubtreesForest.mono_strong (fun root children h hs => ?_) forest
+    (AllSubtreesForest.and forest hAlloc hWrite)
+  obtain ⟨hA, hW⟩ := (AllSubtrees.node_iff.mp h).1
+  unfold frameDeallocConflictSkipRoot at hs
+  cases hf : frameDeallocSkipRoot depth nLocals root with
+  | true =>
+    have hFalse :
+        Bool.and (Nat.beq root.targetFrameDepth depth)
+          (Nat.blt root.targetLocal nLocals) = false := by
+      unfold frameDeallocSkipRoot at hf
+      cases hb : Bool.and (Nat.beq root.targetFrameDepth depth)
+          (Nat.blt root.targetLocal nLocals) with
+      | false => rfl
+      | true => rw [hb] at hf; exact Bool.noConfusion hf
+    refine ⟨by unfold frameDeallocConflictAt; rw [hFalse]; rfl, fun e he => ?_⟩
+    unfold frameDeallocConflictAt
+    rw [(hA.1 e he).1, (hA.1 e he).2, hFalse]
+    rfl
+  | false =>
+    rw [hf] at hs
+    have hdisRoot : root.perm = .disabled := by
+      cases hp : root.perm with
+      | disabled => rfl
+      | cell => rw [hp] at hs; exact Bool.noConfusion hs
+      | unique => rw [hp] at hs; exact Bool.noConfusion hs
+      | frozen => rw [hp] at hs; exact Bool.noConfusion hs
+      | reservedFrz _ => rw [hp] at hs; exact Bool.noConfusion hs
+      | reservedIM => rw [hp] at hs; exact Bool.noConfusion hs
+    have hNoopZero : ∀ e : BorrowEntry,
+        isForeignWriteNoopPerm (isBorrowProtected activeProtectors e) e.perm =
+          true →
+        frameDeallocConflictAt activeProtectors depth nLocals e = false := by
+      intro e hNoop
+      unfold frameDeallocConflictAt
+      cases hp : e.perm with
+      | disabled =>
+        have hPrev : preventsDeallocation .disabled = false := rfl
+        rw [hPrev]
+        cases Bool.and (Nat.beq e.targetFrameDepth depth)
+          (Nat.blt e.targetLocal nLocals) <;>
+          cases isBorrowProtected activeProtectors e <;> rfl
+      | cell =>
+        have hPrev : preventsDeallocation .cell = false := rfl
+        rw [hPrev]
+        cases Bool.and (Nat.beq e.targetFrameDepth depth)
+          (Nat.blt e.targetLocal nLocals) <;>
+          cases isBorrowProtected activeProtectors e <;> rfl
+      | reservedIM =>
+        rw [hp] at hNoop
+        cases hProt : isBorrowProtected activeProtectors e with
+        | false =>
+          cases Bool.and (Nat.beq e.targetFrameDepth depth)
+            (Nat.blt e.targetLocal nLocals) <;> rfl
+        | true => rw [hProt] at hNoop; exact Bool.noConfusion hNoop
+      | unique => rw [hp] at hNoop; exact Bool.noConfusion hNoop
+      | frozen => rw [hp] at hNoop; exact Bool.noConfusion hNoop
+      | reservedFrz _ => rw [hp] at hNoop; exact Bool.noConfusion hNoop
+    exact ⟨hNoopZero root (by rw [hdisRoot]; rfl),
+      fun e he => hNoopZero e (hW hdisRoot e he)⟩
+
+/-- Frame teardown preserves `DisabledRootWriteNoopForest` unconditionally on
+any structurally well-formed forest. -/
+theorem pruneDisableFrameBorrows_preserves_disabledRootWriteNoop
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hWrite : DisabledRootWriteNoopForest activeProtectors forest)
+    (depth nLocals : Nat) :
+    DisabledRootWriteNoopForest activeProtectors
+      (pruneDisableFrameBorrows forest depth nLocals) := by
+  have hSub : ∀ (t : BorrowSubtree), SameAllocSubtree allBorrows t →
+      AllSubtrees (DisabledRootWriteNoopNode activeProtectors) t →
+      AllSubtrees (DisabledRootWriteNoopNode activeProtectors)
+        (pruneMapSubtree (frameDeallocSkipRoot depth nLocals)
+          (disableFrameBorrowEntry depth nLocals) t) := by
+    intro t
+    refine BorrowSubtree.rec (motive_1 := fun t =>
+        SameAllocSubtree allBorrows t →
+        AllSubtrees (DisabledRootWriteNoopNode activeProtectors) t →
+        AllSubtrees (DisabledRootWriteNoopNode activeProtectors)
+          (pruneMapSubtree (frameDeallocSkipRoot depth nLocals)
+            (disableFrameBorrowEntry depth nLocals) t))
+      (motive_2 := fun ts =>
+        SameAllocForest allBorrows ts →
+        DisabledRootWriteNoopForest activeProtectors ts →
+        DisabledRootWriteNoopForest activeProtectors
+          (pruneDisableFrameBorrows ts depth nLocals))
+      (fun root children ih hA hW => ?_)
+      (fun _ _ => by
+        unfold pruneDisableFrameBorrows; rw [pruneMapForest_nil]
+        exact AllSubtreesForest.nil_iff.mpr True.intro)
+      (fun t0 ts0 iht ihts hA hW => by
+        have hA' := AllSubtreesForest.cons_iff.mp hA
+        have hW' := AllSubtreesForest.cons_iff.mp hW
+        unfold pruneDisableFrameBorrows; rw [pruneMapForest_cons]
+        exact AllSubtreesForest.cons_iff.mpr
+          ⟨iht hA'.1 hW'.1, ihts hA'.2 hW'.2⟩)
+      t
+    cases hs : frameDeallocSkipRoot depth nLocals root with
+    | true => rw [pruneMapSubtree_skip children hs]; exact hW
+    | false =>
+      have hA' := AllSubtrees.node_iff.mp hA
+      have hW' := AllSubtrees.node_iff.mp hW
+      have hTrue :
+          Bool.and (Nat.beq root.targetFrameDepth depth)
+            (Nat.blt root.targetLocal nLocals) = true := by
+        unfold frameDeallocSkipRoot at hs
+        cases hb : Bool.and (Nat.beq root.targetFrameDepth depth)
+            (Nat.blt root.targetLocal nLocals) with
+        | true => rfl
+        | false => rw [hb] at hs; exact Bool.noConfusion hs
+      rw [pruneMapSubtree_visit children hs]
+      refine AllSubtrees.node_iff.mpr ⟨fun _ e he => ?_, ih hA'.2 hW'.2⟩
+      have hEq := pruneDisableFrameBorrows_equiv_fullScan hA'.2 depth nLocals
+      rw [disableFrameBorrows_eq_map] at hEq
+      have he' :
+          e ∈ (BorrowForest.toList children).map
+            (disableFrameBorrowEntry depth nLocals) := by
+        rw [← hEq]; exact he
+      obtain ⟨e₀, he₀, rfl⟩ := List.mem_map.mp he'
+      have hPerm :
+          (disableFrameBorrowEntry depth nLocals e₀).perm = .disabled := by
+        unfold disableFrameBorrowEntry
+        rw [(hA'.1.1 e₀ he₀).1, (hA'.1.1 e₀ he₀).2, hTrue]
+      rw [hPerm]
+      rfl
+  induction forest with
+  | nil =>
+    unfold pruneDisableFrameBorrows; rw [pruneMapForest_nil]
+    exact AllSubtreesForest.nil_iff.mpr True.intro
+  | cons t ts ih =>
+    have hA := AllSubtreesForest.cons_iff.mp hAlloc
+    have hW := AllSubtreesForest.cons_iff.mp hWrite
+    unfold pruneDisableFrameBorrows; rw [pruneMapForest_cons]
+    exact AllSubtreesForest.cons_iff.mpr ⟨hSub t hA.1 hW.1, ih hA.2 hW.2⟩
+
+/-- Frame teardown preserves `FrozenOrDisabledRootReadNoopForest`
+unconditionally on any structurally well-formed forest. -/
+theorem pruneDisableFrameBorrows_preserves_frozenOrDisabledRootReadNoop
+    {allBorrows : List BorrowEntry} {forest : BorrowForest}
+    {activeProtectors : List Nat} (hAlloc : SameAllocForest allBorrows forest)
+    (hRead : FrozenOrDisabledRootReadNoopForest activeProtectors forest)
+    (depth nLocals : Nat) :
+    FrozenOrDisabledRootReadNoopForest activeProtectors
+      (pruneDisableFrameBorrows forest depth nLocals) := by
+  have hSub : ∀ (t : BorrowSubtree), SameAllocSubtree allBorrows t →
+      AllSubtrees (FrozenOrDisabledRootReadNoopNode activeProtectors) t →
+      AllSubtrees (FrozenOrDisabledRootReadNoopNode activeProtectors)
+        (pruneMapSubtree (frameDeallocSkipRoot depth nLocals)
+          (disableFrameBorrowEntry depth nLocals) t) := by
+    intro t
+    refine BorrowSubtree.rec (motive_1 := fun t =>
+        SameAllocSubtree allBorrows t →
+        AllSubtrees (FrozenOrDisabledRootReadNoopNode activeProtectors) t →
+        AllSubtrees (FrozenOrDisabledRootReadNoopNode activeProtectors)
+          (pruneMapSubtree (frameDeallocSkipRoot depth nLocals)
+            (disableFrameBorrowEntry depth nLocals) t))
+      (motive_2 := fun ts =>
+        SameAllocForest allBorrows ts →
+        FrozenOrDisabledRootReadNoopForest activeProtectors ts →
+        FrozenOrDisabledRootReadNoopForest activeProtectors
+          (pruneDisableFrameBorrows ts depth nLocals))
+      (fun root children ih hA hR => ?_)
+      (fun _ _ => by
+        unfold pruneDisableFrameBorrows; rw [pruneMapForest_nil]
+        exact AllSubtreesForest.nil_iff.mpr True.intro)
+      (fun t0 ts0 iht ihts hA hR => by
+        have hA' := AllSubtreesForest.cons_iff.mp hA
+        have hR' := AllSubtreesForest.cons_iff.mp hR
+        unfold pruneDisableFrameBorrows; rw [pruneMapForest_cons]
+        exact AllSubtreesForest.cons_iff.mpr
+          ⟨iht hA'.1 hR'.1, ihts hA'.2 hR'.2⟩)
+      t
+    cases hs : frameDeallocSkipRoot depth nLocals root with
+    | true => rw [pruneMapSubtree_skip children hs]; exact hR
+    | false =>
+      have hA' := AllSubtrees.node_iff.mp hA
+      have hR' := AllSubtrees.node_iff.mp hR
+      have hTrue :
+          Bool.and (Nat.beq root.targetFrameDepth depth)
+            (Nat.blt root.targetLocal nLocals) = true := by
+        unfold frameDeallocSkipRoot at hs
+        cases hb : Bool.and (Nat.beq root.targetFrameDepth depth)
+            (Nat.blt root.targetLocal nLocals) with
+        | true => rfl
+        | false => rw [hb] at hs; exact Bool.noConfusion hs
+      rw [pruneMapSubtree_visit children hs]
+      refine AllSubtrees.node_iff.mpr ⟨fun _ e he => ?_, ih hA'.2 hR'.2⟩
+      have hEq := pruneDisableFrameBorrows_equiv_fullScan hA'.2 depth nLocals
+      rw [disableFrameBorrows_eq_map] at hEq
+      have he' :
+          e ∈ (BorrowForest.toList children).map
+            (disableFrameBorrowEntry depth nLocals) := by
+        rw [← hEq]; exact he
+      obtain ⟨e₀, he₀, rfl⟩ := List.mem_map.mp he'
+      have hPerm :
+          (disableFrameBorrowEntry depth nLocals e₀).perm = .disabled := by
+        unfold disableFrameBorrowEntry
+        rw [(hA'.1.1 e₀ he₀).1, (hA'.1.1 e₀ he₀).2, hTrue]
+      rw [hPerm]
+      rfl
+  induction forest with
+  | nil =>
+    unfold pruneDisableFrameBorrows; rw [pruneMapForest_nil]
+    exact AllSubtreesForest.nil_iff.mpr True.intro
+  | cons t ts ih =>
+    have hA := AllSubtreesForest.cons_iff.mp hAlloc
+    have hR := AllSubtreesForest.cons_iff.mp hRead
+    unfold pruneDisableFrameBorrows; rw [pruneMapForest_cons]
+    exact AllSubtreesForest.cons_iff.mpr ⟨hSub t hA.1 hR.1, ih hA.2 hR.2⟩
 
 /-- With no active protector, no write is a protected-write conflict. -/
 theorem hasProtectedWriteConflict_nil_protectors (borrows : List BorrowEntry)
@@ -10565,6 +12346,488 @@ theorem thinMutRefProtectedCallee_liftFrame :
       (locals' := [.uninit, .init thinRefParentVal])
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl
     exact ⟨StepsTo.single (hThin.1 s3 hS3), hThin.2.2 s3 hS3⟩
+  · intro env' mem' hEq
+    refine liftState_iff_liftFrame.mp ?_
+    rw [hEq]
+    exact LiftState.of_step rfl (LiftState.of_retNormal rfl rfl)
+
+/-! ### 2.11 Two-argument Stage-3 retags: unindexed refutation & mixed instance
+
+1. `prepFnEntryRetagThins_stepsTo_unindexed_premise_false_two_args` proves
+   constructively on a concrete 2-parameter `fn(&u8, &u8)` callee that while
+   `prepFnEntryRetagThins twoArgThinCallee [1, 2]` succeeds and executes 2
+   real `stepMirFn` steps (via `prepFnEntryRetagThins_stepsTo_indexed`), the
+   unindexed `hStep` premise of `prepFnEntryRetagThins_stepsTo` is **false**
+   because `prepFnEntryRetagThin` ignores `stmtIdx`: at `stmtIdx = 1`,
+   `prepFnEntryRetagThin _ 1` re-retags `_1` while `stepMirFn` retags `_2`!
+2. `twoArgMixedProtectedCallee_liftFrame` proves an end-to-end 2-parameter
+   mixed `fn(&u8, &[u8])` four-stage `LiftFrame` instance via
+   `prepFnEntryRetags` and `prepFnEntryRetags_stepsTo`.
+-/
+
+/-- Callee taking two thin `&u8` parameters (`_1` and `_2`):
+`bb0: { Retag([fn entry] _1); Retag([fn entry] _2); _0 = const (); return; }`.
+-/
+def twoArgThinCallee : CapturedMir where
+  defPath := "Anneal::TreeBorrowsPruningAndFrameWp::two_arg_thin_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [
+    { mutability := .mut, ty := emptyFnUnitTy, debugName := some "_0" },
+    { mutability := .not, ty := thinRefU8Ty, debugName := some "_1" },
+    { mutability := .not, ty := thinRefU8Ty, debugName := some "_2" }]
+  basicBlocks := [
+    { statements := [
+        { kind := .retag .fnEntry { local_ := 1, projection := [] }
+          span := "retag_1" },
+        { kind := .retag .fnEntry { local_ := 2, projection := [] }
+          span := "retag_2" },
+        { kind := .assign { local_ := 0, projection := [] }
+            (.use (.constant { ty := emptyFnUnitTy, val := .zeroSized }))
+          span := "unit" }]
+      terminator := { kind := .return_, span := "ret" }
+      isCleanup := false }]
+  fnAbi := {
+    args := [
+      { layout := emptyFnUnitLayout, mode := .direct },
+      { layout := emptyFnUnitLayout, mode := .direct }]
+    ret := { layout := emptyFnUnitLayout, mode := .direct }
+    conv := .rust
+    canUnwind := false }
+  layouts := emptyFnLayouts
+  allocations := []
+
+/-- Entry state of `twoArgThinCallee` at `bb0, stmtIdx = 0` with `_1` at tag
+`1` and `_2` at tag `2`. -/
+def twoArgThinEntryState : MachineState :=
+  let base := initMachineStateWithCallees twoArgThinCallee [] []
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init thinRefParentVal,
+                          .init thinRefChildVal] }
+    memory :=
+      { base.memory with
+        activeCallee := some twoArgThinCallee
+        borrows := [
+          { tag := 1, targetLocal := 3, targetFrameDepth := 0,
+            targetProjection := [], perm := .frozen },
+          { tag := 2, targetLocal := 4, targetFrameDepth := 0,
+            targetProjection := [], perm := .frozen }]
+        activeProtectors := []
+        nextTag := 3
+        nextProtector := 10 } }
+
+/--
+**Constructive refutation of the unindexed `hStep` premise in
+`prepFnEntryRetagThins_stepsTo` on 2 parameters.** On `twoArgThinCallee`,
+`prepFnEntryRetagThins twoArgThinCallee [1, 2]` succeeds from
+`twoArgThinEntryState` and steps identically to 2 real `stepMirFn` steps (by
+`prepFnEntryRetagThins_stepsTo_indexed`), YET the unindexed `loc ∈ [1, 2]`
+premise of `prepFnEntryRetagThins_stepsTo` is **false** at `stmtIdx = 1`!
+-/
+theorem prepFnEntryRetagThins_stepsTo_unindexed_premise_false_two_args :
+    ∃ s₃ : MachineState,
+      (prepFnEntryRetagThins twoArgThinCallee [1, 2]).run
+          twoArgThinEntryState = .ok () s₃ ∧
+      StepsTo twoArgThinCallee twoArgThinEntryState 2 s₃ ∧
+      ¬ (∀ (loc : Local) (st st₁ : MachineState),
+          loc ∈ ([1, 2] : List Local) →
+          st.frame.blockIdx = twoArgThinEntryState.frame.blockIdx →
+          st.memory.activeCallee = twoArgThinEntryState.memory.activeCallee →
+          (prepFnEntryRetagThin twoArgThinCallee loc).run st = .ok () st₁ →
+          stepMirFn twoArgThinCallee st = MirStepNode.step st₁) := by
+  let s₁ := twoArgThinEntryState
+  let child3 : BorrowEntry :=
+    { tag := 3, targetLocal := 3, targetFrameDepth := 0, allocDead := false,
+      targetProjection := [], perm := .frozen, rangeOffset := 0, rangeLen := 0,
+      protector := some 10, parentTag := some 1 }
+  let child4 : BorrowEntry :=
+    { tag := 4, targetLocal := 4, targetFrameDepth := 0, allocDead := false,
+      targetProjection := [], perm := .frozen, rangeOffset := 0, rangeLen := 0,
+      protector := some 11, parentTag := some 2 }
+  let s₂ : MachineState :=
+    advanceStmt s₁
+      [.uninit, .init (.ptr { allocId := 3, offsetBytes := 0 } 8),
+       .init thinRefChildVal]
+      { s₁.memory with
+        borrows := child3 :: s₁.memory.borrows
+        nextTag := 4
+        activeProtectors := [10]
+        nextProtector := 11 }
+  let s₃ : MachineState :=
+    advanceStmt s₂
+      [.uninit, .init (.ptr { allocId := 3, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 4, offsetBytes := 0 } 8)]
+      { s₂.memory with
+        borrows := child4 :: s₂.memory.borrows
+        nextTag := 5
+        activeProtectors := [11, 10]
+        nextProtector := 12 }
+  have hRun12 :
+      (prepFnEntryRetagThins twoArgThinCallee [1, 2]).run s₁ = .ok () s₃ := rfl
+  have hSteps : StepsTo twoArgThinCallee s₁ 2 s₃ :=
+    StepsTo.step (s₁ := s₂) rfl (StepsTo.single rfl)
+  refine ⟨s₃, hRun12, hSteps, fun hBad => ?_⟩
+  let sWrong : MachineState :=
+    advanceStmt s₂
+      [.uninit, .init (.ptr { allocId := 4, offsetBytes := 0 } 8),
+       .init thinRefChildVal]
+      { s₂.memory with
+        borrows :=
+          { tag := 4, targetLocal := 3, targetFrameDepth := 0,
+            allocDead := false, targetProjection := [], perm := .frozen,
+            rangeOffset := 0, rangeLen := 0, protector := some 11,
+            parentTag := some 3 } :: s₂.memory.borrows
+        nextTag := 5
+        activeProtectors := [11, 10]
+        nextProtector := 12 }
+  have hRunWrong :
+      (prepFnEntryRetagThin twoArgThinCallee 1).run s₂ = .ok () sWrong := rfl
+  have hEq : stepMirFn twoArgThinCallee s₂ = MirStepNode.step sWrong :=
+    hBad 1 s₂ sWrong (List.mem_cons_self ..) rfl rfl hRunWrong
+  have hReal : stepMirFn twoArgThinCallee s₂ = MirStepNode.step s₃ := rfl
+  have hStepEq :
+      (MirStepNode.step s₃ : MirStepNode) = MirStepNode.step sWrong :=
+    hReal.symm.trans hEq
+  have hWP :
+      evalNodeWP
+        (fun
+          | .running st => st.frame.locals = s₃.frame.locals
+          | _ => False)
+        (fun _ => False) (MirStepNode.step s₃) := rfl
+  rw [hStepEq] at hWP
+  have hLocEq : sWrong.frame.locals = s₃.frame.locals := hWP
+  cases hLocEq
+
+/-- Callee taking mixed 2-argument references `(_1 : &u8, _2 : &[u8])`:
+`bb0: { Retag([fn entry] _1); Retag([fn entry] _2); _0 = const (); return; }`.
+-/
+def twoArgMixedCallee : CapturedMir where
+  defPath := "Anneal::TreeBorrowsPruningAndFrameWp::two_arg_mixed_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [
+    { mutability := .mut, ty := emptyFnUnitTy, debugName := some "_0" },
+    { mutability := .not, ty := thinRefU8Ty, debugName := some "_1" },
+    { mutability := .not, ty := protSliceRefTy, debugName := some "_2" }]
+  basicBlocks := [
+    { statements := [
+        { kind := .retag .fnEntry { local_ := 1, projection := [] }
+          span := "retag_thin_1" },
+        { kind := .retag .fnEntry { local_ := 2, projection := [] }
+          span := "retag_fat_2" },
+        { kind := .assign { local_ := 0, projection := [] }
+            (.use (.constant { ty := emptyFnUnitTy, val := .zeroSized }))
+          span := "unit" }]
+      terminator := { kind := .return_, span := "ret" }
+      isCleanup := false }]
+  fnAbi := {
+    args := [
+      { layout := emptyFnUnitLayout, mode := .direct },
+      { layout := emptyFnUnitLayout, mode := .direct }]
+    ret := { layout := emptyFnUnitLayout, mode := .direct }
+    conv := .rust
+    canUnwind := false }
+  layouts := emptyFnLayouts
+  allocations := []
+
+/-- Function-item type of `twoArgMixedCallee`. -/
+def twoArgMixedCalleeItemTy : Ty :=
+  { kind := .fnDef twoArgMixedCallee.defPath [], layoutIdx := 0 }
+
+/-- Caller passing `(_2 : &u8, _3 : &[u8])` to `twoArgMixedCallee`. -/
+def twoArgMixedCaller : CapturedMir where
+  defPath := "Anneal::TreeBorrowsPruningAndFrameWp::two_arg_mixed_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [
+    { mutability := .mut, ty := emptyFnUnitTy, debugName := some "_0" },
+    { mutability := .mut, ty := emptyFnUnitTy, debugName := some "_1" },
+    { mutability := .not, ty := thinRefU8Ty, debugName := some "_2" },
+    { mutability := .not, ty := protSliceRefTy, debugName := some "_3" }]
+  basicBlocks := [
+    { statements := []
+      terminator := {
+        kind := .call
+          (.constant { ty := twoArgMixedCalleeItemTy, val := .zeroSized })
+          [.copy { local_ := 2, projection := [] },
+           .copy { local_ := 3, projection := [] }]
+          { local_ := 1, projection := [] } (some 1) .continue_
+        span := "call_two_mixed" }
+      isCleanup := false },
+    { statements := [
+        { kind := .assign { local_ := 0, projection := [] }
+            (.use (.constant { ty := emptyFnUnitTy, val := .zeroSized }))
+          span := "unit" }]
+      terminator := { kind := .return_, span := "ret" }
+      isCleanup := false }]
+  fnAbi := {
+    args := []
+    ret := { layout := emptyFnUnitLayout, mode := .direct }
+    conv := .rust
+    canUnwind := false }
+  layouts := emptyFnLayouts
+  allocations := []
+
+/-- Fat slice value `&[u8]` pointing to borrow tag `5` with length `4`. -/
+def twoArgSliceVal : Value :=
+  .aggregate 0 [.ptr { allocId := 5, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩]
+
+/-- Initial memory of `twoArgMixedCaller`: thin parent `.unique` tag `1` +
+sibling `.unique` tag `9` on caller local `4`, and fat slice `.frozen` tag `5`
+on caller local `5`. -/
+def twoArgMixedCallerMem : Memory :=
+  { (initMachineStateWithCallees twoArgMixedCaller []
+      [twoArgMixedCallee]).memory with
+      borrows := [
+        { tag := 1, targetLocal := 4, targetFrameDepth := 0,
+          targetProjection := [], perm := .unique },
+        { tag := 9, targetLocal := 4, targetFrameDepth := 0,
+          targetProjection := [], perm := .unique },
+        { tag := 5, targetLocal := 5, targetFrameDepth := 0,
+          targetProjection := [], perm := .frozen }]
+      activeProtectors := []
+      nextTag := 2
+      nextProtector := 10 }
+
+/-- Post-retag contract of `twoArgMixedCallee` starting at `bb0, stmtIdx = 2`
+after both `_1` (thin `&u8`, rewritten to child tag `2` with protector `10`)
+and `_2` (fat `&[u8]`, protector `11` attached to tag `5`) have been retagged.
+-/
+def twoArgMixedCalleeContract : FramePrepContract twoArgMixedCaller where
+  Pre := fun s =>
+    s.memory.activeCallee = some twoArgMixedCallee ∧
+    s.frame = { blockIdx := 0, stmtIdx := 2,
+                locals := [.uninit, .init thinRefChildVal,
+                           .init twoArgSliceVal] } ∧
+    s.memory.activeProtectors = [11, 10] ∧
+    ∀ e, e ∈ s.memory.borrows → e.targetFrameDepth ≠ length s.memory.callStack
+  Post := fun s₀ retVal sRet =>
+    retVal = .unit ∧
+    sRet =
+      { frame := { blockIdx := 0, stmtIdx := 3,
+                   locals := [.init .unit, .init thinRefChildVal,
+                              .init twoArgSliceVal] }
+        memory :=
+          { s₀.memory with
+            borrows :=
+              invalidateConflictingBorrows s₀.memory.borrows 0 .none
+                (length s₀.memory.callStack) } }
+  steps := fun _ => 1
+  exec := fun s₀ h => by
+    obtain ⟨hCal, hFr, hProt, hFresh⟩ := h
+    cases s₀ with
+    | mk frame memory =>
+      have hFr' :
+          frame = { blockIdx := 0, stmtIdx := 2,
+                    locals := [.uninit, .init thinRefChildVal,
+                               .init twoArgSliceVal] } := hFr
+      rw [hFr']
+      have hCur :
+          memory.activeCallee.getD twoArgMixedCaller = twoArgMixedCallee := by
+        rw [hCal]; rfl
+      have hStep :
+          stepMirFn twoArgMixedCaller
+            { frame := { blockIdx := 0, stmtIdx := 2,
+                         locals := [.uninit, .init thinRefChildVal,
+                                    .init twoArgSliceVal] }
+              memory := memory } =
+            MirStepNode.step
+              { frame := { blockIdx := 0, stmtIdx := 3,
+                           locals := [.init .unit, .init thinRefChildVal,
+                                      .init twoArgSliceVal] }
+                memory :=
+                  { memory with
+                    borrows :=
+                      invalidateConflictingBorrows memory.borrows 0 .none
+                        (length memory.callStack) } } := by
+        rw [stepMirFn_frame_stmt hCur (Or.inl rfl) rfl rfl]
+        have hrv :
+            evalRvalue [.uninit, .init thinRefChildVal, .init twoArgSliceVal]
+                (.use (.constant { ty := emptyFnUnitTy, val := .zeroSized }))
+                memory twoArgMixedCallee.localDecls twoArgMixedCallee.layouts =
+              .ok .unit [.uninit, .init thinRefChildVal, .init twoArgSliceVal]
+                memory := rfl
+        unfold evalStmt; dsimp only []; rw [hrv]; dsimp only []
+        rw [hProt]; dsimp only []
+        rw [hasProtectedWriteConflict_unrelated_frame memory.borrows [11, 10]
+          0 .none .nil 0 0 (length memory.callStack) hFresh]
+        rfl
+      have hRR :
+          ReturnReady twoArgMixedCaller
+            { frame := { blockIdx := 0, stmtIdx := 3,
+                         locals := [.init .unit, .init thinRefChildVal,
+                                    .init twoArgSliceVal] }
+              memory :=
+                { memory with
+                  borrows :=
+                    invalidateConflictingBorrows memory.borrows 0 .none
+                      (length memory.callStack) } }
+            .unit := by
+        refine ⟨twoArgMixedCallee, _, hCur, Or.inl rfl, rfl, rfl, rfl, rfl, ?_⟩
+        have hEq :
+            invalidateConflictingBorrows memory.borrows 0 .none
+              (length memory.callStack) = memory.borrows :=
+          invalidateConflictingBorrows_unrelated_eq memory.borrows 0 .none
+            (length memory.callStack) fun e he => by
+              rw [beq_false_of_ne (hFresh e he)]; rfl
+        rw [hEq]
+        exact hasFrameDeallocProtectorConflict_unrelated_frame
+          memory.borrows memory.activeProtectors (length memory.callStack)
+          3 hFresh
+      exact ⟨_, .unit, StepsTo.single hStep, hRR, rfl, rfl, rfl⟩
+
+/--
+**End-to-end 2-parameter mixed `(&u8, &[u8])` four-stage `LiftFrame`
+instance.** Exercises `prepFnEntryRetags twoArgMixedCallee [1, 2]` +
+`prepFnEntryRetags_stepsTo` + `stepMirFn_retag_fnEntry_any_ptr` +
+`stepMirFn_retag_fnEntry_any_fat` + `wpFramePrepStage3_sound_stepMirFn` across
+both a thin `&u8` parameter (minting child tag `2`, protector `10`, and
+freezing sibling `.unique` tag `9`) AND a fat `&[u8]` slice parameter
+(attaching protector `11` to tag `5`) in 7 trusted steps!
+-/
+theorem twoArgMixedProtectedCallee_liftFrame :
+    LiftFrame twoArgMixedCaller 0 0
+      [.uninit, .uninit, .init thinRefParentVal, .init twoArgSliceVal]
+      twoArgMixedCallerMem (fun v => v = .unit) 7 := by
+  let env0 : PureEnv :=
+    [.uninit, .uninit, .init thinRefParentVal, .init twoArgSliceVal]
+  let s0 : MachineState :=
+    PureState.toMachineState { bb := 0, stmtIdx := 0, env := env0 }
+      twoArgMixedCallerMem
+  let call0 : PreparedCall :=
+    ⟨twoArgMixedCallee, [thinRefParentVal, twoArgSliceVal], env0⟩
+  let s1 : MachineState :=
+    pushCalleeFrame s0 twoArgMixedCaller env0
+      { local_ := 1, projection := [] } 1 twoArgMixedCallee
+      [thinRefParentVal, twoArgSliceVal] .continue_
+  let child2 : BorrowEntry :=
+    { tag := 2, targetLocal := 4, targetFrameDepth := 0, allocDead := false,
+      targetProjection := [], perm := .frozen, rangeOffset := 0, rangeLen := 0,
+      protector := some 10, parentTag := some 1 }
+  let s2 : MachineState :=
+    advanceStmt s1 [.uninit, .init thinRefChildVal, .init twoArgSliceVal]
+      { s1.memory with
+        borrows := [
+          child2,
+          { tag := 1, targetLocal := 4, targetFrameDepth := 0,
+            targetProjection := [], perm := .unique },
+          { tag := 9, targetLocal := 4, targetFrameDepth := 0,
+            targetProjection := [], perm := .frozen },
+          { tag := 5, targetLocal := 5, targetFrameDepth := 0,
+            targetProjection := [], perm := .frozen }]
+        nextTag := 3
+        activeProtectors := [10]
+        nextProtector := 11 }
+  let s3 : MachineState :=
+    advanceStmt s2 [.uninit, .init thinRefChildVal, .init twoArgSliceVal]
+      { s2.memory with
+        borrows := [
+          child2,
+          { tag := 1, targetLocal := 4, targetFrameDepth := 0,
+            targetProjection := [], perm := .unique },
+          { tag := 9, targetLocal := 4, targetFrameDepth := 0,
+            targetProjection := [], perm := .frozen },
+          { tag := 5, targetLocal := 5, targetFrameDepth := 0,
+            targetProjection := [], perm := .frozen, protector := some 11 }]
+        activeProtectors := [11, 10]
+        nextProtector := 12 }
+  let sRet : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 3,
+                 locals := [.init .unit, .init thinRefChildVal,
+                            .init twoArgSliceVal] }
+      memory :=
+        { s3.memory with
+          borrows :=
+            invalidateConflictingBorrows s3.memory.borrows 0 .none
+              (length s3.memory.callStack) } }
+  let sPost : MachineState :=
+    PureState.toMachineState
+      { bb := 1, stmtIdx := 0,
+        env := [.uninit, .init .unit, .init thinRefParentVal,
+                .init twoArgSliceVal] }
+      { twoArgMixedCallerMem with
+        borrows := s3.memory.borrows
+        activeProtectors := []
+        activeCallee := some twoArgMixedCaller
+        nextTag := 3
+        nextProtector := 12 }
+  have hEntry :
+      (prepCallEntry twoArgMixedCaller
+          (.constant { ty := twoArgMixedCalleeItemTy, val := .zeroSized })
+          [.copy { local_ := 2, projection := [] },
+           .copy { local_ := 3, projection := [] }]
+          { local_ := 1, projection := [] } 1 .continue_).run s0 =
+        .ok call0 s1 := rfl
+  have hS3 :
+      (prepFnEntryRetags twoArgMixedCallee [1, 2]).run s1 = .ok () s3 := rfl
+  have hTd : prepTeardownAndWriteback.run sRet = .ok () sPost := rfl
+  have hWp :
+      (wpFramePrepStage3 twoArgMixedCalleeContract twoArgMixedCaller
+        (.constant { ty := twoArgMixedCalleeItemTy, val := .zeroSized })
+        [.copy { local_ := 2, projection := [] },
+         .copy { local_ := 3, projection := [] }]
+        { local_ := 1, projection := [] } 1 .continue_
+        (prepFnEntryRetags twoArgMixedCallee [1, 2]) (fun st => st = sPost)
+        s0).down := by
+    unfold wpFramePrepStage3 prepCallEntryStage3
+    refine (wp_framePost_iff _ _ _).mpr ⟨call0, s3, ?_, ?_, ?_⟩
+    · rw [run_bind_ok hEntry, run_bind_ok hS3]; rfl
+    · refine ⟨rfl, rfl, rfl, fun e he => ?_⟩
+      cases he with
+      | head => intro h; cases h
+      | tail _ ht =>
+        cases ht with
+        | head => intro h; cases h
+        | tail _ ht2 =>
+          cases ht2 with
+          | head => intro h; cases h
+          | tail _ ht3 =>
+            cases ht3 with
+            | head => intro h; cases h
+            | tail _ ht4 => cases ht4
+    · intro sRet' retVal hPost _ _
+      rw [hPost.2]
+      exact (wp_framePost_iff _ _ _).mpr ⟨(), sPost, hTd, rfl⟩
+  refine wpFramePrepStage3_sound_stepMirFn (body := twoArgMixedCaller)
+    (cur := twoArgMixedCaller)
+    (blk :=
+      { statements := []
+        terminator := {
+          kind :=
+            .call
+              (.constant { ty := twoArgMixedCalleeItemTy, val := .zeroSized })
+              [.copy { local_ := 2, projection := [] },
+               .copy { local_ := 3, projection := [] }]
+              { local_ := 1, projection := [] } (some 1) .continue_
+          span := "call_two_mixed" }
+        isCleanup := false })
+    twoArgMixedCalleeContract 2 1 rfl (Or.inl rfl) rfl rfl rfl
+    (fun _ _ => Nat.le_refl 1) hWp ?_ ?_
+  · intro call' s1' s3' hE' hS3'
+    rw [hEntry] at hE'; cases hE'
+    exact prepFnEntryRetags_stepsTo [1, 2] hS3'
+      fun i loc st st₁ hget hblk hst hcal hrun => by
+        have hCur' :
+            st.memory.activeCallee.getD twoArgMixedCaller =
+              twoArgMixedCallee := by rw [hcal]; rfl
+        have hBb' :
+            get? twoArgMixedCallee.basicBlocks st.frame.blockIdx =
+              get? twoArgMixedCallee.basicBlocks 0 := by rw [hblk]; rfl
+        cases i with
+        | zero =>
+          cases hget
+          exact (stepMirFn_retag_fnEntry_any_ok hCur' (Or.inl rfl)
+            (by rw [hBb']; rfl) (by rw [hst]; rfl) hrun).1
+        | succ i' =>
+          cases i' with
+          | zero =>
+            cases hget
+            exact (stepMirFn_retag_fnEntry_any_ok hCur' (Or.inl rfl)
+              (by rw [hBb']; rfl) (by rw [hst]; rfl) hrun).1
+          | succ _ => cases hget
   · intro env' mem' hEq
     refine liftState_iff_liftFrame.mp ?_
     rw [hEq]
