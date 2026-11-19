@@ -2152,6 +2152,150 @@ theorem canary_part1_part3_helper_defs_coverage :
   refine ⟨rfl, rfl, ExtTreeMap0.size_empty, ?_, rfl, by simp [stringToRawNatBytes]⟩
   simp [ExtTreeMap0.ofList, ExtTreeMap0.get?_insert, MiriAllocId.one, id2]
 
+/-! ## Section 3E: Inductive Retag Invariants, Memory-Order Static Segments, and Custom-DST Wide References -/
+
+private def invChainW0 : FnEntryBorrowWorld where
+  nodes := [⟨0, none, .unique, 0, 4, none, true⟩]
+  activeProtectors := []
+  nextTag := 1
+  nextProtector := 10
+
+private def invChainW1 : FnEntryBorrowWorld where
+  nodes := [
+    ⟨1, some 0, .reservedFrz false, 0, 4, some 10, true⟩,
+    ⟨0, none, .unique, 0, 4, none, true⟩
+  ]
+  activeProtectors := [10]
+  nextTag := 2
+  nextProtector := 11
+
+private def invChainW2 : FnEntryBorrowWorld where
+  nodes := [
+    ⟨2, some 1, .unique, 0, 4, some 11, true⟩,
+    ⟨1, some 0, .unique, 0, 4, some 10, true⟩,
+    ⟨0, none, .unique, 0, 4, none, true⟩
+  ]
+  activeProtectors := [11, 10]
+  nextTag := 3
+  nextProtector := 12
+
+private def tagsWFNotInductiveW0 : FnEntryBorrowWorld where
+  nodes := [⟨0, none, .unique, 0, 4, none, true⟩, ⟨5, some 0, .unique, 0, 4, none, true⟩]
+  activeProtectors := []
+  nextTag := 4
+  nextProtector := 10
+
+private def tagsWFNotInductiveW1 : FnEntryBorrowWorld where
+  nodes := [
+    ⟨4, some 0, .reservedFrz false, 0, 4, some 10, true⟩,
+    ⟨0, none, .unique, 0, 4, none, true⟩,
+    ⟨5, some 0, .frozen, 0, 4, none, true⟩
+  ]
+  activeProtectors := [10]
+  nextTag := 5
+  nextProtector := 11
+
+theorem canary_part2A_inductive_invariant_across_two_retags :
+    execFnEntryMutRetagPrunedSourceOrder invChainW0 0 0 4 .rustcNoWritable false = .ok (invChainW1, 1) ∧
+    execFnEntryMutRetagPrunedSourceOrder invChainW1 1 0 4 .writableChildWrite false = .ok (invChainW2, 2) ∧
+    FnEntryBorrowInv invChainW2 0 ∧
+    BorrowTreeTagsWF invChainW2 ∧
+    RetagShape invChainW1 invChainW2 1 0 4 ∧
+    execFnEntryMutRetagTraversalOrderDirect invChainW1 1 0 4 .writableChildWrite false = .ok (invChainW2, 2) ∧
+    BorrowTreeTagsWF tagsWFNotInductiveW0 ∧
+    execFnEntryMutRetagPrunedSourceOrder tagsWFNotInductiveW0 0 0 4 .rustcNoWritable false =
+      .ok (tagsWFNotInductiveW1, 4) ∧
+    ¬ BorrowTreeTagsWF tagsWFNotInductiveW1 ∧
+    ¬ BorrowTreeFreshWF tagsWFNotInductiveW0 := by
+  have h1 : execFnEntryMutRetagPrunedSourceOrder invChainW0 0 0 4 .rustcNoWritable false =
+      .ok (invChainW1, 1) := rfl
+  have h2 : execFnEntryMutRetagPrunedSourceOrder invChainW1 1 0 4 .writableChildWrite false =
+      .ok (invChainW2, 2) := rfl
+  have hd2 : execFnEntryMutRetagTraversalOrderDirect invChainW1 1 0 4 .writableChildWrite false =
+      .ok (invChainW2, 2) := rfl
+  have inv0 : FnEntryBorrowInv invChainW0 0 :=
+    FnEntryBorrowInv.singleRoot 0 1 10 0 4 .unique true (by decide) (by decide)
+  have inv1 := execFnEntryMutRetagPrunedSourceOrder_preserves_inv invChainW0 invChainW1 0 0 0 4 1
+    .rustcNoWritable false inv0 h1
+  have inv2 := (execFnEntryMutRetagTraversalOrderDirect_preserves_inv invChainW1 invChainW2 0 1 0 4 2
+    .writableChildWrite false inv1 hd2).2
+  have hshape := (execFnEntryMutRetagPrunedSourceOrder_ok_retagShape invChainW1 invChainW2 1 0 4 2
+    .writableChildWrite false (by decide) h2).2
+  have hbad := borrowTreeTagsWF_not_inductive
+  have hbad1 : execFnEntryMutRetagPrunedSourceOrder tagsWFNotInductiveW0 0 0 4 .rustcNoWritable false =
+      .ok (tagsWFNotInductiveW1, 4) := rfl
+  have hnot1 := not_borrowTreeTagsWF_of_nextTag_used tagsWFNotInductiveW1 rfl
+  have hnotFresh : ¬ BorrowTreeFreshWF tagsWFNotInductiveW0 := fun hf =>
+    absurd (hf.tagsBelow ⟨5, some 0, .unique, 0, 4, none, true⟩ (by decide)) (by decide)
+  exact ⟨h1, h2, inv2, inv2.fresh.toTagsWF, hshape, hd2, hbad.1, hbad1, hnot1, hnotFresh⟩
+
+theorem canary_part2A_trusted_fnEntryRetagPerm_matches_upstream_create :
+    (MiriRetagPolicyMirror.create ⟨true, true, true⟩ .shared .fnEntry ⟨true, false⟩).map
+        (fun p => if rigidTyIsFreeze 16 (.uint .u32) then p.freezePermission else p.nonfreezePermission) =
+      some (fnEntryRetagPerm .not (.uint .u32)) ∧
+    (MiriRetagPolicyMirror.create ⟨true, true, true⟩ .mutable .fnEntry ⟨true, true⟩).map
+        (fun p => if rigidTyIsFreeze 16 (.uint .u32) then p.freezePermission else p.nonfreezePermission) =
+      some (fnEntryRetagPerm .mut (.uint .u32)) := by
+  have hShared := fnEntryRetagPerm_eq_upstream_create_noImplicitWrite ⟨true, true, true⟩ ⟨true, false⟩
+    (.uint .u32)
+  have hMut := fnEntryRetagPerm_eq_upstream_create_noImplicitWrite ⟨true, true, true⟩ ⟨true, true⟩
+    (.uint .u32)
+  exact ⟨hShared.1, hMut.2 rfl⟩
+
+private def staticDeclOrderCells : StaticTyDesc :=
+  .composite 8 [(4, .unsafeCell 4), (0, .unsafeCell 4)]
+
+private def staticThreeOutOfOrder : StaticTyDesc :=
+  .composite 8 [(0, .freezeScalar 2), (6, .unsafeCell 2), (2, .unsafeCell 2)]
+
+theorem canary_part2B_memoryOrder_freeze_segments_and_byte_level_spec :
+    (staticFreezeSegments staticDeclOrderCells).2 = [⟨0, 4, .unsafeCell⟩, ⟨4, 4, .unsafeCell⟩] ∧
+    evalRawMutStaticWriteMiri staticDeclOrderCells (retagStaticPreservedAt staticDeclOrderCells 1 2) 0 8 =
+      .ok ∧
+    byteInNonZeroUnsafeCell staticDeclOrderCells 5 = true ∧
+    evalRawMutStaticWriteMiri staticThreeOutOfOrder (retagStaticPreservedAt staticThreeOutOfOrder 1 2) 2 6 =
+      .ub ∧
+    byteInNonZeroUnsafeCell staticThreeOutOfOrder 4 = false ∧
+    (∃ s ∈ (staticFreezeSegments staticThreeOutOfOrder).2,
+      s.kind = .freeze ∧ s.offset ≤ 4 ∧ 4 < s.offset + s.len) ∧
+    sortCellsByOffset [(6, 2), (2, 2), (4, 1)] = [(2, 2), (4, 1), (6, 2)] ∧
+    CellsOffsetSorted (sortCellsByOffset [(6, 2), (2, 2), (4, 1)]) := by
+  have hsep := static_fieldOrder_independent_segments
+  have hok : evalRawMutStaticWriteMiri staticDeclOrderCells
+      (retagStaticPreservedAt staticDeclOrderCells 1 2) 0 8 = .ok := hsep.2.2.2.2.1
+  have hspec := static_preserved_write_ok_iff_all_bytes_in_unsafeCell staticDeclOrderCells 1 2 0 8
+    (by decide) rfl
+  have hbyte5 := hspec.1.1 hok 5 (by decide) (by decide)
+  have hfrz := (staticFreezeSegments_freeze_byte_iff staticThreeOutOfOrder 4 (by decide)).2 rfl
+  exact ⟨hsep.1, hok, hbyte5, hsep.2.2.2.2.2.2.2.2.2, rfl, hfrz, rfl, sortCellsByOffset_sorted _⟩
+
+theorem canary_part3C_customDst_wide_refs_and_dynLayout_totality :
+    visitConcreteValue 4 (encodeLeUInt64Bytes 16 ++ encodeLeUInt64Bytes 3) 0
+      (.ref false (.tuple [.uint 4, .slice (.uint 1)])) = .ok () ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 16 ++ encodeLeUInt64Bytes 9223372036854775807) 0
+      (.ref false (.tuple [.uint 4, .slice (.uint 1)])) = .error .nestedSliceTooBig ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 18 ++ encodeLeUInt64Bytes 0) 0
+      (.ref false (.adt "S" [.uint 1, .dynamic "Send"])) (fun _ _ => .ok (4, 4)) =
+      .error (.nestedUnalignedSafeRef 4 18) ∧
+    (∃ r, dynSizeAlign (.sliceLen 7) (.tuple [.uint 4, .slice (.uint 1)]) = .ok r) ∧
+    (∃ r, dynSizeAlign (.vtable 16 8) (.adt "S" [.uint 1, .dynamic "Send"]) = .ok r) ∧
+    (∃ r, fieldsDynSizeAlign (.sliceLen 7) 0 1 [.uint 4, .slice (.uint 1)] = .ok r) ∧
+    checkNestedWideSafeRefChildSession NestedDynMetaOracle.failClosed
+      (.tuple [.uint 4, .slice (.uint 1)]) (List.replicate 16 (0, none)) ≠
+      .error (.layoutErr .unsizedField) ∧
+    DynMetaVal.matchesKind .thin (some .sliceLen) = false := by
+  have hc := visitConcreteValue_nestedCustomDst_cases
+  have htot1 := dynSizeAlign_total_of_layout_ok (.tuple [.uint 4, .slice (.uint 1)]) (.sliceLen 7)
+    (lay := ⟨4, 4, false, true, some .sliceLen⟩) rfl rfl
+  have htot2 := dynSizeAlign_total_of_layout_ok (.adt "S" [.uint 1, .dynamic "Send"]) (.vtable 16 8)
+    (lay := ⟨1, 1, false, true, some .dynVTable⟩) rfl rfl
+  have htot3 := fieldsDynSizeAlign_total_of_layout_ok [.uint 4, .slice (.uint 1)] (.sliceLen 7) 0 1 true
+    (lay := ⟨4, 4, false, true, some .sliceLen⟩) rfl rfl
+  have hno := checkNestedWideSafeRefChildSession_sliceTail_no_layoutErr NestedDynMetaOracle.failClosed
+    (.tuple [.uint 4, .slice (.uint 1)]) ⟨4, 4, false, true, some .sliceLen⟩
+    (List.replicate 16 (0, none)) rfl rfl rfl .unsizedField
+  exact ⟨hc.2.1, hc.2.2.2.2.1, hc.2.2.2.2.2.2.1, htot1, htot2, htot3, hno, rfl⟩
+
 /-! ## Section 4: Fast `M = 16` Closed Workload Canary -/
 
 private def mkSmallAllocId (n : Nat) (h : n < 1000) : MiriAllocId :=
@@ -2601,6 +2745,106 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritable.visitConcreteValue_nestedRawUnsized_l
 -/
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.visitConcreteValue_nestedRawUnsized_layout_checked
 
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.fnEntryRetagPerm_eq_upstream_create_noImplicitWrite' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.fnEntryRetagPerm_eq_upstream_create_noImplicitWrite
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.stepNodeOnRangeRead_nodeMetaRel' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.stepNodeOnRangeRead_nodeMetaRel
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.stepNodeOnRangeWrite_nodeMetaRel' does not depend on any axioms
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.stepNodeOnRangeWrite_nodeMetaRel
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.BorrowTreeFreshWF.toTagsWF' does not depend on any axioms
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.BorrowTreeFreshWF.toTagsWF
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.RetagShape.freshWF' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.RetagShape.freshWF
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.RetagShape.rootedWF' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.RetagShape.rootedWF
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.RetagShape.noProtectedReservedIM' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.RetagShape.noProtectedReservedIM
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_ok_retagShape' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_ok_retagShape
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.FnEntryBorrowInv.singleRoot' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.FnEntryBorrowInv.singleRoot
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_preserves_inv' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_preserves_inv
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagTraversalOrderDirect_preserves_inv' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagTraversalOrderDirect_preserves_inv
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.borrowTreeTagsWF_not_inductive' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.borrowTreeTagsWF_not_inductive
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.sortCellsByOffset_sorted' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.sortCellsByOffset_sorted
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.staticFreezeSegments_freeze_byte_iff' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.staticFreezeSegments_freeze_byte_iff
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.static_preserved_write_ok_iff_all_bytes_in_unsafeCell' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.static_preserved_write_ok_iff_all_bytes_in_unsafeCell
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.static_fieldOrder_independent_segments' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.static_fieldOrder_independent_segments
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.dynSizeAlign_total_of_layout_ok' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.dynSizeAlign_total_of_layout_ok
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.checkNestedWideSafeRefChildSession_sliceTail_no_layoutErr' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.checkNestedWideSafeRefChildSession_sliceTail_no_layoutErr
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.visitConcreteValue_nestedCustomDst_cases' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.visitConcreteValue_nestedCustomDst_cases
+
 /-! ## Section 6: Meta-Level `run_cmd` Audit & Rolled-Back Self-Tests -/
 
 section MetaAudit
@@ -2660,7 +2904,11 @@ private def isCompilerGeneratedAuxThm (env : Environment) (nm : Name) : Bool :=
         hasNumericPrefix s "_cstage"
     | _ => false
 
-private def isCompilerGeneratedAuxDef (env : Environment) (nm : Name) : Bool :=
+/-- Name-shape heuristic for compiler-generated definitions (matchers, recursors, `deriving` output,
+structure plumbing). On its own it is bypassable — a source-written `Foo.default`, `Foo.repr`, or
+`match_helper` has the same shape — so `isCompilerGeneratedAuxDef` trusts it only for declarations
+WITHOUT a source declaration range. -/
+private def hasCompilerGeneratedDefName (env : Environment) (nm : Name) : Bool :=
   if env.isProjectionFn nm then true
   else if nameHasComponent nm (fun s =>
       s == "decEq" || s == "repr" || s == "reprPrec" || s == "beq" ||
@@ -2682,6 +2930,47 @@ private def isCompilerGeneratedAuxDef (env : Environment) (nm : Name) : Bool :=
       hasParentDecl && (s == "mk" || s == "elim" || s == "induct" ||
         hasNumericPrefix s "match_" || hasNumericPrefix s "_cstage")
     | _ => false
+
+/-- Whether `nm` has a source declaration range, i.e. it was written by a `def` / `theorem` /
+`instance` / `deriving` command rather than synthesized by the compiler (matchers, `casesOn`,
+`noConfusionType`, `ctorIdx`, `_f`, `_sparseCasesOn_*`, equation lemmas, ...). -/
+private def hasDeclRange (env : Environment) (nm : Name) : Bool :=
+  (declRangeExt.find? (level := .exported) env nm).isSome ||
+    (declRangeExt.find? (level := .server) env nm).isSome
+
+/-- A registered instance of a derivable DATA class (`Repr`, `DecidableEq` / `Decidable`, `Inhabited`,
+`BEq`): type-class plumbing rather than model content. -/
+private def isDerivedDataInstance (env : Environment) (nm : Name) : Bool :=
+  Lean.Meta.isInstanceCore env nm &&
+    match env.find? nm with
+    | some ci =>
+      match ci.type.getForallBody.getAppFn with
+      | .const c _ =>
+        c == ``Repr || c == ``DecidableEq || c == ``Decidable || c == ``Inhabited || c == ``BEq
+      | _ => false
+    | none => false
+
+/-- A public definition is exempt from canary reachability only if it is a structure projection, a
+derived data instance (or one of its helper definitions), or has NO source declaration range AND a
+compiler-generated name shape. Every definition written in source — whatever it is called — must be
+reachable from a closed canary. -/
+private def isCompilerGeneratedAuxDef (env : Environment) (nm : Name) : Bool :=
+  env.isProjectionFn nm || isDerivedDataInstance env nm ||
+    (match nm with
+     | .str p _ => isDerivedDataInstance env p
+     | _ => false) ||
+    (!hasDeclRange env nm && (hasCompilerGeneratedDefName env nm || nm.isInternalDetail))
+
+/-- A theorem that `isCompilerGeneratedAuxThm` exempts BY NAME although it has a source declaration
+range and is neither a structure projection nor the `_iff` companion that `@[ext]` generates for an
+existing theorem: a source-written theorem hiding behind a compiler-looking name. -/
+private def isNameExemptSourceWrittenThm (env : Environment) (nm : Name) : Bool :=
+  isCompilerGeneratedAuxThm env nm && !env.isProjectionFn nm && hasDeclRange env nm &&
+    !(match nm with
+      | .str p s =>
+        (s == "ext_iff" && env.contains (.str p "ext")) ||
+          (s == "ext_get?_iff" && env.contains (.str p "ext_get?"))
+      | _ => false)
 
 /-- Collect unpruned transitive constant closure (used for axiom soundness — never prunes dead code). -/
 private partial def collectTransitiveClosure (env : Environment) (roots : List Name) : NameSet :=
@@ -2994,6 +3283,7 @@ run_cmd do
   let mut unsafeDecls : List Name := []
   let mut placeholderDecls : List Name := []
   let mut launderedDecls : List Name := []
+  let mut disguisedThms : List Name := []
   let mut tautologyCanaries : List Name := []
   let mut conditionalCanaries : List Name := []
 
@@ -3007,6 +3297,8 @@ run_cmd do
       | .thmInfo _ =>
         if !isPrivateName nm && !isCompilerGeneratedAuxThm env nm then
           theoryPubThms := nm :: theoryPubThms
+        if isNameExemptSourceWrittenThm env nm then
+          disguisedThms := nm :: disguisedThms
       | .defnInfo _ =>
         if !isPrivateName nm && !isCompilerGeneratedAuxDef env nm then
           theoryPubDefs := nm :: theoryPubDefs
@@ -3027,6 +3319,8 @@ run_cmd do
         s == "isAuditedTheoryThm" ||
         s == "nameHasComponent" || s == "isNonEmptyDigits" || s == "isDigitUnderscoreSuffix" ||
         s == "hasNumericPrefix" || s == "isCompilerGeneratedAuxThm" || s == "isCompilerGeneratedAuxDef" ||
+        s == "hasCompilerGeneratedDefName" || s == "hasDeclRange" || s == "isDerivedDataInstance" ||
+        s == "isNameExemptSourceWrittenThm" ||
         s == "collectTransitiveClosure" || s == "collectPrunedExprConsts" ||
         s == "collectPrunedReachableClosure" || s == "exprMentionsAudited" ||
         s == "exprMentionsAuditedThm" || s == "hasPlaceholderBindingWith" ||
@@ -3042,12 +3336,16 @@ run_cmd do
         s == "hasDiscardedCtorFieldWith" ||
         s == "stripLetBindings" || s == "hasTautologicalConjunct" ||
         s == "isCompilerGeneratedAuxThm" || s == "isCompilerGeneratedAuxDef" ||
+        s == "hasCompilerGeneratedDefName" || s == "hasDeclRange" || s == "isDerivedDataInstance" ||
+        s == "isNameExemptSourceWrittenThm" ||
         s == "nameHasComponent" ||
         s == "isNonEmptyDigits" || s == "isDigitUnderscoreSuffix" || s == "hasNumericPrefix") then
       auditedRoots := nm :: auditedRoots
       totalDecls := totalDecls + 1
       if ci.isUnsafe then
         unsafeDecls := nm :: unsafeDecls
+      if isNameExemptSourceWrittenThm env nm then
+        disguisedThms := nm :: disguisedThms
       if isConditionalPublicTestThm env nm ci then
         conditionalCanaries := nm :: conditionalCanaries
       else
@@ -3093,6 +3391,8 @@ run_cmd do
     failures := m!"dead placeholder bindings found: {placeholderDecls}" :: failures
   if !launderedDecls.isEmpty then
     failures := m!"theory theorems discarded through constructor projections: {launderedDecls}" :: failures
+  if !disguisedThms.isEmpty then
+    failures := m!"source-written theorems exempted by a compiler-looking name: {disguisedThms}" :: failures
   if !tautologyCanaries.isEmpty then
     failures := m!"tautological conjuncts in canaries: {tautologyCanaries}" :: failures
   if !conditionalCanaries.isEmpty then
@@ -3104,7 +3404,7 @@ run_cmd do
   if !failures.isEmpty then
     throwError m!"AUDIT FAILURE:\n{MessageData.joinSep failures.reverse "\n"}"
 
-  -- 19 Rolled-Back Self-Tests proving the audit detects every defect class with zero false positives
+  -- 21 Rolled-Back Self-Tests proving the audit detects every defect class with zero false positives
   -- Self-test 1: Classical.choice detection
   let st1 := (checkDeclAxioms env ``Classical.choice).contains ``Classical.choice
   unless st1 do throwError "SELF-TEST 1 FAILED: Classical.choice not caught"
@@ -3299,7 +3599,7 @@ run_cmd do
 
   -- Self-test 19: unreachable public theory `def` detection (rolled back)
   let st19 : Bool ← withoutModifyingEnv do
-    let deadDefName := `Anneal.ExtTreeMapAllocAndNoWritable._selftest_deadPublicDef
+    let deadDefName := `Anneal.ExtTreeMapAllocAndNoWritable.selftest_deadPublicDef
     liftCoreM <| addDecl (.defnDecl {
       name := deadDefName, levelParams := [],
       type := natTy, value := mkNatLit 42, hints := .abbrev, safety := .safe
@@ -3308,7 +3608,51 @@ run_cmd do
     pure (!isPrivateName deadDefName && !isCompilerGeneratedAuxDef e deadDefName && !reachable.contains deadDefName)
   unless st19 do throwError "SELF-TEST 19 FAILED: unreachable public theory def not caught"
 
-  logInfo m!"audit passed: {totalDecls} declarations ({theoryPubThms.length} theory public theorems, {theoryPubDefs.length} theory public defs/abbrevs, {closedCanaries.length} closed test canaries, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 unexpected axioms, 0 placeholder uses, 0 constructor-projection launderings, 0 tautological conjuncts, 0 conditional test theorems, 100% pruned theorem & def reachability; 19/19 rolled-back self-tests passed)"
+  -- Self-test 20: public-def exemption is decided by SOURCE RANGE, not by name shape (rolled back).
+  -- Definitions named like compiler output (`match_*`, `*.default`) stay exempt only while they have
+  -- no declaration range; with one they are audited. Real user-written theory defs carry ranges.
+  let st20 : Bool ← withoutModifyingEnv do
+    let fakeMatch := `Anneal.ExtTreeMapAllocAndNoWritable.match_fake_unreached
+    let fakeDefault := `Anneal.ExtTreeMapAllocAndNoWritable.KeyedAllocWorld.default
+    for nmFake in [fakeMatch, fakeDefault] do
+      liftCoreM <| addDecl (.defnDecl {
+        name := nmFake, levelParams := [],
+        type := natTy, value := mkNatLit 7, hints := .abbrev, safety := .safe
+      })
+    let e0 ← getEnv
+    let exemptWithoutRange :=
+      isCompilerGeneratedAuxDef e0 fakeMatch && isCompilerGeneratedAuxDef e0 fakeDefault
+    let rng : DeclarationRange := { pos := ⟨1, 0⟩, charUtf16 := 0, endPos := ⟨1, 1⟩, endCharUtf16 := 1 }
+    addDeclarationRanges fakeMatch { range := rng, selectionRange := rng }
+    addDeclarationRanges fakeDefault { range := rng, selectionRange := rng }
+    let e ← getEnv
+    pure (exemptWithoutRange &&
+      hasCompilerGeneratedDefName e fakeMatch && hasCompilerGeneratedDefName e fakeDefault &&
+      !isCompilerGeneratedAuxDef e fakeMatch && !isCompilerGeneratedAuxDef e fakeDefault &&
+      !isCompilerGeneratedAuxDef e ``KeyedAllocWorld.checkPtrAccess &&
+      !isCompilerGeneratedAuxDef e ``visitConcreteValue &&
+      isCompilerGeneratedAuxDef e ``TreeTagNode.casesOn &&
+      isCompilerGeneratedAuxDef e ``TreeTagNode.tag)
+  unless st20 do throwError "SELF-TEST 20 FAILED: public-def exemption not decided by source range"
+
+  -- Self-test 21: a source-written theorem hiding behind a compiler-looking name (`Foo.eq`) is flagged,
+  -- while structure projections and `@[ext]`-generated `_iff` companions are not (rolled back)
+  let st21 : Bool ← withoutModifyingEnv do
+    let fakeEq := `Anneal.ExtTreeMapAllocAndNoWritable.KeyedAllocWorld.eq
+    liftCoreM <| addDecl (.thmDecl {
+      name := fakeEq, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro })
+    let e0 ← getEnv
+    let unflaggedWithoutRange :=
+      isCompilerGeneratedAuxThm e0 fakeEq && !isNameExemptSourceWrittenThm e0 fakeEq
+    let rng : DeclarationRange := { pos := ⟨1, 0⟩, charUtf16 := 0, endPos := ⟨1, 1⟩, endCharUtf16 := 1 }
+    addDeclarationRanges fakeEq { range := rng, selectionRange := rng }
+    let e ← getEnv
+    pure (unflaggedWithoutRange && isNameExemptSourceWrittenThm e fakeEq &&
+      !isNameExemptSourceWrittenThm e ``KeyedAllocWorld.ext_iff &&
+      !isNameExemptSourceWrittenThm e ``BorrowTreeTagsWF.tagsNodup)
+  unless st21 do throwError "SELF-TEST 21 FAILED: name-disguised source-written theorem not flagged"
+
+  logInfo m!"audit passed: {totalDecls} declarations ({theoryPubThms.length} theory public theorems, {theoryPubDefs.length} theory public defs/abbrevs, {closedCanaries.length} closed test canaries, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 unexpected axioms, 0 placeholder uses, 0 constructor-projection launderings, 0 name-disguised source-written theorems, 0 tautological conjuncts, 0 conditional test theorems, 100% pruned theorem & def reachability; 21/21 rolled-back self-tests passed)"
 
 end MetaAudit
 

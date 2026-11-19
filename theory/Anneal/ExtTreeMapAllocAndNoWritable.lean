@@ -30,9 +30,11 @@ Complete, kernel-checked, `Classical.choice`-free theory covering:
   operational bridge to `Trusted.Rustc.V2026_06_01.MirSemantics`, bottom-up
   `ancestorPathNodes` source-order borrow-tree traversal, hypothesis-free
   success-path equivalence across two-pass / flat-upstream / source-order
-  models, `.frozen` preservation under `rustcNoWritable`, and syntactic
-  `isSyntacticFreeze` static allocation mutability separating preserved `#1620`
-  static-temporary retags from pre-`#1620` raw address-of erasure.
+  models, `.frozen` preservation under `rustcNoWritable`, the inductive
+  retag invariant `FnEntryBorrowInv` (`BorrowTreeFreshWF` + rootedness +
+  `NoProtectedReservedIM`), and syntactic `isSyntacticFreeze` static allocation
+  mutability with memory-ordered `FreezeVisitor` segments separating preserved
+  `#1620` static-temporary retags from pre-`#1620` raw address-of erasure.
 - **Part 3 (`lean-miri#79`, `#75`, `#82`)**: `O(1)` syntactic `Sized` fast-path
   with custom-DST `unsizedMetadataTail` / `unsizedDynTailTrait?`,
   `getAllocInfo`-backed `validateSafeThinRef` with provenance-agnostic null
@@ -57,7 +59,9 @@ Complete, kernel-checked, `Classical.choice`-free theory covering:
 | `stepNodeOnRangeRead` / `stepNodeOnRangeWrite` | `Miri.TreeBorrows.performAccess` + `Tree.LocationState.performAccess` (incl. `accessed`) |
 | `execFnEntryMutRetagSourceOrder` / `execFnEntryMutRetagPrunedSourceOrder` | `Miri.TreeBorrows.RetagPipeline` (`accessTreeForReborrow`) over `TraversalTree.traverse` + `NormalTreeState.performAccess` (`SkipSelfAndChildren`) |
 | `foreignVisitScheduleNodes`, `execFnEntryMutRetagTraversalOrder`, `execFnEntryMutRetagTraversalOrderDirect` | `TraversalTree.initialForeignRoots` + `foreignPostorder` (`foreignEvents` visit order; exact standalone equivalence on `BorrowTreeRootedWF`) |
-| `IdempotentForeignAccess`, `sifa_foreign_transition_idempotent` | `Miri.TreeBorrows.IdempotentForeignAccess` + `LocationState.skipIfKnownNoop` SIFA soundness |
+| `IdempotentForeignAccess`, `sifa_foreign_transition_idempotent` | `Miri.TreeBorrows.IdempotentForeignAccess` + `LocationState.skipIfKnownNoop` (per-node idempotence only) |
+| `sortCellsByOffset`, `staticFreezeSegments` | `FreezeVisitor.visitValue` (`FieldsShape::Arbitrary` in `memoryOrder`) + `unsafeCellAction` cursor walk |
+| `RetagShape`, `BorrowTreeFreshWF`, `FnEntryBorrowInv` | shape and inductive invariants of `RetagPipeline.accessTreeForReborrow` + `newChild` (fresh `BorTag` / protector ids) |
 | `RetagStepErr.protectedReservedIMInvariant` | `AccessOutcome.ImpossibleProtectedReservedIM` / `NormalAccessStatus.PermissionInvariantFailure` (not UB) |
 | `KeyedAllocWorld.checkPtrAccess`, `LinearAllocWorld.checkPtrAccess` | `Miri.Memory.sizeAsI64` + `checkAndDerefPtr` via `ValidityMachine.checkPointerAccessResult` |
 | `checkNestedWideSafeRefChildSession`, `dynSizeAlign` | `ValidityVisitor.checkSafe` on wide places (`checkMetadata`, `size_and_align_of_val`) |
@@ -69,8 +73,12 @@ Complete, kernel-checked, `Classical.choice`-free theory covering:
 Honest scope: Miri's `extra_fn_ptr_map` / va-list tables, export-ID tables, and wildcard provenance are
 not modeled; the machine hook has no memory side effects beyond the race-clock detach; borrow-tree nodes
 carry one coarse byte range (no per-byte lazy permissions, so the `SkipSelfAndChildren` pruning of
-Models 4 and 5 is decided per node rather than per location, while SIFA cache soundness is proved at the
-per-node transition layer); the `execFnEntryMutRetag*` models cover `&mut` / `Box` parameters only
+Models 4 and 5 is decided per node rather than per location); the SIFA cache is NOT part of any retag
+model: `sifa_foreign_transition_idempotent` proves only that a single node is stable under a repeated
+foreign access, whereas upstream's SIFA-triggered `SkipSelfAndChildren` prunes a whole subtree and
+additionally relies on the cache invariant maintained by `ensureNoStrongerThan` (a parent's cache is
+never stronger than a child's), which is neither modeled nor proved here; the `execFnEntryMutRetag*`
+models cover `&mut` / `Box` parameters only
 (upstream mints `.frozen` / `.cell` children for shared references, see
 `fnEntry_shared_childPerms_outside_mut_models`); Models 1-4 blame the first failing FOREIGN node in list
 order whereas Model 5 and standalone `execFnEntryMutRetagTraversalOrderDirect` follow upstream reverse-
@@ -3667,6 +3675,37 @@ theorem fnEntryRetagPerm_mut_eq_reservedFrz (pointee : RigidTy) :
 
 theorem retagPerm_fnEntry_eq_fnEntryRetagPerm (mutability : Mutability) (pointee : RigidTy) :
     retagPerm .fnEntry mutability pointee = fnEntryRetagPerm mutability pointee := rfl
+
+/-- Trusted `fnEntryRetagPerm` agrees with upstream `RetagPolicy.create` whenever no implicit write is
+performed: a shared `FnEntry` retag mints `.frozen` / `.cell` according to WHOLE-TYPE `Freeze`ness (the
+trusted semantics has no per-byte interior-mutability precision), and a `&mut` retag under
+`.rustcNoWritable` mints `.reservedFrz false` on both `Freeze` and `UnsafeCell` bytes. -/
+theorem fnEntryRetagPerm_eq_upstream_create_noImplicitWrite
+    (facts : ParamTypeFacts) (attrs : ParamRetagAttrs) (pointee : RigidTy) :
+    (MiriRetagPolicyMirror.create facts .shared .fnEntry attrs).map
+        (fun p => if rigidTyIsFreeze 16 pointee then p.freezePermission else p.nonfreezePermission) =
+      some (fnEntryRetagPerm .not pointee) ∧
+    (selectFnEntryPolicy facts .mutable attrs = .rustcNoWritable →
+      (MiriRetagPolicyMirror.create facts .mutable .fnEntry attrs).map
+          (fun p => if rigidTyIsFreeze 16 pointee then p.freezePermission else p.nonfreezePermission) =
+        some (fnEntryRetagPerm .mut pointee)) := by
+  cases facts with | mk u uu frz =>
+  cases attrs with | mk iw rnw =>
+  have hnot : fnEntryRetagPerm .not pointee =
+      (match rigidTyIsFreeze 16 pointee with
+       | true => TreeBorrowPerm.frozen
+       | false => TreeBorrowPerm.cell) := rfl
+  have hmut : fnEntryRetagPerm .mut pointee = TreeBorrowPerm.reservedFrz false := rfl
+  rw [hnot, hmut]
+  constructor
+  · cases rigidTyIsFreeze 16 pointee <;>
+      cases u <;> cases uu <;> cases frz <;> cases iw <;> cases rnw <;> rfl
+  · intro hpol
+    cases rigidTyIsFreeze 16 pointee <;>
+      cases u <;> cases uu <;> cases frz <;> cases iw <;> cases rnw <;>
+      first
+      | rfl
+      | exact absurd hpol (by decide)
 
 /-- Post-retag implicit child write overlay for `Trusted.Rustc.V2026_06_01.MirSemantics.MachineState`,
 modeling the `writableChildWrite` transition after `evalStmt (.retag .fnEntry place)`.
@@ -7639,7 +7678,10 @@ def recordNew (recorded : IdempotentForeignAccess) (isLocal isWrite : Bool) :
 
 end IdempotentForeignAccess
 
-/-- **SIFA Soundness (`LocationState.skipIfKnownNoop`)**: once a node `n` survives a foreign access
+/-- **Per-node SIFA idempotence (`LocationState.skipIfKnownNoop`)** — the node-level half of SIFA
+soundness only; it does NOT justify pruning the node's subtree, which upstream additionally derives from
+the parent-no-stronger-than-child cache invariant (`ensureNoStrongerThan`), not modeled here. Once a node
+`n` survives a foreign access
 `k1` (`read` or `write`) producing `n'`, EVERY subsequent foreign access `k2` permitted by SIFA
 (`canSkipForeign (fromForeign k1) (fromForeign k2) = true`) on the same range is a provable NO-OP
 returning `.ok n'` unchanged — across all 6 `TreeBorrowPerm` states, both protector polarities, and
@@ -7792,6 +7834,431 @@ theorem sifa_rank_and_localReset_separation :
     stepNodeOnRangeRead [] false 0 4 { rNode with perm := .unique } = .ok { rNode with perm := .frozen } :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-! #### Inductive Borrow-Tree Invariants (`BorrowTreeFreshWF`, `RetagShape`, `FnEntryBorrowInv`)
+
+`BorrowTreeTagsWF`, `BorrowTreeRootedWF`, and `NoProtectedReservedIM` are hypotheses of the one-step
+theorems above. This section makes them usable across SEQUENCES of retags: `BorrowTreeFreshWF` is the
+inductive strengthening of `BorrowTreeTagsWF` (which is not preserved by a retag,
+`borrowTreeTagsWF_not_inductive`), `RetagShape` is the common shape of every successful retag, and
+`FnEntryBorrowInv` bundles the three invariants with establishment (`singleRoot`) and preservation by
+Model 4 and the standalone Model 5. -/
+
+/-- Shape data preserved by every per-node retag step: tag, parent link, protector, and byte range are
+unchanged, and no step ever CREATES a `.reservedIM` permission. -/
+def NodeMetaRel (n n' : TreeTagNode) : Prop :=
+  n'.tag = n.tag ∧ n'.parentTag = n.parentTag ∧ n'.protector = n.protector ∧
+  n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
+  (n'.perm = .reservedIM → n.perm = .reservedIM)
+
+theorem NodeMetaRel.refl (n : TreeTagNode) : NodeMetaRel n n :=
+  ⟨rfl, rfl, rfl, rfl, rfl, id⟩
+
+theorem listRel_nodeMetaRel_refl (xs : List TreeTagNode) : ListRel NodeMetaRel xs xs := by
+  induction xs with
+  | nil => exact ListRel.nil
+  | cons x rest ih => exact ListRel.cons (NodeMetaRel.refl x) ih
+
+/-- Every successful READ step (local or foreign) preserves the node's shape data. -/
+theorem stepNodeOnRangeRead_nodeMetaRel {ps : List Nat} {isLoc : Bool} {off len : Nat}
+    {n n' : TreeTagNode} (h : stepNodeOnRangeRead ps isLoc off len n = .ok n') : NodeMetaRel n n' := by
+  unfold stepNodeOnRangeRead at h
+  repeat' (split at h)
+  all_goals first
+    | (injection h with h; subst h
+       exact ⟨rfl, rfl, rfl, rfl, rfl, fun hp => by first | exact hp | cases hp⟩)
+    | cases h
+
+/-- Every successful WRITE step (local or foreign) preserves the node's shape data. -/
+theorem stepNodeOnRangeWrite_nodeMetaRel {ps : List Nat} {isLoc : Bool} {off len : Nat}
+    {n n' : TreeTagNode} (h : stepNodeOnRangeWrite ps isLoc off len n = .ok n') : NodeMetaRel n n' := by
+  unfold stepNodeOnRangeWrite at h
+  repeat' (split at h)
+  all_goals first
+    | (injection h with h; subst h
+       exact ⟨rfl, rfl, rfl, rfl, rfl, fun hp => by first | exact hp | cases hp⟩)
+    | cases h
+
+theorem ListRel.nodeMetaRel_map_tag_eq {xs ys : List TreeTagNode} (h : ListRel NodeMetaRel xs ys) :
+    ys.map (·.tag) = xs.map (·.tag) := by
+  induction h with
+  | nil => rfl
+  | cons hxy _ ih => simp only [List.map_cons, hxy.1, ih]
+
+/-- Tag lookup commutes with shape-preserving node updates. -/
+theorem ListRel.nodeMetaRel_findNode? {xs ys : List TreeTagNode} (h : ListRel NodeMetaRel xs ys)
+    {t : Nat} {x : TreeTagNode} (hx : findNode? xs t = some x) :
+    ∃ y, findNode? ys t = some y ∧ NodeMetaRel x y := by
+  induction h with
+  | nil => simp [findNode?] at hx
+  | @cons x0 y0 xs' ys' hxy _ ih =>
+    simp only [findNode?, List.find?] at hx ⊢
+    cases hb : (x0.tag == t) with
+    | true =>
+      rw [hb] at hx
+      injection hx with hx
+      subst hx
+      refine ⟨y0, ?_, hxy⟩
+      rw [hxy.1, hb]
+    | false =>
+      rw [hb] at hx
+      rcases ih hx with ⟨y, hy, hr⟩
+      refine ⟨y, ?_, hr⟩
+      rw [hxy.1, hb]
+      exact hy
+
+/-- INDUCTIVE freshness invariant of a borrow-tree world: every existing tag, parent link, and
+protector id (on nodes and in `activeProtectors`) lies STRICTLY BELOW the fresh counters. Unlike
+`BorrowTreeTagsWF` (which only says the single next tag / protector is unused, and is therefore NOT
+preserved by a retag), this is preserved by every successful retag (`RetagShape.freshWF`). -/
+structure BorrowTreeFreshWF (w : FnEntryBorrowWorld) : Prop where
+  tagsNodup : (w.nodes.map (·.tag)).Nodup
+  tagsBelow : ∀ n ∈ w.nodes, n.tag < w.nextTag
+  parentsBelow : ∀ n ∈ w.nodes, ∀ p, n.parentTag = some p → p < w.nextTag
+  protectorsBelow : ∀ n ∈ w.nodes, ∀ q, n.protector = some q → q < w.nextProtector
+  activeBelow : ∀ q ∈ w.activeProtectors, q < w.nextProtector
+
+/-- The inductive invariant implies the one-step well-formedness used by the model-equivalence theorems. -/
+theorem BorrowTreeFreshWF.toTagsWF {w : FnEntryBorrowWorld} (h : BorrowTreeFreshWF w) :
+    BorrowTreeTagsWF w :=
+  ⟨h.tagsNodup,
+    fun n hn heq => Nat.lt_irrefl w.nextTag (heq ▸ h.tagsBelow n hn),
+    fun n hn heq => Nat.lt_irrefl w.nextTag (h.parentsBelow n hn _ heq),
+    fun n hn heq => Nat.lt_irrefl w.nextProtector (h.protectorsBelow n hn _ heq)⟩
+
+/-- Shape of every successful non-skip `FnEntry` retag `w ↦ w'` through `parentTag` on
+`[off, off + len)`: the parent exists, a fresh PROTECTED child (tag `w.nextTag`, protector
+`w.nextProtector`, permission never `.reservedIM`) sits on top of shape-preserved nodes, and both fresh
+counters advance by one. -/
+structure RetagShape (w w' : FnEntryBorrowWorld) (parentTag off len : Nat) : Prop where
+  parentExists : ∃ pNode, findNode? w.nodes parentTag = some pNode
+  nodes : ∃ childPerm nodes', childPerm ≠ TreeBorrowPerm.reservedIM ∧
+    w'.nodes = ⟨w.nextTag, some parentTag, childPerm, off, len, some w.nextProtector, true⟩ :: nodes' ∧
+    ListRel NodeMetaRel w.nodes nodes'
+  activeProtectors : w'.activeProtectors = w.nextProtector :: w.activeProtectors
+  nextTag : w'.nextTag = w.nextTag + 1
+  nextProtector : w'.nextProtector = w.nextProtector + 1
+
+/-- Freshness is preserved by every retag of `RetagShape`. -/
+theorem RetagShape.freshWF {w w' : FnEntryBorrowWorld} {parentTag off len : Nat}
+    (hwf : BorrowTreeFreshWF w) (hsh : RetagShape w w' parentTag off len) :
+    BorrowTreeFreshWF w' := by
+  rcases hsh.parentExists with ⟨pNode, hp⟩
+  rcases mem_of_findNode?_eq_some hp with ⟨hpMem, hpTag⟩
+  rcases hsh.nodes with ⟨cp, nodes', _, hnodes, hrel⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · rw [hnodes, List.map_cons, ListRel.nodeMetaRel_map_tag_eq hrel]
+    refine List.nodup_cons.2 ⟨?_, hwf.tagsNodup⟩
+    intro hmem
+    rcases List.mem_map.1 hmem with ⟨n, hn, heq⟩
+    have heq' : n.tag = w.nextTag := heq
+    exact Nat.lt_irrefl w.nextTag (heq' ▸ hwf.tagsBelow n hn)
+  · intro n hn
+    rw [hnodes] at hn
+    rw [hsh.nextTag]
+    rcases List.mem_cons.1 hn with rfl | hn'
+    · exact Nat.lt_succ_self _
+    · rcases ListRel.exists_of_mem_right hrel hn' with ⟨m, hm, hmr⟩
+      rw [hmr.1]
+      exact Nat.lt_succ_of_lt (hwf.tagsBelow m hm)
+  · intro n hn p hpar
+    rw [hnodes] at hn
+    rw [hsh.nextTag]
+    rcases List.mem_cons.1 hn with rfl | hn'
+    · injection hpar with hpar
+      subst hpar
+      exact Nat.lt_succ_of_lt (hpTag ▸ hwf.tagsBelow pNode hpMem)
+    · rcases ListRel.exists_of_mem_right hrel hn' with ⟨m, hm, hmr⟩
+      rw [hmr.2.1] at hpar
+      exact Nat.lt_succ_of_lt (hwf.parentsBelow m hm p hpar)
+  · intro n hn q hq
+    rw [hnodes] at hn
+    rw [hsh.nextProtector]
+    rcases List.mem_cons.1 hn with rfl | hn'
+    · injection hq with hq
+      subst hq
+      exact Nat.lt_succ_self _
+    · rcases ListRel.exists_of_mem_right hrel hn' with ⟨m, hm, hmr⟩
+      rw [hmr.2.2.1] at hq
+      exact Nat.lt_succ_of_lt (hwf.protectorsBelow m hm q hq)
+  · intro q hq
+    rw [hsh.activeProtectors] at hq
+    rw [hsh.nextProtector]
+    rcases List.mem_cons.1 hq with rfl | hq'
+    · exact Nat.lt_succ_self _
+    · exact Nat.lt_succ_of_lt (hwf.activeBelow q hq')
+
+private theorem reachesRoot_cons_fresh_of_nodeMetaRel {w : FnEntryBorrowWorld}
+    (hwf : BorrowTreeFreshWF w) {child : TreeTagNode} (hct : child.tag = w.nextTag)
+    {nodes' : List TreeTagNode} (hrel : ListRel NodeMetaRel w.nodes nodes')
+    {rootTag d t : Nat} (h : ReachesRoot w.nodes rootTag d t) :
+    ReachesRoot (child :: nodes') rootTag d t := by
+  have hskip : ∀ {t' : Nat} {x : TreeTagNode}, findNode? w.nodes t' = some x →
+      ∃ y, findNode? (child :: nodes') t' = some y ∧ NodeMetaRel x y := by
+    intro t' x hx
+    rcases mem_of_findNode?_eq_some hx with ⟨hxMem, hxTag⟩
+    rcases ListRel.nodeMetaRel_findNode? hrel hx with ⟨y, hy, hr⟩
+    refine ⟨y, ?_, hr⟩
+    have hne : (child.tag == t') = false := by
+      apply beq_false_of_ne
+      rw [hct, ← hxTag]
+      exact Nat.ne_of_gt (hwf.tagsBelow x hxMem)
+    simp only [findNode?, List.find?, hne]
+    exact hy
+  induction h with
+  | root r hr hpar =>
+    rcases hskip hr with ⟨y, hy, hrel'⟩
+    exact ReachesRoot.root y hy (by rw [hrel'.2.1]; exact hpar)
+  | step d t p n hn hpar _ ih =>
+    rcases hskip hn with ⟨y, hy, hrel'⟩
+    exact ReachesRoot.step d t p y hy (by rw [hrel'.2.1]; exact hpar) ih
+
+/-- Rootedness is preserved by every retag of `RetagShape` (given freshness): the new child hangs off an
+existing node, and shape-preserved nodes keep their parent chains. -/
+theorem RetagShape.rootedWF {w w' : FnEntryBorrowWorld} {parentTag off len rootTag : Nat}
+    (hwf : BorrowTreeFreshWF w) (hroot : BorrowTreeRootedWF w rootTag)
+    (hsh : RetagShape w w' parentTag off len) :
+    BorrowTreeRootedWF w' rootTag := by
+  have hfresh' := RetagShape.freshWF hwf hsh
+  rcases hsh.parentExists with ⟨pNode, hp⟩
+  rcases mem_of_findNode?_eq_some hp with ⟨hpMem, hpTag⟩
+  rcases hsh.nodes with ⟨cp, nodes', _, hnodes, hrel⟩
+  have hlen : w'.nodes.length = w.nodes.length + 1 := by
+    rw [hnodes, List.length_cons, ListRel.length_eq hrel]
+  refine ⟨hfresh'.tagsNodup, ?_⟩
+  intro n hn
+  rw [hlen]
+  rw [hnodes] at hn ⊢
+  rcases List.mem_cons.1 hn with rfl | hn'
+  · rcases hroot.reachesRoot pNode hpMem with ⟨d, hd, hreach⟩
+    rw [hpTag] at hreach
+    refine ⟨d + 1, Nat.succ_lt_succ hd, ?_⟩
+    exact ReachesRoot.step d w.nextTag parentTag
+      ⟨w.nextTag, some parentTag, cp, off, len, some w.nextProtector, true⟩
+      (by simp [findNode?]) rfl
+      (reachesRoot_cons_fresh_of_nodeMetaRel hwf rfl hrel hreach)
+  · rcases ListRel.exists_of_mem_right hrel hn' with ⟨m, hm, hmr⟩
+    rcases hroot.reachesRoot m hm with ⟨d, hd, hreach⟩
+    refine ⟨d, Nat.lt_succ_of_lt hd, ?_⟩
+    rw [hmr.1]
+    exact reachesRoot_cons_fresh_of_nodeMetaRel hwf rfl hrel hreach
+
+/-- `NoProtectedReservedIM` is preserved by every retag of `RetagShape` (given freshness): the new
+child is never `.reservedIM`, no step creates `.reservedIM`, and the freshly activated protector id is
+not carried by any existing node. -/
+theorem RetagShape.noProtectedReservedIM {w w' : FnEntryBorrowWorld} {parentTag off len : Nat}
+    (hwf : BorrowTreeFreshWF w) (hno : NoProtectedReservedIM w)
+    (hsh : RetagShape w w' parentTag off len) :
+    NoProtectedReservedIM w' := by
+  rcases hsh.nodes with ⟨cp, nodes', hcp, hnodes, hrel⟩
+  intro n hn hperm
+  rw [hnodes] at hn
+  rcases List.mem_cons.1 hn with rfl | hn'
+  · exact absurd hperm hcp
+  · rcases ListRel.exists_of_mem_right hrel hn' with ⟨m, hm, hmr⟩
+    have hmPerm : m.perm = .reservedIM := hmr.2.2.2.2.2 hperm
+    have hmProt := hno m hm hmPerm
+    rw [hsh.activeProtectors]
+    unfold TreeTagNode.isProtected at hmProt ⊢
+    rw [hmr.2.2.1]
+    cases hq : m.protector with
+    | none => rfl
+    | some q =>
+      rw [hq] at hmProt
+      have hne : (w.nextProtector == q) = false :=
+        beq_false_of_ne (Nat.ne_of_gt (hwf.protectorsBelow m hm q hq))
+      simp only [List.any_cons, hne, Bool.false_or]
+      exact hmProt
+
+private theorem prunedStepRel_read_nodeMetaRel (w : FnEntryBorrowWorld) (parentTag : Nat)
+    (isWrite : Bool) (off len : Nat) (n n' : TreeTagNode)
+    (h : PrunedStepRel w parentTag isWrite off len
+      (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m) n n') :
+    NodeMetaRel n n' := by
+  rcases h with ⟨_, hs⟩ | ⟨_, _, hs⟩ | ⟨_, _, hs⟩
+  · exact stepNodeOnRangeRead_nodeMetaRel hs
+  · subst hs; exact NodeMetaRel.refl _
+  · exact stepNodeOnRangeRead_nodeMetaRel hs
+
+private theorem prunedStepRel_write_nodeMetaRel (w : FnEntryBorrowWorld) (parentTag : Nat)
+    (isWrite : Bool) (off len : Nat) (n n' : TreeTagNode)
+    (h : PrunedStepRel w parentTag isWrite off len
+      (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m) n n') :
+    NodeMetaRel n n' := by
+  rcases h with ⟨_, hs⟩ | ⟨_, _, hs⟩ | ⟨_, _, hs⟩
+  · exact stepNodeOnRangeWrite_nodeMetaRel hs
+  · subst hs; exact NodeMetaRel.refl _
+  · exact stepNodeOnRangeWrite_nodeMetaRel hs
+
+/-- Every successful non-skip Model 4 retag (ZST or not, `.rustcNoWritable` or `.writableChildWrite`)
+returns the fresh tag `w.nextTag` and has `RetagShape`. -/
+theorem execFnEntryMutRetagPrunedSourceOrder_ok_retagShape
+    (w w' : FnEntryBorrowWorld) (parentTag off len childTag : Nat)
+    (policy : FnEntryRetagPolicy) (requireInit : Bool) (hpol : policy ≠ .skipRetag)
+    (hok : execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit =
+      .ok (w', childTag)) :
+    childTag = w.nextTag ∧ RetagShape w w' parentTag off len := by
+  have hp : ∃ pNode, findNode? w.nodes parentTag = some pNode := by
+    cases hf : findNode? w.nodes parentTag with
+    | some pn => exact ⟨pn, rfl⟩
+    | none =>
+      unfold execFnEntryMutRetagPrunedSourceOrder at hok
+      cases policy <;> simp [hf] at hok
+      exact absurd rfl hpol
+  rcases hp with ⟨pNode, hpf⟩
+  by_cases hlen : len = 0
+  · subst hlen
+    unfold execFnEntryMutRetagPrunedSourceOrder at hok
+    cases policy with
+    | skipRetag => exact absurd rfl hpol
+    | rustcNoWritable =>
+      simp only [hpf, beq_self_eq_true, ↓reduceIte] at hok
+      injection hok with hpair
+      rcases Prod.mk.inj hpair with ⟨hw, hct⟩
+      subst hw; subst hct
+      exact ⟨rfl, ⟨⟨pNode, hpf⟩, ⟨.reservedFrz false, w.nodes, (by decide), rfl,
+        listRel_nodeMetaRel_refl _⟩, rfl, rfl, rfl⟩⟩
+    | writableChildWrite =>
+      simp only [hpf, beq_self_eq_true, ↓reduceIte] at hok
+      injection hok with hpair
+      rcases Prod.mk.inj hpair with ⟨hw, hct⟩
+      subst hw; subst hct
+      exact ⟨rfl, ⟨⟨pNode, hpf⟩, ⟨.reservedFrz false, w.nodes, (by decide), rfl,
+        listRel_nodeMetaRel_refl _⟩, rfl, rfl, rfl⟩⟩
+  · cases policy with
+    | skipRetag => exact absurd rfl hpol
+    | rustcNoWritable =>
+      rcases execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_inv w w' parentTag off len
+        childTag requireInit hlen hok with ⟨hc, hact, hnt, hnp, _, _, nodes', hnodes, hrel⟩
+      exact ⟨hc, ⟨⟨pNode, hpf⟩, ⟨.reservedFrz false, nodes', (by decide), hnodes,
+        ListRel.imp (prunedStepRel_read_nodeMetaRel w parentTag false off len) hrel⟩,
+        hact, hnt, hnp⟩⟩
+    | writableChildWrite =>
+      rcases execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_inv w w' parentTag off len
+        childTag requireInit hlen hok with ⟨_, _, hc, hact, hnt, hnp, nodes', hnodes, hrel⟩
+      exact ⟨hc, ⟨⟨pNode, hpf⟩, ⟨.unique, nodes', (by decide), hnodes,
+        ListRel.imp (prunedStepRel_write_nodeMetaRel w parentTag true off len) hrel⟩,
+        hact, hnt, hnp⟩⟩
+
+/-- Inductive borrow-tree invariant for sequences of `FnEntry` retags: freshness, rootedness at
+`rootTag`, and the upstream reachability invariant `NoProtectedReservedIM`. It is established by
+`FnEntryBorrowInv.singleRoot` and preserved by every successful Model 4 / Model 5 retag. -/
+structure FnEntryBorrowInv (w : FnEntryBorrowWorld) (rootTag : Nat) : Prop where
+  fresh : BorrowTreeFreshWF w
+  rooted : BorrowTreeRootedWF w rootTag
+  noProtectedReservedIM : NoProtectedReservedIM w
+
+/-- A freshly created allocation — one unprotected root node whose permission is not `.reservedIM` and
+whose tag is below `nextTag` — satisfies the invariant for ANY fresh protector counter. -/
+theorem FnEntryBorrowInv.singleRoot (r nextTag nextProtector off len : Nat) (perm : TreeBorrowPerm)
+    (acc : Bool) (hlt : r < nextTag) (hperm : perm ≠ .reservedIM) :
+    FnEntryBorrowInv
+      { nodes := [⟨r, none, perm, off, len, none, acc⟩], activeProtectors := []
+        nextTag := nextTag, nextProtector := nextProtector } r := by
+  refine ⟨⟨by simp, ?_, ?_, ?_, ?_⟩, ⟨by simp, ?_⟩, ?_⟩
+  · intro n hn
+    simp only [List.mem_singleton] at hn
+    subst hn; exact hlt
+  · intro n hn p hpar
+    simp only [List.mem_singleton] at hn
+    subst hn; cases hpar
+  · intro n hn q hq
+    simp only [List.mem_singleton] at hn
+    subst hn; cases hq
+  · intro q hq; cases hq
+  · intro n hn
+    simp only [List.mem_singleton] at hn
+    subst hn
+    exact ⟨0, Nat.zero_lt_one,
+      ReachesRoot.root ⟨r, none, perm, off, len, none, acc⟩ (by simp [findNode?]) rfl⟩
+  · intro n hn hp
+    simp only [List.mem_singleton] at hn
+    subst hn
+    exact absurd hp hperm
+
+/-- The invariant is preserved by every retag of `RetagShape`. -/
+theorem RetagShape.inv {w w' : FnEntryBorrowWorld} {parentTag off len rootTag : Nat}
+    (hinv : FnEntryBorrowInv w rootTag) (hsh : RetagShape w w' parentTag off len) :
+    FnEntryBorrowInv w' rootTag :=
+  ⟨RetagShape.freshWF hinv.fresh hsh, RetagShape.rootedWF hinv.fresh hinv.rooted hsh,
+    RetagShape.noProtectedReservedIM hinv.fresh hinv.noProtectedReservedIM hsh⟩
+
+/-- **Invariant preservation for Model 4**: every successful `execFnEntryMutRetagPrunedSourceOrder`
+(any policy, any range, including `.skipRetag` and zero-sized retags) maps an invariant world to an
+invariant world, so the one-step theorems stated under `BorrowTreeTagsWF` / `BorrowTreeRootedWF` /
+`NoProtectedReservedIM` apply again to the result. -/
+theorem execFnEntryMutRetagPrunedSourceOrder_preserves_inv
+    (w w' : FnEntryBorrowWorld) (rootTag parentTag off len childTag : Nat)
+    (policy : FnEntryRetagPolicy) (requireInit : Bool)
+    (hinv : FnEntryBorrowInv w rootTag)
+    (hok : execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit =
+      .ok (w', childTag)) :
+    FnEntryBorrowInv w' rootTag := by
+  by_cases hpol : policy = .skipRetag
+  · subst hpol
+    unfold execFnEntryMutRetagPrunedSourceOrder at hok
+    injection hok with hpair
+    rcases Prod.mk.inj hpair with ⟨hw, _⟩
+    subst hw
+    exact hinv
+  · exact RetagShape.inv hinv
+      (execFnEntryMutRetagPrunedSourceOrder_ok_retagShape w w' parentTag off len childTag policy
+        requireInit hpol hok).2
+
+/-- **Invariant preservation for the standalone Model 5**: on an invariant world the upstream-order
+model `execFnEntryMutRetagTraversalOrderDirect` succeeds exactly when Model 4 does, with the same
+world, so it preserves the invariant too. -/
+theorem execFnEntryMutRetagTraversalOrderDirect_preserves_inv
+    (w w' : FnEntryBorrowWorld) (rootTag parentTag off len childTag : Nat)
+    (policy : FnEntryRetagPolicy) (requireInit : Bool)
+    (hinv : FnEntryBorrowInv w rootTag)
+    (hok : execFnEntryMutRetagTraversalOrderDirect w parentTag off len policy requireInit =
+      .ok (w', childTag)) :
+    execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit = .ok (w', childTag) ∧
+    FnEntryBorrowInv w' rootTag := by
+  rw [execFnEntryMutRetagTraversalOrderDirect_eq_traversalOrder_of_rootedWF hinv.rooted] at hok
+  have h4 := (execFnEntryMutRetagTraversalOrder_ok_iff_prunedSourceOrder_ok _ w parentTag off len policy
+    requireInit (w', childTag)).1 hok
+  exact ⟨h4, execFnEntryMutRetagPrunedSourceOrder_preserves_inv w w' rootTag parentTag off len childTag
+    policy requireInit hinv h4⟩
+
+/-- A world in which some node already carries the next tag is not `BorrowTreeTagsWF`. -/
+theorem not_borrowTreeTagsWF_of_nextTag_used (w : FnEntryBorrowWorld)
+    (h : w.nodes.any (fun n => n.tag == w.nextTag) = true) : ¬ BorrowTreeTagsWF w := by
+  intro hwf
+  rcases List.any_eq_true.1 h with ⟨n, hn, heq⟩
+  exact hwf.nextTagFresh n hn (beq_iff_eq.1 heq)
+
+/-- `BorrowTreeTagsWF` is NOT inductive: a world with tags `[0, 5]` and `nextTag = 4` satisfies it (the
+single next tag `4` is unused), yet one successful retag advances `nextTag` to the already-used tag `5`
+(so the result is no longer `BorrowTreeTagsWF`), and a second successful retag mints a DUPLICATE tag
+`5`. `BorrowTreeFreshWF` rules this world out and is preserved by every retag. -/
+theorem borrowTreeTagsWF_not_inductive :
+    let w0 : FnEntryBorrowWorld := {
+      nodes := [⟨0, none, .unique, 0, 4, none, true⟩, ⟨5, some 0, .unique, 0, 4, none, true⟩]
+      activeProtectors := []
+      nextTag := 4
+      nextProtector := 10
+    }
+    BorrowTreeTagsWF w0 ∧
+    (match execFnEntryMutRetagPrunedSourceOrder w0 0 0 4 .rustcNoWritable with
+     | .ok (w1, _) =>
+       w1.nodes.any (fun n => n.tag == w1.nextTag) = true ∧
+       (match execFnEntryMutRetagPrunedSourceOrder w1 0 0 4 .rustcNoWritable with
+        | .ok (w2, _) => w2.nodes.map (·.tag) = [5, 4, 0, 5]
+        | .error _ => False)
+     | .error _ => False) := by
+  refine ⟨⟨by decide, ?_, ?_, ?_⟩, ?_⟩
+  · intro n hn
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hn
+    rcases hn with rfl | rfl <;> decide
+  · intro n hn
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hn
+    rcases hn with rfl | rfl <;> decide
+  · intro n hn
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hn
+    rcases hn with rfl | rfl <;> decide
+  · exact ⟨rfl, rfl⟩
+
 /-! ### 2B. Static-Access Temporary Retag (`charon#1620`) & Syntactic `is_freeze` Static Mutability -/
 
 /-- Type descriptor for static allocation mutability (`intern.rs:222-229`) and `FreezeVisitor` layout decomposition. -/
@@ -7855,18 +8322,38 @@ def StaticTyDesc.totalByteSize : StaticTyDesc → Nat
   | .padding sz => sz
   | .composite total _ => total
 
+/-- Insert an `UnsafeCell` interval `(offset, len)` into an offset-sorted interval list (stable: before
+the first interval whose offset is not smaller). -/
+def insertCellByOffset (c : Nat × Nat) : List (Nat × Nat) → List (Nat × Nat)
+  | [] => [c]
+  | d :: rest => if c.1 ≤ d.1 then c :: d :: rest else d :: insertCellByOffset c rest
+
+/-- Sort `UnsafeCell` intervals into MEMORY order (increasing offset), mirroring upstream
+`FreezeVisitor.visitValue`, which walks `FieldsShape::Arbitrary` fields in `memoryOrder`
+(`FreezeVisitor.lean:104-107`) rather than in declaration order. -/
+def sortCellsByOffset : List (Nat × Nat) → List (Nat × Nat)
+  | [] => []
+  | c :: rest => insertCellByOffset c (sortCellsByOffset rest)
+
+/-- Cursor walk of `FreezeVisitor.unsafeCellAction` over memory-ordered intervals: a `.freeze` gap before
+each interval, then the interval itself. The cursor never moves backwards (`max`), so even overlapping
+intervals (which upstream rejects as `invalidProgram`) cannot produce a `.freeze` segment over
+interior-mutable bytes. -/
 private def buildFreezeSegmentsAux (cursor totalSize : Nat) : List (Nat × Nat) → List StaticFreezeSegment
   | [] =>
     if cursor < totalSize then [⟨cursor, totalSize - cursor, .freeze⟩] else []
   | (cellOff, cellLen) :: rest =>
     let lead := if cursor < cellOff then [⟨cursor, cellOff - cursor, .freeze⟩] else []
     let cell := [⟨cellOff, cellLen, .unsafeCell⟩]
-    lead ++ cell ++ buildFreezeSegmentsAux (cellOff + cellLen) totalSize rest
+    lead ++ cell ++ buildFreezeSegmentsAux (max cursor (cellOff + cellLen)) totalSize rest
 
-/-- Decompose `desc` into `(totalSize, segments)` matching `Miri.TreeBorrows.FreezeVisitor`. -/
+/-- Decompose `desc` into `(totalSize, segments)` matching `Miri.TreeBorrows.FreezeVisitor`: the non-zero
+`UnsafeCell` intervals are visited in MEMORY order (`sortCellsByOffset`), independent of the order in
+which `composite` fields are listed, so `.freeze` segments are exactly the gaps between interior-mutable
+intervals (`staticFreezeSegments_freeze_byte_iff`). -/
 def staticFreezeSegments (desc : StaticTyDesc) : Nat × List StaticFreezeSegment :=
   let total := desc.totalByteSize
-  (total, buildFreezeSegmentsAux 0 total (collectNonZeroUnsafeCells 0 desc))
+  (total, buildFreezeSegmentsAux 0 total (sortCellsByOffset (collectNonZeroUnsafeCells 0 desc)))
 
 /-- Per-segment Tree Borrows permission map on a static allocation. -/
 structure StaticBorrowState where
@@ -7956,7 +8443,7 @@ theorem static_pureFreeze_preserved_ub_vs_erased_unsound
     rangesOverlap_one_true (Nat.zero_le _) (by omega)
   constructor
   · simp [evalRawMutStaticWriteTB, retagStaticPreservedAt, staticFreezeSegments,
-      StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells, buildFreezeSegmentsAux, hsz, hle, hov]
+      StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells, sortCellsByOffset, buildFreezeSegmentsAux, hsz, hle, hov]
   · simp [evalRawMutStaticWriteTB, retagStaticErasedAt, StaticTyDesc.totalByteSize, hnz, hle]
 
 theorem static_pureFreeze_erased_write_caught_by_readOnly_alloc
@@ -7979,7 +8466,7 @@ theorem static_pureUnsafeCell_preserved_write_ok
   refine ⟨rfl, ?_⟩
   simp [evalRawMutStaticWriteMiri, evalRawMutStaticWriteTB, retagStaticPreservedAt,
     staticFreezeSegments, StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells,
-    buildFreezeSegmentsAux, staticAllocMutability, StaticTyDesc.isSyntacticFreeze, hnz, hle]
+    sortCellsByOffset, insertCellByOffset, buildFreezeSegmentsAux, staticAllocMutability, StaticTyDesc.isSyntacticFreeze, hnz, hle]
 
 /-- Universal mixed-composite static `(Freeze[frzLen], UnsafeCell[cellLen], Padding[tailLen])`:
 `staticAllocMutability = .mut`, so Miri allows writing to the allocation; preserved `#1620` retag
@@ -8007,7 +8494,8 @@ theorem static_mixed_miri_separation
   · simp only [evalRawMutStaticWriteMiri, evalRawMutStaticWriteTB, retagStaticPreservedAt,
       staticFreezeSegments, StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells,
       collectFieldsNonZeroUnsafeCells, Nat.zero_add, hcellNz, Bool.false_eq_true, ↓reduceIte,
-      List.nil_append, List.append_nil, buildFreezeSegmentsAux, hfrz, hmut, hle]
+      List.nil_append, List.append_nil, sortCellsByOffset, insertCellByOffset, buildFreezeSegmentsAux,
+      Nat.zero_max, hfrz, hmut, hle]
     rcases hwrite with hlead | ⟨htailLo, htailHi⟩
     · have hovLead : rangesOverlap writeOff 1 0 frzLen = true :=
         rangesOverlap_one_true (Nat.zero_le _) (by omega)
@@ -8043,14 +8531,16 @@ theorem static_mixed_miri_unsafeCell_write_ok
     simp only [Nat.add_zero] at hmut hle
     simp [evalRawMutStaticWriteMiri, evalRawMutStaticWriteTB, retagStaticPreservedAt,
       staticFreezeSegments, StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells,
-      collectFieldsNonZeroUnsafeCells, hcellNz, buildFreezeSegmentsAux, hfrz, hmut, hle, hnoLead]
+      collectFieldsNonZeroUnsafeCells, hcellNz, sortCellsByOffset, insertCellByOffset,
+      buildFreezeSegmentsAux, hfrz, hmut, hle, hnoLead]
   · have htailLt : frzLen + cellLen < frzLen + cellLen + tailLen := by omega
     have hsub : frzLen + cellLen + tailLen - (frzLen + cellLen) = tailLen := by omega
     have hnoTail : rangesOverlap writeOff 1 (frzLen + cellLen) tailLen = false :=
       rangesOverlap_one_false_of_lt (by omega)
     simp [evalRawMutStaticWriteMiri, evalRawMutStaticWriteTB, retagStaticPreservedAt,
       staticFreezeSegments, StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells,
-      collectFieldsNonZeroUnsafeCells, hcellNz, buildFreezeSegmentsAux, hfrz, hmut, hle,
+      collectFieldsNonZeroUnsafeCells, hcellNz, sortCellsByOffset, insertCellByOffset,
+      buildFreezeSegmentsAux, hfrz, hmut, hle,
       htailLt, hsub, hnoLead, hnoTail]
 
 /-- Zero-sized `UnsafeCell<()>` composite static `(Freeze[frzLen], UnsafeCell<()>)`:
@@ -8078,13 +8568,312 @@ theorem static_zstUnsafeCell_composite_miri_separation
   have hsegs : (staticFreezeSegments (.composite frzLen [(0, .freezeScalar frzLen), (frzLen, .unsafeCell 0)])).2 =
       [⟨0, frzLen, .freeze⟩] := by
     simp [staticFreezeSegments, StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells,
-      collectFieldsNonZeroUnsafeCells, buildFreezeSegmentsAux, hfrz]
+      collectFieldsNonZeroUnsafeCells, sortCellsByOffset, buildFreezeSegmentsAux, hfrz]
   refine ⟨hsegs, hsyn, hmut, ?_, ?_⟩
   · simp [evalRawMutStaticWriteMiri, evalRawMutStaticWriteTB, retagStaticPreservedAt,
       staticFreezeSegments, StaticTyDesc.totalByteSize, collectNonZeroUnsafeCells,
-      collectFieldsNonZeroUnsafeCells, buildFreezeSegmentsAux, hfrz, hmut, hle, hov]
+      collectFieldsNonZeroUnsafeCells, sortCellsByOffset, buildFreezeSegmentsAux, hfrz, hmut, hle, hov]
   · simp [evalRawMutStaticWriteMiri, evalRawMutStaticWriteTB, retagStaticErasedAt,
       StaticTyDesc.totalByteSize, hfrzNz, hmut, hle]
+
+/-! #### Memory-Order `FreezeVisitor` Segments and General Byte-Level Correctness of the Preserved Retag -/
+
+/-- Byte `b` lies inside some non-zero-sized `UnsafeCell` of `desc` (declaration-order independent). -/
+def byteInNonZeroUnsafeCell (desc : StaticTyDesc) (b : Nat) : Bool :=
+  (collectNonZeroUnsafeCells 0 desc).any fun c => decide (c.1 ≤ b) && decide (b < c.1 + c.2)
+
+theorem mem_insertCellByOffset (c x : Nat × Nat) (xs : List (Nat × Nat)) :
+    x ∈ insertCellByOffset c xs ↔ x = c ∨ x ∈ xs := by
+  induction xs with
+  | nil => simp [insertCellByOffset]
+  | cons d rest ih =>
+    simp only [insertCellByOffset]
+    split
+    · simp
+    · simp only [List.mem_cons, ih]
+      constructor
+      · rintro (h | h | h)
+        · exact Or.inr (Or.inl h)
+        · exact Or.inl h
+        · exact Or.inr (Or.inr h)
+      · rintro (h | h | h)
+        · exact Or.inr (Or.inl h)
+        · exact Or.inl h
+        · exact Or.inr (Or.inr h)
+
+/-- Sorting into memory order neither drops nor invents `UnsafeCell` intervals. -/
+theorem mem_sortCellsByOffset (x : Nat × Nat) (xs : List (Nat × Nat)) :
+    x ∈ sortCellsByOffset xs ↔ x ∈ xs := by
+  induction xs with
+  | nil => simp [sortCellsByOffset]
+  | cons c rest ih =>
+    simp only [sortCellsByOffset, mem_insertCellByOffset, ih, List.mem_cons]
+
+/-- Memory order: every interval's offset is at most the offset of every later interval. -/
+def CellsOffsetSorted : List (Nat × Nat) → Prop
+  | [] => True
+  | c :: rest => (∀ d ∈ rest, c.1 ≤ d.1) ∧ CellsOffsetSorted rest
+
+theorem insertCellByOffset_sorted (c : Nat × Nat) (xs : List (Nat × Nat))
+    (h : CellsOffsetSorted xs) : CellsOffsetSorted (insertCellByOffset c xs) := by
+  induction xs with
+  | nil =>
+    show CellsOffsetSorted [c]
+    exact ⟨fun d hd => absurd hd (List.not_mem_nil), trivial⟩
+  | cons d rest ih =>
+    simp only [insertCellByOffset]
+    split
+    · rename_i hle
+      refine ⟨?_, h⟩
+      intro e he
+      cases he with
+      | head => exact hle
+      | tail _ he' => exact Nat.le_trans hle (h.1 e he')
+    · rename_i hnle
+      refine ⟨?_, ih h.2⟩
+      intro e he
+      rcases (mem_insertCellByOffset c e rest).1 he with rfl | he'
+      · exact Nat.le_of_lt (Nat.lt_of_not_le hnle)
+      · exact h.1 e he'
+
+theorem sortCellsByOffset_sorted (xs : List (Nat × Nat)) :
+    CellsOffsetSorted (sortCellsByOffset xs) := by
+  induction xs with
+  | nil => trivial
+  | cons c rest ih => exact insertCellByOffset_sorted c _ ih
+
+/-- `.freeze` segments emitted for memory-ordered intervals are EXACTLY the in-bounds bytes at or
+after the cursor that lie in no interval — for arbitrary (even overlapping) intervals. -/
+private theorem buildFreezeSegmentsAux_freeze_iff (total : Nat) :
+    ∀ (cells : List (Nat × Nat)) (cursor : Nat), CellsOffsetSorted cells →
+      ∀ b, b < total →
+        ((∃ s ∈ buildFreezeSegmentsAux cursor total cells,
+            s.kind = .freeze ∧ s.offset ≤ b ∧ b < s.offset + s.len) ↔
+          (cursor ≤ b ∧ ∀ c ∈ cells, ¬ (c.1 ≤ b ∧ b < c.1 + c.2))) := by
+  intro cells
+  induction cells with
+  | nil =>
+    intro cursor _ b hb
+    simp only [buildFreezeSegmentsAux]
+    constructor
+    · rintro ⟨s, hs, _, hlo, _⟩
+      split at hs
+      · simp only [List.mem_singleton] at hs
+        subst hs
+        exact ⟨hlo, fun _ hc => by cases hc⟩
+      · cases hs
+    · rintro ⟨hlo, _⟩
+      have hlt : cursor < total := Nat.lt_of_le_of_lt hlo hb
+      refine ⟨⟨cursor, total - cursor, .freeze⟩, by simp [hlt], rfl, hlo, ?_⟩
+      show b < cursor + (total - cursor)
+      omega
+  | cons c rest ih =>
+    intro cursor hsorted b hb
+    rcases c with ⟨o, l⟩
+    simp only [buildFreezeSegmentsAux, List.mem_append, List.mem_singleton]
+    constructor
+    · rintro ⟨s, (hs | hs) | hs, hkind, hlo, hhi⟩
+      · split at hs
+        · rename_i hco
+          simp only [List.mem_singleton] at hs
+          subst hs
+          simp only at hlo hhi
+          refine ⟨hlo, ?_⟩
+          intro d hd
+          cases hd with
+          | head => exact fun ⟨hx, _⟩ => Nat.lt_irrefl b (Nat.lt_of_lt_of_le (by omega) hx)
+          | tail _ hd' =>
+            have hsd : o ≤ d.1 := hsorted.1 d hd'
+            exact fun ⟨hx, _⟩ => Nat.lt_irrefl b (Nat.lt_of_lt_of_le (by omega) hx)
+        · cases hs
+      · subst hs
+        cases hkind
+      · rcases (ih (max cursor (o + l)) hsorted.2 b hb).1 ⟨s, hs, hkind, hlo, hhi⟩ with ⟨hcur, hrest⟩
+        have h1 : cursor ≤ b := Nat.le_trans (Nat.le_max_left _ _) hcur
+        have h2 : o + l ≤ b := Nat.le_trans (Nat.le_max_right _ _) hcur
+        refine ⟨h1, ?_⟩
+        intro d hd
+        cases hd with
+        | head => exact fun ⟨_, hy⟩ => Nat.lt_irrefl b (Nat.lt_of_lt_of_le hy h2)
+        | tail _ hd' => exact hrest d hd'
+    · rintro ⟨hcur, hall⟩
+      have hhead := hall (o, l) (List.mem_cons_self ..)
+      simp only at hhead
+      by_cases hbo : b < o
+      · have hco : cursor < o := Nat.lt_of_le_of_lt hcur hbo
+        refine ⟨⟨cursor, o - cursor, .freeze⟩, Or.inl (Or.inl (by simp [hco])), rfl, hcur, ?_⟩
+        show b < cursor + (o - cursor)
+        omega
+      · have hol : o + l ≤ b :=
+          Nat.le_of_not_lt (fun hlt => hhead ⟨Nat.le_of_not_lt hbo, hlt⟩)
+        have hmax : max cursor (o + l) ≤ b := by
+          rw [Nat.max_def]; split <;> assumption
+        rcases (ih (max cursor (o + l)) hsorted.2 b hb).2
+          ⟨hmax, fun d hd => hall d (List.mem_cons_of_mem _ hd)⟩ with ⟨s, hs, hk, hlo, hhi⟩
+        exact ⟨s, Or.inr hs, hk, hlo, hhi⟩
+
+/-- Byte-level meaning of the `FreezeVisitor` decomposition, for EVERY descriptor (any field order, any
+nesting): an in-bounds byte lies in a `.freeze` segment iff it lies in no non-zero-sized `UnsafeCell`. -/
+theorem staticFreezeSegments_freeze_byte_iff (desc : StaticTyDesc) (b : Nat)
+    (hb : b < desc.totalByteSize) :
+    (∃ s ∈ (staticFreezeSegments desc).2, s.kind = .freeze ∧ s.offset ≤ b ∧ b < s.offset + s.len) ↔
+      byteInNonZeroUnsafeCell desc b = false := by
+  have hcore := buildFreezeSegmentsAux_freeze_iff desc.totalByteSize
+    (sortCellsByOffset (collectNonZeroUnsafeCells 0 desc)) 0
+    (sortCellsByOffset_sorted _) b hb
+  have hany : byteInNonZeroUnsafeCell desc b = false ↔
+      ∀ c ∈ sortCellsByOffset (collectNonZeroUnsafeCells 0 desc), ¬ (c.1 ≤ b ∧ b < c.1 + c.2) := by
+    unfold byteInNonZeroUnsafeCell
+    rw [List.any_eq_false]
+    constructor
+    · intro h c hc hcb
+      have := h c ((mem_sortCellsByOffset c _).1 hc)
+      simp [hcb.1, hcb.2] at this
+    · intro h c hc
+      have := h c ((mem_sortCellsByOffset c _).2 hc)
+      simp only [Bool.and_eq_true, decide_eq_true_eq]
+      exact this
+  show (∃ s ∈ buildFreezeSegmentsAux 0 desc.totalByteSize
+      (sortCellsByOffset (collectNonZeroUnsafeCells 0 desc)),
+      s.kind = .freeze ∧ s.offset ≤ b ∧ b < s.offset + s.len) ↔ _
+  rw [hcore, hany]
+  exact ⟨fun h => h.2, fun h => ⟨Nat.zero_le _, h⟩⟩
+
+private theorem rangesOverlap_iff_exists_byte (off len so sl : Nat) :
+    rangesOverlap off len so sl = true ↔ ∃ b, off ≤ b ∧ b < off + len ∧ so ≤ b ∧ b < so + sl := by
+  unfold rangesOverlap
+  simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, decide_eq_true_eq]
+  constructor
+  · rintro ⟨⟨⟨hl, hs⟩, h1⟩, h2⟩
+    refine ⟨max off so, Nat.le_max_left _ _, ?_, Nat.le_max_right _ _, ?_⟩
+    · rw [Nat.max_def]; split <;> omega
+    · rw [Nat.max_def]; split <;> omega
+  · rintro ⟨b, h1, h2, h3, h4⟩
+    exact ⟨⟨⟨by omega, by omega⟩, by omega⟩, by omega⟩
+
+/-- Tree Borrows write check on a non-empty in-bounds range: UB exactly when some overlapping segment is
+`.frozen` or `.disabled`, and `.ok` otherwise. -/
+private theorem evalRawMutStaticWriteTB_ub_iff (st : StaticBorrowState) (off len : Nat)
+    (hin : off + len ≤ st.totalSize) (hlen : len ≠ 0) :
+    (evalRawMutStaticWriteTB st off len = .ub ↔
+      ∃ p ∈ st.segments, rangesOverlap off len p.1.offset p.1.len = true ∧
+        (p.2 = .frozen ∨ p.2 = .disabled)) ∧
+    (evalRawMutStaticWriteTB st off len = .ub ∨ evalRawMutStaticWriteTB st off len = .ok) := by
+  have hnot : ¬ (off + len > st.totalSize) := Nat.not_lt.2 hin
+  have hlenB : (len == 0) = false := beq_false_of_ne hlen
+  unfold evalRawMutStaticWriteTB
+  simp only [hnot, ↓reduceIte, hlenB, Bool.false_eq_true]
+  generalize hb : List.any st.segments _ = bl
+  cases bl with
+  | true =>
+    show (StaticWriteOutcome.ub = .ub ↔ _) ∧ (StaticWriteOutcome.ub = .ub ∨ StaticWriteOutcome.ub = .ok)
+    refine ⟨⟨fun _ => ?_, fun _ => rfl⟩, Or.inl rfl⟩
+    rw [List.any_eq_true] at hb
+    rcases hb with ⟨⟨seg, perm⟩, hmem, hcond⟩
+    simp only [Bool.and_eq_true] at hcond
+    refine ⟨(seg, perm), hmem, hcond.1, ?_⟩
+    cases perm <;> first | exact Or.inl rfl | exact Or.inr rfl | cases hcond.2
+  | false =>
+    show (StaticWriteOutcome.ok = .ub ↔ _) ∧ (StaticWriteOutcome.ok = .ub ∨ StaticWriteOutcome.ok = .ok)
+    refine ⟨⟨(fun h => by cases h), fun hE => ?_⟩, Or.inr rfl⟩
+    rw [List.any_eq_false] at hb
+    rcases hE with ⟨⟨seg, perm⟩, hmem, hov, hperm⟩
+    have hthis := hb (seg, perm) hmem
+    simp only at hov hperm hthis
+    rcases hperm with h | h <;> (subst h; simp [hov] at hthis)
+
+/-- General correctness of the preserved `charon#1620` static-temporary retag on EVERY interior-mutable
+static (any field order, any nesting, any write range): an in-bounds write through
+`(&raw const *&STATIC).cast_mut()` is accepted iff EVERY written byte lies inside a non-zero-sized
+`UnsafeCell`, and is Tree Borrows UB otherwise (never `.readOnlyAlloc` / `.outOfBounds`). -/
+theorem static_preserved_write_ok_iff_all_bytes_in_unsafeCell
+    (desc : StaticTyDesc) (rootTag tmpTag off len : Nat)
+    (hin : off + len ≤ desc.totalByteSize) (hmut : staticAllocMutability desc = .mut) :
+    (evalRawMutStaticWriteMiri desc (retagStaticPreservedAt desc rootTag tmpTag) off len = .ok ↔
+      ∀ b, off ≤ b → b < off + len → byteInNonZeroUnsafeCell desc b = true) ∧
+    (evalRawMutStaticWriteMiri desc (retagStaticPreservedAt desc rootTag tmpTag) off len = .ok ∨
+      evalRawMutStaticWriteMiri desc (retagStaticPreservedAt desc rootTag tmpTag) off len = .ub) := by
+  have hnot : ¬ (off + len > desc.totalByteSize) := Nat.not_lt.2 hin
+  have hmutB : (staticAllocMutability desc == AllocMutability.not) = false := by rw [hmut]; rfl
+  have htot : (retagStaticPreservedAt desc rootTag tmpTag).totalSize = desc.totalByteSize := rfl
+  have hsegs : (retagStaticPreservedAt desc rootTag tmpTag).segments =
+      (staticFreezeSegments desc).2.map fun s =>
+        (s, match s.kind with | .freeze => TreeBorrowPerm.frozen | .unsafeCell => TreeBorrowPerm.cell) := rfl
+  have hMiri : evalRawMutStaticWriteMiri desc (retagStaticPreservedAt desc rootTag tmpTag) off len =
+      evalRawMutStaticWriteTB (retagStaticPreservedAt desc rootTag tmpTag) off len := by
+    unfold evalRawMutStaticWriteMiri
+    rw [htot]
+    simp only [hnot, ↓reduceIte, hmutB, Bool.false_eq_true]
+  rw [hMiri]
+  -- "some frozen / disabled segment overlaps" is "some written byte lies outside every UnsafeCell"
+  have hblockedByte : (∃ p ∈ (retagStaticPreservedAt desc rootTag tmpTag).segments,
+        rangesOverlap off len p.1.offset p.1.len = true ∧ (p.2 = .frozen ∨ p.2 = .disabled)) ↔
+      ∃ b, off ≤ b ∧ b < off + len ∧ byteInNonZeroUnsafeCell desc b = false := by
+    rw [hsegs]
+    constructor
+    · rintro ⟨p, hp, hov, hperm⟩
+      rw [List.mem_map] at hp
+      rcases hp with ⟨s, hs, rfl⟩
+      simp only at hov hperm
+      cases hk : s.kind with
+      | unsafeCell => rw [hk] at hperm; rcases hperm with h | h <;> cases h
+      | freeze =>
+        rcases (rangesOverlap_iff_exists_byte off len s.offset s.len).1 hov with ⟨b, h1, h2, h3, h4⟩
+        exact ⟨b, h1, h2,
+          (staticFreezeSegments_freeze_byte_iff desc b (by omega)).1 ⟨s, hs, hk, h3, h4⟩⟩
+    · rintro ⟨b, h1, h2, hb⟩
+      rcases (staticFreezeSegments_freeze_byte_iff desc b (by omega)).2 hb with ⟨s, hs, hk, h3, h4⟩
+      refine ⟨(s, match s.kind with | .freeze => TreeBorrowPerm.frozen | .unsafeCell => TreeBorrowPerm.cell),
+        List.mem_map.2 ⟨s, hs, rfl⟩,
+        (rangesOverlap_iff_exists_byte off len s.offset s.len).2 ⟨b, h1, h2, h3, h4⟩, ?_⟩
+      refine Or.inl ?_
+      simp only [hk]
+  by_cases hlen : len = 0
+  · subst hlen
+    have hv : evalRawMutStaticWriteTB (retagStaticPreservedAt desc rootTag tmpTag) off 0 = .ok := by
+      unfold evalRawMutStaticWriteTB
+      rw [htot]
+      simp only [hnot, ↓reduceIte, beq_self_eq_true]
+    rw [hv]
+    exact ⟨⟨fun _ b h1 h2 => absurd h2 (by omega), fun _ => rfl⟩, Or.inl rfl⟩
+  · rcases evalRawMutStaticWriteTB_ub_iff (retagStaticPreservedAt desc rootTag tmpTag) off len
+      (by rw [htot]; exact hin) hlen with ⟨hiff, hub | hok⟩
+    · rcases hblockedByte.1 (hiff.1 hub) with ⟨b, h1, h2, hb⟩
+      rw [hub]
+      refine ⟨⟨(fun h => by cases h), fun h => ?_⟩, Or.inr rfl⟩
+      rw [h b h1 h2] at hb
+      cases hb
+    · rw [hok]
+      refine ⟨⟨fun _ b h1 h2 => ?_, fun _ => rfl⟩, Or.inl rfl⟩
+      cases hb : byteInNonZeroUnsafeCell desc b with
+      | true => rfl
+      | false =>
+        have hub := hiff.2 (hblockedByte.2 ⟨b, h1, h2, hb⟩)
+        rw [hok] at hub
+        cases hub
+
+/-- Field-order independence (`FreezeVisitor` walks `memoryOrder`): an all-`UnsafeCell` static whose two
+cells are listed in DECLARATION order `[(4, cell), (0, cell)]` decomposes into the same two `.unsafeCell`
+segments as the memory-ordered listing — no `.freeze` segment — so every in-bounds write is accepted. An
+unsorted cursor walk would instead emit contradictory `.freeze` segments over interior-mutable bytes and
+report spurious UB. -/
+theorem static_fieldOrder_independent_segments :
+    let declOrder : StaticTyDesc := .composite 8 [(4, .unsafeCell 4), (0, .unsafeCell 4)]
+    let memOrder : StaticTyDesc := .composite 8 [(0, .unsafeCell 4), (4, .unsafeCell 4)]
+    let threeOutOfOrder : StaticTyDesc :=
+      .composite 8 [(0, .freezeScalar 2), (6, .unsafeCell 2), (2, .unsafeCell 2)]
+    (staticFreezeSegments declOrder).2 = [⟨0, 4, .unsafeCell⟩, ⟨4, 4, .unsafeCell⟩] ∧
+    (staticFreezeSegments declOrder).2 = (staticFreezeSegments memOrder).2 ∧
+    evalRawMutStaticWriteMiri declOrder (retagStaticPreservedAt declOrder 1 2) 0 1 = .ok ∧
+    evalRawMutStaticWriteMiri declOrder (retagStaticPreservedAt declOrder 1 2) 5 1 = .ok ∧
+    evalRawMutStaticWriteMiri declOrder (retagStaticPreservedAt declOrder 1 2) 0 8 = .ok ∧
+    (staticFreezeSegments threeOutOfOrder).2 =
+      [⟨0, 2, .freeze⟩, ⟨2, 2, .unsafeCell⟩, ⟨4, 2, .freeze⟩, ⟨6, 2, .unsafeCell⟩] ∧
+    evalRawMutStaticWriteMiri threeOutOfOrder (retagStaticPreservedAt threeOutOfOrder 1 2) 6 2 = .ok ∧
+    evalRawMutStaticWriteMiri threeOutOfOrder (retagStaticPreservedAt threeOutOfOrder 1 2) 2 2 = .ok ∧
+    evalRawMutStaticWriteMiri threeOutOfOrder (retagStaticPreservedAt threeOutOfOrder 1 2) 4 1 = .ub ∧
+    evalRawMutStaticWriteMiri threeOutOfOrder (retagStaticPreservedAt threeOutOfOrder 1 2) 2 6 = .ub := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide
 
 /-! ## Part 3: `[T; N]` `Sized` Fast-Path (`lean-miri#79`), Auto-Trait `dyn Send` VTables (`lean-miri#75`), & Null-VTable Precedence (`lean-miri#82`) -/
 
@@ -11406,5 +12195,201 @@ theorem wideDynDeep_nestedDyn_rawDyn_and_layoutMismatch :
       dynSizeAlign, worldNestedDynOracle, decodeVTableWord, wordProvenance,
       NestedDynMetaOracle.failClosed]
     try rfl
+
+/-! #### Totality of Dynamic DST Layout and Custom-DST Wide References
+
+`dynSizeAlign` (`size_and_align_of_val`) succeeds on every well-laid-out DST whose runtime metadata has
+the kind its static layout asks for, so nested wide references to custom struct / tuple DSTs are never
+rejected for layout reasons. -/
+
+/-- Runtime pointer metadata `md` has the kind the static layout asks for: a length for slice / `str`
+tails, a vtable `(size, align)` for `dyn` tails (thin and `extern` pointees take no dynamic metadata). -/
+def DynMetaVal.matchesKind : DynMetaVal → Option DstMetadataKind → Bool
+  | .sliceLen _, some .sliceLen => true
+  | .vtable _ _, some .dynVTable => true
+  | _, _ => false
+
+mutual
+/-- Totality of `size_and_align_of_val` on well-laid-out DSTs: whenever the static layout of `ty` exists
+and the runtime metadata has the kind that layout asks for, `dynSizeAlign` SUCCEEDS — for bare slices /
+`str` / `dyn` and for every custom struct / tuple DST with such a tail, at any nesting depth. The
+fail-closed `.layoutErr .unsizedField` arms of `dynSizeAlign` are therefore unreachable from
+`checkNestedWideSafeRefChildSession`, which never spuriously rejects a wide reference for layout
+reasons. -/
+theorem dynSizeAlign_total_of_layout_ok :
+    ∀ (ty : ProtoTy) (md : DynMetaVal) {lay : ProtoLayout}, computeTyLayout ty = .ok lay →
+      md.matchesKind lay.metaKind = true → ∃ r, dynSizeAlign md ty = .ok r
+  | .slice elem, md, lay, h, hm => by
+    unfold computeTyLayout at h
+    cases hl : computeTyLayout elem with
+    | error _ => simp [hl] at h
+    | ok el =>
+      simp only [hl] at h
+      split at h
+      · cases h
+      · rename_i hsized
+        injection h with h
+        subst h
+        cases md with
+        | thin => cases hm
+        | vtable _ _ => cases hm
+        | sliceLen len =>
+          exact ⟨(el.sizeBytes * len, el.alignBytes), by simp [dynSizeAlign, hl, hsized]⟩
+  | .str, md, lay, h, hm => by
+    simp [computeTyLayout] at h
+    subst h
+    cases md with
+    | thin => cases hm
+    | vtable _ _ => cases hm
+    | sliceLen len => exact ⟨_, rfl⟩
+  | .dynamic _, md, lay, h, hm => by
+    simp [computeTyLayout] at h
+    subst h
+    cases md with
+    | thin => cases hm
+    | sliceLen _ => cases hm
+    | vtable sz al => exact ⟨_, rfl⟩
+  | .tuple fields, md, lay, h, hm => by
+    unfold computeTyLayout at h
+    rcases fieldsDynSizeAlign_total_of_layout_ok fields md 0 1 true h hm with ⟨r, hr⟩
+    exact ⟨r, by simp [dynSizeAlign, hr]⟩
+  | .adt _ fields, md, lay, h, hm => by
+    unfold computeTyLayout at h
+    rcases fieldsDynSizeAlign_total_of_layout_ok fields md 0 1 true h hm with ⟨r, hr⟩
+    exact ⟨r, by simp [dynSizeAlign, hr]⟩
+  | .unit, md, lay, h, hm => by
+    have hk := (isSyntacticallySized_eq_of_computeTyLayout_ok .unit h).2
+    rw [← hk] at hm
+    cases md <;> cases hm
+  | .never, md, lay, h, hm => by
+    have hk := (isSyntacticallySized_eq_of_computeTyLayout_ok .never h).2
+    rw [← hk] at hm
+    cases md <;> cases hm
+  | .bool, md, lay, h, hm => by
+    have hk := (isSyntacticallySized_eq_of_computeTyLayout_ok .bool h).2
+    rw [← hk] at hm
+    cases md <;> cases hm
+  | .char, md, lay, h, hm => by
+    have hk := (isSyntacticallySized_eq_of_computeTyLayout_ok .char h).2
+    rw [← hk] at hm
+    cases md <;> cases hm
+  | .uint sz, md, lay, h, hm => by
+    have hk := (isSyntacticallySized_eq_of_computeTyLayout_ok (.uint sz) h).2
+    rw [← hk] at hm
+    cases md <;> cases hm
+  | .fnPtr, md, lay, h, hm => by
+    have hk := (isSyntacticallySized_eq_of_computeTyLayout_ok .fnPtr h).2
+    rw [← hk] at hm
+    cases md <;> cases hm
+  | .ref m inner, md, lay, h, hm => by
+    have hk := (isSyntacticallySized_eq_of_computeTyLayout_ok (.ref m inner) h).2
+    rw [← hk] at hm
+    cases md <;> cases hm
+  | .rawPtr m inner, md, lay, h, hm => by
+    have hk := (isSyntacticallySized_eq_of_computeTyLayout_ok (.rawPtr m inner) h).2
+    rw [← hk] at hm
+    cases md <;> cases hm
+  | .array elem len, md, lay, h, hm => by
+    have hk := (isSyntacticallySized_eq_of_computeTyLayout_ok (.array elem len) h).2
+    rw [← hk] at hm
+    cases md <;> cases hm
+  | .foreign, md, lay, h, hm => by
+    have hk := (isSyntacticallySized_eq_of_computeTyLayout_ok .foreign h).2
+    rw [← hk] at hm
+    cases md <;> cases hm
+
+theorem fieldsDynSizeAlign_total_of_layout_ok :
+    ∀ (fields : List ProtoTy) (md : DynMetaVal) (curSize curAlign : Nat) (curInhab : Bool)
+      {lay : ProtoLayout}, computeFieldsLayout curSize curAlign curInhab fields = .ok lay →
+      md.matchesKind lay.metaKind = true → ∃ r, fieldsDynSizeAlign md curSize curAlign fields = .ok r
+  | [], md, _, _, _, lay, h, hm => by
+    unfold computeFieldsLayout at h
+    dsimp only at h
+    split at h
+    · cases h
+    · injection h with h
+      subst h
+      cases md <;> cases hm
+  | [last], md, curSize, curAlign, _, lay, h, hm => by
+    unfold computeFieldsLayout at h
+    cases hl : computeTyLayout last with
+    | error _ => simp [hl] at h
+    | ok l =>
+      simp only [hl] at h
+      have hmk : lay.metaKind = l.metaKind := by
+        split at h <;> split at h <;> first | (injection h with h; subst h; rfl) | cases h
+      rw [hmk] at hm
+      rcases dynSizeAlign_total_of_layout_ok last md hl hm with ⟨⟨sz, al⟩, hr⟩
+      exact ⟨(alignUpNat (alignUpNat curSize al + sz) (Nat.max curAlign al), Nat.max curAlign al),
+        by simp [fieldsDynSizeAlign, hr]⟩
+  | f :: a :: rest, md, curSize, curAlign, curInhab, lay, h, hm => by
+    unfold computeFieldsLayout at h
+    cases hf : computeTyLayout f with
+    | error _ => simp [hf] at h
+    | ok fl =>
+      simp only [hf] at h
+      split at h
+      · cases h
+      · rename_i hsz
+        split at h
+        · cases h
+        · rcases fieldsDynSizeAlign_total_of_layout_ok (a :: rest) md _ _ _ h hm with ⟨r, hr⟩
+          exact ⟨r, by simp [fieldsDynSizeAlign, hf, hsz, hr]⟩
+end
+
+/-- No spurious layout rejection of nested wide references with slice / `str` tails: for EVERY pointee
+type whose static layout exists with slice metadata (bare or as the tail of a custom struct / tuple
+DST) and every full-width 16-byte pointer, `checkNestedWideSafeRefChildSession` never reports a
+`.layoutErr` — only genuine validity failures (`InvalidMeta`, address-space end, null, uninhabited,
+unaligned) or success. -/
+theorem checkNestedWideSafeRefChildSession_sliceTail_no_layoutErr
+    (oracle : NestedDynMetaOracle) (inner : ProtoTy) (lay : ProtoLayout)
+    (rawBytes : List (UInt8 × Option MiriAllocId))
+    (hl : computeTyLayout inner = .ok lay) (hk : lay.metaKind = some .sliceLen)
+    (hw : rawBytes.length = 16) (e : LayoutErr) :
+    checkNestedWideSafeRefChildSession oracle inner rawBytes ≠ .error (.layoutErr e) := by
+  rcases dynSizeAlign_total_of_layout_ok inner
+    (.sliceLen (decodeLeUInt64 (rawBytes.drop 8)).toNat) hl (by rw [hk]; rfl) with ⟨⟨sz, al⟩, hr⟩
+  unfold checkNestedWideSafeRefChildSession
+  simp only [hl, hk, hw, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hr]
+  split
+  · intro h; cases h
+  · unfold checkNestedSafeRefWord
+    repeat' split
+    all_goals (intro h; cases h)
+
+/-- Custom-DST wide references on concrete bytes: `&(u32, [u8])` uses the DYNAMIC size
+`align_up(4 + len, 4)` and the struct alignment `4` (a 3-byte tail at an aligned address is accepted, a
+misaligned data word is rejected, and a length pushing the struct past `isize::MAX` is `InvalidMeta`
+although the bare tail alone would fit); `&(u8, dyn Trait)` takes its alignment from the VTABLE (`4`
+with a `u32` vtable, `1` with a `u8` vtable); and a thin `&(u32, ExternType)` uses the static prefix
+layout. -/
+theorem visitConcreteValue_nestedCustomDst_cases :
+    let dstSlice := ProtoTy.tuple [.uint 4, .slice (.uint 1)]
+    let dstDyn := ProtoTy.adt "S" [.uint 1, .dynamic "Send"]
+    let dstExtern := ProtoTy.tuple [.uint 4, .foreign]
+    dynSizeAlign (.sliceLen 3) dstSlice = .ok (8, 4) ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 16 ++ encodeLeUInt64Bytes 3) 0 (.ref false dstSlice) = .ok () ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 18 ++ encodeLeUInt64Bytes 3) 0 (.ref false dstSlice) =
+      .error (.nestedUnalignedSafeRef 4 18) ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 16 ++ encodeLeUInt64Bytes 9223372036854775800) 0
+      (.ref false dstSlice) = .ok () ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 16 ++ encodeLeUInt64Bytes 9223372036854775807) 0
+      (.ref false dstSlice) = .error .nestedSliceTooBig ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 16 ++ encodeLeUInt64Bytes 9223372036854775807) 0
+      (.ref false (.slice (.uint 1))) = .ok () ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 18 ++ encodeLeUInt64Bytes 0) 0 (.ref false dstDyn)
+      (fun _ _ => .ok (4, 4)) = .error (.nestedUnalignedSafeRef 4 18) ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 18 ++ encodeLeUInt64Bytes 0) 0 (.ref false dstDyn)
+      (fun _ _ => .ok (1, 1)) = .ok () ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 16 ++ encodeLeUInt64Bytes 0) 0 (.ref false dstDyn) =
+      .error .nestedDynVTableUnresolved ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 16) 0 (.ref false dstExtern) = .ok () ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 18) 0 (.ref false dstExtern) =
+      .error (.nestedUnalignedSafeRef 4 18) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+    first
+    | rfl
+    | (simp [visitConcreteValue, unsizedMetadataTail, fieldsUnsizedMetadataTail]; rfl)
 
 end Anneal.ExtTreeMapAllocAndNoWritable
