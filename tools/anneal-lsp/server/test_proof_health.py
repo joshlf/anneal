@@ -6144,6 +6144,123 @@ class TestEpisode2ProjectionAndRewriteOrderHazards(unittest.TestCase):
         )
         self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(b2_neg), [])
 
+    def test_a2_suffices_first_arm_proj_arg_and_inline_comment_regressions(self) -> None:
+        import lean_lexer
+
+        # 1. Balanced attributes with syntax quotations (`@[my_attr `(command| @[simp] ...)]`
+        # vs top-level quoted `@[simp]` vs unclosed `@[broken`).
+        attr_quot_src = (
+            "@[my_attr `(command| @[simp] def x := 1)]\n"
+            "def realDecl : Nat := 0\n"
+            "def quotedOnly := `(command| @[simp] def y := 2)\n"
+            "@[broken\n"
+            "@[simp] def afterBroken : Nat := 3\n"
+        )
+        self.assertEqual(
+            [(a.line_no, a.content) for a in lean_lexer.scan_balanced_attributes(attr_quot_src)],
+            [(1, "my_attr `(command| @[simp] def x := 1)"), (5, "simp")],
+        )
+
+        # 2. `NamespaceTracker`: inline `/- ... -/` block comments around `namespace ... in`
+        # and col-0 `section` / `end` tokens inside multi-line bracket expressions.
+        ns_a2 = (
+            "namespace A in\n"
+            "/- comment -/ theorem inA : True := by\n"
+            "  open Classical in\n"
+            "  trivial\n"
+            "def outA := 2\n"
+            "/- comment -/ namespace A2 in\n"
+            "theorem inA2 : True := by\n"
+            "  open Classical in\n"
+            "  trivial\n"
+            "def outA2 := 2\n"
+            "namespace B in\n"
+            "  def inB : Nat := 1\n"
+            "  /- comment -/ def outB : Nat := 2\n"
+            "namespace Foo\n"
+            "def xs : List Nat := [\n"
+            "1,\n"
+            "section,\n"
+            "end\n"
+            "]\n"
+            "def stillInFoo := 0\n"
+            "end Foo\n"
+        )
+        tr_a2 = lean_lexer.track_namespaces(ns_a2)
+        self.assertEqual(tr_a2.violations, ())
+        t1 = ns_a2.index("trivial")
+        self.assertEqual(tr_a2.namespace_at(t1), ("A",))
+        self.assertEqual(tr_a2.namespace_at(ns_a2.index("def outA")), ())
+        t2 = ns_a2.index("trivial", t1 + 1)
+        self.assertEqual(tr_a2.namespace_at(t2), ("A2",))
+        self.assertEqual(tr_a2.namespace_at(ns_a2.index("def outA2")), ())
+        self.assertEqual(tr_a2.namespace_at(ns_a2.index("def inB")), ("B",))
+        self.assertEqual(tr_a2.namespace_at(ns_a2.index("def outB")), ())
+        self.assertEqual(tr_a2.namespace_at(ns_a2.index("def stillInFoo")), ("Foo",))
+
+        # 3. Advisory regressions: `suffices h : <chain> by` canonical `dsimp at h; simp [h]`
+        # fix and post-`by` sibling goal, `first | simp; try ... | rw ...` arms, and
+        # `_call_mentions_ident` projections (`h.symm`, `h.1`, `«h».symm`) vs qualified
+        # (`Foo.h`, `Foo.«h»`) / config (`-zeta`, `zeta := false`) names.
+        R_PROJ = proof_health.RULE_SIMP_DEEP_PROJECTION_CHAIN
+        S_STMT = proof_health.SUBRULE_SIMP_AFTER_PROJECTION_STATEMENT
+        R_TRY = proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET
+
+        a2_pos = (
+            "theorem p : P := by\n"
+            "  have h1 : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simp [h1.symm]\n"
+            "  have h2 : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simpa using h2.1\n"
+            "  have «h3» : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simp [«h3».symm]\n"
+            "  suffices h4 : (advanceStmt s l m).memory.locals = l by\n"
+            "    exact h0 h4\n"
+            "  simp\n"
+            "  cases hc with | inl c1 => try cases hd with | inl a => rw [a] at hEval ⊢ | inr b => exact h0\n"
+            "  rcases hc with c1 | c2; try cases hd with | inl a => rw [a] at hEval ⊢ | inr b => exact h0\n"
+        )
+        self.assertEqual(
+            [
+                (f.line, f.rule, f.subrule)
+                for f in proof_health.scan_projection_and_rewrite_order_hazards(a2_pos)
+            ],
+            [
+                (3, R_PROJ, S_STMT),
+                (5, R_PROJ, S_STMT),
+                (7, R_PROJ, S_STMT),
+                (10, R_PROJ, S_STMT),
+                (11, R_TRY, ""),
+                (12, R_TRY, ""),
+            ],
+        )
+
+        a2_neg = (
+            "theorem clean : P := by\n"
+            "  suffices h1 : (advanceStmt s l m).memory.locals = l by\n"
+            "    dsimp only [advanceStmt] at h1\n"
+            "    simp [h1]\n"
+            "  dsimp only [advanceStmt]\n"
+            "  simp\n"
+            "  suffices h2 : (advanceStmt s l m).memory.locals = l by\n"
+            "    simp only [foo]\n"
+            "    exact h0 h2\n"
+            "  dsimp only [advanceStmt]\n"
+            "  simp\n"
+            "  have h3 : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simp [Foo.h3]\n"
+            "  have «h4» : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simp [Foo.«h4»]\n"
+            "  have zeta : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simp -zeta +zeta (config := { zeta := false }) [foo]\n"
+            "  first | simp; try exact h0 | rw [h] at hEval ⊢\n"
+            "  first | focus try simp | rw [h] at hEval ⊢\n"
+            "  (first | simp; try exact h0 | rw [h] at hEval ⊢)\n"
+            "  first\n"
+            "  | simp; try exact h0 | rw [h] at hEval ⊢\n"
+        )
+        self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(a2_neg), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -543,11 +543,19 @@ def scan_lean_source(
 def _inside_guillemets(stripped: str, pos: int) -> bool:
     """True when `pos` lies strictly inside a `«...»` identifier closed on its line."""
     line_start = stripped.rfind("\n", 0, pos) + 1
-    g = stripped.rfind("«", line_start, pos)
-    if g == -1:
-        return False
     nl = stripped.find("\n", pos)
     line_end = len(stripped) if nl == -1 else nl
+    g = stripped.rfind("«", line_start, pos)
+    while (
+        g != -1
+        and g > line_start
+        and g + 1 < line_end
+        and stripped[g - 1] == "'"
+        and stripped[g + 1] == "'"
+    ):
+        g = stripped.rfind("«", line_start, g)
+    if g == -1:
+        return False
     close = stripped.find("»", g + 1, line_end)
     return close != -1 and close >= pos
 
@@ -595,9 +603,9 @@ _ATTR_TOKEN_RE = None  # compiled by `_attr_token_re` on first use
 def _attr_token_re():
     """Compiled pattern of the tokens that matter inside an attribute list of comment- and
     string-blanked code: a guillemet identifier or a character literal (skipped whole, so
-    the brackets inside `«a]b»` and `']'` never count), a nested `@[`, or one bracket. A
-    `'` right after an identifier character or `»` is a prime and starts no character
-    literal."""
+    the brackets inside `«a]b»` and `']'` never count), a syntax quotation opener, a nested
+    `@[`, or one bracket. A `'` right after an identifier character or `»` is a prime and
+    starts no character literal."""
     global _ATTR_TOKEN_RE
     if _ATTR_TOKEN_RE is None:
         import re  # deferred: importing this module must stay cheap
@@ -605,7 +613,7 @@ def _attr_token_re():
         _ATTR_TOKEN_RE = re.compile(
             r"«[^»\n]*»"
             r"|(?<![\w'!?\u00bb])'(?:\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)|[^'\\\n])'"
-            r"|@\[|[\[\](){}⟨⟩]"
+            r"|`[\(\[\{]|@\[|[\[\](){}⟨⟩]"
         )
     return _ATTR_TOKEN_RE
 
@@ -622,33 +630,41 @@ def match_balanced_attribute(stripped: str, pos: int) -> int | None:
 
     `stripped` must be comment- and string-blanked code (see
     `strip_comments_and_strings_preserving_offsets`). Nested `[...]`, `(...)`, `{...}` and
-    `⟨...⟩` are tracked; brackets inside guillemet identifiers and character literals are
-    ignored, and `@[` inside a guillemet identifier (`«@[foo]»`) or attached to an
-    identifier as an as-pattern (`xs@[a, b]`) is not an attribute. The list is malformed,
-    and rejected, when a closing bracket does not match the innermost open one, when another
-    standalone `@[` starts before it is closed (attribute lists do not nest, so a missing
-    `]` never swallows the following declaration), or when the text ends first. Every
-    rejection stops at the offending token, so scanning is linear.
+    `⟨...⟩` (including syntax quotations `` `(...) `` / `` `[...] `` / `` `{...} ``) are
+    tracked; brackets inside guillemet identifiers and character literals are ignored, and
+    `@[` inside a guillemet identifier (`«@[foo]»`) or attached to an identifier as an
+    as-pattern (`xs@[a, b]`) is not an attribute. The list is malformed, and rejected, when
+    a closing bracket does not match the innermost open one, when another standalone `@[`
+    starts outside a syntax quotation before it is closed (attribute lists do not nest, so a
+    missing `]` never swallows the following declaration), or when the text ends first.
+    Every rejection stops at the offending token, so scanning is linear.
     """
     if pos < 0 or not stripped.startswith("@[", pos):
         return None
     if _is_as_pattern_at(stripped, pos) or _inside_guillemets(stripped, pos):
         return None
-    expected = ["]"]
+    expected: list[tuple[str, bool]] = [("]", False)]
+    quot_depth = 0
     for m in _attr_token_re().finditer(stripped, pos + 2):
         tok = m.group()
         if len(tok) != 1:
+            if len(tok) == 2 and tok[0] == "`":
+                expected.append((_CLOSER_OF[tok[1]], True))
+                quot_depth += 1
+                continue
             if tok == "@[":
-                if _is_as_pattern_at(stripped, m.start()):
-                    expected.append("]")
+                if quot_depth > 0 or _is_as_pattern_at(stripped, m.start()):
+                    expected.append(("]", False))
                     continue
                 return None
             continue  # guillemet identifier or character literal
         closer = _CLOSER_OF.get(tok)
         if closer is not None:
-            expected.append(closer)
-        elif tok == expected[-1]:
-            expected.pop()
+            expected.append((closer, False))
+        elif tok == expected[-1][0]:
+            _, is_quot = expected.pop()
+            if is_quot:
+                quot_depth -= 1
             if not expected:
                 return m.end()
         else:
@@ -663,16 +679,27 @@ def scan_balanced_attributes(
     source order (`match_balanced_attribute` decides what is well formed).
 
     `stripped` is `strip_comments_and_strings_preserving_offsets(text)` when the caller
-    already has it; attributes inside comments, strings and guillemet identifiers are never
-    reported. A malformed `@[` is skipped and scanning resumes right after it.
+    already has it; attributes inside comments, strings, syntax quotations and guillemet
+    identifiers are never reported. A malformed `@[` is skipped and scanning resumes right
+    after it.
     """
     if stripped is None or len(stripped) != len(text):
         stripped = strip_comments_and_strings_preserving_offsets(text)
     spans: list[AttributeSpan] = []
     find = stripped.find
-    line_of = LineCounter(stripped)
     start = find("@[", pos if pos > 0 else 0)
+    if start == -1:
+        return spans
+    quot_spans = (
+        _quotation_spans(stripped, _scope_res()[3], has_guillemets=("«" in stripped))
+        if "`" in stripped
+        else ()
+    )
+    line_of = LineCounter(stripped)
     while start != -1:
+        if quot_spans and _inside_spans(quot_spans, start):
+            start = find("@[", start + 2)
+            continue
         end = match_balanced_attribute(stripped, start)
         if end is None:
             start = find("@[", start + 2)
@@ -738,8 +765,8 @@ _SCOPE_RES = None  # compiled by `_scope_res` on first use
 
 def _scope_res():
     """Compiled regex bundle `(name_re, part_re, bracket_re, quot_re, line_re, cont_re,
-    cmd_re, strict_cmd_re, in_prefix_re, in_tok_re)` for `NamespaceTracker`, compiled once
-    on first use."""
+    cmd_re, strict_cmd_re, decl_boundary_re, in_prefix_re, in_tok_re)` for
+    `NamespaceTracker`, compiled once on first use."""
     global _SCOPE_RES
     if _SCOPE_RES is None:
         import re  # deferred: importing this module must stay cheap
@@ -777,6 +804,14 @@ def _scope_res():
             r"deriving|import|add_decl_doc|register_option|alias)"
             r"(?![\w'!?.])"
         )
+        # Reserved declaration heads (excluding `end`/`namespace`/`section`/`mutual`, which
+        # can appear as identifiers inside multi-line bracket expressions) for col-0 block bounds.
+        decl_boundary_re = re.compile(
+            r"#[A-Za-z_]\w*(?!\[)|"
+            r"(?:theorem|lemma|def|abbrev|structure|inductive|class|instance|axiom|opaque|example|"
+            r"declare_syntax_cat|initialize|builtin_initialize|import|add_decl_doc|register_option|alias)"
+            r"(?![\w'!?.])"
+        )
         in_prefix_re = re.compile(
             r"(?:namespace|section|set_option|open|variable|universe|attribute|include|omit|export|"
             r"notation|infix|infixl|infixr|prefix|postfix|macro|macro_rules|syntax|elab|elab_rules)"
@@ -794,6 +829,7 @@ def _scope_res():
             cont_re,
             cmd_re,
             strict_cmd_re,
+            decl_boundary_re,
             in_prefix_re,
             in_tok_re,
         )
@@ -948,11 +984,23 @@ def _enclosing_col0_block(stripped: str, pos: int, line_start: int, cmd_re, n: i
     return blk_start, blk_end
 
 
+def _may_have_unclosed_bracket(seg: str) -> bool:
+    """Fast `str.count` prefilter: True when `seg` may hold an unclosed `(`, `[`, `{`, `⟨`."""
+    if (
+        seg.count("(") > seg.count(")")
+        or seg.count("[") > seg.count("]")
+        or seg.count("{") > seg.count("}")
+        or seg.count("⟨") > seg.count("⟩")
+    ):
+        return True
+    return ("«" in seg or "'" in seg) and any(c in seg for c in "([{⟨")
+
+
 def _scope_keyword_hits(
     stripped: str,
     bracket_re,
     quot_re,
-    cmd_re,
+    decl_boundary_re,
     *,
     quot_spans: list[tuple[int, int]] | None = None,
 ) -> list[tuple[int, str]]:
@@ -1013,10 +1061,10 @@ def _scope_keyword_hits(
                 ]
             if _inside_spans(cached_line_spans, p):
                 continue
-        if p > line_start:
-            blk_bounds = _enclosing_col0_block(stripped, p, line_start, cmd_re, n)
+        if line_start > 0:
+            blk_bounds = _enclosing_col0_block(stripped, p, line_start, decl_boundary_re, n)
             blk_start, blk_end = blk_bounds
-            if blk_start < line_start and any(c in stripped[blk_start:line_start] for c in "([{⟨"):
+            if blk_start < line_start and _may_have_unclosed_bracket(stripped[blk_start:line_start]):
                 if blk_bounds != cached_blk_bounds:
                     cached_blk_bounds = blk_bounds
                     cached_blk_spans = [
@@ -1033,12 +1081,26 @@ def _column_of(stripped: str, pos: int) -> int:
     return pos - (stripped.rfind("\n", 0, pos) + 1)
 
 
-def _line_indent_of(stripped: str, pos: int) -> int:
-    line_start = stripped.rfind("\n", 0, pos) + 1
+def _true_line_indent(text: str, line_start: int, first_tok_pos: int) -> int:
+    """True visual indentation of the line starting at `line_start` before `first_tok_pos`,
+    unaffected by inline `/- ... -/` block comments blanked into spaces in `stripped`."""
+    if first_tok_pos <= line_start:
+        return 0
     k = line_start
-    n = len(stripped)
-    while k < n and stripped[k] in " \t":
+    n = len(text)
+    limit = first_tok_pos if first_tok_pos < n else n
+    while k < limit and text[k] in " \t":
         k += 1
+    if k == first_tok_pos or text.startswith("/-", k):
+        return k - line_start
+    open_c = text.rfind("/-", 0, first_tok_pos)
+    if open_c != -1:
+        c_line = text.rfind("\n", 0, open_c) + 1
+        j = c_line
+        while j < open_c and text[j] in " \t":
+            j += 1
+        if j == open_c:
+            return open_c - c_line
     return k - line_start
 
 
@@ -1073,6 +1135,7 @@ def _find_in_governed_end(
     in_end: int,
     cmd_indent: int,
     *,
+    text: str | None = None,
     quot_spans: list[tuple[int, int]] = (),  # type: ignore[assignment]
 ) -> tuple[int, bool]:
     """Given `<scope_cmd> in` ending at `in_end` with governing line indentation
@@ -1083,10 +1146,11 @@ def _find_in_governed_end(
     `end_offset` is the offset where the governed command ends (`in_end` when `in` is
     dangling before `end` or EOF).
     """
-    _, _, bracket_re, _, line_re, cont_re, cmd_re, strict_cmd_re, in_prefix_re, in_tok_re = (
+    _, _, bracket_re, _, line_re, cont_re, cmd_re, strict_cmd_re, _, in_prefix_re, in_tok_re = (
         _scope_res()
     )
     n = len(stripped)
+    src = text if text is not None and len(text) == n else stripped
 
     def is_cmd_start(cand: int) -> bool:
         kw = _skip_attrs_and_mods(stripped, cand)
@@ -1252,15 +1316,16 @@ def _find_in_governed_end(
                 body_pos += 1
 
     # Multi-line scan: any non-continuation command starting at or left of the governed
-    # command's own line indentation ends it (skipping commands inside syntax quotations).
-    stop_indent = max(cmd_indent, _line_indent_of(stripped, p))
+    # command's own true line indentation ends it (skipping syntax quotations).
+    p_line_start = stripped.rfind("\n", 0, p) + 1
+    stop_indent = max(cmd_indent, _true_line_indent(src, p_line_start, p))
     cur = line_end
     while cur < n:
         m = line_re.search(stripped, cur)
         if m is None:
             return n, False
-        indent = len(m.group(1))
         cand = m.end()
+        indent = _true_line_indent(src, m.start() + 1, cand)
         if (
             indent <= stop_indent
             and not (quot_spans and _inside_spans(quot_spans, cand))
@@ -1349,7 +1414,7 @@ class NamespaceTracker:
         if stripped is None or len(stripped) != len(text):
             stripped = strip_comments_and_strings_preserving_offsets(text)
         n = len(stripped)
-        name_re, part_re, bracket_re, quot_re, _, _, cmd_re, *_ = _scope_res()
+        name_re, part_re, bracket_re, quot_re, _, _, _, _, decl_boundary_re, *_ = _scope_res()
         line_of = LineCounter(stripped)
         offsets: list[int] = []
         namespaces: list[tuple[str, ...]] = []
@@ -1419,7 +1484,7 @@ class NamespaceTracker:
         )
 
         for pos, kw in _scope_keyword_hits(
-            stripped, bracket_re, quot_re, cmd_re, quot_spans=quot_spans
+            stripped, bracket_re, quot_re, decl_boundary_re, quot_spans=quot_spans
         ):
             if pos < consumed:
                 continue
@@ -1514,9 +1579,10 @@ class NamespaceTracker:
             in_end = match_in_keyword(name_end)
             if in_end != -1:
                 consumed = in_end
-                cmd_indent = min(kw_col, _line_indent_of(stripped, pos))
+                pos_line_start = stripped.rfind("\n", 0, pos) + 1
+                cmd_indent = min(kw_col, _true_line_indent(text, pos_line_start, pos))
                 end_off, is_mut = _find_in_governed_end(
-                    stripped, in_end, cmd_indent, quot_spans=quot_spans
+                    stripped, in_end, cmd_indent, text=text, quot_spans=quot_spans
                 )
                 if not is_mut and end_off <= in_end:
                     continue

@@ -3120,36 +3120,77 @@ def _enclosing_simp_call(
     return None
 
 
-def _call_mentions_ident(call_slice: str, ident: str) -> bool:
-    """True when `call_slice` references `ident` positively (excluding simp erasures `[-h]`)."""
+def _call_mentions_ident(args_slice: str, ident: str, *, has_using: bool = False) -> bool:
+    """True when `args_slice` (after the simp tactic head) references `ident` positively,
+    allowing projections (`h.symm`, `h.1`) while excluding qualified names (`Foo.h`,
+    `Foo.«h»`), simp erasures (`[-h]`), config flags (`-zeta`, `+zeta`), and named
+    config/field assignments (`zeta := false`)."""
     if not ident:
         return False
     is_gui = ident[0] == "«"
     klen = len(ident)
-    n_sl = len(call_slice)
-    has_gui = "«" in call_slice
-    pos = call_slice.find(ident)
+    n_sl = len(args_slice)
+    has_gui = "«" in args_slice
+    using_rel = -1
+    if has_using:
+        u = args_slice.rfind("using")
+        while u != -1:
+            if (
+                u == 0 or not (_is_ident_char(args_slice[u - 1]) or args_slice[u - 1] in ".«")
+            ) and (
+                u + 5 >= n_sl
+                or not (_is_ident_char(args_slice[u + 5]) or args_slice[u + 5] in ".»")
+            ):
+                using_rel = u + 5
+                break
+            u = args_slice.rfind("using", 0, u)
+    pos = args_slice.find(ident)
     while pos != -1:
         end = pos + klen
-        if is_gui or (
-            (pos == 0 or not (_is_ident_char(call_slice[pos - 1]) or call_slice[pos - 1] in ".«"))
-            and (end >= n_sl or not (_is_ident_char(call_slice[end]) or call_slice[end] in ".»"))
-            and not (has_gui and lean_lexer._inside_guillemets(call_slice, pos))
+        valid_before = pos == 0 or not (
+            _is_ident_char(args_slice[pos - 1]) or args_slice[pos - 1] in ".«»"
+        )
+        valid_after = end >= n_sl or not (
+            _is_ident_char(args_slice[end])
+            or (args_slice[end] == "«" if is_gui else args_slice[end] in "«»")
+        )
+        if (
+            valid_before
+            and valid_after
+            and (is_gui or not (has_gui and lean_lexer._inside_guillemets(args_slice, pos)))
         ):
+            in_using = using_rel != -1 and pos >= using_rel
+            if ident == "only" and not in_using:
+                pos = args_slice.find(ident, end)
+                continue
+            f = _adv_skip_ws(args_slice, end, n_sl)
+            if args_slice.startswith(":=", f) and not args_slice.startswith(":==", f):
+                pos = args_slice.find(ident, end)
+                continue
+            if (
+                not in_using
+                and pos > 0
+                and args_slice[pos - 1] in "+-"
+                and (pos == 1 or args_slice[pos - 2] in _ADV_WS)
+                and "[" not in args_slice[: pos - 1]
+                and args_slice.count("(", 0, pos - 1) <= args_slice.count(")", 0, pos - 1)
+            ):
+                pos = args_slice.find(ident, end)
+                continue
             # Ignore simp erasure entries `-h` (`[-h]` / `[..., -h]`).
             b = pos - 1
-            while b >= 0 and call_slice[b] in _ADV_WS:
+            while b >= 0 and args_slice[b] in _ADV_WS:
                 b -= 1
             is_erasure = False
-            if b >= 0 and call_slice[b] == "-":
+            if b >= 0 and args_slice[b] == "-":
                 b2 = b - 1
-                while b2 >= 0 and call_slice[b2] in _ADV_WS:
+                while b2 >= 0 and args_slice[b2] in _ADV_WS:
                     b2 -= 1
-                if b2 >= 0 and call_slice[b2] in "[,":
+                if b2 >= 0 and args_slice[b2] in "[,":
                     is_erasure = True
             if not is_erasure:
                 return True
-        pos = call_slice.find(ident, end)
+        pos = args_slice.find(ident, end)
     return False
 
 
@@ -3207,10 +3248,10 @@ def _simp_step_at(
                 return tactic_kind, s
             if rem_targets & loc_set:
                 return tactic_kind, s
-            call_slice = stripped[s:call_end]
+            args_slice = stripped[s + len(tactic_kind) : call_end]
             for hyp in rem_targets:
                 if hyp != "⊢" and (
-                    _call_mentions_ident(call_slice, hyp)
+                    _call_mentions_ident(args_slice, hyp, has_using=has_using)
                     or (hyp == "this" and tactic_kind.startswith("simpa") and not has_using)
                 ):
                     return tactic_kind, s
@@ -3325,7 +3366,7 @@ def _simp_after_statement(
         elif statement_kw == "suffices":
             if entered_own_by:
                 hyp = _extract_statement_bound_hyp(stripped, kw_end, end)
-                targets = frozenset(("⊢", hyp)) if hyp is not None else None
+                targets = frozenset((hyp,)) if hyp is not None else None
             else:
                 targets = frozenset(("⊢",))
         if p == -1:
@@ -3338,10 +3379,70 @@ def _simp_after_statement(
             if p != -1
             else None
         )
+        if (
+            step is None
+            and statement_kw == "suffices"
+            and entered_own_by
+            and p != -1
+            and _adv_col(stripped, p) > col
+        ):
+            _, tok2, nxt2 = _adv_scan_to(stripped, p, n, col + 1, _ADV_NO_STOPS)
+            if tok2 == "\n" and _adv_col(stripped, nxt2) == col:
+                step = _simp_step_at(
+                    stripped, nxt2, n, has_guillemets, targets=frozenset(("⊢",))
+                )
         if step is None:
             continue  # inner term/statement did not lead to `simp`: try an enclosing one
         return statement_kw, kw_pos, step[0], step[1]
     return None
+
+
+def _is_in_first_arm(stripped: str, line_start: int, t: int) -> bool:
+    """True when `try` at `t` sits inside an inline `first | ...` arm at the same bracket
+    depth on the current line, so a following standalone `|` begins the next `first`
+    alternative rather than continuing `try`."""
+    if stripped.find("|", line_start, t) == -1:
+        return False
+    group_start = line_start
+    open_stack: list[int] = []
+    pipes_by_depth: dict[int, list[int]] = {0: []}
+    for m in _advisory_regexes().step_token.finditer(stripped, line_start, t):
+        tok = m.group()
+        ch = tok[0]
+        if ch in ("«", "'"):
+            continue
+        if ch in "([{⟨":
+            open_stack.append(m.end())
+            pipes_by_depth[len(open_stack)] = []
+        elif ch in ")]}⟩":
+            if open_stack:
+                pipes_by_depth.pop(len(open_stack), None)
+                open_stack.pop()
+            else:
+                group_start = m.end()
+                pipes_by_depth[0] = []
+        elif tok == "|":
+            pipes_by_depth.setdefault(len(open_stack), []).append(m.start())
+    cur_depth = len(open_stack)
+    if cur_depth > 0:
+        group_start = open_stack[-1]
+    pipes = pipes_by_depth.get(cur_depth)
+    if not pipes:
+        return False
+    first_pipe = pipes[0]
+    last_pipe = pipes[-1]
+    if "=>" in stripped[last_pipe + 1 : t]:
+        return False
+    b = first_pipe - 1
+    while b >= group_start and stripped[b] in " \t":
+        b -= 1
+    if b < group_start and cur_depth == 0:
+        return True
+    if b >= group_start + 4 and stripped[b - 4 : b + 1] == "first":
+        before_f = b - 5
+        if before_f < 0 or not (_is_ident_char(stripped[before_f]) or stripped[before_f] in ".«"):
+            return True
+    return False
 
 
 def _is_non_tactic_try(stripped: str, t: int) -> bool:
@@ -3457,13 +3558,10 @@ def _try_rewrite_hyp_before_target(
                 continue  # `try` with no indented tactic block before a sibling step
         else:
             # Only treat a subsequent standalone `|` as ending `try`'s scope when `try`
-            # itself sits directly inside an inline `first | ...` arm; otherwise `|` inside
-            # `try` belongs to a nested `cases` / `match` / `first` / `rcases` tactic.
+            # itself sits inside an inline `first | ...` arm; otherwise `|` inside `try`
+            # belongs to a nested `cases` / `match` / `first` / `rcases` tactic.
             line_start = stripped.rfind("\n", 0, t) + 1
-            b_try = t - 1
-            while b_try >= line_start and stripped[b_try] in " \t":
-                b_try -= 1
-            in_first_arm = b_try >= line_start and stripped[b_try] == "|"
+            in_first_arm = _is_in_first_arm(stripped, line_start, t)
             try_stops = _ADV_TRY_STOPS if in_first_arm else _ADV_NO_STOPS
             min_indent = min(first_col, try_col + 1) if first_col > try_col else first_col
             if not has_nl_after_try and not in_first_arm and stripped[first] not in "({":
