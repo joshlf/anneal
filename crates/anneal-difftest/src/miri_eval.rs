@@ -2313,18 +2313,42 @@ fn blank_char_intervals_preserving_lines(
     out
 }
 
+fn collect_stage_ns_use_tree(
+    mod_name: &str,
+    tree: &syn::UseTree,
+    map: &mut BTreeMap<String, String>,
+) {
+    match tree {
+        syn::UseTree::Name(n) if n.ident != "self" => {
+            map.insert(n.ident.to_string(), mod_name.to_string());
+        }
+        syn::UseTree::Rename(r) if r.rename != "_" => {
+            map.insert(r.rename.to_string(), mod_name.to_string());
+        }
+        syn::UseTree::Group(g) => {
+            for sub in &g.items {
+                collect_stage_ns_use_tree(mod_name, sub, map);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn parse_stage_ns_reexports_from_items(items: &[syn::Item]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for item in items {
         if let syn::Item::Use(u) = item
             && matches!(u.vis, syn::Visibility::Public(_))
-            && let syn::UseTree::Path(p) = &u.tree
         {
-            let mod_name = p.ident.to_string();
-            if mod_name.starts_with("stage_ns_")
-                && let syn::UseTree::Name(n) = &*p.tree
-            {
-                map.insert(n.ident.to_string(), mod_name);
+            let tree = match &u.tree {
+                syn::UseTree::Path(p) if p.ident == "self" => &*p.tree,
+                other => other,
+            };
+            if let syn::UseTree::Path(p) = tree {
+                let mod_name = p.ident.to_string();
+                if mod_name.starts_with("stage_ns_") {
+                    collect_stage_ns_use_tree(&mod_name, &p.tree, &mut map);
+                }
             }
         }
     }
@@ -2337,18 +2361,49 @@ fn parse_stage_ns_reexports(lib_rs: &str) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-fn non_entry_item_ident_and_vis(item: &syn::Item) -> Option<(String, &syn::Visibility)> {
+fn non_entry_item_vis_matching_name<'a>(
+    item: &'a syn::Item,
+    target_name: &str,
+) -> Option<&'a syn::Visibility> {
     match item {
-        syn::Item::Fn(i) => Some((i.sig.ident.to_string(), &i.vis)),
-        syn::Item::Const(i) => Some((i.ident.to_string(), &i.vis)),
-        syn::Item::Static(i) => Some((i.ident.to_string(), &i.vis)),
-        syn::Item::Struct(i) => Some((i.ident.to_string(), &i.vis)),
-        syn::Item::Enum(i) => Some((i.ident.to_string(), &i.vis)),
-        syn::Item::Union(i) => Some((i.ident.to_string(), &i.vis)),
-        syn::Item::Type(i) => Some((i.ident.to_string(), &i.vis)),
-        syn::Item::Trait(i) => Some((i.ident.to_string(), &i.vis)),
-        syn::Item::Mod(i) => Some((i.ident.to_string(), &i.vis)),
+        syn::Item::Fn(i) if i.sig.ident == target_name => Some(&i.vis),
+        syn::Item::Const(i) if i.ident == target_name => Some(&i.vis),
+        syn::Item::Static(i) if i.ident == target_name => Some(&i.vis),
+        syn::Item::Struct(i) if i.ident == target_name => Some(&i.vis),
+        syn::Item::Enum(i) if i.ident == target_name => Some(&i.vis),
+        syn::Item::Union(i) if i.ident == target_name => Some(&i.vis),
+        syn::Item::Type(i) if i.ident == target_name => Some(&i.vis),
+        syn::Item::Trait(i) if i.ident == target_name => Some(&i.vis),
+        syn::Item::Mod(i) if i.ident == target_name => Some(&i.vis),
+        syn::Item::Use(u) => {
+            let mut bound = Vec::new();
+            let mut globs = Vec::new();
+            crate::mutators_miri::collect_use_tree_bound_idents(
+                None,
+                &u.tree,
+                &mut bound,
+                &mut globs,
+            );
+            bound.iter().any(|id| id == target_name).then_some(&u.vis)
+        }
         _ => None,
+    }
+}
+
+fn head_unqualified_type_ident(mut ty: &syn::Type) -> Option<String> {
+    loop {
+        match ty {
+            syn::Type::Paren(p) => ty = &p.elem,
+            syn::Type::Group(g) => ty = &g.elem,
+            syn::Type::Path(tp)
+                if tp.qself.is_none()
+                    && tp.path.leading_colon.is_none()
+                    && tp.path.segments.len() == 1 =>
+            {
+                return Some(tp.path.segments[0].ident.to_string());
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -2472,17 +2527,14 @@ fn stage_candidate_source_for_batch_with_reserved(
         let emitted_end = batch_start_line + local_end.saturating_sub(1);
         let tokens = quote::ToTokens::to_token_stream(item).to_string();
         let is_non_local_impl = if let syn::Item::Impl(im) = item {
-            let mut self_idents = BTreeSet::new();
-            collect_ident_tokens(
-                quote::ToTokens::to_token_stream(&im.self_ty),
-                &mut self_idents,
-            );
-            let mut trait_idents = BTreeSet::new();
-            if let Some((_, tp, _)) = &im.trait_ {
-                collect_ident_tokens(quote::ToTokens::to_token_stream(tp), &mut trait_idents);
-            }
-            !(self_idents.iter().any(|id| local_type_defs.contains(id))
-                || trait_idents.iter().any(|id| local_trait_defs.contains(id)))
+            let self_is_local = head_unqualified_type_ident(&im.self_ty)
+                .is_some_and(|id| local_type_defs.contains(&id));
+            let trait_is_local = im.trait_.as_ref().is_some_and(|(_, tp, _)| {
+                tp.leading_colon.is_none()
+                    && tp.segments.len() == 1
+                    && local_trait_defs.contains(&tp.segments[0].ident.to_string())
+            });
+            !(self_is_local || trait_is_local)
         } else {
             false
         };
@@ -2492,10 +2544,16 @@ fn stage_candidate_source_for_batch_with_reserved(
                 .or_else(|| k.strip_prefix("mac:"))
                 .is_some_and(|id| id == cand.fn_name || reserved_entry_names.contains(id))
         });
+        let exact_match_in_seen = keys
+            .iter()
+            .all(|k| seen_aux.get(k).is_some_and(|prev| !prev.tokens.is_empty() && prev.tokens == tokens));
         let collides_seen = keys
             .iter()
             .any(|k| seen_aux.get(k).is_some_and(|prev| prev.tokens != tokens));
-        if collides_reserved_entry || collides_seen {
+        let collides_prior_non_local_impl = is_non_local_impl
+            && !exact_match_in_seen
+            && seen_aux.contains_key("__meta:non_local_impl");
+        if collides_reserved_entry || collides_seen || collides_prior_non_local_impl {
             has_conflict = true;
         }
         entries.push(AuxCandidateEntry {
@@ -2509,11 +2567,7 @@ fn stage_candidate_source_for_batch_with_reserved(
             is_non_local_impl,
         });
     }
-    if has_conflict
-        && entries
-            .iter()
-            .any(|e| e.is_non_local_impl && e.keys.iter().any(|k| seen_aux.contains_key(k)))
-    {
+    if has_conflict && entries.iter().any(|e| e.is_non_local_impl) {
         needs_isolated_preamble = true;
     }
     let reserve_entry_val = |seen: &mut BTreeMap<String, SeenStagedAuxItem>, line: u32| {
@@ -2534,9 +2588,8 @@ fn stage_candidate_source_for_batch_with_reserved(
             {
                 continue;
             }
-            if let Some((ident, vis)) = non_entry_item_ident_and_vis(item)
-                && ident == cand.fn_name
-                && matches!(vis, syn::Visibility::Public(_))
+            if let Some(vis) = non_entry_item_vis_matching_name(item, &cand.fn_name)
+                && !matches!(vis, syn::Visibility::Inherited)
                 && let Some(bounds) = node_span_bounds(vis)
             {
                 vis_blanks.push(bounds);
@@ -2549,6 +2602,36 @@ fn stage_candidate_source_for_batch_with_reserved(
         };
         reserve_entry_val(seen_aux, batch_start_line);
         if needs_isolated_preamble {
+            let preamble_seen = seed_seen_staged_aux_from_preamble();
+            let mut iso_blanks = vis_blanks;
+            for item in &parsed.items {
+                if let syn::Item::Fn(func) = item
+                    && func.sig.ident == cand.fn_name
+                {
+                    continue;
+                }
+                let keys = crate::mutators_miri::aux_item_namespace_keys(item);
+                if keys.is_empty() {
+                    continue;
+                }
+                let tokens = quote::ToTokens::to_token_stream(item).to_string();
+                let redundant_with_preamble = match item {
+                    syn::Item::Use(_) => keys.iter().all(|k| preamble_seen.contains_key(k)),
+                    _ => keys.iter().all(|k| {
+                        preamble_seen
+                            .get(k)
+                            .is_some_and(|prev| !prev.tokens.is_empty() && prev.tokens == tokens)
+                    }),
+                };
+                if redundant_with_preamble && let Some(bounds) = node_span_bounds(item) {
+                    iso_blanks.push(bounds);
+                }
+            }
+            let iso_body = if iso_blanks.is_empty() {
+                trimmed.to_string()
+            } else {
+                blank_char_intervals_preserving_lines(trimmed, &iso_blanks)
+            };
             let ns_header =
                 format!("pub mod stage_ns_{ns_idx} {{\n{MIRI_CORPUS_MODULE_PREAMBLE}\n");
             let header_newlines = ns_header.bytes().filter(|&b| b == b'\n').count() as u32;
@@ -2559,7 +2642,7 @@ fn stage_candidate_source_for_batch_with_reserved(
                 .count() as u32
                 + 1;
             let wrapped = format!(
-                "{ns_header}{ns_body}\n}} pub use stage_ns_{ns_idx}::{};",
+                "{ns_header}{iso_body}\n}} pub use stage_ns_{ns_idx}::{};",
                 cand.fn_name
             );
             return (
@@ -2609,6 +2692,9 @@ fn stage_candidate_source_for_batch_with_reserved(
                 emitted_start_line: entry.emitted_start,
                 emitted_end_line: entry.emitted_end,
             };
+            if entry.is_non_local_impl {
+                seen_aux.insert("__meta:non_local_impl".to_string(), record.clone());
+            }
             for key in entry.keys {
                 seen_aux.insert(key, record.clone());
             }
@@ -3049,7 +3135,27 @@ struct ScopeGraphData {
     aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>>,
     impl_method_names: BTreeSet<String>,
     top_level_fns: BTreeSet<String>,
+    defined_value_names: BTreeSet<String>,
+    defined_type_names: BTreeSet<String>,
+    defined_macro_names: BTreeSet<String>,
     inherits_super: bool,
+}
+
+fn record_scope_defined_names(items: &[syn::Item], graph: &mut ScopeGraphData) {
+    for item in items {
+        if let syn::Item::Fn(func) = item {
+            graph.top_level_fns.insert(func.sig.ident.to_string());
+        }
+        for key in crate::mutators_miri::aux_item_namespace_keys(item) {
+            if let Some(v) = key.strip_prefix("val:") {
+                graph.defined_value_names.insert(v.to_string());
+            } else if let Some(t) = key.strip_prefix("ty:") {
+                graph.defined_type_names.insert(t.to_string());
+            } else if let Some(m) = key.strip_prefix("mac:") {
+                graph.defined_macro_names.insert(m.to_string());
+            }
+        }
+    }
 }
 
 struct ScopedReachability {
@@ -3093,11 +3199,7 @@ fn compute_scoped_reachability(lib_rs: &str, items: &[OracleItemSpec]) -> Scoped
                         inherits_super: mod_items_use_super_glob(&sub_items),
                         ..ScopeGraphData::default()
                     };
-                    for sub in &sub_items {
-                        if let syn::Item::Fn(func) = sub {
-                            ns_data.top_level_fns.insert(func.sig.ident.to_string());
-                        }
-                    }
+                    record_scope_defined_names(&sub_items, &mut ns_data);
                     collect_fn_and_aux_items(
                         &sub_items,
                         &mut ns_data.fn_bodies,
@@ -3107,13 +3209,11 @@ fn compute_scoped_reachability(lib_rs: &str, items: &[OracleItemSpec]) -> Scoped
                     stage_ns.insert(mod_name, ns_data);
                 }
                 other => {
-                    if let syn::Item::Fn(func) = &other {
-                        root.top_level_fns.insert(func.sig.ident.to_string());
-                    }
                     root_items.push(other);
                 }
             }
         }
+        record_scope_defined_names(&root_items, &mut root);
         collect_fn_and_aux_items(
             &root_items,
             &mut root.fn_bodies,
@@ -3199,12 +3299,18 @@ fn compute_scoped_reachability(lib_rs: &str, items: &[OracleItemSpec]) -> Scoped
                             worklist.push(next);
                         }
                     }
-                } else if ns_graph.inherits_super
-                    && (root.fn_bodies.contains_key(&name) || root.aux_tokens.contains_key(&name))
-                {
-                    let root_node = (None, name);
-                    if !visited.contains(&root_node) {
-                        worklist.push(root_node);
+                }
+                if ns_graph.inherits_super {
+                    let inherits_root_val = !ns_graph.defined_value_names.contains(&name)
+                        && root.fn_bodies.contains_key(&name);
+                    let inherits_root_aux = !ns_graph.defined_type_names.contains(&name)
+                        && !ns_graph.defined_macro_names.contains(&name)
+                        && root.aux_tokens.contains_key(&name);
+                    if inherits_root_val || inherits_root_aux {
+                        let root_node = (None, name);
+                        if !visited.contains(&root_node) {
+                            worklist.push(root_node);
+                        }
                     }
                 }
             }
@@ -4003,7 +4109,12 @@ fn confirm_helper_module_suffixes(
                 .filter(|(_, s)| s == *suffix)
                 .any(|(short, _)| {
                     if let Some(self_ty) = matching_impl_self_ty(short, suffix) {
-                        return scope_aux.contains(&self_ty);
+                        let root_aux = scoped.reached_aux_by_scope.get(&None).unwrap_or(&empty_set);
+                        let reached_via_super = target_scope.is_some()
+                            && scope_graph.inherits_super
+                            && !scope_graph.defined_type_names.contains(&self_ty)
+                            && root_aux.contains(&self_ty);
+                        return scope_aux.contains(&self_ty) || reached_via_super;
                     }
                     let is_opaque = !scope_graph.fn_bodies.contains_key(short)
                         && !scope_graph.impl_method_names.contains(short);
@@ -6009,6 +6120,7 @@ fn discover_reproducer_candidate_fn(source: &str) -> Option<String> {
         for item in parsed.items {
             if let syn::Item::Fn(func) = item
                 && matches!(func.vis, syn::Visibility::Public(_))
+                && func.sig.asyncness.is_none()
                 && func.sig.inputs.is_empty()
                 && crate::mutators_miri::is_zero_arg_callable_generics(&func.sig.generics)
             {
@@ -13452,5 +13564,157 @@ pub fn cand_impl_b() -> u32 {
         );
         // `ns_uses_guard_pair` didn't even mention `SeedPair`! Verify touching `SeedPair` in ns links Drop:
         assert!(ns_drop_linked.is_empty());
+
+        // 11. `ep1-A3` regressions:
+        //     (a) `use` imports (`use core::mem::size_of;` repeated across candidates,
+        //         `use core::cell::UnsafeCell;` matching preamble, and conflicting
+        //         `use core::mem::align_of as size_of;`),
+        //     (b) `impl Uninit<LocalA> { fn clash(...) }` vs `impl Uninit<LocalB> { fn clash(...) }`,
+        //         `type PairAlias = PairU32; impl PairAlias` vs `impl PairU32`, and
+        //         `pub(crate) struct <cand.fn_name>` restricted-visibility blanking,
+        //     (c) `stage_ns_0` (`use super::*;`) type/value namespace split (`struct root_model_helper`
+        //         + calling `root_model_helper()`) and `impl RootGuardHolder` preserving
+        //         root `UnwindCleanupGuard` Drop reachability, and
+        //     (d) `discover_reproducer_candidate_fn` skipping `pub async fn`.
+        let use_cand_0_src = "\
+use core::mem::size_of;
+#[derive(Copy, Clone)]
+pub struct LocalA;
+impl Uninit<LocalA> {
+    fn clash(&self) -> u32 { 10u32 }
+}
+type PairAlias = PairU32;
+impl PairAlias {
+    fn alias_ext(&self) -> u32 { self.a }
+}
+pub fn cand_ep1_a3_0() -> u32 {
+    let u: Uninit<LocalA> = Uninit { value: LocalA };
+    let p = PairU32 { a: 2u32, b: 3u32 };
+    (size_of::<PairU32>() as u32) + u.clash() + p.alias_ext()
+}
+";
+        let use_cand_1_src = "\
+use core::mem::size_of;
+pub fn cand_ep1_a3_1() -> u32 {
+    size_of::<u32>() as u32
+}
+";
+        let use_cand_2_src = "\
+use core::cell::UnsafeCell;
+use core::mem::align_of as size_of;
+pub(crate) struct cand_ep1_a3_2 {
+    pub v: u32,
+}
+#[derive(Copy, Clone)]
+pub struct LocalB;
+impl Uninit<LocalB> {
+    fn clash(&self) -> u32 { 20u32 }
+}
+impl PairU32 {
+    fn alias_ext(&self) -> u32 { self.b }
+}
+pub fn cand_ep1_a3_2() -> u32 {
+    let c = UnsafeCell::new(1u32);
+    let _ = &c;
+    let s = cand_ep1_a3_2 { v: size_of::<u64>() as u32 };
+    let u: Uninit<LocalB> = Uninit { value: LocalB };
+    let p = PairU32 { a: 4u32, b: 5u32 };
+    s.v + u.clash() + p.alias_ext()
+}
+";
+        let ep1_a3_cands: Vec<GeneratedMiriCandidate> = [
+            (0usize, "cand_ep1_a3_0", use_cand_0_src),
+            (1usize, "cand_ep1_a3_1", use_cand_1_src),
+            (2usize, "cand_ep1_a3_2", use_cand_2_src),
+        ]
+        .into_iter()
+        .map(|(id, name, src)| GeneratedMiriCandidate {
+            id,
+            seed_index: 0,
+            seed_name: name.to_string(),
+            fn_name: name.to_string(),
+            seed_u64: id as u64 + 100,
+            applied_mutators: Vec::new(),
+            tracked_locals: Vec::new(),
+            fn_source: src.to_string(),
+            source: crate::mutators_miri::build_standalone_candidate_source(src),
+        })
+        .collect();
+        let a3_reserved: BTreeSet<String> = ep1_a3_cands.iter().map(|c| c.fn_name.clone()).collect();
+        let mut a3_staged = exact_prefix.clone();
+        let a3_repro_start = a3_staged.lines().count() as u32 + 1;
+        let mut a3_seen = seed_seen_staged_aux_from_preamble();
+        let mut a3_ns = 0usize;
+        for cand in &ep1_a3_cands {
+            let b_start = a3_staged.lines().count() as u32 + 1;
+            let (txt, _, _) = stage_candidate_source_for_batch_with_reserved(
+                cand,
+                b_start,
+                a3_repro_start,
+                &mut a3_seen,
+                &mut a3_ns,
+                &a3_reserved,
+            );
+            a3_staged.push_str(&txt);
+            a3_staged.push_str("\n\n");
+        }
+        assert!(
+            compile_rust_snippet("ep1_a3_use_uninit_alias_and_pub_crate", &a3_staged),
+            "ep1-A3 use + Uninit<Local> + type-alias impl + pub(crate) struct batch must compile:\n{a3_staged}"
+        );
+
+        let split_ns_src = format!(
+            "{exact_prefix}\n\
+             pub struct RootGuardHolder {{ pub g: UnwindCleanupGuard }}\n\
+             pub const __ANNEAL_MODEL_root_model_helper: &str = \"root_model_helper\";\n\
+             pub fn root_model_helper() -> u32 {{ 9u32 }}\n\
+             pub mod stage_ns_0 {{ use super::*;\n\
+             struct root_model_helper {{ pub a: u32 }}\n\
+             impl RootGuardHolder {{ fn ping(&self) -> u32 {{ 1u32 }} }}\n\
+             pub fn ns_split_entry() -> u32 {{\n\
+                 let _t = root_model_helper {{ a: 2u32 }};\n\
+                 let h = RootGuardHolder {{ g: UnwindCleanupGuard(3u32) }};\n\
+                 h.ping() + root_model_helper()\n\
+             }}\n\
+             }} pub use stage_ns_0::ns_split_entry;\n"
+        );
+        let split_pairs = vec![
+            (
+                "root_model_helper".to_string(),
+                "MiriDiffCorpus.root_model_helper".to_string(),
+            ),
+            (
+                "ping".to_string(),
+                "MiriDiffCorpus.stage_ns_0_RootGuardHolder_ping".to_string(),
+            ),
+            (
+                "drop".to_string(),
+                "MiriDiffCorpus._UnwindCleanupGuard_as_core_ops_Drop_drop".to_string(),
+            ),
+        ];
+        let split_helpers = vec![
+            "MiriDiffCorpus.root_model_helper".to_string(),
+            "MiriDiffCorpus.stage_ns_0_RootGuardHolder_ping".to_string(),
+            "MiriDiffCorpus._UnwindCleanupGuard_as_core_ops_Drop_drop".to_string(),
+        ];
+        let split_linked = confirm_helper_module_suffixes(
+            &split_ns_src,
+            "MiriDiffCorpus",
+            &split_pairs,
+            &split_helpers,
+            &[OracleItemSpec::with_fuel("ns_split_entry".to_string(), 200)],
+        );
+        assert_eq!(
+            split_linked, split_helpers,
+            "type-only shadowing and impl RootGuardHolder in stage_ns_0 must keep super fn + root Drop: {split_linked:?}"
+        );
+
+        assert_eq!(
+            discover_reproducer_candidate_fn(
+                "#![no_std]\npub fn real_sync_repro() -> u32 { 1 }\npub async fn trailing_async() -> u32 { 2 }\n"
+            )
+            .as_deref(),
+            Some("real_sync_repro")
+        );
     }
 }

@@ -1016,19 +1016,28 @@ fn target_entry_fn_index(
     };
     find_last(&|f| {
         matches!(f.vis, syn::Visibility::Public(_))
+            && f.sig.asyncness.is_none()
             && f.sig.inputs.is_empty()
             && is_zero_arg_callable_generics(&f.sig.generics)
     })
     .or_else(|| {
         find_last(&|f| {
             matches!(f.vis, syn::Visibility::Public(_))
+                && f.sig.asyncness.is_none()
                 && is_zero_arg_callable_generics(&f.sig.generics)
         })
     })
-    .or_else(|| find_last(&|f| matches!(f.vis, syn::Visibility::Public(_))))
     .or_else(|| {
-        find_last(&|f| f.sig.inputs.is_empty() && is_zero_arg_callable_generics(&f.sig.generics))
+        find_last(&|f| matches!(f.vis, syn::Visibility::Public(_)) && f.sig.asyncness.is_none())
     })
+    .or_else(|| {
+        find_last(&|f| {
+            f.sig.asyncness.is_none()
+                && f.sig.inputs.is_empty()
+                && is_zero_arg_callable_generics(&f.sig.generics)
+        })
+    })
+    .or_else(|| find_last(&|f| f.sig.asyncness.is_none()))
     .or_else(|| find_last(&|_| true))
 }
 
@@ -1069,6 +1078,7 @@ pub fn extract_closed_corpus_seeds(corpus_source: &str) -> Vec<MiriCorpusSeed> {
             }
             let name = func.sig.ident.to_string();
             if is_helper_fn_name_in_set(&name, &local_models)
+                || func.sig.asyncness.is_some()
                 || !func.sig.inputs.is_empty()
                 || !is_zero_arg_callable_generics(&func.sig.generics)
             {
@@ -5454,11 +5464,108 @@ impl MiriSeedDraw {
     }
 }
 
+pub(crate) fn collect_use_tree_bound_idents(
+    parent_ident: Option<&syn::Ident>,
+    tree: &syn::UseTree,
+    bound_idents: &mut Vec<String>,
+    glob_prefixes: &mut Vec<String>,
+) {
+    match tree {
+        syn::UseTree::Name(n) => {
+            if n.ident == "self" {
+                if let Some(p) = parent_ident {
+                    bound_idents.push(p.to_string());
+                }
+            } else {
+                bound_idents.push(n.ident.to_string());
+            }
+        }
+        syn::UseTree::Rename(r) => {
+            if r.rename != "_" {
+                bound_idents.push(r.rename.to_string());
+            }
+        }
+        syn::UseTree::Path(p) => {
+            collect_use_tree_bound_idents(Some(&p.ident), &p.tree, bound_idents, glob_prefixes);
+        }
+        syn::UseTree::Group(g) => {
+            for sub in &g.items {
+                collect_use_tree_bound_idents(parent_ident, sub, bound_idents, glob_prefixes);
+            }
+        }
+        syn::UseTree::Glob(_) => {
+            let pfx = parent_ident
+                .map(std::string::ToString::to_string)
+                .unwrap_or_default();
+            glob_prefixes.push(pfx);
+        }
+    }
+}
+
+fn prune_preamble_use_tree(
+    parent_ident: Option<&syn::Ident>,
+    tree: &syn::UseTree,
+    preamble_keys: &std::collections::BTreeSet<String>,
+) -> Option<syn::UseTree> {
+    let ident_conflicts_preamble = |id: &str| {
+        preamble_keys.contains(&format!("ty:{id}"))
+            || preamble_keys.contains(&format!("val:{id}"))
+            || preamble_keys.contains(&format!("mac:{id}"))
+    };
+    match tree {
+        syn::UseTree::Name(n) => {
+            let eff = if n.ident == "self" {
+                parent_ident.map(std::string::ToString::to_string)?
+            } else {
+                n.ident.to_string()
+            };
+            (!ident_conflicts_preamble(&eff)).then(|| syn::UseTree::Name(n.clone()))
+        }
+        syn::UseTree::Rename(r) => {
+            if r.rename != "_" && ident_conflicts_preamble(&r.rename.to_string()) {
+                None
+            } else {
+                Some(syn::UseTree::Rename(r.clone()))
+            }
+        }
+        syn::UseTree::Path(p) => prune_preamble_use_tree(Some(&p.ident), &p.tree, preamble_keys)
+            .map(|sub| {
+                syn::UseTree::Path(syn::UsePath {
+                    ident: p.ident.clone(),
+                    colon2_token: p.colon2_token,
+                    tree: Box::new(sub),
+                })
+            }),
+        syn::UseTree::Group(g) => {
+            let kept: Vec<syn::UseTree> = g
+                .items
+                .iter()
+                .filter_map(|sub| prune_preamble_use_tree(parent_ident, sub, preamble_keys))
+                .collect();
+            match kept.len() {
+                0 => None,
+                1 => kept.into_iter().next(),
+                _ => {
+                    let mut punct = syn::punctuated::Punctuated::new();
+                    for sub in kept {
+                        punct.push(sub);
+                    }
+                    Some(syn::UseTree::Group(syn::UseGroup {
+                        brace_token: g.brace_token,
+                        items: punct,
+                    }))
+                }
+            }
+        }
+        syn::UseTree::Glob(_) => Some(tree.clone()),
+    }
+}
+
 /// Rust namespace/coherence keys occupied by a top-level auxiliary item so
 /// `close_miri_seed` and multi-candidate crate staging detect both exact
 /// duplicates and cross-kind collisions (such as `struct Foo` vs `enum Foo` in
-/// the type namespace, or tuple/unit `struct S(u32)` vs `fn S()` / `const S` in
-/// the value namespace).
+/// the type namespace, tuple/unit `struct S(u32)` vs `fn S()` / `const S` in
+/// the value namespace, or `use` imports colliding with preamble/sibling items).
 pub(crate) fn aux_item_namespace_keys(item: &Item) -> Vec<String> {
     match item {
         Item::Fn(f) => vec![format!("val:{}", f.sig.ident)],
@@ -5487,6 +5594,21 @@ pub(crate) fn aux_item_namespace_keys(item: &Item) -> Vec<String> {
             .as_ref()
             .map(|id| vec![format!("mac:{id}")])
             .unwrap_or_default(),
+        Item::Use(u) => {
+            let mut bound = Vec::new();
+            let mut globs = Vec::new();
+            collect_use_tree_bound_idents(None, &u.tree, &mut bound, &mut globs);
+            let mut keys = Vec::with_capacity(bound.len() * 3 + globs.len());
+            for id in bound {
+                keys.push(format!("ty:{id}"));
+                keys.push(format!("val:{id}"));
+                keys.push(format!("mac:{id}"));
+            }
+            for g in globs {
+                keys.push(format!("use_glob:{g}"));
+            }
+            keys
+        }
         Item::Impl(im) => {
             let self_ty = im.self_ty.to_token_stream().to_string();
             if let Some((bang, trait_path, _)) = &im.trait_ {
@@ -5570,6 +5692,12 @@ fn close_miri_seed(
             }
             Item::Const(c) if c.ident == "_" => {
                 kept_items.push(Item::Const(c));
+            }
+            Item::Use(mut u) => {
+                if let Some(pruned) = prune_preamble_use_tree(None, &u.tree, preamble_keys) {
+                    u.tree = pruned;
+                    kept_items.push(Item::Use(u));
+                }
             }
             other => {
                 let keys = aux_item_namespace_keys(&other);
@@ -8509,6 +8637,48 @@ fn pass_named_private_helper() -> u32 { 1u32 }
                 cand.source
             );
         }
+
+        // Seeds with `use` imports (`use core::mem::{size_of, transmute};`) must
+        // prune redundant preamble imports (`transmute`) while preserving
+        // non-preamble imports (`size_of`), and `async fn` items must never be
+        // extracted as synchronous zero-arg corpus seeds or fallback candidates.
+        let use_and_async_seed = "\
+use core::mem::{size_of, transmute};
+pub fn pass_seed_with_use_import() -> u32 {
+    size_of::<PairU32>() as u32
+}
+pub async fn trailing_async_helper() -> u32 {
+    99u32
+}
+";
+        let use_batch = generate_miri_batch(&[use_and_async_seed], 2, 0xC16_A301);
+        assert_eq!(use_batch.len(), 2);
+        for cand in &use_batch {
+            assert_eq!(cand.seed_name, "pass_seed_with_use_import");
+            assert!(
+                cand.fn_source.contains("use core::mem::size_of;"),
+                "non-preamble `use` import dropped by close_miri_seed:\n{}",
+                cand.fn_source
+            );
+            assert!(
+                crate::miri_eval::compile_rust_snippet("use_import_cand", &cand.source),
+                "candidate with pruned `use` import failed rustc:\n{}",
+                cand.source
+            );
+        }
+        assert_eq!(
+            extract_closed_corpus_seeds(use_and_async_seed)
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>(),
+            vec!["pass_seed_with_use_import"]
+        );
+        assert_eq!(
+            discover_top_level_zero_arg_pub_fns_in_source_text(
+                "pub async fn rogue_async() {} pub fn sync_cand() { @@@ }"
+            ),
+            vec!["sync_cand"]
+        );
 
         // 2. `close_miri_seed` / `seeded_type_expr` must synthesize valid `FreezeAndCell`,
         //    `NonCopyU32`, `UnwindCleanupGuard`, and `UnsafeCell<u32>` arguments and

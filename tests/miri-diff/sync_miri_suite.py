@@ -476,6 +476,9 @@ def _mask_nested_blocks_and_attrs(clean_src: str) -> str:
 
 _TOP_PREFIX = r"(?:^|[;}])\s*"
 _FN_QUALS = r"(?:const\s+|unsafe\s+|extern(?:\s+(?:(?:b|c)?r#*)?\"[^\"]*\"#*)?\s+)*"
+_ANY_FN_QUALS = (
+    r"(?:const\s+|async\s+|unsafe\s+|extern(?:\s+(?:(?:b|c)?r#*)?\"[^\"]*\"#*)?\s+)*"
+)
 
 
 def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
@@ -561,8 +564,8 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
         for ident in re.findall(
             _TOP_PREFIX
             + r"(?:pub(?:\s*\([^)]*\))?\s+)?"
-            + _FN_QUALS
-            + r"(?:fn|const|static(?:\s+mut)?|struct|enum|union|type)\s+([A-Za-z0-9_]+)\b",
+            + _ANY_FN_QUALS
+            + r"(?:fn|const|static(?:\s+mut)?|struct|enum|union|type|trait|mod)\s+([A-Za-z0-9_]+)\b",
             top_lib_no_str,
         )
         if not ident.startswith("__ANNEAL_MODEL_")
@@ -643,7 +646,7 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
         for m in re.finditer(
             _TOP_PREFIX
             + r"(?:pub(?:\s*\([^)]*\))?\s+)?"
-            + _FN_QUALS
+            + _ANY_FN_QUALS
             + r"fn\s+([A-Za-z0-9_]+)\b",
             top_lib_no_str,
         )
@@ -653,7 +656,7 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
     if rogue_top_fns:
         raise ValueError(
             "corpus/src/lib.rs declares top-level functions (private, parameterized, "
-            "`pub(...)`, or generic) without `__ANNEAL_MODEL_*` markers: "
+            "`pub(...)`, `async`, or generic) without `__ANNEAL_MODEL_*` markers: "
             f"{rogue_top_fns}"
         )
 

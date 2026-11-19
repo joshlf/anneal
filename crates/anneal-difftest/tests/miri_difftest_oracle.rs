@@ -4345,7 +4345,8 @@ pub fn pass_c16_preamble_impl_a() -> u32 {
 }
 ";
     let preamble_impl_b_src = "\
-pub struct pass_c16_preamble_impl_b {
+use core::ptr::addr_of;
+pub(crate) struct pass_c16_preamble_impl_b {
     pub extra: u32,
 }
 impl PairU32 {
@@ -4360,7 +4361,8 @@ pub fn c16_scoped_ns_model(x: u32) -> u32 {
 pub fn pass_c16_preamble_impl_b() -> u32 {
     let local_s = pass_c16_preamble_impl_b { extra: 5u32 };
     let p = PairU32 { a: 10u32, b: 15u32 };
-    c16_scoped_ns_model(wrapping_add(p.c16_pair_score(), local_s.extra))
+    let extra_val: u32 = unsafe { *addr_of!(local_s.extra) };
+    c16_scoped_ns_model(wrapping_add(p.c16_pair_score(), extra_val))
 }
 ";
     multi_batch.push(handwritten_candidate(
