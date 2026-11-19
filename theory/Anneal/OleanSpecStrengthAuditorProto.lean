@@ -6,6 +6,7 @@ import Lean.Util.CollectAxioms
 import Lean.Compiler.ImplementedByAttr
 import Lean.Compiler.ExternAttr
 import Lean.Compiler.CSimpAttr
+import Lean.Compiler.IR.CompilerM
 import Trusted.VerificationResult
 
 /-!
@@ -99,11 +100,20 @@ structure AuditPolicy where
   fuelOverride? : Option Nat := none
   /-- Heartbeat budget for re-checking each provisionally accepted native-evaluation
       axiom `ax : e = true` (`recheckProvisionalNativeIO`). `e` is first evaluated by
-      `Meta.whnf` under this budget; only if that settles on a Bool literal is the
-      kernel asked to certify the result by reduction alone. A confirmed axiom no longer
-      depends on trusting the compiler, a refuted one is rejected, and an axiom that
-      cannot be decided within the budget stays provisional. `0` disables the re-check. -/
+      `Meta.whnf` (at `.all` transparency so `@[irreducible]` cannot block evaluation)
+      under this budget; only if that settles on a Bool literal is the kernel asked to
+      certify the result by reduction alone. A confirmed axiom no longer depends on
+      trusting the compiler, a refuted one is rejected, and an axiom that cannot be
+      decided within the budget stays provisional. `0` disables the re-check. -/
   nativeRecheckHeartbeats : Nat := 200000
+  /-- When `true` (or automatically whenever `allowProvisionalNative` is `true`), also
+      reject any ambient `unsafe` declaration, `@[implemented_by]`, `@[extern]`,
+      non-stdlib `@[csimp]`, or non-companion `_unsafe_rec` sibling anywhere in the
+      non-toolchain modules declaring reached non-stdlib constants (and their
+      non-toolchain transitive imports). This closes closed-section `@[local csimp]`
+      poisoning whose attribute entry is erased at `end` and whose target may be fully
+      inlined into compiled IR. -/
+  forbidAmbientModuleOverrides : Bool := false
   deriving Repr, Inhabited
 
 /-- Constructive policy forbidding `Classical.choice` (allowing only `propext` and `Quot.sound`). -/
@@ -469,9 +479,11 @@ def hasUnsafeRecComponent (n : Name) : Bool :=
 
 /-- Check whether `ci` is the Lean equation compiler's dead codegen-only `_unsafe_rec`
     companion for a safe, total, non-partial parent `defnInfo` in the same module
-    with matching kernel `type` and `levelParams`.
+    with matching kernel `type` and `levelParams`, and whose body actually contains a
+    recursive call to at least one `._unsafe_rec` constant (empirically true for 100% of
+    genuine equation-compiler companions, ruling out non-recursive metaprogram forgeries).
     Such companions are skipped during module inventory scans, but are ALWAYS rejected
-    if ever reached in any declaration's transitive closure. -/
+    if ever reached directly in a kernel dependency closure. -/
 def isCodegenUnsafeRec (env : Environment) (modName? : Option Name) (ci : ConstantInfo) : Bool :=
   if ci.isUnsafe || !ci.isPartial then false
   else
@@ -483,9 +495,18 @@ def isCodegenUnsafeRec (env : Environment) (modName? : Option Name) (ci : Consta
         else
           match parentCi with
           | .defnInfo _ =>
+            let callsUnsafeRec :=
+              match ci.value? (allowOpaque := true) with
+              | some val =>
+                val.getUsedConstantsAsSet.any fun d =>
+                  match d with
+                  | .str _ "_unsafe_rec" => true
+                  | _ => false
+              | none => false
             originModule? env parent == modName? &&
             ci.type == parentCi.type &&
-            ci.levelParams == parentCi.levelParams
+            ci.levelParams == parentCi.levelParams &&
+            callsUnsafeRec
           | _ => false
       | none => false
     | _ => false
@@ -852,6 +873,182 @@ def checkStatementOriginsInEnv (privEnv : Environment) (policy : AuditPolicy)
     (target : Name) (rootType : Expr) : Array AuditViolation :=
   (statementOriginWalk privEnv policy target rootType {}).1
 
+/-- Test whether module `m` belongs to the pinned Lean toolchain (`Init`, `Std`, `Lean`). -/
+private def isToolchainMod (m : Name) : Bool :=
+  isStdlibMod m || matchesRootPrefix m `Lean
+
+/-- Test whether a declaration name starts with a toolchain root (`Init`, `Std`, `Lean`),
+    used to avoid descending into toolchain-generated IR-only auxiliary functions. -/
+private def isToolchainDeclName (n : Name) : Bool :=
+  let root := Lean.privateToUserName n
+  matchesRootPrefix root `Init || matchesRootPrefix root `Std || matchesRootPrefix root `Lean
+
+/-- Extract all function callees (`fap`/`pap`) from a compiled `Lean.IR.Decl` using a
+    fuel-bounded iterative worklist (zero `partial`, zero `unsafe`). Returns
+    `(callees, isExternIr, fuelExhausted)`. -/
+private def irDeclCallees (d : Lean.IR.Decl) (fuel : Nat := 65536) : NameSet × Bool × Bool := Id.run do
+  match d with
+  | .extern .. => return ({}, true, false)
+  | .fdecl _ _ _ body _ =>
+    let mut stack : Array Lean.IR.FnBody := #[body]
+    let mut acc : NameSet := {}
+    for _ in [:fuel] do
+      if stack.isEmpty then
+        return (acc, false, false)
+      let cur := stack.back!
+      stack := stack.pop
+      match cur with
+      | .vdecl _ _ (.fap f _) b => acc := acc.insert f; stack := stack.push b
+      | .vdecl _ _ (.pap f _) b => acc := acc.insert f; stack := stack.push b
+      | .vdecl _ _ _ b => stack := stack.push b
+      | .jdecl _ _ v b => stack := stack.push b; stack := stack.push v
+      | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b | .sset _ _ _ _ _ b
+      | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => stack := stack.push b
+      | .case _ _ _ alts =>
+        for alt in alts do
+          match alt with
+          | .ctor _ b => stack := stack.push b
+          | .default b => stack := stack.push b
+      | _ => pure ()
+    return (acc, false, !stack.isEmpty)
+
+/-- Walk compiled IR (`Lean.IR.findEnvDecl`, available both in-process and on-disk under
+    `loadExts := false`) starting from `startDecl`, following IR-only non-toolchain
+    auxiliary functions (`_closed_*`, `_boxed`, `_redArg`, `_lambda_*`) transitively to
+    collect every reached kernel-level callee (and flag any non-toolchain IR `.extern`
+    callee or fuel exhaustion). Catches non-inlined `@[local csimp]` and IR-level
+    redirections invisible in kernel terms. -/
+private def collectIRCalleesForDecl (privEnv : Environment) (csimpIdx : CSimpIndex)
+    (rootTarget : Name) (startDecl : Name) (irVisited : NameSet) (fuel : Nat := 8192) :
+    Array Name × Array AuditViolation × NameSet := Id.run do
+  let kenv := privEnv.checked.get
+  let mut irSeen := irVisited
+  let mut irStack : Array Name := #[]
+  let mut kernelCallees : Array Name := #[]
+  let mut vs : Array AuditViolation := #[]
+  if !irSeen.contains startDecl then
+    irSeen := irSeen.insert startDecl
+    irStack := irStack.push startDecl
+  for _ in [:fuel] do
+    if irStack.isEmpty then
+      return (kernelCallees, vs, irSeen)
+    let cur := irStack.back!
+    irStack := irStack.pop
+    if let some irDecl := Lean.IR.findEnvDecl privEnv cur then
+      let (callees, isExt, exhausted) := irDeclCallees irDecl
+      if exhausted then
+        vs := pushUniqueViolation vs (.auditFuelExhausted rootTarget s!"IR body walk ({cur})")
+      if isExt && cur != startDecl && !((originModule? privEnv cur).any isToolchainMod) &&
+          !isToolchainDeclName cur then
+        vs := pushUniqueViolation vs
+          (.compilerOverrideAttribute rootTarget cur "ir_extern_callee"
+            s!"compiled IR of {startDecl} calls extern IR declaration {cur}")
+      for f in callees.toArray.qsort Name.lt do
+        match kenv.find? f with
+        | some fCi =>
+          let fMod? := originModule? privEnv f
+          let fIsTool := fMod?.any isToolchainMod
+          let fHasNonStdSibling := match kenv.find? (f.str "_unsafe_rec") with
+            | some _ => !((originModule? privEnv (f.str "_unsafe_rec")).any isStdlibMod)
+            | none => false
+          if !fIsTool || csimpIdx.fromToThm.contains f || fHasNonStdSibling then
+            let f' := match f with
+              | .str owner "_unsafe_rec" =>
+                if isCodegenUnsafeRec privEnv (originModule? privEnv owner) fCi then owner else f
+              | _ => f
+            kernelCallees := kernelCallees.push f'
+        | none =>
+          if !isToolchainDeclName f && !irSeen.contains f then
+            irSeen := irSeen.insert f
+            irStack := irStack.push f
+  if !irStack.isEmpty then
+    vs := pushUniqueViolation vs (.auditFuelExhausted rootTarget s!"IR callee walk ({startDecl})")
+  return (kernelCallees, vs, irSeen)
+
+/-- Scan all non-toolchain modules declaring any reached non-toolchain constant (and
+    their downward non-toolchain transitive imports, plus `kenv.constants.map₂` if any
+    local constant was reached) for ambient `unsafe` declarations, `@[implemented_by]`,
+    `@[extern]`, non-stdlib `@[csimp]`, or non-companion `_unsafe_rec` siblings.
+
+    Because `@[local csimp]` is erased when its `section` closes (leaving zero entries in
+    `CSimp.ext` on disk) and its target can be fully inlined into compiled IR, scanning
+    ambient non-toolchain modules closes the only way `@[local csimp]` can introduce a
+    compiled-vs.-kernel discrepancy. -/
+private def ambientModuleOverrideViolations (privEnv : Environment) (csimpIdx : CSimpIndex)
+    (repTarget : Name) (visited : NameSet) : Array AuditViolation := Id.run do
+  let kenv := privEnv.checked.get
+  let nMods := privEnv.header.moduleNames.size
+  let mut modIdxMap : Std.HashMap Name Nat := {}
+  for i in [:nMods] do
+    modIdxMap := modIdxMap.insert privEnv.header.moduleNames[i]! i
+  let mut activeMods := Array.replicate nMods false
+  let mut sawLocal := false
+  for n in visited.toArray do
+    match privEnv.getModuleIdxFor? n with
+    | none => sawLocal := true
+    | some idx =>
+      if idx.toNat < nMods then
+        let m := privEnv.header.moduleNames[idx.toNat]!
+        if !isToolchainMod m then
+          activeMods := activeMods.set! idx.toNat true
+  if sawLocal then
+    for imp in privEnv.header.imports do
+      if !isToolchainMod imp.module then
+        if let some j := modIdxMap[imp.module]? then
+          activeMods := activeMods.set! j true
+  -- Downward transitive closure over non-toolchain imports (bounded by `nMods`).
+  for _ in [:nMods] do
+    let mut changed := false
+    for i in [:nMods] do
+      if activeMods[i]! then
+        for imp in privEnv.header.moduleData[i]!.imports do
+          if !isToolchainMod imp.module then
+            if let some j := modIdxMap[imp.module]? then
+              if !activeMods[j]! then
+                activeMods := activeMods.set! j true
+                changed := true
+    if !changed then break
+  let mut vs : Array AuditViolation := #[]
+  let mut checked : NameSet := {}
+  let mut ambientDecls : Array (Name × ConstantInfo) := #[]
+  for i in [:nMods] do
+    if activeMods[i]! then
+      let mdata := privEnv.header.moduleData[i]!
+      for d in mdata.constNames do
+        if !checked.contains d then
+          if let some dCi := kenv.find? d then
+            checked := checked.insert d
+            ambientDecls := ambientDecls.push (d, dCi)
+      for d in mdata.extraConstNames do
+        if !checked.contains d then
+          if let some dCi := kenv.find? d then
+            checked := checked.insert d
+            ambientDecls := ambientDecls.push (d, dCi)
+  if sawLocal then
+    for (d, dCi) in kenv.constants.map₂.toList do
+      if !checked.contains d then
+        checked := checked.insert d
+        ambientDecls := ambientDecls.push (d, dCi)
+  for (d, dCi) in ambientDecls do
+    if dCi.isUnsafe then
+      vs := pushUniqueViolation vs
+        (.compilerOverrideAttribute repTarget d "ambient_unsafe"
+          s!"ambient unsafe declaration {d} in non-toolchain module closure can poison compiled code via local overrides")
+    let ovs := checkCompilerOverridesOnDecl privEnv csimpIdx repTarget d
+    for ov in ovs do
+      vs := pushUniqueViolation vs ov
+    if let .str owner "_unsafe_rec" := d then
+      let dMod? := originModule? privEnv d
+      if !(dMod?.any isStdlibMod) && !isCodegenUnsafeRec privEnv dMod? dCi then
+        let isOpaquePartial := match kenv.find? owner with
+          | some (.opaqueInfo _) => dCi.isPartial || dCi.isUnsafe
+          | _ => false
+        if !isOpaquePartial then
+          vs := pushUniqueViolation vs
+            (.compilerOverrideAttribute repTarget owner "ambient_unsafe_rec_sibling"
+              s!"ambient non-companion _unsafe_rec sibling {d} in non-toolchain module closure")
+  return vs
+
 /-- Audit a list of target declarations in a given `Environment` (pure total core,
     always inspecting `env.setExporting false` and `env.checked.get`).
     Uses an iterative, bounded $O(V + E)$ worklist (zero `partial`, zero `unsafe`,
@@ -872,6 +1069,7 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
   let mut provisional : NameSet := {}
   let mut pending : Array (Name × Name) := #[]
   let mut visited : NameSet := {}
+  let mut irVisited : NameSet := {}
   let mut stmtSeen : NameSet := {}
   let fuel := auditFuel privEnv policy targets.size
   if privEnv.header.isModule then
@@ -930,43 +1128,77 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
         if !visited.contains d then
           visited := visited.insert d
           pending := pending.push (rootTarget, d)
+      -- Compiled IR callee audit: catches non-inlined `@[local csimp]` and IR-level
+      -- redirections whose callees never appear in kernel terms.
+      if policy.checkCompilerOverrides && !(modName?.any isToolchainMod) then
+        let (irCallees, irVs, irVisited') :=
+          collectIRCalleesForDecl privEnv csimpIdx rootTarget n irVisited
+        irVisited := irVisited'
+        violations := irVs.foldl pushUniqueViolation violations
+        for d in irCallees do
+          if !visited.contains d then
+            visited := visited.insert d
+            pending := pending.push (rootTarget, d)
       -- Name-based compiler override. Lean's code generator compiles `n` from a sibling
-      -- constant `n._unsafe_rec` whenever one exists, with no attribute involved, so a
-      -- plain `def foo._unsafe_rec` declared before `def foo` silently replaces the
-      -- compiled code of `foo`. The kernel closure never reaches such a sibling, so it is
-      -- looked up explicitly. A sibling that is not shaped like an equation-compiler
-      -- companion is a compiler override; a companion-shaped one is the code that
-      -- actually runs, so its dependencies are audited like those of `n` itself.
-      -- (`.opaqueInfo` parents are `partial def`s, reported by `detectPartialOrUnsafeRec`.)
-      if policy.checkCompilerOverrides && !(modName?.any isStdlibMod) then
+      -- constant `n._unsafe_rec` whenever one exists, with no attribute involved. Check
+      -- EVERY reached `n` (including stdlib `n`, guarding on the *sibling's* origin
+      -- module so user-declared `<StdlibFn>._unsafe_rec` is caught!). Only skip `.opaqueInfo`
+      -- parents when `recCi` is partial/unsafe (already reported by `detectPartialOrUnsafeRec`);
+      -- a safe `def foo._unsafe_rec` next to `opaque foo` is an override. For companion-shaped
+      -- siblings, audit compiler override attributes on `recName` itself, its compiled IR,
+      -- and its kernel dependencies.
+      if policy.checkCompilerOverrides then
         let recName := n.str "_unsafe_rec"
         if let some recCi := kenv.find? recName then
-          let parentIsOpaque := match ci with
-            | .opaqueInfo _ => true
-            | _ => false
-          if !parentIsOpaque then
-            if isCodegenUnsafeRec privEnv modName? recCi then
+          let recMod? := originModule? privEnv recName
+          if !(recMod?.any isStdlibMod) then
+            let handledByOpaquePartial := match ci with
+              | .opaqueInfo _ => recCi.isPartial || recCi.isUnsafe
+              | _ => false
+            if !handledByOpaquePartial then
+              if policy.forbidPartialAndUnsafe && recCi.isUnsafe then
+                violations := pushUniqueViolation violations
+                  (.unsafeDeclaration rootTarget recName recMod?)
+              let recOvs := checkCompilerOverridesOnDecl privEnv csimpIdx rootTarget recName
+              violations := recOvs.foldl pushUniqueViolation violations
+              if !isCodegenUnsafeRec privEnv modName? recCi then
+                violations := pushUniqueViolation violations
+                  (.compilerOverrideAttribute rootTarget n "unsafe_rec_sibling"
+                    s!"compiled code for {n} is taken from sibling {recName}, which is not an equation-compiler companion ({constantInfoKind recCi}, partial={recCi.isPartial}, unsafe={recCi.isUnsafe})")
               let (recEdges, recOpenVs) := declarationEdges rootTarget recCi
               violations := recOpenVs.foldl pushUniqueViolation violations
               for d in recEdges.toArray.qsort Name.lt do
-                -- Companions of the same recursion group are audited through their owners.
-                let d' := match d with
-                  | .str owner "_unsafe_rec" =>
-                    match kenv.find? d with
-                    | some dCi =>
-                      if isCodegenUnsafeRec privEnv (originModule? privEnv owner) dCi then owner else d
-                    | none => d
-                  | _ => d
-                if !visited.contains d' then
-                  visited := visited.insert d'
-                  pending := pending.push (rootTarget, d')
-            else
-              violations := pushUniqueViolation violations
-                (.compilerOverrideAttribute rootTarget n "unsafe_rec_sibling"
-                  s!"compiled code for {n} is taken from sibling {recName}, which is not an equation-compiler companion ({constantInfoKind recCi}, partial={recCi.isPartial}, unsafe={recCi.isUnsafe})")
+                if d != recName then
+                  -- Companions of the same recursion group are audited through their owners.
+                  let d' := match d with
+                    | .str owner "_unsafe_rec" =>
+                      match kenv.find? d with
+                      | some dCi =>
+                        if isCodegenUnsafeRec privEnv (originModule? privEnv owner) dCi then owner else d
+                      | none => d
+                    | _ => d
+                  if !visited.contains d' then
+                    visited := visited.insert d'
+                    pending := pending.push (rootTarget, d')
+              let (recIrCallees, recIrVs, irVisited') :=
+                collectIRCalleesForDecl privEnv csimpIdx rootTarget recName irVisited
+              irVisited := irVisited'
+              violations := recIrVs.foldl pushUniqueViolation violations
+              for d in recIrCallees do
+                if d != recName && !visited.contains d then
+                  visited := visited.insert d
+                  pending := pending.push (rootTarget, d)
   if !pending.isEmpty then
     violations := pushUniqueViolation violations
       (.auditFuelExhausted (targets[0]?.getD .anonymous) "kernel dependency closure")
+  -- Ambient non-toolchain module override scan (enabled explicitly via
+  -- `policy.forbidAmbientModuleOverrides` or automatically whenever
+  -- `policy.allowProvisionalNative` allows compiled code to affect proof soundness).
+  if policy.checkCompilerOverrides &&
+      (policy.forbidAmbientModuleOverrides || policy.allowProvisionalNative) &&
+      !targets.isEmpty then
+    let ambVs := ambientModuleOverrideViolations privEnv csimpIdx targets[0]! visited
+    violations := ambVs.foldl pushUniqueViolation violations
   -- Cross-check against `Lean.collectAxioms` in `env.setExporting false`.
   if policy.crossCheckCollectAxioms then
     if targets.size <= 32 then
@@ -1008,30 +1240,50 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
   else
     return .rejected violations stats
 
+/-- Choose a throw-away theorem name guaranteed absent from `kenv` so a hostile user
+    declaration cannot collide with the re-check name and force `addDeclCore` to fail
+    with `.alreadyDeclared`. -/
+private def freshRecheckName (privEnv : Environment) (axName : Name) (rhs : Bool) : Name := Id.run do
+  let kenv := privEnv.checked.get
+  let suffix := if rhs then "true" else "false"
+  let base := (axName.str "_kernel_recheck").str suffix
+  if (kenv.find? base).isNone then
+    return base
+  let bound :=
+    privEnv.header.moduleData.foldl (init := 250000) (fun acc d => acc + d.constants.size) +
+    kenv.constants.map₂.toList.length + 4
+  for i in [:bound] do
+    let cand := base.num i
+    if (kenv.find? cand).isNone then
+      return cand
+  return base.str "_fallback"
+
 /-- Ask the kernel whether the Bool expression `e` of the native-evaluation axiom
     `axName : e = true` reduces to `rhs`, by type-checking `Eq.refl rhs : e = rhs` as a
-    throw-away theorem. `maxHeartbeats` is the kernel's absolute per-thread heartbeat
-    threshold; exceeding it (or any other kernel failure) yields `false`. Nothing is
-    added to `privEnv`. -/
+    throw-away theorem under a guaranteed-fresh name. `maxHeartbeats` is the kernel's
+    absolute per-thread heartbeat threshold; exceeding it (or any other kernel failure)
+    yields `false`. Nothing is added to `privEnv`. -/
 def kernelProvesNativeEq (privEnv : Environment) (axName : Name) (ci : ConstantInfo)
     (rhs : Bool) (maxHeartbeats : Nat) : Bool :=
   match ci.type with
   | .app (.app (.app (.const ``Eq [lvl]) boolTy) e) _ =>
+    let kenv := privEnv.checked.get
     let rhsExpr := if rhs then mkConst ``Bool.true else mkConst ``Bool.false
     let decl := Declaration.thmDecl {
-      name := (axName.str "_kernel_recheck").str (if rhs then "true" else "false")
+      name := freshRecheckName privEnv axName rhs
       levelParams := ci.levelParams
       type := mkApp3 (mkConst ``Eq [lvl]) boolTy e rhsExpr
       value := mkApp2 (mkConst ``Eq.refl [lvl]) boolTy rhsExpr
     }
-    match privEnv.checked.get.addDeclCore maxHeartbeats.toUSize 512 decl none with
+    match kenv.addDeclCore maxHeartbeats.toUSize 512 decl none with
     | .ok _ => true
     | .error _ => false
   | _ => false
 
-/-- Evaluate the closed Bool expression `e` with `Meta.whnf` under a heartbeat budget.
-    Returns `some b` when `e` weak-head-reduces to the literal `b`, and `none` on
-    timeout, on any elaborator exception, or when reduction gets stuck.
+/-- Evaluate the closed Bool expression `e` with `Meta.withTransparency .all (Meta.whnf e)`
+    under a heartbeat budget (unfolding `@[irreducible]` definitions just like Lean's
+    kernel does). Returns `some b` when `e` weak-head-reduces to the literal `b`, and
+    `none` on timeout, on any elaborator exception, or when reduction gets stuck.
 
     The kernel only polls its heartbeat threshold at coarse intervals (measured: a
     unary recursion over a `10^8` literal ran for seconds past a small threshold), so
@@ -1048,7 +1300,7 @@ def boundedEvalBoolIO (privEnv : Environment) (e : Expr) (maxHeartbeats : Nat) :
   }
   let coreState : Core.State := { env := privEnv }
   let act : MetaM (Option Bool) := do
-    let r ← Meta.whnf e
+    let r ← Meta.withTransparency .all <| Meta.whnf e
     if r.isConstOf ``Bool.true then return some true
     else if r.isConstOf ``Bool.false then return some false
     else return none
@@ -1255,14 +1507,14 @@ def checkModuleProvenanceIO (moduleNames : Array Name)
         | some d => some (some d, "the pinned toolchain library directory")
         | none => some (none, s!"pinned toolchain library directory does not exist: {libDir}")
       else
-        match trustRoots.find? (matchesRootPrefix m ·) with
-        | none => none
-        | some r =>
-          match pinnedReal.find? (·.1 == r) with
-          | some (_, some d) => some (some d, s!"the directory pinned for module root {r}")
-          | some (_, none) =>
-            some (none, s!"pinned directory for module root {r} does not exist")
-          | none =>
+        match pinnedReal.find? (fun (r, _) => matchesRootPrefix m r) with
+        | some (r, some d) => some (some d, s!"the directory pinned for module root {r}")
+        | some (r, none) =>
+          some (none, s!"pinned directory for module root {r} does not exist")
+        | none =>
+          match trustRoots.find? (matchesRootPrefix m ·) with
+          | none => none
+          | some r =>
             some (none, s!"module root {r} carries trust but has no pinnedModuleRoots entry")
     match expected? with
     | none => pure ()
@@ -1298,15 +1550,20 @@ def checkModuleProvenanceIO (moduleNames : Array Name)
                   s!"artifact directory resolves outside {why}")
         -- 2. Verify the `.olean` file itself AND every existing companion part
         --    (`.olean.server`, `.olean.private`, `.ir.sig`, `.ir`) resolve via `realPath`
-        --    inside `dir` (blocking split-artifact symlink attacks).
-        let parts : Array (String × System.FilePath) := #[
-          ("olean", p),
-          ("olean.server", OLeanLevel.server.adjustFileName p),
-          ("olean.private", OLeanLevel.private.adjustFileName p),
-          ("ir.sig", p.withExtension "ir.sig"),
-          ("ir", p.withExtension "ir")
+        --    to the exact expected file path denoted by module `m` inside `dir` (blocking
+        --    both split-artifact symlinks outside `dir` and intra-root module/companion
+        --    aliasing via symlinked directories or companion files).
+        let expectedOlean := Lean.modToFilePath dir m "olean"
+        let parts : Array (String × System.FilePath × System.FilePath) := #[
+          ("olean", p, expectedOlean),
+          ("olean.server", OLeanLevel.server.adjustFileName p,
+            OLeanLevel.server.adjustFileName expectedOlean),
+          ("olean.private", OLeanLevel.private.adjustFileName p,
+            OLeanLevel.private.adjustFileName expectedOlean),
+          ("ir.sig", p.withExtension "ir.sig", expectedOlean.withExtension "ir.sig"),
+          ("ir", p.withExtension "ir", expectedOlean.withExtension "ir")
         ]
-        for (partLabel, partPath) in parts do
+        for (partLabel, partPath, expectedPart) in parts do
           let mustExist := partLabel == "olean"
           let existsNow ← partPath.pathExists
           if mustExist || existsNow then
@@ -1320,14 +1577,10 @@ def checkModuleProvenanceIO (moduleNames : Array Name)
                 violations := pushUniqueViolation violations
                   (.moduleProvenanceSpoofed m partPath.toString
                     s!"{partLabel} artifact resolves outside {why}")
-              -- The resolved `.olean` must be the file that *this* module name denotes
-              -- inside the pinned directory. A symlinked directory can otherwise alias
-              -- one genuine module under another trusted name (`Std/Alias` pointing at
-              -- the toolchain's `Lean/Meta`), relabelling its declarations as stdlib.
-              if partLabel == "olean" && partReal != Lean.modToFilePath dir m "olean" then
+              if partReal != expectedPart then
                 violations := pushUniqueViolation violations
                   (.moduleProvenanceSpoofed m partPath.toString
-                    s!"resolves to a different module's artifact inside {why}")
+                    s!"{partLabel} artifact resolves to a different module's artifact inside {why}")
   return violations
 
 /-- Run a computation with `extraSearchPaths` temporarily prepended to `Lean.searchPathRef`,
@@ -1931,6 +2184,19 @@ structure ModularDeterministicSpecCert
     (fun (p : List Value × Memory) => pre p.1 p.2)
     (fun (p : List Value × Memory) (r : Value × Memory) => post p.1 p.2 r.1 r.2)
 
+/-- Constructive direct input-sensitivity specification-strength certificate for a
+    modular rely–guarantee contract `(envAssumed, pre, post)`: pairs a non-vacuous
+    external-call handler witness with an `InputSensitiveSpecCert` over `(pre, post)`. -/
+structure ModularInputSensitiveSpecCert
+    (envAssumed : ExternalCallHandler → Prop)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) : Type where
+  handler : ExternalCallHandler
+  handler_valid : envAssumed handler
+  cert : InputSensitiveSpecCert
+    (fun (p : List Value × Memory) => pre p.1 p.2)
+    (fun (p : List Value × Memory) (r : Value × Memory) => post p.1 p.2 r.1 r.2)
+
 /-- A modular contract with vacuous rely predicate `envAssumed := fun _ => False`
     can never admit a `ModularSpecStrengthCert`. -/
 theorem no_modular_cert_of_vacuous_envAssumed
@@ -1938,6 +2204,36 @@ theorem no_modular_cert_of_vacuous_envAssumed
     (post : List Value → Memory → Value → Memory → Prop) :
     ModularSpecStrengthCert (fun _ => False) pre post → False :=
   fun c => c.handler_valid
+
+/-- A modular contract with vacuous rely predicate `envAssumed := fun _ => False`
+    can never admit a `ModularInputSensitiveSpecCert`. -/
+theorem no_modular_input_sensitive_cert_of_vacuous_envAssumed
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) :
+    ModularInputSensitiveSpecCert (fun _ => False) pre post → False :=
+  fun c => c.handler_valid
+
+/-- A modular contract whose precondition holds on at most one `(args, mem)` input
+    can never admit a `ModularInputSensitiveSpecCert`. -/
+theorem no_modular_input_sensitive_cert_of_singleton_req
+    (envAssumed : ExternalCallHandler → Prop)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (hSingle : ∀ a₁ m₁ a₂ m₂, pre a₁ m₁ → pre a₂ m₂ → (a₁, m₁) = (a₂, m₂)) :
+    ModularInputSensitiveSpecCert envAssumed pre post → False :=
+  fun c => no_input_sensitive_cert_of_singleton_req
+    (fun p p' h1 h2 => hSingle p.1 p.2 p'.1 p'.2 h1 h2) c.cert
+
+/-- A modular contract whose postcondition ignores the input can never admit a
+    `ModularInputSensitiveSpecCert`. -/
+theorem no_modular_input_sensitive_cert_of_input_independent_ens
+    (envAssumed : ExternalCallHandler → Prop)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (hIndep : ∀ a₁ m₁ a₂ m₂ r m', pre a₁ m₁ → pre a₂ m₂ → post a₁ m₁ r m' → post a₂ m₂ r m') :
+    ModularInputSensitiveSpecCert envAssumed pre post → False :=
+  fun c => no_input_sensitive_cert_of_input_independent_ens
+    (fun p p' r h1 h2 hPost => hIndep p.1 p.2 p'.1 p'.2 r.1 r.2 h1 h2 hPost) c.cert
 
 /-- A modular contract with vacuous precondition `pre := fun _ _ => False`
     can never admit a `ModularSpecStrengthCert`. -/
@@ -1969,7 +2265,8 @@ private def directCertHeads : Array Name := #[
 private def directModularCertHeads : Array Name := #[
   ``ModularSpecStrengthCert,
   ``ModularMultiMutantSpecCert,
-  ``ModularDeterministicSpecCert
+  ``ModularDeterministicSpecCert,
+  ``ModularInputSensitiveSpecCert
 ]
 
 /-- Certificate typeclass heads paired with the specification class they certify. -/
@@ -3342,6 +3639,18 @@ def fuchsiaUsercopyCopyinInputSensitive :
     injection hF0 with hS
     injection hS with hBits _
     exact Nat.noConfusion hBits
+
+/-- Direct claim-bound input-sensitivity certificate for `ModularVerificationResult`
+    of `fuchsia_usercopy::usercopy_copyin_bracketed` (constructive: `[propext, Quot.sound]`
+    via `Trusted.ITree.ret`, zero `Classical.choice`). -/
+def fuchsiaUsercopyCopyinModularDirectInputSensitiveCert :
+    ModularInputSensitiveSpecCert
+      fuchsiaHermeticCopyRely
+      fuchsiaUsercopyCopyinPre
+      fuchsiaUsercopyCopyinPost where
+  handler := fuchsiaHermeticCopyWitnessHandler
+  handler_valid := fuchsiaHermeticCopyWitnessHandler_valid
+  cert := fuchsiaUsercopyCopyinInputSensitive
 
 /-! ### Diagnostic Contrast: Weak Upper-Bound-Only Spec (`weak_vmo_subslice_upper_bound_only`) -/
 

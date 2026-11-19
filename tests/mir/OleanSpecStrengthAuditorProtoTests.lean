@@ -61,6 +61,36 @@ elab "proto_forge_unsafe_rec_companion " parent:ident " : " ty:term " := " val:t
       hints := ReducibilityHints.«opaque», safety := DefinitionSafety.«partial», all := [n] }
     addDecl (Declaration.mutualDefnDecl [defn])
 
+/-- Test-only command declaring a *self-recursive* `partial`-safety `<parent>._unsafe_rec : Nat → Nat`
+    companion (`fun n => cond true (body n) (<parent>._unsafe_rec n)`), exercising the
+    strictly narrowed Residual 1b shape and companion-level attribute/axiom auditing. -/
+elab "proto_forge_self_rec_companion " parent:ident " := " body:term : command => do
+  liftTermElabM do
+    let natTy := mkConst ``Nat
+    let fnTy := mkForall `n .default natTy natTy
+    let bodyE ← instantiateMVars (← Term.elabTermEnsuringType body fnTy)
+    Term.synthesizeSyntheticMVarsNoPostponing
+    let bodyE ← instantiateMVars bodyE
+    let n := parent.getId.str "_unsafe_rec"
+    let recVal := mkLambda `n .default natTy <|
+      mkApp4 (mkConst ``Bool.rec [Level.succ Level.zero])
+        (mkLambda `_ .default (mkConst ``Bool) natTy)
+        (mkApp (mkConst n) (mkBVar 0))
+        (mkApp bodyE (mkBVar 0))
+        (mkConst ``Bool.true)
+    let defn : DefinitionVal := {
+      name := n, levelParams := [], type := fnTy, value := recVal,
+      hints := ReducibilityHints.«opaque», safety := DefinitionSafety.«partial», all := [n] }
+    addDecl (Declaration.mutualDefnDecl [defn])
+
+/-- Test-only command attaching `@[implemented_by imp]` directly via `Lean.Compiler.setImplementedBy`
+    (used to test `@[implemented_by]` placed on a forged `_unsafe_rec` companion). -/
+elab "proto_set_implemented_by " target:ident imp:ident : command => do
+  let env ← getEnv
+  match Lean.Compiler.setImplementedBy env target.getId imp.getId with
+  | .ok env' => setEnv env'
+  | .error msg => throwError "proto_set_implemented_by failed: {msg}"
+
 /-! ## Helper: Sandboxed Elaboration & Deterministic Receipt Formatting -/
 
 /-- Elaborate Lean source code against a copy of the live `Environment` without
@@ -1037,8 +1067,8 @@ run_cmd do
 info: S1_unsafe_rec_sibling_override: rejected [compilerOverrideAttribute]
 S1_unsafe_rec_sibling_false_proof_provisional: rejected [compilerOverrideAttribute, unapprovedAxiom]
 S1_genuine_recursion_companions: ok []
-S1_forged_companion_hides_axiom: rejected [unapprovedAxiom]
-S1_forged_companion_shape_residual: ok []
+S1_forged_companion_hides_axiom: rejected [compilerOverrideAttribute, unapprovedAxiom]
+S1_forged_companion_shape_residual: rejected [compilerOverrideAttribute]
 S2_native_not_true_forged: rejected [unapprovedAxiom]
 S2_native_expensive_forged_stays_provisional: ok [] provisionalNative=1 kernelConfirmed=0
 S2_native_recheck_disabled: ok [] provisionalNative=1 kernelConfirmed=0
@@ -1191,6 +1221,171 @@ run_cmd do
     [ formatVerdictTags "S5_input_sensitive_cert_bound" vSensitive
     , formatVerdictTags "S5_input_sensitive_cert_claim_bound" vSensitiveClaim
     , formatVerdictTags "S5_input_sensitive_cert_wrong_spec" vSensitiveWrong ]
+  logInfo (String.intercalate "\n" lines)
+
+/-! ## Pass A2 Hardening Regressions: Recheck Sabotage, Stdlib/Opaque/Companion `_unsafe_rec`, `@[local csimp]` IR & Ambient Overrides, Modular Input Sensitivity -/
+
+/-- Type-level refutation: vacuous rely blocks `ModularInputSensitiveSpecCert`. -/
+theorem testA2_modular_vacuous_rely_input_sensitive_refuted :
+    ModularInputSensitiveSpecCert (fun _ => False) fuchsiaUsercopyCopyinPre fuchsiaUsercopyCopyinPost → False :=
+  no_modular_input_sensitive_cert_of_vacuous_envAssumed _ _
+
+/-- Type-level refutation: singleton precondition blocks `ModularInputSensitiveSpecCert`. -/
+theorem testA2_modular_singleton_input_sensitive_refuted :
+    ModularInputSensitiveSpecCert fuchsiaHermeticCopyRely
+      (fun args mem => args = [] ∧ mem = emptyMemory)
+      fuchsiaUsercopyCopyinPost → False :=
+  no_modular_input_sensitive_cert_of_singleton_req _ _ _ (by
+    intro a1 m1 a2 m2 ⟨ha1, hm1⟩ ⟨ha2, hm2⟩
+    subst ha1; subst hm1; subst ha2; subst hm2; rfl)
+
+/--
+info: A2_1a_recheck_name_collision: rejected [unapprovedAxiom]
+A2_1b_irreducible_native_recheck: rejected [unapprovedAxiom]
+A2_2a_stdlib_unsafe_rec_sibling: rejected [compilerOverrideAttribute]
+A2_2b_companion_implemented_by: rejected [compilerOverrideAttribute]
+A2_2c_self_rec_companion_hides_axiom: rejected [unapprovedAxiom]
+A2_2c_self_rec_companion_residual: ok []
+A2_3_opaque_safe_unsafe_rec_sibling: rejected [compilerOverrideAttribute]
+A2_9a_local_csimp_noinline_ir_caught: rejected [unsafeDeclaration]
+A2_9b_local_csimp_inlined_slow_native_caught: rejected [compilerOverrideAttribute]
+A2_4b_modular_input_sensitive_claim_bound: ok []
+A2_4b_modular_input_sensitive_wrong_rely: rejected [specStrengthCertInvalidType]
+-/
+#guard_msgs in
+run_cmd do
+  let strict : AuditPolicy := { checkStatementOrigin := false }
+  let prov : AuditPolicy := { checkStatementOrigin := false, allowProvisionalNative := true }
+  let mut lines : List String := []
+  let kw := "sor" ++ "ry"
+
+  -- A2-1a: pre-declaring `<axName>._kernel_recheck.false` used to trigger `.alreadyDeclared`
+  -- inside `kernelProvesNativeEq`, keeping a provably-false axiom provisional (`ok`).
+  let env1a ← elabInSandbox <|
+    "def a2c._native.native_decide.ax_1_1._kernel_recheck.false : Unit := ()\n" ++
+    "axiom a2c._native.native_decide.ax_1_1 : (!true) = true\n" ++
+    "theorem a2cThm : False := Bool.noConfusion a2c._native.native_decide.ax_1_1\n"
+  let v1a ← liftIO <| auditDeclsInEnvIO env1a #[`a2cThm] prov
+  liftIO <| assertRejectedWithTag "A2_1a_recheck_name_collision" v1a "unapprovedAxiom"
+  lines := lines ++ [formatVerdictTags "A2_1a_recheck_name_collision" v1a]
+
+  -- A2-1b: `@[irreducible]` def returning `false` used to stall `Meta.whnf` at default
+  -- transparency, bypassing `kernelProvesNativeEq` (`ok`).
+  let env1b ← elabInSandbox <|
+    "@[irreducible] def a2IrredFalse : Bool := false\n" ++
+    "axiom a2ir._native.native_decide.ax_1_1 : a2IrredFalse = true\n" ++
+    "theorem a2irThm : False := by\n" ++
+    "  have h1 : a2IrredFalse = false := by unfold a2IrredFalse; rfl\n" ++
+    "  have h2 := a2ir._native.native_decide.ax_1_1\n" ++
+    "  rw [h1] at h2; exact Bool.noConfusion h2\n"
+  let v1b ← liftIO <| auditDeclsInEnvIO env1b #[`a2irThm] prov
+  liftIO <| assertRejectedWithTag "A2_1b_irreducible_native_recheck" v1b "unapprovedAxiom"
+  lines := lines ++ [formatVerdictTags "A2_1b_irreducible_native_recheck" v1b]
+
+  -- A2-2a: user-declared `<StdlibFn>._unsafe_rec` used to be skipped because the parent
+  -- (`Bool.xor`) lives in stdlib.
+  let env2a ← elabInSandbox <|
+    "def Bool.xor._unsafe_rec (_a _b : Bool) : Bool := true\n" ++
+    "theorem a2StdSib : Bool.xor false false = false := rfl\n"
+  let v2a ← liftIO <| auditDeclsInEnvIO env2a #[`a2StdSib] strict
+  liftIO <| assertRejectedWithTag "A2_2a_stdlib_unsafe_rec_sibling" v2a "compilerOverrideAttribute"
+  lines := lines ++ [formatVerdictTags "A2_2a_stdlib_unsafe_rec_sibling" v2a]
+
+  -- A2-2b: `@[implemented_by]` attached to a self-recursive companion-shaped `_unsafe_rec`
+  -- used to be missed because `checkCompilerOverridesOnDecl` never ran on `recName`.
+  let env2b ← elabInSandbox <|
+    "def a2CompEvil (n : Nat) : Nat := n + 99\n" ++
+    "def a2CompSafe (n : Nat) : Nat := n\n" ++
+    "proto_forge_self_rec_companion a2CompSafe := fun n => n\n" ++
+    "proto_set_implemented_by a2CompSafe._unsafe_rec a2CompEvil\n" ++
+    "theorem a2CompThm : a2CompSafe 1 = 1 := rfl\n"
+  let v2b ← liftIO <| auditDeclsInEnvIO env2b #[`a2CompThm] strict
+  liftIO <| assertRejectedWithTag "A2_2b_companion_implemented_by" v2b "compilerOverrideAttribute"
+  lines := lines ++ [formatVerdictTags "A2_2b_companion_implemented_by" v2b]
+
+  -- A2-2c: non-recursive forged companions are now killed (see updated `S1_forged_companion_*`
+  -- above); a *self-recursive* forged companion hiding an axiom is still rejected, while a
+  -- clean self-recursive forged companion pins the strictly narrowed Residual 1b.
+  let env2c ← elabInSandbox <|
+    "axiom a2Hidden : Nat\n" ++
+    "def a2RecAx (n : Nat) : Nat := n\n" ++
+    "proto_forge_self_rec_companion a2RecAx := fun n => n + a2Hidden\n" ++
+    "theorem a2RecAxThm : a2RecAx 1 = 1 := rfl\n" ++
+    "def a2RecClean (n : Nat) : Nat := n\n" ++
+    "proto_forge_self_rec_companion a2RecClean := fun n => n + 1\n" ++
+    "theorem a2RecCleanThm : a2RecClean 1 = 1 := rfl\n"
+  let v2cAx ← liftIO <| auditDeclsInEnvIO env2c #[`a2RecAxThm] strict
+  let v2cClean ← liftIO <| auditDeclsInEnvIO env2c #[`a2RecCleanThm] strict
+  liftIO <| assertRejectedWithTag "A2_2c_self_rec_companion_hides_axiom" v2cAx "unapprovedAxiom"
+  liftIO <| assertAuditOk "A2_2c_self_rec_companion_residual" v2cClean
+  lines := lines ++
+    [ formatVerdictTags "A2_2c_self_rec_companion_hides_axiom" v2cAx
+    , formatVerdictTags "A2_2c_self_rec_companion_residual" v2cClean ]
+
+  -- A2-3: non-partial `opaque` with a safe (non-partial) `_unsafe_rec` sibling used to fall
+  -- through the mutual blind spot between `detectPartialOrUnsafeRec` and the `S1` check.
+  let env3 ← elabInSandbox <|
+    "def a2Op._unsafe_rec (n : Nat) : Nat := n + 1\n" ++
+    "opaque a2Op (n : Nat) : Nat := n\n" ++
+    "theorem a2OpThm : a2Op 1 = a2Op 1 := rfl\n"
+  let v3 ← liftIO <| auditDeclsInEnvIO env3 #[`a2OpThm] strict
+  liftIO <| assertRejectedWithTag "A2_3_opaque_safe_unsafe_rec_sibling" v3 "compilerOverrideAttribute"
+  lines := lines ++ [formatVerdictTags "A2_3_opaque_safe_unsafe_rec_sibling" v3]
+
+  -- A2-9a: closed-section `@[local csimp]` vanishes from `CSimp.ext` at `end`, yet a
+  -- non-inlined target still appears in `Lean.IR.findEnvDecl` and is now caught directly
+  -- in the closure even with `allowProvisionalNative := false, forbidAmbientModuleOverrides := false`.
+  let env9a ← elabInSandbox <|
+    "unsafe def a2NoInlEvil (a b : Nat) : Nat := a + b + 999\n" ++
+    "@[noinline, implemented_by a2NoInlEvil] def a2NoInlAdd (a b : Nat) : Nat := a + b\n" ++
+    "section\n" ++
+    "@[local csimp] theorem a2NoInlRedir : @Nat.add = @a2NoInlAdd := by funext a b; rfl\n" ++
+    "def a2NoInlCaller (a b : Nat) : Nat := Nat.add a b\n" ++
+    "end\n" ++
+    "theorem a2NoInlThm : a2NoInlCaller 2 3 = 5 := rfl\n"
+  let v9a ← liftIO <| auditDeclsInEnvIO env9a #[`a2NoInlThm] strict
+  liftIO <| assertRejectedWithTag "A2_9a_local_csimp_noinline_ir_caught" v9a "unsafeDeclaration"
+  lines := lines ++ [formatVerdictTags "A2_9a_local_csimp_noinline_ir_caught" v9a]
+
+  -- A2-9b: closed-section `@[local csimp]` whose target is *fully inlined* into `ret 999`,
+  -- combined with a slow `native_decide` proof of a false equality, used to audit `ok`
+  -- under `allowProvisionalNative := true`; now caught by the ambient module override scan.
+  let env9b ← elabInSandbox <|
+    "def a2Slow : Nat → Bool | 0 => true | n + 1 => a2Slow n\n" ++
+    "unsafe def a2InlEvil (_a _b : Nat) : Nat := 999\n" ++
+    "@[implemented_by a2InlEvil] def a2InlAdd (a b : Nat) : Nat := a + b\n" ++
+    "section\n" ++
+    "@[local csimp] theorem a2InlRedir : @Nat.add = @a2InlAdd := by funext a b; rfl\n" ++
+    "def a2InlCaller (a b : Nat) : Nat := Nat.add a b\n" ++
+    "end\n" ++
+    "theorem a2InlSlowNative : (a2Slow 2000000 && (a2InlCaller 2 3 == 999)) = true := by native_decide\n"
+  let v9b ← liftIO <| auditDeclsInEnvIO env9b #[`a2InlSlowNative] prov
+  liftIO <| assertRejectedWithTag "A2_9b_local_csimp_inlined_slow_native_caught" v9b "compilerOverrideAttribute"
+  lines := lines ++ [formatVerdictTags "A2_9b_local_csimp_inlined_slow_native_caught" v9b]
+
+  -- A2-4b: claim-bound `ModularInputSensitiveSpecCert` binding all three components
+  -- `(envAssumed, pre, post)` of `ModularVerificationResult`.
+  let envModIS ← elabInSandbox <|
+    "open Trusted.VerificationResult Trusted.MirSemantics Trusted.MirAst\n" ++
+    "open Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "axiom a2Body : CapturedMir\n" ++
+    "noncomputable def a2ModClaim : ModularClaim :=\n" ++
+    "  { body := a2Body, envAssumed := fuchsiaHermeticCopyRely,\n" ++
+    "    pre := fuchsiaUsercopyCopyinPre, post := fuchsiaUsercopyCopyinPost }\n" ++
+    s!"theorem a2ModVerified : ModularVerificationResult a2ModClaim := by {kw}\n" ++
+    "noncomputable def a2ModBadRelyClaim : ModularClaim :=\n" ++
+    "  { body := a2Body, envAssumed := fun _ => False,\n" ++
+    "    pre := fuchsiaUsercopyCopyinPre, post := fuchsiaUsercopyCopyinPost }\n" ++
+    s!"theorem a2ModBadRelyVerified : ModularVerificationResult a2ModBadRelyClaim := by {kw}\n"
+  let vModIS ← withSandboxEnv envModIS <|
+    auditClaimSpecStrengthInEnv `a2ModVerified (some ``fuchsiaUsercopyCopyinModularDirectInputSensitiveCert)
+  let vModISBad ← withSandboxEnv envModIS <|
+    auditClaimSpecStrengthInEnv `a2ModBadRelyVerified (some ``fuchsiaUsercopyCopyinModularDirectInputSensitiveCert)
+  liftIO <| assertAuditOk "A2_4b_modular_input_sensitive_claim_bound" vModIS
+  liftIO <| assertRejectedWithTag "A2_4b_modular_input_sensitive_wrong_rely" vModISBad "specStrengthCertInvalidType"
+  lines := lines ++
+    [ formatVerdictTags "A2_4b_modular_input_sensitive_claim_bound" vModIS
+    , formatVerdictTags "A2_4b_modular_input_sensitive_wrong_rely" vModISBad ]
   logInfo (String.intercalate "\n" lines)
 
 /-! ### Type-Level Refutations for Discriminating Kills and Deterministic Specifications -/
@@ -1700,6 +1895,49 @@ def runDiskHardeningRegressions : IO String := do
     assertRejectedWithTag "A1_prelude_redeclared_ofReduceBool" vPreludeFakeOfRB "unapprovedAxiom"
     lines := lines.push (formatVerdictTags "A1_prelude_fake_native_eq_bool" vPreludeFakeNat)
     lines := lines.push (formatVerdictTags "A1_prelude_redeclared_ofReduceBool" vPreludeFakeOfRB)
+
+    -- A2-4a: intra-root companion-part symlink aliasing (`Trusted/A.olean.private` pointing
+    --        to `Trusted/B.olean.private` inside the SAME pinned directory) must be rejected
+    --        even when `Trusted/A.olean` itself is at its exact expected path.
+    let compPinDir := tmpDir / "CompPinRoot"
+    IO.FS.createDirAll (compPinDir / "Trusted")
+    IO.FS.writeFile (compPinDir / "Trusted" / "ModA.olean") "a-olean"
+    IO.FS.writeFile (compPinDir / "Trusted" / "ModB.olean.private") "b-private"
+    let _ ← IO.Process.output {
+      cmd := "ln"
+      args := #["-s", (compPinDir / "Trusted" / "ModB.olean.private").toString,
+                (compPinDir / "Trusted" / "ModA.olean.private").toString]
+    }
+    let vCompAlias ← withExtraSearchPaths [compPinDir] do
+      let vs ← checkModuleProvenanceIO #[`Trusted.ModA]
+        (pinnedModuleRoots := #[(`Trusted, compPinDir)])
+      pure (if vs.isEmpty then AuditVerdict.ok {} else AuditVerdict.rejected vs {})
+    assertRejectedWithTag "A2_symlink_companion_part_alias" vCompAlias "moduleProvenanceSpoofed"
+    lines := lines.push (formatVerdictTags "A2_symlink_companion_part_alias" vCompAlias)
+
+    -- A2-9 (on-disk, `loadExts := false`, minimal `Init.Prelude`-only module): `@[local csimp]`
+    --       leaves 0 entries in `CSimp.ext` on disk and inlines its target, yet
+    --       `forbidAmbientModuleOverrides := true` catches the ambient `@[implemented_by]`/`unsafe`
+    --       override in the compiled module.
+    let localCsimpLean := tmpDir / "ProtoDiskLocalCsimp.lean"
+    IO.FS.writeFile localCsimpLean <|
+      "prelude\n" ++
+      "import Init.Prelude\n" ++
+      "def myId (n : Nat) : Nat := n\n" ++
+      "unsafe def evilId (_ : Nat) : Nat := Nat.succ Nat.zero\n" ++
+      "@[implemented_by evilId] def sneakyId (n : Nat) : Nat := n\n" ++
+      "section\n" ++
+      "@[local csimp] theorem localRedir : Eq myId sneakyId := Eq.refl myId\n" ++
+      "def callerId (n : Nat) : Nat := myId n\n" ++
+      "end\n" ++
+      "theorem cleanClaim : Eq (callerId Nat.zero) Nat.zero := Eq.refl Nat.zero\n"
+    compileTempModuleToOlean tmpDir localCsimpLean (tmpDir / "ProtoDiskLocalCsimp.olean")
+    let loadedLocalCsimp ← loadOrThrow "A2_disk_local_csimp_load" #[`ProtoDiskLocalCsimp] pol [tmpDir]
+    let vDiskLocalCsimp ← auditLoadedModulesIO loadedLocalCsimp
+      { checkStatementOrigin := false, forbidAmbientModuleOverrides := true }
+      (explicitTargets? := some #[`cleanClaim])
+    assertRejectedWithTag "A2_disk_local_csimp_ambient_override" vDiskLocalCsimp "compilerOverrideAttribute"
+    lines := lines.push (formatVerdictTags "A2_disk_local_csimp_ambient_override" vDiskLocalCsimp)
     return lines
   let lines ← try body finally IO.FS.removeDirAll tmpDir
   let clean := !(← tmpDir.pathExists)
@@ -1720,6 +1958,8 @@ A1_symlink_split_provenance: rejected [moduleProvenanceSpoofed]
 S4_symlinked_directory_module_alias: rejected [moduleProvenanceSpoofed]
 A1_prelude_fake_native_eq_bool: rejected [unapprovedAxiom]
 A1_prelude_redeclared_ofReduceBool: rejected [unapprovedAxiom]
+A2_symlink_companion_part_alias: rejected [moduleProvenanceSpoofed]
+A2_disk_local_csimp_ambient_override: rejected [compilerOverrideAttribute]
 tmp_clean=true
 -/
 #guard_msgs in
@@ -1735,8 +1975,8 @@ run_cmd do
 def pureSpecHalfPrefixes : Array String := #[
   "SpecStrengthCert", "MutantCategory", "NamedMutantKill", "MultiMutantSpecCert",
   "DeterministicSpecCert", "InputSensitiveSpecCert", "ModularSpecStrengthCert",
-  "ModularMultiMutantSpecCert",
-  "ModularDeterministicSpecCert", "no_", "mutant_impl", "multi_mutant", "ItemSpecStrengthCert",
+  "ModularMultiMutantSpecCert", "ModularDeterministicSpecCert",
+  "ModularInputSensitiveSpecCert", "no_", "mutant_impl", "multi_mutant", "ItemSpecStrengthCert",
   "ItemMultiMutantCert", "StatefulItem", "ModularItem", "fxfs", "fuchsia", "weak",
   "truncated", "strong", "mutatedFrameMemory", "instDecidableEqMutantCategory",
   "instReprMutantCategory", "instInhabitedMutantCategory"]
@@ -1921,5 +2161,24 @@ info: 'Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinModularDirectDe
 /-- info: 'Anneal.OleanSpecStrengthAuditorProtoTests.testSinglePointSpecNotInputSensitive' does not depend on any axioms -/
 #guard_msgs in
 #print axioms Anneal.OleanSpecStrengthAuditorProtoTests.testSinglePointSpecNotInputSensitive
+
+/--
+info: 'Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinModularDirectInputSensitiveCert' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinModularDirectInputSensitiveCert
+
+/-- info: 'Anneal.OleanSpecStrengthAuditorProto.no_modular_input_sensitive_cert_of_vacuous_envAssumed' does not depend on any axioms -/
+#guard_msgs in
+#print axioms Anneal.OleanSpecStrengthAuditorProto.no_modular_input_sensitive_cert_of_vacuous_envAssumed
+
+/-- info: 'Anneal.OleanSpecStrengthAuditorProto.no_modular_input_sensitive_cert_of_singleton_req' does not depend on any axioms -/
+#guard_msgs in
+#print axioms Anneal.OleanSpecStrengthAuditorProto.no_modular_input_sensitive_cert_of_singleton_req
+
+/-- info: 'Anneal.OleanSpecStrengthAuditorProto.no_modular_input_sensitive_cert_of_input_independent_ens' does not depend on any axioms -/
+#guard_msgs in
+#print axioms Anneal.OleanSpecStrengthAuditorProto.no_modular_input_sensitive_cert_of_input_independent_ens
 
 end Anneal.OleanSpecStrengthAuditorProtoTests
