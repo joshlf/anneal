@@ -27080,6 +27080,7 @@ section MoveDeinitEquivPins
   MoveDeinitEquiv.readProjectedValue_preserves_no_movedUninit
   MoveDeinitEquiv.writeStackThinPtrTypedDeref_eq_legacy_of_no_movedUninit
   MoveDeinitEquiv.writeStackThinPtrTypedDeref_eq_legacy_nonUnion
+  MoveDeinitEquiv.deinitSubPlaceByteWindow_subscalar_nonUnion_none
   MoveDeinitEquiv.movedUninitValue_ne_wellFormed_scalar
   MoveDeinitEquiv.evalOperand_move_root_deinit
   MoveDeinitEquiv.evalOperand_copy_deinit_movedUninit_ub
@@ -27169,6 +27170,29 @@ example (indexLocals targetLocals : List LocalSlot)
   MoveDeinitEquiv.writeStackThinPtrTypedDeref_eq_legacy_nonUnion indexLocals targetLocals entry
     ptrVal restProj val localDecls layouts pointeeTyOpt accessedTyOpt targetDecls targetLayouts
     hroot hnoUnion
+
+example (locals : List LocalSlot) (localDecls : List MirAst.LocalDecl)
+    (layouts : Layout.LayoutTable) (targetLocal : MirAst.Local) (targetRootVal : Value)
+    (containerProj : List ProjectionElem) (byteOff reqBytes : Nat) (oldSc : MirAst.ScalarInt)
+    (fieldVal : Value)
+    (hpos : Nat.ble 1 reqBytes = true)
+    (hread : readProjectedForLocal locals localDecls layouts targetLocal targetRootVal
+      containerProj = .ok (.scalar oldSc))
+    (hnotUnionContainer : ∀ subTy count,
+      placeTyResolved localDecls layouts { local_ := targetLocal, projection := containerProj } =
+        .some subTy →
+      ∀ l, Layout.LayoutTable.lookup layouts
+        (resolveTyWithLocalDecls localDecls layouts subTy).layoutIdx = .some l →
+      l.fields ≠ .union count)
+    (hnoTouchesUnion :
+      placeTouchesUnion localDecls layouts { local_ := targetLocal, projection := containerProj } =
+        false)
+    (hsub : Bool.and (Nat.beq byteOff 0) (Nat.beq reqBytes oldSc.sizeBytes) = false) :
+    deinitSubPlaceByteWindow locals localDecls layouts targetLocal targetRootVal containerProj
+      byteOff (.some reqBytes) fieldVal = .none :=
+  MoveDeinitEquiv.deinitSubPlaceByteWindow_subscalar_nonUnion_none locals localDecls layouts
+    targetLocal targetRootVal containerProj byteOff reqBytes oldSc fieldVal hpos hread
+    hnotUnionContainer hnoTouchesUnion hsub
 
 example (sc : MirAst.ScalarInt) (hrange : sc.bits < 2 ^ (8 * sc.sizeBytes)) :
     Value.scalar sc ≠ movedUninitValue ∧ valueContainsMovedUninit (.scalar sc) = false :=

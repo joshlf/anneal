@@ -1918,6 +1918,75 @@ theorem writeStackThinPtrTypedDeref_eq_legacy_nonUnion
   exact readProjectedValue_preserves_no_movedUninit indexLocals fullProj targetRootVal oldVal
     (hroot targetRootVal hslot) hread
 
+/-- **Fail-closed strict sub-scalar `Deref` move on non-union targets.** When a
+typed thin-pointer `Deref` move targets a strict byte window
+(`Bool.and (Nat.beq byteOff 0) (Nat.beq reqBytes oldSc.sizeBytes) = false`) of a
+non-union `Value.scalar oldSc`, `deinitSubPlaceByteWindow` returns `.none`
+(failing closed to `.unsupported` in `evalMoveOperandDeinit`) rather than
+overwriting the entire scalar and poisoning unmoved sibling bytes. -/
+theorem deinitSubPlaceByteWindow_subscalar_nonUnion_none
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (targetLocal : Local) (targetRootVal : Value) (containerProj : List ProjectionElem)
+    (byteOff reqBytes : Nat) (oldSc : ScalarInt) (fieldVal : Value)
+    (hpos : Nat.ble 1 reqBytes = true)
+    (hread : readProjectedForLocal locals localDecls layouts targetLocal targetRootVal
+      containerProj = .ok (.scalar oldSc))
+    (hnotUnionContainer : ∀ subTy count,
+      placeTyResolved localDecls layouts { local_ := targetLocal, projection := containerProj } =
+        .some subTy →
+      ∀ l, LayoutTable.lookup layouts (resolveTyWithLocalDecls localDecls layouts subTy).layoutIdx =
+        .some l →
+      l.fields ≠ .union count)
+    (hnoTouchesUnion :
+      placeTouchesUnion localDecls layouts { local_ := targetLocal, projection := containerProj } =
+        false)
+    (hsub : Bool.and (Nat.beq byteOff 0) (Nat.beq reqBytes oldSc.sizeBytes) = false) :
+    deinitSubPlaceByteWindow locals localDecls layouts targetLocal targetRootVal containerProj
+      byteOff (.some reqBytes) fieldVal = .none := by
+  unfold deinitSubPlaceByteWindow
+  dsimp only
+  rw [hpos]
+  dsimp only
+  rw [hread]
+  dsimp only
+  cases hpty : placeTyResolved localDecls layouts
+      { local_ := targetLocal, projection := containerProj } with
+  | none =>
+    dsimp only
+    rw [hnoTouchesUnion]
+    dsimp only
+    rw [hsub]
+  | some subTy =>
+    dsimp only
+    cases hlk : LayoutTable.lookup layouts
+        (resolveTyWithLocalDecls localDecls layouts subTy).layoutIdx with
+    | none =>
+      dsimp only
+      rw [hnoTouchesUnion]
+      dsimp only
+      rw [hsub]
+    | some l =>
+      have hnu := hnotUnionContainer subTy
+      cases l with
+      | mk sz al brepr flds vars uninh fls =>
+        cases hf : flds with
+        | union count => exact absurd hf (hnu count hpty _ hlk)
+        | primitive =>
+          dsimp only
+          rw [hnoTouchesUnion]
+          dsimp only
+          rw [hsub]
+        | arbitrary _ _ =>
+          dsimp only
+          rw [hnoTouchesUnion]
+          dsimp only
+          rw [hsub]
+        | array _ _ =>
+          dsimp only
+          rw [hnoTouchesUnion]
+          dsimp only
+          rw [hsub]
+
 /-- Leading `.opaqueCast` is transparent to `lastStructuralProjection?`. -/
 theorem lastStructuralProjection?_opaqueCast_prefix (ty : Ty) (proj : List ProjectionElem) :
     lastStructuralProjection? (.opaqueCast ty :: proj) = lastStructuralProjection? proj := by
@@ -2228,36 +2297,61 @@ theorem canary_D5_typed_field_offset_deref_move :
     evalOperand d5TypedTupleAfterMove (.copy (pl 3 [.deref])) d5Borrows []
       d5TypedTupleLayouts [] d5TypedTupleDecls [] true = .ub := ⟨rfl, rfl, rfl⟩
 
-/-- Typed local declarations for `_1 : u16 = 0x0302` and `_2 : *mut u8` pointing
-at byte offset `1` inside `_1`. -/
+/-- Typed local declarations for `_1 : u16 = 0x0302`, `_2 : *mut u8` pointing
+at byte offset `1` inside `_1`, and `_3 : *const u8` pointing at byte offset `0`. -/
 def d5TypedScalarDecls : List LocalDecl :=
   [{ mutability := .mut, ty := u8Ty, debugName := .none },
    { mutability := .mut, ty := { kind := .uint .u16, layoutIdx := 0 }, debugName := .none },
    { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 },
+     debugName := .none },
+   { mutability := .not, ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 },
      debugName := .none }]
 
 def d5TypedScalarLocals : List LocalSlot :=
   [.uninit,
    .init (.scalar { bits := 770, sizeBytes := 2 }),
-   .init (.ptr { allocId := 2, offsetBytes := 1 } 8)]
+   .init (.ptr { allocId := 2, offsetBytes := 1 } 8),
+   .init (.ptr { allocId := 3, offsetBytes := 0 } 8)]
 
-def d5TypedScalarAfterMove : List LocalSlot :=
+def d5TypedFullScalarDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := u8Ty, debugName := .none },
+   { mutability := .mut, ty := { kind := .uint .u16, layoutIdx := 0 }, debugName := .none },
+   { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u16), layoutIdx := 0 },
+     debugName := .none }]
+
+def d5TypedFullScalarLocals : List LocalSlot :=
   [.uninit,
-   .init movedUninitValue,
-   .init (.ptr { allocId := 2, offsetBytes := 1 } 8)]
+   .init (.scalar { bits := 770, sizeBytes := 2 }),
+   .init (.ptr { allocId := 2, offsetBytes := 0 } 8)]
 
-/-- **`D5` typed intra-scalar byte-window `Deref` move (`localDecls ≠ .nil`).**
-Moving a `u8` at byte offset `1` out of `_1 : u16 = 0x0302` (`770`) delivers the
-high byte `3` and marks `_1` as moved-out so subsequent reads of `_1` or `*_2`
-fault with `.ub`. -/
+def d5TypedFullScalarAfterMove : List LocalSlot :=
+  [.uninit,
+   .uninit,
+   .init (.ptr { allocId := 2, offsetBytes := 0 } 8)]
+
+/-- **`D5` typed scalar vs strict sub-scalar `Deref` moves (`localDecls ≠ .nil`).**
+Moving a strict `u8` slice at byte offset `1` out of non-union `_1 : u16 = 0x0302`
+fails closed with `.unsupported` (rather than overwriting `_1` with `movedUninitValue`
+and poisoning the unmoved byte `0` read through `*_3`), whereas moving the full
+`u16` scalar through `*(_2 : *mut u16)` delivers `0x0302` and sets `_1` to
+`.uninit` so subsequent reads of `_1` or `*_2` fault with `.ub`. -/
 theorem canary_D5_typed_scalar_byte_window_deref_move :
-    evalOperand d5TypedScalarLocals (.move (pl 2 [.deref])) d5Borrows []
+    evalOperand d5TypedScalarLocals (.copy (pl 2 [.deref])) d5Borrows []
       emptyLayoutTable [] d5TypedScalarDecls [] true =
-      .ok (sc8 3) d5TypedScalarAfterMove ∧
-    evalOperand d5TypedScalarAfterMove (.copy (pl 1 [])) d5Borrows []
-      emptyLayoutTable [] d5TypedScalarDecls [] true = .ub ∧
-    evalOperand d5TypedScalarAfterMove (.copy (pl 2 [.deref])) d5Borrows []
-      emptyLayoutTable [] d5TypedScalarDecls [] true = .ub := ⟨rfl, rfl, rfl⟩
+      .ok (sc8 3) d5TypedScalarLocals ∧
+    evalOperand d5TypedScalarLocals (.copy (pl 3 [.deref])) d5Borrows []
+      emptyLayoutTable [] d5TypedScalarDecls [] true =
+      .ok (sc8 2) d5TypedScalarLocals ∧
+    evalOperand d5TypedScalarLocals (.move (pl 2 [.deref])) d5Borrows []
+      emptyLayoutTable [] d5TypedScalarDecls [] true = .unsupported ∧
+    evalOperand d5TypedFullScalarLocals (.move (pl 2 [.deref])) d5Borrows []
+      emptyLayoutTable [] d5TypedFullScalarDecls [] true =
+      .ok (.scalar { bits := 770, sizeBytes := 2 }) d5TypedFullScalarAfterMove ∧
+    evalOperand d5TypedFullScalarAfterMove (.copy (pl 1 [])) d5Borrows []
+      emptyLayoutTable [] d5TypedFullScalarDecls [] true = .ub ∧
+    evalOperand d5TypedFullScalarAfterMove (.copy (pl 2 [.deref])) d5Borrows []
+      emptyLayoutTable [] d5TypedFullScalarDecls [] true = .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! #### `D9`: element and subslice moves -/
 

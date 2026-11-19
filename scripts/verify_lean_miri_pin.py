@@ -1590,7 +1590,18 @@ def _check_elan_overrides(repo_root: Path, name: str, elan_home: Path, environ: 
     if env_tc and env_tc != name:
         c.err("toolchain", f"ELAN_TOOLCHAIN={env_tc!r} overrides the repository lean-toolchain {name!r}")
     settings = elan_home / "settings.toml"
-    if not settings.exists():
+    if not os.path.lexists(settings):
+        return
+    try:
+        settings_st = os.lstat(settings)
+    except OSError as exc:
+        c.err("toolchain", f"cannot inspect elan settings {settings}: {exc}")
+        return
+    if stat.S_ISLNK(settings_st.st_mode) or not stat.S_ISREG(settings_st.st_mode):
+        c.err("toolchain", f"elan settings {settings} is a symlink or not a regular file")
+        return
+    if settings_st.st_mode & stat.S_IWOTH:
+        c.err("toolchain", f"elan settings {settings} is world-writable")
         return
     try:
         import tomllib  # Python >= 3.11
@@ -1598,7 +1609,7 @@ def _check_elan_overrides(repo_root: Path, name: str, elan_home: Path, environ: 
         c.warn("toolchain", f"cannot parse {settings} (tomllib unavailable); elan directory overrides not checked")
         return
     try:
-        data = tomllib.loads(_read_small_regular_file(settings).decode("utf-8"))
+        data = tomllib.loads(_read_small_regular_file(settings, expect=settings_st).decode("utf-8"))
     except (OSError, ValueError) as exc:
         c.err("toolchain", f"cannot parse elan settings {settings}: {exc}")
         return
@@ -1742,7 +1753,15 @@ def elf_dynamic_entries(
             if not iraw.endswith(b"\0") or b"\0" in iraw[:-1]:
                 raise ValueError("unterminated or embedded-NUL PT_INTERP path")
             ipath = iraw[:-1].decode("utf-8", "surrogateescape")
-            if not os.path.isabs(ipath) or ".." in ipath.split("/"):
+            iparts = ipath.split("/")
+            if (
+                not ipath.startswith("/")
+                or ipath.endswith("/")
+                or any(part in ("", ".", "..") for part in iparts[1:])
+                or not all(0x21 <= ord(ch) <= 0x7E for ch in ipath)
+                or iparts[1] == "tmp"
+                or iparts[1:3] in (["var", "tmp"], ["dev", "shm"])
+            ):
                 raise ValueError(f"invalid PT_INTERP path {ipath!r}")
             if dynamic is None:
                 raise ValueError("PT_INTERP present without PT_DYNAMIC")
@@ -1789,6 +1808,8 @@ def elf_dynamic_entries(
             raise ValueError("unterminated PT_DYNAMIC segment (missing DT_NULL)")
         if any(t in (0x7FFFFFFD, 0x7FFFFFFF) for t, _ in entries):  # DT_AUXILIARY, DT_FILTER
             raise ValueError("unsupported ELF dynamic filter tag (DT_AUXILIARY/DT_FILTER)")
+        if any(t in (0x6FFFFEFB, 0x6FFFFEFC) for t, _ in entries):  # DT_DEPAUDIT, DT_AUDIT
+            raise ValueError("unsupported ELF dynamic audit tag (DT_AUDIT/DT_DEPAUDIT)")
         if strtab is None or strsz is None:
             if any(t in (1, 15, 29) for t, _ in entries):
                 raise ValueError("DT_NEEDED/DT_RUNPATH present without DT_STRTAB/DT_STRSZ")
@@ -1866,23 +1887,42 @@ def _validate_runpath_entry(entry: str, origin: str, real_root: str) -> Tuple[Op
             return None, "outside"
         if expanded != "/" and (expanded.endswith("/") or "//" in expanded):
             return None, "unsupported"
+        root_prefix = "/" if real_root == "/" else real_root.rstrip(os.sep) + "/"
+        if expanded == real_root or not expanded.startswith(root_prefix):
+            return None, "outside"
     real = os.path.realpath(expanded)
     if real == real_root or not real.startswith(real_root + os.sep):
         return None, "outside"
     return Path(os.path.normpath(expanded)), None
 
 
-def _runpath_dir_problem(root: Path, directory: Path) -> Optional[str]:
+def _rel_under_toolchain(root: Path, real_root: str, target: Path) -> Optional[str]:
+    """Canonical POSIX relative path of `target` below `root` or `real_root`,
+    or `None` if `target` is not strictly beneath either prefix."""
+    target_str = os.path.normpath(str(target))
+    for base in (os.path.normpath(str(root)), os.path.normpath(real_root)):
+        prefix = "/" if base == "/" else base + os.sep
+        if target_str.startswith(prefix):
+            rel = target_str[len(prefix):].replace(os.sep, "/")
+            if rel and not any(p in ("", ".", "..") for p in rel.split("/")):
+                return rel
+    return None
+
+
+def _runpath_dir_problem(root: Path, directory: Path, real_root: Optional[str] = None) -> Optional[str]:
     """Why `directory` (or an existing ancestor up to `root`) is unsafe as a
     `DT_RUNPATH` search directory: symlink, non-directory, or world-writable."""
-    dir_rel = os.path.relpath(directory, root).replace(os.sep, "/")
+    eff_real_root = os.path.realpath(root) if real_root is None else real_root
+    dir_rel = _rel_under_toolchain(root, eff_real_root, directory)
+    if dir_rel is None:
+        return f"DT_RUNPATH search directory {directory} resolves outside the toolchain root"
     try:
         root_st = os.lstat(root)
     except OSError as exc:
         return f"DT_RUNPATH search directory {dir_rel} is unreadable ({exc.strerror})"
     if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode) or (root_st.st_mode & stat.S_IWOTH):
         return f"DT_RUNPATH search directory {dir_rel} is world-writable or not a directory"
-    parts = [p for p in dir_rel.split("/") if p and p != "."]
+    parts = dir_rel.split("/")
     for i in range(1, len(parts) + 1):
         cur = root.joinpath(*parts[:i])
         try:
@@ -1960,9 +2000,14 @@ def _check_runpath_shadowing(toolchain_dir: Path, real_root: str, elf_rels: Sequ
             if reason == "outside" or directory is None:
                 c.err("toolchain", f"{rel}: DT_RUNPATH entry {entry!r} resolves outside the toolchain root")
                 continue
-            if directory not in search_dirs:
-                search_dirs.append(directory)
-                dir_problem = _runpath_dir_problem(toolchain_dir, directory)
+            dir_rel = _rel_under_toolchain(toolchain_dir, real_root, directory)
+            if dir_rel is None:
+                c.err("toolchain", f"{rel}: DT_RUNPATH entry {entry!r} resolves outside the toolchain root")
+                continue
+            canonical_dir = toolchain_dir.joinpath(*dir_rel.split("/"))
+            if canonical_dir not in search_dirs:
+                search_dirs.append(canonical_dir)
+                dir_problem = _runpath_dir_problem(toolchain_dir, canonical_dir, real_root)
                 if dir_problem is not None:
                     c.err("toolchain", f"{rel}: {dir_problem}")
         for soname in needed:
@@ -2089,8 +2134,13 @@ def _verify_toolchain_impl(
     if toolchain_dir is None:
         resolved_by = "elan"
         home = elan_home if elan_home is not None else default_elan_home(environ)
+        if os.path.lexists(home):
+            _lstat_real_dir(home, f"elan home {home}", c, "toolchain")
+        toolchains_parent = home / "toolchains"
+        if os.path.lexists(toolchains_parent):
+            _lstat_real_dir(toolchains_parent, f"elan toolchains directory {toolchains_parent}", c, "toolchain")
         _check_elan_overrides(repo_root, name, home, environ, c)
-        toolchain_dir = home / "toolchains" / toolchain_dir_name(name)
+        toolchain_dir = toolchains_parent / toolchain_dir_name(name)
     else:
         c.warn("toolchain", f"toolchain resolved via test-only override {toolchain_dir}, not via elan")
     if _lstat_real_dir(toolchain_dir, f"toolchain root {toolchain_dir}", c, "toolchain") is None:

@@ -5664,7 +5664,15 @@ def elf_dynamic_entries(path: Path) -> tuple[tuple[str, ...], tuple[tuple[int, t
             if not raw.endswith(b"\0") or b"\0" in raw[:-1]:
                 raise ValueError("unterminated or embedded-NUL PT_INTERP path")
             interp_path = raw[:-1].decode("utf-8", "surrogateescape")
-            if not interp_path.startswith("/") or ".." in interp_path.split("/"):
+            interp_parts = interp_path.split("/")
+            if (
+                not interp_path.startswith("/")
+                or interp_path.endswith("/")
+                or any(part in ("", ".", "..") for part in interp_parts[1:])
+                or not all(0x21 <= ord(ch) <= 0x7E for ch in interp_path)
+                or interp_parts[1] == "tmp"
+                or interp_parts[1:3] in (["var", "tmp"], ["dev", "shm"])
+            ):
                 raise ValueError(f"invalid PT_INTERP path {interp_path!r}")
             if dynamic is None:
                 raise ValueError("PT_INTERP present without PT_DYNAMIC")
@@ -5711,6 +5719,8 @@ def elf_dynamic_entries(path: Path) -> tuple[tuple[str, ...], tuple[tuple[int, t
             raise ValueError("unterminated PT_DYNAMIC segment (missing DT_NULL)")
         if any(tag in (0x7FFFFFFD, 0x7FFFFFFF) for tag, _ in entries):  # DT_AUXILIARY, DT_FILTER
             raise ValueError("unsupported ELF dynamic filter tag (DT_AUXILIARY/DT_FILTER)")
+        if any(tag in (0x6FFFFEFB, 0x6FFFFEFC) for tag, _ in entries):  # DT_DEPAUDIT, DT_AUDIT
+            raise ValueError("unsupported ELF dynamic audit tag (DT_AUDIT/DT_DEPAUDIT)")
         if strtab is None or strsz is None:
             if any(tag in (1, 15, 29) for tag, _ in entries):
                 raise ValueError("DT_NEEDED/DT_RUNPATH present without DT_STRTAB/DT_STRSZ")
@@ -5786,23 +5796,42 @@ def _validate_runpath_entry(entry: str, origin: str, real_root: str) -> tuple[Pa
             return None, "outside"
         if expanded != "/" and (expanded.endswith("/") or "//" in expanded):
             return None, "unsupported"
+        root_prefix = "/" if real_root == "/" else real_root.rstrip(os.sep) + "/"
+        if expanded == real_root or not expanded.startswith(root_prefix):
+            return None, "outside"
     real = os.path.realpath(expanded)
     if real == real_root or not real.startswith(real_root + os.sep):
         return None, "outside"
     return Path(os.path.normpath(expanded)), None
 
 
-def _runpath_dir_problem(root: Path, directory: Path) -> str | None:
+def _rel_under_toolchain(root: Path, real_root: str, target: Path) -> str | None:
+    """Canonical POSIX relative path of `target` below `root` or `real_root`,
+    or `None` if `target` is not strictly beneath either prefix."""
+    target_str = os.path.normpath(str(target))
+    for base in (os.path.normpath(str(root)), os.path.normpath(real_root)):
+        prefix = "/" if base == "/" else base + os.sep
+        if target_str.startswith(prefix):
+            rel = target_str[len(prefix):].replace(os.sep, "/")
+            if rel and not any(part in ("", ".", "..") for part in rel.split("/")):
+                return rel
+    return None
+
+
+def _runpath_dir_problem(root: Path, directory: Path, real_root: str | None = None) -> str | None:
     """Why `directory` (or an existing ancestor up to `root`) is unsafe as a
     `DT_RUNPATH` search directory: symlink, non-directory, or world-writable."""
-    dir_rel = os.path.relpath(directory, root).replace(os.sep, "/")
+    eff_real_root = os.path.realpath(root) if real_root is None else real_root
+    dir_rel = _rel_under_toolchain(root, eff_real_root, directory)
+    if dir_rel is None:
+        return f"DT_RUNPATH search directory {directory} resolves outside the toolchain root"
     try:
         root_st = os.lstat(root)
     except OSError as error:
         return f"DT_RUNPATH search directory {dir_rel} is unreadable ({error.strerror})"
     if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode) or (root_st.st_mode & stat.S_IWOTH):
         return f"DT_RUNPATH search directory {dir_rel} is world-writable or not a directory"
-    parts = [p for p in dir_rel.split("/") if p and p != "."]
+    parts = dir_rel.split("/")
     for index in range(1, len(parts) + 1):
         cur = root.joinpath(*parts[:index])
         try:
@@ -5864,9 +5893,14 @@ def runpath_shadowing_findings(prefix: Path, elf_rels: list[str], pinned: set[st
             if reason == "outside" or directory is None:
                 problems.append(f"{rel}: DT_RUNPATH entry {entry!r} resolves outside the toolchain root")
                 continue
-            if directory not in search_dirs:
-                search_dirs.append(directory)
-                dir_problem = _runpath_dir_problem(prefix, directory)
+            dir_rel = _rel_under_toolchain(prefix, real_root, directory)
+            if dir_rel is None:
+                problems.append(f"{rel}: DT_RUNPATH entry {entry!r} resolves outside the toolchain root")
+                continue
+            canonical_dir = prefix.joinpath(*dir_rel.split("/"))
+            if canonical_dir not in search_dirs:
+                search_dirs.append(canonical_dir)
+                dir_problem = _runpath_dir_problem(prefix, canonical_dir, real_root)
                 if dir_problem is not None:
                     problems.append(f"{rel}: {dir_problem}")
         for soname in needed:
@@ -6010,6 +6044,17 @@ def admit_lean_before_execution(selected: Path, lean: Path, lock: dict) -> str:
                                     "(symlinks at or below the toolchain prefix are forbidden); nothing was executed")
         if root_st.st_mode & stat.S_IWOTH:
             raise Failure(2, phase, f"{root_dir} is world-writable; nothing was executed")
+        toolchains_dir = root_dir.parent
+        if toolchains_dir.name == "toolchains":
+            for anc_dir in (toolchains_dir, toolchains_dir.parent):
+                try:
+                    anc_st = os.lstat(anc_dir)
+                except OSError as error:
+                    raise Failure(2, phase, f"cannot inspect {anc_dir}: {error}") from error
+                if stat.S_ISLNK(anc_st.st_mode) or not stat.S_ISDIR(anc_st.st_mode):
+                    raise Failure(2, phase, f"{anc_dir} is a symlink or not a directory; nothing was executed")
+                if anc_st.st_mode & stat.S_IWOTH:
+                    raise Failure(2, phase, f"{anc_dir} is world-writable; nothing was executed")
     if selected.parent.name != "bin" or lean.parent.name != "bin":
         # `lean_release_findings` inventories `<prefix>/bin/` and resolves the DT_RUNPATH
         # of `<prefix>/bin/lean`: the executable that runs must be that very file, not a

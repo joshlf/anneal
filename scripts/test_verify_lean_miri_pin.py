@@ -284,6 +284,7 @@ def make_elf64(
     omit_dt_null: bool = False,
     dyn_outside_load: bool = False,
     extra_dyn_strings: Sequence[Tuple[int, str]] = (),
+    interp_path: Optional[bytes] = None,
 ) -> bytes:
     """Minimal ELF64 little-endian ET_DYN image: one PT_LOAD covering the whole
     file plus a PT_DYNAMIC segment with DT_NEEDED*, DT_RUNPATH (29) / DT_RPATH
@@ -308,11 +309,13 @@ def make_elf64(
     if unterminated:
         del strtab[-1]
     declared_strsz = len(strtab) - (1 if unterminated_within_strsz and len(strtab) > 1 else 0)
-    n_phdrs = 3 if overlapping_loads else 2
+    n_phdrs = 2 + (1 if overlapping_loads else 0) + (1 if interp_path is not None else 0)
     dyn_off = 64 + n_phdrs * phentsize
     dyn_slots = len(dyn) + (2 if omit_dt_null else 3)  # + DT_STRTAB, DT_STRSZ, [DT_NULL]
     str_off = dyn_off + 16 * dyn_slots
-    total = str_off + len(strtab)
+    interp_bytes = interp_path or b""
+    interp_off = str_off + len(strtab)
+    total = interp_off + len(interp_bytes)
     if not omit_strtab:
         dyn.append((5, str_off + (0x100000 if strtab_outside_load else 0)))
         dyn.append((10, declared_strsz + (64 if strsz_overrun else 0)))
@@ -330,10 +333,13 @@ def make_elf64(
     dyn_vaddr = dyn_off + (0x200000 if dyn_outside_load else 0)
     ph_dyn = struct.pack("<IIQQQQQQ", 2, 6, dyn_off, dyn_vaddr, dyn_vaddr, 16 * dyn_slots, 16 * dyn_slots, 8).ljust(phentsize, b"\0")
     phdrs_bytes = ph_load + ph_dyn
+    if interp_path is not None:
+        ph_interp = struct.pack("<IIQQQQQQ", 3, 4, interp_off, interp_off, interp_off, len(interp_bytes), len(interp_bytes), 1).ljust(phentsize, b"\0")
+        phdrs_bytes += ph_interp
     if overlapping_loads:
         ph_overlap = struct.pack("<IIQQQQQQ", 1, 4, 0, 0x100, 0x100, 64, 64, 0x1000).ljust(phentsize, b"\0")
         phdrs_bytes += ph_overlap
-    return ehdr + phdrs_bytes + body + bytes(strtab)
+    return ehdr + phdrs_bytes + body + bytes(strtab) + interp_bytes
 
 
 def malformed_elf_cases() -> List[Tuple[str, bytes, str]]:
@@ -356,6 +362,16 @@ def malformed_elf_cases() -> List[Tuple[str, bytes, str]]:
         ("DT_AUXILIARY filter tag", make_elf64(["libfoo.so"], ["$ORIGIN"], extra_dyn_strings=[(0x7FFFFFFD, "libaux.so")]), "DT_AUXILIARY/DT_FILTER"),
         ("DT_FILTER filter tag", make_elf64(["libfoo.so"], ["$ORIGIN"], extra_dyn_strings=[(0x7FFFFFFF, "libflt.so")]), "DT_AUXILIARY/DT_FILTER"),
         ("DT_AUXILIARY without DT_STRTAB", make_elf64([], [], omit_strtab=True, extra_dyn_strings=[(0x7FFFFFFD, "libaux.so")]), "DT_AUXILIARY/DT_FILTER"),
+        ("DT_AUDIT audit tag", make_elf64(["libfoo.so"], ["$ORIGIN"], extra_dyn_strings=[(0x6FFFFEFC, "libaudit.so")]), "DT_AUDIT/DT_DEPAUDIT"),
+        ("DT_DEPAUDIT audit tag", make_elf64(["libfoo.so"], ["$ORIGIN"], extra_dyn_strings=[(0x6FFFFEFB, "libdepaudit.so")]), "DT_AUDIT/DT_DEPAUDIT"),
+        ("DT_AUDIT without DT_STRTAB", make_elf64([], [], omit_strtab=True, extra_dyn_strings=[(0x6FFFFEFC, "libaudit.so")]), "DT_AUDIT/DT_DEPAUDIT"),
+        ("PT_INTERP under /tmp", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/tmp/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /var/tmp", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/var/tmp/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP under /dev/shm", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/dev/shm/evil-ld.so\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP double slash", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/lib64//ld-linux-x86-64.so.2\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP dot segment", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/lib64/./ld-linux-x86-64.so.2\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP trailing slash", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/lib64/\0"), "invalid PT_INTERP path"),
+        ("PT_INTERP whitespace/control", make_elf64(["libfoo.so"], ["$ORIGIN"], interp_path=b"/lib64/ld\n.so\0"), "invalid PT_INTERP path"),
         ("ELFCLASS32", good[:4] + b"\x01" + good[5:], "unsupported ELF object"),
         ("big-endian", good[:5] + b"\x02" + good[6:], "unsupported ELF object"),
         ("truncated ELF header", good[:40], "unsupported ELF object"),
@@ -1886,6 +1902,102 @@ class ElfDynamicParserTests(TempCase):
                 self.assertEqual(CT._validate_runpath_entry(entry, origin, real_root), V._validate_runpath_entry(entry, origin, real_root))
         for bad_entry in (real_root + "/lib/$ORIGIN", real_root + "/lib/${ORIGIN}", real_root + "//lib", real_root + "/lib/"):
             self.assertEqual(V._validate_runpath_entry(bad_entry, origin, real_root), (None, "unsupported"))
+        # External symlink pointing at `real_root` must be rejected as `"outside"`
+        # even though `os.path.realpath` resolves inside `real_root`.
+        ext_sym = self.tmp / "ext-sym-to-root"
+        os.symlink(real_root, ext_sym)
+        for bad_sym_entry in (str(ext_sym / "lib"), str(ext_sym / "lib" / "lean")):
+            self.assertEqual(V._validate_runpath_entry(bad_sym_entry, origin, real_root), (None, "outside"))
+            self.assertEqual(CT._validate_runpath_entry(bad_sym_entry, origin, real_root), (None, "outside"))
+        # Canonical `PT_INTERP` is accepted identically by both parsers.
+        interp_elf = self.put(make_elf64(["libfoo.so"], ["$ORIGIN/../lib"], interp_path=b"/lib64/ld-linux-x86-64.so.2\0"), "good-interp")
+        self.assertEqual(CT.elf_dynamic_entries(interp_elf), V.elf_dynamic_entries(interp_elf))
+
+    def test_ancestor_symlink_above_toolchain_root_admits_real_root_runpath(self) -> None:
+        """Simulates macOS `/var -> private/var`: when an ancestor *above* the
+        toolchain root is a symlink (`sym_parent/tc`, where `tc` itself is a real
+        0755 directory), a `DT_RUNPATH` entry naming `real_root + '/lib/lean'` must
+        not walk up through `sym_parent` or falsely fail `RUNPATH shadowing`."""
+        real_parent = self.tmp / "real-parent"
+        real_parent.mkdir()
+        os.chmod(real_parent, 0o755)
+        sym_parent = self.tmp / "sym-parent"
+        os.symlink(real_parent, sym_parent)
+        make_fake_toolchain(real_parent, name="tc")
+        tc_via_sym = sym_parent / "tc"
+        real_tc = os.path.realpath(tc_via_sym)
+        shared_elf = make_elf64(["libleanshared_1.so"], [real_tc + "/lib/lean", "$ORIGIN"])
+        (tc_via_sym / "lib" / "lean" / "libleanshared.so").write_bytes(shared_elf)
+        os.chmod(tc_via_sym / "lib" / "lean" / "libleanshared.so", 0o644)
+        pin_path = self.tmp / "anc-sym-pin.json"
+        ws = self.workspace()
+        dumped = V.verify_toolchain(ws.root, toolchain_dir=tc_via_sym)
+        V.write_toolchain_pin(dumped, pin_path)
+        verified = V.verify_toolchain(ws.root, toolchain_dir=tc_via_sym, toolchain_pin_json=pin_path)
+        self.assertEqual(verified.pin_status, "verified")
+        lean_elf = make_elf64(["libleanshared.so"], [real_tc + "/lib/lean", "$ORIGIN/../lib/lean"])
+        (tc_via_sym / "bin" / "lean").write_bytes(lean_elf)
+        os.chmod(tc_via_sym / "bin" / "lean", 0o755)
+        release = {
+            "files": {
+                rel: _sha256((tc_via_sym / rel).read_bytes())
+                for rel in ("bin/lean", "bin/lake", "lib/lean/libleanshared.so", "lib/lean/libleanshared_1.so",
+                            "lib/lean/libleanshared_2.so", "lib/lean/libInit_shared.so")
+            }
+        }
+        self.assertEqual(CT.lean_release_findings(tc_via_sym, release), [])
+
+    def test_elan_parent_world_writable_or_symlink_settings_never_executes_binaries(self) -> None:
+        ws = self.workspace()
+        elan = self.tmp / "elan-ww"
+        toolchains = elan / "toolchains"
+        toolchains.mkdir(parents=True)
+        os.chmod(elan, 0o755)
+        os.chmod(toolchains, 0o755)
+        tc_dir = make_fake_toolchain(toolchains, name=V.toolchain_dir_name(REPO_TOOLCHAIN))
+        canary = self.tmp / "elan-ww-canary"
+        (tc_dir / "bin" / "lean").write_text(
+            f"#!/bin/sh\necho pwned > {shlex.quote(str(canary))}\n"
+            f"echo 'Lean (version {REPO_LEAN_VERSION}, x86_64-unknown-linux-gnu, commit {FAKE_COMMIT}, Release)'\n"
+        )
+        os.chmod(tc_dir / "bin" / "lean", 0o755)
+        pin_file = self.tmp / "elan-ww-pin.json"
+        V.write_toolchain_pin(V.verify_toolchain(ws.root, toolchain_dir=tc_dir), pin_file)
+        if canary.exists():
+            canary.unlink()
+        os.chmod(toolchains, 0o777)
+        try:
+            self.assertRejected(
+                lambda: V.verify_toolchain(ws.root, elan_home=elan, toolchain_pin_json=pin_file, environ={}),
+                "elan toolchains directory",
+                "is world-writable",
+                "skipped `bin/lean --version`",
+            )
+            self.assertFalse(canary.exists())
+        finally:
+            os.chmod(toolchains, 0o755)
+        # Broken symlink at `settings.toml` and world-writable `settings.toml` both fail closed.
+        os.symlink("/nonexistent-elan-settings", elan / "settings.toml")
+        self.assertRejected(
+            lambda: V.verify_toolchain(ws.root, elan_home=elan, toolchain_pin_json=pin_file, environ={}),
+            "elan settings",
+            "is a symlink",
+            "skipped `bin/lean --version`",
+        )
+        self.assertFalse(canary.exists())
+        (elan / "settings.toml").unlink()
+        (elan / "settings.toml").write_text('default_toolchain = "stable"\n', encoding="utf-8")
+        os.chmod(elan / "settings.toml", 0o666)
+        try:
+            self.assertRejected(
+                lambda: V.verify_toolchain(ws.root, elan_home=elan, toolchain_pin_json=pin_file, environ={}),
+                "elan settings",
+                "is world-writable",
+                "skipped `bin/lean --version`",
+            )
+            self.assertFalse(canary.exists())
+        finally:
+            os.chmod(elan / "settings.toml", 0o644)
 
 
 # ---------------------------------------------------------------------------

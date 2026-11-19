@@ -2657,6 +2657,40 @@ def claimDerefBorrows : List BorrowEntry :=
   [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .active },
    { tag := 3, targetLocal := 1, targetProjection := [], perm := .frozen }]
 
+/-- Layout table `[u8, u16, thin-ptr]` for scalar and sub-scalar typed `Deref` move claims. -/
+def claimScalarDerefLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [claimU8Layout, claimU16Layout, claimPtrLayout] }
+
+/-- Local declarations `_0 : u8, _1 : u8, _2 : *mut u8` for the transparent root-move
+and raw-pointer `Deref` re-initialization claim. -/
+def claimU8ScalarDerefDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := claimU8Ty, debugName := .none },
+   { mutability := .mut, ty := claimU8Ty, debugName := .none },
+   { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 2 }, debugName := .none }]
+
+/-- Local declarations `_0 : u8, _1 : u16, _2 : *mut u16, _3 : *mut u8, _4 : *const u8`
+for the full-scalar vs strict-sub-scalar `Deref` move claim. -/
+def claimU16ScalarDerefDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := claimU8Ty, debugName := .none },
+   { mutability := .mut, ty := claimU16Ty, debugName := .none },
+   { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u16), layoutIdx := 2 }, debugName := .none },
+   { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 2 }, debugName := .none },
+   { mutability := .not, ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 2 }, debugName := .none }]
+
+/-- Layout table `[u8, u16, union U, thin-ptr]` for the union byte-window `Deref` move claim. -/
+def claimUnionPtrLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [claimU8Layout, claimU16Layout, claimUnionULayout, claimPtrLayout] }
+
+/-- Local declarations `_0 : u8, _1 : U, _2 : *mut u8, _3 : *const u8` for the union
+byte-window `Deref` move claim. -/
+def claimUnionPtrDecls : List LocalDecl :=
+  [{ mutability := .mut, ty := claimU8Ty, debugName := .none },
+   { mutability := .mut, ty := { kind := .adt "U" [], layoutIdx := 2 }, debugName := .none },
+   { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 3 }, debugName := .none },
+   { mutability := .not, ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 3 }, debugName := .none }]
+
 /-- **Live bridge to `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand`.**
 
 (a) Moving an unprojected root local returns its value and sets the slot to
@@ -2746,11 +2780,26 @@ def claimDerefBorrows : List BorrowEntry :=
        move _l.idx]` fault with `.ub`, and `[move _l.idx, copy _l.j]` returns
        `[v, w]` on every non-union sibling field `j ≠ idx`; if the moved field is
        zero-sized, moving `_l.idx` leaves the aggregate intact so both
-       `[move _l.idx, copy _l.idx]` and `[move _l.idx, copy _l]` succeed; and
+       `[move _l.idx, copy _l.idx]` and `[move _l.idx, copy _l]` succeed;
    16. (*non-vacuity of both polarities of 15*) on a typed aggregate `_1 : ((), u8)`
        whose `0`-byte field holds `.aggregate 0 [] ≠ .unit`, `[move _1.0, copy _1]`
        succeeds in the typed context while faulting with `.ub` in the untyped
-       context, and `[move _1.1, copy _1]` faults with `.ub`. -/
+       context, and `[move _1.1, copy _1]` faults with `.ub`;
+   17. (*transparent-projection moves & typed `Deref` sub-place re-initialization*)
+       moving a non-zero-sized local wrapped in `.unwrapUnsafeBinder` or
+       `.opaqueCast` marks its slot with `movedMarkerValue` so re-reading `_l`
+       faults with `.ub` in all states, and after moving `(*_2).0` out of
+       `_1 = [(1, 2), (3, 4)]` (`_2 : *mut (u8, u8)` at byte offset `2`), writing
+       `(*_2).0 = 9` via `writePlaceValue` (`writeStackThinPtrTypedDeref`) replaces
+       `movedUninitValue` and restores `_1[1] = (9, 4)`; and
+   18. (*full-scalar vs strict-sub-scalar vs union byte-window `Deref` moves*)
+       moving a full-width scalar through `*(_2 : *mut u16)` sets `_1 : u16` to
+       `.uninit` (allowing `*_2 = v` re-initialization); moving a strict sub-scalar
+       byte slice through `*(_3 : *mut u8)` on a non-union `_1 : u16` fails closed
+       with `.unsupported` rather than poisoning unmoved sibling bytes (`copy (*_4)`
+       at byte `1` remains `.ok`); whereas moving `*(_2 : *mut u8)` at byte `0` of
+       `union U { a: u8, b: u16 }` deinitializes byte `0` via its `AbstractByte`
+       overlay while preserving the unmoved byte `1` (`copy (*_3) = .ok`). -/
 def TrustedProjectedMoveDeinitClaim : Prop :=
   -- (a) root moves (legacy `false` and `deinitProjectedMoves := true`)
   (∀ (locals locals' : List LocalSlot) (l : Local) (v : Value) (borrows : List BorrowEntry)
@@ -3100,6 +3149,89 @@ def TrustedProjectedMoveDeinitClaim : Prop :=
     evalOperands locals [.move ⟨l, [.field 0 fty0]⟩, .copy ⟨l, []⟩] [] [] layouts [] []
       [] true = .ub ∧
     evalOperands locals [.move ⟨l, [.field 1 fty1]⟩, .copy ⟨l, []⟩] [] [] layouts [] localDecls
-      [] true = .ub)
+      [] true = .ub) ∧
+  -- (c17) transparent-projection moves (`unwrapUnsafeBinder` / `opaqueCast`) fault
+  --       on re-read (all states), and typed `Deref` sub-place `writePlaceValue`
+  --       re-initializes a moved-out `movedUninitValue` field
+  ((∀ (locals locals' : List LocalSlot) (l : Local) (v : Value) (ty : Ty)
+        (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
+        (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+        (callStack : List SavedCallerFrame),
+      Trusted.Sequence.get? locals l = some (.init v) →
+      Trusted.Sequence.set? locals l (.init (movedMarkerValue [] v)) = some locals' →
+      valueContainsMovedUninit v = false →
+      (placeTouchesUnion localDecls layouts ⟨l, [.unwrapUnsafeBinder ty]⟩ = false →
+        moveValueIsZeroSized localDecls layouts
+            (placeTyResolved localDecls layouts ⟨l, [.unwrapUnsafeBinder ty]⟩) v = false →
+        evalOperand locals (.move ⟨l, [.unwrapUnsafeBinder ty]⟩) borrows globals layouts
+          callerLocals localDecls callStack true = .ok v locals') ∧
+      (placeTouchesUnion localDecls layouts ⟨l, [.opaqueCast ty]⟩ = false →
+        moveValueIsZeroSized localDecls layouts
+            (placeTyResolved localDecls layouts ⟨l, [.opaqueCast ty]⟩) v = false →
+        evalOperand locals (.move ⟨l, [.opaqueCast ty]⟩) borrows globals layouts callerLocals
+          localDecls callStack true = .ok v locals')) ∧
+    evalOperand [.uninit, .init (u8Value 5), .init (.ptr { allocId := 2, offsetBytes := 0 } 8)]
+        (.move ⟨1, [.unwrapUnsafeBinder claimU8Ty]⟩) claimDerefBorrows [] claimScalarDerefLayouts
+        [] claimU8ScalarDerefDecls [] true =
+      .ok (u8Value 5)
+        [.uninit, .init movedUninitValue, .init (.ptr { allocId := 2, offsetBytes := 0 } 8)] ∧
+    evalOperand
+        [.uninit, .init movedUninitValue, .init (.ptr { allocId := 2, offsetBytes := 0 } 8)]
+        (.copy ⟨1, []⟩) claimDerefBorrows [] claimScalarDerefLayouts [] claimU8ScalarDerefDecls
+        [] true = .ub ∧
+    (∃ localsMoved localsReinit : List LocalSlot,
+      evalOperand
+          [.uninit,
+           .init (.aggregate 0 [.aggregate 0 [u8Value 1, u8Value 2],
+             .aggregate 0 [u8Value 3, u8Value 4]]),
+           .init (.ptr { allocId := 2, offsetBytes := 2 } 8),
+           .init (.ptr { allocId := 3, offsetBytes := 2 } 8)]
+          (.move ⟨2, [.deref, .field 0 claimU8Ty]⟩) claimDerefBorrows [] claimPairArrLayouts []
+          claimPairArrDecls [] true = .ok (u8Value 3) localsMoved ∧
+      writePlaceValue localsMoved claimDerefBorrows ⟨2, [.deref, .field 0 claimU8Ty]⟩ (u8Value 9)
+          claimPairArrDecls claimPairArrLayouts = .ok localsReinit ∧
+      evalOperand localsReinit (.copy ⟨2, [.deref, .field 0 claimU8Ty]⟩) claimDerefBorrows []
+          claimPairArrLayouts [] claimPairArrDecls [] true = .ok (u8Value 9) localsReinit ∧
+      evalOperand localsReinit (.copy ⟨1, [.constantIndex 1 2 false]⟩) claimDerefBorrows []
+          claimPairArrLayouts [] claimPairArrDecls [] true =
+        .ok (.aggregate 0 [u8Value 9, u8Value 4]) localsReinit)) ∧
+  -- (c18) full-scalar vs strict-sub-scalar fail-closed vs union byte-window `Deref` moves
+  (let u16Init : List LocalSlot :=
+      [.uninit, .init (.scalar ⟨770, 2⟩),
+       .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 3, offsetBytes := 1 } 8)]
+   let u16Moved : List LocalSlot :=
+      [.uninit, .uninit,
+       .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 3, offsetBytes := 1 } 8)]
+   evalOperand u16Init (.move ⟨2, [.deref]⟩) claimDerefBorrows [] claimScalarDerefLayouts []
+      claimU16ScalarDerefDecls [] true = .ok (.scalar ⟨770, 2⟩) u16Moved ∧
+   writePlaceValue u16Moved claimDerefBorrows ⟨2, [.deref]⟩ (.scalar ⟨1284, 2⟩)
+      claimU16ScalarDerefDecls claimScalarDerefLayouts =
+     .ok [.uninit, .init (.scalar ⟨1284, 2⟩),
+          .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+          .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+          .init (.ptr { allocId := 3, offsetBytes := 1 } 8)] ∧
+   evalOperand u16Init (.copy ⟨3, [.deref]⟩) claimDerefBorrows [] claimScalarDerefLayouts []
+      claimU16ScalarDerefDecls [] true = .ok (u8Value 2) u16Init ∧
+   evalOperand u16Init (.copy ⟨4, [.deref]⟩) claimDerefBorrows [] claimScalarDerefLayouts []
+      claimU16ScalarDerefDecls [] true = .ok (u8Value 3) u16Init ∧
+   evalOperand u16Init (.move ⟨3, [.deref]⟩) claimDerefBorrows [] claimScalarDerefLayouts []
+      claimU16ScalarDerefDecls [] true = .unsupported ∧
+   ∃ localsUnion' : List LocalSlot,
+     evalOperand
+         [.uninit, .init (.aggregate 0 [.unit, .scalar ⟨770, 2⟩]),
+          .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+          .init (.ptr { allocId := 3, offsetBytes := 1 } 8)]
+         (.move ⟨2, [.deref]⟩) claimDerefBorrows [] claimUnionPtrLayouts [] claimUnionPtrDecls []
+         true = .ok (u8Value 2) localsUnion' ∧
+     evalOperand localsUnion' (.copy ⟨2, [.deref]⟩) claimDerefBorrows [] claimUnionPtrLayouts []
+       claimUnionPtrDecls [] true = .ub ∧
+     evalOperand localsUnion' (.copy ⟨1, [.field 1 claimU16Ty]⟩) claimDerefBorrows []
+       claimUnionPtrLayouts [] claimUnionPtrDecls [] true = .ub ∧
+     evalOperand localsUnion' (.copy ⟨3, [.deref]⟩) claimDerefBorrows [] claimUnionPtrLayouts []
+       claimUnionPtrDecls [] true = .ok (u8Value 3) localsUnion')
 
 end Trusted.Correspondence

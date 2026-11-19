@@ -926,6 +926,19 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         shutil.rmtree(prefix / "lib/extra")
         expect_finding(install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"], extra_dyn=[(0x7FFFFFFD, "libaux.so")])),
                        "cannot parse the ELF dynamic section of bin/lean: unsupported ELF dynamic filter tag (DT_AUXILIARY/DT_FILTER)")
+        expect_finding(install(elf64(["libleanshared.so"], ["$ORIGIN/../lib/lean"], extra_dyn=[(0x6FFFFEFC, "libaudit.so")])),
+                       "cannot parse the ELF dynamic section of bin/lean: unsupported ELF dynamic audit tag (DT_AUDIT/DT_DEPAUDIT)")
+        ext_sym = suite / "ext-sym-to-prefix"
+        os.symlink(os.path.realpath(prefix), ext_sym)
+        expect_finding(install(elf64(["libleanshared.so"], [str(ext_sym / "lib/lean")])),
+                       "bin/lean: DT_RUNPATH entry")
+        ext_sym.unlink()
+        sym_anc = suite / "sym-anc"
+        os.symlink(suite, sym_anc)
+        anc_release = install(elf64(["libleanshared.so"], [os.path.realpath(prefix) + "/lib/lean", "$ORIGIN/../lib/lean"]))
+        assert runner.lean_release_findings(sym_anc / "toolchain-fixture", anc_release) == [], \
+            runner.lean_release_findings(sym_anc / "toolchain-fixture", anc_release)
+        sym_anc.unlink()
         prefix.chmod(0o777)
         expect_finding(clean, "toolchain root is world-writable")
         prefix.chmod(0o755)

@@ -593,4 +593,45 @@ theorem canary_trusted_evalOperands_D7_deref_order_with_frozen_sibling :
         .ok [u8Value 3, u8Value 4] d5TrustedTypedDerefAfterMove :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-- **`D1`/`D3`/`D5` transparent-projection move, typed `Deref` sub-place
+re-initialization, and sub-scalar vs union byte-window `Deref` canaries**:
+1. `move (unwrap_unsafe!(_1))` marks `_1` with `movedUninitValue`, and
+   `(*_2).0 = 9` via `writePlaceValue` re-initializes the moved-out field of
+   `_1 : [(u8, u8); 2]`;
+2. strict sub-scalar `move (*_3)` (`*mut u8` on non-union `_1 : u16`) fails
+   closed with `.unsupported` rather than poisoning byte `1`; and
+3. `move (*_2)` (`*mut u8` at byte `0` of `union U { a: u8, b: u16 }`)
+   deinitializes byte `0` while keeping byte `1` (`copy (*_3)`) readable. -/
+theorem canary_trusted_transparent_root_and_subscalar_deref_move :
+    let u16Init : List LocalSlot :=
+      [.uninit, .init (.scalar ⟨770, 2⟩),
+       .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+       .init (.ptr { allocId := 3, offsetBytes := 1 } 8)]
+    evalOperand [.uninit, .init (u8Value 5), .init (.ptr { allocId := 2, offsetBytes := 0 } 8)]
+        (.move (tpl 1 [.unwrapUnsafeBinder claimU8Ty])) claimDerefBorrows []
+        claimScalarDerefLayouts [] claimU8ScalarDerefDecls [] true =
+      .ok (u8Value 5)
+        [.uninit, .init movedUninitValue, .init (.ptr { allocId := 2, offsetBytes := 0 } 8)] ∧
+    writePlaceValue d5TrustedTypedDerefAfterMove claimDerefBorrows
+        (tpl 2 [.deref, .field 0 claimU8Ty]) (u8Value 9) claimPairArrDecls claimPairArrLayouts =
+      .ok [.uninit,
+           .init (.aggregate 0 [.aggregate 0 [u8Value 1, u8Value 2],
+             .aggregate 0 [u8Value 9, u8Value 4]]),
+           .init (.ptr { allocId := 2, offsetBytes := 2 } 8),
+           .init (.ptr { allocId := 3, offsetBytes := 2 } 8)] ∧
+    evalOperand u16Init (.move (tpl 3 [.deref])) claimDerefBorrows [] claimScalarDerefLayouts []
+      claimU16ScalarDerefDecls [] true = .unsupported ∧
+    evalOperand
+        [.uninit, .init (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨0, 0⟩, .scalar ⟨3, 1⟩]]),
+         .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+         .init (.ptr { allocId := 3, offsetBytes := 1 } 8)]
+        (.copy (tpl 3 [.deref])) claimDerefBorrows [] claimUnionPtrLayouts [] claimUnionPtrDecls []
+        true =
+      .ok (u8Value 3)
+        [.uninit, .init (.aggregate 0 [.unit, .unit, .aggregate 0 [.scalar ⟨0, 0⟩, .scalar ⟨3, 1⟩]]),
+         .init (.ptr { allocId := 2, offsetBytes := 0 } 8),
+         .init (.ptr { allocId := 3, offsetBytes := 1 } 8)] :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
 end Anneal.Mir.Correspondence

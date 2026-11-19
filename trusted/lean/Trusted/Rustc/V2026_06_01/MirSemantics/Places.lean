@@ -10625,13 +10625,12 @@ def deinitSubPlaceByteWindow
         | false =>
           match oldSubVal with
           | .scalar oldSc =>
-            match Nat.ble (Nat.add byteOff reqBytes) oldSc.sizeBytes with
+            match Bool.and (Nat.beq byteOff 0) (Nat.beq reqBytes oldSc.sizeBytes) with
             | false => .none
             | true =>
-              match containerProj, Bool.and (Nat.beq byteOff 0) (Nat.beq reqBytes oldSc.sizeBytes) with
-              | .nil, true => set? locals targetLocal .uninit
-              | .nil, false => set? locals targetLocal (.init movedUninitValue)
-              | _ :: _, _ =>
+              match containerProj with
+              | .nil => set? locals targetLocal .uninit
+              | _ :: _ =>
                 match writeProjectedForLocal locals localDecls layouts targetLocal targetRootVal containerProj movedUninitValue with
                 | .ok rootVal' => set? locals targetLocal (.init rootVal')
                 | .ub => .none
