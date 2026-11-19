@@ -2271,7 +2271,7 @@ fn enforces_mir_wp_canary_claim_proof_rules() {
 
 /// Verifies Pass 2 non-backsliding enforcement (`--require-correspondence`):
 /// missing correspondence directories, `verifyCorrespondenceClaims` across all
-/// 40 required claims, and `verifyRefEvaluatorIndependence` (required Miri
+/// 41 required claims, and `verifyRefEvaluatorIndependence` (required Miri
 /// primitives and rejection of named `Trusted.MirSemantics` evaluator entry
 /// points).
 #[test]
@@ -2422,6 +2422,8 @@ fn enforces_correspondence_non_backsliding() {
          def isZstEnumTy : Nat := 0\n\
          def findDiscrVariant? : Nat := 0\n\
          def assignHasUnsupportedOverlap : Nat := 0\n\
+         def anyMoveOperandMayOverlapPlace : Nat := 0\n\
+         def deinitPlace : Nat := 0\n\
          def writeAggregateTuple : Nat := 0\n\
          def bodyEntryAdmitted : Nat := 0\n\
          def evalCallArgs : Nat := 0\n\
@@ -2488,7 +2490,7 @@ fn enforces_correspondence_non_backsliding() {
         "unexpected error: {err_weak_claim}"
     );
 
-    // 2b. When all 40 required claims and proofs are present,
+    // 2b. When all 41 required claims and proofs are present,
     // `verifyCorrespondenceClaims` succeeds and
     // `verifyRefEvaluatorIndependence` rejects an `evalRefStep` that omits
     // required Miri primitives or illegally references a named
@@ -2543,6 +2545,10 @@ fn enforces_correspondence_non_backsliding() {
              def mkBinaryBuiltinProgD22 : Nat := 0\n\
              def progDivergingCallReturnD23 : Nat := 0\n\
              def progDivergingBuiltinD23 : Nat := 0\n\
+             def progCallDeinitUnwindReadD24 : Nat := 0\n\
+             def progCallMoveOverlapDstD24 : Nat := 0\n\
+             def progBuiltinMoveOverlapDstD24 : Nat := 0\n\
+             def progCallAndBuiltinCopyOverlapDstD24 : Nat := 0\n\
              def initRefState : Nat := 0\n\
              def evalRefStep : Nat := {eval_ref_step_body}\n\
              def CorrespondenceClaim : Prop :=\n\
@@ -2672,6 +2678,13 @@ fn enforces_correspondence_non_backsliding() {
                progDivergingCallReturnD23 = encodeProg ∧\n\
                Trusted.MirSemantics.ReachesResult ∧ Trusted.MirSemantics.WellFormed ∧\n\
                RefReachesOutcome\n\
+             def CanaryD24CallDeinitAndOverlapClaim : Prop :=\n\
+               progCallDeinitUnwindReadD24 = progCallMoveOverlapDstD24 ∧\n\
+               progBuiltinMoveOverlapDstD24 = progCallAndBuiltinCopyOverlapDstD24 ∧\n\
+               progCallDeinitUnwindReadD24 = encodeProg ∧\n\
+               Trusted.MirSemantics.WellFormed ∧ Trusted.MirSemantics.Behavior ∧\n\
+               RefWellFormed ∧ RefBehavior ∧\n\
+               Trusted.MirSemantics.ReachesResult ∧ RefReachesOutcome\n\
              end Trusted.Correspondence\n"
         )
     };
@@ -2742,6 +2755,8 @@ fn enforces_correspondence_non_backsliding() {
                ⟨Eq.refl _, Eq.refl _, True.intro, True.intro, True.intro, True.intro, True.intro⟩\n\
              theorem canary_D23_diverging_call_return_ub : CanaryD23DivergingCallReturnUbClaim :=\n\
                ⟨Eq.refl _, Eq.refl _, True.intro, True.intro, True.intro⟩\n\
+             theorem canary_D24_call_deinit_and_overlap : CanaryD24CallDeinitAndOverlapClaim :=\n\
+               ⟨Eq.refl _, Eq.refl _, Eq.refl _, True.intro, True.intro, True.intro, True.intro, True.intro, True.intro⟩\n\
              end Anneal.MirCorrespondenceProof\n"
         )
     };
@@ -2900,6 +2915,8 @@ fn enforces_correspondence_non_backsliding() {
         "isZstEnumTy",
         "findDiscrVariant?",
         "assignHasUnsupportedOverlap",
+        "anyMoveOperandMayOverlapPlace",
+        "deinitPlace",
         "writeAggregateTuple",
         "bodyEntryAdmitted",
         "evalCallArgs",

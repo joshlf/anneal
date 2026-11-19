@@ -1567,6 +1567,27 @@ noncomputable def anyOperandMayOverlapPlace (dst : Place) :
   | opnd :: rest =>
     operandMayOverlapPlace dst opnd || anyOperandMayOverlapPlace dst rest
 
+/-- Return `true` iff `opnd` is a `.move` whose source place may overlap `dst`.
+In `rustc` (`compiler/rustc_const_eval/src/interpret/call.rs`,
+`move_definitely_disjoint` + `init_stack_frame`) and `lean-miri`
+(`Miri/Interpreter/Call.lean`, `moveDefinitelyDisjoint` + `passArgument` +
+`protectArgument`), passing a `.move` argument whose local overlaps the call
+destination disables `move_definitely_disjoint`, forces the argument in-place,
+and applies Tree Borrows / Stacked Borrows protectors to both the moved
+argument and `dst`, causing immediate UB even for scalars. -/
+noncomputable def moveOperandMayOverlapPlace (dst : Place) : Operand → Bool
+  | .move src => placesMayOverlap dst src
+  | .copy _ => false
+  | .constant _ => false
+
+/-- Return `true` iff any `.move` operand in `ops` may overlap `dst`. -/
+noncomputable def anyMoveOperandMayOverlapPlace (dst : Place) :
+    List Operand → Bool
+  | [] => false
+  | opnd :: rest =>
+    moveOperandMayOverlapPlace dst opnd ||
+      anyMoveOperandMayOverlapPlace dst rest
+
 /-- Return `true` iff `ty` is a tuple type (`MirTy.tuple _`). -/
 noncomputable def isTupleTy : MirTy → Bool
   | .tuple _ => true
@@ -2057,22 +2078,28 @@ noncomputable def jumpToBlock (frame : FrameState) (callers : List FrameState)
     callerMem
   }
 
-/-- Check that `place` resolves to a live storage slot in `locals` whose shape
-matches `place.projection` (without requiring initialization), matching the
-`place_to_op(destination)` liveness check in `init_stack_frame`
+/-- Deinitialize `place` of type `ty` in `locals` on call entry: verifies that
+`place` resolves to a live storage slot whose shape matches `place.projection`
+and writes `uninitSlotVal ty` at that subplace (`writeSlotPath?`), matching the
+`place_to_op(destination)` liveness check and
+`protect_in_place_function_argument` (`write_uninit`) in `init_stack_frame`
 (`compiler/rustc_const_eval/src/interpret/call.rs`, `rust-lang/rust`
 `8144389c895da997dbdecaa635e41d6a50be6ffd`) and
-`Miri.Interpreter.Call.initStackFrame`
-(`vendor/lean-miri/Miri/Interpreter/Call.lean`). -/
-noncomputable def checkPlaceLive (locals : List LocalSlot) (place : Place) :
-    Except FaultKind Unit :=
+`Miri.Interpreter.Call.initStackFrame` /
+`Miri.Interpreter.MachineHooks.protectInPlaceFunctionArgument`
+(`vendor/lean-miri/Miri/Interpreter/{Call,MachineHooks}.lean`). -/
+noncomputable def deinitPlace (locals : List LocalSlot) (place : Place)
+    (ty : MirTy) : Except FaultKind (List LocalSlot) :=
   match getElem? locals place.localId with
   | none => .error .unsupported
   | some .dead => .error .undefined
   | some (.live root) =>
-    match readSlotPath? root place.projection with
-    | some _ => .ok ()
+    match writeSlotPath? root place.projection (uninitSlotVal ty) with
     | none => .error .unsupported
+    | some root' =>
+      match setElem? locals place.localId (.live root') with
+      | some locals' => .ok locals'
+      | none => .error .unsupported
 
 /-- Stage 1 left-to-right call argument evaluation via `evalOperandToSlot`,
 threading `locals` across conservative `Operand.move` deinitializations in
@@ -2462,15 +2489,18 @@ that panics on a zero divisor) can still satisfy `WellFormed` and
   cleanup block (`bb.cleanup = false`) it faults with `.unsupported`, matching
   the `return_from_current_stack_frame` assertion that unwinding returns only
   from cleanup blocks (as `.return_` faults with `.unsupported` inside one).
-- `.call callee args dst target unwind` resolves `dst`'s static type in the
-  caller, evaluates `args` left-to-right (`evalCallArgs`), checks `callee`'s
-  existence, `bodyEntryAdmitted`, argument arity, and return-type compatibility
-  against `dst`, checks `dst` liveness (`checkPlaceLive`), validates `args`
-  left-to-right (`validateCallArgs`), initializes the callee locals
-  (`initLocalsLoop`), and pushes the callee frame with
-  `returnCont = some ⟨dst, target, unwind⟩` onto the call stack.
-- `.callBuiltin builtin args dst target _unwind` resolves `dst`'s static type,
-  evaluates `args` left-to-right (`evalCallArgs` + `readPrimitiveArgs`),
+- `.call callee args dst target unwind` rejects `.move` arguments that may
+  overlap `dst` (`anyMoveOperandMayOverlapPlace`), resolves `dst`'s static type
+  in the caller, evaluates `args` left-to-right (`evalCallArgs`), checks
+  `callee`'s existence, `bodyEntryAdmitted`, argument arity, and return-type
+  compatibility against `dst`, deinitializes `dst` on call entry
+  (`deinitPlace`), validates `args` left-to-right (`validateCallArgs`),
+  initializes the callee locals (`initLocalsLoop`), and pushes the callee frame
+  with `returnCont = some ⟨dst, target, unwind⟩` onto the call stack above the
+  caller frame with deinitialized `dst`.
+- `.callBuiltin builtin args dst target _unwind` rejects `.move` arguments that
+  may overlap `dst` (`anyMoveOperandMayOverlapPlace`), resolves `dst`'s static
+  type, evaluates `args` left-to-right (`evalCallArgs` + `readPrimitiveArgs`),
   evaluates `evalCoreBuiltin`, writes the result into `dst` (`writePlace`), and
   jumps to `target` (or faults with `.undefined` when `target = none`). -/
 noncomputable def evalTerminator (p : Program) (body : Body) (bb : BasicBlock)
@@ -2549,76 +2579,82 @@ noncomputable def evalTerminator (p : Program) (body : Body) (bb : BasicBlock)
     else
       .fault .unsupported
   | .call callee args dst target unwind =>
-    match getElem? body.locals dst.localId with
-    | none => .fault .unsupported
-    | some localTy =>
-      match projectTy? localTy dst.projection with
+    if anyMoveOperandMayOverlapPlace dst args then
+      .fault .unsupported
+    else
+      match getElem? body.locals dst.localId with
       | none => .fault .unsupported
-      | some dstTy =>
-        match evalCallArgs body.locals frame.locals args with
-        | .error k => .fault k
-        | .ok (argPairs, localsAfterArgs) =>
-          match getElem? p.bodies callee with
-          | none => .fault .unsupported
-          | some calleeBody =>
-            if !bodyEntryAdmitted calleeBody then
-              .fault .unsupported
-            else if !Nat.beq argPairs.length calleeBody.argumentCount then
-              .fault .unsupported
-            else
-              match getElem? calleeBody.locals 0 with
-              | none => .fault .unsupported
-              | some calleeRetTy =>
-                if !MirTy.beq calleeRetTy dstTy then
-                  .fault .unsupported
-                else
-                  match checkPlaceLive localsAfterArgs dst with
-                  | .error k => .fault k
-                  | .ok () =>
-                    let paramTys :=
-                      (calleeBody.locals.drop 1).take calleeBody.argumentCount
-                    match validateCallArgs argPairs paramTys with
-                    | .error k => .fault k
-                    | .ok argVals =>
-                      let calleeLocals :=
-                        initLocalsLoop calleeBody argVals 0 calleeBody.locals
-                      let callerFrame' : FrameState :=
-                        { frame with locals := localsAfterArgs }
-                      let calleeFrame : FrameState := {
-                        defId := callee
-                        blockIdx := 0
-                        stmtIdx := 0
-                        locals := calleeLocals
-                        returnCont := some ⟨dst, target, unwind⟩
-                      }
-                      .step {
-                        frames := calleeFrame :: callerFrame' :: callers
-                        callerMem
-                      }
-  | .callBuiltin builtin args dst target _ =>
-    match getElem? body.locals dst.localId with
-    | none => .fault .unsupported
-    | some localTy =>
-      match projectTy? localTy dst.projection with
-      | none => .fault .unsupported
-      | some dstTy =>
-        match evalCallArgs body.locals frame.locals args with
-        | .error k => .fault k
-        | .ok (argPairs, localsAfterArgs) =>
-          match readPrimitiveArgs argPairs with
+      | some localTy =>
+        match projectTy? localTy dst.projection with
+        | none => .fault .unsupported
+        | some dstTy =>
+          match evalCallArgs body.locals frame.locals args with
           | .error k => .fault k
-          | .ok argVals =>
-            match evalCoreBuiltin builtin argVals with
+          | .ok (argPairs, localsAfterArgs) =>
+            match getElem? p.bodies callee with
+            | none => .fault .unsupported
+            | some calleeBody =>
+              if !bodyEntryAdmitted calleeBody then
+                .fault .unsupported
+              else if !Nat.beq argPairs.length calleeBody.argumentCount then
+                .fault .unsupported
+              else
+                match getElem? calleeBody.locals 0 with
+                | none => .fault .unsupported
+                | some calleeRetTy =>
+                  if !MirTy.beq calleeRetTy dstTy then
+                    .fault .unsupported
+                  else
+                    match deinitPlace localsAfterArgs dst dstTy with
+                    | .error k => .fault k
+                    | .ok localsAfterDeinit =>
+                      let paramTys :=
+                        (calleeBody.locals.drop 1).take calleeBody.argumentCount
+                      match validateCallArgs argPairs paramTys with
+                      | .error k => .fault k
+                      | .ok argVals =>
+                        let calleeLocals :=
+                          initLocalsLoop calleeBody argVals 0 calleeBody.locals
+                        let callerFrame' : FrameState :=
+                          { frame with locals := localsAfterDeinit }
+                        let calleeFrame : FrameState := {
+                          defId := callee
+                          blockIdx := 0
+                          stmtIdx := 0
+                          locals := calleeLocals
+                          returnCont := some ⟨dst, target, unwind⟩
+                        }
+                        .step {
+                          frames := calleeFrame :: callerFrame' :: callers
+                          callerMem
+                        }
+  | .callBuiltin builtin args dst target _ =>
+    if anyMoveOperandMayOverlapPlace dst args then
+      .fault .unsupported
+    else
+      match getElem? body.locals dst.localId with
+      | none => .fault .unsupported
+      | some localTy =>
+        match projectTy? localTy dst.projection with
+        | none => .fault .unsupported
+        | some dstTy =>
+          match evalCallArgs body.locals frame.locals args with
+          | .error k => .fault k
+          | .ok (argPairs, localsAfterArgs) =>
+            match readPrimitiveArgs argPairs with
             | .error k => .fault k
-            | .ok resVal =>
-              match writePlace localsAfterArgs dst dstTy resVal with
+            | .ok argVals =>
+              match evalCoreBuiltin builtin argVals with
               | .error k => .fault k
-              | .ok localsAfterWrite =>
-                match target with
-                | some nextBb =>
-                  jumpToBlock { frame with locals := localsAfterWrite }
-                    callers callerMem nextBb
-                | none => .fault .undefined
+              | .ok resVal =>
+                match writePlace localsAfterArgs dst dstTy resVal with
+                | .error k => .fault k
+                | .ok localsAfterWrite =>
+                  match target with
+                  | some nextBb =>
+                    jumpToBlock { frame with locals := localsAfterWrite }
+                      callers callerMem nextBb
+                  | none => .fault .undefined
   | .unsupported =>
     .fault .unsupported
 

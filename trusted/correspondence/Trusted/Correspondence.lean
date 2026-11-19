@@ -2033,6 +2033,24 @@ noncomputable def refAnyOperandMayOverlapPlace (dst : Miri.MIR.Place) :
     refOperandMayOverlapPlace dst opnd ||
       refAnyOperandMayOverlapPlace dst rest
 
+/-- Independent $M_{\text{ref}}$ check whether `mirOp` is a `.Move` whose source
+place may overlap `dst`. -/
+noncomputable def refMoveOperandMayOverlapPlace (dst : Miri.MIR.Place) :
+    Miri.MIR.Operand → Bool
+  | .Move src => refPlacesMayOverlap dst src
+  | .Copy _ => false
+  | .Constant _ => false
+  | .RuntimeChecks _ => false
+
+/-- Independent $M_{\text{ref}}$ check whether any `.Move` operand in `ops` may
+overlap `dst`. -/
+noncomputable def refAnyMoveOperandMayOverlapPlace (dst : Miri.MIR.Place) :
+    List Miri.MIR.Operand → Bool
+  | [] => false
+  | opnd :: rest =>
+    refMoveOperandMayOverlapPlace dst opnd ||
+      refAnyMoveOperandMayOverlapPlace dst rest
+
 /-- Independent $M_{\text{ref}}$ tuple-type predicate. -/
 noncomputable def refIsTupleTy : MirTy → Bool
   | .tuple _ => true
@@ -2579,6 +2597,42 @@ noncomputable def refCheckPlaceLive (rlocals : List RefLocalState)
     | _ => .error .undefined
   | _ => .error .unsupported
 
+/-- Independent $M_{\text{ref}}$ call-entry destination deinitialization for
+`Miri.Interpreter.Call.initStackFrame` (`protectArgument destinationMplace`):
+reads the destination local through `Miri.Interpreter.evalPlaceToOp`, writes
+`refUninitSlotVal dst.ty` at `dst.projection` (`refWriteSlotPath?`), and
+commits the updated slot via `Miri.Interpreter.placeWriteLocalImmediate`. -/
+noncomputable def refDeinitPlace (rlocals : List RefLocalState)
+    (dst : RefDest) : Except FaultKind (List RefLocalState) :=
+  match MirSemantics.getElem? rlocals dst.localId with
+  | some ⟨slot, some localTy⟩ =>
+    let frame₀ := mkSingleLocalMiriFrame (slotToMiriLocalValue slot) false
+    match Miri.Interpreter.evalPlaceToOp (refLocalAccessHooks false) frame₀
+        () ⟨0, Array.empty⟩ (some refSizedLocalLayout) with
+    | ⟨_, _, .ok ⟨.immediate imm, _⟩⟩ =>
+      let root : SlotVal :=
+        match miriImmediateToPayload? imm with
+        | some sv => sv
+        | none => .uninit
+      match refWriteSlotPath? root dst.projection
+          (refUninitSlotVal dst.ty) with
+      | none => .error .unsupported
+      | some root' =>
+        match Miri.Interpreter.placeWriteLocalImmediate
+            EStateM.get EStateM.set (pure true)
+            (fun _ _ => pure ()) (fun _ _ => pure ())
+            0 refSizedLocalLayout (payloadToMiriImmediate root') frame₀ with
+        | .ok () frame₁ =>
+          match frame₁.getLocal 0,
+              MirSemantics.setElem? rlocals dst.localId
+                ⟨.live root', some localTy⟩ with
+          | .ok ⟨.live (.immediate _), _⟩, some rlocals' => .ok rlocals'
+          | .ok ⟨.live (.immediate _), _⟩, none => .error .unsupported
+          | _, _ => .error .undefined
+        | .error _ _ => .error .undefined
+    | _ => .error .undefined
+  | _ => .error .unsupported
+
 /-- Stage 2 left-to-right primitive-operand reading for `CoreBuiltin` argument
 lists in $M_{\text{ref}}$ (`readRefPrimitiveSlot`). -/
 noncomputable def refReadPrimitiveArgs :
@@ -3116,16 +3170,19 @@ noncomputable def refCallHooks (rp : RefProg) :
         | [] => .error (.unsupported "empty frames in call destination") st
   placeToOp := fun _ rplace st =>
     match rplace with
-    | .memory ⟨⟨⟨_, some (.arg ty sv)⟩, _, _⟩, _⟩ =>
-      .ok ⟨.immediate (payloadToMiriImmediate (.arg ty sv)),
-        refSizedLocalLayout⟩ st
-    | .memory ⟨⟨⟨_, some (.dst rdest _)⟩, _, _⟩, _⟩ =>
-      match st.machine.frames with
-      | top :: _ =>
-        match refCheckPlaceLive top.locals rdest with
-        | .ok () => .ok ⟨.immediate .uninit, refSizedLocalLayout⟩ st
-        | .error k => .error (faultToStepError k) st
-      | [] => .error (.unsupported "empty frames in destination liveness") st
+    | .memory mp =>
+      match mp.mplace.ptr.provenance with
+      | some (.arg ty sv) =>
+        .ok ⟨.immediate (payloadToMiriImmediate (.arg ty sv)),
+          refSizedLocalLayout⟩ st
+      | some (.dst rdest _) =>
+        match st.machine.frames with
+        | top :: _ =>
+          match refCheckPlaceLive top.locals rdest with
+          | .ok () => .ok ⟨.indirect mp.mplace, mp.layout⟩ st
+          | .error k => .error (faultToStepError k) st
+        | [] => .error (.unsupported "empty frames in destination liveness") st
+      | none => .error (.invalidProgram "unexpected call place in placeToOp") st
     | _ => .error (.invalidProgram "unexpected call place in placeToOp") st
   forceAllocation := fun _ rplace st =>
     match rplace with
@@ -3188,7 +3245,18 @@ noncomputable def refCallHooks (rp : RefProg) :
                 calleeInit := some { ci with
                   argValsRev := v :: ci.argValsRev } } }
     | _, _, _ => .error (.invalidProgram "invalid copyAllowTransmute state") st
-  protectArgument := fun _ _ st => .ok () st
+  protectArgument := fun _ mplace st =>
+    match mplace.mplace.ptr.provenance with
+    | some (.dst rdest _) =>
+      match st.machine.frames with
+      | top :: rest =>
+        match refDeinitPlace top.locals rdest with
+        | .ok localsAfterDeinit =>
+          .ok () { st with machine := { st.machine with
+            frames := { top with locals := localsAfterDeinit } :: rest } }
+        | .error k => .error (faultToStepError k) st
+      | [] => .error (.unsupported "empty frames in destination deinit") st
+    | _ => .ok () st
   withRetagMode := fun _ _ act => act
   nonCapturingClosure := fun _ _ _ st => .ok false st
   allocateStack := fun _ _ st =>
@@ -3496,8 +3564,19 @@ noncomputable def refTerminatorHooksFor (rp : RefProg)
           | .error k => .error (faultToStepError k)
           | .ok _ => .error (.unsupported "non-bool SwitchInt Eq result"))
   call := fun c term st =>
-    Miri.Interpreter.Call.run
-      (Miri.Interpreter.Call.evalCallTerminator (refCallHooks rp) c 2 term) st
+    match term.kind with
+    | .Call _ args dst _ _ _ _ =>
+      if refAnyMoveOperandMayOverlapPlace dst
+          (args.toList.map (fun a => a.operand)) then
+        (st, .error (.unsupported "overlapping move call arg and dest"))
+      else
+        Miri.Interpreter.Call.run
+          (Miri.Interpreter.Call.evalCallTerminator (refCallHooks rp) c 2 term)
+          st
+    | _ =>
+      Miri.Interpreter.Call.run
+        (Miri.Interpreter.Call.evalCallTerminator (refCallHooks rp) c 2 term)
+        st
   tailCall := fun _ _ st => (st, .error (.unsupported "TailCall unsupported"))
   drop := fun _ _ _ _ st => (st, .error (.unsupported "Drop unsupported"))
   ignoreOptionalOverflowChecks := fun _ => false
@@ -4134,7 +4213,7 @@ def DivergesIffRefDivergesClaim : Prop :=
   ∀ (p : Program) (q : Query),
     Diverges p q ↔ RefDiverges (encodeProg p) q
 
-/-! ### Correspondence Canary Programs and Claims (`D6`–`D23`)
+/-! ### Correspondence Canary Programs and Claims (`D6`–`D24`)
 
 `D6`–`D9` are self-consistency canaries of Anneal's deliberately stricter
 move-deinitialization rule (see `evalRefMiriOperandToSlot`): `eval_operand` at
@@ -5300,5 +5379,168 @@ def CanaryD23DivergingCallReturnUbClaim : Prop :=
   ¬ WellFormed progDivergingBuiltinD23 queryEmpty ∧
   (∃ maxSteps, RefReachesOutcome (encodeProg progDivergingBuiltinD23)
     queryEmpty maxSteps .ub)
+
+/-- `D24` (call-entry destination deinitialization observed on unwind):
+Body `0` initializes `_1 = 7u32` and calls unwinding body `1` with destination
+`_1` and `.cleanup 2`. Call entry deinitializes `_1`, so when body `1` panics
+and unwinds into cleanup block `2`, reading `_1` faults with `.undefined` /
+`.ub` rather than reading the stale `7u32`. -/
+noncomputable def progCallDeinitUnwindReadD24 : Program where
+  entryDefId := 0
+  bodies := [
+    {
+      argumentCount := 0
+      locals := [u32Ty, u32Ty]
+      basicBlocks := [
+        {
+          statements := [
+            .assign ⟨1, []⟩
+              (.use (.constant ⟨u32Ty, .scalar (BitVec.ofNat 128 7)⟩))
+          ]
+          terminator := .call 1 [] ⟨1, []⟩ (some 1) (.cleanup 2)
+        },
+        {
+          statements := [.assign ⟨0, []⟩ (.use (.copy ⟨1, []⟩))]
+          terminator := .return_
+        },
+        {
+          statements := [.assign ⟨0, []⟩ (.use (.copy ⟨1, []⟩))]
+          terminator := .unwindResume
+          cleanup := true
+        }
+      ]
+    },
+    {
+      argumentCount := 0
+      locals := [u32Ty]
+      basicBlocks := [{
+        statements := []
+        terminator := .assert
+          (.constant ⟨.bool, .scalar (BitVec.ofNat 128 0)⟩) true
+          (.overflow .add) 0 .continue_
+      }]
+    }
+  ]
+
+/-- `D24` (direct `.call` with `.move` argument overlapping `dst`):
+Body `0` executes `_1 = callee(move _1)`. Because `rustc`/Miri rejects
+overlapping moved arguments and destinations under Tree Borrows / Stacked
+Borrows protectors, both $M_{\text{anneal}}$ and $M_{\text{ref}}$ fail closed
+with `.fault .unsupported` / `.blocked`. -/
+noncomputable def progCallMoveOverlapDstD24 : Program where
+  entryDefId := 0
+  bodies := [
+    {
+      argumentCount := 1
+      locals := [u32Ty, u32Ty]
+      basicBlocks := [
+        {
+          statements := []
+          terminator := .call 1 [.move ⟨1, []⟩] ⟨1, []⟩ (some 1) .continue_
+        },
+        {
+          statements := [.assign ⟨0, []⟩ (.use (.copy ⟨1, []⟩))]
+          terminator := .return_
+        }
+      ]
+    },
+    {
+      argumentCount := 1
+      locals := [u32Ty, u32Ty]
+      basicBlocks := [{
+        statements := [.assign ⟨0, []⟩ (.use (.copy ⟨1, []⟩))]
+        terminator := .return_
+      }]
+    }
+  ]
+
+/-- `D24` (`.callBuiltin` with `.move` argument overlapping `dst`):
+Body `0` executes `_1 = wrapping_add(move _1, 1u32)` and fails closed with
+`.fault .unsupported` / `.blocked`. -/
+noncomputable def progBuiltinMoveOverlapDstD24 : Program where
+  entryDefId := 0
+  bodies := [{
+    argumentCount := 1
+    locals := [u32Ty, u32Ty]
+    basicBlocks := [
+      {
+        statements := []
+        terminator := .callBuiltin .wrappingAdd
+          [.move ⟨1, []⟩, .constant ⟨u32Ty, .scalar (BitVec.ofNat 128 1)⟩]
+          ⟨1, []⟩ (some 1) .continue_
+      },
+      {
+        statements := [.assign ⟨0, []⟩ (.use (.copy ⟨1, []⟩))]
+        terminator := .return_
+      }
+    ]
+  }]
+
+/-- `D24` positive contrast: `.copy` arguments overlapping `dst` remain
+admitted for both direct `.call` and `.callBuiltin`
+(`_1 = id(copy _1); _1 = wrapping_add(copy _1, 1); _0 = copy _1`). -/
+noncomputable def progCallAndBuiltinCopyOverlapDstD24 : Program where
+  entryDefId := 0
+  bodies := [
+    {
+      argumentCount := 1
+      locals := [u32Ty, u32Ty]
+      basicBlocks := [
+        {
+          statements := []
+          terminator := .call 1 [.copy ⟨1, []⟩] ⟨1, []⟩ (some 1) .continue_
+        },
+        {
+          statements := []
+          terminator := .callBuiltin .wrappingAdd
+            [.copy ⟨1, []⟩, .constant ⟨u32Ty, .scalar (BitVec.ofNat 128 1)⟩]
+            ⟨1, []⟩ (some 2) .continue_
+        },
+        {
+          statements := [.assign ⟨0, []⟩ (.use (.copy ⟨1, []⟩))]
+          terminator := .return_
+        }
+      ]
+    },
+    {
+      argumentCount := 1
+      locals := [u32Ty, u32Ty]
+      basicBlocks := [{
+        statements := [.assign ⟨0, []⟩ (.use (.copy ⟨1, []⟩))]
+        terminator := .return_
+      }]
+    }
+  ]
+
+/-- Trusted claim for
+`Anneal.MirCorrespondenceProof.canary_D24_call_deinit_and_overlap`: exercises
+(1) call-entry `dst` deinitialization observed as `.undefined`/`.ub` when a
+caller cleanup block reads `dst` after callee unwind, (2) fail-closed
+`.unsupported`/`.blocked` on `.move` arguments overlapping `dst` for both
+direct `.call` and `.callBuiltin`, and (3) positive contrast admitting `.copy`
+arguments overlapping `dst` for both `.call` and `.callBuiltin`. -/
+def CanaryD24CallDeinitAndOverlapClaim : Prop :=
+  let q9 : Query := { args := [u32Val 9] }
+  ReachesResult progCallDeinitUnwindReadD24 queryEmpty (.fault .undefined) ∧
+  ¬ ReachesResult progCallDeinitUnwindReadD24 queryEmpty (.fault .unsupported) ∧
+  ¬ WellFormed progCallDeinitUnwindReadD24 queryEmpty ∧
+  (∃ maxSteps, RefReachesOutcome (encodeProg progCallDeinitUnwindReadD24)
+    queryEmpty maxSteps .ub) ∧
+  ReachesResult progCallMoveOverlapDstD24 q9 (.fault .unsupported) ∧
+  ¬ ReachesResult progCallMoveOverlapDstD24 q9 (.fault .undefined) ∧
+  ¬ WellFormed progCallMoveOverlapDstD24 q9 ∧
+  (∃ maxSteps, RefReachesOutcome (encodeProg progCallMoveOverlapDstD24)
+    q9 maxSteps .blocked) ∧
+  ReachesResult progBuiltinMoveOverlapDstD24 q9 (.fault .unsupported) ∧
+  ¬ ReachesResult progBuiltinMoveOverlapDstD24 q9 (.fault .undefined) ∧
+  ¬ WellFormed progBuiltinMoveOverlapDstD24 q9 ∧
+  (∃ maxSteps, RefReachesOutcome (encodeProg progBuiltinMoveOverlapDstD24)
+    q9 maxSteps .blocked) ∧
+  WellFormed progCallAndBuiltinCopyOverlapDstD24 q9 ∧
+  Behavior progCallAndBuiltinCopyOverlapDstD24 q9
+    (.returned ⟨u32Val 10, ⟨[]⟩⟩) ∧
+  RefWellFormed (encodeProg progCallAndBuiltinCopyOverlapDstD24) q9 ∧
+  RefBehavior (encodeProg progCallAndBuiltinCopyOverlapDstD24) q9
+    (.returned ⟨u32Val 10, ⟨[]⟩⟩)
 
 end Trusted.Correspondence

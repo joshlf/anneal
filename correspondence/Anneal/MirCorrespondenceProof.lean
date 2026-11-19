@@ -27,7 +27,7 @@ open Anneal.MirCorrespondenceBase
 # MIR Correspondence Proofs (`Anneal.MirCorrespondenceProof`)
 
 This module proves Anneal's per-step MIR simulation, end-to-end correspondence
-theorems, and Pass 2 non-vacuity canaries (`D6`–`D23`) on top of the codec,
+theorems, and Pass 2 non-vacuity canaries (`D6`–`D24`) on top of the codec,
 canonicality, and `vendor/lean-miri` scalar/discriminant bridge lemmas in
 `Anneal.MirCorrespondenceBase`.
 -/
@@ -497,6 +497,61 @@ private theorem refAnyOperandMayOverlapPlace_eq {ts : List MirTy}
     dsimp only [List.map, refAnyOperandMayOverlapPlace,
       anyOperandMayOverlapPlace]
     rw [refOperandMayOverlapPlace_eq h_dst h_o, ih h_os]
+
+private theorem refMoveOperandMayOverlapPlace_eq {ts : List MirTy}
+    {rdst : RefPlace} {dst : Place} {rop : RefOperand} {op : Operand}
+    (h_dst : decodePlace ts rdst = some dst)
+    (h_op : decodeOperand ts rop = some op) :
+    refMoveOperandMayOverlapPlace (toMiriPlace rdst) (toMiriOperand rop) =
+      moveOperandMayOverlapPlace dst op := by
+  cases rop with
+  | copy rp =>
+    dsimp only [decodeOperand, optMap] at h_op
+    cases h_p : decodePlace ts rp with
+    | none => rw [h_p] at h_op; cases h_op
+    | some p =>
+      rw [h_p] at h_op
+      injection h_op with h_eq
+      subst h_eq
+      rfl
+  | move rp =>
+    dsimp only [decodeOperand, optMap] at h_op
+    cases h_p : decodePlace ts rp with
+    | none => rw [h_p] at h_op; cases h_op
+    | some p =>
+      rw [h_p] at h_op
+      injection h_op with h_eq
+      subst h_eq
+      exact refPlacesMayOverlap_eq h_dst h_p
+  | constant rc =>
+    dsimp only [decodeOperand, optMap] at h_op
+    cases h_t : MirSemantics.getElem? ts rc.ty with
+    | none => rw [h_t] at h_op; cases h_op
+    | some ty =>
+      rw [h_t] at h_op
+      injection h_op with h_eq
+      subst h_eq
+      cases rc with | mk _ lit => cases lit <;> rfl
+
+private theorem refAnyMoveOperandMayOverlapPlace_eq {ts : List MirTy}
+    {rdst : RefPlace} {dst : Place} {rops : List RefOperand}
+    {ops : List Operand}
+    (h_dst : decodePlace ts rdst = some dst)
+    (h_ops : mapOption (decodeOperand ts) rops = some ops) :
+    refAnyMoveOperandMayOverlapPlace (toMiriPlace rdst)
+        (rops.map toMiriOperand) =
+      anyMoveOperandMayOverlapPlace dst ops := by
+  induction rops generalizing ops with
+  | nil =>
+    injection h_ops with h_eq
+    subst h_eq
+    rfl
+  | cons ro ros ih =>
+    let ⟨o, os, h_o, h_os, h_eq⟩ := mapOption_cons_inv h_ops
+    subst h_eq
+    dsimp only [List.map, refAnyMoveOperandMayOverlapPlace,
+      anyMoveOperandMayOverlapPlace]
+    rw [refMoveOperandMayOverlapPlace_eq h_dst h_o, ih h_os]
 
 private theorem refIsTupleTy_eq (ty : MirTy) :
     refIsTupleTy ty = isTupleTy ty := by
@@ -3615,15 +3670,88 @@ private theorem writeRefPlace_return_eq {bodyLocals : List MirTy}
             rw [setElem?_zipRefLocals_some h_ty h_set]
             rfl
 
-private theorem refCheckPlaceLive_eq {ts bodyLocals : List MirTy}
+private theorem setElem?_isSome_of_getElem?_some {α : Type} {xs : List α}
+    {i : Nat} {x : α} (h : MirSemantics.getElem? xs i = some x) (y : α) :
+    ∃ xs', MirSemantics.setElem? xs i y = some xs' := by
+  induction xs generalizing i with
+  | nil => cases i <;> cases h
+  | cons a rest ih =>
+    cases i with
+    | zero => exact ⟨y :: rest, rfl⟩
+    | succ k =>
+      let ⟨rest', h_set⟩ := ih h
+      exact ⟨a :: rest', by dsimp only [MirSemantics.setElem?]; rw [h_set]⟩
+
+private theorem readSlotPath?_isSome_iff_writeSlotPath?_isSome
+    (sv : SlotVal) (proj : List ProjectionElem) (new : SlotVal) :
+    (readSlotPath? sv proj).isSome = (writeSlotPath? sv proj new).isSome := by
+  induction proj generalizing sv with
+  | nil => rfl
+  | cons elem rest ih =>
+    cases sv with
+    | tuple fields =>
+      cases elem with
+      | field idx ty =>
+        dsimp only [readSlotPath?, writeSlotPath?]
+        cases h_get : MirSemantics.getElem? fields idx with
+        | none => rfl
+        | some field =>
+          dsimp only
+          have ih' := ih field
+          cases h_w : writeSlotPath? field rest new with
+          | none =>
+            rw [h_w] at ih'
+            cases h_r : readSlotPath? field rest with
+            | none => rfl
+            | some _ => rw [h_r] at ih'; cases ih'
+          | some field' =>
+            dsimp only
+            let ⟨fields', h_set⟩ :=
+              setElem?_isSome_of_getElem?_some h_get field'
+            rw [h_set]
+            rw [h_w] at ih'
+            cases h_r : readSlotPath? field rest with
+            | none => rw [h_r] at ih'; cases ih'
+            | some _ => rfl
+      | deref | unsupported => rfl
+    | uninit | scalar _ | ptr _ | bool _ | unit | enumVal _ _ | bytes _ => rfl
+
+private theorem deinitPlace_length {slots slots' : List LocalSlot}
+    {dst : Place} {dstTy : MirTy}
+    (h : deinitPlace slots dst dstTy = .ok slots') :
+    slots'.length = slots.length := by
+  unfold deinitPlace at h
+  cases h_sl : MirSemantics.getElem? slots dst.localId with
+  | none => rw [h_sl] at h; cases h
+  | some slot =>
+    rw [h_sl] at h
+    cases slot with
+    | dead => cases h
+    | live root =>
+      dsimp only at h
+      cases h_w : writeSlotPath? root dst.projection (uninitSlotVal dstTy) with
+      | none => rw [h_w] at h; cases h
+      | some root' =>
+        rw [h_w] at h; dsimp only at h
+        cases h_set : MirSemantics.setElem? slots dst.localId (.live root') with
+        | none => rw [h_set] at h; cases h
+        | some s' =>
+          rw [h_set] at h
+          injection h with h_eq
+          subst h_eq
+          exact setElem?_length h_set
+
+private theorem refCheckPlaceLive_of_deinitPlace {ts bodyLocals : List MirTy}
     {slots : List LocalSlot} {rproj : List RefProjectionElem} {dst : Place}
     {localTy dstTy : MirTy}
     (h_ty : MirSemantics.getElem? bodyLocals dst.localId = some localTy)
     (h_proj : mapOption (decodeProjElem ts) rproj = some dst.projection) :
     refCheckPlaceLive (zipRefLocals bodyLocals slots)
         ⟨dst.localId, rproj.map toMiriProjElem, dstTy⟩ =
-      checkPlaceLive slots dst := by
-  unfold refCheckPlaceLive checkPlaceLive
+      match deinitPlace slots dst dstTy with
+      | .ok _ => .ok ()
+      | .error k => .error k := by
+  unfold refCheckPlaceLive deinitPlace
   cases h_sl : MirSemantics.getElem? slots dst.localId with
   | none =>
     rw [getElem?_zipRefLocals_none_right h_sl]
@@ -3638,7 +3766,60 @@ private theorem refCheckPlaceLive_eq {ts bodyLocals : List MirTy}
       rw [miriImmToPayload?_roundtrip]
       dsimp only
       rw [refReadSlotPath?_eq h_proj]
-      cases readSlotPath? root dst.projection <;> rfl
+      have h_eq := readSlotPath?_isSome_iff_writeSlotPath?_isSome root
+        dst.projection (uninitSlotVal dstTy)
+      cases h_w : writeSlotPath? root dst.projection (uninitSlotVal dstTy) with
+      | none =>
+        rw [h_w] at h_eq
+        cases h_r : readSlotPath? root dst.projection with
+        | none => rfl
+        | some _ => rw [h_r] at h_eq; cases h_eq
+      | some root' =>
+        dsimp only
+        let ⟨slots', h_set⟩ :=
+          setElem?_isSome_of_getElem?_some h_sl (.live root')
+        rw [h_set]
+        rw [h_w] at h_eq
+        cases h_r : readSlotPath? root dst.projection with
+        | none => rw [h_r] at h_eq; cases h_eq
+        | some _ => rfl
+
+private theorem refDeinitPlace_eq {ts bodyLocals : List MirTy}
+    {slots : List LocalSlot} {rproj : List RefProjectionElem} {dst : Place}
+    {localTy dstTy : MirTy}
+    (h_ty : MirSemantics.getElem? bodyLocals dst.localId = some localTy)
+    (h_proj : mapOption (decodeProjElem ts) rproj = some dst.projection) :
+    refDeinitPlace (zipRefLocals bodyLocals slots)
+        ⟨dst.localId, rproj.map toMiriProjElem, dstTy⟩ =
+      mapSlotsRes bodyLocals (deinitPlace slots dst dstTy) := by
+  unfold refDeinitPlace deinitPlace
+  cases h_sl : MirSemantics.getElem? slots dst.localId with
+  | none =>
+    rw [getElem?_zipRefLocals_none_right h_sl]
+    rfl
+  | some slot =>
+    rw [getElem?_zipRefLocals_some h_ty h_sl]
+    cases slot with
+    | dead => rfl
+    | live root =>
+      dsimp only
+      rw [evalPlaceToOp_sized_live]
+      dsimp only
+      rw [miriImmToPayload?_roundtrip]
+      dsimp only
+      rw [refWriteSlotPath?_eq h_proj, refUninitSlotVal_eq]
+      cases writeSlotPath? root dst.projection (uninitSlotVal dstTy) with
+      | none => rfl
+      | some root' =>
+        dsimp only
+        cases h_set :
+            MirSemantics.setElem? slots dst.localId (.live root') with
+        | none =>
+          rw [setElem?_zipRefLocals_none h_set]
+          rfl
+        | some slots' =>
+          rw [setElem?_zipRefLocals_some h_ty h_set]
+          rfl
 
 private theorem unwindFrame_cleanup (callerMem : CallerMemory) (f : FrameState)
     (callers : List FrameState) (blk : BasicBlockId) :
@@ -5724,9 +5905,6 @@ private theorem passArgument_eq {rp : RefProg}
       .ok (.frameLocal 0 localId none refSizedLocalLayout
         (Miri.Interpreter.LocalsIdentity.ofAllocationToken 0)) st := rfl
   have h_deinit : (refCallHooks rp).deinitMovedPlace = false := rfl
-  have h_prot : ∀ mp st',
-      (refCallHooks rp).protectArgument () mp st' = .ok () st' :=
-    fun _ _ => rfl
   dsimp only [bind, Bind.bind, pure, Pure.pure]
   rw [h_argLay, h_lay]
   have h_eq0 : (0 == refSizedLocalLayout.ty) = true := rfl
@@ -5929,7 +6107,13 @@ private theorem passArgument_eq {rp : RefProg}
               rw [eStateM_bind_ok h_copy]
               rw [h_deinit]
               simp only [Bool.false_eq_true, ite_false]
-              exact h_prot mp _
+              dsimp only [extractRefCallArg?, op] at h_ext
+              cases h_prov : mp.mplace.ptr.provenance with
+              | none => rw [h_prov] at h_ext; cases h_ext
+              | some prov =>
+                cases prov with
+                | dst _ _ => rw [h_prov] at h_ext; cases h_ext
+                | arg _ _ => dsimp only [refCallHooks]; rw [h_prov]
 
 private theorem initStackFrame_argsLoop_eq {rp : RefProg}
     {rbody : RefBody} {calleeBody : Body}
@@ -6228,6 +6412,68 @@ private theorem initStackFrame_argsLoop_dispatch {rp : RefProg} {p : Program}
       (eStateM_bind_ok h_ok (fun __s => EStateM.pure (__s.fst, __s.snd)))]
     exact h_cont argVals mf' h_vc
 
+private theorem of_bool_true_else {P : Prop} (b : Bool)
+    (h_true : b = true → P) (h_false : b = false → P) : P := by
+  cases b with
+  | true => exact h_true rfl
+  | false => exact h_false rfl
+
+private theorem evalRefTerminator_call_overlap {rp : RefProg}
+    {rbb : RefBasicBlock} {rframe : RefFrameState}
+    {rcallers : List RefFrameState} {callerMem : CallerMemory}
+    {func : Miri.MIR.Operand} {margs : Array Miri.MIR.SpannedOperand}
+    {mdest : Miri.MIR.Place} {target : Option BasicBlockId}
+    {munwind : Miri.MIR.UnwindAction}
+    (h_term : toMiriTerminatorForDispatch rbb.terminator = {
+      sourceInfo := ⟨⟨0⟩, 0⟩
+      kind := .Call func margs mdest target munwind .Normal ⟨0⟩
+    })
+    (h_ov : refAnyMoveOperandMayOverlapPlace mdest
+        (margs.toList.map (fun a => a.operand)) = true) :
+    evalRefTerminator rp rbb rframe rcallers callerMem = .fault .unsupported := by
+  rw [evalRefTerminator_eq_of_term]
+  let mirTerm := toMiriTerminatorForDispatch rbb.terminator
+  let st₀ := mkRefTermStepState rframe rcallers mirTerm rbb.cleanup
+  have h_step :
+      Miri.Interpreter.ControlFlow.evalTerminator
+        (refTerminatorHooksFor rp callerMem) () mirTerm st₀ =
+      (st₀, .error (.unsupported "overlapping move call arg and dest")) := by
+    have h_kind : mirTerm.kind =
+        .Call func margs mdest target munwind .Normal ⟨0⟩ := by
+      dsimp only [mirTerm]
+      rw [h_term]
+    have h_call :
+        (refTerminatorHooksFor rp callerMem).call () mirTerm st₀ =
+        (st₀, .error (.unsupported "overlapping move call arg and dest")) := by
+      dsimp only [refTerminatorHooksFor]
+      rw [h_kind]
+      dsimp only
+      rw [h_ov]
+      rfl
+    unfold Miri.Interpreter.ControlFlow.evalTerminator
+    rw [h_kind, h_call]
+    rfl
+  change (match Miri.Interpreter.ControlFlow.evalTerminator
+      (refTerminatorHooksFor rp callerMem) () mirTerm st₀ with
+    | (st', .ok ()) =>
+      match st'.machine.terminal with
+      | some res => res
+      | none =>
+        match extractMirLocation? st', st'.machine.frames with
+        | some loc, top :: rest =>
+          .step {
+            frames :=
+              ({ top with
+                 blockIdx := loc.block
+                 stmtIdx := loc.statementIndex } :: rest).reverse
+            callerMem
+          }
+        | none, _ => drainRefUnwind rp callerMem (rcallers.length + 1) st'
+        | _, _ => .fault .unsupported
+    | (_, .error (.undefinedBehavior _)) => .fault .undefined
+    | (_, _) => .fault .unsupported) = .fault .unsupported
+  rw [h_step]
+
 private theorem evalRefTerminator_call_bridge {rp : RefProg}
     {rbb : RefBasicBlock} {rframe : RefFrameState}
     {rcallers : List RefFrameState} {callerMem : CallerMemory}
@@ -6239,6 +6485,8 @@ private theorem evalRefTerminator_call_bridge {rp : RefProg}
       sourceInfo := ⟨⟨0⟩, 0⟩
       kind := .Call func margs mdest target munwind .Normal ⟨0⟩
     })
+    (h_noOverlap : refAnyMoveOperandMayOverlapPlace mdest
+        (margs.toList.map (fun a => a.operand)) = false)
     (h_post :
       let mirTerm := toMiriTerminatorForDispatch rbb.terminator
       let st₀ := mkRefTermStepState rframe rcallers mirTerm rbb.cleanup
@@ -6263,14 +6511,22 @@ private theorem evalRefTerminator_call_bridge {rp : RefProg}
           (st', .error (.invalidProgram "evaluating this call made no progress"))
         else
           (st', .ok ()) := by
-    unfold Miri.Interpreter.ControlFlow.evalTerminator
-    dsimp only [refTerminatorHooksFor, Miri.Interpreter.Call.run,
-      Id.run, Pure.pure]
     have h_kind : mirTerm.kind =
         .Call func margs mdest target munwind .Normal ⟨0⟩ := by
       dsimp only [mirTerm]
       rw [h_term]
-    rw [h_kind]
+    have h_call :
+        (refTerminatorHooksFor rp callerMem).call () mirTerm st₀ =
+        Miri.Interpreter.Call.run
+          (Miri.Interpreter.Call.evalCallTerminator (refCallHooks rp) () 2 mirTerm)
+          st₀ := by
+      dsimp only [refTerminatorHooksFor]
+      rw [h_kind]
+      dsimp only
+      rw [h_noOverlap, ite_false_eq_true]
+    unfold Miri.Interpreter.ControlFlow.evalTerminator
+    rw [h_kind, h_call]
+    dsimp only [Miri.Interpreter.Call.run, Id.run, Pure.pure]
     cases Miri.Interpreter.Call.evalCallTerminator
         (refCallHooks rp) () 2 mirTerm st₀ with
     | error err st' => rfl
@@ -6345,7 +6601,23 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
   let ⟨_, _, _, _, h_bodies⟩ := decodeProg_inv h_dec
   unfold evalTerminator
   dsimp only
-  refine evalRefTerminator_call_bridge (by rw [h_rt]; rfl) ?_
+  have h_ov_eq :
+      refAnyMoveOperandMayOverlapPlace (toMiriPlace rdst)
+        ((Array.mk (rargs.map (fun a =>
+          (⟨⟨0⟩, toMiriOperand a⟩ : Miri.MIR.SpannedOperand)))).toList.map
+          (fun a => a.operand)) =
+      anyMoveOperandMayOverlapPlace dst args := by
+    dsimp only [Array.toList]
+    rw [List.map_map]
+    exact refAnyMoveOperandMayOverlapPlace_eq h_dst h_args
+  refine of_bool_true_else (anyMoveOperandMayOverlapPlace dst args)
+    (fun h_ov => ?_) (fun h_ov_f => ?_)
+  · rw [h_ov] at h_ov_eq
+    rw [h_ov]
+    exact evalRefTerminator_call_overlap (by rw [h_rt]; rfl) h_ov_eq
+  rw [h_ov_f] at h_ov_eq
+  rw [h_ov_f, ite_false_eq_true]
+  refine evalRefTerminator_call_bridge (by rw [h_rt]; rfl) h_ov_eq ?_
   rw [h_rt]
   let mirTerm : Miri.MIR.Terminator :=
     toMiriTerminatorForDispatch (.call callee rargs rdst target unwind)
@@ -6416,12 +6688,14 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
         dsimp only
         let rdest : RefDest :=
           ⟨dst.localId, rdst.projection.map toMiriProjElem, dstTy⟩
-        let destPlace : Miri.Interpreter.RuntimeStackPlace RefCallProv :=
-          .memory ⟨⟨⟨Miri.ABI.Size.ZERO, some (.dst rdest dst)⟩, .none, none⟩,
+        let destMplace : Miri.Interpreter.MPlaceTy RefCallProv :=
+          ⟨⟨⟨Miri.ABI.Size.ZERO, some (.dst rdest dst)⟩, .none, none⟩,
             refSizedLocalLayout⟩
+        let destPlace : Miri.Interpreter.RuntimeStackPlace RefCallProv :=
+          .memory destMplace
         have h_ep : (refCallHooks rp).evalPlace () (toMiriPlace rdst) false st₀ =
             .ok destPlace st₀ := by
-          dsimp only [refCallHooks, st₀, liftFrame, toMiriPlace]
+          dsimp only [refCallHooks, st₀, liftFrame, toMiriPlace, destPlace, destMplace]
           rw [h_dst_id, h_z]
           dsimp only [Array.toList]
           rw [refProjectTy?_eq h_dst_proj, h_pt]
@@ -6503,7 +6777,7 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
                  | some rbody => rbody.argumentCount | none => 0)
                 evaluated destPlace target (toMiriUnwindAction unwind) st₁ =
                 .error (.unsupported "callee body out of bounds") st₁ := by
-              dsimp only [refCallHooks, destPlace]
+              dsimp only [refCallHooks, destPlace, destMplace]
               rw [h_rcb]
             rw [eStateM_bind_error h_find]
             rfl
@@ -6521,7 +6795,7 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
                    | some rbody => rbody.argumentCount | none => 0)
                   evaluated destPlace target (toMiriUnwindAction unwind) st₁ =
                   .error (.unsupported "callee body not admitted") st₁ := by
-                dsimp only [refCallHooks, destPlace]
+                dsimp only [refCallHooks, destPlace, destMplace]
                 rw [h_rcb_get]
                 dsimp only
                 rw [h_clocs]
@@ -6541,7 +6815,7 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
                      | some rbody => rbody.argumentCount | none => 0)
                     evaluated destPlace target (toMiriUnwindAction unwind) st₁ =
                     .error (.unsupported "call argument count mismatch") st₁ := by
-                  dsimp only [refCallHooks, destPlace]
+                  dsimp only [refCallHooks, destPlace, destMplace]
                   rw [h_rcb_get]
                   dsimp only
                   rw [h_clocs]
@@ -6563,7 +6837,7 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
                        | some rbody => rbody.argumentCount | none => 0)
                       evaluated destPlace target (toMiriUnwindAction unwind) st₁ =
                       .error (.unsupported "callee missing return local") st₁ := by
-                    dsimp only [refCallHooks, destPlace]
+                    dsimp only [refCallHooks, destPlace, destMplace]
                     rw [h_rcb_get]
                     dsimp only
                     rw [h_clocs]
@@ -6586,7 +6860,7 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
                          | some rbody => rbody.argumentCount | none => 0)
                         evaluated destPlace target (toMiriUnwindAction unwind) st₁ =
                         .error (.unsupported "call return type mismatch") st₁ := by
-                      dsimp only [refCallHooks, destPlace]
+                      dsimp only [refCallHooks, destPlace, destMplace]
                       rw [h_rcb_get]
                       dsimp only
                       rw [h_clocs]
@@ -6619,7 +6893,7 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
                         evaluated destPlace target (toMiriUnwindAction unwind) st₁ =
                         .ok (some (loaded,
                           { kind := .Item callee, args := Array.empty })) st₁ := by
-                      dsimp only [refCallHooks, destPlace]
+                      dsimp only [refCallHooks, destPlace, destMplace]
                       rw [h_rcb_get]
                       dsimp only
                       rw [h_clocs]
@@ -6678,21 +6952,20 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
                     simp only [ite_true]
                     have h_pl_op :
                         (refCallHooks rp).placeToOp () destPlace st₁ =
-                          match checkPlaceLive localsAfterArgs dst with
-                          | .ok () => .ok ⟨.immediate .uninit, refSizedLocalLayout⟩ st₁
+                          match deinitPlace localsAfterArgs dst dstTy with
+                          | .ok _ => .ok ⟨.indirect destMplace.mplace, destMplace.layout⟩ st₁
                           | .error k => .error (faultToStepError k) st₁ := by
-                      dsimp only [refCallHooks, destPlace, st₁, liftFrame]
-                      rw [refCheckPlaceLive_eq h_ty h_dst_proj]
-                      cases checkPlaceLive localsAfterArgs dst <;> rfl
+                      dsimp only [refCallHooks, destPlace, destMplace, st₁, liftFrame]
+                      rw [refCheckPlaceLive_of_deinitPlace h_ty h_dst_proj]
+                      cases deinitPlace localsAfterArgs dst dstTy <;> rfl
                     repeat rw [eStateM_bind_assoc]
-                    cases h_live : checkPlaceLive localsAfterArgs dst with
+                    cases h_deinit : deinitPlace localsAfterArgs dst dstTy with
                     | error k =>
-                      rw [h_live] at h_pl_op
+                      rw [h_deinit] at h_pl_op
                       rw [eStateM_bind_error h_pl_op]
                       cases k <;> rfl
-                    | ok u_unit =>
-                      cases u_unit
-                      rw [h_live] at h_pl_op
+                    | ok localsAfterDeinit =>
+                      rw [h_deinit] at h_pl_op
                       rw [eStateM_bind_ok h_pl_op]
                       dsimp only
                       let contMiri : Miri.Interpreter.ReturnContinuation :=
@@ -6725,7 +6998,7 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
                           (refCallHooks rp).pushRaw ()
                             { kind := .Item callee, args := Array.empty } loaded
                             destPlace contMiri st₁ = .ok () st₂ := by
-                        dsimp only [refCallHooks, destPlace, st₁, stk]
+                        dsimp only [refCallHooks, destPlace, destMplace, st₁, stk]
                         rw [h_rcb_get]
                         dsimp only
                         rw [h_clocs]
@@ -6819,7 +7092,7 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
                               stmtIdx := 0
                               locals := initLocalsLoop calleeBody argVals 0 calleeBody.locals
                               returnCont := some ⟨dst, target, unwind⟩
-                            } :: { f with locals := localsAfterArgs } :: callers
+                            } :: { f with locals := localsAfterDeinit } :: callers
                             callerMem := callerMem
                           })
                           ?_ h_carg h_blt h_arity_eq h_ev_m rfl rfl ?_)
@@ -6929,6 +7202,33 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
                               .ok true s := fun _ => rfl
                         rw [eStateM_bind_ok (h_retCompat _)]
                         rw [ite_eq_left rfl]
+                        have h_prot_dst :
+                            (refCallHooks rp).protectArgument () destMplace {
+                              stack := ⟨Array.mk ((pre ++ [mframe]) ++
+                                [{ mf_end with location := .unwinding ⟨0⟩ }])⟩
+                              machine := {
+                                frames :=
+                                  liftFrame body.locals
+                                    { f with locals := localsAfterArgs } :: rcallers
+                                calleeInit :=
+                                  some { ci₀ with argValsRev := argVals.reverse }
+                              }
+                            } = .ok () {
+                              stack := ⟨Array.mk ((pre ++ [mframe]) ++
+                                [{ mf_end with location := .unwinding ⟨0⟩ }])⟩
+                              machine := {
+                                frames :=
+                                  liftFrame body.locals
+                                    { f with locals := localsAfterDeinit } :: rcallers
+                                calleeInit :=
+                                  some { ci₀ with argValsRev := argVals.reverse }
+                              }
+                            } := by
+                          dsimp only [refCallHooks, destMplace, rdest, liftFrame]
+                          rw [refDeinitPlace_eq h_ty h_dst_proj, h_deinit]
+                          rfl
+                        repeat rw [eStateM_bind_assoc]
+                        rw [eStateM_bind_ok h_prot_dst]
                         repeat rw [eStateM_bind_assoc]
                         refine congr_bind_ok (h_ss_post ⟨0⟩ _ _) ?_
                         repeat rw [eStateM_bind_assoc]
@@ -6952,7 +7252,7 @@ private theorem evalRefTerminator_call_eq {rp : RefProg} {p : Program}
                         let calleeLocals :=
                           initLocalsLoop calleeBody argVals 0 calleeBody.locals
                         let callerFrame' : FrameState :=
-                          { f with locals := localsAfterArgs }
+                          { f with locals := localsAfterDeinit }
                         let calleeFrame : FrameState := {
                           defId := callee
                           blockIdx := 0
@@ -7057,7 +7357,23 @@ private theorem evalRefTerminator_callBuiltin_eq {rp : RefProg} {p : Program}
   let ⟨h_dst_id, h_dst_proj⟩ := decodePlace_inv h_dst
   unfold evalTerminator
   dsimp only
-  refine evalRefTerminator_call_bridge (by rw [h_rt]; rfl) ?_
+  have h_ov_eq :
+      refAnyMoveOperandMayOverlapPlace (toMiriPlace rdst)
+        ((Array.mk (rargs.map (fun a =>
+          (⟨⟨0⟩, toMiriOperand a⟩ : Miri.MIR.SpannedOperand)))).toList.map
+          (fun a => a.operand)) =
+      anyMoveOperandMayOverlapPlace dst args := by
+    dsimp only [Array.toList]
+    rw [List.map_map]
+    exact refAnyMoveOperandMayOverlapPlace_eq h_dst h_args
+  refine of_bool_true_else (anyMoveOperandMayOverlapPlace dst args)
+    (fun h_ov => ?_) (fun h_ov_f => ?_)
+  · rw [h_ov] at h_ov_eq
+    rw [h_ov]
+    exact evalRefTerminator_call_overlap (by rw [h_rt]; rfl) h_ov_eq
+  rw [h_ov_f] at h_ov_eq
+  rw [h_ov_f, ite_false_eq_true]
+  refine evalRefTerminator_call_bridge (by rw [h_rt]; rfl) h_ov_eq ?_
   rw [h_rt]
   let mirTerm : Miri.MIR.Terminator :=
     toMiriTerminatorForDispatch (.callBuiltin builtin rargs rdst target unwind)
@@ -7797,96 +8113,104 @@ theorem evalTerminator_step_inv {p : Program} {body : Body} {bb : BasicBlock}
       | unit | enumVal _ _ | tuple _ | ptr _ | bytes _ => cases h_step
   | call callee args dst target unwind =>
     dsimp only [evalTerminator] at h_step
-    cases h_ty : MirSemantics.getElem? body.locals dst.localId with
-    | none => rw [h_ty] at h_step; cases h_step
-    | some localTy =>
-      rw [h_ty] at h_step; dsimp only at h_step
-      cases h_pt : projectTy? localTy dst.projection with
-      | none => rw [h_pt] at h_step; cases h_step
-      | some dstTy =>
-        rw [h_pt] at h_step; dsimp only at h_step
-        cases h_ec : evalCallArgs body.locals f.locals args with
-        | error _ => rw [h_ec] at h_step; cases h_step
-        | ok res =>
-          let ⟨argPairs, localsAfterArgs⟩ := res
-          rw [h_ec] at h_step; dsimp only at h_step
-          have h_len₁ := (evalCallArgs_length h_ec).1.trans h_len
-          cases h_cb : MirSemantics.getElem? p.bodies callee with
-          | none => rw [h_cb] at h_step; cases h_step
-          | some calleeBody =>
-            rw [h_cb] at h_step; dsimp only at h_step
-            cases h_adm : bodyEntryAdmitted calleeBody <;> rw [h_adm] at h_step
-            · cases h_step
-            · dsimp only [Bool.not, ite_false_eq_true] at h_step
-              cases h_ar : Nat.beq argPairs.length calleeBody.argumentCount <;>
-                rw [h_ar] at h_step
+    cases h_ov : anyMoveOperandMayOverlapPlace dst args with
+    | true => rw [h_ov] at h_step; cases h_step
+    | false =>
+      rw [h_ov, ite_false_eq_true] at h_step
+      cases h_ty : MirSemantics.getElem? body.locals dst.localId with
+      | none => rw [h_ty] at h_step; cases h_step
+      | some localTy =>
+        rw [h_ty] at h_step; dsimp only at h_step
+        cases h_pt : projectTy? localTy dst.projection with
+        | none => rw [h_pt] at h_step; cases h_step
+        | some dstTy =>
+          rw [h_pt] at h_step; dsimp only at h_step
+          cases h_ec : evalCallArgs body.locals f.locals args with
+          | error _ => rw [h_ec] at h_step; cases h_step
+          | ok res =>
+            let ⟨argPairs, localsAfterArgs⟩ := res
+            rw [h_ec] at h_step; dsimp only at h_step
+            have h_len₁ := (evalCallArgs_length h_ec).1.trans h_len
+            cases h_cb : MirSemantics.getElem? p.bodies callee with
+            | none => rw [h_cb] at h_step; cases h_step
+            | some calleeBody =>
+              rw [h_cb] at h_step; dsimp only at h_step
+              cases h_adm : bodyEntryAdmitted calleeBody <;> rw [h_adm] at h_step
               · cases h_step
               · dsimp only [Bool.not, ite_false_eq_true] at h_step
-                cases h_ret : MirSemantics.getElem? calleeBody.locals 0 with
-                | none => rw [h_ret] at h_step; cases h_step
-                | some calleeRetTy =>
-                  rw [h_ret] at h_step; dsimp only at h_step
-                  cases h_rt : MirTy.beq calleeRetTy dstTy <;> rw [h_rt] at h_step
-                  · cases h_step
-                  · dsimp only [Bool.not, ite_false_eq_true] at h_step
-                    cases h_lv : checkPlaceLive localsAfterArgs dst with
-                    | error _ => rw [h_lv] at h_step; cases h_step
-                    | ok u_unit =>
-                      cases u_unit
-                      rw [h_lv] at h_step; dsimp only at h_step
-                      cases h_vc : validateCallArgs argPairs
-                          ((calleeBody.locals.drop 1).take calleeBody.argumentCount) with
-                      | error _ => rw [h_vc] at h_step; cases h_step
-                      | ok argVals =>
-                        rw [h_vc] at h_step
-                        injection h_step with h_eq
-                        subst h_eq
-                        refine ⟨List.cons_ne_nil _ _, rfl, ?_⟩
-                        dsimp only [liftFrames]
-                        rw [h_cb, h_f_body]
-                        exact ⟨⟨calleeBody, h_cb,
-                            initLocalsLoop_length calleeBody argVals 0 calleeBody.locals, rfl⟩,
-                          ⟨body, h_f_body, h_len₁, rfl⟩,
-                          framesSimInv_liftFrames h_cs⟩
+                cases h_ar : Nat.beq argPairs.length calleeBody.argumentCount <;>
+                  rw [h_ar] at h_step
+                · cases h_step
+                · dsimp only [Bool.not, ite_false_eq_true] at h_step
+                  cases h_ret : MirSemantics.getElem? calleeBody.locals 0 with
+                  | none => rw [h_ret] at h_step; cases h_step
+                  | some calleeRetTy =>
+                    rw [h_ret] at h_step; dsimp only at h_step
+                    cases h_rt : MirTy.beq calleeRetTy dstTy <;> rw [h_rt] at h_step
+                    · cases h_step
+                    · dsimp only [Bool.not, ite_false_eq_true] at h_step
+                      cases h_deinit : deinitPlace localsAfterArgs dst dstTy with
+                      | error _ => rw [h_deinit] at h_step; cases h_step
+                      | ok localsAfterDeinit =>
+                        rw [h_deinit] at h_step; dsimp only at h_step
+                        cases h_vc : validateCallArgs argPairs
+                            ((calleeBody.locals.drop 1).take calleeBody.argumentCount) with
+                        | error _ => rw [h_vc] at h_step; cases h_step
+                        | ok argVals =>
+                          rw [h_vc] at h_step
+                          injection h_step with h_eq
+                          subst h_eq
+                          refine ⟨List.cons_ne_nil _ _, rfl, ?_⟩
+                          dsimp only [liftFrames]
+                          rw [h_cb, h_f_body]
+                          exact ⟨⟨calleeBody, h_cb,
+                              initLocalsLoop_length calleeBody argVals 0 calleeBody.locals, rfl⟩,
+                            ⟨body, h_f_body,
+                              (deinitPlace_length h_deinit).trans h_len₁, rfl⟩,
+                            framesSimInv_liftFrames h_cs⟩
   | callBuiltin builtin args dst target unwind =>
     dsimp only [evalTerminator] at h_step
-    cases h_ty : MirSemantics.getElem? body.locals dst.localId with
-    | none => rw [h_ty] at h_step; cases h_step
-    | some localTy =>
-      rw [h_ty] at h_step; dsimp only at h_step
-      cases h_pt : projectTy? localTy dst.projection with
-      | none => rw [h_pt] at h_step; cases h_step
-      | some dstTy =>
-        rw [h_pt] at h_step; dsimp only at h_step
-        cases h_ec : evalCallArgs body.locals f.locals args with
-        | error _ => rw [h_ec] at h_step; cases h_step
-        | ok res =>
-          let ⟨argPairs, localsAfterArgs⟩ := res
-          rw [h_ec] at h_step; dsimp only at h_step
-          have h_len₁ := (evalCallArgs_length h_ec).1.trans h_len
-          cases h_rp : readPrimitiveArgs argPairs with
-          | error _ => rw [h_rp] at h_step; cases h_step
-          | ok argVals =>
-            rw [h_rp] at h_step; dsimp only at h_step
-            cases h_eb : evalCoreBuiltin builtin argVals with
-            | error _ => rw [h_eb] at h_step; cases h_step
-            | ok resVal =>
-              rw [h_eb] at h_step; dsimp only at h_step
-              cases h_wr : writePlace localsAfterArgs dst dstTy resVal with
-              | error _ => rw [h_wr] at h_step; cases h_step
-              | ok localsAfterWrite =>
-                rw [h_wr] at h_step; dsimp only at h_step
-                cases target with
-                | none => cases h_step
-                | some nextBb =>
-                  injection h_step with h_eq
-                  subst h_eq
-                  refine ⟨List.cons_ne_nil _ _, rfl, ?_⟩
-                  dsimp only [liftFrames]
-                  rw [h_f_body]
-                  exact ⟨⟨body, h_f_body,
-                      (writePlace_length h_wr).trans h_len₁, rfl⟩,
-                    framesSimInv_liftFrames h_cs⟩
+    cases h_ov : anyMoveOperandMayOverlapPlace dst args with
+    | true => rw [h_ov] at h_step; cases h_step
+    | false =>
+      rw [h_ov, ite_false_eq_true] at h_step
+      cases h_ty : MirSemantics.getElem? body.locals dst.localId with
+      | none => rw [h_ty] at h_step; cases h_step
+      | some localTy =>
+        rw [h_ty] at h_step; dsimp only at h_step
+        cases h_pt : projectTy? localTy dst.projection with
+        | none => rw [h_pt] at h_step; cases h_step
+        | some dstTy =>
+          rw [h_pt] at h_step; dsimp only at h_step
+          cases h_ec : evalCallArgs body.locals f.locals args with
+          | error _ => rw [h_ec] at h_step; cases h_step
+          | ok res =>
+            let ⟨argPairs, localsAfterArgs⟩ := res
+            rw [h_ec] at h_step; dsimp only at h_step
+            have h_len₁ := (evalCallArgs_length h_ec).1.trans h_len
+            cases h_rp : readPrimitiveArgs argPairs with
+            | error _ => rw [h_rp] at h_step; cases h_step
+            | ok argVals =>
+              rw [h_rp] at h_step; dsimp only at h_step
+              cases h_eb : evalCoreBuiltin builtin argVals with
+              | error _ => rw [h_eb] at h_step; cases h_step
+              | ok resVal =>
+                rw [h_eb] at h_step; dsimp only at h_step
+                cases h_wr : writePlace localsAfterArgs dst dstTy resVal with
+                | error _ => rw [h_wr] at h_step; cases h_step
+                | ok localsAfterWrite =>
+                  rw [h_wr] at h_step; dsimp only at h_step
+                  cases target with
+                  | none => cases h_step
+                  | some nextBb =>
+                    injection h_step with h_eq
+                    subst h_eq
+                    refine ⟨List.cons_ne_nil _ _, rfl, ?_⟩
+                    dsimp only [liftFrames]
+                    rw [h_f_body]
+                    exact ⟨⟨body, h_f_body,
+                        (writePlace_length h_wr).trans h_len₁, rfl⟩,
+                      framesSimInv_liftFrames h_cs⟩
 
 theorem evalStep_step_inv {p : Program} {c : Choice} {s s' : State}
     {rfs : List RefFrameState}
@@ -8681,7 +9005,7 @@ theorem miri_move_deinit_wiring_claim_holds : MiriMoveDeinitWiringClaim := by
     exact ⟨rfl, rfl⟩
 
 /-! ## Move Deinitialization, Overflow, Enum, Tuple, Cast, Unwind, Call, and
-Core-Builtin Canaries (`D6`–`D23`) -/
+Core-Builtin Canaries (`D6`–`D24`) -/
 
 open Trusted.Correspondence Anneal.MirWp
 
@@ -9167,5 +9491,30 @@ theorem canary_D23_diverging_call_return_ub :
     (expected := .undefined) (other := .unsupported)
     (fun h => FaultKind.noConfusion h) rfl
   exact ⟨a₁, a₂, a₃, a₄, b₁, b₂, b₃, b₄⟩
+
+/-- `D24` (call-entry destination deinitialization observed as `.undefined` /
+`.ub` on unwind cleanup read, fail-closed `.unsupported`/`.blocked` on `.move`
+arguments overlapping `dst` for both direct `.call` and `.callBuiltin`, and
+positive contrast admitting `.copy` arguments overlapping `dst` in both
+$M_{\text{anneal}}$ and $M_{\text{ref}}$). -/
+theorem canary_D24_call_deinit_and_overlap :
+    CanaryD24CallDeinitAndOverlapClaim := by
+  let q9 : Query := { args := [u32Val 9] }
+  let ⟨a₁, a₂, a₃, a₄⟩ := negative_ref_of_execFault
+    (p := progCallDeinitUnwindReadD24) (q := queryEmpty) (fuel := 5)
+    (expected := .undefined) (other := .unsupported)
+    (fun h => FaultKind.noConfusion h) rfl
+  let ⟨b₁, b₂, b₃, b₄⟩ := negative_ref_of_execFault
+    (p := progCallMoveOverlapDstD24) (q := q9) (fuel := 1)
+    (expected := .unsupported) (other := .undefined)
+    (fun h => FaultKind.noConfusion h) rfl
+  let ⟨c₁, c₂, c₃, c₄⟩ := negative_ref_of_execFault
+    (p := progBuiltinMoveOverlapDstD24) (q := q9) (fuel := 1)
+    (expected := .unsupported) (other := .undefined)
+    (fun h => FaultKind.noConfusion h) rfl
+  let ⟨d₁, d₂, d₃, d₄⟩ := positive_ref_of_exec
+    (p := progCallAndBuiltinCopyOverlapDstD24) (q := q9) (fuel := 6)
+    (out := .returned ⟨u32Val 10, ⟨[]⟩⟩) rfl
+  exact ⟨a₁, a₂, a₃, a₄, b₁, b₂, b₃, b₄, c₁, c₂, c₃, c₄, d₁, d₂, d₃, d₄⟩
 
 end Anneal.MirCorrespondenceProof

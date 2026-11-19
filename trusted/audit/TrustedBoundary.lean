@@ -110,7 +110,7 @@ this file across seven JSON IPC modes (`run` and `main`):
   `correspondence/`) directly on top of that replayed vendor kernel
   environment, checks that the 21-root `Miri.Interpreter.ExecutionMachine` cone
   and correspondence cone are free of `unsafe`, `partial`, `.vendorMiri`
-  `opaque`, and unapproved axioms, and verifies all 40 Pass 2 correspondence,
+  `opaque`, and unapproved axioms, and verifies all 41 Pass 2 correspondence,
   wiring, and canary claims plus reference-evaluator independence checks.
 - **`"target-audit"` (external target crate verification):**
   Loads compiled target `.olean` artifacts (`TargetOrigin`: `.foundation`,
@@ -2032,7 +2032,7 @@ def requireCorrClaimProof (env : Environment)
   requireClaimProof env corrLocals `Trusted.Correspondence
     `Anneal.MirCorrespondenceProof claimName none proofName reqConsts
 
-/-- Verify that all 40 Pass 2 correspondence, wiring, and canary (`D6`–`D23`)
+/-- Verify that all 41 Pass 2 correspondence, wiring, and canary (`D6`–`D24`)
 claims—covering top-level correspondence, fault equivalence, `deinitMovedPlace`
 wiring, codec round-trip, constructor preservation, uniqueness, simulation, and
 canaries—are present in `Trusted.Correspondence`, reference their required
@@ -2331,13 +2331,26 @@ def verifyCorrespondenceClaims (env : Environment)
          `Trusted.MirSemantics.ReachesResult,
          `Trusted.MirSemantics.WellFormed,
          `Trusted.Correspondence.RefReachesOutcome,
+         `Trusted.Correspondence.encodeProg]),
+      (`Trusted.Correspondence.CanaryD24CallDeinitAndOverlapClaim,
+       `Anneal.MirCorrespondenceProof.canary_D24_call_deinit_and_overlap,
+       [`Trusted.Correspondence.progCallDeinitUnwindReadD24,
+         `Trusted.Correspondence.progCallMoveOverlapDstD24,
+         `Trusted.Correspondence.progBuiltinMoveOverlapDstD24,
+         `Trusted.Correspondence.progCallAndBuiltinCopyOverlapDstD24,
+         `Trusted.MirSemantics.WellFormed,
+         `Trusted.MirSemantics.Behavior,
+         `Trusted.Correspondence.RefWellFormed,
+         `Trusted.Correspondence.RefBehavior,
+         `Trusted.MirSemantics.ReachesResult,
+         `Trusted.Correspondence.RefReachesOutcome,
          `Trusted.Correspondence.encodeProg])] do
     requireCorrClaimProof env corrLocals claimName proofName reqConsts
 
 /-- Verify that the reference machine `M_ref`
 (`Trusted.Correspondence.evalRefStep` and
 `Trusted.Correspondence.initRefState`) reaches the 35 required
-`vendor/lean-miri` primitives and never references any of the 66 named
+`vendor/lean-miri` primitives and never references any of the 68 named
 `M_anneal` evaluator entry points below. This is a regression check against
 accidental fallback to `M_anneal`; human review of `trusted/correspondence/`
 remains the semantic boundary. -/
@@ -2424,6 +2437,8 @@ def verifyRefEvaluatorIndependence (env : Environment)
       `Trusted.MirSemantics.placesMayOverlap,
       `Trusted.MirSemantics.operandMayOverlapPlace,
       `Trusted.MirSemantics.anyOperandMayOverlapPlace,
+      `Trusted.MirSemantics.moveOperandMayOverlapPlace,
+      `Trusted.MirSemantics.anyMoveOperandMayOverlapPlace,
       `Trusted.MirSemantics.isTupleTy,
       `Trusted.MirSemantics.assignHasUnsupportedOverlap,
       `Trusted.MirSemantics.writeAggregateTupleFields,
@@ -2431,7 +2446,7 @@ def verifyRefEvaluatorIndependence (env : Environment)
       `Trusted.MirSemantics.checkVal,
       `Trusted.MirSemantics.checkArgsMatch,
       `Trusted.MirSemantics.bodyEntryAdmitted,
-      `Trusted.MirSemantics.checkPlaceLive,
+      `Trusted.MirSemantics.deinitPlace,
       `Trusted.MirSemantics.evalCallArgs,
       `Trusted.MirSemantics.validateCallArgs,
       `Trusted.MirSemantics.readPrimitiveArgs,
@@ -2570,7 +2585,7 @@ def replayCorrAndVendor (sysrootStr : String)
   return (miriReplayed, corrReplayed)
 
 /-- Verify the 21-root `Miri.Interpreter.ExecutionMachine` cone and—when
-Pass 2 correspondence modules are present—all 40 correspondence claims,
+Pass 2 correspondence modules are present—all 41 correspondence claims,
 reference-evaluator independence, and the correspondence dependency cone in a
 dedicated scope. -/
 def verifyCorrConesAndClaims

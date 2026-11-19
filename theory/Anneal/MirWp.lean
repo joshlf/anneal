@@ -2803,36 +2803,39 @@ theorem evalTerminator_frame_retag (p : Program) (body : Body)
     cases h_cf
   | callBuiltin builtin args dst target _ =>
     dsimp only
-    cases Trusted.MirSemantics.getElem? body.locals dst.localId with
-    | none => exact ⟨(fun _ h => by cases h), rfl⟩
-    | some localTy =>
-      dsimp only
-      cases projectTy? localTy dst.projection with
+    cases anyMoveOperandMayOverlapPlace dst args with
+    | true => exact ⟨(fun _ h => by cases h), rfl⟩
+    | false =>
+      cases Trusted.MirSemantics.getElem? body.locals dst.localId with
       | none => exact ⟨(fun _ h => by cases h), rfl⟩
-      | some dstTy =>
+      | some localTy =>
         dsimp only
-        cases evalCallArgs body.locals f.locals args with
-        | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-        | ok pair =>
+        cases projectTy? localTy dst.projection with
+        | none => exact ⟨(fun _ h => by cases h), rfl⟩
+        | some dstTy =>
           dsimp only
-          cases readPrimitiveArgs pair.1 with
+          cases evalCallArgs body.locals f.locals args with
           | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-          | ok argVals =>
+          | ok pair =>
             dsimp only
-            cases evalCoreBuiltin builtin argVals with
+            cases readPrimitiveArgs pair.1 with
             | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-            | ok resVal =>
+            | ok argVals =>
               dsimp only
-              cases writePlace pair.2 dst dstTy resVal with
+              cases evalCoreBuiltin builtin argVals with
               | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-              | ok l' =>
-                cases target with
-                | none => exact ⟨(fun _ h => by cases h), rfl⟩
-                | some nextBb =>
-                  refine ⟨?_, rfl⟩
-                  intro s' hStep
-                  injection hStep with hEq; subst hEq
-                  exact ⟨_, rfl, h_id⟩
+              | ok resVal =>
+                dsimp only
+                cases writePlace pair.2 dst dstTy resVal with
+                | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
+                | ok l' =>
+                  cases target with
+                  | none => exact ⟨(fun _ h => by cases h), rfl⟩
+                  | some nextBb =>
+                    refine ⟨?_, rfl⟩
+                    intro s' hStep
+                    injection hStep with hEq; subst hEq
+                    exact ⟨_, rfl, h_id⟩
   | unsupported =>
     exact ⟨(fun _ h => by cases h), rfl⟩
 
@@ -3766,7 +3769,8 @@ theorem validateCallArgs_spec :
             rfl
 
 /-- Structural helper for `attachCallers` with definitional reduction on
-singleton and multi-frame stacks. -/
+singleton and multi-frame stacks (uses `@List.rec` + `noncomputable` to avoid
+generating an `_unsafe_rec` compiler helper). -/
 noncomputable def attachCallersAux (cont : ReturnContinuation)
     (callers : List FrameState) (head : FrameState) (tail : List FrameState) :
     List FrameState :=
@@ -4678,92 +4682,102 @@ theorem evalStep_attachState (p : Program) (cont : ReturnContinuation)
           cases inner with
           | nil =>
             dsimp only [attachCallers, attachCallersAux, attachState]
-            cases Trusted.MirSemantics.getElem? body.locals dst.localId with
-            | none => exact ⟨(fun _ h => by cases h), rfl⟩
-            | some lTy =>
-              dsimp only
-              cases projectTy? lTy dst.projection with
+            cases anyMoveOperandMayOverlapPlace dst args with
+            | true => exact ⟨(fun _ h => by cases h), rfl⟩
+            | false =>
+              cases Trusted.MirSemantics.getElem? body.locals dst.localId with
               | none => exact ⟨(fun _ h => by cases h), rfl⟩
-              | some dTy =>
+              | some lTy =>
                 dsimp only
-                cases evalCallArgs body.locals f.locals args with
-                | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                | ok ap =>
+                cases projectTy? lTy dst.projection with
+                | none => exact ⟨(fun _ h => by cases h), rfl⟩
+                | some dTy =>
                   dsimp only
-                  cases Trusted.MirSemantics.getElem? p.bodies callee with
-                  | none => exact ⟨(fun _ h => by cases h), rfl⟩
-                  | some cBody =>
+                  cases evalCallArgs body.locals f.locals args with
+                  | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
+                  | ok ap =>
                     dsimp only
-                    cases bodyEntryAdmitted cBody with
-                    | false => exact ⟨(fun _ h => by cases h), rfl⟩
-                    | true =>
-                      cases Nat.beq ap.1.length cBody.argumentCount with
+                    cases Trusted.MirSemantics.getElem? p.bodies callee with
+                    | none => exact ⟨(fun _ h => by cases h), rfl⟩
+                    | some cBody =>
+                      dsimp only
+                      cases bodyEntryAdmitted cBody with
                       | false => exact ⟨(fun _ h => by cases h), rfl⟩
                       | true =>
-                        cases Trusted.MirSemantics.getElem? cBody.locals 0 with
-                        | none => exact ⟨(fun _ h => by cases h), rfl⟩
-                        | some cRetTy =>
-                          dsimp only
-                          cases MirTy.beq cRetTy dTy with
-                          | false => exact ⟨(fun _ h => by cases h), rfl⟩
-                          | true =>
-                            cases checkPlaceLive ap.2 dst with
-                            | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                            | ok _ =>
-                              dsimp only
-                              cases validateCallArgs ap.1
-                                  ((cBody.locals.drop 1).take
-                                    cBody.argumentCount) with
+                        cases Nat.beq ap.1.length cBody.argumentCount with
+                        | false => exact ⟨(fun _ h => by cases h), rfl⟩
+                        | true =>
+                          cases Trusted.MirSemantics.getElem? cBody.locals 0
+                            with
+                          | none => exact ⟨(fun _ h => by cases h), rfl⟩
+                          | some cRetTy =>
+                            dsimp only
+                            cases MirTy.beq cRetTy dTy with
+                            | false => exact ⟨(fun _ h => by cases h), rfl⟩
+                            | true =>
+                              cases deinitPlace ap.2 dst dTy with
                               | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                              | ok argVals =>
-                                refine ⟨?_, rfl⟩
-                                intro s' hStep
-                                injection hStep with hEq; subst hEq
-                                exact ⟨rfl, hShape⟩
+                              | ok localsAfterDeinit =>
+                                dsimp only
+                                cases validateCallArgs ap.1
+                                    ((cBody.locals.drop 1).take
+                                      cBody.argumentCount) with
+                                | error _ =>
+                                  exact ⟨(fun _ h => by cases h), rfl⟩
+                                | ok argVals =>
+                                  refine ⟨?_, rfl⟩
+                                  intro s' hStep
+                                  injection hStep with hEq; subst hEq
+                                  exact ⟨rfl, hShape⟩
           | cons g tail =>
             dsimp only [attachCallers, attachCallersAux, attachState]
-            cases Trusted.MirSemantics.getElem? body.locals dst.localId with
-            | none => exact ⟨(fun _ h => by cases h), rfl⟩
-            | some lTy =>
-              dsimp only
-              cases projectTy? lTy dst.projection with
+            cases anyMoveOperandMayOverlapPlace dst args with
+            | true => exact ⟨(fun _ h => by cases h), rfl⟩
+            | false =>
+              cases Trusted.MirSemantics.getElem? body.locals dst.localId with
               | none => exact ⟨(fun _ h => by cases h), rfl⟩
-              | some dTy =>
+              | some lTy =>
                 dsimp only
-                cases evalCallArgs body.locals f.locals args with
-                | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                | ok ap =>
+                cases projectTy? lTy dst.projection with
+                | none => exact ⟨(fun _ h => by cases h), rfl⟩
+                | some dTy =>
                   dsimp only
-                  cases Trusted.MirSemantics.getElem? p.bodies callee with
-                  | none => exact ⟨(fun _ h => by cases h), rfl⟩
-                  | some cBody =>
+                  cases evalCallArgs body.locals f.locals args with
+                  | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
+                  | ok ap =>
                     dsimp only
-                    cases bodyEntryAdmitted cBody with
-                    | false => exact ⟨(fun _ h => by cases h), rfl⟩
-                    | true =>
-                      cases Nat.beq ap.1.length cBody.argumentCount with
+                    cases Trusted.MirSemantics.getElem? p.bodies callee with
+                    | none => exact ⟨(fun _ h => by cases h), rfl⟩
+                    | some cBody =>
+                      dsimp only
+                      cases bodyEntryAdmitted cBody with
                       | false => exact ⟨(fun _ h => by cases h), rfl⟩
                       | true =>
-                        cases Trusted.MirSemantics.getElem? cBody.locals 0 with
-                        | none => exact ⟨(fun _ h => by cases h), rfl⟩
-                        | some cRetTy =>
-                          dsimp only
-                          cases MirTy.beq cRetTy dTy with
-                          | false => exact ⟨(fun _ h => by cases h), rfl⟩
-                          | true =>
-                            cases checkPlaceLive ap.2 dst with
-                            | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                            | ok _ =>
-                              dsimp only
-                              cases validateCallArgs ap.1
-                                  ((cBody.locals.drop 1).take
-                                    cBody.argumentCount) with
+                        cases Nat.beq ap.1.length cBody.argumentCount with
+                        | false => exact ⟨(fun _ h => by cases h), rfl⟩
+                        | true =>
+                          cases Trusted.MirSemantics.getElem? cBody.locals 0
+                            with
+                          | none => exact ⟨(fun _ h => by cases h), rfl⟩
+                          | some cRetTy =>
+                            dsimp only
+                            cases MirTy.beq cRetTy dTy with
+                            | false => exact ⟨(fun _ h => by cases h), rfl⟩
+                            | true =>
+                              cases deinitPlace ap.2 dst dTy with
                               | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                              | ok argVals =>
-                                refine ⟨?_, rfl⟩
-                                intro s' hStep
-                                injection hStep with hEq; subst hEq
-                                exact ⟨rfl, hShape⟩
+                              | ok localsAfterDeinit =>
+                                dsimp only
+                                cases validateCallArgs ap.1
+                                    ((cBody.locals.drop 1).take
+                                      cBody.argumentCount) with
+                                | error _ =>
+                                  exact ⟨(fun _ h => by cases h), rfl⟩
+                                | ok argVals =>
+                                  refine ⟨?_, rfl⟩
+                                  intro s' hStep
+                                  injection hStep with hEq; subst hEq
+                                  exact ⟨rfl, hShape⟩
         | callBuiltin builtin args dst target _ =>
           unfold evalTerminator jumpToBlock
           rw [hT]
@@ -4771,68 +4785,74 @@ theorem evalStep_attachState (p : Program) (cont : ReturnContinuation)
           cases inner with
           | nil =>
             dsimp only [attachCallers, attachCallersAux, attachState]
-            cases Trusted.MirSemantics.getElem? body.locals dst.localId with
-            | none => exact ⟨(fun _ h => by cases h), rfl⟩
-            | some lTy =>
-              dsimp only
-              cases projectTy? lTy dst.projection with
+            cases anyMoveOperandMayOverlapPlace dst args with
+            | true => exact ⟨(fun _ h => by cases h), rfl⟩
+            | false =>
+              cases Trusted.MirSemantics.getElem? body.locals dst.localId with
               | none => exact ⟨(fun _ h => by cases h), rfl⟩
-              | some dTy =>
+              | some lTy =>
                 dsimp only
-                cases evalCallArgs body.locals f.locals args with
-                | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                | ok ap =>
+                cases projectTy? lTy dst.projection with
+                | none => exact ⟨(fun _ h => by cases h), rfl⟩
+                | some dTy =>
                   dsimp only
-                  cases readPrimitiveArgs ap.1 with
+                  cases evalCallArgs body.locals f.locals args with
                   | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                  | ok argVals =>
+                  | ok ap =>
                     dsimp only
-                    cases evalCoreBuiltin builtin argVals with
+                    cases readPrimitiveArgs ap.1 with
                     | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                    | ok resVal =>
+                    | ok argVals =>
                       dsimp only
-                      cases writePlace ap.2 dst dTy resVal with
+                      cases evalCoreBuiltin builtin argVals with
                       | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                      | ok l' =>
-                        cases target with
-                        | none => exact ⟨(fun _ h => by cases h), rfl⟩
-                        | some nextBb =>
-                          refine ⟨?_, rfl⟩
-                          intro s' hStep
-                          injection hStep with hEq; subst hEq
-                          exact hShape
+                      | ok resVal =>
+                        dsimp only
+                        cases writePlace ap.2 dst dTy resVal with
+                        | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
+                        | ok l' =>
+                          cases target with
+                          | none => exact ⟨(fun _ h => by cases h), rfl⟩
+                          | some nextBb =>
+                            refine ⟨?_, rfl⟩
+                            intro s' hStep
+                            injection hStep with hEq; subst hEq
+                            exact hShape
           | cons g tail =>
             dsimp only [attachCallers, attachCallersAux, attachState]
-            cases Trusted.MirSemantics.getElem? body.locals dst.localId with
-            | none => exact ⟨(fun _ h => by cases h), rfl⟩
-            | some lTy =>
-              dsimp only
-              cases projectTy? lTy dst.projection with
+            cases anyMoveOperandMayOverlapPlace dst args with
+            | true => exact ⟨(fun _ h => by cases h), rfl⟩
+            | false =>
+              cases Trusted.MirSemantics.getElem? body.locals dst.localId with
               | none => exact ⟨(fun _ h => by cases h), rfl⟩
-              | some dTy =>
+              | some lTy =>
                 dsimp only
-                cases evalCallArgs body.locals f.locals args with
-                | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                | ok ap =>
+                cases projectTy? lTy dst.projection with
+                | none => exact ⟨(fun _ h => by cases h), rfl⟩
+                | some dTy =>
                   dsimp only
-                  cases readPrimitiveArgs ap.1 with
+                  cases evalCallArgs body.locals f.locals args with
                   | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                  | ok argVals =>
+                  | ok ap =>
                     dsimp only
-                    cases evalCoreBuiltin builtin argVals with
+                    cases readPrimitiveArgs ap.1 with
                     | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                    | ok resVal =>
+                    | ok argVals =>
                       dsimp only
-                      cases writePlace ap.2 dst dTy resVal with
+                      cases evalCoreBuiltin builtin argVals with
                       | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
-                      | ok l' =>
-                        cases target with
-                        | none => exact ⟨(fun _ h => by cases h), rfl⟩
-                        | some nextBb =>
-                          refine ⟨?_, rfl⟩
-                          intro s' hStep
-                          injection hStep with hEq; subst hEq
-                          exact hShape
+                      | ok resVal =>
+                        dsimp only
+                        cases writePlace ap.2 dst dTy resVal with
+                        | error _ => exact ⟨(fun _ h => by cases h), rfl⟩
+                        | ok l' =>
+                          cases target with
+                          | none => exact ⟨(fun _ h => by cases h), rfl⟩
+                          | some nextBb =>
+                            refine ⟨?_, rfl⟩
+                            intro s' hStep
+                            injection hStep with hEq; subst hEq
+                            exact hShape
         | unsupported =>
           unfold evalTerminator
           rw [hT]
@@ -5138,7 +5158,8 @@ theorem evalStep_call {p : Program} {callerBody calleeBody : Body}
     {callerMem : CallerMemory} {callee : DefId} {args : List Operand}
     {dst : Place} {target : Option BasicBlockId} {unwind : UnwindAction}
     {localTy dstTy calleeRetTy : MirTy}
-    {argPairs : List (MirTy × SlotVal)} {localsAfterArgs : List LocalSlot}
+    {argPairs : List (MirTy × SlotVal)}
+    {localsAfterArgs localsAfterDeinit : List LocalSlot}
     {argVals : List Val}
     (h_caller : Trusted.MirSemantics.getElem? p.bodies frame.defId =
       some callerBody)
@@ -5147,6 +5168,7 @@ theorem evalStep_call {p : Program} {callerBody calleeBody : Body}
     (h_stmt : Trusted.MirSemantics.getElem? bb.statements frame.stmtIdx = none)
     (h_len : Nat.beq frame.stmtIdx bb.statements.length = true)
     (h_term : bb.terminator = .call callee args dst target unwind)
+    (h_noOverlap : anyMoveOperandMayOverlapPlace dst args = false)
     (h_dstLocal : Trusted.MirSemantics.getElem? callerBody.locals dst.localId =
       some localTy)
     (h_dstTy : projectTy? localTy dst.projection = some dstTy)
@@ -5157,13 +5179,13 @@ theorem evalStep_call {p : Program} {callerBody calleeBody : Body}
     (h_retTy : Trusted.MirSemantics.getElem? calleeBody.locals 0 =
       some calleeRetTy)
     (h_retEq : calleeRetTy = dstTy)
-    (h_live : checkPlaceLive localsAfterArgs dst = .ok ())
+    (h_deinit : deinitPlace localsAfterArgs dst dstTy = .ok localsAfterDeinit)
     (h_val : validateCallArgs argPairs
       ((calleeBody.locals.drop 1).take calleeBody.argumentCount) =
       .ok argVals) :
     evalStep p 0 { frames := frame :: callers, callerMem := callerMem } =
       .step (attachState ⟨dst, target, unwind⟩
-        ({ frame with locals := localsAfterArgs } :: callers)
+        ({ frame with locals := localsAfterDeinit } :: callers)
         {
           frames := [{
             defId := callee
@@ -5198,6 +5220,7 @@ theorem evalStep_call {p : Program} {callerBody calleeBody : Body}
   rw [ite_bool_true h_len]
   rw [h_term]
   dsimp only
+  rw [ite_bool_false h_noOverlap]
   rw [h_dstLocal]
   dsimp only
   rw [h_dstTy]
@@ -5212,7 +5235,7 @@ theorem evalStep_call {p : Program} {callerBody calleeBody : Body}
   dsimp only
   subst h_retEq
   rw [ite_bool_false (by rw [MirTy.beq_iff.mpr rfl]; rfl)]
-  rw [h_live]
+  rw [h_deinit]
   dsimp only
   rw [h_val]
   rfl
@@ -5226,7 +5249,8 @@ theorem wpCallStep {p : Program} {onDone : TerminalOut → Prop}
     {callee : DefId} {args : List Operand} {dst : Place}
     {target : Option BasicBlockId} {unwind : UnwindAction}
     {localTy dstTy calleeRetTy : MirTy}
-    {argPairs : List (MirTy × SlotVal)} {localsAfterArgs : List LocalSlot}
+    {argPairs : List (MirTy × SlotVal)}
+    {localsAfterArgs localsAfterDeinit : List LocalSlot}
     {argVals : List Val} {contFuel : Nat}
     (spec : CallSpec p callee)
     (h_caller : Trusted.MirSemantics.getElem? p.bodies frame.defId =
@@ -5236,6 +5260,7 @@ theorem wpCallStep {p : Program} {onDone : TerminalOut → Prop}
     (h_stmt : Trusted.MirSemantics.getElem? bb.statements frame.stmtIdx = none)
     (h_len : Nat.beq frame.stmtIdx bb.statements.length = true)
     (h_term : bb.terminator = .call callee args dst target unwind)
+    (h_noOverlap : anyMoveOperandMayOverlapPlace dst args = false)
     (h_dstLocal : Trusted.MirSemantics.getElem? callerBody.locals dst.localId =
       some localTy)
     (h_dstTy : projectTy? localTy dst.projection = some dstTy)
@@ -5244,19 +5269,19 @@ theorem wpCallStep {p : Program} {onDone : TerminalOut → Prop}
     (h_retTy : Trusted.MirSemantics.getElem? spec.calleeBody.locals 0 =
       some calleeRetTy)
     (h_retEq : calleeRetTy = dstTy)
-    (h_live : checkPlaceLive localsAfterArgs dst = .ok ())
+    (h_deinit : deinitPlace localsAfterArgs dst dstTy = .ok localsAfterDeinit)
     (h_val : validateCallArgs argPairs
       ((spec.calleeBody.locals.drop 1).take spec.calleeBody.argumentCount) =
         .ok argVals)
     (h_pre : spec.pre argVals)
     (h_ret : ∀ retVal cm, spec.post argVals retVal cm →
       match applyCallReturn p ⟨dst, target, unwind⟩
-          { frame with locals := localsAfterArgs } callers retVal cm with
+          { frame with locals := localsAfterDeinit } callers retVal cm with
       | .step s' => wpOutcomeState p onDone onFault contFuel s'
       | .done out => onDone out
       | .fault k => onFault k)
     (h_unw : ∀ cm, spec.unwindPost argVals cm →
-      match unwindFrame cm { frame with locals := localsAfterArgs } callers
+      match unwindFrame cm { frame with locals := localsAfterDeinit } callers
           unwind with
       | .step s' => wpOutcomeState p onDone onFault contFuel s'
       | .done out => onDone out
@@ -5269,8 +5294,8 @@ theorem wpCallStep {p : Program} {onDone : TerminalOut → Prop}
     | .step st' => execOutcomeState p onDone onFault (spec.fuel + contFuel) st'
     | .done out => onDone out
     | .fault k => onFault k)
-  rw [evalStep_call h_caller h_bb h_stmt h_len h_term h_dstLocal h_dstTy h_args
-    spec.h_body spec.h_admitted h_retTy h_retEq h_live h_val]
+  rw [evalStep_call h_caller h_bb h_stmt h_len h_term h_noOverlap h_dstLocal
+    h_dstTy h_args spec.h_body spec.h_admitted h_retTy h_retEq h_deinit h_val]
   exact execOutcomeState_of_wpOutcomeState
     (wpOutcomeState_attachState rfl
       (spec.sound argVals callerMem (validateCallArgs_spec h_val).1 h_pre)
@@ -5283,7 +5308,8 @@ theorem execCallStep {p : Program} {onDone : TerminalOut → Prop}
     {callee : DefId} {args : List Operand} {dst : Place}
     {target : Option BasicBlockId} {unwind : UnwindAction}
     {localTy dstTy calleeRetTy : MirTy}
-    {argPairs : List (MirTy × SlotVal)} {localsAfterArgs : List LocalSlot}
+    {argPairs : List (MirTy × SlotVal)}
+    {localsAfterArgs localsAfterDeinit : List LocalSlot}
     {argVals : List Val} {contFuel : Nat}
     (spec : CallSpec p callee)
     (h_caller : Trusted.MirSemantics.getElem? p.bodies frame.defId =
@@ -5293,6 +5319,7 @@ theorem execCallStep {p : Program} {onDone : TerminalOut → Prop}
     (h_stmt : Trusted.MirSemantics.getElem? bb.statements frame.stmtIdx = none)
     (h_len : Nat.beq frame.stmtIdx bb.statements.length = true)
     (h_term : bb.terminator = .call callee args dst target unwind)
+    (h_noOverlap : anyMoveOperandMayOverlapPlace dst args = false)
     (h_dstLocal : Trusted.MirSemantics.getElem? callerBody.locals dst.localId =
       some localTy)
     (h_dstTy : projectTy? localTy dst.projection = some dstTy)
@@ -5301,19 +5328,19 @@ theorem execCallStep {p : Program} {onDone : TerminalOut → Prop}
     (h_retTy : Trusted.MirSemantics.getElem? spec.calleeBody.locals 0 =
       some calleeRetTy)
     (h_retEq : calleeRetTy = dstTy)
-    (h_live : checkPlaceLive localsAfterArgs dst = .ok ())
+    (h_deinit : deinitPlace localsAfterArgs dst dstTy = .ok localsAfterDeinit)
     (h_val : validateCallArgs argPairs
       ((spec.calleeBody.locals.drop 1).take spec.calleeBody.argumentCount) =
         .ok argVals)
     (h_pre : spec.pre argVals)
     (h_ret : ∀ retVal cm, spec.post argVals retVal cm →
       match applyCallReturn p ⟨dst, target, unwind⟩
-          { frame with locals := localsAfterArgs } callers retVal cm with
+          { frame with locals := localsAfterDeinit } callers retVal cm with
       | .step s' => execOutcomeState p onDone onFault contFuel s'
       | .done out => onDone out
       | .fault k => onFault k)
     (h_unw : ∀ cm, spec.unwindPost argVals cm →
-      match unwindFrame cm { frame with locals := localsAfterArgs } callers
+      match unwindFrame cm { frame with locals := localsAfterDeinit } callers
           unwind with
       | .step s' => execOutcomeState p onDone onFault contFuel s'
       | .done out => onDone out
@@ -5321,12 +5348,12 @@ theorem execCallStep {p : Program} {onDone : TerminalOut → Prop}
     execOutcomeState p onDone onFault (spec.fuel + contFuel + 1)
       { frames := frame :: callers, callerMem := callerMem } := by
   refine execOutcomeState_of_wpOutcomeState
-    (wpCallStep spec h_caller h_bb h_stmt h_len h_term h_dstLocal h_dstTy
-      h_args h_retTy h_retEq h_live h_val h_pre ?_ ?_)
+    (wpCallStep spec h_caller h_bb h_stmt h_len h_term h_noOverlap h_dstLocal
+      h_dstTy h_args h_retTy h_retEq h_deinit h_val h_pre ?_ ?_)
   · intro retVal cm hPost
     have hR := h_ret retVal cm hPost
     cases hApp : applyCallReturn p ⟨dst, target, unwind⟩
-        { frame with locals := localsAfterArgs } callers retVal cm with
+        { frame with locals := localsAfterDeinit } callers retVal cm with
     | step s' =>
       rw [hApp] at hR
       exact wpOutcomeState_of_execOutcomeState hR
@@ -5334,7 +5361,7 @@ theorem execCallStep {p : Program} {onDone : TerminalOut → Prop}
     | fault _ => rw [hApp] at hR; exact hR
   · intro cm hPost
     have hU := h_unw cm hPost
-    cases hUnwStep : unwindFrame cm { frame with locals := localsAfterArgs }
+    cases hUnwStep : unwindFrame cm { frame with locals := localsAfterDeinit }
         callers unwind with
     | step s' =>
       rw [hUnwStep] at hU
@@ -5351,7 +5378,8 @@ theorem wpCallSummary {p : Program} {post : TerminalOut → Prop}
     {callers : List FrameState} {callerMem : CallerMemory} {callee : DefId}
     {args : List Operand} {dst : Place} {nextBb : BasicBlockId}
     {unwind : UnwindAction} {localTy dstTy calleeRetTy : MirTy}
-    {argPairs : List (MirTy × SlotVal)} {localsAfterArgs : List LocalSlot}
+    {argPairs : List (MirTy × SlotVal)}
+    {localsAfterArgs localsAfterDeinit : List LocalSlot}
     {argVals : List Val} {contFuel : Nat}
     (spec : CallSpec p callee)
     (h_caller : Trusted.MirSemantics.getElem? p.bodies frame.defId =
@@ -5361,6 +5389,7 @@ theorem wpCallSummary {p : Program} {post : TerminalOut → Prop}
     (h_stmt : Trusted.MirSemantics.getElem? bb.statements frame.stmtIdx = none)
     (h_len : Nat.beq frame.stmtIdx bb.statements.length = true)
     (h_term : bb.terminator = .call callee args dst (some nextBb) unwind)
+    (h_noOverlap : anyMoveOperandMayOverlapPlace dst args = false)
     (h_dstLocal : Trusted.MirSemantics.getElem? callerBody.locals dst.localId =
       some localTy)
     (h_dstTy : projectTy? localTy dst.projection = some dstTy)
@@ -5369,14 +5398,14 @@ theorem wpCallSummary {p : Program} {post : TerminalOut → Prop}
     (h_retTy : Trusted.MirSemantics.getElem? spec.calleeBody.locals 0 =
       some calleeRetTy)
     (h_retEq : calleeRetTy = dstTy)
-    (h_live : checkPlaceLive localsAfterArgs dst = .ok ())
+    (h_deinit : deinitPlace localsAfterArgs dst dstTy = .ok localsAfterDeinit)
     (h_val : validateCallArgs argPairs
       ((spec.calleeBody.locals.drop 1).take spec.calleeBody.argumentCount) =
         .ok argVals)
     (h_pre : spec.pre argVals)
     (h_ret : ∀ retVal cm, spec.post argVals retVal cm →
       ∃ localsAfterWrite,
-        writePlace localsAfterArgs dst dstTy retVal = .ok localsAfterWrite ∧
+        writePlace localsAfterDeinit dst dstTy retVal = .ok localsAfterWrite ∧
         wpState p contFuel
           {
             frames := {
@@ -5389,15 +5418,15 @@ theorem wpCallSummary {p : Program} {post : TerminalOut → Prop}
           }
           post)
     (h_unw : ∀ cm, spec.unwindPost argVals cm →
-      match unwindFrame cm { frame with locals := localsAfterArgs } callers
+      match unwindFrame cm { frame with locals := localsAfterDeinit } callers
           unwind with
       | .step s' => wpState p contFuel s' post
       | .done out => post out
       | .fault _ => False) :
     wpState p (spec.fuel + contFuel + 1)
       { frames := frame :: callers, callerMem := callerMem } post := by
-  refine wpCallStep spec h_caller h_bb h_stmt h_len h_term h_dstLocal h_dstTy
-    h_args h_retTy h_retEq h_live h_val h_pre ?_ h_unw
+  refine wpCallStep spec h_caller h_bb h_stmt h_len h_term h_noOverlap
+    h_dstLocal h_dstTy h_args h_retTy h_retEq h_deinit h_val h_pre ?_ h_unw
   intro retVal cm hPost
   let ⟨localsAfterWrite, hWrite, hCont⟩ := h_ret retVal cm hPost
   unfold applyCallReturn
@@ -5417,7 +5446,8 @@ theorem execCallSummary {p : Program} {post : TerminalOut → Prop}
     {callers : List FrameState} {callerMem : CallerMemory} {callee : DefId}
     {args : List Operand} {dst : Place} {nextBb : BasicBlockId}
     {unwind : UnwindAction} {localTy dstTy calleeRetTy : MirTy}
-    {argPairs : List (MirTy × SlotVal)} {localsAfterArgs : List LocalSlot}
+    {argPairs : List (MirTy × SlotVal)}
+    {localsAfterArgs localsAfterDeinit : List LocalSlot}
     {argVals : List Val} {contFuel : Nat}
     (spec : CallSpec p callee)
     (h_caller : Trusted.MirSemantics.getElem? p.bodies frame.defId =
@@ -5427,6 +5457,7 @@ theorem execCallSummary {p : Program} {post : TerminalOut → Prop}
     (h_stmt : Trusted.MirSemantics.getElem? bb.statements frame.stmtIdx = none)
     (h_len : Nat.beq frame.stmtIdx bb.statements.length = true)
     (h_term : bb.terminator = .call callee args dst (some nextBb) unwind)
+    (h_noOverlap : anyMoveOperandMayOverlapPlace dst args = false)
     (h_dstLocal : Trusted.MirSemantics.getElem? callerBody.locals dst.localId =
       some localTy)
     (h_dstTy : projectTy? localTy dst.projection = some dstTy)
@@ -5435,14 +5466,14 @@ theorem execCallSummary {p : Program} {post : TerminalOut → Prop}
     (h_retTy : Trusted.MirSemantics.getElem? spec.calleeBody.locals 0 =
       some calleeRetTy)
     (h_retEq : calleeRetTy = dstTy)
-    (h_live : checkPlaceLive localsAfterArgs dst = .ok ())
+    (h_deinit : deinitPlace localsAfterArgs dst dstTy = .ok localsAfterDeinit)
     (h_val : validateCallArgs argPairs
       ((spec.calleeBody.locals.drop 1).take spec.calleeBody.argumentCount) =
         .ok argVals)
     (h_pre : spec.pre argVals)
     (h_ret : ∀ retVal cm, spec.post argVals retVal cm →
       ∃ localsAfterWrite,
-        writePlace localsAfterArgs dst dstTy retVal = .ok localsAfterWrite ∧
+        writePlace localsAfterDeinit dst dstTy retVal = .ok localsAfterWrite ∧
         execState p contFuel
           {
             frames := {
@@ -5455,7 +5486,7 @@ theorem execCallSummary {p : Program} {post : TerminalOut → Prop}
           }
           post)
     (h_unw : ∀ cm, spec.unwindPost argVals cm →
-      match unwindFrame cm { frame with locals := localsAfterArgs } callers
+      match unwindFrame cm { frame with locals := localsAfterDeinit } callers
           unwind with
       | .step s' => execState p contFuel s' post
       | .done out => post out
@@ -5463,14 +5494,14 @@ theorem execCallSummary {p : Program} {post : TerminalOut → Prop}
     execState p (spec.fuel + contFuel + 1)
       { frames := frame :: callers, callerMem := callerMem } post := by
   refine execOutcomeState_of_wpOutcomeState
-    (wpCallSummary spec h_caller h_bb h_stmt h_len h_term h_dstLocal h_dstTy
-      h_args h_retTy h_retEq h_live h_val h_pre ?_ ?_)
+    (wpCallSummary spec h_caller h_bb h_stmt h_len h_term h_noOverlap
+      h_dstLocal h_dstTy h_args h_retTy h_retEq h_deinit h_val h_pre ?_ ?_)
   · intro retVal cm hPost
     let ⟨l', hW, hC⟩ := h_ret retVal cm hPost
     exact ⟨l', hW, wpOutcomeState_of_execOutcomeState hC⟩
   · intro cm hPost
     have hU := h_unw cm hPost
-    cases hUnwStep : unwindFrame cm { frame with locals := localsAfterArgs }
+    cases hUnwStep : unwindFrame cm { frame with locals := localsAfterDeinit }
         callers unwind with
     | step s' =>
       rw [hUnwStep] at hU
@@ -5492,6 +5523,7 @@ theorem evalStep_callBuiltin {p : Program} {body : Body} {bb : BasicBlock}
     (h_len : Nat.beq frame.stmtIdx bb.statements.length = true)
     (h_term : bb.terminator =
       .callBuiltin builtin args dst (some nextBb) unwind)
+    (h_noOverlap : anyMoveOperandMayOverlapPlace dst args = false)
     (h_dstLocal : Trusted.MirSemantics.getElem? body.locals dst.localId =
       some localTy)
     (h_dstTy : projectTy? localTy dst.projection = some dstTy)
@@ -5522,6 +5554,7 @@ theorem evalStep_callBuiltin {p : Program} {body : Body} {bb : BasicBlock}
   rw [ite_bool_true h_len]
   rw [h_term]
   dsimp only
+  rw [ite_bool_false h_noOverlap]
   rw [h_dstLocal]
   dsimp only
   rw [h_dstTy]
@@ -5550,6 +5583,7 @@ theorem wpCallBuiltin {p : Program} {onDone : TerminalOut → Prop}
     (h_len : Nat.beq frame.stmtIdx bb.statements.length = true)
     (h_term : bb.terminator =
       .callBuiltin builtin args dst (some nextBb) unwind)
+    (h_noOverlap : anyMoveOperandMayOverlapPlace dst args = false)
     (h_dstLocal : Trusted.MirSemantics.getElem? body.locals dst.localId =
       some localTy)
     (h_dstTy : projectTy? localTy dst.projection = some dstTy)
@@ -5576,8 +5610,8 @@ theorem wpCallBuiltin {p : Program} {onDone : TerminalOut → Prop}
     | .step st' => execOutcomeState p onDone onFault fuel st'
     | .done out => onDone out
     | .fault k => onFault k)
-  rw [evalStep_callBuiltin h_body h_bb h_stmt h_len h_term h_dstLocal h_dstTy
-    h_args h_prim h_eval h_write]
+  rw [evalStep_callBuiltin h_body h_bb h_stmt h_len h_term h_noOverlap
+    h_dstLocal h_dstTy h_args h_prim h_eval h_write]
   exact execOutcomeState_of_wpOutcomeState h_cont
 
 /-- Deterministic `execOutcomeState` version of `wpCallBuiltin`. -/
@@ -5596,6 +5630,7 @@ theorem execCallBuiltin {p : Program} {onDone : TerminalOut → Prop}
     (h_len : Nat.beq frame.stmtIdx bb.statements.length = true)
     (h_term : bb.terminator =
       .callBuiltin builtin args dst (some nextBb) unwind)
+    (h_noOverlap : anyMoveOperandMayOverlapPlace dst args = false)
     (h_dstLocal : Trusted.MirSemantics.getElem? body.locals dst.localId =
       some localTy)
     (h_dstTy : projectTy? localTy dst.projection = some dstTy)
@@ -5617,7 +5652,8 @@ theorem execCallBuiltin {p : Program} {onDone : TerminalOut → Prop}
     execOutcomeState p onDone onFault (fuel + 1)
       { frames := frame :: callers, callerMem := callerMem } :=
   execOutcomeState_of_wpOutcomeState
-    (wpCallBuiltin h_body h_bb h_stmt h_len h_term h_dstLocal h_dstTy
-      h_args h_prim h_eval h_write (wpOutcomeState_of_execOutcomeState h_cont))
+    (wpCallBuiltin h_body h_bb h_stmt h_len h_term h_noOverlap h_dstLocal
+      h_dstTy h_args h_prim h_eval h_write
+      (wpOutcomeState_of_execOutcomeState h_cont))
 
 end Anneal.MirWp

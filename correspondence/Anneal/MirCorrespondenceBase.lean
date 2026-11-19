@@ -56,7 +56,7 @@ This module proves the foundational codec, simulation-uniqueness, and
 
 Per-step simulation (`evalRefStep_eq`), end-to-end correspondence
 (`anneal_corresponds_to_miri`, `reachesResult_fault_iff_refReachesOutcome`,
-`miri_move_deinit_wiring_claim_holds`), and non-vacuity canaries (`D6`–`D23`)
+`miri_move_deinit_wiring_claim_holds`), and non-vacuity canaries (`D6`–`D24`)
 are proved in `Anneal.MirCorrespondenceProof`.
 -/
 
