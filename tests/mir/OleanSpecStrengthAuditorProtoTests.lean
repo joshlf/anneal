@@ -91,6 +91,23 @@ elab "proto_set_implemented_by " target:ident imp:ident : command => do
   | .ok env' => setEnv env'
   | .error msg => throwError "proto_set_implemented_by failed: {msg}"
 
+/-- Test-only command overwriting `target`'s compiled IR entry in `Lean.IR.declMapExt`
+    with a body calling `callee` (or returning a constant `999` when `callee?` is `none`),
+    simulating a hostile metaprogram manipulating `IR.declMapExt` directly. -/
+elab "proto_forge_ir_call " target:ident callee:ident : command => do
+  let x : IR.VarId := ⟨1⟩
+  let r : IR.VarId := ⟨2⟩
+  let body := IR.FnBody.vdecl r .tobject (.fap callee.getId #[.var x]) (.ret (.var r))
+  let d := IR.Decl.fdecl target.getId #[⟨x, false, .tobject⟩] .tobject body {}
+  modifyEnv (Lean.IR.declMapExt.addEntry · d)
+
+elab "proto_forge_ir_const " target:ident : command => do
+  let x : IR.VarId := ⟨1⟩
+  let r : IR.VarId := ⟨2⟩
+  let body := IR.FnBody.vdecl r .tagged (.lit (.num 999)) (.ret (.var r))
+  let d := IR.Decl.fdecl target.getId #[⟨x, false, .tobject⟩] .tobject body {}
+  modifyEnv (Lean.IR.declMapExt.addEntry · d)
+
 /-! ## Helper: Sandboxed Elaboration & Deterministic Receipt Formatting -/
 
 /-- Elaborate Lean source code against a copy of the live `Environment` without
@@ -1535,6 +1552,157 @@ run_cmd do
   lines := lines ++
     [ formatVerdictProvisional "B3_R_forged_native_pair_on_stuck_term_residual" vRProv
     , formatVerdictTags "B3_R_forged_native_pair_strict_policy" vRStrict ]
+  logInfo (String.intercalate "\n" lines)
+
+/-! ## Pass A3 Hardening Regressions: `_sunfold` Spec-Gate Spoofing, `@[export]`, `IO Unit` Initializers, and Forged `IR.declMapExt` -/
+
+/--
+info: A3_3a_sunfold_vacuous_claim_rejected: rejected [specStrengthCertInvalidType]
+A3_3b_sunfold_fake_category_coverage_rejected: rejected [specStrengthCoverageGap]
+A3_3c_sunfold_hidden_shadowing_instance_rejected: rejected [specInstanceAmbiguous]
+A3_3d_sunfold_unit_as_cert_rejected: rejected [specStrengthCertInvalidType]
+A3_3e_sunfold_trivial_as_claim_rejected: rejected [specStrengthCertInvalidType]
+A3_6_export_attr_rejected: rejected [compilerOverrideAttribute]
+A3_4a_io_unit_init_direct_rejected: rejected [compilerOverrideAttribute]
+A3_4b_io_unit_init_ambient_rejected: rejected [compilerOverrideAttribute]
+A3_4c_builtin_init_io_unit_rejected: rejected [compilerOverrideAttribute]
+A3_12a_forged_ir_calling_unsafe_caught: rejected [unsafeDeclaration]
+A3_12b_forged_ir_clean_ret_residual: ok []
+-/
+#guard_msgs in
+run_cmd do
+  let strict : AuditPolicy := { checkStatementOrigin := false }
+  let amb : AuditPolicy := { checkStatementOrigin := false, forbidAmbientModuleOverrides := true }
+  let mut lines : List String := []
+  let kw := "sor" ++ "ry"
+
+  -- A3-3a: hand-written `pre._sunfold` / `post._sunfold` used to trick `Meta.isDefEq`
+  -- in `checkCertBinding`, letting a completely vacuous (`False`/`True`) claim pass
+  -- `auditClaimSpecStrengthInEnv` with an unrelated strong certificate (`ok`).
+  let env3a ← elabInSandbox <|
+    "open Trusted.VerificationResult Trusted.MirSemantics Trusted.MirAst\n" ++
+    "open Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "axiom a3aBody : CapturedMir\n" ++
+    "def a3VacPre (_ : List Value) : Prop := False\n" ++
+    "def a3VacPre._sunfold : List Value → Prop := fxfsVmoSubslicePre\n" ++
+    "def a3VacPost (_ : List Value) (_ : Value) : Prop := True\n" ++
+    "def a3VacPost._sunfold : List Value → Value → Prop := fxfsVmoSubslicePost\n" ++
+    "noncomputable def a3VacClaim : Claim := { body := a3aBody, pre := a3VacPre, post := a3VacPost }\n" ++
+    s!"theorem a3VacVerified : VerificationResult a3VacClaim := by {kw}\n"
+  let v3a ← withSandboxEnv env3a <|
+    auditClaimSpecStrengthInEnv `a3VacVerified (some ``fxfsVmoSubsliceMultiCert)
+  liftIO <| assertRejectedWithTag "A3_3a_sunfold_vacuous_claim_rejected" v3a "specStrengthCertInvalidType"
+  lines := lines ++ [formatVerdictTags "A3_3a_sunfold_vacuous_claim_rejected" v3a]
+
+  -- A3-3b: hand-written `kills._sunfold` (carrying a `sorry`-faked `.unpreservedFrame` kill
+  -- outside the certificate's kernel closure) used to trick `Meta.whnf` in
+  -- `missingMutantCategories`, passing `requiredCategories := [.unpreservedFrame]` (`ok`).
+  let env3b ← elabInSandbox <|
+    "open Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "def a3WeakKills (_ : Unit) : List (NamedMutantKill fxfsVmoSubslicePre fxfsVmoSubslicePost) :=\n" ++
+    "  [fxfsVmoSubsliceMultiCert.kills.head (by intro h; cases h)]\n" ++
+    "def a3WeakCert : MultiMutantSpecCert fxfsVmoSubslicePre fxfsVmoSubslicePost :=\n" ++
+    "  { fxfsVmoSubsliceMultiCert with kills := a3WeakKills (), kills_nonempty := by intro h; cases h }\n" ++
+    "def a3WeakKills._sunfold (_ : Unit) : List (NamedMutantKill fxfsVmoSubslicePre fxfsVmoSubslicePost) :=\n" ++
+    s!"  [\{ name := \"fake\", category := .unpreservedFrame, input := fxfsVmoSubsliceMultiCert.x₀, input_valid := fxfsVmoSubsliceMultiCert.req_nonvacuous, referenceOutput := fxfsVmoSubsliceMultiCert.y₀, reference_accepted := fxfsVmoSubsliceMultiCert.ens_realizable, mutantOutput := fxfsVmoSubsliceMultiCert.y₀, killed := by {kw} }]\n"
+  let v3b ← withSandboxEnv env3b <|
+    auditSpecStrengthCertInEnv `fxfs (some `a3WeakCert)
+      (expectedReq? := some (mkConst ``fxfsVmoSubslicePre))
+      (expectedEns? := some (mkConst ``fxfsVmoSubslicePost))
+      (requiredCategories := [.unpreservedFrame])
+  liftIO <| assertRejectedWithTag "A3_3b_sunfold_fake_category_coverage_rejected" v3b "specStrengthCoverageGap"
+  lines := lines ++ [formatVerdictTags "A3_3b_sunfold_fake_category_coverage_rejected" v3b]
+
+  -- A3-3c: hand-written `alias._sunfold := PUnit` used to hide a weak shadowing
+  -- `ItemSpec` instance from `specInstanceCandidatesMeta` (`ok`).
+  let env3c ← elabInSandbox <|
+    "open Trusted.VerificationResult Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "abbrev a3Hide (_ : Unit) : Type 1 := ItemSpec \"proto::a3sunfold\"\n" ++
+    "instance a3WeakSunfold : a3Hide () := { pre := fun _ => True }\n" ++
+    "def a3Hide._sunfold (_ : Unit) : Type 1 := PUnit.{2}\n" ++
+    "instance a3StrongSunfold : ItemSpec \"proto::a3sunfold\" := { pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n" ++
+    "instance a3CertSunfold : ItemMultiMutantCert \"proto::a3sunfold\" := { cert := fxfsVmoSubsliceMultiCert }\n"
+  let v3c ← withSandboxEnv env3c <| auditItemSpecStrengthBySynth "proto::a3sunfold"
+  liftIO <| assertRejectedWithTag "A3_3c_sunfold_hidden_shadowing_instance_rejected" v3c "specInstanceAmbiguous"
+  lines := lines ++ [formatVerdictTags "A3_3c_sunfold_hidden_shadowing_instance_rejected" v3c]
+
+  -- A3-3d: hand-written `FakeCertTy._sunfold := SpecStrengthCert ...` used to let literal
+  -- `Unit.unit` (`()`) pass `auditSpecStrengthCertInEnv` with zero axioms (`ok`).
+  let env3d ← elabInSandbox <|
+    "open Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "def a3FakeCertTy (_ : Unit) : Type := Unit\n" ++
+    "def a3UnitCert : a3FakeCertTy () := ()\n" ++
+    "def a3FakeCertTy._sunfold (_ : Unit) : Type := SpecStrengthCert fxfsVmoSubslicePre fxfsVmoSubslicePost\n"
+  let v3d ← withSandboxEnv env3d <|
+    auditSpecStrengthCertInEnv `fxfs (some `a3UnitCert)
+      (expectedReq? := some (mkConst ``fxfsVmoSubslicePre))
+      (expectedEns? := some (mkConst ``fxfsVmoSubslicePost))
+  liftIO <| assertRejectedWithTag "A3_3d_sunfold_unit_as_cert_rejected" v3d "specStrengthCertInvalidType"
+  lines := lines ++ [formatVerdictTags "A3_3d_sunfold_unit_as_cert_rejected" v3d]
+
+  -- A3-3e: hand-written `FakeClaimTy._sunfold := VerificationResult ...` used to let
+  -- `True.intro` (`trivial`) pass `auditClaimSpecStrengthInEnv` (`ok`).
+  let env3e ← elabInSandbox <|
+    "open Trusted.VerificationResult Trusted.MirSemantics Trusted.MirAst Anneal.OleanSpecStrengthAuditorProto\n" ++
+    "axiom a3eBody : CapturedMir\n" ++
+    "noncomputable def a3eClaim : Claim := { body := a3eBody, pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n" ++
+    "def a3FakeClaimTy (_ : Unit) : Prop := True\n" ++
+    "theorem a3TrivialVerified : a3FakeClaimTy () := trivial\n" ++
+    "def a3FakeClaimTy._sunfold (_ : Unit) : Prop := VerificationResult a3eClaim\n"
+  let v3e ← withSandboxEnv env3e <|
+    auditClaimSpecStrengthInEnv `a3TrivialVerified (some ``fxfsVmoSubsliceMultiCert)
+  liftIO <| assertRejectedWithTag "A3_3e_sunfold_trivial_as_claim_rejected" v3e "specStrengthCertInvalidType"
+  lines := lines ++ [formatVerdictTags "A3_3e_sunfold_trivial_as_claim_rejected" v3e]
+
+  -- A3-6: `@[export <c_sym>]` closes Residual #6 alongside `@[init]`.
+  let env6 ← elabInSandbox <|
+    "@[export a3_c_symbol] def a3Exported (n : Nat) : Nat := n\n" ++
+    "theorem a3ExpThm : a3Exported 1 = 1 := rfl\n"
+  let v6 ← liftIO <| auditDeclsInEnvIO env6 #[`a3ExpThm] strict
+  liftIO <| assertRejectedWithTag "A3_6_export_attr_rejected" v6 "compilerOverrideAttribute"
+  unless v6.violations.any (fun | .compilerOverrideAttribute _ `a3Exported "export" _ => true | _ => false) do
+    throwError "A3_6: expected `export` override violation on a3Exported"
+  lines := lines ++ [formatVerdictTags "A3_6_export_attr_rejected" v6]
+
+  -- A3-4a/b/c: `IO Unit` initializers (`@[init]` direct + ambient, and `@[builtin_init]`).
+  let env4a ← elabInSandbox <|
+    "@[init] def a3IoInit : IO Unit := pure ()\n" ++
+    "theorem a3IoDirect : a3IoInit = a3IoInit := rfl\n" ++
+    "theorem a3IoClean : (1 : Nat) + 1 = 2 := rfl\n"
+  let v4a ← liftIO <| auditDeclsInEnvIO env4a #[`a3IoDirect] strict
+  let v4b ← liftIO <| auditDeclsInEnvIO env4a #[`a3IoClean] amb
+  let env4c ← elabInSandbox <|
+    "@[builtin_init] def a3BuiltinIo : IO Unit := pure ()\n" ++
+    "theorem a3BuiltinThm : a3BuiltinIo = a3BuiltinIo := rfl\n"
+  let v4c ← liftIO <| auditDeclsInEnvIO env4c #[`a3BuiltinThm] strict
+  liftIO <| assertRejectedWithTag "A3_4a_io_unit_init_direct_rejected" v4a "compilerOverrideAttribute"
+  liftIO <| assertRejectedWithTag "A3_4b_io_unit_init_ambient_rejected" v4b "compilerOverrideAttribute"
+  liftIO <| assertRejectedWithTag "A3_4c_builtin_init_io_unit_rejected" v4c "compilerOverrideAttribute"
+  lines := lines ++
+    [ formatVerdictTags "A3_4a_io_unit_init_direct_rejected" v4a
+    , formatVerdictTags "A3_4b_io_unit_init_ambient_rejected" v4b
+    , formatVerdictTags "A3_4c_builtin_init_io_unit_rejected" v4c ]
+
+  -- A3-12a/b: metaprogram-forged `Lean.IR.declMapExt` entries. An injected IR call to an
+  -- `unsafe` declaration is caught directly by `collectIRCalleesForDecl`; a clean
+  -- constant-return IR replacement carrying no attributes or bad callees pins the
+  -- documented compiled-IR forgery residual (closed only by source recompilation).
+  let env12a ← elabInSandbox <|
+    "unsafe def a3IrEvil (n : Nat) : Nat := n + 999\n" ++
+    "def a3IrVictim (n : Nat) : Nat := n\n" ++
+    "proto_forge_ir_call a3IrVictim a3IrEvil\n" ++
+    "theorem a3IrThm : a3IrVictim 1 = 1 := rfl\n"
+  let v12a ← liftIO <| auditDeclsInEnvIO env12a #[`a3IrThm] strict
+  liftIO <| assertRejectedWithTag "A3_12a_forged_ir_calling_unsafe_caught" v12a "unsafeDeclaration"
+  let env12b ← elabInSandbox <|
+    "def a3IrCleanVictim (n : Nat) : Nat := n\n" ++
+    "proto_forge_ir_const a3IrCleanVictim\n" ++
+    "theorem a3IrCleanThm : a3IrCleanVictim 1 = 1 := rfl\n"
+  let v12b ← liftIO <| auditDeclsInEnvIO env12b #[`a3IrCleanThm] strict
+  liftIO <| assertAuditOk "A3_12b_forged_ir_clean_ret_residual" v12b
+  lines := lines ++
+    [ formatVerdictTags "A3_12a_forged_ir_calling_unsafe_caught" v12a
+    , formatVerdictTags "A3_12b_forged_ir_clean_ret_residual" v12b ]
   logInfo (String.intercalate "\n" lines)
 
 /-! ### Type-Level Refutations for Discriminating Kills and Deterministic Specifications -/

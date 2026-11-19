@@ -802,6 +802,9 @@ def checkCompilerOverridesOnDecl (privEnv : Environment) (csimpIdx : CSimpIndex)
     else if Lean.isIOUnitInitFn privEnv n then
       vs := vs.push (.compilerOverrideAttribute target n "init"
         "IO action executed at module load time")
+    if let some expSym := Lean.getExportNameFor? privEnv n then
+      vs := vs.push (.compilerOverrideAttribute target n "export"
+        s!"exported under unmangled C symbol {expSym}")
   if let some (toDecl, thmName) := csimpIdx.fromToThm[n]? then
     vs := vs.push (.compilerOverrideAttribute target n "csimp_target"
       s!"replaced in compiled code by {toDecl} via @[csimp] {thmName}")
@@ -2606,42 +2609,107 @@ def specInstanceCandidates (privEnv : Environment) (specClass : Name) (defId : S
     | _ => pure ()
   return found.qsort Name.lt
 
-/-- Full `MetaM` scan for all non-constructor constants in modules reaching `specClass`
-    (plus local constants) whose type reduces under `Meta.withTransparency .all`
-    (`Meta.forallTelescopeReducing` + `Meta.whnf`, covering β/ζ/δ/ι/projection/quotient
-    reductions) to `specClass "<defId>"`, or to `specClass e` for a non-literal `e`, or
-    fails to reduce cleanly (fail-closed). -/
-def specInstanceCandidatesMeta (specClass : Name) (defId : String) : MetaM (Array Name) := do
-  let privEnv := (← getEnv).setExporting false
+/-- Run a `MetaM` check with `Lean.Meta.smartUnfolding` disabled so hand-written
+    `<name>._sunfold` sibling constants can never steer `Meta.whnf`, `Meta.isDefEq`, or
+    `Meta.synthInstance?` away from the kernel's true definitions. -/
+private def withKernelFaithfulMeta (act : MetaM α) : MetaM α :=
+  withOptions (fun opts => Lean.Meta.smartUnfolding.set opts false) act
+
+/-- Choose a fresh throw-away name under `prefixName` guaranteed absent from `privEnv`. -/
+private def freshKernelCheckName (privEnv : Environment) (prefixName : Name) (tag : String) : Name := Id.run do
   let kenv := privEnv.checked.get
-  let classMod? := originModule? privEnv specClass
-  let mut found : Array Name := #[]
-  for (n, ci) in constantsReachingSpecClass privEnv specClass do
-    match ci with
-    | .defnInfo _ | .opaqueInfo _ | .axiomInfo _ | .thmInfo _ =>
-      if specClass.isPrefixOf n && originModule? privEnv n == classMod? then
-        continue
-      if canFastSkipSpecCandidate kenv specClass ci then
-        continue
-      let isCandidate ← try
-        Meta.withTransparency .all do
-          Meta.forallTelescopeReducing ci.type fun _ body => do
-            let body ← Meta.whnf body
-            if body.getAppFn.constName? == some specClass then
-              let arg := body.getAppArgs[0]?.getD (.bvar 0)
-              let arg ← Meta.whnf arg
-              match arg with
-              | Expr.lit (Literal.strVal s) => return (s == defId)
-              | _ => return true
-            else
-              return false
-      catch _ =>
-        -- Fail closed if reduction throws (e.g. heartbeat/recursion limit).
-        pure true
-      if isCandidate then
-        found := found.push n
-    | _ => pure ()
-  return found.qsort Name.lt
+  let base := prefixName.str tag
+  if (kenv.find? base).isNone then
+    return base
+  let bound :=
+    privEnv.header.moduleData.foldl (init := 250000) (fun acc d => acc + d.constants.size) +
+    kenv.constants.map₂.toList.length + 4
+  for i in [:bound] do
+    let cand := base.num i
+    if (kenv.find? cand).isNone then
+      return cand
+  return base.str "_fallback"
+
+/-- Ask Lean's kernel directly whether closed term `val` has type `ty` (in `privEnv`),
+    without modifying `privEnv`. Used to make certificate binding and claim extraction
+    rest on the kernel alone rather than `MetaM` definitional equality. -/
+private def kernelConfirmsHasType (privEnv : Environment) (label : Name)
+    (levelParams : List Name) (val ty : Expr) (isProp : Bool) : Bool :=
+  if val.hasFVar || val.hasMVar || val.hasLooseBVars ||
+     ty.hasFVar || ty.hasMVar || ty.hasLooseBVars then
+    false
+  else
+    let fresh := freshKernelCheckName privEnv label "_kernel_type_check"
+    let decl :=
+      if isProp then
+        Declaration.thmDecl { name := fresh, levelParams, type := ty, value := val }
+      else
+        Declaration.defnDecl {
+          name := fresh, levelParams, type := ty, value := val,
+          hints := .opaque, safety := .safe
+        }
+    match privEnv.checked.get.addDeclCore 0 512 decl none with
+    | .ok _ => true
+    | .error _ => false
+
+/-- Ask Lean's kernel directly whether `boolExpr = Bool.true` holds by definitional
+    reduction (`Eq.refl true`), without modifying `privEnv`. -/
+private def kernelConfirmsBoolTrue (privEnv : Environment) (label : Name)
+    (levelParams : List Name) (boolExpr : Expr) : Bool :=
+  if boolExpr.hasFVar || boolExpr.hasMVar || boolExpr.hasLooseBVars then
+    false
+  else
+    let lvl := Level.succ Level.zero
+    let boolTy := mkConst ``Bool
+    let trueE := mkConst ``Bool.true
+    let decl := Declaration.thmDecl {
+      name := freshKernelCheckName privEnv label "_kernel_covers_check"
+      levelParams
+      type := mkApp3 (mkConst ``Eq [lvl]) boolTy boolExpr trueE
+      value := mkApp2 (mkConst ``Eq.refl [lvl]) boolTy trueE
+    }
+    match privEnv.checked.get.addDeclCore 0 512 decl none with
+    | .ok _ => true
+    | .error _ => false
+
+/-- Full `MetaM` scan for all non-constructor constants in modules reaching `specClass`
+    (plus local constants) whose type reduces under `withKernelFaithfulMeta` and
+    `Meta.withTransparency .all` (`Meta.forallTelescopeReducing` + `Meta.whnf`, covering
+    β/ζ/δ/ι/projection/quotient reductions without consulting `_sunfold`) to
+    `specClass "<defId>"`, or to `specClass e` for a non-literal `e`, or fails to reduce
+    cleanly (fail-closed). -/
+def specInstanceCandidatesMeta (specClass : Name) (defId : String) : MetaM (Array Name) :=
+  withKernelFaithfulMeta do
+    let privEnv := (← getEnv).setExporting false
+    let kenv := privEnv.checked.get
+    let classMod? := originModule? privEnv specClass
+    let mut found : Array Name := #[]
+    for (n, ci) in constantsReachingSpecClass privEnv specClass do
+      match ci with
+      | .defnInfo _ | .opaqueInfo _ | .axiomInfo _ | .thmInfo _ =>
+        if specClass.isPrefixOf n && originModule? privEnv n == classMod? then
+          continue
+        if canFastSkipSpecCandidate kenv specClass ci then
+          continue
+        let isCandidate ← try
+          Meta.withTransparency .all do
+            Meta.forallTelescopeReducing ci.type fun _ body => do
+              let body ← Meta.whnf body
+              if body.getAppFn.constName? == some specClass then
+                let arg := body.getAppArgs[0]?.getD (.bvar 0)
+                let arg ← Meta.whnf arg
+                match arg with
+                | Expr.lit (Literal.strVal s) => return (s == defId)
+                | _ => return true
+              else
+                return false
+        catch _ =>
+          -- Fail closed if reduction throws (e.g. heartbeat/recursion limit).
+          pure true
+        if isCandidate then
+          found := found.push n
+      | _ => pure ()
+    return found.qsort Name.lt
 
 /-- Resolve *the* specification instance of `specClass` for `defId`, failing closed
     unless exactly one candidate constant exists and typeclass synthesis selects it.
@@ -2649,100 +2717,115 @@ def specInstanceCandidatesMeta (specClass : Name) (defId : String) : MetaM (Arra
     A verification claim is stated against whichever instance resolved when the claim
     was elaborated. If a second instance for the same `defId` exists (declared later,
     with higher priority, after erasing the first, or hidden behind `let`/beta/projection/
-    alias/recursor reductions), a certificate could be checked against a stronger
-    specification than the one actually verified; uniqueness rules that substitution out. -/
+    alias/recursor/`_sunfold` reductions), a certificate could be checked against a
+    stronger specification than the one actually verified; uniqueness rules that out. -/
 def resolveUniqueSpecInstance (specName : Name) (specClass : Name) (defId : String) :
-    MetaM (Except AuditViolation Expr) := do
-  let candidates ← specInstanceCandidatesMeta specClass defId
-  if candidates.isEmpty then
-    return .error (.specStrengthCertMissing specName
-      s!"no {specClass} instance found for \"{defId}\"")
-  if candidates.size != 1 then
-    return .error (.specInstanceAmbiguous specName specClass candidates)
-  let specTy := mkApp (mkConst specClass) (mkStrLit defId)
-  match (← Meta.synthInstance? specTy) with
-  | none =>
-    return .error (.specStrengthCertMissing specName
-      s!"no {specClass} instance found for \"{defId}\"")
-  | some inst =>
-    -- The instance must be the candidate constant itself, with no arguments. If it is
-    -- an application (`@Ext.toItemSpec extInst`, `@paramSpec cfgInst`), the specification
-    -- depends on further instance arguments whose own uniqueness is not established: a
-    -- second `extInst` / `cfgInst` declared later would silently change which
-    -- specification this resolves to.
-    if inst.isConstOf candidates[0]! then
-      return .ok inst
-    else
-      return .error (.specInstanceAmbiguous specName specClass
-        (candidates.push (inst.getAppFn.constName?.getD .anonymous)))
+    MetaM (Except AuditViolation Expr) :=
+  withKernelFaithfulMeta do
+    let candidates ← specInstanceCandidatesMeta specClass defId
+    if candidates.isEmpty then
+      return .error (.specStrengthCertMissing specName
+        s!"no {specClass} instance found for \"{defId}\"")
+    if candidates.size != 1 then
+      return .error (.specInstanceAmbiguous specName specClass candidates)
+    let specTy := mkApp (mkConst specClass) (mkStrLit defId)
+    match (← Meta.synthInstance? specTy) with
+    | none =>
+      return .error (.specStrengthCertMissing specName
+        s!"no {specClass} instance found for \"{defId}\"")
+    | some inst =>
+      -- The instance must be the candidate constant itself, with no arguments. If it is
+      -- an application (`@Ext.toItemSpec extInst`, `@paramSpec cfgInst`), the specification
+      -- depends on further instance arguments whose own uniqueness is not established: a
+      -- second `extInst` / `cfgInst` declared later would silently change which
+      -- specification this resolves to.
+      if inst.isConstOf candidates[0]! then
+        return .ok inst
+      else
+        return .error (.specInstanceAmbiguous specName specClass
+          (candidates.push (inst.getAppFn.constName?.getD .anonymous)))
 
 /-- Bind the (weak-head-normal) certificate type `ty` of `certDecl` to the target
-    specification. Returns `none` when bound, or the violation explaining why not.
+    specification, confirming the resulting binding directly in Lean's kernel
+    (`kernelConfirmsHasType`) under `withKernelFaithfulMeta`. Returns `none` when bound,
+    or the violation explaining why not.
 
     A certificate that cannot be tied to the specification under audit is worthless, so
     binding information is mandatory: direct certificates need *both* `expectedReq?` and
     `expectedEns?`; typeclass certificates need `expectedDefId?` and must mention the
     unique specification instance for that `defId`. -/
-private def checkCertBinding (specName certDecl : Name) (ty : Expr)
+private def checkCertBinding (privEnv : Environment) (specName certDecl : Name)
+    (certCi : ConstantInfo) (ty : Expr)
     (expectedReq? expectedEns? : Option Expr) (expectedDefId? : Option String)
     (expectedEnvAssumed? : Option Expr := none) :
-    MetaM (Option AuditViolation) := do
-  let fn := ty.getAppFn
-  let args := ty.getAppArgs
-  let tyStr := toString (← Meta.ppExpr ty)
-  let invalid (msg : String) : AuditViolation :=
-    .specStrengthCertInvalidType certDecl specName s!"{msg}: {tyStr}"
-  let some head := fn.constName?
-    | return some (invalid "not a SpecStrengthCert type")
-  if directCertHeads.contains head then
-    if expectedEnvAssumed?.isSome then
-      return some (invalid "expected Modular*SpecCert binding envAssumed, got")
-    if args.size != 4 then
-      return some (invalid "malformed direct certificate type")
-    match expectedReq?, expectedEns? with
-    | some expReq, some expEns =>
-      unless (← Meta.isDefEq args[2]! expReq) do
-        return some (invalid "precondition mismatch")
-      unless (← Meta.isDefEq args[3]! expEns) do
-        return some (invalid "postcondition mismatch")
-      return none
-    | _, _ =>
-      return some (invalid
-        "unbound certificate (both expectedReq? and expectedEns? are required to bind a direct certificate to its specification)")
-  else if directModularCertHeads.contains head then
-    if args.size != 3 then
-      return some (invalid "malformed direct modular certificate type")
-    match expectedEnvAssumed?, expectedReq?, expectedEns? with
-    | some expEnv, some expPre, some expPost =>
-      unless (← Meta.isDefEq args[0]! expEnv) do
-        return some (invalid "rely predicate (envAssumed) mismatch")
-      unless (← Meta.isDefEq args[1]! expPre) do
-        return some (invalid "precondition mismatch")
-      unless (← Meta.isDefEq args[2]! expPost) do
-        return some (invalid "postcondition mismatch")
-      return none
-    | _, _, _ =>
-      return some (invalid
-        "unbound modular certificate (expectedEnvAssumed?, expectedReq?, and expectedEns? are all required)")
-  else
-    match classCertHeads.find? (·.1 == head) with
-    | none => return some (invalid "not a SpecStrengthCert type")
-    | some (_, specClass) =>
-      if expectedReq?.isSome || expectedEns?.isSome || expectedEnvAssumed?.isSome then
-        return some (invalid "expected direct SpecStrengthCert/MultiMutantSpecCert/Modular*SpecCert, got")
-      let some defId := expectedDefId?
-        | return some (invalid
-            "unbound certificate (expectedDefId? is required to bind a typeclass certificate to its specification)")
-      if args.size != 2 then
-        return some (invalid "malformed typeclass certificate type")
-      unless (← Meta.isDefEq args[0]! (mkStrLit defId)) do
-        return some (invalid s!"certificate is for a different defId than \"{defId}\"")
-      match (← resolveUniqueSpecInstance specName specClass defId) with
-      | .error v => return some v
-      | .ok inst =>
-        unless (← Meta.isDefEq args[1]! inst) do
-          return some (invalid "certificate is stated against a different specification instance")
+    MetaM (Option AuditViolation) :=
+  withKernelFaithfulMeta do
+    let fn := ty.getAppFn
+    let args := ty.getAppArgs
+    let tyStr := toString (← Meta.ppExpr ty)
+    let invalid (msg : String) : AuditViolation :=
+      .specStrengthCertInvalidType certDecl specName s!"{msg}: {tyStr}"
+    let some head := fn.constName?
+      | return some (invalid "not a SpecStrengthCert type")
+    let certLvls := fn.constLevels!
+    let certVal := mkConst certDecl (certCi.levelParams.map mkLevelParam)
+    let confirmKernel (boundTy : Expr) : MetaM (Option AuditViolation) := do
+      let boundTy ← instantiateMVars boundTy
+      let isProp ← Meta.isProp boundTy
+      if kernelConfirmsHasType privEnv certDecl certCi.levelParams certVal boundTy isProp then
         return none
+      else
+        return some (invalid "kernel rejected certificate binding against expected specification")
+    if directCertHeads.contains head then
+      if expectedEnvAssumed?.isSome then
+        return some (invalid "expected Modular*SpecCert binding envAssumed, got")
+      if args.size != 4 then
+        return some (invalid "malformed direct certificate type")
+      match expectedReq?, expectedEns? with
+      | some expReq, some expEns =>
+        unless (← Meta.isDefEq args[2]! expReq) do
+          return some (invalid "precondition mismatch")
+        unless (← Meta.isDefEq args[3]! expEns) do
+          return some (invalid "postcondition mismatch")
+        confirmKernel (mkApp4 (mkConst head certLvls) args[0]! args[1]! expReq expEns)
+      | _, _ =>
+        return some (invalid
+          "unbound certificate (both expectedReq? and expectedEns? are required to bind a direct certificate to its specification)")
+    else if directModularCertHeads.contains head then
+      if args.size != 3 then
+        return some (invalid "malformed direct modular certificate type")
+      match expectedEnvAssumed?, expectedReq?, expectedEns? with
+      | some expEnv, some expPre, some expPost =>
+        unless (← Meta.isDefEq args[0]! expEnv) do
+          return some (invalid "rely predicate (envAssumed) mismatch")
+        unless (← Meta.isDefEq args[1]! expPre) do
+          return some (invalid "precondition mismatch")
+        unless (← Meta.isDefEq args[2]! expPost) do
+          return some (invalid "postcondition mismatch")
+        confirmKernel (mkApp3 (mkConst head certLvls) expEnv expPre expPost)
+      | _, _, _ =>
+        return some (invalid
+          "unbound modular certificate (expectedEnvAssumed?, expectedReq?, and expectedEns? are all required)")
+    else
+      match classCertHeads.find? (·.1 == head) with
+      | none => return some (invalid "not a SpecStrengthCert type")
+      | some (_, specClass) =>
+        if expectedReq?.isSome || expectedEns?.isSome || expectedEnvAssumed?.isSome then
+          return some (invalid "expected direct SpecStrengthCert/MultiMutantSpecCert/Modular*SpecCert, got")
+        let some defId := expectedDefId?
+          | return some (invalid
+              "unbound certificate (expectedDefId? is required to bind a typeclass certificate to its specification)")
+        if args.size != 2 then
+          return some (invalid "malformed typeclass certificate type")
+        let defIdLit := mkStrLit defId
+        unless (← Meta.isDefEq args[0]! defIdLit) do
+          return some (invalid s!"certificate is for a different defId than \"{defId}\"")
+        match (← resolveUniqueSpecInstance specName specClass defId) with
+        | .error v => return some v
+        | .ok inst =>
+          unless (← Meta.isDefEq args[1]! inst) do
+            return some (invalid "certificate is stated against a different specification instance")
+          confirmKernel (mkApp2 (mkConst head certLvls) defIdLit inst)
 
 /-- Stable human-readable label of a `MutantCategory` (used in audit receipts). -/
 def MutantCategory.label : MutantCategory → String
@@ -2766,59 +2849,61 @@ def MutantCategory.toExpr : MutantCategory → Expr
   | .unpreservedFrame => mkConst ``MutantCategory.unpreservedFrame
   | .custom label => mkApp (mkConst ``MutantCategory.custom) (mkStrLit label)
 
-/-- Decide, by reducing `MultiMutantSpecCert.coversCategory multiExpr cat` to a `Bool`
-    literal, which of the `required` categories the certificate term `multiExpr` fails
-    to kill. Anything that does not reduce to `Bool.true` counts as missing. -/
-private def missingMutantCategories (multiExpr : Expr) (required : List MutantCategory) :
-    MetaM (Array String) := do
-  let mut missing : Array String := #[]
-  for cat in required do
-    let covers ← Meta.mkAppM ``MultiMutantSpecCert.coversCategory #[multiExpr, cat.toExpr]
-    let r ← Meta.whnf covers
-    unless r.isConstOf ``Bool.true do
-      missing := missing.push cat.label
-  return missing
+/-- Decide, by reducing `MultiMutantSpecCert.coversCategory multiExpr cat` under
+    `withKernelFaithfulMeta` AND confirming `covers = Bool.true` directly in Lean's
+    kernel (`kernelConfirmsBoolTrue`), which of the `required` categories `multiExpr`
+    fails to kill. Anything not kernel-confirmed as `Bool.true` counts as missing. -/
+private def missingMutantCategories (privEnv : Environment) (certLabel : Name)
+    (levelParams : List Name) (multiExpr : Expr) (required : List MutantCategory) :
+    MetaM (Array String) :=
+  withKernelFaithfulMeta do
+    let mut missing : Array String := #[]
+    for cat in required do
+      let covers ← instantiateMVars (← Meta.mkAppM ``MultiMutantSpecCert.coversCategory #[multiExpr, cat.toExpr])
+      let r ← Meta.whnf covers
+      if !r.isConstOf ``Bool.true || !kernelConfirmsBoolTrue privEnv certLabel levelParams covers then
+        missing := missing.push cat.label
+    return missing
 
 /-- Enforce `required` mutant-category coverage on the certificate expression `certExpr`
     whose weak-head-normal type has head constant `head`. Single-mutant and
     `DeterministicSpecCert` witnesses carry no categorized kills and therefore cannot
     satisfy a non-empty `required` list. -/
-private def checkCategoryCoverage (certLabel : Name) (head : Name) (certExpr : Expr)
-    (required : List MutantCategory) : MetaM (Option AuditViolation) := do
-  if required.isEmpty then
-    return none
-  let multiExpr? : Option Expr ←
-    if head == ``MultiMutantSpecCert then pure (some certExpr)
-    else if multiMutantCertHeads.contains head then
-      pure (some (← Meta.mkProjection certExpr `cert))
-    else pure none
-  match multiExpr? with
-  | none =>
-    return some (.specStrengthCoverageGap certLabel (required.map (·.label)).toArray
-      "certificate carries no categorized mutant kills")
-  | some multiExpr =>
-    let missing ← missingMutantCategories multiExpr required
-    if missing.isEmpty then
+private def checkCategoryCoverage (privEnv : Environment) (certLabel : Name)
+    (levelParams : List Name) (head : Name) (certExpr : Expr)
+    (required : List MutantCategory) : MetaM (Option AuditViolation) :=
+  withKernelFaithfulMeta do
+    if required.isEmpty then
       return none
-    else
-      return some (.specStrengthCoverageGap certLabel missing
-        "required mutant categories are not killed by the certificate")
+    let multiExpr? : Option Expr ←
+      if head == ``MultiMutantSpecCert then pure (some certExpr)
+      else if multiMutantCertHeads.contains head then
+        pure (some (← Meta.mkProjection certExpr `cert))
+      else pure none
+    match multiExpr? with
+    | none =>
+      return some (.specStrengthCoverageGap certLabel (required.map (·.label)).toArray
+        "certificate carries no categorized mutant kills")
+    | some multiExpr =>
+      let missing ← missingMutantCategories privEnv certLabel levelParams multiExpr required
+      if missing.isEmpty then
+        return none
+      else
+        return some (.specStrengthCoverageGap certLabel missing
+          "required mutant categories are not killed by the certificate")
 
 /-- `MetaM` specification-strength gate verifying that:
     1. A registered `SpecStrengthCert` / `MultiMutantSpecCert` / `DeterministicSpecCert`
        (or `*Item*Cert`) declaration `certDecl` exists in the environment;
-    2. Its kernel type reduces via `whnf` to a recognised certificate head that is
-       *bound* to the target specification (`checkCertBinding`): direct certificates
-       must match both `expectedReq?` and `expectedEns?` up to `Meta.isDefEq`;
-       typeclass certificates must match `expectedDefId?` and the unique specification
-       instance for it. Omitting the binding information is rejected, never waved
-       through (preventing certificate substitution from an unrelated strong spec);
+    2. Its kernel type reduces via `withKernelFaithfulMeta` `whnf` (ignoring `_sunfold`)
+       to a recognised certificate head that is *bound* to the target specification and
+       confirmed directly by Lean's kernel (`checkCertBinding`);
     3. The certificate declaration itself passes the `MetaM` environment audit under
        `policy` (default `AuditPolicy.constructive`, preventing `sorry`-faked,
        `Classical.choice`-tainted, `partial`, `unsafe`, or `@[implemented_by]` certs);
     4. When `requiredCategories` is non-empty, the certificate is a categorized
-       multi-mutant certificate whose kills cover every required `MutantCategory`
-       (`.specStrengthCoverageGap` otherwise). -/
+       multi-mutant certificate whose kills are kernel-confirmed to cover every required
+       `MutantCategory` (`.specStrengthCoverageGap` otherwise). -/
 def auditSpecStrengthCertInEnv
     (specName : Name)
     (certDecl? : Option Name)
@@ -2828,199 +2913,214 @@ def auditSpecStrengthCertInEnv
     (expectedDefId? : Option String := none)
     (requiredCategories : List MutantCategory := [])
     (expectedEnvAssumed? : Option Expr := none) :
-    MetaM AuditVerdict := do
-  let t0 ← IO.monoNanosNow
-  let reject (vs : Array AuditViolation) : MetaM AuditVerdict := do
-    let t1 ← IO.monoNanosNow
-    return .rejected vs { elapsedMicros := (t1 - t0) / 1000 }
-  match certDecl? with
-  | none =>
-    reject #[.specStrengthCertMissing specName
-      "no registered SpecStrengthCert or MultiMutantSpecCert declaration"]
-  | some certDecl =>
-    let env ← getEnv
-    let privEnv := env.setExporting false
-    match privEnv.checked.get.find? certDecl with
-    | none => reject #[.missingDeclaration certDecl]
-    | some ci =>
-      let ty ← Meta.whnf ci.type
-      match (← checkCertBinding specName certDecl ty expectedReq? expectedEns? expectedDefId?
-          expectedEnvAssumed?) with
-      | some v => reject #[v]
-      | none =>
-        -- Audit the certificate declaration BEFORE reducing it via `Meta.whnf` in
-        -- `checkCategoryCoverage`, so `sorry`-faked, `partial`, `unsafe`, or
-        -- `Classical.choice`-tainted certs always fail with their true soundness
-        -- violation rather than being masked by `.specStrengthCoverageGap` (and
-        -- unaudited terms are never evaluated by `whnf`).
-        let envVerdict ← liftM <| auditDeclsInEnvIO privEnv #[certDecl] policy
-        match envVerdict with
-        | .rejected vs s =>
-          let t1 ← IO.monoNanosNow
-          return .rejected vs { s with elapsedMicros := (t1 - t0) / 1000 }
-        | .ok s =>
-          let certExpr := mkConst certDecl (ci.levelParams.map mkLevelParam)
-          let head := ty.getAppFn.constName?.getD .anonymous
-          match (← checkCategoryCoverage certDecl head certExpr requiredCategories) with
-          | some v =>
+    MetaM AuditVerdict :=
+  withKernelFaithfulMeta do
+    let t0 ← IO.monoNanosNow
+    let reject (vs : Array AuditViolation) : MetaM AuditVerdict := do
+      let t1 ← IO.monoNanosNow
+      return .rejected vs { elapsedMicros := (t1 - t0) / 1000 }
+    match certDecl? with
+    | none =>
+      reject #[.specStrengthCertMissing specName
+        "no registered SpecStrengthCert or MultiMutantSpecCert declaration"]
+    | some certDecl =>
+      let env ← getEnv
+      let privEnv := env.setExporting false
+      match privEnv.checked.get.find? certDecl with
+      | none => reject #[.missingDeclaration certDecl]
+      | some ci =>
+        let ty ← Meta.whnf ci.type
+        match (← checkCertBinding privEnv specName certDecl ci ty expectedReq? expectedEns?
+            expectedDefId? expectedEnvAssumed?) with
+        | some v => reject #[v]
+        | none =>
+          -- Audit the certificate declaration BEFORE reducing it via `Meta.whnf` in
+          -- `checkCategoryCoverage`, so `sorry`-faked, `partial`, `unsafe`, or
+          -- `Classical.choice`-tainted certs always fail with their true soundness
+          -- violation rather than being masked by `.specStrengthCoverageGap` (and
+          -- unaudited terms are never evaluated by `whnf`).
+          let envVerdict ← liftM <| auditDeclsInEnvIO privEnv #[certDecl] policy
+          match envVerdict with
+          | .rejected vs s =>
             let t1 ← IO.monoNanosNow
-            return .rejected #[v] { s with elapsedMicros := (t1 - t0) / 1000 }
-          | none =>
-            let t1 ← IO.monoNanosNow
-            return .ok { s with elapsedMicros := (t1 - t0) / 1000 }
+            return .rejected vs { s with elapsedMicros := (t1 - t0) / 1000 }
+          | .ok s =>
+            let certExpr := mkConst certDecl (ci.levelParams.map mkLevelParam)
+            let head := ty.getAppFn.constName?.getD .anonymous
+            match (← checkCategoryCoverage privEnv certDecl ci.levelParams head certExpr requiredCategories) with
+            | some v =>
+              let t1 ← IO.monoNanosNow
+              return .rejected #[v] { s with elapsedMicros := (t1 - t0) / 1000 }
+            | none =>
+              let t1 ← IO.monoNanosNow
+              return .ok { s with elapsedMicros := (t1 - t0) / 1000 }
 
 /-- Pair a 2-ary precondition `pre : A → M → Prop` and 4-ary postcondition
     `post : A → M → R → M → Prop` into `A × M → Prop` and `A × M → R × M → Prop`. -/
-private def pairStatefulContract (pre post : Expr) : MetaM (Option (Expr × Expr)) := do
-  let postTy ← Meta.whnf (← Meta.inferType post)
-  Meta.forallBoundedTelescope postTy (some 4) fun xs _ => do
-    if xs.size != 4 then
-      return none
-    else
-      let aTy ← Meta.inferType xs[0]!
-      let mTy ← Meta.inferType xs[1]!
-      let rTy ← Meta.inferType xs[2]!
-      let inTy ← Meta.mkAppM ``Prod #[aTy, mTy]
-      let outTy ← Meta.mkAppM ``Prod #[rTy, mTy]
-      let req ← Meta.withLocalDeclD `p inTy fun p => do
-        Meta.mkLambdaFVars #[p]
-          (mkApp2 pre (← Meta.mkAppM ``Prod.fst #[p]) (← Meta.mkAppM ``Prod.snd #[p]))
-      let ens ← Meta.withLocalDeclD `p inTy fun p =>
-        Meta.withLocalDeclD `r outTy fun r => do
-          Meta.mkLambdaFVars #[p, r]
-            (mkApp4 post (← Meta.mkAppM ``Prod.fst #[p]) (← Meta.mkAppM ``Prod.snd #[p])
-              (← Meta.mkAppM ``Prod.fst #[r]) (← Meta.mkAppM ``Prod.snd #[r]))
-      return some (req, ens)
+private def pairStatefulContract (pre post : Expr) : MetaM (Option (Expr × Expr)) :=
+  withKernelFaithfulMeta do
+    let postTy ← Meta.whnf (← Meta.inferType post)
+    Meta.forallBoundedTelescope postTy (some 4) fun xs _ => do
+      if xs.size != 4 then
+        return none
+      else
+        let aTy ← Meta.inferType xs[0]!
+        let mTy ← Meta.inferType xs[1]!
+        let rTy ← Meta.inferType xs[2]!
+        let inTy ← Meta.mkAppM ``Prod #[aTy, mTy]
+        let outTy ← Meta.mkAppM ``Prod #[rTy, mTy]
+        let req ← Meta.withLocalDeclD `p inTy fun p => do
+          Meta.mkLambdaFVars #[p]
+            (mkApp2 pre (← Meta.mkAppM ``Prod.fst #[p]) (← Meta.mkAppM ``Prod.snd #[p]))
+        let ens ← Meta.withLocalDeclD `p inTy fun p =>
+          Meta.withLocalDeclD `r outTy fun r => do
+            Meta.mkLambdaFVars #[p, r]
+              (mkApp4 post (← Meta.mkAppM ``Prod.fst #[p]) (← Meta.mkAppM ``Prod.snd #[p])
+                (← Meta.mkAppM ``Prod.fst #[r]) (← Meta.mkAppM ``Prod.snd #[r]))
+        return some (req, ens)
 
 /-- Claim-bound specification-strength gate.
 
     Reads the contract straight out of the audited verification claim (`claimDecl`, which
-    must be a `.thmInfo` when `requireClaimTheorem := true`):
+    must be a `.thmInfo` when `requireClaimTheorem := true`), disabling `smartUnfolding`
+    and kernel-confirming that `claimDecl` actually has the extracted claim type:
     - `VerificationResult c`: binds a direct `SpecStrengthCert` / `MultiMutantSpecCert` /
-      `DeterministicSpecCert` against `(c.pre, c.post)`.
+      `DeterministicSpecCert` / `InputSensitiveSpecCert` against `(c.pre, c.post)`.
     - `StatefulVerificationResult c` / `TotalVerificationResult c`: binds a direct
       certificate against paired `(c.pre, c.post)` over `(List Value × Memory, Value × Memory)`.
     - `ModularVerificationResult c`: binds a direct `ModularSpecStrengthCert` /
-      `ModularMultiMutantSpecCert` / `ModularDeterministicSpecCert` against ALL THREE
-      components `(c.envAssumed, c.pre, c.post)` (witnessing rely non-vacuity as well as
-      pre/post strength).
+      `ModularMultiMutantSpecCert` / `ModularDeterministicSpecCert` /
+      `ModularInputSensitiveSpecCert` against ALL THREE components
+      `(c.envAssumed, c.pre, c.post)` (witnessing rely non-vacuity as well as pre/post strength).
 
-    Because the expected contract comes from the claim's own statement, a certificate
-    for any other specification (a stronger sibling instance, a shadowing instance, or a
-    spec that was never verified) cannot be substituted. -/
+    Because the expected contract comes from the claim's own kernel-confirmed statement,
+    a certificate for any other specification (a stronger sibling instance, a shadowing
+    instance, a `_sunfold` spoof, or an unverified spec) cannot be substituted. -/
 def auditClaimSpecStrengthInEnv
     (claimDecl : Name)
     (certDecl? : Option Name)
     (policy : AuditPolicy := { AuditPolicy.constructive with checkStatementOrigin := false })
     (requiredCategories : List MutantCategory := [])
     (requireClaimTheorem : Bool := true) :
-    MetaM AuditVerdict := do
-  let t0 ← IO.monoNanosNow
-  let reject (vs : Array AuditViolation) : MetaM AuditVerdict := do
-    let t1 ← IO.monoNanosNow
-    return .rejected vs { elapsedMicros := (t1 - t0) / 1000 }
-  let privEnv := (← getEnv).setExporting false
-  match privEnv.checked.get.find? claimDecl with
-  | none => reject #[.missingDeclaration claimDecl]
-  | some ci =>
-    if requireClaimTheorem && !ci.isTheorem then
-      reject #[.notTheoremKind claimDecl (constantInfoKind ci)]
-    else
-      let ty ← Meta.whnf ci.type
-      let args := ty.getAppArgs
-      let head := ty.getAppFn.constName?.getD .anonymous
-      let tyStr := toString (← Meta.ppExpr ty)
-      let notClaim (why : String) : AuditViolation :=
-        .specStrengthCertInvalidType claimDecl claimDecl s!"{why}: {tyStr}"
-      if args.size != 1 then
-        reject #[notClaim "claim is not a supported VerificationResult"]
-      else if head == ``VerificationResult then
-        let c := args[0]!
-        let pre ← Meta.mkAppM ``Claim.pre #[c]
-        let post ← Meta.mkAppM ``Claim.post #[c]
-        auditSpecStrengthCertInEnv claimDecl certDecl? (some pre) (some post) policy none
-          requiredCategories
-      else if head == ``StatefulVerificationResult then
-        let c := args[0]!
-        let pre ← Meta.mkAppM ``StatefulClaim.pre #[c]
-        let post ← Meta.mkAppM ``StatefulClaim.post #[c]
-        match (← pairStatefulContract pre post) with
-        | none => reject #[notClaim "stateful claim postcondition is not 4-ary"]
-        | some (req, ens) =>
-          auditSpecStrengthCertInEnv claimDecl certDecl? (some req) (some ens) policy none
-            requiredCategories
-      else if head == ``TotalVerificationResult then
-        let c := args[0]!
-        let pre ← Meta.mkAppM ``TotalClaim.pre #[c]
-        let post ← Meta.mkAppM ``TotalClaim.post #[c]
-        match (← pairStatefulContract pre post) with
-        | none => reject #[notClaim "total claim postcondition is not 4-ary"]
-        | some (req, ens) =>
-          auditSpecStrengthCertInEnv claimDecl certDecl? (some req) (some ens) policy none
-            requiredCategories
-      else if head == ``ModularVerificationResult then
-        let c := args[0]!
-        let envAssumed ← Meta.mkAppM ``ModularClaim.envAssumed #[c]
-        let pre ← Meta.mkAppM ``ModularClaim.pre #[c]
-        let post ← Meta.mkAppM ``ModularClaim.post #[c]
-        auditSpecStrengthCertInEnv claimDecl certDecl? (some pre) (some post) policy none
-          requiredCategories (expectedEnvAssumed? := some envAssumed)
+    MetaM AuditVerdict :=
+  withKernelFaithfulMeta do
+    let t0 ← IO.monoNanosNow
+    let reject (vs : Array AuditViolation) : MetaM AuditVerdict := do
+      let t1 ← IO.monoNanosNow
+      return .rejected vs { elapsedMicros := (t1 - t0) / 1000 }
+    let privEnv := (← getEnv).setExporting false
+    match privEnv.checked.get.find? claimDecl with
+    | none => reject #[.missingDeclaration claimDecl]
+    | some ci =>
+      if requireClaimTheorem && !ci.isTheorem then
+        reject #[.notTheoremKind claimDecl (constantInfoKind ci)]
       else
-        reject #[notClaim "claim is not a VerificationResult / StatefulVerificationResult / TotalVerificationResult / ModularVerificationResult"]
+        let ty ← Meta.whnf ci.type
+        let args := ty.getAppArgs
+        let head := ty.getAppFn.constName?.getD .anonymous
+        let tyStr := toString (← Meta.ppExpr ty)
+        let notClaim (why : String) : AuditViolation :=
+          .specStrengthCertInvalidType claimDecl claimDecl s!"{why}: {tyStr}"
+        let claimVal := mkConst claimDecl (ci.levelParams.map mkLevelParam)
+        if args.size != 1 then
+          reject #[notClaim "claim is not a supported VerificationResult"]
+        else if !kernelConfirmsHasType privEnv claimDecl ci.levelParams claimVal
+            (mkApp (mkConst head ty.getAppFn.constLevels!) args[0]!) true then
+          reject #[notClaim "kernel rejected extracted VerificationResult claim type"]
+        else if head == ``VerificationResult then
+          let c := args[0]!
+          let pre ← Meta.mkAppM ``Claim.pre #[c]
+          let post ← Meta.mkAppM ``Claim.post #[c]
+          auditSpecStrengthCertInEnv claimDecl certDecl? (some pre) (some post) policy none
+            requiredCategories
+        else if head == ``StatefulVerificationResult then
+          let c := args[0]!
+          let pre ← Meta.mkAppM ``StatefulClaim.pre #[c]
+          let post ← Meta.mkAppM ``StatefulClaim.post #[c]
+          match (← pairStatefulContract pre post) with
+          | none => reject #[notClaim "stateful claim postcondition is not 4-ary"]
+          | some (req, ens) =>
+            auditSpecStrengthCertInEnv claimDecl certDecl? (some req) (some ens) policy none
+              requiredCategories
+        else if head == ``TotalVerificationResult then
+          let c := args[0]!
+          let pre ← Meta.mkAppM ``TotalClaim.pre #[c]
+          let post ← Meta.mkAppM ``TotalClaim.post #[c]
+          match (← pairStatefulContract pre post) with
+          | none => reject #[notClaim "total claim postcondition is not 4-ary"]
+          | some (req, ens) =>
+            auditSpecStrengthCertInEnv claimDecl certDecl? (some req) (some ens) policy none
+              requiredCategories
+        else if head == ``ModularVerificationResult then
+          let c := args[0]!
+          let envAssumed ← Meta.mkAppM ``ModularClaim.envAssumed #[c]
+          let pre ← Meta.mkAppM ``ModularClaim.pre #[c]
+          let post ← Meta.mkAppM ``ModularClaim.post #[c]
+          auditSpecStrengthCertInEnv claimDecl certDecl? (some pre) (some post) policy none
+            requiredCategories (expectedEnvAssumed? := some envAssumed)
+        else
+          reject #[notClaim "claim is not a VerificationResult / StatefulVerificationResult / TotalVerificationResult / ModularVerificationResult"]
 
 /-- Shared implementation of the typeclass-synthesis gates: resolves the unique
     specification instance of `specClass` for `defId`, synthesizes a
     `multiCertClass` (falling back to `singleCertClass` unless `requireMultiMutant`)
-    certificate for exactly that instance, audits every constant of the witness FIRST,
-    and then checks any required mutant-category coverage. -/
+    certificate for exactly that instance, kernel-confirms its type, audits every
+    constant of the witness FIRST, and then kernel-confirms any required mutant-category
+    coverage. -/
 private def auditSpecStrengthBySynthCore
     (specClass multiCertClass singleCertClass : Name)
     (defId : String) (policy : AuditPolicy) (requireMultiMutant : Bool)
     (requiredCategories : List MutantCategory) :
-    MetaM AuditVerdict := do
-  let t0 ← IO.monoNanosNow
-  let reject (vs : Array AuditViolation) : MetaM AuditVerdict := do
-    let t1 ← IO.monoNanosNow
-    return .rejected vs { elapsedMicros := (t1 - t0) / 1000 }
-  let specName := Name.mkSimple defId
-  let defIdExpr := mkStrLit defId
-  match (← resolveUniqueSpecInstance specName specClass defId) with
-  | .error v => reject #[v]
-  | .ok specInst =>
-    let singleCertTy := mkApp2 (mkConst singleCertClass) defIdExpr specInst
-    let multiCertTy := mkApp2 (mkConst multiCertClass) defIdExpr specInst
-    let needMulti := requireMultiMutant || !requiredCategories.isEmpty
-    let cert? : Option (Expr × Name) ← match (← Meta.synthInstance? multiCertTy) with
-      | some inst => pure (some (inst, multiCertClass))
+    MetaM AuditVerdict :=
+  withKernelFaithfulMeta do
+    let t0 ← IO.monoNanosNow
+    let reject (vs : Array AuditViolation) : MetaM AuditVerdict := do
+      let t1 ← IO.monoNanosNow
+      return .rejected vs { elapsedMicros := (t1 - t0) / 1000 }
+    let specName := Name.mkSimple defId
+    let defIdExpr := mkStrLit defId
+    match (← resolveUniqueSpecInstance specName specClass defId) with
+    | .error v => reject #[v]
+    | .ok specInst =>
+      let singleCertTy := mkApp2 (mkConst singleCertClass) defIdExpr specInst
+      let multiCertTy := mkApp2 (mkConst multiCertClass) defIdExpr specInst
+      let needMulti := requireMultiMutant || !requiredCategories.isEmpty
+      let cert? : Option (Expr × Name × Expr) ← match (← Meta.synthInstance? multiCertTy) with
+        | some inst => pure (some (inst, multiCertClass, multiCertTy))
+        | none =>
+          if needMulti then pure none
+          else pure ((← Meta.synthInstance? singleCertTy).map (·, singleCertClass, singleCertTy))
+      match cert? with
       | none =>
-        if needMulti then pure none
-        else pure ((← Meta.synthInstance? singleCertTy).map (·, singleCertClass))
-    match cert? with
-    | none =>
-      let wanted := if needMulti then s!"{multiCertClass}"
-        else s!"{singleCertClass} or {multiCertClass}"
-      reject #[.specStrengthCertMissing specName s!"no {wanted} instance found for \"{defId}\""]
-    | some (certInst, certHead) =>
-      match expressionEdges certInst with
-      | .error msg =>
-        reject #[.openTermExpression specName specName s!"synthesized cert instance: {msg}"]
-      | .ok constSet =>
-        let env ← getEnv
-        let privEnv := env.setExporting false
-        let targets := constSet.toArray.qsort Name.lt
-        let envVerdict ← liftM <| auditDeclsInEnvIO privEnv targets policy
-        match envVerdict with
-        | .rejected vs s =>
-          let t1 ← IO.monoNanosNow
-          return .rejected vs { s with elapsedMicros := (t1 - t0) / 1000 }
-        | .ok s =>
-          match (← checkCategoryCoverage specName certHead certInst requiredCategories) with
-          | some v =>
-            let t1 ← IO.monoNanosNow
-            return .rejected #[v] { s with elapsedMicros := (t1 - t0) / 1000 }
-          | none =>
-            let t1 ← IO.monoNanosNow
-            return .ok { s with elapsedMicros := (t1 - t0) / 1000 }
+        let wanted := if needMulti then s!"{multiCertClass}"
+          else s!"{singleCertClass} or {multiCertClass}"
+        reject #[.specStrengthCertMissing specName s!"no {wanted} instance found for \"{defId}\""]
+      | some (certInst, certHead, certTy) =>
+        let certInst ← instantiateMVars certInst
+        match expressionEdges certInst with
+        | .error msg =>
+          reject #[.openTermExpression specName specName s!"synthesized cert instance: {msg}"]
+        | .ok constSet =>
+          let env ← getEnv
+          let privEnv := env.setExporting false
+          if !kernelConfirmsHasType privEnv specName [] certInst certTy false then
+            reject #[.specStrengthCertInvalidType specName specName
+              "kernel rejected synthesized certificate instance type"]
+          else
+            let targets := constSet.toArray.qsort Name.lt
+            let envVerdict ← liftM <| auditDeclsInEnvIO privEnv targets policy
+            match envVerdict with
+            | .rejected vs s =>
+              let t1 ← IO.monoNanosNow
+              return .rejected vs { s with elapsedMicros := (t1 - t0) / 1000 }
+            | .ok s =>
+              match (← checkCategoryCoverage privEnv specName [] certHead certInst requiredCategories) with
+              | some v =>
+                let t1 ← IO.monoNanosNow
+                return .rejected #[v] { s with elapsedMicros := (t1 - t0) / 1000 }
+              | none =>
+                let t1 ← IO.monoNanosNow
+                return .ok { s with elapsedMicros := (t1 - t0) / 1000 }
 
 /-- `MetaM` gate using typeclass synthesis to locate an `ItemSpecStrengthCert` (or
     `ItemMultiMutantCert`) for the unique `ItemSpec defId`, rejecting fail-closed if the
