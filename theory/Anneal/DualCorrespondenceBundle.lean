@@ -322,6 +322,40 @@ theorem symm_comp_ofEquiv (f : α → β) (g : β → α)
       CodecLaws.id β :=
   ofEquiv_comp_symm g f right_inv left_inv
 
+/-- Identity law for `CodecLaws.prod`: `(id α).prod (id β) = id (α × β)`. -/
+theorem prod_id (α : Type u) (β : Type v) :
+    (CodecLaws.id α).prod (CodecLaws.id β) = CodecLaws.id (α × β) :=
+  ext (fun _ => rfl) (fun _ => rfl)
+    (fun _ => ⟨fun _ => True.intro, fun _ => ⟨True.intro, True.intro⟩⟩)
+
+/-- Functoriality of `CodecLaws.prod` on `encode`. -/
+theorem prod_comp_encode {γ₁ : Type w₁} {γ₂ : Type w₂}
+    (c₁ : CodecLaws α₁ β₁) (d₁ : CodecLaws β₁ γ₁)
+    (c₂ : CodecLaws α₂ β₂) (d₂ : CodecLaws β₂ γ₂) (p : α₁ × α₂) :
+    ((c₁.comp d₁).prod (c₂.comp d₂)).encode p =
+      ((c₁.prod c₂).comp (d₁.prod d₂)).encode p := rfl
+
+/-- Functoriality of `CodecLaws.prod` on `decode`. -/
+theorem prod_comp_decode {γ₁ : Type w₁} {γ₂ : Type w₂}
+    (c₁ : CodecLaws α₁ β₁) (d₁ : CodecLaws β₁ γ₁)
+    (c₂ : CodecLaws α₂ β₂) (d₂ : CodecLaws β₂ γ₂) (q : γ₁ × γ₂) :
+    ((c₁.comp d₁).prod (c₂.comp d₂)).decode q =
+      ((c₁.prod c₂).comp (d₁.prod d₂)).decode q := by
+  show ((d₁.decode q.1).bind c₁.decode).bind
+      (fun a₁ => ((d₂.decode q.2).bind c₂.decode).bind fun a₂ => some (a₁, a₂))
+    = ((d₁.decode q.1).bind fun b₁ =>
+        (d₂.decode q.2).bind fun b₂ => some (b₁, b₂)).bind
+      (fun b => (c₁.decode b.1).bind fun a₁ =>
+        (c₂.decode b.2).bind fun a₂ => some (a₁, a₂))
+  cases d₁.decode q.1 with
+  | none => rfl
+  | some b₁ =>
+    cases d₂.decode q.2 with
+    | none =>
+      dsimp only [Option.bind]
+      cases c₁.decode b₁ <;> rfl
+    | some b₂ => rfl
+
 end CodecLaws
 
 /--
@@ -1007,6 +1041,16 @@ def liftMode {Mode' : Type uM'} (f : Mode' → Mode) :
   ExecR := fun m => R.ExecR (f m)
   RetRel := R.RetRel
   UnwRel := R.UnwRel
+
+/-- Mode reindexing preserves `ProductiveAnneal`. -/
+theorem liftMode_productiveAnneal {Mode' : Type uM'} (f : Mode' → Mode)
+    (h : R.ProductiveAnneal) : (R.liftMode f).ProductiveAnneal :=
+  fun m p q hg => h (f m) p q hg
+
+/-- Mode reindexing preserves `ProductiveRef`. -/
+theorem liftMode_productiveRef {Mode' : Type uM'} (f : Mode' → Mode)
+    (h : R.ProductiveRef) : (R.liftMode f).ProductiveRef :=
+  fun m p q hg => h (f m) p q hg
 
 /--
 Vertical composition of step relations through a middle model: Anneal model of
@@ -2715,6 +2759,95 @@ theorem crossAuthorityUnwindEquiv
     obtain ⟨uMR, hRMR, hrelMR⟩ := eqMR.unwind_anneal_to_ref cMR uA hAMR
     exact ⟨uA, cMR, uMR, eA, hRMR, hrelMR, hrelLM⟩
 
+/--
+**Cross-authority unwind equivalence (`↔`, Case 3).** When each authority's
+unwind relation is left-injective (`uA` uniquely determined by the authority's
+unwind payload), unwind reachability at every `uA : UnwA` agrees by `↔` across
+`MiniRust`, `ExecAnneal`, and `LeanMiri` without requiring determinism.
+-/
+theorem crossAuthorityUnwindIff
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    {mMR : ModeMR} {mLM : ModeLM} (hmode : B.toAnnealMR mMR = B.toAnnealLM mLM)
+    {p : Prog} {q : Query} (hgMR : B.mrRel.SupportGate mMR p q)
+    (hgLM : B.lmRel.SupportGate mLM p q)
+    (hrevMR : B.mrRel.ReverseTotal) (hrevLM : B.lmRel.ReverseTotal)
+    (hinjMR : ∀ u₁ u₂ uR,
+      B.mrRel.UnwRel u₁ uR → B.mrRel.UnwRel u₂ uR → u₁ = u₂)
+    (hinjLM : ∀ u₁ u₂ uR,
+      B.lmRel.UnwRel u₁ uR → B.lmRel.UnwRel u₂ uR → u₁ = u₂) (uA : UnwA) :
+    ((∃ c u, B.mrRel.ExecR mMR p q c (.unwind u) ∧ B.mrRel.UnwRel uA u) ↔
+      B.ExecAnneal (B.toAnnealMR mMR) p q (.unwind uA)) ∧
+    ((∃ c u, B.lmRel.ExecR mLM p q c (.unwind u) ∧ B.lmRel.UnwRel uA u) ↔
+      B.ExecAnneal (B.toAnnealLM mLM) p q (.unwind uA)) ∧
+    ((∃ c u, B.mrRel.ExecR mMR p q c (.unwind u) ∧ B.mrRel.UnwRel uA u) ↔
+      (∃ c u, B.lmRel.ExecR mLM p q c (.unwind u) ∧ B.lmRel.UnwRel uA u)) := by
+  have eqMR := B.mrSim.exactBehaviorEq_of_reverseTotal hrevMR hgMR
+  have eqLM := B.lmSim.exactBehaviorEq_of_reverseTotal hrevLM hgLM
+  have iffMR :
+      (∃ c u, B.mrRel.ExecR mMR p q c (.unwind u) ∧ B.mrRel.UnwRel uA u) ↔
+        B.ExecAnneal (B.toAnnealMR mMR) p q (.unwind uA) := by
+    constructor
+    · intro ⟨c, u, hR, hrel⟩
+      obtain ⟨uA', hA', hrel'⟩ := eqMR.unwind_ref_to_anneal c u hR
+      rw [hinjMR uA uA' u hrel hrel']
+      exact (B.anneal_exec_coherent.1 mMR p q (.unwind uA')).mp ⟨c, hA'⟩
+    · intro hA
+      obtain ⟨c, hA'⟩ := (B.anneal_exec_coherent.1 mMR p q (.unwind uA)).mpr hA
+      obtain ⟨u, hR, hrel⟩ := eqMR.unwind_anneal_to_ref c uA hA'
+      exact ⟨c, u, hR, hrel⟩
+  have iffLM :
+      (∃ c u, B.lmRel.ExecR mLM p q c (.unwind u) ∧ B.lmRel.UnwRel uA u) ↔
+        B.ExecAnneal (B.toAnnealLM mLM) p q (.unwind uA) := by
+    constructor
+    · intro ⟨c, u, hR, hrel⟩
+      obtain ⟨uA', hA', hrel'⟩ := eqLM.unwind_ref_to_anneal c u hR
+      rw [hinjLM uA uA' u hrel hrel']
+      exact (B.anneal_exec_coherent.2 mLM p q (.unwind uA')).mp ⟨c, hA'⟩
+    · intro hA
+      obtain ⟨c, hA'⟩ := (B.anneal_exec_coherent.2 mLM p q (.unwind uA)).mpr hA
+      obtain ⟨u, hR, hrel⟩ := eqLM.unwind_anneal_to_ref c uA hA'
+      exact ⟨c, u, hR, hrel⟩
+  refine ⟨iffMR, iffLM, ?_⟩
+  rw [iffMR, iffLM, hmode]
+
+/--
+**Unified 4-way cross-authority exact equivalence (Cases 1–4,
+nondeterministic).** Packages Cases 1 (`fault`), 2 (`normal`), 3 (`unwind`),
+and 4 (`diverge`) at matched Anneal modes inside both gates under
+`ReverseTotal` in a single theorem.
+-/
+theorem crossAuthorityExactEquiv
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    {mMR : ModeMR} {mLM : ModeLM} (hmode : B.toAnnealMR mMR = B.toAnnealLM mLM)
+    {p : Prog} {q : Query} (hgMR : B.mrRel.SupportGate mMR p q)
+    (hgLM : B.lmRel.SupportGate mLM p q)
+    (hrevMR : B.mrRel.ReverseTotal) (hrevLM : B.lmRel.ReverseTotal) :
+    (∀ k,
+      (∃ c, B.mrRel.ExecR mMR p q c (.fault k)) ↔
+        (∃ c, B.lmRel.ExecR mLM p q c (.fault k))) ∧
+    (∀ a,
+      (∃ c r, B.mrRel.ExecR mMR p q c (.normal r) ∧ B.mrRel.RetRel a r) ↔
+        (∃ c r, B.lmRel.ExecR mLM p q c (.normal r) ∧ B.lmRel.RetRel a r)) ∧
+    ((∀ cMR uMR, B.mrRel.ExecR mMR p q cMR (.unwind uMR) →
+        ∃ uA cLM uLM,
+          B.ExecAnneal (B.toAnnealMR mMR) p q (.unwind uA) ∧
+          B.lmRel.ExecR mLM p q cLM (.unwind uLM) ∧
+          B.mrRel.UnwRel uA uMR ∧ B.lmRel.UnwRel uA uLM) ∧
+      (∀ cLM uLM, B.lmRel.ExecR mLM p q cLM (.unwind uLM) →
+        ∃ uA cMR uMR,
+          B.ExecAnneal (B.toAnnealLM mLM) p q (.unwind uA) ∧
+          B.mrRel.ExecR mMR p q cMR (.unwind uMR) ∧
+          B.mrRel.UnwRel uA uMR ∧ B.lmRel.UnwRel uA uLM)) ∧
+    ((∃ c, B.mrRel.ExecR mMR p q c .diverge) ↔
+      (∃ c, B.lmRel.ExecR mLM p q c .diverge)) := by
+  have hNorm := B.crossAuthorityNormalEquiv hmode hgMR hgLM hrevMR hrevLM
+  have hUnw := B.crossAuthorityUnwindEquiv hmode hgMR hgLM hrevMR hrevLM
+  have hDiv := B.crossAuthorityDivergeEquiv hmode hgMR hgLM hrevMR hrevLM
+  exact ⟨fun k => B.crossAuthorityFaultEquiv hmode hgMR hgLM k,
+         fun a => (hNorm.1 a).2.2, hUnw, hDiv.2.2⟩
+
 /-- Both authorities' `CorrespondenceClaim`s follow directly from a bundle. -/
 theorem correspondenceClaims
     (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
@@ -3188,6 +3321,154 @@ def transPreserveFaultMode {ModeX : Type uMX} {RetX : Type uRX}
     B₀.anneal_exec_coherent
 
 /--
+Per-authority constructive mode-sensitivity transport strategy for vertical
+bundle composition: either the witness flips on a fault (`faultFlip`, needing
+neither `ReverseTotal` nor functional unwind relations), or the front
+simulation has `ReverseTotal` and a functional unwind relation (`reverseTotal`).
+-/
+inductive ModeSensitivityTransport
+    {Mode : Type uM} {Choice : Type uC} {RetX : Type uRX} {RetA : Type uRA}
+    {RetR : Type uRR} {UnwX : Type uUX} {UnwA : Type uUA} {UnwR : Type uUR}
+    (R₁ : ModeParamStepRel Mode Prog Query Choice RetX RetA UnwX UnwA)
+    (R₂ : ModeParamStepRel Mode Prog Query Choice RetA RetR UnwA UnwR)
+    (ms? : Option (ModeSensitivityWitness R₂)) : Type _ where
+  /-- Transport a fault-flipping witness without `ReverseTotal`. -/
+  | faultFlip (h : ∀ ms, ms? = some ms → ms.IsFaultFlip)
+  /-- Transport any witness via front `ReverseTotal` and functional unwind. -/
+  | reverseTotal (hrev : R₁.ReverseTotal)
+      (hUnw : ∀ x y₁ y₂, R₁.UnwRel x y₁ → R₁.UnwRel x y₂ → y₁ = y₂)
+
+/--
+Mixed mode-sensitivity-preserving vertical bundle composition: each authority
+independently transports its `modeSensitivity?` witness via EITHER `faultFlip`
+(requiring no `ReverseTotal`) OR `reverseTotal`, unifying `compPreserveMode`
+and `compPreserveFaultMode` on asymmetric bundles.
+-/
+def compPreserveModeMixed {ModeX : Type uMX} {RetX : Type uRX}
+    {UnwX : Type uUX}
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (frontCodec : CodecLaws RetX RetA)
+    {mrFront : ModeParamStepRel ModeMR Prog Query ChoiceMR RetX RetA UnwX UnwA}
+    {lmFront : ModeParamStepRel ModeLM Prog Query ChoiceLM RetX RetA UnwX UnwA}
+    (mrFrontSim : ModeStepSim mrFront) (lmFrontSim : ModeStepSim lmFront)
+    (hmidMR : ∀ m p q c out,
+      mrFront.ExecR m p q c out ↔ B.mrRel.ExecA m p q c out)
+    (hmidLM : ∀ m p q c out,
+      lmFront.ExecR m p q c out ↔ B.lmRel.ExecA m p q c out)
+    (hgateMR : ∀ m p q, B.mrRel.SupportGate m p q → mrFront.SupportGate m p q)
+    (hgateLM : ∀ m p q, B.lmRel.SupportGate m p q → lmFront.SupportGate m p q)
+    (hcodecMR : ∀ x a, mrFront.RetRel x a → a = frontCodec.encode x)
+    (hcodecLM : ∀ x a, lmFront.RetRel x a → a = frontCodec.encode x)
+    (trMR :
+      ModeSensitivityTransport mrFront B.mrRel B.mrFlip.modeSensitivity?)
+    (trLM :
+      ModeSensitivityTransport lmFront B.lmRel B.lmFlip.modeSensitivity?)
+    (toFrontMR : ModeMR → ModeX) (toFrontLM : ModeLM → ModeX)
+    (ExecFront : ModeX → Prog → Query → ExecOutcome4 RetX UnwX → Prop)
+    (hcoh :
+      (∀ m p q out,
+        (∃ c, mrFront.ExecA m p q c out) ↔ ExecFront (toFrontMR m) p q out) ∧
+      (∀ m p q out,
+        (∃ c, lmFront.ExecA m p q c out) ↔ ExecFront (toFrontLM m) p q out)) :
+    DualCorrespondenceBundle ModeX Prog Query RetX UnwX Rep ModeMR ChoiceMR
+      RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM :=
+  let mrMs? : Option (ModeSensitivityWitness (mrFront.comp B.mrRel)) :=
+    match hMR : B.mrFlip.modeSensitivity? with
+    | none => none
+    | some ms =>
+      match trMR with
+      | .faultFlip hF =>
+        some (ms.compFrontOfFaultFlip (hF ms hMR) mrFrontSim hmidMR hgateMR)
+      | .reverseTotal hrev hUnw =>
+        some (ms.compFrontOfReverseTotal mrFrontSim hrev hmidMR hgateMR
+          (fun x y₁ y₂ h₁ h₂ =>
+            (hcodecMR x y₁ h₁).trans (hcodecMR x y₂ h₂).symm)
+          hUnw)
+  let lmMs? : Option (ModeSensitivityWitness (lmFront.comp B.lmRel)) :=
+    match hLM : B.lmFlip.modeSensitivity? with
+    | none => none
+    | some ms =>
+      match trLM with
+      | .faultFlip hF =>
+        some (ms.compFrontOfFaultFlip (hF ms hLM) lmFrontSim hmidLM hgateLM)
+      | .reverseTotal hrev hUnw =>
+        some (ms.compFrontOfReverseTotal lmFrontSim hrev hmidLM hgateLM
+          (fun x y₁ y₂ h₁ h₂ =>
+            (hcodecLM x y₁ h₁).trans (hcodecLM x y₂ h₂).symm)
+          hUnw)
+  B.comp frontCodec mrFrontSim lmFrontSim hmidMR hmidLM hgateMR hgateLM
+    hcodecMR hcodecLM toFrontMR toFrontLM ExecFront hcoh mrMs? lmMs?
+
+/-- Reference productivity transfers to Anneal productivity on both
+authorities of a bundle. -/
+theorem productiveAnneal_of_productiveRef
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (hMR : B.mrRel.ProductiveRef) (hLM : B.lmRel.ProductiveRef) :
+    B.mrRel.ProductiveAnneal ∧ B.lmRel.ProductiveAnneal :=
+  ⟨B.mrSim.productiveAnneal_of_productiveRef hMR,
+   B.lmSim.productiveAnneal_of_productiveRef hLM⟩
+
+/-- Reverse totality transfers Anneal productivity to reference productivity on
+both authorities of a bundle. -/
+theorem productiveRef_of_reverseTotal
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (hrevMR : B.mrRel.ReverseTotal) (hrevLM : B.lmRel.ReverseTotal)
+    (hMR : B.mrRel.ProductiveAnneal) (hLM : B.lmRel.ProductiveAnneal) :
+    B.mrRel.ProductiveRef ∧ B.lmRel.ProductiveRef :=
+  ⟨B.mrSim.productiveRef_of_reverseTotal hrevMR hMR,
+   B.lmSim.productiveRef_of_reverseTotal hrevLM hLM⟩
+
+/-- `DualCorrespondenceBundle.liftMode` preserves Anneal productivity. -/
+theorem liftMode_productiveAnneal {ModeMR' : Type uMM'} {ModeLM' : Type uML'}
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (fMR : ModeMR' → ModeMR) (gMR : ModeMR → ModeMR')
+    (hMR : ∀ m, fMR (gMR m) = m) (fLM : ModeLM' → ModeLM)
+    (gLM : ModeLM → ModeLM') (hLM : ∀ m, fLM (gLM m) = m)
+    (hpMR : B.mrRel.ProductiveAnneal) (hpLM : B.lmRel.ProductiveAnneal) :
+    (B.liftMode fMR gMR hMR fLM gLM hLM).mrRel.ProductiveAnneal ∧
+      (B.liftMode fMR gMR hMR fLM gLM hLM).lmRel.ProductiveAnneal :=
+  ⟨B.mrRel.liftMode_productiveAnneal fMR hpMR,
+   B.lmRel.liftMode_productiveAnneal fLM hpLM⟩
+
+/-- Vertical bundle composition inherits Anneal productivity from the front
+step relations. -/
+theorem comp_productiveAnneal {ModeX : Type uMX} {RetX : Type uRX}
+    {UnwX : Type uUX}
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (frontCodec : CodecLaws RetX RetA)
+    {mrFront : ModeParamStepRel ModeMR Prog Query ChoiceMR RetX RetA UnwX UnwA}
+    {lmFront : ModeParamStepRel ModeLM Prog Query ChoiceLM RetX RetA UnwX UnwA}
+    (mrFrontSim : ModeStepSim mrFront) (lmFrontSim : ModeStepSim lmFront)
+    (hmidMR : ∀ m p q c out,
+      mrFront.ExecR m p q c out ↔ B.mrRel.ExecA m p q c out)
+    (hmidLM : ∀ m p q c out,
+      lmFront.ExecR m p q c out ↔ B.lmRel.ExecA m p q c out)
+    (hgateMR : ∀ m p q, B.mrRel.SupportGate m p q → mrFront.SupportGate m p q)
+    (hgateLM : ∀ m p q, B.lmRel.SupportGate m p q → lmFront.SupportGate m p q)
+    (hcodecMR : ∀ x a, mrFront.RetRel x a → a = frontCodec.encode x)
+    (hcodecLM : ∀ x a, lmFront.RetRel x a → a = frontCodec.encode x)
+    (toFrontMR : ModeMR → ModeX) (toFrontLM : ModeLM → ModeX)
+    (ExecFront : ModeX → Prog → Query → ExecOutcome4 RetX UnwX → Prop)
+    (hcoh :
+      (∀ m p q out,
+        (∃ c, mrFront.ExecA m p q c out) ↔ ExecFront (toFrontMR m) p q out) ∧
+      (∀ m p q out,
+        (∃ c, lmFront.ExecA m p q c out) ↔ ExecFront (toFrontLM m) p q out))
+    (hpMR : mrFront.ProductiveAnneal) (hpLM : lmFront.ProductiveAnneal) :
+    (B.comp frontCodec mrFrontSim lmFrontSim hmidMR hmidLM hgateMR hgateLM
+        hcodecMR hcodecLM toFrontMR toFrontLM ExecFront
+        hcoh).mrRel.ProductiveAnneal ∧
+      (B.comp frontCodec mrFrontSim lmFrontSim hmidMR hmidLM hgateMR hgateLM
+        hcodecMR hcodecLM toFrontMR toFrontLM ExecFront
+        hcoh).lmRel.ProductiveAnneal :=
+  ⟨fun m p q hg => hpMR m p q hg.1, fun m p q hg => hpLM m p q hg.1⟩
+
+/--
 Ergonomic constructor from evaluation-equivalence theorems. The Anneal model
 is a deterministic, choice-independent evaluator `evalA`; each authority is a
 relational model (`ExecMR`, `ExecLM`). The simulations follow from, per
@@ -3280,6 +3561,64 @@ def fromEquiv (codec : CodecLaws RetA Rep) (repMR : RetMR → Rep)
     lmFlip :=
       FlipDirectionWitness.ofFaultAndMode lmSim lmPositive lmFault hmLM
         lmMode? }
+
+/-- Every bundle built with `fromEquiv` satisfies `ProductiveAnneal` on both
+authorities (using the witness choice from `mrPositive` / `lmPositive`). -/
+theorem fromEquiv_productiveAnneal (codec : CodecLaws RetA Rep)
+    (repMR : RetMR → Rep) (repLM : RetLM → Rep)
+    (evalA : ModeA → Prog → Query → ExecOutcome4 RetA UnwA)
+    (toAnnealMR : ModeMR → ModeA) (toAnnealLM : ModeLM → ModeA)
+    (gateMR : ModeMR → Prog → Query → Prop)
+    (gateLM : ModeLM → Prog → Query → Prop)
+    (ExecMR :
+      ModeMR → Prog → Query → ChoiceMR → ExecOutcome4 RetMR UnwMR → Prop)
+    (ExecLM :
+      ModeLM → Prog → Query → ChoiceLM → ExecOutcome4 RetLM UnwLM → Prop)
+    (RetRelMR : RetA → RetMR → Prop) (UnwRelMR : UnwA → UnwMR → Prop)
+    (RetRelLM : RetA → RetLM → Prop) (UnwRelLM : UnwA → UnwLM → Prop)
+    (hRetMR : ∀ a r, RetRelMR a r → repMR r = codec.encode a)
+    (hRetLM : ∀ a r, RetRelLM a r → repLM r = codec.encode a)
+    (fwdMR : ∀ m p q c out, gateMR m p q → ExecMR m p q c out →
+      ChoiceCoupledOutcomeRel RetRelMR UnwRelMR (evalA (toAnnealMR m) p q) out)
+    (revMR : ∀ m p q c k, gateMR m p q →
+      evalA (toAnnealMR m) p q = .fault k → ExecMR m p q c (.fault k))
+    (fwdLM : ∀ m p q c out, gateLM m p q → ExecLM m p q c out →
+      ChoiceCoupledOutcomeRel RetRelLM UnwRelLM (evalA (toAnnealLM m) p q) out)
+    (revLM : ∀ m p q c k, gateLM m p q →
+      evalA (toAnnealLM m) p q = .fault k → ExecLM m p q c (.fault k))
+    (mrPositive : PositiveWitness
+      (ModeParamStepRel.ofAnnealEval toAnnealMR gateMR evalA ExecMR RetRelMR
+        UnwRelMR))
+    (lmPositive : PositiveWitness
+      (ModeParamStepRel.ofAnnealEval toAnnealLM gateLM evalA ExecLM RetRelLM
+        UnwRelLM))
+    (mrFault : FaultEquivWitness
+      (ModeParamStepRel.ofAnnealEval toAnnealMR gateMR evalA ExecMR RetRelMR
+        UnwRelMR))
+    (lmFault : FaultEquivWitness
+      (ModeParamStepRel.ofAnnealEval toAnnealLM gateLM evalA ExecLM RetRelLM
+        UnwRelLM))
+    (hmMR : mrFault.m = mrPositive.m) (hmLM : lmFault.m = lmPositive.m)
+    (mrMode? : Option (ModeSensitivityWitness
+      (ModeParamStepRel.ofAnnealEval toAnnealMR gateMR evalA ExecMR RetRelMR
+        UnwRelMR)) := none)
+    (lmMode? : Option (ModeSensitivityWitness
+      (ModeParamStepRel.ofAnnealEval toAnnealLM gateLM evalA ExecLM RetRelLM
+        UnwRelLM)) := none)
+    (mrRevTotal? : Option (PLift
+      (ModeParamStepRel.ofAnnealEval toAnnealMR gateMR evalA ExecMR RetRelMR
+        UnwRelMR).ReverseTotal) := none)
+    (lmRevTotal? : Option (PLift
+      (ModeParamStepRel.ofAnnealEval toAnnealLM gateLM evalA ExecLM RetRelLM
+        UnwRelLM).ReverseTotal) := none) :
+    let B :=
+      fromEquiv codec repMR repLM evalA toAnnealMR toAnnealLM gateMR gateLM
+        ExecMR ExecLM RetRelMR UnwRelMR RetRelLM UnwRelLM hRetMR hRetLM fwdMR
+        revMR fwdLM revLM mrPositive lmPositive mrFault lmFault hmMR hmLM
+        mrMode? lmMode? mrRevTotal? lmRevTotal?
+    B.mrRel.ProductiveAnneal ∧ B.lmRel.ProductiveAnneal :=
+  ⟨fun m p q _ => ⟨mrPositive.c, evalA (toAnnealMR m) p q, rfl⟩,
+   fun m p q _ => ⟨lmPositive.c, evalA (toAnnealLM m) p q, rfl⟩⟩
 
 /--
 Choice-gated deterministic-Anneal constructor (`fromEquivGated`), completing
@@ -3384,6 +3723,76 @@ def fromEquivGated (codec : CodecLaws RetA Rep) (repMR : RetMR → Rep)
     lmFlip :=
       FlipDirectionWitness.ofFaultAndMode lmSim lmPositive lmFault hmLM
         lmMode? }
+
+/-- Every bundle built with `fromEquivGated` satisfies `ProductiveAnneal` on
+both authorities, directly discharging Section 4.5 choice productivity from
+`hChoiceMR` and `hChoiceLM`. -/
+theorem fromEquivGated_productiveAnneal (codec : CodecLaws RetA Rep)
+    (repMR : RetMR → Rep) (repLM : RetLM → Rep)
+    (evalA : ModeA → Prog → Query → ExecOutcome4 RetA UnwA)
+    (toAnnealMR : ModeMR → ModeA) (toAnnealLM : ModeLM → ModeA)
+    (gateMR : ModeMR → Prog → Query → Prop)
+    (gateLM : ModeLM → Prog → Query → Prop)
+    (validChoiceMR : ModeMR → Prog → Query → ChoiceMR → Prop)
+    (validChoiceLM : ModeLM → Prog → Query → ChoiceLM → Prop)
+    (hChoiceMR : ∀ m p q, ∃ c, validChoiceMR m p q c)
+    (hChoiceLM : ∀ m p q, ∃ c, validChoiceLM m p q c)
+    (ExecMR :
+      ModeMR → Prog → Query → ChoiceMR → ExecOutcome4 RetMR UnwMR → Prop)
+    (ExecLM :
+      ModeLM → Prog → Query → ChoiceLM → ExecOutcome4 RetLM UnwLM → Prop)
+    (RetRelMR : RetA → RetMR → Prop) (UnwRelMR : UnwA → UnwMR → Prop)
+    (RetRelLM : RetA → RetLM → Prop) (UnwRelLM : UnwA → UnwLM → Prop)
+    (hRetMR : ∀ a r, RetRelMR a r → repMR r = codec.encode a)
+    (hRetLM : ∀ a r, RetRelLM a r → repLM r = codec.encode a)
+    (fwdMR : ∀ m p q c out, gateMR m p q → ExecMR m p q c out →
+      validChoiceMR m p q c ∧
+      ChoiceCoupledOutcomeRel RetRelMR UnwRelMR (evalA (toAnnealMR m) p q) out)
+    (revMR : ∀ m p q c k, gateMR m p q → validChoiceMR m p q c →
+      evalA (toAnnealMR m) p q = .fault k → ExecMR m p q c (.fault k))
+    (fwdLM : ∀ m p q c out, gateLM m p q → ExecLM m p q c out →
+      validChoiceLM m p q c ∧
+      ChoiceCoupledOutcomeRel RetRelLM UnwRelLM (evalA (toAnnealLM m) p q) out)
+    (revLM : ∀ m p q c k, gateLM m p q → validChoiceLM m p q c →
+      evalA (toAnnealLM m) p q = .fault k → ExecLM m p q c (.fault k))
+    (mrPositive : PositiveWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealMR gateMR validChoiceMR evalA
+        ExecMR RetRelMR UnwRelMR))
+    (lmPositive : PositiveWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealLM gateLM validChoiceLM evalA
+        ExecLM RetRelLM UnwRelLM))
+    (mrFault : FaultEquivWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealMR gateMR validChoiceMR evalA
+        ExecMR RetRelMR UnwRelMR))
+    (lmFault : FaultEquivWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealLM gateLM validChoiceLM evalA
+        ExecLM RetRelLM UnwRelLM))
+    (hmMR : mrFault.m = mrPositive.m) (hmLM : lmFault.m = lmPositive.m)
+    (mrMode? : Option (ModeSensitivityWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealMR gateMR validChoiceMR evalA
+        ExecMR RetRelMR UnwRelMR)) := none)
+    (lmMode? : Option (ModeSensitivityWitness
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealLM gateLM validChoiceLM evalA
+        ExecLM RetRelLM UnwRelLM)) := none)
+    (mrRevTotal? : Option (PLift
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealMR gateMR validChoiceMR evalA
+        ExecMR RetRelMR UnwRelMR).ReverseTotal) := none)
+    (lmRevTotal? : Option (PLift
+      (ModeParamStepRel.ofAnnealEvalGated toAnnealLM gateLM validChoiceLM evalA
+        ExecLM RetRelLM UnwRelLM).ReverseTotal) := none) :
+    let B :=
+      fromEquivGated codec repMR repLM evalA toAnnealMR toAnnealLM gateMR
+        gateLM validChoiceMR validChoiceLM hChoiceMR hChoiceLM ExecMR ExecLM
+        RetRelMR UnwRelMR RetRelLM UnwRelLM hRetMR hRetLM fwdMR revMR fwdLM
+        revLM mrPositive lmPositive mrFault lmFault hmMR hmLM mrMode? lmMode?
+        mrRevTotal? lmRevTotal?
+    B.mrRel.ProductiveAnneal ∧ B.lmRel.ProductiveAnneal :=
+  ⟨fun m p q _ =>
+      let ⟨c, hc⟩ := hChoiceMR m p q
+      ⟨c, evalA (toAnnealMR m) p q, hc, rfl⟩,
+   fun m p q _ =>
+      let ⟨c, hc⟩ := hChoiceLM m p q
+      ⟨c, evalA (toAnnealLM m) p q, hc, rfl⟩⟩
 
 /--
 `fromEquiv` specialized to deterministic authority evaluators `evalMR` /
