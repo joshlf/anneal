@@ -202,6 +202,44 @@ theorem ofEquiv_decode (f : α → β) (g : β → α) (left_inv : ∀ a, g (f a
     (right_inv : ∀ b, f (g b) = b) (b : β) :
     (ofEquiv f g left_inv right_inv).decode b = some (g b) := rfl
 
+/-- Symmetric inverse of an `ofEquiv` codec. -/
+def ofEquiv_symm (f : α → β) (g : β → α) (left_inv : ∀ a, g (f a) = a)
+    (right_inv : ∀ b, f (g b) = b) : CodecLaws β α :=
+  ofEquiv g f right_inv left_inv
+
+/-- Left identity of `CodecLaws.comp` on `encode`. -/
+theorem comp_id_left_encode (c : CodecLaws α β) (a : α) :
+    ((CodecLaws.id α).comp c).encode a = c.encode a := rfl
+
+/-- Left identity of `CodecLaws.comp` on `decode`. -/
+theorem comp_id_left_decode (c : CodecLaws α β) (b : β) :
+    ((CodecLaws.id α).comp c).decode b = c.decode b := by
+  show (c.decode b).bind some = c.decode b
+  cases c.decode b <;> rfl
+
+/-- Right identity of `CodecLaws.comp` on `encode`. -/
+theorem comp_id_right_encode (c : CodecLaws α β) (a : α) :
+    (c.comp (CodecLaws.id β)).encode a = c.encode a := rfl
+
+/-- Right identity of `CodecLaws.comp` on `decode`. -/
+theorem comp_id_right_decode (c : CodecLaws α β) (b : β) :
+    (c.comp (CodecLaws.id β)).decode b = c.decode b := rfl
+
+/-- Associativity of `CodecLaws.comp` on `encode`. -/
+theorem comp_assoc_encode {δ : Type w₁} (c₁ : CodecLaws α β)
+    (c₂ : CodecLaws β γ) (c₃ : CodecLaws γ δ) (a : α) :
+    ((c₁.comp c₂).comp c₃).encode a = (c₁.comp (c₂.comp c₃)).encode a := rfl
+
+/-- Associativity of `CodecLaws.comp` on `decode`. -/
+theorem comp_assoc_decode {δ : Type w₁} (c₁ : CodecLaws α β)
+    (c₂ : CodecLaws β γ) (c₃ : CodecLaws γ δ) (d : δ) :
+    ((c₁.comp c₂).comp c₃).decode d = (c₁.comp (c₂.comp c₃)).decode d := by
+  show (c₃.decode d).bind (fun g => (c₂.decode g).bind c₁.decode) =
+    ((c₃.decode d).bind c₂.decode).bind c₁.decode
+  cases c₃.decode d with
+  | none => rfl
+  | some g => rfl
+
 end CodecLaws
 
 /--
@@ -2204,6 +2242,86 @@ theorem threeWayNormalAgreement_validRep
   rw [hMRrep, hLMrep]
   exact ⟨B.codec.encode_valid a, B.codec.encode_valid a⟩
 
+/--
+**Three-way unwind agreement (Case 3).** At matched Anneal modes, if Anneal is
+deterministic on `(toAnnealMR mMR, p, q)`, then any `MiniRust` unwind and any
+`LeanMiri` unwind agree through one Anneal unwind payload `uA`.
+-/
+theorem threeWayUnwindAgreement
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    {mMR : ModeMR} {mLM : ModeLM} (hmode : B.toAnnealMR mMR = B.toAnnealLM mLM)
+    {p : Prog} {q : Query} (hgMR : B.mrRel.SupportGate mMR p q)
+    (hgLM : B.lmRel.SupportGate mLM p q)
+    (hdet : ∀ out out', B.ExecAnneal (B.toAnnealMR mMR) p q out →
+      B.ExecAnneal (B.toAnnealMR mMR) p q out' → out = out')
+    {cMR : ChoiceMR} {uMR : UnwMR}
+    (hMR : B.mrRel.ExecR mMR p q cMR (.unwind uMR))
+    {cLM : ChoiceLM} {uLM : UnwLM}
+    (hLM : B.lmRel.ExecR mLM p q cLM (.unwind uLM)) :
+    ∃ uA : UnwA,
+      B.ExecAnneal (B.toAnnealMR mMR) p q (.unwind uA) ∧
+      B.mrRel.UnwRel uA uMR ∧ B.lmRel.UnwRel uA uLM := by
+  obtain ⟨outA, hA, hc⟩ :=
+    B.mrSim.forward_total mMR p q cMR (.unwind uMR) hgMR hMR
+  obtain ⟨uA, huA, hrelMR⟩ := hc.unwind_ref_to_anneal uMR rfl
+  rw [huA] at hA
+  obtain ⟨outA', hA', hc'⟩ :=
+    B.lmSim.forward_total mLM p q cLM (.unwind uLM) hgLM hLM
+  obtain ⟨uA', huA', hrelLM⟩ := hc'.unwind_ref_to_anneal uLM rfl
+  rw [huA'] at hA'
+  have eA := (B.anneal_exec_coherent.1 mMR p q (.unwind uA)).mp ⟨cMR, hA⟩
+  have eA' := (B.anneal_exec_coherent.2 mLM p q (.unwind uA')).mp ⟨cLM, hA'⟩
+  rw [← hmode] at eA'
+  have heq :
+      ExecOutcome4.unwind (Ret := RetA) uA = .unwind uA' := hdet _ _ eA eA'
+  cases heq
+  exact ⟨uA, eA, hrelMR, hrelLM⟩
+
+/--
+**Cross-authority divergence equivalence (Case 4).** At matched Anneal modes
+inside both support gates, when both authority simulations have reverse
+totality, `MiniRust` diverges iff the single Anneal model diverges iff
+`LeanMiri` diverges.
+-/
+theorem crossAuthorityDivergeEquiv
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    {mMR : ModeMR} {mLM : ModeLM} (hmode : B.toAnnealMR mMR = B.toAnnealLM mLM)
+    {p : Prog} {q : Query} (hgMR : B.mrRel.SupportGate mMR p q)
+    (hgLM : B.lmRel.SupportGate mLM p q)
+    (hrevMR : B.mrRel.ReverseTotal) (hrevLM : B.lmRel.ReverseTotal) :
+    ((∃ c, B.mrRel.ExecR mMR p q c .diverge) ↔
+      B.ExecAnneal (B.toAnnealMR mMR) p q .diverge) ∧
+    ((∃ c, B.lmRel.ExecR mLM p q c .diverge) ↔
+      B.ExecAnneal (B.toAnnealLM mLM) p q .diverge) ∧
+    ((∃ c, B.mrRel.ExecR mMR p q c .diverge) ↔
+      (∃ c, B.lmRel.ExecR mLM p q c .diverge)) := by
+  have eqMR := B.mrSim.exactBehaviorEq_of_reverseTotal hrevMR hgMR
+  have eqLM := B.lmSim.exactBehaviorEq_of_reverseTotal hrevLM hgLM
+  have hMR : (∃ c, B.mrRel.ExecR mMR p q c .diverge) ↔
+      B.ExecAnneal (B.toAnnealMR mMR) p q .diverge := by
+    constructor
+    · intro ⟨c, hR⟩
+      exact (B.anneal_exec_coherent.1 mMR p q .diverge).mp
+        ⟨c, (eqMR.diverge_iff c).mpr hR⟩
+    · intro hA
+      obtain ⟨c, hA'⟩ := (B.anneal_exec_coherent.1 mMR p q .diverge).mpr hA
+      exact ⟨c, (eqMR.diverge_iff c).mp hA'⟩
+  have hLM : (∃ c, B.lmRel.ExecR mLM p q c .diverge) ↔
+      B.ExecAnneal (B.toAnnealLM mLM) p q .diverge := by
+    constructor
+    · intro ⟨c, hR⟩
+      exact (B.anneal_exec_coherent.2 mLM p q .diverge).mp
+        ⟨c, (eqLM.diverge_iff c).mpr hR⟩
+    · intro hA
+      obtain ⟨c, hA'⟩ := (B.anneal_exec_coherent.2 mLM p q .diverge).mpr hA
+      exact ⟨c, (eqLM.diverge_iff c).mp hA'⟩
+  have hBoth : (∃ c, B.mrRel.ExecR mMR p q c .diverge) ↔
+      (∃ c, B.lmRel.ExecR mLM p q c .diverge) := by
+    rw [hMR, hLM, hmode]
+  exact ⟨hMR, hLM, hBoth⟩
+
 /-- Both authorities' `CorrespondenceClaim`s follow directly from a bundle. -/
 theorem correspondenceClaims
     (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
@@ -2487,6 +2605,85 @@ theorem trans_codec {ModeX : Type uMX} {RetX : Type uRX} {UnwX : Type uUX}
     (hrepMR : ∀ a, B₀.repMR a = a) (hrepLM : ∀ a, B₀.repLM a = a) :
     (B₀.trans B₁ hmidMR hmidLM hgateMR hgateLM hrepMR hrepLM).codec =
       B₀.codec.comp B₁.codec := rfl
+
+/--
+Mode-sensitivity-preserving vertical bundle composition: whenever the front
+simulations have `ReverseTotal` and functional unwind relations (return
+functionality already follows from `hcodecMR` / `hcodecLM`), any recorded
+`modeSensitivity?` witnesses on `B` are transported automatically instead of
+dropped.
+-/
+def compPreserveMode {ModeX : Type uMX} {RetX : Type uRX} {UnwX : Type uUX}
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (frontCodec : CodecLaws RetX RetA)
+    {mrFront : ModeParamStepRel ModeMR Prog Query ChoiceMR RetX RetA UnwX UnwA}
+    {lmFront : ModeParamStepRel ModeLM Prog Query ChoiceLM RetX RetA UnwX UnwA}
+    (mrFrontSim : ModeStepSim mrFront) (lmFrontSim : ModeStepSim lmFront)
+    (hrevMR : mrFront.ReverseTotal) (hrevLM : lmFront.ReverseTotal)
+    (hmidMR : ∀ m p q c out,
+      mrFront.ExecR m p q c out ↔ B.mrRel.ExecA m p q c out)
+    (hmidLM : ∀ m p q c out,
+      lmFront.ExecR m p q c out ↔ B.lmRel.ExecA m p q c out)
+    (hgateMR : ∀ m p q, B.mrRel.SupportGate m p q → mrFront.SupportGate m p q)
+    (hgateLM : ∀ m p q, B.lmRel.SupportGate m p q → lmFront.SupportGate m p q)
+    (hcodecMR : ∀ x a, mrFront.RetRel x a → a = frontCodec.encode x)
+    (hcodecLM : ∀ x a, lmFront.RetRel x a → a = frontCodec.encode x)
+    (hUnwFunMR : ∀ x u₁ u₂, mrFront.UnwRel x u₁ → mrFront.UnwRel x u₂ →
+      u₁ = u₂)
+    (hUnwFunLM : ∀ x u₁ u₂, lmFront.UnwRel x u₁ → lmFront.UnwRel x u₂ →
+      u₁ = u₂)
+    (toFrontMR : ModeMR → ModeX) (toFrontLM : ModeLM → ModeX)
+    (ExecFront : ModeX → Prog → Query → ExecOutcome4 RetX UnwX → Prop)
+    (hcoh :
+      (∀ m p q out,
+        (∃ c, mrFront.ExecA m p q c out) ↔ ExecFront (toFrontMR m) p q out) ∧
+      (∀ m p q out,
+        (∃ c, lmFront.ExecA m p q c out) ↔ ExecFront (toFrontLM m) p q out)) :
+    DualCorrespondenceBundle ModeX Prog Query RetX UnwX Rep ModeMR ChoiceMR
+      RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM :=
+  B.comp frontCodec mrFrontSim lmFrontSim hmidMR hmidLM hgateMR hgateLM
+    hcodecMR hcodecLM toFrontMR toFrontLM ExecFront hcoh
+    (B.mrFlip.modeSensitivity?.map fun ms =>
+      ms.compFrontOfReverseTotal mrFrontSim hrevMR hmidMR hgateMR
+        (fun x b₁ b₂ h₁ h₂ => (hcodecMR x b₁ h₁).trans (hcodecMR x b₂ h₂).symm)
+        hUnwFunMR)
+    (B.lmFlip.modeSensitivity?.map fun ms =>
+      ms.compFrontOfReverseTotal lmFrontSim hrevLM hmidLM hgateLM
+        (fun x b₁ b₂ h₁ h₂ => (hcodecLM x b₁ h₁).trans (hcodecLM x b₂ h₂).symm)
+        hUnwFunLM)
+
+/--
+Mode-sensitivity-preserving transitive bundle composition: automatically
+transports `B₁`'s recorded `modeSensitivity?` witnesses across `B₀`.
+-/
+def transPreserveMode {ModeX : Type uMX} {RetX : Type uRX} {UnwX : Type uUX}
+    (B₀ : DualCorrespondenceBundle ModeX Prog Query RetX UnwX RetA ModeMR
+      ChoiceMR RetA UnwA ModeLM ChoiceLM RetA UnwA)
+    (B₁ : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (hrevMR : B₀.mrRel.ReverseTotal) (hrevLM : B₀.lmRel.ReverseTotal)
+    (hmidMR : ∀ m p q c out,
+      B₀.mrRel.ExecR m p q c out ↔ B₁.mrRel.ExecA m p q c out)
+    (hmidLM : ∀ m p q c out,
+      B₀.lmRel.ExecR m p q c out ↔ B₁.lmRel.ExecA m p q c out)
+    (hgateMR : ∀ m p q,
+      B₁.mrRel.SupportGate m p q → B₀.mrRel.SupportGate m p q)
+    (hgateLM : ∀ m p q,
+      B₁.lmRel.SupportGate m p q → B₀.lmRel.SupportGate m p q)
+    (hrepMR : ∀ a, B₀.repMR a = a) (hrepLM : ∀ a, B₀.repLM a = a)
+    (hUnwFunMR : ∀ x u₁ u₂, B₀.mrRel.UnwRel x u₁ → B₀.mrRel.UnwRel x u₂ →
+      u₁ = u₂)
+    (hUnwFunLM : ∀ x u₁ u₂, B₀.lmRel.UnwRel x u₁ → B₀.lmRel.UnwRel x u₂ →
+      u₁ = u₂) :
+    DualCorrespondenceBundle ModeX Prog Query RetX UnwX Rep ModeMR ChoiceMR
+      RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM :=
+  B₁.compPreserveMode B₀.codec B₀.mrSim B₀.lmSim hrevMR hrevLM hmidMR hmidLM
+    hgateMR hgateLM
+    (fun x a h => (hrepMR a).symm.trans (B₀.mr_ret_codec x a h))
+    (fun x a h => (hrepLM a).symm.trans (B₀.lm_ret_codec x a h))
+    hUnwFunMR hUnwFunLM B₀.toAnnealMR B₀.toAnnealLM B₀.ExecAnneal
+    B₀.anneal_exec_coherent
 
 /--
 Ergonomic constructor from evaluation-equivalence theorems. The Anneal model
