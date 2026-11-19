@@ -6666,6 +6666,88 @@ class TestEpisode2ProjectionAndRewriteOrderHazards(unittest.TestCase):
         )
         self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(b4_neg), [])
 
+    def test_a4_reserved_decl_bounds_guillemet_arrows_term_parens_and_combinator_continuations(
+        self,
+    ) -> None:
+        import lean_lexer
+
+        # 1. Non-reserved core-Lean identifiers (`alias`, `lemma`, `run_cmd`, `add_decl_doc`,
+        # `register_option`) at col 0 inside multi-line bracket expressions must not truncate
+        # `_enclosing_col0_block` before a col-0 `end` / `section`, and `meta` modifier is
+        # skipped like `private` / `unsafe`.
+        ns_a4 = (
+            "namespace Foo\n"
+            "meta def checkWords (alias lemma run_cmd : Nat) : List Nat := [\n"
+            "alias,\n"
+            "lemma,\n"
+            "run_cmd,\n"
+            "end\n"
+            "]\n"
+            "def stillInFoo := 0\n"
+            "end Foo\n"
+            "namespace M in\n"
+            "meta def inM : Nat := 1\n"
+            "def outM : Nat := 2\n"
+        )
+        tr_a4 = lean_lexer.track_namespaces(ns_a4)
+        self.assertEqual(tr_a4.violations, ())
+        self.assertEqual(tr_a4.namespace_at(ns_a4.index("def stillInFoo")), ("Foo",))
+        self.assertEqual(tr_a4.namespace_at(ns_a4.index("inM")), ("M",))
+        self.assertEqual(tr_a4.namespace_at(ns_a4.index("def outM")), ())
+
+        # 2. Advisory regressions: guillemets/char literals/lambda arrows in `_statement_seq_col`
+        # (`intro «a=>b»; change`, `| inl «(» => intro h0; change`, `| inl _ => · intro h0; change`,
+        # `have f := fun x => x; change`), multi-line term-continuation `(show ...)` under `:=`
+        # not falsely flagged, `first | ...` after `rcases ... | ...` / `cases ... =>` / `fun =>`,
+        # and `<;>` / `<|>` multi-line continuations after combinator-prefixed `try`.
+        R_PROJ = proof_health.RULE_SIMP_DEEP_PROJECTION_CHAIN
+        S_STMT = proof_health.SUBRULE_SIMP_AFTER_PROJECTION_STATEMENT
+        R_TRY = proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET
+
+        a4_pos = (
+            "theorem p : P := by\n"
+            "  intro «a=>b»; change (advanceStmt s l m).memory.locals = l\n"
+            "  simp\n"
+            "  cases hc with\n"
+            "  | inl «(» => intro h0; change (advanceStmt s l m).memory.locals = l\n"
+            "               simp\n"
+            "  | inr _ => · intro h0; change (advanceStmt s l m).memory.locals = l\n"
+            "               simp\n"
+            "  have f := fun x => x; change (advanceStmt s l m).memory.locals = l\n"
+            "  simp\n"
+            "  all_goals try simp <;>\n"
+            "    rw [h] at hEval ⊢\n"
+            "  cases hc with\n"
+            "  | inl _ => try exact h1 <|>\n"
+            "    erw [h] at hEval ⊢\n"
+            "  | inr _ => exact h0\n"
+        )
+        self.assertEqual(
+            [
+                (f.line, f.rule, f.subrule)
+                for f in proof_health.scan_projection_and_rewrite_order_hazards(a4_pos)
+            ],
+            [
+                (3, R_PROJ, S_STMT),
+                (6, R_PROJ, S_STMT),
+                (8, R_PROJ, S_STMT),
+                (10, R_PROJ, S_STMT),
+                (12, R_TRY, ""),
+                (15, R_TRY, ""),
+            ],
+        )
+
+        a4_neg = (
+            "theorem clean : P := by\n"
+            "  have hProof : Prop :=\n"
+            "    (show (advanceStmt s l m).memory.locals = l from h0); simp\n"
+            "  rcases hc with c1 | c2; first | try simp | rw [h] at hEval ⊢\n"
+            "  cases hc with | inl c1 => first | try simp | rw [h] at hEval ⊢ | inr _ => exact h0\n"
+            "  first | exact «a=>b»; try simp | rw [h] at hEval ⊢\n"
+            "  first | have f := fun x => x; try simp | rw [h] at hEval ⊢\n"
+        )
+        self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(a4_neg), [])
+
 
 if __name__ == "__main__":
     unittest.main()

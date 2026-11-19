@@ -2782,8 +2782,8 @@ class _AdvisoryRegexes:
         # Standalone `|` excludes `|-` turnstiles and `||` / `|>` / `<|>` operators.
         self.step_token = re.compile(
             _ADV_GUI_OR_CHAR
-            + r"|[()\[\]{}⟨⟩;,\n]|:=|<;>|(?<![|<])\|(?![->|])|"
-            + r"(?<![\w'!?.\u00ab])(?:by|from|at)(?![\w'!?.\u00bb])"
+            + r"|[()\[\]{}⟨⟩;,\n]|:=|=>|<;>|(?<![|<])\|(?![->|])|"
+            + r"(?<![\w'!?.\u00ab])(?:by|from|at|fun|λ)(?![\w'!?.\u00bb])"
         )
         self.bracket = re.compile(_ADV_GUI_OR_CHAR + r"|[()\[\]{}⟨⟩]")
         # One projection: `.field`, `.1`, `.«field»`.
@@ -2893,6 +2893,7 @@ def _adv_scan_to(
     stops: frozenset[str],
     *,
     same_line_stops: frozenset[str] = _ADV_NO_STOPS,
+    infix_min_indent: int | None = None,
 ) -> tuple[int, str, int]:
     """Follow the tactic step (or term) starting at `pos` and return `(end, token, next)`,
     where it stops outside every bracket opened after `pos`:
@@ -2900,14 +2901,15 @@ def _adv_scan_to(
     * at a token of `stops` (`;`, `<;>`, `,`, `:=`, `by`, `from`, `at`) or (before the
       first newline at depth 0) a token of `same_line_stops`: `token` is that token and
       `next` the offset just past it;
-    * at a line end whose next non-blank line is indented less than `min_indent` (a new
-      step or a dedent; more deeply indented lines continue the step): `token` is `"\\n"`
-      and `next` the offset of that next line's first character;
+    * at a line end whose next non-blank line is indented less than `min_indent` (or
+      `infix_min_indent` when the line ends with `<;>` / `<|>`): `token` is `"\\n"` and
+      `next` the offset of that next line's first character;
     * at a bracket that closes one opened before `pos` (`token` `")"`), at the end of the
       text, or after `_ADV_SCAN_LIMIT` characters (`token` `""`): `next` is `-1`.
     """
     depth = 0
     crossed_nl = False
+    inf_min = min_indent if infix_min_indent is None else infix_min_indent
     hard_end = pos + _ADV_SCAN_LIMIT
     if hard_end > n:
         hard_end = n
@@ -2931,7 +2933,19 @@ def _adv_scan_to(
             k = line.end()
             if k >= n:
                 return n, "", -1
-            if k - line.start(1) < min_indent:
+            nxt_indent = k - line.start(1)
+            req_indent = min_indent
+            if inf_min < min_indent and nxt_indent >= inf_min:
+                e = m.start() - 1
+                while e >= pos and stripped[e] in " \t\r":
+                    e -= 1
+                if (
+                    e >= pos + 2
+                    and stripped[e - 2 : e + 1] in ("<;>", "<|>")
+                    and not lean_lexer._inside_guillemets(stripped, e)
+                ):
+                    req_indent = inf_min
+            if nxt_indent < req_indent:
                 return m.start(), "\n", k
             crossed_nl = True
         elif tok in stops or (not crossed_nl and tok in same_line_stops):
@@ -3392,8 +3406,9 @@ def _statement_seq_col(stripped: str, kw_pos: int, col: int) -> int:
     ):
         return col
     depth = 0
-    arrow_end = -1
-    has_arrow = "=>" in stripped[line_start:kw_pos]
+    saw_semi = False
+    saw_term_arrow_src = False
+    arm_arrow_end = -1
     for m in _advisory_regexes().step_token.finditer(stripped, line_start, kw_pos):
         tok = m.group()
         ch = tok[0]
@@ -3405,48 +3420,77 @@ def _statement_seq_col(stripped: str, kw_pos: int, col: int) -> int:
             if depth == 0:
                 return col
             depth -= 1
-        elif depth == 0 and tok == "by":
-            # A `;` after an unparenthesised `by` stays inside that `by` block rather than
-            # continuing the enclosing line's tactic sequence.
-            return col
+        elif depth == 0:
+            if tok == "by":
+                # A `;` after an unparenthesised `by` stays inside that `by` block rather
+                # than continuing the enclosing line's tactic sequence.
+                return col
+            if tok in (":=", "fun", "λ"):
+                saw_term_arrow_src = True
+            elif tok in (";", "<;>"):
+                saw_semi = True
+                saw_term_arrow_src = False
+            elif tok == "=>" and not saw_semi and not saw_term_arrow_src:
+                arm_arrow_end = m.end()
     if depth != 0:
         return col
-    if has_arrow:
-        # Inside `| pat => tac1; change ...`, a sibling of `tac1` aligns with `tac1` after `=>`.
-        d = 0
-        pos = line_start
-        while pos < kw_pos:
-            ch = stripped[pos]
-            if ch in "([{⟨":
-                d += 1
-            elif ch in ")]}⟩" and d > 0:
-                d -= 1
-            elif d == 0 and stripped.startswith("=>", pos):
-                arrow_end = pos + 2
-                pos += 2
-                continue
-            pos += 1
-        if arrow_end != -1:
-            k = arrow_end
-            while k < kw_pos and stripped[k] in " \t":
+    if arm_arrow_end != -1:
+        k = arm_arrow_end
+        while k < kw_pos:
+            ch = stripped[k]
+            if ch in " \t·":
                 k += 1
-            return k - line_start
+            elif ch in ".-+*" and k + 1 < kw_pos and stripped[k + 1] in " \t":
+                k += 1
+            else:
+                break
+        return k - line_start
     return _adv_step_col(stripped, kw_pos)
 
 
+_TERM_LINE_END_WORDS = frozenset(
+    ("from", "exact", "apply", "refine", "return", "fun", "λ", "show", "change")
+)
+
+
+def _prev_line_ends_term_prefix(stripped: str, line_start: int) -> bool:
+    """True when the preceding non-blank line ends with `:=` / `=` / `←` / `→` or a
+    term-introducing keyword so a leading `(...)` on `line_start` continues a term."""
+    cur = line_start - 1
+    while cur >= 0 and stripped[cur] in " \t\r\n":
+        cur -= 1
+    if cur < 0:
+        return False
+    prev_start = stripped.rfind("\n", 0, cur) + 1
+    ch = stripped[cur]
+    if ch in ":=←→+*,":
+        return True
+    if ch == "-" and (cur == prev_start or stripped[cur - 1] != "|"):
+        return True
+    if _is_ident_char(ch) or ch == "λ":
+        w = cur
+        while w > prev_start and _is_ident_char(stripped[w - 1]):
+            w -= 1
+        if stripped[w : cur + 1] in _TERM_LINE_END_WORDS:
+            return True
+    return False
+
+
 def _enclosing_tactic_paren_col(stripped: str, kw_pos: int, col: int) -> int:
-    """When `statement_kw` at `kw_pos` is directly wrapped in a tactic-position `(` or `{`
-    on the same line (`  (suffices ... by ...)` or `  (change ...)`), return the enclosing
-    step's column, else `-1`."""
+    """When `statement_kw` at `kw_pos` is directly wrapped in a tactic-position `(` on the
+    same line (`  (suffices ... by ...)` or `  (change ...)`), return the enclosing step's
+    column, else `-1`."""
     line_start = stripped.rfind("\n", 0, kw_pos) + 1
     b = kw_pos - 1
     while b >= line_start and stripped[b] in " \t":
         b -= 1
-    if b < line_start or stripped[b] not in "({":
+    if b < line_start or stripped[b] != "(":
         return -1
     b_col = b - line_start
     step_c = _adv_step_col(stripped, b)
     if b_col == step_c:
+        if _prev_line_ends_term_prefix(stripped, line_start):
+            return -1
         return step_c
     seq_c = _statement_seq_col(stripped, b, b_col)
     return seq_c if seq_c != b_col else -1
@@ -3524,7 +3568,7 @@ def _simp_after_statement(
                 p = _adv_skip_ws(stripped, nxt, n)
             elif tok == "\n" and _adv_col(stripped, nxt) in (col, seq_col):
                 p = nxt
-            elif tok == ")" and step_end < n:
+            elif tok == ")" and step_end < n and stripped[step_end] == ")":
                 wrap_col = _enclosing_tactic_paren_col(stripped, kw_pos, col)
                 if wrap_col != -1:
                     _, tok_w, nxt_w = _adv_scan_to(
@@ -3555,7 +3599,7 @@ def _simp_after_statement(
                 end2, tok2, nxt2 = _adv_scan_to(stripped, p, n, min_col + 1, _ADV_NO_STOPS)
                 if tok2 == "\n" and _adv_col(stripped, nxt2) in (col, seq_col):
                     post_p = nxt2
-                elif tok2 == ")" and end2 < n:
+                elif tok2 == ")" and end2 < n and stripped[end2] == ")":
                     wrap_col = _enclosing_tactic_paren_col(stripped, kw_pos, col)
                     if wrap_col != -1:
                         _, tok3, nxt3 = _adv_scan_to(
@@ -3587,7 +3631,8 @@ def _is_in_first_arm(stripped: str, line_start: int, t: int) -> bool:
         return False
     group_start = line_start
     open_stack: list[int] = []
-    pipes_by_depth: dict[int, list[int]] = {0: []}
+    # Per-depth state `[active_first_arm, in_fun_binder]`.
+    state_by_depth: dict[int, list[bool]] = {0: [False, False]}
     for m in _advisory_regexes().step_token.finditer(stripped, line_start, t):
         tok = m.group()
         ch = tok[0]
@@ -3595,36 +3640,42 @@ def _is_in_first_arm(stripped: str, line_start: int, t: int) -> bool:
             continue
         if ch in "([{⟨":
             open_stack.append(m.end())
-            pipes_by_depth[len(open_stack)] = []
+            state_by_depth[len(open_stack)] = [False, False]
         elif ch in ")]}⟩":
             if open_stack:
-                pipes_by_depth.pop(len(open_stack), None)
+                state_by_depth.pop(len(open_stack), None)
                 open_stack.pop()
             else:
                 group_start = m.end()
-                pipes_by_depth[0] = []
-        elif tok == "|":
-            pipes_by_depth.setdefault(len(open_stack), []).append(m.start())
-    cur_depth = len(open_stack)
-    if cur_depth > 0:
-        group_start = open_stack[-1]
-    pipes = pipes_by_depth.get(cur_depth)
-    if not pipes:
-        return False
-    first_pipe = pipes[0]
-    last_pipe = pipes[-1]
-    if "=>" in stripped[last_pipe + 1 : t]:
-        return False
-    b = first_pipe - 1
-    while b >= group_start and stripped[b] in " \t":
-        b -= 1
-    if b < group_start and cur_depth == 0:
-        return True
-    if b >= group_start + 4 and stripped[b - 4 : b + 1] == "first":
-        before_f = b - 5
-        if before_f < 0 or not (_is_ident_char(stripped[before_f]) or stripped[before_f] in ".«"):
-            return True
-    return False
+                state_by_depth[0] = [False, False]
+        else:
+            d = len(open_stack)
+            g_lo = open_stack[-1] if d > 0 else group_start
+            st = state_by_depth.setdefault(d, [False, False])
+            if tok in ("fun", "λ"):
+                st[1] = True
+            elif tok in (";", "<;>"):
+                st[1] = False
+            elif tok == "=>":
+                if st[1]:
+                    st[1] = False
+                else:
+                    st[0] = False
+            elif tok == "|":
+                st[1] = False
+                p_pos = m.start()
+                b = p_pos - 1
+                while b >= g_lo and stripped[b] in " \t":
+                    b -= 1
+                if b < g_lo and d == 0:
+                    st[0] = True
+                elif b >= g_lo + 4 and stripped[b - 4 : b + 1] == "first":
+                    before_f = b - 5
+                    if before_f < 0 or not (
+                        _is_ident_char(stripped[before_f]) or stripped[before_f] in ".«"
+                    ):
+                        st[0] = True
+    return state_by_depth.get(len(open_stack), [False, False])[0]
 
 
 def _is_non_tactic_try(stripped: str, t: int) -> bool:
@@ -3749,18 +3800,33 @@ def _try_rewrite_hyp_before_target(
                 _ADV_TRY_STOPS if (in_first_arm and not has_nl_after_try) else _ADV_NO_STOPS
             )
             min_indent = first_col if has_nl_after_try else min(first_col, t_col + 1)
+            infix_min = min(min_indent, try_col + 1)
             if not has_nl_after_try and not in_first_arm and stripped[first] not in "({":
                 flat = flat_line.match(stripped, first)
                 if flat is not None:
                     flat_end = flat.end()
                     line = next_line.match(stripped, flat_end + 1) if flat_end < n else None
-                    if line is None or line.end() >= n or line.end() - line.start(1) < min_indent:
+                    nxt_ind = (
+                        -1
+                        if (line is None or line.end() >= n)
+                        else line.end() - line.start(1)
+                    )
+                    if nxt_ind < infix_min or (
+                        nxt_ind < min_indent
+                        and not stripped[first:flat_end].rstrip(" \t\r").endswith("<|>")
+                    ):
                         if find("w", first, flat_end) != -1:
                             for head in rw_head.finditer(stripped, first, flat_end):
                                 consider(head)
                         continue
             scope_end = _adv_scan_to(
-                stripped, first, n, min_indent, _ADV_NO_STOPS, same_line_stops=same_line_stops
+                stripped,
+                first,
+                n,
+                min_indent,
+                _ADV_NO_STOPS,
+                same_line_stops=same_line_stops,
+                infix_min_indent=infix_min,
             )[0]
         if find("w", first, scope_end) != -1:
             for head in rw_head.finditer(stripped, first, scope_end):

@@ -747,6 +747,7 @@ _DECL_MODIFIERS = (
     "nonrec",
     "scoped",
     "local",
+    "meta",
 )
 
 _NON_CMD_AFTER_CHARS = frozenset(":=<>≤≥≠+-*/,)]}|")
@@ -805,15 +806,16 @@ def _scope_res():
             r"deriving|import|add_decl_doc|register_option|alias)"
             r"(?![\w'!?.])"
         )
-        # Reserved declaration/command heads (excluding `end`/`namespace`/`section`/`mutual`
-        # and words like `open`/`prefix`/`postfix`/`attribute` that can appear as identifiers
-        # inside multi-line bracket expressions) for col-0 block bounds.
+        # Core-Lean reserved declaration/command heads (excluding non-reserved identifiers
+        # such as `alias`/`run_*`/`add_decl_doc`/`register_option` and `end`/`namespace`/
+        # `section`/`mutual`, and requiring `lemma` to precede a header token) for col-0 bounds.
         decl_boundary_re = re.compile(
             r"#[A-Za-z_]\w*(?!\[)|"
-            r"(?:theorem|lemma|def|abbrev|structure|inductive|class|instance|axiom|opaque|example|"
+            r"lemma(?=[ \t]+[^\s,)\]}=:;])|"
+            r"(?:theorem|def|abbrev|structure|inductive|class|instance|axiom|opaque|example|"
             r"export|variable|universe|set_option|notation|infix|infixl|infixr|macro|macro_rules|"
             r"syntax|elab|elab_rules|deriving|declare_syntax_cat|initialize|builtin_initialize|"
-            r"import|add_decl_doc|register_option|run_cmd|run_elab|run_meta|alias)"
+            r"import)"
             r"(?![\w'!?.])"
         )
         in_prefix_re = re.compile(
@@ -957,7 +959,7 @@ def _is_non_command_scope_token(stripped: str, pos: int, kw: str, line_start: in
     return False
 
 
-_MOD_OR_ATTR_FIRST = frozenset("@pnusl")
+_MOD_OR_ATTR_FIRST = frozenset("@mpnusl")
 
 
 def _enclosing_col0_block(stripped: str, pos: int, line_start: int, cmd_re, n: int) -> tuple[int, int]:
