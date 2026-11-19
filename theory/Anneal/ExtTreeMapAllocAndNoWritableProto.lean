@@ -3113,6 +3113,98 @@ theorem keyedDeallocateMachine_perThreadClock_catches_unsynced_reader
   exact (keyedDeallocateMachine_race_checked_before_cleanup w id entry clk actor tb
     hlive hsz hmut hnodead hrace hracy).2.1
 
+/-- **Canonical Sparse Vector-Clock Constructor (`DeallocActor.ofVClock`, `[adv A3]`)**: constructs a
+`DeallocActor` whose `observedTimestamp` fallback is **`0`** (`VTimestamp.ZERO`), matching
+`Miri.Concurrency.VClock.index` (`VectorClock.lean:221–223`: absent vector indices denote
+`VTimestamp.ZERO`). Mixing a nonzero scalar `observedTimestamp` with a partial `perThreadView`
+unsoundly grants `actor` visibility `observedTimestamp` over every *unlisted* thread (`[adv B3]`
+§1.1 scope `(iv)`), whereas `ofVClock` enforces `0` for every unlisted thread! -/
+def DeallocActor.ofVClock (thread : UInt32) (clockEntries : List (UInt32 × UInt64)) : DeallocActor :=
+  { thread := thread, observedTimestamp := 0, perThreadView := clockEntries }
+
+private theorem find_perThreadView_unlisted_none (target : UInt32) :
+    ∀ (entries : List (UInt32 × UInt64)),
+      (∀ p ∈ entries, p.1 ≠ target) →
+      entries.find? (fun p => p.1 == target) = none
+  | [], _ => rfl
+  | (tid, ts) :: rest, hall => by
+    have hne : tid ≠ target := hall (tid, ts) (List.mem_cons_self ..)
+    have hbeq : (tid == target) = false := beq_false_of_ne hne
+    simp [List.find?, hbeq,
+      find_perThreadView_unlisted_none target rest (fun p hp => hall p (List.mem_cons_of_mem _ hp))]
+
+/-- **Absent Vector-Clock Coordinates Denote Zero (`DeallocActor.ofVClock_viewFor_unlisted_eq_zero`,
+`[adv A3]`)**: matching `Miri.Concurrency.VClock.index` (`VectorClock.lean:222`), for every thread
+`target` absent from `entries`, `(DeallocActor.ofVClock tid entries).viewFor target = 0`. -/
+theorem DeallocActor.ofVClock_viewFor_unlisted_eq_zero
+    (tid target : UInt32) (entries : List (UInt32 × UInt64))
+    (hunlisted : ∀ p ∈ entries, p.1 ≠ target) :
+    (DeallocActor.ofVClock tid entries).viewFor target = 0 := by
+  unfold DeallocActor.ofVClock DeallocActor.viewFor
+  simp [find_perThreadView_unlisted_none target entries hunlisted]
+
+/-- **Unlisted-Reader Data-Race Soundness vs. Nonzero Scalar Fallback
+(`deallocActor_ofVClock_catches_unlisted_reader_vs_nonzeroFallback`, `[adv A3]`)**: when a foreign
+thread `rThread` absent from `entries` has read `id` at `0 < clk.readTimestamp ≤ obsFallback`,
+`DeallocActor.ofVClock tid entries` evaluates `viewFor rThread = 0` and catches `.error (.hookFailure
+"DataRace")`, whereas mixing a nonzero scalar fallback `obsFallback` with the partial list `entries`
+(`⟨tid, obsFallback, entries⟩`) falsely reports `.ok ()` (closing B3's §1.1 scope `(iv)` gap). -/
+theorem deallocActor_ofVClock_catches_unlisted_reader_vs_nonzeroFallback
+    (w : KeyedAllocWorld) (id : MiriAllocId) (entry : LocalAllocEntry) (clk : RaceClockEntry)
+    (tid rThread : UInt32) (obsFallback : UInt64) (entries : List (UInt32 × UInt64))
+    (hlive : w.findLive? id = some entry)
+    (hsz : entry.sizeBytes ≠ 0)
+    (hmut : entry.mutability = .mut)
+    (hnodead : w.findDead? id = none)
+    (hrace : w.findRace? id = some clk)
+    (hsameWriter : clk.writerThread = tid)
+    (hreader : clk.lastReaderThread = some rThread)
+    (hneReader : rThread ≠ tid)
+    (hrPos : 0 < clk.readTimestamp)
+    (hfallbackGe : clk.readTimestamp ≤ obsFallback)
+    (hnoExtra : clk.extraReaders = [])
+    (hunlisted : ∀ p ∈ entries, p.1 ≠ rThread) :
+    (DeallocActor.ofVClock tid entries).viewFor rThread = 0 ∧
+    (w.deallocateMachine (.provenanced id 0)
+      (some (entry.sizeBytes, entry.alignBytes)) entry.kind
+      (DeallocActor.ofVClock tid entries) .ok).2.2 = .error (.hookFailure "DataRace") ∧
+    (w.deallocateMachine (.provenanced id 0)
+      (some (entry.sizeBytes, entry.alignBytes)) entry.kind
+      ⟨tid, obsFallback, entries⟩ .ok).2.2 = .ok () := by
+  have hv0 := DeallocActor.ofVClock_viewFor_unlisted_eq_zero tid rThread entries hunlisted
+  have hraceCatch :
+      (w.deallocateMachine (.provenanced id 0)
+        (some (entry.sizeBytes, entry.alignBytes)) entry.kind
+        (DeallocActor.ofVClock tid entries) .ok).2.2 = .error (.hookFailure "DataRace") :=
+    keyedDeallocateMachine_sameWriter_foreignRead_races w id entry clk
+      (DeallocActor.ofVClock tid entries) rThread .ok
+      hlive hsz hmut hnodead hrace hsameWriter hreader hneReader (hv0 ▸ hrPos)
+  have hvFall : (⟨tid, obsFallback, entries⟩ : DeallocActor).viewFor rThread = obsFallback := by
+    unfold DeallocActor.viewFor
+    simp [find_perThreadView_unlisted_none rThread entries hunlisted]
+  have hnotLt : decide (obsFallback < clk.readTimestamp) = false :=
+    decide_eq_false (fun hlt =>
+      Nat.not_lt.mpr (UInt64.le_iff_toNat_le.mp hfallbackGe) (UInt64.lt_iff_toNat_lt.mp hlt))
+  have hverdOk : raceDeallocVerdict ⟨tid, obsFallback, entries⟩ clk = .ok := by
+    unfold raceDeallocVerdict
+    simp [hsameWriter, hreader, hvFall, hnotLt, hnoExtra, findExtraReaderRace]
+  have hsz_false : (some entry.sizeBytes == some (0 : UInt64)) = false := by
+    cases h : (some entry.sizeBytes == some (0 : UInt64)) with
+    | false => rfl
+    | true =>
+      have heq : some entry.sizeBytes = some 0 := eq_of_beq h
+      injection heq with h0
+      exact False.elim (hsz h0)
+  have hmut_false : (entry.mutability == .not) = false := by rw [hmut]; rfl
+  have hlive' : w.live.get? id = some entry := hlive
+  have hrace' : w.race.get? id = some clk := hrace
+  have hdead' : w.dead.get? id = none := hnodead
+  refine ⟨hv0, hraceCatch, ?_⟩
+  simp [KeyedAllocWorld.deallocateMachine, KeyedAllocWorld.deallocate,
+    KeyedAllocWorld.removeLive, KeyedAllocWorld.removeRace, KeyedAllocWorld.insertDead,
+    KeyedAllocWorld.findLive?, KeyedAllocWorld.findRace?, KeyedAllocWorld.findDead?,
+    machineDeallocHook, hsz_false, hverdOk, hlive', hrace', hdead', hmut_false]
+
 /-! ## Section 3: Part 2 — `#[rustc_no_writable]` (`charon#1619` + `minirust#295`) & Static-Access Temporary Retags (`charon#1620`) -/
 
 /-! ### Part 2A: Per-Parameter `FnEntryRetagPolicy` (`writableChildWrite` vs. `rustcNoWritable`) -/
@@ -4088,9 +4180,50 @@ theorem execFnEntryMutRetag_frozenParent_protectedChild_diverges_from_upstream
       isDescendantOrSelf, isDescendantOrSelfAux,
       Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
 
-/-- Preliminary ancestor-first pass (`[adv A2]`), mirroring `Miri.TreeBorrows.TraversalTree.traverse`
-(`Traversal.lean:102–118`, `localEvents ++ foreignEvents`), which **always** traverses the accessed
-node and its ancestors before any foreign subtree regardless of flat-list insertion order. -/
+/-- Bottom-up parent-link ancestor path (`[adv A3]`), mirroring
+`Miri.TreeBorrows.Tree.TraversalTree.ancestorPathAux` (`Traversal.lean:45–53`) verbatim: starts at
+the accessed node `currTag`, then follows `n.parentTag` up to the root (`none`), independent of the
+order in which nodes happen to be stored in `allNodes`! -/
+def ancestorPathNodes (allNodes : List TreeTagNode) : Nat → Nat → List TreeTagNode
+  | 0, _ => []
+  | fuel + 1, currTag =>
+    match findTagNode? allNodes currTag with
+    | none => []
+    | some n =>
+      match n.parentTag with
+      | none => [n]
+      | some pTag => n :: ancestorPathNodes allNodes fuel pTag
+
+/-- **Accessed-Node-First Schedule Law (`ancestorPathNodes_head`, `[adv A3]`)**: exact counterpart of
+`Miri.TreeBorrows.Tree.TraversalTree.ancestorPath_head` / `traverse_starts_at_accessed_node`
+(`Traversal.lean:63, 114`) — the bottom-up ancestor walk always visits `findTagNode? allNodes
+startTag` first, regardless of list order. -/
+theorem ancestorPathNodes_head (allNodes : List TreeTagNode) (fuel startTag : Nat) :
+    (ancestorPathNodes allNodes (fuel + 1) startTag).head? = findTagNode? allNodes startTag := by
+  unfold ancestorPathNodes
+  cases findTagNode? allNodes startTag with
+  | none => rfl
+  | some n =>
+    dsimp only
+    cases n.parentTag <;> rfl
+
+def checkNodesListM (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode) :
+    List TreeTagNode → Except RetagStepErr Unit
+  | [] => .ok ()
+  | n :: ns => do
+    let _ ← stepFn n
+    checkNodesListM stepFn ns
+
+/-- Bottom-up parent-link local check (`[adv A3]`): steps `ancestorPathNodes` from accessed
+`targetTag` up to the root, closing B3's flat-list local-order gap (`B3` open item `(i)`). -/
+def checkAncestorPathM (allNodes : List TreeTagNode) (targetTag : Nat)
+    (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode) : Except RetagStepErr Unit :=
+  checkNodesListM stepFn (ancestorPathNodes allNodes (allNodes.length + 1) targetTag)
+
+/-- Flat-list local ancestor pass (`[adv A2]`): retained after `checkAncestorPathM` so even
+pathological duplicate-tag lists still check every `isDescendantOrSelf` node before any foreign
+node, while `checkAncestorPathM` enforces upstream's exact bottom-up `start -> parent -> ... -> root`
+diagnostic order first (`[adv A3]`). -/
 def checkAncestorsM (allNodes : List TreeTagNode) (targetTag : Nat)
     (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode) :
     List TreeTagNode → Except RetagStepErr Unit
@@ -4105,18 +4238,18 @@ def checkAncestorsM (allNodes : List TreeTagNode) (targetTag : Nat)
 def stepNodesAncestorFirst (allNodes : List TreeTagNode) (targetTag : Nat)
     (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode)
     (nodes : List TreeTagNode) : Except RetagStepErr (List TreeTagNode) := do
+  checkAncestorPathM allNodes targetTag stepFn
   checkAncestorsM allNodes targetTag stepFn nodes
   mapNodesM stepFn nodes
 
 /-- **Upstream Traversal-Order-Faithful `FnEntry` Mutable Retag (`execFnEntryMutRetagSourceOrder`,
-`[adv A2]`)**: matches both `RetagPipeline.accessTreeForReborrow`'s single-parent-access rule AND
-`TraversalTree.traverse`'s `localEvents ++ foreignEvents` ancestor-before-foreign order.
-*Honest scope (`[adv B3]`)*: `checkAncestorsM` steps the local nodes in **flat-list** order, whereas
-upstream's `ancestorPath` is bottom-up (accessed node first, then parent, …, root). The two coincide
-on newest-first lists (as built by `childNode :: nodes` insertion); on other list orders only the
-*reported* local error can differ (`.ancestorWriteForbidden` vs. `.conflictedProtectedChildWrite`),
-never success vs. failure (`checkAncestorsM` succeeds iff every local step succeeds), see
-`execFnEntryMutRetag_ok_iff_upstream_ok_iff_sourceOrder_ok`. -/
+`[adv A2]`, bottom-up `ancestorPathNodes` upgrade `[adv A3]`)**: matches
+1. `RetagPipeline.accessTreeForReborrow`'s single-parent-access rule,
+2. `TraversalTree.traverse`'s `localEvents ++ foreignEvents` ancestor-before-foreign order, AND
+3. `TraversalTree.ancestorPath`'s **bottom-up** (`start -> parent -> ... -> root`) local order via
+   `checkAncestorPathM` (`[adv A3]`, discharging B3 open item `(i)` so local error precedence matches
+   upstream on **every** node-list order, not only newest-first lists; see
+   `execFnEntryMutRetagSourceOrder_bottomUp_vs_flatAncestors`). -/
 def execFnEntryMutRetagSourceOrder (w : FnEntryBorrowWorld) (parentTag off len : Nat)
     (facts : RetagTypeFacts) (implicitWrites : Bool) (paramPolicy : FnEntryRetagPolicy) :
     Except RetagStepErr (FnEntryBorrowWorld × Option Nat) := do
@@ -4209,9 +4342,61 @@ theorem execFnEntryMutRetagUpstream_reversedList_violates_traversalOrder
       TreeBorrowPerm.toAbstractPerm, TreeTagNode.isProtected, hov, hprot7,
       Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
   · unfold execFnEntryMutRetagSourceOrder selectFnEntryPolicy stepNodesAncestorFirst
-    simp [hunpin, findTagNode?, hbound, hlen0, checkAncestorsM, stepNodeOnRangeWrite,
-      isDescendantOrSelf, isDescendantOrSelfAux,
+    simp [hunpin, findTagNode?, hbound, hlen0, checkAncestorPathM, ancestorPathNodes,
+      checkNodesListM, stepNodeOnRangeWrite, isDescendantOrSelf, isDescendantOrSelfAux,
       Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
+
+/-- **Bottom-Up `ancestorPathNodes` vs. Flat-List `checkAncestorsM` Local Diagnostic Separation
+(`execFnEntryMutRetagSourceOrder_bottomUp_vs_flatAncestors`, `[adv A3]`)**: on a root-first
+`BorrowTreeTagsWF` world `[⟨1 (.frozen root)⟩, ⟨2 (protected .reservedFrz true child, parent = some 1)⟩]`
+retagging `parentTag = 2` under `.writableChildWrite`, A2's flat-list `checkAncestorsM` visits root
+`1` *before* accessed child `2` and reports `.ancestorWriteForbidden`, whereas upgraded
+`execFnEntryMutRetagSourceOrder` (`checkAncestorPathM`) walks `ancestorPathNodes` bottom-up (`[2, 1]`,
+matching `Traversal.lean:45–53, 114`) and reports `.conflictedProtectedChildWrite`! -/
+theorem execFnEntryMutRetagSourceOrder_bottomUp_vs_flatAncestors
+    (allocId len : Nat) (bytes : List AbstractByte) (facts : RetagTypeFacts)
+    (hlen : 0 < len) (hbound : len ≤ bytes.length) (hunpin : facts.tyIsUnpin = true) :
+    let wRootFirst : FnEntryBorrowWorld := {
+      allocId := allocId
+      bytes := bytes
+      nodes := [
+        ⟨1, allocId, 0, len, .frozen, none, none⟩,
+        ⟨2, allocId, 0, len, .reservedFrz true, some 7, some 1⟩
+      ]
+      activeProtectors := ProtectorSet.empty.insert 7
+      nextTag := 3
+      nextProtector := 8
+    }
+    let stepW :=
+      stepNodeOnRangeWrite wRootFirst.nodes wRootFirst.activeProtectors allocId 0 len 2
+    checkAncestorsM wRootFirst.nodes 2 stepW wRootFirst.nodes = .error .ancestorWriteForbidden ∧
+    execFnEntryMutRetagSourceOrder wRootFirst 2 0 len facts true .writableChildWrite =
+      .error .conflictedProtectedChildWrite := by
+  have hlen0 : Nat.beq len 0 = false := by
+    cases len with
+    | zero => omega
+    | succ _ => rfl
+  have hprot7 : (ProtectorSet.empty.insert 7).contains 7 = true :=
+    ProtectorSet.contains_insert_self _ _
+  refine ⟨?_, ?_⟩
+  · simp [checkAncestorsM, stepNodeOnRangeWrite, isDescendantOrSelf, isDescendantOrSelfAux,
+      findTagNode?, hlen0, Bind.bind, Except.bind]
+  · unfold execFnEntryMutRetagSourceOrder selectFnEntryPolicy stepNodesAncestorFirst
+    simp [hunpin, findTagNode?, hbound, hlen0, checkAncestorPathM, ancestorPathNodes,
+      checkNodesListM, stepNodeOnRangeWrite, isDescendantOrSelf, isDescendantOrSelfAux,
+      TreeTagNode.isProtected, hprot7, Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
+
+private theorem checkNodesListM_ok_of_mem_ok
+    (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode) :
+    ∀ (ns : List TreeTagNode),
+      (∀ n ∈ ns, ∃ n', stepFn n = .ok n') →
+      checkNodesListM stepFn ns = .ok ()
+  | [], _ => rfl
+  | n :: rest, hok => by
+    unfold checkNodesListM
+    obtain ⟨n', hn'⟩ := hok n (List.mem_cons_self ..)
+    rw [hn']
+    exact checkNodesListM_ok_of_mem_ok stepFn rest (fun m hm => hok m (List.mem_cons_of_mem _ hm))
 
 private theorem checkAncestorsM_ok_of_anc_ok
     (allNodes : List TreeTagNode) (targetTag : Nat)
@@ -4651,6 +4836,54 @@ private theorem isProtected_insert_fresh
       | true => have := Nat.eq_of_beq_eq_true h; omega
     simp [ProtectorSet.insert, ProtectorSet.contains, natListContainsBool, hb1]
 
+private theorem mem_and_desc_of_mem_ancestorPathNodes (allNodes : List TreeTagNode) :
+    ∀ (fuel currTag : Nat) (n : TreeTagNode),
+      n ∈ ancestorPathNodes allNodes fuel currTag →
+      n ∈ allNodes ∧ isDescendantOrSelfAux fuel allNodes currTag n.tag = true
+  | 0, _, _, h => nomatch h
+  | fuel + 1, currTag, n, h => by
+    unfold ancestorPathNodes at h
+    cases hf : findTagNode? allNodes currTag with
+    | none => rw [hf] at h; nomatch h
+    | some nd =>
+      rw [hf] at h
+      dsimp only at h
+      have hndMem := findTagNode?_some_mem allNodes currTag nd hf
+      have hndTag := findTagNode?_some_tag allNodes currTag nd hf
+      cases hp : nd.parentTag with
+      | none =>
+        rw [hp] at h
+        rcases List.mem_singleton.mp h with rfl
+        refine ⟨hndMem, ?_⟩
+        unfold isDescendantOrSelfAux
+        rw [hndTag, Nat.beq_refl]
+        rfl
+      | some pTag =>
+        rw [hp] at h
+        rcases List.mem_cons.mp h with rfl | hrest
+        · refine ⟨hndMem, ?_⟩
+          unfold isDescendantOrSelfAux
+          rw [hndTag, Nat.beq_refl]
+          rfl
+        · obtain ⟨hnMem, hdesc⟩ := mem_and_desc_of_mem_ancestorPathNodes allNodes fuel pTag n hrest
+          refine ⟨hnMem, ?_⟩
+          unfold isDescendantOrSelfAux
+          cases Nat.beq currTag n.tag
+          · simp [hf, hp, hdesc]
+          · rfl
+
+private theorem checkAncestorPathM_ok_of_anc_ok
+    (allNodes : List TreeTagNode) (targetTag : Nat)
+    (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode)
+    (hok : ∀ n ∈ allNodes, isDescendantOrSelf allNodes targetTag n.tag = true → ∃ n', stepFn n = .ok n') :
+    checkAncestorPathM allNodes targetTag stepFn = .ok () := by
+  unfold checkAncestorPathM
+  apply checkNodesListM_ok_of_mem_ok
+  intro n hmem
+  obtain ⟨hnMem, hdesc⟩ :=
+    mem_and_desc_of_mem_ancestorPathNodes allNodes (allNodes.length + 1) targetTag n hmem
+  exact hok n hnMem hdesc
+
 /-- **Arbitrary-World Three-Model Equivalence Under Writable Ancestors
 (`execFnEntryMutRetag_eq_sourceOrder_of_writableAncestors`, `[adv A2]`)**: for **every**
 `w : FnEntryBorrowWorld` with fresh tag/protector counters (`BorrowTreeTagsWF w`) and writable
@@ -4667,6 +4900,15 @@ theorem execFnEntryMutRetag_eq_sourceOrder_of_writableAncestors
       execFnEntryMutRetagUpstream w parentTag off len facts implicitWrites paramPolicy ∧
     execFnEntryMutRetagUpstream w parentTag off len facts implicitWrites paramPolicy =
       execFnEntryMutRetagSourceOrder w parentTag off len facts implicitWrites paramPolicy := by
+  have hcapRead : checkAncestorPathM w.nodes parentTag
+      (stepNodeOnRangeRead w.nodes w.activeProtectors w.allocId off len parentTag) = .ok () :=
+    checkAncestorPathM_ok_of_anc_ok _ _ _ (fun n hm hanc =>
+      stepNodeOnRangeRead_anc_ok_of_not_disabled w parentTag off len n hanc
+        (fun ha => (hwrit n hm hanc ha).2.1))
+  have hcapWrite : checkAncestorPathM w.nodes parentTag
+      (stepNodeOnRangeWrite w.nodes w.activeProtectors w.allocId off len parentTag) = .ok () :=
+    checkAncestorPathM_ok_of_anc_ok _ _ _ (fun n hm hanc =>
+      stepNodeOnRangeWrite_anc_ok_of_writable w parentTag off len n hanc (hwrit n hm hanc))
   have hcaRead : checkAncestorsM w.nodes parentTag
       (stepNodeOnRangeRead w.nodes w.activeProtectors w.allocId off len parentTag) w.nodes = .ok () :=
     checkAncestorsM_ok_of_anc_ok _ _ _ w.nodes (fun n hm hanc =>
@@ -4803,8 +5045,8 @@ theorem execFnEntryMutRetag_eq_sourceOrder_of_writableAncestors
             cases Nat.beq len 0
             · simp only [Bool.false_eq_true, ↓reduceIte]
               cases selected.performsImplicitWrite && !false
-              · rw [hcaRead]; rfl
-              · rw [hcaWrite]; rfl
+              · rw [hcapRead, hcaRead]; rfl
+              · rw [hcapWrite, hcaWrite]; rfl
             · rfl
         · rfl
 
@@ -4871,27 +5113,33 @@ theorem sourceOrder_rustcNoWritable_preserves_all_frozen_nodes
           cases hlen0 : Nat.beq len 0
           · simp only [hlen0, Bool.false_eq_true, Bool.false_and, ↓reduceIte,
               stepNodesAncestorFirst] at hok
-            cases hca : checkAncestorsM w.nodes parentTag
-                (stepNodeOnRangeRead w.nodes w.activeProtectors w.allocId off len parentTag) w.nodes with
-            | error _ => rw [hca] at hok; nomatch hok
+            cases hcap : checkAncestorPathM w.nodes parentTag
+                (stepNodeOnRangeRead w.nodes w.activeProtectors w.allocId off len parentTag) with
+            | error _ => rw [hcap] at hok; nomatch hok
             | ok _ =>
-              rw [hca] at hok
+              rw [hcap] at hok
               dsimp only [Bind.bind, Except.bind] at hok
-              cases hmap : mapNodesM
+              cases hca : checkAncestorsM w.nodes parentTag
                   (stepNodeOnRangeRead w.nodes w.activeProtectors w.allocId off len parentTag) w.nodes with
-              | error _ => rw [hmap] at hok; nomatch hok
-              | ok ns' =>
-                rw [hmap] at hok
-                injection hok with hpair
-                injection hpair with hw' _
-                subst hw'
-                apply List.mem_cons_of_mem
-                refine mapNodesM_preserves_fixed_mem _ w.nodes ns' n hmap hmem ?_
-                unfold stepNodeOnRangeRead
-                simp only [hlen0, Bool.false_eq_true, ↓reduceIte, hfrz]
-                cases isDescendantOrSelf w.nodes parentTag n.tag
-                · cases byteRangeOverlapsWrite n.toByteRangePerm w.allocId off len <;> rfl
-                · cases Nat.beq n.allocId w.allocId <;> rfl
+              | error _ => rw [hca] at hok; nomatch hok
+              | ok _ =>
+                rw [hca] at hok
+                dsimp only [Bind.bind, Except.bind] at hok
+                cases hmap : mapNodesM
+                    (stepNodeOnRangeRead w.nodes w.activeProtectors w.allocId off len parentTag) w.nodes with
+                | error _ => rw [hmap] at hok; nomatch hok
+                | ok ns' =>
+                  rw [hmap] at hok
+                  injection hok with hpair
+                  injection hpair with hw' _
+                  subst hw'
+                  apply List.mem_cons_of_mem
+                  refine mapNodesM_preserves_fixed_mem _ w.nodes ns' n hmap hmem ?_
+                  unfold stepNodeOnRangeRead
+                  simp only [hlen0, Bool.false_eq_true, ↓reduceIte, hfrz]
+                  cases isDescendantOrSelf w.nodes parentTag n.tag
+                  · cases byteRangeOverlapsWrite n.toByteRangePerm w.allocId off len <;> rfl
+                  · cases Nat.beq n.allocId w.allocId <;> rfl
           · simp only [hlen0, ↓reduceIte] at hok
             injection hok with hpair
             injection hpair with hw' _
@@ -4917,38 +5165,47 @@ private theorem mapNodesM_ok_each {ε : Type} (f : TreeTagNode → Except ε Tre
         · exact ⟨hd', heq ▸ hhd⟩
         · exact mapNodesM_ok_each f tl tl' htl n hmem
 
-/-- `[adv B3]` helper: the ancestor-first pre-pass never changes *whether* a traversal succeeds. -/
+/-- `[adv B3]` + `[adv A3]` helper: neither the bottom-up `checkAncestorPathM` pre-pass nor
+`checkAncestorsM` changes *whether* a traversal over `allNodes` succeeds. -/
 private theorem stepNodesAncestorFirst_ok_iff
     (allNodes : List TreeTagNode) (targetTag : Nat)
-    (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode) (nodes ns' : List TreeTagNode) :
-    stepNodesAncestorFirst allNodes targetTag stepFn nodes = .ok ns' ↔
-      mapNodesM stepFn nodes = .ok ns' := by
+    (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode) (ns' : List TreeTagNode) :
+    stepNodesAncestorFirst allNodes targetTag stepFn allNodes = .ok ns' ↔
+      mapNodesM stepFn allNodes = .ok ns' := by
   unfold stepNodesAncestorFirst
   constructor
   · intro h
-    cases hca : checkAncestorsM allNodes targetTag stepFn nodes with
-    | error _ => rw [hca] at h; nomatch h
-    | ok _ => rw [hca] at h; exact h
+    cases hcap : checkAncestorPathM allNodes targetTag stepFn with
+    | error _ => rw [hcap] at h; nomatch h
+    | ok _ =>
+      rw [hcap] at h
+      dsimp only [Bind.bind, Except.bind] at h
+      cases hca : checkAncestorsM allNodes targetTag stepFn allNodes with
+      | error _ => rw [hca] at h; nomatch h
+      | ok _ => rw [hca] at h; exact h
   · intro h
-    have hca : checkAncestorsM allNodes targetTag stepFn nodes = .ok () :=
-      checkAncestorsM_ok_of_anc_ok allNodes targetTag stepFn nodes
-        (fun n hn _ => mapNodesM_ok_each stepFn nodes ns' h n hn)
-    rw [hca]
+    have hcap : checkAncestorPathM allNodes targetTag stepFn = .ok () :=
+      checkAncestorPathM_ok_of_anc_ok allNodes targetTag stepFn
+        (fun n hn _ => mapNodesM_ok_each stepFn allNodes ns' h n hn)
+    have hca : checkAncestorsM allNodes targetTag stepFn allNodes = .ok () :=
+      checkAncestorsM_ok_of_anc_ok allNodes targetTag stepFn allNodes
+        (fun n hn _ => mapNodesM_ok_each stepFn allNodes ns' h n hn)
+    rw [hcap, hca]
     exact h
 
 private theorem stepNodesAncestorFirst_bind_ok_iff {β : Type}
     (allNodes : List TreeTagNode) (targetTag : Nat)
-    (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode) (nodes : List TreeTagNode)
+    (stepFn : TreeTagNode → Except RetagStepErr TreeTagNode)
     (k : List TreeTagNode → Except RetagStepErr β) (r : β) :
-    (stepNodesAncestorFirst allNodes targetTag stepFn nodes >>= k) = .ok r ↔
-      (mapNodesM stepFn nodes >>= k) = .ok r := by
-  cases hm : mapNodesM stepFn nodes with
+    (stepNodesAncestorFirst allNodes targetTag stepFn allNodes >>= k) = .ok r ↔
+      (mapNodesM stepFn allNodes >>= k) = .ok r := by
+  cases hm : mapNodesM stepFn allNodes with
   | ok ns' =>
-    rw [(stepNodesAncestorFirst_ok_iff allNodes targetTag stepFn nodes ns').mpr hm]
+    rw [(stepNodesAncestorFirst_ok_iff allNodes targetTag stepFn ns').mpr hm]
   | error e =>
-    cases hs : stepNodesAncestorFirst allNodes targetTag stepFn nodes with
+    cases hs : stepNodesAncestorFirst allNodes targetTag stepFn allNodes with
     | ok ns' =>
-      rw [(stepNodesAncestorFirst_ok_iff allNodes targetTag stepFn nodes ns').mp hs] at hm
+      rw [(stepNodesAncestorFirst_ok_iff allNodes targetTag stepFn ns').mp hs] at hm
       nomatch hm
     | error e' =>
       constructor <;> intro h <;> nomatch h
@@ -4982,8 +5239,8 @@ theorem execFnEntryMutRetagUpstream_ok_iff_sourceOrder_ok
           cases Nat.beq len 0
           · simp only [Bool.false_eq_true, ↓reduceIte]
             cases selected.performsImplicitWrite && !false
-            · exact (stepNodesAncestorFirst_bind_ok_iff _ _ _ _ _ _).symm
-            · exact (stepNodesAncestorFirst_bind_ok_iff _ _ _ _ _ _).symm
+            · exact (stepNodesAncestorFirst_bind_ok_iff _ _ _ _ _).symm
+            · exact (stepNodesAncestorFirst_bind_ok_iff _ _ _ _ _).symm
           · exact Iff.rfl
       · exact Iff.rfl
 
@@ -5599,11 +5856,93 @@ theorem static_pureUnsafeCell_preserved_write_ok
   rw [hstep1]
   rfl
 
+mutual
+
+/-- Syntactic `Ty::is_freeze` predicate on `StaticTyDesc` (`[adv A3]`): `false` whenever any
+`UnsafeCell` field appears anywhere in the type — **including zero-sized `UnsafeCell<()>`**
+(`sizeBytes = 0`, `impl<T: ?Sized> !Freeze for UnsafeCell<T>`)! -/
+def StaticTyDesc.isSyntacticFreeze : StaticTyDesc → Bool
+  | .freezeScalar _ => true
+  | .unsafeCell _ => false
+  | .composite _ fields => staticFieldsSyntacticFreeze fields
+
+def staticFieldsSyntacticFreeze : List (Nat × StaticTyDesc) → Bool
+  | [] => true
+  | (_, f) :: rest => f.isSyntacticFreeze && staticFieldsSyntacticFreeze rest
+
+end
+
+mutual
+
+private theorem not_isSyntacticFreeze_of_desc_uc :
+    ∀ (d : StaticTyDesc) (absOff : Nat) (uc : StaticLayoutSegment),
+      uc ∈ buildFreezeSegmentsDesc absOff d → uc.kind = .unsafeCell →
+      d.isSyntacticFreeze = false
+  | .freezeScalar _, absOff, uc, hmem, hkind => by
+    unfold buildFreezeSegmentsDesc at hmem
+    split at hmem
+    · rcases List.mem_singleton.mp hmem with rfl; nomatch hkind
+    · nomatch hmem
+  | .unsafeCell _, _, _, _, _ => rfl
+  | .composite _ subFields, absOff, uc, hmem, hkind => by
+    unfold buildFreezeSegmentsDesc at hmem
+    unfold StaticTyDesc.isSyntacticFreeze
+    exact not_staticFieldsSyntacticFreeze_of_uc subFields absOff absOff uc hmem hkind
+
+private theorem not_staticFieldsSyntacticFreeze_of_uc :
+    ∀ (fields : List (Nat × StaticTyDesc)) (baseOff cursor : Nat) (uc : StaticLayoutSegment),
+      uc ∈ buildFreezeSegmentsFields baseOff cursor fields → uc.kind = .unsafeCell →
+      staticFieldsSyntacticFreeze fields = false
+  | [], _, _, _, hmem, _ => nomatch hmem
+  | (relOff, fDesc) :: rest, baseOff, cursor, uc, hmem, hkind => by
+    unfold buildFreezeSegmentsFields at hmem
+    dsimp only at hmem
+    rw [List.append_assoc] at hmem
+    rcases List.mem_append.mp hmem with hpad | hrest1
+    · split at hpad
+      · rcases List.mem_singleton.mp hpad with rfl; nomatch hkind
+      · nomatch hpad
+    · unfold staticFieldsSyntacticFreeze
+      rcases List.mem_append.mp hrest1 with hf | htl
+      · rw [not_isSyntacticFreeze_of_desc_uc fDesc (baseOff + relOff) uc hf hkind]
+        rfl
+      · rw [not_staticFieldsSyntacticFreeze_of_uc rest baseOff _ uc htl hkind, Bool.and_false]
+
+end
+
+private theorem not_isSyntacticFreeze_of_hasUnsafeCellSeg (desc : StaticTyDesc)
+    (hhasUC : ∃ uc ∈ (staticFreezeSegments desc).2, uc.kind = .unsafeCell) :
+    desc.isSyntacticFreeze = false := by
+  rcases hhasUC with ⟨uc, hmem, hkind⟩
+  cases desc with
+  | freezeScalar _ =>
+    unfold staticFreezeSegments at hmem
+    dsimp only at hmem
+    split at hmem
+    · rcases List.mem_singleton.mp hmem with rfl; nomatch hkind
+    · nomatch hmem
+  | unsafeCell _ => rfl
+  | composite _ fields =>
+    unfold staticFreezeSegments at hmem
+    dsimp only at hmem
+    rcases List.mem_append.mp hmem with hbody | htrail
+    · unfold StaticTyDesc.isSyntacticFreeze
+      exact not_staticFieldsSyntacticFreeze_of_uc fields 0 0 uc hbody hkind
+    · split at htrail
+      · rcases List.mem_singleton.mp htrail with rfl; nomatch hkind
+      · nomatch htrail
+
 /-- Allocation mutability rustc's const-eval interner assigns an immutable `static` item
-(`intern_const_alloc_recursive`, `InternKind::Static(Mutability::Not)`, `[adv B1]`):
-`Mutability::Not` iff the type is `Freeze` (no `UnsafeCell` byte), `Mutability::Mut` otherwise. -/
+(`compiler/rustc_const_eval/src/interpret/intern.rs:222–229`, `InternKind::Static(Mutability::Not)`,
+`[adv B1]`, **fixed in `[adv A3]`**):
+`if ret.layout.ty.is_freeze(*ecx.tcx, ecx.typing_env) { Mutability::Not } else { Mutability::Mut }`.
+`[adv A3]` fix: B1 scanned `(staticFreezeSegments desc).2` for `.unsafeCell` byte segments, which
+**falsely returned `.not`** on `!Freeze` composites containing a zero-sized `UnsafeCell<()>` (such as
+`static S: (u8, UnsafeCell<()>)`, where `FreezeVisitor.wholeUnsafeCell` in `FreezeVisitor.lean:69`
+skips `0`-byte segments so all emitted bytes are `.freeze`, yet `ty.is_freeze` is `false` so rustc
+interns `S` as `Mutability::Mut` — see `static_zstUnsafeCell_composite_miri_separation`!). -/
 def staticAllocMutability (desc : StaticTyDesc) : Mutability :=
-  if (staticFreezeSegments desc).2.any (fun seg => seg.kind == .unsafeCell) then .mut else .not
+  if desc.isSyntacticFreeze then .not else .mut
 
 /-- Miri-faithful raw static write (`[adv B1]`): the allocation-mutability gate (Miri's
 `writeToReadOnly` / read-only allocation check) runs before any Tree Borrows transition; zero-sized
@@ -5631,11 +5970,7 @@ theorem static_pureFreeze_erased_write_caught_by_readOnly_alloc
       (retagStaticErased allocId (.freezeScalar sizeBytes) initBytes) writeOff newBytes = .ub ∧
     evalRawMutStaticWriteMiri (.freezeScalar sizeBytes)
       (retagStaticPreserved allocId (.freezeScalar sizeBytes) initBytes) writeOff newBytes = .ub := by
-  have hmut : staticAllocMutability (.freezeScalar sizeBytes) = .not := by
-    unfold staticAllocMutability staticFreezeSegments
-    by_cases hsz : 0 < sizeBytes
-    · simp [hsz]
-    · simp [hsz]
+  have hmut : staticAllocMutability (.freezeScalar sizeBytes) = .not := rfl
   have hlen0 : Nat.beq newBytes.length 0 = false := by
     cases h : newBytes.length with
     | zero => omega
@@ -5731,11 +6066,9 @@ theorem static_mixed_miri_separation
     ∃ st', evalRawMutStaticWriteMiri desc
       (retagStaticErasedAt rootTag allocId desc initBytes) writeOff newBytes = .ok st' := by
   have hmut : staticAllocMutability desc = .mut := by
-    rcases hhasUC with ⟨uc, hucMem, hucKind⟩
     unfold staticAllocMutability
-    have hany : ((staticFreezeSegments desc).2.any (fun seg => seg.kind == .unsafeCell)) = true :=
-      List.any_eq_true.mpr ⟨uc, hucMem, by simp [hucKind]⟩
-    simp [hany]
+    rw [not_isSyntacticFreeze_of_hasUnsafeCellSeg desc hhasUC]
+    rfl
   have hlen0 : Nat.beq newBytes.length 0 = false := by
     cases h : newBytes.length with
     | zero => omega
@@ -5797,11 +6130,9 @@ theorem static_mixed_miri_unsafeCell_write_ok
         bytes := (writeAbstractBytesAt initBytes writeOff newBytes).getD initBytes
       } := by
   have hmut : staticAllocMutability desc = .mut := by
-    rcases hhasUC with ⟨uc, hucMem, hucKind⟩
     unfold staticAllocMutability
-    have hany : ((staticFreezeSegments desc).2.any (fun seg => seg.kind == .unsafeCell)) = true :=
-      List.any_eq_true.mpr ⟨uc, hucMem, by simp [hucKind]⟩
-    simp [hany]
+    rw [not_isSyntacticFreeze_of_hasUnsafeCellSeg desc hhasUC]
+    rfl
   have hlen0 : Nat.beq newBytes.length 0 = false := by
     cases h : newBytes.length with
     | zero => omega
@@ -5825,6 +6156,119 @@ theorem static_mixed_miri_unsafeCell_write_ok
   cases byteRangeOverlapsWrite ⟨rootTag, allocId, 0, (staticFreezeSegments desc).1, .active, none⟩
       allocId writeOff newBytes.length <;>
     simp [stepSelfWriteByteRange, permAllowsWrite, permAfterSelfWrite, hchildOk]
+
+/-- **Zero-Sized `UnsafeCell<()>` Composite Static Separation
+(`static_zstUnsafeCell_composite_miri_separation`, `[adv A3]`)**: exposes and fixes B1's
+`staticAllocMutability` bug against `rustc_const_eval/src/interpret/intern.rs:222–229` +
+`FreezeVisitor.lean:69`:
+On `static S: (T, UnsafeCell<()>)` (`desc = .composite freezeSz [(0, .freezeScalar freezeSz),
+(freezeSz, .unsafeCell 0)]` with `freezeSz > 0`):
+1. `FreezeVisitor.wholeUnsafeCell` (`size != 0`, `FreezeVisitor.lean:69`) skips the `0`-byte
+   `UnsafeCell<()>`, so `(staticFreezeSegments desc).2 = [⟨0, freezeSz, .freeze⟩]` has **zero**
+   `.unsafeCell` segments (B1's segment-scan `staticAllocMutability` falsely returned `.not`!).
+2. Yet `desc.isSyntacticFreeze = false`, so rustc (`intern.rs:225`) interns `S` with
+   `staticAllocMutability desc = .mut`!
+3. Therefore, under Miri's allocation-mutability semantics (`evalRawMutStaticWriteMiri`), mutating
+   any non-empty in-bounds slice through `(&raw const S).cast_mut()` **faults with `.ub`** under
+   `charon#1620`'s preserved temporary retag while **unsoundly succeeding** under pre-`#1620`
+   erasure — even without a single `.unsafeCell` byte segment! -/
+theorem static_zstUnsafeCell_composite_miri_separation
+    (rootTag childTag allocId freezeSz writeOff : Nat)
+    (initBytes newBytes : List AbstractByte)
+    (hneTag : rootTag ≠ childTag)
+    (hfzPos : 0 < freezeSz)
+    (hne : 0 < newBytes.length)
+    (hb₁ : writeOff + newBytes.length ≤ freezeSz)
+    (hb₂ : writeOff + newBytes.length ≤ initBytes.length) :
+    let desc : StaticTyDesc :=
+      .composite freezeSz [(0, .freezeScalar freezeSz), (freezeSz, .unsafeCell 0)]
+    (staticFreezeSegments desc).2 = [⟨0, freezeSz, .freeze⟩] ∧
+    ((staticFreezeSegments desc).2.any (fun seg => seg.kind == .unsafeCell)) = false ∧
+    desc.isSyntacticFreeze = false ∧
+    staticAllocMutability desc = .mut ∧
+    evalRawMutStaticWriteMiri desc
+      (retagStaticPreservedAt rootTag childTag allocId desc initBytes) writeOff newBytes = .ub ∧
+    ∃ st', evalRawMutStaticWriteMiri desc
+      (retagStaticErasedAt rootTag allocId desc initBytes) writeOff newBytes = .ok st' := by
+  intro desc
+  have hsegs : staticFreezeSegments desc = (freezeSz, [⟨0, freezeSz, .freeze⟩]) := by
+    simp [desc, staticFreezeSegments, buildFreezeSegmentsFields, buildFreezeSegmentsDesc,
+      endCursorOfSegments, hfzPos]
+  have hmut : staticAllocMutability desc = .mut := by
+    simp [desc, staticAllocMutability, StaticTyDesc.isSyntacticFreeze, staticFieldsSyntacticFreeze]
+  have hlen0 : Nat.beq newBytes.length 0 = false := by
+    cases h : newBytes.length with
+    | zero => omega
+    | succ _ => rfl
+  have htag_ne : Nat.beq rootTag childTag = false := by
+    cases h : Nat.beq rootTag childTag with
+    | false => rfl
+    | true => exact False.elim (hneTag (Nat.eq_of_beq_eq_true h))
+  have hbA : decide (freezeSz < writeOff + newBytes.length) = false := decide_eq_false (by omega)
+  have hbB : decide (initBytes.length < writeOff + newBytes.length) = false := decide_eq_false (by omega)
+  have hov : byteRangesOverlapBool 0 freezeSz writeOff newBytes.length = true := by
+    unfold byteRangesOverlapBool
+    cases hfz : freezeSz with
+    | zero => omega
+    | succ f =>
+      cases hnb : newBytes.length with
+      | zero => omega
+      | succ k =>
+        rw [hfz, hnb] at hb₁
+        have hd1 : Nat.ble 1 (writeOff + (k + 1)) = true := Nat.ble_eq.mpr (by omega)
+        have hd2 : Nat.ble (writeOff + 1) (0 + (f + 1)) = true := Nat.ble_eq.mpr (by omega)
+        change (!(Nat.beq (f + 1) 0) && (!(Nat.beq (k + 1) 0) &&
+          (Nat.ble 1 (writeOff + (k + 1)) && Nat.ble (writeOff + 1) (0 + (f + 1))))) = true
+        rw [hd1, hd2]
+        rfl
+  have hovRoot :
+      byteRangeOverlapsWrite ⟨rootTag, allocId, 0, freezeSz, .active, none⟩ allocId writeOff
+        newBytes.length = true := by
+    unfold byteRangeOverlapsWrite
+    simp [Nat.beq_refl, hov]
+  have hovChild :
+      byteRangeOverlapsWrite ⟨childTag, allocId, 0, freezeSz, .frozen, none⟩ allocId writeOff
+        newBytes.length = true := by
+    unfold byteRangeOverlapsWrite
+    simp [Nat.beq_refl, hov]
+  refine ⟨by rw [hsegs], by rw [hsegs]; rfl, rfl, hmut, ?_, ?_⟩
+  · unfold evalRawMutStaticWriteMiri evalRawMutStaticWrite retagStaticPreservedAt
+    rw [hmut, hsegs]
+    dsimp only [List.map, StaticSegmentKind.sharedRetagPerm, TreeBorrowPerm.toAbstractPerm]
+    rw [hbA, hbB]
+    have hstep2 :
+        stepStaticPermsOnWrite allocId childTag writeOff newBytes.length
+          [⟨childTag, allocId, 0, freezeSz, .frozen, none⟩] rootTag = none := by
+      unfold stepStaticPermsOnWrite
+      simp [hlen0, Nat.beq_refl, hovChild, stepSelfWriteByteRange, permAllowsWrite]
+    have hstep1 :
+        stepStaticPermsOnWrite allocId childTag writeOff newBytes.length
+          [⟨rootTag, allocId, 0, freezeSz, .active, none⟩,
+           ⟨childTag, allocId, 0, freezeSz, .frozen, none⟩] rootTag = none := by
+      unfold stepStaticPermsOnWrite
+      rw [hlen0]
+      simp [htag_ne, Nat.beq_refl, hovRoot, stepSelfWriteByteRange, permAllowsWrite,
+        permAfterSelfWrite, hstep2]
+    rw [hstep1]
+    rfl
+  · refine ⟨{
+      retagStaticErasedAt rootTag allocId desc initBytes with
+      bytes := (writeAbstractBytesAt initBytes writeOff newBytes).getD initBytes
+    }, ?_⟩
+    unfold evalRawMutStaticWriteMiri evalRawMutStaticWrite retagStaticErasedAt
+    rw [hmut, hsegs]
+    dsimp only
+    rw [hbA, hbB]
+    have hstep :
+        stepStaticPermsOnWrite allocId rootTag writeOff newBytes.length
+          [⟨rootTag, allocId, 0, freezeSz, .active, none⟩] rootTag =
+        some [⟨rootTag, allocId, 0, freezeSz, .active, none⟩] := by
+      unfold stepStaticPermsOnWrite
+      rw [hlen0]
+      simp [Nat.beq_refl, hovRoot, stepSelfWriteByteRange, permAllowsWrite,
+        permAfterSelfWrite, stepStaticPermsOnWrite]
+    rw [hstep]
+    rfl
 
 /-! ## Section 4: Part 3 — Array `[T; N]` `Sized` Fast-Path (`lean-miri#79`), Principal-Less `dyn Send` VTables (`lean-miri#75`), & Null-VTable Precedence (`lean-miri#82`) -/
 
@@ -8131,16 +8575,19 @@ def validateWideDynLegacyDataFirst (w : KeyedAllocWorld) (reg : VTableRegistry) 
   | .maybeNull _ _ => throw (WideDynValidityErr.nullSafePointer true)
   | _ => validateWideDynSafePtr w reg maxSize expectedSpec mayDangle dataPtr vtablePtr
 
-/-- **General Precedence Theorem (`wideDyn_invalidVTable_precedes_all_data_ub`, `lean-miri#82`)**:
-whenever `validateVTableHalf` fails with `vErr`, `validateWideDynSafePtr` deterministically returns
-`.error vErr` **regardless** of `dataPtr` (even when `dataPtr` is simultaneously `.null`,
-`.maybeNull`, `.danglingInt`, dead, out-of-bounds, or unaligned)! -/
+/-- **General Precedence Theorem (`wideDyn_invalidVTable_precedes_all_data_ub`, `lean-miri#82`,
+mode-generalized `[adv A3]`)**: whenever `validateVTableHalf` fails with `vErr`,
+`validateWideDynSafePtr` deterministically returns `.error vErr` **regardless** of `dataPtr` or
+`recursive` mode (even when `dataPtr` is simultaneously `.null`, `.maybeNull`, `.danglingInt`, dead,
+out-of-bounds, or unaligned)! -/
 theorem wideDyn_invalidVTable_precedes_all_data_ub
     (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
     (expectedSpec : DynExistentialSpec) (mayDangle : Bool)
     (dataPtr vtablePtr : ScalarPtrHalf) (vErr : WideDynValidityErr)
-    (hv : validateVTableHalf w reg vtablePtr expectedSpec = .error vErr) :
-    validateWideDynSafePtr w reg maxSize expectedSpec mayDangle dataPtr vtablePtr = .error vErr := by
+    (hv : validateVTableHalf w reg vtablePtr expectedSpec = .error vErr)
+    (recursive : Bool := false) :
+    validateWideDynSafePtr w reg maxSize expectedSpec mayDangle dataPtr vtablePtr recursive =
+      .error vErr := by
   unfold validateWideDynSafePtr
   simp [hv, Bind.bind, Except.bind]
 
@@ -8156,16 +8603,17 @@ theorem wideDyn_doubleNull_separation
       .error (.nullSafePointer false) := by
   exact ⟨rfl, rfl⟩
 
-/-- **Valid-VTable Preservation Theorem (`wideDyn_validVTable_nullData_reports_nullSafePointer`)**:
-whenever `vtablePtr` resolves to a valid matching `VTableDescriptor`, a null `dataPtr` still
-deterministically faults with `.error (.nullSafePointer false)` under both `mayDangle = false` and
-`mayDangle = true` (even for zero-sized `sizeBytes = 0` concrete types!). -/
+/-- **Valid-VTable Preservation Theorem (`wideDyn_validVTable_nullData_reports_nullSafePointer`,
+mode-generalized `[adv A3]`)**: whenever `vtablePtr` resolves to a valid matching `VTableDescriptor`,
+a null `dataPtr` still deterministically faults with `.error (.nullSafePointer false)` under both
+`mayDangle = false` and `mayDangle = true` and both `recursive` settings! -/
 theorem wideDyn_validVTable_nullData_reports_nullSafePointer
     (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
     (expectedSpec : DynExistentialSpec) (mayDangle : Bool)
     (vtablePtr : ScalarPtrHalf) (desc : VTableDescriptor)
-    (hv : validateVTableHalf w reg vtablePtr expectedSpec = .ok desc) :
-    validateWideDynSafePtr w reg maxSize expectedSpec mayDangle .null vtablePtr =
+    (hv : validateVTableHalf w reg vtablePtr expectedSpec = .ok desc)
+    (recursive : Bool := false) :
+    validateWideDynSafePtr w reg maxSize expectedSpec mayDangle .null vtablePtr recursive =
       .error (.nullSafePointer false) := by
   unfold validateWideDynSafePtr
   cases mayDangle <;> simp [hv, Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
@@ -8369,33 +8817,35 @@ def validateRawWideDynPtrMeta (w : KeyedAllocWorld) (reg : VTableRegistry)
   (validateVTableHalf w reg vtablePtr expectedSpec).map (fun _ => ())
 
 /-- **Raw Wide `dyn` Pointers: VTable Identity Checked, Data Half Unchecked
-(`rawWideDyn_vtable_checked_data_unchecked`, `[adv B3]`)**: for every world, registry, expected spec
-and vtable half:
+(`rawWideDyn_vtable_checked_data_unchecked`, `[adv B3]`, mode-generalized `[adv A3]`)**: for every
+world, registry, expected spec, vtable half, and validation mode `recursive`:
 1. the raw check fails with exactly the vtable error the *safe* validator reports first for **every**
-   data half (`wideDyn_invalidVTable_precedes_all_data_ub`), and
+   data half and **both** `recursive` settings (`wideDyn_invalidVTable_precedes_all_data_ub`), and
 2. whenever the vtable is valid the raw check succeeds, although the safe validator still rejects a
-   null data half (`.nullSafePointer false`) — raw pointers skip all data-pointer checks. -/
+   null data half (`.nullSafePointer false`) in both `recursive` settings — raw pointers skip all
+   data-pointer checks. -/
 theorem rawWideDyn_vtable_checked_data_unchecked
     (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
     (expectedSpec : DynExistentialSpec) (vtablePtr : ScalarPtrHalf) (mayDangle : Bool) :
-    (∀ (vErr : WideDynValidityErr) (dataPtr : ScalarPtrHalf),
+    (∀ (vErr : WideDynValidityErr) (dataPtr : ScalarPtrHalf) (recursive : Bool),
       validateVTableHalf w reg vtablePtr expectedSpec = .error vErr →
       validateRawWideDynPtrMeta w reg expectedSpec vtablePtr = .error vErr ∧
-      validateWideDynSafePtr w reg maxSize expectedSpec mayDangle dataPtr vtablePtr = .error vErr) ∧
-    (∀ (desc : VTableDescriptor),
+      validateWideDynSafePtr w reg maxSize expectedSpec mayDangle dataPtr vtablePtr recursive =
+        .error vErr) ∧
+    (∀ (desc : VTableDescriptor) (recursive : Bool),
       validateVTableHalf w reg vtablePtr expectedSpec = .ok desc →
       validateRawWideDynPtrMeta w reg expectedSpec vtablePtr = .ok () ∧
-      validateWideDynSafePtr w reg maxSize expectedSpec mayDangle .null vtablePtr =
+      validateWideDynSafePtr w reg maxSize expectedSpec mayDangle .null vtablePtr recursive =
         .error (.nullSafePointer false)) := by
-  refine ⟨fun vErr dataPtr hv => ⟨?_, ?_⟩, fun desc hv => ⟨?_, ?_⟩⟩
+  refine ⟨fun vErr dataPtr recursive hv => ⟨?_, ?_⟩, fun desc recursive hv => ⟨?_, ?_⟩⟩
   · unfold validateRawWideDynPtrMeta
     rw [hv]; rfl
   · exact wideDyn_invalidVTable_precedes_all_data_ub w reg maxSize expectedSpec mayDangle
-      dataPtr vtablePtr vErr hv
+      dataPtr vtablePtr vErr hv recursive
   · unfold validateRawWideDynPtrMeta
     rw [hv]; rfl
   · exact wideDyn_validVTable_nullData_reports_nullSafePointer w reg maxSize expectedSpec mayDangle
-      vtablePtr desc hv
+      vtablePtr desc hv recursive
 
 /-- **The `ProtoTy`-Level Raw `dyn` Check Is Shape-Only
 (`rawWideDyn_shapeCheck_misses_invalid_vtable`, `[adv B3]`)**: for every *non-null* integer vtable
@@ -8576,5 +9026,420 @@ theorem saltedVTable_distinct_salts_distinct_allocIds_both_valid
       rw [ExtTreeMap0.get?_insert_self]
     unfold validateVTableHalf
     simp [d₂, hg2, ha2, hselfMatch]
+
+/-! ### `[adv A3]` Unified End-to-End Raw-Pointer Validator (`validateRawPtrFull`) & Recursive `childSession` Pointed-To Memory Validation (`validateWideDynSafePtrWithBytes`) -/
+
+mutual
+
+/-- Extract the dynamic trait name from a `ProtoTy`'s recursive unsized tail (`[adv A3]`), bridging
+Part 3A's `ProtoTy` (including custom struct/tuple DSTs such as `MyDynDst(u32, dyn Debug)`) to
+Part 3B/3C's `DynExistentialSpec` and `validateRawWideDynPtrMeta` (`B3` open item `(ii)`). -/
+def unsizedDynTailTrait? : ProtoTy → Option String
+  | .dynamic tr => some tr
+  | .tuple fields => fieldsUnsizedDynTailTrait? none fields
+  | .adt _ fields => fieldsUnsizedDynTailTrait? none fields
+  | _ => none
+
+def fieldsUnsizedDynTailTrait? (acc : Option String) : List ProtoTy → Option String
+  | [] => acc
+  | f :: fs => fieldsUnsizedDynTailTrait? (unsizedDynTailTrait? f) fs
+
+end
+
+mutual
+
+/-- **`unsizedDynTailTrait?` Iff `.dynMeta` Tail (`unsizedDynTailTrait?_isSome_eq_dynMeta`,
+`[adv A3]`)**: across all nested tuples and ADTs, `unsizedDynTailTrait? ty` returns `some _` if and
+only if `unsizedMetadataTail ty == some .dynMeta`. -/
+theorem unsizedDynTailTrait?_isSome_eq_dynMeta :
+    ∀ (ty : ProtoTy), (unsizedDynTailTrait? ty).isSome = (unsizedMetadataTail ty == some .dynMeta)
+  | .bool | .char | .u8 | .u16 | .u32 | .u64 | .usize | .i32 | .i64 | .isize | .never => rfl
+  | .rawPtr _ _ | .ref _ _ | .fnPtr => rfl
+  | .array _ _ | .str | .slice _ | .foreign _ => rfl
+  | .dynamic _ => rfl
+  | .tuple fields => fieldsDynTailTrait?_isSome_eq_dynMeta none none fields rfl
+  | .adt _ fields => fieldsDynTailTrait?_isSome_eq_dynMeta none none fields rfl
+
+theorem fieldsDynTailTrait?_isSome_eq_dynMeta
+    (accTr : Option String) (accMk : Option UnsizedMetaKind) :
+    ∀ (fields : List ProtoTy),
+      accTr.isSome = (accMk == some .dynMeta) →
+      (fieldsUnsizedDynTailTrait? accTr fields).isSome =
+        (fieldsUnsizedMetadataTail accMk fields == some .dynMeta)
+  | [], hacc => hacc
+  | f :: fs, _ => by
+    unfold fieldsUnsizedDynTailTrait? fieldsUnsizedMetadataTail
+    exact fieldsDynTailTrait?_isSome_eq_dynMeta (unsizedDynTailTrait? f) (unsizedMetadataTail f) fs
+      (unsizedDynTailTrait?_isSome_eq_dynMeta f)
+
+end
+
+/-- Full raw-pointer runtime representation carrying `ScalarPtrHalf` (including provenance and byte
+offsets!) for both data and vtable words (`[adv A3]`), closing `PtrReprVal.wideDyn`'s inability to
+represent nonzero vtable offsets (`B3` open item `(ii)`). -/
+inductive FullRawPtrVal where
+  | thin (dataHalf : ScalarPtrHalf)
+  | wideSlice (dataHalf : ScalarPtrHalf) (elemCount : UInt64)
+  | wideDyn (dataHalf : ScalarPtrHalf) (vtableHalf : ScalarPtrHalf)
+  deriving DecidableEq, Repr
+
+inductive FullRawPtrErr where
+  | layoutErr (err : LayoutComputeErr)
+  | expectedThinRawPtr
+  | expectedWideSliceMeta
+  | expectedWideDynMeta
+  | vtableErr (err : WideDynValidityErr)
+  deriving DecidableEq, Repr
+
+/-- **Unified Upstream-Faithful Raw-Pointer Validator (`validateRawPtrFull`, `[adv A3]`)**,
+combining Part 3A (`lean-miri#79`), Part 3B (`lean-miri#75`), and Part 3C (`lean-miri#82`) in exact
+`ValidityVisitor.primitive .rawPointer _ sized` (`ValidityVisitor.lean:184–195, 317–327`) +
+`PointerPlaceMachine.fromImmediate` (`PointerPlaceMachine.lean:81`) order:
+1. `isSyntacticallySized pointee = true`: checks thinness in `O(1)` without querying `computeTyLayout`
+   or vtables (accepting `*const [u8; usize::MAX]` and `*const [*const dyn Send; usize::MAX]`).
+2. `isSyntacticallySized pointee = false`:
+   - **First** queries `computeTyLayout maxSize pointee` (`fromImmediate`, line 81), so an unsized
+     DST with an overflowing head (`*const ([u8; usize::MAX], dyn Send)`) fails with `.layoutErr`
+     *before* `checkMetadata` inspects its (possibly null) vtable!
+   - **Then** dispatches on `unsizedMetadataTail pointee` (`checkMetadata`, lines 186–195), routing
+     `.dynMeta` tails (both bare `*const dyn Trait` and custom DSTs `*const MyDynDst(u32, dyn Trait)`)
+     through `validateRawWideDynPtrMeta` while leaving `dataHalf` completely unchecked! -/
+def validateRawPtrFull (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (resolveTrait : String → DynExistentialSpec) (maxSize : Nat)
+    (pointee : ProtoTy) (val : FullRawPtrVal) : Except FullRawPtrErr Unit :=
+  if isSyntacticallySized pointee then
+    match val with
+    | .thin _ => .ok ()
+    | _ => .error .expectedThinRawPtr
+  else do
+    let _ ← (computeTyLayout maxSize pointee).mapError FullRawPtrErr.layoutErr
+    match unsizedMetadataTail pointee with
+    | none => .error .expectedWideSliceMeta
+    | some .sliceMeta =>
+      match val with
+      | .wideSlice _ _ => .ok ()
+      | _ => .error .expectedWideSliceMeta
+    | some .externThin =>
+      match val with
+      | .thin _ => .ok ()
+      | _ => .error .expectedThinRawPtr
+    | some .dynMeta =>
+      match val, unsizedDynTailTrait? pointee with
+      | .wideDyn _ vtableHalf, some tr =>
+        (validateRawWideDynPtrMeta w reg (resolveTrait tr) vtableHalf).mapError FullRawPtrErr.vtableErr
+      | _, _ => .error .expectedWideDynMeta
+
+/-- **Sized Fast-Path Preservation on `validateRawPtrFull`
+(`validateRawPtrFull_sized_skips_layout_and_vtable`, `[adv A3]`)**: for every syntactically `Sized`
+pointee (including oversized `[T; N]`), `validateRawPtrFull` accepts any thin raw pointer in `O(1)`
+independently of `maxSize`, `w`, and `reg`. -/
+theorem validateRawPtrFull_sized_skips_layout_and_vtable
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (resolveTrait : String → DynExistentialSpec)
+    (maxSize : Nat) (pointee : ProtoTy) (dataHalf : ScalarPtrHalf)
+    (hsized : isSyntacticallySized pointee = true) :
+    validateRawPtrFull w reg resolveTrait maxSize pointee (.thin dataHalf) = .ok () := by
+  unfold validateRawPtrFull
+  rw [hsized]
+  rfl
+
+private theorem roundUpToAlign_one_eq (n : Nat) : roundUpToAlign n 1 = n := by
+  unfold roundUpToAlign
+  have hm : Nat.mod n 1 = 0 := Nat.mod_one n
+  simp [hm]
+
+/-- **Custom `dyn`-DST Layout-Before-VTable Precedence & VTable-Identity Round-Trip
+(`validateRawPtrFull_customDynDst_layout_and_vtable_soundness`, `[adv A3]`)**: discharges B3 open
+item `(ii)` end-to-end across Parts 3A, 3B, and 3C:
+1. On `*const ([elem; count], dyn tr)` whose sized head `[elem; count]` overflows `maxSize`, even
+   when `dataHalf = .null` and `vtableHalf = .null`, `validateRawPtrFull` reports
+   `.error (.layoutErr (.sizeOverflow ...))` *before* `.vtableErr .invalidVTableNull` (matching
+   `PointerPlaceMachine.fromImmediate` line 81 before `checkMetadata` line 186).
+2. On a layout-valid custom struct DST `*const MyDynDst(headTy, dyn tr)`:
+   - every invalid vtable (`null`, `danglingInt 0x1000`, nonzero offset `off ≠ 0`, or trait mismatch)
+     is rejected with `.error (.vtableErr vErr)` (closing `validateRawPtrFastPath`'s shape-only gap!),
+   - every valid vtable succeeds with `.ok ()` for *every* `dataHalf` (including `.null`)! -/
+theorem validateRawPtrFull_customDynDst_layout_and_vtable_soundness
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (resolveTrait : String → DynExistentialSpec)
+    (maxSize : Nat) (elem headTy : ProtoTy) (el hl : ComputedTyLayout) (count : Nat)
+    (dp tr : String) (hel : computeTyLayout maxSize elem = .ok el)
+    (helSz : el.isSized = true) (hoverflow : el.sizeBytes * count > maxSize)
+    (hhead : computeTyLayout maxSize headTy = .ok hl) (hheadSz : hl.isSized = true)
+    (hheadFit : roundUpToAlign (roundUpToAlign 0 hl.alignBytes + hl.sizeBytes) 1 ≤ maxSize) :
+    validateRawPtrFull w reg resolveTrait maxSize (.tuple [.array elem count, .dynamic tr])
+      (.wideDyn .null .null) =
+      .error (.layoutErr (.sizeOverflow (el.sizeBytes * count) maxSize)) ∧
+    (∀ (vErr : WideDynValidityErr) (dataHalf vtableHalf : ScalarPtrHalf),
+      validateVTableHalf w reg vtableHalf (resolveTrait tr) = .error vErr →
+      validateRawPtrFull w reg resolveTrait maxSize (.adt dp [headTy, .dynamic tr])
+        (.wideDyn dataHalf vtableHalf) = .error (.vtableErr vErr)) ∧
+    (∀ (desc : VTableDescriptor) (dataHalf vtableHalf : ScalarPtrHalf),
+      validateVTableHalf w reg vtableHalf (resolveTrait tr) = .ok desc →
+      validateRawPtrFull w reg resolveTrait maxSize (.adt dp [headTy, .dynamic tr])
+        (.wideDyn dataHalf vtableHalf) = .ok ()) := by
+  have harr : computeTyLayout maxSize (.array elem count) =
+      .error (.sizeOverflow (el.sizeBytes * count) maxSize) := by
+    unfold computeTyLayout
+    simp [hel, helSz, hoverflow, Bind.bind, Except.bind, throw, throwThe, MonadExceptOf.throw]
+  have hfirstGtFalse : ¬ (roundUpToAlign 0 hl.alignBytes + hl.sizeBytes > maxSize) := by
+    have hle := roundUpToAlign_one_eq (roundUpToAlign 0 hl.alignBytes + hl.sizeBytes)
+    omega
+  have hadtOk :
+      computeTyLayout maxSize (.adt dp [headTy, .dynamic tr]) =
+        .ok ⟨roundUpToAlign (roundUpToAlign 0 hl.alignBytes + hl.sizeBytes) 1,
+             Nat.max (Nat.max 1 hl.alignBytes) 1, false, hl.isInhabited⟩ := by
+    unfold computeTyLayout computeFieldsLayout
+    simp only [hhead, hheadSz, hfirstGtFalse, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+      Bool.true_and, Bind.bind, Except.bind]
+    unfold computeFieldsLayout
+    have hdyn : computeTyLayout maxSize (.dynamic tr) = .ok ⟨0, 1, false, true⟩ := rfl
+    have hnotGt2 : ¬ (roundUpToAlign (roundUpToAlign 0 hl.alignBytes + hl.sizeBytes) 1 > maxSize) := by
+      omega
+    simp [hdyn, hnotGt2, Bind.bind, Except.bind, Pure.pure, Except.pure]
+  have hunszAdt : isSyntacticallySized (.adt dp [headTy, .dynamic tr]) = false := rfl
+  have htailAdt : unsizedMetadataTail (.adt dp [headTy, .dynamic tr]) = some .dynMeta := rfl
+  have htrAdt : unsizedDynTailTrait? (.adt dp [headTy, .dynamic tr]) = some tr := rfl
+  refine ⟨?_, ?_, ?_⟩
+  · unfold validateRawPtrFull
+    have hunszTup : isSyntacticallySized (.tuple [.array elem count, .dynamic tr]) = false := rfl
+    have htupErr : computeTyLayout maxSize (.tuple [.array elem count, .dynamic tr]) =
+        .error (.sizeOverflow (el.sizeBytes * count) maxSize) := by
+      unfold computeTyLayout computeFieldsLayout
+      simp [harr, Bind.bind, Except.bind]
+    simp [hunszTup, htupErr, Except.mapError, Bind.bind, Except.bind]
+  · intro vErr dataHalf vtableHalf hvErr
+    unfold validateRawPtrFull validateRawWideDynPtrMeta
+    simp [hunszAdt, hadtOk, htailAdt, htrAdt, hvErr, Except.mapError, Except.map,
+      Bind.bind, Except.bind]
+  · intro desc dataHalf vtableHalf hvOk
+    unfold validateRawPtrFull validateRawWideDynPtrMeta
+    simp [hunszAdt, hadtOk, htailAdt, htrAdt, hvOk, Except.mapError, Except.map,
+      Bind.bind, Except.bind]
+
+/-- Deferred recursive `childSession` pointee errors (`ValidityVisitor.lean:302–329, 412–418, 527–556`,
+`[adv A3]`, discharging B3 open item `(iii)`). -/
+inductive TrackedDynPointeeErr where
+  | uninhabitedPointee
+  | uninitPointeeByte
+  | invalidBoolScalar (byte : UInt8)
+  | nestedAddressTooClose (sizeBytes : Nat)
+  | nullNestedSafePtr
+  | uninhabitedNestedSafePtr
+  | unalignedNestedSafePtr (requiredAlign : Nat) (actualAddr : UInt64)
+  deriving DecidableEq, Repr
+
+inductive WideDynFullErr where
+  | rootErr (err : WideDynValidityErr)
+  | pointeeErr (err : TrackedDynPointeeErr)
+  deriving DecidableEq, Repr
+
+def decodeLittleEndianU64 : List AbstractByte → UInt64
+  | [] => 0
+  | .uninit :: _ => 0
+  | .init b _ :: rest => (UInt64.ofNat b.toNat) + 256 * decodeLittleEndianU64 rest
+
+def allBytesWithoutProvenance : List AbstractByte → Bool
+  | [] => true
+  | .uninit :: _ => false
+  | .init _ (some _) :: _ => false
+  | .init _ none :: rest => allBytesWithoutProvenance rest
+
+/-- Deferred recursive reference-tracker visitor on the unpacked concrete pointee of `&dyn Trait`
+(`ValidityVisitor.lean:302–329, 412–418, 552`, `[adv A3]`):
+`validatePlace … (recursive := true)` pops each tracked `(mplace, dyn Trait)` under
+`childSession := { flags := { reset := false, mayDangle := true }, refTracking := none }`, unpacks
+`dyn Trait` to `desc.concreteTy`, and visits the pointee slice in `w.live`:
+- `.bool` reads 1 byte (`lines 308–310`): `.uninit` -> `.uninitPointeeByte`, `b > 1` ->
+  `.invalidBoolScalar b`, `0` or `1` -> `.ok ()`.
+- Integer/char scalars require `lay.sizeBytes` initialized bytes (`line 308`).
+- Nested safe references `.ref _ innerPt` run `checkSafe` under `childSession`
+  (`flags.mayDangle = true`, `refTracking = none`, `lines 198–241, 552`): initialized 8-byte read,
+  integer `addressTooClose`, non-null, `opsemInhabited innerPt`, and alignment still run, while
+  `checkPointerAccess` and further `refTracking` are skipped — so an aligned non-null **dangling**
+  integer `&u32` inside `&(&u32 as dyn Send)` **succeeds** even under `-Zmiri-recursive-validation`,
+  whereas `&!` inside `&(&! as dyn Sync)` fails `opsemInhabited` (`line 226`)! -/
+def visitTrackedConcretePointee (maxSize : Nat) (concreteTy : ProtoTy)
+    (pointeeSlice : List AbstractByte) : Except TrackedDynPointeeErr Unit := do
+  let lay ←
+    match computeTyLayout maxSize concreteTy with
+    | .ok l => .ok l
+    | .error _ => .error .uninhabitedPointee
+  if !lay.isInhabited then
+    throw .uninhabitedPointee
+  match concreteTy with
+  | .bool =>
+    match pointeeSlice with
+    | [.init b _] =>
+      if b ≤ 1 then .ok () else .error (.invalidBoolScalar b)
+    | _ => .error .uninitPointeeByte
+  | .u8 | .u16 | .char | .u32 | .u64 | .usize | .i32 | .i64 | .isize =>
+    if !(Nat.beq pointeeSlice.length lay.sizeBytes) || !(allBytesInitialized pointeeSlice) then
+      .error .uninitPointeeByte
+    else
+      .ok ()
+  | .ref _ innerPt =>
+    if !(Nat.beq pointeeSlice.length 8) || !(allBytesInitialized pointeeSlice) then
+      throw .uninitPointeeByte
+    let innerLay ←
+      match computeTyLayout maxSize innerPt with
+      | .ok il => .ok il
+      | .error _ => .error .uninhabitedNestedSafePtr
+    let addr := decodeLittleEndianU64 pointeeSlice
+    if allBytesWithoutProvenance pointeeSlice &&
+        decide (addr.toNat + innerLay.sizeBytes ≥ usizeMax64) then
+      throw (.nestedAddressTooClose innerLay.sizeBytes)
+    if addr == 0 then
+      throw .nullNestedSafePtr
+    if !innerLay.isInhabited then
+      throw .uninhabitedNestedSafePtr
+    if innerLay.alignBytes > 0 && (addr.toNat % innerLay.alignBytes != 0) then
+      throw (.unalignedNestedSafePtr innerLay.alignBytes addr)
+    return ()
+  | _ =>
+    if !(Nat.beq pointeeSlice.length lay.sizeBytes) then
+      .error .uninitPointeeByte
+    else
+      .ok ()
+
+/-- Memory-content-aware wide `dyn` safe-pointer validator (`[adv A3]`, discharging B3 open item
+`(iii)`): runs `validateWideDynSafePtr` on the root pointer first, and under `recursive && !mayDangle`
+additionally runs `visitTrackedConcretePointee` (`childSession` `mayDangle = true, refTracking = none`)
+on `(liveEntry.bytes.drop dataOff).take sz`. -/
+def validateWideDynSafePtrWithBytes (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
+    (expectedSpec : DynExistentialSpec) (mayDangle : Bool)
+    (dataPtr vtablePtr : ScalarPtrHalf) (recursive : Bool := false) :
+    Except WideDynFullErr (ProtoTy × UInt64 × UInt64) := do
+  let rootRes ←
+    (validateWideDynSafePtr w reg maxSize expectedSpec mayDangle dataPtr vtablePtr recursive).mapError
+      WideDynFullErr.rootErr
+  let (concreteTy, sz, al) := rootRes
+  if recursive && !mayDangle then
+    match dataPtr with
+    | .provenanced _ dataId dataOff =>
+      let slice :=
+        match w.findLive? dataId with
+        | some liveEntry => (liveEntry.bytes.drop dataOff.toNat).take sz.toNat
+        | none => []
+      (visitTrackedConcretePointee maxSize concreteTy slice).mapError WideDynFullErr.pointeeErr
+      return (concreteTy, sz, al)
+    | _ => return (concreteTy, sz, al)
+  else
+    return (concreteTy, sz, al)
+
+private theorem validateVTableHalf_insertLive_eq
+    (w : KeyedAllocWorld) (id : MiriAllocId) (e : LocalAllocEntry)
+    (reg : VTableRegistry) (vt : ScalarPtrHalf) (spec : DynExistentialSpec) :
+    validateVTableHalf (w.insertLive id e) reg vt spec = validateVTableHalf w reg vt spec := by
+  unfold validateVTableHalf KeyedAllocWorld.findGlobal? KeyedAllocWorld.insertLive
+  cases vt <;> rfl
+
+/-- **Recursive Pointee Memory Validation & `childSession` `mayDangle = true` Theorem
+(`wideDyn_recursive_bytes_and_childSession_mayDangle`, `[adv A3]`)**: matching
+`ValidityVisitor.lean:198–241, 308–310, 412–418, 527–556`:
+1. Default non-recursive validation (`recursive = false`) accepts `&dyn Trait` pointing to `.uninit`
+   bytes or invalid `0x02 : bool` bytes, whereas `recursive = true` rejects `.uninit` with
+   `.pointeeErr .uninitPointeeByte` and `0x02 : bool` with `.pointeeErr (.invalidBoolScalar 2)`.
+2. Under `recursive = true`, the deferred tracker visits the unpacked concrete pointee under
+   `childSession` (`flags.mayDangle = true`, `refTracking = none`, `ValidityVisitor.lean:552`):
+   - a null nested `&u32` (`0x00`) faults with `.pointeeErr .nullNestedSafePtr`,
+   - an aligned non-null **dangling** integer `&u32` (`addr = 4`, no provenance) **succeeds** with
+     `.ok (.ref .not .u32, 8, 8)` because `childSession` sets `mayDangle = true` and stops tracking,
+   - a non-null aligned nested `&!` (`addr = 4`) still faults with
+     `.pointeeErr .uninhabitedNestedSafePtr` because `opsemInhabited` (`line 226`) runs even under
+     `mayDangle = true`! -/
+theorem wideDyn_recursive_bytes_and_childSession_mayDangle
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
+    (expectedSpec : DynExistentialSpec) (vtBool vtRefU32 vtRefNever : ScalarPtrHalf)
+    (descBool descRefU32 descRefNever : VTableDescriptor)
+    (dataId : MiriAllocId) (addr : UInt64)
+    (hvBool : validateVTableHalf w reg vtBool expectedSpec = .ok descBool)
+    (hctBool : descBool.concreteTy = .bool)
+    (hszBool : descBool.sizeBytes = 1)
+    (halBool : descBool.alignBytes = 1)
+    (hvRefU32 : validateVTableHalf w reg vtRefU32 expectedSpec = .ok descRefU32)
+    (hctRefU32 : descRefU32.concreteTy = .ref .not .u32)
+    (hszRefU32 : descRefU32.sizeBytes = 8)
+    (halRefU32 : descRefU32.alignBytes = 8)
+    (hvRefNever : validateVTableHalf w reg vtRefNever expectedSpec = .ok descRefNever)
+    (hctRefNever : descRefNever.concreteTy = .ref .not .never)
+    (hszRefNever : descRefNever.sizeBytes = 8)
+    (halRefNever : descRefNever.alignBytes = 8)
+    (hnz : addr ≠ 0)
+    (halign8 : addr % 8 = 0) :
+    let wUninit := w.insertLive dataId ⟨.heap, 8, 8, .mut, List.replicate 8 .uninit⟩
+    let wBadBool := w.insertLive dataId ⟨.heap, 8, 8, .mut, [.init 2 none]⟩
+    let wNullRef := w.insertLive dataId ⟨.heap, 8, 8, .mut, zeroInitBytes 8⟩
+    let wDangRef := w.insertLive dataId ⟨.heap, 8, 8, .mut, .init 4 none :: zeroInitBytes 7⟩
+    validateWideDynSafePtrWithBytes wUninit reg maxSize expectedSpec false
+      (.provenanced addr dataId 0) vtBool false = .ok (.bool, 1, 1) ∧
+    validateWideDynSafePtrWithBytes wUninit reg maxSize expectedSpec false
+      (.provenanced addr dataId 0) vtBool true = .error (.pointeeErr .uninitPointeeByte) ∧
+    validateWideDynSafePtrWithBytes wBadBool reg maxSize expectedSpec false
+      (.provenanced addr dataId 0) vtBool false = .ok (.bool, 1, 1) ∧
+    validateWideDynSafePtrWithBytes wBadBool reg maxSize expectedSpec false
+      (.provenanced addr dataId 0) vtBool true = .error (.pointeeErr (.invalidBoolScalar 2)) ∧
+    validateWideDynSafePtrWithBytes wNullRef reg maxSize expectedSpec false
+      (.provenanced addr dataId 0) vtRefU32 true = .error (.pointeeErr .nullNestedSafePtr) ∧
+    validateWideDynSafePtrWithBytes wDangRef reg maxSize expectedSpec false
+      (.provenanced addr dataId 0) vtRefU32 true = .ok (.ref .not .u32, 8, 8) ∧
+    validateWideDynSafePtrWithBytes wDangRef reg maxSize expectedSpec false
+      (.provenanced addr dataId 0) vtRefNever true = .error (.pointeeErr .uninhabitedNestedSafePtr) := by
+  intro wUninit wBadBool wNullRef wDangRef
+  have haddr0 : (addr == 0) = false := beq_false_of_ne hnz
+  have hmod1 : (addr % 1 != 0) = false := by
+    have h1 : addr % 1 = 0 := UInt64.mod_one
+    rw [h1]; rfl
+  have hmod8 : (addr % 8 != 0) = false := by rw [halign8]; rfl
+  have hvB : ∀ e, validateVTableHalf (w.insertLive dataId e) reg vtBool expectedSpec = .ok descBool :=
+    fun e => (validateVTableHalf_insertLive_eq w dataId e reg vtBool expectedSpec).trans hvBool
+  have hvRU : ∀ e, validateVTableHalf (w.insertLive dataId e) reg vtRefU32 expectedSpec = .ok descRefU32 :=
+    fun e => (validateVTableHalf_insertLive_eq w dataId e reg vtRefU32 expectedSpec).trans hvRefU32
+  have hvRN : ∀ e, validateVTableHalf (w.insertLive dataId e) reg vtRefNever expectedSpec = .ok descRefNever :=
+    fun e => (validateVTableHalf_insertLive_eq w dataId e reg vtRefNever expectedSpec).trans hvRefNever
+  have hinfo : ∀ bs, (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩).getAllocInfo dataId =
+      .ok ⟨8, 8, .liveData, .mut⟩ := by
+    intro bs
+    unfold KeyedAllocWorld.getAllocInfo KeyedAllocWorld.findLive? KeyedAllocWorld.insertLive
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
+  have hfind : ∀ bs, (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩).findLive? dataId =
+      some ⟨.heap, 8, 8, .mut, bs⟩ := by
+    intro bs
+    unfold KeyedAllocWorld.findLive? KeyedAllocWorld.insertLive
+    exact ExtTreeMap0.get?_insert_self _ _ _
+  have hrootB : ∀ bs rec,
+      validateWideDynSafePtr (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩) reg maxSize
+        expectedSpec false (.provenanced addr dataId 0) vtBool rec = .ok (.bool, 1, 1) := by
+    intro bs rec
+    unfold validateWideDynSafePtr
+    rw [hvB]
+    dsimp only [Bind.bind, Except.bind]
+    rw [hszBool, halBool, hctBool, hinfo, haddr0, hmod1]
+    cases rec <;> rfl
+  have hrootRU : ∀ bs rec,
+      validateWideDynSafePtr (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩) reg maxSize
+        expectedSpec false (.provenanced addr dataId 0) vtRefU32 rec = .ok (.ref .not .u32, 8, 8) := by
+    intro bs rec
+    unfold validateWideDynSafePtr
+    rw [hvRU]
+    dsimp only [Bind.bind, Except.bind]
+    rw [hszRefU32, halRefU32, hctRefU32, hinfo, haddr0, hmod8]
+    cases rec <;> rfl
+  have hrootRN : ∀ bs rec,
+      validateWideDynSafePtr (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩) reg maxSize
+        expectedSpec false (.provenanced addr dataId 0) vtRefNever rec = .ok (.ref .not .never, 8, 8) := by
+    intro bs rec
+    unfold validateWideDynSafePtr
+    rw [hvRN]
+    dsimp only [Bind.bind, Except.bind]
+    rw [hszRefNever, halRefNever, hctRefNever, hinfo, haddr0, hmod8]
+    cases rec <;> rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wUninit]; rw [hrootB]; rfl
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wUninit]; rw [hrootB, hfind]; rfl
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wBadBool]; rw [hrootB]; rfl
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wBadBool]; rw [hrootB, hfind]; rfl
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wNullRef]; rw [hrootRU, hfind]; rfl
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wDangRef]; rw [hrootRU, hfind]; rfl
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wDangRef]; rw [hrootRN, hfind]; rfl
 
 end Anneal.ExtTreeMapAllocAndNoWritableProto

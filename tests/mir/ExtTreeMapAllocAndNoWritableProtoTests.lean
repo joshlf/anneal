@@ -797,6 +797,35 @@ theorem canary_part1_allocateMachine_lifecycle_and_perThread_multiReader_clock :
     hLiveM (by decide) rfl hNoDeadM hClkM (by decide) (by decide) (by decide)
   exact ⟨⟨hrelAlloc.1, hrelAlloc.2, hokC.2.1⟩, hokU.2.1, hokS.2.1, hracePerThread, by decide +kernel⟩
 
+def unlistedReaderRaceWorld : KeyedAllocWorld :=
+  (KeyedAllocWorld.empty.insertLive testId1 entryHeap8).setRace testId1
+    ⟨1, 2, 5, false, some 3, []⟩
+
+/-- **`[adv A3]` Closed canary — `DeallocActor.ofVClock` unlisted-zero semantics vs. nonzero scalar
+fallback (`VectorClock.lean:221–223`)**:
+Thread `1` writes at `t = 2`, Thread `3` (absent from `entries = [(2, 10)]`) reads at `t = 5`:
+1. `DeallocActor.ofVClock 1 [(2, 10)]` evaluates `viewFor 3 = 0` (`VTimestamp.ZERO`) and catches
+   `.error (.hookFailure "DataRace")`.
+2. Mixing a nonzero scalar fallback `observedTimestamp = 10` with the partial list `[(2, 10)]`
+   (`⟨1, 10, [(2, 10)]⟩`) falsely treats unlisted Thread `3` as observed at `t = 10 ≥ 5` and
+   unsoundly returns `.ok ()` (closing B3's §1.1 scope `(iv)` gap). -/
+theorem canary_part1_ofVClock_unlisted_zero_vs_nonzeroFallback_race :
+    (DeallocActor.ofVClock 1 [(2, 10)]).viewFor 3 = 0 ∧
+    (unlistedReaderRaceWorld.deallocateMachine (.provenanced testId1 0) (some (8, 8)) .heap
+      (DeallocActor.ofVClock 1 [(2, 10)]) .ok).2.2 = .error (.hookFailure "DataRace") ∧
+    (unlistedReaderRaceWorld.deallocateMachine (.provenanced testId1 0) (some (8, 8)) .heap
+      ⟨1, 10, [(2, 10)]⟩ .ok).2.2 = .ok () := by
+  have hLive : unlistedReaderRaceWorld.findLive? testId1 = some entryHeap8 :=
+    ExtTreeMap0.get?_insert_self _ _ _
+  have hNoDead : unlistedReaderRaceWorld.findDead? testId1 = none :=
+    ExtTreeMap0.get?_empty _
+  have hClk : unlistedReaderRaceWorld.findRace? testId1 = some ⟨1, 2, 5, false, some 3, []⟩ :=
+    ExtTreeMap0.get?_insert_self _ _ _
+  exact deallocActor_ofVClock_catches_unlisted_reader_vs_nonzeroFallback
+    unlistedReaderRaceWorld testId1 entryHeap8 ⟨1, 2, 5, false, some 3, []⟩
+    1 3 10 [(2, 10)] hLive (by decide) rfl hNoDead hClk rfl rfl (by decide) (by decide)
+    (by decide) rfl (by decide)
+
 /-! ## Section 2: Part 2A & 2B Closed Canaries (`charon#1619/#1620` + `minirust#295`) -/
 
 def unpinFreezeFacts : RetagTypeFacts := ⟨true, true, true⟩
@@ -1413,6 +1442,57 @@ theorem canary_part2A_successEquivalence_and_errorOnlyDivergence :
   exact ⟨⟨hwfCF, by decide, hrev.2⟩, ⟨rW, hW, hiffW.1.mp hW, hiffW.2.mp (hiffW.1.mp hW)⟩,
     ⟨rN, hN, hiffN.2.mp (hiffN.1.mp hN)⟩⟩
 
+/-- **`[adv A3]` Closed canary — bottom-up `ancestorPathNodes` local diagnostic precedence vs.
+flat-list `checkAncestorsM` (`Traversal.lean:45–53, 114`)**:
+On a well-formed (`BorrowTreeTagsWF`) root-first world `[⟨1 (.frozen root)⟩, ⟨2 (protected
+.reservedFrz true child, parent = some 1)⟩]` retagging `parentTag = 2` under `.writableChildWrite`:
+1. `ancestorPathNodes` visits accessed node `2` first (`ancestorPathNodes_head`),
+2. A2's flat-list `checkAncestorsM` visits root `1` first and reports `.ancestorWriteForbidden`,
+3. Upgraded `execFnEntryMutRetagSourceOrder` walks `ancestorPathNodes` bottom-up (`[2, 1]`) and
+   reports `.conflictedProtectedChildWrite` (discharging B3 open item `(i)`). -/
+theorem canary_part2A_bottomUp_ancestorPath_precedence :
+    let wRootFirst : FnEntryBorrowWorld := {
+      allocId := 10
+      bytes := [.uninit, .uninit, .uninit, .uninit]
+      nodes := [
+        ⟨1, 10, 0, 4, .frozen, none, none⟩,
+        ⟨2, 10, 0, 4, .reservedFrz true, some 7, some 1⟩
+      ]
+      activeProtectors := ProtectorSet.empty.insert 7
+      nextTag := 3
+      nextProtector := 8
+    }
+    BorrowTreeTagsWF wRootFirst ∧
+    (ancestorPathNodes wRootFirst.nodes (wRootFirst.nodes.length + 1) 2).head? =
+      findTagNode? wRootFirst.nodes 2 ∧
+    checkAncestorsM wRootFirst.nodes 2
+      (stepNodeOnRangeWrite wRootFirst.nodes wRootFirst.activeProtectors 10 0 4 2)
+      wRootFirst.nodes = .error .ancestorWriteForbidden ∧
+    execFnEntryMutRetagSourceOrder wRootFirst 2 0 4 unpinFreezeFacts true .writableChildWrite =
+      .error .conflictedProtectedChildWrite := by
+  have hwfRF : BorrowTreeTagsWF {
+      allocId := 10
+      bytes := [.uninit, .uninit, .uninit, .uninit]
+      nodes := [
+        ⟨1, 10, 0, 4, .frozen, none, none⟩,
+        ⟨2, 10, 0, 4, .reservedFrz true, some 7, some 1⟩
+      ]
+      activeProtectors := ProtectorSet.empty.insert 7
+      nextTag := 3
+      nextProtector := 8 } := by
+    intro n hmem
+    rcases List.mem_cons.mp hmem with rfl | h1
+    · exact ⟨by decide, (fun p hp => nomatch hp), (fun pr hpr => nomatch hpr)⟩
+    · rcases List.mem_cons.mp h1 with rfl | h2
+      · refine ⟨by decide, fun p hp => by injection hp with hp'; subst hp'; decide,
+          fun pr hpr => by injection hpr with hpr'; subst hpr'; decide⟩
+      · nomatch h2
+  have hhead := ancestorPathNodes_head
+    [⟨1, 10, 0, 4, .frozen, none, none⟩, ⟨2, 10, 0, 4, .reservedFrz true, some 7, some 1⟩] 2 2
+  have hsep := execFnEntryMutRetagSourceOrder_bottomUp_vs_flatAncestors
+    10 4 [.uninit, .uninit, .uninit, .uninit] unpinFreezeFacts (by decide) (by decide) rfl
+  exact ⟨hwfRF, hhead, hsep⟩
+
 /-- **`[adv B1]` Closed canary — `charon#1620` separation under Miri's allocation mutability**:
 a mixed `(Freeze, UnsafeCell)` static is interned *mutable*, so the read-only check does not save
 the erased lowering: writing the `Freeze` `flag` byte through pre-`#1620` erased
@@ -1501,6 +1581,28 @@ theorem canary_part2B_general_mixed_static_miri_theorems :
     mixedCompositeInitBytes [(.init 1 none), (.init 2 none), (.init 3 none), (.init 4 none)]
     (by decide) (by decide) (by decide) (by decide) hhasUC (by decide)
   exact ⟨hsep1, hsep8, hucOk⟩
+
+/-- **`[adv A3]` Closed canary — zero-sized `UnsafeCell<()>` composite static separation under Miri
+allocation mutability (`rustc_const_eval/src/interpret/intern.rs:222–229` + `FreezeVisitor.lean:69`)**:
+On `static S: (u8, UnsafeCell<()>) = (42, UnsafeCell::new(()))` (`zstUcStaticDesc`):
+1. `FreezeVisitor` skips the `0`-byte `UnsafeCell<()>`, emitting **only** `[⟨0, 1, .freeze⟩]` (zero
+   `.unsafeCell` segments — B1's segment-scan `staticAllocMutability` falsely returned `.not`!),
+2. Yet `isSyntacticFreeze = false`, so rustc (`intern.rs:225`) interns `S` with
+   `staticAllocMutability = .mut`,
+3. Under `evalRawMutStaticWriteMiri`, `charon#1620`'s preserved temporary retag faults with `.ub` on
+   mutating byte `0`, whereas pre-`#1620` erased `&raw const S` unsoundly succeeds with `.ok`! -/
+theorem canary_part2B_zstUnsafeCell_composite_static_miri_separation :
+    let desc : StaticTyDesc := .composite 1 [(0, .freezeScalar 1), (1, .unsafeCell 0)]
+    (staticFreezeSegments desc).2 = [⟨0, 1, .freeze⟩] ∧
+    ((staticFreezeSegments desc).2.any (fun seg => seg.kind == .unsafeCell)) = false ∧
+    desc.isSyntacticFreeze = false ∧
+    staticAllocMutability desc = .mut ∧
+    evalRawMutStaticWriteMiri desc
+      (retagStaticPreservedAt 10 20 70 desc [(.init 42 none)]) 0 [(.init 99 none)] = .ub ∧
+    ∃ st', evalRawMutStaticWriteMiri desc
+      (retagStaticErasedAt 10 70 desc [(.init 42 none)]) 0 [(.init 99 none)] = .ok st' :=
+  static_zstUnsafeCell_composite_miri_separation 10 20 70 1 0
+    [(.init 42 none)] [(.init 99 none)] (by decide) (by decide) (by decide) (by decide) (by decide)
 
 /-! ## Section 3: Part 3A, 3B, & 3C Closed Canaries (`lean-miri#75/#79/#82`) -/
 
@@ -2244,8 +2346,12 @@ theorem canary_part3C_rawWideDyn_vtable_identity :
     validateRawWideDynPtrMeta w reg specSend validVt = .ok () ∧
     validateWideDynSafePtr w reg maxRepresentableSize64 specSend false .null validVt =
       .error (.nullSafePointer false) ∧
+    validateWideDynSafePtr w reg maxRepresentableSize64 specSend false .null validVt true =
+      .error (.nullSafePointer false) ∧
     validateRawWideDynPtrMeta w reg specSend .null = .error .invalidVTableNull ∧
     validateWideDynSafePtr w reg maxRepresentableSize64 specSend false .null .null =
+      .error .invalidVTableNull ∧
+    validateWideDynSafePtr w reg maxRepresentableSize64 specSend false .null .null true =
       .error .invalidVTableNull := by
   dsimp only [wideDynWorldAndReg]
   let w := wideDynWorldAndReg.1
@@ -2261,8 +2367,151 @@ theorem canary_part3C_rawWideDyn_vtable_identity :
     (.principalLess [.send]) (.provenanced 0x1000 testId1 0) false
   have hrawNull := rawWideDyn_vtable_checked_data_unchecked w reg maxRepresentableSize64
     (.principalLess [.send]) .null false
-  exact ⟨rfl, hshape.1, hshape.2, (hraw.2 descU64 hvOk).1, (hraw.2 descU64 hvOk).2,
-    (hrawNull.1 _ .null hvNull).1, (hrawNull.1 _ .null hvNull).2⟩
+  exact ⟨rfl, hshape.1, hshape.2, (hraw.2 descU64 false hvOk).1, (hraw.2 descU64 false hvOk).2,
+    (hraw.2 descU64 true hvOk).2, (hrawNull.1 _ .null false hvNull).1,
+    (hrawNull.1 _ .null false hvNull).2, (hrawNull.1 _ .null true hvNull).2⟩
+
+def resolveTestProtoDynSpec : String → DynExistentialSpec
+  | "Debug" => ⟨some debugPrincipal, AutoTraitSet.ofList [.send]⟩
+  | _ => .principalLess [.send]
+
+/-- **`[adv A3]` Closed canary — unified end-to-end `validateRawPtrFull` (`lean-miri#79/#75/#82`,
+discharging B3 open item `(ii)`)**:
+1. `unsizedDynTailTrait?_isSome_eq_dynMeta` & `fieldsDynTailTrait?_isSome_eq_dynMeta` bridge custom
+   struct/tuple DSTs (`MyDynDst(u32, dyn Debug)`) to `DynExistentialSpec`.
+2. `validateRawPtrFull_sized_skips_layout_and_vtable`: `*const [u8; usize::MAX]` still succeeds in
+   `O(1)` without querying layout or vtables.
+3. `validateRawPtrFull_customDynDst_layout_and_vtable_soundness`:
+   - On `*const ([u8; usize::MAX], dyn Debug)` with `(data = .null, vtable = .null)`, layout overflow
+     fires **before** `.vtableErr .invalidVTableNull` (`fromImmediate` line 81 before `checkMetadata`
+     line 186),
+   - On `*const MyDynDst(u32, dyn Debug)`, dangling integer `0x1000`, nonzero vtable offset `8`, and
+     principal-less `u64 as dyn Send` vtable all fail with `.vtableErr`, while valid `b2DescDebug`
+     vtable + `.null` data half **succeeds** with `.ok ()`! -/
+theorem canary_part3A_3B_3C_unified_validateRawPtrFull :
+    (unsizedDynTailTrait? (.adt "MyDynDst" [.u32, .dynamic "Debug"])).isSome =
+      (unsizedMetadataTail (.adt "MyDynDst" [.u32, .dynamic "Debug"]) == some .dynMeta) ∧
+    (fieldsUnsizedDynTailTrait? none [.u32, .dynamic "Debug"]).isSome =
+      (fieldsUnsizedMetadataTail none [.u32, .dynamic "Debug"] == some .dynMeta) ∧
+    validateRawPtrFull b2W1 b2Reg1 resolveTestProtoDynSpec maxRepresentableSize64
+      (.array .u8 usizeMax64) (.thin .null) = .ok () ∧
+    validateRawPtrFull b2W1 b2Reg1 resolveTestProtoDynSpec maxRepresentableSize64
+      (.tuple [.array .u8 usizeMax64, .dynamic "Debug"]) (.wideDyn .null .null) =
+      .error (.layoutErr (.sizeOverflow (1 * usizeMax64) maxRepresentableSize64)) ∧
+    validateRawPtrFull b2W1 b2Reg1 resolveTestProtoDynSpec maxRepresentableSize64
+      (.adt "MyDynDst" [.u32, .dynamic "Debug"]) (.wideDyn .null (.danglingInt 0x1000)) =
+      .error (.vtableErr .invalidVTableDanglingInt) ∧
+    validateRawPtrFull b2W1 b2Reg1 resolveTestProtoDynSpec maxRepresentableSize64
+      (.adt "MyDynDst" [.u32, .dynamic "Debug"])
+      (.wideDyn .null (.provenanced 0x1000 b2DescDebug.allocId 8)) =
+      .error (.vtableErr .invalidVTableNonzeroOffset) ∧
+    validateRawPtrFull wideDynWorldAndReg.1 wideDynWorldAndReg.2.1 resolveTestProtoDynSpec
+      maxRepresentableSize64 (.adt "MyDynDst" [.u32, .dynamic "Debug"])
+      (.wideDyn .null (.provenanced 0x1000 testId1 0)) =
+      .error (.vtableErr .invalidVTableTrait) ∧
+    validateRawPtrFull b2W1 b2Reg1 resolveTestProtoDynSpec maxRepresentableSize64
+      (.adt "MyDynDst" [.u32, .dynamic "Debug"])
+      (.wideDyn .null (.provenanced 0x1000 b2DescDebug.allocId 0)) = .ok () := by
+  have hbr1 := unsizedDynTailTrait?_isSome_eq_dynMeta (.adt "MyDynDst" [.u32, .dynamic "Debug"])
+  have hbr2 := fieldsDynTailTrait?_isSome_eq_dynMeta none none [.u32, .dynamic "Debug"] rfl
+  have hszSkip := validateRawPtrFull_sized_skips_layout_and_vtable
+    b2W1 b2Reg1 resolveTestProtoDynSpec maxRepresentableSize64 (.array .u8 usizeMax64) .null rfl
+  have hdst := validateRawPtrFull_customDynDst_layout_and_vtable_soundness
+    b2W1 b2Reg1 resolveTestProtoDynSpec maxRepresentableSize64 .u8 .u32
+    ⟨1, 1, true, true⟩ ⟨4, 4, true, true⟩ usizeMax64 "MyDynDst" "Debug"
+    rfl rfl (by decide) rfl rfl (by decide)
+  have hdstMismatch := validateRawPtrFull_customDynDst_layout_and_vtable_soundness
+    wideDynWorldAndReg.1 wideDynWorldAndReg.2.1 resolveTestProtoDynSpec maxRepresentableSize64
+    .u8 .u32 ⟨1, 1, true, true⟩ ⟨4, 4, true, true⟩ usizeMax64 "MyDynDst" "Debug"
+    rfl rfl (by decide) rfl rfl (by decide)
+  have hvDang : validateVTableHalf b2W1 b2Reg1 (.danglingInt 0x1000)
+      (resolveTestProtoDynSpec "Debug") = .error .invalidVTableDanglingInt := rfl
+  have hvOff : validateVTableHalf b2W1 b2Reg1 (.provenanced 0x1000 b2DescDebug.allocId 8)
+      (resolveTestProtoDynSpec "Debug") = .error .invalidVTableNonzeroOffset := rfl
+  have hvTrait : validateVTableHalf wideDynWorldAndReg.1 wideDynWorldAndReg.2.1
+      (.provenanced 0x1000 testId1 0) (resolveTestProtoDynSpec "Debug") =
+      .error .invalidVTableTrait := by decide +kernel
+  have hvOk : validateVTableHalf b2W1 b2Reg1 (.provenanced 0x1000 b2DescDebug.allocId 0)
+      (resolveTestProtoDynSpec "Debug") = .ok b2DescDebug := by decide +kernel
+  exact ⟨
+    hbr1,
+    hbr2,
+    hszSkip,
+    hdst.1,
+    hdst.2.1 _ .null _ hvDang,
+    hdst.2.1 _ .null _ hvOff,
+    hdstMismatch.2.1 _ .null _ hvTrait,
+    hdst.2.2 b2DescDebug .null _ hvOk
+  ⟩
+
+def a3DescBool : VTableDescriptor :=
+  ⟨testId1, .bool, .principalLess [.send], "drop_bool", 1, 1,
+    [.dropInPlace "drop_bool", .size 1, .align 1]⟩
+
+def a3DescRefU32 : VTableDescriptor :=
+  ⟨testId2, .ref .not .u32, .principalLess [.send], "drop_ref_u32", 8, 8,
+    [.dropInPlace "drop_ref_u32", .size 8, .align 8]⟩
+
+def a3DescRefNever : VTableDescriptor :=
+  ⟨testId3, .ref .not .never, .principalLess [.send], "drop_ref_never", 8, 8,
+    [.dropInPlace "drop_ref_never", .size 8, .align 8]⟩
+
+def a3ChildSessionWorld : KeyedAllocWorld :=
+  ((KeyedAllocWorld.empty.registerGlobal ⟨testId1, .vtable, 0, 1, .not⟩).registerGlobal
+    ⟨testId2, .vtable, 0, 8, .not⟩).registerGlobal
+    ⟨testId3, .vtable, 0, 8, .not⟩
+
+def a3ChildSessionReg : VTableRegistry where
+  byKey := (((∅ : ExtTreeMap0 VTableKey VTableDescriptor).insert
+      (mkCanonicalVTableKey .bool none [.send]) a3DescBool).insert
+      (mkCanonicalVTableKey (.ref .not .u32) none [.send]) a3DescRefU32).insert
+      (mkCanonicalVTableKey (.ref .not .never) none [.send]) a3DescRefNever
+  byAlloc := (((∅ : ExtTreeMap0 MiriAllocId VTableDescriptor).insert testId1 a3DescBool).insert
+      testId2 a3DescRefU32).insert testId3 a3DescRefNever
+
+/-- **`[adv A3]` Closed canary — recursive pointee byte validation & `childSession` `mayDangle = true`
+(`ValidityVisitor.lean:198–241, 308–310, 412–418, 527–556`, discharging B3 open item `(iii)`)**:
+1. Non-recursive default (`recursive = false`) accepts `&dyn Send` pointing to `.uninit` or invalid
+   `0x02 : bool` bytes, whereas `recursive = true` rejects `.uninit` with `.uninitPointeeByte` and
+   `0x02 : bool` with `.invalidBoolScalar 2`.
+2. Under `recursive = true`, `childSession` (`flags.mayDangle = true, refTracking = none`, line 552)
+   rejects null nested `&u32` (`0x00`) with `.nullNestedSafePtr`, **accepts** aligned non-null
+   dangling integer `&u32` (`addr = 4`, no provenance), and rejects aligned non-null `&!` with
+   `.uninhabitedNestedSafePtr`! -/
+theorem canary_part3C_recursive_pointee_bytes_and_childSession_mayDangle :
+    let specSend := DynExistentialSpec.principalLess [.send]
+    let vtB := ScalarPtrHalf.provenanced 0x1000 testId1 0
+    let vtRU := ScalarPtrHalf.provenanced 0x2000 testId2 0
+    let vtRN := ScalarPtrHalf.provenanced 0x3000 testId3 0
+    let wUninit := a3ChildSessionWorld.insertLive testIdMax ⟨.heap, 8, 8, .mut, List.replicate 8 .uninit⟩
+    let wBadBool := a3ChildSessionWorld.insertLive testIdMax ⟨.heap, 8, 8, .mut, [.init 2 none]⟩
+    let wNullRef := a3ChildSessionWorld.insertLive testIdMax ⟨.heap, 8, 8, .mut, Anneal.BitValidity.zeroInitBytes 8⟩
+    let wDangRef := a3ChildSessionWorld.insertLive testIdMax ⟨.heap, 8, 8, .mut, .init 4 none :: Anneal.BitValidity.zeroInitBytes 7⟩
+    validateWideDynSafePtrWithBytes wUninit a3ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtB false = .ok (.bool, 1, 1) ∧
+    validateWideDynSafePtrWithBytes wUninit a3ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtB true = .error (.pointeeErr .uninitPointeeByte) ∧
+    validateWideDynSafePtrWithBytes wBadBool a3ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtB false = .ok (.bool, 1, 1) ∧
+    validateWideDynSafePtrWithBytes wBadBool a3ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtB true = .error (.pointeeErr (.invalidBoolScalar 2)) ∧
+    validateWideDynSafePtrWithBytes wNullRef a3ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtRU true = .error (.pointeeErr .nullNestedSafePtr) ∧
+    validateWideDynSafePtrWithBytes wDangRef a3ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtRU true = .ok (.ref .not .u32, 8, 8) ∧
+    validateWideDynSafePtrWithBytes wDangRef a3ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtRN true = .error (.pointeeErr .uninhabitedNestedSafePtr) := by
+  have hvB : validateVTableHalf a3ChildSessionWorld a3ChildSessionReg
+      (.provenanced 0x1000 testId1 0) (.principalLess [.send]) = .ok a3DescBool := by decide +kernel
+  have hvRU : validateVTableHalf a3ChildSessionWorld a3ChildSessionReg
+      (.provenanced 0x2000 testId2 0) (.principalLess [.send]) = .ok a3DescRefU32 := by decide +kernel
+  have hvRN : validateVTableHalf a3ChildSessionWorld a3ChildSessionReg
+      (.provenanced 0x3000 testId3 0) (.principalLess [.send]) = .ok a3DescRefNever := by decide +kernel
+  exact wideDyn_recursive_bytes_and_childSession_mayDangle
+    a3ChildSessionWorld a3ChildSessionReg maxRepresentableSize64 (.principalLess [.send])
+    (.provenanced 0x1000 testId1 0) (.provenanced 0x2000 testId2 0) (.provenanced 0x3000 testId3 0)
+    a3DescBool a3DescRefU32 a3DescRefNever testIdMax 16
+    hvB rfl rfl rfl hvRU rfl rfl rfl hvRN rfl rfl rfl (by decide) (by decide)
 
 /-! ## Section 4: Explicit `#guard_msgs in #print axioms` Verification -/
 
@@ -2431,6 +2680,41 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_mayDangle_addressTooClos
 -/
 #guard_msgs in
 #print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_mayDangle_addressTooClose_and_uninhabited_concrete_ok
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.deallocActor_ofVClock_catches_unlisted_reader_vs_nonzeroFallback' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.deallocActor_ofVClock_catches_unlisted_reader_vs_nonzeroFallback
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.execFnEntryMutRetagSourceOrder_bottomUp_vs_flatAncestors' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.execFnEntryMutRetagSourceOrder_bottomUp_vs_flatAncestors
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.static_zstUnsafeCell_composite_miri_separation' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.static_zstUnsafeCell_composite_miri_separation
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.validateRawPtrFull_customDynDst_layout_and_vtable_soundness' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.validateRawPtrFull_customDynDst_layout_and_vtable_soundness
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_recursive_bytes_and_childSession_mayDangle' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_recursive_bytes_and_childSession_mayDangle
 
 /-! ## Section 5: Deterministic Workload Generators & Elaboration Benchmarks (`M = 16, 64, 128, 256`) -/
 
@@ -2637,29 +2921,31 @@ run_cmd do
   let rec exprHasUnusedPlaceholderTo (targetSet : NameSet) (e : Expr) : Bool :=
     match e with
     | .letE _ ty val body _ =>
+      -- `[adv A3]`: check `!body.hasLooseBVar 0` (the bound variable itself!) rather than
+      -- `!body.hasLooseBVars`, which missed unused `let _ := @thm` inside parameterized helpers
+      -- (`private def f (x : Nat) := let _ := @thm; x`, where `body = .bvar 1` has loose bvars!).
       let unusedAndMentionsTarget :=
-        (!body.hasLooseBVars) && val.getUsedConstants.any (fun nm => targetSet.contains nm)
+        (!body.hasLooseBVar 0) && val.getUsedConstants.any (fun nm => targetSet.contains nm)
       unusedAndMentionsTarget ||
         exprHasUnusedPlaceholderTo targetSet ty ||
         exprHasUnusedPlaceholderTo targetSet val ||
         exprHasUnusedPlaceholderTo targetSet body
     | .app f a =>
-      -- `[adv B1]` + `[adv A1]`: flag beta-redex `(fun _ => b) thm` and `letFun` at any application
-      -- spine depth when a lambda argument ignores its bound variable while another argument mentions
-      -- a prototype public theorem.
+      -- `[adv B1]` + `[adv A1]` + `[adv A3]`: flag beta-redex `(fun _ => b) thm` and `@letFun α β v f`
+      -- using `!b.hasLooseBVar 0` on the continuation lambda `args[3]!` (NOT the return-type motive
+      -- `args[1]!`, which previously false-positived on valid non-dependent term-mode `have h := thm; …`
+      -- while missing parameterized `private def f (x : Nat) := have _ := @thm; x`).
       let betaUnused :=
         match f with
-        | .lam _ _ b _ => (!b.hasLooseBVars) && a.getUsedConstants.any (fun nm => targetSet.contains nm)
+        | .lam _ _ b _ => (!b.hasLooseBVar 0) && a.getUsedConstants.any (fun nm => targetSet.contains nm)
         | _ => false
       let letFunUnused :=
         match e.getAppFn with
         | .const nm _ =>
-          if nm == ``letFun then
-            let args := e.getAppArgs
-            args.any (fun | .lam _ _ b _ => !b.hasLooseBVars | _ => false) &&
-              args.any (fun
-                | .lam _ _ _ _ => false
-                | arg => arg.getUsedConstants.any (fun c => targetSet.contains c))
+          let args := e.getAppArgs
+          if nm == ``letFun && args.size >= 4 then
+            (match args[3]! with | .lam _ _ b _ => !b.hasLooseBVar 0 | _ => false) &&
+              args[2]!.getUsedConstants.any (fun c => targetSet.contains c)
           else false
         | _ => false
       betaUnused || letFunUnused ||
@@ -2670,9 +2956,73 @@ run_cmd do
     | .proj _ _ e' => exprHasUnusedPlaceholderTo targetSet e'
     | _ => false
 
-  -- `[adv B2]` + `[adv A2]`: tautological equations / iffs (`a = a`, `a ↔ a`), Boolean-reflected
-  -- `BEq.beq a a`, `let`-aliased `let x := a; x = a`, and vacuous `True` conjuncts (`True ∧ P` /
-  -- `P ∧ True` / top-level `True`) anywhere in a closed witness *statement* are flagged.
+  -- `[adv A3]`: prune dead `.letE` / beta-redex / `letFun` bindings across ALL modules (both
+  -- `Proto.lean` and `Tests.lean`) when computing theorem reachability, so cross-module placeholder
+  -- laundering (`have _ := @unreachedThm` inside a `Proto.lean` helper theorem) never counts toward
+  -- 100% reachability, while keeping `collectTransitiveClosure` unpruned for axiom safety.
+  let rec collectLiveConstantsAux (acc : NameSet) (e : Expr) : NameSet :=
+    match e with
+    | .const nm _ => acc.insert nm
+    | .letE _ ty val body _ =>
+      if !body.hasLooseBVar 0 then
+        collectLiveConstantsAux acc body
+      else
+        collectLiveConstantsAux (collectLiveConstantsAux (collectLiveConstantsAux acc ty) val) body
+    | .app f a =>
+      match f with
+      | .lam _ _ b _ =>
+        if !b.hasLooseBVar 0 then
+          collectLiveConstantsAux acc b
+        else
+          collectLiveConstantsAux (collectLiveConstantsAux acc f) a
+      | _ =>
+        match e.getAppFn with
+        | .const nm _ =>
+          let args := e.getAppArgs
+          if nm == ``letFun && args.size >= 4 then
+            match args[3]! with
+            | .lam _ _ b _ =>
+              if !b.hasLooseBVar 0 then
+                let rest := (args.extract 4 args.size).foldl collectLiveConstantsAux (acc.insert nm)
+                collectLiveConstantsAux rest b
+              else
+                collectLiveConstantsAux (collectLiveConstantsAux acc f) a
+            | _ => collectLiveConstantsAux (collectLiveConstantsAux acc f) a
+          else
+            collectLiveConstantsAux (collectLiveConstantsAux acc f) a
+        | _ => collectLiveConstantsAux (collectLiveConstantsAux acc f) a
+    | .lam _ ty b _ => collectLiveConstantsAux (collectLiveConstantsAux acc ty) b
+    | .forallE _ ty b _ => collectLiveConstantsAux (collectLiveConstantsAux acc ty) b
+    | .mdata _ e' => collectLiveConstantsAux acc e'
+    | .proj _ _ e' => collectLiveConstantsAux acc e'
+    | _ => acc
+
+  let collectPrunedReachableClosure (env : Environment) (roots : Array Name) : NameSet := Id.run do
+    let mut visited : NameSet := {}
+    let mut worklist : Array Name := roots
+    while !worklist.isEmpty do
+      let curr := worklist.back!
+      worklist := worklist.pop
+      if visited.contains curr then
+        continue
+      visited := visited.insert curr
+      match env.find? curr with
+      | none => continue
+      | some ci =>
+        let liveDeps : NameSet :=
+          match ci.value? (allowOpaque := true) with
+          | some val => collectLiveConstantsAux (collectLiveConstantsAux {} ci.type) val
+          | none => ci.getUsedConstantsAsSet
+        for dep in liveDeps do
+          if !visited.contains dep then
+            worklist := worklist.push dep
+    return visited
+
+  -- `[adv B2]` + `[adv A2]` + `[adv A3]`: tautological equations / iffs / inequalities (`a = a`,
+  -- `a ↔ a`, `BEq.beq a a`, `a ≤ a`), `let`-aliased tautologies, vacuous `True` / duplicate
+  -- conjuncts & disjuncts (`True ∧ P`, `P ∨ True`, `P ∧ P`, `P ∨ P`), `¬ False`, and vacuous
+  -- embedded implications (`(False → P) ∧ Q`, `(P → True) ∧ Q`) anywhere in a closed witness
+  -- *statement* are flagged.
   let rec resolveClosedLetAlias : Array (Option Expr) → Nat → Expr → Expr
     | _, 0, e => e
     | letCtx, fuel + 1, .mdata _ e' => resolveClosedLetAlias letCtx (fuel + 1) e'
@@ -2703,16 +3053,30 @@ run_cmd do
             let lhs := resolveClosedLetAlias letCtx 8 args[2]!
             let rhs := resolveClosedLetAlias letCtx 8 args[3]!
             lhs == rhs
+          else if nm == ``LE.le && args.size == 4 then
+            let lhs := resolveClosedLetAlias letCtx 8 args[2]!
+            let rhs := resolveClosedLetAlias letCtx 8 args[3]!
+            lhs == rhs
           else if nm == ``And && args.size == 2 then
-            (resolveClosedLetAlias letCtx 8 args[0]!).isConstOf ``True ||
-              (resolveClosedLetAlias letCtx 8 args[1]!).isConstOf ``True
+            let lhs := resolveClosedLetAlias letCtx 8 args[0]!
+            let rhs := resolveClosedLetAlias letCtx 8 args[1]!
+            lhs == rhs || lhs.isConstOf ``True || rhs.isConstOf ``True
+          else if nm == ``Or && args.size == 2 then
+            let lhs := resolveClosedLetAlias letCtx 8 args[0]!
+            let rhs := resolveClosedLetAlias letCtx 8 args[1]!
+            lhs == rhs || lhs.isConstOf ``True || rhs.isConstOf ``True
+          else if nm == ``Not && args.size == 1 then
+            (resolveClosedLetAlias letCtx 8 args[0]!).isConstOf ``False
           else false
         | _ => false
       here || exprHasTautologyAux letCtx f || exprHasTautologyAux letCtx a
     | .lam _ ty b _ =>
       exprHasTautologyAux letCtx ty || exprHasTautologyAux (letCtx.push none) b
     | .forallE _ ty b _ =>
-      exprHasTautologyAux letCtx ty || exprHasTautologyAux (letCtx.push none) b
+      let dom := resolveClosedLetAlias letCtx 8 ty
+      let cod := resolveClosedLetAlias (letCtx.push none) 8 b
+      dom.isConstOf ``False || cod.isConstOf ``True ||
+        exprHasTautologyAux letCtx ty || exprHasTautologyAux (letCtx.push none) b
     | .letE _ ty v b _ =>
       let resolvedV := resolveClosedLetAlias letCtx 8 v
       let entry := if !resolvedV.hasLooseBVars then some resolvedV else none
@@ -2822,8 +3186,9 @@ run_cmd do
   if !tautologicalWitnesses.isEmpty then
     throwError "axiom audit FAILED: closed witnesses with tautological `a = a` / `a ↔ a` conjuncts: {tautologicalWitnesses}"
 
-  -- Verify 100% public theorem reachability from closed test witnesses alone
-  let (closedReachable, _, _, _, _) := collectTransitiveClosure env closedTestWitnesses
+  -- Verify 100% public theorem reachability from closed test witnesses alone (`[adv A3]`: prune
+  -- dead `.letE` / beta-redex / `letFun` bindings across ALL modules including `Proto.lean`)
+  let closedReachable := collectPrunedReachableClosure env closedTestWitnesses
   let mut unreachedThms : Array Name := #[]
   for thmNm in protoPublicThms do
     if !closedReachable.contains thmNm then
@@ -2978,6 +3343,82 @@ run_cmd do
     if !exprHasTautology tvLet.type || !exprHasTautology tvBeq.type || !exprHasTautology tvTr.type then
       throwError "audit self-test 11 FAILED: missed let-aliased, BEq, or True-conjunct tautology!"
 
-  logInfo s!"axiom audit passed: {allAuditRoots.size} declarations ({protoPublicThms.size} prototype public theorems, {closedTestWitnesses.size} closed test witnesses, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 axioms outside propext/Quot.sound, 0 placeholder uses, 0 tautological conjuncts, 0 undischarged conditional test theorems, 100% theorem reachability from closed test witnesses; 11/11 rolled-back self-tests passed)"
+  -- Self-test 12 (`[adv A3]`):
+  -- (a) parameterized `private def` placeholder laundering (`x : Nat => let _ := @thm; x` and
+  --     `have _ := @thm; x`, missed by `!b.hasLooseBVars` in B1–B3 & A1–A2!) is flagged, while a
+  --     genuine non-dependent term-mode `have h := thm; h` (falsely flagged by B1's motive check!)
+  --     passes without false positive;
+  -- (b) `collectPrunedReachableClosure` prunes dead `have _ := @target` bindings inside intermediate
+  --     helper theorems so cross-module placeholder laundering inside `Proto.lean` cannot fake 100%
+  --     reachability;
+  -- (c) vacuous embedded implications (`(False → P) ∧ Q`), `P ∨ True`, and reflexive `a ≤ a` are
+  --     flagged by `exprHasTautology`.
+  withoutModifyingEnv do
+    let Except.ok stx12a1 := Parser.runParserCategory (← getEnv) `command
+      "private def _probeParamLetLaunder (x : Nat) : Nat := let _ := @Anneal.ExtTreeMapAllocAndNoWritableProto.KeyedAllocWorld.ext; x" "<probe12a1>"
+      | throwError "self-test 12a1 parse failed"
+    elabCommand stx12a1
+    let Except.ok stx12a2 := Parser.runParserCategory (← getEnv) `command
+      "private def _probeParamHaveLaunder (x : Nat) : Nat := have _ := @Anneal.ExtTreeMapAllocAndNoWritableProto.KeyedAllocWorld.ext; x" "<probe12a2>"
+      | throwError "self-test 12a2 parse failed"
+    elabCommand stx12a2
+    let Except.ok stx12a3 := Parser.runParserCategory (← getEnv) `command
+      "private theorem _probeLegitTermHave : MiriAllocId.ofUInt64 0 = none := have h := MiriAllocId.ofUInt64_zero; h" "<probe12a3>"
+      | throwError "self-test 12a3 parse failed"
+    elabCommand stx12a3
+    let mut caughtLetParam := false
+    let mut caughtHaveParam := false
+    let mut falsePosLegitHave := false
+    for (nm, ci) in (← getEnv).constants.map₂.toList do
+      if let some val := ci.value? (allowOpaque := true) then
+        if nm.toString.endsWith "_probeParamLetLaunder" && exprHasUnusedPlaceholderTo protoPublicThmSet val then
+          caughtLetParam := true
+        if nm.toString.endsWith "_probeParamHaveLaunder" && exprHasUnusedPlaceholderTo protoPublicThmSet val then
+          caughtHaveParam := true
+        if nm.toString.endsWith "_probeLegitTermHave" && exprHasUnusedPlaceholderTo protoPublicThmSet val then
+          falsePosLegitHave := true
+    if !caughtLetParam || !caughtHaveParam || falsePosLegitHave then
+      throwError "audit self-test 12a FAILED: parameterized placeholder or legitimate term-mode `have` mishandled!"
+
+    let Except.ok stx12b1 := Parser.runParserCategory (← getEnv) `command
+      "theorem _probeUnreachedTarget : (1 : Nat) = 1 := rfl" "<probe12b1>"
+      | throwError "self-test 12b1 parse failed"
+    elabCommand stx12b1
+    let Except.ok stx12b2 := Parser.runParserCategory (← getEnv) `command
+      "theorem _probeMidLaunderHelper : (2 : Nat) = 2 := by\n  have _ := @_probeUnreachedTarget\n  exact rfl" "<probe12b2>"
+      | throwError "self-test 12b2 parse failed"
+    elabCommand stx12b2
+    let Except.ok stx12b3 := Parser.runParserCategory (← getEnv) `command
+      "theorem _probeOuterWitness : (2 : Nat) = 2 := _probeMidLaunderHelper" "<probe12b3>"
+      | throwError "self-test 12b3 parse failed"
+    elabCommand stx12b3
+    let prunedVis := collectPrunedReachableClosure (← getEnv)
+      #[`Anneal.ExtTreeMapAllocAndNoWritableProtoTests._probeOuterWitness]
+    if !prunedVis.contains `Anneal.ExtTreeMapAllocAndNoWritableProtoTests._probeMidLaunderHelper ||
+        prunedVis.contains `Anneal.ExtTreeMapAllocAndNoWritableProtoTests._probeUnreachedTarget then
+      throwError "audit self-test 12b FAILED: `collectPrunedReachableClosure` failed to prune dead cross-theorem placeholder!"
+
+    let Except.ok stx12c1 := Parser.runParserCategory (← getEnv) `command
+      "theorem _probeFalseImpConj : (False → (1 : Nat) = 2) ∧ (1 : Nat) < 2 := ⟨False.elim, by decide⟩" "<probe12c1>"
+      | throwError "self-test 12c1 parse failed"
+    elabCommand stx12c1
+    let Except.ok stx12c2 := Parser.runParserCategory (← getEnv) `command
+      "theorem _probeOrTrue : ((1 : Nat) = 2 ∨ True) ∧ (1 : Nat) < 2 := ⟨Or.inr True.intro, by decide⟩" "<probe12c2>"
+      | throwError "self-test 12c2 parse failed"
+    elabCommand stx12c2
+    let Except.ok stx12c3 := Parser.runParserCategory (← getEnv) `command
+      "theorem _probeReflLe : (2 : Nat) ≤ 2 ∧ (1 : Nat) < 2 := ⟨Nat.le_refl 2, by decide⟩" "<probe12c3>"
+      | throwError "self-test 12c3 parse failed"
+    elabCommand stx12c3
+    let some (.thmInfo tvFI) := (← getEnv).find? `Anneal.ExtTreeMapAllocAndNoWritableProtoTests._probeFalseImpConj
+      | throwError "self-test 12c1 lookup failed"
+    let some (.thmInfo tvOT) := (← getEnv).find? `Anneal.ExtTreeMapAllocAndNoWritableProtoTests._probeOrTrue
+      | throwError "self-test 12c2 lookup failed"
+    let some (.thmInfo tvRL) := (← getEnv).find? `Anneal.ExtTreeMapAllocAndNoWritableProtoTests._probeReflLe
+      | throwError "self-test 12c3 lookup failed"
+    if !exprHasTautology tvFI.type || !exprHasTautology tvOT.type || !exprHasTautology tvRL.type then
+      throwError "audit self-test 12c FAILED: missed False-implication, Or-True, or reflexive LE tautology!"
+
+  logInfo s!"axiom audit passed: {allAuditRoots.size} declarations ({protoPublicThms.size} prototype public theorems, {closedTestWitnesses.size} closed test witnesses, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 axioms outside propext/Quot.sound, 0 placeholder uses, 0 tautological conjuncts, 0 undischarged conditional test theorems, 100% theorem reachability from closed test witnesses; 12/12 rolled-back self-tests passed)"
 
 end Anneal.ExtTreeMapAllocAndNoWritableProtoTests
