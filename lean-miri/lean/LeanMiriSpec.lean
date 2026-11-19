@@ -303,7 +303,7 @@ import LeanMiriSpec.Audit
   `ReifyFnPointer` simulations (`step_terminator_unreachable_ub_simulation`,
   `step_terminator_drop_noop_simulation`,
   `step_terminator_drop_projected_simulation`,
-  `step_terminator_drop_projected_uninit_divergence`,
+  `step_terminator_drop_projected_init_no_glue_divergence`,
   `canonical_drop_no_glue_preserves_local_divergence`,
   `step_terminator_drop_canonical_no_glue_step_divergence`,
   `step_terminator_return_root_simulation`,

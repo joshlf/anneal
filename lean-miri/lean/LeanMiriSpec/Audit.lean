@@ -15932,7 +15932,7 @@ example :
           ∀ i (hi : i < (variants[variantIdx]'hv_lt).length),
             (∃ (hi_act : i < (variants[v_act]'hv_act).length),
               (variants[variantIdx]'hv_lt)[i]'hi = (variants[v_act]'hv_act)[i]'hi_act) ∨
-            (get? fieldVals i = none ∧
+            ((get? fieldVals i = none ∨ get? fieldVals i = some .uninit) ∧
               ∃ b,
                 ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat ≤ b ∧
                 b < ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat +
@@ -15973,9 +15973,11 @@ example :
         stmt.kind = .setDiscriminant ⟨dstIdx, .nil⟩ variantIdx →
         get? body.localDecls dstIdx = some dstDecl →
         env dstDecl.ty = some (tagBytes, variants) →
-        variantIdx < variants.length →
+        (hv_lt : variantIdx < variants.length) →
         get? s.frame.locals dstIdx = some .uninit →
-        let s' := advanceStmt s (s.frame.locals.set dstIdx (.init (.aggregate variantIdx .nil)))
+        let s' := advanceStmt s
+          (s.frame.locals.set dstIdx
+            (.init (.aggregate variantIdx (replicateValue (variants[variantIdx]'hv_lt).length .uninit))))
         stepMirFn body s = .step s' ∧
         StepRelLM2_3 body env allocBudget m
           (stepMirFn body s)
@@ -16007,7 +16009,7 @@ example :
           ∀ i (hi : i < (variants[variantIdx]'hv_lt).length),
             (∃ (hi_act : i < (variants[v_act]'hv_act).length),
               (variants[variantIdx]'hv_lt)[i]'hi = (variants[v_act]'hv_act)[i]'hi_act) ∨
-            (get? fieldVals i = none ∧
+            ((get? fieldVals i = none ∨ get? fieldVals i = some .uninit) ∧
               ∃ b,
                 ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat ≤ b ∧
                 b < ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat +
@@ -16142,6 +16144,7 @@ example :
         (hj : j < (variants[v_act]'hv_act).length) →
         j < fieldVals.length →
         ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt) = ((variants[v_act]'hv_act)[j]'hj) →
+        get? fieldVals j ≠ some .uninit →
         stepMirFn body s = .fail .ub ∧
         ∃ (sc : MirAst.ScalarInt) (m' : AnnealStepState),
           get? fieldVals j = some (.scalar sc) ∧
@@ -16406,6 +16409,9 @@ example :
         dstDecl.ty = srcDecl.ty →
         (get? s.frame.locals srcIdx = some .uninit →
           IsImmediateStepLocal m srcIdx) →
+        (∀ v_act fieldVals,
+          get? s.frame.locals srcIdx = some (.init (.aggregate v_act fieldVals)) →
+            valueListContainsUninit fieldVals = false) →
         let mRes :=
           Miri.Interpreter.Step.step
             (annealStepHooksLM2_3 body.localDecls body.layouts) () m
@@ -16609,6 +16615,9 @@ example :
         env decl.ty = some (tagBytes, variants) →
         (get? s.frame.locals idx = some .uninit →
           IsImmediateStepLocal m idx) →
+        (∀ v_act fieldVals,
+          get? s.frame.locals idx = some (.init (.aggregate v_act fieldVals)) →
+            valueListContainsUninit fieldVals = false) →
         let mRes :=
           Miri.Interpreter.Step.step
             (annealStepHooksLM2_3 body.localDecls body.layouts) () m
@@ -16728,6 +16737,7 @@ example :
         get? body.localDecls idx = some decl →
         env decl.ty = some (tagBytes, variants) →
         get? s.frame.locals idx = some (.init rootVal) →
+        valueContainsUninit rootVal = false →
         stepMirFn body s =
           MirStepNode.step
             (advanceStmt s (s.frame.locals.set idx (.init rootVal)) s.memory) ∧
@@ -16845,6 +16855,9 @@ example :
         env decl0.ty = some (tagBytes, variants) →
         (get? s.frame.locals 0 = some .uninit →
           IsImmediateStepLocal m 0) →
+        (∀ v_act fieldVals,
+          get? s.frame.locals 0 = some (.init (.aggregate v_act fieldVals)) →
+            valueListContainsUninit fieldVals = false) →
         StepRelEnumReturnLM2_3 body env m
           (stepMirFn body s)
           (Miri.Interpreter.Step.step
@@ -21511,13 +21524,22 @@ example
     (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
     (hroot :
       get? s.frame.locals localId = some .dead ∨
-        get? s.frame.locals localId = some .uninit) :
+        get? s.frame.locals localId = some .uninit)
+    (hShell :
+      (uninitContainerFieldShell?
+        (activeMirBody rootBody s).localDecls
+        (activeMirBody rootBody s).layouts
+        (resolveTyWithLocalDecls
+          (activeMirBody rootBody s).localDecls
+          (activeMirBody rootBody s).layouts
+          decl.ty)
+        fieldIdx).isSome = true) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
         (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m) :=
   step_terminator_drop_projected_simulation
-    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm hroot fnPtrs
+    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm hroot fnPtrs hShell
 
 example
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}

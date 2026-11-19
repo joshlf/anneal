@@ -2127,13 +2127,25 @@ theorem writeProjectedForLocal_union_field_uninit {body : CapturedMir} {locals :
   simp only [hn_eq] at *
   have hshell : uninitFieldWriteShell? body.localDecls body.layouts u (.field j fty) .nil =
       some (.aggregate 0 .nil) := by
-    unfold uninitFieldWriteShell? placeTy
+    have hr := resolveTyWithLocalDecls_of_union (localDecls := body.localDecls) hwt
+    have his_u : Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout body.layouts uDecl.ty = true := by
+      unfold Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout
+      rw [hk_u, hlookup]
+      cases tl
+      dsimp only at hfu ⊢
+      subst hfu
+      rfl
+    unfold uninitFieldWriteShell? placeTy uninitContainerFieldShell?
     rw [hdecl_u]
     dsimp only [resolveProjectedTy]
-    cases hty_u : uDecl.ty with | mk uk ul =>
-    rw [hty_u] at hk_u
-    dsimp only at hk_u ⊢
-    subst hk_u
+    rw [hr, his_u]
+    dsimp only
+    rw [hlookup]
+    cases tl
+    dsimp only at hfu ⊢
+    subst hfu
+    dsimp only
+    rw [Nat.blt_eq.mpr hj]
     rfl
   refine ⟨hshell, ?_⟩
   have htouch := placeTouchesUnion_union_field hdecl_u hwt j fty
@@ -2209,10 +2221,9 @@ theorem writeProjectedForLocal_union_field_ge {body : CapturedMir} {locals : Lis
     (hfl' : ∃ fl, unionFieldLayoutOf body.layouts (translateTy uDecl.ty body.layouts) j = some fl ∧
       fl.layout.size = (translateTy fty body.layouts).layout.size) :
     writeProjectedForLocal locals body.localDecls body.layouts u
-        (ensureNestedFieldShells (.aggregate 0 (unionSlotFields n f (.scalar sc))) [.field j fty])
+        (.aggregate 0 (unionSlotFields n f (.scalar sc)))
         [.field j fty] (.scalar sc') =
       .ok (.aggregate 0 (unionSlotFields n j (.scalar sc'))) := by
-  dsimp only [ensureNestedFieldShells]
   obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, htl_sz, _, _, _, _⟩ :=
     hwt.adt_spec
   have hn_eq : n' = n := by
@@ -2336,13 +2347,12 @@ theorem writeProjectedForLocal_union_field_lt {body : CapturedMir} {locals : Lis
         ((encodeLittleEndianBytes sc.bits sc.sizeBytes none).drop sc'.sizeBytes ++
           replicateUninitBytes (S - sc.sizeBytes))
     writeProjectedForLocal locals body.localDecls body.layouts u
-        (ensureNestedFieldShells (.aggregate 0 (unionSlotFields n f (.scalar sc))) [.field j fty])
+        (.aggregate 0 (unionSlotFields n f (.scalar sc)))
         [.field j fty] (.scalar sc') =
       .ok (.aggregate 0
         (unionSlotFields n j (.scalar sc') ++
           [.aggregate 0 (encodeRawAbstractByteVals mergedBytes)])) := by
   intro mergedBytes
-  dsimp only [ensureNestedFieldShells]
   obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, htl_sz, _, _, _, _⟩ :=
     hwt.adt_spec
   have hn_eq : n' = n := by
@@ -2488,7 +2498,7 @@ theorem writeProjectedForLocal_union_field_lt_of_initSlot {body : CapturedMir}
     ∃ oldVal,
       slot_u = .init oldVal ∧
       writeProjectedForLocal locals body.localDecls body.layouts u
-          (ensureNestedFieldShells oldVal [.field j fty])
+          oldVal
           [.field j fty] (.scalar sc') =
         .ok (.aggregate 0
           (unionSlotFields n j (.scalar sc') ++
@@ -2550,7 +2560,6 @@ theorem writeProjectedForLocal_union_field_lt_of_initSlot {body : CapturedMir}
         rebuildUnionFieldsAfterWriteOpt_scalar_aux _ _ _ _ _ _ _ hold_mem,
         range'_map_ite_eq_unionSlotFields hj]
   refine ⟨.aggregate 0 oldFields, rfl, ?_⟩
-  dsimp only [ensureNestedFieldShells]
   have htouch := placeTouchesUnion_union_field hdecl_u hwt j fty
   have hr_base := resolveTyWithLocalDecls_of_union (localDecls := body.localDecls) hwt
   have hble_j : Nat.ble (j + 1) n = true := Nat.ble_eq.mpr hj
@@ -5106,11 +5115,9 @@ theorem writeProjectedForLocal_subslice_constIndex
     (hoff_lt : off < minLen)
     (hmin_le : minLen ≤ subsliceEnd count toIdx fromEnd - fromIdx) :
     writeProjectedForLocal locals localDecls layouts arrIdx
-        (ensureNestedFieldShells (.aggregate 0 elems)
-          [.subslice fromIdx toIdx fromEnd, .constantIndex off minLen false])
+        (.aggregate 0 elems)
         [.subslice fromIdx toIdx fromEnd, .constantIndex off minLen false] v =
       .ok (.aggregate 0 (elems.set (fromIdx + off) v)) := by
-  dsimp only [ensureNestedFieldShells]
   unfold writeProjectedForLocal
   rw [placeTouchesUnion_subslice_constIndex]
   dsimp only
@@ -6325,7 +6332,7 @@ theorem step_union_field_write_simulation
     have ha_ok' : evalStmt s ⟨.assign ⟨u, [.field f f0Ty]⟩ (.use op), span⟩
         body.localDecls body.layouts = MirStepNode.step (advanceStmt s locals₂ s.memory) := by
       unfold evalStmt; dsimp only; rw [hrv]; simp only []
-      rw [hu_slot]; dsimp only
+      rw [hu_slot]; dsimp only [ensureNestedFieldShells]
       rw [hwp]; dsimp only
       rw [set?_eq_some_set hlt_af_u, hprot, hbor]
       dsimp only [invalidateConflictingBorrowsAtProj]
@@ -7770,7 +7777,7 @@ theorem step_union_nonzero_field_write_simulation
     have ha_ok' : evalStmt s ⟨.assign ⟨u, [.field j fty]⟩ (.use op), span⟩
         body.localDecls body.layouts = MirStepNode.step (advanceStmt s locals₂ s.memory) := by
       unfold evalStmt; dsimp only; rw [hrv]; simp only []
-      rw [hu_slot]; dsimp only
+      rw [hu_slot]; dsimp only [ensureNestedFieldShells]
       rw [hwp]; dsimp only
       rw [set?_eq_some_set hlt_af_u, hprot, hbor]
       dsimp only [invalidateConflictingBorrowsAtProj]
@@ -8302,7 +8309,7 @@ theorem step_union_narrower_field_write_simulation
     have ha_ok' : evalStmt s ⟨.assign ⟨u, [.field j fty]⟩ (.use op), span⟩
         body.localDecls body.layouts = MirStepNode.step (advanceStmt s locals₂ s.memory) := by
       unfold evalStmt; dsimp only; rw [hrv]; simp only []
-      rw [hu_slot, hold_eq]; dsimp only
+      rw [hu_slot, hold_eq]; dsimp only [ensureNestedFieldShells]
       rw [hwp]; dsimp only
       rw [set?_eq_some_set hlt_af_u, hprot, hbor]
       dsimp only [invalidateConflictingBorrowsAtProj]
@@ -13004,7 +13011,7 @@ theorem step_subslice_elem_write_simulation
             (.use (.constant c)), span⟩ body.localDecls body.layouts =
           MirStepNode.step (advanceStmt s locals₂ s.memory) := by
         unfold evalStmt; dsimp only; rw [ha_rv]; dsimp only
-        rw [hinit]; dsimp only
+        rw [hinit]; dsimp only [ensureNestedFieldShells]
         rw [hwp]; dsimp only
         rw [set?_eq_some_set hlt_af_arr, hprot, hbor]
         dsimp only [invalidateConflictingBorrowsAtProj]

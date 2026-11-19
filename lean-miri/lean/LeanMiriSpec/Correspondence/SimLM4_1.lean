@@ -32,9 +32,9 @@ scalar-pair, unit, and array fragment (`ImmediateRel` / `MemPlaceRel`):
    `dropGlue = none` performs a plain `ControlFlow.goToBlock target` that
    preserves the local's value. Projected drops `⟨localId, [.field i _]⟩` keep
    canonical no-glue behavior in the hooks (`step_terminator_drop_projected_simulation`
-   for `.dead` and initialized scalar-pair roots;
-   `step_terminator_drop_projected_uninit_divergence` for the residual Stage-1
-   fault on an `.uninit` root).
+   for `.dead` and `.uninit` roots;
+   `step_terminator_drop_projected_init_no_glue_divergence` for initialized
+   scalar-pair roots where `Trusted` deinitializes the dropped field).
 3. `step_terminator_return_root_simulation`: `TerminatorKind.return_` from the
    root frame (`s.memory.callStack = []`) faults with UB on `.dead`/`.uninit` `_0`
    and produces the terminal `.retNormal retVal s.memory` outcome in Anneal and
@@ -453,15 +453,26 @@ theorem step_terminator_drop_noop_simulation
       | indirect slot0 mp cachedLayout hlay hne_dead hmemRel0 =>
         exact False.elim (himm' mp rfl)
       | immediate _ imm cachedLayout hcache hval =>
+        obtain ⟨hno_conf, htb', hvalid', hcid_bor', hbt', hbfv'⟩ :=
+          dropLocal_borrows_invariants hbfv htb hvalid hcid_bor hbt localId
+        let borrows' := invalidateConflictingBorrows s.memory.borrows localId .none (length s.memory.callStack)
         have ha_drop :
             evalTerminator s bb.terminator (some (activeMirBody rootBody s)) =
               MirStepNode.step
-                { s with frame := { blockIdx := target, stmtIdx := 0, locals := s.frame.locals.set localId .uninit } } := by
+                { s with
+                  frame := { blockIdx := target, stmtIdx := 0, locals := s.frame.locals.set localId .uninit }
+                  memory := { s.memory with borrows := borrows' } } := by
           unfold evalTerminator
           rw [hterm]
           dsimp only
           rw [hslot, set?_eq_some_set hlt_af]
-          rcases hval with ⟨rfl, _⟩ | ⟨_, rfl, _⟩ <;> rfl
+          cases hap : s.memory.activeProtectors with
+          | nil =>
+            rcases hval with ⟨rfl, _⟩ | ⟨_, rfl, _⟩ <;> rfl
+          | cons pH pT =>
+            have hcf := hno_conf pH pT hap
+            rcases hval with ⟨rfl, _⟩ | ⟨_, rfl, _⟩ <;>
+              (dsimp only; rw [hcf])
         have hrep_mf :=
           frame_replaceLocalValue_of_lt topFrame localId hlt_mf (.live (.immediate .uninit))
         rw [hrep_mf]
@@ -542,7 +553,7 @@ theorem step_terminator_drop_noop_simulation
         refine .mk topFrame' (by simp) hcal_root hcal_nonroot
           (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody] using hlinks'.toForall2)
           (by simpa [activeMirBody] using hlinks')
-          hdisj' htb hvalid hcid_pos hcid_act hcid_bor hbt hbfv
+          hdisj' htb' hvalid' hcid_pos hcid_act hcid_bor' hbt' hbfv'
 
 /-- **Divergence Lemma (`H3`, `canonical_drop_no_glue_preserves_local_divergence`)**:
 When dropping an unprojected live immediate local `localId` with value
@@ -651,7 +662,16 @@ theorem step_terminator_drop_projected_simulation
     (hroot :
       get? s.frame.locals localId = some .dead ∨
         get? s.frame.locals localId = some .uninit)
-    (fnPtrs : List FnPtrEntry := .nil) :
+    (fnPtrs : List FnPtrEntry := .nil)
+    (hShell :
+      (uninitContainerFieldShell?
+        (activeMirBody rootBody s).localDecls
+        (activeMirBody rootBody s).layouts
+        (resolveTyWithLocalDecls
+          (activeMirBody rootBody s).localDecls
+          (activeMirBody rootBody s).layouts
+          decl.ty)
+        fieldIdx).isSome = true := by rfl) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
@@ -699,7 +719,25 @@ theorem step_terminator_drop_projected_simulation
         exact False.elim (himm' mp rfl)
       | immediate _ imm cachedLayout hcache hval =>
         rcases hval with ⟨rfl, rfl⟩ | ⟨v, rfl, _⟩
-        · have hpush_go :
+        · obtain ⟨shVal, hsh_eq⟩ := Option.isSome_iff_exists.mp hShell
+          have hpty :
+              placeTy (activeMirBody rootBody s).localDecls (activeMirBody rootBody s).layouts
+                { local_ := localId, projection := .nil } = some decl.ty := by
+            unfold placeTy
+            rw [hdecl]
+          let rProj :=
+            resolveBorrowWriteLocalProj
+              (activeMirBody rootBody s).localDecls
+              (activeMirBody rootBody s).layouts
+              s.frame.locals
+              localId
+              [.field fieldIdx fieldTy]
+          let borrows' :=
+            invalidateConflictingBorrowsAtProj s.memory.borrows localId .none rProj 0 0
+              (length s.memory.callStack)
+          obtain ⟨hno_conf, htb', hvalid', hcid_bor', hbt', hbfv'⟩ :=
+            dropLocalAtProj_borrows_invariants hbfv htb hvalid hcid_bor hbt localId rProj
+          have hpush_go :
               m.stack.frames.pop.push { topFrame with location := .mir ⟨target, 0⟩ } =
                 ⟨restMfs.reverse ++ [{ topFrame with location := .mir ⟨target, 0⟩ }]⟩ := by
             apply Array.ext'
@@ -721,17 +759,49 @@ theorem step_terminator_drop_projected_simulation
             rw [harr] at hdisj
             refine hdisj.replace_top ?_ (fun _ _ lay hi => ⟨lay, hi⟩)
             exact hdisj.intra_frame topFrame (by simp)
+          have htail :
+              deinitTailOk s.frame.locals
+                (activeMirBody rootBody s).localDecls
+                (activeMirBody rootBody s).layouts
+                (placeTy (activeMirBody rootBody s).localDecls (activeMirBody rootBody s).layouts
+                  { local_ := localId, projection := .nil })
+                [.field fieldIdx fieldTy] = true := by
+            rw [hpty]
+            unfold deinitTailOk
+            dsimp only
+            rw [hsh_eq]
+          have ha_drop_uninit :
+              evalTerminator s bb.terminator (some (activeMirBody rootBody s)) =
+                MirStepNode.step
+                  { s with
+                    frame := { blockIdx := target, stmtIdx := 0, locals := s.frame.locals }
+                    memory := { s.memory with borrows := borrows' } } := by
+            unfold evalTerminator
+            rw [hterm]
+            dsimp only [bodyLocalDeclsOf]
+            rw [hslot, htail]
+            cases hap : s.memory.activeProtectors with
+            | nil => rfl
+            | cons pH pT =>
+              dsimp only
+              rw [hno_conf pH pT hap]
           rcases hfield with rfl | rfl <;>
-          · dsimp only [deinitTailOk, Miri.Interpreter.ControlFlow.goToBlock,
+          · have ha_drop_uninit' := ha_drop_uninit
+            unfold evalTerminator at ha_drop_uninit'
+            rw [hterm] at ha_drop_uninit'
+            dsimp only [bodyLocalDeclsOf] at ha_drop_uninit'
+            rw [hslot, htail] at ha_drop_uninit'
+            dsimp only at ha_drop_uninit'
+            dsimp only [bodyLocalDeclsOf, Miri.Interpreter.ControlFlow.goToBlock,
               Miri.Interpreter.ControlFlow.setLocation, Miri.Interpreter.Stack.currentFrame?]
-            rw [hback]
+            rw [htail, hback]
             dsimp only [Except.map, pure, Pure.pure]
-            rw [hpush_go]
+            rw [hpush_go, ha_drop_uninit']
             apply StepRelMultiFrame.step
             exact .mk topFrame' (array_back?_append_singleton restMfs.reverse topFrame') hcal_root hcal_nonroot
               (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody] using hlinks'.toForall2)
               (by simpa [activeMirBody] using hlinks')
-              hdisj' htb hvalid hcid_pos hcid_act hcid_bor hbt hbfv
+              hdisj' htb' hvalid' hcid_pos hcid_act hcid_bor' hbt' hbfv'
         · exfalso
           rcases hroot with hdead | huninit
           · rw [hslot] at hdead; cases hdead
@@ -788,7 +858,7 @@ theorem step_terminator_drop_projected_init_no_glue_divergence
       tf'.locals[localId]? =
         some ⟨.live (.immediate (.scalarPair (.fromScalarInt msc₁) (.fromScalarInt msc₂))), lay⟩ := by
   intro deinitPair
-  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, htb, hvalid, _, _, hcid_bor, hbt, hbfv⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -824,10 +894,22 @@ theorem step_terminator_drop_projected_init_no_glue_divergence
           .ok ⟨.live (.immediate (.scalarPair (.fromScalarInt msc₁) (.fromScalarInt msc₂))), lay⟩ := by
         unfold Miri.Interpreter.Frame.getLocal
         simp [hlt_mf, hmls_p, pure, Except.pure]
+      let rProj :=
+        resolveBorrowWriteLocalProj
+          (activeMirBody rootBody s).localDecls
+          (activeMirBody rootBody s).layouts
+          s.frame.locals
+          localId
+          [.field fieldIdx fieldTy]
+      obtain ⟨hno_conf, _, _, _, _, _⟩ :=
+        dropLocalAtProj_borrows_invariants hbfv htb hvalid hcid_bor hbt localId rProj
       refine ⟨?_, ?_⟩
       · refine ⟨{ s with
           frame := { blockIdx := target, stmtIdx := 0,
-                     locals := s.frame.locals.set localId (.init deinitPair) } }, ?_, rfl, ?_, ?_⟩
+                     locals := s.frame.locals.set localId (.init deinitPair) }
+          memory := { s.memory with
+            borrows := invalidateConflictingBorrowsAtProj s.memory.borrows localId .none
+              rProj 0 0 (length s.memory.callStack) } }, ?_, rfl, ?_, ?_⟩
         · rw [stepMirFn_activeMirBody_eq rootBody s hphase]
           have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
           simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
@@ -835,10 +917,19 @@ theorem step_terminator_drop_projected_init_no_glue_divergence
           rw [hterm]
           dsimp only [bodyLocalDeclsOf, deinitProjectedForLocal]
           rw [hpair]
-          dsimp only
+          dsimp only [projListHasDeref]
           rw [hNoUnion]
-          rcases hfield with rfl | rfl <;>
-            simp [deinitPair, deinitProjectedValue, get?, set?, hlt_af]
+          cases hap : s.memory.activeProtectors with
+          | nil =>
+            dsimp only [rProj]
+            rcases hfield with rfl | rfl <;>
+              simp [deinitPair, deinitProjectedValue, get?, set?, hlt_af]
+          | cons pH pT =>
+            have hcf := hno_conf pH pT hap
+            dsimp only [rProj] at hcf ⊢
+            rw [hcf]
+            rcases hfield with rfl | rfl <;>
+              simp [deinitPair, deinitProjectedValue, get?, set?, hlt_af]
         · rw [get?_eq_getElem?, List.getElem?_set_self hlt_af]
         · rcases hfield with rfl | rfl <;> rfl
       · have hpush_go :
@@ -935,7 +1026,7 @@ theorem step_terminator_drop_canonical_no_glue_step_divergence
       gf.locals[localId]? = some ⟨.live (.immediate (.scalar (.fromScalarInt msc))), lay⟩) := by
   have hsim :=
     step_terminator_drop_noop_simulation hstate hphase hbb hstmt_none hstmt_len hterm hdecl himm
-  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, htb, hvalid, _, _, hcid_bor, hbt, hbfv⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
   · rw [hmfs] at hforall; cases hforall
@@ -951,6 +1042,8 @@ theorem step_terminator_drop_canonical_no_glue_step_divergence
       have hslot_eq : slot = .init (.scalar sc) := Option.some.inj (hslot.symm.trans hslot_sc)
       subst hslot_eq
       have himm' := himm topFrame hback mls hmls
+      obtain ⟨hno_conf, _, _, _, _, _⟩ :=
+        dropLocal_borrows_invariants hbfv htb hvalid hcid_bor hbt localId
       cases hloc with
       | indirect _ mp _ _ _ _ => exact False.elim (himm' mp rfl)
       | immediate _ imm cachedLayout _ hval =>
@@ -960,7 +1053,11 @@ theorem step_terminator_drop_canonical_no_glue_step_divergence
           cases himmRel with
           | scalar _ msc _ _ _ _ =>
             refine ⟨hsim, ?_, ?_⟩
-            · refine ⟨{ s with frame := { blockIdx := target, stmtIdx := 0, locals := s.frame.locals.set localId .uninit } }, ?_, ?_⟩
+            · refine ⟨{ s with
+                frame := { blockIdx := target, stmtIdx := 0, locals := s.frame.locals.set localId .uninit }
+                memory := { s.memory with
+                  borrows := invalidateConflictingBorrows s.memory.borrows localId .none
+                    (length s.memory.callStack) } }, ?_, ?_⟩
               · rw [stepMirFn_activeMirBody_eq rootBody s hphase]
                 have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
                 simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
@@ -968,6 +1065,11 @@ theorem step_terminator_drop_canonical_no_glue_step_divergence
                 rw [hterm]
                 dsimp only
                 rw [hslot_sc, set?_eq_some_set hlt_af]
+                cases hap : s.memory.activeProtectors with
+                | nil => rfl
+                | cons pH pT =>
+                  dsimp only
+                  rw [hno_conf pH pT hap]
               · dsimp only
                 rw [get?_eq_getElem?, List.getElem?_set_self hlt_af]
             · have hmls' : topFrame.locals[localId]'hlt_mf =

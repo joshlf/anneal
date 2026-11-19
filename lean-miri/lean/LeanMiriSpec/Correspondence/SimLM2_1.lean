@@ -7651,12 +7651,11 @@ private theorem writeProjectedForLocal_elem_eq
     (locals : List LocalSlot) (arrIdx : Local) {proj : ProjectionElem}
     (hproj : WellTypedArrayElemProj body s tf proj)
     (rootVal newVal : Value) :
-    writeProjectedForLocal locals body.localDecls body.layouts arrIdx
-        (ensureNestedFieldShells rootVal [proj]) [proj] newVal =
+    writeProjectedForLocal locals body.localDecls body.layouts arrIdx rootVal [proj] newVal =
       writeProjectedValue locals rootVal [proj] newVal := by
   have hnu := placeTouchesUnion_single_elem_false body.localDecls body.layouts arrIdx hproj.shape
   rcases hproj.shape with ⟨_, rfl⟩ | ⟨_, _, _, rfl⟩ <;> {
-    dsimp only [ensureNestedFieldShells, writeProjectedForLocal]
+    dsimp only [writeProjectedForLocal]
     rw [hnu]
   }
 
@@ -8013,7 +8012,7 @@ theorem step_assign_array_element_simulation
                 (.aggregate 0 es) (.scalar sc)
               have hw_f := hw_for (.aggregate 0 es) (.scalar sc)
               rw [hproj_c] at hw_c hw_ub hw_f
-              rw [hes]; dsimp only; rw [hw_f, hw_c, hw_ub (.scalar sc)]
+              rw [hes]; dsimp only [ensureNestedFieldShells]; rw [hw_f, hw_c, hw_ub (.scalar sc)]
           | constantIndex offset minLen fromEnd =>
             dsimp only
             rw [hget_arr₁]
@@ -8024,7 +8023,7 @@ theorem step_assign_array_element_simulation
                 (.aggregate 0 es) (.scalar sc)
               have hw_f := hw_for (.aggregate 0 es) (.scalar sc)
               rw [hproj_c] at hw_c hw_ub hw_f
-              rw [hes]; dsimp only; rw [hw_f, hw_c, hw_ub (.scalar sc)]
+              rw [hes]; dsimp only [ensureNestedFieldShells]; rw [hw_f, hw_c, hw_ub (.scalar sc)]
           | _ =>
             cases hproj_c ▸ hproj
         have hm_err : Miri.Interpreter.Step.evalStatement
@@ -8125,7 +8124,7 @@ theorem step_assign_array_element_simulation
           | index _ =>
             dsimp only
             rw [hinit_elems₁]
-            dsimp only
+            dsimp only [ensureNestedFieldShells]
             rw [hproj_c] at hw_congr hwrite_proj hw_for
             rw [hw_for, hw_congr, hwrite_proj (.scalar sc)]
             dsimp only
@@ -8135,7 +8134,7 @@ theorem step_assign_array_element_simulation
           | constantIndex _ _ _ =>
             dsimp only
             rw [hinit_elems₁]
-            dsimp only
+            dsimp only [ensureNestedFieldShells]
             rw [hproj_c] at hw_congr hwrite_proj hw_for
             rw [hw_for, hw_congr, hwrite_proj (.scalar sc)]
             dsimp only
@@ -8225,7 +8224,7 @@ theorem step_assign_array_element_simulation
             · simp [hu, uninitFieldWriteShell?]
             · have hw_f := hw_for (.aggregate 0 es) (.scalar sc_s)
               rw [hproj_c] at hw_ub hw_f
-              rw [hes]; dsimp only; rw [hw_f, hw_ub (.scalar sc_s)]
+              rw [hes]; dsimp only [ensureNestedFieldShells]; rw [hw_f, hw_ub (.scalar sc_s)]
           | constantIndex _ _ _ =>
             dsimp only
             rcases ha_dst_ub with hd | hu | ⟨es, hes, hw_ub⟩
@@ -8233,7 +8232,7 @@ theorem step_assign_array_element_simulation
             · simp [hu, uninitFieldWriteShell?]
             · have hw_f := hw_for (.aggregate 0 es) (.scalar sc_s)
               rw [hproj_c] at hw_ub hw_f
-              rw [hes]; dsimp only; rw [hw_f, hw_ub (.scalar sc_s)]
+              rw [hes]; dsimp only [ensureNestedFieldShells]; rw [hw_f, hw_ub (.scalar sc_s)]
           | _ =>
             cases hproj_c ▸ hdst_proj
         rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb
@@ -8341,7 +8340,7 @@ theorem step_assign_array_element_simulation
           | index _ =>
             dsimp only
             rw [hinit_elems]
-            dsimp only
+            dsimp only [ensureNestedFieldShells]
             rw [hproj_c] at hwrite_proj hw_for
             rw [hw_for, hwrite_proj (.scalar sc_s)]
             dsimp only
@@ -8351,7 +8350,7 @@ theorem step_assign_array_element_simulation
           | constantIndex _ _ _ =>
             dsimp only
             rw [hinit_elems]
-            dsimp only
+            dsimp only [ensureNestedFieldShells]
             rw [hproj_c] at hwrite_proj hw_for
             rw [hw_for, hwrite_proj (.scalar sc_s)]
             dsimp only

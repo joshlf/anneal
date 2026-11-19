@@ -4187,17 +4187,18 @@ private theorem StructMemPlaceRel.ensureNestedFieldShells_eq
     {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
     {rootVal : Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
     (h : StructMemPlaceRel mach ty layouts fields paths rootVal mp)
+    (decls : List LocalDecl) (curTyOpt : Option Ty)
     {k : Nat} (hk : k < fields.length)
     {projs sfx : List ProjectionElem} (hne : projs ≠ [])
     (hp : paths[k]? = some (projs ++ sfx)) :
-    ensureNestedFieldShells rootVal projs = rootVal := by
+    ensureNestedFieldShells rootVal projs decls layouts curTyOpt = .some rootVal := by
   rcases h with ⟨_, _, _, _, _, _, hplen, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hfields, _⟩
   obtain ⟨_, _, _, hvpath, _⟩ := hfields k hk
   have hk_p : k < paths.length := by rw [hplen]; exact hk
   rw [List.getElem?_eq_getElem hk_p] at hp
   injection hp with hp_eq
   rw [hp_eq] at hvpath
-  exact ensureNestedFieldShells_eq_self_of_populated projs rootVal
+  exact ensureNestedFieldShells_eq_self_of_populated projs rootVal decls layouts curTyOpt
     (hvpath.of_append hne).fieldShellChainPopulated_true
 
 theorem evalStatement_assign_use_lm2_2_eq
@@ -4568,9 +4569,11 @@ private theorem step_assign_nested_field_write_simulation_core
               MirStepNode.step (advanceStmt s (locals₁.set dstIdx (.init rootVal')) s.memory) := by
             unfold evalStmt; dsimp only
             rw [hev_rv]; dsimp only
-            rw [hdst_loc₁]; dsimp only [writeProjectedForLocal]
-            rw [hnot_union, hsmpr_init.ensureNestedFieldShells_eq hk (by nofun)
+            rw [hdst_loc₁]; dsimp only
+            rw [hsmpr_init.ensureNestedFieldShells_eq body.localDecls _ hk (by nofun)
               (sfx := []) (by simpa using hpath_eq)]
+            dsimp only [writeProjectedForLocal]
+            rw [hnot_union]
             have hwp : writeProjectedValue locals₁ rootVal (.field idx₀ fty₀ :: ps) (.scalar sc) =
                 .ok rootVal' := by rw [← hpk_eq]; exact hw_proj locals₁
             rw [hwp]; dsimp only
@@ -4660,9 +4663,11 @@ private theorem step_assign_nested_field_write_simulation_core
               MirStepNode.step (advanceStmt s (locals₁.set dstIdx (.init rootVal')) s.memory) := by
             unfold evalStmt; dsimp only
             rw [hev_rv]; dsimp only
-            rw [hdst_loc₁]; dsimp only [writeProjectedForLocal]
-            rw [hnot_union, hsmpr.ensureNestedFieldShells_eq hk (by nofun)
+            rw [hdst_loc₁]; dsimp only
+            rw [hsmpr.ensureNestedFieldShells_eq body.localDecls _ hk (by nofun)
               (sfx := []) (by simpa using hpath_eq)]
+            dsimp only [writeProjectedForLocal]
+            rw [hnot_union]
             have hwp : writeProjectedValue locals₁ rootVal (.field idx₀ fty₀ :: ps) (.scalar sc) =
                 .ok rootVal' := by rw [← hpk_eq]; exact hw_proj locals₁
             rw [hwp]; dsimp only
@@ -5031,9 +5036,11 @@ theorem step_assign_nested_substruct_write_simulation
                 MirStepNode.step (advanceStmt s (locals₁.set dstIdx (.init rootVal')) s.memory) := by
               unfold evalStmt; dsimp only
               rw [hev_rv]; dsimp only
-              rw [hdst_loc₁]; dsimp only [writeProjectedForLocal]
-              rw [hnot_union, hsmpr.ensureNestedFieldShells_eq hk₀ (by nofun)
+              rw [hdst_loc₁]; dsimp only
+              rw [hsmpr.ensureNestedFieldShells_eq body.localDecls _ hk₀ (by nofun)
                 (sfx := [.field 0 mid₀]) (by rw [List.getElem?_eq_getElem hk₀_p, hpath₀])]
+              dsimp only [writeProjectedForLocal]
+              rw [hnot_union]
               rw [hw_proj locals₁]; dsimp only
               rw [set?_eq_some_set hlt_loc₁, hprot, hbor]
               dsimp only [invalidateConflictingBorrowsAtProj]
@@ -5351,9 +5358,11 @@ theorem step_assign_nested_scalar_wrap_write_simulation
                   MirStepNode.step (advanceStmt s (locals₁.set dstIdx (.init rootVal')) s.memory) := by
                 unfold evalStmt; dsimp only
                 rw [hev_rv]; dsimp only
-                rw [hdst_loc₁]; dsimp only [writeProjectedForLocal]
-                rw [hnot_union, hsmpr_init.ensureNestedFieldShells_eq hk₀ (by nofun)
+                rw [hdst_loc₁]; dsimp only
+                rw [hsmpr_init.ensureNestedFieldShells_eq body.localDecls _ hk₀ (by nofun)
                   (sfx := [.field 0 mid₀]) (by rw [List.getElem?_eq_getElem hk₀_p, hpath₀])]
+                dsimp only [writeProjectedForLocal]
+                rw [hnot_union]
                 rw [hw_proj locals₁]; dsimp only
                 rw [set?_eq_some_set hlt_loc₁, hprot, hbor]
                 dsimp only [invalidateConflictingBorrowsAtProj]
@@ -5434,9 +5443,11 @@ theorem step_assign_nested_scalar_wrap_write_simulation
                   MirStepNode.step (advanceStmt s (locals₁.set dstIdx (.init rootVal')) s.memory) := by
                 unfold evalStmt; dsimp only
                 rw [hev_rv]; dsimp only
-                rw [hdst_loc₁]; dsimp only [writeProjectedForLocal]
-                rw [hnot_union, hsmpr.ensureNestedFieldShells_eq hk₀ (by nofun)
+                rw [hdst_loc₁]; dsimp only
+                rw [hsmpr.ensureNestedFieldShells_eq body.localDecls _ hk₀ (by nofun)
                   (sfx := [.field 0 mid₀]) (by rw [List.getElem?_eq_getElem hk₀_p, hpath₀])]
+                dsimp only [writeProjectedForLocal]
+                rw [hnot_union]
                 rw [hw_proj locals₁]; dsimp only
                 rw [set?_eq_some_set hlt_loc₁, hprot, hbor]
                 dsimp only [invalidateConflictingBorrowsAtProj]
@@ -7424,11 +7435,15 @@ private theorem evalStmt_assign_projected_step_location
           | ok rootVal' => exact finish_write locals₁ mem₁ rootVal'
       | init rootVal =>
         dsimp only
-        cases writeProjectedForLocal locals₁ body.localDecls body.layouts dstIdx
-            (ensureNestedFieldShells rootVal (.field idx₀ fty₀ :: ps))
-            (.field idx₀ fty₀ :: ps) val with
-        | ub | unsupported => intro h; cases h
-        | ok rootVal' => exact finish_write locals₁ mem₁ rootVal'
+        cases ensureNestedFieldShells rootVal (.field idx₀ fty₀ :: ps) body.localDecls body.layouts
+            (placeTy body.localDecls body.layouts { local_ := dstIdx, projection := .nil }) with
+        | none => intro h; cases h
+        | some rootValSh =>
+          dsimp only
+          cases writeProjectedForLocal locals₁ body.localDecls body.layouts dstIdx
+              rootValSh (.field idx₀ fty₀ :: ps) val with
+          | ub | unsupported => intro h; cases h
+          | ok rootVal' => exact finish_write locals₁ mem₁ rootVal'
 
 private theorem evalStmt_step_location_lm2_2
     {body : CapturedMir} {env : StructTypeEnv}

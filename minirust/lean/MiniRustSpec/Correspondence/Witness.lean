@@ -13528,10 +13528,10 @@ theorem evalStmt_deinit_proj_deinits (s : MachineState) (decls : List LocalDecl)
     evalStmt s ⟨.deinit ⟨i, pe :: rest⟩, span⟩ decls layouts =
       MirStepNode.step (advanceStmt s newLocals) := by
   cases pe with
-  | deref => simp [deinitProjectedForLocal, projListHasDeref] at hd
+  | deref => simp [deinitProjectedForLocal] at hd
   | _ =>
     simp [evalStmt, Trusted.Sequence.get?, hs, hd, hset, hbor, hprot,
-      invalidateConflictingBorrowsAtProj, MirStepNode.step, advanceStmt]
+      MirStepNode.step, advanceStmt]
     cases hm : s.memory; simp_all
 
 /-- The ABI of a function with one `Padded(u8, u32, u16)` argument returning
