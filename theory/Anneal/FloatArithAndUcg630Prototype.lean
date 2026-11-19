@@ -60,6 +60,18 @@ for `Trusted.Rustc.V2026_06_01.MirSemantics`:
      targets, the exact shape of the policy split (`strip = strict ∨ strict = UB`),
      and general (non-witness) policy-independence / no-forgery theorems.
 
+4. **Completeness results** (§9–§13):
+   - Correct rounding of `add` / `sub`, exactness and magnitude bound of `rem`,
+     gradual underflow, cross-format signaling-NaN survival, composite
+     (array / tuple / wide-slice) erasure, and cast-level policy independence;
+   - Sign symmetry of the rounding core (`roundRatioTiesToEven_not_neg`),
+     sign-symmetric `mul` / `div` / `rem`, and the multiplicative identity `1.0`;
+   - Multi-variant enum decoding: conservativity of the untyped policy-aware
+     decoder with respect to the trusted decoder, the pointer-payload
+     regression witness, and the typed per-variant decoder
+     (`decodeMultiVariantEnumTypedWithPolicy`);
+   - Outcome shape and failure preservation of the relational dispatcher.
+
 Every definition and theorem follows projection discipline (`.1`/`.2` instead of
 `Prod.casesOn`/`Prod.rec`/`Prod.recOn`).
 -/
@@ -7937,5 +7949,882 @@ theorem multiVariant_enum_fix_separation_witness :
         (encodeLittleEndianBytes protoEnumShapedPtr.offsetBytes 8 .none) =
       .some (.aggregate 1 [.scalar ⟨42, 4⟩]) := by
   exact ⟨rfl, rfl, rfl⟩
+
+/-! ## §11. Sign Symmetry of Rounding, Sign-Symmetric Arithmetic & Multiplicative Identities -/
+
+private def rrExponent (f : IeeeFormat) (n d : Nat) : Int :=
+  max (ratioExponent n d) f.minExponent
+
+private def rrSignificand (f : IeeeFormat) (n d : Nat) : Nat :=
+  roundQuotientTiesToEven
+    (powScale n d ((f.fractionBits : Int) - rrExponent f n d)).1
+    (powScale n d ((f.fractionBits : Int) - rrExponent f n d)).2
+
+private def rrCarry (f : IeeeFormat) (n d : Nat) : Bool :=
+  decide (2 ^ (f.fractionBits + 1) ≤ rrSignificand f n d)
+
+private def rrSignificand' (f : IeeeFormat) (n d : Nat) : Nat :=
+  if rrCarry f n d then rrSignificand f n d / 2 else rrSignificand f n d
+
+private def rrExponent' (f : IeeeFormat) (n d : Nat) : Int :=
+  if rrCarry f n d then rrExponent f n d + 1 else rrExponent f n d
+
+/-- The trusted rounding core as a sign-independent decision tree: `neg` only
+selects the sign of the emitted zero / infinity / encoded bit pattern. -/
+private theorem roundRatioTiesToEven_eq_shape (f : IeeeFormat) (neg : Bool) (n d : Nat) :
+    roundRatioTiesToEven f neg n d =
+      if d = 0 then preferredNaNBits f
+      else if n = 0 then zeroBits f neg
+      else if rrExponent f n d > f.maxExponent then infBits f neg
+      else if rrExponent' f n d > f.maxExponent then infBits f neg
+      else if rrSignificand' f n d < 2 ^ f.fractionBits then
+        (if rrExponent' f n d = f.minExponent then encodeBits f neg 0 (rrSignificand' f n d)
+         else preferredNaNBits f)
+      else if 2 ^ (f.fractionBits + 1) ≤ rrSignificand' f n d then preferredNaNBits f
+      else encodeBits f neg (rrExponent' f n d + (f.bias : Int)).toNat
+        (rrSignificand' f n d - 2 ^ f.fractionBits) := rfl
+
+/-- **Sign symmetry of `roundTiesToEven`**: rounding the exact rational with the
+opposite sign yields exactly the bitwise negation (round-to-nearest-even is an
+odd function, including underflow to `±0`, subnormals, and overflow to `±Inf`). -/
+theorem roundRatioTiesToEven_not_neg (f : IeeeFormat) (neg : Bool) (n d : Nat) (hd : 0 < d) :
+    roundRatioTiesToEven f (!neg) n d =
+      evalFloatNegProto f (roundRatioTiesToEven f neg n d) := by
+  have hnn := roundRatioTiesToEven_not_nan f neg n d hd
+  have hpn := isNaNBits_preferredNaNBits f
+  rw [roundRatioTiesToEven_eq_shape] at hnn
+  rw [roundRatioTiesToEven_eq_shape f (!neg), roundRatioTiesToEven_eq_shape f neg]
+  have hd0 : ¬ d = 0 := by omega
+  rw [if_neg' hd0] at hnn
+  rw [if_neg' hd0, if_neg' hd0]
+  by_cases hn0 : n = 0
+  · rw [if_pos' hn0, if_pos' hn0]
+    exact (evalFloatNegProto_zeroBits f neg).symm
+  · rw [if_neg' hn0] at hnn
+    rw [if_neg' hn0, if_neg' hn0]
+    by_cases he : rrExponent f n d > f.maxExponent
+    · rw [if_pos' he, if_pos' he]
+      exact (evalFloatNegProto_infBits f neg).symm
+    · rw [if_neg' he] at hnn
+      rw [if_neg' he, if_neg' he]
+      by_cases he' : rrExponent' f n d > f.maxExponent
+      · rw [if_pos' he', if_pos' he']
+        exact (evalFloatNegProto_infBits f neg).symm
+      · rw [if_neg' he'] at hnn
+        rw [if_neg' he', if_neg' he']
+        by_cases hs : rrSignificand' f n d < 2 ^ f.fractionBits
+        · rw [if_pos' hs] at hnn
+          rw [if_pos' hs, if_pos' hs]
+          by_cases hm : rrExponent' f n d = f.minExponent
+          · rw [if_pos' hm, if_pos' hm]
+            exact (evalFloatNegProto_encodeBits f neg 0 _ (Nat.two_pow_pos _) hs).symm
+          · rw [if_neg' hm, hpn] at hnn
+            cases hnn
+        · rw [if_neg' hs] at hnn
+          rw [if_neg' hs, if_neg' hs]
+          by_cases hbig : 2 ^ (f.fractionBits + 1) ≤ rrSignificand' f n d
+          · rw [if_pos' hbig, hpn] at hnn
+            cases hnn
+          · rw [if_neg' hbig, if_neg' hbig]
+            have hbias := IeeeFormat.two_bias_lt f
+            have htwo : 2 ^ (f.fractionBits + 1) = 2 * 2 ^ f.fractionBits := by
+              rw [Nat.pow_succ]; omega
+            have hE : (rrExponent' f n d + (f.bias : Int)).toNat < 2 ^ f.exponentBits := by
+              unfold IeeeFormat.maxExponent at he'
+              omega
+            have hF : rrSignificand' f n d - 2 ^ f.fractionBits < 2 ^ f.fractionBits := by omega
+            exact (evalFloatNegProto_encodeBits f neg _ _ hE hF).symm
+
+private theorem bool_xor_not_left (p q : Bool) : xor (!p) q = !(xor p q) := by
+  cases p <;> cases q <;> rfl
+
+private theorem bool_xor_not_right (p q : Bool) : xor p (!q) = !(xor p q) := by
+  cases p <;> cases q <;> rfl
+
+/-- `(-a) * b = -(a * b)` bit-for-bit whenever the product is not NaN. -/
+theorem evalFloatArithBaseProto_mul_neg_left (f : IeeeFormat) (a b : Nat)
+    (hnan : isNaNBits f (evalFloatArithBaseProto .mul f a b) = false) :
+    evalFloatArithBaseProto .mul f (evalFloatNegProto f a) b =
+      evalFloatNegProto f (evalFloatArithBaseProto .mul f a b) := by
+  have hpn := isNaNBits_preferredNaNBits f
+  unfold evalFloatArithBaseProto at hnan ⊢
+  rw [decodeBits_evalFloatNegProto]
+  cases hl : decodeBits f a with
+  | nan _ _ _ => rw [hl] at hnan; cases hpn.symm.trans hnan
+  | inf ln =>
+    cases hr : decodeBits f b with
+    | nan _ _ _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | zero _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | inf rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_infBits]
+    | finite rn _ _ =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_infBits]
+  | zero ln =>
+    cases hr : decodeBits f b with
+    | nan _ _ _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | inf _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | zero rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_zeroBits]
+    | finite rn _ _ =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_zeroBits]
+  | finite ln lnum lden =>
+    cases hr : decodeBits f b with
+    | nan _ _ _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | inf rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_infBits]
+    | zero rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_zeroBits]
+    | finite rn rnum rden =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left]
+      exact roundRatioTiesToEven_not_neg f _ _ _
+        (Nat.mul_pos (decodeBits_finite_den_pos f a ln lnum lden hl)
+          (decodeBits_finite_den_pos f b rn rnum rden hr))
+
+/-- `a * (-b) = -(a * b)` bit-for-bit whenever the product is not NaN. -/
+theorem evalFloatArithBaseProto_mul_neg_right (f : IeeeFormat) (a b : Nat)
+    (hnan : isNaNBits f (evalFloatArithBaseProto .mul f a b) = false) :
+    evalFloatArithBaseProto .mul f a (evalFloatNegProto f b) =
+      evalFloatNegProto f (evalFloatArithBaseProto .mul f a b) := by
+  rw [evalFloatArithBaseProto_mul_comm f a (evalFloatNegProto f b),
+    evalFloatArithBaseProto_mul_comm f a b]
+  rw [evalFloatArithBaseProto_mul_comm f a b] at hnan
+  exact evalFloatArithBaseProto_mul_neg_left f b a hnan
+
+/-- `(-a) / b = -(a / b)` bit-for-bit whenever the quotient is not NaN. -/
+theorem evalFloatArithBaseProto_div_neg_left (f : IeeeFormat) (a b : Nat)
+    (hnan : isNaNBits f (evalFloatArithBaseProto .div f a b) = false) :
+    evalFloatArithBaseProto .div f (evalFloatNegProto f a) b =
+      evalFloatNegProto f (evalFloatArithBaseProto .div f a b) := by
+  have hpn := isNaNBits_preferredNaNBits f
+  unfold evalFloatArithBaseProto at hnan ⊢
+  rw [decodeBits_evalFloatNegProto]
+  cases hl : decodeBits f a with
+  | nan _ _ _ => rw [hl] at hnan; cases hpn.symm.trans hnan
+  | inf ln =>
+    cases hr : decodeBits f b with
+    | nan _ _ _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | inf _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | zero rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_infBits]
+    | finite rn _ _ =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_infBits]
+  | zero ln =>
+    cases hr : decodeBits f b with
+    | nan _ _ _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | zero _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | inf rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_zeroBits]
+    | finite rn _ _ =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_zeroBits]
+  | finite ln lnum lden =>
+    cases hr : decodeBits f b with
+    | nan _ _ _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | zero rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_infBits]
+    | inf rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left, evalFloatNegProto_zeroBits]
+    | finite rn rnum rden =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_left]
+      exact roundRatioTiesToEven_not_neg f _ _ _
+        (Nat.mul_pos (decodeBits_finite_den_pos f a ln lnum lden hl)
+          (decodeBits_finite_num_pos f b rn rnum rden hr))
+
+/-- `a / (-b) = -(a / b)` bit-for-bit whenever the quotient is not NaN. -/
+theorem evalFloatArithBaseProto_div_neg_right (f : IeeeFormat) (a b : Nat)
+    (hnan : isNaNBits f (evalFloatArithBaseProto .div f a b) = false) :
+    evalFloatArithBaseProto .div f a (evalFloatNegProto f b) =
+      evalFloatNegProto f (evalFloatArithBaseProto .div f a b) := by
+  have hpn := isNaNBits_preferredNaNBits f
+  unfold evalFloatArithBaseProto at hnan ⊢
+  rw [decodeBits_evalFloatNegProto]
+  cases hl : decodeBits f a with
+  | nan _ _ _ => rw [hl] at hnan; cases hpn.symm.trans hnan
+  | inf ln =>
+    cases hr : decodeBits f b with
+    | nan _ _ _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | inf _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | zero rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_right, evalFloatNegProto_infBits]
+    | finite rn _ _ =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_right, evalFloatNegProto_infBits]
+  | zero ln =>
+    cases hr : decodeBits f b with
+    | nan _ _ _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | zero _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | inf rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_right, evalFloatNegProto_zeroBits]
+    | finite rn _ _ =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_right, evalFloatNegProto_zeroBits]
+  | finite ln lnum lden =>
+    cases hr : decodeBits f b with
+    | nan _ _ _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | zero rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_right, evalFloatNegProto_infBits]
+    | inf rn =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_right, evalFloatNegProto_zeroBits]
+    | finite rn rnum rden =>
+      dsimp only [negateFloatKind]
+      rw [bool_xor_not_right]
+      exact roundRatioTiesToEven_not_neg f _ _ _
+        (Nat.mul_pos (decodeBits_finite_den_pos f a ln lnum lden hl)
+          (decodeBits_finite_num_pos f b rn rnum rden hr))
+
+/-- `(-a) % b = -(a % b)` bit-for-bit whenever the remainder is not NaN (the
+remainder is an odd function of the dividend). -/
+theorem evalFloatArithBaseProto_rem_neg_left (f : IeeeFormat) (a b : Nat)
+    (hnan : isNaNBits f (evalFloatArithBaseProto .rem f a b) = false) :
+    evalFloatArithBaseProto .rem f (evalFloatNegProto f a) b =
+      evalFloatNegProto f (evalFloatArithBaseProto .rem f a b) := by
+  have hpn := isNaNBits_preferredNaNBits f
+  have hmodneg : evalFloatNegProto f a % 2 ^ f.width = evalFloatNegProto f (a % 2 ^ f.width) := by
+    rw [Nat.mod_eq_of_lt (evalFloatNegProto_lt f a), evalFloatNegProto_mod]
+  unfold evalFloatArithBaseProto at hnan ⊢
+  rw [decodeBits_evalFloatNegProto]
+  cases hl : decodeBits f a with
+  | nan _ _ _ => rw [hl] at hnan; cases hpn.symm.trans hnan
+  | inf _ =>
+    rw [hl] at hnan
+    cases hr : decodeBits f b <;> rw [hr] at hnan <;> cases hpn.symm.trans hnan
+  | zero ln =>
+    cases hr : decodeBits f b with
+    | nan _ _ _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | zero _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | inf _ => dsimp only [negateFloatKind]; exact hmodneg
+    | finite _ _ _ => dsimp only [negateFloatKind]; rw [evalFloatNegProto_zeroBits]
+  | finite ln lnum lden =>
+    cases hr : decodeBits f b with
+    | nan _ _ _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | zero _ => rw [hl, hr] at hnan; cases hpn.symm.trans hnan
+    | inf _ => dsimp only [negateFloatKind]; exact hmodneg
+    | finite rn rnum rden =>
+      dsimp only [negateFloatKind]
+      exact roundRatioTiesToEven_not_neg f _ _ _
+        (Nat.mul_pos (decodeBits_finite_den_pos f a ln lnum lden hl)
+          (decodeBits_finite_den_pos f b rn rnum rden hr))
+
+/-- `a % (-b) = a % b` unconditionally, for all bit patterns: the truncated
+remainder ignores the divisor's sign (also on NaN results, which are always the
+preferred NaN). -/
+theorem evalFloatArithBaseProto_rem_neg_right (f : IeeeFormat) (a b : Nat) :
+    evalFloatArithBaseProto .rem f a (evalFloatNegProto f b) =
+      evalFloatArithBaseProto .rem f a b := by
+  unfold evalFloatArithBaseProto
+  rw [decodeBits_evalFloatNegProto]
+  cases decodeBits f a <;> cases decodeBits f b <;> rfl
+
+/-- Bit pattern of `1.0` in format `f`. -/
+def oneBitsProto (f : IeeeFormat) : Nat := encodeBits f false f.bias 0
+
+theorem decodeBits_oneBitsProto (f : IeeeFormat) :
+    decodeBits f (oneBitsProto f) = .finite false (2 ^ f.fractionBits) (2 ^ f.fractionBits) := by
+  cases f <;> rfl
+
+private theorem bool_xor_false_right (p : Bool) : xor p false = p := by
+  cases p <;> rfl
+
+/-- `x * 1.0 = x` and `x / 1.0 = x` exactly (canonical bit pattern) for every
+non-NaN `x`: signed zeros, subnormals, normals, and infinities are fixed points
+(no spurious rounding or sign change). -/
+theorem evalFloatArithBaseProto_mul_div_one_right (f : IeeeFormat) (x : Nat)
+    (hx : isNaNBits f x = false) :
+    evalFloatArithBaseProto .mul f x (oneBitsProto f) = x % 2 ^ f.width ∧
+      evalFloatArithBaseProto .div f x (oneBitsProto f) = x % 2 ^ f.width := by
+  have hmod : x % 2 ^ f.width < 2 ^ f.width := Nat.mod_lt _ (Nat.two_pow_pos _)
+  unfold evalFloatArithBaseProto
+  rw [decodeBits_oneBitsProto, ← decodeBits_mod_width f x]
+  unfold isNaNBits at hx
+  rw [← decodeBits_mod_width f x] at hx
+  cases hd : decodeBits f (x % 2 ^ f.width) with
+  | nan _ _ _ => rw [hd] at hx; cases hx
+  | inf ln =>
+    dsimp only
+    rw [bool_xor_false_right]
+    exact ⟨(bits_eq_infBits_of_decodeBits_inf f _ ln hmod hd).symm,
+      (bits_eq_infBits_of_decodeBits_inf f _ ln hmod hd).symm⟩
+  | zero ln =>
+    dsimp only
+    rw [bool_xor_false_right]
+    exact ⟨(bits_eq_zeroBits_of_decodeBits_zero f _ ln hmod hd).symm,
+      (bits_eq_zeroBits_of_decodeBits_zero f _ ln hmod hd).symm⟩
+  | finite ln lnum lden =>
+    dsimp only
+    rw [bool_xor_false_right]
+    have hden := decodeBits_finite_den_pos f _ ln lnum lden hd
+    have hpow : 0 < 2 ^ f.fractionBits := Nat.two_pow_pos _
+    have hcongr : roundRatioTiesToEven f ln (lnum * 2 ^ f.fractionBits)
+        (lden * 2 ^ f.fractionBits) = roundRatioTiesToEven f ln lnum lden := by
+      rw [← roundRatioBits_tiesToEven, ← roundRatioBits_tiesToEven]
+      exact roundRatioBits_congr .tiesToEven f ln _ _ _ _ (Nat.mul_pos hden hpow) hden
+        (by rw [Nat.mul_right_comm, Nat.mul_assoc])
+    rw [hcongr]
+    exact ⟨roundRatioTiesToEven_eq_bits_of_decodeBits_finite f _ ln lnum lden hmod hd,
+      roundRatioTiesToEven_eq_bits_of_decodeBits_finite f _ ln lnum lden hmod hd⟩
+
+/-! ## §12. Multi-Variant Enum Fix: TCB Conservativity, Pointer-Payload Regression & Typed Per-Variant Decoding -/
+
+/-- A decoded scalar always carries the byte length of its image. -/
+theorem decodeScalarBytes_sizeBytes (bytes : List AbstractByte) (signed : Bool)
+    (p : ScalarVal × Option (Nat × Nat)) (h : decodeScalarBytes bytes signed = .some p) :
+    p.1.sizeBytes = length bytes := by
+  unfold decodeScalarBytes at h
+  dsimp only at h
+  cases hz : Nat.beq (length bytes) 0 with
+  | true => rw [hz] at h; cases h
+  | false =>
+    rw [hz] at h
+    cases hd : decodeLittleEndianBytes bytes with
+    | none => rw [hd] at h; cases h
+    | some q =>
+      rw [hd] at h
+      cases q with
+      | mk bits prov =>
+        injection h with hp
+        rw [← hp]
+
+/-- On integer scalar layouts other than the 4-byte `char` range
+(`0..=0x10FFFF`), `.stripProvenance` decoding coincides with the trusted
+provenance-oblivious `Bytes.decodeScalarLayoutBytes` (the decoder used by the
+TCB for multi-variant enum tags). On the 4-byte `char` range the policy decoder
+is additionally stricter (it rejects surrogates). -/
+theorem decodeScalarLayoutBytesWithPolicy_strip_eq_trusted_int
+    (bits : Nat) (signed : Bool) (vr : WrappingRange) (bytes : List AbstractByte)
+    (hnotchar : Bool.and (Nat.beq (Nat.div bits 8) 4)
+      (Bool.and (Nat.beq vr.start 0) (Nat.beq vr.end_ 0x10FFFF)) = false) :
+    decodeScalarLayoutBytesWithPolicy .stripProvenance (.initialized (.int bits signed) vr) bytes =
+      decodeScalarLayoutBytes (.initialized (.int bits signed) vr) bytes := by
+  unfold decodeScalarLayoutBytesWithPolicy decodeScalarLayoutBytes
+  dsimp only [scalarLayoutByteWidth, primitiveKindByteWidth]
+  cases Nat.beq bits 0 with
+  | true => rfl
+  | false =>
+    dsimp only
+    cases hlen : Nat.beq (length bytes) (Nat.div bits 8) with
+    | false => rfl
+    | true =>
+      dsimp only [policyRejectsProv]
+      cases hsc : decodeScalarBytes bytes false with
+      | none => rfl
+      | some p =>
+        have hsz : p.1.sizeBytes = Nat.div bits 8 :=
+          (decodeScalarBytes_sizeBytes bytes false p hsc).trans (Nat.eq_of_beq_eq_true hlen)
+        cases p with
+        | mk sv prov =>
+          dsimp only at hsz ⊢
+          cases wrappingRangeContains vr sv.bits with
+          | false => rfl
+          | true =>
+            dsimp only
+            rw [hsz, hnotchar]
+
+/-- **Conservativity of the proposed enum fix at `.stripProvenance`**: on every
+multi-variant enum layout whose tag decodes identically under the policy
+decoder and the trusted tag decoder (e.g. every integer tag outside the 4-byte
+`char` range, `decodeScalarLayoutBytesWithPolicy_strip_eq_trusted_int`),
+`decodeMultiVariantEnumWithPolicy .stripProvenance` **is** today's trusted
+`decodeTypedValueFromBytes` — for all byte images, with or without provenance.
+Hence adopting the fix changes TCB behavior only under `.strictUcg630Ub`, and
+there only by rejecting (`decodeMultiVariantEnumWithPolicy_strict_refines_strip`). -/
+theorem decodeMultiVariantEnumWithPolicy_strip_eq_trusted
+    (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy)
+    (layoutIdx : LayoutIdx) (l : TypeLayout) (tagLayout : ScalarLayout) (tagField : Nat)
+    (variantShapes : List FieldsShape) (bytes : List AbstractByte)
+    (hlk : LayoutTable.lookup layouts layoutIdx = .some l)
+    (hvar : l.variants = .multiple tagLayout tagField variantShapes)
+    (htag : ∀ bs, decodeScalarLayoutBytesWithPolicy .stripProvenance tagLayout bs =
+      decodeScalarLayoutBytes tagLayout bs) :
+    decodeTypedValueFromBytes (.succ fuel) layouts
+        { kind := .adt defPath args, layoutIdx := layoutIdx } bytes =
+      decodeMultiVariantEnumWithPolicy .stripProvenance l tagLayout tagField variantShapes
+        bytes := by
+  unfold decodeTypedValueFromBytes decodeMultiVariantEnumWithPolicy
+  dsimp only [normalizeCodecTy]
+  rw [hlk]
+  dsimp only
+  cases hu : Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
+  | true => rfl
+  | false =>
+    dsimp only
+    rw [hvar]
+    dsimp only
+    unfold decodeValueFromBytes
+    dsimp only
+    rw [hlk]
+    dsimp only
+    rw [hu]
+    dsimp only
+    rw [hvar]
+    dsimp only
+    cases l.fields with
+    | arbitrary outerOffsets _ =>
+      cases scalarLayoutByteWidth tagLayout with
+      | none => rfl
+      | some tagSz =>
+        dsimp only
+        cases get? outerOffsets tagField with
+        | none => rfl
+        | some tagOff =>
+          dsimp only
+          cases sliceAbstractBytes bytes tagOff.bytes tagSz with
+          | none => rfl
+          | some tagSlice =>
+            dsimp only
+            rw [htag]
+            cases decodeScalarLayoutBytes tagLayout tagSlice with
+            | none => rfl
+            | some tv => cases tv <;> rfl
+    | primitive => rfl
+    | union _ => rfl
+    | array _ _ => rfl
+
+/-- `enum P { A(*const u8), B(*const u8) }`: `u64` tag at offset `0`, thin
+pointer payload at offset `8` in both variants (layout index `1`), with the
+payload field layout (a pointer scalar) at index `2`. -/
+def protoPtrPayloadEnumLayout : TypeLayout := {
+  size := { bytes := 16 }
+  align := { bytes := 8 }
+  backendRepr := .memory
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple (.initialized (.int 64 false) ⟨0, 1⟩) 0
+    [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]]
+  isUninhabited := false
+}
+
+def protoPtrFieldLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 8 }
+  backendRepr := .scalar (.initialized (.pointer 0) ⟨0, scalarModulus 8 - 1⟩)
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+def protoU32FieldLayout : TypeLayout := {
+  size := { bytes := 4 }
+  align := { bytes := 4 }
+  backendRepr := .scalar (.initialized (.int 32 false) ⟨0, scalarModulus 4 - 1⟩)
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+def protoTypedEnumLayouts : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [protoUnitLayout, protoPtrPayloadEnumLayout, protoPtrFieldLayout,
+    protoTwoVariantEnumLayout, protoU32FieldLayout]
+}
+
+def protoPtrPayloadEnumTy : Ty := { kind := .adt "P" [], layoutIdx := 1 }
+
+/-- Byte image of the genuine value `P::B(p)` with `p = (alloc 7, addr 0x1000)`:
+a provenance-free tag `1` followed by an intact pointer image. No
+pointer-to-integer reinterpretation is involved. -/
+def protoPtrPayloadEnumBytes : List AbstractByte :=
+  appendAbstractBytes (encodeLittleEndianBytes 1 8 .none)
+    (encodeLittleEndianBytes 0x1000 8 (.some (7, 7)))
+
+/-- Policy-aware multi-variant enum decoding with **typed per-variant payload
+fields**: `variantFieldLayouts[varIdx]` lists the `LayoutTable` indices of the
+selected variant's fields (information the TCB layout capture must add, since
+`TypeLayout.fieldLayouts` exists only for single-variant aggregates). Each
+payload field is decoded by the policy-aware typed decoder `decodeChild` on its
+own byte slice, so pointer fields keep intact provenance under both policies
+and integer fields obey the policy field by field. When no per-variant field
+layouts are available it falls back to the untyped, whole-image-gated span
+decoding of `decodeMultiVariantEnumWithPolicy`. -/
+def decodeMultiVariantEnumTypedWithPolicy
+    (policy : Ptr2IntTransmutePolicy)
+    (decodeChild : Ty → List AbstractByte → Option Value)
+    (layouts : LayoutTable)
+    (l : TypeLayout)
+    (tagLayout : ScalarLayout)
+    (tagField : Nat)
+    (variantShapes : List FieldsShape)
+    (variantFieldLayouts : List (List Nat))
+    (bytes : List AbstractByte) :
+    Option Value :=
+  let spanFallback (varIdx : Nat) (varOffsets : List Size) : Option Value :=
+    match policyRejectsProv policy bytes with
+    | true => .none
+    | false =>
+      match decodeFieldsBySpan bytes l.size.bytes varOffsets with
+      | .some vals => .some (.aggregate varIdx vals)
+      | .none => .none
+  match Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
+  | true => .none
+  | false =>
+    match l.fields, scalarLayoutByteWidth tagLayout with
+    | .arbitrary outerOffsets _, .some tagSz =>
+      match get? outerOffsets tagField with
+      | .none => .none
+      | .some tagOff =>
+        match sliceAbstractBytes bytes tagOff.bytes tagSz with
+        | .none => .none
+        | .some tagSlice =>
+          match decodeScalarLayoutBytesWithPolicy policy tagLayout tagSlice with
+          | .some (.scalar tagSc) =>
+            match get? variantShapes tagSc.bits with
+            | .some (.arbitrary varOffsets _) =>
+              match get? variantFieldLayouts tagSc.bits with
+              | .some fls =>
+                match Nat.beq (length fls) (length varOffsets) with
+                | true =>
+                  match
+                    decodeFieldsByLayoutIdxs
+                      (fun fIdx fSlice =>
+                        decodeChild { kind := .adt "" .nil, layoutIdx := fIdx } fSlice)
+                      layouts bytes varOffsets fls
+                  with
+                  | .some vals => .some (.aggregate tagSc.bits vals)
+                  | .none => .none
+                | false => spanFallback tagSc.bits varOffsets
+              | .none => spanFallback tagSc.bits varOffsets
+            | _ => .none
+          | _ => .none
+    | _, _ => .none
+
+/-- Without per-variant field layouts the typed decoder is exactly the untyped
+proposal `decodeMultiVariantEnumWithPolicy` (conservative extension). -/
+theorem decodeMultiVariantEnumTypedWithPolicy_nil_eq
+    (policy : Ptr2IntTransmutePolicy) (decodeChild : Ty → List AbstractByte → Option Value)
+    (layouts : LayoutTable) (l : TypeLayout) (tagLayout : ScalarLayout) (tagField : Nat)
+    (variantShapes : List FieldsShape) (bytes : List AbstractByte) :
+    decodeMultiVariantEnumTypedWithPolicy policy decodeChild layouts l tagLayout tagField
+        variantShapes .nil bytes =
+      decodeMultiVariantEnumWithPolicy policy l tagLayout tagField variantShapes bytes := by
+  unfold decodeMultiVariantEnumTypedWithPolicy decodeMultiVariantEnumWithPolicy
+  dsimp only
+  cases Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
+  | true => rfl
+  | false =>
+    dsimp only
+    cases l.fields with
+    | arbitrary outerOffsets _ =>
+      cases scalarLayoutByteWidth tagLayout with
+      | none => rfl
+      | some tagSz =>
+        dsimp only
+        cases get? outerOffsets tagField with
+        | none => rfl
+        | some tagOff =>
+          dsimp only
+          cases sliceAbstractBytes bytes tagOff.bytes tagSz with
+          | none => rfl
+          | some tagSlice =>
+            dsimp only
+            cases decodeScalarLayoutBytesWithPolicy policy tagLayout tagSlice with
+            | none => rfl
+            | some tv =>
+              cases tv with
+              | scalar tagSc =>
+                dsimp only
+                cases get? variantShapes tagSc.bits with
+                | none => rfl
+                | some vs => cases vs <;> rfl
+              | unit => rfl
+              | ptr _ _ => rfl
+              | aggregate _ _ => rfl
+    | primitive => rfl
+    | union _ => rfl
+    | array _ _ => rfl
+
+/-- Policy refinement of the typed enum decoder: every `.strictUcg630Ub`
+success is the identical `.stripProvenance` success, provided the payload
+decoders refine (as `decodeTypedValueFromBytesWithPolicy` does). -/
+theorem decodeMultiVariantEnumTypedWithPolicy_strict_refines_strip
+    (childStrict childStrip : Ty → List AbstractByte → Option Value)
+    (layouts : LayoutTable) (l : TypeLayout) (tagLayout : ScalarLayout) (tagField : Nat)
+    (variantShapes : List FieldsShape) (variantFieldLayouts : List (List Nat))
+    (bytes : List AbstractByte) (v : Value)
+    (hchild : ∀ ty bs cv, childStrict ty bs = .some cv → childStrip ty bs = .some cv)
+    (h : decodeMultiVariantEnumTypedWithPolicy .strictUcg630Ub childStrict layouts l tagLayout
+      tagField variantShapes variantFieldLayouts bytes = .some v) :
+    decodeMultiVariantEnumTypedWithPolicy .stripProvenance childStrip layouts l tagLayout
+      tagField variantShapes variantFieldLayouts bytes = .some v := by
+  unfold decodeMultiVariantEnumTypedWithPolicy at h ⊢
+  dsimp only at h ⊢
+  cases hu : Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
+  | true => rw [hu] at h; cases h
+  | false =>
+    rw [hu] at h
+    dsimp only at h ⊢
+    cases hf : l.fields with
+    | arbitrary outerOffsets _ =>
+      rw [hf] at h
+      cases htw : scalarLayoutByteWidth tagLayout with
+      | none => rw [htw] at h; cases h
+      | some tagSz =>
+        rw [htw] at h
+        dsimp only at h ⊢
+        cases hg : get? outerOffsets tagField with
+        | none => rw [hg] at h; cases h
+        | some tagOff =>
+          rw [hg] at h
+          dsimp only at h ⊢
+          cases hsl : sliceAbstractBytes bytes tagOff.bytes tagSz with
+          | none => rw [hsl] at h; cases h
+          | some tagSlice =>
+            rw [hsl] at h
+            dsimp only at h ⊢
+            cases htd : decodeScalarLayoutBytesWithPolicy .strictUcg630Ub tagLayout tagSlice with
+            | none => rw [htd] at h; cases h
+            | some tv =>
+              rw [htd] at h
+              rw [decodeScalarLayoutBytesWithPolicy_strict_refines_strip tagLayout tagSlice tv htd]
+              cases tv with
+              | scalar tagSc =>
+                dsimp only at h ⊢
+                cases hvs : get? variantShapes tagSc.bits with
+                | none => rw [hvs] at h; cases h
+                | some vs =>
+                  rw [hvs] at h
+                  cases vs with
+                  | arbitrary varOffsets _ =>
+                    dsimp only at h ⊢
+                    have hspan :
+                        (match policyRejectsProv .strictUcg630Ub bytes with
+                          | true => (none : Option Value)
+                          | false =>
+                            match decodeFieldsBySpan bytes l.size.bytes varOffsets with
+                            | .some vals => .some (.aggregate tagSc.bits vals)
+                            | .none => .none) = .some v →
+                        (match policyRejectsProv .stripProvenance bytes with
+                          | true => (none : Option Value)
+                          | false =>
+                            match decodeFieldsBySpan bytes l.size.bytes varOffsets with
+                            | .some vals => .some (.aggregate tagSc.bits vals)
+                            | .none => .none) = .some v := by
+                      intro hs
+                      dsimp only [policyRejectsProv] at hs ⊢
+                      cases hp : abstractBytesHaveProv bytes with
+                      | true => rw [hp] at hs; cases hs
+                      | false => rw [hp] at hs; exact hs
+                    cases hfl : get? variantFieldLayouts tagSc.bits with
+                    | none => rw [hfl] at h; exact hspan h
+                    | some fls =>
+                      rw [hfl] at h
+                      dsimp only at h ⊢
+                      cases hlen : Nat.beq (length fls) (length varOffsets) with
+                      | false => rw [hlen] at h; exact hspan h
+                      | true =>
+                        rw [hlen] at h
+                        dsimp only at h ⊢
+                        cases hdf : decodeFieldsByLayoutIdxs
+                            (fun fIdx fSlice =>
+                              childStrict { kind := .adt "" .nil, layoutIdx := fIdx } fSlice)
+                            layouts bytes varOffsets fls with
+                        | none => rw [hdf] at h; cases h
+                        | some vals =>
+                          rw [hdf] at h
+                          rw [decodeFieldsByLayoutIdxs_mono
+                            (fun fIdx fSlice =>
+                              childStrict { kind := .adt "" .nil, layoutIdx := fIdx } fSlice)
+                            (fun fIdx fSlice =>
+                              childStrip { kind := .adt "" .nil, layoutIdx := fIdx } fSlice)
+                            layouts bytes (fun fIdx bs cv hc => hchild _ bs cv hc)
+                            varOffsets fls vals hdf]
+                          exact h
+                  | primitive => cases h
+                  | union _ => cases h
+                  | array _ _ => cases h
+              | unit => cases h
+              | ptr _ _ => cases h
+              | aggregate _ _ => cases h
+    | primitive => rw [hf] at h; cases h
+    | union _ => rw [hf] at h; cases h
+    | array _ _ => rw [hf] at h; cases h
+
+/-- **Kernel-checked critique of the untyped enum fix and its typed repair
+(`by rfl`)** on the genuine value `P::B(p)` (no pointer-to-integer
+reinterpretation anywhere):
+1. *TCB finding*: today's trusted decoder returns the pointer payload as a
+   provenance-less integer (`Value.scalar`) — pointer provenance is silently
+   dropped when a pointer-carrying multi-variant enum is decoded from bytes;
+2. *Regression of the untyped fix*: `decodeMultiVariantEnumWithPolicy
+   .strictUcg630Ub` rejects this image outright (its whole-image
+   `policyRejectsProv` gate cannot tell a pointer payload from a transmuted
+   integer), so adopting it at the `.multiple` fallback would turn every typed
+   copy of a pointer-carrying enum into UB under the default policy; under
+   `.stripProvenance` it still drops the provenance;
+3. *Typed repair*: with per-variant field layouts,
+   `decodeMultiVariantEnumTypedWithPolicy` returns `Value.ptr` with intact
+   provenance under **both** policies, while the integer-payload enum
+   `E { A(u32), B(u32) }` still flips (`.none` strict vs. `.some` strip) on
+   provenance-carrying pointer bytes. -/
+theorem multiVariant_enum_pointer_payload_regression_and_typed_fix_witness :
+    decodeTypedValueFromBytes 4 protoTypedEnumLayouts protoPtrPayloadEnumTy
+        protoPtrPayloadEnumBytes =
+      .some (.aggregate 1 [.scalar ⟨0x1000, 8⟩]) ∧
+    decodeMultiVariantEnumWithPolicy .strictUcg630Ub protoPtrPayloadEnumLayout
+        (.initialized (.int 64 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]]
+        protoPtrPayloadEnumBytes = .none ∧
+    decodeMultiVariantEnumWithPolicy .stripProvenance protoPtrPayloadEnumLayout
+        (.initialized (.int 64 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]]
+        protoPtrPayloadEnumBytes =
+      .some (.aggregate 1 [.scalar ⟨0x1000, 8⟩]) ∧
+    decodeMultiVariantEnumTypedWithPolicy .strictUcg630Ub
+        (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub 4 protoTypedEnumLayouts)
+        protoTypedEnumLayouts protoPtrPayloadEnumLayout
+        (.initialized (.int 64 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]] [[2], [2]]
+        protoPtrPayloadEnumBytes =
+      .some (.aggregate 1 [.ptr { allocId := 7, offsetBytes := 0x1000 } 8]) ∧
+    decodeMultiVariantEnumTypedWithPolicy .stripProvenance
+        (decodeTypedValueFromBytesWithPolicy .stripProvenance 4 protoTypedEnumLayouts)
+        protoTypedEnumLayouts protoPtrPayloadEnumLayout
+        (.initialized (.int 64 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]] [[2], [2]]
+        protoPtrPayloadEnumBytes =
+      .some (.aggregate 1 [.ptr { allocId := 7, offsetBytes := 0x1000 } 8]) ∧
+    decodeMultiVariantEnumTypedWithPolicy .strictUcg630Ub
+        (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub 4 protoTypedEnumLayouts)
+        protoTypedEnumLayouts protoTwoVariantEnumLayout
+        (.initialized (.int 32 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 4 }] [0], .arbitrary [{ bytes := 4 }] [0]] [[4], [4]]
+        (encodeLittleEndianBytes protoEnumShapedPtr.offsetBytes 8 (.some (7, 7))) = .none ∧
+    decodeMultiVariantEnumTypedWithPolicy .stripProvenance
+        (decodeTypedValueFromBytesWithPolicy .stripProvenance 4 protoTypedEnumLayouts)
+        protoTypedEnumLayouts protoTwoVariantEnumLayout
+        (.initialized (.int 32 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 4 }] [0], .arbitrary [{ bytes := 4 }] [0]] [[4], [4]]
+        (encodeLittleEndianBytes protoEnumShapedPtr.offsetBytes 8 (.some (7, 7))) =
+      .some (.aggregate 1 [.scalar ⟨42, 4⟩]) := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ## §13. Relational Dispatcher: Outcome Shape & Failure Preservation -/
+
+/-- **Outcome shape of the relational dispatcher** (both modes): every related
+result is either exactly the deterministic evaluator's result, or both are
+successful scalar results of the same byte width over the same post-state
+(`locals'`, `mem`) differing only in the scalar bits (the NaN choice). -/
+theorem EvalRvalueFloatRelProto.eq_fun_or_scalar_variant
+    (mode : FloatArithMode) (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (h : EvalRvalueFloatRelProto mode locals rv mem localDecls layouts res) :
+    res = evalRvalueFloatProto locals rv mem localDecls layouts ∨
+      ∃ out base w locals',
+        evalRvalueFloatProto locals rv mem localDecls layouts =
+          .ok (.scalar ⟨base, w⟩) locals' mem ∧
+        res = .ok (.scalar ⟨out, w⟩) locals' mem := by
+  unfold EvalRvalueFloatRelProto at h
+  cases rv with
+  | binaryOp op lhsOp rhsOp =>
+    dsimp only at h
+    cases hlTy : floatTyOf? (operandTy localDecls layouts lhsOp) with
+    | none => rw [hlTy] at h; exact Or.inl h
+    | some lhsFk =>
+      rw [hlTy] at h
+      cases hrTy : floatTyOf? (operandTy localDecls layouts rhsOp) with
+      | none => rw [hrTy] at h; exact Or.inl h
+      | some rhsFk =>
+        rw [hrTy] at h
+        cases hlEv : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals
+            localDecls mem.callStack with
+        | ub => rw [hlEv] at h; exact Or.inl h
+        | unsupported => rw [hlEv] at h; exact Or.inl h
+        | ok lv locals₁ =>
+          rw [hlEv] at h
+          cases lv with
+          | scalar lhsSc =>
+            dsimp only at h
+            cases hrEv : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts
+                mem.callerLocals localDecls mem.callStack with
+            | ub => rw [hrEv] at h; exact Or.inl h
+            | unsupported => rw [hrEv] at h; exact Or.inl h
+            | ok rvVal locals₂ =>
+              rw [hrEv] at h
+              cases rvVal with
+              | scalar rhsSc =>
+                dsimp only at h
+                cases hfmtL : ieeeFormatOfFloatTy? lhsFk with
+                | none => rw [hfmtL] at h; exact Or.inl h
+                | some fmtL =>
+                  rw [hfmtL] at h
+                  cases hfmtR : ieeeFormatOfFloatTy? rhsFk with
+                  | none => rw [hfmtR] at h; exact Or.inl h
+                  | some fmtR =>
+                    rw [hfmtR] at h
+                    dsimp only at h
+                    by_cases hcond : (fmtL == fmtR && Nat.beq lhsSc.sizeBytes fmtL.byteWidth &&
+                        Nat.beq rhsSc.sizeBytes fmtL.byteWidth && isFloatArithBinOp op) = true
+                    · rw [if_pos' hcond] at h
+                      have hcond3 : (fmtL == fmtR && Nat.beq lhsSc.sizeBytes fmtL.byteWidth &&
+                          Nat.beq rhsSc.sizeBytes fmtL.byteWidth) = true :=
+                        bool_and_true_left hcond
+                      have hop : isFloatArithBinOp op = true := bool_and_true_right hcond
+                      have heval : evalRvalueFloatProto locals (.binaryOp op lhsOp rhsOp) mem
+                          localDecls layouts =
+                          .ok (.scalar ⟨evalFloatArithBaseProto op fmtL lhsSc.bits rhsSc.bits,
+                            fmtL.byteWidth⟩) locals₂ mem := by
+                        unfold evalRvalueFloatProto
+                        dsimp only
+                        rw [hlTy, hrTy]; dsimp only
+                        rw [hlEv]; dsimp only
+                        rw [hrEv]; dsimp only
+                        rw [hfmtL, hfmtR]; dsimp only
+                        rw [if_pos' hcond3]
+                        unfold evalFloatArithBaseProto?
+                        rw [if_pos' hop]
+                      obtain ⟨out, _, hres⟩ := h
+                      exact Or.inr ⟨out, _, fmtL.byteWidth, locals₂, heval, hres⟩
+                    · rw [if_neg' hcond] at h
+                      exact Or.inl h
+              | unit => exact Or.inl h
+              | ptr _ _ => exact Or.inl h
+              | aggregate _ _ => exact Or.inl h
+          | unit => exact Or.inl h
+          | ptr _ _ => exact Or.inl h
+          | aggregate _ _ => exact Or.inl h
+  | _ => exact Or.inl h
+
+/-- **Failure preservation of the relational dispatcher** (both modes): a
+related result is `.ub` / `.unsupported` exactly when the deterministic
+evaluator's is, and a related `.ok` implies a deterministic `.ok` over the same
+post-state. Hence every functional fail-closed theorem (`f16` / `f128`, format
+mismatches, mixed float / non-float operands, `UnOp.not`) transfers verbatim to
+`EvalRvalueFloatRelProto`: nondeterministic NaN choice can never turn a failure
+into a success or vice versa. -/
+theorem EvalRvalueFloatRelProto.failure_preserved
+    (mode : FloatArithMode) (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (res : RvalueEvalResult)
+    (h : EvalRvalueFloatRelProto mode locals rv mem localDecls layouts res) :
+    (res = .ub ↔ evalRvalueFloatProto locals rv mem localDecls layouts = .ub) ∧
+    (res = .unsupported ↔
+      evalRvalueFloatProto locals rv mem localDecls layouts = .unsupported) ∧
+    (∀ v locals' mem', res = .ok v locals' mem' →
+      ∃ v', evalRvalueFloatProto locals rv mem localDecls layouts = .ok v' locals' mem') := by
+  rcases EvalRvalueFloatRelProto.eq_fun_or_scalar_variant mode locals rv mem localDecls layouts
+    res h with heq | ⟨out, base, w, locals₂, hfun, hres⟩
+  · rw [heq]
+    exact ⟨Iff.rfl, Iff.rfl, fun v locals' mem' hv => ⟨v, hv⟩⟩
+  · rw [hfun, hres]
+    refine ⟨⟨fun hc => (by cases hc), fun hc => (by cases hc)⟩,
+      ⟨fun hc => (by cases hc), fun hc => (by cases hc)⟩, ?_⟩
+    intro v locals' mem' hv
+    injection hv with _ hl hm
+    rw [← hl, ← hm]
+    exact ⟨_, rfl⟩
 
 end Anneal.FloatArithAndUcg630Prototype

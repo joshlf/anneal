@@ -37,12 +37,18 @@ Kernel-checked (`by rfl` / constructive proof) test suite covering:
 15. `.stripProvenance` composite erasure (arrays, tuples, wide-slice metadata), extra flip /
     preservation witnesses, full cast-level policy independence, no-forgery theorems, and
     the prototyped Finding #3 policy-aware multi-variant enum fix;
-16. Applied non-`True`-typed instantiations reaching 100% of public theorems in
-    `Anneal.FloatArithAndUcg630Prototype` (zero bare `True`-typed catch-all list);
-17. Automated `run_cmd` constructive axiom (`[propext, Quot.sound]`),
+16. Applied non-`True`-typed instantiations of the remaining Part A / Part B theorems
+    (zero bare `True`-typed catch-all list);
+17. Sign-symmetric `mul` / `div` / `rem`, the multiplicative identity `1.0`, enum-fix
+    conservativity, the pointer-payload regression witness, and typed per-variant enum
+    decoding;
+18. Direct instantiations of every theorem previously reached only transitively (including
+    the brief's headline negation, refinement, and provenance-free-equivalence theorems),
+    concrete nondeterministic dispatcher outcomes, and relational failure preservation;
+19. Automated `run_cmd` constructive axiom (`[propext, Quot.sound]`),
     projection-discipline (zero `Prod.casesOn`/`Prod.rec`/`Prod.recOn`, closed over
     matchers for definitions *and* theorem statements), zero-host-`Float`,
-    zero-`True`-typed-test, and 100% applied theorem reachability audit.
+    zero-`True`-typed-test, and 100% **direct** theorem coverage audit.
 -/
 
 namespace Anneal.FloatArithAndUcg630ProtoTests
@@ -1421,7 +1427,405 @@ theorem test_policy_indep_no_forge_and_enum_fix_applied
       [.arbitrary [{ bytes := 4 }] [0], .arbitrary [{ bytes := 4 }] [0]] bytes rfl,
    multiVariant_enum_fix_separation_witness.1⟩
 
-/-! ## §15. Automated `run_cmd` Constructive Axiom, Projection-Discipline & Reachability Audit -/
+/-! ## §15. Sign-Symmetric Arithmetic, Multiplicative Identities & Typed Enum Decoding -/
+
+set_option exponentiation.threshold 4096 in
+set_option maxRecDepth 65536 in
+/-- Sign symmetry of the rounding core and of `mul` / `div` / `rem`, and the
+multiplicative identity `1.0`, on concrete operands (including an inexact
+quotient, a subnormal, a negative zero remainder, and infinities) and for all
+bit patterns where the statement is unconditional. -/
+theorem test_sign_symmetry_and_identities (f : IeeeFormat) (a b : Nat) :
+    -- rounding 1/3 with either sign yields bitwise-negated results
+    roundRatioTiesToEven .binary32 (!false) 1 3 =
+      evalFloatNegProto .binary32 (roundRatioTiesToEven .binary32 false 1 3) ∧
+    roundRatioTiesToEven .binary32 true 1 3 = 0xBEAAAAAB ∧
+    -- (-3.0) * 2.0 = -(3.0 * 2.0) = -6.0 and 3.0 * (-2.0) = -6.0
+    evalFloatArithBaseProto .mul .binary32 (evalFloatNegProto .binary32 0x40400000) 0x40000000 =
+      evalFloatNegProto .binary32 (evalFloatArithBaseProto .mul .binary32 0x40400000 0x40000000) ∧
+    evalFloatArithBaseProto .mul .binary32 0x40400000 (evalFloatNegProto .binary32 0x40000000) =
+      evalFloatNegProto .binary32 (evalFloatArithBaseProto .mul .binary32 0x40400000 0x40000000) ∧
+    evalFloatArithBaseProto .mul .binary32 0xC0400000 0x40000000 = 0xC0C00000 ∧
+    -- (-1.0) / 3.0 = -(1.0 / 3.0) and 1.0 / (-3.0) = -(1.0 / 3.0) (inexact, rounded once)
+    evalFloatArithBaseProto .div .binary32 (evalFloatNegProto .binary32 0x3F800000) 0x40400000 =
+      evalFloatNegProto .binary32 (evalFloatArithBaseProto .div .binary32 0x3F800000 0x40400000) ∧
+    evalFloatArithBaseProto .div .binary32 0x3F800000 (evalFloatNegProto .binary32 0x40400000) =
+      evalFloatNegProto .binary32 (evalFloatArithBaseProto .div .binary32 0x3F800000 0x40400000) ∧
+    evalFloatArithBaseProto .div .binary32 0xBF800000 0x40400000 = 0xBEAAAAAB ∧
+    -- (-5.5) % 2.0 = -(5.5 % 2.0) = -1.5, and (-Inf) / 2.0 = -(Inf / 2.0)
+    evalFloatArithBaseProto .rem .binary32 (evalFloatNegProto .binary32 0x40B00000) 0x40000000 =
+      evalFloatNegProto .binary32 (evalFloatArithBaseProto .rem .binary32 0x40B00000 0x40000000) ∧
+    evalFloatArithBaseProto .div .binary32 (evalFloatNegProto .binary32 0x7F800000) 0x40000000 =
+      evalFloatNegProto .binary32 (evalFloatArithBaseProto .div .binary32 0x7F800000 0x40000000) ∧
+    -- the remainder ignores the divisor's sign, for every pair of bit patterns
+    evalFloatArithBaseProto .rem f a (evalFloatNegProto f b) = evalFloatArithBaseProto .rem f a b ∧
+    -- 1.0 decodes to 2^fb / 2^fb; x * 1.0 = x and x / 1.0 = x on -min_subnormal (f64),
+    -- -0.0 and -Inf (f32)
+    oneBitsProto .binary32 = 0x3F800000 ∧
+    oneBitsProto .binary64 = 0x3FF0000000000000 ∧
+    decodeBits f (oneBitsProto f) = .finite false (2 ^ f.fractionBits) (2 ^ f.fractionBits) ∧
+    evalFloatArithBaseProto .mul .binary64 0x8000000000000001 (oneBitsProto .binary64) =
+      0x8000000000000001 % 2 ^ IeeeFormat.binary64.width ∧
+    evalFloatArithBaseProto .div .binary64 0x8000000000000001 (oneBitsProto .binary64) =
+      0x8000000000000001 % 2 ^ IeeeFormat.binary64.width ∧
+    evalFloatArithBaseProto .mul .binary32 0x80000000 (oneBitsProto .binary32) =
+      0x80000000 % 2 ^ IeeeFormat.binary32.width ∧
+    evalFloatArithBaseProto .div .binary32 0xFF800000 (oneBitsProto .binary32) =
+      0xFF800000 % 2 ^ IeeeFormat.binary32.width :=
+  ⟨roundRatioTiesToEven_not_neg .binary32 false 1 3 (by decide),
+   rfl,
+   evalFloatArithBaseProto_mul_neg_left .binary32 0x40400000 0x40000000 rfl,
+   evalFloatArithBaseProto_mul_neg_right .binary32 0x40400000 0x40000000 rfl,
+   rfl,
+   evalFloatArithBaseProto_div_neg_left .binary32 0x3F800000 0x40400000 rfl,
+   evalFloatArithBaseProto_div_neg_right .binary32 0x3F800000 0x40400000 rfl,
+   rfl,
+   evalFloatArithBaseProto_rem_neg_left .binary32 0x40B00000 0x40000000 rfl,
+   evalFloatArithBaseProto_div_neg_left .binary32 0x7F800000 0x40000000 rfl,
+   evalFloatArithBaseProto_rem_neg_right f a b,
+   rfl,
+   rfl,
+   decodeBits_oneBitsProto f,
+   (evalFloatArithBaseProto_mul_div_one_right .binary64 0x8000000000000001 rfl).1,
+   (evalFloatArithBaseProto_mul_div_one_right .binary64 0x8000000000000001 rfl).2,
+   (evalFloatArithBaseProto_mul_div_one_right .binary32 0x80000000 rfl).1,
+   (evalFloatArithBaseProto_mul_div_one_right .binary32 0xFF800000 rfl).2⟩
+
+/-- The untyped enum fix is exactly today's trusted decoder under
+`.stripProvenance` (for every byte image and fuel), and the typed per-variant
+decoder refines across policies and preserves pointer payloads. -/
+theorem test_enum_fix_conservativity_and_typed_decoding (fuel : Nat)
+    (bytes : List AbstractByte) (v : Value) :
+    -- conservativity: trusted typed decoder = untyped fix at `.stripProvenance`
+    decodeTypedValueFromBytes (fuel + 1) protoEnumLayouts protoTwoVariantEnumTy bytes =
+      decodeMultiVariantEnumWithPolicy .stripProvenance protoTwoVariantEnumLayout
+        (.initialized (.int 32 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 4 }] [0], .arbitrary [{ bytes := 4 }] [0]] bytes ∧
+    -- the tag decoders agree on the `u32` tag (not the `char` range)
+    decodeScalarLayoutBytesWithPolicy .stripProvenance (.initialized (.int 32 false) ⟨0, 1⟩)
+        bytes =
+      decodeScalarLayoutBytes (.initialized (.int 32 false) ⟨0, 1⟩) bytes ∧
+    -- decoded scalars carry the image length
+    (∀ p, decodeScalarBytes bytes false = some p → p.1.sizeBytes = Trusted.Sequence.length bytes) ∧
+    -- without per-variant layouts the typed decoder is the untyped proposal
+    decodeMultiVariantEnumTypedWithPolicy .strictUcg630Ub
+        (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub 4 protoTypedEnumLayouts)
+        protoTypedEnumLayouts protoPtrPayloadEnumLayout (.initialized (.int 64 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]] [] bytes =
+      decodeMultiVariantEnumWithPolicy .strictUcg630Ub protoPtrPayloadEnumLayout
+        (.initialized (.int 64 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]] bytes ∧
+    -- typed decoder refinement on the pointer-payload enum, for every byte image
+    (decodeMultiVariantEnumTypedWithPolicy .strictUcg630Ub
+        (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub 4 protoTypedEnumLayouts)
+        protoTypedEnumLayouts protoPtrPayloadEnumLayout (.initialized (.int 64 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]] [[2], [2]] bytes =
+        some v →
+      decodeMultiVariantEnumTypedWithPolicy .stripProvenance
+        (decodeTypedValueFromBytesWithPolicy .stripProvenance 4 protoTypedEnumLayouts)
+        protoTypedEnumLayouts protoPtrPayloadEnumLayout (.initialized (.int 64 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]] [[2], [2]] bytes =
+        some v) ∧
+    -- regression of the untyped fix vs. typed repair on the genuine value `P::B(p)`
+    decodeMultiVariantEnumWithPolicy .strictUcg630Ub protoPtrPayloadEnumLayout
+        (.initialized (.int 64 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]]
+        protoPtrPayloadEnumBytes = none ∧
+    decodeMultiVariantEnumTypedWithPolicy .strictUcg630Ub
+        (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub 4 protoTypedEnumLayouts)
+        protoTypedEnumLayouts protoPtrPayloadEnumLayout (.initialized (.int 64 false) ⟨0, 1⟩) 0
+        [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]] [[2], [2]]
+        protoPtrPayloadEnumBytes =
+      some (.aggregate 1 [.ptr { allocId := 7, offsetBytes := 0x1000 } 8]) :=
+  ⟨decodeMultiVariantEnumWithPolicy_strip_eq_trusted fuel protoEnumLayouts "E" [] 1
+      protoTwoVariantEnumLayout (.initialized (.int 32 false) ⟨0, 1⟩) 0
+      [.arbitrary [{ bytes := 4 }] [0], .arbitrary [{ bytes := 4 }] [0]] bytes rfl rfl
+      (fun bs => decodeScalarLayoutBytesWithPolicy_strip_eq_trusted_int 32 false ⟨0, 1⟩ bs rfl),
+   decodeScalarLayoutBytesWithPolicy_strip_eq_trusted_int 32 false ⟨0, 1⟩ bytes rfl,
+   fun p hp => decodeScalarBytes_sizeBytes bytes false p hp,
+   decodeMultiVariantEnumTypedWithPolicy_nil_eq .strictUcg630Ub _ protoTypedEnumLayouts
+      protoPtrPayloadEnumLayout (.initialized (.int 64 false) ⟨0, 1⟩) 0
+      [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]] bytes,
+   fun h => decodeMultiVariantEnumTypedWithPolicy_strict_refines_strip
+      (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub 4 protoTypedEnumLayouts)
+      (decodeTypedValueFromBytesWithPolicy .stripProvenance 4 protoTypedEnumLayouts)
+      protoTypedEnumLayouts protoPtrPayloadEnumLayout (.initialized (.int 64 false) ⟨0, 1⟩) 0
+      [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]] [[2], [2]] bytes v
+      (fun ty bs cv hc =>
+        decodeTypedValueFromBytesWithPolicy_strict_refines_strip 4 protoTypedEnumLayouts ty bs cv
+          hc) h,
+   multiVariant_enum_pointer_payload_regression_and_typed_fix_witness.2.1,
+   multiVariant_enum_pointer_payload_regression_and_typed_fix_witness.2.2.2.1⟩
+
+/-! ## §16. Direct Instantiations of Every Theorem Previously Reached Only Transitively -/
+
+/-- The brief's headline negation theorems (`evalFloatNegProto_lt`,
+`evalFloatNegProto_involutive`, `decodeBits_evalFloatNegProto`) and their bit-level
+helpers, instantiated directly. -/
+theorem test_negation_headlines_direct (f : IeeeFormat) (bits : Nat) :
+    evalFloatNegProto f bits < 2 ^ f.width ∧
+    evalFloatNegProto .binary32 (evalFloatNegProto .binary32 0x7F800001) = 0x7F800001 ∧
+    decodeBits f (evalFloatNegProto f bits) = negateFloatKind (decodeBits f bits) ∧
+    decodeBits .binary32 (evalFloatNegProto .binary32 0x7FC0ABCD) = .nan true true 0x40ABCD ∧
+    unpackBits f (evalFloatNegProto f bits) =
+      { unpackBits f bits with neg := !(unpackBits f bits).neg } ∧
+    isNaNBits f (evalFloatNegProto f bits) = isNaNBits f bits ∧
+    signedNum (!true) 5 = -signedNum true 5 ∧
+    unpackBits f (bits % 2 ^ f.width) = unpackBits f bits ∧
+    decodeBits f (bits % 2 ^ f.width) = decodeBits f bits ∧
+    (0 : Nat) < 8388608 ∧
+    floatKindNeg (decodeBits f bits) = (unpackBits f bits).neg ∧
+    floatKindNeg (decodeBits .binary32 (roundRatioTiesToEven .binary32 true 1 3)) = true ∧
+    2 ^ f.width = 2 * 2 ^ (f.width - 1) :=
+  ⟨evalFloatNegProto_lt f bits,
+   evalFloatNegProto_involutive .binary32 0x7F800001 (by decide),
+   decodeBits_evalFloatNegProto f bits,
+   (decodeBits_evalFloatNegProto .binary32 0x7FC0ABCD).trans rfl,
+   unpackBits_evalFloatNegProto f bits,
+   isNaNBits_evalFloatNegProto f bits,
+   signedNum_neg true 5,
+   unpackBits_mod_width f bits,
+   decodeBits_mod_width f bits,
+   decodeBits_finite_num_pos .binary32 0x3F800000 false 8388608 8388608 rfl,
+   floatKindNeg_decodeBits f bits,
+   floatKindNeg_roundRatioTiesToEven .binary32 true 1 3 (by decide),
+   (ieeeFormat_width_split f).1⟩
+
+/-- NaN classification, canonicalization, and candidate-membership theorems
+instantiated directly. -/
+theorem test_nan_theorems_direct (f : IeeeFormat) (bits : Nat)
+    (inputs : List (IeeeFormat × Nat)) (mode : FloatArithMode) :
+    isNaNBits f (preferredNaNBits f) = true ∧
+    isNaNBits .binary32 0x7F800001 = true ∧
+    isNaNBits f (bits % 2 ^ f.width) = isNaNBits f bits ∧
+    isSignalingNaNBits f (bits % 2 ^ f.width) = isSignalingNaNBits f bits ∧
+    evalFloatToFloatRoundTiesToEven f .binary64 (bits % 2 ^ f.width) =
+      evalFloatToFloatRoundTiesToEven f .binary64 bits ∧
+    quietedNaNCandidates f (canonFloatInputs inputs) = quietedNaNCandidates f inputs ∧
+    signalingNaNCandidates f (canonFloatInputs inputs) = signalingNaNCandidates f inputs ∧
+    preferredNaNBits f ∈ nanChoicesProto f inputs mode ∧
+    0x7FC00000 ∈ nanChoicesProto .binary32 [(.binary32, 0x7F800001)] .nondeterministic ∧
+    (0xFFC00001 < 2 ^ IeeeFormat.binary32.width ∧ isNaNBits .binary32 0xFFC00001 = true) ∧
+    isAdmissibleQuietNaN .binary32 0x7FC00001 = true ∧
+    (0x7F800001 < 2 ^ IeeeFormat.binary32.width ∧
+      isSignalingNaNBits .binary32 0x7F800001 = true) ∧
+    (isSignalingNaNBits f bits = true ↔
+      ∃ neg payload, decodeBits f bits = .nan neg false payload ∧
+        payload ≠ 0 ∧ payload < 2 ^ (f.fractionBits - 1)) ∧
+    (0xFFC00001 ∈ expandNaNSigns .binary32 [0x7FC00001] ↔
+      ∃ c, c ∈ [0x7FC00001] ∧ (0xFFC00001 = c ∨ 0xFFC00001 = evalFloatNegProto .binary32 c)) ∧
+    (bits ∈ quietedNaNCandidates f inputs ↔
+      ∃ e, e ∈ inputs ∧ isNaNBits e.1 e.2 = true ∧
+        bits = evalFloatToFloatRoundTiesToEven e.1 f e.2) ∧
+    (bits ∈ signalingNaNCandidates f inputs ↔
+      ∃ e, e ∈ inputs ∧ isSignalingNaNBits e.1 e.2 = true ∧
+        signalingNaNLowerOf f e.1 e.2 ≠ 0 ∧ bits = signalingNaNCandidateOf f e.1 e.2) ∧
+    (signalingNaNLowerOf .binary32 .binary32 0xFF800002 ≠ 0 ∧
+      signalingNaNCandidateOf .binary32 .binary32 0xFF800002 =
+        0xFF800002 % 2 ^ IeeeFormat.binary32.width) :=
+  ⟨isNaNBits_preferredNaNBits f,
+   isNaNBits_of_isSignalingNaNBits .binary32 0x7F800001 rfl,
+   isNaNBits_mod_width f bits,
+   isSignalingNaNBits_mod_width f bits,
+   evalFloatToFloatRoundTiesToEven_mod_width f .binary64 bits,
+   quietedNaNCandidates_canon f inputs,
+   signalingNaNCandidates_canon f inputs,
+   preferredNaNBits_mem_nanChoicesProto f inputs mode,
+   nanChoicesProto_det_subset_nondet .binary32 [(.binary32, 0x7F800001)] 0x7FC00000 (by decide),
+   nanChoicesProto_mem_lt_and_nan .binary32 [(.binary32, 0x7F800001)] .nondeterministic
+      0xFFC00001 (by decide),
+   isAdmissibleQuietNaN_of_mem_quieted .binary32 [(.binary32, 0x7F800001)] 0x7FC00001
+      (by decide),
+   isSignalingNaNBits_of_mem_signaling .binary32 [(.binary32, 0x7F800001)] 0x7F800001
+      (by decide),
+   isSignalingNaNBits_iff_payload_lt f bits,
+   expandNaNSigns_mem_iff .binary32 [0x7FC00001] 0xFFC00001,
+   mem_quietedNaNCandidates_iff f inputs bits,
+   mem_signalingNaNCandidates_iff f inputs bits,
+   same_format_signaling_candidate_eq .binary32 0xFF800002 rfl⟩
+
+/-- Base-arithmetic NaN theorems and relational / dispatcher mode theorems
+instantiated directly. -/
+theorem test_arith_and_relational_direct (op : BinOp) (b out : Nat) (mode : FloatArithMode)
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (res : RvalueEvalResult) :
+    evalFloatArithBaseProto .div .binary32 0 0 = preferredNaNBits .binary32 ∧
+    evalFloatArithBaseProto op .binary32 0x7F800001 b = preferredNaNBits .binary32 ∧
+    evalFloatArithBaseProto op .binary32 b 0x7FC00000 = preferredNaNBits .binary32 ∧
+    evalFloatPartialCompareProto .binary32 (0x1BF800000 % 2 ^ IeeeFormat.binary32.width)
+        (b % 2 ^ IeeeFormat.binary32.width) =
+      evalFloatPartialCompareProto .binary32 0x1BF800000 b ∧
+    (EvalFloatBinOpRel mode .div .binary32 0 0 out →
+      isNaNBits .binary32 out = isNaNBits .binary32 (evalFloatArithBaseProto .div .binary32 0 0)) ∧
+    (EvalRvalueFloatRelProto .deterministic locals rv mem localDecls layouts res ↔
+      res = evalRvalueFloatProto locals rv mem localDecls layouts) ∧
+    (EvalRvalueFloatRelProto .deterministic locals rv mem localDecls layouts res →
+      EvalRvalueFloatRelProto .nondeterministic locals rv mem localDecls layouts res) :=
+  ⟨evalFloatArithBaseProto_eq_preferredNaN_of_isNaN .div .binary32 0 0 rfl,
+   evalFloatArithBaseProto_nan_left op .binary32 0x7F800001 b rfl,
+   evalFloatArithBaseProto_nan_right op .binary32 b 0x7FC00000 rfl,
+   evalFloatPartialCompareProto_mod_width .binary32 0x1BF800000 b,
+   fun h => EvalFloatBinOpRel.nan_iff mode .div .binary32 0 0 out h,
+   EvalRvalueFloatRelProto.det_iff locals rv mem localDecls layouts res,
+   fun h => EvalRvalueFloatRelProto.det_imp_nondet locals rv mem localDecls layouts res h⟩
+
+/-- The brief's headline policy theorems (structural refinement, provenance-free
+equivalence, union / thin-raw-pointer independence) and the provenance-erasure
+algebra, instantiated directly for arbitrary inputs. -/
+theorem test_policy_headlines_direct (bytes s : List AbstractByte) (fuel n off len : Nat)
+    (layouts : LayoutTable) (ty : Ty) (sl : ScalarLayout) (isRef : Bool) (pointee : RigidTy)
+    (ptrBytes : Nat) (v : Value) (locals : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) :
+    (abstractBytesHaveProv bytes = false →
+      abstractBytesHaveProv (takeAbstractBytes n bytes) = false) ∧
+    (abstractBytesHaveProv bytes = false →
+      abstractBytesHaveProv (dropAbstractBytes n bytes) = false) ∧
+    (abstractBytesHaveProv bytes = false → sliceAbstractBytes bytes off len = some s →
+      abstractBytesHaveProv s = false) ∧
+    (abstractBytesHaveProv bytes = false → abstractBytesUniformProv bytes = false) ∧
+    abstractBytesHaveProv (stripAbstractBytesProv bytes) = false ∧
+    Trusted.Sequence.length (stripAbstractBytesProv bytes) = Trusted.Sequence.length bytes ∧
+    decodeLittleEndianBytes (stripAbstractBytesProv bytes) =
+      (match decodeLittleEndianBytes bytes with
+       | some p => some (p.1, none)
+       | none => none) ∧
+    decodeScalarBytes (stripAbstractBytesProv bytes) false =
+      (match decodeScalarBytes bytes false with
+       | some p => some (p.1, none)
+       | none => none) ∧
+    decodeValueFromBytes (fuel + 1) layouts { kind := .uint .u64, layoutIdx := 0 }
+        (stripAbstractBytesProv bytes) =
+      decodeValueFromBytes (fuel + 1) layouts { kind := .uint .u64, layoutIdx := 0 } bytes ∧
+    (abstractBytesHaveProv bytes = false →
+      decodePtrBytesNoForgeWithPolicy .stripProvenance isRef pointee ptrBytes bytes =
+        decodePtrBytesNoForgeWithPolicy .strictUcg630Ub isRef pointee ptrBytes bytes) ∧
+    (abstractBytesHaveProv bytes = false →
+      decodeScalarLayoutBytesWithPolicy .stripProvenance sl bytes =
+        decodeScalarLayoutBytesWithPolicy .strictUcg630Ub sl bytes) ∧
+    (abstractBytesHaveProv bytes = false →
+      decodeTypedValueFromBytesWithPolicy .stripProvenance fuel layouts ty bytes =
+        decodeTypedValueFromBytesWithPolicy .strictUcg630Ub fuel layouts ty bytes) ∧
+    (decodePtrBytesNoForgeWithPolicy .strictUcg630Ub isRef pointee ptrBytes bytes = some v →
+      decodePtrBytesNoForgeWithPolicy .stripProvenance isRef pointee ptrBytes bytes = some v) ∧
+    (decodeScalarLayoutBytesWithPolicy .strictUcg630Ub sl bytes = some v →
+      decodeScalarLayoutBytesWithPolicy .stripProvenance sl bytes = some v) ∧
+    (decodeTypedValueFromBytesWithPolicy .strictUcg630Ub fuel layouts ty bytes = some v →
+      decodeTypedValueFromBytesWithPolicy .stripProvenance fuel layouts ty bytes = some v) ∧
+    (decodeTypedValueFromBytesWithPolicy .stripProvenance fuel layouts ty bytes =
+        decodeTypedValueFromBytesWithPolicy .strictUcg630Ub fuel layouts ty bytes ∨
+      decodeTypedValueFromBytesWithPolicy .strictUcg630Ub fuel layouts ty bytes = none) ∧
+    decodeTypedValueFromBytesWithPolicy .stripProvenance (fuel + 1) protoTransmuteLayouts
+        { kind := protoMaybeUninitU8Kind, layoutIdx := 1 } bytes =
+      decodeTypedValueFromBytesWithPolicy .strictUcg630Ub (fuel + 1) protoTransmuteLayouts
+        { kind := protoMaybeUninitU8Kind, layoutIdx := 1 } bytes ∧
+    decodeTypedValueFromBytesWithPolicy .stripProvenance (fuel + 1) layouts
+        { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 } bytes =
+      decodeTypedValueFromBytesWithPolicy .strictUcg630Ub (fuel + 1) layouts
+        { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 } bytes ∧
+    ((∀ bs,
+        decodeTypedValueFromBytesWithPolicy .stripProvenance defaultCodecFuel layouts
+            (resolveTyWithLocalDecls localDecls layouts ty) bs =
+          decodeTypedValueFromBytesWithPolicy .strictUcg630Ub defaultCodecFuel layouts
+            (resolveTyWithLocalDecls localDecls layouts ty) bs) →
+      evalByteCastWithPolicy .stripProvenance locals op ty mem localDecls layouts =
+        evalByteCastWithPolicy .strictUcg630Ub locals op ty mem localDecls layouts) :=
+  ⟨abstractBytesHaveProv_take n bytes,
+   abstractBytesHaveProv_drop n bytes,
+   fun hnp hsl => abstractBytesHaveProv_slice bytes s off len hnp hsl,
+   abstractBytesUniformProv_false_of_no_prov bytes,
+   abstractBytesHaveProv_stripAbstractBytesProv bytes,
+   length_stripAbstractBytesProv bytes,
+   decodeLittleEndianBytes_stripAbstractBytesProv bytes,
+   decodeScalarBytes_stripAbstractBytesProv bytes false,
+   decodeValueFromBytes_scalar_stripAbstractBytesProv fuel layouts (.uint .u64) 0 bytes
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))),
+   decodePtrBytesNoForgeWithPolicy_strip_eq_strict_of_no_prov isRef pointee ptrBytes bytes,
+   decodeScalarLayoutBytesWithPolicy_strip_eq_strict_of_no_prov sl bytes,
+   decodeTypedValueFromBytesWithPolicy_strip_eq_strict_of_no_prov fuel layouts ty bytes,
+   decodePtrBytesNoForgeWithPolicy_strict_refines_strip isRef pointee ptrBytes bytes v,
+   decodeScalarLayoutBytesWithPolicy_strict_refines_strip sl bytes v,
+   decodeTypedValueFromBytesWithPolicy_strict_refines_strip fuel layouts ty bytes v,
+   decodeTypedValueFromBytesWithPolicy_strip_eq_strict_or_strict_none fuel layouts ty bytes,
+   decodeTypedValueFromBytesWithPolicy_union_policy_indep fuel protoTransmuteLayouts
+      "core::mem::maybe_uninit::MaybeUninit" [.uint .u8] 1 protoMaybeUninitU8Layout 2 bytes
+      rfl rfl rfl,
+   decodeTypedValueFromBytesWithPolicy_thinRawPtr_policy_indep fuel layouts .mut (.uint .u8) 0
+      bytes rfl,
+   evalByteCastWithPolicy_policy_indep_of_decode_indep locals op ty mem localDecls layouts⟩
+
+/-- Concrete nondeterministic dispatcher outcomes on `+0.0_f32 / +0.0_f32`
+(locals `3`, `3`): the relational semantics admits the preferred NaN with either
+sign, rejects any other payload, and the deterministic mode admits only
+`0x7FC00000`. -/
+theorem test_relational_dispatcher_nan_outcomes :
+    EvalRvalueFloatRelProto .nondeterministic floatMisdispatchLocals
+      (.binaryOp .div (.copy ⟨3, []⟩) (.copy ⟨3, []⟩)) emptyMemory floatMisdispatchDecls
+      emptyLayoutTable (.ok (.scalar ⟨0xFFC00000, 4⟩) floatMisdispatchLocals emptyMemory) ∧
+    EvalRvalueFloatRelProto .nondeterministic floatMisdispatchLocals
+      (.binaryOp .div (.copy ⟨3, []⟩) (.copy ⟨3, []⟩)) emptyMemory floatMisdispatchDecls
+      emptyLayoutTable (.ok (.scalar ⟨0x7FC00000, 4⟩) floatMisdispatchLocals emptyMemory) ∧
+    ¬ EvalRvalueFloatRelProto .nondeterministic floatMisdispatchLocals
+      (.binaryOp .div (.copy ⟨3, []⟩) (.copy ⟨3, []⟩)) emptyMemory floatMisdispatchDecls
+      emptyLayoutTable (.ok (.scalar ⟨0x7FC00001, 4⟩) floatMisdispatchLocals emptyMemory) ∧
+    ¬ EvalRvalueFloatRelProto .deterministic floatMisdispatchLocals
+      (.binaryOp .div (.copy ⟨3, []⟩) (.copy ⟨3, []⟩)) emptyMemory floatMisdispatchDecls
+      emptyLayoutTable (.ok (.scalar ⟨0xFFC00000, 4⟩) floatMisdispatchLocals emptyMemory) := by
+  have hrel : ∀ (mode : FloatArithMode) (bits : Nat),
+      EvalRvalueFloatRelProto mode floatMisdispatchLocals
+          (.binaryOp .div (.copy ⟨3, []⟩) (.copy ⟨3, []⟩)) emptyMemory floatMisdispatchDecls
+          emptyLayoutTable (.ok (.scalar ⟨bits, 4⟩) floatMisdispatchLocals emptyMemory) ↔
+        ∃ out, EvalFloatBinOpRel mode .div .binary32 0 0 out ∧
+          RvalueEvalResult.ok (.scalar ⟨bits, 4⟩) floatMisdispatchLocals emptyMemory =
+            .ok (.scalar ⟨out, 4⟩) floatMisdispatchLocals emptyMemory :=
+    fun _ _ => Iff.rfl
+  have hpos : EvalFloatBinOpRel .nondeterministic .div .binary32 0 0 0x7FC00000 :=
+    EvalFloatBinOpRel.det_imp_nondet .div .binary32 0 0 _
+      ((EvalFloatBinOpRel.det_iff .div .binary32 0 0 _).mpr ⟨rfl, rfl⟩)
+  refine ⟨(hrel _ _).mpr ⟨0xFFC00000,
+      EvalFloatBinOpRel.nondet_neg_closed .div .binary32 0 0 0x7FC00000 rfl hpos, rfl⟩,
+    (hrel _ _).mpr ⟨0x7FC00000, hpos, rfl⟩, ?_, ?_⟩
+  · intro h
+    obtain ⟨out, hout, heq⟩ := (hrel _ _).mp h
+    injection heq with hv _ _
+    injection hv with hsc
+    injection hsc with hbits _
+    rw [← hbits] at hout
+    have hmem : 0x7FC00001 ∈
+        nanChoicesProto .binary32 [(.binary32, 0), (.binary32, 0)] .nondeterministic := hout.2
+    exact absurd hmem (by decide)
+  · intro h
+    obtain ⟨out, hout, heq⟩ := (hrel _ _).mp h
+    injection heq with hv _ _
+    injection hv with hsc
+    injection hsc with hbits _
+    rw [← hbits] at hout
+    exact absurd ((EvalFloatBinOpRel.det_iff .div .binary32 0 0 _).mp hout).2 (by decide)
+
+/-- Outcome shape and failure preservation of the relational dispatcher: on the
+`f16` fixture no mode and no state relates to `.ok`, and in general every
+related result is the deterministic one up to the scalar bits. -/
+theorem test_relational_failure_preservation (mode : FloatArithMode) (locals : List LocalSlot)
+    (mem : Memory) (op : BinOp) (rv : Rvalue) (res res' : RvalueEvalResult)
+    (h : EvalRvalueFloatRelProto mode locals (.binaryOp op (.copy ⟨5, []⟩) (.copy ⟨5, []⟩)) mem
+      floatMisdispatchDecls emptyLayoutTable res)
+    (h' : EvalRvalueFloatRelProto mode locals rv mem floatMisdispatchDecls emptyLayoutTable res') :
+    (res = .ub ∨ res = .unsupported) ∧
+    (res' = evalRvalueFloatProto locals rv mem floatMisdispatchDecls emptyLayoutTable ∨
+      ∃ out base w locals',
+        evalRvalueFloatProto locals rv mem floatMisdispatchDecls emptyLayoutTable =
+          .ok (.scalar ⟨base, w⟩) locals' mem ∧
+        res' = .ok (.scalar ⟨out, w⟩) locals' mem) := by
+  have hp := EvalRvalueFloatRelProto.failure_preserved mode locals _ mem floatMisdispatchDecls
+    emptyLayoutTable res h
+  refine ⟨?_, EvalRvalueFloatRelProto.eq_fun_or_scalar_variant mode locals rv mem
+    floatMisdispatchDecls emptyLayoutTable res' h'⟩
+  rcases evalRvalueFloatProto_binaryOp_fail_closed_of_unmodeled_or_mismatch locals op
+      (.copy ⟨5, []⟩) (.copy ⟨5, []⟩) mem floatMisdispatchDecls emptyLayoutTable .f16 .f16
+      rfl rfl (fun _ hf => by cases hf.1) with hub | huns
+  · exact Or.inl (hp.1.mpr hub)
+  · exact Or.inr (hp.2.1.mpr huns)
+
+/-! ## §17. Automated `run_cmd` Constructive Axiom, Projection-Discipline & Reachability Audit -/
 
 /-
 Audit rules (every violation is a hard `throwError`):
@@ -1438,8 +1842,14 @@ Audit rules (every violation is a hard `throwError`):
 4. Zero trivial `: True` test theorems: no test theorem in `Anneal.FloatArithAndUcg630ProtoTests`
    may have a stripped return type equal to `True` (preventing empty `have _ := ...; trivial`
    reachability stubs).
-5. 100% applied reachability: every public theorem of `Anneal.FloatArithAndUcg630Prototype`
-   (≥ 200 theorems) is transitively instantiated by non-`True`-typed test declarations.
+5. 100% **direct** applied coverage: every public theorem of
+   `Anneal.FloatArithAndUcg630Prototype` (≥ 219 theorems) is referenced *directly* by the
+   proof or statement of a non-`True`-typed test declaration. Being reached only
+   transitively (because another module theorem's proof happens to use it) does not count:
+   that rule let 55 theorems — including brief headlines such as
+   `evalFloatNegProto_involutive`, `decodeBits_evalFloatNegProto`, and
+   `decodeTypedValueFromBytesWithPolicy_strict_refines_strip` — pass as "instantiated"
+   without any test mentioning them.
 -/
 open Lean Elab Command in
 run_cmd do
@@ -1448,7 +1858,7 @@ run_cmd do
   let prodElims : List Name := [``Prod.casesOn, ``Prod.rec, ``Prod.recOn]
   let modName : Name := `Anneal.FloatArithAndUcg630Prototype
   let testNs : Name := `Anneal.FloatArithAndUcg630ProtoTests
-  let minPublicTheorems : Nat := 200
+  let minPublicTheorems : Nat := 219
   let some modIdx := env.getModuleIdx? modName | throwError "module {modName} not imported"
   let isHostFloat : Name → Bool := fun c =>
     let user := (privateToUserName? c).getD c
@@ -1515,6 +1925,7 @@ run_cmd do
   if theorems < minPublicTheorems then
     throwError "{modName}: audited only {theorems} public theorems (expected ≥ {minPublicTheorems})"
   let mut reached : NameSet := {}
+  let mut direct : NameSet := {}
   let mut work : Array Name := #[]
   let mut testDecls : Nat := 0
   for (n, ci) in env.constants.map₂.toList do
@@ -1530,9 +1941,11 @@ run_cmd do
       for c in ci.getUsedConstantsAsSet do
         if isHostFloat c then
           throwError "host Float usage: test {n} mentions {c}"
-        if env.getModuleIdxFor? c == some modIdx && !reached.contains c then
-          reached := reached.insert c
-          work := work.push c
+        if env.getModuleIdxFor? c == some modIdx then
+          direct := direct.insert c
+          if !reached.contains c then
+            reached := reached.insert c
+            work := work.push c
       testDecls := testDecls + 1
   while !work.isEmpty do
     let c := work.back!
@@ -1545,9 +1958,13 @@ run_cmd do
   let unreached := auditedThms.filter (fun n => !reached.contains n)
   unless unreached.isEmpty do
     throwError "public theorems not transitively instantiated by non-True applied tests ({unreached.size}): {unreached.toList}"
+  let notDirect := auditedThms.filter (fun n => !direct.contains n)
+  unless notDirect.isEmpty do
+    throwError "public theorems never referenced directly by a non-True applied test \
+      ({notDirect.size}): {notDirect.toList}"
   logInfo m!"axiom & reachability audit passed: {audited + testDecls} declarations \
     ({theorems} public module theorems, all constructive [propext, Quot.sound] and 100% \
-    transitively instantiated by non-True applied tests; zero True-typed test stubs; no \
+    directly instantiated by non-True applied tests; zero True-typed test stubs; no \
     Prod.casesOn/Prod.rec; {auxAudited} auxiliary module constants axiom-audited; zero host Float)"
 
 end Anneal.FloatArithAndUcg630ProtoTests
