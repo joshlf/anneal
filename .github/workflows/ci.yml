@@ -34,6 +34,10 @@ jobs:
   check-todo:
     runs-on: ubuntu-latest
     name: Check for todo comments
+    env:
+      ACTIONS_CACHE_URL: ''
+      ACTIONS_RESULTS_URL: ''
+      ACTIONS_RUNTIME_TOKEN: ''
     steps:
       - name: Install ripgrep
         run: |
@@ -43,6 +47,20 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify root TCB manifest
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum --check --strict trusted/root-manifest.sha256
+          else
+            shasum --algorithm 256 --check trusted/root-manifest.sha256
+          fi
+          for p in .cargo rust-toolchain rust-toolchain.toml; do
+            if [ -e "$p" ] || [ -L "$p" ]; then
+              echo "forbidden root config override: $p" >&2
+              exit 1
+            fi
+          done
       - name: Run todo check
         run: ./ci/check_todo.sh
       - name: Test release tooling and the Codex review gate
@@ -55,6 +73,10 @@ jobs:
   check-non-stable-version:
     runs-on: ubuntu-latest
     name: Check for non-stable cargo-anneal version
+    env:
+      ACTIONS_CACHE_URL: ''
+      ACTIONS_RESULTS_URL: ''
+      ACTIONS_RUNTIME_TOKEN: ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,6 +92,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Verify root TCB manifest
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum --check --strict trusted/root-manifest.sha256
+          else
+            shasum --algorithm 256 --check trusted/root-manifest.sha256
+          fi
+          for p in .cargo rust-toolchain rust-toolchain.toml; do
+            if [ -e "$p" ] || [ -L "$p" ]; then
+              echo "forbidden root config override: $p" >&2
+              exit 1
+            fi
+          done
       - name: Restore the Cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -99,6 +135,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Verify root TCB manifest
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum --check --strict trusted/root-manifest.sha256
+          else
+            shasum --algorithm 256 --check trusted/root-manifest.sha256
+          fi
+          for p in .cargo rust-toolchain rust-toolchain.toml; do
+            if [ -e "$p" ] || [ -L "$p" ]; then
+              echo "forbidden root config override: $p" >&2
+              exit 1
+            fi
+          done
 
       # Same pinned release and checksum as .github/workflows/trusted-boundary.yml.
       - name: Provision the pinned Lean release
@@ -177,6 +227,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Verify root TCB manifest
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum --check --strict trusted/root-manifest.sha256
+          else
+            shasum --algorithm 256 --check trusted/root-manifest.sha256
+          fi
+          for p in .cargo rust-toolchain rust-toolchain.toml; do
+            if [ -e "$p" ] || [ -L "$p" ]; then
+              echo "forbidden root config override: $p" >&2
+              exit 1
+            fi
+          done
 
       - name: Provision the pinned Lean release
         run: |
