@@ -1388,6 +1388,155 @@ run_cmd do
     , formatVerdictTags "A2_4b_modular_input_sensitive_wrong_rely" vModISBad ]
   logInfo (String.intercalate "\n" lines)
 
+/-! ## Pass B3 Hardening Regressions: Unsound `@[local csimp]` Lemmas, Specialised IR, `_sunfold` Siblings, `initialize` Constants -/
+
+/--
+info: B3_1a_local_csimp_axiom_lemma_slow_native: rejected [unapprovedAxiom]
+B3_1b_local_csimp_unproved_lemma_slow_native: rejected [sorryAxiomReached]
+B3_1c_local_csimp_sound_lemma_slow_native: ok [] provisionalNative=1 kernelConfirmed=0
+B3_2_ir_callee_in_specialised_loop_body: rejected [unsafeDeclaration]
+B3_3a_sunfold_sibling_constant: rejected [unapprovedAxiom]
+B3_3b_sunfold_sibling_function: rejected [unapprovedAxiom]
+B3_4a_initialize_constant_reached: rejected [compilerOverrideAttribute]
+B3_4b_initialize_constant_in_native_axiom: rejected [compilerOverrideAttribute]
+B3_R_forged_native_pair_on_stuck_term_residual: ok [] provisionalNative=2 kernelConfirmed=0
+B3_R_forged_native_pair_strict_policy: rejected [nativeDecideReached]
+-/
+#guard_msgs in
+run_cmd do
+  let strict : AuditPolicy := { checkStatementOrigin := false }
+  let prov : AuditPolicy := { checkStatementOrigin := false, allowProvisionalNative := true }
+  let mut lines : List String := []
+  let kw := "sor" ++ "ry"
+
+  -- B3-1: a closed-section `@[local csimp]` lemma leaves no attribute entry behind, and
+  -- its replacement here is an ordinary pure definition carrying no override of its own,
+  -- so the ambient attribute scan had nothing to report. The redirection is exactly as
+  -- sound as the lemma's proof: resting on a custom axiom (1a) or on an unproved goal
+  -- (1b) it makes compiled `Nat.add` return 999, and a `native_decide` proof too slow for
+  -- the kernel re-check then certified the false equation (`ok`, provisional). Lemmas of
+  -- `@[csimp]` shape are now audited as roots; a soundly proved one (1c) stays admissible.
+  let localCsimpEnv (pfx lemmaProof : String) (expected : Nat) : String :=
+    s!"def {pfx}Slow : Nat → Bool | 0 => true | n + 1 => {pfx}Slow n\n" ++
+    s!"def {pfx}Repl (a b : Nat) : Nat := {if expected == 5 then "a + b" else "999"}\n" ++
+    (if lemmaProof == "axiom" then s!"axiom {pfx}BadEq : @Nat.add = @{pfx}Repl\n" else "") ++
+    "section\n" ++
+    s!"@[local csimp] theorem {pfx}Redir : @Nat.add = @{pfx}Repl := " ++
+      (if lemmaProof == "axiom" then s!"{pfx}BadEq" else lemmaProof) ++ "\n" ++
+    s!"def {pfx}Caller (a b : Nat) : Nat := Nat.add a b\n" ++
+    "end\n" ++
+    s!"theorem {pfx}Native : ({pfx}Slow 2000000 && ({pfx}Caller 2 3 == {expected})) = true := by native_decide\n"
+  let env1a ← elabInSandbox (localCsimpEnv "b3Ax" "axiom" 999)
+  let v1a ← liftIO <| auditDeclsInEnvIO env1a #[`b3AxNative] prov
+  liftIO <| assertRejectedWithTag "B3_1a_local_csimp_axiom_lemma_slow_native" v1a "unapprovedAxiom"
+  unless v1a.violations.any (fun | .unapprovedAxiom _ ax _ _ => ax == `b3AxBadEq | _ => false) do
+    throwError "B3_1a: expected the lemma's axiom b3AxBadEq to be reported"
+  let env1b ← elabInSandbox (localCsimpEnv "b3Un" s!"by {kw}" 999)
+  let v1b ← liftIO <| auditDeclsInEnvIO env1b #[`b3UnNative] prov
+  liftIO <| assertRejectedWithTag "B3_1b_local_csimp_unproved_lemma_slow_native" v1b "sorryAxiomReached"
+  let env1c ← elabInSandbox (localCsimpEnv "b3Ok" "by funext a b; rfl" 5)
+  let v1c ← liftIO <| auditDeclsInEnvIO env1c #[`b3OkNative] prov
+  liftIO <| assertAuditOk "B3_1c_local_csimp_sound_lemma_slow_native" v1c
+  lines := lines ++
+    [ formatVerdictTags "B3_1a_local_csimp_axiom_lemma_slow_native" v1a
+    , formatVerdictTags "B3_1b_local_csimp_unproved_lemma_slow_native" v1b
+    , formatVerdictProvisional "B3_1c_local_csimp_sound_lemma_slow_native" v1c ]
+
+  -- B3-2: the compiled-IR callee walk skipped IR-only auxiliaries whose *name* is rooted
+  -- in the toolchain. Specialising a toolchain function for user code emits the copy into
+  -- the user's module under exactly such a name: the body of a range `for` loop compiles
+  -- to `Std.Legacy.Range.forIn'.loop._at_.<caller>.spec_0`, so the redirected call inside
+  -- the loop was never seen (`ok`), while the same call in a straight-line caller was
+  -- reported. Ownership is now decided by declaring module, never by name.
+  let env2 ← elabInSandbox <|
+    "unsafe def b3LoopEvil (a b : Nat) : Nat := a + b + 999\n" ++
+    "@[noinline, implemented_by b3LoopEvil] def b3LoopAdd (a b : Nat) : Nat := a + b\n" ++
+    "section\n" ++
+    "@[local csimp] theorem b3LoopRedir : @Nat.add = @b3LoopAdd := by funext a b; rfl\n" ++
+    "def b3LoopCaller (n : Nat) : Nat := Id.run do\n" ++
+    "  let mut acc := 0\n" ++
+    "  for i in [0:n] do\n" ++
+    "    acc := Nat.add acc i\n" ++
+    "  return acc\n" ++
+    "end\n" ++
+    "theorem b3LoopThm : b3LoopCaller 0 = b3LoopCaller 0 := rfl\n"
+  let v2 ← liftIO <| auditDeclsInEnvIO env2 #[`b3LoopThm] strict
+  liftIO <| assertRejectedWithTag "B3_2_ir_callee_in_specialised_loop_body" v2 "unsafeDeclaration"
+  lines := lines ++ [formatVerdictTags "B3_2_ir_callee_in_specialised_loop_body" v2]
+
+  -- B3-3: `Meta.whnf` unfolds `f` through a sibling constant `f._sunfold` (smart
+  -- unfolding) that it finds purely by name. A hand-written sibling made the bounded
+  -- evaluator read `true` where the kernel computes `false`; the kernel then refused to
+  -- certify `true`, and the provably false axiom was left provisional (`ok`). Smart
+  -- unfolding is now disabled for the bounded evaluation and the kernel is asked about
+  -- both polarities before an axiom may stay provisional.
+  let env3 ← elabInSandbox <|
+    "def b3SunConst : Bool := false\n" ++
+    "def b3SunConst._sunfold : Bool := true\n" ++
+    "axiom b3sc._native.native_decide.ax_1_1 : b3SunConst = true\n" ++
+    "theorem b3SunConstThm : b3SunConst = true := b3sc._native.native_decide.ax_1_1\n" ++
+    "def b3SunFn (n : Nat) : Bool := n == 5\n" ++
+    "def b3SunFn._sunfold (_n : Nat) : Bool := true\n" ++
+    "axiom b3sf._native.native_decide.ax_1_1 : b3SunFn 3 = true\n" ++
+    "theorem b3SunFnThm : b3SunFn 3 = true := b3sf._native.native_decide.ax_1_1\n"
+  let v3a ← liftIO <| auditDeclsInEnvIO env3 #[`b3SunConstThm] prov
+  let v3b ← liftIO <| auditDeclsInEnvIO env3 #[`b3SunFnThm] prov
+  liftIO <| assertRejectedWithTag "B3_3a_sunfold_sibling_constant" v3a "unapprovedAxiom"
+  liftIO <| assertRejectedWithTag "B3_3b_sunfold_sibling_function" v3b "unapprovedAxiom"
+  lines := lines ++
+    [ formatVerdictTags "B3_3a_sunfold_sibling_constant" v3a
+    , formatVerdictTags "B3_3b_sunfold_sibling_function" v3b ]
+
+  -- B3-4: `initialize x : T ← act` is `@[init initFn] opaque x : T`: the kernel sees an
+  -- opaque constant, compiled code sees whatever `act` returned when the module was
+  -- loaded. It carried none of the attributes the auditor looked for (`ok`). The on-disk
+  -- regression `B3_4_initialize_two_process_false` below derives `False` from it using
+  -- nothing but honest compiler output.
+  let env4 ← elabInSandbox <|
+    "initialize b3InitCoin : Nat ← pure 999\n" ++
+    "theorem b3InitCoinThm : b3InitCoin = b3InitCoin := rfl\n" ++
+    "initialize b3InitFlag : Bool ← pure true\n" ++
+    "axiom b3if._native.native_decide.ax_1_1 : b3InitFlag = true\n" ++
+    "theorem b3InitFlagThm : b3InitFlag = true := b3if._native.native_decide.ax_1_1\n"
+  let v4a ← liftIO <| auditDeclsInEnvIO env4 #[`b3InitCoinThm] strict
+  let v4b ← liftIO <| auditDeclsInEnvIO env4 #[`b3InitFlagThm] prov
+  liftIO <| assertRejectedWithTag "B3_4a_initialize_constant_reached" v4a "compilerOverrideAttribute"
+  liftIO <| assertRejectedWithTag "B3_4b_initialize_constant_in_native_axiom" v4b "compilerOverrideAttribute"
+  for (label, v, decl) in [("B3_4a", v4a, `b3InitCoin), ("B3_4b", v4b, `b3InitFlag)] do
+    unless v.violations.any
+        (fun | .compilerOverrideAttribute _ d kind _ => d == decl && kind == "init" | _ => false) do
+      throwError "{label}: expected an `init` override violation on {decl}"
+  lines := lines ++
+    [ formatVerdictTags "B3_4a_initialize_constant_reached" v4a
+    , formatVerdictTags "B3_4b_initialize_constant_in_native_axiom" v4b ]
+
+  -- B3-R (pinned residual, NOT closed): Lean `v4.34.1` discards the auxiliary definition
+  -- `native_decide` compiles and keeps only `ax : e = true`, so nothing in the environment
+  -- tells a compiler-emitted native axiom from a hand-written one of the same name and
+  -- shape. The kernel re-check refutes a forgery only when `e` reduces to a literal within
+  -- the budget. An expression that is stuck (here on an `opaque` constant; equally on
+  -- well-founded recursion the kernel cannot unfold) costs the forger nothing: two
+  -- contradictory hand-written axioms prove `False` and the provisional policy still
+  -- answers `ok`, with both axioms listed as provisional. A provisional verdict is
+  -- therefore never a pass; the default policy rejects the same environment.
+  let envR ← elabInSandbox <|
+    "opaque b3Stuck : Bool\n" ++
+    "axiom b3r1._native.native_decide.ax_1_1 : b3Stuck = true\n" ++
+    "axiom b3r2._native.native_decide.ax_1_1 : (!b3Stuck) = true\n" ++
+    "theorem b3ForgedFalse : False := by\n" ++
+    "  have h1 := b3r1._native.native_decide.ax_1_1\n" ++
+    "  have h2 := b3r2._native.native_decide.ax_1_1\n" ++
+    "  rw [h1] at h2\n" ++
+    "  exact absurd h2 (by decide)\n"
+  let vRProv ← liftIO <| auditDeclsInEnvIO envR #[`b3ForgedFalse] prov
+  let vRStrict ← liftIO <| auditDeclsInEnvIO envR #[`b3ForgedFalse] strict
+  liftIO <| assertAuditOk "B3_R_forged_native_pair_on_stuck_term_residual" vRProv
+  liftIO <| assertRejectedWithTag "B3_R_forged_native_pair_strict_policy" vRStrict "nativeDecideReached"
+  lines := lines ++
+    [ formatVerdictProvisional "B3_R_forged_native_pair_on_stuck_term_residual" vRProv
+    , formatVerdictTags "B3_R_forged_native_pair_strict_policy" vRStrict ]
+  logInfo (String.intercalate "\n" lines)
+
 /-! ### Type-Level Refutations for Discriminating Kills and Deterministic Specifications -/
 
 /-- A specification that is satisfiable at input `0` but unimplementable everywhere else.
@@ -1801,7 +1950,40 @@ def runDiskHardeningRegressions : IO String := do
       (tmpDir / "Verify" / "ProtoDiskVictimTrusted.olean")
     let trustedBoundaryPol : AuditPolicy :=
       { AuditPolicy.strictClaim with statementAllowedRoots := #[`Init, `Std, `Trusted] }
-    let loadedTrustedVictim ← loadOrThrow "D7_load" #[`Verify.ProtoDiskVictimTrusted] {} [tmpDir]
+    -- B3-4 (on-disk, separate compiler processes): `initialize` makes the compiled value
+    --      of an opaque constant depend on the process that loaded its module. Two honest
+    --      `native_decide` runs, one with a marker file present and one without, certify
+    --      `protoInitFlag = true` and `protoInitFlag = false`; a third module combines
+    --      them into a complete proof of `False`. No hand-written axiom, `unsafe`,
+    --      `@[implemented_by]`, `@[extern]`, or `@[csimp]` is involved, and neither native
+    --      axiom can be refuted by reduction (the constant is opaque), so the provisional
+    --      policy used to report `ok`. The modules share the D7 load below, because each
+    --      additional in-process load of the `Init` closure costs its full size in heap.
+    let flagPath := tmpDir / "proto_init_flag"
+    IO.FS.writeFile (tmpDir / "ProtoDiskInitA.lean")
+      s!"initialize protoInitFlag : Bool ← System.FilePath.pathExists \"{flagPath}\"\n"
+    compileTempModuleWithPath tmpDir (tmpDir / "ProtoDiskInitA.lean") (tmpDir / "ProtoDiskInitA.olean")
+    IO.FS.writeFile flagPath "present"
+    IO.FS.writeFile (tmpDir / "ProtoDiskInitC1.lean") <|
+      "import ProtoDiskInitA\n" ++
+      "theorem protoInitSeenTrue : protoInitFlag = true := by native_decide\n"
+    compileTempModuleWithPath tmpDir (tmpDir / "ProtoDiskInitC1.lean") (tmpDir / "ProtoDiskInitC1.olean")
+    IO.FS.removeFile flagPath
+    IO.FS.writeFile (tmpDir / "ProtoDiskInitC2.lean") <|
+      "import ProtoDiskInitA\n" ++
+      "theorem protoInitSeenFalse : protoInitFlag = false := by native_decide\n"
+    compileTempModuleWithPath tmpDir (tmpDir / "ProtoDiskInitC2.lean") (tmpDir / "ProtoDiskInitC2.olean")
+    IO.FS.writeFile (tmpDir / "ProtoDiskInitC3.lean") <|
+      "import ProtoDiskInitC1\n" ++
+      "import ProtoDiskInitC2\n" ++
+      "theorem protoInitFalse : False :=\n" ++
+      "  absurd (protoInitSeenTrue.symm.trans protoInitSeenFalse) (by decide)\n"
+    compileTempModuleWithPath tmpDir (tmpDir / "ProtoDiskInitC3.lean") (tmpDir / "ProtoDiskInitC3.olean")
+    let loadedTrustedVictim ← loadOrThrow "D7_load"
+      #[`Verify.ProtoDiskVictimTrusted, `ProtoDiskInitC3] {} [tmpDir]
+    let vInitFalse ← auditLoadedModulesIO loadedTrustedVictim
+      { checkStatementOrigin := false, allowProvisionalNative := true }
+      (explicitTargets? := some #[`protoInitFalse])
     let auditTrustedVictim (policy : AuditPolicy) (pins : Array (Name × System.FilePath)) :=
       auditLoadedModulesIO loadedTrustedVictim policy
         (explicitTargets? := some #[`Verify.claimTrustedLeak]) (pinnedModuleRoots := pins)
@@ -1938,6 +2120,59 @@ def runDiskHardeningRegressions : IO String := do
       (explicitTargets? := some #[`cleanClaim])
     assertRejectedWithTag "A2_disk_local_csimp_ambient_override" vDiskLocalCsimp "compilerOverrideAttribute"
     lines := lines.push (formatVerdictTags "A2_disk_local_csimp_ambient_override" vDiskLocalCsimp)
+
+    -- B3-4 verdict (modules compiled and loaded together with D7 above).
+    assertRejectedWithTag "B3_4_initialize_two_process_false" vInitFalse "compilerOverrideAttribute"
+    let namesInitFlag := vInitFalse.violations.any fun
+      | .compilerOverrideAttribute _ d kind _ => d == `protoInitFlag && kind == "init"
+      | _ => false
+    unless namesInitFlag do
+      throw <| IO.userError s!"expected an init override on protoInitFlag:\n{auditReportJson vInitFalse |>.pretty}"
+    lines := lines.push (formatVerdictTags "B3_4_initialize_two_process_false" vInitFalse)
+
+    -- B3-5 (on-disk `module` file, minimal `Init.Prelude`-only closure): function bodies
+    --      of a `module` are compiled into the `.ir` companion; its `.olean` parts keep
+    --      opaque stubs for public functions and nothing for private ones, and Lean's
+    --      loader silently continues without `.ir` when `.ir.sig` is absent. Deleting the
+    --      two files therefore blinded the compiled-IR callee walk (`ok`) that reports
+    --      the redirected call while they are present.
+    let irModLean := tmpDir / "ProtoDiskIrMod.lean"
+    let irModOlean := tmpDir / "ProtoDiskIrMod.olean"
+    IO.FS.writeFile irModLean <|
+      "module\n" ++
+      "prelude\n" ++
+      "public import Init.Prelude\n" ++
+      "unsafe def protoIrEvil (a b : Nat) : Nat := Nat.succ (Nat.add a b)\n" ++
+      "@[noinline, implemented_by protoIrEvil] def protoIrAdd (a b : Nat) : Nat := Nat.add a b\n" ++
+      "section\n" ++
+      "@[local csimp] theorem protoIrRedir : Eq Nat.add protoIrAdd := Eq.refl Nat.add\n" ++
+      "public def protoIrCaller (a b : Nat) : Nat := Nat.add a b\n" ++
+      "end\n" ++
+      "public theorem protoIrClaim :\n" ++
+      "    Eq (protoIrCaller Nat.zero Nat.zero) (protoIrCaller Nat.zero Nat.zero) := Eq.refl _\n"
+    compileTempModuleToOlean tmpDir irModLean irModOlean
+    let irSigPath := irModOlean.withExtension "ir.sig"
+    let irPath := irModOlean.withExtension "ir"
+    unless (← irSigPath.pathExists) && (← irPath.pathExists) do
+      throw <| IO.userError "expected .ir.sig and .ir to be emitted for module file"
+    let loadedIrMod ← loadOrThrow "B3_5_load" #[`ProtoDiskIrMod] pol [tmpDir]
+    let vIrPresent ← auditLoadedModulesIO loadedIrMod pol (explicitTargets? := some #[`protoIrClaim])
+    assertRejectedWithTag "B3_5_module_ir_callee_with_ir_artifact" vIrPresent "unsafeDeclaration"
+    lines := lines.push (formatVerdictTags "B3_5_module_ir_callee_with_ir_artifact" vIrPresent)
+    IO.FS.removeFile irSigPath
+    IO.FS.removeFile irPath
+    let vIrMissing ← auditCompiledModulesIO #[`ProtoDiskIrMod] pol
+      (explicitTargets? := some #[`protoIrClaim]) (extraSearchPaths := [tmpDir])
+    assertRejectedWithTag "B3_5_module_ir_artifact_deleted" vIrMissing "missingPrivateArtifact"
+    lines := lines.push (formatVerdictTags "B3_5_module_ir_artifact_deleted" vIrMissing)
+    -- A caller importing by itself (skipping the artifact scan) reaches the pure auditor
+    -- with stubs in place of function bodies; that must not be read as "no callees".
+    let vIrStub ← withExtraSearchPaths [tmpDir] do
+      let stubEnv ← Lean.importModules #[{ module := `ProtoDiskIrMod }] {}
+        (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := OLeanLevel.private)
+      pure (auditDeclsInEnvPure stubEnv #[`protoIrClaim] pol)
+    assertRejectedWithTag "B3_5_module_ir_stub_in_pure_auditor" vIrStub "environmentLoadFailed"
+    lines := lines.push (formatVerdictTags "B3_5_module_ir_stub_in_pure_auditor" vIrStub)
     return lines
   let lines ← try body finally IO.FS.removeDirAll tmpDir
   let clean := !(← tmpDir.pathExists)
@@ -1960,6 +2195,10 @@ A1_prelude_fake_native_eq_bool: rejected [unapprovedAxiom]
 A1_prelude_redeclared_ofReduceBool: rejected [unapprovedAxiom]
 A2_symlink_companion_part_alias: rejected [moduleProvenanceSpoofed]
 A2_disk_local_csimp_ambient_override: rejected [compilerOverrideAttribute]
+B3_4_initialize_two_process_false: rejected [compilerOverrideAttribute]
+B3_5_module_ir_callee_with_ir_artifact: rejected [unsafeDeclaration]
+B3_5_module_ir_artifact_deleted: rejected [missingPrivateArtifact]
+B3_5_module_ir_stub_in_pure_auditor: rejected [environmentLoadFailed]
 tmp_clean=true
 -/
 #guard_msgs in
